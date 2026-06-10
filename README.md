@@ -34,7 +34,7 @@ conv.chat("我叫什么名字？")  -- AI 记得叫小明
 cargo build --release
 
 # 运行脚本
-cargo run -- examples/hello_v10.mora
+cargo run -- examples/ai_workflow.mora
 
 # 交互式 REPL
 cargo run -- --repl

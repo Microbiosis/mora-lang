@@ -1,5 +1,7 @@
 # Mora
 
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.20628918.svg)](https://doi.org/10.5281/zenodo.20628918)
+
 一门轻量级 Lua 风格的 AI 工作流脚本语言。
 
 ```mora

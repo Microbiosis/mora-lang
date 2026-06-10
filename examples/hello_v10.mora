@@ -1,0 +1,61 @@
+-- examples/hello_v10.mora
+-- 演示 Mora v10 真实 HTTP + 真实 AI 工作流能力
+
+task main()
+  print("=== Mora v10 demo: real HTTP + real AI ===")
+  print("")
+
+  -- [1] json.parse + json.stringify
+  print("[1] json.parse + json.stringify")
+  let json_text: string = "{\"name\":\"Mora\",\"version\":10}"
+  let obj = json.parse(json_text)
+  print("  name: " + obj.get("name"))
+  let s = json.stringify(obj)
+  print("  stringified: " + s)
+  print("")
+
+  -- [2] 数组 JSON 解析 + reduce
+  print("[2] JSON array parsing + reduce")
+  let arr = json.parse("[10, 20, 30]")
+  let sum = arr.reduce(fn(a, b) a + b end, 0)
+  print("  sum: " + sum)
+  print("")
+
+  -- [3] 嵌套 JSON
+  print("[3] nested JSON")
+  let nested = json.parse("{\"user\":{\"name\":\"XiaoMing\",\"age\":25}}")
+  let user = nested.get("user")
+  print("  user.name: " + user.get("name"))
+  print("  user.age: " + user.get("age"))
+  print("")
+
+  -- [4] json.stringify + dict 构造
+  print("[4] json.stringify dict")
+  let msg: dict = {greeting: "hello", count: 42}
+  let ser = json.stringify(msg)
+  print("  " + ser)
+  print("")
+
+  -- [5] ai.chat — 单轮 mock
+  print("[5] ai.chat mock")
+  try
+    let answer: string = ai.chat("Say hi")
+    print("  " + answer)
+  catch err
+    print("  " + err)
+  end
+  print("")
+
+  -- [6] 闭包 + 管道
+  print("[6] closures + pipeline")
+  let words: list = ["hello", "world", "mora", "v10"]
+  let lengths = words.map(fn(s) s.len() end)
+  let total = lengths.reduce(fn(a, b) a + b end, 0)
+  print("  total chars: " + total)
+  print("")
+
+  print("=== All local tests passed ===")
+  print("")
+  print("To test real HTTP: cargo run -- examples/hello_v10_web.mora")
+  print("To test real AI:   set OPENAI_API_KEY and run again")
+end

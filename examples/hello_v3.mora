@@ -1,0 +1,35 @@
+let config = { model: "gpt-4", temperature: 0.7, max_tokens: 200 }
+let urls = ["https://example.com", "https://test.com"]
+
+task summarize(input, model)
+  prompt = "Summarize using {model}: {input}"
+  result = ai.chat(prompt)
+  return result
+end
+
+task main()
+  print("Config: " + config)
+  print("Model: " + config["model"])
+
+  for url in urls
+    try
+      text = web.fetch(url)
+      summary = summarize(text, config["model"])
+      print("- " + summary)
+    catch err
+      print("Failed to process " + url + ": " + err)
+    end
+  end
+
+  let items = [1, 2, 3]
+  items = items.push(4)
+  print("Items: " + items)
+  print("Length: " + items.len())
+
+  let data = { name: "Mora", version: 3 }
+  data = data.set("features", ["dict", "try/catch", "format strings"])
+  print("Data keys: " + data.keys())
+  print("Data: " + data)
+
+  print("Done")
+end

@@ -1,0 +1,16 @@
+[package]
+name = "mora"
+version = "0.0.1"
+edition = "2021"
+authors = ["Mora contributors"]
+description = "A lightweight Lua-style scripting language for AI workflows (v10: real HTTP, real AI, real JSON)"
+license = "BSD-3-Clause"
+keywords = ["scripting", "ai", "workflow", "lua-style", "embedded"]
+categories = ["development-tools", "parser-implementations"]
+
+[dependencies]
+# v10 首次外部依赖：ureq 同步 HTTP 客户端
+# 选择 ureq 而非 reqwest 的理由：ureq 同步阻塞，与同步解释器天然契合
+# 不引入 tokio 等 async runtime
+# 注意：v9 零依赖承诺被打破，但守住"不引入 async runtime"的红线
+ureq = "2.9"

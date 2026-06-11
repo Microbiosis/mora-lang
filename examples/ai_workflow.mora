@@ -8,23 +8,23 @@ task main()
   -- [1] json.parse + json.stringify
   print("[1] json.parse + json.stringify")
   let json_text: string = "{\"name\":\"Mora\",\"version\":10}"
-  let obj = json.parse(json_text)
+  let obj: dict = json.parse(json_text)
   print("  name: " + obj.get("name"))
-  let s = json.stringify(obj)
+  let s: string = json.stringify(obj)
   print("  stringified: " + s)
   print("")
 
   -- [2] 数组 JSON 解析 + reduce
   print("[2] JSON array parsing + reduce")
-  let arr = json.parse("[10, 20, 30]")
-  let sum = arr.reduce(fn(a, b) a + b end, 0)
+  let arr: list = json.parse("[10, 20, 30]")
+  let sum: number = arr.reduce(fn(a: number, b: number) a + b end, 0)
   print("  sum: " + sum)
   print("")
 
   -- [3] 嵌套 JSON
   print("[3] nested JSON")
-  let nested = json.parse("{\"user\":{\"name\":\"XiaoMing\",\"age\":25}}")
-  let user = nested.get("user")
+  let nested: dict = json.parse("{\"user\":{\"name\":\"XiaoMing\",\"age\":25}}")
+  let user: dict = nested.get("user")
   print("  user.name: " + user.get("name"))
   print("  user.age: " + user.get("age"))
   print("")
@@ -32,7 +32,7 @@ task main()
   -- [4] json.stringify + dict 构造
   print("[4] json.stringify dict")
   let msg: dict = {greeting: "hello", count: 42}
-  let ser = json.stringify(msg)
+  let ser: string = json.stringify(msg)
   print("  " + ser)
   print("")
 
@@ -49,8 +49,8 @@ task main()
   -- [6] 闭包 + 管道
   print("[6] closures + pipeline")
   let words: list = ["hello", "world", "mora", "v10"]
-  let lengths = words.map(fn(s) s.len() end)
-  let total = lengths.reduce(fn(a, b) a + b end, 0)
+  let lengths: list = words.map(fn(s: string) s.len() end)
+  let total: number = lengths.reduce(fn(a: number, b: number) a + b end, 0)
   print("  total chars: " + total)
   print("")
 

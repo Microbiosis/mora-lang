@@ -1,0 +1,27 @@
+{
+  "extensions": ["mora"],
+  "scope": "source.mora",
+  "hidden_from_command_palette": false,
+  "context_menu": {
+    "format": "Mora: Format",
+    "hover": "Mora: Hover docs"
+  },
+  "lsp_servers": [
+    {
+      "command": ["mora-lsp"],
+      "languages": ["mora"],
+      "schemes": ["file", "buffer"]
+    }
+  ],
+  "syntax": {
+    "mora": {
+      "extends": "Packages/Default/Plain Text.tmLanguage",
+      "patterns": [
+        { "name": "comment.line.double-dash.mora", "match": "--.*$" },
+        { "name": "string.quoted.double.mora", "match": "\"(?:\\\\.|[^\"\\\\])*\"" },
+        { "name": "constant.numeric.mora", "match": "-?\\d+(\\.\\d+)?" },
+        { "name": "keyword.control.mora", "match": "\\b(let|task|fn|if|then|end|for|in|try|catch|return|parallel|match|with|import|export|save|load|read|write|append|true|false|nil)\\b" }
+      ]
+    }
+  }
+}

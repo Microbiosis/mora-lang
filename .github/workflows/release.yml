@@ -1,0 +1,140 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            artifact: mora
+            ext: ''
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            artifact: mora
+            ext: ''
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            artifact: mora
+            ext: ''
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            artifact: mora
+            ext: ''
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            artifact: mora
+            ext: '.exe'
+
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo registry & target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Install musl toolchain
+        if: contains(matrix.target, 'musl')
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+        shell: bash
+
+      - name: Build mora CLI
+        run: cargo build --release --target ${{ matrix.target }} --bin mora
+        shell: bash
+
+      - name: Build mora-lsp
+        run: cargo build --release --target ${{ matrix.target }} --bin mora-lsp
+        shell: bash
+
+      - name: Package mora
+        shell: bash
+        run: |
+          mkdir -p artifacts
+          cp target/${{ matrix.target }}/release/mora${{ matrix.ext }} artifacts/
+          cp target/${{ matrix.target }}/release/mora-lsp${{ matrix.ext }} artifacts/
+          cd artifacts
+          if [[ "${{ matrix.ext }}" == ".exe" ]]; then
+            7z a ../mora-${{ matrix.target }}.zip mora.exe mora-lsp.exe
+          else
+            tar czf ../mora-${{ matrix.target }}.tar.gz mora mora-lsp
+          fi
+
+      - name: Upload mora CLI artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mora-${{ matrix.target }}
+          path: mora-${{ matrix.target }}.*
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: Create checksums
+        id: checksums
+        shell: bash
+        run: |
+          cd dist
+          CHECKSUMS=$(find . -type f \( -name '*.tar.gz' -o -name '*.zip' \) -exec sha256sum {} \;)
+          echo "$CHECKSUMS"
+          EOF=$(dd if=/dev/urandom bs=15 count=1 status=none | base64)
+          echo "sha256sums<<$EOF" >> "$GITHUB_OUTPUT"
+          echo "$CHECKSUMS" >> "$GITHUB_OUTPUT"
+          echo "$EOF" >> "$GITHUB_OUTPUT"
+
+      - name: Collect release files
+        shell: bash
+        run: |
+          mkdir -p release
+          find dist -type f \( -name '*.tar.gz' -o -name '*.zip' \) -exec cp {} release/ \;
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release/*
+          body: |
+            Mora v${{ github.ref_name }} binaries
+
+            See [README](https://github.com/Microbiosis/mora-lang#readme) for installation and usage.
+
+            ## SHA-256 Checksums
+            ```
+            ${{ steps.checksums.outputs.sha256sums }}
+            ```
+          draft: false
+          prerelease: false
+          generate_release_notes: true

@@ -1,0 +1,81 @@
+{
+  "name": "mora",
+  "scopeName": "source.mora",
+  "fileTypes": ["mora"],
+  "patterns": [
+    { "include": "#comments" },
+    { "include": "#strings" },
+    { "include": "#numbers" },
+    { "include": "#keywords" },
+    { "include": "#builtin-types" },
+    { "include": "#builtin-modules" },
+    { "include": "#task-call" },
+    { "include": "#method-call" },
+    { "include": "#identifiers" }
+  ],
+  "repository": {
+    "comments": {
+      "patterns": [
+        {
+          "name": "comment.line.double-dash.mora",
+          "match": "--.*$"
+        }
+      ]
+    },
+    "strings": {
+      "name": "string.quoted.double.mora",
+      "begin": "\"",
+      "end": "\"",
+      "patterns": [
+        {
+          "name": "constant.character.escape.mora",
+          "match": "\\\\."
+        }
+      ]
+    },
+    "numbers": {
+      "patterns": [
+        {
+          "name": "constant.numeric.mora",
+          "match": "-?\\d+(\\.\\d+)?"
+        }
+      ]
+    },
+    "keywords": {
+      "patterns": [
+        {
+          "name": "keyword.control.mora",
+          "match": "\\b(let|task|fn|if|then|end|for|in|while|do|try|catch|return|parallel|match|with|import|export|save|load|read|write|append|read_bytes|write_bytes|into|true|false|nil)\\b"
+        }
+      ]
+    },
+    "builtin-types": {
+      "patterns": [
+        {
+          "name": "entity.name.type.mora",
+          "match": "\\b(string|number|bool|list|dict|task|closure|conversation)\\b"
+        }
+      ]
+    },
+    "builtin-modules": {
+      "patterns": [
+        {
+          "name": "support.module.mora",
+          "match": "\\b(ai|web|json|file)\\b"
+        }
+      ]
+    },
+    "task-call": {
+      "name": "entity.name.function.mora",
+      "match": "\\b([a-z_][a-zA-Z0-9_]*)\\s*\\("
+    },
+    "method-call": {
+      "name": "support.function.mora",
+      "match": "\\.([a-z_][a-zA-Z0-9_]*)\\b"
+    },
+    "identifiers": {
+      "name": "variable.other.mora",
+      "match": "\\b[a-z_][a-zA-Z0-9_]*\\b"
+    }
+  }
+}

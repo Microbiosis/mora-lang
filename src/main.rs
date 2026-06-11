@@ -1,7 +1,4 @@
-mod ast;
-mod interpreter;
-mod lexer;
-mod parser;
+// mod ast; mod interpreter; ... 现在由 src/lib.rs 暴露
 
 use std::env;
 use std::fs;
@@ -9,9 +6,10 @@ use std::io::{self, Write};
 use std::process;
 use std::path::Path;
 
-use interpreter::Interpreter;
-use lexer::Lexer;
-use parser::Parser;
+use mora::interpreter::{FlowSignal, Interpreter};
+use mora::lexer::Lexer;
+use mora::parser::Parser;
+use mora::typeck;
 
 fn main() {
     let args: Vec<String> = env::args().collect();
@@ -146,6 +144,22 @@ fn run_file(path: &str) {
     let mut parser = Parser::new(tokens);
     let stmts = parser.parse();
 
+    // v11: 静态类型检查（默认启用；MORA_NO_TYPECK=1 可禁用）
+    if env::var("MORA_NO_TYPECK").is_err() {
+        let type_errors = typeck::check_program(&stmts);
+        if !type_errors.is_empty() {
+            for err in &type_errors {
+                if err.line > 0 {
+                    eprintln!("Type error at line {}: {}", err.line, err.message);
+                } else {
+                    eprintln!("Type error: {}", err.message);
+                }
+            }
+            eprintln!("\n{} type error(s) found.", type_errors.len());
+            process::exit(1);
+        }
+    }
+
     let mut interpreter = Interpreter::new();
     if let Err(e) = interpreter.interpret(&stmts) {
         eprintln!("Runtime error: {}", e);
@@ -189,8 +203,8 @@ fn run_repl() {
 
         for stmt in &stmts {
             match interpreter.execute(stmt) {
-                Ok(Some(value)) => println!("= {}", value),
-                Ok(None) => {}
+                Ok(FlowSignal::Return(value)) => println!("= {}", value),
+                Ok(FlowSignal::None) => {}
                 Err(e) => eprintln!("Error: {}", e),
             }
         }

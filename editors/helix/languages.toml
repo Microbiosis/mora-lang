@@ -1,0 +1,20 @@
+# 追加到 ~/.config/helix/languages.toml
+[[language]]
+name = "mora"
+scope = "source.mora"
+file-types = ["mora"]
+comment-token = "--"
+auto-format = true
+
+# LSP server
+[language.lsp]
+command = "mora-lsp"
+args = []
+
+# 缩进配置
+indent = { tab-width = 2, unit = "  " }
+
+# 高亮关键词（Helix 内置 regex 查询）
+[[grammar]]
+name = "mora"
+source = { path = "grammars/mora.wasm" }   # 占位：Mora 无现成 tree-sitter grammar

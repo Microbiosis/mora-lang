@@ -1,4 +1,4 @@
-import "examples/tools"
+import "examples/lib/tools"
 
 task main()
   let text = web.fetch("https://example.com")

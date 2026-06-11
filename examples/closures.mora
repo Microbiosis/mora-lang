@@ -1,0 +1,35 @@
+let numbers: list = [1, 2, 3, 4, 5]
+
+-- 闭包：匿名函数
+task main()
+  -- map: 每个元素乘以 2
+  let doubled: list = numbers.map(fn(x: number) x * 2 end)
+  print("Doubled: " + doubled)
+
+  -- filter: 保留大于 2 的
+  let filtered: list = numbers.filter(fn(x: number) x > 2 end)
+  print("Filtered: " + filtered)
+
+  -- reduce: 求和
+  let sum: number = numbers.reduce(fn(acc: number, x: number) acc + x end, 0)
+  print("Sum: " + sum)
+
+  -- 闭包捕获外部变量
+  let multiplier: number = 3
+  let tripled: list = numbers.map(fn(x: number) x * multiplier end)
+  print("Tripled: " + tripled)
+
+  -- 管道 + 闭包
+  let result: number = numbers
+    |> filter(fn(x: number) x > 2 end)
+    |> map(fn(x: number) x * 10 end)
+    |> reduce(fn(a: number, b: number) a + b end, 0)
+  print("Pipeline result: " + result)
+
+  -- 闭包作为变量
+  let is_even: closure = fn(x: number) x % 2 == 0 end
+  let evens: list = numbers.filter(is_even)
+  print("Evens: " + evens)
+
+  print("Done")
+end

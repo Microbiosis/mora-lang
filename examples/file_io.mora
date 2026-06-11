@@ -1,0 +1,115 @@
+-- ============================================================
+-- v11: file.* 模块 + 顶层 read/write/append/read_bytes/write_bytes 语法糖
+-- ============================================================
+--
+-- 演示范围：
+--   1. file.* 内建模块：文本 IO、二进制 IO、目录、路径
+--   2. 顶层语法糖：read/write/append/read_bytes/write_bytes
+--   3. try/catch 错误处理
+--   4. save/load（基于 file.* 重构后行为等价）
+
+import "examples/lib/tools"
+
+task main()
+  -- ---------- 路径辅助 ----------
+  let workdir = file.cwd()
+  print("[cwd] " + workdir)
+
+  let joined = file.join("examples", "tmp", "hello.txt")
+  print("[join] " + joined)
+
+  let abs_path = file.abs(joined)
+  print("[abs]  " + abs_path)
+
+  print("[base] " + file.basename(joined))   -- hello.txt
+  print("[dir]  " + file.dirname(joined))    -- examples/tmp
+  print("[ext]  " + file.extname(joined))    -- .txt
+
+  -- ---------- 目录准备 ----------
+  let tmp_dir = file.join("examples", "tmp")
+  if file.exists(tmp_dir) == false then
+    file.mkdir_all(tmp_dir)
+  end
+  if file.is_dir(tmp_dir) == false then
+    print("[error] tmp dir creation failed")
+    return
+  end
+
+  -- ---------- 文本 IO: file.* 模块形式 ----------
+  let hello_path = file.join(tmp_dir, "hello.txt")
+  file.write_text(hello_path, "Hello, Mora!\n")
+  file.append_text(hello_path, "第二行：中文测试\n")
+  file.append_text(hello_path, "third line\n")
+
+  let content = file.read_text(hello_path)
+  print("[read_text] " + content.replace("\n", " | "))
+
+  print("[size] " + file.size(hello_path))   -- 字节数
+  print("[is_file] " + file.is_file(hello_path))
+
+  -- ---------- 文本 IO: 顶层语法糖 ----------
+  let via_top = file.join(tmp_dir, "via_top.txt")
+  write via_top, "通过顶层 write 写入\n"
+  append via_top, "通过顶层 append 追加\n"
+  read via_top into top_content
+  print("[top] " + top_content.replace("\n", " | "))
+
+  -- ---------- 二进制 IO: file.* 模块形式 ----------
+  let bin_path = file.join(tmp_dir, "data.bin")
+  -- "Mora" 的 UTF-8 字节：4d 6f 72 61
+  file.write_bytes(bin_path, "4d6f7261")
+  let hex = file.read_bytes(bin_path)
+  print("[bin hex] " + hex + " (expect 4d6f7261)")
+
+  -- ---------- 二进制 IO: 顶层语法糖 ----------
+  let bin_top = file.join(tmp_dir, "data_top.bin")
+  write_bytes bin_top, "0011223344ff"
+  read_bytes bin_top into top_hex
+  print("[bin top] " + top_hex)
+
+  -- ---------- 元信息 + 重命名 ----------
+  let original = file.join(tmp_dir, "data.bin")
+  let renamed = file.join(tmp_dir, "data_renamed.bin")
+  if file.exists(renamed) then
+    file.remove(renamed)
+  end
+  file.rename(original, renamed)
+  print("[exists original] " + file.exists(original))   -- false
+  print("[exists renamed]  " + file.exists(renamed))    -- true
+
+  -- ---------- touch：创建空文件 / 存在则 no-op ----------
+  let touched = file.join(tmp_dir, "touched.txt")
+  file.touch(touched)
+  print("[touched size] " + file.size(touched))   -- 0
+  print("[touched is_file] " + file.is_file(touched))
+
+  -- ---------- list + 清理 ----------
+  let items = file.list(tmp_dir)
+  print("[list] " + items)
+  print("[count] " + items.len())
+
+  -- save/load 行为对照（v9 持久化）
+  let json_path = file.join(tmp_dir, "config.json")
+  save json_path, {name: "mora", version: 11, features: ["file", "io"]}
+  load json_path, cfg
+  print("[load] name=" + cfg.get("name") + ", version=" + cfg.get("version"))
+
+  -- ---------- 错误处理演示 ----------
+  try
+    let missing = file.join(tmp_dir, "not_exist.txt")
+    read missing into data
+    print("[should not reach] " + data)
+  catch err
+    print("[caught] " + err)
+  end
+
+  -- ---------- 清理 ----------
+  file.remove(hello_path)
+  file.remove(via_top)
+  file.remove(bin_top)
+  file.remove(renamed)
+  file.remove(touched)
+  file.remove(json_path)
+  file.remove(tmp_dir)
+  print("[cleanup] done")
+end

@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    name: Test (ubuntu-latest, stable)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+        continue-on-error: true
+
+      - name: cargo build --release
+        run: cargo build --release
+
+      - name: cargo test
+        run: cargo test --lib
+
+      - name: LSP end-to-end smoke
+        run: |
+          cargo build --release --example lsp_smoke
+          ./target/release/examples/lsp_smoke ./target/release/mora-lsp

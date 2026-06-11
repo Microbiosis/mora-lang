@@ -8,6 +8,18 @@ license = "BSD-3-Clause"
 keywords = ["scripting", "ai", "workflow", "lua-style", "embedded"]
 categories = ["development-tools", "parser-implementations"]
 
+[lib]
+name = "mora"
+path = "src/lib.rs"
+
+[[bin]]
+name = "mora"
+path = "src/main.rs"
+
+[[bin]]
+name = "mora-lsp"
+path = "src/bin/lsp.rs"
+
 [dependencies]
 # v10 首次外部依赖：ureq 同步 HTTP 客户端
 # 选择 ureq 而非 reqwest 的理由：ureq 同步阻塞，与同步解释器天然契合

@@ -1,0 +1,29 @@
+-- ============================================================
+-- v11: typeck 错误演示
+-- ============================================================
+-- 运行：mora examples/typeck_demo.mora
+-- 预期：typeck 会一次性报告所有错误并退出（非 0）
+--
+-- 也可设 MORA_NO_TYPECK=1 跳过 typeck，让脚本继续运行（演示动态行为）
+
+task main(): number
+  -- 错误 1：let 类型不匹配（number vs string）
+  let x: number = "hello"
+
+  -- 错误 2：task 参数类型不匹配
+  task bad_arg(n: number)
+    return n
+  end
+  let _ = bad_arg("not a number")
+
+  -- 错误 3：return 类型不匹配（声明 number，return string）
+  return "wrong type"
+
+  -- 错误 4：binary 操作符无效（bool + number）
+  let _ = true + 1
+
+  -- 错误 5：for-in 不可迭代
+  for x in 42 do
+    let _ = x
+  end
+end

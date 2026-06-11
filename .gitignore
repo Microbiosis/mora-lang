@@ -3,3 +3,4 @@
 *.exe
 *.tmp
 *.tmp.*
+.worktrees/

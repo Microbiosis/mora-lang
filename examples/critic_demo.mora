@@ -1,0 +1,35 @@
+-- ========================================
+-- agent.critic 输出质量评估演示
+-- ========================================
+
+print("=== 质量评估（无上下文） ===")
+let r1 = agent.critic("Mora 是一门轻量级 Lua 风格的 AI 原生脚本语言，支持流式输出、工具调用、长期记忆、多模型路由、Agent 编排和 Token 预算。")
+print("分数: " + r1.get("score"))
+print("判定: " + r1.get("verdict"))
+print("问题: " + r1.get("issues"))
+print("建议: " + r1.get("suggestion"))
+
+print("")
+print("=== 质量评估（短文本） ===")
+let r2 = agent.critic("好")
+print("分数: " + r2.get("score"))
+print("判定: " + r2.get("verdict"))
+print("问题: " + r2.get("issues"))
+
+print("")
+print("=== 幻觉检测（有上下文） ===")
+let context = "Mora 语言于 2026 年发布，使用 Rust 编写，支持 AI 工作流脚本。"
+let answer_good = "Mora 是 2026 年发布的 Rust 语言实现的 AI 脚本语言。"
+let answer_bad = "Mora 是 2020 年由 Google 发布的 Python 框架，用于机器学习。"
+
+let r3 = agent.critic(answer_good, context)
+print("回答: " + answer_good)
+print("分数: " + r3.get("score"))
+print("判定: " + r3.get("verdict"))
+
+print("")
+let r4 = agent.critic(answer_bad, context)
+print("回答: " + answer_bad)
+print("分数: " + r4.get("score"))
+print("判定: " + r4.get("verdict"))
+print("问题: " + r4.get("issues"))

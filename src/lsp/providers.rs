@@ -298,7 +298,7 @@ pub fn completion(docs: &HashMap<String, DocumentState>, params: &Value) -> Valu
     }
 
     // 4. 内置对象 / builtin 方法
-    for builtin in ["ai", "web", "json", "file"] {
+    for builtin in ["ai", "web", "json", "file", "memory", "agent"] {
         if seen.insert(builtin.to_string()) {
             let mut m = BTreeMap::new();
             m.insert("label".to_string(), Value::String_(builtin.to_string()));

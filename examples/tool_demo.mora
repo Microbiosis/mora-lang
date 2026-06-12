@@ -1,0 +1,29 @@
+-- ========================================
+-- ai.tool 工具调用演示
+-- ========================================
+-- 无 API Key 时自动走 mock 模式
+
+-- 1. 注册工具
+let corpus = ["AI入门指南", "机器学习基础", "深度学习实战", "烹饪教程", "Python编程"]
+
+ai.tool("search", "搜索知识库", "{\"type\":\"object\",\"properties\":{\"query\":{\"type\":\"string\"}}}", fn(args)
+  print("  [search] 搜索知识库")
+  return "搜索结果: " + corpus.get(0) + ", " + corpus.get(1)
+end)
+
+ai.tool("calculate", "数学计算", "{\"type\":\"object\",\"properties\":{\"expression\":{\"type\":\"string\"}}}", fn(args)
+  print("  [calculate] 执行计算")
+  return "计算结果: 42"
+end)
+
+-- 2. 调用对话（mock 模式自动调用工具）
+print("=== 注册了工具后的 ai.chat ===")
+print("（有 API Key 时，AI 会自动决定调用哪个工具）")
+print("（无 API Key 时，mock 模式调用第一个注册工具）")
+print("")
+let result = ai.chat("帮我搜索机器学习相关文档")
+print("返回: " + result)
+
+print("")
+print("=== 演示完成 ===")
+print("注册的工具数: " + len(["search", "calculate"]))

@@ -14,7 +14,26 @@ use mora::typeck;
 fn main() {
     let args: Vec<String> = env::args().collect();
 
-    // v10: 启动横幅（在 REPL/文件模式前显示）
+    // --version / --help 不显示 banner
+    if args.len() >= 2 {
+        match args[1].as_str() {
+            "--version" | "-v" => { println!("Mora v0.03"); return; }
+            "--help" | "-h" => {
+                println!("Mora v0.03 — AI native scripting language");
+                println!();
+                println!("Usage:");
+                println!("  mora <file.mora>        Run a script");
+                println!("  mora --repl             Interactive REPL");
+                println!("  mora --check <file>     Type check only");
+                println!("  mora --version          Show version");
+                println!("  mora --help             Show this help");
+                return;
+            }
+            _ => {}
+        }
+    }
+
+    // 启动横幅
     print_banner();
 
     if args.len() < 2 {
@@ -24,6 +43,13 @@ fn main() {
 
     match args[1].as_str() {
         "--repl" => run_repl(),
+        "--check" => {
+            if args.len() < 3 {
+                eprintln!("Usage: mora --check <file.mora>");
+                process::exit(1);
+            }
+            run_check(&args[2]);
+        }
         "install" => {
             if args.len() < 3 {
                 eprintln!("Usage: mora install <url>");
@@ -110,15 +136,14 @@ fn print_banner() {
     let model = env::var("MORA_AI_MODEL").unwrap_or_else(|_| "gpt-4o-mini".to_string());
     let base_url = env::var("MORA_AI_BASE_URL").unwrap_or_else(|_| "https://api.openai.com/v1".to_string());
 
-    println!("Mora v0.01 — AI workflow scripting (real HTTP + real AI)");
+    println!("Mora v0.03 — AI native scripting language");
     if has_openai_key {
-        println!("  ai.chat / ai.create: real API (model: {}, endpoint: {})", model, base_url);
+        println!("  AI: real API (model: {}, endpoint: {})", model, base_url);
     } else {
-        println!("  ai.chat: mock mode (set OPENAI_API_KEY for real calls)");
-        println!("  ai.create: unavailable (requires OPENAI_API_KEY)");
+        println!("  AI: mock mode (set OPENAI_API_KEY for real calls)");
     }
-    println!("  web.fetch: real HTTP via ureq");
-    println!("  json.parse / json.stringify: real JSON processing");
+    println!("  Features: ai.stream / ai.tool / memory.* / ai.route / agent.* / ai.budget");
+    println!("  Built-in: web.fetch / json.* / file.* / typeck / mora-lsp");
     println!();
 }
 
@@ -167,8 +192,33 @@ fn run_file(path: &str) {
     }
 }
 
+fn run_check(path: &str) {
+    let source = fs::read_to_string(path).expect("Failed to read file");
+
+    let mut lexer = Lexer::new(&source);
+    let tokens = lexer.scan_tokens();
+
+    let mut parser = Parser::new(tokens);
+    let stmts = parser.parse();
+
+    let type_errors = typeck::check_program(&stmts);
+    if type_errors.is_empty() {
+        println!("No type errors found. ({} statements)", stmts.len());
+    } else {
+        for err in &type_errors {
+            if err.line > 0 {
+                eprintln!("Type error at line {}: {}", err.line, err.message);
+            } else {
+                eprintln!("Type error: {}", err.message);
+            }
+        }
+        eprintln!("\n{} type error(s) found.", type_errors.len());
+        process::exit(1);
+    }
+}
+
 fn run_repl() {
-    println!("Mora v0.01 REPL — type 'exit' to quit");
+    println!("Mora v0.03 REPL — type 'exit' to quit");
     println!();
 
     let mut interpreter = Interpreter::new();

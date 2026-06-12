@@ -1,0 +1,28 @@
+-- ========================================
+-- ai.route 多模型路由演示
+-- ========================================
+
+-- 1. 定义路由
+ai.route({
+  "fast": "gpt-4o-mini",
+  "deep": "gpt-4o",
+  "code": "gpt-4o"
+})
+
+-- 2. 使用路由
+print("=== 多模型路由 ===")
+print("（无 API Key 时走 mock 模式）")
+print("")
+
+let r1 = ai.chat("你好", "fast")
+print("[fast] " + r1)
+
+let r2 = ai.chat("分析 Raft 和 Paxos 的区别", "deep")
+print("[deep] " + r2)
+
+let r3 = ai.chat("写一个快速排序", "code")
+print("[code] " + r3)
+
+-- 3. 不指定路由时用默认模型
+let r4 = ai.chat("默认模型回复")
+print("[default] " + r4)

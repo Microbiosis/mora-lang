@@ -2,16 +2,37 @@ use std::sync::{Arc, Mutex};
 use std::collections::HashMap;
 use std::env;
 use std::fs;
+use std::io::{BufRead, BufReader, Read};
 use std::time::Duration;
 
 use crate::ast::*;
 use crate::lexer::Lexer;
 use crate::parser::Parser;
 
+/// 包装 BufReader<Box<dyn Read + Send + Sync>>，实现 Debug/Clone
+#[derive(Clone)]
+pub struct StreamReader(Arc<Mutex<BufReader<Box<dyn Read + Send + Sync>>>>);
+
+impl StreamReader {
+    pub fn new(reader: BufReader<Box<dyn Read + Send + Sync>>) -> Self {
+        StreamReader(Arc::new(Mutex::new(reader)))
+    }
+    pub fn lock(&self) -> std::sync::MutexGuard<'_, BufReader<Box<dyn Read + Send + Sync>>> {
+        self.0.lock().unwrap()
+    }
+}
+
+impl std::fmt::Debug for StreamReader {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "StreamReader")
+    }
+}
+
 // v10 HTTP 超时配置
 const HTTP_READ_TIMEOUT_SECS: u64 = 30;
 const HTTP_WRITE_TIMEOUT_SECS: u64 = 10;
 const AI_READ_TIMEOUT_SECS: u64 = 60;
+const AI_STREAM_TIMEOUT_SECS: u64 = 300; // 流式输出需要更长超时
 
 #[derive(Debug, Clone)]
 pub enum Value {
@@ -38,6 +59,19 @@ pub enum Value {
         model: String,
         base_url: String,
         api_key: String,
+    },
+    // v0.03: 流式输出
+    Stream {
+        reader: StreamReader,
+        done: Arc<Mutex<bool>>,
+    },
+    // v0.03: Agent 编排
+    Agent {
+        name: String,
+        tool_names: Vec<String>,
+        model_route: String,
+        max_steps: usize,
+        system: String,
     },
 }
 
@@ -79,6 +113,8 @@ impl std::fmt::Display for Value {
             Value::Conversation { model, messages, .. } => {
                 write!(f, "<conversation {} ({} messages)>", model, messages.len())
             }
+            Value::Stream { .. } => write!(f, "<stream>"),
+            Value::Agent { name, .. } => write!(f, "<agent {}>", name),
         }
     }
 }
@@ -131,6 +167,68 @@ impl Environment {
 pub struct Interpreter {
     globals: Arc<Mutex<Environment>>,
     environment: Arc<Mutex<Environment>>,
+    tool_registry: HashMap<String, ToolDef>,
+    memory_store: Vec<MemoryEntry>,
+    model_routes: HashMap<String, RouteConfig>,
+    token_budget: Option<TokenBudget>,
+    token_usage: TokenUsage,
+}
+
+/// Token 预算配置
+#[derive(Clone)]
+struct TokenBudget {
+    total: usize,
+    per_call: Option<usize>,
+    alert_threshold: f64,  // 0.0-1.0，超过此比例时告警
+}
+
+/// Token 消耗统计
+#[derive(Clone, Default)]
+struct TokenUsage {
+    input: usize,
+    output: usize,
+}
+
+/// 模型路由配置
+#[derive(Clone)]
+struct RouteConfig {
+    model: String,
+    base_url: String,
+    api_key: String,
+    max_tokens: Option<usize>,
+    system: Option<String>,
+}
+
+/// 记忆条目
+#[derive(Clone)]
+struct MemoryEntry {
+    key: String,
+    text: String,
+    embedding: Vec<f64>,
+}
+
+/// 工具定义（注册时存储）
+#[derive(Clone)]
+struct ToolDef {
+    name: String,
+    description: String,
+    parameters: String,  // JSON Schema 字符串
+    handler: Value,      // Closure
+}
+
+/// 结构化聊天消息（用于支持 tool_calls）
+enum ChatMessage {
+    User { content: String },
+    Assistant { content: Option<String>, tool_calls: Vec<ToolCall> },
+    Tool { tool_call_id: String, content: String },
+}
+
+/// 工具调用信息
+#[derive(Clone)]
+struct ToolCall {
+    id: String,
+    name: String,
+    arguments: String,  // JSON 字符串
 }
 
 impl Interpreter {
@@ -139,12 +237,12 @@ impl Interpreter {
         globals.lock().unwrap().define("print".to_string(), Value::Builtin("print".to_string()), false);
         globals.lock().unwrap().define("range".to_string(), Value::Builtin("range".to_string()), false);
         globals.lock().unwrap().define("len".to_string(), Value::Builtin("len".to_string()), false);
-        Self { globals: globals.clone(), environment: globals }
+        Self { globals: globals.clone(), environment: globals, tool_registry: HashMap::new(), memory_store: Vec::new(), model_routes: HashMap::new(), token_budget: None, token_usage: TokenUsage::default() }
     }
 
     pub fn new_with_globals(globals: Arc<Mutex<Environment>>) -> Self {
         let env = Arc::new(Mutex::new(Environment::with_parent(globals.clone())));
-        Self { globals: globals.clone(), environment: env }
+        Self { globals: globals.clone(), environment: env, tool_registry: HashMap::new(), memory_store: Vec::new(), model_routes: HashMap::new(), token_budget: None, token_usage: TokenUsage::default() }
     }
 
     #[allow(dead_code)]
@@ -240,6 +338,38 @@ impl Interpreter {
                             env.lock().unwrap().define(var.clone(), Value::String(ch.to_string()), false);
                             let signal = self.execute_block(body, env)?;
                             if signal.is_return() { return Ok(signal); }
+                        }
+                        Ok(FlowSignal::None)
+                    }
+                    Value::Stream { reader, done } => {
+                        loop {
+                            let token = {
+                                let mut guard = reader.lock();
+                                if *done.lock().unwrap() {
+                                    None
+                                } else {
+                                    match Self::read_next_sse_token(&mut *guard) {
+                                        Ok(Some(t)) => Some(t),
+                                        Ok(None) => {
+                                            *done.lock().unwrap() = true;
+                                            None
+                                        }
+                                        Err(e) => {
+                                            *done.lock().unwrap() = true;
+                                            return Err(format!("ai.stream: {}", e));
+                                        }
+                                    }
+                                }
+                            };
+                            match token {
+                                Some(tok) => {
+                                    let env = Arc::new(Mutex::new(Environment::with_parent(self.environment.clone())));
+                                    env.lock().unwrap().define(var.clone(), Value::String(tok), false);
+                                    let signal = self.execute_block(body, env)?;
+                                    if signal.is_return() { return Ok(signal); }
+                                }
+                                None => break,
+                            }
                         }
                         Ok(FlowSignal::None)
                     }
@@ -833,18 +963,51 @@ impl Interpreter {
             Value::Builtin(name) => match (name.as_str(), method) {
                 ("ai", "chat") => {
                     let prompt = args.get(0).map(|v| v.to_string()).unwrap_or_default();
-                    // v10: 单轮无状态调用（向后兼容），支持环境变量配置
-                    match env::var("OPENAI_API_KEY") {
-                        Ok(key) if !key.is_empty() => {
-                            let model = env::var("MORA_AI_MODEL").unwrap_or_else(|_| "gpt-4o-mini".to_string());
-                            let base_url = env::var("MORA_AI_BASE_URL").unwrap_or_else(|_| "https://api.openai.com/v1".to_string());
-                            let msgs = vec![("user".to_string(), prompt)];
-                            self.real_ai_chat(&msgs, &key, &model, &base_url)
+                    // 检查是否有路由参数
+                    let route_name = args.get(1).and_then(|v| match v {
+                        Value::String(s) => Some(s.clone()),
+                        _ => None,
+                    });
+                    let route = route_name.as_ref().and_then(|n| self.model_routes.get(n));
+                    // 确定使用的模型和 API 配置
+                    let default_key = env::var("OPENAI_API_KEY").unwrap_or_default();
+                    let (api_key, model, base_url) = if let Some(r) = route {
+                        let key = if r.api_key.is_empty() { default_key.clone() } else { r.api_key.clone() };
+                        (key, r.model.clone(), r.base_url.clone())
+                    } else {
+                        let model = env::var("MORA_AI_MODEL").unwrap_or_else(|_| "gpt-4o-mini".to_string());
+                        let base_url = env::var("MORA_AI_BASE_URL").unwrap_or_else(|_| "https://api.openai.com/v1".to_string());
+                        (default_key, model, base_url)
+                    };
+                    if api_key.is_empty() {
+                        // Mock 模式
+                        if !self.tool_registry.is_empty() {
+                            let mock_result = self.mock_tool_call(&prompt);
+                            if let Some(result) = mock_result {
+                                return Ok(Value::String(result));
+                            }
                         }
-                        _ => {
-                            eprintln!("[ai.chat mock — set OPENAI_API_KEY for real call] {}", prompt);
-                            Ok(Value::String(format!("[Mock response for: {}]", prompt)))
+                        eprintln!("[ai.chat mock — set OPENAI_API_KEY for real call] {}", prompt);
+                        return Ok(Value::String(format!("[Mock response for: {}]", prompt)));
+                    }
+                    // 构建消息（如果有 system prompt 则前置）
+                    let mut messages: Vec<ChatMessage> = Vec::new();
+                    if let Some(r) = route {
+                        if let Some(ref sys) = r.system {
+                            messages.push(ChatMessage::User { content: sys.clone() });
                         }
+                    }
+                    if self.tool_registry.is_empty() {
+                        let plain_msgs: Vec<(String, String)> = messages.iter().map(|m| match m {
+                            ChatMessage::User { content } => ("user".to_string(), content.clone()),
+                            _ => ("user".to_string(), String::new()),
+                        }).chain(std::iter::once(("user".to_string(), prompt))).collect();
+                        self.real_ai_chat(&plain_msgs, &api_key, &model, &base_url)
+                    } else {
+                        messages.push(ChatMessage::User { content: prompt });
+                        let tools: Vec<ToolDef> = self.tool_registry.values().cloned().collect();
+                        let tool_refs: Vec<&ToolDef> = tools.iter().collect();
+                        self.real_ai_chat_with_tools(&mut messages, &api_key, &model, &base_url, &tool_refs)
                     }
                 }
                 ("ai", "create") => {
@@ -880,6 +1043,47 @@ impl Interpreter {
                     Ok(Value::String(value_to_json(&value)))
                 }
                 ("file", method) => self.call_file_method(method, &args),
+                ("memory", method) => self.call_memory_method(method, &args),
+                ("agent", "create") => {
+                    // agent.create("name", {tools: [...], model: "deep", max_steps: 10, system: "..."})
+                    let name = match args.get(0) {
+                        Some(Value::String(s)) => s.clone(),
+                        _ => return Err("agent.create: first arg must be a string (agent name)".to_string()),
+                    };
+                    let config = match args.get(1) {
+                        Some(Value::Dict(d)) => d.clone(),
+                        _ => return Err("agent.create: second arg must be a dict (config)".to_string()),
+                    };
+                    let tool_names = match config.get("tools") {
+                        Some(Value::List(items)) => {
+                            items.iter().map(|v| v.to_string()).collect()
+                        }
+                        _ => vec![],
+                    };
+                    let model_route = match config.get("model") {
+                        Some(Value::String(s)) => s.clone(),
+                        _ => "default".to_string(),
+                    };
+                    let max_steps = match config.get("max_steps") {
+                        Some(Value::Number(n)) => *n as usize,
+                        _ => 10,
+                    };
+                    let system = match config.get("system") {
+                        Some(Value::String(s)) => s.clone(),
+                        _ => "You are a helpful assistant. Use the available tools to complete the task.".to_string(),
+                    };
+                    Ok(Value::Agent { name, tool_names, model_route, max_steps, system })
+                }
+                ("agent", "critic") => {
+                    // agent.critic(answer) — 评估输出质量
+                    // agent.critic(answer, context) — 检查是否基于上下文（幻觉检测）
+                    let answer = match args.get(0) {
+                        Some(v) => v.to_string(),
+                        _ => return Err("agent.critic: first arg must be the text to evaluate".to_string()),
+                    };
+                    let context = args.get(1).map(|v| v.to_string());
+                    self.run_critic(&answer, context.as_deref())
+                }
                 _ => Err(format!("Unknown method: {}.{}", name, method)),
             },
             Value::Conversation { ref mut messages, ref model, ref base_url, ref api_key } => {
@@ -948,7 +1152,55 @@ impl Interpreter {
                     _ => Err(format!("String has no method: {}", method)),
                 }
             }
-            _ => Err(format!("Can only call methods on lists, dicts, strings, conversations, or builtin objects")),
+            Value::Stream { ref reader, ref done } => {
+                match method {
+                    "collect" => {
+                        let mut result = String::new();
+                        if !*done.lock().unwrap() {
+                            let mut guard = reader.lock();
+                            loop {
+                                match Self::read_next_sse_token(&mut *guard) {
+                                    Ok(Some(token)) => result.push_str(&token),
+                                    Ok(None) => {
+                                        *done.lock().unwrap() = true;
+                                        break;
+                                    }
+                                    Err(e) => {
+                                        *done.lock().unwrap() = true;
+                                        return Err(format!("ai.stream.collect: {}", e));
+                                    }
+                                }
+                            }
+                        }
+                        Ok(Value::String(result))
+                    }
+                    "is_done" => {
+                        Ok(Value::Bool(*done.lock().unwrap()))
+                    }
+                    _ => Err(format!("Stream has no method: {}", method)),
+                }
+            }
+            Value::Agent { ref name, ref tool_names, ref model_route, max_steps, ref system } => {
+                match method {
+                    "run" => {
+                        let task = args.get(0).map(|v| v.to_string()).unwrap_or_default();
+                        if task.is_empty() {
+                            return Err("agent.run: first arg must be a string (task)".to_string());
+                        }
+                        // 克隆需要的数据（避免借用冲突）
+                        let agent_name = name.clone();
+                        let agent_tools = tool_names.clone();
+                        let agent_route = model_route.clone();
+                        let agent_max = max_steps;
+                        let agent_system = system.clone();
+                        self.run_agent(&agent_name, &agent_tools, &agent_route, agent_max, &agent_system, &task)
+                    }
+                    "name" => Ok(Value::String(name.clone())),
+                    "max_steps" => Ok(Value::Number(max_steps as f64)),
+                    _ => Err(format!("Agent has no method: {}", method)),
+                }
+            }
+            _ => Err(format!("Can only call methods on lists, dicts, strings, conversations, streams, agents, or builtin objects")),
         }
     }
 
@@ -1211,9 +1463,113 @@ impl Interpreter {
     }
 
     // ===================================================================
+    // v0.03: memory.* — 长期记忆（向量存储 + 语义检索）
+    // ===================================================================
+    fn call_memory_method(&mut self, method: &str, args: &[Value]) -> Result<Value, String> {
+        match method {
+            "store" => {
+                // memory.store(key, text) — 存储记忆
+                let key = match args.get(0) {
+                    Some(Value::String(s)) => s.clone(),
+                    _ => return Err("memory.store: first arg must be a string (key)".to_string()),
+                };
+                let text = match args.get(1) {
+                    Some(Value::String(s)) => s.clone(),
+                    _ => return Err("memory.store: second arg must be a string (text)".to_string()),
+                };
+                // 生成 embedding（有 API key 用真实嵌入，否则 mock）
+                let embedding = self.get_embedding(&text)?;
+                // 如果 key 已存在则更新
+                if let Some(entry) = self.memory_store.iter_mut().find(|e| e.key == key) {
+                    entry.text = text;
+                    entry.embedding = embedding;
+                } else {
+                    self.memory_store.push(MemoryEntry { key, text, embedding });
+                }
+                Ok(Value::Nil)
+            }
+            "recall" => {
+                // memory.recall(query, k?) — 语义检索 top-k
+                let query = match args.get(0) {
+                    Some(Value::String(s)) => s.clone(),
+                    _ => return Err("memory.recall: first arg must be a string (query)".to_string()),
+                };
+                let k = match args.get(1) {
+                    Some(Value::Number(n)) if *n > 0.0 => *n as usize,
+                    _ => 3,
+                };
+                if self.memory_store.is_empty() {
+                    return Ok(Value::List(vec![]));
+                }
+                let query_emb = self.get_embedding(&query)?;
+                // 计算每个条目的余弦相似度
+                let mut scored: Vec<(usize, f64)> = self.memory_store.iter().enumerate()
+                    .filter_map(|(i, entry)| {
+                        cosine_similarity(&query_emb, &entry.embedding).ok().map(|s| (i, s))
+                    })
+                    .collect();
+                scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                let results: Vec<Value> = scored.iter().take(k)
+                    .map(|(i, score)| {
+                        let entry = &self.memory_store[*i];
+                        let mut m = HashMap::new();
+                        m.insert("key".to_string(), Value::String(entry.key.clone()));
+                        m.insert("text".to_string(), Value::String(entry.text.clone()));
+                        m.insert("score".to_string(), Value::Number(*score));
+                        Value::Dict(m)
+                    })
+                    .collect();
+                Ok(Value::List(results))
+            }
+            "forget" => {
+                // memory.forget(key) — 删除指定记忆
+                let key = match args.get(0) {
+                    Some(Value::String(s)) => s.clone(),
+                    _ => return Err("memory.forget: first arg must be a string (key)".to_string()),
+                };
+                self.memory_store.retain(|e| e.key != key);
+                Ok(Value::Nil)
+            }
+            "clear" => {
+                // memory.clear() — 清空所有记忆
+                self.memory_store.clear();
+                Ok(Value::Nil)
+            }
+            "list" => {
+                // memory.list() — 列出所有记忆的 key
+                let keys: Vec<Value> = self.memory_store.iter()
+                    .map(|e| Value::String(e.key.clone()))
+                    .collect();
+                Ok(Value::List(keys))
+            }
+            "len" => {
+                Ok(Value::Number(self.memory_store.len() as f64))
+            }
+            _ => Err(format!("memory.{}: unknown method", method)),
+        }
+    }
+
+    /// 获取文本的 embedding（有 API key 用真实嵌入，否则 mock）
+    fn get_embedding(&self, text: &str) -> Result<Vec<f64>, String> {
+        let has_key = env::var("OPENAI_API_KEY").map(|k| !k.is_empty()).unwrap_or(false);
+        if has_key {
+            let api_key = env::var("OPENAI_API_KEY").unwrap();
+            let model = env::var("MORA_EMBED_MODEL")
+                .unwrap_or_else(|_| "text-embedding-3-small".to_string());
+            let base_url = env::var("MORA_AI_BASE_URL")
+                .unwrap_or_else(|_| "https://api.openai.com/v1".to_string());
+            let result = real_ai_embed_strings(&[text.to_string()], &api_key, &model, &base_url, None)?;
+            // result 是 List<Number>（单条）
+            value_list_to_f64(&result, "memory.embed")
+        } else {
+            Ok(mock_bow_embedding(text))
+        }
+    }
+
+    // ===================================================================
     // v11: ai.* — 向量嵌入、相似度、语义检索
     // ===================================================================
-    fn call_ai_method(&self, method: &str, args: &[Value]) -> Result<Value, String> {
+    fn call_ai_method(&mut self, method: &str, args: &[Value]) -> Result<Value, String> {
         match method {
             "embed" => {
                 // ai.embed(text | list_of_text, dim?) -> List<Number> | List<List<Number>>
@@ -1277,6 +1633,135 @@ impl Interpreter {
                 // ai.search(query, corpus, k) -> List<{text, score, index}>
                 // MVP：同步现场 embedding + cosine 排序。无 API key 时使用 mock 词袋兜底。
                 self.ai_search_mvp(args)
+            }
+            "stream" => {
+                let prompt = args.get(0).map(|v| v.to_string()).unwrap_or_default();
+                if prompt.is_empty() {
+                    return Err("ai.stream: prompt cannot be empty".to_string());
+                }
+                match env::var("OPENAI_API_KEY") {
+                    Ok(key) if !key.is_empty() => {
+                        let model = env::var("MORA_AI_MODEL")
+                            .unwrap_or_else(|_| "gpt-4o-mini".to_string());
+                        let base_url = env::var("MORA_AI_BASE_URL")
+                            .unwrap_or_else(|_| "https://api.openai.com/v1".to_string());
+                        let msgs = vec![("user".to_string(), prompt)];
+                        self.create_ai_stream(&msgs, &key, &model, &base_url)
+                    }
+                    _ => {
+                        eprintln!("[ai.stream mock — set OPENAI_API_KEY for real streaming]");
+                        Ok(Self::create_mock_stream(&prompt))
+                    }
+                }
+            }
+            "tool" => {
+                // ai.tool(name, description, parameters_dict, handler_closure)
+                let name = match args.get(0) {
+                    Some(Value::String(s)) => s.clone(),
+                    _ => return Err("ai.tool: first arg must be a string (tool name)".to_string()),
+                };
+                let description = match args.get(1) {
+                    Some(Value::String(s)) => s.clone(),
+                    _ => return Err("ai.tool: second arg must be a string (description)".to_string()),
+                };
+                let parameters = match args.get(2) {
+                    Some(Value::Dict(_)) => value_to_json(args.get(2).unwrap()),
+                    Some(Value::String(s)) => s.clone(),
+                    _ => return Err("ai.tool: third arg must be a dict or JSON string (parameters schema)".to_string()),
+                };
+                let handler = match args.get(3) {
+                    Some(Value::Closure { .. }) | Some(Value::Task { .. }) => args.get(3).unwrap().clone(),
+                    _ => return Err("ai.tool: fourth arg must be a closure or task (handler)".to_string()),
+                };
+                self.tool_registry.insert(name.clone(), ToolDef {
+                    name: name.clone(),
+                    description,
+                    parameters,
+                    handler,
+                });
+                Ok(Value::Nil)
+            }
+            "route" => {
+                // ai.route({"fast": "gpt-4o-mini", "deep": "gpt-4o"})
+                // 或 ai.route({"fast": {model: "gpt-4o-mini", max_tokens: 256}})
+                let config = match args.get(0) {
+                    Some(Value::Dict(d)) => d,
+                    _ => return Err("ai.route: first arg must be a dict".to_string()),
+                };
+                let api_key = env::var("OPENAI_API_KEY").unwrap_or_default();
+                let base_url = env::var("MORA_AI_BASE_URL")
+                    .unwrap_or_else(|_| "https://api.openai.com/v1".to_string());
+                for (name, val) in config {
+                    let route = match val {
+                        Value::String(model) => RouteConfig {
+                            model: model.clone(),
+                            base_url: base_url.clone(),
+                            api_key: api_key.clone(),
+                            max_tokens: None,
+                            system: None,
+                        },
+                        Value::Dict(m) => {
+                            let model = match m.get("model") {
+                                Some(Value::String(s)) => s.clone(),
+                                _ => return Err(format!("ai.route '{}': 'model' field required", name)),
+                            };
+                            let r_base = match m.get("base_url") {
+                                Some(Value::String(s)) => s.clone(),
+                                _ => base_url.clone(),
+                            };
+                            let r_key = match m.get("api_key") {
+                                Some(Value::String(s)) => s.clone(),
+                                _ => api_key.clone(),
+                            };
+                            let max_tokens = match m.get("max_tokens") {
+                                Some(Value::Number(n)) => Some(*n as usize),
+                                _ => None,
+                            };
+                            let system = match m.get("system") {
+                                Some(Value::String(s)) => Some(s.clone()),
+                                _ => None,
+                            };
+                            RouteConfig { model, base_url: r_base, api_key: r_key, max_tokens, system }
+                        }
+                        _ => return Err(format!("ai.route '{}': value must be a string or dict", name)),
+                    };
+                    self.model_routes.insert(name.clone(), route);
+                }
+                Ok(Value::Nil)
+            }
+            "budget" => {
+                // ai.budget({total: 100000, per_call: 4096, alert: 0.8})
+                let config = match args.get(0) {
+                    Some(Value::Dict(d)) => d,
+                    _ => return Err("ai.budget: first arg must be a dict".to_string()),
+                };
+                let total = match config.get("total") {
+                    Some(Value::Number(n)) => *n as usize,
+                    _ => return Err("ai.budget: 'total' field required (number)".to_string()),
+                };
+                let per_call = match config.get("per_call") {
+                    Some(Value::Number(n)) if *n > 0.0 => Some(*n as usize),
+                    _ => None,
+                };
+                let alert_threshold = match config.get("alert") {
+                    Some(Value::Number(n)) => *n,
+                    _ => 0.8,
+                };
+                self.token_budget = Some(TokenBudget { total, per_call, alert_threshold });
+                Ok(Value::Nil)
+            }
+            "usage" => {
+                // ai.usage() -> {input, output, total, remaining}
+                let total_used = self.token_usage.input + self.token_usage.output;
+                let remaining = self.token_budget.as_ref()
+                    .map(|b| b.total.saturating_sub(total_used))
+                    .unwrap_or(usize::MAX);
+                let mut m = HashMap::new();
+                m.insert("input".to_string(), Value::Number(self.token_usage.input as f64));
+                m.insert("output".to_string(), Value::Number(self.token_usage.output as f64));
+                m.insert("total".to_string(), Value::Number(total_used as f64));
+                m.insert("remaining".to_string(), Value::Number(remaining as f64));
+                Ok(Value::Dict(m))
             }
             _ => Err(format!("ai.{}: unknown method", method)),
         }
@@ -1425,7 +1910,7 @@ impl Interpreter {
     /// - **手写 JSON 请求体**：保持零 serde 依赖原则
     /// - **结构化 JSON 响应解析**：用 json_to_value 提取 choices[0].message.content
     /// - **同步阻塞**：60s 读超时（AI 推理可能慢）
-    fn real_ai_chat(&self, messages: &[(String, String)], api_key: &str, model: &str, base_url: &str) -> Result<Value, String> {
+    fn real_ai_chat(&mut self, messages: &[(String, String)], api_key: &str, model: &str, base_url: &str) -> Result<Value, String> {
         if messages.is_empty() {
             return Err("ai.chat: messages cannot be empty".to_string());
         }
@@ -1467,6 +1952,9 @@ impl Interpreter {
         {
             Ok(response) => match response.into_string() {
                 Ok(text) => {
+                    // 追踪 token 消耗
+                    let (input, output) = Self::extract_usage(&text);
+                    let _ = self.track_tokens(input, output); // 预算超限不阻断，只告警
                     // 结构化 JSON 解析：提取 choices[0].message.content
                     self.extract_ai_content(&text)
                         .or_else(|_| Ok(Value::String(text)))
@@ -1486,6 +1974,241 @@ impl Interpreter {
                 url, t
             )),
         }
+    }
+
+    /// 带工具调用的 AI 对话（支持 tool_calls 自动循环）
+    fn real_ai_chat_with_tools(&mut self, messages: &mut Vec<ChatMessage>, api_key: &str, model: &str, base_url: &str, tools: &[&ToolDef]) -> Result<Value, String> {
+        let max_rounds = 10;
+        for _round in 0..max_rounds {
+            // 构建 messages JSON
+            let msgs_json = Self::build_chat_messages_json(messages);
+
+            // 构建 tools JSON
+            let tools_json = if tools.is_empty() {
+                String::new()
+            } else {
+                let tool_entries: Vec<String> = tools.iter().map(|t| {
+                    format!(
+                        r#"{{"type":"function","function":{{"name":"{}","description":"{}","parameters":{}}}}}"#,
+                        t.name.replace('\\', "\\\\").replace('"', "\\\""),
+                        t.description.replace('\\', "\\\\").replace('"', "\\\""),
+                        t.parameters
+                    )
+                }).collect();
+                format!(r#","tools":[{}]"#, tool_entries.join(","))
+            };
+
+            let escaped_model = model.replace('\\', "\\\\").replace('"', "\\\"");
+            let body = format!(
+                r#"{{"model":"{}","messages":[{}]{}"#,
+                escaped_model, msgs_json, tools_json
+            );
+            // 闭合 JSON（tools_json 已带前导逗号）
+            let body = if tools_json.is_empty() {
+                format!("{}}}", body)
+            } else {
+                format!("{}}}", body)
+            };
+
+            let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
+            let agent = ureq::AgentBuilder::new()
+                .timeout_read(Duration::from_secs(AI_READ_TIMEOUT_SECS))
+                .timeout_write(Duration::from_secs(HTTP_WRITE_TIMEOUT_SECS))
+                .build();
+
+            let response_text = match agent.post(&url)
+                .set("Authorization", &format!("Bearer {}", api_key))
+                .set("Content-Type", "application/json")
+                .send_string(&body)
+            {
+                Ok(response) => response.into_string()
+                    .map_err(|e| format!("ai.chat: failed to read response body: {}", e))?,
+                Err(ureq::Error::Status(status, response)) => {
+                    let body = response.into_string().unwrap_or_default();
+                    let excerpt: String = body.chars().take(300).collect();
+                    return Err(format!("ai.chat: API error HTTP {} from {} (body: {})", status, url, excerpt));
+                }
+                Err(ureq::Error::Transport(t)) => {
+                    return Err(format!("ai.chat: network error connecting to {}: {}", url, t));
+                }
+            };
+
+            // 解析响应
+            let (input, output) = Self::extract_usage(&response_text);
+            let _ = self.track_tokens(input, output);
+            let (content, tool_calls) = Self::extract_chat_response(&response_text)?;
+
+            if tool_calls.is_empty() {
+                // 无工具调用，返回最终内容
+                return Ok(Value::String(content.unwrap_or_default()));
+            }
+
+            // 有工具调用：追加 assistant 消息，执行工具，追加 tool 结果
+            messages.push(ChatMessage::Assistant {
+                content: content.clone(),
+                tool_calls: tool_calls.clone(),
+            });
+
+            for tc in &tool_calls {
+                // 查找 handler
+                let handler = tools.iter().find(|t| t.name == tc.name).map(|t| &t.handler);
+                let result = if let Some(handler_val) = handler {
+                    // 构造参数 Dict 传给闭包
+                    let args_dict = if let Ok(params_val) = json_to_value(&tc.arguments) {
+                        params_val
+                    } else {
+                        Value::String(tc.arguments.clone())
+                    };
+                    match self.call_value(handler_val, vec![args_dict]) {
+                        Ok(val) => val.to_string(),
+                        Err(e) => format!("Error: {}", e),
+                    }
+                } else {
+                    format!("Error: tool '{}' not found", tc.name)
+                };
+                messages.push(ChatMessage::Tool {
+                    tool_call_id: tc.id.clone(),
+                    content: result,
+                });
+            }
+        }
+        Err("ai.chat: max tool call rounds exceeded".to_string())
+    }
+
+    /// 构建 ChatMessage 列表的 JSON 字符串
+    fn build_chat_messages_json(messages: &[ChatMessage]) -> String {
+        let parts: Vec<String> = messages.iter().map(|msg| {
+            match msg {
+                ChatMessage::User { content } => {
+                    let esc = content.replace('\\', "\\\\").replace('"', "\\\"")
+                        .replace('\n', "\\n").replace('\r', "\\r").replace('\t', "\\t");
+                    format!(r#"{{"role":"user","content":"{}"}}"#, esc)
+                }
+                ChatMessage::Assistant { content, tool_calls } => {
+                    let mut parts = vec![r#""role":"assistant""#.to_string()];
+                    match content {
+                        Some(c) => {
+                            let esc = c.replace('\\', "\\\\").replace('"', "\\\"")
+                                .replace('\n', "\\n").replace('\r', "\\r").replace('\t', "\\t");
+                            parts.push(format!(r#""content":"{}""#, esc));
+                        }
+                        None => parts.push(r#""content":null"#.to_string()),
+                    }
+                    if !tool_calls.is_empty() {
+                        let tc_json: Vec<String> = tool_calls.iter().map(|tc| {
+                            format!(
+                                r#"{{"id":"{}","type":"function","function":{{"name":"{}","arguments":"{}"}}}}"#,
+                                tc.id.replace('\\', "\\\\").replace('"', "\\\""),
+                                tc.name.replace('\\', "\\\\").replace('"', "\\\""),
+                                tc.arguments.replace('\\', "\\\\").replace('"', "\\\"")
+                            )
+                        }).collect();
+                        parts.push(format!(r#""tool_calls":[{}]"#, tc_json.join(",")));
+                    }
+                    format!("{{{}}}", parts.join(","))
+                }
+                ChatMessage::Tool { tool_call_id, content } => {
+                    let esc_id = tool_call_id.replace('\\', "\\\\").replace('"', "\\\"");
+                    let esc_content = content.replace('\\', "\\\\").replace('"', "\\\"")
+                        .replace('\n', "\\n").replace('\r', "\\r").replace('\t', "\\t");
+                    format!(r#"{{"role":"tool","tool_call_id":"{}","content":"{}"}}"#, esc_id, esc_content)
+                }
+            }
+        }).collect();
+        parts.join(",")
+    }
+
+    /// 从 API 响应中提取 content 和 tool_calls
+    fn extract_chat_response(json_text: &str) -> Result<(Option<String>, Vec<ToolCall>), String> {
+        let root = json_to_value(json_text)?;
+        if let Value::Dict(ref map) = root {
+            if let Some(Value::List(choices)) = map.get("choices") {
+                if let Some(first) = choices.first() {
+                    if let Value::Dict(ref choice_map) = first {
+                        if let Some(Value::Dict(ref msg_map)) = choice_map.get("message") {
+                            // 提取 content
+                            let content = match msg_map.get("content") {
+                                Some(Value::String(s)) => Some(s.clone()),
+                                _ => None,
+                            };
+                            // 提取 tool_calls
+                            let mut tool_calls = Vec::new();
+                            if let Some(Value::List(tc_list)) = msg_map.get("tool_calls") {
+                                for tc_val in tc_list {
+                                    if let Value::Dict(tc_map) = tc_val {
+                                        let id = match tc_map.get("id") {
+                                            Some(Value::String(s)) => s.clone(),
+                                            _ => format!("call_{}", tool_calls.len()),
+                                        };
+                                        if let Some(Value::Dict(func_map)) = tc_map.get("function") {
+                                            let name = match func_map.get("name") {
+                                                Some(Value::String(s)) => s.clone(),
+                                                _ => continue,
+                                            };
+                                            let arguments = match func_map.get("arguments") {
+                                                Some(Value::String(s)) => s.clone(),
+                                                _ => "{}".to_string(),
+                                            };
+                                            tool_calls.push(ToolCall { id, name, arguments });
+                                        }
+                                    }
+                                }
+                            }
+                            return Ok((content, tool_calls));
+                        }
+                    }
+                }
+            }
+        }
+        Err("Could not parse chat response".to_string())
+    }
+
+    /// 从 API 响应中提取 usage（prompt_tokens, completion_tokens）
+    fn extract_usage(json_text: &str) -> (usize, usize) {
+        if let Ok(root) = json_to_value(json_text) {
+            if let Value::Dict(ref map) = root {
+                if let Some(Value::Dict(ref usage)) = map.get("usage") {
+                    let input = match usage.get("prompt_tokens") {
+                        Some(Value::Number(n)) => *n as usize,
+                        _ => 0,
+                    };
+                    let output = match usage.get("completion_tokens") {
+                        Some(Value::Number(n)) => *n as usize,
+                        _ => 0,
+                    };
+                    return (input, output);
+                }
+            }
+        }
+        (0, 0)
+    }
+
+    /// 记录 token 消耗并检查预算
+    fn track_tokens(&mut self, input: usize, output: usize) -> Result<(), String> {
+        self.token_usage.input += input;
+        self.token_usage.output += output;
+        let total_used = self.token_usage.input + self.token_usage.output;
+        if let Some(ref budget) = self.token_budget {
+            if total_used > budget.total {
+                return Err(format!("Token budget exceeded: used {}/{}", total_used, budget.total));
+            }
+            let ratio = total_used as f64 / budget.total as f64;
+            if ratio >= budget.alert_threshold {
+                eprintln!("[ai.budget warning] Token usage at {:.0}% ({}/{})", ratio * 100.0, total_used, budget.total);
+            }
+        }
+        Ok(())
+    }
+
+    /// 检查预算是否已耗尽
+    fn check_budget(&self) -> Result<(), String> {
+        if let Some(ref budget) = self.token_budget {
+            let total_used = self.token_usage.input + self.token_usage.output;
+            if total_used >= budget.total {
+                return Err(format!("Token budget exhausted: {}/{}", total_used, budget.total));
+            }
+        }
+        Ok(())
     }
 
     /// 从 OpenAI 兼容 API 响应中提取 choices[0].message.content
@@ -1517,6 +2240,330 @@ impl Interpreter {
         }
 
         Err("Could not extract content from API response".to_string())
+    }
+
+    // ===================================================================
+    // v0.03: 流式输出 (ai.stream)
+    // ===================================================================
+
+    /// 从 SSE 流中读取下一个 token
+    /// 返回 Ok(Some(token)) — 有新 token
+    /// 返回 Ok(None) — 流结束 [DONE]
+    /// 返回 Err — 解析错误
+    fn read_next_sse_token(reader: &mut BufReader<Box<dyn Read + Send + Sync>>) -> Result<Option<String>, String> {
+        loop {
+            let mut line = String::new();
+            match reader.read_line(&mut line) {
+                Ok(0) => return Ok(None), // EOF
+                Ok(_) => {
+                    let trimmed = line.trim();
+                    if trimmed.is_empty() { continue; }
+                    if let Some(data) = trimmed.strip_prefix("data: ") {
+                        let data = data.trim();
+                        if data == "[DONE]" { return Ok(None); }
+                        // 解析 JSON，提取 choices[0].delta.content
+                        if let Ok(root) = json_to_value(data) {
+                            if let Value::Dict(ref map) = root {
+                                if let Some(Value::List(choices)) = map.get("choices") {
+                                    if let Some(first) = choices.first() {
+                                        if let Value::Dict(ref choice_map) = first {
+                                            if let Some(Value::Dict(ref delta)) = choice_map.get("delta") {
+                                                if let Some(Value::String(content)) = delta.get("content") {
+                                                    if !content.is_empty() {
+                                                        return Ok(Some(content.clone()));
+                                                    }
+                                                }
+                                            }
+                                            // finish_reason 字段出现但无 content，跳过
+                                            if choice_map.contains_key("finish_reason") {
+                                                continue;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        // JSON 解析失败或无 content，跳过此行
+                    }
+                    // 非 data: 开头的行（event:, id:, retry:），跳过
+                }
+                Err(e) => return Err(format!("SSE read error: {}", e)),
+            }
+        }
+    }
+
+    /// 创建真实 HTTP 流式连接
+    fn create_ai_stream(&self, messages: &[(String, String)], api_key: &str, model: &str, base_url: &str) -> Result<Value, String> {
+        let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
+
+        // 构建 JSON body（与 real_ai_chat 相同，加 stream:true）
+        let msgs_json: String = messages.iter().map(|(role, content)| {
+            let escaped_content = content
+                .replace('\\', "\\\\")
+                .replace('"', "\\\"")
+                .replace('\n', "\\n")
+                .replace('\r', "\\r")
+                .replace('\t', "\\t");
+            format!(r#"{{"role":"{}","content":"{}"}}"#, role, escaped_content)
+        }).collect::<Vec<_>>().join(",");
+
+        let escaped_model = model.replace('\\', "\\\\").replace('"', "\\\"");
+        let body = format!(
+            r#"{{"model":"{}","messages":[{}],"stream":true}}"#,
+            escaped_model, msgs_json
+        );
+
+        let agent = ureq::AgentBuilder::new()
+            .timeout_read(Duration::from_secs(AI_STREAM_TIMEOUT_SECS))
+            .timeout_write(Duration::from_secs(HTTP_WRITE_TIMEOUT_SECS))
+            .build();
+
+        match agent.post(&url)
+            .set("Authorization", &format!("Bearer {}", api_key))
+            .set("Content-Type", "application/json")
+            .send_string(&body)
+        {
+            Ok(response) => {
+                let reader = response.into_reader(); // Box<dyn Read + Send>
+                let buf_reader = BufReader::new(reader);
+                Ok(Value::Stream {
+                    reader: StreamReader::new(buf_reader),
+                    done: Arc::new(Mutex::new(false)),
+                })
+            }
+            Err(ureq::Error::Status(status, response)) => {
+                let body = response.into_string().unwrap_or_default();
+                let excerpt: String = body.chars().take(300).collect();
+                Err(format!("ai.stream: API error HTTP {} from {} (body: {})", status, url, excerpt))
+            }
+            Err(ureq::Error::Transport(t)) => {
+                Err(format!("ai.stream: network error connecting to {}: {}", url, t))
+            }
+        }
+    }
+
+    /// 执行输出质量评估（agent.critic）
+    fn run_critic(&mut self, answer: &str, context: Option<&str>) -> Result<Value, String> {
+        let critic_prompt = if let Some(ctx) = context {
+            // 有上下文：检查幻觉（回答是否基于上下文）
+            format!(
+                r#"Evaluate if the answer is grounded in the given context. Check for hallucinations (claims not supported by context).
+
+Context:
+{}
+
+Answer:
+{}
+
+Respond in this exact format (one line per field):
+score: <1-10>
+verdict: <supported|partial|hallucinated>
+issues: <comma-separated issues or "none">
+suggestion: <improvement suggestion or "none">"#,
+                ctx, answer
+            )
+        } else {
+            // 无上下文：评估输出质量
+            format!(
+                r#"Evaluate the quality of this AI-generated text. Check for: clarity, coherence, relevance, factual accuracy.
+
+Text:
+{}
+
+Respond in this exact format (one line per field):
+score: <1-10>
+verdict: <good|acceptable|poor>
+issues: <comma-separated issues or "none">
+suggestion: <improvement suggestion or "none">"#,
+                answer
+            )
+        };
+
+        // 用 ai.chat 调用评估（走 fast 路由或默认模型）
+        let has_key = env::var("OPENAI_API_KEY").map(|k| !k.is_empty()).unwrap_or(false);
+        if has_key {
+            let api_key = env::var("OPENAI_API_KEY").unwrap();
+            let model = env::var("MORA_AI_MODEL").unwrap_or_else(|_| "gpt-4o-mini".to_string());
+            let base_url = env::var("MORA_AI_BASE_URL").unwrap_or_else(|_| "https://api.openai.com/v1".to_string());
+            let msgs = vec![("user".to_string(), critic_prompt)];
+            match self.real_ai_chat(&msgs, &api_key, &model, &base_url) {
+                Ok(Value::String(response)) => Ok(self.parse_critic_response(&response, context.is_some())),
+                Ok(other) => Ok(other),
+                Err(e) => Err(format!("agent.critic: {}", e)),
+            }
+        } else {
+            // Mock 模式：基于简单启发式评估
+            Ok(self.mock_critic(answer, context))
+        }
+    }
+
+    /// 解析 critic 响应为结构化 Dict
+    fn parse_critic_response(&self, response: &str, has_context: bool) -> Value {
+        let mut m = HashMap::new();
+        let mut score = 5.0;
+        let mut verdict = "unknown".to_string();
+        let mut issues = "none".to_string();
+        let mut suggestion = "none".to_string();
+
+        for line in response.lines() {
+            let line = line.trim();
+            if let Some(val) = line.strip_prefix("score:") {
+                if let Ok(n) = val.trim().parse::<f64>() { score = n; }
+            } else if let Some(val) = line.strip_prefix("verdict:") {
+                verdict = val.trim().to_string();
+            } else if let Some(val) = line.strip_prefix("issues:") {
+                issues = val.trim().to_string();
+            } else if let Some(val) = line.strip_prefix("suggestion:") {
+                suggestion = val.trim().to_string();
+            }
+        }
+
+        m.insert("score".to_string(), Value::Number(score));
+        m.insert("verdict".to_string(), Value::String(verdict));
+        m.insert("issues".to_string(), Value::String(issues));
+        m.insert("suggestion".to_string(), Value::String(suggestion));
+        if has_context {
+            m.insert("hallucination_check".to_string(), Value::Bool(true));
+        }
+        Value::Dict(m)
+    }
+
+    /// Mock critic：基于简单启发式
+    fn mock_critic(&self, answer: &str, context: Option<&str>) -> Value {
+        let mut m = HashMap::new();
+        let len = answer.len();
+        let score = if len < 10 { 3.0 } else if len < 50 { 6.0 } else { 8.0 };
+
+        let (verdict, issues) = if let Some(ctx) = context {
+            // 简单检查：回答中的词是否在上下文中出现
+            let ctx_lower = ctx.to_lowercase();
+            let answer_words: Vec<&str> = answer.split_whitespace().collect();
+            let matched = answer_words.iter()
+                .filter(|w| ctx_lower.contains(&w.to_lowercase()))
+                .count();
+            let ratio = if answer_words.is_empty() { 0.0 } else { matched as f64 / answer_words.len() as f64 };
+            if ratio > 0.5 {
+                ("supported".to_string(), "none".to_string())
+            } else if ratio > 0.2 {
+                ("partial".to_string(), "some claims may not be grounded in context".to_string())
+            } else {
+                ("hallucinated".to_string(), "most claims not found in context".to_string())
+            }
+        } else {
+            if score >= 7.0 {
+                ("good".to_string(), "none".to_string())
+            } else if score >= 5.0 {
+                ("acceptable".to_string(), "could be more detailed".to_string())
+            } else {
+                ("poor".to_string(), "too short, lacks detail".to_string())
+            }
+        };
+
+        m.insert("score".to_string(), Value::Number(score));
+        m.insert("verdict".to_string(), Value::String(verdict));
+        m.insert("issues".to_string(), Value::String(issues));
+        m.insert("suggestion".to_string(), Value::String("set OPENAI_API_KEY for real evaluation".to_string()));
+        if context.is_some() {
+            m.insert("hallucination_check".to_string(), Value::Bool(true));
+        }
+        Value::Dict(m)
+    }
+
+    /// 执行 Agent 多步推理循环
+    fn run_agent(&mut self, agent_name: &str, tool_names: &[String], model_route: &str, max_steps: usize, system: &str, task: &str) -> Result<Value, String> {
+        // 收集 Agent 需要的工具
+        let agent_tools: Vec<ToolDef> = tool_names.iter()
+            .filter_map(|n| self.tool_registry.get(n).cloned())
+            .collect();
+        let tool_refs: Vec<&ToolDef> = agent_tools.iter().collect();
+
+        // 确定 API 配置
+        let route = self.model_routes.get(model_route);
+        let default_key = env::var("OPENAI_API_KEY").unwrap_or_default();
+        let (api_key, model, base_url) = if let Some(r) = route {
+            let key = if r.api_key.is_empty() { default_key.clone() } else { r.api_key.clone() };
+            (key, r.model.clone(), r.base_url.clone())
+        } else {
+            let model = env::var("MORA_AI_MODEL").unwrap_or_else(|_| "gpt-4o-mini".to_string());
+            let base_url = env::var("MORA_AI_BASE_URL").unwrap_or_else(|_| "https://api.openai.com/v1".to_string());
+            (default_key, model, base_url)
+        };
+
+        // Mock 模式：直接执行第一个工具并返回结果
+        if api_key.is_empty() {
+            eprintln!("[agent '{}' mock — set OPENAI_API_KEY for real agent loop]", agent_name);
+            if let Some(first_tool) = agent_tools.first() {
+                let args_dict = Value::Dict(HashMap::new());
+                let tool_result = match self.call_value(&first_tool.handler, vec![args_dict]) {
+                    Ok(val) => val.to_string(),
+                    Err(e) => format!("Tool error: {}", e),
+                };
+                return Ok(Value::String(format!("[Agent '{}'] Task: {}\nTool '{}' result: {}", agent_name, task, first_tool.name, tool_result)));
+            }
+            return Ok(Value::String(format!("[Agent '{}'] Task: {} (no tools, mock response)", agent_name, task)));
+        }
+
+        // 构建初始消息
+        let mut messages: Vec<ChatMessage> = Vec::new();
+        messages.push(ChatMessage::User {
+            content: format!("{}\n\nTask: {}", system, task),
+        });
+
+        // 多步推理循环
+        for step in 0..max_steps {
+            eprintln!("[agent '{}' step {}/{}]", agent_name, step + 1, max_steps);
+            match self.real_ai_chat_with_tools(&mut messages, &api_key, &model, &base_url, &tool_refs) {
+                Ok(result) => return Ok(result),
+                Err(e) => {
+                    // real_ai_chat_with_tools 只在 max tool rounds exceeded 时返回 Err
+                    // 其他情况下 Ok 就是最终结果
+                    return Err(format!("agent.run error at step {}: {}", step + 1, e));
+                }
+            }
+        }
+        Err(format!("agent '{}': max steps ({}) exceeded", agent_name, max_steps))
+    }
+
+    /// Mock 工具调用（无 API Key 时，调用第一个注册的工具）
+    fn mock_tool_call(&mut self, _prompt: &str) -> Option<String> {
+        // 取第一个注册工具的 handler（clone 避免借用冲突）
+        let found = self.tool_registry.values().next()
+            .map(|tool| (tool.name.clone(), tool.handler.clone()));
+        if let Some((name, handler)) = found {
+            eprintln!("[ai.tool mock — calling tool '{}']", name);
+            let args_dict = Value::Dict(HashMap::new());
+            match self.call_value(&handler, vec![args_dict]) {
+                Ok(val) => return Some(val.to_string()),
+                Err(e) => return Some(format!("[Tool '{}' error: {}]", name, e)),
+            }
+        }
+        None
+    }
+
+    /// 创建 mock 流（无 API Key 时使用）
+    fn create_mock_stream(prompt: &str) -> Value {
+        let mock_text = format!("[Mock stream for: {}]", prompt);
+        let mut sse_data = String::new();
+        for ch in mock_text.chars() {
+            let escaped = match ch {
+                '\\' => "\\\\".to_string(),
+                '"' => "\\\"".to_string(),
+                '\n' => "\\n".to_string(),
+                _ => ch.to_string(),
+            };
+            sse_data.push_str(&format!(
+                "data: {{\"choices\":[{{\"delta\":{{\"content\":\"{}\"}}}}]}}\n\n",
+                escaped
+            ));
+        }
+        sse_data.push_str("data: [DONE]\n\n");
+
+        let cursor = std::io::Cursor::new(sse_data.into_bytes());
+        let reader: Box<dyn Read + Send + Sync> = Box::new(cursor);
+        Value::Stream {
+            reader: StreamReader::new(BufReader::new(reader)),
+            done: Arc::new(Mutex::new(false)),
+        }
     }
 
     // ===================================================================
@@ -1794,7 +2841,7 @@ fn is_truthy(value: &Value) -> bool {
 }
 
 fn is_builtin_object(name: &str) -> bool {
-    matches!(name, "ai" | "web" | "json" | "file")
+    matches!(name, "ai" | "web" | "json" | "file" | "memory" | "agent")
 }
 
 /// v11: 顶层 read/write 等语句使用的字符串参数提取助手
@@ -1937,6 +2984,8 @@ fn check_type(value: &Value, hint: &str) -> bool {
         (Value::Dict(_), "dict") => true,
         (Value::Task{..}, "task") => true,
         (Value::Conversation{..}, "conversation") => true,
+        (Value::Stream{..}, "stream") => true,
+        (Value::Agent{..}, "agent") => true,
         _ => false,
     }
 }
@@ -1953,6 +3002,8 @@ fn type_name(value: &Value) -> &'static str {
         Value::Closure{..} => "closure",
         Value::Builtin(_) => "builtin",
         Value::Conversation{..} => "conversation",
+        Value::Stream{..} => "stream",
+        Value::Agent{..} => "agent",
     }
 }
 
@@ -1984,6 +3035,8 @@ fn value_to_json(value: &Value) -> String {
         Value::Closure { .. } => "null".to_string(),
         Value::Builtin(_) => "null".to_string(),
         Value::Conversation { .. } => "null".to_string(),
+        Value::Stream { .. } => "null".to_string(),
+        Value::Agent { .. } => "null".to_string(),
     }
 }
 

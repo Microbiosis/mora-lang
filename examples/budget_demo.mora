@@ -1,0 +1,29 @@
+-- ========================================
+-- ai.budget / ai.usage Token 预算演示
+-- ========================================
+
+-- 1. 设置预算
+ai.budget({total: 100000, per_call: 4096, alert: 0.8})
+
+-- 2. 查看初始状态
+print("=== Token 预算 ===")
+let u1 = ai.usage()
+print("输入: " + u1.get("input"))
+print("输出: " + u1.get("output"))
+print("总计: " + u1.get("total"))
+print("剩余: " + u1.get("remaining"))
+
+-- 3. 模拟一次 AI 调用（mock 模式不消耗真实 token）
+print("")
+print("=== 模拟调用 ===")
+let r = ai.chat("你好")
+print("回复: " + r)
+
+-- 4. 查看调用后状态（mock 模式 usage 为 0）
+print("")
+print("=== 调用后 ===")
+let u2 = ai.usage()
+print("输入: " + u2.get("input"))
+print("输出: " + u2.get("output"))
+print("总计: " + u2.get("total"))
+print("剩余: " + u2.get("remaining"))

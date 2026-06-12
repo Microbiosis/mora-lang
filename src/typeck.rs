@@ -42,6 +42,7 @@ pub enum Type {
     Task,
     Closure,
     Conversation,
+    Stream,
     Builtin,
     /// 推断不出或用户未标注时的退路——不做严格检查
     Any,
@@ -59,6 +60,7 @@ impl Type {
             Type::Task => "task",
             Type::Closure => "closure",
             Type::Conversation => "conversation",
+            Type::Stream => "stream",
             Type::Builtin => "builtin",
             Type::Any => "any",
         }
@@ -76,6 +78,7 @@ impl Type {
             "task" => Type::Task,
             "closure" => Type::Closure,
             "conversation" => Type::Conversation,
+            "stream" => Type::Stream,
             // 未知类型名 → Any（不报错；Mora 允许扩展类型）
             _ => Type::Any,
         }

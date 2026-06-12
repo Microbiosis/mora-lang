@@ -538,10 +538,13 @@ impl Parser {
         else if self.match_token(&[TokenType::LBrace]) {
             let span = self.span_of_previous_keyword();
             let mut entries = Vec::new();
+            while self.check(&TokenType::Newline) { self.advance(); }
             if !self.check(&TokenType::RBrace) {
                 let (k, v) = self.dict_entry();
                 entries.push((k, Box::new(v)));
                 while self.match_token(&[TokenType::Comma]) {
+                    while self.check(&TokenType::Newline) { self.advance(); }
+                    if self.check(&TokenType::RBrace) { break; }
                     let (k, v) = self.dict_entry();
                     entries.push((k, Box::new(v)));
                 }

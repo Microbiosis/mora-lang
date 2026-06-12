@@ -1,11 +1,11 @@
 [package]
 name = "mora"
-version = "0.0.1"
+version = "0.0.3"
 edition = "2021"
 authors = ["Mora contributors"]
-description = "A lightweight Lua-style scripting language for AI workflows (v10: real HTTP, real AI, real JSON)"
+description = "An AI-native scripting language with streaming, tool calling, memory, routing, agent orchestration, and token budgeting"
 license = "BSD-3-Clause"
-keywords = ["scripting", "ai", "workflow", "lua-style", "embedded"]
+keywords = ["scripting", "ai", "workflow", "lua-style", "ai-native"]
 categories = ["development-tools", "parser-implementations"]
 
 [lib]

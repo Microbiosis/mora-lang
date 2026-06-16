@@ -111,6 +111,17 @@ impl Parser {
         else if self.match_token(&[TokenType::Append]) { Some(self.append_statement()) }
         else if self.match_token(&[TokenType::Write]) { Some(self.write_statement()) }
         else if self.match_token(&[TokenType::Return]) { Some(self.return_statement()) }
+        // v0.04.0: AI 原语
+        else if self.match_token(&[TokenType::WithKeyword]) { Some(self.with_statement()) }
+        else if self.match_token(&[TokenType::Stream]) { Some(self.stream_statement()) }
+        else if self.match_token(&[TokenType::Tool]) { Some(self.tool_statement()) }
+        else if self.match_token(&[TokenType::Break]) { Some(self.break_statement()) }
+        else if self.match_token(&[TokenType::Continue]) { Some(self.continue_statement()) }
+        // v0.04 终态: 云服务原生
+        else if self.match_token(&[TokenType::Serve]) { Some(self.serve_statement()) }
+        else if self.match_token(&[TokenType::Route]) { Some(self.route_statement()) }
+        else if self.match_token(&[TokenType::Observe]) { Some(self.observe_statement()) }
+        else if self.match_token(&[TokenType::Span]) { Some(self.span_statement()) }
         else if self.check_index_assignment() { Some(self.index_assignment()) }
         else if self.check_assignment() { Some(self.assignment_statement()) }
         else { self.expression_statement() }
@@ -240,6 +251,12 @@ impl Parser {
         }
         self.consume(&TokenType::Catch, "Expected 'catch' after try block");
         let catch_var = self.consume_identifier("Expected variable name after 'catch'");
+        // v0.04.0: 可选 catch 类型注解
+        let catch_type = if self.match_token(&[TokenType::Colon]) {
+            Some(self.consume_identifier("Expected type name after ':' in catch"))
+        } else {
+            None
+        };
         while self.check(&TokenType::Newline) { self.advance(); }
         let mut catch_block = Vec::new();
         while !self.check(&TokenType::End) && !self.is_at_end() {
@@ -247,7 +264,7 @@ impl Parser {
             if let Some(stmt) = self.declaration() { catch_block.push(stmt); }
         }
         self.consume(&TokenType::End, "Expected 'end' after catch block");
-        Stmt::Try { try_block, catch_var, catch_block, span }
+        Stmt::Try { try_block, catch_var, catch_type, catch_block, span }
     }
 
     fn return_statement(&mut self) -> Stmt {
@@ -377,7 +394,7 @@ impl Parser {
 
     fn match_expression(&mut self) -> Expr {
         let expr = self.expression();
-        self.consume(&TokenType::With, "Expected 'with' after match expression");
+        self.consume(&TokenType::WithKeyword, "Expected 'with' after match expression");
         let mut arms = Vec::new();
         while !self.check(&TokenType::End) && !self.is_at_end() {
             if self.check(&TokenType::Newline) { self.advance(); continue; }
@@ -472,6 +489,9 @@ impl Parser {
                 let args = if self.check(&TokenType::RParen) { vec![] } else { self.arguments() };
                 self.consume(&TokenType::RParen, "Expected ')' after arguments");
                 if let Expr::Variable(name, _) = expr {
+                    // v0.04 终态 Slice 2: IDENT(args) 默认 Call
+                    // 解释器在 evaluate 时会先检查 route_registry
+                    // (已注册 → 走 RouteCall 路径; 未注册 → 普通 Call)
                     expr = Expr::Call { callee: name, args, span };
                 } else {
                     panic!("Can only call functions by name in Mora v1");
@@ -524,6 +544,23 @@ impl Parser {
             } else {
                 Expr::Literal(Literal::String(s, Span::new(line, column)))
             }
+        }
+        // v0.04.0: p"..." prompt 表达式
+        else if let Some(Token { token_type: TokenType::PromptString(s), line, column, .. }) = self.peek().cloned() {
+            self.advance();
+            let span = Span::new(line, column);
+            let inner = if has_format_interpolation(&s) {
+                self.parse_format_string(&s)
+            } else {
+                Expr::Literal(Literal::String(s, span))
+            };
+            // 无论是否有插值，都包成 Prompt 节点，让解释器走 ai.chat
+            let parts = match inner {
+                Expr::Literal(Literal::String(s, _)) => vec![Expr::Literal(Literal::String(s, span))],
+                Expr::Binary { left, op: BinaryOp::Add, right, .. } => self.flatten_prompt_parts(*left, *right),
+                other => vec![other],
+            };
+            Expr::Prompt { parts, span }
         }
         else if self.match_token(&[TokenType::LBracket]) {
             let span = self.span_of_previous_keyword();
@@ -753,6 +790,344 @@ impl Parser {
             }
             _ => panic!("{} at line {}", message, self.peek().map(|t| t.line).unwrap_or(0)),
         }
+    }
+
+    // ===================================================================
+    // v0.04.0: AI 原语语句解析
+    // ===================================================================
+
+    /// `with model = "...", budget = 1000 do ... end`
+    fn with_statement(&mut self) -> Stmt {
+        let span = self.span_of_previous_keyword();
+        let mut bindings = Vec::new();
+        // 第一个 binding 必需
+        let key = self.consume_identifier("Expected binding key in 'with' (e.g. model, budget, temperature)");
+        self.consume(&TokenType::Assign, "Expected '=' after 'with' binding key");
+        let value = self.expression();
+        bindings.push((key, value));
+        // 后续 binding
+        while self.match_token(&[TokenType::Comma]) {
+            let key = self.consume_identifier("Expected binding key in 'with'");
+            self.consume(&TokenType::Assign, "Expected '=' after 'with' binding key");
+            let value = self.expression();
+            bindings.push((key, value));
+        }
+        while self.check(&TokenType::Newline) { self.advance(); }
+        let mut body = Vec::new();
+        while !self.check(&TokenType::End) && !self.is_at_end() {
+            if self.check(&TokenType::Newline) { self.advance(); continue; }
+            if let Some(stmt) = self.declaration() { body.push(stmt); }
+        }
+        self.consume(&TokenType::End, "Expected 'end' after with block");
+        Stmt::With { bindings, body, span }
+    }
+
+    /// `stream <expr> as <var> do ... end`
+    fn stream_statement(&mut self) -> Stmt {
+        let span = self.span_of_previous_keyword();
+        let prompt = self.expression();
+        self.consume(&TokenType::As, "Expected 'as' after stream expression (v0.04.0 syntax: stream <expr> as <var> do ... end)");
+        let var = self.consume_identifier("Expected variable name after 'as'");
+        self.consume(&TokenType::Do, "Expected 'do' after variable name");
+        while self.check(&TokenType::Newline) { self.advance(); }
+        let mut body = Vec::new();
+        while !self.check(&TokenType::End) && !self.is_at_end() {
+            if self.check(&TokenType::Newline) { self.advance(); continue; }
+            if let Some(stmt) = self.declaration() { body.push(stmt); }
+        }
+        self.consume(&TokenType::End, "Expected 'end' after stream block");
+        Stmt::StreamFor { prompt, var, body, span }
+    }
+
+    /// `tool name(params): return_type do ... end`
+    fn tool_statement(&mut self) -> Stmt {
+        let span = self.span_of_previous_keyword();
+        let name = self.consume_identifier("Expected tool name");
+        let params = if self.match_token(&[TokenType::LParen]) {
+            let mut p = Vec::new();
+            if !self.check(&TokenType::RParen) {
+                p.push(self.typed_parameter());
+                while self.match_token(&[TokenType::Comma]) {
+                    p.push(self.typed_parameter());
+                }
+            }
+            self.consume(&TokenType::RParen, "Expected ')' after tool params");
+            p
+        } else {
+            Vec::new()
+        };
+        let return_type = if self.match_token(&[TokenType::Colon]) {
+            Some(self.consume_identifier("Expected return type after ':'"))
+        } else {
+            None
+        };
+        self.consume(&TokenType::Do, "Expected 'do' after tool signature");
+        while self.check(&TokenType::Newline) { self.advance(); }
+        let mut body = Vec::new();
+        while !self.check(&TokenType::End) && !self.is_at_end() {
+            if self.check(&TokenType::Newline) { self.advance(); continue; }
+            if let Some(stmt) = self.declaration() { body.push(stmt); }
+        }
+        self.consume(&TokenType::End, "Expected 'end' after tool body");
+        let exported = false; // v0.04.1: export tool 跟进
+        Stmt::ToolDef { name, params, return_type, body, exported, span }
+    }
+
+    fn break_statement(&mut self) -> Stmt {
+        let span = self.span_of_previous_keyword();
+        Stmt::Break { span }
+    }
+
+    fn continue_statement(&mut self) -> Stmt {
+        let span = self.span_of_previous_keyword();
+        Stmt::Continue { span }
+    }
+
+    /// 把 parse_format_string 生成的 StringConcat 左结合链展平为 Vec<Expr>
+    fn flatten_prompt_parts(&self, left: Expr, right: Expr) -> Vec<Expr> {
+        let mut out = Vec::new();
+        fn collect(e: Expr, out: &mut Vec<Expr>) {
+            match e {
+                Expr::Binary { left, op: BinaryOp::Add, right, .. } => {
+                    collect(*left, out);
+                    collect(*right, out);
+                }
+                other => out.push(other),
+            }
+        }
+        collect(left, &mut out);
+        collect(right, &mut out);
+        out
+    }
+
+    // ===================================================================
+    // v0.04 终态: 云服务原生 statement 解析
+    // ===================================================================
+
+    /// `serve as <protocol> [on port N] do body end`
+    /// 协议: http / mcp / repl / stdio
+    fn serve_statement(&mut self) -> Stmt {
+        let span = self.span_of_previous_keyword();
+        self.consume(&TokenType::As, "Expected 'as' after 'serve'");
+        // 协议关键字
+        let protocol = if self.match_token(&[TokenType::Http]) {
+            // 可选 on port N
+            let host = "127.0.0.1".to_string();
+            let port = if self.match_token(&[TokenType::On]) {
+                // 期望: on port 3000
+                self.consume_identifier("Expected 'port' after 'on'");
+                if let Some(Token { token_type: TokenType::Number(n), .. }) = self.peek().cloned() {
+                    self.advance();
+                    n as u16
+                } else {
+                    panic!("Expected number for port after 'on port'");
+                }
+            } else {
+                3000
+            };
+            ServeProtocol::Http { host, port }
+        } else if self.match_token(&[TokenType::Mcp]) {
+            ServeProtocol::Mcp
+        } else if self.match_token(&[TokenType::Repl]) {
+            ServeProtocol::Repl
+        } else if self.match_token(&[TokenType::Stdio]) {
+            ServeProtocol::Stdio
+        } else {
+            panic!("Expected protocol (http/mcp/repl/stdio) after 'serve as'");
+        };
+        while self.check(&TokenType::Newline) { self.advance(); }
+        while self.check(&TokenType::Newline) { self.advance(); }
+        // do ... end 块: 块内是 HTTP route / MCP tool / 普通 statement 混合
+        let (routes, body) = if self.match_token(&[TokenType::Do]) {
+            let mut routes = Vec::new();
+            let mut stmts = Vec::new();
+            while !self.check(&TokenType::End) && !self.is_at_end() {
+                if self.check(&TokenType::Newline) { self.advance(); continue; }
+                if self.is_http_route_line() {
+                    routes.push(self.parse_http_route());
+                } else if self.is_mcp_tool_line() {
+                    routes.push(self.parse_mcp_tool_route());
+                } else {
+                    if let Some(stmt) = self.declaration() { stmts.push(stmt); }
+                }
+            }
+            self.consume(&TokenType::End, "Expected 'end' after serve body");
+            (routes, stmts)
+        } else {
+            (Vec::new(), Vec::new())
+        };
+        Stmt::Serve { protocol, routes, body, span }
+    }
+
+    /// 判断当前是否 HTTP route 行 (IDENT STRING -> ...)
+    /// 注意: HTTP 方法是普通 Identifier,大写敏感 (GET/POST/PUT/DELETE/PATCH)
+    fn is_http_route_line(&self) -> bool {
+        // peek[0] = Identifier, peek[1] = String, peek[2] = Arrow
+        if let Some(t0) = self.peek_n(0) {
+            if let TokenType::Identifier(name) = &t0.token_type {
+                if HttpMethod::from_str(name).is_some() {
+                    if let Some(t1) = self.peek_n(1) {
+                        if matches!(t1.token_type, TokenType::String(_)) {
+                            if let Some(t2) = self.peek_n(2) {
+                                if matches!(t2.token_type, TokenType::Arrow) {
+                                    return true;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    /// 判断当前是否 MCP tool 行 (tool IDENT)
+    fn is_mcp_tool_line(&self) -> bool {
+        if let Some(t0) = self.peek_n(0) {
+            if matches!(t0.token_type, TokenType::Tool) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// 解析 HTTP route: `GET "/path" -> fn(req) ... end`
+    fn parse_http_route(&mut self) -> RouteDecl {
+        // IDENT
+        let method = match self.advance() {
+            Some(Token { token_type: TokenType::Identifier(name), .. }) => {
+                HttpMethod::from_str(&name).expect("is_http_route_line should have checked")
+            }
+            _ => panic!("Expected HTTP method identifier"),
+        };
+        // STRING
+        let path = match self.advance() {
+            Some(Token { token_type: TokenType::String(s), .. }) => s.clone(),
+            _ => panic!("Expected path string after HTTP method"),
+        };
+        // Arrow "->"
+        self.consume(&TokenType::Arrow, "Expected '->' after route path");
+        // Handler: expression (通常 fn(req) ... end)
+        let handler = self.expression();
+        RouteDecl::HttpRoute { method, path, handler }
+    }
+
+    /// 解析 MCP tool: `tool name(args): type do body end`
+    /// 这里复用 tool_statement 把 ToolDef 提出来,再包成 ToolEntry
+    fn parse_mcp_tool_route(&mut self) -> RouteDecl {
+        // consume Tool token (tool_statement 假设 Tool 已被 dispatch 吃掉)
+        self.consume(&TokenType::Tool, "Expected 'tool' keyword");
+        // 复用现有 tool_statement, 它会从 identifier 开始
+        let stmt = self.tool_statement();
+        let (name, params, return_type, handler) = match stmt {
+            Stmt::ToolDef { name, params, return_type, body, .. } => {
+                // 把 body 包成 closure (handler 接 args dict)
+                let closure = Expr::Closure {
+                    params: vec![("args".to_string(), Some("any".to_string()))],
+                    return_type: None,
+                    body,
+                    span: Span::default(),
+                };
+                (name, params, return_type, closure)
+            }
+            _ => panic!("Expected ToolDef from tool_statement"),
+        };
+        RouteDecl::ToolEntry { name, params, return_type, handler }
+    }
+
+    fn peek_n(&self, n: usize) -> Option<Token> {
+        self.tokens.get(self.current + n).cloned()
+    }
+
+    /// `route <name>: <expr>`
+    fn route_statement(&mut self) -> Stmt {
+        let span = self.span_of_previous_keyword();
+        let name = self.consume_identifier("Expected route name after 'route'");
+        self.consume(&TokenType::Colon, "Expected ':' after route name");
+        let target = self.expression();
+        Stmt::Route { name, target, span }
+    }
+
+    /// `observe <config> do body end`
+    /// config: trace / metrics / otel endpoint "<url>"
+    fn observe_statement(&mut self) -> Stmt {
+        let span = self.span_of_previous_keyword();
+        let config = if self.match_token(&[TokenType::Trace]) {
+            ObserveConfig::Trace
+        } else if self.match_token(&[TokenType::Metrics]) {
+            ObserveConfig::Metrics
+        } else if self.match_token(&[TokenType::Otel]) {
+            // otel endpoint "<url>"
+            self.consume_identifier("Expected 'endpoint' after 'observe otel'");
+            // 期望 string
+            let endpoint = if let Some(Token { token_type: TokenType::String(s), .. }) = self.peek().cloned() {
+                self.advance();
+                Expr::Literal(Literal::String(s, Span::default()))
+            } else {
+                panic!("Expected string endpoint");
+            };
+            ObserveConfig::Otel { endpoint }
+        } else {
+            panic!("Expected trace / metrics / otel after 'observe'");
+        };
+        while self.check(&TokenType::Newline) { self.advance(); }
+        let body = if self.match_token(&[TokenType::Do]) {
+            let mut b = Vec::new();
+            while !self.check(&TokenType::End) && !self.is_at_end() {
+                if self.check(&TokenType::Newline) { self.advance(); continue; }
+                if let Some(stmt) = self.declaration() { b.push(stmt); }
+            }
+            self.consume(&TokenType::End, "Expected 'end' after observe body");
+            b
+        } else {
+            // 没有 do: body 为空, 但 end 还是要消费
+            self.consume(&TokenType::End, "Expected 'end' after observe block");
+            Vec::new()
+        };
+        Stmt::Observe { config, body, span }
+    }
+
+    /// `span "<name>" tags {..} do body end`
+    fn span_statement(&mut self) -> Stmt {
+        let span = self.span_of_previous_keyword();
+        let name = match self.advance() {
+            Some(Token { token_type: TokenType::String(s), .. }) => s.clone(),
+            _ => panic!("Expected span name string"),
+        };
+        // 可选 tags
+        let attributes = if self.match_token(&[TokenType::Tags]) {
+            self.consume(&TokenType::LBrace, "Expected '{' after 'tags'");
+            let mut attrs = Vec::new();
+            // 解析 k: v, k: v, ...
+            loop {
+                let key = match self.advance() {
+                    Some(Token { token_type: TokenType::Identifier(n), .. }) => n.clone(),
+                    Some(Token { token_type: TokenType::String(s), .. }) => s.clone(),
+                    _ => panic!("Expected tag key"),
+                };
+                self.consume(&TokenType::Colon, "Expected ':' after tag key");
+                let val = self.expression();
+                attrs.push((key, val));
+                if !self.match_token(&[TokenType::Comma]) { break; }
+            }
+            self.consume(&TokenType::RBrace, "Expected '}' after tags");
+            attrs
+        } else {
+            Vec::new()
+        };
+        while self.check(&TokenType::Newline) { self.advance(); }
+        let body = if self.match_token(&[TokenType::Do]) {
+            let mut b = Vec::new();
+            while !self.check(&TokenType::End) && !self.is_at_end() {
+                if self.check(&TokenType::Newline) { self.advance(); continue; }
+                if let Some(stmt) = self.declaration() { b.push(stmt); }
+            }
+            self.consume(&TokenType::End, "Expected 'end' after span body");
+            b
+        } else {
+            Vec::new()
+        };
+        Stmt::Span { name, attributes, body, span }
     }
 }
 

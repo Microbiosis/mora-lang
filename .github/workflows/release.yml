@@ -91,6 +91,33 @@ jobs:
           name: mora-${{ matrix.target }}
           path: mora-${{ matrix.target }}.*
 
+  docker:
+    name: Build Docker Image
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: false
+          tags: mora:v${{ github.ref_name }},mora:latest
+          platforms: linux/amd64
+
+      - name: Save Docker image
+        run: docker save mora:v${{ github.ref_name }} | gzip > mora-docker-amd64.tar.gz
+
+      - name: Upload Docker artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mora-docker
+          path: mora-docker-amd64.tar.gz
+
   release:
     name: Publish GitHub Release
     needs: build
@@ -127,9 +154,48 @@ jobs:
         with:
           files: release/*
           body: |
-            Mora v${{ github.ref_name }} binaries
+            # Mora v${{ github.ref_name }} — AI 原生 + 云服务原生
 
-            See [README](https://github.com/Microbiosis/mora-lang#readme) for installation and usage.
+            Mora v0.04 终态: AI 调用和云服务能力全部下沉到语言层。
+            一段 Mora 脚本 = 可部署的 AI HTTP / MCP server + 可观测 + 类型化错误。
+
+            ## 核心特性
+
+            - **AI 调用是语法原语**: `p"..."` / `with` / `stream` / `tool` / `catch e: AiError`
+            - **HTTP / MCP server 是语法块**: `serve as http` / `serve as mcp`
+            - **可观测是语法块**: `observe trace` / `span` 块 + OTEL
+            - **单二进制多协议**: `mora` 根据脚本顶层 `serve` 块自动选择协议
+            - **Route 是语言概念**: `route fast: "gpt-4o-mini"` + `fast(p"...")`
+
+            ## 快速开始
+
+            ```bash
+            # 写一个 Mora 脚本 (含 serve + tool)
+            cat > hello.mora << 'EOF'
+            observe trace
+            route fast: "gpt-4o-mini"
+
+            serve as http on port 3000 do
+              GET "/chat" -> fn(req)
+                return fast(p"hello: {req.query.name}")
+              end
+            end
+            EOF
+
+            # 跑 (单二进制, 自动起 HTTP server)
+            mora hello.mora
+            # 另一终端: curl http://localhost:3000/chat?name=World
+            ```
+
+            ## 完整文档
+
+            - [README](https://github.com/Microbiosis/mora-lang#readme)
+            - [v0.04 终态 RFC](docs/v0.04-final-cloud-native-rfc.md)
+            - [v0.04 工作流总结](docs/v0.04-phase2-workflow-summary.md)
+
+            ## 升级
+
+            v0.04 不向后兼容 v0.03. 升级需要修改脚本 (见 docs/v0.04-release-notes.md)。
 
             ## SHA-256 Checksums
             ```

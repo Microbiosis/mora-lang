@@ -1,10 +1,17 @@
 #[derive(Debug, Clone, PartialEq)]
 pub enum TokenType {
     Let, Task, If, Then, End, Return, True, False, Nil, For, In, Try, Catch, Import, Export,
-    Parallel, Match, With, Save, Load, Fn, Into,
+    Parallel, Match, WithKeyword, Save, Load, Fn, Into, As, Do,
     Read, Write, Append, ReadBytes, WriteBytes,
+    Stream, Tool, Break, Continue,
+    // v0.04 终态: 云服务原生关键字
+    Serve, Route, Observe, Span, Tags, Record, Endpoint, Repl, Stdio, Mcp, Http, On,
+    Trace, Metrics, Otel,
+    // 注意: HTTP 方法 (GET/POST/PUT/DELETE/PATCH) 不作关键字
+    // —— 保持 Identifier,parser 在 serve 块内做大小写敏感判断
     Identifier(String),
     String(String),
+    PromptString(String),  // v0.04.0: p"..."
     Number(f64),
     Plus, Minus, Star, Slash, Percent,
     Assign, Equal, NotEqual,
@@ -148,7 +155,14 @@ impl Lexer {
             '\n' => { self.line += 1; self.column = 1; Some(Token { token_type: TokenType::Newline, line: start_line, column: start_col }) }
             _ => {
                 if c.is_ascii_digit() { Some(self.number_from(start_line, start_col)) }
-                else if c.is_ascii_alphabetic() || c == '_' { Some(self.identifier_from(start_line, start_col)) }
+                else if c.is_ascii_alphabetic() || c == '_' {
+                    // v0.04.0: 检测 p"..." 前缀
+                    if c == 'p' && self.peek() == '"' {
+                        self.advance(); // 消费 "
+                        return Some(self.prompt_string_from(start_line, start_col));
+                    }
+                    Some(self.identifier_from(start_line, start_col))
+                }
                 else { panic!("Unexpected character '{}' at line {}", c, self.line) }
             }
         }
@@ -180,6 +194,36 @@ impl Lexer {
         if self.is_at_end() { panic!("Unterminated string at line {}", self.line) }
         self.advance(); // closing "
         Token { token_type: TokenType::String(value), line: start_line, column: start_col }
+    }
+
+    /// v0.04.0: 解析 p"..." prompt 字符串
+    /// 复用 string_from 的转义规则，但 token 类型是 PromptString
+    fn prompt_string_from(&mut self, start_line: usize, start_col: usize) -> Token {
+        let mut value = String::new();
+        while self.peek() != '"' && !self.is_at_end() {
+            if self.peek() == '\n' { self.line += 1; self.column = 0; }
+            if self.peek() == '\\' {
+                self.advance();
+                if self.is_at_end() { break; }
+                match self.advance() {
+                    '"' => { value.push('"'); }
+                    '\\' => { value.push('\\'); }
+                    'n' => { value.push('\n'); }
+                    't' => { value.push('\t'); }
+                    'r' => { value.push('\r'); }
+                    '0' => { value.push('\0'); }
+                    other => {
+                        value.push('\\');
+                        value.push(other);
+                    }
+                }
+            } else {
+                value.push(self.advance());
+            }
+        }
+        if self.is_at_end() { panic!("Unterminated prompt string at line {}", self.line) }
+        self.advance(); // closing "
+        Token { token_type: TokenType::PromptString(value), line: start_line, column: start_col }
     }
 
     fn number_from(&mut self, start_line: usize, start_col: usize) -> Token {
@@ -216,7 +260,7 @@ impl Lexer {
             "export" => TokenType::Export,
             "parallel" => TokenType::Parallel,
             "match" => TokenType::Match,
-            "with" => TokenType::With,
+            "with" => TokenType::WithKeyword,
             "save" => TokenType::Save,
             "load" => TokenType::Load,
             "fn" => TokenType::Fn,
@@ -226,6 +270,28 @@ impl Lexer {
             "append" => TokenType::Append,
             "read_bytes" => TokenType::ReadBytes,
             "write_bytes" => TokenType::WriteBytes,
+            "as" => TokenType::As,
+            "do" => TokenType::Do,
+            "on" => TokenType::On,
+            "stream" => TokenType::Stream,
+            "tool" => TokenType::Tool,
+            "break" => TokenType::Break,
+            "continue" => TokenType::Continue,
+            // v0.04 终态: 云服务原生关键字
+            "serve" => TokenType::Serve,
+            "route" => TokenType::Route,
+            "observe" => TokenType::Observe,
+            "span" => TokenType::Span,
+            "tags" => TokenType::Tags,
+            "record" => TokenType::Record,
+            "endpoint" => TokenType::Endpoint,
+            "repl" => TokenType::Repl,
+            "stdio" => TokenType::Stdio,
+            "mcp" => TokenType::Mcp,
+            "http" => TokenType::Http,
+            "trace" => TokenType::Trace,
+            "metrics" => TokenType::Metrics,
+            "otel" => TokenType::Otel,
             _ => TokenType::Identifier(value),
         };
         Token { token_type, line: start_line, column: start_col }

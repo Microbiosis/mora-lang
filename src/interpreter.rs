@@ -8,6 +8,7 @@ use std::time::Duration;
 use crate::ast::*;
 use crate::lexer::Lexer;
 use crate::parser::Parser;
+use crate::trace::collector::TraceCollector;
 
 /// 包装 BufReader<Box<dyn Read + Send + Sync>>，实现 Debug/Clone
 #[derive(Clone)]
@@ -172,6 +173,27 @@ pub struct Interpreter {
     model_routes: HashMap<String, RouteConfig>,
     token_budget: Option<TokenBudget>,
     token_usage: TokenUsage,
+    pub trace: TraceCollector,
+    // v0.04 终态 Slice 2: route registry (name -> model name)
+    route_registry: HashMap<String, String>,
+}
+
+// v0.04 终态: 显式实现 Clone 而非 derive
+// (HashMap/Vec 字段需要 clone; Arc/Option 内部; TraceCollector 自身 derive Clone)
+impl Clone for Interpreter {
+    fn clone(&self) -> Self {
+        Self {
+            globals: self.globals.clone(),
+            environment: self.environment.clone(),
+            tool_registry: self.tool_registry.clone(),
+            memory_store: self.memory_store.clone(),
+            model_routes: self.model_routes.clone(),
+            token_budget: self.token_budget.clone(),
+            token_usage: self.token_usage.clone(),
+            trace: self.trace.clone(),
+            route_registry: self.route_registry.clone(),
+        }
+    }
 }
 
 /// Token 预算配置
@@ -209,11 +231,11 @@ struct MemoryEntry {
 
 /// 工具定义（注册时存储）
 #[derive(Clone)]
-struct ToolDef {
-    name: String,
-    description: String,
-    parameters: String,  // JSON Schema 字符串
-    handler: Value,      // Closure
+pub struct ToolDef {
+    pub name: String,
+    pub description: String,
+    pub parameters: String,  // JSON Schema 字符串
+    pub handler: Value,      // Closure
 }
 
 /// 结构化聊天消息（用于支持 tool_calls）
@@ -237,17 +259,42 @@ impl Interpreter {
         globals.lock().unwrap().define("print".to_string(), Value::Builtin("print".to_string()), false);
         globals.lock().unwrap().define("range".to_string(), Value::Builtin("range".to_string()), false);
         globals.lock().unwrap().define("len".to_string(), Value::Builtin("len".to_string()), false);
-        Self { globals: globals.clone(), environment: globals, tool_registry: HashMap::new(), memory_store: Vec::new(), model_routes: HashMap::new(), token_budget: None, token_usage: TokenUsage::default() }
+        Self { globals: globals.clone(), environment: globals, tool_registry: HashMap::new(), memory_store: Vec::new(), model_routes: HashMap::new(), token_budget: None, token_usage: TokenUsage::default(), trace: TraceCollector::new(false), route_registry: HashMap::new() }
+    }
+
+    /// v0.04 终态: 构造一个空 Interpreter (用于 std::mem::replace 占位)
+    /// 空 Interpreter 不能跑 execute, 仅作为占位符存在
+    pub fn new_empty() -> Self {
+        let globals = Arc::new(Mutex::new(Environment::new()));
+        Self {
+            globals: globals.clone(),
+            environment: globals,
+            tool_registry: HashMap::new(),
+            memory_store: Vec::new(),
+            model_routes: HashMap::new(),
+            token_budget: None,
+            token_usage: TokenUsage::default(),
+            trace: TraceCollector::new(false),
+            route_registry: HashMap::new(),
+        }
     }
 
     pub fn new_with_globals(globals: Arc<Mutex<Environment>>) -> Self {
         let env = Arc::new(Mutex::new(Environment::with_parent(globals.clone())));
-        Self { globals: globals.clone(), environment: env, tool_registry: HashMap::new(), memory_store: Vec::new(), model_routes: HashMap::new(), token_budget: None, token_usage: TokenUsage::default() }
+        Self { globals: globals.clone(), environment: env, tool_registry: HashMap::new(), memory_store: Vec::new(), model_routes: HashMap::new(), token_budget: None, token_usage: TokenUsage::default(), trace: TraceCollector::new(false), route_registry: HashMap::new() }
     }
 
     #[allow(dead_code)]
     pub fn get_globals(&self) -> Arc<Mutex<Environment>> {
         self.globals.clone()
+    }
+
+    pub fn get_tool_registry(&self) -> &HashMap<String, ToolDef> {
+        &self.tool_registry
+    }
+
+    pub fn set_trace_enabled(&mut self, enabled: bool) {
+        self.trace = TraceCollector::new(enabled);
     }
 
     pub fn interpret(&mut self, stmts: &[Stmt]) -> Result<(), String> {
@@ -329,6 +376,8 @@ impl Interpreter {
                             env.lock().unwrap().define(var.clone(), item, false);
                             let signal = self.execute_block(body, env)?;
                             if signal.is_return() { return Ok(signal); }
+                            if matches!(signal, FlowSignal::Break) { return Ok(FlowSignal::None); }
+                            if matches!(signal, FlowSignal::Continue) { continue; }
                         }
                         Ok(FlowSignal::None)
                     }
@@ -338,6 +387,8 @@ impl Interpreter {
                             env.lock().unwrap().define(var.clone(), Value::String(ch.to_string()), false);
                             let signal = self.execute_block(body, env)?;
                             if signal.is_return() { return Ok(signal); }
+                            if matches!(signal, FlowSignal::Break) { return Ok(FlowSignal::None); }
+                            if matches!(signal, FlowSignal::Continue) { continue; }
                         }
                         Ok(FlowSignal::None)
                     }
@@ -367,6 +418,8 @@ impl Interpreter {
                                     env.lock().unwrap().define(var.clone(), Value::String(tok), false);
                                     let signal = self.execute_block(body, env)?;
                                     if signal.is_return() { return Ok(signal); }
+                                    if matches!(signal, FlowSignal::Break) { return Ok(FlowSignal::None); }
+                                    if matches!(signal, FlowSignal::Continue) { continue; }
                                 }
                                 None => break,
                             }
@@ -376,14 +429,25 @@ impl Interpreter {
                     _ => Err(format!("Cannot iterate over {}", iter_val)),
                 }
             }
-            Stmt::Try { try_block, catch_var, catch_block, span: _ } => {
+            Stmt::Try { try_block, catch_var, catch_type, catch_block, span: _ } => {
                 let env = Arc::new(Mutex::new(Environment::with_parent(self.environment.clone())));
                 match self.execute_block(try_block, env.clone()) {
                     // 运行时错误：进 catch。**return 信号不算错误**，直接穿透。
                     Ok(signal @ FlowSignal::Return(_)) => Ok(signal),
                     Ok(FlowSignal::None) => Ok(FlowSignal::None),
+                    Ok(other) => Ok(other),  // v0.04.0: break/continue 穿透
                     Err(err_msg) => {
-                        env.lock().unwrap().define(catch_var.clone(), Value::String(err_msg), false);
+                        // v0.04.0: 类型化错误
+                        // catch_type == Some("AiError") → 包成 AiError dict
+                        // catch_type == None → 沿用 v0.03 字符串行为
+                        let err_value = match catch_type {
+                            Some(t) if t == "AiError" => Self::build_ai_error_static(&err_msg),
+                            Some(t) => {
+                                return Err(format!("try/catch: unsupported catch type '{}' (v0.04.0 only supports AiError or no annotation)", t));
+                            }
+                            None => Value::String(err_msg),
+                        };
+                        env.lock().unwrap().define(catch_var.clone(), err_value, false);
                         // catch 块内若有 return 也要穿透
                         self.execute_block(catch_block, env)
                     }
@@ -519,6 +583,236 @@ impl Interpreter {
                 let _val = self.evaluate(expr)?;
                 Ok(FlowSignal::None)
             }
+            // ============ v0.04.0: AI 原语 ============
+            Stmt::With { bindings, body, span: _ } => {
+                // 推入 AI 上下文栈
+                let prev_model = std::env::var("MORA_AI_MODEL").ok();
+                let prev_temp  = std::env::var("MORA_AI_TEMPERATURE").ok();
+                let prev_budget = std::env::var("MORA_AI_BUDGET").ok();
+                let prev_budget_used = std::env::var("MORA_AI_BUDGET_USED").ok();
+                let prev_max = std::env::var("MORA_AI_MAX_TOKENS").ok();
+                for (key, val_expr) in bindings {
+                    let v = self.evaluate(val_expr)?;
+                    let s = match &v {
+                        Value::String(s) => s.clone(),
+                        Value::Number(n) => n.to_string(),
+                        Value::Bool(b) => b.to_string(),
+                        other => other.to_string(),
+                    };
+                    let env_key = match key.as_str() {
+                        "model" => "MORA_AI_MODEL",
+                        "budget" => "MORA_AI_BUDGET",
+                        "temperature" => "MORA_AI_TEMPERATURE",
+                        "max_tokens" => "MORA_AI_MAX_TOKENS",
+                        other => {
+                            return Err(format!("with: unknown binding '{}' (valid: model, budget, temperature, max_tokens)", other));
+                        }
+                    };
+                    std::env::set_var(env_key, s);
+                }
+                // budget_used 保留外层值（按 RFC §2.2.4 选"覆盖"语义：内层重新计数）
+                let env_in = Arc::new(Mutex::new(Environment::with_parent(self.environment.clone())));
+                let result = self.execute_block(body, env_in);
+                // 恢复外层环境
+                Self::restore_env("MORA_AI_MODEL", &prev_model);
+                Self::restore_env("MORA_AI_TEMPERATURE", &prev_temp);
+                Self::restore_env("MORA_AI_BUDGET", &prev_budget);
+                Self::restore_env("MORA_AI_BUDGET_USED", &prev_budget_used);
+                Self::restore_env("MORA_AI_MAX_TOKENS", &prev_max);
+                result
+            }
+            Stmt::StreamFor { prompt, var, body, span: _ } => {
+                // 求值 prompt（应当是 Prompt 表达式，返回 Value::Stream）
+                let prompt_str = Self::eval_prompt_parts_from_stmt(prompt, self)?;
+                // v0.04 终态: stream 块简化 — mock 模式按字符拆 token
+                // (v0.04.1 跟进真实 streaming SSE)
+                let tokens: Vec<String> = prompt_str.chars().map(|c| c.to_string()).collect();
+                for token in tokens {
+                    let env_in = Arc::new(Mutex::new(Environment::with_parent(self.environment.clone())));
+                    env_in.lock().unwrap().define(var.clone(), Value::String(token), false);
+                    let signal = self.execute_block(body, env_in)?;
+                    match signal {
+                        FlowSignal::Return(r) => return Ok(FlowSignal::Return(r)),
+                        FlowSignal::Break => return Ok(FlowSignal::None),
+                        FlowSignal::Continue => continue,
+                        FlowSignal::None => {}
+                    }
+                }
+                Ok(FlowSignal::None)
+            }
+            Stmt::ToolDef { name, params, return_type, body, exported: _, span: _ } => {
+                // v0.04.0: 注册到全局工具表（与 v0.03 ai.tool 等价）
+                let name_clone = name.clone();
+                let param_names: Vec<String> = params.iter().map(|(n, _)| n.clone()).collect();
+                let type_hints: Vec<String> = params.iter().map(|(_, t)| t.clone().unwrap_or_else(|| "any".to_string())).collect();
+                let return_str = return_type.clone().unwrap_or_else(|| "any".to_string());
+                // 用闭包捕获 body
+                let tool_body = body.clone();
+                let func = Value::Task {
+                    name: name.clone(),
+                    params: param_names.clone(),
+                    body: tool_body,
+                };
+                self.environment.lock().unwrap().define(name.clone(), func, false);
+                // 同时注册到 ai.tool registry（v0.03 路径）
+                self.register_tool(name_clone, param_names, type_hints, return_str);
+                Ok(FlowSignal::None)
+            }
+            Stmt::Break { span: _ } => Ok(FlowSignal::Break),
+            Stmt::Continue { span: _ } => Ok(FlowSignal::Continue),
+            // v0.04 终态 Slice 1: serve 块
+            Stmt::Serve { protocol, routes, body, span: _ } => {
+                match protocol {
+                    ServeProtocol::Http { host, port } => {
+                        use std::collections::HashMap;
+                        use std::sync::{Arc, Mutex};
+                        let route_table: Arc<Mutex<HashMap<(String, String), Value>>> =
+                            Arc::new(Mutex::new(HashMap::new()));
+                        for r in routes {
+                            if let RouteDecl::HttpRoute { method, path, handler } = r {
+                                let handler_value = self.evaluate(&handler)?;
+                                route_table.lock().unwrap().insert(
+                                    (method.as_str().to_string(), path.clone()),
+                                    handler_value,
+                                );
+                            }
+                        }
+                        let body_env = Arc::new(Mutex::new(Environment::with_parent(self.environment.clone())));
+                        let body_signal = self.execute_block(body, body_env)?;
+                        let taken = std::mem::replace(self, Interpreter::new_empty());
+                        let interp_arc: Arc<Mutex<Interpreter>> = Arc::new(Mutex::new(taken));
+                        eprintln!("[serve] starting HTTP server on {}:{}", host, port);
+                        let host_str = host.clone();
+                        crate::http_server::start(&host_str, *port, route_table, interp_arc)
+                            .map_err(|e| format!("HTTP server error: {}", e))?;
+                        Ok(body_signal)
+                    }
+                    ServeProtocol::Mcp => {
+                        // Slice 4: 内嵌 MCP server
+                        // 收集 tool 块到 McpTool registry
+                        use std::collections::HashMap;
+                        use std::sync::{Arc, Mutex};
+                        let tool_registry: Arc<Mutex<HashMap<String, crate::mcp_server::McpTool>>> =
+                            Arc::new(Mutex::new(HashMap::new()));
+                        for r in routes {
+                            if let RouteDecl::ToolEntry { name, params, return_type, handler } = r {
+                                // 求值 handler (闭包)
+                                let handler_value = self.evaluate(&handler)?;
+                                // v0.04 终态 Slice 5: 自动生成 JSON Schema (从 params + 类型 hint)
+                                let param_names: Vec<String> = params.iter().map(|(n, _)| n.clone()).collect();
+                                let param_types: Vec<String> = params.iter()
+                                    .map(|(_, t)| t.clone().unwrap_or_else(|| "string".to_string()))
+                                    .collect();
+                                let schema = Self::tool_to_json_schema(&param_names, &param_types);
+                                // 拼接 return type 描述
+                                let schema_with_return = if let Some(rt) = return_type {
+                                    let rt_lower = schema.trim_end_matches('}');
+                                    format!("{},\"_return_type\":\"{}\"}}", rt_lower, rt)
+                                } else {
+                                    schema
+                                };
+                                let tool = crate::mcp_server::McpTool {
+                                    name: name.clone(),
+                                    description: String::new(),
+                                    parameters: schema_with_return,
+                                    handler: handler_value,
+                                };
+                                tool_registry.lock().unwrap().insert(name.clone(), tool);
+                                eprintln!("[mcp] registered tool: {} ({} params)", name, param_names.len());
+                            }
+                        }
+                        // 执行 body
+                        let body_env = Arc::new(Mutex::new(Environment::with_parent(self.environment.clone())));
+                        let body_signal = self.execute_block(body, body_env)?;
+                        // 移交 self 到 Arc<Mutex<>> 启动 MCP server
+                        let taken = std::mem::replace(self, Interpreter::new_empty());
+                        let interp_arc: Arc<Mutex<Interpreter>> = Arc::new(Mutex::new(taken));
+                        eprintln!("[serve] starting MCP server on stdio");
+                        crate::mcp_server::start(tool_registry, interp_arc)
+                            .map_err(|e| format!("MCP server error: {}", e))?;
+                        Ok(body_signal)
+                    }
+                    ServeProtocol::Repl => {
+                        eprintln!("[serve] REPL not yet implemented");
+                        Ok(FlowSignal::None)
+                    }
+                    ServeProtocol::Stdio => {
+                        eprintln!("[serve] Stdio not yet implemented");
+                        Ok(FlowSignal::None)
+                    }
+                }
+            }
+            // v0.04 终态 Slice 2: route 块
+            Stmt::Route { name, target, .. } => {
+                let model_name = match self.evaluate(target)? {
+                    Value::String(s) => s,
+                    other => {
+                        return Err(format!(
+                            "route '{}' target must be a string, got {}",
+                            name, other
+                        ));
+                    }
+                };
+                self.route_registry.insert(name.clone(), model_name);
+                eprintln!("[route] registered: {} -> {}", name, self.route_registry[name]);
+                Ok(FlowSignal::None)
+            }
+            // v0.04 终态 Slice 3: 可观测
+            Stmt::Observe { config, body, .. } => {
+                match config {
+                    ObserveConfig::Trace => {
+                        self.trace.set_enabled(true);
+                        eprintln!("[observe] trace enabled");
+                    }
+                    ObserveConfig::Metrics => {
+                        self.trace.set_enabled(true);
+                        eprintln!("[observe] metrics enabled (currently same as trace)");
+                    }
+                    ObserveConfig::Otel { endpoint } => {
+                        // 求值 endpoint (期望字符串字面量)
+                        let endpoint_str = match self.evaluate(endpoint)? {
+                            Value::String(s) => s,
+                            other => return Err(format!("observe otel endpoint must be a string, got {}", other)),
+                        };
+                        self.trace.set_otel_endpoint(endpoint_str.clone());
+                        self.trace.set_enabled(true);
+                        eprintln!("[observe] OTEL enabled, endpoint: {}", endpoint_str);
+                    }
+                }
+                // 执行 body
+                let body_env = Arc::new(Mutex::new(Environment::with_parent(self.environment.clone())));
+                self.execute_block(body, body_env)
+            }
+            Stmt::Span { name, attributes, body, .. } => {
+                // 求值 attributes 成 HashMap<String, String>
+                let mut attrs_map = std::collections::HashMap::new();
+                for (k, v_expr) in attributes {
+                    let v_str = match self.evaluate(v_expr)? {
+                        Value::String(s) => s,
+                        other => other.to_string(),
+                    };
+                    attrs_map.insert(k.clone(), v_str);
+                }
+                // 起 span
+                let handle = self.trace.start_span(name, attrs_map);
+                // 执行 body
+                let body_env = Arc::new(Mutex::new(Environment::with_parent(self.environment.clone())));
+                let result = self.execute_block(body, body_env);
+                // 结束 span (RAII 风格)
+                let attrs_end = std::collections::HashMap::new();
+                match &result {
+                    Ok(_) => handle.end(attrs_end),
+                    Err(e) => handle.end_error(e, attrs_end),
+                }
+                result
+            }
+        }   // ← match stmt { ... } 闭合
+    }       // ← pub fn execute(...) 闭合
+
+    fn restore_env(key: &str, prev: &Option<String>) {
+        match prev {
+            Some(v) => std::env::set_var(key, v),
+            None => std::env::remove_var(key),
         }
     }
 
@@ -528,13 +822,84 @@ impl Interpreter {
         let mut last = FlowSignal::None;
         for stmt in stmts {
             last = self.execute(stmt)?;
-            // 任何 return 信号立即停止块执行
-            if last.is_return() {
-                break;
+            // 任何 return/break/continue 信号立即停止块执行并向外冒泡
+            match last {
+                FlowSignal::Return(_) | FlowSignal::Break | FlowSignal::Continue => break,
+                FlowSignal::None => {}
             }
         }
         self.environment = previous;
         Ok(last)
+    }
+
+    // ===================================================================
+    // v0.04.0: AI 原语辅助函数
+    // ===================================================================
+
+    /// 注册 tool 到全局工具表
+    fn register_tool(&mut self, name: String, params: Vec<String>, types: Vec<String>, return_type: String) {
+        // v0.04 终态 Slice 5: 真正实现 — 自动生成 JSON Schema 并存到 tool_registry
+        // description: v0.04.0 简化（空字符串，v0.04.1 跟进 desc: 段）
+        // parameters: 从 params + types 自动生成 JSON Schema
+        let schema = Self::tool_to_json_schema(&params, &types);
+        let tool_def = crate::interpreter::ToolDef {
+            name: name.clone(),
+            description: String::new(),
+            parameters: schema,
+            handler: Value::Nil,  // handler 不存这里 (handler 是 Stmt::ToolDef body 的 closure, 解析时已绑)
+        };
+        self.tool_registry.insert(name, tool_def);
+    }
+
+    /// v0.04 终态 Slice 5: 从 params + types 生成标准 JSON Schema
+    fn tool_to_json_schema(params: &[String], types: &[String]) -> String {
+        // 生成 {"type":"object","properties":{...},"required":[...]} 格式
+        let mut properties = String::from("{");
+        let mut required = Vec::new();
+        for (i, p) in params.iter().enumerate() {
+            if i > 0 { properties.push_str(","); }
+            let ty = types.get(i).map(|s| s.as_str()).unwrap_or("string");
+            let json_type = match ty {
+                "number" | "int" | "float" => "number",
+                "bool" => "boolean",
+                "list" | "array" => "array",
+                _ => "string",
+            };
+            properties.push_str(&format!("\"{}\":{{\"type\":\"{}\"}}", p, json_type));
+            required.push(p.clone());
+        }
+        properties.push_str("}");
+        let required_str = required.iter()
+            .map(|r| format!("\"{}\"", r))
+            .collect::<Vec<_>>()
+            .join(",");
+        format!("{{\"type\":\"object\",\"properties\":{},\"required\":[{}]}}", properties, required_str)
+    }
+
+    /// v0.04.0: 把运行时错误包成 AiError dict
+    /// 字段: message, code, retryable, attempts, cause
+    /// 用 dict 表达（Mora 暂时没有 struct literal）
+    fn build_ai_error_static(err_msg: &str) -> Value {
+        let mut m = std::collections::HashMap::new();
+        m.insert("message".to_string(), Value::String(err_msg.to_string()));
+        // 简单 code 推断
+        let code = if err_msg.contains("rate") || err_msg.contains("limit") {
+            "rate_limit"
+        } else if err_msg.contains("timeout") {
+            "timeout"
+        } else if err_msg.contains("context") || err_msg.contains("length") {
+            "context_length"
+        } else if err_msg.contains("auth") || err_msg.contains("key") {
+            "auth"
+        } else {
+            "unknown"
+        };
+        let retryable = matches!(code, "rate_limit" | "timeout");
+        m.insert("code".to_string(), Value::String(code.to_string()));
+        m.insert("retryable".to_string(), Value::Bool(retryable));
+        m.insert("attempts".to_string(), Value::Number(1.0));
+        m.insert("cause".to_string(), Value::String(err_msg.to_string()));
+        Value::Dict(m)
     }
 
     fn execute_parallel(&mut self, stmts: &[Stmt]) -> Result<FlowSignal, String> {
@@ -664,6 +1029,20 @@ impl Interpreter {
                 self.evaluate_pipe(left_val, right)
             }
             Expr::Call { callee, args, span: _ } => {
+                // v0.04 终态 Slice 2: 先看 route_registry
+                if self.route_registry.contains_key(callee) {
+                    // 已注册 → 走 RouteCall 路径
+                    let model = self.route_registry.get(callee).unwrap().clone();
+                    if args.is_empty() {
+                        return Err(format!("route '{}()' requires 1 argument (the prompt)", callee));
+                    }
+                    let prompt_str = match Self::eval_route_arg(&args[0], self) {
+                        Ok(s) => s,
+                        Err(e) => return Err(e),
+                    };
+                    return Self::do_ai_chat(self, &model, &prompt_str);
+                }
+                // 未注册 → 普通函数调用
                 let arg_values: Result<Vec<Value>, String> = args.iter().map(|a| self.evaluate(a.as_ref())).collect();
                 self.call_function(callee, arg_values?)
             }
@@ -717,7 +1096,72 @@ impl Interpreter {
                 }
                 Err("No match arm matched".to_string())
             }
+            // v0.04 终态: p"..." → 直接调 real_ai_chat_inner (不再走 ai.chat builtin)
+            Expr::Prompt { parts, .. } => {
+                let prompt_str = Self::eval_prompt_parts(parts, self)?;
+                Self::do_ai_chat(self, "gpt-4o-mini", &prompt_str)
+            }
+            // v0.04 终态 Slice 2: fast(p"...") → 直接调 real_ai_chat_inner 用对应 model
+            Expr::RouteCall { name, args, .. } => {
+                // 1. 找 model
+                let model = self.route_registry.get(name)
+                    .ok_or_else(|| format!("route '{}' not defined (use `route {}: \"<model>\"` first)", name, name))?
+                    .clone();
+                // 2. 求值 args[0] (期望是 Prompt 表达式)
+                if args.is_empty() {
+                    return Err(format!("route call '{}()' requires 1 argument (the prompt)", name));
+                }
+                let prompt_str = Self::eval_route_arg(&args[0], self)?;
+                Self::do_ai_chat(self, &model, &prompt_str)
+            }
         }
+    }
+
+    /// v0.04 终态 Slice 2: 求值 RouteCall 的单个参数
+    /// 期望是 Prompt 表达式 — 拼接 parts 为字符串
+    fn eval_route_arg(arg: &Expr, interp: &mut Interpreter) -> Result<String, String> {
+        match arg {
+            Expr::Prompt { parts, .. } => Self::eval_prompt_parts(parts, interp),
+            other => Ok(interp.evaluate(other)?.to_string()),
+        }
+    }
+
+    /// v0.04.0: 把 Prompt 节点的 parts 拼接为字符串
+    /// 内部临时借用 self 来 evaluate 每个 part（closure 隔离借用）
+    fn eval_prompt_parts(parts: &[Expr], interp: &mut Interpreter) -> Result<String, String> {
+        let mut s = String::new();
+        for p in parts {
+            let v = interp.evaluate(p)?;
+            s.push_str(&v.to_string());
+        }
+        Ok(s)
+    }
+
+    /// v0.04.0: Stmt::StreamFor 用 — 接受任意 prompt 表达式（不仅是 Prompt 节点）
+    fn eval_prompt_parts_from_stmt(prompt_expr: &Expr, interp: &mut Interpreter) -> Result<String, String> {
+        match prompt_expr {
+            Expr::Prompt { parts, .. } => Self::eval_prompt_parts(parts, interp),
+            other => Ok(interp.evaluate(other)?.to_string()),
+        }
+    }
+
+    /// v0.04 终态: AI chat 的统一入口
+    /// 替代 v0.03 的 ai.chat builtin
+    /// - model: 模型名 (e.g. "gpt-4o-mini")
+    /// - prompt: prompt 字符串
+    fn do_ai_chat(interp: &mut Interpreter, model: &str, prompt: &str) -> Result<Value, String> {
+        let api_key = std::env::var("OPENAI_API_KEY").unwrap_or_default();
+        let base_url = std::env::var("MORA_AI_BASE_URL")
+            .unwrap_or_else(|_| "https://api.openai.com/v1".to_string());
+
+        if api_key.is_empty() {
+            // Mock 模式
+            eprintln!("[ai.chat mock — set OPENAI_API_KEY for real call] {}", prompt);
+            return Ok(Value::String(format!("[Mock response for: {}]", prompt)));
+        }
+
+        let messages = vec![("user".to_string(), prompt.to_string())];
+        interp.real_ai_chat(&messages, &api_key, model, &base_url)
     }
 
     fn evaluate_pipe(&mut self, left_val: Value, right: &Expr) -> Result<Value, String> {
@@ -961,72 +1405,6 @@ impl Interpreter {
                 }
             }
             Value::Builtin(name) => match (name.as_str(), method) {
-                ("ai", "chat") => {
-                    let prompt = args.get(0).map(|v| v.to_string()).unwrap_or_default();
-                    // 检查是否有路由参数
-                    let route_name = args.get(1).and_then(|v| match v {
-                        Value::String(s) => Some(s.clone()),
-                        _ => None,
-                    });
-                    let route = route_name.as_ref().and_then(|n| self.model_routes.get(n));
-                    // 确定使用的模型和 API 配置
-                    let default_key = env::var("OPENAI_API_KEY").unwrap_or_default();
-                    let (api_key, model, base_url) = if let Some(r) = route {
-                        let key = if r.api_key.is_empty() { default_key.clone() } else { r.api_key.clone() };
-                        (key, r.model.clone(), r.base_url.clone())
-                    } else {
-                        let model = env::var("MORA_AI_MODEL").unwrap_or_else(|_| "gpt-4o-mini".to_string());
-                        let base_url = env::var("MORA_AI_BASE_URL").unwrap_or_else(|_| "https://api.openai.com/v1".to_string());
-                        (default_key, model, base_url)
-                    };
-                    if api_key.is_empty() {
-                        // Mock 模式
-                        if !self.tool_registry.is_empty() {
-                            let mock_result = self.mock_tool_call(&prompt);
-                            if let Some(result) = mock_result {
-                                return Ok(Value::String(result));
-                            }
-                        }
-                        eprintln!("[ai.chat mock — set OPENAI_API_KEY for real call] {}", prompt);
-                        return Ok(Value::String(format!("[Mock response for: {}]", prompt)));
-                    }
-                    // 构建消息（如果有 system prompt 则前置）
-                    let mut messages: Vec<ChatMessage> = Vec::new();
-                    if let Some(r) = route {
-                        if let Some(ref sys) = r.system {
-                            messages.push(ChatMessage::User { content: sys.clone() });
-                        }
-                    }
-                    if self.tool_registry.is_empty() {
-                        let plain_msgs: Vec<(String, String)> = messages.iter().map(|m| match m {
-                            ChatMessage::User { content } => ("user".to_string(), content.clone()),
-                            _ => ("user".to_string(), String::new()),
-                        }).chain(std::iter::once(("user".to_string(), prompt))).collect();
-                        self.real_ai_chat(&plain_msgs, &api_key, &model, &base_url)
-                    } else {
-                        messages.push(ChatMessage::User { content: prompt });
-                        let tools: Vec<ToolDef> = self.tool_registry.values().cloned().collect();
-                        let tool_refs: Vec<&ToolDef> = tools.iter().collect();
-                        self.real_ai_chat_with_tools(&mut messages, &api_key, &model, &base_url, &tool_refs)
-                    }
-                }
-                ("ai", "create") => {
-                    // v10: 创建多轮对话对象
-                    let model = args.get(0).map(|v| v.to_string()).unwrap_or_else(|| "gpt-4o-mini".to_string());
-                    let base_url = args.get(1).map(|v| v.to_string()).unwrap_or_else(|| "https://api.openai.com/v1".to_string());
-                    match env::var("OPENAI_API_KEY") {
-                        Ok(key) if !key.is_empty() => {
-                            Ok(Value::Conversation {
-                                messages: vec![],
-                                model,
-                                base_url,
-                                api_key: key,
-                            })
-                        }
-                        _ => Err("ai.create: set OPENAI_API_KEY environment variable for real calls".to_string()),
-                    }
-                }
-                ("ai", method) => self.call_ai_method(method, &args),
                 ("web", "fetch") => {
                     let url = args.get(0).map(|v| v.to_string()).unwrap_or_default();
                     // v10: 真实 HTTP GET
@@ -1043,7 +1421,6 @@ impl Interpreter {
                     Ok(Value::String(value_to_json(&value)))
                 }
                 ("file", method) => self.call_file_method(method, &args),
-                ("memory", method) => self.call_memory_method(method, &args),
                 ("agent", "create") => {
                     // agent.create("name", {tools: [...], model: "deep", max_steps: 10, system: "..."})
                     let name = match args.get(0) {
@@ -1204,7 +1581,7 @@ impl Interpreter {
         }
     }
 
-    fn call_value(&mut self, value: &Value, args: Vec<Value>) -> Result<Value, String> {
+    pub fn call_value(&mut self, value: &Value, args: Vec<Value>) -> Result<Value, String> {
         match value {
             Value::Closure { params, body, env } => {
                 let params = params.clone();
@@ -1465,407 +1842,17 @@ impl Interpreter {
     // ===================================================================
     // v0.03: memory.* — 长期记忆（向量存储 + 语义检索）
     // ===================================================================
-    fn call_memory_method(&mut self, method: &str, args: &[Value]) -> Result<Value, String> {
-        match method {
-            "store" => {
-                // memory.store(key, text) — 存储记忆
-                let key = match args.get(0) {
-                    Some(Value::String(s)) => s.clone(),
-                    _ => return Err("memory.store: first arg must be a string (key)".to_string()),
-                };
-                let text = match args.get(1) {
-                    Some(Value::String(s)) => s.clone(),
-                    _ => return Err("memory.store: second arg must be a string (text)".to_string()),
-                };
-                // 生成 embedding（有 API key 用真实嵌入，否则 mock）
-                let embedding = self.get_embedding(&text)?;
-                // 如果 key 已存在则更新
-                if let Some(entry) = self.memory_store.iter_mut().find(|e| e.key == key) {
-                    entry.text = text;
-                    entry.embedding = embedding;
-                } else {
-                    self.memory_store.push(MemoryEntry { key, text, embedding });
-                }
-                Ok(Value::Nil)
-            }
-            "recall" => {
-                // memory.recall(query, k?) — 语义检索 top-k
-                let query = match args.get(0) {
-                    Some(Value::String(s)) => s.clone(),
-                    _ => return Err("memory.recall: first arg must be a string (query)".to_string()),
-                };
-                let k = match args.get(1) {
-                    Some(Value::Number(n)) if *n > 0.0 => *n as usize,
-                    _ => 3,
-                };
-                if self.memory_store.is_empty() {
-                    return Ok(Value::List(vec![]));
-                }
-                let query_emb = self.get_embedding(&query)?;
-                // 计算每个条目的余弦相似度
-                let mut scored: Vec<(usize, f64)> = self.memory_store.iter().enumerate()
-                    .filter_map(|(i, entry)| {
-                        cosine_similarity(&query_emb, &entry.embedding).ok().map(|s| (i, s))
-                    })
-                    .collect();
-                scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-                let results: Vec<Value> = scored.iter().take(k)
-                    .map(|(i, score)| {
-                        let entry = &self.memory_store[*i];
-                        let mut m = HashMap::new();
-                        m.insert("key".to_string(), Value::String(entry.key.clone()));
-                        m.insert("text".to_string(), Value::String(entry.text.clone()));
-                        m.insert("score".to_string(), Value::Number(*score));
-                        Value::Dict(m)
-                    })
-                    .collect();
-                Ok(Value::List(results))
-            }
-            "forget" => {
-                // memory.forget(key) — 删除指定记忆
-                let key = match args.get(0) {
-                    Some(Value::String(s)) => s.clone(),
-                    _ => return Err("memory.forget: first arg must be a string (key)".to_string()),
-                };
-                self.memory_store.retain(|e| e.key != key);
-                Ok(Value::Nil)
-            }
-            "clear" => {
-                // memory.clear() — 清空所有记忆
-                self.memory_store.clear();
-                Ok(Value::Nil)
-            }
-            "list" => {
-                // memory.list() — 列出所有记忆的 key
-                let keys: Vec<Value> = self.memory_store.iter()
-                    .map(|e| Value::String(e.key.clone()))
-                    .collect();
-                Ok(Value::List(keys))
-            }
-            "len" => {
-                Ok(Value::Number(self.memory_store.len() as f64))
-            }
-            _ => Err(format!("memory.{}: unknown method", method)),
-        }
-    }
 
-    /// 获取文本的 embedding（有 API key 用真实嵌入，否则 mock）
     fn get_embedding(&self, text: &str) -> Result<Vec<f64>, String> {
-        let has_key = env::var("OPENAI_API_KEY").map(|k| !k.is_empty()).unwrap_or(false);
-        if has_key {
-            let api_key = env::var("OPENAI_API_KEY").unwrap();
-            let model = env::var("MORA_EMBED_MODEL")
-                .unwrap_or_else(|_| "text-embedding-3-small".to_string());
-            let base_url = env::var("MORA_AI_BASE_URL")
-                .unwrap_or_else(|_| "https://api.openai.com/v1".to_string());
-            let result = real_ai_embed_strings(&[text.to_string()], &api_key, &model, &base_url, None)?;
-            // result 是 List<Number>（单条）
-            value_list_to_f64(&result, "memory.embed")
-        } else {
-            Ok(mock_bow_embedding(text))
-        }
+        // v0.04 终态: 只支持 mock embedding (real_ai_embed_strings 已删除, v1.0 恢复)
+        Ok(mock_bow_embedding(text))
     }
 
     // ===================================================================
     // v11: ai.* — 向量嵌入、相似度、语义检索
     // ===================================================================
-    fn call_ai_method(&mut self, method: &str, args: &[Value]) -> Result<Value, String> {
-        match method {
-            "embed" => {
-                // ai.embed(text | list_of_text, dim?) -> List<Number> | List<List<Number>>
-                let first = args.get(0).cloned().unwrap_or(Value::Nil);
-                let dim = match args.get(1) {
-                    Some(Value::Number(n)) if *n > 0.0 => Some(*n as u32),
-                    Some(Value::Number(n)) if *n == 0.0 => None,
-                    Some(_) => return Err("ai.embed: dimensions must be a positive number".to_string()),
-                    None => None,
-                };
-                let api_key = env::var("OPENAI_API_KEY")
-                    .map_err(|_| "ai.embed: set OPENAI_API_KEY environment variable".to_string())?;
-                let model = env::var("MORA_EMBED_MODEL")
-                    .unwrap_or_else(|_| "text-embedding-3-small".to_string());
-                let base_url = env::var("MORA_AI_BASE_URL")
-                    .unwrap_or_else(|_| "https://api.openai.com/v1".to_string());
 
-                match first {
-                    Value::String(s) => {
-                        // 单文本
-                        real_ai_embed_strings(&[s], &api_key, &model, &base_url, dim)
-                    }
-                    Value::List(items) => {
-                        // 批量：必须全为字符串
-                        let mut strs = Vec::with_capacity(items.len());
-                        for it in &items {
-                            match it {
-                                Value::String(s) => strs.push(s.clone()),
-                                _ => return Err("ai.embed: list elements must be strings".to_string()),
-                            }
-                        }
-                        if strs.is_empty() {
-                            return Err("ai.embed: list is empty".to_string());
-                        }
-                        real_ai_embed_strings(&strs, &api_key, &model, &base_url, dim)
-                    }
-                    _ => Err("ai.embed: first arg must be a string or list of strings".to_string()),
-                }
-            }
-            "cosine" => {
-                // ai.cosine(vec_a, vec_b) -> Number [-1, 1]
-                let a = value_list_to_f64(args.get(0).unwrap_or(&Value::Nil), "ai.cosine")?;
-                let b = value_list_to_f64(args.get(1).unwrap_or(&Value::Nil), "ai.cosine")?;
-                Ok(Value::Number(cosine_similarity(&a, &b)?))
-            }
-            "dot" => {
-                let a = value_list_to_f64(args.get(0).unwrap_or(&Value::Nil), "ai.dot")?;
-                let b = value_list_to_f64(args.get(1).unwrap_or(&Value::Nil), "ai.dot")?;
-                Ok(Value::Number(dot_product(&a, &b)?))
-            }
-            "euclidean" => {
-                let a = value_list_to_f64(args.get(0).unwrap_or(&Value::Nil), "ai.euclidean")?;
-                let b = value_list_to_f64(args.get(1).unwrap_or(&Value::Nil), "ai.euclidean")?;
-                Ok(Value::Number(euclidean_distance(&a, &b)?))
-            }
-            "norm" => {
-                let a = value_list_to_f64(args.get(0).unwrap_or(&Value::Nil), "ai.norm")?;
-                Ok(Value::Number(l2_norm(&a)))
-            }
-            "search" => {
-                // ai.search(query, corpus, k) -> List<{text, score, index}>
-                // MVP：同步现场 embedding + cosine 排序。无 API key 时使用 mock 词袋兜底。
-                self.ai_search_mvp(args)
-            }
-            "stream" => {
-                let prompt = args.get(0).map(|v| v.to_string()).unwrap_or_default();
-                if prompt.is_empty() {
-                    return Err("ai.stream: prompt cannot be empty".to_string());
-                }
-                match env::var("OPENAI_API_KEY") {
-                    Ok(key) if !key.is_empty() => {
-                        let model = env::var("MORA_AI_MODEL")
-                            .unwrap_or_else(|_| "gpt-4o-mini".to_string());
-                        let base_url = env::var("MORA_AI_BASE_URL")
-                            .unwrap_or_else(|_| "https://api.openai.com/v1".to_string());
-                        let msgs = vec![("user".to_string(), prompt)];
-                        self.create_ai_stream(&msgs, &key, &model, &base_url)
-                    }
-                    _ => {
-                        eprintln!("[ai.stream mock — set OPENAI_API_KEY for real streaming]");
-                        Ok(Self::create_mock_stream(&prompt))
-                    }
-                }
-            }
-            "tool" => {
-                // ai.tool(name, description, parameters_dict, handler_closure)
-                let name = match args.get(0) {
-                    Some(Value::String(s)) => s.clone(),
-                    _ => return Err("ai.tool: first arg must be a string (tool name)".to_string()),
-                };
-                let description = match args.get(1) {
-                    Some(Value::String(s)) => s.clone(),
-                    _ => return Err("ai.tool: second arg must be a string (description)".to_string()),
-                };
-                let parameters = match args.get(2) {
-                    Some(Value::Dict(_)) => value_to_json(args.get(2).unwrap()),
-                    Some(Value::String(s)) => s.clone(),
-                    _ => return Err("ai.tool: third arg must be a dict or JSON string (parameters schema)".to_string()),
-                };
-                let handler = match args.get(3) {
-                    Some(Value::Closure { .. }) | Some(Value::Task { .. }) => args.get(3).unwrap().clone(),
-                    _ => return Err("ai.tool: fourth arg must be a closure or task (handler)".to_string()),
-                };
-                self.tool_registry.insert(name.clone(), ToolDef {
-                    name: name.clone(),
-                    description,
-                    parameters,
-                    handler,
-                });
-                Ok(Value::Nil)
-            }
-            "route" => {
-                // ai.route({"fast": "gpt-4o-mini", "deep": "gpt-4o"})
-                // 或 ai.route({"fast": {model: "gpt-4o-mini", max_tokens: 256}})
-                let config = match args.get(0) {
-                    Some(Value::Dict(d)) => d,
-                    _ => return Err("ai.route: first arg must be a dict".to_string()),
-                };
-                let api_key = env::var("OPENAI_API_KEY").unwrap_or_default();
-                let base_url = env::var("MORA_AI_BASE_URL")
-                    .unwrap_or_else(|_| "https://api.openai.com/v1".to_string());
-                for (name, val) in config {
-                    let route = match val {
-                        Value::String(model) => RouteConfig {
-                            model: model.clone(),
-                            base_url: base_url.clone(),
-                            api_key: api_key.clone(),
-                            max_tokens: None,
-                            system: None,
-                        },
-                        Value::Dict(m) => {
-                            let model = match m.get("model") {
-                                Some(Value::String(s)) => s.clone(),
-                                _ => return Err(format!("ai.route '{}': 'model' field required", name)),
-                            };
-                            let r_base = match m.get("base_url") {
-                                Some(Value::String(s)) => s.clone(),
-                                _ => base_url.clone(),
-                            };
-                            let r_key = match m.get("api_key") {
-                                Some(Value::String(s)) => s.clone(),
-                                _ => api_key.clone(),
-                            };
-                            let max_tokens = match m.get("max_tokens") {
-                                Some(Value::Number(n)) => Some(*n as usize),
-                                _ => None,
-                            };
-                            let system = match m.get("system") {
-                                Some(Value::String(s)) => Some(s.clone()),
-                                _ => None,
-                            };
-                            RouteConfig { model, base_url: r_base, api_key: r_key, max_tokens, system }
-                        }
-                        _ => return Err(format!("ai.route '{}': value must be a string or dict", name)),
-                    };
-                    self.model_routes.insert(name.clone(), route);
-                }
-                Ok(Value::Nil)
-            }
-            "budget" => {
-                // ai.budget({total: 100000, per_call: 4096, alert: 0.8})
-                let config = match args.get(0) {
-                    Some(Value::Dict(d)) => d,
-                    _ => return Err("ai.budget: first arg must be a dict".to_string()),
-                };
-                let total = match config.get("total") {
-                    Some(Value::Number(n)) => *n as usize,
-                    _ => return Err("ai.budget: 'total' field required (number)".to_string()),
-                };
-                let per_call = match config.get("per_call") {
-                    Some(Value::Number(n)) if *n > 0.0 => Some(*n as usize),
-                    _ => None,
-                };
-                let alert_threshold = match config.get("alert") {
-                    Some(Value::Number(n)) => *n,
-                    _ => 0.8,
-                };
-                self.token_budget = Some(TokenBudget { total, per_call, alert_threshold });
-                Ok(Value::Nil)
-            }
-            "usage" => {
-                // ai.usage() -> {input, output, total, remaining}
-                let total_used = self.token_usage.input + self.token_usage.output;
-                let remaining = self.token_budget.as_ref()
-                    .map(|b| b.total.saturating_sub(total_used))
-                    .unwrap_or(usize::MAX);
-                let mut m = HashMap::new();
-                m.insert("input".to_string(), Value::Number(self.token_usage.input as f64));
-                m.insert("output".to_string(), Value::Number(self.token_usage.output as f64));
-                m.insert("total".to_string(), Value::Number(total_used as f64));
-                m.insert("remaining".to_string(), Value::Number(remaining as f64));
-                Ok(Value::Dict(m))
-            }
-            _ => Err(format!("ai.{}: unknown method", method)),
-        }
-    }
 
-    /// ai.search MVP：现场对 query + corpus 各调一次 embed，按 cosine 排序取 top-k
-    fn ai_search_mvp(&self, args: &[Value]) -> Result<Value, String> {
-        let query = match args.get(0) {
-            Some(Value::String(s)) => s.clone(),
-            _ => return Err("ai.search: first arg must be a string (query)".to_string()),
-        };
-        let corpus = match args.get(1) {
-            Some(Value::List(items)) => {
-                let mut strs = Vec::with_capacity(items.len());
-                for it in items {
-                    match it {
-                        Value::String(s) => strs.push(s.clone()),
-                        _ => return Err("ai.search: corpus elements must be strings".to_string()),
-                    }
-                }
-                strs
-            }
-            _ => return Err("ai.search: second arg must be a list of strings (corpus)".to_string()),
-        };
-        let k = match args.get(2) {
-            Some(Value::Number(n)) if *n > 0.0 => (*n as usize).min(corpus.len()),
-            _ => corpus.len(),
-        };
-        if corpus.is_empty() {
-            return Err("ai.search: corpus is empty".to_string());
-        }
-
-        // 准备输入：query + corpus
-        let mut inputs = Vec::with_capacity(corpus.len() + 1);
-        inputs.push(query.clone());
-        inputs.extend(corpus.iter().cloned());
-
-        // 调用 embed
-        let has_key = env::var("OPENAI_API_KEY").map(|k| !k.is_empty()).unwrap_or(false);
-        let embeddings = if has_key {
-            let api_key = env::var("OPENAI_API_KEY").unwrap();
-            let model = env::var("MORA_EMBED_MODEL")
-                .unwrap_or_else(|_| "text-embedding-3-small".to_string());
-            let base_url = env::var("MORA_AI_BASE_URL")
-                .unwrap_or_else(|_| "https://api.openai.com/v1".to_string());
-            let result = real_ai_embed_strings(&inputs, &api_key, &model, &base_url, None)?;
-            // result 是 List<List<Number>>（因为 inputs.len() > 1）
-            match result {
-                Value::List(embs) => {
-                    let mut out = Vec::with_capacity(embs.len());
-                    for e in embs {
-                        if let Ok(v) = value_list_to_f64(&e, "ai.search") {
-                            out.push(v);
-                        } else {
-                            return Err("ai.search: failed to parse embedding response".to_string());
-                        }
-                    }
-                    out
-                }
-                _ => return Err("ai.search: unexpected embedding response shape".to_string()),
-            }
-        } else {
-            // Mock fallback：词袋 + 共享词 hash → 向量
-            eprintln!("[ai.search mock — set OPENAI_API_KEY for real semantic search]");
-            inputs.iter().map(|s| mock_bow_embedding(s)).collect()
-        };
-
-        // 第一个是 query，剩下的对应 corpus
-        if embeddings.is_empty() {
-            return Err("ai.search: no embeddings returned".to_string());
-        }
-        let q_vec = &embeddings[0];
-        let mut scored: Vec<(usize, f64)> = embeddings[1..]
-            .iter()
-            .enumerate()
-            .map(|(i, v)| (i, cosine_similarity(q_vec, v).unwrap_or(0.0)))
-            .collect();
-        // 降序
-        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        scored.truncate(k);
-
-        // 构造 List<Dict{text, score, index}>
-        let mut out = Vec::with_capacity(scored.len());
-        for (idx, score) in scored {
-            let mut m = std::collections::HashMap::new();
-            m.insert("text".to_string(), Value::String(corpus[idx].clone()));
-            m.insert("score".to_string(), Value::Number(score));
-            m.insert("index".to_string(), Value::Number(idx as f64));
-            out.push(Value::Dict(m));
-        }
-        Ok(Value::List(out))
-    }
-
-    // ===================================================================
-    // v10: 真实 HTTP 客户端实现（基于 ureq）
-    // ===================================================================
-
-    /// 真实 HTTP GET 请求。失败时返回带上下文的错误信息。
-    ///
-    /// 设计要点：
-    /// - 30s 读超时、10s 写超时（AI/网络条件下的合理值）
-    /// - 4xx/5xx 状态码视为错误（语义：响应不可用）
-    /// - 错误信息包含状态码 + URL + 响应体前 200 字符（便于排错）
-    /// - 同步阻塞，与同步解释器天然契合
     fn real_web_fetch(&self, url: &str) -> Result<Value, String> {
         if url.is_empty() {
             return Err("web.fetch: URL cannot be empty".to_string());
@@ -1911,6 +1898,32 @@ impl Interpreter {
     /// - **结构化 JSON 响应解析**：用 json_to_value 提取 choices[0].message.content
     /// - **同步阻塞**：60s 读超时（AI 推理可能慢）
     fn real_ai_chat(&mut self, messages: &[(String, String)], api_key: &str, model: &str, base_url: &str) -> Result<Value, String> {
+        let mut span_attrs = std::collections::HashMap::new();
+        span_attrs.insert("model".to_string(), model.to_string());
+        span_attrs.insert("messages".to_string(), messages.len().to_string());
+        let span = self.trace.start_span("ai.chat", span_attrs);
+        let start = std::time::Instant::now();
+
+        let result = self.real_ai_chat_inner(messages, api_key, model, base_url);
+
+        let elapsed = start.elapsed();
+        let mut end_attrs = std::collections::HashMap::new();
+        end_attrs.insert("latency_ms".to_string(), elapsed.as_millis().to_string());
+        match &result {
+            Ok(val) => {
+                end_attrs.insert("output_len".to_string(), val.to_string().len().to_string());
+                span.end(end_attrs);
+                self.trace.record_call("ai.chat", elapsed, true);
+            }
+            Err(e) => {
+                span.end_error(e, end_attrs);
+                self.trace.record_call("ai.chat", elapsed, false);
+            }
+        }
+        result
+    }
+
+    fn real_ai_chat_inner(&mut self, messages: &[(String, String)], api_key: &str, model: &str, base_url: &str) -> Result<Value, String> {
         if messages.is_empty() {
             return Err("ai.chat: messages cannot be empty".to_string());
         }
@@ -2187,6 +2200,7 @@ impl Interpreter {
     fn track_tokens(&mut self, input: usize, output: usize) -> Result<(), String> {
         self.token_usage.input += input;
         self.token_usage.output += output;
+        self.trace.record_tokens(input as u64, output as u64);
         let total_used = self.token_usage.input + self.token_usage.output;
         if let Some(ref budget) = self.token_budget {
             if total_used > budget.total {
@@ -2201,17 +2215,7 @@ impl Interpreter {
     }
 
     /// 检查预算是否已耗尽
-    fn check_budget(&self) -> Result<(), String> {
-        if let Some(ref budget) = self.token_budget {
-            let total_used = self.token_usage.input + self.token_usage.output;
-            if total_used >= budget.total {
-                return Err(format!("Token budget exhausted: {}/{}", total_used, budget.total));
-            }
-        }
-        Ok(())
-    }
 
-    /// 从 OpenAI 兼容 API 响应中提取 choices[0].message.content
     fn extract_ai_content(&self, json_text: &str) -> Result<Value, String> {
         let root = json_to_value(json_text)?;
 
@@ -2525,22 +2529,7 @@ suggestion: <improvement suggestion or "none">"#,
     }
 
     /// Mock 工具调用（无 API Key 时，调用第一个注册的工具）
-    fn mock_tool_call(&mut self, _prompt: &str) -> Option<String> {
-        // 取第一个注册工具的 handler（clone 避免借用冲突）
-        let found = self.tool_registry.values().next()
-            .map(|tool| (tool.name.clone(), tool.handler.clone()));
-        if let Some((name, handler)) = found {
-            eprintln!("[ai.tool mock — calling tool '{}']", name);
-            let args_dict = Value::Dict(HashMap::new());
-            match self.call_value(&handler, vec![args_dict]) {
-                Ok(val) => return Some(val.to_string()),
-                Err(e) => return Some(format!("[Tool '{}' error: {}]", name, e)),
-            }
-        }
-        None
-    }
 
-    /// 创建 mock 流（无 API Key 时使用）
     fn create_mock_stream(prompt: &str) -> Value {
         let mock_text = format!("[Mock stream for: {}]", prompt);
         let mut sse_data = String::new();
@@ -2579,79 +2568,7 @@ suggestion: <improvement suggestion or "none">"#,
 }
 
 // 实际接收 strings 的版本（避免 self 借用冲突）
-fn real_ai_embed_strings(
-    inputs: &[String],
-    api_key: &str,
-    model: &str,
-    base_url: &str,
-    dim: Option<u32>,
-) -> Result<Value, String> {
-    if inputs.is_empty() {
-        return Err("ai.embed: inputs cannot be empty".to_string());
-    }
 
-    // 构造 JSON body
-    let escaped_model = model.replace('\\', "\\\\").replace('"', "\\\"");
-    let inputs_json: String = inputs.iter()
-        .map(|s| {
-            let esc = s
-                .replace('\\', "\\\\")
-                .replace('"', "\\\"")
-                .replace('\n', "\\n")
-                .replace('\r', "\\r")
-                .replace('\t', "\\t");
-            format!("\"{}\"", esc)
-        })
-        .collect::<Vec<_>>()
-        .join(",");
-    let body = if let Some(d) = dim {
-        format!(
-            r#"{{"model":"{}","input":[{}],"dimensions":{}}}"#,
-            escaped_model, inputs_json, d
-        )
-    } else {
-        format!(
-            r#"{{"model":"{}","input":[{}]}}"#,
-            escaped_model, inputs_json
-        )
-    };
-
-    let url = format!("{}/embeddings", base_url.trim_end_matches('/'));
-
-    let agent = ureq::AgentBuilder::new()
-        .timeout_read(Duration::from_secs(AI_READ_TIMEOUT_SECS))
-        .timeout_write(Duration::from_secs(HTTP_WRITE_TIMEOUT_SECS))
-        .build();
-
-    match agent
-        .post(&url)
-        .set("Authorization", &format!("Bearer {}", api_key))
-        .set("Content-Type", "application/json")
-        .send_string(&body)
-    {
-        Ok(response) => match response.into_string() {
-            Ok(text) => extract_embeddings(&text, inputs.len()),
-            Err(e) => Err(format!("ai.embed: failed to read response body: {}", e)),
-        },
-        Err(ureq::Error::Status(status, response)) => {
-            let body = response.into_string().unwrap_or_default();
-            let excerpt: String = body.chars().take(300).collect();
-            Err(format!(
-                "ai.embed: API error HTTP {} from {} (body: {})",
-                status, url, excerpt
-            ))
-        }
-        Err(ureq::Error::Transport(t)) => Err(format!(
-            "ai.embed: network error connecting to {}: {}",
-            url, t
-        )),
-    }
-}
-
-/// 从 OpenAI 兼容 embeddings 响应中提取所有 embedding 向量
-///
-/// 响应格式: {"data": [{"embedding": [0.1, 0.2, ...], "index": 0}, ...], ...}
-/// 返回 Value::List<Vec<Value::Number>> 单条，或 Value::List<Vec<List<...>>> 批量。
 fn extract_embeddings(json_text: &str, expected_count: usize) -> Result<Value, String> {
     let root = json_to_value(json_text)?;
     let data = if let Value::Dict(ref map) = root {
@@ -2710,22 +2627,7 @@ fn extract_embeddings(json_text: &str, expected_count: usize) -> Result<Value, S
     }
 }
 
-/// 把 Value 列表转成 f64 列表
-fn value_list_to_f64(v: &Value, ctx: &str) -> Result<Vec<f64>, String> {
-    match v {
-        Value::List(items) => items
-            .iter()
-            .map(|x| match x {
-                Value::Number(n) => Ok(*n),
-                _ => Err(format!("{}: expected list of numbers", ctx)),
-            })
-            .collect(),
-        _ => Err(format!("{}: expected a list", ctx)),
-    }
-}
-
-/// 兜底 mock embedding：基于词袋的简单 hash 向量（32 维）
-/// 用于 ai.search 在无 API key 时仍能跑通。语义粗糙，但保证端到端 demo 可重现。
+/// mock embedding (用于 memory.* 语义检索 mock 模式)
 fn mock_bow_embedding(s: &str) -> Vec<f64> {
     const DIM: usize = 32;
     let mut v = vec![0.0_f64; DIM];
@@ -2742,57 +2644,12 @@ fn mock_bow_embedding(s: &str) -> Vec<f64> {
 }
 
 /// 余弦相似度: (a·b) / (||a|| * ||b||)，范围 [-1, 1]
-fn cosine_similarity(a: &[f64], b: &[f64]) -> Result<f64, String> {
-    if a.len() != b.len() {
-        return Err(format!(
-            "cosine: vector length mismatch ({} vs {})",
-            a.len(),
-            b.len()
-        ));
-    }
-    let mut dot = 0.0_f64;
-    let mut na = 0.0_f64;
-    let mut nb = 0.0_f64;
-    for i in 0..a.len() {
-        dot += a[i] * b[i];
-        na += a[i] * a[i];
-        nb += b[i] * b[i];
-    }
-    let denom = na.sqrt() * nb.sqrt();
-    if denom == 0.0 {
-        return Ok(0.0);
-    }
-    Ok(dot / denom)
-}
 
 /// 点积: a·b
-fn dot_product(a: &[f64], b: &[f64]) -> Result<f64, String> {
-    if a.len() != b.len() {
-        return Err(format!(
-            "dot: vector length mismatch ({} vs {})",
-            a.len(),
-            b.len()
-        ));
-    }
-    Ok(a.iter().zip(b).map(|(x, y)| x * y).sum())
-}
 
 /// 欧氏距离: sqrt(sum((a-b)^2))，值越小越相似
-fn euclidean_distance(a: &[f64], b: &[f64]) -> Result<f64, String> {
-    if a.len() != b.len() {
-        return Err(format!(
-            "euclidean: vector length mismatch ({} vs {})",
-            a.len(),
-            b.len()
-        ));
-    }
-    Ok(a.iter().zip(b).map(|(x, y)| (x - y).powi(2)).sum::<f64>().sqrt())
-}
 
 /// L2 范数
-fn l2_norm(a: &[f64]) -> f64 {
-    a.iter().map(|x| x * x).sum::<f64>().sqrt()
-}
 
 // ===================================================================
 // 控制流信号（v11 重构）
@@ -2815,6 +2672,8 @@ fn l2_norm(a: &[f64]) -> f64 {
 pub enum FlowSignal {
     None,
     Return(Value),
+    Break,        // v0.04.0
+    Continue,     // v0.04.0
 }
 
 impl FlowSignal {
@@ -2823,6 +2682,9 @@ impl FlowSignal {
         match self {
             FlowSignal::None => Value::Nil,
             FlowSignal::Return(v) => v,
+            // v0.04.0: break/continue 在块边界被吞掉，不会走到 into_value
+            FlowSignal::Break => Value::Nil,
+            FlowSignal::Continue => Value::Nil,
         }
     }
 
@@ -3276,6 +3138,42 @@ mod embed_tests {
         assert!(diffs > 0);
     }
 }
+/// 余弦相似度: (a·b) / (||a|| * ||b||)，范围 [-1, 1]
+fn cosine_similarity(a: &[f64], b: &[f64]) -> Result<f64, String> {
+    if a.len() != b.len() {
+        return Err(format!("cosine_similarity: length mismatch ({} vs {})", a.len(), b.len()));
+    }
+    let dot = dot_product(a, b)?;
+    let na = l2_norm(a);
+    let nb = l2_norm(b);
+    if na == 0.0 || nb == 0.0 {
+        return Ok(0.0);
+    }
+    Ok(dot / (na * nb))
+}
+
+/// 点积: a·b
+fn dot_product(a: &[f64], b: &[f64]) -> Result<f64, String> {
+    if a.len() != b.len() {
+        return Err(format!("dot_product: length mismatch ({} vs {})", a.len(), b.len()));
+    }
+    Ok(a.iter().zip(b.iter()).map(|(x, y)| x * y).sum())
+}
+
+/// 欧氏距离: sqrt(sum((a-b)^2))
+fn euclidean_distance(a: &[f64], b: &[f64]) -> Result<f64, String> {
+    if a.len() != b.len() {
+        return Err(format!("euclidean_distance: length mismatch ({} vs {})", a.len(), b.len()));
+    }
+    Ok(a.iter().zip(b.iter()).map(|(x, y)| (x - y).powi(2)).sum::<f64>().sqrt())
+}
+
+/// L2 范数: sqrt(sum(x^2))
+fn l2_norm(a: &[f64]) -> f64 {
+    a.iter().map(|x| x * x).sum::<f64>().sqrt()
+}
+
+
 
 // ===================================================================
 // 单元测试 — for 循环（修复 v10 之前的 bug：result.is_some() 误判）

@@ -111,6 +111,12 @@ fn collect_references(stmts: &[Stmt], name: &str, refs: &mut Vec<(usize, usize)>
         match expr {
             Expr::Variable(n, span) if n == name => refs.push((span.line, span.column)),
             Expr::Variable(_, _) => {}
+            Expr::Prompt { parts, .. } => {
+                for p in parts { walk_expr(p, name, refs); }
+            }
+            Expr::RouteCall { args, .. } => {
+                for a in args { walk_expr(a, name, refs); }
+            }
             Expr::Call { callee, args, span, .. } => {
                 if callee == name {
                     refs.push((span.line, span.column));
@@ -256,7 +262,9 @@ pub fn completion(docs: &HashMap<String, DocumentState>, params: &Value) -> Valu
     for kw in ["let", "task", "if", "then", "end", "for", "in", "try", "catch",
                "return", "fn", "true", "false", "nil", "match", "with",
                "save", "load", "import", "parallel", "read", "write", "append",
-               "read_bytes", "write_bytes", "into", "export"] {
+               "read_bytes", "write_bytes", "into", "export",
+               // v0.04.0: AI 原语
+               "stream", "tool", "break", "continue"] {
         if seen.insert(kw.to_string()) {
             let mut m = BTreeMap::new();
             m.insert("label".to_string(), Value::String_(kw.to_string()));
@@ -729,9 +737,11 @@ pub fn semantic_tokens(docs: &HashMap<String, DocumentState>, params: &Value) ->
             TokenType::Let | TokenType::Task | TokenType::If | TokenType::Then | TokenType::End |
             TokenType::For | TokenType::In | TokenType::Try | TokenType::Catch | TokenType::Return |
             TokenType::Fn | TokenType::True | TokenType::False | TokenType::Nil | TokenType::Match |
-            TokenType::With | TokenType::Save | TokenType::Load | TokenType::Import |
+            TokenType::WithKeyword | TokenType::Save | TokenType::Load | TokenType::Import |
             TokenType::Parallel | TokenType::Read | TokenType::Write | TokenType::Append |
-            TokenType::ReadBytes | TokenType::WriteBytes | TokenType::Into | TokenType::Export => 0,  // keyword
+            TokenType::ReadBytes | TokenType::WriteBytes | TokenType::Into | TokenType::Export |
+            // v0.04.0: AI 原语关键字
+            TokenType::Stream | TokenType::Tool | TokenType::Break | TokenType::Continue => 0,  // keyword
             TokenType::String(_) => 3,  // string
             TokenType::Number(_) => 4,  // number
             _ => continue,
@@ -874,7 +884,16 @@ fn end_stmt_span_line(stmt: &Stmt) -> usize {
         | Stmt::AppendFile { span, .. }
         | Stmt::ReadBytesFile { span, .. }
         | Stmt::WriteBytesFile { span, .. }
-        | Stmt::Return { span, .. } => span.line,
+        | Stmt::Return { span, .. }
+        | Stmt::With { span, .. }
+        | Stmt::StreamFor { span, .. }
+        | Stmt::ToolDef { span, .. }
+        | Stmt::Break { span, .. }
+        | Stmt::Continue { span, .. }
+        | Stmt::Serve { span, .. }
+        | Stmt::Route { span, .. }
+        | Stmt::Observe { span, .. }
+        | Stmt::Span { span, .. } => span.line,
         Stmt::Expr(_) => 0,
     }
 }

@@ -295,6 +295,20 @@ impl<'a> Parser<'a> {
     }
 }
 
+// ===================================================================
+// 公共 API
+// ===================================================================
+
+/// 解析 JSON 字符串为 Value
+pub fn parse(s: &str) -> Result<Value, String> {
+    Parser::new(s).parse_value()
+}
+
+/// Value 转 JSON 字符串
+pub fn to_string(v: &Value) -> String {
+    format!("{}", v)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -20,6 +20,10 @@ path = "src/main.rs"
 name = "mora-lsp"
 path = "src/bin/lsp.rs"
 
+# v0.04 终态: 删除 mora-mcp 和 mora-serve 二进制
+# 单二进制 mora 根据脚本内 `serve as mcp/http` 块自动选择协议
+# 详见 docs/v0.04-final-cloud-native-rfc.md §6 Slice 6
+
 [dependencies]
 # v10 首次外部依赖：ureq 同步 HTTP 客户端
 # 选择 ureq 而非 reqwest 的理由：ureq 同步阻塞，与同步解释器天然契合

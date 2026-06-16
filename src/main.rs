@@ -17,12 +17,12 @@ fn main() {
     // --version / --help 不显示 banner
     if args.len() >= 2 {
         match args[1].as_str() {
-            "--version" | "-v" => { println!("Mora v0.03"); return; }
+            "--version" | "-v" => { println!("Mora v0.04"); return; }
             "--help" | "-h" => {
-                println!("Mora v0.03 — AI native scripting language");
+                println!("Mora v0.04 — AI 原生 + 云服务原生");
                 println!();
                 println!("Usage:");
-                println!("  mora <file.mora>        Run a script");
+                println!("  mora <file.mora>        Run a script (auto-detect serve as http/mcp/repl)");
                 println!("  mora --repl             Interactive REPL");
                 println!("  mora --check <file>     Type check only");
                 println!("  mora --version          Show version");
@@ -85,7 +85,7 @@ fn install_package(url: &str) {
             .output()
     } else {
         println!("Neither curl nor wget found. Please install one of them.");
-        println!("Or manually download {} to {}", url, dest);
+        println!("Or manually download {} to {}", dest, url);
         return;
     };
 
@@ -136,13 +136,14 @@ fn print_banner() {
     let model = env::var("MORA_AI_MODEL").unwrap_or_else(|_| "gpt-4o-mini".to_string());
     let base_url = env::var("MORA_AI_BASE_URL").unwrap_or_else(|_| "https://api.openai.com/v1".to_string());
 
-    println!("Mora v0.03 — AI native scripting language");
+    println!("Mora v0.04 — AI 原生 + 云服务原生");
     if has_openai_key {
         println!("  AI: real API (model: {}, endpoint: {})", model, base_url);
     } else {
         println!("  AI: mock mode (set OPENAI_API_KEY for real calls)");
     }
-    println!("  Features: ai.stream / ai.tool / memory.* / ai.route / agent.* / ai.budget");
+    println!("  AI 原语: p\"...\" / with / stream / tool / catch e: AiError");
+    println!("  云服务: serve as http/mcp/repl + route + observe/span");
     println!("  Built-in: web.fetch / json.* / file.* / typeck / mora-lsp");
     println!();
 }
@@ -218,7 +219,7 @@ fn run_check(path: &str) {
 }
 
 fn run_repl() {
-    println!("Mora v0.03 REPL — type 'exit' to quit");
+    println!("Mora v0.04 REPL — type 'exit' to quit");
     println!();
 
     let mut interpreter = Interpreter::new();
@@ -255,6 +256,7 @@ fn run_repl() {
             match interpreter.execute(stmt) {
                 Ok(FlowSignal::Return(value)) => println!("= {}", value),
                 Ok(FlowSignal::None) => {}
+                Ok(FlowSignal::Break) | Ok(FlowSignal::Continue) => {}  // v0.04.0: 顶层无 loop
                 Err(e) => eprintln!("Error: {}", e),
             }
         }

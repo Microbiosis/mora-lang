@@ -115,6 +115,66 @@ cargo build --release
 | `MORA_EMBED_MODEL` | Embedding 模型 | `text-embedding-3-small` |
 | `MORA_NO_TYPECK` | 设为 `1` 跳过静态类型检查 | （空 = 启用） |
 
+## v0.04 终态: 云服务原生 (Single-binary Multi-protocol)
+
+v0.04 终态把 HTTP server / MCP server / 可观测全部下沉到语言层。一段 Mora 脚本可以同时起 HTTP + MCP server + trace, 单进程, 零外部依赖。
+
+### `serve` 块 (单二进制多协议)
+
+```mora
+-- 一段代码 = HTTP server + MCP server + 可观测
+observe trace
+
+route fast: "gpt-4o-mini"
+route deep: "gpt-4o"
+
+serve as http on port 3000 do
+  GET "/health" -> fn(req) return {status: "ok"} end
+  POST "/chat"  -> fn(req) return deep(p"用 deep 回答: {req.body.text}") end
+end
+
+serve as mcp do
+  tool search(query: string): string do
+    return "found: " + args["query"]
+  end
+end
+```
+
+跑 `mora script.mora` —— 单进程同时起 HTTP (3000) + MCP (stdio) + trace。
+
+| 协议 | 关键字 | 用途 |
+|------|--------|------|
+| HTTP | `serve as http on port N` | REST API (动态路由) |
+| MCP | `serve as mcp` | Claude Desktop 等 MCP 客户端 |
+| REPL | `serve as repl` | (v0.04.1) |
+| Stdio | `serve as stdio` | (v0.04.1) |
+
+### `route` 块 (模型绑定)
+
+```mora
+route fast: "gpt-4o-mini"
+route deep: "gpt-4o"
+
+let s = fast(p"summarize: {text}")
+let a = deep(p"analyze: {question}")
+```
+
+`fast(p"...")` 自动绑到 `gpt-4o-mini`, `deep(p"...")` 绑到 `gpt-4o`。
+
+### `observe` / `span` 块 (可观测)
+
+```mora
+observe trace
+observe otel endpoint "http://otel-collector:4317"
+
+span "user_request" tags {user_id: u.id} do
+  let r = deep(p"...")
+  record_tokens(input, output)
+end
+```
+
+`observe` 启用 trace, `span` RAII 风格的子块。`record_tokens` 显式计 token。
+
 ## 静态类型检查
 
 Mora v11 在解释执行前自动做一遍轻量静态类型检查。

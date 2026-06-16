@@ -25,7 +25,7 @@ pub enum Stmt {
     TaskDef { name: String, params: Vec<(String, Option<String>)>, return_type: Option<String>, body: Vec<Stmt>, exported: bool, span: Span },
     If { condition: Expr, then_branch: Vec<Stmt>, span: Span },
     For { var: String, var_type: Option<String>, iterable: Expr, body: Vec<Stmt>, span: Span },
-    Try { try_block: Vec<Stmt>, catch_var: String, catch_block: Vec<Stmt>, span: Span },
+    Try { try_block: Vec<Stmt>, catch_var: String, catch_type: Option<String>, catch_block: Vec<Stmt>, span: Span },
     Import { path: String, span: Span },
     Parallel { stmts: Vec<Stmt>, span: Span },
     Match { expr: Expr, arms: Vec<(Pattern, Vec<Stmt>)>, span: Span },
@@ -38,6 +38,70 @@ pub enum Stmt {
     WriteBytesFile { path: Expr, content: Expr, span: Span },
     Return { value: Option<Expr>, span: Span },
     Expr(Expr),
+    // v0.04.0: AI 原语
+    With { bindings: Vec<(String, Expr)>, body: Vec<Stmt>, span: Span },
+    StreamFor { prompt: Expr, var: String, body: Vec<Stmt>, span: Span },
+    ToolDef { name: String, params: Vec<(String, Option<String>)>, return_type: Option<String>, body: Vec<Stmt>, exported: bool, span: Span },
+    Break { span: Span },
+    Continue { span: Span },
+    // v0.04 终态: 云服务原生
+    Serve { protocol: ServeProtocol, routes: Vec<RouteDecl>, body: Vec<Stmt>, span: Span },
+    Route { name: String, target: Expr, span: Span },
+    Observe { config: ObserveConfig, body: Vec<Stmt>, span: Span },
+    Span { name: String, attributes: Vec<(String, Expr)>, body: Vec<Stmt>, span: Span },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ServeProtocol {
+    Http { host: String, port: u16 },
+    Mcp,
+    Repl,
+    Stdio,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum HttpMethod {
+    Get,
+    Post,
+    Put,
+    Delete,
+    Patch,
+}
+
+impl HttpMethod {
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s.to_uppercase().as_str() {
+            "GET" => Some(HttpMethod::Get),
+            "POST" => Some(HttpMethod::Post),
+            "PUT" => Some(HttpMethod::Put),
+            "DELETE" => Some(HttpMethod::Delete),
+            "PATCH" => Some(HttpMethod::Patch),
+            _ => None,
+        }
+    }
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            HttpMethod::Get => "GET",
+            HttpMethod::Post => "POST",
+            HttpMethod::Put => "PUT",
+            HttpMethod::Delete => "DELETE",
+            HttpMethod::Patch => "PATCH",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum RouteDecl {
+    HttpRoute { method: HttpMethod, path: String, handler: Expr },
+    // v0.04 终态 Slice 5: ToolEntry 加 params + return_type 字段用于生成 JSON Schema
+    ToolEntry { name: String, params: Vec<(String, Option<String>)>, return_type: Option<String>, handler: Expr },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ObserveConfig {
+    Trace,
+    Metrics,
+    Otel { endpoint: Expr },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -52,6 +116,10 @@ pub enum Expr {
     Literal(Literal),
     Variable(String, Span),
     Grouping(Box<Expr>, Span),
+    // v0.04.0: AI 原语
+    Prompt { parts: Vec<Expr>, span: Span },
+    // v0.04 终态: route 调用
+    RouteCall { name: String, args: Vec<Box<Expr>>, span: Span },
 }
 
 #[derive(Debug, Clone, PartialEq)]

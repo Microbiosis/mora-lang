@@ -283,10 +283,19 @@ impl TypeChecker {
                 for s in body { self.check_stmt(s, symbols); }
                 symbols.pop_scope();
             }
-            Stmt::Try { try_block, catch_block, .. } => {
+            Stmt::Try { try_block, catch_type, catch_block, .. } => {
                 symbols.push_scope();
                 for s in try_block { self.check_stmt(s, symbols); }
                 symbols.pop_scope();
+                // v0.04.0: catch_type 校验
+                if let Some(t) = catch_type {
+                    if t != "AiError" {
+                        self.errors.push(TypeError::new(
+                            0, // span.line 暂未传（typeck API 已有，但这里用 0 占位）
+                            format!("try/catch: type '{}' not supported (v0.04.0 only supports 'AiError' or no annotation)", t),
+                        ));
+                    }
+                }
                 symbols.push_scope();
                 for s in catch_block { self.check_stmt(s, symbols); }
                 symbols.pop_scope();
@@ -359,6 +368,45 @@ impl TypeChecker {
             }
             Stmt::Expr(expr) => {
                 self.check_expr(expr, symbols);
+            }
+            // v0.04.0: AI 原语
+            Stmt::With { bindings, body, .. } => {
+                symbols.push_scope();
+                // bindings 不在当前 scope 暴露（仅运行时影响）；仍然 typeck
+                for (_key, val_expr) in bindings {
+                    self.check_expr(val_expr, symbols);
+                }
+                for s in body { self.check_stmt(s, symbols); }
+                symbols.pop_scope();
+            }
+            Stmt::StreamFor { prompt, var, body, .. } => {
+                let _ = self.check_expr(prompt, symbols);
+                symbols.push_scope();
+                symbols.define(var.clone(), Type::String);
+                for s in body { self.check_stmt(s, symbols); }
+                symbols.pop_scope();
+            }
+            Stmt::ToolDef { name, params, return_type, body, exported, .. } => {
+                symbols.push_scope();
+                for (pname, phint) in params {
+                    let pty = phint.as_deref().map(Type::from_hint).unwrap_or(Type::Any);
+                    symbols.define(pname.clone(), pty);
+                }
+                let prev_hint = self.current_return_hint.clone();
+                self.current_return_hint = return_type.as_deref().map(Type::from_hint);
+                for s in body { self.check_stmt(s, symbols); }
+                self.current_return_hint = prev_hint;
+                symbols.pop_scope();
+                let declared = return_type.as_deref().map(Type::from_hint).unwrap_or(Type::Any);
+                symbols.define(name.clone(), declared);
+                let _ = exported;
+            }
+            Stmt::Break { .. } | Stmt::Continue { .. } => {
+                // v0.04.0 简化:仅警告(v0.04.1 强制"必须在 loop 内")
+            }
+            // v0.04 终态: 云服务原生 —— Slice 1 stub
+            Stmt::Serve { .. } | Stmt::Route { .. } | Stmt::Observe { .. } | Stmt::Span { .. } => {
+                // Slice 1 stub: 不做严格检查
             }
         }
     }
@@ -437,6 +485,20 @@ impl TypeChecker {
                 ty
             }
             Expr::Grouping(inner, _) => self.check_expr(inner, symbols),
+            // v0.04.0: p"..." 表达式 type = String
+            Expr::Prompt { parts, .. } => {
+                for p in parts {
+                    let _ = self.check_expr(p, symbols);
+                }
+                Type::String
+            }
+            // v0.04 终态 Slice 2: RouteCall type = String
+            Expr::RouteCall { args, .. } => {
+                for a in args {
+                    let _ = self.check_expr(a, symbols);
+                }
+                Type::String
+            }
         }
     }
 
@@ -567,7 +629,9 @@ fn expr_debug_line(expr: &Expr) -> usize {
         | Expr::MethodCall { span, .. }
         | Expr::Index { span, .. }
         | Expr::Closure { span, .. }
-        | Expr::Match { span, .. } => span.line,
+        | Expr::Match { span, .. }
+        | Expr::Prompt { span, .. }
+        | Expr::RouteCall { span, .. } => span.line,
         Expr::Literal(lit) => literal_debug_line(lit),
         Expr::Variable(_, span) | Expr::Grouping(_, span) => span.line,
     }

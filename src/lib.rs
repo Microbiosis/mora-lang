@@ -9,3 +9,6 @@ pub mod lexer;
 pub mod parser;
 pub mod typeck;
 pub mod lsp;
+pub mod trace;
+pub mod http_server;
+pub mod mcp_server;

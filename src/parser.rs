@@ -97,6 +97,21 @@ impl Parser {
         }
     }
 
+    /// peek 当前 token 是否是名字为 `name` 的普通标识符
+    fn peek_is_identifier(&self, name: &str) -> bool {
+        matches!(self.peek(), Some(Token { token_type: TokenType::Identifier(n), .. }) if n == name)
+    }
+
+    /// 消耗当前 token, 若是指定名字的普通标识符则返回 true; 否则不消耗并返回 false
+    fn match_identifier(&mut self, name: &str) -> bool {
+        if self.peek_is_identifier(name) {
+            self.advance();
+            true
+        } else {
+            false
+        }
+    }
+
     fn statement(&mut self) -> Option<Stmt> {
         if self.match_token(&[TokenType::If]) { Some(self.if_statement()) }
         else if self.match_token(&[TokenType::For]) { Some(self.for_statement()) }
@@ -122,6 +137,9 @@ impl Parser {
         else if self.match_token(&[TokenType::Route]) { Some(self.route_statement()) }
         else if self.match_token(&[TokenType::Observe]) { Some(self.observe_statement()) }
         else if self.match_token(&[TokenType::Span]) { Some(self.span_statement()) }
+        // v0.04.0 终态补: 显式 token 计数（RFC §2.4）
+        // 词法把 "record_tokens" 整体当普通标识符；match_identifier 先消耗它, 然后调 record_tokens_statement
+        else if self.match_identifier("record_tokens") { Some(self.record_tokens_statement()) }
         else if self.check_index_assignment() { Some(self.index_assignment()) }
         else if self.check_assignment() { Some(self.assignment_statement()) }
         else { self.expression_statement() }
@@ -486,14 +504,27 @@ impl Parser {
         loop {
             if self.match_token(&[TokenType::LParen]) {
                 let span = self.span_of_previous_keyword();
-                let args = if self.check(&TokenType::RParen) { vec![] } else { self.arguments() };
-                self.consume(&TokenType::RParen, "Expected ')' after arguments");
-                if let Expr::Variable(name, _) = expr {
-                    // v0.04 终态 Slice 2: IDENT(args) 默认 Call
-                    // 解释器在 evaluate 时会先检查 route_registry
-                    // (已注册 → 走 RouteCall 路径; 未注册 → 普通 Call)
-                    expr = Expr::Call { callee: name, args, span };
+                if let Expr::Variable(name, _) = &expr {
+                    if name == "ai_model" {
+                        // ai_model(...) 走专用解析, 支持 keyword arg
+                        expr = self.parse_ai_model_call(span);
+                    } else if self.check(&TokenType::RParen) {
+                        // 空参, 直接生成 Call
+                        self.advance();
+                        expr = Expr::Call { callee: name.clone(), args: vec![], span };
+                    } else {
+                        let args = self.arguments();
+                        self.consume(&TokenType::RParen, "Expected ')' after arguments");
+                        expr = Expr::Call { callee: name.clone(), args, span };
+                    }
                 } else {
+                    // 其他表达式后接 (...): 不允许 (v1 限制)
+                    if self.check(&TokenType::RParen) {
+                        self.advance();
+                    } else {
+                        let _args = self.arguments();
+                        self.consume(&TokenType::RParen, "Expected ')' after arguments");
+                    }
                     panic!("Can only call functions by name in Mora v1");
                 }
             } else if self.match_token(&[TokenType::LBracket]) {
@@ -1128,6 +1159,58 @@ impl Parser {
             Vec::new()
         };
         Stmt::Span { name, attributes, body, span }
+    }
+
+    /// `record_tokens(<input>, <output>)` 顶层语句
+    /// v0.04.0 终态补: 显式 token 计数（RFC §2.4 / §3.3）
+    /// 词法把 `record_tokens` 当作普通 Identifier; statement() 在分派前用 match_identifier
+    /// 消耗该标识符后调用本函数。
+    fn record_tokens_statement(&mut self) -> Stmt {
+        let span = self.span_of_previous_keyword();
+        self.consume(&TokenType::LParen, "Expected '(' after 'record_tokens'");
+        let input = self.expression();
+        self.consume(&TokenType::Comma, "Expected ',' between record_tokens args");
+        let output = self.expression();
+        self.consume(&TokenType::RParen, "Expected ')' after record_tokens args");
+        Stmt::RecordTokens { input, output, span }
+    }
+
+    /// `ai_model(<model>, [temperature: T], [max_tokens: N], [system: "..."])`
+    /// v0.04 终态补: 路由元数据表达式（RFC §2.3）
+    /// 在 LParen 已被消耗后调用; 结束时需消耗 RParen
+    fn parse_ai_model_call(&mut self, span: Span) -> Expr {
+        // 第一参数必为 model 名字符串
+        if self.check(&TokenType::RParen) {
+            panic!("ai_model: missing model name argument");
+        }
+        let model = self.expression();
+        // 解析可选 keyword args: temperature: / max_tokens: / system:
+        let mut temperature = None;
+        let mut max_tokens = None;
+        let mut system = None;
+        while self.match_token(&[TokenType::Comma]) {
+            // 期望 IDENT: expr
+            let key = match self.advance() {
+                Some(Token { token_type: TokenType::Identifier(n), .. }) => n.clone(),
+                _ => panic!("ai_model: expected keyword name (temperature/max_tokens/system)"),
+            };
+            self.consume(&TokenType::Colon, "ai_model: expected ':' after keyword");
+            let val = self.expression();
+            match key.as_str() {
+                "temperature" => temperature = Some(Box::new(val)),
+                "max_tokens" => max_tokens = Some(Box::new(val)),
+                "system" => system = Some(Box::new(val)),
+                other => panic!("ai_model: unknown keyword '{}' (valid: temperature, max_tokens, system)", other),
+            }
+        }
+        self.consume(&TokenType::RParen, "Expected ')' after ai_model args");
+        Expr::AiModelCall {
+            model: Box::new(model),
+            temperature,
+            max_tokens,
+            system,
+            span,
+        }
     }
 }
 

@@ -2,11 +2,10 @@
 
 use std::env;
 use std::fs;
-use std::io::{self, Write};
 use std::process;
 use std::path::Path;
 
-use mora::interpreter::{FlowSignal, Interpreter};
+use mora::interpreter::Interpreter;
 use mora::lexer::Lexer;
 use mora::parser::Parser;
 use mora::typeck;
@@ -136,15 +135,16 @@ fn print_banner() {
     let model = env::var("MORA_AI_MODEL").unwrap_or_else(|_| "gpt-4o-mini".to_string());
     let base_url = env::var("MORA_AI_BASE_URL").unwrap_or_else(|_| "https://api.openai.com/v1".to_string());
 
-    println!("Mora v0.04 — AI 原生 + 云服务原生");
+    println!("Mora v0.04");
     if has_openai_key {
         println!("  AI: real API (model: {}, endpoint: {})", model, base_url);
     } else {
         println!("  AI: mock mode (set OPENAI_API_KEY for real calls)");
     }
     println!("  AI 原语: p\"...\" / with / stream / tool / catch e: AiError");
-    println!("  云服务: serve as http/mcp/repl + route + observe/span");
+    println!("  serve: http / mcp / repl / stdio + route + observe / span");
     println!("  Built-in: web.fetch / json.* / file.* / typeck / mora-lsp");
+    println!("  ⚠  v0.04 不兼容 v0.03 builtin (ai.chat/stream/tool/budget/route/usage/embed/cosine/search/memory.* 均报 Unknown method)");
     println!();
 }
 
@@ -219,46 +219,6 @@ fn run_check(path: &str) {
 }
 
 fn run_repl() {
-    println!("Mora v0.04 REPL — type 'exit' to quit");
-    println!();
-
     let mut interpreter = Interpreter::new();
-    let stdin = io::stdin();
-
-    loop {
-        print!("mora> ");
-        io::stdout().flush().unwrap();
-
-        let mut line = String::new();
-        if stdin.read_line(&mut line).is_err() {
-            break;
-        }
-
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        if line == "exit" || line == "quit" {
-            println!("Bye!");
-            break;
-        }
-
-        let mut lexer = Lexer::new(line);
-        let tokens = lexer.scan_tokens();
-        let mut parser = Parser::new(tokens);
-        let stmts = parser.parse();
-
-        if stmts.is_empty() {
-            continue;
-        }
-
-        for stmt in &stmts {
-            match interpreter.execute(stmt) {
-                Ok(FlowSignal::Return(value)) => println!("= {}", value),
-                Ok(FlowSignal::None) => {}
-                Ok(FlowSignal::Break) | Ok(FlowSignal::Continue) => {}  // v0.04.0: 顶层无 loop
-                Err(e) => eprintln!("Error: {}", e),
-            }
-        }
-    }
+    Interpreter::run_repl_with(&mut interpreter);
 }

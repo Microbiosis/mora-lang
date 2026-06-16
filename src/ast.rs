@@ -49,6 +49,9 @@ pub enum Stmt {
     Route { name: String, target: Expr, span: Span },
     Observe { config: ObserveConfig, body: Vec<Stmt>, span: Span },
     Span { name: String, attributes: Vec<(String, Expr)>, body: Vec<Stmt>, span: Span },
+    /// v0.04.0 终态补: 显式 token 计数（RFC §2.4 / §3.3）
+    /// 语义: 累加到当前 TraceCollector，不触发预算超限
+    RecordTokens { input: Expr, output: Expr, span: Span },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -120,6 +123,15 @@ pub enum Expr {
     Prompt { parts: Vec<Expr>, span: Span },
     // v0.04 终态: route 调用
     RouteCall { name: String, args: Vec<Box<Expr>>, span: Span },
+    // v0.04 终态补: ai_model(...) 路由元数据表达式（RFC §2.3）
+    // 解析: ai_model("model-name", temperature: 0.7, max_tokens: 2000, system: "...")
+    AiModelCall {
+        model: Box<Expr>,
+        temperature: Option<Box<Expr>>,
+        max_tokens: Option<Box<Expr>>,
+        system: Option<Box<Expr>>,
+        span: Span,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]

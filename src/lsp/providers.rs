@@ -117,6 +117,12 @@ fn collect_references(stmts: &[Stmt], name: &str, refs: &mut Vec<(usize, usize)>
             Expr::RouteCall { args, .. } => {
                 for a in args { walk_expr(a, name, refs); }
             }
+            Expr::AiModelCall { model, temperature, max_tokens, system, .. } => {
+                walk_expr(model, name, refs);
+                if let Some(t) = temperature { walk_expr(t, name, refs); }
+                if let Some(n) = max_tokens { walk_expr(n, name, refs); }
+                if let Some(s) = system { walk_expr(s, name, refs); }
+            }
             Expr::Call { callee, args, span, .. } => {
                 if callee == name {
                     refs.push((span.line, span.column));
@@ -893,7 +899,8 @@ fn end_stmt_span_line(stmt: &Stmt) -> usize {
         | Stmt::Serve { span, .. }
         | Stmt::Route { span, .. }
         | Stmt::Observe { span, .. }
-        | Stmt::Span { span, .. } => span.line,
+        | Stmt::Span { span, .. }
+        | Stmt::RecordTokens { span, .. } => span.line,
         Stmt::Expr(_) => 0,
     }
 }

@@ -405,8 +405,29 @@ impl TypeChecker {
                 // v0.04.0 简化:仅警告(v0.04.1 强制"必须在 loop 内")
             }
             // v0.04 终态: 云服务原生 —— Slice 1 stub
-            Stmt::Serve { .. } | Stmt::Route { .. } | Stmt::Observe { .. } | Stmt::Span { .. } => {
+            Stmt::Serve { .. } | Stmt::Observe { .. } | Stmt::Span { .. } => {
                 // Slice 1 stub: 不做严格检查
+            }
+            // v0.04 终态补: Stmt::Route 必须递归 typeck target, 触发 ai_model 校验
+            Stmt::Route { target, .. } => {
+                self.check_expr(target, symbols);
+            }
+            // v0.04.0 终态补: record_tokens 参数必须 number
+            Stmt::RecordTokens { input, output, span, .. } => {
+                let in_ty = self.check_expr(input, symbols);
+                if !matches!(in_ty, Type::Number | Type::Any) {
+                    self.errors.push(TypeError::new(
+                        span.line,
+                        format!("record_tokens: input must be number, got '{}'", in_ty.name()),
+                    ));
+                }
+                let out_ty = self.check_expr(output, symbols);
+                if !matches!(out_ty, Type::Number | Type::Any) {
+                    self.errors.push(TypeError::new(
+                        span.line,
+                        format!("record_tokens: output must be number, got '{}'", out_ty.name()),
+                    ));
+                }
             }
         }
     }
@@ -498,6 +519,45 @@ impl TypeChecker {
                     let _ = self.check_expr(a, symbols);
                 }
                 Type::String
+            }
+            // v0.04 终态补: ai_model(...) 表达式 type = Dict
+            // 校验: model 字符串, temperature/max_tokens number, system string
+            Expr::AiModelCall { model, temperature, max_tokens, system, span } => {
+                let mt = self.check_expr(model, symbols);
+                if !matches!(mt, Type::String | Type::Any) {
+                    self.errors.push(TypeError::new(
+                        span.line,
+                        format!("ai_model: model name must be string, got '{}'", mt.name()),
+                    ));
+                }
+                if let Some(t) = temperature {
+                    let tt = self.check_expr(t, symbols);
+                    if !matches!(tt, Type::Number | Type::Any) {
+                        self.errors.push(TypeError::new(
+                            span.line,
+                            format!("ai_model: temperature must be number, got '{}'", tt.name()),
+                        ));
+                    }
+                }
+                if let Some(n) = max_tokens {
+                    let nt = self.check_expr(n, symbols);
+                    if !matches!(nt, Type::Number | Type::Any) {
+                        self.errors.push(TypeError::new(
+                            span.line,
+                            format!("ai_model: max_tokens must be number, got '{}'", nt.name()),
+                        ));
+                    }
+                }
+                if let Some(s) = system {
+                    let st = self.check_expr(s, symbols);
+                    if !matches!(st, Type::String | Type::Any) {
+                        self.errors.push(TypeError::new(
+                            span.line,
+                            format!("ai_model: system must be string, got '{}'", st.name()),
+                        ));
+                    }
+                }
+                Type::Dict
             }
         }
     }
@@ -631,7 +691,8 @@ fn expr_debug_line(expr: &Expr) -> usize {
         | Expr::Closure { span, .. }
         | Expr::Match { span, .. }
         | Expr::Prompt { span, .. }
-        | Expr::RouteCall { span, .. } => span.line,
+        | Expr::RouteCall { span, .. }
+        | Expr::AiModelCall { span, .. } => span.line,
         Expr::Literal(lit) => literal_debug_line(lit),
         Expr::Variable(_, span) | Expr::Grouping(_, span) => span.line,
     }

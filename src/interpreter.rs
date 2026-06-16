@@ -8,7 +8,7 @@ use std::time::Duration;
 use crate::ast::*;
 use crate::lexer::Lexer;
 use crate::parser::Parser;
-use crate::trace::collector::TraceCollector;
+use crate::trace_collector::TraceCollector;
 
 /// 包装 BufReader<Box<dyn Read + Send + Sync>>，实现 Debug/Clone
 #[derive(Clone)]
@@ -169,7 +169,7 @@ pub struct Interpreter {
     globals: Arc<Mutex<Environment>>,
     environment: Arc<Mutex<Environment>>,
     tool_registry: HashMap<String, ToolDef>,
-    memory_store: Vec<MemoryEntry>,
+    // v0.04 终态补: memory_store 字段已删除（RFC §4.1 memory.* builtin 推迟到 v1.0）
     model_routes: HashMap<String, RouteConfig>,
     token_budget: Option<TokenBudget>,
     token_usage: TokenUsage,
@@ -186,7 +186,7 @@ impl Clone for Interpreter {
             globals: self.globals.clone(),
             environment: self.environment.clone(),
             tool_registry: self.tool_registry.clone(),
-            memory_store: self.memory_store.clone(),
+            // v0.04 终态补: memory_store 字段已删除（RFC §4.1 memory.* 推迟到 v1.0）
             model_routes: self.model_routes.clone(),
             token_budget: self.token_budget.clone(),
             token_usage: self.token_usage.clone(),
@@ -221,13 +221,7 @@ struct RouteConfig {
     system: Option<String>,
 }
 
-/// 记忆条目
-#[derive(Clone)]
-struct MemoryEntry {
-    key: String,
-    text: String,
-    embedding: Vec<f64>,
-}
+/// 记忆条目 — v0.04 终态补: 字段已删 (RFC §4.1 memory.* 推迟到 v1.0)
 
 /// 工具定义（注册时存储）
 #[derive(Clone)]
@@ -259,7 +253,7 @@ impl Interpreter {
         globals.lock().unwrap().define("print".to_string(), Value::Builtin("print".to_string()), false);
         globals.lock().unwrap().define("range".to_string(), Value::Builtin("range".to_string()), false);
         globals.lock().unwrap().define("len".to_string(), Value::Builtin("len".to_string()), false);
-        Self { globals: globals.clone(), environment: globals, tool_registry: HashMap::new(), memory_store: Vec::new(), model_routes: HashMap::new(), token_budget: None, token_usage: TokenUsage::default(), trace: TraceCollector::new(false), route_registry: HashMap::new() }
+        Self { globals: globals.clone(), environment: globals, tool_registry: HashMap::new(), model_routes: HashMap::new(), token_budget: None, token_usage: TokenUsage::default(), trace: TraceCollector::new(false), route_registry: HashMap::new() }
     }
 
     /// v0.04 终态: 构造一个空 Interpreter (用于 std::mem::replace 占位)
@@ -270,7 +264,6 @@ impl Interpreter {
             globals: globals.clone(),
             environment: globals,
             tool_registry: HashMap::new(),
-            memory_store: Vec::new(),
             model_routes: HashMap::new(),
             token_budget: None,
             token_usage: TokenUsage::default(),
@@ -281,7 +274,7 @@ impl Interpreter {
 
     pub fn new_with_globals(globals: Arc<Mutex<Environment>>) -> Self {
         let env = Arc::new(Mutex::new(Environment::with_parent(globals.clone())));
-        Self { globals: globals.clone(), environment: env, tool_registry: HashMap::new(), memory_store: Vec::new(), model_routes: HashMap::new(), token_budget: None, token_usage: TokenUsage::default(), trace: TraceCollector::new(false), route_registry: HashMap::new() }
+        Self { globals: globals.clone(), environment: env, tool_registry: HashMap::new(), model_routes: HashMap::new(), token_budget: None, token_usage: TokenUsage::default(), trace: TraceCollector::new(false), route_registry: HashMap::new() }
     }
 
     #[allow(dead_code)]
@@ -733,22 +726,47 @@ impl Interpreter {
                         Ok(body_signal)
                     }
                     ServeProtocol::Repl => {
-                        eprintln!("[serve] REPL not yet implemented");
+                        // v0.04 终态补: 真实 REPL 入口（与 main.rs --repl 共享同一份代码）
+                        // 移交 self 到 &mut, REPL 接管 stdin
+                        eprintln!("[serve] starting REPL on stdin");
+                        let mut taken = std::mem::replace(self, Interpreter::new_empty());
+                        Interpreter::run_repl_with(&mut taken);
                         Ok(FlowSignal::None)
                     }
                     ServeProtocol::Stdio => {
-                        eprintln!("[serve] Stdio not yet implemented");
+                        // v0.04 终态补: 简化的 stdio 协议 —— 读 stdin 一行, 执行 body 中
+                        // 注册的 handler (无 handler 时回显该行), 写回 stdout。
+                        // v0.04 范围内只做最简 echo 占位（RFC §2.2 提到 "自定义协议" 留给 v0.04.1）
+                        eprintln!("[serve] starting stdio server (echo mode, type 'exit' to quit)");
+                        Self::serve_stdio_echo();
                         Ok(FlowSignal::None)
                     }
                 }
             }
             // v0.04 终态 Slice 2: route 块
             Stmt::Route { name, target, .. } => {
-                let model_name = match self.evaluate(target)? {
-                    Value::String(s) => s,
+                // v0.04 终态补: 接受三种 target 形态
+                //   1. Expr::String("model-name")        —— v0.04 终态裸字符串写法
+                //   2. Expr::AiModelCall{...}            —— v0.04 RFC §2.3 终态 ai_model 写法
+                //   3. 其他 expr 错误
+                let target_val = self.evaluate(target)?;
+                let model_name = match &target_val {
+                    Value::String(s) => s.clone(),
+                    Value::Dict(m) => {
+                        // ai_model(...) 解释后返回的 dict 含 _model 字段
+                        match m.get("_model") {
+                            Some(Value::String(s)) => s.clone(),
+                            _ => {
+                                return Err(format!(
+                                    "route '{}' target dict missing _model field",
+                                    name
+                                ));
+                            }
+                        }
+                    }
                     other => {
                         return Err(format!(
-                            "route '{}' target must be a string, got {}",
+                            "route '{}' target must be a string or ai_model(...), got {}",
                             name, other
                         ));
                     }
@@ -806,8 +824,81 @@ impl Interpreter {
                 }
                 result
             }
+            // v0.04.0 终态补: 显式 token 计数（RFC §2.4）
+            // 语义: 累加到 TraceCollector; 不触发预算超限
+            //     (预算检查在 track_tokens 即 API 自动返回时; record_tokens 是用户声明)
+            Stmt::RecordTokens { input, output, span: _ } => {
+                let in_val = self.evaluate(input)?;
+                let out_val = self.evaluate(output)?;
+                let in_n = match &in_val {
+                    Value::Number(n) => *n as u64,
+                    _ => return Err(format!("record_tokens: input must be number, got {}", in_val)),
+                };
+                let out_n = match &out_val {
+                    Value::Number(n) => *n as u64,
+                    _ => return Err(format!("record_tokens: output must be number, got {}", out_val)),
+                };
+                self.trace.record_tokens(in_n, out_n);
+                Ok(FlowSignal::None)
+            }
         }   // ← match stmt { ... } 闭合
     }       // ← pub fn execute(...) 闭合
+
+    /// v0.04 终态补: REPL 入口（main.rs 和 serve as repl 共用）
+    /// 与 main.rs::run_repl 行为一致：循环读 stdin, 逐行 tokenize+parse+execute
+    /// 接收外部 &mut Interpreter 保留 setup 代码的 state
+    pub fn run_repl_with(interp: &mut Interpreter) {
+        use std::io::{self, BufRead, Write};
+        println!("Mora v0.04 REPL — type 'exit' to quit");
+        println!();
+        let stdin = io::stdin();
+        let mut handle = stdin.lock();
+        let mut line = String::new();
+        loop {
+            print!("mora> ");
+            let _ = io::stdout().flush();
+            line.clear();
+            if handle.read_line(&mut line).is_err() { break; }
+            let trimmed = line.trim();
+            if trimmed.is_empty() { continue; }
+            if trimmed == "exit" || trimmed == "quit" {
+                println!("Bye!");
+                break;
+            }
+            let tokens = Lexer::new(trimmed).scan_tokens();
+            let stmts = Parser::new(tokens).parse();
+            if stmts.is_empty() { continue; }
+            for stmt in &stmts {
+                match interp.execute(stmt) {
+                    Ok(FlowSignal::Return(v)) => println!("= {}", v),
+                    Ok(FlowSignal::None) => {}
+                    Ok(FlowSignal::Break) | Ok(FlowSignal::Continue) => {}
+                    Err(e) => eprintln!("Error: {}", e),
+                }
+            }
+        }
+    }
+
+    /// v0.04 终态补: serve as stdio 最简 echo 占位
+    /// 设计: 阻塞读 stdin, 每行回写到 stdout 前缀 `echo: `
+    /// v0.04.1 跟进: body 中可注册 handler, 走自定义协议
+    fn serve_stdio_echo() {
+        use std::io::{self, BufRead, Write};
+        let stdin = io::stdin();
+        let mut handle = stdin.lock();
+        let stdout = io::stdout();
+        let mut out = stdout.lock();
+        let mut line = String::new();
+        loop {
+            line.clear();
+            if handle.read_line(&mut line).is_err() { break; }
+            let trimmed = line.trim();
+            if trimmed == "exit" || trimmed == "quit" { break; }
+            if trimmed.is_empty() { continue; }
+            let _ = writeln!(out, "echo: {}", trimmed);
+            let _ = out.flush();
+        }
+    }
 
     fn restore_env(key: &str, prev: &Option<String>) {
         match prev {
@@ -1113,6 +1204,38 @@ impl Interpreter {
                 }
                 let prompt_str = Self::eval_route_arg(&args[0], self)?;
                 Self::do_ai_chat(self, &model, &prompt_str)
+            }
+            // v0.04 终态补: ai_model("name", temperature: 0.7, ...) 表达式
+            // 求值后返回 Dict {_model, temperature?, max_tokens?, system?}
+            Expr::AiModelCall { model, temperature, max_tokens, system, span: _ } => {
+                let model_str = match self.evaluate(model)? {
+                    Value::String(s) => s,
+                    other => return Err(format!("ai_model: model name must be string, got {}", other)),
+                };
+                let mut m = std::collections::HashMap::new();
+                m.insert("_model".to_string(), Value::String(model_str));
+                if let Some(t) = temperature {
+                    let v = self.evaluate(t)?;
+                    if !matches!(v, Value::Number(_)) {
+                        return Err(format!("ai_model: temperature must be number, got {}", v));
+                    }
+                    m.insert("temperature".to_string(), v);
+                }
+                if let Some(n) = max_tokens {
+                    let v = self.evaluate(n)?;
+                    if !matches!(v, Value::Number(_)) {
+                        return Err(format!("ai_model: max_tokens must be number, got {}", v));
+                    }
+                    m.insert("max_tokens".to_string(), v);
+                }
+                if let Some(s) = system {
+                    let v = self.evaluate(s)?;
+                    if !matches!(v, Value::String(_)) {
+                        return Err(format!("ai_model: system must be string, got {}", v));
+                    }
+                    m.insert("system".to_string(), v);
+                }
+                Ok(Value::Dict(m))
             }
         }
     }
@@ -1842,7 +1965,11 @@ impl Interpreter {
     // ===================================================================
     // v0.03: memory.* — 长期记忆（向量存储 + 语义检索）
     // ===================================================================
+    // v0.04 终态: memory.* builtin 全部移除（RFC §4.1 推迟到 v1.0）
+    //   get_embedding / mock_bow_embedding / extract_embeddings 无 builtin caller
+    //   留作"v1.0 复活点", 用 #[allow(dead_code)] 抑制 warning
 
+    #[allow(dead_code)]
     fn get_embedding(&self, text: &str) -> Result<Vec<f64>, String> {
         // v0.04 终态: 只支持 mock embedding (real_ai_embed_strings 已删除, v1.0 恢复)
         Ok(mock_bow_embedding(text))
@@ -2530,6 +2657,8 @@ suggestion: <improvement suggestion or "none">"#,
 
     /// Mock 工具调用（无 API Key 时，调用第一个注册的工具）
 
+    /// v0.04 终态补: mock 流占位, 无 builtin caller, 留作 v1.0 复活点
+    #[allow(dead_code)]
     fn create_mock_stream(prompt: &str) -> Value {
         let mock_text = format!("[Mock stream for: {}]", prompt);
         let mut sse_data = String::new();
@@ -2569,6 +2698,8 @@ suggestion: <improvement suggestion or "none">"#,
 
 // 实际接收 strings 的版本（避免 self 借用冲突）
 
+/// v0.04 终态补: ai.embed builtin 移除, 留作 v1.0 复活点
+#[allow(dead_code)]
 fn extract_embeddings(json_text: &str, expected_count: usize) -> Result<Value, String> {
     let root = json_to_value(json_text)?;
     let data = if let Value::Dict(ref map) = root {
@@ -3138,6 +3269,9 @@ mod embed_tests {
         assert!(diffs > 0);
     }
 }
+/// v0.04 终态补: 向量相似度/距离工具函数, v0.03 ai.cosine/dot/euclidean/norm 推迟到 v1.0
+/// 保留为 "v1.0 复活点" + 内部测试用
+#[allow(dead_code)]
 /// 余弦相似度: (a·b) / (||a|| * ||b||)，范围 [-1, 1]
 fn cosine_similarity(a: &[f64], b: &[f64]) -> Result<f64, String> {
     if a.len() != b.len() {
@@ -3153,6 +3287,7 @@ fn cosine_similarity(a: &[f64], b: &[f64]) -> Result<f64, String> {
 }
 
 /// 点积: a·b
+#[allow(dead_code)]
 fn dot_product(a: &[f64], b: &[f64]) -> Result<f64, String> {
     if a.len() != b.len() {
         return Err(format!("dot_product: length mismatch ({} vs {})", a.len(), b.len()));
@@ -3161,6 +3296,7 @@ fn dot_product(a: &[f64], b: &[f64]) -> Result<f64, String> {
 }
 
 /// 欧氏距离: sqrt(sum((a-b)^2))
+#[allow(dead_code)]
 fn euclidean_distance(a: &[f64], b: &[f64]) -> Result<f64, String> {
     if a.len() != b.len() {
         return Err(format!("euclidean_distance: length mismatch ({} vs {})", a.len(), b.len()));
@@ -3169,6 +3305,7 @@ fn euclidean_distance(a: &[f64], b: &[f64]) -> Result<f64, String> {
 }
 
 /// L2 范数: sqrt(sum(x^2))
+#[allow(dead_code)]
 fn l2_norm(a: &[f64]) -> f64 {
     a.iter().map(|x| x * x).sum::<f64>().sqrt()
 }

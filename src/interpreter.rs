@@ -169,16 +169,16 @@ pub struct Interpreter {
     globals: Arc<Mutex<Environment>>,
     environment: Arc<Mutex<Environment>>,
     tool_registry: HashMap<String, ToolDef>,
-    // v0.04 终态补: memory_store 字段已删除（RFC §4.1 memory.* builtin 推迟到 v1.0）
+    // v0.04补: memory_store 字段已删除（RFC §4.1 memory.* builtin 推迟到 v1.0）
     model_routes: HashMap<String, RouteConfig>,
     token_budget: Option<TokenBudget>,
     token_usage: TokenUsage,
     pub trace: TraceCollector,
-    // v0.04 终态 Slice 2: route registry (name -> model name)
+    // v0.04 Slice 2: route registry (name -> model name)
     route_registry: HashMap<String, String>,
 }
 
-// v0.04 终态: 显式实现 Clone 而非 derive
+// v0.04: 显式实现 Clone 而非 derive
 // (HashMap/Vec 字段需要 clone; Arc/Option 内部; TraceCollector 自身 derive Clone)
 impl Clone for Interpreter {
     fn clone(&self) -> Self {
@@ -186,7 +186,7 @@ impl Clone for Interpreter {
             globals: self.globals.clone(),
             environment: self.environment.clone(),
             tool_registry: self.tool_registry.clone(),
-            // v0.04 终态补: memory_store 字段已删除（RFC §4.1 memory.* 推迟到 v1.0）
+            // v0.04补: memory_store 字段已删除（RFC §4.1 memory.* 推迟到 v1.0）
             model_routes: self.model_routes.clone(),
             token_budget: self.token_budget.clone(),
             token_usage: self.token_usage.clone(),
@@ -221,7 +221,7 @@ struct RouteConfig {
     system: Option<String>,
 }
 
-/// 记忆条目 — v0.04 终态补: 字段已删 (RFC §4.1 memory.* 推迟到 v1.0)
+/// 记忆条目 — v0.04补: 字段已删 (RFC §4.1 memory.* 推迟到 v1.0)
 
 /// 工具定义（注册时存储）
 #[derive(Clone)]
@@ -256,7 +256,7 @@ impl Interpreter {
         Self { globals: globals.clone(), environment: globals, tool_registry: HashMap::new(), model_routes: HashMap::new(), token_budget: None, token_usage: TokenUsage::default(), trace: TraceCollector::new(false), route_registry: HashMap::new() }
     }
 
-    /// v0.04 终态: 构造一个空 Interpreter (用于 std::mem::replace 占位)
+    /// v0.04: 构造一个空 Interpreter (用于 std::mem::replace 占位)
     /// 空 Interpreter 不能跑 execute, 仅作为占位符存在
     pub fn new_empty() -> Self {
         let globals = Arc::new(Mutex::new(Environment::new()));
@@ -617,7 +617,7 @@ impl Interpreter {
             Stmt::StreamFor { prompt, var, body, span: _ } => {
                 // 求值 prompt（应当是 Prompt 表达式，返回 Value::Stream）
                 let prompt_str = Self::eval_prompt_parts_from_stmt(prompt, self)?;
-                // v0.04 终态: stream 块简化 — mock 模式按字符拆 token
+                // v0.04: stream 块简化 — mock 模式按字符拆 token
                 // (v0.04.1 跟进真实 streaming SSE)
                 let tokens: Vec<String> = prompt_str.chars().map(|c| c.to_string()).collect();
                 for token in tokens {
@@ -653,7 +653,7 @@ impl Interpreter {
             }
             Stmt::Break { span: _ } => Ok(FlowSignal::Break),
             Stmt::Continue { span: _ } => Ok(FlowSignal::Continue),
-            // v0.04 终态 Slice 1: serve 块
+            // v0.04 Slice 1: serve 块
             Stmt::Serve { protocol, routes, body, span: _ } => {
                 match protocol {
                     ServeProtocol::Http { host, port } => {
@@ -691,7 +691,7 @@ impl Interpreter {
                             if let RouteDecl::ToolEntry { name, params, return_type, handler } = r {
                                 // 求值 handler (闭包)
                                 let handler_value = self.evaluate(&handler)?;
-                                // v0.04 终态 Slice 5: 自动生成 JSON Schema (从 params + 类型 hint)
+                                // v0.04 Slice 5: 自动生成 JSON Schema (从 params + 类型 hint)
                                 let param_names: Vec<String> = params.iter().map(|(n, _)| n.clone()).collect();
                                 let param_types: Vec<String> = params.iter()
                                     .map(|(_, t)| t.clone().unwrap_or_else(|| "string".to_string()))
@@ -726,7 +726,7 @@ impl Interpreter {
                         Ok(body_signal)
                     }
                     ServeProtocol::Repl => {
-                        // v0.04 终态补: 真实 REPL 入口（与 main.rs --repl 共享同一份代码）
+                        // v0.04补: 真实 REPL 入口（与 main.rs --repl 共享同一份代码）
                         // 移交 self 到 &mut, REPL 接管 stdin
                         eprintln!("[serve] starting REPL on stdin");
                         let mut taken = std::mem::replace(self, Interpreter::new_empty());
@@ -734,7 +734,7 @@ impl Interpreter {
                         Ok(FlowSignal::None)
                     }
                     ServeProtocol::Stdio => {
-                        // v0.04 终态补: 简化的 stdio 协议 —— 读 stdin 一行, 执行 body 中
+                        // v0.04补: 简化的 stdio 协议 —— 读 stdin 一行, 执行 body 中
                         // 注册的 handler (无 handler 时回显该行), 写回 stdout。
                         // v0.04 范围内只做最简 echo 占位（RFC §2.2 提到 "自定义协议" 留给 v0.04.1）
                         eprintln!("[serve] starting stdio server (echo mode, type 'exit' to quit)");
@@ -743,10 +743,10 @@ impl Interpreter {
                     }
                 }
             }
-            // v0.04 终态 Slice 2: route 块
+            // v0.04 Slice 2: route 块
             Stmt::Route { name, target, .. } => {
-                // v0.04 终态补: 接受三种 target 形态
-                //   1. Expr::String("model-name")        —— v0.04 终态裸字符串写法
+                // v0.04补: 接受三种 target 形态
+                //   1. Expr::String("model-name")        —— v0.04裸字符串写法
                 //   2. Expr::AiModelCall{...}            —— v0.04 RFC §2.3 终态 ai_model 写法
                 //   3. 其他 expr 错误
                 let target_val = self.evaluate(target)?;
@@ -775,7 +775,7 @@ impl Interpreter {
                 eprintln!("[route] registered: {} -> {}", name, self.route_registry[name]);
                 Ok(FlowSignal::None)
             }
-            // v0.04 终态 Slice 3: 可观测
+            // v0.04 Slice 3: 可观测
             Stmt::Observe { config, body, .. } => {
                 match config {
                     ObserveConfig::Trace => {
@@ -844,7 +844,7 @@ impl Interpreter {
         }   // ← match stmt { ... } 闭合
     }       // ← pub fn execute(...) 闭合
 
-    /// v0.04 终态补: REPL 入口（main.rs 和 serve as repl 共用）
+    /// v0.04补: REPL 入口（main.rs 和 serve as repl 共用）
     /// 与 main.rs::run_repl 行为一致：循环读 stdin, 逐行 tokenize+parse+execute
     /// 接收外部 &mut Interpreter 保留 setup 代码的 state
     pub fn run_repl_with(interp: &mut Interpreter) {
@@ -879,7 +879,7 @@ impl Interpreter {
         }
     }
 
-    /// v0.04 终态补: serve as stdio 最简 echo 占位
+    /// v0.04补: serve as stdio 最简 echo 占位
     /// 设计: 阻塞读 stdin, 每行回写到 stdout 前缀 `echo: `
     /// v0.04.1 跟进: body 中可注册 handler, 走自定义协议
     fn serve_stdio_echo() {
@@ -929,7 +929,7 @@ impl Interpreter {
 
     /// 注册 tool 到全局工具表
     fn register_tool(&mut self, name: String, params: Vec<String>, types: Vec<String>, return_type: String) {
-        // v0.04 终态 Slice 5: 真正实现 — 自动生成 JSON Schema 并存到 tool_registry
+        // v0.04 Slice 5: 真正实现 — 自动生成 JSON Schema 并存到 tool_registry
         // description: v0.04.0 简化（空字符串，v0.04.1 跟进 desc: 段）
         // parameters: 从 params + types 自动生成 JSON Schema
         let schema = Self::tool_to_json_schema(&params, &types);
@@ -942,7 +942,7 @@ impl Interpreter {
         self.tool_registry.insert(name, tool_def);
     }
 
-    /// v0.04 终态 Slice 5: 从 params + types 生成标准 JSON Schema
+    /// v0.04 Slice 5: 从 params + types 生成标准 JSON Schema
     fn tool_to_json_schema(params: &[String], types: &[String]) -> String {
         // 生成 {"type":"object","properties":{...},"required":[...]} 格式
         let mut properties = String::from("{");
@@ -1120,7 +1120,7 @@ impl Interpreter {
                 self.evaluate_pipe(left_val, right)
             }
             Expr::Call { callee, args, span: _ } => {
-                // v0.04 终态 Slice 2: 先看 route_registry
+                // v0.04 Slice 2: 先看 route_registry
                 if self.route_registry.contains_key(callee) {
                     // 已注册 → 走 RouteCall 路径
                     let model = self.route_registry.get(callee).unwrap().clone();
@@ -1187,12 +1187,12 @@ impl Interpreter {
                 }
                 Err("No match arm matched".to_string())
             }
-            // v0.04 终态: p"..." → 直接调 real_ai_chat_inner (不再走 ai.chat builtin)
+            // v0.04: p"..." → 直接调 real_ai_chat_inner (不再走 ai.chat builtin)
             Expr::Prompt { parts, .. } => {
                 let prompt_str = Self::eval_prompt_parts(parts, self)?;
                 Self::do_ai_chat(self, "gpt-4o-mini", &prompt_str)
             }
-            // v0.04 终态 Slice 2: fast(p"...") → 直接调 real_ai_chat_inner 用对应 model
+            // v0.04 Slice 2: fast(p"...") → 直接调 real_ai_chat_inner 用对应 model
             Expr::RouteCall { name, args, .. } => {
                 // 1. 找 model
                 let model = self.route_registry.get(name)
@@ -1205,7 +1205,7 @@ impl Interpreter {
                 let prompt_str = Self::eval_route_arg(&args[0], self)?;
                 Self::do_ai_chat(self, &model, &prompt_str)
             }
-            // v0.04 终态补: ai_model("name", temperature: 0.7, ...) 表达式
+            // v0.04补: ai_model("name", temperature: 0.7, ...) 表达式
             // 求值后返回 Dict {_model, temperature?, max_tokens?, system?}
             Expr::AiModelCall { model, temperature, max_tokens, system, span: _ } => {
                 let model_str = match self.evaluate(model)? {
@@ -1240,7 +1240,7 @@ impl Interpreter {
         }
     }
 
-    /// v0.04 终态 Slice 2: 求值 RouteCall 的单个参数
+    /// v0.04 Slice 2: 求值 RouteCall 的单个参数
     /// 期望是 Prompt 表达式 — 拼接 parts 为字符串
     fn eval_route_arg(arg: &Expr, interp: &mut Interpreter) -> Result<String, String> {
         match arg {
@@ -1268,7 +1268,7 @@ impl Interpreter {
         }
     }
 
-    /// v0.04 终态: AI chat 的统一入口
+    /// v0.04: AI chat 的统一入口
     /// 替代 v0.03 的 ai.chat builtin
     /// - model: 模型名 (e.g. "gpt-4o-mini")
     /// - prompt: prompt 字符串
@@ -1965,13 +1965,13 @@ impl Interpreter {
     // ===================================================================
     // v0.03: memory.* — 长期记忆（向量存储 + 语义检索）
     // ===================================================================
-    // v0.04 终态: memory.* builtin 全部移除（RFC §4.1 推迟到 v1.0）
+    // v0.04: memory.* builtin 全部移除（RFC §4.1 推迟到 v1.0）
     //   get_embedding / mock_bow_embedding / extract_embeddings 无 builtin caller
     //   留作"v1.0 复活点", 用 #[allow(dead_code)] 抑制 warning
 
     #[allow(dead_code)]
     fn get_embedding(&self, text: &str) -> Result<Vec<f64>, String> {
-        // v0.04 终态: 只支持 mock embedding (real_ai_embed_strings 已删除, v1.0 恢复)
+        // v0.04: 只支持 mock embedding (real_ai_embed_strings 已删除, v1.0 恢复)
         Ok(mock_bow_embedding(text))
     }
 
@@ -2657,7 +2657,7 @@ suggestion: <improvement suggestion or "none">"#,
 
     /// Mock 工具调用（无 API Key 时，调用第一个注册的工具）
 
-    /// v0.04 终态补: mock 流占位, 无 builtin caller, 留作 v1.0 复活点
+    /// v0.04补: mock 流占位, 无 builtin caller, 留作 v1.0 复活点
     #[allow(dead_code)]
     fn create_mock_stream(prompt: &str) -> Value {
         let mock_text = format!("[Mock stream for: {}]", prompt);
@@ -2698,7 +2698,7 @@ suggestion: <improvement suggestion or "none">"#,
 
 // 实际接收 strings 的版本（避免 self 借用冲突）
 
-/// v0.04 终态补: ai.embed builtin 移除, 留作 v1.0 复活点
+/// v0.04补: ai.embed builtin 移除, 留作 v1.0 复活点
 #[allow(dead_code)]
 fn extract_embeddings(json_text: &str, expected_count: usize) -> Result<Value, String> {
     let root = json_to_value(json_text)?;
@@ -3269,7 +3269,7 @@ mod embed_tests {
         assert!(diffs > 0);
     }
 }
-/// v0.04 终态补: 向量相似度/距离工具函数, v0.03 ai.cosine/dot/euclidean/norm 推迟到 v1.0
+/// v0.04补: 向量相似度/距离工具函数, v0.03 ai.cosine/dot/euclidean/norm 推迟到 v1.0
 /// 保留为 "v1.0 复活点" + 内部测试用
 #[allow(dead_code)]
 /// 余弦相似度: (a·b) / (||a|| * ||b||)，范围 [-1, 1]

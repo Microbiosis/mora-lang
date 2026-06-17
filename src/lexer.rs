@@ -4,7 +4,7 @@ pub enum TokenType {
     Parallel, Match, WithKeyword, Save, Load, Fn, Into, As, Do,
     Read, Write, Append, ReadBytes, WriteBytes,
     Stream, Tool, Break, Continue,
-    // v0.04 终态: 云服务原生关键字
+    // v0.04: 云服务原生关键字
     Serve, Route, Observe, Span, Tags, Record, Endpoint, Repl, Stdio, Mcp, Http, On,
     Trace, Metrics, Otel,
     // 注意: HTTP 方法 (GET/POST/PUT/DELETE/PATCH) 不作关键字
@@ -277,7 +277,7 @@ impl Lexer {
             "tool" => TokenType::Tool,
             "break" => TokenType::Break,
             "continue" => TokenType::Continue,
-            // v0.04 终态: 云服务原生关键字
+            // v0.04: 云服务原生关键字
             "serve" => TokenType::Serve,
             "route" => TokenType::Route,
             "observe" => TokenType::Observe,

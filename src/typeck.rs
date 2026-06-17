@@ -404,11 +404,11 @@ impl TypeChecker {
             Stmt::Break { .. } | Stmt::Continue { .. } => {
                 // v0.04.0 简化:仅警告(v0.04.1 强制"必须在 loop 内")
             }
-            // v0.04 终态: 云服务原生 —— Slice 1 stub
+            // v0.04: 云服务原生 —— Slice 1 stub
             Stmt::Serve { .. } | Stmt::Observe { .. } | Stmt::Span { .. } => {
                 // Slice 1 stub: 不做严格检查
             }
-            // v0.04 终态补: Stmt::Route 必须递归 typeck target, 触发 ai_model 校验
+            // v0.04补: Stmt::Route 必须递归 typeck target, 触发 ai_model 校验
             Stmt::Route { target, .. } => {
                 self.check_expr(target, symbols);
             }
@@ -513,14 +513,14 @@ impl TypeChecker {
                 }
                 Type::String
             }
-            // v0.04 终态 Slice 2: RouteCall type = String
+            // v0.04 Slice 2: RouteCall type = String
             Expr::RouteCall { args, .. } => {
                 for a in args {
                     let _ = self.check_expr(a, symbols);
                 }
                 Type::String
             }
-            // v0.04 终态补: ai_model(...) 表达式 type = Dict
+            // v0.04补: ai_model(...) 表达式 type = Dict
             // 校验: model 字符串, temperature/max_tokens number, system string
             Expr::AiModelCall { model, temperature, max_tokens, system, span } => {
                 let mt = self.check_expr(model, symbols);

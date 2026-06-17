@@ -44,7 +44,7 @@ pub enum Stmt {
     ToolDef { name: String, params: Vec<(String, Option<String>)>, return_type: Option<String>, body: Vec<Stmt>, exported: bool, span: Span },
     Break { span: Span },
     Continue { span: Span },
-    // v0.04 终态: 云服务原生
+    // v0.04: 云服务原生
     Serve { protocol: ServeProtocol, routes: Vec<RouteDecl>, body: Vec<Stmt>, span: Span },
     Route { name: String, target: Expr, span: Span },
     Observe { config: ObserveConfig, body: Vec<Stmt>, span: Span },
@@ -96,7 +96,7 @@ impl HttpMethod {
 #[derive(Debug, Clone, PartialEq)]
 pub enum RouteDecl {
     HttpRoute { method: HttpMethod, path: String, handler: Expr },
-    // v0.04 终态 Slice 5: ToolEntry 加 params + return_type 字段用于生成 JSON Schema
+    // v0.04 Slice 5: ToolEntry 加 params + return_type 字段用于生成 JSON Schema
     ToolEntry { name: String, params: Vec<(String, Option<String>)>, return_type: Option<String>, handler: Expr },
 }
 
@@ -121,9 +121,9 @@ pub enum Expr {
     Grouping(Box<Expr>, Span),
     // v0.04.0: AI 原语
     Prompt { parts: Vec<Expr>, span: Span },
-    // v0.04 终态: route 调用
+    // v0.04: route 调用
     RouteCall { name: String, args: Vec<Box<Expr>>, span: Span },
-    // v0.04 终态补: ai_model(...) 路由元数据表达式（RFC §2.3）
+    // v0.04补: ai_model(...) 路由元数据表达式（RFC §2.3）
     // 解析: ai_model("model-name", temperature: 0.7, max_tokens: 2000, system: "...")
     AiModelCall {
         model: Box<Expr>,

@@ -132,7 +132,7 @@ impl Parser {
         else if self.match_token(&[TokenType::Tool]) { Some(self.tool_statement()) }
         else if self.match_token(&[TokenType::Break]) { Some(self.break_statement()) }
         else if self.match_token(&[TokenType::Continue]) { Some(self.continue_statement()) }
-        // v0.04 终态: 云服务原生
+        // v0.04: 云服务原生
         else if self.match_token(&[TokenType::Serve]) { Some(self.serve_statement()) }
         else if self.match_token(&[TokenType::Route]) { Some(self.route_statement()) }
         else if self.match_token(&[TokenType::Observe]) { Some(self.observe_statement()) }
@@ -932,7 +932,7 @@ impl Parser {
     }
 
     // ===================================================================
-    // v0.04 终态: 云服务原生 statement 解析
+    // v0.04: 云服务原生 statement 解析
     // ===================================================================
 
     /// `serve as <protocol> [on port N] do body end`
@@ -1176,7 +1176,7 @@ impl Parser {
     }
 
     /// `ai_model(<model>, [temperature: T], [max_tokens: N], [system: "..."])`
-    /// v0.04 终态补: 路由元数据表达式（RFC §2.3）
+    /// v0.04补: 路由元数据表达式（RFC §2.3）
     /// 在 LParen 已被消耗后调用; 结束时需消耗 RParen
     fn parse_ai_model_call(&mut self, span: Span) -> Expr {
         // 第一参数必为 model 名字符串

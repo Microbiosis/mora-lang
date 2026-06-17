@@ -119,7 +119,7 @@ v0.04 把 AI 调用做成语法原语（`p"..."` / `with` / `stream` / `tool` / 
 | 上下文配置 | `with model = "..." / budget = N` | ✅ 块语句 |
 | AI 错误 | `try ... catch e: AiError` | ✅ 类型化错误，注入 dict `{message, code, retryable, attempts, cause}` |
 | 显式 token 计数 | `record_tokens(input, output)` | ✅ 顶层语句 |
-| 向量嵌入 | `ai.embed(text \| list)` | ⏸ 推迟到 v1.0（RFC §4.1） |
+| 向量嵌入 | `ai.embed(text \| list)` | ⏸ 推迟到 v1.0 |
 | 向量运算 | `ai.cosine/dot/euclidean/norm` | ⏸ 推迟到 v1.0 |
 | 语义检索 | `ai.search(query, corpus, k?)` | ⏸ 推迟到 v1.0 |
 | 多模型路由 | `route fast: ai_model("gpt-4o-mini")` | ✅ 块语句（旧写法 `route fast: "gpt-4o-mini"` 仍兼容） |

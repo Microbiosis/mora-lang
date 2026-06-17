@@ -92,13 +92,13 @@ impl TraceCollector {
         }
     }
 
-    /// v0.04 终态 Slice 3: 启用/禁用 trace (不丢已有 spans)
+    /// v0.04 Slice 3: 启用/禁用 trace (不丢已有 spans)
     pub fn set_enabled(&self, enabled: bool) {
         let mut inner = self.inner.lock().unwrap();
         inner.enabled = enabled;
     }
 
-    /// v0.04 终态 Slice 3: 设置 OTEL endpoint
+    /// v0.04 Slice 3: 设置 OTEL endpoint
     pub fn set_otel_endpoint(&self, endpoint: String) {
         let mut inner = self.inner.lock().unwrap();
         inner.otel_endpoint = Some(endpoint);

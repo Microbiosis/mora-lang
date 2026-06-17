@@ -1,0 +1,137 @@
+-- v0.05 e2e 验证脚本
+-- 验证 20 类 typeck 错误 + 修复建议
+-- 用法: mora --check test_data/typeck_errors.mora
+-- 期望: 20 个 type error，exit 2
+
+-- ============================
+-- 类别 1: let 类型不匹配
+-- 期望: type mismatch: let x, expected number, got string
+-- ============================
+let x: number = "hello"
+
+-- ============================
+-- 类别 2: 无法推断（未注册函数调用）
+-- 期望: cannot infer type: let y
+-- ============================
+let y = some_unknown_func(42)
+
+-- ============================
+-- 类别 3: 数字运算（number * list）
+-- 期望: operator '*' requires number operands
+-- ============================
+let lst = [1, 2, 3]
+let z = 42 * lst
+
+-- ============================
+-- 类别 4: 加法运算（number + list）
+-- 期望: operator '+' not defined for 'number' and 'list'
+-- ============================
+let a = 42 + [1, 2]
+
+-- ============================
+-- 类别 5: 比较运算（number vs list）
+-- 期望: comparison requires number or string, got 'number' and 'list'
+-- ============================
+let b = 42 > [1, 2]
+
+-- ============================
+-- 类别 6: with model 类型错误
+-- 期望: with model = ..., expected string, got number
+-- ============================
+with model = 42
+print("hi")
+end
+
+-- ============================
+-- 类别 7: with 未知 binding
+-- 期望: with: unknown binding 'foo'
+-- ============================
+with foo = "bar"
+print("hi")
+end
+
+-- ============================
+-- 类别 8: with temperature 类型错误
+-- 期望: with temperature = ..., expected number, got string
+-- ============================
+with temperature = "hot"
+print("hi")
+end
+
+-- ============================
+-- 类别 9: record_tokens input 类型错误
+-- 期望: record_tokens: input must be number
+-- ============================
+record_tokens("not_a_number", 50)
+
+-- ============================
+-- 类别 10: record_tokens output 类型错误
+-- 期望: record_tokens: output must be number
+-- ============================
+record_tokens(100, "not_a_number")
+
+-- ============================
+-- 类别 11: try-catch 不支持的类型
+-- 期望: try/catch: type 'MyError' not supported
+-- ============================
+try
+  print("hi")
+catch e: MyError
+  print(e)
+end
+
+-- ============================
+-- 类别 12: return 类型不匹配
+-- 期望: return type mismatch: expected 'number', got 'string'
+-- ============================
+task bad_return(): number
+  return "hello"
+end
+
+-- ============================
+-- 类别 13: print 函数参数个数（替代"return 无值"，typeck 不检查缺少 return）
+-- ============================
+print("ok")
+-- ============================
+-- 类别 14: 函数参数个数不匹配
+-- 期望: function 'print' expects 1 args, got 0
+-- ============================
+print()
+
+-- ============================
+-- 类别 15: 函数参数类型不匹配
+-- 期望: arg 1 of 'range': expected 'number', got 'string'
+-- ============================
+range("not_a_number", 10)
+
+-- ============================
+-- 类别 16: route 参数个数不匹配
+-- 期望: route 'fast()' expects 1 arg
+-- ============================
+route fast: "gpt-4o-mini"
+let r1 = fast()
+let r2 = fast("hi", "extra")
+
+-- ============================
+-- 类别 17: ai_model 类型错误
+-- 期望: ai_model: model name must be string
+-- ============================
+route bad_model: ai_model(123)
+
+-- ============================
+-- 类别 18: ai_model temperature 类型错误
+-- 期望: ai_model: temperature must be number
+-- ============================
+route bad_temp: ai_model("gpt-4o", temperature: "hot")
+
+-- ============================
+-- 类别 19: ai_model max_tokens 类型错误
+-- 期望: ai_model: max_tokens must be number
+-- ============================
+route bad_max: ai_model("gpt-4o", max_tokens: "lots")
+
+-- ============================
+-- 类别 20: ai_model system 类型错误
+-- 期望: ai_model: system must be string
+-- ============================
+route bad_sys: ai_model("gpt-4o", system: 123)

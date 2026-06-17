@@ -16,7 +16,7 @@ serve as http on port 3000 do
   POST "/chat" -> fn(req)
     -- Slice 3: span 块嵌套在 handler 内
     span "user_chat" tags {path: "/chat"} do
-      let user_text = req["body"]["text"]
+      let user_text := req["body"]["text"]
       let answer = fast(p"answer: {user_text}")
       print("span finished, answer: " + answer)
     end

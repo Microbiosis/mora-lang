@@ -5,7 +5,7 @@ pub enum TokenType {
     Read, Write, Append, ReadBytes, WriteBytes,
     Stream, Tool, Break, Continue,
     // v0.04: 云服务原生关键字
-    Serve, Route, Observe, Span, Tags, Record, Endpoint, Repl, Stdio, Mcp, Http, On,
+    Serve, Route, Observe, Span, Tags, Record, Repl, Stdio, Mcp, Http, On,
     Trace, Metrics, Otel,
     // 注意: HTTP 方法 (GET/POST/PUT/DELETE/PATCH) 不作关键字
     // —— 保持 Identifier,parser 在 serve 块内做大小写敏感判断
@@ -17,6 +17,8 @@ pub enum TokenType {
     Assign, Equal, NotEqual,
     Greater, Less, GreaterEqual, LessEqual,
     Pipe, Arrow,
+    // v0.05: := 显式 Any 标注（let x := expr = Any，跳过严格 typeck）
+    Walrus,
     LParen, RParen, LBracket, RBracket, LBrace, RBrace, Dot, Comma, Colon,
     Newline,
     EOF,
@@ -130,7 +132,13 @@ impl Lexer {
             '}' => Some(Token { token_type: TokenType::RBrace, line: start_line, column: start_col }),
             '.' => Some(Token { token_type: TokenType::Dot, line: start_line, column: start_col }),
             ',' => Some(Token { token_type: TokenType::Comma, line: start_line, column: start_col }),
-            ':' => Some(Token { token_type: TokenType::Colon, line: start_line, column: start_col }),
+            ':' => {
+                if self.match_char('=') {
+                    Some(Token { token_type: TokenType::Walrus, line: start_line, column: start_col })
+                } else {
+                    Some(Token { token_type: TokenType::Colon, line: start_line, column: start_col })
+                }
+            }
             '|' => {
                 if self.match_char('>') { Some(Token { token_type: TokenType::Pipe, line: start_line, column: start_col }) }
                 else { panic!("Unexpected '|' at line {}; did you mean '|>'?", self.line) }
@@ -284,7 +292,7 @@ impl Lexer {
             "span" => TokenType::Span,
             "tags" => TokenType::Tags,
             "record" => TokenType::Record,
-            "endpoint" => TokenType::Endpoint,
+            // v0.05 Bugfix: "endpoint" 不再作关键字 —— 走 Identifier 让 parser 用 match_identifier 处理
             "repl" => TokenType::Repl,
             "stdio" => TokenType::Stdio,
             "mcp" => TokenType::Mcp,

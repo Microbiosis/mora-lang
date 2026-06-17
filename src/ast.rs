@@ -19,7 +19,7 @@ impl Span {
 #[derive(Debug, Clone, PartialEq)]
 #[allow(dead_code)]
 pub enum Stmt {
-    Let { name: String, type_hint: Option<String>, init: Expr, exported: bool, span: Span },
+    Let { name: String, type_hint: Option<String>, init: Expr, exported: bool, is_any: bool, span: Span },
     Assign { name: String, value: Expr, span: Span },
     IndexAssign { object: Expr, index: Expr, value: Expr, span: Span },
     TaskDef { name: String, params: Vec<(String, Option<String>)>, return_type: Option<String>, body: Vec<Stmt>, exported: bool, span: Span },

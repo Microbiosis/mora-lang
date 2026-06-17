@@ -308,7 +308,8 @@ impl Interpreter {
 
     pub fn execute(&mut self, stmt: &Stmt) -> Result<FlowSignal, String> {
         match stmt {
-            Stmt::Let { name, type_hint, init, exported, span: _ } => {
+            Stmt::Let { name, type_hint, init, exported, is_any: _, span: _ } => {
+                // v0.05: is_any 仅影响 typeck（强制推断 vs 显式 Any），运行时无差别
                 let value = self.evaluate(init)?;
                 if let Some(hint) = type_hint {
                     if !check_type(&value, hint) {

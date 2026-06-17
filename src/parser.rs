@@ -37,14 +37,22 @@ impl Parser {
         // 'let' 关键字位置（"previous" 是刚消耗的 let token）
         let span = self.span_of_previous_keyword();
         let name = self.consume_identifier("Expected variable name after 'let'");
-        let type_hint = if self.match_token(&[TokenType::Colon]) {
-            Some(self.consume_identifier("Expected type name after ':'"))
+        // v0.05: 互斥语法 —— `:` (类型 hint) 或 `:=` (显式 Any)
+        //   `let x: T = expr`  → type_hint=Some("T"), is_any=false
+        //   `let x := expr`    → type_hint=None, is_any=true (无 Assign, lexer 把 := 切成一个 Walrus token)
+        //   `let x = expr`     → type_hint=None, is_any=false (需 Assign)
+        let (type_hint, is_any) = if self.match_token(&[TokenType::Walrus]) {
+            (None, true)
+        } else if self.match_token(&[TokenType::Colon]) {
+            (Some(self.consume_identifier("Expected type name after ':'")), false)
         } else {
-            None
+            (None, false)
         };
-        self.consume(&TokenType::Assign, "Expected '=' after variable name/type");
+        if !is_any {
+            self.consume(&TokenType::Assign, "Expected '=' after variable name/type");
+        }
         let init = self.expression();
-        Stmt::Let { name, type_hint, init, exported, span }
+        Stmt::Let { name, type_hint, init, exported, is_any, span }
     }
 
     fn task_declaration(&mut self, exported: bool) -> Stmt {
@@ -363,7 +371,8 @@ impl Parser {
         while self.match_token(&[TokenType::Equal, TokenType::NotEqual]) {
             let op = self.previous_op();
             let right = self.comparison();
-            expr = Expr::Binary { left: Box::new(expr), op, right: Box::new(right), span: Span::default() };
+            let span = self.span_of_previous_keyword();
+            expr = Expr::Binary { left: Box::new(expr), op, right: Box::new(right), span };
         }
         expr
     }
@@ -373,7 +382,8 @@ impl Parser {
         while self.match_token(&[TokenType::Greater, TokenType::GreaterEqual, TokenType::Less, TokenType::LessEqual]) {
             let op = self.previous_op();
             let right = self.term();
-            expr = Expr::Binary { left: Box::new(expr), op, right: Box::new(right), span: Span::default() };
+            let span = self.span_of_previous_keyword();
+            expr = Expr::Binary { left: Box::new(expr), op, right: Box::new(right), span };
         }
         expr
     }
@@ -383,7 +393,8 @@ impl Parser {
         while self.match_token(&[TokenType::Plus, TokenType::Minus]) {
             let op = self.previous_op();
             let right = self.factor();
-            expr = Expr::Binary { left: Box::new(expr), op, right: Box::new(right), span: Span::default() };
+            let span = self.span_of_previous_keyword();
+            expr = Expr::Binary { left: Box::new(expr), op, right: Box::new(right), span };
         }
         expr
     }
@@ -393,7 +404,8 @@ impl Parser {
         while self.match_token(&[TokenType::Star, TokenType::Slash, TokenType::Percent]) {
             let op = self.previous_op();
             let right = self.unary();
-            expr = Expr::Binary { left: Box::new(expr), op, right: Box::new(right), span: Span::default() };
+            let span = self.span_of_previous_keyword();
+            expr = Expr::Binary { left: Box::new(expr), op, right: Box::new(right), span };
         }
         expr
     }
@@ -402,7 +414,8 @@ impl Parser {
         if self.match_token(&[TokenType::Minus]) {
             let op = self.previous_op();
             let right = self.unary();
-            Expr::Binary { left: Box::new(Expr::Literal(Literal::Number(0.0, Span::default()))), op, right: Box::new(right), span: Span::default() }
+            let span = self.span_of_previous_keyword();
+            Expr::Binary { left: Box::new(Expr::Literal(Literal::Number(0.0, Span::default()))), op, right: Box::new(right), span }
         } else if self.match_token(&[TokenType::Match]) {
             self.match_expression()
         } else {

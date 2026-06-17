@@ -89,9 +89,12 @@ task bad_return(): number
 end
 
 -- ============================
--- 类别 13: print 函数参数个数（替代"return 无值"，typeck 不检查缺少 return）
+-- 类别 13: return 无值但期望非 nil
+-- 期望: missing return in task 'bad_return2' with return type 'number'
 -- ============================
-print("ok")
+task bad_return2(): number
+  print("forgot return")
+end
 -- ============================
 -- 类别 14: 函数参数个数不匹配
 -- 期望: function 'print' expects 1 args, got 0

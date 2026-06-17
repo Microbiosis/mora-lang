@@ -378,6 +378,19 @@ impl TypeChecker {
                 for s in body {
                     self.check_stmt(s, symbols);
                 }
+                // v0.05: 检查"缺少 return"
+                // 如果声明了非 nil/Any 的返回类型，body 里必须有 return 语句
+                if let Some(ret_hint) = &self.current_return_hint {
+                    if !matches!(ret_hint, Type::Nil | Type::Any) && !body_has_return(body) {
+                        self.errors.push(TypeError::from_span_with_detail(
+                            span,
+                            format!("missing return in task '{}' with return type '{}'", name, ret_hint.name()),
+                            ret_hint.name(),
+                            "nil (missing return)",
+                            format!("add `return <expr>` at the end of the task body"),
+                        ));
+                    }
+                }
                 self.current_return_hint = prev_hint;
                 symbols.pop_scope();
                 let _ = (name, span);
@@ -978,6 +991,38 @@ fn literal_to_span(lit: &Literal) -> Span {
         Literal::String(_, s) | Literal::Number(_, s) | Literal::Bool(_, s) |
         Literal::Nil(s) | Literal::List(_, s) | Literal::Dict(_, s) => *s,
     }
+}
+
+/// 递归检查 body 里是否有 return 语句（包括嵌套 if/for/try 里）
+fn body_has_return(stmts: &[Stmt]) -> bool {
+    for stmt in stmts {
+        match stmt {
+            Stmt::Return { .. } => return true,
+            Stmt::If { then_branch, .. } => {
+                if body_has_return(then_branch) { return true; }
+            }
+            Stmt::For { body, .. } => {
+                if body_has_return(body) { return true; }
+            }
+            Stmt::Try { try_block, catch_block, .. } => {
+                if body_has_return(try_block) || body_has_return(catch_block) { return true; }
+            }
+            Stmt::Parallel { stmts, .. } => {
+                if body_has_return(stmts) { return true; }
+            }
+            Stmt::Match { arms, .. } => {
+                for (_pat, arm_stmts) in arms {
+                    if body_has_return(arm_stmts) { return true; }
+                }
+            }
+            Stmt::With { body, .. } | Stmt::StreamFor { body, .. } | Stmt::ToolDef { body, .. } |
+            Stmt::Observe { body, .. } | Stmt::Span { body, .. } => {
+                if body_has_return(body) { return true; }
+            }
+            _ => {}
+        }
+    }
+    false
 }
 
 fn iter_ty_debug_line(expr: &Expr) -> usize {

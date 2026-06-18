@@ -25,10 +25,18 @@ router = router.route("GET", "/users/:id", fn(req)
   return {user: user_id}
 end)
 router = router.route("POST", "/json", fn(req)
-  -- match expr 在闭包内只能用 let 绑定，不能直接 return
+  -- req.json() 返回 Result<Value, ParseError>，用 ? 解包
   let result := req.json()
   let val := result.get("ok")
   return {parsed: val, status: "ok"}
+end)
+
+router = router.route("POST", "/json-validate", fn(req)
+  -- String.json() 直接解析 body 字符串
+  let body_str := req["body"]
+  let parsed := body_str.json()
+  let ok_val := parsed.get("ok")
+  return {data: ok_val}
 end)
 
 router.listen("127.0.0.1", 3000)

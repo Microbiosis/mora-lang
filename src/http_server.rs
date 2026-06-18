@@ -196,29 +196,29 @@ fn parse_body_value(body: &str) -> Value {
         Ok(JsonValue::Object(map)) => {
             let mut out = HashMap::new();
             for (k, v) in map {
-                out.insert(k, json_to_value(v));
+                out.insert(k, json_lsp_to_value(v));
             }
             Value::Dict(out)
         }
         Ok(JsonValue::Array(items)) => {
-            Value::List(items.into_iter().map(json_to_value).collect())
+            Value::List(items.into_iter().map(json_lsp_to_value).collect())
         }
-        Ok(other) => json_to_value(other),
+        Ok(other) => json_lsp_to_value(other),
         Err(_) => Value::String(body.to_string()),
     }
 }
 
-fn json_to_value(j: JsonValue) -> Value {
+fn json_lsp_to_value(j: JsonValue) -> Value {
     match j {
         JsonValue::Null => Value::Nil,
         JsonValue::Bool(b) => Value::Bool(b),
         JsonValue::Number(n) => Value::Number(n),
         JsonValue::String_(s) => Value::String(s),
-        JsonValue::Array(items) => Value::List(items.into_iter().map(json_to_value).collect()),
+        JsonValue::Array(items) => Value::List(items.into_iter().map(json_lsp_to_value).collect()),
         JsonValue::Object(map) => {
             let mut out = HashMap::new();
             for (k, v) in map {
-                out.insert(k, json_to_value(v));
+                out.insert(k, json_lsp_to_value(v));
             }
             Value::Dict(out)
         }

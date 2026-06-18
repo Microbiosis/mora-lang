@@ -1610,6 +1610,7 @@ impl Interpreter {
                     _ => Err(format!("Conversation has no method: {}", method)),
                 }
             }
+            // v0.07.1: String.json() — 解析 JSON 字符串，返回 Result<Value, ParseError>
             Value::String(s) => {
                 match method {
                     "len" => Ok(Value::Number(s.len() as f64)),
@@ -1639,6 +1640,26 @@ impl Interpreter {
                         let from = args.get(0).map(|v| v.to_string()).unwrap_or_default();
                         let to = args.get(1).map(|v| v.to_string()).unwrap_or_default();
                         Ok(Value::String(s.replace(&from, &to)))
+                    }
+                    // v0.07.3: String.json() — 与 Dict.json() 同构 API
+                    "json" => {
+                        if s.trim().is_empty() {
+                            let mut err = HashMap::new();
+                            err.insert("err".to_string(), Value::String("ParseError: empty body".to_string()));
+                            return Ok(Value::Dict(err));
+                        }
+                        match json_to_value(&s) {
+                            Ok(val) => {
+                                let mut result = HashMap::new();
+                                result.insert("ok".to_string(), val);
+                                Ok(Value::Dict(result))
+                            }
+                            Err(e) => {
+                                let mut err = HashMap::new();
+                                err.insert("err".to_string(), Value::String(format!("ParseError: {}", e)));
+                                Ok(Value::Dict(err))
+                            }
+                        }
                     }
                     _ => Err(format!("String has no method: {}", method)),
                 }
@@ -3109,7 +3130,8 @@ fn value_to_json(value: &Value) -> String {
     }
 }
 
-fn json_to_value(json: &str) -> Result<Value, String> {
+/// v0.07.3: 通用 JSON 解析 (pub scope — 供 http_server 复用)
+pub fn json_to_value(json: &str) -> Result<Value, String> {
     let trimmed = json.trim();
     if trimmed.is_empty() {
         return Err("Empty JSON".to_string());

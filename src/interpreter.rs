@@ -74,6 +74,14 @@ pub enum Value {
         max_steps: usize,
         system: String,
     },
+    // v0.06: AiConfig 值类型
+    AiConfig {
+        model: Option<String>,
+        temperature: Option<f64>,
+        max_tokens: Option<usize>,
+        system: Option<String>,
+        budget: Option<usize>,
+    },
 }
 
 // 手动实现 PartialEq（Arc<Mutex<Environment>> 不支持自动派生）
@@ -116,6 +124,11 @@ impl std::fmt::Display for Value {
             }
             Value::Stream { .. } => write!(f, "<stream>"),
             Value::Agent { name, .. } => write!(f, "<agent {}>", name),
+            // v0.06: AiConfig 值类型 (builder 字段)
+            Value::AiConfig { model, temperature, max_tokens, system, budget } => {
+                write!(f, "AiConfig(model={:?}, temp={:?}, max_tokens={:?}, system={:?}, budget={:?})",
+                    model, temperature, max_tokens, system, budget)
+            },
         }
     }
 }
@@ -176,6 +189,18 @@ pub struct Interpreter {
     pub trace: TraceCollector,
     // v0.04 Slice 2: route registry (name -> model name)
     route_registry: HashMap<String, String>,
+    // v0.06: 当前 with 块 set 的 AiConfig 值 (替代 env hack)
+    current_ai_config: Option<AiConfigValue>,
+}
+
+/// v0.06: with 块字段 (不经过 env 变量)
+#[derive(Clone, Debug, Default)]
+struct AiConfigValue {
+    model: Option<String>,
+    temperature: Option<f64>,
+    max_tokens: Option<usize>,
+    budget: Option<usize>,
+    system: Option<String>,
 }
 
 // v0.04: 显式实现 Clone 而非 derive
@@ -192,6 +217,7 @@ impl Clone for Interpreter {
             token_usage: self.token_usage.clone(),
             trace: self.trace.clone(),
             route_registry: self.route_registry.clone(),
+            current_ai_config: self.current_ai_config.clone(),
         }
     }
 }
@@ -219,6 +245,7 @@ struct RouteConfig {
     api_key: String,
     max_tokens: Option<usize>,
     system: Option<String>,
+    temperature: Option<f64>,
 }
 
 /// 记忆条目 — v0.04补: 字段已删 (RFC §4.1 memory.* 推迟到 v1.0)
@@ -253,7 +280,7 @@ impl Interpreter {
         globals.lock().unwrap().define("print".to_string(), Value::Builtin("print".to_string()), false);
         globals.lock().unwrap().define("range".to_string(), Value::Builtin("range".to_string()), false);
         globals.lock().unwrap().define("len".to_string(), Value::Builtin("len".to_string()), false);
-        Self { globals: globals.clone(), environment: globals, tool_registry: HashMap::new(), model_routes: HashMap::new(), token_budget: None, token_usage: TokenUsage::default(), trace: TraceCollector::new(false), route_registry: HashMap::new() }
+        Self { globals: globals.clone(), environment: globals, tool_registry: HashMap::new(), model_routes: HashMap::new(), token_budget: None, token_usage: TokenUsage::default(), trace: TraceCollector::new(false), route_registry: HashMap::new(), current_ai_config: None }
     }
 
     /// v0.04: 构造一个空 Interpreter (用于 std::mem::replace 占位)
@@ -269,12 +296,13 @@ impl Interpreter {
             token_usage: TokenUsage::default(),
             trace: TraceCollector::new(false),
             route_registry: HashMap::new(),
+            current_ai_config: None,
         }
     }
 
     pub fn new_with_globals(globals: Arc<Mutex<Environment>>) -> Self {
         let env = Arc::new(Mutex::new(Environment::with_parent(globals.clone())));
-        Self { globals: globals.clone(), environment: env, tool_registry: HashMap::new(), model_routes: HashMap::new(), token_budget: None, token_usage: TokenUsage::default(), trace: TraceCollector::new(false), route_registry: HashMap::new() }
+        Self { globals: globals.clone(), environment: env, tool_registry: HashMap::new(), model_routes: HashMap::new(), token_budget: None, token_usage: TokenUsage::default(), trace: TraceCollector::new(false), route_registry: HashMap::new(), current_ai_config: None }
     }
 
     #[allow(dead_code)]
@@ -579,40 +607,52 @@ impl Interpreter {
             }
             // ============ v0.04.0: AI 原语 ============
             Stmt::With { bindings, body, span: _ } => {
-                // 推入 AI 上下文栈
-                let prev_model = std::env::var("MORA_AI_MODEL").ok();
-                let prev_temp  = std::env::var("MORA_AI_TEMPERATURE").ok();
-                let prev_budget = std::env::var("MORA_AI_BUDGET").ok();
-                let prev_budget_used = std::env::var("MORA_AI_BUDGET_USED").ok();
-                let prev_max = std::env::var("MORA_AI_MAX_TOKENS").ok();
+                // v0.06: 推入 `current_ai_config` 栈 (替代 v0.04 env hack)
+                let prev_cfg = self.current_ai_config.clone();
+                let mut cfg = prev_cfg.clone().unwrap_or_default();
                 for (key, val_expr) in bindings {
                     let v = self.evaluate(val_expr)?;
-                    let s = match &v {
-                        Value::String(s) => s.clone(),
-                        Value::Number(n) => n.to_string(),
-                        Value::Bool(b) => b.to_string(),
-                        other => other.to_string(),
-                    };
-                    let env_key = match key.as_str() {
-                        "model" => "MORA_AI_MODEL",
-                        "budget" => "MORA_AI_BUDGET",
-                        "temperature" => "MORA_AI_TEMPERATURE",
-                        "max_tokens" => "MORA_AI_MAX_TOKENS",
-                        other => {
-                            return Err(format!("with: unknown binding '{}' (valid: model, budget, temperature, max_tokens)", other));
+                    match key.as_str() {
+                        "model" => {
+                            cfg.model = Some(match &v {
+                                Value::String(s) => s.clone(),
+                                other => other.to_string(),
+                            });
                         }
-                    };
-                    std::env::set_var(env_key, s);
+                        "temperature" => {
+                            cfg.temperature = Some(match &v {
+                                Value::Number(n) => *n,
+                                _ => return Err(format!("with: temperature must be number, got {}", v)),
+                            });
+                        }
+                        "max_tokens" => {
+                            cfg.max_tokens = Some(match &v {
+                                Value::Number(n) => *n as usize,
+                                _ => return Err(format!("with: max_tokens must be number, got {}", v)),
+                            });
+                        }
+                        "budget" => {
+                            cfg.budget = Some(match &v {
+                                Value::Number(n) => *n as usize,
+                                _ => return Err(format!("with: budget must be number, got {}", v)),
+                            });
+                        }
+                        "system" => {
+                            cfg.system = Some(match &v {
+                                Value::String(s) => s.clone(),
+                                other => other.to_string(),
+                            });
+                        }
+                        other => {
+                            return Err(format!("with: unknown binding '{}' (valid: model, budget, temperature, max_tokens, system)", other));
+                        }
+                    }
                 }
-                // budget_used 保留外层值（按 RFC §2.2.4 选"覆盖"语义：内层重新计数）
+                self.current_ai_config = Some(cfg);
                 let env_in = Arc::new(Mutex::new(Environment::with_parent(self.environment.clone())));
                 let result = self.execute_block(body, env_in);
-                // 恢复外层环境
-                Self::restore_env("MORA_AI_MODEL", &prev_model);
-                Self::restore_env("MORA_AI_TEMPERATURE", &prev_temp);
-                Self::restore_env("MORA_AI_BUDGET", &prev_budget);
-                Self::restore_env("MORA_AI_BUDGET_USED", &prev_budget_used);
-                Self::restore_env("MORA_AI_MAX_TOKENS", &prev_max);
+                // 恢复外层 config
+                self.current_ai_config = prev_cfg;
                 result
             }
             Stmt::StreamFor { prompt, var, body, span: _ } => {
@@ -1273,6 +1313,7 @@ impl Interpreter {
     /// 替代 v0.03 的 ai.chat builtin
     /// - model: 模型名 (e.g. "gpt-4o-mini")
     /// - prompt: prompt 字符串
+    /// v0.06: 接 current_ai_config (替代 env hack)  --- temperature/max_tokens/system 下传
     fn do_ai_chat(interp: &mut Interpreter, model: &str, prompt: &str) -> Result<Value, String> {
         let api_key = std::env::var("OPENAI_API_KEY").unwrap_or_default();
         let base_url = std::env::var("MORA_AI_BASE_URL")
@@ -1280,11 +1321,16 @@ impl Interpreter {
 
         if api_key.is_empty() {
             // Mock 模式
-            eprintln!("[ai.chat mock — set OPENAI_API_KEY for real call] {}", prompt);
+            let cfg_info = interp.current_ai_config.as_ref()
+                .map(|c| format!("config: temp={:?}, max_tokens={:?}", c.temperature, c.max_tokens))
+                .unwrap_or_default();
+            eprintln!("[ai.chat mock — set OPENAI_API_KEY for real call] {} {}", prompt, cfg_info);
             return Ok(Value::String(format!("[Mock response for: {}]", prompt)));
         }
 
-        let messages = vec![("user".to_string(), prompt.to_string())];
+        let mut messages = vec![("user".to_string(), prompt.to_string())];
+        // v0.06: 从 current_ai_config 取 temperature/max_tokens/system,
+        // 拼进 real_ai_chat_inner (v0.06.5 才改函数签名，这里先保留 env 兼容)
         interp.real_ai_chat(&messages, &api_key, model, &base_url)
     }
 
@@ -2998,6 +3044,7 @@ fn type_name(value: &Value) -> &'static str {
         Value::Conversation{..} => "conversation",
         Value::Stream{..} => "stream",
         Value::Agent{..} => "agent",
+        Value::AiConfig{..} => "ai_config",
     }
 }
 
@@ -3031,6 +3078,7 @@ fn value_to_json(value: &Value) -> String {
         Value::Conversation { .. } => "null".to_string(),
         Value::Stream { .. } => "null".to_string(),
         Value::Agent { .. } => "null".to_string(),
+        Value::AiConfig { .. } => "null".to_string(),
     }
 }
 

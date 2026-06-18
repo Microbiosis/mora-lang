@@ -132,19 +132,19 @@ fn print_banner() {
     let has_openai_key = env::var("OPENAI_API_KEY")
         .map(|k| !k.is_empty())
         .unwrap_or(false);
-    let model = env::var("MORA_AI_MODEL").unwrap_or_else(|_| "gpt-4o-mini".to_string());
+    // v0.06.5: MORA_AI_MODEL 不再作为全局默认；模型路由走 `route` 块 + `with` 块
     let base_url = env::var("MORA_AI_BASE_URL").unwrap_or_else(|_| "https://api.openai.com/v1".to_string());
 
     println!("Mora v0.06");
     if has_openai_key {
-        println!("  AI: real API (model: {}, endpoint: {})", model, base_url);
+        println!("  AI: real API (endpoint: {})", base_url);
     } else {
         println!("  AI: mock mode (set OPENAI_API_KEY for real calls)");
     }
-    println!("  AI 原语: p\"...\" / with / stream / tool / catch e: AiError / ai.chat / AiConfig");
-    println!("  serve: http / mcp / repl / stdio + route + observe / span");
+    println!("  AI 原语: p\"...\" / with / stream / tool / catch e: AiError / ai.chat / AiConfig / Result<?>");
+    println!("  serve: http / mcp / repl / stdio + route + observe / span + Router / HttpRequest");
     println!("  Built-in: web.fetch / json.* / file.* / typeck (必走) / mora-lsp");
-    println!("  v0.06: ai.chat(cfg, p\"...\") + AiConfig::new() 类型签名 (typeck)");
+    println!("  v0.06.5: route 元数据下传 (temperature/max_tokens/system); MORA_AI_MODEL 已移除");
     println!("  ⚠  不兼容 v0.03 builtin (ai.chat/stream/tool/budget/route/usage/embed/cosine/search/memory.* 均报 Unknown method)");
     println!();
 }

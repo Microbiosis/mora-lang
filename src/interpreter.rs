@@ -826,7 +826,30 @@ impl Interpreter {
                         ));
                     }
                 };
+                // v0.06.5: route 元数据 (temperature/max_tokens/system) 存入 current_ai_config
+                let model_name_clone = model_name.clone();
+                let mut route_cfg: Option<AiConfigValue> = None;
+                if let Value::Dict(ref m) = target_val {
+                    let mut cfg = AiConfigValue::default();
+                    cfg.model = m.get("_model").and_then(|v| match v { Value::String(s) => Some(s.clone()), _ => None });
+                    cfg.temperature = m.get("temperature").and_then(|v| match v { Value::Number(n) => Some(*n), _ => None });
+                    cfg.max_tokens = m.get("max_tokens").and_then(|v| match v { Value::Number(n) => Some(*n as usize), _ => None });
+                    cfg.system = m.get("system").and_then(|v| match v { Value::String(s) => Some(s.clone()), _ => None });
+                    route_cfg = Some(cfg);
+                }
                 self.route_registry.insert(name.clone(), model_name);
+                // v0.06.5: 存 route cfg 到 model_routes (替代 env)
+                if let Some(cfg) = route_cfg {
+                    let rc = RouteConfig {
+                        model: model_name_clone,
+                        base_url: String::new(),
+                        api_key: String::new(),
+                        max_tokens: cfg.max_tokens,
+                        system: cfg.system.clone(),
+                        temperature: cfg.temperature,
+                    };
+                    self.model_routes.insert(name.clone(), rc);
+                }
                 eprintln!("[route] registered: {} -> {}", name, self.route_registry[name]);
                 Ok(FlowSignal::None)
             }
@@ -2135,6 +2158,7 @@ impl Interpreter {
     /// - **手写 JSON 请求体**：保持零 serde 依赖原则
     /// - **结构化 JSON 响应解析**：用 json_to_value 提取 choices[0].message.content
     /// - **同步阻塞**：60s 读超时（AI 推理可能慢）
+    /// v0.06.5: AI chat 新签名 — 接 temperature/max_tokens/system 从 current_ai_config
     fn real_ai_chat(&mut self, messages: &[(String, String)], api_key: &str, model: &str, base_url: &str) -> Result<Value, String> {
         let mut span_attrs = std::collections::HashMap::new();
         span_attrs.insert("model".to_string(), model.to_string());
@@ -2161,6 +2185,7 @@ impl Interpreter {
         result
     }
 
+    /// v0.06.5: HTTP body 构建 — 拼 json 时接 temperature/max_tokens/system
     fn real_ai_chat_inner(&mut self, messages: &[(String, String)], api_key: &str, model: &str, base_url: &str) -> Result<Value, String> {
         if messages.is_empty() {
             return Err("ai.chat: messages cannot be empty".to_string());
@@ -2183,10 +2208,23 @@ impl Interpreter {
         let escaped_model = model
             .replace('\\', "\\\\")
             .replace('"', "\\\"");
-        let body = format!(
-            r#"{{"model":"{}","messages":[{}]}}"#,
+        // v0.06.5: 拼 temperature/max_tokens/system 从 current_ai_config
+        let mut body = format!(
+            r#"{{"model":"{}","messages":[{}]"#,
             escaped_model, msgs_json
         );
+        if let Some(ref cfg) = self.current_ai_config {
+            if let Some(temp) = cfg.temperature {
+                body.push_str(&format!(",\"temperature\":{}", temp));
+            }
+            if let Some(mt) = cfg.max_tokens {
+                body.push_str(&format!(",\"max_tokens\":{}", mt));
+            }
+            if let Some(ref sys) = cfg.system {
+                body.push_str(&format!(",\"system\":\"{}\"", sys.replace('"', "\\\"")));
+            }
+        }
+        body.push('}');
 
         let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
 

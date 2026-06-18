@@ -52,6 +52,8 @@ pub enum Type {
     AiError,
     /// v0.06: AI 模块类型（`ai` 内建变量的接收者类型）
     AiModule,
+    /// v0.06.2: 类型化错误处理 Result<T, E>
+    Result_(Box<Type>, Box<Type>),
     /// 推断不出或用户未标注时的退路——不做严格检查
     Any,
 }
@@ -74,6 +76,11 @@ impl Type {
             Type::AiResult => "ai_result",
             Type::AiError => "ai_error",
             Type::AiModule => "ai",
+            Type::Result_(ok, err) => {
+                // 动态格式化：Result<string, AiError> 只能在运行时 name()
+                let _ = (ok, err);
+                "result"
+            },
             Type::Any => "any",
         }
     }
@@ -99,9 +106,13 @@ impl Type {
         }
     }
 
-    /// 类型兼容：Any 总兼容；其它要求严格相等
+    /// 类型兼容：Any 总兼容；Result<T,E> 与 Ok/Err 兼容
     pub fn compatible_with(&self, expected: &Type) -> bool {
         if matches!(self, Type::Any) || matches!(expected, Type::Any) {
+            return true;
+        }
+        // v0.06.2: Result<T,E> 兼容 —— 任何同构 Result 兼容
+        if matches!(self, Type::Result_(_, _)) && matches!(expected, Type::Result_(_, _)) {
             return true;
         }
         self == expected
@@ -834,6 +845,24 @@ impl TypeChecker {
                 }
                 Type::Dict
             }
+            // v0.06.2: expr? 操作符 — expr 必须是 Result<T,E> , 返回 T
+            Expr::Question { expr, span } => {
+                let expr_ty = self.check_expr(expr, symbols);
+                match &expr_ty {
+                    Type::Result_(ok_ty, _err_ty) => (**ok_ty).clone(),
+                    Type::Any => Type::Any,  // 推断不出, 不报
+                    _ => {
+                        self.errors.push(TypeError::from_span_with_detail(
+                            span,
+                            format!("'?' operator expects Result<T,E>, got '{}'", expr_ty.name()),
+                            "result",
+                            expr_ty.name(),
+                            "wrap the expression in Ok(...) or change return type to Result<T,E>",
+                        ));
+                        Type::Any
+                    }
+                }
+            }
         }
     }
 
@@ -1014,6 +1043,7 @@ fn expr_debug_line(expr: &Expr) -> usize {
         | Expr::Prompt { span, .. }
         | Expr::RouteCall { span, .. }
         | Expr::AiModelCall { span, .. } => span.line,
+        Expr::Question { span, .. } => span.line,
         Expr::Literal(lit) => literal_debug_line(lit),
         Expr::Variable(_, span) | Expr::Grouping(_, span) => span.line,
     }
@@ -1045,6 +1075,7 @@ fn expr_to_span(expr: &Expr) -> Option<Span> {
         | Expr::Prompt { span, .. }
         | Expr::RouteCall { span, .. }
         | Expr::AiModelCall { span, .. } => Some(*span),
+        Expr::Question { span, .. } => Some(*span),
         Expr::Literal(lit) => Some(literal_to_span(lit)),
         Expr::Variable(_, span) | Expr::Grouping(_, span) => Some(*span),
     }

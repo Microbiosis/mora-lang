@@ -1278,6 +1278,23 @@ impl Interpreter {
                 }
                 Ok(Value::Dict(m))
             }
+            // v0.06.2: expr? 操作符 — Result<T,E> 早 return
+            Expr::Question { expr, span: _ } => {
+                match self.evaluate(expr)? {
+                    Value::Dict(ref m) if m.contains_key("ok") => {
+                        Ok(m.get("ok").cloned().unwrap_or(Value::Nil))
+                    }
+                    Value::Dict(ref m) if m.contains_key("err") => {
+                        let err_val = m.get("err").cloned().unwrap_or(Value::Nil);
+                        // ? 操作符在 task/closure 内触发早 return，
+                        // 但当前在 evaluate 递归里无法早 return →
+                        // 这里把 Err 包装成 Continue/特殊标记，由调用方
+                        // (call_task/call_closure 的 execute_block) 检测
+                        Err(format!("?error: {}", err_val))
+                    }
+                    other => Err(format!("'?' expects Result<T,E> (dict with 'ok' or 'err'), got {}", other)),
+                }
+            }
         }
     }
 

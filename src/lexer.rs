@@ -19,6 +19,8 @@ pub enum TokenType {
     Pipe, Arrow,
     // v0.05: := 显式 Any 标注（let x := expr = Any，跳过严格 typeck）
     Walrus,
+    // v0.06.2: ? 操作符（expr? 传播 Result 错误）
+    Question,
     LParen, RParen, LBracket, RBracket, LBrace, RBrace, Dot, Comma, Colon,
     Newline,
     EOF,
@@ -159,6 +161,8 @@ impl Lexer {
                 if self.match_char('=') { Some(Token { token_type: TokenType::NotEqual, line: start_line, column: start_col }) }
                 else { panic!("Unexpected '!' at line {}", self.line) }
             }
+            // v0.06.2: ? 操作符
+            '?' => Some(Token { token_type: TokenType::Question, line: start_line, column: start_col }),
             '"' => Some(self.string_from(start_line, start_col)),
             '\n' => { self.line += 1; self.column = 1; Some(Token { token_type: TokenType::Newline, line: start_line, column: start_col }) }
             _ => {

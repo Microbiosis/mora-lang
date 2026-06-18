@@ -1148,9 +1148,10 @@ impl Parser {
         let name = self.consume_identifier("Expected trait name");
         while self.check(&TokenType::Newline) { self.advance(); }
         let mut methods = Vec::new();
-        while !self.check(&TokenType::End) && !self.is_at_end() {
-            if self.check(&TokenType::Newline) { self.advance(); continue; }
-            // fn name(params): ret_type
+        loop {
+            // 跳过方法之间的 Newline
+            while self.check(&TokenType::Newline) { self.advance(); }
+            if self.check(&TokenType::End) || self.is_at_end() { break; }
             let mspan = self.span_of_previous_keyword();
             self.consume(&TokenType::Fn, "Expected 'fn' in trait method");
             let mname = self.consume_identifier("Expected method name in trait");
@@ -1158,10 +1159,14 @@ impl Parser {
             let params = if self.check(&TokenType::RParen) { vec![] }
                          else { self.parameters() };
             self.consume(&TokenType::RParen, "Expected ')' after trait method params");
-            let return_type = if self.check(&TokenType::Colon) {
+            // v0.08.1: 支持 `-> RetType` 语法（也兼容 `: RetType` 旧风格）
+            let return_type = if self.match_token(&[TokenType::Arrow]) {
+                Some(self.consume_identifier("Expected return type after '->'"))
+            } else if self.check(&TokenType::Colon) {
                 self.advance();
                 Some(self.consume_identifier("Expected return type after ':'"))
             } else { None };
+            // 跳到本行末尾
             while self.check(&TokenType::Newline) { self.advance(); }
             methods.push(TraitMethod { name: mname, params, return_type, span: mspan });
         }
@@ -1177,8 +1182,10 @@ impl Parser {
         let for_type = self.consume_identifier("Expected type name after 'for'");
         while self.check(&TokenType::Newline) { self.advance(); }
         let mut methods = Vec::new();
-        while !self.check(&TokenType::End) && !self.is_at_end() {
-            if self.check(&TokenType::Newline) { self.advance(); continue; }
+        loop {
+            // 跳过方法之间的 Newline
+            while self.check(&TokenType::Newline) { self.advance(); }
+            if self.check(&TokenType::End) || self.is_at_end() { break; }
             let mspan = self.span_of_previous_keyword();
             self.consume(&TokenType::Fn, "Expected 'fn' in impl method");
             let mname = self.consume_identifier("Expected method name in impl");
@@ -1186,7 +1193,10 @@ impl Parser {
             let params = if self.check(&TokenType::RParen) { vec![] }
                          else { self.parameters() };
             self.consume(&TokenType::RParen, "Expected ')' after impl method params");
-            let return_type = if self.check(&TokenType::Colon) {
+            // v0.08.1: 支持 `-> RetType` 和 `: RetType` 两种
+            let return_type = if self.match_token(&[TokenType::Arrow]) {
+                Some(self.consume_identifier("Expected return type after '->'"))
+            } else if self.check(&TokenType::Colon) {
                 self.advance();
                 Some(self.consume_identifier("Expected return type after ':'"))
             } else { None };
@@ -1203,7 +1213,6 @@ impl Parser {
                 self.consume(&TokenType::End, "Expected 'end' after impl method body");
                 body
             } else {
-                // 无 body 标记：到下一个 fn 或 impl end 为止
                 vec![]
             };
             while self.check(&TokenType::Newline) { self.advance(); }

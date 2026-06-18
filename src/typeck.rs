@@ -139,6 +139,10 @@ impl Type {
         if matches!(self, Type::Result_(_, _)) && matches!(expected, Type::Result_(_, _)) {
             return true;
         }
+        // v0.08.1: Nil 兼容所有 trait（用于 dyn Trait = nil 占位）
+        if matches!(self, Type::Nil) {
+            return true;
+        }
         // v0.08: Trait/Struct 兼容
         if let (Type::Trait(a), Type::Trait(b)) = (self, expected) {
             return a == b;
@@ -383,6 +387,23 @@ impl TypeChecker {
             // v0.05: 收集 route 名称 —— `let x = fast(p"...")` 推断为 String
             if let Stmt::Route { name, .. } = stmt {
                 self.routes.insert(name.clone());
+            }
+            // v0.08.1: 收集 trait 定义
+            if let Stmt::TraitDef { name, methods, .. } = stmt {
+                let mut method_sigs = Vec::new();
+                for m in methods {
+                    let param_types: Vec<(String, Type)> = m.params.iter()
+                        .map(|(n, hint)| (n.clone(), hint.as_deref().map(Type::from_hint).unwrap_or(Type::Any)))
+                        .collect();
+                    let ret = m.return_type.as_deref().map(Type::from_hint).unwrap_or(Type::Any);
+                    method_sigs.push((m.name.clone(), Signature { params: param_types, return_type: ret }));
+                }
+                self.trait_registry.insert(name.clone(), TraitTypeDef { name: name.clone(), methods: method_sigs });
+            }
+            // v0.08.1: 收集 impl 关联 (for_type, trait_name) → methods
+            if let Stmt::ImplDef { trait_name, for_type, methods, .. } = stmt {
+                let method_names: Vec<String> = methods.iter().map(|m| m.name.clone()).collect();
+                self.impl_registry.insert((for_type.clone(), trait_name.clone()), method_names);
             }
         }
     }
@@ -818,6 +839,33 @@ impl TypeChecker {
                 // v0.06: AiConfig 链式参数校验
                 if matches!(ot, Type::AiConfig) {
                     check_ai_config_method(method, args, &mut self.errors, span);
+                }
+                // v0.08.1: dyn trait dispatch — 从 trait_registry 查方法返回类型
+                if let Type::Trait(tname) = &ot {
+                    if let Some(td) = self.trait_registry.get(tname) {
+                        for (mname, sig) in &td.methods {
+                            if mname == method {
+                                // trait method signature includes `self` as first param
+                                //   user call: provider.greet("Mora")
+                                //   sig: greet(self, name) -> params = [self, name]
+                                //   expected user args = sig.params.len() - 1
+                                let expected = sig.params.len().saturating_sub(1);
+                                if args.len() != expected {
+                                    self.errors.push(TypeError::from_span(
+                                        span,
+                                        format!("trait method '{}.{}' expects {} args, got {}",
+                                            tname, method, expected, args.len()),
+                                    ));
+                                }
+                                return sig.return_type.clone();
+                            }
+                        }
+                        self.errors.push(TypeError::from_span(
+                            span,
+                            format!("trait '{}' has no method '{}'", tname, method),
+                        ));
+                        return Type::Any;
+                    }
                 }
                 method_return_type(&ot, method)
             }

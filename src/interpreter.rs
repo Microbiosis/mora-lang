@@ -856,18 +856,26 @@ impl Interpreter {
                 Ok(FlowSignal::None)
             }
             // v0.08: impl 块 — 为 trait 提供实现，注册到 impl_table
+            // v0.08.1: 同时为每个 impl method 注册为 __impl_TraitName_methodName TaskDef
+            //          使 vtable dispatcher closure 可通过 call_task 路由调用
             Stmt::ImplDef { trait_name, for_type, methods, span: _ } => {
-                let method_stmts: Vec<Stmt> = methods.iter().map(|m| Stmt::TaskDef {
-                    name: m.name.clone(),
-                    params: m.params.clone(),
-                    return_type: m.return_type.clone(),
-                    body: m.body.clone(),
-                    exported: false,
-                    span: m.span,
-                }).collect();
-                self.impl_table.entry(for_type.clone())
-                    .or_default()
-                    .push((trait_name.clone(), method_stmts));
+                for m in methods {
+                    let impl_method_name = format!("__impl_{}_{}", trait_name, m.name);
+                    let td = Stmt::TaskDef {
+                        name: impl_method_name.clone(),
+                        params: m.params.clone(),
+                        return_type: m.return_type.clone(),
+                        body: m.body.clone(),
+                        exported: false,
+                        span: m.span,
+                    };
+                    // 1. 执行 TaskDef 注册到 environment
+                    self.execute(&td)?;
+                    // 2. 记录到 impl_table 供 typeck 检索
+                    self.impl_table.entry(for_type.clone())
+                        .or_default()
+                        .push((trait_name.clone(), vec![td]));
+                }
                 Ok(FlowSignal::None)
             }
         }   // ← match stmt { ... } 闭合
@@ -1259,13 +1267,46 @@ impl Interpreter {
         }
     }
 
-    /// v0.08: 求值 dyn trait 表达式 → TraitObject
-    fn eval_dyn_trait(&self, trait_name: &str) -> Result<Value, String> {
+    /// v0.08.1: 求值 dyn trait 表达式 → TraitObject
+    /// vtable 真正绑定 impl 方法的 closure（用 self 捕获 data）
+    fn eval_dyn_trait(&mut self, trait_name: &str) -> Result<Value, String> {
         let mut vtable = HashMap::new();
         let mut methods = HashMap::new();
-        if let Some(info) = self.trait_registry.get(trait_name) {
-            for m in &info.methods {
-                methods.insert(m.name.clone(), Value::Nil);
+        if let Some(info) = self.trait_registry.get(trait_name).cloned() {
+            for m in info.methods {
+                // 为每个 trait method 构造一个 dispatcher closure
+                //   闭包签名: (self, arg1, arg2, ...) -> result
+                //   内部: 找到 self 的具体类型对应的 impl method (TaskDef)，call_task
+                let trait_name_owned = trait_name.to_string();
+                let method_name = m.name.clone();
+                let param_names: Vec<String> = m.params.iter().map(|(n, _)| n.clone()).collect();
+                // 构造闭包 body:
+                //   __impl_method_name(self, arg1, arg2, ...)
+                //   impl method 已被注册到 environment（via call_task 路由），名字加 "impl_"
+                let impl_method_name = format!("__impl_{}_{}", trait_name_owned, method_name);
+                let body = vec![Stmt::Expr(Expr::Call {
+                    callee: impl_method_name.clone(),
+                    args: {
+                        let mut v = vec![Box::new(Expr::Variable("self".to_string(), Span::default()))];
+                        for p in &param_names {
+                            v.push(Box::new(Expr::Variable(p.clone(), Span::default())));
+                        }
+                        v
+                    },
+                    span: Span::default(),
+                })];
+                let closure = Value::Closure {
+                    params: {
+                        let mut v: Vec<String> = vec!["self".to_string()];
+                        for p in &param_names {
+                            v.push(p.clone());
+                        }
+                        v
+                    },
+                    body,
+                    env: self.environment.clone(),
+                };
+                methods.insert(method_name, closure);
             }
         }
         vtable.insert(trait_name.to_string(), methods);
@@ -1494,6 +1535,18 @@ impl Interpreter {
     }
 
     fn call_method(&mut self, mut object: Value, method: &str, args: Vec<Value>) -> Result<Value, String> {
+        // v0.08.1: dyn dispatch — 先查 trait object vtable
+        if let Value::TraitObject { ref data, ref vtable } = object {
+            for (_trait_name, methods) in vtable.iter() {
+                if let Some(method_value) = methods.get(method) {
+                    // 把 receiver 作为第一个参数传给方法
+                    let mut all_args = vec![(**data).clone()];
+                    all_args.extend(args);
+                    return self.call_value(method_value, all_args);
+                }
+            }
+            return Err(format!("trait object: method '{}' not found", method));
+        }
         match object {
             Value::List(list) => {
                 match method {
@@ -3144,6 +3197,10 @@ fn check_type(value: &Value, hint: &str) -> bool {
         (Value::Conversation{..}, "conversation") => true,
         (Value::Stream{..}, "stream") => true,
         (Value::Agent{..}, "agent") => true,
+        // v0.08.1: Nil 兼容 dyn Trait 标注（trait 对象占位）
+        (Value::Nil, h) if h.starts_with("dyn:") => true,
+        // v0.08.1: TraitObject 兼容对应的 dyn Trait 标注
+        (Value::TraitObject{..}, h) if h.starts_with("dyn:") => true,
         _ => false,
     }
 }

@@ -55,12 +55,14 @@ pub enum Stmt {
     ImplDef { trait_name: String, for_type: String, methods: Vec<FnDef>, span: Span },
 }
 
-/// v0.08: trait 方法签名（仅签名，无 body）
+/// v0.08: trait 方法签名（v0.08.3: body 可选——非空表示默认实现）
 #[derive(Debug, Clone, PartialEq)]
 pub struct TraitMethod {
     pub name: String,
     pub params: Vec<(String, Option<String>)>,
     pub return_type: Option<String>,
+    /// v0.08.3: 默认实现 body。空 = 纯签名；非空 = 默认实现（impl 可省略）
+    pub body: Vec<Stmt>,
     pub span: Span,
 }
 

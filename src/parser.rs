@@ -1166,9 +1166,16 @@ impl Parser {
                 self.advance();
                 Some(self.consume_identifier("Expected return type after ':'"))
             } else { None };
+            // v0.08.3: 默认实现 `= expr`（trait 内 fn 直接给实现，impl 可省略）
+            let body = if self.match_token(&[TokenType::Assign]) {
+                let expr = self.expression();
+                vec![Stmt::Expr(expr)]
+            } else {
+                vec![]
+            };
             // 跳到本行末尾
             while self.check(&TokenType::Newline) { self.advance(); }
-            methods.push(TraitMethod { name: mname, params, return_type, span: mspan });
+            methods.push(TraitMethod { name: mname, params, return_type, body, span: mspan });
         }
         self.consume(&TokenType::End, "Expected 'end' after trait body");
         Stmt::TraitDef { name, methods, span }

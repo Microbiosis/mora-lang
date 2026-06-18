@@ -315,7 +315,8 @@ pub struct TypeChecker {
 #[derive(Debug, Clone)]
 struct TraitTypeDef {
     name: String,
-    methods: Vec<(String, Signature)>,
+    /// v0.08.3: (method_name, signature, has_default_impl)
+    methods: Vec<(String, Signature, bool)>,
 }
 
 /// 任务/闭包签名
@@ -396,7 +397,8 @@ impl TypeChecker {
                         .map(|(n, hint)| (n.clone(), hint.as_deref().map(Type::from_hint).unwrap_or(Type::Any)))
                         .collect();
                     let ret = m.return_type.as_deref().map(Type::from_hint).unwrap_or(Type::Any);
-                    method_sigs.push((m.name.clone(), Signature { params: param_types, return_type: ret }));
+                    let has_default = !m.body.is_empty();
+                    method_sigs.push((m.name.clone(), Signature { params: param_types, return_type: ret }, has_default));
                 }
                 self.trait_registry.insert(name.clone(), TraitTypeDef { name: name.clone(), methods: method_sigs });
             }
@@ -747,28 +749,32 @@ impl TypeChecker {
                     // clone trait def to avoid borrow conflict during recursive typeck
                     let td = self.trait_registry.get(trait_name).cloned().unwrap();
                     let impl_methods = methods.clone();
-                    for tm in &td.methods {
-                        let impl_m = impl_methods.iter().find(|m| m.name == tm.0);
+                    for (tm_name, tm_sig, tm_has_default) in &td.methods {
+                        let impl_m = impl_methods.iter().find(|m| m.name == *tm_name);
                         if impl_m.is_none() {
-                            self.errors.push(TypeError::from_span(span,
-                                format!("impl '{}' for '{}': missing method '{}'", trait_name, for_type, tm.0)));
-                        } else {
-                            // 校验参数个数和类型 hint
-                            let im = impl_m.unwrap();
-                            if im.params.len() != tm.1.params.len() {
-                                self.errors.push(TypeError::from_span(&im.span,
-                                    format!("impl '{}' for '{}': method '{}' expects {} params, got {}",
-                                        trait_name, for_type, tm.0, tm.1.params.len(), im.params.len())));
+                            // v0.08.3: 如果 trait method 有默认实现，impl 可省略
+                            if !*tm_has_default {
+                                self.errors.push(TypeError::from_span(span,
+                                    format!("impl '{}' for '{}': missing method '{}'", trait_name, for_type, tm_name)));
                             }
-                            // 递归 typeck 方法体
-                            symbols.push_scope();
-                            for (pname, phint) in &im.params {
-                                let pty = phint.as_deref().map(Type::from_hint).unwrap_or(Type::Any);
-                                symbols.define(pname.clone(), pty);
-                            }
-                            for s in &im.body { self.check_stmt(s, symbols); }
-                            symbols.pop_scope();
+                            continue;
                         }
+                        // 校验参数个数和类型 hint
+                        let im = impl_m.unwrap();
+                        if im.params.len() != tm_sig.params.len() {
+                            self.errors.push(TypeError::from_span(&im.span,
+                                format!("impl '{}' for '{}': method '{}' expects {} params, got {}",
+                                    trait_name, for_type, tm_name, tm_sig.params.len(), im.params.len())));
+                        }
+                        // 递归 typeck 方法体
+                        let im = impl_m.unwrap();
+                        symbols.push_scope();
+                        for (pname, phint) in &im.params {
+                            let pty = phint.as_deref().map(Type::from_hint).unwrap_or(Type::Any);
+                            symbols.define(pname.clone(), pty);
+                        }
+                        for s in &im.body { self.check_stmt(s, symbols); }
+                        symbols.pop_scope();
                     }
                     // 注册 impl type (Struct(name, [trait_name]))
                     symbols.define(for_type.clone(),
@@ -843,12 +849,8 @@ impl TypeChecker {
                 // v0.08.1: dyn trait dispatch — 从 trait_registry 查方法返回类型
                 if let Type::Trait(tname) = &ot {
                     if let Some(td) = self.trait_registry.get(tname) {
-                        for (mname, sig) in &td.methods {
+                        for (mname, sig, _has_default) in &td.methods {
                             if mname == method {
-                                // trait method signature includes `self` as first param
-                                //   user call: provider.greet("Mora")
-                                //   sig: greet(self, name) -> params = [self, name]
-                                //   expected user args = sig.params.len() - 1
                                 let expected = sig.params.len().saturating_sub(1);
                                 if args.len() != expected {
                                     self.errors.push(TypeError::from_span(

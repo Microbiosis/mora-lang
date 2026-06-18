@@ -843,6 +843,8 @@ impl Interpreter {
                 Ok(FlowSignal::None)
             }
             // v0.08: trait 定义 — 注册到 trait_registry
+            // v0.08.3: 有默认实现的 method 同步注册为 __impl_<Trait>_<Trait>_<method>
+            //          任何 impl 没实现时，dispatcher fallback 到默认实现
             Stmt::TraitDef { name, methods, span: _ } => {
                 let method_sigs: Vec<TraitMethodSig> = methods.iter().map(|m| TraitMethodSig {
                     name: m.name.clone(),
@@ -853,6 +855,21 @@ impl Interpreter {
                     name: name.clone(),
                     methods: method_sigs,
                 });
+                // 默认实现：注册到 __impl_<Trait>_<Trait>_<method>（self 类型是 trait 名）
+                for m in methods {
+                    if !m.body.is_empty() {
+                        let default_method_name = format!("__impl_{}_{}_{}", name, name, m.name);
+                        let td = Stmt::TaskDef {
+                            name: default_method_name.clone(),
+                            params: m.params.clone(),
+                            return_type: m.return_type.clone(),
+                            body: m.body.clone(),
+                            exported: false,
+                            span: m.span,
+                        };
+                        self.execute(&td)?;
+                    }
+                }
                 Ok(FlowSignal::None)
             }
             // v0.08: impl 块 — 为 trait 提供实现，注册到 impl_table
@@ -1336,6 +1353,7 @@ impl Interpreter {
         let trait_names: Vec<String> = self.trait_registry.keys().cloned().collect();
         drop(env);
         for tname in &trait_names {
+            // 1. 先找具体类型的 impl
             let impl_method_name = format!("__impl_{}_{}_{}", tname, type_tag, method);
             let env = self.environment.lock().unwrap();
             if let Some(task) = env.get(&impl_method_name) {
@@ -1344,37 +1362,44 @@ impl Interpreter {
                 all_args.extend(args);
                 return self.call_value(&task, all_args);
             }
+            drop(env);
+            // 2. v0.08.3: fallback 到 trait 自身的默认实现
+            //    默认实现注册为 __impl_<Trait>_<Trait>_<method>（self 类型 = trait 名）
+            let default_method_name = format!("__impl_{}_{}_{}", tname, tname, method);
+            let env = self.environment.lock().unwrap();
+            if let Some(task) = env.get(&default_method_name) {
+                drop(env);
+                let mut all_args = vec![data.clone()];
+                all_args.extend(args);
+                return self.call_value(&task, all_args);
+            }
+            drop(env);
         }
         Err(format!("trait dispatch: no impl for type '{}' method '{}'", type_tag, method))
     }
 
     /// v0.08.2: 构造 trait instance（Trait::new("ForType") 调用）
-    /// 返回 TraitObject，data 携带 _type 标签用于 dispatcher 选 impl
+    /// v0.08.3: 即使 ForType 没有任何 impl（仅用默认实现）也允许构造
     fn construct_trait_instance(&mut self, trait_name: &str, for_type: &str) -> Result<Value, String> {
-        // 检查是否有该 ForType 的 impl
-        let env = self.environment.lock().unwrap();
-        let mut has_impl = false;
         let method_names: Vec<String> = self.trait_registry.get(trait_name)
             .map(|td| td.methods.iter().map(|m| m.name.clone()).collect())
             .unwrap_or_default();
-        drop(env);
+        // v0.08.3: 不再强制要求 ForType 有 impl——trait 自带默认实现即可
+        // 检查：每个 trait method 必须有具体类型 impl 或 trait 默认实现
         for m in &method_names {
             let impl_name = format!("__impl_{}_{}_{}", trait_name, for_type, m);
+            let default_name = format!("__impl_{}_{}_{}", trait_name, trait_name, m);
             let env = self.environment.lock().unwrap();
-            if env.get(&impl_name).is_some() {
-                drop(env);
-                has_impl = true;
-                break;
-            }
+            let has_specific = env.get(&impl_name).is_some();
+            let has_default = env.get(&default_name).is_some();
             drop(env);
-        }
-        if !has_impl && !method_names.is_empty() {
-            return Err(format!("trait {} has no impl for type '{}'", trait_name, for_type));
+            if !has_specific && !has_default {
+                return Err(format!("trait {} method '{}' has no impl for type '{}' and no default", trait_name, m, for_type));
+            }
         }
         // data 携带 _type
         let mut data_map = HashMap::new();
         data_map.insert("_type".to_string(), Value::String(for_type.to_string()));
-        // 复用 eval_dyn_trait 构造 vtable
         let vtable = self.build_trait_vtable(trait_name)?;
         Ok(Value::TraitObject { data: Box::new(Value::Dict(data_map)), vtable })
     }

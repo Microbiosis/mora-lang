@@ -62,9 +62,13 @@ pub enum Type {
     HttpResponse,
     /// v0.06.6: MCP 服务器构建器
     McpServer,
+    /// v0.08: dyn trait 类型（名称、方法签名表）
+    Trait(String),
+    /// v0.08: impl 类型 —— 携带自身类型名 + 实现的 trait 列表
+    Struct(String, Vec<String>),
     /// 推断不出或用户未标注时的退路——不做严格检查
     Any,
-}
+}  // ← close pub enum Type
 
 impl Type {
     pub fn name(&self) -> &'static str {
@@ -93,6 +97,8 @@ impl Type {
             Type::HttpRequest => "http_request",
             Type::HttpResponse => "http_response",
             Type::McpServer => "mcp_server",
+            Type::Trait(_) => "trait",
+            Type::Struct(_, _) => "struct",
             Type::Any => "any",
         }
     }
@@ -117,6 +123,8 @@ impl Type {
             "http_request" => Type::HttpRequest,
             "http_response" => Type::HttpResponse,
             "mcp_server" => Type::McpServer,
+            // v0.08: dyn: 前缀 → Trait 类型
+            s if s.starts_with("dyn:") => Type::Trait(s[4..].to_string()),
             // 未知类型名 → Any（不报错；Mora 允许扩展类型）
             _ => Type::Any,
         }
@@ -130,6 +138,13 @@ impl Type {
         // v0.06.2: Result<T,E> 兼容 —— 任何同构 Result 兼容
         if matches!(self, Type::Result_(_, _)) && matches!(expected, Type::Result_(_, _)) {
             return true;
+        }
+        // v0.08: Trait/Struct 兼容
+        if let (Type::Trait(a), Type::Trait(b)) = (self, expected) {
+            return a == b;
+        }
+        if let (Type::Struct(_, traits), Type::Trait(trait_name)) = (self, expected) {
+            return traits.contains(trait_name);
         }
         self == expected
     }
@@ -285,8 +300,18 @@ pub struct TypeChecker {
     errors: Vec<TypeError>,
     /// 当前所在 task/closure 的返回类型 hint（None 表示未标注）
     current_return_hint: Option<Type>,
-    /// v0.05: 已注册的 route 名称（供 `let x = fast(p"...")` 推断为 String）
+    // v0.05: 已注册的 route 名称（供 `let x = fast(p"...")` 推断为 String）
     routes: std::collections::HashSet<String>,
+    // v0.08:  trait/impl 注册表
+    trait_registry: HashMap<String, TraitTypeDef>,
+    impl_registry: HashMap<(String, String), Vec<String>>,
+}
+
+/// v0.08: typeck 内使用的 trait 定义
+#[derive(Debug, Clone)]
+struct TraitTypeDef {
+    name: String,
+    methods: Vec<(String, Signature)>,
 }
 
 /// 任务/闭包签名
@@ -335,6 +360,9 @@ impl TypeChecker {
             errors: Vec::new(),
             current_return_hint: None,
             routes: std::collections::HashSet::new(),
+            // v0.08
+            trait_registry: std::collections::HashMap::new(),
+            impl_registry: std::collections::HashMap::new(),
         }
     }
 
@@ -678,6 +706,54 @@ impl TypeChecker {
                     ));
                 }
             }
+            // v0.08: trait/impl — 第一趟 collect_signatures 已注册, 这里做完整性检查
+            Stmt::TraitDef { name, methods, .. } => {
+                // 确保方法签名无重复
+                let mut seen = std::collections::HashSet::new();
+                for m in methods {
+                    if !seen.insert(&m.name) {
+                        self.errors.push(TypeError::from_span(&m.span,
+                            format!("trait '{}': duplicate method '{}'", name, m.name)));
+                    }
+                }
+            }
+            Stmt::ImplDef { trait_name, for_type, methods, span, .. } => {
+                // 验证 trait 存在
+                if !self.trait_registry.contains_key(trait_name) {
+                    self.errors.push(TypeError::from_span(span,
+                        format!("impl: trait '{}' not defined", trait_name)));
+                } else {
+                    // clone trait def to avoid borrow conflict during recursive typeck
+                    let td = self.trait_registry.get(trait_name).cloned().unwrap();
+                    let impl_methods = methods.clone();
+                    for tm in &td.methods {
+                        let impl_m = impl_methods.iter().find(|m| m.name == tm.0);
+                        if impl_m.is_none() {
+                            self.errors.push(TypeError::from_span(span,
+                                format!("impl '{}' for '{}': missing method '{}'", trait_name, for_type, tm.0)));
+                        } else {
+                            // 校验参数个数和类型 hint
+                            let im = impl_m.unwrap();
+                            if im.params.len() != tm.1.params.len() {
+                                self.errors.push(TypeError::from_span(&im.span,
+                                    format!("impl '{}' for '{}': method '{}' expects {} params, got {}",
+                                        trait_name, for_type, tm.0, tm.1.params.len(), im.params.len())));
+                            }
+                            // 递归 typeck 方法体
+                            symbols.push_scope();
+                            for (pname, phint) in &im.params {
+                                let pty = phint.as_deref().map(Type::from_hint).unwrap_or(Type::Any);
+                                symbols.define(pname.clone(), pty);
+                            }
+                            for s in &im.body { self.check_stmt(s, symbols); }
+                            symbols.pop_scope();
+                        }
+                    }
+                    // 注册 impl type (Struct(name, [trait_name]))
+                    symbols.define(for_type.clone(),
+                        Type::Struct(format!("{}", for_type), vec![trait_name.clone()]));
+                }
+            }
         }
     }
 
@@ -845,6 +921,8 @@ impl TypeChecker {
             }
             // v0.07.1: NamespaceRef — IDENT::IDENT, typeck as Any for now
             Expr::NamespaceRef { .. } => Type::Any,
+            // v0.08: DynTrait — dyn TraitName type hint
+            Expr::DynTrait { .. } => Type::Any,
         }
     }
 
@@ -1035,6 +1113,7 @@ fn expr_debug_line(expr: &Expr) -> usize {
         | Expr::AiModelCall { span, .. } => span.line,
         Expr::Question { span, .. } => span.line,
         Expr::NamespaceRef { span, .. } => span.line,
+        Expr::DynTrait { span, .. } => span.line,
         Expr::Literal(lit) => literal_debug_line(lit),
         Expr::Variable(_, span) | Expr::Grouping(_, span) => span.line,
     }
@@ -1068,6 +1147,7 @@ fn expr_to_span(expr: &Expr) -> Option<Span> {
         | Expr::AiModelCall { span, .. } => Some(*span),
         Expr::Question { span, .. } => Some(*span),
         Expr::NamespaceRef { span, .. } => Some(*span),
+        Expr::DynTrait { span, .. } => Some(*span),
         Expr::Literal(lit) => Some(literal_to_span(lit)),
         Expr::Variable(_, span) | Expr::Grouping(_, span) => Some(*span),
     }
@@ -1080,7 +1160,7 @@ fn literal_to_span(lit: &Literal) -> Span {
     }
 }
 
-/// 递归检查 body 里是否有 return 语句（包括嵌套 if/for/try 里）
+/// 递归检查 body 里是否有 return 语句（包括嵌套 if/for 里）
 fn body_has_return(stmts: &[Stmt]) -> bool {
     for stmt in stmts {
         match stmt {
@@ -1102,6 +1182,11 @@ fn body_has_return(stmts: &[Stmt]) -> bool {
             Stmt::With { body, .. } | Stmt::StreamFor { body, .. } | Stmt::ToolDef { body, .. } |
             Stmt::Observe { body, .. } | Stmt::Span { body, .. } => {
                 if body_has_return(body) { return true; }
+            }
+            Stmt::ImplDef { methods, .. } => {
+                for m in methods {
+                    if body_has_return(&m.body) { return true; }
+                }
             }
             _ => {}
         }

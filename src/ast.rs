@@ -50,6 +50,28 @@ pub enum Stmt {
     /// v0.04.0 终态补: 显式 token 计数（RFC §2.4 / §3.3）
     /// 语义: 累加到当前 TraceCollector，不触发预算超限
     RecordTokens { input: Expr, output: Expr, span: Span },
+    // v0.08: trait 系统
+    TraitDef { name: String, methods: Vec<TraitMethod>, span: Span },
+    ImplDef { trait_name: String, for_type: String, methods: Vec<FnDef>, span: Span },
+}
+
+/// v0.08: trait 方法签名（仅签名，无 body）
+#[derive(Debug, Clone, PartialEq)]
+pub struct TraitMethod {
+    pub name: String,
+    pub params: Vec<(String, Option<String>)>,
+    pub return_type: Option<String>,
+    pub span: Span,
+}
+
+/// v0.08: 通用函数定义（用于 impl 块方法体）
+#[derive(Debug, Clone, PartialEq)]
+pub struct FnDef {
+    pub name: String,
+    pub params: Vec<(String, Option<String>)>,
+    pub return_type: Option<String>,
+    pub body: Vec<Stmt>,
+    pub span: Span,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -88,6 +110,8 @@ pub enum Expr {
     Question { expr: Box<Expr>, span: Span },
     // v0.07.1: NamespaceRef — IDENT::IDENT 解析, 如 Router::new / McpServer::new
     NamespaceRef { namespace: String, name: String, span: Span },
+    // v0.08: dyn trait 类型标注
+    DynTrait { trait_name: String, span: Span },
 }
 
 #[derive(Debug, Clone, PartialEq)]

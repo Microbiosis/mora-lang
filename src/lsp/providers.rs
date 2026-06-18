@@ -146,6 +146,7 @@ fn collect_references(stmts: &[Stmt], name: &str, refs: &mut Vec<(usize, usize)>
             }
             Expr::Question { expr: inner, .. } => walk_expr(inner, name, refs),
             Expr::NamespaceRef { .. } => {},
+            Expr::DynTrait { .. } => {},
             Expr::Call { callee, args, span, .. } => {
                 if callee == name {
                     refs.push((span.line, span.column));
@@ -206,6 +207,12 @@ fn collect_references(stmts: &[Stmt], name: &str, refs: &mut Vec<(usize, usize)>
                 }
             }
             Stmt::Return { value: Some(v), .. } => walk_expr(v, name, refs),
+            Stmt::TraitDef { .. } => {},
+            Stmt::ImplDef { methods, .. } => {
+                for m in methods {
+                    for s in &m.body { walk_stmt(s, name, refs); }
+                }
+            }
             _ => {}
         }
     }
@@ -351,7 +358,9 @@ pub fn completion(docs: &HashMap<String, DocumentState>, params: &Value) -> Valu
                "stream", "tool", "break", "continue",
                // v0.06.7: 云服务原语 (serve/try/catch 已移除)
                "route", "observe", "span", "tags",
-               "record_tokens", "ai_model"] {
+               "record_tokens", "ai_model",
+               // v0.08: trait 系统
+               "trait", "impl", "dyn", "Self"] {
         if seen.insert(kw.to_string()) {
             items.push(make_completion(kw, 14.0, None));
         }
@@ -827,7 +836,9 @@ pub fn semantic_tokens(docs: &HashMap<String, DocumentState>, params: &Value) ->
             TokenType::Parallel | TokenType::Read | TokenType::Write | TokenType::Append |
             TokenType::ReadBytes | TokenType::WriteBytes | TokenType::Into | TokenType::Export |
             // v0.04.0: AI 原语关键字
-            TokenType::Stream | TokenType::Tool | TokenType::Break | TokenType::Continue => 0,  // keyword
+            TokenType::Stream | TokenType::Tool | TokenType::Break | TokenType::Continue |
+            // v0.08: trait 系统关键字
+            TokenType::Trait | TokenType::Impl | TokenType::Dyn | TokenType::Self_ => 0,  // keyword
             TokenType::String(_) => 3,  // string
             TokenType::Number(_) => 4,  // number
             _ => continue,
@@ -930,6 +941,12 @@ pub fn folding_range(docs: &HashMap<String, DocumentState>, params: &Value) -> V
                         out.push((span.line, end_stmt_span_line(end_stmt)));
                     }
                 }
+                Stmt::TraitDef { span, .. } => {
+                    out.push((span.line, span.line));
+                }
+                Stmt::ImplDef { span, .. } => {
+                    out.push((span.line, span.line));
+                }
                 _ => {}
             }
         }
@@ -973,7 +990,9 @@ fn end_stmt_span_line(stmt: &Stmt) -> usize {
         | Stmt::Route { span, .. }
         | Stmt::Observe { span, .. }
         | Stmt::Span { span, .. }
-        | Stmt::RecordTokens { span, .. } => span.line,
+        | Stmt::RecordTokens { span, .. }
+        | Stmt::TraitDef { span, .. }
+        | Stmt::ImplDef { span, .. } => span.line,
         Stmt::Expr(_) => 0,
     }
 }

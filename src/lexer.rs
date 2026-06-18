@@ -24,6 +24,8 @@ pub enum TokenType {
     Question,
     // v0.07.1: :: 操作符（Namespace qualification like Router::new）
     ColonColon,
+    // v0.08: trait / impl / dyn / Self
+    Trait, Impl, Dyn, Self_,
     LParen, RParen, LBracket, RBracket, LBrace, RBrace, Dot, Comma, Colon,
     Newline,
     EOF,
@@ -307,6 +309,11 @@ impl Lexer {
             "trace" => TokenType::Trace,
             "metrics" => TokenType::Metrics,
             "otel" => TokenType::Otel,
+            // v0.08: trait 系统
+            "trait" => TokenType::Trait,
+            "impl" => TokenType::Impl,
+            "dyn" => TokenType::Dyn,
+            "Self" => TokenType::Self_,
             _ => TokenType::Identifier(value),
         };
         Token { token_type, line: start_line, column: start_col }

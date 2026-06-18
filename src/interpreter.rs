@@ -98,6 +98,11 @@ pub enum Value {
     McpServer {
         tools: Vec<(String, Value)>,  // (tool_name, handler)
     },
+    // v0.08: trait 对象 — 携带数据 + vtable
+    TraitObject {
+        data: Box<Value>,
+        vtable: HashMap<String, HashMap<String, Value>>,  // trait_name → (method_name → closure)
+    },
 }
 
 // 手动实现 PartialEq（Arc<Mutex<Environment>> 不支持自动派生）
@@ -148,6 +153,10 @@ impl std::fmt::Display for Value {
             Value::Router { routes } => write!(f, "<router ({} routes)>", routes.lock().unwrap().len()),
             Value::HttpRequest { method, path, .. } => write!(f, "<http_request {} {}>", method, path),
             Value::McpServer { tools } => write!(f, "<mcp_server ({} tools)>", tools.len()),
+            Value::TraitObject { data, vtable } => {
+                let trait_names: Vec<String> = vtable.keys().cloned().collect();
+                write!(f, "<trait_object {:?} implements [{}]>", data, trait_names.join(", "))
+            },
         }
     }
 }
@@ -210,6 +219,9 @@ pub struct Interpreter {
     route_registry: HashMap<String, String>,
     // v0.06: 当前 with 块 set 的 AiConfig 值 (替代 env hack)
     current_ai_config: Option<AiConfigValue>,
+    // v0.08: trait 系统注册表
+    pub trait_registry: HashMap<String, TraitInfo>,
+    pub impl_table: HashMap<String, Vec<(String, Vec<Stmt>)>>,
 }
 
 /// v0.06: with 块字段 (不经过 env 变量)
@@ -237,6 +249,8 @@ impl Clone for Interpreter {
             trace: self.trace.clone(),
             route_registry: self.route_registry.clone(),
             current_ai_config: self.current_ai_config.clone(),
+            trait_registry: self.trait_registry.clone(),
+            impl_table: self.impl_table.clone(),
         }
     }
 }
@@ -278,6 +292,21 @@ pub struct ToolDef {
     pub handler: Value,      // Closure
 }
 
+/// v0.08: trait 注册条目
+#[derive(Clone, Debug)]
+pub struct TraitInfo {
+    pub name: String,
+    pub methods: Vec<TraitMethodSig>,
+}
+
+/// v0.08: trait 方法签名
+#[derive(Clone, Debug)]
+pub struct TraitMethodSig {
+    pub name: String,
+    pub params: Vec<(String, Option<String>)>,
+    pub return_type: Option<String>,
+}
+
 /// 结构化聊天消息（用于支持 tool_calls）
 enum ChatMessage {
     User { content: String },
@@ -299,7 +328,7 @@ impl Interpreter {
         globals.lock().unwrap().define("print".to_string(), Value::Builtin("print".to_string()), false);
         globals.lock().unwrap().define("range".to_string(), Value::Builtin("range".to_string()), false);
         globals.lock().unwrap().define("len".to_string(), Value::Builtin("len".to_string()), false);
-        Self { globals: globals.clone(), environment: globals, tool_registry: HashMap::new(), model_routes: HashMap::new(), token_budget: None, token_usage: TokenUsage::default(), trace: TraceCollector::new(false), route_registry: HashMap::new(), current_ai_config: None }
+        Self { globals: globals.clone(), environment: globals, tool_registry: HashMap::new(), model_routes: HashMap::new(), token_budget: None, token_usage: TokenUsage::default(), trace: TraceCollector::new(false), route_registry: HashMap::new(), current_ai_config: None, trait_registry: HashMap::new(), impl_table: HashMap::new() }
     }
 
     /// v0.04: 构造一个空 Interpreter (用于 std::mem::replace 占位)
@@ -316,12 +345,14 @@ impl Interpreter {
             trace: TraceCollector::new(false),
             route_registry: HashMap::new(),
             current_ai_config: None,
+            trait_registry: HashMap::new(),
+            impl_table: HashMap::new(),
         }
     }
 
     pub fn new_with_globals(globals: Arc<Mutex<Environment>>) -> Self {
         let env = Arc::new(Mutex::new(Environment::with_parent(globals.clone())));
-        Self { globals: globals.clone(), environment: env, tool_registry: HashMap::new(), model_routes: HashMap::new(), token_budget: None, token_usage: TokenUsage::default(), trace: TraceCollector::new(false), route_registry: HashMap::new(), current_ai_config: None }
+        Self { globals: globals.clone(), environment: env, tool_registry: HashMap::new(), model_routes: HashMap::new(), token_budget: None, token_usage: TokenUsage::default(), trace: TraceCollector::new(false), route_registry: HashMap::new(), current_ai_config: None, trait_registry: HashMap::new(), impl_table: HashMap::new() }
     }
 
     #[allow(dead_code)]
@@ -811,6 +842,34 @@ impl Interpreter {
                 self.trace.record_tokens(in_n, out_n);
                 Ok(FlowSignal::None)
             }
+            // v0.08: trait 定义 — 注册到 trait_registry
+            Stmt::TraitDef { name, methods, span: _ } => {
+                let method_sigs: Vec<TraitMethodSig> = methods.iter().map(|m| TraitMethodSig {
+                    name: m.name.clone(),
+                    params: m.params.clone(),
+                    return_type: m.return_type.clone(),
+                }).collect();
+                self.trait_registry.insert(name.clone(), TraitInfo {
+                    name: name.clone(),
+                    methods: method_sigs,
+                });
+                Ok(FlowSignal::None)
+            }
+            // v0.08: impl 块 — 为 trait 提供实现，注册到 impl_table
+            Stmt::ImplDef { trait_name, for_type, methods, span: _ } => {
+                let method_stmts: Vec<Stmt> = methods.iter().map(|m| Stmt::TaskDef {
+                    name: m.name.clone(),
+                    params: m.params.clone(),
+                    return_type: m.return_type.clone(),
+                    body: m.body.clone(),
+                    exported: false,
+                    span: m.span,
+                }).collect();
+                self.impl_table.entry(for_type.clone())
+                    .or_default()
+                    .push((trait_name.clone(), method_stmts));
+                Ok(FlowSignal::None)
+            }
         }   // ← match stmt { ... } 闭合
     }       // ← pub fn execute(...) 闭合
 
@@ -1193,7 +1252,24 @@ impl Interpreter {
                     }
                 }
             }
+            // v0.08: DynTrait — evaluate to trait object stub
+            Expr::DynTrait { trait_name, .. } => {
+                self.eval_dyn_trait(&trait_name)
+            }
         }
+    }
+
+    /// v0.08: 求值 dyn trait 表达式 → TraitObject
+    fn eval_dyn_trait(&self, trait_name: &str) -> Result<Value, String> {
+        let mut vtable = HashMap::new();
+        let mut methods = HashMap::new();
+        if let Some(info) = self.trait_registry.get(trait_name) {
+            for m in &info.methods {
+                methods.insert(m.name.clone(), Value::Nil);
+            }
+        }
+        vtable.insert(trait_name.to_string(), methods);
+        Ok(Value::TraitObject { data: Box::new(Value::Nil), vtable })
     }
 
     /// v0.04 Slice 2: 求值 RouteCall 的单个参数
@@ -3090,6 +3166,7 @@ fn type_name(value: &Value) -> &'static str {
         Value::Router{..} => "router",
         Value::HttpRequest{..} => "http_request",
         Value::McpServer{..} => "mcp_server",
+        Value::TraitObject{..} => "trait_object",
     }
 }
 
@@ -3127,6 +3204,7 @@ fn value_to_json(value: &Value) -> String {
         Value::Router { .. } => "null".to_string(),
         Value::HttpRequest { .. } => "null".to_string(),
         Value::McpServer { .. } => "null".to_string(),
+        Value::TraitObject { .. } => "null".to_string(),
     }
 }
 

@@ -843,6 +843,8 @@ impl TypeChecker {
                     }
                 }
             }
+            // v0.07.1: NamespaceRef — IDENT::IDENT, typeck as Any for now
+            Expr::NamespaceRef { .. } => Type::Any,
         }
     }
 
@@ -1032,6 +1034,7 @@ fn expr_debug_line(expr: &Expr) -> usize {
         | Expr::RouteCall { span, .. }
         | Expr::AiModelCall { span, .. } => span.line,
         Expr::Question { span, .. } => span.line,
+        Expr::NamespaceRef { span, .. } => span.line,
         Expr::Literal(lit) => literal_debug_line(lit),
         Expr::Variable(_, span) | Expr::Grouping(_, span) => span.line,
     }
@@ -1064,6 +1067,7 @@ fn expr_to_span(expr: &Expr) -> Option<Span> {
         | Expr::RouteCall { span, .. }
         | Expr::AiModelCall { span, .. } => Some(*span),
         Expr::Question { span, .. } => Some(*span),
+        Expr::NamespaceRef { span, .. } => Some(*span),
         Expr::Literal(lit) => Some(literal_to_span(lit)),
         Expr::Variable(_, span) | Expr::Grouping(_, span) => Some(*span),
     }

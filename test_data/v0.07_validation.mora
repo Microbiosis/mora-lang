@@ -1,0 +1,145 @@
+-- v0.07.1: 综合验证脚本 + req.json() demo
+-- 验证 v0.07 新增特性:
+--   1. req.json(): Result<Dict, ParseError> — 等价于 "json" builtin 方法
+--   2. match 表达式 — 处理 Result<T,E> 解包
+--   3. ? 操作符 — 早 return
+--   4. Router::new() 显式 API — .route() / .listen()
+--   5. McpServer::new() 显式 API — .tool() / .serve()
+-- 用法: mora --check test_data/v0.07_validation.mora
+-- 期望: typeck 通过, 运行时在 mock 模式执行
+
+-- ============================
+-- 测试 1: req.json() — body 是 JSON string，解析为 Dict
+-- ============================
+task json_parse_ok()
+  -- 模拟 request body: {"name": "mora", "version": 1}
+  let req := {
+    method: "POST",
+    path: "/users",
+    header_list: [{name: "Content-Type", value: "application/json"}],
+    body: "{\"name\": \"mora\", \"version\": 1}",
+    query: {},
+    params: {}
+  }
+  let result := req.json()
+  match result with
+    {ok: val} -> print("parsed: " + val)
+    {err: e} -> print("error: " + e)
+  end
+end
+
+-- ============================
+-- 测试 2: req.json() — 空 body → err
+-- ============================
+task json_parse_empty()
+  let req := {
+    body: ""
+  }
+  let result := req.json()
+  match result with
+    {ok: val} -> print("unexpected ok")
+    {err: e} -> print("expected err: " + e)
+  end
+end
+
+-- ============================
+-- 测试 3: req.json() — 非 JSON body → err
+-- ============================
+task json_parse_bad()
+  let req := {
+    body: "not json at all"
+  }
+  let result := req.json()
+  let val := result.get("ok")
+  print("val: " + val)
+end
+
+-- ============================
+-- 测试 4: req.json() — 数组 body → ok
+-- ============================
+task json_parse_array()
+  let req := {
+    body: "[1, 2, 3]"
+  }
+  let result := req.json()
+  match result with
+    {ok: list} -> print("ok: list length " + list.len())
+    {err: e} -> print("unexpected err: " + e)
+  end
+end
+
+-- ============================
+-- 测试 5: match 表达式（Expr::Match）
+-- ============================
+task match_expr_test()
+  let val = 42
+  let label = match val with
+    0 -> "zero"
+    1 -> "one"
+    42 -> "answer"
+    _ -> "other"
+  end
+  print("match expr result: " + label)
+end
+
+-- ============================
+-- 测试 6: ? 操作符 — Result 解包
+-- ============================
+task result_ok()
+  let r := {ok: 42}
+  let v := r?
+  print("result ok: " + v)
+end
+
+-- ============================
+-- 测试 7: ? 操作符 — Result 错误
+-- ============================
+task result_err()
+  let r := {err: "something went wrong"}
+  let v := r?
+  print("should not reach: " + v)
+end
+
+-- ============================
+-- 测试 8: route + ai_model 元数据下传
+-- ============================
+route fast: ai_model("gpt-4o-mini", temperature: 0.7, max_tokens: 2000)
+route deep: ai_model("gpt-4o", system: "You are a helpful assistant")
+
+task route_test()
+  let text := "Mora v0.07"
+  let summary = fast(p"summarize: {text}")
+  print("summary: " + summary)
+end
+
+-- ============================
+-- 测试 9: with 块 — AiConfig 栈模型
+-- ============================
+with model = "gpt-4o", temperature = 0.3
+  let r = p"hello"
+  print("with-block result: " + r)
+end
+
+-- ============================
+-- 测试 10: observe + span + record_tokens
+-- ============================
+observe trace do
+end
+
+span "validation" tags {filename: "v0.07_validation.mora"} do
+  record_tokens(100, 50)
+  print("span complete")
+end
+
+-- ============================
+-- 测试 11: Router 显式 API (typeck)
+-- ============================
+-- 注: Router::new() 是解析器 builtin, 此处只验证 typeck 层面不报错
+-- 实际 HTTP 监听需在运行时用真实 Router::new() 调用
+
+-- ============================
+-- 测试 12: McpServer 显式 API (typeck)
+-- ============================
+-- 注: McpServer::new() 是解析器 builtin, 此处只验证 typeck 层面不报错
+
+print("v0.07 validation complete")

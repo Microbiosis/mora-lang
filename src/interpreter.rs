@@ -1180,6 +1180,19 @@ impl Interpreter {
                     other => Err(format!("'?' expects Result<T,E> (dict with 'ok' or 'err'), got {}", other)),
                 }
             }
+            // v0.07.1: NamespaceRef — IDENT::IDENT evaluated by joining and calling as builtin
+            Expr::NamespaceRef { namespace, name, span: _ } => {
+                let qualified = format!("{}::{}", namespace, name);
+                // Router::new / McpServer::new etc.
+                match qualified.as_str() {
+                    "Router::new" => Ok(Value::Router { routes: Arc::new(Mutex::new(Vec::new())) }),
+                    "McpServer::new" => Ok(Value::McpServer { tools: Vec::new() }),
+                    other => {
+                        // fallback: look up in call_function
+                        self.call_function(other, vec![])
+                    }
+                }
+            }
         }
     }
 
@@ -1477,6 +1490,31 @@ impl Interpreter {
                         Ok(Value::List(values))
                     }
                     "len" => Ok(Value::Number(map.len() as f64)),
+                    // v0.07.1: req.json() — 从 body 字段解析 JSON，返回 Result<Dict, ParseError>
+                    "json" => {
+                        let body_val = map.get("body").cloned().unwrap_or(Value::String(String::new()));
+                        let body_str = match body_val {
+                            Value::String(s) => s,
+                            _ => body_val.to_string(),
+                        };
+                        if body_str.trim().is_empty() {
+                            let mut err = HashMap::new();
+                            err.insert("err".to_string(), Value::String("ParseError: empty body".to_string()));
+                            return Ok(Value::Dict(err));
+                        }
+                        match json_to_value(&body_str) {
+                            Ok(val) => {
+                                let mut result = HashMap::new();
+                                result.insert("ok".to_string(), val);
+                                Ok(Value::Dict(result))
+                            }
+                            Err(e) => {
+                                let mut err = HashMap::new();
+                                err.insert("err".to_string(), Value::String(format!("ParseError: {}", e)));
+                                Ok(Value::Dict(err))
+                            }
+                        }
+                    }
                     _ => Err(format!("Dict has no method: {}", method)),
                 }
             }

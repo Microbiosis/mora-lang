@@ -22,6 +22,8 @@ pub enum TokenType {
     Walrus,
     // v0.06.2: ? 操作符（expr? 传播 Result 错误）
     Question,
+    // v0.07.1: :: 操作符（Namespace qualification like Router::new）
+    ColonColon,
     LParen, RParen, LBracket, RBracket, LBrace, RBrace, Dot, Comma, Colon,
     Newline,
     EOF,
@@ -138,6 +140,8 @@ impl Lexer {
             ':' => {
                 if self.match_char('=') {
                     Some(Token { token_type: TokenType::Walrus, line: start_line, column: start_col })
+                } else if self.match_char(':') {
+                    Some(Token { token_type: TokenType::ColonColon, line: start_line, column: start_col })
                 } else {
                     Some(Token { token_type: TokenType::Colon, line: start_line, column: start_col })
                 }

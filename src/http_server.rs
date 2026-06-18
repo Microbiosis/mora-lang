@@ -154,7 +154,7 @@ fn handle_connection(
     send_response(&mut stream, status, &body_str)
 }
 
-/// 调 Mora 闭包,把 request 包装成 dict 传入
+/// 调 Mora 闭包,把 request 包装成 dict 传入. 附加 .json() / .text() 方法
 fn invoke_handler(
     handler: Value,
     req: &HttpRequest,

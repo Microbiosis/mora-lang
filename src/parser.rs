@@ -508,8 +508,19 @@ impl Parser {
                         self.consume(&TokenType::RParen, "Expected ')' after arguments");
                         expr = Expr::Call { callee: name.clone(), args, span };
                     }
+                } else if let Expr::NamespaceRef { namespace, name, .. } = &expr {
+                    // Router::new() / McpServer::new() etc.
+                    let callee = format!("{}::{}", namespace, name);
+                    if self.check(&TokenType::RParen) {
+                        self.advance();
+                        expr = Expr::Call { callee, args: vec![], span };
+                    } else {
+                        let args = self.arguments();
+                        self.consume(&TokenType::RParen, "Expected ')' after arguments");
+                        expr = Expr::Call { callee, args, span };
+                    }
                 } else {
-                    // 其他表达式后接 (...): 不允许 (v1 限制)
+                    // other Expr followed by (): skip arguments and treat as direct call attempt
                     if self.check(&TokenType::RParen) {
                         self.advance();
                     } else {
@@ -531,7 +542,24 @@ impl Parser {
                     self.consume(&TokenType::RParen, "Expected ')' after arguments");
                     a
                 } else { vec![] };
+                let span = self.span_of_previous_keyword();  // span for MethodCall
                 expr = Expr::MethodCall { object: Box::new(expr), method, args, span };
+            } else if self.match_token(&[TokenType::ColonColon]) {
+                // v0.07.1: expr::method call - convert to NamespaceRef or handle inline
+                let method = self.consume_method_name("Expected method name after '::'");
+                let cspan = self.span_of_previous_keyword();
+                match &expr {
+                    Expr::Variable(ns, _) if &ns == &"Router" || &ns == &"McpServer" => {
+                        let callee = format!("{}::{}", ns, method);
+                        let args = if self.match_token(&[TokenType::LParen]) {
+                            let a = if self.check(&TokenType::RParen) { vec![] } else { self.arguments() };
+                            self.consume(&TokenType::RParen, "Expected ')' after arguments");
+                            a
+                        } else { vec![] };
+                        expr = Expr::Call { callee, args, span: cspan };
+                    }
+                    _ => panic!("Expected method name after '.' at line {}", self.peek().map(|t| t.line).unwrap_or(0)),
+                }
             } else {
                 break;
             }
@@ -613,7 +641,13 @@ impl Parser {
         }
         else if let Some(Token { token_type: TokenType::Identifier(name), line, column, .. }) = self.peek().cloned() {
             self.advance();
-            Expr::Variable(name, Span::new(line, column))
+            // v0.07.1: IDENT::IDENT → NamespaceRef
+            if self.match_token(&[TokenType::ColonColon]) {
+                let method = self.consume_identifier("Expected name after '::'");
+                Expr::NamespaceRef { namespace: name, name: method, span: Span::new(line, column) }
+            } else {
+                Expr::Variable(name, Span::new(line, column))
+            }
         }
         else if self.match_token(&[TokenType::LParen]) {
             let span = self.span_of_previous_keyword();
@@ -789,6 +823,24 @@ impl Parser {
                 let n = name.clone();
                 self.advance();
                 n
+            }
+            Some(Token { token_type: TokenType::ColonColon, .. }) => {
+                // v0.07.1: ColonColon found where method name expected — skip and return identifier
+                // This handles the edge case of .:: parsing in dot-chains
+                self.advance();
+                // Consume the next identifier after ::
+                match self.peek() {
+                    Some(Token { token_type: TokenType::Identifier(name), .. }) => {
+                        let n = name.clone();
+                        self.advance();
+                        n
+                    }
+                    _ => panic!("{} at line {}", message, self.peek().map(|t| t.line).unwrap_or(0)),
+                }
+            }
+            Some(Token { token_type: TokenType::Route, .. }) => {
+                self.advance();
+                "route".to_string()
             }
             Some(Token { token_type: TokenType::ReadBytes, .. }) => {
                 self.advance();

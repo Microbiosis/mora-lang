@@ -86,6 +86,8 @@ pub enum Expr {
     },
     // v0.06.2: ? 操作符（Result<T,E> 的早 return 语法糖）
     Question { expr: Box<Expr>, span: Span },
+    // v0.07.1: NamespaceRef — IDENT::IDENT 解析, 如 Router::new / McpServer::new
+    NamespaceRef { namespace: String, name: String, span: Span },
 }
 
 #[derive(Debug, Clone, PartialEq)]

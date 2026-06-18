@@ -1,5 +1,6 @@
--- v0.08.1: trait + impl + dyn dispatch demo
--- 测: trait 定义 / impl 块 / typeck 完整性 / dyn Trait 类型标注
+-- v0.08.2: trait + impl + dyn dispatch demo
+-- 测: trait 定义 / impl 块 / `dyn Trait` 类型标注 / 真正 dyn dispatch
+-- v0.08.2: Trait::new("ForType") 构造 instance，dispatcher 按 receiver._type 选 impl
 
 trait Greeter
   fn greet(self, name: string) -> string
@@ -14,11 +15,10 @@ impl Greeter for Chinese
 end
 
 task main()
-  -- dyn Trait 表达式构造 TraitObject (data=nil, vtable 绑定 impl methods)
-  -- 当前 typeck 已验证方法存在, 运行时 vtable 闭包已构造, 但 receiver 是 nil 时
-  -- method call 返回 nil —— 完整多态需要 receiver 携带类型标签 (v1.0 work)
-  let en: dyn Greeter = nil
-  let cn: dyn Greeter = nil
-  print("en: " + (en == nil))
-  print("cn: " + (cn == nil))
+  let en: dyn Greeter = Greeter::new("English")
+  let cn: dyn Greeter = Greeter::new("Chinese")
+  let r1 = en.greet("Mora")
+  let r2 = cn.greet("Mora")
+  print("r1: " + r1)
+  print("r2: " + r2)
 end

@@ -26,10 +26,44 @@ pub struct HttpRequest {
     pub query: String,
     pub headers: Vec<(String, String)>,
     pub body: String,
+    /// v0.06.4: 路径参数 (/users/:id → {"id": "123"})
+    pub params: HashMap<String, String>,
 }
 
-/// 动态路由表: (method, path) -> Mora 闭包
+/// 动态路由条目: (pattern, handler) — pattern 支持 :param
 pub type RouteTable = Arc<Mutex<HashMap<(String, String), Value>>>;
+
+/// v0.06.4: 尝试匹配路径参数 — 返回 Some(params) 或 None
+fn match_path_pattern(pattern: &str, actual: &str) -> Option<HashMap<String, String>> {
+    let pat_segs: Vec<&str> = pattern.trim_matches('/').split('/').collect();
+    let act_segs: Vec<&str> = actual.trim_matches('/').split('/').collect();
+    if pat_segs.len() != act_segs.len() {
+        return None;
+    }
+    let mut params = HashMap::new();
+    for (p, a) in pat_segs.iter().zip(act_segs.iter()) {
+        if let Some(name) = p.strip_prefix(':') {
+            params.insert(name.to_string(), a.to_string());
+        } else if p != a {
+            return None;
+        }
+    }
+    Some(params)
+}
+
+/// v0.06.4: 解析 query string → dict
+fn parse_query_dict(query: &str) -> Value {
+    use std::collections::HashMap;
+    let mut m = HashMap::new();
+    if query.is_empty() {
+        return Value::Dict(m);
+    }
+    for pair in query.split('&') {
+        let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
+        m.insert(k.to_string(), Value::String(v.to_string()));
+    }
+    Value::Dict(m)
+}
 
 /// 启动 HTTP server (阻塞当前线程)
 /// routes 是从 Stmt::Serve 提取的路由表
@@ -79,17 +113,32 @@ fn handle_connection(
     routes: RouteTable,
     interpreter: Arc<Mutex<Interpreter>>,
 ) -> io::Result<()> {
-    let req = parse_request(&mut stream)?;
+    let mut req = parse_request(&mut stream)?;
+    req.params = HashMap::new();
 
-    // 找路由: 精确匹配 (method, path)
-    let handler = {
+    // v0.06.4: 先精确匹配，再模式匹配 (:param)
+    let handler_with_params: Option<(Value, HashMap<String, String>)> = {
         let routes = routes.lock().unwrap();
-        routes.get(&(req.method.clone(), req.path.clone())).cloned()
+        // 1) 精确匹配
+        if let Some(h) = routes.get(&(req.method.clone(), req.path.clone())) {
+            Some((h.clone(), HashMap::new()))
+        } else {
+            // 2) 模式匹配 — 遍历所有注册路由
+            let mut found: Option<(Value, HashMap<String, String>)> = None;
+            for ((_m, pattern), h) in routes.iter() {
+                if *_m != req.method { continue; }
+                if let Some(params) = match_path_pattern(pattern, &req.path) {
+                    found = Some((h.clone(), params));
+                    break;
+                }
+            }
+            found
+        }
     };
 
-    let (status, body_str) = match handler {
-        Some(handler_value) => {
-            // 调闭包
+    let (status, body_str) = match handler_with_params {
+        Some((handler_value, params)) => {
+            req.params = params;
             match invoke_handler(handler_value, &req, interpreter) {
                 Ok(value) => {
                     let json = value_to_json_string(&value);
@@ -99,10 +148,6 @@ fn handle_connection(
             }
         }
         None => {
-            // 405 vs 404 区分
-            let routes = routes.lock().unwrap();
-            let path_exists = routes.values().any(|_| true); // placeholder
-            let _ = path_exists;
             (404, json_error(&format!("no route for {} {}", req.method, req.path)))
         }
     };
@@ -120,13 +165,20 @@ fn invoke_handler(
     let mut req_dict = HashMap::new();
     req_dict.insert("method".to_string(), Value::String(req.method.clone()));
     req_dict.insert("path".to_string(), Value::String(req.path.clone()));
-    req_dict.insert("query".to_string(), Value::String(req.query.clone()));
+    // v0.06.4: query 改为 dict
+    req_dict.insert("query".to_string(), parse_query_dict(&req.query));
     req_dict.insert("body".to_string(), parse_body_value(&req.body));
     let mut headers_dict = HashMap::new();
     for (k, v) in &req.headers {
         headers_dict.insert(k.clone(), Value::String(v.clone()));
     }
     req_dict.insert("headers".to_string(), Value::Dict(headers_dict));
+    // v0.06.4: 路径参数注入
+    let mut params_dict = HashMap::new();
+    for (k, v) in &req.params {
+        params_dict.insert(k.clone(), Value::String(v.clone()));
+    }
+    req_dict.insert("params".to_string(), Value::Dict(params_dict));
     let req_value = Value::Dict(req_dict);
 
     // 调闭包: handler(req_dict)
@@ -250,7 +302,7 @@ fn parse_request(stream: &mut TcpStream) -> io::Result<HttpRequest> {
         body = String::from_utf8_lossy(&buf).to_string();
     }
 
-    Ok(HttpRequest { method, path, query, headers, body })
+    Ok(HttpRequest { method, path, query, headers, body, params: HashMap::new() })
 }
 
 fn send_response(stream: &mut TcpStream, status: u16, body: &str) -> io::Result<()> {

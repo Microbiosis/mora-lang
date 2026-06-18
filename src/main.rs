@@ -16,9 +16,9 @@ fn main() {
     // --version / --help 不显示 banner
     if args.len() >= 2 {
         match args[1].as_str() {
-            "--version" | "-v" => { println!("Mora v0.05"); return; }
+            "--version" | "-v" => { println!("Mora v0.06"); return; }
             "--help" | "-h" => {
-                println!("Mora v0.05 — AI 原生 + 云服务原生");
+                println!("Mora v0.06 — AI 原生 + 云服务原生");
                 println!();
                 println!("Usage:");
                 println!("  mora <file.mora>        Run a script (auto-detect serve as http/mcp/repl)");
@@ -135,16 +135,16 @@ fn print_banner() {
     let model = env::var("MORA_AI_MODEL").unwrap_or_else(|_| "gpt-4o-mini".to_string());
     let base_url = env::var("MORA_AI_BASE_URL").unwrap_or_else(|_| "https://api.openai.com/v1".to_string());
 
-    println!("Mora v0.05");
+    println!("Mora v0.06");
     if has_openai_key {
         println!("  AI: real API (model: {}, endpoint: {})", model, base_url);
     } else {
         println!("  AI: mock mode (set OPENAI_API_KEY for real calls)");
     }
-    println!("  AI 原语: p\"...\" / with / stream / tool / catch e: AiError");
+    println!("  AI 原语: p\"...\" / with / stream / tool / catch e: AiError / ai.chat / AiConfig");
     println!("  serve: http / mcp / repl / stdio + route + observe / span");
     println!("  Built-in: web.fetch / json.* / file.* / typeck (必走) / mora-lsp");
-    println!("  v0.05: typeck 必走 (exit 2 on error); `let x := expr` 显式 Any 标注");
+    println!("  v0.06: ai.chat(cfg, p\"...\") + AiConfig::new() 类型签名 (typeck)");
     println!("  ⚠  不兼容 v0.03 builtin (ai.chat/stream/tool/budget/route/usage/embed/cosine/search/memory.* 均报 Unknown method)");
     println!();
 }

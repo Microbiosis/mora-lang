@@ -82,6 +82,18 @@ pub enum Value {
         system: Option<String>,
         budget: Option<usize>,
     },
+    // v0.06.3: Router 值类型 — 路由用 Arc 包避免递归类型
+    Router {
+        routes: Arc<Mutex<Vec<(String, String, Value)>>>,  // (method, path, handler)
+    },
+    // v0.06.3: HttpRequest 值类型
+    HttpRequest {
+        method: String,
+        path: String,
+        query: String,
+        body: Box<Value>,
+        params: HashMap<String, String>,
+    },
 }
 
 // 手动实现 PartialEq（Arc<Mutex<Environment>> 不支持自动派生）
@@ -129,6 +141,8 @@ impl std::fmt::Display for Value {
                 write!(f, "AiConfig(model={:?}, temp={:?}, max_tokens={:?}, system={:?}, budget={:?})",
                     model, temperature, max_tokens, system, budget)
             },
+            Value::Router { routes } => write!(f, "<router ({} routes)>", routes.lock().unwrap().len()),
+            Value::HttpRequest { method, path, .. } => write!(f, "<http_request {} {}>", method, path),
         }
     }
 }
@@ -1433,6 +1447,8 @@ impl Interpreter {
                 };
                 Ok(Value::Number(len as f64))
             }
+            // v0.06.3: Router::new() builtin
+            "Router::new" => Ok(Value::Router { routes: Arc::new(Mutex::new(Vec::new())) }),
             _ => {
                 // 先 clone 出值，释放 borrow，避免借用冲突
                 let looked_up = self.environment.lock().unwrap().get(name).clone();
@@ -1764,7 +1780,38 @@ impl Interpreter {
                     _ => Err(format!("Agent has no method: {}", method)),
                 }
             }
-            _ => Err(format!("Can only call methods on lists, dicts, strings, conversations, streams, agents, or builtin objects")),
+            // v0.06.3: Router 方法
+            Value::Router { ref mut routes } => {
+                let mut r = routes.lock().unwrap();
+                match method {
+                    "route" => {
+                        let http_method = args.get(0).map(|v| v.to_string()).unwrap_or_default().to_uppercase();
+                        let path = args.get(1).map(|v| v.to_string()).unwrap_or_default();
+                        let handler = args.get(2).cloned().ok_or("Router.route() requires a handler")?;
+                        r.push((http_method, path, handler));
+                        Ok(Value::Router { routes: routes.clone() })
+                    }
+                    "listen" => {
+                        let addr = args.get(0).map(|v| v.to_string()).unwrap_or_else(|| "0.0.0.0:3000".to_string());
+                        let (host, port) = addr.split_once(':').unwrap_or(("0.0.0.0", "3000"));
+                        let port: u16 = port.parse().map_err(|_| format!("Invalid port: {}", port))?;
+                        let r_clone: Vec<(String, String, Value)> = r.clone();
+                        drop(r);
+                        eprintln!("[Router] starting HTTP server on {}", addr);
+                        let interp_arc: Arc<Mutex<Interpreter>> = Arc::new(Mutex::new(self.clone()));
+                        crate::http_server::start(
+                            host, port,
+                            Arc::new(Mutex::new(r_clone.iter().map(|(m,p,h)|
+                                ((m.clone(), p.clone()), h.clone())
+                            ).collect())),
+                            interp_arc,
+                        ).map_err(|e| format!("HTTP server error: {}", e))?;
+                        Ok(Value::Nil)
+                    }
+                    _ => { drop(r); Err(format!("Router has no method: {}", method)) },
+                }
+            }
+            _ => Err(format!("Can only call methods on lists, dicts, strings, conversations, streams, agents, routers, or builtin objects")),
         }
     }
 
@@ -3062,6 +3109,8 @@ fn type_name(value: &Value) -> &'static str {
         Value::Stream{..} => "stream",
         Value::Agent{..} => "agent",
         Value::AiConfig{..} => "ai_config",
+        Value::Router{..} => "router",
+        Value::HttpRequest{..} => "http_request",
     }
 }
 
@@ -3096,6 +3145,8 @@ fn value_to_json(value: &Value) -> String {
         Value::Stream { .. } => "null".to_string(),
         Value::Agent { .. } => "null".to_string(),
         Value::AiConfig { .. } => "null".to_string(),
+        Value::Router { .. } => "null".to_string(),
+        Value::HttpRequest { .. } => "null".to_string(),
     }
 }
 

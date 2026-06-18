@@ -54,6 +54,12 @@ pub enum Type {
     AiModule,
     /// v0.06.2: 类型化错误处理 Result<T, E>
     Result_(Box<Type>, Box<Type>),
+    /// v0.06.3: HTTP 路由构建器
+    Router,
+    /// v0.06.3: HTTP 请求对象
+    HttpRequest,
+    /// v0.06.3: HTTP 响应对象（handler 返回值）
+    HttpResponse,
     /// 推断不出或用户未标注时的退路——不做严格检查
     Any,
 }
@@ -81,6 +87,9 @@ impl Type {
                 let _ = (ok, err);
                 "result"
             },
+            Type::Router => "router",
+            Type::HttpRequest => "http_request",
+            Type::HttpResponse => "http_response",
             Type::Any => "any",
         }
     }
@@ -101,6 +110,9 @@ impl Type {
             "ai_config" => Type::AiConfig,
             "ai_result" => Type::AiResult,
             "ai_error" => Type::AiError,
+            "router" => Type::Router,
+            "http_request" => Type::HttpRequest,
+            "http_response" => Type::HttpResponse,
             // 未知类型名 → Any（不报错；Mora 允许扩展类型）
             _ => Type::Any,
         }
@@ -304,6 +316,11 @@ impl TypeChecker {
             ],
             return_type: Type::AiResult,
         });
+        // v0.06.3: Router::new() -> Router
+        sigs.insert("Router::new".to_string(), Signature {
+            params: vec![],
+            return_type: Type::Router,
+        });
         Self {
             signatures: sigs,
             errors: Vec::new(),
@@ -339,6 +356,8 @@ impl TypeChecker {
         let mut symbols = SymbolTable::new();
         // v0.06: 注入 `ai` 内建变量 (AiModule 类型)
         symbols.define("ai".to_string(), Type::AiModule);
+        // v0.06.3: 注入 `Router` builtin (Router::new() 走签名表)
+        symbols.define("Router".to_string(), Type::Builtin);
         for stmt in stmts {
             self.check_stmt(stmt, &mut symbols);
         }
@@ -970,6 +989,11 @@ fn method_return_type(receiver: &Type, method: &str) -> Type {
         (Type::AiConfig, "max_tokens") => Type::AiConfig,
         (Type::AiConfig, "system") => Type::AiConfig,
         (Type::AiConfig, "budget") => Type::AiConfig,
+        // v0.06.3: Router 链式方法
+        (Type::Router, "route") => Type::Router,
+        (Type::Router, "listen") => Type::Nil,
+        // v0.06.3: HttpRequest 方法
+        (Type::HttpRequest, "json") => Type::Any,  // ~Result<T, ParseError>
         (Type::Any, _) => Type::Any,
         (_, "len") => Type::Number,  // 通用 len
         _ => Type::Any,

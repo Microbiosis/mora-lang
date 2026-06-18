@@ -200,6 +200,8 @@ fn value_to_json(v: &Value) -> JsonValue {
         Value::Conversation { .. } => JsonValue::String_("<conversation>".to_string()),
         Value::Agent { .. } => JsonValue::String_("<agent>".to_string()),
         Value::AiConfig { .. } => JsonValue::String_("<ai_config>".to_string()),
+        Value::Router { .. } => JsonValue::String_("<router>".to_string()),
+        Value::HttpRequest { .. } => JsonValue::String_("<http_request>".to_string()),
     }
 }
 

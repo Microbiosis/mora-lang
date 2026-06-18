@@ -818,51 +818,59 @@ impl Parser {
     /// 用 lexer 关键字化后,这些方法名不再是 TokenType::Identifier,旧 consume_identifier 会 panic。
     /// 这里把它们还原为字面字符串,语义不变(运行时再分发)。
     fn consume_method_name(&mut self, message: &str) -> String {
+        // v0.07.1: 接受任何 token（包括 Identifier + keyword）作为方法名
+        // consume_identifier 只接受 TokenType::Identifier，但像 "route"/"mcp" 被词法
+        // 关键字化后不再是 Identifier——这里统一用 advance 拿到它然后返回字符串表示
         match self.peek() {
             Some(Token { token_type: TokenType::Identifier(name), .. }) => {
                 let n = name.clone();
                 self.advance();
                 n
             }
-            Some(Token { token_type: TokenType::ColonColon, .. }) => {
-                // v0.07.1: ColonColon found where method name expected — skip and return identifier
-                // This handles the edge case of .:: parsing in dot-chains
-                self.advance();
-                // Consume the next identifier after ::
-                match self.peek() {
-                    Some(Token { token_type: TokenType::Identifier(name), .. }) => {
-                        let n = name.clone();
-                        self.advance();
-                        n
+            Some(tok) => {
+                // 取 token 的字符串表示（lexer 已经把关键字映射好了）
+                let name = match &tok.token_type {
+                    TokenType::Route => "route".to_string(),
+                    TokenType::ReadBytes => "read_bytes".to_string(),
+                    TokenType::WriteBytes => "write_bytes".to_string(),
+                    TokenType::Read => "read".to_string(),
+                    TokenType::Write => "write".to_string(),
+                    TokenType::Append => "append".to_string(),
+                    TokenType::Let => "let".to_string(),
+                    TokenType::Task => "task".to_string(),
+                    TokenType::If => "if".to_string(),
+                    TokenType::For => "for".to_string(),
+                    TokenType::In => "in".to_string(),
+                    TokenType::Import => "import".to_string(),
+                    TokenType::As => "as".to_string(),
+                    TokenType::Do => "do".to_string(),
+                    TokenType::WithKeyword => "with".to_string(),
+                    TokenType::Save => "save".to_string(),
+                    TokenType::Load => "load".to_string(),
+                    TokenType::Fn => "fn".to_string(),
+                    TokenType::Into => "into".to_string(),
+                    TokenType::Stream => "stream".to_string(),
+                    TokenType::Tool => "tool".to_string(),
+                    TokenType::Break => "break".to_string(),
+                    TokenType::Continue => "continue".to_string(),
+                    TokenType::Observe => "observe".to_string(),
+                    TokenType::Span => "span".to_string(),
+                    TokenType::Tags => "tags".to_string(),
+                    TokenType::Record => "record".to_string(),
+                    TokenType::Trace => "trace".to_string(),
+                    TokenType::Metrics => "metrics".to_string(),
+                    TokenType::Otel => "otel".to_string(),
+                    TokenType::Export => "export".to_string(),
+                    TokenType::Parallel => "parallel".to_string(),
+                    _ => {
+                        // 检查是否是 Identifier 类 token (被词法降级为 Ident 的关键字)
+                        panic!("{} at line {}: unexpected token {:?}", message, tok.line, tok.token_type)
                     }
-                    _ => panic!("{} at line {}", message, self.peek().map(|t| t.line).unwrap_or(0)),
-                }
-            }
-            Some(Token { token_type: TokenType::Route, .. }) => {
+                };
                 self.advance();
-                "route".to_string()
+                name
             }
-            Some(Token { token_type: TokenType::ReadBytes, .. }) => {
-                self.advance();
-                "read_bytes".to_string()
-            }
-            Some(Token { token_type: TokenType::WriteBytes, .. }) => {
-                self.advance();
-                "write_bytes".to_string()
-            }
-            Some(Token { token_type: TokenType::Read, .. }) => {
-                self.advance();
-                "read".to_string()
-            }
-            Some(Token { token_type: TokenType::Write, .. }) => {
-                self.advance();
-                "write".to_string()
-            }
-            Some(Token { token_type: TokenType::Append, .. }) => {
-                self.advance();
-                "append".to_string()
-            }
-            _ => panic!("{} at line {}", message, self.peek().map(|t| t.line).unwrap_or(0)),
+            None => panic!("{} at end of input", message),
         }
     }
 

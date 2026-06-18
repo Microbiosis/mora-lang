@@ -112,10 +112,6 @@ fn collect_definitions(stmts: &[Stmt]) -> HashMap<String, Vec<(usize, usize)>> {
                 }
                 Stmt::If { then_branch, .. } => walk(then_branch, out),
                 Stmt::For { body, .. } => walk(body, out),
-                Stmt::Try { try_block, catch_block, .. } => {
-                    walk(try_block, out);
-                    walk(catch_block, out);
-                }
                 Stmt::Parallel { stmts, .. } => walk(stmts, out),
                 Stmt::Match { arms, .. } => {
                     for (_p, arm_stmts) in arms {
@@ -198,10 +194,6 @@ fn collect_references(stmts: &[Stmt], name: &str, refs: &mut Vec<(usize, usize)>
             Stmt::For { iterable, body, .. } => {
                 walk_expr(iterable, name, refs);
                 for s in body { walk_stmt(s, name, refs); }
-            }
-            Stmt::Try { try_block, catch_block, .. } => {
-                for s in try_block { walk_stmt(s, name, refs); }
-                for s in catch_block { walk_stmt(s, name, refs); }
             }
             Stmt::Parallel { stmts, .. } => {
                 for s in stmts { walk_stmt(s, name, refs); }
@@ -312,21 +304,7 @@ pub fn completion(docs: &HashMap<String, DocumentState>, params: &Value) -> Valu
         }
     }
 
-    // `serve as ` → 补 protocol
-    if prefix.ends_with("serve as ") || prefix == "serve as" {
-        for proto in ["http", "mcp", "repl", "stdio"] {
-            if seen.insert(proto.to_string()) {
-                let detail = match proto {
-                    "http" => "HTTP REST server (serve as http on port 3000 do ... end)",
-                    "mcp" => "MCP tool server (serve as mcp do ... end)",
-                    "repl" => "Interactive REPL (serve as repl do ... end)",
-                    "stdio" => "Stdio echo (serve as stdio do ... end)",
-                    _ => "",
-                };
-                items.push(make_completion(proto, 14.0, Some(detail)));
-            }
-        }
-    }
+    // v0.06.7: serve as 已移除——用 Router::new() / McpServer::new() 显式 API
 
     // `observe ` → 补 config
     if prefix.ends_with("observe ") || prefix == "observe" {
@@ -364,14 +342,14 @@ pub fn completion(docs: &HashMap<String, DocumentState>, params: &Value) -> Valu
     // ── 通用关键字补全 ─────────────────────────────────────────
 
     // 1. 关键字
-    for kw in ["let", "task", "if", "then", "end", "for", "in", "try", "catch",
+    for kw in ["let", "task", "if", "then", "end", "for", "in",
                "return", "fn", "true", "false", "nil", "match", "with",
                "save", "load", "import", "parallel", "read", "write", "append",
                "read_bytes", "write_bytes", "into", "export",
                // v0.04.0: AI 原语
                "stream", "tool", "break", "continue",
-               // v0.05: 云服务原语
-               "serve", "route", "observe", "span", "tags",
+               // v0.06.7: 云服务原语 (serve/try/catch 已移除)
+               "route", "observe", "span", "tags",
                "record_tokens", "ai_model"] {
         if seen.insert(kw.to_string()) {
             items.push(make_completion(kw, 14.0, None));
@@ -842,7 +820,7 @@ pub fn semantic_tokens(docs: &HashMap<String, DocumentState>, params: &Value) ->
         let (line, col) = (tok.line, 0u32);
         let token_type = match &tok.token_type {
             TokenType::Let | TokenType::Task | TokenType::If | TokenType::Then | TokenType::End |
-            TokenType::For | TokenType::In | TokenType::Try | TokenType::Catch | TokenType::Return |
+            TokenType::For | TokenType::In | TokenType::Return |
             TokenType::Fn | TokenType::True | TokenType::False | TokenType::Nil | TokenType::Match |
             TokenType::WithKeyword | TokenType::Save | TokenType::Load | TokenType::Import |
             TokenType::Parallel | TokenType::Read | TokenType::Write | TokenType::Append |
@@ -939,11 +917,6 @@ pub fn folding_range(docs: &HashMap<String, DocumentState>, params: &Value) -> V
                         out.push((span.line, end_stmt_span_line(end_stmt)));
                     }
                 }
-                Stmt::Try { span, catch_block, .. } => {
-                    if let Some(end_stmt) = catch_block.last() {
-                        out.push((span.line, end_stmt_span_line(end_stmt)));
-                    }
-                }
                 Stmt::Match { span, arms, .. } => {
                     if let Some((_p, last_arm)) = arms.last() {
                         if let Some(end_stmt) = last_arm.last() {
@@ -980,7 +953,6 @@ fn end_stmt_span_line(stmt: &Stmt) -> usize {
         | Stmt::TaskDef { span, .. }
         | Stmt::If { span, .. }
         | Stmt::For { span, .. }
-        | Stmt::Try { span, .. }
         | Stmt::Import { span, .. }
         | Stmt::Parallel { span, .. }
         | Stmt::Match { span, .. }
@@ -997,7 +969,6 @@ fn end_stmt_span_line(stmt: &Stmt) -> usize {
         | Stmt::ToolDef { span, .. }
         | Stmt::Break { span, .. }
         | Stmt::Continue { span, .. }
-        | Stmt::Serve { span, .. }
         | Stmt::Route { span, .. }
         | Stmt::Observe { span, .. }
         | Stmt::Span { span, .. }

@@ -15,7 +15,6 @@ use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
 
-use crate::ast::HttpMethod;
 use crate::interpreter::{Interpreter, Value};
 use crate::lsp::json::{to_string as json_to_string, Value as JsonValue};
 
@@ -66,7 +65,7 @@ fn parse_query_dict(query: &str) -> Value {
 }
 
 /// 启动 HTTP server (阻塞当前线程)
-/// routes 是从 Stmt::Serve 提取的路由表
+/// routes 是从 Router 显式 API 收集的路由表
 pub fn start(
     host: &str,
     port: u16,

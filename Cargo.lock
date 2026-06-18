@@ -219,7 +219,7 @@ dependencies = [
 
 [[package]]
 name = "mora"
-version = "0.0.6"
+version = "0.0.7"
 dependencies = [
  "ureq",
 ]

@@ -480,23 +480,6 @@ impl TypeChecker {
                 for s in body { self.check_stmt(s, symbols); }
                 symbols.pop_scope();
             }
-            Stmt::Try { try_block, catch_type, catch_block, span, .. } => {
-                symbols.push_scope();
-                for s in try_block { self.check_stmt(s, symbols); }
-                symbols.pop_scope();
-                // v0.04.0: catch_type 校验
-                if let Some(t) = catch_type {
-                    if t != "AiError" {
-                        self.errors.push(TypeError::from_span(
-                            span,
-                            format!("try/catch: type '{}' not supported (v0.04.0 only supports 'AiError' or no annotation)", t),
-                        ));
-                    }
-                }
-                symbols.push_scope();
-                for s in catch_block { self.check_stmt(s, symbols); }
-                symbols.pop_scope();
-            }
             Stmt::Import { .. } => {
                 // 不做跨模块 symbol 解析
             }
@@ -638,38 +621,7 @@ impl TypeChecker {
             Stmt::Break { .. } | Stmt::Continue { .. } => {
                 // v0.04.0 简化:仅警告(v0.04.1 强制"必须在 loop 内")
             }
-            // v0.05: 云服务原生 —— 严格 typeck
-            Stmt::Serve { protocol, routes, body, span, .. } => {
-                // 校验 protocol
-                match protocol {
-                    ServeProtocol::Http { port, .. } => {
-                        // port 必须是 number literal
-                        if *port == 0 {
-                            self.errors.push(TypeError::from_span(
-                                span,
-                                "serve as http: port cannot be 0",
-                            ));
-                        }
-                    }
-                    ServeProtocol::Mcp | ServeProtocol::Repl | ServeProtocol::Stdio => {
-                        // 这些协议无参数限制
-                    }
-                }
-                // 校验 routes
-                for r in routes {
-                    match r {
-                        RouteDecl::HttpRoute { handler, .. } => {
-                            self.check_expr(handler, symbols);
-                        }
-                        RouteDecl::ToolEntry { handler, .. } => {
-                            self.check_expr(handler, symbols);
-                        }
-                    }
-                }
-                symbols.push_scope();
-                for s in body { self.check_stmt(s, symbols); }
-                symbols.pop_scope();
-            }
+            // v0.06.7: serve as 已移除，用 Router::new() / McpServer::new() 显式 API
             Stmt::Observe { config, body, span, .. } => {
                 // 校验 observe config
                 match config {
@@ -1134,9 +1086,6 @@ fn body_has_return(stmts: &[Stmt]) -> bool {
             }
             Stmt::For { body, .. } => {
                 if body_has_return(body) { return true; }
-            }
-            Stmt::Try { try_block, catch_block, .. } => {
-                if body_has_return(try_block) || body_has_return(catch_block) { return true; }
             }
             Stmt::Parallel { stmts, .. } => {
                 if body_has_return(stmts) { return true; }

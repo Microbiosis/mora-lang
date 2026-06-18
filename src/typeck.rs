@@ -60,6 +60,8 @@ pub enum Type {
     HttpRequest,
     /// v0.06.3: HTTP 响应对象（handler 返回值）
     HttpResponse,
+    /// v0.06.6: MCP 服务器构建器
+    McpServer,
     /// 推断不出或用户未标注时的退路——不做严格检查
     Any,
 }
@@ -90,6 +92,7 @@ impl Type {
             Type::Router => "router",
             Type::HttpRequest => "http_request",
             Type::HttpResponse => "http_response",
+            Type::McpServer => "mcp_server",
             Type::Any => "any",
         }
     }
@@ -113,6 +116,7 @@ impl Type {
             "router" => Type::Router,
             "http_request" => Type::HttpRequest,
             "http_response" => Type::HttpResponse,
+            "mcp_server" => Type::McpServer,
             // 未知类型名 → Any（不报错；Mora 允许扩展类型）
             _ => Type::Any,
         }
@@ -320,6 +324,11 @@ impl TypeChecker {
         sigs.insert("Router::new".to_string(), Signature {
             params: vec![],
             return_type: Type::Router,
+        });
+        // v0.06.6: McpServer::new() -> McpServer
+        sigs.insert("McpServer::new".to_string(), Signature {
+            params: vec![],
+            return_type: Type::McpServer,
         });
         Self {
             signatures: sigs,
@@ -992,6 +1001,9 @@ fn method_return_type(receiver: &Type, method: &str) -> Type {
         // v0.06.3: Router 链式方法
         (Type::Router, "route") => Type::Router,
         (Type::Router, "listen") => Type::Nil,
+        // v0.06.6: McpServer 链式方法
+        (Type::McpServer, "tool") => Type::McpServer,
+        (Type::McpServer, "serve") => Type::Nil,
         // v0.06.3: HttpRequest 方法
         (Type::HttpRequest, "json") => Type::Any,  // ~Result<T, ParseError>
         (Type::Any, _) => Type::Any,

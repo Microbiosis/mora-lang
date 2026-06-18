@@ -254,6 +254,7 @@ fn value_to_json(v: &Value) -> JsonValue {
         Value::AiConfig { .. } => JsonValue::String_("<ai_config>".to_string()),
         Value::Router { .. } => JsonValue::String_("<router>".to_string()),
         Value::HttpRequest { .. } => JsonValue::String_("<http_request>".to_string()),
+        Value::McpServer { .. } => JsonValue::String_("<mcp_server>".to_string()),
     }
 }
 

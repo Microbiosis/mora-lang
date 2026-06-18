@@ -94,6 +94,10 @@ pub enum Value {
         body: Box<Value>,
         params: HashMap<String, String>,
     },
+    // v0.06.6: McpServer 值类型
+    McpServer {
+        tools: Vec<(String, Value)>,  // (tool_name, handler)
+    },
 }
 
 // 手动实现 PartialEq（Arc<Mutex<Environment>> 不支持自动派生）
@@ -143,6 +147,7 @@ impl std::fmt::Display for Value {
             },
             Value::Router { routes } => write!(f, "<router ({} routes)>", routes.lock().unwrap().len()),
             Value::HttpRequest { method, path, .. } => write!(f, "<http_request {} {}>", method, path),
+            Value::McpServer { tools } => write!(f, "<mcp_server ({} tools)>", tools.len()),
         }
     }
 }
@@ -1472,6 +1477,8 @@ impl Interpreter {
             }
             // v0.06.3: Router::new() builtin
             "Router::new" => Ok(Value::Router { routes: Arc::new(Mutex::new(Vec::new())) }),
+            // v0.06.6: McpServer::new() builtin
+            "McpServer::new" => Ok(Value::McpServer { tools: Vec::new() }),
             _ => {
                 // 先 clone 出值，释放 borrow，避免借用冲突
                 let looked_up = self.environment.lock().unwrap().get(name).clone();
@@ -1834,7 +1841,38 @@ impl Interpreter {
                     _ => { drop(r); Err(format!("Router has no method: {}", method)) },
                 }
             }
-            _ => Err(format!("Can only call methods on lists, dicts, strings, conversations, streams, agents, routers, or builtin objects")),
+            // v0.06.6: McpServer 方法
+            Value::McpServer { ref mut tools } => {
+                match method {
+                    "tool" => {
+                        let name = args.get(0).map(|v| v.to_string()).unwrap_or_default();
+                        let handler = args.get(2).cloned().ok_or("McpServer.tool() requires 3 args (name, schema, handler)")?;
+                        tools.push((name, handler));
+                        Ok(Value::McpServer { tools: tools.clone() })
+                    }
+                    "serve" => {
+                        let tools_clone = tools.clone();
+                        eprintln!("[McpServer] starting MCP server on stdio ({} tools)", tools_clone.len());
+                        let tool_registry: Arc<Mutex<HashMap<String, crate::mcp_server::McpTool>>> =
+                            Arc::new(Mutex::new(HashMap::new()));
+                        for (name, handler) in tools_clone {
+                            let mcp_tool = crate::mcp_server::McpTool {
+                                name: name.clone(),
+                                description: String::new(),
+                                parameters: "{}".to_string(),
+                                handler,
+                            };
+                            tool_registry.lock().unwrap().insert(name, mcp_tool);
+                        }
+                        let interp_arc: Arc<Mutex<Interpreter>> = Arc::new(Mutex::new(self.clone()));
+                        crate::mcp_server::start(tool_registry, interp_arc)
+                            .map_err(|e| format!("MCP server error: {}", e))?;
+                        Ok(Value::Nil)
+                    }
+                    _ => Err(format!("McpServer has no method: {}", method)),
+                }
+            }
+            _ => Err(format!("Can only call methods on lists, dicts, strings, conversations, streams, agents, routers, mcp_servers, or builtin objects")),
         }
     }
 
@@ -3149,6 +3187,7 @@ fn type_name(value: &Value) -> &'static str {
         Value::AiConfig{..} => "ai_config",
         Value::Router{..} => "router",
         Value::HttpRequest{..} => "http_request",
+        Value::McpServer{..} => "mcp_server",
     }
 }
 
@@ -3185,6 +3224,7 @@ fn value_to_json(value: &Value) -> String {
         Value::AiConfig { .. } => "null".to_string(),
         Value::Router { .. } => "null".to_string(),
         Value::HttpRequest { .. } => "null".to_string(),
+        Value::McpServer { .. } => "null".to_string(),
     }
 }
 

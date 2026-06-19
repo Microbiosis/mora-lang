@@ -51,7 +51,7 @@ pub enum Stmt {
     /// 语义: 累加到当前 TraceCollector，不触发预算超限
     RecordTokens { input: Expr, output: Expr, span: Span },
     // v0.08: trait 系统
-    TraitDef { name: String, methods: Vec<TraitMethod>, span: Span },
+    TraitDef { name: String, parents: Vec<String>, methods: Vec<TraitMethod>, span: Span },
     ImplDef { trait_name: String, for_type: String, methods: Vec<FnDef>, span: Span },
 }
 

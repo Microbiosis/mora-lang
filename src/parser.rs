@@ -1143,9 +1143,20 @@ impl Parser {
     // ===================================================================
 
     /// `trait Name ... method_signatures ... end`
+    /// `trait Name [: Parent1, Parent2, ...] ... method_signatures ... end`
     fn parse_trait_def(&mut self, _exported: bool) -> Stmt {
         let span = self.span_of_previous_keyword();
         let name = self.consume_identifier("Expected trait name");
+        // v0.08.4: 可选 `:` 后跟父 trait 列表（用 `,` 分隔）
+        let parents = if self.match_token(&[TokenType::Colon]) {
+            let mut ps = vec![self.consume_identifier("Expected parent trait name after ':'")];
+            while self.match_token(&[TokenType::Comma]) {
+                ps.push(self.consume_identifier("Expected parent trait name"));
+            }
+            ps
+        } else {
+            vec![]
+        };
         while self.check(&TokenType::Newline) { self.advance(); }
         let mut methods = Vec::new();
         loop {
@@ -1178,7 +1189,7 @@ impl Parser {
             methods.push(TraitMethod { name: mname, params, return_type, body, span: mspan });
         }
         self.consume(&TokenType::End, "Expected 'end' after trait body");
-        Stmt::TraitDef { name, methods, span }
+        Stmt::TraitDef { name, parents, methods, span }
     }
 
     /// `impl TraitName for TypeName ... method_bodies ... end`

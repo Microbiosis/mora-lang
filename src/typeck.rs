@@ -312,10 +312,12 @@ pub struct TypeChecker {
 }
 
 /// v0.08: typeck 内使用的 trait 定义
+/// v0.08.4: 加 parents 字段实现 trait 继承
 #[derive(Debug, Clone)]
 struct TraitTypeDef {
     name: String,
-    /// v0.08.3: (method_name, signature, has_default_impl)
+    parents: Vec<String>,
+    /// (method_name, signature, has_default_impl)
     methods: Vec<(String, Signature, bool)>,
 }
 
@@ -327,6 +329,31 @@ pub struct Signature {
 }
 
 impl TypeChecker {
+    /// v0.08.4: 递归收集 trait + 所有父 trait 的方法（去重，防止循环继承）
+    fn collect_trait_methods_recursive(
+        &self,
+        trait_name: &str,
+        visited: &mut std::collections::HashSet<String>,
+        out: &mut Vec<(String, Signature, bool)>,
+    ) {
+        if visited.contains(trait_name) { return; }  // 防循环
+        visited.insert(trait_name.to_string());
+        let td = match self.trait_registry.get(trait_name) {
+            Some(td) => td,
+            None => return,  // 未知父 trait —— typeck 已报错过
+        };
+        // 先收集父 trait 的方法（深度优先，子覆盖父）
+        for parent in &td.parents {
+            self.collect_trait_methods_recursive(parent, visited, out);
+        }
+        // 再收集本 trait 的方法（同名覆盖父 trait 的）
+        for m in &td.methods {
+            // 去重：先移除同名旧项（来自父 trait）
+            out.retain(|(n, _, _)| n != &m.0);
+            out.push(m.clone());
+        }
+    }
+
     pub fn new() -> Self {
         let mut sigs = HashMap::new();
         // 内置函数签名
@@ -390,7 +417,8 @@ impl TypeChecker {
                 self.routes.insert(name.clone());
             }
             // v0.08.1: 收集 trait 定义
-            if let Stmt::TraitDef { name, methods, .. } = stmt {
+            // v0.08.4: 记录 parent traits
+            if let Stmt::TraitDef { name, parents, methods, .. } = stmt {
                 let mut method_sigs = Vec::new();
                 for m in methods {
                     let param_types: Vec<(String, Type)> = m.params.iter()
@@ -400,7 +428,11 @@ impl TypeChecker {
                     let has_default = !m.body.is_empty();
                     method_sigs.push((m.name.clone(), Signature { params: param_types, return_type: ret }, has_default));
                 }
-                self.trait_registry.insert(name.clone(), TraitTypeDef { name: name.clone(), methods: method_sigs });
+                self.trait_registry.insert(name.clone(), TraitTypeDef {
+                    name: name.clone(),
+                    parents: parents.clone(),
+                    methods: method_sigs,
+                });
             }
             // v0.08.1: 收集 impl 关联 (for_type, trait_name) → methods
             if let Stmt::ImplDef { trait_name, for_type, methods, .. } = stmt {
@@ -741,15 +773,16 @@ impl TypeChecker {
                 }
             }
             Stmt::ImplDef { trait_name, for_type, methods, span, .. } => {
-                // 验证 trait 存在
+                // v0.08.4: 验证 trait 存在，然后递归收集 trait + 所有父 trait 的方法
                 if !self.trait_registry.contains_key(trait_name) {
                     self.errors.push(TypeError::from_span(span,
                         format!("impl: trait '{}' not defined", trait_name)));
                 } else {
-                    // clone trait def to avoid borrow conflict during recursive typeck
-                    let td = self.trait_registry.get(trait_name).cloned().unwrap();
+                    let mut all_methods: Vec<(String, Signature, bool)> = Vec::new();
+                    let mut visited = std::collections::HashSet::new();
+                    self.collect_trait_methods_recursive(trait_name, &mut visited, &mut all_methods);
                     let impl_methods = methods.clone();
-                    for (tm_name, tm_sig, tm_has_default) in &td.methods {
+                    for (tm_name, tm_sig, tm_has_default) in &all_methods {
                         let impl_m = impl_methods.iter().find(|m| m.name == *tm_name);
                         if impl_m.is_none() {
                             // v0.08.3: 如果 trait method 有默认实现，impl 可省略
@@ -767,7 +800,6 @@ impl TypeChecker {
                                     trait_name, for_type, tm_name, tm_sig.params.len(), im.params.len())));
                         }
                         // 递归 typeck 方法体
-                        let im = impl_m.unwrap();
                         symbols.push_scope();
                         for (pname, phint) in &im.params {
                             let pty = phint.as_deref().map(Type::from_hint).unwrap_or(Type::Any);
@@ -848,26 +880,28 @@ impl TypeChecker {
                 }
                 // v0.08.1: dyn trait dispatch — 从 trait_registry 查方法返回类型
                 if let Type::Trait(tname) = &ot {
-                    if let Some(td) = self.trait_registry.get(tname) {
-                        for (mname, sig, _has_default) in &td.methods {
-                            if mname == method {
-                                let expected = sig.params.len().saturating_sub(1);
-                                if args.len() != expected {
-                                    self.errors.push(TypeError::from_span(
-                                        span,
-                                        format!("trait method '{}.{}' expects {} args, got {}",
-                                            tname, method, expected, args.len()),
-                                    ));
-                                }
-                                return sig.return_type.clone();
+                    // v0.08.4: 递归收集 trait + 父 trait 的方法
+                    let mut all_methods: Vec<(String, Signature, bool)> = Vec::new();
+                    let mut visited = std::collections::HashSet::new();
+                    self.collect_trait_methods_recursive(tname, &mut visited, &mut all_methods);
+                    for (mname, sig, _has_default) in &all_methods {
+                        if mname == method {
+                            let expected = sig.params.len().saturating_sub(1);
+                            if args.len() != expected {
+                                self.errors.push(TypeError::from_span(
+                                    span,
+                                    format!("trait method '{}.{}' expects {} args, got {}",
+                                        tname, method, expected, args.len()),
+                                ));
                             }
+                            return sig.return_type.clone();
                         }
-                        self.errors.push(TypeError::from_span(
-                            span,
-                            format!("trait '{}' has no method '{}'", tname, method),
-                        ));
-                        return Type::Any;
                     }
+                    self.errors.push(TypeError::from_span(
+                        span,
+                        format!("trait '{}' has no method '{}'", tname, method),
+                    ));
+                    return Type::Any;
                 }
                 method_return_type(&ot, method)
             }

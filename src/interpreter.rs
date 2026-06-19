@@ -293,9 +293,11 @@ pub struct ToolDef {
 }
 
 /// v0.08: trait 注册条目
+/// v0.08.4: 加 parents 字段实现 trait 继承
 #[derive(Clone, Debug)]
 pub struct TraitInfo {
     pub name: String,
+    pub parents: Vec<String>,
     pub methods: Vec<TraitMethodSig>,
 }
 
@@ -845,7 +847,8 @@ impl Interpreter {
             // v0.08: trait 定义 — 注册到 trait_registry
             // v0.08.3: 有默认实现的 method 同步注册为 __impl_<Trait>_<Trait>_<method>
             //          任何 impl 没实现时，dispatcher fallback 到默认实现
-            Stmt::TraitDef { name, methods, span: _ } => {
+            // v0.08.4: 记录 parents（trait 继承）
+            Stmt::TraitDef { name, parents, methods, span: _ } => {
                 let method_sigs: Vec<TraitMethodSig> = methods.iter().map(|m| TraitMethodSig {
                     name: m.name.clone(),
                     params: m.params.clone(),
@@ -853,6 +856,7 @@ impl Interpreter {
                 }).collect();
                 self.trait_registry.insert(name.clone(), TraitInfo {
                     name: name.clone(),
+                    parents: parents.clone(),
                     methods: method_sigs,
                 });
                 // 默认实现：注册到 __impl_<Trait>_<Trait>_<method>（self 类型是 trait 名）
@@ -1335,24 +1339,44 @@ impl Interpreter {
     /// v0.08.2: dyn dispatch —— 接收 data + method，从 vtable 找 closure 调用
     /// call_method 之前的 trait object 分支调用此函数
     fn dispatch_trait_method(&mut self, data: &Value, method: &str, args: Vec<Value>) -> Result<Value, String> {
-        // 从 data 提取 _type 字段（trait 实例的类型标签）
-        let type_tag = match data {
+        // 从 data 提取 _type + _trait 字段
+        let (type_tag, trait_name) = match data {
             Value::Dict(map) => {
-                if let Some(Value::String(s)) = map.get("_type") {
-                    s.clone()
-                } else {
-                    return Err(format!("trait dispatch: data missing '_type' field, got {:?}", data));
-                }
+                let t = match map.get("_type") {
+                    Some(Value::String(s)) => s.clone(),
+                    _ => return Err(format!("trait dispatch: data missing '_type' field, got {:?}", data)),
+                };
+                let tr = match map.get("_trait") {
+                    Some(Value::String(s)) => s.clone(),
+                    _ => return Err(format!("trait dispatch: data missing '_trait' field, got {:?}", data)),
+                };
+                (t, tr)
             }
-            Value::Nil => return Ok(Value::Nil),  // Nil receiver 直接返回 nil
+            Value::Nil => return Ok(Value::Nil),
             _ => return Err(format!("trait dispatch: data must be dict or nil, got {:?}", data)),
         };
-        // 按 type_tag 选合适的 trait（遍历所有 trait registry 找匹配的 impl method）
-        let env = self.environment.lock().unwrap();
-        // 收集所有 trait 名
-        let trait_names: Vec<String> = self.trait_registry.keys().cloned().collect();
-        drop(env);
-        for tname in &trait_names {
+        // v0.08.4: 递归向上找 trait（trait 继承）
+        // 顺序: root trait → 父 trait chain（整个继承链）
+        let mut search_chain: Vec<String> = vec![trait_name.clone()];
+        let mut visited_trait = std::collections::HashSet::new();
+        visited_trait.insert(trait_name.clone());
+        // BFS 沿 parents chain 找所有祖先 trait
+        let mut worklist: Vec<String> = vec![trait_name.clone()];
+        while let Some(t) = worklist.pop() {
+            let env = self.environment.lock().unwrap();
+            let trait_def = self.trait_registry.get(&t).cloned();
+            drop(env);
+            if let Some(td) = trait_def {
+                for p in &td.parents {
+                    if !visited_trait.contains(p) {
+                        visited_trait.insert(p.clone());
+                        search_chain.push(p.clone());
+                        worklist.push(p.clone());
+                    }
+                }
+            }
+        }
+        for tname in &search_chain {
             // 1. 先找具体类型的 impl
             let impl_method_name = format!("__impl_{}_{}_{}", tname, type_tag, method);
             let env = self.environment.lock().unwrap();
@@ -1364,7 +1388,6 @@ impl Interpreter {
             }
             drop(env);
             // 2. v0.08.3: fallback 到 trait 自身的默认实现
-            //    默认实现注册为 __impl_<Trait>_<Trait>_<method>（self 类型 = trait 名）
             let default_method_name = format!("__impl_{}_{}_{}", tname, tname, method);
             let env = self.environment.lock().unwrap();
             if let Some(task) = env.get(&default_method_name) {
@@ -1380,6 +1403,7 @@ impl Interpreter {
 
     /// v0.08.2: 构造 trait instance（Trait::new("ForType") 调用）
     /// v0.08.3: 即使 ForType 没有任何 impl（仅用默认实现）也允许构造
+    /// v0.08.4: 记录 _trait 字段供 dispatcher 定位 search chain
     fn construct_trait_instance(&mut self, trait_name: &str, for_type: &str) -> Result<Value, String> {
         let method_names: Vec<String> = self.trait_registry.get(trait_name)
             .map(|td| td.methods.iter().map(|m| m.name.clone()).collect())
@@ -1397,9 +1421,10 @@ impl Interpreter {
                 return Err(format!("trait {} method '{}' has no impl for type '{}' and no default", trait_name, m, for_type));
             }
         }
-        // data 携带 _type
+        // data 携带 _type 和 _trait（v0.08.4: dispatcher 用 _trait 定位 search chain）
         let mut data_map = HashMap::new();
         data_map.insert("_type".to_string(), Value::String(for_type.to_string()));
+        data_map.insert("_trait".to_string(), Value::String(trait_name.to_string()));
         let vtable = self.build_trait_vtable(trait_name)?;
         Ok(Value::TraitObject { data: Box::new(Value::Dict(data_map)), vtable })
     }
@@ -1599,6 +1624,18 @@ impl Interpreter {
         let env = Arc::new(Mutex::new(Environment::with_parent(self.globals.clone())));
         for (i, param) in params.iter().enumerate() {
             let value = args.get(i).cloned().unwrap_or(Value::Nil);
+            // v0.08.4: 如果 value 是 trait data (Dict 带 _trait 字段)，包装为 TraitObject
+            //          使 body 内部 self.method() 走 trait dispatch
+            let value = if let Value::Dict(ref map) = value {
+                if map.contains_key("_trait") {
+                    let trait_name = match map.get("_trait") {
+                        Some(Value::String(s)) => s.clone(),
+                        _ => "".to_string(),
+                    };
+                    let vtable = self.build_trait_vtable(&trait_name).unwrap_or_default();
+                    Value::TraitObject { data: Box::new(value), vtable }
+                } else { value }
+            } else { value };
             env.lock().unwrap().define(param.clone(), value, false);
         }
         // v0.08.2: impl method body 单表达式时作为返回值 (与 closure 行为一致)

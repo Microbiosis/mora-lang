@@ -85,6 +85,37 @@ cargo build --release
 | 管道运算符 | `data \|> func()` |
 | 并行执行 | `parallel ... end` |
 | 模块系统 | `import "path"`，`export let/task` |
+| trait 系统（v0.08+） | `trait Name`，`impl Name for Type`，`fn m(self) -> T = expr`，`dyn Trait`，`Trait::new("Type")`，`trait Foo: Bar, Baz`（继承） |
+
+### trait 系统（v0.08+）
+
+```mora
+-- trait 定义（可继承、可有默认实现）
+trait Named
+  fn get_name(self) -> string = "Anonymous"
+end
+
+trait Aged
+  fn get_age(self) -> number = 0
+end
+
+trait Person: Named, Aged
+  fn greet(self) -> string = "Hello, I am " + self.get_name()
+end
+
+-- 为具体类型实现 trait
+impl Person for Human
+  fn get_name(self) = "Alice"
+  fn get_age(self) = 30
+  -- greet() 用 Person 默认实现
+end
+
+-- 构造 dyn trait 对象 + 方法调用
+let h: dyn Person = Person::new("Human")
+print(h.greet())  -- "Hello, I am Alice"
+```
+
+完整 demo 见 [`examples/trait_inherit_demo.mora`](./examples/trait_inherit_demo.mora)、[`examples/trait_default_demo.mora`](./examples/trait_default_demo.mora)。
 
 ### 标准库
 

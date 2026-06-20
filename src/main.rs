@@ -56,6 +56,14 @@ fn main() {
             }
             install_package(&args[2]);
         }
+        // v0.08.5 fix: `mora run <file>` 子命令——之前 `run` 被当作文件名
+        "run" => {
+            if args.len() < 3 {
+                eprintln!("Usage: mora run <file.mora>");
+                process::exit(1);
+            }
+            run_file(&args[2]);
+        }
         _ => run_file(&args[1]),
     }
 }

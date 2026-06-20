@@ -98,10 +98,17 @@ pub enum Value {
     McpServer {
         tools: Vec<(String, Value)>,  // (tool_name, handler)
     },
-    // v0.08: trait 对象 — 携带数据 + vtable
+    // v0.08.5: trait 对象 — 携带 data + for_type + trait_name（一等值类型）
+    // 之前 _type / _trait 塞在 Dict 里当信封，导致 call_task 通过 dict key 内容判断
+    // self 是否需要包装为 TraitObject——interpreter 在读 Dict 字面量做 type 决策。
+    // 现在三个字段都是 TraitObject 自身的组成部分，与普通 Dict 不可混淆。
     TraitObject {
+        /// 构造时指定的 ForType 字符串（如 "Human"），dispatcher 用它选 __impl_<Trait>_<ForType>_<method>
+        for_type: String,
+        /// 构造时指定的 trait 名（如 "Person"），dispatcher 用它定位 search chain 起点
+        trait_name: String,
+        /// 用户提供的真实数据（普通 Dict 或其他 Value）
         data: Box<Value>,
-        vtable: HashMap<String, HashMap<String, Value>>,  // trait_name → (method_name → closure)
     },
 }
 
@@ -153,9 +160,8 @@ impl std::fmt::Display for Value {
             Value::Router { routes } => write!(f, "<router ({} routes)>", routes.lock().unwrap().len()),
             Value::HttpRequest { method, path, .. } => write!(f, "<http_request {} {}>", method, path),
             Value::McpServer { tools } => write!(f, "<mcp_server ({} tools)>", tools.len()),
-            Value::TraitObject { data, vtable } => {
-                let trait_names: Vec<String> = vtable.keys().cloned().collect();
-                write!(f, "<trait_object {:?} implements [{}]>", data, trait_names.join(", "))
+            Value::TraitObject { for_type, trait_name, data } => {
+                write!(f, "<trait_object for={} as {} data={:?}>", for_type, trait_name, data)
             },
         }
     }
@@ -204,6 +210,88 @@ impl Environment {
             false
         }
     }
+}
+
+// ===================================================================
+// v0.08.5: trait impl method 注册名集中生成
+// 之前散落在 6 处 format!("__impl_{}_{}_{}", ...)，改命名规则要 6 处同步
+// 现在收敛到这两个函数
+// ===================================================================
+
+/// 具体类型 impl method 在 environment 里的注册名
+/// 格式: __impl_<Trait>_<ForType>_<method>
+pub(crate) fn impl_method_key(trait_name: &str, for_type: &str, method: &str) -> String {
+    format!("__impl_{}_{}_{}", trait_name, for_type, method)
+}
+
+/// trait 默认实现在 environment 里的注册名（self 类型 = trait 名）
+/// 格式: __impl_<Trait>_<Trait>_<method>
+pub(crate) fn default_impl_method_key(trait_name: &str, method: &str) -> String {
+    format!("__impl_{}_{}_{}", trait_name, trait_name, method)
+}
+
+/// v0.08.5: BFS 收集 trait + 全部祖先的方法名（去重、防循环）
+/// 用于：构造 trait instance 时的完整性检查（与 dispatch 保持一致）
+///
+/// 参数 trait_registry 是 trait 元数据表（self.trait_registry 借用）
+pub(crate) fn collect_required_methods<'a>(
+    trait_registry: &'a HashMap<String, TraitInfo>,
+    trait_name: &str,
+) -> Vec<&'a str> {
+    let mut out: Vec<&'a str> = Vec::new();
+    let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut worklist: Vec<&str> = vec![trait_name];
+    while let Some(t) = worklist.pop() {
+        if !visited.insert(t.to_string()) { continue; }
+        let td = match trait_registry.get(t) {
+            Some(td) => td,
+            None => continue,  // 未知父 trait 跳过（typeck 已报错过）
+        };
+        for p in &td.parents {
+            if !visited.contains(p) {
+                worklist.push(p.as_str());
+            }
+        }
+        for m in &td.methods {
+            // 去重（子 trait 方法覆盖父 trait 同名方法）
+            if !out.contains(&m.name.as_str()) {
+                out.push(m.name.as_str());
+            }
+        }
+    }
+    out
+}
+
+/// v0.08.5: BFS 收集 trait + 全部祖先的 trait 名（去重、防循环）
+/// 用于：trait dispatch 时查找 `__impl_<Trait>_<ForType>_<method>` 的 `<Trait>` 部分
+///      （子 trait 的方法可能未实现，dispatcher fallback 到父 trait 的默认实现）
+///
+/// 与 collect_required_methods 的区别：本函数返回 trait 名（用于查 env 中的注册键），
+/// collect_required_methods 返回 method 名（用于完整性检查）。
+pub(crate) fn collect_parent_traits<'a>(
+    trait_registry: &'a HashMap<String, TraitInfo>,
+    trait_name: &str,
+) -> Vec<&'a str> {
+    let mut out: Vec<&'a str> = Vec::new();
+    let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut worklist: Vec<&str> = vec![trait_name];
+    while let Some(t) = worklist.pop() {
+        if !visited.insert(t.to_string()) { continue; }
+        let td = match trait_registry.get(t) {
+            Some(td) => td,
+            None => continue,  // 未知父 trait 跳过（typeck 已报错过）
+        };
+        // 先记录当前 trait
+        if !out.contains(&td.name.as_str()) {
+            out.push(td.name.as_str());
+        }
+        for p in &td.parents {
+            if !visited.contains(p) {
+                worklist.push(p.as_str());
+            }
+        }
+    }
+    out
 }
 
 pub struct Interpreter {
@@ -1135,7 +1223,7 @@ impl Interpreter {
                 let left_val = self.evaluate(left)?;
                 self.evaluate_pipe(left_val, right)
             }
-            Expr::Call { callee, args, span: _ } => {
+            Expr::Call { callee, args, span } => {
                 // v0.04 Slice 2: 先看 route_registry
                 if self.route_registry.contains_key(callee) {
                     // 已注册 → 走 RouteCall 路径
@@ -1151,12 +1239,12 @@ impl Interpreter {
                 }
                 // 未注册 → 普通函数调用
                 let arg_values: Result<Vec<Value>, String> = args.iter().map(|a| self.evaluate(a.as_ref())).collect();
-                self.call_function(callee, arg_values?)
+                self.call_function(callee, arg_values?, *span)
             }
-            Expr::MethodCall { object, method, args, span: _ } => {
+            Expr::MethodCall { object, method, args, span } => {
                 let obj = self.evaluate(object)?;
                 let arg_values: Result<Vec<Value>, String> = args.iter().map(|a| self.evaluate(a.as_ref())).collect();
-                self.call_method(obj, method, arg_values?)
+                self.call_method(obj, method, arg_values?, *span)
             }
             Expr::Index { object, index, span: _ } => {
                 let obj = self.evaluate(object)?;
@@ -1279,7 +1367,7 @@ impl Interpreter {
                     "McpServer::new" => Ok(Value::McpServer { tools: Vec::new() }),
                     other => {
                         // fallback: look up in call_function
-                        self.call_function(other, vec![])
+                        self.call_function(other, vec![], Span::default())
                     }
                 }
             }
@@ -1295,157 +1383,100 @@ impl Interpreter {
     ///   receiver.method(args) → dispatcher(self, ...args)
     ///   dispatcher 内: 根据 self._type 选 __impl_Trait_ForType_method 调用
     fn eval_dyn_trait(&mut self, trait_name: &str) -> Result<Value, String> {
-        let mut vtable = HashMap::new();
-        let mut methods = HashMap::new();
-        if let Some(info) = self.trait_registry.get(trait_name).cloned() {
-            for m in info.methods {
-                let method_name = m.name.clone();
-                let param_names: Vec<String> = m.params.iter().map(|(n, _)| n.clone()).collect();
-                // dispatcher body: __impl_Trait_ForType_method(self, ...args)
-                //   当前简化为: 用 self._type 拼方法名并 call
-                //   真实实现需要 match —— 见 v0.08.2 runtime multi-dispatch
-                let dispatcher_body = vec![
-                    Stmt::Return {
-                        value: Some(Expr::Index {
-                            object: Box::new(Expr::Variable("self".to_string(), Span::default())),
-                            index: Box::new(Expr::Literal(Literal::String(method_name.clone(), Span::default()))),
-                            span: Span::default(),
-                        }),
-                        span: Span::default(),
-                    }
-                ];
-                let closure = Value::Closure {
-                    params: {
-                        let mut v: Vec<String> = vec!["self".to_string()];
-                        for p in &param_names {
-                            v.push(p.clone());
-                        }
-                        v
-                    },
-                    body: dispatcher_body,
-                    env: self.environment.clone(),
-                };
-                methods.insert(method_name, closure);
-            }
-        }
-        vtable.insert(trait_name.to_string(), methods);
-        // data 携带 _type 字段，dispatcher 通过 self._type 选 impl
-        //   v0.08.2 简化: data 初始化为 {"_type": "nil"}，构造时由 builtin 覆盖
-        let mut data_map = HashMap::new();
-        data_map.insert("_type".to_string(), Value::String("nil".to_string()));
-        Ok(Value::TraitObject { data: Box::new(Value::Dict(data_map)), vtable })
+        // v0.08.5: 简化实现 —— TraitObject 自身携带 for_type/trait_name，不再构造 vtable
+        // vtable 在旧设计中是 dispatch 占位 closure，但实际 dispatch 走
+        // dispatch_trait_method() 通过 __impl_* 注册名查 env，不通过 vtable closure
+        // data 用空 dict 占位（用户一般用 Trait::new("ForType") 覆盖）
+        Ok(Value::TraitObject {
+            for_type: "nil".to_string(),
+            trait_name: trait_name.to_string(),
+            data: Box::new(Value::Dict(HashMap::new())),
+        })
     }
 
-    /// v0.08.2: dyn dispatch —— 接收 data + method，从 vtable 找 closure 调用
-    /// call_method 之前的 trait object 分支调用此函数
-    fn dispatch_trait_method(&mut self, data: &Value, method: &str, args: Vec<Value>) -> Result<Value, String> {
-        // 从 data 提取 _type + _trait 字段
-        let (type_tag, trait_name) = match data {
-            Value::Dict(map) => {
-                let t = match map.get("_type") {
-                    Some(Value::String(s)) => s.clone(),
-                    _ => return Err(format!("trait dispatch: data missing '_type' field, got {:?}", data)),
-                };
-                let tr = match map.get("_trait") {
-                    Some(Value::String(s)) => s.clone(),
-                    _ => return Err(format!("trait dispatch: data missing '_trait' field, got {:?}", data)),
-                };
-                (t, tr)
-            }
+    /// v0.08.5: dyn dispatch —— 接收 TraitObject + method，从 trait 继承链找 impl 调用
+    /// 不再嗅探 data 里的 Dict key（TraitObject 自身字段就是 type 元数据）
+    /// v0.08.5 fix: 错误信息附调用点 span（line N），用户可在编辑器跳转
+    fn dispatch_trait_method(
+        &mut self,
+        receiver: &Value,
+        method: &str,
+        args: Vec<Value>,
+        call_site: Span,
+    ) -> Result<Value, String> {
+        // v0.08.5: 直接从 TraitObject 字段读 for_type / trait_name（不再嗅探 data._type / data._trait）
+        let (for_type, trait_name) = match receiver {
+            Value::TraitObject { for_type, trait_name, .. } => (for_type.clone(), trait_name.clone()),
             Value::Nil => return Ok(Value::Nil),
-            _ => return Err(format!("trait dispatch: data must be dict or nil, got {:?}", data)),
+            _ => return Err(format!(
+                "trait dispatch at line {}: receiver must be trait object or nil, got {:?}",
+                call_site.line, receiver
+            )),
         };
-        // v0.08.4: 递归向上找 trait（trait 继承）
-        // 顺序: root trait → 父 trait chain（整个继承链）
-        let mut search_chain: Vec<String> = vec![trait_name.clone()];
-        let mut visited_trait = std::collections::HashSet::new();
-        visited_trait.insert(trait_name.clone());
-        // BFS 沿 parents chain 找所有祖先 trait
-        let mut worklist: Vec<String> = vec![trait_name.clone()];
-        while let Some(t) = worklist.pop() {
-            let env = self.environment.lock().unwrap();
-            let trait_def = self.trait_registry.get(&t).cloned();
-            drop(env);
-            if let Some(td) = trait_def {
-                for p in &td.parents {
-                    if !visited_trait.contains(p) {
-                        visited_trait.insert(p.clone());
-                        search_chain.push(p.clone());
-                        worklist.push(p.clone());
-                    }
-                }
-            }
-        }
+        // v0.08.5: 用 collect_parent_traits() 沿 parents chain BFS 收集所有候选 trait
+        // （子 trait 的方法未实现时 dispatcher fallback 到父 trait 的默认实现）
+        let search_chain = collect_parent_traits(&self.trait_registry, &trait_name);
         for tname in &search_chain {
             // 1. 先找具体类型的 impl
-            let impl_method_name = format!("__impl_{}_{}_{}", tname, type_tag, method);
+            let impl_name = impl_method_key(tname, &for_type, method);
             let env = self.environment.lock().unwrap();
-            if let Some(task) = env.get(&impl_method_name) {
+            if let Some(task) = env.get(&impl_name) {
                 drop(env);
-                let mut all_args = vec![data.clone()];
+                let mut all_args = vec![receiver.clone()];
                 all_args.extend(args);
                 return self.call_value(&task, all_args);
             }
             drop(env);
             // 2. v0.08.3: fallback 到 trait 自身的默认实现
-            let default_method_name = format!("__impl_{}_{}_{}", tname, tname, method);
+            let default_name = default_impl_method_key(tname, method);
             let env = self.environment.lock().unwrap();
-            if let Some(task) = env.get(&default_method_name) {
+            if let Some(task) = env.get(&default_name) {
                 drop(env);
-                let mut all_args = vec![data.clone()];
+                let mut all_args = vec![receiver.clone()];
                 all_args.extend(args);
                 return self.call_value(&task, all_args);
             }
             drop(env);
         }
-        Err(format!("trait dispatch: no impl for type '{}' method '{}'", type_tag, method))
+        Err(format!(
+            "trait dispatch at line {}: no impl for type '{}' method '{}' (searched: {})",
+            call_site.line,
+            for_type,
+            method,
+            search_chain.iter().map(|s| s.to_string()).collect::<Vec<_>>().join(" → ")
+        ))
     }
 
     /// v0.08.2: 构造 trait instance（Trait::new("ForType") 调用）
     /// v0.08.3: 即使 ForType 没有任何 impl（仅用默认实现）也允许构造
     /// v0.08.4: 记录 _trait 字段供 dispatcher 定位 search chain
-    fn construct_trait_instance(&mut self, trait_name: &str, for_type: &str) -> Result<Value, String> {
-        let method_names: Vec<String> = self.trait_registry.get(trait_name)
-            .map(|td| td.methods.iter().map(|m| m.name.clone()).collect())
-            .unwrap_or_default();
-        // v0.08.3: 不再强制要求 ForType 有 impl——trait 自带默认实现即可
-        // 检查：每个 trait method 必须有具体类型 impl 或 trait 默认实现
-        for m in &method_names {
-            let impl_name = format!("__impl_{}_{}_{}", trait_name, for_type, m);
-            let default_name = format!("__impl_{}_{}_{}", trait_name, trait_name, m);
-            let env = self.environment.lock().unwrap();
+    /// v0.08.5: 用共享 collect_required_methods() 走完祖先链；
+    ///          TraitObject 改为一等值类型（for_type/trait_name/data 都是字段）
+    /// v0.08.5 fix: 错误信息附调用点 span（line N），与 dispatch_trait_method 对齐
+    fn construct_trait_instance(&mut self, trait_name: &str, for_type: &str, call_site: Span) -> Result<Value, String> {
+        // v0.08.5 fix: 检查整个 trait 继承链上所有方法，不只是 trait 自身
+        let method_names = collect_required_methods(&self.trait_registry, trait_name);
+        let env = self.environment.lock().unwrap();
+        for m in method_names {
+            let impl_name = impl_method_key(trait_name, for_type, m);
+            let default_name = default_impl_method_key(trait_name, m);
             let has_specific = env.get(&impl_name).is_some();
             let has_default = env.get(&default_name).is_some();
-            drop(env);
             if !has_specific && !has_default {
-                return Err(format!("trait {} method '{}' has no impl for type '{}' and no default", trait_name, m, for_type));
+                drop(env);
+                return Err(format!(
+                    "trait {} method '{}' has no impl for type '{}' and no default (line {})",
+                    trait_name, m, for_type, call_site.line
+                ));
             }
         }
-        // data 携带 _type 和 _trait（v0.08.4: dispatcher 用 _trait 定位 search chain）
-        let mut data_map = HashMap::new();
-        data_map.insert("_type".to_string(), Value::String(for_type.to_string()));
-        data_map.insert("_trait".to_string(), Value::String(trait_name.to_string()));
-        let vtable = self.build_trait_vtable(trait_name)?;
-        Ok(Value::TraitObject { data: Box::new(Value::Dict(data_map)), vtable })
-    }
-
-    /// v0.08.2: 构造 trait vtable（dispatcher 占位 closure）
-    /// 实际 dispatch 由 call_method 走 dispatch_trait_method，不通过 vtable closure
-    fn build_trait_vtable(&self, trait_name: &str) -> Result<HashMap<String, HashMap<String, Value>>, String> {
-        let mut vtable = HashMap::new();
-        let mut methods = HashMap::new();
-        if let Some(info) = self.trait_registry.get(trait_name) {
-            for m in &info.methods {
-                let closure = Value::Closure {
-                    params: vec!["self".to_string()],
-                    body: vec![Stmt::Expr(Expr::Variable("__unreachable__".to_string(), Span::default()))],
-                    env: self.environment.clone(),
-                };
-                methods.insert(m.name.clone(), closure);
-            }
-        }
-        vtable.insert(trait_name.to_string(), methods);
-        Ok(vtable)
+        drop(env);
+        // v0.08.5: TraitObject 三个字段都是自身一部分（不再用 Dict 信封）
+        Ok(Value::TraitObject {
+            for_type: for_type.to_string(),
+            trait_name: trait_name.to_string(),
+            data: Box::new(Value::Dict(HashMap::new())),
+        })
     }
 
     /// v0.04 Slice 2: 求值 RouteCall 的单个参数
@@ -1503,31 +1534,32 @@ impl Interpreter {
 
     fn evaluate_pipe(&mut self, left_val: Value, right: &Expr) -> Result<Value, String> {
         match right {
-            Expr::Call { callee, args, span: _ } => {
+            Expr::Call { callee, args, span } => {
                 // 检查是否是列表/字符串方法名——自动转为方法调用
                 if is_pipe_method(callee) {
                     let mut arg_values: Vec<Value> = Vec::new();
                     for arg in args {
                         arg_values.push(self.evaluate(arg.as_ref())?);
                     }
-                    return self.call_method(left_val, callee, arg_values);
+                    return self.call_method(left_val, callee, arg_values, *span);
                 }
                 let mut arg_values: Vec<Value> = vec![left_val];
                 for arg in args {
                     arg_values.push(self.evaluate(arg.as_ref())?);
                 }
-                self.call_function(callee, arg_values)
+                self.call_function(callee, arg_values, *span)
             }
-            Expr::MethodCall { object, method, args, span: _ } => {
+            Expr::MethodCall { object, method, args, span } => {
                 let obj = self.evaluate(object)?;
                 let mut arg_values: Vec<Value> = vec![left_val];
                 for arg in args {
                     arg_values.push(self.evaluate(arg.as_ref())?);
                 }
-                self.call_method(obj, method, arg_values)
+                self.call_method(obj, method, arg_values, *span)
             }
             Expr::Variable(name, _) => {
-                self.call_function(name, vec![left_val])
+                // Variable 在 pipe 右侧的 span 不可得,用 Span::default()（line=0）
+                self.call_function(name, vec![left_val], Span::default())
             }
             Expr::Pipe { left: inner_left, right: inner_right, span: _ } => {
                 let inner_val = self.evaluate_pipe(left_val, inner_left)?;
@@ -1558,13 +1590,13 @@ impl Interpreter {
         }
     }
 
-    fn call_function(&mut self, name: &str, args: Vec<Value>) -> Result<Value, String> {
+    fn call_function(&mut self, name: &str, args: Vec<Value>, call_site: Span) -> Result<Value, String> {
         // v0.08.2: Trait::new("ForType") —— 构造 trait instance
         //   data = {"_type": "ForType"}，vtable 绑定所有 impl methods
         if let Some(tname) = name.strip_suffix("::new") {
             if self.trait_registry.contains_key(tname) {
                 let type_arg = args.get(0).map(|v| v.to_string()).unwrap_or_default();
-                return self.construct_trait_instance(tname, &type_arg);
+                return self.construct_trait_instance(tname, &type_arg, call_site);
             }
         }
         match name {
@@ -1623,19 +1655,10 @@ impl Interpreter {
     fn call_task(&mut self, params: &[String], body: &[Stmt], args: Vec<Value>) -> Result<Value, String> {
         let env = Arc::new(Mutex::new(Environment::with_parent(self.globals.clone())));
         for (i, param) in params.iter().enumerate() {
+            // v0.08.5: TraitObject 已经是一等值类型（含 for_type/trait_name/data），
+            // 不再嗅探 Dict key。直接传 args[i]，让 dispatch_trait_method 在
+            // receiver 上自然走 TraitObject 分支。
             let value = args.get(i).cloned().unwrap_or(Value::Nil);
-            // v0.08.4: 如果 value 是 trait data (Dict 带 _trait 字段)，包装为 TraitObject
-            //          使 body 内部 self.method() 走 trait dispatch
-            let value = if let Value::Dict(ref map) = value {
-                if map.contains_key("_trait") {
-                    let trait_name = match map.get("_trait") {
-                        Some(Value::String(s)) => s.clone(),
-                        _ => "".to_string(),
-                    };
-                    let vtable = self.build_trait_vtable(&trait_name).unwrap_or_default();
-                    Value::TraitObject { data: Box::new(value), vtable }
-                } else { value }
-            } else { value };
             env.lock().unwrap().define(param.clone(), value, false);
         }
         // v0.08.2: impl method body 单表达式时作为返回值 (与 closure 行为一致)
@@ -1695,11 +1718,11 @@ impl Interpreter {
         Ok(last_expr_value)
     }
 
-    fn call_method(&mut self, mut object: Value, method: &str, args: Vec<Value>) -> Result<Value, String> {
-        // v0.08.2: dyn dispatch —— 优先 dyn trait 分发（按 receiver data._type 选 impl）
-        if let Value::TraitObject { data, vtable: _ } = &object {
-            // 走专门的 dispatcher（不通过 vtable closure——直接按 data._type 选 impl）
-            return self.dispatch_trait_method(data, method, args);
+    fn call_method(&mut self, mut object: Value, method: &str, args: Vec<Value>, call_site: Span) -> Result<Value, String> {
+        // v0.08.5: dyn dispatch —— TraitObject 走 dispatch_trait_method（按 for_type + trait_name 选 impl）
+        // call_site 透传给 dispatcher，dispatch 失败时报错带行号方便定位
+        if let Value::TraitObject { .. } = &object {
+            return self.dispatch_trait_method(&object, method, args, call_site);
         }
         match object {
             Value::List(list) => {
@@ -3890,5 +3913,147 @@ end
         assert!(!FlowSignal::None.is_return());
         assert!(FlowSignal::Return(Value::Nil).is_return());
         assert!(FlowSignal::Return(Value::Number(0.0)).is_return());
+    }
+}
+
+// ===================================================================
+// v0.08.5: trait 系统单测（之前 0 个单测守护，回归靠 3 个 happy examples）
+// ===================================================================
+#[cfg(test)]
+mod trait_tests {
+    use super::*;
+    use crate::lexer::Lexer;
+    use crate::parser::Parser;
+
+    fn run(src: &str) -> Result<(), String> {
+        let tokens = Lexer::new(src).scan_tokens();
+        let stmts = Parser::new(tokens).parse();
+        let mut interp = Interpreter::new();
+        interp.interpret(&stmts)
+    }
+
+    /// v0.08.5: trait 基本 dispatch —— impl method 被正确路由
+    #[test]
+    fn test_trait_basic_dispatch() {
+        let src = r#"
+trait Greeter
+  fn greet(self) -> string = "default"
+end
+
+impl Greeter for English
+  fn greet(self) = "Hello!"
+end
+
+task main()
+  let g: dyn Greeter = Greeter::new("English")
+  print(g.greet())
+end
+"#;
+        run(src).expect("should run");
+    }
+
+    #[test]
+    fn test_trait_inherit_construction_checks_parents() {
+        // v0.08.5 fix: 之前 construct_trait_instance 只检查 trait 自身方法，
+        // 不走 parents 链——trait Person: Named 且 Person 没写 greet() 时
+        // 构造会报 "missing method greet"，但实际调用时 dispatch 走 Named 默认实现能成功。
+        // 现在构造和 dispatch 都用 collect_required_methods()。
+        let src = r#"
+trait Named
+  fn get_name(self) -> string = "Anon"
+end
+
+trait Greeter: Named
+  fn greet(self) -> string = "Hi, " + self.get_name()
+end
+
+impl Greeter for Human
+  -- 只写 get_name()，greet() 用 Greeter 默认实现
+  fn get_name(self) = "Alice"
+end
+
+task main()
+  let g: dyn Greeter = Greeter::new("Human")
+  let s = g.greet()
+  print(s)
+end
+"#;
+        run(src).expect("should construct via parent default");
+    }
+
+    #[test]
+    fn test_trait_default_implementation_fallback() {
+        // v0.08.3: trait method body 作为默认实现，impl 可省略
+        let src = r#"
+trait Calc
+  fn double(self) -> number = self.value() * 2
+  fn value(self) -> number
+end
+
+impl Calc for Ten
+  fn value(self) = 10
+  -- double() 用默认实现
+end
+
+task main()
+  let c: dyn Calc = Calc::new("Ten")
+  print(c.double())
+end
+"#;
+        run(src).expect("default impl should work");
+    }
+
+    #[test]
+    fn test_trait_duplicate_impl_detected_at_construction() {
+        // v0.08.5: 构造时如果 trait 链上有方法既无 impl 也无默认实现，报错
+        // 这里 trait Greeter 要求 fn greet()，impl 写了别的 fn foo() 而 greet() 没实现 →
+        // 构造 Greeter::new("Empty") 时 collect_required_methods() 走 env 找不到 greet 的 impl，
+        // 应返回 Err 含 "greet"。
+        // 注：parser 不接受完全空的 impl 块（要求至少一个 fn），所以这里 impl 写一个无关方法。
+        let src = r#"
+trait Greeter
+  fn greet(self) -> string
+end
+
+impl Greeter for Empty
+  fn foo(self) = 1
+end
+
+task main()
+  let g: dyn Greeter = Greeter::new("Empty")
+  print(g.greet())
+end
+"#;
+        let tokens = Lexer::new(src).scan_tokens();
+        let stmts = Parser::new(tokens).parse();
+        let mut interp = Interpreter::new();
+        let result = interp.interpret(&stmts);
+        assert!(result.is_err(), "construct should fail when method has no impl and no default");
+        let err = result.unwrap_err();
+        assert!(err.contains("greet"), "error should mention method name 'greet': {}", err);
+    }
+
+    #[test]
+    fn test_trait_circular_inheritance_no_panic() {
+        // v0.08.5: typeck 已防循环继承，这里只验证 interpreter 不会 panic
+        let src = r#"
+trait A: B
+  fn a(self) -> number = 1
+end
+
+trait B: A
+  fn b(self) -> number = 2
+end
+
+task main()
+  -- 只 typeck 不跑 dispatch
+  print(1)
+end
+"#;
+        let tokens = Lexer::new(src).scan_tokens();
+        let stmts = Parser::new(tokens).parse();
+        let mut interp = Interpreter::new();
+        // 不期望 panic；可能报 typeck error（来自循环继承检测），也可能通过
+        let _ = interp.interpret(&stmts);
     }
 }

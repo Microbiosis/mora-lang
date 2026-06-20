@@ -5,3 +5,5 @@
 *.tmp.*
 .worktrees/
 docs/
+# v0.08.5: subagent-driven-development 工作流元数据
+sdd/

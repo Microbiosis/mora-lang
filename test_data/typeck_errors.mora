@@ -134,3 +134,19 @@ route bad_max: ai_model("gpt-4o", max_tokens: "lots")
 -- 期望: ai_model: system must be string
 -- ============================
 route bad_sys: ai_model("gpt-4o", system: 123)
+
+-- v0.08.5: trait 错误 case
+-- Case 24: trait 不存在
+impl NonExistent for X
+  fn foo() = 1
+end
+
+-- Case 25: impl 缺方法（trait 要求 fn bar() 但 impl 只写了 fn foo()）
+trait TwoMethod
+  fn foo()
+  fn bar()
+end
+
+impl TwoMethod for Y
+  fn foo() = 1
+end

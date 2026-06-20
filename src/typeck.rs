@@ -64,8 +64,6 @@ pub enum Type {
     McpServer,
     /// v0.08: dyn trait 类型（名称、方法签名表）
     Trait(String),
-    /// v0.08: impl 类型 —— 携带自身类型名 + 实现的 trait 列表
-    Struct(String, Vec<String>),
     /// 推断不出或用户未标注时的退路——不做严格检查
     Any,
 }  // ← close pub enum Type
@@ -98,7 +96,7 @@ impl Type {
             Type::HttpResponse => "http_response",
             Type::McpServer => "mcp_server",
             Type::Trait(_) => "trait",
-            Type::Struct(_, _) => "struct",
+            // v0.08.5: Type::Struct 已删除，统一为 Type::Trait 注册
             Type::Any => "any",
         }
     }
@@ -143,13 +141,11 @@ impl Type {
         if matches!(self, Type::Nil) {
             return true;
         }
-        // v0.08: Trait/Struct 兼容
+        // v0.08.5: Trait 兼容
         if let (Type::Trait(a), Type::Trait(b)) = (self, expected) {
             return a == b;
         }
-        if let (Type::Struct(_, traits), Type::Trait(trait_name)) = (self, expected) {
-            return traits.contains(trait_name);
-        }
+        // v0.08.5: Type::Struct 已删除，统一为 Type::Trait 注册
         self == expected
     }
 }
@@ -808,9 +804,11 @@ impl TypeChecker {
                         for s in &im.body { self.check_stmt(s, symbols); }
                         symbols.pop_scope();
                     }
-                    // 注册 impl type (Struct(name, [trait_name]))
-                    symbols.define(for_type.clone(),
-                        Type::Struct(format!("{}", for_type), vec![trait_name.clone()]));
+                    // v0.08.5: 注册 impl type 为 Type::Trait(trait_name)
+                    //   之前用 Type::Struct(name, [trait_name]) 但 interpreter 完全不消费 Struct
+                    //   现在直接注册为 Trait 类型——dispatch 时 receiver 类型若是 Trait(trait_name)
+                    //   表示它实现了这个 trait
+                    symbols.define(for_type.clone(), Type::Trait(trait_name.clone()));
                 }
             }
         }
@@ -1005,8 +1003,8 @@ impl TypeChecker {
             }
             // v0.07.1: NamespaceRef — IDENT::IDENT, typeck as Any for now
             Expr::NamespaceRef { .. } => Type::Any,
-            // v0.08: DynTrait — dyn TraitName type hint
-            Expr::DynTrait { .. } => Type::Any,
+            // v0.08.5: DynTrait — dyn TraitName type hint，对齐 let x: dyn Trait 解析为 Type::Trait(name)
+            Expr::DynTrait { trait_name, .. } => Type::Trait(trait_name.clone()),
         }
     }
 

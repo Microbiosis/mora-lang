@@ -1,0 +1,44 @@
+-- v0.07: HTTP server demo（serve as 已移除，走 Router::new() 显式 API）
+-- 测: 多路由 / POST / JSON body / 路径参数 / query dict / req.json()
+
+observe trace do
+end
+
+route fast: ai_model("gpt-4o-mini")
+
+let router = Router::new()
+router = router.route("GET", "/health", fn(req)
+  return {status: "ok", version: "v0.07"}
+end)
+router = router.route("GET", "/greet", fn(req)
+  let name := req["query"]["name"]
+  return "hello, " + name
+end)
+router = router.route("POST", "/echo", fn(req)
+  return {
+    received: req["body"],
+    method: req["method"]
+  }
+end)
+router = router.route("GET", "/users/:id", fn(req)
+  let user_id := req["params"]["id"]
+  return {user: user_id}
+end)
+router = router.route("POST", "/json", fn(req)
+  -- req.json() 返回 Result<Value, ParseError>，用 ? 解包
+  let result := req.json()
+  let val := result.get("ok")
+  return {parsed: val, status: "ok"}
+end)
+
+router = router.route("POST", "/json-validate", fn(req)
+  -- String.json() 直接解析 body 字符串
+  let body_str := req["body"]
+  let parsed := body_str.json()
+  let ok_val := parsed.get("ok")
+  return {data: ok_val}
+end)
+
+router.listen("127.0.0.1", 3000)
+
+print("server started on http://127.0.0.1:3000")

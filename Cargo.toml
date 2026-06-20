@@ -1,6 +1,6 @@
 [package]
 name = "mora"
-version = "0.0.6"
+version = "0.0.7"
 edition = "2021"
 authors = ["Mora contributors"]
 description = "An AI-native scripting language with streaming, tool calling, memory, routing, agent orchestration, and token budgeting"

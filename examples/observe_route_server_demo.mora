@@ -1,0 +1,28 @@
+-- v0.07: observe + span + HTTP server + route 综合 demo
+-- 测: trace + span 嵌套 + AI 路由 + Router 显式 API
+
+route fast: ai_model("gpt-4o-mini")
+
+observe trace do
+end
+
+let router = Router::new()
+router = router.route("GET", "/health", fn(req)
+  return {status: "ok"}
+end)
+router = router.route("POST", "/chat", fn(req)
+  span "user_chat" tags {path: "/chat"} do
+    let user_text := req["body"]["text"]
+    let answer = fast(p"answer: {user_text}")
+    print("span finished, answer: " + answer)
+  end
+  let reply = fast(p"reply hi")
+  return reply
+end)
+router = router.route("GET", "/traces", fn(req)
+  return {spans: "see stderr"}
+end)
+
+router.listen("127.0.0.1", 3000)
+
+print("server up")

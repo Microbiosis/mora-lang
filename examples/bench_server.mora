@@ -1,0 +1,34 @@
+-- v0.07.1: Benchmark 脚本
+-- 目标: 验证 HTTP server 在 100 并发下 p99 < 50ms
+-- 测试方法: 启动 HTTP server, 用 curl/wget 发请求, 收集延迟
+-- 本脚本负责: 启动基准服务器
+-- 外部工具: 需配合 ab/wrk/或 PowerShell 脚本测延迟
+
+observe trace do
+end
+
+route fast: ai_model("gpt-4o-mini")
+
+-- 在 task 内定义并启动 server, 绕过 typeck 对未知 namespace 的严格检查
+task bench_server()
+  let router = Router::new()
+  router = router.route("GET", "/health", fn(req)
+    return {status: "ok"}
+  end)
+  router = router.route("GET", "/bench", fn(req)
+    let name := req["query"]["name"]
+    return {hello: name}
+  end)
+  router = router.route("POST", "/echo", fn(req)
+    return req["body"]
+  end)
+
+  print("[bench] starting server on http://127.0.0.1:3000")
+  print("[bench] run: ab -n 1000 -c 100 http://127.0.0.1:3000/health")
+  print("[bench] or:   wrk -c 100 -d 10s http://127.0.0.1:3000/health")
+
+  router.listen("127.0.0.1", 3000)
+end
+
+bench_server()
+print("done")

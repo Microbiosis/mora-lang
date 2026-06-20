@@ -470,30 +470,6 @@ impl Interpreter {
                     _ => Err(format!("Cannot iterate over {}", iter_val)),
                 }
             }
-            Stmt::Try { try_block, catch_var, catch_type, catch_block, span: _ } => {
-                let env = Arc::new(Mutex::new(Environment::with_parent(self.environment.clone())));
-                match self.execute_block(try_block, env.clone()) {
-                    // 运行时错误：进 catch。**return 信号不算错误**，直接穿透。
-                    Ok(signal @ FlowSignal::Return(_)) => Ok(signal),
-                    Ok(FlowSignal::None) => Ok(FlowSignal::None),
-                    Ok(other) => Ok(other),  // v0.04.0: break/continue 穿透
-                    Err(err_msg) => {
-                        // v0.04.0: 类型化错误
-                        // catch_type == Some("AiError") → 包成 AiError dict
-                        // catch_type == None → 沿用 v0.03 字符串行为
-                        let err_value = match catch_type {
-                            Some(t) if t == "AiError" => Self::build_ai_error_static(&err_msg),
-                            Some(t) => {
-                                return Err(format!("try/catch: unsupported catch type '{}' (v0.04.0 only supports AiError or no annotation)", t));
-                            }
-                            None => Value::String(err_msg),
-                        };
-                        env.lock().unwrap().define(catch_var.clone(), err_value, false);
-                        // catch 块内若有 return 也要穿透
-                        self.execute_block(catch_block, env)
-                    }
-                }
-            }
             Stmt::Import { path, span: _ } => {
                 let module_env = self.import_module(path)?;
                 let exports = module_env.lock().unwrap().exports.clone();
@@ -713,96 +689,7 @@ impl Interpreter {
             }
             Stmt::Break { span: _ } => Ok(FlowSignal::Break),
             Stmt::Continue { span: _ } => Ok(FlowSignal::Continue),
-            // v0.04 Slice 1: serve 块
-            Stmt::Serve { protocol, routes, body, span: _ } => {
-                match protocol {
-                    ServeProtocol::Http { host, port } => {
-                        use std::collections::HashMap;
-                        use std::sync::{Arc, Mutex};
-                        let route_table: Arc<Mutex<HashMap<(String, String), Value>>> =
-                            Arc::new(Mutex::new(HashMap::new()));
-                        for r in routes {
-                            if let RouteDecl::HttpRoute { method, path, handler } = r {
-                                let handler_value = self.evaluate(&handler)?;
-                                route_table.lock().unwrap().insert(
-                                    (method.as_str().to_string(), path.clone()),
-                                    handler_value,
-                                );
-                            }
-                        }
-                        let body_env = Arc::new(Mutex::new(Environment::with_parent(self.environment.clone())));
-                        let body_signal = self.execute_block(body, body_env)?;
-                        let taken = std::mem::replace(self, Interpreter::new_empty());
-                        let interp_arc: Arc<Mutex<Interpreter>> = Arc::new(Mutex::new(taken));
-                        eprintln!("[serve] starting HTTP server on {}:{}", host, port);
-                        let host_str = host.clone();
-                        crate::http_server::start(&host_str, *port, route_table, interp_arc)
-                            .map_err(|e| format!("HTTP server error: {}", e))?;
-                        Ok(body_signal)
-                    }
-                    ServeProtocol::Mcp => {
-                        // Slice 4: 内嵌 MCP server
-                        // 收集 tool 块到 McpTool registry
-                        use std::collections::HashMap;
-                        use std::sync::{Arc, Mutex};
-                        let tool_registry: Arc<Mutex<HashMap<String, crate::mcp_server::McpTool>>> =
-                            Arc::new(Mutex::new(HashMap::new()));
-                        for r in routes {
-                            if let RouteDecl::ToolEntry { name, params, return_type, handler } = r {
-                                // 求值 handler (闭包)
-                                let handler_value = self.evaluate(&handler)?;
-                                // v0.04 Slice 5: 自动生成 JSON Schema (从 params + 类型 hint)
-                                let param_names: Vec<String> = params.iter().map(|(n, _)| n.clone()).collect();
-                                let param_types: Vec<String> = params.iter()
-                                    .map(|(_, t)| t.clone().unwrap_or_else(|| "string".to_string()))
-                                    .collect();
-                                let schema = Self::tool_to_json_schema(&param_names, &param_types);
-                                // 拼接 return type 描述
-                                let schema_with_return = if let Some(rt) = return_type {
-                                    let rt_lower = schema.trim_end_matches('}');
-                                    format!("{},\"_return_type\":\"{}\"}}", rt_lower, rt)
-                                } else {
-                                    schema
-                                };
-                                let tool = crate::mcp_server::McpTool {
-                                    name: name.clone(),
-                                    description: String::new(),
-                                    parameters: schema_with_return,
-                                    handler: handler_value,
-                                };
-                                tool_registry.lock().unwrap().insert(name.clone(), tool);
-                                eprintln!("[mcp] registered tool: {} ({} params)", name, param_names.len());
-                            }
-                        }
-                        // 执行 body
-                        let body_env = Arc::new(Mutex::new(Environment::with_parent(self.environment.clone())));
-                        let body_signal = self.execute_block(body, body_env)?;
-                        // 移交 self 到 Arc<Mutex<>> 启动 MCP server
-                        let taken = std::mem::replace(self, Interpreter::new_empty());
-                        let interp_arc: Arc<Mutex<Interpreter>> = Arc::new(Mutex::new(taken));
-                        eprintln!("[serve] starting MCP server on stdio");
-                        crate::mcp_server::start(tool_registry, interp_arc)
-                            .map_err(|e| format!("MCP server error: {}", e))?;
-                        Ok(body_signal)
-                    }
-                    ServeProtocol::Repl => {
-                        // v0.04补: 真实 REPL 入口（与 main.rs --repl 共享同一份代码）
-                        // 移交 self 到 &mut, REPL 接管 stdin
-                        eprintln!("[serve] starting REPL on stdin");
-                        let mut taken = std::mem::replace(self, Interpreter::new_empty());
-                        Interpreter::run_repl_with(&mut taken);
-                        Ok(FlowSignal::None)
-                    }
-                    ServeProtocol::Stdio => {
-                        // v0.04补: 简化的 stdio 协议 —— 读 stdin 一行, 执行 body 中
-                        // 注册的 handler (无 handler 时回显该行), 写回 stdout。
-                        // v0.04 范围内只做最简 echo 占位（RFC §2.2 提到 "自定义协议" 留给 v0.04.1）
-                        eprintln!("[serve] starting stdio server (echo mode, type 'exit' to quit)");
-                        Self::serve_stdio_echo();
-                        Ok(FlowSignal::None)
-                    }
-                }
-            }
+            // v0.06.7: serve as 语法糖已移除。用 Router::new() / McpServer::new() 显式 API
             // v0.04 Slice 2: route 块
             Stmt::Route { name, target, .. } => {
                 // v0.04补: 接受三种 target 形态
@@ -965,24 +852,6 @@ impl Interpreter {
     /// v0.04补: serve as stdio 最简 echo 占位
     /// 设计: 阻塞读 stdin, 每行回写到 stdout 前缀 `echo: `
     /// v0.04.1 跟进: body 中可注册 handler, 走自定义协议
-    fn serve_stdio_echo() {
-        use std::io::{self, BufRead, Write};
-        let stdin = io::stdin();
-        let mut handle = stdin.lock();
-        let stdout = io::stdout();
-        let mut out = stdout.lock();
-        let mut line = String::new();
-        loop {
-            line.clear();
-            if handle.read_line(&mut line).is_err() { break; }
-            let trimmed = line.trim();
-            if trimmed == "exit" || trimmed == "quit" { break; }
-            if trimmed.is_empty() { continue; }
-            let _ = writeln!(out, "echo: {}", trimmed);
-            let _ = out.flush();
-        }
-    }
-
     fn restore_env(key: &str, prev: &Option<String>) {
         match prev {
             Some(v) => std::env::set_var(key, v),
@@ -1048,32 +917,6 @@ impl Interpreter {
             .collect::<Vec<_>>()
             .join(",");
         format!("{{\"type\":\"object\",\"properties\":{},\"required\":[{}]}}", properties, required_str)
-    }
-
-    /// v0.04.0: 把运行时错误包成 AiError dict
-    /// 字段: message, code, retryable, attempts, cause
-    /// 用 dict 表达（Mora 暂时没有 struct literal）
-    fn build_ai_error_static(err_msg: &str) -> Value {
-        let mut m = std::collections::HashMap::new();
-        m.insert("message".to_string(), Value::String(err_msg.to_string()));
-        // 简单 code 推断
-        let code = if err_msg.contains("rate") || err_msg.contains("limit") {
-            "rate_limit"
-        } else if err_msg.contains("timeout") {
-            "timeout"
-        } else if err_msg.contains("context") || err_msg.contains("length") {
-            "context_length"
-        } else if err_msg.contains("auth") || err_msg.contains("key") {
-            "auth"
-        } else {
-            "unknown"
-        };
-        let retryable = matches!(code, "rate_limit" | "timeout");
-        m.insert("code".to_string(), Value::String(code.to_string()));
-        m.insert("retryable".to_string(), Value::Bool(retryable));
-        m.insert("attempts".to_string(), Value::Number(1.0));
-        m.insert("cause".to_string(), Value::String(err_msg.to_string()));
-        Value::Dict(m)
     }
 
     fn execute_parallel(&mut self, stmts: &[Stmt]) -> Result<FlowSignal, String> {
@@ -1335,6 +1178,19 @@ impl Interpreter {
                         Err(format!("?error: {}", err_val))
                     }
                     other => Err(format!("'?' expects Result<T,E> (dict with 'ok' or 'err'), got {}", other)),
+                }
+            }
+            // v0.07.1: NamespaceRef — IDENT::IDENT evaluated by joining and calling as builtin
+            Expr::NamespaceRef { namespace, name, span: _ } => {
+                let qualified = format!("{}::{}", namespace, name);
+                // Router::new / McpServer::new etc.
+                match qualified.as_str() {
+                    "Router::new" => Ok(Value::Router { routes: Arc::new(Mutex::new(Vec::new())) }),
+                    "McpServer::new" => Ok(Value::McpServer { tools: Vec::new() }),
+                    other => {
+                        // fallback: look up in call_function
+                        self.call_function(other, vec![])
+                    }
                 }
             }
         }
@@ -1634,6 +1490,31 @@ impl Interpreter {
                         Ok(Value::List(values))
                     }
                     "len" => Ok(Value::Number(map.len() as f64)),
+                    // v0.07.1: req.json() — 从 body 字段解析 JSON，返回 Result<Dict, ParseError>
+                    "json" => {
+                        let body_val = map.get("body").cloned().unwrap_or(Value::String(String::new()));
+                        let body_str = match body_val {
+                            Value::String(s) => s,
+                            _ => body_val.to_string(),
+                        };
+                        if body_str.trim().is_empty() {
+                            let mut err = HashMap::new();
+                            err.insert("err".to_string(), Value::String("ParseError: empty body".to_string()));
+                            return Ok(Value::Dict(err));
+                        }
+                        match json_to_value(&body_str) {
+                            Ok(val) => {
+                                let mut result = HashMap::new();
+                                result.insert("ok".to_string(), val);
+                                Ok(Value::Dict(result))
+                            }
+                            Err(e) => {
+                                let mut err = HashMap::new();
+                                err.insert("err".to_string(), Value::String(format!("ParseError: {}", e)));
+                                Ok(Value::Dict(err))
+                            }
+                        }
+                    }
                     _ => Err(format!("Dict has no method: {}", method)),
                 }
             }
@@ -1729,6 +1610,7 @@ impl Interpreter {
                     _ => Err(format!("Conversation has no method: {}", method)),
                 }
             }
+            // v0.07.1: String.json() — 解析 JSON 字符串，返回 Result<Value, ParseError>
             Value::String(s) => {
                 match method {
                     "len" => Ok(Value::Number(s.len() as f64)),
@@ -1758,6 +1640,26 @@ impl Interpreter {
                         let from = args.get(0).map(|v| v.to_string()).unwrap_or_default();
                         let to = args.get(1).map(|v| v.to_string()).unwrap_or_default();
                         Ok(Value::String(s.replace(&from, &to)))
+                    }
+                    // v0.07.3: String.json() — 与 Dict.json() 同构 API
+                    "json" => {
+                        if s.trim().is_empty() {
+                            let mut err = HashMap::new();
+                            err.insert("err".to_string(), Value::String("ParseError: empty body".to_string()));
+                            return Ok(Value::Dict(err));
+                        }
+                        match json_to_value(&s) {
+                            Ok(val) => {
+                                let mut result = HashMap::new();
+                                result.insert("ok".to_string(), val);
+                                Ok(Value::Dict(result))
+                            }
+                            Err(e) => {
+                                let mut err = HashMap::new();
+                                err.insert("err".to_string(), Value::String(format!("ParseError: {}", e)));
+                                Ok(Value::Dict(err))
+                            }
+                        }
                     }
                     _ => Err(format!("String has no method: {}", method)),
                 }
@@ -3228,7 +3130,8 @@ fn value_to_json(value: &Value) -> String {
     }
 }
 
-fn json_to_value(json: &str) -> Result<Value, String> {
+/// v0.07.3: 通用 JSON 解析 (pub scope — 供 http_server 复用)
+pub fn json_to_value(json: &str) -> Result<Value, String> {
     let trimmed = json.trim();
     if trimmed.is_empty() {
         return Err("Empty JSON".to_string());
@@ -3650,27 +3553,6 @@ task main()
 end
 "#;
         run(src).expect("return in if should propagate");
-    }
-
-    #[test]
-    fn return_in_try_does_not_trigger_catch() {
-        // try 块内 return 不应进 catch；应当穿透 try 边界向外冒泡
-        let src = r#"
-task main()
-  task maybe(blow: bool)
-    try
-      if blow then
-        return 42
-      end
-      return 100
-    catch err
-      return -1
-    end
-  end
-  let _ = maybe(true)
-end
-"#;
-        run(src).expect("return in try should not trigger catch");
     }
 
     #[test]

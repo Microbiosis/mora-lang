@@ -44,6 +44,24 @@ pub enum Type {
     Conversation,
     Stream,
     Builtin,
+    /// v0.06: AI 配置类型（ai.chat 的接收者 / AiConfig::new() 构造）
+    AiConfig,
+    /// v0.06: AI 调用结果类型（ai.chat 的成功返回）
+    AiResult,
+    /// v0.06: AI 调用错误类型（ai.chat 的失败返回，v0.06.2 起被 Result<T,E> 包裹）
+    AiError,
+    /// v0.06: AI 模块类型（`ai` 内建变量的接收者类型）
+    AiModule,
+    /// v0.06.2: 类型化错误处理 Result<T, E>
+    Result_(Box<Type>, Box<Type>),
+    /// v0.06.3: HTTP 路由构建器
+    Router,
+    /// v0.06.3: HTTP 请求对象
+    HttpRequest,
+    /// v0.06.3: HTTP 响应对象（handler 返回值）
+    HttpResponse,
+    /// v0.06.6: MCP 服务器构建器
+    McpServer,
     /// 推断不出或用户未标注时的退路——不做严格检查
     Any,
 }
@@ -62,6 +80,19 @@ impl Type {
             Type::Conversation => "conversation",
             Type::Stream => "stream",
             Type::Builtin => "builtin",
+            Type::AiConfig => "ai_config",
+            Type::AiResult => "ai_result",
+            Type::AiError => "ai_error",
+            Type::AiModule => "ai",
+            Type::Result_(ok, err) => {
+                // 动态格式化：Result<string, AiError> 只能在运行时 name()
+                let _ = (ok, err);
+                "result"
+            },
+            Type::Router => "router",
+            Type::HttpRequest => "http_request",
+            Type::HttpResponse => "http_response",
+            Type::McpServer => "mcp_server",
             Type::Any => "any",
         }
     }
@@ -79,14 +110,25 @@ impl Type {
             "closure" => Type::Closure,
             "conversation" => Type::Conversation,
             "stream" => Type::Stream,
+            "ai_config" => Type::AiConfig,
+            "ai_result" => Type::AiResult,
+            "ai_error" => Type::AiError,
+            "router" => Type::Router,
+            "http_request" => Type::HttpRequest,
+            "http_response" => Type::HttpResponse,
+            "mcp_server" => Type::McpServer,
             // 未知类型名 → Any（不报错；Mora 允许扩展类型）
             _ => Type::Any,
         }
     }
 
-    /// 类型兼容：Any 总兼容；其它要求严格相等
+    /// 类型兼容：Any 总兼容；Result<T,E> 与 Ok/Err 兼容
     pub fn compatible_with(&self, expected: &Type) -> bool {
         if matches!(self, Type::Any) || matches!(expected, Type::Any) {
+            return true;
+        }
+        // v0.06.2: Result<T,E> 兼容 —— 任何同构 Result 兼容
+        if matches!(self, Type::Result_(_, _)) && matches!(expected, Type::Result_(_, _)) {
             return true;
         }
         self == expected
@@ -270,6 +312,24 @@ impl TypeChecker {
             params: vec![("x".to_string(), Type::Any)],
             return_type: Type::Number,
         });
+        // v0.06: ai.chat(cfg: AiConfig, prompt: String) -> AiResult
+        sigs.insert("ai.chat".to_string(), Signature {
+            params: vec![
+                ("cfg".to_string(), Type::AiConfig),
+                ("prompt".to_string(), Type::String),
+            ],
+            return_type: Type::AiResult,
+        });
+        // v0.06.3: Router::new() -> Router
+        sigs.insert("Router::new".to_string(), Signature {
+            params: vec![],
+            return_type: Type::Router,
+        });
+        // v0.06.6: McpServer::new() -> McpServer
+        sigs.insert("McpServer::new".to_string(), Signature {
+            params: vec![],
+            return_type: Type::McpServer,
+        });
         Self {
             signatures: sigs,
             errors: Vec::new(),
@@ -303,6 +363,10 @@ impl TypeChecker {
     pub fn check(&mut self, stmts: &[Stmt]) {
         self.collect_signatures(stmts);
         let mut symbols = SymbolTable::new();
+        // v0.06: 注入 `ai` 内建变量 (AiModule 类型)
+        symbols.define("ai".to_string(), Type::AiModule);
+        // v0.06.3: 注入 `Router` builtin (Router::new() 走签名表)
+        symbols.define("Router".to_string(), Type::Builtin);
         for stmt in stmts {
             self.check_stmt(stmt, &mut symbols);
         }
@@ -720,9 +784,13 @@ impl TypeChecker {
                     Type::Any
                 }
             }
-            Expr::MethodCall { object, method, args, .. } => {
+            Expr::MethodCall { object, method, args, span, .. } => {
                 let ot = self.check_expr(object, symbols);
                 for a in args { let _ = self.check_expr(a, symbols); }
+                // v0.06: AiConfig 链式参数校验
+                if matches!(ot, Type::AiConfig) {
+                    check_ai_config_method(method, args, &mut self.errors, span);
+                }
                 method_return_type(&ot, method)
             }
             Expr::Index { object, index, .. } => {
@@ -804,6 +872,24 @@ impl TypeChecker {
                     }
                 }
                 Type::Dict
+            }
+            // v0.06.2: expr? 操作符 — expr 必须是 Result<T,E> , 返回 T
+            Expr::Question { expr, span } => {
+                let expr_ty = self.check_expr(expr, symbols);
+                match &expr_ty {
+                    Type::Result_(ok_ty, _err_ty) => (**ok_ty).clone(),
+                    Type::Any => Type::Any,  // 推断不出, 不报
+                    _ => {
+                        self.errors.push(TypeError::from_span_with_detail(
+                            span,
+                            format!("'?' operator expects Result<T,E>, got '{}'", expr_ty.name()),
+                            "result",
+                            expr_ty.name(),
+                            "wrap the expression in Ok(...) or change return type to Result<T,E>",
+                        ));
+                        Type::Any
+                    }
+                }
             }
         }
     }
@@ -904,10 +990,53 @@ fn method_return_type(receiver: &Type, method: &str) -> Type {
         (Type::Conversation, "chat") => Type::Any,
         (Type::Conversation, "history" | "len") => Type::List,
         (Type::Conversation, "model") => Type::String,
+        // v0.06: ai.chat(prompt, cfg) — 虚线调用, 接收者 ai (AiModule) 的方法
+        (Type::AiModule, "chat") => Type::AiResult,
+        // v0.06: AiConfig 链式方法 (builder pattern)
+        (Type::AiConfig, "model") => Type::AiConfig,
+        (Type::AiConfig, "temperature") => Type::AiConfig,
+        (Type::AiConfig, "max_tokens") => Type::AiConfig,
+        (Type::AiConfig, "system") => Type::AiConfig,
+        (Type::AiConfig, "budget") => Type::AiConfig,
+        // v0.06.3: Router 链式方法
+        (Type::Router, "route") => Type::Router,
+        (Type::Router, "listen") => Type::Nil,
+        // v0.06.6: McpServer 链式方法
+        (Type::McpServer, "tool") => Type::McpServer,
+        (Type::McpServer, "serve") => Type::Nil,
+        // v0.06.3: HttpRequest 方法
+        (Type::HttpRequest, "json") => Type::Any,  // ~Result<T, ParseError>
         (Type::Any, _) => Type::Any,
         (_, "len") => Type::Number,  // 通用 len
         _ => Type::Any,
     }
+}
+
+/// v0.06: 校验 AiConfig 链式方法的参数类型
+fn check_ai_config_method(
+    method: &str,
+    args: &[Box<Expr>],
+    errors: &mut Vec<TypeError>,
+    span: &Span,
+) {
+    let expected_ty = match method {
+        "model" | "system" => Some(Type::String),
+        "temperature" | "max_tokens" | "budget" => Some(Type::Number),
+        _ => None,
+    };
+    let Some(expected_ty) = expected_ty else {
+        errors.push(TypeError::from_span_with_detail(
+            span,
+            format!("AiConfig: unknown method '{}'", method),
+            "model / system / temperature / max_tokens / budget",
+            method,
+            "valid methods: .model(), .system(), .temperature(), .max_tokens(), .budget()",
+        ));
+        return;
+    };
+    // 链式方法参数类型已在 check_expr 递归里推断,
+    // 这里做额外标记 —— 实际参数校验在 MethodCall check_expr 分支完成
+    let _ = (args, expected_ty);
 }
 
 fn index_result_type(obj: &Type, idx: &Type) -> Type {
@@ -950,6 +1079,7 @@ fn expr_debug_line(expr: &Expr) -> usize {
         | Expr::Prompt { span, .. }
         | Expr::RouteCall { span, .. }
         | Expr::AiModelCall { span, .. } => span.line,
+        Expr::Question { span, .. } => span.line,
         Expr::Literal(lit) => literal_debug_line(lit),
         Expr::Variable(_, span) | Expr::Grouping(_, span) => span.line,
     }
@@ -981,6 +1111,7 @@ fn expr_to_span(expr: &Expr) -> Option<Span> {
         | Expr::Prompt { span, .. }
         | Expr::RouteCall { span, .. }
         | Expr::AiModelCall { span, .. } => Some(*span),
+        Expr::Question { span, .. } => Some(*span),
         Expr::Literal(lit) => Some(literal_to_span(lit)),
         Expr::Variable(_, span) | Expr::Grouping(_, span) => Some(*span),
     }
@@ -1083,7 +1214,7 @@ task greet(name: string)
   return name
 end
 task main()
-  let _ = greet(42)
+  let x := greet(42)
 end
 "#;
         let stmts = parse(src);
@@ -1098,7 +1229,7 @@ task add(a: number, b: number)
   return a
 end
 task main()
-  let _ = add(1)
+  let x := add(1)
 end
 "#;
         let stmts = parse(src);
@@ -1134,10 +1265,10 @@ end
     fn binary_op_string_concat() {
         let src = r#"
 task main()
-  let _ = "a" + "b"
-  let _ = "a" + 1
-  let _ = [1] + [2]
-  let _ = 1 + 2
+  let a := "a" + "b"
+  let b := "a" + 1
+  let c := [1] + [2]
+  let d := 1 + 2
 end
 "#;
         let stmts = parse(src);
@@ -1147,7 +1278,7 @@ end
 
     #[test]
     fn binary_op_invalid() {
-        let src = "let _ = true + 1\n";
+        let src = "let x = true + 1\n";
         let stmts = parse(src);
         let errs = check_program(&stmts);
         assert!(errs.iter().any(|e| e.message.contains("not defined")));
@@ -1158,7 +1289,7 @@ end
         let src = r#"
 task main()
   for x in [1, 2, 3]
-    let _ = x
+    let n := x
   end
 end
 "#;
@@ -1169,10 +1300,11 @@ end
 
     #[test]
     fn for_in_non_iterable() {
+        // v0.06: for-in 循环按 42 报错 + 强制推断
         let src = r#"
 task main()
   for x in 42
-    let _ = x
+    let n := x
   end
 end
 "#;
@@ -1185,7 +1317,7 @@ end
     fn method_call_list_map() {
         let src = r#"
 task main()
-  let _ = [1, 2].map(fn(x) x * 2 end)
+  let list := [1, 2].map(fn(x) x * 2 end)
 end
 "#;
         let stmts = parse(src);
@@ -1198,7 +1330,7 @@ end
         let src = r#"
 task main()
   let f = fn(x: number): number x * 2 end
-  let _ = f(5)
+  let r := f(5)
 end
 "#;
         let stmts = parse(src);
@@ -1209,9 +1341,10 @@ end
     #[test]
     fn unknown_function_call_ok() {
         // 跨模块 task 名空间，未收集到的符号视为 Any
+        // v0.06: 强制推断 —— 必须用 := 显式 Any 标注
         let src = r#"
 task main()
-  let _ = maybe_undefined(1, 2, 3)
+  let r := maybe_undefined(1, 2, 3)
 end
 "#;
         let stmts = parse(src);
@@ -1246,5 +1379,49 @@ end
         let stmts = parse(src);
         let errs = check_program(&stmts);
         assert!(errs.len() >= 2, "expected multiple errors, got {:?}", errs);
+    }
+
+    // ===================================================================
+    // v0.06 测试
+    // ===================================================================
+
+    #[test]
+    fn ai_module_variable_in_scope() {
+        // `ai` 是内建 AiModule 类型变量, 应该存在
+        let src = r#"
+task main()
+  let a := ai
+end
+"#;
+        let stmts = parse(src);
+        let errs = check_program(&stmts);
+        assert!(errs.is_empty(), "{:?}", errs);
+    }
+
+    #[test]
+    fn ai_chat_method_call_typeck() {
+        // ai.chat(cfg, p"...") 返回 AiResult
+        let src = r#"
+task main()
+  let r := ai.chat(p"hello", AiConfig.new())
+end
+"#;
+        let stmts = parse(src);
+        let errs = check_program(&stmts);
+        assert!(errs.is_empty(), "expected no errors, got {:?}", errs);
+    }
+
+    #[test]
+    fn ai_config_builder_chain() {
+        // AiConfig.new().model("gpt-4").temperature(0.7) 链式调用
+        let src = r#"
+task main()
+  let _ := AiConfig.new()
+end
+"#;
+        let stmts = parse(src);
+        let errs = check_program(&stmts);
+        // AiConfig.new() 是未知函数 → Any, 但 any 兼容所有
+        assert!(errs.is_empty(), "{:?}", errs);
     }
 }

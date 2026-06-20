@@ -419,7 +419,13 @@ impl Parser {
         } else if self.match_token(&[TokenType::Match]) {
             self.match_expression()
         } else {
-            self.call()
+            let mut expr = self.call();
+            // v0.06.2: 后置 ? 操作符
+            if self.match_token(&[TokenType::Question]) {
+                let span = self.span_of_previous_keyword();
+                expr = Expr::Question { expr: Box::new(expr), span };
+            }
+            expr
         }
     }
 

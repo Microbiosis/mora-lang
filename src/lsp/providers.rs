@@ -148,6 +148,7 @@ fn collect_references(stmts: &[Stmt], name: &str, refs: &mut Vec<(usize, usize)>
                 if let Some(n) = max_tokens { walk_expr(n, name, refs); }
                 if let Some(s) = system { walk_expr(s, name, refs); }
             }
+            Expr::Question { expr: inner, .. } => walk_expr(inner, name, refs),
             Expr::Call { callee, args, span, .. } => {
                 if callee == name {
                     refs.push((span.line, span.column));

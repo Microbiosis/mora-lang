@@ -2,7 +2,7 @@
 -- 测: 多路由 / POST / JSON body / 状态修改
 
 -- 全局状态
-let request_count = 0
+let request_count := 0
 
 serve as http on port 3000 do
   -- 简单 GET
@@ -12,7 +12,7 @@ serve as http on port 3000 do
 
   -- 路径参数（v0.04.1 支持, 当前用 query 实现）
   GET "/greet" -> fn(req)
-    let name = req["query"]
+    let name := req["query"]
     return "hello, " + name
   end
 

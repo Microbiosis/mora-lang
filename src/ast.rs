@@ -132,6 +132,8 @@ pub enum Expr {
         system: Option<Box<Expr>>,
         span: Span,
     },
+    // v0.06.2: ? 操作符（Result<T,E> 的早 return 语法糖）
+    Question { expr: Box<Expr>, span: Span },
 }
 
 #[derive(Debug, Clone, PartialEq)]

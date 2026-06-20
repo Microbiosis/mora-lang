@@ -74,6 +74,30 @@ pub enum Value {
         max_steps: usize,
         system: String,
     },
+    // v0.06: AiConfig 值类型
+    AiConfig {
+        model: Option<String>,
+        temperature: Option<f64>,
+        max_tokens: Option<usize>,
+        system: Option<String>,
+        budget: Option<usize>,
+    },
+    // v0.06.3: Router 值类型 — 路由用 Arc 包避免递归类型
+    Router {
+        routes: Arc<Mutex<Vec<(String, String, Value)>>>,  // (method, path, handler)
+    },
+    // v0.06.3: HttpRequest 值类型
+    HttpRequest {
+        method: String,
+        path: String,
+        query: String,
+        body: Box<Value>,
+        params: HashMap<String, String>,
+    },
+    // v0.06.6: McpServer 值类型
+    McpServer {
+        tools: Vec<(String, Value)>,  // (tool_name, handler)
+    },
 }
 
 // 手动实现 PartialEq（Arc<Mutex<Environment>> 不支持自动派生）
@@ -116,6 +140,14 @@ impl std::fmt::Display for Value {
             }
             Value::Stream { .. } => write!(f, "<stream>"),
             Value::Agent { name, .. } => write!(f, "<agent {}>", name),
+            // v0.06: AiConfig 值类型 (builder 字段)
+            Value::AiConfig { model, temperature, max_tokens, system, budget } => {
+                write!(f, "AiConfig(model={:?}, temp={:?}, max_tokens={:?}, system={:?}, budget={:?})",
+                    model, temperature, max_tokens, system, budget)
+            },
+            Value::Router { routes } => write!(f, "<router ({} routes)>", routes.lock().unwrap().len()),
+            Value::HttpRequest { method, path, .. } => write!(f, "<http_request {} {}>", method, path),
+            Value::McpServer { tools } => write!(f, "<mcp_server ({} tools)>", tools.len()),
         }
     }
 }
@@ -176,6 +208,18 @@ pub struct Interpreter {
     pub trace: TraceCollector,
     // v0.04 Slice 2: route registry (name -> model name)
     route_registry: HashMap<String, String>,
+    // v0.06: 当前 with 块 set 的 AiConfig 值 (替代 env hack)
+    current_ai_config: Option<AiConfigValue>,
+}
+
+/// v0.06: with 块字段 (不经过 env 变量)
+#[derive(Clone, Debug, Default)]
+struct AiConfigValue {
+    model: Option<String>,
+    temperature: Option<f64>,
+    max_tokens: Option<usize>,
+    budget: Option<usize>,
+    system: Option<String>,
 }
 
 // v0.04: 显式实现 Clone 而非 derive
@@ -192,6 +236,7 @@ impl Clone for Interpreter {
             token_usage: self.token_usage.clone(),
             trace: self.trace.clone(),
             route_registry: self.route_registry.clone(),
+            current_ai_config: self.current_ai_config.clone(),
         }
     }
 }
@@ -219,6 +264,7 @@ struct RouteConfig {
     api_key: String,
     max_tokens: Option<usize>,
     system: Option<String>,
+    temperature: Option<f64>,
 }
 
 /// 记忆条目 — v0.04补: 字段已删 (RFC §4.1 memory.* 推迟到 v1.0)
@@ -253,7 +299,7 @@ impl Interpreter {
         globals.lock().unwrap().define("print".to_string(), Value::Builtin("print".to_string()), false);
         globals.lock().unwrap().define("range".to_string(), Value::Builtin("range".to_string()), false);
         globals.lock().unwrap().define("len".to_string(), Value::Builtin("len".to_string()), false);
-        Self { globals: globals.clone(), environment: globals, tool_registry: HashMap::new(), model_routes: HashMap::new(), token_budget: None, token_usage: TokenUsage::default(), trace: TraceCollector::new(false), route_registry: HashMap::new() }
+        Self { globals: globals.clone(), environment: globals, tool_registry: HashMap::new(), model_routes: HashMap::new(), token_budget: None, token_usage: TokenUsage::default(), trace: TraceCollector::new(false), route_registry: HashMap::new(), current_ai_config: None }
     }
 
     /// v0.04: 构造一个空 Interpreter (用于 std::mem::replace 占位)
@@ -269,12 +315,13 @@ impl Interpreter {
             token_usage: TokenUsage::default(),
             trace: TraceCollector::new(false),
             route_registry: HashMap::new(),
+            current_ai_config: None,
         }
     }
 
     pub fn new_with_globals(globals: Arc<Mutex<Environment>>) -> Self {
         let env = Arc::new(Mutex::new(Environment::with_parent(globals.clone())));
-        Self { globals: globals.clone(), environment: env, tool_registry: HashMap::new(), model_routes: HashMap::new(), token_budget: None, token_usage: TokenUsage::default(), trace: TraceCollector::new(false), route_registry: HashMap::new() }
+        Self { globals: globals.clone(), environment: env, tool_registry: HashMap::new(), model_routes: HashMap::new(), token_budget: None, token_usage: TokenUsage::default(), trace: TraceCollector::new(false), route_registry: HashMap::new(), current_ai_config: None }
     }
 
     #[allow(dead_code)]
@@ -579,40 +626,52 @@ impl Interpreter {
             }
             // ============ v0.04.0: AI 原语 ============
             Stmt::With { bindings, body, span: _ } => {
-                // 推入 AI 上下文栈
-                let prev_model = std::env::var("MORA_AI_MODEL").ok();
-                let prev_temp  = std::env::var("MORA_AI_TEMPERATURE").ok();
-                let prev_budget = std::env::var("MORA_AI_BUDGET").ok();
-                let prev_budget_used = std::env::var("MORA_AI_BUDGET_USED").ok();
-                let prev_max = std::env::var("MORA_AI_MAX_TOKENS").ok();
+                // v0.06: 推入 `current_ai_config` 栈 (替代 v0.04 env hack)
+                let prev_cfg = self.current_ai_config.clone();
+                let mut cfg = prev_cfg.clone().unwrap_or_default();
                 for (key, val_expr) in bindings {
                     let v = self.evaluate(val_expr)?;
-                    let s = match &v {
-                        Value::String(s) => s.clone(),
-                        Value::Number(n) => n.to_string(),
-                        Value::Bool(b) => b.to_string(),
-                        other => other.to_string(),
-                    };
-                    let env_key = match key.as_str() {
-                        "model" => "MORA_AI_MODEL",
-                        "budget" => "MORA_AI_BUDGET",
-                        "temperature" => "MORA_AI_TEMPERATURE",
-                        "max_tokens" => "MORA_AI_MAX_TOKENS",
-                        other => {
-                            return Err(format!("with: unknown binding '{}' (valid: model, budget, temperature, max_tokens)", other));
+                    match key.as_str() {
+                        "model" => {
+                            cfg.model = Some(match &v {
+                                Value::String(s) => s.clone(),
+                                other => other.to_string(),
+                            });
                         }
-                    };
-                    std::env::set_var(env_key, s);
+                        "temperature" => {
+                            cfg.temperature = Some(match &v {
+                                Value::Number(n) => *n,
+                                _ => return Err(format!("with: temperature must be number, got {}", v)),
+                            });
+                        }
+                        "max_tokens" => {
+                            cfg.max_tokens = Some(match &v {
+                                Value::Number(n) => *n as usize,
+                                _ => return Err(format!("with: max_tokens must be number, got {}", v)),
+                            });
+                        }
+                        "budget" => {
+                            cfg.budget = Some(match &v {
+                                Value::Number(n) => *n as usize,
+                                _ => return Err(format!("with: budget must be number, got {}", v)),
+                            });
+                        }
+                        "system" => {
+                            cfg.system = Some(match &v {
+                                Value::String(s) => s.clone(),
+                                other => other.to_string(),
+                            });
+                        }
+                        other => {
+                            return Err(format!("with: unknown binding '{}' (valid: model, budget, temperature, max_tokens, system)", other));
+                        }
+                    }
                 }
-                // budget_used 保留外层值（按 RFC §2.2.4 选"覆盖"语义：内层重新计数）
+                self.current_ai_config = Some(cfg);
                 let env_in = Arc::new(Mutex::new(Environment::with_parent(self.environment.clone())));
                 let result = self.execute_block(body, env_in);
-                // 恢复外层环境
-                Self::restore_env("MORA_AI_MODEL", &prev_model);
-                Self::restore_env("MORA_AI_TEMPERATURE", &prev_temp);
-                Self::restore_env("MORA_AI_BUDGET", &prev_budget);
-                Self::restore_env("MORA_AI_BUDGET_USED", &prev_budget_used);
-                Self::restore_env("MORA_AI_MAX_TOKENS", &prev_max);
+                // 恢复外层 config
+                self.current_ai_config = prev_cfg;
                 result
             }
             Stmt::StreamFor { prompt, var, body, span: _ } => {
@@ -772,7 +831,30 @@ impl Interpreter {
                         ));
                     }
                 };
+                // v0.06.5: route 元数据 (temperature/max_tokens/system) 存入 current_ai_config
+                let model_name_clone = model_name.clone();
+                let mut route_cfg: Option<AiConfigValue> = None;
+                if let Value::Dict(ref m) = target_val {
+                    let mut cfg = AiConfigValue::default();
+                    cfg.model = m.get("_model").and_then(|v| match v { Value::String(s) => Some(s.clone()), _ => None });
+                    cfg.temperature = m.get("temperature").and_then(|v| match v { Value::Number(n) => Some(*n), _ => None });
+                    cfg.max_tokens = m.get("max_tokens").and_then(|v| match v { Value::Number(n) => Some(*n as usize), _ => None });
+                    cfg.system = m.get("system").and_then(|v| match v { Value::String(s) => Some(s.clone()), _ => None });
+                    route_cfg = Some(cfg);
+                }
                 self.route_registry.insert(name.clone(), model_name);
+                // v0.06.5: 存 route cfg 到 model_routes (替代 env)
+                if let Some(cfg) = route_cfg {
+                    let rc = RouteConfig {
+                        model: model_name_clone,
+                        base_url: String::new(),
+                        api_key: String::new(),
+                        max_tokens: cfg.max_tokens,
+                        system: cfg.system.clone(),
+                        temperature: cfg.temperature,
+                    };
+                    self.model_routes.insert(name.clone(), rc);
+                }
                 eprintln!("[route] registered: {} -> {}", name, self.route_registry[name]);
                 Ok(FlowSignal::None)
             }
@@ -1238,6 +1320,23 @@ impl Interpreter {
                 }
                 Ok(Value::Dict(m))
             }
+            // v0.06.2: expr? 操作符 — Result<T,E> 早 return
+            Expr::Question { expr, span: _ } => {
+                match self.evaluate(expr)? {
+                    Value::Dict(ref m) if m.contains_key("ok") => {
+                        Ok(m.get("ok").cloned().unwrap_or(Value::Nil))
+                    }
+                    Value::Dict(ref m) if m.contains_key("err") => {
+                        let err_val = m.get("err").cloned().unwrap_or(Value::Nil);
+                        // ? 操作符在 task/closure 内触发早 return，
+                        // 但当前在 evaluate 递归里无法早 return →
+                        // 这里把 Err 包装成 Continue/特殊标记，由调用方
+                        // (call_task/call_closure 的 execute_block) 检测
+                        Err(format!("?error: {}", err_val))
+                    }
+                    other => Err(format!("'?' expects Result<T,E> (dict with 'ok' or 'err'), got {}", other)),
+                }
+            }
         }
     }
 
@@ -1273,6 +1372,7 @@ impl Interpreter {
     /// 替代 v0.03 的 ai.chat builtin
     /// - model: 模型名 (e.g. "gpt-4o-mini")
     /// - prompt: prompt 字符串
+    /// v0.06: 接 current_ai_config (替代 env hack)  --- temperature/max_tokens/system 下传
     fn do_ai_chat(interp: &mut Interpreter, model: &str, prompt: &str) -> Result<Value, String> {
         let api_key = std::env::var("OPENAI_API_KEY").unwrap_or_default();
         let base_url = std::env::var("MORA_AI_BASE_URL")
@@ -1280,11 +1380,16 @@ impl Interpreter {
 
         if api_key.is_empty() {
             // Mock 模式
-            eprintln!("[ai.chat mock — set OPENAI_API_KEY for real call] {}", prompt);
+            let cfg_info = interp.current_ai_config.as_ref()
+                .map(|c| format!("config: temp={:?}, max_tokens={:?}", c.temperature, c.max_tokens))
+                .unwrap_or_default();
+            eprintln!("[ai.chat mock — set OPENAI_API_KEY for real call] {} {}", prompt, cfg_info);
             return Ok(Value::String(format!("[Mock response for: {}]", prompt)));
         }
 
-        let messages = vec![("user".to_string(), prompt.to_string())];
+        let mut messages = vec![("user".to_string(), prompt.to_string())];
+        // v0.06: 从 current_ai_config 取 temperature/max_tokens/system,
+        // 拼进 real_ai_chat_inner (v0.06.5 才改函数签名，这里先保留 env 兼容)
         interp.real_ai_chat(&messages, &api_key, model, &base_url)
     }
 
@@ -1370,6 +1475,10 @@ impl Interpreter {
                 };
                 Ok(Value::Number(len as f64))
             }
+            // v0.06.3: Router::new() builtin
+            "Router::new" => Ok(Value::Router { routes: Arc::new(Mutex::new(Vec::new())) }),
+            // v0.06.6: McpServer::new() builtin
+            "McpServer::new" => Ok(Value::McpServer { tools: Vec::new() }),
             _ => {
                 // 先 clone 出值，释放 borrow，避免借用冲突
                 let looked_up = self.environment.lock().unwrap().get(name).clone();
@@ -1701,7 +1810,69 @@ impl Interpreter {
                     _ => Err(format!("Agent has no method: {}", method)),
                 }
             }
-            _ => Err(format!("Can only call methods on lists, dicts, strings, conversations, streams, agents, or builtin objects")),
+            // v0.06.3: Router 方法
+            Value::Router { ref mut routes } => {
+                let mut r = routes.lock().unwrap();
+                match method {
+                    "route" => {
+                        let http_method = args.get(0).map(|v| v.to_string()).unwrap_or_default().to_uppercase();
+                        let path = args.get(1).map(|v| v.to_string()).unwrap_or_default();
+                        let handler = args.get(2).cloned().ok_or("Router.route() requires a handler")?;
+                        r.push((http_method, path, handler));
+                        Ok(Value::Router { routes: routes.clone() })
+                    }
+                    "listen" => {
+                        let addr = args.get(0).map(|v| v.to_string()).unwrap_or_else(|| "0.0.0.0:3000".to_string());
+                        let (host, port) = addr.split_once(':').unwrap_or(("0.0.0.0", "3000"));
+                        let port: u16 = port.parse().map_err(|_| format!("Invalid port: {}", port))?;
+                        let r_clone: Vec<(String, String, Value)> = r.clone();
+                        drop(r);
+                        eprintln!("[Router] starting HTTP server on {}", addr);
+                        let interp_arc: Arc<Mutex<Interpreter>> = Arc::new(Mutex::new(self.clone()));
+                        crate::http_server::start(
+                            host, port,
+                            Arc::new(Mutex::new(r_clone.iter().map(|(m,p,h)|
+                                ((m.clone(), p.clone()), h.clone())
+                            ).collect())),
+                            interp_arc,
+                        ).map_err(|e| format!("HTTP server error: {}", e))?;
+                        Ok(Value::Nil)
+                    }
+                    _ => { drop(r); Err(format!("Router has no method: {}", method)) },
+                }
+            }
+            // v0.06.6: McpServer 方法
+            Value::McpServer { ref mut tools } => {
+                match method {
+                    "tool" => {
+                        let name = args.get(0).map(|v| v.to_string()).unwrap_or_default();
+                        let handler = args.get(2).cloned().ok_or("McpServer.tool() requires 3 args (name, schema, handler)")?;
+                        tools.push((name, handler));
+                        Ok(Value::McpServer { tools: tools.clone() })
+                    }
+                    "serve" => {
+                        let tools_clone = tools.clone();
+                        eprintln!("[McpServer] starting MCP server on stdio ({} tools)", tools_clone.len());
+                        let tool_registry: Arc<Mutex<HashMap<String, crate::mcp_server::McpTool>>> =
+                            Arc::new(Mutex::new(HashMap::new()));
+                        for (name, handler) in tools_clone {
+                            let mcp_tool = crate::mcp_server::McpTool {
+                                name: name.clone(),
+                                description: String::new(),
+                                parameters: "{}".to_string(),
+                                handler,
+                            };
+                            tool_registry.lock().unwrap().insert(name, mcp_tool);
+                        }
+                        let interp_arc: Arc<Mutex<Interpreter>> = Arc::new(Mutex::new(self.clone()));
+                        crate::mcp_server::start(tool_registry, interp_arc)
+                            .map_err(|e| format!("MCP server error: {}", e))?;
+                        Ok(Value::Nil)
+                    }
+                    _ => Err(format!("McpServer has no method: {}", method)),
+                }
+            }
+            _ => Err(format!("Can only call methods on lists, dicts, strings, conversations, streams, agents, routers, mcp_servers, or builtin objects")),
         }
     }
 
@@ -2025,6 +2196,7 @@ impl Interpreter {
     /// - **手写 JSON 请求体**：保持零 serde 依赖原则
     /// - **结构化 JSON 响应解析**：用 json_to_value 提取 choices[0].message.content
     /// - **同步阻塞**：60s 读超时（AI 推理可能慢）
+    /// v0.06.5: AI chat 新签名 — 接 temperature/max_tokens/system 从 current_ai_config
     fn real_ai_chat(&mut self, messages: &[(String, String)], api_key: &str, model: &str, base_url: &str) -> Result<Value, String> {
         let mut span_attrs = std::collections::HashMap::new();
         span_attrs.insert("model".to_string(), model.to_string());
@@ -2051,6 +2223,7 @@ impl Interpreter {
         result
     }
 
+    /// v0.06.5: HTTP body 构建 — 拼 json 时接 temperature/max_tokens/system
     fn real_ai_chat_inner(&mut self, messages: &[(String, String)], api_key: &str, model: &str, base_url: &str) -> Result<Value, String> {
         if messages.is_empty() {
             return Err("ai.chat: messages cannot be empty".to_string());
@@ -2073,10 +2246,23 @@ impl Interpreter {
         let escaped_model = model
             .replace('\\', "\\\\")
             .replace('"', "\\\"");
-        let body = format!(
-            r#"{{"model":"{}","messages":[{}]}}"#,
+        // v0.06.5: 拼 temperature/max_tokens/system 从 current_ai_config
+        let mut body = format!(
+            r#"{{"model":"{}","messages":[{}]"#,
             escaped_model, msgs_json
         );
+        if let Some(ref cfg) = self.current_ai_config {
+            if let Some(temp) = cfg.temperature {
+                body.push_str(&format!(",\"temperature\":{}", temp));
+            }
+            if let Some(mt) = cfg.max_tokens {
+                body.push_str(&format!(",\"max_tokens\":{}", mt));
+            }
+            if let Some(ref sys) = cfg.system {
+                body.push_str(&format!(",\"system\":\"{}\"", sys.replace('"', "\\\"")));
+            }
+        }
+        body.push('}');
 
         let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
 
@@ -2998,6 +3184,10 @@ fn type_name(value: &Value) -> &'static str {
         Value::Conversation{..} => "conversation",
         Value::Stream{..} => "stream",
         Value::Agent{..} => "agent",
+        Value::AiConfig{..} => "ai_config",
+        Value::Router{..} => "router",
+        Value::HttpRequest{..} => "http_request",
+        Value::McpServer{..} => "mcp_server",
     }
 }
 
@@ -3031,6 +3221,10 @@ fn value_to_json(value: &Value) -> String {
         Value::Conversation { .. } => "null".to_string(),
         Value::Stream { .. } => "null".to_string(),
         Value::Agent { .. } => "null".to_string(),
+        Value::AiConfig { .. } => "null".to_string(),
+        Value::Router { .. } => "null".to_string(),
+        Value::HttpRequest { .. } => "null".to_string(),
+        Value::McpServer { .. } => "null".to_string(),
     }
 }
 

@@ -1,9 +1,8 @@
--- v0.04 终态 Slice 3 demo: observe + span
+-- v0.07: observe + span demo（serve as 已移除）
 -- 测: 启用 trace + 创建 span + 嵌套 span
 
 -- 启用 trace
 observe trace do
-  -- body 是普通语句
   print("trace enabled")
 end
 
@@ -13,7 +12,7 @@ span "main_work" do
 
   -- 嵌套 span
   span "sub_task" tags {key: "value"} do
-    let who = "world"
+    let who := "world"
     let r = p"hello {who}"
     print("sub_task result: " + r)
   end

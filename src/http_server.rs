@@ -15,7 +15,6 @@ use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
 
-use crate::ast::HttpMethod;
 use crate::interpreter::{Interpreter, Value};
 use crate::lsp::json::{to_string as json_to_string, Value as JsonValue};
 
@@ -66,7 +65,7 @@ fn parse_query_dict(query: &str) -> Value {
 }
 
 /// 启动 HTTP server (阻塞当前线程)
-/// routes 是从 Stmt::Serve 提取的路由表
+/// routes 是从 Router 显式 API 收集的路由表
 pub fn start(
     host: &str,
     port: u16,
@@ -155,7 +154,7 @@ fn handle_connection(
     send_response(&mut stream, status, &body_str)
 }
 
-/// 调 Mora 闭包,把 request 包装成 dict 传入
+/// 调 Mora 闭包,把 request 包装成 dict 传入. 附加 .json() / .text() 方法
 fn invoke_handler(
     handler: Value,
     req: &HttpRequest,
@@ -197,29 +196,29 @@ fn parse_body_value(body: &str) -> Value {
         Ok(JsonValue::Object(map)) => {
             let mut out = HashMap::new();
             for (k, v) in map {
-                out.insert(k, json_to_value(v));
+                out.insert(k, json_lsp_to_value(v));
             }
             Value::Dict(out)
         }
         Ok(JsonValue::Array(items)) => {
-            Value::List(items.into_iter().map(json_to_value).collect())
+            Value::List(items.into_iter().map(json_lsp_to_value).collect())
         }
-        Ok(other) => json_to_value(other),
+        Ok(other) => json_lsp_to_value(other),
         Err(_) => Value::String(body.to_string()),
     }
 }
 
-fn json_to_value(j: JsonValue) -> Value {
+fn json_lsp_to_value(j: JsonValue) -> Value {
     match j {
         JsonValue::Null => Value::Nil,
         JsonValue::Bool(b) => Value::Bool(b),
         JsonValue::Number(n) => Value::Number(n),
         JsonValue::String_(s) => Value::String(s),
-        JsonValue::Array(items) => Value::List(items.into_iter().map(json_to_value).collect()),
+        JsonValue::Array(items) => Value::List(items.into_iter().map(json_lsp_to_value).collect()),
         JsonValue::Object(map) => {
             let mut out = HashMap::new();
             for (k, v) in map {
-                out.insert(k, json_to_value(v));
+                out.insert(k, json_lsp_to_value(v));
             }
             Value::Dict(out)
         }

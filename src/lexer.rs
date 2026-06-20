@@ -1,14 +1,15 @@
 #[derive(Debug, Clone, PartialEq)]
 pub enum TokenType {
-    Let, Task, If, Then, End, Return, True, False, Nil, For, In, Try, Catch, Import, Export,
+    Let, Task, If, Then, End, Return, True, False, Nil, For, In, Import, Export,
     Parallel, Match, WithKeyword, Save, Load, Fn, Into, As, Do,
     Read, Write, Append, ReadBytes, WriteBytes,
     Stream, Tool, Break, Continue,
-    // v0.04: 云服务原生关键字
-    Serve, Route, Observe, Span, Tags, Record, Repl, Stdio, Mcp, Http, On,
+    // v0.06.7: 移除 v0.04 云服务原生关键字 Serve/Http/Mcp/Repl/Stdio/On
+    // 云服务走显式 API: Router::new() / McpServer::new()
+    Route, Observe, Span, Tags, Record,
     Trace, Metrics, Otel,
     // 注意: HTTP 方法 (GET/POST/PUT/DELETE/PATCH) 不作关键字
-    // —— 保持 Identifier,parser 在 serve 块内做大小写敏感判断
+    // —— 保持 Identifier,显式 API Router.route() 按字符串匹配
     Identifier(String),
     String(String),
     PromptString(String),  // v0.04.0: p"..."
@@ -21,6 +22,8 @@ pub enum TokenType {
     Walrus,
     // v0.06.2: ? 操作符（expr? 传播 Result 错误）
     Question,
+    // v0.07.1: :: 操作符（Namespace qualification like Router::new）
+    ColonColon,
     LParen, RParen, LBracket, RBracket, LBrace, RBrace, Dot, Comma, Colon,
     Newline,
     EOF,
@@ -137,6 +140,8 @@ impl Lexer {
             ':' => {
                 if self.match_char('=') {
                     Some(Token { token_type: TokenType::Walrus, line: start_line, column: start_col })
+                } else if self.match_char(':') {
+                    Some(Token { token_type: TokenType::ColonColon, line: start_line, column: start_col })
                 } else {
                     Some(Token { token_type: TokenType::Colon, line: start_line, column: start_col })
                 }
@@ -266,8 +271,8 @@ impl Lexer {
             "nil" => TokenType::Nil,
             "for" => TokenType::For,
             "in" => TokenType::In,
-            "try" => TokenType::Try,
-            "catch" => TokenType::Catch,
+            "try" => TokenType::Identifier("try".to_string()),
+            "catch" => TokenType::Identifier("catch".to_string()),
             "import" => TokenType::Import,
             "export" => TokenType::Export,
             "parallel" => TokenType::Parallel,
@@ -284,23 +289,21 @@ impl Lexer {
             "write_bytes" => TokenType::WriteBytes,
             "as" => TokenType::As,
             "do" => TokenType::Do,
-            "on" => TokenType::On,
+            "on" => TokenType::Identifier("on".to_string()),
             "stream" => TokenType::Stream,
             "tool" => TokenType::Tool,
             "break" => TokenType::Break,
             "continue" => TokenType::Continue,
-            // v0.04: 云服务原生关键字
-            "serve" => TokenType::Serve,
+            // v0.06.7: serve/as/mcp/repl/stdio/http/on 不再是关键字——移除
             "route" => TokenType::Route,
             "observe" => TokenType::Observe,
             "span" => TokenType::Span,
             "tags" => TokenType::Tags,
             "record" => TokenType::Record,
-            // v0.05 Bugfix: "endpoint" 不再作关键字 —— 走 Identifier 让 parser 用 match_identifier 处理
-            "repl" => TokenType::Repl,
-            "stdio" => TokenType::Stdio,
-            "mcp" => TokenType::Mcp,
-            "http" => TokenType::Http,
+            "repl" => TokenType::Identifier("repl".to_string()),
+            "stdio" => TokenType::Identifier("stdio".to_string()),
+            "mcp" => TokenType::Identifier("mcp".to_string()),
+            "http" => TokenType::Identifier("http".to_string()),
             "trace" => TokenType::Trace,
             "metrics" => TokenType::Metrics,
             "otel" => TokenType::Otel,

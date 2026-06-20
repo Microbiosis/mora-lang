@@ -1,0 +1,16 @@
+-- v0.07: MCP server demo（serve as mcp 已移除，走 McpServer::new() 显式 API）
+-- 测: tool 注册 + serve 启动
+
+let mcp = McpServer::new()
+mcp = mcp.tool("search", {query: "string", max_results: "number"}, fn(args)
+  let q := args["query"]
+  let n := args["max_results"]
+  return "found " + n + " docs for: " + q
+end)
+mcp = mcp.tool("calculate", {expression: "string"}, fn(args)
+  return 42
+end)
+
+mcp.serve()
+
+print("server blocks")

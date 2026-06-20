@@ -71,14 +71,10 @@ record_tokens("not_a_number", 50)
 record_tokens(100, "not_a_number")
 
 -- ============================
--- 类别 11: try-catch 不支持的类型
--- 期望: try/catch: type 'MyError' not supported
+-- 类别 11: 已移除 — try-catch 语法糖被移除
+-- 不再支持 try/catch 语法
 -- ============================
-try
-  print("hi")
-catch e: MyError
-  print(e)
-end
+-- （此测试用例已废弃，try-catch 不再是合法语法）
 
 -- ============================
 -- 类别 12: return 类型不匹配

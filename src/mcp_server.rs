@@ -1,4 +1,4 @@
-//! Mora MCP Server (v0.04 终态: 内嵌到解释器中)
+//! Mora MCP Server (v0.04: 内嵌到解释器中)
 //!
 //! 设计: JSON-RPC 2.0 over stdin/stdout (MCP 协议)
 //! - 客户端 (如 Claude Desktop) 通过 stdin 发 JSON-RPC 请求
@@ -190,7 +190,7 @@ fn wrap_response(id: JsonValue, result: JsonValue) -> JsonValue {
 }
 
 fn handle_initialize(_req: &JsonValue) -> JsonValue {
-    // 返回 capabilities (v0.04 终态: 只支持 tools)
+    // 返回 capabilities (v0.04: 只支持 tools)
     let mut capabilities = std::collections::BTreeMap::new();
     let mut tools_cap = std::collections::BTreeMap::new();
     tools_cap.insert("listChanged".to_string(), JsonValue::Bool(false));

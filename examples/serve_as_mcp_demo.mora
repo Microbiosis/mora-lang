@@ -4,8 +4,8 @@
 serve as mcp do
   -- Slice 5: tool 现在可以带 params, 自动生成 JSON Schema
   tool search(query: string, max_results: number): string do
-    let q = args["query"]
-    let n = args["max_results"]
+    let q := args["query"]
+    let n := args["max_results"]
     return "found " + n + " docs for: " + q
   end
 

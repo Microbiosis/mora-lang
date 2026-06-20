@@ -2,14 +2,13 @@
 
 use std::env;
 use std::fs;
-use std::io::{self, Write};
 use std::process;
 use std::path::Path;
 
-use mora::interpreter::{FlowSignal, Interpreter};
+use mora::interpreter::Interpreter;
 use mora::lexer::Lexer;
 use mora::parser::Parser;
-use mora::typeck;
+use mora::typeck::{self, format_error};
 
 fn main() {
     let args: Vec<String> = env::args().collect();
@@ -17,9 +16,9 @@ fn main() {
     // --version / --help 不显示 banner
     if args.len() >= 2 {
         match args[1].as_str() {
-            "--version" | "-v" => { println!("Mora v0.04"); return; }
+            "--version" | "-v" => { println!("Mora v0.05"); return; }
             "--help" | "-h" => {
-                println!("Mora v0.04 — AI 原生 + 云服务原生");
+                println!("Mora v0.05 — AI 原生 + 云服务原生");
                 println!();
                 println!("Usage:");
                 println!("  mora <file.mora>        Run a script (auto-detect serve as http/mcp/repl)");
@@ -136,15 +135,17 @@ fn print_banner() {
     let model = env::var("MORA_AI_MODEL").unwrap_or_else(|_| "gpt-4o-mini".to_string());
     let base_url = env::var("MORA_AI_BASE_URL").unwrap_or_else(|_| "https://api.openai.com/v1".to_string());
 
-    println!("Mora v0.04 — AI 原生 + 云服务原生");
+    println!("Mora v0.05");
     if has_openai_key {
         println!("  AI: real API (model: {}, endpoint: {})", model, base_url);
     } else {
         println!("  AI: mock mode (set OPENAI_API_KEY for real calls)");
     }
     println!("  AI 原语: p\"...\" / with / stream / tool / catch e: AiError");
-    println!("  云服务: serve as http/mcp/repl + route + observe/span");
-    println!("  Built-in: web.fetch / json.* / file.* / typeck / mora-lsp");
+    println!("  serve: http / mcp / repl / stdio + route + observe / span");
+    println!("  Built-in: web.fetch / json.* / file.* / typeck (必走) / mora-lsp");
+    println!("  v0.05: typeck 必走 (exit 2 on error); `let x := expr` 显式 Any 标注");
+    println!("  ⚠  不兼容 v0.03 builtin (ai.chat/stream/tool/budget/route/usage/embed/cosine/search/memory.* 均报 Unknown method)");
     println!();
 }
 
@@ -170,20 +171,15 @@ fn run_file(path: &str) {
     let mut parser = Parser::new(tokens);
     let stmts = parser.parse();
 
-    // v11: 静态类型检查（默认启用；MORA_NO_TYPECK=1 可禁用）
-    if env::var("MORA_NO_TYPECK").is_err() {
-        let type_errors = typeck::check_program(&stmts);
-        if !type_errors.is_empty() {
-            for err in &type_errors {
-                if err.line > 0 {
-                    eprintln!("Type error at line {}: {}", err.line, err.message);
-                } else {
-                    eprintln!("Type error: {}", err.message);
-                }
-            }
-            eprintln!("\n{} type error(s) found.", type_errors.len());
-            process::exit(1);
+    // v0.05: 静态类型检查必走（移除 v0.04 MORA_NO_TYPECK env 跳过逻辑）
+    let type_errors = typeck::check_program(&stmts);
+    if !type_errors.is_empty() {
+        for err in &type_errors {
+            eprintln!("{}", format_error(err));
         }
+        eprintln!("\n{} type error(s) found.", type_errors.len());
+        // v0.05: typeck 失败 exit code 2（区分运行时错误 1）
+        process::exit(2);
     }
 
     let mut interpreter = Interpreter::new();
@@ -207,58 +203,15 @@ fn run_check(path: &str) {
         println!("No type errors found. ({} statements)", stmts.len());
     } else {
         for err in &type_errors {
-            if err.line > 0 {
-                eprintln!("Type error at line {}: {}", err.line, err.message);
-            } else {
-                eprintln!("Type error: {}", err.message);
-            }
+            eprintln!("{}", format_error(err));
         }
         eprintln!("\n{} type error(s) found.", type_errors.len());
-        process::exit(1);
+        // v0.05: typeck 失败 exit code 2
+        process::exit(2);
     }
 }
 
 fn run_repl() {
-    println!("Mora v0.04 REPL — type 'exit' to quit");
-    println!();
-
     let mut interpreter = Interpreter::new();
-    let stdin = io::stdin();
-
-    loop {
-        print!("mora> ");
-        io::stdout().flush().unwrap();
-
-        let mut line = String::new();
-        if stdin.read_line(&mut line).is_err() {
-            break;
-        }
-
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        if line == "exit" || line == "quit" {
-            println!("Bye!");
-            break;
-        }
-
-        let mut lexer = Lexer::new(line);
-        let tokens = lexer.scan_tokens();
-        let mut parser = Parser::new(tokens);
-        let stmts = parser.parse();
-
-        if stmts.is_empty() {
-            continue;
-        }
-
-        for stmt in &stmts {
-            match interpreter.execute(stmt) {
-                Ok(FlowSignal::Return(value)) => println!("= {}", value),
-                Ok(FlowSignal::None) => {}
-                Ok(FlowSignal::Break) | Ok(FlowSignal::Continue) => {}  // v0.04.0: 顶层无 loop
-                Err(e) => eprintln!("Error: {}", e),
-            }
-        }
-    }
+    Interpreter::run_repl_with(&mut interpreter);
 }

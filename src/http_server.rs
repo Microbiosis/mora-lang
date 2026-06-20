@@ -1,4 +1,4 @@
-//! Mora HTTP Server (v0.04 终态: 内嵌在解释器中)
+//! Mora HTTP Server (v0.04: 内嵌在解释器中)
 //!
 //! 设计: 零依赖 HTTP/1.1 + 动态路由表 (HTTP method + path → Mora 闭包)
 //! 与 v0.03 src/serve/server.rs 不同: endpoint 是 Mora 脚本里声明的,

@@ -1,0 +1,32 @@
+-- v0.08.4: trait 继承 demo
+-- 测: trait 可继承其他 trait (`trait Foo: Bar, Baz`)
+--      impl 子 trait 时自动覆盖父 trait 的方法
+--      impl 子 trait 时如果方法名与父 trait 冲突，impl 一个即可
+
+trait Named
+  fn get_name(self) -> string = "Anonymous"
+end
+
+trait Aged
+  fn get_age(self) -> number = 0
+end
+
+trait Person: Named, Aged
+  fn greet(self) -> string = "Hello, I am " + self.get_name() + ", age " + self.get_age()
+end
+
+impl Person for Human
+  fn get_name(self) = "Alice"
+  fn get_age(self) = 30
+  -- greet 继承自 Person 默认实现，调用时走默认
+end
+
+task main()
+  let h: dyn Person = Person::new("Human")
+  let n = h.get_name()
+  let a = h.get_age()
+  let g = h.greet()
+  print("name: " + n)
+  print("age:  " + a)
+  print("greet: " + g)
+end

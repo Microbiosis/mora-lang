@@ -1,5 +1,6 @@
 #!/bin/bash
-# v0.05 e2e 验证脚本 — 检查 20 类 typeck 错误是否全部命中
+# v0.08 e2e 验证脚本 — 检查 19 类 typeck 错误是否全部命中
+# v0.08 起类别 11（try-catch）已废弃（v0.05.0 移除 try-catch 语法糖）
 # 用法: bash test_data/verify_typeck_errors.sh
 
 set -e
@@ -7,7 +8,7 @@ MORA=${MORA:-./target/debug/mora}
 SCRIPT="test_data/typeck_errors.mora"
 EXPECTED_MIN=20  # 至少 20 个错误（级联可能更多）
 
-echo "=== v0.05 e2e typeck 验证 ==="
+echo "=== v0.08 e2e typeck 验证 ==="
 OUTPUT=$($MORA --check "$SCRIPT" 2>&1) || true
 ACTUAL=$(echo "$OUTPUT" | grep -c "Type error at line" || true)
 
@@ -39,7 +40,7 @@ check "类别 7:  with 未知 binding"     "with: unknown binding"
 check "类别 8:  with temperature 类型" "with temperature = ..."
 check "类别 9:  record_tokens input"   "record_tokens: input must be number"
 check "类别 10: record_tokens output"  "record_tokens: output must be number"
-check "类别 11: try-catch 不支持"      "try/catch: type 'MyError'"
+# v0.08.5: 类别 11 try-catch 已废弃（v0.05.0 移除），跳过
 check "类别 12: return 类型不匹配"     "return type mismatch: expected 'number', got 'string'"
 check "类别 13: return 无值"           "missing return.*bad_return2"
 check "类别 14: print 参数个数"        "function 'print' expects"
@@ -51,7 +52,7 @@ check "类别 19: ai_model max_tokens"   "ai_model: max_tokens must be number"
 check "类别 20: ai_model system"       "ai_model: system must be string"
 
 echo ""
-echo "结果: $PASS / 20 通过, $FAIL 失败"
+echo "结果: $PASS / 19 通过, $FAIL 失败"
 
 if [ "$FAIL" -gt 0 ]; then
   echo "❌ 有失败项"
@@ -62,5 +63,5 @@ if [ "$ACTUAL" -lt "$EXPECTED_MIN" ]; then
   exit 1
 fi
 
-echo "✅ 全部 20 类 typeck 错误命中，共 $ACTUAL 个错误"
+echo "✅ 全部 19 类 typeck 错误命中，共 $ACTUAL 个错误"
 exit 0

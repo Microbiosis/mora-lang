@@ -26,6 +26,10 @@ impl Parser {
             Some(self.let_declaration(exported))
         } else if self.match_token(&[TokenType::Task]) {
             Some(self.task_declaration(exported))
+        } else if self.match_token(&[TokenType::Trait]) {
+            Some(self.parse_trait_def(exported))
+        } else if self.match_token(&[TokenType::Impl]) {
+            Some(self.parse_impl_def())
         } else if exported {
             panic!("Expected 'let' or 'task' after 'export' at line {}", self.peek().map(|t| t.line).unwrap_or(0))
         } else {
@@ -38,13 +42,18 @@ impl Parser {
         let span = self.span_of_previous_keyword();
         let name = self.consume_identifier("Expected variable name after 'let'");
         // v0.05: 互斥语法 —— `:` (类型 hint) 或 `:=` (显式 Any)
-        //   `let x: T = expr`  → type_hint=Some("T"), is_any=false
-        //   `let x := expr`    → type_hint=None, is_any=true (无 Assign, lexer 把 := 切成一个 Walrus token)
-        //   `let x = expr`     → type_hint=None, is_any=false (需 Assign)
+        // v0.08: 支持 `let x: dyn Trait = expr`
         let (type_hint, is_any) = if self.match_token(&[TokenType::Walrus]) {
             (None, true)
         } else if self.match_token(&[TokenType::Colon]) {
-            (Some(self.consume_identifier("Expected type name after ':'")), false)
+            // 检查是否是 dyn Trait
+            let hint = if self.match_token(&[TokenType::Dyn]) {
+                let tname = self.consume_identifier("Expected trait name after 'dyn'");
+                format!("dyn:{}", tname)
+            } else {
+                self.consume_identifier("Expected type name after ':'")
+            };
+            (Some(hint), false)
         } else {
             (None, false)
         };
@@ -1127,6 +1136,117 @@ impl Parser {
             system,
             span,
         }
+    }
+
+    // ===================================================================
+    // v0.08: trait 系统解析
+    // ===================================================================
+
+    /// `trait Name ... method_signatures ... end`
+    /// `trait Name [: Parent1, Parent2, ...] ... method_signatures ... end`
+    fn parse_trait_def(&mut self, _exported: bool) -> Stmt {
+        let span = self.span_of_previous_keyword();
+        let name = self.consume_identifier("Expected trait name");
+        // v0.08.4: 可选 `:` 后跟父 trait 列表（用 `,` 分隔）
+        let parents = if self.match_token(&[TokenType::Colon]) {
+            let mut ps = vec![self.consume_identifier("Expected parent trait name after ':'")];
+            while self.match_token(&[TokenType::Comma]) {
+                ps.push(self.consume_identifier("Expected parent trait name"));
+            }
+            ps
+        } else {
+            vec![]
+        };
+        while self.check(&TokenType::Newline) { self.advance(); }
+        let mut methods = Vec::new();
+        loop {
+            // 跳过方法之间的 Newline
+            while self.check(&TokenType::Newline) { self.advance(); }
+            if self.check(&TokenType::End) || self.is_at_end() { break; }
+            let mspan = self.span_of_previous_keyword();
+            self.consume(&TokenType::Fn, "Expected 'fn' in trait method");
+            let mname = self.consume_identifier("Expected method name in trait");
+            self.consume(&TokenType::LParen, "Expected '(' after trait method name");
+            let params = if self.check(&TokenType::RParen) { vec![] }
+                         else { self.parameters() };
+            self.consume(&TokenType::RParen, "Expected ')' after trait method params");
+            // v0.08.1: 支持 `-> RetType` 语法（也兼容 `: RetType` 旧风格）
+            let return_type = if self.match_token(&[TokenType::Arrow]) {
+                Some(self.consume_identifier("Expected return type after '->'"))
+            } else if self.check(&TokenType::Colon) {
+                self.advance();
+                Some(self.consume_identifier("Expected return type after ':'"))
+            } else { None };
+            // v0.08.3: 默认实现 `= expr`（trait 内 fn 直接给实现，impl 可省略）
+            // v0.08.5 任务 2: 增加 `do ... end` 块语法（多语句默认实现）
+            let body = if self.match_token(&[TokenType::Assign]) {
+                let expr = self.expression();
+                vec![Stmt::Expr(expr)]
+            } else if self.match_token(&[TokenType::Do]) {
+                let mut body = Vec::new();
+                while !self.check(&TokenType::End) && !self.is_at_end() {
+                    if self.check(&TokenType::Newline) { self.advance(); continue; }
+                    if let Some(stmt) = self.declaration() { body.push(stmt); }
+                }
+                self.consume(&TokenType::End, "Expected 'end' after trait method body");
+                body
+            } else {
+                vec![]
+            };
+            // 跳到本行末尾
+            while self.check(&TokenType::Newline) { self.advance(); }
+            methods.push(TraitMethod { name: mname, params, return_type, body, span: mspan });
+        }
+        self.consume(&TokenType::End, "Expected 'end' after trait body");
+        Stmt::TraitDef { name, parents, methods, span }
+    }
+
+    /// `impl TraitName for TypeName ... method_bodies ... end`
+    fn parse_impl_def(&mut self) -> Stmt {
+        let span = self.span_of_previous_keyword();
+        let trait_name = self.consume_identifier("Expected trait name after 'impl'");
+        self.consume(&TokenType::For, "Expected 'for' after trait name in impl");
+        let for_type = self.consume_identifier("Expected type name after 'for'");
+        while self.check(&TokenType::Newline) { self.advance(); }
+        let mut methods = Vec::new();
+        loop {
+            // 跳过方法之间的 Newline
+            while self.check(&TokenType::Newline) { self.advance(); }
+            if self.check(&TokenType::End) || self.is_at_end() { break; }
+            let mspan = self.span_of_previous_keyword();
+            self.consume(&TokenType::Fn, "Expected 'fn' in impl method");
+            let mname = self.consume_identifier("Expected method name in impl");
+            self.consume(&TokenType::LParen, "Expected '(' after impl method name");
+            let params = if self.check(&TokenType::RParen) { vec![] }
+                         else { self.parameters() };
+            self.consume(&TokenType::RParen, "Expected ')' after impl method params");
+            // v0.08.1: 支持 `-> RetType` 和 `: RetType` 两种
+            let return_type = if self.match_token(&[TokenType::Arrow]) {
+                Some(self.consume_identifier("Expected return type after '->'"))
+            } else if self.check(&TokenType::Colon) {
+                self.advance();
+                Some(self.consume_identifier("Expected return type after ':'"))
+            } else { None };
+            // body: = expr 或 do ... end 块
+            let body = if self.match_token(&[TokenType::Assign]) {
+                let expr = self.expression();
+                vec![Stmt::Expr(expr)]
+            } else if self.match_token(&[TokenType::Do]) {
+                let mut body = Vec::new();
+                while !self.check(&TokenType::End) && !self.is_at_end() {
+                    if self.check(&TokenType::Newline) { self.advance(); continue; }
+                    if let Some(stmt) = self.declaration() { body.push(stmt); }
+                }
+                self.consume(&TokenType::End, "Expected 'end' after impl method body");
+                body
+            } else {
+                vec![]
+            };
+            while self.check(&TokenType::Newline) { self.advance(); }
+            methods.push(FnDef { name: mname, params, return_type, body, span: mspan });
+        }
+        self.consume(&TokenType::End, "Expected 'end' after impl block");
+        Stmt::ImplDef { trait_name, for_type, methods, span }
     }
 }
 

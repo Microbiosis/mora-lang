@@ -134,3 +134,42 @@ route bad_max: ai_model("gpt-4o", max_tokens: "lots")
 -- 期望: ai_model: system must be string
 -- ============================
 route bad_sys: ai_model("gpt-4o", system: 123)
+
+-- v0.08.5: trait 错误 case
+-- Case 24: trait 不存在
+impl NonExistent for X
+  fn foo() = 1
+end
+
+-- Case 25: impl 缺方法（trait 要求 fn bar() 但 impl 只写了 fn foo()）
+trait TwoMethod
+  fn foo()
+  fn bar()
+end
+
+impl TwoMethod for Y
+  fn foo() = 1
+end
+
+-- v0.08.5 任务 1: trait 错误 case（self-less 方法）
+-- Case 26: self-less 方法参数个数错误（trait 要求 2 个 args，用户传 1 个）
+trait PureMathA
+  fn add(a: number, b: number) -> number  -- self-less, expects 2 args (a, b 都对外可见, 不含 self 隐藏参数）
+end
+
+impl PureMathA for CalcA  -- impl 完全空，add 用 trait 默认实现（trait 里没有给默认）会报缺方法
+end
+
+-- Case 27: self-less 方法调用参数过多 (a, b 共 2 个, 传 3 个会报错，因为 trait 签名是 self-less 2 args, 期望用户传 2 个, 实际传 3 个不匹配)
+trait PureMathB
+  fn add(a: number, b: number) -> number = a + b  -- self-less with default
+end
+
+impl PureMathB for CalcB
+  -- 用默认
+end
+
+task main()
+  let m: dyn PureMathB = PureMathB::new("CalcB")
+  print(m.add(1, 2, 3))  -- self-less trait expects 2 args (a, b), 传 3 个 → typeck error
+end

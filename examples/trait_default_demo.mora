@@ -1,0 +1,30 @@
+-- v0.08.3: trait 默认实现 demo
+-- 测: trait 方法可在 trait 定义内提供 `= expr` 默认实现
+--      impl 可省略该方法，自动 fallback 到默认实现
+
+trait Greeter
+  fn hello(self, name: string) -> string = "Hi, " + name + "!"
+  fn bye(self, name: string) -> string = "Bye, " + name + "!"
+end
+
+-- English 只覆盖 hello，没实现 bye —— 应 fallback 到默认 "Hi, " + name + "!"
+impl Greeter for English
+  fn hello(self, name) = "Hello, " + name + "!"
+end
+
+-- Japanese 完全省略所有方法 —— 两个方法都走默认实现
+impl Greeter for Japanese
+end
+
+task main()
+  let en: dyn Greeter = Greeter::new("English")
+  let jp: dyn Greeter = Greeter::new("Japanese")
+  let r1 = en.hello("Mora")
+  let r2 = en.bye("Mora")
+  let r3 = jp.hello("Mora")
+  let r4 = jp.bye("Mora")
+  print("en.hello: " + r1)
+  print("en.bye:   " + r2)
+  print("jp.hello: " + r3)
+  print("jp.bye:   " + r4)
+end

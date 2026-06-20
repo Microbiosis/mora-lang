@@ -62,9 +62,11 @@ pub enum Type {
     HttpResponse,
     /// v0.06.6: MCP 服务器构建器
     McpServer,
+    /// v0.08: dyn trait 类型（名称、方法签名表）
+    Trait(String),
     /// 推断不出或用户未标注时的退路——不做严格检查
     Any,
-}
+}  // ← close pub enum Type
 
 impl Type {
     pub fn name(&self) -> &'static str {
@@ -93,6 +95,8 @@ impl Type {
             Type::HttpRequest => "http_request",
             Type::HttpResponse => "http_response",
             Type::McpServer => "mcp_server",
+            Type::Trait(_) => "trait",
+            // v0.08.5: Type::Struct 已删除，统一为 Type::Trait 注册
             Type::Any => "any",
         }
     }
@@ -117,6 +121,8 @@ impl Type {
             "http_request" => Type::HttpRequest,
             "http_response" => Type::HttpResponse,
             "mcp_server" => Type::McpServer,
+            // v0.08: dyn: 前缀 → Trait 类型
+            s if s.starts_with("dyn:") => Type::Trait(s[4..].to_string()),
             // 未知类型名 → Any（不报错；Mora 允许扩展类型）
             _ => Type::Any,
         }
@@ -131,6 +137,15 @@ impl Type {
         if matches!(self, Type::Result_(_, _)) && matches!(expected, Type::Result_(_, _)) {
             return true;
         }
+        // v0.08.1: Nil 兼容所有 trait（用于 dyn Trait = nil 占位）
+        if matches!(self, Type::Nil) {
+            return true;
+        }
+        // v0.08.5: Trait 兼容
+        if let (Type::Trait(a), Type::Trait(b)) = (self, expected) {
+            return a == b;
+        }
+        // v0.08.5: Type::Struct 已删除，统一为 Type::Trait 注册
         self == expected
     }
 }
@@ -285,8 +300,22 @@ pub struct TypeChecker {
     errors: Vec<TypeError>,
     /// 当前所在 task/closure 的返回类型 hint（None 表示未标注）
     current_return_hint: Option<Type>,
-    /// v0.05: 已注册的 route 名称（供 `let x = fast(p"...")` 推断为 String）
+    // v0.05: 已注册的 route 名称（供 `let x = fast(p"...")` 推断为 String）
     routes: std::collections::HashSet<String>,
+    // v0.08:  trait/impl 注册表
+    trait_registry: HashMap<String, TraitTypeDef>,
+    impl_registry: HashMap<(String, String), Vec<String>>,
+}
+
+/// v0.08: typeck 内使用的 trait 定义
+/// v0.08.4: 加 parents 字段实现 trait 继承
+#[derive(Debug, Clone)]
+struct TraitTypeDef {
+    name: String,
+    parents: Vec<String>,
+    /// (method_name, signature, has_default_impl, has_self)
+    /// v0.08.5 任务 1: has_self 表示 trait method 第一个参数是否为 `self`
+    methods: Vec<(String, Signature, bool, bool)>,
 }
 
 /// 任务/闭包签名
@@ -297,6 +326,32 @@ pub struct Signature {
 }
 
 impl TypeChecker {
+    /// v0.08.4: 递归收集 trait + 所有父 trait 的方法（去重，防止循环继承）
+    /// v0.08.5 任务 1: 返回 (name, sig, has_default, has_self) 4 元组
+    fn collect_trait_methods_recursive(
+        &self,
+        trait_name: &str,
+        visited: &mut std::collections::HashSet<String>,
+        out: &mut Vec<(String, Signature, bool, bool)>,
+    ) {
+        if visited.contains(trait_name) { return; }  // 防循环
+        visited.insert(trait_name.to_string());
+        let td = match self.trait_registry.get(trait_name) {
+            Some(td) => td,
+            None => return,  // 未知父 trait —— typeck 已报错过
+        };
+        // 先收集父 trait 的方法（深度优先，子覆盖父）
+        for parent in &td.parents {
+            self.collect_trait_methods_recursive(parent, visited, out);
+        }
+        // 再收集本 trait 的方法（同名覆盖父 trait 的）
+        for m in &td.methods {
+            // 去重：先移除同名旧项（来自父 trait）
+            out.retain(|(n, _, _, _)| n != &m.0);
+            out.push(m.clone());
+        }
+    }
+
     pub fn new() -> Self {
         let mut sigs = HashMap::new();
         // 内置函数签名
@@ -335,6 +390,9 @@ impl TypeChecker {
             errors: Vec::new(),
             current_return_hint: None,
             routes: std::collections::HashSet::new(),
+            // v0.08
+            trait_registry: std::collections::HashMap::new(),
+            impl_registry: std::collections::HashMap::new(),
         }
     }
 
@@ -355,6 +413,31 @@ impl TypeChecker {
             // v0.05: 收集 route 名称 —— `let x = fast(p"...")` 推断为 String
             if let Stmt::Route { name, .. } = stmt {
                 self.routes.insert(name.clone());
+            }
+            // v0.08.1: 收集 trait 定义
+            // v0.08.4: 记录 parent traits
+            if let Stmt::TraitDef { name, parents, methods, .. } = stmt {
+                let mut method_sigs = Vec::new();
+                for m in methods {
+                    let param_types: Vec<(String, Type)> = m.params.iter()
+                        .map(|(n, hint)| (n.clone(), hint.as_deref().map(Type::from_hint).unwrap_or(Type::Any)))
+                        .collect();
+                    let ret = m.return_type.as_deref().map(Type::from_hint).unwrap_or(Type::Any);
+                    let has_default = !m.body.is_empty();
+                    // v0.08.5 任务 1: 第一个参数名为 `self` 视为有 self
+                    let has_self = m.params.first().map(|(n, _)| n == "self").unwrap_or(false);
+                    method_sigs.push((m.name.clone(), Signature { params: param_types, return_type: ret }, has_default, has_self));
+                }
+                self.trait_registry.insert(name.clone(), TraitTypeDef {
+                    name: name.clone(),
+                    parents: parents.clone(),
+                    methods: method_sigs,
+                });
+            }
+            // v0.08.1: 收集 impl 关联 (for_type, trait_name) → methods
+            if let Stmt::ImplDef { trait_name, for_type, methods, .. } = stmt {
+                let method_names: Vec<String> = methods.iter().map(|m| m.name.clone()).collect();
+                self.impl_registry.insert((for_type.clone(), trait_name.clone()), method_names);
             }
         }
     }
@@ -678,6 +761,60 @@ impl TypeChecker {
                     ));
                 }
             }
+            // v0.08: trait/impl — 第一趟 collect_signatures 已注册, 这里做完整性检查
+            Stmt::TraitDef { name, methods, .. } => {
+                // 确保方法签名无重复
+                let mut seen = std::collections::HashSet::new();
+                for m in methods {
+                    if !seen.insert(&m.name) {
+                        self.errors.push(TypeError::from_span(&m.span,
+                            format!("trait '{}': duplicate method '{}'", name, m.name)));
+                    }
+                }
+            }
+            Stmt::ImplDef { trait_name, for_type, methods, span, .. } => {
+                // v0.08.4: 验证 trait 存在，然后递归收集 trait + 所有父 trait 的方法
+                if !self.trait_registry.contains_key(trait_name) {
+                    self.errors.push(TypeError::from_span(span,
+                        format!("impl: trait '{}' not defined", trait_name)));
+                } else {
+                    let mut all_methods: Vec<(String, Signature, bool, bool)> = Vec::new();
+                    let mut visited = std::collections::HashSet::new();
+                    self.collect_trait_methods_recursive(trait_name, &mut visited, &mut all_methods);
+                    let impl_methods = methods.clone();
+                    for (tm_name, tm_sig, tm_has_default, _tm_has_self) in &all_methods {
+                        let impl_m = impl_methods.iter().find(|m| m.name == *tm_name);
+                        if impl_m.is_none() {
+                            // v0.08.3: 如果 trait method 有默认实现，impl 可省略
+                            if !*tm_has_default {
+                                self.errors.push(TypeError::from_span(span,
+                                    format!("impl '{}' for '{}': missing method '{}'", trait_name, for_type, tm_name)));
+                            }
+                            continue;
+                        }
+                        // 校验参数个数和类型 hint
+                        let im = impl_m.unwrap();
+                        if im.params.len() != tm_sig.params.len() {
+                            self.errors.push(TypeError::from_span(&im.span,
+                                format!("impl '{}' for '{}': method '{}' expects {} params, got {}",
+                                    trait_name, for_type, tm_name, tm_sig.params.len(), im.params.len())));
+                        }
+                        // 递归 typeck 方法体
+                        symbols.push_scope();
+                        for (pname, phint) in &im.params {
+                            let pty = phint.as_deref().map(Type::from_hint).unwrap_or(Type::Any);
+                            symbols.define(pname.clone(), pty);
+                        }
+                        for s in &im.body { self.check_stmt(s, symbols); }
+                        symbols.pop_scope();
+                    }
+                    // v0.08.5: 注册 impl type 为 Type::Trait(trait_name)
+                    //   之前用 Type::Struct(name, [trait_name]) 但 interpreter 完全不消费 Struct
+                    //   现在直接注册为 Trait 类型——dispatch 时 receiver 类型若是 Trait(trait_name)
+                    //   表示它实现了这个 trait
+                    symbols.define(for_type.clone(), Type::Trait(trait_name.clone()));
+                }
+            }
         }
     }
 
@@ -742,6 +879,33 @@ impl TypeChecker {
                 // v0.06: AiConfig 链式参数校验
                 if matches!(ot, Type::AiConfig) {
                     check_ai_config_method(method, args, &mut self.errors, span);
+                }
+                // v0.08.1: dyn trait dispatch — 从 trait_registry 查方法返回类型
+                if let Type::Trait(tname) = &ot {
+                    // v0.08.4: 递归收集 trait + 父 trait 的方法
+                    let mut all_methods: Vec<(String, Signature, bool, bool)> = Vec::new();
+                    let mut visited = std::collections::HashSet::new();
+                    self.collect_trait_methods_recursive(tname, &mut visited, &mut all_methods);
+                    for (mname, sig, _has_default, has_self) in &all_methods {
+                        if mname == method {
+                            // v0.08.5 任务 1: self-having 时减 1（去掉 self 参数）
+                            //                self-less 时不减（用户传的就是全部 args）
+                            let expected = if *has_self { sig.params.len().saturating_sub(1) } else { sig.params.len() };
+                            if args.len() != expected {
+                                self.errors.push(TypeError::from_span(
+                                    span,
+                                    format!("trait method '{}.{}' expects {} args, got {}",
+                                        tname, method, expected, args.len()),
+                                ));
+                            }
+                            return sig.return_type.clone();
+                        }
+                    }
+                    self.errors.push(TypeError::from_span(
+                        span,
+                        format!("trait '{}' has no method '{}'", tname, method),
+                    ));
+                    return Type::Any;
                 }
                 method_return_type(&ot, method)
             }
@@ -845,6 +1009,8 @@ impl TypeChecker {
             }
             // v0.07.1: NamespaceRef — IDENT::IDENT, typeck as Any for now
             Expr::NamespaceRef { .. } => Type::Any,
+            // v0.08.5: DynTrait — dyn TraitName type hint，对齐 let x: dyn Trait 解析为 Type::Trait(name)
+            Expr::DynTrait { trait_name, .. } => Type::Trait(trait_name.clone()),
         }
     }
 
@@ -1035,6 +1201,7 @@ fn expr_debug_line(expr: &Expr) -> usize {
         | Expr::AiModelCall { span, .. } => span.line,
         Expr::Question { span, .. } => span.line,
         Expr::NamespaceRef { span, .. } => span.line,
+        Expr::DynTrait { span, .. } => span.line,
         Expr::Literal(lit) => literal_debug_line(lit),
         Expr::Variable(_, span) | Expr::Grouping(_, span) => span.line,
     }
@@ -1068,6 +1235,7 @@ fn expr_to_span(expr: &Expr) -> Option<Span> {
         | Expr::AiModelCall { span, .. } => Some(*span),
         Expr::Question { span, .. } => Some(*span),
         Expr::NamespaceRef { span, .. } => Some(*span),
+        Expr::DynTrait { span, .. } => Some(*span),
         Expr::Literal(lit) => Some(literal_to_span(lit)),
         Expr::Variable(_, span) | Expr::Grouping(_, span) => Some(*span),
     }
@@ -1080,7 +1248,7 @@ fn literal_to_span(lit: &Literal) -> Span {
     }
 }
 
-/// 递归检查 body 里是否有 return 语句（包括嵌套 if/for/try 里）
+/// 递归检查 body 里是否有 return 语句（包括嵌套 if/for 里）
 fn body_has_return(stmts: &[Stmt]) -> bool {
     for stmt in stmts {
         match stmt {
@@ -1102,6 +1270,11 @@ fn body_has_return(stmts: &[Stmt]) -> bool {
             Stmt::With { body, .. } | Stmt::StreamFor { body, .. } | Stmt::ToolDef { body, .. } |
             Stmt::Observe { body, .. } | Stmt::Span { body, .. } => {
                 if body_has_return(body) { return true; }
+            }
+            Stmt::ImplDef { methods, .. } => {
+                for m in methods {
+                    if body_has_return(&m.body) { return true; }
+                }
             }
             _ => {}
         }

@@ -16,9 +16,9 @@ fn main() {
     // --version / --help 不显示 banner
     if args.len() >= 2 {
         match args[1].as_str() {
-            "--version" | "-v" => { println!("Mora v0.07"); return; }
+            "--version" | "-v" => { println!("Mora v0.08"); return; }
             "--help" | "-h" => {
-                println!("Mora v0.07 — AI 原生 + 显式 API");
+                println!("Mora v0.08 — trait 系统 + 泛型");
                 println!();
                 println!("Usage:");
                 println!("  mora <file.mora>        Run a script (auto-detect serve as http/mcp/repl)");
@@ -55,6 +55,14 @@ fn main() {
                 process::exit(1);
             }
             install_package(&args[2]);
+        }
+        // v0.08.5 fix: `mora run <file>` 子命令——之前 `run` 被当作文件名
+        "run" => {
+            if args.len() < 3 {
+                eprintln!("Usage: mora run <file.mora>");
+                process::exit(1);
+            }
+            run_file(&args[2]);
         }
         _ => run_file(&args[1]),
     }
@@ -135,7 +143,7 @@ fn print_banner() {
     // v0.06.5: MORA_AI_MODEL 不再作为全局默认；模型路由走 `route` 块 + `with` 块
     let base_url = env::var("MORA_AI_BASE_URL").unwrap_or_else(|_| "https://api.openai.com/v1".to_string());
 
-    println!("Mora v0.07");
+    println!("Mora v0.08");
     if has_openai_key {
         println!("  AI: real API (endpoint: {})", base_url);
     } else {
@@ -143,9 +151,9 @@ fn print_banner() {
     }
     println!("  AI 原语: p\"...\" / with / stream / tool / ai.chat / AiConfig / Result<?>");
     println!("  显式 API: Router::new() / McpServer::new() + route + observe / span");
+    println!("  Trait 系统: trait / impl / dyn / ::new() / 继承 / 默认实现");
     println!("  Built-in: web.fetch / json.* / file.* / typeck (必走) / mora-lsp");
-    println!("  v0.07: 移除 try-catch / serve as 语法糖，只保留显式 API");
-    println!("  ⚠  不兼容 v0.03 builtin (ai.chat/stream/tool/budget/route/usage/embed/cosine/search/memory.* 均报 Unknown method)");
+    println!("  ⚠  不兼容 v0.03 builtin");
     println!();
 }
 

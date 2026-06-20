@@ -19,7 +19,7 @@ impl Span {
 #[derive(Debug, Clone, PartialEq)]
 #[allow(dead_code)]
 pub enum Stmt {
-    Let { name: String, type_hint: Option<String>, init: Expr, exported: bool, span: Span },
+    Let { name: String, type_hint: Option<String>, init: Expr, exported: bool, is_any: bool, span: Span },
     Assign { name: String, value: Expr, span: Span },
     IndexAssign { object: Expr, index: Expr, value: Expr, span: Span },
     TaskDef { name: String, params: Vec<(String, Option<String>)>, return_type: Option<String>, body: Vec<Stmt>, exported: bool, span: Span },
@@ -44,11 +44,14 @@ pub enum Stmt {
     ToolDef { name: String, params: Vec<(String, Option<String>)>, return_type: Option<String>, body: Vec<Stmt>, exported: bool, span: Span },
     Break { span: Span },
     Continue { span: Span },
-    // v0.04 终态: 云服务原生
+    // v0.04: 云服务原生
     Serve { protocol: ServeProtocol, routes: Vec<RouteDecl>, body: Vec<Stmt>, span: Span },
     Route { name: String, target: Expr, span: Span },
     Observe { config: ObserveConfig, body: Vec<Stmt>, span: Span },
     Span { name: String, attributes: Vec<(String, Expr)>, body: Vec<Stmt>, span: Span },
+    /// v0.04.0 终态补: 显式 token 计数（RFC §2.4 / §3.3）
+    /// 语义: 累加到当前 TraceCollector，不触发预算超限
+    RecordTokens { input: Expr, output: Expr, span: Span },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -93,7 +96,7 @@ impl HttpMethod {
 #[derive(Debug, Clone, PartialEq)]
 pub enum RouteDecl {
     HttpRoute { method: HttpMethod, path: String, handler: Expr },
-    // v0.04 终态 Slice 5: ToolEntry 加 params + return_type 字段用于生成 JSON Schema
+    // v0.04 Slice 5: ToolEntry 加 params + return_type 字段用于生成 JSON Schema
     ToolEntry { name: String, params: Vec<(String, Option<String>)>, return_type: Option<String>, handler: Expr },
 }
 
@@ -118,8 +121,17 @@ pub enum Expr {
     Grouping(Box<Expr>, Span),
     // v0.04.0: AI 原语
     Prompt { parts: Vec<Expr>, span: Span },
-    // v0.04 终态: route 调用
+    // v0.04: route 调用
     RouteCall { name: String, args: Vec<Box<Expr>>, span: Span },
+    // v0.04补: ai_model(...) 路由元数据表达式（RFC §2.3）
+    // 解析: ai_model("model-name", temperature: 0.7, max_tokens: 2000, system: "...")
+    AiModelCall {
+        model: Box<Expr>,
+        temperature: Option<Box<Expr>>,
+        max_tokens: Option<Box<Expr>>,
+        system: Option<Box<Expr>>,
+        span: Span,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]

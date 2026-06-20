@@ -34,6 +34,31 @@ fn position_to_offset(text: &str, line: usize, col: usize) -> usize {
     text.len()
 }
 
+/// 取 cursor 所在行 cursor 之前的文本（用于上下文感知补全）
+fn get_line_prefix(text: &str, line: usize, col: usize) -> String {
+    let mut current_line = 0;
+    let mut result = String::new();
+    for c in text.chars() {
+        if current_line == line {
+            result.push(c);
+            if result.len() >= col { break; }
+        }
+        if c == '\n' { current_line += 1; }
+    }
+    result
+}
+
+/// 创建 LSP completion item
+fn make_completion(label: &str, kind: f64, detail: Option<&str>) -> Value {
+    let mut m = BTreeMap::new();
+    m.insert("label".to_string(), Value::String_(label.to_string()));
+    m.insert("kind".to_string(), Value::Number(kind));
+    if let Some(d) = detail {
+        m.insert("detail".to_string(), Value::String_(d.to_string()));
+    }
+    Value::Object(m)
+}
+
 /// 在某 offset 取一个标识符（变量名）
 fn ident_at_offset(text: &str, offset: usize) -> Option<String> {
     let bytes = text.as_bytes();
@@ -116,6 +141,12 @@ fn collect_references(stmts: &[Stmt], name: &str, refs: &mut Vec<(usize, usize)>
             }
             Expr::RouteCall { args, .. } => {
                 for a in args { walk_expr(a, name, refs); }
+            }
+            Expr::AiModelCall { model, temperature, max_tokens, system, .. } => {
+                walk_expr(model, name, refs);
+                if let Some(t) = temperature { walk_expr(t, name, refs); }
+                if let Some(n) = max_tokens { walk_expr(n, name, refs); }
+                if let Some(s) = system { walk_expr(s, name, refs); }
             }
             Expr::Call { callee, args, span, .. } => {
                 if callee == name {
@@ -250,13 +281,86 @@ pub fn completion(docs: &HashMap<String, DocumentState>, params: &Value) -> Valu
         Some(s) => s,
         None => return Value::Array(vec![]),
     };
-    let (_text, stmts) = match parsed_doc(docs, uri) {
+    let pos = match params.get("position") {
+        Some(p) => p,
+        None => return Value::Array(vec![]),
+    };
+    let line_num = pos.get("line").and_then(|n| n.as_i64()).unwrap_or(0) as usize;
+    let col = pos.get("character").and_then(|n| n.as_i64()).unwrap_or(0) as usize;
+
+    let (text, stmts) = match parsed_doc(docs, uri) {
         Some(t) => t,
         None => return Value::Array(vec![]),
     };
 
+    // 取当前行 cursor 之前的文本
+    let prefix = get_line_prefix(&text, line_num, col);
+
     let mut items: Vec<Value> = Vec::new();
     let mut seen: BTreeSet<String> = BTreeSet::new();
+
+    // ── v0.05: 上下文感知 AI 原语补全 ──────────────────────────
+
+    // `with ` → 补 config keys
+    if prefix.ends_with("with ") || prefix == "with" {
+        for key in ["model", "temperature", "max_tokens", "budget", "system"] {
+            let label = format!("{} = ", key);
+            if seen.insert(label.clone()) {
+                items.push(make_completion(&label, 14.0, Some(&format!("AI config: {} = ...", key))));
+            }
+        }
+    }
+
+    // `serve as ` → 补 protocol
+    if prefix.ends_with("serve as ") || prefix == "serve as" {
+        for proto in ["http", "mcp", "repl", "stdio"] {
+            if seen.insert(proto.to_string()) {
+                let detail = match proto {
+                    "http" => "HTTP REST server (serve as http on port 3000 do ... end)",
+                    "mcp" => "MCP tool server (serve as mcp do ... end)",
+                    "repl" => "Interactive REPL (serve as repl do ... end)",
+                    "stdio" => "Stdio echo (serve as stdio do ... end)",
+                    _ => "",
+                };
+                items.push(make_completion(proto, 14.0, Some(detail)));
+            }
+        }
+    }
+
+    // `observe ` → 补 config
+    if prefix.ends_with("observe ") || prefix == "observe" {
+        for cfg in ["trace", "metrics", "otel"] {
+            if seen.insert(cfg.to_string()) {
+                let detail = match cfg {
+                    "trace" => "Enable trace (observe trace do ... end)",
+                    "metrics" => "Enable metrics (observe metrics do ... end)",
+                    "otel" => "OTEL export (observe otel endpoint \"http://...\" do ... end)",
+                    _ => "",
+                };
+                items.push(make_completion(cfg, 14.0, Some(detail)));
+            }
+        }
+    }
+
+    // `ai_model(` → 补 keyword args
+    if prefix.ends_with("ai_model(") || prefix.ends_with("ai_model( ") {
+        for kw in ["temperature", "max_tokens", "system"] {
+            if seen.insert(kw.to_string()) {
+                items.push(make_completion(&format!("{}: ", kw), 14.0, Some(&format!("AI model param: {}", kw))));
+            }
+        }
+    }
+
+    // `p"` → 补 prompt 模板提示
+    if prefix.ends_with("p\"") {
+        for tmpl in ["p\"\"", "p\"{variable}\"", "p\"summarize: {text}\""] {
+            if seen.insert(tmpl.to_string()) {
+                items.push(make_completion(tmpl, 15.0, Some("Prompt template")));
+            }
+        }
+    }
+
+    // ── 通用关键字补全 ─────────────────────────────────────────
 
     // 1. 关键字
     for kw in ["let", "task", "if", "then", "end", "for", "in", "try", "catch",
@@ -264,31 +368,25 @@ pub fn completion(docs: &HashMap<String, DocumentState>, params: &Value) -> Valu
                "save", "load", "import", "parallel", "read", "write", "append",
                "read_bytes", "write_bytes", "into", "export",
                // v0.04.0: AI 原语
-               "stream", "tool", "break", "continue"] {
+               "stream", "tool", "break", "continue",
+               // v0.05: 云服务原语
+               "serve", "route", "observe", "span", "tags",
+               "record_tokens", "ai_model"] {
         if seen.insert(kw.to_string()) {
-            let mut m = BTreeMap::new();
-            m.insert("label".to_string(), Value::String_(kw.to_string()));
-            m.insert("kind".to_string(), Value::Number(14.0));  // Keyword
-            items.push(Value::Object(m));
+            items.push(make_completion(kw, 14.0, None));
         }
     }
 
-    // 2. 局部变量（所有 let 名字）
+    // 2. 局部变量
     for stmt in &stmts {
         if let Stmt::Let { name, .. } = stmt {
             if seen.insert(name.clone()) {
-                let mut m = BTreeMap::new();
-                m.insert("label".to_string(), Value::String_(name.clone()));
-                m.insert("kind".to_string(), Value::Number(6.0));  // Variable
-                items.push(Value::Object(m));
+                items.push(make_completion(&name, 6.0, None));
             }
         }
         if let Stmt::For { var, .. } = stmt {
             if seen.insert(var.clone()) {
-                let mut m = BTreeMap::new();
-                m.insert("label".to_string(), Value::String_(var.clone()));
-                m.insert("kind".to_string(), Value::Number(6.0));
-                items.push(Value::Object(m));
+                items.push(make_completion(&var, 6.0, None));
             }
         }
     }
@@ -297,21 +395,29 @@ pub fn completion(docs: &HashMap<String, DocumentState>, params: &Value) -> Valu
     for stmt in &stmts {
         if let Stmt::TaskDef { name, .. } = stmt {
             if seen.insert(name.clone()) {
-                let mut m = BTreeMap::new();
-                m.insert("label".to_string(), Value::String_(name.clone()));
-                m.insert("kind".to_string(), Value::Number(3.0));  // Function
-                items.push(Value::Object(m));
+                items.push(make_completion(&name, 3.0, None));
             }
         }
     }
 
-    // 4. 内置对象 / builtin 方法
+    // 4. 内置对象
     for builtin in ["ai", "web", "json", "file", "memory", "agent"] {
         if seen.insert(builtin.to_string()) {
-            let mut m = BTreeMap::new();
-            m.insert("label".to_string(), Value::String_(builtin.to_string()));
-            m.insert("kind".to_string(), Value::Number(9.0));  // Module
-            items.push(Value::Object(m));
+            items.push(make_completion(builtin, 9.0, None));
+        }
+    }
+
+    // 5. AI 原语关键字 (补充)
+    for kw in ["p\"", "ai_model(", "fast(", "deep("] {
+        if seen.insert(kw.to_string()) {
+            let detail = match kw {
+                "p\"" => "Prompt expression",
+                "ai_model(" => "Route model declaration",
+                "fast(" => "Fast route call",
+                "deep(" => "Deep route call",
+                _ => "",
+            };
+            items.push(make_completion(kw, 14.0, Some(detail)));
         }
     }
 
@@ -893,7 +999,8 @@ fn end_stmt_span_line(stmt: &Stmt) -> usize {
         | Stmt::Serve { span, .. }
         | Stmt::Route { span, .. }
         | Stmt::Observe { span, .. }
-        | Stmt::Span { span, .. } => span.line,
+        | Stmt::Span { span, .. }
+        | Stmt::RecordTokens { span, .. } => span.line,
         Stmt::Expr(_) => 0,
     }
 }

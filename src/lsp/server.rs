@@ -286,14 +286,41 @@ impl Server {
         let stmts = Parser::new(tokens).parse();
         let errs = typeck::check_program(&stmts);
         errs.into_iter().map(|e| {
-            // 单点错误：end = line/line + 1
+            // v0.05: line/column 都是 1-based (typeck)，LSP 是 0-based
+            //   column 默认 0 表示"未知"，减 1 后 = -1 → saturating_sub 保证不溢出
+            let line_0 = e.line.saturating_sub(1);
+            let col_0 = e.column.saturating_sub(1);
+            // v0.05: 把 expected/actual/hint 拼到 message 里（LSP 暂不支持结构化字段）
+            let mut message = e.message.clone();
+            if e.expected.is_some() || e.actual.is_some() || e.hint.is_some() {
+                message.push('\n');
+                if let Some(exp) = &e.expected {
+                    message.push_str(&format!("  expected: {}\n", exp));
+                }
+                if let Some(act) = &e.actual {
+                    message.push_str(&format!("  actual:   {}\n", act));
+                }
+                if let Some(hint) = &e.hint {
+                    message.push_str(&format!("  hint:     {}\n", hint));
+                }
+                // 去掉末尾换行
+                message = message.trim_end_matches('\n').to_string();
+            }
+            // v0.05: end 列号策略
+            //   - column > 0 → 精确定位 (col_0 + 1)
+            //   - column = 0 (未知) → 整行标记 (end_column = 1，让 VS Code 高亮行首)
+            let end_col_0 = if e.column == 0 {
+                1
+            } else {
+                col_0 + 1
+            };
             Diagnostic {
-                line: e.line.saturating_sub(1),       // typeck 是 1-based；LSP 是 0-based
-                column: 0,
-                end_line: e.line.saturating_sub(1),
-                end_column: 100,                     // 占位：实际位置需要更细
-                severity: 1,                          // Error
-                message: e.message,
+                line: line_0,
+                column: col_0,
+                end_line: line_0,
+                end_column: end_col_0,
+                severity: 1,
+                message,
                 source: "mora-typeck".to_string(),
             }
         }).collect()

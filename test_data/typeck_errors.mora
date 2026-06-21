@@ -173,3 +173,22 @@ task main()
   let m: dyn PureMathB = PureMathB::new("CalcB")
   print(m.add(1, 2, 3))  -- self-less trait expects 2 args (a, b), 传 3 个 → typeck error
 end
+
+-- v0.09: trait 泛型错误 case
+-- Case 28: trait 泛型参数个数不匹配
+trait ContainerA<T>
+  fn get(self) -> T
+end
+
+impl ContainerA for BoxedA  -- 缺 <T>，trait expects 1 generic
+  fn get(self) = 1
+end
+
+-- Case 29: impl 泛型参数过多
+trait ContainerB<T>
+  fn get(self) -> T
+end
+
+impl ContainerB<number, string> for BoxedB  -- trait expects 1 generic, 给 2 个
+  fn get(self) = 1
+end

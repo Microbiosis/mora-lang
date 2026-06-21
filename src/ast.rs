@@ -51,8 +51,28 @@ pub enum Stmt {
     /// 语义: 累加到当前 TraceCollector，不触发预算超限
     RecordTokens { input: Expr, output: Expr, span: Span },
     // v0.08: trait 系统
-    TraitDef { name: String, parents: Vec<String>, methods: Vec<TraitMethod>, span: Span },
-    ImplDef { trait_name: String, for_type: String, methods: Vec<FnDef>, span: Span },
+    TraitDef { name: String, generics: Vec<GenericParam>, parents: Vec<String>, methods: Vec<TraitMethod>, span: Span },
+    ImplDef {
+        generics: Vec<GenericParam>,
+        trait_generics: Vec<String>,
+        trait_name: String,
+        for_type: String,
+        for_generics: Vec<String>,
+        where_clause: Vec<GenericParam>,
+        methods: Vec<FnDef>,
+        span: Span,
+    },
+}
+
+/// v0.09: 泛型参数（trait/impl/method 的类型参数）
+///   例如 `trait Foo<T>` / `impl<T> Foo<T> for Bar` 中的 `T`
+///   v0.09 简化: bound 是 trait 名（如 "Comparable"），v0.10 改为 Vec<TraitRef>
+#[derive(Debug, Clone, PartialEq)]
+pub struct GenericParam {
+    pub name: String,
+    /// v0.09: bound 作为字符串（trait 名），v0.10 强化为结构化
+    pub bound: Option<String>,
+    pub span: Span,
 }
 
 /// v0.08: trait 方法签名（v0.08.3: body 可选——非空表示默认实现）
@@ -63,6 +83,8 @@ pub struct TraitMethod {
     pub return_type: Option<String>,
     /// v0.08.3: 默认实现 body。空 = 纯签名；非空 = 默认实现（impl 可省略）
     pub body: Vec<Stmt>,
+    /// v0.09: trait method 自己的泛型参数（少见，类比 Rust trait 默认方法）
+    pub generics: Vec<GenericParam>,
     pub span: Span,
 }
 
@@ -113,7 +135,7 @@ pub enum Expr {
     // v0.07.1: NamespaceRef — IDENT::IDENT 解析, 如 Router::new / McpServer::new
     NamespaceRef { namespace: String, name: String, span: Span },
     // v0.08: dyn trait 类型标注
-    DynTrait { trait_name: String, span: Span },
+    DynTrait { generics: Vec<String>, trait_name: String, span: Span },
 }
 
 #[derive(Debug, Clone, PartialEq)]

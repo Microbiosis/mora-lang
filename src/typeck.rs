@@ -62,8 +62,12 @@ pub enum Type {
     HttpResponse,
     /// v0.06.6: MCP 服务器构建器
     McpServer,
-    /// v0.08: dyn trait 类型（名称、方法签名表）
-    Trait(String),
+    /// v0.08: dyn trait 类型（名称）
+    /// v0.09: 携带泛型参数列表（如 `dyn Container<number>`）
+    Trait { name: String, generics: Vec<Type> },
+    /// v0.09: 具体类型（替代 v0.08.5 删的 Type::Struct）
+    ///   携带泛型参数 + 实现的 trait 列表
+    Concrete { name: String, generics: Vec<Type>, traits: Vec<Type> },
     /// 推断不出或用户未标注时的退路——不做严格检查
     Any,
 }  // ← close pub enum Type
@@ -95,7 +99,8 @@ impl Type {
             Type::HttpRequest => "http_request",
             Type::HttpResponse => "http_response",
             Type::McpServer => "mcp_server",
-            Type::Trait(_) => "trait",
+            Type::Trait { .. } => "trait",
+            Type::Concrete { .. } => "concrete",
             // v0.08.5: Type::Struct 已删除，统一为 Type::Trait 注册
             Type::Any => "any",
         }
@@ -122,7 +127,22 @@ impl Type {
             "http_response" => Type::HttpResponse,
             "mcp_server" => Type::McpServer,
             // v0.08: dyn: 前缀 → Trait 类型
-            s if s.starts_with("dyn:") => Type::Trait(s[4..].to_string()),
+            // v0.09: dyn:Foo<number> → Trait { name: "Foo", generics: [Number] }
+            s if s.starts_with("dyn:") => {
+                let rest = &s[4..];
+                if let Some(lt) = rest.find('<') {
+                    let name = rest[..lt].to_string();
+                    let generics_str = &rest[lt+1..rest.len()-1];
+                    let generics: Vec<Type> = if generics_str.is_empty() {
+                        vec![]
+                    } else {
+                        generics_str.split(',').map(|s| Type::from_hint(s.trim())).collect()
+                    };
+                    Type::Trait { name, generics }
+                } else {
+                    Type::Trait { name: rest.to_string(), generics: vec![] }
+                }
+            }
             // 未知类型名 → Any（不报错；Mora 允许扩展类型）
             _ => Type::Any,
         }
@@ -142,8 +162,13 @@ impl Type {
             return true;
         }
         // v0.08.5: Trait 兼容
-        if let (Type::Trait(a), Type::Trait(b)) = (self, expected) {
-            return a == b;
+        // v0.09: 含泛型比较（name 一致 + generics 个数一致 + 元素兼容）
+        if let (Type::Trait { name: a, generics: ga }, Type::Trait { name: b, generics: gb }) = (self, expected) {
+            if a != b || ga.len() != gb.len() { return false; }
+            for (x, y) in ga.iter().zip(gb.iter()) {
+                if !x.compatible_with(y) { return false; }
+            }
+            return true;
         }
         // v0.08.5: Type::Struct 已删除，统一为 Type::Trait 注册
         self == expected
@@ -310,9 +335,12 @@ pub struct TypeChecker {
 /// v0.08: typeck 内使用的 trait 定义
 /// v0.08.4: 加 parents 字段实现 trait 继承
 #[derive(Debug, Clone)]
+// TraitTypeDef 已有 Debug + Clone derive（impl 完整性检查用 tdef.cloned()）
 struct TraitTypeDef {
     name: String,
     parents: Vec<String>,
+    /// v0.09: trait 自身的泛型参数列表（如 `trait Container<T>` 的 `["T"]`）
+    generics: Vec<String>,
     /// (method_name, signature, has_default_impl, has_self)
     /// v0.08.5 任务 1: has_self 表示 trait method 第一个参数是否为 `self`
     methods: Vec<(String, Signature, bool, bool)>,
@@ -416,7 +444,9 @@ impl TypeChecker {
             }
             // v0.08.1: 收集 trait 定义
             // v0.08.4: 记录 parent traits
-            if let Stmt::TraitDef { name, parents, methods, .. } = stmt {
+            // v0.09: 记录 trait 自身的泛型参数列表
+            if let Stmt::TraitDef { name, generics, parents, methods, .. } = stmt {
+                let trait_generics: Vec<String> = generics.iter().map(|g| g.name.clone()).collect();
                 let mut method_sigs = Vec::new();
                 for m in methods {
                     let param_types: Vec<(String, Type)> = m.params.iter()
@@ -430,14 +460,26 @@ impl TypeChecker {
                 }
                 self.trait_registry.insert(name.clone(), TraitTypeDef {
                     name: name.clone(),
+                    generics: trait_generics,  // v0.09
                     parents: parents.clone(),
                     methods: method_sigs,
                 });
             }
             // v0.08.1: 收集 impl 关联 (for_type, trait_name) → methods
-            if let Stmt::ImplDef { trait_name, for_type, methods, .. } = stmt {
+            // v0.09: 加 trait_generics 字段 + 泛型参数个数检查
+            if let Stmt::ImplDef { trait_name, trait_generics, for_type, methods, span, .. } = stmt {
                 let method_names: Vec<String> = methods.iter().map(|m| m.name.clone()).collect();
                 self.impl_registry.insert((for_type.clone(), trait_name.clone()), method_names);
+                // v0.09: trait 泛型参数个数检查（仅检查 trait 声明的 generics 个数）
+                if let Some(tdef) = self.trait_registry.get(trait_name).cloned() {
+                    let expected = tdef.generics.len();
+                    let actual = trait_generics.len();
+                    if expected != actual {
+                        self.errors.push(TypeError::from_span(span,
+                            format!("impl '{}' for '{}': trait expects {} generics, got {}",
+                                trait_name, for_type, expected, actual)));
+                    }
+                }
             }
         }
     }
@@ -772,7 +814,18 @@ impl TypeChecker {
                     }
                 }
             }
-            Stmt::ImplDef { trait_name, for_type, methods, span, .. } => {
+            // v0.09: 解构含 5 个新字段
+            Stmt::ImplDef { trait_name, trait_generics, for_type, for_generics: _, where_clause: _, methods, span, .. } => {
+                // v0.09: trait 泛型参数个数检查（先于完整性检查）
+                if let Some(tdef) = self.trait_registry.get(trait_name).cloned() {
+                    let expected = tdef.generics.len();
+                    let actual = trait_generics.len();
+                    if expected != actual {
+                        self.errors.push(TypeError::from_span(span,
+                            format!("impl '{}' for '{}': trait expects {} generics, got {}",
+                                trait_name, for_type, expected, actual)));
+                    }
+                }
                 // v0.08.4: 验证 trait 存在，然后递归收集 trait + 所有父 trait 的方法
                 if !self.trait_registry.contains_key(trait_name) {
                     self.errors.push(TypeError::from_span(span,
@@ -812,7 +865,8 @@ impl TypeChecker {
                     //   之前用 Type::Struct(name, [trait_name]) 但 interpreter 完全不消费 Struct
                     //   现在直接注册为 Trait 类型——dispatch 时 receiver 类型若是 Trait(trait_name)
                     //   表示它实现了这个 trait
-                    symbols.define(for_type.clone(), Type::Trait(trait_name.clone()));
+                    // v0.09: 加空 generics（无泛型实例化）
+                    symbols.define(for_type.clone(), Type::Trait { name: trait_name.clone(), generics: vec![] });
                 }
             }
         }
@@ -881,7 +935,8 @@ impl TypeChecker {
                     check_ai_config_method(method, args, &mut self.errors, span);
                 }
                 // v0.08.1: dyn trait dispatch — 从 trait_registry 查方法返回类型
-                if let Type::Trait(tname) = &ot {
+                // v0.09: 解构 Type::Trait { name, generics }
+                if let Type::Trait { name: tname, .. } = &ot {
                     // v0.08.4: 递归收集 trait + 父 trait 的方法
                     let mut all_methods: Vec<(String, Signature, bool, bool)> = Vec::new();
                     let mut visited = std::collections::HashSet::new();
@@ -1010,7 +1065,8 @@ impl TypeChecker {
             // v0.07.1: NamespaceRef — IDENT::IDENT, typeck as Any for now
             Expr::NamespaceRef { .. } => Type::Any,
             // v0.08.5: DynTrait — dyn TraitName type hint，对齐 let x: dyn Trait 解析为 Type::Trait(name)
-            Expr::DynTrait { trait_name, .. } => Type::Trait(trait_name.clone()),
+            // v0.09: 加空 generics（trait 表达式本身不带泛型标注）
+            Expr::DynTrait { trait_name, .. } => Type::Trait { name: trait_name.clone(), generics: vec![] },
         }
     }
 

@@ -26,6 +26,8 @@ pub enum TokenType {
     ColonColon,
     // v0.08: trait / impl / dyn / Self
     Trait, Impl, Dyn, Self_,
+    // v0.09: where 子句关键字（trait/impl 末尾的约束）
+    Where,
     LParen, RParen, LBracket, RBracket, LBrace, RBrace, Dot, Comma, Colon,
     Newline,
     EOF,
@@ -312,6 +314,7 @@ impl Lexer {
             // v0.08: trait 系统
             "trait" => TokenType::Trait,
             "impl" => TokenType::Impl,
+            "where" => TokenType::Where,
             "dyn" => TokenType::Dyn,
             "Self" => TokenType::Self_,
             _ => TokenType::Identifier(value),

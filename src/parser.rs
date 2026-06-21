@@ -43,13 +43,18 @@ impl Parser {
         let name = self.consume_identifier("Expected variable name after 'let'");
         // v0.05: 互斥语法 —— `:` (类型 hint) 或 `:=` (显式 Any)
         // v0.08: 支持 `let x: dyn Trait = expr`
+        // v0.09: 支持 `let x: dyn Trait<T> = expr`（泛型 trait）
         let (type_hint, is_any) = if self.match_token(&[TokenType::Walrus]) {
             (None, true)
         } else if self.match_token(&[TokenType::Colon]) {
             // 检查是否是 dyn Trait
             let hint = if self.match_token(&[TokenType::Dyn]) {
                 let tname = self.consume_identifier("Expected trait name after 'dyn'");
-                format!("dyn:{}", tname)
+                // v0.09: 解析泛型 `<T, U>`（如果存在）
+                let generics_suffix = if self.check(&TokenType::Less) {
+                    self.parse_type_list_to_string()
+                } else { String::new() };
+                format!("dyn:{}{}", tname, generics_suffix)
             } else {
                 self.consume_identifier("Expected type name after ':'")
             };
@@ -518,7 +523,8 @@ impl Parser {
                         expr = Expr::Call { callee: name.clone(), args, span };
                     }
                 } else if let Expr::NamespaceRef { namespace, name, .. } = &expr {
-                    // Router::new() / McpServer::new() etc.
+                    // Router::new() / McpServer::new() / Container<number>::new() etc.
+                    // v0.09: namespace 可能含 generics（如 "Container<number>"）
                     let callee = format!("{}::{}", namespace, name);
                     if self.check(&TokenType::RParen) {
                         self.advance();
@@ -650,12 +656,19 @@ impl Parser {
         }
         else if let Some(Token { token_type: TokenType::Identifier(name), line, column, .. }) = self.peek().cloned() {
             self.advance();
+            // v0.09: 检查是否带泛型 `<T, U>` —— 仅当 `<` 后是 IDENT 时视为泛型
+            let mut ns_or_name = name.clone();
+            if self.check(&TokenType::Less) && self.peek_after_less_is_ident() {
+                // 解析泛型，把 "Foo<T,U>" 拼到 namespace
+                let generics = self.parse_type_list();
+                ns_or_name = format!("{}<{}>", name, generics.join(","));
+            }
             // v0.07.1: IDENT::IDENT → NamespaceRef
             if self.match_token(&[TokenType::ColonColon]) {
                 let method = self.consume_identifier("Expected name after '::'");
-                Expr::NamespaceRef { namespace: name, name: method, span: Span::new(line, column) }
+                Expr::NamespaceRef { namespace: ns_or_name, name: method, span: Span::new(line, column) }
             } else {
-                Expr::Variable(name, Span::new(line, column))
+                Expr::Variable(ns_or_name, Span::new(line, column))
             }
         }
         else if self.match_token(&[TokenType::LParen]) {
@@ -791,6 +804,76 @@ impl Parser {
     fn peek(&self) -> Option<&Token> { self.tokens.get(self.current) }
     fn peek_next(&self) -> Option<&Token> { self.tokens.get(self.current + 1) }
     fn previous(&self) -> Option<&Token> { self.tokens.get(self.current - 1) }
+
+    /// v0.09: 检查当前 `<` 后是否是 IDENT（用于消歧泛型 vs 比较）
+    /// peek() = Less, peek_next() = Identifier(_) → 泛型开始
+    fn peek_after_less_is_ident(&self) -> bool {
+        let is_less = self.peek().map(|t| matches!(t.token_type, TokenType::Less)).unwrap_or(false);
+        let next_is_ident = self.peek_next().map(|t| matches!(t.token_type, TokenType::Identifier(_))).unwrap_or(false);
+        is_less && next_is_ident
+    }
+
+    /// v0.09: 解析 trait/impl 的泛型参数 `<T>` 或 `<T: Bound>` 或 `<T, U, V>`
+    /// 当前 token 假设是 `<` (Less)
+    fn parse_generic_params(&mut self) -> Vec<crate::ast::GenericParam> {
+        use crate::ast::GenericParam;
+        let mut params = Vec::new();
+        // 当前 token 是 `<`
+        self.advance(); // 消耗 `<`
+        loop {
+            let pspan = self.span_of_previous_keyword();
+            let pname = self.consume_identifier("Expected generic param name");
+            let pbound = if self.match_token(&[TokenType::Colon]) {
+                Some(self.consume_identifier("Expected bound trait name after ':'"))
+            } else { None };
+            params.push(GenericParam { name: pname, bound: pbound, span: pspan });
+            if !self.match_token(&[TokenType::Comma]) { break; }
+        }
+        self.consume(&TokenType::Greater, "Expected '>' after generic params");
+        params
+    }
+
+    /// v0.09: 解析类型列表 `<T, U, V>` 用于 trait_generics / for_generics
+    /// 当前 token 假设是 `<` (Less)
+    fn parse_type_list(&mut self) -> Vec<String> {
+        let mut types = Vec::new();
+        self.advance(); // 消耗 `<`
+        loop {
+            let tn = self.consume_identifier("Expected type name");
+            types.push(tn);
+            if !self.match_token(&[TokenType::Comma]) { break; }
+        }
+        self.consume(&TokenType::Greater, "Expected '>' after type list");
+        types
+    }
+
+    /// v0.09: 解析类型列表为字符串（用于 type hint 如 `dyn:Container<number>`）
+    fn parse_type_list_to_string(&mut self) -> String {
+        let types = self.parse_type_list();
+        if types.is_empty() {
+            String::new()
+        } else {
+            format!("<{}>", types.join(","))
+        }
+    }
+
+    /// v0.09: 解析 where 子句 `where T: Bound, U: Bound2`
+    fn parse_where_clause(&mut self) -> Vec<crate::ast::GenericParam> {
+        use crate::ast::GenericParam;
+        // 当前 token 是 `where`
+        self.advance(); // 消耗 `where`
+        let mut clauses = Vec::new();
+        loop {
+            let pspan = self.span_of_previous_keyword();
+            let pname = self.consume_identifier("Expected where clause param name");
+            let pbound = if self.match_token(&[TokenType::Colon]) {
+                Some(self.consume_identifier("Expected bound trait name after ':'"))
+            } else { None };
+            clauses.push(GenericParam { name: pname, bound: pbound, span: pspan });
+            if !self.match_token(&[TokenType::Comma]) { break; }
+        }
+        clauses
+    }
 
     fn previous_op(&self) -> BinaryOp {
         match self.previous().unwrap().token_type {
@@ -1147,6 +1230,13 @@ impl Parser {
     fn parse_trait_def(&mut self, _exported: bool) -> Stmt {
         let span = self.span_of_previous_keyword();
         let name = self.consume_identifier("Expected trait name");
+        // v0.09: 解析 trait 自身的泛型参数 `<T>` / `<T: Bound>` / `<T, U, V>`
+        //   复用 lexer 的 Less/Greater token（与比较运算符同）
+        //   消歧规则: `<` 后是 IDENT → 泛型开始
+        let generics = if self.check(&TokenType::Less)
+            && self.peek_after_less_is_ident() {
+            self.parse_generic_params()
+        } else { vec![] };
         // v0.08.4: 可选 `:` 后跟父 trait 列表（用 `,` 分隔）
         let parents = if self.match_token(&[TokenType::Colon]) {
             let mut ps = vec![self.consume_identifier("Expected parent trait name after ':'")];
@@ -1195,18 +1285,56 @@ impl Parser {
             };
             // 跳到本行末尾
             while self.check(&TokenType::Newline) { self.advance(); }
-            methods.push(TraitMethod { name: mname, params, return_type, body, span: mspan });
+            // v0.09: trait method 自己的 generics (暂留空，Step 2 加解析)
+            methods.push(TraitMethod {
+                name: mname,
+                params,
+                return_type,
+                body,
+                generics: vec![],
+                span: mspan,
+            });
         }
         self.consume(&TokenType::End, "Expected 'end' after trait body");
-        Stmt::TraitDef { name, parents, methods, span }
+        Stmt::TraitDef {
+            name,
+            generics,  // v0.09: 用解析的 generics（不再硬编码 vec![]）
+            parents,
+            methods,
+            span,
+        }
     }
 
-    /// `impl TraitName for TypeName ... method_bodies ... end`
+    /// `impl<T> TraitName<...> for TypeName<...> where T: Bound ... method_bodies ... end`
+    /// v0.09: 支持 impl generics + trait_generics + for_generics + where clause
     fn parse_impl_def(&mut self) -> Stmt {
         let span = self.span_of_previous_keyword();
+
+        // v0.09: impl 自身的泛型参数 `impl<T, U>`
+        let generics = if self.check(&TokenType::Less)
+            && self.peek_after_less_is_ident() {
+            self.parse_generic_params()
+        } else { vec![] };
+
         let trait_name = self.consume_identifier("Expected trait name after 'impl'");
+
+        // v0.09: trait 的泛型参数 `Foo<T>`（任意 IDENT 后都视为类型列表）
+        let trait_generics = if self.check(&TokenType::Less) {
+            self.parse_type_list()
+        } else { vec![] };
+
         self.consume(&TokenType::For, "Expected 'for' after trait name in impl");
         let for_type = self.consume_identifier("Expected type name after 'for'");
+
+        // v0.09: for_type 的泛型参数 `Bar<U>`
+        let for_generics = if self.check(&TokenType::Less) {
+            self.parse_type_list()
+        } else { vec![] };
+
+        // v0.09: where 子句 `where T: Bound, U: Bound2`
+        let where_clause = if self.match_token(&[TokenType::Where]) {
+            self.parse_where_clause()
+        } else { vec![] };
         while self.check(&TokenType::Newline) { self.advance(); }
         let mut methods = Vec::new();
         loop {
@@ -1246,7 +1374,16 @@ impl Parser {
             methods.push(FnDef { name: mname, params, return_type, body, span: mspan });
         }
         self.consume(&TokenType::End, "Expected 'end' after impl block");
-        Stmt::ImplDef { trait_name, for_type, methods, span }
+        Stmt::ImplDef {
+            generics,
+            trait_generics,
+            trait_name,
+            for_type,
+            for_generics,
+            where_clause,
+            methods,
+            span,
+        }
     }
 }
 

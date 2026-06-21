@@ -29,3 +29,8 @@ path = "src/bin/lsp.rs"
 # 不引入 tokio 等 async runtime
 # 注意：v9 零依赖承诺被打破，但守住"不引入 async runtime"的红线
 ureq = "2.9"
+# v0.11: libc 用于设置 SO_REUSEADDR（避免 TIME_WAIT 端口占用）
+# 选择 libc 而非 socket2 的理由：libc 是 Rust 几乎必备的 stdlib-like 包，
+# 体积小（编译期常量），且 ureq 自身已经间接依赖 libc
+# extra_traits feature 提供 SOL_SOCKET / SO_REUSEADDR 等常量
+libc = { version = "0.2", features = ["extra_traits"] }

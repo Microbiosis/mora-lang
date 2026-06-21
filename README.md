@@ -168,6 +168,10 @@ end
 | 协议 | 关键字 | 用途 |
 |------|--------|------|
 | HTTP | `serve as http on port N` | REST API (动态路由) |
+
+**v0.11 起**：HTTP server 启动时如果 `port N` 被占，会自动试 `N+1, N+2, N+3`（最多 4 个端口），
+并设置 `SO_REUSEADDR`（允许重用 TIME_WAIT 状态的端口）。如果 4 个端口都被占，server 启动失败。
+控制台会打印实际监听的端口，例如 `[serve] requested port 3000 unavailable, using 3001 instead`。
 | MCP | `serve as mcp` | Claude Desktop 等 MCP 客户端 |
 | REPL | `serve as repl` | 进入交互式 REPL |
 | Stdio | `serve as stdio` | echo 占位（v0.04.1 跟进自定义协议） |

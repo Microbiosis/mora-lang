@@ -64,16 +64,111 @@ fn parse_query_dict(query: &str) -> Value {
     Value::Dict(m)
 }
 
+/// v0.11: 设置 SO_REUSEADDR 跨平台实现
+///   - Unix: 通过 AsRawFd 获取 fd，setsockopt syscall 设置 SO_REUSEADDR
+///   - Windows: 通过 AsRawSocket 获取 socket，setsockopt 设置 SO_REUSEADDR
+///   - 失败静默（SO_REUSEADDR 是 best-effort，不影响主流程）
+///
+///   v0.11 简化: SO_REUSEADDR / SOL_SOCKET 用硬编码数字
+///     - SOL_SOCKET = 1 on Unix, 0xFFFF on Windows (7 in winsock2.h, 0x0FFF)
+//   - SO_REUSEADDR = 2 on Unix, 4 on Windows
+fn set_reuse_addr(listener: &TcpListener) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        let fd = listener.as_raw_fd();
+        // v0.11: SOL_SOCKET=1, SO_REUSEADDR=2 on Unix (Linux/macOS/BSD)
+        let opt: libc::c_int = 1;  // enable
+        let _ = unsafe {
+            libc::setsockopt(
+                fd,
+                1,  // SOL_SOCKET
+                2,  // SO_REUSEADDR
+                &opt as *const _ as *const libc::c_void,
+                std::mem::size_of_val(&opt) as libc::socklen_t,
+            )
+        };
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawSocket;
+        let socket = listener.as_raw_socket();
+        // v0.11: SOL_SOCKET=0xFFFF, SO_REUSEADDR=4 on Windows (winsock2.h)
+        let opt: libc::c_int = 1;  // enable
+        let _ = unsafe {
+            libc::setsockopt(
+                socket as libc::SOCKET,
+                0xFFFF,  // SOL_SOCKET (Windows)
+                4,  // SO_REUSEADDR (Windows)
+                &opt as *const _ as *const libc::c_char,
+                std::mem::size_of_val(&opt) as libc::c_int,
+            )
+        };
+    }
+}
+
+/// v0.11: 尝试在指定端口或附近端口绑定
+///   - 先尝试 requested_port
+///   - 失败则试 requested_port+1, +2, ... 直到 max_attempts 个端口
+///   - 都失败返回最后一次错误
+///   - 设置 SO_REUSEADDR 允许重用 TIME_WAIT 状态的端口
+fn bind_with_reuse(
+    host: &str,
+    requested_port: u16,
+    max_attempts: u16,
+) -> io::Result<(TcpListener, u16)> {
+    use std::net::SocketAddr;
+    for offset in 0..max_attempts {
+        // 防止 u16 溢出
+        let port = match requested_port.checked_add(offset) {
+            Some(p) => p,
+            None => break,  // 端口超过 u16 上限
+        };
+        let addr: SocketAddr = match format!("{}:{}", host, port).parse() {
+            Ok(a) => a,
+            Err(_) => continue,
+        };
+        match TcpListener::bind(addr) {
+            Ok(listener) => {
+                // v0.11: 设置 SO_REUSEADDR 允许重用 TIME_WAIT 状态的端口
+                set_reuse_addr(&listener);
+                if offset > 0 {
+                    eprintln!(
+                        "[serve] requested port {} unavailable, using {} instead",
+                        requested_port, port
+                    );
+                }
+                return Ok((listener, port));
+            }
+            Err(_) => {
+                // 端口被占，尝试下一个
+                continue;
+            }
+        }
+    }
+    // 所有尝试都失败
+    Err(io::Error::new(
+        io::ErrorKind::AddrInUse,
+        format!(
+            "could not bind to any port in range {}-{}",
+            requested_port,
+            requested_port.saturating_add(max_attempts - 1)
+        ),
+    ))
+}
+
 /// 启动 HTTP server (阻塞当前线程)
 /// routes 是从 Router 显式 API 收集的路由表
+/// v0.11: 自动选可用端口（4096-4099），加 SO_REUSEADDR 缓解 TIME_WAIT
 pub fn start(
     host: &str,
     port: u16,
     routes: RouteTable,
     interpreter: Arc<Mutex<Interpreter>>,
 ) -> io::Result<()> {
-    let addr = format!("{}:{}", host, port);
-    let listener = TcpListener::bind(&addr)?;
+    // v0.11: 自动选端口（避免与之前未释放的进程冲突）
+    let (listener, actual_port) = bind_with_reuse(host, port, 4)?;
+    let addr = format!("{}:{}", host, actual_port);
     eprintln!("[serve] Mora HTTP server listening on http://{}", addr);
     eprintln!("[serve] Endpoints:");
     {

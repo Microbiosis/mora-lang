@@ -218,6 +218,57 @@ impl Environment {
 // 现在收敛到这两个函数
 // ===================================================================
 
+/// v0.10: AI 调用 retry 配置（环境变量可覆盖）
+/// MORA_AI_RETRY_MAX: 最大重试次数（默认 3，总计 4 次请求）
+/// MORA_AI_RETRY_BASE_MS: 首次重试前的等待基准（默认 1000ms，后续翻倍 + jitter）
+fn ai_retry_max() -> u32 {
+    std::env::var("MORA_AI_RETRY_MAX")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(3)
+}
+fn ai_retry_base_ms() -> u64 {
+    std::env::var("MORA_AI_RETRY_BASE_MS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1000)
+}
+
+/// v0.10: 判断错误是否可重试
+///   - Transport 错误（网络问题）：可重试
+///   - HTTP 429（rate limit）：可重试
+///   - HTTP 5xx（服务器问题）：可重试
+///   - HTTP 4xx 除 429：不可重试（client 错误）
+fn is_retryable_error(err: &str) -> bool {
+    if err.contains("network error") {
+        return true;  // ureq::Error::Transport
+    }
+    if let Some(rest) = err.strip_prefix("ai.chat: API error HTTP ") {
+        if let Some(code_str) = rest.split_whitespace().next() {
+            if let Ok(code) = code_str.parse::<u16>() {
+                if code == 429 || (500..600).contains(&code) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// v0.10: 计算 retry 等待时间（指数退避 + jitter）
+///   attempt=0 → base
+///   attempt=1 → base * 2 + jitter
+///   attempt=2 → base * 4 + jitter
+fn retry_sleep_ms(attempt: u32, base_ms: u64) -> u64 {
+    let exp = base_ms.saturating_mul(1u64 << attempt.min(10));
+    let jitter = (exp / 5) as i64;
+    let offset = (std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| (d.subsec_nanos() as i64) % (jitter * 2 + 1) - jitter)
+        .unwrap_or(0));
+    (exp as i64 + offset).max(0) as u64
+}
+
 /// 具体类型 impl method 在 environment 里的注册名
 /// 格式: __impl_<Trait>_<ForType>_<method>
 pub(crate) fn impl_method_key(trait_name: &str, for_type: &str, method: &str) -> String {
@@ -2436,7 +2487,8 @@ impl Interpreter {
         result
     }
 
-    /// v0.06.5: HTTP body 构建 — 拼 json 时接 temperature/max_tokens/system
+        /// v0.06.5: HTTP body 构建 — 拼 json 时接 temperature/max_tokens/system
+    /// v0.10: 包 retry 循环（exponential backoff + jitter）
     fn real_ai_chat_inner(&mut self, messages: &[(String, String)], api_key: &str, model: &str, base_url: &str) -> Result<Value, String> {
         if messages.is_empty() {
             return Err("ai.chat: messages cannot be empty".to_string());
@@ -2484,36 +2536,60 @@ impl Interpreter {
             .timeout_write(Duration::from_secs(HTTP_WRITE_TIMEOUT_SECS))
             .build();
 
-        match agent
-            .post(&url)
-            .set("Authorization", &format!("Bearer {}", api_key))
-            .set("Content-Type", "application/json")
-            .send_string(&body)
-        {
-            Ok(response) => match response.into_string() {
-                Ok(text) => {
-                    // 追踪 token 消耗
-                    let (input, output) = Self::extract_usage(&text);
-                    let _ = self.track_tokens(input, output); // 预算超限不阻断，只告警
-                    // 结构化 JSON 解析：提取 choices[0].message.content
-                    self.extract_ai_content(&text)
-                        .or_else(|_| Ok(Value::String(text)))
-                }
-                Err(e) => Err(format!("ai.chat: failed to read response body: {}", e)),
-            },
-            Err(ureq::Error::Status(status, response)) => {
-                let body = response.into_string().unwrap_or_default();
-                let excerpt: String = body.chars().take(300).collect();
-                Err(format!(
-                    "ai.chat: API error HTTP {} from {} (body: {})",
-                    status, url, excerpt
-                ))
+        // v0.10: retry 循环（exponential backoff + jitter）
+        let max_retries = ai_retry_max();
+        let base_ms = ai_retry_base_ms();
+        for attempt in 0..=max_retries {
+            if attempt > 0 {
+                let sleep = retry_sleep_ms(attempt - 1, base_ms);
+                std::thread::sleep(Duration::from_millis(sleep));
             }
-            Err(ureq::Error::Transport(t)) => Err(format!(
-                "ai.chat: network error connecting to {}: {}",
-                url, t
-            )),
+            match agent
+                .post(&url)
+                .set("Authorization", &format!("Bearer {}", api_key))
+                .set("Content-Type", "application/json")
+                .send_string(&body)
+            {
+                Ok(response) => match response.into_string() {
+                    Ok(text) => {
+                        let (input, output) = Self::extract_usage(&text);
+                        let _ = self.track_tokens(input, output);
+                        return self.extract_ai_content(&text)
+                            .or_else(|_| Ok(Value::String(text)));
+                    }
+                    Err(e) => {
+                        let err = format!("ai.chat: failed to read response body: {}", e);
+                        if attempt < max_retries && is_retryable_error(&err) {
+                            continue;
+                        }
+                        return Err(err);
+                    }
+                },
+                Err(ureq::Error::Status(status, response)) => {
+                    let body_text = response.into_string().unwrap_or_default();
+                    let excerpt: String = body_text.chars().take(300).collect();
+                    let err = format!(
+                        "ai.chat: API error HTTP {} from {} (body: {})",
+                        status, url, excerpt
+                    );
+                    if attempt < max_retries && is_retryable_error(&err) {
+                        continue;
+                    }
+                    return Err(err);
+                }
+                Err(ureq::Error::Transport(t)) => {
+                    let err = format!(
+                        "ai.chat: network error connecting to {}: {}",
+                        url, t
+                    );
+                    if attempt < max_retries && is_retryable_error(&err) {
+                        continue;
+                    }
+                    return Err(err);
+                }
+            }
         }
+        Err("ai.chat: retry loop exited without result".to_string())
     }
 
     /// 带工具调用的 AI 对话（支持 tool_calls 自动循环）
@@ -4146,5 +4222,83 @@ end
         let stmts = Parser::new(tokens).parse();
         let mut interp = Interpreter::new();
         interp.interpret(&stmts).expect("mixed = expr and do/end should work");
+    }
+}
+
+// ============================
+// v0.10: AI 调用 retry 单测（测试纯函数）
+// ============================
+#[cfg(test)]
+mod retry_tests {
+    use super::*;
+
+    /// v0.10: 错误分类逻辑
+    #[test]
+    fn test_is_retryable_error_transport() {
+        // 网络错误：可重试
+        assert!(is_retryable_error("ai.chat: network error connecting to https://api.example.com: connection refused"));
+        assert!(is_retryable_error("ai.chat: network error connecting to https://api.example.com: timeout"));
+    }
+
+    #[test]
+    fn test_is_retryable_error_http_429() {
+        // HTTP 429 rate limit：可重试
+        assert!(is_retryable_error("ai.chat: API error HTTP 429 from https://api.example.com (body: rate limit exceeded)"));
+    }
+
+    #[test]
+    fn test_is_retryable_error_http_5xx() {
+        // HTTP 5xx：可重试
+        assert!(is_retryable_error("ai.chat: API error HTTP 500 from https://api.example.com (body: server error)"));
+        assert!(is_retryable_error("ai.chat: API error HTTP 502 from https://api.example.com (body: bad gateway)"));
+        assert!(is_retryable_error("ai.chat: API error HTTP 503 from https://api.example.com (body: unavailable)"));
+        assert!(is_retryable_error("ai.chat: API error HTTP 599 from https://api.example.com (body: edge)"));
+    }
+
+    #[test]
+    fn test_is_retryable_error_http_4xx_not_retryable() {
+        // HTTP 4xx（除 429）：不可重试
+        assert!(!is_retryable_error("ai.chat: API error HTTP 400 from https://api.example.com (body: bad request)"));
+        assert!(!is_retryable_error("ai.chat: API error HTTP 401 from https://api.example.com (body: unauthorized)"));
+        assert!(!is_retryable_error("ai.chat: API error HTTP 403 from https://api.example.com (body: forbidden)"));
+        assert!(!is_retryable_error("ai.chat: API error HTTP 404 from https://api.example.com (body: not found)"));
+    }
+
+    #[test]
+    fn test_is_retryable_error_other() {
+        // 其他错误：不可重试
+        assert!(!is_retryable_error("ai.chat: messages cannot be empty"));
+        assert!(!is_retryable_error("ai.chat: failed to read response body: some io error"));
+    }
+
+    /// v0.10: 重试 sleep 时间计算
+    #[test]
+    fn test_retry_sleep_ms_exponential() {
+        // base=1000ms 时：attempt=0 → ~1000, attempt=1 → ~2000, attempt=2 → ~4000
+        let base = 1000u64;
+        let s0 = retry_sleep_ms(0, base);
+        let s1 = retry_sleep_ms(1, base);
+        let s2 = retry_sleep_ms(2, base);
+        // 实际值有 ±20% jitter
+        assert!(s0 >= 800 && s0 <= 1200, "s0={}", s0);
+        assert!(s1 >= 1600 && s1 <= 2400, "s1={}", s1);
+        assert!(s2 >= 3200 && s2 <= 4800, "s2={}", s2);
+    }
+
+    #[test]
+    fn test_retry_sleep_ms_no_overflow() {
+        // base=1000ms，attempt=100 不会 overflow（saturating_mul）
+        let s = retry_sleep_ms(100, 1000);
+        // saturating_mul 限制左移 ≤ 10 → exp ≈ 1024 * 1000 ≈ 1M ms
+        assert!(s > 0);
+    }
+
+    /// v0.10: ai_retry_max / ai_retry_base_ms 默认值
+    #[test]
+    fn test_ai_retry_config_defaults() {
+        // 不设环境变量时应返回默认值
+        // 注：环境变量可能已被其他测试污染，这里只验证函数不会 panic
+        let _ = ai_retry_max();
+        let _ = ai_retry_base_ms();
     }
 }

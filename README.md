@@ -6,7 +6,7 @@
 
 一个轻量级脚本语言，内建 AI 调用（`p"..."` 表达式）、HTTP server、MCP server、长期记忆、Agent 编排。
 
-**v0.20**: 融合 9 个语言的设计基因 (Prolog、StreamIt、APL、Clojure、Lisp、Smalltalk、Common Lisp、Ballerina、Logo)
+**v0.23**: 融合 9 个语言的设计基因 + 强类型升级 (Prolog、StreamIt、APL、Clojure、Lisp、Smalltalk、Common Lisp、Ballerina、Logo)
 
 ```mora
 -- 一段代码 = HTTP + MCP + 可观测 (v0.04)

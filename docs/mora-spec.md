@@ -1,4 +1,4 @@
-# Mora 语言规范 (v0.20)
+# Mora 语言规范 (v0.23)
 
 > **Mora** — AI-native 静态类型脚本语言，面向 Agent 编排与云原生可观测。
 > 融合 9 个语言的设计基因：Prolog、StreamIt、APL、Clojure、Lisp、Smalltalk、Common Lisp、Ballerina、Logo。

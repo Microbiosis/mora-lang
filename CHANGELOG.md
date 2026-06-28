@@ -2,7 +2,7 @@
 
 All notable changes to Mora will be documented in this file.
 
-## [v0.20] - 2026-06-28
+## [v0.23] - 2026-06-28
 
 ### 9 Languages Features Integration (Complete)
 

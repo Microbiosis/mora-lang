@@ -1,5 +1,5 @@
--- v0.07.1: 综合验证脚本 + req.json() demo
--- 验证 v0.07 新增特性:
+-- v0.13: 综合验证脚本 + req.json() demo
+-- v0.07 新增特性 (Walrus 已删, 全部加 :T hint):
 --   1. req.json(): Result<Dict, ParseError> — 等价于 "json" builtin 方法
 --   2. match 表达式 — 处理 Result<T,E> 解包
 --   3. ? 操作符 — 早 return
@@ -13,7 +13,7 @@
 -- ============================
 task json_parse_ok()
   -- 模拟 request body: {"name": "mora", "version": 1}
-  let req := {
+  let req: any = {
     method: "POST",
     path: "/users",
     header_list: [{name: "Content-Type", value: "application/json"}],
@@ -21,7 +21,7 @@ task json_parse_ok()
     query: {},
     params: {}
   }
-  let result := req.json()
+  let result: any = req.json()
   match result with
     {ok: val} -> print("parsed: " + val)
     {err: e} -> print("error: " + e)
@@ -32,10 +32,10 @@ end
 -- 测试 2: req.json() — 空 body → err
 -- ============================
 task json_parse_empty()
-  let req := {
+  let req: any = {
     body: ""
   }
-  let result := req.json()
+  let result: any = req.json()
   match result with
     {ok: val} -> print("unexpected ok")
     {err: e} -> print("expected err: " + e)
@@ -46,11 +46,11 @@ end
 -- 测试 3: req.json() — 非 JSON body → err
 -- ============================
 task json_parse_bad()
-  let req := {
+  let req: any = {
     body: "not json at all"
   }
-  let result := req.json()
-  let val := result.get("ok")
+  let result: any = req.json()
+  let val: any = result.get("ok")
   print("val: " + val)
 end
 
@@ -58,10 +58,10 @@ end
 -- 测试 4: req.json() — 数组 body → ok
 -- ============================
 task json_parse_array()
-  let req := {
+  let req: any = {
     body: "[1, 2, 3]"
   }
-  let result := req.json()
+  let result: any = req.json()
   match result with
     {ok: list} -> print("ok: list length " + list.len())
     {err: e} -> print("unexpected err: " + e)
@@ -72,8 +72,8 @@ end
 -- 测试 5: match 表达式（Expr::Match）
 -- ============================
 task match_expr_test()
-  let val = 42
-  let label = match val with
+  let val: number = 42
+  let label: string = match val with
     0 -> "zero"
     1 -> "one"
     42 -> "answer"
@@ -86,8 +86,8 @@ end
 -- 测试 6: ? 操作符 — Result 解包
 -- ============================
 task result_ok()
-  let r := {ok: 42}
-  let v := r?
+  let r: any = {ok: 42}
+  let v: any = r?
   print("result ok: " + v)
 end
 
@@ -95,8 +95,8 @@ end
 -- 测试 7: ? 操作符 — Result 错误
 -- ============================
 task result_err()
-  let r := {err: "something went wrong"}
-  let v := r?
+  let r: any = {err: "something went wrong"}
+  let v: any = r?
   print("should not reach: " + v)
 end
 
@@ -107,8 +107,8 @@ route fast: ai_model("gpt-4o-mini", temperature: 0.7, max_tokens: 2000)
 route deep: ai_model("gpt-4o", system: "You are a helpful assistant")
 
 task route_test()
-  let text := "Mora v0.07"
-  let summary = fast(p"summarize: {text}")
+  let text: string = "Mora v0.07"
+  let summary: string = fast(p"summarize: {text}")
   print("summary: " + summary)
 end
 
@@ -116,7 +116,7 @@ end
 -- 测试 9: with 块 — AiConfig 栈模型
 -- ============================
 with model = "gpt-4o", temperature = 0.3
-  let r = p"hello"
+  let r: string = p"hello"
   print("with-block result: " + r)
 end
 

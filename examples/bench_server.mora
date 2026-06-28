@@ -11,12 +11,12 @@ route fast: ai_model("gpt-4o-mini")
 
 -- 在 task 内定义并启动 server, 绕过 typeck 对未知 namespace 的严格检查
 task bench_server()
-  let router = Router::new()
+  let router: any = Router::new()
   router = router.route("GET", "/health", fn(req)
     return {status: "ok"}
   end)
   router = router.route("GET", "/bench", fn(req)
-    let name := req["query"]["name"]
+    let name: string = req["query"]["name"]
     return {hello: name}
   end)
   router = router.route("POST", "/echo", fn(req)

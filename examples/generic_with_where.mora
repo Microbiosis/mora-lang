@@ -1,0 +1,29 @@
+-- v0.09 完整版: 泛型 + where 子句 demo
+-- 测: where 约束验证 + bound 强制存在
+
+trait Comparable
+  fn less(self, other: number) -> bool
+end
+
+trait Min<T> where T: Comparable
+  fn smaller(self, other: T) -> T
+end
+
+impl Comparable for number
+  fn less(self, other) = self < other
+end
+
+impl Min<number> for NumPair
+  fn smaller(self, other) = do
+    if self.less(other) then
+      return self
+    end
+    return other
+  end
+end
+
+task main()
+  let p: dyn Min<number> = Min<number>::new("NumPair")
+  let m = p.smaller(10)
+  print("min: " + m)
+end

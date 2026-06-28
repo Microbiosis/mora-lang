@@ -5,9 +5,9 @@
 //! - Metrics：Token 消耗、调用次数、延迟统计
 //! - 输出：JSON 格式，兼容 OpenTelemetry Collector
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use std::collections::HashMap;
 
 /// Trace span
 #[derive(Debug, Clone)]
@@ -75,10 +75,16 @@ impl TraceCollector {
     }
 
     /// 开始一个 span
-    pub fn start_span(&self, name: &str, attributes: HashMap<String, String>) -> SpanHandle {
+    pub fn start_span(&self, name: &str, _attributes: HashMap<String, String>) -> SpanHandle {
         let mut inner = self.inner.lock().unwrap();
         if !inner.enabled {
-            return SpanHandle { trace_id: String::new(), span_id: String::new(), start: Instant::now(), collector: self.clone(), name: name.to_string() };
+            return SpanHandle {
+                trace_id: String::new(),
+                span_id: String::new(),
+                start: Instant::now(),
+                collector: self.clone(),
+                name: name.to_string(),
+            };
         }
         inner.counter += 1;
         let span_id = format!("span_{}", inner.counter);
@@ -105,9 +111,16 @@ impl TraceCollector {
     }
 
     /// 结束 span
-    fn end_span(&self, handle: &SpanHandle, status: SpanStatus, attributes: HashMap<String, String>) {
+    fn end_span(
+        &self,
+        handle: &SpanHandle,
+        status: SpanStatus,
+        attributes: HashMap<String, String>,
+    ) {
         let mut inner = self.inner.lock().unwrap();
-        if !inner.enabled { return; }
+        if !inner.enabled {
+            return;
+        }
         let duration = handle.start.elapsed();
         let span = Span {
             name: handle.name.clone(),
@@ -141,7 +154,8 @@ impl TraceCollector {
             _ => {}
         }
         inner.metrics.latency_sum_ms += latency.as_millis() as u64;
-        inner.metrics.avg_latency_ms = inner.metrics.latency_sum_ms as f64 / inner.metrics.total_calls as f64;
+        inner.metrics.avg_latency_ms =
+            inner.metrics.latency_sum_ms as f64 / inner.metrics.total_calls as f64;
         if !success {
             inner.metrics.total_errors += 1;
         }
@@ -183,7 +197,10 @@ impl TraceCollector {
                 match &s.status { SpanStatus::Ok => "OK", SpanStatus::Error(_) => "ERROR" }
             )
         }).collect();
-        format!(r#"{{"resourceSpans":[{{"scopeSpans":[{{"spans":[{}]}}]}}]}}"#, spans.join(","))
+        format!(
+            r#"{{"resourceSpans":[{{"scopeSpans":[{{"spans":[{}]}}]}}]}}"#,
+            spans.join(",")
+        )
     }
 
     /// 指标转 JSON
@@ -191,8 +208,15 @@ impl TraceCollector {
         let m = self.get_metrics();
         format!(
             r#"{{"totalCalls":{},"aiChatCalls":{},"aiStreamCalls":{},"toolCalls":{},"memoryOps":{},"totalInputTokens":{},"totalOutputTokens":{},"totalErrors":{},"avgLatencyMs":{:.1}}}"#,
-            m.total_calls, m.ai_chat_calls, m.ai_stream_calls, m.tool_calls, m.memory_operations,
-            m.total_input_tokens, m.total_output_tokens, m.total_errors, m.avg_latency_ms
+            m.total_calls,
+            m.ai_chat_calls,
+            m.ai_stream_calls,
+            m.tool_calls,
+            m.memory_operations,
+            m.total_input_tokens,
+            m.total_output_tokens,
+            m.total_errors,
+            m.avg_latency_ms
         )
     }
 }
@@ -214,7 +238,8 @@ impl SpanHandle {
 
     /// 错误结束
     pub fn end_error(self, error: &str, attributes: HashMap<String, String>) {
-        self.collector.end_span(&self, SpanStatus::Error(error.to_string()), attributes);
+        self.collector
+            .end_span(&self, SpanStatus::Error(error.to_string()), attributes);
     }
 }
 

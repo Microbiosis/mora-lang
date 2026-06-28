@@ -16,7 +16,7 @@ use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
 
 use crate::interpreter::{Interpreter, Value};
-use crate::lsp::json::{to_string as json_to_string, Value as JsonValue};
+use crate::lsp::json::{Value as JsonValue, to_string as json_to_string};
 
 /// HTTP request 解析结果
 pub struct HttpRequest {
@@ -78,12 +78,12 @@ fn set_reuse_addr(listener: &TcpListener) {
         use std::os::unix::io::AsRawFd;
         let fd = listener.as_raw_fd();
         // v0.11: SOL_SOCKET=1, SO_REUSEADDR=2 on Unix (Linux/macOS/BSD)
-        let opt: libc::c_int = 1;  // enable
+        let opt: libc::c_int = 1; // enable
         let _ = unsafe {
             libc::setsockopt(
                 fd,
-                1,  // SOL_SOCKET
-                2,  // SO_REUSEADDR
+                1, // SOL_SOCKET
+                2, // SO_REUSEADDR
                 &opt as *const _ as *const libc::c_void,
                 std::mem::size_of_val(&opt) as libc::socklen_t,
             )
@@ -94,12 +94,12 @@ fn set_reuse_addr(listener: &TcpListener) {
         use std::os::windows::io::AsRawSocket;
         let socket = listener.as_raw_socket();
         // v0.11: SOL_SOCKET=0xFFFF, SO_REUSEADDR=4 on Windows (winsock2.h)
-        let opt: libc::c_int = 1;  // enable
+        let opt: libc::c_int = 1; // enable
         let _ = unsafe {
             libc::setsockopt(
                 socket as libc::SOCKET,
-                0xFFFF,  // SOL_SOCKET (Windows)
-                4,  // SO_REUSEADDR (Windows)
+                0xFFFF, // SOL_SOCKET (Windows)
+                4,      // SO_REUSEADDR (Windows)
                 &opt as *const _ as *const libc::c_char,
                 std::mem::size_of_val(&opt) as libc::c_int,
             )
@@ -122,7 +122,7 @@ fn bind_with_reuse(
         // 防止 u16 溢出
         let port = match requested_port.checked_add(offset) {
             Some(p) => p,
-            None => break,  // 端口超过 u16 上限
+            None => break, // 端口超过 u16 上限
         };
         let addr: SocketAddr = match format!("{}:{}", host, port).parse() {
             Ok(a) => a,
@@ -172,7 +172,7 @@ pub fn start(
     eprintln!("[serve] Mora HTTP server listening on http://{}", addr);
     eprintln!("[serve] Endpoints:");
     {
-        let routes = routes.lock().unwrap();
+        let routes = routes.lock().expect("routes mutex poisoned");
         let mut by_method: HashMap<&str, Vec<&str>> = HashMap::new();
         for (m, p) in routes.keys() {
             by_method.entry(m.as_str()).or_default().push(p.as_str());
@@ -185,16 +185,45 @@ pub fn start(
     }
     eprintln!();
 
+    // v0.22: 连接池优化 - 使用 Arc<Mutex<Receiver>> 共享接收器
+    let pool_size = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .min(16);  // 最多 16 个线程
+
+    let (tx, rx) = std::sync::mpsc::channel::<TcpStream>();
+    let rx = Arc::new(Mutex::new(rx));
+
+    // 启动工作线程
+    for _ in 0..pool_size {
+        let rx = rx.clone();
+        let routes = routes.clone();
+        let interp = interpreter.clone();
+        std::thread::spawn(move || {
+            loop {
+                let stream = {
+                    let guard = rx.lock().expect("rx mutex poisoned");
+                    guard.recv()
+                };
+                match stream {
+                    Ok(stream) => {
+                        if let Err(e) = handle_connection(stream, routes.clone(), interp.clone()) {
+                            eprintln!("[serve] connection error: {}", e);
+                        }
+                    }
+                    Err(_) => break, // channel 关闭
+                }
+            }
+        });
+    }
+
+    // 主线程接受连接
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
-                let routes = routes.clone();
-                let interp = interpreter.clone();
-                std::thread::spawn(move || {
-                    if let Err(e) = handle_connection(stream, routes, interp) {
-                        eprintln!("[serve] connection error: {}", e);
-                    }
-                });
+                if let Err(e) = tx.send(stream) {
+                    eprintln!("[serve] dispatch error: {}", e);
+                }
             }
             Err(e) => eprintln!("[serve] accept error: {}", e),
         }
@@ -212,7 +241,7 @@ fn handle_connection(
 
     // v0.06.4: 先精确匹配，再模式匹配 (:param)
     let handler_with_params: Option<(Value, HashMap<String, String>)> = {
-        let routes = routes.lock().unwrap();
+        let routes = routes.lock().expect("routes mutex poisoned");
         // 1) 精确匹配
         if let Some(h) = routes.get(&(req.method.clone(), req.path.clone())) {
             Some((h.clone(), HashMap::new()))
@@ -220,7 +249,9 @@ fn handle_connection(
             // 2) 模式匹配 — 遍历所有注册路由
             let mut found: Option<(Value, HashMap<String, String>)> = None;
             for ((_m, pattern), h) in routes.iter() {
-                if *_m != req.method { continue; }
+                if *_m != req.method {
+                    continue;
+                }
                 if let Some(params) = match_path_pattern(pattern, &req.path) {
                     found = Some((h.clone(), params));
                     break;
@@ -241,9 +272,10 @@ fn handle_connection(
                 Err(e) => (500, json_error(&format!("handler error: {}", e))),
             }
         }
-        None => {
-            (404, json_error(&format!("no route for {} {}", req.method, req.path)))
-        }
+        None => (
+            404,
+            json_error(&format!("no route for {} {}", req.method, req.path)),
+        ),
     };
 
     send_response(&mut stream, status, &body_str)
@@ -276,7 +308,7 @@ fn invoke_handler(
     let req_value = Value::Dict(req_dict);
 
     // 调闭包: handler(req_dict)
-    let mut interp = interpreter.lock().unwrap();
+    let mut interp = interpreter.lock().expect("interpreter mutex poisoned");
     interp.call_value(&handler, vec![req_value])
 }
 
@@ -331,6 +363,7 @@ fn value_to_json(v: &Value) -> JsonValue {
         Value::Bool(b) => JsonValue::Bool(*b),
         Value::Number(n) => JsonValue::Number(*n),
         Value::String(s) => JsonValue::String_(s.clone()),
+        Value::Char(c) => JsonValue::String_(c.to_string()),
         Value::List(items) => JsonValue::Array(items.iter().map(value_to_json).collect()),
         Value::Dict(map) => {
             let mut out = std::collections::BTreeMap::new();
@@ -350,9 +383,12 @@ fn value_to_json(v: &Value) -> JsonValue {
         Value::TraitObject { .. } => JsonValue::String_("<trait_object>".to_string()),
         Value::HttpRequest { .. } => JsonValue::String_("<http_request>".to_string()),
         Value::McpServer { .. } => JsonValue::String_("<mcp_server>".to_string()),
+        Value::Compose(_) => JsonValue::String_("<compose>".to_string()),
+        Value::Partial(_, _) => JsonValue::String_("<partial>".to_string()),
+        Value::Atom(_) => JsonValue::String_("<atom>".to_string()),
+        Value::Macro { .. } => JsonValue::String_("<macro>".to_string()),
     }
 }
-
 
 fn json_error(msg: &str) -> String {
     let escaped = msg.replace('\\', "\\\\").replace('"', "\\\"");
@@ -367,13 +403,13 @@ fn parse_request(stream: &mut TcpStream) -> io::Result<HttpRequest> {
     let mut reader = BufReader::new(stream.try_clone()?);
     let mut first_line = String::new();
     reader.read_line(&mut first_line)?;
-    let parts: Vec<&str> = first_line.trim().split_whitespace().collect();
-    let method = parts.get(0).unwrap_or(&"GET").to_string();
+    let parts: Vec<&str> = first_line.split_whitespace().collect();
+    let method = parts.first().unwrap_or(&"GET").to_string();
 
     // path 可能带 query string
     let raw_path = parts.get(1).unwrap_or(&"/").to_string();
     let (path, query) = match raw_path.find('?') {
-        Some(i) => (raw_path[..i].to_string(), raw_path[i+1..].to_string()),
+        Some(i) => (raw_path[..i].to_string(), raw_path[i + 1..].to_string()),
         None => (raw_path, String::new()),
     };
 
@@ -382,7 +418,9 @@ fn parse_request(stream: &mut TcpStream) -> io::Result<HttpRequest> {
     loop {
         let mut line = String::new();
         reader.read_line(&mut line)?;
-        if line.trim().is_empty() { break; }
+        if line.trim().is_empty() {
+            break;
+        }
         if let Some((name, value)) = line.trim().split_once(':') {
             headers.push((name.trim().to_string(), value.trim().to_string()));
             if name.trim().eq_ignore_ascii_case("Content-Length") {
@@ -398,7 +436,14 @@ fn parse_request(stream: &mut TcpStream) -> io::Result<HttpRequest> {
         body = String::from_utf8_lossy(&buf).to_string();
     }
 
-    Ok(HttpRequest { method, path, query, headers, body, params: HashMap::new() })
+    Ok(HttpRequest {
+        method,
+        path,
+        query,
+        headers,
+        body,
+        params: HashMap::new(),
+    })
 }
 
 fn send_response(stream: &mut TcpStream, status: u16, body: &str) -> io::Result<()> {
@@ -411,7 +456,10 @@ fn send_response(stream: &mut TcpStream, status: u16, body: &str) -> io::Result<
     };
     let response = format!(
         "HTTP/1.1 {} {}\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n{}",
-        status, status_text, body.as_bytes().len(), body
+        status,
+        status_text,
+        body.len(),
+        body
     );
     stream.write_all(response.as_bytes())?;
     stream.flush()

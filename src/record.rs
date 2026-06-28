@@ -1803,7 +1803,7 @@ pattern:github-token
             Event::AiChat { id: 1, ts_ms: 1000, model: "m".into(), prompt_hash: "h".into(), prompt_preview: "test".into(), response: "api_key=sk-abc123def456ghi789jkl012mno".into(), tokens_in: 10, tokens_out: 5, latency_ms: 100, error: None },
         ];
         let findings = audit_recording(&events, &[]);
-        assert!(findings.len() > 0);
+        assert!(!findings.is_empty());
         assert_eq!(findings[0].pattern, "openai-api-key");
     }
 

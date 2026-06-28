@@ -18,11 +18,11 @@ fn main() {
     if args.len() >= 2 {
         match args[1].as_str() {
             "--version" | "-v" => {
-                println!("Mora v0.11");
+                println!("Mora v0.23");
                 return;
             }
             "--help" | "-h" => {
-                println!("Mora v0.15 — record / replay / diff / list / stats / timeline");
+                println!("Mora v0.23 — record / replay / diff / list / stats / timeline / snapshot");
                 println!();
                 println!("Usage:");
                 println!("  mora <file.mora>           Run a script");
@@ -273,7 +273,7 @@ fn print_banner() {
     let base_url =
         env::var("MORA_AI_BASE_URL").unwrap_or_else(|_| "https://api.openai.com/v1".to_string());
 
-    println!("Mora v0.15");
+    println!("Mora v0.23");
     if has_openai_key {
         println!("  AI: real API (endpoint: {})", base_url);
     } else {

@@ -86,9 +86,9 @@ pub enum TokenType {
     // v0.09: where 子句关键字（trait/impl 末尾的约束）
     Where,
     // v0.23: 类型系统增强
-    Type,      // type 关键字
-    Enum,      // enum 关键字
-    Struct,    // struct 关键字
+    Type,   // type 关键字
+    Enum,   // enum 关键字
+    Struct, // struct 关键字
     LParen,
     RParen,
     LBracket,
@@ -99,8 +99,8 @@ pub enum TokenType {
     DotDotDot, // v0.16: '...' 用于列表 rest 模式
     Comma,
     Colon,
-    Amp,      // v0.21: '&' 借用
-    AmpMut,   // v0.21: '&mut' 可变借用
+    Amp,              // v0.21: '&' 借用
+    AmpMut,           // v0.21: '&mut' 可变借用
     Lifetime(String), // v0.21: 'a 生命周期标注
     Newline,
     EOF,
@@ -414,7 +414,14 @@ impl Lexer {
                     if next == '\'' {
                         // 字符 'x'
                         Some(self.char_from(start_line, start_col))
-                    } else if next == '>' || next == ')' || next == ',' || next == ' ' || next == '\n' || next == '\0' || !next.is_ascii_alphanumeric() {
+                    } else if next == '>'
+                        || next == ')'
+                        || next == ','
+                        || next == ' '
+                        || next == '\n'
+                        || next == '\0'
+                        || !next.is_ascii_alphanumeric()
+                    {
                         // 生命周期 'a
                         let mut lifetime = String::new();
                         while self.peek().is_ascii_alphanumeric() || self.peek() == '_' {

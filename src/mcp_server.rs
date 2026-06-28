@@ -46,7 +46,7 @@ pub fn start(tools: ToolRegistry, interpreter: Arc<Mutex<Interpreter>>) -> io::R
     let pool_size = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(4)
-        .min(8);  // MCP 最多 8 个并发
+        .min(8); // MCP 最多 8 个并发
 
     let (tx, rx) = std::sync::mpsc::channel::<(JsonValue, std::sync::mpsc::Sender<JsonValue>)>();
     let rx = Arc::new(Mutex::new(rx));

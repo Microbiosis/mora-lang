@@ -189,7 +189,7 @@ pub fn start(
     let pool_size = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(4)
-        .min(16);  // 最多 16 个线程
+        .min(16); // 最多 16 个线程
 
     let (tx, rx) = std::sync::mpsc::channel::<TcpStream>();
     let rx = Arc::new(Mutex::new(rx));

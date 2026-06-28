@@ -6,7 +6,6 @@
 pub mod ast;
 pub mod ast_v2;
 pub mod flow;
-pub mod typed_ast;
 pub mod http_server;
 pub mod interpreter;
 pub mod lexer;
@@ -16,4 +15,5 @@ pub mod parser;
 pub mod record;
 pub mod trace_collector;
 pub mod typeck;
+pub mod typed_ast;
 pub mod value;

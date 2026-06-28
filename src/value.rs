@@ -19,8 +19,12 @@ impl StreamReader {
     pub fn new(reader: BufReader<Box<dyn std::io::Read + Send + Sync>>) -> Self {
         StreamReader(Arc::new(Mutex::new(reader)))
     }
-    pub fn lock(&self) -> std::sync::MutexGuard<'_, BufReader<Box<dyn std::io::Read + Send + Sync>>> {
-        self.0.lock().expect("StreamReader mutex poisoned: cannot acquire read lock")
+    pub fn lock(
+        &self,
+    ) -> std::sync::MutexGuard<'_, BufReader<Box<dyn std::io::Read + Send + Sync>>> {
+        self.0
+            .lock()
+            .expect("StreamReader mutex poisoned: cannot acquire read lock")
     }
 }
 
@@ -178,7 +182,11 @@ impl std::fmt::Display for Value {
                 )
             }
             Value::Router { routes } => {
-                write!(f, "<router ({} routes)>", routes.lock().expect("Router routes mutex poisoned").len())
+                write!(
+                    f,
+                    "<router ({} routes)>",
+                    routes.lock().expect("Router routes mutex poisoned").len()
+                )
             }
             Value::HttpRequest { method, path, .. } => {
                 write!(f, "<http_request {} {}>", method, path)
@@ -255,7 +263,10 @@ impl Environment {
         if let Some(value) = self.values.get(name) {
             Some(value.clone())
         } else if let Some(parent) = &self.parent {
-            parent.lock().expect("parent environment mutex poisoned").get(name)
+            parent
+                .lock()
+                .expect("parent environment mutex poisoned")
+                .get(name)
         } else {
             None
         }
@@ -266,7 +277,10 @@ impl Environment {
             self.values.insert(name.to_string(), value);
             true
         } else if let Some(parent) = &self.parent {
-            parent.lock().expect("parent environment mutex poisoned").assign(name, value)
+            parent
+                .lock()
+                .expect("parent environment mutex poisoned")
+                .assign(name, value)
         } else {
             false
         }
@@ -279,7 +293,10 @@ impl Environment {
         if let Some(value) = self.values.get(name) {
             Some(Binding::Value(value.clone()))
         } else if let Some(parent) = &self.parent {
-            parent.lock().expect("parent environment mutex poisoned").get_binding(name)
+            parent
+                .lock()
+                .expect("parent environment mutex poisoned")
+                .get_binding(name)
         } else {
             None
         }
@@ -290,7 +307,10 @@ impl Environment {
         if let Some(value) = self.values.remove(name) {
             Ok(value)
         } else if let Some(parent) = &self.parent {
-            parent.lock().expect("parent environment mutex poisoned").move_variable(name)
+            parent
+                .lock()
+                .expect("parent environment mutex poisoned")
+                .move_variable(name)
         } else {
             Err(format!("undefined variable: {}", name))
         }
@@ -301,7 +321,10 @@ impl Environment {
         if let Some(value) = self.values.get(name) {
             Ok(Arc::new(Mutex::new(value.clone())))
         } else if let Some(parent) = &self.parent {
-            parent.lock().expect("parent environment mutex poisoned").borrow_variable(name)
+            parent
+                .lock()
+                .expect("parent environment mutex poisoned")
+                .borrow_variable(name)
         } else {
             Err(format!("undefined variable: {}", name))
         }
@@ -312,7 +335,10 @@ impl Environment {
         if let Some(value) = self.values.get(name) {
             Ok(Arc::new(Mutex::new(value.clone())))
         } else if let Some(parent) = &self.parent {
-            parent.lock().expect("parent environment mutex poisoned").borrow_variable_mut(name)
+            parent
+                .lock()
+                .expect("parent environment mutex poisoned")
+                .borrow_variable_mut(name)
         } else {
             Err(format!("undefined variable: {}", name))
         }

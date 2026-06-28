@@ -31,13 +31,19 @@ pub struct DocumentState {
 
 #[derive(Debug, Clone)]
 pub struct Diagnostic {
-    pub line: usize,        // 0-based
-    pub column: usize,      // 0-based
+    pub line: usize,   // 0-based
+    pub column: usize, // 0-based
     pub end_line: usize,
     pub end_column: usize,
-    pub severity: u8,       // 1=Error, 2=Warning, 3=Info, 4=Hint
+    pub severity: u8, // 1=Error, 2=Warning, 3=Info, 4=Hint
     pub message: String,
-    pub source: String,     // "mora-typeck"
+    pub source: String, // "mora-typeck"
+}
+
+impl Default for Server {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Server {
@@ -54,7 +60,7 @@ impl Server {
         loop {
             let raw = match transport::read_message(&mut self.stdin)? {
                 Some(s) => s,
-                None => return Ok(()),  // EOF
+                None => return Ok(()), // EOF
             };
             let msg = match Parser::new(&raw).parse_value() {
                 Ok(v) => v,
@@ -64,13 +70,19 @@ impl Server {
                 }
             };
             self.handle_message(msg)?;
-            if *self.shutdown.lock().unwrap() { break; }
+            if *self.shutdown.lock().expect("shutdown mutex poisoned") {
+                break;
+            }
         }
         Ok(())
     }
 
     fn handle_message(&mut self, msg: Value) -> io::Result<()> {
-        let method = msg.get("method").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let method = msg
+            .get("method")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
         let id = msg.get("id").cloned();
         let params = msg.get("params").cloned().unwrap_or(Value::Null);
 
@@ -81,7 +93,7 @@ impl Server {
         }
 
         // request：必须回复（成功或错误）
-        let id = id.unwrap();
+        let id = id.expect("id should exist");
         match self.handle_request(&method, params) {
             Ok(result) => self.send_response(id, Some(result), None)?,
             Err(err_msg) => self.send_response(id, None, Some(err_msg))?,
@@ -95,17 +107,20 @@ impl Server {
                 // 客户端握手完成标志；什么都不做
             }
             "exit" => {
-                *self.shutdown.lock().unwrap() = true;
+                *self.shutdown.lock().expect("shutdown mutex poisoned") = true;
             }
             "textDocument/didOpen" => {
                 if let Some(doc) = parse_doc_params(&params) {
                     let diags = self.check_diagnostics(&doc.text);
                     let uri = doc.uri.clone();
-                    let mut docs = self.docs.lock().unwrap();
-                    docs.insert(uri.clone(), DocumentState {
-                        diagnostics: diags.clone(),
-                        ..doc
-                    });
+                    let mut docs = self.docs.lock().expect("docs mutex poisoned");
+                    docs.insert(
+                        uri.clone(),
+                        DocumentState {
+                            diagnostics: diags.clone(),
+                            ..doc
+                        },
+                    );
                     drop(docs);
                     let _ = self.publish_diagnostics(&uri, &diags);
                 }
@@ -113,28 +128,39 @@ impl Server {
             "textDocument/didChange" => {
                 if let Some((uri, version, text)) = parse_change_params(&params) {
                     let diags = self.check_diagnostics(&text);
-                    let mut docs = self.docs.lock().unwrap();
-                    docs.insert(uri.clone(), DocumentState {
-                        uri: uri.clone(),
-                        text,
-                        version,
-                        diagnostics: diags.clone(),
-                    });
+                    let mut docs = self.docs.lock().expect("docs mutex poisoned");
+                    docs.insert(
+                        uri.clone(),
+                        DocumentState {
+                            uri: uri.clone(),
+                            text,
+                            version,
+                            diagnostics: diags.clone(),
+                        },
+                    );
                     drop(docs);
                     let _ = self.publish_diagnostics(&uri, &diags);
                 }
             }
             "textDocument/didClose" => {
-                if let Some(uri) = params.get("textDocument").and_then(|t| t.get("uri")).and_then(|u| u.as_str()) {
-                    self.docs.lock().unwrap().remove(uri);
+                if let Some(uri) = params
+                    .get("textDocument")
+                    .and_then(|t| t.get("uri"))
+                    .and_then(|u| u.as_str())
+                {
+                    self.docs.lock().expect("docs mutex poisoned").remove(uri);
                 }
             }
             "textDocument/didSave" => {
-                if let Some(uri) = params.get("textDocument").and_then(|t| t.get("uri")).and_then(|u| u.as_str()) {
-                    let text_opt = self.docs.lock().unwrap().get(uri).map(|d| d.text.clone());
+                if let Some(uri) = params
+                    .get("textDocument")
+                    .and_then(|t| t.get("uri"))
+                    .and_then(|u| u.as_str())
+                {
+                    let text_opt = self.docs.lock().expect("docs mutex poisoned").get(uri).map(|d| d.text.clone());
                     if let Some(text) = text_opt {
                         let diags = self.check_diagnostics(&text);
-                        let mut docs = self.docs.lock().unwrap();
+                        let mut docs = self.docs.lock().expect("docs mutex poisoned");
                         if let Some(d) = docs.get_mut(uri) {
                             d.diagnostics = diags.clone();
                         }
@@ -153,7 +179,7 @@ impl Server {
         match method {
             "initialize" => Ok(self.handle_initialize(params)),
             "shutdown" => {
-                *self.shutdown.lock().unwrap() = true;
+                *self.shutdown.lock().expect("shutdown mutex poisoned") = true;
                 Ok(Value::Null)
             }
             "textDocument/hover" => self.handle_hover(params),
@@ -175,7 +201,8 @@ impl Server {
     // ---------------------------------------------------------------
     fn handle_initialize(&self, _params: Value) -> Value {
         // 报告 server 能力
-        let mut capabilities: std::collections::BTreeMap<String, Value> = std::collections::BTreeMap::new();
+        let mut capabilities: std::collections::BTreeMap<String, Value> =
+            std::collections::BTreeMap::new();
 
         // textDocumentSync
         let mut tds = std::collections::BTreeMap::new();
@@ -188,20 +215,28 @@ impl Server {
 
         // completionProvider
         let mut cp = std::collections::BTreeMap::new();
-        cp.insert("triggerCharacters".to_string(), Value::Array(vec![Value::String_(":".to_string())]));
+        cp.insert(
+            "triggerCharacters".to_string(),
+            Value::Array(vec![Value::String_(":".to_string())]),
+        );
         capabilities.insert("completionProvider".to_string(), Value::Object(cp));
 
         capabilities.insert("definitionProvider".to_string(), Value::Bool(true));
         capabilities.insert("referencesProvider".to_string(), Value::Bool(true));
         capabilities.insert("documentSymbolProvider".to_string(), Value::Bool(true));
         capabilities.insert("documentFormattingProvider".to_string(), Value::Bool(true));
-        capabilities.insert("documentRangeFormattingProvider".to_string(), Value::Bool(true));
+        capabilities.insert(
+            "documentRangeFormattingProvider".to_string(),
+            Value::Bool(true),
+        );
         capabilities.insert("renameProvider".to_string(), Value::Bool(true));
         capabilities.insert("foldingRangeProvider".to_string(), Value::Bool(true));
 
         // semanticTokensProvider
         let mut token_types = Vec::new();
-        for t in ["keyword", "function", "variable", "string", "number", "comment", "type", "operator"] {
+        for t in [
+            "keyword", "function", "variable", "string", "number", "comment", "type", "operator",
+        ] {
             token_types.push(Value::String_(t.to_string()));
         }
         let mut token_mods = Vec::new();
@@ -230,47 +265,47 @@ impl Server {
     // 各 LSP method 的占位实现 — 真正逻辑在 providers 模块
     // ---------------------------------------------------------------
     fn handle_hover(&self, params: Value) -> Result<Value, String> {
-        let docs = self.docs.lock().unwrap();
+        let docs = self.docs.lock().expect("docs mutex poisoned");
         super::providers::hover(&docs, &params)
     }
 
     fn handle_completion(&self, params: Value) -> Value {
-        let docs = self.docs.lock().unwrap();
+        let docs = self.docs.lock().expect("docs mutex poisoned");
         super::providers::completion(&docs, &params)
     }
 
     fn handle_definition(&self, params: Value) -> Value {
-        let docs = self.docs.lock().unwrap();
+        let docs = self.docs.lock().expect("docs mutex poisoned");
         super::providers::definition(&docs, &params)
     }
 
     fn handle_references(&self, params: Value) -> Value {
-        let docs = self.docs.lock().unwrap();
+        let docs = self.docs.lock().expect("docs mutex poisoned");
         super::providers::references(&docs, &params)
     }
 
     fn handle_document_symbol(&self, params: Value) -> Value {
-        let docs = self.docs.lock().unwrap();
+        let docs = self.docs.lock().expect("docs mutex poisoned");
         super::providers::document_symbol(&docs, &params)
     }
 
     fn handle_formatting(&self, params: Value, range: bool) -> Value {
-        let docs = self.docs.lock().unwrap();
+        let docs = self.docs.lock().expect("docs mutex poisoned");
         super::providers::formatting(&docs, &params, range)
     }
 
     fn handle_rename(&self, params: Value) -> Value {
-        let docs = self.docs.lock().unwrap();
+        let docs = self.docs.lock().expect("docs mutex poisoned");
         super::providers::rename(&docs, &params)
     }
 
     fn handle_semantic_tokens(&self, params: Value) -> Value {
-        let docs = self.docs.lock().unwrap();
+        let docs = self.docs.lock().expect("docs mutex poisoned");
         super::providers::semantic_tokens(&docs, &params)
     }
 
     fn handle_folding_range(&self, params: Value) -> Value {
-        let docs = self.docs.lock().unwrap();
+        let docs = self.docs.lock().expect("docs mutex poisoned");
         super::providers::folding_range(&docs, &params)
     }
 
@@ -285,78 +320,94 @@ impl Server {
         let tokens = Lexer::new(text).scan_tokens();
         let stmts = Parser::new(tokens).parse();
         let errs = typeck::check_program(&stmts);
-        errs.into_iter().map(|e| {
-            // v0.05: line/column 都是 1-based (typeck)，LSP 是 0-based
-            //   column 默认 0 表示"未知"，减 1 后 = -1 → saturating_sub 保证不溢出
-            let line_0 = e.line.saturating_sub(1);
-            let col_0 = e.column.saturating_sub(1);
-            // v0.05: 把 expected/actual/hint 拼到 message 里（LSP 暂不支持结构化字段）
-            let mut message = e.message.clone();
-            if e.expected.is_some() || e.actual.is_some() || e.hint.is_some() {
-                message.push('\n');
-                if let Some(exp) = &e.expected {
-                    message.push_str(&format!("  expected: {}\n", exp));
+        errs.into_iter()
+            .map(|e| {
+                // v0.05: line/column 都是 1-based (typeck)，LSP 是 0-based
+                //   column 默认 0 表示"未知"，减 1 后 = -1 → saturating_sub 保证不溢出
+                let line_0 = e.line.saturating_sub(1);
+                let col_0 = e.column.saturating_sub(1);
+                // v0.05: 把 expected/actual/hint 拼到 message 里（LSP 暂不支持结构化字段）
+                let mut message = e.message.clone();
+                if e.expected.is_some() || e.actual.is_some() || e.hint.is_some() {
+                    message.push('\n');
+                    if let Some(exp) = &e.expected {
+                        message.push_str(&format!("  expected: {}\n", exp));
+                    }
+                    if let Some(act) = &e.actual {
+                        message.push_str(&format!("  actual:   {}\n", act));
+                    }
+                    if let Some(hint) = &e.hint {
+                        message.push_str(&format!("  hint:     {}\n", hint));
+                    }
+                    // 去掉末尾换行
+                    message = message.trim_end_matches('\n').to_string();
                 }
-                if let Some(act) = &e.actual {
-                    message.push_str(&format!("  actual:   {}\n", act));
+                // v0.05: end 列号策略
+                //   - column > 0 → 精确定位 (col_0 + 1)
+                //   - column = 0 (未知) → 整行标记 (end_column = 1，让 VS Code 高亮行首)
+                let end_col_0 = if e.column == 0 { 1 } else { col_0 + 1 };
+                Diagnostic {
+                    line: line_0,
+                    column: col_0,
+                    end_line: line_0,
+                    end_column: end_col_0,
+                    severity: 1,
+                    message,
+                    source: "mora-typeck".to_string(),
                 }
-                if let Some(hint) = &e.hint {
-                    message.push_str(&format!("  hint:     {}\n", hint));
-                }
-                // 去掉末尾换行
-                message = message.trim_end_matches('\n').to_string();
-            }
-            // v0.05: end 列号策略
-            //   - column > 0 → 精确定位 (col_0 + 1)
-            //   - column = 0 (未知) → 整行标记 (end_column = 1，让 VS Code 高亮行首)
-            let end_col_0 = if e.column == 0 {
-                1
-            } else {
-                col_0 + 1
-            };
-            Diagnostic {
-                line: line_0,
-                column: col_0,
-                end_line: line_0,
-                end_column: end_col_0,
-                severity: 1,
-                message,
-                source: "mora-typeck".to_string(),
-            }
-        }).collect()
+            })
+            .collect()
     }
 
     fn publish_diagnostics(&self, uri: &str, diags: &[Diagnostic]) -> io::Result<()> {
         let mut params = std::collections::BTreeMap::new();
         params.insert("uri".to_string(), Value::String_(uri.to_string()));
-        let arr: Vec<Value> = diags.iter().map(|d| {
-            let mut m = std::collections::BTreeMap::new();
-            m.insert("range".to_string(), Value::Object({
-                let mut r = std::collections::BTreeMap::new();
-                r.insert("start".to_string(), Value::Object({
-                    let mut p = std::collections::BTreeMap::new();
-                    p.insert("line".to_string(), Value::Number(d.line as f64));
-                    p.insert("character".to_string(), Value::Number(d.column as f64));
-                    p
-                }));
-                r.insert("end".to_string(), Value::Object({
-                    let mut p = std::collections::BTreeMap::new();
-                    p.insert("line".to_string(), Value::Number(d.end_line as f64));
-                    p.insert("character".to_string(), Value::Number(d.end_column as f64));
-                    p
-                }));
-                r
-            }));
-            m.insert("severity".to_string(), Value::Number(d.severity as f64));
-            m.insert("source".to_string(), Value::String_(d.source.clone()));
-            m.insert("message".to_string(), Value::String_(d.message.clone()));
-            Value::Object(m)
-        }).collect();
+        let arr: Vec<Value> = diags
+            .iter()
+            .map(|d| {
+                let mut m = std::collections::BTreeMap::new();
+                m.insert(
+                    "range".to_string(),
+                    Value::Object({
+                        let mut r = std::collections::BTreeMap::new();
+                        r.insert(
+                            "start".to_string(),
+                            Value::Object({
+                                let mut p = std::collections::BTreeMap::new();
+                                p.insert("line".to_string(), Value::Number(d.line as f64));
+                                p.insert("character".to_string(), Value::Number(d.column as f64));
+                                p
+                            }),
+                        );
+                        r.insert(
+                            "end".to_string(),
+                            Value::Object({
+                                let mut p = std::collections::BTreeMap::new();
+                                p.insert("line".to_string(), Value::Number(d.end_line as f64));
+                                p.insert(
+                                    "character".to_string(),
+                                    Value::Number(d.end_column as f64),
+                                );
+                                p
+                            }),
+                        );
+                        r
+                    }),
+                );
+                m.insert("severity".to_string(), Value::Number(d.severity as f64));
+                m.insert("source".to_string(), Value::String_(d.source.clone()));
+                m.insert("message".to_string(), Value::String_(d.message.clone()));
+                Value::Object(m)
+            })
+            .collect();
         params.insert("diagnostics".to_string(), Value::Array(arr));
 
         let mut notif = std::collections::BTreeMap::new();
         notif.insert("jsonrpc".to_string(), Value::String_("2.0".to_string()));
-        notif.insert("method".to_string(), Value::String_("textDocument/publishDiagnostics".to_string()));
+        notif.insert(
+            "method".to_string(),
+            Value::String_("textDocument/publishDiagnostics".to_string()),
+        );
         notif.insert("params".to_string(), Value::Object(params));
         let body = Value::Object(notif).to_string();
         let stdout = io::stdout();
@@ -364,19 +415,28 @@ impl Server {
         transport::write_message(&mut lock, &body)
     }
 
-    fn send_response(&self, id: Value, result: Option<Value>, err: Option<String>) -> io::Result<()> {
+    fn send_response(
+        &self,
+        id: Value,
+        result: Option<Value>,
+        err: Option<String>,
+    ) -> io::Result<()> {
         let mut msg = std::collections::BTreeMap::new();
         msg.insert("jsonrpc".to_string(), Value::String_("2.0".to_string()));
         msg.insert("id".to_string(), id);
         match (result, err) {
-            (Some(r), None) => { msg.insert("result".to_string(), r); }
+            (Some(r), None) => {
+                msg.insert("result".to_string(), r);
+            }
             (None, Some(e)) => {
                 let mut err_obj = std::collections::BTreeMap::new();
                 err_obj.insert("code".to_string(), Value::Number(-32603.0));
                 err_obj.insert("message".to_string(), Value::String_(e));
                 msg.insert("error".to_string(), Value::Object(err_obj));
             }
-            _ => { msg.insert("result".to_string(), Value::Null); }
+            _ => {
+                msg.insert("result".to_string(), Value::Null);
+            }
         }
         let body = Value::Object(msg).to_string();
         let stdout = io::stdout();
@@ -390,7 +450,12 @@ pub fn parse_doc_params(params: &Value) -> Option<DocumentState> {
     let uri = td.get("uri")?.as_str()?.to_string();
     let text = td.get("text")?.as_str()?.to_string();
     let version = td.get("version").and_then(|v| v.as_i64()).unwrap_or(0);
-    Some(DocumentState { uri, text, version, diagnostics: vec![] })
+    Some(DocumentState {
+        uri,
+        text,
+        version,
+        diagnostics: vec![],
+    })
 }
 
 pub fn parse_change_params(params: &Value) -> Option<(String, i64, String)> {

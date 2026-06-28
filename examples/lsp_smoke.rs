@@ -10,11 +10,13 @@
 //!
 //! 用 cargo run --example lsp_smoke 跑（依赖已编译的 mora-lsp）
 
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufReader, Read, Write};
 use std::process::{Command, Stdio};
 
 fn main() {
-    let exe = std::env::args().nth(1).unwrap_or_else(|| "mora-lsp".to_string());
+    let exe = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "mora-lsp".to_string());
     println!("[client] launching {}", exe);
 
     let mut child = Command::new(&exe)
@@ -33,10 +35,16 @@ fn main() {
     write_msg(&mut stdin, init);
     let resp = read_msg(&mut reader);
     println!("[client] initialize response: {} bytes", resp.len());
-    assert!(resp.contains("capabilities"), "expected capabilities in response");
+    assert!(
+        resp.contains("capabilities"),
+        "expected capabilities in response"
+    );
 
     // 2. initialized notification
-    write_msg(&mut stdin, r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#);
+    write_msg(
+        &mut stdin,
+        r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#,
+    );
 
     // 3. didOpen with intentionally bad code
     let bad_code = "let x: number = \"hello\"\n";
@@ -49,8 +57,14 @@ fn main() {
     // 4. read publishDiagnostics
     let diag = read_msg(&mut reader);
     println!("[client] diagnostics: {}", diag);
-    assert!(diag.contains("publishDiagnostics"), "expected publishDiagnostics");
-    assert!(diag.contains("type mismatch"), "expected type mismatch error");
+    assert!(
+        diag.contains("publishDiagnostics"),
+        "expected publishDiagnostics"
+    );
+    assert!(
+        diag.contains("type mismatch"),
+        "expected type mismatch error"
+    );
 
     // 5. hover at line 0, char 4 (x identifier)
     let hover = r#"{"jsonrpc":"2.0","id":2,"method":"textDocument/hover","params":{"textDocument":{"uri":"file:///tmp/test.mora"},"position":{"line":0,"character":4}}}"#;
@@ -64,12 +78,21 @@ fn main() {
     write_msg(&mut stdin, comp);
     let comp_resp = read_msg(&mut reader);
     println!("[client] completion: {} bytes", comp_resp.len());
-    assert!(comp_resp.contains("\"id\":3"), "expected completion response");
+    assert!(
+        comp_resp.contains("\"id\":3"),
+        "expected completion response"
+    );
 
     // 7. shutdown + exit
-    write_msg(&mut stdin, r#"{"jsonrpc":"2.0","id":99,"method":"shutdown","params":null}"#);
+    write_msg(
+        &mut stdin,
+        r#"{"jsonrpc":"2.0","id":99,"method":"shutdown","params":null}"#,
+    );
     let _ = read_msg(&mut reader);
-    write_msg(&mut stdin, r#"{"jsonrpc":"2.0","method":"exit","params":null}"#);
+    write_msg(
+        &mut stdin,
+        r#"{"jsonrpc":"2.0","method":"exit","params":null}"#,
+    );
 
     drop(stdin);
     let _ = child.wait();
@@ -93,8 +116,12 @@ fn read_msg<R: Read>(r: &mut R) -> String {
     loop {
         line.clear();
         loop {
-            if r.read(&mut byte).unwrap() == 0 { return String::new(); }
-            if byte[0] == b'\n' { break; }
+            if r.read(&mut byte).unwrap() == 0 {
+                return String::new();
+            }
+            if byte[0] == b'\n' {
+                break;
+            }
             if byte[0] != b'\r' {
                 line.push(byte[0] as char);
             }
@@ -103,10 +130,10 @@ fn read_msg<R: Read>(r: &mut R) -> String {
             // 空行 = header 结束
             break;
         }
-        if let Some((name, value)) = line.split_once(':') {
-            if name.trim().eq_ignore_ascii_case("Content-Length") {
-                content_length = value.trim().parse().ok();
-            }
+        if let Some((name, value)) = line.split_once(':')
+            && name.trim().eq_ignore_ascii_case("Content-Length")
+        {
+            content_length = value.trim().parse().ok();
         }
     }
     let len = content_length.unwrap_or(0);

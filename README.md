@@ -2,8 +2,11 @@
 
 [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.20628917.svg)](https://doi.org/10.5281/zenodo.20628917)
 [![Release](https://img.shields.io/github/v/release/Microbiosis/mora-lang)](https://github.com/Microbiosis/mora-lang/releases/latest)
+[![CI](https://github.com/Microbiosis/mora-lang/actions/workflows/ci.yml/badge.svg)](https://github.com/Microbiosis/mora-lang/actions/workflows/ci.yml)
 
 一个轻量级脚本语言，内建 AI 调用（`p"..."` 表达式）、HTTP server、MCP server、长期记忆、Agent 编排。
+
+**v0.20**: 融合 9 个语言的设计基因 (Prolog、StreamIt、APL、Clojure、Lisp、Smalltalk、Common Lisp、Ballerina、Logo)
 
 ```mora
 -- 一段代码 = HTTP + MCP + 可观测 (v0.04)
@@ -38,7 +41,7 @@ end
 
 ## 安装
 
-从 [Releases](https://github.com/Microbiosis/mora-lang/releases/tag/v0.03) 下载对应平台的二进制包（包含 `mora` + `mora-lsp`），解压后即可使用。
+从 [Releases](https://github.com/Microbiosis/mora-lang/releases/latest) 下载对应平台的二进制包（包含 `mora` + `mora-lsp`），解压后即可使用。
 
 | 平台 | 文件 |
 |------|------|
@@ -77,14 +80,32 @@ cargo build --release
 |------|------|
 | 变量 | `let x = 1`，`let s: string = "你好"` |
 | 函数 | `task foo(x: string): string ... end` |
-| 闭包 | `fn(x) x + 1 end` |
+| 闭包 | `fn(x) return x + 1 end` |
 | 列表 | `[1, 2, 3]`，`list.map(fn)`，`list.filter(fn)`，`list.reduce(fn, init)` |
 | 字典 | `{key: val}`，`dict.get("key")` |
 | 字符串 | `.len()`、`.upper()`、`.lower()`、`.trim()`、`.split()`、`.contains()`、`.replace()` |
-| 流程控制 | `if/then/end`、`for x in list/end`、`try/catch/end`、`match expr with/end` |
+| 流程控制 | `if/then/end`、`for x in list/end`、`match expr with/end` |
 | 管道运算符 | `data \|> func()` |
 | 并行执行 | `parallel ... end` |
 | 模块系统 | `import "path"`，`export let/task` |
+
+### v0.16-v0.20 新特性 (9 语言融合)
+
+| 特性 | 来源 | 语法 |
+|------|------|------|
+| **守卫条件** | Prolog | `match n with x when x > 0 -> ... end` |
+| **列表 rest** | Prolog | `let [head, ...tail] = [1, 2, 3]` |
+| **管道闭包** | StreamIt | `5 \|> fn(x) return x * 2 end` |
+| **窗口聚合** | StreamIt | `[1,2,3,4,5].window(3)` → `[[1,2,3],[2,3,4],[3,4,5]]` |
+| **数组操作** | APL | `.shape()`、`.flatten()`、`.transpose()`、`.reshape()` |
+| **广播算术** | APL | `[1,2,3] * 2` → `[2,4,6]` |
+| **组合函数** | Clojure | `compose(f, g, h)` |
+| **部分应用** | Lisp | `partial(add, 10)` |
+| **原子引用** | Clojure | `atom(0)`、`swap()`、`deref()` |
+| **运行时反射** | Smalltalk | `type_of()`、`is_instance()`、`methods_of()` |
+| **用户宏** | Common Lisp | `macro name(params) ... end` |
+| **Worker 并发** | Ballerina | `parallel worker w1 ... end end` |
+| **事务支持** | Ballerina | `transaction ... compensation ... end` |
 
 ### 标准库
 
@@ -95,6 +116,17 @@ cargo build --release
 | `file.*` | `read_text/write_text/append_text/read_bytes/write_bytes`、`exists/is_file/is_dir/size/list/mkdir/remove/rename/copy/touch`、`cwd/chdir/home_dir/join/abs/basename/dirname/extname` |
 | 持久化 | `save "file.json", value`，`load "file.json", var` |
 | 文件语法糖 | `read "a.txt" into x`，`write "a.txt", content`，`append "a.txt", content` |
+
+### v1.0 方向与项目哲学
+
+Mora **永远不会到达 v1.0**,但**永远在逼近 v1.0**。
+
+- v1.0 的方向是真实的:形式化语义、Hindley-Milner 推断、向量嵌入、长期记忆、SemVer API 稳定性等
+- 这些方向的工作**持续在做**,从 v0.13 起每个版本都推进一部分
+- 因为 v1.0 不到达,所以这些工作**永远做不完,永远在优化**
+- 这是项目基因的一部分 —— 不是"以后再说"的托词,是"现在就在做但永远在路上"的诚实
+
+表中标 🔄 的项 = 正在逼近 v1.0 但仍在演进,不代表"推迟",代表"持续优化方向"。
 
 ### AI 调用
 
@@ -119,13 +151,13 @@ v0.04 把 AI 调用做成语法原语（`p"..."` / `with` / `stream` / `tool` / 
 | 上下文配置 | `with model = "..." / budget = N` | ✅ 块语句 |
 | AI 错误 | `try ... catch e: AiError` | ✅ 类型化错误，注入 dict `{message, code, retryable, attempts, cause}` |
 | 显式 token 计数 | `record_tokens(input, output)` | ✅ 顶层语句 |
-| 向量嵌入 | `ai.embed(text \| list)` | ⏸ 推迟到 v1.0 |
-| 向量运算 | `ai.cosine/dot/euclidean/norm` | ⏸ 推迟到 v1.0 |
-| 语义检索 | `ai.search(query, corpus, k?)` | ⏸ 推迟到 v1.0 |
+| 向量嵌入 | `ai.embed(text \| list)` | 🔄 逼近 v1.0 持续方向 |
+| 向量运算 | `ai.cosine/dot/euclidean/norm` | 🔄 逼近 v1.0 持续方向 |
+| 语义检索 | `ai.search(query, corpus, k?)` | 🔄 逼近 v1.0 持续方向 |
 | 多模型路由 | `route fast: ai_model("gpt-4o-mini")` | ✅ 块语句（旧写法 `route fast: "gpt-4o-mini"` 仍兼容） |
 | Token 预算 | `with budget = N` + `observe trace` | ✅ 由 `with` 配置 + observe metrics 替代 |
 | Token 用量查询 | `observe trace` / `observe metrics` 块内置 | ✅ 由 observe 块 metrics 替代 `ai.usage()` |
-| 长期记忆 | `memory.store/recall/forget/...` | ⏸ 推迟到 v1.0 |
+| 长期记忆 | `memory.store/recall/forget/...` | 🔄 逼近 v1.0 持续方向 |
 | Agent 编排 | `agent.create(name, config).run(task)` | ✅ 保留 |
 | 输出评估 | `agent.critic(text)` / `agent.critic(text, ctx)` | ✅ 保留 |
 

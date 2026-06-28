@@ -6,12 +6,12 @@ end
 
 route fast: ai_model("gpt-4o-mini")
 
-let router = Router::new()
+let router: any = Router::new()
 router = router.route("GET", "/health", fn(req)
   return {status: "ok", version: "v0.07"}
 end)
 router = router.route("GET", "/greet", fn(req)
-  let name := req["query"]["name"]
+  let name: string = req["query"]["name"]
   return "hello, " + name
 end)
 router = router.route("POST", "/echo", fn(req)
@@ -21,21 +21,21 @@ router = router.route("POST", "/echo", fn(req)
   }
 end)
 router = router.route("GET", "/users/:id", fn(req)
-  let user_id := req["params"]["id"]
+  let user_id: string = req["params"]["id"]
   return {user: user_id}
 end)
 router = router.route("POST", "/json", fn(req)
   -- req.json() 返回 Result<Value, ParseError>，用 ? 解包
-  let result := req.json()
-  let val := result.get("ok")
+  let result: any = req.json()
+  let val: any = result.get("ok")
   return {parsed: val, status: "ok"}
 end)
 
 router = router.route("POST", "/json-validate", fn(req)
   -- String.json() 直接解析 body 字符串
-  let body_str := req["body"]
-  let parsed := body_str.json()
-  let ok_val := parsed.get("ok")
+  let body_str: any = req["body"]
+  let parsed: any = body_str.json()
+  let ok_val: any = parsed.get("ok")
   return {data: ok_val}
 end)
 

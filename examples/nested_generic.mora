@@ -1,0 +1,25 @@
+-- v0.09 完整版: 嵌套泛型 demo
+-- 测: Container<Boxed<number>> 嵌套泛型 dispatch
+-- v0.09 简化版: 用 Mock function 代替 struct literal
+
+trait Boxed<T>
+  fn unbox(self) -> T
+end
+
+trait Container<T>
+  fn get(self) -> T
+end
+
+impl Boxed<number> for NumBox
+  fn unbox(self) = 42
+end
+
+impl Container<Boxed<number>> for Outer
+  fn get(self) = 42  -- v0.09 简化版: hardcoded value
+end
+
+task main()
+  let c: dyn Container<Boxed<number>> = Container<Boxed<number>>::new("Outer")
+  let inner = c.get()
+  print("nested generics demo done")
+end

@@ -21,7 +21,7 @@ pub fn read_message<R: Read>(reader: &mut R) -> io::Result<Option<String>> {
         // 读一个 byte 序列直到 \n
         loop {
             match reader.read(&mut byte_buf) {
-                Ok(0) => return Ok(None),  // EOF
+                Ok(0) => return Ok(None), // EOF
                 Ok(_) => {
                     if byte_buf[0] == b'\n' {
                         break;
@@ -43,22 +43,26 @@ pub fn read_message<R: Read>(reader: &mut R) -> io::Result<Option<String>> {
     // 解析 Content-Length
     let mut content_length: Option<usize> = None;
     for line in &header_lines {
-        if let Some((name, value)) = line.split_once(':') {
-            if name.trim().eq_ignore_ascii_case("Content-Length") {
-                content_length = value.trim().parse().ok();
-            }
+        if let Some((name, value)) = line.split_once(':')
+            && name.trim().eq_ignore_ascii_case("Content-Length")
+        {
+            content_length = value.trim().parse().ok();
         }
     }
     let len = match content_length {
         Some(n) => n,
-        None => return Err(io::Error::new(io::ErrorKind::InvalidData, "missing Content-Length")),
+        None => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "missing Content-Length",
+            ));
+        }
     };
 
     // 读 body
     let mut body = vec![0u8; len];
     reader.read_exact(&mut body)?;
-    let s = String::from_utf8(body)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let s = String::from_utf8(body).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     Ok(Some(s))
 }
 

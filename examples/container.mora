@@ -1,0 +1,25 @@
+-- v0.09 完整版: 泛型 Container trait demo
+-- 测: trait 带 1 个类型参数，impl 多种实例化，dispatch key 隔离
+
+trait Container<T>
+  fn put(self, key: string, value: T)
+  fn get(self, key: string) -> T
+end
+
+impl Container<number> for NumStore
+  fn put(self, key, value) = print("num[" + key + "]=" + value)
+  fn get(self, key) = 0  -- 模拟返回
+end
+
+impl Container<string> for StrStore
+  fn put(self, key, value) = print("str[" + key + "]=" + value)
+  fn get(self, key) = ""
+end
+
+task main()
+  let n: dyn Container<number> = Container<number>::new("NumStore")
+  let s: dyn Container<string> = Container<string>::new("StrStore")
+  n.put("age", 30)
+  s.put("name", "Alice")
+  print("v0.09 trait generics demo done")
+end

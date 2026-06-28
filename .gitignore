@@ -4,4 +4,4 @@
 *.tmp
 *.tmp.*
 .worktrees/
-docs/
+.mora/

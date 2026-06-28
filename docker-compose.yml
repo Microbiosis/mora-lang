@@ -2,25 +2,25 @@
 #
 # 用法:
 #   docker compose up mora-repl        # 启动 REPL
-#   docker compose up mora-serve       # 启动 HTTP API
-#   docker compose run mora-repl examples/memory_demo.mora  # 运行脚本
+#   docker compose up mora-http        # 启动 HTTP API
+#   docker compose run mora-repl examples/http_server_demo.mora  # 运行脚本
 
 services:
-  # 运行脚本
+  # REPL 交互式环境
   mora-repl:
     build: .
     stdin_open: true
     tty: true
 
   # HTTP API 服务
-  mora-serve:
+  mora-http:
     build: .
-    command: ["mora-serve", "examples/serve_init.mora", "--port", "3000"]
+    command: ["mora", "examples/http_server_demo.mora"]
     ports:
       - "3000:3000"
 
   # MCP server（供 Claude Desktop 等客户端）
   mora-mcp:
     build: .
-    command: ["mora-mcp", "examples/mcp_init.mora"]
+    command: ["mora", "examples/mcp_server_demo.mora"]
     stdin_open: true

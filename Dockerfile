@@ -1,4 +1,4 @@
-# Mora v0.04 — AI 原生 + 云服务原生（单二进制多协议）
+# Mora v0.20 — AI 原生脚本语言 (9 语言融合)
 # 多阶段构建：编译阶段 + 运行阶段
 
 # ============================================================
@@ -13,8 +13,7 @@ COPY Cargo.toml Cargo.lock ./
 COPY src/ src/
 COPY examples/ examples/
 
-# v0.04 终态：只 build 2 个二进制（mora + mora-lsp）
-# mora-mcp / mora-serve 已删除（v0.04 终态用单二进制多协议）
+# 构建 mora + mora-lsp
 RUN cargo build --release --target x86_64-unknown-linux-musl && \
     strip target/x86_64-unknown-linux-musl/release/mora && \
     strip target/x86_64-unknown-linux-musl/release/mora-lsp

@@ -22,24 +22,40 @@ pub enum Value {
     Number(f64),
     String_(String),
     Array(Vec<Value>),
-    Object(BTreeMap<String, Value>),  // BTreeMap 让序列化确定性
+    Object(BTreeMap<String, Value>), // BTreeMap 让序列化确定性
 }
 
 impl Value {
     pub fn as_str(&self) -> Option<&str> {
-        if let Value::String_(s) = self { Some(s.as_str()) } else { None }
+        if let Value::String_(s) = self {
+            Some(s.as_str())
+        } else {
+            None
+        }
     }
 
     pub fn as_i64(&self) -> Option<i64> {
-        if let Value::Number(n) = self { Some(*n as i64) } else { None }
+        if let Value::Number(n) = self {
+            Some(*n as i64)
+        } else {
+            None
+        }
     }
 
     pub fn as_object(&self) -> Option<&BTreeMap<String, Value>> {
-        if let Value::Object(m) = self { Some(m) } else { None }
+        if let Value::Object(m) = self {
+            Some(m)
+        } else {
+            None
+        }
     }
 
     pub fn as_array(&self) -> Option<&Vec<Value>> {
-        if let Value::Array(a) = self { Some(a) } else { None }
+        if let Value::Array(a) = self {
+            Some(a)
+        } else {
+            None
+        }
     }
 
     pub fn get(&self, key: &str) -> Option<&Value> {
@@ -77,7 +93,9 @@ fn write_value(f: &mut fmt::Formatter<'_>, v: &Value) -> fmt::Result {
         Value::Array(items) => {
             f.write_str("[")?;
             for (i, it) in items.iter().enumerate() {
-                if i > 0 { f.write_str(",")?; }
+                if i > 0 {
+                    f.write_str(",")?;
+                }
                 write_value(f, it)?;
             }
             f.write_str("]")
@@ -85,7 +103,9 @@ fn write_value(f: &mut fmt::Formatter<'_>, v: &Value) -> fmt::Result {
         Value::Object(map) => {
             f.write_str("{")?;
             for (i, (k, v)) in map.iter().enumerate() {
-                if i > 0 { f.write_str(",")?; }
+                if i > 0 {
+                    f.write_str(",")?;
+                }
                 write!(f, "\"{}\":", escape_string(k))?;
                 write_value(f, v)?;
             }
@@ -121,7 +141,10 @@ pub struct Parser<'a> {
 
 impl<'a> Parser<'a> {
     pub fn new(s: &'a str) -> Self {
-        Self { bytes: s.as_bytes(), pos: 0 }
+        Self {
+            bytes: s.as_bytes(),
+            pos: 0,
+        }
     }
 
     pub fn parse_value(&mut self) -> Result<Value, String> {
@@ -209,7 +232,9 @@ impl<'a> Parser<'a> {
 
     fn parse_number(&mut self) -> Result<Value, String> {
         let start = self.pos;
-        if self.bytes[self.pos] == b'-' { self.pos += 1; }
+        if self.bytes[self.pos] == b'-' {
+            self.pos += 1;
+        }
         while self.pos < self.bytes.len() && self.bytes[self.pos].is_ascii_digit() {
             self.pos += 1;
         }
@@ -219,9 +244,13 @@ impl<'a> Parser<'a> {
                 self.pos += 1;
             }
         }
-        if self.pos < self.bytes.len() && (self.bytes[self.pos] == b'e' || self.bytes[self.pos] == b'E') {
+        if self.pos < self.bytes.len()
+            && (self.bytes[self.pos] == b'e' || self.bytes[self.pos] == b'E')
+        {
             self.pos += 1;
-            if self.pos < self.bytes.len() && (self.bytes[self.pos] == b'+' || self.bytes[self.pos] == b'-') {
+            if self.pos < self.bytes.len()
+                && (self.bytes[self.pos] == b'+' || self.bytes[self.pos] == b'-')
+            {
                 self.pos += 1;
             }
             while self.pos < self.bytes.len() && self.bytes[self.pos].is_ascii_digit() {
@@ -250,8 +279,13 @@ impl<'a> Parser<'a> {
                 return Err("unterminated array".to_string());
             }
             match self.bytes[self.pos] {
-                b',' => { self.pos += 1; }
-                b']' => { self.pos += 1; return Ok(Value::Array(items)); }
+                b',' => {
+                    self.pos += 1;
+                }
+                b']' => {
+                    self.pos += 1;
+                    return Ok(Value::Array(items));
+                }
                 _ => return Err("expected ',' or ']'".to_string()),
             }
         }
@@ -281,8 +315,13 @@ impl<'a> Parser<'a> {
                 return Err("unterminated object".to_string());
             }
             match self.bytes[self.pos] {
-                b',' => { self.pos += 1; }
-                b'}' => { self.pos += 1; return Ok(Value::Object(map)); }
+                b',' => {
+                    self.pos += 1;
+                }
+                b'}' => {
+                    self.pos += 1;
+                    return Ok(Value::Object(map));
+                }
                 _ => return Err("expected ',' or '}'".to_string()),
             }
         }
@@ -316,18 +355,43 @@ mod tests {
     #[test]
     fn parse_primitives() {
         assert_eq!(Parser::new("null").parse_value().unwrap(), Value::Null);
-        assert_eq!(Parser::new("true").parse_value().unwrap(), Value::Bool(true));
-        assert_eq!(Parser::new("false").parse_value().unwrap(), Value::Bool(false));
-        assert_eq!(Parser::new("42").parse_value().unwrap(), Value::Number(42.0));
-        assert_eq!(Parser::new("3.14").parse_value().unwrap(), Value::Number(3.14));
-        assert_eq!(Parser::new("-1").parse_value().unwrap(), Value::Number(-1.0));
-        assert_eq!(Parser::new("\"hi\"").parse_value().unwrap(), Value::String_("hi".to_string()));
+        assert_eq!(
+            Parser::new("true").parse_value().unwrap(),
+            Value::Bool(true)
+        );
+        assert_eq!(
+            Parser::new("false").parse_value().unwrap(),
+            Value::Bool(false)
+        );
+        assert_eq!(
+            Parser::new("42").parse_value().unwrap(),
+            Value::Number(42.0)
+        );
+        assert_eq!(
+            Parser::new("1.5").parse_value().unwrap(),
+            Value::Number(1.5)
+        );
+        assert_eq!(
+            Parser::new("-1").parse_value().unwrap(),
+            Value::Number(-1.0)
+        );
+        assert_eq!(
+            Parser::new("\"hi\"").parse_value().unwrap(),
+            Value::String_("hi".to_string())
+        );
     }
 
     #[test]
     fn parse_array() {
         let v = Parser::new("[1, 2, 3]").parse_value().unwrap();
-        assert_eq!(v, Value::Array(vec![Value::Number(1.0), Value::Number(2.0), Value::Number(3.0)]));
+        assert_eq!(
+            v,
+            Value::Array(vec![
+                Value::Number(1.0),
+                Value::Number(2.0),
+                Value::Number(3.0)
+            ])
+        );
     }
 
     #[test]
@@ -336,7 +400,9 @@ mod tests {
         if let Value::Object(m) = v {
             assert_eq!(m.get("a"), Some(&Value::Number(1.0)));
             assert_eq!(m.get("b"), Some(&Value::String_("x".to_string())));
-        } else { panic!(); }
+        } else {
+            panic!();
+        }
     }
 
     #[test]
@@ -346,16 +412,26 @@ mod tests {
         if let Value::Object(m) = v {
             assert_eq!(m.get("jsonrpc").and_then(|v| v.as_str()), Some("2.0"));
             assert_eq!(m.get("id").and_then(|v| v.as_i64()), Some(1));
-        } else { panic!(); }
+        } else {
+            panic!();
+        }
     }
 
     #[test]
     fn serialize_roundtrip() {
-        let original = Value::Object([
-            ("a".to_string(), Value::Number(1.0)),
-            ("b".to_string(), Value::String_("hi\n".to_string())),
-            ("c".to_string(), Value::Array(vec![Value::Bool(true), Value::Null])),
-        ].iter().cloned().collect());
+        let original = Value::Object(
+            [
+                ("a".to_string(), Value::Number(1.0)),
+                ("b".to_string(), Value::String_("hi\n".to_string())),
+                (
+                    "c".to_string(),
+                    Value::Array(vec![Value::Bool(true), Value::Null]),
+                ),
+            ]
+            .iter()
+            .cloned()
+            .collect(),
+        );
         let s = original.to_string();
         let parsed = Parser::new(&s).parse_value().unwrap();
         assert_eq!(original, parsed);

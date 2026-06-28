@@ -207,9 +207,11 @@ impl Recorder {
             let file = fs::File::create(path)
                 .map_err(|e| format!("recorder: failed to create {}: {}", path.display(), e))?;
             let mut encoder = flate2::write::GzEncoder::new(file, flate2::Compression::default());
-            encoder.write_all(out.as_bytes())
+            encoder
+                .write_all(out.as_bytes())
                 .map_err(|e| format!("recorder: failed to compress: {}", e))?;
-            encoder.finish()
+            encoder
+                .finish()
                 .map_err(|e| format!("recorder: failed to finish compression: {}", e))?;
         } else {
             fs::write(path, out)
@@ -714,8 +716,8 @@ pub fn list_recordings(dir: &Path) -> Result<Vec<RecordingInfo>, String> {
     if !dir.exists() {
         return Ok(Vec::new());
     }
-    let entries = fs::read_dir(dir)
-        .map_err(|e| format!("list: failed to read {}: {}", dir.display(), e))?;
+    let entries =
+        fs::read_dir(dir).map_err(|e| format!("list: failed to read {}: {}", dir.display(), e))?;
     let mut infos = Vec::new();
     for entry in entries {
         let entry = entry.map_err(|e| format!("list: read_dir error: {}", e))?;
@@ -725,8 +727,8 @@ pub fn list_recordings(dir: &Path) -> Result<Vec<RecordingInfo>, String> {
                 .file_stem()
                 .map(|s| s.to_string_lossy().to_string())
                 .unwrap_or_default();
-            let metadata = fs::metadata(&path)
-                .map_err(|e| format!("list: metadata error: {}", e))?;
+            let metadata =
+                fs::metadata(&path).map_err(|e| format!("list: metadata error: {}", e))?;
             let size_bytes = metadata.len();
             // 快速计数事件数
             let event_count = count_lines(&path).unwrap_or(0);
@@ -760,7 +762,11 @@ pub struct RecordingInfo {
 fn count_lines(path: &Path) -> Result<usize, String> {
     let file = fs::File::open(path).map_err(|e| e.to_string())?;
     let reader = BufReader::new(file);
-    Ok(reader.lines().map_while(Result::ok).filter(|l| !l.trim().is_empty()).count())
+    Ok(reader
+        .lines()
+        .map_while(Result::ok)
+        .filter(|l| !l.trim().is_empty())
+        .count())
 }
 
 fn load_time_range(path: &Path) -> (u128, u128) {
@@ -834,9 +840,7 @@ pub fn compute_stats(events: &[Event]) -> RecordingStats {
                 }
             }
             Event::WebFetch {
-                latency_ms,
-                error,
-                ..
+                latency_ms, error, ..
             } => {
                 stats.web_fetch_count += 1;
                 stats.total_latency_ms += latency_ms;
@@ -975,7 +979,10 @@ fn export_markdown(events: &[Event], name: &str) -> String {
     md.push_str(&format!("- AI calls: {}\n", stats.ai_chat_count));
     md.push_str(&format!("- Web calls: {}\n", stats.web_fetch_count));
     md.push_str(&format!("- Errors: {}\n", stats.error_count));
-    md.push_str(&format!("- Tokens: {} in + {} out\n", stats.total_tokens_in, stats.total_tokens_out));
+    md.push_str(&format!(
+        "- Tokens: {} in + {} out\n",
+        stats.total_tokens_in, stats.total_tokens_out
+    ));
     md.push_str(&format!("- Duration: {}ms\n\n", stats.duration_ms));
 
     md.push_str("## Timeline\n\n");
@@ -983,9 +990,15 @@ fn export_markdown(events: &[Event], name: &str) -> String {
     md.push_str("|---|------|--------|--------|---------|--------|\n");
     let rows = build_timeline(events);
     for row in &rows {
-        let detail = if row.detail.len() > 40 { format!("{}…", &row.detail[..39]) } else { row.detail.clone() };
-        md.push_str(&format!("| {} | {} | {} | {} | {}ms | {} |\n",
-            row.seq, row.kind, detail, row.tokens, row.latency_ms, row.status));
+        let detail = if row.detail.len() > 40 {
+            format!("{}…", &row.detail[..39])
+        } else {
+            row.detail.clone()
+        };
+        md.push_str(&format!(
+            "| {} | {} | {} | {} | {}ms | {} |\n",
+            row.seq, row.kind, detail, row.tokens, row.latency_ms, row.status
+        ));
     }
     md
 }
@@ -999,16 +1012,18 @@ pub fn redact_secrets(s: &str) -> String {
     while i < len {
         // 检查 sk-xxx, key-xxx 模式
         if i + 3 <= len {
-            let prefix: String = chars[i..i+3.min(len - i)].iter().collect();
+            let prefix: String = chars[i..i + 3.min(len - i)].iter().collect();
             if (prefix == "sk-" || prefix == "ke") && i + 4 <= len {
                 // key-
-                let longer: String = chars[i..i+4.min(len - i)].iter().collect();
+                let longer: String = chars[i..i + 4.min(len - i)].iter().collect();
                 if prefix == "sk-" || longer == "key-" {
                     // 找到前缀，收集后续字母数字
                     let start = i;
                     let p = if prefix == "sk-" { "sk-" } else { "key-" };
                     i += p.len();
-                    while i < len && (chars[i].is_alphanumeric() || chars[i] == '_' || chars[i] == '-') {
+                    while i < len
+                        && (chars[i].is_alphanumeric() || chars[i] == '_' || chars[i] == '-')
+                    {
                         i += 1;
                     }
                     if i - start > 20 {
@@ -1027,14 +1042,20 @@ pub fn redact_secrets(s: &str) -> String {
         }
         // 检查 Bearer xxx
         if i + 7 <= len {
-            let bearer: String = chars[i..i+7].iter().collect();
+            let bearer: String = chars[i..i + 7].iter().collect();
             if bearer == "Bearer " {
                 let start = i;
                 i += 7;
-                while i < len && (chars[i].is_alphanumeric() || chars[i] == '_' || chars[i] == '-' || chars[i] == '.') {
+                while i < len
+                    && (chars[i].is_alphanumeric()
+                        || chars[i] == '_'
+                        || chars[i] == '-'
+                        || chars[i] == '.')
+                {
                     i += 1;
                 }
-                if i - start > 27 { // "Bearer " (7) + 20+ chars
+                if i - start > 27 {
+                    // "Bearer " (7) + 20+ chars
                     out.push_str("Bearer <REDACTED>");
                     continue;
                 } else {
@@ -1082,7 +1103,10 @@ pub fn parse_moraignore(content: &str) -> Vec<IgnoreRule> {
                 Some(IgnoreRule::Field(field.trim().to_string()))
             } else if let Some(path) = line.strip_prefix("path:") {
                 Some(IgnoreRule::Path(path.trim().to_string()))
-            } else { line.strip_prefix("pattern:").map(|pat| IgnoreRule::Pattern(pat.trim().to_string())) }
+            } else {
+                line.strip_prefix("pattern:")
+                    .map(|pat| IgnoreRule::Pattern(pat.trim().to_string()))
+            }
         })
         .collect()
 }
@@ -1128,7 +1152,11 @@ fn audit_json_value(event_id: u64, field: &str, value: &str, findings: &mut Vec<
                 .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '-' || *c == '.')
                 .count();
             if token_len >= 20 {
-                let preview = format!("{}{}", prefix, &value[token_start..token_start + 5.min(token_len)]);
+                let preview = format!(
+                    "{}{}",
+                    prefix,
+                    &value[token_start..token_start + 5.min(token_len)]
+                );
                 findings.push(AuditFinding {
                     event_id,
                     field: field.to_string(),
@@ -1145,9 +1173,12 @@ pub fn audit_recording(events: &[Event], ignore_rules: &[IgnoreRule]) -> Vec<Aud
     let mut findings = Vec::new();
     for ev in events {
         let (id, json_str) = match ev {
-            Event::AiChat { id, response, prompt_preview, .. } => {
-                (*id, format!("{} {}", prompt_preview, response))
-            }
+            Event::AiChat {
+                id,
+                response,
+                prompt_preview,
+                ..
+            } => (*id, format!("{} {}", prompt_preview, response)),
             Event::WebFetch { id, url, .. } => (*id, url.clone()),
             Event::Note { id, message, .. } => (*id, message.clone()),
         };
@@ -1204,9 +1235,12 @@ pub fn generate_report(
     md.push_str(&format!("| AI Calls | {} |\n", stats.ai_chat_count));
     md.push_str(&format!("| Web Calls | {} |\n", stats.web_fetch_count));
     md.push_str(&format!("| Errors | {} |\n", stats.error_count));
-    md.push_str(&format!("| Tokens (in+out) | {}+{}={} |\n",
-        stats.total_tokens_in, stats.total_tokens_out,
-        stats.total_tokens_in + stats.total_tokens_out));
+    md.push_str(&format!(
+        "| Tokens (in+out) | {}+{}={} |\n",
+        stats.total_tokens_in,
+        stats.total_tokens_out,
+        stats.total_tokens_in + stats.total_tokens_out
+    ));
     md.push_str(&format!("| Duration | {}ms |\n", stats.duration_ms));
     md.push('\n');
 
@@ -1215,10 +1249,18 @@ pub fn generate_report(
     if findings.is_empty() {
         md.push_str("✓ No secrets detected.\n\n");
     } else {
-        md.push_str(&format!("⚠ {} potential secret(s) found:\n\n", findings.len()));
-        md.push_str("| Event | Field | Pattern | Preview |\n|-------|-------|---------|----------|\n");
+        md.push_str(&format!(
+            "⚠ {} potential secret(s) found:\n\n",
+            findings.len()
+        ));
+        md.push_str(
+            "| Event | Field | Pattern | Preview |\n|-------|-------|---------|----------|\n",
+        );
         for f in &findings {
-            md.push_str(&format!("| {} | {} | {} | {} |\n", f.event_id, f.field, f.pattern, f.preview));
+            md.push_str(&format!(
+                "| {} | {} | {} | {} |\n",
+                f.event_id, f.field, f.pattern, f.preview
+            ));
         }
         md.push('\n');
     }
@@ -1228,9 +1270,15 @@ pub fn generate_report(
     md.push_str("| # | Kind | Detail | Tokens | Lat(ms) | Status |\n");
     md.push_str("|---|------|--------|--------|---------|--------|\n");
     for row in &build_timeline(events) {
-        let detail = if row.detail.len() > 50 { format!("{}…", &row.detail[..49]) } else { row.detail.clone() };
-        md.push_str(&format!("| {} | {} | {} | {} | {} | {} |\n",
-            row.seq, row.kind, detail, row.tokens, row.latency_ms, row.status));
+        let detail = if row.detail.len() > 50 {
+            format!("{}…", &row.detail[..49])
+        } else {
+            row.detail.clone()
+        };
+        md.push_str(&format!(
+            "| {} | {} | {} | {} | {} | {} |\n",
+            row.seq, row.kind, detail, row.tokens, row.latency_ms, row.status
+        ));
     }
     md.push('\n');
 
@@ -1258,7 +1306,7 @@ pub struct SnapshotBaseline {
 #[derive(Clone, Debug, PartialEq)]
 pub struct EventSummary {
     pub kind: String,
-    pub key: String,      // model+prompt_hash 或 url
+    pub key: String, // model+prompt_hash 或 url
     pub tokens_in: usize,
     pub tokens_out: usize,
     pub has_error: bool,
@@ -1266,7 +1314,14 @@ pub struct EventSummary {
 
 fn event_to_summary(ev: &Event) -> EventSummary {
     match ev {
-        Event::AiChat { model, prompt_hash, tokens_in, tokens_out, error, .. } => EventSummary {
+        Event::AiChat {
+            model,
+            prompt_hash,
+            tokens_in,
+            tokens_out,
+            error,
+            ..
+        } => EventSummary {
             kind: "ai.chat".to_string(),
             key: format!("{}|{}", model, prompt_hash),
             tokens_in: *tokens_in,
@@ -1301,7 +1356,11 @@ pub fn create_snapshot(name: &str, events: &[Event]) -> SnapshotBaseline {
 
 /// 快照基线序列化为 JSONL (简化格式)
 pub fn snapshot_to_jsonl(snap: &SnapshotBaseline) -> String {
-    let mut out = format!("{{\"name\":\"{}\",\"created_ms\":{}}}\n", esc(&snap.name), snap.created_ms);
+    let mut out = format!(
+        "{{\"name\":\"{}\",\"created_ms\":{}}}\n",
+        esc(&snap.name),
+        snap.created_ms
+    );
     for s in &snap.event_summaries {
         out.push_str(&format!(
             "{{\"kind\":\"{}\",\"key\":\"{}\",\"tokens_in\":{},\"tokens_out\":{},\"has_error\":{}}}\n",
@@ -1314,7 +1373,9 @@ pub fn snapshot_to_jsonl(snap: &SnapshotBaseline) -> String {
 /// 从 JSONL 解析快照基线
 pub fn snapshot_from_jsonl(content: &str) -> Option<SnapshotBaseline> {
     let lines: Vec<&str> = content.lines().collect();
-    if lines.is_empty() { return None; }
+    if lines.is_empty() {
+        return None;
+    }
     let first = lines[0];
     // 提取 name 和 created_ms
     let name = extract_json_string(first, "name")?;
@@ -1326,9 +1387,19 @@ pub fn snapshot_from_jsonl(content: &str) -> Option<SnapshotBaseline> {
         let tokens_in = extract_json_number(line, "tokens_in").unwrap_or(0) as usize;
         let tokens_out = extract_json_number(line, "tokens_out").unwrap_or(0) as usize;
         let has_error = line.contains("\"has_error\":true");
-        summaries.push(EventSummary { kind, key, tokens_in, tokens_out, has_error });
+        summaries.push(EventSummary {
+            kind,
+            key,
+            tokens_in,
+            tokens_out,
+            has_error,
+        });
     }
-    Some(SnapshotBaseline { name, event_summaries: summaries, created_ms })
+    Some(SnapshotBaseline {
+        name,
+        event_summaries: summaries,
+        created_ms,
+    })
 }
 
 fn extract_json_string(line: &str, key: &str) -> Option<String> {
@@ -1343,7 +1414,9 @@ fn extract_json_number(line: &str, key: &str) -> Option<u128> {
     let pattern = format!("\"{}\":", key);
     let start = line.find(&pattern)? + pattern.len();
     let rest = &line[start..];
-    let end = rest.find(|c: char| !c.is_ascii_digit()).unwrap_or(rest.len());
+    let end = rest
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(rest.len());
     rest[..end].parse().ok()
 }
 
@@ -1355,11 +1428,18 @@ pub enum SnapshotDiff {
     /// 事件数不同
     CountMismatch { expected: usize, actual: usize },
     /// 单个事件不同
-    EventChanged { index: usize, expected: EventSummary, actual: EventSummary },
+    EventChanged {
+        index: usize,
+        expected: EventSummary,
+        actual: EventSummary,
+    },
     /// 新增事件
     EventAdded { index: usize, actual: EventSummary },
     /// 缺失事件
-    EventMissing { index: usize, expected: EventSummary },
+    EventMissing {
+        index: usize,
+        expected: EventSummary,
+    },
 }
 
 /// 对比快照基线与当前事件
@@ -1381,10 +1461,16 @@ pub fn diff_snapshot(baseline: &SnapshotBaseline, current: &[Event]) -> Vec<Snap
                 }
             }
             (Some(expected), None) => {
-                diffs.push(SnapshotDiff::EventMissing { index: i, expected: expected.clone() });
+                diffs.push(SnapshotDiff::EventMissing {
+                    index: i,
+                    expected: expected.clone(),
+                });
             }
             (None, Some(actual)) => {
-                diffs.push(SnapshotDiff::EventAdded { index: i, actual: actual.clone() });
+                diffs.push(SnapshotDiff::EventAdded {
+                    index: i,
+                    actual: actual.clone(),
+                });
             }
             (None, None) => {}
         }
@@ -1643,7 +1729,15 @@ mod tests {
         let _ = fs::remove_file(&path);
         let mut r = Recorder::new_record(path.clone()).unwrap();
         r.record_ai_chat("gpt-4o".into(), "p".into(), "r".into(), 100, 50, 200, None);
-        r.record_ai_chat("gpt-4o".into(), "p2".into(), "r2".into(), 200, 100, 300, None);
+        r.record_ai_chat(
+            "gpt-4o".into(),
+            "p2".into(),
+            "r2".into(),
+            200,
+            100,
+            300,
+            None,
+        );
         r.record_web_fetch("https://x.com".into(), "GET".into(), 200, 1024, 50, None);
         r.record_note("test".into());
         r.save().unwrap();
@@ -1672,9 +1766,18 @@ mod tests {
 
     #[test]
     fn export_jsonl_roundtrip() {
-        let events = vec![
-            Event::AiChat { id: 1, ts_ms: 1000, model: "m".into(), prompt_hash: "h".into(), prompt_preview: "p".into(), response: "r".into(), tokens_in: 10, tokens_out: 5, latency_ms: 100, error: None },
-        ];
+        let events = vec![Event::AiChat {
+            id: 1,
+            ts_ms: 1000,
+            model: "m".into(),
+            prompt_hash: "h".into(),
+            prompt_preview: "p".into(),
+            response: "r".into(),
+            tokens_in: 10,
+            tokens_out: 5,
+            latency_ms: 100,
+            error: None,
+        }];
         let jsonl = export_recording(&events, &ExportFormat::Jsonl, "test");
         assert!(jsonl.contains("\"kind\":\"ai.chat\""));
         assert!(jsonl.contains("\"model\":\"m\""));
@@ -1682,9 +1785,18 @@ mod tests {
 
     #[test]
     fn export_markdown_has_table() {
-        let events = vec![
-            Event::AiChat { id: 1, ts_ms: 1000, model: "m".into(), prompt_hash: "h".into(), prompt_preview: "p".into(), response: "r".into(), tokens_in: 10, tokens_out: 5, latency_ms: 100, error: None },
-        ];
+        let events = vec![Event::AiChat {
+            id: 1,
+            ts_ms: 1000,
+            model: "m".into(),
+            prompt_hash: "h".into(),
+            prompt_preview: "p".into(),
+            response: "r".into(),
+            tokens_in: 10,
+            tokens_out: 5,
+            latency_ms: 100,
+            error: None,
+        }];
         let md = export_recording(&events, &ExportFormat::Markdown, "test");
         assert!(md.contains("# Recording: test"));
         assert!(md.contains("| # | Kind |"));
@@ -1709,9 +1821,18 @@ mod tests {
 
     #[test]
     fn snapshot_roundtrip() {
-        let events = vec![
-            Event::AiChat { id: 1, ts_ms: 1000, model: "m".into(), prompt_hash: "h".into(), prompt_preview: "p".into(), response: "r".into(), tokens_in: 10, tokens_out: 5, latency_ms: 100, error: None },
-        ];
+        let events = vec![Event::AiChat {
+            id: 1,
+            ts_ms: 1000,
+            model: "m".into(),
+            prompt_hash: "h".into(),
+            prompt_preview: "p".into(),
+            response: "r".into(),
+            tokens_in: 10,
+            tokens_out: 5,
+            latency_ms: 100,
+            error: None,
+        }];
         let snap = create_snapshot("test", &events);
         let jsonl = snapshot_to_jsonl(&snap);
         let restored = snapshot_from_jsonl(&jsonl).unwrap();
@@ -1722,9 +1843,18 @@ mod tests {
 
     #[test]
     fn snapshot_diff_match() {
-        let events = vec![
-            Event::AiChat { id: 1, ts_ms: 1000, model: "m".into(), prompt_hash: "h".into(), prompt_preview: "p".into(), response: "r".into(), tokens_in: 10, tokens_out: 5, latency_ms: 100, error: None },
-        ];
+        let events = vec![Event::AiChat {
+            id: 1,
+            ts_ms: 1000,
+            model: "m".into(),
+            prompt_hash: "h".into(),
+            prompt_preview: "p".into(),
+            response: "r".into(),
+            tokens_in: 10,
+            tokens_out: 5,
+            latency_ms: 100,
+            error: None,
+        }];
         let snap = create_snapshot("test", &events);
         let diffs = diff_snapshot(&snap, &events);
         assert_eq!(diffs.len(), 1);
@@ -1733,37 +1863,102 @@ mod tests {
 
     #[test]
     fn snapshot_diff_changed() {
-        let events_a = vec![
-            Event::AiChat { id: 1, ts_ms: 1000, model: "m".into(), prompt_hash: "h".into(), prompt_preview: "p".into(), response: "r".into(), tokens_in: 10, tokens_out: 5, latency_ms: 100, error: None },
-        ];
-        let events_b = vec![
-            Event::AiChat { id: 1, ts_ms: 1000, model: "m2".into(), prompt_hash: "h".into(), prompt_preview: "p".into(), response: "r".into(), tokens_in: 20, tokens_out: 10, latency_ms: 200, error: None },
-        ];
+        let events_a = vec![Event::AiChat {
+            id: 1,
+            ts_ms: 1000,
+            model: "m".into(),
+            prompt_hash: "h".into(),
+            prompt_preview: "p".into(),
+            response: "r".into(),
+            tokens_in: 10,
+            tokens_out: 5,
+            latency_ms: 100,
+            error: None,
+        }];
+        let events_b = vec![Event::AiChat {
+            id: 1,
+            ts_ms: 1000,
+            model: "m2".into(),
+            prompt_hash: "h".into(),
+            prompt_preview: "p".into(),
+            response: "r".into(),
+            tokens_in: 20,
+            tokens_out: 10,
+            latency_ms: 200,
+            error: None,
+        }];
         let snap = create_snapshot("test", &events_a);
         let diffs = diff_snapshot(&snap, &events_b);
-        assert!(diffs.iter().any(|d| matches!(d, SnapshotDiff::EventChanged { .. })));
+        assert!(
+            diffs
+                .iter()
+                .any(|d| matches!(d, SnapshotDiff::EventChanged { .. }))
+        );
     }
 
     #[test]
     fn snapshot_diff_missing_event() {
         let events_a = vec![
-            Event::AiChat { id: 1, ts_ms: 1000, model: "m".into(), prompt_hash: "h".into(), prompt_preview: "p".into(), response: "r".into(), tokens_in: 10, tokens_out: 5, latency_ms: 100, error: None },
-            Event::Note { id: 2, ts_ms: 1100, message: "note".into() },
+            Event::AiChat {
+                id: 1,
+                ts_ms: 1000,
+                model: "m".into(),
+                prompt_hash: "h".into(),
+                prompt_preview: "p".into(),
+                response: "r".into(),
+                tokens_in: 10,
+                tokens_out: 5,
+                latency_ms: 100,
+                error: None,
+            },
+            Event::Note {
+                id: 2,
+                ts_ms: 1100,
+                message: "note".into(),
+            },
         ];
-        let events_b = vec![
-            Event::AiChat { id: 1, ts_ms: 1000, model: "m".into(), prompt_hash: "h".into(), prompt_preview: "p".into(), response: "r".into(), tokens_in: 10, tokens_out: 5, latency_ms: 100, error: None },
-        ];
+        let events_b = vec![Event::AiChat {
+            id: 1,
+            ts_ms: 1000,
+            model: "m".into(),
+            prompt_hash: "h".into(),
+            prompt_preview: "p".into(),
+            response: "r".into(),
+            tokens_in: 10,
+            tokens_out: 5,
+            latency_ms: 100,
+            error: None,
+        }];
         let snap = create_snapshot("test", &events_a);
         let diffs = diff_snapshot(&snap, &events_b);
-        assert!(diffs.iter().any(|d| matches!(d, SnapshotDiff::EventMissing { .. })));
+        assert!(
+            diffs
+                .iter()
+                .any(|d| matches!(d, SnapshotDiff::EventMissing { .. }))
+        );
     }
 
     #[test]
     fn generate_report_basic() {
-        let events = vec![
-            Event::AiChat { id: 1, ts_ms: 1000, model: "m".into(), prompt_hash: "h".into(), prompt_preview: "p".into(), response: "r".into(), tokens_in: 10, tokens_out: 5, latency_ms: 100, error: None },
-        ];
-        let report = generate_report(&events, "test", Some("fix retry"), Some("pytest -q"), &[("os", "windows")]);
+        let events = vec![Event::AiChat {
+            id: 1,
+            ts_ms: 1000,
+            model: "m".into(),
+            prompt_hash: "h".into(),
+            prompt_preview: "p".into(),
+            response: "r".into(),
+            tokens_in: 10,
+            tokens_out: 5,
+            latency_ms: 100,
+            error: None,
+        }];
+        let report = generate_report(
+            &events,
+            "test",
+            Some("fix retry"),
+            Some("pytest -q"),
+            &[("os", "windows")],
+        );
         assert!(report.contains("# Evidence Report: test"));
         assert!(report.contains("fix retry"));
         assert!(report.contains("pytest -q"));
@@ -1790,18 +1985,36 @@ pattern:github-token
 
     #[test]
     fn audit_recording_clean() {
-        let events = vec![
-            Event::AiChat { id: 1, ts_ms: 1000, model: "m".into(), prompt_hash: "h".into(), prompt_preview: "hello".into(), response: "world".into(), tokens_in: 10, tokens_out: 5, latency_ms: 100, error: None },
-        ];
+        let events = vec![Event::AiChat {
+            id: 1,
+            ts_ms: 1000,
+            model: "m".into(),
+            prompt_hash: "h".into(),
+            prompt_preview: "hello".into(),
+            response: "world".into(),
+            tokens_in: 10,
+            tokens_out: 5,
+            latency_ms: 100,
+            error: None,
+        }];
         let findings = audit_recording(&events, &[]);
         assert_eq!(findings.len(), 0);
     }
 
     #[test]
     fn audit_recording_finds_sk_key() {
-        let events = vec![
-            Event::AiChat { id: 1, ts_ms: 1000, model: "m".into(), prompt_hash: "h".into(), prompt_preview: "test".into(), response: "api_key=sk-abc123def456ghi789jkl012mno".into(), tokens_in: 10, tokens_out: 5, latency_ms: 100, error: None },
-        ];
+        let events = vec![Event::AiChat {
+            id: 1,
+            ts_ms: 1000,
+            model: "m".into(),
+            prompt_hash: "h".into(),
+            prompt_preview: "test".into(),
+            response: "api_key=sk-abc123def456ghi789jkl012mno".into(),
+            tokens_in: 10,
+            tokens_out: 5,
+            latency_ms: 100,
+            error: None,
+        }];
         let findings = audit_recording(&events, &[]);
         assert!(!findings.is_empty());
         assert_eq!(findings[0].pattern, "openai-api-key");
@@ -1809,9 +2022,18 @@ pattern:github-token
 
     #[test]
     fn audit_recording_respects_ignore_rules() {
-        let events = vec![
-            Event::AiChat { id: 1, ts_ms: 1000, model: "m".into(), prompt_hash: "h".into(), prompt_preview: "test".into(), response: "api_key=sk-abc123def456ghi789jkl012mno".into(), tokens_in: 10, tokens_out: 5, latency_ms: 100, error: None },
-        ];
+        let events = vec![Event::AiChat {
+            id: 1,
+            ts_ms: 1000,
+            model: "m".into(),
+            prompt_hash: "h".into(),
+            prompt_preview: "test".into(),
+            response: "api_key=sk-abc123def456ghi789jkl012mno".into(),
+            tokens_in: 10,
+            tokens_out: 5,
+            latency_ms: 100,
+            error: None,
+        }];
         let rules = vec![IgnoreRule::Pattern("sk-".to_string())];
         let findings = audit_recording(&events, &rules);
         assert_eq!(findings.len(), 0);
@@ -1827,8 +2049,23 @@ pattern:github-token
     #[test]
     fn build_timeline_basic() {
         let events = vec![
-            Event::AiChat { id: 1, ts_ms: 1000, model: "m".into(), prompt_hash: "h".into(), prompt_preview: "p".into(), response: "hi".into(), tokens_in: 10, tokens_out: 5, latency_ms: 100, error: None },
-            Event::Note { id: 2, ts_ms: 1100, message: "note".into() },
+            Event::AiChat {
+                id: 1,
+                ts_ms: 1000,
+                model: "m".into(),
+                prompt_hash: "h".into(),
+                prompt_preview: "p".into(),
+                response: "hi".into(),
+                tokens_in: 10,
+                tokens_out: 5,
+                latency_ms: 100,
+                error: None,
+            },
+            Event::Note {
+                id: 2,
+                ts_ms: 1100,
+                message: "note".into(),
+            },
         ];
         let rows = build_timeline(&events);
         assert_eq!(rows.len(), 2);

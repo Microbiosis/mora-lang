@@ -1024,22 +1024,27 @@ impl TypeChecker {
 
                     // v0.21: 检查参数中的生命周期标注
                     if let Some(hint) = phint
-                        && hint.contains('\'') {
-                            // 提取生命周期名 (如 'a 从 &'a string)
-                            if let Some(lt_pos) = hint.find('\'') {
-                                let lt_str = &hint[lt_pos..];
-                                if let Some(lt_end) = lt_str.find(|c: char| !c.is_alphanumeric() && c != '_') {
-                                    let lifetime = &lt_str[..lt_end];
-                                    if !self.lifetime_env.declared.contains(&lifetime.to_string()) {
-                                        self.errors.push(TypeError::from_span(
-                                            span,
-                                            format!("use of undeclared lifetime '{}'", lifetime),
-                                        ));
-                                    }
-                                    self.lifetime_env.bindings.insert(pname.clone(), lifetime.to_string());
+                        && hint.contains('\'')
+                    {
+                        // 提取生命周期名 (如 'a 从 &'a string)
+                        if let Some(lt_pos) = hint.find('\'') {
+                            let lt_str = &hint[lt_pos..];
+                            if let Some(lt_end) =
+                                lt_str.find(|c: char| !c.is_alphanumeric() && c != '_')
+                            {
+                                let lifetime = &lt_str[..lt_end];
+                                if !self.lifetime_env.declared.contains(&lifetime.to_string()) {
+                                    self.errors.push(TypeError::from_span(
+                                        span,
+                                        format!("use of undeclared lifetime '{}'", lifetime),
+                                    ));
                                 }
+                                self.lifetime_env
+                                    .bindings
+                                    .insert(pname.clone(), lifetime.to_string());
                             }
                         }
+                    }
                 }
                 let prev_hint = self.current_return_hint.clone();
                 self.current_return_hint = return_type.as_deref().map(Type::from_hint);
@@ -1047,18 +1052,19 @@ impl TypeChecker {
                 // v0.21: 检查返回类型中的生命周期
                 if let Some(ret) = return_type
                     && ret.contains('\'')
-                        && let Some(lt_pos) = ret.find('\'') {
-                            let lt_str = &ret[lt_pos..];
-                            if let Some(lt_end) = lt_str.find(|c: char| !c.is_alphanumeric() && c != '_') {
-                                let lifetime = &lt_str[..lt_end];
-                                if !self.lifetime_env.declared.contains(&lifetime.to_string()) {
-                                    self.errors.push(TypeError::from_span(
-                                        span,
-                                        format!("use of undeclared lifetime '{}' in return type", lifetime),
-                                    ));
-                                }
-                            }
+                    && let Some(lt_pos) = ret.find('\'')
+                {
+                    let lt_str = &ret[lt_pos..];
+                    if let Some(lt_end) = lt_str.find(|c: char| !c.is_alphanumeric() && c != '_') {
+                        let lifetime = &lt_str[..lt_end];
+                        if !self.lifetime_env.declared.contains(&lifetime.to_string()) {
+                            self.errors.push(TypeError::from_span(
+                                span,
+                                format!("use of undeclared lifetime '{}' in return type", lifetime),
+                            ));
                         }
+                    }
+                }
 
                 for s in body {
                     self.check_stmt(s, symbols);
@@ -1153,7 +1159,9 @@ impl TypeChecker {
                 // 接收的类型在运行时确定
             }
             // v0.19: 事务块
-            Stmt::Transaction { body, compensation, .. } => {
+            Stmt::Transaction {
+                body, compensation, ..
+            } => {
                 for s in body {
                     self.check_stmt(s, symbols);
                 }
@@ -1177,7 +1185,10 @@ impl TypeChecker {
             // v0.23: 枚举类型
             Stmt::EnumDef { name, variants, .. } => {
                 // 注册枚举类型
-                symbols.define(name.clone(), Type::Dict(Box::new(Type::String), Box::new(Type::Union(vec![]))));
+                symbols.define(
+                    name.clone(),
+                    Type::Dict(Box::new(Type::String), Box::new(Type::Union(vec![]))),
+                );
                 // 注册每个变体
                 for v in variants {
                     symbols.define(v.name.clone(), Type::Builtin);
@@ -1186,15 +1197,22 @@ impl TypeChecker {
             // v0.23: 结构体类型
             Stmt::StructDef { name, fields, .. } => {
                 // 注册结构体类型为函数
-                let param_types: Vec<(String, Type)> = fields.iter()
+                let param_types: Vec<(String, Type)> = fields
+                    .iter()
                     .map(|f| (f.name.clone(), Type::from_hint(&f.type_hint)))
                     .collect();
-                self.signatures.insert(name.clone(), Signature {
-                    params: param_types.clone(),
-                    raw_params: param_types.iter().map(|_| None).collect(),
-                    return_type: Type::Dict(Box::new(Type::String), Box::new(Type::Union(vec![]))),
-                    raw_return_type: None,
-                });
+                self.signatures.insert(
+                    name.clone(),
+                    Signature {
+                        params: param_types.clone(),
+                        raw_params: param_types.iter().map(|_| None).collect(),
+                        return_type: Type::Dict(
+                            Box::new(Type::String),
+                            Box::new(Type::Union(vec![])),
+                        ),
+                        raw_return_type: None,
+                    },
+                );
                 symbols.define(name.clone(), Type::Task);
             }
             Stmt::Match { expr, arms, .. } => {
@@ -1916,10 +1934,7 @@ impl TypeChecker {
                         let cond_ty = self.check_expr(condition, symbols);
                         if cond_ty != Type::Bool && cond_ty != Type::Union(vec![]) {
                             self.errors.push(TypeError {
-                                message: format!(
-                                    "Guard condition must be bool, got {:?}",
-                                    cond_ty
-                                ),
+                                message: format!("Guard condition must be bool, got {:?}", cond_ty),
                                 line: 0,
                                 column: 0,
                                 expected: Some("bool".to_string()),
@@ -2093,12 +2108,18 @@ impl TypeChecker {
                 if !borrows.is_empty() {
                     self.errors.push(TypeError::from_span(
                         &span,
-                        format!("cannot borrow `{}` as mutable because it is already borrowed", name),
+                        format!(
+                            "cannot borrow `{}` as mutable because it is already borrowed",
+                            name
+                        ),
                     ));
                 }
             } else {
                 // 不可变借用：不能有可变借用
-                if borrows.iter().any(|(kind, _)| matches!(kind, BorrowKind::Mutable)) {
+                if borrows
+                    .iter()
+                    .any(|(kind, _)| matches!(kind, BorrowKind::Mutable))
+                {
                     self.errors.push(TypeError::from_span(
                         &span,
                         format!("cannot borrow `{}` as immutable because it is also borrowed as mutable", name),
@@ -2108,8 +2129,13 @@ impl TypeChecker {
         }
 
         // 记录借用
-        let kind = if mutable { BorrowKind::Mutable } else { BorrowKind::Shared };
-        self.borrow_checker.borrows
+        let kind = if mutable {
+            BorrowKind::Mutable
+        } else {
+            BorrowKind::Shared
+        };
+        self.borrow_checker
+            .borrows
             .entry(name.to_string())
             .or_default()
             .push((kind, span));
@@ -2120,12 +2146,13 @@ impl TypeChecker {
     fn mark_moved(&mut self, name: &str, span: Span) {
         // 如果有借用，报错
         if let Some(borrows) = self.borrow_checker.borrows.get(name)
-            && !borrows.is_empty() {
-                self.errors.push(TypeError::from_span(
-                    &span,
-                    format!("cannot move `{}` because it is borrowed", name),
-                ));
-            }
+            && !borrows.is_empty()
+        {
+            self.errors.push(TypeError::from_span(
+                &span,
+                format!("cannot move `{}` because it is borrowed", name),
+            ));
+        }
         self.borrow_checker.moved.insert(name.to_string());
         self.borrow_checker.borrows.remove(name);
     }

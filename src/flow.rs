@@ -67,7 +67,8 @@ pub fn hex_nibble(c: u8) -> Option<u8> {
 pub fn is_pipe_method(name: &str) -> bool {
     matches!(
         name,
-        "map" | "filter"
+        "map"
+            | "filter"
             | "reduce"
             | "push"
             | "pop"
@@ -304,34 +305,45 @@ pub fn value_type_name(value: &Value) -> &'static str {
 pub fn get_methods_for_value(value: &Value) -> Vec<String> {
     match value {
         Value::String(_) => vec![
-            "len", "upper", "lower", "trim", "starts_with", "ends_with",
-            "contains", "split", "replace", "json",
+            "len",
+            "upper",
+            "lower",
+            "trim",
+            "starts_with",
+            "ends_with",
+            "contains",
+            "split",
+            "replace",
+            "json",
         ],
         Value::List(_) => vec![
-            "push", "pop", "get", "len", "map", "filter", "reduce",
-            "take", "drop", "window", "batch", "shape", "flatten",
-            "transpose", "reshape",
+            "push",
+            "pop",
+            "get",
+            "len",
+            "map",
+            "filter",
+            "reduce",
+            "take",
+            "drop",
+            "window",
+            "batch",
+            "shape",
+            "flatten",
+            "transpose",
+            "reshape",
         ],
-        Value::Dict(_) => vec![
-            "get", "set", "keys", "values", "len", "json",
-        ],
-        Value::Conversation { .. } => vec![
-            "chat", "history", "clear", "model", "len",
-        ],
-        Value::Stream { .. } => vec![
-            "collect", "is_done",
-        ],
-        Value::Router { .. } => vec![
-            "route", "listen",
-        ],
-        Value::McpServer { .. } => vec![
-            "tool", "serve",
-        ],
-        Value::Agent { .. } => vec![
-            "run", "name", "max_steps",
-        ],
+        Value::Dict(_) => vec!["get", "set", "keys", "values", "len", "json"],
+        Value::Conversation { .. } => vec!["chat", "history", "clear", "model", "len"],
+        Value::Stream { .. } => vec!["collect", "is_done"],
+        Value::Router { .. } => vec!["route", "listen"],
+        Value::McpServer { .. } => vec!["tool", "serve"],
+        Value::Agent { .. } => vec!["run", "name", "max_steps"],
         _ => vec![],
-    }.into_iter().map(|s| s.to_string()).collect()
+    }
+    .into_iter()
+    .map(|s| s.to_string())
+    .collect()
 }
 
 /// JSON 字符串转 Value
@@ -500,7 +512,9 @@ fn parse_json_number(s: &str) -> Result<(Value, usize), String> {
         }
     }
     let num_str = &s[..i];
-    let num: f64 = num_str.parse().map_err(|_| format!("Invalid number: {}", num_str))?;
+    let num: f64 = num_str
+        .parse()
+        .map_err(|_| format!("Invalid number: {}", num_str))?;
     Ok((Value::Number(num), i))
 }
 
@@ -525,7 +539,13 @@ pub fn value_to_json(value: &Value) -> String {
         Value::Dict(map) => {
             let parts: Vec<String> = map
                 .iter()
-                .map(|(k, v)| format!("\"{}\":{}", k.replace('\\', "\\\\").replace('"', "\\\""), value_to_json(v)))
+                .map(|(k, v)| {
+                    format!(
+                        "\"{}\":{}",
+                        k.replace('\\', "\\\\").replace('"', "\\\""),
+                        value_to_json(v)
+                    )
+                })
                 .collect();
             format!("{{{}}}", parts.join(","))
         }
@@ -537,7 +557,9 @@ pub fn value_to_json(value: &Value) -> String {
         Value::Agent { name, .. } => format!("\"<agent {}>\"", name),
         Value::AiConfig { .. } => "\"<ai_config>\"".to_string(),
         Value::Router { .. } => "\"<router>\"".to_string(),
-        Value::HttpRequest { method, path, .. } => format!("\"<http_request {} {}>\"", method, path),
+        Value::HttpRequest { method, path, .. } => {
+            format!("\"<http_request {} {}>\"", method, path)
+        }
         Value::McpServer { .. } => "\"<mcp_server>\"".to_string(),
         Value::TraitObject { .. } => "\"<trait_object>\"".to_string(),
         Value::Compose(_) => "null".to_string(),

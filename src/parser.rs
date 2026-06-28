@@ -99,7 +99,11 @@ impl Parser {
         if self.check(&TokenType::Less) {
             self.advance(); // consume '<'
             loop {
-                if let Some(Token { token_type: TokenType::Lifetime(lt), .. }) = self.peek().cloned() {
+                if let Some(Token {
+                    token_type: TokenType::Lifetime(lt),
+                    ..
+                }) = self.peek().cloned()
+                {
                     self.advance();
                     lifetime_params.push(lt);
                     if self.match_token(&[TokenType::Comma]) {
@@ -209,9 +213,13 @@ impl Parser {
         } else if self.match_token(&[TokenType::Transaction]) {
             Some(self.transaction_statement())
         } else if self.match_token(&[TokenType::Commit]) {
-            Some(Stmt::Commit { span: self.span_of_previous_keyword() })
+            Some(Stmt::Commit {
+                span: self.span_of_previous_keyword(),
+            })
         } else if self.match_token(&[TokenType::Rollback]) {
-            Some(Stmt::Rollback { span: self.span_of_previous_keyword() })
+            Some(Stmt::Rollback {
+                span: self.span_of_previous_keyword(),
+            })
         } else if self.match_token(&[TokenType::Macro]) {
             Some(self.macro_definition())
         } else if self.match_token(&[TokenType::Save]) {
@@ -302,13 +310,20 @@ impl Parser {
                     self.advance(); // consume '>'
                     break;
                 }
-                if self.is_at_end() { break; }
+                if self.is_at_end() {
+                    break;
+                }
             }
         }
 
         self.consume(&TokenType::Assign, "Expected '=' after type alias name");
         let target = self.consume_identifier("Expected target type");
-        Stmt::TypeAlias { name, generics, target, span }
+        Stmt::TypeAlias {
+            name,
+            generics,
+            target,
+            span,
+        }
     }
 
     /// v0.23: enum Name { Variant1, Variant2(Type) }
@@ -323,18 +338,30 @@ impl Parser {
             loop {
                 let param = self.consume_identifier("Expected generic parameter");
                 generics.push(param);
-                if self.match_token(&[TokenType::Comma]) { continue; }
-                if self.check(&TokenType::Greater) { self.advance(); break; }
-                if self.is_at_end() { break; }
+                if self.match_token(&[TokenType::Comma]) {
+                    continue;
+                }
+                if self.check(&TokenType::Greater) {
+                    self.advance();
+                    break;
+                }
+                if self.is_at_end() {
+                    break;
+                }
             }
         }
 
         self.consume(&TokenType::LBrace, "Expected '{' after enum name");
-        while self.check(&TokenType::Newline) { self.advance(); }
+        while self.check(&TokenType::Newline) {
+            self.advance();
+        }
 
         let mut variants = Vec::new();
         while !self.check(&TokenType::RBrace) && !self.is_at_end() {
-            if self.check(&TokenType::Newline) { self.advance(); continue; }
+            if self.check(&TokenType::Newline) {
+                self.advance();
+                continue;
+            }
             let variant_name = self.consume_identifier("Expected variant name");
             let data = if self.check(&TokenType::LParen) {
                 self.advance(); // consume '('
@@ -344,11 +371,19 @@ impl Parser {
             } else {
                 None
             };
-            variants.push(crate::ast::EnumVariant { name: variant_name, data });
+            variants.push(crate::ast::EnumVariant {
+                name: variant_name,
+                data,
+            });
             self.match_token(&[TokenType::Comma]);
         }
         self.consume(&TokenType::RBrace, "Expected '}' after enum variants");
-        Stmt::EnumDef { name, generics, variants, span }
+        Stmt::EnumDef {
+            name,
+            generics,
+            variants,
+            span,
+        }
     }
 
     /// v0.23: struct Name { field1: Type, field2: Type }
@@ -363,26 +398,46 @@ impl Parser {
             loop {
                 let param = self.consume_identifier("Expected generic parameter");
                 generics.push(param);
-                if self.match_token(&[TokenType::Comma]) { continue; }
-                if self.check(&TokenType::Greater) { self.advance(); break; }
-                if self.is_at_end() { break; }
+                if self.match_token(&[TokenType::Comma]) {
+                    continue;
+                }
+                if self.check(&TokenType::Greater) {
+                    self.advance();
+                    break;
+                }
+                if self.is_at_end() {
+                    break;
+                }
             }
         }
 
         self.consume(&TokenType::LBrace, "Expected '{' after struct name");
-        while self.check(&TokenType::Newline) { self.advance(); }
+        while self.check(&TokenType::Newline) {
+            self.advance();
+        }
 
         let mut fields = Vec::new();
         while !self.check(&TokenType::RBrace) && !self.is_at_end() {
-            if self.check(&TokenType::Newline) { self.advance(); continue; }
+            if self.check(&TokenType::Newline) {
+                self.advance();
+                continue;
+            }
             let field_name = self.consume_identifier("Expected field name");
             self.consume(&TokenType::Colon, "Expected ':' after field name");
             let type_hint = self.consume_identifier("Expected field type");
-            fields.push(crate::ast::StructField { name: field_name, type_hint });
+            fields.push(crate::ast::StructField {
+                name: field_name,
+                type_hint,
+            });
             self.match_token(&[TokenType::Comma]);
         }
         self.consume(&TokenType::RBrace, "Expected '}' after struct fields");
-        Stmt::StructDef { name, generics, fields, span }
+        Stmt::StructDef {
+            name,
+            generics,
+            fields,
+            span,
+        }
     }
 
     fn parallel_statement(&mut self) -> Stmt {
@@ -434,7 +489,12 @@ impl Parser {
                 });
             }
             // v0.19: 解析 receive 语句 (let x = <- source)
-            else if self.check(&TokenType::Less) && self.peek_next().map(|t| t.token_type == TokenType::Minus).unwrap_or(false) {
+            else if self.check(&TokenType::Less)
+                && self
+                    .peek_next()
+                    .map(|t| t.token_type == TokenType::Minus)
+                    .unwrap_or(false)
+            {
                 self.advance(); // consume '<'
                 self.advance(); // consume '-'
                 let source = self.consume_identifier("Expected source worker name");
@@ -484,7 +544,11 @@ impl Parser {
             }
         }
         self.consume(&TokenType::End, "Expected 'end' after transaction block");
-        Stmt::Transaction { body, compensation, span }
+        Stmt::Transaction {
+            body,
+            compensation,
+            span,
+        }
     }
 
     /// v0.20: macro name(params) ... end
@@ -514,12 +578,21 @@ impl Parser {
             }
         }
         self.consume(&TokenType::End, "Expected 'end' after macro body");
-        Stmt::MacroDef { name, params, body, span }
+        Stmt::MacroDef {
+            name,
+            params,
+            body,
+            span,
+        }
     }
 
     /// 检查下一个 token 是否是指定的标识符
     fn check_identifier(&self, name: &str) -> bool {
-        if let Some(Token { token_type: TokenType::Identifier(n), .. }) = self.peek() {
+        if let Some(Token {
+            token_type: TokenType::Identifier(n),
+            ..
+        }) = self.peek()
+        {
             n == name
         } else {
             false
@@ -879,7 +952,11 @@ impl Parser {
             }
             if let Some(pattern) = self.pattern() {
                 // v0.16: 解析 when 守卫条件
-                let is_when = if let Some(Token { token_type: TokenType::Identifier(name), .. }) = self.peek() {
+                let is_when = if let Some(Token {
+                    token_type: TokenType::Identifier(name),
+                    ..
+                }) = self.peek()
+                {
                     name == "when"
                 } else {
                     false
@@ -963,7 +1040,8 @@ impl Parser {
                         // 检查是否是 ...rest 模式
                         if self.check(&TokenType::DotDotDot) {
                             self.advance(); // consume '...'
-                            rest = Some(self.consume_identifier("Expected variable name after '...'"));
+                            rest =
+                                Some(self.consume_identifier("Expected variable name after '...'"));
                             break;
                         }
                         if let Some(p) = self.pattern() {
@@ -973,7 +1051,10 @@ impl Parser {
                 }
             }
             self.consume(&TokenType::RBracket, "Expected ']' after list pattern");
-            Some(Pattern::List { prefix: items, rest })
+            Some(Pattern::List {
+                prefix: items,
+                rest,
+            })
         } else if self.match_token(&[TokenType::LBrace]) {
             let mut entries = Vec::new();
             if !self.check(&TokenType::RBrace) {

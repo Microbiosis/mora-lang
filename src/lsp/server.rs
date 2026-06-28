@@ -157,7 +157,12 @@ impl Server {
                     .and_then(|t| t.get("uri"))
                     .and_then(|u| u.as_str())
                 {
-                    let text_opt = self.docs.lock().expect("docs mutex poisoned").get(uri).map(|d| d.text.clone());
+                    let text_opt = self
+                        .docs
+                        .lock()
+                        .expect("docs mutex poisoned")
+                        .get(uri)
+                        .map(|d| d.text.clone());
                     if let Some(text) = text_opt {
                         let diags = self.check_diagnostics(&text);
                         let mut docs = self.docs.lock().expect("docs mutex poisoned");

@@ -6,7 +6,9 @@
 //! - **类型信息保留**：类型检查后保留类型信息
 //! - **Visitor 模式**：解耦遍历逻辑
 
-use crate::ast::{BinaryOp, FnDef, GenericParam, Literal, ObserveConfig, Pattern, Span, TraitMethod};
+use crate::ast::{
+    BinaryOp, FnDef, GenericParam, Literal, ObserveConfig, Pattern, Span, TraitMethod,
+};
 use crate::typeck::Type;
 
 // ===================================================================

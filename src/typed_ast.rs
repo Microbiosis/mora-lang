@@ -112,9 +112,7 @@ impl TypedAstConverter {
                 stmts: self.convert_stmts(stmts),
             },
 
-            Stmt::Match {
-                expr, arms, ..
-            } => StmtKind::Match {
+            Stmt::Match { expr, arms, .. } => StmtKind::Match {
                 expr: self.convert_expr(expr),
                 arms: arms
                     .iter()
@@ -122,60 +120,44 @@ impl TypedAstConverter {
                     .collect(),
             },
 
-            Stmt::Save {
-                path, value, ..
-            } => StmtKind::Save {
+            Stmt::Save { path, value, .. } => StmtKind::Save {
                 path: self.convert_expr(path),
                 value: self.convert_expr(value),
             },
 
-            Stmt::Load {
-                path, var, ..
-            } => StmtKind::Load {
+            Stmt::Load { path, var, .. } => StmtKind::Load {
                 path: self.convert_expr(path),
                 var: var.clone(),
             },
 
-            Stmt::ReadFile {
-                path, var, ..
-            } => StmtKind::ReadFile {
+            Stmt::ReadFile { path, var, .. } => StmtKind::ReadFile {
                 path: self.convert_expr(path),
                 var: var.clone(),
             },
 
-            Stmt::WriteFile {
-                path, content, ..
-            } => StmtKind::WriteFile {
+            Stmt::WriteFile { path, content, .. } => StmtKind::WriteFile {
                 path: self.convert_expr(path),
                 content: self.convert_expr(content),
             },
 
-            Stmt::AppendFile {
-                path, content, ..
-            } => StmtKind::AppendFile {
+            Stmt::AppendFile { path, content, .. } => StmtKind::AppendFile {
                 path: self.convert_expr(path),
                 content: self.convert_expr(content),
             },
 
-            Stmt::ReadBytesFile {
-                path, var, ..
-            } => StmtKind::ReadBytesFile {
+            Stmt::ReadBytesFile { path, var, .. } => StmtKind::ReadBytesFile {
                 path: self.convert_expr(path),
                 var: var.clone(),
             },
 
-            Stmt::WriteBytesFile {
-                path, content, ..
-            } => StmtKind::WriteBytesFile {
+            Stmt::WriteBytesFile { path, content, .. } => StmtKind::WriteBytesFile {
                 path: self.convert_expr(path),
                 content: self.convert_expr(content),
             },
 
             Stmt::Expr(expr) => StmtKind::Expr(self.convert_expr(expr)),
 
-            Stmt::With {
-                bindings, body, ..
-            } => StmtKind::With {
+            Stmt::With { bindings, body, .. } => StmtKind::With {
                 bindings: bindings
                     .iter()
                     .map(|(k, v)| (k.clone(), self.convert_expr(v)))
@@ -184,10 +166,7 @@ impl TypedAstConverter {
             },
 
             Stmt::StreamFor {
-                prompt,
-                var,
-                body,
-                ..
+                prompt, var, body, ..
             } => StmtKind::StreamFor {
                 prompt: self.convert_expr(prompt),
                 var: var.clone(),
@@ -212,16 +191,12 @@ impl TypedAstConverter {
             Stmt::Break { .. } => StmtKind::Break,
             Stmt::Continue { .. } => StmtKind::Continue,
 
-            Stmt::Route {
-                name, target, ..
-            } => StmtKind::Route {
+            Stmt::Route { name, target, .. } => StmtKind::Route {
                 name: name.clone(),
                 target: self.convert_expr(target),
             },
 
-            Stmt::Observe {
-                config, body, ..
-            } => StmtKind::Observe {
+            Stmt::Observe { config, body, .. } => StmtKind::Observe {
                 config: config.clone(),
                 body: self.convert_stmts(body),
             },
@@ -240,9 +215,7 @@ impl TypedAstConverter {
                 body: self.convert_stmts(body),
             },
 
-            Stmt::RecordTokens {
-                input, output, ..
-            } => StmtKind::RecordTokens {
+            Stmt::RecordTokens { input, output, .. } => StmtKind::RecordTokens {
                 input: self.convert_expr(input),
                 output: self.convert_expr(output),
             },
@@ -281,31 +254,23 @@ impl TypedAstConverter {
                 methods: methods.clone(),
             },
 
-            Stmt::Worker {
-                name, body, ..
-            } => StmtKind::Worker {
+            Stmt::Worker { name, body, .. } => StmtKind::Worker {
                 name: name.clone(),
                 body: self.convert_stmts(body),
             },
 
-            Stmt::Send {
-                value, target, ..
-            } => StmtKind::Send {
+            Stmt::Send { value, target, .. } => StmtKind::Send {
                 value: self.convert_expr(value),
                 target: target.clone(),
             },
 
-            Stmt::Receive {
-                var, source, ..
-            } => StmtKind::Receive {
+            Stmt::Receive { var, source, .. } => StmtKind::Receive {
                 var: var.clone(),
                 source: source.clone(),
             },
 
             Stmt::Transaction {
-                body,
-                compensation,
-                ..
+                body, compensation, ..
             } => StmtKind::Transaction {
                 body: self.convert_stmts(body),
                 compensation: self.convert_stmts(compensation),
@@ -323,17 +288,32 @@ impl TypedAstConverter {
             },
 
             // v0.23: 类型系统增强
-            Stmt::TypeAlias { name, generics, target, .. } => StmtKind::TypeAlias {
+            Stmt::TypeAlias {
+                name,
+                generics,
+                target,
+                ..
+            } => StmtKind::TypeAlias {
                 name: name.clone(),
                 generics: generics.clone(),
                 target: target.clone(),
             },
-            Stmt::EnumDef { name, generics, variants, .. } => StmtKind::EnumDef {
+            Stmt::EnumDef {
+                name,
+                generics,
+                variants,
+                ..
+            } => StmtKind::EnumDef {
                 name: name.clone(),
                 generics: generics.clone(),
                 variants: variants.clone(),
             },
-            Stmt::StructDef { name, generics, fields, .. } => StmtKind::StructDef {
+            Stmt::StructDef {
+                name,
+                generics,
+                fields,
+                ..
+            } => StmtKind::StructDef {
                 name: name.clone(),
                 generics: generics.clone(),
                 fields: fields.clone(),
@@ -364,9 +344,7 @@ impl TypedAstConverter {
                 right: self.convert_expr(right),
             },
 
-            Expr::Call {
-                callee, args, ..
-            } => ExprKind::Call {
+            Expr::Call { callee, args, .. } => ExprKind::Call {
                 callee: callee.clone(),
                 args: args.iter().map(|a| self.convert_expr(a)).collect(),
             },
@@ -382,9 +360,7 @@ impl TypedAstConverter {
                 args: args.iter().map(|a| self.convert_expr(a)).collect(),
             },
 
-            Expr::Index {
-                object, index, ..
-            } => ExprKind::Index {
+            Expr::Index { object, index, .. } => ExprKind::Index {
                 object: self.convert_expr(object),
                 index: self.convert_expr(index),
             },
@@ -400,9 +376,7 @@ impl TypedAstConverter {
                 body: self.convert_stmts(body),
             },
 
-            Expr::Match {
-                expr, arms, ..
-            } => ExprKind::Match {
+            Expr::Match { expr, arms, .. } => ExprKind::Match {
                 expr: self.convert_expr(expr),
                 arms: arms
                     .iter()
@@ -414,9 +388,7 @@ impl TypedAstConverter {
                 parts: parts.iter().map(|p| self.convert_expr(p)).collect(),
             },
 
-            Expr::RouteCall {
-                name, args, ..
-            } => ExprKind::RouteCall {
+            Expr::RouteCall { name, args, .. } => ExprKind::RouteCall {
                 name: name.clone(),
                 args: args.iter().map(|a| self.convert_expr(a)).collect(),
             },
@@ -512,7 +484,7 @@ impl TypedAstConverter {
             | Stmt::Rollback { span }
             | Stmt::MacroDef { span, .. } => *span,
             // v0.23: 类型系统增强
-            | Stmt::TypeAlias { span, .. }
+            Stmt::TypeAlias { span, .. }
             | Stmt::EnumDef { span, .. }
             | Stmt::StructDef { span, .. } => *span,
             Stmt::Expr(expr) => self.get_expr_span(expr),

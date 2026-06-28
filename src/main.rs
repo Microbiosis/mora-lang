@@ -22,7 +22,9 @@ fn main() {
                 return;
             }
             "--help" | "-h" => {
-                println!("Mora v0.23 — record / replay / diff / list / stats / timeline / snapshot");
+                println!(
+                    "Mora v0.23 — record / replay / diff / list / stats / timeline / snapshot"
+                );
                 println!();
                 println!("Usage:");
                 println!("  mora <file.mora>           Run a script");
@@ -30,7 +32,9 @@ fn main() {
                 println!("  mora --check <file>        Type check only");
                 println!();
                 println!("Recording:");
-                println!("  mora record <file> <name>  Record ai.chat/web.fetch to .mora/recordings/<name>.jsonl");
+                println!(
+                    "  mora record <file> <name>  Record ai.chat/web.fetch to .mora/recordings/<name>.jsonl"
+                );
                 println!("  mora replay <file> <name>  Replay recording (deterministic)");
                 println!("  mora diff <a> <b>          Diff two recordings");
                 println!("  mora record list           List all recordings");
@@ -80,7 +84,9 @@ fn main() {
         // v0.14/v0.15: 录制 / 重放 / 对比 / list / stats / timeline
         "record" => {
             if args.len() < 3 {
-                eprintln!("Usage: mora record <file.mora> <name> | mora record list|stats|timeline ...");
+                eprintln!(
+                    "Usage: mora record <file.mora> <name> | mora record list|stats|timeline ..."
+                );
                 process::exit(1);
             }
             match args[2].as_str() {
@@ -101,7 +107,9 @@ fn main() {
                 }
                 "export" => {
                     if args.len() < 4 {
-                        eprintln!("Usage: mora record export <name> [--format jsonl|md] [--output <file>]");
+                        eprintln!(
+                            "Usage: mora record export <name> [--format jsonl|md] [--output <file>]"
+                        );
                         process::exit(1);
                     }
                     let name = &args[3];
@@ -110,8 +118,14 @@ fn main() {
                     let mut i = 4;
                     while i < args.len() {
                         match args[i].as_str() {
-                            "--format" | "-f" => { i += 1; format = args.get(i).cloned().unwrap_or(format); }
-                            "--output" | "-o" => { i += 1; output = args.get(i).cloned(); }
+                            "--format" | "-f" => {
+                                i += 1;
+                                format = args.get(i).cloned().unwrap_or(format);
+                            }
+                            "--output" | "-o" => {
+                                i += 1;
+                                output = args.get(i).cloned();
+                            }
                             _ => {}
                         }
                         i += 1;
@@ -137,7 +151,9 @@ fn main() {
                 }
                 "report" => {
                     if args.len() < 4 {
-                        eprintln!("Usage: mora record report <name> [--note <text>] [--verify <cmd>] [--output <file>]");
+                        eprintln!(
+                            "Usage: mora record report <name> [--note <text>] [--verify <cmd>] [--output <file>]"
+                        );
                         process::exit(1);
                     }
                     let name = &args[3];
@@ -147,9 +163,18 @@ fn main() {
                     let mut i = 4;
                     while i < args.len() {
                         match args[i].as_str() {
-                            "--note" => { i += 1; note = args.get(i).cloned(); }
-                            "--verify" => { i += 1; verify = args.get(i).cloned(); }
-                            "--output" | "-o" => { i += 1; output = args.get(i).cloned(); }
+                            "--note" => {
+                                i += 1;
+                                note = args.get(i).cloned();
+                            }
+                            "--verify" => {
+                                i += 1;
+                                verify = args.get(i).cloned();
+                            }
+                            "--output" | "-o" => {
+                                i += 1;
+                                output = args.get(i).cloned();
+                            }
                             _ => {}
                         }
                         i += 1;
@@ -502,12 +527,18 @@ fn run_record_list() {
                 return;
             }
             println!("Recordings ({}):\n", infos.len());
-            println!("{:<20} {:>8} {:>6} {:>20}", "NAME", "SIZE", "EVENTS", "LAST MODIFIED");
+            println!(
+                "{:<20} {:>8} {:>6} {:>20}",
+                "NAME", "SIZE", "EVENTS", "LAST MODIFIED"
+            );
             println!("{}", "-".repeat(60));
             for info in &infos {
                 let size = format_size(info.size_bytes);
                 let time = format_ts(info.last_ts_ms);
-                println!("{:<20} {:>8} {:>6} {:>20}", info.name, size, info.event_count, time);
+                println!(
+                    "{:<20} {:>8} {:>6} {:>20}",
+                    info.name, size, info.event_count, time
+                );
             }
         }
         Err(e) => {
@@ -536,9 +567,12 @@ fn run_record_stats(name: &str) {
     println!("  notes:       {}", stats.note_count);
     println!("Errors:        {}", stats.error_count);
     println!("{}", "-".repeat(40));
-    println!("Tokens:        {} in + {} out = {} total",
-        stats.total_tokens_in, stats.total_tokens_out,
-        stats.total_tokens_in + stats.total_tokens_out);
+    println!(
+        "Tokens:        {} in + {} out = {} total",
+        stats.total_tokens_in,
+        stats.total_tokens_out,
+        stats.total_tokens_in + stats.total_tokens_out
+    );
     if let Some(avg_in) = stats.total_tokens_in.checked_div(stats.ai_chat_count) {
         let avg_out = stats.total_tokens_out / stats.ai_chat_count;
         println!("  avg/call:    {} in + {} out", avg_in, avg_out);
@@ -547,7 +581,10 @@ fn run_record_stats(name: &str) {
     println!("Latency:       {}ms total", stats.total_latency_ms);
     if stats.ai_chat_count + stats.web_fetch_count > 0 {
         let count = stats.ai_chat_count + stats.web_fetch_count;
-        println!("  avg:         {}ms", stats.total_latency_ms / count as u128);
+        println!(
+            "  avg:         {}ms",
+            stats.total_latency_ms / count as u128
+        );
         println!("  min:         {}ms", stats.min_latency_ms);
         println!("  max:         {}ms", stats.max_latency_ms);
     }
@@ -607,7 +644,9 @@ fn run_snapshot(file: &str, name: &str, update: bool) {
     let stmts = Parser::new(tokens).parse();
     let type_errors = typeck::check_program(&stmts);
     if !type_errors.is_empty() {
-        for err in &type_errors { eprintln!("{}", format_error(err)); }
+        for err in &type_errors {
+            eprintln!("{}", format_error(err));
+        }
         eprintln!("snapshot: typeck failed");
         process::exit(2);
     }
@@ -623,12 +662,18 @@ fn run_snapshot(file: &str, name: &str, update: bool) {
         let snap = record::create_snapshot(name, &current_events);
         let content = record::snapshot_to_jsonl(&snap);
         let dir = snapshots_dir();
-        if !dir.exists() { let _ = fs::create_dir_all(&dir); }
+        if !dir.exists() {
+            let _ = fs::create_dir_all(&dir);
+        }
         if let Err(e) = fs::write(&snap_file, &content) {
             eprintln!("snapshot: failed to write {}: {}", snap_file.display(), e);
             process::exit(1);
         }
-        println!("✓ snapshot '{}' saved ({} events)", name, snap.event_summaries.len());
+        println!(
+            "✓ snapshot '{}' saved ({} events)",
+            name,
+            snap.event_summaries.len()
+        );
     } else {
         // 对比基线
         let baseline_content = fs::read_to_string(&snap_file).unwrap_or_default();
@@ -640,25 +685,55 @@ fn run_snapshot(file: &str, name: &str, update: bool) {
             }
         };
         let diffs = record::diff_snapshot(&baseline, &current_events);
-        let mismatches: Vec<_> = diffs.iter().filter(|d| !matches!(d, record::SnapshotDiff::Match(_))).collect();
+        let mismatches: Vec<_> = diffs
+            .iter()
+            .filter(|d| !matches!(d, record::SnapshotDiff::Match(_)))
+            .collect();
         if mismatches.is_empty() {
-            println!("✓ snapshot '{}' passed ({} events match)", name, baseline.event_summaries.len());
+            println!(
+                "✓ snapshot '{}' passed ({} events match)",
+                name,
+                baseline.event_summaries.len()
+            );
         } else {
-            eprintln!("✗ snapshot '{}' FAILED ({} difference(s)):\n", name, mismatches.len());
+            eprintln!(
+                "✗ snapshot '{}' FAILED ({} difference(s)):\n",
+                name,
+                mismatches.len()
+            );
             for diff in &mismatches {
                 match diff {
                     record::SnapshotDiff::CountMismatch { expected, actual } => {
                         eprintln!("  event count: expected={}, actual={}", expected, actual);
                     }
-                    record::SnapshotDiff::EventChanged { index, expected, actual } => {
-                        eprintln!("  #{}: expected {:?} key={}", index + 1, expected.kind, expected.key);
+                    record::SnapshotDiff::EventChanged {
+                        index,
+                        expected,
+                        actual,
+                    } => {
+                        eprintln!(
+                            "  #{}: expected {:?} key={}",
+                            index + 1,
+                            expected.kind,
+                            expected.key
+                        );
                         eprintln!("       got      {:?} key={}", actual.kind, actual.key);
                     }
                     record::SnapshotDiff::EventAdded { index, actual } => {
-                        eprintln!("  #{}: added {:?} key={}", index + 1, actual.kind, actual.key);
+                        eprintln!(
+                            "  #{}: added {:?} key={}",
+                            index + 1,
+                            actual.kind,
+                            actual.key
+                        );
                     }
                     record::SnapshotDiff::EventMissing { index, expected } => {
-                        eprintln!("  #{}: missing {:?} key={}", index + 1, expected.kind, expected.key);
+                        eprintln!(
+                            "  #{}: missing {:?} key={}",
+                            index + 1,
+                            expected.kind,
+                            expected.key
+                        );
                     }
                     _ => {}
                 }
@@ -713,16 +788,30 @@ fn run_record_audit(name: &str, policy_path: &str) {
     if findings.is_empty() {
         println!("✓ No secrets found in recording '{}'", name);
         if !ignore_rules.is_empty() {
-            println!("  ({} rules from {} applied)", ignore_rules.len(), policy_path);
+            println!(
+                "  ({} rules from {} applied)",
+                ignore_rules.len(),
+                policy_path
+            );
         }
     } else {
-        println!("⚠ {} potential secret(s) found in '{}':\n", findings.len(), name);
+        println!(
+            "⚠ {} potential secret(s) found in '{}':\n",
+            findings.len(),
+            name
+        );
         println!("{:<6} {:<20} {:<20} PREVIEW", "EVENT", "FIELD", "PATTERN");
         println!("{}", "-".repeat(70));
         for f in &findings {
-            println!("{:<6} {:<20} {:<20} {}", f.event_id, f.field, f.pattern, f.preview);
+            println!(
+                "{:<6} {:<20} {:<20} {}",
+                f.event_id, f.field, f.pattern, f.preview
+            );
         }
-        println!("\nRun with --policy {} to ignore known-safe patterns", policy_path);
+        println!(
+            "\nRun with --policy {} to ignore known-safe patterns",
+            policy_path
+        );
         process::exit(1);
     }
 }
@@ -743,43 +832,71 @@ fn run_record_timeline(name: &str) {
         return;
     }
     println!("Timeline: {} ({} events)\n", name, rows.len());
-    println!("{:<4} {:<10} {:<50} {:>10} {:>8} {:>8}", "#", "KIND", "DETAIL", "TOKENS", "LAT(ms)", "STATUS");
+    println!(
+        "{:<4} {:<10} {:<50} {:>10} {:>8} {:>8}",
+        "#", "KIND", "DETAIL", "TOKENS", "LAT(ms)", "STATUS"
+    );
     println!("{}", "-".repeat(94));
     for row in &rows {
-        println!("{:<4} {:<10} {:<50} {:>10} {:>8} {:>8}",
-            row.seq, row.kind, truncate(&row.detail, 50), row.tokens, row.latency_ms, row.status);
+        println!(
+            "{:<4} {:<10} {:<50} {:>10} {:>8} {:>8}",
+            row.seq,
+            row.kind,
+            truncate(&row.detail, 50),
+            row.tokens,
+            row.latency_ms,
+            row.status
+        );
     }
 }
 
 fn format_size(bytes: u64) -> String {
-    if bytes < 1024 { format!("{}B", bytes) }
-    else if bytes < 1024 * 1024 { format!("{}KB", bytes / 1024) }
-    else { format!("{}MB", bytes / (1024 * 1024)) }
+    if bytes < 1024 {
+        format!("{}B", bytes)
+    } else if bytes < 1024 * 1024 {
+        format!("{}KB", bytes / 1024)
+    } else {
+        format!("{}MB", bytes / (1024 * 1024))
+    }
 }
 
 fn format_ts(ts_ms: u128) -> String {
-    if ts_ms == 0 { return "-".to_string(); }
+    if ts_ms == 0 {
+        return "-".to_string();
+    }
     // 显示相对时间
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis())
         .unwrap_or(0);
     let diff_ms = now.saturating_sub(ts_ms);
-    if diff_ms < 60_000 { "just now".to_string() }
-    else if diff_ms < 3_600_000 { format!("{}min ago", diff_ms / 60_000) }
-    else if diff_ms < 86_400_000 { format!("{}h ago", diff_ms / 3_600_000) }
-    else { format!("{}d ago", diff_ms / 86_400_000) }
+    if diff_ms < 60_000 {
+        "just now".to_string()
+    } else if diff_ms < 3_600_000 {
+        format!("{}min ago", diff_ms / 60_000)
+    } else if diff_ms < 86_400_000 {
+        format!("{}h ago", diff_ms / 3_600_000)
+    } else {
+        format!("{}d ago", diff_ms / 86_400_000)
+    }
 }
 
 fn format_duration(ms: u128) -> String {
-    if ms < 1000 { format!("{}ms", ms) }
-    else if ms < 60_000 { format!("{:.1}s", ms as f64 / 1000.0) }
-    else { format!("{:.1}min", ms as f64 / 60_000.0) }
+    if ms < 1000 {
+        format!("{}ms", ms)
+    } else if ms < 60_000 {
+        format!("{:.1}s", ms as f64 / 1000.0)
+    } else {
+        format!("{:.1}min", ms as f64 / 60_000.0)
+    }
 }
 
 fn truncate(s: &str, max: usize) -> String {
-    if s.len() <= max { s.to_string() }
-    else { format!("{}…", &s[..max - 1]) }
+    if s.len() <= max {
+        s.to_string()
+    } else {
+        format!("{}…", &s[..max - 1])
+    }
 }
 
 fn run_check(path: &str) {

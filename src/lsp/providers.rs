@@ -1294,9 +1294,9 @@ fn end_stmt_span_line(stmt: &Stmt) -> usize {
         | Stmt::ImplDef { span, .. } => span.line,
         Stmt::Expr(_) => 0,
         // v0.19: Worker 并发
-        Stmt::Worker { span, .. }
-        | Stmt::Send { span, .. }
-        | Stmt::Receive { span, .. } => span.line,
+        Stmt::Worker { span, .. } | Stmt::Send { span, .. } | Stmt::Receive { span, .. } => {
+            span.line
+        }
         // v0.19: 事务
         Stmt::Transaction { span, .. }
         | Stmt::Commit { span, .. }

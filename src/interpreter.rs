@@ -12,7 +12,7 @@ use crate::parser::Parser;
 use crate::trace_collector::TraceCollector;
 
 // Re-export value types for backward compatibility
-pub use crate::value::{Value, Environment, FlowSignal, StreamReader};
+pub use crate::value::{Environment, FlowSignal, StreamReader, Value};
 
 /// v0.22: 检查方法是否可以融合执行
 fn is_fusable_method(method: &str) -> bool {
@@ -26,10 +26,18 @@ fn try_fold_binary(left: &Value, op: &BinaryOp, right: &Value) -> Option<Value> 
         (Value::Number(l), BinaryOp::Sub, Value::Number(r)) => Some(Value::Number(l - r)),
         (Value::Number(l), BinaryOp::Mul, Value::Number(r)) => Some(Value::Number(l * r)),
         (Value::Number(l), BinaryOp::Div, Value::Number(r)) => {
-            if *r != 0.0 { Some(Value::Number(l / r)) } else { None }
+            if *r != 0.0 {
+                Some(Value::Number(l / r))
+            } else {
+                None
+            }
         }
         (Value::Number(l), BinaryOp::Mod, Value::Number(r)) => {
-            if *r != 0.0 { Some(Value::Number(l % r)) } else { None }
+            if *r != 0.0 {
+                Some(Value::Number(l % r))
+            } else {
+                None
+            }
         }
         (Value::String(l), BinaryOp::Add, Value::String(r)) => {
             Some(Value::String(format!("{}{}", l, r)))
@@ -54,7 +62,6 @@ const AI_READ_TIMEOUT_SECS: u64 = 60;
 
 // Value enum is now in value.rs
 // Re-exported above via pub use crate::value::*;
-
 
 // Environment is now in value.rs
 // Re-exported above via pub use crate::value::*;
@@ -280,10 +287,10 @@ impl Clone for Interpreter {
             recorder: crate::record::Recorder::new_off(),
             worker_channels: HashMap::new(), // 不克隆 channel
             worker_receivers: HashMap::new(),
-            ai_cache: HashMap::new(), // 不克隆缓存
+            ai_cache: HashMap::new(),        // 不克隆缓存
             string_interner: HashMap::new(), // 不克隆驻留池
-            method_cache: HashMap::new(), // 不克隆缓存
-            ai_batch_queue: Vec::new(), // 不克隆队列
+            method_cache: HashMap::new(),    // 不克隆缓存
+            ai_batch_queue: Vec::new(),      // 不克隆队列
         }
     }
 }
@@ -496,7 +503,12 @@ impl Interpreter {
             self.execute(stmt)?;
         }
         // 先 clone 出值，再释放 borrow，避免借用冲突
-        let main_task = self.globals.lock().expect("globals mutex poisoned").get("main").clone();
+        let main_task = self
+            .globals
+            .lock()
+            .expect("globals mutex poisoned")
+            .get("main")
+            .clone();
         if let Some(Value::Task { params, body, .. }) = main_task
             && params.is_empty()
         {
@@ -539,7 +551,12 @@ impl Interpreter {
                 span: _,
             } => {
                 let val = self.evaluate(value)?;
-                if !self.environment.lock().expect("environment mutex poisoned").assign(name, val.clone()) {
+                if !self
+                    .environment
+                    .lock()
+                    .expect("environment mutex poisoned")
+                    .assign(name, val.clone())
+                {
                     self.environment
                         .lock()
                         .unwrap()
@@ -622,7 +639,11 @@ impl Interpreter {
                             let env = Arc::new(Mutex::new(Environment::with_parent(
                                 self.environment.clone(),
                             )));
-                            env.lock().expect("env mutex poisoned").define(var.clone(), item, false);
+                            env.lock().expect("env mutex poisoned").define(
+                                var.clone(),
+                                item,
+                                false,
+                            );
                             let signal = self.execute_block(body, env)?;
                             if signal.is_return() {
                                 return Ok(signal);
@@ -710,38 +731,64 @@ impl Interpreter {
             }
             Stmt::Import { path, span: _ } => {
                 let module_env = self.import_module(path)?;
-                let exports = module_env.lock().expect("env mutex poisoned").exports.clone();
+                let exports = module_env
+                    .lock()
+                    .expect("env mutex poisoned")
+                    .exports
+                    .clone();
                 for (name, value) in exports {
-                    self.environment.lock().expect("environment mutex poisoned").define(name, value, false);
+                    self.environment
+                        .lock()
+                        .expect("environment mutex poisoned")
+                        .define(name, value, false);
                 }
                 Ok(FlowSignal::None)
             }
             Stmt::Parallel { stmts, span: _ } => self.execute_parallel(stmts),
             // v0.19: Worker 声明（在 parallel 块内处理）
-            Stmt::Worker { name: _, body: _, span: _ } => {
+            Stmt::Worker {
+                name: _,
+                body: _,
+                span: _,
+            } => {
                 // Worker 声明本身不执行，由 parallel 块处理
                 Ok(FlowSignal::None)
-            },
+            }
             // v0.19: 发送消息
-            Stmt::Send { value, target, span: _ } => {
+            Stmt::Send {
+                value,
+                target,
+                span: _,
+            } => {
                 let val = self.evaluate(value)?;
                 // 通过 channel 发送到目标 worker
                 if let Some(tx) = self.worker_channels.get(target) {
                     tx.send(val).map_err(|e| format!("Send error: {}", e))?;
                 }
                 Ok(FlowSignal::None)
-            },
+            }
             // v0.19: 接收消息
-            Stmt::Receive { var, source, span: _ } => {
+            Stmt::Receive {
+                var,
+                source,
+                span: _,
+            } => {
                 // 从 source worker 接收消息
                 if let Some(rx) = self.worker_receivers.get(source) {
                     let val = rx.recv().map_err(|e| format!("Receive error: {}", e))?;
-                    self.environment.lock().expect("environment mutex poisoned").define(var.clone(), val, false);
+                    self.environment
+                        .lock()
+                        .expect("environment mutex poisoned")
+                        .define(var.clone(), val, false);
                 }
                 Ok(FlowSignal::None)
-            },
+            }
             // v0.19: 事务块
-            Stmt::Transaction { body, compensation, span: _ } => {
+            Stmt::Transaction {
+                body,
+                compensation,
+                span: _,
+            } => {
                 // 执行事务体
                 let result = self.execute_transaction_body(body);
                 match result {
@@ -758,35 +805,42 @@ impl Interpreter {
                         Err(e)
                     }
                 }
-            },
+            }
             // v0.19: 提交事务 (空操作，事务自动提交)
             Stmt::Commit { span: _ } => Ok(FlowSignal::None),
             // v0.19: 回滚事务
             Stmt::Rollback { span: _ } => Err("Transaction rolled back".to_string()),
             // v0.20: 宏定义 (注册到环境)
-            Stmt::MacroDef { name, params, body, span: _ } => {
+            Stmt::MacroDef {
+                name,
+                params,
+                body,
+                span: _,
+            } => {
                 // 宏在运行时存储为特殊的 Value
-                self.environment.lock().expect("environment mutex poisoned").define(
-                    name.clone(),
-                    Value::Macro {
-                        name: name.clone(),
-                        params: params.clone(),
-                        body: body.clone(),
-                    },
-                    false,
-                );
+                self.environment
+                    .lock()
+                    .expect("environment mutex poisoned")
+                    .define(
+                        name.clone(),
+                        Value::Macro {
+                            name: name.clone(),
+                            params: params.clone(),
+                            body: body.clone(),
+                        },
+                        false,
+                    );
                 Ok(FlowSignal::None)
-            },
+            }
             // v0.23: 类型别名
             Stmt::TypeAlias { name, target, .. } => {
                 // 类型别名在运行时只是注册名称映射
-                self.environment.lock().expect("environment mutex poisoned").define(
-                    name.clone(),
-                    Value::String(target.clone()),
-                    false,
-                );
+                self.environment
+                    .lock()
+                    .expect("environment mutex poisoned")
+                    .define(name.clone(), Value::String(target.clone()), false);
                 Ok(FlowSignal::None)
-            },
+            }
             // v0.23: 枚举类型
             Stmt::EnumDef { name, variants, .. } => {
                 // 枚举在运行时存储为字典 {variant_name: Value::Builtin(...)}
@@ -794,13 +848,12 @@ impl Interpreter {
                 for v in variants {
                     enum_map.insert(v.name.clone(), Value::Builtin(v.name.clone()));
                 }
-                self.environment.lock().expect("environment mutex poisoned").define(
-                    name.clone(),
-                    Value::Dict(enum_map),
-                    false,
-                );
+                self.environment
+                    .lock()
+                    .expect("environment mutex poisoned")
+                    .define(name.clone(), Value::Dict(enum_map), false);
                 Ok(FlowSignal::None)
-            },
+            }
             // v0.23: 结构体类型
             Stmt::StructDef { name, fields, .. } => {
                 // 结构体在运行时存储为构造函数
@@ -811,13 +864,12 @@ impl Interpreter {
                     body: vec![], // 空 body，实际构造在 call_method 中处理
                     env: self.environment.clone(),
                 };
-                self.environment.lock().expect("environment mutex poisoned").define(
-                    name.clone(),
-                    constructor,
-                    false,
-                );
+                self.environment
+                    .lock()
+                    .expect("environment mutex poisoned")
+                    .define(name.clone(), constructor, false);
                 Ok(FlowSignal::None)
-            },
+            }
             Stmt::Match {
                 expr,
                 arms,
@@ -830,7 +882,9 @@ impl Interpreter {
                             self.environment.clone(),
                         )));
                         for (name, value) in bindings {
-                            env.lock().expect("env mutex poisoned").define(name, value, false);
+                            env.lock()
+                                .expect("env mutex poisoned")
+                                .define(name, value, false);
                         }
                         return self.execute_block(arm_stmts, env);
                     }
@@ -933,11 +987,10 @@ impl Interpreter {
                 let path_str = expect_string(path_val, "read_bytes path")?;
                 let bytes = std::fs::read(&path_str)
                     .map_err(|e| format!("read_bytes: cannot read '{}': {}", path_str, e))?;
-                self.environment.lock().expect("environment mutex poisoned").define(
-                    var.clone(),
-                    Value::String(hex_encode(&bytes)),
-                    false,
-                );
+                self.environment
+                    .lock()
+                    .expect("environment mutex poisoned")
+                    .define(var.clone(), Value::String(hex_encode(&bytes)), false);
                 println!(
                     "[read_bytes] {} -> {} ({} bytes)",
                     path_str,
@@ -1023,7 +1076,12 @@ impl Interpreter {
                         "per_call" => {
                             cfg.per_call = Some(match &v {
                                 Value::Number(n) => *n as usize,
-                                _ => return Err(format!("with: per_call must be number, got {}", v)),
+                                _ => {
+                                    return Err(format!(
+                                        "with: per_call must be number, got {}",
+                                        v
+                                    ));
+                                }
                             });
                         }
                         "system" => {
@@ -1583,11 +1641,12 @@ impl Interpreter {
 
     /// v0.19: Worker 并发执行
     fn execute_parallel_workers(&mut self, stmts: &[Stmt]) -> Result<FlowSignal, String> {
-        use std::sync::mpsc;
         use std::collections::HashMap;
+        use std::sync::mpsc;
 
         // 收集所有 worker 声明
-        let workers: Vec<(String, Vec<Stmt>)> = stmts.iter()
+        let workers: Vec<(String, Vec<Stmt>)> = stmts
+            .iter()
             .filter_map(|s| match s {
                 Stmt::Worker { name, body, .. } => Some((name.clone(), body.clone())),
                 _ => None,
@@ -1595,7 +1654,8 @@ impl Interpreter {
             .collect();
 
         // 为每个 worker 创建 channel
-        let mut channels: HashMap<String, (mpsc::Sender<Value>, mpsc::Receiver<Value>)> = HashMap::new();
+        let mut channels: HashMap<String, (mpsc::Sender<Value>, mpsc::Receiver<Value>)> =
+            HashMap::new();
         for (name, _) in &workers {
             let (tx, rx) = mpsc::channel();
             channels.insert(name.clone(), (tx, rx));
@@ -1724,7 +1784,11 @@ impl Interpreter {
                         self.environment.clone(),
                     )));
                     for (name, value) in &bindings {
-                        env.lock().expect("env mutex poisoned").define(name.clone(), value.clone(), false);
+                        env.lock().expect("env mutex poisoned").define(
+                            name.clone(),
+                            value.clone(),
+                            false,
+                        );
                     }
                     let previous = self.environment.clone();
                     self.environment = env;
@@ -1771,7 +1835,11 @@ impl Interpreter {
         match expr {
             Expr::Literal(lit) => self.literal_to_value(lit),
             Expr::Variable(name, _) => {
-                let value = self.environment.lock().expect("environment mutex poisoned").get(name);
+                let value = self
+                    .environment
+                    .lock()
+                    .expect("environment mutex poisoned")
+                    .get(name);
                 match value {
                     Some(v) => Ok(v),
                     None if is_builtin_object(name) => Ok(Value::Builtin(name.clone())),
@@ -1789,9 +1857,10 @@ impl Interpreter {
                 // 如果两个操作数都是字面量，直接计算
                 if let (Expr::Literal(l), Expr::Literal(r)) = (left.as_ref(), right.as_ref())
                     && let (Ok(lv), Ok(rv)) = (self.literal_to_value(l), self.literal_to_value(r))
-                        && let Some(folded) = try_fold_binary(&lv, op, &rv) {
-                            return Ok(folded);
-                        }
+                    && let Some(folded) = try_fold_binary(&lv, op, &rv)
+                {
+                    return Ok(folded);
+                }
                 let left = self.evaluate(left)?;
                 let right = self.evaluate(right)?;
                 eval_binary(left, op, right)
@@ -1808,7 +1877,11 @@ impl Interpreter {
                 // v0.04 Slice 2: 先看 route_registry
                 if self.route_registry.contains_key(callee) {
                     // 已注册 → 走 RouteCall 路径
-                    let model = self.route_registry.get(callee).expect("route should exist").clone();
+                    let model = self
+                        .route_registry
+                        .get(callee)
+                        .expect("route should exist")
+                        .clone();
                     if args.is_empty() {
                         return Err(format!(
                             "route '{}()' requires 1 argument (the prompt)",
@@ -1901,7 +1974,9 @@ impl Interpreter {
                             self.environment.clone(),
                         )));
                         for (name, value) in bindings {
-                            env.lock().expect("env mutex poisoned").define(name, value, false);
+                            env.lock()
+                                .expect("env mutex poisoned")
+                                .define(name, value, false);
                         }
                         let previous = self.environment.clone();
                         self.environment = env;
@@ -2336,17 +2411,17 @@ impl Interpreter {
                         args,
                         ..
                     } = current_right.as_ref()
-                        && is_fusable_method(method) {
-                            ops.push((method.clone(), args.clone()));
-                            if let Expr::Pipe {
-                                right: next_right,
-                                ..
-                            } = object.as_ref()
-                            {
-                                current_right = next_right;
-                                continue;
-                            }
+                        && is_fusable_method(method)
+                    {
+                        ops.push((method.clone(), args.clone()));
+                        if let Expr::Pipe {
+                            right: next_right, ..
+                        } = object.as_ref()
+                        {
+                            current_right = next_right;
+                            continue;
                         }
+                    }
                     break;
                 }
 
@@ -2362,7 +2437,8 @@ impl Interpreter {
                         for arg in &args {
                             evaluated_args.push(self.evaluate(arg)?);
                         }
-                        result = self.call_method(result, &method, evaluated_args, Span::default())?;
+                        result =
+                            self.call_method(result, &method, evaluated_args, Span::default())?;
                     }
                     Ok(result)
                 }
@@ -2557,7 +2633,9 @@ impl Interpreter {
             "methods_of" => {
                 let value = args.first().ok_or("methods_of() requires 1 argument")?;
                 let methods = get_methods_for_value(value);
-                Ok(Value::List(methods.into_iter().map(Value::String).collect()))
+                Ok(Value::List(
+                    methods.into_iter().map(Value::String).collect(),
+                ))
             }
             // v0.17: into(collection, fn) → 应用 fn 到集合的每个元素
             "into" => {
@@ -2589,7 +2667,12 @@ impl Interpreter {
             "McpServer::new" => Ok(Value::McpServer { tools: Vec::new() }),
             _ => {
                 // 先 clone 出值，释放 borrow，避免借用冲突
-                let looked_up = self.environment.lock().expect("environment mutex poisoned").get(name).clone();
+                let looked_up = self
+                    .environment
+                    .lock()
+                    .expect("environment mutex poisoned")
+                    .get(name)
+                    .clone();
                 if let Some(value) = looked_up {
                     match value {
                         Value::Task { params, body, .. } => {
@@ -2624,7 +2707,11 @@ impl Interpreter {
                             )));
                             for (i, param) in params.iter().enumerate() {
                                 let value = args.get(i).cloned().unwrap_or(Value::Nil);
-                                env.lock().expect("env mutex poisoned").define(param.clone(), value, false);
+                                env.lock().expect("env mutex poisoned").define(
+                                    param.clone(),
+                                    value,
+                                    false,
+                                );
                             }
                             let previous = self.environment.clone();
                             self.environment = env;
@@ -2642,11 +2729,7 @@ impl Interpreter {
     }
 
     /// v0.17: 直接调用 Value 形式的函数（用于管道闭包）
-    fn call_function_value(
-        &mut self,
-        func: &Value,
-        args: Vec<Value>,
-    ) -> Result<Value, String> {
+    fn call_function_value(&mut self, func: &Value, args: Vec<Value>) -> Result<Value, String> {
         match func {
             Value::Task { params, body, .. } => self.call_task(params, body, args),
             Value::Closure { params, body, env } => {
@@ -2682,7 +2765,9 @@ impl Interpreter {
             // 不再嗅探 Dict key。直接传 args[i]，让 dispatch_trait_method 在
             // receiver 上自然走 TraitObject 分支。
             let value = args.get(i).cloned().unwrap_or(Value::Nil);
-            env.lock().expect("env mutex poisoned").define(param.clone(), value, false);
+            env.lock()
+                .expect("env mutex poisoned")
+                .define(param.clone(), value, false);
         }
         // v0.08.2: impl method body 单表达式时作为返回值 (与 closure 行为一致)
         let actual_body = if body.len() == 1 {
@@ -2713,7 +2798,10 @@ impl Interpreter {
         let call_env = Arc::new(Mutex::new(Environment::with_parent(env)));
         for (i, param) in params.iter().enumerate() {
             let value = args.get(i).cloned().unwrap_or(Value::Nil);
-            call_env.lock().expect("env mutex poisoned").define(param.clone(), value, false);
+            call_env
+                .lock()
+                .expect("env mutex poisoned")
+                .define(param.clone(), value, false);
         }
         // 闭包是**表达式**：body 通常是 [Stmt::Expr(expr)] 或 [Stmt::Return(val)]
         // 求值约定（与 task 不同——task 必须显式 return 才返回值）：
@@ -3733,22 +3821,27 @@ impl Interpreter {
         // v0.15: mock_llm 模式 — 从队列中取出下一个响应
         if let Some(ref mut cfg) = self.current_ai_config
             && let Some(ref mut responses) = cfg.mock_responses
-                && !responses.is_empty() {
-                    let response = responses.remove(0); // 消费第一个
-                    // 模拟 token 估算
-                    let tokens_in = messages.iter().map(|(_, c)| c.len()).sum::<usize>() / 4;
-                    let tokens_out = response.len() / 4;
-                    self.recorder.record_ai_chat(
-                        model.to_string(),
-                        messages.last().map(|(_, c)| c.as_str()).unwrap_or("").to_string(),
-                        response.clone(),
-                        tokens_in,
-                        tokens_out,
-                        0, // mock 无延迟
-                        None,
-                    );
-                    return Ok(Value::String(response));
-                }
+            && !responses.is_empty()
+        {
+            let response = responses.remove(0); // 消费第一个
+            // 模拟 token 估算
+            let tokens_in = messages.iter().map(|(_, c)| c.len()).sum::<usize>() / 4;
+            let tokens_out = response.len() / 4;
+            self.recorder.record_ai_chat(
+                model.to_string(),
+                messages
+                    .last()
+                    .map(|(_, c)| c.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                response.clone(),
+                tokens_in,
+                tokens_out,
+                0, // mock 无延迟
+                None,
+            );
+            return Ok(Value::String(response));
+        }
 
         // v0.22: AI 调用内联缓存
         let cache_key = format!("{}:{:?}", model, messages);
@@ -3793,9 +3886,11 @@ impl Interpreter {
         let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
 
         // v0.22: 流式响应优化 - 添加 stream 参数
-        let use_stream = self.current_ai_config.as_ref()
+        let use_stream = self
+            .current_ai_config
+            .as_ref()
             .and_then(|c| c.max_tokens)
-            .map(|mt| mt > 1000)  // 长响应使用流式
+            .map(|mt| mt > 1000) // 长响应使用流式
             .unwrap_or(false);
 
         if use_stream {
@@ -4117,15 +4212,16 @@ impl Interpreter {
     fn track_tokens(&mut self, input: usize, output: usize) -> Result<(), String> {
         // v0.15: 检查每次调用上限
         if let Some(ref budget) = self.token_budget
-            && let Some(per_call) = budget.per_call {
-                let call_total = input + output;
-                if call_total > per_call {
-                    return Err(format!(
-                        "Token per-call limit exceeded: this call used {}, limit is {}",
-                        call_total, per_call
-                    ));
-                }
+            && let Some(per_call) = budget.per_call
+        {
+            let call_total = input + output;
+            if call_total > per_call {
+                return Err(format!(
+                    "Token per-call limit exceeded: this call used {}, limit is {}",
+                    call_total, per_call
+                ));
             }
+        }
 
         self.token_usage.input += input;
         self.token_usage.output += output;
@@ -4650,7 +4746,6 @@ fn mock_bow_embedding(s: &str) -> Vec<f64> {
 
 // FlowSignal is now in value.rs
 // Re-exported above via pub use crate::value::*;
-
 
 // ===================================================================
 // v11: 单元测试 — 相似度函数
@@ -6082,7 +6177,10 @@ mod mock_llm_tests {
         // 由于 ai.chat 需要 cfg 参数，这里用简单的内联测试
         let mut interp = Interpreter::new();
         interp.current_ai_config = Some(AiConfigValue {
-            mock_responses: Some(vec!["mock response 1".to_string(), "mock response 2".to_string()]),
+            mock_responses: Some(vec![
+                "mock response 1".to_string(),
+                "mock response 2".to_string(),
+            ]),
             ..Default::default()
         });
         let msgs = vec![("user".to_string(), "test prompt".to_string())];

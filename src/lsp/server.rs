@@ -271,27 +271,27 @@ impl Server {
     // ---------------------------------------------------------------
     fn handle_hover(&self, params: Value) -> Result<Value, String> {
         let docs = self.docs.lock().expect("docs mutex poisoned");
-        super::providers::hover(&docs, &params)
+        super::providers::hover_v2(&docs, &params)
     }
 
     fn handle_completion(&self, params: Value) -> Value {
         let docs = self.docs.lock().expect("docs mutex poisoned");
-        super::providers::completion(&docs, &params)
+        super::providers::completion_v2(&docs, &params)
     }
 
     fn handle_definition(&self, params: Value) -> Value {
         let docs = self.docs.lock().expect("docs mutex poisoned");
-        super::providers::definition(&docs, &params)
+        super::providers::definition_v2(&docs, &params)
     }
 
     fn handle_references(&self, params: Value) -> Value {
         let docs = self.docs.lock().expect("docs mutex poisoned");
-        super::providers::references(&docs, &params)
+        super::providers::references_v2(&docs, &params)
     }
 
     fn handle_document_symbol(&self, params: Value) -> Value {
         let docs = self.docs.lock().expect("docs mutex poisoned");
-        super::providers::document_symbol(&docs, &params)
+        super::providers::document_symbol_v2(&docs, &params)
     }
 
     fn handle_formatting(&self, params: Value, range: bool) -> Value {
@@ -301,7 +301,7 @@ impl Server {
 
     fn handle_rename(&self, params: Value) -> Value {
         let docs = self.docs.lock().expect("docs mutex poisoned");
-        super::providers::rename(&docs, &params)
+        super::providers::rename_v2(&docs, &params)
     }
 
     fn handle_semantic_tokens(&self, params: Value) -> Value {
@@ -311,19 +311,16 @@ impl Server {
 
     fn handle_folding_range(&self, params: Value) -> Value {
         let docs = self.docs.lock().expect("docs mutex poisoned");
-        super::providers::folding_range(&docs, &params)
+        super::providers::folding_range_v2(&docs, &params)
     }
 
     // ---------------------------------------------------------------
     // Diagnostics（typeck → LSP Diagnostic）
     // ---------------------------------------------------------------
     fn check_diagnostics(&self, text: &str) -> Vec<Diagnostic> {
-        use crate::lexer::Lexer;
-        use crate::parser::Parser;
         use crate::typeck;
 
-        let tokens = Lexer::new(text).scan_tokens();
-        let stmts = Parser::new(tokens).parse();
+        let stmts = crate::interpreter::parse_code(text);
         let errs = typeck::check_program(&stmts);
         errs.into_iter()
             .map(|e| {

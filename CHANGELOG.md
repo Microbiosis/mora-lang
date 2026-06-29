@@ -2,11 +2,72 @@
 
 All notable changes to Mora will be documented in this file.
 
-## [v0.23] - 2026-06-28
+## [v0.24] - 2026-06-29
+
+### ParserV2 完整迁移 (Complete)
+
+ParserV2 已完成对旧 Parser 的完整迁移，所有功能已覆盖。
+
+#### 新增语句解析
+- **append_statement**: 追加文件写入
+- **read_bytes_statement**: 读取字节文件
+- **write_bytes_statement**: 写入字节文件
+- **stream_statement**: 流式循环 `stream <expr> as <var> do ... end`
+- **tool_statement**: 工具定义 `tool name(params): type do ... end`
+- **observe_statement**: 可观测性配置 (trace/metrics/otel)
+- **span_statement**: 追踪范围 `span "name" tags {..} do ... end`
+- **record_tokens_statement**: 记录 token 使用量
+
+#### 新增表达式解析
+- **match_expression**: 模式匹配表达式
+- **pattern**: 模式解析 (字面量/变量/列表/字典/通配符)
+- **parse_format_string**: 格式字符串插值
+- **parse_ai_model_call**: ai_model 调用 (支持 keyword args)
+- **flatten_prompt_parts**: Prompt 表达式展平
+
+#### 新增类型系统支持
+- **parse_generic_params**: 泛型参数 `<T: Bound>`
+- **parse_type_list**: 类型列表 `<T, U, V>`
+- **parse_type_name_recursive**: 递归解析嵌套泛型
+- **parse_where_clause**: where 子句
+
+#### 重构
+- **ObserveConfig**: 在 ast_v2.rs 中定义新类型，使用 NodeId
+- **FnDef**: 在 ast_v2.rs 中定义新类型，使用 Vec<NodeId> 作为 body
+- **consume_method_name**: 支持关键字作为方法名
 
 ### 9 Languages Features Integration (Complete)
 
 All features from the learning plan have been implemented.
+
+### v0.21: Rust 风格类型系统
+
+- **借用语法**: `&expr` / `&mut expr`
+- **生命周期标注**: `<'a>` 参数
+- **借用冲突检查**: 编译期检查不可变/可变借用冲突
+
+### v0.22: 性能优化
+
+- **AI 调用内联缓存**: 相同 prompt 直接返回缓存结果
+- **管道融合**: 连续 map/filter/take/drop 合并执行
+- **常量折叠**: 编译期计算常量表达式
+- **字符串驻留**: 相同字符串只存储一次
+- **HTTP 连接池**: 线程池优化 (最多16线程)
+- **MCP 异步处理**: 线程池处理请求 (最多8并发)
+- **类型检查增量优化**: 缓存已检查的表达式类型
+
+### v0.24: 强类型升级
+
+- **类型别名**: `type Name = TargetType`
+- **枚举类型**: `enum Name { V1, V2(Type) }`
+- **结构体类型**: `struct Name { field: Type }`
+
+### 文档
+
+- **docs/mora-spec.md**: Mora 语言规范 (20 章)
+- **docs/influences.md**: 9 语言影响分析
+- **docs/learning-plan.md**: 特性融入计划
+- **docs/workflow-v0.20.md**: 开发工作流
 
 From Prolog, StreamIt, APL, Clojure, Lisp, Smalltalk, Common Lisp, Ballerina, Logo.
 

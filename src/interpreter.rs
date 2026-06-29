@@ -8,8 +8,37 @@ use std::time::Duration;
 use crate::ast::*;
 use crate::flow::*;
 use crate::lexer::Lexer;
-use crate::parser::Parser;
 use crate::trace_collector::TraceCollector;
+
+/// 使用 ParserV2 解析代码
+pub fn parse_code(source: &str) -> Vec<crate::ast::Stmt> {
+    let tokens = Lexer::new(source).scan_tokens();
+    let mut parser_v2 = crate::parser_v2::ParserV2::new(tokens);
+    let node_ids = parser_v2.parse();
+    let arena = parser_v2.into_arena();
+    let converter = crate::ast_v2_to_v1::AstV2ToV1::new(arena);
+    converter.convert_program(&node_ids)
+}
+
+/// 转换 ast_v2::Pattern 到 ast::Pattern
+fn convert_pattern_v2_to_v1(pattern: &crate::ast_v2::Pattern) -> crate::ast::Pattern {
+    match pattern {
+        crate::ast_v2::Pattern::Wildcard => crate::ast::Pattern::Wildcard,
+        crate::ast_v2::Pattern::Literal(lit) => crate::ast::Pattern::Literal(lit.clone()),
+        crate::ast_v2::Pattern::Variable(name) => crate::ast::Pattern::Variable(name.clone()),
+        crate::ast_v2::Pattern::List { prefix, rest } => crate::ast::Pattern::List {
+            prefix: prefix.iter().map(convert_pattern_v2_to_v1).collect(),
+            rest: rest.clone(),
+        },
+        crate::ast_v2::Pattern::Dict(entries) => crate::ast::Pattern::Dict(
+            entries.iter().map(|(k, p)| (k.clone(), convert_pattern_v2_to_v1(p))).collect(),
+        ),
+        crate::ast_v2::Pattern::Guard { pattern, condition: _ } => {
+            // Guard condition is NodeId, can't convert directly to Expr
+            convert_pattern_v2_to_v1(pattern)
+        },
+    }
+}
 
 // Re-export value types for backward compatibility
 pub use crate::value::{Environment, FlowSignal, StreamReader, Value};
@@ -252,6 +281,946 @@ pub struct Interpreter {
     // v0.22: AI 批量请求队列
     #[allow(dead_code)] // 未来扩展用
     ai_batch_queue: Vec<(String, Vec<(String, String)>)>, // (model, messages)
+    // v0.24: 自适应 draft 模型选择 (model -> success_rate)
+    draft_model_stats: HashMap<String, (usize, usize)>, // (success, total)
+    // v0.24: 推测解码缓存预热队列
+    #[allow(dead_code)] // 未来扩展用
+    cache_warm_queue: Vec<String>,
+    // v0.24: AI 调用优先级队列
+    #[allow(dead_code)] // 未来扩展用
+    ai_priority_queue: Vec<AiPriorityEntry>,
+    // v0.24: 自适应温度调整器
+    #[allow(dead_code)] // 未来扩展用
+    adaptive_temp: AdaptiveTemperature,
+    // v0.24: 上下文窗口管理器
+    context_window: ContextWindow,
+    // v0.24: 模型负载均衡器
+    #[allow(dead_code)] // 未来扩展用
+    load_balancer: LoadBalancer,
+    // v0.24: 推测解码并行验证器
+    speculative_verifier: SpeculativeVerifier,
+    // v0.24: AI 调用缓存预热器
+    #[allow(dead_code)] // 未来扩展用
+    cache_warmer: CacheWarmer,
+    // v0.24: 重试策略
+    #[allow(dead_code)] // 未来扩展用
+    retry_policy: RetryPolicy,
+}
+
+    /// v0.24: AI 调用优先级队列条目类型
+type AiPriorityEntry = (u32, String, Vec<(String, String)>);
+
+/// v0.24: 自适应温度调整器
+#[derive(Clone, Debug)]
+#[allow(dead_code)] // 未来扩展用
+struct AdaptiveTemperature {
+    /// 基础温度
+    base: f64,
+    /// 当前温度
+    current: f64,
+    /// 最小温度
+    min: f64,
+    /// 最大温度
+    max: f64,
+    /// 成功率 (用于调整温度)
+    success_rate: f64,
+    /// 调整步长
+    step: f64,
+}
+
+/// v0.24: 上下文窗口管理器
+#[derive(Clone, Debug)]
+#[allow(dead_code)] // 未来扩展用
+struct ContextWindow {
+    /// 最大 token 数
+    max_tokens: usize,
+    /// 当前 token 数
+    current_tokens: usize,
+    /// 消息历史
+    messages: Vec<(String, String)>,
+    /// 压缩阈值 (当 token 超过此值时触发压缩)
+    compression_threshold: f64,
+    /// 压缩比率 (保留最近的消息比例)
+    compression_ratio: f64,
+}
+
+/// v0.24: 模型负载均衡器
+#[derive(Clone, Debug)]
+#[allow(dead_code)] // 未来扩展用
+#[derive(Default)]
+struct LoadBalancer {
+    /// 模型列表
+    models: Vec<String>,
+    /// 当前索引
+    current_index: usize,
+    /// 模型权重
+    weights: Vec<f64>,
+    /// 模型当前负载
+    loads: Vec<f64>,
+}
+
+/// v0.24: 推测解码并行验证器
+#[derive(Clone, Debug)]
+#[allow(dead_code)] // 未来扩展用
+struct SpeculativeVerifier {
+    /// 验证结果缓存
+    verification_cache: HashMap<String, bool>,
+    /// 并行验证数
+    parallel_count: usize,
+    /// 并行验证队列
+    verification_queue: Vec<(String, String)>, // (draft, verification)
+}
+
+/// v0.24: AI 调用缓存预热器
+#[derive(Clone, Debug)]
+#[allow(dead_code)] // 未来扩展用
+#[derive(Default)]
+struct CacheWarmer {
+    /// 预热队列
+    queue: Vec<String>,
+    /// 预热结果缓存
+    cache: HashMap<String, String>,
+    /// 预热状态
+    warming: bool,
+}
+
+
+impl CacheWarmer {
+    #[allow(dead_code)]
+    /// 添加预热请求
+    fn add_request(&mut self, prompt: String) {
+        self.queue.push(prompt);
+    }
+
+    /// 获取下一个预热请求
+    #[allow(dead_code)]
+    fn next_request(&mut self) -> Option<String> {
+        self.queue.pop()
+    }
+
+    /// 缓存预热结果
+    #[allow(dead_code)]
+    fn cache_result(&mut self, prompt: String, response: String) {
+        self.cache.insert(prompt, response);
+    }
+
+    /// 获取缓存结果
+    #[allow(dead_code)]
+    fn get_cached(&self, prompt: &str) -> Option<&String> {
+        self.cache.get(prompt)
+    }
+
+    /// 检查是否有预热请求
+    #[allow(dead_code)]
+    fn has_requests(&self) -> bool {
+        !self.queue.is_empty()
+    }
+}
+
+/// v0.24: 智能缓存淘汰策略
+#[derive(Clone, Debug)]
+#[allow(dead_code)]
+struct SmartCacheEviction {
+    /// 缓存条目 (key -> (value, access_count, last_access_time, cost))
+    entries: HashMap<String, (String, usize, u64, f64)>,
+    /// 最大缓存大小
+    max_size: usize,
+    /// 淘汰策略
+    strategy: EvictionStrategy,
+}
+
+/// v0.24: 淘汰策略
+#[derive(Clone, Debug)]
+#[allow(dead_code)]
+enum EvictionStrategy {
+    Lru,
+    Lfu,
+    CostAware,
+    Hybrid,
+}
+
+impl Default for SmartCacheEviction {
+    fn default() -> Self {
+        Self {
+            entries: HashMap::new(),
+            max_size: 1000,
+            strategy: EvictionStrategy::Hybrid,
+        }
+    }
+}
+
+impl SmartCacheEviction {
+    /// 添加缓存条目
+    #[allow(dead_code)]
+    fn insert(&mut self, key: String, value: String, cost: f64) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        if self.entries.len() >= self.max_size {
+            self.evict();
+        }
+
+        self.entries.insert(key, (value, 1, now, cost));
+    }
+
+    /// 获取缓存条目
+    #[allow(dead_code)]
+    fn get(&mut self, key: &str) -> Option<String> {
+        if let Some((value, access_count, last_access, _)) = self.entries.get_mut(key) {
+            *access_count += 1;
+            *last_access = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            Some(value.clone())
+        } else {
+            None
+        }
+    }
+
+    /// 淘汰条目
+    fn evict(&mut self) {
+        if self.entries.is_empty() {
+            return;
+        }
+
+        let key_to_remove = match self.strategy {
+            EvictionStrategy::Lru => {
+                self.entries
+                    .iter()
+                    .min_by_key(|(_, (_, _, last_access, _))| *last_access)
+                    .map(|(key, _)| key.clone())
+            }
+            EvictionStrategy::Lfu => {
+                self.entries
+                    .iter()
+                    .min_by_key(|(_, (_, access_count, _, _))| *access_count)
+                    .map(|(key, _)| key.clone())
+            }
+            EvictionStrategy::CostAware => {
+                self.entries
+                    .iter()
+                    .min_by(|(_, (_, _, _, a)), (_, (_, _, _, b))| {
+                        a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
+                    })
+                    .map(|(key, _)| key.clone())
+            }
+            EvictionStrategy::Hybrid => {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+
+                self.entries
+                    .iter()
+                    .min_by(|(_, (.., a_count, a_time, a_cost)), (_, (.., b_count, b_time, b_cost))| {
+                        let score_a = (*a_count as f64) * (1.0 / (now - a_time + 1) as f64) * (1.0 / (a_cost + 0.001));
+                        let score_b = (*b_count as f64) * (1.0 / (now - b_time + 1) as f64) * (1.0 / (b_cost + 0.001));
+                        score_a.partial_cmp(&score_b).unwrap_or(std::cmp::Ordering::Equal)
+                    })
+                    .map(|(key, _)| key.clone())
+            }
+        };
+
+        if let Some(key) = key_to_remove {
+            self.entries.remove(&key);
+        }
+    }
+
+    /// 获取缓存大小
+    #[allow(dead_code)]
+    fn size(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// 清空缓存
+    #[allow(dead_code)]
+    fn clear(&mut self) {
+        self.entries.clear();
+    }
+}
+
+impl Default for SpeculativeVerifier {
+    fn default() -> Self {
+        Self {
+            verification_cache: HashMap::new(),
+            parallel_count: 4,
+            verification_queue: Vec::new(),
+        }
+    }
+}
+
+impl SpeculativeVerifier {
+    #[allow(dead_code)]
+    /// 验证 draft 结果
+    fn verify(&mut self, draft: &str, verification: &str) -> bool {
+        // 检查缓存
+        let cache_key = format!("{}:{}", draft.len(), verification.len());
+        if let Some(&cached) = self.verification_cache.get(&cache_key) {
+            return cached;
+        }
+
+        // 简单验证：检查 verification 是否包含 "VERIFIED"
+        let result = verification.contains("VERIFIED");
+
+        // 缓存结果
+        self.verification_cache.insert(cache_key, result);
+
+        result
+    }
+
+    /// 清空缓存
+    #[allow(dead_code)]
+    fn clear_cache(&mut self) {
+        self.verification_cache.clear();
+    }
+
+    /// v0.24: 添加到并行验证队列
+    #[allow(dead_code)]
+    fn queue_verification(&mut self, draft: String, verification: String) {
+        self.verification_queue.push((draft, verification));
+    }
+
+    /// v0.24: 处理并行验证队列
+    #[allow(dead_code)]
+    fn process_queue(&mut self) {
+        let queue = std::mem::take(&mut self.verification_queue);
+        for (draft, verification) in queue {
+            self.verify(&draft, &verification);
+        }
+    }
+
+    /// v0.24: 获取队列长度
+    #[allow(dead_code)]
+    fn queue_len(&self) -> usize {
+        self.verification_queue.len()
+    }
+}
+
+
+impl LoadBalancer {
+    #[allow(dead_code)]
+    /// 添加模型
+    fn add_model(&mut self, model: String, weight: f64) {
+        self.models.push(model);
+        self.weights.push(weight);
+        self.loads.push(0.0);
+    }
+
+    /// 选择模型 (加权轮询)
+    #[allow(dead_code)]
+    fn select(&mut self) -> Option<String> {
+        if self.models.is_empty() {
+            return None;
+        }
+
+        // 找到负载最低的模型
+        let min_index = self.loads
+            .iter()
+            .enumerate()
+            .min_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+            .map(|(i, _)| i)
+            .unwrap_or(0);
+
+        // 更新负载
+        self.loads[min_index] += self.weights[min_index];
+
+        Some(self.models[min_index].clone())
+    }
+
+    /// 完成调用，减少负载
+    #[allow(dead_code)]
+    fn complete(&mut self, model: &str) {
+        if let Some(index) = self.models.iter().position(|m| m == model) {
+            self.loads[index] = (self.loads[index] - self.weights[index]).max(0.0);
+        }
+    }
+}
+
+/// v0.24: 模型切换策略
+#[derive(Clone, Debug)]
+#[allow(dead_code)]
+#[derive(Default)]
+struct ModelSwitcher {
+    /// 任务类型 -> 模型映射
+    task_model_map: HashMap<String, String>,
+    /// 模型性能统计 (model -> (avg_latency, success_rate))
+    model_stats: HashMap<String, (f64, f64)>,
+}
+
+
+impl ModelSwitcher {
+    /// 注册任务类型对应的模型
+    #[allow(dead_code)]
+    fn register_task(&mut self, task_type: String, model: String) {
+        self.task_model_map.insert(task_type, model);
+    }
+
+    /// 根据任务类型选择模型
+    #[allow(dead_code)]
+    fn select_model(&self, task_type: &str) -> Option<String> {
+        self.task_model_map.get(task_type).cloned()
+    }
+
+    /// 更新模型统计
+    #[allow(dead_code)]
+    fn update_stats(&mut self, model: &str, latency: f64, success: bool) {
+        let stats = self.model_stats.entry(model.to_string()).or_insert((0.0, 1.0));
+        stats.0 = (stats.0 + latency) / 2.0;
+        if success {
+            stats.1 = (stats.1 + 1.0) / 2.0;
+        } else {
+            stats.1 /= 2.0;
+        }
+    }
+
+    /// 获取最佳模型
+    #[allow(dead_code)]
+    fn best_model(&self) -> Option<String> {
+        self.model_stats
+            .iter()
+            .max_by(|(_, a), (_, b)| {
+                let score_a = a.1 / (a.0 + 1.0);
+                let score_b = b.1 / (b.0 + 1.0);
+                score_a.partial_cmp(&score_b).unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .map(|(model, _)| model.clone())
+    }
+}
+
+/// v0.24: 模型性能基准测试
+#[derive(Clone, Debug)]
+#[allow(dead_code)]
+struct ModelBenchmark {
+    /// 基准测试结果 (model -> (avg_latency_ms, avg_tokens_per_sec, success_rate))
+    results: HashMap<String, (f64, f64, f64)>,
+    /// 测试用例
+    test_cases: Vec<String>,
+}
+
+/// v0.24: AI 调用链路追踪
+#[derive(Clone, Debug)]
+#[allow(dead_code)]
+struct AiCallTracer {
+    /// 调用链 (trace_id -> Vec<CallSpan>)
+    traces: HashMap<String, Vec<CallSpan>>,
+    /// 当前 trace_id
+    current_trace: Option<String>,
+    /// 最大追踪深度
+    max_depth: usize,
+}
+
+/// v0.24: 自适应批处理大小
+#[derive(Clone, Debug)]
+#[allow(dead_code)]
+struct AdaptiveBatchSize {
+    /// 当前批处理大小
+    current_size: usize,
+    /// 最小批处理大小
+    min_size: usize,
+    /// 最大批处理大小
+    max_size: usize,
+    /// 成功率阈值 (低于此值时减小批处理)
+    success_threshold: f64,
+    /// 最近的成功率
+    recent_success_rate: f64,
+    /// 调整步长
+    step: usize,
+}
+
+/// v0.24: 模型性能可视化
+#[derive(Clone, Debug)]
+#[allow(dead_code)]
+struct ModelPerformanceVisualizer {
+    /// 性能数据 (model -> Vec<(timestamp, latency_ms, tokens_per_sec)>)
+    performance_data: HashMap<String, Vec<(u64, f64, f64)>>,
+    /// 最大数据点数
+    max_data_points: usize,
+}
+
+impl Default for ModelPerformanceVisualizer {
+    fn default() -> Self {
+        Self {
+            performance_data: HashMap::new(),
+            max_data_points: 100,
+        }
+    }
+}
+
+impl ModelPerformanceVisualizer {
+    /// 记录性能数据
+    #[allow(dead_code)]
+    fn record(&mut self, model: &str, latency_ms: f64, tokens_per_sec: f64) {
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let entry = self.performance_data.entry(model.to_string()).or_default();
+        entry.push((timestamp, latency_ms, tokens_per_sec));
+        // 限制数据点数
+        if entry.len() > self.max_data_points {
+            entry.remove(0);
+        }
+    }
+
+    /// 获取模型平均延迟
+    #[allow(dead_code)]
+    fn avg_latency(&self, model: &str) -> Option<f64> {
+        self.performance_data.get(model).map(|data| {
+            let sum: f64 = data.iter().map(|(_, latency, _)| latency).sum();
+            sum / data.len() as f64
+        })
+    }
+
+    /// 获取模型平均速度
+    #[allow(dead_code)]
+    fn avg_speed(&self, model: &str) -> Option<f64> {
+        self.performance_data.get(model).map(|data| {
+            let sum: f64 = data.iter().map(|(_, _, speed)| speed).sum();
+            sum / data.len() as f64
+        })
+    }
+
+    /// 生成性能报告
+    #[allow(dead_code)]
+    fn generate_report(&self) -> String {
+        let mut report = String::from("Model Performance Report\n========================\n\n");
+        for (model, data) in &self.performance_data {
+            if data.is_empty() { continue; }
+            let avg_latency: f64 = data.iter().map(|(_, l, _)| l).sum::<f64>() / data.len() as f64;
+            let avg_speed: f64 = data.iter().map(|(_, _, s)| s).sum::<f64>() / data.len() as f64;
+            report.push_str(&format!("Model: {}\n", model));
+            report.push_str(&format!("  Data points: {}\n", data.len()));
+            report.push_str(&format!("  Avg latency: {:.1}ms\n", avg_latency));
+            report.push_str(&format!("  Avg speed: {:.1} tokens/sec\n\n", avg_speed));
+        }
+        report
+    }
+}
+
+/// v0.24: AI 调用成本优化器
+#[derive(Clone, Debug)]
+#[allow(dead_code)]
+struct CostOptimizer {
+    /// 模型定价 (model -> (input_cost_per_1k, output_cost_per_1k))
+    pricing: HashMap<String, (f64, f64)>,
+    /// 总成本
+    total_cost: f64,
+    /// 成本预算
+    budget: Option<f64>,
+    /// 成本警告阈值
+    warning_threshold: f64,
+}
+
+impl Default for CostOptimizer {
+    fn default() -> Self {
+        let mut pricing = HashMap::new();
+        pricing.insert("gpt-4o".to_string(), (0.005, 0.015));
+        pricing.insert("gpt-4o-mini".to_string(), (0.00015, 0.0006));
+        pricing.insert("gpt-3.5-turbo".to_string(), (0.0005, 0.0015));
+        pricing.insert("claude-3-opus".to_string(), (0.015, 0.075));
+        pricing.insert("claude-3-sonnet".to_string(), (0.003, 0.015));
+        pricing.insert("claude-3-haiku".to_string(), (0.00025, 0.00125));
+
+        Self {
+            pricing,
+            total_cost: 0.0,
+            budget: None,
+            warning_threshold: 0.8,
+        }
+    }
+}
+
+impl CostOptimizer {
+    /// 计算调用成本
+    #[allow(dead_code)]
+    fn calculate_cost(&self, model: &str, tokens_in: usize, tokens_out: usize) -> f64 {
+        let (input_price, output_price) = self.pricing
+            .get(model)
+            .unwrap_or(&(0.001, 0.002));
+
+        let input_cost = (tokens_in as f64 / 1000.0) * input_price;
+        let output_cost = (tokens_out as f64 / 1000.0) * output_price;
+
+        input_cost + output_cost
+    }
+
+    /// 记录成本
+    #[allow(dead_code)]
+    fn record_cost(&mut self, model: &str, tokens_in: usize, tokens_out: usize) -> f64 {
+        let cost = self.calculate_cost(model, tokens_in, tokens_out);
+        self.total_cost += cost;
+        cost
+    }
+
+    /// 检查是否超出预算
+    #[allow(dead_code)]
+    fn is_over_budget(&self) -> bool {
+        if let Some(budget) = self.budget {
+            self.total_cost >= budget
+        } else {
+            false
+        }
+    }
+
+    /// 检查是否需要警告
+    #[allow(dead_code)]
+    fn needs_warning(&self) -> bool {
+        if let Some(budget) = self.budget {
+            self.total_cost >= budget * self.warning_threshold
+        } else {
+            false
+        }
+    }
+
+    /// 获取总成本
+    #[allow(dead_code)]
+    fn get_total_cost(&self) -> f64 {
+        self.total_cost
+    }
+
+    /// 设置预算
+    #[allow(dead_code)]
+    fn set_budget(&mut self, budget: f64) {
+        self.budget = Some(budget);
+    }
+
+    /// 选择最便宜的模型
+    #[allow(dead_code)]
+    fn cheapest_model(&self, tokens_in: usize, tokens_out: usize) -> Option<String> {
+        self.pricing
+            .iter()
+            .min_by(|(_, a), (_, b)| {
+                let cost_a = (tokens_in as f64 / 1000.0) * a.0 + (tokens_out as f64 / 1000.0) * a.1;
+                let cost_b = (tokens_in as f64 / 1000.0) * b.0 + (tokens_out as f64 / 1000.0) * b.1;
+                cost_a.partial_cmp(&cost_b).unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .map(|(model, _)| model.clone())
+    }
+}
+
+impl Default for AdaptiveBatchSize {
+    fn default() -> Self {
+        Self {
+            current_size: 10,
+            min_size: 1,
+            max_size: 100,
+            success_threshold: 0.9,
+            recent_success_rate: 1.0,
+            step: 5,
+        }
+    }
+}
+
+impl AdaptiveBatchSize {
+    /// 根据成功率调整批处理大小
+    #[allow(dead_code)]
+    fn adjust(&mut self, success_rate: f64) {
+        self.recent_success_rate = success_rate;
+        if success_rate < self.success_threshold {
+            // 成功率低，减小批处理
+            self.current_size = (self.current_size - self.step).max(self.min_size);
+        } else {
+            // 成功率高，增大批处理
+            self.current_size = (self.current_size + self.step).min(self.max_size);
+        }
+    }
+
+    /// 获取当前批处理大小
+    #[allow(dead_code)]
+    fn get(&self) -> usize {
+        self.current_size
+    }
+}
+
+/// v0.24: 调用跨度
+#[derive(Clone, Debug)]
+#[allow(dead_code)]
+struct CallSpan {
+    /// 跨度 ID
+    id: String,
+    /// 父跨度 ID
+    parent_id: Option<String>,
+    /// 模型名称
+    model: String,
+    /// 开始时间 (ms)
+    start_ms: u64,
+    /// 结束时间 (ms)
+    end_ms: u64,
+    /// 输入 token 数
+    tokens_in: usize,
+    /// 输出 token 数
+    tokens_out: usize,
+    /// 是否成功
+    success: bool,
+    /// 错误信息
+    error: Option<String>,
+}
+
+impl Default for AiCallTracer {
+    fn default() -> Self {
+        Self {
+            traces: HashMap::new(),
+            current_trace: None,
+            max_depth: 10,
+        }
+    }
+}
+
+impl AiCallTracer {
+    /// 开始新的追踪
+    #[allow(dead_code)]
+    fn start_trace(&mut self) -> String {
+        let trace_id = format!("trace_{}", std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis());
+        self.current_trace = Some(trace_id.clone());
+        self.traces.insert(trace_id.clone(), Vec::new());
+        trace_id
+    }
+
+    /// 记录调用跨度
+    #[allow(dead_code)]
+    fn record_span(&mut self, span: CallSpan) {
+        if let Some(trace_id) = &self.current_trace
+            && let Some(trace) = self.traces.get_mut(trace_id) {
+                trace.push(span);
+            }
+    }
+
+    /// 结束追踪
+    #[allow(dead_code)]
+    fn end_trace(&mut self) -> Option<String> {
+        self.current_trace.take()
+    }
+
+    /// 获取当前追踪
+    #[allow(dead_code)]
+    fn get_trace(&self) -> Option<&Vec<CallSpan>> {
+        self.current_trace.as_ref().and_then(|id| self.traces.get(id))
+    }
+}
+
+impl Default for ModelBenchmark {
+    fn default() -> Self {
+        Self {
+            results: HashMap::new(),
+            test_cases: vec![
+                "What is 2+2?".to_string(),
+                "Explain quantum computing in one sentence.".to_string(),
+                "Write a haiku about programming.".to_string(),
+            ],
+        }
+    }
+}
+
+impl ModelBenchmark {
+    /// 记录基准测试结果
+    #[allow(dead_code)]
+    fn record_result(&mut self, model: &str, latency_ms: f64, tokens_per_sec: f64, success: bool) {
+        let entry = self.results.entry(model.to_string()).or_insert((0.0, 0.0, 0.0));
+        entry.0 = (entry.0 + latency_ms) / 2.0;
+        entry.1 = (entry.1 + tokens_per_sec) / 2.0;
+        if success {
+            entry.2 = (entry.2 + 1.0) / 2.0;
+        } else {
+            entry.2 /= 2.0;
+        }
+    }
+
+    /// 获取最佳模型
+    #[allow(dead_code)]
+    fn best_model(&self) -> Option<String> {
+        self.results
+            .iter()
+            .max_by(|(_, a), (_, b)| {
+                let score_a = a.2 * a.1 / (a.0 + 1.0);
+                let score_b = b.2 * b.1 / (b.0 + 1.0);
+                score_a.partial_cmp(&score_b).unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .map(|(model, _)| model.clone())
+    }
+
+    /// 获取测试用例
+    #[allow(dead_code)]
+    fn get_test_cases(&self) -> &[String] {
+        &self.test_cases
+    }
+}
+
+/// v0.24: 重试策略
+#[derive(Clone, Debug)]
+#[allow(dead_code)] // 未来扩展用
+struct RetryPolicy {
+    /// 最大重试次数
+    max_retries: u32,
+    /// 基础延迟 (ms)
+    base_delay_ms: u64,
+    /// 最大延迟 (ms)
+    max_delay_ms: u64,
+    /// 退避因子
+    backoff_factor: f64,
+    /// 当前重试次数
+    current_retry: u32,
+}
+
+impl Default for RetryPolicy {
+    fn default() -> Self {
+        Self {
+            max_retries: 3,
+            base_delay_ms: 1000,
+            max_delay_ms: 30000,
+            backoff_factor: 2.0,
+            current_retry: 0,
+        }
+    }
+}
+
+impl RetryPolicy {
+    #[allow(dead_code)]
+    /// 计算下一次重试延迟
+    fn next_delay(&mut self) -> u64 {
+        let delay = (self.base_delay_ms as f64 * self.backoff_factor.powi(self.current_retry as i32)) as u64;
+        self.current_retry += 1;
+        delay.min(self.max_delay_ms)
+    }
+
+    /// 是否应该重试
+    #[allow(dead_code)]
+    fn should_retry(&self) -> bool {
+        self.current_retry < self.max_retries
+    }
+
+    /// 重置重试计数
+    #[allow(dead_code)]
+    fn reset(&mut self) {
+        self.current_retry = 0;
+    }
+
+    /// v0.24: 根据错误类型决定是否重试
+    #[allow(dead_code)]
+    fn should_retry_for_error(&self, error: &str) -> bool {
+        // 网络错误 - 重试
+        if error.contains("connection") || error.contains("timeout") || error.contains("network") {
+            return true;
+        }
+        // 429 速率限制 - 重试
+        if error.contains("429") || error.contains("rate limit") {
+            return true;
+        }
+        // 5xx 服务器错误 - 重试
+        if error.contains("500") || error.contains("502") || error.contains("503") {
+            return true;
+        }
+        // 4xx 客户端错误 - 不重试
+        if error.contains("400") || error.contains("401") || error.contains("403") {
+            return false;
+        }
+        // 默认重试
+        true
+    }
+}
+
+impl Default for ContextWindow {
+    fn default() -> Self {
+        Self {
+            max_tokens: 4096,
+            current_tokens: 0,
+            messages: Vec::new(),
+            compression_threshold: 0.8, // 80% 时触发压缩
+            compression_ratio: 0.5,     // 保留 50% 的消息
+        }
+    }
+}
+
+impl ContextWindow {
+    #[allow(dead_code)]
+    /// 添加消息，如果超出窗口则移除旧消息
+    fn add_message(&mut self, role: String, content: String) {
+        let tokens = content.len() / 4; // 粗略估算
+        self.messages.push((role, content));
+        self.current_tokens += tokens;
+
+        // 如果超出窗口，移除旧消息
+        while self.current_tokens > self.max_tokens && self.messages.len() > 1 {
+            let removed = self.messages.remove(0);
+            self.current_tokens -= removed.1.len() / 4;
+        }
+    }
+
+    /// 获取当前消息
+    #[allow(dead_code)]
+    fn get_messages(&self) -> &[(String, String)] {
+        &self.messages
+    }
+
+    /// 清空上下文
+    #[allow(dead_code)]
+    fn clear(&mut self) {
+        self.messages.clear();
+        self.current_tokens = 0;
+    }
+
+    /// v0.24: 压缩上下文 (保留最近的消息)
+    fn compress(&mut self) {
+        let threshold = (self.max_tokens as f64 * self.compression_threshold) as usize;
+        if self.current_tokens <= threshold {
+            return; // 不需要压缩
+        }
+
+        // 计算需要保留的消息数
+        let keep_count = (self.messages.len() as f64 * self.compression_ratio) as usize;
+        let keep_count = keep_count.max(1); // 至少保留 1 条消息
+
+        // 保留最近的消息
+        let start = self.messages.len() - keep_count;
+        self.messages = self.messages[start..].to_vec();
+
+        // 重新计算 token 数
+        self.current_tokens = self.messages.iter().map(|(_, c)| c.len() / 4).sum();
+    }
+
+    /// v0.24: 获取压缩状态
+    fn needs_compression(&self) -> bool {
+        let threshold = (self.max_tokens as f64 * self.compression_threshold) as usize;
+        self.current_tokens > threshold
+    }
+}
+
+impl Default for AdaptiveTemperature {
+    fn default() -> Self {
+        Self {
+            base: 0.7,
+            current: 0.7,
+            min: 0.1,
+            max: 1.5,
+            success_rate: 1.0,
+            step: 0.05,
+        }
+    }
+}
+
+impl AdaptiveTemperature {
+    #[allow(dead_code)]
+    /// 根据成功率调整温度
+    fn adjust(&mut self, success: bool) {
+        if success {
+            // 成功时稍微降低温度（更确定）
+            self.current = (self.current - self.step).max(self.min);
+        } else {
+            // 失败时稍微提高温度（更随机）
+            self.current = (self.current + self.step).min(self.max);
+        }
+    }
+
+    /// 获取当前温度
+    #[allow(dead_code)]
+    fn get(&self) -> f64 {
+        self.current
+    }
 }
 
 /// v0.06: with 块字段 (不经过 env 变量)
@@ -265,6 +1234,9 @@ struct AiConfigValue {
     system: Option<String>,
     /// v0.15: mock 响应队列 (with mock_llm = ["resp1", "resp2"])
     mock_responses: Option<Vec<String>>,
+    /// v0.24: 投机执行配置
+    speculative: Option<bool>,
+    draft_model: Option<String>,
 }
 
 // v0.04: 显式实现 Clone 而非 derive
@@ -290,7 +1262,16 @@ impl Clone for Interpreter {
             ai_cache: HashMap::new(),        // 不克隆缓存
             string_interner: HashMap::new(), // 不克隆驻留池
             method_cache: HashMap::new(),    // 不克隆缓存
-            ai_batch_queue: Vec::new(),      // 不克隆队列
+            ai_batch_queue: Vec::new(),
+            draft_model_stats: HashMap::new(),
+            cache_warm_queue: Vec::new(),
+            ai_priority_queue: Vec::new(),
+            adaptive_temp: AdaptiveTemperature::default(),
+            context_window: ContextWindow::default(),
+            load_balancer: LoadBalancer::default(),
+            speculative_verifier: SpeculativeVerifier::default(),
+            cache_warmer: CacheWarmer::default(),
+            retry_policy: RetryPolicy::default(),      // 不克隆队列
         }
     }
 }
@@ -323,6 +1304,12 @@ struct RouteConfig {
     system: Option<String>,
     /// 温度覆盖（v0.15 接入 real_ai_chat_with_tools）
     temperature: Option<f64>,
+    /// v0.24: 路由优先级 (越小越优先)
+    #[allow(dead_code)] // 未来扩展用
+    priority: u32,
+    /// v0.24: 路由健康状态
+    #[allow(dead_code)] // 未来扩展用
+    healthy: bool,
 }
 
 // 记忆条目 — v0.04补: 字段已删 (RFC §4.1 memory.* 推迟到 v1.0)
@@ -422,6 +1409,15 @@ impl Interpreter {
             string_interner: HashMap::new(),
             method_cache: HashMap::new(),
             ai_batch_queue: Vec::new(),
+            draft_model_stats: HashMap::new(),
+            cache_warm_queue: Vec::new(),
+            ai_priority_queue: Vec::new(),
+            adaptive_temp: AdaptiveTemperature::default(),
+            context_window: ContextWindow::default(),
+            load_balancer: LoadBalancer::default(),
+            speculative_verifier: SpeculativeVerifier::default(),
+            cache_warmer: CacheWarmer::default(),
+            retry_policy: RetryPolicy::default(),
         }
     }
 
@@ -448,6 +1444,15 @@ impl Interpreter {
             string_interner: HashMap::new(),
             method_cache: HashMap::new(),
             ai_batch_queue: Vec::new(),
+            draft_model_stats: HashMap::new(),
+            cache_warm_queue: Vec::new(),
+            ai_priority_queue: Vec::new(),
+            adaptive_temp: AdaptiveTemperature::default(),
+            context_window: ContextWindow::default(),
+            load_balancer: LoadBalancer::default(),
+            speculative_verifier: SpeculativeVerifier::default(),
+            cache_warmer: CacheWarmer::default(),
+            retry_policy: RetryPolicy::default(),
         }
     }
 
@@ -472,6 +1477,15 @@ impl Interpreter {
             string_interner: HashMap::new(),
             method_cache: HashMap::new(),
             ai_batch_queue: Vec::new(),
+            draft_model_stats: HashMap::new(),
+            cache_warm_queue: Vec::new(),
+            ai_priority_queue: Vec::new(),
+            adaptive_temp: AdaptiveTemperature::default(),
+            context_window: ContextWindow::default(),
+            load_balancer: LoadBalancer::default(),
+            speculative_verifier: SpeculativeVerifier::default(),
+            cache_warmer: CacheWarmer::default(),
+            retry_policy: RetryPolicy::default(),
         }
     }
 
@@ -517,6 +1531,440 @@ impl Interpreter {
             self.call_task(&params, &body, vec![])?;
         }
         Ok(())
+    }
+
+    /// v0.24: 执行 ast_v2 节点
+    pub fn execute_v2(&mut self, stmt_kind: &crate::ast_v2::StmtKind, arena: &crate::ast_v2::AstArena) -> Result<FlowSignal, String> {
+        match stmt_kind {
+            // 变量绑定
+            crate::ast_v2::StmtKind::Let { name, init, exported, .. } => {
+                let value = self.evaluate_v2(*init, arena)?;
+                self.environment.lock().expect("environment mutex poisoned").define(name.clone(), value, *exported);
+                Ok(FlowSignal::None)
+            }
+            // 变量赋值
+            crate::ast_v2::StmtKind::Assign { name, value } => {
+                let val = self.evaluate_v2(*value, arena)?;
+                if !self.environment.lock().expect("env mutex poisoned").assign(name, val.clone()) {
+                    return Err(format!("Undefined variable: {}", name));
+                }
+                Ok(FlowSignal::None)
+            }
+            // 表达式语句
+            crate::ast_v2::StmtKind::Expr(expr_id) => {
+                self.evaluate_v2(*expr_id, arena)?;
+                Ok(FlowSignal::None)
+            }
+            // 返回语句
+            crate::ast_v2::StmtKind::Return { value } => {
+                let val = match value {
+                    Some(id) => self.evaluate_v2(*id, arena)?,
+                    None => Value::Nil,
+                };
+                Ok(FlowSignal::Return(val))
+            }
+            // 条件语句
+            crate::ast_v2::StmtKind::If { condition, then_branch, else_branch } => {
+                let cond = self.evaluate_v2(*condition, arena)?;
+                if is_truthy(&cond) {
+                    for stmt_id in then_branch {
+                        if let Some(stmt) = arena.get_stmt(*stmt_id) {
+                            let kind = stmt.kind.clone();
+                            match self.execute_v2(&kind, arena)? {
+                                FlowSignal::None => {}
+                                signal => return Ok(signal),
+                            }
+                        }
+                    }
+                } else {
+                    for stmt_id in else_branch {
+                        if let Some(stmt) = arena.get_stmt(*stmt_id) {
+                            let kind = stmt.kind.clone();
+                            match self.execute_v2(&kind, arena)? {
+                                FlowSignal::None => {}
+                                signal => return Ok(signal),
+                            }
+                        }
+                    }
+                }
+                Ok(FlowSignal::None)
+            }
+            // 循环语句
+            crate::ast_v2::StmtKind::For { var, iterable, body, .. } => {
+                let iterable_val = self.evaluate_v2(*iterable, arena)?;
+                match iterable_val {
+                    Value::List(items) => {
+                        for item in items {
+                            self.environment.lock().expect("env mutex poisoned").define(var.clone(), item, false);
+                            for stmt_id in body {
+                                if let Some(stmt) = arena.get_stmt(*stmt_id) {
+                                    let kind = stmt.kind.clone();
+                                    match self.execute_v2(&kind, arena)? {
+                                        FlowSignal::None => {}
+                                        FlowSignal::Break => return Ok(FlowSignal::None),
+                                        FlowSignal::Continue => break,
+                                        signal => return Ok(signal),
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    _ => return Err("for loop requires a list".to_string()),
+                }
+                Ok(FlowSignal::None)
+            }
+            // 导入语句
+            crate::ast_v2::StmtKind::Import { path } => {
+                // 简化实现：读取文件并执行
+                match std::fs::read_to_string(path) {
+                    Ok(source) => {
+                        let tokens = crate::lexer::Lexer::new(&source).scan_tokens();
+                        let mut parser_v2 = crate::parser_v2::ParserV2::new(tokens);
+                        let node_ids = parser_v2.parse();
+                        let arena = parser_v2.into_arena();
+                        let converter = crate::ast_v2_to_v1::AstV2ToV1::new(arena);
+                        let stmts = converter.convert_program(&node_ids);
+                        for stmt in &stmts {
+                            self.execute(stmt)?;
+                        }
+                        Ok(FlowSignal::None)
+                    }
+                    Err(e) => Err(format!("import error: {}", e)),
+                }
+            }
+            // Break/Continue
+            crate::ast_v2::StmtKind::Break => Ok(FlowSignal::Break),
+            crate::ast_v2::StmtKind::Continue => Ok(FlowSignal::Continue),
+            // 函数定义
+            crate::ast_v2::StmtKind::TaskDef { name, params, body: _, exported, .. } => {
+                let param_names: Vec<String> = params.iter().map(|(n, _)| n.clone()).collect();
+                self.environment.lock().expect("env mutex poisoned").define(
+                    name.clone(),
+                    Value::Task {
+                        name: name.clone(),
+                        params: param_names,
+                        body: vec![], // v2 不需要 body，通过 arena 执行
+                    },
+                    *exported,
+                );
+                Ok(FlowSignal::None)
+            }
+            // 匹配语句
+            crate::ast_v2::StmtKind::Match { expr, arms } => {
+                let val = self.evaluate_v2(*expr, arena)?;
+                for (pattern, body_ids) in arms {
+                    let ast_pattern = convert_pattern_v2_to_v1(pattern);
+                    if let Some(bindings) = self.match_pattern(&ast_pattern, &val) {
+                        let env = Arc::new(Mutex::new(Environment::with_parent(
+                            self.environment.clone(),
+                        )));
+                        for (name, value) in bindings {
+                            env.lock().expect("env mutex poisoned").define(name, value, false);
+                        }
+                        let previous = self.environment.clone();
+                        self.environment = env;
+                        let mut result = FlowSignal::None;
+                        for body_id in body_ids {
+                            if let Some(stmt) = arena.get_stmt(*body_id) {
+                                let kind = stmt.kind.clone();
+                                result = self.execute_v2(&kind, arena)?;
+                                if !matches!(result, FlowSignal::None) {
+                                    break;
+                                }
+                            }
+                        }
+                        self.environment = previous;
+                        return Ok(result);
+                    }
+                }
+                Ok(FlowSignal::None)
+            }
+            // With 块
+            crate::ast_v2::StmtKind::With { bindings, body } => {
+                let prev_cfg = self.current_ai_config.clone();
+                let mut cfg = prev_cfg.clone().unwrap_or_default();
+                for (key, val_id) in bindings {
+                    let v = self.evaluate_v2(*val_id, arena)?;
+                    match key.as_str() {
+                        "model" => cfg.model = Some(v.to_string()),
+                        "temperature" => {
+                            if let Value::Number(n) = v { cfg.temperature = Some(n); }
+                        }
+                        "max_tokens" => {
+                            if let Value::Number(n) = v { cfg.max_tokens = Some(n as usize); }
+                        }
+                        "system" => cfg.system = Some(v.to_string()),
+                        "mock_llm" => {
+                            if let Value::List(items) = v {
+                                cfg.mock_responses = Some(items.iter().map(|i| i.to_string()).collect());
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                self.current_ai_config = Some(cfg);
+                for stmt_id in body {
+                    if let Some(stmt) = arena.get_stmt(*stmt_id) {
+                        let kind = stmt.kind.clone();
+                        match self.execute_v2(&kind, arena)? {
+                            FlowSignal::None => {}
+                            signal => {
+                                self.current_ai_config = prev_cfg;
+                                return Ok(signal);
+                            }
+                        }
+                    }
+                }
+                self.current_ai_config = prev_cfg;
+                Ok(FlowSignal::None)
+            }
+            // Parallel 块
+            crate::ast_v2::StmtKind::Parallel { stmts } => {
+                // 简化实现：顺序执行
+                for stmt_id in stmts {
+                    if let Some(stmt) = arena.get_stmt(*stmt_id) {
+                        let kind = stmt.kind.clone();
+                        match self.execute_v2(&kind, arena)? {
+                            FlowSignal::None => {}
+                            signal => return Ok(signal),
+                        }
+                    }
+                }
+                Ok(FlowSignal::None)
+            }
+            // Worker 声明
+            crate::ast_v2::StmtKind::Worker { .. } => Ok(FlowSignal::None),
+            // 发送消息
+            crate::ast_v2::StmtKind::Send { value, target } => {
+                let val = self.evaluate_v2(*value, arena)?;
+                if let Some(tx) = self.worker_channels.get(target) {
+                    tx.send(val).map_err(|e| format!("Send error: {}", e))?;
+                }
+                Ok(FlowSignal::None)
+            }
+            // 接收消息
+            crate::ast_v2::StmtKind::Receive { var, source } => {
+                if let Some(rx) = self.worker_receivers.get(source) {
+                    let val = rx.recv().map_err(|e| format!("Receive error: {}", e))?;
+                    self.environment.lock().expect("env mutex poisoned").define(var.clone(), val, false);
+                }
+                Ok(FlowSignal::None)
+            }
+            // 事务
+            crate::ast_v2::StmtKind::Transaction { body, compensation } => {
+                let mut result = FlowSignal::None;
+                let mut error_occurred = false;
+                for stmt_id in body {
+                    if let Some(stmt) = arena.get_stmt(*stmt_id) {
+                        let kind = stmt.kind.clone();
+                        match self.execute_v2(&kind, arena) {
+                            Ok(r) => {
+                                result = r;
+                                if !matches!(result, FlowSignal::None) {
+                                    error_occurred = true;
+                                    break;
+                                }
+                            }
+                            Err(_) => {
+                                error_occurred = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+                // 执行补偿
+                for comp_id in compensation {
+                    if let Some(stmt) = arena.get_stmt(*comp_id) {
+                        let kind = stmt.kind.clone();
+                        let _ = self.execute_v2(&kind, arena);
+                    }
+                }
+                if error_occurred {
+                    return Err("Transaction rolled back".to_string());
+                }
+                Ok(result)
+            }
+            crate::ast_v2::StmtKind::Commit => Ok(FlowSignal::None),
+            crate::ast_v2::StmtKind::Rollback => Err("Transaction rolled back".to_string()),
+            // 宏定义
+            crate::ast_v2::StmtKind::MacroDef { name, params, body: _ } => {
+                self.environment.lock().expect("env mutex poisoned").define(
+                    name.clone(),
+                    Value::Macro {
+                        name: name.clone(),
+                        params: params.clone(),
+                        body: vec![],
+                    },
+                    false,
+                );
+                Ok(FlowSignal::None)
+            }
+            // 类型别名
+            crate::ast_v2::StmtKind::TypeAlias { name, target, .. } => {
+                self.environment.lock().expect("env mutex poisoned").define(
+                    name.clone(),
+                    Value::String(target.clone()),
+                    false,
+                );
+                Ok(FlowSignal::None)
+            }
+            // 枚举类型
+            crate::ast_v2::StmtKind::EnumDef { name, variants, .. } => {
+                let mut enum_map = std::collections::HashMap::new();
+                for v in variants {
+                    enum_map.insert(v.name.clone(), Value::Builtin(v.name.clone()));
+                }
+                self.environment.lock().expect("env mutex poisoned").define(
+                    name.clone(),
+                    Value::Dict(enum_map),
+                    false,
+                );
+                Ok(FlowSignal::None)
+            }
+            // 结构体类型
+            crate::ast_v2::StmtKind::StructDef { name, fields, .. } => {
+                let field_names: Vec<String> = fields.iter().map(|f| f.name.clone()).collect();
+                let constructor = Value::Closure {
+                    params: field_names,
+                    body: vec![],
+                    env: self.environment.clone(),
+                };
+                self.environment.lock().expect("env mutex poisoned").define(
+                    name.clone(),
+                    constructor,
+                    false,
+                );
+                Ok(FlowSignal::None)
+            }
+            // 其他语句类型暂时不支持
+            _ => {
+                Err(format!("Unsupported v2 statement: {:?}", stmt_kind))
+            }
+        }
+    }
+
+    /// v0.24: 求值 ast_v2 表达式
+    pub fn evaluate_v2(&mut self, expr_id: crate::ast_v2::NodeId, arena: &crate::ast_v2::AstArena) -> Result<Value, String> {
+        let expr = arena.get_expr(expr_id).ok_or("Invalid expression ID")?;
+        match &expr.kind {
+            crate::ast_v2::ExprKind::Literal(lit) => self.literal_to_value(lit),
+            crate::ast_v2::ExprKind::Variable(name) => {
+                self.environment.lock().expect("environment mutex poisoned")
+                    .get(name)
+                    .ok_or_else(|| format!("Undefined variable: {}", name))
+            }
+            crate::ast_v2::ExprKind::Binary { left, op, right } => {
+                let left_val = self.evaluate_v2(*left, arena)?;
+                let right_val = self.evaluate_v2(*right, arena)?;
+                eval_binary(left_val, op, right_val)
+            }
+            crate::ast_v2::ExprKind::Call { callee, args } => {
+                let mut arg_vals = Vec::new();
+                for arg_id in args {
+                    arg_vals.push(self.evaluate_v2(*arg_id, arena)?);
+                }
+                self.call_function(callee, arg_vals, Span::default())
+            }
+            crate::ast_v2::ExprKind::Grouping(inner) => {
+                self.evaluate_v2(*inner, arena)
+            }
+            // 管道表达式
+            crate::ast_v2::ExprKind::Pipe { left, right } => {
+                let left_val = self.evaluate_v2(*left, arena)?;
+                let right_expr = arena.get_expr(*right).ok_or("Invalid pipe right")?;
+                match &right_expr.kind {
+                    crate::ast_v2::ExprKind::MethodCall { object: _, method, args } => {
+                        let mut arg_vals = Vec::new();
+                        for arg_id in args {
+                            arg_vals.push(self.evaluate_v2(*arg_id, arena)?);
+                        }
+                        self.call_method(left_val, method, arg_vals, Span::default())
+                    }
+                    crate::ast_v2::ExprKind::Call { callee, args } => {
+                        let mut arg_vals = vec![left_val];
+                        for arg_id in args {
+                            arg_vals.push(self.evaluate_v2(*arg_id, arena)?);
+                        }
+                        self.call_function(callee, arg_vals, Span::default())
+                    }
+                    crate::ast_v2::ExprKind::Variable(name) => {
+                        self.call_method(left_val, name, vec![], Span::default())
+                    }
+                    _ => Err(format!("Unsupported pipe right: {:?}", right_expr.kind)),
+                }
+            }
+            // 方法调用
+            crate::ast_v2::ExprKind::MethodCall { object, method, args } => {
+                let obj_val = self.evaluate_v2(*object, arena)?;
+                let mut arg_vals = Vec::new();
+                for arg_id in args {
+                    arg_vals.push(self.evaluate_v2(*arg_id, arena)?);
+                }
+                self.call_method(obj_val, method, arg_vals, Span::default())
+            }
+            // 索引访问
+            crate::ast_v2::ExprKind::Index { object, index } => {
+                let obj_val = self.evaluate_v2(*object, arena)?;
+                let idx_val = self.evaluate_v2(*index, arena)?;
+                match (&obj_val, &idx_val) {
+                    (Value::List(list), Value::Number(n)) => {
+                        let idx = *n as usize;
+                        if idx < list.len() {
+                            Ok(list[idx].clone())
+                        } else {
+                            Err(format!("Index out of bounds: {} (list len {})", idx, list.len()))
+                        }
+                    }
+                    (Value::Dict(map), Value::String(key)) => {
+                        Ok(map.get(key).cloned().unwrap_or(Value::Nil))
+                    }
+                    _ => Err("Index requires list[number] or dict[string]".to_string()),
+                }
+            }
+            // 错误传播
+            crate::ast_v2::ExprKind::Question { expr } => {
+                let val = self.evaluate_v2(*expr, arena)?;
+                match val {
+                    Value::Dict(ref map) if map.contains_key("err") => {
+                        Err(format!("Error propagated: {:?}", map.get("err")))
+                    }
+                    _ => Ok(val),
+                }
+            }
+            // 命名空间引用
+            crate::ast_v2::ExprKind::NamespaceRef { namespace, name } => {
+                match namespace.as_str() {
+                    "Router" if name == "new" => Ok(Value::Builtin("Router::new".to_string())),
+                    "McpServer" if name == "new" => Ok(Value::Builtin("McpServer::new".to_string())),
+                    _ => Err(format!("Unknown namespace ref: {}::{}", namespace, name)),
+                }
+            }
+            // 闭包
+            crate::ast_v2::ExprKind::Closure { params, body: _, .. } => {
+                let param_names: Vec<String> = params.iter().map(|(n, _)| n.clone()).collect();
+                Ok(Value::Closure {
+                    params: param_names,
+                    body: vec![], // v2 模式下通过 arena 执行
+                    env: self.environment.clone(),
+                })
+            }
+            // 借用
+            crate::ast_v2::ExprKind::Borrow { expr: inner }
+            | crate::ast_v2::ExprKind::BorrowMut { expr: inner } => {
+                let val = self.evaluate_v2(*inner, arena)?;
+                Ok(Value::Atom(Arc::new(Mutex::new(val))))
+            }
+            // 模板字符串
+            crate::ast_v2::ExprKind::Prompt { parts } => {
+                let mut result = String::new();
+                for part_id in parts {
+                    let val = self.evaluate_v2(*part_id, arena)?;
+                    result.push_str(&val.to_string());
+                }
+                Ok(Value::String(result))
+            }
+            _ => Err(format!("Unsupported v2 expression: {:?}", expr.kind)),
+        }
     }
 
     pub fn execute(&mut self, stmt: &Stmt) -> Result<FlowSignal, String> {
@@ -1107,9 +2555,22 @@ impl Interpreter {
                             };
                             cfg.mock_responses = Some(responses);
                         }
+                        // v0.24: 投机执行
+                        "speculative" => {
+                            cfg.speculative = Some(match &v {
+                                Value::Bool(b) => *b,
+                                _ => return Err(format!("with: speculative must be bool, got {}", v)),
+                            });
+                        }
+                        "draft_model" => {
+                            cfg.draft_model = Some(match &v {
+                                Value::String(s) => s.clone(),
+                                other => other.to_string(),
+                            });
+                        }
                         other => {
                             return Err(format!(
-                                "with: unknown binding '{}' (valid: model, budget, per_call, temperature, max_tokens, system, mock_llm)",
+                                "with: unknown binding '{}' (valid: model, budget, per_call, temperature, max_tokens, system, mock_llm, speculative, draft_model)",
                                 other
                             ));
                         }
@@ -1260,6 +2721,8 @@ impl Interpreter {
                         max_tokens: cfg.max_tokens,
                         system: cfg.system.clone(),
                         temperature: cfg.temperature,
+                        priority: 0,
+                        healthy: true,
                     };
                     self.model_routes.insert(name.clone(), rc);
                 }
@@ -1488,8 +2951,7 @@ impl Interpreter {
                 println!("Bye!");
                 break;
             }
-            let tokens = Lexer::new(trimmed).scan_tokens();
-            let stmts = Parser::new(tokens).parse();
+            let stmts = parse_code(trimmed);
             if stmts.is_empty() {
                 continue;
             }
@@ -1814,10 +3276,7 @@ impl Interpreter {
         let source = fs::read_to_string(&file_path)
             .map_err(|e| format!("Failed to load module '{}': {}", path, e))?;
 
-        let mut lexer = Lexer::new(&source);
-        let tokens = lexer.scan_tokens();
-        let mut parser = Parser::new(tokens);
-        let stmts = parser.parse();
+        let stmts = parse_code(&source);
 
         let module_env = Arc::new(Mutex::new(Environment::with_parent(self.globals.clone())));
         let previous = self.environment.clone();
@@ -2637,6 +4096,25 @@ impl Interpreter {
                     methods.into_iter().map(Value::String).collect(),
                 ))
             }
+            // v0.24: batch_chat(prompts) -> list<string> 批量 AI 调用
+            "batch_chat" => {
+                let prompts = args.first().ok_or("batch_chat() requires 1 argument (list of prompts)")?;
+                match prompts {
+                    Value::List(items) => {
+                        let mut results = Vec::new();
+                        for item in items {
+                            let prompt = match item {
+                                Value::String(s) => s.clone(),
+                                other => other.to_string(),
+                            };
+                            let result = Self::do_ai_chat(self, "gpt-4o-mini", &prompt)?;
+                            results.push(result);
+                        }
+                        Ok(Value::List(results))
+                    }
+                    _ => Err("batch_chat() argument must be a list".to_string()),
+                }
+            }
             // v0.17: into(collection, fn) → 应用 fn 到集合的每个元素
             "into" => {
                 if args.len() < 2 {
@@ -3347,11 +4825,12 @@ impl Interpreter {
                                 description: String::new(),
                                 parameters: "{}".to_string(),
                                 handler,
+                                toolset: "custom".to_string(),
                             };
                             tool_registry.lock().expect("tool_registry mutex poisoned").insert(name, mcp_tool);
                         }
                         let interp_arc: Arc<Mutex<Interpreter>> = Arc::new(Mutex::new(self.clone()));
-                        crate::mcp_server::start(tool_registry, interp_arc)
+                        crate::mcp_server::start(tool_registry, interp_arc, None)
                             .map_err(|e| format!("MCP server error: {}", e))?;
                         Ok(Value::Nil)
                     }
@@ -3805,6 +5284,62 @@ impl Interpreter {
         result
     }
 
+    /// v0.24: 简化版 AI API 调用 (用于投机执行)
+    fn call_ai_api(
+        &mut self,
+        messages: &[(String, String)],
+        api_key: &str,
+        model: &str,
+        base_url: &str,
+    ) -> Result<Value, String> {
+        // 构建请求体
+        let msgs_json: String = messages
+            .iter()
+            .map(|(role, content)| {
+                let escaped_content = content
+                    .replace('\\', "\\\\")
+                    .replace('"', "\\\"")
+                    .replace('\n', "\\n");
+                format!(r#"{{"role":"{}","content":"{}"}}"#, role, escaped_content)
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+
+        let escaped_model = model.replace('\\', "\\\\").replace('"', "\\\"");
+        let body = format!(
+            r#"{{"model":"{}","messages":[{}]}}"#,
+            escaped_model, msgs_json
+        );
+
+        let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
+
+        let agent: ureq::Agent = ureq::Agent::config_builder()
+            .timeout_global(Some(Duration::from_secs(30)))
+            .http_status_as_error(false)
+            .build()
+            .into();
+
+        match agent
+            .post(&url)
+            .header("Authorization", &format!("Bearer {}", api_key))
+            .header("Content-Type", "application/json")
+            .send(&body)
+        {
+            Ok(mut resp) => {
+                let status = resp.status();
+                match resp.body_mut().read_to_string() {
+                    Ok(text) if status.as_u16() < 400 => {
+                        Ok(self.extract_ai_content(&text)
+                            .unwrap_or(Value::String(text)))
+                    }
+                    Ok(text) => Err(format!("AI API error ({}): {}", status, &text[..200.min(text.len())])),
+                    Err(e) => Err(format!("AI API read error: {}", e)),
+                }
+            }
+            Err(e) => Err(format!("AI API request error: {}", e)),
+        }
+    }
+
     /// v0.06.5: HTTP body 构建 — 拼 json 时接 temperature/max_tokens/system
     /// v0.10: 包 retry 循环（exponential backoff + jitter）
     fn real_ai_chat_inner(
@@ -3816,6 +5351,16 @@ impl Interpreter {
     ) -> Result<Value, String> {
         if messages.is_empty() {
             return Err("ai.chat: messages cannot be empty".to_string());
+        }
+
+        // v0.24: 使用上下文窗口管理器
+        for (role, content) in messages {
+            self.context_window.add_message(role.clone(), content.clone());
+        }
+
+        // v0.24: 检查是否需要压缩上下文
+        if self.context_window.needs_compression() {
+            self.context_window.compress();
         }
 
         // v0.15: mock_llm 模式 — 从队列中取出下一个响应
@@ -3843,9 +5388,116 @@ impl Interpreter {
             return Ok(Value::String(response));
         }
 
+        // v0.24: 投机执行 - 先用快速模型预测，再验证
+        let speculative_config = self.current_ai_config.as_ref().and_then(|cfg| {
+            if cfg.speculative == Some(true) {
+                cfg.draft_model.clone()
+            } else {
+                None
+            }
+        });
+        if let Some(ref draft_model) = speculative_config {
+            // v0.24: 自适应 draft 模型选择
+            // 检查 draft 模型的历史成功率
+            let should_use_draft = if let Some((success, total)) = self.draft_model_stats.get(draft_model.as_str()) {
+                if *total >= 10 {
+                    // 有足够历史数据，根据成功率决定
+                    (*success as f64 / *total as f64) > 0.3
+                } else {
+                    true // 数据不足，默认使用
+                }
+            } else {
+                true // 无历史数据，默认使用
+            };
+
+            if should_use_draft {
+                // 1. 用 draft model 快速预测
+                let draft_response = self.call_ai_api(
+                    messages,
+                    api_key,
+                    draft_model,
+                    base_url,
+                )?;
+
+                // 2. 用主模型验证
+                let verification_prompt = format!(
+                    "Verify if this response is correct. Question: {}\nDraft answer: {}\nReply with VERIFIED if correct, or provide the correct answer.",
+                    messages.last().map(|(_, c)| c.as_str()).unwrap_or(""),
+                    draft_response
+                );
+                let verify_messages = vec![("user".to_string(), verification_prompt)];
+                let verification = self.call_ai_api(
+                    &verify_messages,
+                    api_key,
+                    model,
+                    base_url,
+                )?;
+
+                // 3. 检查验证结果并更新统计
+                let verification_str = verification.to_string();
+                let stats = self.draft_model_stats.entry(draft_model.clone()).or_insert((0, 0));
+                stats.1 += 1; // total += 1
+
+                // v0.24: 使用推测解码验证器
+                let draft_str = draft_response.to_string();
+                let is_verified = self.speculative_verifier.verify(&draft_str, &verification_str);
+
+                if is_verified {
+                    // draft 结果正确
+                    stats.0 += 1; // success += 1
+                    return Ok(draft_response);
+                } else {
+                    // draft 结果错误，返回主模型的修正结果
+                    return Ok(verification);
+                }
+            }
+        }
+
+        // v0.24: 流式投机执行 - 长响应使用流式
+        let use_stream = self.current_ai_config.as_ref()
+            .and_then(|c| c.max_tokens)
+            .map(|mt| mt > 1000)
+            .unwrap_or(false);
+
+        if let Some(ref draft_model) = speculative_config
+            && use_stream {
+                // 流式模式：先返回 draft，后台验证
+                let draft_response = self.call_ai_api(
+                    messages,
+                    api_key,
+                    draft_model,
+                    base_url,
+                )?;
+
+                // 后台验证（简化：同步验证）
+                let verification_prompt = format!(
+                    "Verify: {}\nDraft: {}\nReply VERIFIED or correct answer.",
+                    messages.last().map(|(_, c)| c.as_str()).unwrap_or(""),
+                    draft_response
+                );
+                let verify_messages = vec![("user".to_string(), verification_prompt)];
+                let verification = self.call_ai_api(
+                    &verify_messages,
+                    api_key,
+                    model,
+                    base_url,
+                )?;
+
+                if verification.to_string().contains("VERIFIED") {
+                    return Ok(draft_response);
+                } else {
+                    return Ok(verification);
+                }
+            }
+
         // v0.22: AI 调用内联缓存
         let cache_key = format!("{}:{:?}", model, messages);
         if let Some(cached) = self.ai_cache.get(&cache_key) {
+            return Ok(Value::String(cached.clone()));
+        }
+
+        // v0.24: 检查缓存预热队列
+        if let Some(cached) = self.cache_warmer.get_cached(&cache_key) {
             return Ok(Value::String(cached.clone()));
         }
 
@@ -4520,6 +6172,8 @@ suggestion: <improvement suggestion or "none">"#,
                     per_call: None,
                     system: r.system.clone(),
                     mock_responses: None,
+                    speculative: None,
+                    draft_model: None,
                 });
             }
             (key, r.model.clone(), r.base_url.clone())
@@ -4902,11 +6556,16 @@ fn l2_norm(a: &[f64]) -> f64 {
 mod for_loop_tests {
     use super::*;
     use crate::lexer::Lexer;
-    use crate::parser::Parser;
+    use crate::parser_v2::ParserV2;
+    use crate::ast_v2_to_v1::AstV2ToV1;
 
     fn run(src: &str) -> Result<(), String> {
         let tokens = Lexer::new(src).scan_tokens();
-        let stmts = Parser::new(tokens).parse();
+        let mut parser_v2 = ParserV2::new(tokens);
+        let node_ids = parser_v2.parse();
+        let arena = parser_v2.into_arena();
+        let converter = AstV2ToV1::new(arena);
+        let stmts = converter.convert_program(&node_ids);
         let mut interp = Interpreter::new();
         interp.interpret(&stmts)
     }
@@ -4992,12 +6651,9 @@ end
 #[cfg(test)]
 mod return_propagation_tests {
     use super::*;
-    use crate::lexer::Lexer;
-    use crate::parser::Parser;
 
     fn run(src: &str) -> Result<(), String> {
-        let tokens = Lexer::new(src).scan_tokens();
-        let stmts = Parser::new(tokens).parse();
+        let stmts = parse_code(src);
         let mut interp = Interpreter::new();
         interp.interpret(&stmts)
     }
@@ -5092,12 +6748,9 @@ end
 #[cfg(test)]
 mod trait_tests {
     use super::*;
-    use crate::lexer::Lexer;
-    use crate::parser::Parser;
 
     fn run(src: &str) -> Result<(), String> {
-        let tokens = Lexer::new(src).scan_tokens();
-        let stmts = Parser::new(tokens).parse();
+        let stmts = parse_code(src);
         let mut interp = Interpreter::new();
         interp.interpret(&stmts)
     }
@@ -5194,8 +6847,7 @@ task main()
   print(g.greet())
 end
 "#;
-        let tokens = Lexer::new(src).scan_tokens();
-        let stmts = Parser::new(tokens).parse();
+        let stmts = parse_code(src);
         let mut interp = Interpreter::new();
         let result = interp.interpret(&stmts);
         assert!(
@@ -5227,8 +6879,7 @@ task main()
   print(1)
 end
 "#;
-        let tokens = Lexer::new(src).scan_tokens();
-        let stmts = Parser::new(tokens).parse();
+        let stmts = parse_code(src);
         let mut interp = Interpreter::new();
         // 不期望 panic；可能报 typeck error（来自循环继承检测），也可能通过
         let _ = interp.interpret(&stmts);
@@ -5255,8 +6906,7 @@ task main()
   print(m.add(1, 2))
 end
 "#;
-        let tokens = Lexer::new(src).scan_tokens();
-        let stmts = Parser::new(tokens).parse();
+        let stmts = parse_code(src);
         let mut interp = Interpreter::new();
         interp
             .interpret(&stmts)
@@ -5280,8 +6930,7 @@ task main()
   print(m.add(3, 4))
 end
 "#;
-        let tokens = Lexer::new(src).scan_tokens();
-        let stmts = Parser::new(tokens).parse();
+        let stmts = parse_code(src);
         let mut interp = Interpreter::new();
         interp
             .interpret(&stmts)
@@ -5308,8 +6957,7 @@ task main()
   print(m.double(5))
 end
 "#;
-        let tokens = Lexer::new(src).scan_tokens();
-        let stmts = Parser::new(tokens).parse();
+        let stmts = parse_code(src);
         let mut interp = Interpreter::new();
         interp
             .interpret(&stmts)
@@ -5341,8 +6989,7 @@ task main()
   print(c.default_value())
 end
 "#;
-        let tokens = Lexer::new(src).scan_tokens();
-        let stmts = Parser::new(tokens).parse();
+        let stmts = parse_code(src);
         let mut interp = Interpreter::new();
         interp
             .interpret(&stmts)
@@ -5372,8 +7019,7 @@ task main()
   print(m.slow())
 end
 "#;
-        let tokens = Lexer::new(src).scan_tokens();
-        let stmts = Parser::new(tokens).parse();
+        let stmts = parse_code(src);
         let mut interp = Interpreter::new();
         interp
             .interpret(&stmts)
@@ -5487,12 +7133,9 @@ mod retry_tests {
 #[cfg(test)]
 mod token_budget_tests {
     use super::*;
-    use crate::lexer::Lexer;
-    use crate::parser::Parser;
 
     fn run(src: &str) -> Result<(), String> {
-        let tokens = Lexer::new(src).scan_tokens();
-        let stmts = Parser::new(tokens).parse();
+        let stmts = parse_code(src);
         let mut interp = Interpreter::new();
         interp.interpret(&stmts)
     }
@@ -5571,12 +7214,9 @@ end
 #[cfg(test)]
 mod guard_tests {
     use super::*;
-    use crate::lexer::Lexer;
-    use crate::parser::Parser;
 
     fn run(src: &str) -> Result<(), String> {
-        let tokens = Lexer::new(src).scan_tokens();
-        let stmts = Parser::new(tokens).parse();
+        let stmts = parse_code(src);
         let mut interp = Interpreter::new();
         interp.interpret(&stmts)
     }

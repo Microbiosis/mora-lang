@@ -6,7 +6,7 @@
 
 一个轻量级脚本语言，内建 AI 调用（`p"..."` 表达式）、HTTP server、MCP server、长期记忆、Agent 编排。
 
-**v0.23**: 融合 9 个语言的设计基因 + 强类型升级 (Prolog、StreamIt、APL、Clojure、Lisp、Smalltalk、Common Lisp、Ballerina、Logo)
+**v0.24**: 融合 9 个语言的设计基因 + 强类型升级 (Prolog、StreamIt、APL、Clojure、Lisp、Smalltalk、Common Lisp、Ballerina、Logo)
 
 ```mora
 -- 一段代码 = HTTP + MCP + 可观测 (v0.04)
@@ -89,23 +89,31 @@ cargo build --release
 | 并行执行 | `parallel ... end` |
 | 模块系统 | `import "path"`，`export let/task` |
 
-### v0.16-v0.20 新特性 (9 语言融合)
+### v0.16-v0.24 新特性
 
-| 特性 | 来源 | 语法 |
-|------|------|------|
-| **守卫条件** | Prolog | `match n with x when x > 0 -> ... end` |
-| **列表 rest** | Prolog | `let [head, ...tail] = [1, 2, 3]` |
-| **管道闭包** | StreamIt | `5 \|> fn(x) return x * 2 end` |
-| **窗口聚合** | StreamIt | `[1,2,3,4,5].window(3)` → `[[1,2,3],[2,3,4],[3,4,5]]` |
-| **数组操作** | APL | `.shape()`、`.flatten()`、`.transpose()`、`.reshape()` |
-| **广播算术** | APL | `[1,2,3] * 2` → `[2,4,6]` |
-| **组合函数** | Clojure | `compose(f, g, h)` |
-| **部分应用** | Lisp | `partial(add, 10)` |
-| **原子引用** | Clojure | `atom(0)`、`swap()`、`deref()` |
-| **运行时反射** | Smalltalk | `type_of()`、`is_instance()`、`methods_of()` |
-| **用户宏** | Common Lisp | `macro name(params) ... end` |
-| **Worker 并发** | Ballerina | `parallel worker w1 ... end end` |
-| **事务支持** | Ballerina | `transaction ... compensation ... end` |
+| 版本 | 特性 | 来源 | 语法 |
+|------|------|------|------|
+| **v0.16** | 守卫条件 | Prolog | `match n with x when x > 0 -> ... end` |
+| **v0.16** | 列表 rest | Prolog | `let [head, ...tail] = [1, 2, 3]` |
+| **v0.17** | 管道闭包 | StreamIt | `5 \|> fn(x) return x * 2 end` |
+| **v0.17** | 窗口聚合 | StreamIt | `[1,2,3,4,5].window(3)` |
+| **v0.17** | 数组操作 | APL | `.shape()`、`.flatten()`、`.transpose()`、`.reshape()` |
+| **v0.17** | 广播算术 | APL | `[1,2,3] * 2` → `[2,4,6]` |
+| **v0.18** | 组合函数 | Clojure | `compose(f, g, h)` |
+| **v0.18** | 部分应用 | Lisp | `partial(add, 10)` |
+| **v0.19** | 原子引用 | Clojure | `atom(0)`、`swap()`、`deref()` |
+| **v0.19** | Worker 并发 | Ballerina | `parallel worker w1 ... end end` |
+| **v0.19** | 事务支持 | Ballerina | `transaction ... compensation ... end` |
+| **v0.20** | 运行时反射 | Smalltalk | `type_of()`、`is_instance()`、`methods_of()` |
+| **v0.20** | 用户宏 | Common Lisp | `macro name(params) ... end` |
+| **v0.21** | 借用语法 | Rust | `&expr`、`&mut expr` |
+| **v0.21** | 生命周期 | Rust | `<'a>` 参数 |
+| **v0.22** | AI 缓存 | 优化 | 相同 prompt 直接返回缓存 |
+| **v0.22** | 管道融合 | 优化 | 连续操作合并执行 |
+| **v0.22** | 常量折叠 | 优化 | 编译期计算 |
+| **v0.24** | 类型别名 | 强类型 | `type Name = TargetType` |
+| **v0.24** | 枚举类型 | 强类型 | `enum Name { V1, V2(Type) }` |
+| **v0.24** | 结构体类型 | 强类型 | `struct Name { field: Type }` |
 
 ### 标准库
 

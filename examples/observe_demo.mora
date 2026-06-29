@@ -12,7 +12,7 @@ span "main_work" do
 
   -- 嵌套 span
   span "sub_task" tags {key: "value"} do
-    let who := "world"
+    let who = "world"
     let r = p"hello {who}"
     print("sub_task result: " + r)
   end

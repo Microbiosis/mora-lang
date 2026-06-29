@@ -4,14 +4,16 @@
 //! 让 CLI binary（src/main.rs）和 LSP server binary（src/bin/lsp.rs）共享。
 
 pub mod ast;
+pub mod ast_adapter;
 pub mod ast_v2;
+pub mod ast_v2_to_v1;
 pub mod flow;
+pub mod parser_v2;
 pub mod http_server;
 pub mod interpreter;
 pub mod lexer;
 pub mod lsp;
 pub mod mcp_server;
-pub mod parser;
 pub mod record;
 pub mod trace_collector;
 pub mod typeck;

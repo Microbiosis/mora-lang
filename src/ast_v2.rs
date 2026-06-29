@@ -7,9 +7,55 @@
 //! - **Visitor 模式**：解耦遍历逻辑
 
 use crate::ast::{
-    BinaryOp, FnDef, GenericParam, Literal, ObserveConfig, Pattern, Span, TraitMethod,
+    BinaryOp, GenericParam, Literal, Span,
 };
 use crate::typeck::Type;
+
+/// 模式 (v2: 使用 NodeId)
+#[derive(Debug, Clone, PartialEq)]
+pub enum Pattern {
+    Wildcard,
+    Literal(Literal),
+    Variable(String),
+    List {
+        prefix: Vec<Pattern>,
+        rest: Option<String>,
+    },
+    Dict(Vec<(String, Pattern)>),
+    Guard {
+        pattern: Box<Pattern>,
+        condition: NodeId,
+    },
+}
+
+/// 函数定义 (v2: 使用 NodeId)
+#[derive(Debug, Clone, PartialEq)]
+pub struct FnDef {
+    pub name: String,
+    pub params: Vec<(String, Option<String>)>,
+    pub return_type: Option<String>,
+    pub body: Vec<NodeId>,
+    pub span: Span,
+}
+
+/// Trait 方法 (v2: 使用 NodeId)
+#[derive(Debug, Clone, PartialEq)]
+pub struct TraitMethod {
+    pub name: String,
+    pub params: Vec<(String, Option<String>)>,
+    pub return_type: Option<String>,
+    pub body: Vec<NodeId>,
+    pub generics: Vec<GenericParam>,
+    pub span: Span,
+}
+
+/// 可观测性配置 (v2: 使用 NodeId)
+#[derive(Debug, Clone, PartialEq)]
+pub enum ObserveConfig {
+    Trace,
+    Metrics,
+    Otel { endpoint: NodeId },
+}
 
 // ===================================================================
 // NodeId
@@ -124,6 +170,12 @@ pub enum ExprKind {
 
     // 分组
     Grouping(NodeId),
+
+    // 列表字面量
+    List(Vec<NodeId>),
+
+    // 字典字面量
+    Dict(Vec<(String, NodeId)>),
 
     // v0.21: 不可变借用
     Borrow {
@@ -402,7 +454,7 @@ impl AstArena {
 
     /// 分配语句节点
     pub fn alloc_stmt(&mut self, kind: StmtKind, span: Span) -> NodeId {
-        let id = NodeId(self.stmts.len() + self.exprs.len()); // 唯一 ID
+        let id = NodeId(self.stmts.len()); // 使用 stmts 的索引
         self.stmts.push(TypedStmt { id, kind, span });
         id
     }

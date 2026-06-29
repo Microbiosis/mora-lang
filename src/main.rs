@@ -7,9 +7,21 @@ use std::process;
 
 use mora::interpreter::Interpreter;
 use mora::lexer::Lexer;
-use mora::parser::Parser;
+use mora::parser_v2::ParserV2;
+use mora::ast_v2_to_v1::AstV2ToV1;
 use mora::record::{self, Mode};
 use mora::typeck::{self, format_error};
+
+/// 使用 ParserV2 解析代码
+fn parse_with_v2(source: &str) -> Vec<mora::ast::Stmt> {
+    let mut lexer = Lexer::new(source);
+    let tokens = lexer.scan_tokens();
+    let mut parser_v2 = ParserV2::new(tokens);
+    let node_ids = parser_v2.parse();
+    let arena = parser_v2.into_arena();
+    let converter = AstV2ToV1::new(arena);
+    converter.convert_program(&node_ids)
+}
 
 fn main() {
     let args: Vec<String> = env::args().collect();
@@ -18,12 +30,12 @@ fn main() {
     if args.len() >= 2 {
         match args[1].as_str() {
             "--version" | "-v" => {
-                println!("Mora v0.23");
+                println!("Mora v0.24");
                 return;
             }
             "--help" | "-h" => {
                 println!(
-                    "Mora v0.23 — record / replay / diff / list / stats / timeline / snapshot"
+                    "Mora v0.24 — record / replay / diff / list / stats / timeline / snapshot"
                 );
                 println!();
                 println!("Usage:");
@@ -40,6 +52,11 @@ fn main() {
                 println!("  mora record list           List all recordings");
                 println!("  mora record stats <name>   Show recording statistics");
                 println!("  mora record timeline <name> Show call timeline");
+                println!();
+                println!("MCP:");
+                println!("  mora mcp tool-list         List available MCP tools");
+                println!("  mora mcp tool-search <q>   Search MCP tools");
+                println!("  mora mcp toolsets          List available toolsets");
                 println!();
                 println!("  mora --version             Show version");
                 println!("  mora --help                Show this help");
@@ -215,6 +232,29 @@ fn main() {
             }
             run_diff(&args[2], &args[3]);
         }
+        // v0.24: MCP CLI 工具
+        "mcp" => {
+            if args.len() < 3 {
+                eprintln!("Usage: mora mcp tool-list|tool-search|toolsets");
+                process::exit(1);
+            }
+            match args[2].as_str() {
+                "tool-list" => run_mcp_tool_list(),
+                "tool-search" => {
+                    if args.len() < 4 {
+                        eprintln!("Usage: mora mcp tool-search <query>");
+                        process::exit(1);
+                    }
+                    run_mcp_tool_search(&args[3]);
+                }
+                "toolsets" => run_mcp_toolsets(),
+                _ => {
+                    eprintln!("Unknown mcp subcommand: {}", args[2]);
+                    eprintln!("Usage: mora mcp tool-list|tool-search|toolsets");
+                    process::exit(1);
+                }
+            }
+        }
         _ => run_file(&args[1]),
     }
 }
@@ -298,7 +338,7 @@ fn print_banner() {
     let base_url =
         env::var("MORA_AI_BASE_URL").unwrap_or_else(|_| "https://api.openai.com/v1".to_string());
 
-    println!("Mora v0.23");
+    println!("Mora v0.24");
     if has_openai_key {
         println!("  AI: real API (endpoint: {})", base_url);
     } else {
@@ -329,11 +369,8 @@ fn update_lock(pkg_name: &str, url: &str) {
 fn run_file(path: &str) {
     let source = fs::read_to_string(path).expect("Failed to read file");
 
-    let mut lexer = Lexer::new(&source);
-    let tokens = lexer.scan_tokens();
-
-    let mut parser = Parser::new(tokens);
-    let stmts = parser.parse();
+    // 使用 ParserV2 解析
+    let stmts = parse_with_v2(&source);
 
     // v0.13: 静态类型检查必走, 无 env skip
     let type_errors = typeck::check_program(&stmts);
@@ -377,8 +414,8 @@ fn run_record(path: &str, name: &str) {
         process::exit(1);
     });
 
-    let tokens = Lexer::new(&source).scan_tokens();
-    let stmts = Parser::new(tokens).parse();
+    // 使用 ParserV2 解析
+    let stmts = parse_with_v2(&source);
 
     let type_errors = typeck::check_program(&stmts);
     if !type_errors.is_empty() {
@@ -424,8 +461,8 @@ fn run_replay(path: &str, name: &str) {
         process::exit(1);
     });
 
-    let tokens = Lexer::new(&source).scan_tokens();
-    let stmts = Parser::new(tokens).parse();
+    // 使用 ParserV2 解析
+    let stmts = parse_with_v2(&source);
 
     let type_errors = typeck::check_program(&stmts);
     if !type_errors.is_empty() {
@@ -640,8 +677,8 @@ fn run_snapshot(file: &str, name: &str, update: bool) {
         eprintln!("snapshot: failed to read {}", file);
         process::exit(1);
     });
-    let tokens = Lexer::new(&source).scan_tokens();
-    let stmts = Parser::new(tokens).parse();
+    // 使用 ParserV2 解析
+    let stmts = parse_with_v2(&source);
     let type_errors = typeck::check_program(&stmts);
     if !type_errors.is_empty() {
         for err in &type_errors {
@@ -902,11 +939,8 @@ fn truncate(s: &str, max: usize) -> String {
 fn run_check(path: &str) {
     let source = fs::read_to_string(path).expect("Failed to read file");
 
-    let mut lexer = Lexer::new(&source);
-    let tokens = lexer.scan_tokens();
-
-    let mut parser = Parser::new(tokens);
-    let stmts = parser.parse();
+    // 使用 ParserV2 解析
+    let stmts = parse_with_v2(&source);
 
     let type_errors = typeck::check_program(&stmts);
     if type_errors.is_empty() {
@@ -924,4 +958,91 @@ fn run_check(path: &str) {
 fn run_repl() {
     let mut interpreter = Interpreter::new();
     Interpreter::run_repl_with(&mut interpreter);
+}
+
+// v0.24: MCP CLI 工具
+
+/// 列出所有可用的 MCP 工具
+fn run_mcp_tool_list() {
+    use mora::mcp_server::builtin_toolsets;
+
+    let toolsets = builtin_toolsets();
+    let mut all_tools: Vec<(&str, &str)> = Vec::new();
+
+    for (toolset, tools) in &toolsets {
+        for tool in tools {
+            all_tools.push((tool, toolset));
+        }
+    }
+
+    // 去重
+    all_tools.sort();
+    all_tools.dedup_by(|a, b| a.0 == b.0);
+
+    println!("MCP Tools ({}):\n", all_tools.len());
+    println!("{:<30} {:<15}", "TOOL", "TOOLSET");
+    println!("{}", "-".repeat(45));
+    for (tool, toolset) in &all_tools {
+        println!("{:<30} {:<15}", tool, toolset);
+    }
+}
+
+/// 搜索 MCP 工具
+fn run_mcp_tool_search(query: &str) {
+    use mora::mcp_server::builtin_toolsets;
+
+    let toolsets = builtin_toolsets();
+    let query_lower = query.to_lowercase();
+    let mut results: Vec<(&str, &str)> = Vec::new();
+
+    for (toolset, tools) in &toolsets {
+        for tool in tools {
+            if tool.to_lowercase().contains(&query_lower)
+                || toolset.to_lowercase().contains(&query_lower)
+            {
+                results.push((tool, toolset));
+            }
+        }
+    }
+
+    results.sort();
+    results.dedup_by(|a, b| a.0 == b.0);
+
+    if results.is_empty() {
+        println!("No tools found matching '{}'", query);
+    } else {
+        println!("Search results for '{}' ({}):\n", query, results.len());
+        println!("{:<30} {:<15}", "TOOL", "TOOLSET");
+        println!("{}", "-".repeat(45));
+        for (tool, toolset) in &results {
+            println!("{:<30} {:<15}", tool, toolset);
+        }
+    }
+}
+
+/// 列出所有可用的 toolset
+fn run_mcp_toolsets() {
+    use mora::mcp_server::builtin_toolsets;
+
+    let toolsets = builtin_toolsets();
+
+    println!("MCP Toolsets ({}):\n", toolsets.len());
+    println!("{:<15} {:>6} DESCRIPTION", "TOOLSET", "TOOLS");
+    println!("{}", "-".repeat(60));
+    for (toolset, tools) in &toolsets {
+        let desc = match toolset.as_str() {
+            "ai" => "AI 调用相关工具",
+            "json" => "JSON 处理工具",
+            "file" => "文件系统操作",
+            "web" => "HTTP 请求工具",
+            "default" => "默认启用的工具集",
+            _ => "",
+        };
+        println!("{:<15} {:>6} {}", toolset, tools.len(), desc);
+    }
+
+    println!("\nUsage:");
+    println!("  mora mcp --toolsets ai,json,file    # 启用指定 toolset");
+    println!("  mora mcp --tools ai.chat,json.parse  # 启用指定工具");
+    println!("  mora mcp --toolsets all              # 启用所有工具");
 }

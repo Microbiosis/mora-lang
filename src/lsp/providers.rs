@@ -100,191 +100,114 @@ fn ident_at_offset(text: &str, offset: usize) -> Option<String> {
 // AST access helpers
 // ===================================================================
 
-use crate::ast::*;
+// v0.24: 未来将迁移为 use crate::ast_v2::*;
 
 /// 拿一个文档的解析结果
-fn parsed_doc(docs: &HashMap<String, DocumentState>, uri: &str) -> Option<(String, Vec<Stmt>)> {
+/// v0.24: 拿一个文档的 ast_v2 解析结果
+#[allow(dead_code)]
+fn parsed_doc_v2(docs: &HashMap<String, DocumentState>, uri: &str) -> Option<(String, Vec<crate::ast_v2::NodeId>, crate::ast_v2::AstArena)> {
     let doc = docs.get(uri)?;
     let tokens = crate::lexer::Lexer::new(&doc.text).scan_tokens();
-    let stmts = crate::parser::Parser::new(tokens).parse();
-    Some((doc.text.clone(), stmts))
+    let mut parser_v2 = crate::parser_v2::ParserV2::new(tokens);
+    let v2_stmts = parser_v2.parse();
+    let arena = parser_v2.into_arena();
+
+    Some((doc.text.clone(), v2_stmts, arena))
 }
 
 /// 收集所有"定义点" (let / task)，按名字索引到 (line, col)
-fn collect_definitions(stmts: &[Stmt]) -> HashMap<String, Vec<(usize, usize)>> {
+/// v0.24: 收集所有"定义点" (ast_v2 版本)
+#[allow(dead_code)]
+fn collect_definitions_v2(stmt_ids: &[crate::ast_v2::NodeId], arena: &crate::ast_v2::AstArena) -> HashMap<String, Vec<(usize, usize)>> {
     let mut out: HashMap<String, Vec<(usize, usize)>> = HashMap::new();
-    fn walk(stmts: &[Stmt], out: &mut HashMap<String, Vec<(usize, usize)>>) {
-        for stmt in stmts {
-            match stmt {
-                Stmt::Let { name, span, .. } => {
+    for stmt_id in stmt_ids {
+        if let Some(stmt) = arena.get_stmt(*stmt_id) {
+            match &stmt.kind {
+                crate::ast_v2::StmtKind::Let { name, .. } => {
                     out.entry(name.clone())
                         .or_default()
-                        .push((span.line, span.column));
+                        .push((stmt.span.line, stmt.span.column));
                 }
-                Stmt::TaskDef { name, span, .. } => {
+                crate::ast_v2::StmtKind::TaskDef { name, .. } => {
                     out.entry(name.clone())
                         .or_default()
-                        .push((span.line, span.column));
-                }
-                Stmt::If { then_branch, .. } => walk(then_branch, out),
-                Stmt::For { body, .. } => walk(body, out),
-                Stmt::Parallel { stmts, .. } => walk(stmts, out),
-                Stmt::Match { arms, .. } => {
-                    for (_p, arm_stmts) in arms {
-                        walk(arm_stmts, out);
-                    }
+                        .push((stmt.span.line, stmt.span.column));
                 }
                 _ => {}
             }
         }
     }
-    walk(stmts, &mut out);
     out
 }
 
-/// 收集所有"引用点"（Expr::Variable / Expr::Call / Expr::MethodCall 出现的位置）
-fn collect_references(stmts: &[Stmt], name: &str, refs: &mut Vec<(usize, usize)>) {
-    fn walk_expr(expr: &Expr, name: &str, refs: &mut Vec<(usize, usize)>) {
-        match expr {
-            Expr::Variable(n, span) if n == name => refs.push((span.line, span.column)),
-            Expr::Variable(_, _) => {}
-            Expr::Prompt { parts, .. } => {
-                for p in parts {
-                    walk_expr(p, name, refs);
+/// v0.24: 收集所有"引用点" (ast_v2 版本)
+#[allow(dead_code)]
+fn collect_references_v2(stmt_ids: &[crate::ast_v2::NodeId], arena: &crate::ast_v2::AstArena, name: &str, refs: &mut Vec<(usize, usize)>) {
+    fn walk_expr_v2(expr_id: crate::ast_v2::NodeId, arena: &crate::ast_v2::AstArena, name: &str, refs: &mut Vec<(usize, usize)>) {
+        if let Some(expr) = arena.get_expr(expr_id) {
+            match &expr.kind {
+                crate::ast_v2::ExprKind::Variable(n) if n == name => {
+                    refs.push((expr.span.line, expr.span.column));
                 }
-            }
-            Expr::RouteCall { args, .. } => {
-                for a in args {
-                    walk_expr(a, name, refs);
+                crate::ast_v2::ExprKind::Call { callee, args, .. } => {
+                    if callee == name {
+                        refs.push((expr.span.line, expr.span.column));
+                    }
+                    for a in args {
+                        walk_expr_v2(*a, arena, name, refs);
+                    }
                 }
-            }
-            Expr::AiModelCall {
-                model,
-                temperature,
-                max_tokens,
-                system,
-                ..
-            } => {
-                walk_expr(model, name, refs);
-                if let Some(t) = temperature {
-                    walk_expr(t, name, refs);
+                crate::ast_v2::ExprKind::MethodCall { object, args, .. } => {
+                    walk_expr_v2(*object, arena, name, refs);
+                    for a in args {
+                        walk_expr_v2(*a, arena, name, refs);
+                    }
                 }
-                if let Some(n) = max_tokens {
-                    walk_expr(n, name, refs);
+                crate::ast_v2::ExprKind::Binary { left, right, .. } => {
+                    walk_expr_v2(*left, arena, name, refs);
+                    walk_expr_v2(*right, arena, name, refs);
                 }
-                if let Some(s) = system {
-                    walk_expr(s, name, refs);
+                crate::ast_v2::ExprKind::Pipe { left, right } => {
+                    walk_expr_v2(*left, arena, name, refs);
+                    walk_expr_v2(*right, arena, name, refs);
                 }
-            }
-            Expr::Question { expr: inner, .. } => walk_expr(inner, name, refs),
-            Expr::NamespaceRef { .. } => {}
-            Expr::DynTrait { .. } => {}
-            Expr::Call {
-                callee, args, span, ..
-            } => {
-                if callee == name {
-                    refs.push((span.line, span.column));
+                crate::ast_v2::ExprKind::Grouping(inner) => {
+                    walk_expr_v2(*inner, arena, name, refs);
                 }
-                for a in args {
-                    walk_expr(a, name, refs);
+                crate::ast_v2::ExprKind::Borrow { expr: inner }
+                | crate::ast_v2::ExprKind::BorrowMut { expr: inner } => {
+                    walk_expr_v2(*inner, arena, name, refs);
                 }
-            }
-            Expr::Binary { left, right, .. } => {
-                walk_expr(left, name, refs);
-                walk_expr(right, name, refs);
-            }
-            Expr::Pipe { left, right, .. } => {
-                walk_expr(left, name, refs);
-                walk_expr(right, name, refs);
-            }
-            Expr::MethodCall { object, args, .. } => {
-                walk_expr(object, name, refs);
-                for a in args {
-                    walk_expr(a, name, refs);
-                }
-            }
-            Expr::Index { object, index, .. } => {
-                walk_expr(object, name, refs);
-                walk_expr(index, name, refs);
-            }
-            Expr::Grouping(e, _) => walk_expr(e, name, refs),
-            Expr::Literal(_) => {}
-            Expr::Closure { body, .. } => {
-                for s in body {
-                    walk_stmt(s, name, refs);
-                }
-            }
-            Expr::Match { expr, arms, .. } => {
-                walk_expr(expr, name, refs);
-                for (_p, arm) in arms {
-                    walk_expr(arm, name, refs);
-                }
-            }
-            // v0.21: 借用表达式
-            Expr::Borrow { expr, .. } | Expr::BorrowMut { expr, .. } => {
-                walk_expr(expr, name, refs);
+                _ => {}
             }
         }
     }
-    fn walk_stmt(stmt: &Stmt, name: &str, refs: &mut Vec<(usize, usize)>) {
-        match stmt {
-            Stmt::Let { init, .. } | Stmt::Assign { value: init, .. } => {
-                walk_expr(init, name, refs)
-            }
-            Stmt::IndexAssign {
-                object,
-                index,
-                value,
-                ..
-            } => {
-                walk_expr(object, name, refs);
-                walk_expr(index, name, refs);
-                walk_expr(value, name, refs);
-            }
-            Stmt::Expr(e) => walk_expr(e, name, refs),
-            Stmt::If {
-                condition,
-                then_branch,
-                ..
-            } => {
-                walk_expr(condition, name, refs);
-                for s in then_branch {
-                    walk_stmt(s, name, refs);
+
+    for stmt_id in stmt_ids {
+        if let Some(stmt) = arena.get_stmt(*stmt_id) {
+            match &stmt.kind {
+                crate::ast_v2::StmtKind::Let { init, .. }
+                | crate::ast_v2::StmtKind::Assign { value: init, .. } => {
+                    walk_expr_v2(*init, arena, name, refs);
                 }
-            }
-            Stmt::For { iterable, body, .. } => {
-                walk_expr(iterable, name, refs);
-                for s in body {
-                    walk_stmt(s, name, refs);
+                crate::ast_v2::StmtKind::Expr(expr_id) => {
+                    walk_expr_v2(*expr_id, arena, name, refs);
                 }
-            }
-            Stmt::Parallel { stmts, .. } => {
-                for s in stmts {
-                    walk_stmt(s, name, refs);
+                crate::ast_v2::StmtKind::Return { value: Some(expr_id) } => {
+                    walk_expr_v2(*expr_id, arena, name, refs);
                 }
-            }
-            Stmt::Match { expr, arms, .. } => {
-                walk_expr(expr, name, refs);
-                for (_p, arm_stmts) in arms {
-                    for s in arm_stmts {
-                        walk_stmt(s, name, refs);
-                    }
+                crate::ast_v2::StmtKind::If { condition, then_branch, else_branch } => {
+                    walk_expr_v2(*condition, arena, name, refs);
+                    collect_references_v2(then_branch, arena, name, refs);
+                    collect_references_v2(else_branch, arena, name, refs);
                 }
-            }
-            Stmt::Return { value: Some(v), .. } => walk_expr(v, name, refs),
-            Stmt::TraitDef { .. } => {}
-            Stmt::ImplDef { methods, .. } => {
-                for m in methods {
-                    for s in &m.body {
-                        walk_stmt(s, name, refs);
-                    }
+                crate::ast_v2::StmtKind::For { iterable, body, .. } => {
+                    walk_expr_v2(*iterable, arena, name, refs);
+                    collect_references_v2(body, arena, name, refs);
                 }
+                _ => {}
             }
-            _ => {}
         }
-    }
-    for stmt in stmts {
-        walk_stmt(stmt, name, refs);
     }
 }
 
@@ -292,7 +215,9 @@ fn collect_references(stmts: &[Stmt], name: &str, refs: &mut Vec<(usize, usize)>
 // Hover
 // ===================================================================
 
-pub fn hover(docs: &HashMap<String, DocumentState>, params: &Value) -> Result<Value, String> {
+/// v0.24: hover 使用 ast_v2
+#[allow(dead_code)]
+pub fn hover_v2(docs: &HashMap<String, DocumentState>, params: &Value) -> Result<Value, String> {
     let uri = params
         .get("textDocument")
         .and_then(|t| t.get("uri"))
@@ -302,65 +227,60 @@ pub fn hover(docs: &HashMap<String, DocumentState>, params: &Value) -> Result<Va
     let line = pos.get("line").and_then(|n| n.as_i64()).unwrap_or(0) as usize;
     let col = pos.get("character").and_then(|n| n.as_i64()).unwrap_or(0) as usize;
 
-    let (text, stmts) = parsed_doc(docs, uri).ok_or("document not found")?;
+    let (text, stmt_ids, arena) = parsed_doc_v2(docs, uri).ok_or("document not found")?;
     let offset = position_to_offset(&text, line, col);
     let ident = match ident_at_offset(&text, offset) {
         Some(s) => s,
         None => return Ok(Value::Null),
     };
 
-    // 找 typeck 类型
-    let type_errors = crate::typeck::check_program(&stmts);
-
-    // 简化的 hover：返回变量名 + 推断类型
-    let mut contents = format!("```mora\nlet {}: <inferred>\n```", ident);
     // 查找 let 的 type_hint
-    for stmt in &stmts {
-        if let Stmt::Let {
-            name, type_hint, ..
-        } = stmt
-            && name == &ident
-            && let Some(h) = type_hint
-        {
-            contents = format!("```mora\nlet {}: {} = ...\n```", ident, h);
-        }
-        if let Stmt::TaskDef {
-            name,
-            params,
-            return_type,
-            ..
-        } = stmt
-            && name == &ident
-        {
-            let param_strs: Vec<String> = params
-                .iter()
-                .map(|(n, h)| match h {
-                    Some(t) => format!("{}: {}", n, t),
-                    None => n.clone(),
-                })
-                .collect();
-            let ret = return_type.as_deref().unwrap_or("any");
-            contents = format!(
-                "```mora\ntask {}({}): {}\n```",
-                ident,
-                param_strs.join(", "),
-                ret
-            );
+    let mut contents = format!("```mora\nlet {}: <inferred>\n```", ident);
+    for stmt_id in &stmt_ids {
+        if let Some(stmt) = arena.get_stmt(*stmt_id) {
+            match &stmt.kind {
+                crate::ast_v2::StmtKind::Let { name, type_hint: Some(h), .. } if name == &ident => {
+                    contents = format!("```mora\nlet {}: {} = ...\n```", ident, h);
+                }
+                crate::ast_v2::StmtKind::Let { name, type_hint: None, .. } if name == &ident => {}
+                crate::ast_v2::StmtKind::TaskDef { name, params, return_type, .. } if name == &ident => {
+                    let param_strs: Vec<String> = params
+                        .iter()
+                        .map(|(n, h)| match h {
+                            Some(t) => format!("{}: {}", n, t),
+                            None => n.clone(),
+                        })
+                        .collect();
+                    let ret = return_type.as_deref().unwrap_or("any");
+                    contents = format!(
+                        "```mora\ntask {}({}): {}\n```",
+                        ident,
+                        param_strs.join(", "),
+                        ret
+                    );
+                }
+                _ => {}
+            }
         }
     }
-    // 把 typeck 错误数也带回去
-    contents.push_str(&format!("\n\n---\ntypeck: {} error(s)", type_errors.len()));
 
-    let mut m = BTreeMap::new();
-    m.insert("contents".to_string(), Value::String_(contents));
-    Ok(Value::Object(m))
+    // 构建返回值
+    let result = super::json::parse(&format!(
+        r#"{{"contents":{{"kind":"markdown","value":"{}"}},"range":{{"start":{{"line":{},"character":{}}},"end":{{"line":{},"character":{}}}}}}}"#,
+        contents.replace('\\', "\\\\").replace('"', "\\\""),
+        line, col.saturating_sub(ident.len()),
+        line, col
+    )).unwrap_or(Value::Null);
+    Ok(result)
 }
 
 // ===================================================================
 // Completion
 // ===================================================================
 
-pub fn completion(docs: &HashMap<String, DocumentState>, params: &Value) -> Value {
+/// v0.24: completion 使用 ast_v2
+#[allow(dead_code)]
+pub fn completion_v2(docs: &HashMap<String, DocumentState>, params: &Value) -> Value {
     let uri = match params
         .get("textDocument")
         .and_then(|t| t.get("uri"))
@@ -376,165 +296,42 @@ pub fn completion(docs: &HashMap<String, DocumentState>, params: &Value) -> Valu
     let line_num = pos.get("line").and_then(|n| n.as_i64()).unwrap_or(0) as usize;
     let col = pos.get("character").and_then(|n| n.as_i64()).unwrap_or(0) as usize;
 
-    let (text, stmts) = match parsed_doc(docs, uri) {
+    let (text, stmt_ids, arena) = match parsed_doc_v2(docs, uri) {
         Some(t) => t,
         None => return Value::Array(vec![]),
     };
 
     // 取当前行 cursor 之前的文本
-    let prefix = get_line_prefix(&text, line_num, col);
+    let _prefix = get_line_prefix(&text, line_num, col);
 
     let mut items: Vec<Value> = Vec::new();
     let mut seen: BTreeSet<String> = BTreeSet::new();
 
-    // ── v0.05: 上下文感知 AI 原语补全 ──────────────────────────
-
-    // `with ` → 补 config keys
-    if prefix.ends_with("with ") || prefix == "with" {
-        for key in ["model", "temperature", "max_tokens", "budget", "system"] {
-            let label = format!("{} = ", key);
-            if seen.insert(label.clone()) {
-                items.push(make_completion(
-                    &label,
-                    14.0,
-                    Some(&format!("AI config: {} = ...", key)),
-                ));
-            }
+    // 收集已定义的变量和函数
+    let defs = collect_definitions_v2(&stmt_ids, &arena);
+    for name in defs.keys() {
+        if seen.insert(name.clone()) {
+            items.push(make_completion(name, 3.0, Some("variable")));
         }
     }
 
-    // v0.06.7: serve as 已移除——用 Router::new() / McpServer::new() 显式 API
-
-    // `observe ` → 补 config
-    if prefix.ends_with("observe ") || prefix == "observe" {
-        for cfg in ["trace", "metrics", "otel"] {
-            if seen.insert(cfg.to_string()) {
-                let detail = match cfg {
-                    "trace" => "Enable trace (observe trace do ... end)",
-                    "metrics" => "Enable metrics (observe metrics do ... end)",
-                    "otel" => "OTEL export (observe otel endpoint \"http://...\" do ... end)",
-                    _ => "",
-                };
-                items.push(make_completion(cfg, 14.0, Some(detail)));
-            }
-        }
-    }
-
-    // `ai_model(` → 补 keyword args
-    if prefix.ends_with("ai_model(") || prefix.ends_with("ai_model( ") {
-        for kw in ["temperature", "max_tokens", "system"] {
-            if seen.insert(kw.to_string()) {
-                items.push(make_completion(
-                    &format!("{}: ", kw),
-                    14.0,
-                    Some(&format!("AI model param: {}", kw)),
-                ));
-            }
-        }
-    }
-
-    // `p"` → 补 prompt 模板提示
-    if prefix.ends_with("p\"") {
-        for tmpl in ["p\"\"", "p\"{variable}\"", "p\"summarize: {text}\""] {
-            if seen.insert(tmpl.to_string()) {
-                items.push(make_completion(tmpl, 15.0, Some("Prompt template")));
-            }
-        }
-    }
-
-    // ── 通用关键字补全 ─────────────────────────────────────────
-
-    // 1. 关键字
+    // 关键字补全
     for kw in [
-        "let",
-        "task",
-        "if",
-        "then",
-        "end",
-        "for",
-        "in",
-        "return",
-        "fn",
-        "true",
-        "false",
-        "nil",
-        "match",
-        "with",
-        "save",
-        "load",
-        "import",
-        "parallel",
-        "read",
-        "write",
-        "append",
-        "read_bytes",
-        "write_bytes",
-        "into",
-        "export",
-        // v0.04.0: AI 原语
-        "stream",
-        "tool",
-        "break",
-        "continue",
-        // v0.06.7: 云服务原语 (serve/try/catch 已移除)
-        "route",
-        "observe",
-        "span",
-        "tags",
-        "record_tokens",
-        "ai_model",
-        // v0.08: trait 系统
-        "trait",
-        "impl",
-        "dyn",
-        "Self",
+        "let", "task", "if", "then", "end", "for", "in", "return", "fn",
+        "true", "false", "nil", "match", "with", "import", "export",
+        "parallel", "break", "continue", "route", "observe",
+        "stream", "tool",
     ] {
         if seen.insert(kw.to_string()) {
-            items.push(make_completion(kw, 14.0, None));
+            items.push(make_completion(kw, 14.0, Some("keyword")));
         }
     }
 
-    // 2. 局部变量
-    for stmt in &stmts {
-        if let Stmt::Let { name, .. } = stmt
-            && seen.insert(name.clone())
-        {
-            items.push(make_completion(name, 6.0, None));
-        }
-        if let Stmt::For { var, .. } = stmt
-            && seen.insert(var.clone())
-        {
-            items.push(make_completion(var, 6.0, None));
-        }
-    }
-
-    // 3. 任务名
-    for stmt in &stmts {
-        if let Stmt::TaskDef { name, .. } = stmt
-            && seen.insert(name.clone())
-        {
-            items.push(make_completion(name, 3.0, None));
-        }
-    }
-
-    // 4. 内置对象
-    for builtin in ["ai", "web", "json", "file", "memory", "agent"] {
+    // 内置函数补全
+    for builtin in ["print", "range", "len", "type_of", "is_instance", "methods_of",
+                     "atom", "swap", "deref", "compose", "partial", "batch_chat"] {
         if seen.insert(builtin.to_string()) {
-            items.push(make_completion(builtin, 9.0, None));
-        }
-    }
-
-    // 5. AI 原语关键字 (补充)
-    for kw in ["p\"", "ai_model(", "fast(", "deep("] {
-        if seen.insert(kw.to_string()) {
-            let detail = match kw {
-                "p\"" => "Prompt expression",
-                "ai_model(" => "Route model declaration",
-                "fast(" => "Fast route call",
-                "deep(" => "Deep route call",
-                _ => "",
-            };
-            items.push(make_completion(kw, 14.0, Some(detail)));
+            items.push(make_completion(builtin, 10.0, Some("builtin")));
         }
     }
 
@@ -545,7 +342,9 @@ pub fn completion(docs: &HashMap<String, DocumentState>, params: &Value) -> Valu
 // Go-to-definition
 // ===================================================================
 
-pub fn definition(docs: &HashMap<String, DocumentState>, params: &Value) -> Value {
+/// v0.24: definition 使用 ast_v2
+#[allow(dead_code)]
+pub fn definition_v2(docs: &HashMap<String, DocumentState>, params: &Value) -> Value {
     let uri = match params
         .get("textDocument")
         .and_then(|t| t.get("uri"))
@@ -561,7 +360,7 @@ pub fn definition(docs: &HashMap<String, DocumentState>, params: &Value) -> Valu
     let line = pos.get("line").and_then(|n| n.as_i64()).unwrap_or(0) as usize;
     let col = pos.get("character").and_then(|n| n.as_i64()).unwrap_or(0) as usize;
 
-    let (text, stmts) = match parsed_doc(docs, uri) {
+    let (text, stmt_ids, arena) = match parsed_doc_v2(docs, uri) {
         Some(t) => t,
         None => return Value::Array(vec![]),
     };
@@ -571,47 +370,31 @@ pub fn definition(docs: &HashMap<String, DocumentState>, params: &Value) -> Valu
         None => return Value::Array(vec![]),
     };
 
-    let defs = collect_definitions(&stmts);
-    let locations: Vec<Value> = defs
-        .get(&ident)
-        .map(|v| {
-            v.iter()
-                .map(|(l, c)| {
-                    let mut m = BTreeMap::new();
-                    m.insert("uri".to_string(), Value::String_(uri.to_string()));
-                    m.insert(
-                        "range".to_string(),
-                        Value::Object({
-                            let mut r = BTreeMap::new();
-                            r.insert(
-                                "start".to_string(),
-                                Value::Object({
-                                    let mut p = BTreeMap::new();
-                                    p.insert("line".to_string(), Value::Number(*l as f64));
-                                    p.insert("character".to_string(), Value::Number(*c as f64));
-                                    p
-                                }),
-                            );
-                            r.insert(
-                                "end".to_string(),
-                                Value::Object({
-                                    let mut p = BTreeMap::new();
-                                    p.insert("line".to_string(), Value::Number(*l as f64));
-                                    p.insert(
-                                        "character".to_string(),
-                                        Value::Number((*c + ident.len()) as f64),
-                                    );
-                                    p
-                                }),
-                            );
-                            r
-                        }),
-                    );
-                    Value::Object(m)
-                })
-                .collect()
-        })
-        .unwrap_or_default();
+    let defs = collect_definitions_v2(&stmt_ids, &arena);
+    let mut locations: Vec<Value> = Vec::new();
+    if let Some(positions) = defs.get(&ident) {
+        for (l, c) in positions {
+            let mut m = BTreeMap::new();
+            m.insert("uri".to_string(), Value::String_(uri.to_string()));
+            m.insert("range".to_string(), Value::Object({
+                let mut r = BTreeMap::new();
+                r.insert("start".to_string(), Value::Object({
+                    let mut s = BTreeMap::new();
+                    s.insert("line".to_string(), Value::Number(*l as f64 - 1.0));
+                    s.insert("character".to_string(), Value::Number(*c as f64 - 1.0));
+                    s
+                }));
+                r.insert("end".to_string(), Value::Object({
+                    let mut s = BTreeMap::new();
+                    s.insert("line".to_string(), Value::Number(*l as f64 - 1.0));
+                    s.insert("character".to_string(), Value::Number(*c as f64 - 1.0 + ident.len() as f64));
+                    s
+                }));
+                r
+            }));
+            locations.push(Value::Object(m));
+        }
+    }
     Value::Array(locations)
 }
 
@@ -619,7 +402,9 @@ pub fn definition(docs: &HashMap<String, DocumentState>, params: &Value) -> Valu
 // References
 // ===================================================================
 
-pub fn references(docs: &HashMap<String, DocumentState>, params: &Value) -> Value {
+/// v0.24: references 使用 ast_v2
+#[allow(dead_code)]
+pub fn references_v2(docs: &HashMap<String, DocumentState>, params: &Value) -> Value {
     let uri = match params
         .get("textDocument")
         .and_then(|t| t.get("uri"))
@@ -635,7 +420,7 @@ pub fn references(docs: &HashMap<String, DocumentState>, params: &Value) -> Valu
     let line = pos.get("line").and_then(|n| n.as_i64()).unwrap_or(0) as usize;
     let col = pos.get("character").and_then(|n| n.as_i64()).unwrap_or(0) as usize;
 
-    let (text, stmts) = match parsed_doc(docs, uri) {
+    let (text, stmt_ids, arena) = match parsed_doc_v2(docs, uri) {
         Some(t) => t,
         None => return Value::Array(vec![]),
     };
@@ -644,54 +429,32 @@ pub fn references(docs: &HashMap<String, DocumentState>, params: &Value) -> Valu
         Some(s) => s,
         None => return Value::Array(vec![]),
     };
-    let _include_decl = params
-        .get("context")
-        .and_then(|c| c.get("includeDeclaration"))
-        .and_then(|v| v.as_i64())
-        .unwrap_or(1)
-        != 0;
 
     let mut refs = Vec::new();
-    collect_references(&stmts, &ident, &mut refs);
+    collect_references_v2(&stmt_ids, &arena, &ident, &mut refs);
 
-    // 简化：refs 里的 (0, 0) 表示"找到但行号未知"
-    // 对于引用查找我们只能给出找到的事实；行号精确化是后续工作
-    let locations: Vec<Value> = refs
-        .iter()
-        .map(|(l, c)| {
-            let mut m = BTreeMap::new();
-            m.insert("uri".to_string(), Value::String_(uri.to_string()));
-            m.insert(
-                "range".to_string(),
-                Value::Object({
-                    let mut r = BTreeMap::new();
-                    r.insert(
-                        "start".to_string(),
-                        Value::Object({
-                            let mut p = BTreeMap::new();
-                            p.insert("line".to_string(), Value::Number(*l as f64));
-                            p.insert("character".to_string(), Value::Number(*c as f64));
-                            p
-                        }),
-                    );
-                    r.insert(
-                        "end".to_string(),
-                        Value::Object({
-                            let mut p = BTreeMap::new();
-                            p.insert("line".to_string(), Value::Number(*l as f64));
-                            p.insert(
-                                "character".to_string(),
-                                Value::Number((*c + ident.len()) as f64),
-                            );
-                            p
-                        }),
-                    );
-                    r
-                }),
-            );
-            Value::Object(m)
-        })
-        .collect();
+    let mut locations: Vec<Value> = Vec::new();
+    for (l, c) in &refs {
+        let mut m = BTreeMap::new();
+        m.insert("uri".to_string(), Value::String_(uri.to_string()));
+        m.insert("range".to_string(), Value::Object({
+            let mut r = BTreeMap::new();
+            r.insert("start".to_string(), Value::Object({
+                let mut s = BTreeMap::new();
+                s.insert("line".to_string(), Value::Number(*l as f64 - 1.0));
+                s.insert("character".to_string(), Value::Number(*c as f64 - 1.0));
+                s
+            }));
+            r.insert("end".to_string(), Value::Object({
+                let mut s = BTreeMap::new();
+                s.insert("line".to_string(), Value::Number(*l as f64 - 1.0));
+                s.insert("character".to_string(), Value::Number(*c as f64 - 1.0 + ident.len() as f64));
+                s
+            }));
+            r
+        }));
+        locations.push(Value::Object(m));
+    }
     Value::Array(locations)
 }
 
@@ -699,7 +462,9 @@ pub fn references(docs: &HashMap<String, DocumentState>, params: &Value) -> Valu
 // Document Symbols
 // ===================================================================
 
-pub fn document_symbol(docs: &HashMap<String, DocumentState>, params: &Value) -> Value {
+/// v0.24: document_symbol 使用 ast_v2
+#[allow(dead_code)]
+pub fn document_symbol_v2(docs: &HashMap<String, DocumentState>, params: &Value) -> Value {
     let uri = match params
         .get("textDocument")
         .and_then(|t| t.get("uri"))
@@ -708,119 +473,60 @@ pub fn document_symbol(docs: &HashMap<String, DocumentState>, params: &Value) ->
         Some(s) => s,
         None => return Value::Array(vec![]),
     };
-    let (_text, stmts) = match parsed_doc(docs, uri) {
+    let (_text, stmt_ids, arena) = match parsed_doc_v2(docs, uri) {
         Some(t) => t,
         None => return Value::Array(vec![]),
     };
     let mut out = Vec::new();
-    for stmt in &stmts {
-        match stmt {
-            Stmt::Let { name, span, .. } => {
-                let mut m = BTreeMap::new();
-                m.insert("name".to_string(), Value::String_(name.clone()));
-                m.insert("kind".to_string(), Value::Number(13.0)); // Variable
-                m.insert(
-                    "range".to_string(),
-                    Value::Object({
+    for stmt_id in &stmt_ids {
+        if let Some(stmt) = arena.get_stmt(*stmt_id) {
+            match &stmt.kind {
+                crate::ast_v2::StmtKind::Let { name, .. } => {
+                    let mut m = BTreeMap::new();
+                    m.insert("name".to_string(), Value::String_(name.clone()));
+                    m.insert("kind".to_string(), Value::Number(13.0)); // Variable
+                    m.insert("range".to_string(), Value::Object({
                         let mut r = BTreeMap::new();
-                        r.insert(
-                            "start".to_string(),
-                            Value::Object({
-                                let mut p = BTreeMap::new();
-                                p.insert("line".to_string(), Value::Number(span.line as f64));
-                                p.insert(
-                                    "character".to_string(),
-                                    Value::Number(span.column as f64),
-                                );
-                                p
-                            }),
-                        );
-                        r.insert(
-                            "end".to_string(),
-                            Value::Object({
-                                let mut p = BTreeMap::new();
-                                p.insert("line".to_string(), Value::Number(span.line as f64));
-                                p.insert(
-                                    "character".to_string(),
-                                    Value::Number((span.column + name.len()) as f64),
-                                );
-                                p
-                            }),
-                        );
+                        r.insert("start".to_string(), Value::Object({
+                            let mut p = BTreeMap::new();
+                            p.insert("line".to_string(), Value::Number(stmt.span.line as f64));
+                            p.insert("character".to_string(), Value::Number(stmt.span.column as f64));
+                            p
+                        }));
+                        r.insert("end".to_string(), Value::Object({
+                            let mut p = BTreeMap::new();
+                            p.insert("line".to_string(), Value::Number(stmt.span.line as f64));
+                            p.insert("character".to_string(), Value::Number((stmt.span.column + name.len()) as f64));
+                            p
+                        }));
                         r
-                    }),
-                );
-                m.insert(
-                    "selectionRange".to_string(),
-                    Value::Object({
+                    }));
+                    out.push(Value::Object(m));
+                }
+                crate::ast_v2::StmtKind::TaskDef { name, .. } => {
+                    let mut m = BTreeMap::new();
+                    m.insert("name".to_string(), Value::String_(name.clone()));
+                    m.insert("kind".to_string(), Value::Number(12.0)); // Function
+                    m.insert("range".to_string(), Value::Object({
                         let mut r = BTreeMap::new();
-                        r.insert(
-                            "start".to_string(),
-                            Value::Object({
-                                let mut p = BTreeMap::new();
-                                p.insert("line".to_string(), Value::Number(span.line as f64));
-                                p.insert(
-                                    "character".to_string(),
-                                    Value::Number(span.column as f64),
-                                );
-                                p
-                            }),
-                        );
-                        r.insert(
-                            "end".to_string(),
-                            Value::Object({
-                                let mut p = BTreeMap::new();
-                                p.insert("line".to_string(), Value::Number(span.line as f64));
-                                p.insert(
-                                    "character".to_string(),
-                                    Value::Number((span.column + name.len()) as f64),
-                                );
-                                p
-                            }),
-                        );
+                        r.insert("start".to_string(), Value::Object({
+                            let mut p = BTreeMap::new();
+                            p.insert("line".to_string(), Value::Number(stmt.span.line as f64));
+                            p.insert("character".to_string(), Value::Number(stmt.span.column as f64));
+                            p
+                        }));
+                        r.insert("end".to_string(), Value::Object({
+                            let mut p = BTreeMap::new();
+                            p.insert("line".to_string(), Value::Number(stmt.span.line as f64));
+                            p.insert("character".to_string(), Value::Number((stmt.span.column + name.len()) as f64));
+                            p
+                        }));
                         r
-                    }),
-                );
-                out.push(Value::Object(m));
+                    }));
+                    out.push(Value::Object(m));
+                }
+                _ => {}
             }
-            Stmt::TaskDef { name, span, .. } => {
-                let mut m = BTreeMap::new();
-                m.insert("name".to_string(), Value::String_(name.clone()));
-                m.insert("kind".to_string(), Value::Number(12.0)); // Function
-                m.insert(
-                    "range".to_string(),
-                    Value::Object({
-                        let mut r = BTreeMap::new();
-                        r.insert(
-                            "start".to_string(),
-                            Value::Object({
-                                let mut p = BTreeMap::new();
-                                p.insert("line".to_string(), Value::Number(span.line as f64));
-                                p.insert(
-                                    "character".to_string(),
-                                    Value::Number(span.column as f64),
-                                );
-                                p
-                            }),
-                        );
-                        r.insert(
-                            "end".to_string(),
-                            Value::Object({
-                                let mut p = BTreeMap::new();
-                                p.insert("line".to_string(), Value::Number(span.line as f64));
-                                p.insert(
-                                    "character".to_string(),
-                                    Value::Number((span.column + name.len()) as f64),
-                                );
-                                p
-                            }),
-                        );
-                        r
-                    }),
-                );
-                out.push(Value::Object(m));
-            }
-            _ => {}
         }
     }
     Value::Array(out)
@@ -976,7 +682,9 @@ fn token_text(tt: &crate::lexer::TokenType) -> String {
 // Rename
 // ===================================================================
 
-pub fn rename(docs: &HashMap<String, DocumentState>, params: &Value) -> Value {
+/// v0.24: rename 使用 ast_v2
+#[allow(dead_code)]
+pub fn rename_v2(docs: &HashMap<String, DocumentState>, params: &Value) -> Value {
     let uri = match params
         .get("textDocument")
         .and_then(|t| t.get("uri"))
@@ -995,7 +703,7 @@ pub fn rename(docs: &HashMap<String, DocumentState>, params: &Value) -> Value {
     };
     let line = pos.get("line").and_then(|n| n.as_i64()).unwrap_or(0) as usize;
     let col = pos.get("character").and_then(|n| n.as_i64()).unwrap_or(0) as usize;
-    let (text, stmts) = match parsed_doc(docs, uri) {
+    let (text, stmt_ids, arena) = match parsed_doc_v2(docs, uri) {
         Some(t) => t,
         None => return Value::Null,
     };
@@ -1005,9 +713,9 @@ pub fn rename(docs: &HashMap<String, DocumentState>, params: &Value) -> Value {
         None => return Value::Null,
     };
 
-    let defs = collect_definitions(&stmts);
+    let defs = collect_definitions_v2(&stmt_ids, &arena);
     let mut refs = Vec::new();
-    collect_references(&stmts, &old_name, &mut refs);
+    collect_references_v2(&stmt_ids, &arena, &old_name, &mut refs);
 
     // 编辑列表：定义 + 引用（合并，按 offset 排序去重）
     let mut edits: BTreeSet<(usize, usize)> = BTreeSet::new();
@@ -1020,46 +728,32 @@ pub fn rename(docs: &HashMap<String, DocumentState>, params: &Value) -> Value {
         edits.insert((*l, *c));
     }
 
-    let edit_list: Vec<Value> = edits
-        .iter()
-        .map(|(l, c)| {
-            let mut m = BTreeMap::new();
-            m.insert(
-                "range".to_string(),
-                Value::Object({
-                    let mut r = BTreeMap::new();
-                    r.insert(
-                        "start".to_string(),
-                        Value::Object({
-                            let mut p = BTreeMap::new();
-                            p.insert("line".to_string(), Value::Number(*l as f64));
-                            p.insert("character".to_string(), Value::Number(*c as f64));
-                            p
-                        }),
-                    );
-                    r.insert(
-                        "end".to_string(),
-                        Value::Object({
-                            let mut p = BTreeMap::new();
-                            p.insert("line".to_string(), Value::Number(*l as f64));
-                            p.insert(
-                                "character".to_string(),
-                                Value::Number((*c + old_name.len()) as f64),
-                            );
-                            p
-                        }),
-                    );
-                    r
-                }),
-            );
-            m.insert("newText".to_string(), Value::String_(new_name.clone()));
-            Value::Object(m)
-        })
-        .collect();
+    let mut changes = BTreeMap::new();
+    let mut edit_list: Vec<Value> = Vec::new();
+    for (l, c) in &edits {
+        let mut m = BTreeMap::new();
+        m.insert("range".to_string(), Value::Object({
+            let mut r = BTreeMap::new();
+            r.insert("start".to_string(), Value::Object({
+                let mut p = BTreeMap::new();
+                p.insert("line".to_string(), Value::Number(*l as f64 - 1.0));
+                p.insert("character".to_string(), Value::Number(*c as f64 - 1.0));
+                p
+            }));
+            r.insert("end".to_string(), Value::Object({
+                let mut p = BTreeMap::new();
+                p.insert("line".to_string(), Value::Number(*l as f64 - 1.0));
+                p.insert("character".to_string(), Value::Number(*c as f64 - 1.0 + old_name.len() as f64));
+                p
+            }));
+            r
+        }));
+        m.insert("newText".to_string(), Value::String_(new_name.clone()));
+        edit_list.push(Value::Object(m));
+    }
+    changes.insert(uri.to_string(), Value::Array(edit_list));
 
     let mut result = BTreeMap::new();
-    let mut changes = BTreeMap::new();
-    changes.insert(uri.to_string(), Value::Array(edit_list));
     result.insert("changes".to_string(), Value::Object(changes));
     Value::Object(result)
 }
@@ -1083,8 +777,8 @@ pub fn semantic_tokens(docs: &HashMap<String, DocumentState>, params: &Value) ->
             });
         }
     };
-    let (text, stmts) = match parsed_doc(docs, uri) {
-        Some(t) => t,
+    let text = match docs.get(uri) {
+        Some(d) => d.text.clone(),
         None => {
             return Value::Object({
                 let mut m = BTreeMap::new();
@@ -1134,9 +828,12 @@ pub fn semantic_tokens(docs: &HashMap<String, DocumentState>, params: &Value) ->
         last_col = col;
     }
 
-    // 给已知任务名加 function token
-    for stmt in &stmts {
-        if let Stmt::TaskDef { name, span, .. } = stmt {
+    // 给已知任务名加 function token (使用 v2)
+    let (_text2, stmt_ids, arena) = parsed_doc_v2(docs, uri).unwrap_or_default();
+    for stmt_id in &stmt_ids {
+        if let Some(stmt) = arena.get_stmt(*stmt_id) {
+        if let crate::ast_v2::StmtKind::TaskDef { name, .. } = &stmt.kind {
+            let span = &stmt.span;
             let dl = (span.line as u32).saturating_sub(last_line);
             let dc = if dl == 0 {
                 (span.column as u32).saturating_sub(last_col)
@@ -1151,7 +848,8 @@ pub fn semantic_tokens(docs: &HashMap<String, DocumentState>, params: &Value) ->
             last_line = span.line as u32;
             last_col = span.column as u32;
         }
-        if let Stmt::Let { name, span, .. } = stmt {
+        if let crate::ast_v2::StmtKind::Let { name, .. } = &stmt.kind {
+            let span = &stmt.span;
             let dl = (span.line as u32).saturating_sub(last_line);
             let dc = if dl == 0 {
                 (span.column as u32).saturating_sub(last_col)
@@ -1165,6 +863,7 @@ pub fn semantic_tokens(docs: &HashMap<String, DocumentState>, params: &Value) ->
             data.push(name.len() as u32);
             last_line = span.line as u32;
             last_col = span.column as u32;
+        }
         }
     }
 
@@ -1190,7 +889,9 @@ fn token_len(tt: &crate::lexer::TokenType) -> usize {
 // Folding range
 // ===================================================================
 
-pub fn folding_range(docs: &HashMap<String, DocumentState>, params: &Value) -> Value {
+/// v0.24: folding_range 使用 ast_v2
+#[allow(dead_code)]
+pub fn folding_range_v2(docs: &HashMap<String, DocumentState>, params: &Value) -> Value {
     let uri = match params
         .get("textDocument")
         .and_then(|t| t.get("uri"))
@@ -1199,113 +900,49 @@ pub fn folding_range(docs: &HashMap<String, DocumentState>, params: &Value) -> V
         Some(s) => s,
         None => return Value::Array(vec![]),
     };
-    let (_text, stmts) = match parsed_doc(docs, uri) {
+    let (_text, stmt_ids, arena) = match parsed_doc_v2(docs, uri) {
         Some(t) => t,
         None => return Value::Array(vec![]),
     };
 
     let mut out = Vec::new();
-    fn collect(stmts: &[Stmt], out: &mut Vec<(usize, usize)>) {
-        for stmt in stmts {
-            match stmt {
-                Stmt::If {
-                    span, then_branch, ..
-                } => {
-                    if let Some(end_stmt) = then_branch.last() {
-                        out.push((span.line, end_stmt_span_line(end_stmt)));
-                    }
+    for stmt_id in &stmt_ids {
+        if let Some(stmt) = arena.get_stmt(*stmt_id) {
+            match &stmt.kind {
+                crate::ast_v2::StmtKind::If { then_branch, .. } => {
+                    if let Some(last_id) = then_branch.last()
+                        && let Some(last_stmt) = arena.get_stmt(*last_id) {
+                            let mut m = BTreeMap::new();
+                            m.insert("startLine".to_string(), Value::Number(stmt.span.line as f64 - 1.0));
+                            m.insert("endLine".to_string(), Value::Number(last_stmt.span.line as f64 - 1.0));
+                            m.insert("kind".to_string(), Value::String_("region".to_string()));
+                            out.push(Value::Object(m));
+                        }
                 }
-                Stmt::For { span, body, .. } => {
-                    if let Some(end_stmt) = body.last() {
-                        out.push((span.line, end_stmt_span_line(end_stmt)));
-                    }
+                crate::ast_v2::StmtKind::For { body, .. } => {
+                    if let Some(last_id) = body.last()
+                        && let Some(last_stmt) = arena.get_stmt(*last_id) {
+                            let mut m = BTreeMap::new();
+                            m.insert("startLine".to_string(), Value::Number(stmt.span.line as f64 - 1.0));
+                            m.insert("endLine".to_string(), Value::Number(last_stmt.span.line as f64 - 1.0));
+                            m.insert("kind".to_string(), Value::String_("region".to_string()));
+                            out.push(Value::Object(m));
+                        }
                 }
-                Stmt::TaskDef { span, body, .. } => {
-                    if let Some(end_stmt) = body.last() {
-                        out.push((span.line, end_stmt_span_line(end_stmt)));
-                    }
-                }
-                Stmt::Match { span, arms, .. } => {
-                    if let Some((_p, last_arm)) = arms.last()
-                        && let Some(end_stmt) = last_arm.last()
-                    {
-                        out.push((span.line, end_stmt_span_line(end_stmt)));
-                    }
-                }
-                Stmt::Parallel { span, stmts: inner } => {
-                    if let Some(end_stmt) = inner.last() {
-                        out.push((span.line, end_stmt_span_line(end_stmt)));
-                    }
-                }
-                Stmt::TraitDef { span, .. } => {
-                    out.push((span.line, span.line));
-                }
-                Stmt::ImplDef { span, .. } => {
-                    out.push((span.line, span.line));
+                crate::ast_v2::StmtKind::TaskDef { body, .. } => {
+                    if let Some(last_id) = body.last()
+                        && let Some(last_stmt) = arena.get_stmt(*last_id) {
+                            let mut m = BTreeMap::new();
+                            m.insert("startLine".to_string(), Value::Number(stmt.span.line as f64 - 1.0));
+                            m.insert("endLine".to_string(), Value::Number(last_stmt.span.line as f64 - 1.0));
+                            m.insert("kind".to_string(), Value::String_("region".to_string()));
+                            out.push(Value::Object(m));
+                        }
                 }
                 _ => {}
             }
         }
     }
-    collect(&stmts, &mut out);
-
-    let ranges: Vec<Value> = out
-        .iter()
-        .map(|(s, e)| {
-            let mut m = BTreeMap::new();
-            m.insert("startLine".to_string(), Value::Number(*s as f64));
-            m.insert("endLine".to_string(), Value::Number(*e as f64));
-            m.insert("kind".to_string(), Value::String_("region".to_string()));
-            Value::Object(m)
-        })
-        .collect();
-    Value::Array(ranges)
+    Value::Array(out)
 }
 
-fn end_stmt_span_line(stmt: &Stmt) -> usize {
-    match stmt {
-        Stmt::Let { span, .. }
-        | Stmt::Assign { span, .. }
-        | Stmt::IndexAssign { span, .. }
-        | Stmt::TaskDef { span, .. }
-        | Stmt::If { span, .. }
-        | Stmt::For { span, .. }
-        | Stmt::Import { span, .. }
-        | Stmt::Parallel { span, .. }
-        | Stmt::Match { span, .. }
-        | Stmt::Save { span, .. }
-        | Stmt::Load { span, .. }
-        | Stmt::ReadFile { span, .. }
-        | Stmt::WriteFile { span, .. }
-        | Stmt::AppendFile { span, .. }
-        | Stmt::ReadBytesFile { span, .. }
-        | Stmt::WriteBytesFile { span, .. }
-        | Stmt::Return { span, .. }
-        | Stmt::With { span, .. }
-        | Stmt::StreamFor { span, .. }
-        | Stmt::ToolDef { span, .. }
-        | Stmt::Break { span, .. }
-        | Stmt::Continue { span, .. }
-        | Stmt::Route { span, .. }
-        | Stmt::Observe { span, .. }
-        | Stmt::Span { span, .. }
-        | Stmt::RecordTokens { span, .. }
-        | Stmt::TraitDef { span, .. }
-        | Stmt::ImplDef { span, .. } => span.line,
-        Stmt::Expr(_) => 0,
-        // v0.19: Worker 并发
-        Stmt::Worker { span, .. } | Stmt::Send { span, .. } | Stmt::Receive { span, .. } => {
-            span.line
-        }
-        // v0.19: 事务
-        Stmt::Transaction { span, .. }
-        | Stmt::Commit { span, .. }
-        | Stmt::Rollback { span, .. } => span.line,
-        // v0.20: 宏
-        Stmt::MacroDef { span, .. } => span.line,
-        // v0.23: 类型系统增强
-        Stmt::TypeAlias { span, .. }
-        | Stmt::EnumDef { span, .. }
-        | Stmt::StructDef { span, .. } => span.line,
-    }
-}

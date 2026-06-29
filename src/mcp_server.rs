@@ -25,20 +25,109 @@ pub struct McpTool {
     pub description: String,
     pub parameters: String, // JSON Schema 字符串
     pub handler: Value,     // Mora 闭包
+    pub toolset: String,    // v0.24: 所属 toolset
 }
 
 pub type ToolRegistry = Arc<Mutex<HashMap<String, McpTool>>>;
 
+/// v0.24: Toolset 配置
+#[derive(Clone, Debug)]
+pub struct ToolsetConfig {
+    /// 启用的 toolset 列表
+    pub enabled: Vec<String>,
+    /// 启用的单个工具列表
+    pub tools: Vec<String>,
+    /// 是否只读模式
+    pub read_only: bool,
+    /// 是否 insiders 模式
+    pub insiders: bool,
+}
+
+impl Default for ToolsetConfig {
+    fn default() -> Self {
+        Self {
+            enabled: vec!["default".to_string()],
+            tools: Vec::new(),
+            read_only: false,
+            insiders: false,
+        }
+    }
+}
+
+impl ToolsetConfig {
+    /// 检查工具是否应该启用
+    pub fn is_tool_enabled(&self, tool: &McpTool) -> bool {
+        // 如果指定了具体工具，只启用这些
+        if !self.tools.is_empty() {
+            return self.tools.contains(&tool.name);
+        }
+
+        // 如果启用了 "all"，启用所有工具
+        if self.enabled.contains(&"all".to_string()) {
+            return true;
+        }
+
+        // 检查工具所属的 toolset 是否启用
+        self.enabled.contains(&tool.toolset)
+            || self.enabled.contains(&"default".to_string())
+    }
+}
+
+/// v0.24: 内置 toolset 定义
+pub fn builtin_toolsets() -> HashMap<String, Vec<String>> {
+    let mut map = HashMap::new();
+    map.insert("ai".to_string(), vec![
+        "ai.chat".to_string(),
+        "ai.stream".to_string(),
+        "ai.create".to_string(),
+        "ai.critic".to_string(),
+    ]);
+    map.insert("json".to_string(), vec![
+        "json.parse".to_string(),
+        "json.stringify".to_string(),
+    ]);
+    map.insert("file".to_string(), vec![
+        "file.read_text".to_string(),
+        "file.write_text".to_string(),
+        "file.exists".to_string(),
+        "file.list".to_string(),
+        "file.mkdir".to_string(),
+        "file.remove".to_string(),
+    ]);
+    map.insert("web".to_string(), vec![
+        "web.fetch".to_string(),
+    ]);
+    map.insert("default".to_string(), vec![
+        "ai.chat".to_string(),
+        "json.parse".to_string(),
+        "json.stringify".to_string(),
+        "file.read_text".to_string(),
+        "web.fetch".to_string(),
+    ]);
+    map
+}
+
 /// 启动 MCP server (阻塞当前线程, 读 stdin 写 stdout)
 /// v0.22: 异步处理优化 - 使用线程池处理请求
-pub fn start(tools: ToolRegistry, interpreter: Arc<Mutex<Interpreter>>) -> io::Result<()> {
+/// v0.24: 支持 toolset 配置
+pub fn start(tools: ToolRegistry, interpreter: Arc<Mutex<Interpreter>>, config: Option<ToolsetConfig>) -> io::Result<()> {
+    let config = config.unwrap_or_default();
+
     eprintln!("[mcp] Mora MCP server starting on stdio");
     {
         let tools = tools.lock().expect("tools mutex poisoned");
-        eprintln!("[mcp] Registered {} tool(s):", tools.len());
-        for (name, _) in tools.iter() {
-            eprintln!("[mcp]   - {}", name);
+        let enabled_count = tools.values().filter(|t| config.is_tool_enabled(t)).count();
+        eprintln!("[mcp] Registered {} tool(s) ({} enabled):", tools.len(), enabled_count);
+        for (name, tool) in tools.iter() {
+            let status = if config.is_tool_enabled(tool) { "✓" } else { "✗" };
+            eprintln!("[mcp]   {} {}", status, name);
         }
+    }
+    if config.read_only {
+        eprintln!("[mcp] Mode: read-only");
+    }
+    if config.insiders {
+        eprintln!("[mcp] Mode: insiders");
     }
     eprintln!();
 

@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::io::BufReader;
 use std::sync::{Arc, Mutex};
 
-use crate::ast::Stmt;
+// v1 Stmt 已移除 — Value::Task/Closure 不再持有 body
 
 // ─── StreamReader ─────────────────────────────────────────
 /// 包装 BufReader<Box<dyn Read + Send + Sync>>，实现 Debug/Clone
@@ -48,12 +48,14 @@ pub enum Value {
     Task {
         name: String,
         params: Vec<String>,
-        body: Vec<Stmt>,
+        /// v2 body: 存储 arena 中的 NodeId 索引
+        v2_body_ids: Vec<usize>,
     },
     Closure {
         params: Vec<String>,
-        body: Vec<Stmt>,
         env: Arc<Mutex<Environment>>,
+        /// v2 模式: 闭包表达式在 arena 中的 NodeId
+        v2_node_id: Option<usize>,
     },
     Builtin(String),
     // v10: 多轮对话对象
@@ -122,7 +124,6 @@ pub enum Value {
     Macro {
         name: String,
         params: Vec<String>,
-        body: Vec<Stmt>,
     },
 }
 

@@ -4,7 +4,7 @@
 //! No signature changes, no field changes, no visibility changes.
 //! Re-exported in interpreter.rs via `use crate::flow::*;`
 
-use crate::ast::*;
+use crate::common::{BinaryOp, Literal};
 use crate::value::Value;
 
 /// 判断值是否为真
@@ -242,8 +242,6 @@ pub fn literal_to_value_static(lit: &Literal) -> Value {
         Literal::Number(n, _) => Value::Number(*n),
         Literal::Bool(b, _) => Value::Bool(*b),
         Literal::Nil(_) => Value::Nil,
-        Literal::List(_, _) => Value::Nil,
-        Literal::Dict(_, _) => Value::Nil,
     }
 }
 

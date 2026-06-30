@@ -1,0 +1,114 @@
+-- ============================================================
+-- v0.25: Multi-Agent 协调模式示例
+-- ============================================================
+
+-- 1. Sequential 模式 — 线性管道
+task sequential_demo()
+  let topic = "AI Agent 架构"
+  orchestrate sequential topic -> result
+    agent researcher
+      task(ai.chat(p"搜索以下主题的最新进展：{topic}"))
+    end
+    agent writer
+      task(ai.chat(p"基于以下研究撰写文章：\n{input}"))
+    end
+    agent editor
+      task(ai.chat(p"编辑以下文章，改进表达：\n{input}"))
+    end
+  end
+  print(result)
+end
+
+-- 2. Graph 模式 — 有向图 + 条件路由
+task graph_demo()
+  let topic = "Multi-Agent 系统"
+  orchestrate graph topic -> result
+    agent researcher
+      with model("gpt-4o-mini")
+      task(ai.chat(p"深度搜索：{input}"))
+    end
+    agent writer
+      task(ai.chat(p"撰写报告：{input}"))
+    end
+    agent reviewer
+      task(ai.chat(p"审阅报告，如果质量好回复'LGTM'，否则指出问题：\n{input}"))
+    end
+    agent editor
+      task(ai.chat(p"根据审阅意见修改：\n{input}"))
+    end
+
+    edges
+      @start -> researcher
+      researcher -> writer
+      writer -> reviewer
+      reviewer -> editor when result.contains("需改进") and rounds < 2
+      reviewer -> @exit when result.contains("LGTM")
+      editor -> @exit when rounds >= 2
+    end
+  end
+  print(result)
+end
+
+-- 3. Loop 模式 — 迭代精炼
+task loop_demo()
+  let text = "这是一段需要改进的文本"
+  orchestrate loop text -> result, max_rounds: 3
+    agent improver
+      task(ai.chat(p"改进以下文本，使其更专业：\n{input}"))
+    end
+    exit_when: result.contains("专业")
+  end
+  print(result)
+end
+
+-- 4. 复杂工作流 — 编排嵌套
+task complex_workflow()
+  let requirement = "设计一个 AI Agent 系统"
+
+  -- 第一阶段：研究
+  orchestrate sequential requirement -> research
+    agent analyst
+      task(ai.chat(p"分析需求：{input}"))
+    end
+    agent researcher
+      task(ai.chat(p"搜索相关方案：{input}"))
+    end
+  end
+
+  -- 第二阶段：设计
+  orchestrate sequential research -> design
+    agent architect
+      task(ai.chat(p"设计架构：{input}"))
+    end
+    agent reviewer
+      task(ai.chat(p"审查设计：{input}"))
+    end
+  end
+
+  print(design)
+end
+
+-- 5. 与 Memory 结合
+task memory_orchestrate()
+  memory.store("task_count", 0)
+
+  orchestrate loop "初始任务" -> result, max_rounds: 3
+    agent worker
+      task(
+        let count = memory.recall("task_count")
+        memory.store("task_count", count + 1)
+        ai.chat(p"执行任务第 {count + 1} 轮：{input}")
+      )
+    end
+    exit_when: result.len() > 100
+  end
+
+  print("总轮次: " + memory.recall("task_count"))
+  print(result)
+end
+
+task main()
+  sequential_demo()
+  loop_demo()
+  print("orchestrate demos 完成")
+end

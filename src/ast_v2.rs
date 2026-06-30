@@ -6,9 +6,7 @@
 //! - **类型信息保留**：类型检查后保留类型信息
 //! - **Visitor 模式**：解耦遍历逻辑
 
-use crate::ast::{
-    BinaryOp, GenericParam, Literal, Span,
-};
+use crate::common::{BinaryOp, GenericParam, Literal, Span};
 use crate::typeck::Type;
 
 /// 模式 (v2: 使用 NodeId)
@@ -406,13 +404,90 @@ pub enum StmtKind {
     EnumDef {
         name: String,
         generics: Vec<String>,
-        variants: Vec<crate::ast::EnumVariant>,
+        variants: Vec<crate::common::EnumVariant>,
     },
     StructDef {
         name: String,
         generics: Vec<String>,
-        fields: Vec<crate::ast::StructField>,
+        fields: Vec<crate::common::StructField>,
     },
+
+    // v0.25: Multi-Agent 协调
+    Orchestrate {
+        input_var: String,
+        result_var: String,
+        kind: OrchestrateKind,
+    },
+
+    // v0.25: Eval 原语 — Agent 行为回归测试
+    Eval {
+        name: String,
+        given: NodeId,
+        expects: Vec<NodeId>,
+        tolerance: Option<f64>,
+        replay_path: Option<String>,
+    },
+
+    // v0.25: Skill 原语 — 可复用能力包
+    SkillDef {
+        name: String,
+        description: Option<String>,
+        version: Option<String>,
+        requires: Vec<String>,
+        tasks: Vec<SkillTask>,
+        verify: Option<SkillVerify>,
+    },
+}
+
+/// v0.25: 编排模式
+#[derive(Debug, Clone)]
+pub enum OrchestrateKind {
+    /// 线性管道：agent 依次执行
+    Sequential { agents: Vec<OrchestrateAgent> },
+    /// 有向图：带条件路由
+    Graph {
+        agents: Vec<OrchestrateAgent>,
+        edges: Vec<OrchestrateEdge>,
+    },
+    /// 迭代精炼：重复执行直到条件满足
+    Loop {
+        agent: OrchestrateAgent,
+        max_rounds: usize,
+        exit_when: Option<NodeId>,
+    },
+}
+
+/// v0.25: 编排中的 Agent 声明
+#[derive(Debug, Clone)]
+pub struct OrchestrateAgent {
+    pub name: String,
+    pub with_config: Option<Vec<(String, NodeId)>>,
+    pub task_expr: NodeId,
+    pub verify_expr: Option<NodeId>,
+}
+
+/// v0.25: 编排中的边（Graph 模式）
+#[derive(Debug, Clone)]
+pub struct OrchestrateEdge {
+    pub from: String,
+    pub to: String,
+    pub condition: Option<NodeId>,
+}
+
+/// v0.25: Skill 中的任务定义
+#[derive(Debug, Clone)]
+pub struct SkillTask {
+    pub name: String,
+    pub params: Vec<(String, Option<String>)>,
+    pub return_type: Option<String>,
+    pub body: Vec<NodeId>,
+}
+
+/// v0.25: Skill 中的验证函数
+#[derive(Debug, Clone)]
+pub struct SkillVerify {
+    pub params: Vec<(String, Option<String>)>,
+    pub body: Vec<NodeId>,
 }
 
 // ===================================================================
@@ -420,7 +495,7 @@ pub enum StmtKind {
 // ===================================================================
 
 /// AST 节点分配器
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct AstArena {
     pub exprs: Vec<TypedExpr>,
     pub stmts: Vec<TypedStmt>,

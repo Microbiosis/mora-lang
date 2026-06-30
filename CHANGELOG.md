@@ -2,11 +2,34 @@
 
 All notable changes to Mora will be documented in this file.
 
-## [v0.24] - 2026-06-29
+## [v0.25] - 2026-07-01
+
+### 代码模块化重构 (Code Modularization)
+
+对 5 个大文件进行了模块化拆分，提升代码可维护性：
+
+#### 拆分详情
+- **interpreter**: 3402 行 → 3 文件 (mod.rs + execute.rs + evaluate.rs)
+- **typeck**: 2838 行 → 2 文件 (mod.rs + check.rs)
+- **parser_v2**: 2609 行 → 3 文件 (mod.rs + statements.rs + expressions.rs)
+- **record**: 2091 行 → 7 文件 (mod.rs + serialization.rs + diff.rs + analysis.rs + audit.rs + snapshot.rs + tests.rs)
+- **lsp/providers**: 1092 行 → 11 文件 (mod.rs + helpers.rs + 9 个 provider 模块)
+
+#### 改进
+- 每个模块职责单一，便于理解和维护
+- 函数按功能分组，提高代码可读性
+- 模块间依赖关系更清晰
+
+### 跨平台兼容性修复
+- 修复 `test_memory_save_load` 测试在 Windows 上的路径问题
+- 使用 `std::env::temp_dir()` 替代硬编码的 `/tmp` 路径
+
+## [v0.24] - 2026-06-30
 
 ### ParserV2 完整迁移 (Complete)
 
 ParserV2 已完成对旧 Parser 的完整迁移，所有功能已覆盖。
+旧 parser.rs (2459 行) 已删除，主程序和测试全部使用 ParserV2。
 
 #### 新增语句解析
 - **append_statement**: 追加文件写入
@@ -17,13 +40,19 @@ ParserV2 已完成对旧 Parser 的完整迁移，所有功能已覆盖。
 - **observe_statement**: 可观测性配置 (trace/metrics/otel)
 - **span_statement**: 追踪范围 `span "name" tags {..} do ... end`
 - **record_tokens_statement**: 记录 token 使用量
+- **assignment_statement**: 赋值语句 `IDENT = expr`
+- **index_assignment**: 索引赋值 `IDENT[expr] = expr`
+- **commit/rollback**: 事务提交/回滚
 
 #### 新增表达式解析
-- **match_expression**: 模式匹配表达式
+- **match_expression**: 模式匹配表达式 (含 when 守卫)
 - **pattern**: 模式解析 (字面量/变量/列表/字典/通配符)
 - **parse_format_string**: 格式字符串插值
 - **parse_ai_model_call**: ai_model 调用 (支持 keyword args)
 - **flatten_prompt_parts**: Prompt 表达式展平
+- **list_literal / dict_literal**: 列表和字典字面量
+- **char_literal**: 字符字面量 `'a'`
+- **NamespaceRef**: 命名空间引用 `Module::method()`
 
 #### 新增类型系统支持
 - **parse_generic_params**: 泛型参数 `<T: Bound>`
@@ -31,10 +60,17 @@ ParserV2 已完成对旧 Parser 的完整迁移，所有功能已覆盖。
 - **parse_type_name_recursive**: 递归解析嵌套泛型
 - **parse_where_clause**: where 子句
 
+#### 类型检查修复
+- **let 推断**: 已知类型自动推断，不再强制要求类型注解
+- **string + any**: 允许字符串拼接 (运行时做类型转换)
+
 #### 重构
 - **ObserveConfig**: 在 ast_v2.rs 中定义新类型，使用 NodeId
-- **FnDef**: 在 ast_v2.rs 中定义新类型，使用 Vec<NodeId> 作为 body
+- **FnDef / TraitMethod**: 在 ast_v2.rs 中定义新类型，使用 Vec<NodeId>
+- **Pattern**: 在 ast_v2.rs 中定义新类型，Guard condition 使用 NodeId
 - **consume_method_name**: 支持关键字作为方法名
+- **表达式优先级**: 修复方法调用优先级 (binary → unary → call → primary)
+- **反向适配器**: ast_v2_to_v1.rs 支持完整 AST 转换
 
 ### 9 Languages Features Integration (Complete)
 

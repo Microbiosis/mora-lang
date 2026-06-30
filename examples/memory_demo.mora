@@ -1,0 +1,47 @@
+-- ============================================================
+-- v0.25: Memory 原语示例 — 会话记忆系统
+-- ============================================================
+
+task main()
+  -- 基本存储和检索
+  memory.store("user_name", "Alice")
+  memory.store("user_age", 30)
+  memory.store("project", "mora-lang")
+
+  print("=== 基本检索 ===")
+  print(memory.recall("user_name"))
+  print(memory.recall("user_age"))
+
+  -- 模糊搜索
+  print("\n=== 搜索 'user' ===")
+  let results = memory.search("user")
+  print(results.len())  -- 2 (user_name, user_age)
+
+  -- 查看所有键
+  print("\n=== 所有键 ===")
+  print(memory.keys())
+  print(memory.size())
+
+  -- 删除条目
+  memory.forget("user_age")
+  print("\n=== 删除后 ===")
+  print(memory.size())
+
+  -- 持久化
+  print("\n=== 持久化 ===")
+  memory.save("/tmp/mora_memory.json")
+  memory.clear()
+  print(memory.size())  -- 0
+
+  memory.load("/tmp/mora_memory.json")
+  print(memory.size())  -- 2
+  print(memory.recall("user_name"))  -- Alice
+
+  -- 在 AI 对话中使用记忆
+  memory.store("conversation_topic", "AI Agent 架构")
+  let topic = memory.recall("conversation_topic")
+  let response = ai.chat(p"讨论 {topic} 的最新进展")
+  memory.store("last_response", response)
+  print("\n=== AI 对话记忆 ===")
+  print(memory.recall("last_response"))
+end

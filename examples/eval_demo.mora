@@ -1,0 +1,61 @@
+-- ============================================================
+-- v0.25: Eval 原语示例 — Agent 行为回归测试
+-- ============================================================
+
+-- 基本用法：对变量做断言
+task basic_eval()
+  let x = 42
+  eval "数字范围检查"
+    given: x
+    expect: given > 0
+    expect: given < 100
+  end
+  print("basic eval passed")
+end
+
+-- 带 tolerance：容忍 LLM 非确定性
+task eval_with_tolerance()
+  let text = "Hello World"
+  eval "字符串检查（容忍度 50%）"
+    given: text
+    tolerance: 0.5
+    expect: given.len() > 0
+    expect: given.contains("Hello")
+    expect: given.contains("Goodbye")  -- 这个会失败，但 tolerance 允许
+  end
+  print("tolerance eval passed")
+end
+
+-- AI 输出质量评估
+task eval_ai_output()
+  let prompt = "用一句话介绍 Mora 语言"
+  let response = ai.chat(prompt)
+
+  eval "AI 响应质量"
+    given: response
+    expect: given.len() > 10
+    expect: given.len() < 500
+    expect: !given.contains("error")
+  end
+  print("AI output quality check passed")
+end
+
+-- 多维度评估
+task eval_code_review()
+  let code = "fn add(a, b) return a + b end"
+  let review = ai.chat(p"审查以下代码：\n{code}")
+
+  eval "代码审查完整性"
+    given: review
+    tolerance: 0.8
+    expect: given.len() > 50
+    expect: given.contains("问题") or given.contains("建议") or given.contains("LGTM")
+  end
+  print("code review eval passed")
+end
+
+task main()
+  basic_eval()
+  eval_with_tolerance()
+  print("all eval demos passed")
+end

@@ -68,58 +68,76 @@ impl ToolsetConfig {
         }
 
         // 检查工具所属的 toolset 是否启用
-        self.enabled.contains(&tool.toolset)
-            || self.enabled.contains(&"default".to_string())
+        self.enabled.contains(&tool.toolset) || self.enabled.contains(&"default".to_string())
     }
 }
 
 /// v0.24: 内置 toolset 定义
 pub fn builtin_toolsets() -> HashMap<String, Vec<String>> {
     let mut map = HashMap::new();
-    map.insert("ai".to_string(), vec![
-        "ai.chat".to_string(),
-        "ai.stream".to_string(),
-        "ai.create".to_string(),
-        "ai.critic".to_string(),
-    ]);
-    map.insert("json".to_string(), vec![
-        "json.parse".to_string(),
-        "json.stringify".to_string(),
-    ]);
-    map.insert("file".to_string(), vec![
-        "file.read_text".to_string(),
-        "file.write_text".to_string(),
-        "file.exists".to_string(),
-        "file.list".to_string(),
-        "file.mkdir".to_string(),
-        "file.remove".to_string(),
-    ]);
-    map.insert("web".to_string(), vec![
-        "web.fetch".to_string(),
-    ]);
-    map.insert("default".to_string(), vec![
-        "ai.chat".to_string(),
-        "json.parse".to_string(),
-        "json.stringify".to_string(),
-        "file.read_text".to_string(),
-        "web.fetch".to_string(),
-    ]);
+    map.insert(
+        "ai".to_string(),
+        vec![
+            "ai.chat".to_string(),
+            "ai.stream".to_string(),
+            "ai.create".to_string(),
+            "ai.critic".to_string(),
+        ],
+    );
+    map.insert(
+        "json".to_string(),
+        vec!["json.parse".to_string(), "json.stringify".to_string()],
+    );
+    map.insert(
+        "file".to_string(),
+        vec![
+            "file.read_text".to_string(),
+            "file.write_text".to_string(),
+            "file.exists".to_string(),
+            "file.list".to_string(),
+            "file.mkdir".to_string(),
+            "file.remove".to_string(),
+        ],
+    );
+    map.insert("web".to_string(), vec!["web.fetch".to_string()]);
+    map.insert(
+        "default".to_string(),
+        vec![
+            "ai.chat".to_string(),
+            "json.parse".to_string(),
+            "json.stringify".to_string(),
+            "file.read_text".to_string(),
+            "web.fetch".to_string(),
+        ],
+    );
     map
 }
 
 /// 启动 MCP server (阻塞当前线程, 读 stdin 写 stdout)
 /// v0.22: 异步处理优化 - 使用线程池处理请求
 /// v0.24: 支持 toolset 配置
-pub fn start(tools: ToolRegistry, interpreter: Arc<Mutex<Interpreter>>, config: Option<ToolsetConfig>) -> io::Result<()> {
+pub fn start(
+    tools: ToolRegistry,
+    interpreter: Arc<Mutex<Interpreter>>,
+    config: Option<ToolsetConfig>,
+) -> io::Result<()> {
     let config = config.unwrap_or_default();
 
     eprintln!("[mcp] Mora MCP server starting on stdio");
     {
         let tools = tools.lock().expect("tools mutex poisoned");
         let enabled_count = tools.values().filter(|t| config.is_tool_enabled(t)).count();
-        eprintln!("[mcp] Registered {} tool(s) ({} enabled):", tools.len(), enabled_count);
+        eprintln!(
+            "[mcp] Registered {} tool(s) ({} enabled):",
+            tools.len(),
+            enabled_count
+        );
         for (name, tool) in tools.iter() {
-            let status = if config.is_tool_enabled(tool) { "✓" } else { "✗" };
+            let status = if config.is_tool_enabled(tool) {
+                "✓"
+            } else {
+                "✗"
+            };
             eprintln!("[mcp]   {} {}", status, name);
         }
     }

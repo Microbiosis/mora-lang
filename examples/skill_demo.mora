@@ -1,0 +1,75 @@
+-- ============================================================
+-- v0.25: Skill 原语示例 — 可复用能力包
+-- ============================================================
+
+-- 定义一个问候 Skill
+skill Greeter
+  description: "多语言问候器"
+  version: "1.0.0"
+  requires: [ai]
+
+  task greet(name: string): string
+    return ai.chat(p"用中文热情问候 {name}，不超过20字")
+  end
+
+  task farewell(name: string): string
+    return ai.chat(p"用中文告别 {name}，不超过20字")
+  end
+
+  verify(result: string)
+    return result.len() > 0
+  end
+end
+
+-- 定义一个代码审查 Skill
+skill CodeReviewer
+  description: "代码质量审查"
+  version: "1.0.0"
+  requires: [ai, json]
+
+  task review(code: string): string
+    return ai.chat(p"审查以下代码，列出问题和建议：\n{code}")
+  end
+
+  task summarize(review: string): string
+    return ai.chat(p"用一句话总结以下审查结果：\n{review}")
+  end
+
+  verify(result: string)
+    return result.len() > 10
+  end
+end
+
+-- 定义一个翻译 Skill
+skill Translator
+  description: "中英文互译"
+  version: "1.0.0"
+
+  task to_en(text: string): string
+    return ai.chat(p"翻译为英文：{text}")
+  end
+
+  task to_zh(text: string): string
+    return ai.chat(p"翻译为中文：{text}")
+  end
+end
+
+task main()
+  -- 访问 Skill 元数据
+  print(Greeter.description)
+  print(Greeter.version)
+  print(Greeter.requires)
+
+  -- 调用 Skill 方法
+  let greeting = Greeter.greet("Mora")
+  print(greeting)
+
+  -- 链式调用多个 Skill
+  let review = CodeReviewer.review("fn add(a, b) return a + b end")
+  let summary = CodeReviewer.summarize(review)
+  print(summary)
+
+  -- 翻译
+  let en = Translator.to_en("你好世界")
+  print(en)
+end

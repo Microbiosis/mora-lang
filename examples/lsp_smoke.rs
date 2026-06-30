@@ -32,7 +32,7 @@ fn main() {
 
     // 1. initialize
     let init = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"capabilities":{}}}"#;
-    write_msg(&mut stdin, init);
+    write_msg(&mut stdin, init).expect("write initialize");
     let resp = read_msg(&mut reader);
     println!("[client] initialize response: {} bytes", resp.len());
     assert!(
@@ -44,7 +44,8 @@ fn main() {
     write_msg(
         &mut stdin,
         r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#,
-    );
+    )
+    .expect("write initialized");
 
     // 3. didOpen with intentionally bad code
     let bad_code = "let x: number = \"hello\"\n";
@@ -52,7 +53,7 @@ fn main() {
         r#"{{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{{"textDocument":{{"uri":"file:///tmp/test.mora","languageId":"mora","version":1,"text":{}}}}}}}"#,
         json_string(bad_code)
     );
-    write_msg(&mut stdin, &did_open);
+    write_msg(&mut stdin, &did_open).expect("write didOpen");
 
     // 4. read publishDiagnostics
     let diag = read_msg(&mut reader);
@@ -68,14 +69,14 @@ fn main() {
 
     // 5. hover at line 0, char 4 (x identifier)
     let hover = r#"{"jsonrpc":"2.0","id":2,"method":"textDocument/hover","params":{"textDocument":{"uri":"file:///tmp/test.mora"},"position":{"line":0,"character":4}}}"#;
-    write_msg(&mut stdin, hover);
+    write_msg(&mut stdin, hover).expect("write hover");
     let hover_resp = read_msg(&mut reader);
     println!("[client] hover: {} bytes", hover_resp.len());
     assert!(hover_resp.contains("\"id\":2"), "expected hover response");
 
     // 6. completion
     let comp = r#"{"jsonrpc":"2.0","id":3,"method":"textDocument/completion","params":{"textDocument":{"uri":"file:///tmp/test.mora"},"position":{"line":0,"character":0}}}"#;
-    write_msg(&mut stdin, comp);
+    write_msg(&mut stdin, comp).expect("write completion");
     let comp_resp = read_msg(&mut reader);
     println!("[client] completion: {} bytes", comp_resp.len());
     assert!(
@@ -84,12 +85,12 @@ fn main() {
     );
 
     // 7. shutdown + exit
-    write_msg(
+    let _ = write_msg(
         &mut stdin,
         r#"{"jsonrpc":"2.0","id":99,"method":"shutdown","params":null}"#,
     );
     let _ = read_msg(&mut reader);
-    write_msg(
+    let _ = write_msg(
         &mut stdin,
         r#"{"jsonrpc":"2.0","method":"exit","params":null}"#,
     );
@@ -100,11 +101,11 @@ fn main() {
     println!("[client] ALL E2E CHECKS PASSED");
 }
 
-fn write_msg<W: Write>(w: &mut W, body: &str) {
+fn write_msg<W: Write>(w: &mut W, body: &str) -> std::io::Result<()> {
     let bytes = body.as_bytes();
-    write!(w, "Content-Length: {}\r\n\r\n", bytes.len()).unwrap();
-    w.write_all(bytes).unwrap();
-    w.flush().unwrap();
+    write!(w, "Content-Length: {}\r\n\r\n", bytes.len())?;
+    w.write_all(bytes)?;
+    w.flush()
 }
 
 fn read_msg<R: Read>(r: &mut R) -> String {

@@ -66,7 +66,7 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-${{ matrix.rust }}-cargo-
 
-      - name: cargo test
+      - name: cargo test --lib
         run: cargo test --lib
 
       - name: cargo test --all-targets
@@ -110,6 +110,37 @@ jobs:
 
       - name: cargo clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
+
+  integration:
+    name: Integration Tests
+    runs-on: ubuntu-latest
+    needs: [check, test]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Build mora
+        run: cargo build --release --bin mora
+
+      - name: Run example scripts
+        run: |
+          for f in examples/container.mora examples/nested_generic.mora examples/observe_demo.mora examples/trait_demo.mora examples/trait_default_demo.mora; do
+            echo "=== $f ==="
+            ./target/release/mora "$f" || true
+          done
 
   lsp:
     name: LSP Smoke Test

@@ -3,7 +3,9 @@
 # 用法:
 #   docker compose up mora-repl        # 启动 REPL
 #   docker compose up mora-http        # 启动 HTTP API
-#   docker compose run mora-repl examples/http_server_demo.mora  # 运行脚本
+#   docker compose up mora-mcp         # 启动 MCP server
+#   docker compose up mora-observe     # 启动可观测服务
+#   docker compose run mora-repl examples/container.mora  # 运行脚本
 
 services:
   # REPL 交互式环境
@@ -24,3 +26,30 @@ services:
     build: .
     command: ["mora", "examples/mcp_server_demo.mora"]
     stdin_open: true
+
+  # 可观测服务（trace + metrics）
+  mora-observe:
+    build: .
+    command: ["mora", "examples/observe_demo.mora"]
+    ports:
+      - "3001:3000"
+
+  # Agent 编排演示
+  mora-orchestrate:
+    build: .
+    command: ["mora", "examples/orchestrate_demo.mora"]
+
+  # Skill 演示
+  mora-skill:
+    build: .
+    command: ["mora", "examples/skill_demo.mora"]
+
+  # Eval 评测演示
+  mora-eval:
+    build: .
+    command: ["mora", "examples/eval_demo.mora"]
+
+  # Memory 记忆演示
+  mora-memory:
+    build: .
+    command: ["mora", "examples/memory_demo.mora"]

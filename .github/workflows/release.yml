@@ -120,7 +120,7 @@ jobs:
 
   release:
     name: Publish GitHub Release
-    needs: build
+    needs: [build, docker]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:
@@ -154,10 +154,9 @@ jobs:
         with:
           files: release/*
           body: |
-            # Mora v${{ github.ref_name }} — AI 原生 + 云服务原生
+            # Mora ${{ github.ref_name }}
 
-            Mora v0.04 终态: AI 调用和云服务能力全部下沉到语言层。
-            一段 Mora 脚本 = 可部署的 AI HTTP / MCP server + 可观测 + 类型化错误。
+            一个轻量级脚本语言，内建 AI 调用、HTTP server、MCP server、长期记忆、Agent 编排。
 
             ## 核心特性
 
@@ -166,11 +165,12 @@ jobs:
             - **可观测是语法块**: `observe trace` / `span` 块 + OTEL
             - **单二进制多协议**: `mora` 根据脚本顶层 `serve` 块自动选择协议
             - **Route 是语言概念**: `route fast: "gpt-4o-mini"` + `fast(p"...")`
+            - **强类型系统**: 类型推断、泛型、trait、enum、struct
 
             ## 快速开始
 
             ```bash
-            # 写一个 Mora 脚本 (含 serve + tool)
+            # 写一个 Mora 脚本
             cat > hello.mora << 'EOF'
             observe trace
             route fast: "gpt-4o-mini"
@@ -182,20 +182,14 @@ jobs:
             end
             EOF
 
-            # 跑 (单二进制, 自动起 HTTP server)
+            # 运行
             mora hello.mora
             # 另一终端: curl http://localhost:3000/chat?name=World
             ```
 
-            ## 完整文档
+            ## 文档
 
             - [README](https://github.com/Microbiosis/mora-lang#readme)
-            - [v0.04 终态 RFC](docs/v0.04-final-cloud-native-rfc.md)
-            - [v0.04 工作流总结](docs/v0.04-phase2-workflow-summary.md)
-
-            ## 升级
-
-            v0.04 不向后兼容 v0.03. 升级需要修改脚本 (见 docs/v0.04-release-notes.md)。
 
             ## SHA-256 Checksums
             ```

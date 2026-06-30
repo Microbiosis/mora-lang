@@ -52,6 +52,18 @@ pub enum TokenType {
     Compensation,
     // v0.20: 宏关键字
     Macro,
+    // v0.25: Multi-Agent 协调关键字
+    Orchestrate,
+    Edges,
+    Loop,
+    MaxRounds,
+    ExitWhen,
+    Rounds,
+    // v0.25: Eval + Skill 关键字
+    Eval,
+    Skill,
+    Expect,
+    Tolerance,
     // 注意: HTTP 方法 (GET/POST/PUT/DELETE/PATCH) 不作关键字
     // —— 保持 Identifier,显式 API Router.route() 按字符串匹配
     Identifier(String),
@@ -704,6 +716,18 @@ impl Lexer {
             "type" => TokenType::Type,
             "enum" => TokenType::Enum,
             "struct" => TokenType::Struct,
+            // v0.25: Multi-Agent 协调
+            "orchestrate" => TokenType::Orchestrate,
+            "edges" => TokenType::Edges,
+            "loop" => TokenType::Loop,
+            "max_rounds" => TokenType::MaxRounds,
+            "exit_when" => TokenType::ExitWhen,
+            "rounds" => TokenType::Rounds,
+            // v0.25: Eval + Skill (description/version/requires/verify/given/replay 是上下文关键字)
+            "eval" => TokenType::Eval,
+            "skill" => TokenType::Skill,
+            "expect" => TokenType::Expect,
+            "tolerance" => TokenType::Tolerance,
             _ => TokenType::Identifier(value),
         };
         Token {

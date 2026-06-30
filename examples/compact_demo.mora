@@ -1,0 +1,38 @@
+-- ============================================================
+-- v0.25: Context Compaction 示例 — 上下文压缩
+-- ============================================================
+
+task main()
+  -- 1. compact() 函数 — 文本摘要
+  print("=== compact() 函数 ===")
+  let long_text = "这是一段很长的文本。它包含了很多关于 AI Agent 架构的讨论。
+我们讨论了 Multi-Agent 协调模式、Memory 系统、Context Compaction 等话题。
+这些话题都是现代 AI Agent 系统的核心组成部分。
+其中 Context Compaction 是解决长对话 token 超限的关键技术。"
+
+  let summary = compact(long_text)
+  print(summary)
+
+  -- 2. Conversation.compact() — 对话历史压缩
+  print("\n=== Conversation 压缩 ===")
+  let conv = ai.new_conversation("gpt-4o-mini")
+  conv.chat("你好，我想讨论 AI Agent 架构")
+  conv.chat("Multi-Agent 协调有哪些模式？")
+  conv.chat("Memory 系统如何设计？")
+  conv.chat("Context Compaction 的原理是什么？")
+
+  print("压缩前消息数: " + conv.len())
+
+  let summary2 = conv.compact()
+  print("压缩摘要: " + summary2)
+  print("压缩后消息数: " + conv.len())
+
+  -- 3. with compact_at() — 自动压缩阈值
+  print("\n=== 自动压缩 ===")
+  with model("gpt-4o-mini"), compact_at(80) do
+    let response = ai.chat("请详细解释 AI Agent 的核心组件")
+    print(response.len())
+  end
+
+  print("compact demo 完成")
+end

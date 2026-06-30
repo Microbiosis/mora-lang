@@ -320,8 +320,8 @@ impl Server {
     fn check_diagnostics(&self, text: &str) -> Vec<Diagnostic> {
         use crate::typeck;
 
-        let stmts = crate::interpreter::parse_code(text);
-        let errs = typeck::check_program(&stmts);
+        let (node_ids, arena) = crate::interpreter::parse_code(text);
+        let errs = typeck::check_program(&node_ids, &arena);
         errs.into_iter()
             .map(|e| {
                 // v0.05: line/column 都是 1-based (typeck)，LSP 是 0-based

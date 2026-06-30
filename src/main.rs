@@ -5,22 +5,22 @@ use std::fs;
 use std::path::Path;
 use std::process;
 
+use mora::ast_v2::AstArena;
+use mora::ast_v2::NodeId;
 use mora::interpreter::Interpreter;
 use mora::lexer::Lexer;
 use mora::parser_v2::ParserV2;
-use mora::ast_v2_to_v1::AstV2ToV1;
 use mora::record::{self, Mode};
 use mora::typeck::{self, format_error};
 
-/// 使用 ParserV2 解析代码
-fn parse_with_v2(source: &str) -> Vec<mora::ast::Stmt> {
+/// 使用 ParserV2 解析代码，直接返回 v2 AST
+fn parse_with_v2(source: &str) -> (Vec<NodeId>, AstArena) {
     let mut lexer = Lexer::new(source);
     let tokens = lexer.scan_tokens();
     let mut parser_v2 = ParserV2::new(tokens);
     let node_ids = parser_v2.parse();
     let arena = parser_v2.into_arena();
-    let converter = AstV2ToV1::new(arena);
-    converter.convert_program(&node_ids)
+    (node_ids, arena)
 }
 
 fn main() {
@@ -30,12 +30,12 @@ fn main() {
     if args.len() >= 2 {
         match args[1].as_str() {
             "--version" | "-v" => {
-                println!("Mora v0.24");
+                println!("Mora v0.25");
                 return;
             }
             "--help" | "-h" => {
                 println!(
-                    "Mora v0.24 — record / replay / diff / list / stats / timeline / snapshot"
+                    "Mora v0.25 — record / replay / diff / list / stats / timeline / snapshot"
                 );
                 println!();
                 println!("Usage:");
@@ -338,7 +338,7 @@ fn print_banner() {
     let base_url =
         env::var("MORA_AI_BASE_URL").unwrap_or_else(|_| "https://api.openai.com/v1".to_string());
 
-    println!("Mora v0.24");
+    println!("Mora v0.25");
     if has_openai_key {
         println!("  AI: real API (endpoint: {})", base_url);
     } else {
@@ -369,11 +369,11 @@ fn update_lock(pkg_name: &str, url: &str) {
 fn run_file(path: &str) {
     let source = fs::read_to_string(path).expect("Failed to read file");
 
-    // 使用 ParserV2 解析
-    let stmts = parse_with_v2(&source);
+    // 使用 ParserV2 解析，直接走 v2 路径
+    let (node_ids, arena) = parse_with_v2(&source);
 
     // v0.13: 静态类型检查必走, 无 env skip
-    let type_errors = typeck::check_program(&stmts);
+    let type_errors = typeck::check_program(&node_ids, &arena);
     if !type_errors.is_empty() {
         for err in &type_errors {
             eprintln!("{}", format_error(err));
@@ -384,7 +384,7 @@ fn run_file(path: &str) {
     }
 
     let mut interpreter = Interpreter::new();
-    if let Err(e) = interpreter.interpret(&stmts) {
+    if let Err(e) = interpreter.interpret(&node_ids, &arena) {
         eprintln!("Runtime error: {}", e);
         process::exit(1);
     }
@@ -414,10 +414,9 @@ fn run_record(path: &str, name: &str) {
         process::exit(1);
     });
 
-    // 使用 ParserV2 解析
-    let stmts = parse_with_v2(&source);
+    let (node_ids, arena) = parse_with_v2(&source);
 
-    let type_errors = typeck::check_program(&stmts);
+    let type_errors = typeck::check_program(&node_ids, &arena);
     if !type_errors.is_empty() {
         for err in &type_errors {
             eprintln!("{}", format_error(err));
@@ -436,7 +435,7 @@ fn run_record(path: &str, name: &str) {
         }
     };
 
-    match interpreter.interpret(&stmts) {
+    match interpreter.interpret(&node_ids, &arena) {
         Ok(()) => {
             if let Err(e) = interpreter.recorder.save() {
                 eprintln!("record: save failed: {}", e);
@@ -446,7 +445,6 @@ fn run_record(path: &str, name: &str) {
             println!("✓ recorded {} events -> {}", n, rec_path.display());
         }
         Err(e) => {
-            // 即便运行报错, 仍尝试 flush 录制的事件 (debug 价值)
             let _ = interpreter.recorder.save();
             eprintln!("Runtime error during record: {}", e);
             eprintln!("(partial recording saved)");
@@ -461,10 +459,9 @@ fn run_replay(path: &str, name: &str) {
         process::exit(1);
     });
 
-    // 使用 ParserV2 解析
-    let stmts = parse_with_v2(&source);
+    let (node_ids, arena) = parse_with_v2(&source);
 
-    let type_errors = typeck::check_program(&stmts);
+    let type_errors = typeck::check_program(&node_ids, &arena);
     if !type_errors.is_empty() {
         for err in &type_errors {
             eprintln!("{}", format_error(err));
@@ -483,7 +480,7 @@ fn run_replay(path: &str, name: &str) {
         }
     };
 
-    if let Err(e) = interpreter.interpret(&stmts) {
+    if let Err(e) = interpreter.interpret(&node_ids, &arena) {
         eprintln!("Runtime error during replay: {}", e);
         process::exit(1);
     }
@@ -677,9 +674,8 @@ fn run_snapshot(file: &str, name: &str, update: bool) {
         eprintln!("snapshot: failed to read {}", file);
         process::exit(1);
     });
-    // 使用 ParserV2 解析
-    let stmts = parse_with_v2(&source);
-    let type_errors = typeck::check_program(&stmts);
+    let (node_ids, arena) = parse_with_v2(&source);
+    let type_errors = typeck::check_program(&node_ids, &arena);
     if !type_errors.is_empty() {
         for err in &type_errors {
             eprintln!("{}", format_error(err));
@@ -688,7 +684,7 @@ fn run_snapshot(file: &str, name: &str, update: bool) {
         process::exit(2);
     }
     let mut interpreter = Interpreter::new();
-    if let Err(e) = interpreter.interpret(&stmts) {
+    if let Err(e) = interpreter.interpret(&node_ids, &arena) {
         eprintln!("snapshot: runtime error: {}", e);
         process::exit(1);
     }
@@ -939,18 +935,16 @@ fn truncate(s: &str, max: usize) -> String {
 fn run_check(path: &str) {
     let source = fs::read_to_string(path).expect("Failed to read file");
 
-    // 使用 ParserV2 解析
-    let stmts = parse_with_v2(&source);
+    let (node_ids, arena) = parse_with_v2(&source);
 
-    let type_errors = typeck::check_program(&stmts);
+    let type_errors = typeck::check_program(&node_ids, &arena);
     if type_errors.is_empty() {
-        println!("No type errors found. ({} statements)", stmts.len());
+        println!("No type errors found. ({} statements)", node_ids.len());
     } else {
         for err in &type_errors {
             eprintln!("{}", format_error(err));
         }
         eprintln!("\n{} type error(s) found.", type_errors.len());
-        // v0.05: typeck 失败 exit code 2
         process::exit(2);
     }
 }

@@ -2,6 +2,73 @@
 
 All notable changes to Mora will be documented in this file.
 
+## [v0.27] - 2026-07-01
+
+### Document 统一 IR — `document.parse(...)` + 块式声明
+
+灵感来自 [opendatalab/MinerU](https://github.com/opendatalab/MinerU) middle_json 抽象。
+Mora 历史上首次支持 PDF / Markdown / HTML 文档解析,统一落到 `Value::Document` IR。
+
+#### 新增关键字
+
+```mora
+document "report" do
+    set origin: "pdf"
+    set max_pages: 3
+    read "./q3-report.pdf"
+end
+
+let doc = document.parse("./q3-report.pdf")
+let md  = doc.markdown()
+let pages = doc.pages()
+let meta = doc.metadata()
+```
+
+#### 新增内建模块 `document`
+
+| 函数 | 作用 |
+|---|---|
+| `document.parse(path)` | 解析文件,返回 `Value::Document` |
+
+#### `Document` value 的方法
+
+| 方法 | 返回 | 含义 |
+|---|---|---|
+| `doc.markdown()` | `string` | 全文档 markdown 渲染 |
+| `doc.text()` | `string` | 纯文本（去格式）|
+| `doc.pages()` | `List<Dict>` | 完整 IR Page 列表 |
+| `doc.blocks()` | `List<Dict>` | 跨页合并的 block |
+| `doc.metadata()` | `Dict` | 元信息（含 origin / pages / size）|
+| `doc.origin()` | `string` | "pdf" / "markdown" / "html" |
+
+#### 新增值类型 + Trait
+
+- `Value::Document { backend: Arc<dyn DocumentBackend + Send + Sync>, metadata: HashMap<String, Value> }`
+- `pub trait DocumentBackend: Debug + Send + Sync { fn origin / pages / markdown / text / metadata / blocks }`
+- 3 个后端实现: `PdfBackend` (lopdf + pdf-extract) / `MarkdownBackend` (pulldown-cmark) / `HtmlBackend` (quick-xml)
+
+#### 新增依赖
+
+- `lopdf` 0.41 + `pdf-extract` 0.12 (PDF)
+- `pulldown-cmark` 0.13 (Markdown)
+- `quick-xml` 0.40 (HTML)
+- 全部纯 Rust, MSRV 1.85 ✅, 无系统依赖
+
+#### 与 v0.26 组合
+
+```mora
+let doc = document.parse("./report.pdf")
+let sys = compose_prompt({role:"system", text:doc.markdown(), budget:"32 KB"})
+let resp = ai.chat(p"根据报告：{sys}\n\n问题：{question}")
+```
+
+#### 技术细节
+
+- **零系统依赖**：所有后端纯 Rust crate
+- **二进制不出 Value 树**：原始 PDF / 图片字节封在 `backend: Arc<dyn ...>` 内
+- **Lazy 后端**：访问 `.pages()` / `.markdown()` 时才构造 Value, 避免一次物化
+- **可扩展**：未来加 PPTX / DOCX 后端仅需 `impl DocumentBackend`
+
 ## [v0.26] - 2026-07-01
 
 ### Prompt Sections — 分段 + 容量预算 + 滚动窗口

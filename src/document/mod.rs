@@ -69,7 +69,7 @@ pub fn parse_document(path: &str) -> Result<Value, String> {
             let text = std::fs::read_to_string(path)
                 .map_err(|e| format!("document.parse: cannot read '{}': {}", path, e))?;
             let backend =
-                crate::document::backend::markdown::MarkdownBackend::from_str(&text);
+                crate::document::backend::markdown::MarkdownBackend::new(&text);
             let meta = backend.metadata()?;
             let mut metadata = match meta {
                 Value::Dict(m) => m,
@@ -83,7 +83,7 @@ pub fn parse_document(path: &str) -> Result<Value, String> {
         "html" | "htm" => {
             let text = std::fs::read_to_string(path)
                 .map_err(|e| format!("document.parse: cannot read '{}': {}", path, e))?;
-            let backend = crate::document::backend::html::HtmlBackend::from_str(&text);
+            let backend = crate::document::backend::html::HtmlBackend::new(&text);
             let meta = backend.metadata()?;
             let mut metadata = match meta {
                 Value::Dict(m) => m,

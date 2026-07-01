@@ -33,7 +33,7 @@ pub struct HtmlBackend {
 }
 
 impl HtmlBackend {
-    pub fn from_str(s: &str) -> Self {
+    pub fn new(s: &str) -> Self {
         let (title, author) = extract_meta(s);
         Self { source: s.to_string(), title, author }
     }
@@ -52,10 +52,10 @@ fn extract_meta(s: &str) -> (Option<String>, Option<String>) {
                 let name = String::from_utf8_lossy(e.name().as_ref()).to_string();
                 if name == "title" {
                     buf.clear();
-                    if let Ok(Event::Text(t)) = reader.read_event_into(&mut buf) {
-                        if let Ok(un) = t.decode() {
-                            title = Some(un.to_string());
-                        }
+                    if let Ok(Event::Text(t)) = reader.read_event_into(&mut buf)
+                        && let Ok(un) = t.decode()
+                    {
+                        title = Some(un.to_string());
                     }
                 } else if name == "meta" {
                     let mut aname: Option<String> = None;
@@ -133,9 +133,6 @@ impl DocumentBackend for HtmlBackend {
                     let name = String::from_utf8_lossy(e.name().as_ref()).to_string();
                     if name == "script" || name == "style" { skip_depth += 1; }
                 }
-                Ok(Event::Empty(e)) => {
-                    let name = String::from_utf8_lossy(e.name().as_ref()).to_string();
-                }
                 Ok(Event::End(e)) => {
                     let name = String::from_utf8_lossy(e.name().as_ref()).to_string();
                     if (name == "script" || name == "style") && skip_depth > 0 {
@@ -191,10 +188,10 @@ impl DocumentBackend for HtmlBackend {
                         skip_depth += 1;
                         continue;
                     }
-                    if current_kind.is_none() {
-                        if let Some(k) = tag_kind(&name) {
-                            current_kind = Some(k.to_string());
-                        }
+                    if current_kind.is_none()
+                        && let Some(k) = tag_kind(&name)
+                    {
+                        current_kind = Some(k.to_string());
                     }
                 }
                 Ok(Event::Text(t)) => {
@@ -206,7 +203,7 @@ impl DocumentBackend for HtmlBackend {
                 Ok(Event::End(e)) => {
                     let name = String::from_utf8_lossy(e.name().as_ref()).to_string();
                     if name == "script" || name == "style" {
-                        if skip_depth > 0 { skip_depth -= 1; }
+                        skip_depth = skip_depth.saturating_sub(1);
                         continue;
                     }
                     if current_kind.is_some() && is_block_tag(&name) {
@@ -243,7 +240,7 @@ mod tests {
             <script>alert(1)</script>
             <pre>code</pre></body></html>
         "#;
-        let backend = HtmlBackend::from_str(html);
+        let backend = HtmlBackend::new(html);
         assert_eq!(backend.origin(), "html");
 
         let meta = backend.metadata().unwrap();

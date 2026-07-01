@@ -148,6 +148,8 @@ impl ParserV2 {
             Some(self.span_statement())
         } else if self.match_identifier("record_tokens") {
             Some(self.record_tokens_statement())
+        } else if self.check(&TokenType::Prompt) {
+            Some(self.prompt_section_statement())
         } else if self.check_index_assignment() {
             Some(self.index_assignment())
         } else if self.check_assignment() {

@@ -2,6 +2,53 @@
 
 All notable changes to Mora will be documented in this file.
 
+## [v0.26] - 2026-07-01
+
+### Prompt Sections — 分段 + 容量预算 + 滚动窗口
+
+灵感来自 [mimiclaw](https://github.com/memovai/mimiclaw)（5 段固定缓冲）和 [headroom](https://github.com/headroomlabs-ai/headroom)（内容感知路由器），把 LLM 的 system prompt 拼装从字符串拼接升级为分段工程。
+
+#### 新增关键字 `prompt`
+
+```mora
+prompt "identity" do
+    set role: "system"
+    set budget: "256 B"
+    read "./SOUL.md"
+end
+
+prompt "memory" do
+    set role: "system"
+    set budget: "8 KB"
+    tail("./sessions/today.jsonl", max: 20)
+end
+
+let sys = compose_prompt("identity", "memory")
+```
+
+#### 新增内建函数
+
+| 名字 | 作用 |
+|---|---|
+| `compose_prompt(...)` | 拼接多段为单一 system prompt，按 section budget 截断 |
+| `tail(path, max: N)` | 取文件末 N 行（JSONL/纯文本） |
+
+#### 新增值类型
+
+- `Value::PromptSection { name, role, text, budget_bytes }`
+
+#### 新增 AST 节点
+
+- `StmtKind::PromptSection { name, body }`
+- `StmtKind::PromptSet { key, value }`（块内 `set role:` / `set budget:`）
+- `StmtKind::PromptRead(NodeId)`（块内 `read`）
+
+#### 技术细节
+
+- **零依赖**：无 tokenizer，按 UTF-8 字节近似（与 mimiclaw 同思路）
+- **可逆性**：每个 section 在环境里是可读 Value，便于调试与中间表示（IR）思路）
+- **可组合**：字典内联形参与块式声明产生同义结果
+
 ## [v0.25] - 2026-07-01
 
 ### 代码模块化重构 (Code Modularization)

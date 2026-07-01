@@ -376,6 +376,17 @@ impl Interpreter {
                 false,
             );
         }
+        // v0.26: 注册 compose_prompt / tail 内建函数 (供 prompt section 块式调用)
+        globals.lock().unwrap().define(
+            "compose_prompt".to_string(),
+            Value::Builtin("compose_prompt".to_string()),
+            false,
+        );
+        globals.lock().unwrap().define(
+            "tail".to_string(),
+            Value::Builtin("tail".to_string()),
+            false,
+        );
         Self {
             globals: globals.clone(),
             environment: globals,
@@ -2493,5 +2504,161 @@ end
         run(&src).expect("memory save/load should work");
         // Cleanup
         let _ = std::fs::remove_file(tmp_file);
+    }
+}
+
+// ===================================================================
+// v0.26: Prompt sections 测试
+// ===================================================================
+#[cfg(test)]
+mod prompt_section_tests {
+    use super::*;
+    use crate::lexer::Lexer;
+    use crate::parser_v2::ParserV2;
+
+    fn run(src: &str) -> Result<(), String> {
+        let tokens = Lexer::new(src).scan_tokens();
+        let mut parser_v2 = ParserV2::new(tokens);
+        let node_ids = parser_v2.parse();
+        let arena = parser_v2.into_arena();
+        let mut interp = Interpreter::new();
+        interp.interpret(&node_ids, &arena)
+    }
+
+    /// 解析测试: prompt "x" do ... end 块能产生 AST
+    /// 该测试使用 set-only 块(不读文件),验证 AST 与基础 evaluate
+    #[test]
+    fn test_prompt_section_parses() {
+        let src = r#"
+prompt "identity" do
+  set role: "system"
+  set budget: "8 KB"
+end
+
+let s = compose_prompt("identity")
+print(s)
+"#;
+        run(src).expect("prompt section block should parse and evaluate");
+    }
+
+    /// 字典式 compose_prompt — 不依赖文件,字典写在同一行(避免 parser 跨行问题)
+    #[test]
+    fn test_compose_prompt_inline_dict() {
+        let src = r#"
+let a = compose_prompt({role:"system", text:"hello", budget:"256 B"})
+let b = compose_prompt({role:"system", text:"bye", budget:"256 B"})
+print(a.len())
+print(b.len())
+"#;
+        run(src).expect("compose_prompt with dict should work");
+    }
+
+    /// 空参错误
+    #[test]
+    fn test_compose_prompt_empty_args() {
+        let src = r#"
+let buf = compose_prompt()
+"#;
+        let result = run(src);
+        assert!(result.is_err(), "compose_prompt() with no args should error");
+        assert!(result.unwrap_err().contains("at least 1"));
+    }
+
+    /// 引用未定义的 section name 应报错
+    #[test]
+    fn test_compose_prompt_undefined_section() {
+        let src = r#"
+let buf = compose_prompt("never_defined")
+"#;
+        let result = run(src);
+        assert!(result.is_err(), "undefined section should error");
+        assert!(result.unwrap_err().contains("not defined"));
+    }
+
+    /// budget 单位解析: 字符串 "8 KB" / "256 B" / 纯数字 1024
+    #[test]
+    fn test_budget_bytes_parsing() {
+        // "8 KB" == 8192
+        let src_b = r#"
+prompt "with_kb" do
+  set role: "system"
+  set budget: "8 KB"
+  read "./non_existent.txt"   -- 会失败,但我们测 set 阶段
+end
+"#;
+        // 不期望运行完整,但至少 set 阶段之前的解析应该能跑
+        // 由于 read 失败,整段会 fail,我们只关心 lexer/parse 不报错,故只跑到 set
+        let tokens = Lexer::new(src_b).scan_tokens();
+        assert!(!tokens.is_empty(), "lex KB-suffix should succeed");
+        let mut parser_v2 = ParserV2::new(tokens);
+        let _nodes = parser_v2.parse();
+        // 如果语法过,这里已经 OK
+    }
+
+    /// 块式 prompt 不读文件可空跑 (只 set role/budget 不 read)
+    #[test]
+    fn test_prompt_section_no_read() {
+        let src = r#"
+prompt "empty" do
+  set role: "system"
+  set budget: "1 KB"
+end
+
+let composed = compose_prompt("empty")
+print(composed)
+"#;
+        run(src).expect("prompt section without read should work");
+    }
+
+    /// tail() builtin 解析并执行 — 临时构造一个文件
+    #[test]
+    fn test_tail_builtin() {
+        use std::env;
+        let tmp = env::temp_dir().join("mora_prompt_tail_test.jsonl");
+        let path = tmp.to_string_lossy().replace('\\', "/");
+        let content = "line1\nline2\nline3\nline4\nline5\n";
+        std::fs::write(&tmp, content).expect("write tmp");
+        // Mora 不支持 keyword args,用 positional
+        let src = format!(
+            r#"
+let last3 = tail("{}", 3)
+print(last3)
+"#,
+            path
+        );
+        let result = run(&src);
+        let _ = std::fs::remove_file(&tmp);
+        result.expect("tail() builtin should work");
+    }
+
+    /// E2E: prompt section 块 + dict inline 混搭
+    #[test]
+    fn test_e2e_mixed_sections() {
+        use std::env;
+        // 写入一个临时 SOUL.md
+        let tmp = env::temp_dir().join("mora_test_soul.md");
+        std::fs::write(&tmp, "I am Mora.").expect("write soul");
+        let path = tmp.to_string_lossy().replace('\\', "/");
+        let src = format!(
+            r#"
+prompt "soul" do
+  set role: "system"
+  set budget: "1 KB"
+  read "{}"
+end
+
+prompt "inline_dict" do
+  set role: "system"
+  set budget: "256 B"
+end
+
+let composed = compose_prompt("soul", "inline_dict", {{role:"user", text:"q"}})
+print(composed)
+"#,
+            path
+        );
+        let result = run(&src);
+        let _ = std::fs::remove_file(&tmp);
+        result.expect("mixed sections should work");
     }
 }

@@ -1,0 +1,46 @@
+-- ============================================================
+-- v0.26: Prompt Sections 示例 — 分段拼装 system prompt
+-- 灵感来源: mimiclaw 的固定缓冲 + headroom 的内容感知压缩
+-- ============================================================
+
+-- 1) 块式声明三段 system prompt (可放任意顺序)
+prompt "identity" do
+    set role: "system"
+    set budget: "256 B"
+    read "./SOUL.md"
+end
+
+prompt "memory" do
+    set role: "system"
+    set budget: "8 KB"
+    tail("./sessions/today.jsonl", 20)
+end
+
+prompt "user_profile" do
+    set role: "system"
+    set budget: "4 KB"
+    read "./USER.md"
+end
+
+-- 2) 一次性把三段拼成 system prompt
+let sys = compose_prompt("identity", "memory", "user_profile")
+print("[system prompt length: " + sys.len() + " bytes]")
+print(sys)
+
+-- 3) 字典式 inline 写法 (适合 ad-hoc)
+let adhoc = compose_prompt(
+    {role:"system", text:"你是一个简洁的助手", budget:"256 B"},
+    {role:"system", text:"当前会话上下文见上", budget:"1 KB"}
+)
+print(adhoc)
+
+-- 4) 单段空 budget 测试
+prompt "tiny" do
+    set role: "system"
+    set budget: "10 B"
+    read "./SOUL.md"
+end
+let tiny_prompt = compose_prompt("tiny")
+print("[tiny truncated: " + tiny_prompt.len() + " bytes]")
+
+print("prompt_section demo 完成")

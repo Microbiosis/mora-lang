@@ -125,6 +125,14 @@ pub enum Value {
         name: String,
         params: Vec<String>,
     },
+    // v0.26: Prompt 分段 — 一段有 role / text / byte 预算的 system prompt 片段
+    // (灵感: mimiclaw 的 5 段固定缓冲 + headroom 的内容感知压缩器)
+    PromptSection {
+        name: String,
+        role: Option<String>,
+        text: Box<Value>,
+        budget_bytes: Option<usize>,
+    },
 }
 
 // 手动实现 PartialEq（Arc<Mutex<Environment>> 不支持自动派生）
@@ -138,6 +146,10 @@ impl PartialEq for Value {
             (Value::Bool(a), Value::Bool(b)) => a == b,
             (Value::List(a), Value::List(b)) => a == b,
             (Value::Dict(a), Value::Dict(b)) => a == b,
+            (
+                Value::PromptSection { name: a, role: ra, text: ta, budget_bytes: ba },
+                Value::PromptSection { name: b, role: rb, text: tb, budget_bytes: bb },
+            ) => a == b && ra == rb && ta == tb && ba == bb,
             _ => false,
         }
     }
@@ -217,6 +229,13 @@ impl std::fmt::Display for Value {
             }
             Value::Macro { name, .. } => {
                 write!(f, "<macro {}>", name)
+            }
+            Value::PromptSection { name, role, budget_bytes, .. } => {
+                write!(
+                    f,
+                    "<prompt_section name={} role={:?} budget={:?}>",
+                    name, role, budget_bytes
+                )
             }
         }
     }

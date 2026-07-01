@@ -5,3 +5,4 @@ pub mod pdf;
 pub mod markdown;
 pub mod html;
 pub mod pptx;
+pub mod docx;

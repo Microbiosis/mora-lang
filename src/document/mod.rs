@@ -94,7 +94,10 @@ pub fn parse_document(path: &str) -> Result<Value, String> {
                 .or_insert(Value::String(path.to_string()));
             Ok(make_document(std::sync::Arc::new(backend), metadata))
         }
-        other => Err(format!("document.parse: unsupported extension '.{}'", other)),
+        other => Err(format!(
+            "document.parse: unsupported extension '.{}' (this v0.28 release supports pdf, markdown, html, pptx, docx)",
+            other
+        )),
     }
 }
 
@@ -154,6 +157,17 @@ mod tests {
     fn parse_unsupported_ext_errors() {
         let r = parse_document("/tmp/x.xyz");
         assert!(r.is_err());
-        assert!(r.unwrap_err().contains("unsupported extension '.xyz'"));
+        let msg = r.unwrap_err();
+        assert!(
+            msg.contains("unsupported extension '.xyz'"),
+            "expected 'unsupported extension '.xyz'' in error, got: {}",
+            msg
+        );
+        // v0.28: error mentions the v0.28 release and the supported extensions.
+        assert!(
+            msg.contains("v0.28") && msg.contains("supports"),
+            "expected v0.28 release support list in error, got: {}",
+            msg
+        );
     }
 }

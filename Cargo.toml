@@ -43,6 +43,10 @@ ureq = "3.3"
 libc = { version = "0.2", features = ["extra_traits"] }
 # v0.22: flate2 用于录制文件压缩存储
 flate2 = "1.1"
+# v0.28: Office (PPTX/DOCX) + Image OCR backends (all pure Rust)
+undoc = { version = "0.5", default-features = false, features = ["docx", "pptx"] }
+ocrs = "0.12"
+image = { version = "0.24", default-features = false, features = ["png"] }
 # v0.27: Document 统一 IR
 # PDF 后端
 lopdf = "0.42"

@@ -388,6 +388,7 @@ fn value_to_json(v: &Value) -> JsonValue {
         Value::Atom(_) => JsonValue::String_("<atom>".to_string()),
         Value::Macro { .. } => JsonValue::String_("<macro>".to_string()),
         Value::PromptSection { .. } => JsonValue::String_("<prompt_section>".to_string()),
+        Value::Document { .. } => JsonValue::String_("<document>".to_string()),
     }
 }
 

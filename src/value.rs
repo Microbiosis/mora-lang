@@ -133,6 +133,12 @@ pub enum Value {
         text: Box<Value>,
         budget_bytes: Option<usize>,
     },
+    // v0.27: Document 统一 IR — 封装一个 Arc<dyn DocumentBackend>，
+    // 二进制原始字节永不出现在 Value 树中
+    Document {
+        backend: std::sync::Arc<dyn crate::document::DocumentBackend>,
+        metadata: std::collections::HashMap<String, Value>,
+    },
 }
 
 // 手动实现 PartialEq（Arc<Mutex<Environment>> 不支持自动派生）
@@ -150,6 +156,10 @@ impl PartialEq for Value {
                 Value::PromptSection { name: a, role: ra, text: ta, budget_bytes: ba },
                 Value::PromptSection { name: b, role: rb, text: tb, budget_bytes: bb },
             ) => a == b && ra == rb && ta == tb && ba == bb,
+            (
+                Value::Document { metadata: a, .. },
+                Value::Document { metadata: b, .. },
+            ) => a == b,
             _ => false,
         }
     }
@@ -237,6 +247,12 @@ impl std::fmt::Display for Value {
                     name, role, budget_bytes
                 )
             }
+            Value::Document { backend, metadata } => write!(
+                f,
+                "<document origin={} meta_keys={}>",
+                backend.origin(),
+                metadata.len()
+            ),
         }
     }
 }

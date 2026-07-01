@@ -6,6 +6,7 @@
 pub mod ai_infra;
 pub mod ast_v2;
 pub mod common;
+pub mod document;
 pub mod flow;
 pub mod http_server;
 pub mod interpreter;

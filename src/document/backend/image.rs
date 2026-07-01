@@ -257,6 +257,7 @@ mod tests {
     /// used elsewhere in this file so the test can run against a tree
     /// that doesn't include the fixtures dir).
     #[test]
+    #[ignore = "v0.28 OCR e2e requires MORA_OCR_MODELS_DIR pointing at the v0.28 vendored models; v0.30 will add CI support for OCR e2e"]
     fn parses_real_png() {
         let path = format!(
             "{}/tests/fixtures/sample.png",

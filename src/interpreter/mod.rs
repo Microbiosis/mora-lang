@@ -3021,4 +3021,49 @@ let result = compact("text")
         // 旧 compact 已重命名, 应报错 (Undefined function: compact)
         assert!(run(src).is_err());
     }
+
+    #[test]
+    fn test_compact_builtin_removed() {
+        // T17: v0.25 compact() 应不再存在 (重命名为 compress)
+        let src = r#"
+            let result = compact("test")
+        "#;
+        let result = run(src);
+        assert!(result.is_err(), "v0.25 compact() should be removed in v0.29");
+        let err = result.unwrap_err();
+        assert!(err.contains("Undefined function") || err.contains("compact"),
+                "error should mention compact being undefined, got: {}", err);
+    }
+
+    #[test]
+    fn test_compress_unknown_strategy_errors() {
+        // T18: 未知 strategy 应报错
+        let src = r#"
+            let result = compress("hello", "totally_invalid_strategy")
+        "#;
+        assert!(run(src).is_err());
+    }
+
+    #[test]
+    fn test_crush_json_non_list_errors() {
+        // T19: 非 List 输入应报错
+        let src = r#"
+            let result = crush_json(42, 10)
+        "#;
+        let result = run(src);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.contains("crush_json:"));
+    }
+
+    #[test]
+    fn test_v0_27_document_parse_still_works() {
+        // T20: 不破坏 v0.27 document.parse 路径
+        let src = r#"
+            let doc = document.parse("./tests/fixtures/sample.md")
+            let meta = doc.metadata()
+            print(meta["origin"])
+        "#;
+        run(src).expect("v0.27 document.parse must still work");
+    }
 }

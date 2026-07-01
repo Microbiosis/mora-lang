@@ -2,6 +2,70 @@
 
 All notable changes to Mora will be documented in this file.
 
+## [v0.29] - 2026-07-01
+
+### compress + crush_json + OCR .rten 迁移
+
+灵感来自 [headroom](https://github.com/headroomlabs-ai/headroom) ContentRouter + Kneedle 设计。
+Mora 历史上首次支持结构化 JSON 列表压缩 + 多策略 system prompt 压缩。
+
+#### 新增关键字 / builtin
+
+```mora
+-- 6 路策略 (auto / head_tail / summary / lossless / json / code-html-log-text)
+let summary = compress(text, "summary")                       -- LLM 摘要
+let head    = compress(text, "head_tail", head_pct: 0.3)     -- 保留首尾
+let lossless = compress(text, "lossless")                     -- 加 size marker
+let auto    = compress(text, "auto")                          -- 内容路由
+
+-- 结构化 JSON 列表压缩 (Kneedle + 异常保留)
+let crushed = crush_json(big_list, max: 10)
+let crushed = crush_json(big_list, max: 10, anomaly_keys: ["error"])
+
+-- 方法链
+let summary = conv.compress("summary")
+let crushed = list.crush_json(10)
+```
+
+#### 新增模块 `compress`
+
+| 名称 | 作用 |
+|---|---|
+| `SubCompressor` trait | `sniff` / `compress` / `origin` 3 方法 |
+| `ContentRouter` | 嗅探 → 选最佳子压缩器 |
+| `JsonSubCompressor` | 委托 crush_json_core |
+| `CodeSubCompressor` | regex 保留签名 + 截断 body |
+| `HtmlSubCompressor` | 复用 v0.27 quick-xml 切块 |
+| `LogSubCompressor` | 行 pattern cluster |
+| `TextSubCompressor` | head_tail / summary / lossless 调度 |
+
+#### ⚠️ BREAKING: `compact` 重命名为 `compress`
+
+v0.25 的 `compact(text)` builtin 已重命名为 `compress(text, "summary")`。
+`examples/compact_demo.mora` 同步改写为 v0.29 风格。
+
+#### OCR `.rten` 模型迁移 (解决 v0.28 tech-debt)
+
+- v0.28 vendored 的 11.7 MB `.rten` 模型已从仓库删除
+- 模型现在从 `~/.local/share/mora/ocr/` 加载 (可用 `MORA_OCR_MODELS_DIR` 覆盖)
+- 新增 `docs/install-ocr.md` 说明下载与安装步骤
+- 新增 `.git/sdd/ocrs-shasums.txt` 作为 reference checksum
+- **BREAKING**: 首次 OCR 调用前需 `mora-install-ocr` 下载模型
+
+#### 新增文件
+
+- `src/compress/{mod,json,code,html,log,text}.rs` (~1000 行)
+- `docs/install-ocr.md`
+- `.git/sdd/ocrs-shasums.txt`
+- `examples/compress_demo.mora` (新)
+
+#### 技术细节
+
+- **零新外部依赖** — 用 v0.27 / v0.28 已有 deps (`regex` transitive from `ocrs`)
+- **字节近似** — 与 v0.26 / v0.27 / v0.28 一致
+- **CodeSubCompressor 纯 regex** — v0.30+ 引入 tree-sitter
+- **错误前缀** `compress.` / `crush_json.` / `ocr.load.`
+
 ## [v0.28] - 2026-07-01
 
 ### Office (PPTX/DOCX) + Image OCR Backends

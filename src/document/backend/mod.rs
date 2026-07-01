@@ -2,5 +2,5 @@
 //! Populated in Tasks 5–7.
 
 pub mod pdf;
-// pub mod markdown; // Task 6
+pub mod markdown;
 // pub mod html;     // Task 7

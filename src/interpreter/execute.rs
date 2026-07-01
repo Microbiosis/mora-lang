@@ -925,7 +925,7 @@ impl Interpreter {
             }
         }
         let path_str = path.ok_or_else(|| {
-            format!("document section '{}': missing 'read <path>' statement", name)
+            format!("document.section {}: missing 'read <path>' statement", name)
         })?;
         let ext = std::path::Path::new(&path_str)
             .extension()
@@ -938,7 +938,7 @@ impl Interpreter {
             "html" | "htm" => "html",
             _ => {
                 return Err(format!(
-                    "document section '{}': unsupported extension '.{}'",
+                    "document.section {}: unsupported extension '.{}'",
                     name, ext
                 ));
             }
@@ -950,7 +950,7 @@ impl Interpreter {
             && backend.origin() != final_origin
         {
             return Err(format!(
-                "document section '{}': origin mismatch (declared '{}' but file is '.{}')",
+                "document.section {}: origin mismatch (declared '{}' but file is '.{}')",
                 name, final_origin, ext
             ));
         }

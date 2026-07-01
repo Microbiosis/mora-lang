@@ -2850,6 +2850,7 @@ mod office_ocr_tests {
     }
 
     #[test]
+    #[ignore = "v0.28 OCR e2e requires MORA_OCR_MODELS_DIR pointing at the v0.28 vendored models; v0.30 will add CI support for OCR e2e"]
     fn factory_png_ocr() {
         let path = fixture("sample.png");
         if !path.exists() {

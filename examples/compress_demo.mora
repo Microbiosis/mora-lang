@@ -1,0 +1,25 @@
+-- ============================================================
+-- v0.29: compress + crush_json 完整演示
+-- ============================================================
+-- 注: 此示例仅演示纯文本 (compress text 三种策略).
+-- crush_json 的 List-of-Dict 输入形式在 unit tests 覆盖
+-- (src/interpreter/mod.rs::compress_tests 6 tests + src/compress/json.rs).
+-- 详见 docs/superpowers/specs/2026-07-01-v0.29-compress-crush-design.md
+
+task main()
+    let text = "Line 1: hello\nLine 2: world\nLine 3: foo\nLine 4: bar\nLine 5: baz\n"
+
+    -- 1. compress(text, "summary") -- LLM 摘要 (mock 模式)
+    print("=== compress summary ===")
+    print(compress(text, "summary"))
+
+    -- 2. compress(text, "head_tail") -- 保留首尾
+    print("\n=== compress head_tail ===")
+    print(compress(text, "head_tail", head_pct: 0.4, tail_pct: 0.4))
+
+    -- 3. compress(text, "lossless")
+    print("\n=== compress lossless ===")
+    print(compress(text, "lossless"))
+
+    print("\ncompress_demo done")
+end

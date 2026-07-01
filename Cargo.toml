@@ -46,6 +46,17 @@ flate2 = "1.1"
 # v0.28: Office (PPTX/DOCX) + Image OCR backends (all pure Rust)
 undoc = { version = "0.5", default-features = false, features = ["docx", "pptx"] }
 ocrs = "0.12"
+# v0.28 Task 6: ocrs does not re-export `rten`, but `OcrEngine::new` requires
+# pre-loaded `rten::Model` instances for the detection + recognition models.
+# We pull rten directly so we can call `rten::Model::load_static_slice` on
+# the `.rten` model files we vendor in `tests/fixtures/`. Pinned to match
+# the version of rten that ocrs 0.12.2 already pulls in transitively.
+rten = "0.24"
+# v0.28 Task 6: ocrs's public API returns `anyhow::Result<T>` everywhere,
+# but ocrs does not re-export `anyhow` itself — so we depend on it directly
+# to spell out the `OnceLock<anyhow::Result<OcrEngine>>` type and to
+# construct an `anyhow::Result` in `get_or_init`.
+anyhow = "1"
 image = { version = "0.24", default-features = false, features = ["png"] }
 # v0.27: Document 统一 IR
 # PDF 后端

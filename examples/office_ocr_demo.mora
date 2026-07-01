@@ -1,0 +1,54 @@
+-- ============================================================
+-- v0.28: Office (PPTX / DOCX) + Image OCR Demo
+-- ============================================================
+--
+-- 演示 v0.28 新增的三种 backend:
+--   PptxBackend  (via undoc 0.5.2)
+--   DocxBackend  (via docx-rs)
+--   ImageBackend (via ocrs + image, full OCR pipeline)
+--
+-- 所有 fixture 都在 tests/fixtures/ 下;运行前先确认 cwd 在仓库根目录。
+
+-- 1) PPTX
+let deck = document.parse("./tests/fixtures/sample.pptx")
+print("[pptx origin] " + deck.metadata()["origin"])
+print("[pptx slides] " + deck.metadata()["pages"])
+print("[pptx markdown length] " + deck.markdown().len())
+print("[pptx text length] " + deck.text().len())
+print("[pptx markdown head]")
+print(deck.markdown())
+
+-- 2) DOCX
+let doc = document.parse("./tests/fixtures/sample.docx")
+print("[docx origin] " + doc.metadata()["origin"])
+print("[docx pages] " + doc.metadata()["pages"])
+print("[docx markdown length] " + doc.markdown().len())
+print("[docx text length] " + doc.text().len())
+print("[docx text head]")
+print(doc.text())
+
+-- 3) Image OCR
+let scan = document.parse("./tests/fixtures/sample.png")
+print("[image origin] " + scan.metadata()["origin"])
+print("[image width x height] " + scan.metadata()["width"] + " x " + scan.metadata()["height"])
+print("[image ocr_engine] " + scan.metadata()["ocr_engine"])
+print("[image format] " + scan.metadata()["format"])
+print("[image ocr text lines] " + scan.text().len())
+
+-- 4) Block form (兼容 v0.27 framework)
+-- 注意: block form 只识别 pdf/md/markdown/html/htm 这几个扩展名,
+--       pptx/docx/png 必须用 document.parse(path) 走工厂。
+document "report" do
+    set origin: "markdown"
+    read "./tests/fixtures/sample.md"
+end
+print("[block: report origin] " + report.metadata()["origin"])
+print("[block: report text length] " + report.text().len())
+print("[block: report text head]")
+print(report.text())
+
+-- 5) 跟 v0.26 compose_prompt 组合: 用 docx 的文本做 system prompt
+let sys = compose_prompt({role:"system", text:doc.text(), budget:"32 KB"})
+print("[combined system prompt bytes] " + sys.len())
+
+print("office_ocr demo 完成")

@@ -40,3 +40,53 @@ pub fn make_document(
 ) -> Value {
     Value::Document { backend, metadata }
 }
+
+/// v0.27: 解析文件路径,根据扩展名分发到对应 backend。
+/// Tasks 5–7 会分别实现 PdfBackend / MarkdownBackend / HtmlBackend。
+pub fn parse_document(path: &str) -> Result<Value, String> {
+    use std::path::Path;
+    let ext = Path::new(path)
+        .extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+    match ext.as_str() {
+        "pdf" => Err("document.parse: PdfBackend not yet implemented (Task 5)".into()),
+        "md" | "markdown" => Err("document.parse: MarkdownBackend not yet implemented (Task 6)".into()),
+        "html" | "htm" => Err("document.parse: HtmlBackend not yet implemented (Task 7)".into()),
+        other => Err(format!("document.parse: unsupported extension '.{}'", other)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_pdf_yields_not_yet_implemented_error() {
+        let r = parse_document("/tmp/x.pdf");
+        assert!(r.is_err());
+        assert!(r.unwrap_err().contains("PdfBackend not yet implemented"));
+    }
+
+    #[test]
+    fn parse_md_yields_not_yet_implemented_error() {
+        let r = parse_document("/tmp/x.md");
+        assert!(r.is_err());
+        assert!(r.unwrap_err().contains("MarkdownBackend not yet implemented"));
+    }
+
+    #[test]
+    fn parse_html_yields_not_yet_implemented_error() {
+        let r = parse_document("/tmp/x.html");
+        assert!(r.is_err());
+        assert!(r.unwrap_err().contains("HtmlBackend not yet implemented"));
+    }
+
+    #[test]
+    fn parse_unsupported_ext_errors() {
+        let r = parse_document("/tmp/x.xyz");
+        assert!(r.is_err());
+        assert!(r.unwrap_err().contains("unsupported extension '.xyz'"));
+    }
+}

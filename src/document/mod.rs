@@ -94,8 +94,53 @@ pub fn parse_document(path: &str) -> Result<Value, String> {
                 .or_insert(Value::String(path.to_string()));
             Ok(make_document(std::sync::Arc::new(backend), metadata))
         }
+        "pptx" => {
+            let bytes = std::fs::read(path)
+                .map_err(|e| format!("document.parse: cannot read '{}': {}", path, e))?;
+            let backend = crate::document::backend::pptx::PptxBackend::from_bytes(bytes)?;
+            let meta = backend.metadata()?;
+            let mut metadata = match meta {
+                Value::Dict(m) => m,
+                _ => HashMap::new(),
+            };
+            metadata
+                .entry("path".to_string())
+                .or_insert(Value::String(path.to_string()));
+            Ok(make_document(std::sync::Arc::new(backend), metadata))
+        }
+        "docx" => {
+            let bytes = std::fs::read(path)
+                .map_err(|e| format!("document.parse: cannot read '{}': {}", path, e))?;
+            let backend = crate::document::backend::docx::DocxBackend::from_bytes(bytes)?;
+            let meta = backend.metadata()?;
+            let mut metadata = match meta {
+                Value::Dict(m) => m,
+                _ => HashMap::new(),
+            };
+            metadata
+                .entry("path".to_string())
+                .or_insert(Value::String(path.to_string()));
+            Ok(make_document(std::sync::Arc::new(backend), metadata))
+        }
+        "png" => {
+            let bytes = std::fs::read(path)
+                .map_err(|e| format!("document.parse: cannot read '{}': {}", path, e))?;
+            let backend = crate::document::backend::image::ImageBackend::from_bytes(
+                bytes,
+                "png".into(),
+            )?;
+            let meta = backend.metadata()?;
+            let mut metadata = match meta {
+                Value::Dict(m) => m,
+                _ => HashMap::new(),
+            };
+            metadata
+                .entry("path".to_string())
+                .or_insert(Value::String(path.to_string()));
+            Ok(make_document(std::sync::Arc::new(backend), metadata))
+        }
         other => Err(format!(
-            "document.parse: unsupported extension '.{}' (this v0.28 release supports pdf, markdown, html, pptx, docx)",
+            "document.parse: unsupported extension '.{}' (this v0.28 release supports pdf, md, markdown, html, htm, pptx, docx, png)",
             other
         )),
     }

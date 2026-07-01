@@ -2783,3 +2783,92 @@ print(report.markdown())
         r.expect("document block end-to-end");
     }
 }
+
+// v0.28 Task 7: end-to-end tests for the new pptx/docx/png backends wired
+// into the `document.parse` factory. These verify the factory arm dispatch
+// (not just the backend unit tests) and exercise cross-feature composition
+// (document.parse + compose_prompt) per the v0.26 + v0.27 + v0.28 interop goal.
+#[cfg(test)]
+mod office_ocr_tests {
+    use super::*;
+    use crate::lexer::Lexer;
+    use crate::parser_v2::ParserV2;
+    use std::path::PathBuf;
+
+    fn fixture(name: &str) -> PathBuf {
+        let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        p.push("tests/fixtures");
+        p.push(name);
+        p
+    }
+
+    fn run(src: &str) -> Result<(), String> {
+        let tokens = Lexer::new(src).scan_tokens();
+        let mut parser_v2 = ParserV2::new(tokens);
+        let node_ids = parser_v2.parse();
+        let arena = parser_v2.into_arena();
+        let mut interp = Interpreter::new();
+        interp.interpret(&node_ids, &arena)
+    }
+
+    #[test]
+    fn factory_pptx() {
+        let path = fixture("sample.pptx");
+        if !path.exists() {
+            return;
+        }
+        let src = format!(
+            "let d = document.parse(\"{}\")\nprint(d.markdown())",
+            path.to_string_lossy().replace('\\', "/")
+        );
+        run(&src).expect("pptx parse end-to-end");
+    }
+
+    #[test]
+    fn factory_docx() {
+        let path = fixture("sample.docx");
+        if !path.exists() {
+            return;
+        }
+        let src = format!(
+            "let d = document.parse(\"{}\")\nprint(d.text())",
+            path.to_string_lossy().replace('\\', "/")
+        );
+        run(&src).expect("docx parse end-to-end");
+    }
+
+    #[test]
+    fn factory_png_ocr() {
+        let path = fixture("sample.png");
+        if !path.exists() {
+            return;
+        }
+        let src = format!(
+            "let d = document.parse(\"{}\")\nprint(d.metadata()[\"ocr_engine\"])",
+            path.to_string_lossy().replace('\\', "/")
+        );
+        run(&src).expect("png parse end-to-end");
+    }
+
+    #[test]
+    fn factory_unsupported_xls() {
+        let src = r#"let d = document.parse("foo.xls")"#;
+        let r = run(src);
+        assert!(r.is_err());
+        assert!(r.unwrap_err().contains("unsupported extension '.xls'"));
+    }
+
+    #[test]
+    fn compose_prompt_with_pptx_text() {
+        // v0.26 + v0.27 + v0.28 interop
+        let path = fixture("sample.pptx");
+        if !path.exists() {
+            return;
+        }
+        let src = format!(
+            "let d = document.parse(\"{}\")\nlet sys = compose_prompt({{role:\"system\", text:d.text(), budget:\"32 KB\"}})\nprint(sys.len())",
+            path.to_string_lossy().replace('\\', "/")
+        );
+        run(&src).expect("compose_prompt with pptx text");
+    }
+}

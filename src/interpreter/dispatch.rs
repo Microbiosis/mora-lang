@@ -159,39 +159,66 @@ impl Interpreter {
                     methods.into_iter().map(Value::String).collect(),
                 ))
             }
-            // v0.25: compact(text) -> string 上下文压缩（AI 摘要）
-            "compact" => {
-                let text = args
-                    .first()
-                    .map(|v| v.to_string())
-                    .ok_or("compact() requires 1 argument")?;
-                if text.is_empty() {
-                    return Ok(Value::String(String::new()));
-                }
-                let api_key = env::var("OPENAI_API_KEY").unwrap_or_default();
-                let base_url = env::var("MORA_AI_BASE_URL")
-                    .unwrap_or_else(|_| "https://api.openai.com/v1".to_string());
-                let model = self
-                    .current_ai_config
-                    .as_ref()
-                    .and_then(|c| c.model.clone())
-                    .unwrap_or_else(|| "gpt-4o-mini".to_string());
-                if api_key.is_empty() {
-                    // Mock 模式：简单截断
-                    let max_len = 200;
-                    if text.len() <= max_len {
-                        Ok(Value::String(text))
-                    } else {
-                        Ok(Value::String(format!("{}...", &text[..max_len])))
-                    }
-                } else {
-                    let prompt = format!(
-                        "Summarize the following text concisely, preserving key information:\n{}",
-                        text
+            // v0.29: compress(input, strategy, options?) -> string 6 路策略压缩
+            "compress" => {
+                if args.len() < 2 {
+                    return Err(
+                        "compress() requires 2 arguments: input and strategy".to_string()
                     );
-                    let messages = vec![("user".to_string(), prompt)];
-                    self.real_ai_chat(&messages, &api_key, &model, &base_url)
                 }
+                let strategy = match &args[1] {
+                    Value::String(s) => s.clone(),
+                    other => {
+                        return Err(format!(
+                            "compress: strategy must be a string, got {:?}",
+                            other
+                        ))
+                    }
+                };
+                let options_val = args
+                    .get(2)
+                    .cloned()
+                    .unwrap_or(Value::Dict(Default::default()));
+                let opts_base = crate::compress::options_from_value(&options_val)?;
+                let opts = crate::compress::CompressOptions {
+                    strategy: strategy.clone(),
+                    ..opts_base
+                };
+                crate::compress::compress_top(&args[0], &strategy, &opts)
+            }
+            // v0.29: crush_json(input, max, options?) -> string Kneedle + 异常保留
+            "crush_json" => {
+                if args.len() < 2 {
+                    return Err(
+                        "crush_json() requires 2 arguments: input and max".to_string()
+                    );
+                }
+                let max_items = match &args[1] {
+                    Value::Number(n) => {
+                        if *n < 0.0 {
+                            return Err("crush_json: max must be non-negative".to_string());
+                        }
+                        *n as usize
+                    }
+                    other => {
+                        return Err(format!(
+                            "crush_json: max must be a number, got {:?}",
+                            other
+                        ))
+                    }
+                };
+                let options_val = args
+                    .get(2)
+                    .cloned()
+                    .unwrap_or(Value::Dict(Default::default()));
+                let opts = crate::compress::options_from_value(&options_val)?;
+                let v = crate::compress::crush_json_core(&args[0], max_items, &opts.anomaly_keys)?;
+                let json = crate::compress::value_to_json_simple(&v);
+                let item_count = if let Value::List(l) = &v { l.len() } else { 0 };
+                Ok(Value::String(format!(
+                    "{}\n<compressed:method=crush_json items={} max={}>",
+                    json, item_count, max_items
+                )))
             }
             // v0.24: batch_chat(prompts) -> list<string> 批量 AI 调用
             "batch_chat" => {
@@ -421,6 +448,32 @@ impl Interpreter {
         match object {
             Value::List(list) => {
                 match method {
+                    // v0.29: List.crush_json(max) -> string Kneedle + 异常保留
+                    "crush_json" => {
+                        let max = args
+                            .first()
+                            .and_then(|v| match v {
+                                Value::Number(n) => {
+                                    if *n < 0.0 {
+                                        None
+                                    } else {
+                                        Some(*n as usize)
+                                    }
+                                }
+                                _ => None,
+                            })
+                            .ok_or_else(|| "List.crush_json: requires max as number".to_string())?;
+                        let opts = crate::compress::CompressOptions::default();
+                        let input_val = Value::List(list.clone());
+                        let v =
+                            crate::compress::crush_json_core(&input_val, max, &opts.anomaly_keys)?;
+                        let json = crate::compress::value_to_json_simple(&v);
+                        let item_count = if let Value::List(l) = &v { l.len() } else { 0 };
+                        Ok(Value::String(format!(
+                            "{}\n<compressed:method=crush_json items={} max={}>",
+                            json, item_count, max
+                        )))
+                    }
                     "push" => {
                         let item = args.first().cloned().unwrap_or(Value::Nil);
                         let mut new_list = list.clone();
@@ -780,52 +833,21 @@ impl Interpreter {
                     }
                     "model" => Ok(Value::String(model.clone())),
                     "len" => Ok(Value::Number(messages.len() as f64)),
-                    "compact" => {
-                        // v0.25: 上下文压缩 — 保留最近 50% 消息，旧消息合并为摘要
-                        if messages.len() <= 2 {
-                            return Ok(Value::String("No messages to compact".to_string()));
-                        }
-                        let keep_count = (messages.len() / 2).max(2);
-                        let old_messages: Vec<(String, String)> =
-                            messages[..messages.len() - keep_count].to_vec();
-                        let recent_messages: Vec<(String, String)> =
-                            messages[messages.len() - keep_count..].to_vec();
-
-                        // 构建摘要 prompt
-                        let old_text: String = old_messages
-                            .iter()
-                            .map(|(r, c)| format!("{}: {}", r, c))
-                            .collect::<Vec<_>>()
-                            .join("\n");
-                        let summary_prompt = format!(
-                            "Summarize the following conversation in 2-3 sentences:\n{}",
-                            old_text
-                        );
-
-                        // 调用 AI 生成摘要
-                        let api_key = env::var("OPENAI_API_KEY").unwrap_or_default();
-                        let base_url = env::var("MORA_AI_BASE_URL")
-                            .unwrap_or_else(|_| "https://api.openai.com/v1".to_string());
-                        let summary = if api_key.is_empty() {
-                            format!("[Summary of {} messages]", old_messages.len())
-                        } else {
-                            let summary_messages = vec![("user".to_string(), summary_prompt)];
-                            self.real_ai_chat(&summary_messages, &api_key, model, &base_url)
-                                .unwrap_or_else(|_| {
-                                    Value::String(format!(
-                                        "[Summary of {} messages]",
-                                        old_messages.len()
-                                    ))
-                                })
-                                .to_string()
+                    // v0.29: Conversation.compact() 已重命名为 compress(strategy?) — 见下方 "compress" arm
+                    // v0.29: Conversation.compress(strategy?) -> string
+                    "compress" => {
+                        let strategy = args
+                            .first()
+                            .and_then(|v| match v {
+                                Value::String(s) => Some(s.clone()),
+                                _ => None,
+                            })
+                            .unwrap_or_else(|| "summary".to_string());
+                        let opts = crate::compress::CompressOptions {
+                            strategy: strategy.clone(),
+                            ..Default::default()
                         };
-
-                        // 替换消息历史
-                        messages.clear();
-                        messages.push(("system".to_string(), format!("Previous context: {}", summary)));
-                        messages.extend(recent_messages);
-
-                        Ok(Value::String(summary))
+                        crate::compress::compress_top(&object, &strategy, &opts)
                     }
                     _ => Err(format!("Conversation has no method: {}", method)),
                 }

@@ -45,7 +45,7 @@ libc = { version = "0.2", features = ["extra_traits"] }
 flate2 = "1.1"
 # v0.27: Document 统一 IR
 # PDF 后端
-lopdf = "0.41"
+lopdf = "0.42"
 pdf-extract = "0.12"
 # Markdown 后端
 pulldown-cmark = "0.13"

@@ -532,9 +532,9 @@ checksum = "953f07c43838f8e6f9758cab68bf5bed85465e7587ebe0b823f1bcd81978ad3a"
 
 [[package]]
 name = "lopdf"
-version = "0.41.0"
+version = "0.42.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "67513274c50a2b51e5f75d9e682fcf4ab064a8a9c9ae2c3c59309084882bb24d"
+checksum = "25aab26d99567469098e64a02f42679f8965c6401263eefa31d8f2dcc37a221c"
 dependencies = [
  "aes",
  "bitflags 2.13.0",
@@ -557,33 +557,6 @@ dependencies = [
  "stringprep",
  "thiserror",
  "time",
- "ttf-parser",
- "weezl",
-]
-
-[[package]]
-name = "lopdf"
-version = "0.42.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "25aab26d99567469098e64a02f42679f8965c6401263eefa31d8f2dcc37a221c"
-dependencies = [
- "aes",
- "bitflags 2.13.0",
- "cbc",
- "ecb",
- "encoding_rs",
- "flate2",
- "getrandom 0.4.3",
- "indexmap",
- "itoa",
- "log",
- "md-5",
- "nom",
- "rand",
- "rangemap",
- "sha2",
- "stringprep",
- "thiserror",
  "ttf-parser",
  "weezl",
 ]
@@ -620,7 +593,7 @@ version = "0.0.26"
 dependencies = [
  "flate2",
  "libc",
- "lopdf 0.41.0",
+ "lopdf",
  "pdf-extract",
  "pulldown-cmark",
  "quick-xml",
@@ -668,7 +641,7 @@ dependencies = [
  "encoding_rs",
  "euclid",
  "log",
- "lopdf 0.42.0",
+ "lopdf",
  "postscript",
  "type1-encoding-parser",
  "unicode-normalization",

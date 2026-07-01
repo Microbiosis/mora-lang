@@ -1577,4 +1577,56 @@ impl ParserV2 {
         let span = self.arena.get_expr(expr_id).map(|e| e.span).unwrap_or(_span);
         self.arena.alloc_stmt(StmtKind::Expr(expr_id), span)
     }
+
+    /// v0.27: `document "name" do ... end` — 块语句入口
+    /// MVP: 先把 do ... end 块解析掉,块内内容稍后任务再处理
+    pub(super) fn document_section_statement(&mut self) -> NodeId {
+        let span = self.span_of_current();
+        self.advance(); // consume 'document'
+        // section name 必须是字符串字面量
+        let name = match self.peek().cloned() {
+            Some(Token {
+                token_type: TokenType::String(s),
+                ..
+            }) => {
+                self.advance();
+                s
+            }
+            _ => {
+                eprintln!(
+                    "Parse error: Expected string section name after 'document' at line {}",
+                    span.line
+                );
+                String::new()
+            }
+        };
+        self.consume(&TokenType::Do, "Expected 'do' after document section name");
+        while self.check(&TokenType::Newline) {
+            self.advance();
+        }
+        // MVP: 暂跳过整个 body 直到 'end' (Task 9 再实现子语句)
+        let mut depth = 1;
+        while !self.is_at_end() && depth > 0 {
+            if self.check(&TokenType::Do) {
+                depth += 1;
+                self.advance();
+                continue;
+            }
+            if self.check(&TokenType::End) {
+                depth -= 1;
+                if depth == 0 {
+                    break;
+                }
+            }
+            self.advance();
+        }
+        self.consume(&TokenType::End, "Expected 'end' to close document section");
+        // 注: name 字段暂不存,MVP 阶段只验证语法可解析
+        let _ = name;
+        let kind = StmtKind::Expr(self.arena.alloc_expr(
+            crate::ast_v2::ExprKind::Literal(crate::common::Literal::Nil(span)),
+            span,
+        ));
+        self.arena.alloc_stmt(kind, span)
+    }
 }

@@ -2662,3 +2662,27 @@ print(composed)
         result.expect("mixed sections should work");
     }
 }
+
+#[cfg(test)]
+mod document_parser_tests {
+    use crate::lexer::Lexer;
+    use crate::parser_v2::ParserV2;
+
+    fn parse(src: &str) -> usize {
+        let tokens = Lexer::new(src).scan_tokens();
+        let mut parser_v2 = ParserV2::new(tokens);
+        parser_v2.parse().len()
+    }
+
+    #[test]
+    fn test_document_block_parses() {
+        // MVP: 块能解析即可
+        let src = r#"
+document "report" do
+  -- placeholder
+end
+"#;
+        let n = parse(src);
+        assert!(n >= 1, "document block should produce >= 1 top-level statement");
+    }
+}

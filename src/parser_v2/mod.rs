@@ -150,6 +150,8 @@ impl ParserV2 {
             Some(self.record_tokens_statement())
         } else if self.check(&TokenType::Prompt) {
             Some(self.prompt_section_statement())
+        } else if self.check(&TokenType::Document) {
+            Some(self.document_section_statement())
         } else if self.check_index_assignment() {
             Some(self.index_assignment())
         } else if self.check_assignment() {

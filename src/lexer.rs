@@ -67,6 +67,8 @@ pub enum TokenType {
     // v0.26: prompt section 块 — 用于声明一段 system prompt 分段
     // 注意：与 p"..." 模板字符串(prompt_string)互不干扰,后者必须在 'p"' 双字符触发
     Prompt,
+    // v0.27: Document 块（与 prompt 块语义类似）
+    Document,
     // 注意: HTTP 方法 (GET/POST/PUT/DELETE/PATCH) 不作关键字
     // —— 保持 Identifier,显式 API Router.route() 按字符串匹配
     Identifier(String),
@@ -733,6 +735,8 @@ impl Lexer {
             "tolerance" => TokenType::Tolerance,
             // v0.26: prompt 块语句（与 p"..." 模板字符串互不干扰）
             "prompt" => TokenType::Prompt,
+            // v0.27: document 块语句（与 prompt "x" do end 同款）
+            "document" => TokenType::Document,
             _ => TokenType::Identifier(value),
         };
         Token {

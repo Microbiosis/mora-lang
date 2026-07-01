@@ -138,6 +138,13 @@ impl Interpreter {
             StmtKind::PromptRead(path_id) => {
                 self.execute_prompt_read(*path_id, arena)
             }
+            StmtKind::DocumentSection { name, body } => {
+                self.execute_document_section(name, body, arena)
+            }
+            StmtKind::DocumentSet { .. } | StmtKind::DocumentRead(_) => {
+                // Already consumed by execute_document_section; unreachable
+                Ok(FlowSignal::None)
+            }
             _ => Err(format!("Unsupported v2 statement: {:?}", stmt_kind)),
         }
     }
@@ -870,6 +877,87 @@ impl Interpreter {
         _arena: &AstArena,
     ) -> Result<FlowSignal, String> {
         // 同上: 块内 PromptRead 已由 execute_prompt_section 消费
+        Ok(FlowSignal::None)
+    }
+
+    // ===================================================================
+    // v0.27: Document section 块执行
+    // 设计: 扫描 body 收集 origin / path,块结束时一次性构造 Value::Document
+    //       存进环境. 与 prompt_section 同模式 — 顺序无关,不污染半成品.
+    // ===================================================================
+
+    fn execute_document_section(
+        &mut self,
+        name: &str,
+        body: &[NodeId],
+        arena: &AstArena,
+    ) -> Result<FlowSignal, String> {
+        let mut origin: Option<String> = None;
+        let mut path: Option<String> = None;
+        for stmt_id in body {
+            let kind = match arena.get_stmt(*stmt_id) {
+                Some(s) => s.kind.clone(),
+                None => continue,
+            };
+            match kind {
+                StmtKind::DocumentSet { key, value } => {
+                    let v = self.evaluate(value, arena)?;
+                    match key.as_str() {
+                        "origin" => {
+                            origin = Some(match v {
+                                Value::String(s) => s,
+                                other => other.to_string(),
+                            });
+                        }
+                        _ => {
+                            // MVP 阶段忽略其他 set 键 (e.g. max_pages)
+                        }
+                    }
+                }
+                StmtKind::DocumentRead(path_id) => {
+                    let v = self.evaluate(path_id, arena)?;
+                    path = Some(match v {
+                        Value::String(s) => s,
+                        other => other.to_string(),
+                    });
+                }
+                _ => {}
+            }
+        }
+        let path_str = path.ok_or_else(|| {
+            format!("document section '{}': missing 'read <path>' statement", name)
+        })?;
+        let ext = std::path::Path::new(&path_str)
+            .extension()
+            .and_then(|s| s.to_str())
+            .unwrap_or("")
+            .to_lowercase();
+        let detected = match ext.as_str() {
+            "pdf" => "pdf",
+            "md" | "markdown" => "markdown",
+            "html" | "htm" => "html",
+            _ => {
+                return Err(format!(
+                    "document section '{}': unsupported extension '.{}'",
+                    name, ext
+                ));
+            }
+        };
+        let final_origin = origin.unwrap_or_else(|| detected.to_string());
+        // Build a Document value via parse_document + verify origin matches
+        let doc = crate::document::parse_document(&path_str)?;
+        if let Value::Document { backend, .. } = &doc
+            && backend.origin() != final_origin
+        {
+            return Err(format!(
+                "document section '{}': origin mismatch (declared '{}' but file is '.{}')",
+                name, final_origin, ext
+            ));
+        }
+        self.environment
+            .lock()
+            .expect("env mutex poisoned")
+            .define(name.to_string(), doc, false);
         Ok(FlowSignal::None)
     }
 }

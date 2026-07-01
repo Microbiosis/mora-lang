@@ -453,6 +453,21 @@ pub enum StmtKind {
     },
     PromptRead(NodeId),
     // tail(...) 复用普通 Expr(Call) — callee == "tail" 由解释器识别
+
+    // v0.27: Document section 块 — 声明一段文档分段
+    // 与 'document "name" do ... end' 语法对应
+    // body 内允许的子语句形态: DocumentSet / DocumentRead
+    DocumentSection {
+        name: String,
+        body: Vec<NodeId>,
+    },
+
+    // v0.27: Document section 块内子语句 — 静态区分 set origin / set max_pages / read
+    DocumentSet {
+        key: String,
+        value: NodeId,
+    },
+    DocumentRead(NodeId),
 }
 
 /// v0.26: Prompt section 块内子语句

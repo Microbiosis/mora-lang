@@ -2,6 +2,70 @@
 
 All notable changes to Mora will be documented in this file.
 
+## [v0.28] - 2026-07-01
+
+### Office (PPTX/DOCX) + Image OCR Backends
+
+灵感来自 v0.27 DocumentBackend 框架与 MinerU 多格式解析思路。
+沿用 v0.27 trait 框架，仅添 3 个 DocumentBackend 后端实现。
+
+#### 新增后端
+
+| 后端 | 文件格式 | 依赖 | 说明 |
+|---|---|---|---|
+| PptxBackend | .pptx | undoc 0.5 | 演示文稿 |
+| DocxBackend | .docx | undoc 0.5 | Word 文档 |
+| ImageBackend | .png | ocrs 0.12 + image 0.24 | 扫描件 OCR（纯 Rust / rten ONNX）|
+
+#### 用法
+
+```mora
+let deck = document.parse("./deck.pptx")           -- PPTX
+let report = document.parse("./report.docx")        -- DOCX
+let scan = document.parse("./scan.png")            -- OCR
+
+print(deck.markdown())                              -- markdown 形式
+print(report.text())                                -- 纯文本
+print(scan.metadata()["ocr_engine"])                -- "rten"
+```
+
+#### 与 v0.26/v0.27 组合
+
+```mora
+-- 与 v0.26 compose_prompt
+let sys = compose_prompt({role:"system", text:deck.text(), budget:"32 KB"})
+-- 与 v0.27 块式声明
+document "report" do
+    set origin: "docx"
+    read "./report.docx"
+end
+```
+
+#### 新增依赖（实现期真实清单）
+
+- `undoc` 0.5（启用 `docx` + `pptx` features，纯 Rust）
+- `ocrs` 0.12（OCR 引擎壳，纯 Rust）
+- `rten` 0.24（ocrs 不再 re-export；必须直接依赖以 `Model::load_static_slice` 加载 `.rten`）
+- `anyhow` 1（ocrs 的 `OcrEngine::new` 暴露 `anyhow::Result`；ocrs 不再 re-export `anyhow`）
+- `image` 0.24（仅 `png` feature；解析 PNG header / dimensions）
+
+全部纯 Rust，MSRV 1.85 ✅，无系统依赖。
+
+#### 技术细节
+
+- **零系统依赖**：所有 5 个新 crate 都是 pure Rust
+- **PNG only in v0.28**：JPEG / XLSX / 扫描 PDF 留 v0.29+
+- **OCR 引擎**：`ocrs 0.12` 基于 Microsoft `rten` ONNX runtime
+- **多语言 OCR**：v0.28 仅英文（eng.traineddata bundled）
+- **工厂分发**：v0.27 的 `parse_document(path)` 已按扩展名自动派发到 `PptxBackend` / `DocxBackend` / `ImageBackend`，用户代码无变化
+
+#### Known issues / v0.29+ roadmap
+
+- **11.7 MB `.rten` 模型 vendoring**：OCR 检测/识别模型（`text-detection.rten` 2.4 MB + `text-recognition.rten` 9.3 MB）以 raw blob 提交在 `tests/fixtures/`，未走 git LFS。每个 contributor / CI 首次 `git clone` 多拉 ~12 MB；`mora` release binary 经 `include_bytes!` 也内嵌这 ~12 MB；二进制 blob 无法在 PR 中 diff/审查；上游模型更新也无刷新路径。详情见 `.git/sdd/tech-debt-v0.29.md`。v0.29 计划三选一：git LFS / `build.rs` 联网下载 / 用户侧 model dir。
+- **OCR 仅英文**：`ocrs 0.12` 加载的 `eng.traineddata` 仅识别拉丁字符。
+- **OCR 仅 PNG**：JPEG / WebP / TIFF 留 v0.29+。
+- **无扫描 PDF**：扫描版 PDF（图片型）尚未接入 OCR 路径。
+
 ## [v0.27] - 2026-07-01
 
 ### Document 统一 IR — `document.parse(...)` + 块式声明

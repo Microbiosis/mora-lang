@@ -65,10 +65,11 @@ impl ContentRouter {
         Self { compressors: vec![] }
     }
 
-    /// 默认路由器 (Task 5 完成后实现)
+    /// 默认路由器 (Task 2: 加入 JsonSubCompressor; Tasks 3-4 还会加更多)
     pub fn default_router() -> Self {
-        // 完整版在 Task 5 Step 3 实现
-        Self::empty()
+        let mut r = Self::empty();
+        r.add(Arc::new(json::JsonSubCompressor));
+        r // Tasks 3-4 还会加更多
     }
 
     /// 注册子压缩器

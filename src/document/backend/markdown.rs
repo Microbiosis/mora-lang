@@ -28,7 +28,7 @@ pub struct MarkdownBackend {
 
 impl MarkdownBackend {
     /// Parse an in-memory markdown string.
-    pub fn from_str(s: &str) -> Self {
+    pub fn new(s: &str) -> Self {
         Self {
             source: s.to_string(),
         }
@@ -111,11 +111,9 @@ impl DocumentBackend for MarkdownBackend {
                 }
                 Event::Text(t) => current_text.push_str(&t),
                 Event::Code(c) => current_text.push_str(&c),
-                Event::End(_) => {
-                    if !current_text.is_empty() {
-                        blocks.push(make_block(&current_kind, &current_text));
-                        current_text.clear();
-                    }
+                Event::End(_) if !current_text.is_empty() => {
+                    blocks.push(make_block(&current_kind, &current_text));
+                    current_text.clear();
                 }
                 _ => {}
             }
@@ -148,7 +146,7 @@ mod tests {
     #[test]
     fn parses_simple_markdown() {
         let md = "# Title\n\nSome text here.\n\n```rust\nlet x = 1;\n```\n";
-        let backend = MarkdownBackend::from_str(md);
+        let backend = MarkdownBackend::new(md);
         assert_eq!(backend.origin(), "markdown");
         assert_eq!(backend.markdown().unwrap(), md);
         let blocks = backend.blocks().unwrap();
@@ -166,7 +164,7 @@ mod tests {
     #[test]
     fn text_strips_markdown() {
         let md = "# Title\n\nSome **bold** text.";
-        let backend = MarkdownBackend::from_str(md);
+        let backend = MarkdownBackend::new(md);
         let text = backend.text().unwrap();
         assert!(!text.contains("#"), "should strip heading marker, got: {:?}", text);
         assert!(text.contains("Title"));

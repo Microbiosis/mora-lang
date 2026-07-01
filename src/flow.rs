@@ -567,6 +567,8 @@ pub fn value_to_json(value: &Value) -> String {
         Value::Atom(arc) => value_to_json(&arc.lock().expect("Atom mutex poisoned")),
         Value::Macro { .. } => "null".to_string(),
         Value::PromptSection { .. } => "null".to_string(),
-        Value::Document { .. } => "\"<document>\"".to_string(),
+        Value::Document { backend, .. } => {
+            format!("\"<document origin=\\\"{}\\\">\"", backend.origin())
+        }
     }
 }

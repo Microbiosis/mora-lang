@@ -247,12 +247,9 @@ impl std::fmt::Display for Value {
                     name, role, budget_bytes
                 )
             }
-            Value::Document { backend, metadata } => write!(
-                f,
-                "<document origin={} meta_keys={}>",
-                backend.origin(),
-                metadata.len()
-            ),
+            Value::Document { backend, .. } => {
+                write!(f, "<document origin=\"{}\">", backend.origin())
+            }
         }
     }
 }

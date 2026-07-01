@@ -170,6 +170,20 @@ impl TypeChecker {
             StmtKind::PromptRead(path_id) => {
                 self.check_expr(*path_id, arena, symbols);
             }
+            // v0.27: document section 块 — 内部子语句顺序无关,递归检查每个子表达式
+            StmtKind::DocumentSection { body, .. } => {
+                for stmt_id in body {
+                    if let Some(stmt) = arena.get_stmt(*stmt_id) {
+                        self.check_stmt(&stmt.kind, arena, symbols);
+                    }
+                }
+            }
+            StmtKind::DocumentSet { value, .. } => {
+                self.check_expr(*value, arena, symbols);
+            }
+            StmtKind::DocumentRead(path_id) => {
+                self.check_expr(*path_id, arena, symbols);
+            }
         }
     }
 

@@ -2710,6 +2710,28 @@ mod document_tests {
         p.to_string_lossy().replace('\\', "/")
     }
 
+    /// v0.27 Task 9: 返回 tests/fixtures/sample.pdf 的 PathBuf.
+    /// 注意: 这个 fixture 是 lopdf-valid 的(327 字节),不能简单生成最小 PDF
+    /// 替换 — 参见 Task 8 report 的 concerns 章节.
+    fn fixture_pdf() -> std::path::PathBuf {
+        let mut p = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        p.push("tests/fixtures/sample.pdf");
+        p
+    }
+
+    /// v0.27 Task 9: no-op stub for `write_minimal_pdf(&path)`.
+    /// 实际使用 fixture_pdf() 已存在的 lopdf-valid 文件; 写一个临时的
+    /// 最小 PDF 字符串是行不通的(参见 Task 8 报告).
+    fn write_minimal_pdf(_path: &std::path::Path) {
+        // 故意 no-op: 真正的最小 PDF 文件就是 fixture_pdf() 指向的文件.
+    }
+
+    /// v0.27 Task 9: cleanup hook for tests that may have written a temp file.
+    /// fixture_pdf() 指向的是已签入的 fixture,绝不能删除 — 别的测试要用.
+    fn cleanup_pdf(_path: &std::path::Path) {
+        // 故意 no-op: fixture 文件被仓库管理,test 不应删除.
+    }
+
     #[test]
     fn document_parse_via_builtin() {
         let p = fixture_pdf_path();
@@ -2738,5 +2760,26 @@ mod document_tests {
         );
         let r = run(&src);
         r.expect("compose_prompt with doc.text() should succeed");
+    }
+
+    #[test]
+    fn document_block_with_pdf() {
+        // v0.27 Task 9: `document "name" do ... end` 块的端到端测试
+        let path = fixture_pdf();
+        write_minimal_pdf(&path);
+        let p = path.to_string_lossy().replace('\\', "/");
+        let src = format!(
+            r#"
+document "report" do
+  set origin: "pdf"
+  read "{}"
+end
+print(report.markdown())
+"#,
+            p
+        );
+        let r = run(&src);
+        cleanup_pdf(&path);
+        r.expect("document block end-to-end");
     }
 }

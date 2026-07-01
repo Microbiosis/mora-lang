@@ -1579,7 +1579,7 @@ impl ParserV2 {
     }
 
     /// v0.27: `document "name" do ... end` — 块语句入口
-    /// MVP: 先把 do ... end 块解析掉,块内内容稍后任务再处理
+    /// 解析 set <key>: <value> / read <expr> 子语句
     pub(super) fn document_section_statement(&mut self) -> NodeId {
         let span = self.span_of_current();
         self.advance(); // consume 'document'
@@ -1604,29 +1604,39 @@ impl ParserV2 {
         while self.check(&TokenType::Newline) {
             self.advance();
         }
-        // MVP: 暂跳过整个 body 直到 'end' (Task 9 再实现子语句)
-        let mut depth = 1;
-        while !self.is_at_end() && depth > 0 {
-            if self.check(&TokenType::Do) {
-                depth += 1;
+        let mut body: Vec<NodeId> = Vec::new();
+        while !self.check(&TokenType::End) && !self.is_at_end() {
+            if self.check(&TokenType::Newline) {
                 self.advance();
                 continue;
             }
-            if self.check(&TokenType::End) {
-                depth -= 1;
-                if depth == 0 {
-                    break;
-                }
+            // set <key>: <value>
+            if self.match_identifier("set") {
+                let s = self.span_of_current();
+                let key = self.consume_identifier("Expected 'origin' or 'max_pages' after 'set'");
+                self.consume(&TokenType::Colon, "Expected ':' after key");
+                let value = self.expression();
+                body.push(self.arena.alloc_stmt(
+                    StmtKind::DocumentSet { key, value },
+                    s,
+                ));
+                continue;
             }
+            // read <expr>
+            if self.match_token(&[TokenType::Read]) {
+                let s = self.span_of_current();
+                let path = self.expression();
+                body.push(self.arena.alloc_stmt(StmtKind::DocumentRead(path), s));
+                continue;
+            }
+            // 未知子语句:跳过当前 token 防卡死
+            eprintln!(
+                "Parse warning: unsupported inner statement in document section at line {}",
+                self.span_of_current().line
+            );
             self.advance();
         }
         self.consume(&TokenType::End, "Expected 'end' to close document section");
-        // 注: name 字段暂不存,MVP 阶段只验证语法可解析
-        let _ = name;
-        let kind = StmtKind::Expr(self.arena.alloc_expr(
-            crate::ast_v2::ExprKind::Literal(crate::common::Literal::Nil(span)),
-            span,
-        ));
-        self.arena.alloc_stmt(kind, span)
+        self.arena.alloc_stmt(StmtKind::DocumentSection { name, body }, span)
     }
 }

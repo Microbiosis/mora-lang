@@ -387,6 +387,7 @@ fn value_to_json(v: &Value) -> JsonValue {
         Value::Partial(_, _) => JsonValue::String_("<partial>".to_string()),
         Value::Atom(_) => JsonValue::String_("<atom>".to_string()),
         Value::Macro { .. } => JsonValue::String_("<macro>".to_string()),
+        Value::PromptSection { .. } => JsonValue::String_("<prompt_section>".to_string()),
     }
 }
 

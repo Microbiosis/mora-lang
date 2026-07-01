@@ -65,8 +65,16 @@ impl ParserV2 {
                 }
                 let mut args = Vec::new();
                 if !self.check(&TokenType::RParen) {
+                    // 跳过参数前的换行
+                    while self.check(&TokenType::Newline) {
+                        self.advance();
+                    }
                     args.push(self.expression());
                     while self.match_token(&[TokenType::Comma]) {
+                        // 跨行调用的支持:v0.26 修复 call() 跨行不跳 newline 的问题
+                        while self.check(&TokenType::Newline) {
+                            self.advance();
+                        }
                         args.push(self.expression());
                     }
                 }

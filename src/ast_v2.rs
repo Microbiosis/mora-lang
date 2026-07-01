@@ -437,6 +437,35 @@ pub enum StmtKind {
         tasks: Vec<SkillTask>,
         verify: Option<SkillVerify>,
     },
+
+    // v0.26: Prompt section 块 — 声明一段 system prompt 分段
+    // 与 'prompt "name" do ... end' 语法对应
+    // body 内允许的子语句形态通过 PromptSectionStmt 静态约束
+    PromptSection {
+        name: String,
+        body: Vec<NodeId>,
+    },
+
+    // v0.26: Prompt section 块内子语句 — 静态区分 set role / set budget / read / tail
+    PromptSet {
+        key: String,
+        value: NodeId,
+    },
+    PromptRead(NodeId),
+    // tail(...) 复用普通 Expr(Call) — callee == "tail" 由解释器识别
+}
+
+/// v0.26: Prompt section 块内子语句
+#[derive(Debug, Clone)]
+pub enum PromptSectionStmt {
+    /// `set role: <expr>` — 设置 role
+    SetRole(NodeId),
+    /// `set budget: <expr>` — 设置 byte 预算
+    SetBudget(NodeId),
+    /// `read <path>` — 读文件
+    Read(NodeId),
+    /// `tail <path>, max: <n>` — 取尾 N 行
+    Tail { path: NodeId, max: NodeId },
 }
 
 /// v0.25: 编排模式

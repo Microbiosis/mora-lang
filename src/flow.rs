@@ -291,6 +291,7 @@ pub fn type_name(value: &Value) -> &'static str {
         Value::Partial(_, _) => "partial",
         Value::Atom(_) => "atom",
         Value::Macro { .. } => "macro",
+        Value::PromptSection { .. } => "prompt_section",
     }
 }
 
@@ -564,5 +565,6 @@ pub fn value_to_json(value: &Value) -> String {
         Value::Partial(_, _) => "null".to_string(),
         Value::Atom(arc) => value_to_json(&arc.lock().expect("Atom mutex poisoned")),
         Value::Macro { .. } => "null".to_string(),
+        Value::PromptSection { .. } => "null".to_string(),
     }
 }

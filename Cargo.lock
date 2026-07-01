@@ -118,7 +118,7 @@ dependencies = [
 
 [[package]]
 name = "mora"
-version = "0.0.25"
+version = "0.0.26"
 dependencies = [
  "flate2",
  "libc",

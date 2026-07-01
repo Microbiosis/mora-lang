@@ -129,6 +129,15 @@ impl Interpreter {
                 verify,
                 arena,
             ),
+            StmtKind::PromptSection { name, body } => {
+                self.execute_prompt_section(name, body, arena)
+            }
+            StmtKind::PromptSet { key, value } => {
+                self.execute_prompt_set(key, *value, arena)
+            }
+            StmtKind::PromptRead(path_id) => {
+                self.execute_prompt_read(*path_id, arena)
+            }
             _ => Err(format!("Unsupported v2 statement: {:?}", stmt_kind)),
         }
     }
@@ -763,4 +772,170 @@ impl Interpreter {
 
         Ok(FlowSignal::None)
     }
+
+    // ===================================================================
+    // v0.26: Prompt section 块执行
+    // 设计: 不要边执行边改环境,而是把整个 body 当作"声明"扫描一遍,
+    //       在块结束时一次性构造 Value::PromptSection 存进环境.
+    // 这样 set/read/tail 顺序无关,且不会半成品污染.
+    // ===================================================================
+
+    fn execute_prompt_section(
+        &mut self,
+        name: &str,
+        body: &[NodeId],
+        arena: &AstArena,
+    ) -> Result<FlowSignal, String> {
+        let mut role: Option<String> = None;
+        let mut budget_bytes: Option<usize> = None;
+        let mut content = String::new();   // 多 read/tail 顺序拼接
+
+        for stmt_id in body {
+            let kind = match arena.get_stmt(*stmt_id) {
+                Some(s) => s.kind.clone(),
+                None => continue,
+            };
+            match &kind {
+                StmtKind::PromptSet { key, value } => {
+                    let v = self.evaluate(*value, arena)?;
+                    match key.as_str() {
+                        "role" => {
+                            role = Some(coerce_to_string(v, "role")?);
+                        }
+                        "budget" => {
+                            // 字符串 "8 KB" / "256 B" / 数字 4096 都接受
+                            budget_bytes = Some(parse_budget(v, "budget")?);
+                        }
+                        _ => {
+                            return Err(format!(
+                                "prompt section '{}': unknown set key '{}' (only 'role' / 'budget')",
+                                name, key
+                            ));
+                        }
+                    }
+                }
+                StmtKind::PromptRead(path_expr) => {
+                    let path = self.evaluate(*path_expr, arena)?;
+                    let path_str = coerce_to_string(path, "read path")?;
+                    let text = std::fs::read_to_string(&path_str).map_err(|e| {
+                        format!(
+                            "prompt section '{}': cannot read '{}': {}",
+                            name, path_str, e
+                        )
+                    })?;
+                    content.push_str(&text);
+                }
+                StmtKind::Expr(expr_id) => {
+                    // 'tail(...)' 作为表达式落地 — 解释为对文件的 tail 操作
+                    let v = self.evaluate(*expr_id, arena)?;
+                    let s = coerce_to_string(v, "tail result")?;
+                    content.push_str(&s);
+                }
+                _ => {
+                    return Err(format!(
+                        "prompt section '{}': unsupported inner statement {:?}",
+                        name, kind
+                    ));
+                }
+            }
+        }
+
+        let section = Value::PromptSection {
+            name: name.to_string(),
+            role,
+            text: Box::new(Value::String(content)),
+            budget_bytes,
+        };
+        self.environment
+            .lock()
+            .expect("env mutex poisoned")
+            .define(name.to_string(), section, false);
+        Ok(FlowSignal::None)
+    }
+
+    fn execute_prompt_set(
+        &mut self,
+        _key: &str,
+        _value: NodeId,
+        _arena: &AstArena,
+    ) -> Result<FlowSignal, String> {
+        // 该分支实际不会到达: 块内 PromptSet 已被 execute_prompt_section 消费
+        // 但 executor match 要求所有变体都被列出
+        Ok(FlowSignal::None)
+    }
+
+    fn execute_prompt_read(
+        &mut self,
+        _path: NodeId,
+        _arena: &AstArena,
+    ) -> Result<FlowSignal, String> {
+        // 同上: 块内 PromptRead 已由 execute_prompt_section 消费
+        Ok(FlowSignal::None)
+    }
+}
+
+/// v0.26: 把 Value 强转字符串 (用于 prompt section 内的 set/read/tail 结果)
+fn coerce_to_string(v: Value, _ctx: &str) -> Result<String, String> {
+    match v {
+        Value::String(s) => Ok(s),
+        Value::Number(n) => Ok(n.to_string()),
+        Value::Bool(b) => Ok(b.to_string()),
+        Value::Nil => Ok(String::new()),
+        other => Ok(other.to_string()),
+    }
+}
+
+/// v0.26: 解析 budget 值
+/// 接受: "256 B" "8 KB" "4 MB" 等带单位的字符串,或纯数字
+fn parse_budget(v: Value, ctx: &str) -> Result<usize, String> {
+    match v {
+        Value::Number(n) => {
+            if n < 0.0 {
+                return Err(format!("{}: budget must be non-negative", ctx));
+            }
+            Ok(n as usize)
+        }
+        Value::String(s) => {
+            let s = s.trim();
+            if s.is_empty() {
+                return Err(format!("{}: empty budget string", ctx));
+            }
+            // 拆分数字 + 单位
+            let (num_part, unit_part) = split_number_unit(s);
+            let num: f64 = num_part
+                .parse()
+                .map_err(|_| format!("{}: invalid budget '{}'", ctx, s))?;
+            let mult: usize = match unit_part.to_uppercase().as_str() {
+                "" | "B" => 1,
+                "KB" | "K" => 1024,
+                "MB" | "M" => 1024 * 1024,
+                "GB" | "G" => 1024 * 1024 * 1024,
+                other => {
+                    return Err(format!(
+                        "{}: unknown budget unit '{}' (B/KB/MB/GB)",
+                        ctx, other
+                    ))
+                }
+            };
+            Ok((num * mult as f64) as usize)
+        }
+        other => Err(format!(
+            "{}: budget must be string or number, got {:?}",
+            ctx, other
+        )),
+    }
+}
+
+fn split_number_unit(s: &str) -> (&str, &str) {
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if c.is_ascii_digit() || c == b'.' {
+            i += 1;
+        } else {
+            break;
+        }
+    }
+    (&s[..i], s[i..].trim())
 }

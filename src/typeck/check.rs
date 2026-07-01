@@ -156,6 +156,20 @@ impl TypeChecker {
             StmtKind::SkillDef { tasks, verify, .. } => {
                 self.check_skill_def_stmt(tasks, verify.as_ref(), arena, symbols);
             }
+            // v0.26: prompt section 块 — 内部子语句顺序无关,在 explain 时跳过类型检查
+            StmtKind::PromptSection { body, .. } => {
+                for stmt_id in body {
+                    if let Some(stmt) = arena.get_stmt(*stmt_id) {
+                        self.check_stmt(&stmt.kind, arena, symbols);
+                    }
+                }
+            }
+            StmtKind::PromptSet { value, .. } => {
+                self.check_expr(*value, arena, symbols);
+            }
+            StmtKind::PromptRead(path_id) => {
+                self.check_expr(*path_id, arena, symbols);
+            }
         }
     }
 

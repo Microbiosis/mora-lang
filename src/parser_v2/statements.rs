@@ -1477,4 +1477,104 @@ impl ParserV2 {
         let kind = StmtKind::RecordTokens { input, output };
         self.arena.alloc_stmt(kind, span)
     }
+
+    /// v0.26: `prompt "name" do ... end` — 声明一段 system prompt 分段
+    /// 块内允许 4 种形态:
+    ///   set role: <expr>
+    ///   set budget: <expr>
+    ///   read <expr>
+    ///   tail(<path>, max: <n>)   -- 走标准 Call,callee = "tail"
+    pub(super) fn prompt_section_statement(&mut self) -> NodeId {
+        let span = self.span_of_current();
+        self.advance(); // consume 'prompt'
+        // section name 必须是字符串字面量
+        let name = match self.peek().cloned() {
+            Some(Token {
+                token_type: TokenType::String(s),
+                ..
+            }) => {
+                self.advance();
+                s
+            }
+            _ => {
+                eprintln!(
+                    "Parse error: Expected string section name after 'prompt' at line {}",
+                    span.line
+                );
+                String::new()
+            }
+        };
+        self.consume(&TokenType::Do, "Expected 'do' after prompt section name");
+        while self.check(&TokenType::Newline) {
+            self.advance();
+        }
+        let mut body = Vec::new();
+        while !self.check(&TokenType::End) && !self.is_at_end() {
+            if self.check(&TokenType::Newline) {
+                self.advance();
+                continue;
+            }
+            match self.parse_prompt_section_inner() {
+                Some(stmt_id) => body.push(stmt_id),
+                None => break,
+            }
+        }
+        self.consume(&TokenType::End, "Expected 'end' to close prompt section");
+        let kind = StmtKind::PromptSection { name, body };
+        self.arena.alloc_stmt(kind, span)
+    }
+
+    /// v0.26: 解析 prompt section 块内子语句
+    /// 返回 None 表示遇到未知形态,调用方应当终止循环
+    fn parse_prompt_section_inner(&mut self) -> Option<NodeId> {
+        // 'set <key>: <value>'
+        if self.match_identifier("set") {
+            let span = self.span_of_current();
+            let key = self.consume_identifier("Expected 'role' or 'budget' after 'set'");
+            self.consume(&TokenType::Colon, "Expected ':' after key");
+            let value = self.expression();
+            return Some(self.arena.alloc_stmt(
+                StmtKind::PromptSet { key, value },
+                span,
+            ));
+        }
+        // 'read <expr>'
+        if self.match_token(&[TokenType::Read]) {
+            let span = self.span_of_current();
+            let path = self.expression();
+            return Some(self.arena.alloc_stmt(StmtKind::PromptRead(path), span));
+        }
+        // 'tail(<path>, max: <n>)' — 标准 Call,callee = "tail"
+        if self.peek_is_identifier("tail")
+            && let Some(next) = self.tokens.get(self.current + 1)
+            && next.token_type == TokenType::LParen
+        {
+            let span = self.span_of_current();
+            return Some(self.expression_statement_for_span(span));
+        }
+        // 兜底: 也允许普通表达式语句(如外部函数调用)
+        if self.check(&TokenType::Identifier("".into()))
+            || matches!(
+                self.peek().map(|t| &t.token_type),
+                Some(TokenType::Identifier(_)) | Some(TokenType::String(_))
+            )
+        {
+            let span = self.span_of_current();
+            return Some(self.expression_statement_for_span(span));
+        }
+        eprintln!(
+            "Parse error: unsupported statement inside prompt section at line {}",
+            self.span_of_current().line
+        );
+        None
+    }
+
+    /// v0.26: 包装 expression_statement 接受显式 span — 复用顶层逻辑
+    fn expression_statement_for_span(&mut self, _span: Span) -> NodeId {
+        // 顶层 expression_statement 不接受外部 span,所以插入临时 advance 模式:
+        // 直接调用 expression 然后 wrap 成 Expr stmt
+        let expr_id = self.expression();
+        let span = self.arena.get_expr(expr_id).map(|e| e.span).unwrap_or(_span);
+        self.arena.alloc_stmt(StmtKind::Expr(expr_id), span)
+    }
 }

@@ -242,6 +242,130 @@ impl Interpreter {
             }),
             // v0.06.6: McpServer::new() builtin
             "McpServer::new" => Ok(Value::McpServer { tools: Vec::new() }),
+            // v0.26: tail(path, max: N) builtin — 读文件末 N 行(JSONL/纯文本皆可)
+            "tail" => {
+                if args.len() < 2 {
+                    return Err(
+                        "tail() requires 2 arguments: path and max".to_string()
+                    );
+                }
+                let path = match &args[0] {
+                    Value::String(s) => s.clone(),
+                    other => return Err(format!(
+                        "tail() first argument must be a string path, got {:?}",
+                        other
+                    )),
+                };
+                let max: usize = match &args[1] {
+                    Value::Number(n) => {
+                        if *n < 0.0 {
+                            return Err("tail() max must be non-negative".to_string());
+                        }
+                        *n as usize
+                    }
+                    _ => {
+                        return Err(
+                            "tail() second argument 'max' must be a number".to_string()
+                        )
+                    }
+                };
+                let content = std::fs::read_to_string(&path).map_err(|e| {
+                    format!("tail() cannot read '{}': {}", path, e)
+                })?;
+                let lines: Vec<&str> = content.lines().collect();
+                let start = if lines.len() > max { lines.len() - max } else { 0 };
+                let tail_str = lines[start..].join("\n");
+                Ok(Value::String(tail_str))
+            }
+            // v0.26: compose_prompt(...) builtin — 把多个 section 拼成 system prompt
+            // 入参形态: (a) 已声明的 section name(String)
+            //          (b) 字典 {role, text, budget}
+            //          (c) 直接的 Value::PromptSection
+            "compose_prompt" => {
+                if args.is_empty() {
+                    return Err(
+                        "compose_prompt() requires at least 1 section".to_string()
+                    );
+                }
+                let mut buf = String::new();
+                for arg in args {
+                    let (name, role, text, budget_bytes) = match arg {
+                        Value::String(section_name) => {
+                            // 从环境查 section
+                            let looked_up = self
+                                .environment
+                                .lock()
+                                .expect("environment mutex poisoned")
+                                .get(&section_name);
+                            match looked_up {
+                                Some(Value::PromptSection {
+                                    name,
+                                    role,
+                                    text,
+                                    budget_bytes,
+                                }) => (name, role, text, budget_bytes),
+                                Some(other) => {
+                                    return Err(format!(
+                                        "compose_prompt: '{}' is not a prompt section (got {:?})",
+                                        section_name, other
+                                    ))
+                                }
+                                None => {
+                                    return Err(format!(
+                                        "compose_prompt: section '{}' not defined (use 'prompt \"{}\" do ... end' first)",
+                                        section_name, section_name
+                                    ))
+                                }
+                            }
+                        }
+                        Value::Dict(map) => {
+                            let role = map.get("role").and_then(|v| match v {
+                                Value::String(s) => Some(s.clone()),
+                                _ => None,
+                            });
+                            let text_val = map.get("text").cloned().unwrap_or(Value::String(String::new()));
+                            let budget = if let Some(b) = map.get("budget") {
+                                Some(parse_budget_dispatch(b.clone(), "budget")?)
+                            } else {
+                                None
+                            };
+                            (
+                                "<inline>".to_string(),
+                                role,
+                                Box::new(text_val),
+                                budget,
+                            )
+                        }
+                        Value::PromptSection { name, role, text, budget_bytes } => {
+                            (name, role, text, budget_bytes)
+                        }
+                        other => {
+                            return Err(format!(
+                                "compose_prompt: section must be name, dict, or PromptSection (got {:?})",
+                                other
+                            ))
+                        }
+                    };
+                    // 应用 budget 截断
+                    let resolved_text = text_to_string(&text);
+                    let truncated = match budget_bytes {
+                        Some(b) if resolved_text.len() > b => {
+                            let mut t = resolved_text.into_bytes();
+                            t.truncate(b);
+                            String::from_utf8_lossy(&t).into_owned()
+                        }
+                        _ => resolved_text,
+                    };
+                    // 拼接
+                    if let Some(r) = &role {
+                        buf.push_str(&format!("\n## {} ({})\n\n", name, r));
+                    } else {
+                        buf.push_str(&format!("\n## {}\n\n", name));
+                    }
+                    buf.push_str(&truncated);
+                }
+                Ok(Value::String(buf))
+            }
             _ => {
                 // 先 clone 出值，释放 borrow，避免借用冲突
                 let looked_up = self
@@ -1036,5 +1160,65 @@ impl Interpreter {
             }
             _ => Err(format!("Value is not callable: {}", value)),
         }
+    }
+}
+
+// ===================================================================
+// v0.26: compose_prompt / tail 辅助函数 (在 dispatch.rs 末尾)
+// ===================================================================
+
+/// 把 Value 转 String (用于 section.text 字段读取)
+fn text_to_string(v: &Value) -> String {
+    match v {
+        Value::String(s) => s.clone(),
+        Value::Number(n) => n.to_string(),
+        Value::Bool(b) => b.to_string(),
+        Value::Nil => String::new(),
+        other => other.to_string(),
+    }
+}
+
+/// 解析 budget 值 (dispatch 层副本,与 execute.rs 同语义)
+fn parse_budget_dispatch(v: Value, ctx: &str) -> Result<usize, String> {
+    match v {
+        Value::Number(n) => {
+            if n < 0.0 {
+                return Err(format!("{}: budget must be non-negative", ctx));
+            }
+            Ok(n as usize)
+        }
+        Value::String(s) => {
+            let s = s.trim();
+            if s.is_empty() {
+                return Err(format!("{}: empty budget string", ctx));
+            }
+            let bytes = s.as_bytes();
+            let mut i = 0;
+            while i < bytes.len() && (bytes[i].is_ascii_digit() || bytes[i] == b'.') {
+                i += 1;
+            }
+            let num_part = &s[..i];
+            let unit_part = s[i..].trim();
+            let num: f64 = num_part
+                .parse()
+                .map_err(|_| format!("{}: invalid budget '{}'", ctx, s))?;
+            let mult: usize = match unit_part.to_uppercase().as_str() {
+                "" | "B" => 1,
+                "KB" | "K" => 1024,
+                "MB" | "M" => 1024 * 1024,
+                "GB" | "G" => 1024 * 1024 * 1024,
+                other => {
+                    return Err(format!(
+                        "{}: unknown budget unit '{}' (B/KB/MB/GB)",
+                        ctx, other
+                    ))
+                }
+            };
+            Ok((num * mult as f64) as usize)
+        }
+        other => Err(format!(
+            "{}: budget must be string or number, got {:?}",
+            ctx, other
+        )),
     }
 }

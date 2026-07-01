@@ -1,0 +1,34 @@
+-- ============================================================
+-- v0.27: Document IR Demo — parse PDF / Markdown / HTML
+-- ============================================================
+
+-- 1) PDF (assuming tests/fixtures/sample.pdf exists)
+let pdf_doc = document.parse("./tests/fixtures/sample.pdf")
+print("[pdf pages] " + pdf_doc.metadata()["pages"])
+print("[pdf first 200 chars of markdown]")
+print(pdf_doc.markdown()[..200])
+
+-- 2) Markdown
+let md_doc = document.parse("./tests/fixtures/sample.md")
+print("[md blocks count] " + md_doc.blocks().len())
+print("[md first heading] " + md_doc.blocks()[0]["spans"][0]["text"])
+
+-- 3) HTML
+let html_doc = document.parse("./tests/fixtures/sample.html")
+print("[html title] " + html_doc.metadata()["title"])
+print("[html author] " + html_doc.metadata()["author"])
+print("[html stripped text first 100 chars]")
+print(html_doc.text()[..100])
+
+-- 4) 块式语法
+document "report" do
+    set origin: "markdown"
+    read "./tests/fixtures/sample.md"
+end
+print("[block: report first 100] " + report.text()[..100])
+
+-- 5) 与 v0.26 compose_prompt 组合
+let sys = compose_prompt({role:"system", text:md_doc.markdown(), budget:"32 KB"})
+print("[combined system prompt bytes] " + sys.len())
+
+print("document_parse demo 完成")

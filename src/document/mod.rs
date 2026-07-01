@@ -80,7 +80,20 @@ pub fn parse_document(path: &str) -> Result<Value, String> {
                 .or_insert(Value::String(path.to_string()));
             Ok(make_document(std::sync::Arc::new(backend), metadata))
         }
-        "html" | "htm" => Err("document.parse: HtmlBackend not yet implemented (Task 7)".into()),
+        "html" | "htm" => {
+            let text = std::fs::read_to_string(path)
+                .map_err(|e| format!("document.parse: cannot read '{}': {}", path, e))?;
+            let backend = crate::document::backend::html::HtmlBackend::from_str(&text);
+            let meta = backend.metadata()?;
+            let mut metadata = match meta {
+                Value::Dict(m) => m,
+                _ => HashMap::new(),
+            };
+            metadata
+                .entry("path".to_string())
+                .or_insert(Value::String(path.to_string()));
+            Ok(make_document(std::sync::Arc::new(backend), metadata))
+        }
         other => Err(format!("document.parse: unsupported extension '.{}'", other)),
     }
 }
@@ -122,10 +135,19 @@ mod tests {
     }
 
     #[test]
-    fn parse_html_yields_not_yet_implemented_error() {
-        let r = parse_document("/tmp/x.html");
-        assert!(r.is_err());
-        assert!(r.unwrap_err().contains("HtmlBackend not yet implemented"));
+    fn parse_html_now_implemented_via_html_backend() {
+        // v0.27 Task 7: HtmlBackend is implemented; factory now reads the file
+        // and wraps the parsed source. We point at our 1-page test fixture and
+        // assert dispatch yields a Value::Document (instead of an Err).
+        let mut p = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        p.push("tests/fixtures/sample.html");
+        let p_str = p.to_string_lossy().to_string();
+        let r = parse_document(&p_str);
+        assert!(r.is_ok(), "parse_document for sample.html should succeed, got: {:?}", r.err());
+        match r.unwrap() {
+            Value::Document { .. } => {}
+            other => panic!("expected Value::Document, got: {:?}", other),
+        }
     }
 
     #[test]

@@ -3,4 +3,4 @@
 
 pub mod pdf;
 pub mod markdown;
-// pub mod html;     // Task 7
+pub mod html;

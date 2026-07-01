@@ -736,6 +736,18 @@ impl Interpreter {
                     let context = args.get(1).map(|v| v.to_string());
                     self.run_critic(&answer, context.as_deref())
                 }
+                // v0.27: 顶层模块入口 — `document.parse(path)` 返回 Value::Document
+                ("document", "parse") => {
+                    let path = args
+                        .first()
+                        .and_then(|v| match v {
+                            Value::String(s) => Some(s.clone()),
+                            _ => None,
+                        })
+                        .ok_or_else(|| "document.parse: requires a path string".to_string())?;
+                    crate::document::parse_document(&path)
+                }
+                ("document", method) => Err(format!("document.{}: unknown method", method)),
                 _ => Err(format!("Unknown method: {}.{}", name, method)),
             },
             Value::Conversation { ref mut messages, ref model, ref base_url, ref api_key } => {
@@ -983,7 +995,23 @@ impl Interpreter {
                     _ => Err(format!("McpServer has no method: {}", method)),
                 }
             }
-            _ => Err("Can only call methods on lists, dicts, strings, conversations, streams, agents, routers, mcp_servers, or builtin objects".to_string()),
+            // v0.27: Document unified IR — value-method dispatch on DocumentBackend
+            Value::Document { backend, .. } => {
+                let _ = (args, call_site);
+                match method {
+                    "markdown" => backend.markdown().map(Value::String),
+                    "text" => backend.text().map(Value::String),
+                    "pages" => backend.pages(),
+                    "metadata" => backend.metadata(),
+                    "blocks" => backend.blocks(),
+                    "origin" => Ok(Value::String(backend.origin().to_string())),
+                    other => Err(format!(
+                        "document.{}: unknown method on Document value",
+                        other
+                    )),
+                }
+            }
+            _ => Err("Can only call methods on lists, dicts, strings, conversations, streams, agents, routers, mcp_servers, documents, or builtin objects".to_string()),
         }
     }
 

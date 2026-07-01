@@ -368,8 +368,8 @@ impl Interpreter {
             .lock()
             .unwrap()
             .define("len".to_string(), Value::Builtin("len".to_string()), false);
-        // v0.25: 注册 builtin 模块对象
-        for name in &["ai", "web", "json", "file", "memory", "agent"] {
+        // v0.25: 注册 builtin 模块对象 (v0.27: 加入 document)
+        for name in &["ai", "web", "json", "file", "memory", "agent", "document"] {
             globals.lock().unwrap().define(
                 name.to_string(),
                 Value::Builtin(name.to_string()),
@@ -2684,5 +2684,59 @@ end
 "#;
         let n = parse(src);
         assert!(n >= 1, "document block should produce >= 1 top-level statement");
+    }
+}
+
+#[cfg(test)]
+mod document_tests {
+    // v0.27 Task 8: end-to-end tests for `document.parse` builtin
+    // and Value::Document method dispatch.
+    use super::*;
+    use crate::lexer::Lexer;
+    use crate::parser_v2::ParserV2;
+
+    fn run(src: &str) -> Result<(), String> {
+        let tokens = Lexer::new(src).scan_tokens();
+        let mut parser_v2 = ParserV2::new(tokens);
+        let node_ids = parser_v2.parse();
+        let arena = parser_v2.into_arena();
+        let mut interp = Interpreter::new();
+        interp.interpret(&node_ids, &arena)
+    }
+
+    fn fixture_pdf_path() -> String {
+        let mut p = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        p.push("tests/fixtures/sample.pdf");
+        p.to_string_lossy().replace('\\', "/")
+    }
+
+    #[test]
+    fn document_parse_via_builtin() {
+        let p = fixture_pdf_path();
+        let src = format!(
+            r#"
+              let doc = document.parse("{}")
+              print(doc.markdown())
+            "#,
+            p
+        );
+        let r = run(&src);
+        r.expect("document.parse end-to-end should succeed");
+    }
+
+    #[test]
+    fn compose_prompt_with_document_text() {
+        // 与 v0.26 compose_prompt 组合
+        let p = fixture_pdf_path();
+        let src = format!(
+            r#"
+              let doc = document.parse("{}")
+              let sys = compose_prompt({{role:"system", text:doc.text(), budget:"32 KB"}})
+              print(sys.len())
+            "#,
+            p
+        );
+        let r = run(&src);
+        r.expect("compose_prompt with doc.text() should succeed");
     }
 }

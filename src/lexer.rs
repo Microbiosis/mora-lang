@@ -189,6 +189,21 @@ impl Lexer {
         }
     }
 
+    /// v0.27: 跳过空格/制表/换行,判断下一个非空白字符是否是 `"`。
+    /// 用于:把 `document "x" do ... end` 与 `document.parse(...)` 区分开。
+    fn peek_non_newline_is_string(&self) -> bool {
+        let mut i = self.current;
+        while i < self.source.len() {
+            let c = self.source[i];
+            if c == ' ' || c == '\t' || c == '\r' || c == '\n' {
+                i += 1;
+            } else {
+                break;
+            }
+        }
+        i < self.source.len() && self.source[i] == '"'
+    }
+
     fn match_char(&mut self, expected: char) -> bool {
         if self.is_at_end() || self.source[self.current] != expected {
             return false;
@@ -736,7 +751,16 @@ impl Lexer {
             // v0.26: prompt 块语句（与 p"..." 模板字符串互不干扰）
             "prompt" => TokenType::Prompt,
             // v0.27: document 块语句（与 prompt "x" do end 同款）
-            "document" => TokenType::Document,
+            // 但允许 `document.parse(...)` 形式:仅当下一个 token 是字符串字面量
+            // (块语句起始)时识别为 Document 关键字,否则退化为 Identifier,
+            // 使其可作为表达式上下文中的模块名。
+            "document" => {
+                if self.peek_non_newline_is_string() {
+                    TokenType::Document
+                } else {
+                    TokenType::Identifier(value)
+                }
+            }
             _ => TokenType::Identifier(value),
         };
         Token {

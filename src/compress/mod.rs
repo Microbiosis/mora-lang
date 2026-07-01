@@ -67,12 +67,17 @@ impl ContentRouter {
 
     /// 默认路由器 (Task 2: 加入 JsonSubCompressor; Task 3 加入 TextSubCompressor;
     /// Task 4 加入 Code/Html/Log。)
-    /// 注意: TextSubCompressor 故意放最后 — sniff 0.5 兜底, 由其他 SC (sniff ≥ 0.6) 先抢。
+    /// 顺序约定: 置信度高的 SC 优先注册 (router::sniff 在 ≥ 0.6 中再选 max,
+    /// 注册顺序不影响最终选择, 但 json/code/html/log 都在 text 之前 —
+    /// text sniff 固定 0.5, 故意兜底)。
     pub fn default_router() -> Self {
         let mut r = Self::empty();
         r.add(Arc::new(json::JsonSubCompressor));
+        r.add(Arc::new(code::CodeSubCompressor));
+        r.add(Arc::new(html::HtmlSubCompressor));
+        r.add(Arc::new(log::LogSubCompressor));
         r.add(Arc::new(text::TextSubCompressor));
-        r // Task 4 还会加 Code/Html/Log
+        r
     }
 
     /// 注册子压缩器

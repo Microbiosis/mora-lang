@@ -51,7 +51,20 @@ pub fn parse_document(path: &str) -> Result<Value, String> {
         .unwrap_or("")
         .to_lowercase();
     match ext.as_str() {
-        "pdf" => Err("document.parse: PdfBackend not yet implemented (Task 5)".into()),
+        "pdf" => {
+            let bytes = std::fs::read(path)
+                .map_err(|e| format!("document.parse: cannot read '{}': {}", path, e))?;
+            let backend = crate::document::backend::pdf::PdfBackend::from_bytes(bytes)?;
+            let meta = backend.metadata()?;
+            let mut metadata = match meta {
+                Value::Dict(m) => m,
+                _ => HashMap::new(),
+            };
+            metadata
+                .entry("path".to_string())
+                .or_insert(Value::String(path.to_string()));
+            Ok(make_document(std::sync::Arc::new(backend), metadata))
+        }
         "md" | "markdown" => Err("document.parse: MarkdownBackend not yet implemented (Task 6)".into()),
         "html" | "htm" => Err("document.parse: HtmlBackend not yet implemented (Task 7)".into()),
         other => Err(format!("document.parse: unsupported extension '.{}'", other)),
@@ -63,10 +76,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_pdf_yields_not_yet_implemented_error() {
-        let r = parse_document("/tmp/x.pdf");
-        assert!(r.is_err());
-        assert!(r.unwrap_err().contains("PdfBackend not yet implemented"));
+    fn parse_pdf_now_implemented_via_pdf_backend() {
+        // v0.27 Task 5: PdfBackend is implemented; factory now reads the file
+        // and wraps the parsed bytes. We point at our 1-page test fixture and
+        // assert the dispatch yields a Value::Document (instead of an Err).
+        let mut p = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        p.push("tests/fixtures/sample.pdf");
+        let p_str = p.to_string_lossy().to_string();
+        let r = parse_document(&p_str);
+        assert!(r.is_ok(), "parse_document for sample.pdf should succeed, got: {:?}", r.err());
+        match r.unwrap() {
+            Value::Document { .. } => {}
+            other => panic!("expected Value::Document, got: {:?}", other),
+        }
     }
 
     #[test]

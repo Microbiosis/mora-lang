@@ -15,7 +15,7 @@ task main()
 
     -- 2. compress(text, "head_tail") -- 保留首尾
     print("\n=== compress head_tail ===")
-    print(compress(text, "head_tail", head_pct: 0.4, tail_pct: 0.4))
+    print(compress(text, "head_tail", {head_pct: 0.4, tail_pct: 0.4}))
 
     -- 3. compress(text, "lossless")
     print("\n=== compress lossless ===")

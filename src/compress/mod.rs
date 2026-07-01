@@ -105,18 +105,136 @@ pub mod html;   // Task 4 填充
 pub mod log;    // Task 4 填充
 pub mod text;   // Task 3 填充
 
-// crush_json 顶层算法 — 在 Task 2 完成后才 re-export:
-//   pub use json::crush_json_core;
-// 现在不写 re-export, 避免 Task 1 引用未定义符号 (json::crush_json_core)
+// v0.29: re-export crush_json_core (Task 2 已定义; Task 5 启用 re-export)
+pub use json::crush_json_core;
 
-// Task 5 之前 compress_top 留作 stub, Task 5 填实
+/// v0.29: 从 Value 中提取可压缩的纯文本。
+///
+/// 支持:
+/// - `Value::String(s)` → 直接使用 `s`
+/// - `Value::Conversation { messages, .. }` → 每条格式化为 `role: content`, 用 `\n` 连接
+/// - `Value::List` 项是 `Value::Dict{role, content}` → 同样格式化为 `role: content`
+/// - 其它 → 错误
+pub fn extract_text(input: &crate::value::Value) -> Result<String, String> {
+    use crate::value::Value;
+    match input {
+        Value::String(s) => Ok(s.clone()),
+        Value::Conversation { messages, .. } => {
+            let lines: Vec<String> = messages
+                .iter()
+                .map(|(role, content)| format!("{}: {}", role, content))
+                .collect();
+            Ok(lines.join("\n"))
+        }
+        Value::List(items) => {
+            let mut lines: Vec<String> = Vec::with_capacity(items.len());
+            for item in items {
+                match item {
+                    Value::Dict(d) => {
+                        let role = d.get("role").map(|v| v.to_string()).unwrap_or_default();
+                        let content = d.get("content").map(|v| v.to_string()).unwrap_or_default();
+                        if role.is_empty() && content.is_empty() {
+                            // 没 role/content 字段: 退回到整项 to_string()
+                            lines.push(item.to_string());
+                        } else {
+                            lines.push(format!("{}: {}", role, content));
+                        }
+                    }
+                    other => lines.push(other.to_string()),
+                }
+            }
+            Ok(lines.join("\n"))
+        }
+        other => Err(format!(
+            "compress: expected Conversation / list of {{role, content}} / string, got {}",
+            value_type_simple(other)
+        )),
+    }
+}
+
+/// v0.29: 从 `Value::Dict` 构建 `CompressOptions`。
+///
+/// 部分字段缺失或类型不匹配时**静默跳过**(不报错) — 调用方可任意选择传入哪些 options。
+pub fn options_from_value(v: &crate::value::Value) -> Result<CompressOptions, String> {
+    use crate::value::Value;
+    let mut opts = CompressOptions::default();
+    if let Value::Dict(map) = v {
+        if let Some(Value::String(s)) = map.get("strategy") {
+            opts.strategy = s.clone();
+        }
+        if let Some(Value::Number(n)) = map.get("head_pct") {
+            opts.head_pct = *n as f32;
+        }
+        if let Some(Value::Number(n)) = map.get("tail_pct") {
+            opts.tail_pct = *n as f32;
+        }
+        if let Some(Value::Number(n)) = map.get("max_bytes") {
+            opts.max_bytes = Some(*n as usize);
+        }
+        if let Some(Value::List(keys)) = map.get("anomaly_keys") {
+            opts.anomaly_keys = keys
+                .iter()
+                .filter_map(|k| match k {
+                    Value::String(s) => Some(s.clone()),
+                    _ => None,
+                })
+                .collect();
+        }
+    }
+    Ok(opts)
+}
+
+/// v0.29: `compress(input, strategy, options)` 顶层 builtin 的核心实现。
+///
+/// Strategy 调度 (per spec §6.6):
+/// - `"auto"`           → 路由器选最佳子压缩器 (json/code/html/log/text 5 个)
+/// - `"head_tail"`      → TextSubCompressor (按 head_pct/tail_pct/max_bytes)
+/// - `"summary"`        → TextSubCompressor (mock LLM, 真实 LLM 留 v0.30)
+/// - `"lossless"`       → TextSubCompressor (原文本 + original_size marker)
+/// - `"json"`           → crush_json_core (input 必须是 List 或 JSON 数组字符串)
+/// - 其它               → 报错
 pub fn compress_top(
-    _input: &crate::value::Value,
-    _strategy: &str,
-    _options: &CompressOptions,
+    input: &crate::value::Value,
+    strategy: &str,
+    options: &CompressOptions,
 ) -> Result<crate::value::Value, String> {
-    // Task 5 实装
-    Err("compress_top: not yet implemented (v0.29 Task 5)".to_string())
+    // "json" strategy 不走文本路径, 直接用原始 input 调 crush_json_core
+    if strategy == "json" {
+        let max_items = options.max_bytes.unwrap_or(8192) / 200;
+        let max_items = max_items.max(1);
+        let v = crush_json_core(input, max_items, &options.anomaly_keys)?;
+        let json = value_to_json_simple(&v);
+        let item_count = if let crate::value::Value::List(l) = &v {
+            l.len()
+        } else {
+            0
+        };
+        return Ok(crate::value::Value::String(format!(
+            "{}\n<compressed:method=crush_json items={} max={}>",
+            json, item_count, max_items
+        )));
+    }
+
+    // 其余 strategy 都需先提取文本
+    let text = extract_text(input)?;
+    let max_bytes = options.max_bytes.unwrap_or(8192);
+
+    match strategy {
+        "auto" => {
+            let router = ContentRouter::default_router();
+            let comp = router.sniff(&text).ok_or_else(|| {
+                "compress.auto: no compressor matched for content".to_string()
+            })?;
+            let out = comp.compress(&text, max_bytes, options)?;
+            Ok(crate::value::Value::String(out))
+        }
+        "head_tail" | "summary" | "lossless" => {
+            let text_comp = text::TextSubCompressor;
+            let out = text_comp.compress(&text, max_bytes, options)?;
+            Ok(crate::value::Value::String(out))
+        }
+        other => Err(format!("compress: unknown strategy '{}'", other)),
+    }
 }
 
 /// v0.29: 极简 JSON 解析 (复用 v0.28 json.parse 风格 — 这里是简化版)

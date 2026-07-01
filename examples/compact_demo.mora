@@ -1,38 +1,37 @@
 -- ============================================================
--- v0.25: Context Compaction 示例 — 上下文压缩
+-- v0.29: Context Compression Demo (renamed from compact_demo)
 -- ============================================================
+-- 注: v0.25 的 compact(text) 在 v0.29 重命名为 compress(text, strategy)
+-- 详见 docs/superpowers/specs/2026-07-01-v0.29-compress-crush-design.md
 
 task main()
-  -- 1. compact() 函数 — 文本摘要
-  print("=== compact() 函数 ===")
-  let long_text = "这是一段很长的文本。它包含了很多关于 AI Agent 架构的讨论。
+    -- 1. compress() 顶层函数
+    let long_text = "这是一段很长的文本。它包含了很多关于 AI Agent 架构的讨论。
 我们讨论了 Multi-Agent 协调模式、Memory 系统、Context Compaction 等话题。
 这些话题都是现代 AI Agent 系统的核心组成部分。
-其中 Context Compaction 是解决长对话 token 超限的关键技术。"
+其中 Context Compaction 是解决长对话 token 超限的关键技术。
+它通过保留关键信息和摘要来减少 token 使用量。"
 
-  let summary = compact(long_text)
-  print(summary)
+    print("=== compress() 函数 (3 策略) ===")
+    let summary = compress(long_text, "summary")
+    print(summary)
+    print("")
+    let head_tail_result = compress(long_text, "head_tail", {head_pct: 0.3, tail_pct: 0.3, max_bytes: 200})
+    print(head_tail_result)
+    print("")
+    let lossless_result = compress(long_text, "lossless")
+    print(lossless_result)
+    print("")
 
-  -- 2. Conversation.compact() — 对话历史压缩
-  print("\n=== Conversation 压缩 ===")
-  let conv = ai.new_conversation("gpt-4o-mini")
-  conv.chat("你好，我想讨论 AI Agent 架构")
-  conv.chat("Multi-Agent 协调有哪些模式？")
-  conv.chat("Memory 系统如何设计？")
-  conv.chat("Context Compaction 的原理是什么？")
+    -- 2. crush_json — 列表型 JSON 压缩
+    print("=== crush_json() ===")
+    -- (语法原因这里展示顶层调用形式, 实际 List 方法链: list.crush_json(10))
+    print("用法: crush_json(list, 10) 或 list.crush_json(10)")
 
-  print("压缩前消息数: " + conv.len())
+    -- 3. 完整架构 (auto) — content router
+    print("=== auto strategy ===")
+    let auto_text = compress("hello world", "auto")  -- 路由到 TextSubCompressor
+    print(auto_text)
 
-  let summary2 = conv.compact()
-  print("压缩摘要: " + summary2)
-  print("压缩后消息数: " + conv.len())
-
-  -- 3. with compact_at() — 自动压缩阈值
-  print("\n=== 自动压缩 ===")
-  with model("gpt-4o-mini"), compact_at(80) do
-    let response = ai.chat("请详细解释 AI Agent 的核心组件")
-    print(response.len())
-  end
-
-  print("compact demo 完成")
+    print("compress demo 完成")
 end

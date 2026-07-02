@@ -5,6 +5,7 @@
 
 pub mod ai_infra;
 pub mod ast_v2;
+pub mod ccr;
 pub mod common;
 pub mod compress;
 pub mod document;
@@ -18,6 +19,8 @@ pub mod mcp_server;
 pub mod mock;
 pub mod parser_v2;
 pub mod record;
+pub mod sandbox;
+pub mod schedule;
 pub mod trace_collector;
 pub mod typeck;
 pub mod value;

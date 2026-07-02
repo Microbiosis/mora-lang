@@ -14,9 +14,9 @@ pub trait DocumentBackend: std::fmt::Debug + Send + Sync {
     /// Format identity string: "pdf" | "markdown" | "html"
     fn origin(&self) -> &'static str;
 
-    /// 完整 IR: List<Page dict> — 与 MinerU middle_json pages 对齐
-    /// Page = {page_no, width, height, blocks: [Block]}
-    /// Block = {kind, bbox, spans: [Span]}
+    /// 完整 IR: `List<Page dict>` — 与 MinerU middle_json pages 对齐
+    /// Page = {page_no, width, height, blocks: \[Block\]}
+    /// Block = {kind, bbox, spans: \[Span\]}
     fn pages(&self) -> Result<Value, String>;
 
     /// 渲染为完整 markdown 字符串

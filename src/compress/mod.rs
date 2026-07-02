@@ -1,6 +1,6 @@
 //! v0.30: 统一压缩原语 — `SubCompressor` trait + `ContentRouter` + SmartCrusher
 //!
-//! 灵感: headroom (https://github.com/headroomlabs-ai/headroom)
+//! 灵感: headroom (<https://github.com/headroomlabs-ai/headroom>)
 //! ContentRouter + Kneedle + 异常保留 设计。
 //!
 //! v0.30 变更:

@@ -2,7 +2,7 @@
 //!
 //! 只支持 LSP 用到的类型：
 //! - object: HashMap<String, Value>
-//! - array: Vec<Value>
+//! - array: `Vec<Value>`
 //! - string, number, bool, null
 //!
 //! 故意不支持：嵌套深度限制宽松（不做 strict JSON）、不做性能优化。

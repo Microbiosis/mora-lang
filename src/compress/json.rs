@@ -1,6 +1,6 @@
 //! v0.30: SmartCrusher — content-aware JSON compression
 //!
-//! 灵感: Headroom (https://github.com/headroomlabs-ai/headroom) — SmartCrusher
+//! 灵感: Headroom (<https://github.com/headroomlabs-ai/headroom>) — SmartCrusher
 //! 核心思想: **不依赖字段名，按值分布推断语义角色**。
 //!
 //! 用法:

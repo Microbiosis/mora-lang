@@ -1,5 +1,5 @@
 //! v0.27: HtmlBackend — quick-xml pull-parser based,
-//! extracts <p>/<h1-h6>/<pre>/<code> blocks plus <title> and <meta name="author">.
+//! extracts `<p>` / `<h1-h6>` / `<pre>` / `<code>` blocks plus `<title>` and `<meta name="author">`.
 //!
 //! Strategy:
 //!   1. Cache the source string at construction time.

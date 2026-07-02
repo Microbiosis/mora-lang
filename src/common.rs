@@ -22,7 +22,7 @@ impl Span {
 
 /// 字面量值（v2 版：List/Dict 使用 NodeId，不含 Expr 引用）
 ///
-/// v1 版 Literal 在 ast.rs 中定义（含 Box<Expr>），此版供 v2 AST 使用。
+/// v1 版 Literal 在 ast.rs 中定义（含 `Box<Expr>`），此版供 v2 AST 使用。
 #[derive(Debug, Clone, PartialEq)]
 pub enum Literal {
     String(String, Span),

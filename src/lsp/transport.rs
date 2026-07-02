@@ -1,9 +1,9 @@
 //! LSP 传输层：手写 JSON-RPC 2.0 over stdin/stdout
 //!
 //! 协议：每个 message 由 HTTP 风格 header + body 组成
-//!   Content-Length: <N>\r\n
-//!   \r\n
-//!   <N bytes of UTF-8 JSON>
+//!   `Content-Length: <N>\r\n`
+//!   `\r\n`
+//!   `<N bytes of UTF-8 JSON>`
 //!
 //! 这里纯同步、单线程，不引入 tokio。LSP server 整体是"循环 read message, dispatch, write response"。
 //! 对于编辑器这种场景吞吐够用；如果以后真要性能，再上 async。

@@ -3,6 +3,7 @@ use crate::value::Value;
 use std::collections::HashMap;
 
 pub mod backend;
+pub mod reading_order;
 
 /// v0.27: Document unified IR backend — every document format
 /// (PDF / Markdown / HTML) implements this to expose a unified surface.

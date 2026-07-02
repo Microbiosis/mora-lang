@@ -162,9 +162,7 @@ impl Interpreter {
             // v0.29: compress(input, strategy, options?) -> string 6 路策略压缩
             "compress" => {
                 if args.len() < 2 {
-                    return Err(
-                        "compress() requires 2 arguments: input and strategy".to_string()
-                    );
+                    return Err("compress() requires 2 arguments: input and strategy".to_string());
                 }
                 let strategy = match &args[1] {
                     Value::String(s) => s.clone(),
@@ -172,7 +170,7 @@ impl Interpreter {
                         return Err(format!(
                             "compress: strategy must be a string, got {:?}",
                             other
-                        ))
+                        ));
                     }
                 };
                 let options_val = args
@@ -189,9 +187,7 @@ impl Interpreter {
             // v0.29: crush_json(input, max, options?) -> string Kneedle + 异常保留
             "crush_json" => {
                 if args.len() < 2 {
-                    return Err(
-                        "crush_json() requires 2 arguments: input and max".to_string()
-                    );
+                    return Err("crush_json() requires 2 arguments: input and max".to_string());
                 }
                 let max_items = match &args[1] {
                     Value::Number(n) => {
@@ -201,10 +197,7 @@ impl Interpreter {
                         *n as usize
                     }
                     other => {
-                        return Err(format!(
-                            "crush_json: max must be a number, got {:?}",
-                            other
-                        ))
+                        return Err(format!("crush_json: max must be a number, got {:?}", other));
                     }
                 };
                 let options_val = args
@@ -218,11 +211,9 @@ impl Interpreter {
                         return Err("crush_json: expected List as first argument".to_string());
                     }
                 };
-                let result =
-                    crate::compress::crush_json(&items, max_items, &opts);
-                let json = crate::compress::value_to_json_simple(&Value::List(
-                    result.items.clone(),
-                ));
+                let result = crate::compress::crush_json(&items, max_items, &opts);
+                let json =
+                    crate::compress::value_to_json_simple(&Value::List(result.items.clone()));
                 Ok(Value::String(format!(
                     "{}\n<compressed:method=smart_crusher strategy={} items={} total={} savings={:.2}>",
                     json,
@@ -284,16 +275,16 @@ impl Interpreter {
             // v0.26: tail(path, max: N) builtin — 读文件末 N 行(JSONL/纯文本皆可)
             "tail" => {
                 if args.len() < 2 {
-                    return Err(
-                        "tail() requires 2 arguments: path and max".to_string()
-                    );
+                    return Err("tail() requires 2 arguments: path and max".to_string());
                 }
                 let path = match &args[0] {
                     Value::String(s) => s.clone(),
-                    other => return Err(format!(
-                        "tail() first argument must be a string path, got {:?}",
-                        other
-                    )),
+                    other => {
+                        return Err(format!(
+                            "tail() first argument must be a string path, got {:?}",
+                            other
+                        ));
+                    }
                 };
                 let max: usize = match &args[1] {
                     Value::Number(n) => {
@@ -302,17 +293,16 @@ impl Interpreter {
                         }
                         *n as usize
                     }
-                    _ => {
-                        return Err(
-                            "tail() second argument 'max' must be a number".to_string()
-                        )
-                    }
+                    _ => return Err("tail() second argument 'max' must be a number".to_string()),
                 };
-                let content = std::fs::read_to_string(&path).map_err(|e| {
-                    format!("tail() cannot read '{}': {}", path, e)
-                })?;
+                let content = std::fs::read_to_string(&path)
+                    .map_err(|e| format!("tail() cannot read '{}': {}", path, e))?;
                 let lines: Vec<&str> = content.lines().collect();
-                let start = if lines.len() > max { lines.len() - max } else { 0 };
+                let start = if lines.len() > max {
+                    lines.len() - max
+                } else {
+                    0
+                };
                 let tail_str = lines[start..].join("\n");
                 Ok(Value::String(tail_str))
             }
@@ -322,9 +312,7 @@ impl Interpreter {
             //          (c) 直接的 Value::PromptSection
             "compose_prompt" => {
                 if args.is_empty() {
-                    return Err(
-                        "compose_prompt() requires at least 1 section".to_string()
-                    );
+                    return Err("compose_prompt() requires at least 1 section".to_string());
                 }
                 let mut buf = String::new();
                 for arg in args {
@@ -347,13 +335,13 @@ impl Interpreter {
                                     return Err(format!(
                                         "compose_prompt: '{}' is not a prompt section (got {:?})",
                                         section_name, other
-                                    ))
+                                    ));
                                 }
                                 None => {
                                     return Err(format!(
                                         "compose_prompt: section '{}' not defined (use 'prompt \"{}\" do ... end' first)",
                                         section_name, section_name
-                                    ))
+                                    ));
                                 }
                             }
                         }
@@ -362,27 +350,28 @@ impl Interpreter {
                                 Value::String(s) => Some(s.clone()),
                                 _ => None,
                             });
-                            let text_val = map.get("text").cloned().unwrap_or(Value::String(String::new()));
+                            let text_val = map
+                                .get("text")
+                                .cloned()
+                                .unwrap_or(Value::String(String::new()));
                             let budget = if let Some(b) = map.get("budget") {
                                 Some(parse_budget_dispatch(b.clone(), "budget")?)
                             } else {
                                 None
                             };
-                            (
-                                "<inline>".to_string(),
-                                role,
-                                Box::new(text_val),
-                                budget,
-                            )
+                            ("<inline>".to_string(), role, Box::new(text_val), budget)
                         }
-                        Value::PromptSection { name, role, text, budget_bytes } => {
-                            (name, role, text, budget_bytes)
-                        }
+                        Value::PromptSection {
+                            name,
+                            role,
+                            text,
+                            budget_bytes,
+                        } => (name, role, text, budget_bytes),
                         other => {
                             return Err(format!(
                                 "compose_prompt: section must be name, dict, or PromptSection (got {:?})",
                                 other
-                            ))
+                            ));
                         }
                     };
                     // 应用 budget 截断
@@ -1276,7 +1265,7 @@ fn parse_budget_dispatch(v: Value, ctx: &str) -> Result<usize, String> {
                     return Err(format!(
                         "{}: unknown budget unit '{}' (B/KB/MB/GB)",
                         ctx, other
-                    ))
+                    ));
                 }
             };
             Ok((num * mult as f64) as usize)

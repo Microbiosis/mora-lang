@@ -42,8 +42,8 @@ use std::sync::OnceLock;
 use image::io::Reader as ImageReader;
 use ocrs::{ImageSource, OcrEngine, OcrEngineParams};
 
-use crate::value::Value;
 use crate::document::DocumentBackend;
+use crate::value::Value;
 
 /// v0.29: 解析 OCR 模型路径 — user-side dir.
 ///
@@ -64,8 +64,7 @@ pub fn user_model_path(name: &str) -> Result<PathBuf, String> {
         let base: PathBuf = std::env::var("XDG_DATA_HOME")
             .map(PathBuf::from)
             .or_else(|_| {
-                std::env::var("HOME")
-                    .map(|h| PathBuf::from(h).join(".local").join("share"))
+                std::env::var("HOME").map(|h| PathBuf::from(h).join(".local").join("share"))
             })
             .map_err(|_| {
                 "ocr.load: cannot resolve OCR model directory. Set MORA_OCR_MODELS_DIR \
@@ -196,7 +195,9 @@ impl ImageBackend {
 }
 
 impl DocumentBackend for ImageBackend {
-    fn origin(&self) -> &'static str { "image" }
+    fn origin(&self) -> &'static str {
+        "image"
+    }
     fn pages(&self) -> Result<Value, String> {
         let mut pd = HashMap::new();
         pd.insert("page_no".into(), Value::Number(1.0));
@@ -205,8 +206,12 @@ impl DocumentBackend for ImageBackend {
         pd.insert("blocks".into(), Value::List(vec![]));
         Ok(Value::List(vec![Value::Dict(pd)]))
     }
-    fn markdown(&self) -> Result<String, String> { Ok(self.lines.join("\n")) }
-    fn text(&self) -> Result<String, String> { Ok(self.lines.join("\n")) }
+    fn markdown(&self) -> Result<String, String> {
+        Ok(self.lines.join("\n"))
+    }
+    fn text(&self) -> Result<String, String> {
+        Ok(self.lines.join("\n"))
+    }
     fn metadata(&self) -> Result<Value, String> {
         let mut m = HashMap::new();
         m.insert("origin".into(), Value::String("image".into()));
@@ -218,7 +223,9 @@ impl DocumentBackend for ImageBackend {
         m.insert("size".into(), Value::Number(self.bytes.len() as f64));
         Ok(Value::Dict(m))
     }
-    fn blocks(&self) -> Result<Value, String> { Ok(Value::List(vec![])) }
+    fn blocks(&self) -> Result<Value, String> {
+        Ok(Value::List(vec![]))
+    }
 }
 
 #[cfg(test)]
@@ -228,8 +235,12 @@ mod tests {
     #[test]
     fn origin_is_image() {
         let backend = ImageBackend {
-            bytes: vec![], width: 0, height: 0, format: "png".into(),
-            lines: vec![], ocr_engine: "rten".into(),
+            bytes: vec![],
+            width: 0,
+            height: 0,
+            format: "png".into(),
+            lines: vec![],
+            ocr_engine: "rten".into(),
         };
         assert_eq!(backend.origin(), "image");
     }
@@ -237,14 +248,20 @@ mod tests {
     #[test]
     fn metadata_has_ocr_engine() {
         let backend = ImageBackend {
-            bytes: vec![], width: 800, height: 600, format: "png".into(),
-            lines: vec![], ocr_engine: "rten".into(),
+            bytes: vec![],
+            width: 800,
+            height: 600,
+            format: "png".into(),
+            lines: vec![],
+            ocr_engine: "rten".into(),
         };
         let meta = backend.metadata().unwrap();
         if let Value::Dict(m) = meta {
             assert_eq!(m.get("ocr_engine"), Some(&Value::String("rten".into())));
             assert_eq!(m.get("format"), Some(&Value::String("png".into())));
-        } else { panic!("metadata should be dict"); }
+        } else {
+            panic!("metadata should be dict");
+        }
     }
 
     /// v0.28 Task 6: end-to-end PNG decode + OCR pipeline against a
@@ -259,10 +276,7 @@ mod tests {
     #[test]
     #[ignore = "v0.28 OCR e2e requires MORA_OCR_MODELS_DIR pointing at the v0.28 vendored models; v0.30 will add CI support for OCR e2e"]
     fn parses_real_png() {
-        let path = format!(
-            "{}/tests/fixtures/sample.png",
-            env!("CARGO_MANIFEST_DIR")
-        );
+        let path = format!("{}/tests/fixtures/sample.png", env!("CARGO_MANIFEST_DIR"));
         if !std::path::Path::new(&path).exists() {
             return;
         }
@@ -273,11 +287,23 @@ mod tests {
         if let Value::Dict(m) = meta {
             let w = m
                 .get("width")
-                .and_then(|v| if let Value::Number(n) = v { Some(*n) } else { None })
+                .and_then(|v| {
+                    if let Value::Number(n) = v {
+                        Some(*n)
+                    } else {
+                        None
+                    }
+                })
                 .expect("width as Number");
             let h = m
                 .get("height")
-                .and_then(|v| if let Value::Number(n) = v { Some(*n) } else { None })
+                .and_then(|v| {
+                    if let Value::Number(n) = v {
+                        Some(*n)
+                    } else {
+                        None
+                    }
+                })
                 .expect("height as Number");
             assert!(w > 0.0, "width should be > 0, got {}", w);
             assert!(h > 0.0, "height should be > 0, got {}", h);

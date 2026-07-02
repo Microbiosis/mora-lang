@@ -13,9 +13,9 @@
 //!
 //! All fields are `pub` so unit tests can construct instances directly and
 //! inspect internals.
-use std::collections::HashMap;
-use crate::value::Value;
 use crate::document::DocumentBackend;
+use crate::value::Value;
+use std::collections::HashMap;
 
 /// v0.27: PDF backend.
 ///

@@ -166,7 +166,11 @@ mod tests {
         let md = "# Title\n\nSome **bold** text.";
         let backend = MarkdownBackend::new(md);
         let text = backend.text().unwrap();
-        assert!(!text.contains("#"), "should strip heading marker, got: {:?}", text);
+        assert!(
+            !text.contains("#"),
+            "should strip heading marker, got: {:?}",
+            text
+        );
         assert!(text.contains("Title"));
         assert!(text.contains("bold"));
     }

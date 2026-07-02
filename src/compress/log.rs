@@ -52,10 +52,7 @@ impl SubCompressor for LogSubCompressor {
     fn sniff(&self, content: &str) -> f32 {
         let line_hits = content
             .lines()
-            .filter(|l| {
-                looks_like_iso_prefix(l)
-                    || SYSLOG_LEVELS.iter().any(|k| l.contains(k))
-            })
+            .filter(|l| looks_like_iso_prefix(l) || SYSLOG_LEVELS.iter().any(|k| l.contains(k)))
             .count();
         let total = content.lines().count().max(1);
         if (line_hits as f32) / (total as f32) >= 0.4 {
@@ -81,10 +78,7 @@ impl SubCompressor for LogSubCompressor {
             if line.contains("ERROR") || line.contains("FATAL") {
                 keep.push(line);
                 error_count += 1;
-            } else if line.contains("INFO")
-                || line.contains("WARN")
-                || line.contains("DEBUG")
-            {
+            } else if line.contains("INFO") || line.contains("WARN") || line.contains("DEBUG") {
                 keep.push(line);
             } else {
                 // 非日志行也保留 (避免截断非结构化日志如 stack trace)

@@ -1533,10 +1533,10 @@ impl ParserV2 {
             let key = self.consume_identifier("Expected 'role' or 'budget' after 'set'");
             self.consume(&TokenType::Colon, "Expected ':' after key");
             let value = self.expression();
-            return Some(self.arena.alloc_stmt(
-                StmtKind::PromptSet { key, value },
-                span,
-            ));
+            return Some(
+                self.arena
+                    .alloc_stmt(StmtKind::PromptSet { key, value }, span),
+            );
         }
         // 'read <expr>'
         if self.match_token(&[TokenType::Read]) {
@@ -1574,7 +1574,11 @@ impl ParserV2 {
         // 顶层 expression_statement 不接受外部 span,所以插入临时 advance 模式:
         // 直接调用 expression 然后 wrap 成 Expr stmt
         let expr_id = self.expression();
-        let span = self.arena.get_expr(expr_id).map(|e| e.span).unwrap_or(_span);
+        let span = self
+            .arena
+            .get_expr(expr_id)
+            .map(|e| e.span)
+            .unwrap_or(_span);
         self.arena.alloc_stmt(StmtKind::Expr(expr_id), span)
     }
 
@@ -1616,10 +1620,10 @@ impl ParserV2 {
                 let key = self.consume_identifier("Expected 'origin' or 'max_pages' after 'set'");
                 self.consume(&TokenType::Colon, "Expected ':' after key");
                 let value = self.expression();
-                body.push(self.arena.alloc_stmt(
-                    StmtKind::DocumentSet { key, value },
-                    s,
-                ));
+                body.push(
+                    self.arena
+                        .alloc_stmt(StmtKind::DocumentSet { key, value }, s),
+                );
                 continue;
             }
             // read <expr>
@@ -1637,6 +1641,7 @@ impl ParserV2 {
             self.advance();
         }
         self.consume(&TokenType::End, "Expected 'end' to close document section");
-        self.arena.alloc_stmt(StmtKind::DocumentSection { name, body }, span)
+        self.arena
+            .alloc_stmt(StmtKind::DocumentSection { name, body }, span)
     }
 }

@@ -1,6 +1,6 @@
 //! v0.27: Document unified IR + DocumentBackend trait
-use std::collections::HashMap;
 use crate::value::Value;
+use std::collections::HashMap;
 
 pub mod backend;
 
@@ -68,8 +68,7 @@ pub fn parse_document(path: &str) -> Result<Value, String> {
         "md" | "markdown" => {
             let text = std::fs::read_to_string(path)
                 .map_err(|e| format!("document.parse: cannot read '{}': {}", path, e))?;
-            let backend =
-                crate::document::backend::markdown::MarkdownBackend::new(&text);
+            let backend = crate::document::backend::markdown::MarkdownBackend::new(&text);
             let meta = backend.metadata()?;
             let mut metadata = match meta {
                 Value::Dict(m) => m,
@@ -125,10 +124,8 @@ pub fn parse_document(path: &str) -> Result<Value, String> {
         "png" => {
             let bytes = std::fs::read(path)
                 .map_err(|e| format!("document.parse: cannot read '{}': {}", path, e))?;
-            let backend = crate::document::backend::image::ImageBackend::from_bytes(
-                bytes,
-                "png".into(),
-            )?;
+            let backend =
+                crate::document::backend::image::ImageBackend::from_bytes(bytes, "png".into())?;
             let meta = backend.metadata()?;
             let mut metadata = match meta {
                 Value::Dict(m) => m,
@@ -159,7 +156,11 @@ mod tests {
         p.push("tests/fixtures/sample.pdf");
         let p_str = p.to_string_lossy().to_string();
         let r = parse_document(&p_str);
-        assert!(r.is_ok(), "parse_document for sample.pdf should succeed, got: {:?}", r.err());
+        assert!(
+            r.is_ok(),
+            "parse_document for sample.pdf should succeed, got: {:?}",
+            r.err()
+        );
         match r.unwrap() {
             Value::Document { .. } => {}
             other => panic!("expected Value::Document, got: {:?}", other),
@@ -175,7 +176,11 @@ mod tests {
         p.push("tests/fixtures/sample.md");
         let p_str = p.to_string_lossy().to_string();
         let r = parse_document(&p_str);
-        assert!(r.is_ok(), "parse_document for sample.md should succeed, got: {:?}", r.err());
+        assert!(
+            r.is_ok(),
+            "parse_document for sample.md should succeed, got: {:?}",
+            r.err()
+        );
         match r.unwrap() {
             Value::Document { .. } => {}
             other => panic!("expected Value::Document, got: {:?}", other),
@@ -191,7 +196,11 @@ mod tests {
         p.push("tests/fixtures/sample.html");
         let p_str = p.to_string_lossy().to_string();
         let r = parse_document(&p_str);
-        assert!(r.is_ok(), "parse_document for sample.html should succeed, got: {:?}", r.err());
+        assert!(
+            r.is_ok(),
+            "parse_document for sample.html should succeed, got: {:?}",
+            r.err()
+        );
         match r.unwrap() {
             Value::Document { .. } => {}
             other => panic!("expected Value::Document, got: {:?}", other),

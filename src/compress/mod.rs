@@ -88,7 +88,9 @@ pub struct ContentRouter {
 impl ContentRouter {
     /// 创建空路由器 (Task 1 中; Task 3-5 完成后改为 default_router)
     pub fn empty() -> Self {
-        Self { compressors: vec![] }
+        Self {
+            compressors: vec![],
+        }
     }
 
     /// 默认路由器 (Task 2: 加入 JsonSubCompressor; Task 3 加入 TextSubCompressor;
@@ -117,7 +119,11 @@ impl ContentRouter {
             .iter()
             .filter_map(|c| {
                 let score = c.sniff(content);
-                if score >= 0.6 { Some((score, c.clone())) } else { None }
+                if score >= 0.6 {
+                    Some((score, c.clone()))
+                } else {
+                    None
+                }
             })
             .max_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal))
             .map(|(_, c)| c)
@@ -125,14 +131,14 @@ impl ContentRouter {
 }
 
 // 子压缩器子模块 (Tasks 3-5 填充)
-pub mod json;   // Task 2 填充
-pub mod code;   // Task 4 填充
-pub mod html;   // Task 4 填充
-pub mod log;    // Task 4 填充
-pub mod text;   // Task 3 填充
+pub mod code; // Task 4 填充
+pub mod html; // Task 4 填充
+pub mod json; // Task 2 填充
+pub mod log; // Task 4 填充
+pub mod text; // Task 3 填充
 
 // v0.30: re-export SmartCrusher 主入口
-pub use json::{crush_json, crush_json_string, CrushResult, FieldRole, FieldStats, ArrayType};
+pub use json::{ArrayType, CrushResult, FieldRole, FieldStats, crush_json, crush_json_string};
 
 /// v0.29: 从 Value 中提取可压缩的纯文本。
 ///
@@ -263,18 +269,14 @@ pub fn compress_top(
                 return Err(format!(
                     "compress.json: expected List, got {}",
                     value_type_simple(input)
-                ))
+                ));
             }
         };
         let result = crush_json(&items, target, options);
         let json = crate::flow::value_to_json(&crate::value::Value::List(result.items.clone()));
         return Ok(crate::value::Value::String(format!(
             "{}\n<compressed:method=smart_crusher strategy={} items={} total={} savings={:.2}>",
-            json,
-            result.strategy_used,
-            result.items_kept,
-            result.items_total,
-            result.savings_ratio
+            json, result.strategy_used, result.items_kept, result.items_total, result.savings_ratio
         )));
     }
 
@@ -285,9 +287,9 @@ pub fn compress_top(
     match strategy {
         "auto" => {
             let router = ContentRouter::default_router();
-            let comp = router.sniff(&text).ok_or_else(|| {
-                "compress.auto: no compressor matched for content".to_string()
-            })?;
+            let comp = router
+                .sniff(&text)
+                .ok_or_else(|| "compress.auto: no compressor matched for content".to_string())?;
             let out = comp.compress(&text, max_bytes, options)?;
             Ok(crate::value::Value::String(out))
         }

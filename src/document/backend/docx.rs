@@ -28,9 +28,9 @@
 //! contract through the 5 stages: `from_bytes`, `parse`, `parse_metadata`
 //! (folded into `parse`), per-paragraph text extraction, `metadata()`
 //! composition.
-use std::collections::HashMap;
-use crate::value::Value;
 use crate::document::DocumentBackend;
+use crate::value::Value;
+use std::collections::HashMap;
 
 /// v0.28: DOCX backend.
 ///
@@ -61,12 +61,7 @@ impl DocxBackend {
         // 1. Build the parser. `DocxParser::from_bytes` consumes the Vec<u8>
         //    and returns the prepared container; this is the cheap step.
         let mut parser = undoc::docx::DocxParser::from_bytes(bytes.clone())
-            .map_err(|e| {
-                format!(
-                    "document.parse: undoc docx from_bytes error: {}",
-                    e
-                )
-            })?;
+            .map_err(|e| format!("document.parse: undoc docx from_bytes error: {}", e))?;
 
         // 2. Run `parse`. This is where the section tree and metadata are
         //    populated; it's the stage that touches user XML the most.

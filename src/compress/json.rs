@@ -23,13 +23,13 @@ use crate::value::Value;
 /// 字段语义角色（按值分布推断，与字段名无关）
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum FieldRole {
-    Id,        // uniqueness > 0.9, 或 UUID, 或顺序递增数字
-    Score,     // bounded numeric range (0-1 或 0-100)
-    Temporal,  // date/timestamp pattern
-    Error,     // 字段名或值含 ERROR_KEYWORDS
-    Anomaly,   // 该字段值 >2σ from mean
-    Constant,  // 所有项相同
-    Generic,   // 兜底
+    Id,       // uniqueness > 0.9, 或 UUID, 或顺序递增数字
+    Score,    // bounded numeric range (0-1 或 0-100)
+    Temporal, // date/timestamp pattern
+    Error,    // 字段名或值含 ERROR_KEYWORDS
+    Anomaly,  // 该字段值 >2σ from mean
+    Constant, // 所有项相同
+    Generic,  // 兜底
 }
 
 /// 单字段的统计特征
@@ -48,11 +48,11 @@ pub struct FieldStats {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ArrayType {
-    TopScores,    // 存在 Score 字段
-    TimeSeries,   // 存在 Temporal 字段
-    Clustered,    // 字段值高冗余 (uniqueness < 0.3)
-    Uniform,      // 所有项 schema 一致且字段数少 (<10)
-    Generic,      // 兜底
+    TopScores,  // 存在 Score 字段
+    TimeSeries, // 存在 Temporal 字段
+    Clustered,  // 字段值高冗余 (uniqueness < 0.3)
+    Uniform,    // 所有项 schema 一致且字段数少 (<10)
+    Generic,    // 兜底
 }
 
 // ──────────────────── 策略 trait ────────────────────
@@ -93,7 +93,10 @@ impl CrushResult {
     pub fn metadata(&self) -> HashMap<String, Value> {
         let mut m = HashMap::new();
         m.insert("strategy".into(), Value::String(self.strategy_used.clone()));
-        m.insert("array_type".into(), Value::String(format!("{:?}", self.array_type)));
+        m.insert(
+            "array_type".into(),
+            Value::String(format!("{:?}", self.array_type)),
+        );
         m.insert("items_total".into(), Value::Number(self.items_total as f64));
         m.insert("items_kept".into(), Value::Number(self.items_kept as f64));
         m.insert(
@@ -111,8 +114,20 @@ impl CrushResult {
 // ──────────────────── 错误关键字常量 ────────────────────
 
 pub const ERROR_KEYWORDS: &[&str] = &[
-    "error", "failed", "exception", "fatal", "panic", "err", "denied", "rejected",
-    "timeout", "abort", "crash", "refused", "unauthorized", "forbidden",
+    "error",
+    "failed",
+    "exception",
+    "fatal",
+    "panic",
+    "err",
+    "denied",
+    "rejected",
+    "timeout",
+    "abort",
+    "crash",
+    "refused",
+    "unauthorized",
+    "forbidden",
 ];
 
 // ──────────────────── 字段角色检测器 ────────────────────
@@ -208,7 +223,9 @@ fn detect_id(uniqueness: f32, values: &[&Value]) -> Option<FieldRole> {
         return Some(FieldRole::Id);
     }
     // 字符串字段: 高 uniqueness 也算 Id (e.g. user_0, user_1, ...)
-    if uniqueness > 0.9 && !values.is_empty() && values.iter().all(|v| matches!(v, Value::String(_)))
+    if uniqueness > 0.9
+        && !values.is_empty()
+        && values.iter().all(|v| matches!(v, Value::String(_)))
     {
         return Some(FieldRole::Id);
     }
@@ -362,8 +379,7 @@ fn is_sequential_numeric(values: &[&Value]) -> bool {
     if nums.len() < 3 {
         return false;
     }
-    nums.windows(2)
-        .all(|w| (w[1] - w[0] - 1.0).abs() < 0.001)
+    nums.windows(2).all(|w| (w[1] - w[0] - 1.0).abs() < 0.001)
 }
 
 fn is_timestamp_pattern(v: &Value) -> bool {
@@ -398,10 +414,9 @@ pub fn detect_array_type(_items: &[Value], fields: &[FieldStats]) -> ArrayType {
     // Uniform: 字段少 (<10) 且全部是 Constant 或 Generic (即没有语义角色的纯数据)
     // 之前误把 is_numeric 全 true 的 Id 字段也算 Uniform, 改为排除 Id
     if fields.len() < 10
-        && fields.iter().all(|f| {
-            f.role == FieldRole::Constant
-                || f.role == FieldRole::Generic
-        })
+        && fields
+            .iter()
+            .all(|f| f.role == FieldRole::Constant || f.role == FieldRole::Generic)
     {
         return ArrayType::Uniform;
     }
@@ -683,11 +698,7 @@ pub fn outliers_by_zscore(values: &[&Value], z: f64) -> Vec<usize> {
         return vec![];
     }
     let mean = nums.iter().map(|(_, n)| n).sum::<f64>() / nums.len() as f64;
-    let var = nums
-        .iter()
-        .map(|(_, n)| (n - mean).powi(2))
-        .sum::<f64>()
-        / nums.len() as f64;
+    let var = nums.iter().map(|(_, n)| (n - mean).powi(2)).sum::<f64>() / nums.len() as f64;
     let std = var.sqrt();
     if std == 0.0 {
         return vec![];
@@ -727,10 +738,7 @@ impl Constraint for KeepBoundaryConstraint {
 
 /// 尝试无损压缩: 转 csv-schema 或 markdown-kv
 /// 返回 None 表示不适用 (schema 不均匀)
-pub fn try_lossless_compact(
-    items: &[Value],
-    fields: &[FieldStats],
-) -> Option<CrushResult> {
+pub fn try_lossless_compact(items: &[Value], fields: &[FieldStats]) -> Option<CrushResult> {
     if items.is_empty() {
         return None;
     }
@@ -749,9 +757,12 @@ pub fn try_lossless_compact(
     }
 
     let all_scalar = fields.iter().all(|f| {
-        f.sample
-            .iter()
-            .all(|v| matches!(v, Value::String(_) | Value::Number(_) | Value::Bool(_) | Value::Nil))
+        f.sample.iter().all(|v| {
+            matches!(
+                v,
+                Value::String(_) | Value::Number(_) | Value::Bool(_) | Value::Nil
+            )
+        })
     });
 
     let compact_str = if all_scalar && fields.iter().any(|f| f.is_numeric) {
@@ -762,11 +773,7 @@ pub fn try_lossless_compact(
                 if let Value::Dict(d) = it {
                     fields
                         .iter()
-                        .map(|f| {
-                            d.get(&f.name)
-                                .map(value_to_json)
-                                .unwrap_or_default()
-                        })
+                        .map(|f| d.get(&f.name).map(value_to_json).unwrap_or_default())
                         .collect::<Vec<_>>()
                         .join(",")
                 } else {
@@ -804,11 +811,7 @@ pub fn try_lossless_compact(
 // ──────────────────── 主入口 `crush_json` ────────────────────
 
 /// v0.30 SmartCrusher 主入口
-pub fn crush_json(
-    items: &[Value],
-    target: usize,
-    options: &CompressOptions,
-) -> CrushResult {
+pub fn crush_json(items: &[Value], target: usize, options: &CompressOptions) -> CrushResult {
     // 1. 边界
     if items.is_empty() {
         return CrushResult {
@@ -824,8 +827,8 @@ pub fn crush_json(
     }
     // 短列表直通: items <= 5 或 items <= target (取 min)
     // 当显式 strategy="lossless" 时, 不直通 (让 Lossless-First 短路判断是否真的无损)
-    let short_passthrough = items.len() <= 5
-        || (items.len() <= target && options.strategy != "lossless");
+    let short_passthrough =
+        items.len() <= 5 || (items.len() <= target && options.strategy != "lossless");
     if short_passthrough {
         return CrushResult {
             items: items.to_vec(),
@@ -852,8 +855,8 @@ pub fn crush_json(
         "cluster" => Box::new(ClusterSampleStrategy),
         "lossless" => {
             if let Some(compact) = try_lossless_compact(items, &fields) {
-                let ratio = 1.0
-                    - (compact.byte_estimate as f32 / estimate_bytes(items).max(1) as f32);
+                let ratio =
+                    1.0 - (compact.byte_estimate as f32 / estimate_bytes(items).max(1) as f32);
                 if ratio >= options.lossless_min_savings_ratio {
                     return compact;
                 }
@@ -879,12 +882,8 @@ pub fn crush_json(
     if options.preserve_outliers {
         constraints.push(Box::new(KeepOutliersConstraint));
     }
-    let k_first = options
-        .k_first
-        .unwrap_or((target as f32 * 0.15) as usize);
-    let k_last = options
-        .k_last
-        .unwrap_or((target as f32 * 0.15) as usize);
+    let k_first = options.k_first.unwrap_or((target as f32 * 0.15) as usize);
+    let k_last = options.k_last.unwrap_or((target as f32 * 0.15) as usize);
     if k_first + k_last < target {
         constraints.push(Box::new(KeepBoundaryConstraint { k_first, k_last }));
     }
@@ -926,7 +925,7 @@ pub fn crush_json_string(
             return Err(format!(
                 "crush.json: expected JSON array, got {}",
                 value_type_name(&other)
-            ))
+            ));
         }
     };
     Ok(crush_json(&items, target, options))
@@ -973,7 +972,7 @@ impl crate::compress::SubCompressor for JsonSubCompressor {
                 return Err(format!(
                     "crush.json: expected JSON array, got {}",
                     value_type_name(&parsed)
-                ))
+                ));
             }
         };
         // 由 max_bytes 推 target: 假设每项 200 bytes (与 v0.29 一致)
@@ -982,11 +981,7 @@ impl crate::compress::SubCompressor for JsonSubCompressor {
         let json = value_to_json(&Value::List(result.items.clone()));
         Ok(format!(
             "{}\n<compressed:method=smart_crusher strategy={} items={} total={} savings={:.2}>",
-            json,
-            result.strategy_used,
-            result.items_kept,
-            result.items_total,
-            result.savings_ratio
+            json, result.strategy_used, result.items_kept, result.items_total, result.savings_ratio
         ))
     }
 
@@ -1016,10 +1011,8 @@ mod tests {
             d
         });
         let fields = extract_field_stats(&items);
-        let role_map: HashMap<&str, FieldRole> = fields
-            .iter()
-            .map(|f| (f.name.as_str(), f.role))
-            .collect();
+        let role_map: HashMap<&str, FieldRole> =
+            fields.iter().map(|f| (f.name.as_str(), f.role)).collect();
         assert_eq!(role_map["id"], FieldRole::Generic);
         assert_eq!(role_map["name"], FieldRole::Id);
     }
@@ -1043,10 +1036,7 @@ mod tests {
             d
         });
         if let Value::Dict(d) = &mut items[5] {
-            d.insert(
-                "msg".into(),
-                Value::String("operation failed".into()),
-            );
+            d.insert("msg".into(), Value::String("operation failed".into()));
         }
         let opts = CompressOptions::default();
         let r = crush_json(&items, 2, &opts);
@@ -1078,11 +1068,7 @@ mod tests {
             let mut d = HashMap::new();
             d.insert(
                 "value".into(),
-                Value::Number(if i == 50 {
-                    1000.0
-                } else {
-                    (i as f64) / 100.0
-                }),
+                Value::Number(if i == 50 { 1000.0 } else { (i as f64) / 100.0 }),
             );
             d
         });
@@ -1107,7 +1093,11 @@ mod tests {
         };
         let r = crush_json(&items, 5, &opts);
         assert_eq!(r.strategy_used, "topn");
-        assert!(r.items.len() <= 5, "top 5 + constraints ≤ 5: got {}", r.items.len());
+        assert!(
+            r.items.len() <= 5,
+            "top 5 + constraints ≤ 5: got {}",
+            r.items.len()
+        );
         // 必须包含最高分 (sqrt(99) ≈ 9.95)
         let scores: Vec<f64> = r
             .items
@@ -1227,7 +1217,11 @@ mod tests {
             d
         });
         let r = crush_json(&items, 10, &CompressOptions::default());
-        assert!(r.savings_ratio > 0.8, "应节省 > 80%, got {}", r.savings_ratio);
+        assert!(
+            r.savings_ratio > 0.8,
+            "应节省 > 80%, got {}",
+            r.savings_ratio
+        );
         let meta = r.metadata();
         assert!(meta.contains_key("strategy"));
         assert!(meta.contains_key("savings_ratio"));

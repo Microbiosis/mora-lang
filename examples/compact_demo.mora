@@ -29,8 +29,18 @@ task main()
     print("用法: crush_json(list, 10) 或 list.crush_json(10)")
 
     -- 3. 完整架构 (auto) — content router
+    -- v0.30 注: auto 策略需长文本触发 ContentRouter sniff (短文本都 < 0.6 阈值)
+    -- 中文长文本所有 sub-compressor sniff 都返回 0.0 (嗅探仅认英文关键字),
+    -- 用一段含 ERROR 关键字的英文长文本演示 auto 路由.
     print("=== auto strategy ===")
-    let auto_text = compress("hello world", "auto")  -- 路由到 TextSubCompressor
+    let en_text = "INFO system startup
+INFO loaded config
+ERROR connection failed at line 42
+ERROR retry attempt 3
+INFO recovered
+WARN deprecated api
+INFO shutdown complete"
+    let auto_text = compress(en_text, "auto")
     print(auto_text)
 
     print("compress demo 完成")

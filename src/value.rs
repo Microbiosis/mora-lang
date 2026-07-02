@@ -153,13 +153,20 @@ impl PartialEq for Value {
             (Value::List(a), Value::List(b)) => a == b,
             (Value::Dict(a), Value::Dict(b)) => a == b,
             (
-                Value::PromptSection { name: a, role: ra, text: ta, budget_bytes: ba },
-                Value::PromptSection { name: b, role: rb, text: tb, budget_bytes: bb },
+                Value::PromptSection {
+                    name: a,
+                    role: ra,
+                    text: ta,
+                    budget_bytes: ba,
+                },
+                Value::PromptSection {
+                    name: b,
+                    role: rb,
+                    text: tb,
+                    budget_bytes: bb,
+                },
             ) => a == b && ra == rb && ta == tb && ba == bb,
-            (
-                Value::Document { metadata: a, .. },
-                Value::Document { metadata: b, .. },
-            ) => a == b,
+            (Value::Document { metadata: a, .. }, Value::Document { metadata: b, .. }) => a == b,
             _ => false,
         }
     }
@@ -240,7 +247,12 @@ impl std::fmt::Display for Value {
             Value::Macro { name, .. } => {
                 write!(f, "<macro {}>", name)
             }
-            Value::PromptSection { name, role, budget_bytes, .. } => {
+            Value::PromptSection {
+                name,
+                role,
+                budget_bytes,
+                ..
+            } => {
                 write!(
                     f,
                     "<prompt_section name={} role={:?} budget={:?}>",

@@ -63,10 +63,7 @@ impl SubCompressor for CodeSubCompressor {
                 || line.trim_start().starts_with('#');
             if is_signature {
                 if body_lines > 0 {
-                    out.push_str(&format!(
-                        "    ... [{} body lines elided] ...\n",
-                        body_lines
-                    ));
+                    out.push_str(&format!("    ... [{} body lines elided] ...\n", body_lines));
                     body_lines = 0;
                 }
                 out.push_str(line);
@@ -79,10 +76,7 @@ impl SubCompressor for CodeSubCompressor {
             }
         }
         if body_lines > 0 {
-            out.push_str(&format!(
-                "    ... [{} body lines elided] ...\n",
-                body_lines
-            ));
+            out.push_str(&format!("    ... [{} body lines elided] ...\n", body_lines));
         }
         out.push_str(&format!(
             "\n<compressed:method=code original_size={}>\n",
@@ -114,11 +108,17 @@ mod tests {
     #[test]
     fn test_code_compress_preserves_signatures() {
         let c = CodeSubCompressor;
-        let src = "fn main() {\n    let x = 1;\n    let y = 2;\n    let z = 3;\n}\nfn helper() {}\n";
+        let src =
+            "fn main() {\n    let x = 1;\n    let y = 2;\n    let z = 3;\n}\nfn helper() {}\n";
         let opts = CompressOptions::default();
-        let out = c.compress(src, 200, &opts).expect("compress should not error");
+        let out = c
+            .compress(src, 200, &opts)
+            .expect("compress should not error");
         assert!(out.contains("fn main()"), "must preserve fn main(): {out}");
-        assert!(out.contains("fn helper()"), "must preserve fn helper(): {out}");
+        assert!(
+            out.contains("fn helper()"),
+            "must preserve fn helper(): {out}"
+        );
         assert!(
             out.contains("body lines elided"),
             "must include elide marker: {out}"

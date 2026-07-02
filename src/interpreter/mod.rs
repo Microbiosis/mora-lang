@@ -2572,7 +2572,10 @@ print(b.len())
 let buf = compose_prompt()
 "#;
         let result = run(src);
-        assert!(result.is_err(), "compose_prompt() with no args should error");
+        assert!(
+            result.is_err(),
+            "compose_prompt() with no args should error"
+        );
         assert!(result.unwrap_err().contains("at least 1"));
     }
 
@@ -2695,7 +2698,10 @@ document "report" do
 end
 "#;
         let n = parse(src);
-        assert!(n >= 1, "document block should produce >= 1 top-level statement");
+        assert!(
+            n >= 1,
+            "document block should produce >= 1 top-level statement"
+        );
     }
 }
 
@@ -2944,7 +2950,7 @@ print(result.contains("original_size=11"))
         run(src).expect("compress lossless should work");
     }
 
-/// T09: SmartCrusher crush_json(list, 10) — auto 模式选 TopN 策略 (有 score 字段)
+    /// T09: SmartCrusher crush_json(list, 10) — auto 模式选 TopN 策略 (有 score 字段)
     #[test]
     fn test_crush_json_list_basic() {
         use crate::compress;
@@ -3011,10 +3017,16 @@ let result = compact("text")
             let result = compact("test")
         "#;
         let result = run(src);
-        assert!(result.is_err(), "v0.25 compact() should be removed in v0.29");
+        assert!(
+            result.is_err(),
+            "v0.25 compact() should be removed in v0.29"
+        );
         let err = result.unwrap_err();
-        assert!(err.contains("Undefined function") || err.contains("compact"),
-                "error should mention compact being undefined, got: {}", err);
+        assert!(
+            err.contains("Undefined function") || err.contains("compact"),
+            "error should mention compact being undefined, got: {}",
+            err
+        );
     }
 
     #[test]

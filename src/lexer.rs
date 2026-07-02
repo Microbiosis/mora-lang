@@ -90,6 +90,9 @@ pub enum TokenType {
     GreaterEqual,
     LessEqual,
     Pipe,
+    // v0.30: `!` 前缀 (逻辑非) 和 `@` 装饰符 (如 @start, @exit graph 节点)
+    Bang,
+    At,
     Arrow,
     // v0.06.2: ? 操作符（expr? 传播 Result 错误）
     Question,
@@ -406,7 +409,13 @@ impl Lexer {
                         column: start_col,
                     })
                 } else {
-                    panic!("Unexpected '!' at line {}", self.line)
+                    // v0.30: `!` 作为前缀操作符 (逻辑非), 在 parser 阶段处理
+                    // (mora 同时支持 `not` 关键字, 两者等价)
+                    Some(Token {
+                        token_type: TokenType::Bang,
+                        line: start_line,
+                        column: start_col,
+                    })
                 }
             }
             // v0.06.2: ? 操作符
@@ -492,6 +501,19 @@ impl Lexer {
                         return Some(self.prompt_string_from(start_line, start_col));
                     }
                     Some(self.identifier_from(start_line, start_col))
+                } else if c == '@' {
+                    // v0.30: `@` 装饰符 (e.g. @start, @exit 用于 graph node label)
+                    // 把 @ 后跟的标识符作为整体 identifier 处理 (含 @ 前缀)
+                    self.advance(); // 消费 @
+                    let mut name = String::from("@");
+                    while self.peek().is_ascii_alphanumeric() || self.peek() == '_' {
+                        name.push(self.advance());
+                    }
+                    Some(Token {
+                        token_type: TokenType::At,
+                        line: start_line,
+                        column: start_col,
+                    })
                 } else {
                     panic!("Unexpected character '{}' at line {}", c, self.line)
                 }

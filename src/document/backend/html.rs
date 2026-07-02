@@ -18,8 +18,8 @@
 
 use std::collections::HashMap;
 
-use quick_xml::events::Event;
 use quick_xml::Reader;
+use quick_xml::events::Event;
 
 use crate::document::DocumentBackend;
 use crate::value::Value;
@@ -35,7 +35,11 @@ pub struct HtmlBackend {
 impl HtmlBackend {
     pub fn new(s: &str) -> Self {
         let (title, author) = extract_meta(s);
-        Self { source: s.to_string(), title, author }
+        Self {
+            source: s.to_string(),
+            title,
+            author,
+        }
     }
 }
 
@@ -44,7 +48,7 @@ fn extract_meta(s: &str) -> (Option<String>, Option<String>) {
     let mut author: Option<String> = None;
     let mut reader = Reader::from_str(s);
     reader.config_mut().trim_text(true);
-        reader.config_mut().check_end_names = false;
+    reader.config_mut().check_end_names = false;
     let mut buf = Vec::new();
     loop {
         match reader.read_event_into(&mut buf) {
@@ -63,8 +67,11 @@ fn extract_meta(s: &str) -> (Option<String>, Option<String>) {
                     for attr in e.attributes().flatten() {
                         let k = String::from_utf8_lossy(attr.key.as_ref()).to_string();
                         let v = String::from_utf8_lossy(&attr.value).to_string();
-                        if k == "name" { aname = Some(v); }
-                        else if k == "content" { acontent = Some(v); }
+                        if k == "name" {
+                            aname = Some(v);
+                        } else if k == "content" {
+                            acontent = Some(v);
+                        }
                     }
                     if aname.as_deref() == Some("author") {
                         author = acontent;
@@ -93,7 +100,10 @@ fn make_block(kind: &str, text: &str) -> Value {
 }
 
 fn is_block_tag(name: &str) -> bool {
-    matches!(name, "p" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "pre" | "code")
+    matches!(
+        name,
+        "p" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "pre" | "code"
+    )
 }
 
 fn tag_kind(name: &str) -> Option<&'static str> {
@@ -106,7 +116,9 @@ fn tag_kind(name: &str) -> Option<&'static str> {
 }
 
 impl DocumentBackend for HtmlBackend {
-    fn origin(&self) -> &'static str { "html" }
+    fn origin(&self) -> &'static str {
+        "html"
+    }
 
     fn pages(&self) -> Result<Value, String> {
         let blocks = self.blocks()?;
@@ -118,7 +130,9 @@ impl DocumentBackend for HtmlBackend {
         Ok(Value::List(vec![Value::Dict(pd)]))
     }
 
-    fn markdown(&self) -> Result<String, String> { self.text() }
+    fn markdown(&self) -> Result<String, String> {
+        self.text()
+    }
 
     fn text(&self) -> Result<String, String> {
         let mut reader = Reader::from_str(&self.source);
@@ -131,7 +145,9 @@ impl DocumentBackend for HtmlBackend {
             match reader.read_event_into(&mut buf) {
                 Ok(Event::Start(e)) => {
                     let name = String::from_utf8_lossy(e.name().as_ref()).to_string();
-                    if name == "script" || name == "style" { skip_depth += 1; }
+                    if name == "script" || name == "style" {
+                        skip_depth += 1;
+                    }
                 }
                 Ok(Event::End(e)) => {
                     let name = String::from_utf8_lossy(e.name().as_ref()).to_string();
@@ -252,13 +268,29 @@ mod tests {
         }
 
         let text = backend.text().unwrap();
-        assert!(!text.contains("alert"), "script body should be stripped, got: {:?}", text);
-        assert!(text.contains("Hello"), "should contain heading text, got: {:?}", text);
-        assert!(text.contains("World"), "should contain paragraph text, got: {:?}", text);
+        assert!(
+            !text.contains("alert"),
+            "script body should be stripped, got: {:?}",
+            text
+        );
+        assert!(
+            text.contains("Hello"),
+            "should contain heading text, got: {:?}",
+            text
+        );
+        assert!(
+            text.contains("World"),
+            "should contain paragraph text, got: {:?}",
+            text
+        );
 
         let blocks = backend.blocks().unwrap();
         if let Value::List(bs) = blocks {
-            assert!(bs.len() >= 3, "should produce heading+paragraph+code blocks, got {}", bs.len());
+            assert!(
+                bs.len() >= 3,
+                "should produce heading+paragraph+code blocks, got {}",
+                bs.len()
+            );
         } else {
             panic!("blocks should be a list");
         }

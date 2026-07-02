@@ -92,7 +92,10 @@ pub fn summary_llm_impl(content: &str, _max_bytes: usize) -> Result<String, Stri
     let api_key = std::env::var("OPENAI_API_KEY").unwrap_or_default();
     let preview: String = content.chars().take(200).collect();
     if api_key.is_empty() {
-        Ok(format!("{}\n<compressed:method=summary mock_mode>", preview))
+        Ok(format!(
+            "{}\n<compressed:method=summary mock_mode>",
+            preview
+        ))
     } else {
         // v0.29: 即使 API key 设置也走 mock, 避免无 LLM 客户端时 panic。
         // v0.30+ 会改成真实调用 (那时再有 OPENAI_API_KEY 时也确保有网络 / SDK)。
@@ -157,8 +160,14 @@ mod tests {
     fn test_text_head_tail_basic() {
         let text = long_text();
         let result = head_tail_impl(&text, 0.3, 0.3, 200);
-        assert!(result.contains("elided"), "must contain elided marker: {result}");
-        assert!(result.starts_with("line 0"), "must start with first line: {result}");
+        assert!(
+            result.contains("elided"),
+            "must contain elided marker: {result}"
+        );
+        assert!(
+            result.starts_with("line 0"),
+            "must start with first line: {result}"
+        );
         // "line 99" is the last entry, expect it (or "line 99\n") near the end
         assert!(
             result.ends_with("line 99\n") || result.contains("line 99"),
@@ -182,8 +191,13 @@ mod tests {
         };
         let c = TextSubCompressor;
         let text = "hello world";
-        let result = c.compress(text, 100, &opts).expect("lossless should not error");
-        assert!(result.contains("hello world"), "lossless must preserve original");
+        let result = c
+            .compress(text, 100, &opts)
+            .expect("lossless should not error");
+        assert!(
+            result.contains("hello world"),
+            "lossless must preserve original"
+        );
         assert!(
             result.contains("original_size=11"),
             "lossless must include original_size marker"

@@ -132,12 +132,8 @@ impl Interpreter {
             StmtKind::PromptSection { name, body } => {
                 self.execute_prompt_section(name, body, arena)
             }
-            StmtKind::PromptSet { key, value } => {
-                self.execute_prompt_set(key, *value, arena)
-            }
-            StmtKind::PromptRead(path_id) => {
-                self.execute_prompt_read(*path_id, arena)
-            }
+            StmtKind::PromptSet { key, value } => self.execute_prompt_set(key, *value, arena),
+            StmtKind::PromptRead(path_id) => self.execute_prompt_read(*path_id, arena),
             StmtKind::DocumentSection { name, body } => {
                 self.execute_document_section(name, body, arena)
             }
@@ -795,7 +791,7 @@ impl Interpreter {
     ) -> Result<FlowSignal, String> {
         let mut role: Option<String> = None;
         let mut budget_bytes: Option<usize> = None;
-        let mut content = String::new();   // 多 read/tail 顺序拼接
+        let mut content = String::new(); // 多 read/tail 顺序拼接
 
         for stmt_id in body {
             let kind = match arena.get_stmt(*stmt_id) {
@@ -853,10 +849,11 @@ impl Interpreter {
             text: Box::new(Value::String(content)),
             budget_bytes,
         };
-        self.environment
-            .lock()
-            .expect("env mutex poisoned")
-            .define(name.to_string(), section, false);
+        self.environment.lock().expect("env mutex poisoned").define(
+            name.to_string(),
+            section,
+            false,
+        );
         Ok(FlowSignal::None)
     }
 
@@ -924,9 +921,8 @@ impl Interpreter {
                 _ => {}
             }
         }
-        let path_str = path.ok_or_else(|| {
-            format!("document.section {}: missing 'read <path>' statement", name)
-        })?;
+        let path_str = path
+            .ok_or_else(|| format!("document.section {}: missing 'read <path>' statement", name))?;
         let ext = std::path::Path::new(&path_str)
             .extension()
             .and_then(|s| s.to_str())
@@ -1002,7 +998,7 @@ fn parse_budget(v: Value, ctx: &str) -> Result<usize, String> {
                     return Err(format!(
                         "{}: unknown budget unit '{}' (B/KB/MB/GB)",
                         ctx, other
-                    ))
+                    ));
                 }
             };
             Ok((num * mult as f64) as usize)

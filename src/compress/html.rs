@@ -10,8 +10,8 @@
 //!   这与 v0.27 `HtmlBackend` (已运行中) 的实际用法一致。
 
 use crate::compress::{CompressOptions, SubCompressor};
-use quick_xml::events::Event;
 use quick_xml::Reader;
+use quick_xml::events::Event;
 
 /// v0.29: `SubCompressor` trait impl for HTML content.
 #[derive(Debug)]
@@ -102,8 +102,7 @@ mod tests {
     #[test]
     fn test_html_strips_script() {
         let c = HtmlSubCompressor;
-        let html =
-            "<html><head><script>alert(1);</script></head><body><p>Hello</p></body></html>";
+        let html = "<html><head><script>alert(1);</script></head><body><p>Hello</p></body></html>";
         let opts = CompressOptions::default();
         let out = c
             .compress(html, 1000, &opts)

@@ -872,9 +872,7 @@ impl ParserV2 {
                     mode
                 );
                 // SAFETY: parse 错误已报告, 默认 Sequential 让 parser 继续
-                crate::ast_v2::OrchestrateKind::Sequential {
-                    agents: Vec::new(),
-                }
+                crate::ast_v2::OrchestrateKind::Sequential { agents: Vec::new() }
             }
         };
 

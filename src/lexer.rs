@@ -365,7 +365,11 @@ impl Lexer {
                         column: start_col,
                     })
                 } else {
-                    Some(self.error_token(start_line, start_col, "Unexpected '|'; did you mean '|>'?"))
+                    Some(self.error_token(
+                        start_line,
+                        start_col,
+                        "Unexpected '|'; did you mean '|>'?",
+                    ))
                 }
             }
             '>' => {
@@ -527,7 +531,11 @@ impl Lexer {
                         column: start_col,
                     })
                 } else {
-                    Some(self.error_token(start_line, start_col, &format!("Unexpected character '{}'", c)))
+                    Some(self.error_token(
+                        start_line,
+                        start_col,
+                        &format!("Unexpected character '{}'", c),
+                    ))
                 }
             }
         }

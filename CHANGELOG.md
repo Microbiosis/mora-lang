@@ -2,6 +2,47 @@
 
 All notable changes to Mora will be documented in this file.
 
+## [v0.31] - 2026-07-02
+
+### No-Panic Refactor + Code Quality Hardening
+
+灵感来自 v0.30 之后的"大检查"反馈 (user: "5 项检查不够").
+本版本专注于**错误处理韧性** — 用户脚本出错时不再让解释器崩溃.
+
+#### 修: 21 panic -> 0 in lexer/parser
+
+用户脚本有语法错误时, 之前整个进程会 `panicked at src/lexer.rs:...`
+直接 abort. 现在:
+- Lexer 8 个 panic 改为 emit `TokenType::Error(String)` token
+- Parser 13 个 panic 改为 `eprintln!` 错误信息 + 返回 safe default
+  (空字符串 / 空 list / 默认 OrchestrateKind.Sequential)
+- 用户看到 `"Parse error: ..."` 友好错误而非 stack trace
+
+`examples/_legacy/` 中的 demo (之前会 panic) 现在不再 crash 进程.
+
+#### 修: Windows OCR model path fallback
+
+`user_model_path()` 之前只检查 `XDG_DATA_HOME` 和 `HOME`,
+两者在 Windows 上都未设置, 永远 fail. 新增 `LOCALAPPDATA` fallback
+作为第 3 选项. 错误信息也更新列出所有 3 个解析路径.
+
+#### 修: cargo doc warnings 14 -> 0
+
+Module-level `//!` 注释中的 HTML 标签未转义:
+- `<Page>`, `<Block>`, `<Span>` 改为 `\[ \]` 或反引号
+- `<p>`, `<N>`, `Vec<Value>` 等改为反引号包
+- bare URL `https://...` 改为 `<https://...>`
+
+`cargo doc --no-deps` 现在 0 warning, docs.rs 渲染干净.
+
+#### 测试
+
+- 272 lib + 5 integration = 277 test 全过
+- `cargo build --all-targets`: clean
+- `cargo clippy --all-targets -- -D warnings`: clean
+- `cargo fmt --check`: 0 diff
+- `cargo doc --no-deps`: 0 warning
+
 ## [v0.30] - 2026-07-02
 
 ### SmartCrusher — 内容感知 JSON 压缩

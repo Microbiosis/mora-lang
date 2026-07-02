@@ -93,6 +93,8 @@ pub enum TokenType {
     // v0.30: `!` 前缀 (逻辑非) 和 `@` 装饰符 (如 @start, @exit graph 节点)
     Bang,
     At,
+    // v0.31: 词法错误时 emit (不 panic), 携带错误信息
+    Error(String),
     Arrow,
     // v0.06.2: ? 操作符（expr? 传播 Result 错误）
     Question,
@@ -167,6 +169,16 @@ impl Lexer {
 
     fn is_at_end(&self) -> bool {
         self.current >= self.source.len()
+    }
+
+    /// v0.31: 词法错误 emit Error token (不 panic).
+    /// 由 parser 看到后停止, 错误信息保留在 token 里.
+    fn error_token(&self, line: usize, column: usize, msg: &str) -> Token {
+        Token {
+            token_type: TokenType::Error(msg.to_string()),
+            line,
+            column,
+        }
     }
 
     fn advance(&mut self) -> char {
@@ -353,7 +365,7 @@ impl Lexer {
                         column: start_col,
                     })
                 } else {
-                    panic!("Unexpected '|' at line {}; did you mean '|>'?", self.line)
+                    Some(self.error_token(start_line, start_col, "Unexpected '|'; did you mean '|>'?"))
                 }
             }
             '>' => {
@@ -515,7 +527,7 @@ impl Lexer {
                         column: start_col,
                     })
                 } else {
-                    panic!("Unexpected character '{}' at line {}", c, self.line)
+                    Some(self.error_token(start_line, start_col, &format!("Unexpected character '{}'", c)))
                 }
             }
         }
@@ -562,7 +574,7 @@ impl Lexer {
             }
         }
         if self.is_at_end() {
-            panic!("Unterminated string at line {}", self.line)
+            return self.error_token(start_line, start_col, "Unterminated string");
         }
         self.advance(); // closing "
         Token {
@@ -577,12 +589,12 @@ impl Lexer {
     fn char_from(&mut self, start_line: usize, start_col: usize) -> Token {
         // 已经消耗了起始单引号 '，现在读一个字符 + 一个闭合 '
         if self.is_at_end() {
-            panic!("Unterminated char literal at line {}", self.line)
+            return self.error_token(start_line, start_col, "Unterminated char literal");
         }
         let ch = if self.peek() == '\\' {
             self.advance(); // consume backslash
             if self.is_at_end() {
-                panic!("Unterminated char literal at line {}", self.line)
+                return self.error_token(start_line, start_col, "Unterminated char escape");
             }
             match self.advance() {
                 '\'' => '\'',
@@ -591,19 +603,23 @@ impl Lexer {
                 't' => '\t',
                 'r' => '\r',
                 '0' => '\0',
-                other => panic!(
-                    "Unsupported char escape '\\{}' at line {}",
-                    other, self.line
-                ),
+                other => {
+                    return self.error_token(
+                        start_line,
+                        start_col,
+                        &format!("Unsupported char escape '\\{}'", other),
+                    );
+                }
             }
         } else {
             self.advance()
         };
         // 期望闭合 '
         if self.is_at_end() || self.peek() != '\'' {
-            panic!(
-                "Char literal must contain exactly one character at line {}",
-                self.line
+            return self.error_token(
+                start_line,
+                start_col,
+                "Char literal must contain exactly one character",
             );
         }
         self.advance(); // consume closing '
@@ -657,7 +673,7 @@ impl Lexer {
             }
         }
         if self.is_at_end() {
-            panic!("Unterminated prompt string at line {}", self.line)
+            return self.error_token(start_line, start_col, "Unterminated prompt string");
         }
         self.advance(); // closing "
         Token {

@@ -317,7 +317,10 @@ impl ParserV2 {
                 self.advance();
                 s
             }
-            _ => panic!("Expected pattern key"),
+            _ => {
+                eprintln!("Parse error: Expected pattern key");
+                String::new()
+            }
         };
         self.consume(&TokenType::Colon, "Expected ':'");
         let pattern = self.pattern();
@@ -480,7 +483,10 @@ impl ParserV2 {
                 self.advance();
                 s
             }
-            _ => panic!("Expected dict key"),
+            _ => {
+                eprintln!("Parse error: Expected dict key");
+                String::new()
+            }
         };
         self.consume(&TokenType::Colon, "Expected ':'");
         let val = self.expression();

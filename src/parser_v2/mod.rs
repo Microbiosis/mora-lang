@@ -69,7 +69,8 @@ impl ParserV2 {
         } else if self.check(&TokenType::Task) {
             Some(self.task_declaration_exported(exported))
         } else if exported {
-            panic!("Expected 'let' or 'task' after 'export'");
+            eprintln!("Parse error: Expected 'let' or 'task' after 'export'");
+            None
         } else if self.check(&TokenType::Trait) {
             Some(self.trait_statement())
         } else if self.check(&TokenType::Return) {
@@ -496,12 +497,23 @@ impl ParserV2 {
                     TokenType::Otel => "otel",
                     TokenType::Export => "export",
                     TokenType::Parallel => "parallel",
-                    _ => panic!("{}: unexpected token {:?}", message, tok.token_type),
+                    _ => {
+                        // v0.31: 未知 token 不再 panic, 返回 "<unknown>" 让 parser 继续
+                        // (LexError 由 lexer 直接 emit Error token, parser 这层兜底)
+                        eprintln!(
+                            "Parse error: {}: unexpected token {:?} at line {} column {}",
+                            message, tok.token_type, tok.line, tok.column
+                        );
+                        "<unknown>"
+                    }
                 };
                 self.advance();
                 name.to_string()
             }
-            None => panic!("{} at end of input", message),
+            None => {
+                eprintln!("Parse error: {} at end of input", message);
+                String::new()
+            }
         }
     }
 
@@ -563,7 +575,7 @@ impl ParserV2 {
                         expr_str.push(c);
                     }
                     if depth != 0 {
-                        panic!("Unmatched '{{' in format string");
+                        eprintln!("Parse error: Unmatched '{{' in format string");
                     }
                     let mut lexer = crate::lexer::Lexer::new(&expr_str);
                     let tokens = lexer.scan_tokens();
@@ -605,7 +617,13 @@ impl ParserV2 {
     fn parse_ai_model_call(&mut self, span: Span) -> NodeId {
         // 第一参数必为 model 名字符串
         if self.check(&TokenType::RParen) {
-            panic!("ai_model: missing model name argument");
+            eprintln!("Parse error: ai_model: missing model name argument");
+            // 跳过 RParen, 插入空字符串 placeholder 让 parser 继续
+            self.advance();
+            return self.arena.alloc_expr(
+                ExprKind::Literal(Literal::String(String::new(), span)),
+                span,
+            );
         }
         let model = self.expression();
         // 解析可选 keyword args: temperature: / max_tokens: / system:
@@ -620,7 +638,9 @@ impl ParserV2 {
                 "temperature" => temperature = Some(val),
                 "max_tokens" => max_tokens = Some(val),
                 "system" => system = Some(val),
-                other => panic!("ai_model: unknown keyword '{}'", other),
+                other => {
+                    eprintln!("Parse error: ai_model: unknown keyword '{}'", other);
+                }
             }
         }
         self.consume(&TokenType::RParen, "Expected ')'");

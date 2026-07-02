@@ -866,7 +866,15 @@ impl ParserV2 {
                 }
             }
             _ => {
-                panic!("Expected 'sequential', 'graph', or 'loop', got '{}'", mode);
+                // v0.31: 不再 panic; 报告错误并返回默认 OrchestrateKind
+                eprintln!(
+                    "Parse error: Expected 'sequential', 'graph', or 'loop', got '{}'",
+                    mode
+                );
+                // SAFETY: parse 错误已报告, 默认 Sequential 让 parser 继续
+                crate::ast_v2::OrchestrateKind::Sequential {
+                    agents: Vec::new(),
+                }
             }
         };
 
@@ -1376,11 +1384,18 @@ impl ParserV2 {
                     self.span_of_current(),
                 )
             } else {
-                panic!("Expected string endpoint");
+                // v0.31: 不再 panic; 用空字符串占位让 parser 继续
+                eprintln!("Parse error: Expected string endpoint after otel");
+                self.arena.alloc_expr(
+                    ExprKind::Literal(Literal::String(String::new(), self.span_of_current())),
+                    self.span_of_current(),
+                )
             };
             ObserveConfig::Otel { endpoint }
         } else {
-            panic!("Expected trace / metrics / otel after 'observe'");
+            // v0.31: 不再 panic; 默认 Trace 让 parser 继续
+            eprintln!("Parse error: Expected trace / metrics / otel after 'observe'");
+            ObserveConfig::Trace
         };
         while self.check(&TokenType::Newline) {
             self.advance();
@@ -1414,7 +1429,10 @@ impl ParserV2 {
                 token_type: TokenType::String(s),
                 ..
             }) => s.clone(),
-            _ => panic!("Expected span name string"),
+            _ => {
+                eprintln!("Parse error: Expected span name string");
+                String::new()
+            }
         };
         let attributes = if self.match_token(&[TokenType::Tags]) {
             self.consume(&TokenType::LBrace, "Expected '{'");
@@ -1429,7 +1447,10 @@ impl ParserV2 {
                         token_type: TokenType::String(s),
                         ..
                     }) => s.clone(),
-                    _ => panic!("Expected tag key"),
+                    _ => {
+                        eprintln!("Parse error: Expected tag key");
+                        String::new()
+                    }
                 };
                 self.consume(&TokenType::Colon, "Expected ':'");
                 let val = self.expression();

@@ -37,6 +37,8 @@ pub struct CompressOptions {
     pub preserve_outliers: bool,
     /// 保留 Id 字段 (注: 仅作标注, 不强制保留以避免破坏压缩率)
     pub preserve_ids: bool,
+    /// v0.32: 递归 compact 整棵 Value 树 (Headroom DocumentCompactor 风格)
+    pub recursive: bool,
     /// 输出格式: "json" | "markdown_kv" | "csv_schema"
     pub output_format: String,
 }
@@ -55,6 +57,7 @@ impl Default for CompressOptions {
             preserve_errors: true,
             preserve_outliers: true,
             preserve_ids: true,
+            recursive: false,
             output_format: "json".into(),
         }
     }
@@ -223,6 +226,9 @@ pub fn options_from_value(v: &crate::value::Value) -> Result<CompressOptions, St
         }
         if let Some(Value::Bool(b)) = map.get("preserve_ids") {
             opts.preserve_ids = *b;
+        }
+        if let Some(Value::Bool(b)) = map.get("recursive") {
+            opts.recursive = *b;
         }
         if let Some(Value::String(s)) = map.get("output_format") {
             opts.output_format = s.clone();

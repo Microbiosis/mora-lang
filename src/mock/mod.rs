@@ -4,7 +4,7 @@
 //! 统一分散在 Mora 各模块的 mock response (compress/text.rs, ai_chat.rs),
 //! 提供统一接口: mock.register("name", fn(args) -> result)
 //!
-//! 设计: 同步 in-process registry, 用 Arc<Mutex> 共享. 避免 async runtime.
+//! 设计: 同步 in-process registry, 用 `Arc<Mutex>` 共享. 避免 async runtime.
 //! 使用 Mora 自己的 Value 类型 (避免引入 serde_json).
 
 use std::collections::HashMap;

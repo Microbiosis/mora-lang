@@ -8,7 +8,7 @@
 //!   * `outer.*` (catch-all)
 //! - Listener 注册通过 `on` 接受模式字符串 (含 `*` segment)
 //!
-//! 设计: 单线程同步, 用 Arc<Mutex> 共享. 避免 async runtime 依赖 (符合 Mora
+//! 设计: 单线程同步, 用 `Arc<Mutex>` 共享. 避免 async runtime 依赖 (符合 Mora
 //! "no async runtime" 红线).
 
 use std::collections::HashMap;
@@ -23,7 +23,7 @@ pub type Handler = Arc<dyn Fn(&str, &Value) + Send + Sync + 'static>;
 /// v0.32: Event bus
 #[derive(Clone, Default)]
 pub struct EventBus {
-    /// 模式 → Vec<Handler>; 模式按 "*" 切分, 存储在 trie-like HashMap
+    /// 模式 → `Vec<Handler>`; 模式按 `*` 切分, 存储在 trie-like HashMap
     /// (简化版: 单层 HashMap, emit 时 linear scan)
     handlers: Arc<Mutex<HashMap<Pattern, Vec<Handler>>>>,
 }

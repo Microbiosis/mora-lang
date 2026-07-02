@@ -9,7 +9,7 @@
 //! v0.33 简化: blocks 列表可携带可选 bbox (x, y, w, h) 字段.
 //! 若无 bbox, 退化到"输入顺序" (Mora 现有 backend 行为).
 //!
-//! 设计: input 任意 List<Value>, 每项必须含 "text" 字段.
+//! 设计: input 任意 `List<Value>`, 每项必须含 "text" 字段.
 //! 可选字段: "bbox" = {x, y, w, h} (Number). 输出加 "reading_order_idx".
 
 use crate::value::Value;
@@ -111,8 +111,8 @@ impl Strategy {
 }
 
 /// v0.33: 为 blocks 列表加 reading_order_idx
-/// input: List<Value>, 每项至少含 "text", 可选 "bbox"
-/// output: 同 List<Value>, 加 "reading_order_idx" 字段
+/// input: `List<Value>`, 每项至少含 "text", 可选 "bbox"
+/// output: 同 `List<Value>`, 加 "reading_order_idx" 字段
 pub fn assign_reading_order(
     blocks: Vec<crate::value::Value>,
     strategy: Strategy,

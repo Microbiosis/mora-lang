@@ -1,7 +1,7 @@
 //! v0.33: CCR (Compress-Cache-Retrieve) for lossy compression
 //!
 //! 灵感: Headroom CCR
-//! (https://github.com/chopratejas/headroom)
+//! (<https://github.com/chopratejas/headroom>)
 //! (crates/headroom-core/src/transforms/smart_crusher/compaction/walker.rs)
 //!
 //! 核心思想: 即使 lossy 压缩丢数据, 也不真正丢:

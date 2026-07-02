@@ -1,7 +1,7 @@
 //! v0.33: Schedule (cron) builtin
 //!
 //! 灵感: MimiClaw cron_service.c
-//! (https://github.com/memovai/mimiclaw/blob/main/cron/cron_service.c)
+//! (<https://github.com/memovai/mimiclaw/blob/main/cron/cron_service.c>)
 //!
 //! cron_job_t 9 字段 (MimiClaw):
 //!   id (8-char hex) / name (32 char) / kind (EVERY / AT) /
@@ -9,13 +9,13 @@
 //!   channel (16 char) / chat_id (96 char) / delete_after_run
 //!
 //! v0.33 简化版: 只实现核心 4 字段 (id / kind / interval_s / at_epoch / message),
-//! 持久化到 <cwd>/.mora_schedule.json (MimiClaw 用 SPIFFS; Mora 用 std::fs).
+//! 持久化到 `<cwd>`/`.mora_schedule.json (MimiClaw 用 SPIFFS; Mora 用 std::fs).
 //!
 //! 提供 builtin:
 //!   schedule.add(name, kind, message, [interval_s | at_epoch]) -> id
 //!   schedule.list() -> [{id, name, kind, message, ...}]
 //!   schedule.remove(id) -> bool
-//!   schedule.tick(now) -> [triggered_messages]  (内部: 由 event loop 调用)
+//!   schedule.tick(now) -> [triggered messages]  (内部: 由 event loop 调用)
 
 use std::collections::HashMap;
 use std::path::PathBuf;

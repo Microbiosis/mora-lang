@@ -237,9 +237,21 @@ pub fn compress_top(
     }
 }
 
-/// v0.29: 极简 JSON 解析 (复用 v0.28 json.parse 风格 — 这里是简化版)
-/// MVP 实现: 暂返回 None, Task 5 之前所有 crush_json 测试用 Rust 构造的 Value
-/// Task 5 之后从 json.parse builtin 借路径
+/// v0.29: 极简 JSON 解析 (stub) — 始终返回 `None`。
+///
+/// **v0.30 follow-up**: 这里应当委托给 `src/interpreter/dispatch.rs` 的
+/// `json_to_value` 真实解析器 (v0.10 已实现, 无新外部依赖)。当前 stub 行为
+/// 是设计上的已知 gap: `JsonSubCompressor::compress` 接受任何 JSON 字符串
+/// 输入都会返回 `crush_json: json.parse failed`。v0.29 demo 用 Rust 构造的
+/// `Value::List` 走 `compress_top(json_strategy)` 路径, 不经此 stub。
+///
+/// 选择 Option B (document + regression test) 而非 Option A (直接引入
+/// `serde_json` 作为直接依赖): v0.29 计划的 Global Constraint 明确禁止
+/// "新增外部依赖"。`serde_json` 虽是 transitive (经 `undoc`), 加为直接
+/// 依赖会破坏该约束; 通过 `dispatch.rs::json_to_value` 内部委托同样无新
+/// 依赖, 留作 v0.30 跟进。
+///
+/// 相关测试: `parse_json_simple_currently_stub` (锁住当前行为)。
 pub fn parse_json_simple(_s: &str) -> Option<crate::value::Value> {
     None
 }
@@ -278,5 +290,17 @@ mod tests {
         let opts = CompressOptions::default();
         assert_eq!(opts.head_pct, 0.3);
         assert!(opts.anomaly_keys.contains(&"error".to_string()));
+    }
+
+    /// v0.29 final review MEDIUM regression test:
+    /// 锁住 `parse_json_simple` 当前 stub 行为 (`None`), 防止回归到 v0.30
+    /// follow-up 落地前的隐性状态变化。v0.30 实现后此测试应被替换为断言
+    /// 真实 JSON 解析的 positive case。
+    #[test]
+    fn parse_json_simple_currently_stub() {
+        assert!(crate::compress::parse_json_simple("[1,2,3]").is_none());
+        assert!(crate::compress::parse_json_simple("{\"a\":1}").is_none());
+        assert!(crate::compress::parse_json_simple("").is_none());
+        assert!(crate::compress::parse_json_simple("not json").is_none());
     }
 }

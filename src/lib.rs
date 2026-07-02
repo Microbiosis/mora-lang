@@ -8,6 +8,7 @@ pub mod ast_v2;
 pub mod common;
 pub mod compress;
 pub mod document;
+pub mod event;
 pub mod flow;
 pub mod http_server;
 pub mod interpreter;

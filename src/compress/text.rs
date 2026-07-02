@@ -19,6 +19,19 @@
 
 use crate::compress::{CompressOptions, SubCompressor};
 
+/// v0.29: 把字节索引向下对齐到最近的 UTF-8 字符边界。
+///
+/// 当 `idx` 落在某个多字节 UTF-8 字符的中间字节上时, 向左回退直到字符起点。
+/// 这样 `&s[..idx]` 和 `&s[idx..]` 都是合法的字符串切片, 不会 panic。
+///
+/// v0.29 final review BLOCKER fix — 由 `examples/compact_demo.mora` 的中文文本触发。
+fn floor_char_boundary(s: &str, mut idx: usize) -> usize {
+    while idx > 0 && !s.is_char_boundary(idx) {
+        idx -= 1;
+    }
+    idx
+}
+
 /// v0.29: head_tail 实现 — 保留首 `head_pct` + 尾 `tail_pct` 字节, 中间 marker。
 ///
 /// 输入契约:
@@ -32,12 +45,9 @@ use crate::compress::{CompressOptions, SubCompressor};
 ///   所以 `content[..head_n]` 不会越界。
 /// - `tail_n = (total * tail_pct) as usize`, 同理 `tail_n ≤ total`,
 ///   `total.saturating_sub(tail_n) ≤ total`, 切片安全。
-/// - 字节截断可能落在 UTF-8 字符中段, 触发 `str::Utf8Error`。
-///   对 MVP: 用 `floor_char_boundary` (stable in 1.85+) 把切片落到字符边界上,
-///   避免 panic (尽管 `&str` 的索引切片本身若不在边界会 panic, 我们用 chars().take().len() 估界)。
-///
-/// v0.29 简化版: 直接做字节切片。任务 6 (compress 顶层 builtin 集成) 时会引入
-/// 真正的字符边界对齐。本任务以"短 demo 文本不含多字节字符"为前提, 不出现 panic。
+/// - 字节截断可能落在 UTF-8 字符中段, 触发 `slice` panic。
+///   修复: 用 `floor_char_boundary` 把切片落到最近的字符边界, 避免 panic
+///   (v0.29 final review BLOCKER fix — `examples/compact_demo.mora` 含中文文本)。
 pub fn head_tail_impl(content: &str, head_pct: f32, tail_pct: f32, max_bytes: usize) -> String {
     let total = content.len();
 
@@ -49,7 +59,11 @@ pub fn head_tail_impl(content: &str, head_pct: f32, tail_pct: f32, max_bytes: us
     // 截断长度计算 + clamp 防御 (head_pct/tail_pct 异常值时仍安全)
     let head_n = (((total as f32) * head_pct) as usize).min(total);
     let tail_n = (((total as f32) * tail_pct) as usize).min(total);
-    let tail_start = total.saturating_sub(tail_n);
+
+    // UTF-8 边界对齐: 避免字节切片落在多字节字符中段触发 panic
+    // (v0.29 final review BLOCKER — 触发源: examples/compact_demo.mora 中文文本)
+    let head_n = floor_char_boundary(content, head_n);
+    let tail_start = floor_char_boundary(content, total.saturating_sub(tail_n));
 
     let head = &content[..head_n];
     let tail = &content[tail_start..];
@@ -191,5 +205,20 @@ mod tests {
             result.contains("elided"),
             "default fallback must use head_tail: {result}"
         );
+    }
+
+    /// v0.29 final review BLOCKER regression test:
+    /// `head_tail_impl` 在含多字节 UTF-8 字符的文本上不应 panic。
+    /// 无 fix 时, head_pct=0.3 的 head_n 落在一个中文字符中间字节, 触发 slice panic。
+    #[test]
+    fn test_text_head_tail_utf8_boundary() {
+        // 中文 + ASCII 混合; 故意长到 max_bytes 8 强制触发 elision
+        let s = "中文测试 abc 中文测试 中文测试 中文测试 中文测试 中文测试 中文测试 中文测试 中文测试 中文测试";
+        let result = head_tail_impl(s, 0.3, 0.3, 8);
+        assert!(
+            result.contains("elided"),
+            "must contain elided marker: {result}"
+        );
+        // No panic is the main assertion — UTF-8 boundary safety
     }
 }

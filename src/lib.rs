@@ -18,6 +18,7 @@ pub mod mcp_server;
 pub mod mock;
 pub mod parser_v2;
 pub mod record;
+pub mod sandbox;
 pub mod schedule;
 pub mod trace_collector;
 pub mod typeck;

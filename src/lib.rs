@@ -5,6 +5,7 @@
 
 pub mod ai_infra;
 pub mod ast_v2;
+pub mod ccr;
 pub mod common;
 pub mod compress;
 pub mod document;

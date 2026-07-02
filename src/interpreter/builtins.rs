@@ -231,6 +231,33 @@ impl Interpreter {
         }
     }
 
+    /// v0.34: event bus.* — 事件总线 (Puter EventClient 风格 wildcard matching)
+    pub fn call_event_method(&self, method: &str, args: &[Value]) -> Result<Value, String> {
+        match method {
+            "emit" => {
+                // bus.emit(event, payload?) — 触发所有匹配 pattern 的 handlers
+                let event = args
+                    .first()
+                    .map(|v| v.to_string())
+                    .ok_or("bus.emit: requires event name as first arg")?;
+                let payload = args.get(1).cloned().unwrap_or(Value::Nil);
+                self.bus.emit(&event, &payload);
+                Ok(Value::Nil)
+            }
+            "off" => {
+                // bus.off(pattern) — 取消注册所有匹配 pattern 的 handlers
+                let pattern = args
+                    .first()
+                    .map(|v| v.to_string())
+                    .ok_or("bus.off: requires pattern as first arg")?;
+                self.bus.off(&pattern);
+                Ok(Value::Nil)
+            }
+            "count" => Ok(Value::Number(self.bus.pattern_count() as f64)),
+            _ => Err(format!("bus.{}: unknown method", method)),
+        }
+    }
+
     /// v0.25: memory.* — 会话记忆系统
     pub fn call_memory_method(&mut self, method: &str, args: &[Value]) -> Result<Value, String> {
         match method {

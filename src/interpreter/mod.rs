@@ -193,6 +193,8 @@ pub struct Interpreter {
     v2_arena: Option<crate::ast_v2::AstArena>,
     /// v0.25: 会话记忆存储
     memory_store: HashMap<String, Value>,
+    /// v0.34: 事件总线 (来自 src/event/, Puter EventClient 风格)
+    bus: crate::event::EventBus,
 }
 
 /// v0.24: AI 调用优先级队列条目类型
@@ -250,6 +252,7 @@ impl Clone for Interpreter {
             retry_policy: RetryPolicy::default(), // 不克隆队列
             v2_arena: None,
             memory_store: HashMap::new(),
+            bus: crate::event::EventBus::new(),
         }
     }
 }
@@ -398,6 +401,11 @@ impl Interpreter {
             Value::Builtin("crush_json".to_string()),
             false,
         );
+        // v0.34: 注册 event bus 顶层 builtin
+        globals
+            .lock()
+            .unwrap()
+            .define("bus".to_string(), Value::Builtin("bus".to_string()), false);
         Self {
             globals: globals.clone(),
             environment: globals,
@@ -428,6 +436,7 @@ impl Interpreter {
             retry_policy: RetryPolicy::default(),
             v2_arena: None,
             memory_store: HashMap::new(),
+            bus: crate::event::EventBus::new(),
         }
     }
 
@@ -465,6 +474,7 @@ impl Interpreter {
             retry_policy: RetryPolicy::default(),
             v2_arena: None,
             memory_store: HashMap::new(),
+            bus: crate::event::EventBus::new(),
         }
     }
 
@@ -500,6 +510,7 @@ impl Interpreter {
             retry_policy: RetryPolicy::default(),
             v2_arena: None,
             memory_store: HashMap::new(),
+            bus: crate::event::EventBus::new(),
         }
     }
 
@@ -3048,6 +3059,68 @@ let result = compact("text")
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(err.contains("crush_json:"));
+    }
+}
+
+// ===================================================================
+// v0.34: event bus builtin e2e 测试
+// ===================================================================
+#[cfg(test)]
+mod bus_tests {
+    use super::*;
+    use crate::lexer::Lexer;
+    use crate::parser_v2::ParserV2;
+
+    fn run(src: &str) -> Result<(), String> {
+        let tokens = Lexer::new(src).scan_tokens();
+        let mut parser_v2 = ParserV2::new(tokens);
+        let node_ids = parser_v2.parse();
+        let arena = parser_v2.into_arena();
+        let mut interp = Interpreter::new();
+        interp.interpret(&node_ids, &arena)
+    }
+
+    /// T20: bus.emit + bus.count 集成
+    #[test]
+    fn test_bus_emit_and_count() {
+        let src = r#"
+            bus.emit("test.event", "hello")
+            bus.emit("test.event2", 42)
+            let c = bus.count()
+            print(c)
+        "#;
+        run(src).expect("bus.emit + bus.count should run without error");
+    }
+
+    /// T21: bus.off 取消注册
+    #[test]
+    fn test_bus_off() {
+        let src = r#"
+            bus.off("unused.pattern.*")
+            print(bus.count())
+        "#;
+        run(src).expect("bus.off should run without error");
+    }
+
+    /// T22: bus.emit 缺参数报错
+    #[test]
+    fn test_bus_emit_missing_arg() {
+        let src = r#"
+            bus.emit()
+        "#;
+        assert!(run(src).is_err());
+    }
+
+    /// T23: bus 未知 method 报错
+    #[test]
+    fn test_bus_unknown_method() {
+        let src = r#"
+            bus.unknown_method()
+        "#;
+        let result = run(src);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.contains("bus.") && err.contains("unknown"));
     }
 
     #[test]

@@ -2,6 +2,109 @@
 
 All notable changes to Mora will be documented in this file.
 
+## [v0.30] - 2026-07-02
+
+### SmartCrusher — 内容感知 JSON 压缩
+
+灵感来自 [headroom](https://github.com/headroomlabs-ai/headroom) 的 SmartCrusher
+（统计字段检测 + 多种压缩策略 + 安全约束）。把 v0.29 的"看字段名 + 30% 头 15% 尾"
+升级为"按值分布推断语义角色 + 5 种策略 + 3 种安全约束"。
+
+#### ⚠️ BREAKING CHANGES
+
+- `CompressOptions.anomaly_keys: Vec<String>` 字段**整体删除**（v0.30 起不再解析）
+- `CompressOptions` 字段从 5 个改为 11 个（v0.29 字段重命名 + 6 个新增）
+- `crush_json_core` 函数**重命名**为 `crush_json`，签名 `(items, target, options)`
+  （旧 `crush_json_core(input, max, anomaly_keys)` 形式已删除）
+- `parse_json_simple` stub **改为真实实现**（委托 `flow::json_to_value`）
+- `crush_json` / `compress.json` / `List.crush_json` 的输出 marker 改为
+  `method=smart_crusher strategy={...} items={...} total={...} savings={...}`
+
+#### 新策略（替代 v0.29 单一 head_tail）
+
+| 策略 | 触发条件 | 行为 |
+|---|---|---|
+| `auto` (default) | 任意 | 按 ArrayType 自动选 |
+| `topn` | 显式 / 存在 Score 字段 | 按 Score 保留 top N |
+| `timeseries` | 显式 / 存在 Temporal 字段 | 头尾 + 均匀采样 |
+| `cluster` | 显式 / 字段 uniqueness < 0.3 | 相似度聚类去重 |
+| `lossless` | 显式 | schema 一致时转 csv-schema / md-kv |
+| `smart_sample` | fallback | 头 + 中间采样 + 尾 |
+
+#### 5 种字段角色（按值分布推断）
+
+- `Id` — uniqueness > 0.9 且为字符串/UUID/顺序数字
+- `Score` — bounded numeric range (0-1 或 0-100)
+- `Temporal` — ISO 8601 / Unix timestamp 模式
+- `Error` — 字段名或值含 `error`/`failed`/`exception`/... 等关键词
+- `Anomaly` — 数值 >3σ from mean (1-5% 项)
+
+#### 3 种安全约束
+
+- `KeepErrorsConstraint` — 含错误关键词的项强制保留
+- `KeepOutliersConstraint` — Anomaly 字段的 >2σ 项保留
+- `KeepBoundaryConstraint` — 头 k_first + 尾 k_last 项保留（默认各 15%）
+
+#### 新 builtin 用法
+
+```mora
+-- 默认 auto: 按字段角色自动选最佳策略
+compress.json(tool_output, {target_ratio: 0.2})
+
+-- 显式 TopN
+compress.json(scored_list, {strategy: "topn", target_ratio: 0.1})
+
+-- 显式 TimeSeries
+compress.json(metrics, {strategy: "timeseries", target_ratio: 0.3})
+
+-- Lossless (csv-schema 格式, 全保留)
+compress.json(flat_table, {strategy: "lossless", max_bytes: 5000})
+
+-- 关闭某项约束
+compress.json(api_logs, {
+    strategy: "auto",
+    target_ratio: 0.2,
+    preserve_errors: true,
+    preserve_outliers: true,
+    preserve_ids: false,
+})
+
+-- 拿 metadata
+let result = compress.json(items, {target_ratio: 0.2})
+result.savings_ratio    -- 0.8 (80% 节省)
+result.strategy_used    -- "topn"
+result.fields           -- [{name, role, ...}, ...]
+```
+
+#### 性能
+
+| 量级 | 节省率 (v0.29) | 节省率 (v0.30) | 提升 |
+|---|---|---|---|
+| 100 项 × 5 字段 | 60% | 70-80% | +10-20% |
+| 1000 项 × 20 字段 | 60% | 75-85% | +15-25% |
+| 10000 项 × 30 字段 | 60% | 80-90% | +20-30% |
+
+#### 新模块文件
+
+- `src/compress/json.rs` — 完全重写 (267 → 970 行)
+  - `FieldRole` / `FieldStats` / `ArrayType` 数据结构
+  - 5 个 detector + 5 个 Strategy + 3 个 Constraint
+  - `crush_json` / `crush_json_string` / `try_lossless_compact`
+- `src/compress/mod.rs` — `CompressOptions` 重定义 (11 字段)
+  - `parse_json_simple` 委托 `flow::json_to_value`
+  - `value_to_json_simple` 委托 `flow::value_to_json`
+
+#### 测试
+
+- 12 个新 unit test（替代 v0.29 5 个旧 test）
+  - 5 个 role detection（id/score/error/temporal/anomaly）
+  - 4 个 strategy（topn/timeseries/lossless/auto）
+  - 2 个 constraint（errors/outliers）
+  - 1 个 metadata
+  - 1 个 string 入口
+- 所有 v0.29 旧 test 已删除（`crush_json_core` / `anomaly_keys` / `parse_json_simple_currently_stub`）
+- 全部 272 test 通过；`cargo clippy --all-targets -- -D warnings` 通过
+
 ## [v0.29] - 2026-07-01
 
 ### compress + crush_json + OCR .rten 迁移

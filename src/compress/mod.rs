@@ -1,35 +1,61 @@
-//! v0.29: 统一压缩原语 — `SubCompressor` trait + `ContentRouter`
+//! v0.30: 统一压缩原语 — `SubCompressor` trait + `ContentRouter` + SmartCrusher
 //!
 //! 灵感: headroom (https://github.com/headroomlabs-ai/headroom)
 //! ContentRouter + Kneedle + 异常保留 设计。
+//!
+//! v0.30 变更:
+//! - `CompressOptions` 完全重定义（11 字段，含 5 策略 + 3 约束开关）
+//! - 删除 v0.29 `anomaly_keys` 字段名兜底（由 SmartCrusher 按值分布自动检测）
+//! - 删除 v0.29 `parse_json_simple` stub（改用 `flow::json_to_value`）
 
 use std::sync::Arc;
 
-/// v0.29: 压缩选项 (跨子压缩器共享)
+/// v0.30: 压缩选项 (跨子压缩器共享)
 #[derive(Debug, Clone)]
 pub struct CompressOptions {
-    /// "auto" | "head_tail" | "summary" | "lossless" | "json"
+    /// 策略名:
+    ///   "auto" (default) | "topn" | "timeseries" | "cluster"
+    ///   | "lossless" | "smart_sample" | "head_tail"
     pub strategy: String,
-    /// head_tail: 保留首 N% (0.0-1.0); 默认 0.3
-    pub head_pct: f32,
-    /// head_tail: 保留尾 M% (0.0-1.0); 默认 0.3
-    pub tail_pct: f32,
     /// 顶层 builtin 显式传入的字节上限
     pub max_bytes: Option<usize>,
-    /// crush_json 异常保留字段; 默认 ["error", "anomaly", "status", "alert"]
-    pub anomaly_keys: Vec<String>,
+    /// 压缩到 N * ratio 项 (0.0-1.0)
+    pub target_ratio: Option<f32>,
+    /// 头尾边界比例 (0.0-1.0), 默认 0.15
+    pub head_pct: f32,
+    /// 尾边界比例 (0.0-1.0), 默认 0.15
+    pub tail_pct: f32,
+    /// 显式覆盖头数
+    pub k_first: Option<usize>,
+    /// 显式覆盖尾数
+    pub k_last: Option<usize>,
+    /// Lossless 短路阈值: 节省率 ≥ 此值才用 lossless (默认 0.15)
+    pub lossless_min_savings_ratio: f32,
+    /// 保留含错误关键词的项 (默认 true)
+    pub preserve_errors: bool,
+    /// 保留统计 outlier (>2σ) 项 (默认 true)
+    pub preserve_outliers: bool,
+    /// 保留 Id 字段 (注: 仅作标注, 不强制保留以避免破坏压缩率)
+    pub preserve_ids: bool,
+    /// 输出格式: "json" | "markdown_kv" | "csv_schema"
+    pub output_format: String,
 }
 
 impl Default for CompressOptions {
     fn default() -> Self {
         Self {
             strategy: "auto".into(),
-            head_pct: 0.3,
-            tail_pct: 0.3,
             max_bytes: None,
-            anomaly_keys: vec![
-                "error".into(), "anomaly".into(), "status".into(), "alert".into(),
-            ],
+            target_ratio: None,
+            head_pct: 0.15,
+            tail_pct: 0.15,
+            k_first: None,
+            k_last: None,
+            lossless_min_savings_ratio: 0.15,
+            preserve_errors: true,
+            preserve_outliers: true,
+            preserve_ids: true,
+            output_format: "json".into(),
         }
     }
 }
@@ -105,8 +131,8 @@ pub mod html;   // Task 4 填充
 pub mod log;    // Task 4 填充
 pub mod text;   // Task 3 填充
 
-// v0.29: re-export crush_json_core (Task 2 已定义; Task 5 启用 re-export)
-pub use json::crush_json_core;
+// v0.30: re-export SmartCrusher 主入口
+pub use json::{crush_json, crush_json_string, CrushResult, FieldRole, FieldStats, ArrayType};
 
 /// v0.29: 从 Value 中提取可压缩的纯文本。
 ///
@@ -152,7 +178,7 @@ pub fn extract_text(input: &crate::value::Value) -> Result<String, String> {
     }
 }
 
-/// v0.29: 从 `Value::Dict` 构建 `CompressOptions`。
+/// v0.30: 从 `Value::Dict` 构建 `CompressOptions`。
 ///
 /// 部分字段缺失或类型不匹配时**静默跳过**(不报错) — 调用方可任意选择传入哪些 options。
 pub fn options_from_value(v: &crate::value::Value) -> Result<CompressOptions, String> {
@@ -162,56 +188,93 @@ pub fn options_from_value(v: &crate::value::Value) -> Result<CompressOptions, St
         if let Some(Value::String(s)) = map.get("strategy") {
             opts.strategy = s.clone();
         }
+        if let Some(Value::Number(n)) = map.get("max_bytes") {
+            opts.max_bytes = Some(*n as usize);
+        }
+        if let Some(Value::Number(n)) = map.get("target_ratio") {
+            opts.target_ratio = Some(*n as f32);
+        }
         if let Some(Value::Number(n)) = map.get("head_pct") {
             opts.head_pct = *n as f32;
         }
         if let Some(Value::Number(n)) = map.get("tail_pct") {
             opts.tail_pct = *n as f32;
         }
-        if let Some(Value::Number(n)) = map.get("max_bytes") {
-            opts.max_bytes = Some(*n as usize);
+        if let Some(Value::Number(n)) = map.get("k_first") {
+            opts.k_first = Some(*n as usize);
         }
-        if let Some(Value::List(keys)) = map.get("anomaly_keys") {
-            opts.anomaly_keys = keys
-                .iter()
-                .filter_map(|k| match k {
-                    Value::String(s) => Some(s.clone()),
-                    _ => None,
-                })
-                .collect();
+        if let Some(Value::Number(n)) = map.get("k_last") {
+            opts.k_last = Some(*n as usize);
         }
+        if let Some(Value::Number(n)) = map.get("lossless_min_savings_ratio") {
+            opts.lossless_min_savings_ratio = *n as f32;
+        }
+        if let Some(Value::Bool(b)) = map.get("preserve_errors") {
+            opts.preserve_errors = *b;
+        }
+        if let Some(Value::Bool(b)) = map.get("preserve_outliers") {
+            opts.preserve_outliers = *b;
+        }
+        if let Some(Value::Bool(b)) = map.get("preserve_ids") {
+            opts.preserve_ids = *b;
+        }
+        if let Some(Value::String(s)) = map.get("output_format") {
+            opts.output_format = s.clone();
+        }
+        // 注: v0.29 的 anomaly_keys 字段不再解析 (无兼容)
     }
     Ok(opts)
 }
 
-/// v0.29: `compress(input, strategy, options)` 顶层 builtin 的核心实现。
+/// v0.30: `compress(input, strategy, options)` 顶层 builtin 的核心实现。
 ///
-/// Strategy 调度 (per spec §6.6):
+/// Strategy 调度:
+/// - `"json"`           → SmartCrusher `crush_json` (input 必须是 List 或 JSON 数组字符串)
 /// - `"auto"`           → 路由器选最佳子压缩器 (json/code/html/log/text 5 个)
 /// - `"head_tail"`      → TextSubCompressor (按 head_pct/tail_pct/max_bytes)
 /// - `"summary"`        → TextSubCompressor (mock LLM, 真实 LLM 留 v0.30)
 /// - `"lossless"`       → TextSubCompressor (原文本 + original_size marker)
-/// - `"json"`           → crush_json_core (input 必须是 List 或 JSON 数组字符串)
 /// - 其它               → 报错
 pub fn compress_top(
     input: &crate::value::Value,
     strategy: &str,
     options: &CompressOptions,
 ) -> Result<crate::value::Value, String> {
-    // "json" strategy 不走文本路径, 直接用原始 input 调 crush_json_core
+    // "json" strategy 不走文本路径, 直接用原始 input 调 SmartCrusher
     if strategy == "json" {
-        let max_items = options.max_bytes.unwrap_or(8192) / 200;
-        let max_items = max_items.max(1);
-        let v = crush_json_core(input, max_items, &options.anomaly_keys)?;
-        let json = value_to_json_simple(&v);
-        let item_count = if let crate::value::Value::List(l) = &v {
-            l.len()
+        // 优先按 max_bytes 推 target; 否则按 target_ratio 推; 兜底 N/2
+        let target = if let Some(mb) = options.max_bytes {
+            (mb / 200).max(1)
+        } else if let Some(ratio) = options.target_ratio {
+            let n = match input {
+                crate::value::Value::List(l) => l.len(),
+                _ => 1,
+            };
+            ((n as f32 * ratio).max(1.0)) as usize
         } else {
-            0
+            match input {
+                crate::value::Value::List(l) => (l.len() as f32 * 0.2).max(1.0) as usize,
+                _ => 1,
+            }
         };
+        let items = match input {
+            crate::value::Value::List(l) => l.clone(),
+            _ => {
+                return Err(format!(
+                    "compress.json: expected List, got {}",
+                    value_type_simple(input)
+                ))
+            }
+        };
+        let result = crush_json(&items, target, options);
+        let json = crate::flow::value_to_json(&crate::value::Value::List(result.items.clone()));
         return Ok(crate::value::Value::String(format!(
-            "{}\n<compressed:method=crush_json items={} max={}>",
-            json, item_count, max_items
+            "{}\n<compressed:method=smart_crusher strategy={} items={} total={} savings={:.2}>",
+            json,
+            result.strategy_used,
+            result.items_kept,
+            result.items_total,
+            result.savings_ratio
         )));
     }
 
@@ -237,28 +300,14 @@ pub fn compress_top(
     }
 }
 
-/// v0.29: 极简 JSON 解析 (stub) — 始终返回 `None`。
-///
-/// **v0.30 follow-up**: 这里应当委托给 `src/interpreter/dispatch.rs` 的
-/// `json_to_value` 真实解析器 (v0.10 已实现, 无新外部依赖)。当前 stub 行为
-/// 是设计上的已知 gap: `JsonSubCompressor::compress` 接受任何 JSON 字符串
-/// 输入都会返回 `crush_json: json.parse failed`。v0.29 demo 用 Rust 构造的
-/// `Value::List` 走 `compress_top(json_strategy)` 路径, 不经此 stub。
-///
-/// 选择 Option B (document + regression test) 而非 Option A (直接引入
-/// `serde_json` 作为直接依赖): v0.29 计划的 Global Constraint 明确禁止
-/// "新增外部依赖"。`serde_json` 虽是 transitive (经 `undoc`), 加为直接
-/// 依赖会破坏该约束; 通过 `dispatch.rs::json_to_value` 内部委托同样无新
-/// 依赖, 留作 v0.30 跟进。
-///
-/// 相关测试: `parse_json_simple_currently_stub` (锁住当前行为)。
-pub fn parse_json_simple(_s: &str) -> Option<crate::value::Value> {
-    None
+/// v0.30: 极简 JSON 解析 — 委托 `flow::json_to_value` 真实实现 (v0.10 已存在)。
+pub fn parse_json_simple(s: &str) -> Option<crate::value::Value> {
+    crate::flow::json_to_value(s).ok()
 }
 
-/// v0.29: Value → JSON 字符串 (用 Value::Display)
+/// v0.30: Value → JSON 字符串 (委托 `flow::value_to_json` 真实实现)
 pub fn value_to_json_simple(v: &crate::value::Value) -> String {
-    v.to_string()
+    crate::flow::value_to_json(v)
 }
 
 /// v0.29: Value 类型名
@@ -288,18 +337,22 @@ mod tests {
     #[test]
     fn compress_options_default() {
         let opts = CompressOptions::default();
-        assert_eq!(opts.head_pct, 0.3);
-        assert!(opts.anomaly_keys.contains(&"error".to_string()));
+        assert_eq!(opts.head_pct, 0.15);
+        assert_eq!(opts.tail_pct, 0.15);
+        assert_eq!(opts.strategy, "auto");
+        assert!(opts.preserve_errors);
+        assert!(opts.preserve_outliers);
     }
 
-    /// v0.29 final review MEDIUM regression test:
-    /// 锁住 `parse_json_simple` 当前 stub 行为 (`None`), 防止回归到 v0.30
-    /// follow-up 落地前的隐性状态变化。v0.30 实现后此测试应被替换为断言
-    /// 真实 JSON 解析的 positive case。
+    /// v0.30: parse_json_simple 现在是真实实现 (委托 flow::json_to_value)
     #[test]
-    fn parse_json_simple_currently_stub() {
-        assert!(crate::compress::parse_json_simple("[1,2,3]").is_none());
-        assert!(crate::compress::parse_json_simple("{\"a\":1}").is_none());
+    fn parse_json_simple_now_real() {
+        // 真实 JSON 解析
+        let v = crate::compress::parse_json_simple("[1,2,3]").unwrap();
+        assert!(matches!(v, crate::value::Value::List(_)));
+        let v = crate::compress::parse_json_simple("{\"a\":1}").unwrap();
+        assert!(matches!(v, crate::value::Value::Dict(_)));
+        // 无效输入
         assert!(crate::compress::parse_json_simple("").is_none());
         assert!(crate::compress::parse_json_simple("not json").is_none());
     }

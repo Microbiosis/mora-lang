@@ -2944,15 +2944,11 @@ print(result.contains("original_size=11"))
         run(src).expect("compress lossless should work");
     }
 
-/// T09: crush_json(list, 10) 截到 10 项, 保留 crush_json marker
-    ///
-    /// 直接调用 Rust 端 `crush_json_core`, 避免 mora 解析器中 `{...}` 字符串插值陷阱
-    /// (mora parser 对 `{{` 处理为字面 `{`, 但 `}}` 不会被识别为转义,
-    /// 导致内嵌 JSON 字符串很难正确转义)。
+/// T09: SmartCrusher crush_json(list, 10) — auto 模式选 TopN 策略 (有 score 字段)
     #[test]
     fn test_crush_json_list_basic() {
         use crate::compress;
-        let mut items: Vec<Value> = (0..100)
+        let items: Vec<Value> = (0..100)
             .map(|i| {
                 let mut d = HashMap::new();
                 d.insert("id".to_string(), Value::Number(i as f64));
@@ -2960,22 +2956,14 @@ print(result.contains("original_size=11"))
                 Value::Dict(d)
             })
             .collect();
-        let input = Value::List(items.clone());
         let opts = compress::CompressOptions::default();
-        let result =
-            compress::crush_json_core(&input, 10, &opts.anomaly_keys).expect("crush_json_core ok");
-        if let Value::List(kept) = &result {
-            assert_eq!(kept.len(), 10, "100 items → 10 max → 10 kept");
-        } else {
-            panic!("crush_json_core must return List");
-        }
-        // 把结果通过 builtin 调用也走一遍 (走 dispatch 路径)
-        let kept = if let Value::List(l) = &result { l.clone() } else { vec![] };
-        items = kept; // suppress unused
-        let _ = items;
+        let result = compress::crush_json(&items, 10, &opts);
+        assert_eq!(result.items.len(), 10, "100 items → target 10 → 10 kept");
+        assert_eq!(result.strategy_used, "topn", "auto + score field → topn");
+        assert!(result.savings_ratio > 0.8, "savings > 80%");
     }
 
-    /// T10: crush_json 异常保留 — 第 25 项含 error 字段必须保留
+    /// T10: SmartCrusher 错误保留 — 第 25 项含 error 字段必须保留
     #[test]
     fn test_crush_json_with_anomaly() {
         use crate::compress;
@@ -2991,24 +2979,18 @@ print(result.contains("original_size=11"))
         if let Value::Dict(d) = &mut items[25] {
             d.insert("error".to_string(), Value::String("BOOM".to_string()));
         }
-        let input = Value::List(items);
         let opts = compress::CompressOptions::default();
-        let result =
-            compress::crush_json_core(&input, 5, &opts.anomaly_keys).expect("crush_json_core ok");
-        // 异常项必须保留
-        let has_boom = if let Value::List(l) = &result {
-            l.iter().any(|it| {
-                if let Value::Dict(d) = it {
-                    d.get("error")
-                        .map(|v| v.to_string().contains("BOOM"))
-                        .unwrap_or(false)
-                } else {
-                    false
-                }
-            })
-        } else {
-            false
-        };
+        let result = compress::crush_json(&items, 5, &opts);
+        // 异常项必须保留 (KeepErrorsConstraint)
+        let has_boom = result.items.iter().any(|it| {
+            if let Value::Dict(d) = it {
+                d.get("error")
+                    .map(|v| v.to_string().contains("BOOM"))
+                    .unwrap_or(false)
+            } else {
+                false
+            }
+        });
         assert!(has_boom, "anomaly item with error='BOOM' must be preserved");
     }
 

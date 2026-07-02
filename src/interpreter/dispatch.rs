@@ -212,12 +212,24 @@ impl Interpreter {
                     .cloned()
                     .unwrap_or(Value::Dict(Default::default()));
                 let opts = crate::compress::options_from_value(&options_val)?;
-                let v = crate::compress::crush_json_core(&args[0], max_items, &opts.anomaly_keys)?;
-                let json = crate::compress::value_to_json_simple(&v);
-                let item_count = if let Value::List(l) = &v { l.len() } else { 0 };
+                let items = match &args[0] {
+                    Value::List(l) => l.clone(),
+                    _ => {
+                        return Err("crush_json: expected List as first argument".to_string());
+                    }
+                };
+                let result =
+                    crate::compress::crush_json(&items, max_items, &opts);
+                let json = crate::compress::value_to_json_simple(&Value::List(
+                    result.items.clone(),
+                ));
                 Ok(Value::String(format!(
-                    "{}\n<compressed:method=crush_json items={} max={}>",
-                    json, item_count, max_items
+                    "{}\n<compressed:method=smart_crusher strategy={} items={} total={} savings={:.2}>",
+                    json,
+                    result.strategy_used,
+                    result.items_kept,
+                    result.items_total,
+                    result.savings_ratio
                 )))
             }
             // v0.24: batch_chat(prompts) -> list<string> 批量 AI 调用
@@ -448,7 +460,7 @@ impl Interpreter {
         match object {
             Value::List(list) => {
                 match method {
-                    // v0.29: List.crush_json(max) -> string Kneedle + 异常保留
+                    // v0.30: List.crush_json(max) -> string SmartCrusher
                     "crush_json" => {
                         let max = args
                             .first()
@@ -464,14 +476,17 @@ impl Interpreter {
                             })
                             .ok_or_else(|| "List.crush_json: requires max as number".to_string())?;
                         let opts = crate::compress::CompressOptions::default();
-                        let input_val = Value::List(list.clone());
-                        let v =
-                            crate::compress::crush_json_core(&input_val, max, &opts.anomaly_keys)?;
-                        let json = crate::compress::value_to_json_simple(&v);
-                        let item_count = if let Value::List(l) = &v { l.len() } else { 0 };
+                        let result = crate::compress::crush_json(&list, max, &opts);
+                        let json = crate::compress::value_to_json_simple(&Value::List(
+                            result.items.clone(),
+                        ));
                         Ok(Value::String(format!(
-                            "{}\n<compressed:method=crush_json items={} max={}>",
-                            json, item_count, max
+                            "{}\n<compressed:method=smart_crusher strategy={} items={} total={} savings={:.2}>",
+                            json,
+                            result.strategy_used,
+                            result.items_kept,
+                            result.items_total,
+                            result.savings_ratio
                         )))
                     }
                     "push" => {

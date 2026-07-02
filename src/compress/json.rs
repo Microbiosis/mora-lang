@@ -1,25 +1,956 @@
-//! v0.29: JsonSubCompressor + crush_json_core (Kneedle + 异常保留)
+//! v0.30: SmartCrusher — content-aware JSON compression
 //!
-//! Provides:
-//! - `JsonSubCompressor`: `SubCompressor` trait impl that delegates to `crush_json_core`
-//! - `crush_json_core`: headroom-style algorithm (30% head + 15% tail + 异常保留)
-//! - `extract_constant_fields`: helper to surface fields common to every list item
+//! 灵感: Headroom (https://github.com/headroomlabs-ai/headroom) — SmartCrusher
+//! 核心思想: **不依赖字段名，按值分布推断语义角色**。
+//!
+//! 用法:
+//! ```ignore
+//! use mora::compress::json::{crush_json, CrushResult};
+//! let result = crush_json(&items, 100, &CompressOptions::default());
+//! ```
+//!
+//! 提供 5 种压缩策略 (TopN / TimeSeries / ClusterSample / SmartSample / Lossless) +
+//! 3 种安全约束 (KeepErrors / KeepOutliers / KeepBoundary)。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
-use crate::compress::{CompressOptions, SubCompressor};
+use crate::compress::CompressOptions;
+use crate::flow::{json_to_value, value_to_json};
 use crate::value::Value;
 
-/// v0.29: `SubCompressor` trait impl for JSON-list content.
-///
-/// This is a thin wrapper around `crush_json_core`. The string-level
-/// sniffing/parsing path is intentionally minimal for v0.29 (Task 5 will
-/// improve the parser via `json.parse`); the unit tests in this module
-/// construct `Value::List` directly in Rust and bypass the string parser.
+// ──────────────────── 字段角色 ────────────────────
+
+/// 字段语义角色（按值分布推断，与字段名无关）
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum FieldRole {
+    Id,        // uniqueness > 0.9, 或 UUID, 或顺序递增数字
+    Score,     // bounded numeric range (0-1 或 0-100)
+    Temporal,  // date/timestamp pattern
+    Error,     // 字段名或值含 ERROR_KEYWORDS
+    Anomaly,   // 该字段值 >2σ from mean
+    Constant,  // 所有项相同
+    Generic,   // 兜底
+}
+
+/// 单字段的统计特征
+#[derive(Debug, Clone)]
+pub struct FieldStats {
+    pub name: String,
+    pub role: FieldRole,
+    pub uniqueness: f32,
+    pub null_rate: f32,
+    pub is_numeric: bool,
+    pub numeric_range: Option<(f64, f64)>,
+    pub sample: Vec<Value>,
+}
+
+// ──────────────────── Array 类型 ────────────────────
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArrayType {
+    TopScores,    // 存在 Score 字段
+    TimeSeries,   // 存在 Temporal 字段
+    Clustered,    // 字段值高冗余 (uniqueness < 0.3)
+    Uniform,      // 所有项 schema 一致且字段数少 (<10)
+    Generic,      // 兜底
+}
+
+// ──────────────────── 策略 trait ────────────────────
+
+pub trait Strategy: std::fmt::Debug + Send + Sync {
+    fn name(&self) -> &'static str;
+    fn select(
+        &self,
+        items: &[Value],
+        fields: &[FieldStats],
+        target: usize,
+        constraints: &[Box<dyn Constraint>],
+    ) -> Vec<usize>;
+}
+
+// ──────────────────── Constraint trait ────────────────────
+
+pub trait Constraint: std::fmt::Debug + Send + Sync {
+    fn name(&self) -> &str;
+    fn apply(&self, keep: &mut Vec<usize>, items: &[Value], fields: &[FieldStats]);
+}
+
+// ──────────────────── 压缩结果 ────────────────────
+
+#[derive(Debug, Clone)]
+pub struct CrushResult {
+    pub items: Vec<Value>,
+    pub strategy_used: String,
+    pub array_type: ArrayType,
+    pub fields: Vec<FieldStats>,
+    pub items_total: usize,
+    pub items_kept: usize,
+    pub savings_ratio: f32,
+    pub byte_estimate: usize,
+}
+
+impl CrushResult {
+    pub fn metadata(&self) -> HashMap<String, Value> {
+        let mut m = HashMap::new();
+        m.insert("strategy".into(), Value::String(self.strategy_used.clone()));
+        m.insert("array_type".into(), Value::String(format!("{:?}", self.array_type)));
+        m.insert("items_total".into(), Value::Number(self.items_total as f64));
+        m.insert("items_kept".into(), Value::Number(self.items_kept as f64));
+        m.insert(
+            "savings_ratio".into(),
+            Value::Number(self.savings_ratio as f64),
+        );
+        m.insert(
+            "fields_detected".into(),
+            Value::Number(self.fields.len() as f64),
+        );
+        m
+    }
+}
+
+// ──────────────────── 错误关键字常量 ────────────────────
+
+pub const ERROR_KEYWORDS: &[&str] = &[
+    "error", "failed", "exception", "fatal", "panic", "err", "denied", "rejected",
+    "timeout", "abort", "crash", "refused", "unauthorized", "forbidden",
+];
+
+// ──────────────────── 字段角色检测器 ────────────────────
+
+/// 主入口：对 items 所有字段跑检测
+pub fn extract_field_stats(items: &[Value]) -> Vec<FieldStats> {
+    let field_names = collect_field_names(items);
+    field_names
+        .into_iter()
+        .map(|name| {
+            let values: Vec<&Value> = items
+                .iter()
+                .filter_map(|it| {
+                    if let Value::Dict(d) = it {
+                        d.get(&name)
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            detect_field_role(&name, &values)
+        })
+        .collect()
+}
+
+fn collect_field_names(items: &[Value]) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    for it in items {
+        if let Value::Dict(d) = it {
+            for k in d.keys() {
+                if seen.insert(k.clone()) {
+                    names.push(k.clone());
+                }
+            }
+        }
+    }
+    names
+}
+
+pub fn detect_field_role(name: &str, values: &[&Value]) -> FieldStats {
+    let uniqueness = compute_uniqueness(values);
+    let null_rate = compute_null_rate(values);
+    let is_numeric = !values.is_empty() && values.iter().all(|v| matches!(v, Value::Number(_)));
+    let numeric_range = if is_numeric {
+        let nums: Vec<f64> = values
+            .iter()
+            .filter_map(|v| {
+                if let Value::Number(n) = v {
+                    Some(*n)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        if nums.is_empty() {
+            None
+        } else {
+            let lo = nums.iter().cloned().fold(f64::INFINITY, f64::min);
+            let hi = nums.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+            Some((lo, hi))
+        }
+    } else {
+        None
+    };
+
+    // 检测顺序: Temporal → Error → Anomaly → Score → Id → Generic
+    // (Temporal/Error/Anomaly 必须先于 Id, 否则高唯一性数值/字符串都被误判为 Id)
+    let role = detect_temporal(values)
+        .or_else(|| detect_error(name, values))
+        .or_else(|| detect_anomaly(values))
+        .or_else(|| detect_score(numeric_range, is_numeric))
+        .or_else(|| detect_id(uniqueness, values))
+        .unwrap_or(FieldRole::Generic);
+
+    FieldStats {
+        name: name.to_string(),
+        role,
+        uniqueness,
+        null_rate,
+        is_numeric,
+        numeric_range,
+        sample: values.iter().take(5).map(|v| (*v).clone()).collect(),
+    }
+}
+
+fn detect_id(uniqueness: f32, values: &[&Value]) -> Option<FieldRole> {
+    // UUID 模式或顺序递增数字 → Id
+    if !values.is_empty() && values.iter().take(10).all(|v| is_uuid_pattern(v)) {
+        return Some(FieldRole::Id);
+    }
+    if is_sequential_numeric(values) {
+        return Some(FieldRole::Id);
+    }
+    // 字符串字段: 高 uniqueness 也算 Id (e.g. user_0, user_1, ...)
+    if uniqueness > 0.9 && !values.is_empty() && values.iter().all(|v| matches!(v, Value::String(_)))
+    {
+        return Some(FieldRole::Id);
+    }
+    None
+}
+
+fn detect_score(range: Option<(f64, f64)>, is_numeric: bool) -> Option<FieldRole> {
+    if !is_numeric {
+        return None;
+    }
+    let (lo, hi) = range?;
+    let span = hi - lo;
+    if (lo >= 0.0 && hi <= 1.0 && span > 0.01) || (lo >= 0.0 && hi <= 100.0 && span > 1.0) {
+        Some(FieldRole::Score)
+    } else {
+        None
+    }
+}
+
+fn detect_temporal(values: &[&Value]) -> Option<FieldRole> {
+    if !values.is_empty() && values.iter().take(10).all(|v| is_timestamp_pattern(v)) {
+        Some(FieldRole::Temporal)
+    } else {
+        None
+    }
+}
+
+fn detect_error(name: &str, values: &[&Value]) -> Option<FieldRole> {
+    let name_match = ERROR_KEYWORDS
+        .iter()
+        .any(|k| name.to_lowercase().contains(k));
+    let value_match = values.iter().any(|v| match v {
+        Value::String(s) => {
+            let sl = s.to_lowercase();
+            ERROR_KEYWORDS.iter().any(|k| sl.contains(k))
+        }
+        Value::Bool(false)
+            if {
+                let n = name.to_lowercase();
+                n.contains("success") || n.contains("ok") || n == "passed"
+            } =>
+        {
+            true
+        }
+        _ => false,
+    });
+    if name_match || value_match {
+        Some(FieldRole::Error)
+    } else {
+        None
+    }
+}
+
+fn detect_anomaly(values: &[&Value]) -> Option<FieldRole> {
+    // 数值字段: 远离 mean > 3σ (更严格, 避免均匀分布的尾部被误判)
+    // 且 outlier 数量少 (1-5% 范围, 不能 0 也不能太多)
+    let nums: Vec<f64> = values
+        .iter()
+        .filter_map(|v| {
+            if let Value::Number(n) = v {
+                Some(*n)
+            } else {
+                None
+            }
+        })
+        .collect();
+    if nums.len() >= 5 {
+        let mean = nums.iter().sum::<f64>() / nums.len() as f64;
+        let var = nums.iter().map(|n| (n - mean).powi(2)).sum::<f64>() / nums.len() as f64;
+        let std = var.sqrt();
+        if std > 0.0 {
+            let outlier_count = nums
+                .iter()
+                .filter(|n| (**n - mean).abs() > 3.0 * std)
+                .count();
+            // 至少 1 个 outlier, 且不超过 5% 项
+            if outlier_count >= 1 && outlier_count * 20 <= nums.len() {
+                return Some(FieldRole::Anomaly);
+            }
+        }
+    }
+    // 字符串字段: 低频 categorical (< 5%)
+    let strs: Vec<&str> = values
+        .iter()
+        .filter_map(|v| {
+            if let Value::String(s) = v {
+                Some(s.as_str())
+            } else {
+                None
+            }
+        })
+        .collect();
+    if strs.len() >= 10 {
+        let mut freq: HashMap<&str, usize> = HashMap::new();
+        for s in &strs {
+            *freq.entry(s).or_insert(0) += 1;
+        }
+        let rare = freq.values().filter(|&&c| c * 20 < strs.len()).count();
+        if rare > 0 && rare * 5 < freq.len() {
+            return Some(FieldRole::Anomaly);
+        }
+    }
+    None
+}
+
+fn compute_uniqueness(values: &[&Value]) -> f32 {
+    if values.is_empty() {
+        return 0.0;
+    }
+    let mut seen: HashSet<String> = HashSet::new();
+    for v in values {
+        seen.insert(format!("{:?}", v));
+    }
+    seen.len() as f32 / values.len() as f32
+}
+
+fn compute_null_rate(values: &[&Value]) -> f32 {
+    if values.is_empty() {
+        return 0.0;
+    }
+    let nulls = values.iter().filter(|v| matches!(v, Value::Nil)).count();
+    nulls as f32 / values.len() as f32
+}
+
+fn is_uuid_pattern(v: &Value) -> bool {
+    if let Value::String(s) = v {
+        let parts: Vec<&str> = s.split('-').collect();
+        parts.len() == 5
+            && parts[0].len() == 8
+            && parts[1].len() == 4
+            && parts[2].len() == 4
+            && parts[3].len() == 4
+            && parts[4].len() == 12
+            && s.chars().all(|c| c == '-' || c.is_ascii_hexdigit())
+    } else {
+        false
+    }
+}
+
+fn is_sequential_numeric(values: &[&Value]) -> bool {
+    let nums: Vec<f64> = values
+        .iter()
+        .filter_map(|v| {
+            if let Value::Number(n) = v {
+                Some(*n)
+            } else {
+                None
+            }
+        })
+        .collect();
+    if nums.len() < 3 {
+        return false;
+    }
+    nums.windows(2)
+        .all(|w| (w[1] - w[0] - 1.0).abs() < 0.001)
+}
+
+fn is_timestamp_pattern(v: &Value) -> bool {
+    match v {
+        Value::String(s) => {
+            let iso = s.len() >= 10
+                && s.as_bytes().get(4) == Some(&b'-')
+                && s.as_bytes().get(7) == Some(&b'-');
+            let unix = s.len() >= 10 && s.len() <= 13 && s.chars().all(|c| c.is_ascii_digit());
+            iso || unix
+        }
+        Value::Number(n) => *n > 1_000_000_000.0 && *n < 10_000_000_000.0,
+        _ => false,
+    }
+}
+
+// ──────────────────── ArrayType 推断 ────────────────────
+
+pub fn detect_array_type(_items: &[Value], fields: &[FieldStats]) -> ArrayType {
+    if fields.iter().any(|f| f.role == FieldRole::Score) {
+        return ArrayType::TopScores;
+    }
+    if fields.iter().any(|f| f.role == FieldRole::Temporal) {
+        return ArrayType::TimeSeries;
+    }
+    if fields
+        .iter()
+        .any(|f| f.uniqueness < 0.3 && f.role != FieldRole::Constant)
+    {
+        return ArrayType::Clustered;
+    }
+    // Uniform: 字段少 (<10) 且全部是 Constant 或 Generic (即没有语义角色的纯数据)
+    // 之前误把 is_numeric 全 true 的 Id 字段也算 Uniform, 改为排除 Id
+    if fields.len() < 10
+        && fields.iter().all(|f| {
+            f.role == FieldRole::Constant
+                || f.role == FieldRole::Generic
+        })
+    {
+        return ArrayType::Uniform;
+    }
+    ArrayType::Generic
+}
+
+// ──────────────────── 5 种压缩策略 ────────────────────
+
+#[derive(Debug)]
+pub struct TopNStrategy;
+
+impl Strategy for TopNStrategy {
+    fn name(&self) -> &'static str {
+        "topn"
+    }
+    fn select(
+        &self,
+        items: &[Value],
+        fields: &[FieldStats],
+        target: usize,
+        constraints: &[Box<dyn Constraint>],
+    ) -> Vec<usize> {
+        let score_field = fields
+            .iter()
+            .find(|f| f.role == FieldRole::Score)
+            .map(|f| f.name.clone());
+        // 没找到 Score 字段 → fall back 到 SmartSampleStrategy 行为 (按 index 顺序 + 头尾)
+        let Some(score_field) = score_field else {
+            return SmartSampleStrategy.select(items, fields, target, constraints);
+        };
+        let mut scored: Vec<(usize, f64)> = items
+            .iter()
+            .enumerate()
+            .map(|(i, it)| {
+                let s = if let Value::Dict(d) = it {
+                    d.get(&score_field)
+                        .and_then(|v| {
+                            if let Value::Number(n) = v {
+                                Some(*n)
+                            } else {
+                                None
+                            }
+                        })
+                        .unwrap_or(0.0)
+                } else {
+                    0.0
+                };
+                (i, s)
+            })
+            .collect();
+        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        let mut keep: Vec<usize> = scored.iter().take(target).map(|(i, _)| *i).collect();
+        apply_all(&mut keep, items, fields, constraints);
+        finalize(keep, target)
+    }
+}
+
+#[derive(Debug)]
+pub struct TimeSeriesStrategy;
+
+impl Strategy for TimeSeriesStrategy {
+    fn name(&self) -> &'static str {
+        "timeseries"
+    }
+    fn select(
+        &self,
+        items: &[Value],
+        _fields: &[FieldStats],
+        target: usize,
+        constraints: &[Box<dyn Constraint>],
+    ) -> Vec<usize> {
+        let n = items.len();
+        let boundary = target / 3;
+        let mut keep: Vec<usize> = (0..boundary.min(n)).collect();
+        keep.extend((n.saturating_sub(boundary)..n).collect::<Vec<_>>());
+
+        let mid_target = target.saturating_sub(keep.len());
+        if mid_target > 0 {
+            let mid_start = boundary;
+            let mid_end = n.saturating_sub(boundary);
+            if mid_end > mid_start {
+                let step = (mid_end - mid_start) as f32 / mid_target as f32;
+                for i in 0..mid_target {
+                    keep.push(mid_start + (i as f32 * step) as usize);
+                }
+            }
+        }
+        apply_all(&mut keep, items, _fields, constraints);
+        finalize(keep, target)
+    }
+}
+
+#[derive(Debug)]
+pub struct ClusterSampleStrategy;
+
+impl Strategy for ClusterSampleStrategy {
+    fn name(&self) -> &'static str {
+        "cluster_sample"
+    }
+    fn select(
+        &self,
+        items: &[Value],
+        _fields: &[FieldStats],
+        target: usize,
+        constraints: &[Box<dyn Constraint>],
+    ) -> Vec<usize> {
+        let mut seen_groups: HashSet<String> = HashSet::new();
+        let mut keep: Vec<usize> = Vec::new();
+        for (i, it) in items.iter().enumerate() {
+            if let Value::Dict(d) = it {
+                let group_key: String = d
+                    .values()
+                    .filter(|v| matches!(v, Value::String(_)))
+                    .take(3)
+                    .map(|v| format!("{:?}", v))
+                    .collect::<Vec<_>>()
+                    .join("|");
+                if seen_groups.insert(group_key) {
+                    keep.push(i);
+                    if keep.len() >= target {
+                        break;
+                    }
+                }
+            }
+        }
+        apply_all(&mut keep, items, _fields, constraints);
+        finalize(keep, target)
+    }
+}
+
+#[derive(Debug)]
+pub struct SmartSampleStrategy;
+
+impl Strategy for SmartSampleStrategy {
+    fn name(&self) -> &'static str {
+        "smart_sample"
+    }
+    fn select(
+        &self,
+        items: &[Value],
+        _fields: &[FieldStats],
+        target: usize,
+        constraints: &[Box<dyn Constraint>],
+    ) -> Vec<usize> {
+        let n = items.len();
+        let k_first = (target / 2).max(1);
+        let k_last = target.saturating_sub(k_first).max(1);
+        let mut keep: Vec<usize> = (0..k_first.min(n)).collect();
+        keep.extend((n.saturating_sub(k_last)..n).collect::<Vec<_>>());
+        let mid_target = target.saturating_sub(keep.len());
+        if mid_target > 0 && n > k_first + k_last {
+            let step = (n - k_first - k_last) as f32 / mid_target as f32;
+            for i in 0..mid_target {
+                keep.push(k_first + (i as f32 * step) as usize);
+            }
+        }
+        apply_all(&mut keep, items, _fields, constraints);
+        finalize(keep, target)
+    }
+}
+
+#[derive(Debug)]
+pub struct LosslessStrategy;
+
+impl Strategy for LosslessStrategy {
+    fn name(&self) -> &'static str {
+        "lossless"
+    }
+    fn select(
+        &self,
+        items: &[Value],
+        _fields: &[FieldStats],
+        target: usize,
+        _constraints: &[Box<dyn Constraint>],
+    ) -> Vec<usize> {
+        (0..items.len().min(target)).collect()
+    }
+}
+
+fn apply_all(
+    keep: &mut Vec<usize>,
+    items: &[Value],
+    fields: &[FieldStats],
+    constraints: &[Box<dyn Constraint>],
+) {
+    for c in constraints {
+        c.apply(keep, items, fields);
+    }
+}
+
+fn finalize(keep: Vec<usize>, target: usize) -> Vec<usize> {
+    let mut v = keep;
+    v.sort_unstable();
+    v.dedup();
+    if v.len() > target {
+        v.truncate(target);
+    }
+    v
+}
+
+// ──────────────────── Constraint 实现 ────────────────────
+
+#[derive(Debug)]
+pub struct KeepErrorsConstraint;
+
+impl Constraint for KeepErrorsConstraint {
+    fn name(&self) -> &str {
+        "keep_errors"
+    }
+    fn apply(&self, keep: &mut Vec<usize>, items: &[Value], _fields: &[FieldStats]) {
+        for (i, it) in items.iter().enumerate() {
+            if keep.contains(&i) {
+                continue;
+            }
+            if let Value::Dict(d) = it {
+                let has_error = d.iter().any(|(k, v)| {
+                    let kk = k.to_lowercase();
+                    ERROR_KEYWORDS.iter().any(|kw| kk.contains(kw))
+                        || matches!(v, Value::String(s) if {
+                            let sl = s.to_lowercase();
+                            ERROR_KEYWORDS.iter().any(|kw| sl.contains(kw))
+                        })
+                        || matches!(v, Value::Bool(false) if {
+                            kk.contains("success") || kk.contains("ok") || kk == "passed"
+                        })
+                });
+                if has_error {
+                    keep.push(i);
+                }
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct KeepOutliersConstraint;
+
+impl Constraint for KeepOutliersConstraint {
+    fn name(&self) -> &str {
+        "keep_outliers"
+    }
+    fn apply(&self, keep: &mut Vec<usize>, items: &[Value], fields: &[FieldStats]) {
+        // 只对 role=Anomaly 字段跑 outlier 检测
+        // (Score 字段的高值是 feature 不是 outlier, 由 TopNStrategy 保留)
+        for field in fields.iter().filter(|f| f.role == FieldRole::Anomaly) {
+            let values: Vec<&Value> = items
+                .iter()
+                .filter_map(|it| {
+                    if let Value::Dict(d) = it {
+                        d.get(&field.name)
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            let outliers = outliers_by_zscore(&values, 2.0);
+            for i in outliers {
+                if !keep.contains(&i) {
+                    keep.push(i);
+                }
+            }
+        }
+    }
+}
+
+pub fn outliers_by_zscore(values: &[&Value], z: f64) -> Vec<usize> {
+    let nums: Vec<(usize, f64)> = values
+        .iter()
+        .enumerate()
+        .filter_map(|(i, v)| {
+            if let Value::Number(n) = v {
+                Some((i, *n))
+            } else {
+                None
+            }
+        })
+        .collect();
+    if nums.len() < 5 {
+        return vec![];
+    }
+    let mean = nums.iter().map(|(_, n)| n).sum::<f64>() / nums.len() as f64;
+    let var = nums
+        .iter()
+        .map(|(_, n)| (n - mean).powi(2))
+        .sum::<f64>()
+        / nums.len() as f64;
+    let std = var.sqrt();
+    if std == 0.0 {
+        return vec![];
+    }
+    nums.iter()
+        .filter(|(_, n)| (*n - mean).abs() > z * std)
+        .map(|(i, _)| *i)
+        .collect()
+}
+
+#[derive(Debug)]
+pub struct KeepBoundaryConstraint {
+    pub k_first: usize,
+    pub k_last: usize,
+}
+
+impl Constraint for KeepBoundaryConstraint {
+    fn name(&self) -> &str {
+        "keep_boundary"
+    }
+    fn apply(&self, keep: &mut Vec<usize>, items: &[Value], _fields: &[FieldStats]) {
+        let n = items.len();
+        for i in 0..self.k_first.min(n) {
+            if !keep.contains(&i) {
+                keep.push(i);
+            }
+        }
+        for i in n.saturating_sub(self.k_last)..n {
+            if !keep.contains(&i) {
+                keep.push(i);
+            }
+        }
+    }
+}
+
+// ──────────────────── Lossless 紧凑格式 ────────────────────
+
+/// 尝试无损压缩: 转 csv-schema 或 markdown-kv
+/// 返回 None 表示不适用 (schema 不均匀)
+pub fn try_lossless_compact(
+    items: &[Value],
+    fields: &[FieldStats],
+) -> Option<CrushResult> {
+    if items.is_empty() {
+        return None;
+    }
+    let first_keys: HashSet<String> = match &items[0] {
+        Value::Dict(d) => d.keys().cloned().collect(),
+        _ => return None,
+    };
+    if !items.iter().all(|it| {
+        if let Value::Dict(d) = it {
+            d.keys().cloned().collect::<HashSet<_>>() == first_keys
+        } else {
+            false
+        }
+    }) {
+        return None;
+    }
+
+    let all_scalar = fields.iter().all(|f| {
+        f.sample
+            .iter()
+            .all(|v| matches!(v, Value::String(_) | Value::Number(_) | Value::Bool(_) | Value::Nil))
+    });
+
+    let compact_str = if all_scalar && fields.iter().any(|f| f.is_numeric) {
+        let header: Vec<&str> = fields.iter().map(|f| f.name.as_str()).collect();
+        let rows: Vec<String> = items
+            .iter()
+            .map(|it| {
+                if let Value::Dict(d) = it {
+                    fields
+                        .iter()
+                        .map(|f| {
+                            d.get(&f.name)
+                                .map(value_to_json)
+                                .unwrap_or_default()
+                        })
+                        .collect::<Vec<_>>()
+                        .join(",")
+                } else {
+                    String::new()
+                }
+            })
+            .collect();
+        format!("schema: {}\n{}", header.join(","), rows.join("\n"))
+    } else {
+        let mut s = String::new();
+        for (i, it) in items.iter().enumerate() {
+            if let Value::Dict(d) = it {
+                s.push_str(&format!("## item_{}\n", i));
+                for (k, v) in d {
+                    s.push_str(&format!("- {}: {}\n", k, value_to_json(v)));
+                }
+            }
+        }
+        s
+    };
+
+    let byte_estimate = compact_str.len();
+    Some(CrushResult {
+        items: vec![Value::String(compact_str)],
+        strategy_used: "lossless_compact".into(),
+        array_type: ArrayType::Uniform,
+        fields: fields.to_vec(),
+        items_total: items.len(),
+        items_kept: items.len(),
+        savings_ratio: 0.0,
+        byte_estimate,
+    })
+}
+
+// ──────────────────── 主入口 `crush_json` ────────────────────
+
+/// v0.30 SmartCrusher 主入口
+pub fn crush_json(
+    items: &[Value],
+    target: usize,
+    options: &CompressOptions,
+) -> CrushResult {
+    // 1. 边界
+    if items.is_empty() {
+        return CrushResult {
+            items: vec![],
+            strategy_used: "passthrough".into(),
+            array_type: ArrayType::Generic,
+            fields: vec![],
+            items_total: 0,
+            items_kept: 0,
+            savings_ratio: 0.0,
+            byte_estimate: 0,
+        };
+    }
+    // 短列表直通: items <= 5 或 items <= target (取 min)
+    // 当显式 strategy="lossless" 时, 不直通 (让 Lossless-First 短路判断是否真的无损)
+    let short_passthrough = items.len() <= 5
+        || (items.len() <= target && options.strategy != "lossless");
+    if short_passthrough {
+        return CrushResult {
+            items: items.to_vec(),
+            strategy_used: "passthrough".into(),
+            array_type: ArrayType::Generic,
+            fields: vec![],
+            items_total: items.len(),
+            items_kept: items.len(),
+            savings_ratio: 0.0,
+            byte_estimate: estimate_bytes(items),
+        };
+    }
+
+    // 2. 字段角色
+    let fields = extract_field_stats(items);
+
+    // 3. Array 类型
+    let array_type = detect_array_type(items, &fields);
+
+    // 4. 选策略
+    let strategy: Box<dyn Strategy> = match options.strategy.as_str() {
+        "topn" => Box::new(TopNStrategy),
+        "timeseries" => Box::new(TimeSeriesStrategy),
+        "cluster" => Box::new(ClusterSampleStrategy),
+        "lossless" => {
+            if let Some(compact) = try_lossless_compact(items, &fields) {
+                let ratio = 1.0
+                    - (compact.byte_estimate as f32 / estimate_bytes(items).max(1) as f32);
+                if ratio >= options.lossless_min_savings_ratio {
+                    return compact;
+                }
+            }
+            Box::new(SmartSampleStrategy)
+        }
+        "smart_sample" | "head_tail" => Box::new(SmartSampleStrategy),
+        "auto" | "" => match array_type {
+            ArrayType::TopScores => Box::new(TopNStrategy),
+            ArrayType::TimeSeries => Box::new(TimeSeriesStrategy),
+            ArrayType::Clustered => Box::new(ClusterSampleStrategy),
+            ArrayType::Uniform => Box::new(LosslessStrategy),
+            ArrayType::Generic => Box::new(SmartSampleStrategy),
+        },
+        _ => Box::new(SmartSampleStrategy),
+    };
+
+    // 5. 构建约束
+    let mut constraints: Vec<Box<dyn Constraint>> = Vec::new();
+    if options.preserve_errors {
+        constraints.push(Box::new(KeepErrorsConstraint));
+    }
+    if options.preserve_outliers {
+        constraints.push(Box::new(KeepOutliersConstraint));
+    }
+    let k_first = options
+        .k_first
+        .unwrap_or((target as f32 * 0.15) as usize);
+    let k_last = options
+        .k_last
+        .unwrap_or((target as f32 * 0.15) as usize);
+    if k_first + k_last < target {
+        constraints.push(Box::new(KeepBoundaryConstraint { k_first, k_last }));
+    }
+
+    // 6. 执行选择
+    let keep = strategy.select(items, &fields, target, &constraints);
+
+    // 7. 构造结果
+    let kept_items: Vec<Value> = keep.iter().map(|&i| items[i].clone()).collect();
+    let byte_estimate = estimate_bytes(&kept_items);
+    CrushResult {
+        items: kept_items,
+        strategy_used: strategy.name().to_string(),
+        array_type,
+        fields,
+        items_total: items.len(),
+        items_kept: keep.len(),
+        savings_ratio: 1.0 - (keep.len() as f32 / items.len() as f32),
+        byte_estimate,
+    }
+}
+
+pub fn estimate_bytes(items: &[Value]) -> usize {
+    items.iter().map(|v| value_to_json(v).len()).sum()
+}
+
+// ──────────────────── 字符串入口（解析后调用 crush_json） ────────────────────
+
+/// 从 JSON 字符串压缩（替代 v0.29 `parse_json_simple` stub）
+pub fn crush_json_string(
+    content: &str,
+    target: usize,
+    options: &CompressOptions,
+) -> Result<CrushResult, String> {
+    let parsed = json_to_value(content)?;
+    let items = match parsed {
+        Value::List(l) => l,
+        other => {
+            return Err(format!(
+                "crush.json: expected JSON array, got {}",
+                value_type_name(&other)
+            ))
+        }
+    };
+    Ok(crush_json(&items, target, options))
+}
+
+fn value_type_name(v: &Value) -> &'static str {
+    match v {
+        Value::String(_) => "string",
+        Value::Number(_) => "number",
+        Value::Bool(_) => "bool",
+        Value::Nil => "null",
+        Value::List(_) => "array",
+        Value::Dict(_) => "object",
+        _ => "other",
+    }
+}
+
+// ──────────────────── SubCompressor 适配（保持 v0.29 trait API） ────────────────────
+
+/// 适配 v0.29 SubCompressor trait：把 content 视为 JSON 数组字符串
 #[derive(Debug)]
 pub struct JsonSubCompressor;
 
-impl SubCompressor for JsonSubCompressor {
+impl crate::compress::SubCompressor for JsonSubCompressor {
     fn sniff(&self, content: &str) -> f32 {
         let trimmed = content.trim_start();
         if trimmed.starts_with('[') || trimmed.starts_with('{') {
@@ -35,12 +966,28 @@ impl SubCompressor for JsonSubCompressor {
         max_bytes: usize,
         options: &CompressOptions,
     ) -> Result<String, String> {
-        // 解析为 Value; MVP 路径 (`parse_json_simple` 仍是 None stub in Task 1)
-        let parsed = parse_json_string(content)?;
-        // 粗略: 每项 ~200 bytes (与 spec §6.6 一致)
-        let max_items = (max_bytes / 200).max(1);
-        let crushed = crush_json_core(&parsed, max_items, &options.anomaly_keys)?;
-        Ok(value_to_json_string(&crushed))
+        let parsed = json_to_value(content).map_err(|e| format!("crush.json: {}", e))?;
+        let items = match parsed {
+            Value::List(l) => l,
+            _ => {
+                return Err(format!(
+                    "crush.json: expected JSON array, got {}",
+                    value_type_name(&parsed)
+                ))
+            }
+        };
+        // 由 max_bytes 推 target: 假设每项 200 bytes (与 v0.29 一致)
+        let target = (max_bytes / 200).max(1);
+        let result = crush_json(&items, target, options);
+        let json = value_to_json(&Value::List(result.items.clone()));
+        Ok(format!(
+            "{}\n<compressed:method=smart_crusher strategy={} items={} total={} savings={:.2}>",
+            json,
+            result.strategy_used,
+            result.items_kept,
+            result.items_total,
+            result.savings_ratio
+        ))
     }
 
     fn origin(&self) -> &'static str {
@@ -48,220 +995,271 @@ impl SubCompressor for JsonSubCompressor {
     }
 }
 
-/// v0.29: 核心算法 — Kneedle + 异常保留 (MVP 实现)
-///
-/// 算法 (headroom-style):
-///   1. N < min_threshold (5) 或 N ≤ max_items → 原样
-///   2. 抽取常量字段 (所有项相同) — 暂记为 v0.30 输出元数据
-///   3. 强制保留 anomaly_keys 字段对应的项
-///   4. Kneedle-like 拐点检测 — MVP: 30% 头 + 15% 尾
-///   5. 去重 + 排序 + 截断
-///   6. 构造返回 `Value::List`
-pub fn crush_json_core(
-    input: &Value,
-    max_items: usize,
-    anomaly_keys: &[String],
-) -> Result<Value, String> {
-    // 1. 必须是 List
-    let items = match input {
-        Value::List(l) => l.clone(),
-        other => {
-            return Err(format!(
-                "crush_json: expected list, got {}",
-                value_type(other)
-            ))
-        }
-    };
-
-    // 空列表直接返回
-    if items.is_empty() {
-        return Ok(Value::List(vec![]));
-    }
-
-    // 2. 验证每个 item 是 Dict
-    for (i, it) in items.iter().enumerate() {
-        if !matches!(it, Value::Dict(_)) {
-            return Err(format!(
-                "crush_json: each item must be a dict (item {} is {})",
-                i,
-                value_type(it)
-            ));
-        }
-    }
-
-    // 3. N < min_threshold (5) 或 N ≤ max_items → 原样
-    if items.len() <= 5 || items.len() <= max_items {
-        return Ok(Value::List(items));
-    }
-
-    // 4. 抽出常量字段 (所有项相同) — MVP 不嵌入输出 (v0.30 改进)
-    let constant_fields = extract_constant_fields(&items);
-    // 抑制 unused 警告: constant_fields 留给 v0.30 输出 metadata
-    let _ = &constant_fields;
-
-    // 5. 标记 anomaly 项 (含 anomaly_keys 的项必须保留)
-    let mut keep_indices: Vec<usize> = Vec::new();
-    for (i, it) in items.iter().enumerate() {
-        if let Value::Dict(d) = it {
-            for k in anomaly_keys {
-                if d.contains_key(k) {
-                    keep_indices.push(i);
-                    break;
-                }
-            }
-        }
-    }
-
-    // 6. Kneedle-like 拐点检测 — MVP: 30% 头 + 15% 尾
-    let n = items.len();
-    let head_count = (n as f32 * 0.3) as usize;
-    let tail_count = (n as f32 * 0.15) as usize;
-    let target = max_items.saturating_sub(keep_indices.len()).max(1);
-    let head_n = head_count.min(target / 2).min(n);
-    let tail_n = tail_count
-        .min(target - head_n)
-        .min(n.saturating_sub(head_n));
-
-    for i in 0..head_n {
-        keep_indices.push(i);
-    }
-    for i in (n - tail_n)..n {
-        keep_indices.push(i);
-    }
-
-    // 7. 去重 + 排序 + 截断
-    keep_indices.sort_unstable();
-    keep_indices.dedup();
-    keep_indices.truncate(max_items);
-
-    // 8. 构造返回 List
-    let kept_items: Vec<Value> = keep_indices.iter().map(|&i| items[i].clone()).collect();
-    Ok(Value::List(kept_items))
-}
-
-/// v0.29: 抽取所有项共有的字段 (字段名 + 值)。
-///
-/// 如果 items 为空 / 第一项不是 Dict / 任何项不是 Dict → 返回空 map。
-pub fn extract_constant_fields(items: &[Value]) -> HashMap<String, Value> {
-    if items.is_empty() {
-        return HashMap::new();
-    }
-    let first = match &items[0] {
-        Value::Dict(d) => d.clone(),
-        _ => return HashMap::new(),
-    };
-    let mut constants = first;
-    for it in &items[1..] {
-        if let Value::Dict(d) = it {
-            constants.retain(|k, v| d.get(k) == Some(v));
-        } else {
-            return HashMap::new();
-        }
-    }
-    constants
-}
-
-// ── 本地 helpers (delegating 到 mod.rs 的 stub) ──────────────────────
-
-fn parse_json_string(s: &str) -> Result<Value, String> {
-    crate::compress::parse_json_simple(s)
-        .ok_or_else(|| "crush_json: json.parse failed".to_string())
-}
-
-fn value_to_json_string(v: &Value) -> String {
-    crate::compress::value_to_json_simple(v)
-}
-
-fn value_type(v: &Value) -> &'static str {
-    crate::compress::value_type_simple(v)
-}
-
-// ── Tests ─────────────────────────────────────────────────────────────
+// ──────────────────── 单元测试 ────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn make_items(n: usize) -> Vec<Value> {
-        (0..n)
+    fn make_items<F: Fn(usize) -> HashMap<String, Value>>(n: usize, f: F) -> Vec<Value> {
+        (0..n).map(|i| Value::Dict(f(i))).collect()
+    }
+
+    // ── 字段角色测试 ──
+
+    #[test]
+    fn role_id_uses_uniqueness_not_name() {
+        let items = make_items(10, |i| {
+            let mut d = HashMap::new();
+            d.insert("id".into(), Value::String("same".into()));
+            d.insert("name".into(), Value::String(format!("user_{}", i)));
+            d
+        });
+        let fields = extract_field_stats(&items);
+        let role_map: HashMap<&str, FieldRole> = fields
+            .iter()
+            .map(|f| (f.name.as_str(), f.role))
+            .collect();
+        assert_eq!(role_map["id"], FieldRole::Generic);
+        assert_eq!(role_map["name"], FieldRole::Id);
+    }
+
+    #[test]
+    fn role_score_uses_range_not_name() {
+        let items = make_items(10, |i| {
+            let mut d = HashMap::new();
+            d.insert("amount".into(), Value::Number(i as f64 / 10.0));
+            d
+        });
+        let fields = extract_field_stats(&items);
+        assert_eq!(fields[0].role, FieldRole::Score);
+    }
+
+    #[test]
+    fn role_error_detects_value_content() {
+        let mut items = make_items(10, |i| {
+            let mut d = HashMap::new();
+            d.insert("msg".into(), Value::String(format!("ok #{}", i)));
+            d
+        });
+        if let Value::Dict(d) = &mut items[5] {
+            d.insert(
+                "msg".into(),
+                Value::String("operation failed".into()),
+            );
+        }
+        let opts = CompressOptions::default();
+        let r = crush_json(&items, 2, &opts);
+        assert!(
+            r.items.iter().any(|it| matches!(it, Value::Dict(d) if
+                d.get("msg").map(|v| v.to_string().contains("failed")).unwrap_or(false)
+            )),
+            "KeepErrorsConstraint 应基于值内容保留 failed 项"
+        );
+    }
+
+    #[test]
+    fn role_temporal_iso8601() {
+        let items = make_items(5, |i| {
+            let mut d = HashMap::new();
+            d.insert(
+                "ts".into(),
+                Value::String(format!("2026-01-{:02}T00:00:00Z", i + 1)),
+            );
+            d
+        });
+        let fields = extract_field_stats(&items);
+        assert_eq!(fields[0].role, FieldRole::Temporal);
+    }
+
+    #[test]
+    fn role_anomaly_zscore_detection() {
+        let items = make_items(100, |i| {
+            let mut d = HashMap::new();
+            d.insert(
+                "value".into(),
+                Value::Number(if i == 50 {
+                    1000.0
+                } else {
+                    (i as f64) / 100.0
+                }),
+            );
+            d
+        });
+        let fields = extract_field_stats(&items);
+        assert_eq!(fields[0].role, FieldRole::Anomaly);
+    }
+
+    // ── 策略测试 ──
+
+    #[test]
+    fn strategy_topn_keeps_highest() {
+        let items: Vec<Value> = (0..100)
             .map(|i| {
                 let mut d = HashMap::new();
-                d.insert("id".to_string(), Value::Number(i as f64));
-                d.insert("score".to_string(), Value::Number((i as f64) * 0.1));
-                d.insert("category".to_string(), Value::String("A".into()));
+                d.insert("score".into(), Value::Number((i as f64).sqrt()));
                 Value::Dict(d)
             })
-            .collect()
-    }
-
-    #[test]
-    fn test_crush_json_small_list_passthrough() {
-        let items = make_items(3);
-        let input = Value::List(items);
-        let result = crush_json_core(&input, 10, &["error".into()]).unwrap();
-        if let Value::List(l) = result {
-            assert_eq!(l.len(), 3, "small list (≤5) should pass through");
-        } else {
-            panic!("expected List");
-        }
-    }
-
-    #[test]
-    fn test_crush_json_basic_compress_100_to_10() {
-        let items = make_items(100);
-        let input = Value::List(items);
-        let result = crush_json_core(&input, 10, &["error".into()]).unwrap();
-        if let Value::List(l) = result {
-            assert_eq!(l.len(), 10, "should crush 100 items to 10");
-        } else {
-            panic!("expected List");
-        }
-    }
-
-    #[test]
-    fn test_crush_json_preserves_anomaly_items() {
-        let mut items = make_items(50);
-        // 第 25 项注入 error 字段
-        if let Value::Dict(d) = &mut items[25] {
-            d.insert("error".to_string(), Value::String("BOOM".into()));
-        }
-        let input = Value::List(items);
-        let result = crush_json_core(&input, 5, &["error".into()]).unwrap();
-        if let Value::List(l) = result {
-            let has_anomaly = l.iter().any(|it| {
-                if let Value::Dict(d) = it {
-                    d.get("error").is_some()
-                } else {
-                    false
+            .collect();
+        let opts = CompressOptions {
+            strategy: "topn".into(),
+            ..CompressOptions::default()
+        };
+        let r = crush_json(&items, 5, &opts);
+        assert_eq!(r.strategy_used, "topn");
+        assert!(r.items.len() <= 5, "top 5 + constraints ≤ 5: got {}", r.items.len());
+        // 必须包含最高分 (sqrt(99) ≈ 9.95)
+        let scores: Vec<f64> = r
+            .items
+            .iter()
+            .filter_map(|it| {
+                if let Value::Dict(d) = it
+                    && let Some(Value::Number(n)) = d.get("score")
+                {
+                    return Some(*n);
                 }
-            });
-            assert!(has_anomaly, "anomaly item with error field must be preserved");
-        } else {
-            panic!("expected List");
+                None
+            })
+            .collect();
+        assert!(
+            scores.iter().any(|&s| (s - 99.0_f64.sqrt()).abs() < 0.001),
+            "top score sqrt(99) must be present, scores: {:?}",
+            scores
+        );
+    }
+
+    #[test]
+    fn strategy_timeseries_preserves_boundary() {
+        let items = make_items(100, |i| {
+            let mut d = HashMap::new();
+            d.insert("ts".into(), Value::String(format!("2026-01-{:02}", i + 1)));
+            d.insert("v".into(), Value::Number(i as f64));
+            d
+        });
+        let opts = CompressOptions {
+            strategy: "timeseries".into(),
+            ..CompressOptions::default()
+        };
+        let r = crush_json(&items, 30, &opts);
+        assert!(r.items.iter().any(|it| matches!(it, Value::Dict(d) if
+            d.get("v") == Some(&Value::Number(0.0))
+        )));
+    }
+
+    #[test]
+    fn strategy_lossless_csv_schema() {
+        let items = make_items(20, |i| {
+            let mut d = HashMap::new();
+            d.insert("id".into(), Value::Number(i as f64));
+            d.insert("name".into(), Value::String(format!("item_{}", i)));
+            d.insert("value".into(), Value::Number(i as f64 * 2.0));
+            d
+        });
+        let opts = CompressOptions {
+            strategy: "lossless".into(),
+            max_bytes: Some(8192),
+            ..CompressOptions::default()
+        };
+        let r = crush_json(&items, 100, &opts);
+        // 走 lossless compact 路径, 输出单字符串
+        assert_eq!(r.strategy_used, "lossless_compact");
+        assert_eq!(r.items.len(), 1);
+        if let Value::String(s) = &r.items[0] {
+            assert!(s.contains("schema:") || s.contains("## "), "got: {}", s);
         }
     }
 
     #[test]
-    fn test_crush_json_extracts_constant_field() {
-        let items = make_items(20);
-        // 所有项都有 `category: "A"` 字段 — 这是常量
-        let constants = extract_constant_fields(&items);
-        assert!(
-            constants.contains_key("category"),
-            "extract_constant_fields should surface `category`"
-        );
-        assert_eq!(constants.get("category"), Some(&Value::String("A".into())));
+    fn strategy_auto_picks_topn_for_scores() {
+        let items = make_items(50, |i| {
+            let mut d = HashMap::new();
+            d.insert("score".into(), Value::Number((i as f64) / 50.0));
+            d.insert("name".into(), Value::String(format!("item_{}", i)));
+            d
+        });
+        let r = crush_json(&items, 5, &CompressOptions::default());
+        assert_eq!(r.array_type, ArrayType::TopScores);
+        assert_eq!(r.strategy_used, "topn");
+    }
+
+    // ── 约束测试 ──
+
+    #[test]
+    fn constraint_keeps_errors() {
+        let mut items = make_items(100, |i| {
+            let mut d = HashMap::new();
+            d.insert("msg".into(), Value::String(format!("ok #{}", i)));
+            d
+        });
+        if let Value::Dict(d) = &mut items[50] {
+            d.insert("msg".into(), Value::String("operation failed".into()));
+        }
+        let r = crush_json(&items, 10, &CompressOptions::default());
+        assert!(r.items.iter().any(|it| matches!(it, Value::Dict(d) if
+            d.get("msg").map(|v| v.to_string().contains("failed")).unwrap_or(false)
+        )));
     }
 
     #[test]
-    fn test_crush_json_rejects_non_list() {
-        let input = Value::String("not a list".into());
-        let result = crush_json_core(&input, 10, &["error".into()]);
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert!(
-            err.starts_with("crush_json:"),
-            "error should start with 'crush_json:' but got: {err}"
+    fn constraint_keeps_outliers() {
+        let items = make_items(100, |i| {
+            let mut d = HashMap::new();
+            d.insert(
+                "value".into(),
+                Value::Number(if i == 50 { 1000.0 } else { (i as f64).sin() }),
+            );
+            d
+        });
+        let r = crush_json(&items, 10, &CompressOptions::default());
+        assert!(r.items.iter().any(|it| matches!(it, Value::Dict(d) if
+            d.get("value") == Some(&Value::Number(1000.0))
+        )));
+    }
+
+    // ── metadata 测试 ──
+
+    #[test]
+    fn metadata_reports_strategy_and_savings() {
+        let items = make_items(100, |i| {
+            let mut d = HashMap::new();
+            d.insert("id".into(), Value::Number(i as f64));
+            d.insert("score".into(), Value::Number((i as f64) / 100.0));
+            d
+        });
+        let r = crush_json(&items, 10, &CompressOptions::default());
+        assert!(r.savings_ratio > 0.8, "应节省 > 80%, got {}", r.savings_ratio);
+        let meta = r.metadata();
+        assert!(meta.contains_key("strategy"));
+        assert!(meta.contains_key("savings_ratio"));
+    }
+
+    // ── 字符串入口测试 ──
+
+    #[test]
+    fn crush_json_string_parses_and_compresses() {
+        let json = r#"[{"id":1,"score":0.5},{"id":2,"score":0.9},{"id":3,"score":0.1}]"#;
+        // 3 items (≤5 短列表直通) — 验证 string 入口能解析 + 短列表直通
+        let r = crush_json_string(json, 2, &CompressOptions::default()).unwrap();
+        assert_eq!(r.items.len(), 3);
+        assert_eq!(r.strategy_used, "passthrough");
+        // 100 items 才走真策略
+        let json_big = format!(
+            "[{}]",
+            (0..100)
+                .map(|i| format!(r#"{{"id":{},"score":{}}}"#, i, (i as f64) / 100.0))
+                .collect::<Vec<_>>()
+                .join(",")
         );
+        let r2 = crush_json_string(&json_big, 10, &CompressOptions::default()).unwrap();
+        assert_eq!(r2.strategy_used, "topn");
+        assert_eq!(r2.items.len(), 10);
+        assert!(r2.savings_ratio > 0.8);
+    }
+
+    #[test]
+    fn crush_json_string_rejects_non_array() {
+        let json = r#"{"not":"array"}"#;
+        let r = crush_json_string(json, 5, &CompressOptions::default());
+        assert!(r.is_err());
     }
 }

@@ -2,6 +2,97 @@
 
 All notable changes to Mora will be documented in this file.
 
+## [v0.32] - 2026-07-02
+
+### Lossless-First Recursive Walker + Event Bus + Mock Registry
+
+灵感: 通过 deep-dive 7 个 AI 基础设施项目 (AIOS / MimiClaw / OpenFugu /
+OpenInfer / MinerU / Headroom / Puter) 提取的高价值原语. 完整路线图见
+`AGENTS_PRIMITIVES.md` (581 行). 本版本聚焦 3 个**可独立发布**的 P0 原语,
+完整 plan/react/openai-serve 留 v0.33.
+
+#### 1. Lossless-First Recursive Walker (Headroom 灵感)
+
+`src/compress/json.rs::compact_value_recursive` + `crush_json_recursive`:
+- 整棵 Value 树的 pure iterative DFS (避免 Windows 1MB stack 溢出)
+- 每个 List 节点 (`len >= min_items`) 尝试 `try_lossless_compact`
+  (csv-schema 或 markdown-kv), 失败保留原值
+- 新增 `CompressOptions.recursive: bool` (default false, 向后兼容)
+- 顶层 List 走标准 SmartCrusher (inlined via `crush_json_inner` 避免栈嵌套)
+- 2 new tests: `recursive_walker_compacts_nested_lists`,
+  `compact_value_recursive_simple`
+
+灵感: [Headroom DocumentCompactor](https://github.com/chopratejas/headroom)
+(`crates/headroom-core/src/transforms/smart_crusher/compaction/walker.rs`)
+
+#### 2. Event Bus with Wildcard (Puter 灵感)
+
+新模块 `src/event/mod.rs`:
+- `EventBus`: `Arc<Mutex<HashMap<Pattern, Vec<Handler>>>>`
+- `on(pattern, handler)` 注册; `off(pattern)` 注销; `emit(event, payload)` 派发
+- `matches(event, pattern)`: Puter 风格
+  - trailing `*` = prefix catch-all (`outer.*` 匹配 `outer.gui.item.removed`)
+  - interior `*` = single segment wildcard (`outer.*.item`)
+  - bare `*` = 匹配一切
+- 8 unit tests covering exact/prefix/interior/catchall/dispatch
+
+灵感: [Puter EventClient](https://github.com/HeyPuter/puter)
+(`src/backend/clients/event/EventClient.ts`)
+
+#### 3. Mock Registry (OpenFugu + OpenInfer 灵感)
+
+新模块 `src/mock/mod.rs`:
+- `MockRegistry`: `Arc<Mutex<HashMap<String, MockHandler>>>`
+- `register(name, fn) / unregister(name) / call(name, args) / count / names`
+- `MockHandler`: `Arc<dyn Fn(&Value) -> Value + Send + Sync>`
+- 使用 Mora 自身 `Value` 类型, 无 `serde_json` 新依赖
+
+灵感:
+- [OpenFugu MockWorld](https://github.com/trotsky1997/OpenFugu) (train/train_trinity.py)
+  用于验证 sep-CMA-ES 训练算法
+- OpenInfer mock mode (无 Python 依赖的纯 Rust 测试)
+
+Mora 之前 `compress/text.rs` / `ai_chat.rs` 散落的 hardcode mock 响应,
+v0.32 起统一通过 `MockRegistry` 注册. 未来 builtin (ai.chat / http.fetch) 可
+consult `mock.call` 决定是否走 mock 路径, 实现 offline deterministic 测试.
+
+#### 4. AGENTS_PRIMITIVES.md (581 行)
+
+新增设计文档, 完整 v0.32+ 路线图 (16 个直接原语 + 5 个跨项目共性 + 7 个待增强).
+每个原语含: 灵感来源 + 实现机制 (含源码引用) + Mora 语法草案 + 实施步骤 +
+关联 Mora 模块.
+
+#### 测试
+
+- 286 lib tests (was 272, +14)
+- `cargo build --all-targets`: clean
+- `cargo clippy --all-targets -- -D warnings`: clean
+- `cargo fmt --check`: 0 diff
+
+#### 路线图 (v0.33+ 计划)
+
+P1 (v0.33 6-8 周):
+- `plan` (DAG) — OpenFugu Conductor
+- `react` (ReAct 循环) — MimiClaw agent_loop.c
+- `document.grouped_layout` — MinerU group-based
+- `document.reading_order` — MinerU 3 策略
+- `schedule` cron — MimiClaw cron_service
+- `skill` markdown — MimiClaw skill_loader
+- `sandbox` 权限 — AIOS + Puter
+- `ccr` Compress-Cache-Retrieve — Headroom
+
+P2+ (v0.34+ 远期):
+- `mora serve --openai` 模式 — OpenInfer vLLM frontend 复用
+- `prefix_cache` — OpenInfer Pegaflow
+- `tiered_memory` — OpenInfer + MimiClaw
+- `lifecycle` 关键字 — Puter hooks
+- DI 容器 (5 层) — Puter
+- `heartbeat` 周期 — MimiClaw
+- `policy` learned router — OpenFugu TRINITY
+- `ai.chat role` — OpenFugu 3 role
+- Error Gradation — OpenFugu evidence grade
+- `cross_page merge` — MinerU
+
 ## [v0.31] - 2026-07-02
 
 ### No-Panic Refactor + Code Quality Hardening

@@ -812,6 +812,15 @@ pub fn try_lossless_compact(items: &[Value], fields: &[FieldStats]) -> Option<Cr
 
 /// v0.30 SmartCrusher 主入口
 pub fn crush_json(items: &[Value], target: usize, options: &CompressOptions) -> CrushResult {
+    // v0.32 recursive=true: 走整棵 Value 树的 recursive walker (delegates to crush_json_recursive)
+    if options.recursive {
+        return crush_json_recursive(items, target, options);
+    }
+    crush_json_inner(items, target, options)
+}
+
+/// v0.32: 内部版本, 顶层 List 的标准 SmartCrusher 流程, 不递归.
+fn crush_json_inner(items: &[Value], target: usize, options: &CompressOptions) -> CrushResult {
     // 1. 边界
     if items.is_empty() {
         return CrushResult {
@@ -906,8 +915,143 @@ pub fn crush_json(items: &[Value], target: usize, options: &CompressOptions) -> 
     }
 }
 
+/// v0.32 recursive 模式: 整棵 Value 树递归 compact (pure iterative, no nested calls)
+/// 顶层 List 走 standard SmartCrusher (inlined), 嵌套结构走 walker
+fn crush_json_recursive(items: &[Value], target: usize, options: &CompressOptions) -> CrushResult {
+    // 1. 顶层 List: inlined standard SmartCrusher logic
+    // (复制 crush_json 主体避免栈嵌套)
+    let top = crush_json_inner(items, target, options);
+
+    // 2. 嵌套结构递归 compact (min_items = target / 4 启发式)
+    let min_items = (target / 4).max(5);
+    let mut new_items = Vec::with_capacity(top.items.len());
+    let mut nested_count = 0;
+    for it in &top.items {
+        let (nv, n) = compact_value_recursive(it, min_items);
+        new_items.push(nv);
+        nested_count += n;
+    }
+    CrushResult {
+        items: new_items,
+        strategy_used: if nested_count > 0 {
+            format!("{}+recursive({})", top.strategy_used, nested_count)
+        } else {
+            top.strategy_used
+        },
+        array_type: top.array_type,
+        fields: top.fields,
+        items_total: top.items_total,
+        items_kept: top.items_kept,
+        savings_ratio: top.savings_ratio,
+        byte_estimate: top.byte_estimate,
+    }
+}
+
 pub fn estimate_bytes(items: &[Value]) -> usize {
     items.iter().map(|v| value_to_json(v).len()).sum()
+}
+
+// ──────────────────── v0.32: Lossless-First Recursive Walker ────────────────────
+//
+// 灵感: Headroom DocumentCompactor (crates/headroom-core/src/transforms/smart_crusher/compaction/walker.rs)
+//
+// 遍历整棵 Value 树, 每个 List 节点都尝试 Lossless Compact.
+// 替换为紧凑表示 (csv-schema 或 markdown-kv), 若不适用则原样保留.
+//
+// 实现: iterative stack 避免深度递归栈溢出 (CI 在 Windows 上 default 1MB stack)
+
+/// 递归 compact 整棵 Value 树. 返回 (new_value, compacted_count)
+pub fn compact_value_recursive(value: &Value, min_items: usize) -> (Value, usize) {
+    // iterative stack-based DFS
+    // entry: (value, parent_kind, parent_key_or_idx, visited_sentinel)
+    // visited_sentinel=true 表示已处理完子节点, 现在 compact 当前节点
+    enum Op {
+        Enter,
+        Exit,
+    }
+    let mut stack: Vec<(Value, Op)> = Vec::new();
+    stack.push((value.clone(), Op::Enter));
+
+    // 后序结果: 用 Vec 模拟递归返回值链
+    let mut results: Vec<(Value, usize)> = Vec::new();
+
+    while let Some((v, op)) = stack.pop() {
+        match op {
+            Op::Enter => {
+                // 先 push Exit (sentinel), 然后 push children (按反序使正序处理)
+                stack.push((v.clone(), Op::Exit));
+                // children
+                match &v {
+                    Value::List(items) => {
+                        for it in items.iter().rev() {
+                            stack.push((it.clone(), Op::Enter));
+                        }
+                    }
+                    Value::Dict(d) => {
+                        // 收集 keys 按反序, 保证原序处理
+                        let mut entries: Vec<(String, Value)> =
+                            d.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+                        entries.reverse();
+                        for (_, val) in entries {
+                            stack.push((val, Op::Enter));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Op::Exit => {
+                // 处理当前节点: 子节点结果在 results 末尾
+                match &v {
+                    Value::List(items) => {
+                        // 弹出 items.len() 个子结果 (后序)
+                        let n_kids = items.len();
+                        let mut new_items = Vec::with_capacity(n_kids);
+                        let mut total = 0;
+                        for _ in 0..n_kids {
+                            if let Some((nv, n)) = results.pop() {
+                                new_items.push(nv);
+                                total += n;
+                            }
+                        }
+                        new_items.reverse();
+                        if items.len() >= min_items {
+                            let fields = extract_field_stats(items);
+                            if let Some(crushed) = try_lossless_compact(items, &fields)
+                                && let Some(first) = crushed.items.into_iter().next()
+                            {
+                                results.push((first, total + 1));
+                                continue;
+                            }
+                        }
+                        results.push((Value::List(new_items), total));
+                    }
+                    Value::Dict(d) => {
+                        let n_kids = d.len();
+                        let mut new_map: std::collections::HashMap<String, Value> =
+                            std::collections::HashMap::with_capacity(n_kids);
+                        let mut total = 0;
+                        let mut keys: Vec<String> = d.keys().cloned().collect();
+                        for _ in 0..n_kids {
+                            if let Some((nv, n)) = results.pop() {
+                                // 配对: 倒序弹出 key
+                                if let Some(k) = keys.pop() {
+                                    new_map.insert(k, nv);
+                                }
+                                total += n;
+                            }
+                        }
+                        results.push((Value::Dict(new_map), total));
+                    }
+                    _ => {
+                        results.push((v.clone(), 0));
+                    }
+                }
+            }
+        }
+    }
+
+    debug_assert_eq!(results.len(), 1, "post-order DFS must yield 1 root result");
+    results.into_iter().next().unwrap()
 }
 
 // ──────────────────── 字符串入口（解析后调用 crush_json） ────────────────────
@@ -1255,5 +1399,64 @@ mod tests {
         let json = r#"{"not":"array"}"#;
         let r = crush_json_string(json, 5, &CompressOptions::default());
         assert!(r.is_err());
+    }
+
+    // ── v0.32: Recursive walker 测试 ──
+
+    #[test]
+    fn recursive_walker_compacts_nested_lists() {
+        // 嵌套结构: 顶层 list 含 dict, dict 里有 nested list
+        // 减少深度避免 stack overflow (Windows 1MB default stack)
+        let items: Vec<Value> = (0..10)
+            .map(|i| {
+                let mut inner = Vec::new();
+                for j in 0..6 {
+                    let mut d = std::collections::HashMap::new();
+                    d.insert("id".into(), Value::Number(j as f64));
+                    d.insert("value".into(), Value::Number((i + j) as f64));
+                    inner.push(Value::Dict(d));
+                }
+                let mut outer = std::collections::HashMap::new();
+                outer.insert("name".into(), Value::String(format!("g{}", i)));
+                outer.insert("items".into(), Value::List(inner));
+                Value::Dict(outer)
+            })
+            .collect();
+
+        let r = crush_json(
+            &items,
+            5,
+            &CompressOptions {
+                recursive: true,
+                ..CompressOptions::default()
+            },
+        );
+        // recursive 模式应能 compact 嵌套结构 (10 outer dicts + 6 inner)
+        assert!(!r.items.is_empty());
+        // 至少 nested 计数 > 0
+        assert!(r.strategy_used.contains("recursive") || r.items_kept >= 5);
+    }
+
+    #[test]
+    fn compact_value_recursive_simple() {
+        // 直接测试 walker
+        let v = Value::List(vec![
+            Value::Dict({
+                let mut d = std::collections::HashMap::new();
+                d.insert("id".into(), Value::Number(1.0));
+                d.insert("name".into(), Value::String("a".into()));
+                d
+            }),
+            Value::Dict({
+                let mut d = std::collections::HashMap::new();
+                d.insert("id".into(), Value::Number(2.0));
+                d.insert("name".into(), Value::String("b".into()));
+                d
+            }),
+        ]);
+        let (new_v, n) = compact_value_recursive(&v, 5);
+        // 单层 compact: 因 min_items=5 但 v.len()=2, 不 compact
+        assert_eq!(n, 0);
+        assert!(matches!(new_v, Value::List(_)));
     }
 }

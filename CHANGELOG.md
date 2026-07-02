@@ -2,6 +2,96 @@
 
 All notable changes to Mora will be documented in this file.
 
+## [v0.33] - 2026-07-02
+
+### Schedule + Sandbox + Reading Order + CCR (4 P1 primitives)
+
+灵感: 7-project deep-dive 的路线图 (AGENTS_PRIMITIVES.md) 的 v0.33 P1 阶段.
+本版本聚焦 4 个**可独立发布**的 P1 原语, 全部 trait-based + 后台 in-memory 状态,
+无新外部依赖.
+
+#### 1. Schedule (cron) — MimiClaw 灵感
+
+`src/schedule/mod.rs`:
+- `Scheduler`: `Arc<Mutex<HashMap<String, Job>>>`
+- `Job { id, name, kind, interval_s, at_epoch, message, last_run_epoch, delete_after_run }`
+- `JobKind`: Every | At
+- `add(name, kind, message, interval_s, at_epoch) -> Result<id, Err>`
+- `list() -> Vec<Job>`, `remove(id) -> bool`
+- `tick(now) -> Vec<triggered_messages>` (consume for event loop)
+- `set_persist_path(path)` + best-effort JSON dump
+
+灵感: MimiClaw cron_service.c (9 字段 cron_job_t).
+**简化**: 无 channel/chat_id, std::fs JSON 持久化 (vs SPIFFS).
+
+#### 2. Sandbox Policy — AIOS + Puter + MimiClaw 灵感
+
+`src/sandbox/mod.rs`:
+- `SandboxPolicy { allow, deny, fs_root, timeout_s, memory_limit_mb }`
+- `check_builtin(name) -> Result<(), Err>` (用 `event::matches` wildcard,
+  deny 优先于 allow)
+- `check_path(path) -> Result<PathBuf, Err>` (MimiClaw 风格 `..` 拒绝,
+  解析后必须在 fs_root 之内)
+- `strict()` / `permissive()` / Default constructors
+
+灵感:
+- MimiClaw path traversal defense
+- AIOS Access Manager (agent_id -> privilege_group)
+- Puter iframe sandbox + capability URL params
+
+#### 3. document.reading_order — MinerU 灵感
+
+`src/document/reading_order/mod.rs`:
+- `BBox { x, y, w, h }` + center/edge accessors
+- `from_value(v)`: accept both flat bbox dict AND block dict with 'bbox' sub-dict
+- `Strategy`: InputOrder | TopToBottom | GapTree | XyCut | GroupBased
+- `assign_reading_order(blocks, strategy)`: 排序后给每 block 加 'reading_order_idx'
+
+灵感: MinerU §2.8 Reading Order Recovery (3 算法).
+**简化**: 无 recursive XY-cut, 无 cross-page merge, 无语义组配对.
+
+#### 4. CCR (Compress-Cache-Retrieve) — Headroom 灵感
+
+`src/ccr/mod.rs`:
+- `CcrStore` trait: `put(data) -> hash; get(hash) -> Option<entry>; len()`
+- `CcrEntry { hash, size, data }`
+- `InMemoryCcrStore` default impl (Arc<Mutex<HashMap>> + u64 counter)
+- `make_marker(hash, size) -> "<<ccr:hash,size>>"`
+- `extract_hash(marker) -> Option<&str>`
+
+灵感: Headroom CcrStore (lossy 后仍可恢复原值).
+**简化**: 8-char hex hash (vs SHA-256), 简化 marker 格式 (无 KIND).
+**未来**: v0.34 集成到 `crush_json` lossy 路径.
+
+#### 测试
+
+- 320 lib tests (was 286, +34)
+- `cargo build --all-targets`: clean
+- `cargo clippy --all-targets -- -D warnings`: clean
+- `cargo fmt --check`: 0 diff
+
+#### 路线图 (v0.34+ 计划)
+
+P1 (v0.34 6-8 周):
+- `react` (ReAct 循环) — MimiClaw agent_loop.c
+- `document.grouped_layout` — MinerU 配对
+- `skill` markdown — MimiClaw skill_loader
+- CCR ↔ crush_json 集成 (lossy 路径自动用 marker)
+- `heartbeat` 周期 — MimiClaw
+- Sandbox ↔ builtin 集成 (file.read 自动 check_path)
+
+P2+ (v0.35+ 远期):
+- `plan` (DAG) — OpenFugu Conductor
+- `mora serve --openai` 模式 — OpenInfer
+- `prefix_cache` — OpenInfer Pegaflow
+- `tiered_memory` — OpenInfer + MimiClaw
+- `lifecycle` 关键字 — Puter
+- DI 容器 (5 层) — Puter
+- `policy` learned router — OpenFugu
+- `ai.chat role` — OpenFugu 3 role
+- Error Gradation — OpenFugu
+- `cross_page merge` — MinerU
+
 ## [v0.32] - 2026-07-02
 
 ### Lossless-First Recursive Walker + Event Bus + Mock Registry

@@ -53,22 +53,27 @@ use crate::value::Value;
 ///    例如 `/usr/share/mora/ocr` 或 `%LOCALAPPDATA%\mora\ocr`).
 /// 2. `$XDG_DATA_HOME/mora/ocr/` (Linux/macOS XDG 规范).
 /// 3. `$HOME/.local/share/mora/ocr/` (XDG_DATA_HOME 未设时的 POSIX fallback).
+/// 4. `%LOCALAPPDATA%\mora\ocr\` (Windows fallback, v0.31 新增).
 ///
-/// 如果 1/2/3 都无法解析, 返回 `Err(String)` 让调用方 fail-loud.
+/// 如果全部无法解析, 返回 `Err(String)` 让调用方 fail-loud.
 pub fn user_model_path(name: &str) -> Result<PathBuf, String> {
     let dir: PathBuf = if let Ok(p) = std::env::var("MORA_OCR_MODELS_DIR") {
         // override: user points DIRECTLY at the ocr dir
         PathBuf::from(p)
     } else {
-        // default: XDG-ish — append `mora/ocr` to the data root
+        // default: XDG-ish (POSIX) or LOCALAPPDATA (Windows) — append `mora/ocr` to data root
         let base: PathBuf = std::env::var("XDG_DATA_HOME")
             .map(PathBuf::from)
             .or_else(|_| {
                 std::env::var("HOME").map(|h| PathBuf::from(h).join(".local").join("share"))
             })
+            .or_else(|_| {
+                // v0.31: Windows fallback — %LOCALAPPDATA%\mora\ocr
+                std::env::var("LOCALAPPDATA").map(PathBuf::from)
+            })
             .map_err(|_| {
                 "ocr.load: cannot resolve OCR model directory. Set MORA_OCR_MODELS_DIR \
-                 or HOME (or XDG_DATA_HOME) to a writable path."
+                 or HOME / XDG_DATA_HOME (POSIX) or LOCALAPPDATA (Windows) to a writable path."
                     .to_string()
             })?;
         base.join("mora").join("ocr")

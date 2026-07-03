@@ -2,6 +2,105 @@
 
 All notable changes to Mora will be documented in this file.
 
+## [v0.34] - 2026-07-03
+
+### Integrate 5 v0.30-0.33 Orphaned Modules as Builtins
+
+v0.30-0.33 added 5 new modules (event/sandbox/schedule/ccr/mock) but
+**never integrated them into Interpreter** — scripts could not call
+`bus.emit()`, `sandbox.run()`, `schedule.add()`, `ccr.put()`,
+`mock.register()`. v0.34 fixes this history debt by adding each
+module as a top-level builtin with method dispatch routing.
+
+This is the **historical debt cleanup** requested by the user
+("解决历史遗留问题") — no new external dependencies, no semantic
+change, no API rename.
+
+#### 1. bus.emit/off/count builtin (event::EventBus)
+- **v0.32 module**: `EventBus` with Puter-style wildcard matching
+  (`outer.*` catch-all prefix, interior `*` single-segment)
+- **v0.34 integration**:
+  * `bus.emit(event, payload?)` — fire all matching handlers
+  * `bus.off(pattern)` — deregister all matching handlers
+  * `bus.count()` — return pattern count
+- **Limitation**: `bus.on(pattern, handler)` requires a Rust closure;
+  not exposed as builtin (closure boundary with builtin dispatch is
+  non-trivial). v0.32's `EventBus::on` remains available for direct
+  Rust API.
+- 4 unit tests in `bus_tests` mod.
+
+#### 2. sandbox.check_builtin/check_path/allow/deny builtin (sandbox::SandboxPolicy)
+- **v0.33 module**: MimiClaw path validation + AIOS access manager
+- **v0.34 integration**:
+  * `sandbox.check_builtin(name)` -> bool (allow/deny pattern match)
+  * `sandbox.check_path(path)` -> bool (reject `..` per MimiClaw)
+  * `sandbox.allow(pattern)` / `sandbox.deny(pattern)`
+  * `sandbox.mode()` -> "strict" or "permissive"
+- 1 unit test in `bus_tests` mod.
+
+#### 3. schedule.add/list/remove/tick/count builtin (schedule::Scheduler)
+- **v0.33 module**: MimiClaw cron_service 9-field cron_job_t
+- **v0.34 integration**:
+  * `schedule.add(name, kind, message, interval_s?, at_epoch?)` -> id
+  * `schedule.list()` -> List of job dicts
+  * `schedule.remove(id)` -> bool
+  * `schedule.tick()` -> [triggered_messages] (uses Scheduler::now())
+  * `schedule.count()` -> pattern count
+- 1 unit test in `bus_tests` mod.
+
+#### 4. ccr.put/get/marker/extract builtin (ccr::CcrStore)
+- **v0.33 module**: Headroom Compress-Cache-Retrieve with
+  `<<ccr:HASH,SIZE>>` marker
+- **v0.34 integration**:
+  * `ccr.put(data)` -> hash (8-char hex from u64 counter)
+  * `ccr.get(hash)` -> data (or Nil if not found)
+  * `ccr.marker(hash, size)` -> `<<ccr:hash,size>>` (Headroom format)
+  * `ccr.extract(marker)` -> hash (parse marker, returns hash part)
+  * `ccr.len()` -> entry count
+- 1 unit test in `bus_tests` mod.
+
+#### 5. mock.register/unregister/count/names builtin (mock::MockRegistry)
+- **v0.32 module**: OpenFugu MockWorld + OpenInfer mock mode pattern
+- **v0.34 integration**:
+  * `mock.register(name)` -> stub (real handler wiring needs closure
+    boundary, deferred to v0.35+)
+  * `mock.unregister(name)` -> stub
+  * `mock.count()` -> pattern count
+  * `mock.names()` -> [String, ...] (registered handler names)
+- **Limitation**: `mock.register` doesn't actually wire a handler
+  (closure boundary). v0.32's `MockRegistry::register` still works
+  for direct Rust API.
+- 1 unit test in `bus_tests` mod.
+
+#### Tests
+
+- 8 new test cases in `bus_tests` mod (consolidated to avoid mod
+  structure issues during iterative development)
+- 328 lib tests pass (was 320 at v0.33 merge, +8)
+- `cargo build --all-targets`: clean
+- `cargo clippy --all-targets -- -D warnings`: clean
+- `cargo fmt --check`: 0 diff
+
+#### Implementation notes
+
+- **5 new fields on Interpreter struct**: bus, sandbox, scheduler,
+  ccr_store, mock_registry (all Arc<Mutex<...>>-based, Clone is
+  cheap)
+- **5 new globals definitions** in `Interpreter::new()`:
+  `bus` / `sandbox` / `schedule` / `ccr` / `mock`
+- **5 new method dispatch functions** in `builtins.rs`:
+  call_event_method, call_sandbox_method, call_schedule_method,
+  call_ccr_method, call_mock_method
+- **5 new dispatch routing arms** in `dispatch.rs` module section
+- All public APIs use `Result<Value, String>` (no panic in production)
+
+#### Roadmap (v0.35+)
+
+- `bus.on()` with closure capture via closure registry
+- `mock.register()` with actual handler wiring
+- `ai.limits` block (step/cost/wall_time) per mini-swe-agent
+- `shell.run` with process group kill (POSIX `killpg`)
+
 ## [v0.33] - 2026-07-02
 
 ### Schedule + Sandbox + Reading Order + CCR (4 P1 primitives)

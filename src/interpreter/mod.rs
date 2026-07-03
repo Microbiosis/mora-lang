@@ -150,9 +150,9 @@ pub struct Interpreter {
     pub impl_table: Arc<HashMap<String, Vec<String>>>,
     // v0.14: 录制/重放器 (默认 Off, 由 CLI 子命令激活)
     pub recorder: crate::record::Recorder,
-    // v0.19: Worker 并发 channels
-    worker_channels: HashMap<String, std::sync::mpsc::Sender<Value>>,
-    worker_receivers: HashMap<String, std::sync::mpsc::Receiver<Value>>,
+    // v0.19: Worker 并发 channels (v0.36: crossbeam-channel for Send/Sync)
+    worker_channels: HashMap<String, crossbeam_channel::Sender<Value>>,
+    worker_receivers: HashMap<String, crossbeam_channel::Receiver<Value>>,
     // v0.22: AI 调用内联缓存 (prompt_hash -> response)
     ai_cache: HashMap<String, String>,
     // v0.22: 字符串驻留池 (减少重复字符串内存)

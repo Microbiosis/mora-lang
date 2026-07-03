@@ -351,10 +351,11 @@ impl Interpreter {
             Value::Builtin("range".to_string()),
             false,
         );
-        globals
-            .lock()
-            .expect("globals mutex poisoned")
-            .define("len".to_string(), Value::Builtin("len".to_string()), false);
+        globals.lock().expect("globals mutex poisoned").define(
+            "len".to_string(),
+            Value::Builtin("len".to_string()),
+            false,
+        );
         // v0.25: 注册 builtin 模块对象 (v0.27: 加入 document)
         for name in &["ai", "web", "json", "file", "memory", "agent", "document"] {
             globals.lock().expect("globals mutex poisoned").define(

@@ -11,6 +11,8 @@ use crate::value::Value;
 
 impl Interpreter {
     /// v0.04: file.* 内建模块 — 完整文件系统能力
+    /// v0.36 (P2-3.15): every file op routes through sandbox.check_path
+    /// so strict policies can block file access.
     pub fn call_file_method(&self, method: &str, args: &[Value]) -> Result<Value, String> {
         let expect_str = |idx: usize, name: &str| -> Result<String, String> {
             match args.get(idx) {
@@ -19,15 +21,24 @@ impl Interpreter {
                 None => Err(format!("file.{}: missing argument {}", method, name)),
             }
         };
+        // v0.36: enforce sandbox on every path-bearing file op.
+        let check_path = |path: &str| -> Result<(), String> {
+            self.sandbox
+                .check_path(path)
+                .map_err(|e| format!("file.{}: sandbox denied '{}': {}", method, path, e))?;
+            Ok(())
+        };
         match method {
             "read_text" => {
                 let path = expect_str(0, "path")?;
+                check_path(&path)?;
                 let content = std::fs::read_to_string(&path)
                     .map_err(|e| format!("file.read_text: cannot read '{}': {}", path, e))?;
                 Ok(Value::String(content))
             }
             "write_text" => {
                 let path = expect_str(0, "path")?;
+                check_path(&path)?;
                 let content = expect_str(1, "content")?;
                 if let Some(parent) = std::path::Path::new(&path).parent()
                     && !parent.as_os_str().is_empty()
@@ -44,6 +55,7 @@ impl Interpreter {
             }
             "append_text" => {
                 let path = expect_str(0, "path")?;
+                check_path(&path)?;
                 let content = expect_str(1, "content")?;
                 use std::io::Write;
                 let mut f = std::fs::OpenOptions::new()
@@ -57,12 +69,14 @@ impl Interpreter {
             }
             "read_bytes" => {
                 let path = expect_str(0, "path")?;
+                check_path(&path)?;
                 let bytes = std::fs::read(&path)
                     .map_err(|e| format!("file.read_bytes: cannot read '{}': {}", path, e))?;
                 Ok(Value::String(hex_encode(&bytes)))
             }
             "write_bytes" => {
                 let path = expect_str(0, "path")?;
+                check_path(&path)?;
                 let hex = expect_str(1, "hex")?;
                 let bytes = hex_decode(&hex).map_err(|e| format!("file.write_bytes: {}", e))?;
                 std::fs::write(&path, &bytes)
@@ -71,24 +85,29 @@ impl Interpreter {
             }
             "exists" => {
                 let path = expect_str(0, "path")?;
+                check_path(&path)?;
                 Ok(Value::Bool(std::path::Path::new(&path).exists()))
             }
             "is_file" => {
                 let path = expect_str(0, "path")?;
+                check_path(&path)?;
                 Ok(Value::Bool(std::path::Path::new(&path).is_file()))
             }
             "is_dir" => {
                 let path = expect_str(0, "path")?;
+                check_path(&path)?;
                 Ok(Value::Bool(std::path::Path::new(&path).is_dir()))
             }
             "size" => {
                 let path = expect_str(0, "path")?;
+                check_path(&path)?;
                 let meta = std::fs::metadata(&path)
                     .map_err(|e| format!("file.size: cannot stat '{}': {}", path, e))?;
                 Ok(Value::Number(meta.len() as f64))
             }
             "list" => {
                 let path = expect_str(0, "path")?;
+                check_path(&path)?;
                 let entries = std::fs::read_dir(&path)
                     .map_err(|e| format!("file.list: cannot read dir '{}': {}", path, e))?;
                 let mut names: Vec<String> = Vec::new();
@@ -101,18 +120,21 @@ impl Interpreter {
             }
             "mkdir" => {
                 let path = expect_str(0, "path")?;
+                check_path(&path)?;
                 std::fs::create_dir(&path)
                     .map_err(|e| format!("file.mkdir: cannot create '{}': {}", path, e))?;
                 Ok(Value::Nil)
             }
             "mkdir_all" => {
                 let path = expect_str(0, "path")?;
+                check_path(&path)?;
                 std::fs::create_dir_all(&path)
                     .map_err(|e| format!("file.mkdir_all: cannot create '{}': {}", path, e))?;
                 Ok(Value::Nil)
             }
             "remove" => {
                 let path = expect_str(0, "path")?;
+                check_path(&path)?;
                 let p = std::path::Path::new(&path);
                 if p.is_dir() {
                     std::fs::remove_dir(&path)
@@ -126,6 +148,7 @@ impl Interpreter {
             }
             "remove_all" => {
                 let path = expect_str(0, "path")?;
+                check_path(&path)?;
                 std::fs::remove_dir_all(&path)
                     .map_err(|e| format!("file.remove_all: cannot remove '{}': {}", path, e))?;
                 Ok(Value::Nil)

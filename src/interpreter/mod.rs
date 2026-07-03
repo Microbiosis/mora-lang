@@ -201,6 +201,8 @@ pub struct Interpreter {
     scheduler: crate::schedule::Scheduler,
     /// v0.34: CCR (Compress-Cache-Retrieve, Headroom style)
     ccr_store: crate::ccr::InMemoryCcrStore,
+    /// v0.34: mock registry (OpenFugu + OpenInfer mock)
+    mock_registry: crate::mock::MockRegistry,
 }
 
 /// v0.24: AI 调用优先级队列条目类型
@@ -262,6 +264,7 @@ impl Clone for Interpreter {
             sandbox: crate::sandbox::SandboxPolicy::permissive(),
             scheduler: crate::schedule::Scheduler::new(),
             ccr_store: crate::ccr::InMemoryCcrStore::new(),
+            mock_registry: crate::mock::MockRegistry::new(),
         }
     }
 }
@@ -432,6 +435,12 @@ impl Interpreter {
             .lock()
             .unwrap()
             .define("ccr".to_string(), Value::Builtin("ccr".to_string()), false);
+        // v0.34: 注册 mock 顶层 builtin
+        globals.lock().unwrap().define(
+            "mock".to_string(),
+            Value::Builtin("mock".to_string()),
+            false,
+        );
         Self {
             globals: globals.clone(),
             environment: globals,
@@ -466,6 +475,7 @@ impl Interpreter {
             sandbox: crate::sandbox::SandboxPolicy::permissive(),
             scheduler: crate::schedule::Scheduler::new(),
             ccr_store: crate::ccr::InMemoryCcrStore::new(),
+            mock_registry: crate::mock::MockRegistry::new(),
         }
     }
 
@@ -507,6 +517,7 @@ impl Interpreter {
             sandbox: crate::sandbox::SandboxPolicy::permissive(),
             scheduler: crate::schedule::Scheduler::new(),
             ccr_store: crate::ccr::InMemoryCcrStore::new(),
+            mock_registry: crate::mock::MockRegistry::new(),
         }
     }
 
@@ -546,6 +557,7 @@ impl Interpreter {
             sandbox: crate::sandbox::SandboxPolicy::permissive(),
             scheduler: crate::schedule::Scheduler::new(),
             ccr_store: crate::ccr::InMemoryCcrStore::new(),
+            mock_registry: crate::mock::MockRegistry::new(),
         }
     }
 
@@ -3185,12 +3197,24 @@ mod bus_tests {
     #[test]
     fn test_ccr_builtin_basic() {
         let src = r#"
-            let m = sandbox.mode()
-            let ok = sandbox.check_builtin("ai.chat")
-            let bad = sandbox.check_path("../escape.txt")
-            print(m, ok, bad)
+            let hash = ccr.put("hello world")
+            let data = ccr.get(hash)
+            print(hash, data)
         "#;
-        run(src).expect("sandbox builtin should work");
+        run(src).expect("ccr.put + ccr.get roundtrip");
+    }
+
+    /// T27: mock builtin (integrate src/mock/, OpenFugu + OpenInfer mock)
+    /// Note: mock.register requires a closure handler (Rust API only);
+    /// the builtin is a stub. We test only count + names.
+    #[test]
+    fn test_mock_builtin_basic() {
+        let src = r#"
+            let n = mock.count()
+            let ns = mock.names()
+            print(n, ns)
+        "#;
+        run(src).expect("mock.count + mock.names should work");
     }
 
     #[test]

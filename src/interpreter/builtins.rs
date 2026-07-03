@@ -420,6 +420,32 @@ impl Interpreter {
         }
     }
 
+    /// v0.34: mock.* — mock registry (OpenFugu + OpenInfer mock)
+    pub fn call_mock_method(&self, method: &str, args: &[Value]) -> Result<Value, String> {
+        match method {
+            "register" => {
+                let name = args
+                    .first()
+                    .map(|v| v.to_string())
+                    .ok_or("mock.register: requires name")?;
+                Ok(Value::String(format!("mock.{} registered", name)))
+            }
+            "unregister" => {
+                let name = args
+                    .first()
+                    .map(|v| v.to_string())
+                    .ok_or("mock.unregister: requires name")?;
+                Ok(Value::String(format!("mock.{} unregistered", name)))
+            }
+            "count" => Ok(Value::Number(self.mock_registry.count() as f64)),
+            "names" => {
+                let names = self.mock_registry.names();
+                Ok(Value::List(names.into_iter().map(Value::String).collect()))
+            }
+            _ => Err(format!("mock.{}: unknown method", method)),
+        }
+    }
+
     /// v0.25: memory.* — 会话记忆系统
     pub fn call_memory_method(&mut self, method: &str, args: &[Value]) -> Result<Value, String> {
         match method {

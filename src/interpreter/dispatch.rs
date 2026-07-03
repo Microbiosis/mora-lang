@@ -759,6 +759,7 @@ impl Interpreter {
                 ("sandbox", method) => self.call_sandbox_method(method, &args),
                 ("schedule", method) => self.call_schedule_method(method, &args),
                 ("ccr", method) => self.call_ccr_method(method, &args),
+                ("mock", method) => self.call_mock_method(method, &args),
                 ("agent", "create") => {
                     // agent.create("name", {tools: [...], model: "deep", max_steps: 10, system: "..."})
                     let name = match args.first() {

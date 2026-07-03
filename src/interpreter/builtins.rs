@@ -258,6 +258,38 @@ impl Interpreter {
         }
     }
 
+    /// v0.34: sandbox.* — path validation + builtin allow/deny (MimiClaw + AIOS)
+    pub fn call_sandbox_method(&self, method: &str, args: &[Value]) -> Result<Value, String> {
+        match method {
+            "mode" => {
+                let policy = &self.sandbox;
+                let mode = if policy.allow.iter().any(|p| p == "*") && policy.deny.is_empty() {
+                    "permissive"
+                } else if policy.allow.is_empty() {
+                    "strict"
+                } else {
+                    "custom"
+                };
+                Ok(Value::String(mode.to_string()))
+            }
+            "check_builtin" => {
+                let name = args
+                    .first()
+                    .map(|v| v.to_string())
+                    .ok_or("sandbox.check_builtin: requires builtin name as first arg")?;
+                Ok(Value::Bool(self.sandbox.check_builtin(&name).is_ok()))
+            }
+            "check_path" => {
+                let path = args
+                    .first()
+                    .map(|v| v.to_string())
+                    .ok_or("sandbox.check_path: requires path as first arg")?;
+                Ok(Value::Bool(self.sandbox.check_path(&path).is_ok()))
+            }
+            _ => Err(format!("sandbox.{}: unknown method", method)),
+        }
+    }
+
     /// v0.25: memory.* — 会话记忆系统
     pub fn call_memory_method(&mut self, method: &str, args: &[Value]) -> Result<Value, String> {
         match method {

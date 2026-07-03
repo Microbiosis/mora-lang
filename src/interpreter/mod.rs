@@ -195,6 +195,8 @@ pub struct Interpreter {
     memory_store: HashMap<String, Value>,
     /// v0.34: 事件总线 (来自 src/event/, Puter EventClient 风格)
     bus: crate::event::EventBus,
+    /// v0.34: 沙箱策略 (来自 src/sandbox/, MimiClaw path validation)
+    sandbox: crate::sandbox::SandboxPolicy,
 }
 
 /// v0.24: AI 调用优先级队列条目类型
@@ -253,6 +255,7 @@ impl Clone for Interpreter {
             v2_arena: None,
             memory_store: HashMap::new(),
             bus: crate::event::EventBus::new(),
+            sandbox: crate::sandbox::SandboxPolicy::permissive(),
         }
     }
 }
@@ -406,6 +409,12 @@ impl Interpreter {
             .lock()
             .unwrap()
             .define("bus".to_string(), Value::Builtin("bus".to_string()), false);
+        // v0.34: 注册 sandbox 顶层 builtin
+        globals.lock().unwrap().define(
+            "sandbox".to_string(),
+            Value::Builtin("sandbox".to_string()),
+            false,
+        );
         Self {
             globals: globals.clone(),
             environment: globals,
@@ -437,6 +446,7 @@ impl Interpreter {
             v2_arena: None,
             memory_store: HashMap::new(),
             bus: crate::event::EventBus::new(),
+            sandbox: crate::sandbox::SandboxPolicy::permissive(),
         }
     }
 
@@ -475,6 +485,7 @@ impl Interpreter {
             v2_arena: None,
             memory_store: HashMap::new(),
             bus: crate::event::EventBus::new(),
+            sandbox: crate::sandbox::SandboxPolicy::permissive(),
         }
     }
 
@@ -511,6 +522,7 @@ impl Interpreter {
             v2_arena: None,
             memory_store: HashMap::new(),
             bus: crate::event::EventBus::new(),
+            sandbox: crate::sandbox::SandboxPolicy::permissive(),
         }
     }
 
@@ -3121,6 +3133,18 @@ mod bus_tests {
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(err.contains("bus.") && err.contains("unknown"));
+    }
+
+    /// T24: sandbox builtin (integrate src/sandbox/)
+    #[test]
+    fn test_sandbox_builtin_basic() {
+        let src = r#"
+            let m = sandbox.mode()
+            let ok = sandbox.check_builtin("ai.chat")
+            let bad = sandbox.check_path("../escape.txt")
+            print(m, ok, bad)
+        "#;
+        run(src).expect("sandbox builtin should work");
     }
 
     #[test]

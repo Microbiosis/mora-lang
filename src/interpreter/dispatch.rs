@@ -755,6 +755,8 @@ impl Interpreter {
                 ("memory", method) => self.call_memory_method(method, &args),
                 // v0.34: event bus.* (Puter EventClient 风格 wildcard)
                 ("bus", method) => self.call_event_method(method, &args),
+                // v0.34: sandbox.* (MimiClaw path validation + AIOS access manager)
+                ("sandbox", method) => self.call_sandbox_method(method, &args),
                 ("agent", "create") => {
                     // agent.create("name", {tools: [...], model: "deep", max_steps: 10, system: "..."})
                     let name = match args.first() {

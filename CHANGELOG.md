@@ -144,70 +144,79 @@ change, no API rename.
 - `cargo clippy --all-targets --all-features -- -D warnings`: clean
 - `cargo fmt --check`: 0 diff
 
-### Concurrency & Pressure: actor/pressure infrastructure (5 actor pilots)
+### 并发与压力：actor/pressure 基础设施（5 个领域 actor 试点）
 
-Step 2 of the v0.34 concurrency roadmap. 引入 tokio + reqwest 作为依赖，
-并为 5 个领域模块（event/schedule/ccr/mock/trace）建立 actor 形态作为
-后续 Interpreter 字段切换的基座。本节不替换 Interpreter 现有 `Arc<Mutex<...>>`
-字段，只提供并行实现供将来切换。
+v0.34 并发路线图的第 2 步。本节引入 tokio + reqwest 作为依赖，
+并为 5 个领域模块（event / schedule / ccr / mock / trace）建立 actor 形态，
+作为后续 Interpreter 字段切换的基座。**本节不替换** Interpreter 现有的
+`Arc<Mutex<...>>` 字段，只提供并行实现供将来切换。
 
-> **重要**: 本次 commit **没有**把 `Interpreter` 字段从
-> `Arc<Mutex<...>>` 切到 `ActorHandle<...>`。原因：所有 5 个
-> `call_*_method`（`call_event_method`/`call_schedule_method`/
-> `call_ccr_method`/`call_mock_method`/`call_ai_tokens_method`）被
-> `dispatch.rs` 同步调用，要把它们改成 `actor.ask(...).await`
-> 必须把整个解释器主路径（`execute` → `call_function` → `call_method`
-> → builtin dispatch）改成 async。这是一次大型改动，留到 v0.35 单独
-> 推进。本节只完成 actor 框架和 5 个领域 actor 的试点实现，并保留
+> **重要**：本次 commit **没有**把 `Interpreter` 字段从
+> `Arc<Mutex<...>>` 切到 `ActorHandle<...>`。原因：5 个 `call_*_method`
+> （`call_event_method` / `call_schedule_method` / `call_ccr_method` /
+> `call_mock_method` / `call_ai_tokens_method`）被 `dispatch.rs` **同步**调用，
+> 改成 `actor.ask(...).await` 就必须把整个解释器主路径
+> （`execute` → `call_function` → `call_method` → builtin dispatch）
+> 全部改成 async。这是一次大型改动，留到 v0.35 单独推进。
+> 本节只完成 actor 框架和 5 个领域 actor 的试点实现，并保留
 > 同步 API 向后兼容。
 
-- `Cargo.toml`:
-  - 新增 `tokio = "1"` (rt-multi-thread, macros, sync, time, net, io-util, signal)。
-  - 新增 `reqwest = "0.12"` (json, stream)；`ureq` 保留直到所有 AI/Web 客户端迁移完成。
-- `src/actor.rs`: 轻量 actor 框架
-  - `ActorHandle<M>`: `tell` (fire-and-forget) + `ask` (request/response)。
-  - `spawn_actor`: 在 tokio task 中跑消息循环，使用 `Box::pin` 让 future
-    可借用 `&mut S`。
-- `src/pressure.rs`: 压力控制基础设施
-  - `CircuitBreaker`: Closed/Open/HalfOpen 三态，failure/success 阈值。
-  - `QuotaManager`: 每个 endpoint 独立维护 concurrent + per-minute 配额。
-  - `PressureControl::call`: 在外部调用前后统一包络熔断/配额/结果回调。
-- `src/main.rs` / `src/bin/lsp.rs`: 入口升级为 `#[tokio::main] async fn main`。
-- `src/event/mod.rs`: `EventBusMsg` + `EventBusState` + `spawn_event_bus_actor`。
-- `src/schedule/mod.rs`: `SchedulerMsg` + `SchedulerState` + `spawn_scheduler_actor`。
-- `src/ccr/mod.rs`: `CcrStoreMsg` + `InMemoryCcrStoreState` + `spawn_ccr_store_actor`。
-- `src/mock/mod.rs`: `MockRegistryMsg` + `MockRegistryState` + `spawn_mock_registry_actor`。
-- `src/trace_collector.rs`: `TraceCollectorMsg` + `TraceCollectorState` + `spawn_trace_collector_actor`。
+#### 改动清单
 
-#### Tests
+- `Cargo.toml`
+  - 新增 `tokio = "1"`：features = `rt-multi-thread, macros, sync, time, net, io-util, signal`。
+  - 新增 `reqwest = "0.12"`：features = `json, stream`；`ureq` 暂时保留，
+    等所有 AI/Web 客户端迁完再删。
+- `src/actor.rs`：轻量 actor 框架
+  - `ActorHandle<M>`：对外句柄，提供 `tell`（fire-and-forget）和
+    `ask`（request/response，基于 `tokio::sync::oneshot`）。
+  - `spawn_actor`：在 tokio task 中跑消息循环。handler 返回
+    `Box::pin(async move { ... })`，允许 future 借用 `&mut S`。
+- `src/pressure.rs`：压力控制基础设施
+  - `CircuitBreaker`：三态（Closed / Open / HalfOpen），失败/成功阈值、
+    Open 持续时间、半开探测。
+  - `QuotaManager`：每个 endpoint 独立维护 concurrent + per-minute 配额。
+  - `PressureControl::call`：统一包络外部调用（先查熔断/配额，再执行，
+    完成后更新状态）。
+- `src/main.rs` / `src/bin/lsp.rs`：入口升级为 `#[tokio::main] async fn main`。
+- `src/event/mod.rs`：`EventBusMsg` + `EventBusState` + `spawn_event_bus_actor`。
+- `src/schedule/mod.rs`：`SchedulerMsg` + `SchedulerState` + `spawn_scheduler_actor`。
+- `src/ccr/mod.rs`：`CcrStoreMsg` + `InMemoryCcrStoreState` + `spawn_ccr_store_actor`。
+- `src/mock/mod.rs`：`MockRegistryMsg` + `MockRegistryState` + `spawn_mock_registry_actor`。
+- `src/trace_collector.rs`：`TraceCollectorMsg` + `TraceCollectorState` + `spawn_trace_collector_actor`。
 
-- 5 个 actor 集成测试（`bus_actor_emit_dispatches_to_handlers`,
-  `scheduler_actor_add_and_tick`, `ccr_actor_put_and_get`,
-  `mock_registry_actor_register_and_call`, `trace_collector_actor_records`）。
-- 原有 5 个 domain 模块的同步 API 测试保持不变（向后兼容）。
+#### 新增测试
 
-#### Next step (deferred to v0.35)
+- 5 个 actor 集成测试：
+  - `bus_actor_emit_dispatches_to_handlers`
+  - `scheduler_actor_add_and_tick`
+  - `ccr_actor_put_and_get`
+  - `mock_registry_actor_register_and_call`
+  - `trace_collector_actor_records`
+- 5 个原有 domain 模块的同步 API 测试保持不变（向后兼容）。
+- `actor.rs` 和 `pressure.rs` 自带的 5 个单元测试。
 
-- `Interpreter` 字段切换 `Arc<Mutex<...>>` → `ActorHandle<...>` 需要把
-  整个 builtin dispatch 树改成 async。试点已确认 5 个 actor 形态可工作，
-  切换前需要：
+#### 下一步（推迟到 v0.35）
 
-  1. `call_function` / `call_method` / `call_value*` 全部 `async fn`
-  2. `execute_*` 系列 `async fn`，`evaluate_*` 同理
-  3. `interpret` 入口 `async fn` 并在 `#[tokio::main]` 中调用
-  4. `run_file` / `run_repl` 走 async 路径
-  5. 现有 330+ 测试要么用 `#[tokio::main]` 包，要么用 `tokio::runtime::Runtime` 新建
+`Interpreter` 字段切换 `Arc<Mutex<...>>` → `ActorHandle<...>` 需要把整个
+builtin dispatch 树改成 async。试点已确认 5 个 actor 形态可工作，切之前要：
 
-- 阶段 3（`PressureControl` 接入 `real_ai_chat` 等）和阶段 4
-  （`ureq` → `reqwest`、HTTP/MCP/LSP 服务器 async）都依赖上面的 async 化，
-  因此也都延迟到 v0.35 同一 commit 系列。
+1. `call_function` / `call_method` / `call_value*` 全部改成 `async fn`。
+2. `execute_*` 系列改成 `async fn`，`evaluate_*` 同理。
+3. `interpret` 入口改成 `async fn` 并在 `#[tokio::main]` 中调用。
+4. `run_file` / `run_repl` 走 async 路径。
+5. 现有 330+ 个测试要么用 `#[tokio::main]` 包，要么用 `tokio::runtime::Runtime` 新建。
 
-#### Verification
+阶段 3（`PressureControl` 接入 `real_ai_chat` 等）和阶段 4
+（`ureq` → `reqwest`、HTTP / MCP / LSP 服务器 async）都依赖上面的 async 化，
+因此也都推迟到 v0.35 同一 commit 系列。
 
-- `cargo build --all-targets`: clean
-- `cargo test --all`: 341 passed, 2 ignored
-- `cargo clippy --all-targets --all-features -- -D warnings`: clean
-- `cargo fmt --check`: 0 diff
+#### 验证
+
+- `cargo build --all-targets`：clean
+- `cargo test --all`：341 passed，2 ignored
+- `cargo clippy --all-targets --all-features -- -D warnings`：clean
+- `cargo fmt --check`：0 diff
 
 ## [v0.33] - 2026-07-02
 

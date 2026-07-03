@@ -137,7 +137,7 @@ pub(crate) fn default_impl_method_key(
 pub struct Interpreter {
     globals: Arc<Mutex<Environment>>,
     environment: Arc<Mutex<Environment>>,
-    tool_registry: HashMap<String, ToolDef>,
+    tool_registry: Arc<HashMap<String, ToolDef>>,
     // v0.04补: memory_store 字段已删除（RFC §4.1 memory.* builtin 推迟到 v1.0）
     model_routes: HashMap<String, RouteConfig>,
     token_budget: Option<TokenBudget>,
@@ -145,9 +145,9 @@ pub struct Interpreter {
     pub trace: TraceCollector,
     // v0.06: 当前 with 块 set 的 AiConfig 值 (替代 env hack)
     current_ai_config: Option<AiConfigValue>,
-    // v0.08: trait 系统注册表
-    pub trait_registry: HashMap<String, TraitInfo>,
-    pub impl_table: HashMap<String, Vec<String>>,
+    // v0.08: trait 系统注册表 (v0.36: wrapped in Arc for cheap clone in HTTP/MCP workers)
+    pub trait_registry: Arc<HashMap<String, TraitInfo>>,
+    pub impl_table: Arc<HashMap<String, Vec<String>>>,
     // v0.14: 录制/重放器 (默认 Off, 由 CLI 子命令激活)
     pub recorder: crate::record::Recorder,
     // v0.19: Worker 并发 channels
@@ -419,14 +419,14 @@ impl Interpreter {
         Self {
             globals: globals.clone(),
             environment: globals,
-            tool_registry: HashMap::new(),
+            tool_registry: Arc::new(HashMap::new()),
             model_routes: HashMap::new(),
             token_budget: None,
             token_usage: TokenUsage::default(),
             trace: TraceCollector::new(false),
             current_ai_config: None,
-            trait_registry: HashMap::new(),
-            impl_table: HashMap::new(),
+            trait_registry: Arc::new(HashMap::new()),
+            impl_table: Arc::new(HashMap::new()),
             recorder: crate::record::Recorder::new_off(),
             worker_channels: HashMap::new(),
             worker_receivers: HashMap::new(),
@@ -453,14 +453,14 @@ impl Interpreter {
         Self {
             globals: globals.clone(),
             environment: globals,
-            tool_registry: HashMap::new(),
+            tool_registry: Arc::new(HashMap::new()),
             model_routes: HashMap::new(),
             token_budget: None,
             token_usage: TokenUsage::default(),
             trace: TraceCollector::new(false),
             current_ai_config: None,
-            trait_registry: HashMap::new(),
-            impl_table: HashMap::new(),
+            trait_registry: Arc::new(HashMap::new()),
+            impl_table: Arc::new(HashMap::new()),
             recorder: crate::record::Recorder::new_off(),
             worker_channels: HashMap::new(),
             worker_receivers: HashMap::new(),
@@ -485,14 +485,14 @@ impl Interpreter {
         Self {
             globals: globals.clone(),
             environment: env,
-            tool_registry: HashMap::new(),
+            tool_registry: Arc::new(HashMap::new()),
             model_routes: HashMap::new(),
             token_budget: None,
             token_usage: TokenUsage::default(),
             trace: TraceCollector::new(false),
             current_ai_config: None,
-            trait_registry: HashMap::new(),
-            impl_table: HashMap::new(),
+            trait_registry: Arc::new(HashMap::new()),
+            impl_table: Arc::new(HashMap::new()),
             recorder: crate::record::Recorder::new_off(),
             worker_channels: HashMap::new(),
             worker_receivers: HashMap::new(),

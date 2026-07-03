@@ -583,7 +583,7 @@ impl Interpreter {
                 has_self: m.params.first().map(|(n, _)| n == "self").unwrap_or(false),
             })
             .collect();
-        self.trait_registry.insert(
+        Arc::make_mut(&mut self.trait_registry).insert(
             name.to_string(),
             TraitInfo {
                 name: name.to_string(),
@@ -625,7 +625,7 @@ impl Interpreter {
         _arena: &AstArena,
     ) -> Result<FlowSignal, String> {
         let _method_names: Vec<String> = methods.iter().map(|m| m.name.clone()).collect();
-        self.impl_table
+        Arc::make_mut(&mut self.impl_table)
             .entry(trait_name.to_string())
             .or_default()
             .push(for_type.to_string());

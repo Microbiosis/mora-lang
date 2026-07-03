@@ -446,6 +446,10 @@ impl ParserV2 {
         let path = self.consume_identifier("Expected path");
         self.consume(&TokenType::Arrow, "Expected '->'");
         let target = self.expression();
+        // v0.35 (P0-C2): `route` was parse+typecheck-only, never executed.
+        // We still parse it as StmtKind::Route; the interpreter now reports
+        // a clear runtime error rather than falling through to a generic
+        // "Unsupported v2 statement" message.
         let kind = StmtKind::Route {
             name: format!("{} {}", method, path),
             target,

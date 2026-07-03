@@ -847,10 +847,29 @@ impl ParserV2 {
                 }
                 // 解析单个 agent
                 let agents = self.parse_agent_decls();
-                let agent = agents
-                    .into_iter()
-                    .next()
-                    .expect("loop requires exactly one agent");
+                let agent = match agents.into_iter().next() {
+                    Some(a) => a,
+                    None => {
+                        // v0.34: 之前 .expect("loop requires exactly one agent") 会 panic；
+                        // 现在按已有"未知模式 fallback 到 Sequential"的模式，报告错误并返回空 loop
+                        eprintln!("Parse error: orchestrate loop requires exactly one agent");
+                        let stmt_kind = StmtKind::Orchestrate {
+                            input_var,
+                            result_var,
+                            kind: OrchestrateKind::Loop {
+                                agent: crate::ast_v2::OrchestrateAgent {
+                                    name: String::new(),
+                                    with_config: None,
+                                    task_expr: crate::ast_v2::NodeId(0),
+                                    verify_expr: None,
+                                },
+                                max_rounds,
+                                exit_when: None,
+                            },
+                        };
+                        return self.arena.alloc_stmt(stmt_kind, span);
+                    }
+                };
                 // 解析 exit_when
                 let mut exit_when = None;
                 if self.check(&TokenType::ExitWhen) {

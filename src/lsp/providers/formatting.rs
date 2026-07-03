@@ -22,9 +22,18 @@ pub fn formatting(docs: &HashMap<String, DocumentState>, params: &Value, range: 
     let formatted = simple_format(&text, range, params);
 
     let (start_line, start_col, end_line, end_col) = if range {
-        let s = params.get("range").expect("range should exist");
-        let start = s.get("start").expect("start should exist");
-        let end = s.get("end").expect("end should exist");
+        let s = match params.get("range") {
+            Some(v) => v,
+            None => return Value::Array(vec![]),
+        };
+        let start = match s.get("start") {
+            Some(v) => v,
+            None => return Value::Array(vec![]),
+        };
+        let end = match s.get("end") {
+            Some(v) => v,
+            None => return Value::Array(vec![]),
+        };
         (
             start.get("line").and_then(|n| n.as_i64()).unwrap_or(0) as usize,
             start.get("character").and_then(|n| n.as_i64()).unwrap_or(0) as usize,

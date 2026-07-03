@@ -455,7 +455,7 @@ fn parse_json_dict(s: &str) -> Result<(Value, usize), String> {
         let (key, key_consumed) = parse_json_string(&s[i..])?;
         let key_str = match key {
             Value::String(s) => s,
-            _ => unreachable!(),
+            _ => return Err("JSON object key must be a string".to_string()),
         };
         i += key_consumed;
         let rest = &s[i..].trim_start();

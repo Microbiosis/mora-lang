@@ -101,6 +101,27 @@ change, no API rename.
 - `ai.limits` block (step/cost/wall_time) per mini-swe-agent
 - `shell.run` with process group kill (POSIX `killpg`)
 
+### Fix Production Panics on User-Input Paths
+
+- `src/lexer.rs`: replace `value.parse().unwrap()` with `error_token`
+  fallback for malformed number literals.
+- `src/flow.rs`: replace `unreachable!()` in `parse_json_dict` with
+  `Err("JSON object key must be a string")`.
+- `src/lsp/providers/formatting.rs`: replace `.expect()` on LSP
+  `range/start/end` params with graceful empty-array fallback.
+- `src/interpreter/mod.rs`: replace `.expect("should have elements")` in
+  `extract_embeddings` with `Result::Err`.
+- `src/parser_v2/statements.rs`: finish v0.34 fix for
+  `.expect("loop requires exactly one agent")` — return a valid `NodeId`
+  via `arena.alloc_stmt` and include the new `with_config` field.
+
+#### Verification
+
+- `cargo build --all-targets`: clean
+- `cargo test --all`: 330 passed, 2 ignored
+- `cargo clippy --all-targets --all-features -- -D warnings`: clean
+- `cargo fmt --check`: 0 diff
+
 ## [v0.33] - 2026-07-02
 
 ### Schedule + Sandbox + Reading Order + CCR (4 P1 primitives)

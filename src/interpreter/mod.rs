@@ -784,7 +784,12 @@ fn extract_embeddings(json_text: &str, expected_count: usize) -> Result<Value, S
 
     if expected_count == 1 {
         // 单条：返回一维 List
-        let vec = indexed.into_iter().next().expect("should have elements").1;
+        let vec = match indexed.into_iter().next() {
+            Some((_, v)) => v,
+            None => {
+                return Err("ai.embed: no embeddings were successfully indexed".to_string());
+            }
+        };
         Ok(Value::List(vec.into_iter().map(Value::Number).collect()))
     } else {
         // 批量：返回 List<List>

@@ -703,7 +703,16 @@ impl Lexer {
             }
         }
         let value: String = self.source[start..self.current].iter().collect();
-        let num: f64 = value.parse().unwrap();
+        let num: f64 = match value.parse() {
+            Ok(n) => n,
+            Err(_) => {
+                return self.error_token(
+                    start_line,
+                    start_col,
+                    &format!("Invalid number literal: {}", value),
+                );
+            }
+        };
         Token {
             token_type: TokenType::Number(num),
             line: start_line,

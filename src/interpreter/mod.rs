@@ -228,11 +228,15 @@ impl Clone for Interpreter {
             cache_warmer: CacheWarmer::default(),
             v2_arena: None,
             memory_store: HashMap::new(),
-            bus: crate::event::EventBus::new(),
-            sandbox: crate::sandbox::SandboxPolicy::permissive(),
-            scheduler: crate::schedule::Scheduler::new(),
-            ccr_store: crate::ccr::InMemoryCcrStore::new(),
-            mock_registry: crate::mock::MockRegistry::new(),
+            // v0.35 (P0-A1): share 5 v0.34 singletons via Arc-backed Clone
+            // instead of fresh-constructing them. Previously, Clone reset
+            // counter state (Scheduler, CcrStore) and lost event handlers
+            // (Bus, MockRegistry), breaking identity across HTTP/MCP workers.
+            bus: self.bus.clone(),
+            sandbox: self.sandbox.clone(),
+            scheduler: self.scheduler.clone(),
+            ccr_store: self.ccr_store.clone(),
+            mock_registry: self.mock_registry.clone(),
         }
     }
 }

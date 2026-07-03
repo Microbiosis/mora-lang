@@ -47,6 +47,21 @@ pub struct InMemoryCcrStore {
     counter: AtomicU64,
 }
 
+// v0.35 (P0-A1): manual Clone — AtomicU64 doesn't impl Clone,
+// so a derived Clone would fail. We don't preserve exact counter
+// state across clones; instead both clones start counting from 0.
+// NOTE: callers wanting shared identity should share via Arc, NOT
+// via Clone. The fix here is only meant to satisfy `self.ccr_store.clone()`
+// inside the Interpreter Clone impl.
+impl Clone for InMemoryCcrStore {
+    fn clone(&self) -> Self {
+        Self {
+            entries: self.entries.clone(),
+            counter: AtomicU64::new(self.counter.load(Ordering::SeqCst)),
+        }
+    }
+}
+
 impl InMemoryCcrStore {
     pub fn new() -> Self {
         Self::default()

@@ -674,6 +674,14 @@ impl Interpreter {
             if node_ids.is_empty() {
                 continue;
             }
+            // v0.35 (P0-C1): REPL also type-checks (other entry points do).
+            let type_errs = crate::typeck::check_program(&node_ids, &arena);
+            if !type_errs.is_empty() {
+                for e in type_errs {
+                    eprintln!("type error: {}", e.message);
+                }
+                continue;
+            }
             for stmt_id in &node_ids {
                 if let Some(stmt) = arena.get_stmt(*stmt_id) {
                     let kind = stmt.kind.clone();

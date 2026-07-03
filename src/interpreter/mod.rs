@@ -199,6 +199,8 @@ pub struct Interpreter {
     sandbox: crate::sandbox::SandboxPolicy,
     /// v0.34: scheduler (cron, MimiClaw style)
     scheduler: crate::schedule::Scheduler,
+    /// v0.34: CCR (Compress-Cache-Retrieve, Headroom style)
+    ccr_store: crate::ccr::InMemoryCcrStore,
 }
 
 /// v0.24: AI 调用优先级队列条目类型
@@ -259,6 +261,7 @@ impl Clone for Interpreter {
             bus: crate::event::EventBus::new(),
             sandbox: crate::sandbox::SandboxPolicy::permissive(),
             scheduler: crate::schedule::Scheduler::new(),
+            ccr_store: crate::ccr::InMemoryCcrStore::new(),
         }
     }
 }
@@ -424,6 +427,11 @@ impl Interpreter {
             Value::Builtin("schedule".to_string()),
             false,
         );
+        // v0.34: 注册 ccr 顶层 builtin
+        globals
+            .lock()
+            .unwrap()
+            .define("ccr".to_string(), Value::Builtin("ccr".to_string()), false);
         Self {
             globals: globals.clone(),
             environment: globals,
@@ -457,6 +465,7 @@ impl Interpreter {
             bus: crate::event::EventBus::new(),
             sandbox: crate::sandbox::SandboxPolicy::permissive(),
             scheduler: crate::schedule::Scheduler::new(),
+            ccr_store: crate::ccr::InMemoryCcrStore::new(),
         }
     }
 
@@ -497,6 +506,7 @@ impl Interpreter {
             bus: crate::event::EventBus::new(),
             sandbox: crate::sandbox::SandboxPolicy::permissive(),
             scheduler: crate::schedule::Scheduler::new(),
+            ccr_store: crate::ccr::InMemoryCcrStore::new(),
         }
     }
 
@@ -535,6 +545,7 @@ impl Interpreter {
             bus: crate::event::EventBus::new(),
             sandbox: crate::sandbox::SandboxPolicy::permissive(),
             scheduler: crate::schedule::Scheduler::new(),
+            ccr_store: crate::ccr::InMemoryCcrStore::new(),
         }
     }
 
@@ -3162,6 +3173,17 @@ mod bus_tests {
     /// T25: schedule builtin (integrate src/schedule/, MimiClaw cron)
     #[test]
     fn test_schedule_builtin_basic() {
+        let src = r#"
+            let id = schedule.add("test", "every", "tick me", 60)
+            let n = schedule.count()
+            print(id, n)
+        "#;
+        run(src).expect("schedule.add should work");
+    }
+
+    /// T26: ccr builtin (integrate src/ccr/, Headroom style)
+    #[test]
+    fn test_ccr_builtin_basic() {
         let src = r#"
             let m = sandbox.mode()
             let ok = sandbox.check_builtin("ai.chat")

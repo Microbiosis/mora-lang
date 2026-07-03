@@ -6,6 +6,7 @@
 //! - get_embedding: 向量嵌入 (mock)
 
 use super::*;
+use crate::ccr::CcrStore;
 use crate::value::Value;
 
 impl Interpreter {
@@ -368,6 +369,54 @@ impl Interpreter {
             }
             "count" => Ok(Value::Number(self.scheduler.count() as f64)),
             _ => Err(format!("schedule.{}: unknown method", method)),
+        }
+    }
+
+    /// v0.34: ccr.* — Compress-Cache-Retrieve (Headroom style)
+    pub fn call_ccr_method(&self, method: &str, args: &[Value]) -> Result<Value, String> {
+        match method {
+            "put" => {
+                let data = args
+                    .first()
+                    .map(|v| v.to_string())
+                    .ok_or("ccr.put: requires data as first arg")?;
+                let hash = self.ccr_store.put(&data);
+                Ok(Value::String(hash))
+            }
+            "get" => {
+                let hash = args
+                    .first()
+                    .map(|v| v.to_string())
+                    .ok_or("ccr.get: requires hash as first arg")?;
+                match self.ccr_store.get(&hash) {
+                    Some(entry) => Ok(Value::String(entry.data)),
+                    None => Ok(Value::Nil),
+                }
+            }
+            "len" => Ok(Value::Number(self.ccr_store.len() as f64)),
+            "marker" => {
+                let hash = args
+                    .first()
+                    .map(|v| v.to_string())
+                    .ok_or("ccr.marker: requires hash as first arg")?;
+                let size = if let Some(Value::Number(n)) = args.get(1) {
+                    *n as usize
+                } else {
+                    0
+                };
+                Ok(Value::String(crate::ccr::make_marker(&hash, size)))
+            }
+            "extract" => {
+                let marker = args
+                    .first()
+                    .map(|v| v.to_string())
+                    .ok_or("ccr.extract: requires marker as first arg")?;
+                match crate::ccr::extract_hash(&marker) {
+                    Some(hash) => Ok(Value::String(hash.to_string())),
+                    None => Err(format!("ccr.extract: not a valid CCR marker: '{}'", marker)),
+                }
+            }
+            _ => Err(format!("ccr.{}: unknown method", method)),
         }
     }
 

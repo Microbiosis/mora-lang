@@ -52,14 +52,20 @@ impl EventBus {
     /// matching 算法: event "outer.gui.item.removed" 匹配
     /// - 精确: "outer.gui.item.removed"
     /// - wildcard: "outer.*", "outer.gui.*", "outer.gui.item.*"
+    ///
+    /// v0.35 (P0-A2): clone-and-drop — drop the lock before invoking
+    /// handlers so a handler that re-enters `bus.emit` on the same
+    /// thread does NOT deadlock on the non-reentrant Mutex.
     pub fn emit(&self, event: &str, payload: &Value) {
-        let map = self.handlers.lock().expect("event bus mutex poisoned");
-        for (pattern, handlers) in map.iter() {
-            if matches(event, pattern) {
-                for h in handlers {
-                    h(event, payload);
-                }
-            }
+        let snapshot: Vec<Handler> = {
+            let map = self.handlers.lock().expect("event bus mutex poisoned");
+            map.iter()
+                .filter(|(pattern, _)| matches(event, pattern))
+                .flat_map(|(_, hs)| hs.iter().cloned())
+                .collect()
+        };
+        for h in snapshot {
+            h(event, payload);
         }
     }
 

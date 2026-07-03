@@ -25,16 +25,13 @@ path = "src/bin/lsp.rs"
 # 单二进制 mora 根据脚本内 `serve as mcp/http` 块自动选择协议
 
 [dependencies]
+# v0.34: 引入 tokio + reqwest，把运行时从同步线程池升级到异步 actor/通道模型。
+# ureq 将逐步迁移到 reqwest，过渡期保留。
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "io-util", "signal"] }
+reqwest = { version = "0.12", features = ["json", "stream"] }
+
 # v10 首次外部依赖：ureq 同步 HTTP 客户端
-# 选择 ureq 而非 reqwest 的理由：ureq 同步阻塞，与同步解释器天然契合
-# 不引入 tokio 等 async runtime
-# 注意：v9 零依赖承诺被打破，但守住"不引入 async runtime"的红线
-# v0.x 升级 ureq 2.12 → 3.3
-# 重大变化:
-#   - AgentBuilder 重写,超时改用 ConfigBuilder.timeout_global
-#   - Error 枚举:Status(u16, Response) → StatusCode(u16) + 多种细粒度变体 (#[non_exhaustive])
-#   - Response::into_string() 移除,改用 .body_mut().read_to_string()
-#   - 升级到 edition 2024 + MSRV 1.85
+# v0.34 起逐步迁移到 reqwest；保留 ureq 直到全部外部调用完成异步化。
 ureq = "3.3"
 # v0.11: libc 用于设置 SO_REUSEADDR（避免 TIME_WAIT 端口占用）
 # 选择 libc 而非 socket2 的理由：libc 是 Rust 几乎必备的 stdlib-like 包，

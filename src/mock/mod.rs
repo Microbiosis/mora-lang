@@ -97,6 +97,67 @@ impl MockRegistry {
     }
 }
 
+// ===================================================================
+// v0.34: MockRegistry actor 形态
+// ===================================================================
+
+use tokio::sync::oneshot;
+
+use crate::actor::{ActorHandle, spawn_actor};
+
+/// MockRegistry actor 消息。
+pub enum MockRegistryMsg {
+    Register {
+        name: String,
+        handler: MockHandler,
+    },
+    Unregister {
+        name: String,
+    },
+    Get {
+        name: String,
+        reply: oneshot::Sender<Option<MockHandler>>,
+    },
+    Count(oneshot::Sender<usize>),
+    Names(oneshot::Sender<Vec<String>>),
+}
+
+#[derive(Default)]
+pub struct MockRegistryState {
+    handlers: HashMap<String, MockHandler>,
+}
+
+impl MockRegistryState {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+/// 启动 MockRegistry actor 并返回 handle。
+pub fn spawn_mock_registry_actor() -> ActorHandle<MockRegistryMsg> {
+    spawn_actor(MockRegistryState::new(), |state, msg| {
+        Box::pin(async move {
+            match msg {
+                MockRegistryMsg::Register { name, handler } => {
+                    state.handlers.insert(name, handler);
+                }
+                MockRegistryMsg::Unregister { name } => {
+                    state.handlers.remove(&name);
+                }
+                MockRegistryMsg::Get { name, reply } => {
+                    let _ = reply.send(state.handlers.get(&name).cloned());
+                }
+                MockRegistryMsg::Count(reply) => {
+                    let _ = reply.send(state.handlers.len());
+                }
+                MockRegistryMsg::Names(reply) => {
+                    let _ = reply.send(state.handlers.keys().cloned().collect());
+                }
+            }
+        })
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -200,5 +261,45 @@ mod tests {
         let mut names = r.names();
         names.sort();
         assert_eq!(names, vec!["a", "b", "c"]);
+    }
+
+    // v0.34: actor pipeline integration test.
+    #[tokio::test]
+    async fn mock_registry_actor_register_and_call() {
+        let r = spawn_mock_registry_actor();
+        r.tell(MockRegistryMsg::Register {
+            name: "greet".to_string(),
+            handler: MockHandler::Native(Arc::new(|args: &Value| {
+                if let Value::String(name) = args {
+                    Value::String(format!("hi, {}!", name))
+                } else {
+                    Value::Nil
+                }
+            })),
+        });
+
+        let handler = r
+            .ask(|reply| MockRegistryMsg::Get {
+                name: "greet".to_string(),
+                reply,
+            })
+            .await
+            .unwrap();
+        match handler {
+            Some(MockHandler::Native(f)) => {
+                let out = f(&Value::String("Mora".to_string()));
+                assert_eq!(out, Value::String("hi, Mora!".to_string()));
+            }
+            _ => panic!("expected Native handler"),
+        }
+
+        let n = r.ask(MockRegistryMsg::Count).await.unwrap();
+        assert_eq!(n, 1);
+
+        r.tell(MockRegistryMsg::Unregister {
+            name: "greet".to_string(),
+        });
+        let n = r.ask(MockRegistryMsg::Count).await.unwrap();
+        assert_eq!(n, 0);
     }
 }

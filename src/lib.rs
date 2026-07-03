@@ -3,6 +3,7 @@
 //! 暴露 lexer / parser / ast / interpreter / typeck / lsp 六个模块，
 //! 让 CLI binary（src/main.rs）和 LSP server binary（src/bin/lsp.rs）共享。
 
+pub mod actor;
 pub mod ai_infra;
 pub mod ast_v2;
 pub mod ccr;
@@ -18,6 +19,7 @@ pub mod lsp;
 pub mod mcp_server;
 pub mod mock;
 pub mod parser_v2;
+pub mod pressure;
 pub mod record;
 pub mod sandbox;
 pub mod schedule;

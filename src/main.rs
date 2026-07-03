@@ -23,7 +23,8 @@ fn parse_with_v2(source: &str) -> (Vec<NodeId>, AstArena) {
     (node_ids, arena)
 }
 
-fn main() {
+#[tokio::main]
+async fn main() {
     let args: Vec<String> = env::args().collect();
 
     // --version / --help 不显示 banner

@@ -266,3 +266,164 @@ fn escape_json(s: &str) -> String {
     }
     out
 }
+
+// ===================================================================
+// v0.34: TraceCollector actor 形态
+// ===================================================================
+
+use tokio::sync::oneshot;
+
+use crate::actor::{ActorHandle, spawn_actor};
+
+/// TraceCollector actor 消息。
+pub enum TraceCollectorMsg {
+    SetEnabled(bool),
+    IsEnabled(oneshot::Sender<bool>),
+    StartSpan {
+        name: String,
+        reply: oneshot::Sender<String>,
+    },
+    EndSpan {
+        span_id: String,
+        duration_ms: u64,
+        status: Option<String>,
+    },
+    RecordTokens {
+        input: u64,
+        output: u64,
+    },
+    RecordCall {
+        kind: String,
+    },
+    GetMetrics(oneshot::Sender<Metrics>),
+}
+
+pub struct TraceCollectorState {
+    enabled: bool,
+    spans: Vec<Span>,
+    metrics: Metrics,
+    counter: u64,
+}
+
+impl TraceCollectorState {
+    pub fn new() -> Self {
+        Self {
+            enabled: false,
+            spans: Vec::new(),
+            metrics: Metrics::default(),
+            counter: 0,
+        }
+    }
+}
+
+impl Default for TraceCollectorState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// 启动 TraceCollector actor 并返回 handle。
+pub fn spawn_trace_collector_actor() -> ActorHandle<TraceCollectorMsg> {
+    spawn_actor(TraceCollectorState::new(), |state, msg| {
+        Box::pin(async move {
+            match msg {
+                TraceCollectorMsg::SetEnabled(e) => {
+                    state.enabled = e;
+                }
+                TraceCollectorMsg::IsEnabled(reply) => {
+                    let _ = reply.send(state.enabled);
+                }
+                TraceCollectorMsg::StartSpan { name, reply } => {
+                    state.counter += 1;
+                    let span_id = format!("{:08x}", state.counter);
+                    let start_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as u64)
+                        .unwrap_or(0);
+                    state.spans.push(Span {
+                        name,
+                        trace_id: span_id.clone(),
+                        span_id: span_id.clone(),
+                        parent_id: None,
+                        start_ms,
+                        duration_ms: 0,
+                        attributes: HashMap::new(),
+                        status: SpanStatus::Ok,
+                    });
+                    let _ = reply.send(span_id);
+                }
+                TraceCollectorMsg::EndSpan {
+                    span_id,
+                    duration_ms,
+                    status,
+                } => {
+                    for s in state.spans.iter_mut() {
+                        if s.span_id == span_id {
+                            s.duration_ms = duration_ms;
+                            if let Some(err) = status {
+                                s.status = SpanStatus::Error(err);
+                            }
+                            break;
+                        }
+                    }
+                }
+                TraceCollectorMsg::RecordTokens { input, output } => {
+                    state.metrics.total_input_tokens += input;
+                    state.metrics.total_output_tokens += output;
+                }
+                TraceCollectorMsg::RecordCall { kind } => {
+                    state.metrics.total_calls += 1;
+                    match kind.as_str() {
+                        "ai_chat" => state.metrics.ai_chat_calls += 1,
+                        "ai_stream" => state.metrics.ai_stream_calls += 1,
+                        "tool" => state.metrics.tool_calls += 1,
+                        "memory" => state.metrics.memory_operations += 1,
+                        _ => {}
+                    }
+                }
+                TraceCollectorMsg::GetMetrics(reply) => {
+                    let _ = reply.send(state.metrics.clone());
+                }
+            }
+        })
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // v0.34: actor pipeline integration test.
+    #[tokio::test]
+    async fn trace_collector_actor_records() {
+        let tc = spawn_trace_collector_actor();
+        tc.tell(TraceCollectorMsg::SetEnabled(true));
+        assert!(tc.ask(TraceCollectorMsg::IsEnabled).await.unwrap());
+
+        let span_id = tc
+            .ask(|reply| TraceCollectorMsg::StartSpan {
+                name: "unit".to_string(),
+                reply,
+            })
+            .await
+            .unwrap();
+        tc.tell(TraceCollectorMsg::EndSpan {
+            span_id: span_id.clone(),
+            duration_ms: 42,
+            status: None,
+        });
+        tc.tell(TraceCollectorMsg::RecordTokens {
+            input: 10,
+            output: 20,
+        });
+        tc.tell(TraceCollectorMsg::RecordCall {
+            kind: "ai_chat".to_string(),
+        });
+
+        let metrics = tc.ask(TraceCollectorMsg::GetMetrics).await.unwrap();
+        assert_eq!(metrics.total_calls, 1);
+        assert_eq!(metrics.ai_chat_calls, 1);
+        assert_eq!(metrics.total_input_tokens, 10);
+        assert_eq!(metrics.total_output_tokens, 20);
+    }
+}

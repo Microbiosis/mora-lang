@@ -144,6 +144,45 @@ change, no API rename.
 - `cargo clippy --all-targets --all-features -- -D warnings`: clean
 - `cargo fmt --check`: 0 diff
 
+### Concurrency & Pressure: actor/pressure infrastructure (5 actor pilots)
+
+Step 2 of the v0.34 concurrency roadmap. 引入 tokio + reqwest 作为依赖，
+并为 5 个领域模块（event/schedule/ccr/mock/trace）建立 actor 形态作为
+后续 Interpreter 字段切换的基座。本节不替换 Interpreter 现有 `Arc<Mutex<...>>`
+字段，只提供并行实现供将来切换。
+
+- `Cargo.toml`:
+  - 新增 `tokio = "1"` (rt-multi-thread, macros, sync, time, net, io-util, signal)。
+  - 新增 `reqwest = "0.12"` (json, stream)；`ureq` 保留直到所有 AI/Web 客户端迁移完成。
+- `src/actor.rs`: 轻量 actor 框架
+  - `ActorHandle<M>`: `tell` (fire-and-forget) + `ask` (request/response)。
+  - `spawn_actor`: 在 tokio task 中跑消息循环，使用 `Box::pin` 让 future
+    可借用 `&mut S`。
+- `src/pressure.rs`: 压力控制基础设施
+  - `CircuitBreaker`: Closed/Open/HalfOpen 三态，failure/success 阈值。
+  - `QuotaManager`: 每个 endpoint 独立维护 concurrent + per-minute 配额。
+  - `PressureControl::call`: 在外部调用前后统一包络熔断/配额/结果回调。
+- `src/main.rs` / `src/bin/lsp.rs`: 入口升级为 `#[tokio::main] async fn main`。
+- `src/event/mod.rs`: `EventBusMsg` + `EventBusState` + `spawn_event_bus_actor`。
+- `src/schedule/mod.rs`: `SchedulerMsg` + `SchedulerState` + `spawn_scheduler_actor`。
+- `src/ccr/mod.rs`: `CcrStoreMsg` + `InMemoryCcrStoreState` + `spawn_ccr_store_actor`。
+- `src/mock/mod.rs`: `MockRegistryMsg` + `MockRegistryState` + `spawn_mock_registry_actor`。
+- `src/trace_collector.rs`: `TraceCollectorMsg` + `TraceCollectorState` + `spawn_trace_collector_actor`。
+
+#### Tests
+
+- 5 个 actor 集成测试（`bus_actor_emit_dispatches_to_handlers`,
+  `scheduler_actor_add_and_tick`, `ccr_actor_put_and_get`,
+  `mock_registry_actor_register_and_call`, `trace_collector_actor_records`）。
+- 原有 5 个 domain 模块的同步 API 测试保持不变（向后兼容）。
+
+#### Verification
+
+- `cargo build --all-targets`: clean
+- `cargo test --all`: 341 passed, 2 ignored
+- `cargo clippy --all-targets --all-features -- -D warnings`: clean
+- `cargo fmt --check`: 0 diff
+
 ## [v0.33] - 2026-07-02
 
 ### Schedule + Sandbox + Reading Order + CCR (4 P1 primitives)

@@ -8,11 +8,15 @@
 //!   * `outer.*` (catch-all)
 //! - Listener 注册通过 `on` 接受模式字符串 (含 `*` segment)
 //!
-//! 设计: 单线程同步, 用 `Arc<Mutex>` 共享. 避免 async runtime 依赖 (符合 Mora
-//! "no async runtime" 红线).
+//! v0.34: 在 v0.32 同步 Mutex 实现之上增加一个 actor 形态 (`EventBusActor`)。
+//! 同步 API 仍然保留，向后兼容；actor 版本提供给解释器减少锁竞争。
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use tokio::sync::oneshot;
+
+use crate::actor::{ActorHandle, spawn_actor};
+use crate::value::Value;
 
 /// Listener 标识: 模式字符串 (e.g. "outer.*" 或 "ai.chat.completed")
 pub type Pattern = String;
@@ -125,7 +129,74 @@ pub fn matches(event: &str, pattern: &str) -> bool {
     true
 }
 
-use crate::value::Value;
+// ===================================================================
+// v0.34: EventBus actor 形态
+// ===================================================================
+
+/// EventBus actor 消息。
+pub enum EventBusMsg {
+    /// 注册一个 pattern + handler。
+    On { pattern: Pattern, handler: Handler },
+    /// 取消注册 pattern（所有 handler）。
+    Off { pattern: Pattern },
+    /// 触发事件。返回匹配到的 handler 列表（在 actor 外调用）。
+    Emit {
+        event: String,
+        payload: Value,
+        reply: oneshot::Sender<Vec<Handler>>,
+    },
+    /// 返回当前注册的模式数。
+    PatternCount(oneshot::Sender<usize>),
+}
+
+/// EventBus actor 状态。
+#[derive(Default)]
+pub struct EventBusState {
+    handlers: HashMap<Pattern, Vec<Handler>>,
+}
+
+impl EventBusState {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+/// 启动 EventBus actor 并返回 handle。
+pub fn spawn_event_bus_actor() -> ActorHandle<EventBusMsg> {
+    spawn_actor(EventBusState::new(), |state, msg| {
+        Box::pin(async move {
+            match msg {
+                EventBusMsg::On { pattern, handler } => {
+                    state.handlers.entry(pattern).or_default().push(handler);
+                }
+                EventBusMsg::Off { pattern } => {
+                    state.handlers.remove(&pattern);
+                }
+                EventBusMsg::Emit {
+                    event,
+                    payload,
+                    reply,
+                } => {
+                    let mut matched: Vec<Handler> = Vec::new();
+                    for (pattern, handlers) in state.handlers.iter() {
+                        if matches(&event, pattern) {
+                            for h in handlers {
+                                matched.push(h.clone());
+                            }
+                        }
+                    }
+                    // payload 在 actor 循环内不需要使用；它会在外层被消费
+                    // 这里仅占位以保持 message enum 字段。
+                    let _ = payload;
+                    let _ = reply.send(matched);
+                }
+                EventBusMsg::PatternCount(reply) => {
+                    let _ = reply.send(state.handlers.len());
+                }
+            }
+        })
+    })
+}
 
 #[cfg(test)]
 mod tests {
@@ -243,5 +314,58 @@ mod tests {
         bus.off("ai.*");
         bus.emit("ai.chat", &Value::Nil);
         assert_eq!(counter.load(Ordering::SeqCst), 1); // unchanged
+    }
+
+    // v0.34: actor pipeline integration test.
+    #[tokio::test]
+    async fn bus_actor_emit_dispatches_to_handlers() {
+        let bus = spawn_event_bus_actor();
+        let counter = Arc::new(AtomicUsize::new(0));
+        let c1 = counter.clone();
+        let c2 = counter.clone();
+        let c3 = counter.clone();
+
+        bus.tell(EventBusMsg::On {
+            pattern: "outer.*".to_string(),
+            handler: Arc::new(move |_, _| {
+                c1.fetch_add(1, Ordering::SeqCst);
+            }),
+        });
+        bus.tell(EventBusMsg::On {
+            pattern: "outer.gui.*".to_string(),
+            handler: Arc::new(move |_, _| {
+                c2.fetch_add(2, Ordering::SeqCst);
+            }),
+        });
+        bus.tell(EventBusMsg::On {
+            pattern: "outer.gui.item.added".to_string(),
+            handler: Arc::new(move |_, _| {
+                c3.fetch_add(4, Ordering::SeqCst);
+            }),
+        });
+
+        let matched = bus
+            .ask(|reply| EventBusMsg::Emit {
+                event: "outer.gui.item.added".to_string(),
+                payload: Value::Nil,
+                reply,
+            })
+            .await
+            .unwrap();
+        // 在 actor 外触发匹配到的 handlers（保证 lock-free 调用）
+        for h in &matched {
+            h("outer.gui.item.added", &Value::Nil);
+        }
+        // 1 + 2 + 4 = 7
+        assert_eq!(counter.load(Ordering::SeqCst), 7);
+
+        let n = bus.ask(EventBusMsg::PatternCount).await.unwrap();
+        assert_eq!(n, 3);
+
+        bus.tell(EventBusMsg::Off {
+            pattern: "outer.*".to_string(),
+        });
+        let n = bus.ask(EventBusMsg::PatternCount).await.unwrap();
+        assert_eq!(n, 2);
     }
 }

@@ -245,6 +245,221 @@ impl Scheduler {
     }
 }
 
+// ===================================================================
+// v0.34: Scheduler actor 形态
+// ===================================================================
+
+use tokio::sync::oneshot;
+
+use crate::actor::{ActorHandle, spawn_actor};
+
+/// Scheduler actor 消息。
+pub enum SchedulerMsg {
+    /// 设置持久化路径
+    SetPersistPath(PathBuf),
+    /// 添加 job，返回 id
+    Add {
+        name: String,
+        kind: JobKind,
+        message: String,
+        interval_s: u64,
+        at_epoch: u64,
+        reply: oneshot::Sender<Result<String, String>>,
+    },
+    /// 列出所有 jobs
+    List(oneshot::Sender<Vec<Job>>),
+    /// 删除一个 job
+    Remove {
+        id: String,
+        reply: oneshot::Sender<bool>,
+    },
+    /// tick 一次
+    Tick {
+        now: u64,
+        reply: oneshot::Sender<Vec<String>>,
+    },
+    /// 当前 jobs 数
+    Count(oneshot::Sender<usize>),
+}
+
+#[derive(Default)]
+pub struct SchedulerState {
+    jobs: HashMap<String, Job>,
+    next_id: u32,
+    persist_path: Option<PathBuf>,
+}
+
+impl SchedulerState {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+/// 启动 Scheduler actor 并返回 handle。
+pub fn spawn_scheduler_actor() -> ActorHandle<SchedulerMsg> {
+    spawn_actor(SchedulerState::new(), |state, msg| {
+        Box::pin(async move {
+            match msg {
+                SchedulerMsg::SetPersistPath(p) => {
+                    state.persist_path = Some(p);
+                }
+                SchedulerMsg::Add {
+                    name,
+                    kind,
+                    message,
+                    interval_s,
+                    at_epoch,
+                    reply,
+                } => {
+                    let r = scheduler_add(state, &name, kind, &message, interval_s, at_epoch);
+                    let ok = r.is_ok();
+                    let _ = reply.send(r);
+                    if ok {
+                        save_to_path(state);
+                    }
+                }
+                SchedulerMsg::List(reply) => {
+                    let list: Vec<Job> = state.jobs.values().cloned().collect();
+                    let _ = reply.send(list);
+                }
+                SchedulerMsg::Remove { id, reply } => {
+                    let removed = state.jobs.remove(&id).is_some();
+                    if removed {
+                        save_to_path(state);
+                    }
+                    let _ = reply.send(removed);
+                }
+                SchedulerMsg::Tick { now, reply } => {
+                    let triggered = scheduler_tick(state, now);
+                    if !triggered.is_empty() {
+                        save_to_path(state);
+                    }
+                    let _ = reply.send(triggered);
+                }
+                SchedulerMsg::Count(reply) => {
+                    let _ = reply.send(state.jobs.len());
+                }
+            }
+        })
+    })
+}
+
+fn next_job_id(counter: &mut u32) -> String {
+    *counter += 1;
+    format!("{:08x}", *counter)
+}
+
+fn now_epoch() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn scheduler_add(
+    state: &mut SchedulerState,
+    name: &str,
+    kind: JobKind,
+    message: &str,
+    interval_s: u64,
+    at_epoch: u64,
+) -> Result<String, String> {
+    if name.is_empty() {
+        return Err("schedule.add: name cannot be empty".to_string());
+    }
+    if message.is_empty() {
+        return Err("schedule.add: message cannot be empty".to_string());
+    }
+    match kind {
+        JobKind::Every => {
+            if interval_s == 0 {
+                return Err("schedule.add: Every kind needs interval_s > 0".to_string());
+            }
+        }
+        JobKind::At => {
+            if at_epoch == 0 {
+                return Err("schedule.add: At kind needs at_epoch > 0".to_string());
+            }
+            if at_epoch <= now_epoch() {
+                return Err(format!(
+                    "schedule.add: at_epoch {} is in the past (now={})",
+                    at_epoch,
+                    now_epoch()
+                ));
+            }
+        }
+    }
+    let id = next_job_id(&mut state.next_id);
+    let now = now_epoch();
+    let job = Job {
+        id: id.clone(),
+        name: name.to_string(),
+        kind,
+        interval_s,
+        at_epoch,
+        message: message.to_string(),
+        last_run_epoch: if kind == JobKind::Every { now } else { 0 },
+        delete_after_run: kind == JobKind::At,
+    };
+    state.jobs.insert(id.clone(), job);
+    Ok(id)
+}
+
+fn scheduler_tick(state: &mut SchedulerState, now: u64) -> Vec<String> {
+    let mut triggered = Vec::new();
+    let mut to_remove = Vec::new();
+    for (id, job) in state.jobs.iter_mut() {
+        let should_fire = match job.kind {
+            JobKind::Every => {
+                if job.interval_s > 0 {
+                    let next = job.last_run_epoch + job.interval_s;
+                    now >= next
+                } else {
+                    false
+                }
+            }
+            JobKind::At => now >= job.at_epoch,
+        };
+        if should_fire {
+            triggered.push(job.message.clone());
+            job.last_run_epoch = now;
+            if job.delete_after_run {
+                to_remove.push(id.clone());
+            }
+        }
+    }
+    for id in &to_remove {
+        state.jobs.remove(id);
+    }
+    triggered
+}
+
+fn save_to_path(state: &SchedulerState) {
+    if let Some(path) = &state.persist_path {
+        let mut json = String::from("[\n");
+        for (i, job) in state.jobs.values().enumerate() {
+            if i > 0 {
+                json.push_str(",\n");
+            }
+            json.push_str(&format!(
+                "  {{\"id\":\"{}\",\"name\":\"{}\",\"kind\":\"{}\",\"message\":\"{}\",\"interval_s\":{},\"at_epoch\":{},\"last_run_epoch\":{}}}",
+                job.id,
+                job.name,
+                match job.kind {
+                    JobKind::Every => "every",
+                    JobKind::At => "at",
+                },
+                job.message.replace('"', "\\\""),
+                job.interval_s,
+                job.at_epoch,
+                job.last_run_epoch
+            ));
+        }
+        json.push_str("\n]\n");
+        let _ = std::fs::write(path, json);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -367,5 +582,57 @@ mod tests {
         // cleanup
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_dir(&dir);
+    }
+
+    // v0.34: actor pipeline integration test.
+    #[tokio::test]
+    async fn scheduler_actor_add_and_tick() {
+        let s = spawn_scheduler_actor();
+        let id = s
+            .ask(|reply| SchedulerMsg::Add {
+                name: "tick".to_string(),
+                kind: JobKind::Every,
+                message: "hi".to_string(),
+                interval_s: 60,
+                at_epoch: 0,
+                reply,
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(id.len(), 8);
+
+        let n = s.ask(SchedulerMsg::Count).await.unwrap();
+        assert_eq!(n, 1);
+
+        // tick at t0 (now): should not fire (last_run=now, next=now+60)
+        let t0 = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let fired = s
+            .ask(|reply| SchedulerMsg::Tick { now: t0, reply })
+            .await
+            .unwrap();
+        assert!(fired.is_empty());
+
+        // tick at t0+60: should fire
+        let fired = s
+            .ask(|reply| SchedulerMsg::Tick {
+                now: t0 + 60,
+                reply,
+            })
+            .await
+            .unwrap();
+        assert_eq!(fired, vec!["hi".to_string()]);
+
+        // remove
+        let removed = s
+            .ask(|reply| SchedulerMsg::Remove { id, reply })
+            .await
+            .unwrap();
+        assert!(removed);
+        let n = s.ask(SchedulerMsg::Count).await.unwrap();
+        assert_eq!(n, 0);
     }
 }

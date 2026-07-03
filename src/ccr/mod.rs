@@ -99,6 +99,66 @@ pub fn extract_hash(marker: &str) -> Option<&str> {
     }
 }
 
+// ===================================================================
+// v0.34: CcrStore actor 形态
+// ===================================================================
+
+use tokio::sync::oneshot;
+
+use crate::actor::{ActorHandle, spawn_actor};
+
+/// CcrStore actor 消息。
+pub enum CcrStoreMsg {
+    Put {
+        data: String,
+        reply: oneshot::Sender<String>,
+    },
+    Get {
+        hash: String,
+        reply: oneshot::Sender<Option<CcrEntry>>,
+    },
+    Len(oneshot::Sender<usize>),
+}
+
+#[derive(Default)]
+pub struct InMemoryCcrStoreState {
+    entries: HashMap<String, CcrEntry>,
+    counter: u64,
+}
+
+impl InMemoryCcrStoreState {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+/// 启动 CcrStore actor 并返回 handle。
+pub fn spawn_ccr_store_actor() -> ActorHandle<CcrStoreMsg> {
+    spawn_actor(InMemoryCcrStoreState::new(), |state, msg| {
+        Box::pin(async move {
+            match msg {
+                CcrStoreMsg::Put { data, reply } => {
+                    state.counter += 1;
+                    let hash = format!("{:08x}", state.counter);
+                    let entry = CcrEntry {
+                        hash: hash.clone(),
+                        size: data.len(),
+                        data: data.clone(),
+                    };
+                    state.entries.insert(hash.clone(), entry);
+                    let _ = reply.send(hash);
+                }
+                CcrStoreMsg::Get { hash, reply } => {
+                    let _ = reply.send(state.entries.get(&hash).cloned());
+                }
+                CcrStoreMsg::Len(reply) => {
+                    let _ = reply.send(state.entries.len());
+                }
+            }
+        })
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -164,5 +224,49 @@ mod tests {
         // retrieve 拿回原值
         let entry = store.get(&hash).unwrap();
         assert_eq!(entry.data.len(), 102_400);
+    }
+
+    // v0.34: actor pipeline integration test.
+    #[tokio::test]
+    async fn ccr_actor_put_and_get() {
+        let store = spawn_ccr_store_actor();
+        let h1 = store
+            .ask(|reply| CcrStoreMsg::Put {
+                data: "data1".to_string(),
+                reply,
+            })
+            .await
+            .unwrap();
+        let h2 = store
+            .ask(|reply| CcrStoreMsg::Put {
+                data: "data2".to_string(),
+                reply,
+            })
+            .await
+            .unwrap();
+        assert_ne!(h1, h2);
+
+        let entry = store
+            .ask(|reply| CcrStoreMsg::Get {
+                hash: h1.clone(),
+                reply,
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(entry.data, "data1");
+        assert_eq!(entry.size, 5);
+
+        let n = store.ask(CcrStoreMsg::Len).await.unwrap();
+        assert_eq!(n, 2);
+
+        let missing = store
+            .ask(|reply| CcrStoreMsg::Get {
+                hash: "deadbeef".to_string(),
+                reply,
+            })
+            .await
+            .unwrap();
+        assert!(missing.is_none());
     }
 }

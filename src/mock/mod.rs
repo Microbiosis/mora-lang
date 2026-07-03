@@ -70,12 +70,21 @@ impl MockRegistry {
 
     /// 调用 mock handler. 返回 None 如果未注册。
     /// 注意：Script handler 需要 interpreter，因此这里只执行 Native handler。
+    ///
+    /// v0.35 (P0-A3): clone-and-drop — drop the lock before invoking the
+    /// handler so a Native handler that re-enters the registry on the
+    /// same thread does NOT deadlock.
     pub fn call(&self, name: &str, args: &Value) -> Option<Value> {
-        let map = self.handlers.lock().expect("mock registry mutex poisoned");
-        map.get(name).and_then(|h| match h {
-            MockHandler::Native(f) => Some(f(args)),
-            MockHandler::Script(_) => None,
-        })
+        let handler = self
+            .handlers
+            .lock()
+            .expect("mock registry mutex poisoned")
+            .get(name)
+            .cloned();
+        match handler {
+            Some(MockHandler::Native(f)) => Some(f(args)),
+            _ => None,
+        }
     }
 
     /// 当前注册的 handler 数 (test helper)

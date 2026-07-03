@@ -622,39 +622,63 @@ pub fn walk_expr<V: AstVisitor<T>, T>(visitor: &mut V, arena: &AstArena, expr: &
     match &expr.kind {
         ExprKind::Literal(_) | ExprKind::Variable(_) => visitor.visit_expr(arena, expr),
         ExprKind::Binary { left, right, .. } => {
-            let _ = visitor.visit_expr(arena, arena.get_expr(*left).unwrap());
-            let _ = visitor.visit_expr(arena, arena.get_expr(*right).unwrap());
+            // v0.35 (P0-B1): previously .unwrap() panicked on dangling NodeId.
+            // Skip child silently — visitor fallthrough handles missing data.
+            if let Some(left_expr) = arena.get_expr(*left) {
+                let _ = visitor.visit_expr(arena, left_expr);
+            }
+            if let Some(right_expr) = arena.get_expr(*right) {
+                let _ = visitor.visit_expr(arena, right_expr);
+            }
             visitor.visit_expr(arena, expr)
         }
         ExprKind::Pipe { left, right } => {
-            let _ = visitor.visit_expr(arena, arena.get_expr(*left).unwrap());
-            let _ = visitor.visit_expr(arena, arena.get_expr(*right).unwrap());
+            if let Some(left_expr) = arena.get_expr(*left) {
+                let _ = visitor.visit_expr(arena, left_expr);
+            }
+            if let Some(right_expr) = arena.get_expr(*right) {
+                let _ = visitor.visit_expr(arena, right_expr);
+            }
             visitor.visit_expr(arena, expr)
         }
         ExprKind::Call { args, .. } => {
             for arg in args {
-                let _ = visitor.visit_expr(arena, arena.get_expr(*arg).unwrap());
+                if let Some(arg_expr) = arena.get_expr(*arg) {
+                    let _ = visitor.visit_expr(arena, arg_expr);
+                }
             }
             visitor.visit_expr(arena, expr)
         }
         ExprKind::MethodCall { object, args, .. } => {
-            let _ = visitor.visit_expr(arena, arena.get_expr(*object).unwrap());
+            if let Some(obj_expr) = arena.get_expr(*object) {
+                let _ = visitor.visit_expr(arena, obj_expr);
+            }
             for arg in args {
-                let _ = visitor.visit_expr(arena, arena.get_expr(*arg).unwrap());
+                if let Some(arg_expr) = arena.get_expr(*arg) {
+                    let _ = visitor.visit_expr(arena, arg_expr);
+                }
             }
             visitor.visit_expr(arena, expr)
         }
         ExprKind::Index { object, index } => {
-            let _ = visitor.visit_expr(arena, arena.get_expr(*object).unwrap());
-            let _ = visitor.visit_expr(arena, arena.get_expr(*index).unwrap());
+            if let Some(obj_expr) = arena.get_expr(*object) {
+                let _ = visitor.visit_expr(arena, obj_expr);
+            }
+            if let Some(idx_expr) = arena.get_expr(*index) {
+                let _ = visitor.visit_expr(arena, idx_expr);
+            }
             visitor.visit_expr(arena, expr)
         }
         ExprKind::Grouping(inner) => {
-            let _ = visitor.visit_expr(arena, arena.get_expr(*inner).unwrap());
+            if let Some(inner_expr) = arena.get_expr(*inner) {
+                let _ = visitor.visit_expr(arena, inner_expr);
+            }
             visitor.visit_expr(arena, expr)
         }
         ExprKind::Borrow { expr: inner } | ExprKind::BorrowMut { expr: inner } => {
-            let _ = visitor.visit_expr(arena, arena.get_expr(*inner).unwrap());
+            if let Some(inner_expr) = arena.get_expr(*inner) {
+                let _ = visitor.visit_expr(arena, inner_expr);
+            }
             visitor.visit_expr(arena, expr)
         }
         _ => visitor.visit_expr(arena, expr),

@@ -446,9 +446,8 @@ impl Interpreter {
         args: Vec<Value>,
         call_site: Span,
     ) -> Result<Value, String> {
-        // v0.22: 方法调用内联缓存
-        let _cache_key = format!("{}:{}", type_name(&object), method);
-        // 注：内联缓存主要优化方法查找，实际执行仍需分派
+        // v0.35 (P0-D3): the inline-cache format! previously lived here.
+        // It was a dead alloc per method dispatch — deleted.
 
         // v0.08.5: dyn dispatch —— TraitObject 走 dispatch_trait_method（按 for_type + trait_name 选 impl）
         // call_site 透传给 dispatcher，dispatch 失败时报错带行号方便定位
@@ -1111,8 +1110,19 @@ impl Interpreter {
         let call_env = Arc::new(Mutex::new(Environment::with_parent(
             self.environment.clone(),
         )));
+        // v0.35 (P0-C4): surface arity errors instead of silently nil-filling.
+        if args.len() < params.len() {
+            return Err(format!(
+                "task expects {} args, got {}",
+                params.len(),
+                args.len()
+            ));
+        }
         for (i, param) in params.iter().enumerate() {
-            let value = args.get(i).cloned().unwrap_or(Value::Nil);
+            let value = args
+                .get(i)
+                .cloned()
+                .ok_or_else(|| format!("missing arg for parameter '{}'", param))?;
             call_env
                 .lock()
                 .map_err(|_| "env mutex poisoned".to_string())?
@@ -1177,9 +1187,19 @@ impl Interpreter {
                         let call_env = std::sync::Arc::new(std::sync::Mutex::new(
                             crate::value::Environment::with_parent(env.clone()),
                         ));
-                        // 绑定参数
+                        // 绑定参数 — v0.35 (P0-C4): arity check
+                        if args.len() < closure_params.len() {
+                            return Err(format!(
+                                "closure expects {} args, got {}",
+                                closure_params.len(),
+                                args.len()
+                            ));
+                        }
                         for (i, (pname, _)) in closure_params.iter().enumerate() {
-                            let val = args.get(i).cloned().unwrap_or(Value::Nil);
+                            let val = args
+                                .get(i)
+                                .cloned()
+                                .ok_or_else(|| format!("missing arg for parameter '{}'", pname))?;
                             call_env
                                 .lock()
                                 .map_err(|_| "env mutex poisoned".to_string())?

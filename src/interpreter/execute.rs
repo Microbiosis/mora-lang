@@ -141,6 +141,12 @@ impl Interpreter {
                 // Already consumed by execute_document_section; unreachable
                 Ok(FlowSignal::None)
             }
+            // v0.35 (P0-C2): `route` statement was parse+typecheck-only.
+            // Now report a clean runtime error instead of fallthrough.
+            StmtKind::Route { name, .. } => Err(format!(
+                "route statement '{}' is not executable in v0.35; use web server endpoints instead",
+                name
+            )),
             _ => Err(format!("Unsupported v2 statement: {:?}", stmt_kind)),
         }
     }

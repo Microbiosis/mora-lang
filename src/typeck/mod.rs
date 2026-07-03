@@ -875,7 +875,9 @@ fn method_return_type(receiver: &Type, method: &str) -> Type {
     // v0.x: dict<K, V> 的方法返回类型
     if let Type::Dict(k, v) = receiver {
         match method {
-            "get" => return v.as_ref().clone(),
+            // v0.35 (P0-C3): runtime may return Nil on missing key, so the
+            // static return type must reflect that: V | Nil.
+            "get" => return Type::Union(vec![v.as_ref().clone(), Type::Nil]),
             "set" => return Type::Dict(k.clone(), v.clone()),
             "keys" => return Type::List(k.clone()),
             "values" => return Type::List(v.clone()),

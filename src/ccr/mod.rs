@@ -47,6 +47,21 @@ pub struct InMemoryCcrStore {
     counter: AtomicU64,
 }
 
+// v0.35 (P0-A1): manual Clone — AtomicU64 doesn't impl Clone,
+// so a derived Clone would fail. We don't preserve exact counter
+// state across clones; instead both clones start counting from 0.
+// NOTE: callers wanting shared identity should share via Arc, NOT
+// via Clone. The fix here is only meant to satisfy `self.ccr_store.clone()`
+// inside the Interpreter Clone impl.
+impl Clone for InMemoryCcrStore {
+    fn clone(&self) -> Self {
+        Self {
+            entries: self.entries.clone(),
+            counter: AtomicU64::new(self.counter.load(Ordering::SeqCst)),
+        }
+    }
+}
+
 impl InMemoryCcrStore {
     pub fn new() -> Self {
         Self::default()
@@ -56,8 +71,10 @@ impl InMemoryCcrStore {
 impl CcrStore for InMemoryCcrStore {
     fn put(&self, data: &str) -> String {
         let n = self.counter.fetch_add(1, Ordering::SeqCst) + 1;
-        // 8-char hex from counter
-        let hash = format!("{:08x}", n);
+        // v0.35 (P0-A4): widen to 16 hex chars so the counter can exceed
+        // 2^32 (4_294_967_296) before hash collisions set in. The visible
+        // hash string is now always 16 chars from AtomicU64.
+        let hash = format!("{:016x}", n);
         let entry = CcrEntry {
             hash: hash.clone(),
             size: data.len(),
@@ -107,7 +124,8 @@ mod tests {
     fn put_and_get() {
         let store = InMemoryCcrStore::new();
         let hash = store.put("hello world");
-        assert_eq!(hash.len(), 8);
+        // v0.35 (P0-A4): hash widened to 16 hex chars.
+        assert_eq!(hash.len(), 16);
         let entry = store.get(&hash).unwrap();
         assert_eq!(entry.data, "hello world");
         assert_eq!(entry.size, 11);

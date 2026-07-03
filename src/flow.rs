@@ -403,26 +403,42 @@ fn parse_json_string(s: &str) -> Result<(Value, usize), String> {
     Err("Unterminated string".to_string())
 }
 
+/// v0.35 (P0-D1): byte-index whitespace skipper. The old code used
+/// `&s[i..].trim_start()` which allocated a new `&str` and re-scanned
+/// remaining bytes on every iteration → O(n²) on whitespace-heavy JSON.
+/// This scans the byte slice directly with no slicing and no allocation.
+fn skip_ws(s: &[u8], mut i: usize) -> usize {
+    while i < s.len() {
+        match s[i] {
+            b' ' | b'\t' | b'\n' | b'\r' => i += 1,
+            _ => break,
+        }
+    }
+    i
+}
+
 fn parse_json_list(s: &str) -> Result<(Value, usize), String> {
     if s.as_bytes()[0] != b'[' {
         return Err("Expected '['".to_string());
     }
+    let bytes = s.as_bytes();
     let mut items = Vec::new();
     let mut i = 1;
     loop {
-        let rest = &s[i..].trim_start();
-        if rest.is_empty() {
+        i = skip_ws(bytes, i);
+        if i >= bytes.len() {
             return Err("Unterminated list".to_string());
         }
-        if rest.as_bytes()[0] == b']' {
-            i += s.len() - i - rest.len() + 1;
+        if bytes[i] == b']' {
+            i += 1;
             break;
         }
         if !items.is_empty() {
-            if rest.as_bytes()[0] != b',' {
+            if bytes[i] != b',' {
                 return Err("Expected ',' in list".to_string());
             }
             i += 1;
+            i = skip_ws(bytes, i);
         }
         let (val, consumed) = parse_json_value(&s[i..])?;
         items.push(val);
@@ -435,22 +451,24 @@ fn parse_json_dict(s: &str) -> Result<(Value, usize), String> {
     if s.as_bytes()[0] != b'{' {
         return Err("Expected '{'".to_string());
     }
+    let bytes = s.as_bytes();
     let mut map = std::collections::HashMap::new();
     let mut i = 1;
     loop {
-        let rest = &s[i..].trim_start();
-        if rest.is_empty() {
+        i = skip_ws(bytes, i);
+        if i >= bytes.len() {
             return Err("Unterminated dict".to_string());
         }
-        if rest.as_bytes()[0] == b'}' {
-            i += s.len() - i - rest.len() + 1;
+        if bytes[i] == b'}' {
+            i += 1;
             break;
         }
         if !map.is_empty() {
-            if rest.as_bytes()[0] != b',' {
+            if bytes[i] != b',' {
                 return Err("Expected ',' in dict".to_string());
             }
             i += 1;
+            i = skip_ws(bytes, i);
         }
         let (key, key_consumed) = parse_json_string(&s[i..])?;
         let key_str = match key {
@@ -458,8 +476,8 @@ fn parse_json_dict(s: &str) -> Result<(Value, usize), String> {
             _ => return Err("JSON object key must be a string".to_string()),
         };
         i += key_consumed;
-        let rest = &s[i..].trim_start();
-        if rest.is_empty() || rest.as_bytes()[0] != b':' {
+        i = skip_ws(bytes, i);
+        if i >= bytes.len() || bytes[i] != b':' {
             return Err("Expected ':' in dict".to_string());
         }
         i += 1;

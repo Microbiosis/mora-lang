@@ -95,8 +95,14 @@ impl TypeChecker {
             } => {
                 self.check_span_stmt(attributes, body, arena, symbols);
             }
-            StmtKind::Send { value, .. } | StmtKind::Route { target: value, .. } => {
+            // v0.35 (P0-C2): Route is parse+typecheck-only; runtime now reports
+            // an explicit error. Still type-check the target expression for
+            // consistency with other statement arms.
+            StmtKind::Send { value, .. } => {
                 self.check_expr(*value, arena, symbols);
+            }
+            StmtKind::Route { target, .. } => {
+                self.check_expr(*target, arena, symbols);
             }
             StmtKind::RecordTokens { input, output } => {
                 self.check_expr(*input, arena, symbols);

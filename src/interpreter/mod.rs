@@ -143,8 +143,6 @@ pub struct Interpreter {
     token_budget: Option<TokenBudget>,
     token_usage: TokenUsage,
     pub trace: TraceCollector,
-    // v0.04 Slice 2: route registry (name -> model name)
-    route_registry: HashMap<String, String>,
     // v0.06: 当前 with 块 set 的 AiConfig 值 (替代 env hack)
     current_ai_config: Option<AiConfigValue>,
     // v0.08: trait 系统注册表
@@ -159,38 +157,19 @@ pub struct Interpreter {
     ai_cache: HashMap<String, String>,
     // v0.22: 字符串驻留池 (减少重复字符串内存)
     string_interner: HashMap<String, Value>,
-    // v0.22: 方法调用内联缓存 (type_name:method -> cached_fn_index)
-    #[allow(dead_code)] // 未来扩展用
-    method_cache: HashMap<String, usize>,
-    // v0.22: AI 批量请求队列
-    #[allow(dead_code)] // 未来扩展用
-    ai_batch_queue: Vec<(String, Vec<(String, String)>)>, // (model, messages)
     // v0.24: 自适应 draft 模型选择 (model -> success_rate)
     draft_model_stats: HashMap<String, (usize, usize)>, // (success, total)
-    // v0.24: 推测解码缓存预热队列
-    #[allow(dead_code)] // 未来扩展用
-    cache_warm_queue: Vec<String>,
-    // v0.24: AI 调用优先级队列
-    #[allow(dead_code)] // 未来扩展用
-    ai_priority_queue: Vec<AiPriorityEntry>,
-    // v0.24: 自适应温度调整器
-    #[allow(dead_code)] // 未来扩展用
-    adaptive_temp: AdaptiveTemperature,
     // v0.24: 上下文窗口管理器
     context_window: ContextWindow,
-    // v0.24: 模型负载均衡器
-    #[allow(dead_code)] // 未来扩展用
-    load_balancer: LoadBalancer,
     // v0.24: 推测解码并行验证器
     speculative_verifier: SpeculativeVerifier,
     // v0.24: AI 调用缓存预热器
     #[allow(dead_code)] // 未来扩展用
     cache_warmer: CacheWarmer,
-    // v0.24: 重试策略
-    #[allow(dead_code)] // 未来扩展用
-    retry_policy: RetryPolicy,
     /// v2 AST arena — 在 interpret 期间存储，供 call_value 执行 v2 闭包
-    v2_arena: Option<crate::ast_v2::AstArena>,
+    /// v0.35 (P0-A5): wrapped in Arc so per-call `.clone()` is cheap
+    /// (Arc bump) instead of deep-cloning the whole arena tree.
+    v2_arena: Option<std::sync::Arc<crate::ast_v2::AstArena>>,
     /// v0.25: 会话记忆存储
     memory_store: HashMap<String, Value>,
     /// v0.34: 事件总线 (来自 src/event/, Puter EventClient 风格)
@@ -204,9 +183,6 @@ pub struct Interpreter {
     /// v0.34: mock registry (OpenFugu + OpenInfer mock)
     mock_registry: crate::mock::MockRegistry,
 }
-
-/// v0.24: AI 调用优先级队列条目类型
-type AiPriorityEntry = (u32, String, Vec<(String, String)>);
 
 /// v0.06: with 块字段 (不经过 env 变量)
 #[derive(Clone, Debug, Default)]
@@ -238,7 +214,6 @@ impl Clone for Interpreter {
             token_budget: self.token_budget.clone(),
             token_usage: self.token_usage.clone(),
             trace: self.trace.clone(),
-            route_registry: self.route_registry.clone(),
             current_ai_config: self.current_ai_config.clone(),
             trait_registry: self.trait_registry.clone(),
             impl_table: self.impl_table.clone(),
@@ -247,24 +222,21 @@ impl Clone for Interpreter {
             worker_receivers: HashMap::new(),
             ai_cache: HashMap::new(),        // 不克隆缓存
             string_interner: HashMap::new(), // 不克隆驻留池
-            method_cache: HashMap::new(),    // 不克隆缓存
-            ai_batch_queue: Vec::new(),
             draft_model_stats: HashMap::new(),
-            cache_warm_queue: Vec::new(),
-            ai_priority_queue: Vec::new(),
-            adaptive_temp: AdaptiveTemperature::default(),
             context_window: ContextWindow::default(),
-            load_balancer: LoadBalancer::default(),
             speculative_verifier: SpeculativeVerifier::default(),
             cache_warmer: CacheWarmer::default(),
-            retry_policy: RetryPolicy::default(), // 不克隆队列
             v2_arena: None,
             memory_store: HashMap::new(),
-            bus: crate::event::EventBus::new(),
-            sandbox: crate::sandbox::SandboxPolicy::permissive(),
-            scheduler: crate::schedule::Scheduler::new(),
-            ccr_store: crate::ccr::InMemoryCcrStore::new(),
-            mock_registry: crate::mock::MockRegistry::new(),
+            // v0.35 (P0-A1): share 5 v0.34 singletons via Arc-backed Clone
+            // instead of fresh-constructing them. Previously, Clone reset
+            // counter state (Scheduler, CcrStore) and lost event handlers
+            // (Bus, MockRegistry), breaking identity across HTTP/MCP workers.
+            bus: self.bus.clone(),
+            sandbox: self.sandbox.clone(),
+            scheduler: self.scheduler.clone(),
+            ccr_store: self.ccr_store.clone(),
+            mock_registry: self.mock_registry.clone(),
         }
     }
 }
@@ -381,7 +353,7 @@ impl Interpreter {
         );
         globals
             .lock()
-            .unwrap()
+            .expect("globals mutex poisoned")
             .define("len".to_string(), Value::Builtin("len".to_string()), false);
         // v0.25: 注册 builtin 模块对象 (v0.27: 加入 document)
         for name in &["ai", "web", "json", "file", "memory", "agent", "document"] {
@@ -451,7 +423,6 @@ impl Interpreter {
             token_budget: None,
             token_usage: TokenUsage::default(),
             trace: TraceCollector::new(false),
-            route_registry: HashMap::new(),
             current_ai_config: None,
             trait_registry: HashMap::new(),
             impl_table: HashMap::new(),
@@ -460,17 +431,10 @@ impl Interpreter {
             worker_receivers: HashMap::new(),
             ai_cache: HashMap::new(),
             string_interner: HashMap::new(),
-            method_cache: HashMap::new(),
-            ai_batch_queue: Vec::new(),
             draft_model_stats: HashMap::new(),
-            cache_warm_queue: Vec::new(),
-            ai_priority_queue: Vec::new(),
-            adaptive_temp: AdaptiveTemperature::default(),
             context_window: ContextWindow::default(),
-            load_balancer: LoadBalancer::default(),
             speculative_verifier: SpeculativeVerifier::default(),
             cache_warmer: CacheWarmer::default(),
-            retry_policy: RetryPolicy::default(),
             v2_arena: None,
             memory_store: HashMap::new(),
             bus: crate::event::EventBus::new(),
@@ -493,7 +457,6 @@ impl Interpreter {
             token_budget: None,
             token_usage: TokenUsage::default(),
             trace: TraceCollector::new(false),
-            route_registry: HashMap::new(),
             current_ai_config: None,
             trait_registry: HashMap::new(),
             impl_table: HashMap::new(),
@@ -502,17 +465,10 @@ impl Interpreter {
             worker_receivers: HashMap::new(),
             ai_cache: HashMap::new(),
             string_interner: HashMap::new(),
-            method_cache: HashMap::new(),
-            ai_batch_queue: Vec::new(),
             draft_model_stats: HashMap::new(),
-            cache_warm_queue: Vec::new(),
-            ai_priority_queue: Vec::new(),
-            adaptive_temp: AdaptiveTemperature::default(),
             context_window: ContextWindow::default(),
-            load_balancer: LoadBalancer::default(),
             speculative_verifier: SpeculativeVerifier::default(),
             cache_warmer: CacheWarmer::default(),
-            retry_policy: RetryPolicy::default(),
             v2_arena: None,
             memory_store: HashMap::new(),
             bus: crate::event::EventBus::new(),
@@ -533,7 +489,6 @@ impl Interpreter {
             token_budget: None,
             token_usage: TokenUsage::default(),
             trace: TraceCollector::new(false),
-            route_registry: HashMap::new(),
             current_ai_config: None,
             trait_registry: HashMap::new(),
             impl_table: HashMap::new(),
@@ -542,17 +497,10 @@ impl Interpreter {
             worker_receivers: HashMap::new(),
             ai_cache: HashMap::new(),
             string_interner: HashMap::new(),
-            method_cache: HashMap::new(),
-            ai_batch_queue: Vec::new(),
             draft_model_stats: HashMap::new(),
-            cache_warm_queue: Vec::new(),
-            ai_priority_queue: Vec::new(),
-            adaptive_temp: AdaptiveTemperature::default(),
             context_window: ContextWindow::default(),
-            load_balancer: LoadBalancer::default(),
             speculative_verifier: SpeculativeVerifier::default(),
             cache_warmer: CacheWarmer::default(),
-            retry_policy: RetryPolicy::default(),
             v2_arena: None,
             memory_store: HashMap::new(),
             bus: crate::event::EventBus::new(),
@@ -592,8 +540,8 @@ impl Interpreter {
         stmt_ids: &[crate::ast_v2::NodeId],
         arena: &crate::ast_v2::AstArena,
     ) -> Result<(), String> {
-        // 存储 arena 供 call_value 执行 v2 闭包
-        self.v2_arena = Some(arena.clone());
+        // 存储 arena 供 call_value 执行 v2 闭包 (v0.35 wrap in Arc)
+        self.v2_arena = Some(std::sync::Arc::new(arena.clone()));
         // 执行所有顶层语句
         for stmt_id in stmt_ids {
             if let Some(stmt) = arena.get_stmt(*stmt_id) {
@@ -672,6 +620,14 @@ impl Interpreter {
             }
             let (node_ids, arena) = parse_code(trimmed);
             if node_ids.is_empty() {
+                continue;
+            }
+            // v0.35 (P0-C1): REPL also type-checks (other entry points do).
+            let type_errs = crate::typeck::check_program(&node_ids, &arena);
+            if !type_errs.is_empty() {
+                for e in type_errs {
+                    eprintln!("type error: {}", e.message);
+                }
                 continue;
             }
             for stmt_id in &node_ids {

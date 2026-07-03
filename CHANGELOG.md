@@ -2,6 +2,97 @@
 
 All notable changes to Mora will be documented in this file.
 
+## [v0.35] - 2026-07-03 — Technical Debt Cleanup (20 P0s)
+
+Remediation of all 20 P0 findings from the v0.34 zero-trust audit.
+No new features; internal hardening across 4 dimensions:
+concurrency / high-stress / strong-typing / static-typing.
+
+### Concurrency (cluster A) — v0.32-0.33 module API hardening
+
+- **`Clone for Interpreter` shares singleton state** (`interpreter/mod.rs`)
+  EventBus / Scheduler / MockRegistry already Arc-backed (`#[derive(Clone)]`);
+  SandboxPolicy derives Clone; `InMemoryCcrStore` now has manual `Clone`
+  (AtomicU64 workaround — counter is preserved at clone time). Previously
+  Clone reset 5 v0.34 fields by fresh-construction, breaking counter identity
+  and losing event handlers across HTTP/MCP worker clones.
+
+- **`EventBus::emit` clone-and-drop** (`event/mod.rs`)
+  Snapshot matched handlers, drop the Mutex guard, then invoke.
+  Re-entrant `bus.emit` from a handler no longer deadlocks.
+
+- **`MockRegistry::call` clone-and-drop** (`mock/mod.rs`)
+  Same pattern. Native handler invocation no longer holds the registry lock.
+
+- **`ccr.put` hash widens 8 → 16 hex chars** (`ccr/mod.rs`)
+  AtomicU64 counter now produces `{:016x}`, avoiding silent overwrite at
+  n = 2^32. Test assertion updated to `hash.len() == 16`.
+
+- **`v2_arena` wrapped in `Arc<AstArena>`** (`interpreter/mod.rs`)
+  Per-call `.clone()` in v2 closure/task dispatch is now a cheap Arc bump
+  instead of deep-cloning the entire AST.
+
+### No-panic refactor residue (cluster B) — completing v0.31 invariant
+
+- **11× `.unwrap()` removed from `walk_expr` visitor** (`ast_v2.rs`)
+  Visitor previously panicked on dangling NodeId. Now skips silently,
+  relying on the existing `_ => visit_expr(arena, expr)` fallthrough.
+
+- **`Value::Router` / `Atom` Display infallible** (`value.rs`)
+  Poisoned mutex no longer crashes the REPL print loop.
+  2 new tests: `router_display_does_not_panic_on_empty_routes` and
+  `atom_display_does_not_panic_on_valid_value`.
+
+- **Bare `.unwrap()` → `.expect()` on globals mutex** (`interpreter/mod.rs`)
+  Symmetric with the 4 other `globals.lock().expect(...)` sites.
+
+- **Lexer rejects control chars in string literals** (`lexer.rs`)
+  NUL and 0x01-0x1f / 0x7f now emit `TokenType::Error` instead of silently
+  absorbing (which crashed POSIX / HTTP / file boundaries downstream).
+  `\t`, `\n`, `\r` stay legitimate for multi-line literals.
+
+### Static-type soundness (cluster C)
+
+- **REPL now type-checks** (`interpreter/mod.rs` `run_repl_with`)
+  Other entry points already did; the REPL was the gap.
+
+- **`Dict.get` return type widens `V` → `V | Nil`** (`typeck/mod.rs`)
+  Runtime may return `Nil` on missing key; typeck now agrees.
+
+- **`call_task_inner` / `call_value_inner` surface arity errors**
+  Previously silently `unwrap_or(Value::Nil)`-filled missing args.
+  Now errors with `"task/closure expects N args, got M"`.
+
+- **`route` statement reports clean runtime error** (`interpreter/execute.rs`)
+  `StmtKind::Route` was parsed + type-checked but never executed.
+  Now reports `"route statement 'X' is not executable in v0.35; use web
+  server endpoints instead"` instead of falling through to a generic
+  "Unsupported v2 statement" message.
+
+### Hot-path / structural (cluster D)
+
+- **8 dead `#[allow(dead_code)]` Interpreter fields removed**
+  `method_cache`, `ai_batch_queue`, `cache_warm_queue`, `ai_priority_queue`,
+  `adaptive_temp`, `load_balancer`, `retry_policy`, `route_registry`.
+  These were write-once-construct with 0 read sites.
+
+- **`_cache_key` dead alloc removed** (`interpreter/dispatch.rs`)
+  Format-on-every-method-dispatch inlined as a comment.
+
+- **`parse_json_list` / `parse_json_dict` O(n²) → O(n)** (`flow.rs`)
+  `&s[i..].trim_start()` per loop iter replaced with byte-index `skip_ws`.
+  No more slicing allocations; O(1) whitespace skip per step.
+
+### Total impact
+- 20 P0s fixed (out of 57 audit findings total)
+- 335 tests pass; 0 failures (+2 from commit B2)
+- 5 demos × unchanged pass count (compact_demo, compress_demo,
+  compress_smart_demo, mcp_server_demo, integration_v0_34)
+- ~210 LOC net + ~40 LOC new tests
+- 16 commits, single feature branch `v0.35-technical-debt`
+
+---
+
 ## [v0.34] - 2026-07-03
 
 ### Integrate 5 v0.30-0.33 Orphaned Modules as Builtins

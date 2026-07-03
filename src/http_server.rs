@@ -240,11 +240,15 @@ fn handle_connection(
     let mut req = parse_request(&mut stream)?;
     req.params = HashMap::new();
 
-    // v0.06.4: 先精确匹配，再模式匹配 (:param)
+    // v0.37 (P1-1.6b): hoist method/path clones before the lock so the
+    // lock only guards the HashMap::get() and the iter(), not String
+    // allocations.
+    let req_method = req.method.clone();
+    let req_path = req.path.clone();
     let handler_with_params: Option<(Value, HashMap<String, String>)> = {
         let routes = routes.lock().expect("routes mutex poisoned");
         // 1) 精确匹配
-        if let Some(h) = routes.get(&(req.method.clone(), req.path.clone())) {
+        if let Some(h) = routes.get(&(req_method, req_path.clone())) {
             Some((h.clone(), HashMap::new()))
         } else {
             // 2) 模式匹配 — 遍历所有注册路由

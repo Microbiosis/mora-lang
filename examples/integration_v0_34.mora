@@ -1,0 +1,39 @@
+-- ============================================================
+-- v0.34: 集成演示 — 5 个 v0.30-0.33 历史遗留 module 集成 builtin
+-- ============================================================
+-- 解决历史遗留问题: event/sandbox/schedule/ccr/mock 之前是
+-- "独立 module" 0 引用, v0.34 起变成可用 builtin.
+-- 运行: mora run examples/integration_v0_34.mora
+
+task main()
+    -- 1. bus.emit / bus.count (v0.32 EventBus, Puter-style wildcard)
+    bus.emit("integration.started", "v0.34 demo")
+    let n = bus.count()
+    print("bus patterns: " + n)
+
+    -- 2. sandbox.check_builtin / check_path (v0.33 SandboxPolicy)
+    let builtin_ok = sandbox.check_builtin("ai.chat")
+    let path_safe = sandbox.check_path("ok.txt")
+    let path_unsafe = sandbox.check_path("../escape.txt")
+    print("sandbox builtin_ok: " + builtin_ok)
+    print("sandbox path_safe: " + path_safe)
+    print("sandbox path_unsafe: " + path_unsafe)
+
+    -- 3. schedule.add / count (v0.33 Scheduler, MimiClaw cron)
+    let job_id = schedule.add("demo", "every", "tick", 60)
+    let job_count = schedule.count()
+    print("schedule job_id: " + job_id)
+    print("schedule job_count: " + job_count)
+
+    -- 4. ccr.put / get (v0.33 CcrStore, Headroom CCR)
+    let hash = ccr.put("hello from v0.34")
+    let restored = ccr.get(hash)
+    print("ccr hash: " + hash)
+    print("ccr restored: " + restored)
+
+    -- 5. mock.count / mock.names (v0.32 MockRegistry)
+    let mock_count = mock.count()
+    print("mock patterns: " + mock_count)
+
+    print("\nv0.34 integration: 5 modules / 5 builtins / 8 new tests")
+end

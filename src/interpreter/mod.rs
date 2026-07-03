@@ -193,6 +193,16 @@ pub struct Interpreter {
     v2_arena: Option<crate::ast_v2::AstArena>,
     /// v0.25: 会话记忆存储
     memory_store: HashMap<String, Value>,
+    /// v0.34: 事件总线 (来自 src/event/, Puter EventClient 风格)
+    bus: crate::event::EventBus,
+    /// v0.34: 沙箱策略 (来自 src/sandbox/, MimiClaw path validation)
+    sandbox: crate::sandbox::SandboxPolicy,
+    /// v0.34: scheduler (cron, MimiClaw style)
+    scheduler: crate::schedule::Scheduler,
+    /// v0.34: CCR (Compress-Cache-Retrieve, Headroom style)
+    ccr_store: crate::ccr::InMemoryCcrStore,
+    /// v0.34: mock registry (OpenFugu + OpenInfer mock)
+    mock_registry: crate::mock::MockRegistry,
 }
 
 /// v0.24: AI 调用优先级队列条目类型
@@ -250,6 +260,11 @@ impl Clone for Interpreter {
             retry_policy: RetryPolicy::default(), // 不克隆队列
             v2_arena: None,
             memory_store: HashMap::new(),
+            bus: crate::event::EventBus::new(),
+            sandbox: crate::sandbox::SandboxPolicy::permissive(),
+            scheduler: crate::schedule::Scheduler::new(),
+            ccr_store: crate::ccr::InMemoryCcrStore::new(),
+            mock_registry: crate::mock::MockRegistry::new(),
         }
     }
 }
@@ -398,6 +413,34 @@ impl Interpreter {
             Value::Builtin("crush_json".to_string()),
             false,
         );
+        // v0.34: 注册 event bus 顶层 builtin
+        globals
+            .lock()
+            .unwrap()
+            .define("bus".to_string(), Value::Builtin("bus".to_string()), false);
+        // v0.34: 注册 sandbox 顶层 builtin
+        globals.lock().unwrap().define(
+            "sandbox".to_string(),
+            Value::Builtin("sandbox".to_string()),
+            false,
+        );
+        // v0.34: 注册 schedule 顶层 builtin
+        globals.lock().unwrap().define(
+            "schedule".to_string(),
+            Value::Builtin("schedule".to_string()),
+            false,
+        );
+        // v0.34: 注册 ccr 顶层 builtin
+        globals
+            .lock()
+            .unwrap()
+            .define("ccr".to_string(), Value::Builtin("ccr".to_string()), false);
+        // v0.34: 注册 mock 顶层 builtin
+        globals.lock().unwrap().define(
+            "mock".to_string(),
+            Value::Builtin("mock".to_string()),
+            false,
+        );
         Self {
             globals: globals.clone(),
             environment: globals,
@@ -428,6 +471,11 @@ impl Interpreter {
             retry_policy: RetryPolicy::default(),
             v2_arena: None,
             memory_store: HashMap::new(),
+            bus: crate::event::EventBus::new(),
+            sandbox: crate::sandbox::SandboxPolicy::permissive(),
+            scheduler: crate::schedule::Scheduler::new(),
+            ccr_store: crate::ccr::InMemoryCcrStore::new(),
+            mock_registry: crate::mock::MockRegistry::new(),
         }
     }
 
@@ -465,6 +513,11 @@ impl Interpreter {
             retry_policy: RetryPolicy::default(),
             v2_arena: None,
             memory_store: HashMap::new(),
+            bus: crate::event::EventBus::new(),
+            sandbox: crate::sandbox::SandboxPolicy::permissive(),
+            scheduler: crate::schedule::Scheduler::new(),
+            ccr_store: crate::ccr::InMemoryCcrStore::new(),
+            mock_registry: crate::mock::MockRegistry::new(),
         }
     }
 
@@ -500,6 +553,11 @@ impl Interpreter {
             retry_policy: RetryPolicy::default(),
             v2_arena: None,
             memory_store: HashMap::new(),
+            bus: crate::event::EventBus::new(),
+            sandbox: crate::sandbox::SandboxPolicy::permissive(),
+            scheduler: crate::schedule::Scheduler::new(),
+            ccr_store: crate::ccr::InMemoryCcrStore::new(),
+            mock_registry: crate::mock::MockRegistry::new(),
         }
     }
 
@@ -3048,6 +3106,115 @@ let result = compact("text")
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(err.contains("crush_json:"));
+    }
+}
+
+// ===================================================================
+// v0.34: event bus builtin e2e 测试
+// ===================================================================
+#[cfg(test)]
+mod bus_tests {
+    use super::*;
+    use crate::lexer::Lexer;
+    use crate::parser_v2::ParserV2;
+
+    fn run(src: &str) -> Result<(), String> {
+        let tokens = Lexer::new(src).scan_tokens();
+        let mut parser_v2 = ParserV2::new(tokens);
+        let node_ids = parser_v2.parse();
+        let arena = parser_v2.into_arena();
+        let mut interp = Interpreter::new();
+        interp.interpret(&node_ids, &arena)
+    }
+
+    /// T20: bus.emit + bus.count 集成
+    #[test]
+    fn test_bus_emit_and_count() {
+        let src = r#"
+            bus.emit("test.event", "hello")
+            bus.emit("test.event2", 42)
+            let c = bus.count()
+            print(c)
+        "#;
+        run(src).expect("bus.emit + bus.count should run without error");
+    }
+
+    /// T21: bus.off 取消注册
+    #[test]
+    fn test_bus_off() {
+        let src = r#"
+            bus.off("unused.pattern.*")
+            print(bus.count())
+        "#;
+        run(src).expect("bus.off should run without error");
+    }
+
+    /// T22: bus.emit 缺参数报错
+    #[test]
+    fn test_bus_emit_missing_arg() {
+        let src = r#"
+            bus.emit()
+        "#;
+        assert!(run(src).is_err());
+    }
+
+    /// T23: bus 未知 method 报错
+    #[test]
+    fn test_bus_unknown_method() {
+        let src = r#"
+            bus.unknown_method()
+        "#;
+        let result = run(src);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.contains("bus.") && err.contains("unknown"));
+    }
+
+    /// T24: sandbox builtin (integrate src/sandbox/)
+    #[test]
+    fn test_sandbox_builtin_basic() {
+        let src = r#"
+            let m = sandbox.mode()
+            let ok = sandbox.check_builtin("ai.chat")
+            let bad = sandbox.check_path("../escape.txt")
+            print(m, ok, bad)
+        "#;
+        run(src).expect("sandbox builtin should work");
+    }
+
+    /// T25: schedule builtin (integrate src/schedule/, MimiClaw cron)
+    #[test]
+    fn test_schedule_builtin_basic() {
+        let src = r#"
+            let id = schedule.add("test", "every", "tick me", 60)
+            let n = schedule.count()
+            print(id, n)
+        "#;
+        run(src).expect("schedule.add should work");
+    }
+
+    /// T26: ccr builtin (integrate src/ccr/, Headroom style)
+    #[test]
+    fn test_ccr_builtin_basic() {
+        let src = r#"
+            let hash = ccr.put("hello world")
+            let data = ccr.get(hash)
+            print(hash, data)
+        "#;
+        run(src).expect("ccr.put + ccr.get roundtrip");
+    }
+
+    /// T27: mock builtin (integrate src/mock/, OpenFugu + OpenInfer mock)
+    /// Note: mock.register requires a closure handler (Rust API only);
+    /// the builtin is a stub. We test only count + names.
+    #[test]
+    fn test_mock_builtin_basic() {
+        let src = r#"
+            let n = mock.count()
+            let ns = mock.names()
+            print(n, ns)
+        "#;
+        run(src).expect("mock.count + mock.names should work");
     }
 
     #[test]

@@ -6,6 +6,7 @@
 //! - get_embedding: 向量嵌入 (mock)
 
 use super::*;
+use crate::ccr::CcrStore;
 use crate::value::Value;
 
 impl Interpreter {
@@ -228,6 +229,220 @@ impl Interpreter {
                 Ok(Value::String(ext))
             }
             _ => Err(format!("file.{}: unknown method", method)),
+        }
+    }
+
+    /// v0.34: event bus.* — 事件总线 (Puter EventClient 风格 wildcard matching)
+    pub fn call_event_method(&self, method: &str, args: &[Value]) -> Result<Value, String> {
+        match method {
+            "emit" => {
+                // bus.emit(event, payload?) — 触发所有匹配 pattern 的 handlers
+                let event = args
+                    .first()
+                    .map(|v| v.to_string())
+                    .ok_or("bus.emit: requires event name as first arg")?;
+                let payload = args.get(1).cloned().unwrap_or(Value::Nil);
+                self.bus.emit(&event, &payload);
+                Ok(Value::Nil)
+            }
+            "off" => {
+                // bus.off(pattern) — 取消注册所有匹配 pattern 的 handlers
+                let pattern = args
+                    .first()
+                    .map(|v| v.to_string())
+                    .ok_or("bus.off: requires pattern as first arg")?;
+                self.bus.off(&pattern);
+                Ok(Value::Nil)
+            }
+            "count" => Ok(Value::Number(self.bus.pattern_count() as f64)),
+            _ => Err(format!("bus.{}: unknown method", method)),
+        }
+    }
+
+    /// v0.34: sandbox.* — path validation + builtin allow/deny (MimiClaw + AIOS)
+    pub fn call_sandbox_method(&self, method: &str, args: &[Value]) -> Result<Value, String> {
+        match method {
+            "mode" => {
+                let policy = &self.sandbox;
+                let mode = if policy.allow.iter().any(|p| p == "*") && policy.deny.is_empty() {
+                    "permissive"
+                } else if policy.allow.is_empty() {
+                    "strict"
+                } else {
+                    "custom"
+                };
+                Ok(Value::String(mode.to_string()))
+            }
+            "check_builtin" => {
+                let name = args
+                    .first()
+                    .map(|v| v.to_string())
+                    .ok_or("sandbox.check_builtin: requires builtin name as first arg")?;
+                Ok(Value::Bool(self.sandbox.check_builtin(&name).is_ok()))
+            }
+            "check_path" => {
+                let path = args
+                    .first()
+                    .map(|v| v.to_string())
+                    .ok_or("sandbox.check_path: requires path as first arg")?;
+                Ok(Value::Bool(self.sandbox.check_path(&path).is_ok()))
+            }
+            _ => Err(format!("sandbox.{}: unknown method", method)),
+        }
+    }
+
+    /// v0.34: schedule.* — cron scheduler (MimiClaw style)
+    pub fn call_schedule_method(&self, method: &str, args: &[Value]) -> Result<Value, String> {
+        match method {
+            "add" => {
+                let name = args
+                    .first()
+                    .map(|v| v.to_string())
+                    .ok_or("schedule.add: requires name")?;
+                let kind_str = args
+                    .get(1)
+                    .map(|v| v.to_string())
+                    .ok_or("schedule.add: requires kind ('every' or 'at')")?;
+                let kind = match kind_str.as_str() {
+                    "every" => crate::schedule::JobKind::Every,
+                    "at" => crate::schedule::JobKind::At,
+                    _ => {
+                        return Err(format!(
+                            "schedule.add: kind must be 'every' or 'at', got '{}'",
+                            kind_str
+                        ));
+                    }
+                };
+                let message = args
+                    .get(2)
+                    .map(|v| v.to_string())
+                    .ok_or("schedule.add: requires message")?;
+                let interval_s = if let Some(Value::Number(n)) = args.get(3) {
+                    *n as u64
+                } else {
+                    0
+                };
+                let at_epoch = if let Some(Value::Number(n)) = args.get(4) {
+                    *n as u64
+                } else {
+                    0
+                };
+                self.scheduler
+                    .add(&name, kind, &message, interval_s, at_epoch)
+                    .map(Value::String)
+            }
+            "list" => {
+                let jobs = self.scheduler.list();
+                let arr: Vec<Value> = jobs
+                    .into_iter()
+                    .map(|j| {
+                        let mut m = std::collections::HashMap::new();
+                        m.insert("id".to_string(), Value::String(j.id));
+                        m.insert("name".to_string(), Value::String(j.name));
+                        m.insert(
+                            "kind".to_string(),
+                            Value::String(match j.kind {
+                                crate::schedule::JobKind::Every => "every".to_string(),
+                                crate::schedule::JobKind::At => "at".to_string(),
+                            }),
+                        );
+                        m.insert("message".to_string(), Value::String(j.message));
+                        m.insert("interval_s".to_string(), Value::Number(j.interval_s as f64));
+                        m.insert("at_epoch".to_string(), Value::Number(j.at_epoch as f64));
+                        Value::Dict(m)
+                    })
+                    .collect();
+                Ok(Value::List(arr))
+            }
+            "remove" => {
+                let id = args
+                    .first()
+                    .map(|v| v.to_string())
+                    .ok_or("schedule.remove: requires id")?;
+                Ok(Value::Bool(self.scheduler.remove(&id)))
+            }
+            "tick" => {
+                let messages = self.scheduler.tick(crate::schedule::Scheduler::now());
+                Ok(Value::List(
+                    messages.into_iter().map(Value::String).collect(),
+                ))
+            }
+            "count" => Ok(Value::Number(self.scheduler.count() as f64)),
+            _ => Err(format!("schedule.{}: unknown method", method)),
+        }
+    }
+
+    /// v0.34: ccr.* — Compress-Cache-Retrieve (Headroom style)
+    pub fn call_ccr_method(&self, method: &str, args: &[Value]) -> Result<Value, String> {
+        match method {
+            "put" => {
+                let data = args
+                    .first()
+                    .map(|v| v.to_string())
+                    .ok_or("ccr.put: requires data as first arg")?;
+                let hash = self.ccr_store.put(&data);
+                Ok(Value::String(hash))
+            }
+            "get" => {
+                let hash = args
+                    .first()
+                    .map(|v| v.to_string())
+                    .ok_or("ccr.get: requires hash as first arg")?;
+                match self.ccr_store.get(&hash) {
+                    Some(entry) => Ok(Value::String(entry.data)),
+                    None => Ok(Value::Nil),
+                }
+            }
+            "len" => Ok(Value::Number(self.ccr_store.len() as f64)),
+            "marker" => {
+                let hash = args
+                    .first()
+                    .map(|v| v.to_string())
+                    .ok_or("ccr.marker: requires hash as first arg")?;
+                let size = if let Some(Value::Number(n)) = args.get(1) {
+                    *n as usize
+                } else {
+                    0
+                };
+                Ok(Value::String(crate::ccr::make_marker(&hash, size)))
+            }
+            "extract" => {
+                let marker = args
+                    .first()
+                    .map(|v| v.to_string())
+                    .ok_or("ccr.extract: requires marker as first arg")?;
+                match crate::ccr::extract_hash(&marker) {
+                    Some(hash) => Ok(Value::String(hash.to_string())),
+                    None => Err(format!("ccr.extract: not a valid CCR marker: '{}'", marker)),
+                }
+            }
+            _ => Err(format!("ccr.{}: unknown method", method)),
+        }
+    }
+
+    /// v0.34: mock.* — mock registry (OpenFugu + OpenInfer mock)
+    pub fn call_mock_method(&self, method: &str, args: &[Value]) -> Result<Value, String> {
+        match method {
+            "register" => {
+                let name = args
+                    .first()
+                    .map(|v| v.to_string())
+                    .ok_or("mock.register: requires name")?;
+                Ok(Value::String(format!("mock.{} registered", name)))
+            }
+            "unregister" => {
+                let name = args
+                    .first()
+                    .map(|v| v.to_string())
+                    .ok_or("mock.unregister: requires name")?;
+                Ok(Value::String(format!("mock.{} unregistered", name)))
+            }
+            "count" => Ok(Value::Number(self.mock_registry.count() as f64)),
+            "names" => {
+                let names = self.mock_registry.names();
+                Ok(Value::List(names.into_iter().map(Value::String).collect()))
+            }
+            _ => Err(format!("mock.{}: unknown method", method)),
         }
     }
 

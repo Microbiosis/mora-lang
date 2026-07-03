@@ -56,8 +56,10 @@ impl InMemoryCcrStore {
 impl CcrStore for InMemoryCcrStore {
     fn put(&self, data: &str) -> String {
         let n = self.counter.fetch_add(1, Ordering::SeqCst) + 1;
-        // 8-char hex from counter
-        let hash = format!("{:08x}", n);
+        // v0.35 (P0-A4): widen to 16 hex chars so the counter can exceed
+        // 2^32 (4_294_967_296) before hash collisions set in. The visible
+        // hash string is now always 16 chars from AtomicU64.
+        let hash = format!("{:016x}", n);
         let entry = CcrEntry {
             hash: hash.clone(),
             size: data.len(),
@@ -107,7 +109,8 @@ mod tests {
     fn put_and_get() {
         let store = InMemoryCcrStore::new();
         let hash = store.put("hello world");
-        assert_eq!(hash.len(), 8);
+        // v0.35 (P0-A4): hash widened to 16 hex chars.
+        assert_eq!(hash.len(), 16);
         let entry = store.get(&hash).unwrap();
         assert_eq!(entry.data, "hello world");
         assert_eq!(entry.size, 11);

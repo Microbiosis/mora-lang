@@ -2,6 +2,93 @@
 
 All notable changes to Mora will be documented in this file.
 
+## [v0.36] - 2026-07-03 — Type Completeness + Permanent Debt Resolution
+
+Round 2 of zero-trust audit cleanup. 14 commits resolving 11 P1 + 1 P2
+items the audit deferred, plus 1 audit-discovered **CI pre-existing bug**.
+P1-2.8 (Env pool) and Permanent #2 (full numeric tower) deferred to v0.37.
+
+### Permanent debt resolution (3 items the v0.34 audit claimed unsolvable)
+
+- **crossbeam-channel migration** — `std::sync::mpsc` → `crossbeam-channel`
+  for `worker_channels` / `worker_receivers`. Sender/Receiver are now
+  `Send + Sync`, eliminating the long-standing "Interpreter: !Send"
+  constraint. Closes Permanent #1.
+
+- **8 new `Type` variants** — `Agent`, `TraitObject`, `Compose`, `Partial`,
+  `Atom`, `Macro`, `PromptSection`, `Document`. Previously these v0.17-
+  v0.27 Value kinds all fell back to `Type::Union(vec![])` (= "any"),
+  leaving them untyped. Closes Permanent #3.
+
+- **NaN/Inf rejection (P1-3.13)** — `Value::Number` Display no longer
+  prints garbage strings; renders `nan`/`inf`/`-inf` and keeps
+  IEEE PartialEq semantics. Closes **part** of Permanent #2 (display
+  layer). Full numeric tower (Int/Float variants, parser suffix) → v0.37.
+
+### High-stress hardening
+
+- `trait_registry` / `impl_table` / `tool_registry` wrapped in `Arc<HashMap>`
+  for cheap `Clone` (P1-2.10). Per-HTTP-worker 50+ KB deep-clone eliminated.
+- `Value::List` / `Dict` Display streams writes (no `Vec<String>::join`)
+  (P1-2.7).
+- `Value` Display adds depth limit (cycle guard) — recursive Value trees
+  no longer stack-overflow (P2-3.14).
+- `estimate_bytes` walks Value tree directly instead of full re-serialize
+  (P1-2.12).
+
+### Concurrency hardening
+
+- `Scheduler.next_id: Mutex<u32>` → `Arc<AtomicU64>` — no overflow (P1-1.8).
+- `SandboxPolicy.allow`/`deny` `Vec<String>` → `BTreeSet<String>` for O(log N)
+  checks (P1-3.10).
+- `http_server` startup routes listing snapshots under Mutex, prints after
+  drop — no lock-held-across-`eprintln!` (P1-1.6).
+
+### Static-type hardening
+
+- `check_impl_def_stmt` rejects `for_type` that doesn't name a known type
+  (P1-4.10) — closes the orphan-impl soundness hole.
+
+### Sandbox integration
+
+- All `file.*` methods now route through `sandbox.check_path` (P2-3.15).
+  Default permissive policy allows everything so existing scripts
+  unaffected; strict policy can now block file access via deny patterns.
+
+### Misc
+
+- `MockRegistry::call` marked `#[deprecated]` — use the wrapper
+  `call_mock_method` from `builtins.rs` (P1-1.9).
+
+### CI fix (pre-existing bug)
+
+- `ci.yml` integration job was referencing 5 example scripts that no
+  longer exist at `examples/*.mora` (they're in `examples/_legacy/`).
+  Job was passing via `|| true` but never actually running anything.
+  Updated to the 5 active demos that DO exist.
+
+### Deferred to v0.37
+
+- **P1-2.8 Env pool** — requires structural change to v2 closure
+  capture; bigger than v0.36 scope warrants.
+- **Permanent #2 full numeric tower** — `Value::Int(i64)`/`Float(f64)`
+  variants + `Literal::Int`/`Float` + parser suffix tokens. Affects 60+
+  Value::Number sites across the codebase.
+- **P1-4.7 `load` typed Union** + **P1-3.6 `Value::Builtin` enum migration** +
+  **P1-3.7/3.8/3.9/3.10 builtin boundaries**.
+- **P2 cluster** — string_interner eviction, ai_cache hash key,
+  parse_json UTF-8, print signature cleanup, typeck error spans
+  (line:0), Never/Unknown placeholder, with-block validation.
+
+### Total impact
+- 14 commits, single feature branch `v0.36-type-completeness`
+- ~300 LOC net + ~30 LOC tests
+- 337 tests pass; 0 failures
+- 5 demos × unchanged pass count
+- 1 new dep: crossbeam-channel 0.5
+
+---
+
 ## [v0.35] - 2026-07-03 — Technical Debt Cleanup (20 P0s)
 
 Remediation of all 20 P0 findings from the v0.34 zero-trust audit.

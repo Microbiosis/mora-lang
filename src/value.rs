@@ -182,7 +182,11 @@ impl std::fmt::Display for Value {
                 if n.is_nan() {
                     f.write_str("nan")
                 } else if n.is_infinite() {
-                    if *n > 0.0 { f.write_str("inf") } else { f.write_str("-inf") }
+                    if *n > 0.0 {
+                        f.write_str("inf")
+                    } else {
+                        f.write_str("-inf")
+                    }
                 } else {
                     write!(f, "{}", n)
                 }

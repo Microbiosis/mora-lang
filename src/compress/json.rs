@@ -950,7 +950,7 @@ fn crush_json_recursive(items: &[Value], target: usize, options: &CompressOption
 pub fn estimate_bytes(items: &[Value]) -> usize {
     // v0.36 (P1-2.12): use streaming byte estimator instead of
     // re-serializing each Value to a String just to call .len().
-    items.iter().map(|v| value_byte_size(v)).sum()
+    items.iter().map(value_byte_size).sum()
 }
 
 /// v0.36 (P1-2.12): streaming byte-size estimate. Walks the Value tree
@@ -970,7 +970,13 @@ fn value_byte_size(v: &Value) -> usize {
                 format!("{}", n).len()
             }
         }
-        Value::Bool(b) => if *b { 4 } else { 5 },
+        Value::Bool(b) => {
+            if *b {
+                4
+            } else {
+                5
+            }
+        }
         Value::Nil => 3, // "nil"
         Value::List(items) => {
             // "[a, b, c]" → 2 (braces) + sum + 2*(len-1) (", ")

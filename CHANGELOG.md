@@ -151,6 +151,16 @@ Step 2 of the v0.34 concurrency roadmap. 引入 tokio + reqwest 作为依赖，
 后续 Interpreter 字段切换的基座。本节不替换 Interpreter 现有 `Arc<Mutex<...>>`
 字段，只提供并行实现供将来切换。
 
+> **重要**: 本次 commit **没有**把 `Interpreter` 字段从
+> `Arc<Mutex<...>>` 切到 `ActorHandle<...>`。原因：所有 5 个
+> `call_*_method`（`call_event_method`/`call_schedule_method`/
+> `call_ccr_method`/`call_mock_method`/`call_ai_tokens_method`）被
+> `dispatch.rs` 同步调用，要把它们改成 `actor.ask(...).await`
+> 必须把整个解释器主路径（`execute` → `call_function` → `call_method`
+> → builtin dispatch）改成 async。这是一次大型改动，留到 v0.35 单独
+> 推进。本节只完成 actor 框架和 5 个领域 actor 的试点实现，并保留
+> 同步 API 向后兼容。
+
 - `Cargo.toml`:
   - 新增 `tokio = "1"` (rt-multi-thread, macros, sync, time, net, io-util, signal)。
   - 新增 `reqwest = "0.12"` (json, stream)；`ureq` 保留直到所有 AI/Web 客户端迁移完成。
@@ -175,6 +185,22 @@ Step 2 of the v0.34 concurrency roadmap. 引入 tokio + reqwest 作为依赖，
   `scheduler_actor_add_and_tick`, `ccr_actor_put_and_get`,
   `mock_registry_actor_register_and_call`, `trace_collector_actor_records`）。
 - 原有 5 个 domain 模块的同步 API 测试保持不变（向后兼容）。
+
+#### Next step (deferred to v0.35)
+
+- `Interpreter` 字段切换 `Arc<Mutex<...>>` → `ActorHandle<...>` 需要把
+  整个 builtin dispatch 树改成 async。试点已确认 5 个 actor 形态可工作，
+  切换前需要：
+
+  1. `call_function` / `call_method` / `call_value*` 全部 `async fn`
+  2. `execute_*` 系列 `async fn`，`evaluate_*` 同理
+  3. `interpret` 入口 `async fn` 并在 `#[tokio::main]` 中调用
+  4. `run_file` / `run_repl` 走 async 路径
+  5. 现有 330+ 测试要么用 `#[tokio::main]` 包，要么用 `tokio::runtime::Runtime` 新建
+
+- 阶段 3（`PressureControl` 接入 `real_ai_chat` 等）和阶段 4
+  （`ureq` → `reqwest`、HTTP/MCP/LSP 服务器 async）都依赖上面的 async 化，
+  因此也都延迟到 v0.35 同一 commit 系列。
 
 #### Verification
 

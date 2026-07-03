@@ -372,6 +372,19 @@ impl Interpreter {
         }
     }
 
+    /// v0.34: ai.tokens — expose TokenUsage counters (mini-swe-agent cost tracking pattern)
+    pub fn call_ai_tokens_method(&self, method: &str, _args: &[Value]) -> Result<Value, String> {
+        match method {
+            "input" => Ok(Value::Number(self.token_usage.input as f64)),
+            "output" => Ok(Value::Number(self.token_usage.output as f64)),
+            "total" => Ok(Value::Number(
+                (self.token_usage.input + self.token_usage.output) as f64,
+            )),
+            "calls" => Ok(Value::Number(self.token_usage.input as f64)),
+            _ => Err(format!("ai.tokens.{}: unknown method", method)),
+        }
+    }
+
     /// v0.34: ccr.* — Compress-Cache-Retrieve (Headroom style)
     pub fn call_ccr_method(&self, method: &str, args: &[Value]) -> Result<Value, String> {
         match method {

@@ -3217,6 +3217,19 @@ mod bus_tests {
         run(src).expect("mock.count + mock.names should work");
     }
 
+    /// T28: ai.tokens builtin (mini-swe-agent cost tracking pattern)
+    #[test]
+    fn test_ai_tokens_builtin() {
+        let src = r#"
+            let input = ai.tokens.input()
+            let output = ai.tokens.output()
+            let total = ai.tokens.total()
+            let calls = ai.tokens.calls()
+            print(input, output, total, calls)
+        "#;
+        run(src).expect("ai.tokens.* should work");
+    }
+
     #[test]
     fn test_v0_27_document_parse_still_works() {
         // T20: 不破坏 v0.27 document.parse 路径

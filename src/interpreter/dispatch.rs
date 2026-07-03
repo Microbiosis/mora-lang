@@ -760,6 +760,9 @@ impl Interpreter {
                 ("schedule", method) => self.call_schedule_method(method, &args),
                 ("ccr", method) => self.call_ccr_method(method, &args),
                 ("mock", method) => self.call_mock_method(method, &args),
+                // v0.34: ai.tokens — expose TokenUsage counters (mini-swe-agent cost tracking)
+                ("ai", "tokens") => Ok(Value::Builtin("ai.tokens".to_string())),
+                ("ai.tokens", method) => self.call_ai_tokens_method(method, &args),
                 ("agent", "create") => {
                     // agent.create("name", {tools: [...], model: "deep", max_steps: 10, system: "..."})
                     let name = match args.first() {

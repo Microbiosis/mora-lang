@@ -948,7 +948,57 @@ fn crush_json_recursive(items: &[Value], target: usize, options: &CompressOption
 }
 
 pub fn estimate_bytes(items: &[Value]) -> usize {
-    items.iter().map(|v| value_to_json(v).len()).sum()
+    // v0.36 (P1-2.12): use streaming byte estimator instead of
+    // re-serializing each Value to a String just to call .len().
+    items.iter().map(value_byte_size).sum()
+}
+
+/// v0.36 (P1-2.12): streaming byte-size estimate. Walks the Value tree
+/// recursively, counting UTF-8 bytes without materializing any String.
+fn value_byte_size(v: &Value) -> usize {
+    match v {
+        Value::String(s) => s.len(),
+        Value::Char(c) => c.len_utf8(),
+        Value::Number(n) => {
+            // f64 Display bytes: integer part + '.' + decimal or scientific.
+            // Cheap heuristic — full precision's unlikely to matter for sizing.
+            if n.is_nan() {
+                3
+            } else if n.is_infinite() {
+                3 + n.is_sign_negative() as usize
+            } else {
+                format!("{}", n).len()
+            }
+        }
+        Value::Bool(b) => {
+            if *b {
+                4
+            } else {
+                5
+            }
+        }
+        Value::Nil => 3, // "nil"
+        Value::List(items) => {
+            // "[a, b, c]" → 2 (braces) + sum + 2*(len-1) (", ")
+            let inner: usize = items.iter().map(value_byte_size).sum();
+            2 + inner + items.len().saturating_sub(1) * 2
+        }
+        Value::Dict(map) => {
+            // "{k: v, k: v}" → 2 + sum('k: v') + 2*(n-1)
+            let mut total = 2;
+            let mut count = 0;
+            for (k, vv) in map {
+                total += k.len() + 2 + value_byte_size(vv); // key + ": " + val
+                count += 1;
+            }
+            if count > 0 {
+                total += (count - 1) * 2;
+            }
+            total
+        }
+        // Other variants: rough tag size.
+        _ => 32,
+    }
 }
 
 // ──────────────────── v0.32: Lossless-First Recursive Walker ────────────────────

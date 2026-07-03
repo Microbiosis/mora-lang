@@ -50,8 +50,8 @@ pub struct Job {
 #[derive(Clone, Default)]
 pub struct Scheduler {
     jobs: Arc<Mutex<HashMap<String, Job>>>,
-    /// Counter for id generation
-    next_id: Arc<Mutex<u32>>,
+    /// v0.36 (P1-1.8): AtomicU64 — was Mutex<u32> which overflowed at 4B adds.
+    next_id: Arc<std::sync::atomic::AtomicU64>,
     /// Persistence file path (None = in-memory only)
     persist_path: Arc<Mutex<Option<PathBuf>>>,
 }
@@ -75,10 +75,13 @@ impl Scheduler {
     }
 
     /// 生成下一个 id (8-char hex from counter)
+    /// v0.36 (P1-1.8): AtomicU64 fetch_add — no lock, no u32 overflow.
     fn next_job_id(&self) -> String {
-        let mut counter = self.next_id.lock().expect("scheduler mutex poisoned");
-        *counter += 1;
-        format!("{:08x}", *counter)
+        let n = self
+            .next_id
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1;
+        format!("{:08x}", n)
     }
 
     /// 当前 unix epoch seconds

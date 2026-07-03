@@ -589,6 +589,17 @@ impl TypeChecker {
                 format!("impl: trait '{}' not defined", trait_name),
             ));
         }
+        // v0.36 (P1-4.10): reject orphan for_type — impl must target a
+        // declared type (builtin, type alias, struct, or enum).
+        if !crate::typeck::is_known_type(for_type) {
+            self.errors.push(TypeError::from_span(
+                &Span::default(),
+                format!(
+                    "impl: type '{}' not declared (must be a builtin, alias, struct, or enum)",
+                    for_type
+                ),
+            ));
+        }
         for m in methods {
             symbols.push_scope();
             for (pname, phint) in &m.params {

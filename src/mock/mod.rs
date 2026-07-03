@@ -68,12 +68,19 @@ impl MockRegistry {
         map.get(name).cloned()
     }
 
-    /// 调用 mock handler. 返回 None 如果未注册。
-    /// 注意：Script handler 需要 interpreter，因此这里只执行 Native handler。
+    /// 调用 mock handler (Native-only). 返回 None 如果未注册或 handler 是 Script。
+    /// 注意：Script handler 需要 interpreter，应当通过 wrapper
+    /// `call_mock_method` (builtins.rs) 来调用，**不要**直接调用本方法。
     ///
     /// v0.35 (P0-A3): clone-and-drop — drop the lock before invoking the
     /// handler so a Native handler that re-enters the registry on the
     /// same thread does NOT deadlock.
+    /// v0.36 (P1-1.9): `#[deprecated]` — use `call_mock_method` from builtins.rs
+    /// which handles BOTH Native AND Script handlers correctly.
+    #[deprecated(
+        since = "0.0.36",
+        note = "use the wrapper call_mock_method from builtins.rs (handles Script handlers too)"
+    )]
     pub fn call(&self, name: &str, args: &Value) -> Option<Value> {
         let handler = self
             .handlers
@@ -108,6 +115,10 @@ impl MockRegistry {
 
 #[cfg(test)]
 mod tests {
+    // v0.36 (P1-1.9): allow using deprecated `MockRegistry::call` from
+    // tests so removing it later is a separate concern.
+    #![allow(deprecated)]
+
     use super::*;
     use std::collections::HashMap;
 

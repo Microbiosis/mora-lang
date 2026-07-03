@@ -137,7 +137,13 @@ jobs:
 
       - name: Run example scripts
         run: |
-          for f in examples/container.mora examples/nested_generic.mora examples/observe_demo.mora examples/trait_demo.mora examples/trait_default_demo.mora; do
+          # v0.36: examples/* in repo root + select items from _legacy/ that
+          # still parse. Skip others.
+          for f in examples/integration_v0_34.mora \
+                   examples/compact_demo.mora \
+                   examples/compress_demo.mora \
+                   examples/compress_smart_demo.mora \
+                   examples/mcp_server_demo.mora; do
             echo "=== $f ==="
             ./target/release/mora "$f" || true
           done

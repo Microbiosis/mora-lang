@@ -1111,8 +1111,19 @@ impl Interpreter {
         let call_env = Arc::new(Mutex::new(Environment::with_parent(
             self.environment.clone(),
         )));
+        // v0.35 (P0-C4): surface arity errors instead of silently nil-filling.
+        if args.len() < params.len() {
+            return Err(format!(
+                "task expects {} args, got {}",
+                params.len(),
+                args.len()
+            ));
+        }
         for (i, param) in params.iter().enumerate() {
-            let value = args.get(i).cloned().unwrap_or(Value::Nil);
+            let value = args
+                .get(i)
+                .cloned()
+                .ok_or_else(|| format!("missing arg for parameter '{}'", param))?;
             call_env
                 .lock()
                 .map_err(|_| "env mutex poisoned".to_string())?
@@ -1177,9 +1188,19 @@ impl Interpreter {
                         let call_env = std::sync::Arc::new(std::sync::Mutex::new(
                             crate::value::Environment::with_parent(env.clone()),
                         ));
-                        // 绑定参数
+                        // 绑定参数 — v0.35 (P0-C4): arity check
+                        if args.len() < closure_params.len() {
+                            return Err(format!(
+                                "closure expects {} args, got {}",
+                                closure_params.len(),
+                                args.len()
+                            ));
+                        }
                         for (i, (pname, _)) in closure_params.iter().enumerate() {
-                            let val = args.get(i).cloned().unwrap_or(Value::Nil);
+                            let val = args
+                                .get(i)
+                                .cloned()
+                                .ok_or_else(|| format!("missing arg for parameter '{}'", pname))?;
                             call_env
                                 .lock()
                                 .map_err(|_| "env mutex poisoned".to_string())?

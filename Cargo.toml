@@ -1,6 +1,6 @@
 [package]
 name = "mora"
-version = "0.0.35"
+version = "0.0.36"
 # v0.x 升级 ureq 3.3.0 → edition 2024 (ureq 3.3.0 要求 edition 2024 + MSRV 1.85)
 edition = "2024"
 authors = ["Mora contributors"]

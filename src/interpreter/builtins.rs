@@ -434,13 +434,19 @@ impl Interpreter {
     }
 
     /// v0.34: mock.* — mock registry (OpenFugu + OpenInfer mock)
-    pub fn call_mock_method(&self, method: &str, args: &[Value]) -> Result<Value, String> {
+    pub fn call_mock_method(&mut self, method: &str, args: &[Value]) -> Result<Value, String> {
         match method {
             "register" => {
                 let name = args
                     .first()
                     .map(|v| v.to_string())
                     .ok_or("mock.register: requires name")?;
+                let handler = args
+                    .get(1)
+                    .cloned()
+                    .ok_or("mock.register: requires handler")?;
+                self.mock_registry
+                    .register(&name, crate::mock::MockHandler::Script(handler));
                 Ok(Value::String(format!("mock.{} registered", name)))
             }
             "unregister" => {
@@ -448,7 +454,22 @@ impl Interpreter {
                     .first()
                     .map(|v| v.to_string())
                     .ok_or("mock.unregister: requires name")?;
-                Ok(Value::String(format!("mock.{} unregistered", name)))
+                self.mock_registry.unregister(&name);
+                Ok(Value::Nil)
+            }
+            "call" => {
+                let name = args
+                    .first()
+                    .map(|v| v.to_string())
+                    .ok_or("mock.call: requires name")?;
+                let call_args = args.get(1).cloned().unwrap_or(Value::Nil);
+                match self.mock_registry.get(&name) {
+                    Some(crate::mock::MockHandler::Native(f)) => Ok(f(&call_args)),
+                    Some(crate::mock::MockHandler::Script(closure)) => {
+                        self.call_value(&closure, vec![call_args])
+                    }
+                    None => Ok(Value::Nil),
+                }
             }
             "count" => Ok(Value::Number(self.mock_registry.count() as f64)),
             "names" => {

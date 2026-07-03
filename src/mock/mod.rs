@@ -12,8 +12,23 @@ use std::sync::{Arc, Mutex};
 
 use crate::value::Value;
 
-/// Mock handler 签名: 输入 Mora Value (List/Dict), 输出 Mora Value
-pub type MockHandler = Arc<dyn Fn(&Value) -> Value + Send + Sync + 'static>;
+/// v0.34: Mock handler 可以是 Rust 原生闭包，也可以是 Mora 脚本闭包
+#[derive(Clone)]
+pub enum MockHandler {
+    /// Rust 原生 handler: 输入 Mora Value (List/Dict), 输出 Mora Value
+    Native(Arc<dyn Fn(&Value) -> Value + Send + Sync + 'static>),
+    /// Mora 脚本闭包 (Value::Closure), 需要 interpreter 执行
+    Script(Value),
+}
+
+impl std::fmt::Debug for MockHandler {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            MockHandler::Native(_) => f.debug_tuple("Native").finish(),
+            MockHandler::Script(v) => f.debug_tuple("Script").field(v).finish(),
+        }
+    }
+}
 
 /// v0.32: Mock registry
 #[derive(Clone, Default)]
@@ -47,10 +62,20 @@ impl MockRegistry {
         map.remove(name);
     }
 
-    /// 调用 mock handler. 返回 None 如果未注册
+    /// 取出 handler 的克隆，由调用方决定如何执行
+    pub fn get(&self, name: &str) -> Option<MockHandler> {
+        let map = self.handlers.lock().expect("mock registry mutex poisoned");
+        map.get(name).cloned()
+    }
+
+    /// 调用 mock handler. 返回 None 如果未注册。
+    /// 注意：Script handler 需要 interpreter，因此这里只执行 Native handler。
     pub fn call(&self, name: &str, args: &Value) -> Option<Value> {
         let map = self.handlers.lock().expect("mock registry mutex poisoned");
-        map.get(name).map(|h| h(args))
+        map.get(name).and_then(|h| match h {
+            MockHandler::Native(f) => Some(f(args)),
+            MockHandler::Script(_) => None,
+        })
     }
 
     /// 当前注册的 handler 数 (test helper)
@@ -86,11 +111,11 @@ mod tests {
     }
 
     #[test]
-    fn register_and_call() {
+    fn register_and_call_native() {
         let r = MockRegistry::new();
         r.register(
             "ai.chat",
-            Arc::new(|args| {
+            MockHandler::Native(Arc::new(|args| {
                 let prompt = if let Value::Dict(d) = args {
                     d.get("prompt").map(|v| v.to_string()).unwrap_or_default()
                 } else {
@@ -103,7 +128,7 @@ mod tests {
                 );
                 out.insert("model".to_string(), Value::String("mock".to_string()));
                 Value::Dict(out)
-            }),
+            })),
         );
         let args = make_dict(&[("prompt", "hello")]);
         let result = r.call("ai.chat", &args).unwrap();
@@ -116,6 +141,28 @@ mod tests {
     }
 
     #[test]
+    fn register_and_call_script() {
+        // Script handler 只能 get 出来，不能直接用 call() 执行（需要 interpreter）
+        let r = MockRegistry::new();
+        let closure = Value::Closure {
+            params: vec!["x".to_string()],
+            env: Arc::new(Mutex::new(crate::value::Environment::new())),
+            v2_node_id: None,
+        };
+        r.register("script.handler", MockHandler::Script(closure));
+        assert_eq!(r.count(), 1);
+        let names = r.names();
+        assert_eq!(names, vec!["script.handler"]);
+        if let Some(MockHandler::Script(_)) = r.get("script.handler") {
+            // ok
+        } else {
+            panic!("expected Script handler");
+        }
+        // call() 对 Script handler 返回 None
+        assert!(r.call("script.handler", &Value::Nil).is_none());
+    }
+
+    #[test]
     fn call_unregistered_returns_none() {
         let r = MockRegistry::new();
         assert!(r.call("nonexistent", &Value::Nil).is_none());
@@ -124,7 +171,10 @@ mod tests {
     #[test]
     fn unregister_removes() {
         let r = MockRegistry::new();
-        r.register("x", Arc::new(|_| Value::String("ok".into())));
+        r.register(
+            "x",
+            MockHandler::Native(Arc::new(|_| Value::String("ok".into()))),
+        );
         assert_eq!(r.count(), 1);
         r.unregister("x");
         assert_eq!(r.count(), 0);
@@ -134,9 +184,18 @@ mod tests {
     #[test]
     fn multiple_handlers() {
         let r = MockRegistry::new();
-        r.register("a", Arc::new(|_| Value::String("1".into())));
-        r.register("b", Arc::new(|_| Value::String("2".into())));
-        r.register("c", Arc::new(|_| Value::String("3".into())));
+        r.register(
+            "a",
+            MockHandler::Native(Arc::new(|_| Value::String("1".into()))),
+        );
+        r.register(
+            "b",
+            MockHandler::Native(Arc::new(|_| Value::String("2".into()))),
+        );
+        r.register(
+            "c",
+            MockHandler::Native(Arc::new(|_| Value::String("3".into()))),
+        );
         assert_eq!(r.count(), 3);
         let mut names = r.names();
         names.sort();

@@ -3205,16 +3205,24 @@ mod bus_tests {
     }
 
     /// T27: mock builtin (integrate src/mock/, OpenFugu + OpenInfer mock)
-    /// Note: mock.register requires a closure handler (Rust API only);
-    /// the builtin is a stub. We test only count + names.
     #[test]
     fn test_mock_builtin_basic() {
         let src = r#"
             let n = mock.count()
             let ns = mock.names()
             print(n, ns)
+
+            let handler = fn(x) return x * 2 end
+            mock.register("double", handler)
+            let doubled = mock.call("double", 21)
+            let n2 = mock.count()
+            print(doubled, n2)
+
+            mock.unregister("double")
+            let n3 = mock.count()
+            print(n3)
         "#;
-        run(src).expect("mock.count + mock.names should work");
+        run(src).expect("mock register/call/unregister should work");
     }
 
     /// T28: ai.tokens builtin (mini-swe-agent cost tracking pattern)

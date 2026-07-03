@@ -1084,7 +1084,14 @@ impl ParserV2 {
 
         self.consume(&TokenType::End, "Expected 'end'");
 
-        let given = given.expect("eval requires 'given:'");
+        let given = match given {
+            Some(g) => g,
+            None => {
+                eprintln!("Parse error: eval block requires a 'given:' clause");
+                crate::ast_v2::NodeId(0)
+            }
+        };
+
         let kind = StmtKind::Eval {
             name,
             given,

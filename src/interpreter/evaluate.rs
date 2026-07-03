@@ -16,7 +16,7 @@ impl Interpreter {
             ExprKind::Variable(name) => self
                 .environment
                 .lock()
-                .expect("environment mutex poisoned")
+                .map_err(|_| "environment mutex poisoned".to_string())?
                 .get(name)
                 .ok_or_else(|| format!("Undefined variable: {}", name)),
             ExprKind::Binary { left, op, right } => {
@@ -63,13 +63,26 @@ impl Interpreter {
             arg_vals.push(self.evaluate(*arg_id, arena)?);
         }
         // v2 路径: 先从环境查找（注意 environment 和 globals 可能是同一个 Arc，不能双锁）
-        let func_val = self.environment.lock().expect("env").get(callee);
+        let func_val = self
+            .environment
+            .lock()
+            .map_err(|_| "environment mutex poisoned".to_string())?
+            .get(callee);
         match func_val {
-            Some(Value::Closure {
-                v2_node_id: Some(_),
-                ..
-            }) => self.call_value_inner(&func_val.unwrap(), arg_vals, arena),
-            _ => self.call_function(callee, arg_vals, Span::default()),
+            Some(ref val) => {
+                if matches!(
+                    val,
+                    Value::Closure {
+                        v2_node_id: Some(_),
+                        ..
+                    }
+                ) {
+                    self.call_value_inner(val, arg_vals, arena)
+                } else {
+                    self.call_function(callee, arg_vals, Span::default())
+                }
+            }
+            None => self.call_function(callee, arg_vals, Span::default()),
         }
     }
 
@@ -99,7 +112,11 @@ impl Interpreter {
                 for arg_id in args {
                     arg_vals.push(self.evaluate(*arg_id, arena)?);
                 }
-                let func_val = self.environment.lock().expect("env").get(callee);
+                let func_val = self
+                    .environment
+                    .lock()
+                    .map_err(|_| "environment mutex poisoned".to_string())?
+                    .get(callee);
                 if let Some(func_val) = func_val {
                     self.call_value_inner(&func_val, arg_vals, arena)
                 } else {
@@ -107,13 +124,13 @@ impl Interpreter {
                 }
             }
             ExprKind::Variable(name) => {
-                let val = self.environment.lock().expect("env").get(name);
+                let val = self
+                    .environment
+                    .lock()
+                    .map_err(|_| "environment mutex poisoned".to_string())?
+                    .get(name);
                 match val {
-                    Some(Value::Closure {
-                        v2_node_id: Some(_),
-                        ..
-                    }) => self.call_value_inner(&val.unwrap(), vec![left_val], arena),
-                    Some(_) => self.call_value_inner(&val.unwrap(), vec![left_val], arena),
+                    Some(ref val) => self.call_value_inner(val, vec![left_val], arena),
                     None => self.call_method(left_val, name, vec![], Span::default()),
                 }
             }
@@ -252,7 +269,7 @@ impl Interpreter {
                 for (name, value) in bindings {
                     self.environment
                         .lock()
-                        .expect("env")
+                        .map_err(|_| "environment mutex poisoned".to_string())?
                         .define(name, value, false);
                 }
                 return self.evaluate(*result_id, arena);
@@ -377,9 +394,7 @@ impl Interpreter {
                 self.environment.clone(),
             )));
             for (name, value) in &bindings {
-                env.lock()
-                    .expect("env")
-                    .define(name.clone(), value.clone(), false);
+                env.lock().ok()?.define(name.clone(), value.clone(), false);
             }
             let previous = self.environment.clone();
             self.environment = env;

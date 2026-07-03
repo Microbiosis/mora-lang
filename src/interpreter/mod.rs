@@ -385,58 +385,60 @@ impl Interpreter {
             .define("len".to_string(), Value::Builtin("len".to_string()), false);
         // v0.25: 注册 builtin 模块对象 (v0.27: 加入 document)
         for name in &["ai", "web", "json", "file", "memory", "agent", "document"] {
-            globals.lock().unwrap().define(
+            globals.lock().expect("globals mutex poisoned").define(
                 name.to_string(),
                 Value::Builtin(name.to_string()),
                 false,
             );
         }
         // v0.26: 注册 compose_prompt / tail 内建函数 (供 prompt section 块式调用)
-        globals.lock().unwrap().define(
+        globals.lock().expect("globals mutex poisoned").define(
             "compose_prompt".to_string(),
             Value::Builtin("compose_prompt".to_string()),
             false,
         );
-        globals.lock().unwrap().define(
+        globals.lock().expect("globals mutex poisoned").define(
             "tail".to_string(),
             Value::Builtin("tail".to_string()),
             false,
         );
         // v0.29: 注册 compress / crush_json 顶层 builtin
-        globals.lock().unwrap().define(
+        globals.lock().expect("globals mutex poisoned").define(
             "compress".to_string(),
             Value::Builtin("compress".to_string()),
             false,
         );
-        globals.lock().unwrap().define(
+        globals.lock().expect("globals mutex poisoned").define(
             "crush_json".to_string(),
             Value::Builtin("crush_json".to_string()),
             false,
         );
         // v0.34: 注册 event bus 顶层 builtin
-        globals
-            .lock()
-            .unwrap()
-            .define("bus".to_string(), Value::Builtin("bus".to_string()), false);
+        globals.lock().expect("globals mutex poisoned").define(
+            "bus".to_string(),
+            Value::Builtin("bus".to_string()),
+            false,
+        );
         // v0.34: 注册 sandbox 顶层 builtin
-        globals.lock().unwrap().define(
+        globals.lock().expect("globals mutex poisoned").define(
             "sandbox".to_string(),
             Value::Builtin("sandbox".to_string()),
             false,
         );
         // v0.34: 注册 schedule 顶层 builtin
-        globals.lock().unwrap().define(
+        globals.lock().expect("globals mutex poisoned").define(
             "schedule".to_string(),
             Value::Builtin("schedule".to_string()),
             false,
         );
         // v0.34: 注册 ccr 顶层 builtin
-        globals
-            .lock()
-            .unwrap()
-            .define("ccr".to_string(), Value::Builtin("ccr".to_string()), false);
+        globals.lock().expect("globals mutex poisoned").define(
+            "ccr".to_string(),
+            Value::Builtin("ccr".to_string()),
+            false,
+        );
         // v0.34: 注册 mock 顶层 builtin
-        globals.lock().unwrap().define(
+        globals.lock().expect("globals mutex poisoned").define(
             "mock".to_string(),
             Value::Builtin("mock".to_string()),
             false,
@@ -611,7 +613,7 @@ impl Interpreter {
         let main_task = self
             .globals
             .lock()
-            .expect("globals mutex poisoned")
+            .map_err(|_| "globals mutex poisoned".to_string())?
             .get("main")
             .clone();
         if let Some(Value::Task { params, .. }) = main_task

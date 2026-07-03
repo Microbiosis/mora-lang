@@ -57,3 +57,19 @@ fn test_parse_legacy_demos_lex_only() {
         eprintln!("{}: lexed without panic", path);
     }
 }
+
+#[test]
+fn test_parse_eval_without_given_no_panic() {
+    // v0.34: eval 块缺少 given: 不应 panic，应 fallback 到 NodeId(0) 并继续 parse
+    let source = r#"eval "my_test"
+    end
+    "#;
+    let mut lexer = Lexer::new(source);
+    let tokens = lexer.scan_tokens();
+    let mut parser = ParserV2::new(tokens);
+    let stmts = parser.parse();
+    assert!(
+        !stmts.is_empty(),
+        "eval block without given: should parse without panic"
+    );
+}

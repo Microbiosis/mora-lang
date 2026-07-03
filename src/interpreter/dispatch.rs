@@ -118,9 +118,13 @@ impl Interpreter {
                 match &args[0] {
                     Value::Atom(arc) => {
                         let func = &args[1];
-                        let old = arc.lock().expect("atom mutex poisoned").clone();
+                        let old = arc
+                            .lock()
+                            .map_err(|_| "atom mutex poisoned".to_string())?
+                            .clone();
                         let new_val = self.call_value(func, vec![old])?;
-                        *arc.lock().expect("atom mutex poisoned") = new_val.clone();
+                        *arc.lock().map_err(|_| "atom mutex poisoned".to_string())? =
+                            new_val.clone();
                         Ok(new_val)
                     }
                     _ => Err("swap() first argument must be an atom".to_string()),
@@ -130,7 +134,10 @@ impl Interpreter {
             "deref" => {
                 let value = args.first().ok_or("deref() requires 1 argument")?;
                 match value {
-                    Value::Atom(arc) => Ok(arc.lock().expect("atom mutex poisoned").clone()),
+                    Value::Atom(arc) => Ok(arc
+                        .lock()
+                        .map_err(|_| "atom mutex poisoned".to_string())?
+                        .clone()),
                     _ => Err("deref() argument must be an atom".to_string()),
                 }
             }
@@ -322,7 +329,7 @@ impl Interpreter {
                             let looked_up = self
                                 .environment
                                 .lock()
-                                .expect("environment mutex poisoned")
+                                .map_err(|_| "environment mutex poisoned".to_string())?
                                 .get(&section_name);
                             match looked_up {
                                 Some(Value::PromptSection {
@@ -399,7 +406,7 @@ impl Interpreter {
                 let looked_up = self
                     .environment
                     .lock()
-                    .expect("environment mutex poisoned")
+                    .map_err(|_| "environment mutex poisoned".to_string())?
                     .get(name)
                     .clone();
                 if let Some(value) = looked_up {
@@ -414,7 +421,9 @@ impl Interpreter {
                             )));
                             for (i, param) in params.iter().enumerate() {
                                 let value = args.get(i).cloned().unwrap_or(Value::Nil);
-                                env.lock().expect("env").define(param.clone(), value, false);
+                                env.lock()
+                                    .map_err(|_| "env mutex poisoned".to_string())?
+                                    .define(param.clone(), value, false);
                             }
                             // Macro body 在 v2 模式下通过 arena 执行，此处简化返回 Nil
                             Ok(Value::Nil)
@@ -924,17 +933,17 @@ impl Interpreter {
                 match method {
                     "collect" => {
                         let mut result = String::new();
-                        if !*done.lock().expect("done mutex poisoned") {
+                        if !*done.lock().map_err(|_| "done mutex poisoned".to_string())? {
                             let mut guard = reader.lock();
                             loop {
                                 match Self::read_next_sse_token(&mut guard) {
                                     Ok(Some(token)) => result.push_str(&token),
                                     Ok(None) => {
-                                        *done.lock().expect("done mutex poisoned") = true;
+                                        *done.lock().map_err(|_| "done mutex poisoned".to_string())? = true;
                                         break;
                                     }
                                     Err(e) => {
-                                        *done.lock().expect("done mutex poisoned") = true;
+                                        *done.lock().map_err(|_| "done mutex poisoned".to_string())? = true;
                                         return Err(format!("ai.stream.collect: {}", e));
                                     }
                                 }
@@ -943,7 +952,7 @@ impl Interpreter {
                         Ok(Value::String(result))
                     }
                     "is_done" => {
-                        Ok(Value::Bool(*done.lock().expect("done mutex poisoned")))
+                        Ok(Value::Bool(*done.lock().map_err(|_| "done mutex poisoned".to_string())?))
                     }
                     _ => Err(format!("Stream has no method: {}", method)),
                 }
@@ -970,7 +979,7 @@ impl Interpreter {
             }
             // v0.06.3: Router 方法
             Value::Router { ref mut routes } => {
-                let mut r = routes.lock().expect("routes mutex poisoned");
+                let mut r = routes.lock().map_err(|_| "routes mutex poisoned".to_string())?;
                 match method {
                     "route" => {
                         let http_method = args.first().map(|v| v.to_string()).unwrap_or_default().to_uppercase();
@@ -1021,7 +1030,7 @@ impl Interpreter {
                                 handler,
                                 toolset: "custom".to_string(),
                             };
-                            tool_registry.lock().expect("tool_registry mutex poisoned").insert(name, mcp_tool);
+                            tool_registry.lock().map_err(|_| "tool_registry mutex poisoned".to_string())?.insert(name, mcp_tool);
                         }
                         let interp_arc: Arc<Mutex<Interpreter>> = Arc::new(Mutex::new(self.clone()));
                         crate::mcp_server::start(tool_registry, interp_arc, None)
@@ -1106,7 +1115,7 @@ impl Interpreter {
             let value = args.get(i).cloned().unwrap_or(Value::Nil);
             call_env
                 .lock()
-                .expect("env")
+                .map_err(|_| "env mutex poisoned".to_string())?
                 .define(param.clone(), value, false);
         }
         let prev_env = self.environment.clone();
@@ -1173,7 +1182,7 @@ impl Interpreter {
                             let val = args.get(i).cloned().unwrap_or(Value::Nil);
                             call_env
                                 .lock()
-                                .expect("env")
+                                .map_err(|_| "env mutex poisoned".to_string())?
                                 .define(pname.clone(), val, false);
                         }
                         let prev_env = self.environment.clone();

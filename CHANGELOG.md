@@ -114,11 +114,33 @@ change, no API rename.
 - `src/parser_v2/statements.rs`: finish v0.34 fix for
   `.expect("loop requires exactly one agent")` — return a valid `NodeId`
   via `arena.alloc_stmt` and include the new `with_config` field.
+- `src/parser_v2/statements.rs`: replace `.expect("eval requires 'given:'")`
+  with fallback to `NodeId(0)` + error log when `given:` is missing.
+- `src/lsp/server.rs`: remove redundant `id.expect("id should exist")`;
+  propagate `docs` and `shutdown` mutex poison via `io::Result`.
+- `src/interpreter/evaluate.rs`: convert `environment.lock().expect(...)` to
+  `?` and remove irrefutable `unwrap()` after `Some` matches.
+- `src/interpreter/execute.rs`: convert all `environment.lock().expect(...)`
+  to `?`.
+- `src/interpreter/dispatch.rs`: convert `atom`/`environment`/`done`/`routes`
+  /`tool_registry` mutex expects to `?`.
+- `src/interpreter/trait_dispatch.rs`: convert `environment.lock().expect(...)`
+  to `?`.
+- `src/interpreter/orchestrate.rs`: convert `environment.lock().expect(...)`
+  to `?` (including the nested closure in Graph edge evaluation).
+- `src/interpreter/mod.rs`: convert `globals.lock().expect(...)` in
+  `interpret()` to `?`; unify `new()` `.unwrap()` to
+  `.expect("globals mutex poisoned")`.
+
+#### Tests
+
+- `tests/parser_v2_integration.rs`: add `test_parse_eval_without_given_no_panic`.
+- `src/lsp/server.rs`: add `handle_notification_without_id_no_panic`.
 
 #### Verification
 
 - `cargo build --all-targets`: clean
-- `cargo test --all`: 330 passed, 2 ignored
+- `cargo test --all`: 331 passed, 2 ignored
 - `cargo clippy --all-targets --all-features -- -D warnings`: clean
 - `cargo fmt --check`: 0 diff
 

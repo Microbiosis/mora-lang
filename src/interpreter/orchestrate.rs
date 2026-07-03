@@ -20,7 +20,7 @@ impl Interpreter {
         let input = self
             .environment
             .lock()
-            .expect("env")
+            .map_err(|_| "env mutex poisoned".to_string())?
             .get(input_var)
             .map(|v| v.to_string())
             .unwrap_or_default();
@@ -31,11 +31,10 @@ impl Interpreter {
                 for agent in agents {
                     current = self.run_orchestrate_agent(agent, &current, arena)?;
                 }
-                self.environment.lock().expect("env").define(
-                    result_var.to_string(),
-                    Value::String(current),
-                    false,
-                );
+                self.environment
+                    .lock()
+                    .map_err(|_| "env mutex poisoned".to_string())?
+                    .define(result_var.to_string(), Value::String(current), false);
             }
             OrchestrateKind::Graph { agents, edges } => {
                 let mut current = input;
@@ -55,21 +54,23 @@ impl Interpreter {
                         }
                         match &e.condition {
                             Some(cond_id) => {
-                                self.environment.lock().expect("env").define(
-                                    "result".to_string(),
-                                    Value::String(current.clone()),
-                                    false,
-                                );
-                                self.environment.lock().expect("env").define(
-                                    "rounds".to_string(),
-                                    Value::Number(
-                                        *rounds_map
-                                            .get(&(e.from.clone(), e.to.clone()))
-                                            .unwrap_or(&0)
-                                            as f64,
-                                    ),
-                                    false,
-                                );
+                                if let Ok(mut env) = self.environment.lock() {
+                                    env.define(
+                                        "result".to_string(),
+                                        Value::String(current.clone()),
+                                        false,
+                                    );
+                                    env.define(
+                                        "rounds".to_string(),
+                                        Value::Number(
+                                            *rounds_map
+                                                .get(&(e.from.clone(), e.to.clone()))
+                                                .unwrap_or(&0)
+                                                as f64,
+                                        ),
+                                        false,
+                                    );
+                                }
                                 self.evaluate(*cond_id, arena)
                                     .map(|v| matches!(v, Value::Bool(true)))
                                     .unwrap_or(false)
@@ -100,11 +101,10 @@ impl Interpreter {
                     }
                 }
 
-                self.environment.lock().expect("env").define(
-                    result_var.to_string(),
-                    Value::String(current),
-                    false,
-                );
+                self.environment
+                    .lock()
+                    .map_err(|_| "env mutex poisoned".to_string())?
+                    .define(result_var.to_string(), Value::String(current), false);
             }
             OrchestrateKind::Loop {
                 agent,
@@ -116,11 +116,10 @@ impl Interpreter {
                     current = self.run_orchestrate_agent(agent, &current, arena)?;
 
                     if let Some(cond_id) = exit_when {
-                        self.environment.lock().expect("env").define(
-                            "result".to_string(),
-                            Value::String(current.clone()),
-                            false,
-                        );
+                        self.environment
+                            .lock()
+                            .map_err(|_| "env mutex poisoned".to_string())?
+                            .define("result".to_string(), Value::String(current.clone()), false);
                         let should_exit = self
                             .evaluate(*cond_id, arena)
                             .map(|v| matches!(v, Value::Bool(true)))
@@ -131,11 +130,10 @@ impl Interpreter {
                     }
                 }
 
-                self.environment.lock().expect("env").define(
-                    result_var.to_string(),
-                    Value::String(current),
-                    false,
-                );
+                self.environment
+                    .lock()
+                    .map_err(|_| "env mutex poisoned".to_string())?
+                    .define(result_var.to_string(), Value::String(current), false);
             }
         }
 
@@ -150,11 +148,10 @@ impl Interpreter {
         arena: &AstArena,
     ) -> Result<String, String> {
         // 绑定 input 变量
-        self.environment.lock().expect("env").define(
-            "input".to_string(),
-            Value::String(input.to_string()),
-            false,
-        );
+        self.environment
+            .lock()
+            .map_err(|_| "env mutex poisoned".to_string())?
+            .define("input".to_string(), Value::String(input.to_string()), false);
 
         // 应用 with 配置
         let prev_config = self.current_ai_config.clone();
@@ -190,11 +187,10 @@ impl Interpreter {
         // verify（如果有的话）
         if let Some(verify_id) = agent.verify_expr {
             for attempt in 0..3 {
-                self.environment.lock().expect("env").define(
-                    "result".to_string(),
-                    Value::String(output.clone()),
-                    false,
-                );
+                self.environment
+                    .lock()
+                    .map_err(|_| "env mutex poisoned".to_string())?
+                    .define("result".to_string(), Value::String(output.clone()), false);
                 let ok = self
                     .evaluate(verify_id, arena)
                     .map(|v| matches!(v, Value::Bool(true)))
@@ -208,11 +204,10 @@ impl Interpreter {
                         agent.name
                     ));
                 }
-                self.environment.lock().expect("env").define(
-                    "input".to_string(),
-                    Value::String(output.clone()),
-                    false,
-                );
+                self.environment
+                    .lock()
+                    .map_err(|_| "env mutex poisoned".to_string())?
+                    .define("input".to_string(), Value::String(output.clone()), false);
                 let retry = self.evaluate(agent.task_expr, arena)?;
                 output = retry.to_string();
             }

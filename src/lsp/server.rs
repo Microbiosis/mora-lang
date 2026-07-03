@@ -70,7 +70,11 @@ impl Server {
                 }
             };
             self.handle_message(msg)?;
-            if *self.shutdown.lock().expect("shutdown mutex poisoned") {
+            if *self
+                .shutdown
+                .lock()
+                .map_err(|_| io::Error::other("shutdown mutex poisoned"))?
+            {
                 break;
             }
         }
@@ -88,32 +92,38 @@ impl Server {
 
         // notification：没有 id 的消息
         if id.is_none() {
-            self.handle_notification(&method, params);
-            return Ok(());
+            return self.handle_notification(&method, params);
         }
 
         // request：必须回复（成功或错误）
-        let id = id.expect("id should exist");
-        match self.handle_request(&method, params) {
-            Ok(result) => self.send_response(id, Some(result), None)?,
-            Err(err_msg) => self.send_response(id, None, Some(err_msg))?,
+        if let Some(id) = id {
+            match self.handle_request(&method, params) {
+                Ok(result) => self.send_response(id, Some(result), None)?,
+                Err(err_msg) => self.send_response(id, None, Some(err_msg))?,
+            }
         }
         Ok(())
     }
 
-    fn handle_notification(&mut self, method: &str, params: Value) {
+    fn handle_notification(&mut self, method: &str, params: Value) -> io::Result<()> {
         match method {
             "initialized" => {
                 // 客户端握手完成标志；什么都不做
             }
             "exit" => {
-                *self.shutdown.lock().expect("shutdown mutex poisoned") = true;
+                *self
+                    .shutdown
+                    .lock()
+                    .map_err(|_| io::Error::other("shutdown mutex poisoned"))? = true;
             }
             "textDocument/didOpen" => {
                 if let Some(doc) = parse_doc_params(&params) {
                     let diags = self.check_diagnostics(&doc.text);
                     let uri = doc.uri.clone();
-                    let mut docs = self.docs.lock().expect("docs mutex poisoned");
+                    let mut docs = self
+                        .docs
+                        .lock()
+                        .map_err(|_| io::Error::other("docs mutex poisoned"))?;
                     docs.insert(
                         uri.clone(),
                         DocumentState {
@@ -128,7 +138,10 @@ impl Server {
             "textDocument/didChange" => {
                 if let Some((uri, version, text)) = parse_change_params(&params) {
                     let diags = self.check_diagnostics(&text);
-                    let mut docs = self.docs.lock().expect("docs mutex poisoned");
+                    let mut docs = self
+                        .docs
+                        .lock()
+                        .map_err(|_| io::Error::other("docs mutex poisoned"))?;
                     docs.insert(
                         uri.clone(),
                         DocumentState {
@@ -148,7 +161,10 @@ impl Server {
                     .and_then(|t| t.get("uri"))
                     .and_then(|u| u.as_str())
                 {
-                    self.docs.lock().expect("docs mutex poisoned").remove(uri);
+                    self.docs
+                        .lock()
+                        .map_err(|_| io::Error::other("docs mutex poisoned"))?
+                        .remove(uri);
                 }
             }
             "textDocument/didSave" => {
@@ -160,12 +176,15 @@ impl Server {
                     let text_opt = self
                         .docs
                         .lock()
-                        .expect("docs mutex poisoned")
+                        .map_err(|_| io::Error::other("docs mutex poisoned"))?
                         .get(uri)
                         .map(|d| d.text.clone());
                     if let Some(text) = text_opt {
                         let diags = self.check_diagnostics(&text);
-                        let mut docs = self.docs.lock().expect("docs mutex poisoned");
+                        let mut docs = self
+                            .docs
+                            .lock()
+                            .map_err(|_| io::Error::other("docs mutex poisoned"))?;
                         if let Some(d) = docs.get_mut(uri) {
                             d.diagnostics = diags.clone();
                         }
@@ -178,25 +197,29 @@ impl Server {
                 // 忽略未知 notification
             }
         }
+        Ok(())
     }
 
     fn handle_request(&mut self, method: &str, params: Value) -> Result<Value, String> {
         match method {
             "initialize" => Ok(self.handle_initialize(params)),
             "shutdown" => {
-                *self.shutdown.lock().expect("shutdown mutex poisoned") = true;
+                *self
+                    .shutdown
+                    .lock()
+                    .map_err(|_| "shutdown mutex poisoned".to_string())? = true;
                 Ok(Value::Null)
             }
             "textDocument/hover" => self.handle_hover(params),
-            "textDocument/completion" => Ok(self.handle_completion(params)),
-            "textDocument/definition" => Ok(self.handle_definition(params)),
-            "textDocument/references" => Ok(self.handle_references(params)),
-            "textDocument/documentSymbol" => Ok(self.handle_document_symbol(params)),
-            "textDocument/formatting" => Ok(self.handle_formatting(params, false)),
-            "textDocument/rangeFormatting" => Ok(self.handle_formatting(params, true)),
-            "textDocument/rename" => Ok(self.handle_rename(params)),
-            "textDocument/semanticTokens/full" => Ok(self.handle_semantic_tokens(params)),
-            "textDocument/foldingRange" => Ok(self.handle_folding_range(params)),
+            "textDocument/completion" => self.handle_completion(params),
+            "textDocument/definition" => self.handle_definition(params),
+            "textDocument/references" => self.handle_references(params),
+            "textDocument/documentSymbol" => self.handle_document_symbol(params),
+            "textDocument/formatting" => self.handle_formatting(params, false),
+            "textDocument/rangeFormatting" => self.handle_formatting(params, true),
+            "textDocument/rename" => self.handle_rename(params),
+            "textDocument/semanticTokens/full" => self.handle_semantic_tokens(params),
+            "textDocument/foldingRange" => self.handle_folding_range(params),
             _ => Err(format!("method not supported: {}", method)),
         }
     }
@@ -270,48 +293,75 @@ impl Server {
     // 各 LSP method 的占位实现 — 真正逻辑在 providers 模块
     // ---------------------------------------------------------------
     fn handle_hover(&self, params: Value) -> Result<Value, String> {
-        let docs = self.docs.lock().expect("docs mutex poisoned");
+        let docs = self
+            .docs
+            .lock()
+            .map_err(|_| "docs mutex poisoned".to_string())?;
         super::providers::hover_v2(&docs, &params)
     }
 
-    fn handle_completion(&self, params: Value) -> Value {
-        let docs = self.docs.lock().expect("docs mutex poisoned");
-        super::providers::completion_v2(&docs, &params)
+    fn handle_completion(&self, params: Value) -> Result<Value, String> {
+        let docs = self
+            .docs
+            .lock()
+            .map_err(|_| "docs mutex poisoned".to_string())?;
+        Ok(super::providers::completion_v2(&docs, &params))
     }
 
-    fn handle_definition(&self, params: Value) -> Value {
-        let docs = self.docs.lock().expect("docs mutex poisoned");
-        super::providers::definition_v2(&docs, &params)
+    fn handle_definition(&self, params: Value) -> Result<Value, String> {
+        let docs = self
+            .docs
+            .lock()
+            .map_err(|_| "docs mutex poisoned".to_string())?;
+        Ok(super::providers::definition_v2(&docs, &params))
     }
 
-    fn handle_references(&self, params: Value) -> Value {
-        let docs = self.docs.lock().expect("docs mutex poisoned");
-        super::providers::references_v2(&docs, &params)
+    fn handle_references(&self, params: Value) -> Result<Value, String> {
+        let docs = self
+            .docs
+            .lock()
+            .map_err(|_| "docs mutex poisoned".to_string())?;
+        Ok(super::providers::references_v2(&docs, &params))
     }
 
-    fn handle_document_symbol(&self, params: Value) -> Value {
-        let docs = self.docs.lock().expect("docs mutex poisoned");
-        super::providers::document_symbol_v2(&docs, &params)
+    fn handle_document_symbol(&self, params: Value) -> Result<Value, String> {
+        let docs = self
+            .docs
+            .lock()
+            .map_err(|_| "docs mutex poisoned".to_string())?;
+        Ok(super::providers::document_symbol_v2(&docs, &params))
     }
 
-    fn handle_formatting(&self, params: Value, range: bool) -> Value {
-        let docs = self.docs.lock().expect("docs mutex poisoned");
-        super::providers::formatting(&docs, &params, range)
+    fn handle_formatting(&self, params: Value, range: bool) -> Result<Value, String> {
+        let docs = self
+            .docs
+            .lock()
+            .map_err(|_| "docs mutex poisoned".to_string())?;
+        Ok(super::providers::formatting(&docs, &params, range))
     }
 
-    fn handle_rename(&self, params: Value) -> Value {
-        let docs = self.docs.lock().expect("docs mutex poisoned");
-        super::providers::rename_v2(&docs, &params)
+    fn handle_rename(&self, params: Value) -> Result<Value, String> {
+        let docs = self
+            .docs
+            .lock()
+            .map_err(|_| "docs mutex poisoned".to_string())?;
+        Ok(super::providers::rename_v2(&docs, &params))
     }
 
-    fn handle_semantic_tokens(&self, params: Value) -> Value {
-        let docs = self.docs.lock().expect("docs mutex poisoned");
-        super::providers::semantic_tokens(&docs, &params)
+    fn handle_semantic_tokens(&self, params: Value) -> Result<Value, String> {
+        let docs = self
+            .docs
+            .lock()
+            .map_err(|_| "docs mutex poisoned".to_string())?;
+        Ok(super::providers::semantic_tokens(&docs, &params))
     }
 
-    fn handle_folding_range(&self, params: Value) -> Value {
-        let docs = self.docs.lock().expect("docs mutex poisoned");
-        super::providers::folding_range_v2(&docs, &params)
+    fn handle_folding_range(&self, params: Value) -> Result<Value, String> {
+        let docs = self
+            .docs
+            .lock()
+            .map_err(|_| "docs mutex poisoned".to_string())?;
+        Ok(super::providers::folding_range_v2(&docs, &params))
     }
 
     // ---------------------------------------------------------------
@@ -469,4 +519,25 @@ pub fn parse_change_params(params: &Value) -> Option<(String, i64, String)> {
     let last = changes.last()?;
     let text = last.get("text")?.as_str()?.to_string();
     Some((uri, version, text))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn handle_notification_without_id_no_panic() {
+        // v0.34: 没有 id 的 JSON-RPC notification 不应 panic
+        let mut server = Server::new();
+        let msg = Value::Object({
+            let mut m = std::collections::BTreeMap::new();
+            m.insert(
+                "method".to_string(),
+                Value::String_("initialized".to_string()),
+            );
+            m
+        });
+        // 不应 panic
+        server.handle_message(msg).unwrap();
+    }
 }

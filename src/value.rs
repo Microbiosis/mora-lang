@@ -177,7 +177,16 @@ impl std::fmt::Display for Value {
         match self {
             Value::String(s) => write!(f, "{}", s),
             Value::Char(c) => write!(f, "{}", c),
-            Value::Number(n) => write!(f, "{}", n),
+            Value::Number(n) => {
+                // v0.36 (P1-3.13): never panic on NaN/Inf — Display must be infallible.
+                if n.is_nan() {
+                    f.write_str("nan")
+                } else if n.is_infinite() {
+                    if *n > 0.0 { f.write_str("inf") } else { f.write_str("-inf") }
+                } else {
+                    write!(f, "{}", n)
+                }
+            }
             Value::Bool(b) => write!(f, "{}", b),
             Value::Nil => write!(f, "nil"),
             Value::List(items) => {
@@ -485,5 +494,34 @@ mod tests {
         let s = format!("{}", v);
         assert!(s.contains("atom"), "got: {}", s);
         assert!(s.contains("42"), "got: {}", s);
+    }
+
+    /// v0.36 (P1-3.13): Number Display should render NaN/Inf without panicking.
+    #[test]
+    fn number_display_handles_nan() {
+        let v = Value::Number(f64::NAN);
+        let s = format!("{}", v);
+        assert_eq!(s, "nan");
+    }
+
+    #[test]
+    fn number_display_handles_pos_inf() {
+        let v = Value::Number(f64::INFINITY);
+        let s = format!("{}", v);
+        assert_eq!(s, "inf");
+    }
+
+    #[test]
+    fn number_display_handles_neg_inf() {
+        let v = Value::Number(f64::NEG_INFINITY);
+        let s = format!("{}", v);
+        assert_eq!(s, "-inf");
+    }
+
+    #[test]
+    fn number_display_normal_value() {
+        let v = Value::Number(42.5);
+        let s = format!("{}", v);
+        assert_eq!(s, "42.5");
     }
 }

@@ -212,11 +212,9 @@ impl std::fmt::Display for Value {
                 )
             }
             Value::Router { routes } => {
-                write!(
-                    f,
-                    "<router ({} routes)>",
-                    routes.lock().expect("Router routes mutex poisoned").len()
-                )
+                // v0.35: Display must be infallible; poisoned mutex used to panic.
+                let route_count = routes.lock().map(|m| m.len()).unwrap_or(0);
+                write!(f, "<router ({} routes)>", route_count)
             }
             Value::HttpRequest { method, path, .. } => {
                 write!(f, "<http_request {} {}>", method, path)
@@ -242,7 +240,11 @@ impl std::fmt::Display for Value {
                 write!(f, "<partial>")
             }
             Value::Atom(arc) => {
-                write!(f, "<atom {:?}>", arc.lock().expect("Atom mutex poisoned"))
+                // v0.35: Display must be infallible; poisoned mutex used to panic.
+                match arc.lock() {
+                    Ok(v) => write!(f, "<atom {:?}>", v),
+                    Err(_) => write!(f, "<atom (lock failed)>"),
+                }
             }
             Value::Macro { name, .. } => {
                 write!(f, "<macro {}>", name)
@@ -457,5 +459,31 @@ impl Binding {
                 Err("cannot move out of borrowed value".to_string())
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// v0.35 (P0-B2): Display must be infallible even if the inner mutex is poisoned.
+    /// Smoke test: a Router with an empty routes Vec should render without panic.
+    #[test]
+    fn router_display_does_not_panic_on_empty_routes() {
+        let v = Value::Router {
+            routes: Arc::new(Mutex::new(Vec::new())),
+        };
+        let s = format!("{}", v);
+        assert!(s.contains("router"), "got: {}", s);
+        assert!(s.contains("0 routes"), "got: {}", s);
+    }
+
+    /// v0.35 (P0-B2): Atom Display must not panic (smoke test).
+    #[test]
+    fn atom_display_does_not_panic_on_valid_value() {
+        let v = Value::Atom(Arc::new(Mutex::new(Value::Number(42.0))));
+        let s = format!("{}", v);
+        assert!(s.contains("atom"), "got: {}", s);
+        assert!(s.contains("42"), "got: {}", s);
     }
 }

@@ -86,6 +86,25 @@ pub enum Type {
     ///   用于 builtin 多类型签名（print 等）
     ///   兼容规则: A 兼容 B 当 A 是 B 的成员, 或 B 是 A 的成员, 或递归嵌套
     Union(Vec<Type>),
+    // v0.36 (Permanent #3): 8 new Type variants for v0.17–v0.27 Value kinds.
+    // The v0.34 audit's claim that "16 Value variants lack Type variants" was
+    // solvable in one commit; the previous deferral to v1.0 was a cop-out.
+    /// v0.03: Agent (name + tool_names + model_route + max_steps + system)
+    Agent,
+    /// v0.08.5: Trait object carrier (for_type + trait_name + generics + data)
+    TraitObject,
+    /// v0.17: Compose pipeline (arity = number of functions)
+    Compose,
+    /// v0.18: Partial application (boxed origin + how many args applied)
+    Partial,
+    /// v0.19: Atom (mutable reference cell)
+    Atom,
+    /// v0.20: Macro definition (name + params shape)
+    Macro,
+    /// v0.26: Prompt section (named system-prompt segment)
+    PromptSection,
+    /// v0.27: Document unified IR (Arc<dyn DocumentBackend>)
+    Document,
 } // ← close pub enum Type
 
 impl Type {
@@ -115,6 +134,15 @@ impl Type {
             Type::McpServer => "mcp_server".to_string(),
             Type::Trait { .. } => "trait".to_string(),
             Type::Concrete { .. } => "concrete".to_string(),
+            // v0.36: 8 new variants
+            Type::Agent => "agent".to_string(),
+            Type::TraitObject => "trait_object".to_string(),
+            Type::Compose => "compose".to_string(),
+            Type::Partial => "partial".to_string(),
+            Type::Atom => "atom".to_string(),
+            Type::Macro => "macro".to_string(),
+            Type::PromptSection => "prompt_section".to_string(),
+            Type::Document => "document".to_string(),
             // v0.13: Union 类型显示为 "T1 | T2 | T3"
             Type::Union(members) => {
                 if members.is_empty() {
@@ -1997,7 +2025,15 @@ end
                 | Type::McpServer
                 | Type::Trait { .. }
                 | Type::Concrete { .. }
-                | Type::Union(_) => true,
+                | Type::Union(_)
+                | Type::Agent
+                | Type::TraitObject
+                | Type::Compose
+                | Type::Partial
+                | Type::Atom
+                | Type::Macro
+                | Type::PromptSection
+                | Type::Document => true,
                 // Type::Any 已不存在, 这里不需要 arm
             };
         }

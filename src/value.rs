@@ -190,12 +190,28 @@ impl std::fmt::Display for Value {
             Value::Bool(b) => write!(f, "{}", b),
             Value::Nil => write!(f, "nil"),
             Value::List(items) => {
-                let parts: Vec<String> = items.iter().map(|v| v.to_string()).collect();
-                write!(f, "[{}]", parts.join(", "))
+                // v0.36 (P1-2.7 + P2-3.14): streaming write, no Vec<String> build.
+                // Depth-limited via fmt_inner helper below to guard against
+                // recursive Value::List / Value::Atom cycles.
+                write!(f, "[")?;
+                for (i, v) in items.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    fmt_inner(f, v, 1)?;
+                }
+                write!(f, "]")
             }
             Value::Dict(map) => {
-                let parts: Vec<String> = map.iter().map(|(k, v)| format!("{}: {}", k, v)).collect();
-                write!(f, "{{{}}}", parts.join(", "))
+                write!(f, "{{")?;
+                for (i, (k, v)) in map.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{}: ", k)?;
+                    fmt_inner(f, v, 1)?;
+                }
+                write!(f, "}}")
             }
             Value::Task { name, .. } => write!(f, "<task {}>", name),
             Value::Closure { .. } => write!(f, "<closure>"),
@@ -274,6 +290,45 @@ impl std::fmt::Display for Value {
                 write!(f, "<document origin=\"{}\">", backend.origin())
             }
         }
+    }
+}
+
+/// v0.36 (P2-3.14): depth-limited Display helper. Walks a Value recursively
+/// but stops at MAX_DEPTH (default 16) to prevent stack overflow on
+/// recursive/cyclic structures (e.g. Atom containing self).
+const DISPLAY_MAX_DEPTH: usize = 16;
+
+fn fmt_inner(f: &mut std::fmt::Formatter<'_>, v: &Value, depth: usize) -> std::fmt::Result {
+    if depth > DISPLAY_MAX_DEPTH {
+        return f.write_str("…");
+    }
+    match v {
+        Value::Atom(arc) => match arc.lock() {
+            Ok(inner) => write!(f, "<atom {:?}>", inner),
+            Err(_) => f.write_str("<atom (lock failed)>"),
+        },
+        Value::List(items) => {
+            write!(f, "[")?;
+            for (i, child) in items.iter().enumerate() {
+                if i > 0 {
+                    write!(f, ", ")?;
+                }
+                fmt_inner(f, child, depth + 1)?;
+            }
+            write!(f, "]")
+        }
+        Value::Dict(map) => {
+            write!(f, "{{")?;
+            for (i, (k, child)) in map.iter().enumerate() {
+                if i > 0 {
+                    write!(f, ", ")?;
+                }
+                write!(f, "{}: ", k)?;
+                fmt_inner(f, child, depth + 1)?;
+            }
+            write!(f, "}}")
+        }
+        _ => write!(f, "{}", v),
     }
 }
 

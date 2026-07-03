@@ -197,6 +197,8 @@ pub struct Interpreter {
     bus: crate::event::EventBus,
     /// v0.34: 沙箱策略 (来自 src/sandbox/, MimiClaw path validation)
     sandbox: crate::sandbox::SandboxPolicy,
+    /// v0.34: scheduler (cron, MimiClaw style)
+    scheduler: crate::schedule::Scheduler,
 }
 
 /// v0.24: AI 调用优先级队列条目类型
@@ -256,6 +258,7 @@ impl Clone for Interpreter {
             memory_store: HashMap::new(),
             bus: crate::event::EventBus::new(),
             sandbox: crate::sandbox::SandboxPolicy::permissive(),
+            scheduler: crate::schedule::Scheduler::new(),
         }
     }
 }
@@ -415,6 +418,12 @@ impl Interpreter {
             Value::Builtin("sandbox".to_string()),
             false,
         );
+        // v0.34: 注册 schedule 顶层 builtin
+        globals.lock().unwrap().define(
+            "schedule".to_string(),
+            Value::Builtin("schedule".to_string()),
+            false,
+        );
         Self {
             globals: globals.clone(),
             environment: globals,
@@ -447,6 +456,7 @@ impl Interpreter {
             memory_store: HashMap::new(),
             bus: crate::event::EventBus::new(),
             sandbox: crate::sandbox::SandboxPolicy::permissive(),
+            scheduler: crate::schedule::Scheduler::new(),
         }
     }
 
@@ -486,6 +496,7 @@ impl Interpreter {
             memory_store: HashMap::new(),
             bus: crate::event::EventBus::new(),
             sandbox: crate::sandbox::SandboxPolicy::permissive(),
+            scheduler: crate::schedule::Scheduler::new(),
         }
     }
 
@@ -523,6 +534,7 @@ impl Interpreter {
             memory_store: HashMap::new(),
             bus: crate::event::EventBus::new(),
             sandbox: crate::sandbox::SandboxPolicy::permissive(),
+            scheduler: crate::schedule::Scheduler::new(),
         }
     }
 
@@ -3138,6 +3150,18 @@ mod bus_tests {
     /// T24: sandbox builtin (integrate src/sandbox/)
     #[test]
     fn test_sandbox_builtin_basic() {
+        let src = r#"
+            let m = sandbox.mode()
+            let ok = sandbox.check_builtin("ai.chat")
+            let bad = sandbox.check_path("../escape.txt")
+            print(m, ok, bad)
+        "#;
+        run(src).expect("sandbox builtin should work");
+    }
+
+    /// T25: schedule builtin (integrate src/schedule/, MimiClaw cron)
+    #[test]
+    fn test_schedule_builtin_basic() {
         let src = r#"
             let m = sandbox.mode()
             let ok = sandbox.check_builtin("ai.chat")

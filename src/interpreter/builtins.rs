@@ -290,6 +290,87 @@ impl Interpreter {
         }
     }
 
+    /// v0.34: schedule.* — cron scheduler (MimiClaw style)
+    pub fn call_schedule_method(&self, method: &str, args: &[Value]) -> Result<Value, String> {
+        match method {
+            "add" => {
+                let name = args
+                    .first()
+                    .map(|v| v.to_string())
+                    .ok_or("schedule.add: requires name")?;
+                let kind_str = args
+                    .get(1)
+                    .map(|v| v.to_string())
+                    .ok_or("schedule.add: requires kind ('every' or 'at')")?;
+                let kind = match kind_str.as_str() {
+                    "every" => crate::schedule::JobKind::Every,
+                    "at" => crate::schedule::JobKind::At,
+                    _ => {
+                        return Err(format!(
+                            "schedule.add: kind must be 'every' or 'at', got '{}'",
+                            kind_str
+                        ));
+                    }
+                };
+                let message = args
+                    .get(2)
+                    .map(|v| v.to_string())
+                    .ok_or("schedule.add: requires message")?;
+                let interval_s = if let Some(Value::Number(n)) = args.get(3) {
+                    *n as u64
+                } else {
+                    0
+                };
+                let at_epoch = if let Some(Value::Number(n)) = args.get(4) {
+                    *n as u64
+                } else {
+                    0
+                };
+                self.scheduler
+                    .add(&name, kind, &message, interval_s, at_epoch)
+                    .map(Value::String)
+            }
+            "list" => {
+                let jobs = self.scheduler.list();
+                let arr: Vec<Value> = jobs
+                    .into_iter()
+                    .map(|j| {
+                        let mut m = std::collections::HashMap::new();
+                        m.insert("id".to_string(), Value::String(j.id));
+                        m.insert("name".to_string(), Value::String(j.name));
+                        m.insert(
+                            "kind".to_string(),
+                            Value::String(match j.kind {
+                                crate::schedule::JobKind::Every => "every".to_string(),
+                                crate::schedule::JobKind::At => "at".to_string(),
+                            }),
+                        );
+                        m.insert("message".to_string(), Value::String(j.message));
+                        m.insert("interval_s".to_string(), Value::Number(j.interval_s as f64));
+                        m.insert("at_epoch".to_string(), Value::Number(j.at_epoch as f64));
+                        Value::Dict(m)
+                    })
+                    .collect();
+                Ok(Value::List(arr))
+            }
+            "remove" => {
+                let id = args
+                    .first()
+                    .map(|v| v.to_string())
+                    .ok_or("schedule.remove: requires id")?;
+                Ok(Value::Bool(self.scheduler.remove(&id)))
+            }
+            "tick" => {
+                let messages = self.scheduler.tick(crate::schedule::Scheduler::now());
+                Ok(Value::List(
+                    messages.into_iter().map(Value::String).collect(),
+                ))
+            }
+            "count" => Ok(Value::Number(self.scheduler.count() as f64)),
+            _ => Err(format!("schedule.{}: unknown method", method)),
+        }
+    }
+
     /// v0.25: memory.* — 会话记忆系统
     pub fn call_memory_method(&mut self, method: &str, args: &[Value]) -> Result<Value, String> {
         match method {

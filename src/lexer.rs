@@ -578,7 +578,22 @@ impl Lexer {
                     }
                 }
             } else {
-                value.push(self.advance());
+                let c = self.advance();
+                // v0.35 (P0-B4): reject control chars in string literals.
+                // NUL and 0x01-0x1f/0x7f round-trip through lexer/JSON
+                // but crash downstream at POSIX/HTTP/file boundaries.
+                // Note: \t, \n, \r (0x09/0x0A/0x0D) are LEGITIMATE in
+                // multi-line string literals and stay allowed.
+                let code = c as u32;
+                let is_legit = matches!(c, '\t' | '\n' | '\r');
+                if !is_legit && (code < 0x20 || c == '\x7f') {
+                    return self.error_token(
+                        start_line,
+                        start_col,
+                        "control character in string literal",
+                    );
+                }
+                value.push(c);
             }
         }
         if self.is_at_end() {
@@ -677,7 +692,18 @@ impl Lexer {
                     }
                 }
             } else {
-                value.push(self.advance());
+                let c = self.advance();
+                // v0.35 (P0-B4): same control-char rejection as string_from.
+                let code = c as u32;
+                let is_legit = matches!(c, '\t' | '\n' | '\r');
+                if !is_legit && (code < 0x20 || c == '\x7f') {
+                    return self.error_token(
+                        start_line,
+                        start_col,
+                        "control character in prompt string",
+                    );
+                }
+                value.push(c);
             }
         }
         if self.is_at_end() {

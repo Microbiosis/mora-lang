@@ -259,21 +259,27 @@ impl Interpreter {
     pub fn call_event_method(&self, method: &str, args: &[Value]) -> Result<Value, String> {
         match method {
             "emit" => {
-                // bus.emit(event, payload?) — 触发所有匹配 pattern 的 handlers
-                let event = args
-                    .first()
-                    .map(|v| v.to_string())
-                    .ok_or("bus.emit: requires event name as first arg")?;
+                // v0.37 (P1-3.7): event name must be Value::String.
+                let event = match args.first() {
+                    Some(Value::String(s)) => s.clone(),
+                    Some(_) => {
+                        return Err("bus.emit: first arg must be a string event name".to_string())
+                    }
+                    None => return Err("bus.emit: requires event name as first arg".to_string()),
+                };
                 let payload = args.get(1).cloned().unwrap_or(Value::Nil);
                 self.bus.emit(&event, &payload);
                 Ok(Value::Nil)
             }
             "off" => {
-                // bus.off(pattern) — 取消注册所有匹配 pattern 的 handlers
-                let pattern = args
-                    .first()
-                    .map(|v| v.to_string())
-                    .ok_or("bus.off: requires pattern as first arg")?;
+                // v0.37: pattern must be Value::String.
+                let pattern = match args.first() {
+                    Some(Value::String(s)) => s.clone(),
+                    Some(_) => {
+                        return Err("bus.off: first arg must be a string pattern".to_string())
+                    }
+                    None => return Err("bus.off: requires pattern as first arg".to_string()),
+                };
                 self.bus.off(&pattern);
                 Ok(Value::Nil)
             }
@@ -297,17 +303,37 @@ impl Interpreter {
                 Ok(Value::String(mode.to_string()))
             }
             "check_builtin" => {
-                let name = args
-                    .first()
-                    .map(|v| v.to_string())
-                    .ok_or("sandbox.check_builtin: requires builtin name as first arg")?;
+                // v0.37: builtin name must be Value::String.
+                let name = match args.first() {
+                    Some(Value::String(s)) => s.clone(),
+                    Some(_) => {
+                        return Err(
+                            "sandbox.check_builtin: name must be a string".to_string(),
+                        );
+                    }
+                    None => {
+                        return Err(
+                            "sandbox.check_builtin: requires builtin name as first arg".to_string(),
+                        );
+                    }
+                };
                 Ok(Value::Bool(self.sandbox.check_builtin(&name).is_ok()))
             }
             "check_path" => {
-                let path = args
-                    .first()
-                    .map(|v| v.to_string())
-                    .ok_or("sandbox.check_path: requires path as first arg")?;
+                // v0.37: path must be Value::String.
+                let path = match args.first() {
+                    Some(Value::String(s)) => s.clone(),
+                    Some(_) => {
+                        return Err(
+                            "sandbox.check_path: path must be a string".to_string(),
+                        );
+                    }
+                    None => {
+                        return Err(
+                            "sandbox.check_path: requires path as first arg".to_string(),
+                        );
+                    }
+                };
                 Ok(Value::Bool(self.sandbox.check_path(&path).is_ok()))
             }
             _ => Err(format!("sandbox.{}: unknown method", method)),
@@ -318,15 +344,22 @@ impl Interpreter {
     pub fn call_schedule_method(&self, method: &str, args: &[Value]) -> Result<Value, String> {
         match method {
             "add" => {
-                let name = args
-                    .first()
-                    .map(|v| v.to_string())
-                    .ok_or("schedule.add: requires name")?;
-                let kind_str = args
-                    .get(1)
-                    .map(|v| v.to_string())
-                    .ok_or("schedule.add: requires kind ('every' or 'at')")?;
-                let kind = match kind_str.as_str() {
+                // v0.37 (P1-3.9): name/kind/message must all be Value::String.
+                let name = match args.first() {
+                    Some(Value::String(s)) => s.clone(),
+                    Some(_) => return Err("schedule.add: name must be a string".to_string()),
+                    None => return Err("schedule.add: requires name".to_string()),
+                };
+                let kind_str = match args.get(1) {
+                    Some(Value::String(s)) => s.as_str(),
+                    Some(_) => {
+                        return Err("schedule.add: kind must be a string".to_string());
+                    }
+                    None => {
+                        return Err("schedule.add: requires kind ('every' or 'at')".to_string());
+                    }
+                };
+                let kind = match kind_str {
                     "every" => crate::schedule::JobKind::Every,
                     "at" => crate::schedule::JobKind::At,
                     _ => {
@@ -336,10 +369,13 @@ impl Interpreter {
                         ));
                     }
                 };
-                let message = args
-                    .get(2)
-                    .map(|v| v.to_string())
-                    .ok_or("schedule.add: requires message")?;
+                let message = match args.get(2) {
+                    Some(Value::String(s)) => s.clone(),
+                    Some(_) => {
+                        return Err("schedule.add: message must be a string".to_string());
+                    }
+                    None => return Err("schedule.add: requires message".to_string()),
+                };
                 let interval_s = if let Some(Value::Number(n)) = args.get(3) {
                     *n as u64
                 } else {
@@ -412,18 +448,26 @@ impl Interpreter {
     pub fn call_ccr_method(&self, method: &str, args: &[Value]) -> Result<Value, String> {
         match method {
             "put" => {
-                let data = args
-                    .first()
-                    .map(|v| v.to_string())
-                    .ok_or("ccr.put: requires data as first arg")?;
+                // v0.37 (P1-3.8): data must be Value::String. Avoids lossy
+                // to_string() of List/Dict that would round-trip into "[...]".
+                let data = match args.first() {
+                    Some(Value::String(s)) => s.clone(),
+                    Some(_) => {
+                        return Err("ccr.put: data must be a string".to_string());
+                    }
+                    None => return Err("ccr.put: requires data as first arg".to_string()),
+                };
                 let hash = self.ccr_store.put(&data);
                 Ok(Value::String(hash))
             }
             "get" => {
-                let hash = args
-                    .first()
-                    .map(|v| v.to_string())
-                    .ok_or("ccr.get: requires hash as first arg")?;
+                let hash = match args.first() {
+                    Some(Value::String(s)) => s.clone(),
+                    Some(_) => {
+                        return Err("ccr.get: hash must be a string".to_string());
+                    }
+                    None => return Err("ccr.get: requires hash as first arg".to_string()),
+                };
                 match self.ccr_store.get(&hash) {
                     Some(entry) => Ok(Value::String(entry.data)),
                     None => Ok(Value::Nil),
@@ -460,10 +504,13 @@ impl Interpreter {
     pub fn call_mock_method(&mut self, method: &str, args: &[Value]) -> Result<Value, String> {
         match method {
             "register" => {
-                let name = args
-                    .first()
-                    .map(|v| v.to_string())
-                    .ok_or("mock.register: requires name")?;
+                let name = match args.first() {
+                    Some(Value::String(s)) => s.clone(),
+                    Some(_) => {
+                        return Err("mock.register: name must be a string".to_string());
+                    }
+                    None => return Err("mock.register: requires name".to_string()),
+                };
                 let handler = args
                     .get(1)
                     .cloned()
@@ -473,18 +520,22 @@ impl Interpreter {
                 Ok(Value::String(format!("mock.{} registered", name)))
             }
             "unregister" => {
-                let name = args
-                    .first()
-                    .map(|v| v.to_string())
-                    .ok_or("mock.unregister: requires name")?;
+                let name = match args.first() {
+                    Some(Value::String(s)) => s.clone(),
+                    Some(_) => {
+                        return Err("mock.unregister: name must be a string".to_string());
+                    }
+                    None => return Err("mock.unregister: requires name".to_string()),
+                };
                 self.mock_registry.unregister(&name);
                 Ok(Value::Nil)
             }
             "call" => {
-                let name = args
-                    .first()
-                    .map(|v| v.to_string())
-                    .ok_or("mock.call: requires name")?;
+                let name = match args.first() {
+                    Some(Value::String(s)) => s.clone(),
+                    Some(_) => return Err("mock.call: name must be a string".to_string()),
+                    None => return Err("mock.call: requires name".to_string()),
+                };
                 let call_args = args.get(1).cloned().unwrap_or(Value::Nil);
                 match self.mock_registry.get(&name) {
                     Some(crate::mock::MockHandler::Native(f)) => Ok(f(&call_args)),

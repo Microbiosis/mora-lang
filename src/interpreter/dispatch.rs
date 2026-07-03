@@ -446,9 +446,8 @@ impl Interpreter {
         args: Vec<Value>,
         call_site: Span,
     ) -> Result<Value, String> {
-        // v0.22: 方法调用内联缓存
-        let _cache_key = format!("{}:{}", type_name(&object), method);
-        // 注：内联缓存主要优化方法查找，实际执行仍需分派
+        // v0.35 (P0-D3): the inline-cache format! previously lived here.
+        // It was a dead alloc per method dispatch — deleted.
 
         // v0.08.5: dyn dispatch —— TraitObject 走 dispatch_trait_method（按 for_type + trait_name 选 impl）
         // call_site 透传给 dispatcher，dispatch 失败时报错带行号方便定位

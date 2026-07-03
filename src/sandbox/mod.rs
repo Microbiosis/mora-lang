@@ -16,10 +16,11 @@ use std::path::{Component, Path, PathBuf};
 /// v0.33: Sandbox 策略
 #[derive(Debug, Clone, Default)]
 pub struct SandboxPolicy {
-    /// 允许的 builtin 模式列表 (e.g. ["memory.*", "ai.chat"])
-    pub allow: Vec<String>,
+    /// v0.36 (P1-3.10): BTreeSet for O(log N) membership checks
+    /// (was Vec<String>, O(N) linear scan).
+    pub allow: std::collections::BTreeSet<String>,
     /// 禁止的 builtin 模式 (优先于 allow)
-    pub deny: Vec<String>,
+    pub deny: std::collections::BTreeSet<String>,
     /// 文件操作根目录 (path validation 基准)
     pub fs_root: Option<PathBuf>,
     /// 超时秒数 (None = 无限制)
@@ -32,8 +33,8 @@ impl SandboxPolicy {
     /// 创建一个空 policy (拒绝一切, 需显式 allow)
     pub fn strict() -> Self {
         Self {
-            allow: vec![],
-            deny: vec![],
+            allow: std::collections::BTreeSet::new(),
+            deny: std::collections::BTreeSet::new(),
             fs_root: None,
             timeout_s: None,
             memory_limit_mb: None,
@@ -42,9 +43,11 @@ impl SandboxPolicy {
 
     /// 创建一个开放 policy (允许一切 builtin, 全路径, 无限制)
     pub fn permissive() -> Self {
+        let mut allow = std::collections::BTreeSet::new();
+        allow.insert("*".to_string());
         Self {
-            allow: vec!["*".to_string()],
-            deny: vec![],
+            allow,
+            deny: std::collections::BTreeSet::new(),
             fs_root: Some(PathBuf::from("/")),
             timeout_s: None,
             memory_limit_mb: None,
@@ -139,8 +142,11 @@ mod tests {
 
     #[test]
     fn allow_pattern_matches() {
+        let mut allow = std::collections::BTreeSet::new();
+        allow.insert("memory.*".to_string());
+        allow.insert("ai.chat".to_string());
         let p = SandboxPolicy {
-            allow: vec!["memory.*".to_string(), "ai.chat".to_string()],
+            allow,
             ..SandboxPolicy::strict()
         };
         assert!(p.check_builtin("memory.store").is_ok());
@@ -151,9 +157,13 @@ mod tests {
 
     #[test]
     fn deny_overrides_allow() {
+        let mut allow = std::collections::BTreeSet::new();
+        allow.insert("*".to_string());
+        let mut deny = std::collections::BTreeSet::new();
+        deny.insert("dangerous.*".to_string());
         let p = SandboxPolicy {
-            allow: vec!["*".to_string()],
-            deny: vec!["dangerous.*".to_string()],
+            allow,
+            deny,
             ..SandboxPolicy::default()
         };
         assert!(p.check_builtin("safe.op").is_ok());

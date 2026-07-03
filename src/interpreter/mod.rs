@@ -167,7 +167,9 @@ pub struct Interpreter {
     #[allow(dead_code)] // 未来扩展用
     cache_warmer: CacheWarmer,
     /// v2 AST arena — 在 interpret 期间存储，供 call_value 执行 v2 闭包
-    v2_arena: Option<crate::ast_v2::AstArena>,
+    /// v0.35 (P0-A5): wrapped in Arc so per-call `.clone()` is cheap
+    /// (Arc bump) instead of deep-cloning the whole arena tree.
+    v2_arena: Option<std::sync::Arc<crate::ast_v2::AstArena>>,
     /// v0.25: 会话记忆存储
     memory_store: HashMap<String, Value>,
     /// v0.34: 事件总线 (来自 src/event/, Puter EventClient 风格)
@@ -534,8 +536,8 @@ impl Interpreter {
         stmt_ids: &[crate::ast_v2::NodeId],
         arena: &crate::ast_v2::AstArena,
     ) -> Result<(), String> {
-        // 存储 arena 供 call_value 执行 v2 闭包
-        self.v2_arena = Some(arena.clone());
+        // 存储 arena 供 call_value 执行 v2 闭包 (v0.35 wrap in Arc)
+        self.v2_arena = Some(std::sync::Arc::new(arena.clone()));
         // 执行所有顶层语句
         for stmt_id in stmt_ids {
             if let Some(stmt) = arena.get_stmt(*stmt_id) {

@@ -341,81 +341,45 @@ impl Default for Interpreter {
 impl Interpreter {
     pub fn new() -> Self {
         let globals = Arc::new(Mutex::new(Environment::new()));
-        globals.lock().expect("globals mutex poisoned").define(
-            "print".to_string(),
-            Value::Builtin("print".to_string()),
-            false,
-        );
-        globals.lock().expect("globals mutex poisoned").define(
-            "range".to_string(),
-            Value::Builtin("range".to_string()),
-            false,
-        );
-        globals.lock().expect("globals mutex poisoned").define(
-            "len".to_string(),
-            Value::Builtin("len".to_string()),
-            false,
-        );
-        // v0.25: 注册 builtin 模块对象 (v0.27: 加入 document)
-        for name in &["ai", "web", "json", "file", "memory", "agent", "document"] {
-            globals.lock().expect("globals mutex poisoned").define(
-                name.to_string(),
-                Value::Builtin(name.to_string()),
+        use crate::value::BuiltinKind as Bk;
+        {
+            let mut g = globals.lock().expect("globals mutex poisoned");
+            // v0.37 (P1-3.6): use typed BuiltinKind instead of String.
+            g.define("print".to_string(), Value::Builtin(Bk::Print), false);
+            g.define("range".to_string(), Value::Builtin(Bk::Range), false);
+            g.define("len".to_string(), Value::Builtin(Bk::Len), false);
+            for (name, kind) in &[
+                ("ai", Bk::AiChat),
+                ("web", Bk::Web),
+                ("json", Bk::Json),
+                ("file", Bk::File),
+                ("memory", Bk::Memory),
+                ("agent", Bk::Agent),
+                ("document", Bk::Document),
+            ] {
+                g.define(name.to_string(), Value::Builtin(*kind), false);
+            }
+            // v0.26: prompt-section builtins
+            g.define(
+                "compose_prompt".to_string(),
+                Value::Builtin(Bk::ComposePrompt),
                 false,
             );
+            g.define("tail".to_string(), Value::Builtin(Bk::Tail), false);
+            // v0.29: compress / crush_json
+            g.define("compress".to_string(), Value::Builtin(Bk::Compress), false);
+            g.define(
+                "crush_json".to_string(),
+                Value::Builtin(Bk::CrushJson),
+                false,
+            );
+            // v0.34: bus / sandbox / schedule / ccr / mock
+            g.define("bus".to_string(), Value::Builtin(Bk::Bus), false);
+            g.define("sandbox".to_string(), Value::Builtin(Bk::Sandbox), false);
+            g.define("schedule".to_string(), Value::Builtin(Bk::Schedule), false);
+            g.define("ccr".to_string(), Value::Builtin(Bk::Ccr), false);
+            g.define("mock".to_string(), Value::Builtin(Bk::Mock), false);
         }
-        // v0.26: 注册 compose_prompt / tail 内建函数 (供 prompt section 块式调用)
-        globals.lock().expect("globals mutex poisoned").define(
-            "compose_prompt".to_string(),
-            Value::Builtin("compose_prompt".to_string()),
-            false,
-        );
-        globals.lock().expect("globals mutex poisoned").define(
-            "tail".to_string(),
-            Value::Builtin("tail".to_string()),
-            false,
-        );
-        // v0.29: 注册 compress / crush_json 顶层 builtin
-        globals.lock().expect("globals mutex poisoned").define(
-            "compress".to_string(),
-            Value::Builtin("compress".to_string()),
-            false,
-        );
-        globals.lock().expect("globals mutex poisoned").define(
-            "crush_json".to_string(),
-            Value::Builtin("crush_json".to_string()),
-            false,
-        );
-        // v0.34: 注册 event bus 顶层 builtin
-        globals.lock().expect("globals mutex poisoned").define(
-            "bus".to_string(),
-            Value::Builtin("bus".to_string()),
-            false,
-        );
-        // v0.34: 注册 sandbox 顶层 builtin
-        globals.lock().expect("globals mutex poisoned").define(
-            "sandbox".to_string(),
-            Value::Builtin("sandbox".to_string()),
-            false,
-        );
-        // v0.34: 注册 schedule 顶层 builtin
-        globals.lock().expect("globals mutex poisoned").define(
-            "schedule".to_string(),
-            Value::Builtin("schedule".to_string()),
-            false,
-        );
-        // v0.34: 注册 ccr 顶层 builtin
-        globals.lock().expect("globals mutex poisoned").define(
-            "ccr".to_string(),
-            Value::Builtin("ccr".to_string()),
-            false,
-        );
-        // v0.34: 注册 mock 顶层 builtin
-        globals.lock().expect("globals mutex poisoned").define(
-            "mock".to_string(),
-            Value::Builtin("mock".to_string()),
-            false,
-        );
         Self {
             globals: globals.clone(),
             environment: globals,

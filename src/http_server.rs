@@ -375,7 +375,7 @@ fn value_to_json(v: &Value) -> JsonValue {
         }
         Value::Task { name, .. } => JsonValue::String_(format!("<task {}>", name)),
         Value::Closure { .. } => JsonValue::String_("<closure>".to_string()),
-        Value::Builtin(name) => JsonValue::String_(format!("<builtin {}>", name)),
+        Value::Builtin(kind) => JsonValue::String_(format!("<builtin {}>", kind)),
         Value::Stream { .. } => JsonValue::String_("<stream>".to_string()),
         Value::Conversation { .. } => JsonValue::String_("<conversation>".to_string()),
         Value::Agent { .. } => JsonValue::String_("<agent>".to_string()),

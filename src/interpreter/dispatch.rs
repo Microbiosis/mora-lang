@@ -2,7 +2,7 @@
 
 use super::*;
 use crate::common::Span;
-use crate::value::Value;
+use crate::value::{BuiltinKind, Value};
 
 impl Interpreter {
     pub(super) fn call_function(
@@ -743,35 +743,38 @@ impl Interpreter {
                     }
                 }
             }
-            Value::Builtin(name) => match (name.as_str(), method) {
-                ("web", "fetch") => {
+            Value::Builtin(kind) => match (kind, method) {
+                (BuiltinKind::Web, "fetch") => {
                     let url = args.first().map(|v| v.to_string()).unwrap_or_default();
                     // v10: 真实 HTTP GET
                     self.real_web_fetch(&url)
                 }
-                ("json", "parse") => {
+                (BuiltinKind::Json, "parse") => {
                     // v10: 真实 JSON 解析
                     let text = args.first().map(|v| v.to_string()).unwrap_or_default();
                     json_to_value(&text).map_err(|e| format!("json.parse: {}", e))
                 }
-                ("json", "stringify") => {
+                (BuiltinKind::Json, "stringify") => {
                     // v10: JSON 序列化
                     let value = args.first().cloned().unwrap_or(Value::Nil);
                     Ok(Value::String(value_to_json(&value)))
                 }
-                ("file", method) => self.call_file_method(method, &args),
-                ("memory", method) => self.call_memory_method(method, &args),
+                (BuiltinKind::File, _) => {
+                    // v0.25: 文件系统 builtin (file.read_text / write_text / ...)
+                    self.call_file_method(method, &args)
+                }
+                (BuiltinKind::Memory, _) => self.call_memory_method(method, &args),
                 // v0.34: event bus.* (Puter EventClient 风格 wildcard)
-                ("bus", method) => self.call_event_method(method, &args),
+                (BuiltinKind::Bus, _) => self.call_event_method(method, &args),
                 // v0.34: sandbox.* (MimiClaw path validation + AIOS access manager)
-                ("sandbox", method) => self.call_sandbox_method(method, &args),
-                ("schedule", method) => self.call_schedule_method(method, &args),
-                ("ccr", method) => self.call_ccr_method(method, &args),
-                ("mock", method) => self.call_mock_method(method, &args),
+                (BuiltinKind::Sandbox, _) => self.call_sandbox_method(method, &args),
+                (BuiltinKind::Schedule, _) => self.call_schedule_method(method, &args),
+                (BuiltinKind::Ccr, _) => self.call_ccr_method(method, &args),
+                (BuiltinKind::Mock, _) => self.call_mock_method(method, &args),
                 // v0.34: ai.tokens — expose TokenUsage counters (mini-swe-agent cost tracking)
-                ("ai", "tokens") => Ok(Value::Builtin("ai.tokens".to_string())),
-                ("ai.tokens", method) => self.call_ai_tokens_method(method, &args),
-                ("agent", "create") => {
+                (BuiltinKind::AiChat, "tokens") => Ok(Value::Builtin(BuiltinKind::AiTokens)),
+                (BuiltinKind::AiTokens, _) => self.call_ai_tokens_method(method, &args),
+                (BuiltinKind::Agent, "create") => {
                     // agent.create("name", {tools: [...], model: "deep", max_steps: 10, system: "..."})
                     let name = match args.first() {
                         Some(Value::String(s)) => s.clone(),
@@ -801,7 +804,7 @@ impl Interpreter {
                     };
                     Ok(Value::Agent { name, tool_names, model_route, max_steps, system })
                 }
-                ("agent", "critic") => {
+                (BuiltinKind::Agent, "critic") => {
                     // agent.critic(answer) — 评估输出质量
                     // agent.critic(answer, context) — 检查是否基于上下文（幻觉检测）
                     let answer = match args.first() {
@@ -812,7 +815,7 @@ impl Interpreter {
                     self.run_critic(&answer, context.as_deref())
                 }
                 // v0.27: 顶层模块入口 — `document.parse(path)` 返回 Value::Document
-                ("document", "parse") => {
+                (BuiltinKind::Document, "parse") => {
                     let path = args
                         .first()
                         .and_then(|v| match v {
@@ -822,8 +825,10 @@ impl Interpreter {
                         .ok_or_else(|| "document.parse: requires a path string".to_string())?;
                     crate::document::parse_document(&path)
                 }
-                ("document", method) => Err(format!("document.{}: unknown method", method)),
-                _ => Err(format!("Unknown method: {}.{}", name, method)),
+                (BuiltinKind::Document, _) => {
+                    Err(format!("document.{}: unknown method", method))
+                }
+                _ => Err(format!("Unknown method: {:?}.{}", kind, method)),
             },
             Value::Conversation { ref mut messages, ref model, ref base_url, ref api_key } => {
                 match method {

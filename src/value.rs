@@ -35,6 +35,68 @@ impl std::fmt::Debug for StreamReader {
 }
 
 // ─── Value ───────────────────────────────────────────────
+
+/// v0.37 (P1-3.6): Typed enum replacing stringly-typed builtin dispatch.
+/// The original audit flagged 30+ string comparisons across dispatch,
+/// Display, JSON encoding, and registration sites as weak typing.
+/// Variants are derived directly from v0.36 mod.rs:346-416 plus the
+/// additional builtin kinds the dispatch table knows about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum BuiltinKind {
+    Print,
+    Range,
+    Len,
+    Web,
+    Json,
+    File,
+    Memory,
+    Bus,
+    Sandbox,
+    Schedule,
+    Ccr,
+    Mock,
+    AiTokens,
+    AiChat,
+    Agent,
+    Document,
+    Compress,
+    CrushJson,
+    Tail,
+    ComposePrompt,
+    Router,
+    McpServer,
+}
+
+impl std::fmt::Display for BuiltinKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            BuiltinKind::Print => "print",
+            BuiltinKind::Range => "range",
+            BuiltinKind::Len => "len",
+            BuiltinKind::Web => "web",
+            BuiltinKind::Json => "json",
+            BuiltinKind::File => "file",
+            BuiltinKind::Memory => "memory",
+            BuiltinKind::Bus => "bus",
+            BuiltinKind::Sandbox => "sandbox",
+            BuiltinKind::Schedule => "schedule",
+            BuiltinKind::Ccr => "ccr",
+            BuiltinKind::Mock => "mock",
+            BuiltinKind::AiTokens => "ai.tokens",
+            BuiltinKind::AiChat => "ai.chat",
+            BuiltinKind::Agent => "agent",
+            BuiltinKind::Document => "document",
+            BuiltinKind::Compress => "compress",
+            BuiltinKind::CrushJson => "crush_json",
+            BuiltinKind::Tail => "tail",
+            BuiltinKind::ComposePrompt => "compose_prompt",
+            BuiltinKind::Router => "Router::new",
+            BuiltinKind::McpServer => "McpServer::new",
+        };
+        f.write_str(s)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum Value {
     String(String),
@@ -57,7 +119,7 @@ pub enum Value {
         /// v2 模式: 闭包表达式在 arena 中的 NodeId
         v2_node_id: Option<usize>,
     },
-    Builtin(String),
+    Builtin(BuiltinKind),
     // v10: 多轮对话对象
     Conversation {
         messages: Vec<(String, String)>, // (role, content) 历史

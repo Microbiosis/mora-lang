@@ -196,9 +196,10 @@ impl Interpreter {
 
     /// 求值命名空间引用
     fn evaluate_namespace_ref(&self, namespace: &str, name: &str) -> Result<Value, String> {
+        use crate::value::BuiltinKind as Bk;
         match namespace {
-            "Router" if name == "new" => Ok(Value::Builtin("Router::new".to_string())),
-            "McpServer" if name == "new" => Ok(Value::Builtin("McpServer::new".to_string())),
+            "Router" if name == "new" => Ok(Value::Builtin(Bk::Router)),
+            "McpServer" if name == "new" => Ok(Value::Builtin(Bk::McpServer)),
             _ => Err(format!("Unknown namespace ref: {}::{}", namespace, name)),
         }
     }

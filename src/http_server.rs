@@ -171,16 +171,17 @@ pub fn start(
     let addr = format!("{}:{}", host, actual_port);
     eprintln!("[serve] Mora HTTP server listening on http://{}", addr);
     eprintln!("[serve] Endpoints:");
-    {
+    let by_method: HashMap<String, Vec<String>> = {
         let routes = routes.lock().expect("routes mutex poisoned");
-        let mut by_method: HashMap<&str, Vec<&str>> = HashMap::new();
+        let mut by_method: HashMap<String, Vec<String>> = HashMap::new();
         for (m, p) in routes.keys() {
-            by_method.entry(m.as_str()).or_default().push(p.as_str());
+            by_method.entry(m.clone()).or_default().push(p.clone());
         }
-        for (m, paths) in by_method {
-            for p in paths {
-                eprintln!("  {:6} {}", m, p);
-            }
+        by_method
+    };
+    for (m, paths) in &by_method {
+        for p in paths {
+            eprintln!("  {:6} {}", m, p);
         }
     }
     eprintln!();

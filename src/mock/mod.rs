@@ -141,7 +141,7 @@ mod tests {
         let r = MockRegistry::new();
         let closure = Value::Closure {
             params: vec!["x".to_string()],
-            env: Arc::new(Mutex::new(crate::value::Environment::new())),
+            env: crate::value::EnvRef(Box::<crate::value::Environment>::default()),
             v2_node_id: None,
         };
         r.register("script.handler", MockHandler::Script(closure));

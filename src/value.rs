@@ -97,6 +97,31 @@ impl std::fmt::Display for BuiltinKind {
     }
 }
 
+/// v0.40: Immutable Environment snapshot for closure captures.
+///
+/// Wraps a Box<Environment>. Unlike the legacy Arc<Mutex<Environment>>,
+/// an EnvRef is owned — the captured env is frozen at capture time
+/// and cannot be mutated by any other thread or closure. This also
+/// makes EnvRef Send (Box<Environment> is Send because Environment
+/// contains only Send-safe fields).
+#[derive(Debug, Clone)]
+pub struct EnvRef(pub Box<Environment>);
+
+impl EnvRef {
+    /// Returns an immutable reference to the inner Environment.
+    pub fn env(&self) -> &Environment {
+        &self.0
+    }
+
+    /// v0.40: convert an Arc<Mutex<Environment>> (legacy) into an
+    /// EnvRef snapshot. The snapshot clones the Environment contents
+    /// at capture time and is immutable thereafter.
+    pub fn from_arc_mutex(parent: std::sync::Arc<std::sync::Mutex<Environment>>) -> Self {
+        let env_clone = parent.lock().expect("env mutex poisoned").clone();
+        EnvRef(Box::new(env_clone))
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum Value {
     String(String),
@@ -119,7 +144,10 @@ pub enum Value {
     },
     Closure {
         params: Vec<String>,
-        env: Arc<Mutex<Environment>>,
+        /// v0.40: env is now EnvRef (Local Rc<RefCell> or Owned Box<Environment>)
+        /// instead of Arc<Mutex<Environment>>. Callers convert via
+        /// EnvRef::from_arc_mutex(arc) for legacy Arc<Mutex<>> sources.
+        env: EnvRef,
         /// v2 模式: 闭包表达式在 arena 中的 NodeId
         v2_node_id: Option<usize>,
     },
@@ -207,7 +235,7 @@ pub enum Value {
     },
 }
 
-// 手动实现 PartialEq（Arc<Mutex<Environment>> 不支持自动派生）
+// 手动实现 PartialEq（EnvRef 不支持自动派生）
 impl PartialEq for Value {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
@@ -407,7 +435,7 @@ fn fmt_inner(f: &mut std::fmt::Formatter<'_>, v: &Value, depth: usize) -> std::f
 }
 
 // ─── Environment ─────────────────────────────────────────
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Environment {
     pub values: HashMap<String, Value>,
     pub exports: HashMap<String, Value>,
@@ -435,6 +463,14 @@ impl Environment {
             exports: HashMap::new(),
             parent: Some(parent),
         }
+    }
+
+    /// v0.40: accept Rc<RefCell<>> for the new env model. Converts
+    /// to Arc<Mutex<>> internally for now (C1 shim, removed in C4).
+    pub fn with_parent_of_rc(parent: std::rc::Rc<std::cell::RefCell<Environment>>) -> Self {
+        Self::with_parent_of(std::sync::Arc::new(std::sync::Mutex::new(
+            parent.borrow().clone(),
+        )))
     }
 
     pub fn define(&mut self, name: String, value: Value, exported: bool) {
@@ -652,5 +688,15 @@ mod tests {
         let v = Value::Number(42.5);
         let s = format!("{}", v);
         assert_eq!(s, "42.5");
+    }
+
+    /// v0.40: EnvRef smoke test.
+    #[test]
+    fn envref_from_arc_mutex_roundtrip() {
+        let mut e = Environment::new();
+        e.define("x".to_string(), Value::String("y".to_string()), false);
+        let arc = std::sync::Arc::new(std::sync::Mutex::new(e));
+        let r = EnvRef::from_arc_mutex(arc);
+        assert_eq!(r.env().get("x"), Some(Value::String("y".to_string())));
     }
 }

@@ -1190,7 +1190,9 @@ impl Interpreter {
                     if let Some((closure_params, closure_body)) = closure_info {
                         // 使用子环境（避免 mutex 死锁）
                         let call_env = std::sync::Arc::new(std::sync::Mutex::new(
-                            crate::value::Environment::with_parent_of(env.clone()),
+                            crate::value::Environment::with_parent_of(std::sync::Arc::new(
+                                std::sync::Mutex::new((*env.0).clone()),
+                            )),
                         ));
                         // 绑定参数 — v0.35 (P0-C4): arity check
                         if args.len() < closure_params.len() {

@@ -322,7 +322,7 @@ impl Interpreter {
         let val = self.evaluate(expr, arena)?;
         for (pattern, body_ids) in arms {
             if let Some(bindings) = self.match_pattern(pattern, &val, arena) {
-                let env = Arc::new(Mutex::new(Environment::with_parent(
+                let env = Arc::new(Mutex::new(Environment::with_parent_of(
                     self.environment.clone(),
                 )));
                 for (name, value) in bindings {

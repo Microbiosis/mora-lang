@@ -393,7 +393,7 @@ impl Interpreter {
         arena: &AstArena,
     ) -> Option<Vec<(String, Value)>> {
         if let Some(bindings) = self.match_pattern(pattern, val, arena) {
-            let env = Arc::new(Mutex::new(Environment::with_parent(
+            let env = Arc::new(Mutex::new(Environment::with_parent_of(
                 self.environment.clone(),
             )));
             for (name, value) in &bindings {

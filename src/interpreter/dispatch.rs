@@ -416,7 +416,7 @@ impl Interpreter {
                         | Value::Compose(_)
                         | Value::Partial(_, _) => self.call_value(&value, args),
                         Value::Macro { params, .. } => {
-                            let env = Arc::new(Mutex::new(Environment::with_parent(
+                            let env = Arc::new(Mutex::new(Environment::with_parent_of(
                                 self.environment.clone(),
                             )));
                             for (i, param) in params.iter().enumerate() {
@@ -1112,7 +1112,7 @@ impl Interpreter {
         args: Vec<Value>,
         arena: &crate::ast_v2::AstArena,
     ) -> Result<Value, String> {
-        let call_env = Arc::new(Mutex::new(Environment::with_parent(
+        let call_env = Arc::new(Mutex::new(Environment::with_parent_of(
             self.environment.clone(),
         )));
         // v0.35 (P0-C4): surface arity errors instead of silently nil-filling.
@@ -1190,7 +1190,7 @@ impl Interpreter {
                     if let Some((closure_params, closure_body)) = closure_info {
                         // 使用子环境（避免 mutex 死锁）
                         let call_env = std::sync::Arc::new(std::sync::Mutex::new(
-                            crate::value::Environment::with_parent(env.clone()),
+                            crate::value::Environment::with_parent_of(env.clone()),
                         ));
                         // 绑定参数 — v0.35 (P0-C4): arity check
                         if args.len() < closure_params.len() {

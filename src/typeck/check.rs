@@ -113,8 +113,16 @@ impl TypeChecker {
                 self.check_expr(*value, arena, symbols);
             }
             StmtKind::Load { path, var, .. } => {
+                // v0.37 (P1-4.7): Load has no v2 executor (falls through to
+                // 'Unsupported v2 statement' at runtime; was orphaned
+                // since v0.34). Type the variable as String to match the
+                // semantically adjacent ReadFile family and give script
+                // authors a deterministic type for the (currently
+                // unimplemented) future Load. Documenting the dead-but-
+                // typeable status so the next v0.38 can implement an
+                // actual executor.
                 self.check_expr(*path, arena, symbols);
-                symbols.define(var.clone(), Type::Union(vec![]));
+                symbols.define(var.clone(), Type::String);
             }
             StmtKind::ReadFile { path, var, .. } | StmtKind::ReadBytesFile { path, var, .. } => {
                 self.check_expr(*path, arena, symbols);

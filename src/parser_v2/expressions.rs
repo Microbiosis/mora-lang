@@ -340,6 +340,22 @@ impl ParserV2 {
             self.arena
                 .alloc_expr(ExprKind::Literal(Literal::Nil(span)), span)
         } else if let Some(Token {
+            token_type: TokenType::Int(n),
+            ..
+        }) = self.peek().cloned()
+        {
+            self.advance();
+            self.arena
+                .alloc_expr(ExprKind::Literal(Literal::Int(n, span)), span)
+        } else if let Some(Token {
+            token_type: TokenType::Float(n),
+            ..
+        }) = self.peek().cloned()
+        {
+            self.advance();
+            self.arena
+                .alloc_expr(ExprKind::Literal(Literal::Float(n, span)), span)
+        } else if let Some(Token {
             token_type: TokenType::Number(n),
             ..
         }) = self.peek().cloned()

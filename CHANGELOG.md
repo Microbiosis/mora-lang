@@ -2,6 +2,56 @@
 
 All notable changes to Mora will be documented in this file.
 
+## [v0.40] - 2026-07-04 — Env Refactor (Closure Env Immutable)
+
+2 commits resolving Permanent #1 (Env cross-thread safety) — the
+LAST of the 5 "permanent debts" the v0.34 audit identified.
+
+### EnvRef immutable snapshot for closure captures
+
+- **`Value::Closure.env` now `EnvRef` (immutable Box<Environment>)**
+  instead of `Arc<Mutex<Environment>>` (shared mutable). The captured
+  environment is FROZEN at closure-creation time — no other thread or
+  closure can mutate a closure's bound variables.
+
+- **`EnvRef`** type introduced — a Box<Environment> wrapper that's
+  Send-safe (Environment contains only Send fields). `EnvRef::borrow()`
+  returns `&Environment` for read access. `EnvRef::from_arc_mutex()`
+  converts legacy `Arc<Mutex<>>` sources.
+
+- **3 Closure constructor sites** (evaluate:214, execute:562, mock:142)
+  now use `EnvRef::from_arc_mutex(self.environment.clone())`.
+- **1 Closure destructure site** (dispatch:1193) updated to clone
+  the inner Environment from EnvRef.
+
+- **NON-CHANGE**: `Interpreter.globals/environment` remain as
+  `Arc<Mutex<Environment>>` — the Rc<RefCell<>> optimization was
+  explored but rejected in v0.40 because it would make Interpreter
+  !Send (breaking HTTP/MCP worker boundaries). This is now
+  documented as a future optimization after Interpreter restructuring.
+
+### Closure env always Local (Immutable Snapshot)
+
+The v0.34 audit claimed "Env cross-thread safety" was a permanent debt.
+v0.40 resolves it by making closures own an immutable copy of the env
+at capture time. Cross-thread workers hold `Arc<Mutex<Interpreter>>` —
+the Interpreter's env chain stays as `Arc<Mutex<>>` (Send-safe), and
+each closure snapshot is an owned Box<Environment> (also Send-safe).
+
+No more "other thread could mutate my closure's env" concern.
+
+### Total impact
+- 2 commits on branch v0.40-env-refactor
+- ~30 LOC net + ~10 LOC tests
+- 1 new test (envref_from_arc_mutex_roundtrip)
+- 5 demos pass (pre-existing PDF test failures in worktree only)
+- 0 new deps
+- **FINAL permanent debt resolved**: v0.34 audit's 5 "permanent debts"
+  are now ALL solved (crossbeam v0.36, Type enum 8 variants v0.36,
+  NaN/Inf guard v0.36, numeric tower v0.38, env snapshot v0.40).
+
+---
+
 ## [v0.39] - 2026-07-03 — Env Refactor DEFERRED (No Functional Change)
 
 1 commit + 1 CHANGELOG; no functional changes shipped.

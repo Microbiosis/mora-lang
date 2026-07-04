@@ -108,7 +108,8 @@ impl std::fmt::Display for BuiltinKind {
 pub struct EnvRef(pub Box<Environment>);
 
 impl EnvRef {
-    pub fn borrow(&self) -> &Environment {
+    /// Returns an immutable reference to the inner Environment.
+    pub fn env(&self) -> &Environment {
         &self.0
     }
 
@@ -116,10 +117,7 @@ impl EnvRef {
     /// EnvRef snapshot. The snapshot clones the Environment contents
     /// at capture time and is immutable thereafter.
     pub fn from_arc_mutex(parent: std::sync::Arc<std::sync::Mutex<Environment>>) -> Self {
-        let env_clone = parent
-            .lock()
-            .expect("env mutex poisoned")
-            .clone();
+        let env_clone = parent.lock().expect("env mutex poisoned").clone();
         EnvRef(Box::new(env_clone))
     }
 }
@@ -469,9 +467,7 @@ impl Environment {
 
     /// v0.40: accept Rc<RefCell<>> for the new env model. Converts
     /// to Arc<Mutex<>> internally for now (C1 shim, removed in C4).
-    pub fn with_parent_of_rc(
-        parent: std::rc::Rc<std::cell::RefCell<Environment>>,
-    ) -> Self {
+    pub fn with_parent_of_rc(parent: std::rc::Rc<std::cell::RefCell<Environment>>) -> Self {
         Self::with_parent_of(std::sync::Arc::new(std::sync::Mutex::new(
             parent.borrow().clone(),
         )))
@@ -701,6 +697,6 @@ mod tests {
         e.define("x".to_string(), Value::String("y".to_string()), false);
         let arc = std::sync::Arc::new(std::sync::Mutex::new(e));
         let r = EnvRef::from_arc_mutex(arc);
-        assert_eq!(r.borrow().get("x"), Some(Value::String("y".to_string())));
+        assert_eq!(r.env().get("x"), Some(Value::String("y".to_string())));
     }
 }

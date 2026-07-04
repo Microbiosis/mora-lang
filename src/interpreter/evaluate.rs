@@ -213,7 +213,7 @@ impl Interpreter {
         let param_names: Vec<String> = params.iter().map(|(n, _)| n.clone()).collect();
         Ok(Value::Closure {
             params: param_names,
-            env: self.environment.clone(),
+            env: crate::value::EnvRef::from_arc_mutex(self.environment.clone()),
             v2_node_id: Some(expr_id.0),
         })
     }

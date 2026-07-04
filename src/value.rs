@@ -97,33 +97,30 @@ impl std::fmt::Display for BuiltinKind {
     }
 }
 
-/// v0.40: Two-tier Environment reference.
+/// v0.40: Immutable Environment snapshot for closure captures.
 ///
-/// - `Local`: Rc<RefCell<Environment>> — main-thread path. Cheap,
-///   single-threaded, NOT Send.
-/// - `Owned`: Box<Environment> — worker-boundary path. Thread-safe
-///   snapshot taken at the boundary via deep clone.
+/// Wraps a Box<Environment>. Unlike the legacy Arc<Mutex<Environment>>,
+/// an EnvRef is owned — the captured env is frozen at capture time
+/// and cannot be mutated by any other thread or closure. This also
+/// makes EnvRef Send (Box<Environment> is Send because Environment
+/// contains only Send-safe fields).
 #[derive(Debug, Clone)]
-pub enum EnvRef {
-    Local(std::rc::Rc<std::cell::RefCell<Environment>>),
-    Owned(Box<Environment>),
-}
+pub struct EnvRef(pub Box<Environment>);
 
 impl EnvRef {
-    pub fn into_local(self) -> std::rc::Rc<std::cell::RefCell<Environment>> {
-        match self {
-            EnvRef::Local(rc) => rc,
-            EnvRef::Owned(b) => {
-                std::rc::Rc::new(std::cell::RefCell::new(*b))
-            }
-        }
+    pub fn borrow(&self) -> &Environment {
+        &self.0
     }
 
-    pub fn as_local(&self) -> &std::rc::Rc<std::cell::RefCell<Environment>> {
-        match self {
-            EnvRef::Local(rc) => rc,
-            EnvRef::Owned(_) => panic!("EnvRef::as_local called on Owned variant"),
-        }
+    /// v0.40: convert an Arc<Mutex<Environment>> (legacy) into an
+    /// EnvRef snapshot. The snapshot clones the Environment contents
+    /// at capture time and is immutable thereafter.
+    pub fn from_arc_mutex(parent: std::sync::Arc<std::sync::Mutex<Environment>>) -> Self {
+        let env_clone = parent
+            .lock()
+            .expect("env mutex poisoned")
+            .clone();
+        EnvRef(Box::new(env_clone))
     }
 }
 
@@ -149,7 +146,10 @@ pub enum Value {
     },
     Closure {
         params: Vec<String>,
-        env: Arc<Mutex<Environment>>,
+        /// v0.40: env is now EnvRef (Local Rc<RefCell> or Owned Box<Environment>)
+        /// instead of Arc<Mutex<Environment>>. Callers convert via
+        /// EnvRef::from_arc_mutex(arc) for legacy Arc<Mutex<>> sources.
+        env: EnvRef,
         /// v2 模式: 闭包表达式在 arena 中的 NodeId
         v2_node_id: Option<usize>,
     },
@@ -237,7 +237,7 @@ pub enum Value {
     },
 }
 
-// 手动实现 PartialEq（Arc<Mutex<Environment>> 不支持自动派生）
+// 手动实现 PartialEq（EnvRef 不支持自动派生）
 impl PartialEq for Value {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
@@ -694,12 +694,13 @@ mod tests {
         assert_eq!(s, "42.5");
     }
 
-    /// v0.40: EnvRef round-trip smoke test.
+    /// v0.40: EnvRef smoke test.
     #[test]
-    fn envref_into_local_roundtrip() {
-        let e = Environment::new();
-        let r = EnvRef::Owned(Box::new(e.clone()));
-        let l = r.into_local();
-        assert!(l.borrow().get("x").is_none());
+    fn envref_from_arc_mutex_roundtrip() {
+        let mut e = Environment::new();
+        e.define("x".to_string(), Value::String("y".to_string()), false);
+        let arc = std::sync::Arc::new(std::sync::Mutex::new(e));
+        let r = EnvRef::from_arc_mutex(arc);
+        assert_eq!(r.borrow().get("x"), Some(Value::String("y".to_string())));
     }
 }

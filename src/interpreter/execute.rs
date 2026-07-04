@@ -561,7 +561,7 @@ impl Interpreter {
         let field_names: Vec<String> = fields.iter().map(|f| f.name.clone()).collect();
         let constructor = Value::Closure {
             params: field_names,
-            env: self.environment.clone(),
+            env: crate::value::EnvRef::from_arc_mutex(self.environment.clone()),
             v2_node_id: None,
         };
         self.environment

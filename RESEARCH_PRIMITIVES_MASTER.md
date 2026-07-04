@@ -1,6 +1,6 @@
 # Mora-lang 原语灵感总纲 — 全量研究文档
 
-> **研究跨度**: v0.34-v0.40 技术债清理 + 13 个开源项目深度解析  
+> **研究跨度**: v0.34-v0.40 技术债清理 + 17 个开源项目深度解析  
 > **文档定位**: 单一权威参考 — mora-lang v0.41+ 新功能路线图  
 > **日期**: 2026-07-04
 
@@ -16,8 +16,9 @@
 | 第 1 轮 | 1 | loongclaw (loong) |
 | 第 2 轮 | 2 | mini-swe-agent, CLI-Anything |
 | 第 3 轮 | 7 | AIOS, mimiclaw, OpenFugu, OpenInfer, MinerU, Headroom, Puter |
-| 第 4 轮 | 4 | multi-agent-revenue-orchestrator, pi-agent/pi-mono, ai-coder-symphony, AgentMesh |
-| **总计** | **15** | (含自检) |
+| 第 4 轮 | 4 | multi-agent-revenue-orchestrator, pi-agent/pi-mono, ai-coder-symphony, AgentMesh (MinimalFuture) |
+| 第 5 轮 | 3 | vesh-agents, AgentMesh Go (hupe1980), AgentMesh (Solace) |
+| **总计** | **17** | (含自检) |
 
 ### 技术债清理 (v0.34-v0.40)
 
@@ -355,6 +356,119 @@ mora-lang v0.32-0.34 对 7 个灵感项目的集成采用了一致模式:
 
 ---
 
+### 1.15 vesh-agents — 收入智能管线
+
+**来源**: PyPI `vesh-agents` v0.1.1 (GitHub 仓库 404, PyPI 文档可用)  
+**定位**: 基于 OpenAI Agents SDK 的 SaaS 收入智能框架. 6 个专门代理管道.
+
+#### 核心发现
+
+**管线架构** (硬编码 5 阶段管道):
+```
+DataConnector → EntityResolver → MetricComputer → AnomalyDetector → InsightReasoner
+    ↑                ↑               ↑               ↑              ↑
+ CSV/Stripe/     Blocking/       MRR/Churn/      Z-score/        BYOM LLM
+ Postgres         Scoring         ARPU/NRR        Rate-of-change  Explanation
+```
+
+**6 个代理**:
+| 代理 | 角色 | MCP 工具 |
+|---|---|---|
+| DataConnector | 从数据源提取数据 | `import_csv`, `extract_stripe`, `extract_postgres` |
+| EntityResolver | 跨数据源匹配记录 | `resolve_entities` (阻塞+评分) |
+| MetricComputer | 计算 SaaS 指标 (MRR, churn, ARPU, NRR, Quick Ratio) | `compute_metrics`, `list_metrics` |
+| AnomalyDetector | 统计异常检测 (Z-score, 变化率) | `detect_anomalies` |
+| InsightReasoner | 解释根因 (BYOM LLM) | `explain_anomaly` |
+| Vesh Orchestrator | 协调管道 | `analyze_csv` (全管道) |
+
+**关键模式**:
+- **管线转交**: 编排器将任务委派给专家, 不是 LLM 路由——基于数据流的硬编码管道
+- **无 LLM 快速路径**: `vesh analyze csv file.csv` 无需 LLM (指标计算是确定性的)
+- **BYOM**: 支持 `litellm/anthropic/claude-sonnet-4`, `openai/gpt-4o`, 等
+- **CLI + MCP 服务器**: 可从终端使用或集成到 Cursor/OpenCode/Claude Desktop
+- **实体解析**: 跨 Stripe/Postgres/CSV 的阻塞评分
+
+**mora-lang 映射**:
+| 原语 | mora-lang 位置 |
+|---|---|
+| 无 LLM 确定性管线 | `orchestrate { pipeline: [A, B, C] }` with `llm: none` |
+| 统计异常检测 | `data.anomaly(method: "zscore" | "rate_of_change")` |
+| 实体解析 | `data.resolve(sources: [csv, stripe, postgres])` |
+| MCP 服务器集成 | `mcp.serve(tools: [DataConnector, MetricComputer, ...])` |
+
+---
+
+### 1.16 AgentMesh Go (hupe1980) — Pregel BSP 图执行
+
+**仓库**: https://github.com/hupe1980/agentmesh (6 ⭐, Go)  
+**定位**: **生产级** 多代理编排框架, 由 Pregel 风格 BSP (批量同步并行) 图处理驱动.
+
+> ⚠️ **注意**: 这是与 MinimalFuture/AgentMesh (Python, LLM 作为路由器) **不同的项目**. hupe1980/agentmesh 是 Go 编写, 生产级, 基于 Pregel BSP 的真正并行执行.
+
+#### 核心发现
+
+**Pregel BSP 执行模型**:
+```
+Superstep 0 → 所有节点并行处理传入消息 → 全局屏障 → Superstep 1 → ...
+```
+- 每个超步: 所有工作节点并行运行, 通过消息总线通信
+- 全局屏障同步: 所有节点完成当前超步后才进入下一步
+- 确定性执行: 相同输入 → 相同输出
+
+**组件架构**:
+```
+应用层 (ReActAgent / SupervisorAgent / RAGAgent)
+    ↓
+图构建器 (验证拓扑, 流式 API)
+    ↓
+编译图 (不可变拓扑, Run() → events, 纯委托)
+    ↓
+接口层 (Structure / Executor / StateManager)
+    ↓
+执行器 (PregelExecutor BSP 超步, 并行工作节点, 消息总线)
+       (SequentialExecutor 拓扑顺序, 单线程)
+```
+
+**关键特性**:
+| 特性 | 实现 |
+|---|---|
+| **无锁状态管理** | 基于通道的状态, 带检查点 + 加密 + 签名 |
+| **零拷贝恢复** | CoW 检查点复用已保存的 map, 仅在键变更时分配 |
+| **WASM 沙箱** | 原生 WASM 沙箱, 集成完整性检查 |
+| **OpenTelemetry** | 内置指标, 非阻塞事件总线扇出 |
+| **A2A 协议** | 标准化多代理通信 |
+| **MCP 支持** | 来自模型上下文协议服务器的动态工具发现 |
+| **电路断路器 + 重试** | 可配置的重试策略 |
+| **人性化回路** | 带条件守卫的审批工作流 |
+| **Go 1.24+** | `iter.Seq2` 模式: `for msg, err := range graph.Run(ctx, input) { ... }` |
+
+**mora-lang 映射**:
+| 原语 | mora-lang 位置 |
+|---|---|
+| BSP 超步执行 | `orchestrate { steps: [step1, step2] }` with barrier sync |
+| 无锁状态管理 | `context.atom(key)` — lock-free 通道 |
+| 零拷贝检查点 | `checkpoint.save()` / `checkpoint.restore()` |
+| WASM 沙箱 | Future `sandbox.wasm(code)` |
+| 人性化回路 | `sandbox.approve { question: "..." }` — 条件守卫 |
+| Go iter.Seq2 模式 | Rust `Iterator<Item = Result<Message, Error>>` |
+
+---
+
+### 1.17 Solace Agent Mesh — 事件驱动多代理
+
+**仓库**: https://github.com/SolaceLabs/solace-agent-mesh  
+**定位**: 事件驱动框架, 用于构建和编排多代理 AI 系统. 基于 Solace 消息总线.
+
+**关键独有模式**:
+- **主题路由**: 代理通过 `topic/subtopic/action` 层次命名空间通信 (不是点对点)
+- **事件溯源**: 所有代理操作都是事件; 状态从事件日志重建
+- **消息持久化**: 代理离线后重连可重放消息
+- **动态代理发现**: 代理在启动时注册主题
+
+**mora-lang 映射**: `bus.subscribe("agent.research.*")` — 通配符订阅, 类似 Solace 的主题路由.
+
+---
+
 ## 2. 跨项目模式映射
 
 ### 2.1 重复模式 (3+ 项目)
@@ -364,12 +478,13 @@ mora-lang v0.32-0.34 对 7 个灵感项目的集成采用了一致模式:
 | **策略引擎 + 能力令牌** | loongclaw, AIOS | `sandbox.key { ... }` |
 | **审计日志 + 哈希链** | loongclaw, CLI-Anything (bundle trajectory) | `audit.jsonl` |
 | **工具注册表 + 双注册表** | loongclaw, CLI-Anything, mimiclaw | `mora-hub.json` |
-| **提供者分类 / ToolKind 枚举** | CLI-Anything (9 kinds), mimiclaw (tools vs skills) | `ToolKind` enum |
+| **提供者分类 / ToolKind 枚举** | CLI-Anything (9 kinds), mimiclaw (tools vs skills), vesh-agents (pipeline agents) | `ToolKind` enum |
 | **子进程隔离 + 进程组清除** | mini-swe-agent, pi-agent | `exec(cmd, timeout)` |
 | **异常即流程** | mini-swe-agent | `FlowSignal` 扩展 |
 | **持久记忆 (markdown)** | pi-agent, AgentMesh, mimiclaw | `memory.remember()` |
-| **共享上下文 / 黑板** | revenue-orchestrator, AgentMesh | `context.outputs` |
+| **共享上下文 / 黑板** | revenue-orchestrator, AgentMesh, vesh-agents (pipeline context) | `context.outputs` |
 | **编辑/优化循环** | CLI-Anything, pi-agent (--reflect) | `mora refine` |
+| **管线转交 (非 LLM 路由)** | vesh-agents (硬编码管道), AgentMesh (LLM-based) | `orchestrate` |
 
 ### 2.2 独有模式 (1 项目)
 
@@ -381,6 +496,12 @@ mora-lang v0.32-0.34 对 7 个灵感项目的集成采用了一致模式:
 | **递归 XY-cut** | MinerU | 递归投影轮廓分裂 |
 | **SHA-256 内容寻址** | Headroom | 哈希与内容相关, 非顺序计数器 |
 | **5 层 DI 容器** | Puter | config→clients→stores→services→controllers→drivers |
+| **Pregel BSP 超步执行** | AgentMesh Go (hupe1980) | 全局屏障同步, 确定性执行 |
+| **零拷贝 CoW 检查点恢复** | AgentMesh Go (hupe1980) | 10k+键检查点无 GC 峰值 |
+| **WASM 沙箱** | AgentMesh Go (hupe1980), loongclaw | 带完整性检查的 WASM 隔离 |
+| **无 LLM 确定性管线** | vesh-agents | 指标计算等无 LLM 快速路径 |
+| **主题路由 (层次命名空间)** | Solace Agent Mesh | `topic/subtopic/action` 发布-订阅 |
+| **事件溯源** | Solace Agent Mesh | 状态从事件日志重建 |
 
 ---
 

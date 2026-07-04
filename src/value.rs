@@ -97,6 +97,36 @@ impl std::fmt::Display for BuiltinKind {
     }
 }
 
+/// v0.40: Two-tier Environment reference.
+///
+/// - `Local`: Rc<RefCell<Environment>> — main-thread path. Cheap,
+///   single-threaded, NOT Send.
+/// - `Owned`: Box<Environment> — worker-boundary path. Thread-safe
+///   snapshot taken at the boundary via deep clone.
+#[derive(Debug, Clone)]
+pub enum EnvRef {
+    Local(std::rc::Rc<std::cell::RefCell<Environment>>),
+    Owned(Box<Environment>),
+}
+
+impl EnvRef {
+    pub fn into_local(self) -> std::rc::Rc<std::cell::RefCell<Environment>> {
+        match self {
+            EnvRef::Local(rc) => rc,
+            EnvRef::Owned(b) => {
+                std::rc::Rc::new(std::cell::RefCell::new(*b))
+            }
+        }
+    }
+
+    pub fn as_local(&self) -> &std::rc::Rc<std::cell::RefCell<Environment>> {
+        match self {
+            EnvRef::Local(rc) => rc,
+            EnvRef::Owned(_) => panic!("EnvRef::as_local called on Owned variant"),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum Value {
     String(String),
@@ -407,7 +437,7 @@ fn fmt_inner(f: &mut std::fmt::Formatter<'_>, v: &Value, depth: usize) -> std::f
 }
 
 // ─── Environment ─────────────────────────────────────────
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Environment {
     pub values: HashMap<String, Value>,
     pub exports: HashMap<String, Value>,
@@ -435,6 +465,16 @@ impl Environment {
             exports: HashMap::new(),
             parent: Some(parent),
         }
+    }
+
+    /// v0.40: accept Rc<RefCell<>> for the new env model. Converts
+    /// to Arc<Mutex<>> internally for now (C1 shim, removed in C4).
+    pub fn with_parent_of_rc(
+        parent: std::rc::Rc<std::cell::RefCell<Environment>>,
+    ) -> Self {
+        Self::with_parent_of(std::sync::Arc::new(std::sync::Mutex::new(
+            parent.borrow().clone(),
+        )))
     }
 
     pub fn define(&mut self, name: String, value: Value, exported: bool) {
@@ -652,5 +692,14 @@ mod tests {
         let v = Value::Number(42.5);
         let s = format!("{}", v);
         assert_eq!(s, "42.5");
+    }
+
+    /// v0.40: EnvRef round-trip smoke test.
+    #[test]
+    fn envref_into_local_roundtrip() {
+        let e = Environment::new();
+        let r = EnvRef::Owned(Box::new(e.clone()));
+        let l = r.into_local();
+        assert!(l.borrow().get("x").is_none());
     }
 }

@@ -618,6 +618,8 @@ impl Interpreter {
         match lit {
             crate::common::Literal::String(s, _) => Ok(self.intern_string(s.clone())),
             crate::common::Literal::Char(c, _) => Ok(Value::Char(*c)),
+            crate::common::Literal::Int(i, _) => Ok(Value::Int(*i)),
+            crate::common::Literal::Float(f, _) => Ok(Value::Float(*f)),
             crate::common::Literal::Number(n, _) => Ok(Value::Number(*n)),
             crate::common::Literal::Bool(b, _) => Ok(Value::Bool(*b)),
             crate::common::Literal::Nil(_) => Ok(Value::Nil),

@@ -802,6 +802,9 @@ impl TypeChecker {
             ExprKind::Literal(lit) => match lit {
                 crate::common::Literal::String(..) => Type::String,
                 crate::common::Literal::Char(..) => Type::Char,
+                // v0.38 (C4): Int/Float literals route to dedicated types.
+                crate::common::Literal::Int(..) => Type::Int,
+                crate::common::Literal::Float(..) => Type::Float,
                 crate::common::Literal::Number(..) => Type::Number,
                 crate::common::Literal::Bool(..) => Type::Bool,
                 crate::common::Literal::Nil(..) => Type::Nil,

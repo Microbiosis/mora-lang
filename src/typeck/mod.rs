@@ -39,6 +39,10 @@ pub enum Type {
     String,
     /// v0.x: 单字符类型（`string[number]` 索引结果）
     Char,
+    // v0.38: numeric tower — Int(i64) and Float(f64) as distinct types.
+    // `Number` is the legacy f64 type retained for unsuffixed literals.
+    Int,
+    Float,
     Number,
     Bool,
     Nil,
@@ -113,6 +117,9 @@ impl Type {
         match self {
             Type::String => "string".to_string(),
             Type::Char => "char".to_string(),
+            // v0.38: Int and Float distinct; Number legacy.
+            Type::Int => "int".to_string(),
+            Type::Float => "float".to_string(),
             Type::Number => "number".to_string(),
             Type::Bool => "bool".to_string(),
             Type::Nil => "nil".to_string(),
@@ -990,6 +997,8 @@ fn substitute_type_hint(
 #[allow(dead_code)]
 fn type_to_hint_string(ty: &Type) -> String {
     match ty {
+        Type::Int => "int".to_string(),
+        Type::Float => "float".to_string(),
         Type::Number => "number".to_string(),
         Type::String => "string".to_string(),
         Type::Char => "char".to_string(),
@@ -2002,7 +2011,9 @@ end
         fn _check() {
             // 直接 match 必须穷尽
             let _t = match Type::Number {
-                Type::Number
+                Type::Int
+                | Type::Float
+                | Type::Number
                 | Type::String
                 | Type::Char
                 | Type::Bool

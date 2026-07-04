@@ -76,6 +76,10 @@ pub enum TokenType {
     /// v0.x: 单字符字面量（`'a'`）
     Char(char),
     PromptString(String), // v0.04.0: p"..."
+    // v0.38: numeric tower — distinct Int/Float tokens. Number is the
+    // legacy default for unsuffixed literals.
+    Int(i64),
+    Float(f64),
     Number(f64),
     Plus,
     Minus,
@@ -728,19 +732,87 @@ impl Lexer {
                 self.advance();
             }
         }
-        let value: String = self.source[start..self.current].iter().collect();
-        let num: f64 = match value.parse() {
-            Ok(n) => n,
-            Err(_) => {
-                return self.error_token(
-                    start_line,
-                    start_col,
-                    &format!("Invalid number literal: {}", value),
-                );
+        // v0.38: detect `i` / `u` / `f` / `I` suffix for Int/Number/Float.
+        let mut value: String = self.source[start..self.current].iter().collect();
+        let mut suffix: Option<char> = None;
+        if matches!(self.peek(), 'i' | 'I' | 'u' | 'U' | 'f' | 'F') {
+            suffix = Some(self.advance());
+            // Optional width: 8/16/32/64.
+            while self.peek().is_ascii_digit() {
+                value.push(self.advance());
             }
+        }
+        let tt = if let Some(s) = suffix {
+            match s {
+                'i' | 'I' => {
+                    // Parse as integer — strip the trailing width digits
+                    // and suffix character before parsing the body.
+                    let digits: String = value
+                        .chars()
+                        .take_while(|c| c.is_ascii_digit() || *c == '-')
+                        .collect();
+                    match digits.parse::<i64>() {
+                        Ok(n) => TokenType::Int(n),
+                        Err(_) => {
+                            return self.error_token(
+                                start_line,
+                                start_col,
+                                &format!("Invalid integer literal: {}", value),
+                            );
+                        }
+                    }
+                }
+                'u' | 'U' => {
+                    // Same as int but cast via i64 (mora doesn't model unsigned).
+                    let digits: String = value
+                        .chars()
+                        .take_while(|c| c.is_ascii_digit() || *c == '-')
+                        .collect();
+                    match digits.parse::<i64>() {
+                        Ok(n) => TokenType::Int(n),
+                        Err(_) => {
+                            return self.error_token(
+                                start_line,
+                                start_col,
+                                &format!("Invalid integer literal: {}", value),
+                            );
+                        }
+                    }
+                }
+                'f' | 'F' => {
+                    // Float — re-parse with suffix stripped (was parsed as
+                    // a partial number above). The trailing chars we
+                    // appended are width digits ('32'/'64'), which are
+                    // safe to drop.
+                    let num: f64 = match value.parse() {
+                        Ok(n) => n,
+                        Err(_) => {
+                            return self.error_token(
+                                start_line,
+                                start_col,
+                                &format!("Invalid float literal: {}", value),
+                            );
+                        }
+                    };
+                    TokenType::Float(num)
+                }
+                _ => unreachable!(),
+            }
+        } else {
+            let num: f64 = match value.parse() {
+                Ok(n) => n,
+                Err(_) => {
+                    return self.error_token(
+                        start_line,
+                        start_col,
+                        &format!("Invalid number literal: {}", value),
+                    );
+                }
+            };
+            TokenType::Number(num)
         };
         Token {
-            token_type: TokenType::Number(num),
+            token_type: tt,
             line: start_line,
             column: start_col,
         }

@@ -94,9 +94,20 @@ pub fn is_pipe_method(name: &str) -> bool {
 }
 
 /// 二元操作求值
+///
+/// v0.38 (C5): addition follows the same Rust-strict promotion rules.
 pub fn eval_binary(left: Value, op: &BinaryOp, right: Value) -> Result<Value, String> {
     match op {
         BinaryOp::Add => match (&left, &right) {
+            // Strict: Int+Int -> Int
+            (Value::Int(a), Value::Int(b)) => Ok(Value::Int(a + b)),
+            // Strict: Float+Float -> Float
+            (Value::Float(a), Value::Float(b)) => Ok(Value::Float(a + b)),
+            // Mixed -> error
+            (Value::Int(_), Value::Float(_)) | (Value::Float(_), Value::Int(_)) => {
+                Err("operator '+' requires both operands to be same numeric type (Int or Float, Rust-strict mode)".to_string())
+            }
+            // Legacy Number compatibility for unsuffixed literals
             (Value::Number(a), Value::Number(b)) => Ok(Value::Number(a + b)),
             (Value::String(a), Value::String(b)) => Ok(Value::String(format!("{}{}", a, b))),
             // 字符串 + 任意类型 → 自动转字符串拼接
@@ -162,12 +173,38 @@ pub fn eval_binary(left: Value, op: &BinaryOp, right: Value) -> Result<Value, St
 }
 
 /// 数值操作辅助
+///
+/// v0.38 (C5): numeric tower — promotion rules (Rust-strict style):
+/// - `Int + Int = Int`        (pure integer arithmetic)
+/// - `Float + Float = Float`  (pure float arithmetic)
+/// - `Int + Float` / `Float + Int` -> strict type error
+/// - Mixed with `Number` -> coerced to f64 (back-compat for unsuffixed literals).
 pub fn numeric_op<F>(left: Value, right: Value, op: F) -> Result<Value, String>
 where
     F: Fn(f64, f64) -> f64,
 {
+    use Value::*;
     match (left, right) {
-        (Value::Number(a), Value::Number(b)) => Ok(Value::Number(op(a, b))),
+        // Strict: Int+Int -> Int
+        (Int(a), Int(b)) => {
+            let af = a as f64;
+            let bf = b as f64;
+            let result = op(af, bf).round() as i64;
+            Ok(Int(result))
+        }
+        // Strict: Float+Float -> Float
+        (Float(a), Float(b)) => Ok(Float(op(a, b))),
+        // Mixed types -> strict error
+        (Int(_), Float(_)) | (Float(_), Int(_)) => Err(
+            "numeric operator does not accept mixed Int and Float operands (Rust-strict mode)"
+                .to_string(),
+        ),
+        // Legacy Number compatibility
+        (Number(a), Number(b)) => Ok(Number(op(a, b))),
+        (Int(a), Number(b)) => Ok(Number(op(a as f64, b))),
+        (Number(a), Int(b)) => Ok(Number(op(a, b as f64))),
+        (Float(a), Number(b)) => Ok(Float(op(a, b))),
+        (Number(a), Float(b)) => Ok(Float(op(a, b))),
         // v0.17: 广播操作 - list op number
         (Value::List(list), Value::Number(scalar)) => {
             let result: Vec<Value> = list
@@ -210,12 +247,25 @@ where
 }
 
 /// 数值比较辅助
+///
+/// v0.38: Int/Int compare as i64, Float/Float as f64, mixed -> error.
 pub fn numeric_cmp<F>(left: Value, right: Value, op: F) -> Result<Value, String>
 where
     F: Fn(f64, f64) -> bool,
 {
+    use Value::*;
     match (left, right) {
-        (Value::Number(a), Value::Number(b)) => Ok(Value::Bool(op(a, b))),
+        (Int(a), Int(b)) => Ok(Bool(op(a as f64, b as f64))),
+        (Float(a), Float(b)) => Ok(Bool(op(a, b))),
+        (Int(_), Float(_)) | (Float(_), Int(_)) => Err(
+            "numeric comparison does not accept mixed Int and Float operands (Rust-strict mode)"
+                .to_string(),
+        ),
+        (Number(a), Number(b)) => Ok(Bool(op(a, b))),
+        (Int(a), Number(b)) => Ok(Bool(op(a as f64, b))),
+        (Number(a), Int(b)) => Ok(Bool(op(a, b as f64))),
+        (Float(a), Number(b)) => Ok(Bool(op(a, b))),
+        (Number(a), Float(b)) => Ok(Bool(op(a, b))),
         _ => Err("Operands must be numbers".to_string()),
     }
 }
@@ -239,6 +289,8 @@ pub fn literal_to_value_static(lit: &Literal) -> Value {
     match lit {
         Literal::String(s, _) => Value::String(s.clone()),
         Literal::Char(c, _) => Value::Char(*c),
+        Literal::Int(i, _) => Value::Int(*i),
+        Literal::Float(f, _) => Value::Float(*f),
         Literal::Number(n, _) => Value::Number(*n),
         Literal::Bool(b, _) => Value::Bool(*b),
         Literal::Nil(_) => Value::Nil,
@@ -271,6 +323,8 @@ pub fn type_name(value: &Value) -> &'static str {
     match value {
         Value::String(_) => "string",
         Value::Char(_) => "char",
+        Value::Int(_) => "int",
+        Value::Float(_) => "float",
         Value::Number(_) => "number",
         Value::Bool(_) => "bool",
         Value::Nil => "nil",
@@ -541,6 +595,9 @@ pub fn value_to_json(value: &Value) -> String {
     match value {
         Value::String(s) => format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\"")),
         Value::Char(c) => format!("\"{}\"", c),
+        // v0.38: Int formatted without decimal; Float always shows decimal.
+        Value::Int(i) => i.to_string(),
+        Value::Float(f) => f.to_string(),
         Value::Number(n) => {
             if n.fract() == 0.0 {
                 format!("{:.0}", n)
@@ -588,5 +645,116 @@ pub fn value_to_json(value: &Value) -> String {
         Value::Document { backend, .. } => {
             format!("\"<document origin=\\\"{}\\\">\"", backend.origin())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::common::BinaryOp;
+    use crate::typeck::Type;
+
+    /// v0.38: Int + Int = Int (no silent promotion to Float).
+    #[test]
+    fn numeric_tower_int_plus_int_yields_int() {
+        let l = Value::Int(2);
+        let r = Value::Int(3);
+        let v = numeric_op(l, r, |a, b| a + b).unwrap();
+        assert_eq!(v, Value::Int(5));
+    }
+
+    /// v0.38: Float + Float = Float.
+    #[test]
+    fn numeric_tower_float_plus_float_yields_float() {
+        let l = Value::Float(1.5);
+        let r = Value::Float(2.5);
+        let v = numeric_op(l, r, |a, b| a + b).unwrap();
+        assert_eq!(v, Value::Float(4.0));
+    }
+
+    /// v0.38: Int + Float is a STRICT error (Rust-style).
+    #[test]
+    fn numeric_tower_int_plus_float_is_error() {
+        let l = Value::Int(2);
+        let r = Value::Float(3.0);
+        let v = numeric_op(l, r, |a, b| a + b);
+        assert!(v.is_err(), "expected strict error, got: {:?}", v);
+    }
+
+    /// v0.38: Float + Int is symmetric — also error.
+    #[test]
+    fn numeric_tower_float_plus_int_is_error() {
+        let l = Value::Float(2.0);
+        let r = Value::Int(3);
+        let v = numeric_op(l, r, |a, b| a + b);
+        assert!(v.is_err());
+    }
+
+    /// v0.38: legacy Number mixed with Int coerces to f64.
+    #[test]
+    fn numeric_tower_number_int_compat() {
+        let l = Value::Number(2.0);
+        let r = Value::Int(3);
+        let v = numeric_op(l, r, |a, b| a + b).unwrap();
+        assert_eq!(v, Value::Number(5.0));
+    }
+
+    /// v0.38: legacy Number mixed with Float coerces to f64.
+    #[test]
+    fn numeric_tower_number_float_compat() {
+        let l = Value::Number(2.0);
+        let r = Value::Float(3.0);
+        let v = numeric_op(l, r, |a, b| a + b).unwrap();
+        assert_eq!(v, Value::Float(5.0));
+    }
+
+    /// v0.38: eval_binary Add(Int, Int) -> Int.
+    #[test]
+    fn eval_binary_int_add() {
+        let v = eval_binary(Value::Int(2), &BinaryOp::Add, Value::Int(3)).unwrap();
+        assert_eq!(v, Value::Int(5));
+    }
+
+    /// v0.38: eval_binary Add(Float, Float) -> Float.
+    #[test]
+    fn eval_binary_float_add() {
+        let v = eval_binary(Value::Float(1.5), &BinaryOp::Add, Value::Float(2.5)).unwrap();
+        assert_eq!(v, Value::Float(4.0));
+    }
+
+    /// v0.38: eval_binary Add(Int, Float) -> strict error.
+    #[test]
+    fn eval_binary_int_float_add_is_error() {
+        let v = eval_binary(Value::Int(2), &BinaryOp::Add, Value::Float(3.0));
+        assert!(v.is_err());
+    }
+
+    /// v0.38: numeric_cmp Int < Int.
+    #[test]
+    fn numeric_cmp_int_lt() {
+        let v = numeric_cmp(Value::Int(1), Value::Int(2), |a, b| a < b).unwrap();
+        assert_eq!(v, Value::Bool(true));
+    }
+
+    /// v0.38: numeric_cmp Float == Float.
+    #[test]
+    fn numeric_cmp_float_eq() {
+        let v = numeric_cmp(Value::Float(1.5), Value::Float(1.5), |a, b| a == b).unwrap();
+        assert_eq!(v, Value::Bool(true));
+    }
+
+    /// v0.38: numeric_cmp Int vs Float is error.
+    #[test]
+    fn numeric_cmp_int_float_is_error() {
+        let v = numeric_cmp(Value::Int(1), Value::Float(1.0), |a, b| a < b);
+        assert!(v.is_err());
+    }
+
+    /// v0.38: typeck still routes Int literal to Type::Int.
+    #[test]
+    fn type_int_name() {
+        assert_eq!(Type::Int.name(), "int");
+        assert_eq!(Type::Float.name(), "float");
+        assert_eq!(Type::Number.name(), "number");
     }
 }

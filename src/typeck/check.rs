@@ -482,6 +482,11 @@ impl TypeChecker {
     }
 
     /// 检查 with 语句
+    ///
+    /// v0.37 (P2-4.15): validate each binding key against the runtime's
+    /// recognized `with` key set. The runtime silently drops unknown
+    /// keys (see execute.rs:386 `_ => {}`); surfacing this as a typeck
+    /// error avoids misconfiguration footguns.
     fn check_with_stmt(
         &mut self,
         bindings: &[(String, NodeId)],
@@ -489,7 +494,27 @@ impl TypeChecker {
         arena: &AstArena,
         symbols: &mut SymbolTable,
     ) {
-        for (_, expr_id) in bindings {
+        const WITH_KEYS: &[&str] = &[
+            "model",
+            "temperature",
+            "max_tokens",
+            "system",
+            "mock_llm",
+            "compact_at",
+        ];
+        for (key, expr_id) in bindings {
+            if !WITH_KEYS.contains(&key.as_str()) {
+                let val_span = self.span_of_expr(arena, *expr_id);
+                self.errors.push(TypeError::from_span(
+                    &val_span,
+                    format!("unknown 'with' config key '{}'", key),
+                ));
+                let e = self.errors.last_mut().unwrap();
+                e.actual = Some(key.clone());
+                e.expected =
+                    Some(format!("one of: {}", WITH_KEYS.join(", ")));
+                e.hint = Some("verify the spelling; unknown keys are silently dropped at runtime".to_string());
+            }
             self.check_expr(*expr_id, arena, symbols);
         }
         for stmt_id in body {

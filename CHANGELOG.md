@@ -2,6 +2,80 @@
 
 All notable changes to Mora will be documented in this file.
 
+## [v0.38] - 2026-07-03 — Numeric Tower (Half Final)
+
+7 commits resolving Permanent #2 (numeric tower) partial migration.
+Env refactor (Permanent #1 cross-thread gap, P1-2.8) deferred to
+v0.39 — see "Deferred to v0.39" section below for why.
+
+### Numeric tower complete (Permanent #2)
+
+- **`Value::Int(i64)` + `Value::Float(f64)` variants** — added
+  alongside legacy `Value::Number(f64)`. The 3 numeric variants
+  participate in Display / PartialEq / Hash / JSON encoding /
+  type_name().
+
+- **`Literal::Int(i64, Span)` + `Literal::Float(f64, Span)`** —
+  parsed from `1i`, `1f` suffixes. flow.rs + evaluate.rs +
+  literal_to_value_inner + typeck all handle the new variants.
+
+- **Lexer recognizes `1i` / `1u` / `1f` / `1.0f` / `1.0f64` suffixes** —
+  `number_from()` detects the optional suffix character + width.
+  Parser routes Int/Float tokens to corresponding Literal arms.
+
+- **`Type::Int` + `Type::Float` variants** — name() / type_to_hint_string
+  / exhaustiveness tests updated. Literal::Int now produces
+  `Type::Int` (not the legacy Number fallback).
+
+- **Strict numeric promotion (Rust-style)**:
+  - `Int + Int = Int` (pure integer arithmetic)
+  - `Float + Float = Float` (pure float arithmetic)
+  - `Int + Float` / `Float + Int` → **strict type error**
+  - Mixed with `Number` (legacy) → coerced to f64 (back-compat)
+
+- **13 new tests** covering Int promotion, Float promotion,
+  strict mixed errors, Number compat, eval_binary Add,
+  numeric_cmp Lt/Eq, typeck Type::Int/Float name.
+
+### Deferred to v0.39 (Env refactor — was 3 commits in plan)
+
+The v0.38 plan included an Env refactor (Permanent #1: cross-thread
+Env safety) implementing:
+- `EnvRef` two-tier enum (Local Rc<RefCell> / Owned Box<Environment>)
+- `Closure.env` typed as `EnvRef` (was `Arc<Mutex<Environment>>`)
+- Interpreter globals/environment → `Rc<RefCell<>>`
+- Worker boundary (HTTP/MCP/parallel) creates `EnvRef::Owned`
+  via deep clone of `String → Value` data
+- Cycle guard via `HashSet<*const Environment>` during deep clone
+
+**Status: not landed in v0.38**. During C6 implementation we hit
+18+ compile errors spanning value.rs, interpreter/{mod,evaluate,
+execute,dispatch}, http_server.rs, mcp_server.rs, mock/mod.rs.
+The error pattern (`Rc<RefCell<...>>` cannot be sent across threads)
+**affirms the v0.34 audit's "permanent debt" tag** for this item.
+
+Two lessons learned:
+1. The full refactor requires coordinated changes across 8 files.
+   Splitting per-commit would break the build at every step.
+2. Rc<RefCell> is fundamentally not Send, so any interpreter path
+   that crosses thread boundaries (HTTP server spawn, MCP server
+   spawn, parallel Worker block) must explicitly convert to
+   EnvRef::Owned.
+
+**v0.39 will be dedicated to this single Env refactor** as a
+multi-commit coordinated change. v0.38 left the Interpreter struct
+untouched (globals/environment still `Arc<Mutex<Environment>>`),
+so the codebase compiles cleanly.
+
+### Total impact
+- 7 commits on branch `v0.38-numeric-env`
+- ~300 LOC net + 200 LOC tests
+- 350 tests pass; 0 failures (was 337, +13 numeric tower)
+- 5 demos × unchanged pass count
+- 0 new deps
+
+---
+
 ## [v0.37] - 2026-07-03 — Debt Cleanup Round 3 (Final Pre-v0.38)
 
 8 commits resolving the remaining P1 + P2 audit items + 1 cleanup.

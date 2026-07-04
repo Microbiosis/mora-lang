@@ -195,9 +195,10 @@ where
         // Strict: Float+Float -> Float
         (Float(a), Float(b)) => Ok(Float(op(a, b))),
         // Mixed types -> strict error
-        (Int(_), Float(_)) | (Float(_), Int(_)) => Err(format!(
+        (Int(_), Float(_)) | (Float(_), Int(_)) => Err(
             "numeric operator does not accept mixed Int and Float operands (Rust-strict mode)"
-        )),
+                .to_string(),
+        ),
         // Legacy Number compatibility
         (Number(a), Number(b)) => Ok(Number(op(a, b))),
         (Int(a), Number(b)) => Ok(Number(op(a as f64, b))),
@@ -256,9 +257,10 @@ where
     match (left, right) {
         (Int(a), Int(b)) => Ok(Bool(op(a as f64, b as f64))),
         (Float(a), Float(b)) => Ok(Bool(op(a, b))),
-        (Int(_), Float(_)) | (Float(_), Int(_)) => Err(format!(
+        (Int(_), Float(_)) | (Float(_), Int(_)) => Err(
             "numeric comparison does not accept mixed Int and Float operands (Rust-strict mode)"
-        )),
+                .to_string(),
+        ),
         (Number(a), Number(b)) => Ok(Bool(op(a, b))),
         (Int(a), Number(b)) => Ok(Bool(op(a as f64, b))),
         (Number(a), Int(b)) => Ok(Bool(op(a, b as f64))),

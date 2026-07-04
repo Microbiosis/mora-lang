@@ -738,7 +738,7 @@ impl Lexer {
         if matches!(self.peek(), 'i' | 'I' | 'u' | 'U' | 'f' | 'F') {
             suffix = Some(self.advance());
             // Optional width: 8/16/32/64.
-            while matches!(self.peek(), '0'..='9') {
+            while self.peek().is_ascii_digit() {
                 value.push(self.advance());
             }
         }

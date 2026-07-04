@@ -445,7 +445,7 @@ impl Interpreter {
     }
 
     pub fn new_with_globals(globals: Arc<Mutex<Environment>>) -> Self {
-        let env = Arc::new(Mutex::new(Environment::with_parent(globals.clone())));
+        let env = Arc::new(Mutex::new(Environment::with_parent_of(globals.clone())));
         Self {
             globals: globals.clone(),
             environment: env,

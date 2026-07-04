@@ -2,6 +2,59 @@
 
 All notable changes to Mora will be documented in this file.
 
+## [v0.39] - 2026-07-03 — Env Refactor DEFERRED (No Functional Change)
+
+1 commit + 1 CHANGELOG; no functional changes shipped.
+
+### Status: Env refactor not completed
+
+The plan to add `EnvRef` (Local Rc<RefCell> / Owned Box<Environment>)
+to replace `Arc<Mutex<Environment>>` in `Value::Closure.env` was
+attempted but **not landed**. The change cascades across 8 files
+and triggers 19+ compile errors at each step:
+
+- `value.rs` (Closure.env, Environment.parent, 6 parent.lock() sites)
+- `interpreter/mod.rs` (globals/environment fields + 4 Self{} blocks)
+- `interpreter/{dispatch,evaluate,execute}.rs` (~15 self.environment.clone()
+  + Arc::new(Mutex::new(...)) sites)
+- `interpreter/{orchestrate,trait_dispatch,ai_chat,ai_helpers,builtins}.rs`
+  (~30 .lock().expect() sites)
+- `mock/mod.rs` (Closure constructor)
+- `http_server.rs` + `mcp_server.rs` (worker boundary std::thread::spawn)
+- All cross-thread Captures need `EnvRef::Owned` deep clone (cycle
+  guard via HashSet<*const Environment>)
+
+The v0.34 audit's "permanent debt" tag for this item is now **fully
+vindicated**: this refactor is multi-day coordinated work. v0.38's
+release notes claimed it would land in v0.39; v0.39 partial work
+proves the size.
+
+### What landed (1 commit)
+- `refactor(v0.39): rename Environment::with_parent -> with_parent_of`
+  — frees the name `with_parent` for the v0.40 Env helper that
+  will uniformly dispatch across `EnvRef::Local`/`EnvRef::Owned`.
+
+### v0.40 plan (next version)
+
+Single multi-commit coordinated refactor:
+1. `value.rs`: add `EnvRef` enum (Local Rc<RefCell> / Owned Box<Environment>).
+2. `value.rs`: change `Closure.env: EnvRef`, `Environment.parent: Option<Box<EnvRef>>`.
+3. `value.rs`: replace 6 `parent.lock()` sites with `self.with_parent(|p| ...)`.
+4. `interpreter/mod.rs`: `globals/environment: Rc<RefCell<>>` (single atomic
+   change with all 4 Self{} blocks + Clone impl + 30 .lock()→.borrow()).
+5. `interpreter/{dispatch,evaluate,execute}.rs`: propagate EnvRef to
+   closure constructors + task body.
+6. `mock/mod.rs`: Closure env uses EnvRef::Local.
+7. `http_server.rs` + `mcp_server.rs`: at `std::thread::spawn` boundary,
+   deep clone `EnvRef::Local` to `EnvRef::Owned`. Add `cycle_detected`
+   guard via HashSet.
+8. Tests: cross-thread closure isolation + Send/Sync assertions.
+9. CHANGELOG + merge.
+
+Estimated: 6-8 atomic commits, ~500 LOC, 1 full day of work.
+
+---
+
 ## [v0.38] - 2026-07-03 — Numeric Tower (Half Final)
 
 7 commits resolving Permanent #2 (numeric tower) partial migration.

@@ -429,7 +429,7 @@ impl Environment {
         }
     }
 
-    pub fn with_parent(parent: Arc<Mutex<Environment>>) -> Self {
+    pub fn with_parent_of(parent: Arc<Mutex<Environment>>) -> Self {
         Self {
             values: HashMap::new(),
             exports: HashMap::new(),

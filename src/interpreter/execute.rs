@@ -537,7 +537,12 @@ impl Interpreter {
     ) -> Result<FlowSignal, String> {
         let mut enum_map = std::collections::HashMap::new();
         for v in variants {
-            enum_map.insert(v.name.clone(), Value::Builtin(v.name.clone()));
+            enum_map.insert(
+                v.name.clone(),
+                // v0.37 (P1-3.6): arbitrary enum variant names are not
+                // registered BuiltinKind variants; use Value::String.
+                Value::String(v.name.clone()),
+            );
         }
         self.environment
             .lock()

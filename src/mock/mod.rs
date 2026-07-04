@@ -68,32 +68,6 @@ impl MockRegistry {
         map.get(name).cloned()
     }
 
-    /// 调用 mock handler (Native-only). 返回 None 如果未注册或 handler 是 Script。
-    /// 注意：Script handler 需要 interpreter，应当通过 wrapper
-    /// `call_mock_method` (builtins.rs) 来调用，**不要**直接调用本方法。
-    ///
-    /// v0.35 (P0-A3): clone-and-drop — drop the lock before invoking the
-    /// handler so a Native handler that re-enters the registry on the
-    /// same thread does NOT deadlock.
-    /// v0.36 (P1-1.9): `#[deprecated]` — use `call_mock_method` from builtins.rs
-    /// which handles BOTH Native AND Script handlers correctly.
-    #[deprecated(
-        since = "0.0.36",
-        note = "use the wrapper call_mock_method from builtins.rs (handles Script handlers too)"
-    )]
-    pub fn call(&self, name: &str, args: &Value) -> Option<Value> {
-        let handler = self
-            .handlers
-            .lock()
-            .expect("mock registry mutex poisoned")
-            .get(name)
-            .cloned();
-        match handler {
-            Some(MockHandler::Native(f)) => Some(f(args)),
-            _ => None,
-        }
-    }
-
     /// 当前注册的 handler 数 (test helper)
     pub fn count(&self) -> usize {
         self.handlers
@@ -115,10 +89,6 @@ impl MockRegistry {
 
 #[cfg(test)]
 mod tests {
-    // v0.36 (P1-1.9): allow using deprecated `MockRegistry::call` from
-    // tests so removing it later is a separate concern.
-    #![allow(deprecated)]
-
     use super::*;
     use std::collections::HashMap;
 
@@ -151,7 +121,12 @@ mod tests {
             })),
         );
         let args = make_dict(&[("prompt", "hello")]);
-        let result = r.call("ai.chat", &args).unwrap();
+        // v0.37 (P1-3.12): use `get()` directly (MockRegistry::call
+        // was deleted). The Native handler is a closure we own.
+        let result = match r.get("ai.chat").unwrap() {
+            MockHandler::Native(f) => f(&args),
+            MockHandler::Script(_) => panic!("expected Native handler"),
+        };
         if let Value::Dict(d) = result {
             assert_eq!(d.get("text").unwrap().to_string(), "[mock] hello");
             assert_eq!(d.get("model").unwrap().to_string(), "mock");
@@ -178,14 +153,18 @@ mod tests {
         } else {
             panic!("expected Script handler");
         }
-        // call() 对 Script handler 返回 None
-        assert!(r.call("script.handler", &Value::Nil).is_none());
+        // v0.37: get() returns the handler; Script handlers cannot be
+        // invoked without an interpreter. Verify get() yields Script.
+        match r.get("script.handler").unwrap() {
+            MockHandler::Script(_) => {}
+            MockHandler::Native(_) => panic!("expected Script handler"),
+        }
     }
 
     #[test]
     fn call_unregistered_returns_none() {
         let r = MockRegistry::new();
-        assert!(r.call("nonexistent", &Value::Nil).is_none());
+        assert!(r.get("nonexistent").is_none());
     }
 
     #[test]
@@ -198,7 +177,7 @@ mod tests {
         assert_eq!(r.count(), 1);
         r.unregister("x");
         assert_eq!(r.count(), 0);
-        assert!(r.call("x", &Value::Nil).is_none());
+        assert!(r.get("x").is_none());
     }
 
     #[test]

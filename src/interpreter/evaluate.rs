@@ -310,6 +310,8 @@ impl Interpreter {
         let lit_val = match lit {
             crate::common::Literal::String(s, _) => Value::String(s.clone()),
             crate::common::Literal::Char(c, _) => Value::Char(*c),
+            crate::common::Literal::Int(i, _) => Value::Int(*i),
+            crate::common::Literal::Float(f, _) => Value::Float(*f),
             crate::common::Literal::Number(n, _) => Value::Number(*n),
             crate::common::Literal::Bool(b, _) => Value::Bool(*b),
             crate::common::Literal::Nil(_) => Value::Nil,

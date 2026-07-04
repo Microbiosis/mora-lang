@@ -27,6 +27,9 @@ impl Span {
 pub enum Literal {
     String(String, Span),
     Char(char, Span),
+    // v0.38: numeric tower — Int/Float distinct from Number legacy.
+    Int(i64, Span),
+    Float(f64, Span),
     Number(f64, Span),
     Bool(bool, Span),
     Nil(Span),

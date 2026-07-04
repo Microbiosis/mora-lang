@@ -239,6 +239,8 @@ pub fn literal_to_value_static(lit: &Literal) -> Value {
     match lit {
         Literal::String(s, _) => Value::String(s.clone()),
         Literal::Char(c, _) => Value::Char(*c),
+        Literal::Int(i, _) => Value::Int(*i),
+        Literal::Float(f, _) => Value::Float(*f),
         Literal::Number(n, _) => Value::Number(*n),
         Literal::Bool(b, _) => Value::Bool(*b),
         Literal::Nil(_) => Value::Nil,

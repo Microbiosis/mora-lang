@@ -7,6 +7,13 @@ use crate::ast_v2::{AstArena, ExprKind, NodeId, StmtKind};
 use crate::common::{BinaryOp, Span};
 
 impl TypeChecker {
+    /// v0.37 (P2-4.11): extract a Span from an expression's NodeId, falling
+    /// back to a 0/0 Span for dangling NodeIds. Used everywhere a typeck
+    /// error should report real source position.
+    fn span_of_expr(&self, arena: &AstArena, id: NodeId) -> Span {
+        arena.get_expr(id).map(|e| e.span).unwrap_or_default()
+    }
+
     /// 检查语句
     pub fn check_stmt(&mut self, kind: &StmtKind, arena: &AstArena, symbols: &mut SymbolTable) {
         match kind {
@@ -211,33 +218,32 @@ impl TypeChecker {
         symbols: &mut SymbolTable,
     ) {
         let init_ty = self.check_expr(init, arena, symbols);
+        let init_span = self.span_of_expr(arena, init);
         let declared = if let Some(hint) = type_hint {
             let t = Type::from_hint(hint);
             // 检查未知类型名
             if !is_known_type(hint) && !self.trait_registry.contains_key(hint) {
-                self.errors.push(TypeError {
-                    message: format!("unknown type name '{}'", hint),
-                    line: 0,
-                    column: 0,
-                    expected: None,
-                    actual: Some(hint.to_string()),
-                    hint: Some("check the type name spelling".to_string()),
-                });
+                self.errors.push(TypeError::from_span(
+                    &init_span,
+                    format!("unknown type name '{}'", hint),
+                ));
+                self.errors.last_mut().unwrap().actual = Some(hint.to_string());
+                self.errors.last_mut().unwrap().hint =
+                    Some("check the type name spelling".to_string());
             }
             // 检查兼容性
             if init_ty != Type::Union(vec![]) && !self.types_compatible(&t, &init_ty) {
-                self.errors.push(TypeError {
-                    message: format!(
+                self.errors.push(TypeError::from_span_with_detail(
+                    &init_span,
+                    format!(
                         "type mismatch: expected '{}', got '{}'",
                         t.name(),
                         init_ty.name()
                     ),
-                    line: 0,
-                    column: 0,
-                    expected: Some(t.name()),
-                    actual: Some(init_ty.name()),
-                    hint: Some("ensure the value matches the declared type".to_string()),
-                });
+                    t.name(),
+                    init_ty.name(),
+                    "ensure the value matches the declared type",
+                ));
             }
             t
         } else {
@@ -255,39 +261,37 @@ impl TypeChecker {
         symbols: &mut SymbolTable,
     ) {
         let _ty = self.check_expr(value, arena, symbols);
+        let value_span = self.span_of_expr(arena, value);
         let existing = symbols.lookup(name);
         if existing == Type::Union(vec![]) {
-            self.errors.push(TypeError {
-                message: format!("Undefined variable: {}", name),
-                line: 0,
-                column: 0,
-                expected: None,
-                actual: None,
-                hint: Some(format!("let {} = ...", name)),
-            });
+            self.errors.push(TypeError::from_span(
+                &value_span,
+                format!("Undefined variable: {}", name),
+            ));
+            self.errors.last_mut().unwrap().hint = Some(format!("let {} = ...", name));
         }
     }
 
     /// 检查 return 语句
     fn check_return_stmt(&mut self, expr_id: NodeId, arena: &AstArena, symbols: &mut SymbolTable) {
         let ret_ty = self.check_expr(expr_id, arena, symbols);
+        let ret_span = self.span_of_expr(arena, expr_id);
         if let Some(ref hint) = self.current_return_hint
             && ret_ty != Type::Union(vec![])
             && *hint != Type::Union(vec![])
             && !self.types_compatible(hint, &ret_ty)
         {
-            self.errors.push(TypeError {
-                message: format!(
+            self.errors.push(TypeError::from_span_with_detail(
+                &ret_span,
+                format!(
                     "return type mismatch: expected '{}', got '{}'",
                     hint.name(),
                     ret_ty.name()
                 ),
-                line: 0,
-                column: 0,
-                expected: Some(hint.name()),
-                actual: Some(ret_ty.name()),
-                hint: Some("ensure the return value matches the declared type".to_string()),
-            });
+                hint.name(),
+                ret_ty.name(),
+                "ensure the return value matches the declared type",
+            ));
         }
     }
 
@@ -302,14 +306,14 @@ impl TypeChecker {
     ) {
         let cond_ty = self.check_expr(condition, arena, symbols);
         if cond_ty != Type::Bool && cond_ty != Type::Union(vec![]) {
-            self.errors.push(TypeError {
-                message: format!("If condition must be bool, got {:?}", cond_ty),
-                line: 0,
-                column: 0,
-                expected: Some("bool".to_string()),
-                actual: Some(format!("{:?}", cond_ty)),
-                hint: None,
-            });
+            let cond_span = self.span_of_expr(arena, condition);
+            self.errors.push(TypeError::from_span_with_detail(
+                &cond_span,
+                format!("If condition must be bool, got {:?}", cond_ty),
+                "bool",
+                format!("{:?}", cond_ty),
+                "",
+            ));
         }
         symbols.push_scope();
         for stmt_id in then_branch {
@@ -345,17 +349,17 @@ impl TypeChecker {
             Type::String => symbols.define(var.to_string(), Type::Char),
             Type::Union(_) => symbols.define(var.to_string(), Type::Union(vec![])),
             _ => {
-                self.errors.push(TypeError {
-                    message: format!(
+                let iter_span = self.span_of_expr(arena, iterable);
+                self.errors.push(TypeError::from_span_with_detail(
+                    &iter_span,
+                    format!(
                         "for loop expects a list or string, got '{}'",
                         iterable_ty.name()
                     ),
-                    line: 0,
-                    column: 0,
-                    expected: Some("list | string".to_string()),
-                    actual: Some(iterable_ty.name()),
-                    hint: Some("convert to list or string first".to_string()),
-                });
+                    "list | string",
+                    iterable_ty.name(),
+                    "convert to list or string first",
+                ));
                 symbols.define(var.to_string(), Type::Union(vec![]));
             }
         }
@@ -384,18 +388,18 @@ impl TypeChecker {
             && val_ty != Type::Union(vec![])
             && !self.types_compatible(elem_ty, &val_ty)
         {
-            self.errors.push(TypeError {
-                message: format!(
+            let val_span = self.span_of_expr(arena, value);
+            self.errors.push(TypeError::from_span_with_detail(
+                &val_span,
+                format!(
                     "element type mismatch on assign: expected '{}', got '{}'",
                     elem_ty.name(),
                     val_ty.name()
                 ),
-                line: 0,
-                column: 0,
-                expected: Some(elem_ty.name()),
-                actual: Some(val_ty.name()),
-                hint: Some("ensure the value matches the list element type".to_string()),
-            });
+                elem_ty.name(),
+                val_ty.name(),
+                "ensure the value matches the list element type",
+            ));
         }
     }
 
@@ -1101,23 +1105,24 @@ impl TypeChecker {
                 if let Some(arg_expr) = arena.get_expr(*arg_id)
                     && let ExprKind::Closure { params, .. } = &arg_expr.kind
                 {
+                    let closure_span = arg_expr.span;
                     for (pname, phint) in params {
                         if phint.is_none() {
-                            self.errors.push(TypeError {
-                                message: format!(
+                            self.errors.push(TypeError::from_span(
+                                &closure_span,
+                                format!(
                                     "missing type annotation for closure parameter '{}'",
                                     pname
                                 ),
-                                line: 0,
-                                column: 0,
-                                expected: Some(elem_ty.name()),
-                                actual: Some("unknown".to_string()),
-                                hint: Some(format!(
-                                    "add type annotation: fn({}: {})",
-                                    pname,
-                                    elem_ty.name()
-                                )),
-                            });
+                            ));
+                            let e = self.errors.last_mut().unwrap();
+                            e.expected = Some(elem_ty.name());
+                            e.actual = Some("unknown".to_string());
+                            e.hint = Some(format!(
+                                "add type annotation: fn({}: {})",
+                                pname,
+                                elem_ty.name()
+                            ));
                         }
                     }
                 }

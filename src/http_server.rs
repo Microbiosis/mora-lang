@@ -366,6 +366,9 @@ fn value_to_json(v: &Value) -> JsonValue {
     match v {
         Value::Nil => JsonValue::Null,
         Value::Bool(b) => JsonValue::Bool(*b),
+        // v0.38: Int fits i64; Float and Number use f64.
+        Value::Int(i) => JsonValue::Number(*i as f64),
+        Value::Float(n) => JsonValue::Number(*n),
         Value::Number(n) => JsonValue::Number(*n),
         Value::String(s) => JsonValue::String_(s.clone()),
         Value::Char(c) => JsonValue::String_(c.to_string()),

@@ -102,6 +102,10 @@ pub enum Value {
     String(String),
     /// v0.x: 单字符（`string[number]` 索引结果）
     Char(char),
+    // v0.38: Numeric tower — distinct Int/Float variants for type safety.
+    // `Number(f64)` is kept as a legacy alias (default for unsuffixed literals).
+    Int(i64),
+    Float(f64),
     Number(f64),
     Bool(bool),
     Nil,
@@ -209,6 +213,8 @@ impl PartialEq for Value {
         match (self, other) {
             (Value::Nil, Value::Nil) => true,
             (Value::Number(a), Value::Number(b)) => a == b,
+            (Value::Int(a), Value::Int(b)) => a == b,
+            (Value::Float(a), Value::Float(b)) => a == b,
             (Value::String(a), Value::String(b)) => a == b,
             (Value::Char(a), Value::Char(b)) => a == b,
             (Value::Bool(a), Value::Bool(b)) => a == b,
@@ -239,6 +245,8 @@ impl std::fmt::Display for Value {
         match self {
             Value::String(s) => write!(f, "{}", s),
             Value::Char(c) => write!(f, "{}", c),
+            Value::Int(i) => write!(f, "{}", i),
+            Value::Float(x) => write!(f, "{}", x),
             Value::Number(n) => {
                 // v0.36 (P1-3.13): never panic on NaN/Inf — Display must be infallible.
                 if n.is_nan() {

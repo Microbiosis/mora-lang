@@ -271,6 +271,8 @@ pub fn type_name(value: &Value) -> &'static str {
     match value {
         Value::String(_) => "string",
         Value::Char(_) => "char",
+        Value::Int(_) => "int",
+        Value::Float(_) => "float",
         Value::Number(_) => "number",
         Value::Bool(_) => "bool",
         Value::Nil => "nil",
@@ -541,6 +543,9 @@ pub fn value_to_json(value: &Value) -> String {
     match value {
         Value::String(s) => format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\"")),
         Value::Char(c) => format!("\"{}\"", c),
+        // v0.38: Int formatted without decimal; Float always shows decimal.
+        Value::Int(i) => i.to_string(),
+        Value::Float(f) => f.to_string(),
         Value::Number(n) => {
             if n.fract() == 0.0 {
                 format!("{:.0}", n)

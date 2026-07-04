@@ -263,7 +263,7 @@ impl Interpreter {
                 let event = match args.first() {
                     Some(Value::String(s)) => s.clone(),
                     Some(_) => {
-                        return Err("bus.emit: first arg must be a string event name".to_string())
+                        return Err("bus.emit: first arg must be a string event name".to_string());
                     }
                     None => return Err("bus.emit: requires event name as first arg".to_string()),
                 };
@@ -276,7 +276,7 @@ impl Interpreter {
                 let pattern = match args.first() {
                     Some(Value::String(s)) => s.clone(),
                     Some(_) => {
-                        return Err("bus.off: first arg must be a string pattern".to_string())
+                        return Err("bus.off: first arg must be a string pattern".to_string());
                     }
                     None => return Err("bus.off: requires pattern as first arg".to_string()),
                 };
@@ -307,13 +307,11 @@ impl Interpreter {
                 let name = match args.first() {
                     Some(Value::String(s)) => s.clone(),
                     Some(_) => {
-                        return Err(
-                            "sandbox.check_builtin: name must be a string".to_string(),
-                        );
+                        return Err("sandbox.check_builtin: name must be a string".to_string());
                     }
                     None => {
                         return Err(
-                            "sandbox.check_builtin: requires builtin name as first arg".to_string(),
+                            "sandbox.check_builtin: requires builtin name as first arg".to_string()
                         );
                     }
                 };
@@ -324,14 +322,10 @@ impl Interpreter {
                 let path = match args.first() {
                     Some(Value::String(s)) => s.clone(),
                     Some(_) => {
-                        return Err(
-                            "sandbox.check_path: path must be a string".to_string(),
-                        );
+                        return Err("sandbox.check_path: path must be a string".to_string());
                     }
                     None => {
-                        return Err(
-                            "sandbox.check_path: requires path as first arg".to_string(),
-                        );
+                        return Err("sandbox.check_path: requires path as first arg".to_string());
                     }
                 };
                 Ok(Value::Bool(self.sandbox.check_path(&path).is_ok()))

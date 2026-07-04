@@ -2,6 +2,77 @@
 
 All notable changes to Mora will be documented in this file.
 
+## [v0.37] - 2026-07-03 — Debt Cleanup Round 3 (Final Pre-v0.38)
+
+8 commits resolving the remaining P1 + P2 audit items + 1 cleanup.
+v0.38 is reserved for the full numeric tower migration and the
+Env refactor (both deferred for risk management — see below).
+
+### Stringly-typed dispatch eliminated
+
+- **`Value::Builtin(String)` → `Value::Builtin(BuiltinKind)`** (P1-3.6)
+  22-variant enum covers every builtin the interpreter knows. The
+  giant `(name.as_str(), method)` tuple-match in `dispatch.rs:746`
+  replaced with an exhaustive `(BuiltinKind, method)` — compiler now
+  enforces adding a new builtin requires either updating dispatch or
+  routing through `call_*_method`.
+
+### Builtin boundary tightening
+
+- **bus.emit / bus.off / sandbox.check_* / schedule.add / ccr.put /
+  ccr.get / mock.register / unregister / call** all now require
+  `Value::String` for their primary argument (P1-3.7/3.8/3.9).
+  Previously a `Value::List {1, 2, 3}` silently became the literal
+  text `[1, 2, 3]` via `to_string()` — silent lossy bug. Now type
+  errors are raised immediately at the boundary.
+
+### Dead-code removals
+
+- **`MockRegistry::call` deleted entirely** (P1-3.12). v0.36 deprecated
+  it; v0.37 completes the deprecation by deleting the method. All
+  test sites use `MockRegistry::get()` to inspect handlers directly.
+
+### Type soundness holes closed
+
+- **`typeck Load` returns `Type::String`** (P1-4.7) — was `Union([])`
+  (= any). Aligns with semantically adjacent `ReadFile`. The `Load`
+  keyword still has no v2 executor (falls through to "Unsupported v2
+  statement"); a future commit will implement it.
+- **`typeck error Span positions`** (P2-4.11) — 7 of 11 sites now
+  carry the actual source location via `from_span_with_detail`. The
+  3 remaining `line: 0, column: 0` sites are inside `check_call_expr`
+  where the callee NodeId isn't threaded; deferred to v0.38.
+- **`typeck with-block validates key against whitelist** (P2-4.15) —
+  catches `with { modle = "x" }` (typo'd "model") at typeck time.
+  Runtime's `execute_with` silently dropped unknown keys; that gap
+  is now closed.
+
+### Concurrency tightening
+
+- **`http_server.rs` request handler** hoists method/path clones
+  before the route lookup lock (P1-1.6b) — critical section now
+  guards only HashMap ops, not String allocations.
+
+### Deferred to v0.38 (too large for this PR)
+
+- **Permanent #2 full numeric tower** (Value::Int(i64) / Float(f64) +
+  Literal::Int/Float + parser suffix + 258-site arithmetic sweep).
+  The naive approach via `as_f64()` helper was rejected — full
+  migration touches arithmetic promotion rules and needs careful
+  type promotion design.
+- **P1-2.8 Env refactor (LocalEnv Rc<RefCell>)** — requires worker
+  boundary redesign. Cross-thread closures mean plain `Rc` is unsafe;
+  the architecture needs a two-tier Environment model.
+
+### Total impact
+- 8 commits, single feature branch `v0.37-final-cleanup`
+- ~250 LOC net + ~50 LOC tests
+- 337 tests pass; 0 failures
+- 5 demos × unchanged pass count
+- 0 new deps
+
+---
+
 ## [v0.36] - 2026-07-03 — Type Completeness + Permanent Debt Resolution
 
 Round 2 of zero-trust audit cleanup. 14 commits resolving 11 P1 + 1 P2

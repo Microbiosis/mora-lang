@@ -511,9 +511,10 @@ impl TypeChecker {
                 ));
                 let e = self.errors.last_mut().unwrap();
                 e.actual = Some(key.clone());
-                e.expected =
-                    Some(format!("one of: {}", WITH_KEYS.join(", ")));
-                e.hint = Some("verify the spelling; unknown keys are silently dropped at runtime".to_string());
+                e.expected = Some(format!("one of: {}", WITH_KEYS.join(", ")));
+                e.hint = Some(
+                    "verify the spelling; unknown keys are silently dropped at runtime".to_string(),
+                );
             }
             self.check_expr(*expr_id, arena, symbols);
         }

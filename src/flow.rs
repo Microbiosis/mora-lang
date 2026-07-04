@@ -94,9 +94,20 @@ pub fn is_pipe_method(name: &str) -> bool {
 }
 
 /// 二元操作求值
+///
+/// v0.38 (C5): addition follows the same Rust-strict promotion rules.
 pub fn eval_binary(left: Value, op: &BinaryOp, right: Value) -> Result<Value, String> {
     match op {
         BinaryOp::Add => match (&left, &right) {
+            // Strict: Int+Int -> Int
+            (Value::Int(a), Value::Int(b)) => Ok(Value::Int(a + b)),
+            // Strict: Float+Float -> Float
+            (Value::Float(a), Value::Float(b)) => Ok(Value::Float(a + b)),
+            // Mixed -> error
+            (Value::Int(_), Value::Float(_)) | (Value::Float(_), Value::Int(_)) => {
+                Err("operator '+' requires both operands to be same numeric type (Int or Float, Rust-strict mode)".to_string())
+            }
+            // Legacy Number compatibility for unsuffixed literals
             (Value::Number(a), Value::Number(b)) => Ok(Value::Number(a + b)),
             (Value::String(a), Value::String(b)) => Ok(Value::String(format!("{}{}", a, b))),
             // 字符串 + 任意类型 → 自动转字符串拼接
@@ -162,12 +173,37 @@ pub fn eval_binary(left: Value, op: &BinaryOp, right: Value) -> Result<Value, St
 }
 
 /// 数值操作辅助
+///
+/// v0.38 (C5): numeric tower — promotion rules (Rust-strict style):
+/// - `Int + Int = Int`        (pure integer arithmetic)
+/// - `Float + Float = Float`  (pure float arithmetic)
+/// - `Int + Float` / `Float + Int` -> strict type error
+/// - Mixed with `Number` -> coerced to f64 (back-compat for unsuffixed literals).
 pub fn numeric_op<F>(left: Value, right: Value, op: F) -> Result<Value, String>
 where
     F: Fn(f64, f64) -> f64,
 {
+    use Value::*;
     match (left, right) {
-        (Value::Number(a), Value::Number(b)) => Ok(Value::Number(op(a, b))),
+        // Strict: Int+Int -> Int
+        (Int(a), Int(b)) => {
+            let af = a as f64;
+            let bf = b as f64;
+            let result = op(af, bf).round() as i64;
+            Ok(Int(result))
+        }
+        // Strict: Float+Float -> Float
+        (Float(a), Float(b)) => Ok(Float(op(a, b))),
+        // Mixed types -> strict error
+        (Int(_), Float(_)) | (Float(_), Int(_)) => Err(format!(
+            "numeric operator does not accept mixed Int and Float operands (Rust-strict mode)"
+        )),
+        // Legacy Number compatibility
+        (Number(a), Number(b)) => Ok(Number(op(a, b))),
+        (Int(a), Number(b)) => Ok(Number(op(a as f64, b))),
+        (Number(a), Int(b)) => Ok(Number(op(a, b as f64))),
+        (Float(a), Number(b)) => Ok(Float(op(a, b))),
+        (Number(a), Float(b)) => Ok(Float(op(a, b))),
         // v0.17: 广播操作 - list op number
         (Value::List(list), Value::Number(scalar)) => {
             let result: Vec<Value> = list
@@ -210,12 +246,24 @@ where
 }
 
 /// 数值比较辅助
+///
+/// v0.38: Int/Int compare as i64, Float/Float as f64, mixed -> error.
 pub fn numeric_cmp<F>(left: Value, right: Value, op: F) -> Result<Value, String>
 where
     F: Fn(f64, f64) -> bool,
 {
+    use Value::*;
     match (left, right) {
-        (Value::Number(a), Value::Number(b)) => Ok(Value::Bool(op(a, b))),
+        (Int(a), Int(b)) => Ok(Bool(op(a as f64, b as f64))),
+        (Float(a), Float(b)) => Ok(Bool(op(a, b))),
+        (Int(_), Float(_)) | (Float(_), Int(_)) => Err(format!(
+            "numeric comparison does not accept mixed Int and Float operands (Rust-strict mode)"
+        )),
+        (Number(a), Number(b)) => Ok(Bool(op(a, b))),
+        (Int(a), Number(b)) => Ok(Bool(op(a as f64, b))),
+        (Number(a), Int(b)) => Ok(Bool(op(a, b as f64))),
+        (Float(a), Number(b)) => Ok(Bool(op(a, b))),
+        (Number(a), Float(b)) => Ok(Bool(op(a, b))),
         _ => Err("Operands must be numbers".to_string()),
     }
 }

@@ -65,6 +65,8 @@ pub enum BuiltinKind {
     ComposePrompt,
     Router,
     McpServer,
+    // v0.43.0: exec.* — parallel subprocess execution (pi-mono v1 inspired)
+    Exec,
 }
 
 impl std::fmt::Display for BuiltinKind {
@@ -92,6 +94,7 @@ impl std::fmt::Display for BuiltinKind {
             BuiltinKind::ComposePrompt => "compose_prompt",
             BuiltinKind::Router => "Router::new",
             BuiltinKind::McpServer => "McpServer::new",
+            BuiltinKind::Exec => "Exec::new",
         };
         f.write_str(s)
     }

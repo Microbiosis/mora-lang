@@ -382,6 +382,8 @@ impl Interpreter {
             g.define("schedule".to_string(), Value::Builtin(Bk::Schedule), false);
             g.define("ccr".to_string(), Value::Builtin(Bk::Ccr), false);
             g.define("mock".to_string(), Value::Builtin(Bk::Mock), false);
+            // v0.43.0: exec.* — parallel subprocess execution (pi-mono v1 inspired)
+            g.define("exec".to_string(), Value::Builtin(Bk::Exec), false);
         }
         Self {
             globals: globals.clone(),

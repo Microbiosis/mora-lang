@@ -2,6 +2,75 @@
 
 All notable changes to Mora will be documented in this file.
 
+## [v0.43.0] - 2026-07-05 — exec.parallel() concurrent subprocess (pi-mono v1)
+
+1 commit; **finishes master doc §4 v0.41-0.43 first wave** (5 patches total).
+
+### exec.parallel() — concurrent subprocess execution
+
+- **New `BuiltinKind::Exec` variant** + `call_exec_method` dispatcher
+  + builtin `exec` registered in `Interpreter::new()` globals.
+
+- **`exec.parallel(cmds, [max_concurrent], [timeout_ms])`** builtin:
+  - First arg: `List[String]` — commands to execute (run via `sh -c`)
+  - Optional 2nd arg: `Number` — max concurrent workers (default = cmds.len())
+  - Optional 3rd arg: `Number` — per-cmd timeout in ms (default = no timeout)
+  - Returns: `List[Dict{cmd, stdout, stderr, exit_code, pid, elapsed_ms, error}]`
+
+- **Process group isolation** (mini-swe-agent v1 style):
+  - **Unix**: `pre_exec` calls `libc::setpgid(0, 0)` to create new process group
+  - **Windows**: `creation_flags(CREATE_NEW_PROCESS_GROUP)` (0x00000200)
+  - On timeout: `killpg(pid, SIGKILL)` (Unix) / `taskkill /F /T /PID` (Windows)
+  - Prevents orphaned grandchild processes
+
+- **STD-ONLY implementation** (deliberate deviation from master doc §6.5):
+  - `tokio::process::Command` (master doc suggested) **rejected** — AGENTS.md
+    and Cargo.toml both forbid async runtime
+  - Used: `std::thread::spawn` + `std::process::Command` +
+    `std::sync::{mpsc, Arc, Condvar, Mutex}`
+  - Custom `Semaphore` impl (std lacks one) using AtomicUsize + Mutex + Condvar
+  - Atomic index distribution via `AtomicUsize::fetch_add`
+
+### 9 new tests (Interpreter-level)
+- `exec_parallel_runs_all_commands` — 3 cmds, 收集 stdout
+- `exec_parallel_respects_max_concurrent` — 6 cmds, max_concurrent=2
+- `exec_parallel_empty_list_returns_empty` — 边界
+- `exec_parallel_collects_stdout_per_command` — 验证内容
+- `exec_parallel_kills_process_group_on_timeout` — `sleep 10` + 200ms timeout
+- `exec_parallel_validates_arg_types` — 类型检查
+- `exec_parallel_validates_cmd_elements` — 元素类型检查
+- `exec_parallel_returns_error_for_missing_command` — 不存在命令 → exit 127
+- `exec_unknown_method_errors` — unknown method
+
+### Design decision: STD vs tokio
+- Master doc §6.5 suggested `tokio::process::Command` + `tokio::sync::Semaphore`
+- Project rule (AGENTS.md §3 + Cargo.toml): **"不引入 async runtime"**
+- Implemented equivalent with std threads + custom Semaphore
+- Result: 0 new deps, all std library APIs
+
+### Total impact
+- 1 commit
+- ~390 LOC (+~250 impl + ~140 tests)
+- +9 tests (415 pre-existing retained)
+- 424 tests pass total, 0 fail
+- clippy clean (`-D warnings`), fmt clean
+- 0 new deps
+
+### v0.41+ roadmap progress (master doc §4)
+| Version | Status | Patch |
+|---------|--------|-------|
+| v0.41.0 | ✅ | event O(segments) |
+| v0.41.1 | ✅ | reading_order XY-Cut++ |
+| v0.42.0 | ✅ | sandbox.key + Capability |
+| v0.42.1 | ✅ | audit.jsonl + AuditSink |
+| **v0.43.0** | ✅ | **exec.parallel()** |
+| v0.43.1+ | planned | memory.remember/recall, bus.subscribe, orchestrate, etc. |
+
+**First wave complete.** All 5 patches from RESEARCH_PRIMITIVES_MASTER_v2.md §4
+implemented and committed.
+
+---
+
 ## [v0.42.1] - 2026-07-05 — Audit Sink SHA-256 Hash Chain (loongclaw)
 
 1 commit; second P1 of the v0.41+ roadmap from RESEARCH_PRIMITIVES_MASTER_v2.md

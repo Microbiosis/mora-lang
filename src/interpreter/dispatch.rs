@@ -828,6 +828,8 @@ impl Interpreter {
                 (BuiltinKind::Document, _) => {
                     Err(format!("document.{}: unknown method", method))
                 }
+                // v0.43.0: exec.* — parallel subprocess execution (pi-mono v1 inspired)
+                (BuiltinKind::Exec, _) => self.call_exec_method(method, &args),
                 _ => Err(format!("Unknown method: {:?}.{}", kind, method)),
             },
             Value::Conversation { ref mut messages, ref model, ref base_url, ref api_key } => {

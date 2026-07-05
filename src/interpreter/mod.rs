@@ -184,6 +184,9 @@ pub struct Interpreter {
     mock_registry: crate::mock::MockRegistry,
     /// v0.42.1: Audit sink (default NullSink; switch to JsonlAuditSink for hash-chained audit log)
     pub audit_sink: std::sync::Arc<dyn crate::audit::AuditSink>,
+    /// v0.43.1: Markdown memory root dir (test isolation + custom path support)
+    /// If None, falls back to $MORA_MEMORY_DIR or $HOME/.mora/memory
+    pub markdown_memory_dir: Option<std::path::PathBuf>,
 }
 
 /// v0.06: with 块字段 (不经过 env 变量)
@@ -240,6 +243,7 @@ impl Clone for Interpreter {
             ccr_store: self.ccr_store.clone(),
             mock_registry: self.mock_registry.clone(),
             audit_sink: self.audit_sink.clone(),
+            markdown_memory_dir: self.markdown_memory_dir.clone(),
         }
     }
 }
@@ -413,6 +417,7 @@ impl Interpreter {
             ccr_store: crate::ccr::InMemoryCcrStore::new(),
             mock_registry: crate::mock::MockRegistry::new(),
             audit_sink: std::sync::Arc::new(crate::audit::NullSink::new()),
+            markdown_memory_dir: None,
         }
     }
 
@@ -448,6 +453,7 @@ impl Interpreter {
             ccr_store: crate::ccr::InMemoryCcrStore::new(),
             mock_registry: crate::mock::MockRegistry::new(),
             audit_sink: std::sync::Arc::new(crate::audit::NullSink::new()),
+            markdown_memory_dir: None,
         }
     }
 
@@ -481,6 +487,7 @@ impl Interpreter {
             ccr_store: crate::ccr::InMemoryCcrStore::new(),
             mock_registry: crate::mock::MockRegistry::new(),
             audit_sink: std::sync::Arc::new(crate::audit::NullSink::new()),
+            markdown_memory_dir: None,
         }
     }
 

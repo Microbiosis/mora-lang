@@ -2,6 +2,97 @@
 
 All notable changes to Mora will be documented in this file.
 
+## [v0.43.1] - 2026-07-05 — memory.remember / bus.subscribe (markdown + pub-sub)
+
+1 commit; third P1 of the v0.41+ roadmap from RESEARCH_PRIMITIVES_MASTER_v2.md.
+
+### memory.remember / recall_markdown / list_markdown (pi-agent inspired)
+
+- **3 new builtins** added to `call_memory_method`:
+  - `memory.remember(category, text)` → `Bool(true)`; appends to
+    `~/.mora/memory/YYYY-MM-DD.md` under `## {category}` section
+  - `memory.recall_markdown(category)` → `String`; collects all entries
+    under `## {category}` across all markdown files
+  - `memory.list_markdown()` → `List[String]`; lists all categories
+
+- **Markdown format** (auto-generated):
+  ```
+  # 2026-07-05
+
+  ## {category}
+
+  - {text}
+
+  ## {other_category}
+
+  - {text}
+  ```
+  Subsequent remember to existing category appends bullets (no duplicate section).
+
+- **`Interpreter.markdown_memory_dir: Option<PathBuf>`** field added;
+  overrides default `~/.mora/memory/` for test isolation + custom deployments.
+  Wired through Clone impl + 3 constructors.
+
+- **Cross-pollination with HashMap memory**: remember also writes to
+  `memory_store["md:{category}"]` so existing `memory.recall()` works.
+
+- **5 helper functions added**:
+  - `markdown_memory_dir(override)` — resolution precedence: field > env > home
+  - `today_date_string()` — UNIX days → YYYY-MM-DD (handles leap years)
+  - `remember_markdown(override, cat, text)` — atomic write per file
+  - `recall_markdown(override, cat)` — read all .md, extract section
+  - `list_markdown_categories(override)` — collect unique `## ` headers
+
+### bus.subscribe / bus.publish (Puter / AgentMesh / Solace inspired)
+
+- **2 new builtins** added to `call_event_method`:
+  - `bus.subscribe(pattern)` → `Number(token)`; registers pattern via
+    `EventBus::on()` with no-op handler (real handlers via LSP/HTTP/MCP layer)
+  - `bus.publish(topic, payload)` → `Number(pattern_count)`; emits via
+    `EventBus::emit()` which has v0.41.0 O(segments) indexed matching
+
+- **Pattern matching** inherits v0.41.0 O(segments) indexed matching
+  (Puter EventClient code-verified). Subscribers using `agent.*` catch
+  `agent.foo`, `agent.foo.bar`, etc.
+
+### 12 new tests (6 memory + 6 bus)
+- `memory_remember_appends_to_markdown` — file write
+- `memory_remember_appends_to_existing_section` — no duplicate section
+- `memory_recall_markdown_returns_text` — section readback
+- `memory_recall_markdown_returns_empty_for_unknown` — missing category
+- `memory_list_markdown_lists_categories` — multiple categories
+- `memory_recall_after_remember_syncs_to_memory_store` — HashMap sync
+- `bus_subscribe_returns_token` — Number(token)
+- `bus_subscribe_validates_pattern` — type check
+- `bus_publish_returns_pattern_count` — Number
+- `bus_publish_validates_topic` — type check
+- `bus_subscribe_then_publish_wildcard_match` — wildcard end-to-end
+- `bus_subscribe_uses_existing_pattern_matching` — exact + prefix patterns
+
+### Design decision: Test isolation via field, not env var
+- Master doc §6.4/§6.5 suggested using `MORA_MEMORY_DIR` env var
+- **Switched to `Interpreter.markdown_memory_dir: Option<PathBuf>`**:
+  - Cleaner test isolation (no global env state, parallel tests safe)
+  - Field-level override matches existing `Interpreter.sandbox`,
+    `Interpreter.audit_sink` pattern
+  - Env var fallback preserved (`$MORA_MEMORY_DIR` still works if field is None)
+  - Default falls back to `$HOME/.mora/memory/`
+
+### Total impact
+- 1 commit
+- ~620 LOC (+~280 impl + ~50 init sites + ~290 tests)
+- +12 tests (424 pre-existing retained)
+- 436 tests pass total (lib 430 + bin 6), 0 fail (1 pre-existing doctest)
+- clippy clean (`-D warnings`), fmt clean
+- 0 new deps
+
+### Next v0.44 patches (per master doc §4)
+- v0.44.0: `orchestrate { on: expression }` — predicate routing (revenue-orchestrator)
+- v0.44.0: `sandbox.containerize` Gondolin mode (pi-mono)
+- v0.45.0: `ToolPlane` Core/Extension adapter (loongclaw) + `ai.retry` + `ai.role`
+
+---
+
 ## [v0.43.0] - 2026-07-05 — exec.parallel() concurrent subprocess (pi-mono v1)
 
 1 commit; **finishes master doc §4 v0.41-0.43 first wave** (5 patches total).

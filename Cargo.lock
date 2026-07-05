@@ -691,7 +691,7 @@ dependencies = [
 
 [[package]]
 name = "mora"
-version = "0.0.43"
+version = "0.0.44"
 dependencies = [
  "anyhow",
  "crossbeam-channel",
@@ -704,6 +704,7 @@ dependencies = [
  "pulldown-cmark",
  "quick-xml 0.40.1",
  "rten",
+ "sha2",
  "undoc",
  "ureq",
 ]

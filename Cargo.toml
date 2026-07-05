@@ -1,6 +1,6 @@
 [package]
 name = "mora"
-version = "0.0.43"
+version = "0.0.44"
 # v0.x 升级 ureq 3.3.0 → edition 2024 (ureq 3.3.0 要求 edition 2024 + MSRV 1.85)
 edition = "2024"
 authors = ["Mora contributors"]
@@ -46,6 +46,8 @@ ureq = "3.3"
 libc = { version = "0.2", features = ["extra_traits"] }
 # v0.22: flate2 用于录制文件压缩存储
 flate2 = "1.1"
+# v0.42.1: sha2 for SHA-256 hash chain in AuditSink (audit.jsonl)
+sha2 = "0.10"
 # v0.28: Office (PPTX/DOCX) + Image OCR backends (all pure Rust)
 undoc = { version = "0.5", default-features = false, features = ["docx", "pptx"] }
 ocrs = "0.12"

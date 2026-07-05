@@ -5,6 +5,8 @@
 
 pub mod ai_infra;
 pub mod ast_v2;
+// v0.42.1: Audit Sink — SHA-256 hash-chained JSONL (loongclaw-inspired)
+pub mod audit;
 pub mod ccr;
 pub mod common;
 pub mod compress;

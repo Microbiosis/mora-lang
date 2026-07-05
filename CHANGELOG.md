@@ -2,6 +2,63 @@
 
 All notable changes to Mora will be documented in this file.
 
+## [v0.42.1] - 2026-07-05 — Audit Sink SHA-256 Hash Chain (loongclaw)
+
+1 commit; second P1 of the v0.41+ roadmap from RESEARCH_PRIMITIVES_MASTER_v2.md
+(loongclaw crates/kernel/src/audit.rs:34-204 inspired).
+
+### Audit Sink — JSONL + SHA-256 hash chain
+
+- **New module `src/audit/mod.rs`** — implements loongclaw-style audit log:
+  - `AuditEvent { timestamp_ms, actor, action, target, payload_json, token_id, prev_hash, hash }`
+  - `AuditSink` trait (`Send + Sync`): write / flush / verify_chain / event_count
+  - `JsonlAuditSink` — append-only JSONL file with SHA-256 hash chain
+    (`hash = SHA-256(canonical_json(event) + prev_hash)`)
+  - `NullSink` — no-op default (audit disabled)
+  - `AuditError` enum (Io, ChainBroken, HashMismatch, ParseError)
+
+- **`Interpreter.audit_sink: Arc<dyn AuditSink>`** field added; default `NullSink`.
+  Wired through `Clone::clone()` impl + 3 constructors.
+
+- **3 new builtins** (added to `call_sandbox_method`, NOT new BuiltinKind):
+  - `sandbox.audit_emit(actor, action, target?, payload?)` → `Value::Bool(true)`
+  - `sandbox.audit_flush()` → flushes write buffer to disk
+  - `sandbox.audit_verify()` → `Value::Bool(true)` if chain OK, else
+    `Value::String(error)` (so Mora can branch on it)
+
+- **Hash chain design**:
+  - First event: `prev_hash = "0" × 64` (genesis)
+  - Each subsequent event: `prev_hash = previous event's hash`
+  - `verify_chain()` reads whole file, recomputes hash for each line,
+    catches both `prev_hash` mismatch (line deleted/inserted) AND
+    `hash` mismatch (content tampered)
+
+- **Crash safety**: `new(path)` reads last line of existing file and
+  restores `last_hash` from the most recent `hash` field — process
+  restart resumes the chain instead of restarting from genesis.
+
+- **No `serde` dep added** — JSON serialization is hand-written
+  (`json_string()` escape function, ~30 LOC). Only `sha2 = "0.10"`
+  added to Cargo.toml (per AGENTS.md §3, deps justified).
+
+### 20 new tests (audit module unit + Interpreter builtin integration)
+- 12 `audit::tests::*` (JsonlAuditSink + NullSink + parser/serializer)
+- 8 `interpreter::builtins::tests_v0421_audit::*` (full builtin flow)
+
+### Total impact
+- 1 commit
+- ~700 LOC (+~480 audit module + ~100 builtin wiring + ~20 InitSite +
+  ~100 tests; minor clones/sed)
+- +20 tests (395 pre-existing retained)
+- 415 tests pass total, 0 fail
+- clippy clean (`-D warnings`), fmt clean
+- 1 new dep (`sha2 = "0.10"`)
+
+### Next v0.43 patches (per master doc §4)
+- v0.43.0: `exec.parallel()` (pi-mono v1 subprocess isolation, ~50 LOC)
+
+---
+
 ## [v0.42.0] - 2026-07-05 — Capability Token System (loongclaw)
 
 1 commit; first P1 of the v0.41+ roadmap from RESEARCH_PRIMITIVES_MASTER_v2.md

@@ -1,19 +1,31 @@
-//! v0.33: Sandbox — path validation + pattern allow/deny
+//! v0.33+: Sandbox — path validation + pattern allow/deny + capability tokens
 //!
 //! 灵感:
 //! - **MimiClaw** path validation: read_file/write_file 拒绝 `..` 路径
 //!   (main/tools/tool_files.c:15-31)
 //! - **AIOS** access manager: agent_id -> privilege_group (hashmap)
 //! - **Puter** iframe sandbox: credentialless + capability-based URL params
+//! - **loongclaw** (v0.42.0) Capability token system: token_id + allowed +
+//!   expires_at + generation, PolicyEngine trait (issue/authorize/revoke)
 //!
 //! v0.33 实现:
 //! - Path safety: 拒绝含 `..` 或绝对路径越界 (out of root) 的操作
 //! - Pattern allow/deny: builtin 名 match (wildcard `*` segment, 与 event 一致)
 //! - Privilege: thread-local sandbox context (类似 thread_local!)
+//!
+//! v0.42.0 增补:
+//! - CapabilityStore: token-based 细粒度授权
+//!   与 pattern-based allow/deny 并存 (后者用于 builtin dispatch, 前者用于
+//!   runtime `sandbox.key { ... }` builtin 调用)
 
 use std::path::{Component, Path, PathBuf};
 
-/// v0.33: Sandbox 策略
+// v0.42.0: Capability Token System (loongclaw-inspired)
+// See capability.rs for full docs.
+pub mod capability;
+pub use capability::{Capability, CapabilityStore, CapabilityToken, SandboxError};
+
+/// v0.33+: Sandbox 策略
 #[derive(Debug, Clone, Default)]
 pub struct SandboxPolicy {
     /// v0.36 (P1-3.10): BTreeSet for O(log N) membership checks
@@ -27,6 +39,9 @@ pub struct SandboxPolicy {
     pub timeout_s: Option<u64>,
     /// 内存限制 MB (None = 无限制)
     pub memory_limit_mb: Option<u64>,
+    /// v0.42.0: Capability token store (loongclaw-inspired)
+    /// 默认 new() 一个空 store, builtin 不可见; 业务代码通过 sandbox.key 发放
+    pub capabilities: CapabilityStore,
 }
 
 impl SandboxPolicy {
@@ -38,6 +53,7 @@ impl SandboxPolicy {
             fs_root: None,
             timeout_s: None,
             memory_limit_mb: None,
+            capabilities: CapabilityStore::new(),
         }
     }
 
@@ -51,6 +67,7 @@ impl SandboxPolicy {
             fs_root: Some(PathBuf::from("/")),
             timeout_s: None,
             memory_limit_mb: None,
+            capabilities: CapabilityStore::new(),
         }
     }
 

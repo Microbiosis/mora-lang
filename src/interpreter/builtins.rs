@@ -330,6 +330,90 @@ impl Interpreter {
                 };
                 Ok(Value::Bool(self.sandbox.check_path(&path).is_ok()))
             }
+            // v0.42.0: sandbox.key { file.read, web.fetch } — issue capability token
+            // Returns: token handle as Value::Number(token_id)
+            "key" => {
+                use std::collections::BTreeSet;
+                use std::time::Duration;
+
+                let mut allowed = BTreeSet::new();
+                for arg in args {
+                    match arg {
+                        Value::String(s) => {
+                            let cap = crate::sandbox::Capability::parse(s).ok_or_else(|| {
+                                format!("sandbox.key: unknown capability '{}'", s)
+                            })?;
+                            allowed.insert(cap);
+                        }
+                        _ => {
+                            return Err(
+                                "sandbox.key: all args must be capability strings (e.g. \"file.read\")"
+                                    .to_string(),
+                            );
+                        }
+                    }
+                }
+                // v0.42.0: 无 TTL (None = 永不过期); 后续可加 sandbox.key_ttl { ... }
+                let ttl: Option<Duration> = None;
+                let token_id = self
+                    .sandbox
+                    .capabilities
+                    .issue(allowed, ttl)
+                    .map_err(|e| format!("sandbox.key: issue failed: {}", e))?;
+                Ok(Value::Number(token_id as f64))
+            }
+            // v0.42.0: sandbox.check_call(token_id, "file.read") — authorize capability
+            // Returns: Value::Bool(true) if authorized, false otherwise
+            "check_call" => {
+                if args.len() != 2 {
+                    return Err(format!(
+                        "sandbox.check_call: requires 2 args (token_id, capability), got {}",
+                        args.len()
+                    ));
+                }
+                let token_id = match &args[0] {
+                    Value::Number(n) => *n as u64,
+                    Value::Int(i) => *i as u64,
+                    _ => {
+                        return Err("sandbox.check_call: token_id must be a number".to_string());
+                    }
+                };
+                let cap_str = match &args[1] {
+                    Value::String(s) => s.clone(),
+                    _ => {
+                        return Err("sandbox.check_call: capability must be a string".to_string());
+                    }
+                };
+                let cap = crate::sandbox::Capability::parse(&cap_str).ok_or_else(|| {
+                    format!("sandbox.check_call: unknown capability '{}'", cap_str)
+                })?;
+                Ok(Value::Bool(
+                    self.sandbox.capabilities.check(token_id, cap).is_ok(),
+                ))
+            }
+            // v0.42.0: sandbox.revoke(token_id) — revoke capability token (bump generation)
+            "revoke" => {
+                if args.len() != 1 {
+                    return Err(format!(
+                        "sandbox.revoke: requires 1 arg (token_id), got {}",
+                        args.len()
+                    ));
+                }
+                let token_id = match &args[0] {
+                    Value::Number(n) => *n as u64,
+                    Value::Int(i) => *i as u64,
+                    _ => {
+                        return Err("sandbox.revoke: token_id must be a number".to_string());
+                    }
+                };
+                self.sandbox
+                    .capabilities
+                    .revoke(token_id)
+                    .map_err(|e| format!("sandbox.revoke: {}", e))?;
+                Ok(Value::Bool(true))
+            }
+            // v0.42.0: sandbox.token_count() — diagnostic
+            "token_count" => Ok(Value::Number(self.sandbox.capabilities.token_count() as f64)),
             _ => Err(format!("sandbox.{}: unknown method", method)),
         }
     }
@@ -639,5 +723,208 @@ impl Interpreter {
     #[allow(dead_code)]
     pub fn get_embedding(&self, text: &str) -> Result<Vec<f64>, String> {
         Ok(mock_bow_embedding(text))
+    }
+}
+
+#[cfg(test)]
+mod tests_v042_capability {
+    use super::*;
+    use crate::value::Value;
+
+    /// v0.42.0: sandbox.key + sandbox.check_call builtin 测试
+
+    #[test]
+    fn sandbox_key_returns_token_id_number() {
+        let interp = Interpreter::new();
+        let args = vec![
+            Value::String("file.read".to_string()),
+            Value::String("web.fetch".to_string()),
+        ];
+        let token_id = interp
+            .call_sandbox_method("key", &args)
+            .expect("sandbox.key should succeed");
+        match token_id {
+            Value::Number(n) => assert_eq!(n, 0.0, "first token_id should be 0"),
+            other => panic!("expected Value::Number, got {:?}", other),
+        }
+        assert_eq!(interp.sandbox.capabilities.token_count(), 1);
+    }
+
+    #[test]
+    fn sandbox_key_with_no_caps_returns_token() {
+        // 空 args 也是合法: 创建一个空 capability 集合 (拒绝一切)
+        let interp = Interpreter::new();
+        let token_id = interp
+            .call_sandbox_method("key", &[])
+            .expect("sandbox.key with no args should succeed");
+        assert!(matches!(token_id, Value::Number(_)));
+        // 空 token 任何 cap 都应被拒绝
+        let check = interp
+            .call_sandbox_method(
+                "check_call",
+                &[token_id.clone(), Value::String("file.read".to_string())],
+            )
+            .expect("check_call should not error");
+        assert_eq!(check, Value::Bool(false));
+    }
+
+    #[test]
+    fn sandbox_key_rejects_unknown_capability_string() {
+        let interp = Interpreter::new();
+        let args = vec![Value::String("not.a.real.cap".to_string())];
+        let err = interp
+            .call_sandbox_method("key", &args)
+            .expect_err("sandbox.key with unknown cap should error");
+        assert!(err.contains("unknown capability"), "got: {}", err);
+        assert_eq!(interp.sandbox.capabilities.token_count(), 0);
+    }
+
+    #[test]
+    fn sandbox_key_rejects_non_string_arg() {
+        let interp = Interpreter::new();
+        let args = vec![Value::Number(42.0)];
+        let err = interp
+            .call_sandbox_method("key", &args)
+            .expect_err("sandbox.key with non-string arg should error");
+        assert!(err.contains("capability strings"), "got: {}", err);
+    }
+
+    #[test]
+    fn sandbox_check_call_authorizes_granted_capability() {
+        let interp = Interpreter::new();
+        let token_id = interp
+            .call_sandbox_method("key", &[Value::String("file.read".to_string())])
+            .expect("issue token");
+
+        let authorized = interp
+            .call_sandbox_method(
+                "check_call",
+                &[token_id.clone(), Value::String("file.read".to_string())],
+            )
+            .expect("check_call");
+        assert_eq!(authorized, Value::Bool(true));
+
+        let denied = interp
+            .call_sandbox_method(
+                "check_call",
+                &[token_id, Value::String("file.write".to_string())],
+            )
+            .expect("check_call");
+        assert_eq!(denied, Value::Bool(false));
+    }
+
+    #[test]
+    fn sandbox_check_call_with_unknown_token_returns_false() {
+        let interp = Interpreter::new();
+        let result = interp
+            .call_sandbox_method(
+                "check_call",
+                &[
+                    Value::Number(9999.0),
+                    Value::String("file.read".to_string()),
+                ],
+            )
+            .expect("check_call should not error, just return false");
+        assert_eq!(result, Value::Bool(false));
+    }
+
+    #[test]
+    fn sandbox_check_call_with_unknown_capability_string_errors() {
+        let interp = Interpreter::new();
+        let token_id = interp
+            .call_sandbox_method("key", &[Value::String("file.read".to_string())])
+            .expect("issue");
+        let err = interp
+            .call_sandbox_method(
+                "check_call",
+                &[token_id, Value::String("not.a.cap".to_string())],
+            )
+            .expect_err("unknown cap should error");
+        assert!(err.contains("unknown capability"), "got: {}", err);
+    }
+
+    #[test]
+    fn sandbox_revoke_bumps_generation() {
+        let interp = Interpreter::new();
+        let token_id = interp
+            .call_sandbox_method("key", &[Value::String("file.read".to_string())])
+            .expect("issue");
+        let token_id_num = match &token_id {
+            Value::Number(n) => *n as u64,
+            _ => panic!("expected Number"),
+        };
+
+        // revoke 前 check_call 返回 true
+        let before = interp
+            .call_sandbox_method(
+                "check_call",
+                &[token_id.clone(), Value::String("file.read".to_string())],
+            )
+            .expect("check_call");
+        assert_eq!(before, Value::Bool(true));
+
+        // revoke
+        let revoked = interp
+            .call_sandbox_method("revoke", std::slice::from_ref(&token_id))
+            .expect("revoke");
+        assert_eq!(revoked, Value::Bool(true));
+
+        // generation 确实 bump 了 (token 仍在 store, 但 generation=1)
+        let token = interp
+            .sandbox
+            .capabilities
+            .get(token_id_num)
+            .expect("token should still exist (loongclaw-style: bump gen, not delete)");
+        assert_eq!(token.generation, 1);
+
+        // 注: call_sandbox_method 不验证 generation (那是 PolicyEngine trait 行为)
+        // 但 store.check 也不验证 — generation 是给业务层用的语义信号
+        let after = interp
+            .call_sandbox_method(
+                "check_call",
+                &[token_id, Value::String("file.read".to_string())],
+            )
+            .expect("check_call");
+        assert_eq!(
+            after,
+            Value::Bool(true),
+            "token still permits (loongclaw style)"
+        );
+    }
+
+    #[test]
+    fn sandbox_token_count_tracks_unique_tokens() {
+        let interp = Interpreter::new();
+        assert_eq!(interp.sandbox.capabilities.token_count(), 0);
+
+        let _ = interp
+            .call_sandbox_method("key", &[Value::String("file.read".to_string())])
+            .unwrap();
+        let _ = interp
+            .call_sandbox_method("key", &[Value::String("web.fetch".to_string())])
+            .unwrap();
+        let _ = interp
+            .call_sandbox_method(
+                "key",
+                &[
+                    Value::String("memory.read".to_string()),
+                    Value::String("memory.write".to_string()),
+                ],
+            )
+            .unwrap();
+        assert_eq!(interp.sandbox.capabilities.token_count(), 3);
+    }
+
+    #[test]
+    fn sandbox_old_methods_still_work() {
+        // v0.42.0 增补不应破坏 v0.33-0.41 的 sandbox.mode / check_builtin / check_path
+        let interp = Interpreter::new();
+        let mode = interp.call_sandbox_method("mode", &[]).expect("mode");
+        assert!(matches!(mode, Value::String(_)));
+
+        let cb = interp
+            .call_sandbox_method("check_builtin", &[Value::String("print".to_string())])
+            .expect("check_builtin");
+        assert_eq!(cb, Value::Bool(true));
     }
 }

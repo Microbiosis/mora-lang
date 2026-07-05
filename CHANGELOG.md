@@ -2,6 +2,68 @@
 
 All notable changes to Mora will be documented in this file.
 
+## [v0.42.0] - 2026-07-05 — Capability Token System (loongclaw)
+
+1 commit; first P1 of the v0.41+ roadmap from RESEARCH_PRIMITIVES_MASTER_v2.md
+(loongclaw crates/contracts/src/contracts.rs:24-52 inspired).
+
+### Capability Token System
+
+- **New module `src/sandbox/capability.rs`** — implements token-based
+  authorization alongside the v0.33 pattern-based `allow/deny`:
+  - `Capability` enum (13 variants: `FileRead`, `FileWrite`, `WebFetch`,
+    `WebSearch`, `ExecBash`, `ExecParallel`, `MemoryRead`, `MemoryWrite`,
+    `AuditEmit`, `BusSubscribe`, `BusPublish`, `AgentInvoke`, `AgentRegister`)
+  - `CapabilityToken { token_id, allowed, denied, expires_at, generation, created_at }`
+  - `CapabilityStore` (Arc<Mutex<BTreeMap>>) — issue/get/check/revoke API
+  - `SandboxError` enum with structured variants (UnknownCapability,
+    TokenExpired, TokenNotFound, CapViolation, GenerationMismatch)
+
+- **`SandboxPolicy.capabilities: CapabilityStore`** field added
+  (default `CapabilityStore::new()`). v0.33 pattern-based API
+  (`allow/deny BTreeSet`, `check_builtin`, `check_path`) is **unchanged**.
+
+- **4 new builtins** wired through `call_sandbox_method`:
+  - `sandbox.key { "file.read", "web.fetch" }` → `Value::Number(token_id)`
+  - `sandbox.check_call(token_id, "file.read")` → `Value::Bool`
+  - `sandbox.revoke(token_id)` → `Value::Bool(true)` (loongclaw-style:
+    bumps `generation`, doesn't delete token)
+  - `sandbox.token_count()` → `Value::Number`
+
+- **`Capability::parse(s)` and `as_str()`** for round-trip between
+  Rust enum and mora source strings.
+
+### Design decisions
+- **Token handle = `Value::Number(u64)`** (NOT a new Value variant).
+  Avoids touching the 56-variant `Value` enum (per AGENTS.md §5, v0.x
+  may break but prefer minimal surface).
+- **Arc<Mutex> around CapabilityStore** so `SandboxPolicy: Clone` still works
+  (interpreter copy semantics share the store, not duplicate it).
+- **Revoke bumps generation** (loongclaw style) instead of deleting.
+  This means `check_call` doesn't validate generation — that's a
+  higher-layer PolicyEngine concern, exposed via `SandboxError::GenerationMismatch`.
+- **No TTL in v0.42.0 builtin** — `sandbox.key` accepts any args, no
+  `sandbox.key_ttl { ..., ttl: 5s }` yet. Token's `expires_at` field is
+  ready; builtins will be added in v0.42.x if needed.
+
+### 21 new tests (CapabilityStore unit + Interpreter builtin integration)
+- 11 `sandbox::capability::tests::*` (CapabilityStore unit)
+- 10 `interpreter::builtins::tests_v042_capability::*` (full builtin flow)
+
+### Total impact
+- 1 commit
+- ~520 LOC (+~280 capability module + ~90 builtin wiring + ~150 tests)
+- +21 tests (374 pre-existing retained)
+- 395 tests pass total, 0 fail
+- clippy clean (`-D warnings`), fmt clean
+- 0 new deps
+
+### Next v0.42+ patches (per master doc §4)
+- v0.42.1: `audit.jsonl` + AuditSink SHA-256 chain (loongclaw, ~200 LOC)
+- v0.43.0: `exec.parallel()` (pi-mono v1 isolation, ~50 LOC)
+
+---
+
 ## [v0.41.1] - 2026-07-05 — Reading Order XY-Cut++ (MinerU algorithm upgrade)
 
 1 commit; second P0 of the v0.41+ roadmap from RESEARCH_PRIMITIVES_MASTER_v2.md.

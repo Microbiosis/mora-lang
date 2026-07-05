@@ -2,6 +2,70 @@
 
 All notable changes to Mora will be documented in this file.
 
+## [v0.41.0] - 2026-07-05 — Event Bus O(segments) (Puter, code-verified)
+
+1 commit; first P0 of the v0.41+ roadmap from RESEARCH_PRIMITIVES_MASTER_v2.md.
+
+### Event bus: O(segments) indexed matching replaces linear scan
+
+- **`EventBus` now uses a 3-bucket index** instead of a single
+  `HashMap<Pattern, Vec<Handler>>` iterated on every emit:
+  - `exact`: literal patterns (e.g. `"ai.chat.completed"`) → O(1) lookup
+  - `prefix`: trailing-wildcard patterns (e.g. `"ai.*"`, `"a.b.*"`, `"*"`)
+    keyed by the prefix-without-`.*` (e.g. `"ai"`, `"a.b"`, `""`) →
+    O(segments) prefix walk
+  - `interior`: middle-wildcard patterns (e.g. `"a.*.c"`, `"*.b.*"`)
+    kept as fallback linear scan (rare in practice; required by
+    existing API semantics)
+
+- **`emit` complexity**:
+  - Old (v0.32-0.40): **O(patterns × segments)** — `map.iter().filter(matches).flat_map(...)`
+  - New (v0.41): **O(segments)** for exact/prefix paths
+    (interior fallback remains O(interior_patterns))
+
+- **`classify_pattern()` helper** routes `on(pattern)` registrations to
+  the correct bucket at registration time, so `emit` never needs to
+  parse patterns.
+
+- **Catch-all `*` pattern**: keyed by empty string `""`, looked up
+  once at the start of `emit`'s prefix walk — verified via new
+  `bus_catchall_star_routes_to_prefix_empty` test.
+
+- **10 new tests** (8 pre-existing retained):
+  - `classify_pattern_routes_correctly` (Pure function test)
+  - `bus_handlers_route_to_correct_buckets` (Register dispatches to right bucket)
+  - `bus_emit_literal_match_fires_handler` (Exact path)
+  - `bus_emit_wildcard_match_fires_handler` (Prefix path)
+  - `bus_emit_with_no_subscribers_is_noop` (Empty case)
+  - `bus_emit_with_multiple_wildcards_fires_all` (Multi-level Puter walk)
+  - `bus_interior_wildcard_still_works` (Interior fallback)
+  - `bus_catchall_star_routes_to_prefix_empty` (Catch-all)
+  - `bus_off_removes_from_correct_bucket` (off() routes to right bucket)
+  - `bus_emit_complexity_scales_with_segments_not_patterns` (Perf benchmark,
+    100 patterns + 1000 emits < 200ms)
+
+### Source inspiration
+`Puter` `src/backend/clients/event/EventClient.ts:62-67` (verified 2026-07-05
+via MCP search; see RESEARCH_PRIMITIVES_MASTER_v2.md §1.10).
+
+### Total impact
+- 1 commit
+- ~165 LOC (108 impl + ~57 tests)
+- +10 tests (8 pre-existing retained)
+- 367 tests pass total, 0 fail
+- clippy clean (`-D warnings`), fmt clean
+- 0 new deps
+- Backwards-compatible: same `on(pattern, handler)` / `emit(event, payload)`
+  / `off(pattern)` API, same matching semantics
+
+### Next v0.41 patches (per master doc §4)
+- v0.41.1: `reading_order` XY-Cut++ (MinerU algorithm upgrade, ~60 LOC)
+- v0.42.0: `sandbox.key` + `Capability` enum (loongclaw, ~200 LOC)
+- v0.42.1: `audit.jsonl` + AuditSink SHA-256 chain (loongclaw, ~200 LOC)
+- v0.43.0: `exec.parallel()` (pi-mono v1 isolation, ~50 LOC)
+
+---
+
 ## [v0.40] - 2026-07-04 — Env Refactor (Closure Env Immutable)
 
 2 commits resolving Permanent #1 (Env cross-thread safety) — the

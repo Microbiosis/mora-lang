@@ -2,6 +2,78 @@
 
 All notable changes to Mora will be documented in this file.
 
+## [v0.41.1] - 2026-07-05 — Reading Order XY-Cut++ (MinerU algorithm upgrade)
+
+1 commit; second P0 of the v0.41+ roadmap from RESEARCH_PRIMITIVES_MASTER_v2.md.
+
+### Reading order: XY-Cut++ algorithm upgrade (MinerU arXiv:2504.10258)
+
+- **New `Strategy::XyCutPlusPlus` variant** (and aliases `xy_cut_plus_plus` /
+  `xy++` / `xy_cut_pp` via `Strategy::from_str`). Old variants
+  (`InputOrder` / `TopToBottom` / `GapTree` / `XyCut` / `GroupBased`)
+  remain unchanged — fully backwards-compatible.
+
+- **Old `Strategy::XyCut` (v0.33)** was a flat sort `(y, then x)` — no
+  recursive segmentation. **New `XyCutPlusPlus`** implements the actual
+  recursive XY-Cut algorithm (arXiv:2504.10258):
+  1. **Cross-layout element detection** (`is_cross_layout`): elements
+     with `width > beta * max_width` AND `overlap_count >= 2` are split
+     off (e.g. cross-column headers / footers).
+  2. **Density-ratio axis selection** (`compute_prefer_horizontal`):
+     `x_density > density_threshold * y_density` → prefer horizontal
+     first (split by y, then within each row by x).
+  3. **Recursive projection-segmentation** (`recursive_xy_cut`):
+     project to axis → find gap-runs → split into sub-segments →
+     recurse with flipped axis preference.
+  4. **Merge cross-layout elements** at the right position based on
+     vertical center.
+
+- **5 helper functions added** (all private, file-local):
+  - `is_cross_layout(all, bbox)` — cross-column detection
+  - `compute_prefer_horizontal(entries)` — adaptive axis selection
+  - `compute_density_ratios(entries)` — x/y density calculation
+  - `project_to_axis(entries, axis)` — 1D histogram projection
+  - `split_projection(hist, min_gap)` — find gap-run segments
+  - `recursive_xy_cut(entries, prefer_horizontal_first)` — core recursion
+  - `merge_cross_layout_elements(main, cross)` + `find_insertion_point`
+
+- **5 named constants** (MinerU defaults):
+  `XY_CUT_PLUS_PLUS_BETA = 2.0`, `DENSITY_THRESHOLD = 0.9`,
+  `OVERLAP_THRESHOLD = 0.1`, `MIN_OVERLAP_COUNT = 2`,
+  `MIN_GAP_THRESHOLD = 5.0`.
+
+- **7 new tests** (8 pre-existing retained):
+  - `strategy_from_str_xy_cut_pp` — aliases parse correctly
+  - `xy_cut_pp_single_column_doc` — newspaper-style vertical ordering
+  - `xy_cut_pp_two_column_doc` — academic two-column (L1,R1,L2,R2 row-by-row)
+  - `xy_cut_pp_with_cross_layout_header` — wide header inserted at top
+  - `xy_cut_pp_single_block_returns_unchanged` — single-block edge case
+  - `xy_cut_pp_preserves_all_blocks` — no blocks lost or duplicated
+  - `xy_cut_pp_complexity_below_o_n_squared` — perf benchmark, 50 blocks < 200ms
+
+### Source inspiration
+`MinerU` arXiv:2504.10258 "XY-Cut++: Advanced Layout Ordering via Hierarchical Mask
+Matching" (April 2025). Mora previously had only the simple `recursive_xy_cut`
+from `mineru/model/reading_order/xycut.py`; v0.41.1 upgrades to the newer
+algorithm per master doc §6.2.
+
+### Total impact
+- 1 commit
+- ~290 LOC (+~230 impl + ~60 tests + ~10 const)
+- +7 tests (8 pre-existing retained)
+- 374 tests pass total (was 367), 0 fail
+- clippy clean (`-D warnings`), fmt clean
+- 0 new deps
+- Backwards-compatible: existing `Strategy` variants unchanged; only adds
+  a new variant + aliases
+
+### Next v0.41 patches (per master doc §4)
+- v0.42.0: `sandbox.key` + `Capability` enum (loongclaw, ~200 LOC)
+- v0.42.1: `audit.jsonl` + AuditSink SHA-256 chain (loongclaw, ~200 LOC)
+- v0.43.0: `exec.parallel()` (pi-mono v1 isolation, ~50 LOC)
+
+---
+
 ## [v0.41.0] - 2026-07-05 — Event Bus O(segments) (Puter, code-verified)
 
 1 commit; first P0 of the v0.41+ roadmap from RESEARCH_PRIMITIVES_MASTER_v2.md.

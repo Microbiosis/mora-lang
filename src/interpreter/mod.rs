@@ -197,6 +197,11 @@ pub struct Interpreter {
     /// v0.46.0: Skill registry (MoraSkillSpec + dual registry, CLI-Anything pattern)
     /// Loaded from `~/.mora/skills/` or via builtin skill.load / skill.install
     pub skill_registry: std::sync::Arc<std::sync::Mutex<crate::skill::SkillRegistry>>,
+    /// v0.48.0: Plans (multi-plan, keyed by name) for plan.update (pi-agent)
+    pub plans:
+        std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, crate::plan::Plan>>>,
+    /// v0.48.0: Refine session registry (multi-script, CLI-Anything /refine)
+    pub refine_registry: std::sync::Arc<std::sync::Mutex<crate::refine::RefineRegistry>>,
 }
 
 /// v0.06: with 块字段 (不经过 env 变量)
@@ -257,6 +262,8 @@ impl Clone for Interpreter {
             container: self.container.clone(),
             tool_planes: self.tool_planes.clone(),
             skill_registry: self.skill_registry.clone(),
+            plans: self.plans.clone(),
+            refine_registry: self.refine_registry.clone(),
         }
     }
 }
@@ -405,6 +412,10 @@ impl Interpreter {
             g.define("tool".to_string(), Value::Builtin(Bk::Toolplane), false);
             // v0.46.0: skill.* — MoraSkillSpec + dual registry
             g.define("skill".to_string(), Value::Builtin(Bk::Skill), false);
+            // v0.48.0: plan.* — real-time checklist (pi-agent)
+            g.define("plan".to_string(), Value::Builtin(Bk::Plan), false);
+            // v0.48.0: mora.* — meta (refine)
+            g.define("mora".to_string(), Value::Builtin(Bk::Mora), false);
         }
         Self {
             globals: globals.clone(),
@@ -439,6 +450,10 @@ impl Interpreter {
             tool_planes: crate::toolplane::shared_default_registry(),
             skill_registry: std::sync::Arc::new(std::sync::Mutex::new(
                 crate::skill::SkillRegistry::new(),
+            )),
+            plans: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            refine_registry: std::sync::Arc::new(std::sync::Mutex::new(
+                crate::refine::RefineRegistry::new(),
             )),
         }
     }
@@ -481,6 +496,10 @@ impl Interpreter {
             skill_registry: std::sync::Arc::new(std::sync::Mutex::new(
                 crate::skill::SkillRegistry::new(),
             )),
+            plans: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            refine_registry: std::sync::Arc::new(std::sync::Mutex::new(
+                crate::refine::RefineRegistry::new(),
+            )),
         }
     }
 
@@ -519,6 +538,10 @@ impl Interpreter {
             tool_planes: crate::toolplane::shared_default_registry(),
             skill_registry: std::sync::Arc::new(std::sync::Mutex::new(
                 crate::skill::SkillRegistry::new(),
+            )),
+            plans: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            refine_registry: std::sync::Arc::new(std::sync::Mutex::new(
+                crate::refine::RefineRegistry::new(),
             )),
         }
     }

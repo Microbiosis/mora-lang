@@ -834,6 +834,10 @@ impl Interpreter {
                 (BuiltinKind::Toolplane, _) => self.call_toolplane_method(method, &args),
                 // v0.46.0: skill.* — MoraSkillSpec + dual registry (CLI-Anything)
                 (BuiltinKind::Skill, _) => self.call_skill_method(method, &args),
+                // v0.48.0: plan.* — real-time checklist (pi-agent)
+                (BuiltinKind::Plan, _) => self.call_plan_method(method, &args),
+                // v0.48.0: mora.* — meta (refine)
+                (BuiltinKind::Mora, _) => self.call_mora_method(method, &args),
                 // v0.45.0: ai.retry / ai.role — top-level AI utilities
                 // (chat still handled by existing AiChat dispatch below)
                 (BuiltinKind::Ai, _) => self.call_ai_method(method, &args),

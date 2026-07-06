@@ -73,6 +73,10 @@ pub enum BuiltinKind {
     Ai,
     // v0.46.0: skill.* — MoraSkillSpec + dual registry (CLI-Anything)
     Skill,
+    // v0.48.0: plan.* — real-time checklist (pi-agent update_plan)
+    Plan,
+    // v0.48.0: mora.* — meta (refine / list-plans) (CLI-Anything /refine)
+    Mora,
 }
 
 impl std::fmt::Display for BuiltinKind {
@@ -103,6 +107,8 @@ impl std::fmt::Display for BuiltinKind {
             BuiltinKind::Exec => "Exec::new",
             BuiltinKind::Toolplane => "Toolplane::new",
             BuiltinKind::Skill => "Skill::new",
+            BuiltinKind::Plan => "Plan::new",
+            BuiltinKind::Mora => "Mora::new",
             BuiltinKind::Ai => "Ai::new",
         };
         f.write_str(s)

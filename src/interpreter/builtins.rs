@@ -1532,6 +1532,271 @@ impl Interpreter {
             _ => Err(format!("skill.{}: unknown method", method)),
         }
     }
+
+    /// v0.48.0: plan.* — real-time checklist (pi-agent update_plan)
+    ///
+    /// Methods:
+    /// - `plan.create(name, steps)` — create new plan
+    /// - `plan.update(name, updates)` — update step statuses
+    ///   updates: List[[id, status]]
+    /// - `plan.add(name, id, text)` — add new step
+    /// - `plan.remove(name, id)` — remove step
+    /// - `plan.list(name?)` — list plans (or steps of one)
+    /// - `plan.info(name)` — Dict{name, total, done, pending, completion_ratio}
+    pub fn call_plan_method(&mut self, method: &str, args: &[Value]) -> Result<Value, String> {
+        let mut plans = self.plans.lock().expect("plans mutex poisoned");
+
+        match method {
+            "create" => {
+                if args.len() < 2 {
+                    return Err("plan.create: requires 2 args (name, steps)".to_string());
+                }
+                let name = args[0].to_string();
+                let steps_arg = match &args[1] {
+                    Value::List(items) => items,
+                    _ => {
+                        return Err(
+                            "plan.create: steps must be a list of {id, text} dicts".to_string()
+                        );
+                    }
+                };
+                let mut plan = crate::plan::Plan::new();
+                for (i, s) in steps_arg.iter().enumerate() {
+                    let d = match s {
+                        Value::Dict(d) => d,
+                        _ => return Err(format!("plan.create: steps[{}] must be a dict", i)),
+                    };
+                    let id = match d.get("id") {
+                        Some(Value::String(s)) => s.clone(),
+                        _ => return Err(format!("plan.create: steps[{}].id must be a string", i)),
+                    };
+                    let text = match d.get("text") {
+                        Some(Value::String(s)) => s.clone(),
+                        _ => {
+                            return Err(format!("plan.create: steps[{}].text must be a string", i));
+                        }
+                    };
+                    let status = match d.get("status") {
+                        Some(Value::String(s)) => crate::plan::StepStatus::parse(s)
+                            .unwrap_or(crate::plan::StepStatus::Pending),
+                        _ => crate::plan::StepStatus::Pending,
+                    };
+                    plan.add_step(crate::plan::PlanStep::new(id, text).with_status(status))
+                        .map_err(|e| format!("plan.create: {}", e))?;
+                }
+                plans.insert(name.clone(), plan);
+                Ok(Value::String(name))
+            }
+            "update" => {
+                if args.len() < 2 {
+                    return Err("plan.update: requires 2 args (name, updates)".to_string());
+                }
+                let name = args[0].to_string();
+                let updates = match &args[1] {
+                    Value::List(items) => items,
+                    _ => {
+                        return Err(
+                            "plan.update: updates must be a list of [id, status]".to_string()
+                        );
+                    }
+                };
+                let mut parsed_updates: Vec<(String, crate::plan::StepStatus)> = Vec::new();
+                for (i, u) in updates.iter().enumerate() {
+                    let pair = match u {
+                        Value::List(p) if p.len() == 2 => p,
+                        _ => {
+                            return Err(format!(
+                                "plan.update: updates[{}] must be [id, status]",
+                                i
+                            ));
+                        }
+                    };
+                    let id = match &pair[0] {
+                        Value::String(s) => s.clone(),
+                        _ => {
+                            return Err(format!(
+                                "plan.update: updates[{}][0] must be id string",
+                                i
+                            ));
+                        }
+                    };
+                    let status = match &pair[1] {
+                        Value::String(s) => crate::plan::StepStatus::parse(s).ok_or_else(|| {
+                            format!("plan.update: updates[{}][1] invalid status '{}'", i, s)
+                        })?,
+                        _ => {
+                            return Err(format!(
+                                "plan.update: updates[{}][1] must be status string",
+                                i
+                            ));
+                        }
+                    };
+                    parsed_updates.push((id, status));
+                }
+                let plan = plans
+                    .get_mut(&name)
+                    .ok_or_else(|| format!("plan.update: plan '{}' not found", name))?;
+                plan.update(&parsed_updates)
+                    .map_err(|e| format!("plan.update: {}", e))?;
+                Ok(Value::Bool(true))
+            }
+            "add" => {
+                if args.len() < 3 {
+                    return Err("plan.add: requires 3 args (name, id, text)".to_string());
+                }
+                let name = args[0].to_string();
+                let id = args[1].to_string();
+                let text = args[2].to_string();
+                let plan = plans
+                    .get_mut(&name)
+                    .ok_or_else(|| format!("plan.add: plan '{}' not found", name))?;
+                plan.add_step(crate::plan::PlanStep::new(id, text))
+                    .map_err(|e| format!("plan.add: {}", e))?;
+                Ok(Value::Bool(true))
+            }
+            "remove" => {
+                if args.len() < 2 {
+                    return Err("plan.remove: requires 2 args (name, id)".to_string());
+                }
+                let name = args[0].to_string();
+                let id = args[1].to_string();
+                let plan = plans
+                    .get_mut(&name)
+                    .ok_or_else(|| format!("plan.remove: plan '{}' not found", name))?;
+                let removed = plan.remove_step(&id);
+                Ok(Value::Bool(removed.is_some()))
+            }
+            "list" => {
+                if let Some(Value::String(name)) = args.first() {
+                    let plan = plans
+                        .get(name)
+                        .ok_or_else(|| format!("plan.list: plan '{}' not found", name))?;
+                    let items: Vec<Value> = plan
+                        .steps()
+                        .iter()
+                        .map(|s| {
+                            let mut d = std::collections::HashMap::new();
+                            d.insert("id".to_string(), Value::String(s.id.clone()));
+                            d.insert("text".to_string(), Value::String(s.text.clone()));
+                            d.insert(
+                                "status".to_string(),
+                                Value::String(s.status.as_str().to_string()),
+                            );
+                            d.insert(
+                                "emoji".to_string(),
+                                Value::String(s.status.emoji().to_string()),
+                            );
+                            Value::Dict(d)
+                        })
+                        .collect();
+                    Ok(Value::List(items))
+                } else {
+                    let mut names: Vec<String> = plans.keys().cloned().collect();
+                    names.sort();
+                    Ok(Value::List(names.into_iter().map(Value::String).collect()))
+                }
+            }
+            "info" => {
+                let name = args
+                    .first()
+                    .ok_or("plan.info: requires plan name")?
+                    .to_string();
+                let plan = plans
+                    .get(&name)
+                    .ok_or_else(|| format!("plan.info: plan '{}' not found", name))?;
+                let mut d = std::collections::HashMap::new();
+                d.insert("name".to_string(), Value::String(name));
+                d.insert("total".to_string(), Value::Number(plan.len() as f64));
+                d.insert(
+                    "done".to_string(),
+                    Value::Number(plan.complete_count() as f64),
+                );
+                d.insert(
+                    "pending".to_string(),
+                    Value::Number(plan.pending_count() as f64),
+                );
+                d.insert(
+                    "completion_ratio".to_string(),
+                    Value::Number(plan.completion_ratio()),
+                );
+                Ok(Value::Dict(d))
+            }
+            _ => Err(format!("plan.{}: unknown method", method)),
+        }
+    }
+
+    /// v0.48.0: mora.* — meta (refine)
+    ///
+    /// Methods:
+    /// - `mora.refine(script_path, instruction)` — run refine iteration
+    ///   (REAL file I/O, writes to .refine/ subdirectory)
+    /// - `mora.refine_info(script_path, iteration?)` — get latest RefineStep
+    ///   or specific iteration
+    /// - `mora.list_refines()` — list all refined scripts
+    pub fn call_mora_method(&mut self, method: &str, args: &[Value]) -> Result<Value, String> {
+        match method {
+            "refine" => {
+                if args.len() < 2 {
+                    return Err(
+                        "mora.refine: requires 2 args (script_path, instruction)".to_string()
+                    );
+                }
+                let script = std::path::PathBuf::from(args[0].to_string());
+                let instruction = args[1].to_string();
+                let mut registry = self
+                    .refine_registry
+                    .lock()
+                    .expect("refine_registry mutex poisoned");
+                let session = registry.get_or_create(&script);
+                let step = session
+                    .refine(&instruction)
+                    .map_err(|e| format!("mora.refine: {}", e))?;
+                Ok(Value::Dict(step.to_dict()))
+            }
+            "refine_info" => {
+                if args.is_empty() {
+                    return Err("mora.refine_info: requires script_path".to_string());
+                }
+                let script = std::path::PathBuf::from(args[0].to_string());
+                let iter = if let Some(Value::Number(n)) = args.get(1) {
+                    Some(*n as usize)
+                } else {
+                    None
+                };
+                let registry = self
+                    .refine_registry
+                    .lock()
+                    .expect("refine_registry mutex poisoned");
+                let session = registry.get(&script).ok_or_else(|| {
+                    format!("mora.refine_info: no session for '{}'", script.display())
+                })?;
+                let step = if let Some(n) = iter {
+                    session
+                        .steps
+                        .get(n.saturating_sub(1))
+                        .ok_or_else(|| format!("mora.refine_info: iteration {} not found", n))?
+                } else {
+                    session
+                        .latest_step()
+                        .ok_or_else(|| "mora.refine_info: no steps yet".to_string())?
+                };
+                Ok(Value::Dict(step.to_dict()))
+            }
+            "list_refines" => {
+                let registry = self
+                    .refine_registry
+                    .lock()
+                    .expect("refine_registry mutex poisoned");
+                let mut names: Vec<String> = Vec::new();
+                for path in registry.session_paths() {
+                    names.push(path.clone());
+                }
+                names.sort();
+                Ok(Value::List(names.into_iter().map(Value::String).collect()))
+            }
+            _ => Err(format!("mora.{}: unknown method", method)),
+        }
+    }
 }
 
 // ============================================================
@@ -3842,6 +4107,530 @@ body
         let mut interp = Interpreter::new();
         let err = interp
             .call_skill_method("nope", &[])
+            .expect_err("unknown method should fail");
+        assert!(err.contains("unknown method"), "got: {}", err);
+    }
+}
+
+#[cfg(test)]
+mod tests_v048_plan {
+    #![allow(unused_mut)]
+    use super::*;
+    use crate::value::Value;
+
+    /// v0.48.0: plan.* builtin (pi-agent update_plan pattern)
+
+    #[test]
+    fn plan_create_then_list() {
+        let mut interp = Interpreter::new();
+        let steps = vec![
+            Value::Dict({
+                let mut d = std::collections::HashMap::new();
+                d.insert("id".to_string(), Value::String("s1".to_string()));
+                d.insert("text".to_string(), Value::String("first".to_string()));
+                d.insert("status".to_string(), Value::String("pending".to_string()));
+                d
+            }),
+            Value::Dict({
+                let mut d = std::collections::HashMap::new();
+                d.insert("id".to_string(), Value::String("s2".to_string()));
+                d.insert("text".to_string(), Value::String("second".to_string()));
+                d
+            }),
+        ];
+        let name = interp
+            .call_plan_method(
+                "create",
+                &[Value::String("myplan".to_string()), Value::List(steps)],
+            )
+            .expect("create");
+        assert_eq!(name, Value::String("myplan".to_string()));
+
+        let list = interp.call_plan_method("list", &[]).expect("list");
+        match list {
+            Value::List(items) => {
+                let names: Vec<String> = items
+                    .into_iter()
+                    .filter_map(|v| match v {
+                        Value::String(s) => Some(s),
+                        _ => None,
+                    })
+                    .collect();
+                assert!(names.contains(&"myplan".to_string()));
+            }
+            _ => panic!("expected List"),
+        }
+    }
+
+    #[test]
+    fn plan_update_step_status() {
+        let mut interp = Interpreter::new();
+        let steps = vec![Value::Dict({
+            let mut d = std::collections::HashMap::new();
+            d.insert("id".to_string(), Value::String("a".to_string()));
+            d.insert("text".to_string(), Value::String("A".to_string()));
+            d
+        })];
+        interp
+            .call_plan_method(
+                "create",
+                &[Value::String("p".to_string()), Value::List(steps)],
+            )
+            .unwrap();
+        // update a -> done
+        let updates = vec![Value::List(vec![
+            Value::String("a".to_string()),
+            Value::String("done".to_string()),
+        ])];
+        let result = interp
+            .call_plan_method(
+                "update",
+                &[Value::String("p".to_string()), Value::List(updates)],
+            )
+            .expect("update");
+        assert_eq!(result, Value::Bool(true));
+
+        let info = interp
+            .call_plan_method("info", &[Value::String("p".to_string())])
+            .expect("info");
+        match info {
+            Value::Dict(d) => {
+                let done = d.get("done").expect("done");
+                match done {
+                    Value::Number(n) => assert_eq!(*n, 1.0),
+                    _ => panic!("expected Number"),
+                }
+            }
+            _ => panic!("expected Dict"),
+        }
+    }
+
+    #[test]
+    fn plan_update_supports_emoji_status() {
+        let mut interp = Interpreter::new();
+        let steps = vec![Value::Dict({
+            let mut d = std::collections::HashMap::new();
+            d.insert("id".to_string(), Value::String("a".to_string()));
+            d.insert("text".to_string(), Value::String("A".to_string()));
+            d
+        })];
+        interp
+            .call_plan_method(
+                "create",
+                &[Value::String("p".to_string()), Value::List(steps)],
+            )
+            .unwrap();
+        // emoji ✅
+        let updates = vec![Value::List(vec![
+            Value::String("a".to_string()),
+            Value::String("✅".to_string()),
+        ])];
+        let result = interp
+            .call_plan_method(
+                "update",
+                &[Value::String("p".to_string()), Value::List(updates)],
+            )
+            .expect("update with emoji");
+        assert_eq!(result, Value::Bool(true));
+    }
+
+    #[test]
+    fn plan_update_unknown_step_errors() {
+        let mut interp = Interpreter::new();
+        interp
+            .call_plan_method(
+                "create",
+                &[
+                    Value::String("p".to_string()),
+                    Value::List(vec![Value::Dict({
+                        let mut d = std::collections::HashMap::new();
+                        d.insert("id".to_string(), Value::String("a".to_string()));
+                        d.insert("text".to_string(), Value::String("A".to_string()));
+                        d
+                    })]),
+                ],
+            )
+            .unwrap();
+        let updates = vec![Value::List(vec![
+            Value::String("ghost".to_string()),
+            Value::String("done".to_string()),
+        ])];
+        let err = interp
+            .call_plan_method(
+                "update",
+                &[Value::String("p".to_string()), Value::List(updates)],
+            )
+            .expect_err("unknown step should fail");
+        assert!(err.contains("not found"), "got: {}", err);
+    }
+
+    #[test]
+    fn plan_add_and_remove_step() {
+        let mut interp = Interpreter::new();
+        interp
+            .call_plan_method(
+                "create",
+                &[Value::String("p".to_string()), Value::List(vec![])],
+            )
+            .unwrap();
+        let added = interp
+            .call_plan_method(
+                "add",
+                &[
+                    Value::String("p".to_string()),
+                    Value::String("a".to_string()),
+                    Value::String("A".to_string()),
+                ],
+            )
+            .expect("add");
+        assert_eq!(added, Value::Bool(true));
+        let removed = interp
+            .call_plan_method(
+                "remove",
+                &[
+                    Value::String("p".to_string()),
+                    Value::String("a".to_string()),
+                ],
+            )
+            .expect("remove");
+        assert_eq!(removed, Value::Bool(true));
+    }
+
+    #[test]
+    fn plan_list_returns_steps_with_emoji() {
+        let mut interp = Interpreter::new();
+        let steps = vec![Value::Dict({
+            let mut d = std::collections::HashMap::new();
+            d.insert("id".to_string(), Value::String("a".to_string()));
+            d.insert("text".to_string(), Value::String("A".to_string()));
+            d
+        })];
+        interp
+            .call_plan_method(
+                "create",
+                &[Value::String("p".to_string()), Value::List(steps)],
+            )
+            .unwrap();
+        let list = interp
+            .call_plan_method("list", &[Value::String("p".to_string())])
+            .expect("list steps");
+        match list {
+            Value::List(items) => {
+                assert_eq!(items.len(), 1);
+                match &items[0] {
+                    Value::Dict(d) => {
+                        let emoji = d.get("emoji").expect("emoji");
+                        match emoji {
+                            Value::String(s) => assert_eq!(s, "⬜"), // pending default
+                            _ => panic!("expected emoji String"),
+                        }
+                    }
+                    _ => panic!("expected Dict"),
+                }
+            }
+            _ => panic!("expected List"),
+        }
+    }
+
+    #[test]
+    fn plan_info_reports_counts() {
+        let mut interp = Interpreter::new();
+        let steps = vec![
+            Value::Dict({
+                let mut d = std::collections::HashMap::new();
+                d.insert("id".to_string(), Value::String("a".to_string()));
+                d.insert("text".to_string(), Value::String("A".to_string()));
+                d.insert("status".to_string(), Value::String("done".to_string()));
+                d
+            }),
+            Value::Dict({
+                let mut d = std::collections::HashMap::new();
+                d.insert("id".to_string(), Value::String("b".to_string()));
+                d.insert("text".to_string(), Value::String("B".to_string()));
+                d
+            }),
+        ];
+        interp
+            .call_plan_method(
+                "create",
+                &[Value::String("p".to_string()), Value::List(steps)],
+            )
+            .unwrap();
+        let info = interp
+            .call_plan_method("info", &[Value::String("p".to_string())])
+            .expect("info");
+        match info {
+            Value::Dict(d) => {
+                let total = d.get("total").expect("total");
+                match total {
+                    Value::Number(n) => assert_eq!(*n, 2.0),
+                    _ => panic!("expected Number"),
+                }
+                let done = d.get("done").expect("done");
+                match done {
+                    Value::Number(n) => assert_eq!(*n, 1.0),
+                    _ => panic!("expected Number"),
+                }
+                let pending = d.get("pending").expect("pending");
+                match pending {
+                    Value::Number(n) => assert_eq!(*n, 1.0),
+                    _ => panic!("expected Number"),
+                }
+                let ratio = d.get("completion_ratio").expect("ratio");
+                match ratio {
+                    Value::Number(n) => assert_eq!(*n, 0.5),
+                    _ => panic!("expected Number"),
+                }
+            }
+            _ => panic!("expected Dict"),
+        }
+    }
+
+    #[test]
+    fn plan_unknown_method_errors() {
+        let mut interp = Interpreter::new();
+        let err = interp
+            .call_plan_method("nope", &[])
+            .expect_err("unknown method should fail");
+        assert!(err.contains("unknown method"), "got: {}", err);
+    }
+}
+
+#[cfg(test)]
+mod tests_v048_refine {
+    #![allow(unused_mut)]
+    use super::*;
+    use crate::value::Value;
+
+    /// v0.48.0: mora.refine + mora.refine_info + mora.list_refines (CLI-Anything /refine)
+    #[allow(unused_imports)]
+    use std::time::UNIX_EPOCH;
+
+    fn write_temp_script(name: &str, content: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "mora_refine_test_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(name);
+        std::fs::write(&path, content).unwrap();
+        path
+    }
+
+    #[test]
+    fn mora_refine_real_file_creates_refined_copy() {
+        let mut interp = Interpreter::new();
+        let script = write_temp_script("demo.mora", "task main()\n  print(\"hi\")\n");
+        let result = interp
+            .call_mora_method(
+                "refine",
+                &[
+                    Value::String(script.to_string_lossy().to_string()),
+                    Value::String("add greeting".to_string()),
+                ],
+            )
+            .expect("refine");
+        match result {
+            Value::Dict(d) => {
+                let iter = d.get("iteration").expect("iteration");
+                match iter {
+                    Value::Number(n) => assert_eq!(*n, 1.0),
+                    _ => panic!("expected Number"),
+                }
+                let refined = d.get("refined").expect("refined");
+                match refined {
+                    Value::String(s) => assert!(s.contains(".refined.1.mora")),
+                    _ => panic!("expected String"),
+                }
+            }
+            _ => panic!("expected Dict"),
+        }
+
+        // 验证 .refine/ 目录存在 + 副本可读
+        let refine_dir = script.parent().unwrap().join("demo.refine");
+        assert!(refine_dir.exists(), ".refine/ should be created");
+        let refined_path = refine_dir.join("demo.refined.1.mora");
+        assert!(refined_path.exists(), "refined copy should exist");
+        let content = std::fs::read_to_string(&refined_path).unwrap();
+        assert!(content.contains("add greeting"));
+        assert!(content.contains("task main()"));
+
+        let _ = std::fs::remove_dir_all(script.parent().unwrap());
+    }
+
+    #[test]
+    fn mora_refine_iteration_increments() {
+        let mut interp = Interpreter::new();
+        let script = write_temp_script("iter.mora", "x\n");
+        for i in 1..=3 {
+            let result = interp
+                .call_mora_method(
+                    "refine",
+                    &[
+                        Value::String(script.to_string_lossy().to_string()),
+                        Value::String(format!("iter {}", i)),
+                    ],
+                )
+                .expect("refine");
+            match result {
+                Value::Dict(d) => {
+                    let iter = d.get("iteration").expect("iteration");
+                    match iter {
+                        Value::Number(n) => assert_eq!(*n, i as f64),
+                        _ => panic!("expected Number"),
+                    }
+                }
+                _ => panic!("expected Dict"),
+            }
+        }
+        let _ = std::fs::remove_dir_all(script.parent().unwrap());
+    }
+
+    #[test]
+    fn mora_refine_info_returns_latest() {
+        let mut interp = Interpreter::new();
+        let script = write_temp_script("info.mora", "x\n");
+        interp
+            .call_mora_method(
+                "refine",
+                &[
+                    Value::String(script.to_string_lossy().to_string()),
+                    Value::String("first".to_string()),
+                ],
+            )
+            .unwrap();
+        let info = interp
+            .call_mora_method(
+                "refine_info",
+                &[Value::String(script.to_string_lossy().to_string())],
+            )
+            .expect("refine_info");
+        match info {
+            Value::Dict(d) => {
+                let inst = d.get("instruction").expect("instruction");
+                match inst {
+                    Value::String(s) => assert_eq!(s, "first"),
+                    _ => panic!("expected String"),
+                }
+            }
+            _ => panic!("expected Dict"),
+        }
+        let _ = std::fs::remove_dir_all(script.parent().unwrap());
+    }
+
+    #[test]
+    fn mora_refine_info_specific_iteration() {
+        let mut interp = Interpreter::new();
+        let script = write_temp_script("specific.mora", "x\n");
+        interp
+            .call_mora_method(
+                "refine",
+                &[
+                    Value::String(script.to_string_lossy().to_string()),
+                    Value::String("v1".to_string()),
+                ],
+            )
+            .unwrap();
+        interp
+            .call_mora_method(
+                "refine",
+                &[
+                    Value::String(script.to_string_lossy().to_string()),
+                    Value::String("v2".to_string()),
+                ],
+            )
+            .unwrap();
+        let info = interp
+            .call_mora_method(
+                "refine_info",
+                &[
+                    Value::String(script.to_string_lossy().to_string()),
+                    Value::Number(1.0),
+                ],
+            )
+            .expect("iter 1");
+        match info {
+            Value::Dict(d) => {
+                let inst = d.get("instruction").expect("instruction");
+                match inst {
+                    Value::String(s) => assert_eq!(s, "v1"),
+                    _ => panic!("expected String"),
+                }
+            }
+            _ => panic!("expected Dict"),
+        }
+        let _ = std::fs::remove_dir_all(script.parent().unwrap());
+    }
+
+    #[test]
+    fn mora_list_refines_lists_all_scripts() {
+        let mut interp = Interpreter::new();
+        let s1 = write_temp_script("s1.mora", "1\n");
+        let s2 = write_temp_script("s2.mora", "2\n");
+        interp
+            .call_mora_method(
+                "refine",
+                &[
+                    Value::String(s1.to_string_lossy().to_string()),
+                    Value::String("a".to_string()),
+                ],
+            )
+            .unwrap();
+        interp
+            .call_mora_method(
+                "refine",
+                &[
+                    Value::String(s2.to_string_lossy().to_string()),
+                    Value::String("b".to_string()),
+                ],
+            )
+            .unwrap();
+        let list = interp
+            .call_mora_method("list_refines", &[])
+            .expect("list_refines");
+        match list {
+            Value::List(items) => {
+                let paths: Vec<String> = items
+                    .into_iter()
+                    .filter_map(|v| match v {
+                        Value::String(s) => Some(s),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(paths.len(), 2);
+                assert!(paths.iter().any(|p| p.contains("s1.mora")));
+                assert!(paths.iter().any(|p| p.contains("s2.mora")));
+            }
+            _ => panic!("expected List"),
+        }
+        let _ = std::fs::remove_dir_all(s1.parent().unwrap());
+        let _ = std::fs::remove_dir_all(s2.parent().unwrap());
+    }
+
+    #[test]
+    fn mora_refine_nonexistent_script_errors() {
+        let mut interp = Interpreter::new();
+        let err = interp
+            .call_mora_method(
+                "refine",
+                &[
+                    Value::String("/nonexistent/foo.mora".to_string()),
+                    Value::String("x".to_string()),
+                ],
+            )
+            .expect_err("nonexistent should fail");
+        assert!(err.contains("mora.refine"), "got: {}", err);
+    }
+
+    #[test]
+    fn mora_unknown_method_errors() {
+        let mut interp = Interpreter::new();
+        let err = interp
+            .call_mora_method("nope", &[])
             .expect_err("unknown method should fail");
         assert!(err.contains("unknown method"), "got: {}", err);
     }

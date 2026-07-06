@@ -2,6 +2,99 @@
 
 All notable changes to Mora will be documented in this file.
 
+## [v0.48.0] - 2026-07-06 — plan.update + mora.refine (pi-agent + CLI-Anything)
+
+1 commit; v0.48+ roadmap from RESEARCH_PRIMITIVES_MASTER_v2.md §3.3.
+
+### plan.update — real-time checklist (pi-agent §1.11)
+
+- **New module `src/plan/mod.rs`**:
+  - `StepStatus` enum: Pending (⬜) / InProgress (🔄) / Done (✅)
+    with emoji ↔ text ↔ alias parsing (todo / doing / completed / etc.)
+  - `PlanStep { id, text, status }` — single checklist item
+  - `Plan` — ordered list + HashMap by_id for O(1) update
+  - `add_step` / `update([(id, status)])` / `remove_step` / `get`
+  - `complete_count` / `in_progress_count` / `pending_count` /
+    `completion_ratio` helpers
+  - 9 module-level tests (emoji/text parsing, add/update/remove,
+    completion_ratio, empty plan)
+
+- **`plan.*` builtins** (added to `call_plan_method`, 7 methods):
+  - `plan.create(name, steps)` → String(name); steps: List[Dict{id, text, status?}]
+  - `plan.update(name, updates)` → Bool(true); updates: List[[id, status]]
+  - `plan.add(name, id, text)` → Bool(true) (append step)
+  - `plan.remove(name, id)` → Bool(true)
+  - `plan.list(name?)` → List (of plan names or step Dict[])
+  - `plan.info(name)` → Dict{total, done, pending, completion_ratio}
+  - Status accepts: pending/todo/⬜, in_progress/in-progress/🔄/doing,
+    done/completed/✅/finish (emoji + text + alias all supported)
+
+### mora.refine — incremental edit loop (CLI-Anything §1.3)
+
+- **New module `src/refine/mod.rs`**:
+  - `RefineStep { iteration, script_path, refined_path, instruction,
+    original_bytes, refined_bytes, diff_lines_added/removed, timestamp }`
+  - `RefineSession::new(script_path)` — computes `<stem>.refine/`
+    subdir from script path
+  - `RefineSession::refine(instruction)` — REAL file I/O: read script,
+    create .refine/ dir, write `<stem>.refined.<n>.<ext>` with
+    `# --- INSTRUCTION (refine iter n): <text>` header + original
+    content. Returns `&RefineStep` with diff line counts.
+  - `RefineRegistry` — multi-script session map
+  - 6 module-level tests (real file I/O, multi-iteration,
+    separate files, nonexistent error, multi-session, dict fields)
+
+- **`mora.*` builtins** (added to `call_mora_method`, 3 methods):
+  - `mora.refine(script_path, instruction)` → Dict{iteration, script,
+    refined, instruction, original_bytes, refined_bytes,
+    diff_lines_added, diff_lines_removed} (REAL file I/O)
+  - `mora.refine_info(script_path, iteration?)` → Dict (latest or
+    specific iteration)
+  - `mora.list_refines()` → List[String] of all script paths with sessions
+
+- **`Interpreter.plans` + `Interpreter.refine_registry` fields** (both
+  `Arc<Mutex<>>` for `&self` API compat).
+
+- **`BuiltinKind::Plan` + `BuiltinKind::Mora`** new variants; `plan` and
+  `mora` global names registered.
+
+### Design decision: REAL file I/O (not metadata-only)
+
+master doc §3.3 says "mora refine 'add X' 增量变更" (CLI-Anything).
+**v0.48.0 actually writes files**:
+- `mora.refine()` reads original script + writes `.refine/<stem>.refined.<n>.<ext>`
+  with instruction header (REAL create_dir_all + write)
+- `mora.refine_info()` re-reads file metadata for accurate
+  original_bytes / refined_bytes
+- No metadata-only "this is what we'd do" stubs
+
+### 30 new tests (9 plan module + 6 refine module + 15 builtin)
+- 9 `plan::tests::*`
+- 6 `refine::tests::*` (incl. real file I/O tests)
+- 8 `tests_v048_plan::*` (create/update/add/remove/list/info/emoji/unknown)
+- 7 `tests_v048_refine::*` (real_file/iteration_increment/latest/specific/
+  list/nonexistent/unknown)
+
+### Total impact
+- 1 commit
+- ~700 LOC (+~280 plan + ~270 refine + ~150 builtin + ~80 tests cleanup)
+- +30 tests (531 pre-existing retained)
+- **561 tests pass total** (lib 555 + bin 6), 0 fail (1 pre-existing doctest)
+- clippy clean (`-D warnings`), fmt clean
+- 0 new deps
+
+### v0.41+ roadmap complete
+
+This commit finishes master doc §4 first wave + v0.45-v0.48 (8 commits).
+v0.41-v0.48 covers all P0/P1/P2 patches identified by §4 of
+RESEARCH_PRIMITIVES_MASTER_v2.md. Future work (v1.0+) includes:
+- WASM sandbox (master doc §3.4)
+- TRINITY router (deferred — repo access limited)
+- 5-layer DI container (Puter)
+- serde_yaml/serde_json upgrades (currently hand-written)
+
+---
+
 ## [v0.47.0] - 2026-07-06 — DAG-as-data + heartbeat.md + context.trim
 
 1 commit; v0.47+ roadmap from RESEARCH_PRIMITIVES_MASTER_v2.md §3.3.

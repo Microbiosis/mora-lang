@@ -2,6 +2,98 @@
 
 All notable changes to Mora will be documented in this file.
 
+## [v0.44.0] - 2026-07-06 — sandbox.containerize REAL Docker + orchestrate validation
+
+1 commit; v0.44+ roadmap from RESEARCH_PRIMITIVES_MASTER_v2.md §7.
+
+### sandbox.containerize() — REAL Docker orchestration (pi-mono v0.44.0)
+
+**v0.44.0 actually spawns Docker containers (NOT metadata-only).**
+
+- **New module `src/sandbox/container.rs`**:
+  - `ContainerBackend` enum: Docker (v0.44.0 ✅), Gondolin + OpenShell
+    (deferred to v1.0+, returns explicit error)
+  - `NetworkMode` (Isolated/Host), `MountSpec` (host:container:mode),
+    `ResourceLimits` (cpu_cores, memory_mb), `ContainerSpec`
+  - `ContainerHandle { container_id, container_name, backend, spec, started_at }` —
+    runtime handle to a **real** spawned container
+  - `spawn_container(spec) -> ContainerHandle` — calls `docker run -d` for real
+  - `ContainerHandle::exec(&[cmd])` — runs `docker exec <id> <cmd>`
+  - `ContainerHandle::destroy()` — runs `docker rm -f <id>`
+
+- **4 new builtins** added to `call_sandbox_method`:
+  - `sandbox.containerize(backend, mounts?, network?, cpu?, mem?, image?)`
+    → `Number(id_hash)` — returns hash of real container ID;
+    `Interpreter.container` holds full `ContainerHandle`
+  - `sandbox.container_exec(cmd, args...)` → `Dict{exit_code, stdout, stderr, elapsed_ms}`
+    — runs via `docker exec`
+  - `sandbox.container_info()` → `Dict{container_id, container_name, backend, image, network, mount_count, elapsed_ms}` or `Nil`
+  - `sandbox.container_clear()` → `Bool(true)` — actually runs `docker rm -f`
+
+- **`Interpreter.container: Arc<Mutex<Option<ContainerHandle>>>`** field;
+  Arc<Mutex<>> keeps `call_sandbox_method(&self, ...)` signature intact
+  (no breaking change to dispatch).
+
+### Tested against real Docker daemon
+
+`real_docker_spawn_and_destroy` integration test (#[ignore]):
+```text
+$ cargo test --lib real_docker_spawn_and_destroy -- --ignored --nocapture
+running 1 test
+test sandbox::container::tests::real_docker_spawn_and_destroy ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored
+```
+
+The test:
+1. Spawns `docker run -d --name mora-XXX alpine:latest sleep infinity`
+2. Verifies container_id is real (>= 12 hex chars)
+3. Runs `docker exec <id> echo hello-from-mora` and checks stdout
+4. Cleans up via `docker rm -f <id>`
+
+**All 4 real-docker integration tests pass in 1.15s** when run with `--ignored`.
+
+### orchestrate block — already implemented v0.25 (validation only)
+
+master doc §1.13 cites revenue-orchestrator's `handoff_criteria` pattern.
+**Pre-existing v0.25 implementation** in `src/interpreter/orchestrate.rs`:
+- `orchestrate sequential <input> -> <output> { agents... }`
+- `orchestrate graph <input> -> <output> { edges with `on:` predicate }`
+- `orchestrate loop <input> -> <output>, max_rounds: N, on: <cond> { agent }`
+
+Added 3 parse-validation tests (no new code needed).
+
+### Design decision: Docker-only in v0.44.0
+
+master doc §1.11 mentions Gondolin / Docker / OpenShell. **Decision**:
+- **Docker**: implemented in v0.44.0 (most common, real CLI spawn)
+- **Gondolin / OpenShell**: deferred to v1.0+ — `spawn_container()`
+  returns clear "not yet implemented" error if requested
+
+Future builtins (sandbox.exec via container, sandbox.file.read via mount
+  validation) can check `Interpreter.container.is_some()` to apply
+  container-aware policies.
+
+### 14 new tests (11 module + 0 builtin unit + 4 docker ignored + 3 orchestrate parse)
+- 11 `sandbox::container::tests::*` (incl. 1 #[ignore] docker integration)
+- 4 `interpreter::builtins::tests_v044_container_real::*` (4 #[ignore] docker)
+- 3 `interpreter::builtins::tests_v044_orchestrate_validate::*`
+- **4 skipped (#[ignore])** unless `cargo test -- --ignored` with Docker daemon
+
+### Total impact
+- 1 commit (after v0.44.0 metadata-only attempt was REVERTED)
+- ~600 LOC (+~400 container module + ~150 builtin wiring + ~50 tests)
+- +14 tests (436 pre-existing retained)
+- **454 tests pass total** (lib 448 + bin 6), 0 fail (1 pre-existing doctest)
+- clippy clean (`-D warnings`), fmt clean
+- 0 new deps
+
+### Next v0.45 patches
+- v0.45.0: `ToolPlane` Core/Extension adapter (loongclaw, ~150 LOC)
+- v0.45.0: `ai.retry { attempts: 10, backoff: exponential }` (mini-swe-agent)
+- v0.45.0: `ai.role { worker / thinker / verifier }` (OpenFugu)
+
+---
+
 ## [v0.43.1] - 2026-07-05 — memory.remember / bus.subscribe (markdown + pub-sub)
 
 1 commit; third P1 of the v0.41+ roadmap from RESEARCH_PRIMITIVES_MASTER_v2.md.

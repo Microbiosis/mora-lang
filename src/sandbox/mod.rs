@@ -25,6 +25,14 @@ use std::path::{Component, Path, PathBuf};
 pub mod capability;
 pub use capability::{Capability, CapabilityStore, CapabilityToken, SandboxError};
 
+// v0.44.0: Container sandbox + REAL Docker orchestration (pi-mono inspired)
+// See container.rs for full docs.
+pub mod container;
+pub use container::{
+    ContainerBackend, ContainerHandle, ContainerSpec, MountSpec, NetworkMode, ResourceLimits,
+    generate_container_name, spawn_container,
+};
+
 /// v0.33+: Sandbox 策略
 #[derive(Debug, Clone, Default)]
 pub struct SandboxPolicy {

@@ -187,6 +187,10 @@ pub struct Interpreter {
     /// v0.43.1: Markdown memory root dir (test isolation + custom path support)
     /// If None, falls back to $MORA_MEMORY_DIR or $HOME/.mora/memory
     pub markdown_memory_dir: Option<std::path::PathBuf>,
+    /// v0.44.0: Container handle (REAL Docker spawn via `docker run`)
+    /// None = no container (run on host). Set via sandbox.containerize builtin.
+    /// Arc<Mutex<>> keeps call_sandbox_method `&self` (Clone-safe).
+    pub container: std::sync::Arc<std::sync::Mutex<Option<crate::sandbox::ContainerHandle>>>,
 }
 
 /// v0.06: with 块字段 (不经过 env 变量)
@@ -244,6 +248,7 @@ impl Clone for Interpreter {
             mock_registry: self.mock_registry.clone(),
             audit_sink: self.audit_sink.clone(),
             markdown_memory_dir: self.markdown_memory_dir.clone(),
+            container: self.container.clone(),
         }
     }
 }
@@ -418,6 +423,7 @@ impl Interpreter {
             mock_registry: crate::mock::MockRegistry::new(),
             audit_sink: std::sync::Arc::new(crate::audit::NullSink::new()),
             markdown_memory_dir: None,
+            container: std::sync::Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
@@ -454,6 +460,7 @@ impl Interpreter {
             mock_registry: crate::mock::MockRegistry::new(),
             audit_sink: std::sync::Arc::new(crate::audit::NullSink::new()),
             markdown_memory_dir: None,
+            container: std::sync::Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
@@ -488,6 +495,7 @@ impl Interpreter {
             mock_registry: crate::mock::MockRegistry::new(),
             audit_sink: std::sync::Arc::new(crate::audit::NullSink::new()),
             markdown_memory_dir: None,
+            container: std::sync::Arc::new(std::sync::Mutex::new(None)),
         }
     }
 

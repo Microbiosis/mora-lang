@@ -512,6 +512,201 @@ impl Interpreter {
                 Ok(()) => Ok(Value::Bool(true)),
                 Err(e) => Ok(Value::String(format!("{}", e))),
             },
+            // v0.44.0: sandbox.containerize(backend, mounts?, network?, cpu_cores?, memory_mb?, image?)
+            // **REAL Docker spawn** via `docker run -d` (NOT metadata-only)
+            // Returns: Number(container_id hash) on success
+            "containerize" => {
+                let backend_str = match args.first() {
+                    Some(Value::String(s)) => s.clone(),
+                    _ => return Err(
+                        "sandbox.containerize: backend must be a string (\"docker\"/\"gondolin\"/\"openshell\")".to_string()
+                    ),
+                };
+                let backend =
+                    crate::sandbox::ContainerBackend::parse(&backend_str).ok_or_else(|| {
+                        format!("sandbox.containerize: unknown backend '{}'", backend_str)
+                    })?;
+                let mut spec = crate::sandbox::ContainerSpec::new(backend);
+
+                // mounts (可选, arg 1)
+                if let Some(Value::List(mounts)) = args.get(1) {
+                    for (i, m) in mounts.iter().enumerate() {
+                        let m_str = match m {
+                            Value::String(s) => s.clone(),
+                            _ => {
+                                return Err(format!(
+                                    "sandbox.containerize: mounts[{}] must be a string",
+                                    i
+                                ));
+                            }
+                        };
+                        let mount = crate::sandbox::MountSpec::parse(&m_str)
+                            .map_err(|e| format!("sandbox.containerize: {}", e))?;
+                        spec.mounts.push(mount);
+                    }
+                }
+
+                // network (可选, arg 2)
+                if let Some(Value::String(net_str)) = args.get(2) {
+                    spec.network =
+                        crate::sandbox::NetworkMode::parse(net_str).ok_or_else(|| {
+                            format!("sandbox.containerize: unknown network '{}'", net_str)
+                        })?;
+                }
+
+                // cpu_cores (可选, arg 3)
+                if let Some(n) = args.get(3) {
+                    match n {
+                        Value::Number(v) => spec.limits.cpu_cores = Some(*v as u32),
+                        Value::Int(i) => spec.limits.cpu_cores = Some(*i as u32),
+                        Value::Nil => {}
+                        _ => {
+                            return Err(
+                                "sandbox.containerize: cpu_cores must be a number".to_string()
+                            );
+                        }
+                    }
+                }
+
+                // memory_mb (可选, arg 4)
+                if let Some(n) = args.get(4) {
+                    match n {
+                        Value::Number(v) => spec.limits.memory_mb = Some(*v as u64),
+                        Value::Int(i) => spec.limits.memory_mb = Some(*i as u64),
+                        Value::Nil => {}
+                        _ => {
+                            return Err(
+                                "sandbox.containerize: memory_mb must be a number".to_string()
+                            );
+                        }
+                    }
+                }
+
+                // image (可选, arg 5; default alpine:latest)
+                if let Some(Value::String(img)) = args.get(5) {
+                    spec.image = img.clone();
+                }
+
+                spec.validate()
+                    .map_err(|e| format!("sandbox.containerize: {}", e))?;
+
+                // **REAL spawn** — 真的调用 docker run
+                let handle = crate::sandbox::spawn_container(&spec)
+                    .map_err(|e| format!("sandbox.containerize: {}", e))?;
+
+                // 用 container_id 的 hash 做成 Number 返回 (handle 存到 Interpreter)
+                let id_hash = {
+                    let mut h: u64 = 14695981039346656037;
+                    for b in handle.container_id.bytes() {
+                        h ^= b as u64;
+                        h = h.wrapping_mul(1099511628211);
+                    }
+                    h
+                };
+
+                *self.container.lock().expect("container mutex poisoned") = Some(handle);
+                Ok(Value::Number(id_hash as f64))
+            }
+            // v0.44.0: sandbox.container_exec(cmd, args...) — run cmd INSIDE container via docker exec
+            // Returns: Dict{exit_code, stdout, stderr, elapsed_ms}
+            "container_exec" => {
+                let guard = self.container.lock().expect("container mutex poisoned");
+                let handle = guard
+                    .as_ref()
+                    .ok_or_else(|| {
+                        "sandbox.container_exec: no container (call sandbox.containerize first)"
+                            .to_string()
+                    })?
+                    .clone();
+                drop(guard);
+
+                if args.is_empty() {
+                    return Err("sandbox.container_exec: requires at least 1 arg (cmd)".to_string());
+                }
+                // 第一个 arg 是 cmd (e.g. "ls"), 后续是 args (e.g. "-la", "/")
+                let mut cmd_parts: Vec<String> = Vec::with_capacity(args.len());
+                for (i, v) in args.iter().enumerate() {
+                    let s = match v {
+                        Value::String(s) => s.clone(),
+                        _ => {
+                            return Err(format!(
+                                "sandbox.container_exec: arg[{}] must be a string",
+                                i
+                            ));
+                        }
+                    };
+                    cmd_parts.push(s);
+                }
+                let cmd_refs: Vec<&str> = cmd_parts.iter().map(String::as_str).collect();
+                let (code, stdout, stderr) = handle
+                    .exec(&cmd_refs)
+                    .map_err(|e| format!("sandbox.container_exec: {}", e))?;
+                let mut d = std::collections::HashMap::new();
+                d.insert("exit_code".to_string(), Value::Number(code as f64));
+                d.insert("stdout".to_string(), Value::String(stdout));
+                d.insert("stderr".to_string(), Value::String(stderr));
+                d.insert(
+                    "elapsed_ms".to_string(),
+                    Value::Number(handle.elapsed().as_millis() as f64),
+                );
+                Ok(Value::Dict(d))
+            }
+            // v0.44.0: sandbox.container_info() — diagnostic, returns Dict (container_id, name, backend, mounts)
+            "container_info" => {
+                let guard = self.container.lock().expect("container mutex poisoned");
+                match guard.as_ref() {
+                    Some(handle) => {
+                        let mut d = std::collections::HashMap::new();
+                        d.insert(
+                            "container_id".to_string(),
+                            Value::String(handle.container_id.clone()),
+                        );
+                        d.insert(
+                            "container_name".to_string(),
+                            Value::String(handle.container_name.clone()),
+                        );
+                        d.insert(
+                            "backend".to_string(),
+                            Value::String(handle.backend.as_str().to_string()),
+                        );
+                        d.insert(
+                            "image".to_string(),
+                            Value::String(handle.spec.image.clone()),
+                        );
+                        d.insert(
+                            "network".to_string(),
+                            Value::String(
+                                match handle.spec.network {
+                                    crate::sandbox::NetworkMode::Isolated => "isolated",
+                                    crate::sandbox::NetworkMode::Host => "host",
+                                }
+                                .to_string(),
+                            ),
+                        );
+                        d.insert(
+                            "mount_count".to_string(),
+                            Value::Number(handle.spec.mounts.len() as f64),
+                        );
+                        d.insert(
+                            "elapsed_ms".to_string(),
+                            Value::Number(handle.elapsed().as_millis() as f64),
+                        );
+                        Ok(Value::Dict(d))
+                    }
+                    None => Ok(Value::Nil),
+                }
+            }
+            // v0.44.0: sandbox.container_clear() — REAL docker rm -f, then clear handle
+            "container_clear" => {
+                let mut guard = self.container.lock().expect("container mutex poisoned");
+                if let Some(handle) = guard.as_ref() {
+                    handle
+                        .destroy()
+                        .map_err(|e| format!("sandbox.container_clear: {}", e))?;
+                }
+                *guard = None;
+                Ok(Value::Bool(true))
+            }
             _ => Err(format!("sandbox.{}: unknown method", method)),
         }
     }
@@ -2350,5 +2545,246 @@ mod tests_v0431_memory_bus {
         // 两个 patterns
         let count = interp.call_event_method("count", &[]).unwrap();
         assert_eq!(count, Value::Number(2.0));
+    }
+}
+
+#[cfg(test)]
+mod tests_v044_container_real {
+    // Tests use `let mut interp = ...` pattern uniformly; some tests don't actually need mut.
+    // Allow unused_mut for the whole module to avoid 5 false positives.
+    #![allow(unused_mut)]
+
+    use super::*;
+    use crate::value::Value;
+
+    /// v0.44.0: REAL Docker container builtin integration
+    /// **Requires Docker daemon** — 默认 #[ignore] 让 CI 无 docker 时跳过
+    fn cleanup_container(interp: &mut Interpreter) {
+        // 尽力清理 (可能根本没 spawn 成功)
+        let _ = interp.call_sandbox_method("container_clear", &[]);
+    }
+
+    #[test]
+    #[ignore = "requires Docker daemon (run with --ignored)"]
+    fn sandbox_containerize_real_spawn() {
+        let mut interp = Interpreter::new();
+        let result = interp
+            .call_sandbox_method("containerize", &[Value::String("docker".to_string())])
+            .expect("containerize should spawn docker");
+        // 返回 Number (container_id hash)
+        match result {
+            Value::Number(n) => assert!(n > 0.0, "container_id hash should be non-zero"),
+            other => panic!("expected Number, got: {:?}", other),
+        }
+        assert!(interp.container.lock().unwrap().is_some());
+        cleanup_container(&mut interp);
+        assert!(interp.container.lock().unwrap().is_none());
+    }
+
+    #[test]
+    #[ignore = "requires Docker daemon (run with --ignored)"]
+    fn sandbox_container_exec_runs_cmd_inside_container() {
+        let mut interp = Interpreter::new();
+        interp
+            .call_sandbox_method("containerize", &[Value::String("docker".to_string())])
+            .unwrap();
+        let result = interp
+            .call_sandbox_method(
+                "container_exec",
+                &[
+                    Value::String("echo".to_string()),
+                    Value::String("hello-from-real-docker".to_string()),
+                ],
+            )
+            .expect("container_exec should succeed");
+        match result {
+            Value::Dict(d) => {
+                let stdout = match d.get("stdout") {
+                    Some(Value::String(s)) => s.clone(),
+                    other => panic!("expected stdout String, got: {:?}", other),
+                };
+                assert!(
+                    stdout.contains("hello-from-real-docker"),
+                    "stdout should contain 'hello-from-real-docker', got: {}",
+                    stdout
+                );
+                let exit_code = d.get("exit_code").expect("exit_code");
+                assert!(
+                    matches!(exit_code, Value::Number(0.0)),
+                    "exit_code should be 0, got: {:?}",
+                    exit_code
+                );
+            }
+            other => panic!("expected Dict, got: {:?}", other),
+        }
+        cleanup_container(&mut interp);
+    }
+
+    #[test]
+    #[ignore = "requires Docker daemon (run with --ignored)"]
+    fn sandbox_container_info_returns_real_container_id() {
+        let mut interp = Interpreter::new();
+        interp
+            .call_sandbox_method("containerize", &[Value::String("docker".to_string())])
+            .unwrap();
+        let info = interp
+            .call_sandbox_method("container_info", &[])
+            .expect("container_info");
+        match info {
+            Value::Dict(d) => {
+                let id = match d.get("container_id") {
+                    Some(Value::String(s)) => s.clone(),
+                    other => panic!("expected container_id String, got: {:?}", other),
+                };
+                assert!(
+                    id.len() >= 12,
+                    "docker container_id hex should be >= 12 chars: {}",
+                    id
+                );
+                let name = d.get("container_name").expect("container_name");
+                match name {
+                    Value::String(s) => assert!(
+                        s.starts_with("mora-"),
+                        "name should start with mora-, got: {}",
+                        s
+                    ),
+                    other => panic!("expected String name, got: {:?}", other),
+                }
+                let backend = d.get("backend").expect("backend");
+                match backend {
+                    Value::String(s) => assert_eq!(s, "docker"),
+                    other => panic!("expected docker backend, got: {:?}", other),
+                }
+            }
+            other => panic!("expected Dict, got: {:?}", other),
+        }
+        cleanup_container(&mut interp);
+    }
+
+    #[test]
+    #[ignore = "requires Docker daemon (run with --ignored)"]
+    fn sandbox_container_clear_really_removes_container() {
+        let mut interp = Interpreter::new();
+        interp
+            .call_sandbox_method("containerize", &[Value::String("docker".to_string())])
+            .unwrap();
+        let id = {
+            let guard = interp.container.lock().unwrap();
+            guard.as_ref().unwrap().container_id.clone()
+        };
+        // 验证 container 真的在 docker 里
+        let check = std::process::Command::new("docker")
+            .args(["inspect", &id, "--format", "{{.State.Running}}"])
+            .output()
+            .expect("docker inspect");
+        assert!(check.status.success(), "docker should know the container");
+        let state = String::from_utf8_lossy(&check.stdout).trim().to_string();
+        assert_eq!(state, "true", "container should be running");
+
+        // clear → 真 docker rm -f
+        let cleared = interp
+            .call_sandbox_method("container_clear", &[])
+            .expect("clear");
+        assert_eq!(cleared, Value::Bool(true));
+
+        // 验证 container 真的没了
+        let check2 = std::process::Command::new("docker")
+            .args(["inspect", &id, "--format", "{{.State.Running}}"])
+            .output()
+            .expect("docker inspect");
+        assert!(
+            !check2.status.success(),
+            "docker inspect should fail for removed container"
+        );
+    }
+
+    #[test]
+    fn sandbox_containerize_rejects_unknown_backend() {
+        let mut interp = Interpreter::new();
+        let err = interp
+            .call_sandbox_method("containerize", &[Value::String("vmware".to_string())])
+            .expect_err("unknown backend should fail");
+        assert!(err.contains("unknown backend"), "got: {}", err);
+    }
+
+    #[test]
+    fn sandbox_containerize_rejects_unimplemented_backend() {
+        // gondolin/openshell 在 v0.44.0 真实未实现, 应该返回明确错误
+        let mut interp = Interpreter::new();
+        let err = interp
+            .call_sandbox_method("containerize", &[Value::String("gondolin".to_string())])
+            .expect_err("gondolin not yet implemented");
+        assert!(err.contains("not yet implemented"), "got: {}", err);
+    }
+
+    #[test]
+    fn sandbox_container_exec_requires_container_first() {
+        let mut interp = Interpreter::new();
+        let err = interp
+            .call_sandbox_method("container_exec", &[Value::String("ls".to_string())])
+            .expect_err("exec without container should fail");
+        assert!(err.contains("no container"), "got: {}", err);
+    }
+
+    #[test]
+    fn sandbox_container_info_returns_nil_when_unset() {
+        let mut interp = Interpreter::new();
+        let info = interp
+            .call_sandbox_method("container_info", &[])
+            .expect("container_info");
+        assert_eq!(info, Value::Nil);
+    }
+}
+
+#[cfg(test)]
+mod tests_v044_orchestrate_validate {
+    use crate::ast_v2::NodeId;
+    use crate::lexer::Lexer;
+    use crate::parser_v2::ParserV2;
+
+    /// v0.44.0: orchestrate block syntax validation (already implemented v0.25)
+    fn parse(src: &str) -> (crate::ast_v2::AstArena, Vec<NodeId>) {
+        let tokens = Lexer::new(src).scan_tokens();
+        let mut parser = ParserV2::new(tokens);
+        let node_ids = parser.parse();
+        (parser.into_arena(), node_ids)
+    }
+
+    #[test]
+    fn orchestrate_sequential_parses() {
+        let src = r#"
+task main()
+  orchestrate sequential x -> y
+    agent a(x) => "a:" + x
+    agent b(x) => "b:" + x
+"#;
+        let (_arena, node_ids) = parse(src);
+        assert!(!node_ids.is_empty());
+    }
+
+    #[test]
+    fn orchestrate_loop_with_on_predicate_parses() {
+        let src = r#"
+task main()
+  orchestrate loop x -> y, max_rounds: 5
+    on: x == "done"
+    agent a(x) => x
+"#;
+        let (_arena, node_ids) = parse(src);
+        assert!(!node_ids.is_empty());
+    }
+
+    #[test]
+    fn orchestrate_graph_with_predicate_edges_parses() {
+        let src = r#"
+task main()
+  orchestrate graph x -> y
+    @start -> a
+    @start -> b on: x == "research"
+    a -> @exit
+    b -> @exit
+"#;
+        let (_arena, node_ids) = parse(src);
+        assert!(!node_ids.is_empty());
     }
 }

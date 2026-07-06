@@ -7,6 +7,7 @@ pub mod ai_infra;
 pub mod ast_v2;
 // v0.42.1: Audit Sink — SHA-256 hash-chained JSONL (loongclaw-inspired)
 pub mod audit;
+// v0.45.0: ToolPlane Core/Extension adapter (loongclaw tool.rs pattern)
 pub mod ccr;
 pub mod common;
 pub mod compress;
@@ -23,6 +24,7 @@ pub mod parser_v2;
 pub mod record;
 pub mod sandbox;
 pub mod schedule;
+pub mod toolplane;
 pub mod trace_collector;
 pub mod typeck;
 pub mod value;

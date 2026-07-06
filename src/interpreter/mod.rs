@@ -191,6 +191,9 @@ pub struct Interpreter {
     /// None = no container (run on host). Set via sandbox.containerize builtin.
     /// Arc<Mutex<>> keeps call_sandbox_method `&self` (Clone-safe).
     pub container: std::sync::Arc<std::sync::Mutex<Option<crate::sandbox::ContainerHandle>>>,
+    /// v0.45.0: ToolPlane registry (multi-plane Core/Extension adapter)
+    /// Default has 2 core planes: "ai" + "sandbox"
+    pub tool_planes: std::sync::Arc<std::sync::Mutex<crate::toolplane::ToolPlaneRegistry>>,
 }
 
 /// v0.06: with 块字段 (不经过 env 变量)
@@ -249,6 +252,7 @@ impl Clone for Interpreter {
             audit_sink: self.audit_sink.clone(),
             markdown_memory_dir: self.markdown_memory_dir.clone(),
             container: self.container.clone(),
+            tool_planes: self.tool_planes.clone(),
         }
     }
 }
@@ -393,6 +397,8 @@ impl Interpreter {
             g.define("mock".to_string(), Value::Builtin(Bk::Mock), false);
             // v0.43.0: exec.* — parallel subprocess execution (pi-mono v1 inspired)
             g.define("exec".to_string(), Value::Builtin(Bk::Exec), false);
+            // v0.45.0: tool.plane.* — ToolPlane Core/Extension adapter
+            g.define("tool".to_string(), Value::Builtin(Bk::Toolplane), false);
         }
         Self {
             globals: globals.clone(),
@@ -424,6 +430,7 @@ impl Interpreter {
             audit_sink: std::sync::Arc::new(crate::audit::NullSink::new()),
             markdown_memory_dir: None,
             container: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            tool_planes: crate::toolplane::shared_default_registry(),
         }
     }
 
@@ -461,6 +468,7 @@ impl Interpreter {
             audit_sink: std::sync::Arc::new(crate::audit::NullSink::new()),
             markdown_memory_dir: None,
             container: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            tool_planes: crate::toolplane::shared_default_registry(),
         }
     }
 
@@ -496,6 +504,7 @@ impl Interpreter {
             audit_sink: std::sync::Arc::new(crate::audit::NullSink::new()),
             markdown_memory_dir: None,
             container: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            tool_planes: crate::toolplane::shared_default_registry(),
         }
     }
 

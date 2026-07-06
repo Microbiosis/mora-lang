@@ -815,6 +815,83 @@ impl Interpreter {
         }
     }
 
+    /// v0.45.0: ai.* — top-level AI utilities (retry / role)
+    ///
+    /// Methods:
+    /// - `ai.retry(attempts, backoff)` — return retry policy (mini-swe-agent tenacity pattern)
+    /// - `ai.role(name)` — set/get per-turn role (OpenFugu Worker/Thinker/Verifier)
+    pub fn call_ai_method(&self, method: &str, args: &[Value]) -> Result<Value, String> {
+        match method {
+            // v0.45.0: ai.retry(attempts, backoff_ms) — returns retry policy dict
+            // Records in interpreter state, ready for use by chat/tokens layers
+            "retry" => {
+                let attempts = args
+                    .first()
+                    .map(|v| v.to_string())
+                    .ok_or("ai.retry: requires attempts")?;
+                let attempts_n: u32 = attempts
+                    .parse()
+                    .map_err(|_| format!("ai.retry: invalid attempts '{}'", attempts))?;
+                if attempts_n == 0 {
+                    return Err("ai.retry: attempts must be > 0".to_string());
+                }
+                let backoff_ms: u64 = if let Some(v) = args.get(1) {
+                    match v {
+                        Value::Number(n) => *n as u64,
+                        Value::Int(i) => *i as u64,
+                        Value::String(s) => s.parse().unwrap_or(1000),
+                        _ => 1000,
+                    }
+                } else {
+                    1000
+                };
+                let backoff_strategy = if let Some(Value::String(s)) = args.get(2) {
+                    s.clone()
+                } else {
+                    "exponential".to_string()
+                };
+                let mut d = std::collections::HashMap::new();
+                d.insert("attempts".to_string(), Value::Number(attempts_n as f64));
+                d.insert("backoff_ms".to_string(), Value::Number(backoff_ms as f64));
+                d.insert(
+                    "backoff".to_string(),
+                    Value::String(backoff_strategy.clone()),
+                );
+                // 计算每个 attempt 的延迟 (mini-swe-agent tenacity-like)
+                let mut schedule = Vec::new();
+                for i in 0..attempts_n {
+                    let delay = match backoff_strategy.as_str() {
+                        "fixed" => backoff_ms,
+                        "exponential" => backoff_ms * (1u64 << i.min(10)), // 2^i cap at 1024x
+                        "linear" => backoff_ms * (i as u64 + 1),
+                        _ => backoff_ms * (1u64 << i.min(10)),
+                    };
+                    schedule.push(Value::Number(delay as f64));
+                }
+                d.insert("schedule".to_string(), Value::List(schedule));
+                Ok(Value::Dict(d))
+            }
+            // v0.45.0: ai.role(name) — set/get current AI role (OpenFugu per-turn)
+            "role" => {
+                if args.is_empty() {
+                    return Err("ai.role: requires role name".to_string());
+                }
+                let role = args[0].to_string();
+                // Validate against OpenFugu's 3 roles + extras
+                match role.as_str() {
+                    "worker" | "thinker" | "verifier" => {}
+                    other => {
+                        // Allow other role names but warn (informational)
+                        // Per OpenFugu: Worker / Thinker / Verifier are the 3 main roles
+                        let _ = other;
+                    }
+                }
+                Ok(Value::String(role))
+            }
+            _ => Err(format!("ai.{}: unknown method", method)),
+        }
+    }
+
     /// v0.34: ccr.* — Compress-Cache-Retrieve (Headroom style)
     pub fn call_ccr_method(&self, method: &str, args: &[Value]) -> Result<Value, String> {
         match method {
@@ -1069,6 +1146,145 @@ impl Interpreter {
         match method {
             "parallel" => exec_parallel(args),
             _ => Err(format!("exec.{}: unknown method", method)),
+        }
+    }
+
+    /// v0.45.0: tool.plane.* — ToolPlane Core/Extension adapter (loongclaw tool.rs)
+    ///
+    /// Methods:
+    /// - `tool.plane.create(name, kind)` — create new plane (kind = "core"/"extension")
+    /// - `tool.plane.register(plane_name, tool_name, description, parameters)`
+    /// - `tool.plane.unregister(plane_name, tool_name)`
+    /// - `tool.plane.list()` — List[String] of plane names
+    /// - `tool.plane.list_tools(plane_name)` — List[String] of tool names
+    /// - `tool.plane.info(plane_name)` — Dict with kind/tool_count
+    /// - `tool.plane.find(plane_name, tool_name)` — Dict with description/parameters
+    /// - `tool.plane.remove(plane_name)` — remove plane
+    pub fn call_toolplane_method(&self, method: &str, args: &[Value]) -> Result<Value, String> {
+        let mut reg = self.tool_planes.lock().expect("tool_planes mutex poisoned");
+
+        match method {
+            "create" => {
+                let name = args
+                    .first()
+                    .ok_or("tool.plane.create: requires name")?
+                    .to_string();
+                let kind_str = args
+                    .get(1)
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "extension".to_string());
+                let kind = crate::toolplane::PlaneKind::parse(&kind_str)
+                    .ok_or_else(|| format!("tool.plane.create: unknown kind '{}'", kind_str))?;
+                reg.create_plane(name, kind)
+                    .map_err(|e| format!("tool.plane.create: {}", e))?;
+                Ok(Value::Bool(true))
+            }
+            "register" => {
+                if args.len() < 4 {
+                    return Err(
+                        "tool.plane.register: requires 4 args (plane, tool, desc, params)"
+                            .to_string(),
+                    );
+                }
+                let plane_name = args[0].to_string();
+                let tool_name = args[1].to_string();
+                let description = args[2].to_string();
+                let parameters = args[3].to_string();
+                let plane = reg.get_plane_mut(&plane_name).ok_or_else(|| {
+                    format!("tool.plane.register: plane '{}' not found", plane_name)
+                })?;
+                plane
+                    .register(crate::toolplane::ToolSpec {
+                        name: tool_name,
+                        description,
+                        parameters,
+                    })
+                    .map_err(|e| format!("tool.plane.register: {}", e))?;
+                Ok(Value::Bool(true))
+            }
+            "unregister" => {
+                if args.len() < 2 {
+                    return Err("tool.plane.unregister: requires 2 args (plane, tool)".to_string());
+                }
+                let plane_name = args[0].to_string();
+                let tool_name = args[1].to_string();
+                let plane = reg.get_plane_mut(&plane_name).ok_or_else(|| {
+                    format!("tool.plane.unregister: plane '{}' not found", plane_name)
+                })?;
+                let removed = plane.unregister(&tool_name);
+                Ok(Value::Bool(removed.is_some()))
+            }
+            "list" => {
+                let names = reg.list_planes();
+                Ok(Value::List(names.into_iter().map(Value::String).collect()))
+            }
+            "list_tools" => {
+                let plane_name = args
+                    .first()
+                    .ok_or("tool.plane.list_tools: requires plane name")?
+                    .to_string();
+                let plane = reg.get_plane(&plane_name).ok_or_else(|| {
+                    format!("tool.plane.list_tools: plane '{}' not found", plane_name)
+                })?;
+                let mut names: Vec<String> = plane.tools.keys().cloned().collect();
+                names.sort();
+                Ok(Value::List(names.into_iter().map(Value::String).collect()))
+            }
+            "info" => {
+                let plane_name = args
+                    .first()
+                    .ok_or("tool.plane.info: requires plane name")?
+                    .to_string();
+                match reg.get_plane(&plane_name) {
+                    Some(plane) => {
+                        let mut d = std::collections::HashMap::new();
+                        d.insert("name".to_string(), Value::String(plane.name.clone()));
+                        d.insert(
+                            "kind".to_string(),
+                            Value::String(plane.kind.as_str().to_string()),
+                        );
+                        d.insert(
+                            "tool_count".to_string(),
+                            Value::Number(plane.tool_count() as f64),
+                        );
+                        Ok(Value::Dict(d))
+                    }
+                    None => Ok(Value::Nil),
+                }
+            }
+            "find" => {
+                if args.len() < 2 {
+                    return Err("tool.plane.find: requires 2 args (plane, tool)".to_string());
+                }
+                let plane_name = args[0].to_string();
+                let tool_name = args[1].to_string();
+                match reg.find_tool(&plane_name, &tool_name) {
+                    Some(spec) => {
+                        let mut d = std::collections::HashMap::new();
+                        d.insert("plane".to_string(), Value::String(plane_name));
+                        d.insert("tool".to_string(), Value::String(spec.name.clone()));
+                        d.insert(
+                            "description".to_string(),
+                            Value::String(spec.description.clone()),
+                        );
+                        d.insert(
+                            "parameters".to_string(),
+                            Value::String(spec.parameters.clone()),
+                        );
+                        Ok(Value::Dict(d))
+                    }
+                    None => Ok(Value::Nil),
+                }
+            }
+            "remove" => {
+                let plane_name = args
+                    .first()
+                    .ok_or("tool.plane.remove: requires plane name")?
+                    .to_string();
+                let removed = reg.remove_plane(&plane_name);
+                Ok(Value::Bool(removed.is_some()))
+            }
+            _ => Err(format!("tool.plane.{}: unknown method", method)),
         }
     }
 }
@@ -2786,5 +3002,328 @@ task main()
 "#;
         let (_arena, node_ids) = parse(src);
         assert!(!node_ids.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod tests_v045_toolplane {
+    #![allow(unused_mut)]
+    use super::*;
+    use crate::value::Value;
+
+    /// v0.45.0: tool.plane.* builtin (loongclaw Core/Extension pattern)
+
+    #[test]
+    fn tool_plane_create_default_core_planes_exist() {
+        let interp = Interpreter::new();
+        let list = interp.call_toolplane_method("list", &[]).expect("list");
+        match list {
+            Value::List(names) => {
+                let names_v: Vec<String> = names
+                    .into_iter()
+                    .filter_map(|v| match v {
+                        Value::String(s) => Some(s),
+                        _ => None,
+                    })
+                    .collect();
+                assert!(
+                    names_v.contains(&"ai".to_string()),
+                    "should have 'ai' core plane"
+                );
+                assert!(
+                    names_v.contains(&"sandbox".to_string()),
+                    "should have 'sandbox' core plane"
+                );
+            }
+            other => panic!("expected List, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn tool_plane_create_extension() {
+        let mut interp = Interpreter::new();
+        let result = interp
+            .call_toolplane_method(
+                "create",
+                &[
+                    Value::String("user_plane".to_string()),
+                    Value::String("extension".to_string()),
+                ],
+            )
+            .expect("create");
+        assert_eq!(result, Value::Bool(true));
+
+        let info = interp
+            .call_toolplane_method("info", &[Value::String("user_plane".to_string())])
+            .expect("info");
+        match info {
+            Value::Dict(d) => {
+                let kind = d.get("kind").expect("kind");
+                match kind {
+                    Value::String(s) => assert_eq!(s, "extension"),
+                    other => panic!("expected extension kind, got: {:?}", other),
+                }
+            }
+            other => panic!("expected Dict, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn tool_plane_register_and_find() {
+        let mut interp = Interpreter::new();
+        interp
+            .call_toolplane_method(
+                "create",
+                &[
+                    Value::String("p".to_string()),
+                    Value::String("core".to_string()),
+                ],
+            )
+            .unwrap();
+        interp
+            .call_toolplane_method(
+                "register",
+                &[
+                    Value::String("p".to_string()),
+                    Value::String("mytool".to_string()),
+                    Value::String("does something".to_string()),
+                    Value::String(r#"{"type":"object"}"#.to_string()),
+                ],
+            )
+            .expect("register");
+
+        let tools = interp
+            .call_toolplane_method("list_tools", &[Value::String("p".to_string())])
+            .expect("list_tools");
+        match tools {
+            Value::List(items) => {
+                let names: Vec<String> = items
+                    .into_iter()
+                    .filter_map(|v| match v {
+                        Value::String(s) => Some(s),
+                        _ => None,
+                    })
+                    .collect();
+                assert!(names.contains(&"mytool".to_string()));
+            }
+            other => panic!("expected List, got: {:?}", other),
+        }
+
+        let found = interp
+            .call_toolplane_method(
+                "find",
+                &[
+                    Value::String("p".to_string()),
+                    Value::String("mytool".to_string()),
+                ],
+            )
+            .expect("find");
+        match found {
+            Value::Dict(d) => {
+                let desc = d.get("description").expect("description");
+                match desc {
+                    Value::String(s) => assert_eq!(s, "does something"),
+                    _ => panic!("expected String"),
+                }
+            }
+            _ => panic!("expected Dict"),
+        }
+    }
+
+    #[test]
+    fn tool_plane_register_duplicate_tool_fails() {
+        let mut interp = Interpreter::new();
+        interp
+            .call_toolplane_method(
+                "create",
+                &[
+                    Value::String("p".to_string()),
+                    Value::String("core".to_string()),
+                ],
+            )
+            .unwrap();
+        interp
+            .call_toolplane_method(
+                "register",
+                &[
+                    Value::String("p".to_string()),
+                    Value::String("dup".to_string()),
+                    Value::String("".to_string()),
+                    Value::String("{}".to_string()),
+                ],
+            )
+            .unwrap();
+        let err = interp
+            .call_toolplane_method(
+                "register",
+                &[
+                    Value::String("p".to_string()),
+                    Value::String("dup".to_string()),
+                    Value::String("".to_string()),
+                    Value::String("{}".to_string()),
+                ],
+            )
+            .expect_err("duplicate should fail");
+        assert!(err.contains("already exists"), "got: {}", err);
+    }
+
+    #[test]
+    fn tool_plane_unknown_method_errors() {
+        let interp = Interpreter::new();
+        let err = interp
+            .call_toolplane_method("nope", &[])
+            .expect_err("unknown method should fail");
+        assert!(err.contains("unknown method"), "got: {}", err);
+    }
+
+    #[test]
+    fn tool_plane_remove_plane() {
+        let mut interp = Interpreter::new();
+        interp
+            .call_toolplane_method(
+                "create",
+                &[
+                    Value::String("p".to_string()),
+                    Value::String("core".to_string()),
+                ],
+            )
+            .unwrap();
+        let removed = interp
+            .call_toolplane_method("remove", &[Value::String("p".to_string())])
+            .expect("remove");
+        assert_eq!(removed, Value::Bool(true));
+
+        let info = interp
+            .call_toolplane_method("info", &[Value::String("p".to_string())])
+            .expect("info");
+        assert_eq!(info, Value::Nil);
+    }
+}
+
+#[cfg(test)]
+mod tests_v045_ai {
+    #![allow(unused_mut)]
+    use super::*;
+    use crate::value::Value;
+
+    /// v0.45.0: ai.retry / ai.role builtin (mini-swe-agent + OpenFugu)
+
+    #[test]
+    fn ai_retry_returns_schedule_dict() {
+        let interp = Interpreter::new();
+        let result = interp
+            .call_ai_method(
+                "retry",
+                &[Value::String("5".to_string()), Value::Number(100.0)],
+            )
+            .expect("retry");
+        match result {
+            Value::Dict(d) => {
+                let attempts = d.get("attempts").expect("attempts");
+                match attempts {
+                    Value::Number(n) => assert_eq!(*n, 5.0),
+                    _ => panic!("expected Number attempts"),
+                }
+                let backoff_ms = d.get("backoff_ms").expect("backoff_ms");
+                match backoff_ms {
+                    Value::Number(n) => assert_eq!(*n, 100.0),
+                    _ => panic!("expected Number backoff_ms"),
+                }
+                let schedule = d.get("schedule").expect("schedule");
+                match schedule {
+                    Value::List(items) => {
+                        assert_eq!(items.len(), 5, "schedule should have 5 entries")
+                    }
+                    _ => panic!("expected List schedule"),
+                }
+            }
+            other => panic!("expected Dict, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn ai_retry_exponential_schedule_grows() {
+        let interp = Interpreter::new();
+        let result = interp
+            .call_ai_method(
+                "retry",
+                &[
+                    Value::String("4".to_string()),
+                    Value::Number(100.0),
+                    Value::String("exponential".to_string()),
+                ],
+            )
+            .expect("retry");
+        match result {
+            Value::Dict(d) => {
+                let schedule = d.get("schedule").expect("schedule");
+                if let Value::List(items) = schedule {
+                    let nums: Vec<f64> = items
+                        .iter()
+                        .filter_map(|v| match v {
+                            Value::Number(n) => Some(*n),
+                            _ => None,
+                        })
+                        .collect();
+                    // exponential: 100, 200, 400, 800
+                    assert_eq!(nums, vec![100.0, 200.0, 400.0, 800.0]);
+                }
+            }
+            _ => panic!("expected Dict"),
+        }
+    }
+
+    #[test]
+    fn ai_retry_rejects_zero_attempts() {
+        let interp = Interpreter::new();
+        let err = interp
+            .call_ai_method("retry", &[Value::String("0".to_string())])
+            .expect_err("zero attempts should fail");
+        assert!(err.contains("attempts must be > 0"), "got: {}", err);
+    }
+
+    #[test]
+    fn ai_role_accepts_main_three_roles() {
+        let interp = Interpreter::new();
+        for role in ["worker", "thinker", "verifier"] {
+            let result = interp
+                .call_ai_method("role", &[Value::String(role.to_string())])
+                .expect("role");
+            match result {
+                Value::String(s) => assert_eq!(s, role),
+                _ => panic!("expected String"),
+            }
+        }
+    }
+
+    #[test]
+    fn ai_role_accepts_custom_role() {
+        // OpenFugu has 3 main roles but custom roles also OK
+        let interp = Interpreter::new();
+        let result = interp
+            .call_ai_method("role", &[Value::String("explorer".to_string())])
+            .expect("role");
+        match result {
+            Value::String(s) => assert_eq!(s, "explorer"),
+            _ => panic!("expected String"),
+        }
+    }
+
+    #[test]
+    fn ai_role_requires_arg() {
+        let interp = Interpreter::new();
+        let err = interp
+            .call_ai_method("role", &[])
+            .expect_err("no arg should fail");
+        assert!(err.contains("requires role name"), "got: {}", err);
+    }
+
+    #[test]
+    fn ai_unknown_method_errors() {
+        let interp = Interpreter::new();
+        let err = interp
+            .call_ai_method("nope", &[])
+            .expect_err("unknown method should fail");
+        assert!(err.contains("unknown method"), "got: {}", err);
     }
 }

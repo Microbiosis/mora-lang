@@ -830,6 +830,11 @@ impl Interpreter {
                 }
                 // v0.43.0: exec.* — parallel subprocess execution (pi-mono v1 inspired)
                 (BuiltinKind::Exec, _) => self.call_exec_method(method, &args),
+                // v0.45.0: tool.plane.* — ToolPlane Core/Extension adapter
+                (BuiltinKind::Toolplane, _) => self.call_toolplane_method(method, &args),
+                // v0.45.0: ai.retry / ai.role — top-level AI utilities
+                // (chat still handled by existing AiChat dispatch below)
+                (BuiltinKind::Ai, _) => self.call_ai_method(method, &args),
                 _ => Err(format!("Unknown method: {:?}.{}", kind, method)),
             },
             Value::Conversation { ref mut messages, ref model, ref base_url, ref api_key } => {

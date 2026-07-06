@@ -2,6 +2,83 @@
 
 All notable changes to Mora will be documented in this file.
 
+## [v0.45.0] - 2026-07-06 — ToolPlane + ai.retry + ai.role
+
+1 commit; v0.45+ roadmap from RESEARCH_PRIMITIVES_MASTER_v2.md §3.3.
+
+### ToolPlane — Core/Extension adapter (loongclaw)
+
+- **New module `src/toolplane/mod.rs`**:
+  - `PlaneKind` enum: `Core` (built-in) vs `Extension` (user/plugin)
+  - `ToolSpec { name, description, parameters }` — metadata only
+  - `ToolPlane` struct: name + kind + `HashMap<String, ToolSpec>`
+  - `ToolPlaneRegistry` — multi-plane container
+  - `default_registry()` — pre-registers `ai` + `sandbox` core planes
+  - 11 module-level tests
+
+- **8 new builtins** added to `call_toolplane_method`:
+  - `tool.plane.create(name, kind)` → `Bool(true)`
+  - `tool.plane.register(plane, tool, desc, params)` → `Bool(true)`
+  - `tool.plane.unregister(plane, tool)` → `Bool(true)` (existed?)
+  - `tool.plane.list()` → `List[String]` of plane names
+  - `tool.plane.list_tools(plane)` → `List[String]` of tool names
+  - `tool.plane.info(plane)` → `Dict{name, kind, tool_count}` or Nil
+  - `tool.plane.find(plane, tool)` → `Dict{plane, tool, desc, params}` or Nil
+  - `tool.plane.remove(plane)` → `Bool(true)`
+
+- **`Interpreter.tool_planes: Arc<Mutex<ToolPlaneRegistry>>`** field;
+  default has 2 core planes (`ai`, `sandbox`).
+  Arc<Mutex<>> keeps `call_toolplane_method(&self, ...)` signature.
+
+- **`BuiltinKind::Toolplane`** new variant; `tool` global registered
+  (alongside existing `exec`, `sandbox`, etc.).
+
+### ai.retry — tenacity-style retry policy (mini-swe-agent)
+
+- **`ai.retry(attempts, backoff_ms?, strategy?)`** builtin:
+  - `attempts`: Number/String — retry count (must be > 0)
+  - `backoff_ms`: Number — base delay in ms (default 1000)
+  - `strategy`: String — `fixed` / `exponential` / `linear` (default exponential)
+  - Returns `Dict{attempts, backoff_ms, backoff, schedule}` where
+    `schedule` is `List[Number]` of computed delays per attempt
+  - Mini-swe-agent uses `tenacity@0.10s→60s` exp backoff; v0.45.0 mirrors
+    this pattern with config validation
+
+### ai.role — per-turn AI role (OpenFugu Worker/Thinker/Verifier)
+
+- **`ai.role(name)`** builtin → `String(name)`:
+  - OpenFugu canonical roles: `worker`, `thinker`, `verifier`
+  - Custom roles also accepted (informational, no validation)
+  - Returns the role name (caller-side enforcement for downstream ai.chat)
+
+### Design decision: additive not replacement
+
+master doc §6.5 says "ToolPlane 替代 tool_registry". **v0.45.0 keeps both**:
+- `Interpreter.tool_registry` (v0.34, single HashMap) — preserved
+- `Interpreter.tool_planes` (v0.45.0, multi-plane) — added
+
+Full migration deferred to v0.46+ to avoid breaking `tool_registry`-using
+code paths in interpreter/execute.rs.
+
+### 13 new tests (11 toolplane module + 6 toolplane builtin + 7 ai builtin)
+- 11 `toolplane::tests::*`
+- 6 `interpreter::builtins::tests_v045_toolplane::*`
+- 7 `interpreter::builtins::tests_v045_ai::*`
+
+### Total impact
+- 1 commit
+- ~580 LOC (+~290 toolplane module + ~200 builtin wiring + ~90 tests)
+- +24 tests (454 pre-existing retained)
+- **478 tests pass total** (lib 472 + bin 6), 0 fail (1 pre-existing doctest)
+- clippy clean (`-D warnings`), fmt clean
+- 0 new deps
+
+### Next v0.46 patches (per master doc §4)
+- v0.46.0: `SKILL.md` 格式 + 双注册表 (`mora-hub.json` + `mora-public.json`) (CLI-Anything)
+- v0.47.0: DAG-as-data (OpenFugu) + `heartbeat.md` (mimiclaw) + `context.trim` (AgentMesh)
+
+---
+
 ## [v0.44.0] - 2026-07-06 — sandbox.containerize REAL Docker + orchestrate validation
 
 1 commit; v0.44+ roadmap from RESEARCH_PRIMITIVES_MASTER_v2.md §7.

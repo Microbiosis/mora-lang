@@ -67,6 +67,10 @@ pub enum BuiltinKind {
     McpServer,
     // v0.43.0: exec.* — parallel subprocess execution (pi-mono v1 inspired)
     Exec,
+    // v0.45.0: tool.plane.* — ToolPlane Core/Extension adapter (loongclaw)
+    Toolplane,
+    // v0.45.0: ai.* — AI utilities (retry / role / reflection)
+    Ai,
 }
 
 impl std::fmt::Display for BuiltinKind {
@@ -95,6 +99,8 @@ impl std::fmt::Display for BuiltinKind {
             BuiltinKind::Router => "Router::new",
             BuiltinKind::McpServer => "McpServer::new",
             BuiltinKind::Exec => "Exec::new",
+            BuiltinKind::Toolplane => "Toolplane::new",
+            BuiltinKind::Ai => "Ai::new",
         };
         f.write_str(s)
     }

@@ -815,12 +815,15 @@ impl Interpreter {
         }
     }
 
-    /// v0.45.0: ai.* — top-level AI utilities (retry / role)
+    /// v0.45.0: ai.* — top-level AI utilities (retry / role / context)
     ///
     /// Methods:
     /// - `ai.retry(attempts, backoff)` — return retry policy (mini-swe-agent tenacity pattern)
     /// - `ai.role(name)` — set/get per-turn role (OpenFugu Worker/Thinker/Verifier)
-    pub fn call_ai_method(&self, method: &str, args: &[Value]) -> Result<Value, String> {
+    /// - `ai.context.trim(threshold?)` — smart compress context window
+    ///   (AgentMesh + pi-agent pattern: oldest messages dropped first)
+    /// - `ai.context.info()` — get current window state
+    pub fn call_ai_method(&mut self, method: &str, args: &[Value]) -> Result<Value, String> {
         match method {
             // v0.45.0: ai.retry(attempts, backoff_ms) — returns retry policy dict
             // Records in interpreter state, ready for use by chat/tokens layers
@@ -887,6 +890,147 @@ impl Interpreter {
                     }
                 }
                 Ok(Value::String(role))
+            }
+            // v0.47.0: ai.context.* — context window control (AgentMesh+pi-agent)
+            "context.trim" => {
+                // 可选 threshold (0.0-1.0), 默认使用 self.context_window.compression_threshold
+                if let Some(v) = args.first() {
+                    let t = match v {
+                        Value::Number(n) => *n,
+                        Value::Int(i) => *i as f64,
+                        _ => {
+                            return Err(
+                                "ai.context.trim: threshold must be a number 0.0-1.0".to_string()
+                            );
+                        }
+                    };
+                    if !(0.0..=1.0).contains(&t) {
+                        return Err(format!(
+                            "ai.context.trim: threshold must be 0.0-1.0, got {}",
+                            t
+                        ));
+                    }
+                    self.context_window.compression_threshold = t;
+                }
+                let before = self.context_window.current_tokens;
+                self.context_window.compress();
+                let after = self.context_window.current_tokens;
+                let dropped = before.saturating_sub(after);
+                Ok(Value::Number(dropped as f64))
+            }
+            "context.info" => {
+                let mut d = std::collections::HashMap::new();
+                d.insert(
+                    "max_tokens".to_string(),
+                    Value::Number(self.context_window.max_tokens as f64),
+                );
+                d.insert(
+                    "current_tokens".to_string(),
+                    Value::Number(self.context_window.current_tokens as f64),
+                );
+                d.insert(
+                    "messages".to_string(),
+                    Value::Number(self.context_window.messages.len() as f64),
+                );
+                d.insert(
+                    "compression_threshold".to_string(),
+                    Value::Number(self.context_window.compression_threshold),
+                );
+                Ok(Value::Dict(d))
+            }
+            // v0.47.0: ai.dag(nodes, edges) — DAG-as-data (OpenFugu §1.6)
+            "dag" => {
+                if args.len() < 2 {
+                    return Err("ai.dag: requires 2 args (nodes, edges)".to_string());
+                }
+                let nodes = match &args[0] {
+                    Value::List(items) => items
+                        .iter()
+                        .map(|v| match v {
+                            Value::String(s) => s.clone(),
+                            _ => v.to_string(),
+                        })
+                        .collect::<Vec<String>>(),
+                    _ => {
+                        return Err("ai.dag: nodes must be a list of strings".to_string());
+                    }
+                };
+                let edges = match &args[1] {
+                    Value::List(items) => {
+                        let mut out = Vec::with_capacity(items.len());
+                        for (i, e) in items.iter().enumerate() {
+                            match e {
+                                Value::List(pair) if pair.len() == 2 => {
+                                    let from = match &pair[0] {
+                                        Value::String(s) => s.clone(),
+                                        _ => pair[0].to_string(),
+                                    };
+                                    let to = match &pair[1] {
+                                        Value::String(s) => s.clone(),
+                                        _ => pair[1].to_string(),
+                                    };
+                                    out.push((from, to));
+                                }
+                                _ => {
+                                    return Err(format!(
+                                        "ai.dag: edges[{}] must be a [from, to] pair",
+                                        i
+                                    ));
+                                }
+                            }
+                        }
+                        out
+                    }
+                    _ => {
+                        return Err("ai.dag: edges must be a list of [from, to] pairs".to_string());
+                    }
+                };
+                let dag = crate::orchestrate_dag::OrchestrateDag::new(nodes, edges);
+                let order = dag
+                    .topological_order()
+                    .map_err(|e| format!("ai.dag: {}", e))?;
+                Ok(Value::List(order.into_iter().map(Value::String).collect()))
+            }
+            // v0.47.0: ai.heartbeat(path?) — heartbeat.md checklist (mimiclaw §1.5)
+            "heartbeat" => {
+                let path = if let Some(Value::String(s)) = args.first() {
+                    std::path::PathBuf::from(s)
+                } else {
+                    let home = std::env::var("HOME")
+                        .or_else(|_| std::env::var("USERPROFILE"))
+                        .unwrap_or_else(|_| std::env::temp_dir().to_string_lossy().into_owned());
+                    std::path::PathBuf::from(home)
+                        .join(".mora")
+                        .join("HEARTBEAT.md")
+                };
+                let report = crate::heartbeat::load_heartbeat(&path)
+                    .map_err(|e| format!("ai.heartbeat: {}", e))?;
+                let mut d = std::collections::HashMap::new();
+                d.insert(
+                    "path".to_string(),
+                    Value::String(path.to_string_lossy().to_string()),
+                );
+                d.insert("total".to_string(), Value::Number(report.total as f64));
+                d.insert("done".to_string(), Value::Number(report.done as f64));
+                d.insert("pending".to_string(), Value::Number(report.pending as f64));
+                d.insert(
+                    "completion_ratio".to_string(),
+                    Value::Number(report.completion_ratio()),
+                );
+                d.insert("is_complete".to_string(), Value::Bool(report.is_complete()));
+                let items: Vec<Value> = report
+                    .items
+                    .into_iter()
+                    .map(|i| {
+                        let mut m = std::collections::HashMap::new();
+                        m.insert("text".to_string(), Value::String(i.text));
+                        m.insert("done".to_string(), Value::Bool(i.done));
+                        m.insert("line".to_string(), Value::Number(i.line_number as f64));
+                        Value::Dict(m)
+                    })
+                    .collect();
+                d.insert("items".to_string(), Value::List(items));
+                Ok(Value::Dict(d))
             }
             _ => Err(format!("ai.{}: unknown method", method)),
         }
@@ -1938,6 +2082,7 @@ fn kill_process_group(pid: u32) {
 
 #[cfg(test)]
 mod tests_v042_capability {
+    #![allow(unused_mut)]
     use super::*;
     use crate::value::Value;
 
@@ -1945,7 +2090,7 @@ mod tests_v042_capability {
 
     #[test]
     fn sandbox_key_returns_token_id_number() {
-        let interp = Interpreter::new();
+        let mut interp = Interpreter::new();
         let args = vec![
             Value::String("file.read".to_string()),
             Value::String("web.fetch".to_string()),
@@ -1963,7 +2108,7 @@ mod tests_v042_capability {
     #[test]
     fn sandbox_key_with_no_caps_returns_token() {
         // 空 args 也是合法: 创建一个空 capability 集合 (拒绝一切)
-        let interp = Interpreter::new();
+        let mut interp = Interpreter::new();
         let token_id = interp
             .call_sandbox_method("key", &[])
             .expect("sandbox.key with no args should succeed");
@@ -1980,7 +2125,7 @@ mod tests_v042_capability {
 
     #[test]
     fn sandbox_key_rejects_unknown_capability_string() {
-        let interp = Interpreter::new();
+        let mut interp = Interpreter::new();
         let args = vec![Value::String("not.a.real.cap".to_string())];
         let err = interp
             .call_sandbox_method("key", &args)
@@ -1991,7 +2136,7 @@ mod tests_v042_capability {
 
     #[test]
     fn sandbox_key_rejects_non_string_arg() {
-        let interp = Interpreter::new();
+        let mut interp = Interpreter::new();
         let args = vec![Value::Number(42.0)];
         let err = interp
             .call_sandbox_method("key", &args)
@@ -2001,7 +2146,7 @@ mod tests_v042_capability {
 
     #[test]
     fn sandbox_check_call_authorizes_granted_capability() {
-        let interp = Interpreter::new();
+        let mut interp = Interpreter::new();
         let token_id = interp
             .call_sandbox_method("key", &[Value::String("file.read".to_string())])
             .expect("issue token");
@@ -2025,7 +2170,7 @@ mod tests_v042_capability {
 
     #[test]
     fn sandbox_check_call_with_unknown_token_returns_false() {
-        let interp = Interpreter::new();
+        let mut interp = Interpreter::new();
         let result = interp
             .call_sandbox_method(
                 "check_call",
@@ -2040,7 +2185,7 @@ mod tests_v042_capability {
 
     #[test]
     fn sandbox_check_call_with_unknown_capability_string_errors() {
-        let interp = Interpreter::new();
+        let mut interp = Interpreter::new();
         let token_id = interp
             .call_sandbox_method("key", &[Value::String("file.read".to_string())])
             .expect("issue");
@@ -2055,7 +2200,7 @@ mod tests_v042_capability {
 
     #[test]
     fn sandbox_revoke_bumps_generation() {
-        let interp = Interpreter::new();
+        let mut interp = Interpreter::new();
         let token_id = interp
             .call_sandbox_method("key", &[Value::String("file.read".to_string())])
             .expect("issue");
@@ -2104,7 +2249,7 @@ mod tests_v042_capability {
 
     #[test]
     fn sandbox_token_count_tracks_unique_tokens() {
-        let interp = Interpreter::new();
+        let mut interp = Interpreter::new();
         assert_eq!(interp.sandbox.capabilities.token_count(), 0);
 
         let _ = interp
@@ -2128,7 +2273,7 @@ mod tests_v042_capability {
     #[test]
     fn sandbox_old_methods_still_work() {
         // v0.42.0 增补不应破坏 v0.33-0.41 的 sandbox.mode / check_builtin / check_path
-        let interp = Interpreter::new();
+        let mut interp = Interpreter::new();
         let mode = interp.call_sandbox_method("mode", &[]).expect("mode");
         assert!(matches!(mode, Value::String(_)));
 
@@ -2141,6 +2286,7 @@ mod tests_v042_capability {
 
 #[cfg(test)]
 mod tests_v0421_audit {
+    #![allow(unused_mut)]
     use super::*;
     use crate::audit::{AuditSink, JsonlAuditSink};
     use crate::value::Value;
@@ -2211,7 +2357,7 @@ mod tests_v0421_audit {
 
     #[test]
     fn audit_emit_validates_arg_types() {
-        let interp = Interpreter::new();
+        let mut interp = Interpreter::new();
         let err = interp
             .call_sandbox_method(
                 "audit_emit",
@@ -2223,7 +2369,7 @@ mod tests_v0421_audit {
 
     #[test]
     fn audit_emit_validates_arg_count() {
-        let interp = Interpreter::new();
+        let mut interp = Interpreter::new();
         let err = interp
             .call_sandbox_method(
                 "audit_emit",
@@ -2317,7 +2463,7 @@ mod tests_v0421_audit {
     #[test]
     fn null_sink_default_audit_emit_returns_true() {
         // 默认 NullSink 应接受所有 audit_emit 调用
-        let interp = Interpreter::new();
+        let mut interp = Interpreter::new();
         let result = interp
             .call_sandbox_method(
                 "audit_emit",
@@ -2365,6 +2511,7 @@ mod tests_v0421_audit {
 
 #[cfg(test)]
 mod tests_v043_exec {
+    #![allow(unused_mut)]
     use super::*;
     use crate::value::Value;
 
@@ -2376,7 +2523,7 @@ mod tests_v043_exec {
 
     #[test]
     fn exec_parallel_runs_all_commands() {
-        let interp = Interpreter::new();
+        let mut interp = Interpreter::new();
         let cmds = vec![cmd("echo a"), cmd("echo b"), cmd("echo c")];
         let result = interp
             .call_exec_method("parallel", &[Value::List(cmds)])
@@ -2409,7 +2556,7 @@ mod tests_v043_exec {
 
     #[test]
     fn exec_parallel_respects_max_concurrent() {
-        let interp = Interpreter::new();
+        let mut interp = Interpreter::new();
         // 6 个 sleep 1s, max_concurrent=2 → 总时间应该 ~3s (而非 ~1s 或 ~6s)
         // 跳过 perf assertion — 只验证结果正确
         let cmds: Vec<Value> = (0..6).map(|i| cmd(&format!("echo {}", i))).collect();
@@ -2436,7 +2583,7 @@ mod tests_v043_exec {
 
     #[test]
     fn exec_parallel_empty_list_returns_empty() {
-        let interp = Interpreter::new();
+        let mut interp = Interpreter::new();
         let result = interp
             .call_exec_method("parallel", &[Value::List(vec![])])
             .unwrap();
@@ -2445,7 +2592,7 @@ mod tests_v043_exec {
 
     #[test]
     fn exec_parallel_collects_stdout_per_command() {
-        let interp = Interpreter::new();
+        let mut interp = Interpreter::new();
         let cmds = vec![cmd("echo line1"), cmd("printf line2"), cmd("echo line3")];
         let result = interp
             .call_exec_method("parallel", &[Value::List(cmds)])
@@ -2483,7 +2630,7 @@ mod tests_v043_exec {
 
     #[test]
     fn exec_parallel_kills_process_group_on_timeout() {
-        let interp = Interpreter::new();
+        let mut interp = Interpreter::new();
         // "sleep 10" + timeout 200ms → 应报 timeout
         let cmds = vec![cmd("sleep 10")];
         let result = interp
@@ -2515,7 +2662,7 @@ mod tests_v043_exec {
 
     #[test]
     fn exec_parallel_validates_arg_types() {
-        let interp = Interpreter::new();
+        let mut interp = Interpreter::new();
         let err = interp
             .call_exec_method("parallel", &[Value::Number(42.0)])
             .expect_err("non-list first arg should fail");
@@ -2524,7 +2671,7 @@ mod tests_v043_exec {
 
     #[test]
     fn exec_parallel_validates_cmd_elements() {
-        let interp = Interpreter::new();
+        let mut interp = Interpreter::new();
         let cmds = vec![cmd("echo ok"), Value::Number(42.0)]; // 第二个不是 string
         let err = interp
             .call_exec_method("parallel", &[Value::List(cmds)])
@@ -2535,7 +2682,7 @@ mod tests_v043_exec {
     #[test]
     fn exec_parallel_returns_error_for_missing_command() {
         // sh -c 调用不存在的命令 → sh 返回 exit_code=127, stderr "command not found"
-        let interp = Interpreter::new();
+        let mut interp = Interpreter::new();
         let cmds = vec![cmd("this_command_definitely_does_not_exist_xyz")];
         let result = interp
             .call_exec_method("parallel", &[Value::List(cmds)])
@@ -2573,7 +2720,7 @@ mod tests_v043_exec {
 
     #[test]
     fn exec_unknown_method_errors() {
-        let interp = Interpreter::new();
+        let mut interp = Interpreter::new();
         let err = interp
             .call_exec_method("nonexistent", &[])
             .expect_err("unknown method should fail");
@@ -2583,6 +2730,7 @@ mod tests_v043_exec {
 
 #[cfg(test)]
 mod tests_v0431_memory_bus {
+    #![allow(unused_mut)]
     use super::*;
     use crate::value::Value;
 
@@ -2774,7 +2922,7 @@ mod tests_v0431_memory_bus {
 
     #[test]
     fn bus_subscribe_returns_token() {
-        let interp = Interpreter::new();
+        let mut interp = Interpreter::new();
         let token = interp
             .call_event_method(
                 "subscribe",
@@ -2790,7 +2938,7 @@ mod tests_v0431_memory_bus {
 
     #[test]
     fn bus_subscribe_validates_pattern() {
-        let interp = Interpreter::new();
+        let mut interp = Interpreter::new();
         let err = interp
             .call_event_method("subscribe", &[Value::Number(42.0)])
             .expect_err("non-string pattern should fail");
@@ -2799,7 +2947,7 @@ mod tests_v0431_memory_bus {
 
     #[test]
     fn bus_publish_returns_pattern_count() {
-        let interp = Interpreter::new();
+        let mut interp = Interpreter::new();
         // subscribe 2 个
         interp
             .call_event_method("subscribe", &[Value::String("ai.*".to_string())])
@@ -2826,7 +2974,7 @@ mod tests_v0431_memory_bus {
 
     #[test]
     fn bus_publish_validates_topic() {
-        let interp = Interpreter::new();
+        let mut interp = Interpreter::new();
         let err = interp
             .call_event_method("publish", &[Value::Number(42.0)])
             .expect_err("non-string topic should fail");
@@ -2836,7 +2984,7 @@ mod tests_v0431_memory_bus {
     #[test]
     fn bus_subscribe_then_publish_wildcard_match() {
         // end-to-end: subscribe "user.*", publish "user.created", 验证 pattern 进入订阅表
-        let interp = Interpreter::new();
+        let mut interp = Interpreter::new();
         interp
             .call_event_method("subscribe", &[Value::String("user.*".to_string())])
             .unwrap();
@@ -2852,7 +3000,7 @@ mod tests_v0431_memory_bus {
     #[test]
     fn bus_subscribe_uses_existing_pattern_matching() {
         // 验证 subscribe 用的就是 EventBus::on() (已经在 v0.41.0 + v0.41.1 测试覆盖)
-        let interp = Interpreter::new();
+        let mut interp = Interpreter::new();
         interp
             .call_event_method("subscribe", &[Value::String("exact.event".to_string())])
             .unwrap();
@@ -3055,6 +3203,7 @@ mod tests_v044_container_real {
 
 #[cfg(test)]
 mod tests_v044_orchestrate_validate {
+    #![allow(unused_mut)]
     use crate::ast_v2::NodeId;
     use crate::lexer::Lexer;
     use crate::parser_v2::ParserV2;
@@ -3116,7 +3265,7 @@ mod tests_v045_toolplane {
 
     #[test]
     fn tool_plane_create_default_core_planes_exist() {
-        let interp = Interpreter::new();
+        let mut interp = Interpreter::new();
         let list = interp.call_toolplane_method("list", &[]).expect("list");
         match list {
             Value::List(names) => {
@@ -3270,7 +3419,7 @@ mod tests_v045_toolplane {
 
     #[test]
     fn tool_plane_unknown_method_errors() {
-        let interp = Interpreter::new();
+        let mut interp = Interpreter::new();
         let err = interp
             .call_toolplane_method("nope", &[])
             .expect_err("unknown method should fail");
@@ -3311,7 +3460,7 @@ mod tests_v045_ai {
 
     #[test]
     fn ai_retry_returns_schedule_dict() {
-        let interp = Interpreter::new();
+        let mut interp = Interpreter::new();
         let result = interp
             .call_ai_method(
                 "retry",
@@ -3344,7 +3493,7 @@ mod tests_v045_ai {
 
     #[test]
     fn ai_retry_exponential_schedule_grows() {
-        let interp = Interpreter::new();
+        let mut interp = Interpreter::new();
         let result = interp
             .call_ai_method(
                 "retry",
@@ -3376,7 +3525,7 @@ mod tests_v045_ai {
 
     #[test]
     fn ai_retry_rejects_zero_attempts() {
-        let interp = Interpreter::new();
+        let mut interp = Interpreter::new();
         let err = interp
             .call_ai_method("retry", &[Value::String("0".to_string())])
             .expect_err("zero attempts should fail");
@@ -3385,7 +3534,7 @@ mod tests_v045_ai {
 
     #[test]
     fn ai_role_accepts_main_three_roles() {
-        let interp = Interpreter::new();
+        let mut interp = Interpreter::new();
         for role in ["worker", "thinker", "verifier"] {
             let result = interp
                 .call_ai_method("role", &[Value::String(role.to_string())])
@@ -3400,7 +3549,7 @@ mod tests_v045_ai {
     #[test]
     fn ai_role_accepts_custom_role() {
         // OpenFugu has 3 main roles but custom roles also OK
-        let interp = Interpreter::new();
+        let mut interp = Interpreter::new();
         let result = interp
             .call_ai_method("role", &[Value::String("explorer".to_string())])
             .expect("role");
@@ -3412,7 +3561,7 @@ mod tests_v045_ai {
 
     #[test]
     fn ai_role_requires_arg() {
-        let interp = Interpreter::new();
+        let mut interp = Interpreter::new();
         let err = interp
             .call_ai_method("role", &[])
             .expect_err("no arg should fail");
@@ -3421,7 +3570,7 @@ mod tests_v045_ai {
 
     #[test]
     fn ai_unknown_method_errors() {
-        let interp = Interpreter::new();
+        let mut interp = Interpreter::new();
         let err = interp
             .call_ai_method("nope", &[])
             .expect_err("unknown method should fail");
@@ -3455,7 +3604,7 @@ mod tests_v046_skill {
 
     #[test]
     fn skill_list_empty_by_default() {
-        let interp = Interpreter::new();
+        let mut interp = Interpreter::new();
         let list = interp.call_skill_method("list", &[]).expect("list");
         match list {
             Value::List(items) => assert_eq!(items.len(), 0),
@@ -3554,7 +3703,7 @@ Find things here.
 
     #[test]
     fn skill_find_unknown_returns_nil() {
-        let interp = Interpreter::new();
+        let mut interp = Interpreter::new();
         let found = interp
             .call_skill_method("find", &[Value::String("nope".to_string())])
             .expect("find");
@@ -3612,7 +3761,7 @@ This skill was loaded from a real file on disk.
 
     #[test]
     fn skill_load_nonexistent_file_errors() {
-        let interp = Interpreter::new();
+        let mut interp = Interpreter::new();
         let err = interp
             .call_skill_method("load", &[Value::String("/nonexistent/foo.md".to_string())])
             .expect_err("nonexistent should fail");
@@ -3690,10 +3839,383 @@ body
 
     #[test]
     fn skill_unknown_method_errors() {
-        let interp = Interpreter::new();
+        let mut interp = Interpreter::new();
         let err = interp
             .call_skill_method("nope", &[])
             .expect_err("unknown method should fail");
         assert!(err.contains("unknown method"), "got: {}", err);
+    }
+}
+
+#[cfg(test)]
+mod tests_v047_dag {
+    #![allow(unused_mut)]
+    use super::*;
+    use crate::value::Value;
+
+    /// v0.47.0: ai.dag builtin (OpenFugu §1.6 DAG-as-data)
+
+    #[test]
+    fn ai_dag_linear_returns_topological_order() {
+        let mut interp = Interpreter::new();
+        let nodes = vec![
+            Value::String("a".to_string()),
+            Value::String("b".to_string()),
+            Value::String("c".to_string()),
+        ];
+        let edges = vec![
+            Value::List(vec![
+                Value::String("a".to_string()),
+                Value::String("b".to_string()),
+            ]),
+            Value::List(vec![
+                Value::String("b".to_string()),
+                Value::String("c".to_string()),
+            ]),
+        ];
+        let result = interp
+            .call_ai_method("dag", &[Value::List(nodes), Value::List(edges)])
+            .expect("dag");
+        match result {
+            Value::List(items) => {
+                let names: Vec<String> = items
+                    .into_iter()
+                    .filter_map(|v| match v {
+                        Value::String(s) => Some(s),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(names, vec!["a", "b", "c"]);
+            }
+            other => panic!("expected List, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn ai_dag_cycle_returns_error() {
+        let mut interp = Interpreter::new();
+        let nodes = vec![
+            Value::String("a".to_string()),
+            Value::String("b".to_string()),
+        ];
+        let edges = vec![
+            Value::List(vec![
+                Value::String("a".to_string()),
+                Value::String("b".to_string()),
+            ]),
+            Value::List(vec![
+                Value::String("b".to_string()),
+                Value::String("a".to_string()),
+            ]),
+        ];
+        let err = interp
+            .call_ai_method("dag", &[Value::List(nodes), Value::List(edges)])
+            .expect_err("cycle should fail");
+        assert!(err.contains("ai.dag"), "got: {}", err);
+        assert!(err.contains("cycle"), "got: {}", err);
+    }
+
+    #[test]
+    fn ai_dag_diamond_returns_valid_order() {
+        let mut interp = Interpreter::new();
+        let nodes = vec![
+            Value::String("a".to_string()),
+            Value::String("b".to_string()),
+            Value::String("c".to_string()),
+            Value::String("d".to_string()),
+        ];
+        let edges = vec![
+            Value::List(vec![
+                Value::String("a".to_string()),
+                Value::String("b".to_string()),
+            ]),
+            Value::List(vec![
+                Value::String("a".to_string()),
+                Value::String("c".to_string()),
+            ]),
+            Value::List(vec![
+                Value::String("b".to_string()),
+                Value::String("d".to_string()),
+            ]),
+            Value::List(vec![
+                Value::String("c".to_string()),
+                Value::String("d".to_string()),
+            ]),
+        ];
+        let result = interp
+            .call_ai_method("dag", &[Value::List(nodes), Value::List(edges)])
+            .expect("dag");
+        match result {
+            Value::List(items) => {
+                let names: Vec<String> = items
+                    .into_iter()
+                    .filter_map(|v| match v {
+                        Value::String(s) => Some(s),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(names[0], "a");
+                assert_eq!(names[3], "d");
+            }
+            _ => panic!("expected List"),
+        }
+    }
+
+    #[test]
+    fn ai_dag_empty_edges_returns_nodes() {
+        let mut interp = Interpreter::new();
+        let nodes = vec![
+            Value::String("a".to_string()),
+            Value::String("b".to_string()),
+        ];
+        let result = interp
+            .call_ai_method("dag", &[Value::List(nodes), Value::List(vec![])])
+            .expect("dag");
+        match result {
+            Value::List(items) => assert_eq!(items.len(), 2),
+            _ => panic!("expected List"),
+        }
+    }
+
+    #[test]
+    fn ai_dag_requires_2_args() {
+        let mut interp = Interpreter::new();
+        let err = interp
+            .call_ai_method("dag", &[])
+            .expect_err("no args should fail");
+        assert!(err.contains("requires 2 args"), "got: {}", err);
+    }
+}
+
+#[cfg(test)]
+mod tests_v047_heartbeat {
+    #![allow(unused_mut)]
+    use super::*;
+    use crate::value::Value;
+
+    /// v0.47.0: ai.heartbeat builtin (mimiclaw §1.5 HEARTBEAT.md pattern)
+    use std::time::UNIX_EPOCH;
+
+    fn write_heartbeat(name: &str, content: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "mora_hb_test_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("{}.md", name));
+        std::fs::write(&path, content).unwrap();
+        path
+    }
+
+    #[test]
+    fn ai_heartbeat_real_file_returns_report() {
+        let mut interp = Interpreter::new();
+        let content = r#"# Heartbeat
+- [x] first done
+- [ ] second pending
+- [x] third done
+- [ ] fourth pending
+"#;
+        let path = write_heartbeat("HB", content);
+        let result = interp
+            .call_ai_method(
+                "heartbeat",
+                &[Value::String(path.to_string_lossy().to_string())],
+            )
+            .expect("heartbeat");
+        match result {
+            Value::Dict(d) => {
+                let total = d.get("total").expect("total");
+                match total {
+                    Value::Number(n) => assert_eq!(*n, 4.0),
+                    _ => panic!("expected Number"),
+                }
+                let done = d.get("done").expect("done");
+                match done {
+                    Value::Number(n) => assert_eq!(*n, 2.0),
+                    _ => panic!("expected Number"),
+                }
+                let pending = d.get("pending").expect("pending");
+                match pending {
+                    Value::Number(n) => assert_eq!(*n, 2.0),
+                    _ => panic!("expected Number"),
+                }
+                let ratio = d.get("completion_ratio").expect("ratio");
+                match ratio {
+                    Value::Number(n) => assert_eq!(*n, 0.5),
+                    _ => panic!("expected Number"),
+                }
+                let complete = d.get("is_complete").expect("complete");
+                assert_eq!(*complete, Value::Bool(false));
+            }
+            _ => panic!("expected Dict"),
+        }
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn ai_heartbeat_all_done_is_complete() {
+        let mut interp = Interpreter::new();
+        let content = "- [x] a\n- [X] b\n- [x] c\n";
+        let path = write_heartbeat("all_done", content);
+        let result = interp
+            .call_ai_method(
+                "heartbeat",
+                &[Value::String(path.to_string_lossy().to_string())],
+            )
+            .expect("heartbeat");
+        match result {
+            Value::Dict(d) => {
+                let complete = d.get("is_complete").expect("complete");
+                assert_eq!(*complete, Value::Bool(true));
+            }
+            _ => panic!("expected Dict"),
+        }
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn ai_heartbeat_empty_heartbeat_is_vacuously_complete() {
+        let mut interp = Interpreter::new();
+        let content = "# only heading\nno checklist items\n";
+        let path = write_heartbeat("empty", content);
+        let result = interp
+            .call_ai_method(
+                "heartbeat",
+                &[Value::String(path.to_string_lossy().to_string())],
+            )
+            .expect("heartbeat");
+        match result {
+            Value::Dict(d) => {
+                let total = d.get("total").expect("total");
+                match total {
+                    Value::Number(n) => assert_eq!(*n, 0.0),
+                    _ => panic!("expected Number"),
+                }
+                let complete = d.get("is_complete").expect("complete");
+                assert_eq!(*complete, Value::Bool(true));
+            }
+            _ => panic!("expected Dict"),
+        }
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn ai_heartbeat_nonexistent_file_errors() {
+        let mut interp = Interpreter::new();
+        let err = interp
+            .call_ai_method(
+                "heartbeat",
+                &[Value::String("/nonexistent/HEARTBEAT.md".to_string())],
+            )
+            .expect_err("nonexistent should fail");
+        assert!(err.contains("ai.heartbeat"), "got: {}", err);
+    }
+
+    #[test]
+    fn ai_heartbeat_items_list_contains_text_and_done() {
+        let mut interp = Interpreter::new();
+        let content = "- [x] task A\n- [ ] task B\n";
+        let path = write_heartbeat("items", content);
+        let result = interp
+            .call_ai_method(
+                "heartbeat",
+                &[Value::String(path.to_string_lossy().to_string())],
+            )
+            .expect("heartbeat");
+        match result {
+            Value::Dict(d) => {
+                let items = d.get("items").expect("items");
+                match items {
+                    Value::List(items) => {
+                        assert_eq!(items.len(), 2);
+                        match &items[0] {
+                            Value::Dict(item) => {
+                                let done = item.get("done").expect("done");
+                                assert_eq!(*done, Value::Bool(true));
+                            }
+                            _ => panic!("expected Dict"),
+                        }
+                    }
+                    _ => panic!("expected List"),
+                }
+            }
+            _ => panic!("expected Dict"),
+        }
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+}
+
+#[cfg(test)]
+mod tests_v047_context {
+    #![allow(unused_mut)]
+    use super::*;
+    use crate::value::Value;
+
+    /// v0.47.0: ai.context.trim + ai.context.info (pi-agent + AgentMesh pattern)
+
+    #[test]
+    fn ai_context_info_returns_window_state() {
+        let mut interp = Interpreter::new();
+        let result = interp
+            .call_ai_method("context.info", &[])
+            .expect("context.info");
+        match result {
+            Value::Dict(d) => {
+                let max = d.get("max_tokens").expect("max_tokens");
+                match max {
+                    Value::Number(n) => assert_eq!(*n, 4096.0, "default max"),
+                    _ => panic!("expected Number"),
+                }
+                let msgs = d.get("messages").expect("messages");
+                match msgs {
+                    Value::Number(n) => assert_eq!(*n, 0.0, "default empty"),
+                    _ => panic!("expected Number"),
+                }
+            }
+            _ => panic!("expected Dict"),
+        }
+    }
+
+    #[test]
+    fn ai_context_trim_empty_drops_zero() {
+        let mut interp = Interpreter::new();
+        let result = interp
+            .call_ai_method("context.trim", &[])
+            .expect("context.trim");
+        match result {
+            Value::Number(n) => assert_eq!(n, 0.0, "empty context drops 0 tokens"),
+            _ => panic!("expected Number"),
+        }
+    }
+
+    #[test]
+    fn ai_context_trim_validates_threshold_range() {
+        let mut interp = Interpreter::new();
+        let err = interp
+            .call_ai_method("context.trim", &[Value::Number(1.5)])
+            .expect_err("1.5 should fail");
+        assert!(err.contains("0.0-1.0"), "got: {}", err);
+
+        let err2 = interp
+            .call_ai_method("context.trim", &[Value::Number(-0.1)])
+            .expect_err("-0.1 should fail");
+        assert!(err2.contains("0.0-1.0"), "got: {}", err2);
+    }
+
+    #[test]
+    fn ai_context_trim_accepts_valid_threshold() {
+        let mut interp = Interpreter::new();
+        let result = interp
+            .call_ai_method("context.trim", &[Value::Number(0.5)])
+            .expect("should succeed");
+        match result {
+            Value::Number(_) => {}
+            _ => panic!("expected Number"),
+        }
     }
 }

@@ -11,10 +11,14 @@ pub mod audit;
 pub mod ccr;
 // v0.46.0: MoraSkillSpec + dual registry (CLI-Anything SKILL.md pattern)
 pub mod common;
+// v0.47.0: DAG-as-data orchestration (OpenFugu §1.6)
+pub mod orchestrate_dag;
+// v0.47.0: Heartbeat executable checklist (mimiclaw §1.5)
 pub mod compress;
 pub mod document;
 pub mod event;
 pub mod flow;
+pub mod heartbeat;
 pub mod http_server;
 pub mod interpreter;
 pub mod lexer;

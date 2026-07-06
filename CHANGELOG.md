@@ -2,6 +2,95 @@
 
 All notable changes to Mora will be documented in this file.
 
+## [v0.47.0] - 2026-07-06 — DAG-as-data + heartbeat.md + context.trim
+
+1 commit; v0.47+ roadmap from RESEARCH_PRIMITIVES_MASTER_v2.md §3.3.
+
+### DAG-as-data orchestration (OpenFugu §1.6)
+
+- **New module `src/orchestrate_dag/mod.rs`**:
+  - `OrchestrateDag { nodes, edges }` — declarative DAG (OpenFugu
+    `model_id[]` / `subtasks[]` / `access_list[]` 三个等长列表的
+    Mora adaptation: nodes + edges)
+  - `validate()` — detect cycles, duplicate nodes, unknown endpoints
+  - `topological_order()` — Kahn's algorithm (BFS) — O(V+E)
+  - `has_cycle()` — boolean helper
+  - 9 module-level tests (linear/diamond/4-layer, cycle detection,
+    self-loop, duplicate node, unknown endpoint)
+
+- **`ai.dag(nodes, edges)` builtin** (added to `call_ai_method`):
+  - `nodes`: `List[String]` — agent names
+  - `edges`: `List[[from, to]]` — pair list
+  - Returns `List[String]` in execution order
+  - Returns error on cycle / invalid input (real topological sort)
+
+### heartbeat.md executable checklist (mimiclaw §1.5)
+
+- **New module `src/heartbeat/mod.rs`**:
+  - `HeartbeatItem { text, done, line_number }` — parsed checklist line
+  - `parse_heartbeat(content, source)` — REAL md parser, supports
+    `- [x]` / `- [X]` / `- [ ]` / `- []` formats
+  - `HeartbeatReport { source, total, done, pending, items }` with
+    `completion_ratio()` and `is_complete()` helpers
+  - `load_heartbeat(path)` — REAL file I/O
+  - 11 module-level tests (incl. 1 real file test)
+
+- **`ai.heartbeat(path?)` builtin** (added to `call_ai_method`):
+  - `path?`: optional path (default `~/.mora/HEARTBEAT.md`)
+  - Returns `Dict{path, total, done, pending, completion_ratio,
+    is_complete, items[]}` — REAL heartbeat.md parse
+  - mimiclaw pattern: HEARTBEAT.md as executable agent behavior source
+
+### context.trim smart truncation (pi-agent + AgentMesh)
+
+- **`ai.context.trim(threshold?)` builtin** (added to `call_ai_method`):
+  - `threshold?`: optional 0.0-1.0 (overrides default 0.8)
+  - Calls `Interpreter.context_window.compress()` (REAL method, drops
+    oldest messages first per `compression_ratio`)
+  - Returns `Number(tokens_dropped)` (Number of tokens freed)
+  - pi-agent+AgentMesh pattern: token-budget-aware truncation
+
+- **`ai.context.info()` builtin** — diagnostic:
+  - Returns `Dict{max_tokens, current_tokens, messages, compression_threshold}`
+
+### Design decision: additive to existing infrastructure
+
+- `OrchestrateDag` is **NEW module** (vs v0.25 orchestrate block syntax):
+  declarative data (nodes + edges) vs procedural block (agents + edges).
+  Both can coexist — block syntax for hand-written, dag builtin for
+  programmatic graph generation.
+
+- `HeartbeatItem` parses markdown checklists by line-prefix match
+  (no regex dep), 30 LOC. v0.34 AIOS `tool_conflict_map` uses same
+  line-iteration pattern.
+
+- `context.trim` calls existing `ContextWindow::compress()` (v0.24)
+  instead of writing new compression logic. `ContextWindow` already
+  has add_message / needs_compression / compress / get_messages.
+
+### 34 new tests (9 DAG module + 11 heartbeat module + 14 builtin)
+- 9 `orchestrate_dag::tests::*` (linear/diamond/4-layer/cycle/self-loop/
+  duplicate/unknown-edge/has_cycle/empty-edges)
+- 11 `heartbeat::tests::*` (parse formats + completion_ratio +
+  is_complete + real file test)
+- 5 `tests_v047_dag::*` (linear/cycle/diamond/empty/2-args)
+- 5 `tests_v047_heartbeat::*` (real_file/all_done/empty/nonexistent/items)
+- 4 `tests_v047_context::*` (info/trim_empty/threshold_range/valid)
+
+### Total impact
+- 1 commit
+- ~770 LOC (+~290 orchestrate_dag + ~180 heartbeat + ~120 builtin + ~180 tests)
+- +34 tests (497 pre-existing retained)
+- **531 tests pass total** (lib 525 + bin 6), 0 fail (1 pre-existing doctest)
+- clippy clean (`-D warnings`), fmt clean
+- 0 new deps
+
+### Next v0.48 patches (per master doc §4)
+- v0.48.0: `mora refine` incremental edit loop (CLI-Anything)
+- v0.48.0: `plan.update([{step, status}])` real-time checklist (pi-agent)
+
+---
+
 ## [v0.46.0] - 2026-07-06 — SKILL.md + MoraSkillSpec + dual registry (CLI-Anything)
 
 1 commit; v0.46+ roadmap from RESEARCH_PRIMITIVES_MASTER_v2.md §3.3.

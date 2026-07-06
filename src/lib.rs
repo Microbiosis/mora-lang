@@ -9,6 +9,7 @@ pub mod ast_v2;
 pub mod audit;
 // v0.45.0: ToolPlane Core/Extension adapter (loongclaw tool.rs pattern)
 pub mod ccr;
+// v0.46.0: MoraSkillSpec + dual registry (CLI-Anything SKILL.md pattern)
 pub mod common;
 pub mod compress;
 pub mod document;
@@ -24,6 +25,7 @@ pub mod parser_v2;
 pub mod record;
 pub mod sandbox;
 pub mod schedule;
+pub mod skill;
 pub mod toolplane;
 pub mod trace_collector;
 pub mod typeck;

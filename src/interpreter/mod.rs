@@ -194,6 +194,9 @@ pub struct Interpreter {
     /// v0.45.0: ToolPlane registry (multi-plane Core/Extension adapter)
     /// Default has 2 core planes: "ai" + "sandbox"
     pub tool_planes: std::sync::Arc<std::sync::Mutex<crate::toolplane::ToolPlaneRegistry>>,
+    /// v0.46.0: Skill registry (MoraSkillSpec + dual registry, CLI-Anything pattern)
+    /// Loaded from `~/.mora/skills/` or via builtin skill.load / skill.install
+    pub skill_registry: std::sync::Arc<std::sync::Mutex<crate::skill::SkillRegistry>>,
 }
 
 /// v0.06: with 块字段 (不经过 env 变量)
@@ -253,6 +256,7 @@ impl Clone for Interpreter {
             markdown_memory_dir: self.markdown_memory_dir.clone(),
             container: self.container.clone(),
             tool_planes: self.tool_planes.clone(),
+            skill_registry: self.skill_registry.clone(),
         }
     }
 }
@@ -399,6 +403,8 @@ impl Interpreter {
             g.define("exec".to_string(), Value::Builtin(Bk::Exec), false);
             // v0.45.0: tool.plane.* — ToolPlane Core/Extension adapter
             g.define("tool".to_string(), Value::Builtin(Bk::Toolplane), false);
+            // v0.46.0: skill.* — MoraSkillSpec + dual registry
+            g.define("skill".to_string(), Value::Builtin(Bk::Skill), false);
         }
         Self {
             globals: globals.clone(),
@@ -431,6 +437,9 @@ impl Interpreter {
             markdown_memory_dir: None,
             container: std::sync::Arc::new(std::sync::Mutex::new(None)),
             tool_planes: crate::toolplane::shared_default_registry(),
+            skill_registry: std::sync::Arc::new(std::sync::Mutex::new(
+                crate::skill::SkillRegistry::new(),
+            )),
         }
     }
 
@@ -469,6 +478,9 @@ impl Interpreter {
             markdown_memory_dir: None,
             container: std::sync::Arc::new(std::sync::Mutex::new(None)),
             tool_planes: crate::toolplane::shared_default_registry(),
+            skill_registry: std::sync::Arc::new(std::sync::Mutex::new(
+                crate::skill::SkillRegistry::new(),
+            )),
         }
     }
 
@@ -505,6 +517,9 @@ impl Interpreter {
             markdown_memory_dir: None,
             container: std::sync::Arc::new(std::sync::Mutex::new(None)),
             tool_planes: crate::toolplane::shared_default_registry(),
+            skill_registry: std::sync::Arc::new(std::sync::Mutex::new(
+                crate::skill::SkillRegistry::new(),
+            )),
         }
     }
 

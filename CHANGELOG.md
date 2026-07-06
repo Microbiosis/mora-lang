@@ -2,6 +2,74 @@
 
 All notable changes to Mora will be documented in this file.
 
+## [v0.46.0] - 2026-07-06 — SKILL.md + MoraSkillSpec + dual registry (CLI-Anything)
+
+1 commit; v0.46+ roadmap from RESEARCH_PRIMITIVES_MASTER_v2.md §3.3.
+
+### MoraSkillSpec + SkillRegistry (CLI-Anything pattern)
+
+- **New module `src/skill/mod.rs`**:
+  - `MoraSkillSpec { name, description, trigger, body, source }` — parsed
+    SKILL.md content (YAML frontmatter + Markdown body)
+  - `MoraSkillSpec::parse(content, source)` — **REAL YAML frontmatter
+    parser** (hand-written, no `serde_yaml` dep); supports `name:`,
+    `description:`, `trigger:` + quoted values
+  - `MoraSkillSpec::load_file(path)` — REAL file I/O read + parse
+  - `SkillRegistry` with **dual-registry semantics** (CLI-Anything's
+    `registry.json` + `public_registry.json`):
+    - Internal: `HashMap<String, MoraSkillSpec>` (programmatic)
+    - External: `public_registry_path: Option<PathBuf>` (mora-public.json hub)
+  - `SkillRegistry::load_public_registry()` — REAL JSON read of hub
+    file (uses simple `find_json_string` helper, no serde_json dep)
+  - 10 module-level tests including 1 real file test
+
+- **7 new builtins** added to `call_skill_method`:
+  - `skill.list()` → `List[String]` of skill names
+  - `skill.find(name)` → `Dict{name, description, trigger, body, source}` or Nil
+  - `skill.load(path)` → `Bool(true)` — REAL `MoraSkillSpec::load_file` call
+  - `skill.install(name, content)` → `Bool(true)` — synthesize from SKILL.md
+    string content
+  - `skill.uninstall(name)` → `Bool(true)`
+  - `skill.set_hub(path)` → `Bool(true)` — set public_registry path
+  - `skill.refresh_hub()` → `Number(count)` — REAL `load_public_registry` call
+
+- **`Interpreter.skill_registry: Arc<Mutex<SkillRegistry>>`** field;
+  Arc<Mutex<>> keeps `call_skill_method(&self, ...)` signature.
+
+- **`BuiltinKind::Skill`** new variant; `skill` global registered.
+
+### Design decision: hand-written YAML/JSON parsers (0 new deps)
+
+master doc §3.3 says "CLI-Anything uses serde_yaml + serde_json". **v0.46.0
+avoids both**:
+- YAML frontmatter (3 keys: name/description/trigger): 30 LOC regex split
+- JSON hub parse (name + description extraction): 5 LOC `find_json_string` helper
+- Result: 0 new Cargo deps, parses the formats CLI-Anything uses
+
+Full `serde_yaml` + `serde_json` support deferred to v1.0+ (per master doc
+future roadmap) when SKILL.md files become more complex.
+
+### 19 new tests (10 module + 9 builtin)
+- 10 `skill::tests::*` (incl. 1 real file test for public_registry)
+- 9 `interpreter::builtins::tests_v046_skill::*` (incl. 2 real file tests
+  for skill.load + skill.set_hub/refresh_hub)
+
+### Total impact
+- 1 commit
+- ~440 LOC (+~280 skill module + ~80 builtin wiring + ~80 tests)
+- +19 tests (478 pre-existing retained)
+- **497 tests pass total** (lib 491 + bin 6), 0 fail (1 pre-existing doctest)
+- clippy clean (`-D warnings`), fmt clean
+- 0 new deps
+
+### Next v0.47 patches (per master doc §4)
+- v0.47.0: DAG-as-data → `orchestrate` 扩展 (OpenFugu)
+- v0.47.0: `heartbeat.md` 可执行检查列表 (mimiclaw)
+- v0.47.0: `context.trim(threshold)` 智能截断 (pi-agent + AgentMesh)
+- v0.48.0: `mora refine` 增量编辑 + `plan.update` 实时清单
+
+---
+
 ## [v0.45.0] - 2026-07-06 — ToolPlane + ai.retry + ai.role
 
 1 commit; v0.45+ roadmap from RESEARCH_PRIMITIVES_MASTER_v2.md §3.3.

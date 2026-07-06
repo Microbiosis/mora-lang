@@ -71,6 +71,8 @@ pub enum BuiltinKind {
     Toolplane,
     // v0.45.0: ai.* — AI utilities (retry / role / reflection)
     Ai,
+    // v0.46.0: skill.* — MoraSkillSpec + dual registry (CLI-Anything)
+    Skill,
 }
 
 impl std::fmt::Display for BuiltinKind {
@@ -100,6 +102,7 @@ impl std::fmt::Display for BuiltinKind {
             BuiltinKind::McpServer => "McpServer::new",
             BuiltinKind::Exec => "Exec::new",
             BuiltinKind::Toolplane => "Toolplane::new",
+            BuiltinKind::Skill => "Skill::new",
             BuiltinKind::Ai => "Ai::new",
         };
         f.write_str(s)

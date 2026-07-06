@@ -832,6 +832,8 @@ impl Interpreter {
                 (BuiltinKind::Exec, _) => self.call_exec_method(method, &args),
                 // v0.45.0: tool.plane.* — ToolPlane Core/Extension adapter
                 (BuiltinKind::Toolplane, _) => self.call_toolplane_method(method, &args),
+                // v0.46.0: skill.* — MoraSkillSpec + dual registry (CLI-Anything)
+                (BuiltinKind::Skill, _) => self.call_skill_method(method, &args),
                 // v0.45.0: ai.retry / ai.role — top-level AI utilities
                 // (chat still handled by existing AiChat dispatch below)
                 (BuiltinKind::Ai, _) => self.call_ai_method(method, &args),

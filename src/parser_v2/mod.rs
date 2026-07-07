@@ -3,8 +3,9 @@
 //! 渐进式迁移：新解析函数直接输出 ast_v2，旧函数通过适配层转换
 
 use crate::ast_v2::{
-    AstArena, ExprKind, FnDef, NodeId, ObserveConfig, OrchestrateAgent, OrchestrateEdge,
-    OrchestrateKind, Pattern, SkillTask, SkillVerify, StmtKind, TraitMethod,
+    AstArena, CheckpointConfig, DynamicKind, ExprKind, FnDef, NodeId, ObserveConfig,
+    OrchestrateAgent, OrchestrateEdge, OrchestrateKind, Pattern, ReducerKind, SkillTask,
+    SkillVerify, StateChannel, StmtKind, TraitMethod,
 };
 use crate::common::{BinaryOp, Literal, Span};
 use crate::lexer::{Token, TokenType};
@@ -497,6 +498,28 @@ impl ParserV2 {
                     TokenType::Otel => "otel",
                     TokenType::Export => "export",
                     TokenType::Parallel => "parallel",
+                    // v0.50: 状态与执行模型关键字降级为方法名
+                    TokenType::State => "state",
+                    TokenType::Node => "node",
+                    TokenType::Channel => "channel",
+                    TokenType::Checkpoint => "checkpoint",
+                    TokenType::Rewind => "rewind",
+                    TokenType::Resume => "resume",
+                    TokenType::Thread => "thread",
+                    TokenType::Dynamic => "dynamic",
+                    TokenType::Map => "map",
+                    TokenType::Reduce => "reduce",
+                    TokenType::FanIn => "fan_in",
+                    TokenType::FanOut => "fan_out",
+                    TokenType::Interrupt => "interrupt",
+                    TokenType::Before => "before",
+                    TokenType::After => "after",
+                    TokenType::Command => "command",
+                    TokenType::Goto => "goto",
+                    TokenType::Update => "update",
+                    TokenType::Add => "add",
+                    TokenType::Last => "last",
+                    TokenType::Merge => "merge",
                     _ => {
                         // v0.31: 未知 token 不再 panic, 返回 "<unknown>" 让 parser 继续
                         // (LexError 由 lexer 直接 emit Error token, parser 这层兜底)

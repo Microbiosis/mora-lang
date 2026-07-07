@@ -16,7 +16,6 @@ impl Interpreter {
             ExprKind::Variable(name) => self
                 .environment
                 .lock()
-                .map_err(|_| "environment mutex poisoned".to_string())?
                 .get(name)
                 .ok_or_else(|| format!("Undefined variable: {}", name)),
             ExprKind::Binary { left, op, right } => {
@@ -47,6 +46,34 @@ impl Interpreter {
             ExprKind::List(items) => self.evaluate_list(items, arena),
             ExprKind::Dict(entries) => self.evaluate_dict(entries, arena),
             ExprKind::Match { expr, arms } => self.evaluate_match_expr(*expr, arms, arena),
+            // v0.50: Command 构造表达式
+            ExprKind::Command { goto, update, resume } => {
+                let mut update_map = HashMap::new();
+                for (key, val_id) in update {
+                    let val = self.evaluate(*val_id, arena)?;
+                    update_map.insert(key.clone(), val);
+                }
+                let mut map = HashMap::new();
+                map.insert("__command__".to_string(), Value::Bool(true));
+                if let Some(g) = goto {
+                    map.insert("goto".to_string(), Value::String(g.clone()));
+                }
+                map.insert("update".to_string(), Value::Dict(update_map));
+                if let Some(r) = resume {
+                    let val = self.evaluate(*r, arena)?;
+                    map.insert("resume".to_string(), val);
+                }
+                Ok(Value::Dict(map))
+            }
+            // v0.50: Send 动态派发
+            ExprKind::Send { target, input } => {
+                let input_val = self.evaluate(*input, arena)?;
+                let mut map = HashMap::new();
+                map.insert("__send__".to_string(), Value::Bool(true));
+                map.insert("target".to_string(), Value::String(target.clone()));
+                map.insert("input".to_string(), input_val);
+                Ok(Value::Dict(map))
+            }
             _ => Err(format!("Unsupported v2 expression: {:?}", expr.kind)),
         }
     }
@@ -63,11 +90,7 @@ impl Interpreter {
             arg_vals.push(self.evaluate(*arg_id, arena)?);
         }
         // v2 路径: 先从环境查找（注意 environment 和 globals 可能是同一个 Arc，不能双锁）
-        let func_val = self
-            .environment
-            .lock()
-            .map_err(|_| "environment mutex poisoned".to_string())?
-            .get(callee);
+        let func_val = self.environment.lock().get(callee);
         match func_val {
             Some(ref val) => {
                 if matches!(
@@ -112,11 +135,7 @@ impl Interpreter {
                 for arg_id in args {
                     arg_vals.push(self.evaluate(*arg_id, arena)?);
                 }
-                let func_val = self
-                    .environment
-                    .lock()
-                    .map_err(|_| "environment mutex poisoned".to_string())?
-                    .get(callee);
+                let func_val = self.environment.lock().get(callee);
                 if let Some(func_val) = func_val {
                     self.call_value_inner(&func_val, arg_vals, arena)
                 } else {
@@ -124,11 +143,7 @@ impl Interpreter {
                 }
             }
             ExprKind::Variable(name) => {
-                let val = self
-                    .environment
-                    .lock()
-                    .map_err(|_| "environment mutex poisoned".to_string())?
-                    .get(name);
+                let val = self.environment.lock().get(name);
                 match val {
                     Some(ref val) => self.call_value_inner(val, vec![left_val], arena),
                     None => self.call_method(left_val, name, vec![], Span::default()),
@@ -268,10 +283,7 @@ impl Interpreter {
             if let Some(bindings) = self.match_pattern(pattern, &val, arena) {
                 // 绑定模式变量
                 for (name, value) in bindings {
-                    self.environment
-                        .lock()
-                        .map_err(|_| "environment mutex poisoned".to_string())?
-                        .define(name, value, false);
+                    self.environment.lock().define(name, value, false);
                 }
                 return self.evaluate(*result_id, arena);
             }
@@ -397,7 +409,7 @@ impl Interpreter {
                 self.environment.clone(),
             )));
             for (name, value) in &bindings {
-                env.lock().ok()?.define(name.clone(), value.clone(), false);
+                env.lock().define(name.clone(), value.clone(), false);
             }
             let previous = self.environment.clone();
             self.environment = env;

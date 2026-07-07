@@ -23,6 +23,7 @@
 //! - 控制流敏感的类型缩窄
 
 mod check;
+pub mod pregel_check;
 
 use std::collections::{HashMap, HashSet};
 
@@ -169,6 +170,8 @@ impl Type {
             "number" => Type::Number,
             "bool" => Type::Bool,
             "nil" => Type::Nil,
+            // v0.50: "any" 应解析为 Union(vec![])（兼容任何类型）
+            "any" => Type::Union(vec![]),
             "list" => Type::List(Box::new(Type::Union(vec![]))),
             "dict" => Type::Dict(Box::new(Type::Union(vec![])), Box::new(Type::Union(vec![]))),
             "task" => Type::Task,

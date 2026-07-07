@@ -9,6 +9,8 @@ pub mod ast_v2;
 pub mod audit;
 // v0.45.0: ToolPlane Core/Extension adapter (loongclaw tool.rs pattern)
 pub mod ccr;
+// v0.50: Checkpoint persistence layer (Memory + SQLite)
+pub mod checkpoint;
 // v0.46.0: MoraSkillSpec + dual registry (CLI-Anything SKILL.md pattern)
 pub mod common;
 // v0.47.0: DAG-as-data orchestration (OpenFugu §1.6)

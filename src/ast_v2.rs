@@ -184,6 +184,18 @@ pub enum ExprKind {
     BorrowMut {
         expr: NodeId,
     },
+
+    // v0.50: Command 构造表达式
+    Command {
+        goto: Option<String>,
+        update: Vec<(String, NodeId)>,
+        resume: Option<NodeId>,
+    },
+    // v0.50: Send 动态派发
+    Send {
+        target: String,
+        input: NodeId,
+    },
 }
 
 // ===================================================================
@@ -499,6 +511,14 @@ pub enum OrchestrateKind {
         max_rounds: usize,
         exit_when: Option<NodeId>,
     },
+    // v0.50: Pregel BSP 执行模型
+    Pregel {
+        agents: Vec<OrchestrateAgent>,
+        edges: Vec<OrchestrateEdge>,
+        state_schema: Vec<StateChannel>,
+        checkpoint: Option<CheckpointConfig>,
+        interrupt_points: Vec<InterruptPoint>,
+    },
 }
 
 /// v0.25: 编排中的 Agent 声明
@@ -516,6 +536,53 @@ pub struct OrchestrateEdge {
     pub from: String,
     pub to: String,
     pub condition: Option<NodeId>,
+    pub dynamic: Option<DynamicKind>, // v0.50
+}
+
+/// v0.50: 状态通道定义（Schema 声明）
+#[derive(Debug, Clone)]
+pub struct StateChannel {
+    pub name: String,
+    pub type_hint: Option<String>,
+    pub reducer: ReducerKind,
+}
+
+/// v0.50: Reducer 合并语义
+#[derive(Debug, Clone)]
+pub enum ReducerKind {
+    Last,       // 默认：覆盖
+    Append,     // 列表追加
+    Add,        // 数值相加
+    Merge(NodeId), // 自定义合并函数
+}
+
+/// v0.50: 检查点配置
+#[derive(Debug, Clone)]
+pub struct CheckpointConfig {
+    pub saver: String,      // "memory" | "sqlite"
+    pub thread_id: Option<NodeId>, // 表达式
+}
+
+/// v0.50: 中断点
+#[derive(Debug, Clone)]
+pub struct InterruptPoint {
+    pub node_name: String,
+    pub when: InterruptWhen,
+}
+
+#[derive(Debug, Clone)]
+pub enum InterruptWhen {
+    Before,
+    After,
+}
+
+/// v0.50: 动态派发类型
+#[derive(Debug, Clone)]
+pub enum DynamicKind {
+    Map,       // 动态展开为 N 个并行任务
+    Reduce,    // 聚合 N 个并行结果
+    FanOut,    // 固定并行 worker
+    FanIn,     // 等待汇聚
 }
 
 /// v0.25: Skill 中的任务定义

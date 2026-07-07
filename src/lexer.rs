@@ -69,6 +69,28 @@ pub enum TokenType {
     Prompt,
     // v0.27: Document 块（与 prompt 块语义类似）
     Document,
+    // v0.50: 状态与执行模型关键字
+    State,       // 'state' (orchestrate 内)
+    Node,        // 'node' (orchestrate 内)
+    Channel,     // 'channel' (orchestrate 内)
+    Checkpoint,  // 'checkpoint' (orchestrate decorator)
+    Rewind,      // 'rewind' (builtin)
+    Resume,      // 'resume' (builtin)
+    Thread,      // 'thread' (checkpoint thread_id)
+    Dynamic,     // 'dynamic' (edge 修饰)
+    Map,         // 'map' (dynamic 类型)
+    Reduce,      // 'reduce' (dynamic 类型)
+    FanIn,       // 'fan_in' (JoinNode)
+    FanOut,      // 'fan_out' (parallel worker)
+    Interrupt,   // 'interrupt' (HITL 暂停点)
+    Before,      // 'before' (interrupt 位置)
+    After,       // 'after' (interrupt 位置)
+    Command,     // 'command' (返回类型)
+    Goto,        // 'goto' (command 字段)
+    Update,      // 'update' (command 字段)
+    Add,         // '@add' 语义
+    Last,        // '@last' 语义 (默认)
+    Merge,       // '@merge' 语义
     // 注意: HTTP 方法 (GET/POST/PUT/DELETE/PATCH) 不作关键字
     // —— 保持 Identifier,显式 API Router.route() 按字符串匹配
     Identifier(String),
@@ -903,6 +925,28 @@ impl Lexer {
             "tolerance" => TokenType::Tolerance,
             // v0.26: prompt 块语句（与 p"..." 模板字符串互不干扰）
             "prompt" => TokenType::Prompt,
+            // v0.50: 状态与执行模型关键字
+            "state" => TokenType::State,
+            "node" => TokenType::Node,
+            "channel" => TokenType::Channel,
+            "checkpoint" => TokenType::Checkpoint,
+            "rewind" => TokenType::Rewind,
+            "resume" => TokenType::Resume,
+            "thread" => TokenType::Thread,
+            "dynamic" => TokenType::Dynamic,
+            "map" => TokenType::Map,
+            "reduce" => TokenType::Reduce,
+            "fan_in" => TokenType::FanIn,
+            "fan_out" => TokenType::FanOut,
+            "interrupt" => TokenType::Interrupt,
+            "before" => TokenType::Before,
+            "after" => TokenType::After,
+            "command" => TokenType::Command,
+            "goto" => TokenType::Goto,
+            "update" => TokenType::Update,
+            "add" => TokenType::Add,
+            "last" => TokenType::Last,
+            "merge" => TokenType::Merge,
             // v0.27: document 块语句（与 prompt "x" do end 同款）
             // 但允许 `document.parse(...)` 形式:仅当下一个 token 是字符串字面量
             // (块语句起始)时识别为 Document 关键字,否则退化为 Identifier,

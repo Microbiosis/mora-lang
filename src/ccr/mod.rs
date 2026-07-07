@@ -14,9 +14,10 @@
 //! - Hash: 8-char hex from u64 counter (Headroom 用 SHA-256; Mora 简化)
 //! - Marker format: `<<ccr:HASH,SIZE>>` (Mora 简化去掉 KIND)
 
+use parking_lot::Mutex;
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
 
 /// v0.33: CCR stored payload
 #[derive(Debug, Clone)]
@@ -41,23 +42,29 @@ pub trait CcrStore: std::fmt::Debug + Send + Sync {
 }
 
 /// v0.33: Default in-memory store
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct InMemoryCcrStore {
     entries: Arc<Mutex<HashMap<String, CcrEntry>>>,
-    counter: AtomicU64,
+    counter: Arc<AtomicU64>,
 }
 
-// v0.35 (P0-A1): manual Clone — AtomicU64 doesn't impl Clone,
-// so a derived Clone would fail. We don't preserve exact counter
-// state across clones; instead both clones start counting from 0.
-// NOTE: callers wanting shared identity should share via Arc, NOT
-// via Clone. The fix here is only meant to satisfy `self.ccr_store.clone()`
-// inside the Interpreter Clone impl.
+impl Default for InMemoryCcrStore {
+    fn default() -> Self {
+        Self {
+            entries: Arc::new(Mutex::new(HashMap::new())),
+            counter: Arc::new(AtomicU64::new(0)),
+        }
+    }
+}
+
+// v0.50.0 (P0-2): counter is Arc<AtomicU64> so Clone shares the counter
+// across all Interpreter clones. This prevents hash collisions when
+// multiple cloned stores concurrently put().
 impl Clone for InMemoryCcrStore {
     fn clone(&self) -> Self {
         Self {
             entries: self.entries.clone(),
-            counter: AtomicU64::new(self.counter.load(Ordering::SeqCst)),
+            counter: self.counter.clone(),
         }
     }
 }
@@ -80,23 +87,16 @@ impl CcrStore for InMemoryCcrStore {
             size: data.len(),
             data: data.to_string(),
         };
-        self.entries
-            .lock()
-            .expect("ccr store mutex poisoned")
-            .insert(hash.clone(), entry);
+        self.entries.lock().insert(hash.clone(), entry);
         hash
     }
 
     fn get(&self, hash: &str) -> Option<CcrEntry> {
-        self.entries
-            .lock()
-            .expect("ccr store mutex poisoned")
-            .get(hash)
-            .cloned()
+        self.entries.lock().get(hash).cloned()
     }
 
     fn len(&self) -> usize {
-        self.entries.lock().expect("ccr store mutex poisoned").len()
+        self.entries.lock().len()
     }
 }
 

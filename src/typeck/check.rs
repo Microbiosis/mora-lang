@@ -720,15 +720,34 @@ impl TypeChecker {
                     }
                 }
             }
-            crate::ast_v2::OrchestrateKind::Loop {
-                agent, exit_when, ..
+            crate::ast_v2::OrchestrateKind::Pregel {
+                agents,
+                edges,
+                state_schema,
+                checkpoint,
+                interrupt_points,
             } => {
+                for agent in agents {
+                    self.check_expr(agent.task_expr, arena, symbols);
+                    if let Some(ref verify) = agent.verify_expr {
+                        self.check_expr(*verify, arena, symbols);
+                    }
+                }
+                let pregel_errors = crate::typeck::pregel_check::check_orchestrate_pregel(
+                    agents,
+                    edges,
+                    state_schema,
+                    checkpoint,
+                    interrupt_points,
+                    &[], // command_gotos: TODO collect from ExprKind::Command inside agents
+                    &[], // send_targets: TODO collect from ExprKind::Send inside agents
+                );
+                self.errors.extend(pregel_errors);
+            }
+            crate::ast_v2::OrchestrateKind::Loop { agent, .. } => {
                 self.check_expr(agent.task_expr, arena, symbols);
                 if let Some(ref verify) = agent.verify_expr {
                     self.check_expr(*verify, arena, symbols);
-                }
-                if let Some(cond) = exit_when {
-                    self.check_expr(*cond, arena, symbols);
                 }
             }
         }
@@ -836,7 +855,102 @@ impl TypeChecker {
                 method,
                 args,
             } => self.check_method_call_expr(*object, method, args, arena, symbols),
-            _ => Type::Union(vec![]),
+            // v0.50: Command 动态控制流表达式
+            ExprKind::Command { goto: _, update, resume } => {
+                for (_, expr_id) in update {
+                    self.check_expr(*expr_id, arena, symbols);
+                }
+                if let Some(resume_id) = resume {
+                    self.check_expr(*resume_id, arena, symbols);
+                }
+                Type::Union(vec![])
+            }
+            // v0.50: Send 动态派发表达式
+            ExprKind::Send { target: _, input } => {
+                self.check_expr(*input, arena, symbols);
+                Type::Union(vec![])
+            }
+            // v0.50: 闭包表达式 — 检查参数类型注解，返回 closure 类型
+            ExprKind::Closure {
+                params,
+                return_type,
+                body: _,
+            } => {
+                // 检查参数类型注解是否有效（如果存在）
+                for (_name, hint) in params {
+                    if let Some(h) = hint {
+                        if !Type::is_builtin_type_name(h) {
+                            // 非内置类型可能是用户自定义类型或 trait — 不报错
+                            // 因为 Type::from_hint 会将未知名解析为 Trait 类型
+                        }
+                    }
+                }
+                // 检查返回类型注解是否有效（如果存在）
+                if let Some(rt) = return_type {
+                    if !Type::is_builtin_type_name(rt) {
+                        // 同上：允许未知类型名（可能是用户自定义）
+                    }
+                }
+                Type::Closure
+            }
+            // v0.50: 模式匹配表达式 — 检查被匹配表达式和所有 arm 的结果类型
+            ExprKind::Match { expr: match_expr, arms } => {
+                let _scrutinee_ty = self.check_expr(*match_expr, arena, symbols);
+                let mut arm_types = Vec::new();
+                for (_pattern, result_id) in arms {
+                    let arm_ty = self.check_expr(*result_id, arena, symbols);
+                    if arm_ty != Type::Union(vec![]) {
+                        arm_types.push(arm_ty);
+                    }
+                }
+                if arm_types.is_empty() {
+                    Type::Union(vec![])
+                } else if arm_types.iter().all(|t| t == &arm_types[0]) {
+                    arm_types[0].clone()
+                } else {
+                    Type::Union(arm_types)
+                }
+            }
+            // v0.50: 路由调用表达式 — 已弃用（v0.35 route statement 不可执行）
+            ExprKind::RouteCall { name, args } => {
+                for arg_id in args {
+                    self.check_expr(*arg_id, arena, symbols);
+                }
+                self.errors.push(TypeError::from_span_with_detail(
+                    &expr.span,
+                    format!("route call '{}' is not supported at runtime (deprecated in v0.35)", name),
+                    "use Router.route() API or web server endpoints",
+                    "route statement",
+                    "rewrite as Router::new().route(method, path, handler)",
+                ));
+                Type::Union(vec![])
+            }
+            // v0.50: AI 模型调用 — 未实现运行时支持
+            ExprKind::AiModelCall {
+                model,
+                temperature,
+                max_tokens,
+                system,
+            } => {
+                self.check_expr(*model, arena, symbols);
+                if let Some(t) = temperature {
+                    self.check_expr(*t, arena, symbols);
+                }
+                if let Some(m) = max_tokens {
+                    self.check_expr(*m, arena, symbols);
+                }
+                if let Some(s) = system {
+                    self.check_expr(*s, arena, symbols);
+                }
+                self.errors.push(TypeError::from_span_with_detail(
+                    &expr.span,
+                    "ai_model() call is not supported at runtime",
+                    "use ai.chat with model configuration",
+                    "ai_model(model, temperature: ...)",
+                    "use ai.chat with 'with model(...)' or set MORA_AI_MODEL env var",
+                ));
+                Type::Union(vec![])
+            }
         }
     }
 
@@ -1170,5 +1284,45 @@ impl TypeChecker {
             return true;
         }
         matches!((a, b), (Type::Union(_), _) | (_, Type::Union(_)))
+    }
+
+    // ------------------------------------------------------------------
+    // v0.50 预留：Pregel / Command / Send 表达式检查接口
+    // 当 Worker 1 完成 ast_v2.rs 扩展后，check_expr 的 match 分支可调用
+    // 以下方法。当前保持为独立方法，避免编译期依赖尚未存在的 variant。
+    // ------------------------------------------------------------------
+
+    /// v0.50: Command 表达式 `{ goto: ..., update: ..., resume: ... }` 类型检查。
+    /// 检查 update 值表达式和 resume 表达式，返回占位类型。
+    pub fn check_expr_v50_command(
+        &mut self,
+        _goto: &Option<String>,
+        update: &[(String, crate::ast_v2::NodeId)],
+        resume: &Option<crate::ast_v2::NodeId>,
+        arena: &AstArena,
+        symbols: &SymbolTable,
+    ) -> Type {
+        for (_, expr_id) in update {
+            self.check_expr(*expr_id, arena, symbols);
+        }
+        if let Some(resume_id) = resume {
+            self.check_expr(*resume_id, arena, symbols);
+        }
+        // Command 的运行时值是结构化数据，在类型系统中暂无专属类型，
+        // 使用 Union(vec![])（Any）作为占位。
+        Type::Union(vec![])
+    }
+
+    /// v0.50: Send 表达式 `send("node", { ... })` 类型检查。
+    /// 检查 input 表达式，返回占位类型。
+    pub fn check_expr_v50_send(
+        &mut self,
+        _target: &str,
+        input: crate::ast_v2::NodeId,
+        arena: &AstArena,
+        symbols: &SymbolTable,
+    ) -> Type {
+        self.check_expr(input, arena, symbols);
+        Type::Union(vec![])
     }
 }

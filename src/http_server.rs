@@ -1,4 +1,4 @@
-//! Mora HTTP Server (v0.04: 内嵌在解释器中)
+//! Mora HTTP Server (v0.50.0: async tokio rewrite)
 //!
 //! 设计: 零依赖 HTTP/1.1 + 动态路由表 (HTTP method + path → Mora 闭包)
 //! 与 v0.03 src/serve/server.rs 不同: endpoint 是 Mora 脚本里声明的,
@@ -11,9 +11,12 @@
 //! - 闭包返回值是 dict,自动 json.stringify 成 response body
 
 use std::collections::HashMap;
-use std::io::{self, BufRead, BufReader, Read, Write};
-use std::net::{TcpListener, TcpStream};
-use std::sync::{Arc, Mutex};
+use std::io;
+use std::sync::Arc;
+
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::time::{Duration, timeout};
 
 use crate::interpreter::{Interpreter, Value};
 use crate::lsp::json::{Value as JsonValue, to_string as json_to_string};
@@ -30,7 +33,7 @@ pub struct HttpRequest {
 }
 
 /// 动态路由条目: (pattern, handler) — pattern 支持 :param
-pub type RouteTable = Arc<Mutex<HashMap<(String, String), Value>>>;
+pub type RouteTable = Arc<tokio::sync::RwLock<HashMap<(String, String), Value>>>;
 
 /// v0.06.4: 尝试匹配路径参数 — 返回 Some(params) 或 None
 fn match_path_pattern(pattern: &str, actual: &str) -> Option<HashMap<String, String>> {
@@ -64,115 +67,21 @@ fn parse_query_dict(query: &str) -> Value {
     Value::Dict(m)
 }
 
-/// v0.11: 设置 SO_REUSEADDR 跨平台实现
-///   - Unix: 通过 AsRawFd 获取 fd，setsockopt syscall 设置 SO_REUSEADDR
-///   - Windows: 通过 AsRawSocket 获取 socket，setsockopt 设置 SO_REUSEADDR
-///   - 失败静默（SO_REUSEADDR 是 best-effort，不影响主流程）
-///
-///   v0.11 简化: SO_REUSEADDR / SOL_SOCKET 用硬编码数字
-///     - SOL_SOCKET = 1 on Unix, 0xFFFF on Windows (7 in winsock2.h, 0x0FFF)
-//   - SO_REUSEADDR = 2 on Unix, 4 on Windows
-fn set_reuse_addr(listener: &TcpListener) {
-    #[cfg(unix)]
-    {
-        use std::os::unix::io::AsRawFd;
-        let fd = listener.as_raw_fd();
-        // v0.11: SOL_SOCKET=1, SO_REUSEADDR=2 on Unix (Linux/macOS/BSD)
-        let opt: libc::c_int = 1; // enable
-        let _ = unsafe {
-            libc::setsockopt(
-                fd,
-                1, // SOL_SOCKET
-                2, // SO_REUSEADDR
-                &opt as *const _ as *const libc::c_void,
-                std::mem::size_of_val(&opt) as libc::socklen_t,
-            )
-        };
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::io::AsRawSocket;
-        let socket = listener.as_raw_socket();
-        // v0.11: SOL_SOCKET=0xFFFF, SO_REUSEADDR=4 on Windows (winsock2.h)
-        let opt: libc::c_int = 1; // enable
-        let _ = unsafe {
-            libc::setsockopt(
-                socket as libc::SOCKET,
-                0xFFFF, // SOL_SOCKET (Windows)
-                4,      // SO_REUSEADDR (Windows)
-                &opt as *const _ as *const libc::c_char,
-                std::mem::size_of_val(&opt) as libc::c_int,
-            )
-        };
-    }
-}
-
-/// v0.11: 尝试在指定端口或附近端口绑定
-///   - 先尝试 requested_port
-///   - 失败则试 requested_port+1, +2, ... 直到 max_attempts 个端口
-///   - 都失败返回最后一次错误
-///   - 设置 SO_REUSEADDR 允许重用 TIME_WAIT 状态的端口
-fn bind_with_reuse(
-    host: &str,
-    requested_port: u16,
-    max_attempts: u16,
-) -> io::Result<(TcpListener, u16)> {
-    use std::net::SocketAddr;
-    for offset in 0..max_attempts {
-        // 防止 u16 溢出
-        let port = match requested_port.checked_add(offset) {
-            Some(p) => p,
-            None => break, // 端口超过 u16 上限
-        };
-        let addr: SocketAddr = match format!("{}:{}", host, port).parse() {
-            Ok(a) => a,
-            Err(_) => continue,
-        };
-        match TcpListener::bind(addr) {
-            Ok(listener) => {
-                // v0.11: 设置 SO_REUSEADDR 允许重用 TIME_WAIT 状态的端口
-                set_reuse_addr(&listener);
-                if offset > 0 {
-                    eprintln!(
-                        "[serve] requested port {} unavailable, using {} instead",
-                        requested_port, port
-                    );
-                }
-                return Ok((listener, port));
-            }
-            Err(_) => {
-                // 端口被占，尝试下一个
-                continue;
-            }
-        }
-    }
-    // 所有尝试都失败
-    Err(io::Error::new(
-        io::ErrorKind::AddrInUse,
-        format!(
-            "could not bind to any port in range {}-{}",
-            requested_port,
-            requested_port.saturating_add(max_attempts - 1)
-        ),
-    ))
-}
-
-/// 启动 HTTP server (阻塞当前线程)
+/// 启动 HTTP server (async)
 /// routes 是从 Router 显式 API 收集的路由表
-/// v0.11: 自动选可用端口（4096-4099），加 SO_REUSEADDR 缓解 TIME_WAIT
-pub fn start(
+/// v0.50.0: 完全 async 化 — tokio::sync::RwLock + tokio::spawn + spawn_blocking
+pub async fn start(
     host: &str,
     port: u16,
     routes: RouteTable,
-    interpreter: Arc<Mutex<Interpreter>>,
+    interpreter: Arc<tokio::sync::RwLock<Interpreter>>,
 ) -> io::Result<()> {
-    // v0.11: 自动选端口（避免与之前未释放的进程冲突）
-    let (listener, actual_port) = bind_with_reuse(host, port, 4)?;
+    let (listener, actual_port) = bind_with_fallback(host, port, 4).await?;
     let addr = format!("{}:{}", host, actual_port);
     eprintln!("[serve] Mora HTTP server listening on http://{}", addr);
     eprintln!("[serve] Endpoints:");
     let by_method: HashMap<String, Vec<String>> = {
-        let routes = routes.lock().expect("routes mutex poisoned");
+        let routes = routes.read().await;
         let mut by_method: HashMap<String, Vec<String>> = HashMap::new();
         for (m, p) in routes.keys() {
             by_method.entry(m.clone()).or_default().push(p.clone());
@@ -186,58 +95,68 @@ pub fn start(
     }
     eprintln!();
 
-    // v0.22: 连接池优化 - 使用 Arc<Mutex<Receiver>> 共享接收器
-    let pool_size = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4)
-        .min(16); // 最多 16 个线程
-
-    let (tx, rx) = std::sync::mpsc::channel::<TcpStream>();
-    let rx = Arc::new(Mutex::new(rx));
-
-    // 启动工作线程
-    for _ in 0..pool_size {
-        let rx = rx.clone();
+    loop {
+        let (stream, _) = listener.accept().await?;
         let routes = routes.clone();
         let interp = interpreter.clone();
-        std::thread::spawn(move || {
-            loop {
-                let stream = {
-                    let guard = rx.lock().expect("rx mutex poisoned");
-                    guard.recv()
-                };
-                match stream {
-                    Ok(stream) => {
-                        if let Err(e) = handle_connection(stream, routes.clone(), interp.clone()) {
-                            eprintln!("[serve] connection error: {}", e);
-                        }
-                    }
-                    Err(_) => break, // channel 关闭
-                }
+        tokio::spawn(async move {
+            if let Err(e) = handle_connection(stream, routes, interp).await {
+                eprintln!("[serve] connection error: {}", e);
             }
         });
     }
-
-    // 主线程接受连接
-    for stream in listener.incoming() {
-        match stream {
-            Ok(stream) => {
-                if let Err(e) = tx.send(stream) {
-                    eprintln!("[serve] dispatch error: {}", e);
-                }
-            }
-            Err(e) => eprintln!("[serve] accept error: {}", e),
-        }
-    }
-    Ok(())
 }
 
-fn handle_connection(
+/// v0.50.0: 异步端口绑定（带 fallback）
+async fn bind_with_fallback(
+    host: &str,
+    requested_port: u16,
+    max_attempts: u16,
+) -> io::Result<(TcpListener, u16)> {
+    for offset in 0..max_attempts {
+        let port = match requested_port.checked_add(offset) {
+            Some(p) => p,
+            None => break,
+        };
+        let bind_addr = format!("{}:{}", host, port);
+        match TcpListener::bind(&bind_addr).await {
+            Ok(listener) => {
+                if offset > 0 {
+                    eprintln!(
+                        "[serve] requested port {} unavailable, using {} instead",
+                        requested_port, port
+                    );
+                }
+                return Ok((listener, port));
+            }
+            Err(_) => continue,
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AddrInUse,
+        format!(
+            "could not bind to any port in range {}-{}",
+            requested_port,
+            requested_port.saturating_add(max_attempts - 1)
+        ),
+    ))
+}
+
+async fn handle_connection(
     mut stream: TcpStream,
     routes: RouteTable,
-    interpreter: Arc<Mutex<Interpreter>>,
+    interpreter: Arc<tokio::sync::RwLock<Interpreter>>,
 ) -> io::Result<()> {
-    let mut req = parse_request(&mut stream)?;
+    let mut req = match timeout(Duration::from_secs(30), parse_request(&mut stream)).await {
+        Ok(Ok(r)) => r,
+        Ok(Err(e)) => return Err(e),
+        Err(_) => {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "request read timeout",
+            ))
+        }
+    };
     req.params = HashMap::new();
 
     // v0.37 (P1-1.6b): hoist method/path clones before the lock so the
@@ -246,9 +165,9 @@ fn handle_connection(
     let req_method = req.method.clone();
     let req_path = req.path.clone();
     let handler_with_params: Option<(Value, HashMap<String, String>)> = {
-        let routes = routes.lock().expect("routes mutex poisoned");
+        let routes = routes.read().await;
         // 1) 精确匹配
-        if let Some(h) = routes.get(&(req_method, req_path.clone())) {
+        if let Some(h) = routes.get(&(req_method.clone(), req_path.clone())) {
             Some((h.clone(), HashMap::new()))
         } else {
             // 2) 模式匹配 — 遍历所有注册路由
@@ -269,12 +188,29 @@ fn handle_connection(
     let (status, body_str) = match handler_with_params {
         Some((handler_value, params)) => {
             req.params = params;
-            match invoke_handler(handler_value, &req, interpreter) {
-                Ok(value) => {
+            // v0.50.0 (P0-4): handler 级 60s 超时, 防止 LLM/AI 慢响应饿死 worker
+            // spawn_blocking 调 invoke_handler (内部持 interpreter lock);
+            // 超时返回 504 Gateway Timeout.
+            let req_for_task = HttpRequest {
+                method: req.method.clone(),
+                path: req.path.clone(),
+                query: req.query.clone(),
+                headers: req.headers.clone(),
+                body: req.body.clone(),
+                params: req.params.clone(),
+            };
+            let interp_clone = interpreter.clone();
+            let handle = tokio::task::spawn_blocking(move || {
+                invoke_handler(handler_value, &req_for_task, interp_clone)
+            });
+            match timeout(Duration::from_secs(60), handle).await {
+                Ok(Ok(Ok(value))) => {
                     let json = value_to_json_string(&value);
                     (200, json)
                 }
-                Err(e) => (500, json_error(&format!("handler error: {}", e))),
+                Ok(Ok(Err(e))) => (500, json_error(&format!("handler error: {}", e))),
+                Ok(Err(_)) => (500, json_error("handler panicked")),
+                Err(_) => (504, json_error("handler timeout after 60s")),
             }
         }
         None => (
@@ -283,14 +219,15 @@ fn handle_connection(
         ),
     };
 
-    send_response(&mut stream, status, &body_str)
+    send_response(&mut stream, status, &body_str).await
 }
 
 /// 调 Mora 闭包,把 request 包装成 dict 传入. 附加 .json() / .text() 方法
+/// 在 spawn_blocking 中执行，使用 blocking_write() 获取 interpreter 锁
 fn invoke_handler(
     handler: Value,
     req: &HttpRequest,
-    interpreter: Arc<Mutex<Interpreter>>,
+    interpreter: Arc<tokio::sync::RwLock<Interpreter>>,
 ) -> Result<Value, String> {
     // 构造 req dict
     let mut req_dict = HashMap::new();
@@ -313,7 +250,7 @@ fn invoke_handler(
     let req_value = Value::Dict(req_dict);
 
     // 调闭包: handler(req_dict)
-    let mut interp = interpreter.lock().expect("interpreter mutex poisoned");
+    let mut interp = interpreter.blocking_write();
     interp.call_value(&handler, vec![req_value])
 }
 
@@ -406,13 +343,13 @@ fn json_error(msg: &str) -> String {
 }
 
 // ===================================================================
-// HTTP 解析
+// HTTP 解析 (async)
 // ===================================================================
 
-fn parse_request(stream: &mut TcpStream) -> io::Result<HttpRequest> {
-    let mut reader = BufReader::new(stream.try_clone()?);
+async fn parse_request(stream: &mut TcpStream) -> io::Result<HttpRequest> {
+    let mut reader = BufReader::new(stream);
     let mut first_line = String::new();
-    reader.read_line(&mut first_line)?;
+    reader.read_line(&mut first_line).await?;
     let parts: Vec<&str> = first_line.split_whitespace().collect();
     let method = parts.first().unwrap_or(&"GET").to_string();
 
@@ -427,7 +364,7 @@ fn parse_request(stream: &mut TcpStream) -> io::Result<HttpRequest> {
     let mut headers = Vec::new();
     loop {
         let mut line = String::new();
-        reader.read_line(&mut line)?;
+        reader.read_line(&mut line).await?;
         if line.trim().is_empty() {
             break;
         }
@@ -442,7 +379,7 @@ fn parse_request(stream: &mut TcpStream) -> io::Result<HttpRequest> {
     let mut body = String::new();
     if content_length > 0 {
         let mut buf = vec![0u8; content_length];
-        reader.read_exact(&mut buf)?;
+        reader.read_exact(&mut buf).await?;
         body = String::from_utf8_lossy(&buf).to_string();
     }
 
@@ -456,7 +393,7 @@ fn parse_request(stream: &mut TcpStream) -> io::Result<HttpRequest> {
     })
 }
 
-fn send_response(stream: &mut TcpStream, status: u16, body: &str) -> io::Result<()> {
+async fn send_response(stream: &mut TcpStream, status: u16, body: &str) -> io::Result<()> {
     let status_text = match status {
         200 => "OK",
         400 => "Bad Request",
@@ -471,6 +408,6 @@ fn send_response(stream: &mut TcpStream, status: u16, body: &str) -> io::Result<
         body.len(),
         body
     );
-    stream.write_all(response.as_bytes())?;
-    stream.flush()
+    stream.write_all(response.as_bytes()).await?;
+    stream.flush().await
 }

@@ -790,12 +790,12 @@ impl ParserV2 {
         let span = self.span_of_current();
         self.advance(); // consume 'orchestrate'
 
-        // 解析模式: sequential / graph / loop
+        // 解析模式: sequential / graph / loop / pregel
         let mode = if self.check(&TokenType::Loop) {
             self.advance();
             "loop".to_string()
         } else {
-            self.consume_identifier("Expected 'sequential', 'graph', or 'loop'")
+            self.consume_identifier("Expected 'sequential', 'graph', 'loop', or 'pregel'")
         };
 
         // 解析 input -> result
@@ -809,12 +809,12 @@ impl ParserV2 {
 
         let kind = match mode.as_str() {
             "sequential" => {
-                let agents = self.parse_agent_decls();
+                let (agents, _) = self.parse_agent_decls();
                 self.consume(&TokenType::End, "Expected 'end'");
                 OrchestrateKind::Sequential { agents }
             }
             "graph" => {
-                let agents = self.parse_agent_decls();
+                let (agents, _) = self.parse_agent_decls();
                 // 解析 edges 块
                 let mut edges = Vec::new();
                 if self.match_identifier("edges") {
@@ -850,12 +850,10 @@ impl ParserV2 {
                     self.advance();
                 }
                 // 解析单个 agent
-                let agents = self.parse_agent_decls();
+                let (agents, _) = self.parse_agent_decls();
                 let agent = match agents.into_iter().next() {
                     Some(a) => a,
                     None => {
-                        // v0.34: 之前 .expect("loop requires exactly one agent") 会 panic；
-                        // 现在按已有"未知模式 fallback 到 Sequential"的模式，报告错误并返回空 loop
                         eprintln!("Parse error: orchestrate loop requires exactly one agent");
                         let stmt_kind = StmtKind::Orchestrate {
                             input_var,
@@ -888,10 +886,62 @@ impl ParserV2 {
                     exit_when,
                 }
             }
+            "pregel" => {
+                // v0.50: Pregel BSP 执行模型
+                // 1. 解析可选 state: { ... }
+                let state_schema = if self.check(&TokenType::State) {
+                    self.advance(); // consume 'state'
+                    self.consume(&TokenType::Colon, "Expected ':'");
+                    self.parse_state_schema()
+                } else {
+                    Vec::new()
+                };
+                while self.check(&TokenType::Newline) {
+                    self.advance();
+                }
+                // 2. 解析可选 checkpoint: ...
+                let checkpoint = if self.check(&TokenType::Checkpoint) {
+                    self.advance(); // consume 'checkpoint'
+                    self.consume(&TokenType::Colon, "Expected ':'");
+                    Some(self.parse_checkpoint_config())
+                } else {
+                    None
+                };
+                while self.check(&TokenType::Newline) {
+                    self.advance();
+                }
+                // 3. 解析 agent 声明（含 interrupt 点）
+                let (agents, interrupt_points) = self.parse_agent_decls();
+                // 4. 解析可选 edges
+                let mut edges = Vec::new();
+                if self.match_identifier("edges") {
+                    while !self.check(&TokenType::End) && !self.is_at_end() {
+                        while self.check(&TokenType::Newline) {
+                            self.advance();
+                        }
+                        if self.check(&TokenType::End) || self.is_at_end() {
+                            break;
+                        }
+                        edges.push(self.parse_edge_decl());
+                    }
+                }
+                // 5. 解析额外 interrupt 点（可能出现在 edges 之后）
+                let mut all_interrupt_points = interrupt_points;
+                let extra = self.parse_interrupt_points();
+                all_interrupt_points.extend(extra);
+                self.consume(&TokenType::End, "Expected 'end'");
+                OrchestrateKind::Pregel {
+                    agents,
+                    edges,
+                    state_schema,
+                    checkpoint,
+                    interrupt_points: all_interrupt_points,
+                }
+            }
             _ => {
                 // v0.31: 不再 panic; 报告错误并返回默认 OrchestrateKind
                 eprintln!(
-                    "Parse error: Expected 'sequential', 'graph', or 'loop', got '{}'",
+                    "Parse error: Expected 'sequential', 'graph', 'loop', or 'pregel', got '{}'",
                     mode
                 );
                 // SAFETY: parse 错误已报告, 默认 Sequential 让 parser 继续
@@ -907,9 +957,102 @@ impl ParserV2 {
         self.arena.alloc_stmt(stmt_kind, span)
     }
 
-    /// 解析 agent 声明列表
-    pub(super) fn parse_agent_decls(&mut self) -> Vec<OrchestrateAgent> {
+    /// 解析 state schema 块
+    fn parse_state_schema(&mut self) -> Vec<StateChannel> {
+        self.consume(&TokenType::LBrace, "Expected '{'");
+        let mut schema = Vec::new();
+        while !self.check(&TokenType::RBrace) && !self.is_at_end() {
+            while self.check(&TokenType::Newline) {
+                self.advance();
+            }
+            if self.check(&TokenType::RBrace) || self.is_at_end() {
+                break;
+            }
+            let name = self.consume_identifier("Expected state channel name");
+            self.consume(&TokenType::Colon, "Expected ':'");
+            // 解析类型 hint（支持 list 类型 [T]）
+            let type_hint = if self.check(&TokenType::LBracket) {
+                self.advance(); // consume '['
+                let inner = self.consume_identifier("Expected type name");
+                self.consume(&TokenType::RBracket, "Expected ']'");
+                Some(format!("[{}]", inner))
+            } else {
+                Some(self.parse_type_name_recursive())
+            };
+            // 解析可选 @reducer
+            let mut reducer = ReducerKind::Last;
+            if self.match_token(&[TokenType::At]) {
+                let reducer_name = self.consume_identifier("Expected reducer name");
+                match reducer_name.as_str() {
+                    "append" => reducer = ReducerKind::Append,
+                    "add" => reducer = ReducerKind::Add,
+                    "last" => reducer = ReducerKind::Last,
+                    "merge" => {
+                        self.consume(&TokenType::LParen, "Expected '('");
+                        let merge_fn = self.expression();
+                        self.consume(&TokenType::RParen, "Expected ')'");
+                        reducer = ReducerKind::Merge(merge_fn);
+                    }
+                    other => {
+                        eprintln!("Parse error: Unknown reducer '{}'", other);
+                    }
+                }
+            }
+            schema.push(StateChannel {
+                name,
+                type_hint,
+                reducer,
+            });
+            if !self.match_token(&[TokenType::Comma]) {
+                break;
+            }
+        }
+        self.consume(&TokenType::RBrace, "Expected '}'");
+        schema
+    }
+
+    /// 解析 checkpoint 配置
+    fn parse_checkpoint_config(&mut self) -> CheckpointConfig {
+        let saver = self.consume_identifier("Expected saver name");
+        let mut thread_id = None;
+        if self.match_token(&[TokenType::Comma]) {
+            if self.check(&TokenType::Thread) {
+                self.advance(); // consume 'thread'
+                self.consume(&TokenType::Colon, "Expected ':'");
+                thread_id = Some(self.expression());
+            }
+        }
+        CheckpointConfig { saver, thread_id }
+    }
+
+    /// 解析 interrupt 点声明
+    fn parse_interrupt_points(&mut self) -> Vec<crate::ast_v2::InterruptPoint> {
+        let mut points = Vec::new();
+        while self.check(&TokenType::Interrupt) {
+            self.advance(); // consume 'interrupt'
+            let when = if self.match_token(&[TokenType::Before]) {
+                crate::ast_v2::InterruptWhen::Before
+            } else if self.match_token(&[TokenType::After]) {
+                crate::ast_v2::InterruptWhen::After
+            } else {
+                eprintln!("Parse error: Expected 'before' or 'after' after 'interrupt'");
+                break;
+            };
+            let node_name = self.consume_identifier("Expected node name");
+            points.push(crate::ast_v2::InterruptPoint { node_name, when });
+            while self.check(&TokenType::Newline) {
+                self.advance();
+            }
+        }
+        points
+    }
+
+    /// 解析 agent 声明列表（v0.50: 同时收集 interrupt 点）
+    pub(super) fn parse_agent_decls(
+        &mut self,
+    ) -> (Vec<OrchestrateAgent>, Vec<crate::ast_v2::InterruptPoint>) {
         let mut agents = Vec::new();
+        let mut interrupt_points = Vec::new();
         while self.check(&TokenType::Newline) {
             self.advance();
         }
@@ -952,6 +1095,10 @@ impl ParserV2 {
                     task_expr,
                     verify_expr,
                 });
+            } else if self.check(&TokenType::Interrupt) {
+                // v0.50: 在 agent 声明中解析 interrupt 点
+                let points = self.parse_interrupt_points();
+                interrupt_points.extend(points);
             } else {
                 break;
             }
@@ -959,7 +1106,7 @@ impl ParserV2 {
                 self.advance();
             }
         }
-        agents
+        (agents, interrupt_points)
     }
 
     /// 解析 with 绑定（复用现有 with 块逻辑）
@@ -1002,7 +1149,28 @@ impl ParserV2 {
         if self.match_identifier("when") {
             condition = Some(self.expression());
         }
-        // 消费可选的分号或换行
+        // v0.50: 解析可选的 dynamic { ... } 子句
+        let mut dynamic = None;
+        if self.match_token(&[TokenType::LBrace]) {
+            if self.match_identifier("dynamic") {
+                self.consume(&TokenType::Colon, "Expected ':'");
+                dynamic = if self.match_token(&[TokenType::Map]) {
+                    Some(DynamicKind::Map)
+                } else if self.match_token(&[TokenType::Reduce]) {
+                    Some(DynamicKind::Reduce)
+                } else if self.match_token(&[TokenType::FanIn]) {
+                    Some(DynamicKind::FanIn)
+                } else if self.match_token(&[TokenType::FanOut]) {
+                    Some(DynamicKind::FanOut)
+                } else {
+                    let name = self.consume_identifier("Expected dynamic kind");
+                    eprintln!("Parse error: Unknown dynamic kind '{}'", name);
+                    None
+                };
+            }
+            self.consume(&TokenType::RBrace, "Expected '}'");
+        }
+        // 消费可选的换行
         if self.check(&TokenType::Newline) {
             self.advance();
         }
@@ -1010,6 +1178,7 @@ impl ParserV2 {
             from,
             to,
             condition,
+            dynamic,
         }
     }
 

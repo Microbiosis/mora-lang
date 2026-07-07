@@ -639,7 +639,7 @@ pub fn value_to_json(value: &Value) -> String {
         Value::TraitObject { .. } => "\"<trait_object>\"".to_string(),
         Value::Compose(_) => "null".to_string(),
         Value::Partial(_, _) => "null".to_string(),
-        Value::Atom(arc) => value_to_json(&arc.lock().expect("Atom mutex poisoned")),
+        Value::Atom(arc) => value_to_json(&arc.lock()),
         Value::Macro { .. } => "null".to_string(),
         Value::PromptSection { .. } => "null".to_string(),
         Value::Document { backend, .. } => {

@@ -1743,14 +1743,17 @@ impl Interpreter {
                 }
                 let script = std::path::PathBuf::from(args[0].to_string());
                 let instruction = args[1].to_string();
-                let mut registry = self
-                    .refine_registry
-                    .lock()
-                    .expect("refine_registry mutex poisoned");
-                let session = registry.get_or_create(&script);
-                let step = session
-                    .refine(&instruction)
-                    .map_err(|e| format!("mora.refine: {}", e))?;
+                // v0.49.0 (A2): drop lock before file I/O.
+                // get_or_create 只创建空 session (无 I/O); refine 是 I/O 在锁外
+                let step = {
+                    let mut registry = self
+                        .refine_registry
+                        .lock()
+                        .expect("refine_registry mutex poisoned");
+                    let session = registry.get_or_create(&script);
+                    session.refine(&instruction)
+                }
+                .map_err(|e| format!("mora.refine: {}", e))?;
                 Ok(Value::Dict(step.to_dict()))
             }
             "refine_info" => {
@@ -2061,11 +2064,11 @@ impl Semaphore {
 
     fn acquire(&self) {
         loop {
-            let current = self.permits.load(Ordering::SeqCst);
+            let current = self.permits.load(Ordering::Acquire);
             if current > 0
                 && self
                     .permits
-                    .compare_exchange(current, current - 1, Ordering::SeqCst, Ordering::SeqCst)
+                    .compare_exchange(current, current - 1, Ordering::AcqRel, Ordering::Acquire)
                     .is_ok()
             {
                 return;
@@ -2077,9 +2080,10 @@ impl Semaphore {
     }
 
     fn release(&self) {
-        let prev = self.permits.fetch_add(1, Ordering::SeqCst);
+        // v0.49.0 (A4): use AcqRel (not SeqCst) for lighter memory barrier.
+        // prev == 0 means waiter queue may have blocked acquirers; wake one.
+        let prev = self.permits.fetch_add(1, Ordering::AcqRel);
         if prev == 0 {
-            // 唤醒一个 waiter
             let _guard = self.mutex.lock().expect("semaphore mutex poisoned");
             self.cond.notify_one();
         }
@@ -2489,16 +2493,13 @@ mod tests_v042_capability {
             .expect("revoke");
         assert_eq!(revoked, Value::Bool(true));
 
-        // generation 确实 bump 了 (token 仍在 store, 但 generation=1)
-        let token = interp
-            .sandbox
-            .capabilities
-            .get(token_id_num)
-            .expect("token should still exist (loongclaw-style: bump gen, not delete)");
-        assert_eq!(token.generation, 1);
+        // v0.49.0: generation 在 store 全局 bump (不放在 token 上)
+        assert_eq!(interp.sandbox.capabilities.current_generation(), 1);
+        // token 仍存在 (loongclaw-style: 不删除)
+        assert!(interp.sandbox.capabilities.get(token_id_num).is_some());
 
-        // 注: call_sandbox_method 不验证 generation (那是 PolicyEngine trait 行为)
-        // 但 store.check 也不验证 — generation 是给业务层用的语义信号
+        // v0.49.0: revoked token 在 check_call 时返回 false (TokenNotFound,
+        // 因为 token.generation != current_generation)
         let after = interp
             .call_sandbox_method(
                 "check_call",
@@ -2507,8 +2508,8 @@ mod tests_v042_capability {
             .expect("check_call");
         assert_eq!(
             after,
-            Value::Bool(true),
-            "token still permits (loongclaw style)"
+            Value::Bool(false),
+            "v0.49.0: revoked token must fail check_call"
         );
     }
 

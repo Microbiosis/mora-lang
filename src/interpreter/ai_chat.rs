@@ -320,17 +320,22 @@ impl Interpreter {
         if let Some(ref draft_model) = speculative_config {
             // v0.24: 自适应 draft 模型选择
             // 检查 draft 模型的历史成功率
-            let should_use_draft =
-                if let Some((success, total)) = self.draft_model_stats.get(draft_model.as_str()) {
-                    if *total >= 10 {
-                        // 有足够历史数据，根据成功率决定
-                        (*success as f64 / *total as f64) > 0.3
-                    } else {
-                        true // 数据不足，默认使用
-                    }
+            let should_use_draft = if let Some((success, total)) = self
+                .draft_model_stats
+                .lock()
+                .expect("draft_model_stats mutex poisoned")
+                .get(draft_model.as_str())
+                .copied()
+            {
+                if total >= 10 {
+                    // 有足够历史数据，根据成功率决定
+                    (success as f64 / total as f64) > 0.3
                 } else {
-                    true // 无历史数据，默认使用
-                };
+                    true // 数据不足，默认使用
+                }
+            } else {
+                true // 无历史数据，默认使用
+            };
 
             if should_use_draft {
                 // 1. 用 draft model 快速预测
@@ -347,21 +352,22 @@ impl Interpreter {
 
                 // 3. 检查验证结果并更新统计
                 let verification_str = verification.to_string();
-                let stats = self
-                    .draft_model_stats
-                    .entry(draft_model.clone())
-                    .or_insert((0, 0));
-                stats.1 += 1; // total += 1
-
                 // v0.24: 使用推测解码验证器
                 let draft_str = draft_response.to_string();
                 let is_verified = self
                     .speculative_verifier
                     .verify(&draft_str, &verification_str);
 
+                // v0.49.0 (A6): 单锁内 update stats (was HashMap entry+stats.x)
+                let mut stats_map = self
+                    .draft_model_stats
+                    .lock()
+                    .expect("draft_model_stats mutex poisoned");
+                let entry = stats_map.entry(draft_model.clone()).or_insert((0, 0));
+                entry.1 += 1; // total += 1
                 if is_verified {
-                    // draft 结果正确
-                    stats.0 += 1; // success += 1
+                    entry.0 += 1; // success += 1
+                    drop(stats_map);
                     return Ok(draft_response);
                 } else {
                     // draft 结果错误，返回主模型的修正结果
@@ -402,8 +408,15 @@ impl Interpreter {
 
         // v0.22: AI 调用内联缓存
         let cache_key = format!("{}:{:?}", model, messages);
-        if let Some(cached) = self.ai_cache.get(&cache_key) {
-            return Ok(Value::String(cached.clone()));
+        // v0.49.0 (C1): LRU cache (was unbounded HashMap)
+        if let Some(cached) = self
+            .ai_cache
+            .lock()
+            .expect("ai_cache mutex poisoned")
+            .get(&cache_key)
+            .cloned()
+        {
+            return Ok(Value::String(cached));
         }
 
         // v0.24: 检查缓存预热队列
@@ -494,8 +507,12 @@ impl Interpreter {
                                 .extract_ai_content(&text)
                                 .unwrap_or(Value::String(text.clone()));
                             // v0.22: 缓存 AI 调用结果
+                            // v0.49.0 (C1): LRU put (was unbounded HashMap insert)
                             if let Value::String(ref s) = result {
-                                self.ai_cache.insert(cache_key.clone(), s.clone());
+                                self.ai_cache
+                                    .lock()
+                                    .expect("ai_cache mutex poisoned")
+                                    .put(cache_key.clone(), s.clone());
                             }
                             return Ok(result);
                         }

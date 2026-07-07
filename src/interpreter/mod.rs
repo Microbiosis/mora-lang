@@ -134,6 +134,57 @@ pub(crate) fn default_impl_method_key(
 /// 用于：构造 trait instance 时的完整性检查（与 dispatch 保持一致）
 ///
 /// 参数 trait_registry 是 trait 元数据表（self.trait_registry 借用）
+///
+/// v0.49.0 (C1+C2): 简单 LRU cache (insertion-order, no hash map to keep 0 deps).
+/// `cap` 上限, 超过 evict 最旧. `Arc<Mutex<>>` for thread-safe shared access.
+pub struct LruCache<V> {
+    cap: usize,
+    /// ordered entries (oldest first) for O(1) pop_front on evict
+    order: std::collections::VecDeque<String>,
+    map: std::collections::HashMap<String, V>,
+}
+
+impl<V> LruCache<V> {
+    pub fn new(cap: usize) -> Self {
+        Self {
+            cap,
+            order: std::collections::VecDeque::new(),
+            map: std::collections::HashMap::new(),
+        }
+    }
+
+    pub fn get(&mut self, key: &str) -> Option<&V> {
+        self.map.get(key)
+    }
+
+    /// 插入或更新. 超 cap 时 evict 最旧.
+    pub fn put(&mut self, key: String, value: V) {
+        if self.map.contains_key(&key) {
+            // 更新 — 不动 order (视为 LRU 不变); 简单实现
+            self.map.insert(key, value);
+            return;
+        }
+        if self.map.len() >= self.cap {
+            // evict oldest
+            if let Some(oldest) = self.order.pop_front() {
+                self.map.remove(&oldest);
+            }
+        }
+        self.order.push_back(key.clone());
+        self.map.insert(key, value);
+    }
+
+    pub fn len(&self) -> usize {
+        self.map.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.map.is_empty()
+    }
+    pub fn cap(&self) -> usize {
+        self.cap
+    }
+}
+
 pub struct Interpreter {
     globals: Arc<Mutex<Environment>>,
     environment: Arc<Mutex<Environment>>,
@@ -154,11 +205,15 @@ pub struct Interpreter {
     worker_channels: HashMap<String, crossbeam_channel::Sender<Value>>,
     worker_receivers: HashMap<String, crossbeam_channel::Receiver<Value>>,
     // v0.22: AI 调用内联缓存 (prompt_hash -> response)
-    ai_cache: HashMap<String, String>,
+    // v0.49.0 (C1): LRU cap=10000 (was unbounded HashMap) — prevents OOM
+    ai_cache: std::sync::Arc<std::sync::Mutex<LruCache<String>>>,
     // v0.22: 字符串驻留池 (减少重复字符串内存)
-    string_interner: HashMap<String, Value>,
+    // v0.49.0 (C2): LRU cap=50000 (was unbounded HashMap)
+    string_interner: std::sync::Arc<std::sync::Mutex<LruCache<Value>>>,
     // v0.24: 自适应 draft 模型选择 (model -> success_rate)
-    draft_model_stats: HashMap<String, (usize, usize)>, // (success, total)
+    // v0.49.0 (A6): wrapped in Arc<Mutex> for thread-safe shared access
+    draft_model_stats:
+        std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, (usize, usize)>>>, // (success, total)
     // v0.24: 上下文窗口管理器
     context_window: ContextWindow,
     // v0.24: 推测解码并行验证器
@@ -240,9 +295,9 @@ impl Clone for Interpreter {
             recorder: crate::record::Recorder::new_off(),
             worker_channels: HashMap::new(), // 不克隆 channel
             worker_receivers: HashMap::new(),
-            ai_cache: HashMap::new(),        // 不克隆缓存
-            string_interner: HashMap::new(), // 不克隆驻留池
-            draft_model_stats: HashMap::new(),
+            ai_cache: self.ai_cache.clone(),
+            string_interner: self.string_interner.clone(),
+            draft_model_stats: self.draft_model_stats.clone(),
             context_window: ContextWindow::default(),
             speculative_verifier: SpeculativeVerifier::default(),
             cache_warmer: CacheWarmer::default(),
@@ -431,9 +486,15 @@ impl Interpreter {
             recorder: crate::record::Recorder::new_off(),
             worker_channels: HashMap::new(),
             worker_receivers: HashMap::new(),
-            ai_cache: HashMap::new(),
-            string_interner: HashMap::new(),
-            draft_model_stats: HashMap::new(),
+            ai_cache: std::sync::Arc::new(std::sync::Mutex::new(
+                crate::interpreter::LruCache::new(10000),
+            )),
+            string_interner: std::sync::Arc::new(std::sync::Mutex::new(
+                crate::interpreter::LruCache::new(50000),
+            )),
+            draft_model_stats: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
             context_window: ContextWindow::default(),
             speculative_verifier: SpeculativeVerifier::default(),
             cache_warmer: CacheWarmer::default(),
@@ -476,9 +537,15 @@ impl Interpreter {
             recorder: crate::record::Recorder::new_off(),
             worker_channels: HashMap::new(),
             worker_receivers: HashMap::new(),
-            ai_cache: HashMap::new(),
-            string_interner: HashMap::new(),
-            draft_model_stats: HashMap::new(),
+            ai_cache: std::sync::Arc::new(std::sync::Mutex::new(
+                crate::interpreter::LruCache::new(10000),
+            )),
+            string_interner: std::sync::Arc::new(std::sync::Mutex::new(
+                crate::interpreter::LruCache::new(50000),
+            )),
+            draft_model_stats: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
             context_window: ContextWindow::default(),
             speculative_verifier: SpeculativeVerifier::default(),
             cache_warmer: CacheWarmer::default(),
@@ -519,9 +586,15 @@ impl Interpreter {
             recorder: crate::record::Recorder::new_off(),
             worker_channels: HashMap::new(),
             worker_receivers: HashMap::new(),
-            ai_cache: HashMap::new(),
-            string_interner: HashMap::new(),
-            draft_model_stats: HashMap::new(),
+            ai_cache: std::sync::Arc::new(std::sync::Mutex::new(
+                crate::interpreter::LruCache::new(10000),
+            )),
+            string_interner: std::sync::Arc::new(std::sync::Mutex::new(
+                crate::interpreter::LruCache::new(50000),
+            )),
+            draft_model_stats: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
             context_window: ContextWindow::default(),
             speculative_verifier: SpeculativeVerifier::default(),
             cache_warmer: CacheWarmer::default(),
@@ -561,11 +634,21 @@ impl Interpreter {
 
     /// v0.22: 字符串驻留 - 相同字符串只存储一次
     pub fn intern_string(&mut self, s: String) -> Value {
-        if let Some(interned) = self.string_interner.get(&s) {
-            return interned.clone();
+        // v0.49.0 (C2): LRU cache + lock (was unbounded HashMap direct access)
+        {
+            let mut map = self
+                .string_interner
+                .lock()
+                .expect("string_interner mutex poisoned");
+            if let Some(interned) = map.get(&s) {
+                return interned.clone();
+            }
         }
         let val = Value::String(s.clone());
-        self.string_interner.insert(s, val.clone());
+        self.string_interner
+            .lock()
+            .expect("string_interner mutex poisoned")
+            .put(s, val.clone());
         val
     }
 

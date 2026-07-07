@@ -13,6 +13,9 @@ pub mod ccr;
 pub mod common;
 // v0.47.0: DAG-as-data orchestration (OpenFugu §1.6)
 pub mod orchestrate_dag;
+// v0.49.0: stress tests (concurrency / correctness / resource-leak)
+#[cfg(test)]
+pub mod stress_tests;
 // v0.47.0: Heartbeat executable checklist (mimiclaw §1.5)
 pub mod compress;
 pub mod document;

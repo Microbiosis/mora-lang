@@ -5,6 +5,9 @@
 //! - run_orchestrate_agent: 执行单个 orchestrate agent
 
 use super::*;
+/// v0.49.0 (B4): orchestrate graph max steps (was hardcoded 100)
+const MAX_GRAPH_STEPS: usize = 1000;
+
 use crate::ast_v2::{AstArena, OrchestrateAgent, OrchestrateKind};
 use crate::value::{FlowSignal, Value};
 
@@ -44,8 +47,11 @@ impl Interpreter {
                     std::collections::HashMap::new();
 
                 loop {
-                    if step > 100 {
-                        return Err("Orchestrate exceeded 100 steps".to_string());
+                    if step > MAX_GRAPH_STEPS {
+                        return Err(format!(
+                            "Orchestrate graph exceeded {} steps (max: {})",
+                            step, MAX_GRAPH_STEPS
+                        ));
                     }
 
                     let next_edge = edges.iter().find(|e| {

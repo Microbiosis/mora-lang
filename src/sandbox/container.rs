@@ -196,6 +196,7 @@ impl ContainerSpec {
 }
 
 /// v0.44.0: 容器运行时 handle (保存真实 container ID + process info)
+/// v0.49.0 (C3): 加 `auto_cleanup` 字段; `Drop` impl 自动 `docker rm -f` (opt-in).
 #[derive(Debug, Clone)]
 pub struct ContainerHandle {
     pub container_id: String,
@@ -203,6 +204,8 @@ pub struct ContainerHandle {
     pub backend: ContainerBackend,
     pub spec: ContainerSpec,
     pub started_at: Instant,
+    /// v0.49.0 (C3): opt-in 自动清理 (default true). 关闭以让容器持久化 (e.g. background worker).
+    pub auto_cleanup: bool,
 }
 
 impl ContainerHandle {
@@ -213,19 +216,87 @@ impl ContainerHandle {
             backend: spec.backend,
             spec,
             started_at: Instant::now(),
+            auto_cleanup: true,
         }
     }
 
-    /// `docker exec <id> <cmd>` — 在容器内执行命令, 返回 (exit_code, stdout, stderr)
+    /// v0.49.0 (C3): opt-out 自动清理
+    pub fn with_auto_cleanup(mut self, enabled: bool) -> Self {
+        self.auto_cleanup = enabled;
+        self
+    }
+}
+
+/// v0.49.0 (C3): Drop impl 自动 `docker rm -f`.
+/// 仅 `auto_cleanup=true` 时触发; 失败静默 (best-effort cleanup).
+impl Drop for ContainerHandle {
+    fn drop(&mut self) {
+        if !self.auto_cleanup {
+            return;
+        }
+        // best-effort: 不传播 error (Drop 是 fn drop(&mut self) -> ())
+        let _ = Command::new("docker")
+            .args(["rm", "-f", &self.container_id])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+}
+
+impl ContainerHandle {
+    /// v0.49.0 (B2): `docker exec <id> <cmd>` with optional timeout.
+    /// `timeout_ms=None` = block indefinitely (legacy).
+    /// `timeout_ms=Some(N)` = spawn waiter thread + recv_timeout(N).
+    /// Returns: (exit_code, stdout, stderr)
     pub fn exec(&self, cmd: &[&str]) -> Result<(i32, String, String), String> {
+        self.exec_with_timeout(cmd, None)
+    }
+
+    pub fn exec_with_timeout(
+        &self,
+        cmd: &[&str],
+        timeout_ms: Option<u64>,
+    ) -> Result<(i32, String, String), String> {
         let mut args = vec!["exec".to_string(), self.container_id.clone()];
         args.extend(cmd.iter().map(|s| s.to_string()));
-        let output = Command::new("docker")
+        let mut command = Command::new("docker");
+        command
             .args(&args)
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()
-            .map_err(|e| format!("docker exec spawn failed: {}", e))?;
+            .stderr(Stdio::piped());
+        let output = match timeout_ms {
+            None => command
+                .output()
+                .map_err(|e| format!("docker exec spawn failed: {}", e))?,
+            Some(ms) => {
+                // v0.49.0 (B2): 线程 + recv_timeout 模式 (参考 exec.parallel v0.43.0)
+                let (tx, rx) = std::sync::mpsc::channel();
+                let child = command
+                    .spawn()
+                    .map_err(|e| format!("docker exec spawn failed: {}", e))?;
+                let pid = child.id();
+                let waiter = std::thread::spawn(move || {
+                    let result = child.wait_with_output();
+                    let _ = tx.send(result);
+                });
+                match rx.recv_timeout(std::time::Duration::from_millis(ms)) {
+                    Ok(Ok(out)) => {
+                        let _ = waiter.join();
+                        out
+                    }
+                    Ok(Err(e)) => {
+                        let _ = waiter.join();
+                        return Err(format!("docker exec wait failed: {}", e));
+                    }
+                    Err(_) => {
+                        // timeout — best-effort kill
+                        timeout_kill_process_group(pid);
+                        let _ = waiter.join();
+                        return Err(format!("docker exec timeout after {}ms", ms));
+                    }
+                }
+            }
+        };
         let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
         let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
         let code = output.status.code().unwrap_or(-1);
@@ -254,13 +325,21 @@ impl ContainerHandle {
     }
 }
 
-/// v0.44.0: `docker run` 生成 container_name = "mora-<uuid>"
+/// v0.49.0 (B3): global AtomicU64 counter for guaranteed unique container names.
+/// `mora-{counter:012}` (12-digit zero-padded, max ~10^12 spawns before wrap).
+/// `fetch_add(1, Relaxed)` 在多线程下保证唯一, 即使 nanos 重复也没事.
+static CONTAINER_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// v0.44.0: `docker run` 生成 container_name = "mora-<nanos>-<counter>"
+/// v0.49.0 (B3): 加 counter 后缀, 保证高并发下唯一 (nanos 可能相同, counter 不会)
 pub fn generate_container_name() -> String {
-    let id: u64 = std::time::SystemTime::now()
+    use std::sync::atomic::Ordering;
+    let nanos: u64 = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64)
         .unwrap_or(0);
-    format!("mora-{:x}", id)
+    let counter = CONTAINER_COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("mora-{:x}-{:x}", nanos, counter)
 }
 
 /// v0.44.0: 真实 spawn docker container
@@ -463,5 +542,20 @@ mod tests {
 
         // 清理
         handle.destroy().expect("docker rm must succeed");
+    }
+}
+
+/// v0.49.0 (B2): timeout helper, kill process group on docker exec timeout.
+/// Unix: killpg(SIGKILL); Windows: taskkill /F /T.
+fn timeout_kill_process_group(pid: u32) {
+    #[cfg(unix)]
+    unsafe {
+        libc::killpg(pid as i32, libc::SIGKILL);
+    }
+    #[cfg(windows)]
+    {
+        let _ = Command::new("taskkill")
+            .args(["/F", "/T", "/PID", &pid.to_string()])
+            .status();
     }
 }

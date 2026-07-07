@@ -1,0 +1,71 @@
+{
+  "name": "mora",
+  "displayName": "Mora Language",
+  "description": "Mora language support: syntax highlighting + LSP-backed diagnostics/hover/completion.",
+  "version": "0.1.0",
+  "publisher": "Mora contributors",
+  "license": "BSD-3-Clause",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Microbiosis/mora-lang"
+  },
+  "engines": {
+    "vscode": "^1.75.0"
+  },
+  "categories": ["Programming Languages", "Linters", "Formatters"],
+  "activationEvents": [
+    "onLanguage:mora",
+    "workspaceContains:**/*.mora"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "languages": [
+      {
+        "id": "mora",
+        "aliases": ["Mora", "mora"],
+        "extensions": [".mora"],
+        "filenames": [],
+        "firstLine": "^--.*Mora",
+        "configuration": "./mora-language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "mora",
+        "scopeName": "source.mora",
+        "path": "./syntaxes/mora.tmLanguage.json"
+      }
+    ],
+    "configuration": {
+      "type": "object",
+      "title": "Mora",
+      "properties": {
+        "mora.languageServer.path": {
+          "type": "string",
+          "default": "mora-lsp",
+          "description": "Path to the mora-lsp binary. Set to an absolute path if not on $PATH."
+        },
+        "mora.languageServer.args": {
+          "type": "array",
+          "default": [],
+          "description": "Extra arguments to pass to mora-lsp."
+        },
+        "mora.noTypeCheck": {
+          "type": "boolean",
+          "default": false,
+          "description": "Disable static type checking (sets MORA_NO_TYPECK=1)."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "build": "tsc -p ./",
+    "package": "vsce package",
+    "lint": "eslint . --ext .ts"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/vscode": "^1.75.0",
+    "typescript": "^5.0.0"
+  }
+}

@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"fn":["builtin_signatures","lookup_builtin","method_arity","method_return_type","method_signature"],"struct":["Signature"]};

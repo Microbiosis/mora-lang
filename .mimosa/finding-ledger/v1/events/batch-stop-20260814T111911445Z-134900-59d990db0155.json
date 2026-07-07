@@ -1,0 +1,164 @@
+{
+  "schemaVersion": "mimosa-finding-ledger-batch/v1",
+  "batchId": "stop-20260814T111911445Z-134900-59d990db0155",
+  "runId": "20260814T111911445Z-134900-59d990db0155",
+  "runStatus": "inconclusive",
+  "coverage": {
+    "status": "partial",
+    "reasons": [
+      {
+        "code": "changed_file_unreadable",
+        "stage": "candidate-select",
+        "target": "tests/debug_union.rs",
+        "detail": "observed changed file no longer exists or cannot be read",
+        "affectsCompletion": true
+      },
+      {
+        "code": "scanner_failed",
+        "stage": "scan",
+        "target": "src/lexer.rs",
+        "detail": "spawnSync D:\\nodejs\\node.exe ETIMEDOUT",
+        "affectsCompletion": true
+      },
+      {
+        "code": "scanner_failed",
+        "stage": "scan",
+        "target": "src/parser_v3/mod.rs",
+        "detail": "spawnSync D:\\nodejs\\node.exe ETIMEDOUT",
+        "affectsCompletion": true
+      },
+      {
+        "code": "scanner_failed",
+        "stage": "scan",
+        "target": "tests/mir_dyntrait.rs",
+        "detail": "spawnSync D:\\nodejs\\node.exe ETIMEDOUT",
+        "affectsCompletion": true
+      },
+      {
+        "code": "scanner_failed",
+        "stage": "scan",
+        "target": "src/config.rs",
+        "detail": "spawnSync D:\\nodejs\\node.exe ETIMEDOUT",
+        "affectsCompletion": true
+      },
+      {
+        "code": "scanner_failed",
+        "stage": "scan",
+        "target": "src/lib.rs",
+        "detail": "spawnSync D:\\nodejs\\node.exe ETIMEDOUT",
+        "affectsCompletion": true
+      },
+      {
+        "code": "scanner_failed",
+        "stage": "scan",
+        "target": "src/interpreter/mod.rs",
+        "detail": "spawnSync D:\\nodejs\\node.exe ETIMEDOUT",
+        "affectsCompletion": true
+      },
+      {
+        "code": "scanner_failed",
+        "stage": "scan",
+        "target": "src/compress/text.rs",
+        "detail": "spawnSync D:\\nodejs\\node.exe ETIMEDOUT",
+        "affectsCompletion": true
+      },
+      {
+        "code": "scanner_failed",
+        "stage": "scan",
+        "target": "src/main.rs",
+        "detail": "spawnSync D:\\nodejs\\node.exe ETIMEDOUT",
+        "affectsCompletion": true
+      },
+      {
+        "code": "scanner_failed",
+        "stage": "scan",
+        "target": "src/mir/cache.rs",
+        "detail": "spawnSync D:\\nodejs\\node.exe ETIMEDOUT",
+        "affectsCompletion": true
+      },
+      {
+        "code": "project_check_failed",
+        "stage": "candidate-select",
+        "target": "tests/debug_union.rs",
+        "detail": "changed_file_unreadable: observed changed file no longer exists or cannot be read",
+        "affectsCompletion": true
+      },
+      {
+        "code": "project_check_failed",
+        "stage": "scan",
+        "target": "src/lexer.rs",
+        "detail": "scanner_failed: spawnSync D:\\nodejs\\node.exe ETIMEDOUT",
+        "affectsCompletion": true
+      },
+      {
+        "code": "project_check_failed",
+        "stage": "scan",
+        "target": "src/parser_v3/mod.rs",
+        "detail": "scanner_failed: spawnSync D:\\nodejs\\node.exe ETIMEDOUT",
+        "affectsCompletion": true
+      },
+      {
+        "code": "project_check_failed",
+        "stage": "scan",
+        "target": "tests/mir_dyntrait.rs",
+        "detail": "scanner_failed: spawnSync D:\\nodejs\\node.exe ETIMEDOUT",
+        "affectsCompletion": true
+      },
+      {
+        "code": "project_check_failed",
+        "stage": "scan",
+        "target": "src/config.rs",
+        "detail": "scanner_failed: spawnSync D:\\nodejs\\node.exe ETIMEDOUT",
+        "affectsCompletion": true
+      },
+      {
+        "code": "project_check_failed",
+        "stage": "scan",
+        "target": "src/lib.rs",
+        "detail": "scanner_failed: spawnSync D:\\nodejs\\node.exe ETIMEDOUT",
+        "affectsCompletion": true
+      },
+      {
+        "code": "project_check_failed",
+        "stage": "scan",
+        "target": "src/interpreter/mod.rs",
+        "detail": "scanner_failed: spawnSync D:\\nodejs\\node.exe ETIMEDOUT",
+        "affectsCompletion": true
+      },
+      {
+        "code": "project_check_failed",
+        "stage": "scan",
+        "target": "src/compress/text.rs",
+        "detail": "scanner_failed: spawnSync D:\\nodejs\\node.exe ETIMEDOUT",
+        "affectsCompletion": true
+      },
+      {
+        "code": "project_check_failed",
+        "stage": "scan",
+        "target": "src/main.rs",
+        "detail": "scanner_failed: spawnSync D:\\nodejs\\node.exe ETIMEDOUT",
+        "affectsCompletion": true
+      },
+      {
+        "code": "project_check_failed",
+        "stage": "scan",
+        "target": "src/mir/cache.rs",
+        "detail": "scanner_failed: spawnSync D:\\nodejs\\node.exe ETIMEDOUT",
+        "affectsCompletion": true
+      }
+    ]
+  },
+  "source": {
+    "component": "zcode-hook",
+    "operationId": "Stop"
+  },
+  "revision": "06d713bebdfc43851417d3652f87c5d22a05f56f",
+  "diffHash": "a286209168d15630a5c7edfc779edcaa1fd56290969cd244d4daf88f28498d21",
+  "rulesVersion": "unavailable",
+  "sessionHash": "fc909c17ce49dafaf06fd7778e38565f7c8ecaad3d8381e1a753c4026b99a740",
+  "reportRef": ".mimosa/reports/task-review-sess_ed1e38d0-3662-4b9c-9163-1e336d7eeca7-20260814T111911445Z-134900-59d990db0155.json",
+  "events": [],
+  "observedFindingIds": [],
+  "verifiedFiles": [],
+  "recordedAt": "2026-08-14T11:19:11.803Z"
+}

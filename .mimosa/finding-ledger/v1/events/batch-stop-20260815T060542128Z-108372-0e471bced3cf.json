@@ -1,0 +1,108 @@
+{
+  "schemaVersion": "mimosa-finding-ledger-batch/v1",
+  "batchId": "stop-20260815T060542128Z-108372-0e471bced3cf",
+  "runId": "20260815T060542128Z-108372-0e471bced3cf",
+  "runStatus": "inconclusive",
+  "coverage": {
+    "status": "partial",
+    "reasons": [
+      {
+        "code": "scanner_failed",
+        "stage": "scan",
+        "target": "src/mir/lower.rs",
+        "detail": "spawnSync D:\\nodejs\\node.exe ETIMEDOUT",
+        "affectsCompletion": true
+      },
+      {
+        "code": "scanner_failed",
+        "stage": "scan",
+        "target": "src/parser_v3/parse.rs",
+        "detail": "spawnSync D:\\nodejs\\node.exe ETIMEDOUT",
+        "affectsCompletion": true
+      },
+      {
+        "code": "scanner_failed",
+        "stage": "scan",
+        "target": "src/mir/vm.rs",
+        "detail": "spawnSync D:\\nodejs\\node.exe ETIMEDOUT",
+        "affectsCompletion": true
+      },
+      {
+        "code": "scanner_failed",
+        "stage": "scan",
+        "target": "src/mir/handlers.rs",
+        "detail": "spawnSync D:\\nodejs\\node.exe ETIMEDOUT",
+        "affectsCompletion": true
+      },
+      {
+        "code": "scanner_failed",
+        "stage": "scan",
+        "target": "tests/e2e.rs",
+        "detail": "spawnSync D:\\nodejs\\node.exe ETIMEDOUT",
+        "affectsCompletion": true
+      },
+      {
+        "code": "scanner_failed",
+        "stage": "scan",
+        "target": "src/parser_v3/emit.rs",
+        "detail": "spawnSync D:\\nodejs\\node.exe ETIMEDOUT",
+        "affectsCompletion": true
+      },
+      {
+        "code": "project_check_failed",
+        "stage": "scan",
+        "target": "src/mir/lower.rs",
+        "detail": "scanner_failed: spawnSync D:\\nodejs\\node.exe ETIMEDOUT",
+        "affectsCompletion": true
+      },
+      {
+        "code": "project_check_failed",
+        "stage": "scan",
+        "target": "src/parser_v3/parse.rs",
+        "detail": "scanner_failed: spawnSync D:\\nodejs\\node.exe ETIMEDOUT",
+        "affectsCompletion": true
+      },
+      {
+        "code": "project_check_failed",
+        "stage": "scan",
+        "target": "src/mir/vm.rs",
+        "detail": "scanner_failed: spawnSync D:\\nodejs\\node.exe ETIMEDOUT",
+        "affectsCompletion": true
+      },
+      {
+        "code": "project_check_failed",
+        "stage": "scan",
+        "target": "src/mir/handlers.rs",
+        "detail": "scanner_failed: spawnSync D:\\nodejs\\node.exe ETIMEDOUT",
+        "affectsCompletion": true
+      },
+      {
+        "code": "project_check_failed",
+        "stage": "scan",
+        "target": "tests/e2e.rs",
+        "detail": "scanner_failed: spawnSync D:\\nodejs\\node.exe ETIMEDOUT",
+        "affectsCompletion": true
+      },
+      {
+        "code": "project_check_failed",
+        "stage": "scan",
+        "target": "src/parser_v3/emit.rs",
+        "detail": "scanner_failed: spawnSync D:\\nodejs\\node.exe ETIMEDOUT",
+        "affectsCompletion": true
+      }
+    ]
+  },
+  "source": {
+    "component": "zcode-hook",
+    "operationId": "Stop"
+  },
+  "revision": "55f2cfe21fca16a1ee185d271a2418f0271d326b",
+  "diffHash": "dd04eb907326454b66f315cbe19ff847f6872046bee75ca864aedb2217dd7a8b",
+  "rulesVersion": "unavailable",
+  "sessionHash": "f71c1f9f5628df226d744c61f368d5afbb58b649cd3377920b0655183b11b07b",
+  "reportRef": ".mimosa/reports/task-review-sess_ee7b592c-b863-4189-9e3d-56bde251f387-20260815T060542128Z-108372-0e471bced3cf.json",
+  "events": [],
+  "observedFindingIds": [],
+  "verifiedFiles": [],
+  "recordedAt": "2026-08-15T06:05:42.507Z"
+}

@@ -1,0 +1,46 @@
+{
+  "schemaVersion": "mimosa-finding-history/v1",
+  "runId": "20260822T103419835Z-35844-3119825e4387",
+  "runStatus": "inconclusive",
+  "errors": [
+    "scan:src/mir/fcfg.rs: scanner_failed: spawnSync D:\\nodejs\\node.exe ETIMEDOUT",
+    "scan:src/mir/fcfg_lower.rs: scanner_failed: spawnSync D:\\nodejs\\node.exe ETIMEDOUT",
+    "scan:src/typeck/annotate.rs: scanner_failed: spawnSync D:\\nodejs\\node.exe ETIMEDOUT",
+    "scan:src/mir/ehir_to_core.rs: scanner_failed: spawnSync D:\\nodejs\\node.exe ETIMEDOUT",
+    "scan:src/mir/witness_to_fcfg.rs: scanner_failed: spawnSync D:\\nodejs\\node.exe ETIMEDOUT",
+    "scan:src/mir/mod.rs: scanner_failed: spawnSync D:\\nodejs\\node.exe ETIMEDOUT",
+    "scan:src/mir/pipeline.rs: scanner_failed: spawnSync D:\\nodejs\\node.exe ETIMEDOUT",
+    "scan:src/cli/mod.rs: scanner_failed: spawnSync D:\\nodejs\\node.exe ETIMEDOUT"
+  ],
+  "target": ".",
+  "revision": "52c43d8c27165d40add2284e895f27028dd5a0e3",
+  "diffHash": "5cedf9111e3c5e6c4472568925a9665510a079f0aaa15a9411e752526d9b756e",
+  "rulesVersion": "unavailable",
+  "recordedAt": "2026-08-22T10:34:19.835Z",
+  "timing": {
+    "startedAt": "2026-08-22T10:34:15.344Z",
+    "completedAt": "2026-08-22T10:34:19.835Z",
+    "durationMs": 4491
+  },
+  "tokens": {
+    "input": 0,
+    "output": 0,
+    "total": 0,
+    "modelCalls": 0,
+    "measurement": "known-zero"
+  },
+  "findings": {
+    "total": 0,
+    "bySeverity": {},
+    "byStatus": {}
+  },
+  "coverage": {
+    "status": "partial",
+    "reasonCounts": {
+      "scanner_failed": 8,
+      "project_check_failed": 8
+    }
+  },
+  "evidenceBoundary": "static_only",
+  "immutableReport": ".mimosa/reports/task-review-sess_464ee804-bff8-4a59-950a-c9957dcd87e7-20260822T103419835Z-35844-3119825e4387.json"
+}

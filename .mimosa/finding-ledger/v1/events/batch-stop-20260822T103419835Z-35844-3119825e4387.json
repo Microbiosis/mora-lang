@@ -1,0 +1,136 @@
+{
+  "schemaVersion": "mimosa-finding-ledger-batch/v1",
+  "batchId": "stop-20260822T103419835Z-35844-3119825e4387",
+  "runId": "20260822T103419835Z-35844-3119825e4387",
+  "runStatus": "inconclusive",
+  "coverage": {
+    "status": "partial",
+    "reasons": [
+      {
+        "code": "scanner_failed",
+        "stage": "scan",
+        "target": "src/mir/fcfg.rs",
+        "detail": "spawnSync D:\\nodejs\\node.exe ETIMEDOUT",
+        "affectsCompletion": true
+      },
+      {
+        "code": "scanner_failed",
+        "stage": "scan",
+        "target": "src/mir/fcfg_lower.rs",
+        "detail": "spawnSync D:\\nodejs\\node.exe ETIMEDOUT",
+        "affectsCompletion": true
+      },
+      {
+        "code": "scanner_failed",
+        "stage": "scan",
+        "target": "src/typeck/annotate.rs",
+        "detail": "spawnSync D:\\nodejs\\node.exe ETIMEDOUT",
+        "affectsCompletion": true
+      },
+      {
+        "code": "scanner_failed",
+        "stage": "scan",
+        "target": "src/mir/ehir_to_core.rs",
+        "detail": "spawnSync D:\\nodejs\\node.exe ETIMEDOUT",
+        "affectsCompletion": true
+      },
+      {
+        "code": "scanner_failed",
+        "stage": "scan",
+        "target": "src/mir/witness_to_fcfg.rs",
+        "detail": "spawnSync D:\\nodejs\\node.exe ETIMEDOUT",
+        "affectsCompletion": true
+      },
+      {
+        "code": "scanner_failed",
+        "stage": "scan",
+        "target": "src/mir/mod.rs",
+        "detail": "spawnSync D:\\nodejs\\node.exe ETIMEDOUT",
+        "affectsCompletion": true
+      },
+      {
+        "code": "scanner_failed",
+        "stage": "scan",
+        "target": "src/mir/pipeline.rs",
+        "detail": "spawnSync D:\\nodejs\\node.exe ETIMEDOUT",
+        "affectsCompletion": true
+      },
+      {
+        "code": "scanner_failed",
+        "stage": "scan",
+        "target": "src/cli/mod.rs",
+        "detail": "spawnSync D:\\nodejs\\node.exe ETIMEDOUT",
+        "affectsCompletion": true
+      },
+      {
+        "code": "project_check_failed",
+        "stage": "scan",
+        "target": "src/mir/fcfg.rs",
+        "detail": "scanner_failed: spawnSync D:\\nodejs\\node.exe ETIMEDOUT",
+        "affectsCompletion": true
+      },
+      {
+        "code": "project_check_failed",
+        "stage": "scan",
+        "target": "src/mir/fcfg_lower.rs",
+        "detail": "scanner_failed: spawnSync D:\\nodejs\\node.exe ETIMEDOUT",
+        "affectsCompletion": true
+      },
+      {
+        "code": "project_check_failed",
+        "stage": "scan",
+        "target": "src/typeck/annotate.rs",
+        "detail": "scanner_failed: spawnSync D:\\nodejs\\node.exe ETIMEDOUT",
+        "affectsCompletion": true
+      },
+      {
+        "code": "project_check_failed",
+        "stage": "scan",
+        "target": "src/mir/ehir_to_core.rs",
+        "detail": "scanner_failed: spawnSync D:\\nodejs\\node.exe ETIMEDOUT",
+        "affectsCompletion": true
+      },
+      {
+        "code": "project_check_failed",
+        "stage": "scan",
+        "target": "src/mir/witness_to_fcfg.rs",
+        "detail": "scanner_failed: spawnSync D:\\nodejs\\node.exe ETIMEDOUT",
+        "affectsCompletion": true
+      },
+      {
+        "code": "project_check_failed",
+        "stage": "scan",
+        "target": "src/mir/mod.rs",
+        "detail": "scanner_failed: spawnSync D:\\nodejs\\node.exe ETIMEDOUT",
+        "affectsCompletion": true
+      },
+      {
+        "code": "project_check_failed",
+        "stage": "scan",
+        "target": "src/mir/pipeline.rs",
+        "detail": "scanner_failed: spawnSync D:\\nodejs\\node.exe ETIMEDOUT",
+        "affectsCompletion": true
+      },
+      {
+        "code": "project_check_failed",
+        "stage": "scan",
+        "target": "src/cli/mod.rs",
+        "detail": "scanner_failed: spawnSync D:\\nodejs\\node.exe ETIMEDOUT",
+        "affectsCompletion": true
+      }
+    ]
+  },
+  "source": {
+    "component": "zcode-hook",
+    "operationId": "Stop"
+  },
+  "revision": "52c43d8c27165d40add2284e895f27028dd5a0e3",
+  "diffHash": "5cedf9111e3c5e6c4472568925a9665510a079f0aaa15a9411e752526d9b756e",
+  "rulesVersion": "unavailable",
+  "sessionHash": "83c98891dca99f12448d2ee36e88d7396972a0ce75da2769df3715f0e3539e25",
+  "reportRef": ".mimosa/reports/task-review-sess_464ee804-bff8-4a59-950a-c9957dcd87e7-20260822T103419835Z-35844-3119825e4387.json",
+  "events": [],
+  "observedFindingIds": [],
+  "verifiedFiles": [],
+  "recordedAt": "2026-08-22T10:34:20.204Z"
+}

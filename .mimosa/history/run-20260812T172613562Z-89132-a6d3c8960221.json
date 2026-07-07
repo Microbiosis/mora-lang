@@ -1,0 +1,54 @@
+{
+  "schemaVersion": "mimosa-finding-history/v1",
+  "runId": "20260812T172613562Z-89132-a6d3c8960221",
+  "runStatus": "inconclusive",
+  "errors": [
+    "scan:src/tea/mod.rs: scanner_failed: spawnSync D:\\nodejs\\node.exe ETIMEDOUT",
+    "scan:src/value.rs: scanner_failed: spawnSync D:\\nodejs\\node.exe ETIMEDOUT",
+    "scan:src/lib.rs: scanner_failed: spawnSync D:\\nodejs\\node.exe ETIMEDOUT",
+    "scan:src/tea/replay.rs: scanner_failed: spawnSync D:\\nodejs\\node.exe ETIMEDOUT",
+    "scan:src/flow.rs: scanner_failed: spawnSync D:\\nodejs\\node.exe ETIMEDOUT",
+    "scan:src/flow/json.rs: scanner_failed: spawnSync D:\\nodejs\\node.exe ETIMEDOUT",
+    "scan:src/http_server.rs: scanner_failed: spawnSync D:\\nodejs\\node.exe ETIMEDOUT",
+    "scan:src/value/display.rs: scanner_failed: spawnSync D:\\nodejs\\node.exe ETIMEDOUT",
+    "scan:src/interpreter/dispatch.rs: scanner_failed: spawnSync D:\\nodejs\\node.exe ETIMEDOUT",
+    "scan:src/interpreter/builtins/xform.rs: scanner_failed: spawnSync D:\\nodejs\\node.exe ETIMEDOUT",
+    "scan:src/interpreter/builtins/tea.rs: scanner_failed: spawnSync D:\\nodejs\\node.exe ETIMEDOUT",
+    "scan:src/interpreter/builtins/mod.rs: scanner_failed: spawnSync D:\\nodejs\\node.exe ETIMEDOUT",
+    "scan:src/mir/handlers.rs: scanner_failed: spawnSync D:\\nodejs\\node.exe ETIMEDOUT",
+    "scan:src/record/serialization.rs: scanner_failed: spawnSync D:\\nodejs\\node.exe ETIMEDOUT",
+    "scan:src/record/tests.rs: scanner_failed: spawnSync D:\\nodejs\\node.exe ETIMEDOUT",
+    "scan:tests/e2e.rs: scanner_failed: spawnSync D:\\nodejs\\node.exe ETIMEDOUT"
+  ],
+  "target": ".",
+  "revision": "06d713bebdfc43851417d3652f87c5d22a05f56f",
+  "diffHash": "294b8dbbb370e0eb3740d24b6fef23172502df601e434ff9d34a06d833e3840f",
+  "rulesVersion": "unavailable",
+  "recordedAt": "2026-08-12T17:26:13.562Z",
+  "timing": {
+    "startedAt": "2026-08-12T17:26:11.083Z",
+    "completedAt": "2026-08-12T17:26:13.562Z",
+    "durationMs": 2479
+  },
+  "tokens": {
+    "input": 0,
+    "output": 0,
+    "total": 0,
+    "modelCalls": 0,
+    "measurement": "known-zero"
+  },
+  "findings": {
+    "total": 0,
+    "bySeverity": {},
+    "byStatus": {}
+  },
+  "coverage": {
+    "status": "partial",
+    "reasonCounts": {
+      "scanner_failed": 16,
+      "project_check_failed": 16
+    }
+  },
+  "evidenceBoundary": "static_only",
+  "immutableReport": ".mimosa/reports/task-review-sess_213710e8-985d-44f8-b96f-f5c18690963d-20260812T172613562Z-89132-a6d3c8960221.json"
+}

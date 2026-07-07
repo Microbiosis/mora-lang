@@ -1,0 +1,8 @@
+schema_version: 1
+module_path: examples
+title: Mora 语言示例与端到端测试
+scope:
+    - examples/
+source_files: []
+depends_on: []
+related_to: []

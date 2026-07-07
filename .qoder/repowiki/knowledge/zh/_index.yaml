@@ -1,0 +1,74 @@
+# 知识卡导出索引文件
+schema_version: 1
+locale: zh-CN
+branch: main
+nodes_managed: true
+exported_at: "2026-07-24T05:55:03Z"
+modules:
+    "":
+        dir_name: Mora AI 原生脚本语言工作区
+        title: Mora AI 原生脚本语言工作区
+        scope:
+            - README.md
+            - Cargo.toml
+            - Cargo.lock
+            - build.rs
+            - Dockerfile
+            - docker-compose.yml
+            - .gitignore
+            - .dockerignore
+            - AGENTS_CODE_MODIFICATION.md
+            - AGENTS_PRIMITIVES.md
+            - AGENTS_PRIMITIVES_v2.md
+            - AGENTS_SESSION_V0_34.md
+            - AGENTS_SESSION_V0_41.md
+            - CHANGELOG.md
+            - LICENSE
+        source_files: []
+        children:
+            - editors
+            - examples
+            - support_utils
+            - tests_and_data
+        depends_on: []
+        related_to: []
+    editors:
+        dir_name: 编辑器集成配置集（VS Code _ Neovim _ Helix _ Sublime _ Vim _ Emacs）
+        title: 编辑器集成配置集（VS Code / Neovim / Helix / Sublime / Vim / Emacs）
+        scope:
+            - editors/
+        source_files: []
+        children: []
+        depends_on: []
+        related_to: []
+    examples:
+        dir_name: Mora 语言示例与端到端测试
+        title: Mora 语言示例与端到端测试
+        scope:
+            - examples/
+        source_files: []
+        children: []
+        depends_on: []
+        related_to: []
+    support_utils:
+        dir_name: 运行时支撑工具集（公共类型、值运算与可观测性）
+        title: 运行时支撑工具集（公共类型、值运算与可观测性）
+        scope:
+            - src/common.rs
+            - src/flow.rs
+            - src/trace_collector.rs
+        source_files: []
+        children: []
+        depends_on: []
+        related_to: []
+    tests_and_data:
+        dir_name: 集成测试、MIR_SSA 调试与类型检查回归数据
+        title: 集成测试、MIR/SSA 调试与类型检查回归数据
+        scope:
+            - tests/
+            - test_data/
+            - proptest-regressions/
+        source_files: []
+        children: []
+        depends_on: []
+        related_to: []

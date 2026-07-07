@@ -1,0 +1,10 @@
+schema_version: 1
+module_path: tests_and_data
+title: 集成测试、MIR/SSA 调试与类型检查回归数据
+scope:
+    - tests/
+    - test_data/
+    - proptest-regressions/
+source_files: []
+depends_on: []
+related_to: []

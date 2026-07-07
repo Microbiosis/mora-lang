@@ -194,8 +194,10 @@ impl std::error::Error for SandboxError {}
 /// v0.42.0: Capability Store — token_id → CapabilityToken 映射
 ///
 /// 设计: 单线程同步, 用 Arc<Mutex> 共享 (与 EventBus 一致).
-/// `next_id` 单调递增; revoke 不删除 token, 而是 bump generation 让旧 token 失配.
-/// 用 Arc<Mutex> 而非裸 Mutex, 这样 CapabilityStore: Clone (interpreter 复制 sandbox 时共享底层).
+/// `next_id` 单调递增.
+/// v0.49.0 (A1+B1): revoke bumps `current_generation` (not token's); `check` requires
+/// `token.generation == current_generation` (else TokenNotFound). Previously `check`
+/// ignored generation entirely — revoke was a no-op for security checks.
 #[derive(Debug, Default, Clone)]
 pub struct CapabilityStore {
     tokens: std::sync::Arc<std::sync::Mutex<CapabilityStoreInner>>,
@@ -205,11 +207,22 @@ pub struct CapabilityStore {
 struct CapabilityStoreInner {
     by_id: BTreeMap<u64, CapabilityToken>,
     next_id: u64,
+    /// v0.49.0: current global generation; bumped by `revoke()`.
+    /// Tokens with `generation != current_generation` are treated as not-found.
+    current_generation: u32,
 }
 
 impl CapabilityStore {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// v0.49.0 (A1): 当前 global generation (public for test assertions)
+    pub fn current_generation(&self) -> u32 {
+        self.tokens
+            .lock()
+            .expect("capability store mutex poisoned")
+            .current_generation
     }
 
     /// 发放新 token
@@ -235,19 +248,25 @@ impl CapabilityStore {
         Ok(token_id)
     }
 
+    /// v0.49.0 (A5): 单锁内 get + check (避免双锁)
     /// 查询 token (返回 clone 用于无锁使用)
     pub fn get(&self, token_id: u64) -> Option<CapabilityToken> {
         let inner = self.tokens.lock().expect("capability store mutex poisoned");
         inner.by_id.get(&token_id).cloned()
     }
 
-    /// 检查 capability (返回 Ok(()) 或 Err(SandboxError))
+    /// v0.49.0 (A5 + A1): 检查 capability (返回 Ok(()) 或 Err(SandboxError))
+    /// 单锁内 get + check; 同时校验 generation (A1) — revoked token 返回 TokenNotFound.
     pub fn check(&self, token_id: u64, capability: Capability) -> Result<(), SandboxError> {
         let inner = self.tokens.lock().expect("capability store mutex poisoned");
         let token = inner
             .by_id
             .get(&token_id)
             .ok_or(SandboxError::TokenNotFound { token_id })?;
+        // v0.49.0 (A1): revoked token 视为不存在
+        if token.generation != inner.current_generation {
+            return Err(SandboxError::TokenNotFound { token_id });
+        }
         let now = SystemTime::now();
         if token.permits(capability, now) {
             Ok(())
@@ -261,14 +280,18 @@ impl CapabilityStore {
         }
     }
 
-    /// 撤销 token (bump generation, 旧持有者的 token 立即失配)
-    pub fn revoke(&self, token_id: u64) -> Result<(), SandboxError> {
+    /// v0.49.0 (B1): 撤销 token — bump GLOBAL `current_generation`.
+    /// 旧持有者的 token 仍携带旧 generation, `check` 会视为 TokenNotFound.
+    /// 这样 revoke 在并发场景下立即生效 (无需遍历所有 token).
+    pub fn revoke(&self, _token_id: u64) -> Result<(), SandboxError> {
+        // 检查 token 存在 (保持 API 兼容, 返回 TokenNotFound if not)
         let mut inner = self.tokens.lock().expect("capability store mutex poisoned");
-        let token = inner
-            .by_id
-            .get_mut(&token_id)
-            .ok_or(SandboxError::TokenNotFound { token_id })?;
-        token.generation += 1;
+        if !inner.by_id.contains_key(&_token_id) {
+            return Err(SandboxError::TokenNotFound {
+                token_id: _token_id,
+            });
+        }
+        inner.current_generation = inner.current_generation.wrapping_add(1);
         Ok(())
     }
 
@@ -392,15 +415,19 @@ mod tests {
 
         store.revoke(id).unwrap();
 
-        // revoke 后 generation bump, 但 store.check 不检查 generation
-        // (generation mismatch 是更高层用, 见 SandboxError::GenerationMismatch)
-        // store 仅删 token 才让 check 报 TokenNotFound
-        // 这里验证 revoke 本身不删除 token (loongclaw 风格, 旧 token 通过 generation 失配)
-        assert!(store.check(id, Capability::FileRead).is_ok());
+        // v0.49.0 (A1+B1): revoke 真的让 token 失效 (return TokenNotFound)
+        let err = store.check(id, Capability::FileRead).unwrap_err();
+        assert!(
+            matches!(err, SandboxError::TokenNotFound { .. }),
+            "revoked token should return TokenNotFound, got: {:?}",
+            err
+        );
 
-        // generation 确实 bump 了
-        let token = store.get(id).unwrap();
-        assert_eq!(token.generation, 1);
+        // current_generation bumped from 0 to 1
+        assert_eq!(store.current_generation(), 1);
+
+        // token 仍存在 (loongclaw 风格: revoke 不删 token, 但失配)
+        assert!(store.get(id).is_some());
     }
 
     #[test]

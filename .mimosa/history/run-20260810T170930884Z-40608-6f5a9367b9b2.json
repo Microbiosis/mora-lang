@@ -1,0 +1,43 @@
+{
+  "schemaVersion": "mimosa-finding-history/v1",
+  "runId": "20260810T170930884Z-40608-6f5a9367b9b2",
+  "runStatus": "inconclusive",
+  "errors": [
+    "scan:src/checkpoint/memory.rs: scanner_failed: spawnSync D:\\nodejs\\node.exe ETIMEDOUT",
+    "scan:src/checkpoint/mod.rs: scanner_failed: spawnSync D:\\nodejs\\node.exe ETIMEDOUT",
+    "scan:src/interpreter/mod.rs: scanner_failed: spawnSync D:\\nodejs\\node.exe ETIMEDOUT",
+    "scan:src/checkpoint/sqlite.rs: scanner_failed: spawnSync D:\\nodejs\\node.exe ETIMEDOUT",
+    "scan:src/mir/host.rs: scanner_failed: spawnSync D:\\nodejs\\node.exe ETIMEDOUT"
+  ],
+  "target": ".",
+  "revision": "321a9e53b0a0e9da73aed45b897ccd3dd9c38c71",
+  "diffHash": "e9790dfa6e30a109af4f444ee9c543de12e6332ddb73ae99884752edbfa509fd",
+  "rulesVersion": "unavailable",
+  "recordedAt": "2026-08-10T17:09:30.884Z",
+  "timing": {
+    "startedAt": "2026-08-10T17:09:26.297Z",
+    "completedAt": "2026-08-10T17:09:30.884Z",
+    "durationMs": 4587
+  },
+  "tokens": {
+    "input": 0,
+    "output": 0,
+    "total": 0,
+    "modelCalls": 0,
+    "measurement": "known-zero"
+  },
+  "findings": {
+    "total": 0,
+    "bySeverity": {},
+    "byStatus": {}
+  },
+  "coverage": {
+    "status": "partial",
+    "reasonCounts": {
+      "scanner_failed": 5,
+      "project_check_failed": 5
+    }
+  },
+  "evidenceBoundary": "static_only",
+  "immutableReport": ".mimosa/reports/task-review-sess_7808e888-2c51-4b9d-95ca-a670e14f6158-20260810T170930884Z-40608-6f5a9367b9b2.json"
+}

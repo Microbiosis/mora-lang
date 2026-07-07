@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"fn":["compress_top","extract_text","options_from_value","parse_json_simple","value_to_json_simple","value_type_simple"],"mod":["code","html","json","log","text"],"struct":["CompressOptions","ContentRouter"],"trait":["SubCompressor"]};

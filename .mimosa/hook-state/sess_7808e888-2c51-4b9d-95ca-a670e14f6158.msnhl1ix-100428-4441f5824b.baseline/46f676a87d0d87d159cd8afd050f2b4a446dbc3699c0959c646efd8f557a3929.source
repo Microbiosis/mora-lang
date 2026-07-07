@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"fn":["resume","rewind"],"struct":["Checkpoint","MemorySaver","SendTask"],"trait":["CheckpointSaver"]};

@@ -1,0 +1,82 @@
+{
+  "summary": {
+    "projectName": "mora-lang",
+    "modelId": "software-fluency",
+    "strengths": [
+      "Strong repository infrastructure (CI workflows, manifests)",
+      "Clear agent practice documentation (AGENTS.md)",
+      "Comprehensive memory coverage for user preferences"
+    ],
+    "weaknesses": [
+      "No observed validation commands after edits",
+      "Long sessions lack outcome review",
+      "Limited project-specific automation assets"
+    ],
+    "dimensions": ["context-map", "environment-readiness", "fast-feedback", "quality-gates", "safe-change"]
+  },
+  "findings": [
+    {
+      "id": "finding-001",
+      "title": "Post-edit validation gap",
+      "target": "代码修改后的构建与测试验证",
+      "observedConsequence": "在分析的会话样本中未观察到任何验证命令类别。代码修改可能缺少显式的构建/测试/lint 验证。",
+      "reason": "AGENTS.md 和内存规范要求修改后进行验证，但会话分析显示零验证命令被观察到。要么验证发生在监控范围之外，要么未持续执行。",
+      "evidenceChain": [
+        "用户请求代码修改（如'完整迁移到 MIR'、更新旧代码）",
+        "Agent 执行编辑但不观察或触发验证命令",
+        "项目内存'修改功能时主动审查历史代码适配性'要求修改后构建和测试",
+        "未检测到强制 edit 后验证的自动化工作流"
+      ],
+      "owner": "开发流程规范",
+      "repairRoute": "在代码修改后添加明确的验证步骤；要求在 agent 工作流中包含 cargo build/test/clippy 命令",
+      "severity": "Medium",
+      "confidence": "High",
+      "dimensionRefs": ["validation"],
+      "verifier": "运行下一个任务并包含明确的验证命令；验证 harness analyze 是否检测到验证命令类别",
+      "category": "Validation",
+      "tags": ["validation", "build-quality", "workflow"]
+    },
+    {
+      "id": "finding-002",
+      "title": "长会话无结果复核",
+      "target": "活跃会话的结果质量评估",
+      "observedConsequence": "检测到 2 个活跃长会话（S1: ~711 分钟，S2: ~250 分钟），但尚未完成结果复核。无法确定这些反映的是复杂任务、工具摩擦还是效率问题。",
+      "reason": "尚未进行语义分类来确定任务族、结果和摩擦。缺乏结果证据使得无法评估效率并进行模型调优决策。",
+      "evidenceChain": [
+        "Agent 参与复杂多步任务（如 MIR 迁移、代码重构）",
+        "会话长时间保持活跃（最长估计 711 分钟）",
+        "未进行语义分类来确定任务族、结果和摩擦",
+        "缺乏结果证据无法进行评估效率和调优模型决策"
+      ],
+      "owner": "会话管理实践",
+      "repairRoute": "使用 session-analysis/usage-review-packet 对长会话进行语义分类；在完成效率结论之前先对结果进行分类",
+      "severity": "Low",
+      "confidence": "Medium",
+      "dimensionRefs": ["efficiency"],
+      "verifier": "为 S1 和 S2 运行 usage-review-packet；确认任务复杂性以及是否需要分解/工具改进",
+      "category": "Efficiency",
+      "tags": ["session-efficiency", "outcome-review", "complex-tasks"]
+    },
+    {
+      "id": "finding-003",
+      "title": "代理实践资产覆盖有限",
+      "target": "项目级自动化资产建设",
+      "observedConsequence": "项目自定义代理自动化有限：1 个规则 (AGENTS.md)、3 个工作流、0 个自定义代理。主要依赖全局内存和插件而非项目特定的自动化。",
+      "reason": "AGENTS.md 中指定了验证命令但未自动化。安装了 9 个插件但没有用于重复模式的项目范围自定义 Agent。未在会话中观察到特定于项目的技能。",
+      "evidenceChain": [
+        "依赖用户内存'修改功能时主动审查历史代码适配性'通过全局内存强制实施",
+        "AGENTS.md 中指定了构建/验证命令但未自动化",
+        "安装了 9 个插件但未对项目范围内的重复模式创建自定义 Agent",
+        "未在会话中观察到针对项目特定工作流程的技能"
+      ],
+      "owner": "自动化资产建设",
+      "repairRoute": "为标准验证命令创建项目级技能或钩子；考虑为常规迁移任务创建自定义 Agent",
+      "severity": "Low",
+      "confidence": "High",
+      "dimensionRefs": ["control"],
+      "verifier": "为'post-change 验证'添加 cargo build --all-targets && cargo test --all'技能；在后续会话中验证调用",
+      "category": "Automation",
+      "tags": ["agent-assets", "automation", "skills"]
+    }
+  ]
+}

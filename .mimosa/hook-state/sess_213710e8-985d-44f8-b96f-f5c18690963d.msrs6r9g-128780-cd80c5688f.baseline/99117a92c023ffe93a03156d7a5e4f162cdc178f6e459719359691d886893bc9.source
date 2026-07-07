@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"fn":["extract_hash","make_marker"],"struct":["CcrEntry","InMemoryCcrStore"],"trait":["CcrStore"]};

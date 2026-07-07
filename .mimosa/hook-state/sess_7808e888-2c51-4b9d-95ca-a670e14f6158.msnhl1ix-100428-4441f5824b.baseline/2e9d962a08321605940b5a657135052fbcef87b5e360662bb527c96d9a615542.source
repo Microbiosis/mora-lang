@@ -1,0 +1,100 @@
+[package]
+name = "mora"
+version = "0.0.53"
+# v0.x 升级 ureq 3.3.0 → edition 2024 (ureq 3.3.0 要求 edition 2024 + MSRV 1.85)
+edition = "2024"
+# v0.51: build.rs 注入 MORAGIT_VERSION 给编译期 env!() 用
+build = "build.rs"
+authors = ["Mora contributors"]
+description = "An AI-native scripting language with streaming, tool calling, memory, routing, agent orchestration, and token budgeting"
+license = "BSD-3-Clause"
+keywords = ["scripting", "ai", "workflow", "lua-style", "ai-native"]
+categories = ["development-tools", "parser-implementations"]
+
+[lib]
+name = "mora"
+path = "src/lib.rs"
+
+[[bin]]
+name = "mora"
+path = "src/main.rs"
+
+[[bin]]
+name = "mora-lsp"
+path = "src/bin/lsp.rs"
+
+# v0.04: 删除 mora-mcp 和 mora-serve 二进制
+# 单二进制 mora 根据脚本内 `serve as mcp/http` 块自动选择协议
+
+[dependencies]
+# v0.36: crossbeam-channel for Send/Sync Interpreter (replaces std::sync::mpsc
+# in worker_channels/worker_receivers; Sender/Receiver both Clone + Send).
+crossbeam-channel = "0.5"
+# v10 首次外部依赖：ureq 同步 HTTP 客户端
+# 选择 ureq 而非 reqwest 的理由：ureq 同步阻塞，与同步解释器天然契合
+# 不引入 tokio 等 async runtime
+# 注意：v9 零依赖承诺被打破，但守住"不引入 async runtime"的红线
+# v0.x 升级 ureq 2.12 → 3.3
+# 重大变化:
+#   - AgentBuilder 重写,超时改用 ConfigBuilder.timeout_global
+#   - Error 枚举:Status(u16, Response) → StatusCode(u16) + 多种细粒度变体 (#[non_exhaustive])
+#   - Response::into_string() 移除,改用 .body_mut().read_to_string()
+#   - 升级到 edition 2024 + MSRV 1.85
+ureq = "3.3"
+# v0.11: libc 用于设置 SO_REUSEADDR（避免 TIME_WAIT 端口占用）
+# 选择 libc 而非 socket2 的理由：libc 是 Rust 几乎必备的 stdlib-like 包，
+# 体积小（编译期常量），且 ureq 自身已经间接依赖 libc
+# extra_traits feature 提供 SOL_SOCKET / SO_REUSEADDR 等常量
+libc = { version = "0.2", features = ["extra_traits"] }
+# v0.22: flate2 用于录制文件压缩存储
+flate2 = "1.1"
+parking_lot = "0.12"
+# v0.50.0 (P0-B): tokio async runtime for HTTP/MCP server layers
+# rt-multi-thread: multi-threaded runtime
+# macros: #[tokio::main] support
+# net: tokio::net::TcpListener
+# time: tokio::time::timeout
+# sync: tokio::sync::RwLock, Mutex, Semaphore
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "io-util", "io-std"] }
+# v0.42.1: sha2 for SHA-256 hash chain in AuditSink (audit.jsonl)
+sha2 = "0.10"
+# v0.28: Office (PPTX/DOCX) + Image OCR backends (all pure Rust)
+# v0.76.09: 升级 undoc 0.5 → 0.8（跨 3 major——Mora 仅用 DocxParser/PptxParser/Block::Paragraph，
+# 这些 API 在 0.5→0.8 路径稳定——ErrorKind/CleanupOptions/Table 渲染变更对 Mora 无影响）
+undoc = { version = "0.8", default-features = false, features = ["docx", "pptx"] }
+ocrs = "0.12"
+# v0.28 Task 6: ocrs does not re-export `rten`, but `OcrEngine::new` requires
+# pre-loaded `rten::Model` instances for the detection + recognition models.
+# We pull rten directly so we can call `rten::Model::load_static_slice` on
+# the `.rten` model files we vendor in `tests/fixtures/`. Pinned to match
+# the version of rten that ocrs 0.12.2 already pulls in transitively.
+rten = "0.24"
+# v0.28 Task 6: ocrs's public API returns `anyhow::Result<T>` everywhere,
+# but ocrs does not re-export `anyhow` itself — so we depend on it directly
+# to spell out the `OnceLock<anyhow::Result<OcrEngine>>` type and to
+# construct an `anyhow::Result` in `get_or_init`.
+anyhow = "1"
+image = { version = "0.24", default-features = false, features = ["png"] }
+# v0.27: Document 统一 IR
+# PDF 后端
+# v0.76.08: 升级 lopdf 0.42 → 0.44（Mimosa P2 评估级——minor 跳，零跨 major 风险）
+lopdf = "0.44"
+pdf-extract = "0.12"
+# Markdown 后端
+pulldown-cmark = "0.13"
+# HTML 后端
+# v0.76.07: 升级 quick-xml ≥ 0.41（Mimosa 扫描：2 个 HIGH CVE 修复）
+quick-xml = "0.41"
+# v0.50: Checkpoint persistence (Worker 3)
+uuid = { version = "1", features = ["v4"] }
+rusqlite = { version = "0.32", optional = true, features = ["bundled"] }
+
+[dev-dependencies]
+# v0.53: property-based testing for formal semantics verification
+proptest = "1.7"
+
+[features]
+checkpoint-sqlite = ["rusqlite"]
+# v0.75.43: copy-and-patch JIT 零外部依赖（纯 std + 手写机器码模板），
+# 无 feature gate — 始终编译，未覆盖指令自动回落 MIR 解释器。
+# （v0.75.34 前的 jit = ["dep:inkwell"] LLVM 路线已废弃删除。）

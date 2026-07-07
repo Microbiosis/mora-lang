@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"mod":["env","error","generalize","unify"],"struct":["ClosureSig","HMInference"]};

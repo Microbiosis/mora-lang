@@ -1,0 +1,61 @@
+{
+  "schemaVersion": "mimosa-finding-history/v1",
+  "runId": "20260814T073123815Z-139004-4f3e01777cd1",
+  "runStatus": "inconclusive",
+  "errors": [
+    "candidate-select:src/runtime/types.rs: candidate_limit_exceeded: 2 changed reviewable file(s) were not scanned because the limit is 20",
+    "scan:src/document/backend/image.rs: scanner_failed: spawnSync D:\\nodejs\\node.exe ETIMEDOUT",
+    "scan:src/compress/text.rs: scanner_failed: spawnSync D:\\nodejs\\node.exe ETIMEDOUT",
+    "scan:src/value.rs: scanner_failed: spawnSync D:\\nodejs\\node.exe ETIMEDOUT",
+    "scan:src/mir/mod.rs: scanner_failed: spawnSync D:\\nodejs\\node.exe ETIMEDOUT",
+    "scan:src/parser_v3/mod.rs: scanner_failed: spawnSync D:\\nodejs\\node.exe ETIMEDOUT",
+    "scan:src/mir/handlers.rs: scanner_failed: spawnSync D:\\nodejs\\node.exe ETIMEDOUT",
+    "scan:src/mir/inst.rs: scanner_failed: spawnSync D:\\nodejs\\node.exe ETIMEDOUT",
+    "scan:src/mir/lower.rs: scanner_failed: spawnSync D:\\nodejs\\node.exe ETIMEDOUT",
+    "scan:src/interpreter/dispatch.rs: scanner_failed: spawnSync D:\\nodejs\\node.exe ETIMEDOUT",
+    "scan:tests/e2e.rs: scanner_failed: spawnSync D:\\nodejs\\node.exe ETIMEDOUT",
+    "scan:src/tea/mod.rs: scanner_failed: spawnSync D:\\nodejs\\node.exe ETIMEDOUT",
+    "scan:src/interpreter/builtins/tea.rs: scanner_failed: spawnSync D:\\nodejs\\node.exe ETIMEDOUT",
+    "scan:tests/tier0_replacement.rs: scanner_failed: spawnSync D:\\nodejs\\node.exe ETIMEDOUT",
+    "scan:src/typeck/dispatch.rs: scanner_failed: spawnSync D:\\nodejs\\node.exe ETIMEDOUT",
+    "scan:src/common/trait_info.rs: scanner_failed: spawnSync D:\\nodejs\\node.exe ETIMEDOUT",
+    "scan:src/common/mod.rs: scanner_failed: spawnSync D:\\nodejs\\node.exe ETIMEDOUT",
+    "scan:src/mir/host.rs: scanner_failed: spawnSync D:\\nodejs\\node.exe ETIMEDOUT",
+    "scan:src/interpreter/mod.rs: scanner_failed: spawnSync D:\\nodejs\\node.exe ETIMEDOUT",
+    "scan:src/runtime/registry.rs: scanner_failed: spawnSync D:\\nodejs\\node.exe ETIMEDOUT",
+    "supply-chain-check:.: stop_budget_exhausted: focused supply-chain check was not run before the gate budget"
+  ],
+  "target": ".",
+  "revision": "06d713bebdfc43851417d3652f87c5d22a05f56f",
+  "diffHash": "18e23f57046323824d2fec5086be86f3e9355cbee5c98f43059b0ca0781b3b8d",
+  "rulesVersion": "unavailable",
+  "recordedAt": "2026-08-14T07:31:23.815Z",
+  "timing": {
+    "startedAt": "2026-08-14T07:31:12.435Z",
+    "completedAt": "2026-08-14T07:31:23.815Z",
+    "durationMs": 11380
+  },
+  "tokens": {
+    "input": 0,
+    "output": 0,
+    "total": 0,
+    "modelCalls": 0,
+    "measurement": "known-zero"
+  },
+  "findings": {
+    "total": 0,
+    "bySeverity": {},
+    "byStatus": {}
+  },
+  "coverage": {
+    "status": "partial",
+    "reasonCounts": {
+      "candidate_limit_exceeded": 1,
+      "scanner_failed": 19,
+      "stop_budget_exhausted": 1,
+      "project_check_failed": 21
+    }
+  },
+  "evidenceBoundary": "static_only",
+  "immutableReport": ".mimosa/reports/task-review-sess_ed1e38d0-3662-4b9c-9163-1e336d7eeca7-20260814T073123815Z-139004-4f3e01777cd1.json"
+}

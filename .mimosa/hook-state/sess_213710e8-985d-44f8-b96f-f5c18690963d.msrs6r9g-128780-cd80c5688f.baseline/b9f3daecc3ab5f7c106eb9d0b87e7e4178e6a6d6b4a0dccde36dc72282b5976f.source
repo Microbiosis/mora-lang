@@ -1,0 +1,151 @@
+//! v0.83: TEA Replay Driver — 从 Recorder 还原 Model 状态。
+//!
+//! 流程：
+//! 1. 加载 Recorder 的 events（按 ts_ms 排序）
+//! 2. 过滤 Msg + StateMutation 事件
+//! 3. 按时间顺序 replay：
+//!    - StateMutation 直接更新 model 字段
+//!    - Msg 触发 update（通过 builtin tea.update 调用）
+//! 4. 返回最终 model + replay warnings
+//!
+//! 注：当前实现是**确定式**（deterministic）replay —— 不调用 update closure，
+//! 直接从 StateMutation diffs 还原 model 状态。完整 update 调用需要 builtin 集成。
+
+use crate::record::{Event, Recorder};
+use crate::tea::{Msg, TeaApp};
+use crate::value::Value;
+
+pub struct ReplayResult {
+    pub final_model: Value,
+    pub msg_count: usize,
+    pub mutation_count: usize,
+    pub warnings: Vec<String>,
+}
+
+/// v0.83: 从 Recorder 还原 Model 状态（确定式）。
+///
+/// 流程：
+/// 1. 遍历 Recorder 的 events
+/// 2. 对每个 StateMutation { var, new }：在 model 字典中设置 var = new
+/// 3. 对每个 Msg：记录到 result 但不调用 update（占位 — 完整 update 需要 builtin 集成）
+///
+/// 后续 commit：实现完整 update 调用链（Step 5 完成后可启用）。
+pub fn replay_tea_app(app: &TeaApp, recorder: &Recorder) -> ReplayResult {
+    let mut result = ReplayResult {
+        final_model: app.model(),
+        msg_count: 0,
+        mutation_count: 0,
+        warnings: Vec::new(),
+    };
+
+    for ev in recorder.events() {
+        match ev {
+            Event::StateMutation { var, new, .. } => {
+                let mut model = result.final_model.clone();
+                if let Value::Dict(ref mut map) = model {
+                    map.insert(var.clone(), new.clone());
+                } else {
+                    // model 不是 Dict —— 警告但继续
+                    result.warnings.push(format!(
+                        "replay: model is not Dict (got {:?}), cannot apply mutation to var '{}'",
+                        model, var
+                    ));
+                    continue;
+                }
+                result.final_model = model;
+                result.mutation_count += 1;
+            }
+            Event::Msg { channel, payload, .. } => {
+                result.msg_count += 1;
+                // 尝试把 Msg dispatch 到 TeaApp
+                match Msg::from_value(payload) {
+                    Ok(msg) => app.dispatch(msg),
+                    Err(e) => result.warnings.push(format!(
+                        "replay: failed to parse Msg payload on channel '{}': {}",
+                        channel, e
+                    )),
+                }
+            }
+            _ => {} // 忽略 AiChat/WebFetch/Note 事件
+        }
+    }
+
+    result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::record::Recorder;
+    use std::env;
+    use std::fs;
+    use std::path::PathBuf;
+
+    fn tmp_path(name: &str) -> PathBuf {
+        let mut p = env::temp_dir();
+        p.push(format!(
+            "mora_tea_replay_test_{}_{}.jsonl",
+            name,
+            std::process::id()
+        ));
+        p
+    }
+
+    #[test]
+    fn replay_applies_state_mutations() {
+        let app = TeaApp::new(Value::Nil, Value::Nil, Value::Nil);
+        let mut model = std::collections::HashMap::new();
+        model.insert("count".to_string(), Value::Int(0));
+        app.set_model(Value::Dict(model));
+
+        let path = tmp_path("state_mut");
+        let mut r = Recorder::new_record(path.clone()).unwrap();
+        r.record_state_mutation(
+            "count".to_string(),
+            Value::Int(0),
+            Value::Int(42),
+        );
+        r.save().unwrap();
+        let r2 = Recorder::new_replay(path.clone()).unwrap();
+        let result = replay_tea_app(&app, &r2);
+        assert_eq!(result.mutation_count, 1);
+        match result.final_model {
+            Value::Dict(map) => {
+                // v0.83: JSON roundtrip 把 Int 变成 Float（value_to_json 用 f64）
+                assert_eq!(map.get("count"), Some(&Value::Float(42.0)));
+            }
+            _ => panic!("expected Dict model"),
+        }
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn replay_dispatches_msgs() {
+        let app = TeaApp::new(Value::Nil, Value::Nil, Value::Nil);
+        let path = tmp_path("msgs");
+        let mut r = Recorder::new_record(path.clone()).unwrap();
+        let mut payload = std::collections::HashMap::new();
+        payload.insert("tag".to_string(), Value::String("Inc".to_string()));
+        r.record_msg(
+            "user".to_string(),
+            Value::Dict(payload),
+            0,
+        );
+        r.save().unwrap();
+        let r2 = Recorder::new_replay(path.clone()).unwrap();
+        let result = replay_tea_app(&app, &r2);
+        assert_eq!(result.msg_count, 1);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn replay_handles_empty_recorder() {
+        let app = TeaApp::new(Value::Nil, Value::Nil, Value::Nil);
+        app.set_model(Value::Int(42));
+        let r = Recorder::new_off();
+        let result = replay_tea_app(&app, &r);
+        assert_eq!(result.mutation_count, 0);
+        assert_eq!(result.msg_count, 0);
+        assert_eq!(result.final_model, Value::Int(42));
+    }
+}

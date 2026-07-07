@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"fn":["parse_change_params","parse_doc_params"],"struct":["Diagnostic","DocumentState","Server"]};

@@ -1,0 +1,59 @@
+{
+  "schemaVersion": "mimosa-finding-history/v1",
+  "runId": "20260811T081035374Z-110764-b331d9115e70",
+  "runStatus": "inconclusive",
+  "errors": [
+    "candidate-select:src/typeck/imports.rs: candidate_limit_exceeded: 9 changed reviewable file(s) were not scanned because the limit is 20",
+    "scan:src/mir/effect.rs: scanner_failed: spawnSync D:\\nodejs\\node.exe ETIMEDOUT",
+    "scan:src/mir/mod.rs: scanner_failed: spawnSync D:\\nodejs\\node.exe ETIMEDOUT",
+    "scan:src/value/persistent.rs: scanner_failed: spawnSync D:\\nodejs\\node.exe ETIMEDOUT",
+    "scan:src/value.rs: scanner_failed: spawnSync D:\\nodejs\\node.exe ETIMEDOUT",
+    "scan:src/mir/lower.rs: scanner_failed: spawnSync D:\\nodejs\\node.exe ETIMEDOUT",
+    "scan:src/mir/ssa/deconstruct.rs: scanner_failed: spawnSync D:\\nodejs\\node.exe ETIMEDOUT",
+    "scan:src/mir/handlers.rs: scanner_failed: spawnSync D:\\nodejs\\node.exe ETIMEDOUT",
+    "scan:src/mir/dag.rs: scanner_failed: spawnSync D:\\nodejs\\node.exe ETIMEDOUT",
+    "scan:src/interpreter/mod.rs: scanner_failed: spawnSync D:\\nodejs\\node.exe ETIMEDOUT",
+    "scan:src/pregel/mod.rs: scanner_failed: spawnSync D:\\nodejs\\node.exe ETIMEDOUT",
+    "scan:src/parser_v3/mod.rs: scanner_failed: spawnSync D:\\nodejs\\node.exe ETIMEDOUT",
+    "scan:src/mir/vm.rs: scanner_failed: spawnSync D:\\nodejs\\node.exe ETIMEDOUT",
+    "scan:tests/tier0_replacement.rs: scanner_failed: spawnSync D:\\nodejs\\node.exe ETIMEDOUT",
+    "scan:tests/orchestrate_v3_pipeline.rs: scanner_failed: spawnSync D:\\nodejs\\node.exe ETIMEDOUT",
+    "scan:tests/jit_compile.rs: scanner_failed: spawnSync D:\\nodejs\\node.exe ETIMEDOUT",
+    "scan:examples/jit_bench.rs: scanner_failed: spawnSync D:\\nodejs\\node.exe ETIMEDOUT",
+    "scan:src/flow.rs: scanner_failed: spawnSync D:\\nodejs\\node.exe ETIMEDOUT",
+    "supply-chain-check:.: stop_budget_exhausted: focused supply-chain check was not run before the gate budget"
+  ],
+  "target": ".",
+  "revision": "321a9e53b0a0e9da73aed45b897ccd3dd9c38c71",
+  "diffHash": "712f9542e2c53c48f0126630f0c87e1a429f2fbae3ef3305de34f620eb7a3193",
+  "rulesVersion": "unavailable",
+  "recordedAt": "2026-08-11T08:10:35.374Z",
+  "timing": {
+    "startedAt": "2026-08-11T08:10:28.313Z",
+    "completedAt": "2026-08-11T08:10:35.374Z",
+    "durationMs": 7061
+  },
+  "tokens": {
+    "input": 0,
+    "output": 0,
+    "total": 0,
+    "modelCalls": 0,
+    "measurement": "known-zero"
+  },
+  "findings": {
+    "total": 0,
+    "bySeverity": {},
+    "byStatus": {}
+  },
+  "coverage": {
+    "status": "partial",
+    "reasonCounts": {
+      "candidate_limit_exceeded": 1,
+      "scanner_failed": 17,
+      "stop_budget_exhausted": 1,
+      "project_check_failed": 19
+    }
+  },
+  "evidenceBoundary": "static_only",
+  "immutableReport": ".mimosa/reports/task-review-sess_05e367be-3429-4b26-ac30-c9bf7bb39867-20260811T081035374Z-110764-b331d9115e70.json"
+}

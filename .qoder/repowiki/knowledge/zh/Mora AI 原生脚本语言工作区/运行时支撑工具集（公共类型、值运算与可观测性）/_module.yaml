@@ -1,0 +1,10 @@
+schema_version: 1
+module_path: support_utils
+title: 运行时支撑工具集（公共类型、值运算与可观测性）
+scope:
+    - src/common.rs
+    - src/flow.rs
+    - src/trace_collector.rs
+source_files: []
+depends_on: []
+related_to: []

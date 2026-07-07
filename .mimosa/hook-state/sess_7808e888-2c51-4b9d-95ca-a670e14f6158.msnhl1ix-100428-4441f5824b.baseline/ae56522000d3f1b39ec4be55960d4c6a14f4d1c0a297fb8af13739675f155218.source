@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"fn":["matches"],"struct":["EventBus"],"type":["Handler","Pattern"]};

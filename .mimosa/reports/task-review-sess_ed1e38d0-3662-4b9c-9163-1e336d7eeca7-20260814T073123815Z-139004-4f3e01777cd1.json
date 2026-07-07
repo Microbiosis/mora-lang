@@ -1,0 +1,860 @@
+{
+  "schema_version": "mimosa-task-review/v2",
+  "run_id": "20260814T073123815Z-139004-4f3e01777cd1",
+  "run_status": "inconclusive",
+  "errors": [
+    {
+      "stage": "candidate-select",
+      "target": "src/runtime/types.rs",
+      "reason": "candidate_limit_exceeded: 2 changed reviewable file(s) were not scanned because the limit is 20"
+    },
+    {
+      "stage": "scan",
+      "target": "src/document/backend/image.rs",
+      "reason": "scanner_failed: spawnSync D:\\nodejs\\node.exe ETIMEDOUT"
+    },
+    {
+      "stage": "scan",
+      "target": "src/compress/text.rs",
+      "reason": "scanner_failed: spawnSync D:\\nodejs\\node.exe ETIMEDOUT"
+    },
+    {
+      "stage": "scan",
+      "target": "src/value.rs",
+      "reason": "scanner_failed: spawnSync D:\\nodejs\\node.exe ETIMEDOUT"
+    },
+    {
+      "stage": "scan",
+      "target": "src/mir/mod.rs",
+      "reason": "scanner_failed: spawnSync D:\\nodejs\\node.exe ETIMEDOUT"
+    },
+    {
+      "stage": "scan",
+      "target": "src/parser_v3/mod.rs",
+      "reason": "scanner_failed: spawnSync D:\\nodejs\\node.exe ETIMEDOUT"
+    },
+    {
+      "stage": "scan",
+      "target": "src/mir/handlers.rs",
+      "reason": "scanner_failed: spawnSync D:\\nodejs\\node.exe ETIMEDOUT"
+    },
+    {
+      "stage": "scan",
+      "target": "src/mir/inst.rs",
+      "reason": "scanner_failed: spawnSync D:\\nodejs\\node.exe ETIMEDOUT"
+    },
+    {
+      "stage": "scan",
+      "target": "src/mir/lower.rs",
+      "reason": "scanner_failed: spawnSync D:\\nodejs\\node.exe ETIMEDOUT"
+    },
+    {
+      "stage": "scan",
+      "target": "src/interpreter/dispatch.rs",
+      "reason": "scanner_failed: spawnSync D:\\nodejs\\node.exe ETIMEDOUT"
+    },
+    {
+      "stage": "scan",
+      "target": "tests/e2e.rs",
+      "reason": "scanner_failed: spawnSync D:\\nodejs\\node.exe ETIMEDOUT"
+    },
+    {
+      "stage": "scan",
+      "target": "src/tea/mod.rs",
+      "reason": "scanner_failed: spawnSync D:\\nodejs\\node.exe ETIMEDOUT"
+    },
+    {
+      "stage": "scan",
+      "target": "src/interpreter/builtins/tea.rs",
+      "reason": "scanner_failed: spawnSync D:\\nodejs\\node.exe ETIMEDOUT"
+    },
+    {
+      "stage": "scan",
+      "target": "tests/tier0_replacement.rs",
+      "reason": "scanner_failed: spawnSync D:\\nodejs\\node.exe ETIMEDOUT"
+    },
+    {
+      "stage": "scan",
+      "target": "src/typeck/dispatch.rs",
+      "reason": "scanner_failed: spawnSync D:\\nodejs\\node.exe ETIMEDOUT"
+    },
+    {
+      "stage": "scan",
+      "target": "src/common/trait_info.rs",
+      "reason": "scanner_failed: spawnSync D:\\nodejs\\node.exe ETIMEDOUT"
+    },
+    {
+      "stage": "scan",
+      "target": "src/common/mod.rs",
+      "reason": "scanner_failed: spawnSync D:\\nodejs\\node.exe ETIMEDOUT"
+    },
+    {
+      "stage": "scan",
+      "target": "src/mir/host.rs",
+      "reason": "scanner_failed: spawnSync D:\\nodejs\\node.exe ETIMEDOUT"
+    },
+    {
+      "stage": "scan",
+      "target": "src/interpreter/mod.rs",
+      "reason": "scanner_failed: spawnSync D:\\nodejs\\node.exe ETIMEDOUT"
+    },
+    {
+      "stage": "scan",
+      "target": "src/runtime/registry.rs",
+      "reason": "scanner_failed: spawnSync D:\\nodejs\\node.exe ETIMEDOUT"
+    },
+    {
+      "stage": "supply-chain-check",
+      "target": ".",
+      "reason": "stop_budget_exhausted: focused supply-chain check was not run before the gate budget"
+    }
+  ],
+  "coverage": {
+    "schema_version": "mimosa-hook-coverage/v1",
+    "status": "partial",
+    "scope": "hook_observed_diff",
+    "baseline": {
+      "complete": true,
+      "captured_files": 524,
+      "candidate_limit": 5000,
+      "truncated": false,
+      "enumeration_error_count": 0,
+      "snapshot_error_count": 0,
+      "compensated_target_count": 22
+    },
+    "change_tracking": {
+      "touched_observed": 21,
+      "touched_retained": 21,
+      "truncated": false,
+      "bash_mutation": true,
+      "bash_discovered": 22,
+      "bash_discovery_limit": 80,
+      "bash_discovery_truncated": false
+    },
+    "candidates": {
+      "eligible_files": 22,
+      "selected_files": 20,
+      "limit": 20,
+      "truncated": true
+    },
+    "scanning": {
+      "required_files": 19,
+      "scanned_files": 0,
+      "skipped_files": 0,
+      "failed_files": 19,
+      "project_checks_required": 1,
+      "project_checks_completed": 0
+    },
+    "notification": {
+      "eligible_findings": 0,
+      "detailed_findings": 0,
+      "detail_limit": 3,
+      "truncated": false
+    },
+    "reason_counts": {
+      "candidate_limit_exceeded": 1,
+      "scanner_failed": 19,
+      "stop_budget_exhausted": 1,
+      "project_check_failed": 21
+    },
+    "reasons": [
+      {
+        "code": "candidate_limit_exceeded",
+        "stage": "candidate-select",
+        "target": "src/runtime/types.rs",
+        "detail": "2 changed reviewable file(s) were not scanned because the limit is 20",
+        "affects_completion": true
+      },
+      {
+        "code": "scanner_failed",
+        "stage": "scan",
+        "target": "src/document/backend/image.rs",
+        "detail": "spawnSync D:\\nodejs\\node.exe ETIMEDOUT",
+        "affects_completion": true
+      },
+      {
+        "code": "scanner_failed",
+        "stage": "scan",
+        "target": "src/compress/text.rs",
+        "detail": "spawnSync D:\\nodejs\\node.exe ETIMEDOUT",
+        "affects_completion": true
+      },
+      {
+        "code": "scanner_failed",
+        "stage": "scan",
+        "target": "src/value.rs",
+        "detail": "spawnSync D:\\nodejs\\node.exe ETIMEDOUT",
+        "affects_completion": true
+      },
+      {
+        "code": "scanner_failed",
+        "stage": "scan",
+        "target": "src/mir/mod.rs",
+        "detail": "spawnSync D:\\nodejs\\node.exe ETIMEDOUT",
+        "affects_completion": true
+      },
+      {
+        "code": "scanner_failed",
+        "stage": "scan",
+        "target": "src/parser_v3/mod.rs",
+        "detail": "spawnSync D:\\nodejs\\node.exe ETIMEDOUT",
+        "affects_completion": true
+      },
+      {
+        "code": "scanner_failed",
+        "stage": "scan",
+        "target": "src/mir/handlers.rs",
+        "detail": "spawnSync D:\\nodejs\\node.exe ETIMEDOUT",
+        "affects_completion": true
+      },
+      {
+        "code": "scanner_failed",
+        "stage": "scan",
+        "target": "src/mir/inst.rs",
+        "detail": "spawnSync D:\\nodejs\\node.exe ETIMEDOUT",
+        "affects_completion": true
+      },
+      {
+        "code": "scanner_failed",
+        "stage": "scan",
+        "target": "src/mir/lower.rs",
+        "detail": "spawnSync D:\\nodejs\\node.exe ETIMEDOUT",
+        "affects_completion": true
+      },
+      {
+        "code": "scanner_failed",
+        "stage": "scan",
+        "target": "src/interpreter/dispatch.rs",
+        "detail": "spawnSync D:\\nodejs\\node.exe ETIMEDOUT",
+        "affects_completion": true
+      },
+      {
+        "code": "scanner_failed",
+        "stage": "scan",
+        "target": "tests/e2e.rs",
+        "detail": "spawnSync D:\\nodejs\\node.exe ETIMEDOUT",
+        "affects_completion": true
+      },
+      {
+        "code": "scanner_failed",
+        "stage": "scan",
+        "target": "src/tea/mod.rs",
+        "detail": "spawnSync D:\\nodejs\\node.exe ETIMEDOUT",
+        "affects_completion": true
+      },
+      {
+        "code": "scanner_failed",
+        "stage": "scan",
+        "target": "src/interpreter/builtins/tea.rs",
+        "detail": "spawnSync D:\\nodejs\\node.exe ETIMEDOUT",
+        "affects_completion": true
+      },
+      {
+        "code": "scanner_failed",
+        "stage": "scan",
+        "target": "tests/tier0_replacement.rs",
+        "detail": "spawnSync D:\\nodejs\\node.exe ETIMEDOUT",
+        "affects_completion": true
+      },
+      {
+        "code": "scanner_failed",
+        "stage": "scan",
+        "target": "src/typeck/dispatch.rs",
+        "detail": "spawnSync D:\\nodejs\\node.exe ETIMEDOUT",
+        "affects_completion": true
+      },
+      {
+        "code": "scanner_failed",
+        "stage": "scan",
+        "target": "src/common/trait_info.rs",
+        "detail": "spawnSync D:\\nodejs\\node.exe ETIMEDOUT",
+        "affects_completion": true
+      },
+      {
+        "code": "scanner_failed",
+        "stage": "scan",
+        "target": "src/common/mod.rs",
+        "detail": "spawnSync D:\\nodejs\\node.exe ETIMEDOUT",
+        "affects_completion": true
+      },
+      {
+        "code": "scanner_failed",
+        "stage": "scan",
+        "target": "src/mir/host.rs",
+        "detail": "spawnSync D:\\nodejs\\node.exe ETIMEDOUT",
+        "affects_completion": true
+      },
+      {
+        "code": "scanner_failed",
+        "stage": "scan",
+        "target": "src/interpreter/mod.rs",
+        "detail": "spawnSync D:\\nodejs\\node.exe ETIMEDOUT",
+        "affects_completion": true
+      },
+      {
+        "code": "scanner_failed",
+        "stage": "scan",
+        "target": "src/runtime/registry.rs",
+        "detail": "spawnSync D:\\nodejs\\node.exe ETIMEDOUT",
+        "affects_completion": true
+      },
+      {
+        "code": "stop_budget_exhausted",
+        "stage": "supply-chain-check",
+        "target": ".",
+        "detail": "focused supply-chain check was not run before the gate budget",
+        "affects_completion": true
+      },
+      {
+        "code": "project_check_failed",
+        "stage": "candidate-select",
+        "target": "src/runtime/types.rs",
+        "detail": "candidate_limit_exceeded: 2 changed reviewable file(s) were not scanned because the limit is 20",
+        "affects_completion": true
+      },
+      {
+        "code": "project_check_failed",
+        "stage": "scan",
+        "target": "src/document/backend/image.rs",
+        "detail": "scanner_failed: spawnSync D:\\nodejs\\node.exe ETIMEDOUT",
+        "affects_completion": true
+      },
+      {
+        "code": "project_check_failed",
+        "stage": "scan",
+        "target": "src/compress/text.rs",
+        "detail": "scanner_failed: spawnSync D:\\nodejs\\node.exe ETIMEDOUT",
+        "affects_completion": true
+      },
+      {
+        "code": "project_check_failed",
+        "stage": "scan",
+        "target": "src/value.rs",
+        "detail": "scanner_failed: spawnSync D:\\nodejs\\node.exe ETIMEDOUT",
+        "affects_completion": true
+      },
+      {
+        "code": "project_check_failed",
+        "stage": "scan",
+        "target": "src/mir/mod.rs",
+        "detail": "scanner_failed: spawnSync D:\\nodejs\\node.exe ETIMEDOUT",
+        "affects_completion": true
+      },
+      {
+        "code": "project_check_failed",
+        "stage": "scan",
+        "target": "src/parser_v3/mod.rs",
+        "detail": "scanner_failed: spawnSync D:\\nodejs\\node.exe ETIMEDOUT",
+        "affects_completion": true
+      },
+      {
+        "code": "project_check_failed",
+        "stage": "scan",
+        "target": "src/mir/handlers.rs",
+        "detail": "scanner_failed: spawnSync D:\\nodejs\\node.exe ETIMEDOUT",
+        "affects_completion": true
+      },
+      {
+        "code": "project_check_failed",
+        "stage": "scan",
+        "target": "src/mir/inst.rs",
+        "detail": "scanner_failed: spawnSync D:\\nodejs\\node.exe ETIMEDOUT",
+        "affects_completion": true
+      },
+      {
+        "code": "project_check_failed",
+        "stage": "scan",
+        "target": "src/mir/lower.rs",
+        "detail": "scanner_failed: spawnSync D:\\nodejs\\node.exe ETIMEDOUT",
+        "affects_completion": true
+      },
+      {
+        "code": "project_check_failed",
+        "stage": "scan",
+        "target": "src/interpreter/dispatch.rs",
+        "detail": "scanner_failed: spawnSync D:\\nodejs\\node.exe ETIMEDOUT",
+        "affects_completion": true
+      },
+      {
+        "code": "project_check_failed",
+        "stage": "scan",
+        "target": "tests/e2e.rs",
+        "detail": "scanner_failed: spawnSync D:\\nodejs\\node.exe ETIMEDOUT",
+        "affects_completion": true
+      },
+      {
+        "code": "project_check_failed",
+        "stage": "scan",
+        "target": "src/tea/mod.rs",
+        "detail": "scanner_failed: spawnSync D:\\nodejs\\node.exe ETIMEDOUT",
+        "affects_completion": true
+      },
+      {
+        "code": "project_check_failed",
+        "stage": "scan",
+        "target": "src/interpreter/builtins/tea.rs",
+        "detail": "scanner_failed: spawnSync D:\\nodejs\\node.exe ETIMEDOUT",
+        "affects_completion": true
+      },
+      {
+        "code": "project_check_failed",
+        "stage": "scan",
+        "target": "tests/tier0_replacement.rs",
+        "detail": "scanner_failed: spawnSync D:\\nodejs\\node.exe ETIMEDOUT",
+        "affects_completion": true
+      },
+      {
+        "code": "project_check_failed",
+        "stage": "scan",
+        "target": "src/typeck/dispatch.rs",
+        "detail": "scanner_failed: spawnSync D:\\nodejs\\node.exe ETIMEDOUT",
+        "affects_completion": true
+      },
+      {
+        "code": "project_check_failed",
+        "stage": "scan",
+        "target": "src/common/trait_info.rs",
+        "detail": "scanner_failed: spawnSync D:\\nodejs\\node.exe ETIMEDOUT",
+        "affects_completion": true
+      },
+      {
+        "code": "project_check_failed",
+        "stage": "scan",
+        "target": "src/common/mod.rs",
+        "detail": "scanner_failed: spawnSync D:\\nodejs\\node.exe ETIMEDOUT",
+        "affects_completion": true
+      },
+      {
+        "code": "project_check_failed",
+        "stage": "scan",
+        "target": "src/mir/host.rs",
+        "detail": "scanner_failed: spawnSync D:\\nodejs\\node.exe ETIMEDOUT",
+        "affects_completion": true
+      },
+      {
+        "code": "project_check_failed",
+        "stage": "scan",
+        "target": "src/interpreter/mod.rs",
+        "detail": "scanner_failed: spawnSync D:\\nodejs\\node.exe ETIMEDOUT",
+        "affects_completion": true
+      },
+      {
+        "code": "project_check_failed",
+        "stage": "scan",
+        "target": "src/runtime/registry.rs",
+        "detail": "scanner_failed: spawnSync D:\\nodejs\\node.exe ETIMEDOUT",
+        "affects_completion": true
+      },
+      {
+        "code": "project_check_failed",
+        "stage": "supply-chain-check",
+        "target": ".",
+        "detail": "stop_budget_exhausted: focused supply-chain check was not run before the gate budget",
+        "affects_completion": true
+      }
+    ],
+    "reasons_truncated": false
+  },
+  "generated_at": "2026-08-14T07:31:23.815Z",
+  "session_id": "sess_ed1e38d0-3662-4b9c-9163-1e336d7eeca7",
+  "target": ".",
+  "revision": "06d713bebdfc43851417d3652f87c5d22a05f56f",
+  "rules_version": "unavailable",
+  "diff_hash": "18e23f57046323824d2fec5086be86f3e9355cbee5c98f43059b0ca0781b3b8d",
+  "diff": {
+    "algorithm": "sha256",
+    "changed_file_count": 20,
+    "changed_files": [
+      {
+        "file": "Cargo.toml",
+        "ranges": [
+          {
+            "start": 59,
+            "end": 60
+          },
+          {
+            "start": 77,
+            "end": 77
+          }
+        ],
+        "before_hash": "dac305e2c1f004279b418d5c166cbe8929017719d0b40d37ec9bf75bb91a4190",
+        "after_hash": "2359093a36d607ad983de24b1a9c0c870bc85c351b70c8f6045171f6b1e771b5"
+      },
+      {
+        "file": "src/common/mod.rs",
+        "ranges": [
+          {
+            "start": 1,
+            "end": 86
+          }
+        ],
+        "before_hash": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "after_hash": "dfcf528be86a341fd8623eb2a33fd86032c8eb9157c7eb62f85009ab208bbf66"
+      },
+      {
+        "file": "src/common/trait_info.rs",
+        "ranges": [
+          {
+            "start": 1,
+            "end": 63
+          }
+        ],
+        "before_hash": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "after_hash": "8acaf34836e308e9429fa9853f9f707986e82f008b2662c84e85aecba5e65807"
+      },
+      {
+        "file": "src/compress/text.rs",
+        "ranges": [
+          {
+            "start": 20,
+            "end": 21
+          },
+          {
+            "start": 23,
+            "end": 25
+          },
+          {
+            "start": 87,
+            "end": 87
+          },
+          {
+            "start": 89,
+            "end": 92
+          },
+          {
+            "start": 94,
+            "end": 94
+          },
+          {
+            "start": 96,
+            "end": 96
+          },
+          {
+            "start": 98,
+            "end": 98
+          },
+          {
+            "start": 101,
+            "end": 113
+          },
+          {
+            "start": 116,
+            "end": 118
+          },
+          {
+            "start": 126,
+            "end": 183
+          }
+        ],
+        "before_hash": "98979f5886c614211342008a6b2282b2b323c6986c9ca38dd8334c2f8c2ea837",
+        "after_hash": "42318cb4e10678d0f7cb3cfe3eb333dd7ff1a3df5625ccc4cd8696c839eac331"
+      },
+      {
+        "file": "src/document/backend/image.rs",
+        "ranges": [
+          {
+            "start": 42,
+            "end": 42
+          }
+        ],
+        "before_hash": "0dbc72ba7300d78251598b1d2ee34a6a25da5a8a658fc5f28cb33772af0c494b",
+        "after_hash": "54a5d3d9de0b65f2f34101f5ea645cf6af3d18e0aa5316f439d23a0f1dd1ef81"
+      },
+      {
+        "file": "src/interpreter/builtins/tea.rs",
+        "ranges": [
+          {
+            "start": 22,
+            "end": 33
+          },
+          {
+            "start": 35,
+            "end": 35
+          },
+          {
+            "start": 39,
+            "end": 51
+          }
+        ],
+        "before_hash": "fcf1939425584430b33b5cb84d60d57ba2b394c700b60fd139b5e3655845133e",
+        "after_hash": "107c350435fb4e48fe6ef44408c36955f37f0d79ff4950aea68a3e8fdbf85485"
+      },
+      {
+        "file": "src/interpreter/dispatch.rs",
+        "ranges": [
+          {
+            "start": 521,
+            "end": 537
+          }
+        ],
+        "before_hash": "50fbbbab9967e022eb59284aeddc6058d1db271a8d5c16ea0f4359b9e5ce405e",
+        "after_hash": "acffc06a6d8508442c69b12b356d1ec6a9abf431426988bcd87ab1662340e66a"
+      },
+      {
+        "file": "src/interpreter/mod.rs",
+        "ranges": [
+          {
+            "start": 132,
+            "end": 134
+          },
+          {
+            "start": 136,
+            "end": 139
+          }
+        ],
+        "before_hash": "3542ecabcc77e025dcfa937e0193abc00420e8633ff11460d5765db707dd7c54",
+        "after_hash": "ba2f8e17f578deb293de4d01a5155ea8977ec803a86c2e9f58f7056deaf45ab8"
+      },
+      {
+        "file": "src/mir/handlers.rs",
+        "ranges": [
+          {
+            "start": 34,
+            "end": 34
+          },
+          {
+            "start": 332,
+            "end": 347
+          },
+          {
+            "start": 349,
+            "end": 358
+          },
+          {
+            "start": 384,
+            "end": 385
+          },
+          {
+            "start": 535,
+            "end": 540
+          },
+          {
+            "start": 546,
+            "end": 546
+          },
+          {
+            "start": 813,
+            "end": 813
+          },
+          {
+            "start": 849,
+            "end": 849
+          }
+        ],
+        "before_hash": "8d1cd6c562323ac0d291e46037300ced985169f2a87791f48f33fc2bc4f0e26e",
+        "after_hash": "1cb7db40e8c856278f62bda141183bd6f9a3342399894307c686e26bc5324665"
+      },
+      {
+        "file": "src/mir/host.rs",
+        "ranges": [
+          {
+            "start": 18,
+            "end": 18
+          }
+        ],
+        "before_hash": "ff42539c889daf4e21b50a85dd3dfbda6eeea6c62143cf45ef27d3d69d074fc0",
+        "after_hash": "602ed7b91060d734d6b22f04a839299977e83a6e82e89b7f51b30ec79047fb9e"
+      },
+      {
+        "file": "src/mir/inst.rs",
+        "ranges": [
+          {
+            "start": 10,
+            "end": 10
+          },
+          {
+            "start": 520,
+            "end": 529
+          },
+          {
+            "start": 558,
+            "end": 559
+          }
+        ],
+        "before_hash": "f03f928d46a25e1ac3ff423fab47a2d1bf23c187ddd149040f92378ce71baf16",
+        "after_hash": "d1c2577b3c6a38d6007e97f36d40d7752239b0d6f2dd70a4649073dcc945a789"
+      },
+      {
+        "file": "src/mir/lower.rs",
+        "ranges": [
+          {
+            "start": 734,
+            "end": 734
+          },
+          {
+            "start": 738,
+            "end": 743
+          }
+        ],
+        "before_hash": "4ecd54ec87cfae2a468abc13ef5a9c5c476141ef5c8517c3bdf1a2b58b1cb728",
+        "after_hash": "a20b1cb8106734ba147916838e6da71241680ea4174556bfd37b0ea61efbc765"
+      },
+      {
+        "file": "src/mir/mod.rs",
+        "ranges": [
+          {
+            "start": 288,
+            "end": 291
+          },
+          {
+            "start": 295,
+            "end": 295
+          }
+        ],
+        "before_hash": "0c04490925e8570adb196adf2d3c458e942f049a38a290bd01779754709f277c",
+        "after_hash": "42d9b6728ed2f0ed8fecf7c936bc1eb73b087e18d9a591905a5234e3207f60f4"
+      },
+      {
+        "file": "src/parser_v3/mod.rs",
+        "ranges": [
+          {
+            "start": 1477,
+            "end": 1499
+          },
+          {
+            "start": 1503,
+            "end": 1503
+          }
+        ],
+        "before_hash": "1e431e6ec71feb0f37f748b921d0673e90358bb4f20199803431ff9b4ab076a2",
+        "after_hash": "db29b580157dcf9627eb272cecdc7357e754d40e0c8bc644ac805deb71901676"
+      },
+      {
+        "file": "src/runtime/registry.rs",
+        "ranges": [
+          {
+            "start": 9,
+            "end": 9
+          },
+          {
+            "start": 62,
+            "end": 62
+          }
+        ],
+        "before_hash": "c9524470ca4f9d9877b0217c4cd36d98cb715a3625049c5cc7dd073db83b25d7",
+        "after_hash": "aca97e450ac763b703e963444c4804d663653eccc9a76f8e6b0121f6e2e79919"
+      },
+      {
+        "file": "src/tea/mod.rs",
+        "ranges": [
+          {
+            "start": 353,
+            "end": 372
+          }
+        ],
+        "before_hash": "7fd693dab81345d14a56d5540448df2ba399d58ff89973746d042a9b090bc0ed",
+        "after_hash": "3c982ce8f13beb61b421c9e4b9a870ae49d1f04caaf3792651a8b7610259b9f2"
+      },
+      {
+        "file": "src/typeck/dispatch.rs",
+        "ranges": [
+          {
+            "start": 83,
+            "end": 83
+          },
+          {
+            "start": 88,
+            "end": 90
+          },
+          {
+            "start": 92,
+            "end": 92
+          }
+        ],
+        "before_hash": "a51d8e6f9dd1ab6bebfc71a0c1425fcb01b622dc71647ed68bfc909949bdd255",
+        "after_hash": "91ad814e81bb30d361158ae5fd613a9ebc07513ae07143288b79843f47f204db"
+      },
+      {
+        "file": "src/value.rs",
+        "ranges": [
+          {
+            "start": 315,
+            "end": 318
+          },
+          {
+            "start": 322,
+            "end": 322
+          }
+        ],
+        "before_hash": "6d46877fb6268ff72d33974fb4fff341ef59a9dc1a06df5cf3489881663698a0",
+        "after_hash": "cbccdcb4359021ce463dbce3e585044dc9ecc76b07b2269a898212a3626675d2"
+      },
+      {
+        "file": "tests/e2e.rs",
+        "ranges": [
+          {
+            "start": 83,
+            "end": 92
+          },
+          {
+            "start": 149,
+            "end": 149
+          }
+        ],
+        "before_hash": "e0a50754530f224f50a2fd7a9c795563a595f817dc3495f968d537378cdc69d4",
+        "after_hash": "ec70325ab6fc04fac412393a74af9139603c9a112cf11b3598756042634fb3f8"
+      },
+      {
+        "file": "tests/tier0_replacement.rs",
+        "ranges": [
+          {
+            "start": 67,
+            "end": 67
+          }
+        ],
+        "before_hash": "58b1f19829db722a71130aeb31353e85be5ffe0c84ec8fcf3e8709f10470dadf",
+        "after_hash": "5197b69729e80f023bedca5dddd4d1d5e2db30894265bad553a1a2b537b682c5"
+      }
+    ]
+  },
+  "timing": {
+    "started_at": "2026-08-14T07:31:12.435Z",
+    "completed_at": "2026-08-14T07:31:23.815Z",
+    "duration_ms": 11380,
+    "measurement": "hook_wall_clock"
+  },
+  "tokens": {
+    "input": 0,
+    "output": 0,
+    "total": 0,
+    "model_calls": 0,
+    "measurement": "known-zero"
+  },
+  "telemetry": {
+    "schemaVersion": "mimosa-gate-telemetry/v1",
+    "profile": "gate",
+    "operation": "Stop",
+    "outcome": "partial/INCONCLUSIVE",
+    "latencyMs": 11380,
+    "peakMemoryBytes": 92913664,
+    "memoryMeasurement": "max-observed-process-rss",
+    "scannedFiles": 0,
+    "cache": {
+      "hits": 0,
+      "misses": 0,
+      "measurement": "not-applicable"
+    },
+    "denyCount": 0,
+    "tokens": {
+      "input": 0,
+      "output": 0,
+      "total": 0,
+      "modelCalls": 0,
+      "measurement": "known-zero"
+    }
+  },
+  "finding_count": 0,
+  "rewake_finding_count": 0,
+  "evidence_boundary": {
+    "scan": "candidate",
+    "static_fix_verification": "observed_static_only",
+    "runtime_verification": "not_performed"
+  },
+  "finding_events": [],
+  "findings": [],
+  "artifacts": {
+    "immutable_report": ".mimosa/reports/task-review-sess_ed1e38d0-3662-4b9c-9163-1e336d7eeca7-20260814T073123815Z-139004-4f3e01777cd1.json",
+    "latest_report": ".mimosa/reports/task-review-sess_ed1e38d0-3662-4b9c-9163-1e336d7eeca7.json",
+    "history_summary": ".mimosa/history/run-20260814T073123815Z-139004-4f3e01777cd1.json"
+  }
+}

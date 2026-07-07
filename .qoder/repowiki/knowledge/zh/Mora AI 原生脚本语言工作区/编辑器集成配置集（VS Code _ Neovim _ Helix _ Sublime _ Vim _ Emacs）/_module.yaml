@@ -1,0 +1,8 @@
+schema_version: 1
+module_path: editors
+title: 编辑器集成配置集（VS Code / Neovim / Helix / Sublime / Vim / Emacs）
+scope:
+    - editors/
+source_files: []
+depends_on: []
+related_to: []

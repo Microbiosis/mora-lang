@@ -1,0 +1,54 @@
+{
+  "schemaVersion": "mimosa-finding-ledger-batch/v1",
+  "batchId": "stop-20260821T145102797Z-8604-5399cbd1202c",
+  "runId": "20260821T145102797Z-8604-5399cbd1202c",
+  "runStatus": "completed",
+  "coverage": {
+    "status": "complete",
+    "reasons": []
+  },
+  "source": {
+    "component": "zcode-hook",
+    "operationId": "Stop"
+  },
+  "revision": "541ebaec96c96a798e877fb32a850d661ed4f5d5",
+  "diffHash": "2da6812a53e48624f3aea1d7562339721266e4c53a4ae03d316322f12f830bc9",
+  "rulesVersion": "unavailable",
+  "sessionHash": "83c98891dca99f12448d2ee36e88d7396972a0ce75da2769df3715f0e3539e25",
+  "reportRef": ".mimosa/reports/task-review-sess_464ee804-bff8-4a59-950a-c9957dcd87e7-20260821T145102797Z-8604-5399cbd1202c.json",
+  "events": [],
+  "observedFindingIds": [],
+  "verifiedFiles": [
+    {
+      "file": "src/mir/core.rs",
+      "direct": "complete",
+      "projectContext": "partial"
+    },
+    {
+      "file": "src/mir/rir.rs",
+      "direct": "complete",
+      "projectContext": "partial"
+    },
+    {
+      "file": "src/mir/lmir.rs",
+      "direct": "complete",
+      "projectContext": "partial"
+    },
+    {
+      "file": "src/mir/fcfg.rs",
+      "direct": "complete",
+      "projectContext": "partial"
+    },
+    {
+      "file": "src/mir/fcfg_lower.rs",
+      "direct": "complete",
+      "projectContext": "partial"
+    },
+    {
+      "file": "src/typeck/annotate.rs",
+      "direct": "complete",
+      "projectContext": "partial"
+    }
+  ],
+  "recordedAt": "2026-08-21T14:51:03.158Z"
+}

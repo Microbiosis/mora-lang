@@ -1,0 +1,2288 @@
+{
+  "schemaVersion": 1,
+  "kind": "core-change-watch-evidence-pack",
+  "status": "ok",
+  "repoRoot": "D:\\Github\\mora-lang",
+  "generatedAt": "2026-07-28T14:38:48.395Z",
+  "summary": {
+    "reviewRecommended": false,
+    "attentionRequired": false,
+    "diffStatus": "ok",
+    "diffSeverity": "critical",
+    "diffScore": 100,
+    "topLanguages": [
+      "python"
+    ],
+    "projectInfo": {
+      "name": "Mora",
+      "description": "",
+      "readmeTitle": "Mora",
+      "identityEvidence": [
+        "README.md:h1"
+      ],
+      "primaryLanguages": [
+        {
+          "language": "python",
+          "sourceFiles": 0,
+          "testFiles": 1
+        }
+      ],
+      "frameworks": [],
+      "sourceFiles": 0,
+      "testFiles": 1,
+      "measuredSourceLines": null,
+      "sourceLineStatus": "none",
+      "sourceLineMethod": "not measured by default; use --measure-source-lines to count tracked readable primary source files only",
+      "sourceRoots": [],
+      "entryCandidates": []
+    },
+    "agentInstructions": {
+      "status": "none",
+      "count": 0,
+      "rootCount": 0,
+      "nestedCount": 0,
+      "suggestedMinimum": 0,
+      "suggestedAdditional": 0,
+      "sourceFilesPerInstruction": null,
+      "sourceFilesUnderNestedInstructions": 0,
+      "nestedSourceFileCoveragePercent": null,
+      "suggestedScopes": [],
+      "reasons": []
+    },
+    "coreCandidates": {
+      "highConfidence": 0,
+      "mediumConfidence": 0,
+      "candidateCount": 0
+    },
+    "changedFiles": 29,
+    "changedLines": 4315,
+    "companionHits": 2,
+    "changeDrift": {
+      "status": "ok",
+      "findingCount": 0,
+      "typeCounts": {}
+    },
+    "coreCodeRules": {
+      "status": "missing",
+      "includeCount": 0,
+      "excludeCount": 0,
+      "boundaryKind": "inferred-core-boundary"
+    },
+    "historyWindows": [
+      30,
+      90,
+      180
+    ],
+    "historyConfidence": {
+      "confidence": "high",
+      "reasons": [
+        "bounded history has enough commits and time span for hotspot ranking"
+      ]
+    },
+    "frameworks": [],
+    "filtersApplied": false
+  },
+  "filters": {
+    "projectProfile": {
+      "ignorePatterns": [],
+      "ignoredCount": 0,
+      "ignoredSample": []
+    },
+    "historyProfile": {
+      "ignorePatterns": [],
+      "ignoredCount": 0,
+      "ignoredSample": []
+    },
+    "coreAnalysis": {
+      "ignorePatterns": [],
+      "ignoredCount": 0,
+      "ignoredSample": []
+    },
+    "diffImpact": {
+      "ignorePatterns": [],
+      "ignoredCount": 0,
+      "ignoredSample": []
+    }
+  },
+  "evidenceSources": {
+    "boundary": "static-local-git-and-file-analysis",
+    "numericSources": [
+      {
+        "claim": "tracked file, language, manifest, source-root, entrypoint, and framework counts",
+        "source": "projectProfile",
+        "command": "git ls-files -z plus local manifest/path inspection"
+      },
+      {
+        "claim": "hot files, hot paths, co-change paths, and history windows",
+        "source": "historyProfile",
+        "command": "git log -500 --numstat --format=commit... --"
+      },
+      {
+        "claim": "changed files, line counts, configured core boundary hits, hot hits, and companion hits",
+        "source": "diffImpact",
+        "command": "git diff --numstat --no-ext-diff --find-renames HEAD --"
+      },
+      {
+        "claim": "changed API, schema, UI, config, error, and CLI surfaces with missing companion evidence",
+        "source": "changeDrift",
+        "command": "git diff --numstat --no-ext-diff --find-renames HEAD -- plus git ls-files -z"
+      },
+      {
+        "claim": "history day windows",
+        "source": "summary.historyWindows",
+        "command": "bounded history windows: 30,90,180"
+      }
+    ],
+    "unverifiedClaims": [
+      {
+        "claim": "tests passed",
+        "status": "UNVERIFIED",
+        "reason": "core-change-watch does not run target project tests"
+      },
+      {
+        "claim": "CI status",
+        "status": "UNVERIFIED",
+        "reason": "core-change-watch does not open external CI systems"
+      },
+      {
+        "claim": "runtime behavior",
+        "status": "UNVERIFIED",
+        "reason": "core-change-watch does not execute the target application"
+      }
+    ]
+  },
+  "projectProfile": {
+    "schemaVersion": 1,
+    "kind": "project-profile",
+    "status": "ok",
+    "repoRoot": "D:\\Github\\mora-lang",
+    "filters": {
+      "ignorePatterns": [],
+      "ignoredCount": 0,
+      "ignoredSample": []
+    },
+    "projectInfo": {
+      "name": "Mora",
+      "description": "",
+      "readmeTitle": "Mora",
+      "evidence": [
+        "README.md:h1"
+      ],
+      "primaryLanguages": [
+        {
+          "language": "python",
+          "sourceFiles": 0,
+          "testFiles": 1
+        }
+      ],
+      "frameworks": [],
+      "sourceFiles": 0,
+      "testFiles": 1,
+      "measuredSourceLines": null,
+      "sourceLineStatus": "none",
+      "sourceLineMethod": "not measured by default; use --measure-source-lines to count tracked readable primary source files only",
+      "sourceRoots": [],
+      "entryCandidates": [],
+      "manifests": [
+        {
+          "path": "Cargo.toml",
+          "kind": "toml",
+          "scripts": []
+        },
+        {
+          "path": "editors/vscode/package.json",
+          "kind": "node",
+          "scripts": [
+            "build",
+            "lint",
+            "package"
+          ]
+        },
+        {
+          "path": "editors/vscode/tsconfig.json",
+          "kind": "config",
+          "scripts": []
+        }
+      ]
+    },
+    "agentInstructions": {
+      "count": 0,
+      "rootCount": 0,
+      "nestedCount": 0,
+      "files": [],
+      "status": "none",
+      "suggestedMinimum": 0,
+      "suggestedAdditional": 0,
+      "sourceFilesPerInstruction": null,
+      "sourceFilesUnderNestedInstructions": 0,
+      "nestedSourceFileCoveragePercent": null,
+      "suggestedScopes": [],
+      "reasons": []
+    },
+    "languages": [
+      {
+        "language": "python",
+        "files": 1,
+        "sourceFiles": 0,
+        "testFiles": 1,
+        "roots": [
+          {
+            "name": "tests/fixtures",
+            "count": 1
+          }
+        ]
+      }
+    ],
+    "manifests": [
+      {
+        "path": "Cargo.toml",
+        "kind": "toml",
+        "scripts": []
+      },
+      {
+        "path": "editors/vscode/package.json",
+        "kind": "node",
+        "scripts": [
+          "build",
+          "lint",
+          "package"
+        ]
+      },
+      {
+        "path": "editors/vscode/tsconfig.json",
+        "kind": "config",
+        "scripts": []
+      }
+    ],
+    "frameworks": [],
+    "sourceRoots": [],
+    "entryCandidates": [],
+    "corePathHints": [],
+    "totals": {
+      "trackedFiles": 241,
+      "trackedFilesBeforeFilters": 241,
+      "sourceFiles": 0,
+      "testFiles": 1,
+      "generatedOrDependencyFiles": 2,
+      "sourceLines": null,
+      "sourceLineMeasurement": "skipped",
+      "readableSourceFiles": 0,
+      "unreadableSourceFiles": 0
+    }
+  },
+  "historyProfile": {
+    "schemaVersion": 1,
+    "kind": "git-history-profile",
+    "status": "ok",
+    "repoRoot": "D:\\Github\\mora-lang",
+    "filters": {
+      "ignorePatterns": [],
+      "ignoredCount": 0,
+      "ignoredSample": []
+    },
+    "range": {
+      "maxCommits": 500,
+      "analyzedCommits": 211,
+      "newest": "6ea89ab",
+      "oldest": "145cc28"
+    },
+    "confidence": {
+      "confidence": "high",
+      "reasons": [
+        "bounded history has enough commits and time span for hotspot ranking"
+      ]
+    },
+    "historyWindows": [
+      {
+        "days": 30,
+        "since": "2026-06-28T14:38:46.000Z",
+        "analyzedCommits": 199,
+        "trendLabel": "recent-hotspots",
+        "interpretation": "recent window for spotting recent hotspots from bounded git history.",
+        "hotFiles": [],
+        "supportingHotFiles": [
+          {
+            "path": "Cargo.lock",
+            "language": null,
+            "role": "other",
+            "supporting": true,
+            "commits": 42,
+            "added": 2182,
+            "deleted": 633,
+            "churn": 2815,
+            "lastTouched": "121dc17"
+          },
+          {
+            "path": "Cargo.toml",
+            "language": null,
+            "role": "configuration",
+            "supporting": true,
+            "commits": 41,
+            "added": 100,
+            "deleted": 35,
+            "churn": 135,
+            "lastTouched": "121dc17"
+          },
+          {
+            "path": "CHANGELOG.md",
+            "language": null,
+            "role": "documentation",
+            "supporting": true,
+            "commits": 37,
+            "added": 2718,
+            "deleted": 463,
+            "churn": 3181,
+            "lastTouched": "121dc17"
+          },
+          {
+            "path": ".gitignore",
+            "language": null,
+            "role": "other",
+            "supporting": true,
+            "commits": 9,
+            "added": 37,
+            "deleted": 2,
+            "churn": 39,
+            "lastTouched": "121dc17"
+          },
+          {
+            "path": "tests/mir_differential.rs",
+            "language": "rust",
+            "role": "test",
+            "supporting": true,
+            "commits": 6,
+            "added": 686,
+            "deleted": 686,
+            "churn": 1372,
+            "lastTouched": "79bef27"
+          },
+          {
+            "path": "README.md",
+            "language": null,
+            "role": "documentation",
+            "supporting": true,
+            "commits": 6,
+            "added": 266,
+            "deleted": 215,
+            "churn": 481,
+            "lastTouched": "121dc17"
+          },
+          {
+            "path": "CLAUDE.md",
+            "language": null,
+            "role": "documentation",
+            "supporting": true,
+            "commits": 4,
+            "added": 44,
+            "deleted": 44,
+            "churn": 88,
+            "lastTouched": "121dc17"
+          },
+          {
+            "path": "docs/mora-spec.md",
+            "language": null,
+            "role": "documentation",
+            "supporting": true,
+            "commits": 3,
+            "added": 1259,
+            "deleted": 1259,
+            "churn": 2518,
+            "lastTouched": "121dc17"
+          },
+          {
+            "path": "tests/orchestrate_v50_integration.rs",
+            "language": "rust",
+            "role": "test",
+            "supporting": true,
+            "commits": 3,
+            "added": 956,
+            "deleted": 56,
+            "churn": 1012,
+            "lastTouched": "8d22fe5"
+          },
+          {
+            "path": "docs/README.md",
+            "language": null,
+            "role": "documentation",
+            "supporting": true,
+            "commits": 3,
+            "added": 156,
+            "deleted": 74,
+            "churn": 230,
+            "lastTouched": "d1e139e"
+          }
+        ],
+        "hotPaths": []
+      },
+      {
+        "days": 90,
+        "since": "2026-04-29T14:38:46.000Z",
+        "analyzedCommits": 211,
+        "trendLabel": "sustained-hotspots",
+        "interpretation": "sustained window for spotting sustained hotspots from bounded git history.",
+        "hotFiles": [],
+        "supportingHotFiles": [
+          {
+            "path": "Cargo.toml",
+            "language": null,
+            "role": "configuration",
+            "supporting": true,
+            "commits": 50,
+            "added": 145,
+            "deleted": 44,
+            "churn": 189,
+            "lastTouched": "145cc28"
+          },
+          {
+            "path": "Cargo.lock",
+            "language": null,
+            "role": "other",
+            "supporting": true,
+            "commits": 49,
+            "added": 2824,
+            "deleted": 639,
+            "churn": 3463,
+            "lastTouched": "145cc28"
+          },
+          {
+            "path": "CHANGELOG.md",
+            "language": null,
+            "role": "documentation",
+            "supporting": true,
+            "commits": 37,
+            "added": 2718,
+            "deleted": 463,
+            "churn": 3181,
+            "lastTouched": "121dc17"
+          },
+          {
+            "path": "README.md",
+            "language": null,
+            "role": "documentation",
+            "supporting": true,
+            "commits": 12,
+            "added": 640,
+            "deleted": 303,
+            "churn": 943,
+            "lastTouched": "145cc28"
+          },
+          {
+            "path": ".gitignore",
+            "language": null,
+            "role": "other",
+            "supporting": true,
+            "commits": 12,
+            "added": 44,
+            "deleted": 2,
+            "churn": 46,
+            "lastTouched": "145cc28"
+          },
+          {
+            "path": "tests/mir_differential.rs",
+            "language": "rust",
+            "role": "test",
+            "supporting": true,
+            "commits": 6,
+            "added": 686,
+            "deleted": 686,
+            "churn": 1372,
+            "lastTouched": "79bef27"
+          },
+          {
+            "path": ".github/workflows/ci.yml",
+            "language": null,
+            "role": "configuration",
+            "supporting": true,
+            "commits": 4,
+            "added": 224,
+            "deleted": 12,
+            "churn": 236,
+            "lastTouched": "0fdea12"
+          },
+          {
+            "path": "examples/lsp_smoke.rs",
+            "language": "rust",
+            "role": "fixture",
+            "supporting": true,
+            "commits": 4,
+            "added": 188,
+            "deleted": 39,
+            "churn": 227,
+            "lastTouched": "0fdea12"
+          },
+          {
+            "path": "test_data/typeck_errors.mora",
+            "language": null,
+            "role": "other",
+            "supporting": true,
+            "commits": 4,
+            "added": 201,
+            "deleted": 7,
+            "churn": 208,
+            "lastTouched": "47d8c3b"
+          },
+          {
+            "path": "CLAUDE.md",
+            "language": null,
+            "role": "documentation",
+            "supporting": true,
+            "commits": 4,
+            "added": 44,
+            "deleted": 44,
+            "churn": 88,
+            "lastTouched": "121dc17"
+          }
+        ],
+        "hotPaths": []
+      },
+      {
+        "days": 180,
+        "since": "2026-01-29T14:38:46.000Z",
+        "analyzedCommits": 211,
+        "trendLabel": "legacy-or-long-range-hotspots",
+        "interpretation": "long-range window for spotting legacy or long range hotspots from bounded git history.",
+        "hotFiles": [],
+        "supportingHotFiles": [
+          {
+            "path": "Cargo.toml",
+            "language": null,
+            "role": "configuration",
+            "supporting": true,
+            "commits": 50,
+            "added": 145,
+            "deleted": 44,
+            "churn": 189,
+            "lastTouched": "145cc28"
+          },
+          {
+            "path": "Cargo.lock",
+            "language": null,
+            "role": "other",
+            "supporting": true,
+            "commits": 49,
+            "added": 2824,
+            "deleted": 639,
+            "churn": 3463,
+            "lastTouched": "145cc28"
+          },
+          {
+            "path": "CHANGELOG.md",
+            "language": null,
+            "role": "documentation",
+            "supporting": true,
+            "commits": 37,
+            "added": 2718,
+            "deleted": 463,
+            "churn": 3181,
+            "lastTouched": "121dc17"
+          },
+          {
+            "path": "README.md",
+            "language": null,
+            "role": "documentation",
+            "supporting": true,
+            "commits": 12,
+            "added": 640,
+            "deleted": 303,
+            "churn": 943,
+            "lastTouched": "145cc28"
+          },
+          {
+            "path": ".gitignore",
+            "language": null,
+            "role": "other",
+            "supporting": true,
+            "commits": 12,
+            "added": 44,
+            "deleted": 2,
+            "churn": 46,
+            "lastTouched": "145cc28"
+          },
+          {
+            "path": "tests/mir_differential.rs",
+            "language": "rust",
+            "role": "test",
+            "supporting": true,
+            "commits": 6,
+            "added": 686,
+            "deleted": 686,
+            "churn": 1372,
+            "lastTouched": "79bef27"
+          },
+          {
+            "path": ".github/workflows/ci.yml",
+            "language": null,
+            "role": "configuration",
+            "supporting": true,
+            "commits": 4,
+            "added": 224,
+            "deleted": 12,
+            "churn": 236,
+            "lastTouched": "0fdea12"
+          },
+          {
+            "path": "examples/lsp_smoke.rs",
+            "language": "rust",
+            "role": "fixture",
+            "supporting": true,
+            "commits": 4,
+            "added": 188,
+            "deleted": 39,
+            "churn": 227,
+            "lastTouched": "0fdea12"
+          },
+          {
+            "path": "test_data/typeck_errors.mora",
+            "language": null,
+            "role": "other",
+            "supporting": true,
+            "commits": 4,
+            "added": 201,
+            "deleted": 7,
+            "churn": 208,
+            "lastTouched": "47d8c3b"
+          },
+          {
+            "path": "CLAUDE.md",
+            "language": null,
+            "role": "documentation",
+            "supporting": true,
+            "commits": 4,
+            "added": 44,
+            "deleted": 44,
+            "churn": 88,
+            "lastTouched": "121dc17"
+          }
+        ],
+        "hotPaths": []
+      }
+    ],
+    "languageTouchCounts": [],
+    "hotFiles": [],
+    "supportingHotFiles": [
+      {
+        "path": "Cargo.toml",
+        "language": null,
+        "role": "configuration",
+        "supporting": true,
+        "commits": 50,
+        "added": 145,
+        "deleted": 44,
+        "churn": 189,
+        "lastTouched": "145cc28"
+      },
+      {
+        "path": "Cargo.lock",
+        "language": null,
+        "role": "other",
+        "supporting": true,
+        "commits": 49,
+        "added": 2824,
+        "deleted": 639,
+        "churn": 3463,
+        "lastTouched": "145cc28"
+      },
+      {
+        "path": "CHANGELOG.md",
+        "language": null,
+        "role": "documentation",
+        "supporting": true,
+        "commits": 37,
+        "added": 2718,
+        "deleted": 463,
+        "churn": 3181,
+        "lastTouched": "121dc17"
+      },
+      {
+        "path": "README.md",
+        "language": null,
+        "role": "documentation",
+        "supporting": true,
+        "commits": 12,
+        "added": 640,
+        "deleted": 303,
+        "churn": 943,
+        "lastTouched": "145cc28"
+      },
+      {
+        "path": ".gitignore",
+        "language": null,
+        "role": "other",
+        "supporting": true,
+        "commits": 12,
+        "added": 44,
+        "deleted": 2,
+        "churn": 46,
+        "lastTouched": "145cc28"
+      },
+      {
+        "path": "tests/mir_differential.rs",
+        "language": "rust",
+        "role": "test",
+        "supporting": true,
+        "commits": 6,
+        "added": 686,
+        "deleted": 686,
+        "churn": 1372,
+        "lastTouched": "79bef27"
+      },
+      {
+        "path": ".github/workflows/ci.yml",
+        "language": null,
+        "role": "configuration",
+        "supporting": true,
+        "commits": 4,
+        "added": 224,
+        "deleted": 12,
+        "churn": 236,
+        "lastTouched": "0fdea12"
+      },
+      {
+        "path": "examples/lsp_smoke.rs",
+        "language": "rust",
+        "role": "fixture",
+        "supporting": true,
+        "commits": 4,
+        "added": 188,
+        "deleted": 39,
+        "churn": 227,
+        "lastTouched": "0fdea12"
+      },
+      {
+        "path": "test_data/typeck_errors.mora",
+        "language": null,
+        "role": "other",
+        "supporting": true,
+        "commits": 4,
+        "added": 201,
+        "deleted": 7,
+        "churn": 208,
+        "lastTouched": "47d8c3b"
+      },
+      {
+        "path": "CLAUDE.md",
+        "language": null,
+        "role": "documentation",
+        "supporting": true,
+        "commits": 4,
+        "added": 44,
+        "deleted": 44,
+        "churn": 88,
+        "lastTouched": "121dc17"
+      },
+      {
+        "path": "docs/mora-spec.md",
+        "language": null,
+        "role": "documentation",
+        "supporting": true,
+        "commits": 3,
+        "added": 1259,
+        "deleted": 1259,
+        "churn": 2518,
+        "lastTouched": "121dc17"
+      },
+      {
+        "path": "tests/orchestrate_v50_integration.rs",
+        "language": "rust",
+        "role": "test",
+        "supporting": true,
+        "commits": 3,
+        "added": 956,
+        "deleted": 56,
+        "churn": 1012,
+        "lastTouched": "8d22fe5"
+      },
+      {
+        "path": ".github/workflows/release.yml",
+        "language": null,
+        "role": "configuration",
+        "supporting": true,
+        "commits": 3,
+        "added": 215,
+        "deleted": 15,
+        "churn": 230,
+        "lastTouched": "0fdea12"
+      },
+      {
+        "path": "docs/README.md",
+        "language": null,
+        "role": "documentation",
+        "supporting": true,
+        "commits": 3,
+        "added": 156,
+        "deleted": 74,
+        "churn": 230,
+        "lastTouched": "d1e139e"
+      },
+      {
+        "path": "examples/memory_demo.mora",
+        "language": null,
+        "role": "fixture",
+        "supporting": true,
+        "commits": 3,
+        "added": 94,
+        "deleted": 47,
+        "churn": 141,
+        "lastTouched": "2e35e63"
+      },
+      {
+        "path": "tests/parser_v2_integration.rs",
+        "language": "rust",
+        "role": "test",
+        "supporting": true,
+        "commits": 3,
+        "added": 96,
+        "deleted": 21,
+        "churn": 117,
+        "lastTouched": "1b1a6a0"
+      },
+      {
+        "path": "examples/compact_demo.mora",
+        "language": null,
+        "role": "fixture",
+        "supporting": true,
+        "commits": 3,
+        "added": 76,
+        "deleted": 29,
+        "churn": 105,
+        "lastTouched": "98c8c37"
+      },
+      {
+        "path": "examples/serve_as_http_demo.mora",
+        "language": null,
+        "role": "fixture",
+        "supporting": true,
+        "commits": 3,
+        "added": 37,
+        "deleted": 37,
+        "churn": 74,
+        "lastTouched": "cc208dc"
+      },
+      {
+        "path": "docker-compose.yml",
+        "language": null,
+        "role": "configuration",
+        "supporting": true,
+        "commits": 3,
+        "added": 62,
+        "deleted": 7,
+        "churn": 69,
+        "lastTouched": "cc208dc"
+      },
+      {
+        "path": "examples/serve_with_route_demo.mora",
+        "language": null,
+        "role": "fixture",
+        "supporting": true,
+        "commits": 3,
+        "added": 34,
+        "deleted": 34,
+        "churn": 68,
+        "lastTouched": "cc208dc"
+      },
+      {
+        "path": "Dockerfile",
+        "language": null,
+        "role": "configuration",
+        "supporting": true,
+        "commits": 3,
+        "added": 46,
+        "deleted": 5,
+        "churn": 51,
+        "lastTouched": "cc208dc"
+      },
+      {
+        "path": "examples/serve_as_mcp_demo.mora",
+        "language": null,
+        "role": "fixture",
+        "supporting": true,
+        "commits": 3,
+        "added": 19,
+        "deleted": 19,
+        "churn": 38,
+        "lastTouched": "cc208dc"
+      },
+      {
+        "path": "examples/observe_demo.mora",
+        "language": null,
+        "role": "fixture",
+        "supporting": true,
+        "commits": 3,
+        "added": 27,
+        "deleted": 4,
+        "churn": 31,
+        "lastTouched": "cc208dc"
+      },
+      {
+        "path": "proptest-regressions/semantics_tests.txt",
+        "language": null,
+        "role": "documentation",
+        "supporting": true,
+        "commits": 3,
+        "added": 12,
+        "deleted": 0,
+        "churn": 12,
+        "lastTouched": "7c2cf09"
+      },
+      {
+        "path": "docs/superpowers/plans/2026-06-23-subproject-a-interpreter-architecture.md",
+        "language": null,
+        "role": "documentation",
+        "supporting": true,
+        "commits": 2,
+        "added": 1415,
+        "deleted": 1415,
+        "churn": 2830,
+        "lastTouched": "121dc17"
+      },
+      {
+        "path": "AUDIT_REPORT_V0_53.md",
+        "language": null,
+        "role": "documentation",
+        "supporting": true,
+        "commits": 2,
+        "added": 1085,
+        "deleted": 1085,
+        "churn": 2170,
+        "lastTouched": "5cb062e"
+      },
+      {
+        "path": "docs/superpowers/specs/api-baseline.txt",
+        "language": null,
+        "role": "documentation",
+        "supporting": true,
+        "commits": 2,
+        "added": 1064,
+        "deleted": 1064,
+        "churn": 2128,
+        "lastTouched": "121dc17"
+      },
+      {
+        "path": "docs/v0.09-test-dispatch-spec.md",
+        "language": null,
+        "role": "documentation",
+        "supporting": true,
+        "commits": 2,
+        "added": 881,
+        "deleted": 881,
+        "churn": 1762,
+        "lastTouched": "8b4fa8c"
+      },
+      {
+        "path": "docs/research/RESEARCH_PRIMITIVES_MASTER_v2.md",
+        "language": null,
+        "role": "documentation",
+        "supporting": true,
+        "commits": 2,
+        "added": 822,
+        "deleted": 822,
+        "churn": 1644,
+        "lastTouched": "d1e139e"
+      },
+      {
+        "path": "docs/_archive/2026-06-23-subproject-a-interpreter-architecture.md",
+        "language": null,
+        "role": "documentation",
+        "supporting": true,
+        "commits": 2,
+        "added": 1460,
+        "deleted": 45,
+        "churn": 1505,
+        "lastTouched": "955529b"
+      },
+      {
+        "path": "docs/_archive/workflow-v0.24-parser-migration.md",
+        "language": null,
+        "role": "documentation",
+        "supporting": true,
+        "commits": 2,
+        "added": 1322,
+        "deleted": 174,
+        "churn": 1496,
+        "lastTouched": "d1e139e"
+      },
+      {
+        "path": "AGENTS_SESSION_V0_41.md",
+        "language": null,
+        "role": "documentation",
+        "supporting": true,
+        "commits": 2,
+        "added": 1046,
+        "deleted": 354,
+        "churn": 1400,
+        "lastTouched": "bc5f64e"
+      },
+      {
+        "path": "AGENTS_SESSION_V0_34.md",
+        "language": null,
+        "role": "documentation",
+        "supporting": true,
+        "commits": 2,
+        "added": 1050,
+        "deleted": 297,
+        "churn": 1347,
+        "lastTouched": "736800a"
+      },
+      {
+        "path": "docs/_archive/v0.09-test-dispatch-spec.md",
+        "language": null,
+        "role": "documentation",
+        "supporting": true,
+        "commits": 2,
+        "added": 1073,
+        "deleted": 192,
+        "churn": 1265,
+        "lastTouched": "d1e139e"
+      },
+      {
+        "path": "docs/_archive/2026-07-03-mora-historical-cleanup-and-9-project-research.md",
+        "language": null,
+        "role": "documentation",
+        "supporting": true,
+        "commits": 2,
+        "added": 949,
+        "deleted": 305,
+        "churn": 1254,
+        "lastTouched": "955529b"
+      },
+      {
+        "path": "docs/_archive/session-workflow-v0.25.md",
+        "language": null,
+        "role": "documentation",
+        "supporting": true,
+        "commits": 2,
+        "added": 963,
+        "deleted": 281,
+        "churn": 1244,
+        "lastTouched": "d1e139e"
+      },
+      {
+        "path": "AGENTS_PRIMITIVES_v2.md",
+        "language": null,
+        "role": "documentation",
+        "supporting": true,
+        "commits": 2,
+        "added": 993,
+        "deleted": 234,
+        "churn": 1227,
+        "lastTouched": "c83707e"
+      },
+      {
+        "path": "AGENTS_PRIMITIVES.md",
+        "language": null,
+        "role": "documentation",
+        "supporting": true,
+        "commits": 2,
+        "added": 850,
+        "deleted": 269,
+        "churn": 1119,
+        "lastTouched": "90f6a68"
+      },
+      {
+        "path": "docs/_archive/workflow-v0.34-panic-and-concurrency.md",
+        "language": null,
+        "role": "documentation",
+        "supporting": true,
+        "commits": 2,
+        "added": 844,
+        "deleted": 256,
+        "churn": 1100,
+        "lastTouched": "d1e139e"
+      },
+      {
+        "path": "docs/learning-plan.md",
+        "language": null,
+        "role": "documentation",
+        "supporting": true,
+        "commits": 2,
+        "added": 546,
+        "deleted": 546,
+        "churn": 1092,
+        "lastTouched": "121dc17"
+      }
+    ],
+    "hotPaths": [],
+    "supportingHotPaths": [
+      {
+        "path": ".",
+        "commits": 202
+      },
+      {
+        "path": "examples",
+        "commits": 94
+      },
+      {
+        "path": "docs/_archive",
+        "commits": 35
+      },
+      {
+        "path": "docs",
+        "commits": 26
+      },
+      {
+        "path": "docs/research",
+        "commits": 22
+      },
+      {
+        "path": "tests",
+        "commits": 21
+      },
+      {
+        "path": "docs/semantics",
+        "commits": 20
+      },
+      {
+        "path": "examples/_legacy",
+        "commits": 20
+      },
+      {
+        "path": "tests/fixtures",
+        "commits": 13
+      },
+      {
+        "path": "docs/reports",
+        "commits": 10
+      },
+      {
+        "path": ".github/workflows",
+        "commits": 8
+      },
+      {
+        "path": "test_data",
+        "commits": 8
+      },
+      {
+        "path": "docs/superpowers",
+        "commits": 6
+      },
+      {
+        "path": "editors/vscode",
+        "commits": 6
+      },
+      {
+        "path": "editors/helix",
+        "commits": 3
+      },
+      {
+        "path": "editors/neovim",
+        "commits": 3
+      },
+      {
+        "path": "proptest-regressions",
+        "commits": 3
+      },
+      {
+        "path": "\"docs/_archive",
+        "commits": 2
+      },
+      {
+        "path": "editors",
+        "commits": 2
+      },
+      {
+        "path": "examples/lib",
+        "commits": 2
+      },
+      {
+        "path": "editors/emacs",
+        "commits": 1
+      },
+      {
+        "path": "editors/sublime",
+        "commits": 1
+      },
+      {
+        "path": "editors/vim",
+        "commits": 1
+      }
+    ],
+    "coChangePaths": []
+  },
+  "coreAnalysis": {
+    "schemaVersion": 1,
+    "kind": "core-candidates",
+    "status": "ok",
+    "repoRoot": "D:\\Github\\mora-lang",
+    "filters": {
+      "ignorePatterns": [],
+      "ignoredCount": 0,
+      "ignoredSample": []
+    },
+    "candidates": [],
+    "summary": {
+      "highConfidence": 0,
+      "mediumConfidence": 0,
+      "candidateCount": 0
+    }
+  },
+  "diffImpact": {
+    "schemaVersion": 1,
+    "kind": "diff-impact",
+    "status": "ok",
+    "repoRoot": "D:\\Github\\mora-lang",
+    "baseRef": "HEAD",
+    "filters": {
+      "ignorePatterns": [],
+      "ignoredCount": 0,
+      "ignoredSample": []
+    },
+    "coreCodeRules": {
+      "status": "missing",
+      "includeCount": 0,
+      "excludeCount": 0,
+      "boundaryKind": "inferred-core-boundary"
+    },
+    "score": 100,
+    "severity": "critical",
+    "reviewRecommended": false,
+    "attentionRequired": false,
+    "reasons": [
+      "changed supporting hot file tests/orchestrate_v50_integration.rs",
+      "changed supporting hot file tests/parser_v2_integration.rs",
+      "wide file change count 29",
+      "large changed-line count 4315"
+    ],
+    "changedFiles": [
+      {
+        "path": "tests/mir_ssa_debug.rs",
+        "added": 3,
+        "deleted": 3,
+        "language": "rust",
+        "role": "test",
+        "supporting": true,
+        "untracked": false
+      },
+      {
+        "path": "tests/orchestrate_v50_integration.rs",
+        "added": 0,
+        "deleted": 900,
+        "language": "rust",
+        "role": "test",
+        "supporting": true,
+        "untracked": false
+      },
+      {
+        "path": "tests/parser_v2_integration.rs",
+        "added": 0,
+        "deleted": 75,
+        "language": "rust",
+        "role": "test",
+        "supporting": true,
+        "untracked": false
+      },
+      {
+        "path": "tests/parser_v3_minimal.rs",
+        "added": 0,
+        "deleted": 95,
+        "language": "rust",
+        "role": "test",
+        "supporting": true,
+        "untracked": false
+      },
+      {
+        "path": "tests/tier0_closure_mir.rs",
+        "added": 3,
+        "deleted": 7,
+        "language": "rust",
+        "role": "test",
+        "supporting": true,
+        "untracked": false
+      },
+      {
+        "path": "tests/tier0_dyntrait.rs",
+        "added": 6,
+        "deleted": 16,
+        "language": "rust",
+        "role": "test",
+        "supporting": true,
+        "untracked": false
+      },
+      {
+        "path": "tests/tier0_replacement.rs",
+        "added": 59,
+        "deleted": 22,
+        "language": "rust",
+        "role": "test",
+        "supporting": true,
+        "untracked": false
+      },
+      {
+        "path": "tests/tier0_trait_mir.rs",
+        "added": 15,
+        "deleted": 15,
+        "language": "rust",
+        "role": "test",
+        "supporting": true,
+        "untracked": false
+      },
+      {
+        "path": "tests/tier1_typeck_mir.rs",
+        "added": 40,
+        "deleted": 60,
+        "language": "rust",
+        "role": "test",
+        "supporting": true,
+        "untracked": false
+      },
+      {
+        "path": "analyze_ast_deps.ps1",
+        "added": 10,
+        "deleted": 0,
+        "language": null,
+        "role": "other",
+        "supporting": true,
+        "untracked": true
+      },
+      {
+        "path": "append_v3.py",
+        "added": 248,
+        "deleted": 0,
+        "language": "python",
+        "role": "source",
+        "supporting": false,
+        "untracked": true
+      },
+      {
+        "path": "append_v3_lower.py",
+        "added": 237,
+        "deleted": 0,
+        "language": "python",
+        "role": "source",
+        "supporting": false,
+        "untracked": true
+      },
+      {
+        "path": "examples/_smoke.mora",
+        "added": 4,
+        "deleted": 0,
+        "language": null,
+        "role": "fixture",
+        "supporting": true,
+        "untracked": true
+      },
+      {
+        "path": "examples/_t.mora",
+        "added": 1,
+        "deleted": 0,
+        "language": null,
+        "role": "fixture",
+        "supporting": true,
+        "untracked": true
+      },
+      {
+        "path": "examples/_t2.mora",
+        "added": 1,
+        "deleted": 0,
+        "language": null,
+        "role": "fixture",
+        "supporting": true,
+        "untracked": true
+      },
+      {
+        "path": "examples/debug_parse.rs",
+        "added": 82,
+        "deleted": 0,
+        "language": "rust",
+        "role": "fixture",
+        "supporting": true,
+        "untracked": true
+      },
+      {
+        "path": "examples/debug_parser.rs",
+        "added": 33,
+        "deleted": 0,
+        "language": "rust",
+        "role": "fixture",
+        "supporting": true,
+        "untracked": true
+      },
+      {
+        "path": "examples/hm_basic_demo.mora",
+        "added": 132,
+        "deleted": 0,
+        "language": null,
+        "role": "fixture",
+        "supporting": true,
+        "untracked": true
+      },
+      {
+        "path": "examples/hm_inference_examples.md",
+        "added": 351,
+        "deleted": 0,
+        "language": null,
+        "role": "fixture",
+        "supporting": true,
+        "untracked": true
+      },
+      {
+        "path": "fix_lower.py",
+        "added": 304,
+        "deleted": 0,
+        "language": "python",
+        "role": "source",
+        "supporting": false,
+        "untracked": true
+      },
+      {
+        "path": "remove_emoji.py",
+        "added": 33,
+        "deleted": 0,
+        "language": "python",
+        "role": "source",
+        "supporting": false,
+        "untracked": true
+      },
+      {
+        "path": "remove_emoji_all.py",
+        "added": 39,
+        "deleted": 0,
+        "language": "python",
+        "role": "source",
+        "supporting": false,
+        "untracked": true
+      },
+      {
+        "path": "scripts/implement_if_else.ps1",
+        "added": 52,
+        "deleted": 0,
+        "language": null,
+        "role": "other",
+        "supporting": true,
+        "untracked": true
+      },
+      {
+        "path": "test_simple.mora",
+        "added": 2,
+        "deleted": 0,
+        "language": null,
+        "role": "other",
+        "supporting": true,
+        "untracked": true
+      },
+      {
+        "path": "tests/debug_parse.rs",
+        "added": 31,
+        "deleted": 0,
+        "language": "rust",
+        "role": "test",
+        "supporting": true,
+        "untracked": true
+      },
+      {
+        "path": "tests/mir_orchestrate_lowering.rs",
+        "added": 180,
+        "deleted": 0,
+        "language": "rust",
+        "role": "test",
+        "supporting": true,
+        "untracked": true
+      },
+      {
+        "path": "tests/orchestrate_v3_pipeline.rs",
+        "added": 298,
+        "deleted": 0,
+        "language": "rust",
+        "role": "test",
+        "supporting": true,
+        "untracked": true
+      },
+      {
+        "path": "tests/parser_v3_coverage.rs",
+        "added": 185,
+        "deleted": 0,
+        "language": "rust",
+        "role": "test",
+        "supporting": true,
+        "untracked": true
+      },
+      {
+        "path": "tests/tier2_mir_expr_pipeline.rs",
+        "added": 773,
+        "deleted": 0,
+        "language": "rust",
+        "role": "test",
+        "supporting": true,
+        "untracked": true
+      }
+    ],
+    "coreHits": [],
+    "hotHits": [],
+    "companionHits": [
+      {
+        "path": "tests/orchestrate_v50_integration.rs",
+        "role": "test",
+        "commits": 3,
+        "churn": 1012
+      },
+      {
+        "path": "tests/parser_v2_integration.rs",
+        "role": "test",
+        "commits": 3,
+        "churn": 117
+      }
+    ],
+    "metrics": {
+      "changedFiles": 29,
+      "changedLines": 4315,
+      "coreHits": 0,
+      "hotHits": 0,
+      "companionHits": 2
+    }
+  },
+  "changeDrift": {
+    "schemaVersion": 1,
+    "kind": "change-drift",
+    "status": "ok",
+    "repoRoot": "D:\\Github\\mora-lang",
+    "baseRef": "HEAD",
+    "filters": {
+      "ignorePatterns": [],
+      "ignoredCount": 0,
+      "ignoredSample": []
+    },
+    "summary": {
+      "findingCount": 0,
+      "highConfidenceCount": 0,
+      "typeCounts": {},
+      "changedFiles": 29
+    },
+    "changedFiles": [
+      {
+        "path": "tests/mir_ssa_debug.rs",
+        "role": "test",
+        "language": "rust",
+        "added": 3,
+        "deleted": 3,
+        "untracked": false
+      },
+      {
+        "path": "tests/orchestrate_v50_integration.rs",
+        "role": "test",
+        "language": "rust",
+        "added": 0,
+        "deleted": 900,
+        "untracked": false
+      },
+      {
+        "path": "tests/parser_v2_integration.rs",
+        "role": "test",
+        "language": "rust",
+        "added": 0,
+        "deleted": 75,
+        "untracked": false
+      },
+      {
+        "path": "tests/parser_v3_minimal.rs",
+        "role": "test",
+        "language": "rust",
+        "added": 0,
+        "deleted": 95,
+        "untracked": false
+      },
+      {
+        "path": "tests/tier0_closure_mir.rs",
+        "role": "test",
+        "language": "rust",
+        "added": 3,
+        "deleted": 7,
+        "untracked": false
+      },
+      {
+        "path": "tests/tier0_dyntrait.rs",
+        "role": "test",
+        "language": "rust",
+        "added": 6,
+        "deleted": 16,
+        "untracked": false
+      },
+      {
+        "path": "tests/tier0_replacement.rs",
+        "role": "test",
+        "language": "rust",
+        "added": 59,
+        "deleted": 22,
+        "untracked": false
+      },
+      {
+        "path": "tests/tier0_trait_mir.rs",
+        "role": "test",
+        "language": "rust",
+        "added": 15,
+        "deleted": 15,
+        "untracked": false
+      },
+      {
+        "path": "tests/tier1_typeck_mir.rs",
+        "role": "test",
+        "language": "rust",
+        "added": 40,
+        "deleted": 60,
+        "untracked": false
+      },
+      {
+        "path": "analyze_ast_deps.ps1",
+        "role": "other",
+        "language": null,
+        "added": 10,
+        "deleted": 0,
+        "untracked": true
+      },
+      {
+        "path": "append_v3.py",
+        "role": "source",
+        "language": "python",
+        "added": 248,
+        "deleted": 0,
+        "untracked": true
+      },
+      {
+        "path": "append_v3_lower.py",
+        "role": "source",
+        "language": "python",
+        "added": 237,
+        "deleted": 0,
+        "untracked": true
+      },
+      {
+        "path": "examples/_smoke.mora",
+        "role": "fixture",
+        "language": null,
+        "added": 4,
+        "deleted": 0,
+        "untracked": true
+      },
+      {
+        "path": "examples/_t.mora",
+        "role": "fixture",
+        "language": null,
+        "added": 1,
+        "deleted": 0,
+        "untracked": true
+      },
+      {
+        "path": "examples/_t2.mora",
+        "role": "fixture",
+        "language": null,
+        "added": 1,
+        "deleted": 0,
+        "untracked": true
+      },
+      {
+        "path": "examples/debug_parse.rs",
+        "role": "fixture",
+        "language": "rust",
+        "added": 82,
+        "deleted": 0,
+        "untracked": true
+      },
+      {
+        "path": "examples/debug_parser.rs",
+        "role": "fixture",
+        "language": "rust",
+        "added": 33,
+        "deleted": 0,
+        "untracked": true
+      },
+      {
+        "path": "examples/hm_basic_demo.mora",
+        "role": "fixture",
+        "language": null,
+        "added": 132,
+        "deleted": 0,
+        "untracked": true
+      },
+      {
+        "path": "examples/hm_inference_examples.md",
+        "role": "fixture",
+        "language": null,
+        "added": 351,
+        "deleted": 0,
+        "untracked": true
+      },
+      {
+        "path": "fix_lower.py",
+        "role": "source",
+        "language": "python",
+        "added": 304,
+        "deleted": 0,
+        "untracked": true
+      },
+      {
+        "path": "remove_emoji.py",
+        "role": "source",
+        "language": "python",
+        "added": 33,
+        "deleted": 0,
+        "untracked": true
+      },
+      {
+        "path": "remove_emoji_all.py",
+        "role": "source",
+        "language": "python",
+        "added": 39,
+        "deleted": 0,
+        "untracked": true
+      },
+      {
+        "path": "scripts/implement_if_else.ps1",
+        "role": "other",
+        "language": null,
+        "added": 52,
+        "deleted": 0,
+        "untracked": true
+      },
+      {
+        "path": "test_simple.mora",
+        "role": "other",
+        "language": null,
+        "added": 2,
+        "deleted": 0,
+        "untracked": true
+      },
+      {
+        "path": "tests/debug_parse.rs",
+        "role": "test",
+        "language": "rust",
+        "added": 31,
+        "deleted": 0,
+        "untracked": true
+      },
+      {
+        "path": "tests/mir_orchestrate_lowering.rs",
+        "role": "test",
+        "language": "rust",
+        "added": 180,
+        "deleted": 0,
+        "untracked": true
+      },
+      {
+        "path": "tests/orchestrate_v3_pipeline.rs",
+        "role": "test",
+        "language": "rust",
+        "added": 298,
+        "deleted": 0,
+        "untracked": true
+      },
+      {
+        "path": "tests/parser_v3_coverage.rs",
+        "role": "test",
+        "language": "rust",
+        "added": 185,
+        "deleted": 0,
+        "untracked": true
+      },
+      {
+        "path": "tests/tier2_mir_expr_pipeline.rs",
+        "role": "test",
+        "language": "rust",
+        "added": 773,
+        "deleted": 0,
+        "untracked": true
+      }
+    ],
+    "findings": []
+  },
+  "recommendedReads": [
+    {
+      "path": "analyze_ast_deps.ps1",
+      "language": null,
+      "role": "other",
+      "supporting": true,
+      "priority": 100,
+      "reasons": [
+        "changed file"
+      ]
+    },
+    {
+      "path": "append_v3_lower.py",
+      "language": "python",
+      "role": "source",
+      "supporting": false,
+      "priority": 100,
+      "reasons": [
+        "changed file"
+      ]
+    },
+    {
+      "path": "append_v3.py",
+      "language": "python",
+      "role": "source",
+      "supporting": false,
+      "priority": 100,
+      "reasons": [
+        "changed file"
+      ]
+    },
+    {
+      "path": "examples/_smoke.mora",
+      "language": null,
+      "role": "fixture",
+      "supporting": true,
+      "priority": 100,
+      "reasons": [
+        "changed file"
+      ]
+    },
+    {
+      "path": "examples/_t.mora",
+      "language": null,
+      "role": "fixture",
+      "supporting": true,
+      "priority": 100,
+      "reasons": [
+        "changed file"
+      ]
+    },
+    {
+      "path": "examples/_t2.mora",
+      "language": null,
+      "role": "fixture",
+      "supporting": true,
+      "priority": 100,
+      "reasons": [
+        "changed file"
+      ]
+    },
+    {
+      "path": "examples/debug_parse.rs",
+      "language": "rust",
+      "role": "fixture",
+      "supporting": true,
+      "priority": 100,
+      "reasons": [
+        "changed file"
+      ]
+    },
+    {
+      "path": "examples/debug_parser.rs",
+      "language": "rust",
+      "role": "fixture",
+      "supporting": true,
+      "priority": 100,
+      "reasons": [
+        "changed file"
+      ]
+    },
+    {
+      "path": "examples/hm_basic_demo.mora",
+      "language": null,
+      "role": "fixture",
+      "supporting": true,
+      "priority": 100,
+      "reasons": [
+        "changed file"
+      ]
+    },
+    {
+      "path": "examples/hm_inference_examples.md",
+      "language": null,
+      "role": "fixture",
+      "supporting": true,
+      "priority": 100,
+      "reasons": [
+        "changed file"
+      ]
+    },
+    {
+      "path": "fix_lower.py",
+      "language": "python",
+      "role": "source",
+      "supporting": false,
+      "priority": 100,
+      "reasons": [
+        "changed file"
+      ]
+    },
+    {
+      "path": "remove_emoji_all.py",
+      "language": "python",
+      "role": "source",
+      "supporting": false,
+      "priority": 100,
+      "reasons": [
+        "changed file"
+      ]
+    },
+    {
+      "path": "remove_emoji.py",
+      "language": "python",
+      "role": "source",
+      "supporting": false,
+      "priority": 100,
+      "reasons": [
+        "changed file"
+      ]
+    },
+    {
+      "path": "scripts/implement_if_else.ps1",
+      "language": null,
+      "role": "other",
+      "supporting": true,
+      "priority": 100,
+      "reasons": [
+        "changed file"
+      ]
+    },
+    {
+      "path": "test_simple.mora",
+      "language": null,
+      "role": "other",
+      "supporting": true,
+      "priority": 100,
+      "reasons": [
+        "changed file"
+      ]
+    },
+    {
+      "path": "tests/debug_parse.rs",
+      "language": "rust",
+      "role": "test",
+      "supporting": true,
+      "priority": 100,
+      "reasons": [
+        "changed file"
+      ]
+    },
+    {
+      "path": "tests/mir_orchestrate_lowering.rs",
+      "language": "rust",
+      "role": "test",
+      "supporting": true,
+      "priority": 100,
+      "reasons": [
+        "changed file"
+      ]
+    },
+    {
+      "path": "tests/mir_ssa_debug.rs",
+      "language": "rust",
+      "role": "test",
+      "supporting": true,
+      "priority": 100,
+      "reasons": [
+        "changed file"
+      ]
+    },
+    {
+      "path": "tests/orchestrate_v3_pipeline.rs",
+      "language": "rust",
+      "role": "test",
+      "supporting": true,
+      "priority": 100,
+      "reasons": [
+        "changed file"
+      ]
+    },
+    {
+      "path": "tests/orchestrate_v50_integration.rs",
+      "language": "rust",
+      "role": "test",
+      "supporting": true,
+      "priority": 100,
+      "reasons": [
+        "changed file"
+      ]
+    }
+  ],
+  "followUpActions": [
+    {
+      "id": "apply-targeted-implementation",
+      "type": "implementation",
+      "priority": "high",
+      "title": "Make the requested behavior change in primary source first",
+      "reason": "Supporting files should follow source behavior, not substitute for the implementation change.",
+      "files": [
+        {
+          "path": "append_v3.py",
+          "role": "source",
+          "language": "python"
+        },
+        {
+          "path": "append_v3_lower.py",
+          "role": "source",
+          "language": "python"
+        },
+        {
+          "path": "fix_lower.py",
+          "role": "source",
+          "language": "python"
+        },
+        {
+          "path": "remove_emoji.py",
+          "role": "source",
+          "language": "python"
+        },
+        {
+          "path": "remove_emoji_all.py",
+          "role": "source",
+          "language": "python"
+        }
+      ],
+      "passCheck": "The requested behavior is implemented in source code and not only reflected in docs, locale, or fixture files."
+    },
+    {
+      "id": "sync-documentation",
+      "type": "companion-sync",
+      "priority": "medium",
+      "title": "Sync documentation when behavior or workflow changes",
+      "reason": "Documentation hotspots are useful follow-up checks but should not be mistaken for core implementation.",
+      "files": [
+        {
+          "path": "CHANGELOG.md",
+          "role": "documentation",
+          "language": null
+        },
+        {
+          "path": "README.md",
+          "role": "documentation",
+          "language": null
+        },
+        {
+          "path": "CLAUDE.md",
+          "role": "documentation",
+          "language": null
+        },
+        {
+          "path": "docs/mora-spec.md",
+          "role": "documentation",
+          "language": null
+        },
+        {
+          "path": "docs/README.md",
+          "role": "documentation",
+          "language": null
+        },
+        {
+          "path": "proptest-regressions/semantics_tests.txt",
+          "role": "documentation",
+          "language": null
+        },
+        {
+          "path": "docs/superpowers/plans/2026-06-23-subproject-a-interpreter-architecture.md",
+          "role": "documentation",
+          "language": null
+        },
+        {
+          "path": "AUDIT_REPORT_V0_53.md",
+          "role": "documentation",
+          "language": null
+        }
+      ],
+      "passCheck": "Docs that describe the changed behavior are updated, or the agent states why docs are unaffected."
+    },
+    {
+      "id": "validate-impact",
+      "type": "validation",
+      "priority": "medium",
+      "title": "Run focused validation for changed core or hotspot areas",
+      "reason": "Detected tests or fixtures can anchor validation.",
+      "files": [
+        {
+          "path": "tests/mir_differential.rs",
+          "role": "test",
+          "language": "rust"
+        },
+        {
+          "path": "examples/lsp_smoke.rs",
+          "role": "fixture",
+          "language": "rust"
+        },
+        {
+          "path": "tests/orchestrate_v50_integration.rs",
+          "role": "test",
+          "language": "rust"
+        },
+        {
+          "path": "examples/memory_demo.mora",
+          "role": "fixture",
+          "language": null
+        },
+        {
+          "path": "tests/parser_v2_integration.rs",
+          "role": "test",
+          "language": "rust"
+        },
+        {
+          "path": "examples/compact_demo.mora",
+          "role": "fixture",
+          "language": null
+        },
+        {
+          "path": "examples/serve_as_http_demo.mora",
+          "role": "fixture",
+          "language": null
+        },
+        {
+          "path": "examples/serve_with_route_demo.mora",
+          "role": "fixture",
+          "language": null
+        }
+      ],
+      "passCheck": "Relevant focused tests, build, lint, smoke, or caller/API checks pass or failures are reported with exact output."
+    }
+  ],
+  "agentGuidance": {
+    "stance": "Use the pack as an evidence starting point, then inspect source files and rerun narrower analysis when project-specific noise is visible.",
+    "optionalReruns": [
+      {
+        "id": "rerun-with-explicit-ignore",
+        "reason": "Supporting hotspots dominate the raw history; rerun with explicit ignores before writing a core-boundary report if they are not relevant to the task.",
+        "commandArgs": [
+          "--ignore",
+          "Cargo.toml,CHANGELOG.md,README.md,.github/workflows/ci.yml,examples/**,CLAUDE.md"
+        ],
+        "patterns": [
+          "Cargo.toml",
+          "CHANGELOG.md",
+          "README.md",
+          ".github/workflows/ci.yml",
+          "examples/**",
+          "CLAUDE.md"
+        ]
+      }
+    ],
+    "reportFiltering": [
+      "Keep primary source candidates and supporting files in separate sections.",
+      "When a locale, docs, fixture, config, or migration file matters, explain it as companion sync or evidence, not as the primary implementation.",
+      "Do not recommend creating, editing, or populating internal core boundary configuration as a user-facing action.",
+      "Do not render the internal core boundary file name or internal core boundary label in user-visible reports, evidence boundaries, recommendations, or handoff prompts; use configured core boundary, inferred core boundary, or affected core files.",
+      "For an affected core chain, review diagnostic coverage through the shared observability rubric. If inspected evidence confirms that a named segment lacks readable logs or correlation, keep the gap and its causal impact as a reader-facing finding; do not infer the gap from logger-call counts or a runtime-only access failure.",
+      "If explicit ignores are used, mention the patterns and do not hide changed files that are directly relevant to the user's request."
+    ],
+    "currentFilters": {
+      "projectProfile": {
+        "ignorePatterns": [],
+        "ignoredCount": 0,
+        "ignoredSample": []
+      },
+      "historyProfile": {
+        "ignorePatterns": [],
+        "ignoredCount": 0,
+        "ignoredSample": []
+      },
+      "coreAnalysis": {
+        "ignorePatterns": [],
+        "ignoredCount": 0,
+        "ignoredSample": []
+      },
+      "diffImpact": {
+        "ignorePatterns": [],
+        "ignoredCount": 0,
+        "ignoredSample": []
+      }
+    },
+    "coreCandidateCount": 0
+  },
+  "reviewMatrix": [
+    {
+      "id": "core-supporting-separation",
+      "title": "Core candidates and supporting hotspots are separated",
+      "status": "ready",
+      "evidence": {
+        "primaryHotFiles": 0,
+        "supportingHotFiles": 40
+      },
+      "note": "Primary hot file lists should not be led by locale, docs, tests, fixtures, config, or migrations."
+    },
+    {
+      "id": "follow-up-edit-readiness",
+      "title": "Analysis can drive implementation work",
+      "status": "ready",
+      "evidence": {
+        "actionIds": [
+          "apply-targeted-implementation",
+          "sync-documentation",
+          "validate-impact"
+        ]
+      },
+      "note": "For change/fix/optimize requests, convert follow-up actions into edits before final validation."
+    },
+    {
+      "id": "history-window-coverage",
+      "title": "History uses 30/90/180 style windows with confidence notes",
+      "status": "ready",
+      "evidence": {
+        "windows": [
+          30,
+          90,
+          180
+        ],
+        "confidence": "high"
+      },
+      "note": "Low history confidence should downgrade hotspot certainty, not block source inspection."
+    },
+    {
+      "id": "large-repo-safety",
+      "title": "Large git output has explicit bounded handling",
+      "status": "ready",
+      "evidence": {
+        "trackedFiles": 241,
+        "trackedFilesBeforeFilters": 241
+      },
+      "note": "A non-empty tracked-file profile is the first regression guard for large repositories."
+    },
+    {
+      "id": "language-framework-coverage",
+      "title": "Language and framework signals are visible",
+      "status": "ready",
+      "evidence": {
+        "languages": [
+          "python"
+        ],
+        "frameworks": []
+      },
+      "note": "Framework signals guide inspection; they do not replace reading implementation files."
+    },
+    {
+      "id": "static-evidence-boundary",
+      "title": "Runtime, CI, and test claims stay unverified until separately checked",
+      "status": "ready",
+      "evidence": {
+        "boundary": "static-local-git-and-file-analysis",
+        "unverified": [
+          "tests passed",
+          "CI status",
+          "runtime behavior"
+        ]
+      },
+      "note": "Reports should cite commands for local counts and mark non-executed claims as UNVERIFIED."
+    },
+    {
+      "id": "core-diagnostic-coverage",
+      "title": "Affected core chains receive a diagnostic-coverage review",
+      "status": "not-applicable",
+      "evidence": {
+        "affectedCoreFiles": [],
+        "actionId": "review-core-diagnostic-coverage"
+      },
+      "note": "The static pack requests a semantic review; source, executable-route, or captured-output evidence must confirm any missing-log finding."
+    },
+    {
+      "id": "change-drift-companion-coverage",
+      "title": "Changed surfaces have companion evidence checks",
+      "status": "ready",
+      "evidence": {
+        "findingCount": 0,
+        "types": []
+      },
+      "note": "Companion drift findings are advisory; update the companion file or document why it is not needed."
+    },
+    {
+      "id": "agent-report-flexibility",
+      "title": "Agents can rerun or filter instead of accepting noisy defaults",
+      "status": "ready",
+      "evidence": {
+        "filtersApplied": false,
+        "optionalSupportingPatterns": [
+          "Cargo.toml",
+          "CHANGELOG.md",
+          "README.md",
+          ".github/workflows/ci.yml",
+          "examples/**",
+          "CLAUDE.md"
+        ]
+      },
+      "note": "Optional filters are analysis aids; they should be disclosed when used."
+    }
+  ]
+}

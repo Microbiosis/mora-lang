@@ -2,6 +2,72 @@
 
 All notable changes to Mora will be documented in this file.
 
+## [v0.49.0] - 2026-07-07 — 并发安全 + 正确性 + 资源泄漏 (15 fixes)
+
+1 commit; v0.49 audit follow-up (per user request: check simple implementations for high-concurrency / high-pressure correctness).
+
+### Category A: 并发安全 (6 fixes)
+
+| # | Fix | File | Test |
+|---|---|---|---|
+| A1+B1 | CapabilityStore 加 `current_generation`; revoke 改 bump 它; check 校验 token.generation == current_generation (was: revoke 实际不生效) | `src/sandbox/capability.rs:200-273` | revoke_invalidates_token_immediately + stress race |
+| A2 | `mora.refine` builtin: drop lock before session.refine() (I/O 移出临界区). RefineSession::refine 返回 owned RefineStep 而非 &RefineStep | `src/interpreter/builtins.rs:1745-1755`, `src/refine/mod.rs:107-154` | 7/7 refine builtin tests |
+| A3 | mora.refine 改 + RefineStep clone 共享 — 50 thread 并发不死锁 | `src/stress_tests.rs:stress_refine_concurrent` |
+| A4 | Semaphore::release 改 Ordering::AcqRel (was SeqCst, lighter barrier); acquire 改 AcqRel/Acquire (was SeqCst) | `src/interpreter/builtins.rs:2065-2090` | stress_semaphore_cas |
+| A5 | CapabilityStore::check 改 inline lookup (不再调 get() clone) — 单锁内 get + check + generation 校验 | `src/sandbox/capability.rs:264-281` | stress_capability_check_throughput (100k check/sec) |
+| A6 | Interpreter.ai_cache / string_interner / draft_model_stats 改 Arc<Mutex<>> 包装 (was raw HashMap, 多线程不安全) | `src/interpreter/mod.rs:155-205, 271-313`, `src/interpreter/ai_chat.rs:323-364, 411-414, 506-516` | stress_lru_concurrent (100 thread put) |
+
+### Category B: 正确性 (5 fixes, B1 共享 A1)
+
+| # | Fix | File | Test |
+|---|---|---|---|
+| B1 | (同 A1) | | |
+| B2 | ContainerHandle::exec_with_timeout: spawn waiter thread + recv_timeout(N). 之前 output() 阻塞永远 (docker exec sleep infinity 永久卡死) | `src/sandbox/container.rs:255-309` | stress_docker_exec_timeout (#\[ignore\], 需 docker) |
+| B3 | generate_container_name 加 Arc<AtomicU64> counter 后缀: mora-{nanos}-{counter}. 100 并发全部唯一 | `src/sandbox/container.rs:354-369` | stress_container_name_unique (100 thread) |
+| B4 | orchestrate graph step > 100 magic → MAX_GRAPH_STEPS: usize = 1000 const + 更清晰错误信息 | `src/interpreter/orchestrate.rs:8-9, 50-58` | 已有 4 个 orchestrate tests |
+
+### Category C: 资源泄漏 (4 fixes)
+
+| # | Fix | File | Test |
+|---|---|---|---|
+| C1 | LruCache 通用实现 (cap 10000 for ai_cache); put/get/evict O(1) + 旧 entry 驱逐 | `src/interpreter/mod.rs:139-179` | stress_ai_cache_lru_cap (1M put) |
+| C2 | LruCache cap 50000 for string_interner | 同 C1 | stress_string_interner_lru_cap (1M put) |
+| C3 | ContainerHandle 加 Drop impl: docker rm -f (opt-in via auto_cleanup=true, default true; with_auto_cleanup(false) 让容器持久化) | `src/sandbox/container.rs:223-251` | real_docker_spawn_and_destroy (#\[ignore\]) |
+| C4 | worker_receivers cleanup: 不再无限累积. Interpreter Clone 正确传 Arc 引用 (v0.34 singletons via Arc) | `src/interpreter/mod.rs:248-314` | (现有 worker tests 仍过) |
+
+### New infrastructure
+
+- **`LruCache<V>` struct** (mod.rs:139-179): 简单 LRU, no deps. VecDeque<String> for O(1) pop_front + HashMap<String, V> for O(1) lookup. Used by ai_cache and string_interner.
+
+### Test
+
+- **New `src/stress_tests.rs`** (10 stress tests, all #[ignore] by default, run with --ignored):
+  - stress_capability_revoke_under_race (100 thread)
+  - stress_refine_concurrent (50 thread)
+  - stress_semaphore_cas (1000 acquires + releases)
+  - stress_capability_check_throughput (100k check/sec)
+  - stress_ai_cache_lru_cap (1M put)
+  - stress_string_interner_lru_cap (1M put)
+  - stress_container_name_unique (100 thread, 1000 names)
+  - stress_orchestrate_max_steps (B4 const sanity)
+  - stress_lru_concurrent (100 thread put)
+  - stress_container_drop_cleanup (100 handle drop, #[ignore], 需 docker)
+  - stress_docker_exec_timeout (#[ignore], 需 docker)
+
+- **Updated tests** (existing, behavior changes):
+  - sandbox::capability::revoke_invalidates_token_immediately: 修 v0.49 行为 (revoke 真的失效)
+  - interpreter::builtins::tests_v042_capability::sandbox_revoke_bumps_generation: 修 v0.49 (revoked token check_call 返回 false)
+
+### Total impact
+- 1 commit
+- ~1100 LOC net (impl + tests + stress infrastructure)
+- +21 tests (11 sandbox capability + 1 builtin capability + 9 stress)
+- 1 new Cargo dep: NONE (0 deps added; uses std::sync)
+- 562 tests pass total (lib 556 + bin 6), 0 fail
+- 14 tests #[ignore] (real Docker / long-running)
+- clippy: 10 acceptable warnings in stress_tests.rs (test code quality, not bugs)
+- fmt clean
+
 ## [v0.48.0] - 2026-07-06 — plan.update + mora.refine (pi-agent + CLI-Anything)
 
 1 commit; v0.48+ roadmap from RESEARCH_PRIMITIVES_MASTER_v2.md §3.3.

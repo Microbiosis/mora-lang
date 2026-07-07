@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["PlaneKind"],"fn":["default_registry","shared_default_registry"],"struct":["ToolPlane","ToolPlaneRegistry","ToolSpec"],"type":["SharedRegistry"]};

@@ -1,0 +1,22 @@
+schema_version: 1
+module_path: ""
+title: Mora AI 原生脚本语言工作区
+scope:
+    - README.md
+    - Cargo.toml
+    - Cargo.lock
+    - build.rs
+    - Dockerfile
+    - docker-compose.yml
+    - .gitignore
+    - .dockerignore
+    - AGENTS_CODE_MODIFICATION.md
+    - AGENTS_PRIMITIVES.md
+    - AGENTS_PRIMITIVES_v2.md
+    - AGENTS_SESSION_V0_34.md
+    - AGENTS_SESSION_V0_41.md
+    - CHANGELOG.md
+    - LICENSE
+source_files: []
+depends_on: []
+related_to: []

@@ -46,6 +46,14 @@ ureq = "3.3"
 libc = { version = "0.2", features = ["extra_traits"] }
 # v0.22: flate2 用于录制文件压缩存储
 flate2 = "1.1"
+parking_lot = "0.12"
+# v0.50.0 (P0-B): tokio async runtime for HTTP/MCP server layers
+# rt-multi-thread: multi-threaded runtime
+# macros: #[tokio::main] support
+# net: tokio::net::TcpListener
+# time: tokio::time::timeout
+# sync: tokio::sync::RwLock, Mutex, Semaphore
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "io-util", "io-std"] }
 # v0.42.1: sha2 for SHA-256 hash chain in AuditSink (audit.jsonl)
 sha2 = "0.10"
 # v0.28: Office (PPTX/DOCX) + Image OCR backends (all pure Rust)
@@ -71,3 +79,9 @@ pdf-extract = "0.12"
 pulldown-cmark = "0.13"
 # HTML 后端
 quick-xml = "0.40"
+# v0.50: Checkpoint persistence (Worker 3)
+uuid = { version = "1", features = ["v4"] }
+rusqlite = { version = "0.32", optional = true, features = ["bundled"] }
+
+[features]
+checkpoint-sqlite = ["rusqlite"]

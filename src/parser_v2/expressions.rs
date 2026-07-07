@@ -406,6 +406,10 @@ impl ParserV2 {
             } else {
                 self.arena.alloc_expr(ExprKind::Variable(ns_or_name), span)
             }
+        } else if self.check(&TokenType::Command) {
+            self.command_expression(span)
+        } else if self.check(&TokenType::Send) {
+            self.send_expression(span)
         } else if self.check(&TokenType::LParen) {
             self.advance();
             let expr = self.expression();
@@ -438,6 +442,95 @@ impl ParserV2 {
             self.arena
                 .alloc_expr(ExprKind::Literal(Literal::Nil(span)), span)
         }
+    }
+
+    /// v0.50: 解析 Command 表达式
+    /// command { goto: "node_name", update: { key: expr }, resume: expr }
+    fn command_expression(&mut self, span: Span) -> NodeId {
+        self.advance(); // consume 'command'
+        self.consume(&TokenType::LBrace, "Expected '{'");
+        let mut goto = None;
+        let mut update = Vec::new();
+        let mut resume = None;
+        while !self.check(&TokenType::RBrace) && !self.is_at_end() {
+            while self.check(&TokenType::Newline) {
+                self.advance();
+            }
+            if self.check(&TokenType::RBrace) || self.is_at_end() {
+                break;
+            }
+            let key = self.consume_identifier("Expected field name");
+            self.consume(&TokenType::Colon, "Expected ':'");
+            match key.as_str() {
+                "goto" => {
+                    if let Some(Token {
+                        token_type: TokenType::String(s),
+                        ..
+                    }) = self.peek().cloned()
+                    {
+                        goto = Some(s);
+                        self.advance();
+                    } else {
+                        eprintln!("Parse error: command.goto expects string literal");
+                        self.expression(); // consume for error recovery
+                    }
+                }
+                "update" => {
+                    self.consume(&TokenType::LBrace, "Expected '{'");
+                    while !self.check(&TokenType::RBrace) && !self.is_at_end() {
+                        while self.check(&TokenType::Newline) {
+                            self.advance();
+                        }
+                        if self.check(&TokenType::RBrace) || self.is_at_end() {
+                            break;
+                        }
+                        let ukey = self.consume_identifier("Expected update key");
+                        self.consume(&TokenType::Colon, "Expected ':'");
+                        let uval = self.expression();
+                        update.push((ukey, uval));
+                        if !self.match_token(&[TokenType::Comma]) {
+                            break;
+                        }
+                    }
+                    self.consume(&TokenType::RBrace, "Expected '}'");
+                }
+                "resume" => {
+                    resume = Some(self.expression());
+                }
+                other => {
+                    eprintln!("Parse error: Unknown command field '{}'", other);
+                    self.expression(); // consume for error recovery
+                }
+            }
+            if !self.match_token(&[TokenType::Comma]) {
+                break;
+            }
+        }
+        self.consume(&TokenType::RBrace, "Expected '}'");
+        let kind = ExprKind::Command { goto, update, resume };
+        self.arena.alloc_expr(kind, span)
+    }
+
+    /// v0.50: 解析 Send 表达式
+    /// send("target", input_expr)
+    fn send_expression(&mut self, span: Span) -> NodeId {
+        self.advance(); // consume 'send'
+        self.consume(&TokenType::LParen, "Expected '('");
+        let target = if let Some(Token {
+            token_type: TokenType::String(s),
+            ..
+        }) = self.peek().cloned()
+        {
+            self.advance();
+            s
+        } else {
+            self.consume_identifier("Expected target name")
+        };
+        self.consume(&TokenType::Comma, "Expected ','");
+        let input = self.expression();
+        self.consume(&TokenType::RParen, "Expected ')'");
+        let kind = ExprKind::Send { target, input };
+        self.arena.alloc_expr(kind, span)
     }
 
     fn list_literal(&mut self, span: Span) -> NodeId {

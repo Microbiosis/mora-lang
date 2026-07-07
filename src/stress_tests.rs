@@ -26,7 +26,14 @@ use std::sync::Arc;
 use std::time::Instant;
 
 #[cfg(test)]
-#[allow(unused_mut, unused_variables, dead_code, clippy::doc_markdown, clippy::items_after_test_module, clippy::map_clone)]
+#[allow(
+    unused_mut,
+    unused_variables,
+    dead_code,
+    clippy::doc_markdown,
+    clippy::items_after_test_module,
+    clippy::map_clone
+)]
 mod tests {
     use super::*;
 
@@ -168,35 +175,36 @@ mod tests {
         use std::time::Duration;
 
         struct Sem {
-            permits: AtomicUsize,
+            inner: StdMutex<usize>,
+            cvar: std::sync::Condvar,
             max: usize,
-            holders: StdMutex<Vec<()>>,
         }
         impl Sem {
             fn new(max: usize) -> Self {
                 Self {
-                    permits: AtomicUsize::new(max),
+                    inner: StdMutex::new(max),
+                    cvar: std::sync::Condvar::new(),
                     max,
-                    holders: StdMutex::new(vec![]),
                 }
             }
             fn acquire(&self) {
-                loop {
-                    let cur = self.permits.load(Ordering::Acquire);
-                    if cur > 0
-                        && self
-                            .permits
-                            .compare_exchange(cur, cur - 1, Ordering::AcqRel, Ordering::Acquire)
-                            .is_ok()
-                    {
-                        return;
-                    }
-                    std::thread::yield_now();
+                // v0.50.0 (P0-12): Condvar-based wait (was yield_now spin).
+                // Prevents CPU saturation under contention.
+                let mut permits = self.inner.lock().expect("Sem inner mutex poisoned");
+                while *permits == 0 {
+                    permits = self.cvar.wait(permits).expect("Condvar wait failed");
                 }
+                *permits -= 1;
             }
             fn release(&self) {
-                let prev = self.permits.fetch_add(1, Ordering::AcqRel);
-                assert!(prev < self.max + 1, "permits overflow: prev={}", prev);
+                let mut permits = self.inner.lock().expect("Sem inner mutex poisoned");
+                *permits += 1;
+                assert!(
+                    *permits <= self.max + 1,
+                    "permits overflow: {} > max+1",
+                    *permits
+                );
+                self.cvar.notify_one();
             }
         }
 
@@ -218,7 +226,7 @@ mod tests {
         }
         assert_eq!(counter.load(Ordering::SeqCst), 1000);
         assert_eq!(
-            sem.permits.load(Ordering::SeqCst),
+            *sem.inner.lock().expect("Sem inner mutex poisoned"),
             10,
             "permits should return to max"
         );

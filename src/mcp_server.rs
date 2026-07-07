@@ -12,8 +12,9 @@
 //! 4. tools/call → 调 tool handler
 
 use std::collections::HashMap;
-use std::io::{self, BufRead, BufReader, Write};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use tokio::io::{self, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::sync::RwLock;
 
 use crate::interpreter::{Interpreter, Value};
 use crate::lsp::json::{Value as JsonValue, to_string as json_to_string};
@@ -28,7 +29,7 @@ pub struct McpTool {
     pub toolset: String,    // v0.24: 所属 toolset
 }
 
-pub type ToolRegistry = Arc<Mutex<HashMap<String, McpTool>>>;
+pub type ToolRegistry = Arc<tokio::sync::RwLock<HashMap<String, McpTool>>>;
 
 /// v0.24: Toolset 配置
 #[derive(Clone, Debug)]
@@ -113,19 +114,18 @@ pub fn builtin_toolsets() -> HashMap<String, Vec<String>> {
     map
 }
 
-/// 启动 MCP server (阻塞当前线程, 读 stdin 写 stdout)
-/// v0.22: 异步处理优化 - 使用线程池处理请求
-/// v0.24: 支持 toolset 配置
-pub fn start(
-    tools: ToolRegistry,
-    interpreter: Arc<Mutex<Interpreter>>,
-    config: Option<ToolsetConfig>,
+/// 启动 MCP server (async tokio, 读 stdin 写 stdout)
+/// v0.50.0: 完全 async 化 — tokio::sync::RwLock + spawn_blocking 包装同步 handler
+pub async fn start(
+    tool_registry: ToolRegistry,
+    interpreter: Arc<tokio::sync::RwLock<Interpreter>>,
+    _stdio: Option<tokio::io::Stdin>,
 ) -> io::Result<()> {
-    let config = config.unwrap_or_default();
+    let config = ToolsetConfig::default();
 
     eprintln!("[mcp] Mora MCP server starting on stdio");
     {
-        let tools = tools.lock().expect("tools mutex poisoned");
+        let tools = tool_registry.read().await;
         let enabled_count = tools.values().filter(|t| config.is_tool_enabled(t)).count();
         eprintln!(
             "[mcp] Registered {} tool(s) ({} enabled):",
@@ -149,50 +149,14 @@ pub fn start(
     }
     eprintln!();
 
-    // v0.22: 创建请求处理线程池
-    let pool_size = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4)
-        .min(8); // MCP 最多 8 个并发
-
-    let (tx, rx) = std::sync::mpsc::channel::<(JsonValue, std::sync::mpsc::Sender<JsonValue>)>();
-    let rx = Arc::new(Mutex::new(rx));
-
-    // 启动工作线程
-    for _ in 0..pool_size {
-        let rx = rx.clone();
-        let tools = tools.clone();
-        let interp = interpreter.clone();
-        std::thread::spawn(move || {
-            loop {
-                let result = {
-                    let guard = rx.lock().expect("rx mutex poisoned");
-                    guard.recv()
-                };
-                let (req, resp_tx) = match result {
-                    Ok(v) => v,
-                    Err(_) => break, // channel 关闭
-                };
-
-                // 处理请求
-                let response = dispatch(&req, &tools, &interp);
-
-                // 发送响应
-                if let Some(resp) = response {
-                    let _ = resp_tx.send(resp);
-                }
-            }
-        });
-    }
-
-    let stdin = io::stdin();
-    let mut reader = BufReader::new(stdin.lock());
-    let stdout = io::stdout();
-    let mut writer = stdout.lock();
+    let stdin = _stdio.unwrap_or_else(tokio::io::stdin);
+    let stdout = tokio::io::stdout();
+    let mut reader = BufReader::new(stdin);
+    let mut writer = stdout;
 
     loop {
         // 读一条 JSON-RPC message (Content-Length framing)
-        let body = match read_message(&mut reader) {
+        let body = match read_message(&mut reader).await {
             Ok(Some(b)) => b,
             Ok(None) => {
                 eprintln!("[mcp] stdin closed, exiting");
@@ -213,29 +177,21 @@ pub fn start(
             }
         };
 
-        // v0.22: 异步分发请求
         let is_notification = req.get("id").is_none();
 
         if is_notification {
-            // notification 直接处理，不等待响应
-            let _ = dispatch(&req, &tools, &interpreter);
+            // notification 直接异步处理，不等待响应
+            let tools = tool_registry.clone();
+            let interp = interpreter.clone();
+            tokio::spawn(async move {
+                let _ = dispatch(&req, &tools, &interp).await;
+            });
         } else {
-            // 请求异步处理
-            let (resp_tx, resp_rx) = std::sync::mpsc::channel();
-            if let Err(e) = tx.send((req, resp_tx)) {
-                eprintln!("[mcp] dispatch error: {}", e);
-                continue;
-            }
-
-            // 等待响应
-            match resp_rx.recv() {
-                Ok(resp) => {
-                    let resp_str = json_to_string(&resp);
-                    write_message(&mut writer, &resp_str)?;
-                }
-                Err(e) => {
-                    eprintln!("[mcp] response error: {}", e);
-                }
+            // 请求同步处理并回写响应
+            let response = dispatch(&req, &tool_registry, &interpreter).await;
+            if let Some(resp) = response {
+                let resp_str = json_to_string(&resp);
+                write_message(&mut writer, &resp_str).await?;
             }
         }
     }
@@ -244,35 +200,18 @@ pub fn start(
 
 /// 读一条 JSON-RPC message (Content-Length framing)
 /// 返回 None 表示 EOF
-fn read_message<R: BufRead>(reader: &mut R) -> io::Result<Option<String>> {
+async fn read_message<R: AsyncBufReadExt + Unpin>(reader: &mut R) -> io::Result<Option<String>> {
     let mut content_length: Option<usize> = None;
     let mut line = String::new();
 
     // 读 headers
     loop {
         line.clear();
-        let mut byte = [0u8; 1];
-        let mut got_eof = false;
-        loop {
-            match reader.read(&mut byte) {
-                Ok(0) => {
-                    got_eof = true;
-                    break;
-                }
-                Ok(_) => {
-                    if byte[0] == b'\n' {
-                        break;
-                    }
-                    if byte[0] != b'\r' {
-                        line.push(byte[0] as char);
-                    }
-                }
-                Err(e) => return Err(e),
-            }
-        }
-        if got_eof {
+        let bytes_read = reader.read_line(&mut line).await?;
+        if bytes_read == 0 {
             return Ok(None);
         }
+        let line = line.trim_end();
         if line.is_empty() {
             // 空行 = header 结束
             break;
@@ -288,24 +227,25 @@ fn read_message<R: BufRead>(reader: &mut R) -> io::Result<Option<String>> {
         None => return Ok(None), // 没 Content-Length header, EOF
     };
     let mut body = vec![0u8; len];
-    reader.read_exact(&mut body)?;
+    reader.read_exact(&mut body).await?;
     Ok(Some(String::from_utf8_lossy(&body).to_string()))
 }
 
 /// 写一条 JSON-RPC message (Content-Length framing)
-fn write_message<W: Write>(writer: &mut W, body: &str) -> io::Result<()> {
+async fn write_message<W: AsyncWriteExt + Unpin>(writer: &mut W, body: &str) -> io::Result<()> {
     let bytes = body.as_bytes();
-    write!(writer, "Content-Length: {}\r\n\r\n", bytes.len())?;
-    writer.write_all(bytes)?;
-    writer.flush()
+    let header = format!("Content-Length: {}\r\n\r\n", bytes.len());
+    writer.write_all(header.as_bytes()).await?;
+    writer.write_all(bytes).await?;
+    writer.flush().await
 }
 
 /// dispatch 一条 JSON-RPC 请求
 /// 返回 None 表示是 notification (不响应)
-fn dispatch(
+async fn dispatch(
     req: &JsonValue,
     tools: &ToolRegistry,
-    interp: &Arc<Mutex<Interpreter>>,
+    interp: &Arc<RwLock<Interpreter>>,
 ) -> Option<JsonValue> {
     let method = req.get("method").and_then(|v| v.as_str())?;
     let id = req.get("id").cloned();
@@ -315,8 +255,8 @@ fn dispatch(
 
     let result = match method {
         "initialize" => Some(handle_initialize(req)),
-        "tools/list" => Some(handle_tools_list(tools)),
-        "tools/call" => Some(handle_tools_call(req, tools, interp)),
+        "tools/list" => Some(handle_tools_list(tools).await),
+        "tools/call" => Some(handle_tools_call(req, tools, interp).await),
         _ => {
             // 未知 method
             if !is_notification {
@@ -388,8 +328,8 @@ fn handle_initialize(_req: &JsonValue) -> JsonValue {
     JsonValue::Object(result)
 }
 
-fn handle_tools_list(tools: &ToolRegistry) -> JsonValue {
-    let tools_locked = tools.lock().expect("tools mutex poisoned");
+async fn handle_tools_list(tools: &ToolRegistry) -> JsonValue {
+    let tools_locked = tools.read().await;
     let mut tools_array = Vec::new();
     for (name, tool) in tools_locked.iter() {
         let mut t = std::collections::BTreeMap::new();
@@ -409,10 +349,10 @@ fn handle_tools_list(tools: &ToolRegistry) -> JsonValue {
     JsonValue::Object(result)
 }
 
-fn handle_tools_call(
+async fn handle_tools_call(
     req: &JsonValue,
     tools: &ToolRegistry,
-    interp: &Arc<Mutex<Interpreter>>,
+    interp: &Arc<RwLock<Interpreter>>,
 ) -> JsonValue {
     // parse params.name and params.arguments
     let params = req.get("params");
@@ -427,7 +367,7 @@ fn handle_tools_call(
 
     // 找 tool
     let tool = {
-        let tools = tools.lock().expect("tools mutex poisoned");
+        let tools = tools.read().await;
         tools.get(&name).cloned()
     };
     let tool = match tool {
@@ -438,39 +378,45 @@ fn handle_tools_call(
     // 把 args 转成 Mora Value
     let args_value = json_to_mora_value(&args_json);
 
-    // 调 handler 闭包
-    let result = {
-        let mut interp = interp.lock().expect("interp mutex poisoned");
-        match interp.call_value(&tool.handler, vec![args_value]) {
-            Ok(v) => v,
-            Err(e) => return mcp_error(-32603, &format!("Tool execution error: {}", e)),
-        }
-    };
+    // 调 handler 闭包 — 在 spawn_blocking 中执行同步调用，避免阻塞 tokio 异步线程
+    let handler = tool.handler.clone();
+    let interp = interp.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        let mut interp = interp.blocking_write();
+        interp.call_value(&handler, vec![args_value])
+    })
+    .await;
 
-    // 转成 MCP content 格式
-    let result_json = mora_to_json(&result);
-    let content_item = match result_json {
-        JsonValue::String_(s) => {
-            let mut c = std::collections::BTreeMap::new();
-            c.insert("type".to_string(), JsonValue::String_("text".to_string()));
-            c.insert("text".to_string(), JsonValue::String_(s));
-            JsonValue::Object(c)
-        }
-        other => {
-            // 非 string 结果: 转 JSON 字符串
-            let mut c = std::collections::BTreeMap::new();
-            c.insert("type".to_string(), JsonValue::String_("text".to_string()));
-            c.insert(
-                "text".to_string(),
-                JsonValue::String_(json_to_string(&other)),
-            );
-            JsonValue::Object(c)
-        }
-    };
+    match result {
+        Ok(Ok(v)) => {
+            // 转成 MCP content 格式
+            let result_json = mora_to_json(&v);
+            let content_item = match result_json {
+                JsonValue::String_(s) => {
+                    let mut c = std::collections::BTreeMap::new();
+                    c.insert("type".to_string(), JsonValue::String_("text".to_string()));
+                    c.insert("text".to_string(), JsonValue::String_(s));
+                    JsonValue::Object(c)
+                }
+                other => {
+                    // 非 string 结果: 转 JSON 字符串
+                    let mut c = std::collections::BTreeMap::new();
+                    c.insert("type".to_string(), JsonValue::String_("text".to_string()));
+                    c.insert(
+                        "text".to_string(),
+                        JsonValue::String_(json_to_string(&other)),
+                    );
+                    JsonValue::Object(c)
+                }
+            };
 
-    let mut result_map = std::collections::BTreeMap::new();
-    result_map.insert("content".to_string(), JsonValue::Array(vec![content_item]));
-    JsonValue::Object(result_map)
+            let mut result_map = std::collections::BTreeMap::new();
+            result_map.insert("content".to_string(), JsonValue::Array(vec![content_item]));
+            JsonValue::Object(result_map)
+        }
+        Ok(Err(e)) => mcp_error(-32603, &format!("Tool execution error: {}", e)),
+        Err(e) => mcp_error(-32603, &format!("Task panicked: {}", e)),
+    }
 }
 
 fn mcp_error(code: i64, message: &str) -> JsonValue {

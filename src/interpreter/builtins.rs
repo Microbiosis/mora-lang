@@ -604,13 +604,13 @@ impl Interpreter {
                     h
                 };
 
-                *self.container.lock().expect("container mutex poisoned") = Some(handle);
+                *self.container.lock() = Some(handle);
                 Ok(Value::Number(id_hash as f64))
             }
             // v0.44.0: sandbox.container_exec(cmd, args...) — run cmd INSIDE container via docker exec
             // Returns: Dict{exit_code, stdout, stderr, elapsed_ms}
             "container_exec" => {
-                let guard = self.container.lock().expect("container mutex poisoned");
+                let guard = self.container.lock();
                 let handle = guard
                     .as_ref()
                     .ok_or_else(|| {
@@ -653,7 +653,7 @@ impl Interpreter {
             }
             // v0.44.0: sandbox.container_info() — diagnostic, returns Dict (container_id, name, backend, mounts)
             "container_info" => {
-                let guard = self.container.lock().expect("container mutex poisoned");
+                let guard = self.container.lock();
                 match guard.as_ref() {
                     Some(handle) => {
                         let mut d = std::collections::HashMap::new();
@@ -698,7 +698,7 @@ impl Interpreter {
             }
             // v0.44.0: sandbox.container_clear() — REAL docker rm -f, then clear handle
             "container_clear" => {
-                let mut guard = self.container.lock().expect("container mutex poisoned");
+                let mut guard = self.container.lock();
                 if let Some(handle) = guard.as_ref() {
                     handle
                         .destroy()
@@ -1305,7 +1305,7 @@ impl Interpreter {
     /// - `tool.plane.find(plane_name, tool_name)` — Dict with description/parameters
     /// - `tool.plane.remove(plane_name)` — remove plane
     pub fn call_toolplane_method(&self, method: &str, args: &[Value]) -> Result<Value, String> {
-        let mut reg = self.tool_planes.lock().expect("tool_planes mutex poisoned");
+        let mut reg = self.tool_planes.lock();
 
         match method {
             "create" => {
@@ -1443,10 +1443,7 @@ impl Interpreter {
     /// - `skill.set_hub(path)` -> Bool (set public_registry path, mora-public.json)
     /// - `skill.refresh_hub()` -> Number (re-read hub, real file I/O)
     pub fn call_skill_method(&self, method: &str, args: &[Value]) -> Result<Value, String> {
-        let mut reg = self
-            .skill_registry
-            .lock()
-            .expect("skill_registry mutex poisoned");
+        let mut reg = self.skill_registry.lock();
 
         match method {
             "list" => {
@@ -1544,7 +1541,7 @@ impl Interpreter {
     /// - `plan.list(name?)` — list plans (or steps of one)
     /// - `plan.info(name)` — Dict{name, total, done, pending, completion_ratio}
     pub fn call_plan_method(&mut self, method: &str, args: &[Value]) -> Result<Value, String> {
-        let mut plans = self.plans.lock().expect("plans mutex poisoned");
+        let mut plans = self.plans.lock();
 
         match method {
             "create" => {
@@ -1746,10 +1743,7 @@ impl Interpreter {
                 // v0.49.0 (A2): drop lock before file I/O.
                 // get_or_create 只创建空 session (无 I/O); refine 是 I/O 在锁外
                 let step = {
-                    let mut registry = self
-                        .refine_registry
-                        .lock()
-                        .expect("refine_registry mutex poisoned");
+                    let mut registry = self.refine_registry.lock();
                     let session = registry.get_or_create(&script);
                     session.refine(&instruction)
                 }
@@ -1766,10 +1760,7 @@ impl Interpreter {
                 } else {
                     None
                 };
-                let registry = self
-                    .refine_registry
-                    .lock()
-                    .expect("refine_registry mutex poisoned");
+                let registry = self.refine_registry.lock();
                 let session = registry.get(&script).ok_or_else(|| {
                     format!("mora.refine_info: no session for '{}'", script.display())
                 })?;
@@ -1786,10 +1777,7 @@ impl Interpreter {
                 Ok(Value::Dict(step.to_dict()))
             }
             "list_refines" => {
-                let registry = self
-                    .refine_registry
-                    .lock()
-                    .expect("refine_registry mutex poisoned");
+                let registry = self.refine_registry.lock();
                 let mut names: Vec<String> = Vec::new();
                 for path in registry.session_paths() {
                     names.push(path.clone());
@@ -1870,7 +1858,19 @@ fn is_leap(year: i32) -> bool {
 
 /// v0.43.1: remember(category, text) — 追加到 ~/.mora/memory/YYYY-MM-DD.md
 /// 文件格式:
+/// ```text
+/// # YYYY-MM-DD
+///
+/// ## {category}
+///
+/// - {text}
+///
+/// ## {other_category}
+///
+/// - {text}
 /// ```
+/// 文件格式:
+/// ```text
 /// # YYYY-MM-DD
 ///
 /// ## {category}
@@ -3307,9 +3307,9 @@ mod tests_v044_container_real {
             Value::Number(n) => assert!(n > 0.0, "container_id hash should be non-zero"),
             other => panic!("expected Number, got: {:?}", other),
         }
-        assert!(interp.container.lock().unwrap().is_some());
+        assert!(interp.container.lock().is_some());
         cleanup_container(&mut interp);
-        assert!(interp.container.lock().unwrap().is_none());
+        assert!(interp.container.lock().is_none());
     }
 
     #[test]
@@ -3400,7 +3400,7 @@ mod tests_v044_container_real {
             .call_sandbox_method("containerize", &[Value::String("docker".to_string())])
             .unwrap();
         let id = {
-            let guard = interp.container.lock().unwrap();
+            let guard = interp.container.lock();
             guard.as_ref().unwrap().container_id.clone()
         };
         // 验证 container 真的在 docker 里

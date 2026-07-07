@@ -6,13 +6,14 @@ mod evaluate;
 mod execute;
 mod orchestrate;
 mod trait_dispatch;
+mod orchestrate_v2;
 
+use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::env;
 use std::fs;
 use std::io::{BufRead, BufReader, Read};
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::sync::Arc;
 
 // v1 AST types no longer imported — all v2 paths use ast_v2 / common
 use crate::ai_infra::*;
@@ -144,7 +145,7 @@ pub struct LruCache<V> {
     map: std::collections::HashMap<String, V>,
 }
 
-impl<V> LruCache<V> {
+impl<V: Clone> LruCache<V> {
     pub fn new(cap: usize) -> Self {
         Self {
             cap,
@@ -153,14 +154,28 @@ impl<V> LruCache<V> {
         }
     }
 
-    pub fn get(&mut self, key: &str) -> Option<&V> {
-        self.map.get(key)
+    /// 真正的 LRU get：命中后把 key 移到 order 末尾（最新）
+    pub fn get(&mut self, key: &str) -> Option<V> {
+        if self.map.contains_key(key) {
+            // 刷新访问顺序
+            if let Some(pos) = self.order.iter().position(|k| k == key) {
+                self.order.remove(pos);
+                self.order.push_back(key.to_string());
+            }
+            self.map.get(key).cloned()
+        } else {
+            None
+        }
     }
 
     /// 插入或更新. 超 cap 时 evict 最旧.
     pub fn put(&mut self, key: String, value: V) {
         if self.map.contains_key(&key) {
-            // 更新 — 不动 order (视为 LRU 不变); 简单实现
+            // 更新 — 刷新 order 为最新
+            if let Some(pos) = self.order.iter().position(|k| k == &key) {
+                self.order.remove(pos);
+            }
+            self.order.push_back(key.clone());
             self.map.insert(key, value);
             return;
         }
@@ -206,14 +221,13 @@ pub struct Interpreter {
     worker_receivers: HashMap<String, crossbeam_channel::Receiver<Value>>,
     // v0.22: AI 调用内联缓存 (prompt_hash -> response)
     // v0.49.0 (C1): LRU cap=10000 (was unbounded HashMap) — prevents OOM
-    ai_cache: std::sync::Arc<std::sync::Mutex<LruCache<String>>>,
+    ai_cache: std::sync::Arc<Mutex<LruCache<String>>>,
     // v0.22: 字符串驻留池 (减少重复字符串内存)
     // v0.49.0 (C2): LRU cap=50000 (was unbounded HashMap)
-    string_interner: std::sync::Arc<std::sync::Mutex<LruCache<Value>>>,
+    string_interner: std::sync::Arc<Mutex<LruCache<Value>>>,
     // v0.24: 自适应 draft 模型选择 (model -> success_rate)
     // v0.49.0 (A6): wrapped in Arc<Mutex> for thread-safe shared access
-    draft_model_stats:
-        std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, (usize, usize)>>>, // (success, total)
+    draft_model_stats: std::sync::Arc<Mutex<std::collections::HashMap<String, (usize, usize)>>>, // (success, total)
     // v0.24: 上下文窗口管理器
     context_window: ContextWindow,
     // v0.24: 推测解码并行验证器
@@ -245,18 +259,19 @@ pub struct Interpreter {
     /// v0.44.0: Container handle (REAL Docker spawn via `docker run`)
     /// None = no container (run on host). Set via sandbox.containerize builtin.
     /// Arc<Mutex<>> keeps call_sandbox_method `&self` (Clone-safe).
-    pub container: std::sync::Arc<std::sync::Mutex<Option<crate::sandbox::ContainerHandle>>>,
+    pub container: std::sync::Arc<Mutex<Option<crate::sandbox::ContainerHandle>>>,
     /// v0.45.0: ToolPlane registry (multi-plane Core/Extension adapter)
     /// Default has 2 core planes: "ai" + "sandbox"
-    pub tool_planes: std::sync::Arc<std::sync::Mutex<crate::toolplane::ToolPlaneRegistry>>,
+    pub tool_planes: std::sync::Arc<Mutex<crate::toolplane::ToolPlaneRegistry>>,
     /// v0.46.0: Skill registry (MoraSkillSpec + dual registry, CLI-Anything pattern)
     /// Loaded from `~/.mora/skills/` or via builtin skill.load / skill.install
-    pub skill_registry: std::sync::Arc<std::sync::Mutex<crate::skill::SkillRegistry>>,
+    pub skill_registry: std::sync::Arc<Mutex<crate::skill::SkillRegistry>>,
     /// v0.48.0: Plans (multi-plan, keyed by name) for plan.update (pi-agent)
-    pub plans:
-        std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, crate::plan::Plan>>>,
+    pub plans: std::sync::Arc<Mutex<std::collections::HashMap<String, crate::plan::Plan>>>,
     /// v0.48.0: Refine session registry (multi-script, CLI-Anything /refine)
-    pub refine_registry: std::sync::Arc<std::sync::Mutex<crate::refine::RefineRegistry>>,
+    pub refine_registry: std::sync::Arc<Mutex<crate::refine::RefineRegistry>>,
+    /// v0.50: Pregel 检查点保存器（由 Worker 2/3 完善 checkpoint 模块后注入）
+    pub checkpoint_saver: Option<std::sync::Arc<dyn crate::interpreter::orchestrate_v2::CheckpointSaver>>,
 }
 
 /// v0.06: with 块字段 (不经过 env 变量)
@@ -319,6 +334,7 @@ impl Clone for Interpreter {
             skill_registry: self.skill_registry.clone(),
             plans: self.plans.clone(),
             refine_registry: self.refine_registry.clone(),
+            checkpoint_saver: self.checkpoint_saver.clone(),
         }
     }
 }
@@ -425,7 +441,7 @@ impl Interpreter {
         let globals = Arc::new(Mutex::new(Environment::new()));
         use crate::value::BuiltinKind as Bk;
         {
-            let mut g = globals.lock().expect("globals mutex poisoned");
+            let mut g = globals.lock();
             // v0.37 (P1-3.6): use typed BuiltinKind instead of String.
             g.define("print".to_string(), Value::Builtin(Bk::Print), false);
             g.define("range".to_string(), Value::Builtin(Bk::Range), false);
@@ -486,15 +502,11 @@ impl Interpreter {
             recorder: crate::record::Recorder::new_off(),
             worker_channels: HashMap::new(),
             worker_receivers: HashMap::new(),
-            ai_cache: std::sync::Arc::new(std::sync::Mutex::new(
-                crate::interpreter::LruCache::new(10000),
-            )),
-            string_interner: std::sync::Arc::new(std::sync::Mutex::new(
-                crate::interpreter::LruCache::new(50000),
-            )),
-            draft_model_stats: std::sync::Arc::new(std::sync::Mutex::new(
-                std::collections::HashMap::new(),
-            )),
+            ai_cache: std::sync::Arc::new(Mutex::new(crate::interpreter::LruCache::new(10000))),
+            string_interner: std::sync::Arc::new(Mutex::new(crate::interpreter::LruCache::new(
+                50000,
+            ))),
+            draft_model_stats: std::sync::Arc::new(Mutex::new(std::collections::HashMap::new())),
             context_window: ContextWindow::default(),
             speculative_verifier: SpeculativeVerifier::default(),
             cache_warmer: CacheWarmer::default(),
@@ -507,15 +519,12 @@ impl Interpreter {
             mock_registry: crate::mock::MockRegistry::new(),
             audit_sink: std::sync::Arc::new(crate::audit::NullSink::new()),
             markdown_memory_dir: None,
-            container: std::sync::Arc::new(std::sync::Mutex::new(None)),
-            tool_planes: crate::toolplane::shared_default_registry(),
-            skill_registry: std::sync::Arc::new(std::sync::Mutex::new(
-                crate::skill::SkillRegistry::new(),
-            )),
-            plans: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
-            refine_registry: std::sync::Arc::new(std::sync::Mutex::new(
-                crate::refine::RefineRegistry::new(),
-            )),
+            container: std::sync::Arc::new(Mutex::new(None)),
+            tool_planes: std::sync::Arc::new(Mutex::new(crate::toolplane::default_registry())),
+            skill_registry: std::sync::Arc::new(Mutex::new(crate::skill::SkillRegistry::new())),
+            plans: std::sync::Arc::new(Mutex::new(std::collections::HashMap::new())),
+            refine_registry: std::sync::Arc::new(Mutex::new(crate::refine::RefineRegistry::new())),
+            checkpoint_saver: None,
         }
     }
 
@@ -537,15 +546,11 @@ impl Interpreter {
             recorder: crate::record::Recorder::new_off(),
             worker_channels: HashMap::new(),
             worker_receivers: HashMap::new(),
-            ai_cache: std::sync::Arc::new(std::sync::Mutex::new(
-                crate::interpreter::LruCache::new(10000),
-            )),
-            string_interner: std::sync::Arc::new(std::sync::Mutex::new(
-                crate::interpreter::LruCache::new(50000),
-            )),
-            draft_model_stats: std::sync::Arc::new(std::sync::Mutex::new(
-                std::collections::HashMap::new(),
-            )),
+            ai_cache: std::sync::Arc::new(Mutex::new(crate::interpreter::LruCache::new(10000))),
+            string_interner: std::sync::Arc::new(Mutex::new(crate::interpreter::LruCache::new(
+                50000,
+            ))),
+            draft_model_stats: std::sync::Arc::new(Mutex::new(std::collections::HashMap::new())),
             context_window: ContextWindow::default(),
             speculative_verifier: SpeculativeVerifier::default(),
             cache_warmer: CacheWarmer::default(),
@@ -558,15 +563,12 @@ impl Interpreter {
             mock_registry: crate::mock::MockRegistry::new(),
             audit_sink: std::sync::Arc::new(crate::audit::NullSink::new()),
             markdown_memory_dir: None,
-            container: std::sync::Arc::new(std::sync::Mutex::new(None)),
-            tool_planes: crate::toolplane::shared_default_registry(),
-            skill_registry: std::sync::Arc::new(std::sync::Mutex::new(
-                crate::skill::SkillRegistry::new(),
-            )),
-            plans: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
-            refine_registry: std::sync::Arc::new(std::sync::Mutex::new(
-                crate::refine::RefineRegistry::new(),
-            )),
+            container: std::sync::Arc::new(Mutex::new(None)),
+            tool_planes: std::sync::Arc::new(Mutex::new(crate::toolplane::default_registry())),
+            skill_registry: std::sync::Arc::new(Mutex::new(crate::skill::SkillRegistry::new())),
+            plans: std::sync::Arc::new(Mutex::new(std::collections::HashMap::new())),
+            refine_registry: std::sync::Arc::new(Mutex::new(crate::refine::RefineRegistry::new())),
+            checkpoint_saver: None,
         }
     }
 
@@ -586,15 +588,11 @@ impl Interpreter {
             recorder: crate::record::Recorder::new_off(),
             worker_channels: HashMap::new(),
             worker_receivers: HashMap::new(),
-            ai_cache: std::sync::Arc::new(std::sync::Mutex::new(
-                crate::interpreter::LruCache::new(10000),
-            )),
-            string_interner: std::sync::Arc::new(std::sync::Mutex::new(
-                crate::interpreter::LruCache::new(50000),
-            )),
-            draft_model_stats: std::sync::Arc::new(std::sync::Mutex::new(
-                std::collections::HashMap::new(),
-            )),
+            ai_cache: std::sync::Arc::new(Mutex::new(crate::interpreter::LruCache::new(10000))),
+            string_interner: std::sync::Arc::new(Mutex::new(crate::interpreter::LruCache::new(
+                50000,
+            ))),
+            draft_model_stats: std::sync::Arc::new(Mutex::new(std::collections::HashMap::new())),
             context_window: ContextWindow::default(),
             speculative_verifier: SpeculativeVerifier::default(),
             cache_warmer: CacheWarmer::default(),
@@ -607,15 +605,51 @@ impl Interpreter {
             mock_registry: crate::mock::MockRegistry::new(),
             audit_sink: std::sync::Arc::new(crate::audit::NullSink::new()),
             markdown_memory_dir: None,
-            container: std::sync::Arc::new(std::sync::Mutex::new(None)),
-            tool_planes: crate::toolplane::shared_default_registry(),
-            skill_registry: std::sync::Arc::new(std::sync::Mutex::new(
-                crate::skill::SkillRegistry::new(),
-            )),
-            plans: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
-            refine_registry: std::sync::Arc::new(std::sync::Mutex::new(
-                crate::refine::RefineRegistry::new(),
-            )),
+            container: std::sync::Arc::new(Mutex::new(None)),
+            tool_planes: std::sync::Arc::new(Mutex::new(crate::toolplane::default_registry())),
+            skill_registry: std::sync::Arc::new(Mutex::new(crate::skill::SkillRegistry::new())),
+            plans: std::sync::Arc::new(Mutex::new(std::collections::HashMap::new())),
+            refine_registry: std::sync::Arc::new(Mutex::new(crate::refine::RefineRegistry::new())),
+            checkpoint_saver: None,
+        }
+    }
+
+    /// v0.50: 回溯到指定检查点之前的步骤（rewind）
+    pub fn rewind(
+        &mut self,
+        thread_id: &str,
+        before_step: usize,
+    ) -> Result<(), String> {
+        if let Some(ref saver) = self.checkpoint_saver {
+            let checkpoints = saver.list(thread_id)?;
+            let to_remove: Vec<String> = checkpoints
+                .into_iter()
+                .filter(|id| {
+                    id.starts_with("step-") && {
+                        let step_str = id.trim_start_matches("step-");
+                        step_str.parse::<usize>().unwrap_or(0) >= before_step
+                    }
+                })
+                .collect();
+            for id in to_remove {
+                // 占位：CheckpointSaver 当前未定义删除接口，
+                // Worker 2/3 完善 checkpoint 模块后补充
+            }
+            Ok(())
+        } else {
+            Err("No checkpoint saver configured".to_string())
+        }
+    }
+
+    /// v0.50: 从最新检查点恢复执行（resume）
+    pub fn resume(&mut self, thread_id: &str) -> Result<HashMap<String, Value>, String> {
+        if let Some(ref saver) = self.checkpoint_saver {
+            let cp = saver.load(thread_id, None)?.ok_or_else(|| {
+                format!("No checkpoint found for thread {}", thread_id)
+            })?;
+            Ok(cp.channel_values)
+        } else {
+            Err("No checkpoint saver configured".to_string())
         }
     }
 
@@ -635,20 +669,12 @@ impl Interpreter {
     /// v0.22: 字符串驻留 - 相同字符串只存储一次
     pub fn intern_string(&mut self, s: String) -> Value {
         // v0.49.0 (C2): LRU cache + lock (was unbounded HashMap direct access)
-        {
-            let mut map = self
-                .string_interner
-                .lock()
-                .expect("string_interner mutex poisoned");
-            if let Some(interned) = map.get(&s) {
-                return interned.clone();
-            }
+        let mut map = self.string_interner.lock();
+        if let Some(interned) = map.get(&s) {
+            return interned;
         }
         let val = Value::String(s.clone());
-        self.string_interner
-            .lock()
-            .expect("string_interner mutex poisoned")
-            .put(s, val.clone());
+        map.put(s, val.clone());
         val
     }
 
@@ -676,12 +702,7 @@ impl Interpreter {
             }
         }
         // 查找并执行 main task
-        let main_task = self
-            .globals
-            .lock()
-            .map_err(|_| "globals mutex poisoned".to_string())?
-            .get("main")
-            .clone();
+        let main_task = self.globals.lock().get("main").clone();
         if let Some(Value::Task { params, .. }) = main_task
             && params.is_empty()
         {

@@ -4,9 +4,10 @@
 //! No signature changes, no field changes, no visibility changes.
 //! Re-exported in interpreter.rs via `pub use crate::value::*;`
 
+use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::io::BufReader;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 // v1 Stmt 已移除 — Value::Task/Closure 不再持有 body
 
@@ -21,10 +22,8 @@ impl StreamReader {
     }
     pub fn lock(
         &self,
-    ) -> std::sync::MutexGuard<'_, BufReader<Box<dyn std::io::Read + Send + Sync>>> {
-        self.0
-            .lock()
-            .expect("StreamReader mutex poisoned: cannot acquire read lock")
+    ) -> parking_lot::MutexGuard<'_, BufReader<Box<dyn std::io::Read + Send + Sync>>> {
+        self.0.lock()
     }
 }
 
@@ -134,8 +133,8 @@ impl EnvRef {
     /// v0.40: convert an Arc<Mutex<Environment>> (legacy) into an
     /// EnvRef snapshot. The snapshot clones the Environment contents
     /// at capture time and is immutable thereafter.
-    pub fn from_arc_mutex(parent: std::sync::Arc<std::sync::Mutex<Environment>>) -> Self {
-        let env_clone = parent.lock().expect("env mutex poisoned").clone();
+    pub fn from_arc_mutex(parent: Arc<Mutex<Environment>>) -> Self {
+        let env_clone = parent.lock().clone();
         EnvRef(Box::new(env_clone))
     }
 }
@@ -357,8 +356,8 @@ impl std::fmt::Display for Value {
                 )
             }
             Value::Router { routes } => {
-                // v0.35: Display must be infallible; poisoned mutex used to panic.
-                let route_count = routes.lock().map(|m| m.len()).unwrap_or(0);
+                // v0.35: Display must be infallible; parking_lot::Mutex does not poison.
+                let route_count = routes.lock().len();
                 write!(f, "<router ({} routes)>", route_count)
             }
             Value::HttpRequest { method, path, .. } => {
@@ -385,11 +384,9 @@ impl std::fmt::Display for Value {
                 write!(f, "<partial>")
             }
             Value::Atom(arc) => {
-                // v0.35: Display must be infallible; poisoned mutex used to panic.
-                match arc.lock() {
-                    Ok(v) => write!(f, "<atom {:?}>", v),
-                    Err(_) => write!(f, "<atom (lock failed)>"),
-                }
+                // v0.35: Display must be infallible; parking_lot::Mutex does not poison.
+                let v = arc.lock();
+                write!(f, "<atom {:?}>", v)
             }
             Value::Macro { name, .. } => {
                 write!(f, "<macro {}>", name)
@@ -423,10 +420,10 @@ fn fmt_inner(f: &mut std::fmt::Formatter<'_>, v: &Value, depth: usize) -> std::f
         return f.write_str("…");
     }
     match v {
-        Value::Atom(arc) => match arc.lock() {
-            Ok(inner) => write!(f, "<atom {:?}>", inner),
-            Err(_) => f.write_str("<atom (lock failed)>"),
-        },
+        Value::Atom(arc) => {
+            let inner = arc.lock();
+            write!(f, "<atom {:?}>", inner)
+        }
         Value::List(items) => {
             write!(f, "[")?;
             for (i, child) in items.iter().enumerate() {
@@ -455,8 +452,8 @@ fn fmt_inner(f: &mut std::fmt::Formatter<'_>, v: &Value, depth: usize) -> std::f
 // ─── Environment ─────────────────────────────────────────
 #[derive(Debug, Clone)]
 pub struct Environment {
-    pub values: HashMap<String, Value>,
-    pub exports: HashMap<String, Value>,
+    pub values: HashMap<String, Arc<Mutex<Value>>>,
+    pub exports: HashMap<String, Arc<Mutex<Value>>>,
     pub parent: Option<Arc<Mutex<Environment>>>,
 }
 
@@ -486,40 +483,33 @@ impl Environment {
     /// v0.40: accept Rc<RefCell<>> for the new env model. Converts
     /// to Arc<Mutex<>> internally for now (C1 shim, removed in C4).
     pub fn with_parent_of_rc(parent: std::rc::Rc<std::cell::RefCell<Environment>>) -> Self {
-        Self::with_parent_of(std::sync::Arc::new(std::sync::Mutex::new(
-            parent.borrow().clone(),
-        )))
+        Self::with_parent_of(Arc::new(Mutex::new(parent.borrow().clone())))
     }
 
     pub fn define(&mut self, name: String, value: Value, exported: bool) {
-        self.values.insert(name.clone(), value.clone());
+        let arc = Arc::new(Mutex::new(value.clone()));
+        self.values.insert(name.clone(), arc.clone());
         if exported {
-            self.exports.insert(name, value);
+            self.exports.insert(name, arc);
         }
     }
 
     pub fn get(&self, name: &str) -> Option<Value> {
-        if let Some(value) = self.values.get(name) {
-            Some(value.clone())
+        if let Some(arc) = self.values.get(name) {
+            Some(arc.lock().clone())
         } else if let Some(parent) = &self.parent {
-            parent
-                .lock()
-                .expect("parent environment mutex poisoned")
-                .get(name)
+            parent.lock().get(name)
         } else {
             None
         }
     }
 
     pub fn assign(&mut self, name: &str, value: Value) -> bool {
-        if self.values.contains_key(name) {
-            self.values.insert(name.to_string(), value);
+        if let Some(arc) = self.values.get(name) {
+            *arc.lock() = value;
             true
         } else if let Some(parent) = &self.parent {
-            parent
-                .lock()
-                .expect("parent environment mutex poisoned")
-                .assign(name, value)
+            parent.lock().assign(name, value)
         } else {
             false
         }
@@ -529,13 +519,10 @@ impl Environment {
 
     /// 获取绑定状态
     pub fn get_binding(&self, name: &str) -> Option<Binding> {
-        if let Some(value) = self.values.get(name) {
-            Some(Binding::Value(value.clone()))
+        if let Some(arc) = self.values.get(name) {
+            Some(Binding::Value(arc.lock().clone()))
         } else if let Some(parent) = &self.parent {
-            parent
-                .lock()
-                .expect("parent environment mutex poisoned")
-                .get_binding(name)
+            parent.lock().get_binding(name)
         } else {
             None
         }
@@ -543,41 +530,32 @@ impl Environment {
 
     /// 移动变量（所有权转移）
     pub fn move_variable(&mut self, name: &str) -> Result<Value, String> {
-        if let Some(value) = self.values.remove(name) {
-            Ok(value)
+        if let Some(arc) = self.values.remove(name) {
+            Ok(arc.lock().clone())
         } else if let Some(parent) = &self.parent {
-            parent
-                .lock()
-                .expect("parent environment mutex poisoned")
-                .move_variable(name)
+            parent.lock().move_variable(name)
         } else {
             Err(format!("undefined variable: {}", name))
         }
     }
 
-    /// 借用变量（不可变）
+    /// 借用变量（不可变）— 返回共享 Arc，修改会反映到原变量
     pub fn borrow_variable(&self, name: &str) -> Result<Arc<Mutex<Value>>, String> {
-        if let Some(value) = self.values.get(name) {
-            Ok(Arc::new(Mutex::new(value.clone())))
+        if let Some(arc) = self.values.get(name) {
+            Ok(Arc::clone(arc))
         } else if let Some(parent) = &self.parent {
-            parent
-                .lock()
-                .expect("parent environment mutex poisoned")
-                .borrow_variable(name)
+            parent.lock().borrow_variable(name)
         } else {
             Err(format!("undefined variable: {}", name))
         }
     }
 
-    /// 可变借用变量
+    /// 可变借用变量 — 返回共享 Arc，修改会反映到原变量
     pub fn borrow_variable_mut(&mut self, name: &str) -> Result<Arc<Mutex<Value>>, String> {
-        if let Some(value) = self.values.get(name) {
-            Ok(Arc::new(Mutex::new(value.clone())))
+        if let Some(arc) = self.values.get(name) {
+            Ok(Arc::clone(arc))
         } else if let Some(parent) = &self.parent {
-            parent
-                .lock()
-                .expect("parent environment mutex poisoned")
-                .borrow_variable_mut(name)
+            parent.lock().borrow_variable_mut(name)
         } else {
             Err(format!("undefined variable: {}", name))
         }
@@ -713,7 +691,7 @@ mod tests {
     fn envref_from_arc_mutex_roundtrip() {
         let mut e = Environment::new();
         e.define("x".to_string(), Value::String("y".to_string()), false);
-        let arc = std::sync::Arc::new(std::sync::Mutex::new(e));
+        let arc = Arc::new(Mutex::new(e));
         let r = EnvRef::from_arc_mutex(arc);
         assert_eq!(r.env().get("x"), Some(Value::String("y".to_string())));
     }

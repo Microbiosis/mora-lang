@@ -26,7 +26,7 @@
 //! 3. interior: O(interior_patterns) 线性扫描
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, RwLock};
 
 use crate::value::Value;
 
@@ -41,19 +41,22 @@ pub type Handler = Arc<dyn Fn(&str, &Value) + Send + Sync + 'static>;
 pub struct EventBus {
     /// v0.41: 双层索引, emit 走 O(segments) 路径
     /// 字面量模式 (无通配符) → handler 列表
-    exact: Arc<Mutex<HashMap<Pattern, Vec<Handler>>>>,
+    /// v0.50.0 (P0-10): Mutex → RwLock (emit 是 read-only, 多 reader 并发)
+    exact: Arc<RwLock<HashMap<Pattern, Vec<Handler>>>>,
     /// 末尾通配符模式 ("a.b.*" 形式, key 即不带末尾 ".*" 的 prefix) → handler 列表
-    prefix: Arc<Mutex<HashMap<Pattern, Vec<Handler>>>>,
+    /// v0.50.0 (P0-10): RwLock (same reason)
+    prefix: Arc<RwLock<HashMap<Pattern, Vec<Handler>>>>,
     /// 中间通配符模式 (e.g. "a.*.c", "*.b.*") → handler 列表
     /// fallback linear scan; 用量极少
-    interior: Arc<Mutex<HashMap<Pattern, Vec<Handler>>>>,
+    /// v0.50.0 (P0-10): RwLock
+    interior: Arc<RwLock<HashMap<Pattern, Vec<Handler>>>>,
 }
 
 impl std::fmt::Debug for EventBus {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let exact = self.exact.lock().map(|h| h.len()).unwrap_or(0);
-        let prefix = self.prefix.lock().map(|h| h.len()).unwrap_or(0);
-        let interior = self.interior.lock().map(|h| h.len()).unwrap_or(0);
+        let exact = self.exact.read().map(|h| h.len()).unwrap_or(0);
+        let prefix = self.prefix.read().map(|h| h.len()).unwrap_or(0);
+        let interior = self.interior.read().map(|h| h.len()).unwrap_or(0);
         f.debug_struct("EventBus")
             .field("exact", &exact)
             .field("prefix", &prefix)
@@ -77,24 +80,25 @@ impl EventBus {
         let bucket = classify_pattern(pattern);
         match bucket {
             PatternBucket::Exact => {
+                // v0.50.0 (P0-10): write lock (on is a write op, rare)
                 self.exact
-                    .lock()
-                    .expect("event bus mutex poisoned")
+                    .write()
+                    .expect("event bus rwlock poisoned")
                     .entry(pattern.to_string())
                     .or_default()
                     .push(handler);
             }
             PatternBucket::Prefix(prefix_key) => {
                 self.prefix
-                    .lock()
-                    .expect("event bus mutex poisoned")
+                    .write()
+                    .expect("event bus rwlock poisoned")
                     .entry(prefix_key)
                     .or_default()
                     .push(handler);
             }
             PatternBucket::Interior => {
                 self.interior
-                    .lock()
+                    .write()
                     .expect("event bus mutex poisoned")
                     .entry(pattern.to_string())
                     .or_default()
@@ -118,7 +122,7 @@ impl EventBus {
             let mut out: Vec<Handler> = Vec::new();
 
             // 1. Exact match (O(1))
-            if let Ok(exact) = self.exact.lock()
+            if let Ok(exact) = self.exact.read()
                 && let Some(handlers) = exact.get(event)
             {
                 out.extend(handlers.iter().cloned());
@@ -132,7 +136,7 @@ impl EventBus {
             //    so we walk i in 0..parts.len()-1 looking up "outer", "outer.gui", "outer.gui.item"
             //    matching prefix["outer.*"], prefix["outer.gui.*"], prefix["outer.gui.item.*"]
             //    BUT: prefix key 不带末尾 ".*", so we lookup "outer", "outer.gui", "outer.gui.item"
-            if let Ok(prefix) = self.prefix.lock() {
+            if let Ok(prefix) = self.prefix.read() {
                 let parts: Vec<&str> = event.split('.').collect();
                 // Catch-all: prefix[""] corresponds to "*" pattern, always fires
                 if let Some(handlers) = prefix.get("") {
@@ -147,7 +151,7 @@ impl EventBus {
             }
 
             // 3. Interior wildcard patterns (fallback linear scan, but rare)
-            if let Ok(interior) = self.interior.lock() {
+            if let Ok(interior) = self.interior.read() {
                 for (pattern, handlers) in interior.iter() {
                     if matches(event, pattern) {
                         out.extend(handlers.iter().cloned());
@@ -169,20 +173,20 @@ impl EventBus {
         match bucket {
             PatternBucket::Exact => {
                 self.exact
-                    .lock()
-                    .expect("event bus mutex poisoned")
+                    .write()
+                    .expect("event bus rwlock poisoned")
                     .remove(pattern);
             }
             PatternBucket::Prefix(prefix_key) => {
                 self.prefix
-                    .lock()
-                    .expect("event bus mutex poisoned")
+                    .write()
+                    .expect("event bus rwlock poisoned")
                     .remove(&prefix_key);
             }
             PatternBucket::Interior => {
                 self.interior
-                    .lock()
-                    .expect("event bus mutex poisoned")
+                    .write()
+                    .expect("event bus rwlock poisoned")
                     .remove(pattern);
             }
         }
@@ -190,9 +194,9 @@ impl EventBus {
 
     /// 当前注册的 (exact + prefix + interior) 模式总数 (test helper)
     pub fn pattern_count(&self) -> usize {
-        let exact = self.exact.lock().map(|h| h.len()).unwrap_or(0);
-        let prefix = self.prefix.lock().map(|h| h.len()).unwrap_or(0);
-        let interior = self.interior.lock().map(|h| h.len()).unwrap_or(0);
+        let exact = self.exact.read().map(|h| h.len()).unwrap_or(0);
+        let prefix = self.prefix.read().map(|h| h.len()).unwrap_or(0);
+        let interior = self.interior.read().map(|h| h.len()).unwrap_or(0);
         exact + prefix + interior
     }
 }

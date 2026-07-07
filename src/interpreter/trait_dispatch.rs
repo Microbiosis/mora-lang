@@ -96,10 +96,7 @@ impl Interpreter {
             // 1. 先找具体类型的 impl
             let impl_name =
                 impl_method_key(tname_str, &trait_generics, &for_type, &for_generics, method);
-            let env = self
-                .environment
-                .lock()
-                .map_err(|_| "env mutex poisoned".to_string())?;
+            let env = self.environment.lock();
             if let Some(task) = env.get(&impl_name) {
                 drop(env);
                 let mut all_args = if has_self {
@@ -114,10 +111,7 @@ impl Interpreter {
 
             // 2. fallback 到 trait 默认实现
             let default_name = default_impl_method_key(tname_str, &trait_generics, method);
-            let env = self
-                .environment
-                .lock()
-                .map_err(|_| "env mutex poisoned".to_string())?;
+            let env = self.environment.lock();
             if let Some(task) = env.get(&default_name) {
                 drop(env);
                 let mut all_args = if has_self {
@@ -150,10 +144,7 @@ impl Interpreter {
         call_site: Span,
     ) -> Result<Value, String> {
         let method_names = collect_required_methods(&self.trait_registry, trait_name);
-        let env = self
-            .environment
-            .lock()
-            .map_err(|_| "env mutex poisoned".to_string())?;
+        let env = self.environment.lock();
         for m in method_names {
             let impl_name = impl_method_key(trait_name, trait_generics, for_type, for_generics, m);
             let default_name = default_impl_method_key(trait_name, trait_generics, m);

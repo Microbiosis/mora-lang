@@ -395,6 +395,21 @@ pub fn spawn_container(spec: &ContainerSpec) -> Result<ContainerHandle, String> 
     Ok(ContainerHandle::new(container_id, name, spec.clone()))
 }
 
+/// v0.49.0 (B2): timeout helper, kill process group on docker exec timeout.
+/// Unix: killpg(SIGKILL); Windows: taskkill /F /T.
+fn timeout_kill_process_group(pid: u32) {
+    #[cfg(unix)]
+    unsafe {
+        libc::killpg(pid as i32, libc::SIGKILL);
+    }
+    #[cfg(windows)]
+    {
+        let _ = Command::new("taskkill")
+            .args(["/F", "/T", "/PID", &pid.to_string()])
+            .status();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -542,20 +557,5 @@ mod tests {
 
         // 清理
         handle.destroy().expect("docker rm must succeed");
-    }
-}
-
-/// v0.49.0 (B2): timeout helper, kill process group on docker exec timeout.
-/// Unix: killpg(SIGKILL); Windows: taskkill /F /T.
-fn timeout_kill_process_group(pid: u32) {
-    #[cfg(unix)]
-    unsafe {
-        libc::killpg(pid as i32, libc::SIGKILL);
-    }
-    #[cfg(windows)]
-    {
-        let _ = Command::new("taskkill")
-            .args(["/F", "/T", "/PID", &pid.to_string()])
-            .status();
     }
 }

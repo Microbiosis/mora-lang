@@ -104,6 +104,9 @@ impl RefineSession {
     /// 3. 写 .refine/<stem>.refined.<n>.mora (REAL write)
     /// 4. 计算 diff (line counts: original vs refined)
     /// 5. 追加 step 到 session
+    ///
+    /// v0.49.0 (A2): refine 返回 owned RefineStep (was &RefineStep)
+    /// 让 caller drop lock before consuming result (避免锁 + I/O 一起)
     /// v0.49.0 (A2): refine 返回 owned RefineStep (was &RefineStep)
     /// 让 caller drop lock before consuming result (避免锁 + I/O 一起)
     pub fn refine(&mut self, instruction: &str) -> Result<RefineStep, String> {

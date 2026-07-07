@@ -4,6 +4,7 @@
 //!       real_ai_chat_inner, real_ai_chat_with_tools, run_critic, run_agent
 
 use super::*;
+use std::time::Duration;
 
 impl Interpreter {
     /// v0.04: AI chat 的统一入口
@@ -323,7 +324,6 @@ impl Interpreter {
             let should_use_draft = if let Some((success, total)) = self
                 .draft_model_stats
                 .lock()
-                .expect("draft_model_stats mutex poisoned")
                 .get(draft_model.as_str())
                 .copied()
             {
@@ -359,10 +359,7 @@ impl Interpreter {
                     .verify(&draft_str, &verification_str);
 
                 // v0.49.0 (A6): 单锁内 update stats (was HashMap entry+stats.x)
-                let mut stats_map = self
-                    .draft_model_stats
-                    .lock()
-                    .expect("draft_model_stats mutex poisoned");
+                let mut stats_map = self.draft_model_stats.lock();
                 let entry = stats_map.entry(draft_model.clone()).or_insert((0, 0));
                 entry.1 += 1; // total += 1
                 if is_verified {
@@ -409,13 +406,7 @@ impl Interpreter {
         // v0.22: AI 调用内联缓存
         let cache_key = format!("{}:{:?}", model, messages);
         // v0.49.0 (C1): LRU cache (was unbounded HashMap)
-        if let Some(cached) = self
-            .ai_cache
-            .lock()
-            .expect("ai_cache mutex poisoned")
-            .get(&cache_key)
-            .cloned()
-        {
+        if let Some(cached) = self.ai_cache.lock().get(&cache_key) {
             return Ok(Value::String(cached));
         }
 
@@ -509,10 +500,7 @@ impl Interpreter {
                             // v0.22: 缓存 AI 调用结果
                             // v0.49.0 (C1): LRU put (was unbounded HashMap insert)
                             if let Value::String(ref s) = result {
-                                self.ai_cache
-                                    .lock()
-                                    .expect("ai_cache mutex poisoned")
-                                    .put(cache_key.clone(), s.clone());
+                                self.ai_cache.lock().put(cache_key.clone(), s.clone());
                             }
                             return Ok(result);
                         }

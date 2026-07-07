@@ -3,7 +3,7 @@
 //! 从 interpreter/mod.rs 提取的 execute 函数拆分为多个小函数
 
 use super::*;
-use crate::ast_v2::{AstArena, NodeId, StmtKind};
+use crate::ast_v2::{AstArena, NodeId, OrchestrateKind, StmtKind};
 use crate::value::{Environment, FlowSignal, Value};
 
 impl Interpreter {
@@ -162,7 +162,6 @@ impl Interpreter {
         let value = self.evaluate(init, arena)?;
         self.environment
             .lock()
-            .map_err(|_| "environment mutex poisoned".to_string())?
             .define(name.to_string(), value, exported);
         Ok(FlowSignal::None)
     }
@@ -175,12 +174,7 @@ impl Interpreter {
         arena: &AstArena,
     ) -> Result<FlowSignal, String> {
         let val = self.evaluate(value, arena)?;
-        if !self
-            .environment
-            .lock()
-            .map_err(|_| "env mutex poisoned".to_string())?
-            .assign(name, val.clone())
-        {
+        if !self.environment.lock().assign(name, val.clone()) {
             return Err(format!("Undefined variable: {}", name));
         }
         Ok(FlowSignal::None)
@@ -247,10 +241,7 @@ impl Interpreter {
             _ => return Err("for loop requires a list or string".to_string()),
         };
         for item in items {
-            self.environment
-                .lock()
-                .map_err(|_| "env mutex poisoned".to_string())?
-                .define(var.to_string(), item, false);
+            self.environment.lock().define(var.to_string(), item, false);
             for stmt_id in body {
                 if let Some(stmt) = arena.get_stmt(*stmt_id) {
                     let kind = stmt.kind.clone();
@@ -297,18 +288,15 @@ impl Interpreter {
     ) -> Result<FlowSignal, String> {
         let param_names: Vec<String> = params.iter().map(|(n, _)| n.clone()).collect();
         let body_ids: Vec<usize> = body.iter().map(|id| id.0).collect();
-        self.environment
-            .lock()
-            .map_err(|_| "env mutex poisoned".to_string())?
-            .define(
-                name.to_string(),
-                Value::Task {
-                    name: name.to_string(),
-                    params: param_names,
-                    v2_body_ids: body_ids,
-                },
-                exported,
-            );
+        self.environment.lock().define(
+            name.to_string(),
+            Value::Task {
+                name: name.to_string(),
+                params: param_names,
+                v2_body_ids: body_ids,
+            },
+            exported,
+        );
         Ok(FlowSignal::None)
     }
 
@@ -326,9 +314,7 @@ impl Interpreter {
                     self.environment.clone(),
                 )));
                 for (name, value) in bindings {
-                    env.lock()
-                        .map_err(|_| "env mutex poisoned".to_string())?
-                        .define(name, value, false);
+                    env.lock().define(name, value, false);
                 }
                 let previous = self.environment.clone();
                 self.environment = env;
@@ -445,10 +431,7 @@ impl Interpreter {
     ) -> Result<FlowSignal, String> {
         if let Some(rx) = self.worker_receivers.get(source) {
             let val = rx.recv().map_err(|e| format!("Receive error: {}", e))?;
-            self.environment
-                .lock()
-                .map_err(|_| "env mutex poisoned".to_string())?
-                .define(var.to_string(), val, false);
+            self.environment.lock().define(var.to_string(), val, false);
         }
         Ok(FlowSignal::None)
     }
@@ -500,17 +483,14 @@ impl Interpreter {
         params: &[String],
         _arena: &AstArena,
     ) -> Result<FlowSignal, String> {
-        self.environment
-            .lock()
-            .map_err(|_| "env mutex poisoned".to_string())?
-            .define(
-                name.to_string(),
-                Value::Macro {
-                    name: name.to_string(),
-                    params: params.to_vec(),
-                },
-                false,
-            );
+        self.environment.lock().define(
+            name.to_string(),
+            Value::Macro {
+                name: name.to_string(),
+                params: params.to_vec(),
+            },
+            false,
+        );
         Ok(FlowSignal::None)
     }
 
@@ -523,7 +503,6 @@ impl Interpreter {
     ) -> Result<FlowSignal, String> {
         self.environment
             .lock()
-            .map_err(|_| "env mutex poisoned".to_string())?
             .define(name.to_string(), Value::String(target.to_string()), false);
         Ok(FlowSignal::None)
     }
@@ -546,7 +525,6 @@ impl Interpreter {
         }
         self.environment
             .lock()
-            .map_err(|_| "env mutex poisoned".to_string())?
             .define(name.to_string(), Value::Dict(enum_map), false);
         Ok(FlowSignal::None)
     }
@@ -566,7 +544,6 @@ impl Interpreter {
         };
         self.environment
             .lock()
-            .map_err(|_| "env mutex poisoned".to_string())?
             .define(name.to_string(), constructor, false);
         Ok(FlowSignal::None)
     }
@@ -602,18 +579,15 @@ impl Interpreter {
             if !m.body.is_empty() {
                 let body_ids: Vec<usize> = m.body.iter().map(|id| id.0).collect();
                 let key = default_impl_method_key(name, &trait_generics, &m.name);
-                self.environment
-                    .lock()
-                    .map_err(|_| "env mutex poisoned".to_string())?
-                    .define(
-                        key,
-                        Value::Task {
-                            name: m.name.clone(),
-                            params: m.params.iter().map(|(n, _)| n.clone()).collect(),
-                            v2_body_ids: body_ids,
-                        },
-                        false,
-                    );
+                self.environment.lock().define(
+                    key,
+                    Value::Task {
+                        name: m.name.clone(),
+                        params: m.params.iter().map(|(n, _)| n.clone()).collect(),
+                        v2_body_ids: body_ids,
+                    },
+                    false,
+                );
             }
         }
         Ok(FlowSignal::None)
@@ -638,18 +612,15 @@ impl Interpreter {
         for m in methods {
             let body_ids: Vec<usize> = m.body.iter().map(|id| id.0).collect();
             let key = impl_method_key(trait_name, trait_generics, for_type, for_generics, &m.name);
-            self.environment
-                .lock()
-                .map_err(|_| "env mutex poisoned".to_string())?
-                .define(
-                    key,
-                    Value::Task {
-                        name: m.name.clone(),
-                        params: m.params.iter().map(|(n, _)| n.clone()).collect(),
-                        v2_body_ids: body_ids,
-                    },
-                    false,
-                );
+            self.environment.lock().define(
+                key,
+                Value::Task {
+                    name: m.name.clone(),
+                    params: m.params.iter().map(|(n, _)| n.clone()).collect(),
+                    v2_body_ids: body_ids,
+                },
+                false,
+            );
         }
         Ok(FlowSignal::None)
     }
@@ -669,7 +640,6 @@ impl Interpreter {
         // 绑定到 `given` 变量供 expect 表达式使用
         self.environment
             .lock()
-            .map_err(|_| "env mutex poisoned".to_string())?
             .define("given".to_string(), given_val.clone(), false);
 
         // 2. 如果有 replay_path，切换到 replay 模式
@@ -717,14 +687,11 @@ impl Interpreter {
 
         if pass_rate >= tol {
             // 通过
-            self.environment
-                .lock()
-                .map_err(|_| "env mutex poisoned".to_string())?
-                .define(
-                    format!("eval_{}", name),
-                    Value::String(format!("PASS ({}/{})", passed, total)),
-                    false,
-                );
+            self.environment.lock().define(
+                format!("eval_{}", name),
+                Value::String(format!("PASS ({}/{})", passed, total)),
+                false,
+            );
             Ok(FlowSignal::None)
         } else {
             Err(format!(
@@ -790,7 +757,6 @@ impl Interpreter {
         // 存储 Skill Dict 到环境
         self.environment
             .lock()
-            .map_err(|_| "env mutex poisoned".to_string())?
             .define(name.to_string(), Value::Dict(skill_meta), false);
 
         Ok(FlowSignal::None)
@@ -871,7 +837,6 @@ impl Interpreter {
         };
         self.environment
             .lock()
-            .map_err(|_| "env mutex poisoned".to_string())?
             .define(name.to_string(), section, false);
         Ok(FlowSignal::None)
     }
@@ -969,10 +934,7 @@ impl Interpreter {
                 name, final_origin, ext
             ));
         }
-        self.environment
-            .lock()
-            .map_err(|_| "env mutex poisoned".to_string())?
-            .define(name.to_string(), doc, false);
+        self.environment.lock().define(name.to_string(), doc, false);
         Ok(FlowSignal::None)
     }
 }

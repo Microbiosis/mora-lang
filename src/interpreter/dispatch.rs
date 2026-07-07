@@ -118,13 +118,9 @@ impl Interpreter {
                 match &args[0] {
                     Value::Atom(arc) => {
                         let func = &args[1];
-                        let old = arc
-                            .lock()
-                            .map_err(|_| "atom mutex poisoned".to_string())?
-                            .clone();
+                        let old = arc.lock().clone();
                         let new_val = self.call_value(func, vec![old])?;
-                        *arc.lock().map_err(|_| "atom mutex poisoned".to_string())? =
-                            new_val.clone();
+                        *arc.lock() = new_val.clone();
                         Ok(new_val)
                     }
                     _ => Err("swap() first argument must be an atom".to_string()),
@@ -134,10 +130,7 @@ impl Interpreter {
             "deref" => {
                 let value = args.first().ok_or("deref() requires 1 argument")?;
                 match value {
-                    Value::Atom(arc) => Ok(arc
-                        .lock()
-                        .map_err(|_| "atom mutex poisoned".to_string())?
-                        .clone()),
+                    Value::Atom(arc) => Ok(arc.lock().clone()),
                     _ => Err("deref() argument must be an atom".to_string()),
                 }
             }
@@ -326,11 +319,7 @@ impl Interpreter {
                     let (name, role, text, budget_bytes) = match arg {
                         Value::String(section_name) => {
                             // 从环境查 section
-                            let looked_up = self
-                                .environment
-                                .lock()
-                                .map_err(|_| "environment mutex poisoned".to_string())?
-                                .get(&section_name);
+                            let looked_up = self.environment.lock().get(&section_name);
                             match looked_up {
                                 Some(Value::PromptSection {
                                     name,
@@ -403,12 +392,7 @@ impl Interpreter {
             }
             _ => {
                 // 先 clone 出值，释放 borrow，避免借用冲突
-                let looked_up = self
-                    .environment
-                    .lock()
-                    .map_err(|_| "environment mutex poisoned".to_string())?
-                    .get(name)
-                    .clone();
+                let looked_up = self.environment.lock().get(name).clone();
                 if let Some(value) = looked_up {
                     match value {
                         Value::Task { .. }
@@ -421,9 +405,7 @@ impl Interpreter {
                             )));
                             for (i, param) in params.iter().enumerate() {
                                 let value = args.get(i).cloned().unwrap_or(Value::Nil);
-                                env.lock()
-                                    .map_err(|_| "env mutex poisoned".to_string())?
-                                    .define(param.clone(), value, false);
+                                env.lock().define(param.clone(), value, false);
                             }
                             // Macro body 在 v2 模式下通过 arena 执行，此处简化返回 Nil
                             Ok(Value::Nil)
@@ -950,17 +932,17 @@ impl Interpreter {
                 match method {
                     "collect" => {
                         let mut result = String::new();
-                        if !*done.lock().map_err(|_| "done mutex poisoned".to_string())? {
+                        if !*done.lock() {
                             let mut guard = reader.lock();
                             loop {
                                 match Self::read_next_sse_token(&mut guard) {
                                     Ok(Some(token)) => result.push_str(&token),
                                     Ok(None) => {
-                                        *done.lock().map_err(|_| "done mutex poisoned".to_string())? = true;
+                                        *done.lock() = true;
                                         break;
                                     }
                                     Err(e) => {
-                                        *done.lock().map_err(|_| "done mutex poisoned".to_string())? = true;
+                                        *done.lock() = true;
                                         return Err(format!("ai.stream.collect: {}", e));
                                     }
                                 }
@@ -969,7 +951,7 @@ impl Interpreter {
                         Ok(Value::String(result))
                     }
                     "is_done" => {
-                        Ok(Value::Bool(*done.lock().map_err(|_| "done mutex poisoned".to_string())?))
+                        Ok(Value::Bool(*done.lock()))
                     }
                     _ => Err(format!("Stream has no method: {}", method)),
                 }
@@ -996,7 +978,7 @@ impl Interpreter {
             }
             // v0.06.3: Router 方法
             Value::Router { ref mut routes } => {
-                let mut r = routes.lock().map_err(|_| "routes mutex poisoned".to_string())?;
+                let mut r = routes.lock();
                 match method {
                     "route" => {
                         let http_method = args.first().map(|v| v.to_string()).unwrap_or_default().to_uppercase();
@@ -1012,14 +994,16 @@ impl Interpreter {
                         let r_clone: Vec<(String, String, Value)> = r.clone();
                         drop(r);
                         eprintln!("[Router] starting HTTP server on {}", addr);
-                        let interp_arc: Arc<Mutex<Interpreter>> = Arc::new(Mutex::new(self.clone()));
-                        crate::http_server::start(
-                            host, port,
-                            Arc::new(Mutex::new(r_clone.iter().map(|(m,p,h)|
-                                ((m.clone(), p.clone()), h.clone())
-                            ).collect())),
-                            interp_arc,
-                        ).map_err(|e| format!("HTTP server error: {}", e))?;
+                        let interp_arc: Arc<tokio::sync::RwLock<Interpreter>> = Arc::new(tokio::sync::RwLock::new(self.clone()));
+                        tokio::runtime::Runtime::new().unwrap().block_on(async {
+                            crate::http_server::start(
+                                host, port,
+                                Arc::new(tokio::sync::RwLock::new(r_clone.iter().map(|(m,p,h)|
+                                    ((m.clone(), p.clone()), h.clone())
+                                ).collect())),
+                                interp_arc,
+                            ).await
+                        }).map_err(|e| format!("HTTP server error: {}", e))?;
                         Ok(Value::Nil)
                     }
                     _ => { drop(r); Err(format!("Router has no method: {}", method)) },
@@ -1037,21 +1021,25 @@ impl Interpreter {
                     "serve" => {
                         let tools_clone = tools.clone();
                         eprintln!("[McpServer] starting MCP server on stdio ({} tools)", tools_clone.len());
-                        let tool_registry: Arc<Mutex<HashMap<String, crate::mcp_server::McpTool>>> =
-                            Arc::new(Mutex::new(HashMap::new()));
-                        for (name, handler) in tools_clone {
-                            let mcp_tool = crate::mcp_server::McpTool {
-                                name: name.clone(),
-                                description: String::new(),
-                                parameters: "{}".to_string(),
-                                handler,
-                                toolset: "custom".to_string(),
-                            };
-                            tool_registry.lock().map_err(|_| "tool_registry mutex poisoned".to_string())?.insert(name, mcp_tool);
-                        }
-                        let interp_arc: Arc<Mutex<Interpreter>> = Arc::new(Mutex::new(self.clone()));
-                        crate::mcp_server::start(tool_registry, interp_arc, None)
-                            .map_err(|e| format!("MCP server error: {}", e))?;
+                        tokio::runtime::Runtime::new().unwrap().block_on(async {
+                            let tool_registry: Arc<tokio::sync::RwLock<HashMap<String, crate::mcp_server::McpTool>>> =
+                                Arc::new(tokio::sync::RwLock::new(HashMap::new()));
+                            {
+                                let mut tr = tool_registry.write().await;
+                                for (name, handler) in tools_clone {
+                                    let mcp_tool = crate::mcp_server::McpTool {
+                                        name: name.clone(),
+                                        description: String::new(),
+                                        parameters: "{}".to_string(),
+                                        handler,
+                                        toolset: "custom".to_string(),
+                                    };
+                                    tr.insert(name, mcp_tool);
+                                }
+                            }
+                            let interp_arc: Arc<tokio::sync::RwLock<Interpreter>> = Arc::new(tokio::sync::RwLock::new(self.clone()));
+                            crate::mcp_server::start(tool_registry, interp_arc, None).await
+                        }).map_err(|e| format!("MCP server error: {}", e))?;
                         Ok(Value::Nil)
                     }
                     _ => Err(format!("McpServer has no method: {}", method)),
@@ -1141,10 +1129,7 @@ impl Interpreter {
                 .get(i)
                 .cloned()
                 .ok_or_else(|| format!("missing arg for parameter '{}'", param))?;
-            call_env
-                .lock()
-                .map_err(|_| "env mutex poisoned".to_string())?
-                .define(param.clone(), value, false);
+            call_env.lock().define(param.clone(), value, false);
         }
         let prev_env = self.environment.clone();
         self.environment = call_env;
@@ -1202,11 +1187,10 @@ impl Interpreter {
                     });
                     if let Some((closure_params, closure_body)) = closure_info {
                         // 使用子环境（避免 mutex 死锁）
-                        let call_env = std::sync::Arc::new(std::sync::Mutex::new(
-                            crate::value::Environment::with_parent_of(std::sync::Arc::new(
-                                std::sync::Mutex::new((*env.0).clone()),
-                            )),
-                        ));
+                        let call_env =
+                            Arc::new(Mutex::new(crate::value::Environment::with_parent_of(
+                                Arc::new(Mutex::new((*env.0).clone())),
+                            )));
                         // 绑定参数 — v0.35 (P0-C4): arity check
                         if args.len() < closure_params.len() {
                             return Err(format!(
@@ -1220,10 +1204,7 @@ impl Interpreter {
                                 .get(i)
                                 .cloned()
                                 .ok_or_else(|| format!("missing arg for parameter '{}'", pname))?;
-                            call_env
-                                .lock()
-                                .map_err(|_| "env mutex poisoned".to_string())?
-                                .define(pname.clone(), val, false);
+                            call_env.lock().define(pname.clone(), val, false);
                         }
                         let prev_env = self.environment.clone();
                         self.environment = call_env;

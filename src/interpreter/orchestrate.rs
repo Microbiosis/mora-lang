@@ -10,10 +10,115 @@ const MAX_GRAPH_STEPS: usize = 1000;
 
 use crate::ast_v2::{AstArena, OrchestrateAgent, OrchestrateKind};
 use crate::value::{FlowSignal, Value};
+use crate::interpreter::orchestrate_v2::PregelEngine;
 
 impl Interpreter {
+    /// v0.50: 执行 Pregel orchestrate 块（通过 orchestrate_v2 引擎）
+    pub fn execute_orchestrate_v2(
+        &mut self,
+        input_var: &str,
+        result_var: &str,
+        agents: &[crate::ast_v2::OrchestrateAgent],
+        edges: &[crate::ast_v2::OrchestrateEdge],
+        state_schema: &[crate::ast_v2::StateChannel],
+        checkpoint: &Option<crate::ast_v2::CheckpointConfig>,
+        interrupt_points: &[crate::ast_v2::InterruptPoint],
+        arena: &AstArena,
+    ) -> Result<FlowSignal, String> {
+        use crate::interpreter::orchestrate_v2::{PregelConfig, MemorySaver, CheckpointSaver};
+
+        let input = self
+            .environment
+            .lock()
+            .get(input_var)
+            .unwrap_or(Value::Nil);
+
+        let config = PregelConfig {
+            agents: agents.to_vec(),
+            edges: edges.to_vec(),
+            state_schema: state_schema.to_vec(),
+            checkpoint: checkpoint.clone(),
+            interrupt_points: interrupt_points.to_vec(),
+        };
+
+        let saver: Option<std::sync::Arc<dyn CheckpointSaver>> = match &config.checkpoint {
+            Some(cp) if cp.saver == "memory" => Some(std::sync::Arc::new(MemorySaver::new())),
+            Some(cp) if cp.saver == "sqlite" => {
+                return Err(format!(
+                    "SQLite checkpoint saver not yet implemented (requested: {})",
+                    cp.saver
+                ));
+            }
+            Some(cp) => return Err(format!("Unknown checkpoint saver: {}", cp.saver)),
+            None => None,
+        };
+
+        let thread_id = match &config.checkpoint {
+            Some(cp) => cp
+                .thread_id
+                .as_ref()
+                .and_then(|node_id| {
+                    self.evaluate(*node_id, arena)
+                        .ok()
+                        .map(|v| v.to_string())
+                })
+                .unwrap_or_else(|| "default".to_string()),
+            None => "default".to_string(),
+        };
+
+        let mut engine = PregelEngine::new(&config, saver, thread_id);
+
+        let mut initial = std::collections::HashMap::new();
+        if !matches!(input, Value::Nil) {
+            initial.insert("input".to_string(), input);
+        }
+        engine.init_channels(initial);
+
+        let result = engine.run(self, arena).map_err(|e| format!("Pregel error: {}", e))?;
+        self.environment
+            .lock()
+            .define(result_var.to_string(), result, false);
+        Ok(FlowSignal::None)
+    }
+
     /// v0.25: 执行 orchestrate 块
     pub fn execute_orchestrate(
+        &mut self,
+        input_var: &str,
+        result_var: &str,
+        kind: &OrchestrateKind,
+        arena: &AstArena,
+    ) -> Result<FlowSignal, String> {
+        match kind {
+            OrchestrateKind::Pregel {
+                agents,
+                edges,
+                state_schema,
+                checkpoint,
+                interrupt_points,
+            } => self.execute_orchestrate_v2(
+                input_var,
+                result_var,
+                agents,
+                edges,
+                state_schema,
+                checkpoint,
+                interrupt_points,
+                arena,
+            ),
+            OrchestrateKind::Sequential { .. }
+            | OrchestrateKind::Graph { .. }
+            | OrchestrateKind::Loop { .. } => self.execute_orchestrate_v1(
+                input_var,
+                result_var,
+                kind,
+                arena,
+            ),
+        }
+    }
+
+    /// v0.25: 执行经典 orchestrate 块（Sequential/Graph/Loop）
+    fn execute_orchestrate_v1(
         &mut self,
         input_var: &str,
         result_var: &str,
@@ -23,7 +128,6 @@ impl Interpreter {
         let input = self
             .environment
             .lock()
-            .map_err(|_| "env mutex poisoned".to_string())?
             .get(input_var)
             .map(|v| v.to_string())
             .unwrap_or_default();
@@ -34,10 +138,11 @@ impl Interpreter {
                 for agent in agents {
                     current = self.run_orchestrate_agent(agent, &current, arena)?;
                 }
-                self.environment
-                    .lock()
-                    .map_err(|_| "env mutex poisoned".to_string())?
-                    .define(result_var.to_string(), Value::String(current), false);
+                self.environment.lock().define(
+                    result_var.to_string(),
+                    Value::String(current),
+                    false,
+                );
             }
             OrchestrateKind::Graph { agents, edges } => {
                 let mut current = input;
@@ -60,7 +165,8 @@ impl Interpreter {
                         }
                         match &e.condition {
                             Some(cond_id) => {
-                                if let Ok(mut env) = self.environment.lock() {
+                                {
+                                    let mut env = self.environment.lock();
                                     env.define(
                                         "result".to_string(),
                                         Value::String(current.clone()),
@@ -107,10 +213,11 @@ impl Interpreter {
                     }
                 }
 
-                self.environment
-                    .lock()
-                    .map_err(|_| "env mutex poisoned".to_string())?
-                    .define(result_var.to_string(), Value::String(current), false);
+                self.environment.lock().define(
+                    result_var.to_string(),
+                    Value::String(current),
+                    false,
+                );
             }
             OrchestrateKind::Loop {
                 agent,
@@ -122,10 +229,11 @@ impl Interpreter {
                     current = self.run_orchestrate_agent(agent, &current, arena)?;
 
                     if let Some(cond_id) = exit_when {
-                        self.environment
-                            .lock()
-                            .map_err(|_| "env mutex poisoned".to_string())?
-                            .define("result".to_string(), Value::String(current.clone()), false);
+                        self.environment.lock().define(
+                            "result".to_string(),
+                            Value::String(current.clone()),
+                            false,
+                        );
                         let should_exit = self
                             .evaluate(*cond_id, arena)
                             .map(|v| matches!(v, Value::Bool(true)))
@@ -136,10 +244,16 @@ impl Interpreter {
                     }
                 }
 
-                self.environment
-                    .lock()
-                    .map_err(|_| "env mutex poisoned".to_string())?
-                    .define(result_var.to_string(), Value::String(current), false);
+                self.environment.lock().define(
+                    result_var.to_string(),
+                    Value::String(current),
+                    false,
+                );
+            }
+            OrchestrateKind::Pregel { .. } => {
+                return Err(
+                    "Pregel must be handled by execute_orchestrate, not v1".to_string(),
+                );
             }
         }
 
@@ -154,10 +268,11 @@ impl Interpreter {
         arena: &AstArena,
     ) -> Result<String, String> {
         // 绑定 input 变量
-        self.environment
-            .lock()
-            .map_err(|_| "env mutex poisoned".to_string())?
-            .define("input".to_string(), Value::String(input.to_string()), false);
+        self.environment.lock().define(
+            "input".to_string(),
+            Value::String(input.to_string()),
+            false,
+        );
 
         // 应用 with 配置
         let prev_config = self.current_ai_config.clone();
@@ -193,10 +308,11 @@ impl Interpreter {
         // verify（如果有的话）
         if let Some(verify_id) = agent.verify_expr {
             for attempt in 0..3 {
-                self.environment
-                    .lock()
-                    .map_err(|_| "env mutex poisoned".to_string())?
-                    .define("result".to_string(), Value::String(output.clone()), false);
+                self.environment.lock().define(
+                    "result".to_string(),
+                    Value::String(output.clone()),
+                    false,
+                );
                 let ok = self
                     .evaluate(verify_id, arena)
                     .map(|v| matches!(v, Value::Bool(true)))
@@ -210,10 +326,11 @@ impl Interpreter {
                         agent.name
                     ));
                 }
-                self.environment
-                    .lock()
-                    .map_err(|_| "env mutex poisoned".to_string())?
-                    .define("input".to_string(), Value::String(output.clone()), false);
+                self.environment.lock().define(
+                    "input".to_string(),
+                    Value::String(output.clone()),
+                    false,
+                );
                 let retry = self.evaluate(agent.task_expr, arena)?;
                 output = retry.to_string();
             }

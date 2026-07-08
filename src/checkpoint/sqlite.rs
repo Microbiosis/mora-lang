@@ -164,10 +164,7 @@ mod tests {
     fn sqlite_save_and_load() {
         let saver = SqliteSaver::new(":memory:").unwrap();
         let mut values = HashMap::new();
-        values.insert(
-            "x".to_string(),
-            crate::value::Value::Int(42),
-        );
+        values.insert("x".to_string(), crate::value::Value::Int(42));
         let cp = make_checkpoint("a", "t1", 1, values);
 
         saver.save("t1", &cp).unwrap();
@@ -241,7 +238,7 @@ mod tests {
         );
         values.insert(
             "score".to_string(),
-            crate::value::Value::Number(3.14),
+            crate::value::Value::Number(std::f64::consts::PI),
         );
 
         let mut channel_versions = HashMap::new();
@@ -259,12 +256,15 @@ mod tests {
             channel_values: values,
             channel_versions,
             versions_seen,
-            pending_sends: vec![super::SendTask {
+            pending_sends: vec![crate::checkpoint::SendTask {
                 target_node: "next".to_string(),
                 input: crate::value::Value::Dict(
-                    [("key".to_string(), crate::value::Value::String("val".to_string()))]
-                        .into_iter()
-                        .collect(),
+                    [(
+                        "key".to_string(),
+                        crate::value::Value::String("val".to_string()),
+                    )]
+                    .into_iter()
+                    .collect(),
                 ),
             }],
             timestamp_ms: 999,

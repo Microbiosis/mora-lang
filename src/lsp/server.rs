@@ -281,7 +281,10 @@ impl Server {
 
         let mut server_info = std::collections::BTreeMap::new();
         server_info.insert("name".to_string(), Value::String_("mora-lsp".to_string()));
-        server_info.insert("version".to_string(), Value::String_("0.1".to_string()));
+        server_info.insert(
+            "version".to_string(),
+            Value::String_(crate::VERSION.to_string()),
+        );
 
         let mut result = std::collections::BTreeMap::new();
         result.insert("capabilities".to_string(), Value::Object(capabilities));

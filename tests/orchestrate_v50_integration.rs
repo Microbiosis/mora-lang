@@ -25,8 +25,8 @@ use mora::ast_v2::{
     CheckpointConfig, DynamicKind, InterruptPoint, InterruptWhen, NodeId, OrchestrateAgent,
     OrchestrateEdge, ReducerKind, StateChannel,
 };
-use mora::typeck::pregel_check::check_orchestrate_pregel;
 use mora::typeck::TypeError;
+use mora::typeck::pregel_check::check_orchestrate_pregel;
 
 // ===================================================================
 // 辅助断言
@@ -124,9 +124,7 @@ fn test_pregel_basic() {
         when: InterruptWhen::Before,
     }];
 
-    let result = check_orchestrate_pregel(
-        &agents, &edges, &state, &cp, &interrupts, &[], &[],
-    );
+    let result = check_orchestrate_pregel(&agents, &edges, &state, &cp, &interrupts, &[], &[]);
     assert_no_errors(result);
 }
 
@@ -234,14 +232,12 @@ fn test_pregel_command_goto() {
 #[test]
 fn test_pregel_command_goto_invalid() {
     // goto 目标不存在时应报错
-    let agents = vec![
-        OrchestrateAgent {
-            name: "classifier".into(),
-            with_config: None,
-            task_expr: NodeId(0),
-            verify_expr: None,
-        },
-    ];
+    let agents = vec![OrchestrateAgent {
+        name: "classifier".into(),
+        with_config: None,
+        task_expr: NodeId(0),
+        verify_expr: None,
+    }];
     let gotos = vec![("nonexistent".into(), 20)];
     let result = check_orchestrate_pregel(&agents, &[], &[], &None, &[], &gotos, &[]);
     assert_error_count(&result, 1);
@@ -251,14 +247,12 @@ fn test_pregel_command_goto_invalid() {
 #[test]
 fn test_pregel_command_goto_special_nodes() {
     // @start 和 @exit 作为 goto 目标应该是合法的（运行时语义）
-    let agents = vec![
-        OrchestrateAgent {
-            name: "classifier".into(),
-            with_config: None,
-            task_expr: NodeId(0),
-            verify_expr: None,
-        },
-    ];
+    let agents = vec![OrchestrateAgent {
+        name: "classifier".into(),
+        with_config: None,
+        task_expr: NodeId(0),
+        verify_expr: None,
+    }];
     let gotos = vec![("@exit".into(), 10), ("@start".into(), 11)];
     let result = check_orchestrate_pregel(&agents, &[], &[], &None, &[], &gotos, &[]);
     assert_no_errors(result);
@@ -477,14 +471,12 @@ fn test_pregel_send_target_valid() {
 
 #[test]
 fn test_pregel_send_target_invalid() {
-    let agents = vec![
-        OrchestrateAgent {
-            name: "split".into(),
-            with_config: None,
-            task_expr: NodeId(0),
-            verify_expr: None,
-        },
-    ];
+    let agents = vec![OrchestrateAgent {
+        name: "split".into(),
+        with_config: None,
+        task_expr: NodeId(0),
+        verify_expr: None,
+    }];
     let sends = vec![("nonexistent".into(), 5)];
     let result = check_orchestrate_pregel(&agents, &[], &[], &None, &[], &[], &sends);
     assert_error_count(&result, 1);
@@ -529,14 +521,12 @@ fn test_pregel_interrupt_resume() {
 
 #[test]
 fn test_pregel_interrupt_unknown_node() {
-    let agents = vec![
-        OrchestrateAgent {
-            name: "classifier".into(),
-            with_config: None,
-            task_expr: NodeId(0),
-            verify_expr: None,
-        },
-    ];
+    let agents = vec![OrchestrateAgent {
+        name: "classifier".into(),
+        with_config: None,
+        task_expr: NodeId(0),
+        verify_expr: None,
+    }];
     let interrupts = vec![InterruptPoint {
         node_name: "nonexistent".into(),
         when: InterruptWhen::Before,
@@ -727,9 +717,8 @@ fn test_pregel_full_graph() {
     let gotos = vec![("handler_urgent".into(), 10)];
     let sends = vec![("handler_normal".into(), 20)];
 
-    let result = check_orchestrate_pregel(
-        &agents, &edges, &state, &cp, &interrupts, &gotos, &sends,
-    );
+    let result =
+        check_orchestrate_pregel(&agents, &edges, &state, &cp, &interrupts, &gotos, &sends);
     assert_no_errors(result);
 }
 
@@ -740,14 +729,12 @@ fn test_pregel_full_graph() {
 #[test]
 fn test_pregel_type_error_accumulation() {
     // 验证 typeck 的多错误收集模式：所有问题一次报告，不中途退出
-    let agents = vec![
-        OrchestrateAgent {
-            name: "A".into(),
-            with_config: None,
-            task_expr: NodeId(0),
-            verify_expr: None,
-        },
-    ];
+    let agents = vec![OrchestrateAgent {
+        name: "A".into(),
+        with_config: None,
+        task_expr: NodeId(0),
+        verify_expr: None,
+    }];
     let edges = vec![
         // 错误 1: to 未知
         OrchestrateEdge {
@@ -789,9 +776,8 @@ fn test_pregel_type_error_accumulation() {
     let gotos = vec![("E".into(), 1)];
     let sends = vec![("F".into(), 2)];
 
-    let result = check_orchestrate_pregel(
-        &agents, &edges, &state, &cp, &interrupts, &gotos, &sends,
-    );
+    let result =
+        check_orchestrate_pregel(&agents, &edges, &state, &cp, &interrupts, &gotos, &sends);
 
     // 期望收集到的错误：
     // 1. Edge to B unknown

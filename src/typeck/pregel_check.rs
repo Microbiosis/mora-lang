@@ -17,8 +17,8 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::ast_v2::{
-    CheckpointConfig, DynamicKind, InterruptPoint, InterruptWhen, OrchestrateAgent,
-    OrchestrateEdge, ReducerKind, StateChannel,
+    CheckpointConfig, DynamicKind, InterruptPoint, OrchestrateAgent, OrchestrateEdge, ReducerKind,
+    StateChannel,
 };
 use crate::typeck::TypeError;
 
@@ -33,8 +33,8 @@ const KNOWN_SAVERS: &[&str] = &["memory", "sqlite", "redis", "postgres"];
 // ===================================================================
 
 fn is_list_type_hint(hint: &str) -> bool {
-    let h = hint.trim();
-    h.starts_with('[') || h.contains("List") || h == "list"
+    let h = hint.trim().to_lowercase();
+    h.starts_with('[') || h.contains("list<") || h.contains("list ") || h == "list"
 }
 
 fn is_number_type_hint(hint: &str) -> bool {
@@ -200,8 +200,14 @@ fn check_edge_ref(
     // v0.50: 动态边的一端引用运行时生成的节点，不需要静态声明：
     // - Map/FanOut: from 是静态节点（任务生成器），to 是动态节点（不需要静态声明）
     // - Reduce/FanIn: from 是动态节点（不需要静态声明），to 是静态节点（聚合器）
-    let skip_from = matches!(edge.dynamic, Some(DynamicKind::Reduce) | Some(DynamicKind::FanIn));
-    let skip_to = matches!(edge.dynamic, Some(DynamicKind::Map) | Some(DynamicKind::FanOut));
+    let skip_from = matches!(
+        edge.dynamic,
+        Some(DynamicKind::Reduce) | Some(DynamicKind::FanIn)
+    );
+    let skip_to = matches!(
+        edge.dynamic,
+        Some(DynamicKind::Map) | Some(DynamicKind::FanOut)
+    );
 
     if !skip_from && !agent_names.contains(edge.from.as_str()) && edge.from != "@start" {
         errors.push(TypeError::with_detail(
@@ -317,7 +323,7 @@ pub fn check_send_placeholder(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ast_v2::NodeId;
+    use crate::ast_v2::{InterruptWhen, NodeId};
     use crate::typeck::TypeError;
 
     fn no_errors(result: Vec<TypeError>) -> Vec<TypeError> {
@@ -325,7 +331,7 @@ mod tests {
         result
     }
 
-    fn has_error(result: &Vec<TypeError>, pat: &str) -> bool {
+    fn has_error(result: &[TypeError], pat: &str) -> bool {
         result.iter().any(|e| e.message.contains(pat))
     }
 
@@ -397,9 +403,7 @@ mod tests {
             when: InterruptWhen::Before,
         }];
 
-        let result = check_orchestrate_pregel(
-            &agents, &edges, &state, &cp, &interrupts, &[], &[],
-        );
+        let result = check_orchestrate_pregel(&agents, &edges, &state, &cp, &interrupts, &[], &[]);
         no_errors(result);
     }
 
@@ -472,7 +476,10 @@ mod tests {
         }];
         let result = check_orchestrate_pregel(&agents, &[], &[], &None, &interrupts, &[], &[]);
         assert_eq!(result.len(), 1);
-        assert!(has_error(&result, "Interrupt point references unknown node"));
+        assert!(has_error(
+            &result,
+            "Interrupt point references unknown node"
+        ));
     }
 
     #[test]

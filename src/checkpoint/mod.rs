@@ -123,10 +123,7 @@ impl Checkpoint {
                 .collect();
             versions_seen.insert(node.clone(), Value::Dict(inner));
         }
-        map.insert(
-            "versions_seen".to_string(),
-            Value::Dict(versions_seen),
-        );
+        map.insert("versions_seen".to_string(), Value::Dict(versions_seen));
 
         let pending_sends: Vec<Value> = self
             .pending_sends
@@ -141,10 +138,7 @@ impl Checkpoint {
                 Value::Dict(send_map)
             })
             .collect();
-        map.insert(
-            "pending_sends".to_string(),
-            Value::List(pending_sends),
-        );
+        map.insert("pending_sends".to_string(), Value::List(pending_sends));
 
         // u128 does not fit safely in f64 (JSON number), so store as string.
         map.insert(
@@ -204,7 +198,7 @@ impl Checkpoint {
                             return Err(format!(
                                 "channel_versions value must be a number: {:?}",
                                 v
-                            ))
+                            ));
                         }
                     };
                     Ok((k.clone(), num))
@@ -229,18 +223,13 @@ impl Checkpoint {
                                         return Err(format!(
                                             "versions_seen value must be a number: {:?}",
                                             v
-                                        ))
+                                        ));
                                     }
                                 };
                                 Ok((k.clone(), num))
                             })
                             .collect::<Result<HashMap<String, u64>, String>>()?,
-                        _ => {
-                            return Err(format!(
-                                "versions_seen inner must be a dict: {:?}",
-                                v
-                            ))
-                        }
+                        _ => return Err(format!("versions_seen inner must be a dict: {:?}", v)),
                     };
                     Ok((node.clone(), inner))
                 })
@@ -258,11 +247,7 @@ impl Checkpoint {
                     };
                     let target_node = match send_map.get("target_node") {
                         Some(Value::String(s)) => s.clone(),
-                        _ => {
-                            return Err(
-                                "pending_sends target_node must be a string".to_string()
-                            )
-                        }
+                        _ => return Err("pending_sends target_node must be a string".to_string()),
                     };
                     let input = match send_map.get("input") {
                         Some(v) => v.clone(),
@@ -340,10 +325,10 @@ pub fn rewind(
 ) -> Result<(), String> {
     let ids = saver.list(thread_id)?;
     for id in ids {
-        if let Some(cp) = saver.load(thread_id, Some(&id))? {
-            if cp.step >= before_step {
-                saver.delete(thread_id, &id)?;
-            }
+        if let Some(cp) = saver.load(thread_id, Some(&id))?
+            && cp.step >= before_step
+        {
+            saver.delete(thread_id, &id)?;
         }
     }
     Ok(())
@@ -352,17 +337,14 @@ pub fn rewind(
 /// Resume: load the latest checkpoint for a thread (highest `step`).
 ///
 /// Returns `None` if no checkpoints exist for the thread.
-pub fn resume(
-    saver: &dyn CheckpointSaver,
-    thread_id: &str,
-) -> Result<Option<Checkpoint>, String> {
+pub fn resume(saver: &dyn CheckpointSaver, thread_id: &str) -> Result<Option<Checkpoint>, String> {
     let ids = saver.list(thread_id)?;
     let mut latest: Option<Checkpoint> = None;
     for id in ids {
-        if let Some(cp) = saver.load(thread_id, Some(&id))? {
-            if latest.as_ref().map_or(true, |l| cp.step > l.step) {
-                latest = Some(cp);
-            }
+        if let Some(cp) = saver.load(thread_id, Some(&id))?
+            && latest.as_ref().is_none_or(|l| cp.step > l.step)
+        {
+            latest = Some(cp);
         }
     }
     Ok(latest)
@@ -454,22 +436,13 @@ mod tests {
     fn resume_returns_latest() {
         let saver = MemorySaver::new();
         saver
-            .save(
-                "t1",
-                &make_checkpoint("a", "t1", 1, HashMap::new()),
-            )
+            .save("t1", &make_checkpoint("a", "t1", 1, HashMap::new()))
             .unwrap();
         saver
-            .save(
-                "t1",
-                &make_checkpoint("b", "t1", 3, HashMap::new()),
-            )
+            .save("t1", &make_checkpoint("b", "t1", 3, HashMap::new()))
             .unwrap();
         saver
-            .save(
-                "t1",
-                &make_checkpoint("c", "t1", 2, HashMap::new()),
-            )
+            .save("t1", &make_checkpoint("c", "t1", 2, HashMap::new()))
             .unwrap();
 
         let latest = resume(&saver, "t1").unwrap();
@@ -481,22 +454,13 @@ mod tests {
     fn rewind_deletes_later_steps() {
         let saver = MemorySaver::new();
         saver
-            .save(
-                "t1",
-                &make_checkpoint("a", "t1", 1, HashMap::new()),
-            )
+            .save("t1", &make_checkpoint("a", "t1", 1, HashMap::new()))
             .unwrap();
         saver
-            .save(
-                "t1",
-                &make_checkpoint("b", "t1", 3, HashMap::new()),
-            )
+            .save("t1", &make_checkpoint("b", "t1", 3, HashMap::new()))
             .unwrap();
         saver
-            .save(
-                "t1",
-                &make_checkpoint("c", "t1", 5, HashMap::new()),
-            )
+            .save("t1", &make_checkpoint("c", "t1", 5, HashMap::new()))
             .unwrap();
 
         rewind(&saver, "t1", 3).unwrap();
@@ -526,16 +490,10 @@ mod tests {
     fn memory_load_latest_without_id() {
         let saver = MemorySaver::new();
         saver
-            .save(
-                "t1",
-                &make_checkpoint("a", "t1", 0, HashMap::new()),
-            )
+            .save("t1", &make_checkpoint("a", "t1", 0, HashMap::new()))
             .unwrap();
         saver
-            .save(
-                "t1",
-                &make_checkpoint("b", "t1", 2, HashMap::new()),
-            )
+            .save("t1", &make_checkpoint("b", "t1", 2, HashMap::new()))
             .unwrap();
 
         let latest = saver.load("t1", None).unwrap();
@@ -546,22 +504,13 @@ mod tests {
     fn memory_list_is_sorted_by_step() {
         let saver = MemorySaver::new();
         saver
-            .save(
-                "t1",
-                &make_checkpoint("c", "t1", 5, HashMap::new()),
-            )
+            .save("t1", &make_checkpoint("c", "t1", 5, HashMap::new()))
             .unwrap();
         saver
-            .save(
-                "t1",
-                &make_checkpoint("a", "t1", 1, HashMap::new()),
-            )
+            .save("t1", &make_checkpoint("a", "t1", 1, HashMap::new()))
             .unwrap();
         saver
-            .save(
-                "t1",
-                &make_checkpoint("b", "t1", 3, HashMap::new()),
-            )
+            .save("t1", &make_checkpoint("b", "t1", 3, HashMap::new()))
             .unwrap();
 
         let ids = saver.list("t1").unwrap();
@@ -572,16 +521,10 @@ mod tests {
     fn memory_delete_removes_checkpoint() {
         let saver = MemorySaver::new();
         saver
-            .save(
-                "t1",
-                &make_checkpoint("a", "t1", 1, HashMap::new()),
-            )
+            .save("t1", &make_checkpoint("a", "t1", 1, HashMap::new()))
             .unwrap();
         saver
-            .save(
-                "t1",
-                &make_checkpoint("b", "t1", 2, HashMap::new()),
-            )
+            .save("t1", &make_checkpoint("b", "t1", 2, HashMap::new()))
             .unwrap();
 
         saver.delete("t1", "a").unwrap();
@@ -594,16 +537,10 @@ mod tests {
     fn memory_isolation_between_threads() {
         let saver = MemorySaver::new();
         saver
-            .save(
-                "t1",
-                &make_checkpoint("a", "t1", 1, HashMap::new()),
-            )
+            .save("t1", &make_checkpoint("a", "t1", 1, HashMap::new()))
             .unwrap();
         saver
-            .save(
-                "t2",
-                &make_checkpoint("b", "t2", 2, HashMap::new()),
-            )
+            .save("t2", &make_checkpoint("b", "t2", 2, HashMap::new()))
             .unwrap();
 
         assert_eq!(saver.list("t1").unwrap().len(), 1);

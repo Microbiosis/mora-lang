@@ -507,7 +507,11 @@ impl ParserV2 {
             }
         }
         self.consume(&TokenType::RBrace, "Expected '}'");
-        let kind = ExprKind::Command { goto, update, resume };
+        let kind = ExprKind::Command {
+            goto,
+            update,
+            resume,
+        };
         self.arena.alloc_expr(kind, span)
     }
 

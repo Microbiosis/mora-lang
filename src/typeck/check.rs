@@ -856,7 +856,11 @@ impl TypeChecker {
                 args,
             } => self.check_method_call_expr(*object, method, args, arena, symbols),
             // v0.50: Command 动态控制流表达式
-            ExprKind::Command { goto: _, update, resume } => {
+            ExprKind::Command {
+                goto: _,
+                update,
+                resume,
+            } => {
                 for (_, expr_id) in update {
                     self.check_expr(*expr_id, arena, symbols);
                 }
@@ -878,23 +882,26 @@ impl TypeChecker {
             } => {
                 // 检查参数类型注解是否有效（如果存在）
                 for (_name, hint) in params {
-                    if let Some(h) = hint {
-                        if !Type::is_builtin_type_name(h) {
-                            // 非内置类型可能是用户自定义类型或 trait — 不报错
-                            // 因为 Type::from_hint 会将未知名解析为 Trait 类型
-                        }
+                    if let Some(h) = hint
+                        && !Type::is_builtin_type_name(h)
+                    {
+                        // 非内置类型可能是用户自定义类型或 trait — 不报错
+                        // 因为 Type::from_hint 会将未知名解析为 Trait 类型
                     }
                 }
                 // 检查返回类型注解是否有效（如果存在）
-                if let Some(rt) = return_type {
-                    if !Type::is_builtin_type_name(rt) {
-                        // 同上：允许未知类型名（可能是用户自定义）
-                    }
+                if let Some(rt) = return_type
+                    && !Type::is_builtin_type_name(rt)
+                {
+                    // 同上：允许未知类型名（可能是用户自定义）
                 }
                 Type::Closure
             }
             // v0.50: 模式匹配表达式 — 检查被匹配表达式和所有 arm 的结果类型
-            ExprKind::Match { expr: match_expr, arms } => {
+            ExprKind::Match {
+                expr: match_expr,
+                arms,
+            } => {
                 let _scrutinee_ty = self.check_expr(*match_expr, arena, symbols);
                 let mut arm_types = Vec::new();
                 for (_pattern, result_id) in arms {
@@ -918,7 +925,10 @@ impl TypeChecker {
                 }
                 self.errors.push(TypeError::from_span_with_detail(
                     &expr.span,
-                    format!("route call '{}' is not supported at runtime (deprecated in v0.35)", name),
+                    format!(
+                        "route call '{}' is not supported at runtime (deprecated in v0.35)",
+                        name
+                    ),
                     "use Router.route() API or web server endpoints",
                     "route statement",
                     "rewrite as Router::new().route(method, path, handler)",

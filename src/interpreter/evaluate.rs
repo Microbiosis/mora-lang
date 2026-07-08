@@ -47,7 +47,11 @@ impl Interpreter {
             ExprKind::Dict(entries) => self.evaluate_dict(entries, arena),
             ExprKind::Match { expr, arms } => self.evaluate_match_expr(*expr, arms, arena),
             // v0.50: Command 构造表达式
-            ExprKind::Command { goto, update, resume } => {
+            ExprKind::Command {
+                goto,
+                update,
+                resume,
+            } => {
                 let mut update_map = HashMap::new();
                 for (key, val_id) in update {
                     let val = self.evaluate(*val_id, arena)?;

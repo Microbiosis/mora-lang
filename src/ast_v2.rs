@@ -550,16 +550,16 @@ pub struct StateChannel {
 /// v0.50: Reducer 合并语义
 #[derive(Debug, Clone)]
 pub enum ReducerKind {
-    Last,       // 默认：覆盖
-    Append,     // 列表追加
-    Add,        // 数值相加
+    Last,          // 默认：覆盖
+    Append,        // 列表追加
+    Add,           // 数值相加
     Merge(NodeId), // 自定义合并函数
 }
 
 /// v0.50: 检查点配置
 #[derive(Debug, Clone)]
 pub struct CheckpointConfig {
-    pub saver: String,      // "memory" | "sqlite"
+    pub saver: String,             // "memory" | "sqlite"
     pub thread_id: Option<NodeId>, // 表达式
 }
 
@@ -579,10 +579,10 @@ pub enum InterruptWhen {
 /// v0.50: 动态派发类型
 #[derive(Debug, Clone)]
 pub enum DynamicKind {
-    Map,       // 动态展开为 N 个并行任务
-    Reduce,    // 聚合 N 个并行结果
-    FanOut,    // 固定并行 worker
-    FanIn,     // 等待汇聚
+    Map,    // 动态展开为 N 个并行任务
+    Reduce, // 聚合 N 个并行结果
+    FanOut, // 固定并行 worker
+    FanIn,  // 等待汇聚
 }
 
 /// v0.25: Skill 中的任务定义

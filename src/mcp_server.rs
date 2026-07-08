@@ -320,7 +320,7 @@ fn handle_initialize(_req: &JsonValue) -> JsonValue {
             s.insert("name".to_string(), JsonValue::String_("mora".to_string()));
             s.insert(
                 "version".to_string(),
-                JsonValue::String_("0.04".to_string()),
+                JsonValue::String_(crate::VERSION.to_string()),
             );
             s
         }),

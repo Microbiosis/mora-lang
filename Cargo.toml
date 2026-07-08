@@ -3,6 +3,8 @@ name = "mora"
 version = "0.0.53"
 # v0.x 升级 ureq 3.3.0 → edition 2024 (ureq 3.3.0 要求 edition 2024 + MSRV 1.85)
 edition = "2024"
+# v0.51: build.rs 注入 MORAGIT_VERSION 给编译期 env!() 用
+build = "build.rs"
 authors = ["Mora contributors"]
 description = "An AI-native scripting language with streaming, tool calling, memory, routing, agent orchestration, and token budgeting"
 license = "BSD-3-Clause"

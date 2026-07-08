@@ -100,6 +100,12 @@ pub struct PregelEngine {
     max_steps: usize,
     checkpoint_saver: Option<Arc<dyn CheckpointSaver>>,
     thread_id: String,
+
+    // v0.51: Interrupt callback (HITL 暂停点真接通)
+    //        外部注册 callback → run() 在 before/after 阶段调
+    //        返回 true = 继续, false = 中断并 return Err("interrupted at ...")
+    interrupt_before_callback: Option<Arc<dyn Fn(&str, InterruptWhen) -> bool>>,
+    interrupt_after_callback: Option<Arc<dyn Fn(&str, InterruptWhen) -> bool>>,
 }
 
 // v0.50 半成品 public API: with_max_steps / get_channel / get_all_channels /
@@ -135,12 +141,32 @@ impl PregelEngine {
             max_steps: 1000,
             checkpoint_saver,
             thread_id,
+            // v0.51: Interrupt callback 默认 None
+            interrupt_before_callback: None,
+            interrupt_after_callback: None,
         }
     }
 
     /// 设置最大步数（默认 1000）
     pub fn with_max_steps(mut self, max: usize) -> Self {
         self.max_steps = max;
+        self
+    }
+    /// v0.51: 设置 interrupt before callback (HITL 暂停点)
+    pub fn with_interrupt_before_callback(
+        mut self,
+        cb: Arc<dyn Fn(&str, InterruptWhen) -> bool>,
+    ) -> Self {
+        self.interrupt_before_callback = Some(cb);
+        self
+    }
+
+    /// v0.51: 设置 interrupt after callback
+    pub fn with_interrupt_after_callback(
+        mut self,
+        cb: Arc<dyn Fn(&str, InterruptWhen) -> bool>,
+    ) -> Self {
+        self.interrupt_after_callback = Some(cb);
         self
     }
 
@@ -187,10 +213,18 @@ impl PregelEngine {
                 }
             }
 
-            // 处理 interrupt before（HITL 暂停点）— 当前为占位
+            // 处理 interrupt before（HITL 暂停点）— v0.51: callback 真接通
+            //        callback 返回 false → 中断并 return Err
             for node_name in &to_execute {
-                for _ip in &self.collect_interrupts(node_name, InterruptWhen::Before) {
-                    // 占位：实际应由外部调用者处理中断
+                for ip in &self.collect_interrupts(node_name, InterruptWhen::Before) {
+                    if let Some(ref cb) = self.interrupt_before_callback
+                        && !cb(&ip.node_name, ip.when)
+                    {
+                        return Err(format!(
+                            "interrupted at node '{}' (before, {:?})",
+                            ip.node_name, ip.when
+                        ));
+                    }
                 }
             }
 
@@ -240,8 +274,15 @@ impl PregelEngine {
 
             // 处理 interrupt after（HITL 暂停点）— 当前为占位
             for node_name in &to_execute {
-                for _ip in &self.collect_interrupts(node_name, InterruptWhen::After) {
-                    // 占位
+                for ip in &self.collect_interrupts(node_name, InterruptWhen::After) {
+                    if let Some(ref cb) = self.interrupt_after_callback
+                        && !cb(&ip.node_name, ip.when)
+                    {
+                        return Err(format!(
+                            "interrupted at node '{}' (after, {:?})",
+                            ip.node_name, ip.when
+                        ));
+                    }
                 }
             }
 

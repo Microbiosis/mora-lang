@@ -16,3 +16,15 @@ AGENTS.md
 /mini-swe-agent/
 /cli-anything/
 /openinfer/
+
+# AI 助手工作流残留 (跨工具会话)
+.codebuddy/
+.workbuddy/
+PROJECT_HEALTH_REPORT.md
+overview.md
+
+# 构建 / 门禁输出缓存 (不应提交)
+build_output.txt
+clippy_output.txt
+fmt_output.txt
+test_output.txt

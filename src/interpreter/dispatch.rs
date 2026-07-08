@@ -4,6 +4,30 @@ use super::*;
 use crate::common::Span;
 use crate::value::{BuiltinKind, Value};
 
+/// S8 fix: 安全地在 async runtime 上阻塞执行，避免嵌套 panic。
+///
+/// `Runtime::new().unwrap().block_on()` 在已处于 tokio context 时会 panic
+/// ("Cannot start a runtime from within a runtime")。本 helper 先检测当前
+/// 是否已有 runtime handle：有则用 `block_in_place` + handle.block_on（要求
+/// multi-threaded runtime，mora 的 http/mcp server 默认用 rt-multi-thread），
+/// 无则新建 Runtime。同时消除 `.unwrap()` panic 风险。
+fn block_on_async<F: std::future::Future>(future: F) -> F::Output {
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => {
+            // 边缘情况：HTTP/MCP handler 内的 Mora 代码又调 Router.listen / McpServer.serve
+            tokio::task::block_in_place(|| handle.block_on(future))
+        }
+        Err(_) => {
+            // 常态：从 sync 解释器调用，不在 runtime 内
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .expect("failed to create tokio runtime for serve")
+                .block_on(future)
+        }
+    }
+}
+
 impl Interpreter {
     pub(super) fn call_function(
         &mut self,
@@ -988,14 +1012,16 @@ impl Interpreter {
                         Ok(Value::Router { routes: routes.clone() })
                     }
                     "listen" => {
-                        let addr = args.first().map(|v| v.to_string()).unwrap_or_else(|| "0.0.0.0:3000".to_string());
-                        let (host, port) = addr.split_once(':').unwrap_or(("0.0.0.0", "3000"));
+                        // S6 fix: 默认绑定 127.0.0.1（仅本机），避免开发服务暴露公网。
+                        // 用户需公网暴露时显式传 "0.0.0.0:3000"。
+                        let addr = args.first().map(|v| v.to_string()).unwrap_or_else(|| "127.0.0.1:3000".to_string());
+                        let (host, port) = addr.split_once(':').unwrap_or(("127.0.0.1", "3000"));
                         let port: u16 = port.parse().map_err(|_| format!("Invalid port: {}", port))?;
                         let r_clone: Vec<(String, String, Value)> = r.clone();
                         drop(r);
                         eprintln!("[Router] starting HTTP server on {}", addr);
                         let interp_arc: Arc<tokio::sync::RwLock<Interpreter>> = Arc::new(tokio::sync::RwLock::new(self.clone()));
-                        tokio::runtime::Runtime::new().unwrap().block_on(async {
+                        block_on_async(async {
                             crate::http_server::start(
                                 host, port,
                                 Arc::new(tokio::sync::RwLock::new(r_clone.iter().map(|(m,p,h)|
@@ -1021,7 +1047,7 @@ impl Interpreter {
                     "serve" => {
                         let tools_clone = tools.clone();
                         eprintln!("[McpServer] starting MCP server on stdio ({} tools)", tools_clone.len());
-                        tokio::runtime::Runtime::new().unwrap().block_on(async {
+                        block_on_async(async {
                             let tool_registry: Arc<tokio::sync::RwLock<HashMap<String, crate::mcp_server::McpTool>>> =
                                 Arc::new(tokio::sync::RwLock::new(HashMap::new()));
                             {

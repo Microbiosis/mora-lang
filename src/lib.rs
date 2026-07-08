@@ -38,6 +38,7 @@ pub mod interpreter;
 pub mod lexer;
 pub mod lsp;
 pub mod mcp_server;
+pub mod mir;
 pub mod mock;
 pub mod parser_v2;
 pub mod plan;

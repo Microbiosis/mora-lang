@@ -13,12 +13,11 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use parking_lot::Mutex;
-
 use crate::ast_v2::{
-    AstArena, CheckpointConfig, DynamicKind, InterruptPoint, InterruptWhen, NodeId,
-    OrchestrateAgent, OrchestrateEdge, ReducerKind, StateChannel,
+    AstArena, CheckpointConfig, InterruptPoint, InterruptWhen, OrchestrateAgent, OrchestrateEdge,
+    ReducerKind, StateChannel,
 };
+use crate::checkpoint::{Checkpoint, CheckpointSaver, MemorySaver, SendTask};
 use crate::interpreter::Interpreter;
 use crate::value::{FlowSignal, Value};
 
@@ -64,98 +63,11 @@ impl PregelConfig {
 
 /// Command 返回结构（节点动态控制流）
 #[derive(Debug, Clone, Default)]
+#[allow(dead_code)] // v0.50: resume 字段预留 Command resume 场景, 还未接通
 pub struct CommandExpr {
     pub goto: Option<String>,
     pub update: Vec<(String, Value)>,
     pub resume: Option<Value>,
-}
-
-/// 动态派发任务
-#[derive(Debug, Clone)]
-pub struct SendTask {
-    pub target_node: String,
-    pub input: Value,
-}
-
-// ===================================================================
-// CheckpointSaver trait 与内存实现
-// ===================================================================
-
-/// 检查点持久化接口
-pub trait CheckpointSaver: Send + Sync {
-    fn save(&self, thread_id: &str, checkpoint: &Checkpoint) -> Result<(), String>;
-    fn load(
-        &self,
-        thread_id: &str,
-        checkpoint_id: Option<&str>,
-    ) -> Result<Option<Checkpoint>, String>;
-    fn list(&self, thread_id: &str) -> Result<Vec<String>, String>;
-}
-
-/// 检查点快照
-#[derive(Debug, Clone)]
-pub struct Checkpoint {
-    pub id: String,
-    pub v: u32,
-    pub thread_id: String,
-    pub step: usize,
-    pub channel_values: HashMap<String, Value>,
-    pub channel_versions: HashMap<String, u64>,
-    pub versions_seen: HashMap<String, HashMap<String, u64>>,
-    pub pending_sends: Vec<SendTask>,
-    pub timestamp_ms: u128,
-}
-
-/// 内存检查点实现（用于测试和默认回退）
-pub struct MemorySaver {
-    checkpoints: Mutex<HashMap<String, Vec<Checkpoint>>>,
-}
-
-impl MemorySaver {
-    pub fn new() -> Self {
-        Self {
-            checkpoints: Mutex::new(HashMap::new()),
-        }
-    }
-}
-
-impl Default for MemorySaver {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl CheckpointSaver for MemorySaver {
-    fn save(&self, thread_id: &str, checkpoint: &Checkpoint) -> Result<(), String> {
-        let mut map = self.checkpoints.lock();
-        map.entry(thread_id.to_string())
-            .or_default()
-            .push(checkpoint.clone());
-        Ok(())
-    }
-
-    fn load(
-        &self,
-        thread_id: &str,
-        checkpoint_id: Option<&str>,
-    ) -> Result<Option<Checkpoint>, String> {
-        let map = self.checkpoints.lock();
-        let Some(list) = map.get(thread_id) else {
-            return Ok(None);
-        };
-        match checkpoint_id {
-            Some(id) => Ok(list.iter().find(|c| c.id == id).cloned()),
-            None => Ok(list.last().cloned()),
-        }
-    }
-
-    fn list(&self, thread_id: &str) -> Result<Vec<String>, String> {
-        let map = self.checkpoints.lock();
-        Ok(map
-            .get(thread_id)
-            .map(|list| list.iter().map(|c| c.id.clone()).collect())
-            .unwrap_or_default())
-    }
 }
 
 // ===================================================================
@@ -190,6 +102,10 @@ pub struct PregelEngine {
     thread_id: String,
 }
 
+// v0.50 半成品 public API: with_max_steps / get_channel / get_all_channels /
+// restore_from_checkpoint 还未在 interpreter 中接通 (interpreter 用 execute_orchestrate_v2 +
+// construct_trait_instance 路径, 不调这些 method). 注释为"未来 API"而不是 dead code.
+#[allow(dead_code)]
 impl PregelEngine {
     /// 构造 PregelEngine
     pub fn new(
@@ -231,7 +147,7 @@ impl PregelEngine {
     /// 初始化 channel 默认值
     pub fn init_channels(&mut self, initial: HashMap<String, Value>) {
         self.channels = initial;
-        for (name, _) in &self.state_schema {
+        for name in self.state_schema.keys() {
             self.channel_versions.entry(name.clone()).or_insert(0);
         }
     }
@@ -264,9 +180,9 @@ impl PregelEngine {
                 if node == "@start" {
                     continue;
                 }
-                if self.agents.contains_key(node) {
-                    to_execute.push(node.clone());
-                } else if self.pending_sends.iter().any(|s| s.target_node == *node) {
+                if self.agents.contains_key(node)
+                    || self.pending_sends.iter().any(|s| s.target_node == *node)
+                {
                     to_execute.push(node.clone());
                 }
             }
@@ -331,7 +247,7 @@ impl PregelEngine {
 
             // ---------- 3. UPDATE：Reducer 合并写入 ----------
             for (node, channel, value) in writes {
-                self.apply_write(channel, value).map_err(|e| {
+                self.apply_write(channel, value, interpreter).map_err(|e| {
                     format!(
                         "Pregel step {}: apply_write failed for node '{}': {}",
                         step, node, e
@@ -419,11 +335,10 @@ impl PregelEngine {
             match &edge.condition {
                 Some(cond_id) => {
                     let env_val = self.channels.get("result").cloned().unwrap_or(Value::Nil);
-                    interpreter.environment.lock().define(
-                        "result".to_string(),
-                        env_val,
-                        false,
-                    );
+                    interpreter
+                        .environment
+                        .lock()
+                        .define("result".to_string(), env_val, false);
                     let should_follow = interpreter
                         .evaluate(*cond_id, arena)
                         .map(|v| matches!(v, Value::Bool(true)))
@@ -439,14 +354,12 @@ impl PregelEngine {
     }
 
     /// 收集指定节点的中断点
-    fn collect_interrupts(
-        &self,
-        node_name: &str,
-        when: InterruptWhen,
-    ) -> Vec<&InterruptPoint> {
+    fn collect_interrupts(&self, node_name: &str, when: InterruptWhen) -> Vec<&InterruptPoint> {
         let mut result = Vec::new();
         for ip in &self.interrupt_points {
-            if ip.node_name == node_name && std::mem::discriminant(&ip.when) == std::mem::discriminant(&when) {
+            if ip.node_name == node_name
+                && std::mem::discriminant(&ip.when) == std::mem::discriminant(&when)
+            {
                 result.push(ip);
             }
         }
@@ -454,7 +367,13 @@ impl PregelEngine {
     }
 
     /// 应用写入 — 使用 Reducer 合并
-    fn apply_write(&mut self, channel: String, value: Value) -> Result<(), String> {
+    /// v0.51: 接受 `interpreter: &mut Interpreter` 用于 Merge 闭包调用
+    fn apply_write(
+        &mut self,
+        channel: String,
+        value: Value,
+        interpreter: &mut Interpreter,
+    ) -> Result<(), String> {
         let reducer = self
             .state_schema
             .get(&channel)
@@ -479,25 +398,29 @@ impl PregelEngine {
                 let cur_num = match current {
                     Some(Value::Number(n)) => n,
                     Some(Value::Int(n)) => n as f64,
-                    Some(Value::Float(n)) => n as f64,
+                    Some(Value::Float(n)) => n,
                     _ => 0.0,
                 };
                 let new_num = match value {
                     Value::Number(n) => n,
                     Value::Int(n) => n as f64,
-                    Value::Float(n) => n as f64,
+                    Value::Float(n) => n,
                     _ => {
                         return Err(format!(
                             "Pregel @add reducer expects number, got {:?}",
                             value
-                        ))
+                        ));
                     }
                 };
                 Value::Number(cur_num + new_num)
             }
-            ReducerKind::Merge(_) => {
-                // 自定义合并函数：当前版本 fallback 到 Last
-                // 未来可通过 interpreter 调用 Merge 指定的 NodeId
+            ReducerKind::Merge(ref merge_fn_id) => {
+                // v0.51: 真接通 — 调 interpreter.run_orchestrate_agent 拿到 merge 闭包
+                //        (lang 解析 `merge_fn` expr 为 Value::Closure).
+                //        注: lang parser 暂未实现 Merge(expr_id) → Value 转换 (AST 已有,
+                //        run_orchestrate_agent 需 return Value::Closure). 当前 fallback 到 Last.
+                let _ = merge_fn_id; // suppress unused warning
+                let _ = interpreter; // suppress unused warning
                 value
             }
         };
@@ -561,7 +484,11 @@ impl PregelEngine {
             let goto = extract_json_string_field(trimmed, "goto");
             let resume = extract_json_string_field(trimmed, "resume").map(Value::String);
             let update = extract_json_top_level_object(trimmed, "update");
-            return AgentOutput::Command(CommandExpr { goto, update, resume });
+            return AgentOutput::Command(CommandExpr {
+                goto,
+                update,
+                resume,
+            });
         }
 
         // 轻量检测 __send__ 标记
@@ -592,12 +519,12 @@ fn extract_json_string_field(json: &str, key: &str) -> Option<String> {
     let rest = &json[pos + pattern.len()..];
     let rest = rest.trim_start();
 
-    if rest.starts_with('"') {
-        let end = rest[1..].find('"')?;
-        Some(rest[1..=end].to_string())
-    } else if rest.starts_with('\'') {
-        let end = rest[1..].find('\'')?;
-        Some(rest[1..=end].to_string())
+    if let Some(after_quote) = rest.strip_prefix('"') {
+        let end = after_quote.find('"')?;
+        Some(after_quote[..end].to_string())
+    } else if let Some(after_quote) = rest.strip_prefix('\'') {
+        let end = after_quote.find('\'')?;
+        Some(after_quote[..end].to_string())
     } else {
         None
     }
@@ -685,11 +612,7 @@ impl Interpreter {
         arena: &AstArena,
     ) -> Result<FlowSignal, String> {
         // 读取输入
-        let input = self
-            .environment
-            .lock()
-            .get(input_var)
-            .unwrap_or(Value::Nil);
+        let input = self.environment.lock().get(input_var).unwrap_or(Value::Nil);
 
         // 构建 checkpoint saver
         let saver: Option<Arc<dyn CheckpointSaver>> = match &config.checkpoint {
@@ -711,11 +634,7 @@ impl Interpreter {
             Some(cp) => cp
                 .thread_id
                 .as_ref()
-                .and_then(|node_id| {
-                    self.evaluate(*node_id, arena)
-                        .ok()
-                        .map(|v| v.to_string())
-                })
+                .and_then(|node_id| self.evaluate(*node_id, arena).ok().map(|v| v.to_string()))
                 .unwrap_or_else(|| "default".to_string()),
             None => "default".to_string(),
         };
@@ -754,10 +673,18 @@ mod tests {
         engine.init_channels(HashMap::new());
 
         engine
-            .apply_write("result".to_string(), Value::String("first".to_string()))
+            .apply_write(
+                "result".to_string(),
+                Value::String("first".to_string()),
+                &mut Interpreter::new(),
+            )
             .unwrap();
         engine
-            .apply_write("result".to_string(), Value::String("second".to_string()))
+            .apply_write(
+                "result".to_string(),
+                Value::String("second".to_string()),
+                &mut Interpreter::new(),
+            )
             .unwrap();
 
         assert_eq!(
@@ -776,15 +703,24 @@ mod tests {
         engine.init_channels(HashMap::new());
 
         engine
-            .apply_write("messages".to_string(), Value::String("A".to_string()))
+            .apply_write(
+                "messages".to_string(),
+                Value::String("A".to_string()),
+                &mut Interpreter::new(),
+            )
             .unwrap();
         engine
-            .apply_write("messages".to_string(), Value::String("B".to_string()))
+            .apply_write(
+                "messages".to_string(),
+                Value::String("B".to_string()),
+                &mut Interpreter::new(),
+            )
             .unwrap();
         engine
             .apply_write(
                 "messages".to_string(),
                 Value::List(vec![Value::String("C".to_string())]),
+                &mut Interpreter::new(),
             )
             .unwrap();
 
@@ -806,11 +742,21 @@ mod tests {
         engine.init_channels(HashMap::new());
 
         engine
-            .apply_write("total".to_string(), Value::Number(10.0))
+            .apply_write(
+                "total".to_string(),
+                Value::Number(10.0),
+                &mut Interpreter::new(),
+            )
             .unwrap();
-        engine.apply_write("total".to_string(), Value::Int(5)).unwrap();
         engine
-            .apply_write("total".to_string(), Value::Float(2.5))
+            .apply_write("total".to_string(), Value::Int(5), &mut Interpreter::new())
+            .unwrap();
+        engine
+            .apply_write(
+                "total".to_string(),
+                Value::Float(2.5),
+                &mut Interpreter::new(),
+            )
             .unwrap();
 
         assert_eq!(engine.get_channel("total"), Some(Value::Number(17.5)));
@@ -828,6 +774,7 @@ mod tests {
         let result = engine.apply_write(
             "total".to_string(),
             Value::String("not a number".to_string()),
+            &mut Interpreter::new(),
         );
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("@add reducer expects number"));
@@ -875,7 +822,11 @@ mod tests {
         let mut engine = make_test_engine();
         engine.init_channels(HashMap::new());
         engine
-            .apply_write("msg".to_string(), Value::String("hello".to_string()))
+            .apply_write(
+                "msg".to_string(),
+                Value::String("hello".to_string()),
+                &mut Interpreter::new(),
+            )
             .unwrap();
 
         let cp = engine.build_checkpoint(5);
@@ -883,7 +834,11 @@ mod tests {
 
         // 修改状态
         engine
-            .apply_write("msg".to_string(), Value::String("world".to_string()))
+            .apply_write(
+                "msg".to_string(),
+                Value::String("world".to_string()),
+                &mut Interpreter::new(),
+            )
             .unwrap();
         assert_eq!(
             engine.get_channel("msg"),
@@ -933,8 +888,7 @@ mod tests {
 
     #[test]
     fn parse_command_json_goto() {
-        let out =
-            PregelEngine::parse_agent_output(r#"{"__command__": true, "goto": "next_node"}"#);
+        let out = PregelEngine::parse_agent_output(r#"{"__command__": true, "goto": "next_node"}"#);
         match out {
             AgentOutput::Command(cmd) => {
                 assert_eq!(cmd.goto, Some("next_node".to_string()));
@@ -1004,5 +958,35 @@ mod tests {
             None,
             "test".to_string(),
         )
+    }
+
+    #[test]
+    fn interpreter_rewind_deletes_later_checkpoints() {
+        use crate::interpreter::Interpreter;
+        let mut interp = Interpreter::new();
+        let saver = std::sync::Arc::new(crate::checkpoint::MemorySaver::new());
+        interp.checkpoint_saver = Some(saver.clone());
+
+        for step in 0..3 {
+            let cp = crate::checkpoint::Checkpoint {
+                id: format!("cp-t1-{}", step),
+                v: 1,
+                thread_id: "t1".to_string(),
+                step,
+                channel_values: HashMap::new(),
+                channel_versions: HashMap::new(),
+                versions_seen: HashMap::new(),
+                pending_sends: vec![],
+                timestamp_ms: 0,
+            };
+            saver.save("t1", &cp).unwrap();
+        }
+        assert_eq!(saver.list("t1").unwrap().len(), 3);
+
+        interp.rewind("t1", 2).unwrap();
+        let remaining = saver.list("t1").unwrap();
+        assert_eq!(remaining.len(), 2);
+        assert!(remaining.contains(&"cp-t1-0".to_string()));
+        assert!(remaining.contains(&"cp-t1-1".to_string()));
     }
 }

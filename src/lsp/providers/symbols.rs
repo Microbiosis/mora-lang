@@ -3,6 +3,22 @@ use crate::lsp::json::Value;
 use crate::lsp::server::DocumentState;
 use std::collections::{BTreeMap, HashMap};
 
+/// v0.51: AST span 是 1-based，LSP Position 是 0-based，统一减 1.
+fn lsp_position(line: usize, column: usize) -> Value {
+    Value::Object({
+        let mut p = BTreeMap::new();
+        p.insert(
+            "line".to_string(),
+            Value::Number(line.saturating_sub(1) as f64),
+        );
+        p.insert(
+            "character".to_string(),
+            Value::Number(column.saturating_sub(1) as f64),
+        );
+        p
+    })
+}
+
 #[allow(dead_code)]
 pub fn document_symbol_v2(docs: &HashMap<String, DocumentState>, params: &Value) -> Value {
     let uri = match params
@@ -31,33 +47,11 @@ pub fn document_symbol_v2(docs: &HashMap<String, DocumentState>, params: &Value)
                             let mut r = BTreeMap::new();
                             r.insert(
                                 "start".to_string(),
-                                Value::Object({
-                                    let mut p = BTreeMap::new();
-                                    p.insert(
-                                        "line".to_string(),
-                                        Value::Number(stmt.span.line as f64),
-                                    );
-                                    p.insert(
-                                        "character".to_string(),
-                                        Value::Number(stmt.span.column as f64),
-                                    );
-                                    p
-                                }),
+                                lsp_position(stmt.span.line, stmt.span.column),
                             );
                             r.insert(
                                 "end".to_string(),
-                                Value::Object({
-                                    let mut p = BTreeMap::new();
-                                    p.insert(
-                                        "line".to_string(),
-                                        Value::Number(stmt.span.line as f64),
-                                    );
-                                    p.insert(
-                                        "character".to_string(),
-                                        Value::Number((stmt.span.column + name.len()) as f64),
-                                    );
-                                    p
-                                }),
+                                lsp_position(stmt.span.line, stmt.span.column + name.len()),
                             );
                             r
                         }),
@@ -74,33 +68,11 @@ pub fn document_symbol_v2(docs: &HashMap<String, DocumentState>, params: &Value)
                             let mut r = BTreeMap::new();
                             r.insert(
                                 "start".to_string(),
-                                Value::Object({
-                                    let mut p = BTreeMap::new();
-                                    p.insert(
-                                        "line".to_string(),
-                                        Value::Number(stmt.span.line as f64),
-                                    );
-                                    p.insert(
-                                        "character".to_string(),
-                                        Value::Number(stmt.span.column as f64),
-                                    );
-                                    p
-                                }),
+                                lsp_position(stmt.span.line, stmt.span.column),
                             );
                             r.insert(
                                 "end".to_string(),
-                                Value::Object({
-                                    let mut p = BTreeMap::new();
-                                    p.insert(
-                                        "line".to_string(),
-                                        Value::Number(stmt.span.line as f64),
-                                    );
-                                    p.insert(
-                                        "character".to_string(),
-                                        Value::Number((stmt.span.column + name.len()) as f64),
-                                    );
-                                    p
-                                }),
+                                lsp_position(stmt.span.line, stmt.span.column + name.len()),
                             );
                             r
                         }),

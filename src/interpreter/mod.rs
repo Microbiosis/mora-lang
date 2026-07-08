@@ -5,8 +5,8 @@ mod dispatch;
 mod evaluate;
 mod execute;
 mod orchestrate;
-mod trait_dispatch;
 mod orchestrate_v2;
+mod trait_dispatch;
 
 use parking_lot::Mutex;
 use std::collections::HashMap;
@@ -271,7 +271,7 @@ pub struct Interpreter {
     /// v0.48.0: Refine session registry (multi-script, CLI-Anything /refine)
     pub refine_registry: std::sync::Arc<Mutex<crate::refine::RefineRegistry>>,
     /// v0.50: Pregel 检查点保存器（由 Worker 2/3 完善 checkpoint 模块后注入）
-    pub checkpoint_saver: Option<std::sync::Arc<dyn crate::interpreter::orchestrate_v2::CheckpointSaver>>,
+    pub checkpoint_saver: Option<std::sync::Arc<dyn crate::checkpoint::CheckpointSaver>>,
 }
 
 /// v0.06: with 块字段 (不经过 env 变量)
@@ -614,26 +614,24 @@ impl Interpreter {
         }
     }
 
-    /// v0.50: 回溯到指定检查点之前的步骤（rewind）
-    pub fn rewind(
-        &mut self,
-        thread_id: &str,
-        before_step: usize,
-    ) -> Result<(), String> {
+    /// v0.51: 回溯到指定检查点之前的步骤（rewind）
+    /// checkpoint id 格式: `cp-{thread_id}-{step}`
+    pub fn rewind(&mut self, thread_id: &str, before_step: usize) -> Result<(), String> {
         if let Some(ref saver) = self.checkpoint_saver {
             let checkpoints = saver.list(thread_id)?;
+            // 解析 `cp-{thread_id}-{step}` 提取 step
+            let thread_prefix = format!("cp-{}-", thread_id);
             let to_remove: Vec<String> = checkpoints
                 .into_iter()
                 .filter(|id| {
-                    id.starts_with("step-") && {
-                        let step_str = id.trim_start_matches("step-");
+                    id.starts_with(&thread_prefix) && {
+                        let step_str = id.trim_start_matches(&thread_prefix);
                         step_str.parse::<usize>().unwrap_or(0) >= before_step
                     }
                 })
                 .collect();
             for id in to_remove {
-                // 占位：CheckpointSaver 当前未定义删除接口，
-                // Worker 2/3 完善 checkpoint 模块后补充
+                saver.delete(thread_id, &id)?;
             }
             Ok(())
         } else {
@@ -644,9 +642,9 @@ impl Interpreter {
     /// v0.50: 从最新检查点恢复执行（resume）
     pub fn resume(&mut self, thread_id: &str) -> Result<HashMap<String, Value>, String> {
         if let Some(ref saver) = self.checkpoint_saver {
-            let cp = saver.load(thread_id, None)?.ok_or_else(|| {
-                format!("No checkpoint found for thread {}", thread_id)
-            })?;
+            let cp = saver
+                .load(thread_id, None)?
+                .ok_or_else(|| format!("No checkpoint found for thread {}", thread_id))?;
             Ok(cp.channel_values)
         } else {
             Err("No checkpoint saver configured".to_string())
@@ -1438,16 +1436,16 @@ end
     fn test_self_less_method_basic() {
         let src = r#"
 trait Math
-  fn add(a: number, b: number) -> number
+  fn f_add(a: number, b: number) -> number
 end
 
 impl Math for Calc
-  fn add(a: number, b: number) = a + b
+  fn f_add(a: number, b: number) = a + b
 end
 
 task main()
   let m: dyn Math = Math::new("Calc")
-  print(m.add(1, 2))
+  print(m.f_add(1, 2))
 end
 "#;
         let (node_ids, arena) = parse_code(src);
@@ -1462,7 +1460,7 @@ end
     fn test_self_less_default_impl() {
         let src = r#"
 trait Math
-  fn add(a: number, b: number) -> number = a * b
+  fn f_add(a: number, b: number) -> number = a * b
 end
 
 impl Math for Calc
@@ -1471,7 +1469,7 @@ end
 
 task main()
   let m: dyn Math = Math::new("Calc")
-  print(m.add(3, 4))
+  print(m.f_add(3, 4))
 end
 "#;
         let (node_ids, arena) = parse_code(src);
@@ -2172,10 +2170,10 @@ end
     fn test_atom_swap_returns() {
         let src = r#"
 task main()
-  let state = atom("initial")
-  let new_val = swap(state, fn(old) return "updated" end)
+  let atom_state = atom("initial")
+  let new_val = swap(atom_state, fn(old) return "updated" end)
   print(new_val)
-  print(deref(state))
+  print(deref(atom_state))
 end
 "#;
         run(src).expect("should return new value from swap");
@@ -2185,9 +2183,9 @@ end
     fn test_partial_basic() {
         let src = r#"
 task main()
-  let add = fn(a, b) return a + b end
-  let add10 = partial(add, 10)
-  let result = add10(5)
+  let f_add = fn(a, b) return a + b end
+  let f_add10 = partial(f_add, 10)
+  let result = f_add10(5)
   print(result)
 end
 "#;
@@ -2198,9 +2196,9 @@ end
     fn test_partial_with_pipe() {
         let src = r#"
 task main()
-  let add = fn(a, b) return a + b end
-  let add10 = partial(add, 10)
-  let result = 5 |> add10
+  let f_add = fn(a, b) return a + b end
+  let f_add10 = partial(f_add, 10)
+  let result = 5 |> f_add10
   print(result)
 end
 "#;

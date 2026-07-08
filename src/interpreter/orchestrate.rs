@@ -9,11 +9,12 @@ use super::*;
 const MAX_GRAPH_STEPS: usize = 1000;
 
 use crate::ast_v2::{AstArena, OrchestrateAgent, OrchestrateKind};
-use crate::value::{FlowSignal, Value};
 use crate::interpreter::orchestrate_v2::PregelEngine;
+use crate::value::{FlowSignal, Value};
 
 impl Interpreter {
     /// v0.50: 执行 Pregel orchestrate 块（通过 orchestrate_v2 引擎）
+    #[allow(clippy::too_many_arguments)] // 9 字段对应 v0.50 orchestrate 语句的全部部分, 不能合并
     pub fn execute_orchestrate_v2(
         &mut self,
         input_var: &str,
@@ -25,13 +26,9 @@ impl Interpreter {
         interrupt_points: &[crate::ast_v2::InterruptPoint],
         arena: &AstArena,
     ) -> Result<FlowSignal, String> {
-        use crate::interpreter::orchestrate_v2::{PregelConfig, MemorySaver, CheckpointSaver};
+        use crate::interpreter::orchestrate_v2::PregelConfig;
 
-        let input = self
-            .environment
-            .lock()
-            .get(input_var)
-            .unwrap_or(Value::Nil);
+        let input = self.environment.lock().get(input_var).unwrap_or(Value::Nil);
 
         let config = PregelConfig {
             agents: agents.to_vec(),
@@ -41,11 +38,24 @@ impl Interpreter {
             interrupt_points: interrupt_points.to_vec(),
         };
 
-        let saver: Option<std::sync::Arc<dyn CheckpointSaver>> = match &config.checkpoint {
-            Some(cp) if cp.saver == "memory" => Some(std::sync::Arc::new(MemorySaver::new())),
+        let saver: Option<std::sync::Arc<dyn crate::checkpoint::CheckpointSaver>> = match &config
+            .checkpoint
+        {
+            Some(cp) if cp.saver == "memory" => {
+                Some(std::sync::Arc::new(crate::checkpoint::MemorySaver::new()))
+            }
+            #[cfg(feature = "checkpoint-sqlite")]
+            Some(cp) if cp.saver == "sqlite" => {
+                // v0.51: SQLite saver 真接通. 默认路径: ./.mora/checkpoints.sqlite
+                std::fs::create_dir_all(".mora").map_err(|e| e.to_string())?;
+                Some(std::sync::Arc::new(crate::checkpoint::SqliteSaver::new(
+                    ".mora/checkpoints.sqlite",
+                )?))
+            }
+            #[cfg(not(feature = "checkpoint-sqlite"))]
             Some(cp) if cp.saver == "sqlite" => {
                 return Err(format!(
-                    "SQLite checkpoint saver not yet implemented (requested: {})",
+                    "SQLite checkpoint saver requires 'checkpoint-sqlite' feature (requested: {})",
                     cp.saver
                 ));
             }
@@ -57,11 +67,7 @@ impl Interpreter {
             Some(cp) => cp
                 .thread_id
                 .as_ref()
-                .and_then(|node_id| {
-                    self.evaluate(*node_id, arena)
-                        .ok()
-                        .map(|v| v.to_string())
-                })
+                .and_then(|node_id| self.evaluate(*node_id, arena).ok().map(|v| v.to_string()))
                 .unwrap_or_else(|| "default".to_string()),
             None => "default".to_string(),
         };
@@ -74,7 +80,9 @@ impl Interpreter {
         }
         engine.init_channels(initial);
 
-        let result = engine.run(self, arena).map_err(|e| format!("Pregel error: {}", e))?;
+        let result = engine
+            .run(self, arena)
+            .map_err(|e| format!("Pregel error: {}", e))?;
         self.environment
             .lock()
             .define(result_var.to_string(), result, false);
@@ -108,12 +116,9 @@ impl Interpreter {
             ),
             OrchestrateKind::Sequential { .. }
             | OrchestrateKind::Graph { .. }
-            | OrchestrateKind::Loop { .. } => self.execute_orchestrate_v1(
-                input_var,
-                result_var,
-                kind,
-                arena,
-            ),
+            | OrchestrateKind::Loop { .. } => {
+                self.execute_orchestrate_v1(input_var, result_var, kind, arena)
+            }
         }
     }
 
@@ -251,9 +256,7 @@ impl Interpreter {
                 );
             }
             OrchestrateKind::Pregel { .. } => {
-                return Err(
-                    "Pregel must be handled by execute_orchestrate, not v1".to_string(),
-                );
+                return Err("Pregel must be handled by execute_orchestrate, not v1".to_string());
             }
         }
 

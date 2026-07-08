@@ -37,7 +37,9 @@ pub fn semantic_tokens(docs: &HashMap<String, DocumentState>, params: &Value) ->
     let tokens = crate::lexer::Lexer::new(&text).scan_tokens();
     use crate::lexer::TokenType;
     for tok in &tokens {
-        let (line, col) = (tok.line, 0u32);
+        // v0.51: 修 col 硬编码 0 — LSP semantic tokens 走 delta encoding,
+        // 起点列必须真实, 否则所有 token 都对齐到行首. 用 tok.column.
+        let (line, col) = (tok.line, tok.column as u32);
         let token_type = match &tok.token_type {
             TokenType::Let | TokenType::Task | TokenType::If | TokenType::Then | TokenType::End |
             TokenType::For | TokenType::In | TokenType::Return |
@@ -75,35 +77,39 @@ pub fn semantic_tokens(docs: &HashMap<String, DocumentState>, params: &Value) ->
         if let Some(stmt) = arena.get_stmt(*stmt_id) {
             if let crate::ast_v2::StmtKind::TaskDef { name, .. } = &stmt.kind {
                 let span = &stmt.span;
-                let dl = (span.line as u32).saturating_sub(last_line);
+                let line = span.line.saturating_sub(1) as u32;
+                let col = span.column.saturating_sub(1) as u32;
+                let dl = line.saturating_sub(last_line);
                 let dc = if dl == 0 {
-                    (span.column as u32).saturating_sub(last_col)
+                    col.saturating_sub(last_col)
                 } else {
-                    span.column as u32
+                    col
                 };
                 data.push(dl);
                 data.push(dc);
                 data.push(1); // function
                 data.push(0);
                 data.push(name.len() as u32);
-                last_line = span.line as u32;
-                last_col = span.column as u32;
+                last_line = line;
+                last_col = col;
             }
             if let crate::ast_v2::StmtKind::Let { name, .. } = &stmt.kind {
                 let span = &stmt.span;
-                let dl = (span.line as u32).saturating_sub(last_line);
+                let line = span.line.saturating_sub(1) as u32;
+                let col = span.column.saturating_sub(1) as u32;
+                let dl = line.saturating_sub(last_line);
                 let dc = if dl == 0 {
-                    (span.column as u32).saturating_sub(last_col)
+                    col.saturating_sub(last_col)
                 } else {
-                    span.column as u32
+                    col
                 };
                 data.push(dl);
                 data.push(dc);
                 data.push(2); // variable
                 data.push(0);
                 data.push(name.len() as u32);
-                last_line = span.line as u32;
-                last_col = span.column as u32;
+                last_line = line;
+                last_col = col;
             }
         }
     }

@@ -570,7 +570,7 @@ pub struct InterruptPoint {
     pub when: InterruptWhen,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub enum InterruptWhen {
     Before,
     After,

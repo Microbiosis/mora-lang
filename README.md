@@ -4,9 +4,19 @@
 [![Release](https://img.shields.io/github/v/release/Microbiosis/mora-lang)](https://github.com/Microbiosis/mora-lang/releases/latest)
 [![CI](https://github.com/Microbiosis/mora-lang/actions/workflows/ci.yml/badge.svg)](https://github.com/Microbiosis/mora-lang/actions/workflows/ci.yml)
 
-一个轻量级脚本语言，内建 AI 调用（`p"..."` 表达式）、HTTP server、MCP server、长期记忆、Agent 编排。
+**Mora** 是一门面向 **AI-native 自动化**的脚本语言——一段代码同时描述 LLM 调用、HTTP/MCP 服务、长期记忆、多 Agent 协作与可观测。
 
-**v0.24**: 融合 9 个语言的设计基因 + 强类型升级 (Prolog、StreamIt、APL、Clojure、Lisp、Smalltalk、Common Lisp、Ballerina、Logo)
+**v0.51** 核心特性：
+- `p"..."` 模板表达式触发 AI 调用；`ai.chat` / `ai.embed` / `ai.critic` / `ai.retry` 内置
+- 同步解释执行（v0.52+ 编译到 MIR 字节码 提速 10×）
+- 0 外部 JSON/serde 依赖（手写 JSON Value + 序列化器，零外部锁）
+- 4 门禁全过：build / **606 测试** / fmt / clippy `-D warnings`
+
+**v0.50** 新增：Pregel BSP 编排引擎（21 个新关键字：`state` / `node` / `channel` / `checkpoint` / `command` / `send` / `interrupt` / `rewind` / ...），支持 LangGraph 风格 multi-agent + checkpoint 回溯。
+
+**v0.45** 起：ToolPlane Core/Extension adapter、MIR α.0 解释器（α.2 Import/Parallel/With 已接通）、SHA-256 hash-chained audit log。
+
+[完整架构文档](docs/ARCHITECTURE.md) · [CHANGELOG](CHANGELOG.md) · [设计影响](docs/influences.md)
 
 ```mora
 -- 一段代码 = HTTP + MCP + 可观测 (v0.04)

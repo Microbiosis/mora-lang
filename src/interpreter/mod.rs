@@ -211,6 +211,8 @@ pub struct Interpreter {
     pub trace: TraceCollector,
     // v0.06: 当前 with 块 set 的 AiConfig 值 (替代 env hack)
     current_ai_config: Option<AiConfigValue>,
+    // α.2: with 块 config 保存/恢复栈（MIR 解释器用）
+    config_stack: Vec<Option<AiConfigValue>>,
     // v0.08: trait 系统注册表 (v0.36: wrapped in Arc for cheap clone in HTTP/MCP workers)
     pub trait_registry: Arc<HashMap<String, TraitInfo>>,
     pub impl_table: Arc<HashMap<String, Vec<String>>>,
@@ -305,6 +307,7 @@ impl Clone for Interpreter {
             token_usage: self.token_usage.clone(),
             trace: self.trace.clone(),
             current_ai_config: self.current_ai_config.clone(),
+            config_stack: Vec::new(),
             trait_registry: self.trait_registry.clone(),
             impl_table: self.impl_table.clone(),
             recorder: crate::record::Recorder::new_off(),
@@ -497,6 +500,7 @@ impl Interpreter {
             token_usage: TokenUsage::default(),
             trace: TraceCollector::new(false),
             current_ai_config: None,
+            config_stack: Vec::new(),
             trait_registry: Arc::new(HashMap::new()),
             impl_table: Arc::new(HashMap::new()),
             recorder: crate::record::Recorder::new_off(),
@@ -541,6 +545,7 @@ impl Interpreter {
             token_usage: TokenUsage::default(),
             trace: TraceCollector::new(false),
             current_ai_config: None,
+            config_stack: Vec::new(),
             trait_registry: Arc::new(HashMap::new()),
             impl_table: Arc::new(HashMap::new()),
             recorder: crate::record::Recorder::new_off(),
@@ -583,6 +588,7 @@ impl Interpreter {
             token_usage: TokenUsage::default(),
             trace: TraceCollector::new(false),
             current_ai_config: None,
+            config_stack: Vec::new(),
             trait_registry: Arc::new(HashMap::new()),
             impl_table: Arc::new(HashMap::new()),
             recorder: crate::record::Recorder::new_off(),
@@ -658,6 +664,75 @@ impl Interpreter {
 
     pub fn get_tool_registry(&self) -> &HashMap<String, ToolDef> {
         &self.tool_registry
+    }
+
+    /// α.0: MIR 解释器的函数调用桥。复用 dispatch.rs 的 call_function。
+    /// pub(crate) 让 mir::interp 能调用，不暴露给 crate 外。
+    pub(crate) fn mir_call_function(
+        &mut self,
+        name: &str,
+        args: Vec<Value>,
+    ) -> Result<Value, String> {
+        self.call_function(name, args, crate::common::Span::default())
+    }
+
+    /// α.1: MIR 解释器的方法调用桥。复用 dispatch.rs 的 call_method。
+    pub(crate) fn mir_call_method(
+        &mut self,
+        object: Value,
+        method: &str,
+        args: Vec<Value>,
+    ) -> Result<Value, String> {
+        self.call_method(object, method, args, crate::common::Span::default())
+    }
+
+    /// α.2: MIR 解释器的 import 桥。复用 execute.rs 的 execute_import。
+    pub(crate) fn mir_import(&mut self, path: &str) -> Result<(), String> {
+        match std::fs::read_to_string(path) {
+            Ok(source) => {
+                let (imported_ids, imported_arena) = parse_code(&source);
+                for sid in &imported_ids {
+                    if let Some(stmt) = imported_arena.get_stmt(*sid) {
+                        let kind = stmt.kind.clone();
+                        self.execute(&kind, &imported_arena)?;
+                    }
+                }
+                Ok(())
+            }
+            Err(e) => Err(format!("import error: {}", e)),
+        }
+    }
+
+    /// α.2: MIR 解释器的 with 块 config 设置桥。
+    /// 保存当前 current_ai_config，应用新 bindings。
+    pub(crate) fn mir_with_config(&mut self, bindings: &[(String, Value)]) -> Result<(), String> {
+        // 保存到栈（mir_restore_config 弹出）
+        self.config_stack.push(self.current_ai_config.clone());
+        let mut cfg = self.current_ai_config.clone().unwrap_or_default();
+        for (key, v) in bindings {
+            match key.as_str() {
+                "model" => cfg.model = Some(v.to_string()),
+                "temperature" => {
+                    if let Value::Number(n) = v {
+                        cfg.temperature = Some(*n);
+                    }
+                }
+                "max_tokens" => {
+                    if let Value::Number(n) = v {
+                        cfg.max_tokens = Some(*n as usize);
+                    }
+                }
+                "system" => cfg.system = Some(v.to_string()),
+                _ => {}
+            }
+        }
+        self.current_ai_config = Some(cfg);
+        Ok(())
+    }
+
+    /// α.2: 恢复 with 块之前的 AI config。
+    pub(crate) fn mir_restore_config(&mut self) {
+        self.current_ai_config = self.config_stack.pop().flatten();
     }
 
     pub fn set_trace_enabled(&mut self, enabled: bool) {
@@ -775,7 +850,10 @@ impl Interpreter {
                         Ok(FlowSignal::None) => {}
                         Ok(FlowSignal::Break) | Ok(FlowSignal::Continue) => {}
                         Ok(FlowSignal::Interrupt { node, when, .. }) => {
-                            eprintln!("Interrupt at node '{}' ({}). Use resume/rewind to continue.", node, when);
+                            eprintln!(
+                                "Interrupt at node '{}' ({}). Use resume/rewind to continue.",
+                                node, when
+                            );
                         }
                         Err(e) => eprintln!("Error: {}", e),
                     }

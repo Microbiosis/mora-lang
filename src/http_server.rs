@@ -401,11 +401,16 @@ async fn send_response(stream: &mut TcpStream, status: u16, body: &str) -> io::R
         500 => "Internal Server Error",
         _ => "OK",
     };
+    // S5 fix: CORS 通配符改为可配置。默认 *（本地开发兼容），生产环境应通过
+    // MORA_CORS_ORIGIN 环境变量收紧（如 "https://example.com"）。
+    // 注意：S6 已将默认绑定改为 127.0.0.1，* 的实际风险已大幅降低（仅本机可达）。
+    let cors_origin = std::env::var("MORA_CORS_ORIGIN").unwrap_or_else(|_| "*".to_string());
     let response = format!(
-        "HTTP/1.1 {} {}\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n{}",
+        "HTTP/1.1 {} {}\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: {}\r\nConnection: close\r\n\r\n{}",
         status,
         status_text,
         body.len(),
+        cors_origin,
         body
     );
     stream.write_all(response.as_bytes()).await?;

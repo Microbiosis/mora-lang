@@ -2000,6 +2000,8 @@ use std::time::{Duration, Instant};
 /// 并行执行结果 (单个 cmd)
 #[derive(Debug, Clone)]
 struct ParallelResult {
+    /// 原始输入索引，用于保证结果顺序 = 输入顺序（并发完成顺序不固定）
+    idx: usize,
     cmd: String,
     stdout: String,
     stderr: String,
@@ -2013,6 +2015,7 @@ struct ParallelResult {
 impl ParallelResult {
     fn to_value(&self) -> Value {
         let mut d = HashMap::new();
+        d.insert("index".to_string(), Value::Int(self.idx as i64));
         d.insert("cmd".to_string(), Value::String(self.cmd.clone()));
         d.insert("stdout".to_string(), Value::String(self.stdout.clone()));
         d.insert("stderr".to_string(), Value::String(self.stderr.clone()));
@@ -2176,7 +2179,7 @@ fn exec_parallel(args: &[Value]) -> Result<Value, String> {
 
                 // 获取信号量
                 sem.acquire();
-                let result = run_single_cmd(&cmd_str, timeout, &cancelled);
+                let result = run_single_cmd(idx, &cmd_str, timeout, &cancelled);
                 sem.release();
 
                 if tx.send(result).is_err() {
@@ -2202,12 +2205,16 @@ fn exec_parallel(args: &[Value]) -> Result<Value, String> {
         let _ = h.join();
     }
 
+    // 按原始索引排序，保证结果顺序 = 输入顺序（消除并发完成顺序导致的竞态）
+    results.sort_by_key(|r| r.idx);
+
     // 转 Value::List[Dict]
     Ok(Value::List(results.iter().map(|r| r.to_value()).collect()))
 }
 
 /// 单个 cmd 执行 (run on worker thread)
 fn run_single_cmd(
+    idx: usize,
     cmd_str: &str,
     timeout: Option<Duration>,
     cancelled: &Arc<AtomicBool>,
@@ -2246,6 +2253,7 @@ fn run_single_cmd(
         Ok(c) => c,
         Err(e) => {
             return ParallelResult {
+                idx,
                 cmd: cmd_str.to_string(),
                 stdout: String::new(),
                 stderr: String::new(),
@@ -2278,6 +2286,7 @@ fn run_single_cmd(
             Ok(Err(e)) => {
                 let _ = waiter.join();
                 return ParallelResult {
+                    idx,
                     cmd: cmd_str.to_string(),
                     stdout: String::new(),
                     stderr: String::new(),
@@ -2293,6 +2302,7 @@ fn run_single_cmd(
                 kill_process_group(pid);
                 let _ = waiter.join();
                 return ParallelResult {
+                    idx,
                     cmd: cmd_str.to_string(),
                     stdout: String::new(),
                     stderr: String::new(),
@@ -2308,6 +2318,7 @@ fn run_single_cmd(
             Ok(out) => out,
             Err(e) => {
                 return ParallelResult {
+                    idx,
                     cmd: cmd_str.to_string(),
                     stdout: String::new(),
                     stderr: String::new(),
@@ -2321,6 +2332,7 @@ fn run_single_cmd(
     };
 
     ParallelResult {
+        idx,
         cmd: cmd_str.to_string(),
         stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
         stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
@@ -2799,7 +2811,7 @@ mod tests_v043_exec {
             other => panic!("expected List, got {:?}", other),
         };
         assert_eq!(list.len(), 3);
-        // 并行执行顺序不固定; 收集所有 stdout
+        // 结果已按输入索引保序（v0.51 修复并发竞态后）；收集所有 stdout 验证内容
         let mut stdouts: Vec<String> = Vec::new();
         for item in &list {
             let d = match item {
@@ -2839,6 +2851,13 @@ mod tests_v043_exec {
                 Value::Dict(d) => d,
                 _ => panic!("not Dict"),
             };
+            // index 字段应等于输入顺序（保序保证）
+            assert_eq!(
+                d.get("index"),
+                Some(&Value::Int(i as i64)),
+                "index field mismatch at position {}",
+                i
+            );
             let stdout = match d.get("stdout") {
                 Some(Value::String(s)) => s.clone(),
                 _ => panic!("no stdout"),

@@ -1015,12 +1015,10 @@ impl ParserV2 {
     fn parse_checkpoint_config(&mut self) -> CheckpointConfig {
         let saver = self.consume_identifier("Expected saver name");
         let mut thread_id = None;
-        if self.match_token(&[TokenType::Comma]) {
-            if self.check(&TokenType::Thread) {
-                self.advance(); // consume 'thread'
-                self.consume(&TokenType::Colon, "Expected ':'");
-                thread_id = Some(self.expression());
-            }
+        if self.match_token(&[TokenType::Comma]) && self.check(&TokenType::Thread) {
+            self.advance(); // consume 'thread'
+            self.consume(&TokenType::Colon, "Expected ':'");
+            thread_id = Some(self.expression());
         }
         CheckpointConfig { saver, thread_id }
     }

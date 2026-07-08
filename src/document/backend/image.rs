@@ -155,8 +155,9 @@ impl ImageBackend {
     pub fn from_bytes(bytes: Vec<u8>, format: String) -> Result<Self, String> {
         if format != "png" {
             return Err(format!(
-                "document.parse: image format '{}' not supported (v0.28: png only)",
-                format
+                "document.parse: image format '{}' not supported (Mora v{}: png only)",
+                format,
+                crate::VERSION
             ));
         }
 

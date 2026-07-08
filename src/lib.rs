@@ -3,6 +3,15 @@
 //! 暴露 lexer / parser / ast / interpreter / typeck / lsp 六个模块，
 //! 让 CLI binary（src/main.rs）和 LSP server binary（src/bin/lsp.rs）共享。
 
+/// v0.51: 版本号叙事的单一真相源。
+///
+/// 编译期从 build.rs 注入的 `MORAGIT_VERSION` env 读取 (来自 `Cargo.toml`
+/// 的 `version` 字段)。`env!` 在编译期展开, 零运行时开销。
+///
+/// 改 `Cargo.toml` 的 version 后, 下次 `cargo build` 自动重 build.rs,
+/// 所有引用 `mora::VERSION` 或 `env!("MORAGIT_VERSION")` 的位置同步更新。
+pub const VERSION: &str = env!("MORAGIT_VERSION");
+
 pub mod ai_infra;
 pub mod ast_v2;
 // v0.42.1: Audit Sink — SHA-256 hash-chained JSONL (loongclaw-inspired)

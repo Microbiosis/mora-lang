@@ -570,6 +570,13 @@ pub enum FlowSignal {
     Return(Value),
     Break,
     Continue,
+    /// v0.51: Pregel HITL 中断 — 引擎在 interrupt before/after 点暂停，
+    /// 由外部调用者决定如何恢复。
+    Interrupt {
+        node: String,
+        when: String,
+        channels: std::collections::HashMap<String, Value>,
+    },
 }
 
 impl FlowSignal {
@@ -579,6 +586,7 @@ impl FlowSignal {
             FlowSignal::Return(v) => v,
             FlowSignal::Break => Value::Nil,
             FlowSignal::Continue => Value::Nil,
+            FlowSignal::Interrupt { .. } => Value::Nil,
         }
     }
 

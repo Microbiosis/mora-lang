@@ -1235,11 +1235,11 @@ end
     #[test]
     fn task_arg_count_mismatch() {
         let src = r#"
-task add(a: number, b: number)
+task f_add(a: number, b: number)
   return a
 end
 task main()
-  let x: number = add(1)
+  let x: number = f_add(1)
 end
 "#;
         let errs = parse_and_check(src);

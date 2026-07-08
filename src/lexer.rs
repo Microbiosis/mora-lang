@@ -70,27 +70,27 @@ pub enum TokenType {
     // v0.27: Document 块（与 prompt 块语义类似）
     Document,
     // v0.50: 状态与执行模型关键字
-    State,       // 'state' (orchestrate 内)
-    Node,        // 'node' (orchestrate 内)
-    Channel,     // 'channel' (orchestrate 内)
-    Checkpoint,  // 'checkpoint' (orchestrate decorator)
-    Rewind,      // 'rewind' (builtin)
-    Resume,      // 'resume' (builtin)
-    Thread,      // 'thread' (checkpoint thread_id)
-    Dynamic,     // 'dynamic' (edge 修饰)
-    Map,         // 'map' (dynamic 类型)
-    Reduce,      // 'reduce' (dynamic 类型)
-    FanIn,       // 'fan_in' (JoinNode)
-    FanOut,      // 'fan_out' (parallel worker)
-    Interrupt,   // 'interrupt' (HITL 暂停点)
-    Before,      // 'before' (interrupt 位置)
-    After,       // 'after' (interrupt 位置)
-    Command,     // 'command' (返回类型)
-    Goto,        // 'goto' (command 字段)
-    Update,      // 'update' (command 字段)
-    Add,         // '@add' 语义
-    Last,        // '@last' 语义 (默认)
-    Merge,       // '@merge' 语义
+    State,      // 'state' (orchestrate 内)
+    Node,       // 'node' (orchestrate 内)
+    Channel,    // 'channel' (orchestrate 内)
+    Checkpoint, // 'checkpoint' (orchestrate decorator)
+    Rewind,     // 'rewind' (builtin)
+    Resume,     // 'resume' (builtin)
+    Thread,     // 'thread' (checkpoint thread_id)
+    Dynamic,    // 'dynamic' (edge 修饰)
+    Map,        // 'map' (dynamic 类型)
+    Reduce,     // 'reduce' (dynamic 类型)
+    FanIn,      // 'fan_in' (JoinNode)
+    FanOut,     // 'fan_out' (parallel worker)
+    Interrupt,  // 'interrupt' (HITL 暂停点)
+    Before,     // 'before' (interrupt 位置)
+    After,      // 'after' (interrupt 位置)
+    Command,    // 'command' (返回类型)
+    Goto,       // 'goto' (command 字段)
+    Update,     // 'update' (command 字段)
+    Add,        // '@add' 语义
+    Last,       // '@last' 语义 (默认)
+    Merge,      // '@merge' 语义
     // 注意: HTTP 方法 (GET/POST/PUT/DELETE/PATCH) 不作关键字
     // —— 保持 Identifier,显式 API Router.route() 按字符串匹配
     Identifier(String),
@@ -942,6 +942,7 @@ impl Lexer {
             "before" => TokenType::Before,
             "after" => TokenType::After,
             "command" => TokenType::Command,
+            "send" => TokenType::Send,
             "goto" => TokenType::Goto,
             "update" => TokenType::Update,
             "add" => TokenType::Add,

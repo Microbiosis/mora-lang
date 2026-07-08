@@ -154,7 +154,7 @@ async fn handle_connection(
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
                 "request read timeout",
-            ))
+            ));
         }
     };
     req.params = HashMap::new();

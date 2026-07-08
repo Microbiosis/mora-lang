@@ -31,6 +31,13 @@ pub fn references_v2(docs: &HashMap<String, DocumentState>, params: &Value) -> V
     };
 
     let mut refs = Vec::new();
+    let defs = collect_definitions_v2(&stmt_ids, &arena);
+    // v0.51: references 包含定义点 + 引用点 (LSP 规范要求)
+    if let Some(positions) = defs.get(&ident) {
+        for (l, c) in positions {
+            refs.push((*l, *c));
+        }
+    }
     collect_references_v2(&stmt_ids, &arena, &ident, &mut refs);
 
     let mut locations: Vec<Value> = Vec::new();

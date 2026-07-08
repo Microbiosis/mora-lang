@@ -12,6 +12,12 @@ pub struct MemorySaver {
     checkpoints: Mutex<HashMap<String, Vec<Checkpoint>>>,
 }
 
+impl Default for MemorySaver {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl MemorySaver {
     pub fn new() -> Self {
         Self {

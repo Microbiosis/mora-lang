@@ -774,6 +774,9 @@ impl Interpreter {
                         Ok(FlowSignal::Return(v)) => println!("= {}", v),
                         Ok(FlowSignal::None) => {}
                         Ok(FlowSignal::Break) | Ok(FlowSignal::Continue) => {}
+                        Ok(FlowSignal::Interrupt { node, when, .. }) => {
+                            eprintln!("Interrupt at node '{}' ({}). Use resume/rewind to continue.", node, when);
+                        }
                         Err(e) => eprintln!("Error: {}", e),
                     }
                 }

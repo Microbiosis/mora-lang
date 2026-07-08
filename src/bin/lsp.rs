@@ -8,7 +8,7 @@ fn main() {
     if args.len() > 1 {
         match args[1].as_str() {
             "--version" | "-v" => {
-                println!("mora-lsp 0.1.0");
+                println!("mora-lsp v{}", mora::VERSION);
                 return;
             }
             "--help" | "-h" => {

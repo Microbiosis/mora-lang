@@ -138,8 +138,9 @@ pub fn parse_document(path: &str) -> Result<Value, String> {
             Ok(make_document(std::sync::Arc::new(backend), metadata))
         }
         other => Err(format!(
-            "document.parse: unsupported extension '.{}' (this v0.28 release supports pdf, md, markdown, html, htm, pptx, docx, png)",
-            other
+            "document.parse: unsupported extension '.{}' (Mora v{} supports pdf, md, markdown, html, htm, pptx, docx, png)",
+            other,
+            crate::VERSION
         )),
     }
 }
@@ -218,10 +219,13 @@ mod tests {
             "expected 'unsupported extension '.xyz'' in error, got: {}",
             msg
         );
-        // v0.28: error mentions the v0.28 release and the supported extensions.
+        // v0.51: error mentions the current Mora version (from build.rs env)
+        // and the supported extensions.
+        let expected_marker = format!("Mora v{}", crate::VERSION);
         assert!(
-            msg.contains("v0.28") && msg.contains("supports"),
-            "expected v0.28 release support list in error, got: {}",
+            msg.contains(&expected_marker) && msg.contains("supports"),
+            "expected '{}' + 'supports' in error, got: {}",
+            expected_marker,
             msg
         );
     }

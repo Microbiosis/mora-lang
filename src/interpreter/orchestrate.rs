@@ -28,7 +28,12 @@ impl Interpreter {
     ) -> Result<FlowSignal, String> {
         use crate::interpreter::orchestrate_v2::PregelConfig;
 
-        let input = self.environment.lock().get(input_var).unwrap_or(Value::Nil);
+        let input = self
+            .core
+            .environment
+            .lock()
+            .get(input_var)
+            .unwrap_or(Value::Nil);
 
         let config = PregelConfig {
             agents: agents.to_vec(),
@@ -83,7 +88,8 @@ impl Interpreter {
         let result = engine
             .run(self, arena)
             .map_err(|e| format!("Pregel error: {}", e))?;
-        self.environment
+        self.core
+            .environment
             .lock()
             .define(result_var.to_string(), result, false);
         Ok(FlowSignal::None)
@@ -131,6 +137,7 @@ impl Interpreter {
         arena: &AstArena,
     ) -> Result<FlowSignal, String> {
         let input = self
+            .core
             .environment
             .lock()
             .get(input_var)
@@ -143,7 +150,7 @@ impl Interpreter {
                 for agent in agents {
                     current = self.run_orchestrate_agent(agent, &current, arena)?;
                 }
-                self.environment.lock().define(
+                self.core.environment.lock().define(
                     result_var.to_string(),
                     Value::String(current),
                     false,
@@ -171,7 +178,7 @@ impl Interpreter {
                         match &e.condition {
                             Some(cond_id) => {
                                 {
-                                    let mut env = self.environment.lock();
+                                    let mut env = self.core.environment.lock();
                                     env.define(
                                         "result".to_string(),
                                         Value::String(current.clone()),
@@ -218,7 +225,7 @@ impl Interpreter {
                     }
                 }
 
-                self.environment.lock().define(
+                self.core.environment.lock().define(
                     result_var.to_string(),
                     Value::String(current),
                     false,
@@ -234,7 +241,7 @@ impl Interpreter {
                     current = self.run_orchestrate_agent(agent, &current, arena)?;
 
                     if let Some(cond_id) = exit_when {
-                        self.environment.lock().define(
+                        self.core.environment.lock().define(
                             "result".to_string(),
                             Value::String(current.clone()),
                             false,
@@ -249,7 +256,7 @@ impl Interpreter {
                     }
                 }
 
-                self.environment.lock().define(
+                self.core.environment.lock().define(
                     result_var.to_string(),
                     Value::String(current),
                     false,
@@ -271,31 +278,31 @@ impl Interpreter {
         arena: &AstArena,
     ) -> Result<String, String> {
         // 绑定 input 变量
-        self.environment.lock().define(
+        self.core.environment.lock().define(
             "input".to_string(),
             Value::String(input.to_string()),
             false,
         );
 
         // 应用 with 配置
-        let prev_config = self.current_ai_config.clone();
+        let prev_config = self.core.current_ai_config.clone();
         if let Some(ref bindings) = agent.with_config {
             for (key, val_id) in bindings {
                 let val = self.evaluate(*val_id, arena)?;
                 match key.as_str() {
                     "model" => {
                         if let Value::String(m) = val {
-                            self.current_ai_config = Some(AiConfigValue {
+                            self.core.current_ai_config = Some(AiConfigValue {
                                 model: Some(m),
-                                ..self.current_ai_config.clone().unwrap_or_default()
+                                ..self.core.current_ai_config.clone().unwrap_or_default()
                             });
                         }
                     }
                     "temperature" => {
                         if let Value::Number(t) = val {
-                            self.current_ai_config = Some(AiConfigValue {
+                            self.core.current_ai_config = Some(AiConfigValue {
                                 temperature: Some(t),
-                                ..self.current_ai_config.clone().unwrap_or_default()
+                                ..self.core.current_ai_config.clone().unwrap_or_default()
                             });
                         }
                     }
@@ -311,7 +318,7 @@ impl Interpreter {
         // verify（如果有的话）
         if let Some(verify_id) = agent.verify_expr {
             for attempt in 0..3 {
-                self.environment.lock().define(
+                self.core.environment.lock().define(
                     "result".to_string(),
                     Value::String(output.clone()),
                     false,
@@ -329,7 +336,7 @@ impl Interpreter {
                         agent.name
                     ));
                 }
-                self.environment.lock().define(
+                self.core.environment.lock().define(
                     "input".to_string(),
                     Value::String(output.clone()),
                     false,
@@ -340,7 +347,7 @@ impl Interpreter {
         }
 
         // 恢复配置
-        self.current_ai_config = prev_config;
+        self.core.current_ai_config = prev_config;
 
         Ok(output)
     }

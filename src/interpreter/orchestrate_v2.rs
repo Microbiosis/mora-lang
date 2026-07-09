@@ -381,10 +381,11 @@ impl PregelEngine {
             match &edge.condition {
                 Some(cond_id) => {
                     let env_val = self.channels.get("result").cloned().unwrap_or(Value::Nil);
-                    interpreter
-                        .environment
-                        .lock()
-                        .define("result".to_string(), env_val, false);
+                    interpreter.core.environment.lock().define(
+                        "result".to_string(),
+                        env_val,
+                        false,
+                    );
                     let should_follow = interpreter
                         .evaluate(*cond_id, arena)
                         .map(|v| matches!(v, Value::Bool(true)))
@@ -822,7 +823,12 @@ impl Interpreter {
         arena: &AstArena,
     ) -> Result<FlowSignal, String> {
         // 读取输入
-        let input = self.environment.lock().get(input_var).unwrap_or(Value::Nil);
+        let input = self
+            .core
+            .environment
+            .lock()
+            .get(input_var)
+            .unwrap_or(Value::Nil);
 
         // 构建 checkpoint saver
         let saver: Option<Arc<dyn CheckpointSaver>> = match &config.checkpoint {
@@ -860,7 +866,8 @@ impl Interpreter {
         let result = engine.run(self, arena)?;
 
         // 绑定结果
-        self.environment
+        self.core
+            .environment
             .lock()
             .define(result_var.to_string(), result, false);
 

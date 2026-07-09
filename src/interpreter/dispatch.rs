@@ -343,7 +343,7 @@ impl Interpreter {
                     let (name, role, text, budget_bytes) = match arg {
                         Value::String(section_name) => {
                             // 从环境查 section
-                            let looked_up = self.environment.lock().get(&section_name);
+                            let looked_up = self.core.environment.lock().get(&section_name);
                             match looked_up {
                                 Some(Value::PromptSection {
                                     name,
@@ -416,7 +416,7 @@ impl Interpreter {
             }
             _ => {
                 // 先 clone 出值，释放 borrow，避免借用冲突
-                let looked_up = self.environment.lock().get(name).clone();
+                let looked_up = self.core.environment.lock().get(name).clone();
                 if let Some(value) = looked_up {
                     match value {
                         Value::Task { .. }
@@ -425,7 +425,7 @@ impl Interpreter {
                         | Value::Partial(_, _) => self.call_value(&value, args),
                         Value::Macro { params, .. } => {
                             let env = Arc::new(Mutex::new(Environment::with_parent_of(
-                                self.environment.clone(),
+                                self.core.environment.clone(),
                             )));
                             for (i, param) in params.iter().enumerate() {
                                 let value = args.get(i).cloned().unwrap_or(Value::Nil);
@@ -1095,7 +1095,7 @@ impl Interpreter {
         match value {
             Value::Closure { v2_node_id, .. } => {
                 if v2_node_id.is_some() {
-                    if let Some(ref arena) = self.v2_arena.clone() {
+                    if let Some(ref arena) = self.core.v2_arena.clone() {
                         return self.call_value_inner(value, args, arena);
                     }
                     return Err("v2 closure requires arena".to_string());
@@ -1110,7 +1110,7 @@ impl Interpreter {
                 v2_body_ids,
                 ..
             } => {
-                if let Some(ref arena) = self.v2_arena.clone() {
+                if let Some(ref arena) = self.core.v2_arena.clone() {
                     return self.call_task_inner(params, v2_body_ids, args, arena);
                 }
                 Err("v2 task requires arena".to_string())
@@ -1140,7 +1140,7 @@ impl Interpreter {
         arena: &crate::ast_v2::AstArena,
     ) -> Result<Value, String> {
         let call_env = Arc::new(Mutex::new(Environment::with_parent_of(
-            self.environment.clone(),
+            self.core.environment.clone(),
         )));
         // v0.35 (P0-C4): surface arity errors instead of silently nil-filling.
         if args.len() < params.len() {
@@ -1157,15 +1157,15 @@ impl Interpreter {
                 .ok_or_else(|| format!("missing arg for parameter '{}'", param))?;
             call_env.lock().define(param.clone(), value, false);
         }
-        let prev_env = self.environment.clone();
-        self.environment = call_env;
+        let prev_env = self.core.environment.clone();
+        self.core.environment = call_env;
         // 单表达式 body：直接返回表达式值（与 closure 行为一致）
         if body_ids.len() == 1
             && let Some(stmt) = arena.get_stmt(crate::ast_v2::NodeId(body_ids[0]))
             && let crate::ast_v2::StmtKind::Expr(expr_id) = &stmt.kind
         {
             let result = self.evaluate(*expr_id, arena);
-            self.environment = prev_env;
+            self.core.environment = prev_env;
             return result;
         }
         for body_idx in body_ids {
@@ -1177,17 +1177,17 @@ impl Interpreter {
                 match signal {
                     FlowSignal::None => {}
                     FlowSignal::Return(val) => {
-                        self.environment = prev_env;
+                        self.core.environment = prev_env;
                         return Ok(val);
                     }
                     signal => {
-                        self.environment = prev_env;
+                        self.core.environment = prev_env;
                         return Err(format!("Unexpected signal in task: {:?}", signal));
                     }
                 }
             }
         }
-        self.environment = prev_env;
+        self.core.environment = prev_env;
         Ok(Value::Nil)
     }
 
@@ -1234,8 +1234,8 @@ impl Interpreter {
                                 .ok_or_else(|| format!("missing arg for parameter '{}'", pname))?;
                             call_env.lock().define(pname.clone(), val, false);
                         }
-                        let prev_env = self.environment.clone();
-                        self.environment = call_env;
+                        let prev_env = self.core.environment.clone();
+                        self.core.environment = call_env;
                         // v0.52 Bug C 根因修复：跟踪 last_value
                         // pre-existing: body 是 expression stmt 形式（`fn(c,n) n end`）时，
                         // execute 内部 `StmtKind::Expr` 丢弃 expr value。
@@ -1252,11 +1252,11 @@ impl Interpreter {
                                 match signal {
                                     FlowSignal::None => {}
                                     FlowSignal::Return(val) => {
-                                        self.environment = prev_env;
+                                        self.core.environment = prev_env;
                                         return Ok(val);
                                     }
                                     signal => {
-                                        self.environment = prev_env;
+                                        self.core.environment = prev_env;
                                         return Err(format!(
                                             "Unexpected signal in closure: {:?}",
                                             signal
@@ -1265,7 +1265,7 @@ impl Interpreter {
                                 }
                             }
                         }
-                        self.environment = prev_env;
+                        self.core.environment = prev_env;
                         // 优先返回 last_value（裸 expression stmt 的 value），否则 Nil
                         return Ok(last_value.unwrap_or(Value::Nil));
                     }

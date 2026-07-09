@@ -254,15 +254,15 @@ pub struct Interpreter {
     /// v0.45.0: ToolPlane registry (multi-plane Core/Extension adapter)
     /// Default has 2 core planes: "ai" + "sandbox"
     pub tool_planes: std::sync::Arc<Mutex<crate::toolplane::ToolPlaneRegistry>>,
-    /// v0.46.0: Skill registry (MoraSkillSpec + dual registry, CLI-Anything pattern)
-    /// Loaded from `~/.mora/skills/` or via builtin skill.load / skill.install
-    pub skill_registry: std::sync::Arc<Mutex<crate::skill::SkillRegistry>>,
-    /// v0.48.0: Plans (multi-plan, keyed by name) for plan.update (pi-agent)
-    pub plans: std::sync::Arc<Mutex<std::collections::HashMap<String, crate::plan::Plan>>>,
-    /// v0.48.0: Refine session registry (multi-script, CLI-Anything /refine)
-    pub refine_registry: std::sync::Arc<Mutex<crate::refine::RefineRegistry>>,
     /// v0.50: Pregel 检查点保存器（由 Worker 2/3 完善 checkpoint 模块后注入）
     pub checkpoint_saver: Option<std::sync::Arc<dyn crate::checkpoint::CheckpointSaver>>,
+    // v0.52 ADR-001: 3 个 OrchRuntime 字段（plans / refine_registry / skill_registry）
+    // 已迁出到 crate::runtime::orch::OrchRuntime，访问走 self.orch.xxx
+    /// v0.52: OrchRuntime facade — BC4 (plans + refine_registry + skill_registry)
+    ///
+    /// 暂保持 `pub` 以让 binary crate（main.rs）和其他外部 crate 可访问 —
+    /// Task 7（Interpreter 薄化阶段）会统一把 `pub` 改为 `pub(crate)` + accessor。
+    pub orch: crate::runtime::orch::OrchRuntime,
 }
 
 /// v0.06: with 块字段 (不经过 env 变量)
@@ -307,6 +307,9 @@ impl Clone for Interpreter {
             // 与原 `ContextWindow::default()` reset 行为不同 — 改为真 clone（更高效、保留状态）
             // 注：token_usage 等会共享 — 行为变化，HTTP/MCP workers 共享 AI 状态
             ai: self.ai.clone(),
+            // v0.52 ADR-001: 3 个 OrchRuntime 字段（plans/refine_registry/skill_registry）
+            // 迁到 OrchRuntime 内部 Clone
+            orch: self.orch.clone(),
             sandbox: self.sandbox.clone(),
             ccr_store: self.ccr_store.clone(),
             mock_registry: self.mock_registry.clone(),
@@ -314,9 +317,6 @@ impl Clone for Interpreter {
             markdown_memory_dir: self.markdown_memory_dir.clone(),
             container: self.container.clone(),
             tool_planes: self.tool_planes.clone(),
-            skill_registry: self.skill_registry.clone(),
-            plans: self.plans.clone(),
-            refine_registry: self.refine_registry.clone(),
             checkpoint_saver: self.checkpoint_saver.clone(),
         }
     }
@@ -487,6 +487,8 @@ impl Interpreter {
             infra: crate::runtime::infra::InfraRuntime::default(),
             // v0.52 ADR-001: 8 个 AI 字段迁到 AiRuntime 内部 Default
             ai: crate::runtime::ai::AiRuntime::default(),
+            // v0.52 ADR-001: 3 个 Orch 字段迁到 OrchRuntime 内部 Default
+            orch: crate::runtime::orch::OrchRuntime::default(),
             worker_channels: HashMap::new(),
             worker_receivers: HashMap::new(),
 
@@ -499,9 +501,6 @@ impl Interpreter {
             markdown_memory_dir: None,
             container: std::sync::Arc::new(Mutex::new(None)),
             tool_planes: std::sync::Arc::new(Mutex::new(crate::toolplane::default_registry())),
-            skill_registry: std::sync::Arc::new(Mutex::new(crate::skill::SkillRegistry::new())),
-            plans: std::sync::Arc::new(Mutex::new(std::collections::HashMap::new())),
-            refine_registry: std::sync::Arc::new(Mutex::new(crate::refine::RefineRegistry::new())),
             checkpoint_saver: None,
         }
     }
@@ -523,6 +522,8 @@ impl Interpreter {
             infra: crate::runtime::infra::InfraRuntime::default(),
             // v0.52 ADR-001: 8 个 AI 字段迁到 AiRuntime 内部 Default
             ai: crate::runtime::ai::AiRuntime::default(),
+            // v0.52 ADR-001: 3 个 Orch 字段迁到 OrchRuntime 内部 Default
+            orch: crate::runtime::orch::OrchRuntime::default(),
             worker_channels: HashMap::new(),
             worker_receivers: HashMap::new(),
 
@@ -535,9 +536,6 @@ impl Interpreter {
             markdown_memory_dir: None,
             container: std::sync::Arc::new(Mutex::new(None)),
             tool_planes: std::sync::Arc::new(Mutex::new(crate::toolplane::default_registry())),
-            skill_registry: std::sync::Arc::new(Mutex::new(crate::skill::SkillRegistry::new())),
-            plans: std::sync::Arc::new(Mutex::new(std::collections::HashMap::new())),
-            refine_registry: std::sync::Arc::new(Mutex::new(crate::refine::RefineRegistry::new())),
             checkpoint_saver: None,
         }
     }
@@ -557,6 +555,8 @@ impl Interpreter {
             infra: crate::runtime::infra::InfraRuntime::default(),
             // v0.52 ADR-001: 8 个 AI 字段迁到 AiRuntime 内部 Default
             ai: crate::runtime::ai::AiRuntime::default(),
+            // v0.52 ADR-001: 3 个 Orch 字段迁到 OrchRuntime 内部 Default
+            orch: crate::runtime::orch::OrchRuntime::default(),
             worker_channels: HashMap::new(),
             worker_receivers: HashMap::new(),
 
@@ -569,9 +569,6 @@ impl Interpreter {
             markdown_memory_dir: None,
             container: std::sync::Arc::new(Mutex::new(None)),
             tool_planes: std::sync::Arc::new(Mutex::new(crate::toolplane::default_registry())),
-            skill_registry: std::sync::Arc::new(Mutex::new(crate::skill::SkillRegistry::new())),
-            plans: std::sync::Arc::new(Mutex::new(std::collections::HashMap::new())),
-            refine_registry: std::sync::Arc::new(Mutex::new(crate::refine::RefineRegistry::new())),
             checkpoint_saver: None,
         }
     }

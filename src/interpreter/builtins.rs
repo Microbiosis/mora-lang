@@ -1444,7 +1444,11 @@ impl Interpreter {
     /// - `skill.set_hub(path)` -> Bool (set public_registry path, mora-public.json)
     /// - `skill.refresh_hub()` -> Number (re-read hub, real file I/O)
     pub fn call_skill_method(&self, method: &str, args: &[Value]) -> Result<Value, String> {
-        let mut reg = self.skill_registry.lock();
+        let mut reg = self
+            .orch
+            .skill_registry
+            .lock()
+            .expect("skill_registry poisoned");
 
         match method {
             "list" => {
@@ -1542,7 +1546,7 @@ impl Interpreter {
     /// - `plan.list(name?)` — list plans (or steps of one)
     /// - `plan.info(name)` — Dict{name, total, done, pending, completion_ratio}
     pub fn call_plan_method(&mut self, method: &str, args: &[Value]) -> Result<Value, String> {
-        let mut plans = self.plans.lock();
+        let mut plans = self.orch.plans.lock().expect("plans poisoned");
 
         match method {
             "create" => {
@@ -1744,7 +1748,11 @@ impl Interpreter {
                 // v0.49.0 (A2): drop lock before file I/O.
                 // get_or_create 只创建空 session (无 I/O); refine 是 I/O 在锁外
                 let step = {
-                    let mut registry = self.refine_registry.lock();
+                    let mut registry = self
+                        .orch
+                        .refine_registry
+                        .lock()
+                        .expect("refine_registry poisoned");
                     let session = registry.get_or_create(&script);
                     session.refine(&instruction)
                 }
@@ -1761,7 +1769,11 @@ impl Interpreter {
                 } else {
                     None
                 };
-                let registry = self.refine_registry.lock();
+                let registry = self
+                    .orch
+                    .refine_registry
+                    .lock()
+                    .expect("refine_registry poisoned");
                 let session = registry.get(&script).ok_or_else(|| {
                     format!("mora.refine_info: no session for '{}'", script.display())
                 })?;
@@ -1778,7 +1790,11 @@ impl Interpreter {
                 Ok(Value::Dict(step.to_dict()))
             }
             "list_refines" => {
-                let registry = self.refine_registry.lock();
+                let registry = self
+                    .orch
+                    .refine_registry
+                    .lock()
+                    .expect("refine_registry poisoned");
                 let mut names: Vec<String> = Vec::new();
                 for path in registry.session_paths() {
                     names.push(path.clone());

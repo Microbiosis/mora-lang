@@ -704,7 +704,8 @@ impl Interpreter {
         for stmt_id in stmt_ids {
             if let Some(stmt) = arena.get_stmt(*stmt_id) {
                 let kind = stmt.kind.clone();
-                match self.execute(&kind, arena)? {
+                let (signal, _) = self.execute(&kind, arena)?;
+                match signal {
                     FlowSignal::None => {}
                     FlowSignal::Return(val) => {
                         return Err(format!("Unexpected return at top level: {:?}", val));
@@ -730,7 +731,8 @@ impl Interpreter {
                     for body_id in &body {
                         if let Some(body_stmt) = arena.get_stmt(*body_id) {
                             let kind = body_stmt.kind.clone();
-                            match self.execute(&kind, arena)? {
+                            let (signal, _) = self.execute(&kind, arena)?;
+                            match signal {
                                 FlowSignal::None => {}
                                 FlowSignal::Return(_) => return Ok(()),
                                 signal => {
@@ -786,17 +788,24 @@ impl Interpreter {
             for stmt_id in &node_ids {
                 if let Some(stmt) = arena.get_stmt(*stmt_id) {
                     let kind = stmt.kind.clone();
-                    match interp.execute(&kind, &arena) {
-                        Ok(FlowSignal::Return(v)) => println!("= {}", v),
-                        Ok(FlowSignal::None) => {}
-                        Ok(FlowSignal::Break) | Ok(FlowSignal::Continue) => {}
-                        Ok(FlowSignal::Interrupt { node, when, .. }) => {
+                    // v0.52: execute 返回 (FlowSignal, Option<Value>)，解构
+                    let (signal, _value) = match interp.execute(&kind, &arena) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            eprintln!("Error: {}", e);
+                            continue;
+                        }
+                    };
+                    match signal {
+                        FlowSignal::Return(v) => println!("= {}", v),
+                        FlowSignal::None => {}
+                        FlowSignal::Break | FlowSignal::Continue => {}
+                        FlowSignal::Interrupt { node, when, .. } => {
                             eprintln!(
                                 "Interrupt at node '{}' ({}). Use resume/rewind to continue.",
                                 node, when
                             );
                         }
-                        Err(e) => eprintln!("Error: {}", e),
                     }
                 }
             }

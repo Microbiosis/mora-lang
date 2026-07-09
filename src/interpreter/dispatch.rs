@@ -1172,7 +1172,9 @@ impl Interpreter {
             let body_id = crate::ast_v2::NodeId(*body_idx);
             if let Some(stmt) = arena.get_stmt(body_id) {
                 let kind = stmt.kind.clone();
-                match self.execute(&kind, arena)? {
+                // v0.52 Bug C 根因修复：跟踪 last_value（与 call_value_inner 闭包逻辑一致）
+                let (signal, _value) = self.execute(&kind, arena)?;
+                match signal {
                     FlowSignal::None => {}
                     FlowSignal::Return(val) => {
                         self.environment = prev_env;
@@ -1234,12 +1236,20 @@ impl Interpreter {
                         }
                         let prev_env = self.environment.clone();
                         self.environment = call_env;
-                        // 执行 body
-                        let result = Value::Nil;
+                        // v0.52 Bug C 根因修复：跟踪 last_value
+                        // pre-existing: body 是 expression stmt 形式（`fn(c,n) n end`）时，
+                        // execute 内部 `StmtKind::Expr` 丢弃 expr value。
+                        // 修复后：execute 返回 (FlowSignal, Option<Value>)，
+                        // 我们跟踪 last Some(value) 作为最终 return value。
+                        let mut last_value: Option<Value> = None;
                         for body_id in &closure_body {
                             if let Some(stmt) = arena.get_stmt(*body_id) {
                                 let kind = stmt.kind.clone();
-                                match self.execute(&kind, arena)? {
+                                let (signal, value) = self.execute(&kind, arena)?;
+                                if value.is_some() {
+                                    last_value = value;
+                                }
+                                match signal {
                                     FlowSignal::None => {}
                                     FlowSignal::Return(val) => {
                                         self.environment = prev_env;
@@ -1256,7 +1266,8 @@ impl Interpreter {
                             }
                         }
                         self.environment = prev_env;
-                        return Ok(result);
+                        // 优先返回 last_value（裸 expression stmt 的 value），否则 Nil
+                        return Ok(last_value.unwrap_or(Value::Nil));
                     }
                     Err(format!("Invalid v2 closure node: {}", node_id.0))
                 } else {

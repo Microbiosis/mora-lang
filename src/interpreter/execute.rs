@@ -8,11 +8,21 @@ use crate::value::{Environment, FlowSignal, Value};
 
 impl Interpreter {
     /// 执行语句（主入口）
+    ///
+    /// 返回 `(FlowSignal, Option<Value>)`：
+    /// - `FlowSignal`: 控制流信号（None / Return / Break / Continue / Interrupt）
+    /// - `Option<Value>`: 语句的"求值结果"
+    ///   - `StmtKind::Expr` 求值的值（修复 pre-existing Bug C — 之前 execute 丢弃 expr value）
+    ///   - 其他语句为 `None`（except `Return` 时 Some(val)）
+    ///   - 闭包/function body 循环用 last `Some` 作为最终 return value
+    ///
+    /// v0.52 根因修复：所有 15 个 call site 显式 match (FlowSignal, Option<Value>)，
+    /// 让"expr value 是否保留"契约一致透明。
     pub fn execute(
         &mut self,
         stmt_kind: &StmtKind,
         arena: &AstArena,
-    ) -> Result<FlowSignal, String> {
+    ) -> Result<(FlowSignal, Option<Value>), String> {
         match stmt_kind {
             StmtKind::Let {
                 name,
@@ -22,8 +32,8 @@ impl Interpreter {
             } => self.execute_let(name, *init, *exported, arena),
             StmtKind::Assign { name, value } => self.execute_assign(name, *value, arena),
             StmtKind::Expr(expr_id) => {
-                self.evaluate(*expr_id, arena)?;
-                Ok(FlowSignal::None)
+                let v = self.evaluate(*expr_id, arena)?;
+                Ok((FlowSignal::None, Some(v)))
             }
             StmtKind::Return { value } => self.execute_return(*value, arena),
             StmtKind::If {
@@ -38,8 +48,8 @@ impl Interpreter {
                 ..
             } => self.execute_for(var, *iterable, body, arena),
             StmtKind::Import { path } => self.execute_import(path),
-            StmtKind::Break => Ok(FlowSignal::Break),
-            StmtKind::Continue => Ok(FlowSignal::Continue),
+            StmtKind::Break => Ok((FlowSignal::Break, None)),
+            StmtKind::Continue => Ok((FlowSignal::Continue, None)),
             StmtKind::TaskDef {
                 name,
                 params,
@@ -50,13 +60,13 @@ impl Interpreter {
             StmtKind::Match { expr, arms } => self.execute_match(*expr, arms, arena),
             StmtKind::With { bindings, body } => self.execute_with(bindings, body, arena),
             StmtKind::Parallel { stmts } => self.execute_parallel(stmts, arena),
-            StmtKind::Worker { .. } => Ok(FlowSignal::None),
+            StmtKind::Worker { .. } => Ok((FlowSignal::None, None)),
             StmtKind::Send { value, target } => self.execute_send(*value, target, arena),
             StmtKind::Receive { var, source } => self.execute_receive(var, source, arena),
             StmtKind::Transaction { body, compensation } => {
                 self.execute_transaction(body, compensation, arena)
             }
-            StmtKind::Commit => Ok(FlowSignal::None),
+            StmtKind::Commit => Ok((FlowSignal::None, None)),
             StmtKind::Rollback => Err("Transaction rolled back".to_string()),
             StmtKind::MacroDef {
                 name,
@@ -98,7 +108,14 @@ impl Interpreter {
                 input_var,
                 result_var,
                 kind,
-            } => self.execute_orchestrate(input_var, result_var, kind, arena),
+            } => {
+                // v0.52: 委派到 `Interpreter::execute_orchestrate` (impl 在 src/interpreter/orchestrate.rs)
+                // 该方法按 kind 分派到 v1 (Sequential/Graph/Loop) 或 v2 (Pregel)
+                // 注意：execute_orchestrate 返回 Result<FlowSignal, String>，需包成
+                // Result<(FlowSignal, Option<Value>), String>
+                let signal = self.execute_orchestrate(input_var, result_var, kind, arena)?;
+                Ok((signal, None))
+            }
             StmtKind::Eval {
                 name,
                 given,
@@ -139,7 +156,7 @@ impl Interpreter {
             }
             StmtKind::DocumentSet { .. } | StmtKind::DocumentRead(_) => {
                 // Already consumed by execute_document_section; unreachable
-                Ok(FlowSignal::None)
+                Ok((FlowSignal::None, None))
             }
             // v0.35 (P0-C2): `route` statement was parse+typecheck-only.
             // Now report a clean runtime error instead of fallthrough.
@@ -158,12 +175,12 @@ impl Interpreter {
         init: NodeId,
         exported: bool,
         arena: &AstArena,
-    ) -> Result<FlowSignal, String> {
+    ) -> Result<(FlowSignal, Option<Value>), String> {
         let value = self.evaluate(init, arena)?;
         self.environment
             .lock()
             .define(name.to_string(), value, exported);
-        Ok(FlowSignal::None)
+        Ok((FlowSignal::None, None))
     }
 
     /// 执行赋值
@@ -172,12 +189,12 @@ impl Interpreter {
         name: &str,
         value: NodeId,
         arena: &AstArena,
-    ) -> Result<FlowSignal, String> {
+    ) -> Result<(FlowSignal, Option<Value>), String> {
         let val = self.evaluate(value, arena)?;
         if !self.environment.lock().assign(name, val.clone()) {
             return Err(format!("Undefined variable: {}", name));
         }
-        Ok(FlowSignal::None)
+        Ok((FlowSignal::None, None))
     }
 
     /// 执行 return 语句
@@ -185,12 +202,12 @@ impl Interpreter {
         &mut self,
         value: Option<NodeId>,
         arena: &AstArena,
-    ) -> Result<FlowSignal, String> {
+    ) -> Result<(FlowSignal, Option<Value>), String> {
         let val = match value {
             Some(id) => self.evaluate(id, arena)?,
             None => Value::Nil,
         };
-        Ok(FlowSignal::Return(val))
+        Ok((FlowSignal::Return(val.clone()), Some(val)))
     }
 
     /// 执行 if 语句
@@ -200,15 +217,16 @@ impl Interpreter {
         then_branch: &[NodeId],
         else_branch: &[NodeId],
         arena: &AstArena,
-    ) -> Result<FlowSignal, String> {
+    ) -> Result<(FlowSignal, Option<Value>), String> {
         let cond = self.evaluate(condition, arena)?;
         if is_truthy(&cond) {
             for stmt_id in then_branch {
                 if let Some(stmt) = arena.get_stmt(*stmt_id) {
                     let kind = stmt.kind.clone();
-                    match self.execute(&kind, arena)? {
+                    let (signal, _) = self.execute(&kind, arena)?;
+                    match signal {
                         FlowSignal::None => {}
-                        signal => return Ok(signal),
+                        signal => return Ok((signal, None)),
                     }
                 }
             }
@@ -216,14 +234,15 @@ impl Interpreter {
             for stmt_id in else_branch {
                 if let Some(stmt) = arena.get_stmt(*stmt_id) {
                     let kind = stmt.kind.clone();
-                    match self.execute(&kind, arena)? {
+                    let (signal, _) = self.execute(&kind, arena)?;
+                    match signal {
                         FlowSignal::None => {}
-                        signal => return Ok(signal),
+                        signal => return Ok((signal, None)),
                     }
                 }
             }
         }
-        Ok(FlowSignal::None)
+        Ok((FlowSignal::None, None))
     }
 
     /// 执行 for 循环
@@ -233,7 +252,7 @@ impl Interpreter {
         iterable: NodeId,
         body: &[NodeId],
         arena: &AstArena,
-    ) -> Result<FlowSignal, String> {
+    ) -> Result<(FlowSignal, Option<Value>), String> {
         let iterable_val = self.evaluate(iterable, arena)?;
         let items: Vec<Value> = match iterable_val {
             Value::List(items) => items,
@@ -245,20 +264,21 @@ impl Interpreter {
             for stmt_id in body {
                 if let Some(stmt) = arena.get_stmt(*stmt_id) {
                     let kind = stmt.kind.clone();
-                    match self.execute(&kind, arena)? {
+                    let (signal, _) = self.execute(&kind, arena)?;
+                    match signal {
                         FlowSignal::None => {}
-                        FlowSignal::Break => return Ok(FlowSignal::None),
+                        FlowSignal::Break => return Ok((FlowSignal::None, None)),
                         FlowSignal::Continue => break,
-                        signal => return Ok(signal),
+                        signal => return Ok((signal, None)),
                     }
                 }
             }
         }
-        Ok(FlowSignal::None)
+        Ok((FlowSignal::None, None))
     }
 
     /// 执行 import 语句
-    fn execute_import(&mut self, path: &str) -> Result<FlowSignal, String> {
+    fn execute_import(&mut self, path: &str) -> Result<(FlowSignal, Option<Value>), String> {
         match std::fs::read_to_string(path) {
             Ok(source) => {
                 let tokens = crate::lexer::Lexer::new(&source).scan_tokens();
@@ -268,10 +288,14 @@ impl Interpreter {
                 for sid in &imported_ids {
                     if let Some(stmt) = imported_arena.get_stmt(*sid) {
                         let kind = stmt.kind.clone();
-                        self.execute(&kind, &imported_arena)?;
+                        // v0.52: execute 返回 (FlowSignal, Option<Value>)，这里丢弃 value
+                        let (signal, _) = self.execute(&kind, &imported_arena)?;
+                        if !matches!(signal, FlowSignal::None) {
+                            return Ok((signal, None));
+                        }
                     }
                 }
-                Ok(FlowSignal::None)
+                Ok((FlowSignal::None, None))
             }
             Err(e) => Err(format!("import error: {}", e)),
         }
@@ -285,7 +309,7 @@ impl Interpreter {
         body: &[NodeId],
         exported: bool,
         _arena: &AstArena,
-    ) -> Result<FlowSignal, String> {
+    ) -> Result<(FlowSignal, Option<Value>), String> {
         let param_names: Vec<String> = params.iter().map(|(n, _)| n.clone()).collect();
         let body_ids: Vec<usize> = body.iter().map(|id| id.0).collect();
         self.environment.lock().define(
@@ -297,7 +321,7 @@ impl Interpreter {
             },
             exported,
         );
-        Ok(FlowSignal::None)
+        Ok((FlowSignal::None, None))
     }
 
     /// 执行 match 语句
@@ -306,7 +330,7 @@ impl Interpreter {
         expr: NodeId,
         arms: &[(crate::ast_v2::Pattern, Vec<NodeId>)],
         arena: &AstArena,
-    ) -> Result<FlowSignal, String> {
+    ) -> Result<(FlowSignal, Option<Value>), String> {
         let val = self.evaluate(expr, arena)?;
         for (pattern, body_ids) in arms {
             if let Some(bindings) = self.match_pattern(pattern, &val, arena) {
@@ -322,17 +346,19 @@ impl Interpreter {
                 for body_id in body_ids {
                     if let Some(stmt) = arena.get_stmt(*body_id) {
                         let kind = stmt.kind.clone();
-                        result = self.execute(&kind, arena)?;
+                        // v0.52: 解构丢弃 Option<Value>，只保留 FlowSignal
+                        let (sig, _) = self.execute(&kind, arena)?;
+                        result = sig;
                         if !matches!(result, FlowSignal::None) {
                             break;
                         }
                     }
                 }
                 self.environment = previous;
-                return Ok(result);
+                return Ok((result, None));
             }
         }
-        Ok(FlowSignal::None)
+        Ok((FlowSignal::None, None))
     }
 
     /// 执行 with 块
@@ -341,7 +367,7 @@ impl Interpreter {
         bindings: &[(String, NodeId)],
         body: &[NodeId],
         arena: &AstArena,
-    ) -> Result<FlowSignal, String> {
+    ) -> Result<(FlowSignal, Option<Value>), String> {
         let prev_cfg = self.current_ai_config.clone();
         let mut cfg = prev_cfg.clone().unwrap_or_default();
         for (key, val_id) in bindings {
@@ -376,17 +402,18 @@ impl Interpreter {
         for stmt_id in body {
             if let Some(stmt) = arena.get_stmt(*stmt_id) {
                 let kind = stmt.kind.clone();
-                match self.execute(&kind, arena)? {
+                let (signal, _) = self.execute(&kind, arena)?;
+                match signal {
                     FlowSignal::None => {}
                     signal => {
                         self.current_ai_config = prev_cfg;
-                        return Ok(signal);
+                        return Ok((signal, None));
                     }
                 }
             }
         }
         self.current_ai_config = prev_cfg;
-        Ok(FlowSignal::None)
+        Ok((FlowSignal::None, None))
     }
 
     /// 执行 parallel 块
@@ -394,18 +421,19 @@ impl Interpreter {
         &mut self,
         stmts: &[NodeId],
         arena: &AstArena,
-    ) -> Result<FlowSignal, String> {
+    ) -> Result<(FlowSignal, Option<Value>), String> {
         // 简化实现：顺序执行
         for stmt_id in stmts {
             if let Some(stmt) = arena.get_stmt(*stmt_id) {
                 let kind = stmt.kind.clone();
-                match self.execute(&kind, arena)? {
+                let (signal, _) = self.execute(&kind, arena)?;
+                match signal {
                     FlowSignal::None => {}
-                    signal => return Ok(signal),
+                    signal => return Ok((signal, None)),
                 }
             }
         }
-        Ok(FlowSignal::None)
+        Ok((FlowSignal::None, None))
     }
 
     /// 执行 send 语句
@@ -414,12 +442,12 @@ impl Interpreter {
         value: NodeId,
         target: &str,
         arena: &AstArena,
-    ) -> Result<FlowSignal, String> {
+    ) -> Result<(FlowSignal, Option<Value>), String> {
         let val = self.evaluate(value, arena)?;
         if let Some(tx) = self.worker_channels.get(target) {
             tx.send(val).map_err(|e| format!("Send error: {}", e))?;
         }
-        Ok(FlowSignal::None)
+        Ok((FlowSignal::None, None))
     }
 
     /// 执行 receive 语句
@@ -428,12 +456,12 @@ impl Interpreter {
         var: &str,
         source: &str,
         _arena: &AstArena,
-    ) -> Result<FlowSignal, String> {
+    ) -> Result<(FlowSignal, Option<Value>), String> {
         if let Some(rx) = self.worker_receivers.get(source) {
             let val = rx.recv().map_err(|e| format!("Receive error: {}", e))?;
             self.environment.lock().define(var.to_string(), val, false);
         }
-        Ok(FlowSignal::None)
+        Ok((FlowSignal::None, None))
     }
 
     /// 执行事务
@@ -442,7 +470,7 @@ impl Interpreter {
         body: &[NodeId],
         compensation: &[NodeId],
         arena: &AstArena,
-    ) -> Result<FlowSignal, String> {
+    ) -> Result<(FlowSignal, Option<Value>), String> {
         let mut result = FlowSignal::None;
         let mut error_occurred = false;
         for stmt_id in body {
@@ -450,7 +478,8 @@ impl Interpreter {
                 let kind = stmt.kind.clone();
                 match self.execute(&kind, arena) {
                     Ok(r) => {
-                        result = r;
+                        // v0.52: r 是 (FlowSignal, Option<Value>)，只取 FlowSignal
+                        result = r.0;
                         if !matches!(result, FlowSignal::None) {
                             error_occurred = true;
                             break;
@@ -467,13 +496,18 @@ impl Interpreter {
         for comp_id in compensation {
             if let Some(stmt) = arena.get_stmt(*comp_id) {
                 let kind = stmt.kind.clone();
-                let _ = self.execute(&kind, arena);
+                // v0.52: 丢弃 result，保留 FlowSignal
+                let (sig, _) = self.execute(&kind, arena)?;
+                if !matches!(sig, FlowSignal::None) {
+                    // 补偿阶段出现 signal 异常 — log 但不 fail（pre-existing 行为）
+                }
             }
         }
         if error_occurred {
             return Err("Transaction rolled back".to_string());
         }
-        Ok(result)
+        // v0.52: result 是 FlowSignal，Ok 包成 (FlowSignal, Option<Value>)
+        Ok((result, None))
     }
 
     /// 执行宏定义
@@ -482,7 +516,7 @@ impl Interpreter {
         name: &str,
         params: &[String],
         _arena: &AstArena,
-    ) -> Result<FlowSignal, String> {
+    ) -> Result<(FlowSignal, Option<Value>), String> {
         self.environment.lock().define(
             name.to_string(),
             Value::Macro {
@@ -491,7 +525,7 @@ impl Interpreter {
             },
             false,
         );
-        Ok(FlowSignal::None)
+        Ok((FlowSignal::None, None))
     }
 
     /// 执行类型别名
@@ -500,11 +534,11 @@ impl Interpreter {
         name: &str,
         target: &str,
         _arena: &AstArena,
-    ) -> Result<FlowSignal, String> {
+    ) -> Result<(FlowSignal, Option<Value>), String> {
         self.environment
             .lock()
             .define(name.to_string(), Value::String(target.to_string()), false);
-        Ok(FlowSignal::None)
+        Ok((FlowSignal::None, None))
     }
 
     /// 执行枚举定义
@@ -513,7 +547,7 @@ impl Interpreter {
         name: &str,
         variants: &[crate::common::EnumVariant],
         _arena: &AstArena,
-    ) -> Result<FlowSignal, String> {
+    ) -> Result<(FlowSignal, Option<Value>), String> {
         let mut enum_map = std::collections::HashMap::new();
         for v in variants {
             enum_map.insert(
@@ -526,7 +560,7 @@ impl Interpreter {
         self.environment
             .lock()
             .define(name.to_string(), Value::Dict(enum_map), false);
-        Ok(FlowSignal::None)
+        Ok((FlowSignal::None, None))
     }
 
     /// 执行结构体定义
@@ -535,7 +569,7 @@ impl Interpreter {
         name: &str,
         fields: &[crate::common::StructField],
         _arena: &AstArena,
-    ) -> Result<FlowSignal, String> {
+    ) -> Result<(FlowSignal, Option<Value>), String> {
         let field_names: Vec<String> = fields.iter().map(|f| f.name.clone()).collect();
         let constructor = Value::Closure {
             params: field_names,
@@ -545,7 +579,7 @@ impl Interpreter {
         self.environment
             .lock()
             .define(name.to_string(), constructor, false);
-        Ok(FlowSignal::None)
+        Ok((FlowSignal::None, None))
     }
 
     /// 执行 trait 定义
@@ -555,7 +589,7 @@ impl Interpreter {
         parents: &[String],
         methods: &[crate::ast_v2::TraitMethod],
         _arena: &AstArena,
-    ) -> Result<FlowSignal, String> {
+    ) -> Result<(FlowSignal, Option<Value>), String> {
         let method_sigs: Vec<TraitMethodSig> = methods
             .iter()
             .map(|m| TraitMethodSig {
@@ -565,7 +599,7 @@ impl Interpreter {
                 has_self: m.params.first().map(|(n, _)| n == "self").unwrap_or(false),
             })
             .collect();
-        Arc::make_mut(&mut self.trait_registry).insert(
+        Arc::make_mut(&mut self.registry.trait_registry).insert(
             name.to_string(),
             TraitInfo {
                 name: name.to_string(),
@@ -590,7 +624,7 @@ impl Interpreter {
                 );
             }
         }
-        Ok(FlowSignal::None)
+        Ok((FlowSignal::None, None))
     }
 
     /// 执行 impl 定义
@@ -602,9 +636,9 @@ impl Interpreter {
         for_generics: &[String],
         methods: &[crate::ast_v2::FnDef],
         _arena: &AstArena,
-    ) -> Result<FlowSignal, String> {
+    ) -> Result<(FlowSignal, Option<Value>), String> {
         let _method_names: Vec<String> = methods.iter().map(|m| m.name.clone()).collect();
-        Arc::make_mut(&mut self.impl_table)
+        Arc::make_mut(&mut self.registry.impl_table)
             .entry(trait_name.to_string())
             .or_default()
             .push(for_type.to_string());
@@ -622,7 +656,7 @@ impl Interpreter {
                 false,
             );
         }
-        Ok(FlowSignal::None)
+        Ok((FlowSignal::None, None))
     }
 
     /// 执行 eval 语句
@@ -634,7 +668,7 @@ impl Interpreter {
         tolerance: Option<f64>,
         replay_path: Option<&str>,
         arena: &AstArena,
-    ) -> Result<FlowSignal, String> {
+    ) -> Result<(FlowSignal, Option<Value>), String> {
         // 1. 求值 given
         let given_val = self.evaluate(given, arena)?;
         // 绑定到 `given` 变量供 expect 表达式使用
@@ -692,7 +726,7 @@ impl Interpreter {
                 Value::String(format!("PASS ({}/{})", passed, total)),
                 false,
             );
-            Ok(FlowSignal::None)
+            Ok((FlowSignal::None, None))
         } else {
             Err(format!(
                 "eval '{}' failed: {}/{} passed (need {:.0}%)",
@@ -715,7 +749,7 @@ impl Interpreter {
         tasks: &[crate::ast_v2::SkillTask],
         verify: &Option<crate::ast_v2::SkillVerify>,
         _arena: &AstArena,
-    ) -> Result<FlowSignal, String> {
+    ) -> Result<(FlowSignal, Option<Value>), String> {
         // 注册 Skill 元数据
         let mut skill_meta = std::collections::HashMap::new();
         skill_meta.insert("name".to_string(), Value::String(name.to_string()));
@@ -759,7 +793,7 @@ impl Interpreter {
             .lock()
             .define(name.to_string(), Value::Dict(skill_meta), false);
 
-        Ok(FlowSignal::None)
+        Ok((FlowSignal::None, None))
     }
 
     // ===================================================================
@@ -774,7 +808,7 @@ impl Interpreter {
         name: &str,
         body: &[NodeId],
         arena: &AstArena,
-    ) -> Result<FlowSignal, String> {
+    ) -> Result<(FlowSignal, Option<Value>), String> {
         let mut role: Option<String> = None;
         let mut budget_bytes: Option<usize> = None;
         let mut content = String::new(); // 多 read/tail 顺序拼接
@@ -838,7 +872,7 @@ impl Interpreter {
         self.environment
             .lock()
             .define(name.to_string(), section, false);
-        Ok(FlowSignal::None)
+        Ok((FlowSignal::None, None))
     }
 
     fn execute_prompt_set(
@@ -846,19 +880,19 @@ impl Interpreter {
         _key: &str,
         _value: NodeId,
         _arena: &AstArena,
-    ) -> Result<FlowSignal, String> {
+    ) -> Result<(FlowSignal, Option<Value>), String> {
         // 该分支实际不会到达: 块内 PromptSet 已被 execute_prompt_section 消费
         // 但 executor match 要求所有变体都被列出
-        Ok(FlowSignal::None)
+        Ok((FlowSignal::None, None))
     }
 
     fn execute_prompt_read(
         &mut self,
         _path: NodeId,
         _arena: &AstArena,
-    ) -> Result<FlowSignal, String> {
+    ) -> Result<(FlowSignal, Option<Value>), String> {
         // 同上: 块内 PromptRead 已由 execute_prompt_section 消费
-        Ok(FlowSignal::None)
+        Ok((FlowSignal::None, None))
     }
 
     // ===================================================================
@@ -872,7 +906,7 @@ impl Interpreter {
         name: &str,
         body: &[NodeId],
         arena: &AstArena,
-    ) -> Result<FlowSignal, String> {
+    ) -> Result<(FlowSignal, Option<Value>), String> {
         let mut origin: Option<String> = None;
         let mut path: Option<String> = None;
         for stmt_id in body {
@@ -935,7 +969,7 @@ impl Interpreter {
             ));
         }
         self.environment.lock().define(name.to_string(), doc, false);
-        Ok(FlowSignal::None)
+        Ok((FlowSignal::None, None))
     }
 }
 

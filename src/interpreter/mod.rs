@@ -134,7 +134,7 @@ pub(crate) fn default_impl_method_key(
 /// v0.08.5: BFS 收集 trait + 全部祖先的方法名（去重、防循环）
 /// 用于：构造 trait instance 时的完整性检查（与 dispatch 保持一致）
 ///
-/// 参数 trait_registry 是 trait 元数据表（self.trait_registry 借用）
+/// 参数 trait_registry 是 trait 元数据表（self.registry.trait_registry 借用）
 ///
 /// v0.49.0 (C1+C2): 简单 LRU cache (insertion-order, no hash map to keep 0 deps).
 /// `cap` 上限, 超过 evict 最旧. `Arc<Mutex<>>` for thread-safe shared access.
@@ -209,9 +209,6 @@ pub struct Interpreter {
     current_ai_config: Option<AiConfigValue>,
     // α.2: with 块 config 保存/恢复栈（MIR 解释器用）
     config_stack: Vec<Option<AiConfigValue>>,
-    // v0.08: trait 系统注册表 (v0.36: wrapped in Arc for cheap clone in HTTP/MCP workers)
-    pub trait_registry: Arc<HashMap<String, TraitInfo>>,
-    pub impl_table: Arc<HashMap<String, Vec<String>>>,
     // v0.19: Worker 并发 channels (v0.36: crossbeam-channel for Send/Sync)
     worker_channels: HashMap<String, crossbeam_channel::Sender<Value>>,
     worker_receivers: HashMap<String, crossbeam_channel::Receiver<Value>>,
@@ -219,8 +216,14 @@ pub struct Interpreter {
     /// v0.35 (P0-A5): wrapped in Arc so per-call `.clone()` is cheap
     /// (Arc bump) instead of deep-cloning the whole arena tree.
     v2_arena: Option<std::sync::Arc<crate::ast_v2::AstArena>>,
-    /// v0.25: 会话记忆存储
-    memory_store: HashMap<String, Value>,
+    // v0.52 ADR-001: 5 个 RegistryRuntime 字段（trait_registry / impl_table /
+    // mock_registry / ccr_store / memory_store）已迁出到
+    // crate::runtime::registry::RegistryRuntime，访问走 self.registry.xxx
+    /// v0.52: RegistryRuntime facade — BC8 (trait_registry + impl_table + mock_registry +
+    /// ccr_store + memory_store)
+    ///
+    /// 暂保持 `pub` — Task 7 阶段会统一改 pub(crate) + accessor
+    pub registry: crate::runtime::registry::RegistryRuntime,
     // v0.52 ADR-001: 5 个 InfraRuntime 字段（recorder / string_interner / ai_cache /
     // bus / scheduler）已迁出到 crate::runtime::infra::InfraRuntime，访问走 self.infra.xxx
     /// v0.52: InfraRuntime facade — BC9 (recorder + string_interner + ai_cache + bus + scheduler)
@@ -236,10 +239,8 @@ pub struct Interpreter {
     ///
     /// 暂保持 `pub` — Task 7 会统一改 pub(crate) + accessor
     pub ai: crate::runtime::ai::AiRuntime,
-    /// v0.34: CCR (Compress-Cache-Retrieve, Headroom style)
-    ccr_store: crate::ccr::InMemoryCcrStore,
-    /// v0.34: mock registry (OpenFugu + OpenInfer mock)
-    mock_registry: crate::mock::MockRegistry,
+    /// v0.34: CCR (Compress-Cache-Retrieve, Headroom style) — 迁到 RegistryRuntime
+    /// v0.34: mock registry (OpenFugu + OpenInfer mock) — 迁到 RegistryRuntime
     // v0.52 ADR-001: 3 个 SandboxRuntime 字段（sandbox / container / tool_planes）
     // 已迁出到 crate::runtime::sandbox::SandboxRuntime，访问走 self.sandbox_facade.xxx
     /// v0.52: SandboxRuntime facade — BC7 (sandbox + container + tool_planes)
@@ -292,12 +293,9 @@ impl Clone for Interpreter {
             // v0.04补: memory_store 字段已删除（RFC §4.1 memory.* 推迟到 v1.0）
             current_ai_config: self.current_ai_config.clone(),
             config_stack: Vec::new(),
-            trait_registry: self.trait_registry.clone(),
-            impl_table: self.impl_table.clone(),
             worker_channels: HashMap::new(), // 不克隆 channel
             worker_receivers: HashMap::new(),
             v2_arena: None,
-            memory_store: HashMap::new(),
             // v0.52 ADR-001: 5 个字段（recorder/string_interner/ai_cache/bus/scheduler）
             // 迁到 InfraRuntime 内部 Clone
             // v0.35 (P0-A1) 设计延续：recorder 重建为 new_off()（per-thread 状态）
@@ -315,8 +313,9 @@ impl Clone for Interpreter {
             // v0.52 ADR-001: 3 个 SandboxRuntime 字段（sandbox/container/tool_planes）
             // 迁到 SandboxRuntime 内部 Clone（ContainerHandle Drop 多次触发是 pre-existing 行为）
             sandbox_facade: self.sandbox_facade.clone(),
-            ccr_store: self.ccr_store.clone(),
-            mock_registry: self.mock_registry.clone(),
+            // v0.52 ADR-001: 5 个 RegistryRuntime 字段（trait_registry/impl_table/
+            // mock_registry/ccr_store/memory_store）迁到 RegistryRuntime 内部 Clone
+            registry: self.registry.clone(),
         }
     }
 }
@@ -480,8 +479,6 @@ impl Interpreter {
 
             current_ai_config: None,
             config_stack: Vec::new(),
-            trait_registry: Arc::new(HashMap::new()),
-            impl_table: Arc::new(HashMap::new()),
             // v0.52 ADR-001: 5 个字段迁到 InfraRuntime 内部 Default
             infra: crate::runtime::infra::InfraRuntime::default(),
             // v0.52 ADR-001: 8 个 AI 字段迁到 AiRuntime 内部 Default
@@ -492,13 +489,12 @@ impl Interpreter {
             persist: crate::runtime::persist::PersistRuntime::default(),
             // v0.52 ADR-001: 3 个 Sandbox 字段迁到 SandboxRuntime 内部 Default
             sandbox_facade: crate::runtime::sandbox::SandboxRuntime::default(),
+            // v0.52 ADR-001: 5 个 Registry 字段迁到 RegistryRuntime 内部 Default
+            registry: crate::runtime::registry::RegistryRuntime::default(),
             worker_channels: HashMap::new(),
             worker_receivers: HashMap::new(),
 
             v2_arena: None,
-            memory_store: HashMap::new(),
-            ccr_store: crate::ccr::InMemoryCcrStore::new(),
-            mock_registry: crate::mock::MockRegistry::new(),
         }
     }
 
@@ -513,8 +509,6 @@ impl Interpreter {
 
             current_ai_config: None,
             config_stack: Vec::new(),
-            trait_registry: Arc::new(HashMap::new()),
-            impl_table: Arc::new(HashMap::new()),
             // v0.52 ADR-001: 5 个字段迁到 InfraRuntime 内部 Default
             infra: crate::runtime::infra::InfraRuntime::default(),
             // v0.52 ADR-001: 8 个 AI 字段迁到 AiRuntime 内部 Default
@@ -525,13 +519,12 @@ impl Interpreter {
             persist: crate::runtime::persist::PersistRuntime::default(),
             // v0.52 ADR-001: 3 个 Sandbox 字段迁到 SandboxRuntime 内部 Default
             sandbox_facade: crate::runtime::sandbox::SandboxRuntime::default(),
+            // v0.52 ADR-001: 5 个 Registry 字段迁到 RegistryRuntime 内部 Default
+            registry: crate::runtime::registry::RegistryRuntime::default(),
             worker_channels: HashMap::new(),
             worker_receivers: HashMap::new(),
 
             v2_arena: None,
-            memory_store: HashMap::new(),
-            ccr_store: crate::ccr::InMemoryCcrStore::new(),
-            mock_registry: crate::mock::MockRegistry::new(),
         }
     }
 
@@ -544,8 +537,6 @@ impl Interpreter {
 
             current_ai_config: None,
             config_stack: Vec::new(),
-            trait_registry: Arc::new(HashMap::new()),
-            impl_table: Arc::new(HashMap::new()),
             // v0.52 ADR-001: 5 个字段迁到 InfraRuntime 内部 Default
             infra: crate::runtime::infra::InfraRuntime::default(),
             // v0.52 ADR-001: 8 个 AI 字段迁到 AiRuntime 内部 Default
@@ -556,13 +547,12 @@ impl Interpreter {
             persist: crate::runtime::persist::PersistRuntime::default(),
             // v0.52 ADR-001: 3 个 Sandbox 字段迁到 SandboxRuntime 内部 Default
             sandbox_facade: crate::runtime::sandbox::SandboxRuntime::default(),
+            // v0.52 ADR-001: 5 个 Registry 字段迁到 RegistryRuntime 内部 Default
+            registry: crate::runtime::registry::RegistryRuntime::default(),
             worker_channels: HashMap::new(),
             worker_receivers: HashMap::new(),
 
             v2_arena: None,
-            memory_store: HashMap::new(),
-            ccr_store: crate::ccr::InMemoryCcrStore::new(),
-            mock_registry: crate::mock::MockRegistry::new(),
         }
     }
 

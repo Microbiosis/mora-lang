@@ -83,10 +83,11 @@ impl Interpreter {
             }
         };
 
-        let search_chain = collect_parent_traits(&self.trait_registry, &trait_name);
+        let search_chain = collect_parent_traits(&self.registry.trait_registry, &trait_name);
         for tname in &search_chain {
             let tname_str: &str = tname;
             let has_self = self
+                .registry
                 .trait_registry
                 .get(tname_str)
                 .and_then(|info| info.methods.iter().find(|m| m.name == method))
@@ -143,7 +144,7 @@ impl Interpreter {
         for_generics: &[String],
         call_site: Span,
     ) -> Result<Value, String> {
-        let method_names = collect_required_methods(&self.trait_registry, trait_name);
+        let method_names = collect_required_methods(&self.registry.trait_registry, trait_name);
         let env = self.environment.lock();
         for m in method_names {
             let impl_name = impl_method_key(trait_name, trait_generics, for_type, for_generics, m);

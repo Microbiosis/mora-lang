@@ -1081,7 +1081,7 @@ impl Interpreter {
                     }
                     None => return Err("ccr.put: requires data as first arg".to_string()),
                 };
-                let hash = self.ccr_store.put(&data);
+                let hash = self.registry.ccr_store.put(&data);
                 Ok(Value::String(hash))
             }
             "get" => {
@@ -1092,12 +1092,12 @@ impl Interpreter {
                     }
                     None => return Err("ccr.get: requires hash as first arg".to_string()),
                 };
-                match self.ccr_store.get(&hash) {
+                match self.registry.ccr_store.get(&hash) {
                     Some(entry) => Ok(Value::String(entry.data)),
                     None => Ok(Value::Nil),
                 }
             }
-            "len" => Ok(Value::Number(self.ccr_store.len() as f64)),
+            "len" => Ok(Value::Number(self.registry.ccr_store.len() as f64)),
             "marker" => {
                 let hash = args
                     .first()
@@ -1139,7 +1139,8 @@ impl Interpreter {
                     .get(1)
                     .cloned()
                     .ok_or("mock.register: requires handler")?;
-                self.mock_registry
+                self.registry
+                    .mock_registry
                     .register(&name, crate::mock::MockHandler::Script(handler));
                 Ok(Value::String(format!("mock.{} registered", name)))
             }
@@ -1151,7 +1152,7 @@ impl Interpreter {
                     }
                     None => return Err("mock.unregister: requires name".to_string()),
                 };
-                self.mock_registry.unregister(&name);
+                self.registry.mock_registry.unregister(&name);
                 Ok(Value::Nil)
             }
             "call" => {
@@ -1161,7 +1162,7 @@ impl Interpreter {
                     None => return Err("mock.call: requires name".to_string()),
                 };
                 let call_args = args.get(1).cloned().unwrap_or(Value::Nil);
-                match self.mock_registry.get(&name) {
+                match self.registry.mock_registry.get(&name) {
                     Some(crate::mock::MockHandler::Native(f)) => Ok(f(&call_args)),
                     Some(crate::mock::MockHandler::Script(closure)) => {
                         self.call_value(&closure, vec![call_args])
@@ -1169,9 +1170,9 @@ impl Interpreter {
                     None => Ok(Value::Nil),
                 }
             }
-            "count" => Ok(Value::Number(self.mock_registry.count() as f64)),
+            "count" => Ok(Value::Number(self.registry.mock_registry.count() as f64)),
             "names" => {
-                let names = self.mock_registry.names();
+                let names = self.registry.mock_registry.names();
                 Ok(Value::List(names.into_iter().map(Value::String).collect()))
             }
             _ => Err(format!("mock.{}: unknown method", method)),
@@ -1187,7 +1188,7 @@ impl Interpreter {
                     .map(|v| v.to_string())
                     .ok_or("memory.store: requires key")?;
                 let value = args.get(1).cloned().unwrap_or(Value::Nil);
-                self.memory_store.insert(key, value);
+                self.registry.memory_store.insert(key, value);
                 Ok(Value::Nil)
             }
             "recall" => {
@@ -1195,7 +1196,12 @@ impl Interpreter {
                     .first()
                     .map(|v| v.to_string())
                     .ok_or("memory.recall: requires key")?;
-                Ok(self.memory_store.get(&key).cloned().unwrap_or(Value::Nil))
+                Ok(self
+                    .registry
+                    .memory_store
+                    .get(&key)
+                    .cloned()
+                    .unwrap_or(Value::Nil))
             }
             "search" => {
                 let query = args
@@ -1204,6 +1210,7 @@ impl Interpreter {
                     .ok_or("memory.search: requires query")?;
                 let query_lower = query.to_lowercase();
                 let results: Vec<Value> = self
+                    .registry
                     .memory_store
                     .iter()
                     .filter(|(k, _)| k.to_lowercase().contains(&query_lower))
@@ -1221,14 +1228,14 @@ impl Interpreter {
                     .first()
                     .map(|v| v.to_string())
                     .ok_or("memory.forget: requires key")?;
-                self.memory_store.remove(&key);
+                self.registry.memory_store.remove(&key);
                 Ok(Value::Nil)
             }
             "clear" => {
-                self.memory_store.clear();
+                self.registry.memory_store.clear();
                 Ok(Value::Nil)
             }
-            "size" => Ok(Value::Number(self.memory_store.len() as f64)),
+            "size" => Ok(Value::Number(self.registry.memory_store.len() as f64)),
             // v0.43.1: memory.remember(category, text) — markdown-backed persistent memory
             // Appends `text` under `## {category}` in ~/.mora/memory/YYYY-MM-DD.md
             // Returns: Bool(true) on success
@@ -1248,7 +1255,8 @@ impl Interpreter {
                 )
                 .map_err(|e| format!("memory.remember: {}", e))?;
                 // 也写到 memory_store (key=category, value=text) 让 recall 能查到
-                self.memory_store
+                self.registry
+                    .memory_store
                     .insert(format!("md:{}", category), Value::String(text));
                 Ok(Value::Bool(true))
             }
@@ -1272,6 +1280,7 @@ impl Interpreter {
             }
             "keys" => {
                 let keys: Vec<Value> = self
+                    .registry
                     .memory_store
                     .keys()
                     .map(|k| Value::String(k.clone()))
@@ -1283,7 +1292,7 @@ impl Interpreter {
                     .first()
                     .map(|v| v.to_string())
                     .ok_or("memory.save: requires path")?;
-                let json = value_to_json(&Value::Dict(self.memory_store.clone()));
+                let json = value_to_json(&Value::Dict(self.registry.memory_store.clone()));
                 fs::write(&path, json).map_err(|e| format!("memory.save: {}", e))?;
                 Ok(Value::Bool(true))
             }
@@ -1296,7 +1305,7 @@ impl Interpreter {
                     fs::read_to_string(&path).map_err(|e| format!("memory.load: {}", e))?;
                 match json_to_value(&content) {
                     Ok(Value::Dict(map)) => {
-                        self.memory_store = map;
+                        self.registry.memory_store = map;
                         Ok(Value::Bool(true))
                     }
                     Ok(_) => Err("memory.load: file must contain a JSON object".to_string()),

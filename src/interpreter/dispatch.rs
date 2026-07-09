@@ -52,7 +52,7 @@ impl Interpreter {
             } else {
                 (tname.to_string(), vec![])
             };
-            if self.trait_registry.contains_key(&trait_name) {
+            if self.registry.trait_registry.contains_key(&trait_name) {
                 let type_arg = args.first().map(|v| v.to_string()).unwrap_or_default();
                 return self.construct_trait_instance(
                     &trait_name,

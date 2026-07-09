@@ -410,20 +410,26 @@ pub fn json_to_value(json: &str) -> Result<Value, String> {
 }
 
 /// JSON 解析辅助
+///
+/// v0.52 bug fix: 返回的 `consumed` 包含 trim 掉的 leading whitespace 字节数
+/// （之前 `trim_start()` 后 return consumed，但 consumed 是 trim 后偏移，
+/// 调用方 `i += consumed` 算原始 s 偏移会少算 trim 字节，导致 dict 内空格错位）
 fn parse_json_value(s: &str) -> Result<(Value, usize), String> {
-    let s = s.trim_start();
-    if s.is_empty() {
+    let ws_consumed = skip_ws(s.as_bytes(), 0);
+    let trimmed = &s[ws_consumed..];
+    if trimmed.is_empty() {
         return Err("Empty JSON value".to_string());
     }
-    match s.as_bytes()[0] {
-        b'"' => parse_json_string(s),
-        b'[' => parse_json_list(s),
-        b'{' => parse_json_dict(s),
-        b't' | b'f' => parse_json_bool(s),
-        b'n' => parse_json_null(s),
-        b'0'..=b'9' | b'-' => parse_json_number(s),
-        _ => Err(format!("Unexpected character in JSON: {}", s)),
-    }
+    let (val, inner_consumed) = match trimmed.as_bytes()[0] {
+        b'"' => parse_json_string(trimmed)?,
+        b'[' => parse_json_list(trimmed)?,
+        b'{' => parse_json_dict(trimmed)?,
+        b't' | b'f' => parse_json_bool(trimmed)?,
+        b'n' => parse_json_null(trimmed)?,
+        b'0'..=b'9' | b'-' => parse_json_number(trimmed)?,
+        _ => return Err(format!("Unexpected character in JSON: {}", trimmed)),
+    };
+    Ok((val, ws_consumed + inner_consumed))
 }
 
 fn parse_json_string(s: &str) -> Result<(Value, usize), String> {
@@ -756,5 +762,62 @@ mod tests {
         assert_eq!(Type::Int.name(), "int");
         assert_eq!(Type::Float.name(), "float");
         assert_eq!(Type::Number.name(), "number");
+    }
+
+    // ===== v0.52 regression: json_to_value 空格 bug =====
+    // pre-existing: parse_json_value 在 line 414 trim_start() 但 return 的 consumed
+    // 不含 trim 字节数，导致 dict 内有空格时解析错位（"Expected ',' in dict"）
+    // 这是 v0.51 P0-3 修 Send 派发时发现的（见 src/runtime/infra.rs:extract_send_tasks
+    // 注释里 hand-write 解析以绕开此 bug）
+
+    #[test]
+    fn json_to_value_dict_no_space() {
+        // 无空格 dict — 应正常解析
+        let v = json_to_value(r#"{"a":1,"b":2}"#).unwrap();
+        if let Value::Dict(m) = v {
+            // parse_json_number 把 int 解析为 Number(f64)（pre-existing 行为）
+            assert_eq!(m.get("a"), Some(&Value::Number(1.0)));
+            assert_eq!(m.get("b"), Some(&Value::Number(2.0)));
+        } else {
+            panic!("expected Dict");
+        }
+    }
+
+    #[test]
+    fn json_to_value_dict_with_space() {
+        // 带空格 dict — pre-existing bug 应 panic "Expected ',' in dict"
+        // 修复后期望 pass
+        let v = json_to_value(r#"{"a": 1, "b": 2}"#).unwrap();
+        if let Value::Dict(m) = v {
+            assert_eq!(m.get("a"), Some(&Value::Number(1.0)));
+            assert_eq!(m.get("b"), Some(&Value::Number(2.0)));
+        } else {
+            panic!("expected Dict, got {:?}", v);
+        }
+    }
+
+    #[test]
+    fn json_to_value_list_with_space() {
+        // 带空格 list — 同样应正常解析
+        let v = json_to_value("[1, 2, 3]").unwrap();
+        if let Value::List(items) = v {
+            assert_eq!(items.len(), 3);
+        } else {
+            panic!("expected List");
+        }
+    }
+
+    #[test]
+    fn json_to_value_nested_with_space() {
+        // 嵌套 dict + 空格
+        let v = json_to_value(r#"{"a": {"b": [1, 2]}}"#).unwrap();
+        if let Value::Dict(m) = &v
+            && let Some(Value::Dict(inner)) = m.get("a")
+            && let Some(Value::List(items)) = inner.get("b")
+        {
+            assert_eq!(items.len(), 2);
+        } else {
+            panic!("nested structure mismatch: {:?}", v);
+        }
     }
 }

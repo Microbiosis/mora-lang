@@ -334,6 +334,11 @@ impl PregelEngine {
 
             active_nodes = next_nodes.into_iter().collect();
 
+            // v0.52 bug fix: 清空本 step 已处理的 pending_sends
+            // pre-existing: pending_sends 只 extend 不清空，导致下一步继续推同一批 SendTask
+            // （重复派发同一批 send — 与 LangGraph BSP 行为不符）
+            self.pending_sends.clear();
+
             // ---------- 4. CHECKPOINT ----------
             if let Some(ref saver) = self.checkpoint_saver {
                 let cp = self.build_checkpoint(step);

@@ -10,6 +10,8 @@
 //!
 //! 跨 facade 协作通过显式依赖注入（参数传 &mut facade），避免 borrow 摩擦。
 
+// v0.52 ADR-001: facade 模块 — Interpreter 字段 pub 让 binary crate 访问
+// 后续 Task 7 阶段会考虑加 accessor
 pub mod ai;
 pub mod core;
 pub mod infra;

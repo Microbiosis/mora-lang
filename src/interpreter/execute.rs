@@ -366,7 +366,7 @@ impl Interpreter {
                 }
                 "compact_at" => {
                     if let Value::Number(n) = v {
-                        self.context_window.compression_threshold = n / 100.0;
+                        self.ai.context_window.compression_threshold = n / 100.0;
                     }
                 }
                 _ => {}

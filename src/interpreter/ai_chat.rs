@@ -160,7 +160,7 @@ impl Interpreter {
         let mut span_attrs = std::collections::HashMap::new();
         span_attrs.insert("model".to_string(), model.to_string());
         span_attrs.insert("messages".to_string(), messages.len().to_string());
-        let span = self.trace.start_span("ai.chat", span_attrs);
+        let span = self.ai.trace.start_span("ai.chat", span_attrs);
         let start = std::time::Instant::now();
 
         let result = self.real_ai_chat_inner(messages, api_key, model, base_url);
@@ -172,11 +172,11 @@ impl Interpreter {
             Ok(val) => {
                 end_attrs.insert("output_len".to_string(), val.to_string().len().to_string());
                 span.end(end_attrs);
-                self.trace.record_call("ai.chat", elapsed, true);
+                self.ai.trace.record_call("ai.chat", elapsed, true);
             }
             Err(e) => {
                 span.end_error(e, end_attrs);
-                self.trace.record_call("ai.chat", elapsed, false);
+                self.ai.trace.record_call("ai.chat", elapsed, false);
             }
         }
         // v0.14: 录制 ai.chat (rough token 估算: prompt 长度/4 + response 长度/4)
@@ -276,13 +276,14 @@ impl Interpreter {
 
         // v0.24: 使用上下文窗口管理器
         for (role, content) in messages {
-            self.context_window
+            self.ai
+                .context_window
                 .add_message(role.clone(), content.clone());
         }
 
         // v0.24: 检查是否需要压缩上下文
-        if self.context_window.needs_compression() {
-            self.context_window.compress();
+        if self.ai.context_window.needs_compression() {
+            self.ai.context_window.compress();
         }
 
         // v0.15: mock_llm 模式 — 从队列中取出下一个响应
@@ -321,9 +322,12 @@ impl Interpreter {
         if let Some(ref draft_model) = speculative_config {
             // v0.24: 自适应 draft 模型选择
             // 检查 draft 模型的历史成功率
+            // v0.52 ADR-001: draft_model_stats 迁到 self.ai
             let should_use_draft = if let Some((success, total)) = self
+                .ai
                 .draft_model_stats
                 .lock()
+                .expect("draft_model_stats poisoned")
                 .get(draft_model.as_str())
                 .copied()
             {
@@ -353,13 +357,20 @@ impl Interpreter {
                 // 3. 检查验证结果并更新统计
                 let verification_str = verification.to_string();
                 // v0.24: 使用推测解码验证器
+                // v0.52 ADR-001: speculative_verifier 迁到 self.ai
                 let draft_str = draft_response.to_string();
                 let is_verified = self
+                    .ai
                     .speculative_verifier
                     .verify(&draft_str, &verification_str);
 
                 // v0.49.0 (A6): 单锁内 update stats (was HashMap entry+stats.x)
-                let mut stats_map = self.draft_model_stats.lock();
+                // v0.52 ADR-001: draft_model_stats 迁到 self.ai
+                let mut stats_map = self
+                    .ai
+                    .draft_model_stats
+                    .lock()
+                    .expect("draft_model_stats poisoned");
                 let entry = stats_map.entry(draft_model.clone()).or_insert((0, 0));
                 entry.1 += 1; // total += 1
                 if is_verified {
@@ -418,7 +429,7 @@ impl Interpreter {
         }
 
         // v0.24: 检查缓存预热队列
-        if let Some(cached) = self.cache_warmer.get_cached(&cache_key) {
+        if let Some(cached) = self.ai.cache_warmer.get_cached(&cache_key) {
             return Ok(Value::String(cached.clone()));
         }
 
@@ -763,7 +774,7 @@ suggestion: <improvement suggestion or "none">"#,
         let tool_refs: Vec<&ToolDef> = agent_tools.iter().collect();
 
         // 确定 API 配置
-        let route = self.model_routes.get(model_route);
+        let route = self.ai.model_routes.get(model_route);
         let default_key = env::var("OPENAI_API_KEY").unwrap_or_default();
         let (api_key, model, base_url) = if let Some(r) = route {
             let key = if r.api_key.is_empty() {

@@ -16,7 +16,7 @@ use std::io::{BufRead, BufReader, Read};
 use std::sync::Arc;
 
 // v1 AST types no longer imported — all v2 paths use ast_v2 / common
-use crate::ai_infra::*;
+// v0.52 ADR-001: ai_infra::* 不再需要（ContextWindow/SpeculativeVerifier/CacheWarmer 迁到 src/runtime/ai.rs）
 use crate::flow::*;
 use crate::lexer::Lexer;
 use crate::trace_collector::TraceCollector;
@@ -204,11 +204,7 @@ pub struct Interpreter {
     globals: Arc<Mutex<Environment>>,
     environment: Arc<Mutex<Environment>>,
     tool_registry: Arc<HashMap<String, ToolDef>>,
-    // v0.04补: memory_store 字段已删除（RFC §4.1 memory.* builtin 推迟到 v1.0）
-    model_routes: HashMap<String, RouteConfig>,
-    token_budget: Option<TokenBudget>,
-    token_usage: TokenUsage,
-    pub trace: TraceCollector,
+    // v0.04补: memory_store 字段已删除（RFC §4.1 memory.* 推迟到 v1.0）
     // v0.06: 当前 with 块 set 的 AiConfig 值 (替代 env hack)
     current_ai_config: Option<AiConfigValue>,
     // α.2: with 块 config 保存/恢复栈（MIR 解释器用）
@@ -219,16 +215,6 @@ pub struct Interpreter {
     // v0.19: Worker 并发 channels (v0.36: crossbeam-channel for Send/Sync)
     worker_channels: HashMap<String, crossbeam_channel::Sender<Value>>,
     worker_receivers: HashMap<String, crossbeam_channel::Receiver<Value>>,
-    // v0.24: 自适应 draft 模型选择 (model -> success_rate)
-    // v0.49.0 (A6): wrapped in Arc<Mutex> for thread-safe shared access
-    draft_model_stats: std::sync::Arc<Mutex<std::collections::HashMap<String, (usize, usize)>>>, // (success, total)
-    // v0.24: 上下文窗口管理器
-    context_window: ContextWindow,
-    // v0.24: 推测解码并行验证器
-    speculative_verifier: SpeculativeVerifier,
-    // v0.24: AI 调用缓存预热器
-    #[allow(dead_code)] // 未来扩展用
-    cache_warmer: CacheWarmer,
     /// v2 AST arena — 在 interpret 期间存储，供 call_value 执行 v2 闭包
     /// v0.35 (P0-A5): wrapped in Arc so per-call `.clone()` is cheap
     /// (Arc bump) instead of deep-cloning the whole arena tree.
@@ -242,6 +228,14 @@ pub struct Interpreter {
     /// 暂保持 `pub` 以让 binary crate（main.rs）和其他外部 crate 可访问 —
     /// Task 7（Interpreter 薄化阶段）会统一把 `pub` 改为 `pub(crate)` + accessor。
     pub infra: crate::runtime::infra::InfraRuntime,
+    // v0.52 ADR-001: 8 个 AI 字段（model_routes/token_budget/token_usage/trace/
+    // draft_model_stats/context_window/speculative_verifier/cache_warmer）已迁出到
+    // crate::runtime::ai::AiRuntime，访问走 self.ai.xxx
+    /// v0.52: AiRuntime facade — BC3 (model_routes + token_budget + token_usage + trace +
+    /// draft_model_stats + context_window + speculative_verifier + cache_warmer)
+    ///
+    /// 暂保持 `pub` — Task 7 会统一改 pub(crate) + accessor
+    pub ai: crate::runtime::ai::AiRuntime,
     /// v0.34: 沙箱策略 (来自 src/sandbox/, MimiClaw path validation)
     sandbox: crate::sandbox::SandboxPolicy,
     /// v0.34: CCR (Compress-Cache-Retrieve, Headroom style)
@@ -297,26 +291,22 @@ impl Clone for Interpreter {
             environment: self.environment.clone(),
             tool_registry: self.tool_registry.clone(),
             // v0.04补: memory_store 字段已删除（RFC §4.1 memory.* 推迟到 v1.0）
-            model_routes: self.model_routes.clone(),
-            token_budget: self.token_budget.clone(),
-            token_usage: self.token_usage.clone(),
-            trace: self.trace.clone(),
             current_ai_config: self.current_ai_config.clone(),
             config_stack: Vec::new(),
             trait_registry: self.trait_registry.clone(),
             impl_table: self.impl_table.clone(),
             worker_channels: HashMap::new(), // 不克隆 channel
             worker_receivers: HashMap::new(),
-            draft_model_stats: self.draft_model_stats.clone(),
-            context_window: ContextWindow::default(),
-            speculative_verifier: SpeculativeVerifier::default(),
-            cache_warmer: CacheWarmer::default(),
             v2_arena: None,
             memory_store: HashMap::new(),
             // v0.52 ADR-001: 5 个字段（recorder/string_interner/ai_cache/bus/scheduler）
             // 迁到 InfraRuntime 内部 Clone
             // v0.35 (P0-A1) 设计延续：recorder 重建为 new_off()（per-thread 状态）
             infra: self.infra.clone(),
+            // v0.52 ADR-001: 8 个 AI 字段迁到 AiRuntime 内部 Clone（derive Clone 真共享）
+            // 与原 `ContextWindow::default()` reset 行为不同 — 改为真 clone（更高效、保留状态）
+            // 注：token_usage 等会共享 — 行为变化，HTTP/MCP workers 共享 AI 状态
+            ai: self.ai.clone(),
             sandbox: self.sandbox.clone(),
             ccr_store: self.ccr_store.clone(),
             mock_registry: self.mock_registry.clone(),
@@ -333,8 +323,9 @@ impl Clone for Interpreter {
 }
 
 /// Token 预算配置
-#[derive(Clone)]
-struct TokenBudget {
+// v0.52 ADR-001: pub 让 src/runtime/ai.rs 可访问（抽 AiRuntime 用）
+#[derive(Debug, Clone)]
+pub struct TokenBudget {
     total: usize,
     /// 每次调用 token 上限（v0.15 接入 track_tokens）
     per_call: Option<usize>,
@@ -342,15 +333,17 @@ struct TokenBudget {
 }
 
 /// Token 消耗统计
-#[derive(Clone, Default)]
-struct TokenUsage {
-    input: usize,
-    output: usize,
+// v0.52 ADR-001: pub struct + pub fields 让 src/runtime/ai.rs 可访问
+#[derive(Debug, Clone, Default)]
+pub struct TokenUsage {
+    pub input: usize,
+    pub output: usize,
 }
 
 /// 模型路由配置
-#[derive(Clone)]
-struct RouteConfig {
+// v0.52 ADR-001: pub 让 src/runtime/ai.rs 可访问
+#[derive(Debug, Clone)]
+pub struct RouteConfig {
     model: String,
     base_url: String,
     api_key: String,
@@ -485,22 +478,18 @@ impl Interpreter {
             globals: globals.clone(),
             environment: globals,
             tool_registry: Arc::new(HashMap::new()),
-            model_routes: HashMap::new(),
-            token_budget: None,
-            token_usage: TokenUsage::default(),
-            trace: TraceCollector::new(false),
+
             current_ai_config: None,
             config_stack: Vec::new(),
             trait_registry: Arc::new(HashMap::new()),
             impl_table: Arc::new(HashMap::new()),
             // v0.52 ADR-001: 5 个字段迁到 InfraRuntime 内部 Default
             infra: crate::runtime::infra::InfraRuntime::default(),
+            // v0.52 ADR-001: 8 个 AI 字段迁到 AiRuntime 内部 Default
+            ai: crate::runtime::ai::AiRuntime::default(),
             worker_channels: HashMap::new(),
             worker_receivers: HashMap::new(),
-            draft_model_stats: std::sync::Arc::new(Mutex::new(std::collections::HashMap::new())),
-            context_window: ContextWindow::default(),
-            speculative_verifier: SpeculativeVerifier::default(),
-            cache_warmer: CacheWarmer::default(),
+
             v2_arena: None,
             memory_store: HashMap::new(),
             sandbox: crate::sandbox::SandboxPolicy::permissive(),
@@ -525,22 +514,18 @@ impl Interpreter {
             globals: globals.clone(),
             environment: globals,
             tool_registry: Arc::new(HashMap::new()),
-            model_routes: HashMap::new(),
-            token_budget: None,
-            token_usage: TokenUsage::default(),
-            trace: TraceCollector::new(false),
+
             current_ai_config: None,
             config_stack: Vec::new(),
             trait_registry: Arc::new(HashMap::new()),
             impl_table: Arc::new(HashMap::new()),
             // v0.52 ADR-001: 5 个字段迁到 InfraRuntime 内部 Default
             infra: crate::runtime::infra::InfraRuntime::default(),
+            // v0.52 ADR-001: 8 个 AI 字段迁到 AiRuntime 内部 Default
+            ai: crate::runtime::ai::AiRuntime::default(),
             worker_channels: HashMap::new(),
             worker_receivers: HashMap::new(),
-            draft_model_stats: std::sync::Arc::new(Mutex::new(std::collections::HashMap::new())),
-            context_window: ContextWindow::default(),
-            speculative_verifier: SpeculativeVerifier::default(),
-            cache_warmer: CacheWarmer::default(),
+
             v2_arena: None,
             memory_store: HashMap::new(),
             sandbox: crate::sandbox::SandboxPolicy::permissive(),
@@ -563,22 +548,18 @@ impl Interpreter {
             globals: globals.clone(),
             environment: env,
             tool_registry: Arc::new(HashMap::new()),
-            model_routes: HashMap::new(),
-            token_budget: None,
-            token_usage: TokenUsage::default(),
-            trace: TraceCollector::new(false),
+
             current_ai_config: None,
             config_stack: Vec::new(),
             trait_registry: Arc::new(HashMap::new()),
             impl_table: Arc::new(HashMap::new()),
             // v0.52 ADR-001: 5 个字段迁到 InfraRuntime 内部 Default
             infra: crate::runtime::infra::InfraRuntime::default(),
+            // v0.52 ADR-001: 8 个 AI 字段迁到 AiRuntime 内部 Default
+            ai: crate::runtime::ai::AiRuntime::default(),
             worker_channels: HashMap::new(),
             worker_receivers: HashMap::new(),
-            draft_model_stats: std::sync::Arc::new(Mutex::new(std::collections::HashMap::new())),
-            context_window: ContextWindow::default(),
-            speculative_verifier: SpeculativeVerifier::default(),
-            cache_warmer: CacheWarmer::default(),
+
             v2_arena: None,
             memory_store: HashMap::new(),
             sandbox: crate::sandbox::SandboxPolicy::permissive(),
@@ -711,7 +692,7 @@ impl Interpreter {
     }
 
     pub fn set_trace_enabled(&mut self, enabled: bool) {
-        self.trace = TraceCollector::new(enabled);
+        self.ai.trace = TraceCollector::new(enabled);
     }
 
     /// v0.22: 字符串驻留 - 相同字符串只存储一次
@@ -1747,7 +1728,7 @@ mod token_budget_tests {
     fn test_per_call_limit_exceeded() {
         // 模拟：设置 per_call=10，然后 track_tokens 超限
         let mut interp = Interpreter::new();
-        interp.token_budget = Some(TokenBudget {
+        interp.ai.token_budget = Some(TokenBudget {
             total: usize::MAX,
             per_call: Some(10),
             alert_threshold: 0.8,
@@ -1761,7 +1742,7 @@ mod token_budget_tests {
     #[test]
     fn test_per_call_limit_within_range() {
         let mut interp = Interpreter::new();
-        interp.token_budget = Some(TokenBudget {
+        interp.ai.token_budget = Some(TokenBudget {
             total: usize::MAX,
             per_call: Some(100),
             alert_threshold: 0.8,
@@ -1774,7 +1755,7 @@ mod token_budget_tests {
     #[test]
     fn test_total_budget_exceeded() {
         let mut interp = Interpreter::new();
-        interp.token_budget = Some(TokenBudget {
+        interp.ai.token_budget = Some(TokenBudget {
             total: 100,
             per_call: None,
             alert_threshold: 0.8,

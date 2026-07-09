@@ -806,12 +806,12 @@ impl Interpreter {
     /// v0.34: ai.tokens — expose TokenUsage counters (mini-swe-agent cost tracking pattern)
     pub fn call_ai_tokens_method(&self, method: &str, _args: &[Value]) -> Result<Value, String> {
         match method {
-            "input" => Ok(Value::Number(self.token_usage.input as f64)),
-            "output" => Ok(Value::Number(self.token_usage.output as f64)),
+            "input" => Ok(Value::Number(self.ai.token_usage.input as f64)),
+            "output" => Ok(Value::Number(self.ai.token_usage.output as f64)),
             "total" => Ok(Value::Number(
-                (self.token_usage.input + self.token_usage.output) as f64,
+                (self.ai.token_usage.input + self.ai.token_usage.output) as f64,
             )),
-            "calls" => Ok(Value::Number(self.token_usage.input as f64)),
+            "calls" => Ok(Value::Number(self.ai.token_usage.input as f64)),
             _ => Err(format!("ai.tokens.{}: unknown method", method)),
         }
     }
@@ -894,7 +894,7 @@ impl Interpreter {
             }
             // v0.47.0: ai.context.* — context window control (AgentMesh+pi-agent)
             "context.trim" => {
-                // 可选 threshold (0.0-1.0), 默认使用 self.context_window.compression_threshold
+                // 可选 threshold (0.0-1.0), 默认使用 self.ai.context_window.compression_threshold
                 if let Some(v) = args.first() {
                     let t = match v {
                         Value::Number(n) => *n,
@@ -911,11 +911,11 @@ impl Interpreter {
                             t
                         ));
                     }
-                    self.context_window.compression_threshold = t;
+                    self.ai.context_window.compression_threshold = t;
                 }
-                let before = self.context_window.current_tokens;
-                self.context_window.compress();
-                let after = self.context_window.current_tokens;
+                let before = self.ai.context_window.current_tokens;
+                self.ai.context_window.compress();
+                let after = self.ai.context_window.current_tokens;
                 let dropped = before.saturating_sub(after);
                 Ok(Value::Number(dropped as f64))
             }
@@ -923,19 +923,19 @@ impl Interpreter {
                 let mut d = std::collections::HashMap::new();
                 d.insert(
                     "max_tokens".to_string(),
-                    Value::Number(self.context_window.max_tokens as f64),
+                    Value::Number(self.ai.context_window.max_tokens as f64),
                 );
                 d.insert(
                     "current_tokens".to_string(),
-                    Value::Number(self.context_window.current_tokens as f64),
+                    Value::Number(self.ai.context_window.current_tokens as f64),
                 );
                 d.insert(
                     "messages".to_string(),
-                    Value::Number(self.context_window.messages.len() as f64),
+                    Value::Number(self.ai.context_window.messages.len() as f64),
                 );
                 d.insert(
                     "compression_threshold".to_string(),
-                    Value::Number(self.context_window.compression_threshold),
+                    Value::Number(self.ai.context_window.compression_threshold),
                 );
                 Ok(Value::Dict(d))
             }

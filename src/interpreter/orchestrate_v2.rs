@@ -25,6 +25,11 @@ use crate::value::{FlowSignal, Value};
 // 引擎内部类型（非 AST）
 // ===================================================================
 
+/// Interrupt 回调签名（v0.51 P0-2 真接通）
+/// 外部注册 callback → run() 在 before/after 阶段调
+/// 返回 `true` = 继续, `false` = 中断并 return `Err("interrupted at ...")`
+pub type InterruptCallback = Arc<dyn Fn(&str, InterruptWhen) -> bool>;
+
 /// Pregel 模式配置（引擎执行入口）
 ///
 /// 与 `ast_v2::OrchestrateKind::Pregel` 字段等价，提供独立结构体以解耦 AST 与引擎。
@@ -104,8 +109,8 @@ pub struct PregelEngine {
     // v0.51: Interrupt callback (HITL 暂停点真接通)
     //        外部注册 callback → run() 在 before/after 阶段调
     //        返回 true = 继续, false = 中断并 return Err("interrupted at ...")
-    interrupt_before_callback: Option<Arc<dyn Fn(&str, InterruptWhen) -> bool>>,
-    interrupt_after_callback: Option<Arc<dyn Fn(&str, InterruptWhen) -> bool>>,
+    interrupt_before_callback: Option<InterruptCallback>,
+    interrupt_after_callback: Option<InterruptCallback>,
 }
 
 // v0.50 半成品 public API: with_max_steps / get_channel / get_all_channels /
@@ -153,19 +158,13 @@ impl PregelEngine {
         self
     }
     /// v0.51: 设置 interrupt before callback (HITL 暂停点)
-    pub fn with_interrupt_before_callback(
-        mut self,
-        cb: Arc<dyn Fn(&str, InterruptWhen) -> bool>,
-    ) -> Self {
+    pub fn with_interrupt_before_callback(mut self, cb: InterruptCallback) -> Self {
         self.interrupt_before_callback = Some(cb);
         self
     }
 
     /// v0.51: 设置 interrupt after callback
-    pub fn with_interrupt_after_callback(
-        mut self,
-        cb: Arc<dyn Fn(&str, InterruptWhen) -> bool>,
-    ) -> Self {
+    pub fn with_interrupt_after_callback(mut self, cb: InterruptCallback) -> Self {
         self.interrupt_after_callback = Some(cb);
         self
     }

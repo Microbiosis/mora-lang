@@ -216,17 +216,9 @@ pub struct Interpreter {
     // v0.08: trait 系统注册表 (v0.36: wrapped in Arc for cheap clone in HTTP/MCP workers)
     pub trait_registry: Arc<HashMap<String, TraitInfo>>,
     pub impl_table: Arc<HashMap<String, Vec<String>>>,
-    // v0.14: 录制/重放器 (默认 Off, 由 CLI 子命令激活)
-    pub recorder: crate::record::Recorder,
     // v0.19: Worker 并发 channels (v0.36: crossbeam-channel for Send/Sync)
     worker_channels: HashMap<String, crossbeam_channel::Sender<Value>>,
     worker_receivers: HashMap<String, crossbeam_channel::Receiver<Value>>,
-    // v0.22: AI 调用内联缓存 (prompt_hash -> response)
-    // v0.49.0 (C1): LRU cap=10000 (was unbounded HashMap) — prevents OOM
-    ai_cache: std::sync::Arc<Mutex<LruCache<String>>>,
-    // v0.22: 字符串驻留池 (减少重复字符串内存)
-    // v0.49.0 (C2): LRU cap=50000 (was unbounded HashMap)
-    string_interner: std::sync::Arc<Mutex<LruCache<Value>>>,
     // v0.24: 自适应 draft 模型选择 (model -> success_rate)
     // v0.49.0 (A6): wrapped in Arc<Mutex> for thread-safe shared access
     draft_model_stats: std::sync::Arc<Mutex<std::collections::HashMap<String, (usize, usize)>>>, // (success, total)
@@ -243,12 +235,15 @@ pub struct Interpreter {
     v2_arena: Option<std::sync::Arc<crate::ast_v2::AstArena>>,
     /// v0.25: 会话记忆存储
     memory_store: HashMap<String, Value>,
-    /// v0.34: 事件总线 (来自 src/event/, Puter EventClient 风格)
-    bus: crate::event::EventBus,
+    // v0.52 ADR-001: 5 个 InfraRuntime 字段（recorder / string_interner / ai_cache /
+    // bus / scheduler）已迁出到 crate::runtime::infra::InfraRuntime，访问走 self.infra.xxx
+    /// v0.52: InfraRuntime facade — BC9 (recorder + string_interner + ai_cache + bus + scheduler)
+    ///
+    /// 暂保持 `pub` 以让 binary crate（main.rs）和其他外部 crate 可访问 —
+    /// Task 7（Interpreter 薄化阶段）会统一把 `pub` 改为 `pub(crate)` + accessor。
+    pub infra: crate::runtime::infra::InfraRuntime,
     /// v0.34: 沙箱策略 (来自 src/sandbox/, MimiClaw path validation)
     sandbox: crate::sandbox::SandboxPolicy,
-    /// v0.34: scheduler (cron, MimiClaw style)
-    scheduler: crate::schedule::Scheduler,
     /// v0.34: CCR (Compress-Cache-Retrieve, Headroom style)
     ccr_store: crate::ccr::InMemoryCcrStore,
     /// v0.34: mock registry (OpenFugu + OpenInfer mock)
@@ -310,24 +305,19 @@ impl Clone for Interpreter {
             config_stack: Vec::new(),
             trait_registry: self.trait_registry.clone(),
             impl_table: self.impl_table.clone(),
-            recorder: crate::record::Recorder::new_off(),
             worker_channels: HashMap::new(), // 不克隆 channel
             worker_receivers: HashMap::new(),
-            ai_cache: self.ai_cache.clone(),
-            string_interner: self.string_interner.clone(),
             draft_model_stats: self.draft_model_stats.clone(),
             context_window: ContextWindow::default(),
             speculative_verifier: SpeculativeVerifier::default(),
             cache_warmer: CacheWarmer::default(),
             v2_arena: None,
             memory_store: HashMap::new(),
-            // v0.35 (P0-A1): share 5 v0.34 singletons via Arc-backed Clone
-            // instead of fresh-constructing them. Previously, Clone reset
-            // counter state (Scheduler, CcrStore) and lost event handlers
-            // (Bus, MockRegistry), breaking identity across HTTP/MCP workers.
-            bus: self.bus.clone(),
+            // v0.52 ADR-001: 5 个字段（recorder/string_interner/ai_cache/bus/scheduler）
+            // 迁到 InfraRuntime 内部 Clone
+            // v0.35 (P0-A1) 设计延续：recorder 重建为 new_off()（per-thread 状态）
+            infra: self.infra.clone(),
             sandbox: self.sandbox.clone(),
-            scheduler: self.scheduler.clone(),
             ccr_store: self.ccr_store.clone(),
             mock_registry: self.mock_registry.clone(),
             audit_sink: self.audit_sink.clone(),
@@ -503,22 +493,17 @@ impl Interpreter {
             config_stack: Vec::new(),
             trait_registry: Arc::new(HashMap::new()),
             impl_table: Arc::new(HashMap::new()),
-            recorder: crate::record::Recorder::new_off(),
+            // v0.52 ADR-001: 5 个字段迁到 InfraRuntime 内部 Default
+            infra: crate::runtime::infra::InfraRuntime::default(),
             worker_channels: HashMap::new(),
             worker_receivers: HashMap::new(),
-            ai_cache: std::sync::Arc::new(Mutex::new(crate::interpreter::LruCache::new(10000))),
-            string_interner: std::sync::Arc::new(Mutex::new(crate::interpreter::LruCache::new(
-                50000,
-            ))),
             draft_model_stats: std::sync::Arc::new(Mutex::new(std::collections::HashMap::new())),
             context_window: ContextWindow::default(),
             speculative_verifier: SpeculativeVerifier::default(),
             cache_warmer: CacheWarmer::default(),
             v2_arena: None,
             memory_store: HashMap::new(),
-            bus: crate::event::EventBus::new(),
             sandbox: crate::sandbox::SandboxPolicy::permissive(),
-            scheduler: crate::schedule::Scheduler::new(),
             ccr_store: crate::ccr::InMemoryCcrStore::new(),
             mock_registry: crate::mock::MockRegistry::new(),
             audit_sink: std::sync::Arc::new(crate::audit::NullSink::new()),
@@ -548,22 +533,17 @@ impl Interpreter {
             config_stack: Vec::new(),
             trait_registry: Arc::new(HashMap::new()),
             impl_table: Arc::new(HashMap::new()),
-            recorder: crate::record::Recorder::new_off(),
+            // v0.52 ADR-001: 5 个字段迁到 InfraRuntime 内部 Default
+            infra: crate::runtime::infra::InfraRuntime::default(),
             worker_channels: HashMap::new(),
             worker_receivers: HashMap::new(),
-            ai_cache: std::sync::Arc::new(Mutex::new(crate::interpreter::LruCache::new(10000))),
-            string_interner: std::sync::Arc::new(Mutex::new(crate::interpreter::LruCache::new(
-                50000,
-            ))),
             draft_model_stats: std::sync::Arc::new(Mutex::new(std::collections::HashMap::new())),
             context_window: ContextWindow::default(),
             speculative_verifier: SpeculativeVerifier::default(),
             cache_warmer: CacheWarmer::default(),
             v2_arena: None,
             memory_store: HashMap::new(),
-            bus: crate::event::EventBus::new(),
             sandbox: crate::sandbox::SandboxPolicy::permissive(),
-            scheduler: crate::schedule::Scheduler::new(),
             ccr_store: crate::ccr::InMemoryCcrStore::new(),
             mock_registry: crate::mock::MockRegistry::new(),
             audit_sink: std::sync::Arc::new(crate::audit::NullSink::new()),
@@ -591,22 +571,17 @@ impl Interpreter {
             config_stack: Vec::new(),
             trait_registry: Arc::new(HashMap::new()),
             impl_table: Arc::new(HashMap::new()),
-            recorder: crate::record::Recorder::new_off(),
+            // v0.52 ADR-001: 5 个字段迁到 InfraRuntime 内部 Default
+            infra: crate::runtime::infra::InfraRuntime::default(),
             worker_channels: HashMap::new(),
             worker_receivers: HashMap::new(),
-            ai_cache: std::sync::Arc::new(Mutex::new(crate::interpreter::LruCache::new(10000))),
-            string_interner: std::sync::Arc::new(Mutex::new(crate::interpreter::LruCache::new(
-                50000,
-            ))),
             draft_model_stats: std::sync::Arc::new(Mutex::new(std::collections::HashMap::new())),
             context_window: ContextWindow::default(),
             speculative_verifier: SpeculativeVerifier::default(),
             cache_warmer: CacheWarmer::default(),
             v2_arena: None,
             memory_store: HashMap::new(),
-            bus: crate::event::EventBus::new(),
             sandbox: crate::sandbox::SandboxPolicy::permissive(),
-            scheduler: crate::schedule::Scheduler::new(),
             ccr_store: crate::ccr::InMemoryCcrStore::new(),
             mock_registry: crate::mock::MockRegistry::new(),
             audit_sink: std::sync::Arc::new(crate::audit::NullSink::new()),
@@ -742,7 +717,12 @@ impl Interpreter {
     /// v0.22: 字符串驻留 - 相同字符串只存储一次
     pub fn intern_string(&mut self, s: String) -> Value {
         // v0.49.0 (C2): LRU cache + lock (was unbounded HashMap direct access)
-        let mut map = self.string_interner.lock();
+        // v0.52: lock 跨 self.infra.string_interner，poison 概率极低 expect
+        let mut map = self
+            .infra
+            .string_interner
+            .lock()
+            .expect("Interpreter string_interner poisoned");
         if let Some(interned) = map.get(&s) {
             return interned;
         }

@@ -268,7 +268,7 @@ impl Interpreter {
                     None => return Err("bus.emit: requires event name as first arg".to_string()),
                 };
                 let payload = args.get(1).cloned().unwrap_or(Value::Nil);
-                self.bus.emit(&event, &payload);
+                self.infra.bus.emit(&event, &payload);
                 Ok(Value::Nil)
             }
             "off" => {
@@ -280,10 +280,10 @@ impl Interpreter {
                     }
                     None => return Err("bus.off: requires pattern as first arg".to_string()),
                 };
-                self.bus.off(&pattern);
+                self.infra.bus.off(&pattern);
                 Ok(Value::Nil)
             }
-            "count" => Ok(Value::Number(self.bus.pattern_count() as f64)),
+            "count" => Ok(Value::Number(self.infra.bus.pattern_count() as f64)),
             // v0.43.1: bus.subscribe(pattern) — pub-sub subscribe (Puter / AgentMesh / Solace)
             // Returns: token (Value::Number) for later unsubscribe
             // Note: handler is internal — actual mora-level callback support would
@@ -299,13 +299,13 @@ impl Interpreter {
                 // 注册一个 no-op handler 让 pattern 进入订阅表
                 // 真实 handler 由上层 (LSP / HTTP / MCP) 通过更高级 API 提供
                 // 这里用空 handler 占位, 返回 token = pattern_count (递增)
-                self.bus.on(
+                self.infra.bus.on(
                     &pattern,
                     Arc::new(|_, _| {
                         // no-op: subscribe 占位
                     }),
                 );
-                let token = self.bus.pattern_count() as u64;
+                let token = self.infra.bus.pattern_count() as u64;
                 Ok(Value::Number(token as f64))
             }
             // v0.43.1: bus.publish(topic, payload) — pub-sub publish (Puter / AgentMesh verified)
@@ -318,9 +318,9 @@ impl Interpreter {
                 };
                 let payload = args.get(1).cloned().unwrap_or(Value::Nil);
                 // 直接走 EventBus::emit, 它已经支持通配符 (Puter O(segments) 索引, v0.41.0)
-                self.bus.emit(&topic, &payload);
+                self.infra.bus.emit(&topic, &payload);
                 // 返回注册的 pattern 数 (informational)
-                Ok(Value::Number(self.bus.pattern_count() as f64))
+                Ok(Value::Number(self.infra.bus.pattern_count() as f64))
             }
             _ => Err(format!("bus.{}: unknown method", method)),
         }
@@ -757,12 +757,13 @@ impl Interpreter {
                 } else {
                     0
                 };
-                self.scheduler
+                self.infra
+                    .scheduler
                     .add(&name, kind, &message, interval_s, at_epoch)
                     .map(Value::String)
             }
             "list" => {
-                let jobs = self.scheduler.list();
+                let jobs = self.infra.scheduler.list();
                 let arr: Vec<Value> = jobs
                     .into_iter()
                     .map(|j| {
@@ -789,15 +790,15 @@ impl Interpreter {
                     .first()
                     .map(|v| v.to_string())
                     .ok_or("schedule.remove: requires id")?;
-                Ok(Value::Bool(self.scheduler.remove(&id)))
+                Ok(Value::Bool(self.infra.scheduler.remove(&id)))
             }
             "tick" => {
-                let messages = self.scheduler.tick(crate::schedule::Scheduler::now());
+                let messages = self.infra.scheduler.tick(crate::schedule::Scheduler::now());
                 Ok(Value::List(
                     messages.into_iter().map(Value::String).collect(),
                 ))
             }
-            "count" => Ok(Value::Number(self.scheduler.count() as f64)),
+            "count" => Ok(Value::Number(self.infra.scheduler.count() as f64)),
             _ => Err(format!("schedule.{}: unknown method", method)),
         }
     }

@@ -428,7 +428,7 @@ fn run_record(path: &str, name: &str) {
 
     let rec_path = recording_path(name);
     let mut interpreter = Interpreter::new();
-    interpreter.recorder = match record::Recorder::new_record(rec_path.clone()) {
+    interpreter.infra.recorder = match record::Recorder::new_record(rec_path.clone()) {
         Ok(r) => r,
         Err(e) => {
             eprintln!("record: {}", e);
@@ -438,15 +438,15 @@ fn run_record(path: &str, name: &str) {
 
     match interpreter.interpret(&node_ids, &arena) {
         Ok(()) => {
-            if let Err(e) = interpreter.recorder.save() {
+            if let Err(e) = interpreter.infra.recorder.save() {
                 eprintln!("record: save failed: {}", e);
                 process::exit(1);
             }
-            let n = interpreter.recorder.events().len();
+            let n = interpreter.infra.recorder.events().len();
             println!("✓ recorded {} events -> {}", n, rec_path.display());
         }
         Err(e) => {
-            let _ = interpreter.recorder.save();
+            let _ = interpreter.infra.recorder.save();
             eprintln!("Runtime error during record: {}", e);
             eprintln!("(partial recording saved)");
             process::exit(1);
@@ -473,7 +473,7 @@ fn run_replay(path: &str, name: &str) {
 
     let rec_path = recording_path(name);
     let mut interpreter = Interpreter::new();
-    interpreter.recorder = match record::Recorder::new_replay(rec_path.clone()) {
+    interpreter.infra.recorder = match record::Recorder::new_replay(rec_path.clone()) {
         Ok(r) => r,
         Err(e) => {
             eprintln!("replay: {}", e);
@@ -487,7 +487,7 @@ fn run_replay(path: &str, name: &str) {
     }
     println!(
         "✓ replayed {} events from {}",
-        interpreter.recorder.events().len(),
+        interpreter.infra.recorder.events().len(),
         rec_path.display()
     );
 }
@@ -689,7 +689,7 @@ fn run_snapshot(file: &str, name: &str, update: bool) {
         eprintln!("snapshot: runtime error: {}", e);
         process::exit(1);
     }
-    let current_events = interpreter.recorder.events().to_vec();
+    let current_events = interpreter.infra.recorder.events().to_vec();
     let snap_file = snapshot_path(name);
     if update || !snap_file.exists() {
         // 创建/更新基线

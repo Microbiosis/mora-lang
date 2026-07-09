@@ -49,7 +49,7 @@ impl Interpreter {
 
     pub(super) fn real_web_fetch(&mut self, url: &str) -> Result<Value, String> {
         // v0.14: 重放模式优先返回录制响应 (deterministic)
-        if let Some(rec) = self.recorder.lookup_web_fetch(url)
+        if let Some(rec) = self.infra.recorder.lookup_web_fetch(url)
             && let Some(status) = rec.status
         {
             return Ok(Value::String(format!(
@@ -99,7 +99,7 @@ impl Interpreter {
                     Ok(Value::String(text))
                 };
                 // v0.14: 录制成功 fetch (status + body_len)
-                self.recorder.record_web_fetch(
+                self.infra.recorder.record_web_fetch(
                     url.to_string(),
                     "GET".to_string(),
                     status.as_u16(),
@@ -117,7 +117,7 @@ impl Interpreter {
             // 其余失败(HostNotFound/Protocol 等)统一兜底
             Err(e) => {
                 let err_str = format!("web.fetch: network error for {}: {}", url, e);
-                self.recorder.record_web_fetch(
+                self.infra.recorder.record_web_fetch(
                     url.to_string(),
                     "GET".to_string(),
                     0,
@@ -153,7 +153,7 @@ impl Interpreter {
             .map(|(role, content)| format!("{}: {}", role, content))
             .collect::<Vec<_>>()
             .join("\n");
-        if let Some(rec) = self.recorder.lookup_ai_chat(model, &prompt_text) {
+        if let Some(rec) = self.infra.recorder.lookup_ai_chat(model, &prompt_text) {
             return Ok(Value::String(rec.response));
         }
 
@@ -186,7 +186,7 @@ impl Interpreter {
         };
         let tokens_in_approx = prompt_text.len() / 4;
         let tokens_out_approx = resp_str.len() / 4;
-        self.recorder.record_ai_chat(
+        self.infra.recorder.record_ai_chat(
             model.to_string(),
             prompt_text,
             resp_str,
@@ -294,7 +294,7 @@ impl Interpreter {
             // 模拟 token 估算
             let tokens_in = messages.iter().map(|(_, c)| c.len()).sum::<usize>() / 4;
             let tokens_out = response.len() / 4;
-            self.recorder.record_ai_chat(
+            self.infra.recorder.record_ai_chat(
                 model.to_string(),
                 messages
                     .last()
@@ -406,7 +406,14 @@ impl Interpreter {
         // v0.22: AI 调用内联缓存
         let cache_key = format!("{}:{:?}", model, messages);
         // v0.49.0 (C1): LRU cache (was unbounded HashMap)
-        if let Some(cached) = self.ai_cache.lock().get(&cache_key) {
+        // v0.52: lock 跨 self.infra.ai_cache，poison 概率极低 expect
+        if let Some(cached) = self
+            .infra
+            .ai_cache
+            .lock()
+            .expect("ai_cache poisoned")
+            .get(&cache_key)
+        {
             return Ok(Value::String(cached));
         }
 
@@ -499,8 +506,13 @@ impl Interpreter {
                                 .unwrap_or(Value::String(text.clone()));
                             // v0.22: 缓存 AI 调用结果
                             // v0.49.0 (C1): LRU put (was unbounded HashMap insert)
+                            // v0.52: lock expect (poison 概率极低)
                             if let Value::String(ref s) = result {
-                                self.ai_cache.lock().put(cache_key.clone(), s.clone());
+                                self.infra
+                                    .ai_cache
+                                    .lock()
+                                    .expect("ai_cache poisoned")
+                                    .put(cache_key.clone(), s.clone());
                             }
                             return Ok(result);
                         }

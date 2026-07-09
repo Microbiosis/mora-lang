@@ -645,7 +645,7 @@ impl Interpreter {
         // 2. 如果有 replay_path，切换到 replay 模式
         let prev_recorder = if let Some(path) = replay_path {
             let prev = std::mem::replace(
-                &mut self.recorder,
+                &mut self.infra.recorder,
                 crate::record::Recorder::new_replay(std::path::PathBuf::from(path)).unwrap_or_else(
                     |e| {
                         eprintln!("eval replay warning: {}", e);
@@ -674,7 +674,7 @@ impl Interpreter {
 
         // 4. 恢复 recorder
         if let Some(prev) = prev_recorder {
-            self.recorder = prev;
+            self.infra.recorder = prev;
         }
 
         // 5. 计算通过率

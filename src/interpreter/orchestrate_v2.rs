@@ -1096,6 +1096,77 @@ mod tests {
         assert!(result.unwrap_err().contains("Merge reducer"));
     }
 
+    #[test]
+    fn reducer_merge_closure_expr_stmt_returns_value_root_cause() {
+        // v0.52 Bug C 根因修复 regression test：
+        // 闭包 body 是裸 expression stmt 形式（`fn(c, n) n end`）应能返回值
+        // pre-existing: execute 内部 `StmtKind::Expr` 丢弃 expr value，
+        //              需要用 `fn(c, n) return n end` 形式（用 FlowSignal::Return 显式返回）
+        // 根因修复：execute 签名改为 (FlowSignal, Option<Value>)，
+        //           StmtKind::Expr 真的返回 Some(expr_value)
+        //           call_value_inner 跟踪 last_value 作为最终 return
+        use crate::lexer::Lexer;
+        use crate::parser_v2::ParserV2;
+        let src = "let _ = fn(c, n) n end";
+        let tokens = Lexer::new(src).scan_tokens();
+        let mut parser = ParserV2::new(tokens);
+        let _ = parser.parse();
+        let arena = parser.into_arena();
+
+        // 找到 2-param Closure 表达式
+        let mut merge_fn_id: Option<NodeId> = None;
+        for i in 0..arena.exprs.len() {
+            if let Some(expr) = arena.get_expr(NodeId(i))
+                && let ExprKind::Closure { params, .. } = &expr.kind
+                && params.len() == 2
+            {
+                merge_fn_id = Some(NodeId(i));
+                break;
+            }
+        }
+        let merge_fn_id = merge_fn_id.expect("应找到 2-param Closure");
+
+        let mut engine = make_test_engine_with_schema(vec![StateChannel {
+            name: "last".to_string(),
+            type_hint: None,
+            reducer: ReducerKind::Merge(merge_fn_id),
+        }]);
+        engine.init_channels(HashMap::new());
+
+        let mut interpreter = Interpreter::new();
+        let _ = interpreter.interpret(&[], &arena);
+
+        // 第一次：current=None, value="first" → 闭包 fn(c, n) n 忽略 c，返回 "first"
+        // 根因修复关键验证：execute(Expr) 返回 Some("first")，call_value_inner 取 last_value
+        engine
+            .apply_write(
+                "last".to_string(),
+                Value::String("first".to_string()),
+                &mut interpreter,
+                &arena,
+            )
+            .unwrap();
+        assert_eq!(
+            engine.get_channel("last"),
+            Some(Value::String("first".to_string())),
+            "根因修复前：channel 应是 Nil（pre-existing 行为）"
+        );
+
+        // 第二次：current="first", value="second" → 闭包返回 "second"
+        engine
+            .apply_write(
+                "last".to_string(),
+                Value::String("second".to_string()),
+                &mut interpreter,
+                &arena,
+            )
+            .unwrap();
+        assert_eq!(
+            engine.get_channel("last"),
+            Some(Value::String("second".to_string()))
+        );
+    }
+
     // ---------- Checkpoint 测试 ----------
 
     #[test]

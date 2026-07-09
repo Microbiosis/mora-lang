@@ -733,14 +733,26 @@ impl TypeChecker {
                         self.check_expr(*verify, arena, symbols);
                     }
                 }
+                // v0.51 P0-7/P0-9: 递归遍历 agent task_expr 收集 Command goto / Send target
+                // 之前传 &[] 等于 pregel_check 内部 6./7. 验证规则空跑
+                let mut command_gotos: Vec<(String, usize)> = Vec::new();
+                let mut send_targets: Vec<(String, usize)> = Vec::new();
+                for agent in agents {
+                    collect_command_sends(
+                        agent.task_expr,
+                        arena,
+                        &mut command_gotos,
+                        &mut send_targets,
+                    );
+                }
                 let pregel_errors = crate::typeck::pregel_check::check_orchestrate_pregel(
                     agents,
                     edges,
                     state_schema,
                     checkpoint,
                     interrupt_points,
-                    &[], // command_gotos: TODO collect from ExprKind::Command inside agents
-                    &[], // send_targets: TODO collect from ExprKind::Send inside agents
+                    &command_gotos,
+                    &send_targets,
                 );
                 self.errors.extend(pregel_errors);
             }
@@ -1335,4 +1347,68 @@ impl TypeChecker {
         self.check_expr(input, arena, symbols);
         Type::Union(vec![])
     }
+}
+
+// ===================================================================
+// v0.51 P0-7/P0-9: 递归遍历 agent task_expr 收集 Command goto / Send target
+// 供 pregel_check 的节点引用验证（pregel_check.rs:106-130）使用
+// ===================================================================
+
+/// 返回 `ExprKind` 包含的直接子 NodeId（MVP 只覆盖 Command / Send）
+///
+/// lang 语法上 `command` / `send` 是顶层表达式（嵌在 block / agent task body 中），
+/// 不会被 BinaryOp / Call 等表达式包裹。本函数只展开 Command / Send 自身的
+/// 子节点（update / resume / input），其他变体不递归 — 因为外部遍历已经处理。
+fn expr_kind_children(kind: &ExprKind) -> Vec<NodeId> {
+    let mut children = Vec::new();
+    match kind {
+        ExprKind::Command { update, resume, .. } => {
+            for (_, id) in update {
+                children.push(*id);
+            }
+            if let Some(r) = resume {
+                children.push(*r);
+            }
+        }
+        ExprKind::Send { input, .. } => {
+            children.push(*input);
+        }
+        _ => {}
+    }
+    children
+}
+
+/// 递归遍历 `root` 表达式 AST 收集 Command goto / Send target 引用
+///
+/// 输出格式与 `check_orchestrate_pregel` 期望的 `(String, usize)` 对齐
+/// （第二个字段是 expr_id.0，作为 typeck 错误报告的 line 占位）
+pub(crate) fn collect_command_sends(
+    root: NodeId,
+    arena: &AstArena,
+    command_gotos: &mut Vec<(String, usize)>,
+    send_targets: &mut Vec<(String, usize)>,
+) {
+    fn walk(
+        id: NodeId,
+        arena: &AstArena,
+        command_gotos: &mut Vec<(String, usize)>,
+        send_targets: &mut Vec<(String, usize)>,
+    ) {
+        let Some(expr) = arena.get_expr(id) else {
+            return;
+        };
+        match &expr.kind {
+            ExprKind::Command { goto: Some(g), .. } => {
+                command_gotos.push((g.clone(), id.0));
+            }
+            ExprKind::Send { target, .. } => {
+                send_targets.push((target.clone(), id.0));
+            }
+            _ => {}
+        }
+        for child_id in expr_kind_children(&expr.kind) {
+            walk(child_id, arena, command_gotos, send_targets);
+        }
+    }
+    walk(root, arena, command_gotos, send_targets);
 }

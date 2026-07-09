@@ -287,12 +287,13 @@ impl PregelEngine {
 
             // ---------- 3. UPDATE：Reducer 合并写入 ----------
             for (node, channel, value) in writes {
-                self.apply_write(channel, value, interpreter).map_err(|e| {
-                    format!(
-                        "Pregel step {}: apply_write failed for node '{}': {}",
-                        step, node, e
-                    )
-                })?;
+                self.apply_write(channel, value, interpreter, arena)
+                    .map_err(|e| {
+                        format!(
+                            "Pregel step {}: apply_write failed for node '{}': {}",
+                            step, node, e
+                        )
+                    })?;
             }
 
             // 处理 Command 的 goto 决定下一跳
@@ -407,12 +408,13 @@ impl PregelEngine {
     }
 
     /// 应用写入 — 使用 Reducer 合并
-    /// v0.51: 接受 `interpreter: &mut Interpreter` 用于 Merge 闭包调用
+    /// v0.51 P0-4: 接受 `interpreter: &mut Interpreter` + `arena: &AstArena` 用于 Merge 闭包调用
     fn apply_write(
         &mut self,
         channel: String,
         value: Value,
         interpreter: &mut Interpreter,
+        arena: &AstArena,
     ) -> Result<(), String> {
         let reducer = self
             .state_schema
@@ -455,13 +457,28 @@ impl PregelEngine {
                 Value::Number(cur_num + new_num)
             }
             ReducerKind::Merge(ref merge_fn_id) => {
-                // v0.51: 真接通 — 调 interpreter.run_orchestrate_agent 拿到 merge 闭包
-                //        (lang 解析 `merge_fn` expr 为 Value::Closure).
-                //        注: lang parser 暂未实现 Merge(expr_id) → Value 转换 (AST 已有,
-                //        run_orchestrate_agent 需 return Value::Closure). 当前 fallback 到 Last.
-                let _ = merge_fn_id; // suppress unused warning
-                let _ = interpreter; // suppress unused warning
-                value
+                // v0.51 P0-4 真接通：
+                // 1) 求值 merge_fn expr → Value::Closure
+                // 2) 验证是 2-param 闭包 (current, new)
+                // 3) 调 call_value([current_or_nil, value]) → merged
+                let merge_fn = interpreter
+                    .evaluate(*merge_fn_id, arena)
+                    .map_err(|e| format!("Merge reducer: eval merge_fn failed: {}", e))?;
+
+                match &merge_fn {
+                    Value::Closure { params, .. } if params.len() == 2 => {}
+                    other => {
+                        return Err(format!(
+                            "Merge reducer: expected 2-param closure (current, new), got {:?}",
+                            other
+                        ));
+                    }
+                }
+
+                let args = vec![current.unwrap_or(Value::Nil), value];
+                interpreter
+                    .call_value(&merge_fn, args)
+                    .map_err(|e| format!("Merge reducer: call merge_fn failed: {}", e))?
             }
         };
 
@@ -515,7 +532,7 @@ impl PregelEngine {
     /// - JSON 含 `__send__` → `AgentOutput::SendTask`
     fn parse_agent_output(output: &str) -> AgentOutput {
         let trimmed = output.trim();
-        if !trimmed.starts_with('{') {
+        if !trimmed.starts_with('{') && !trimmed.starts_with('[') {
             return AgentOutput::Value(Value::String(output.to_string()));
         }
 
@@ -533,8 +550,9 @@ impl PregelEngine {
 
         // 轻量检测 __send__ 标记
         if trimmed.contains("\"__send__\"") || trimmed.contains("'__send__'") {
-            // 简化：返回空 send 列表（占位）
-            return AgentOutput::SendTask(Vec::new());
+            // v0.51 P0-3 真接通 — 调 extract_send_tasks 解析 (evaluate.rs:73-80
+            // ExprKind::Send 求值输出 `{__send__, target, input}` 的 JSON 格式)
+            return AgentOutput::SendTask(extract_send_tasks(trimmed));
         }
 
         AgentOutput::Value(Value::String(output.to_string()))
@@ -542,6 +560,7 @@ impl PregelEngine {
 }
 
 /// Agent 输出类型
+#[derive(Debug)]
 enum AgentOutput {
     Value(Value),
     Command(CommandExpr),
@@ -636,6 +655,152 @@ fn extract_json_top_level_object(json: &str, key: &str) -> Vec<(String, Value)> 
     result
 }
 
+/// v0.51 P0-3: 从简化 JSON 字符串中提取 `__send__` 字段的 SendTask 列表
+///
+/// 期望格式（与 `evaluate.rs:73-80` `ExprKind::Send` 求值输出对齐）：
+/// ```text
+///   单个：{"__send__": true, "target": "node_name", "input": <any Value>}
+///   批量：[{"__send__": true, "target": "a", "input": ...}, ...]
+/// ```
+///
+/// 字段名 `target`（而非 Checkpoint 持久化的 `target_node`）— 这两种场景不同：
+/// - agent 输出 → `target`（与 evaluate.rs:77 对齐）
+/// - Checkpoint pending_sends → `target_node`（与 mod.rs:248 对齐）
+///
+/// 实现说明：手写轻量解析，因为 `crate::flow::json_to_value` 对带空格 JSON
+/// 解析有 pre-existing bug（trim_start 后 consumed 不含前导空白，索引错位）。
+/// 本函数只解析 `__send__` / `target` / `input` 三个字段，`target` 必须是
+/// 字符串字面量（双引号包围），`input` 取其原始 JSON 子串转 Value。
+///
+/// 解析失败（缺字段 / 格式不符）静默返回空 Vec，与 Command 分支风格一致。
+fn extract_send_tasks(json: &str) -> Vec<SendTask> {
+    let trimmed = json.trim();
+    // 顶层是 `[` → 批量；其它（含 `{`）→ 视作单个
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+    let bodies: Vec<&str> = if let Some(stripped) = trimmed.strip_prefix('[') {
+        // 截取 `[...]` 内部内容
+        let inner = match stripped.rsplit_once(']') {
+            Some((inside, _)) => inside,
+            None => return Vec::new(),
+        };
+        // 简易按顶层 `}` 边界切分（不支持嵌套 `{}` 内含 `}` 的 input —
+        // 当前 evaluate.rs:73-80 输出的 `input` 不含 `}` 边界冲突）
+        split_top_level_dicts(inner)
+    } else {
+        vec![trimmed]
+    };
+
+    bodies
+        .into_iter()
+        .filter_map(|body| parse_one_send_task(body.trim()))
+        .collect()
+}
+
+/// 按顶层 `}` 边界切分 JSON 列表的内部 dict body（不含外层 `{` `}`）
+fn split_top_level_dicts(s: &str) -> Vec<&str> {
+    let mut result = Vec::new();
+    let bytes = s.as_bytes();
+    let mut depth = 0;
+    let mut start: Option<usize> = None;
+    for (i, &c) in bytes.iter().enumerate() {
+        match c {
+            b'{' => {
+                if depth == 0 {
+                    start = Some(i);
+                }
+                depth += 1;
+            }
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    if let Some(st) = start {
+                        result.push(&s[st..=i]);
+                    }
+                    start = None;
+                }
+            }
+            _ => {}
+        }
+    }
+    result
+}
+
+/// 从单个 dict body 提取一个 SendTask
+///
+/// body 应是 `{...}` 包裹的 dict，但本函数不强制要求（兼容手撕子串）
+fn parse_one_send_task(body: &str) -> Option<SendTask> {
+    // 校验含 __send__ 字段
+    if !body.contains("\"__send__\"") && !body.contains("'__send__'") {
+        return None;
+    }
+    // 提取 target（双引号字符串）
+    let target = extract_json_string_field(body, "target")?;
+    // 提取 input（取 "input": 后到下一个顶层 , 或 } 的子串，转 Value）
+    let input_value = extract_input_value(body);
+    Some(SendTask {
+        target_node: target,
+        input: input_value,
+    })
+}
+
+/// 从 dict body 中提取 "input" 字段的 JSON 子串并反序列化为 Value
+fn extract_input_value(body: &str) -> Value {
+    // 找 "input":
+    let pattern_dq = "\"input\":";
+    let pattern_sq = "'input':";
+    let (pos, quote_char) = if let Some(p) = body.find(pattern_dq) {
+        (p + pattern_dq.len(), '"')
+    } else if let Some(p) = body.find(pattern_sq) {
+        (p + pattern_sq.len(), '\'')
+    } else {
+        return Value::Nil;
+    };
+    let rest = body[pos..].trim_start();
+    if rest.is_empty() {
+        return Value::Nil;
+    }
+    // 按顶层边界切到下一个 , 或 }
+    let bytes = rest.as_bytes();
+    let mut depth = 0;
+    let mut end = rest.len();
+    let mut in_str: Option<u8> = None;
+    for (i, &c) in bytes.iter().enumerate() {
+        match c {
+            b'\\' if in_str.is_some() => {
+                // 跳过下一个字符（转义）
+                continue;
+            }
+            b'"' | b'\'' if quote_char == c as char => {
+                in_str = match in_str {
+                    Some(_) => None,
+                    None => Some(c),
+                };
+            }
+            b'{' | b'[' if in_str.is_none() => depth += 1,
+            b'}' | b']' if in_str.is_none() => {
+                depth -= 1;
+                if depth < 0 {
+                    end = i;
+                    break;
+                }
+            }
+            b',' if in_str.is_none() && depth == 0 => {
+                end = i;
+                break;
+            }
+            _ => {}
+        }
+    }
+    let raw = rest[..end].trim();
+    if raw.is_empty() {
+        return Value::Nil;
+    }
+    // 尝试解析为 JSON Value（用项目内 json_to_value）
+    crate::flow::json_to_value(raw).unwrap_or(Value::String(raw.to_string()))
+}
+
 // ===================================================================
 // Interpreter 扩展：Pregel 执行入口
 // ===================================================================
@@ -704,6 +869,8 @@ impl Interpreter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ast_v2::{ExprKind, NodeId};
+    use crate::common::{Literal, Span};
 
     // ---------- Reducer 语义测试 ----------
 
@@ -717,6 +884,7 @@ mod tests {
                 "result".to_string(),
                 Value::String("first".to_string()),
                 &mut Interpreter::new(),
+                &AstArena::default(),
             )
             .unwrap();
         engine
@@ -724,6 +892,7 @@ mod tests {
                 "result".to_string(),
                 Value::String("second".to_string()),
                 &mut Interpreter::new(),
+                &AstArena::default(),
             )
             .unwrap();
 
@@ -747,6 +916,7 @@ mod tests {
                 "messages".to_string(),
                 Value::String("A".to_string()),
                 &mut Interpreter::new(),
+                &AstArena::default(),
             )
             .unwrap();
         engine
@@ -754,6 +924,7 @@ mod tests {
                 "messages".to_string(),
                 Value::String("B".to_string()),
                 &mut Interpreter::new(),
+                &AstArena::default(),
             )
             .unwrap();
         engine
@@ -761,6 +932,7 @@ mod tests {
                 "messages".to_string(),
                 Value::List(vec![Value::String("C".to_string())]),
                 &mut Interpreter::new(),
+                &AstArena::default(),
             )
             .unwrap();
 
@@ -786,16 +958,23 @@ mod tests {
                 "total".to_string(),
                 Value::Number(10.0),
                 &mut Interpreter::new(),
+                &AstArena::default(),
             )
             .unwrap();
         engine
-            .apply_write("total".to_string(), Value::Int(5), &mut Interpreter::new())
+            .apply_write(
+                "total".to_string(),
+                Value::Int(5),
+                &mut Interpreter::new(),
+                &AstArena::default(),
+            )
             .unwrap();
         engine
             .apply_write(
                 "total".to_string(),
                 Value::Float(2.5),
                 &mut Interpreter::new(),
+                &AstArena::default(),
             )
             .unwrap();
 
@@ -815,9 +994,101 @@ mod tests {
             "total".to_string(),
             Value::String("not a number".to_string()),
             &mut Interpreter::new(),
+            &AstArena::default(),
         );
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("@add reducer expects number"));
+    }
+
+    // ---------- v0.51 P0-4: ReducerKind::Merge 真接通测试 ----------
+
+    #[test]
+    fn reducer_merge_calls_closure_with_current_and_new() {
+        // 解析 `let _ = fn(c, n) return n end` → 找到 Closure 表达式 NodeId
+        // 用 `return n` 而非裸 `n`，因为 call_value_inner 只通过 FlowSignal::Return
+        // 捕获闭包 body 结果（pre-existing 行为：body 是 expression stmt 时被丢弃）
+        use crate::lexer::Lexer;
+        use crate::parser_v2::ParserV2;
+        let src = "let _ = fn(c, n) return n end";
+        let tokens = Lexer::new(src).scan_tokens();
+        let mut parser = ParserV2::new(tokens);
+        let _stmt_ids = parser.parse();
+        let arena = parser.into_arena();
+
+        // 找到 Closure 表达式（扫描 arena 找 params.len() == 2 的那个）
+        let mut merge_fn_id: Option<NodeId> = None;
+        for i in 0..arena.exprs.len() {
+            if let Some(expr) = arena.get_expr(NodeId(i))
+                && let ExprKind::Closure { params, .. } = &expr.kind
+                && params.len() == 2
+            {
+                merge_fn_id = Some(NodeId(i));
+                break;
+            }
+        }
+        let merge_fn_id = merge_fn_id.expect("解析后应找到 2-param Closure");
+
+        let mut engine = make_test_engine_with_schema(vec![StateChannel {
+            name: "last_write".to_string(),
+            type_hint: None,
+            reducer: ReducerKind::Merge(merge_fn_id),
+        }]);
+        engine.init_channels(HashMap::new());
+
+        // 构造带 v2_arena 的 interpreter（interpret([]) 仅触发 v2_arena 设置）
+        let mut interpreter = Interpreter::new();
+        let _ = interpreter.interpret(&[], &arena);
+
+        // 第一次写入：current=None → args=[Nil, "first"] → 闭包 fn(c, n) return n 忽略 c，返回 "first"
+        engine
+            .apply_write(
+                "last_write".to_string(),
+                Value::String("first".to_string()),
+                &mut interpreter,
+                &arena,
+            )
+            .unwrap();
+        assert_eq!(
+            engine.get_channel("last_write"),
+            Some(Value::String("first".to_string()))
+        );
+
+        // 第二次写入：current=Some("first") → ("first", "second") → 闭包返回 "second"
+        engine
+            .apply_write(
+                "last_write".to_string(),
+                Value::String("second".to_string()),
+                &mut interpreter,
+                &arena,
+            )
+            .unwrap();
+        assert_eq!(
+            engine.get_channel("last_write"),
+            Some(Value::String("second".to_string()))
+        );
+    }
+
+    #[test]
+    fn reducer_merge_rejects_non_closure() {
+        // merge_fn_id 指向一个数字字面量（不是闭包）→ Merge 路径应报 arity 错误
+        let mut arena = AstArena::new();
+        let literal_id = arena.alloc_expr(
+            ExprKind::Literal(Literal::Number(42.0, Span::default())),
+            Span::default(),
+        );
+
+        let mut engine = make_test_engine_with_schema(vec![StateChannel {
+            name: "x".to_string(),
+            type_hint: None,
+            reducer: ReducerKind::Merge(literal_id),
+        }]);
+        engine.init_channels(HashMap::new());
+        let mut interpreter = Interpreter::new();
+        interpreter.interpret(&[], &arena).unwrap();
+
+        let result = engine.apply_write("x".to_string(), Value::Int(1), &mut interpreter, &arena);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Merge reducer"));
     }
 
     // ---------- Checkpoint 测试 ----------
@@ -866,6 +1137,7 @@ mod tests {
                 "msg".to_string(),
                 Value::String("hello".to_string()),
                 &mut Interpreter::new(),
+                &AstArena::default(),
             )
             .unwrap();
 
@@ -878,6 +1150,7 @@ mod tests {
                 "msg".to_string(),
                 Value::String("world".to_string()),
                 &mut Interpreter::new(),
+                &AstArena::default(),
             )
             .unwrap();
         assert_eq!(
@@ -951,6 +1224,53 @@ mod tests {
                 assert_eq!(cmd.update[0].1, Value::Number(0.9));
             }
             _ => panic!("Expected Command"),
+        }
+    }
+
+    // ---------- v0.51 P0-3: __send__ parse 测试 ----------
+
+    #[test]
+    fn parse_send_single_task() {
+        // 单个 SendTask 格式（与 evaluate.rs:73-80 ExprKind::Send 求值输出对齐）
+        let out = PregelEngine::parse_agent_output(
+            r#"{"__send__": true, "target": "process", "input": "hello"}"#,
+        );
+        match out {
+            AgentOutput::SendTask(tasks) => {
+                assert_eq!(tasks.len(), 1);
+                assert_eq!(tasks[0].target_node, "process");
+                assert_eq!(tasks[0].input, Value::String("hello".to_string()));
+            }
+            _ => panic!("Expected SendTask, got {:?}", out),
+        }
+    }
+
+    #[test]
+    fn parse_send_batch_tasks() {
+        // 批量 SendTask 格式（顶层是 List）
+        // 注：json_to_value 把整数解析为 Value::Number（f64）而非 Value::Int
+        let out = PregelEngine::parse_agent_output(
+            r#"[{"__send__": true, "target": "a", "input": 1}, {"__send__": true, "target": "b", "input": 2}]"#,
+        );
+        match out {
+            AgentOutput::SendTask(tasks) => {
+                assert_eq!(tasks.len(), 2);
+                assert_eq!(tasks[0].target_node, "a");
+                assert_eq!(tasks[0].input, Value::Number(1.0));
+                assert_eq!(tasks[1].target_node, "b");
+                assert_eq!(tasks[1].input, Value::Number(2.0));
+            }
+            _ => panic!("Expected SendTask, got {:?}", out),
+        }
+    }
+
+    #[test]
+    fn parse_send_missing_target_returns_empty() {
+        // 缺 target 字段应静默返回空（与 Command 分支风格一致）
+        let out = PregelEngine::parse_agent_output(r#"{"__send__": true, "input": "no target"}"#);
+        match out {
+            AgentOutput::SendTask(tasks) => assert!(tasks.is_empty()),
+            _ => panic!("Expected empty SendTask, got {:?}", out),
         }
     }
 

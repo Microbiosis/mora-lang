@@ -125,7 +125,7 @@ impl Interpreter {
     /// 记录 token 消耗并检查预算
     pub(super) fn track_tokens(&mut self, input: usize, output: usize) -> Result<(), String> {
         // v0.15: 检查每次调用上限
-        if let Some(ref budget) = self.token_budget
+        if let Some(ref budget) = self.ai.token_budget
             && let Some(per_call) = budget.per_call
         {
             let call_total = input + output;
@@ -137,11 +137,11 @@ impl Interpreter {
             }
         }
 
-        self.token_usage.input += input;
-        self.token_usage.output += output;
-        self.trace.record_tokens(input as u64, output as u64);
-        let total_used = self.token_usage.input + self.token_usage.output;
-        if let Some(ref budget) = self.token_budget {
+        self.ai.token_usage.input += input;
+        self.ai.token_usage.output += output;
+        self.ai.trace.record_tokens(input as u64, output as u64);
+        let total_used = self.ai.token_usage.input + self.ai.token_usage.output;
+        if let Some(ref budget) = self.ai.token_budget {
             if total_used > budget.total {
                 return Err(format!(
                     "Token budget exceeded: used {}/{}",

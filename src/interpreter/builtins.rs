@@ -495,20 +495,22 @@ impl Interpreter {
                     None
                 };
                 let event = crate::audit::AuditEvent::new(actor, action, target, payload, None);
-                self.audit_sink
+                self.persist
+                    .audit_sink
                     .write(event)
                     .map_err(|e| format!("sandbox.audit_emit: write failed: {}", e))?;
                 Ok(Value::Bool(true))
             }
             // v0.42.1: sandbox.audit_flush() — flush audit sink to disk
             "audit_flush" => {
-                self.audit_sink
+                self.persist
+                    .audit_sink
                     .flush()
                     .map_err(|e| format!("sandbox.audit_flush: {}", e))?;
                 Ok(Value::Bool(true))
             }
             // v0.42.1: sandbox.audit_verify() — verify hash chain (returns true / error string)
-            "audit_verify" => match self.audit_sink.verify_chain() {
+            "audit_verify" => match self.persist.audit_sink.verify_chain() {
                 Ok(()) => Ok(Value::Bool(true)),
                 Err(e) => Ok(Value::String(format!("{}", e))),
             },
@@ -1210,8 +1212,12 @@ impl Interpreter {
                     .get(1)
                     .map(|v| v.to_string())
                     .ok_or("memory.remember: requires text")?;
-                remember_markdown(self.markdown_memory_dir.as_deref(), &category, &text)
-                    .map_err(|e| format!("memory.remember: {}", e))?;
+                remember_markdown(
+                    self.persist.markdown_memory_dir.as_deref(),
+                    &category,
+                    &text,
+                )
+                .map_err(|e| format!("memory.remember: {}", e))?;
                 // 也写到 memory_store (key=category, value=text) 让 recall 能查到
                 self.memory_store
                     .insert(format!("md:{}", category), Value::String(text));
@@ -1224,15 +1230,17 @@ impl Interpreter {
                     .first()
                     .map(|v| v.to_string())
                     .ok_or("memory.recall_markdown: requires category")?;
-                recall_markdown(self.markdown_memory_dir.as_deref(), &category)
+                recall_markdown(self.persist.markdown_memory_dir.as_deref(), &category)
                     .map(Value::String)
                     .map_err(|e| format!("memory.recall_markdown: {}", e))
             }
             // v0.43.1: memory.list_markdown() — list all categories
             // Returns: List[String] of category names
-            "list_markdown" => list_markdown_categories(self.markdown_memory_dir.as_deref())
-                .map(|cats| Value::List(cats.into_iter().map(Value::String).collect()))
-                .map_err(|e| format!("memory.list_markdown: {}", e)),
+            "list_markdown" => {
+                list_markdown_categories(self.persist.markdown_memory_dir.as_deref())
+                    .map(|cats| Value::List(cats.into_iter().map(Value::String).collect()))
+                    .map_err(|e| format!("memory.list_markdown: {}", e))
+            }
             "keys" => {
                 let keys: Vec<Value> = self
                     .memory_store
@@ -2608,7 +2616,7 @@ mod tests_v0421_audit {
         let mut interp = Interpreter::new();
         let path = temp_log_path("emit_basic.jsonl");
         let sink = Arc::new(JsonlAuditSink::new_fresh(&path).unwrap());
-        interp.audit_sink = sink.clone();
+        interp.persist.audit_sink = sink.clone();
 
         let result = interp
             .call_sandbox_method(
@@ -2632,7 +2640,7 @@ mod tests_v0421_audit {
         let mut interp = Interpreter::new();
         let path = temp_log_path("emit_minimal.jsonl");
         let sink = Arc::new(JsonlAuditSink::new_fresh(&path).unwrap());
-        interp.audit_sink = sink.clone();
+        interp.persist.audit_sink = sink.clone();
 
         // 仅 actor + action
         let result = interp
@@ -2679,7 +2687,7 @@ mod tests_v0421_audit {
         let mut interp = Interpreter::new();
         let path = temp_log_path("verify.jsonl");
         let sink = Arc::new(JsonlAuditSink::new_fresh(&path).unwrap());
-        interp.audit_sink = sink.clone();
+        interp.persist.audit_sink = sink.clone();
 
         for i in 0..5 {
             interp
@@ -2712,7 +2720,7 @@ mod tests_v0421_audit {
         let mut interp = Interpreter::new();
         let path = temp_log_path("tampered.jsonl");
         let sink = Arc::new(JsonlAuditSink::new_fresh(&path).unwrap());
-        interp.audit_sink = sink.clone();
+        interp.persist.audit_sink = sink.clone();
 
         for i in 0..3 {
             interp
@@ -2776,7 +2784,7 @@ mod tests_v0421_audit {
         let mut interp = Interpreter::new();
         let path = temp_log_path("real_file.jsonl");
         let sink = Arc::new(JsonlAuditSink::new_fresh(&path).unwrap());
-        interp.audit_sink = sink.clone();
+        interp.persist.audit_sink = sink.clone();
 
         interp
             .call_sandbox_method(
@@ -3060,7 +3068,7 @@ mod tests_v0431_memory_bus {
     fn memory_remember_appends_to_markdown() {
         let dir = setup_temp_memory_dir();
         let mut interp = Interpreter::new();
-        interp.markdown_memory_dir = Some(dir.clone());
+        interp.persist.markdown_memory_dir = Some(dir.clone());
         let result = interp
             .call_memory_method(
                 "remember",
@@ -3087,7 +3095,7 @@ mod tests_v0431_memory_bus {
     fn memory_remember_appends_to_existing_section() {
         let dir = setup_temp_memory_dir();
         let mut interp = Interpreter::new();
-        interp.markdown_memory_dir = Some(dir.clone());
+        interp.persist.markdown_memory_dir = Some(dir.clone());
         interp
             .call_memory_method(
                 "remember",
@@ -3120,7 +3128,7 @@ mod tests_v0431_memory_bus {
     fn memory_recall_markdown_returns_text() {
         let dir = setup_temp_memory_dir();
         let mut interp = Interpreter::new();
-        interp.markdown_memory_dir = Some(dir.clone());
+        interp.persist.markdown_memory_dir = Some(dir.clone());
         interp
             .call_memory_method(
                 "remember",
@@ -3144,7 +3152,7 @@ mod tests_v0431_memory_bus {
     fn memory_recall_markdown_returns_empty_for_unknown() {
         let dir = setup_temp_memory_dir();
         let mut interp = Interpreter::new();
-        interp.markdown_memory_dir = Some(dir.clone());
+        interp.persist.markdown_memory_dir = Some(dir.clone());
         let result = interp
             .call_memory_method("recall_markdown", &[Value::String("nope".to_string())])
             .expect("recall");
@@ -3156,7 +3164,7 @@ mod tests_v0431_memory_bus {
     fn memory_list_markdown_lists_categories() {
         let dir = setup_temp_memory_dir();
         let mut interp = Interpreter::new();
-        interp.markdown_memory_dir = Some(dir.clone());
+        interp.persist.markdown_memory_dir = Some(dir.clone());
         interp
             .call_memory_method(
                 "remember",
@@ -3199,7 +3207,7 @@ mod tests_v0431_memory_bus {
     fn memory_recall_after_remember_syncs_to_memory_store() {
         let dir = setup_temp_memory_dir();
         let mut interp = Interpreter::new();
-        interp.markdown_memory_dir = Some(dir.clone());
+        interp.persist.markdown_memory_dir = Some(dir.clone());
         interp
             .call_memory_method(
                 "remember",

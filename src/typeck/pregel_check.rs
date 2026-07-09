@@ -705,4 +705,49 @@ mod tests {
         let result = check_orchestrate_pregel(&agents, &[], &[], &None, &interrupts, &[], &[]);
         no_errors(result);
     }
+
+    // ---------- v0.51 P0-7/P0-9: collect_command_sends 收集 → pregel_check 验证 ----------
+
+    #[test]
+    fn collected_command_goto_triggers_validation() {
+        // 模拟 typeck 收集后传给 pregel_check：
+        // command_goto 引用未声明节点 "nonexistent" → 期望 pregel_check 报错
+        let agents = vec![OrchestrateAgent {
+            name: "root".into(),
+            with_config: None,
+            task_expr: NodeId(0),
+            verify_expr: None,
+        }];
+        let gotos = vec![("nonexistent".into(), 42_usize)];
+        let result = check_orchestrate_pregel(&agents, &[], &[], &None, &[], &gotos, &[]);
+        assert!(
+            has_error(
+                &result,
+                "Command goto references unknown node 'nonexistent'"
+            ),
+            "expected Command goto error, got: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn collected_send_target_triggers_validation() {
+        // send target 引用未声明节点 "missing_node" → 期望 pregel_check 报错
+        let agents = vec![OrchestrateAgent {
+            name: "root".into(),
+            with_config: None,
+            task_expr: NodeId(0),
+            verify_expr: None,
+        }];
+        let sends = vec![("missing_node".into(), 7_usize)];
+        let result = check_orchestrate_pregel(&agents, &[], &[], &None, &[], &[], &sends);
+        assert!(
+            has_error(
+                &result,
+                "Send target references unknown node 'missing_node'"
+            ),
+            "expected Send target error, got: {:?}",
+            result
+        );
+    }
 }

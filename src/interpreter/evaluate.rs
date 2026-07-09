@@ -14,6 +14,7 @@ impl Interpreter {
         match &expr.kind {
             ExprKind::Literal(lit) => self.literal_to_value_inner(lit),
             ExprKind::Variable(name) => self
+                .core
                 .environment
                 .lock()
                 .get(name)
@@ -94,7 +95,7 @@ impl Interpreter {
             arg_vals.push(self.evaluate(*arg_id, arena)?);
         }
         // v2 路径: 先从环境查找（注意 environment 和 globals 可能是同一个 Arc，不能双锁）
-        let func_val = self.environment.lock().get(callee);
+        let func_val = self.core.environment.lock().get(callee);
         match func_val {
             Some(ref val) => {
                 if matches!(
@@ -139,7 +140,7 @@ impl Interpreter {
                 for arg_id in args {
                     arg_vals.push(self.evaluate(*arg_id, arena)?);
                 }
-                let func_val = self.environment.lock().get(callee);
+                let func_val = self.core.environment.lock().get(callee);
                 if let Some(func_val) = func_val {
                     self.call_value_inner(&func_val, arg_vals, arena)
                 } else {
@@ -147,7 +148,7 @@ impl Interpreter {
                 }
             }
             ExprKind::Variable(name) => {
-                let val = self.environment.lock().get(name);
+                let val = self.core.environment.lock().get(name);
                 match val {
                     Some(ref val) => self.call_value_inner(val, vec![left_val], arena),
                     None => self.call_method(left_val, name, vec![], Span::default()),
@@ -232,7 +233,7 @@ impl Interpreter {
         let param_names: Vec<String> = params.iter().map(|(n, _)| n.clone()).collect();
         Ok(Value::Closure {
             params: param_names,
-            env: crate::value::EnvRef::from_arc_mutex(self.environment.clone()),
+            env: crate::value::EnvRef::from_arc_mutex(self.core.environment.clone()),
             v2_node_id: Some(expr_id.0),
         })
     }
@@ -287,7 +288,7 @@ impl Interpreter {
             if let Some(bindings) = self.match_pattern(pattern, &val, arena) {
                 // 绑定模式变量
                 for (name, value) in bindings {
-                    self.environment.lock().define(name, value, false);
+                    self.core.environment.lock().define(name, value, false);
                 }
                 return self.evaluate(*result_id, arena);
             }
@@ -410,15 +411,15 @@ impl Interpreter {
     ) -> Option<Vec<(String, Value)>> {
         if let Some(bindings) = self.match_pattern(pattern, val, arena) {
             let env = Arc::new(Mutex::new(Environment::with_parent_of(
-                self.environment.clone(),
+                self.core.environment.clone(),
             )));
             for (name, value) in &bindings {
                 env.lock().define(name.clone(), value.clone(), false);
             }
-            let previous = self.environment.clone();
-            self.environment = env;
+            let previous = self.core.environment.clone();
+            self.core.environment = env;
             let cond_result = self.evaluate(condition, arena);
-            self.environment = previous;
+            self.core.environment = previous;
             match cond_result {
                 Ok(Value::Bool(true)) => Some(bindings),
                 Ok(Value::Bool(false)) | Ok(_) => None,

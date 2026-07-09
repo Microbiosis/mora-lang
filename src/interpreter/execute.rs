@@ -177,7 +177,8 @@ impl Interpreter {
         arena: &AstArena,
     ) -> Result<(FlowSignal, Option<Value>), String> {
         let value = self.evaluate(init, arena)?;
-        self.environment
+        self.core
+            .environment
             .lock()
             .define(name.to_string(), value, exported);
         Ok((FlowSignal::None, None))
@@ -191,7 +192,7 @@ impl Interpreter {
         arena: &AstArena,
     ) -> Result<(FlowSignal, Option<Value>), String> {
         let val = self.evaluate(value, arena)?;
-        if !self.environment.lock().assign(name, val.clone()) {
+        if !self.core.environment.lock().assign(name, val.clone()) {
             return Err(format!("Undefined variable: {}", name));
         }
         Ok((FlowSignal::None, None))
@@ -260,7 +261,10 @@ impl Interpreter {
             _ => return Err("for loop requires a list or string".to_string()),
         };
         for item in items {
-            self.environment.lock().define(var.to_string(), item, false);
+            self.core
+                .environment
+                .lock()
+                .define(var.to_string(), item, false);
             for stmt_id in body {
                 if let Some(stmt) = arena.get_stmt(*stmt_id) {
                     let kind = stmt.kind.clone();
@@ -312,7 +316,7 @@ impl Interpreter {
     ) -> Result<(FlowSignal, Option<Value>), String> {
         let param_names: Vec<String> = params.iter().map(|(n, _)| n.clone()).collect();
         let body_ids: Vec<usize> = body.iter().map(|id| id.0).collect();
-        self.environment.lock().define(
+        self.core.environment.lock().define(
             name.to_string(),
             Value::Task {
                 name: name.to_string(),
@@ -335,13 +339,13 @@ impl Interpreter {
         for (pattern, body_ids) in arms {
             if let Some(bindings) = self.match_pattern(pattern, &val, arena) {
                 let env = Arc::new(Mutex::new(Environment::with_parent_of(
-                    self.environment.clone(),
+                    self.core.environment.clone(),
                 )));
                 for (name, value) in bindings {
                     env.lock().define(name, value, false);
                 }
-                let previous = self.environment.clone();
-                self.environment = env;
+                let previous = self.core.environment.clone();
+                self.core.environment = env;
                 let mut result = FlowSignal::None;
                 for body_id in body_ids {
                     if let Some(stmt) = arena.get_stmt(*body_id) {
@@ -354,7 +358,7 @@ impl Interpreter {
                         }
                     }
                 }
-                self.environment = previous;
+                self.core.environment = previous;
                 return Ok((result, None));
             }
         }
@@ -368,7 +372,7 @@ impl Interpreter {
         body: &[NodeId],
         arena: &AstArena,
     ) -> Result<(FlowSignal, Option<Value>), String> {
-        let prev_cfg = self.current_ai_config.clone();
+        let prev_cfg = self.core.current_ai_config.clone();
         let mut cfg = prev_cfg.clone().unwrap_or_default();
         for (key, val_id) in bindings {
             let v = self.evaluate(*val_id, arena)?;
@@ -398,7 +402,7 @@ impl Interpreter {
                 _ => {}
             }
         }
-        self.current_ai_config = Some(cfg);
+        self.core.current_ai_config = Some(cfg);
         for stmt_id in body {
             if let Some(stmt) = arena.get_stmt(*stmt_id) {
                 let kind = stmt.kind.clone();
@@ -406,13 +410,13 @@ impl Interpreter {
                 match signal {
                     FlowSignal::None => {}
                     signal => {
-                        self.current_ai_config = prev_cfg;
+                        self.core.current_ai_config = prev_cfg;
                         return Ok((signal, None));
                     }
                 }
             }
         }
-        self.current_ai_config = prev_cfg;
+        self.core.current_ai_config = prev_cfg;
         Ok((FlowSignal::None, None))
     }
 
@@ -444,7 +448,7 @@ impl Interpreter {
         arena: &AstArena,
     ) -> Result<(FlowSignal, Option<Value>), String> {
         let val = self.evaluate(value, arena)?;
-        if let Some(tx) = self.worker_channels.get(target) {
+        if let Some(tx) = self.core.worker_channels.get(target) {
             tx.send(val).map_err(|e| format!("Send error: {}", e))?;
         }
         Ok((FlowSignal::None, None))
@@ -457,9 +461,12 @@ impl Interpreter {
         source: &str,
         _arena: &AstArena,
     ) -> Result<(FlowSignal, Option<Value>), String> {
-        if let Some(rx) = self.worker_receivers.get(source) {
+        if let Some(rx) = self.core.worker_receivers.get(source) {
             let val = rx.recv().map_err(|e| format!("Receive error: {}", e))?;
-            self.environment.lock().define(var.to_string(), val, false);
+            self.core
+                .environment
+                .lock()
+                .define(var.to_string(), val, false);
         }
         Ok((FlowSignal::None, None))
     }
@@ -517,7 +524,7 @@ impl Interpreter {
         params: &[String],
         _arena: &AstArena,
     ) -> Result<(FlowSignal, Option<Value>), String> {
-        self.environment.lock().define(
+        self.core.environment.lock().define(
             name.to_string(),
             Value::Macro {
                 name: name.to_string(),
@@ -535,9 +542,11 @@ impl Interpreter {
         target: &str,
         _arena: &AstArena,
     ) -> Result<(FlowSignal, Option<Value>), String> {
-        self.environment
-            .lock()
-            .define(name.to_string(), Value::String(target.to_string()), false);
+        self.core.environment.lock().define(
+            name.to_string(),
+            Value::String(target.to_string()),
+            false,
+        );
         Ok((FlowSignal::None, None))
     }
 
@@ -557,7 +566,8 @@ impl Interpreter {
                 Value::String(v.name.clone()),
             );
         }
-        self.environment
+        self.core
+            .environment
             .lock()
             .define(name.to_string(), Value::Dict(enum_map), false);
         Ok((FlowSignal::None, None))
@@ -573,10 +583,11 @@ impl Interpreter {
         let field_names: Vec<String> = fields.iter().map(|f| f.name.clone()).collect();
         let constructor = Value::Closure {
             params: field_names,
-            env: crate::value::EnvRef::from_arc_mutex(self.environment.clone()),
+            env: crate::value::EnvRef::from_arc_mutex(self.core.environment.clone()),
             v2_node_id: None,
         };
-        self.environment
+        self.core
+            .environment
             .lock()
             .define(name.to_string(), constructor, false);
         Ok((FlowSignal::None, None))
@@ -613,7 +624,7 @@ impl Interpreter {
             if !m.body.is_empty() {
                 let body_ids: Vec<usize> = m.body.iter().map(|id| id.0).collect();
                 let key = default_impl_method_key(name, &trait_generics, &m.name);
-                self.environment.lock().define(
+                self.core.environment.lock().define(
                     key,
                     Value::Task {
                         name: m.name.clone(),
@@ -646,7 +657,7 @@ impl Interpreter {
         for m in methods {
             let body_ids: Vec<usize> = m.body.iter().map(|id| id.0).collect();
             let key = impl_method_key(trait_name, trait_generics, for_type, for_generics, &m.name);
-            self.environment.lock().define(
+            self.core.environment.lock().define(
                 key,
                 Value::Task {
                     name: m.name.clone(),
@@ -672,7 +683,8 @@ impl Interpreter {
         // 1. 求值 given
         let given_val = self.evaluate(given, arena)?;
         // 绑定到 `given` 变量供 expect 表达式使用
-        self.environment
+        self.core
+            .environment
             .lock()
             .define("given".to_string(), given_val.clone(), false);
 
@@ -721,7 +733,7 @@ impl Interpreter {
 
         if pass_rate >= tol {
             // 通过
-            self.environment.lock().define(
+            self.core.environment.lock().define(
                 format!("eval_{}", name),
                 Value::String(format!("PASS ({}/{})", passed, total)),
                 false,
@@ -789,7 +801,8 @@ impl Interpreter {
         }
 
         // 存储 Skill Dict 到环境
-        self.environment
+        self.core
+            .environment
             .lock()
             .define(name.to_string(), Value::Dict(skill_meta), false);
 
@@ -869,7 +882,8 @@ impl Interpreter {
             text: Box::new(Value::String(content)),
             budget_bytes,
         };
-        self.environment
+        self.core
+            .environment
             .lock()
             .define(name.to_string(), section, false);
         Ok((FlowSignal::None, None))
@@ -968,7 +982,10 @@ impl Interpreter {
                 name, final_origin, ext
             ));
         }
-        self.environment.lock().define(name.to_string(), doc, false);
+        self.core
+            .environment
+            .lock()
+            .define(name.to_string(), doc, false);
         Ok((FlowSignal::None, None))
     }
 }

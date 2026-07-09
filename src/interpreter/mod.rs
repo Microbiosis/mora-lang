@@ -201,74 +201,33 @@ impl<V: Clone> LruCache<V> {
 }
 
 pub struct Interpreter {
-    globals: Arc<Mutex<Environment>>,
-    environment: Arc<Mutex<Environment>>,
-    tool_registry: Arc<HashMap<String, ToolDef>>,
-    // v0.04补: memory_store 字段已删除（RFC §4.1 memory.* 推迟到 v1.0）
-    // v0.06: 当前 with 块 set 的 AiConfig 值 (替代 env hack)
-    current_ai_config: Option<AiConfigValue>,
-    // α.2: with 块 config 保存/恢复栈（MIR 解释器用）
-    config_stack: Vec<Option<AiConfigValue>>,
-    // v0.19: Worker 并发 channels (v0.36: crossbeam-channel for Send/Sync)
-    worker_channels: HashMap<String, crossbeam_channel::Sender<Value>>,
-    worker_receivers: HashMap<String, crossbeam_channel::Receiver<Value>>,
-    /// v2 AST arena — 在 interpret 期间存储，供 call_value 执行 v2 闭包
-    /// v0.35 (P0-A5): wrapped in Arc so per-call `.clone()` is cheap
-    /// (Arc bump) instead of deep-cloning the whole arena tree.
-    v2_arena: Option<std::sync::Arc<crate::ast_v2::AstArena>>,
-    // v0.52 ADR-001: 5 个 RegistryRuntime 字段（trait_registry / impl_table /
-    // mock_registry / ccr_store / memory_store）已迁出到
-    // crate::runtime::registry::RegistryRuntime，访问走 self.registry.xxx
-    /// v0.52: RegistryRuntime facade — BC8 (trait_registry + impl_table + mock_registry +
+    /// v0.52 ADR-001: CoreRuntime — 8 个核心执行字段（globals/environment/tool_registry/
+    /// v2_arena/current_ai_config/config_stack/worker_channels/worker_receivers）
+    pub(crate) core: crate::runtime::core::CoreRuntime,
+    /// v0.52 ADR-001: RegistryRuntime facade — BC8 (trait_registry + impl_table + mock_registry +
     /// ccr_store + memory_store)
-    ///
-    /// 暂保持 `pub` — Task 7 阶段会统一改 pub(crate) + accessor
-    pub registry: crate::runtime::registry::RegistryRuntime,
-    // v0.52 ADR-001: 5 个 InfraRuntime 字段（recorder / string_interner / ai_cache /
-    // bus / scheduler）已迁出到 crate::runtime::infra::InfraRuntime，访问走 self.infra.xxx
-    /// v0.52: InfraRuntime facade — BC9 (recorder + string_interner + ai_cache + bus + scheduler)
-    ///
-    /// 暂保持 `pub` 以让 binary crate（main.rs）和其他外部 crate 可访问 —
-    /// Task 7（Interpreter 薄化阶段）会统一把 `pub` 改为 `pub(crate)` + accessor。
-    pub infra: crate::runtime::infra::InfraRuntime,
-    // v0.52 ADR-001: 8 个 AI 字段（model_routes/token_budget/token_usage/trace/
-    // draft_model_stats/context_window/speculative_verifier/cache_warmer）已迁出到
-    // crate::runtime::ai::AiRuntime，访问走 self.ai.xxx
-    /// v0.52: AiRuntime facade — BC3 (model_routes + token_budget + token_usage + trace +
+    pub(crate) registry: crate::runtime::registry::RegistryRuntime,
+    /// v0.52 ADR-001: InfraRuntime facade — BC9 (recorder + string_interner + ai_cache + bus + scheduler)
+    pub(crate) infra: crate::runtime::infra::InfraRuntime,
+    /// v0.52 ADR-001: AiRuntime facade — BC3 (model_routes + token_budget + token_usage + trace +
     /// draft_model_stats + context_window + speculative_verifier + cache_warmer)
-    ///
-    /// 暂保持 `pub` — Task 7 会统一改 pub(crate) + accessor
-    pub ai: crate::runtime::ai::AiRuntime,
-    /// v0.34: CCR (Compress-Cache-Retrieve, Headroom style) — 迁到 RegistryRuntime
-    /// v0.34: mock registry (OpenFugu + OpenInfer mock) — 迁到 RegistryRuntime
-    // v0.52 ADR-001: 3 个 SandboxRuntime 字段（sandbox / container / tool_planes）
-    // 已迁出到 crate::runtime::sandbox::SandboxRuntime，访问走 self.sandbox_facade.xxx
-    /// v0.52: SandboxRuntime facade — BC7 (sandbox + container + tool_planes)
+    pub(crate) ai: crate::runtime::ai::AiRuntime,
+    /// v0.52 ADR-001: SandboxRuntime facade — BC7 (sandbox + container + tool_planes)
     ///
     /// 注：capability 是 module-level state（`src/sandbox/capability.rs::CapabilityStore`），
     /// 不属于 Interpreter 字段 — 保留 module-level 访问。
-    ///
-    /// 暂保持 `pub` — Task 7 阶段会统一改 pub(crate) + accessor
-    pub sandbox_facade: crate::runtime::sandbox::SandboxRuntime,
-    // v0.52 ADR-001: 3 个 PersistRuntime 字段（audit_sink / markdown_memory_dir /
-    // checkpoint_saver）已迁出到 crate::runtime::persist::PersistRuntime，访问走 self.persist.xxx
-    /// v0.52: PersistRuntime facade — BC5 (audit_sink + markdown_memory_dir + checkpoint_saver)
-    ///
-    /// 暂保持 `pub` — Task 7 阶段会统一改 pub(crate) + accessor
-    pub persist: crate::runtime::persist::PersistRuntime,
-    // v0.52 ADR-001: 3 个 OrchRuntime 字段（plans / refine_registry / skill_registry）
-    // 已迁出到 crate::runtime::orch::OrchRuntime，访问走 self.orch.xxx
-    /// v0.52: OrchRuntime facade — BC4 (plans + refine_registry + skill_registry)
-    ///
-    /// 暂保持 `pub` 以让 binary crate（main.rs）和其他外部 crate 可访问 —
-    /// Task 7（Interpreter 薄化阶段）会统一把 `pub` 改为 `pub(crate)` + accessor。
-    pub orch: crate::runtime::orch::OrchRuntime,
+    pub(crate) sandbox: crate::runtime::sandbox::SandboxRuntime,
+    /// v0.52 ADR-001: PersistRuntime facade — BC5 (audit_sink + markdown_memory_dir + checkpoint_saver)
+    pub(crate) persist: crate::runtime::persist::PersistRuntime,
+    /// v0.52 ADR-001: OrchRuntime facade — BC4 (plans + refine_registry + skill_registry)
+    pub(crate) orch: crate::runtime::orch::OrchRuntime,
 }
 
 /// v0.06: with 块字段 (不经过 env 变量)
+/// v0.52 ADR-001: pub 让 CoreRuntime (runtime/core.rs) 可引用
 #[derive(Clone, Debug, Default)]
 #[allow(dead_code)]
-struct AiConfigValue {
+pub struct AiConfigValue {
     model: Option<String>,
     temperature: Option<f64>,
     max_tokens: Option<usize>,
@@ -283,39 +242,17 @@ struct AiConfigValue {
 }
 
 // v0.04: 显式实现 Clone 而非 derive
-// (HashMap/Vec 字段需要 clone; Arc/Option 内部; TraceCollector 自身 derive Clone)
+// v0.52 ADR-001: Interpreter 已薄化为 7 个 facade holder，Clone 简化
 impl Clone for Interpreter {
     fn clone(&self) -> Self {
         Self {
-            globals: self.globals.clone(),
-            environment: self.environment.clone(),
-            tool_registry: self.tool_registry.clone(),
-            // v0.04补: memory_store 字段已删除（RFC §4.1 memory.* 推迟到 v1.0）
-            current_ai_config: self.current_ai_config.clone(),
-            config_stack: Vec::new(),
-            worker_channels: HashMap::new(), // 不克隆 channel
-            worker_receivers: HashMap::new(),
-            v2_arena: None,
-            // v0.52 ADR-001: 5 个字段（recorder/string_interner/ai_cache/bus/scheduler）
-            // 迁到 InfraRuntime 内部 Clone
-            // v0.35 (P0-A1) 设计延续：recorder 重建为 new_off()（per-thread 状态）
-            infra: self.infra.clone(),
-            // v0.52 ADR-001: 8 个 AI 字段迁到 AiRuntime 内部 Clone（derive Clone 真共享）
-            // 与原 `ContextWindow::default()` reset 行为不同 — 改为真 clone（更高效、保留状态）
-            // 注：token_usage 等会共享 — 行为变化，HTTP/MCP workers 共享 AI 状态
-            ai: self.ai.clone(),
-            // v0.52 ADR-001: 3 个 OrchRuntime 字段（plans/refine_registry/skill_registry）
-            // 迁到 OrchRuntime 内部 Clone
-            orch: self.orch.clone(),
-            // v0.52 ADR-001: 3 个 PersistRuntime 字段（audit_sink/markdown_memory_dir/checkpoint_saver）
-            // 迁到 PersistRuntime 内部 Clone
-            persist: self.persist.clone(),
-            // v0.52 ADR-001: 3 个 SandboxRuntime 字段（sandbox/container/tool_planes）
-            // 迁到 SandboxRuntime 内部 Clone（ContainerHandle Drop 多次触发是 pre-existing 行为）
-            sandbox_facade: self.sandbox_facade.clone(),
-            // v0.52 ADR-001: 5 个 RegistryRuntime 字段（trait_registry/impl_table/
-            // mock_registry/ccr_store/memory_store）迁到 RegistryRuntime 内部 Clone
+            core: self.core.clone(),
             registry: self.registry.clone(),
+            infra: self.infra.clone(),
+            ai: self.ai.clone(),
+            sandbox: self.sandbox.clone(),
+            persist: self.persist.clone(),
+            orch: self.orch.clone(),
         }
     }
 }
@@ -473,86 +410,55 @@ impl Interpreter {
             g.define("mora".to_string(), Value::Builtin(Bk::Mora), false);
         }
         Self {
-            globals: globals.clone(),
-            environment: globals,
-            tool_registry: Arc::new(HashMap::new()),
-
-            current_ai_config: None,
-            config_stack: Vec::new(),
-            // v0.52 ADR-001: 5 个字段迁到 InfraRuntime 内部 Default
+            core: crate::runtime::core::CoreRuntime {
+                globals: globals.clone(),
+                environment: globals,
+                tool_registry: Arc::new(HashMap::new()),
+                ..Default::default()
+            },
+            // v0.52 ADR-001: 其余 facade 内部 Default
             infra: crate::runtime::infra::InfraRuntime::default(),
-            // v0.52 ADR-001: 8 个 AI 字段迁到 AiRuntime 内部 Default
             ai: crate::runtime::ai::AiRuntime::default(),
-            // v0.52 ADR-001: 3 个 Orch 字段迁到 OrchRuntime 内部 Default
             orch: crate::runtime::orch::OrchRuntime::default(),
-            // v0.52 ADR-001: 3 个 Persist 字段迁到 PersistRuntime 内部 Default
             persist: crate::runtime::persist::PersistRuntime::default(),
-            // v0.52 ADR-001: 3 个 Sandbox 字段迁到 SandboxRuntime 内部 Default
-            sandbox_facade: crate::runtime::sandbox::SandboxRuntime::default(),
-            // v0.52 ADR-001: 5 个 Registry 字段迁到 RegistryRuntime 内部 Default
+            sandbox: crate::runtime::sandbox::SandboxRuntime::default(),
             registry: crate::runtime::registry::RegistryRuntime::default(),
-            worker_channels: HashMap::new(),
-            worker_receivers: HashMap::new(),
-
-            v2_arena: None,
         }
     }
 
     /// v0.04: 构造一个空 Interpreter (用于 std::mem::replace 占位)
     /// 空 Interpreter 不能跑 execute, 仅作为占位符存在
     pub fn new_empty() -> Self {
-        let globals = Arc::new(Mutex::new(Environment::new()));
+        let env = Arc::new(Mutex::new(Environment::new()));
         Self {
-            globals: globals.clone(),
-            environment: globals,
-            tool_registry: Arc::new(HashMap::new()),
-
-            current_ai_config: None,
-            config_stack: Vec::new(),
-            // v0.52 ADR-001: 5 个字段迁到 InfraRuntime 内部 Default
+            core: crate::runtime::core::CoreRuntime {
+                globals: env.clone(),
+                environment: env,
+                ..Default::default()
+            },
             infra: crate::runtime::infra::InfraRuntime::default(),
-            // v0.52 ADR-001: 8 个 AI 字段迁到 AiRuntime 内部 Default
             ai: crate::runtime::ai::AiRuntime::default(),
-            // v0.52 ADR-001: 3 个 Orch 字段迁到 OrchRuntime 内部 Default
             orch: crate::runtime::orch::OrchRuntime::default(),
-            // v0.52 ADR-001: 3 个 Persist 字段迁到 PersistRuntime 内部 Default
             persist: crate::runtime::persist::PersistRuntime::default(),
-            // v0.52 ADR-001: 3 个 Sandbox 字段迁到 SandboxRuntime 内部 Default
-            sandbox_facade: crate::runtime::sandbox::SandboxRuntime::default(),
-            // v0.52 ADR-001: 5 个 Registry 字段迁到 RegistryRuntime 内部 Default
+            sandbox: crate::runtime::sandbox::SandboxRuntime::default(),
             registry: crate::runtime::registry::RegistryRuntime::default(),
-            worker_channels: HashMap::new(),
-            worker_receivers: HashMap::new(),
-
-            v2_arena: None,
         }
     }
 
     pub fn new_with_globals(globals: Arc<Mutex<Environment>>) -> Self {
         let env = Arc::new(Mutex::new(Environment::with_parent_of(globals.clone())));
         Self {
-            globals: globals.clone(),
-            environment: env,
-            tool_registry: Arc::new(HashMap::new()),
-
-            current_ai_config: None,
-            config_stack: Vec::new(),
-            // v0.52 ADR-001: 5 个字段迁到 InfraRuntime 内部 Default
+            core: crate::runtime::core::CoreRuntime {
+                globals: globals.clone(),
+                environment: env,
+                ..Default::default()
+            },
             infra: crate::runtime::infra::InfraRuntime::default(),
-            // v0.52 ADR-001: 8 个 AI 字段迁到 AiRuntime 内部 Default
             ai: crate::runtime::ai::AiRuntime::default(),
-            // v0.52 ADR-001: 3 个 Orch 字段迁到 OrchRuntime 内部 Default
             orch: crate::runtime::orch::OrchRuntime::default(),
-            // v0.52 ADR-001: 3 个 Persist 字段迁到 PersistRuntime 内部 Default
             persist: crate::runtime::persist::PersistRuntime::default(),
-            // v0.52 ADR-001: 3 个 Sandbox 字段迁到 SandboxRuntime 内部 Default
-            sandbox_facade: crate::runtime::sandbox::SandboxRuntime::default(),
-            // v0.52 ADR-001: 5 个 Registry 字段迁到 RegistryRuntime 内部 Default
+            sandbox: crate::runtime::sandbox::SandboxRuntime::default(),
             registry: crate::runtime::registry::RegistryRuntime::default(),
-            worker_channels: HashMap::new(),
-            worker_receivers: HashMap::new(),
-
-            v2_arena: None,
         }
     }
 
@@ -595,11 +501,21 @@ impl Interpreter {
 
     #[allow(dead_code)]
     pub fn get_globals(&self) -> Arc<Mutex<Environment>> {
-        self.globals.clone()
+        self.core.globals.clone()
     }
 
     pub fn get_tool_registry(&self) -> &HashMap<String, ToolDef> {
-        &self.tool_registry
+        &self.core.tool_registry
+    }
+
+    /// 访问 InfraRuntime（二进制 crate 需 accessor 而非直接字段访问）
+    pub fn infra(&self) -> &crate::runtime::infra::InfraRuntime {
+        &self.infra
+    }
+
+    /// 可变访问 InfraRuntime
+    pub fn infra_mut(&mut self) -> &mut crate::runtime::infra::InfraRuntime {
+        &mut self.infra
     }
 
     /// α.0: MIR 解释器的函数调用桥。复用 dispatch.rs 的 call_function。
@@ -643,8 +559,10 @@ impl Interpreter {
     /// 保存当前 current_ai_config，应用新 bindings。
     pub(crate) fn mir_with_config(&mut self, bindings: &[(String, Value)]) -> Result<(), String> {
         // 保存到栈（mir_restore_config 弹出）
-        self.config_stack.push(self.current_ai_config.clone());
-        let mut cfg = self.current_ai_config.clone().unwrap_or_default();
+        self.core
+            .config_stack
+            .push(self.core.current_ai_config.clone());
+        let mut cfg = self.core.current_ai_config.clone().unwrap_or_default();
         for (key, v) in bindings {
             match key.as_str() {
                 "model" => cfg.model = Some(v.to_string()),
@@ -662,13 +580,13 @@ impl Interpreter {
                 _ => {}
             }
         }
-        self.current_ai_config = Some(cfg);
+        self.core.current_ai_config = Some(cfg);
         Ok(())
     }
 
     /// α.2: 恢复 with 块之前的 AI config。
     pub(crate) fn mir_restore_config(&mut self) {
-        self.current_ai_config = self.config_stack.pop().flatten();
+        self.core.current_ai_config = self.core.config_stack.pop().flatten();
     }
 
     pub fn set_trace_enabled(&mut self, enabled: bool) {
@@ -699,7 +617,7 @@ impl Interpreter {
         arena: &crate::ast_v2::AstArena,
     ) -> Result<(), String> {
         // 存储 arena 供 call_value 执行 v2 闭包 (v0.35 wrap in Arc)
-        self.v2_arena = Some(std::sync::Arc::new(arena.clone()));
+        self.core.v2_arena = Some(std::sync::Arc::new(arena.clone()));
         // 执行所有顶层语句
         for stmt_id in stmt_ids {
             if let Some(stmt) = arena.get_stmt(*stmt_id) {
@@ -717,7 +635,7 @@ impl Interpreter {
             }
         }
         // 查找并执行 main task
-        let main_task = self.globals.lock().get("main").clone();
+        let main_task = self.core.globals.lock().get("main").clone();
         if let Some(Value::Task { params, .. }) = main_task
             && params.is_empty()
         {
@@ -2389,7 +2307,7 @@ mod mock_llm_tests {
         // mock_llm 测试需要在 with 块内调用 ai.chat
         // 由于 ai.chat 需要 cfg 参数，这里用简单的内联测试
         let mut interp = Interpreter::new();
-        interp.current_ai_config = Some(AiConfigValue {
+        interp.core.current_ai_config = Some(AiConfigValue {
             mock_responses: Some(vec![
                 "mock response 1".to_string(),
                 "mock response 2".to_string(),
@@ -2409,7 +2327,7 @@ mod mock_llm_tests {
     #[test]
     fn test_mock_llm_exhausted() {
         let mut interp = Interpreter::new();
-        interp.current_ai_config = Some(AiConfigValue {
+        interp.core.current_ai_config = Some(AiConfigValue {
             mock_responses: Some(vec!["only one".to_string()]),
             ..Default::default()
         });

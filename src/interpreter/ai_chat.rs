@@ -25,6 +25,7 @@ impl Interpreter {
         if api_key.is_empty() {
             // Mock 模式
             let cfg_info = interp
+                .core
                 .current_ai_config
                 .as_ref()
                 .map(|c| {
@@ -287,7 +288,7 @@ impl Interpreter {
         }
 
         // v0.15: mock_llm 模式 — 从队列中取出下一个响应
-        if let Some(ref mut cfg) = self.current_ai_config
+        if let Some(ref mut cfg) = self.core.current_ai_config
             && let Some(ref mut responses) = cfg.mock_responses
             && !responses.is_empty()
         {
@@ -312,7 +313,7 @@ impl Interpreter {
         }
 
         // v0.24: 投机执行 - 先用快速模型预测，再验证
-        let speculative_config = self.current_ai_config.as_ref().and_then(|cfg| {
+        let speculative_config = self.core.current_ai_config.as_ref().and_then(|cfg| {
             if cfg.speculative == Some(true) {
                 cfg.draft_model.clone()
             } else {
@@ -386,6 +387,7 @@ impl Interpreter {
 
         // v0.24: 流式投机执行 - 长响应使用流式
         let use_stream = self
+            .core
             .current_ai_config
             .as_ref()
             .and_then(|c| c.max_tokens)
@@ -454,7 +456,7 @@ impl Interpreter {
             r#"{{"model":"{}","messages":[{}]"#,
             escaped_model, msgs_json
         );
-        if let Some(ref cfg) = self.current_ai_config {
+        if let Some(ref cfg) = self.core.current_ai_config {
             if let Some(temp) = cfg.temperature {
                 body.push_str(&format!(",\"temperature\":{}", temp));
             }
@@ -471,6 +473,7 @@ impl Interpreter {
 
         // v0.22: 流式响应优化 - 添加 stream 参数
         let use_stream = self
+            .core
             .current_ai_config
             .as_ref()
             .and_then(|c| c.max_tokens)
@@ -596,7 +599,7 @@ impl Interpreter {
                 escaped_model, msgs_json, tools_json
             );
             // v0.15: 拼 temperature/max_tokens/system 从 current_ai_config（与 real_ai_chat_inner 对齐）
-            if let Some(ref cfg) = self.current_ai_config {
+            if let Some(ref cfg) = self.core.current_ai_config {
                 if let Some(temp) = cfg.temperature {
                     body.push_str(&format!(",\"temperature\":{}", temp));
                 }
@@ -769,7 +772,7 @@ suggestion: <improvement suggestion or "none">"#,
         // 收集 Agent 需要的工具
         let agent_tools: Vec<ToolDef> = tool_names
             .iter()
-            .filter_map(|n| self.tool_registry.get(n).cloned())
+            .filter_map(|n| self.core.tool_registry.get(n).cloned())
             .collect();
         let tool_refs: Vec<&ToolDef> = agent_tools.iter().collect();
 
@@ -784,7 +787,7 @@ suggestion: <improvement suggestion or "none">"#,
             };
             // v0.15: 将 route 的 ai 配置设入 current_ai_config
             if r.max_tokens.is_some() || r.system.is_some() || r.temperature.is_some() {
-                self.current_ai_config = Some(AiConfigValue {
+                self.core.current_ai_config = Some(AiConfigValue {
                     model: Some(r.model.clone()),
                     temperature: r.temperature,
                     max_tokens: r.max_tokens,

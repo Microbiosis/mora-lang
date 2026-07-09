@@ -236,19 +236,19 @@ pub struct Interpreter {
     ///
     /// 暂保持 `pub` — Task 7 会统一改 pub(crate) + accessor
     pub ai: crate::runtime::ai::AiRuntime,
-    /// v0.34: 沙箱策略 (来自 src/sandbox/, MimiClaw path validation)
-    sandbox: crate::sandbox::SandboxPolicy,
     /// v0.34: CCR (Compress-Cache-Retrieve, Headroom style)
     ccr_store: crate::ccr::InMemoryCcrStore,
     /// v0.34: mock registry (OpenFugu + OpenInfer mock)
     mock_registry: crate::mock::MockRegistry,
-    /// v0.44.0: Container handle (REAL Docker spawn via `docker run`)
-    /// None = no container (run on host). Set via sandbox.containerize builtin.
-    /// Arc<Mutex<>> keeps call_sandbox_method `&self` (Clone-safe).
-    pub container: std::sync::Arc<Mutex<Option<crate::sandbox::ContainerHandle>>>,
-    /// v0.45.0: ToolPlane registry (multi-plane Core/Extension adapter)
-    /// Default has 2 core planes: "ai" + "sandbox"
-    pub tool_planes: std::sync::Arc<Mutex<crate::toolplane::ToolPlaneRegistry>>,
+    // v0.52 ADR-001: 3 个 SandboxRuntime 字段（sandbox / container / tool_planes）
+    // 已迁出到 crate::runtime::sandbox::SandboxRuntime，访问走 self.sandbox_facade.xxx
+    /// v0.52: SandboxRuntime facade — BC7 (sandbox + container + tool_planes)
+    ///
+    /// 注：capability 是 module-level state（`src/sandbox/capability.rs::CapabilityStore`），
+    /// 不属于 Interpreter 字段 — 保留 module-level 访问。
+    ///
+    /// 暂保持 `pub` — Task 7 阶段会统一改 pub(crate) + accessor
+    pub sandbox_facade: crate::runtime::sandbox::SandboxRuntime,
     // v0.52 ADR-001: 3 个 PersistRuntime 字段（audit_sink / markdown_memory_dir /
     // checkpoint_saver）已迁出到 crate::runtime::persist::PersistRuntime，访问走 self.persist.xxx
     /// v0.52: PersistRuntime facade — BC5 (audit_sink + markdown_memory_dir + checkpoint_saver)
@@ -312,11 +312,11 @@ impl Clone for Interpreter {
             // v0.52 ADR-001: 3 个 PersistRuntime 字段（audit_sink/markdown_memory_dir/checkpoint_saver）
             // 迁到 PersistRuntime 内部 Clone
             persist: self.persist.clone(),
-            sandbox: self.sandbox.clone(),
+            // v0.52 ADR-001: 3 个 SandboxRuntime 字段（sandbox/container/tool_planes）
+            // 迁到 SandboxRuntime 内部 Clone（ContainerHandle Drop 多次触发是 pre-existing 行为）
+            sandbox_facade: self.sandbox_facade.clone(),
             ccr_store: self.ccr_store.clone(),
             mock_registry: self.mock_registry.clone(),
-            container: self.container.clone(),
-            tool_planes: self.tool_planes.clone(),
         }
     }
 }
@@ -490,16 +490,15 @@ impl Interpreter {
             orch: crate::runtime::orch::OrchRuntime::default(),
             // v0.52 ADR-001: 3 个 Persist 字段迁到 PersistRuntime 内部 Default
             persist: crate::runtime::persist::PersistRuntime::default(),
+            // v0.52 ADR-001: 3 个 Sandbox 字段迁到 SandboxRuntime 内部 Default
+            sandbox_facade: crate::runtime::sandbox::SandboxRuntime::default(),
             worker_channels: HashMap::new(),
             worker_receivers: HashMap::new(),
 
             v2_arena: None,
             memory_store: HashMap::new(),
-            sandbox: crate::sandbox::SandboxPolicy::permissive(),
             ccr_store: crate::ccr::InMemoryCcrStore::new(),
             mock_registry: crate::mock::MockRegistry::new(),
-            container: std::sync::Arc::new(Mutex::new(None)),
-            tool_planes: std::sync::Arc::new(Mutex::new(crate::toolplane::default_registry())),
         }
     }
 
@@ -524,16 +523,15 @@ impl Interpreter {
             orch: crate::runtime::orch::OrchRuntime::default(),
             // v0.52 ADR-001: 3 个 Persist 字段迁到 PersistRuntime 内部 Default
             persist: crate::runtime::persist::PersistRuntime::default(),
+            // v0.52 ADR-001: 3 个 Sandbox 字段迁到 SandboxRuntime 内部 Default
+            sandbox_facade: crate::runtime::sandbox::SandboxRuntime::default(),
             worker_channels: HashMap::new(),
             worker_receivers: HashMap::new(),
 
             v2_arena: None,
             memory_store: HashMap::new(),
-            sandbox: crate::sandbox::SandboxPolicy::permissive(),
             ccr_store: crate::ccr::InMemoryCcrStore::new(),
             mock_registry: crate::mock::MockRegistry::new(),
-            container: std::sync::Arc::new(Mutex::new(None)),
-            tool_planes: std::sync::Arc::new(Mutex::new(crate::toolplane::default_registry())),
         }
     }
 
@@ -556,16 +554,15 @@ impl Interpreter {
             orch: crate::runtime::orch::OrchRuntime::default(),
             // v0.52 ADR-001: 3 个 Persist 字段迁到 PersistRuntime 内部 Default
             persist: crate::runtime::persist::PersistRuntime::default(),
+            // v0.52 ADR-001: 3 个 Sandbox 字段迁到 SandboxRuntime 内部 Default
+            sandbox_facade: crate::runtime::sandbox::SandboxRuntime::default(),
             worker_channels: HashMap::new(),
             worker_receivers: HashMap::new(),
 
             v2_arena: None,
             memory_store: HashMap::new(),
-            sandbox: crate::sandbox::SandboxPolicy::permissive(),
             ccr_store: crate::ccr::InMemoryCcrStore::new(),
             mock_registry: crate::mock::MockRegistry::new(),
-            container: std::sync::Arc::new(Mutex::new(None)),
-            tool_planes: std::sync::Arc::new(Mutex::new(crate::toolplane::default_registry())),
         }
     }
 

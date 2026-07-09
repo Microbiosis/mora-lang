@@ -23,7 +23,8 @@ impl Interpreter {
         };
         // v0.36: enforce sandbox on every path-bearing file op.
         let check_path = |path: &str| -> Result<(), String> {
-            self.sandbox
+            self.sandbox_facade
+                .sandbox
                 .check_path(path)
                 .map_err(|e| format!("file.{}: sandbox denied '{}': {}", method, path, e))?;
             Ok(())
@@ -330,7 +331,7 @@ impl Interpreter {
     pub fn call_sandbox_method(&self, method: &str, args: &[Value]) -> Result<Value, String> {
         match method {
             "mode" => {
-                let policy = &self.sandbox;
+                let policy = &self.sandbox_facade.sandbox;
                 let mode = if policy.allow.iter().any(|p| p == "*") && policy.deny.is_empty() {
                     "permissive"
                 } else if policy.allow.is_empty() {
@@ -353,7 +354,9 @@ impl Interpreter {
                         );
                     }
                 };
-                Ok(Value::Bool(self.sandbox.check_builtin(&name).is_ok()))
+                Ok(Value::Bool(
+                    self.sandbox_facade.sandbox.check_builtin(&name).is_ok(),
+                ))
             }
             "check_path" => {
                 // v0.37: path must be Value::String.
@@ -366,7 +369,9 @@ impl Interpreter {
                         return Err("sandbox.check_path: requires path as first arg".to_string());
                     }
                 };
-                Ok(Value::Bool(self.sandbox.check_path(&path).is_ok()))
+                Ok(Value::Bool(
+                    self.sandbox_facade.sandbox.check_path(&path).is_ok(),
+                ))
             }
             // v0.42.0: sandbox.key { file.read, web.fetch } — issue capability token
             // Returns: token handle as Value::Number(token_id)
@@ -394,6 +399,7 @@ impl Interpreter {
                 // v0.42.0: 无 TTL (None = 永不过期); 后续可加 sandbox.key_ttl { ... }
                 let ttl: Option<Duration> = None;
                 let token_id = self
+                    .sandbox_facade
                     .sandbox
                     .capabilities
                     .issue(allowed, ttl)
@@ -426,7 +432,11 @@ impl Interpreter {
                     format!("sandbox.check_call: unknown capability '{}'", cap_str)
                 })?;
                 Ok(Value::Bool(
-                    self.sandbox.capabilities.check(token_id, cap).is_ok(),
+                    self.sandbox_facade
+                        .sandbox
+                        .capabilities
+                        .check(token_id, cap)
+                        .is_ok(),
                 ))
             }
             // v0.42.0: sandbox.revoke(token_id) — revoke capability token (bump generation)
@@ -444,14 +454,17 @@ impl Interpreter {
                         return Err("sandbox.revoke: token_id must be a number".to_string());
                     }
                 };
-                self.sandbox
+                self.sandbox_facade
+                    .sandbox
                     .capabilities
                     .revoke(token_id)
                     .map_err(|e| format!("sandbox.revoke: {}", e))?;
                 Ok(Value::Bool(true))
             }
             // v0.42.0: sandbox.token_count() — diagnostic
-            "token_count" => Ok(Value::Number(self.sandbox.capabilities.token_count() as f64)),
+            "token_count" => Ok(Value::Number(
+                self.sandbox_facade.sandbox.capabilities.token_count() as f64,
+            )),
             // v0.42.1: sandbox.audit_emit(actor, action, target?, payload?) — write audit event
             "audit_emit" => {
                 if args.len() < 2 || args.len() > 4 {
@@ -606,13 +619,21 @@ impl Interpreter {
                     h
                 };
 
-                *self.container.lock() = Some(handle);
+                *self
+                    .sandbox_facade
+                    .container
+                    .lock()
+                    .expect("container poisoned") = Some(handle);
                 Ok(Value::Number(id_hash as f64))
             }
             // v0.44.0: sandbox.container_exec(cmd, args...) — run cmd INSIDE container via docker exec
             // Returns: Dict{exit_code, stdout, stderr, elapsed_ms}
             "container_exec" => {
-                let guard = self.container.lock();
+                let guard = self
+                    .sandbox_facade
+                    .container
+                    .lock()
+                    .expect("container poisoned");
                 let handle = guard
                     .as_ref()
                     .ok_or_else(|| {
@@ -655,7 +676,11 @@ impl Interpreter {
             }
             // v0.44.0: sandbox.container_info() — diagnostic, returns Dict (container_id, name, backend, mounts)
             "container_info" => {
-                let guard = self.container.lock();
+                let guard = self
+                    .sandbox_facade
+                    .container
+                    .lock()
+                    .expect("container poisoned");
                 match guard.as_ref() {
                     Some(handle) => {
                         let mut d = std::collections::HashMap::new();
@@ -700,7 +725,11 @@ impl Interpreter {
             }
             // v0.44.0: sandbox.container_clear() — REAL docker rm -f, then clear handle
             "container_clear" => {
-                let mut guard = self.container.lock();
+                let mut guard = self
+                    .sandbox_facade
+                    .container
+                    .lock()
+                    .expect("container poisoned");
                 if let Some(handle) = guard.as_ref() {
                     handle
                         .destroy()
@@ -1314,7 +1343,11 @@ impl Interpreter {
     /// - `tool.plane.find(plane_name, tool_name)` — Dict with description/parameters
     /// - `tool.plane.remove(plane_name)` — remove plane
     pub fn call_toolplane_method(&self, method: &str, args: &[Value]) -> Result<Value, String> {
-        let mut reg = self.tool_planes.lock();
+        let mut reg = self
+            .sandbox_facade
+            .tool_planes
+            .lock()
+            .expect("tool_planes poisoned");
 
         match method {
             "create" => {
@@ -2408,7 +2441,7 @@ mod tests_v042_capability {
             Value::Number(n) => assert_eq!(n, 0.0, "first token_id should be 0"),
             other => panic!("expected Value::Number, got {:?}", other),
         }
-        assert_eq!(interp.sandbox.capabilities.token_count(), 1);
+        assert_eq!(interp.sandbox_facade.sandbox.capabilities.token_count(), 1);
     }
 
     #[test]
@@ -2437,7 +2470,7 @@ mod tests_v042_capability {
             .call_sandbox_method("key", &args)
             .expect_err("sandbox.key with unknown cap should error");
         assert!(err.contains("unknown capability"), "got: {}", err);
-        assert_eq!(interp.sandbox.capabilities.token_count(), 0);
+        assert_eq!(interp.sandbox_facade.sandbox.capabilities.token_count(), 0);
     }
 
     #[test]
@@ -2531,9 +2564,23 @@ mod tests_v042_capability {
         assert_eq!(revoked, Value::Bool(true));
 
         // v0.49.0: generation 在 store 全局 bump (不放在 token 上)
-        assert_eq!(interp.sandbox.capabilities.current_generation(), 1);
+        assert_eq!(
+            interp
+                .sandbox_facade
+                .sandbox
+                .capabilities
+                .current_generation(),
+            1
+        );
         // token 仍存在 (loongclaw-style: 不删除)
-        assert!(interp.sandbox.capabilities.get(token_id_num).is_some());
+        assert!(
+            interp
+                .sandbox_facade
+                .sandbox
+                .capabilities
+                .get(token_id_num)
+                .is_some()
+        );
 
         // v0.49.0: revoked token 在 check_call 时返回 false (TokenNotFound,
         // 因为 token.generation != current_generation)
@@ -2553,7 +2600,7 @@ mod tests_v042_capability {
     #[test]
     fn sandbox_token_count_tracks_unique_tokens() {
         let mut interp = Interpreter::new();
-        assert_eq!(interp.sandbox.capabilities.token_count(), 0);
+        assert_eq!(interp.sandbox_facade.sandbox.capabilities.token_count(), 0);
 
         let _ = interp
             .call_sandbox_method("key", &[Value::String("file.read".to_string())])
@@ -2570,7 +2617,7 @@ mod tests_v042_capability {
                 ],
             )
             .unwrap();
-        assert_eq!(interp.sandbox.capabilities.token_count(), 3);
+        assert_eq!(interp.sandbox_facade.sandbox.capabilities.token_count(), 3);
     }
 
     #[test]
@@ -3351,9 +3398,23 @@ mod tests_v044_container_real {
             Value::Number(n) => assert!(n > 0.0, "container_id hash should be non-zero"),
             other => panic!("expected Number, got: {:?}", other),
         }
-        assert!(interp.container.lock().is_some());
+        assert!(
+            interp
+                .sandbox_facade
+                .container
+                .lock()
+                .expect("container poisoned")
+                .is_some()
+        );
         cleanup_container(&mut interp);
-        assert!(interp.container.lock().is_none());
+        assert!(
+            interp
+                .sandbox_facade
+                .container
+                .lock()
+                .expect("container poisoned")
+                .is_none()
+        );
     }
 
     #[test]
@@ -3444,7 +3505,11 @@ mod tests_v044_container_real {
             .call_sandbox_method("containerize", &[Value::String("docker".to_string())])
             .unwrap();
         let id = {
-            let guard = interp.container.lock();
+            let guard = interp
+                .sandbox_facade
+                .container
+                .lock()
+                .expect("container poisoned");
             guard.as_ref().unwrap().container_id.clone()
         };
         // 验证 container 真的在 docker 里

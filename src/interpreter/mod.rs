@@ -242,11 +242,6 @@ pub struct Interpreter {
     ccr_store: crate::ccr::InMemoryCcrStore,
     /// v0.34: mock registry (OpenFugu + OpenInfer mock)
     mock_registry: crate::mock::MockRegistry,
-    /// v0.42.1: Audit sink (default NullSink; switch to JsonlAuditSink for hash-chained audit log)
-    pub audit_sink: std::sync::Arc<dyn crate::audit::AuditSink>,
-    /// v0.43.1: Markdown memory root dir (test isolation + custom path support)
-    /// If None, falls back to $MORA_MEMORY_DIR or $HOME/.mora/memory
-    pub markdown_memory_dir: Option<std::path::PathBuf>,
     /// v0.44.0: Container handle (REAL Docker spawn via `docker run`)
     /// None = no container (run on host). Set via sandbox.containerize builtin.
     /// Arc<Mutex<>> keeps call_sandbox_method `&self` (Clone-safe).
@@ -254,8 +249,12 @@ pub struct Interpreter {
     /// v0.45.0: ToolPlane registry (multi-plane Core/Extension adapter)
     /// Default has 2 core planes: "ai" + "sandbox"
     pub tool_planes: std::sync::Arc<Mutex<crate::toolplane::ToolPlaneRegistry>>,
-    /// v0.50: Pregel 检查点保存器（由 Worker 2/3 完善 checkpoint 模块后注入）
-    pub checkpoint_saver: Option<std::sync::Arc<dyn crate::checkpoint::CheckpointSaver>>,
+    // v0.52 ADR-001: 3 个 PersistRuntime 字段（audit_sink / markdown_memory_dir /
+    // checkpoint_saver）已迁出到 crate::runtime::persist::PersistRuntime，访问走 self.persist.xxx
+    /// v0.52: PersistRuntime facade — BC5 (audit_sink + markdown_memory_dir + checkpoint_saver)
+    ///
+    /// 暂保持 `pub` — Task 7 阶段会统一改 pub(crate) + accessor
+    pub persist: crate::runtime::persist::PersistRuntime,
     // v0.52 ADR-001: 3 个 OrchRuntime 字段（plans / refine_registry / skill_registry）
     // 已迁出到 crate::runtime::orch::OrchRuntime，访问走 self.orch.xxx
     /// v0.52: OrchRuntime facade — BC4 (plans + refine_registry + skill_registry)
@@ -310,14 +309,14 @@ impl Clone for Interpreter {
             // v0.52 ADR-001: 3 个 OrchRuntime 字段（plans/refine_registry/skill_registry）
             // 迁到 OrchRuntime 内部 Clone
             orch: self.orch.clone(),
+            // v0.52 ADR-001: 3 个 PersistRuntime 字段（audit_sink/markdown_memory_dir/checkpoint_saver）
+            // 迁到 PersistRuntime 内部 Clone
+            persist: self.persist.clone(),
             sandbox: self.sandbox.clone(),
             ccr_store: self.ccr_store.clone(),
             mock_registry: self.mock_registry.clone(),
-            audit_sink: self.audit_sink.clone(),
-            markdown_memory_dir: self.markdown_memory_dir.clone(),
             container: self.container.clone(),
             tool_planes: self.tool_planes.clone(),
-            checkpoint_saver: self.checkpoint_saver.clone(),
         }
     }
 }
@@ -489,6 +488,8 @@ impl Interpreter {
             ai: crate::runtime::ai::AiRuntime::default(),
             // v0.52 ADR-001: 3 个 Orch 字段迁到 OrchRuntime 内部 Default
             orch: crate::runtime::orch::OrchRuntime::default(),
+            // v0.52 ADR-001: 3 个 Persist 字段迁到 PersistRuntime 内部 Default
+            persist: crate::runtime::persist::PersistRuntime::default(),
             worker_channels: HashMap::new(),
             worker_receivers: HashMap::new(),
 
@@ -497,11 +498,8 @@ impl Interpreter {
             sandbox: crate::sandbox::SandboxPolicy::permissive(),
             ccr_store: crate::ccr::InMemoryCcrStore::new(),
             mock_registry: crate::mock::MockRegistry::new(),
-            audit_sink: std::sync::Arc::new(crate::audit::NullSink::new()),
-            markdown_memory_dir: None,
             container: std::sync::Arc::new(Mutex::new(None)),
             tool_planes: std::sync::Arc::new(Mutex::new(crate::toolplane::default_registry())),
-            checkpoint_saver: None,
         }
     }
 
@@ -524,6 +522,8 @@ impl Interpreter {
             ai: crate::runtime::ai::AiRuntime::default(),
             // v0.52 ADR-001: 3 个 Orch 字段迁到 OrchRuntime 内部 Default
             orch: crate::runtime::orch::OrchRuntime::default(),
+            // v0.52 ADR-001: 3 个 Persist 字段迁到 PersistRuntime 内部 Default
+            persist: crate::runtime::persist::PersistRuntime::default(),
             worker_channels: HashMap::new(),
             worker_receivers: HashMap::new(),
 
@@ -532,11 +532,8 @@ impl Interpreter {
             sandbox: crate::sandbox::SandboxPolicy::permissive(),
             ccr_store: crate::ccr::InMemoryCcrStore::new(),
             mock_registry: crate::mock::MockRegistry::new(),
-            audit_sink: std::sync::Arc::new(crate::audit::NullSink::new()),
-            markdown_memory_dir: None,
             container: std::sync::Arc::new(Mutex::new(None)),
             tool_planes: std::sync::Arc::new(Mutex::new(crate::toolplane::default_registry())),
-            checkpoint_saver: None,
         }
     }
 
@@ -557,6 +554,8 @@ impl Interpreter {
             ai: crate::runtime::ai::AiRuntime::default(),
             // v0.52 ADR-001: 3 个 Orch 字段迁到 OrchRuntime 内部 Default
             orch: crate::runtime::orch::OrchRuntime::default(),
+            // v0.52 ADR-001: 3 个 Persist 字段迁到 PersistRuntime 内部 Default
+            persist: crate::runtime::persist::PersistRuntime::default(),
             worker_channels: HashMap::new(),
             worker_receivers: HashMap::new(),
 
@@ -565,18 +564,15 @@ impl Interpreter {
             sandbox: crate::sandbox::SandboxPolicy::permissive(),
             ccr_store: crate::ccr::InMemoryCcrStore::new(),
             mock_registry: crate::mock::MockRegistry::new(),
-            audit_sink: std::sync::Arc::new(crate::audit::NullSink::new()),
-            markdown_memory_dir: None,
             container: std::sync::Arc::new(Mutex::new(None)),
             tool_planes: std::sync::Arc::new(Mutex::new(crate::toolplane::default_registry())),
-            checkpoint_saver: None,
         }
     }
 
     /// v0.51: 回溯到指定检查点之前的步骤（rewind）
     /// checkpoint id 格式: `cp-{thread_id}-{step}`
     pub fn rewind(&mut self, thread_id: &str, before_step: usize) -> Result<(), String> {
-        if let Some(ref saver) = self.checkpoint_saver {
+        if let Some(ref saver) = self.persist.checkpoint_saver {
             let checkpoints = saver.list(thread_id)?;
             // 解析 `cp-{thread_id}-{step}` 提取 step
             let thread_prefix = format!("cp-{}-", thread_id);
@@ -600,7 +596,7 @@ impl Interpreter {
 
     /// v0.50: 从最新检查点恢复执行（resume）
     pub fn resume(&mut self, thread_id: &str) -> Result<HashMap<String, Value>, String> {
-        if let Some(ref saver) = self.checkpoint_saver {
+        if let Some(ref saver) = self.persist.checkpoint_saver {
             let cp = saver
                 .load(thread_id, None)?
                 .ok_or_else(|| format!("No checkpoint found for thread {}", thread_id))?;

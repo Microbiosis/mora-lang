@@ -1325,7 +1325,7 @@ mod tests {
         use crate::interpreter::Interpreter;
         let mut interp = Interpreter::new();
         let saver = std::sync::Arc::new(crate::checkpoint::MemorySaver::new());
-        interp.checkpoint_saver = Some(saver.clone());
+        interp.persist.checkpoint_saver = Some(saver.clone());
 
         for step in 0..3 {
             let cp = crate::checkpoint::Checkpoint {

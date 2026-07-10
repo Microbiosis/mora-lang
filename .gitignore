@@ -10,6 +10,7 @@ docs/
 # AI assistant internal files
 CLAUDE.md
 AGENTS.md
+AGENTS_CODE_MODIFICATION.md
 
 # 临时调研产物 (跨会话遗留)
 /openinfer_source_analysis.md

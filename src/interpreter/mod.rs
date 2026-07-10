@@ -566,15 +566,29 @@ impl Interpreter {
         for (key, v) in bindings {
             match key.as_str() {
                 "model" => cfg.model = Some(v.to_string()),
-                "temperature" => {
-                    if let Value::Number(n) = v {
+                "temperature" => match v {
+                    // 守卫表达式会把绑定的字段转为 &f64（缺省模式），
+                    // 必须用 `*n` 解引用以匹配 Owned f64 类型。
+                    Value::Number(n) if n.is_finite() => {
                         cfg.temperature = Some(*n);
                     }
-                }
-                "max_tokens" => {
-                    if let Value::Number(n) = v {
-                        cfg.max_tokens = Some(*n as usize);
+                    Value::Float(n) if n.is_finite() => {
+                        cfg.temperature = Some(*n);
                     }
+                    Value::Int(i) => {
+                        cfg.temperature = Some(*i as f64);
+                    }
+                    // 拒绝非数值（与 execute.rs 中 with 块的 temperature 处理路径同语义）。
+                    other => {
+                        return Err(format!(
+                            "with_config.temperature: expected finite number, got {:?}",
+                            other
+                        ));
+                    }
+                },
+                // 取负数/NaN 必须报错，不能静默换为 usize::MAX。
+                "max_tokens" => {
+                    cfg.max_tokens = Some(crate::flow::usize_from_value(v, "max_tokens")?);
                 }
                 "system" => cfg.system = Some(v.to_string()),
                 _ => {}
@@ -799,9 +813,10 @@ fn extract_embeddings(json_text: &str, expected_count: usize) -> Result<Value, S
         .into_iter()
         .map(|item| {
             if let Value::Dict(m) = item {
+                // LLM API 偶发返回负 index / NaN；fallback 为 0，与缺字段语义一致。
                 let index = match m.get("index") {
-                    Some(Value::Number(n)) => *n as usize,
-                    _ => 0,
+                    Some(v) => crate::flow::usize_from_value(v, "ai.embed index").unwrap_or(0),
+                    None => 0,
                 };
                 let vec = match m.get("embedding") {
                     Some(Value::List(vs)) => vs
@@ -3298,5 +3313,24 @@ mod bus_tests {
             print(meta["origin"])
         "#;
         run(src).expect("v0.27 document.parse must still work");
+    }
+
+    // ===== 索引防御回归 =====
+
+    /// 列表索引负数必须返回 Err（防止 `*n as usize` 静默换为极大值）。
+    #[test]
+    fn index_negative_number_errors() {
+        let src = r#"
+task main()
+  let xs = [1, 2, 3]
+  let _ = xs[-1]
+end
+"#;
+        let result = run(src);
+        assert!(
+            result.is_err(),
+            "negative index should error, got: {:?}",
+            result
+        );
     }
 }

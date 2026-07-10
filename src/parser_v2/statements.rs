@@ -143,10 +143,15 @@ impl ParserV2 {
         }
         self.consume(&TokenType::End, "Expected 'end'");
 
+        // v0.55: 当前 else 关键字未在 lexer 内 — 此处暂不扩展 `if-else`。
+        // 需要时: 在 `src/lexer.rs` 加 `TokenType::Else` + 关键字映射("else"=>Else),
+        // 再在本路径添加 else 分支。这是 跨 lexer + parser 的特性,留作未来 feature-PR。
+        let else_branch = vec![];
+
         let kind = StmtKind::If {
             condition,
             then_branch,
-            else_branch: vec![],
+            else_branch,
         };
         self.arena.alloc_stmt(kind, span)
     }
@@ -272,10 +277,12 @@ impl ParserV2 {
             if self.check(&TokenType::End) {
                 break;
             }
-            // 简化：只支持变量模式
-            let pattern = self.consume_identifier("Expected pattern");
+            // v0.55 root-cause: 之前用 `consume_identifier` 直接吞第一 token 当模式,
+            // 无法表达 `_` 通配符 / 字面模式 / 列表模式。改走表达式层的
+            // `pattern()` 共享同一套模式语法,与 expression-level match 一致。
+            let pattern = self.pattern();
             let arm_expr = self.expression();
-            arms.push((Pattern::Variable(pattern), vec![arm_expr]));
+            arms.push((pattern, vec![arm_expr]));
         }
         self.consume(&TokenType::End, "Expected 'end'");
 
@@ -842,7 +849,19 @@ impl ParserV2 {
                         ..
                     }) = self.peek().cloned()
                     {
-                        max_rounds = n as usize;
+                        // 拒绝负数 / NaN / Inf / 越界 —— 这些值经 `n as usize` 会静默
+                        // 换为 usize::MAX 或 0（平台相关）。违反时按 parser 风格
+                        // 打印诊断 + 降级，继续 parse。
+                        if !n.is_finite() || n < 0.0 || n > usize::MAX as f64 {
+                            eprintln!(
+                                "Parse error: orchestrate.loop max_rounds must be a non-negative finite number in [0, {}], got {}",
+                                usize::MAX,
+                                n
+                            );
+                            max_rounds = 0;
+                        } else {
+                            max_rounds = n as usize;
+                        }
                         self.advance();
                     }
                 }
@@ -1859,5 +1878,289 @@ impl ParserV2 {
         self.consume(&TokenType::End, "Expected 'end' to close document section");
         self.arena
             .alloc_stmt(StmtKind::DocumentSection { name, body }, span)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! 语句解析器白盒测试。
+    //!
+    //! 覆盖顶层 entry `parse()` 路径:
+    //! - let / task / if / for / return / assign / match / import / expression
+    use super::*;
+    use crate::ast_v2::StmtKind;
+    use crate::lexer::Lexer;
+
+    /// 解析整个程序,返回首个 stmt 的 StmtKind。
+    fn first_stmt(src: &str) -> StmtKind {
+        let tokens = Lexer::new(src).scan_tokens();
+        let mut parser = ParserV2::new(tokens);
+        let stmts = parser.parse();
+        let arena = parser.into_arena();
+        // find first non-EOF statement
+        for id in stmts {
+            if let Some(s) = arena.get_stmt(id) {
+                return s.kind.clone();
+            }
+        }
+        panic!("no statement produced from: {src}");
+    }
+
+    #[test]
+    fn parses_let_with_int_literal() {
+        let kind = first_stmt("let x = 42");
+        let StmtKind::Let { name, .. } = &kind else {
+            panic!("expected Let, got: {:?}", kind);
+        };
+        assert_eq!(name, "x");
+    }
+
+    #[test]
+    fn parses_let_with_type_hint() {
+        let kind = first_stmt("let x: number = 7");
+        let StmtKind::Let {
+            name, type_hint, ..
+        } = &kind
+        else {
+            panic!("expected Let, got: {:?}", kind);
+        };
+        assert_eq!(name, "x");
+        assert_eq!(type_hint.as_deref(), Some("number"));
+    }
+
+    #[test]
+    fn parses_export_let() {
+        let kind = first_stmt("export let x = 1");
+        let StmtKind::Let { exported, .. } = &kind else {
+            panic!("expected Let, got: {:?}", kind);
+        };
+        assert!(exported);
+    }
+
+    #[test]
+    fn parses_task_with_no_params() {
+        let kind = first_stmt("task foo() 1 end");
+        let StmtKind::TaskDef { name, params, .. } = &kind else {
+            panic!("expected TaskDef, got: {:?}", kind);
+        };
+        assert_eq!(name, "foo");
+        assert!(params.is_empty());
+    }
+
+    #[test]
+    fn parses_task_with_two_params() {
+        // 注意:`add` 是关键字(TokenType::Add / `@add` 语义),不能用作任务名。
+        // 改用 `combine`。
+        let kind = first_stmt("task combine(a, b)\n  1\nend");
+        let StmtKind::TaskDef { name, params, .. } = &kind else {
+            panic!("expected TaskDef, got: {:?}", kind);
+        };
+        assert_eq!(name, "combine");
+        assert_eq!(params.len(), 2);
+    }
+
+    #[test]
+    fn parses_task_with_return_type() {
+        let kind = first_stmt("task identity(x): number x end");
+        let StmtKind::TaskDef { return_type, .. } = &kind else {
+            panic!("expected TaskDef, got: {:?}", kind);
+        };
+        assert_eq!(return_type.as_deref(), Some("number"));
+    }
+
+    /// v0.55 (Bug C): `else` 关键字未在 lexer 内,parser 层无法扩展
+    /// `if-else` 分支。测试锁定当前现状(`else` 作为 identifier):
+    /// - lexer 把 `else` 当 identifier
+    /// - parser 把 `if x then 1 end` 解析为 If(then_branch=[1], else_branch=[])
+    /// - `if x then 1 else 2 end` 当前无法产生干净的双分支 If,因为 `else`
+    ///   是 identifier,parser 会吞 `else 2 end` 作为 then_branch 内的语句。
+    ///
+    /// 修复路径(留作未来 PR): 在 `src/lexer.rs` 加 `TokenType::Else` 与
+    /// `"else"` 关键字映射,然后在 `if_statement` 内添加 `else` 吞入 + 递归解析。
+    #[test]
+    fn if_else_branch_is_unimplemented_feature_in_lexer() {
+        // 1. 文档化 lexer 现状: `else` 是 identifier,不是关键字
+        let tokens = crate::lexer::Lexer::new("else").scan_tokens();
+        assert_eq!(
+            tokens[0].token_type,
+            crate::lexer::TokenType::Identifier("else".to_string())
+        );
+        // 2. 文档化 parser 现状: `if x then 1 end` 解析为 then-only
+        let kind = first_stmt("if x then 1 end");
+        if let StmtKind::If {
+            then_branch,
+            else_branch,
+            ..
+        } = &kind
+        {
+            assert_eq!(then_branch.len(), 1);
+            assert!(else_branch.is_empty());
+        } else {
+            panic!("expected If, got: {:?}", kind);
+        }
+    }
+
+    #[test]
+    fn parses_for_over_list() {
+        let kind = first_stmt("for x in xs 1 end");
+        let StmtKind::For { var, iterable, .. } = &kind else {
+            panic!("expected For, got: {:?}", kind);
+        };
+        assert_eq!(var, "x");
+        // iterable is NodeId; we don't easily check its kind here
+        let _ = iterable;
+    }
+
+    #[test]
+    fn parses_return_statement_with_value() {
+        let kind = first_stmt("return 42");
+        let StmtKind::Return { value } = &kind else {
+            panic!("expected Return, got: {:?}", kind);
+        };
+        assert!(value.is_some());
+    }
+
+    #[test]
+    fn parses_return_statement_without_value() {
+        // `return` 后必须紧跟 newline/EOF 才识别为 None —— 否则会被吞进 expression
+        let kind = first_stmt("return\n");
+        let StmtKind::Return { value } = &kind else {
+            panic!("expected Return, got: {:?}", kind);
+        };
+        assert!(value.is_none());
+    }
+
+    #[test]
+    fn parses_simple_assignment() {
+        let kind = first_stmt("x = 5");
+        let StmtKind::Assign { name, .. } = &kind else {
+            panic!("expected Assign, got: {:?}", kind);
+        };
+        assert_eq!(name, "x");
+    }
+
+    #[test]
+    fn parses_match_statement_with_two_arms() {
+        // 注意: 当前 match 只识别 identifier 模式(wildcard `_` 不支持),
+        // 也使用 `with` 而不是 `=>`;arm 形式: `pat expr`
+        let kind = first_stmt("match x with\n  a 1\n  b 0\nend");
+        let StmtKind::Match { arms, .. } = &kind else {
+            panic!("expected Match stmt, got: {:?}", kind);
+        };
+        assert_eq!(arms.len(), 2);
+    }
+
+    /// v0.55 (Bug D) root-cause: `match_statement` 直接读 identifier 当模式,
+    /// 不走完整 `pattern()` 解析。改走 pattern() 后,`_` 通配符 / 字面模式 / 列表模式
+    /// 都可用,与 expression-level match 共享同一套模式语法。
+    #[test]
+    fn match_statement_should_call_pattern_for_wildcard() {
+        // 当前 match_statement: `match _ with 99 end` 会失败,因为
+        // `consume_identifier` 把 `_` 当 identifier 消耗,然后期待 1 个 arm
+        // body(表达式),但后面是 `99`(数字字面量可接受),所以技术上能解析,
+        // 但模式绑定是 `Variable("_")` 而非 `Wildcard`。
+        // 修复后,`pattern()` 在 `_` 时返回 Pattern::Wildcard。
+        let kind = first_stmt("match _ with _ 99 end");
+        let StmtKind::Match { arms, .. } = &kind else {
+            panic!("expected Match stmt, got: {:?}", kind);
+        };
+        assert_eq!(arms.len(), 1);
+        let (pattern, _body) = arms.first().expect("1 arm");
+        // 修复后应是 Wildcard; 修复前是 Variable("_")
+        assert!(
+            matches!(pattern, Pattern::Wildcard),
+            "after fix: pattern should be Wildcard, got: {:?}",
+            pattern
+        );
+    }
+
+    #[test]
+    fn parses_import_statement() {
+        let kind = first_stmt("import std::io");
+        // import is its own variant
+        let s = format!("{:?}", kind);
+        assert!(
+            s.contains("Import"),
+            "import → {:?}, expected Import variant",
+            kind
+        );
+    }
+
+    #[test]
+    fn parses_expression_statement() {
+        // 调用表达式(如 print(...))也是合法 statement
+        let kind = first_stmt("print(1)");
+        // 可归类为 Expression / Call / MethodCall 等;只需能解析、不报错
+        let s = format!("{:?}", kind);
+        assert!(!s.is_empty());
+    }
+
+    #[test]
+    fn parses_struct_definition() {
+        let kind = first_stmt("struct Point end");
+        let StmtKind::StructDef { name, fields, .. } = &kind else {
+            panic!("expected StructDef, got: {:?}", kind);
+        };
+        assert_eq!(name, "Point");
+        assert!(fields.is_empty());
+    }
+
+    #[test]
+    fn parses_enum_definition_with_variants() {
+        let kind = first_stmt("enum Color\n  Red\n  Green\nend");
+        let StmtKind::EnumDef { name, variants, .. } = &kind else {
+            panic!("expected EnumDef, got: {:?}", kind);
+        };
+        assert_eq!(name, "Color");
+        assert_eq!(variants.len(), 2);
+    }
+
+    #[test]
+    fn parses_loop_orchestrate_with_max_rounds_bounded() {
+        // 受 v0.54 orchestrator max_rounds bounded by parser 影响
+        // 负数 -> 降级处理 (eprintln 警告 + 用 0);此处只测合法正值
+        let kind = first_stmt("orchestrate loop(name: x, max_rounds: 3)\n  end\n");
+        let s = format!("{:?}", kind);
+        assert!(s.contains("Orchestrate"), "got: {:?}", kind);
+    }
+
+    #[test]
+    fn parses_trait_decl_with_method() {
+        let kind = first_stmt("trait Greet\n  fn greet(self): string\nend");
+        let StmtKind::TraitDef { name, methods, .. } = &kind else {
+            panic!("expected TraitDef, got: {:?}", kind);
+        };
+        assert_eq!(name, "Greet");
+        assert!(!methods.is_empty());
+    }
+
+    #[test]
+    fn parses_parallel_block() {
+        let kind = first_stmt("parallel\n  a()\n  b()\nend");
+        let s = format!("{:?}", kind);
+        assert!(s.contains("Parallel"), "got: {:?}", kind);
+    }
+
+    #[test]
+    fn parses_with_block() {
+        let kind = first_stmt("with { x = 1 }\n  body()\nend");
+        let s = format!("{:?}", kind);
+        assert!(s.contains("With"), "got: {:?}", kind);
+    }
+
+    #[test]
+    fn parses_break_and_continue() {
+        // 两个独立语句,各自在 parse() 返回的 Vec 中
+        let tokens = Lexer::new("break\ncontinue\n").scan_tokens();
+        let mut parser = ParserV2::new(tokens);
+        let stmts = parser.parse();
+        assert_eq!(stmts.len(), 2);
+        let arena = parser.into_arena();
+        let kinds: Vec<_> = stmts
+            .iter()
+            .filter_map(|id| arena.get_stmt(*id).map(|s| s.kind.clone()))
+            .collect();
+        assert!(matches!(kinds[0], StmtKind::Break));
+        assert!(matches!(kinds[1], StmtKind::Continue));
     }
 }

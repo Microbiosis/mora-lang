@@ -197,8 +197,10 @@ pub fn options_from_value(v: &crate::value::Value) -> Result<CompressOptions, St
         if let Some(Value::String(s)) = map.get("strategy") {
             opts.strategy = s.clone();
         }
-        if let Some(Value::Number(n)) = map.get("max_bytes") {
-            opts.max_bytes = Some(*n as usize);
+        // 整数字段（max_bytes / k_first / k_last）拒绝负数 / NaN / Inf，
+        // 防止 `*n as usize` 静默换为 usize::MAX。
+        if let Some(v) = map.get("max_bytes") {
+            opts.max_bytes = Some(crate::flow::usize_from_value(v, "compress.max_bytes")?);
         }
         if let Some(Value::Number(n)) = map.get("target_ratio") {
             opts.target_ratio = Some(*n as f32);
@@ -209,11 +211,11 @@ pub fn options_from_value(v: &crate::value::Value) -> Result<CompressOptions, St
         if let Some(Value::Number(n)) = map.get("tail_pct") {
             opts.tail_pct = *n as f32;
         }
-        if let Some(Value::Number(n)) = map.get("k_first") {
-            opts.k_first = Some(*n as usize);
+        if let Some(v) = map.get("k_first") {
+            opts.k_first = Some(crate::flow::usize_from_value(v, "compress.k_first")?);
         }
-        if let Some(Value::Number(n)) = map.get("k_last") {
-            opts.k_last = Some(*n as usize);
+        if let Some(v) = map.get("k_last") {
+            opts.k_last = Some(crate::flow::usize_from_value(v, "compress.k_last")?);
         }
         if let Some(Value::Number(n)) = map.get("lossless_min_savings_ratio") {
             opts.lossless_min_savings_ratio = *n as f32;

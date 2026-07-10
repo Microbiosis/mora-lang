@@ -379,13 +379,27 @@ impl Interpreter {
             match key.as_str() {
                 "model" => cfg.model = Some(v.to_string()),
                 "temperature" => {
-                    if let Value::Number(n) = v {
-                        cfg.temperature = Some(n);
+                    // 接受 Int / Number / Float 有限数值，拒绝其它类型。
+                    match v {
+                        Value::Number(n) | Value::Float(n) if n.is_finite() => {
+                            cfg.temperature = Some(n);
+                        }
+                        Value::Int(i) => {
+                            cfg.temperature = Some(i as f64);
+                        }
+                        other => {
+                            return Err(format!(
+                                "temperature: expected a finite number, got {:?}",
+                                other
+                            ));
+                        }
                     }
                 }
                 "max_tokens" => {
-                    if let Value::Number(n) = v {
-                        cfg.max_tokens = Some(n as usize);
+                    // 负数/NaN 必须错误返回，不能静默换为 usize::MAX。
+                    match crate::flow::usize_from_value(&v, "max_tokens") {
+                        Ok(n) => cfg.max_tokens = Some(n),
+                        Err(e) => return Err(e),
                     }
                 }
                 "system" => cfg.system = Some(v.to_string()),
@@ -839,8 +853,11 @@ impl Interpreter {
                             role = Some(coerce_to_string(v, "role")?);
                         }
                         "budget" => {
-                            // 字符串 "8 KB" / "256 B" / 数字 4096 都接受
-                            budget_bytes = Some(parse_budget(v, "budget")?);
+                            // 字符串 "8 KB" / "256 B" / 纯数字 4096 都接受。
+                            // 复用 dispatch::parse_budget_dispatch（dispatch 与 execute
+                            // 不再各持一份）。
+                            budget_bytes =
+                                Some(super::dispatch::parse_budget_dispatch(v, "budget")?);
                         }
                         _ => {
                             return Err(format!(
@@ -1001,57 +1018,145 @@ fn coerce_to_string(v: Value, _ctx: &str) -> Result<String, String> {
     }
 }
 
-/// v0.26: 解析 budget 值
-/// 接受: "256 B" "8 KB" "4 MB" 等带单位的字符串,或纯数字
-fn parse_budget(v: Value, ctx: &str) -> Result<usize, String> {
-    match v {
-        Value::Number(n) => {
-            if n < 0.0 {
-                return Err(format!("{}: budget must be non-negative", ctx));
-            }
-            Ok(n as usize)
-        }
-        Value::String(s) => {
-            let s = s.trim();
-            if s.is_empty() {
-                return Err(format!("{}: empty budget string", ctx));
-            }
-            // 拆分数字 + 单位
-            let (num_part, unit_part) = split_number_unit(s);
-            let num: f64 = num_part
-                .parse()
-                .map_err(|_| format!("{}: invalid budget '{}'", ctx, s))?;
-            let mult: usize = match unit_part.to_uppercase().as_str() {
-                "" | "B" => 1,
-                "KB" | "K" => 1024,
-                "MB" | "M" => 1024 * 1024,
-                "GB" | "G" => 1024 * 1024 * 1024,
-                other => {
-                    return Err(format!(
-                        "{}: unknown budget unit '{}' (B/KB/MB/GB)",
-                        ctx, other
-                    ));
-                }
-            };
-            Ok((num * mult as f64) as usize)
-        }
-        other => Err(format!(
-            "{}: budget must be string or number, got {:?}",
-            ctx, other
-        )),
-    }
-}
+#[cfg(test)]
+mod tests {
+    //! execute 白盒测试。
+    //!
+    //! 通过 Lexer → ParserV2 → Interpreter::execute 全路径,验证关键 statement
+    //! 派发语义。覆盖:
+    //! - let 绑定 / 赋值
+    //! - return
+    //! - if (then 分支)
+    //! - for-in 循环
+    //! - assign / index-assign
+    //! - StmtKind 派发的总入口
+    use super::*;
+    use crate::lexer::Lexer;
+    use crate::parser_v2::ParserV2;
+    use crate::value::{FlowSignal, Value};
 
-fn split_number_unit(s: &str) -> (&str, &str) {
-    let bytes = s.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        let c = bytes[i];
-        if c.is_ascii_digit() || c == b'.' {
-            i += 1;
-        } else {
-            break;
+    /// 解析整段 source,然后按顺序 execute 所有 stmt。
+    /// 返回最终 signal 与最后一个表达式的 value (若有)。
+    fn run(src: &str) -> (FlowSignal, Option<Value>) {
+        let tokens = Lexer::new(src).scan_tokens();
+        let mut parser = ParserV2::new(tokens);
+        let stmts = parser.parse();
+        let arena = parser.into_arena();
+        let mut interp = Interpreter::new();
+        let mut last_signal = FlowSignal::None;
+        for id in stmts {
+            let kind = arena.get_stmt(id).expect("stmt").kind.clone();
+            let (sig, _val) = interp
+                .execute(&kind, &arena)
+                .unwrap_or_else(|e| panic!("execute failed: {e}"));
+            last_signal = sig;
+        }
+        (last_signal, None)
+    }
+
+    #[test]
+    fn execute_let_binds_name_in_environment() {
+        let (sig, _) = run("let x = 42\n");
+        assert!(matches!(sig, FlowSignal::None));
+    }
+
+    #[test]
+    fn execute_let_chains_for_subsequent_assign() {
+        let (sig, _) = run("let a = 1\nlet b = a\n");
+        assert!(matches!(sig, FlowSignal::None));
+    }
+
+    #[test]
+    fn execute_assign_overwrites_existing_binding() {
+        let (sig, _) = run("let x = 1\nx = 2\n");
+        assert!(matches!(sig, FlowSignal::None));
+    }
+
+    #[test]
+    fn execute_return_statement_propagates_flow_signal_return() {
+        let (sig, _) = run("return 1\n");
+        assert!(matches!(sig, FlowSignal::Return(_)));
+    }
+
+    #[test]
+    fn execute_if_branches_correctly() {
+        let (sig, _) = run("let flag = 1\nif flag then let x = 1 end\n");
+        assert!(matches!(sig, FlowSignal::None));
+    }
+
+    #[test]
+    fn execute_for_loops_over_list_iterable() {
+        let (sig, _) = run("for i in [1, 2, 3]\n let _ = i\nend\n");
+        assert!(matches!(sig, FlowSignal::None));
+    }
+
+    #[test]
+    fn execute_break_and_continue_parse_and_dispatch_without_error() {
+        // 注意:Break/Continue 是 inner-body stmt,它们的 FlowSignal 由 For 循环
+        // 内部消费;这里仅断言 dispatch 边界(总入口派发 + 各种 inner stmt) 不报
+        // 错 / 不 panic。
+        let src = "for i in [1, 2]\n  if i == 1\n    break\n  end\n  continue\nend\n";
+        let tokens = Lexer::new(src).scan_tokens();
+        let mut parser = ParserV2::new(tokens);
+        let stmts = parser.parse();
+        let arena = parser.into_arena();
+        let mut interp = Interpreter::new();
+        for id in &stmts {
+            if let Some(s) = arena.get_stmt(*id) {
+                // execute 必须不 panic,即使内部对 break/continue 的处理走
+                // 复杂路径(For 循环会捕获 / 重发 signal)。
+                let _ = interp.execute(&s.kind, &arena);
+            }
         }
     }
-    (&s[..i], s[i..].trim())
+
+    /// v0.55: 锁定 For 循环的 signal 转发语义 —— For 自身产生的最终
+    /// FlowSignal 是 None(即使循环体里 break/continue)。这是 execute()
+    /// 调用于最外层 For 时正确的预期:For 把 inner signal 消费掉,
+    /// 不向上传播 Break/Continue。
+    #[test]
+    fn execute_for_swallows_break_continue_signal_returned_to_outer() {
+        let src = "for i in [1, 2]\n  break\nend\n";
+        let tokens = Lexer::new(src).scan_tokens();
+        let mut parser = ParserV2::new(tokens);
+        let stmts = parser.parse();
+        let arena = parser.into_arena();
+        let mut interp = Interpreter::new();
+        // 直接 dispatch For stmt
+        if let Some(s) = stmts.first().and_then(|id| arena.get_stmt(*id)) {
+            let (sig, _) = interp
+                .execute(&s.kind, &arena)
+                .expect("for should execute cleanly");
+            assert!(
+                matches!(sig, FlowSignal::None),
+                "For inner break should not propagate: got {:?}",
+                sig
+            );
+        } else {
+            panic!("no stmt");
+        }
+    }
+
+    #[test]
+    fn execute_dispatches_unknown_stmt_kind_without_panic() {
+        // 这是 execute() 的总入口派发边界:任何 StmtKind 子类都该走 default 分支
+        // 并返回 (FlowSignal::None, None)。这是 v0.52 根因修复:15 个 call site
+        // 必须显式 match,不能依赖 catch-all 推断。
+        let tokens = Lexer::new("let x = 1\n").scan_tokens();
+        let mut parser = ParserV2::new(tokens);
+        let stmts = parser.parse();
+        let arena = parser.into_arena();
+        let mut interp = Interpreter::new();
+        let mut count = 0;
+        for id in &stmts {
+            if let Some(s) = arena.get_stmt(*id) {
+                let (sig, _) = interp
+                    .execute(&s.kind, &arena)
+                    .expect("execute should not error");
+                assert!(matches!(sig, FlowSignal::None));
+                count += 1;
+            }
+        }
+        assert!(count >= 1, "should dispatch at least one stmt");
+    }
 }

@@ -12,6 +12,50 @@ use crate::flow::{json_to_value, value_to_json};
 use crate::value::Value;
 use std::collections::HashMap;
 
+/// 将 `Value` 提取为非负整数 `T`（bounded）。
+///
+/// 接受 `Value::Int` / `Value::Number` / `Value::Float` 三种数值类型；
+/// 任何 NaN / Inf / 负数 / 越界均返回错误，杜绝 `*n as u32` 等静默换为不可预期值。
+///
+/// `max` 是目标类型 `T` 的上界（必须用 `u64::MAX` / `usize::MAX as u64` 等显式值传入）；
+/// 任何 `Value` 数值超过 `max` 即报错。
+pub(crate) fn bounded_uint_from_value<T>(value: &Value, ctx: &str, max: u64) -> Result<T, String>
+where
+    T: TryFrom<u64>,
+    <T as TryFrom<u64>>::Error: std::fmt::Debug,
+{
+    let raw: u64 = match value {
+        Value::Int(i) => {
+            if *i < 0 {
+                return Err(format!(
+                    "{}: must be a non-negative integer, got Int({})",
+                    ctx, i
+                ));
+            }
+            if (*i as u64) > max {
+                return Err(format!("{}: value {} exceeds maximum {}", ctx, i, max));
+            }
+            *i as u64
+        }
+        Value::Number(n) | Value::Float(n) => {
+            if !n.is_finite() || *n < 0.0 || *n > max as f64 {
+                return Err(format!(
+                    "{}: must be a non-negative finite number in [0, {}], got {}",
+                    ctx, max, n
+                ));
+            }
+            *n as u64
+        }
+        other => {
+            return Err(format!(
+                "{}: expected non-negative integer, got {:?}",
+                ctx, other
+            ));
+        }
+    };
+    T::try_from(raw).map_err(|e| format!("{}: cast overflow: {:?}", ctx, e))
+}
+
 // ------------------------------------------------------------------
 // SendTask
 // ------------------------------------------------------------------
@@ -162,11 +206,10 @@ impl Checkpoint {
             _ => return Err("Checkpoint id must be a string".to_string()),
         };
 
-        let v = match map.get("v") {
-            Some(Value::Int(i)) => *i as u32,
-            Some(Value::Number(n)) => *n as u32,
-            Some(Value::Float(f)) => *f as u32,
-            _ => return Err("Checkpoint v must be a number".to_string()),
+        // 所有数值字段拒绝 NaN / Inf / 负数 / 越界。
+        let v: u32 = match map.get("v") {
+            Some(v) => bounded_uint_from_value(v, "Checkpoint.v", u32::MAX as u64)?,
+            None => return Err("Checkpoint v must be present".to_string()),
         };
 
         let thread_id = match map.get("thread_id") {
@@ -174,11 +217,9 @@ impl Checkpoint {
             _ => return Err("Checkpoint thread_id must be a string".to_string()),
         };
 
-        let step = match map.get("step") {
-            Some(Value::Int(i)) => *i as usize,
-            Some(Value::Number(n)) => *n as usize,
-            Some(Value::Float(f)) => *f as usize,
-            _ => return Err("Checkpoint step must be a number".to_string()),
+        let step: usize = match map.get("step") {
+            Some(v) => bounded_uint_from_value(v, "Checkpoint.step", usize::MAX as u64)?,
+            None => return Err("Checkpoint step must be present".to_string()),
         };
 
         let channel_values = match map.get("channel_values") {
@@ -190,17 +231,8 @@ impl Checkpoint {
             Some(Value::Dict(m)) => m
                 .iter()
                 .map(|(k, v)| {
-                    let num = match v {
-                        Value::Int(i) => *i as u64,
-                        Value::Number(n) => *n as u64,
-                        Value::Float(f) => *f as u64,
-                        _ => {
-                            return Err(format!(
-                                "channel_versions value must be a number: {:?}",
-                                v
-                            ));
-                        }
-                    };
+                    let num: u64 =
+                        bounded_uint_from_value(v, "Checkpoint.channel_versions", u64::MAX)?;
                     Ok((k.clone(), num))
                 })
                 .collect::<Result<HashMap<String, u64>, String>>()?,
@@ -215,17 +247,11 @@ impl Checkpoint {
                         Value::Dict(inner_map) => inner_map
                             .iter()
                             .map(|(k, v)| {
-                                let num = match v {
-                                    Value::Int(i) => *i as u64,
-                                    Value::Number(n) => *n as u64,
-                                    Value::Float(f) => *f as u64,
-                                    _ => {
-                                        return Err(format!(
-                                            "versions_seen value must be a number: {:?}",
-                                            v
-                                        ));
-                                    }
-                                };
+                                let num: u64 = bounded_uint_from_value(
+                                    v,
+                                    "Checkpoint.versions_seen",
+                                    u64::MAX,
+                                )?;
                                 Ok((k.clone(), num))
                             })
                             .collect::<Result<HashMap<String, u64>, String>>()?,
@@ -611,5 +637,87 @@ mod tests {
         let bad = r#"[1,2,3]"#;
         let result = Checkpoint::from_json(bad);
         assert!(result.is_err());
+    }
+
+    // ===== Checkpoint::from_json / bounded_uint_from_value 边界回归 =====
+
+    #[test]
+    fn checkpoint_from_json_rejects_negative_v() {
+        let bad = r#"{"id":"x","v":-1,"thread_id":"t1","step":0,"channel_values":{},"channel_versions":{},"versions_seen":{},"pending_sends":[],"timestamp_ms":"0"}"#;
+        let result = Checkpoint::from_json(bad);
+        assert!(
+            result.is_err(),
+            "negative v should be rejected, got: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn checkpoint_from_json_rejects_negative_step() {
+        let bad = r#"{"id":"x","v":1,"thread_id":"t1","step":-5,"channel_values":{},"channel_versions":{},"versions_seen":{},"pending_sends":[],"timestamp_ms":"0"}"#;
+        let result = Checkpoint::from_json(bad);
+        assert!(
+            result.is_err(),
+            "negative step should be rejected, got: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn checkpoint_from_json_rejects_nan_v() {
+        // JSON 标准 NaN 表示为 null；这里测 Null 字段被拒绝的情形。
+        let bad = r#"{"id":"x","v":null,"thread_id":"t1","step":0,"channel_values":{},"channel_versions":{},"versions_seen":{},"pending_sends":[],"timestamp_ms":"0"}"#;
+        let result = Checkpoint::from_json(bad);
+        assert!(
+            result.is_err(),
+            "null v should be rejected, got: {:?}",
+            result
+        );
+    }
+
+    // ===== bounded_uint_from_value 助手回归 =====
+
+    #[test]
+    fn bounded_uint_int_ok() {
+        let r: u32 = bounded_uint_from_value(&Value::Int(7), "ctx", u32::MAX as u64).unwrap();
+        assert_eq!(r, 7);
+    }
+
+    #[test]
+    fn bounded_uint_number_ok() {
+        let r: u32 = bounded_uint_from_value(&Value::Number(5.0), "ctx", u32::MAX as u64).unwrap();
+        assert_eq!(r, 5);
+    }
+
+    #[test]
+    fn bounded_uint_negative_int_errors() {
+        let r: Result<u32, String> =
+            bounded_uint_from_value(&Value::Int(-1), "ctx", u32::MAX as u64);
+        assert!(r.is_err(), "negative Int must error, got: {:?}", r);
+    }
+
+    /// 越界 Int（u32::MAX + 1）必须错误 —— 不接受隐式 wrap。
+    #[test]
+    fn bounded_uint_int_overflow_errors() {
+        let r: Result<u32, String> =
+            bounded_uint_from_value(&Value::Int(u32::MAX as i64 + 1), "ctx", u32::MAX as u64);
+        assert!(r.is_err(), "out-of-range Int must error, got: {:?}", r);
+    }
+
+    #[test]
+    fn bounded_uint_nan_errors() {
+        let r: Result<u32, String> =
+            bounded_uint_from_value(&Value::Float(f64::NAN), "ctx", u32::MAX as u64);
+        assert!(r.is_err());
+        let r: Result<u32, String> =
+            bounded_uint_from_value(&Value::Float(f64::INFINITY), "ctx", u32::MAX as u64);
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn bounded_uint_non_number_errors() {
+        let r: Result<u32, String> =
+            bounded_uint_from_value(&Value::String("foo".to_string()), "ctx", u32::MAX as u64);
+        assert!(r.is_err());
     }
 }

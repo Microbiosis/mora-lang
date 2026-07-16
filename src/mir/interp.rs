@@ -6,7 +6,7 @@
 //! α.0 复用现有 Interpreter 的 call_function / eval_binary，不重写 builtins。
 //! 这样 MIR 解释器只替代"执行引擎"，AI/transport/sandbox facade 不受影响。
 
-use crate::flow::{eval_binary, usize_from_value};
+use crate::flow::eval_binary;
 use crate::interpreter::Interpreter;
 use crate::value::{Environment, Value};
 
@@ -181,21 +181,23 @@ pub fn run_mir(
 }
 
 /// α.1: 索引操作 List[i] / Dict[key] / String[i]
-///
-/// 与 `interpreter/evaluate.rs::evaluate_index` 语义一致。索引通过 `usize_from_value`
-/// 统一做 Int/Number/Float + 负数 + NaN + 越界检查，避免 `*i / *n as usize`
-/// 静默换为 usize::MAX。
 fn index_value(obj: &Value, idx: &Value) -> Result<Value, String> {
     match (obj, idx) {
-        (Value::List(list), _) => {
-            let i = usize_from_value(idx, "List index")?;
+        (Value::List(list), Value::Int(i)) => {
+            let i = *i as usize;
+            list.get(i)
+                .cloned()
+                .ok_or_else(|| format!("index {} out of bounds (len {})", i, list.len()))
+        }
+        (Value::List(list), Value::Number(n)) => {
+            let i = *n as usize;
             list.get(i)
                 .cloned()
                 .ok_or_else(|| format!("index {} out of bounds (len {})", i, list.len()))
         }
         (Value::Dict(map), Value::String(key)) => Ok(map.get(key).cloned().unwrap_or(Value::Nil)),
-        (Value::String(s), _) => {
-            let i = usize_from_value(idx, "String index")?;
+        (Value::String(s), Value::Int(i)) => {
+            let i = *i as usize;
             s.chars().nth(i).map(Value::Char).ok_or_else(|| {
                 format!(
                     "string index {} out of bounds (len {})",

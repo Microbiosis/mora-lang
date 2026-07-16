@@ -2,31 +2,7 @@
 
 use super::*;
 use crate::common::Span;
-use crate::flow::usize_from_value;
 use crate::value::{BuiltinKind, Value};
-
-/// 从 Value 提取 i64 值（接受 Int / Number / Float）。
-/// 非有限数 / 越界返回 Err。
-fn int_from_value(v: &Value) -> Result<i64, String> {
-    match v {
-        Value::Int(i) => Ok(*i),
-        Value::Number(n) => {
-            if n.is_finite() && *n >= i64::MIN as f64 && *n <= i64::MAX as f64 {
-                Ok(*n as i64)
-            } else {
-                Err(format!("cannot convert number {} to integer", n))
-            }
-        }
-        Value::Float(f) => {
-            if f.is_finite() && *f >= i64::MIN as f64 && *f <= i64::MAX as f64 {
-                Ok(*f as i64)
-            } else {
-                Err(format!("cannot convert float {} to integer", f))
-            }
-        }
-        other => Err(format!("expected number, got {:?}", other)),
-    }
-}
 
 /// S8 fix: 安全地在 async runtime 上阻塞执行，避免嵌套 panic。
 ///
@@ -98,20 +74,32 @@ impl Interpreter {
                 Ok(Value::Nil)
             }
             "range" => {
-                // v0.38: 支持 Int 和 Number 两种字面量类型
-                let start = args.first().map(int_from_value).unwrap_or(Ok(0))?;
-                let end = args.get(1).map(int_from_value).unwrap_or(Ok(start))?;
-                let step = args.get(2).map(int_from_value).unwrap_or(Ok(1))?;
-                if step <= 0 {
-                    return Err("range: step must be positive".to_string());
-                }
+                let start = args
+                    .first()
+                    .and_then(|v| match v {
+                        Value::Number(n) => Some(*n as i64),
+                        _ => None,
+                    })
+                    .unwrap_or(0);
+                let end = args
+                    .get(1)
+                    .and_then(|v| match v {
+                        Value::Number(n) => Some(*n as i64),
+                        _ => None,
+                    })
+                    .unwrap_or(start);
+                let step = args
+                    .get(2)
+                    .and_then(|v| match v {
+                        Value::Number(n) => Some(*n as i64),
+                        _ => None,
+                    })
+                    .unwrap_or(1);
                 let mut items = Vec::new();
                 let mut i = start;
                 while i < end {
-                    items.push(Value::Int(i));
-                    i = i
-                        .checked_add(step)
-                        .ok_or_else(|| "range: integer overflow".to_string())?;
+                    items.push(Value::Number(i as f64));
+                    i += step;
                 }
                 Ok(Value::List(items))
             }
@@ -225,7 +213,17 @@ impl Interpreter {
                 if args.len() < 2 {
                     return Err("crush_json() requires 2 arguments: input and max".to_string());
                 }
-                let max_items = usize_from_value(&args[1], "crush_json: max")?;
+                let max_items = match &args[1] {
+                    Value::Number(n) => {
+                        if *n < 0.0 {
+                            return Err("crush_json: max must be non-negative".to_string());
+                        }
+                        *n as usize
+                    }
+                    other => {
+                        return Err(format!("crush_json: max must be a number, got {:?}", other));
+                    }
+                };
                 let options_val = args
                     .get(2)
                     .cloned()
@@ -312,7 +310,15 @@ impl Interpreter {
                         ));
                     }
                 };
-                let max: usize = usize_from_value(&args[1], "tail() max")?;
+                let max: usize = match &args[1] {
+                    Value::Number(n) => {
+                        if *n < 0.0 {
+                            return Err("tail() max must be non-negative".to_string());
+                        }
+                        *n as usize
+                    }
+                    _ => return Err("tail() second argument 'max' must be a number".to_string()),
+                };
                 let content = std::fs::read_to_string(&path)
                     .map_err(|e| format!("tail() cannot read '{}': {}", path, e))?;
                 let lines: Vec<&str> = content.lines().collect();
@@ -459,10 +465,19 @@ impl Interpreter {
                 match method {
                     // v0.30: List.crush_json(max) -> string SmartCrusher
                     "crush_json" => {
-                        let max = match args.first() {
-                            Some(v) => usize_from_value(v, "List.crush_json: max")?,
-                            None => return Err("List.crush_json: requires max as integer".to_string()),
-                        };
+                        let max = args
+                            .first()
+                            .and_then(|v| match v {
+                                Value::Number(n) => {
+                                    if *n < 0.0 {
+                                        None
+                                    } else {
+                                        Some(*n as usize)
+                                    }
+                                }
+                                _ => None,
+                            })
+                            .ok_or_else(|| "List.crush_json: requires max as number".to_string())?;
                         let opts = crate::compress::CompressOptions::default();
                         let result = crate::compress::crush_json(&list, max, &opts);
                         let json = crate::compress::value_to_json_simple(&Value::List(
@@ -484,11 +499,7 @@ impl Interpreter {
                         Ok(Value::List(new_list))
                     }
                     "get" => {
-                        // 缺失或非数值时按 0 处理（兼容原先 `[].get()` 的 fallback 语义）。
-                        let index = match args.first() {
-                            Some(v) => usize_from_value(v, "List.get: index").unwrap_or(0),
-                            None => 0,
-                        };
+                        let index = args.first().and_then(|v| match v { Value::Number(n) => Some(*n as usize), _ => None }).unwrap_or(0);
                         Ok(list.get(index).cloned().unwrap_or(Value::Nil))
                     }
                     "pop" => {
@@ -527,28 +538,25 @@ impl Interpreter {
                     }
                     // v0.18: take(n) - 取前 n 个元素
                     "take" => {
-                        let n = match args.first() {
-                            Some(v) => usize_from_value(v, "List.take: n")?,
-                            None => return Err("take() requires a count argument".to_string()),
-                        };
+                        let n = args.first()
+                            .and_then(|v| match v { Value::Number(n) => Some(*n as usize), _ => None })
+                            .ok_or("take() requires a count argument")?;
                         let result: Vec<Value> = list.into_iter().take(n).collect();
                         Ok(Value::List(result))
                     }
                     // v0.18: drop(n) - 跳过前 n 个元素
                     "drop" => {
-                        let n = match args.first() {
-                            Some(v) => usize_from_value(v, "List.drop: n")?,
-                            None => return Err("drop() requires a count argument".to_string()),
-                        };
+                        let n = args.first()
+                            .and_then(|v| match v { Value::Number(n) => Some(*n as usize), _ => None })
+                            .ok_or("drop() requires a count argument")?;
                         let result: Vec<Value> = list.into_iter().skip(n).collect();
                         Ok(Value::List(result))
                     }
                     // v0.17: window(size) - 滑动窗口
                     "window" => {
-                        let size = match args.first() {
-                            Some(v) => usize_from_value(v, "List.window: size")?,
-                            None => return Err("window() requires a size argument".to_string()),
-                        };
+                        let size = args.first()
+                            .and_then(|v| match v { Value::Number(n) => Some(*n as usize), _ => None })
+                            .ok_or("window() requires a size argument")?;
                         if size == 0 {
                             return Err("window() size must be > 0".to_string());
                         }
@@ -563,10 +571,9 @@ impl Interpreter {
                     }
                     // v0.17: batch(size) - 翻转窗口（批次处理）
                     "batch" => {
-                        let size = match args.first() {
-                            Some(v) => usize_from_value(v, "List.batch: size")?,
-                            None => return Err("batch() requires a size argument".to_string()),
-                        };
+                        let size = args.first()
+                            .and_then(|v| match v { Value::Number(n) => Some(*n as usize), _ => None })
+                            .ok_or("batch() requires a size argument")?;
                         if size == 0 {
                             return Err("batch() size must be > 0".to_string());
                         }
@@ -640,14 +647,12 @@ impl Interpreter {
                     }
                     // v0.17: reshape(rows, cols) - 重塑列表
                     "reshape" => {
-                        let rows = match args.first() {
-                            Some(v) => usize_from_value(v, "List.reshape: rows")?,
-                            None => return Err("reshape() requires rows argument".to_string()),
-                        };
-                        let cols = match args.get(1) {
-                            Some(v) => usize_from_value(v, "List.reshape: cols")?,
-                            None => return Err("reshape() requires cols argument".to_string()),
-                        };
+                        let rows = args.first()
+                            .and_then(|v| match v { Value::Number(n) => Some(*n as usize), _ => None })
+                            .ok_or("reshape() requires rows argument")?;
+                        let cols = args.get(1)
+                            .and_then(|v| match v { Value::Number(n) => Some(*n as usize), _ => None })
+                            .ok_or("reshape() requires cols argument")?;
                         let total = rows * cols;
                         // 展平后重塑
                         fn flatten_list(val: &Value, out: &mut Vec<Value>) {
@@ -796,7 +801,7 @@ impl Interpreter {
                         _ => "default".to_string(),
                     };
                     let max_steps = match config.get("max_steps") {
-                        Some(v) => usize_from_value(v, "Agent.max_steps").unwrap_or(10),
+                        Some(Value::Number(n)) => *n as usize,
                         _ => 10,
                     };
                     let system = match config.get("system") {
@@ -1304,36 +1309,14 @@ fn text_to_string(v: &Value) -> String {
     }
 }
 
-/// 解析 budget 值（数字字节数，支持单位后缀 B/KB/MB/GB）。
-///
-/// 接受 `Value::Int` / `Value::Number` / `Value::Float`：对所有数值类型做
-/// **非负 + 有限性 + 上界**检查，禁止 `-1i64 as usize` 静默换为 usize::MAX。
-/// 字符串形如 `"8 KB"`，数字部分解析失败或单位未识别均返回错误。
-pub(crate) fn parse_budget_dispatch(v: Value, ctx: &str) -> Result<usize, String> {
+/// 解析 budget 值 (dispatch 层副本,与 execute.rs 同语义)
+fn parse_budget_dispatch(v: Value, ctx: &str) -> Result<usize, String> {
     match v {
-        Value::Int(i) => {
-            if i < 0 {
+        Value::Number(n) => {
+            if n < 0.0 {
                 return Err(format!("{}: budget must be non-negative", ctx));
             }
-            Ok(i as usize)
-        }
-        Value::Number(n) => {
-            if !n.is_finite() || n < 0.0 {
-                return Err(format!(
-                    "{}: budget must be a non-negative finite number",
-                    ctx
-                ));
-            }
             Ok(n as usize)
-        }
-        Value::Float(f) => {
-            if !f.is_finite() || f < 0.0 {
-                return Err(format!(
-                    "{}: budget must be a non-negative finite float",
-                    ctx
-                ));
-            }
-            Ok(f as usize)
         }
         Value::String(s) => {
             let s = s.trim();
@@ -1368,50 +1351,5 @@ pub(crate) fn parse_budget_dispatch(v: Value, ctx: &str) -> Result<usize, String
             "{}: budget must be string or number, got {:?}",
             ctx, other
         )),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    // ===== parse_budget / int_from_value 边界回归 =====
-
-    #[test]
-    fn parse_budget_dispatch_accepts_int() {
-        let v = parse_budget_dispatch(Value::Int(2048), "ctx").unwrap();
-        assert_eq!(v, 2048);
-    }
-
-    /// 负 Int 必须错误返回 —— 直接 `-1_i64 as usize` 会静默换为 usize::MAX。
-    #[test]
-    fn parse_budget_dispatch_rejects_negative_int() {
-        let r = parse_budget_dispatch(Value::Int(-1), "ctx");
-        assert!(
-            r.is_err(),
-            "negative Int budget must error (avoid `as usize` silent wrap), got: {:?}",
-            r
-        );
-    }
-
-    #[test]
-    fn parse_budget_dispatch_rejects_negative_number() {
-        let r = parse_budget_dispatch(Value::Number(-2.5), "ctx");
-        assert!(r.is_err(), "got: {:?}", r);
-    }
-
-    #[test]
-    fn int_from_value_rejects_non_number() {
-        let r = int_from_value(&Value::String("foo".to_string()));
-        assert!(r.is_err());
-    }
-
-    /// 浮点 NaN / Inf 必须错误返回 —— `f64 as i64` 是 UB。
-    #[test]
-    fn int_from_value_rejects_nan_float() {
-        let r = int_from_value(&Value::Float(f64::NAN));
-        assert!(r.is_err(), "NaN must error, got: {:?}", r);
-        let r = int_from_value(&Value::Float(f64::INFINITY));
-        assert!(r.is_err(), "Inf must error, got: {:?}", r);
     }
 }

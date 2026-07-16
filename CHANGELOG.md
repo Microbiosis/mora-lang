@@ -2,61 +2,6 @@
 
 All notable changes to Mora will be documented in this file.
 
-## [v0.55.0] - 2026-07-10 — 数值 cast 根因修复 + 核心路径白盒测试 + 代码修改行为约束
-
-User-driven audit batches (v0.53 → v0.55). 主要 4 块工作:
-
-### 1. 数值类型 cast 取巧根因修复（17 Bug → 2 helper）
-
-| 类型 | Bug | 根因 / 修复 |
-|------|-----|-------------|
-| `Int` 上溢未检测 | `BinaryOp::Add` (Int+Int) 漏 `checked_add` | v0.53 修了 Sub/Mul/Div/Mod 但漏 Add;补回 `checked_add` 保持 5 算子一致 |
-| `*n as usize` 静默 wrap | 15+ 处分布在 lexer/parser/dispatch/execute/mir/builtins | 抽 `flow::usize_from_value` 统一防御;新数值走 `Int/Number/Float + 负数 + NaN + Inf + 越界` 五重检查 |
-| `parse_budget` 仅支持 `Number` | `dispatch.rs` 与 `execute.rs` 重复实现 | 删 `execute.rs::parse_budget` 副本,改 `dispatch.rs` 改 `pub(crate)` 复用 |
-| `numeric_cmp` 走 f64 丢精度 | 签名 `Fn(f64,f64)→bool` 把 Int 强转 f64 | 改双闭包 `Fn(f64,f64) + Fn(i64,i64)`,Int/Int 走 i64 直比 |
-| `Checkpoint::from_json` 4 段重复 cast | 每个数值字段都重写 Int/Number/Float 路径 | 抽 `bounded_uint_from_value<T: TryFrom<u64>>` 泛型 |
-| 其它 | `sandbox.containerize cpu_cores/memory_mb` / `ai.embed index` / `compress options` / `parser orchestrate.loop max_rounds` / `mir::interp::index_value` / `document::reading_order_idx` | 同上 cast helper 收敛 |
-
-### 2. 语义瑕疵 fix-or-document（5 finding）
-
-| # | Finding | 裁定 |
-|---|---------|------|
-| A | `Int == Int → false` | **Fix** — `flow::values_equal` 漏 Int/Float arms;新增 4 arms + strict 跨类型 false |
-| B | `-3i → Number(-3.0)` | **Fix** — parser desugar left 硬编码 `Number(0.0)`;改用 `literal_kind` 按 operand 后缀选 `Int(0)` / `Float(0.0)` / `Number(0.0)` |
-| C | `if` 无 `else` 分支 | **Document as lexer gap** — `TokenType::Else` 在 lexer 中不存在,属 feature;留作未来 PR。regression test `if_else_branch_is_unimplemented_feature_in_lexer` 锁住现状,未来 lexer 升级时会自动 fail 提醒补 parser |
-| D | `match_statement` 不识别 `_` 通配符 | **Fix** — `consume_identifier` → `self.pattern()`,与 expression-level 共享模式语法 |
-| E | `execute` break/continue signal scope | **Document** — For 循环正确消费 inner Break/Continue,旧测试期望错误;新增 `execute_for_swallows_break_continue_signal_returned_to_outer` 锁定正确行为 |
-
-### 3. 核心路径白盒测试（99 个新 tests,0 行 production 改动）
-
-| 文件 | 入口 | 新增 tests |
-|------|------|-----------:|
-| `src/lexer.rs` | `Lexer::new / scan_tokens` | 27 |
-| `src/parser_v2/expressions.rs` | `ParserV2::expression / pattern / closure` | 19 |
-| `src/parser_v2/statements.rs` | `ParserV2::parse` 派发到 30+ `pub(super) fn` | 22 |
-| `src/parser_v2/mod.rs` | `ParserV2::new / parse / into_arena` | 7 |
-| `src/interpreter/evaluate.rs` | `Interpreter::evaluate` | 16 |
-| `src/interpreter/execute.rs` | `Interpreter::execute` | 9 |
-
-之前 6 个核心文件 0 直接单元测试,全部由 `builtins.rs` 集成测试间接覆盖 — 现补齐。
-
-### 4. 全新约束文件
-
-`AGENTS_CODE_MODIFICATION.md` — 与 `AGENTS.md` / `CLAUDE.md` 并列,落地 7 条代码修改行为约束 + 红线(根因 / 可移植 / 清晰度 / 范围 / 回归 / 交付)。未来所有 AI 会话按此执行。
-
-### 5. 审计产物
-
-`AUDIT_REPORT_V0_53.md` (1085 行,6 附录 A-F) — 全程审计 + 修复记录 + finding 裁定理由。
-`ARCHITECTURE_BUG_DETECTION_REPORT_2026-07-10.md` (404 行) — 上游产出的架构分析(本批审计前 baseline)。
-
-### Test / Quality
-
-- `cargo test --all` — **800 passed; 0 failed; 14 ignored**
-- `cargo clippy --all-targets --all-features -- -D warnings` — clean
-- `cargo fmt --check` — clean
-- 净增量 **+129 tests** (从 671 → 800),**0 回归**
-- 用户脚本输入面 `panic!` 路径:**0** (helper 收敛后无新引入)
-
 ## [v0.49.0] - 2026-07-07 — 并发安全 + 正确性 + 资源泄漏 (15 fixes)
 
 1 commit; v0.49 audit follow-up (per user request: check simple implementations for high-concurrency / high-pressure correctness).

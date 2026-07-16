@@ -109,14 +109,13 @@ impl Interpreter {
         if let Ok(Value::Dict(map)) = json_to_value(json_text)
             && let Some(Value::Dict(usage)) = map.get("usage")
         {
-            // LLM API 偶发不返回 usage 字段或返回负值；缺省按 0 计费统计。
             let input = match usage.get("prompt_tokens") {
-                Some(v) => crate::flow::usize_from_value(v, "usage.prompt_tokens").unwrap_or(0),
-                None => 0,
+                Some(Value::Number(n)) => *n as usize,
+                _ => 0,
             };
             let output = match usage.get("completion_tokens") {
-                Some(v) => crate::flow::usize_from_value(v, "usage.completion_tokens").unwrap_or(0),
-                None => 0,
+                Some(Value::Number(n)) => *n as usize,
+                _ => 0,
             };
             return (input, output);
         }

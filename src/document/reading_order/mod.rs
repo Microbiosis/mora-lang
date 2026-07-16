@@ -599,11 +599,10 @@ mod tests {
 
     fn reading_order_idx(b: &Value) -> Option<usize> {
         if let Value::Dict(d) = b {
-            // reading_order_idx 应为有限正整数；非法值（如 NaN / 负数）
-            // 视为字段缺失，回退到上一层的 natural 排序。
-            match d.get("reading_order_idx") {
-                Some(v) => crate::flow::usize_from_value(v, "reading_order_idx").ok(),
-                None => None,
+            if let Some(Value::Number(n)) = d.get("reading_order_idx") {
+                Some(*n as usize)
+            } else {
+                None
             }
         } else {
             None

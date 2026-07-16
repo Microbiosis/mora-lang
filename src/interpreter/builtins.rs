@@ -568,34 +568,29 @@ impl Interpreter {
                 }
 
                 // cpu_cores (可选, arg 3)
-                // 拒绝 `-1 as u32 = u32::MAX` 与 NaN/Inf（NaN/Inf 在 `as u32`
-                // 上行为平台相关，不能依赖）。
                 if let Some(n) = args.get(3) {
                     match n {
+                        Value::Number(v) => spec.limits.cpu_cores = Some(*v as u32),
+                        Value::Int(i) => spec.limits.cpu_cores = Some(*i as u32),
                         Value::Nil => {}
-                        v => {
-                            spec.limits.cpu_cores =
-                                Some(crate::checkpoint::bounded_uint_from_value::<u32>(
-                                    v,
-                                    "sandbox.cpu_cores",
-                                    u32::MAX as u64,
-                                )?);
+                        _ => {
+                            return Err(
+                                "sandbox.containerize: cpu_cores must be a number".to_string()
+                            );
                         }
                     }
                 }
 
                 // memory_mb (可选, arg 4)
-                // 同 cpu_cores，使用 bounded_uint_from_value<u64> 拒绝负值/NaN/Inf。
                 if let Some(n) = args.get(4) {
                     match n {
+                        Value::Number(v) => spec.limits.memory_mb = Some(*v as u64),
+                        Value::Int(i) => spec.limits.memory_mb = Some(*i as u64),
                         Value::Nil => {}
-                        v => {
-                            spec.limits.memory_mb =
-                                Some(crate::checkpoint::bounded_uint_from_value::<u64>(
-                                    v,
-                                    "sandbox.memory_mb",
-                                    u64::MAX,
-                                )?);
+                        _ => {
+                            return Err(
+                                "sandbox.containerize: memory_mb must be a number".to_string()
+                            );
                         }
                     }
                 }
@@ -1090,10 +1085,10 @@ impl Interpreter {
                     .first()
                     .map(|v| v.to_string())
                     .ok_or("ccr.marker: requires hash as first arg")?;
-                // size 缺省为 0；非法值（负数/NaN/非数值）也降级为 0。
-                let size = match args.get(1) {
-                    Some(v) => crate::flow::usize_from_value(v, "ccr.marker: size").unwrap_or(0),
-                    None => 0,
+                let size = if let Some(Value::Number(n)) = args.get(1) {
+                    *n as usize
+                } else {
+                    0
                 };
                 Ok(Value::String(crate::ccr::make_marker(&hash, size)))
             }
@@ -1801,10 +1796,10 @@ impl Interpreter {
                     return Err("mora.refine_info: requires script_path".to_string());
                 }
                 let script = std::path::PathBuf::from(args[0].to_string());
-                // iter 缺省为 None（由调用方走默认迭代策略）。
-                let iter = match args.get(1) {
-                    Some(v) => Some(crate::flow::usize_from_value(v, "mora.refine_info: iter")?),
-                    None => None,
+                let iter = if let Some(Value::Number(n)) = args.get(1) {
+                    Some(*n as usize)
+                } else {
+                    None
                 };
                 let registry = self
                     .orch
@@ -2176,9 +2171,16 @@ fn exec_parallel(args: &[Value]) -> Result<Value, String> {
     }
 
     // 第二个 arg (可选): max_concurrent
-    // 缺省值（不传时）为 `cmds.len()` ——全部并发；负数/NaN 必须错误返回。
     let max_concurrent: usize = if args.len() >= 2 {
-        crate::flow::usize_from_value(&args[1], "exec.parallel: max_concurrent")?.max(1)
+        match &args[1] {
+            Value::Number(n) => (*n as usize).max(1),
+            Value::Int(i) => (*i as usize).max(1),
+            _ => {
+                return Err(
+                    "exec.parallel: max_concurrent must be a non-negative number".to_string(),
+                );
+            }
+        }
     } else {
         cmds.len() // 默认: 全部并发
     };

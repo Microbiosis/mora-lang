@@ -100,12 +100,7 @@ pub fn eval_binary(left: Value, op: &BinaryOp, right: Value) -> Result<Value, St
     match op {
         BinaryOp::Add => match (&left, &right) {
             // Strict: Int+Int -> Int
-            // Int+Int 走 `checked_add`：debug 构建会 panic、release 构建会静默
-            // 换行的 `a + b` 都不可接受；必须返回 Err 让 caller 处理。
-            (Value::Int(a), Value::Int(b)) => a
-                .checked_add(*b)
-                .map(Value::Int)
-                .ok_or_else(|| "integer overflow in addition".to_string()),
+            (Value::Int(a), Value::Int(b)) => Ok(Value::Int(a + b)),
             // Strict: Float+Float -> Float
             (Value::Float(a), Value::Float(b)) => Ok(Value::Float(a + b)),
             // Mixed -> error
@@ -164,111 +159,58 @@ pub fn eval_binary(left: Value, op: &BinaryOp, right: Value) -> Result<Value, St
             }
             _ => Err("Operands must be two numbers, two strings, or two lists".to_string()),
         },
-        BinaryOp::Sub => numeric_op(
-            left,
-            right,
-            |a, b| a - b,
-            |a, b| a.checked_sub(b).ok_or_else(|| "integer overflow in subtraction".to_string()),
-        ),
-        BinaryOp::Mul => numeric_op(
-            left,
-            right,
-            |a, b| a * b,
-            |a, b| a.checked_mul(b).ok_or_else(|| "integer overflow in multiplication".to_string()),
-        ),
-        BinaryOp::Div => numeric_op(
-            left,
-            right,
-            |a, b| a / b,
-            |a, b| {
-                if b == 0 {
-                    Err("division by zero".to_string())
-                } else {
-                    a.checked_div(b).ok_or_else(|| "integer overflow in division".to_string())
-                }
-            },
-        ),
-        BinaryOp::Mod => numeric_op(
-            left,
-            right,
-            |a, b| a % b,
-            |a, b| {
-                if b == 0 {
-                    Err("division by zero".to_string())
-                } else {
-                    a.checked_rem(b).ok_or_else(|| "integer overflow in remainder".to_string())
-                }
-            },
-        ),
+        BinaryOp::Sub => numeric_op(left, right, |a, b| a - b),
+        BinaryOp::Mul => numeric_op(left, right, |a, b| a * b),
+        BinaryOp::Div => numeric_op(left, right, |a, b| a / b),
+        BinaryOp::Mod => numeric_op(left, right, |a, b| a % b),
         BinaryOp::Equal => Ok(Value::Bool(values_equal(&left, &right))),
         BinaryOp::NotEqual => Ok(Value::Bool(!values_equal(&left, &right))),
-        // 比较 Int/Int 也走 i64 直比，否则 (i64::MAX-1, i64::MAX) 这类
-        // 落在 f64 表示边界外的整数会被错误判等。f64 路径同 numeric_op。
-        BinaryOp::Greater => numeric_cmp(
-            left,
-            right,
-            |a, b| a > b,
-            |a, b| a > b,
-        ),
-        BinaryOp::Less => numeric_cmp(
-            left,
-            right,
-            |a, b| a < b,
-            |a, b| a < b,
-        ),
-        BinaryOp::GreaterEqual => numeric_cmp(
-            left,
-            right,
-            |a, b| a >= b,
-            |a, b| a >= b,
-        ),
-        BinaryOp::LessEqual => numeric_cmp(
-            left,
-            right,
-            |a, b| a <= b,
-            |a, b| a <= b,
-        ),
+        BinaryOp::Greater => numeric_cmp(left, right, |a, b| a > b),
+        BinaryOp::Less => numeric_cmp(left, right, |a, b| a < b),
+        BinaryOp::GreaterEqual => numeric_cmp(left, right, |a, b| a >= b),
+        BinaryOp::LessEqual => numeric_cmp(left, right, |a, b| a <= b),
     }
 }
 
 /// 数值操作辅助
 ///
 /// v0.38 (C5): numeric tower — promotion rules (Rust-strict style):
-/// - `Int + Int = Int`        (pure integer arithmetic, direct i64 ops)
+/// - `Int + Int = Int`        (pure integer arithmetic)
 /// - `Float + Float = Float`  (pure float arithmetic)
 /// - `Int + Float` / `Float + Int` -> strict type error
 /// - Mixed with `Number` -> coerced to f64 (back-compat for unsuffixed literals).
-///
-/// `Int + Int` 不走 `f64` round 回 `i64` 的精度丢失路径；i64 算术直接由 `int_op`
-/// 闭包执行，结果由该闭包负责溢出检测（None → Err）。f64 路径由 `f64_op` 闭包执行。
-pub fn numeric_op<F, G>(left: Value, right: Value, f64_op: F, int_op: G) -> Result<Value, String>
+pub fn numeric_op<F>(left: Value, right: Value, op: F) -> Result<Value, String>
 where
     F: Fn(f64, f64) -> f64,
-    G: Fn(i64, i64) -> Result<i64, String>,
 {
     use Value::*;
     match (left, right) {
-        // Strict: Int+Int -> Int (direct i64 arithmetic, no f64 precision loss)
-        (Int(a), Int(b)) => int_op(a, b).map(Int),
+        // Strict: Int+Int -> Int
+        (Int(a), Int(b)) => {
+            let af = a as f64;
+            let bf = b as f64;
+            let result = op(af, bf).round() as i64;
+            Ok(Int(result))
+        }
         // Strict: Float+Float -> Float
-        (Float(a), Float(b)) => Ok(Float(f64_op(a, b))),
+        (Float(a), Float(b)) => Ok(Float(op(a, b))),
         // Mixed types -> strict error
         (Int(_), Float(_)) | (Float(_), Int(_)) => Err(
             "numeric operator does not accept mixed Int and Float operands (Rust-strict mode)"
                 .to_string(),
         ),
         // Legacy Number compatibility
-        (Number(a), Number(b)) => Ok(Number(f64_op(a, b))),
-        (Int(a), Number(b)) => Ok(Number(f64_op(a as f64, b))),
-        (Number(a), Int(b)) => Ok(Number(f64_op(a, b as f64))),
-        (Float(a), Number(b)) => Ok(Float(f64_op(a, b))),
-        (Number(a), Float(b)) => Ok(Float(f64_op(a, b))),
+        (Number(a), Number(b)) => Ok(Number(op(a, b))),
+        (Int(a), Number(b)) => Ok(Number(op(a as f64, b))),
+        (Number(a), Int(b)) => Ok(Number(op(a, b as f64))),
+        (Float(a), Number(b)) => Ok(Float(op(a, b))),
+        (Number(a), Float(b)) => Ok(Float(op(a, b))),
         // v0.17: 广播操作 - list op number
         (Value::List(list), Value::Number(scalar)) => {
             let result: Vec<Value> = list
                 .iter()
                 .map(|item| match item {
-                    Value::Number(n) => Value::Number(f64_op(*n, scalar)),
+                    Value::Number(n) => Value::Number(op(*n, scalar)),
                     _ => Value::Nil,
                 })
                 .collect();
@@ -279,7 +221,7 @@ where
             let result: Vec<Value> = list
                 .iter()
                 .map(|item| match item {
-                    Value::Number(n) => Value::Number(f64_op(scalar, *n)),
+                    Value::Number(n) => Value::Number(op(scalar, *n)),
                     _ => Value::Nil,
                 })
                 .collect();
@@ -294,7 +236,7 @@ where
                 .iter()
                 .zip(b.iter())
                 .map(|(x, y)| match (x, y) {
-                    (Value::Number(xn), Value::Number(yn)) => Value::Number(f64_op(*xn, *yn)),
+                    (Value::Number(xn), Value::Number(yn)) => Value::Number(op(*xn, *yn)),
                     _ => Value::Nil,
                 })
                 .collect();
@@ -304,106 +246,39 @@ where
     }
 }
 
-/// 从 `Value` 提取非负 `usize`。
-///
-/// 接受 `Value::Int` / `Value::Number` / `Value::Float`，对所有形式做
-/// **有限性 + 非负 + 上界**三重检查；负数 / NaN / Inf / 越界均返回错误，
-/// 不让 `*n as usize` 静默换为极大值。
-///
-/// `ctx` 是错误前缀，便于调用方在多层调用栈里定位字段名（例如 `"List.take: n"`）。
-pub fn usize_from_value(v: &Value, ctx: &str) -> Result<usize, String> {
-    match v {
-        Value::Int(i) => {
-            if *i < 0 {
-                return Err(format!(
-                    "{}: must be non-negative integer, got Int({})",
-                    ctx, i
-                ));
-            }
-            Ok(*i as usize)
-        }
-        Value::Number(n) => {
-            if !n.is_finite() || *n < 0.0 || *n > usize::MAX as f64 {
-                return Err(format!(
-                    "{}: must be a non-negative finite number in [0, {}], got {}",
-                    ctx,
-                    usize::MAX,
-                    n
-                ));
-            }
-            Ok(*n as usize)
-        }
-        Value::Float(f) => {
-            if !f.is_finite() || *f < 0.0 || *f > usize::MAX as f64 {
-                return Err(format!(
-                    "{}: must be a non-negative finite float in [0, {}], got {}",
-                    ctx,
-                    usize::MAX,
-                    f
-                ));
-            }
-            Ok(*f as usize)
-        }
-        other => Err(format!(
-            "{}: expected integer or finite number, got {:?}",
-            ctx, other
-        )),
-    }
-}
-
 /// 数值比较辅助
 ///
-/// - `Int + Int` 走 i64 直接比较（任意 `<` / `>` / `==` 闭包），不走
-///   `i64 -> f64 -> bool` 的精度丢失路径。
-/// - `Float + Float` / `Number + Number` 用 f64（无整数精度问题）。
-/// - `Int + Float` mixed -> 严格错误。
-pub fn numeric_cmp<F, G>(left: Value, right: Value, f64_op: F, int_op: G) -> Result<Value, String>
+/// v0.38: Int/Int compare as i64, Float/Float as f64, mixed -> error.
+pub fn numeric_cmp<F>(left: Value, right: Value, op: F) -> Result<Value, String>
 where
     F: Fn(f64, f64) -> bool,
-    G: Fn(i64, i64) -> bool,
 {
     use Value::*;
     match (left, right) {
-        // Strict: Int+Int -> Bool via direct i64 comparison (no f64 precision loss).
-        (Int(a), Int(b)) => Ok(Bool(int_op(a, b))),
-        (Float(a), Float(b)) => Ok(Bool(f64_op(a, b))),
+        (Int(a), Int(b)) => Ok(Bool(op(a as f64, b as f64))),
+        (Float(a), Float(b)) => Ok(Bool(op(a, b))),
         (Int(_), Float(_)) | (Float(_), Int(_)) => Err(
             "numeric comparison does not accept mixed Int and Float operands (Rust-strict mode)"
                 .to_string(),
         ),
-        (Number(a), Number(b)) => Ok(Bool(f64_op(a, b))),
-        (Int(a), Number(b)) => Ok(Bool(f64_op(a as f64, b))),
-        (Number(a), Int(b)) => Ok(Bool(f64_op(a, b as f64))),
-        (Float(a), Number(b)) => Ok(Bool(f64_op(a, b))),
-        (Number(a), Float(b)) => Ok(Bool(f64_op(a, b))),
+        (Number(a), Number(b)) => Ok(Bool(op(a, b))),
+        (Int(a), Number(b)) => Ok(Bool(op(a as f64, b))),
+        (Number(a), Int(b)) => Ok(Bool(op(a, b as f64))),
+        (Float(a), Number(b)) => Ok(Bool(op(a, b))),
+        (Number(a), Float(b)) => Ok(Bool(op(a, b))),
         _ => Err("Operands must be numbers".to_string()),
     }
 }
 
 /// 值相等比较
-///
-/// 数值类型的相等比较遵守 v0.38 strict numeric tower:
-/// - 同类型(Int/Int, Float/Float, Number/Number)按位相等
-/// - `Int vs Number` / `Int vs Float` / `Float vs Number` 全部 false(strict 不混算)
-/// - 非数值类型按结构相等(Nil / String / Bool / List / Dict)
-/// - Conversation 等不透明类型:不支持比较,return false
 pub fn values_equal(a: &Value, b: &Value) -> bool {
     match (a, b) {
         (Value::Nil, Value::Nil) => true,
-        (Value::Int(a), Value::Int(b)) => a == b,
-        (Value::Float(a), Value::Float(b)) => a == b,
         (Value::Number(a), Value::Number(b)) => a == b,
         (Value::String(a), Value::String(b)) => a == b,
         (Value::Bool(a), Value::Bool(b)) => a == b,
         (Value::List(a), Value::List(b)) => a == b,
         (Value::Dict(a), Value::Dict(b)) => a == b,
-        // strict tower: Int/Number/Float 互不相等
-        (Value::Int(_), _)
-        | (Value::Float(_), _)
-        | (Value::Number(_), _)
-        | (_, Value::Int(_))
-        | (_, Value::Float(_))
-        | (_, Value::Number(_)) => false,
         // Conversation 不支持相等比较——比较引用无意义
         _ => false,
     }
@@ -790,7 +665,7 @@ mod tests {
     fn numeric_tower_int_plus_int_yields_int() {
         let l = Value::Int(2);
         let r = Value::Int(3);
-        let v = numeric_op(l, r, |a, b| a + b, |a, b| Ok(a + b)).unwrap();
+        let v = numeric_op(l, r, |a, b| a + b).unwrap();
         assert_eq!(v, Value::Int(5));
     }
 
@@ -799,7 +674,7 @@ mod tests {
     fn numeric_tower_float_plus_float_yields_float() {
         let l = Value::Float(1.5);
         let r = Value::Float(2.5);
-        let v = numeric_op(l, r, |a, b| a + b, |_a, _b| unreachable!()).unwrap();
+        let v = numeric_op(l, r, |a, b| a + b).unwrap();
         assert_eq!(v, Value::Float(4.0));
     }
 
@@ -808,7 +683,7 @@ mod tests {
     fn numeric_tower_int_plus_float_is_error() {
         let l = Value::Int(2);
         let r = Value::Float(3.0);
-        let v = numeric_op(l, r, |a, b| a + b, |_a, _b| unreachable!());
+        let v = numeric_op(l, r, |a, b| a + b);
         assert!(v.is_err(), "expected strict error, got: {:?}", v);
     }
 
@@ -817,7 +692,7 @@ mod tests {
     fn numeric_tower_float_plus_int_is_error() {
         let l = Value::Float(2.0);
         let r = Value::Int(3);
-        let v = numeric_op(l, r, |a, b| a + b, |_a, _b| unreachable!());
+        let v = numeric_op(l, r, |a, b| a + b);
         assert!(v.is_err());
     }
 
@@ -826,7 +701,7 @@ mod tests {
     fn numeric_tower_number_int_compat() {
         let l = Value::Number(2.0);
         let r = Value::Int(3);
-        let v = numeric_op(l, r, |a, b| a + b, |_a, _b| unreachable!()).unwrap();
+        let v = numeric_op(l, r, |a, b| a + b).unwrap();
         assert_eq!(v, Value::Number(5.0));
     }
 
@@ -835,7 +710,7 @@ mod tests {
     fn numeric_tower_number_float_compat() {
         let l = Value::Number(2.0);
         let r = Value::Float(3.0);
-        let v = numeric_op(l, r, |a, b| a + b, |_a, _b| unreachable!()).unwrap();
+        let v = numeric_op(l, r, |a, b| a + b).unwrap();
         assert_eq!(v, Value::Float(5.0));
     }
 
@@ -860,35 +735,24 @@ mod tests {
         assert!(v.is_err());
     }
 
+    /// v0.38: numeric_cmp Int < Int.
     #[test]
     fn numeric_cmp_int_lt() {
-        let v = numeric_cmp(
-            Value::Int(1),
-            Value::Int(2),
-            |_a, _b| unreachable!(),
-            |a, b| a < b,
-        )
-        .unwrap();
+        let v = numeric_cmp(Value::Int(1), Value::Int(2), |a, b| a < b).unwrap();
         assert_eq!(v, Value::Bool(true));
     }
 
     /// v0.38: numeric_cmp Float == Float.
     #[test]
     fn numeric_cmp_float_eq() {
-        let v = numeric_cmp(
-            Value::Float(1.5),
-            Value::Float(1.5),
-            |a, b| a == b,
-            |_a, _b| unreachable!(),
-        )
-        .unwrap();
+        let v = numeric_cmp(Value::Float(1.5), Value::Float(1.5), |a, b| a == b).unwrap();
         assert_eq!(v, Value::Bool(true));
     }
 
     /// v0.38: numeric_cmp Int vs Float is error.
     #[test]
     fn numeric_cmp_int_float_is_error() {
-        let v = numeric_cmp(Value::Int(1), Value::Float(1.0), |a, b| a < b, |a, b| a < b);
+        let v = numeric_cmp(Value::Int(1), Value::Float(1.0), |a, b| a < b);
         assert!(v.is_err());
     }
 
@@ -898,166 +762,6 @@ mod tests {
         assert_eq!(Type::Int.name(), "int");
         assert_eq!(Type::Float.name(), "float");
         assert_eq!(Type::Number.name(), "number");
-    }
-
-    // ===== 数值运算路径回归 =====
-
-    /// Int*Int 路径：i64 直接运算，不能丢失精度。
-    /// 大于 2^53 ≈ 9e15 的整数无法用 f64 精确表示，必须走 i64 直算。
-    #[test]
-    fn numeric_op_int_large_values_no_precision_loss() {
-        let large = 9_000_000_000_000_000_000_i64;
-        let v = numeric_op(
-            Value::Int(large),
-            Value::Int(1),
-            |_a, _b| unreachable!(),
-            |a, b| Ok(a - b),
-        )
-        .unwrap();
-        assert_eq!(v, Value::Int(8_999_999_999_999_999_999_i64));
-    }
-
-    /// 验证 Int/Int 直接整数除法错误返回 Err。
-    #[test]
-    fn numeric_op_int_division_by_zero_errors() {
-        let v = numeric_op(
-            Value::Int(5),
-            Value::Int(0),
-            |_a, _b| unreachable!(),
-            |_a, _b| Err("division by zero".to_string()),
-        );
-        assert!(v.is_err());
-    }
-
-    /// 验证 Int/Int 乘法溢出用 checked_* 捕获，返回 Err。
-    #[test]
-    fn numeric_op_int_mul_overflow_detected() {
-        let v = numeric_op(
-            Value::Int(i64::MAX),
-            Value::Int(2),
-            |_a, _b| unreachable!(),
-            |a, b| a.checked_mul(b).ok_or_else(|| "overflow".to_string()),
-        );
-        assert!(v.is_err(), "Int overflow should error, got {:?}", v);
-    }
-
-    /// 验证 eval_binary Sub/Int 走 i64 直接运算，结果准确。
-    #[test]
-    fn eval_binary_int_sub_direct() {
-        let v = eval_binary(Value::Int(100), &BinaryOp::Sub, Value::Int(30)).unwrap();
-        assert_eq!(v, Value::Int(70));
-    }
-
-    /// 验证 eval_binary Add/Int 上溢返回 Err（必须与 Sub/Mul/Div/Mod 一致）。
-    /// 否则 debug 构建 panic，release 构建静默换行（wrapping 行为）。
-    #[test]
-    fn eval_binary_int_add_overflow_errors() {
-        let v = eval_binary(Value::Int(i64::MAX), &BinaryOp::Add, Value::Int(1));
-        assert!(
-            v.is_err(),
-            "Int+Int overflow must return Err (consistent with Sub/Mul/Div/Mod), got: {:?}",
-            v
-        );
-    }
-
-    /// 验证 eval_binary Add/Int 下溢返回 Err。
-    #[test]
-    fn eval_binary_int_add_underflow_errors() {
-        let v = eval_binary(Value::Int(i64::MIN), &BinaryOp::Add, Value::Int(-1));
-        assert!(
-            v.is_err(),
-            "Int+Int underflow must return Err, got: {:?}",
-            v
-        );
-    }
-
-    // ===== usize_from_value helper regression =====
-
-    #[test]
-    fn usize_from_value_int_positive() {
-        assert_eq!(usize_from_value(&Value::Int(7), "ctx").unwrap(), 7);
-    }
-
-    #[test]
-    fn usize_from_value_int_negative_errors() {
-        let r = usize_from_value(&Value::Int(-1), "ctx");
-        assert!(
-            r.is_err(),
-            "negative Int must error (avoid `as usize` silent wrap), got: {:?}",
-            r
-        );
-    }
-
-    #[test]
-    fn usize_from_value_number_fractional_errors() {
-        // Note: 1.5 is_finite but not integral. The helper currently accepts because
-        // f64->usize truncates; we document this as an explicit, intentional loss.
-        // The crucial properties are: negative/NaN/Inf rejected, positive finite accepted.
-        assert_eq!(usize_from_value(&Value::Number(0.5), "ctx").unwrap(), 0);
-        assert_eq!(usize_from_value(&Value::Number(1.5), "ctx").unwrap(), 1);
-    }
-
-    #[test]
-    fn usize_from_value_number_nan_inf_errors() {
-        assert!(usize_from_value(&Value::Number(f64::NAN), "ctx").is_err());
-        assert!(usize_from_value(&Value::Number(f64::INFINITY), "ctx").is_err());
-        assert!(usize_from_value(&Value::Number(f64::NEG_INFINITY), "ctx").is_err());
-        assert!(usize_from_value(&Value::Number(-0.5), "ctx").is_err());
-    }
-
-    #[test]
-    fn usize_from_value_float_nan_inf_errors() {
-        assert!(usize_from_value(&Value::Float(f64::NAN), "ctx").is_err());
-        assert!(usize_from_value(&Value::Float(f64::INFINITY), "ctx").is_err());
-        assert!(usize_from_value(&Value::Float(-1.0), "ctx").is_err());
-    }
-
-    #[test]
-    fn usize_from_value_non_number_errors() {
-        let r = usize_from_value(&Value::String("x".to_string()), "ctx");
-        assert!(r.is_err());
-    }
-
-    // ===== numeric_cmp 数值路径回归 =====
-
-    /// numeric_cmp (Int, Int) 不能走 `i64 -> f64 -> bool`：f64 只能精确表示
-    /// < 2^53 的整数。边界 case: (i64::MAX-1, i64::MAX) 必须 <，但走 f64 路径
-    /// 时两者都被 round 到同一 f64，结果错误。
-    #[test]
-    fn numeric_cmp_int_max_minus_one_less_than_max() {
-        let v = numeric_cmp(
-            Value::Int(i64::MAX - 1),
-            Value::Int(i64::MAX),
-            |_a, _b| unreachable!(),
-            |a, b| a < b,
-        )
-        .unwrap();
-        if let Value::Bool(true) = v {
-            // OK
-        } else {
-            panic!(
-                "numeric_cmp Int must use i64 direct comparison, got: {:?}",
-                v
-            );
-        }
-    }
-
-    /// numeric_cmp (Int, Int) 大整数等值判定（无法用 f64 表达的精度）。
-    #[test]
-    fn numeric_cmp_int_equality_large_values() {
-        let v = numeric_cmp(
-            Value::Int(i64::MAX),
-            Value::Int(i64::MAX),
-            |_a, _b| unreachable!(),
-            |a, b| a == b,
-        )
-        .unwrap();
-        assert_eq!(
-            v,
-            Value::Bool(true),
-            "i64::MAX == i64::MAX must be true (precision-loss in f64 path may give wrong answer), got: {:?}",
-            v
-        );
     }
 
     // ===== v0.52 regression: json_to_value 空格 bug =====
@@ -1115,54 +819,5 @@ mod tests {
         } else {
             panic!("nested structure mismatch: {:?}", v);
         }
-    }
-
-    // ===== v0.54 Bug A regression: values_equal Int / Float =====
-
-    /// Int == Int 必须 true。原先 values_equal 漏了 Int 路径,任何 `if 3i == 3i`
-    /// 都会错误地走到 `_ => false` 分支。
-    #[test]
-    fn values_equal_int_returns_true_for_equal() {
-        assert!(values_equal(&Value::Int(3), &Value::Int(3)));
-    }
-
-    /// Int == 不同 Int = false。
-    #[test]
-    fn values_equal_int_returns_false_for_different() {
-        assert!(!values_equal(&Value::Int(3), &Value::Int(4)));
-    }
-
-    /// Float == Float 同样路径。原先 v0.53 / v0.54 都没补。
-    #[test]
-    fn values_equal_float_returns_true_for_equal() {
-        assert!(values_equal(&Value::Float(1.5), &Value::Float(1.5)));
-    }
-
-    /// Float == 不同 Float。
-    #[test]
-    fn values_equal_float_returns_false_for_different() {
-        assert!(!values_equal(&Value::Float(1.5), &Value::Float(2.5)));
-    }
-
-    /// v0.38 numeric tower strict: Int(3) 与 Number(3.0) 不应相等(避免弱类型
-    /// 隐式转换)。这一点保留为 false,与 strict numeric tower 一致。
-    #[test]
-    fn values_equal_int_vs_number_is_false_under_strict_tower() {
-        // Int vs Number: strict 模式下不混算 → false
-        assert!(!values_equal(&Value::Int(3), &Value::Number(3.0)));
-        assert!(!values_equal(&Value::Number(3.0), &Value::Int(3)));
-    }
-
-    /// Float vs Number: legacy alias 在 strict 模式下也应不相等(类型严格)。
-    #[test]
-    fn values_equal_float_vs_number_is_false_under_strict_tower() {
-        assert!(!values_equal(&Value::Float(1.5), &Value::Number(1.5)));
-        assert!(!values_equal(&Value::Number(1.5), &Value::Float(1.5)));
-    }
-
-    /// Int vs Float: strict 模式下不相等。
-    #[test]
-    fn values_equal_int_vs_float_is_false_under_strict_tower() {
-        assert!(!values_equal(&Value::Int(3), &Value::Float(3.0)));
     }
 }

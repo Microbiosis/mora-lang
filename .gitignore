@@ -28,3 +28,12 @@ build_output.txt
 clippy_output.txt
 fmt_output.txt
 test_output.txt
+
+# ZCode CLI 工作区缓存
+.zcode/
+
+# AI 图片生成结果 (工具产出，不应提交)
+*_preview.png
+*_preview.jpg
+*_generated.png
+*_generated.jpg

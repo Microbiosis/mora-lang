@@ -23,6 +23,8 @@ use crate::value::Value;
 
 pub mod interp;
 pub mod lower;
+pub mod opt;
+pub mod ssa;
 
 pub use interp::run_mir;
 pub use lower::lower_program;

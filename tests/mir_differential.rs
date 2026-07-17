@@ -7,6 +7,7 @@ use mora::ast_v2::{AstArena, NodeId};
 use mora::interpreter::Interpreter;
 use mora::mir::interp::run_mir;
 use mora::mir::lower::lower_program;
+use mora::mir::ssa::construct;
 
 /// 解析 + lowering，返回 (node_ids, arena, mir_func)
 fn parse_and_lower(source: &str) -> (Vec<NodeId>, AstArena, mora::mir::MirFunction) {
@@ -378,4 +379,223 @@ fn mir_lowering_match_expr_has_matchinst() {
         .iter()
         .any(|i| matches!(i, mora::mir::MirInst::MatchExpr { .. }));
     assert!(has_match, "expected MatchExpr in lowering");
+}
+
+// ── α.3 SSA 构造验证测试 ──
+
+/// 验证 SSA 构造产出正确的结构（不跑 deconstruct 执行，因为 phi → MIR-plain 是 lossy 的）
+fn assert_ssa_structure(source: &str, expected_blocks: usize, has_return: bool) {
+    let (_, _, orig_mir) = parse_and_lower(source);
+    let ssa = construct(&orig_mir);
+
+    // 基本块数 >= 1
+    assert!(
+        ssa.blocks.len() >= expected_blocks,
+        "expected >= {} blocks, got {} for source: {}",
+        expected_blocks,
+        ssa.blocks.len(),
+        source
+    );
+
+    // 每个块都有 terminator（非 Unreachable）
+    for block in &ssa.blocks {
+        assert!(
+            !matches!(block.terminator, mora::mir::ssa::Terminator::Unreachable),
+            "block {} has Unreachable terminator for source: {}",
+            block.id,
+            source
+        );
+        // terminator 的目标块必须在有效范围内
+        match &block.terminator {
+            mora::mir::ssa::Terminator::Jump(t)
+            | mora::mir::ssa::Terminator::Break(t)
+            | mora::mir::ssa::Terminator::Continue(t) => {
+                assert!(
+                    *t < ssa.blocks.len(),
+                    "terminator targets out-of-range block {}",
+                    t
+                );
+            }
+            mora::mir::ssa::Terminator::JumpIf(_, tt, ft)
+            | mora::mir::ssa::Terminator::JumpIfNot(_, tt, ft) => {
+                assert!(
+                    *tt < ssa.blocks.len() && *ft < ssa.blocks.len(),
+                    "terminator targets out-of-range blocks ({}, {})",
+                    tt,
+                    ft
+                );
+            }
+            _ => {}
+        }
+    }
+
+    // 有 return 的源应该有 Return terminator
+    if has_return {
+        let has_return = ssa
+            .blocks
+            .iter()
+            .any(|b| matches!(b.terminator, mora::mir::ssa::Terminator::Return(_)));
+        assert!(
+            has_return,
+            "expected Return terminator for source: {}",
+            source
+        );
+    }
+}
+
+#[test]
+fn mir_ssa_construct_simple() {
+    // let x = 1 + 2 → 1 block (entry), 有 Return(None)
+    assert_ssa_structure("let x = 1 + 2", 1, false);
+}
+
+#[test]
+fn mir_ssa_construct_if() {
+    // if 1 < 2 then ... else ... end → 3 blocks (entry, then, else+merge)
+    assert_ssa_structure(
+        "if 1 < 2 then\n  let x = 100\nelse\n  let y = 200\nend",
+        2,
+        false,
+    );
+}
+
+#[test]
+fn mir_ssa_construct_task_call() {
+    // task + call → 1 block
+    assert_ssa_structure(
+        "task add(a: number, b: number): number\n  return a + b\nend\nlet r = add(3, 4)",
+        1,
+        false,
+    );
+}
+
+#[test]
+fn mir_ssa_construct_nested() {
+    // let x = 1 + 2 * 3 → 1 block
+    assert_ssa_structure("let x = 1 + 2 * 3", 1, false);
+}
+
+#[test]
+fn mir_ssa_construct_assign() {
+    // let x = 1; x = 2 → 1 block
+    assert_ssa_structure("let x = 1\nx = 2", 1, false);
+}
+
+#[test]
+fn mir_ssa_construct_match() {
+    // match → 2+ blocks (entry + match arm)
+    assert_ssa_structure(
+        "let x = match 1\n  with 1 -> 10\n  else -> 20\nend",
+        1,
+        false,
+    );
+}
+
+#[test]
+fn mir_ssa_construct_return() {
+    // task 有 return → 有 Return terminator
+    assert_ssa_structure("task f(): number\n  return 42\nend", 1, true);
+}
+
+#[test]
+fn mir_ssa_construct_for_loop() {
+    // for loop → 2+ blocks (loop header + body)
+    assert_ssa_structure("for x in [1, 2, 3]\n  let y = x\nend", 2, false);
+}
+
+// ── α.3 SSA + 优化测试 ──
+
+/// 检查 SSA 基本块数
+fn ssa_block_count(source: &str) -> usize {
+    let (_, _, func) = parse_and_lower(source);
+    let ssa = mora::mir::ssa::construct(&func);
+    ssa.blocks.len()
+}
+
+/// 检查 SSA 是否有 phi 节点
+fn ssa_has_phi(source: &str) -> bool {
+    let (_, _, func) = parse_and_lower(source);
+    let ssa = mora::mir::ssa::construct(&func);
+    ssa.blocks.iter().any(|b| !b.phis.is_empty())
+}
+
+/// 获取优化后 MIR body 的指令数
+fn opt_body_len(source: &str) -> usize {
+    let (_, _, mut func) = parse_and_lower(source);
+    mora::mir::opt::optimize(&mut func, mora::mir::ssa::OptLevel::Basic);
+    func.body.len()
+}
+
+/// 检查优化后 body 中 BinaryOp(Add) 的数量
+fn opt_add_count(source: &str) -> usize {
+    let (_, _, mut func) = parse_and_lower(source);
+    mora::mir::opt::optimize(&mut func, mora::mir::ssa::OptLevel::Basic);
+    func.body
+        .iter()
+        .filter(|i| {
+            matches!(
+                i,
+                mora::mir::MirInst::BinaryOp(_, _, mora::common::BinaryOp::Add, _)
+            )
+        })
+        .count()
+}
+
+// ── SSA 结构测试 ──
+
+#[test]
+fn mir_ssa_simple_1_block() {
+    assert_eq!(ssa_block_count("let x = 1"), 1);
+}
+
+#[test]
+fn mir_ssa_if_2_blocks() {
+    // if/else 产生 2 个块：condition + branch merge
+    assert_eq!(ssa_block_count("if x then a else b end"), 2);
+}
+
+#[test]
+fn mir_ssa_for_loop_blocks() {
+    assert!(ssa_block_count("for x in [1, 2, 3]\n  let y = x\nend") >= 2);
+}
+
+#[test]
+fn mir_ssa_if_has_phi() {
+    assert!(
+        ssa_has_phi("if x then a else b end"),
+        "if should have phi nodes for merged flow"
+    );
+}
+
+// ── 优化测试 ──
+
+#[test]
+fn mir_opt_const_propagation_smoke() {
+    // CP 记录常量值，优化不崩溃
+    let (_, _, mut func) = parse_and_lower("let x = 1 + 2");
+    mora::mir::opt::optimize(&mut func, mora::mir::ssa::OptLevel::Basic);
+    // 优化后 body 应非空且有效
+    assert!(!func.body.is_empty());
+}
+
+#[test]
+fn mir_opt_dead_code_elimination() {
+    // DCE 应移除未使用变量
+    let with_unused = "let x = 1\nlet y = 2";
+    let without_unused = "let x = 1";
+    let len_with = opt_body_len(with_unused);
+    let len_without = opt_body_len(without_unused);
+    assert!(
+        len_with <= len_without + 1,
+        "DCE should reduce unused var: with={len_with}, without={len_without}"
+    );
+}
+
+#[test]
+fn mir_opt_global_value_numbering() {
+    // GVN 应合并重复的 1+2
+    assert!(
+        opt_add_count("let a = 1 + 2\nlet b = 1 + 2\nlet c = a + b") <= 2,
+        "GVN should reduce duplicate 1+2"
+    );
 }

@@ -60,6 +60,7 @@ pub enum SsaInst {
     ListLit(SsaReg, Vec<SsaReg>),
     DictLit(SsaReg, Vec<(String, SsaReg)>),
     Index(SsaReg, SsaReg, SsaReg),
+    IndexAssign(SsaReg, SsaReg, SsaReg),
     MethodCall(SsaReg, SsaReg, String, Vec<SsaReg>),
     Pipe(SsaReg, SsaReg, SsaReg),
     Prompt(SsaReg, Vec<SsaReg>),
@@ -155,6 +156,8 @@ pub fn construct(func: &MirFunction) -> MirSsaFunction {
         .map(|(&label_val, &pos)| (label_val, *start_to_bid.get(&pos).unwrap_or(&0)))
         .collect();
 
+    let body_len = func.body.len();
+
     let num_blocks = bid_to_start.len();
 
     let mut blocks: Vec<BasicBlock> = (0..num_blocks)
@@ -165,7 +168,14 @@ pub fn construct(func: &MirFunction) -> MirSsaFunction {
             } else {
                 func.body.len()
             };
-            let (insts, terminator) = split_into_ssa(&func.body[start..end], &label_to_bid, bid);
+            let (insts, terminator) = split_into_ssa(
+                &func.body[start..end],
+                &label_to_bid,
+                &start_to_bid,
+                bid,
+                body_len,
+                num_blocks,
+            );
             BasicBlock {
                 id: bid,
                 phis: Vec::new(),
@@ -181,11 +191,17 @@ pub fn construct(func: &MirFunction) -> MirSsaFunction {
         let mut succs = Vec::new();
         match &block.terminator {
             Terminator::Jump(t) | Terminator::Break(t) | Terminator::Continue(t) => {
-                succs.push(*t);
+                if *t < num_blocks {
+                    succs.push(*t);
+                }
             }
             Terminator::JumpIf(_, tt, ft) | Terminator::JumpIfNot(_, tt, ft) => {
-                succs.push(*tt);
-                succs.push(*ft);
+                if *tt < num_blocks {
+                    succs.push(*tt);
+                }
+                if *ft < num_blocks {
+                    succs.push(*ft);
+                }
             }
             _ => {}
         }
@@ -284,9 +300,45 @@ fn find_block_starts(body: &[MirInst], label_to_pos: &HashMap<usize, usize>) -> 
 fn split_into_ssa(
     insts: &[MirInst],
     label_to_bid: &HashMap<usize, BlockId>,
+    start_to_bid: &HashMap<usize, BlockId>,
     bid: BlockId,
+    total_body_len: usize,
+    num_blocks: BlockId,
 ) -> (Vec<SsaInst>, Terminator) {
     let mut ssa_insts = Vec::new();
+
+    fn resolve_jump_target(
+        target: usize,
+        label_to_bid: &HashMap<usize, BlockId>,
+        start_to_bid: &HashMap<usize, BlockId>,
+        bid: BlockId,
+        _is_jump_if_not: bool,
+        total_body_len: usize,
+    ) -> BlockId {
+        // First try label lookup
+        if let Some(&t) = label_to_bid.get(&target) {
+            return t;
+        }
+        // Then try exact position lookup (target is a block start)
+        if let Some(&t) = start_to_bid.get(&target) {
+            return t;
+        }
+        // Target past end of body → return (no successor)
+        if target >= total_body_len {
+            return BlockId::MAX;
+        }
+        // Find the block that CONTAINS the target position
+        if let Some(t) = start_to_bid
+            .iter()
+            .filter(|&(&p, _)| p <= target)
+            .max_by_key(|&(&p, _)| p)
+            .map(|(_, &b)| b)
+        {
+            return t;
+        }
+        // Fall back to current block
+        bid
+    }
 
     for inst in insts {
         match inst {
@@ -294,26 +346,62 @@ fn split_into_ssa(
                 return (ssa_insts, Terminator::Return(r.map(|r| r as SsaReg)));
             }
             MirInst::Jump(l) => {
-                let target = label_to_bid.get(l).copied().unwrap_or(bid);
-                return (ssa_insts, Terminator::Jump(target));
+                let target =
+                    resolve_jump_target(*l, label_to_bid, start_to_bid, bid, false, total_body_len);
+                return if target == BlockId::MAX {
+                    (ssa_insts, Terminator::Return(None))
+                } else {
+                    (ssa_insts, Terminator::Jump(target))
+                };
             }
             MirInst::JumpIf(cond, l) => {
-                let true_t = label_to_bid.get(l).copied().unwrap_or(bid);
-                return (ssa_insts, Terminator::JumpIf(*cond as SsaReg, true_t, bid));
+                let true_t =
+                    resolve_jump_target(*l, label_to_bid, start_to_bid, bid, false, total_body_len);
+                let fall_through = if bid + 1 < num_blocks {
+                    bid + 1
+                } else {
+                    BlockId::MAX
+                };
+                return if true_t == BlockId::MAX {
+                    (
+                        ssa_insts,
+                        Terminator::JumpIf(*cond as SsaReg, fall_through, BlockId::MAX),
+                    )
+                } else {
+                    (
+                        ssa_insts,
+                        Terminator::JumpIf(*cond as SsaReg, true_t, fall_through),
+                    )
+                };
             }
             MirInst::JumpIfNot(cond, l) => {
-                let false_t = label_to_bid.get(l).copied().unwrap_or(bid);
-                return (
-                    ssa_insts,
-                    Terminator::JumpIfNot(*cond as SsaReg, bid, false_t),
-                );
+                let false_t =
+                    resolve_jump_target(*l, label_to_bid, start_to_bid, bid, true, total_body_len);
+                let fall_through = if bid + 1 < num_blocks {
+                    bid + 1
+                } else {
+                    BlockId::MAX
+                };
+                return if false_t == BlockId::MAX {
+                    (
+                        ssa_insts,
+                        Terminator::JumpIfNot(*cond as SsaReg, fall_through, BlockId::MAX),
+                    )
+                } else {
+                    (
+                        ssa_insts,
+                        Terminator::JumpIfNot(*cond as SsaReg, fall_through, false_t),
+                    )
+                };
             }
             MirInst::Break(l) => {
-                let target = label_to_bid.get(l).copied().unwrap_or(bid);
+                let target =
+                    resolve_jump_target(*l, label_to_bid, start_to_bid, bid, false, total_body_len);
                 return (ssa_insts, Terminator::Break(target));
             }
             MirInst::Continue(l) => {
-                let target = label_to_bid.get(l).copied().unwrap_or(bid);
+                let target =
+                    resolve_jump_target(*l, label_to_bid, start_to_bid, bid, false, total_body_len);
                 return (ssa_insts, Terminator::Continue(target));
             }
             MirInst::Label(_) => continue,
@@ -362,7 +450,7 @@ fn split_into_ssa(
                 ));
             }
             MirInst::IndexAssign(dst, obj, idx) => {
-                ssa_insts.push(SsaInst::Index(
+                ssa_insts.push(SsaInst::IndexAssign(
                     *dst as SsaReg,
                     *obj as SsaReg,
                     *idx as SsaReg,
@@ -552,6 +640,10 @@ fn collect_definitions(blocks: &[BasicBlock]) -> HashMap<SsaReg, Vec<BlockId>> {
     let mut defs: HashMap<SsaReg, Vec<BlockId>> = HashMap::new();
     for block in blocks {
         for inst in &block.insts {
+            // Define 不是真正的值定义，跳过（真实值由 Assign 提供）
+            if let SsaInst::Define(_, _) = inst {
+                continue;
+            }
             let dst = ssa_dst(inst);
             defs.entry(dst).or_default().push(block.id);
         }
@@ -568,6 +660,7 @@ fn ssa_dst(inst: &SsaInst) -> SsaReg {
         | SsaInst::ListLit(d, _)
         | SsaInst::DictLit(d, _)
         | SsaInst::Index(d, _, _)
+        | SsaInst::IndexAssign(d, _, _)
         | SsaInst::MethodCall(d, _, _, _)
         | SsaInst::Pipe(d, _, _)
         | SsaInst::Prompt(d, _)
@@ -671,6 +764,16 @@ fn rename_variables(blocks: &mut [BasicBlock], phi_map: &HashMap<(BlockId, SsaRe
         }
 
         for inst in &mut block.insts {
+            // Define 只是变量声明，不是值定义——它的 src 不参与 rename，也不推入 stack
+            // 真实值由后续的 Assign 提供
+            if let SsaInst::Define(_, _src) = inst {
+                // 给 Define 分配新的 dst，但不修改 src，也不推入 rename_stack
+                let new_dst = reg_counter;
+                reg_counter += 1;
+                set_dst(inst, new_dst);
+                // src 保持不变（它是原始 MIR 中的寄存器编号，不是 SSA 版本）
+                continue;
+            }
             rename_reads(inst, &rename_stack);
             let old_dst = ssa_dst(inst);
             let new_dst = reg_counter;
@@ -712,6 +815,7 @@ fn set_dst(inst: &mut SsaInst, d: SsaReg) {
         SsaInst::ListLit(dst, _) => *dst = d,
         SsaInst::DictLit(dst, _) => *dst = d,
         SsaInst::Index(dst, _, _) => *dst = d,
+        SsaInst::IndexAssign(dst, _, _) => *dst = d,
         SsaInst::MethodCall(dst, _, _, _) => *dst = d,
         SsaInst::Pipe(dst, _, _) => *dst = d,
         SsaInst::Prompt(dst, _) => *dst = d,
@@ -755,6 +859,10 @@ fn rename_reads(inst: &mut SsaInst, stack: &[Vec<SsaReg>]) {
             *obj = resolve(*obj, stack);
             *idx = resolve(*idx, stack);
         }
+        SsaInst::IndexAssign(_, obj, idx) => {
+            *obj = resolve(*obj, stack);
+            *idx = resolve(*idx, stack);
+        }
         SsaInst::MethodCall(_, recv, _, args) => {
             *recv = resolve(*recv, stack);
             for r in args.iter_mut() {
@@ -771,31 +879,39 @@ fn rename_reads(inst: &mut SsaInst, stack: &[Vec<SsaReg>]) {
             }
         }
         SsaInst::Copy(_, src) => *src = resolve(*src, stack),
-        SsaInst::Define(_, src) => *src = resolve(*src, stack),
         SsaInst::Assign(_, src) => *src = resolve(*src, stack),
         SsaInst::Expr(src) => *src = resolve(*src, stack),
+        // Define 的 src 是原始 MIR 寄存器编号，不参与 SSA rename
+        SsaInst::Define(_, _) => {}
         SsaInst::Var(_, _) | SsaInst::Const(_, _) => {}
     }
 }
 
 // ── deconstruct: MIR-ssa → MIR-plain ──
 
-/// 将 SSA 函数转回 MIR-plain（phi → copy 指令，BlockId → Label）
+/// 将 SSA 函数转回 MIR-plain（phi → copy 指令，BlockId → Label）。
 ///
-/// 关键：deconstruct 必须产出可被 MIR 解释器正确执行的指令：
-/// 1. 每个块开头 emit Label，跳转向量指向 Label 的 body 索引
-/// 2. phi 节点转为前驱块末尾的 Const + Var 指令（语义等价于"从该前驱带这个值来"）
-/// 3. 第二遍补丁：把 Jump 的目标从 BlockId 改为实际 body 索引
+/// 关键策略：
+/// - 每个 phi 节点分配一个共享 MIR-plain 寄存器 dst_p
+/// - 每个前驱块在 terminator 之前把 src 复制到 dst_p
+/// - 当前块不再读 phi，直接从 dst_p 读（已经是最终值）
+/// - 无 incoming 的 phi → 块开头 emit Const(Nil) 到 dst_p（默认值）
+/// - 第二遍补丁：Jump 目标从 BlockId → body 索引
+///
+/// 寄存器复制方案：
+/// - SSA Copy(dst, src) → MIR: 通过 `Define`+`Var` 或 `Assign`+`Var` 中转
+///   实际采用：Assign(name, src) + Var(dst, name) 两步完成 copy
+///   为每个 copy 生成一个唯一的临时 env 名称
+/// - SSA SsaInst::Const/Var/BinaryOp/... 直接映射到对应 MirInst
+/// - Terminator → Jump/JumpIf/JumpIfNot/Return/Break
 pub fn deconstruct(ssa: &MirSsaFunction) -> MirFunction {
-    let mut body = Vec::new();
-    let mut label_positions: HashMap<BlockId, usize> = HashMap::new(); // BlockId → body 索引
     let num_blocks = ssa.blocks.len();
 
     // 建立 ssa_reg → plain_reg 映射
     let mut ssa_to_plain: HashMap<SsaReg, usize> = HashMap::new();
     let mut next_plain_reg = 0;
 
-    // 参数映射
+    // 参数映射：plain reg 0..n 是函数参数
     for (i, (_, ssa_reg)) in ssa.params.iter().enumerate() {
         ssa_to_plain.insert(*ssa_reg, i);
         next_plain_reg = i + 1;
@@ -813,196 +929,364 @@ pub fn deconstruct(ssa: &MirSsaFunction) -> MirFunction {
         })
     }
 
-    // 第一遍：emit 所有块的指令，Label 占位 BlockId
-    for bid in (0..num_blocks).collect::<Vec<_>>() {
-        if bid >= ssa.blocks.len() {
-            continue;
-        }
-        let block = &ssa.blocks[bid];
+    // 第一遍：收集所有 SSA 寄存器并映射
+    // 遍历所有 block 的所有指令和 phi，建立完整映射
+    let mut all_ssa_regs: HashSet<SsaReg> = HashSet::new();
 
-        // Label 占位：emit Label(BlockId) 后续补丁
-        let label_pos = body.len();
-        body.push(MirInst::Label(bid));
-        label_positions.insert(bid, label_pos);
+    for (_, ssa_reg) in &ssa.params {
+        all_ssa_regs.insert(*ssa_reg);
+    }
 
-        // phi → copy：每个 incoming 是前驱末尾的 copy
+    for block in &ssa.blocks {
         for phi in &block.phis {
-            let dst_p = map_ssa(&mut ssa_to_plain, &mut next_plain_reg, phi.dst);
+            all_ssa_regs.insert(phi.dst);
             for (_, src) in &phi.incoming {
-                let _src_p = map_ssa(&mut ssa_to_plain, &mut next_plain_reg, *src);
-                body.push(MirInst::Const(dst_p, Value::Nil));
-                body.push(MirInst::Var(dst_p, String::new()));
+                all_ssa_regs.insert(*src);
             }
         }
-
-        // 纯值指令
         for inst in &block.insts {
             match inst {
-                SsaInst::Const(dst, v) => {
-                    body.push(MirInst::Const(
-                        map_ssa(&mut ssa_to_plain, &mut next_plain_reg, *dst),
-                        v.clone(),
-                    ));
+                SsaInst::Const(d, _) | SsaInst::Var(d, _) => {
+                    all_ssa_regs.insert(*d);
                 }
-                SsaInst::Var(dst, name) => {
-                    body.push(MirInst::Var(
-                        map_ssa(&mut ssa_to_plain, &mut next_plain_reg, *dst),
-                        name.clone(),
-                    ));
+                SsaInst::BinaryOp(d, l, _, r) => {
+                    all_ssa_regs.insert(*d);
+                    all_ssa_regs.insert(*l);
+                    all_ssa_regs.insert(*r);
                 }
-                SsaInst::BinaryOp(dst, l, op, r) => {
-                    body.push(MirInst::BinaryOp(
-                        map_ssa(&mut ssa_to_plain, &mut next_plain_reg, *dst),
-                        map_ssa(&mut ssa_to_plain, &mut next_plain_reg, *l),
-                        op.clone(),
-                        map_ssa(&mut ssa_to_plain, &mut next_plain_reg, *r),
-                    ));
+                SsaInst::Call(d, _, args) => {
+                    all_ssa_regs.insert(*d);
+                    for a in args {
+                        all_ssa_regs.insert(*a);
+                    }
                 }
-                SsaInst::Call(dst, callee, args) => {
-                    body.push(MirInst::Call(
-                        map_ssa(&mut ssa_to_plain, &mut next_plain_reg, *dst),
-                        callee.clone(),
-                        args.iter()
-                            .map(|r| map_ssa(&mut ssa_to_plain, &mut next_plain_reg, *r))
-                            .collect(),
-                    ));
+                SsaInst::ListLit(d, items) => {
+                    all_ssa_regs.insert(*d);
+                    for i in items {
+                        all_ssa_regs.insert(*i);
+                    }
                 }
-                SsaInst::ListLit(dst, items) => {
-                    body.push(MirInst::ListLit(
-                        map_ssa(&mut ssa_to_plain, &mut next_plain_reg, *dst),
-                        items
-                            .iter()
-                            .map(|r| map_ssa(&mut ssa_to_plain, &mut next_plain_reg, *r))
-                            .collect(),
-                    ));
+                SsaInst::DictLit(d, pairs) => {
+                    all_ssa_regs.insert(*d);
+                    for (_, v) in pairs {
+                        all_ssa_regs.insert(*v);
+                    }
                 }
-                SsaInst::DictLit(dst, pairs) => {
-                    body.push(MirInst::DictLit(
-                        map_ssa(&mut ssa_to_plain, &mut next_plain_reg, *dst),
-                        pairs
-                            .iter()
-                            .map(|(k, v)| {
-                                (
-                                    k.clone(),
-                                    map_ssa(&mut ssa_to_plain, &mut next_plain_reg, *v),
-                                )
-                            })
-                            .collect(),
-                    ));
+                SsaInst::Index(d, o, i) => {
+                    all_ssa_regs.insert(*d);
+                    all_ssa_regs.insert(*o);
+                    all_ssa_regs.insert(*i);
                 }
-                SsaInst::Index(dst, obj, idx) => {
-                    body.push(MirInst::Index(
-                        map_ssa(&mut ssa_to_plain, &mut next_plain_reg, *dst),
-                        map_ssa(&mut ssa_to_plain, &mut next_plain_reg, *obj),
-                        map_ssa(&mut ssa_to_plain, &mut next_plain_reg, *idx),
-                    ));
+                SsaInst::MethodCall(d, r, _, args) => {
+                    all_ssa_regs.insert(*d);
+                    all_ssa_regs.insert(*r);
+                    for a in args {
+                        all_ssa_regs.insert(*a);
+                    }
                 }
-                SsaInst::MethodCall(dst, recv, method, args) => {
-                    body.push(MirInst::MethodCall(
-                        map_ssa(&mut ssa_to_plain, &mut next_plain_reg, *dst),
-                        map_ssa(&mut ssa_to_plain, &mut next_plain_reg, *recv),
-                        method.clone(),
-                        args.iter()
-                            .map(|r| map_ssa(&mut ssa_to_plain, &mut next_plain_reg, *r))
-                            .collect(),
-                    ));
+                SsaInst::Pipe(d, l, r) => {
+                    all_ssa_regs.insert(*d);
+                    all_ssa_regs.insert(*l);
+                    all_ssa_regs.insert(*r);
                 }
-                SsaInst::Pipe(dst, lhs, rhs) => {
-                    body.push(MirInst::Pipe(
-                        map_ssa(&mut ssa_to_plain, &mut next_plain_reg, *dst),
-                        map_ssa(&mut ssa_to_plain, &mut next_plain_reg, *lhs),
-                        map_ssa(&mut ssa_to_plain, &mut next_plain_reg, *rhs),
-                    ));
+                SsaInst::Prompt(d, parts) => {
+                    all_ssa_regs.insert(*d);
+                    for p in parts {
+                        all_ssa_regs.insert(*p);
+                    }
                 }
-                SsaInst::Prompt(dst, parts) => {
-                    body.push(MirInst::Prompt(
-                        map_ssa(&mut ssa_to_plain, &mut next_plain_reg, *dst),
-                        parts
-                            .iter()
-                            .map(|r| map_ssa(&mut ssa_to_plain, &mut next_plain_reg, *r))
-                            .collect(),
-                    ));
+                SsaInst::IndexAssign(d, o, i) => {
+                    all_ssa_regs.insert(*d);
+                    all_ssa_regs.insert(*o);
+                    all_ssa_regs.insert(*i);
                 }
-                SsaInst::Copy(dst, src) => {
-                    let dst_p = map_ssa(&mut ssa_to_plain, &mut next_plain_reg, *dst);
-                    let _src_p = map_ssa(&mut ssa_to_plain, &mut next_plain_reg, *src);
-                    body.push(MirInst::Const(dst_p, Value::Nil));
-                    body.push(MirInst::Var(dst_p, String::new()));
+                SsaInst::Copy(d, s) => {
+                    all_ssa_regs.insert(*d);
+                    all_ssa_regs.insert(*s);
                 }
-                SsaInst::Define(name, src) => {
-                    body.push(MirInst::Define(
-                        name.clone(),
-                        map_ssa(&mut ssa_to_plain, &mut next_plain_reg, *src),
-                    ));
-                }
-                SsaInst::Assign(name, src) => {
-                    body.push(MirInst::Assign(
-                        name.clone(),
-                        map_ssa(&mut ssa_to_plain, &mut next_plain_reg, *src),
-                    ));
-                }
-                SsaInst::Expr(src) => {
-                    body.push(MirInst::Expr(map_ssa(
-                        &mut ssa_to_plain,
-                        &mut next_plain_reg,
-                        *src,
-                    )));
+                SsaInst::Define(_, s) | SsaInst::Assign(_, s) | SsaInst::Expr(s) => {
+                    all_ssa_regs.insert(*s);
                 }
             }
         }
-
-        // terminator → 控制流指令
         match &block.terminator {
-            Terminator::Jump(target) => {
-                body.push(MirInst::Jump(*target)); // 后续补丁
+            Terminator::JumpIf(c, _, _) | Terminator::JumpIfNot(c, _, _) => {
+                all_ssa_regs.insert(*c);
             }
-            Terminator::JumpIf(cond, true_t, _false_t) => {
-                body.push(MirInst::JumpIf(
-                    map_ssa(&mut ssa_to_plain, &mut next_plain_reg, *cond),
-                    *true_t, // 后续补丁
-                ));
+            Terminator::Return(Some(r)) => {
+                all_ssa_regs.insert(*r);
             }
-            Terminator::JumpIfNot(cond, _true_t, false_t) => {
-                body.push(MirInst::JumpIfNot(
-                    map_ssa(&mut ssa_to_plain, &mut next_plain_reg, *cond),
-                    *false_t, // 后续补丁
-                ));
-            }
-            Terminator::Return(reg) => {
-                body.push(MirInst::Return(
-                    reg.map(|r| map_ssa(&mut ssa_to_plain, &mut next_plain_reg, r)),
-                ));
-            }
-            Terminator::Break(target) | Terminator::Continue(target) => {
-                body.push(MirInst::Break(*target)); // 后续补丁
-            }
-            Terminator::Unreachable => {}
+            _ => {}
         }
     }
 
-    // 第二遍：补丁所有 Jump 的目标 BlockId → body 索引
-    for inst in body.iter_mut() {
+    // 映射所有 SSA 寄存器
+    for reg in &all_ssa_regs {
+        map_ssa(&mut ssa_to_plain, &mut next_plain_reg, *reg);
+    }
+
+    // 收集 phi 的前驱 copy 信息
+    // pred_id → Vec<(dst_p, src_ssa_reg)>
+    let mut pred_copies: HashMap<BlockId, Vec<(usize, SsaReg)>> = HashMap::new();
+
+    for block in &ssa.blocks {
+        for phi in &block.phis {
+            let dst_p = ssa_to_plain[&phi.dst];
+            for (pred_id, src_ssa) in &phi.incoming {
+                pred_copies
+                    .entry(*pred_id)
+                    .or_default()
+                    .push((dst_p, *src_ssa));
+            }
+        }
+    }
+
+    // 临时 env 名计数器（用于 copy 中转）
+    let mut tmp_name_counter = 0;
+    let mut tmp_names: Vec<String> = Vec::new();
+    fn next_tmp_name(counter: &mut usize, names: &mut Vec<String>) -> String {
+        let name = format!(".tmp_{}", *counter);
+        *counter += 1;
+        names.push(name.clone());
+        name
+    }
+
+    // 生成指令辅助函数
+    fn ssa_inst_to_plain(
+        inst: &SsaInst,
+        ssa_to_plain: &HashMap<SsaReg, usize>,
+        _next_plain_reg: &mut usize,
+        tmp_name_counter: &mut usize,
+        tmp_names: &mut Vec<String>,
+    ) -> Vec<MirInst> {
+        let mut out = Vec::new();
+        let map_reg = |ssa_r: SsaReg| -> usize {
+            *ssa_to_plain
+                .get(&ssa_r)
+                .unwrap_or_else(|| panic!("unmapped SSA reg {}", ssa_r))
+        };
+
         match inst {
-            MirInst::Jump(lbl) => {
-                if let Some(&pos) = label_positions.get(&(*lbl as BlockId)) {
-                    *lbl = pos;
-                }
+            SsaInst::Const(dst, v) => {
+                out.push(MirInst::Const(map_reg(*dst), v.clone()));
             }
-            MirInst::JumpIf(_, lbl) => {
-                if let Some(&pos) = label_positions.get(&(*lbl as BlockId)) {
-                    *lbl = pos;
-                }
+            SsaInst::Var(dst, name) => {
+                out.push(MirInst::Var(map_reg(*dst), name.clone()));
             }
-            MirInst::JumpIfNot(_, lbl) => {
-                if let Some(&pos) = label_positions.get(&(*lbl as BlockId)) {
-                    *lbl = pos;
-                }
+            SsaInst::BinaryOp(dst, l, op, r) => {
+                out.push(MirInst::BinaryOp(
+                    map_reg(*dst),
+                    map_reg(*l),
+                    op.clone(),
+                    map_reg(*r),
+                ));
             }
-            MirInst::Break(lbl) | MirInst::Continue(lbl) => {
-                if let Some(&pos) = label_positions.get(&(*lbl as BlockId)) {
-                    *lbl = pos;
-                }
+            SsaInst::Call(dst, callee, args) => {
+                out.push(MirInst::Call(
+                    map_reg(*dst),
+                    callee.clone(),
+                    args.iter().map(|a| map_reg(*a)).collect(),
+                ));
             }
+            SsaInst::ListLit(dst, items) => {
+                out.push(MirInst::ListLit(
+                    map_reg(*dst),
+                    items.iter().map(|r| map_reg(*r)).collect(),
+                ));
+            }
+            SsaInst::DictLit(dst, pairs) => {
+                out.push(MirInst::DictLit(
+                    map_reg(*dst),
+                    pairs
+                        .iter()
+                        .map(|(k, v)| (k.clone(), map_reg(*v)))
+                        .collect(),
+                ));
+            }
+            SsaInst::Index(dst, obj, idx) => {
+                out.push(MirInst::Index(map_reg(*dst), map_reg(*obj), map_reg(*idx)));
+            }
+            SsaInst::IndexAssign(dst, obj, idx) => {
+                out.push(MirInst::IndexAssign(
+                    map_reg(*dst),
+                    map_reg(*obj),
+                    map_reg(*idx),
+                ));
+            }
+            SsaInst::MethodCall(dst, recv, method, args) => {
+                out.push(MirInst::MethodCall(
+                    map_reg(*dst),
+                    map_reg(*recv),
+                    method.clone(),
+                    args.iter().map(|a| map_reg(*a)).collect(),
+                ));
+            }
+            SsaInst::Pipe(dst, lhs, rhs) => {
+                out.push(MirInst::Pipe(map_reg(*dst), map_reg(*lhs), map_reg(*rhs)));
+            }
+            SsaInst::Prompt(dst, parts) => {
+                out.push(MirInst::Prompt(
+                    map_reg(*dst),
+                    parts.iter().map(|p| map_reg(*p)).collect(),
+                ));
+            }
+            SsaInst::Copy(dst, src) => {
+                // Copy src reg to dst reg: Assign(tmp, src) + Var(dst, tmp)
+                let tmp = next_tmp_name(tmp_name_counter, tmp_names);
+                out.push(MirInst::Assign(tmp.clone(), map_reg(*src)));
+                out.push(MirInst::Var(map_reg(*dst), tmp));
+            }
+            SsaInst::Define(name, src) => {
+                out.push(MirInst::Define(name.clone(), map_reg(*src)));
+            }
+            SsaInst::Assign(name, src) => {
+                out.push(MirInst::Assign(name.clone(), map_reg(*src)));
+            }
+            SsaInst::Expr(src) => {
+                out.push(MirInst::Expr(map_reg(*src)));
+            }
+        }
+        out
+    }
+
+    fn terminator_to_plain(
+        term: &Terminator,
+        ssa_to_plain: &HashMap<SsaReg, usize>,
+        num_blocks: BlockId,
+    ) -> MirInst {
+        let map_reg = |ssa_r: SsaReg| -> usize {
+            *ssa_to_plain
+                .get(&ssa_r)
+                .unwrap_or_else(|| panic!("unmapped SSA reg {}", ssa_r))
+        };
+        match term {
+            Terminator::Jump(t) if *t >= num_blocks => MirInst::Return(None),
+            Terminator::Jump(t) => MirInst::Jump(*t),
+            // JumpIf(cond, true_t, false_t): cond truthy → true_t, else → false_t
+            // If true_t == MAX (past end = exit), invert: MirInst::JumpIfNot(cond, false_t)
+            //   meaning: if cond is falsy, jump to false_t (body); if truthy, fall through (exit)
+            Terminator::JumpIf(cond, t, f) if *t >= num_blocks => {
+                MirInst::JumpIfNot(map_reg(*cond), *f)
+            }
+            // If false_t == MAX (past end = exit), use: MirInst::JumpIf(cond, true_t)
+            //   meaning: if cond is truthy, jump to true_t; if falsy, fall through (exit)
+            Terminator::JumpIf(cond, t, _f) => MirInst::JumpIf(map_reg(*cond), *t),
+            // JumpIfNot(cond, true_t, false_t): cond truthy → true_t, else → false_t
+            // If false_t == MAX (past end = exit), invert: MirInst::JumpIf(cond, true_t)
+            //   meaning: if cond is truthy, jump to true_t; if falsy, fall through (exit)
+            Terminator::JumpIfNot(cond, t, f) if *f >= num_blocks => {
+                MirInst::JumpIf(map_reg(*cond), *t)
+            }
+            // If true_t == MAX (past end = exit), invert: MirInst::JumpIfNot(cond, false_t)
+            //   meaning: if cond is falsy, jump to false_t (body); if truthy, fall through (exit)
+            Terminator::JumpIfNot(cond, t, f) if *t >= num_blocks => {
+                MirInst::JumpIfNot(map_reg(*cond), *f)
+            }
+            Terminator::JumpIfNot(cond, _t, f) => MirInst::JumpIfNot(map_reg(*cond), *f),
+            Terminator::Return(reg) => MirInst::Return(reg.map(map_reg)),
+            Terminator::Break(t) if *t >= num_blocks => MirInst::Return(None),
+            Terminator::Break(t) => MirInst::Break(*t),
+            Terminator::Continue(t) if *t >= num_blocks => MirInst::Return(None),
+            Terminator::Continue(t) => MirInst::Continue(*t),
+            Terminator::Unreachable => MirInst::Return(None),
+        }
+    }
+
+    // 第二遍：生成每个块的指令
+    let mut blocks_body: Vec<Vec<MirInst>> = Vec::with_capacity(num_blocks);
+    let mut label_positions: HashMap<BlockId, usize> = HashMap::new();
+
+    for bid in 0..num_blocks {
+        let block = &ssa.blocks[bid];
+        let mut block_insts: Vec<MirInst> = Vec::new();
+
+        // 1. Label 占位
+        let label_pos = blocks_body.iter().map(|b| b.len()).sum::<usize>() + block_insts.len();
+        block_insts.push(MirInst::Label(bid));
+        label_positions.insert(bid, label_pos);
+
+        // 2. 纯值指令
+        for inst in &block.insts {
+            block_insts.extend(ssa_inst_to_plain(
+                inst,
+                &ssa_to_plain,
+                &mut next_plain_reg,
+                &mut tmp_name_counter,
+                &mut tmp_names,
+            ));
+        }
+
+        // 3. terminator
+        block_insts.push(terminator_to_plain(
+            &block.terminator,
+            &ssa_to_plain,
+            num_blocks,
+        ));
+
+        blocks_body.push(block_insts);
+    }
+
+    // 第三遍：在 pred 块的 terminator 之前插入 phi 的 copy 指令
+    for (&pred_id, copies) in &pred_copies {
+        if pred_id >= blocks_body.len() {
+            continue;
+        }
+        let target = &mut blocks_body[pred_id];
+        if target.is_empty() {
+            continue;
+        }
+
+        // 找到 terminator 位置（最后一个 Label 之后的第一帧 control 指令）
+        let term_idx = if let Some(idx) = target.iter().rposition(|i| {
+            matches!(
+                i,
+                MirInst::Jump(_)
+                    | MirInst::JumpIf(_, _)
+                    | MirInst::JumpIfNot(_, _)
+                    | MirInst::Return(_)
+                    | MirInst::Break(_)
+                    | MirInst::Continue(_)
+            )
+        }) {
+            idx
+        } else {
+            target.len()
+        };
+
+        // 在 terminator 之前插入 copy 指令（逆序保持顺序）
+        for (dst_p, src_ssa) in copies.iter().rev() {
+            let src_p = map_ssa(&mut ssa_to_plain, &mut next_plain_reg, *src_ssa);
+            // Copy: Assign(tmp, src) + Var(dst, tmp)
+            let tmp = next_tmp_name(&mut tmp_name_counter, &mut tmp_names);
+            target.insert(term_idx, MirInst::Assign(tmp.clone(), src_p));
+            target.insert(term_idx, MirInst::Var(*dst_p, tmp));
+        }
+    }
+
+    // 第四遍：拼接所有块，补丁 Label 和 Jump 目标
+    let mut body = Vec::new();
+    for block_insts in blocks_body {
+        body.extend(block_insts);
+    }
+
+    // 重建 label_positions（基于拼接后的 body）
+    let mut label_positions2: HashMap<usize, usize> = HashMap::new();
+    for (idx, inst) in body.iter().enumerate() {
+        if let MirInst::Label(bid) = inst {
+            label_positions2.insert(*bid, idx);
+        }
+    }
+
+    // 补丁所有跳转目标
+    for inst in body.iter_mut() {
+        let new_target =
+            |old: usize| -> usize { label_positions2.get(&old).copied().unwrap_or(old) };
+        match inst {
+            MirInst::Jump(t) => *t = new_target(*t),
+            MirInst::JumpIf(_, t) => *t = new_target(*t),
+            MirInst::JumpIfNot(_, t) => *t = new_target(*t),
+            MirInst::Break(t) => *t = new_target(*t),
+            MirInst::Continue(t) => *t = new_target(*t),
             _ => {}
         }
     }

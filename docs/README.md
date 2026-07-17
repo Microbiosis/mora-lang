@@ -48,10 +48,8 @@ docs/
 │   ├── chatdev-analysis-report.md
 │   └── agents-cli_analysis.md
 │
-├── _archive/                  ← 历史会话工作流（v0.08-v0.34 时代产物）
-│   └── *.md
-│
-└── superpowers/               ← Superpowers 相关文档
+└── _archive/                  ← 历史会话产物（v0.08-v0.34 时代，共 19 个文件）
+    └── *.md / *.txt
 ```
 
 ## 文档类型规则
@@ -62,7 +60,7 @@ docs/
 | `docs/semantics/*.md` | 形式化语义 | 随语言演进 | `value-equality.md` |
 | `docs/reports/*.md` | 审计 / 质量报告 | 历史归档 | `AUDIT_ZEROTRUST_V0_34.md` |
 | `docs/research/*.md` | 调研 / 竞品分析 | 探索性 | `research-langgraph.md` |
-| `docs/_archive/*.md` | 历史会话工作流 | 已归档 | `workflow-v0.24-parser-migration.md` |
+| `docs/_archive/*.md` | 历史会话产物 | 已归档 | `workflow-v0.24-parser-migration.md` |
 | 根目录 `*.md` | 仓库核心配置 | 长期维护 | `README.md`, `CHANGELOG.md` |
 | 根目录 `AGENTS_*.md` | Agent 规则 | 长期维护 | `AGENTS_CODE_MODIFICATION.md` |
 

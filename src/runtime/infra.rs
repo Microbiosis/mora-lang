@@ -14,11 +14,11 @@ use crate::value::Value;
 /// Clone 时 recorder 重建为 new_off()（与 `Interpreter::clone` 现有行为一致）。
 /// Arc<Mutex<LruCache<..>> 字段共享 Arc，scheduler/bus 有 Clone impl。
 pub struct InfraRuntime {
-    pub recorder: Recorder,
-    pub string_interner: Arc<Mutex<LruCache<Value>>>,
-    pub ai_cache: Arc<Mutex<LruCache<String>>>,
-    pub bus: EventBus,
-    pub scheduler: Scheduler,
+    pub(crate) recorder: Recorder,
+    pub(crate) string_interner: Arc<Mutex<LruCache<Value>>>,
+    pub(crate) ai_cache: Arc<Mutex<LruCache<String>>>,
+    pub(crate) bus: EventBus,
+    pub(crate) scheduler: Scheduler,
 }
 
 impl Clone for InfraRuntime {
@@ -61,6 +61,16 @@ impl InfraRuntime {
         cache.put(key.clone(), val);
         // 返回 put 后 key 的 map index（仅占位 — 实际项目未使用该返回值）
         key.len()
+    }
+
+    /// 获取 recorder 引用（main.rs 需要直接访问）
+    pub fn recorder(&self) -> &Recorder {
+        &self.recorder
+    }
+
+    /// 替换 recorder（main.rs 需要整体替换 recorder 实例）
+    pub fn replace_recorder(&mut self, recorder: Recorder) {
+        self.recorder = recorder;
     }
 }
 

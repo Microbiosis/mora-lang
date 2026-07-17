@@ -17,21 +17,21 @@ use crate::value::{Environment, Value};
 #[derive(Clone)]
 pub struct CoreRuntime {
     /// 全局变量环境
-    pub globals: Arc<Mutex<Environment>>,
+    pub(crate) globals: Arc<Mutex<Environment>>,
     /// 当前执行环境（可嵌套）
-    pub environment: Arc<Mutex<Environment>>,
+    pub(crate) environment: Arc<Mutex<Environment>>,
     /// 工具注册表（MCP / builtin tool 的运行时注册）
-    pub tool_registry: Arc<HashMap<String, ToolDef>>,
+    pub(crate) tool_registry: Arc<HashMap<String, ToolDef>>,
     /// v2 AST arena — 在 interpret 期间存储，供 call_value 执行 v2 闭包
-    pub v2_arena: Option<Arc<AstArena>>,
+    pub(crate) v2_arena: Option<Arc<AstArena>>,
     /// 当前 with 块 set 的 AiConfig 值
-    pub current_ai_config: Option<AiConfigValue>,
+    pub(crate) current_ai_config: Option<AiConfigValue>,
     /// with 块 config 保存/恢复栈（MIR 解释器用）
-    pub config_stack: Vec<Option<AiConfigValue>>,
+    pub(crate) config_stack: Vec<Option<AiConfigValue>>,
     /// Worker 并发 channels（sender 端）
-    pub worker_channels: HashMap<String, crossbeam_channel::Sender<Value>>,
+    pub(crate) worker_channels: HashMap<String, crossbeam_channel::Sender<Value>>,
     /// Worker 并发 channels（receiver 端）
-    pub worker_receivers: HashMap<String, crossbeam_channel::Receiver<Value>>,
+    pub(crate) worker_receivers: HashMap<String, crossbeam_channel::Receiver<Value>>,
 }
 
 impl Default for CoreRuntime {

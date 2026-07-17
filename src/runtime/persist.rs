@@ -11,12 +11,12 @@ use crate::checkpoint::CheckpointSaver;
 #[derive(Clone)]
 pub struct PersistRuntime {
     /// v0.42.1: Audit sink (default NullSink; switch to JsonlAuditSink for hash-chained audit log)
-    pub audit_sink: Arc<dyn crate::audit::AuditSink>,
+    pub(crate) audit_sink: Arc<dyn crate::audit::AuditSink>,
     /// v0.43.1: Markdown memory root dir (test isolation + custom path support)
     /// If None, falls back to $MORA_MEMORY_DIR or $HOME/.mora/memory
-    pub markdown_memory_dir: Option<PathBuf>,
+    pub(crate) markdown_memory_dir: Option<PathBuf>,
     /// v0.50: Pregel 检查点保存器（由 Worker 2/3 完善 checkpoint 模块后注入）
-    pub checkpoint_saver: Option<Arc<dyn CheckpointSaver>>,
+    pub(crate) checkpoint_saver: Option<Arc<dyn CheckpointSaver>>,
 }
 
 impl Default for PersistRuntime {

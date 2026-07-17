@@ -94,7 +94,24 @@ impl TypeChecker {
             StmtKind::StreamFor { prompt, body, .. } => {
                 self.check_stream_for_stmt(*prompt, body, arena, symbols);
             }
-            StmtKind::ToolDef { body, .. } | StmtKind::Observe { body, .. } => {
+            StmtKind::ToolDef {
+                name,
+                description: _,
+                params,
+                return_type,
+                body,
+                exported: _,
+            } => {
+                self.check_tool_def_stmt(
+                    name,
+                    params,
+                    return_type.as_deref(),
+                    body,
+                    arena,
+                    symbols,
+                );
+            }
+            StmtKind::Observe { body, .. } => {
                 self.check_block_stmts(body, arena, symbols);
             }
             StmtKind::Span {
@@ -460,7 +477,65 @@ impl TypeChecker {
         );
     }
 
-    /// 检查模式匹配语句
+    /// 检查 tool 定义语句
+    ///
+    /// 校验参数类型 hint 与返回类型 hint（编译期签名校验），
+    /// 并在 symbols 注册 tool 的签名（后续调用点可校验实参）。
+    fn check_tool_def_stmt(
+        &mut self,
+        name: &str,
+        params: &[(String, Option<String>)],
+        return_type: Option<&str>,
+        body: &[NodeId],
+        arena: &AstArena,
+        symbols: &mut SymbolTable,
+    ) {
+        symbols.push_scope();
+        for (pname, phint) in params {
+            let pty = phint
+                .as_deref()
+                .map(Type::from_hint)
+                .unwrap_or(Type::Union(vec![]));
+            symbols.define(pname.clone(), pty);
+        }
+        self.current_return_hint = return_type
+            .map(Type::from_hint)
+            .or(Some(Type::Union(vec![])));
+        for stmt_id in body {
+            if let Some(stmt) = arena.get_stmt(*stmt_id) {
+                let kind = stmt.kind.clone();
+                self.check_stmt(&kind, arena, symbols);
+            }
+        }
+        self.current_return_hint = None;
+        symbols.pop_scope();
+        // 注册 tool 签名（与 task 签名相同结构）
+        let param_types: Vec<(String, Type)> = params
+            .iter()
+            .map(|(n, hint)| {
+                (
+                    n.clone(),
+                    hint.as_deref()
+                        .map(Type::from_hint)
+                        .unwrap_or(Type::Union(vec![])),
+                )
+            })
+            .collect();
+        let raw_params: Vec<Option<String>> = params.iter().map(|(_, hint)| hint.clone()).collect();
+        let ret = return_type
+            .map(Type::from_hint)
+            .unwrap_or(Type::Union(vec![]));
+        let raw_ret = return_type.map(|s| s.to_string());
+        self.signatures.insert(
+            name.to_string(),
+            Signature {
+                params: param_types,
+                raw_params,
+                return_type: ret,
+                raw_return_type: raw_ret,
+            },
+        );
+    }
     fn check_match_stmt(
         &mut self,
         expr: NodeId,
@@ -501,6 +576,7 @@ impl TypeChecker {
             "system",
             "mock_llm",
             "compact_at",
+            "tools",
         ];
         for (key, expr_id) in bindings {
             if !WITH_KEYS.contains(&key.as_str()) {

@@ -157,6 +157,15 @@ pub enum Value {
         /// v2 body: 存储 arena 中的 NodeId 索引
         v2_body_ids: Vec<usize>,
     },
+    /// v0.54: 工具声明 — 可被 AI 调用的命名工具
+    Tool {
+        name: String,
+        description: String,
+        params: Vec<String>,
+        return_type: Option<String>,
+        /// v2 body: 存储 arena 中的 NodeId 索引
+        v2_body_ids: Vec<usize>,
+    },
     Closure {
         params: Vec<String>,
         /// v0.40: env is now EnvRef (Local Rc<RefCell> or Owned Box<Environment>)
@@ -329,6 +338,7 @@ impl std::fmt::Display for Value {
                 write!(f, "}}")
             }
             Value::Task { name, .. } => write!(f, "<task {}>", name),
+            Value::Tool { name, .. } => write!(f, "<tool {}>", name),
             Value::Closure { .. } => write!(f, "<closure>"),
             Value::Builtin(name) => write!(f, "<builtin {}>", name),
             Value::Conversation {

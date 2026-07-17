@@ -1540,6 +1540,20 @@ impl ParserV2 {
         let span = self.span_of_current();
         self.advance(); // consume 'tool'
         let name = self.consume_identifier("Expected tool name");
+
+        // 可选: description 字符串直接跟在 name 后面 (引号内)
+        // 语法: tool name "description" (...) ...
+        let description = if let Some(Token {
+            token_type: TokenType::String(s),
+            ..
+        }) = self.peek().cloned()
+        {
+            self.advance();
+            s
+        } else {
+            String::new()
+        };
+
         let params = if self.match_token(&[TokenType::LParen]) {
             let mut p = Vec::new();
             if !self.check(&TokenType::RParen) {
@@ -1554,7 +1568,12 @@ impl ParserV2 {
             Vec::new()
         };
         let return_type = if self.match_token(&[TokenType::Colon]) {
-            Some(self.consume_identifier("Expected return type"))
+            let mut rtype = self.consume_identifier("Expected return type");
+            // Normalize legacy "number" type hint to "float".
+            if rtype == "number" {
+                rtype = "float".to_string();
+            }
+            Some(rtype)
         } else {
             None
         };
@@ -1575,6 +1594,7 @@ impl ParserV2 {
         self.consume(&TokenType::End, "Expected 'end'");
         let kind = StmtKind::ToolDef {
             name,
+            description,
             params,
             return_type,
             body,

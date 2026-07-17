@@ -317,6 +317,7 @@ fn value_to_json(v: &Value) -> JsonValue {
             JsonValue::Object(out)
         }
         Value::Task { name, .. } => JsonValue::String_(format!("<task {}>", name)),
+        Value::Tool { name, .. } => JsonValue::String_(format!("<tool {}>", name)),
         Value::Closure { .. } => JsonValue::String_("<closure>".to_string()),
         Value::Builtin(kind) => JsonValue::String_(format!("<builtin {}>", kind)),
         Value::Stream { .. } => JsonValue::String_("<stream>".to_string()),

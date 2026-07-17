@@ -57,6 +57,22 @@ impl Interpreter {
                 exported,
                 ..
             } => self.execute_task_def(name, params, body, *exported, arena),
+            StmtKind::ToolDef {
+                name,
+                description,
+                params,
+                return_type,
+                body,
+                exported,
+            } => self.execute_tool_def(
+                name,
+                description,
+                params,
+                return_type.as_deref(),
+                body,
+                *exported,
+                arena,
+            ),
             StmtKind::Match { expr, arms } => self.execute_match(*expr, arms, arena),
             StmtKind::With { bindings, body } => self.execute_with(bindings, body, arena),
             StmtKind::Parallel { stmts } => self.execute_parallel(stmts, arena),
@@ -328,6 +344,113 @@ impl Interpreter {
         Ok((FlowSignal::None, None))
     }
 
+    /// 执行 tool 定义（v0.54 新增）
+    ///
+    /// 1. 注册为 `Value::Tool` 到 environment（可像 task 一样被 `tool_name()` 调用）
+    /// 2. 构建闭包 + JSON Schema，注册为 `ToolDef` 到 `core.tool_registry`（供 AI 调用）
+    #[allow(clippy::too_many_arguments)]
+    fn execute_tool_def(
+        &mut self,
+        name: &str,
+        description: &str,
+        params: &[(String, Option<String>)],
+        return_type: Option<&str>,
+        body: &[NodeId],
+        exported: bool,
+        _arena: &AstArena,
+    ) -> Result<(FlowSignal, Option<Value>), String> {
+        let param_names: Vec<String> = params.iter().map(|(n, _)| n.clone()).collect();
+        let return_type_str = return_type.map(|s| s.to_string());
+        let body_ids: Vec<usize> = body.iter().map(|id| id.0).collect();
+
+        // 1) 注册 Value::Tool 到 environment（可在 Mora 代码中像 task 一样调用）
+        self.core.environment.lock().define(
+            name.to_string(),
+            Value::Tool {
+                name: name.to_string(),
+                description: description.to_string(),
+                params: param_names.clone(),
+                return_type: return_type_str.clone(),
+                v2_body_ids: body_ids.clone(),
+            },
+            exported,
+        );
+
+        // 2) 构建闭包 + JSON Schema，注册到 core.tool_registry（供 AI 调用）
+        let closure = Value::Closure {
+            params: param_names,
+            env: crate::value::EnvRef::from_arc_mutex(self.core.environment.clone()),
+            v2_node_id: None, // tool body uses body_ids, not a single node
+        };
+        let schema = self.build_tool_json_schema(name, description, params, return_type);
+        let tool_def = crate::interpreter::ToolDef {
+            name: name.to_string(),
+            description: description.to_string(),
+            parameters: schema,
+            handler: closure,
+        };
+        // 注意：tool_registry 是 Arc<HashMap>，需 clone 后替换（clone 的 Interpreter 共享 Arc）
+        let mut tr = (*self.core.tool_registry).clone();
+        tr.insert(name.to_string(), tool_def);
+        self.core.tool_registry = Arc::new(tr);
+
+        Ok((FlowSignal::None, None))
+    }
+
+    /// 从类型 hint 生成 JSON Schema 字符串（手写，无外部 crate）
+    fn build_tool_json_schema(
+        &self,
+        _name: &str,
+        description: &str,
+        params: &[(String, Option<String>)],
+        return_type: Option<&str>,
+    ) -> String {
+        let mut properties: Vec<String> = Vec::new();
+        let mut required: Vec<String> = Vec::new();
+        for (pname, hint) in params {
+            let json_type = self.type_hint_to_json_type(hint);
+            properties.push(format!("\"{}\":{{\"type\":\"{}\"}}", pname, json_type));
+            required.push(pname.clone());
+        }
+        let props = properties.join(",");
+        let reqs = required
+            .into_iter()
+            .map(|s| format!("\"{}\"", s))
+            .collect::<Vec<_>>()
+            .join(",");
+        let mut schema = format!(
+            r#"{{"type":"object","properties":{{{}}},"required":[{}]}}"#,
+            props, reqs
+        );
+        if let Some(rt) = return_type {
+            let rt_json = self.type_hint_to_json_type(&Some(rt.to_string()));
+            let desc = if description.is_empty() {
+                "Tool return value"
+            } else {
+                description
+            };
+            schema.push_str(&format!(
+                r#","returnType":{{"type":"{}","description":"{}"}}"#,
+                rt_json, desc
+            ));
+        }
+        schema
+    }
+
+    /// 将 Mora type hint 映射为 JSON Schema type
+    fn type_hint_to_json_type(&self, hint: &Option<String>) -> &'static str {
+        match hint.as_deref() {
+            Some("string") => "string",
+            Some("float") | Some("number") => "number",
+            Some("int") => "integer",
+            Some("bool") => "boolean",
+            Some("list") | Some("list<any>") => "array",
+            Some("dict") => "object",
+            Some("any") | None => "string", // default fallback
+            _ => "string",
+        }
+    }
+
     /// 执行 match 语句
     fn execute_match(
         &mut self,
@@ -397,6 +520,12 @@ impl Interpreter {
                 "compact_at" => {
                     if let Value::Float(n) = v {
                         self.ai.context_window.compression_threshold = n / 100.0;
+                    }
+                }
+                // v0.54: with tools: ["read_file", "run_cmd"] — 自动绑定 tool 列表到 AI 调用
+                "tools" => {
+                    if let Value::List(items) = v {
+                        cfg.tool_names = Some(items.iter().map(|i| i.to_string()).collect());
                     }
                 }
                 _ => {}

@@ -8,7 +8,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::common::BinaryOp;
-use crate::mir::ssa::{BasicBlock, MirSsaFunction, SsaInst, SsaReg, Terminator};
+use crate::mir::ssa::{MirSsaFunction, SsaInst, SsaReg, Terminator};
 use crate::value::Value;
 
 /// 对 MIR-plain 函数执行优化 pass
@@ -53,6 +53,7 @@ fn ssa_dst(inst: &SsaInst) -> SsaReg {
         | SsaInst::ListLit(d, _)
         | SsaInst::DictLit(d, _)
         | SsaInst::Index(d, _, _)
+        | SsaInst::IndexAssign(d, _, _)
         | SsaInst::MethodCall(d, _, _, _)
         | SsaInst::Pipe(d, _, _)
         | SsaInst::Prompt(d, _)
@@ -63,19 +64,33 @@ fn ssa_dst(inst: &SsaInst) -> SsaReg {
     }
 }
 
-fn max_dst_in_block(block: &BasicBlock) -> SsaReg {
-    block.insts.iter().map(ssa_dst).max().unwrap_or(0)
-}
-
 // ── 常量传播 (CP) ──
 
 /// SSA 常量传播：
 /// - Const 的值记录到 const_vals 表
-/// - BinaryOp 两边都是常量时折叠（常量折叠）
+/// - BinaryOp 两边都是常量时折叠（常量折叠），把 BinaryOp 改写为 Const
+/// - Copy/Assign/Expr 中源是常量时，目标也标记为常量
 fn const_propagate(ssa: &mut MirSsaFunction) {
     for block in &mut ssa.blocks {
-        let max = max_dst_in_block(block);
-        let mut const_vals: Vec<Option<Value>> = vec![None; max.saturating_add(1)];
+        // 收集本块所有 dst reg 的最大值
+        let mut max_dst = 0;
+        for inst in &block.insts {
+            let d = ssa_dst(inst);
+            if d > max_dst {
+                max_dst = d;
+            }
+        }
+        // 也检查 phi dst 和 terminator
+        for phi in &block.phis {
+            if phi.dst > max_dst {
+                max_dst = phi.dst;
+            }
+        }
+        if let Terminator::Return(Some(r)) = &block.terminator
+            && *r > max_dst {
+                max_dst = *r;
+            }
+        let mut const_vals: Vec<Option<Value>> = vec![None; max_dst.saturating_add(1)];
 
         for inst in &mut block.insts {
             let dst = ssa_dst(inst);
@@ -86,18 +101,41 @@ fn const_propagate(ssa: &mut MirSsaFunction) {
             // Const → 记录常量值
             if let SsaInst::Const(_, v) = inst {
                 const_vals[dst] = Some(v.clone());
+                continue;
             }
 
-            // BinaryOp 两边常量 → 折叠
+            // Copy(src) → 如果 src 是常量，dst 也是
+            if let SsaInst::Copy(_, src) = inst {
+                if let Some(ref v) = safe_get(&const_vals, *src) {
+                    const_vals[dst] = Some(v.clone());
+                }
+                continue;
+            }
+
+            // BinaryOp 两边常量 → 折叠为 Const
             if let SsaInst::BinaryOp(_, l, op, r) = inst
                 && let (Some(ref lv), Some(ref rv)) =
                     (safe_get(&const_vals, *l), safe_get(&const_vals, *r))
             {
                 let result = crate::flow::eval_binary(lv.clone(), op, rv.clone());
                 if let Ok(v) = result {
-                    const_vals[dst] = Some(v);
+                    const_vals[dst] = Some(v.clone());
+                    // 直接改写为 Const
+                    *inst = SsaInst::Const(dst, v);
+                    continue;
                 }
             }
+
+            // 其他指令：如果 src 是常量，dst 也标记
+            let src_opt = match inst {
+                SsaInst::Define(_, s) | SsaInst::Assign(_, s) | SsaInst::Expr(s) => Some(s),
+                SsaInst::BinaryOp(_, _, _, _) => None, // 已处理
+                _ => None,
+            };
+            if let Some(src) = src_opt
+                && let Some(ref v) = safe_get(&const_vals, *src) {
+                    const_vals[dst] = Some(v.clone());
+                }
         }
     }
 }
@@ -154,6 +192,10 @@ fn dead_code_elim(ssa: &mut MirSsaFunction) {
                     }
                 }
                 SsaInst::Index(_, obj, idx) => {
+                    used.insert(*obj);
+                    used.insert(*idx);
+                }
+                SsaInst::IndexAssign(_, obj, idx) => {
                     used.insert(*obj);
                     used.insert(*idx);
                 }
@@ -284,6 +326,10 @@ fn apply_replacement(inst: &mut SsaInst, map: &HashMap<SsaReg, SsaReg>) {
             }
         }
         SsaInst::Index(_, obj, idx) => {
+            replace(obj, map);
+            replace(idx, map);
+        }
+        SsaInst::IndexAssign(_, obj, idx) => {
             replace(obj, map);
             replace(idx, map);
         }

@@ -277,3 +277,105 @@ fn mir_lowering_parallel_is_sequential() {
         "expected >=2 Define in parallel lowering"
     );
 }
+
+// ── α.2 差分测试：MatchExpr ──
+
+#[test]
+fn mir_differential_match_literal() {
+    assert_differential("let x = match 1\n  with 1 -> 10\n  else -> 20\nend");
+}
+
+#[test]
+fn mir_differential_match_bool_true() {
+    assert_differential("let x = match true\n  with true -> 100\n  else -> 200\nend");
+}
+
+#[test]
+fn mir_differential_match_bool_false() {
+    assert_differential("let x = match false\n  with true -> 100\n  else -> 200\nend");
+}
+
+#[test]
+fn mir_differential_match_nilexpr() {
+    assert_differential("let x = match nil\n  with nil -> 42\n  else -> 0\nend");
+}
+
+#[test]
+fn mir_differential_match_var_pattern() {
+    // 变量模式匹配任意值
+    assert_differential("let x = match 99\n  with v -> v\nend");
+}
+
+#[test]
+fn mir_differential_match_wildcard() {
+    assert_differential("let x = match \"hello\"\n  with _ -> 1\nend");
+}
+
+#[test]
+fn mir_differential_match_list() {
+    assert_differential("let x = match [1, 2, 3]\n  with [1, a, 3] -> a\n  else -> 0\nend");
+}
+
+#[test]
+fn mir_differential_match_dict() {
+    assert_differential("let x = match {a: 5, b: 10}\n  with {a: v} -> v\n  else -> 0\nend");
+}
+
+#[test]
+fn mir_differential_match_statement() {
+    // match statement: match expr with pattern -> expr end
+    // 注意：match 语句的 arm 是表达式，不是语句
+    // 当前 AST 解析器对 match statement 有已知问题（NodeId 错误），
+    // 仅验证 lowering 产出 MatchExpr 指令
+    let (_, _, mir) = parse_and_lower("let x = 10\nmatch x with 10 ->\n  x + 1\nend");
+    let has_match = mir
+        .body
+        .iter()
+        .any(|i| matches!(i, mora::mir::MirInst::MatchExpr { .. }));
+    assert!(has_match, "expected MatchExpr in match statement lowering");
+}
+
+#[test]
+fn mir_differential_index_assign_list() {
+    // IndexAssign 在 AST 解释器中未实现（Unsupported v2 statement），
+    // 仅验证 MIR lowering 不 panic 且指令存在
+    let (_, _, mir) = parse_and_lower("let xs = [1, 2, 3]\nxs[1] = 99\nlet r = xs[1]");
+    let has_index_assign = mir
+        .body
+        .iter()
+        .any(|i| matches!(i, mora::mir::MirInst::IndexAssign(..)));
+    assert!(has_index_assign, "expected IndexAssign in lowering");
+}
+
+#[test]
+fn mir_differential_index_assign_dict() {
+    let (_, _, mir) = parse_and_lower("let d = {a: 1, b: 2}\nd[\"c\"] = 3\nlet r = d[\"c\"]");
+    let has_index_assign = mir
+        .body
+        .iter()
+        .any(|i| matches!(i, mora::mir::MirInst::IndexAssign(..)));
+    assert!(has_index_assign, "expected IndexAssign in lowering");
+}
+
+#[test]
+fn mir_differential_stream_for() {
+    // stream 语法: stream expr as var do body end
+    // AST 解释器对 stream_for 没有特殊处理，仅验证 lowering 不 panic
+    let (_, _, mir) = parse_and_lower("stream p\"hello world\" as line do\n  let x = 1\nend");
+    assert!(!mir.body.is_empty(), "expected non-empty MIR body");
+    let has_stream = mir
+        .body
+        .iter()
+        .any(|i| matches!(i, mora::mir::MirInst::StreamFor { .. }));
+    assert!(has_stream, "expected StreamFor in lowering");
+}
+
+#[test]
+fn mir_lowering_match_expr_has_matchinst() {
+    let (_, _, mir) = parse_and_lower("let x = match 1\n  with 1 -> 10\nend");
+    let has_match = mir
+        .body
+        .iter()
+        .any(|i| matches!(i, mora::mir::MirInst::MatchExpr { .. }));
+    assert!(has_match, "expected MatchExpr in lowering");
+}

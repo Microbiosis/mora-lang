@@ -88,6 +88,14 @@ pub fn run_mir(
                 regs[*dst] = index_value(&obj_val, &idx_val)?;
                 pc += 1;
             }
+            MirInst::IndexAssign(obj, idx, val) => {
+                let mut obj_val = regs[*obj].clone();
+                let idx_val = regs[*idx].clone();
+                let val_val = regs[*val].clone();
+                index_assign_value(&mut obj_val, &idx_val, &val_val)?;
+                regs[*obj] = obj_val;
+                pc += 1;
+            }
             MirInst::MethodCall(dst, recv, method, args) => {
                 let recv_val = regs[*recv].clone();
                 let arg_vals: Vec<Value> = args.iter().map(|r| regs[*r].clone()).collect();
@@ -175,6 +183,56 @@ pub fn run_mir(
             MirInst::Continue(lbl) => {
                 pc = *lbl;
             }
+            MirInst::MatchExpr { val, arms } => {
+                let val_val = regs[*val].clone();
+                // 依次尝试每个 arm，找到匹配的第一个
+                let mut matched = false;
+                for (pat_str, cond_reg, arm_func, output_reg) in arms {
+                    if self_match_pattern(
+                        &val_val,
+                        pat_str,
+                        cond_reg.as_ref().map(|r| &regs[*r]),
+                        env,
+                    ) {
+                        let result = run_mir(arm_func, interp, env)?;
+                        regs[*output_reg] = result;
+                        matched = true;
+                        break;
+                    }
+                }
+                if !matched {
+                    // 没有匹配任何 arm，返回 Nil
+                    if let Some((_pat, _cond, _func, output_reg)) = arms.first() {
+                        regs[*output_reg] = Value::Nil;
+                    }
+                }
+                pc += 1;
+            }
+            MirInst::ToolDef { .. } => {
+                // tool 定义由 AST 解释器 execute_tool_def 处理，
+                // MIR 解释器不独立处理 tool 注册（委托给 AST 路径）
+                pc += 1;
+            }
+            MirInst::StreamFor {
+                prompt_reg,
+                var,
+                body,
+            } => {
+                // stream_for: 委托 AST 解释器的 stream_for 语义
+                // 简化实现：顺序执行 body（与 parallel 相同）
+                let _prompt = regs[*prompt_reg].clone();
+                let _ = var;
+                // 占位：实际 stream_for 需要 AI 集成
+                let mut child_env = env.clone();
+                let result = run_mir(body, interp, &mut child_env)?;
+                let _ = result;
+                pc += 1;
+            }
+            MirInst::MatchArm { .. } => {
+                // MatchArm 是 MatchExpr 的内部 arm，不直接出现在 body 顶层
+                // 若出现则跳过（应已由 MatchExpr lowering 纳入嵌套 MirFunction）
+                pc += 1;
+            }
         }
     }
     Ok(Value::Nil)
@@ -232,4 +290,145 @@ fn is_truthy(v: &Value) -> bool {
         Value::String(s) => !s.is_empty(),
         _ => true,
     }
+}
+
+/// α.2: 索引赋值 obj[idx] = val（就地修改）
+fn index_assign_value(obj: &mut Value, idx: &Value, val: &Value) -> Result<(), String> {
+    match (obj, idx) {
+        (Value::List(list), Value::Int(i)) => {
+            let i = *i as usize;
+            if i >= list.len() {
+                Err(format!("index {} out of bounds (len {})", i, list.len()))
+            } else {
+                list[i] = val.clone();
+                Ok(())
+            }
+        }
+        (Value::List(list), Value::Float(n)) => {
+            let i = *n as usize;
+            if i >= list.len() {
+                Err(format!("index {} out of bounds (len {})", i, list.len()))
+            } else {
+                list[i] = val.clone();
+                Ok(())
+            }
+        }
+        (Value::Dict(map), Value::String(key)) => {
+            map.insert(key.clone(), val.clone());
+            Ok(())
+        }
+        _ => Err("cannot index assign with given object and index".to_string()),
+    }
+}
+
+/// α.2: MIR 模式匹配（简化版）
+/// pat_str 来自 pattern_to_string 的序列化结果
+fn self_match_pattern(
+    val: &Value,
+    pat_str: &str,
+    _cond_reg: Option<&Value>,
+    env: &mut Environment,
+) -> bool {
+    // 通配符匹配任意值
+    if pat_str == "_" {
+        return true;
+    }
+    // 变量模式：纯标识符（无 ":" 前缀）匹配任意值，绑定到 env
+    if !pat_str.contains(':') {
+        env.define(pat_str.to_string(), val.clone(), false);
+        return true;
+    }
+    // nil 模式
+    if pat_str == "nil" {
+        return matches!(val, Value::Nil);
+    }
+    // bool 模式
+    if pat_str == "bool:true" {
+        return matches!(val, Value::Bool(true));
+    }
+    if pat_str == "bool:false" {
+        return matches!(val, Value::Bool(false));
+    }
+    // int 模式: int:42
+    if let Some(suffix) = pat_str.strip_prefix("int:")
+        && let Value::Int(i) = val
+        && let Ok(n) = suffix.parse::<i64>()
+    {
+        return i == &n;
+    }
+    // float 模式: float:3.14
+    if let Some(suffix) = pat_str.strip_prefix("float:")
+        && let Value::Float(f) = val
+        && let Ok(n) = suffix.parse::<f64>()
+    {
+        return (f - n).abs() < 1e-9;
+    }
+    // str 模式: str:hello
+    if let Some(suffix) = pat_str.strip_prefix("str:")
+        && let Value::String(s) = val
+    {
+        return s == suffix;
+    }
+    // 列表模式: list:[p1,p2,...]
+    if pat_str == "list:[]" {
+        return matches!(val, Value::List(items) if items.is_empty());
+    }
+    if let Some(inner) = pat_str
+        .strip_prefix("list:[")
+        .and_then(|s| s.strip_suffix(']'))
+    {
+        if let Value::List(items) = val {
+            let pats: Vec<&str> = if inner.is_empty() {
+                Vec::new()
+            } else {
+                inner.split(',').collect()
+            };
+            if items.len() != pats.len() {
+                return false;
+            }
+            return items
+                .iter()
+                .zip(pats.iter())
+                .all(|(item, pat)| self_match_pattern(item, pat, None, env));
+        }
+        return false;
+    }
+    // 字典模式: dict:{k1:v1,k2:v2,...}
+    if pat_str == "dict:{}" {
+        return matches!(val, Value::Dict(map) if map.is_empty());
+    }
+    if let Some(inner) = pat_str
+        .strip_prefix("dict:{")
+        .and_then(|s| s.strip_suffix('}'))
+    {
+        if let Value::Dict(map) = val {
+            let pairs: Vec<&str> = if inner.is_empty() {
+                Vec::new()
+            } else {
+                inner.split(',').collect()
+            };
+            return pairs.iter().all(|pair| {
+                if let Some((k, v)) = pair.split_once(':') {
+                    map.get(k)
+                        .map(|item| self_match_pattern(item, v, None, env))
+                        .unwrap_or(false)
+                } else {
+                    false
+                }
+            });
+        }
+        return false;
+    }
+    // 守卫模式: guard:inner — 只检查内部模式匹配
+    if let Some(inner) = pat_str.strip_prefix("guard:") {
+        return self_match_pattern(val, inner, _cond_reg, env);
+    }
+    // 字符模式: char:c
+    if let Some(suffix) = pat_str.strip_prefix("char:")
+        && let Value::Char(c) = val
+    {
+        return *c == suffix.chars().next().unwrap_or('\0');
+    }
+    // 未匹配的模式
+    false
 }

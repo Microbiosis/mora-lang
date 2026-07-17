@@ -3,7 +3,7 @@
 //! 遍历 ASTv2，为每个表达式分配虚拟寄存器，生成线性 MIR 指令序列。
 //! 控制流（If/For）展平为 Label + Jump。FlowSignal 枚举传返 → Jump/Return/Break/Continue 指令。
 
-use crate::ast_v2::{AstArena, ExprKind, NodeId, StmtKind};
+use crate::ast_v2::{AstArena, ExprKind, NodeId, Pattern, StmtKind};
 use crate::common::BinaryOp;
 use crate::flow::literal_to_value_static;
 
@@ -149,6 +149,26 @@ impl Lowerer {
                     .collect::<Result<_, _>>()?;
                 let dst = self.alloc_reg();
                 self.emit(MirInst::Prompt(dst, part_regs));
+                Ok(dst)
+            }
+            // α.2: 模式匹配表达式——lowering 为 MatchExpr 指令
+            ExprKind::Match { expr, arms } => {
+                let val_reg = self.lower_expr(*expr, arena)?;
+                let match_arms: Vec<(String, Option<Reg>, Box<MirFunction>, Reg)> = arms
+                    .iter()
+                    .map(|(pattern, arm_eid)| {
+                        let pat_str = self.pattern_to_string(pattern);
+                        let mut body_lowerer = Lowerer::new();
+                        let arm_val_reg = body_lowerer.lower_expr(*arm_eid, arena)?;
+                        body_lowerer.emit(MirInst::Return(Some(arm_val_reg)));
+                        Ok((pat_str, None, Box::new(body_lowerer.finish()), arm_val_reg))
+                    })
+                    .collect::<Result<Vec<_>, String>>()?;
+                let dst = self.alloc_reg();
+                self.emit(MirInst::MatchExpr {
+                    val: val_reg,
+                    arms: match_arms,
+                });
                 Ok(dst)
             }
             _ => Err(format!(
@@ -350,6 +370,84 @@ impl Lowerer {
                 }
                 Ok(())
             }
+            // α.2: index assignment — obj[idx] = val
+            StmtKind::IndexAssign {
+                object,
+                index,
+                value,
+            } => {
+                let obj_reg = self.lower_expr(*object, arena)?;
+                let idx_reg = self.lower_expr(*index, arena)?;
+                let val_reg = self.lower_expr(*value, arena)?;
+                self.emit(MirInst::IndexAssign(obj_reg, idx_reg, val_reg));
+                Ok(())
+            }
+            // α.2: match 语句 — lowering 为 MatchExpr
+            // 注意：parser 将 match statement 的 arm body 存储为
+            // Vec<NodeId>，但实际内容是表达式而非语句，需用 lower_expr。
+            StmtKind::Match { expr, arms } => {
+                let val_reg = self.lower_expr(*expr, arena)?;
+                let match_arms: Vec<(String, Option<Reg>, Box<MirFunction>, Reg)> = arms
+                    .iter()
+                    .map(|(pattern, body_ids)| {
+                        let pat_str = self.pattern_to_string(pattern);
+                        // body_ids 中存储的是表达式，需要 lower_expr
+                        let mut body_lowerer = Lowerer::new();
+                        if let Some(&arm_eid) = body_ids.first() {
+                            let arm_val_reg = body_lowerer.lower_expr(arm_eid, arena)?;
+                            body_lowerer.emit(MirInst::Return(Some(arm_val_reg)));
+                        }
+                        Ok((pat_str, None, Box::new(body_lowerer.finish()), 0))
+                    })
+                    .collect::<Result<Vec<_>, String>>()?;
+                let _dst = self.alloc_reg();
+                self.emit(MirInst::MatchExpr {
+                    val: val_reg,
+                    arms: match_arms,
+                });
+                Ok(())
+            }
+            // α.2: stream_for — stream_for var in prompt body end
+            StmtKind::StreamFor { prompt, var, body } => {
+                let prompt_reg = self.lower_expr(*prompt, arena)?;
+                let mut body_lowerer = Lowerer::new();
+                for s in body {
+                    body_lowerer.lower_stmt(*s, arena)?;
+                }
+                let body_mir = body_lowerer.finish();
+                self.emit(MirInst::StreamFor {
+                    prompt_reg,
+                    var: var.clone(),
+                    body: Box::new(body_mir),
+                });
+                Ok(())
+            }
+            // α.2: tool 定义
+            StmtKind::ToolDef {
+                name,
+                description,
+                params,
+                return_type,
+                body,
+                exported,
+            } => {
+                let param_names: Vec<String> = params.iter().map(|(n, _)| n.clone()).collect();
+                let return_type_str = return_type.clone();
+                let mut body_lowerer = Lowerer::new();
+                for s in body {
+                    body_lowerer.lower_stmt(*s, arena)?;
+                }
+                let body_mir = body_lowerer.finish();
+                self.emit(MirInst::ToolDef {
+                    name: name.clone(),
+                    description: description.clone(),
+                    params: param_names,
+                    return_type: return_type_str,
+                    body: Box::new(body_mir),
+                    exported: *exported,
+                });
+                Ok(())
+            }
             _ => Err(format!(
                 "lower_stmt: StmtKind {:?} not yet supported (α.2)",
                 std::mem::discriminant(&stmt.kind)
@@ -365,6 +463,45 @@ impl Lowerer {
                 *lbl = label;
             }
             _ => {}
+        }
+    }
+
+    /// 将 Pattern 转换为字符串描述，用于 MIR MatchExpr
+    /// MIR 解释器根据模式类型执行不同的匹配逻辑
+    fn pattern_to_string(&self, pattern: &Pattern) -> String {
+        match pattern {
+            Pattern::Wildcard => "_".to_string(),
+            Pattern::Variable(name) => name.clone(),
+            Pattern::Literal(lit) => match lit {
+                crate::common::Literal::String(s, _) => format!("str:{}", s),
+                crate::common::Literal::Char(c, _) => format!("char:{}", c),
+                crate::common::Literal::Int(i, _) => format!("int:{}", i),
+                crate::common::Literal::Float(f, _) => format!("float:{}", f),
+                crate::common::Literal::Bool(b, _) => format!("bool:{}", b),
+                crate::common::Literal::Nil(_) => "nil".to_string(),
+            },
+            Pattern::List { prefix, rest } => {
+                let prefixes: Vec<String> =
+                    prefix.iter().map(|p| self.pattern_to_string(p)).collect();
+                if let Some(r) = rest {
+                    format!("list:[{}]|rest:{}", prefixes.join(","), r)
+                } else {
+                    format!("list:[{}]", prefixes.join(","))
+                }
+            }
+            Pattern::Dict(entries) => {
+                let fields: Vec<String> = entries
+                    .iter()
+                    .map(|(k, v)| format!("{}:{}", k, self.pattern_to_string(v)))
+                    .collect();
+                format!("dict:{{{}}}", fields.join(","))
+            }
+            Pattern::Guard {
+                pattern,
+                condition: _,
+            } => {
+                format!("guard:{}", self.pattern_to_string(pattern))
+            }
         }
     }
 }

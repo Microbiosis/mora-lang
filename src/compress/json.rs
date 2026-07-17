@@ -97,15 +97,15 @@ impl CrushResult {
             "array_type".into(),
             Value::String(format!("{:?}", self.array_type)),
         );
-        m.insert("items_total".into(), Value::Number(self.items_total as f64));
-        m.insert("items_kept".into(), Value::Number(self.items_kept as f64));
+        m.insert("items_total".into(), Value::Float(self.items_total as f64));
+        m.insert("items_kept".into(), Value::Float(self.items_kept as f64));
         m.insert(
             "savings_ratio".into(),
-            Value::Number(self.savings_ratio as f64),
+            Value::Float(self.savings_ratio as f64),
         );
         m.insert(
             "fields_detected".into(),
-            Value::Number(self.fields.len() as f64),
+            Value::Float(self.fields.len() as f64),
         );
         m
     }
@@ -171,12 +171,12 @@ fn collect_field_names(items: &[Value]) -> Vec<String> {
 pub fn detect_field_role(name: &str, values: &[&Value]) -> FieldStats {
     let uniqueness = compute_uniqueness(values);
     let null_rate = compute_null_rate(values);
-    let is_numeric = !values.is_empty() && values.iter().all(|v| matches!(v, Value::Number(_)));
+    let is_numeric = !values.is_empty() && values.iter().all(|v| matches!(v, Value::Float(_)));
     let numeric_range = if is_numeric {
         let nums: Vec<f64> = values
             .iter()
             .filter_map(|v| {
-                if let Value::Number(n) = v {
+                if let Value::Float(n) = v {
                     Some(*n)
                 } else {
                     None
@@ -285,7 +285,7 @@ fn detect_anomaly(values: &[&Value]) -> Option<FieldRole> {
     let nums: Vec<f64> = values
         .iter()
         .filter_map(|v| {
-            if let Value::Number(n) = v {
+            if let Value::Float(n) = v {
                 Some(*n)
             } else {
                 None
@@ -369,7 +369,7 @@ fn is_sequential_numeric(values: &[&Value]) -> bool {
     let nums: Vec<f64> = values
         .iter()
         .filter_map(|v| {
-            if let Value::Number(n) = v {
+            if let Value::Float(n) = v {
                 Some(*n)
             } else {
                 None
@@ -391,7 +391,7 @@ fn is_timestamp_pattern(v: &Value) -> bool {
             let unix = s.len() >= 10 && s.len() <= 13 && s.chars().all(|c| c.is_ascii_digit());
             iso || unix
         }
-        Value::Number(n) => *n > 1_000_000_000.0 && *n < 10_000_000_000.0,
+        Value::Float(n) => *n > 1_000_000_000.0 && *n < 10_000_000_000.0,
         _ => false,
     }
 }
@@ -454,7 +454,7 @@ impl Strategy for TopNStrategy {
                 let s = if let Value::Dict(d) = it {
                     d.get(&score_field)
                         .and_then(|v| {
-                            if let Value::Number(n) = v {
+                            if let Value::Float(n) = v {
                                 Some(*n)
                             } else {
                                 None
@@ -687,7 +687,7 @@ pub fn outliers_by_zscore(values: &[&Value], z: f64) -> Vec<usize> {
         .iter()
         .enumerate()
         .filter_map(|(i, v)| {
-            if let Value::Number(n) = v {
+            if let Value::Float(n) = v {
                 Some((i, *n))
             } else {
                 None
@@ -760,7 +760,7 @@ pub fn try_lossless_compact(items: &[Value], fields: &[FieldStats]) -> Option<Cr
         f.sample.iter().all(|v| {
             matches!(
                 v,
-                Value::String(_) | Value::Number(_) | Value::Bool(_) | Value::Nil
+                Value::String(_) | Value::Float(_) | Value::Bool(_) | Value::Nil
             )
         })
     });
@@ -959,7 +959,7 @@ fn value_byte_size(v: &Value) -> usize {
     match v {
         Value::String(s) => s.len(),
         Value::Char(c) => c.len_utf8(),
-        Value::Number(n) => {
+        Value::Float(n) => {
             // f64 Display bytes: integer part + '.' + decimal or scientific.
             // Cheap heuristic — full precision's unlikely to matter for sizing.
             if n.is_nan() {
@@ -1128,7 +1128,7 @@ pub fn crush_json_string(
 fn value_type_name(v: &Value) -> &'static str {
     match v {
         Value::String(_) => "string",
-        Value::Number(_) => "number",
+        Value::Float(_) => "float",
         Value::Bool(_) => "bool",
         Value::Nil => "null",
         Value::List(_) => "array",
@@ -1215,7 +1215,7 @@ mod tests {
     fn role_score_uses_range_not_name() {
         let items = make_items(10, |i| {
             let mut d = HashMap::new();
-            d.insert("amount".into(), Value::Number(i as f64 / 10.0));
+            d.insert("amount".into(), Value::Float(i as f64 / 10.0));
             d
         });
         let fields = extract_field_stats(&items);
@@ -1262,7 +1262,7 @@ mod tests {
             let mut d = HashMap::new();
             d.insert(
                 "value".into(),
-                Value::Number(if i == 50 { 1000.0 } else { (i as f64) / 100.0 }),
+                Value::Float(if i == 50 { 1000.0 } else { (i as f64) / 100.0 }),
             );
             d
         });
@@ -1277,7 +1277,7 @@ mod tests {
         let items: Vec<Value> = (0..100)
             .map(|i| {
                 let mut d = HashMap::new();
-                d.insert("score".into(), Value::Number((i as f64).sqrt()));
+                d.insert("score".into(), Value::Float((i as f64).sqrt()));
                 Value::Dict(d)
             })
             .collect();
@@ -1298,7 +1298,7 @@ mod tests {
             .iter()
             .filter_map(|it| {
                 if let Value::Dict(d) = it
-                    && let Some(Value::Number(n)) = d.get("score")
+                    && let Some(Value::Float(n)) = d.get("score")
                 {
                     return Some(*n);
                 }
@@ -1317,7 +1317,7 @@ mod tests {
         let items = make_items(100, |i| {
             let mut d = HashMap::new();
             d.insert("ts".into(), Value::String(format!("2026-01-{:02}", i + 1)));
-            d.insert("v".into(), Value::Number(i as f64));
+            d.insert("v".into(), Value::Float(i as f64));
             d
         });
         let opts = CompressOptions {
@@ -1326,7 +1326,7 @@ mod tests {
         };
         let r = crush_json(&items, 30, &opts);
         assert!(r.items.iter().any(|it| matches!(it, Value::Dict(d) if
-            d.get("v") == Some(&Value::Number(0.0))
+            d.get("v") == Some(&Value::Float(0.0))
         )));
     }
 
@@ -1334,9 +1334,9 @@ mod tests {
     fn strategy_lossless_csv_schema() {
         let items = make_items(20, |i| {
             let mut d = HashMap::new();
-            d.insert("id".into(), Value::Number(i as f64));
+            d.insert("id".into(), Value::Float(i as f64));
             d.insert("name".into(), Value::String(format!("item_{}", i)));
-            d.insert("value".into(), Value::Number(i as f64 * 2.0));
+            d.insert("value".into(), Value::Float(i as f64 * 2.0));
             d
         });
         let opts = CompressOptions {
@@ -1357,7 +1357,7 @@ mod tests {
     fn strategy_auto_picks_topn_for_scores() {
         let items = make_items(50, |i| {
             let mut d = HashMap::new();
-            d.insert("score".into(), Value::Number((i as f64) / 50.0));
+            d.insert("score".into(), Value::Float((i as f64) / 50.0));
             d.insert("name".into(), Value::String(format!("item_{}", i)));
             d
         });
@@ -1390,13 +1390,13 @@ mod tests {
             let mut d = HashMap::new();
             d.insert(
                 "value".into(),
-                Value::Number(if i == 50 { 1000.0 } else { (i as f64).sin() }),
+                Value::Float(if i == 50 { 1000.0 } else { (i as f64).sin() }),
             );
             d
         });
         let r = crush_json(&items, 10, &CompressOptions::default());
         assert!(r.items.iter().any(|it| matches!(it, Value::Dict(d) if
-            d.get("value") == Some(&Value::Number(1000.0))
+            d.get("value") == Some(&Value::Float(1000.0))
         )));
     }
 
@@ -1406,8 +1406,8 @@ mod tests {
     fn metadata_reports_strategy_and_savings() {
         let items = make_items(100, |i| {
             let mut d = HashMap::new();
-            d.insert("id".into(), Value::Number(i as f64));
-            d.insert("score".into(), Value::Number((i as f64) / 100.0));
+            d.insert("id".into(), Value::Float(i as f64));
+            d.insert("score".into(), Value::Float((i as f64) / 100.0));
             d
         });
         let r = crush_json(&items, 10, &CompressOptions::default());
@@ -1462,8 +1462,8 @@ mod tests {
                 let mut inner = Vec::new();
                 for j in 0..6 {
                     let mut d = std::collections::HashMap::new();
-                    d.insert("id".into(), Value::Number(j as f64));
-                    d.insert("value".into(), Value::Number((i + j) as f64));
+                    d.insert("id".into(), Value::Float(j as f64));
+                    d.insert("value".into(), Value::Float((i + j) as f64));
                     inner.push(Value::Dict(d));
                 }
                 let mut outer = std::collections::HashMap::new();
@@ -1493,13 +1493,13 @@ mod tests {
         let v = Value::List(vec![
             Value::Dict({
                 let mut d = std::collections::HashMap::new();
-                d.insert("id".into(), Value::Number(1.0));
+                d.insert("id".into(), Value::Float(1.0));
                 d.insert("name".into(), Value::String("a".into()));
                 d
             }),
             Value::Dict({
                 let mut d = std::collections::HashMap::new();
-                d.insert("id".into(), Value::Number(2.0));
+                d.insert("id".into(), Value::Float(2.0));
                 d.insert("name".into(), Value::String("b".into()));
                 d
             }),

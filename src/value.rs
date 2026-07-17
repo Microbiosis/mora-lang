@@ -144,11 +144,9 @@ pub enum Value {
     String(String),
     /// v0.x: 单字符（`string[number]` 索引结果）
     Char(char),
-    // v0.38: Numeric tower — distinct Int/Float variants for type safety.
-    // `Number(f64)` is kept as a legacy alias (default for unsuffixed literals).
+    // v0.38: Numeric tower — distinct Int and Float variants.
     Int(i64),
     Float(f64),
-    Number(f64),
     Bool(bool),
     Nil,
     List(Vec<Value>),
@@ -257,9 +255,8 @@ impl PartialEq for Value {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
             (Value::Nil, Value::Nil) => true,
-            (Value::Number(a), Value::Number(b)) => a == b,
-            (Value::Int(a), Value::Int(b)) => a == b,
             (Value::Float(a), Value::Float(b)) => a == b,
+            (Value::Int(a), Value::Int(b)) => a == b,
             (Value::String(a), Value::String(b)) => a == b,
             (Value::Char(a), Value::Char(b)) => a == b,
             (Value::Bool(a), Value::Bool(b)) => a == b,
@@ -291,8 +288,7 @@ impl std::fmt::Display for Value {
             Value::String(s) => write!(f, "{}", s),
             Value::Char(c) => write!(f, "{}", c),
             Value::Int(i) => write!(f, "{}", i),
-            Value::Float(x) => write!(f, "{}", x),
-            Value::Number(n) => {
+            Value::Float(n) => {
                 // v0.36 (P1-3.13): never panic on NaN/Inf — Display must be infallible.
                 if n.is_nan() {
                     f.write_str("nan")
@@ -659,7 +655,7 @@ mod tests {
     /// v0.35 (P0-B2): Atom Display must not panic (smoke test).
     #[test]
     fn atom_display_does_not_panic_on_valid_value() {
-        let v = Value::Atom(Arc::new(Mutex::new(Value::Number(42.0))));
+        let v = Value::Atom(Arc::new(Mutex::new(Value::Float(42.0))));
         let s = format!("{}", v);
         assert!(s.contains("atom"), "got: {}", s);
         assert!(s.contains("42"), "got: {}", s);
@@ -668,28 +664,28 @@ mod tests {
     /// v0.36 (P1-3.13): Number Display should render NaN/Inf without panicking.
     #[test]
     fn number_display_handles_nan() {
-        let v = Value::Number(f64::NAN);
+        let v = Value::Float(f64::NAN);
         let s = format!("{}", v);
         assert_eq!(s, "nan");
     }
 
     #[test]
     fn number_display_handles_pos_inf() {
-        let v = Value::Number(f64::INFINITY);
+        let v = Value::Float(f64::INFINITY);
         let s = format!("{}", v);
         assert_eq!(s, "inf");
     }
 
     #[test]
     fn number_display_handles_neg_inf() {
-        let v = Value::Number(f64::NEG_INFINITY);
+        let v = Value::Float(f64::NEG_INFINITY);
         let s = format!("{}", v);
         assert_eq!(s, "-inf");
     }
 
     #[test]
     fn number_display_normal_value() {
-        let v = Value::Number(42.5);
+        let v = Value::Float(42.5);
         let s = format!("{}", v);
         assert_eq!(s, "42.5");
     }

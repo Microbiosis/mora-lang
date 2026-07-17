@@ -189,7 +189,7 @@ fn index_value(obj: &Value, idx: &Value) -> Result<Value, String> {
                 .cloned()
                 .ok_or_else(|| format!("index {} out of bounds (len {})", i, list.len()))
         }
-        (Value::List(list), Value::Number(n)) => {
+        (Value::List(list), Value::Float(n)) => {
             let i = *n as usize;
             list.get(i)
                 .cloned()
@@ -216,7 +216,6 @@ fn value_to_string(v: &Value) -> String {
         Value::String(s) => s.clone(),
         Value::Int(i) => i.to_string(),
         Value::Float(f) => f.to_string(),
-        Value::Number(n) => n.to_string(),
         Value::Bool(b) => b.to_string(),
         Value::Nil => "nil".to_string(),
         Value::Char(c) => c.to_string(),
@@ -228,9 +227,8 @@ fn is_truthy(v: &Value) -> bool {
     match v {
         Value::Bool(b) => *b,
         Value::Nil => false,
-        Value::Number(n) => *n != 0.0,
+        Value::Float(n) => *n != 0.0,
         Value::Int(i) => *i != 0,
-        Value::Float(f) => *f != 0.0,
         Value::String(s) => !s.is_empty(),
         _ => true,
     }

@@ -104,7 +104,7 @@ impl Interpreter {
                 check_path(&path)?;
                 let meta = std::fs::metadata(&path)
                     .map_err(|e| format!("file.size: cannot stat '{}': {}", path, e))?;
-                Ok(Value::Number(meta.len() as f64))
+                Ok(Value::Float(meta.len() as f64))
             }
             "list" => {
                 let path = expect_str(0, "path")?;
@@ -284,9 +284,9 @@ impl Interpreter {
                 self.infra.bus.off(&pattern);
                 Ok(Value::Nil)
             }
-            "count" => Ok(Value::Number(self.infra.bus.pattern_count() as f64)),
+            "count" => Ok(Value::Float(self.infra.bus.pattern_count() as f64)),
             // v0.43.1: bus.subscribe(pattern) — pub-sub subscribe (Puter / AgentMesh / Solace)
-            // Returns: token (Value::Number) for later unsubscribe
+            // Returns: token (Value::Float) for later unsubscribe
             // Note: handler is internal — actual mora-level callback support would
             // require lifting Fn closures to a sandboxed layer; for now subscribe()
             // registers the subscription slot, and publish() fires it.
@@ -307,7 +307,7 @@ impl Interpreter {
                     }),
                 );
                 let token = self.infra.bus.pattern_count() as u64;
-                Ok(Value::Number(token as f64))
+                Ok(Value::Float(token as f64))
             }
             // v0.43.1: bus.publish(topic, payload) — pub-sub publish (Puter / AgentMesh verified)
             // Returns: Number of registered patterns (informational; actual fire via emit)
@@ -321,7 +321,7 @@ impl Interpreter {
                 // 直接走 EventBus::emit, 它已经支持通配符 (Puter O(segments) 索引, v0.41.0)
                 self.infra.bus.emit(&topic, &payload);
                 // 返回注册的 pattern 数 (informational)
-                Ok(Value::Number(self.infra.bus.pattern_count() as f64))
+                Ok(Value::Float(self.infra.bus.pattern_count() as f64))
             }
             _ => Err(format!("bus.{}: unknown method", method)),
         }
@@ -372,7 +372,7 @@ impl Interpreter {
                 Ok(Value::Bool(self.sandbox.sandbox.check_path(&path).is_ok()))
             }
             // v0.42.0: sandbox.key { file.read, web.fetch } — issue capability token
-            // Returns: token handle as Value::Number(token_id)
+            // Returns: token handle as Value::Float(token_id)
             "key" => {
                 use std::collections::BTreeSet;
                 use std::time::Duration;
@@ -402,7 +402,7 @@ impl Interpreter {
                     .capabilities
                     .issue(allowed, ttl)
                     .map_err(|e| format!("sandbox.key: issue failed: {}", e))?;
-                Ok(Value::Number(token_id as f64))
+                Ok(Value::Float(token_id as f64))
             }
             // v0.42.0: sandbox.check_call(token_id, "file.read") — authorize capability
             // Returns: Value::Bool(true) if authorized, false otherwise
@@ -414,7 +414,7 @@ impl Interpreter {
                     ));
                 }
                 let token_id = match &args[0] {
-                    Value::Number(n) => *n as u64,
+                    Value::Float(n) => *n as u64,
                     Value::Int(i) => *i as u64,
                     _ => {
                         return Err("sandbox.check_call: token_id must be a number".to_string());
@@ -446,7 +446,7 @@ impl Interpreter {
                     ));
                 }
                 let token_id = match &args[0] {
-                    Value::Number(n) => *n as u64,
+                    Value::Float(n) => *n as u64,
                     Value::Int(i) => *i as u64,
                     _ => {
                         return Err("sandbox.revoke: token_id must be a number".to_string());
@@ -460,7 +460,7 @@ impl Interpreter {
                 Ok(Value::Bool(true))
             }
             // v0.42.0: sandbox.token_count() — diagnostic
-            "token_count" => Ok(Value::Number(
+            "token_count" => Ok(Value::Float(
                 self.sandbox.sandbox.capabilities.token_count() as f64,
             )),
             // v0.42.1: sandbox.audit_emit(actor, action, target?, payload?) — write audit event
@@ -570,7 +570,7 @@ impl Interpreter {
                 // cpu_cores (可选, arg 3)
                 if let Some(n) = args.get(3) {
                     match n {
-                        Value::Number(v) => spec.limits.cpu_cores = Some(*v as u32),
+                        Value::Float(v) => spec.limits.cpu_cores = Some(*v as u32),
                         Value::Int(i) => spec.limits.cpu_cores = Some(*i as u32),
                         Value::Nil => {}
                         _ => {
@@ -584,7 +584,7 @@ impl Interpreter {
                 // memory_mb (可选, arg 4)
                 if let Some(n) = args.get(4) {
                     match n {
-                        Value::Number(v) => spec.limits.memory_mb = Some(*v as u64),
+                        Value::Float(v) => spec.limits.memory_mb = Some(*v as u64),
                         Value::Int(i) => spec.limits.memory_mb = Some(*i as u64),
                         Value::Nil => {}
                         _ => {
@@ -618,7 +618,7 @@ impl Interpreter {
                 };
 
                 *self.sandbox.container.lock().expect("container poisoned") = Some(handle);
-                Ok(Value::Number(id_hash as f64))
+                Ok(Value::Float(id_hash as f64))
             }
             // v0.44.0: sandbox.container_exec(cmd, args...) — run cmd INSIDE container via docker exec
             // Returns: Dict{exit_code, stdout, stderr, elapsed_ms}
@@ -655,12 +655,12 @@ impl Interpreter {
                     .exec(&cmd_refs)
                     .map_err(|e| format!("sandbox.container_exec: {}", e))?;
                 let mut d = std::collections::HashMap::new();
-                d.insert("exit_code".to_string(), Value::Number(code as f64));
+                d.insert("exit_code".to_string(), Value::Float(code as f64));
                 d.insert("stdout".to_string(), Value::String(stdout));
                 d.insert("stderr".to_string(), Value::String(stderr));
                 d.insert(
                     "elapsed_ms".to_string(),
-                    Value::Number(handle.elapsed().as_millis() as f64),
+                    Value::Float(handle.elapsed().as_millis() as f64),
                 );
                 Ok(Value::Dict(d))
             }
@@ -698,11 +698,11 @@ impl Interpreter {
                         );
                         d.insert(
                             "mount_count".to_string(),
-                            Value::Number(handle.spec.mounts.len() as f64),
+                            Value::Float(handle.spec.mounts.len() as f64),
                         );
                         d.insert(
                             "elapsed_ms".to_string(),
-                            Value::Number(handle.elapsed().as_millis() as f64),
+                            Value::Float(handle.elapsed().as_millis() as f64),
                         );
                         Ok(Value::Dict(d))
                     }
@@ -760,12 +760,12 @@ impl Interpreter {
                     }
                     None => return Err("schedule.add: requires message".to_string()),
                 };
-                let interval_s = if let Some(Value::Number(n)) = args.get(3) {
+                let interval_s = if let Some(Value::Float(n)) = args.get(3) {
                     *n as u64
                 } else {
                     0
                 };
-                let at_epoch = if let Some(Value::Number(n)) = args.get(4) {
+                let at_epoch = if let Some(Value::Float(n)) = args.get(4) {
                     *n as u64
                 } else {
                     0
@@ -791,8 +791,8 @@ impl Interpreter {
                             }),
                         );
                         m.insert("message".to_string(), Value::String(j.message));
-                        m.insert("interval_s".to_string(), Value::Number(j.interval_s as f64));
-                        m.insert("at_epoch".to_string(), Value::Number(j.at_epoch as f64));
+                        m.insert("interval_s".to_string(), Value::Float(j.interval_s as f64));
+                        m.insert("at_epoch".to_string(), Value::Float(j.at_epoch as f64));
                         Value::Dict(m)
                     })
                     .collect();
@@ -811,7 +811,7 @@ impl Interpreter {
                     messages.into_iter().map(Value::String).collect(),
                 ))
             }
-            "count" => Ok(Value::Number(self.infra.scheduler.count() as f64)),
+            "count" => Ok(Value::Float(self.infra.scheduler.count() as f64)),
             _ => Err(format!("schedule.{}: unknown method", method)),
         }
     }
@@ -819,12 +819,12 @@ impl Interpreter {
     /// v0.34: ai.tokens — expose TokenUsage counters (mini-swe-agent cost tracking pattern)
     pub fn call_ai_tokens_method(&self, method: &str, _args: &[Value]) -> Result<Value, String> {
         match method {
-            "input" => Ok(Value::Number(self.ai.token_usage.input as f64)),
-            "output" => Ok(Value::Number(self.ai.token_usage.output as f64)),
-            "total" => Ok(Value::Number(
+            "input" => Ok(Value::Float(self.ai.token_usage.input as f64)),
+            "output" => Ok(Value::Float(self.ai.token_usage.output as f64)),
+            "total" => Ok(Value::Float(
                 (self.ai.token_usage.input + self.ai.token_usage.output) as f64,
             )),
-            "calls" => Ok(Value::Number(self.ai.token_usage.input as f64)),
+            "calls" => Ok(Value::Float(self.ai.token_usage.input as f64)),
             _ => Err(format!("ai.tokens.{}: unknown method", method)),
         }
     }
@@ -854,7 +854,7 @@ impl Interpreter {
                 }
                 let backoff_ms: u64 = if let Some(v) = args.get(1) {
                     match v {
-                        Value::Number(n) => *n as u64,
+                        Value::Float(n) => *n as u64,
                         Value::Int(i) => *i as u64,
                         Value::String(s) => s.parse().unwrap_or(1000),
                         _ => 1000,
@@ -868,8 +868,8 @@ impl Interpreter {
                     "exponential".to_string()
                 };
                 let mut d = std::collections::HashMap::new();
-                d.insert("attempts".to_string(), Value::Number(attempts_n as f64));
-                d.insert("backoff_ms".to_string(), Value::Number(backoff_ms as f64));
+                d.insert("attempts".to_string(), Value::Float(attempts_n as f64));
+                d.insert("backoff_ms".to_string(), Value::Float(backoff_ms as f64));
                 d.insert(
                     "backoff".to_string(),
                     Value::String(backoff_strategy.clone()),
@@ -883,7 +883,7 @@ impl Interpreter {
                         "linear" => backoff_ms * (i as u64 + 1),
                         _ => backoff_ms * (1u64 << i.min(10)),
                     };
-                    schedule.push(Value::Number(delay as f64));
+                    schedule.push(Value::Float(delay as f64));
                 }
                 d.insert("schedule".to_string(), Value::List(schedule));
                 Ok(Value::Dict(d))
@@ -910,7 +910,7 @@ impl Interpreter {
                 // 可选 threshold (0.0-1.0), 默认使用 self.ai.context_window.compression_threshold
                 if let Some(v) = args.first() {
                     let t = match v {
-                        Value::Number(n) => *n,
+                        Value::Float(n) => *n,
                         Value::Int(i) => *i as f64,
                         _ => {
                             return Err(
@@ -930,25 +930,25 @@ impl Interpreter {
                 self.ai.context_window.compress();
                 let after = self.ai.context_window.current_tokens;
                 let dropped = before.saturating_sub(after);
-                Ok(Value::Number(dropped as f64))
+                Ok(Value::Float(dropped as f64))
             }
             "context.info" => {
                 let mut d = std::collections::HashMap::new();
                 d.insert(
                     "max_tokens".to_string(),
-                    Value::Number(self.ai.context_window.max_tokens as f64),
+                    Value::Float(self.ai.context_window.max_tokens as f64),
                 );
                 d.insert(
                     "current_tokens".to_string(),
-                    Value::Number(self.ai.context_window.current_tokens as f64),
+                    Value::Float(self.ai.context_window.current_tokens as f64),
                 );
                 d.insert(
                     "messages".to_string(),
-                    Value::Number(self.ai.context_window.messages.len() as f64),
+                    Value::Float(self.ai.context_window.messages.len() as f64),
                 );
                 d.insert(
                     "compression_threshold".to_string(),
-                    Value::Number(self.ai.context_window.compression_threshold),
+                    Value::Float(self.ai.context_window.compression_threshold),
                 );
                 Ok(Value::Dict(d))
             }
@@ -1024,12 +1024,12 @@ impl Interpreter {
                     "path".to_string(),
                     Value::String(path.to_string_lossy().to_string()),
                 );
-                d.insert("total".to_string(), Value::Number(report.total as f64));
-                d.insert("done".to_string(), Value::Number(report.done as f64));
-                d.insert("pending".to_string(), Value::Number(report.pending as f64));
+                d.insert("total".to_string(), Value::Float(report.total as f64));
+                d.insert("done".to_string(), Value::Float(report.done as f64));
+                d.insert("pending".to_string(), Value::Float(report.pending as f64));
                 d.insert(
                     "completion_ratio".to_string(),
-                    Value::Number(report.completion_ratio()),
+                    Value::Float(report.completion_ratio()),
                 );
                 d.insert("is_complete".to_string(), Value::Bool(report.is_complete()));
                 let items: Vec<Value> = report
@@ -1039,7 +1039,7 @@ impl Interpreter {
                         let mut m = std::collections::HashMap::new();
                         m.insert("text".to_string(), Value::String(i.text));
                         m.insert("done".to_string(), Value::Bool(i.done));
-                        m.insert("line".to_string(), Value::Number(i.line_number as f64));
+                        m.insert("line".to_string(), Value::Float(i.line_number as f64));
                         Value::Dict(m)
                     })
                     .collect();
@@ -1079,13 +1079,13 @@ impl Interpreter {
                     None => Ok(Value::Nil),
                 }
             }
-            "len" => Ok(Value::Number(self.registry.ccr_store.len() as f64)),
+            "len" => Ok(Value::Int(self.registry.ccr_store.len() as i64)),
             "marker" => {
                 let hash = args
                     .first()
                     .map(|v| v.to_string())
                     .ok_or("ccr.marker: requires hash as first arg")?;
-                let size = if let Some(Value::Number(n)) = args.get(1) {
+                let size = if let Some(Value::Float(n)) = args.get(1) {
                     *n as usize
                 } else {
                     0
@@ -1152,7 +1152,7 @@ impl Interpreter {
                     None => Ok(Value::Nil),
                 }
             }
-            "count" => Ok(Value::Number(self.registry.mock_registry.count() as f64)),
+            "count" => Ok(Value::Float(self.registry.mock_registry.count() as f64)),
             "names" => {
                 let names = self.registry.mock_registry.names();
                 Ok(Value::List(names.into_iter().map(Value::String).collect()))
@@ -1217,7 +1217,7 @@ impl Interpreter {
                 self.registry.memory_store.clear();
                 Ok(Value::Nil)
             }
-            "size" => Ok(Value::Number(self.registry.memory_store.len() as f64)),
+            "size" => Ok(Value::Float(self.registry.memory_store.len() as f64)),
             // v0.43.1: memory.remember(category, text) — markdown-backed persistent memory
             // Appends `text` under `## {category}` in ~/.mora/memory/YYYY-MM-DD.md
             // Returns: Bool(true) on success
@@ -1422,7 +1422,7 @@ impl Interpreter {
                         );
                         d.insert(
                             "tool_count".to_string(),
-                            Value::Number(plane.tool_count() as f64),
+                            Value::Float(plane.tool_count() as f64),
                         );
                         Ok(Value::Dict(d))
                     }
@@ -1561,7 +1561,7 @@ impl Interpreter {
                 let count = reg
                     .load_public_registry()
                     .map_err(|e| format!("skill.refresh_hub: {}", e))?;
-                Ok(Value::Number(count as f64))
+                Ok(Value::Float(count as f64))
             }
             _ => Err(format!("skill.{}: unknown method", method)),
         }
@@ -1740,18 +1740,18 @@ impl Interpreter {
                     .ok_or_else(|| format!("plan.info: plan '{}' not found", name))?;
                 let mut d = std::collections::HashMap::new();
                 d.insert("name".to_string(), Value::String(name));
-                d.insert("total".to_string(), Value::Number(plan.len() as f64));
+                d.insert("total".to_string(), Value::Float(plan.len() as f64));
                 d.insert(
                     "done".to_string(),
-                    Value::Number(plan.complete_count() as f64),
+                    Value::Float(plan.complete_count() as f64),
                 );
                 d.insert(
                     "pending".to_string(),
-                    Value::Number(plan.pending_count() as f64),
+                    Value::Float(plan.pending_count() as f64),
                 );
                 d.insert(
                     "completion_ratio".to_string(),
-                    Value::Number(plan.completion_ratio()),
+                    Value::Float(plan.completion_ratio()),
                 );
                 Ok(Value::Dict(d))
             }
@@ -1796,7 +1796,7 @@ impl Interpreter {
                     return Err("mora.refine_info: requires script_path".to_string());
                 }
                 let script = std::path::PathBuf::from(args[0].to_string());
-                let iter = if let Some(Value::Number(n)) = args.get(1) {
+                let iter = if let Some(Value::Float(n)) = args.get(1) {
                     Some(*n as usize)
                 } else {
                     None
@@ -2078,13 +2078,13 @@ impl ParallelResult {
         }
         d.insert(
             "elapsed_ms".to_string(),
-            Value::Number(self.elapsed_ms as f64),
+            Value::Float(self.elapsed_ms as f64),
         );
         // pid == 0 表示 unknown (spawn 失败或 pre-spawn)
         if self.pid == 0 {
             d.insert("pid".to_string(), Value::Nil);
         } else {
-            d.insert("pid".to_string(), Value::Number(self.pid as f64));
+            d.insert("pid".to_string(), Value::Float(self.pid as f64));
         }
         match &self.error {
             Some(e) => {
@@ -2173,7 +2173,7 @@ fn exec_parallel(args: &[Value]) -> Result<Value, String> {
     // 第二个 arg (可选): max_concurrent
     let max_concurrent: usize = if args.len() >= 2 {
         match &args[1] {
-            Value::Number(n) => (*n as usize).max(1),
+            Value::Float(n) => (*n as usize).max(1),
             Value::Int(i) => (*i as usize).max(1),
             _ => {
                 return Err(
@@ -2188,7 +2188,7 @@ fn exec_parallel(args: &[Value]) -> Result<Value, String> {
     // 第三个 arg (可选): timeout_ms
     let timeout: Option<Duration> = if args.len() >= 3 {
         match &args[2] {
-            Value::Number(n) => Some(Duration::from_millis(*n as u64)),
+            Value::Float(n) => Some(Duration::from_millis(*n as u64)),
             Value::Int(i) => Some(Duration::from_millis(*i as u64)),
             Value::Nil => None,
             _ => return Err("exec.parallel: timeout_ms must be a number or nil".to_string()),
@@ -2429,8 +2429,8 @@ mod tests_v042_capability {
             .call_sandbox_method("key", &args)
             .expect("sandbox.key should succeed");
         match token_id {
-            Value::Number(n) => assert_eq!(n, 0.0, "first token_id should be 0"),
-            other => panic!("expected Value::Number, got {:?}", other),
+            Value::Float(n) => assert_eq!(n, 0.0, "first token_id should be 0"),
+            other => panic!("expected Value::Float, got {:?}", other),
         }
         assert_eq!(interp.sandbox.sandbox.capabilities.token_count(), 1);
     }
@@ -2442,7 +2442,7 @@ mod tests_v042_capability {
         let token_id = interp
             .call_sandbox_method("key", &[])
             .expect("sandbox.key with no args should succeed");
-        assert!(matches!(token_id, Value::Number(_)));
+        assert!(matches!(token_id, Value::Float(_)));
         // 空 token 任何 cap 都应被拒绝
         let check = interp
             .call_sandbox_method(
@@ -2467,7 +2467,7 @@ mod tests_v042_capability {
     #[test]
     fn sandbox_key_rejects_non_string_arg() {
         let mut interp = Interpreter::new();
-        let args = vec![Value::Number(42.0)];
+        let args = vec![Value::Float(42.0)];
         let err = interp
             .call_sandbox_method("key", &args)
             .expect_err("sandbox.key with non-string arg should error");
@@ -2504,10 +2504,7 @@ mod tests_v042_capability {
         let result = interp
             .call_sandbox_method(
                 "check_call",
-                &[
-                    Value::Number(9999.0),
-                    Value::String("file.read".to_string()),
-                ],
+                &[Value::Float(9999.0), Value::String("file.read".to_string())],
             )
             .expect("check_call should not error, just return false");
         assert_eq!(result, Value::Bool(false));
@@ -2535,7 +2532,7 @@ mod tests_v042_capability {
             .call_sandbox_method("key", &[Value::String("file.read".to_string())])
             .expect("issue");
         let token_id_num = match &token_id {
-            Value::Number(n) => *n as u64,
+            Value::Float(n) => *n as u64,
             _ => panic!("expected Number"),
         };
 
@@ -2695,7 +2692,7 @@ mod tests_v0421_audit {
         let err = interp
             .call_sandbox_method(
                 "audit_emit",
-                &[Value::Number(42.0), Value::String("action".to_string())],
+                &[Value::Float(42.0), Value::String("action".to_string())],
             )
             .expect_err("non-string actor should fail");
         assert!(err.contains("actor must be a string"), "got: {}", err);
@@ -2895,7 +2892,7 @@ mod tests_v043_exec {
         // 跳过 perf assertion — 只验证结果正确
         let cmds: Vec<Value> = (0..6).map(|i| cmd(&format!("echo {}", i))).collect();
         let result = interp
-            .call_exec_method("parallel", &[Value::List(cmds), Value::Number(2.0)])
+            .call_exec_method("parallel", &[Value::List(cmds), Value::Float(2.0)])
             .unwrap();
         let list = match result {
             Value::List(l) => l,
@@ -2977,7 +2974,7 @@ mod tests_v043_exec {
         let result = interp
             .call_exec_method(
                 "parallel",
-                &[Value::List(cmds), Value::Number(1.0), Value::Number(200.0)],
+                &[Value::List(cmds), Value::Float(1.0), Value::Float(200.0)],
             )
             .unwrap();
         let list = match result {
@@ -3005,7 +3002,7 @@ mod tests_v043_exec {
     fn exec_parallel_validates_arg_types() {
         let mut interp = Interpreter::new();
         let err = interp
-            .call_exec_method("parallel", &[Value::Number(42.0)])
+            .call_exec_method("parallel", &[Value::Float(42.0)])
             .expect_err("non-list first arg should fail");
         assert!(err.contains("list of strings"), "got: {}", err);
     }
@@ -3013,7 +3010,7 @@ mod tests_v043_exec {
     #[test]
     fn exec_parallel_validates_cmd_elements() {
         let mut interp = Interpreter::new();
-        let cmds = vec![cmd("echo ok"), Value::Number(42.0)]; // 第二个不是 string
+        let cmds = vec![cmd("echo ok"), Value::Float(42.0)]; // 第二个不是 string
         let err = interp
             .call_exec_method("parallel", &[Value::List(cmds)])
             .expect_err("non-string cmd should fail");
@@ -3272,7 +3269,7 @@ mod tests_v0431_memory_bus {
             .expect("subscribe");
         // token 是 Number (pattern_count 1)
         match token {
-            Value::Number(n) => assert_eq!(n, 1.0),
+            Value::Float(n) => assert_eq!(n, 1.0),
             other => panic!("expected Number, got: {:?}", other),
         }
     }
@@ -3281,7 +3278,7 @@ mod tests_v0431_memory_bus {
     fn bus_subscribe_validates_pattern() {
         let mut interp = Interpreter::new();
         let err = interp
-            .call_event_method("subscribe", &[Value::Number(42.0)])
+            .call_event_method("subscribe", &[Value::Float(42.0)])
             .expect_err("non-string pattern should fail");
         assert!(err.contains("pattern must be a string"), "got: {}", err);
     }
@@ -3308,7 +3305,7 @@ mod tests_v0431_memory_bus {
             .expect("publish");
         // 返回 pattern_count (2)
         match count {
-            Value::Number(n) => assert_eq!(n, 2.0),
+            Value::Float(n) => assert_eq!(n, 2.0),
             other => panic!("expected Number, got: {:?}", other),
         }
     }
@@ -3317,7 +3314,7 @@ mod tests_v0431_memory_bus {
     fn bus_publish_validates_topic() {
         let mut interp = Interpreter::new();
         let err = interp
-            .call_event_method("publish", &[Value::Number(42.0)])
+            .call_event_method("publish", &[Value::Float(42.0)])
             .expect_err("non-string topic should fail");
         assert!(err.contains("topic must be a string"), "got: {}", err);
     }
@@ -3335,7 +3332,7 @@ mod tests_v0431_memory_bus {
             .unwrap();
         // pattern_count 应 = 1
         let count = interp.call_event_method("count", &[]).unwrap();
-        assert_eq!(count, Value::Number(1.0));
+        assert_eq!(count, Value::Float(1.0));
     }
 
     #[test]
@@ -3350,7 +3347,7 @@ mod tests_v0431_memory_bus {
             .unwrap();
         // 两个 patterns
         let count = interp.call_event_method("count", &[]).unwrap();
-        assert_eq!(count, Value::Number(2.0));
+        assert_eq!(count, Value::Float(2.0));
     }
 }
 
@@ -3379,7 +3376,7 @@ mod tests_v044_container_real {
             .expect("containerize should spawn docker");
         // 返回 Number (container_id hash)
         match result {
-            Value::Number(n) => assert!(n > 0.0, "container_id hash should be non-zero"),
+            Value::Float(n) => assert!(n > 0.0, "container_id hash should be non-zero"),
             other => panic!("expected Number, got: {:?}", other),
         }
         assert!(
@@ -3430,7 +3427,7 @@ mod tests_v044_container_real {
                 );
                 let exit_code = d.get("exit_code").expect("exit_code");
                 assert!(
-                    matches!(exit_code, Value::Number(0.0)),
+                    matches!(exit_code, Value::Float(0.0)),
                     "exit_code should be 0, got: {:?}",
                     exit_code
                 );
@@ -3819,19 +3816,19 @@ mod tests_v045_ai {
         let result = interp
             .call_ai_method(
                 "retry",
-                &[Value::String("5".to_string()), Value::Number(100.0)],
+                &[Value::String("5".to_string()), Value::Float(100.0)],
             )
             .expect("retry");
         match result {
             Value::Dict(d) => {
                 let attempts = d.get("attempts").expect("attempts");
                 match attempts {
-                    Value::Number(n) => assert_eq!(*n, 5.0),
+                    Value::Float(n) => assert_eq!(*n, 5.0),
                     _ => panic!("expected Number attempts"),
                 }
                 let backoff_ms = d.get("backoff_ms").expect("backoff_ms");
                 match backoff_ms {
-                    Value::Number(n) => assert_eq!(*n, 100.0),
+                    Value::Float(n) => assert_eq!(*n, 100.0),
                     _ => panic!("expected Number backoff_ms"),
                 }
                 let schedule = d.get("schedule").expect("schedule");
@@ -3854,7 +3851,7 @@ mod tests_v045_ai {
                 "retry",
                 &[
                     Value::String("4".to_string()),
-                    Value::Number(100.0),
+                    Value::Float(100.0),
                     Value::String("exponential".to_string()),
                 ],
             )
@@ -3866,7 +3863,7 @@ mod tests_v045_ai {
                     let nums: Vec<f64> = items
                         .iter()
                         .filter_map(|v| match v {
-                            Value::Number(n) => Some(*n),
+                            Value::Float(n) => Some(*n),
                             _ => None,
                         })
                         .collect();
@@ -4185,7 +4182,7 @@ body
             .call_skill_method("refresh_hub", &[])
             .expect("refresh_hub");
         match count {
-            Value::Number(n) => assert!(n >= 1.0, "expected at least 1 hub entry, got {}", n),
+            Value::Float(n) => assert!(n >= 1.0, "expected at least 1 hub entry, got {}", n),
             other => panic!("expected Number, got: {:?}", other),
         }
 
@@ -4287,7 +4284,7 @@ mod tests_v048_plan {
             Value::Dict(d) => {
                 let done = d.get("done").expect("done");
                 match done {
-                    Value::Number(n) => assert_eq!(*n, 1.0),
+                    Value::Float(n) => assert_eq!(*n, 1.0),
                     _ => panic!("expected Number"),
                 }
             }
@@ -4453,22 +4450,22 @@ mod tests_v048_plan {
             Value::Dict(d) => {
                 let total = d.get("total").expect("total");
                 match total {
-                    Value::Number(n) => assert_eq!(*n, 2.0),
+                    Value::Float(n) => assert_eq!(*n, 2.0),
                     _ => panic!("expected Number"),
                 }
                 let done = d.get("done").expect("done");
                 match done {
-                    Value::Number(n) => assert_eq!(*n, 1.0),
+                    Value::Float(n) => assert_eq!(*n, 1.0),
                     _ => panic!("expected Number"),
                 }
                 let pending = d.get("pending").expect("pending");
                 match pending {
-                    Value::Number(n) => assert_eq!(*n, 1.0),
+                    Value::Float(n) => assert_eq!(*n, 1.0),
                     _ => panic!("expected Number"),
                 }
                 let ratio = d.get("completion_ratio").expect("ratio");
                 match ratio {
-                    Value::Number(n) => assert_eq!(*n, 0.5),
+                    Value::Float(n) => assert_eq!(*n, 0.5),
                     _ => panic!("expected Number"),
                 }
             }
@@ -4528,7 +4525,7 @@ mod tests_v048_refine {
             Value::Dict(d) => {
                 let iter = d.get("iteration").expect("iteration");
                 match iter {
-                    Value::Number(n) => assert_eq!(*n, 1.0),
+                    Value::Float(n) => assert_eq!(*n, 1.0),
                     _ => panic!("expected Number"),
                 }
                 let refined = d.get("refined").expect("refined");
@@ -4570,7 +4567,7 @@ mod tests_v048_refine {
                 Value::Dict(d) => {
                     let iter = d.get("iteration").expect("iteration");
                     match iter {
-                        Value::Number(n) => assert_eq!(*n, i as f64),
+                        Value::Float(n) => assert_eq!(*n, i as f64),
                         _ => panic!("expected Number"),
                     }
                 }
@@ -4639,7 +4636,7 @@ mod tests_v048_refine {
                 "refine_info",
                 &[
                     Value::String(script.to_string_lossy().to_string()),
-                    Value::Number(1.0),
+                    Value::Float(1.0),
                 ],
             )
             .expect("iter 1");
@@ -4910,22 +4907,22 @@ mod tests_v047_heartbeat {
             Value::Dict(d) => {
                 let total = d.get("total").expect("total");
                 match total {
-                    Value::Number(n) => assert_eq!(*n, 4.0),
+                    Value::Float(n) => assert_eq!(*n, 4.0),
                     _ => panic!("expected Number"),
                 }
                 let done = d.get("done").expect("done");
                 match done {
-                    Value::Number(n) => assert_eq!(*n, 2.0),
+                    Value::Float(n) => assert_eq!(*n, 2.0),
                     _ => panic!("expected Number"),
                 }
                 let pending = d.get("pending").expect("pending");
                 match pending {
-                    Value::Number(n) => assert_eq!(*n, 2.0),
+                    Value::Float(n) => assert_eq!(*n, 2.0),
                     _ => panic!("expected Number"),
                 }
                 let ratio = d.get("completion_ratio").expect("ratio");
                 match ratio {
-                    Value::Number(n) => assert_eq!(*n, 0.5),
+                    Value::Float(n) => assert_eq!(*n, 0.5),
                     _ => panic!("expected Number"),
                 }
                 let complete = d.get("is_complete").expect("complete");
@@ -4972,7 +4969,7 @@ mod tests_v047_heartbeat {
             Value::Dict(d) => {
                 let total = d.get("total").expect("total");
                 match total {
-                    Value::Number(n) => assert_eq!(*n, 0.0),
+                    Value::Float(n) => assert_eq!(*n, 0.0),
                     _ => panic!("expected Number"),
                 }
                 let complete = d.get("is_complete").expect("complete");
@@ -5047,12 +5044,12 @@ mod tests_v047_context {
             Value::Dict(d) => {
                 let max = d.get("max_tokens").expect("max_tokens");
                 match max {
-                    Value::Number(n) => assert_eq!(*n, 4096.0, "default max"),
+                    Value::Float(n) => assert_eq!(*n, 4096.0, "default max"),
                     _ => panic!("expected Number"),
                 }
                 let msgs = d.get("messages").expect("messages");
                 match msgs {
-                    Value::Number(n) => assert_eq!(*n, 0.0, "default empty"),
+                    Value::Float(n) => assert_eq!(*n, 0.0, "default empty"),
                     _ => panic!("expected Number"),
                 }
             }
@@ -5067,7 +5064,7 @@ mod tests_v047_context {
             .call_ai_method("context.trim", &[])
             .expect("context.trim");
         match result {
-            Value::Number(n) => assert_eq!(n, 0.0, "empty context drops 0 tokens"),
+            Value::Float(n) => assert_eq!(n, 0.0, "empty context drops 0 tokens"),
             _ => panic!("expected Number"),
         }
     }
@@ -5076,12 +5073,12 @@ mod tests_v047_context {
     fn ai_context_trim_validates_threshold_range() {
         let mut interp = Interpreter::new();
         let err = interp
-            .call_ai_method("context.trim", &[Value::Number(1.5)])
+            .call_ai_method("context.trim", &[Value::Float(1.5)])
             .expect_err("1.5 should fail");
         assert!(err.contains("0.0-1.0"), "got: {}", err);
 
         let err2 = interp
-            .call_ai_method("context.trim", &[Value::Number(-0.1)])
+            .call_ai_method("context.trim", &[Value::Float(-0.1)])
             .expect_err("-0.1 should fail");
         assert!(err2.contains("0.0-1.0"), "got: {}", err2);
     }
@@ -5090,10 +5087,10 @@ mod tests_v047_context {
     fn ai_context_trim_accepts_valid_threshold() {
         let mut interp = Interpreter::new();
         let result = interp
-            .call_ai_method("context.trim", &[Value::Number(0.5)])
+            .call_ai_method("context.trim", &[Value::Float(0.5)])
             .expect("should succeed");
         match result {
-            Value::Number(_) => {}
+            Value::Float(_) => {}
             _ => panic!("expected Number"),
         }
     }

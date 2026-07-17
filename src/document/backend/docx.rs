@@ -152,10 +152,10 @@ impl DocumentBackend for DocxBackend {
             block_dict.insert(
                 "bbox".into(),
                 Value::List(vec![
-                    Value::Number(0.0),
-                    Value::Number(0.0),
-                    Value::Number(0.0),
-                    Value::Number(0.0),
+                    Value::Float(0.0),
+                    Value::Float(0.0),
+                    Value::Float(0.0),
+                    Value::Float(0.0),
                 ]),
             );
             let mut span_dict: HashMap<String, Value> = HashMap::new();
@@ -163,10 +163,10 @@ impl DocumentBackend for DocxBackend {
             span_dict.insert(
                 "bbox".into(),
                 Value::List(vec![
-                    Value::Number(0.0),
-                    Value::Number(0.0),
-                    Value::Number(0.0),
-                    Value::Number(0.0),
+                    Value::Float(0.0),
+                    Value::Float(0.0),
+                    Value::Float(0.0),
+                    Value::Float(0.0),
                 ]),
             );
             span_dict.insert("score".into(), Value::Nil);
@@ -175,9 +175,9 @@ impl DocumentBackend for DocxBackend {
         }
 
         let mut page_dict: HashMap<String, Value> = HashMap::new();
-        page_dict.insert("page_no".into(), Value::Number(1.0));
-        page_dict.insert("width".into(), Value::Number(0.0));
-        page_dict.insert("height".into(), Value::Number(0.0));
+        page_dict.insert("page_no".into(), Value::Float(1.0));
+        page_dict.insert("width".into(), Value::Float(0.0));
+        page_dict.insert("height".into(), Value::Float(0.0));
         page_dict.insert("blocks".into(), Value::List(blocks));
         Ok(Value::List(vec![Value::Dict(page_dict)]))
     }
@@ -200,8 +200,8 @@ impl DocumentBackend for DocxBackend {
     fn metadata(&self) -> Result<Value, String> {
         let mut m: HashMap<String, Value> = HashMap::new();
         m.insert("origin".into(), Value::String("docx".into()));
-        m.insert("pages".into(), Value::Number(1.0));
-        m.insert("size".into(), Value::Number(self.bytes.len() as f64));
+        m.insert("pages".into(), Value::Float(1.0));
+        m.insert("size".into(), Value::Float(self.bytes.len() as f64));
         for (k, v) in &self.metadata {
             m.insert(k.clone(), Value::String(v.clone()));
         }

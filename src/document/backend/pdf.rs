@@ -79,9 +79,9 @@ impl DocumentBackend for PdfBackend {
         let mut out: Vec<Value> = Vec::with_capacity(self.page_count);
         for (i, text) in self.per_page_text.iter().enumerate() {
             let mut page_dict: HashMap<String, Value> = HashMap::new();
-            page_dict.insert("page_no".into(), Value::Number((i as f64) + 1.0));
-            page_dict.insert("width".into(), Value::Number(595.0));
-            page_dict.insert("height".into(), Value::Number(842.0));
+            page_dict.insert("page_no".into(), Value::Float((i as f64) + 1.0));
+            page_dict.insert("width".into(), Value::Float(595.0));
+            page_dict.insert("height".into(), Value::Float(842.0));
 
             // One placeholder text block per page.
             let mut block_dict: HashMap<String, Value> = HashMap::new();
@@ -89,10 +89,10 @@ impl DocumentBackend for PdfBackend {
             block_dict.insert(
                 "bbox".into(),
                 Value::List(vec![
-                    Value::Number(0.0),
-                    Value::Number(0.0),
-                    Value::Number(595.0),
-                    Value::Number(842.0),
+                    Value::Float(0.0),
+                    Value::Float(0.0),
+                    Value::Float(595.0),
+                    Value::Float(842.0),
                 ]),
             );
             let mut span_dict: HashMap<String, Value> = HashMap::new();
@@ -100,10 +100,10 @@ impl DocumentBackend for PdfBackend {
             span_dict.insert(
                 "bbox".into(),
                 Value::List(vec![
-                    Value::Number(0.0),
-                    Value::Number(0.0),
-                    Value::Number(595.0),
-                    Value::Number(842.0),
+                    Value::Float(0.0),
+                    Value::Float(0.0),
+                    Value::Float(595.0),
+                    Value::Float(842.0),
                 ]),
             );
             span_dict.insert("score".into(), Value::Nil);
@@ -130,8 +130,8 @@ impl DocumentBackend for PdfBackend {
     fn metadata(&self) -> Result<Value, String> {
         let mut m: HashMap<String, Value> = HashMap::new();
         m.insert("origin".into(), Value::String("pdf".into()));
-        m.insert("pages".into(), Value::Number(self.page_count as f64));
-        m.insert("size".into(), Value::Number(self.bytes.len() as f64));
+        m.insert("pages".into(), Value::Float(self.page_count as f64));
+        m.insert("size".into(), Value::Float(self.bytes.len() as f64));
         // Merge info-dict keys (currently always empty for MVP).
         for (k, v) in &self.info {
             m.insert(k.clone(), Value::String(v.clone()));
@@ -149,10 +149,10 @@ impl DocumentBackend for PdfBackend {
             block_dict.insert(
                 "bbox".into(),
                 Value::List(vec![
-                    Value::Number(0.0),
-                    Value::Number(0.0),
-                    Value::Number(595.0),
-                    Value::Number(842.0),
+                    Value::Float(0.0),
+                    Value::Float(0.0),
+                    Value::Float(595.0),
+                    Value::Float(842.0),
                 ]),
             );
             let mut span_dict: HashMap<String, Value> = HashMap::new();

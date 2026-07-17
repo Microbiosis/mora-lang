@@ -85,5 +85,9 @@ quick-xml = "0.40"
 uuid = { version = "1", features = ["v4"] }
 rusqlite = { version = "0.32", optional = true, features = ["bundled"] }
 
+[dev-dependencies]
+# v0.53: property-based testing for formal semantics verification
+proptest = "1.7"
+
 [features]
 checkpoint-sqlite = ["rusqlite"]

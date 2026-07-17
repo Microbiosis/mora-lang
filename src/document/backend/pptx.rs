@@ -138,19 +138,19 @@ impl DocumentBackend for PptxBackend {
         let mut out: Vec<Value> = Vec::with_capacity(self.per_slide_text.len());
         for (i, text) in self.per_slide_text.iter().enumerate() {
             let mut page_dict: HashMap<String, Value> = HashMap::new();
-            page_dict.insert("page_no".into(), Value::Number((i as f64) + 1.0));
-            page_dict.insert("width".into(), Value::Number(960.0));
-            page_dict.insert("height".into(), Value::Number(540.0));
+            page_dict.insert("page_no".into(), Value::Float((i as f64) + 1.0));
+            page_dict.insert("width".into(), Value::Float(960.0));
+            page_dict.insert("height".into(), Value::Float(540.0));
 
             let mut block_dict: HashMap<String, Value> = HashMap::new();
             block_dict.insert("kind".into(), Value::String("text".into()));
             block_dict.insert(
                 "bbox".into(),
                 Value::List(vec![
-                    Value::Number(0.0),
-                    Value::Number(0.0),
-                    Value::Number(960.0),
-                    Value::Number(540.0),
+                    Value::Float(0.0),
+                    Value::Float(0.0),
+                    Value::Float(960.0),
+                    Value::Float(540.0),
                 ]),
             );
             let mut span_dict: HashMap<String, Value> = HashMap::new();
@@ -158,10 +158,10 @@ impl DocumentBackend for PptxBackend {
             span_dict.insert(
                 "bbox".into(),
                 Value::List(vec![
-                    Value::Number(0.0),
-                    Value::Number(0.0),
-                    Value::Number(0.0),
-                    Value::Number(0.0),
+                    Value::Float(0.0),
+                    Value::Float(0.0),
+                    Value::Float(0.0),
+                    Value::Float(0.0),
                 ]),
             );
             span_dict.insert("score".into(), Value::Nil);
@@ -190,8 +190,8 @@ impl DocumentBackend for PptxBackend {
     fn metadata(&self) -> Result<Value, String> {
         let mut m: HashMap<String, Value> = HashMap::new();
         m.insert("origin".into(), Value::String("pptx".into()));
-        m.insert("pages".into(), Value::Number(self.slide_count as f64));
-        m.insert("size".into(), Value::Number(self.bytes.len() as f64));
+        m.insert("pages".into(), Value::Float(self.slide_count as f64));
+        m.insert("size".into(), Value::Float(self.bytes.len() as f64));
         for (k, v) in &self.metadata {
             m.insert(k.clone(), Value::String(v.clone()));
         }

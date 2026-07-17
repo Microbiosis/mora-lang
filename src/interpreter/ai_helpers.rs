@@ -110,11 +110,11 @@ impl Interpreter {
             && let Some(Value::Dict(usage)) = map.get("usage")
         {
             let input = match usage.get("prompt_tokens") {
-                Some(Value::Number(n)) => *n as usize,
+                Some(Value::Float(n)) => *n as usize,
                 _ => 0,
             };
             let output = match usage.get("completion_tokens") {
-                Some(Value::Number(n)) => *n as usize,
+                Some(Value::Float(n)) => *n as usize,
                 _ => 0,
             };
             return (input, output);
@@ -264,7 +264,7 @@ impl Interpreter {
             }
         }
 
-        m.insert("score".to_string(), Value::Number(score));
+        m.insert("score".to_string(), Value::Float(score));
         m.insert("verdict".to_string(), Value::String(verdict));
         m.insert("issues".to_string(), Value::String(issues));
         m.insert("suggestion".to_string(), Value::String(suggestion));
@@ -325,7 +325,7 @@ impl Interpreter {
             }
         };
 
-        m.insert("score".to_string(), Value::Number(score));
+        m.insert("score".to_string(), Value::Float(score));
         m.insert("verdict".to_string(), Value::String(verdict));
         m.insert("issues".to_string(), Value::String(issues));
         m.insert(

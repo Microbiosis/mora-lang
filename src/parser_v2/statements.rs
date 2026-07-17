@@ -80,7 +80,12 @@ impl ParserV2 {
         let mut return_type = None;
         if self.check(&TokenType::Colon) {
             self.advance();
-            return_type = Some(self.consume_identifier("Expected return type"));
+            let mut rtype = self.consume_identifier("Expected return type");
+            // Normalize legacy "number" type hint to "float" (Type::Number merged into Type::Float).
+            if rtype == "number" {
+                rtype = "float".to_string();
+            }
+            return_type = Some(rtype);
         }
 
         while self.check(&TokenType::Newline) {
@@ -845,7 +850,7 @@ impl ParserV2 {
                     self.advance(); // consume 'max_rounds'
                     self.consume(&TokenType::Colon, "Expected ':'");
                     if let Some(Token {
-                        token_type: TokenType::Number(n),
+                        token_type: TokenType::Float(n),
                         ..
                     }) = self.peek().cloned()
                     {
@@ -1245,7 +1250,7 @@ impl ParserV2 {
                 self.advance(); // consume 'tolerance'
                 self.consume(&TokenType::Colon, "Expected ':'");
                 if let Some(Token {
-                    token_type: TokenType::Number(n),
+                    token_type: TokenType::Float(n),
                     ..
                 }) = self.peek().cloned()
                 {
@@ -1925,7 +1930,7 @@ mod tests {
             panic!("expected Let, got: {:?}", kind);
         };
         assert_eq!(name, "x");
-        assert_eq!(type_hint.as_deref(), Some("number"));
+        assert_eq!(type_hint.as_deref(), Some("float"));
     }
 
     #[test]
@@ -1965,7 +1970,7 @@ mod tests {
         let StmtKind::TaskDef { return_type, .. } = &kind else {
             panic!("expected TaskDef, got: {:?}", kind);
         };
-        assert_eq!(return_type.as_deref(), Some("number"));
+        assert_eq!(return_type.as_deref(), Some("float"));
     }
 
     /// v0.55 (Bug C): `else` 关键字未在 lexer 内,parser 层无法扩展

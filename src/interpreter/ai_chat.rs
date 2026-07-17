@@ -18,9 +18,9 @@ impl Interpreter {
         model: &str,
         prompt: &str,
     ) -> Result<Value, String> {
-        let api_key = std::env::var("OPENAI_API_KEY").unwrap_or_default();
-        let base_url = std::env::var("MORA_AI_BASE_URL")
-            .unwrap_or_else(|_| "https://api.openai.com/v1".to_string());
+        let api_key = env::var(AI_API_KEY_ENV).unwrap_or_default();
+        let base_url =
+            env::var(AI_BASE_URL_ENV).unwrap_or_else(|_| AI_BASE_URL_DEFAULT.to_string());
 
         if api_key.is_empty() {
             // Mock 模式
@@ -45,7 +45,15 @@ impl Interpreter {
         let messages = vec![("user".to_string(), prompt.to_string())];
         // v0.06: 从 current_ai_config 取 temperature/max_tokens/system,
         // 拼进 real_ai_chat_inner (v0.06.5 才改函数签名，这里先保留 env 兼容)
-        interp.real_ai_chat(&messages, &api_key, model, &base_url)
+        // v0.xx: 优先使用 current_ai_config.model (with 块语法设置),
+        // 未设定时 fallback 到调用方传入的 model (向后兼容)
+        let effective_model = interp
+            .core
+            .current_ai_config
+            .as_ref()
+            .and_then(|c| c.model.as_ref())
+            .map_or_else(|| model.to_string(), |v| v.clone());
+        interp.real_ai_chat(&messages, &api_key, &effective_model, &base_url)
     }
 
     pub(super) fn real_web_fetch(&mut self, url: &str) -> Result<Value, String> {
@@ -737,14 +745,14 @@ suggestion: <improvement suggestion or "none">"#,
         };
 
         // 用 ai.chat 调用评估（走 fast 路由或默认模型）
-        let has_key = env::var("OPENAI_API_KEY")
+        let has_key = env::var(AI_API_KEY_ENV)
             .map(|k| !k.is_empty())
             .unwrap_or(false);
         if has_key {
-            let api_key = env::var("OPENAI_API_KEY").unwrap_or_default();
-            let model = env::var("MORA_AI_MODEL").unwrap_or_else(|_| "gpt-4o-mini".to_string());
-            let base_url = env::var("MORA_AI_BASE_URL")
-                .unwrap_or_else(|_| "https://api.openai.com/v1".to_string());
+            let api_key = env::var(AI_API_KEY_ENV).unwrap_or_default();
+            let model = env::var(AI_MODEL_ENV).unwrap_or_else(|_| AI_MODEL_DEFAULT.to_string());
+            let base_url =
+                env::var(AI_BASE_URL_ENV).unwrap_or_else(|_| AI_BASE_URL_DEFAULT.to_string());
             let msgs = vec![("user".to_string(), critic_prompt)];
             match self.real_ai_chat(&msgs, &api_key, &model, &base_url) {
                 Ok(Value::String(response)) => {
@@ -778,7 +786,7 @@ suggestion: <improvement suggestion or "none">"#,
 
         // 确定 API 配置
         let route = self.ai.model_routes.get(model_route);
-        let default_key = env::var("OPENAI_API_KEY").unwrap_or_default();
+        let default_key = env::var(AI_API_KEY_ENV).unwrap_or_default();
         let (api_key, model, base_url) = if let Some(r) = route {
             let key = if r.api_key.is_empty() {
                 default_key.clone()
@@ -801,9 +809,9 @@ suggestion: <improvement suggestion or "none">"#,
             }
             (key, r.model.clone(), r.base_url.clone())
         } else {
-            let model = env::var("MORA_AI_MODEL").unwrap_or_else(|_| "gpt-4o-mini".to_string());
-            let base_url = env::var("MORA_AI_BASE_URL")
-                .unwrap_or_else(|_| "https://api.openai.com/v1".to_string());
+            let model = env::var(AI_MODEL_ENV).unwrap_or_else(|_| AI_MODEL_DEFAULT.to_string());
+            let base_url =
+                env::var(AI_BASE_URL_ENV).unwrap_or_else(|_| AI_BASE_URL_DEFAULT.to_string());
             (default_key, model, base_url)
         };
 

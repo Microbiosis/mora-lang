@@ -206,9 +206,9 @@ impl DocumentBackend for ImageBackend {
     }
     fn pages(&self) -> Result<Value, String> {
         let mut pd = HashMap::new();
-        pd.insert("page_no".into(), Value::Number(1.0));
-        pd.insert("width".into(), Value::Number(self.width as f64));
-        pd.insert("height".into(), Value::Number(self.height as f64));
+        pd.insert("page_no".into(), Value::Float(1.0));
+        pd.insert("width".into(), Value::Float(self.width as f64));
+        pd.insert("height".into(), Value::Float(self.height as f64));
         pd.insert("blocks".into(), Value::List(vec![]));
         Ok(Value::List(vec![Value::Dict(pd)]))
     }
@@ -221,12 +221,12 @@ impl DocumentBackend for ImageBackend {
     fn metadata(&self) -> Result<Value, String> {
         let mut m = HashMap::new();
         m.insert("origin".into(), Value::String("image".into()));
-        m.insert("pages".into(), Value::Number(1.0));
+        m.insert("pages".into(), Value::Float(1.0));
         m.insert("format".into(), Value::String(self.format.clone()));
-        m.insert("width".into(), Value::Number(self.width as f64));
-        m.insert("height".into(), Value::Number(self.height as f64));
+        m.insert("width".into(), Value::Float(self.width as f64));
+        m.insert("height".into(), Value::Float(self.height as f64));
         m.insert("ocr_engine".into(), Value::String(self.ocr_engine.clone()));
-        m.insert("size".into(), Value::Number(self.bytes.len() as f64));
+        m.insert("size".into(), Value::Float(self.bytes.len() as f64));
         Ok(Value::Dict(m))
     }
     fn blocks(&self) -> Result<Value, String> {
@@ -294,7 +294,7 @@ mod tests {
             let w = m
                 .get("width")
                 .and_then(|v| {
-                    if let Value::Number(n) = v {
+                    if let Value::Float(n) = v {
                         Some(*n)
                     } else {
                         None
@@ -304,7 +304,7 @@ mod tests {
             let h = m
                 .get("height")
                 .and_then(|v| {
-                    if let Value::Number(n) = v {
+                    if let Value::Float(n) = v {
                         Some(*n)
                     } else {
                         None

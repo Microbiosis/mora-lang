@@ -186,7 +186,7 @@ impl Interpreter {
                                     );
                                     env.define(
                                         "rounds".to_string(),
-                                        Value::Number(
+                                        Value::Float(
                                             *rounds_map
                                                 .get(&(e.from.clone(), e.to.clone()))
                                                 .unwrap_or(&0)
@@ -299,7 +299,7 @@ impl Interpreter {
                         }
                     }
                     "temperature" => {
-                        if let Value::Number(t) = val {
+                        if let Value::Float(t) = val {
                             self.core.current_ai_config = Some(AiConfigValue {
                                 temperature: Some(t),
                                 ..self.core.current_ai_config.clone().unwrap_or_default()

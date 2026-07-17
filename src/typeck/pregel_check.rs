@@ -39,7 +39,7 @@ fn is_list_type_hint(hint: &str) -> bool {
 
 fn is_number_type_hint(hint: &str) -> bool {
     let h = hint.trim().to_lowercase();
-    h.contains("number") || h.contains("int") || h.contains("float") || h == "num"
+    h.contains("float") || h.contains("int") || h.contains("float") || h == "num"
 }
 
 // ===================================================================
@@ -385,7 +385,7 @@ mod tests {
             },
             StateChannel {
                 name: "total_cost".into(),
-                type_hint: Some("number".into()),
+                type_hint: Some("float".into()),
                 reducer: ReducerKind::Add,
             },
             StateChannel {

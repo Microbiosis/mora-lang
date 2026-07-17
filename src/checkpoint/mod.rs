@@ -164,8 +164,7 @@ impl Checkpoint {
 
         let v = match map.get("v") {
             Some(Value::Int(i)) => *i as u32,
-            Some(Value::Number(n)) => *n as u32,
-            Some(Value::Float(f)) => *f as u32,
+            Some(Value::Float(n)) => *n as u32,
             _ => return Err("Checkpoint v must be a number".to_string()),
         };
 
@@ -176,8 +175,7 @@ impl Checkpoint {
 
         let step = match map.get("step") {
             Some(Value::Int(i)) => *i as usize,
-            Some(Value::Number(n)) => *n as usize,
-            Some(Value::Float(f)) => *f as usize,
+            Some(Value::Float(n)) => *n as usize,
             _ => return Err("Checkpoint step must be a number".to_string()),
         };
 
@@ -192,8 +190,7 @@ impl Checkpoint {
                 .map(|(k, v)| {
                     let num = match v {
                         Value::Int(i) => *i as u64,
-                        Value::Number(n) => *n as u64,
-                        Value::Float(f) => *f as u64,
+                        Value::Float(n) => *n as u64,
                         _ => {
                             return Err(format!(
                                 "channel_versions value must be a number: {:?}",
@@ -217,8 +214,7 @@ impl Checkpoint {
                             .map(|(k, v)| {
                                 let num = match v {
                                     Value::Int(i) => *i as u64,
-                                    Value::Number(n) => *n as u64,
-                                    Value::Float(f) => *f as u64,
+                                    Value::Float(n) => *n as u64,
                                     _ => {
                                         return Err(format!(
                                             "versions_seen value must be a number: {:?}",
@@ -264,8 +260,7 @@ impl Checkpoint {
                 .parse::<u128>()
                 .map_err(|e| format!("Invalid timestamp_ms: {}", e))?,
             Some(Value::Int(i)) => *i as u128,
-            Some(Value::Number(n)) => *n as u128,
-            Some(Value::Float(f)) => *f as u128,
+            Some(Value::Float(n)) => *n as u128,
             _ => return Err("Checkpoint timestamp_ms must be a string or number".to_string()),
         };
 

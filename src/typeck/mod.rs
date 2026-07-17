@@ -41,10 +41,8 @@ pub enum Type {
     /// v0.x: 单字符类型（`string[number]` 索引结果）
     Char,
     // v0.38: numeric tower — Int(i64) and Float(f64) as distinct types.
-    // `Number` is the legacy f64 type retained for unsuffixed literals.
     Int,
     Float,
-    Number,
     Bool,
     Nil,
     /// v0.x: 列表类型携带元素类型（`list<T>`）
@@ -118,10 +116,9 @@ impl Type {
         match self {
             Type::String => "string".to_string(),
             Type::Char => "char".to_string(),
-            // v0.38: Int and Float distinct; Number legacy.
+            // v0.38: Int and Float distinct.
             Type::Int => "int".to_string(),
             Type::Float => "float".to_string(),
-            Type::Number => "number".to_string(),
             Type::Bool => "bool".to_string(),
             Type::Nil => "nil".to_string(),
             Type::List(elem) => format!("list<{}>", elem.name()),
@@ -167,7 +164,7 @@ impl Type {
         match hint {
             "string" => Type::String,
             "char" => Type::Char,
-            "number" => Type::Number,
+            "float" | "number" => Type::Float, // v0.x: "number" kept for backwards compatibility
             "bool" => Type::Bool,
             "nil" => Type::Nil,
             // v0.50: "any" 应解析为 Union(vec![])（兼容任何类型）
@@ -263,7 +260,7 @@ impl Type {
             name,
             "string"
                 | "char"
-                | "number"
+                | "float"
                 | "bool"
                 | "nil"
                 | "list"
@@ -363,7 +360,7 @@ pub fn is_known_type(name: &str) -> bool {
         lower.as_str(),
         "string"
             | "char"
-            | "number"
+            | "float"
             | "bool"
             | "nil"
             | "list"
@@ -678,7 +675,7 @@ impl TypeChecker {
                     "x".to_string(),
                     Type::Union(vec![
                         Type::String,
-                        Type::Number,
+                        Type::Float,
                         Type::Bool,
                         Type::Char,
                         Type::Nil,
@@ -696,12 +693,12 @@ impl TypeChecker {
             "range".to_string(),
             Signature {
                 params: vec![
-                    ("start".to_string(), Type::Number),
-                    ("end".to_string(), Type::Number),
-                    ("step".to_string(), Type::Number),
+                    ("start".to_string(), Type::Float),
+                    ("end".to_string(), Type::Float),
+                    ("step".to_string(), Type::Float),
                 ],
                 raw_params: vec![None, None, None],
-                return_type: Type::List(Box::new(Type::Number)),
+                return_type: Type::List(Box::new(Type::Float)),
                 raw_return_type: None,
             },
         );
@@ -718,7 +715,7 @@ impl TypeChecker {
                     ]),
                 )],
                 raw_params: vec![None],
-                return_type: Type::Number,
+                return_type: Type::Float,
                 raw_return_type: None,
             },
         );
@@ -825,8 +822,8 @@ impl TypeChecker {
                     };
                 }
                 // number + number (允许 Any 兼容 number 作为 boundary)
-                if matches!(lt, Type::Number) && matches!(rt, Type::Number) {
-                    return Type::Number;
+                if matches!(lt, Type::Float) && matches!(rt, Type::Float) {
+                    return Type::Float;
                 }
                 // Any 在二元运算中视为"未知" - 上游负责保证不推 Any
                 //   (string + Any 也应报错, 因为 Any 已不是 boundary)
@@ -844,8 +841,8 @@ impl TypeChecker {
                 Type::Union(vec![])
             }
             Sub | Mul | Div | Mod => {
-                if matches!(lt, Type::Number) && matches!(rt, Type::Number) {
-                    Type::Number
+                if matches!(lt, Type::Float) && matches!(rt, Type::Float) {
+                    Type::Float
                 } else {
                     self.errors.push(TypeError::from_span_with_detail(
                         &span,
@@ -870,8 +867,8 @@ impl TypeChecker {
             }
             Equal | NotEqual => Type::Bool,
             Greater | Less | GreaterEqual | LessEqual => {
-                if matches!(lt, Type::Number | Type::String)
-                    && matches!(rt, Type::Number | Type::String)
+                if matches!(lt, Type::Float | Type::String)
+                    && matches!(rt, Type::Float | Type::String)
                 {
                     Type::Bool
                 } else {
@@ -906,7 +903,7 @@ fn method_return_type(receiver: &Type, method: &str) -> Type {
             "push" => return Type::List(elem.clone()),
             // reduce/pop/get 的返回类型不依赖元素类型，仍为 Any
             "reduce" | "pop" | "get" => return Type::Union(vec![]),
-            "len" => return Type::Number,
+            "len" => return Type::Float,
             _ => {} // fall through to fallback
         }
     }
@@ -919,7 +916,7 @@ fn method_return_type(receiver: &Type, method: &str) -> Type {
             "set" => return Type::Dict(k.clone(), v.clone()),
             "keys" => return Type::List(k.clone()),
             "values" => return Type::List(v.clone()),
-            "len" => return Type::Number,
+            "len" => return Type::Float,
             _ => {} // fall through to fallback
         }
     }
@@ -929,7 +926,7 @@ fn method_return_type(receiver: &Type, method: &str) -> Type {
 /// 通用方法返回类型（不依赖 list/dict 元素类型）
 fn method_return_type_fallback(receiver: &Type, method: &str) -> Type {
     match (receiver, method) {
-        (Type::String, "len") => Type::Number,
+        (Type::String, "len") => Type::Float,
         (Type::String, "upper" | "lower" | "trim" | "replace") => Type::String,
         (Type::String, "starts_with" | "ends_with" | "contains") => Type::Bool,
         (Type::String, "split") => Type::List(Box::new(Type::String)),
@@ -953,13 +950,13 @@ fn method_return_type_fallback(receiver: &Type, method: &str) -> Type {
         // v0.06.3: HttpRequest 方法
         (Type::HttpRequest, "json") => Type::Union(vec![]), // ~Result<T, ParseError>
         (Type::Union(_), _) => Type::Union(vec![]),
-        (_, "len") => Type::Number, // 通用 len
+        (_, "len") => Type::Float, // 通用 len
         _ => Type::Union(vec![]),
     }
 }
 
 /// v0.10 修复: 在 type hint 字符串中替换 trait 泛型参数名
-///   `substitute_type_hint("T", {T: number})` → `Some("number")`
+///   `substitute_type_hint("T", {T: number})` → `Some("float")`
 ///   `substitute_type_hint("Boxed<T>", {T: number})` → `Some("Boxed<number>")`
 ///   `substitute_type_hint("T<U>", {T: number, U: string})` → `Some("number<string>")`
 ///   不在替换表中的标识符保留原样
@@ -1002,7 +999,6 @@ fn type_to_hint_string(ty: &Type) -> String {
     match ty {
         Type::Int => "int".to_string(),
         Type::Float => "float".to_string(),
-        Type::Number => "number".to_string(),
         Type::String => "string".to_string(),
         Type::Char => "char".to_string(),
         Type::Bool => "bool".to_string(),
@@ -1559,7 +1555,7 @@ end
     fn from_hint_list_with_element() {
         assert_eq!(
             Type::from_hint("list<number>"),
-            Type::List(Box::new(Type::Number))
+            Type::List(Box::new(Type::Float))
         );
     }
 
@@ -1567,7 +1563,7 @@ end
     fn from_hint_nested_list() {
         assert_eq!(
             Type::from_hint("list<list<number>>"),
-            Type::List(Box::new(Type::List(Box::new(Type::Number))))
+            Type::List(Box::new(Type::List(Box::new(Type::Float))))
         );
     }
 
@@ -1575,7 +1571,7 @@ end
     fn from_hint_dict_kv() {
         assert_eq!(
             Type::from_hint("dict<string, number>"),
-            Type::Dict(Box::new(Type::String), Box::new(Type::Number))
+            Type::Dict(Box::new(Type::String), Box::new(Type::Float))
         );
     }
 
@@ -1612,8 +1608,8 @@ end
     #[test]
     fn type_name_generic() {
         assert_eq!(
-            Type::List(Box::new(Type::Number)).name(),
-            "list<number>".to_string()
+            Type::List(Box::new(Type::Float)).name(),
+            "list<float>".to_string()
         );
         assert_eq!(
             Type::Dict(Box::new(Type::String), Box::new(Type::Union(vec![]))).name(),
@@ -1771,9 +1767,9 @@ end
 
     #[test]
     fn union_name_format() {
-        // v0.13: Union([String, Number]) → "string | number"
-        let t = Type::Union(vec![Type::String, Type::Number]);
-        assert_eq!(t.name(), "string | number");
+        // v0.13: Union([String, Float]) → "string | float"
+        let t = Type::Union(vec![Type::String, Type::Float]);
+        assert_eq!(t.name(), "string | float");
     }
 
     #[test]
@@ -1786,16 +1782,16 @@ end
     #[test]
     fn union_compatible_with_member() {
         // v0.13: String ∈ Union([String, Number, Bool])
-        let union_ty = Type::Union(vec![Type::String, Type::Number, Type::Bool]);
+        let union_ty = Type::Union(vec![Type::String, Type::Float, Type::Bool]);
         assert!(union_ty.compatible_with(&Type::String));
-        assert!(union_ty.compatible_with(&Type::Number));
+        assert!(union_ty.compatible_with(&Type::Float));
         assert!(!union_ty.compatible_with(&Type::Char));
     }
 
     #[test]
     fn union_member_compatible_with_union() {
         // v0.13: String 兼容 Union([String, Number])
-        let union_ty = Type::Union(vec![Type::String, Type::Number]);
+        let union_ty = Type::Union(vec![Type::String, Type::Float]);
         assert!(Type::String.compatible_with(&union_ty));
         assert!(!Type::Char.compatible_with(&union_ty));
     }
@@ -1804,7 +1800,7 @@ end
     fn union_nested_compatible() {
         // v0.13: List<Number> 兼容 List<Union<...empty...>> (空 Union = any element)
         let union_list = Type::List(Box::new(Type::Union(vec![])));
-        assert!(Type::List(Box::new(Type::Number)).compatible_with(&union_list));
+        assert!(Type::List(Box::new(Type::Float)).compatible_with(&union_list));
     }
 
     #[test]
@@ -1812,8 +1808,8 @@ end
         // v0.13: 空 Union 兼容任何类型 (相当于旧 Any)
         let any_ty = Type::Union(vec![]);
         assert!(any_ty.compatible_with(&Type::String));
-        assert!(any_ty.compatible_with(&Type::Number));
-        assert!(Type::List(Box::new(Type::Number)).compatible_with(&any_ty));
+        assert!(any_ty.compatible_with(&Type::Float));
+        assert!(Type::List(Box::new(Type::Float)).compatible_with(&any_ty));
     }
 
     // ============ builtin 显式 Union 签名 ============
@@ -1988,7 +1984,7 @@ end
     #[test]
     fn result_must_be_isomorphic_v0_13() {
         // v0.13: Result<number, string> != Result<string, string>
-        let r1 = Type::Result_(Box::new(Type::Number), Box::new(Type::String));
+        let r1 = Type::Result_(Box::new(Type::Float), Box::new(Type::String));
         let r2 = Type::Result_(Box::new(Type::String), Box::new(Type::String));
         assert!(
             !r1.compatible_with(&r2),
@@ -1999,8 +1995,8 @@ end
     #[test]
     fn result_isomorphic_compatible() {
         // v0.13: Result<number, string> 兼容 Result<number, string>
-        let r1 = Type::Result_(Box::new(Type::Number), Box::new(Type::String));
-        let r2 = Type::Result_(Box::new(Type::Number), Box::new(Type::String));
+        let r1 = Type::Result_(Box::new(Type::Float), Box::new(Type::String));
+        let r2 = Type::Result_(Box::new(Type::Float), Box::new(Type::String));
         assert!(r1.compatible_with(&r2));
     }
 
@@ -2013,10 +2009,9 @@ end
         //   (编译错误 = 测试失败)
         fn _check() {
             // 直接 match 必须穷尽
-            let _t = match Type::Number {
+            let _t = match Type::Float {
                 Type::Int
                 | Type::Float
-                | Type::Number
                 | Type::String
                 | Type::Char
                 | Type::Bool

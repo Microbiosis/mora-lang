@@ -197,25 +197,25 @@ pub fn options_from_value(v: &crate::value::Value) -> Result<CompressOptions, St
         if let Some(Value::String(s)) = map.get("strategy") {
             opts.strategy = s.clone();
         }
-        if let Some(Value::Number(n)) = map.get("max_bytes") {
+        if let Some(Value::Float(n)) = map.get("max_bytes") {
             opts.max_bytes = Some(*n as usize);
         }
-        if let Some(Value::Number(n)) = map.get("target_ratio") {
+        if let Some(Value::Float(n)) = map.get("target_ratio") {
             opts.target_ratio = Some(*n as f32);
         }
-        if let Some(Value::Number(n)) = map.get("head_pct") {
+        if let Some(Value::Float(n)) = map.get("head_pct") {
             opts.head_pct = *n as f32;
         }
-        if let Some(Value::Number(n)) = map.get("tail_pct") {
+        if let Some(Value::Float(n)) = map.get("tail_pct") {
             opts.tail_pct = *n as f32;
         }
-        if let Some(Value::Number(n)) = map.get("k_first") {
+        if let Some(Value::Float(n)) = map.get("k_first") {
             opts.k_first = Some(*n as usize);
         }
-        if let Some(Value::Number(n)) = map.get("k_last") {
+        if let Some(Value::Float(n)) = map.get("k_last") {
             opts.k_last = Some(*n as usize);
         }
-        if let Some(Value::Number(n)) = map.get("lossless_min_savings_ratio") {
+        if let Some(Value::Float(n)) = map.get("lossless_min_savings_ratio") {
             opts.lossless_min_savings_ratio = *n as f32;
         }
         if let Some(Value::Bool(b)) = map.get("preserve_errors") {
@@ -323,7 +323,7 @@ pub fn value_type_simple(v: &crate::value::Value) -> &'static str {
     use crate::value::Value;
     match v {
         Value::String(_) => "string",
-        Value::Number(_) => "number",
+        Value::Float(_) => "float",
         Value::Bool(_) => "bool",
         Value::Nil => "nil",
         Value::List(_) => "list",

@@ -281,7 +281,7 @@ fn json_lsp_to_value(j: JsonValue) -> Value {
     match j {
         JsonValue::Null => Value::Nil,
         JsonValue::Bool(b) => Value::Bool(b),
-        JsonValue::Number(n) => Value::Number(n),
+        JsonValue::Number(n) => Value::Float(n),
         JsonValue::String_(s) => Value::String(s),
         JsonValue::Array(items) => Value::List(items.into_iter().map(json_lsp_to_value).collect()),
         JsonValue::Object(map) => {
@@ -306,7 +306,6 @@ fn value_to_json(v: &Value) -> JsonValue {
         // v0.38: Int fits i64; Float and Number use f64.
         Value::Int(i) => JsonValue::Number(*i as f64),
         Value::Float(n) => JsonValue::Number(*n),
-        Value::Number(n) => JsonValue::Number(*n),
         Value::String(s) => JsonValue::String_(s.clone()),
         Value::Char(c) => JsonValue::String_(c.to_string()),
         Value::List(items) => JsonValue::Array(items.iter().map(value_to_json).collect()),

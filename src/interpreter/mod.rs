@@ -252,6 +252,8 @@ pub struct AiConfigValue {
     /// v0.24: 投机执行配置
     speculative: Option<bool>,
     draft_model: Option<String>,
+    /// v0.54: tool 绑定 — with tools: ["read_file", "run_cmd"]
+    tool_names: Option<Vec<String>>,
 }
 
 // v0.04: 显式实现 Clone 而非 derive

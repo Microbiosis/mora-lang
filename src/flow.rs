@@ -292,6 +292,7 @@ pub fn check_type(value: &Value, hint: &str) -> bool {
         (Value::List(_), "list") => true,
         (Value::Dict(_), "dict") => true,
         (Value::Task { .. }, "task") => true,
+        (Value::Tool { .. }, "tool") => true,
         (Value::Conversation { .. }, "conversation") => true,
         (Value::Stream { .. }, "stream") => true,
         (Value::Agent { .. }, "agent") => true,
@@ -315,6 +316,7 @@ pub fn type_name(value: &Value) -> &'static str {
         Value::List(_) => "list",
         Value::Dict(_) => "dict",
         Value::Task { .. } => "task",
+        Value::Tool { .. } => "tool",
         Value::Closure { .. } => "closure",
         Value::Builtin(_) => "builtin",
         Value::Conversation { .. } => "conversation",
@@ -614,6 +616,7 @@ pub fn value_to_json(value: &Value) -> String {
             format!("{{{}}}", parts.join(","))
         }
         Value::Task { name, .. } => format!("\"<task {}>\"", name),
+        Value::Tool { name, .. } => format!("\"<tool {}>\"", name),
         Value::Closure { .. } => "\"<closure>\"".to_string(),
         Value::Builtin(name) => format!("\"<builtin {}>\"", name),
         Value::Conversation { model, .. } => format!("\"<conversation {}>\"", model),

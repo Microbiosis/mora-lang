@@ -329,6 +329,7 @@ pub enum StmtKind {
     // 工具定义
     ToolDef {
         name: String,
+        description: String,
         params: Vec<(String, Option<String>)>,
         return_type: Option<String>,
         body: Vec<NodeId>,

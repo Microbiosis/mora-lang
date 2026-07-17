@@ -805,6 +805,7 @@ suggestion: <improvement suggestion or "none">"#,
                     mock_responses: None,
                     speculative: None,
                     draft_model: None,
+                    tool_names: None,
                 });
             }
             (key, r.model.clone(), r.base_url.clone())

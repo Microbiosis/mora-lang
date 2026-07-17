@@ -379,12 +379,12 @@ impl Interpreter {
             match key.as_str() {
                 "model" => cfg.model = Some(v.to_string()),
                 "temperature" => {
-                    if let Value::Number(n) = v {
+                    if let Value::Float(n) = v {
                         cfg.temperature = Some(n);
                     }
                 }
                 "max_tokens" => {
-                    if let Value::Number(n) = v {
+                    if let Value::Float(n) = v {
                         cfg.max_tokens = Some(n as usize);
                     }
                 }
@@ -395,7 +395,7 @@ impl Interpreter {
                     }
                 }
                 "compact_at" => {
-                    if let Value::Number(n) = v {
+                    if let Value::Float(n) = v {
                         self.ai.context_window.compression_threshold = n / 100.0;
                     }
                 }
@@ -994,7 +994,7 @@ impl Interpreter {
 fn coerce_to_string(v: Value, _ctx: &str) -> Result<String, String> {
     match v {
         Value::String(s) => Ok(s),
-        Value::Number(n) => Ok(n.to_string()),
+        Value::Float(n) => Ok(n.to_string()),
         Value::Bool(b) => Ok(b.to_string()),
         Value::Nil => Ok(String::new()),
         other => Ok(other.to_string()),
@@ -1005,7 +1005,7 @@ fn coerce_to_string(v: Value, _ctx: &str) -> Result<String, String> {
 /// 接受: "256 B" "8 KB" "4 MB" 等带单位的字符串,或纯数字
 fn parse_budget(v: Value, ctx: &str) -> Result<usize, String> {
     match v {
-        Value::Number(n) => {
+        Value::Float(n) => {
             if n < 0.0 {
                 return Err(format!("{}: budget must be non-negative", ctx));
             }

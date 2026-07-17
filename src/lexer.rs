@@ -98,11 +98,9 @@ pub enum TokenType {
     /// v0.x: 单字符字面量（`'a'`）
     Char(char),
     PromptString(String), // v0.04.0: p"..."
-    // v0.38: numeric tower — distinct Int/Float tokens. Number is the
-    // legacy default for unsuffixed literals.
+    // v0.38: numeric tower — Int and Float tokens.
     Int(i64),
     Float(f64),
-    Number(f64),
     Plus,
     Minus,
     Star,
@@ -831,7 +829,7 @@ impl Lexer {
                     );
                 }
             };
-            TokenType::Number(num)
+            TokenType::Float(num)
         };
         Token {
             token_type: tt,

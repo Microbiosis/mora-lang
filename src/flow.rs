@@ -12,7 +12,7 @@ pub fn is_truthy(value: &Value) -> bool {
     match value {
         Value::Nil => false,
         Value::Bool(b) => *b,
-        Value::Number(n) => *n != 0.0,
+        Value::Float(n) => *n != 0.0,
         Value::String(s) => !s.is_empty(),
         Value::List(l) => !l.is_empty(),
         Value::Dict(d) => !d.is_empty(),
@@ -107,8 +107,6 @@ pub fn eval_binary(left: Value, op: &BinaryOp, right: Value) -> Result<Value, St
             (Value::Int(_), Value::Float(_)) | (Value::Float(_), Value::Int(_)) => {
                 Err("operator '+' requires both operands to be same numeric type (Int or Float, Rust-strict mode)".to_string())
             }
-            // Legacy Number compatibility for unsuffixed literals
-            (Value::Number(a), Value::Number(b)) => Ok(Value::Number(a + b)),
             (Value::String(a), Value::String(b)) => Ok(Value::String(format!("{}{}", a, b))),
             // 字符串 + 任意类型 → 自动转字符串拼接
             (Value::String(a), _) => Ok(Value::String(format!("{}{}", a, right))),
@@ -120,7 +118,7 @@ pub fn eval_binary(left: Value, op: &BinaryOp, right: Value) -> Result<Value, St
                         .iter()
                         .zip(b.iter())
                         .map(|(x, y)| match (x, y) {
-                            (Value::Number(xn), Value::Number(yn)) => Value::Number(xn + yn),
+                            (Value::Float(xn), Value::Float(yn)) => Value::Float(xn + yn),
                             (Value::String(xs), Value::String(ys)) => {
                                 Value::String(format!("{}{}", xs, ys))
                             }
@@ -135,11 +133,11 @@ pub fn eval_binary(left: Value, op: &BinaryOp, right: Value) -> Result<Value, St
                 }
             }
             // v0.17: 广播 - list + number
-            (Value::List(list), Value::Number(scalar)) => {
+            (Value::List(list), Value::Float(scalar)) => {
                 let result: Vec<Value> = list
                     .iter()
                     .map(|item| match item {
-                        Value::Number(n) => Value::Number(n + scalar),
+                        Value::Float(n) => Value::Float(n + scalar),
                         Value::String(s) => Value::String(format!("{}{}", s, scalar)),
                         _ => Value::Nil,
                     })
@@ -147,11 +145,11 @@ pub fn eval_binary(left: Value, op: &BinaryOp, right: Value) -> Result<Value, St
                 Ok(Value::List(result))
             }
             // v0.17: 广播 - number + list
-            (Value::Number(scalar), Value::List(list)) => {
+            (Value::Float(scalar), Value::List(list)) => {
                 let result: Vec<Value> = list
                     .iter()
                     .map(|item| match item {
-                        Value::Number(n) => Value::Number(scalar + n),
+                        Value::Float(n) => Value::Float(scalar + n),
                         _ => Value::Nil,
                     })
                     .collect();
@@ -178,7 +176,6 @@ pub fn eval_binary(left: Value, op: &BinaryOp, right: Value) -> Result<Value, St
 /// - `Int + Int = Int`        (pure integer arithmetic)
 /// - `Float + Float = Float`  (pure float arithmetic)
 /// - `Int + Float` / `Float + Int` -> strict type error
-/// - Mixed with `Number` -> coerced to f64 (back-compat for unsuffixed literals).
 pub fn numeric_op<F>(left: Value, right: Value, op: F) -> Result<Value, String>
 where
     F: Fn(f64, f64) -> f64,
@@ -199,29 +196,23 @@ where
             "numeric operator does not accept mixed Int and Float operands (Rust-strict mode)"
                 .to_string(),
         ),
-        // Legacy Number compatibility
-        (Number(a), Number(b)) => Ok(Number(op(a, b))),
-        (Int(a), Number(b)) => Ok(Number(op(a as f64, b))),
-        (Number(a), Int(b)) => Ok(Number(op(a, b as f64))),
-        (Float(a), Number(b)) => Ok(Float(op(a, b))),
-        (Number(a), Float(b)) => Ok(Float(op(a, b))),
         // v0.17: 广播操作 - list op number
-        (Value::List(list), Value::Number(scalar)) => {
+        (Value::List(list), Value::Float(scalar)) => {
             let result: Vec<Value> = list
                 .iter()
                 .map(|item| match item {
-                    Value::Number(n) => Value::Number(op(*n, scalar)),
+                    Value::Float(n) => Value::Float(op(*n, scalar)),
                     _ => Value::Nil,
                 })
                 .collect();
             Ok(Value::List(result))
         }
         // v0.17: 广播操作 - number op list
-        (Value::Number(scalar), Value::List(list)) => {
+        (Value::Float(scalar), Value::List(list)) => {
             let result: Vec<Value> = list
                 .iter()
                 .map(|item| match item {
-                    Value::Number(n) => Value::Number(op(scalar, *n)),
+                    Value::Float(n) => Value::Float(op(scalar, *n)),
                     _ => Value::Nil,
                 })
                 .collect();
@@ -236,7 +227,7 @@ where
                 .iter()
                 .zip(b.iter())
                 .map(|(x, y)| match (x, y) {
-                    (Value::Number(xn), Value::Number(yn)) => Value::Number(op(*xn, *yn)),
+                    (Value::Float(xn), Value::Float(yn)) => Value::Float(op(*xn, *yn)),
                     _ => Value::Nil,
                 })
                 .collect();
@@ -261,11 +252,6 @@ where
             "numeric comparison does not accept mixed Int and Float operands (Rust-strict mode)"
                 .to_string(),
         ),
-        (Number(a), Number(b)) => Ok(Bool(op(a, b))),
-        (Int(a), Number(b)) => Ok(Bool(op(a as f64, b))),
-        (Number(a), Int(b)) => Ok(Bool(op(a, b as f64))),
-        (Float(a), Number(b)) => Ok(Bool(op(a, b))),
-        (Number(a), Float(b)) => Ok(Bool(op(a, b))),
         _ => Err("Operands must be numbers".to_string()),
     }
 }
@@ -274,7 +260,7 @@ where
 pub fn values_equal(a: &Value, b: &Value) -> bool {
     match (a, b) {
         (Value::Nil, Value::Nil) => true,
-        (Value::Number(a), Value::Number(b)) => a == b,
+        (Value::Float(a), Value::Float(b)) => a == b,
         (Value::String(a), Value::String(b)) => a == b,
         (Value::Bool(a), Value::Bool(b)) => a == b,
         (Value::List(a), Value::List(b)) => a == b,
@@ -291,7 +277,6 @@ pub fn literal_to_value_static(lit: &Literal) -> Value {
         Literal::Char(c, _) => Value::Char(*c),
         Literal::Int(i, _) => Value::Int(*i),
         Literal::Float(f, _) => Value::Float(*f),
-        Literal::Number(n, _) => Value::Number(*n),
         Literal::Bool(b, _) => Value::Bool(*b),
         Literal::Nil(_) => Value::Nil,
     }
@@ -301,7 +286,7 @@ pub fn literal_to_value_static(lit: &Literal) -> Value {
 pub fn check_type(value: &Value, hint: &str) -> bool {
     match (value, hint) {
         (Value::String(_), "string") => true,
-        (Value::Number(_), "number") => true,
+        (Value::Float(_), "float") => true,
         (Value::Bool(_), "bool") => true,
         (Value::Nil, "nil") => true,
         (Value::List(_), "list") => true,
@@ -325,7 +310,6 @@ pub fn type_name(value: &Value) -> &'static str {
         Value::Char(_) => "char",
         Value::Int(_) => "int",
         Value::Float(_) => "float",
-        Value::Number(_) => "number",
         Value::Bool(_) => "bool",
         Value::Nil => "nil",
         Value::List(_) => "list",
@@ -593,7 +577,7 @@ fn parse_json_number(s: &str) -> Result<(Value, usize), String> {
     let num: f64 = num_str
         .parse()
         .map_err(|_| format!("Invalid number: {}", num_str))?;
-    Ok((Value::Number(num), i))
+    Ok((Value::Float(num), i))
 }
 
 /// Value 转 JSON 字符串
@@ -603,12 +587,11 @@ pub fn value_to_json(value: &Value) -> String {
         Value::Char(c) => format!("\"{}\"", c),
         // v0.38: Int formatted without decimal; Float always shows decimal.
         Value::Int(i) => i.to_string(),
-        Value::Float(f) => f.to_string(),
-        Value::Number(n) => {
-            if n.fract() == 0.0 {
-                format!("{:.0}", n)
+        Value::Float(f) => {
+            if f.fract() == 0.0 {
+                format!("{:.0}", f)
             } else {
-                format!("{}", n)
+                format!("{}", f)
             }
         }
         Value::Bool(b) => b.to_string(),
@@ -696,19 +679,10 @@ mod tests {
         assert!(v.is_err());
     }
 
-    /// v0.38: legacy Number mixed with Int coerces to f64.
-    #[test]
-    fn numeric_tower_number_int_compat() {
-        let l = Value::Number(2.0);
-        let r = Value::Int(3);
-        let v = numeric_op(l, r, |a, b| a + b).unwrap();
-        assert_eq!(v, Value::Number(5.0));
-    }
-
     /// v0.38: legacy Number mixed with Float coerces to f64.
     #[test]
     fn numeric_tower_number_float_compat() {
-        let l = Value::Number(2.0);
+        let l = Value::Float(2.0);
         let r = Value::Float(3.0);
         let v = numeric_op(l, r, |a, b| a + b).unwrap();
         assert_eq!(v, Value::Float(5.0));
@@ -761,7 +735,7 @@ mod tests {
     fn type_int_name() {
         assert_eq!(Type::Int.name(), "int");
         assert_eq!(Type::Float.name(), "float");
-        assert_eq!(Type::Number.name(), "number");
+        assert_eq!(Type::Float.name(), "float");
     }
 
     // ===== v0.52 regression: json_to_value 空格 bug =====
@@ -776,8 +750,8 @@ mod tests {
         let v = json_to_value(r#"{"a":1,"b":2}"#).unwrap();
         if let Value::Dict(m) = v {
             // parse_json_number 把 int 解析为 Number(f64)（pre-existing 行为）
-            assert_eq!(m.get("a"), Some(&Value::Number(1.0)));
-            assert_eq!(m.get("b"), Some(&Value::Number(2.0)));
+            assert_eq!(m.get("a"), Some(&Value::Float(1.0)));
+            assert_eq!(m.get("b"), Some(&Value::Float(2.0)));
         } else {
             panic!("expected Dict");
         }
@@ -789,8 +763,8 @@ mod tests {
         // 修复后期望 pass
         let v = json_to_value(r#"{"a": 1, "b": 2}"#).unwrap();
         if let Value::Dict(m) = v {
-            assert_eq!(m.get("a"), Some(&Value::Number(1.0)));
-            assert_eq!(m.get("b"), Some(&Value::Number(2.0)));
+            assert_eq!(m.get("a"), Some(&Value::Float(1.0)));
+            assert_eq!(m.get("b"), Some(&Value::Float(2.0)));
         } else {
             panic!("expected Dict, got {:?}", v);
         }

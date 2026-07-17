@@ -106,7 +106,7 @@ fn test_pregel_basic() {
         },
         StateChannel {
             name: "total_cost".into(),
-            type_hint: Some("number".into()),
+            type_hint: Some("float".into()),
             reducer: ReducerKind::Add,
         },
         StateChannel {
@@ -267,7 +267,7 @@ fn test_pregel_command_update() {
     let state = vec![
         StateChannel {
             name: "priority".into(),
-            type_hint: Some("number".into()),
+            type_hint: Some("float".into()),
             reducer: ReducerKind::Last,
         },
         StateChannel {
@@ -553,7 +553,7 @@ fn test_pregel_rewind_schema_valid() {
         },
         StateChannel {
             name: "total_cost".into(),
-            type_hint: Some("number".into()),
+            type_hint: Some("float".into()),
             reducer: ReducerKind::Add,
         },
     ];
@@ -577,7 +577,7 @@ fn test_pregel_stress_100_channels() {
     for i in 0..100 {
         state.push(StateChannel {
             name: format!("ch_{}", i),
-            type_hint: Some("number".into()),
+            type_hint: Some("float".into()),
             reducer: ReducerKind::Add,
         });
     }
@@ -691,7 +691,7 @@ fn test_pregel_full_graph() {
         },
         StateChannel {
             name: "total_cost".into(),
-            type_hint: Some("number".into()),
+            type_hint: Some("float".into()),
             reducer: ReducerKind::Add,
         },
         StateChannel {
@@ -824,7 +824,7 @@ fn test_reducer_append_with_list_type_variants() {
 #[test]
 fn test_reducer_add_with_number_type_variants() {
     // 验证多种数值类型表示法都被接受
-    for hint in ["number", "int", "float", "Int", "Float"] {
+    for hint in ["float", "int", "float", "Int", "Float"] {
         let state = vec![StateChannel {
             name: "counter".into(),
             type_hint: Some(hint.into()),

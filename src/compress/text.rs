@@ -89,7 +89,7 @@ pub fn head_tail_impl(content: &str, head_pct: f32, tail_pct: f32, max_bytes: us
 /// - 检测 API key 有效 → 调 `real_ai_chat` (复用 v0.25 的 LLM 入口, 详见
 ///   `src/interpreter/dispatch.rs`); 失败再 fallback 到 mock + 错误日志。
 pub fn summary_llm_impl(content: &str, _max_bytes: usize) -> Result<String, String> {
-    let api_key = std::env::var("OPENAI_API_KEY").unwrap_or_default();
+    let api_key = std::env::var(crate::interpreter::AI_API_KEY_ENV).unwrap_or_default();
     let preview: String = content.chars().take(200).collect();
     if api_key.is_empty() {
         Ok(format!(

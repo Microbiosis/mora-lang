@@ -263,7 +263,7 @@ impl Server {
         // semanticTokensProvider
         let mut token_types = Vec::new();
         for t in [
-            "keyword", "function", "variable", "string", "number", "comment", "type", "operator",
+            "keyword", "function", "variable", "string", "float", "comment", "type", "operator",
         ] {
             token_types.push(Value::String_(t.to_string()));
         }

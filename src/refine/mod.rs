@@ -38,10 +38,7 @@ impl RefineStep {
     pub fn to_dict(&self) -> std::collections::HashMap<String, crate::value::Value> {
         use crate::value::Value;
         let mut d = std::collections::HashMap::new();
-        d.insert(
-            "iteration".to_string(),
-            Value::Number(self.iteration as f64),
-        );
+        d.insert("iteration".to_string(), Value::Float(self.iteration as f64));
         d.insert(
             "script".to_string(),
             Value::String(self.script_path.display().to_string()),
@@ -56,19 +53,19 @@ impl RefineStep {
         );
         d.insert(
             "original_bytes".to_string(),
-            Value::Number(self.original_bytes as f64),
+            Value::Float(self.original_bytes as f64),
         );
         d.insert(
             "refined_bytes".to_string(),
-            Value::Number(self.refined_bytes as f64),
+            Value::Float(self.refined_bytes as f64),
         );
         d.insert(
             "diff_lines_added".to_string(),
-            Value::Number(self.diff_lines_added as f64),
+            Value::Float(self.diff_lines_added as f64),
         );
         d.insert(
             "diff_lines_removed".to_string(),
-            Value::Number(self.diff_lines_removed as f64),
+            Value::Float(self.diff_lines_removed as f64),
         );
         d
     }

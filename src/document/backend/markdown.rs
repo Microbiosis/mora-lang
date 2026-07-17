@@ -44,9 +44,9 @@ impl DocumentBackend for MarkdownBackend {
     /// page whose blocks are the full `blocks()` list.
     fn pages(&self) -> Result<Value, String> {
         let mut page_dict: HashMap<String, Value> = HashMap::new();
-        page_dict.insert("page_no".into(), Value::Number(1.0));
-        page_dict.insert("width".into(), Value::Number(0.0));
-        page_dict.insert("height".into(), Value::Number(0.0));
+        page_dict.insert("page_no".into(), Value::Float(1.0));
+        page_dict.insert("width".into(), Value::Float(0.0));
+        page_dict.insert("height".into(), Value::Float(0.0));
         page_dict.insert("blocks".into(), self.blocks()?);
         Ok(Value::List(vec![Value::Dict(page_dict)]))
     }
@@ -74,8 +74,8 @@ impl DocumentBackend for MarkdownBackend {
     fn metadata(&self) -> Result<Value, String> {
         let mut m: HashMap<String, Value> = HashMap::new();
         m.insert("origin".into(), Value::String("markdown".into()));
-        m.insert("pages".into(), Value::Number(1.0));
-        m.insert("size".into(), Value::Number(self.source.len() as f64));
+        m.insert("pages".into(), Value::Float(1.0));
+        m.insert("size".into(), Value::Float(self.source.len() as f64));
         Ok(Value::Dict(m))
     }
 
@@ -128,11 +128,11 @@ impl DocumentBackend for MarkdownBackend {
 fn make_block(kind: &str, text: &str) -> Value {
     let mut bd: HashMap<String, Value> = HashMap::new();
     bd.insert("kind".into(), Value::String(kind.into()));
-    bd.insert("bbox".into(), Value::List(vec![Value::Number(0.0); 4]));
+    bd.insert("bbox".into(), Value::List(vec![Value::Float(0.0); 4]));
 
     let mut span: HashMap<String, Value> = HashMap::new();
     span.insert("text".into(), Value::String(text.into()));
-    span.insert("bbox".into(), Value::List(vec![Value::Number(0.0); 4]));
+    span.insert("bbox".into(), Value::List(vec![Value::Float(0.0); 4]));
     span.insert("score".into(), Value::Nil);
     bd.insert("spans".into(), Value::List(vec![Value::Dict(span)]));
 

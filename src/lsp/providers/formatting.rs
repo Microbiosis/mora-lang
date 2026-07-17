@@ -147,7 +147,7 @@ fn token_text(tt: &crate::lexer::TokenType) -> String {
     use crate::lexer::TokenType;
     match tt {
         TokenType::String(s) => format!("\"{}\"", s),
-        TokenType::Number(n) => n.to_string(),
+        TokenType::Float(n) => n.to_string(),
         TokenType::Identifier(s) => s.clone(),
         _ => format!("{:?}", tt).to_lowercase(),
     }

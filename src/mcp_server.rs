@@ -433,7 +433,7 @@ fn json_to_mora_value(j: &JsonValue) -> Value {
     match j {
         JsonValue::Null => Value::Nil,
         JsonValue::Bool(b) => Value::Bool(*b),
-        JsonValue::Number(n) => Value::Number(*n),
+        JsonValue::Number(n) => Value::Float(*n),
         JsonValue::String_(s) => Value::String(s.clone()),
         JsonValue::Array(items) => Value::List(items.iter().map(json_to_mora_value).collect()),
         JsonValue::Object(map) => {
@@ -450,7 +450,7 @@ fn mora_to_json(v: &Value) -> JsonValue {
     match v {
         Value::Nil => JsonValue::Null,
         Value::Bool(b) => JsonValue::Bool(*b),
-        Value::Number(n) => JsonValue::Number(*n),
+        Value::Float(n) => JsonValue::Number(*n),
         Value::String(s) => JsonValue::String_(s.clone()),
         Value::List(items) => JsonValue::Array(items.iter().map(mora_to_json).collect()),
         Value::Dict(map) => {

@@ -238,7 +238,7 @@ mod tests {
         );
         values.insert(
             "score".to_string(),
-            crate::value::Value::Number(std::f64::consts::PI),
+            crate::value::Value::Float(std::f64::consts::PI),
         );
 
         let mut channel_versions = HashMap::new();

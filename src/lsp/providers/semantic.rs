@@ -52,7 +52,7 @@ pub fn semantic_tokens(docs: &HashMap<String, DocumentState>, params: &Value) ->
             // v0.08: trait 系统关键字
             TokenType::Trait | TokenType::Impl | TokenType::Dyn | TokenType::Self_ => 0,  // keyword
             TokenType::String(_) => 3,  // string
-            TokenType::Number(_) => 4,  // number
+            TokenType::Float(_) => 4,  // number
             _ => continue,
         };
         let len = token_len(&tok.token_type) as u32;
@@ -126,7 +126,7 @@ fn token_len(tt: &crate::lexer::TokenType) -> usize {
     use crate::lexer::TokenType;
     match tt {
         TokenType::String(s) => s.len() + 2,
-        TokenType::Number(n) => n.to_string().len(),
+        TokenType::Float(n) => n.to_string().len(),
         TokenType::Identifier(s) => s.len(),
         _ => format!("{:?}", tt).len(),
     }

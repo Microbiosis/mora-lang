@@ -36,7 +36,7 @@ impl ParserV2 {
             let operand = self.unary();
             let zero = self
                 .arena
-                .alloc_expr(ExprKind::Literal(Literal::Number(0.0, span)), span);
+                .alloc_expr(ExprKind::Literal(Literal::Float(0.0, span)), span);
             let kind = ExprKind::Binary {
                 left: zero,
                 op: BinaryOp::Sub,
@@ -241,12 +241,12 @@ impl ParserV2 {
         } else if self.match_token(&[TokenType::Nil]) {
             Pattern::Literal(Literal::Nil(Span::default()))
         } else if let Some(Token {
-            token_type: TokenType::Number(n),
+            token_type: TokenType::Float(n),
             ..
         }) = self.peek().cloned()
         {
             self.advance();
-            Pattern::Literal(Literal::Number(n, Span::default()))
+            Pattern::Literal(Literal::Float(n, Span::default()))
         } else if let Some(Token {
             token_type: TokenType::String(s),
             ..
@@ -356,13 +356,13 @@ impl ParserV2 {
             self.arena
                 .alloc_expr(ExprKind::Literal(Literal::Float(n, span)), span)
         } else if let Some(Token {
-            token_type: TokenType::Number(n),
+            token_type: TokenType::Float(n),
             ..
         }) = self.peek().cloned()
         {
             self.advance();
             self.arena
-                .alloc_expr(ExprKind::Literal(Literal::Number(n, span)), span)
+                .alloc_expr(ExprKind::Literal(Literal::Float(n, span)), span)
         } else if let Some(Token {
             token_type: TokenType::Char(ch),
             ..

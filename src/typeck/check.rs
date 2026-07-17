@@ -836,7 +836,6 @@ impl TypeChecker {
                 // v0.38 (C4): Int/Float literals route to dedicated types.
                 crate::common::Literal::Int(..) => Type::Int,
                 crate::common::Literal::Float(..) => Type::Float,
-                crate::common::Literal::Number(..) => Type::Number,
                 crate::common::Literal::Bool(..) => Type::Bool,
                 crate::common::Literal::Nil(..) => Type::Nil,
             },
@@ -989,8 +988,8 @@ impl TypeChecker {
         let right_ty = self.check_expr(right, arena, symbols);
         match op {
             BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div | BinaryOp::Mod => {
-                if left_ty == Type::Number && right_ty == Type::Number {
-                    Type::Number
+                if left_ty == Type::Float && right_ty == Type::Float {
+                    Type::Float
                 } else if left_ty == Type::String || right_ty == Type::String {
                     Type::String
                 } else {
@@ -1094,11 +1093,11 @@ impl TypeChecker {
         let it = self.check_expr(index, arena, symbols);
         match &ot {
             Type::List(elem) => {
-                if !matches!(&it, Type::Number) {
+                if !matches!(&it, Type::Float) {
                     self.errors.push(TypeError::from_span_with_detail(
                         &expr.span,
                         "list index must be number",
-                        "number",
+                        "float",
                         it.name(),
                         "use a number to index a list",
                     ));
@@ -1118,11 +1117,11 @@ impl TypeChecker {
                 v.as_ref().clone()
             }
             Type::String => {
-                if !matches!(&it, Type::Number) {
+                if !matches!(&it, Type::Float) {
                     self.errors.push(TypeError::from_span_with_detail(
                         &expr.span,
                         "string index must be number",
-                        "number",
+                        "float",
                         it.name(),
                         "use a number to index a string",
                     ));

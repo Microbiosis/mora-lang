@@ -21,6 +21,19 @@ use crate::flow::*;
 use crate::lexer::Lexer;
 use crate::trace_collector::TraceCollector;
 
+/// AI 模型配置常量（避免硬编码）
+/// 通过环境变量覆盖；未设定时使用默认值。
+///
+/// 环境变量:
+///   MORA_AI_MODEL    — 默认模型名称
+///   OPENAI_API_KEY   — API 密钥
+///   MORA_AI_BASE_URL — 服务端点 URL
+pub const AI_MODEL_ENV: &str = "MORA_AI_MODEL";
+pub const AI_MODEL_DEFAULT: &str = "gpt-4o-mini";
+pub const AI_API_KEY_ENV: &str = "OPENAI_API_KEY";
+pub const AI_BASE_URL_ENV: &str = "MORA_AI_BASE_URL";
+pub const AI_BASE_URL_DEFAULT: &str = "https://api.openai.com/v1";
+
 /// 使用 ParserV2 解析代码，返回 v2 AST (node_ids + arena)
 pub fn parse_code(source: &str) -> (Vec<crate::ast_v2::NodeId>, crate::ast_v2::AstArena) {
     let tokens = Lexer::new(source).scan_tokens();
@@ -567,12 +580,12 @@ impl Interpreter {
             match key.as_str() {
                 "model" => cfg.model = Some(v.to_string()),
                 "temperature" => {
-                    if let Value::Number(n) = v {
+                    if let Value::Float(n) = v {
                         cfg.temperature = Some(*n);
                     }
                 }
                 "max_tokens" => {
-                    if let Value::Number(n) = v {
+                    if let Value::Float(n) = v {
                         cfg.max_tokens = Some(*n as usize);
                     }
                 }
@@ -741,7 +754,6 @@ impl Interpreter {
             crate::common::Literal::Char(c, _) => Ok(Value::Char(*c)),
             crate::common::Literal::Int(i, _) => Ok(Value::Int(*i)),
             crate::common::Literal::Float(f, _) => Ok(Value::Float(*f)),
-            crate::common::Literal::Number(n, _) => Ok(Value::Number(*n)),
             crate::common::Literal::Bool(b, _) => Ok(Value::Bool(*b)),
             crate::common::Literal::Nil(_) => Ok(Value::Nil),
         }
@@ -800,14 +812,14 @@ fn extract_embeddings(json_text: &str, expected_count: usize) -> Result<Value, S
         .map(|item| {
             if let Value::Dict(m) = item {
                 let index = match m.get("index") {
-                    Some(Value::Number(n)) => *n as usize,
+                    Some(Value::Float(n)) => *n as usize,
                     _ => 0,
                 };
                 let vec = match m.get("embedding") {
                     Some(Value::List(vs)) => vs
                         .iter()
                         .filter_map(|v| {
-                            if let Value::Number(n) = v {
+                            if let Value::Float(n) = v {
                                 Some(*n)
                             } else {
                                 None
@@ -836,12 +848,12 @@ fn extract_embeddings(json_text: &str, expected_count: usize) -> Result<Value, S
                 return Err("ai.embed: no embeddings were successfully indexed".to_string());
             }
         };
-        Ok(Value::List(vec.into_iter().map(Value::Number).collect()))
+        Ok(Value::List(vec.into_iter().map(Value::Float).collect()))
     } else {
         // 批量：返回 List<List>
         let items: Vec<Value> = indexed
             .into_iter()
-            .map(|(_, v)| Value::List(v.into_iter().map(Value::Number).collect()))
+            .map(|(_, v)| Value::List(v.into_iter().map(Value::Float).collect()))
             .collect();
         Ok(Value::List(items))
     }
@@ -1220,8 +1232,8 @@ end
         // FlowSignal::None → nil (Mora 的"无显式 return"语义)
         assert_eq!(FlowSignal::None.into_value(), Value::Nil);
         assert_eq!(
-            FlowSignal::Return(Value::Number(42.0)).into_value(),
-            Value::Number(42.0)
+            FlowSignal::Return(Value::Float(42.0)).into_value(),
+            Value::Float(42.0)
         );
     }
 
@@ -1229,7 +1241,7 @@ end
     fn flow_signal_is_return_distinguishes_signals() {
         assert!(!FlowSignal::None.is_return());
         assert!(FlowSignal::Return(Value::Nil).is_return());
-        assert!(FlowSignal::Return(Value::Number(0.0)).is_return());
+        assert!(FlowSignal::Return(Value::Float(0.0)).is_return());
     }
 }
 
@@ -2082,7 +2094,7 @@ end
     fn test_is_instance() {
         let src = r#"
 task main()
-  print(is_instance(42, "number"))
+  print(is_instance(42, "float"))
   print(is_instance("hello", "string"))
   print(is_instance(42, "string"))
 end
@@ -3026,7 +3038,7 @@ mod compress_tests {
         let src = format!(
             r#"
 let result = compress("{}", "summary")
-print(len(result) > 0)
+print(len(result) > 0i)
 "#,
             text
         );
@@ -3066,8 +3078,8 @@ print(result.contains("original_size=11"))
         let items: Vec<Value> = (0..100)
             .map(|i| {
                 let mut d = HashMap::new();
-                d.insert("id".to_string(), Value::Number(i as f64));
-                d.insert("score".to_string(), Value::Number((i as f64) * 0.01));
+                d.insert("id".to_string(), Value::Float(i as f64));
+                d.insert("score".to_string(), Value::Float((i as f64) * 0.01));
                 Value::Dict(d)
             })
             .collect();
@@ -3085,8 +3097,8 @@ print(result.contains("original_size=11"))
         let mut items: Vec<Value> = (0..50)
             .map(|i| {
                 let mut d = HashMap::new();
-                d.insert("id".to_string(), Value::Number(i as f64));
-                d.insert("score".to_string(), Value::Number((i as f64) * 0.01));
+                d.insert("id".to_string(), Value::Float(i as f64));
+                d.insert("score".to_string(), Value::Float((i as f64) * 0.01));
                 Value::Dict(d)
             })
             .collect();

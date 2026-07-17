@@ -77,28 +77,28 @@ impl Interpreter {
                 let start = args
                     .first()
                     .and_then(|v| match v {
-                        Value::Number(n) => Some(*n as i64),
+                        Value::Float(n) => Some(*n as i64),
                         _ => None,
                     })
                     .unwrap_or(0);
                 let end = args
                     .get(1)
                     .and_then(|v| match v {
-                        Value::Number(n) => Some(*n as i64),
+                        Value::Float(n) => Some(*n as i64),
                         _ => None,
                     })
                     .unwrap_or(start);
                 let step = args
                     .get(2)
                     .and_then(|v| match v {
-                        Value::Number(n) => Some(*n as i64),
+                        Value::Float(n) => Some(*n as i64),
                         _ => None,
                     })
                     .unwrap_or(1);
                 let mut items = Vec::new();
                 let mut i = start;
                 while i < end {
-                    items.push(Value::Number(i as f64));
+                    items.push(Value::Float(i as f64));
                     i += step;
                 }
                 Ok(Value::List(items))
@@ -110,7 +110,7 @@ impl Interpreter {
                     Some(Value::Dict(map)) => map.len(),
                     _ => return Err("len() expects a list, string, or dict".to_string()),
                 };
-                Ok(Value::Number(len as f64))
+                Ok(Value::Int(len as i64))
             }
             // v0.17: compose(f1, f2, f3) → fn(x) = f3(f2(f1(x)))
             "compose" => {
@@ -214,7 +214,7 @@ impl Interpreter {
                     return Err("crush_json() requires 2 arguments: input and max".to_string());
                 }
                 let max_items = match &args[1] {
-                    Value::Number(n) => {
+                    Value::Float(n) => {
                         if *n < 0.0 {
                             return Err("crush_json: max must be non-negative".to_string());
                         }
@@ -260,7 +260,9 @@ impl Interpreter {
                                 Value::String(s) => s.clone(),
                                 other => other.to_string(),
                             };
-                            let result = Self::do_ai_chat(self, "gpt-4o-mini", &prompt)?;
+                            let model = std::env::var(AI_MODEL_ENV)
+                                .unwrap_or_else(|_| AI_MODEL_DEFAULT.to_string());
+                            let result = Self::do_ai_chat(self, &model, &prompt)?;
                             results.push(result);
                         }
                         Ok(Value::List(results))
@@ -311,7 +313,7 @@ impl Interpreter {
                     }
                 };
                 let max: usize = match &args[1] {
-                    Value::Number(n) => {
+                    Value::Float(n) => {
                         if *n < 0.0 {
                             return Err("tail() max must be non-negative".to_string());
                         }
@@ -468,7 +470,7 @@ impl Interpreter {
                         let max = args
                             .first()
                             .and_then(|v| match v {
-                                Value::Number(n) => {
+                                Value::Float(n) => {
                                     if *n < 0.0 {
                                         None
                                     } else {
@@ -499,7 +501,7 @@ impl Interpreter {
                         Ok(Value::List(new_list))
                     }
                     "get" => {
-                        let index = args.first().and_then(|v| match v { Value::Number(n) => Some(*n as usize), _ => None }).unwrap_or(0);
+                        let index = args.first().and_then(|v| match v { Value::Float(n) => Some(*n as usize), _ => None }).unwrap_or(0);
                         Ok(list.get(index).cloned().unwrap_or(Value::Nil))
                     }
                     "pop" => {
@@ -507,7 +509,7 @@ impl Interpreter {
                         let item = new_list.pop().unwrap_or(Value::Nil);
                         Ok(item)
                     }
-                    "len" => Ok(Value::Number(list.len() as f64)),
+                    "len" => Ok(Value::Int(list.len() as i64)),
                     "map" => {
                         let mapper = args.first().cloned().ok_or("map() requires a function")?;
                         let mut result = Vec::new();
@@ -539,7 +541,7 @@ impl Interpreter {
                     // v0.18: take(n) - 取前 n 个元素
                     "take" => {
                         let n = args.first()
-                            .and_then(|v| match v { Value::Number(n) => Some(*n as usize), _ => None })
+                            .and_then(|v| match v { Value::Float(n) => Some(*n as usize), _ => None })
                             .ok_or("take() requires a count argument")?;
                         let result: Vec<Value> = list.into_iter().take(n).collect();
                         Ok(Value::List(result))
@@ -547,7 +549,7 @@ impl Interpreter {
                     // v0.18: drop(n) - 跳过前 n 个元素
                     "drop" => {
                         let n = args.first()
-                            .and_then(|v| match v { Value::Number(n) => Some(*n as usize), _ => None })
+                            .and_then(|v| match v { Value::Float(n) => Some(*n as usize), _ => None })
                             .ok_or("drop() requires a count argument")?;
                         let result: Vec<Value> = list.into_iter().skip(n).collect();
                         Ok(Value::List(result))
@@ -555,7 +557,7 @@ impl Interpreter {
                     // v0.17: window(size) - 滑动窗口
                     "window" => {
                         let size = args.first()
-                            .and_then(|v| match v { Value::Number(n) => Some(*n as usize), _ => None })
+                            .and_then(|v| match v { Value::Float(n) => Some(*n as usize), _ => None })
                             .ok_or("window() requires a size argument")?;
                         if size == 0 {
                             return Err("window() size must be > 0".to_string());
@@ -572,7 +574,7 @@ impl Interpreter {
                     // v0.17: batch(size) - 翻转窗口（批次处理）
                     "batch" => {
                         let size = args.first()
-                            .and_then(|v| match v { Value::Number(n) => Some(*n as usize), _ => None })
+                            .and_then(|v| match v { Value::Float(n) => Some(*n as usize), _ => None })
                             .ok_or("batch() requires a size argument")?;
                         if size == 0 {
                             return Err("batch() size must be > 0".to_string());
@@ -604,7 +606,7 @@ impl Interpreter {
                             }
                         }
                         let shape = get_shape(&Value::List(list.clone()));
-                        Ok(Value::List(shape.iter().map(|n| Value::Number(*n as f64)).collect()))
+                        Ok(Value::List(shape.iter().map(|n| Value::Float(*n as f64)).collect()))
                     }
                     // v0.17: flatten() - 展平嵌套列表
                     "flatten" => {
@@ -648,10 +650,10 @@ impl Interpreter {
                     // v0.17: reshape(rows, cols) - 重塑列表
                     "reshape" => {
                         let rows = args.first()
-                            .and_then(|v| match v { Value::Number(n) => Some(*n as usize), _ => None })
+                            .and_then(|v| match v { Value::Float(n) => Some(*n as usize), _ => None })
                             .ok_or("reshape() requires rows argument")?;
                         let cols = args.get(1)
-                            .and_then(|v| match v { Value::Number(n) => Some(*n as usize), _ => None })
+                            .and_then(|v| match v { Value::Float(n) => Some(*n as usize), _ => None })
                             .ok_or("reshape() requires cols argument")?;
                         let total = rows * cols;
                         // 展平后重塑
@@ -704,7 +706,7 @@ impl Interpreter {
                         let values: Vec<Value> = map.values().cloned().collect();
                         Ok(Value::List(values))
                     }
-                    "len" => Ok(Value::Number(map.len() as f64)),
+                    "len" => Ok(Value::Int(map.len() as i64)),
                     // v0.07.1: req.json() — 从 body 字段解析 JSON，返回 Result<Dict, ParseError>
                     "json" => {
                         let body_val = map.get("body").cloned().unwrap_or(Value::String(String::new()));
@@ -801,7 +803,7 @@ impl Interpreter {
                         _ => "default".to_string(),
                     };
                     let max_steps = match config.get("max_steps") {
-                        Some(Value::Number(n)) => *n as usize,
+                        Some(Value::Float(n)) => *n as usize,
                         _ => 10,
                     };
                     let system = match config.get("system") {
@@ -878,7 +880,7 @@ impl Interpreter {
                         Ok(Value::Nil)
                     }
                     "model" => Ok(Value::String(model.clone())),
-                    "len" => Ok(Value::Number(messages.len() as f64)),
+                    "len" => Ok(Value::Int(messages.len() as i64)),
                     // v0.29: Conversation.compact() 已重命名为 compress(strategy?) — 见下方 "compress" arm
                     // v0.29: Conversation.compress(strategy?) -> string
                     "compress" => {
@@ -901,7 +903,7 @@ impl Interpreter {
             // v0.07.1: String.json() — 解析 JSON 字符串，返回 Result<Value, ParseError>
             Value::String(s) => {
                 match method {
-                    "len" => Ok(Value::Number(s.len() as f64)),
+                    "len" => Ok(Value::Float(s.len() as f64)),
                     "upper" => Ok(Value::String(s.to_uppercase())),
                     "lower" => Ok(Value::String(s.to_lowercase())),
                     "trim" => Ok(Value::String(s.trim().to_string())),
@@ -996,7 +998,7 @@ impl Interpreter {
                         self.run_agent(&agent_name, &agent_tools, &agent_route, agent_max, &agent_system, &task)
                     }
                     "name" => Ok(Value::String(name.clone())),
-                    "max_steps" => Ok(Value::Number(max_steps as f64)),
+                    "max_steps" => Ok(Value::Float(max_steps as f64)),
                     _ => Err(format!("Agent has no method: {}", method)),
                 }
             }
@@ -1302,7 +1304,7 @@ impl Interpreter {
 fn text_to_string(v: &Value) -> String {
     match v {
         Value::String(s) => s.clone(),
-        Value::Number(n) => n.to_string(),
+        Value::Float(n) => n.to_string(),
         Value::Bool(b) => b.to_string(),
         Value::Nil => String::new(),
         other => other.to_string(),
@@ -1312,7 +1314,7 @@ fn text_to_string(v: &Value) -> String {
 /// 解析 budget 值 (dispatch 层副本,与 execute.rs 同语义)
 fn parse_budget_dispatch(v: Value, ctx: &str) -> Result<usize, String> {
     match v {
-        Value::Number(n) => {
+        Value::Float(n) => {
             if n < 0.0 {
                 return Err(format!("{}: budget must be non-negative", ctx));
             }

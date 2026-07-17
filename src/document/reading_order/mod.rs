@@ -68,7 +68,7 @@ impl BBox {
         };
         let get = |k: &str| {
             bbox_dict.get(k).and_then(|x| {
-                if let Value::Number(n) = x {
+                if let Value::Float(n) = x {
                     Some(*n)
                 } else {
                     None
@@ -268,7 +268,7 @@ pub fn assign_reading_order(
             if let Value::Dict(ref mut d) = block {
                 d.insert(
                     "reading_order_idx".to_string(),
-                    Value::Number(new_idx as f64),
+                    Value::Float(new_idx as f64),
                 );
             }
             block
@@ -588,10 +588,10 @@ mod tests {
         d.insert("text".to_string(), Value::String(text.to_string()));
         if let Some(b) = bbox {
             let mut bb = HashMap::new();
-            bb.insert("x".to_string(), Value::Number(b.x));
-            bb.insert("y".to_string(), Value::Number(b.y));
-            bb.insert("w".to_string(), Value::Number(b.w));
-            bb.insert("h".to_string(), Value::Number(b.h));
+            bb.insert("x".to_string(), Value::Float(b.x));
+            bb.insert("y".to_string(), Value::Float(b.y));
+            bb.insert("w".to_string(), Value::Float(b.w));
+            bb.insert("h".to_string(), Value::Float(b.h));
             d.insert("bbox".to_string(), Value::Dict(bb));
         }
         Value::Dict(d)
@@ -599,7 +599,7 @@ mod tests {
 
     fn reading_order_idx(b: &Value) -> Option<usize> {
         if let Value::Dict(d) = b {
-            if let Some(Value::Number(n)) = d.get("reading_order_idx") {
+            if let Some(Value::Float(n)) = d.get("reading_order_idx") {
                 Some(*n as usize)
             } else {
                 None

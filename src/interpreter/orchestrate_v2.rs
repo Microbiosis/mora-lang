@@ -444,15 +444,13 @@ impl PregelEngine {
             }
             ReducerKind::Add => {
                 let cur_num = match current {
-                    Some(Value::Number(n)) => n,
-                    Some(Value::Int(n)) => n as f64,
                     Some(Value::Float(n)) => n,
+                    Some(Value::Int(n)) => n as f64,
                     _ => 0.0,
                 };
                 let new_num = match value {
-                    Value::Number(n) => n,
-                    Value::Int(n) => n as f64,
                     Value::Float(n) => n,
+                    Value::Int(n) => n as f64,
                     _ => {
                         return Err(format!(
                             "Pregel @add reducer expects number, got {:?}",
@@ -460,7 +458,7 @@ impl PregelEngine {
                         ));
                     }
                 };
-                Value::Number(cur_num + new_num)
+                Value::Float(cur_num + new_num)
             }
             ReducerKind::Merge(ref merge_fn_id) => {
                 // v0.51 P0-4 真接通：
@@ -651,7 +649,7 @@ fn extract_json_top_level_object(json: &str, key: &str) -> Vec<(String, Value)> 
             } else if let Ok(n) = v.parse::<i64>() {
                 Value::Int(n)
             } else if let Ok(n) = v.parse::<f64>() {
-                Value::Number(n)
+                Value::Float(n)
             } else {
                 Value::String(v)
             };
@@ -960,7 +958,7 @@ mod tests {
     fn reducer_add_sums_numbers() {
         let mut engine = make_test_engine_with_schema(vec![StateChannel {
             name: "total".to_string(),
-            type_hint: Some("number".to_string()),
+            type_hint: Some("float".to_string()),
             reducer: ReducerKind::Add,
         }]);
         engine.init_channels(HashMap::new());
@@ -968,7 +966,7 @@ mod tests {
         engine
             .apply_write(
                 "total".to_string(),
-                Value::Number(10.0),
+                Value::Float(10.0),
                 &mut Interpreter::new(),
                 &AstArena::default(),
             )
@@ -990,14 +988,14 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(engine.get_channel("total"), Some(Value::Number(17.5)));
+        assert_eq!(engine.get_channel("total"), Some(Value::Float(17.5)));
     }
 
     #[test]
     fn reducer_add_rejects_non_number() {
         let mut engine = make_test_engine_with_schema(vec![StateChannel {
             name: "total".to_string(),
-            type_hint: Some("number".to_string()),
+            type_hint: Some("float".to_string()),
             reducer: ReducerKind::Add,
         }]);
         engine.init_channels(HashMap::new());
@@ -1085,7 +1083,7 @@ mod tests {
         // merge_fn_id 指向一个数字字面量（不是闭包）→ Merge 路径应报 arity 错误
         let mut arena = AstArena::new();
         let literal_id = arena.alloc_expr(
-            ExprKind::Literal(Literal::Number(42.0, Span::default())),
+            ExprKind::Literal(Literal::Float(42.0, Span::default())),
             Span::default(),
         );
 
@@ -1304,7 +1302,7 @@ mod tests {
                 assert_eq!(cmd.goto, Some("A".to_string()));
                 assert_eq!(cmd.update.len(), 1);
                 assert_eq!(cmd.update[0].0, "score");
-                assert_eq!(cmd.update[0].1, Value::Number(0.9));
+                assert_eq!(cmd.update[0].1, Value::Float(0.9));
             }
             _ => panic!("Expected Command"),
         }
@@ -1331,7 +1329,7 @@ mod tests {
     #[test]
     fn parse_send_batch_tasks() {
         // 批量 SendTask 格式（顶层是 List）
-        // 注：json_to_value 把整数解析为 Value::Number（f64）而非 Value::Int
+        // 注：json_to_value 把整数解析为 Value::Float（f64）而非 Value::Int
         let out = PregelEngine::parse_agent_output(
             r#"[{"__send__": true, "target": "a", "input": 1}, {"__send__": true, "target": "b", "input": 2}]"#,
         );
@@ -1339,9 +1337,9 @@ mod tests {
             AgentOutput::SendTask(tasks) => {
                 assert_eq!(tasks.len(), 2);
                 assert_eq!(tasks[0].target_node, "a");
-                assert_eq!(tasks[0].input, Value::Number(1.0));
+                assert_eq!(tasks[0].input, Value::Float(1.0));
                 assert_eq!(tasks[1].target_node, "b");
-                assert_eq!(tasks[1].input, Value::Number(2.0));
+                assert_eq!(tasks[1].input, Value::Float(2.0));
             }
             _ => panic!("Expected SendTask, got {:?}", out),
         }

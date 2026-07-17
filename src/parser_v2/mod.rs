@@ -171,7 +171,12 @@ impl ParserV2 {
         let name = self.consume_identifier("Expected parameter name");
         let mut type_hint = None;
         if self.match_token(&[TokenType::Colon]) {
-            type_hint = Some(self.consume_identifier("Expected type"));
+            let mut hint = self.consume_identifier("Expected type");
+            // Normalize legacy "number" type hint to "float".
+            if hint == "number" {
+                hint = "float".to_string();
+            }
+            type_hint = Some(hint);
         }
         (name, type_hint)
     }
@@ -427,6 +432,12 @@ impl ParserV2 {
 
     fn parse_type_name_recursive(&mut self) -> String {
         let tn = self.consume_identifier("Expected type name");
+        // Normalize legacy "number" type hint to "float" (Type::Number merged into Type::Float).
+        let tn = if tn == "number" {
+            "float".to_string()
+        } else {
+            tn
+        };
         if self.check(&TokenType::Less) && self.peek_after_less_is_ident() {
             let generics = self.parse_type_list();
             format!("{}<{}>", tn, generics.join(","))

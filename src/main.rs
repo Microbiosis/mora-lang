@@ -332,12 +332,12 @@ fn command_exists(cmd: &str) -> bool {
 }
 
 fn print_banner() {
-    let has_openai_key = env::var("OPENAI_API_KEY")
+    use mora::interpreter::{AI_API_KEY_ENV, AI_BASE_URL_DEFAULT, AI_BASE_URL_ENV};
+    let has_openai_key = env::var(AI_API_KEY_ENV)
         .map(|k| !k.is_empty())
         .unwrap_or(false);
     // v0.06.5: MORA_AI_MODEL 不再作为全局默认；模型路由走 `route` 块 + `with` 块
-    let base_url =
-        env::var("MORA_AI_BASE_URL").unwrap_or_else(|_| "https://api.openai.com/v1".to_string());
+    let base_url = env::var(AI_BASE_URL_ENV).unwrap_or_else(|_| AI_BASE_URL_DEFAULT.to_string());
 
     println!("Mora v{}", mora::VERSION);
     if has_openai_key {
@@ -428,25 +428,27 @@ fn run_record(path: &str, name: &str) {
 
     let rec_path = recording_path(name);
     let mut interpreter = Interpreter::new();
-    interpreter.infra_mut().recorder = match record::Recorder::new_record(rec_path.clone()) {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("record: {}", e);
-            process::exit(1);
-        }
-    };
+    interpreter.infra_mut().replace_recorder(
+        match record::Recorder::new_record(rec_path.clone()) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("record: {}", e);
+                process::exit(1);
+            }
+        },
+    );
 
     match interpreter.interpret(&node_ids, &arena) {
         Ok(()) => {
-            if let Err(e) = interpreter.infra_mut().recorder.save() {
+            if let Err(e) = interpreter.infra_mut().recorder().save() {
                 eprintln!("record: save failed: {}", e);
                 process::exit(1);
             }
-            let n = interpreter.infra().recorder.events().len();
+            let n = interpreter.infra().recorder().events().len();
             println!("✓ recorded {} events -> {}", n, rec_path.display());
         }
         Err(e) => {
-            let _ = interpreter.infra_mut().recorder.save();
+            let _ = interpreter.infra_mut().recorder().save();
             eprintln!("Runtime error during record: {}", e);
             eprintln!("(partial recording saved)");
             process::exit(1);
@@ -473,13 +475,15 @@ fn run_replay(path: &str, name: &str) {
 
     let rec_path = recording_path(name);
     let mut interpreter = Interpreter::new();
-    interpreter.infra_mut().recorder = match record::Recorder::new_replay(rec_path.clone()) {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("replay: {}", e);
-            process::exit(1);
-        }
-    };
+    interpreter.infra_mut().replace_recorder(
+        match record::Recorder::new_replay(rec_path.clone()) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("replay: {}", e);
+                process::exit(1);
+            }
+        },
+    );
 
     if let Err(e) = interpreter.interpret(&node_ids, &arena) {
         eprintln!("Runtime error during replay: {}", e);
@@ -487,7 +491,7 @@ fn run_replay(path: &str, name: &str) {
     }
     println!(
         "✓ replayed {} events from {}",
-        interpreter.infra().recorder.events().len(),
+        interpreter.infra().recorder().events().len(),
         rec_path.display()
     );
 }
@@ -689,7 +693,7 @@ fn run_snapshot(file: &str, name: &str, update: bool) {
         eprintln!("snapshot: runtime error: {}", e);
         process::exit(1);
     }
-    let current_events = interpreter.infra().recorder.events().to_vec();
+    let current_events = interpreter.infra().recorder().events().to_vec();
     let snap_file = snapshot_path(name);
     if update || !snap_file.exists() {
         // 创建/更新基线

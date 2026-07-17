@@ -13,14 +13,14 @@ use crate::toolplane::ToolPlaneRegistry;
 #[derive(Clone)]
 pub struct SandboxRuntime {
     /// v0.34: 沙箱策略 (来自 src/sandbox/, MimiClaw path validation)
-    pub sandbox: SandboxPolicy,
+    pub(crate) sandbox: SandboxPolicy,
     /// v0.44.0: Container handle (REAL Docker spawn via `docker run`)
     /// None = no container (run on host). Set via sandbox.containerize builtin.
     /// Arc<Mutex<>> keeps call_sandbox_method `&self` (Clone-safe).
-    pub container: Arc<Mutex<Option<ContainerHandle>>>,
+    pub(crate) container: Arc<Mutex<Option<ContainerHandle>>>,
     /// v0.45.0: ToolPlane registry (multi-plane Core/Extension adapter)
     /// Default has 2 core planes: "ai" + "sandbox"
-    pub tool_planes: Arc<Mutex<ToolPlaneRegistry>>,
+    pub(crate) tool_planes: Arc<Mutex<ToolPlaneRegistry>>,
 }
 
 impl Default for SandboxRuntime {

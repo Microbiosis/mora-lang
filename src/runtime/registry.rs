@@ -13,15 +13,15 @@ use crate::value::Value;
 #[derive(Clone)]
 pub struct RegistryRuntime {
     /// v0.08: trait 系统注册表 (v0.36: wrapped in Arc for cheap clone in HTTP/MCP workers)
-    pub trait_registry: Arc<HashMap<String, TraitInfo>>,
+    pub(crate) trait_registry: Arc<HashMap<String, TraitInfo>>,
     /// v0.08: impl 表 (trait_name -> [impl_type_names])
-    pub impl_table: Arc<HashMap<String, Vec<String>>>,
+    pub(crate) impl_table: Arc<HashMap<String, Vec<String>>>,
     /// v0.34: mock registry (OpenFugu + OpenInfer mock)
-    pub mock_registry: MockRegistry,
+    pub(crate) mock_registry: MockRegistry,
     /// v0.34: CCR (Compress-Cache-Retrieve, Headroom style)
-    pub ccr_store: InMemoryCcrStore,
+    pub(crate) ccr_store: InMemoryCcrStore,
     /// v0.25: 会话记忆存储
-    pub memory_store: HashMap<String, Value>,
+    pub(crate) memory_store: HashMap<String, Value>,
 }
 
 impl Default for RegistryRuntime {

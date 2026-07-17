@@ -12,12 +12,12 @@ use crate::skill::SkillRegistry;
 #[derive(Debug, Clone)]
 pub struct OrchRuntime {
     /// v0.48.0: Plans (multi-plan, keyed by name) for plan.update (pi-agent)
-    pub plans: Arc<Mutex<HashMap<String, Plan>>>,
+    pub(crate) plans: Arc<Mutex<HashMap<String, Plan>>>,
     /// v0.48.0: Refine session registry (multi-script, CLI-Anything /refine)
-    pub refine_registry: Arc<Mutex<RefineRegistry>>,
+    pub(crate) refine_registry: Arc<Mutex<RefineRegistry>>,
     /// v0.46.0: Skill registry (MoraSkillSpec + dual registry, CLI-Anything pattern)
     /// Loaded from `~/.mora/skills/` or via builtin skill.load / skill.install
-    pub skill_registry: Arc<Mutex<SkillRegistry>>,
+    pub(crate) skill_registry: Arc<Mutex<SkillRegistry>>,
 }
 
 impl Default for OrchRuntime {

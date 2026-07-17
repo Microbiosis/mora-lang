@@ -11,17 +11,17 @@ use crate::trace_collector::TraceCollector;
 
 // 注：TraceCollector 没 derive Debug，所以 AiRuntime 也不 derive Debug
 // v0.52 ADR-001: 字段类型（TokenUsage/TokenBudget/RouteConfig）是 pub
-// 所以 AiRuntime 字段也是 pub（与字段类型可见性一致 — clippy 要求）
+// 所以 AiRuntime 字段也是 pub(crate)（字段类型可见性一致 — clippy 要求）
 #[derive(Clone)]
 pub struct AiRuntime {
-    pub model_routes: HashMap<String, RouteConfig>,
-    pub token_budget: Option<TokenBudget>,
-    pub token_usage: TokenUsage,
-    pub trace: TraceCollector,
-    pub draft_model_stats: Arc<Mutex<HashMap<String, (usize, usize)>>>,
-    pub context_window: ContextWindow,
-    pub speculative_verifier: SpeculativeVerifier,
-    pub cache_warmer: CacheWarmer,
+    pub(crate) model_routes: HashMap<String, RouteConfig>,
+    pub(crate) token_budget: Option<TokenBudget>,
+    pub(crate) token_usage: TokenUsage,
+    pub(crate) trace: TraceCollector,
+    pub(crate) draft_model_stats: Arc<Mutex<HashMap<String, (usize, usize)>>>,
+    pub(crate) context_window: ContextWindow,
+    pub(crate) speculative_verifier: SpeculativeVerifier,
+    pub(crate) cache_warmer: CacheWarmer,
 }
 
 impl Default for AiRuntime {

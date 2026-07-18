@@ -30,6 +30,21 @@ pub struct MirSsaFunction {
     pub params: Vec<(String, SsaReg)>,
     pub blocks: Vec<BasicBlock>,
     pub entry: BlockId,
+    /// α.8: 每个 SSA 寄存器的推断类型（用于 JIT 编译）
+    pub types: Vec<RegType>,
+}
+
+/// α.8: SSA 寄存器的推断类型
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum RegType {
+    Void,
+    Int,
+    Float,
+    Bool,
+    String,
+    List(Box<RegType>), // list<T>
+    Dict(Vec<RegType>), // dict: (key_type, val_type)
+    Any,                // dyn 类型，不可特化
 }
 
 /// 基本块：phi + 纯值指令 + terminator
@@ -140,6 +155,7 @@ pub fn construct(func: &MirFunction) -> MirSsaFunction {
                 succs: Vec::new(),
             }],
             entry: 0,
+            types: Vec::new(),
         };
     }
 
@@ -242,6 +258,7 @@ pub fn construct(func: &MirFunction) -> MirSsaFunction {
             .collect(),
         blocks,
         entry: 0,
+        types: Vec::new(), // 由 typeinfer 后续填充
     }
 }
 

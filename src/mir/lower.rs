@@ -477,6 +477,46 @@ impl Lowerer {
                 });
                 Ok(())
             }
+            // α.4: 事务 — body + compensation 分别 lower 成嵌套 MirFunction
+            StmtKind::Transaction { body, compensation } => {
+                let mut body_lowerer = Lowerer::new();
+                for s in body {
+                    body_lowerer.lower_stmt(*s, arena)?;
+                }
+                let body_mir = body_lowerer.finish();
+                let mut comp_lowerer = Lowerer::new();
+                for s in compensation {
+                    comp_lowerer.lower_stmt(*s, arena)?;
+                }
+                let comp_mir = comp_lowerer.finish();
+                self.emit(MirInst::Transaction {
+                    body: Box::new(body_mir),
+                    compensation: Box::new(comp_mir),
+                });
+                Ok(())
+            }
+            // α.4: send — 求值 value 为寄存器，emit Send 指令
+            StmtKind::Send { value, target } => {
+                let val_reg = self.lower_expr(*value, arena)?;
+                self.emit(MirInst::Send {
+                    value: val_reg,
+                    target: target.clone(),
+                });
+                Ok(())
+            }
+            // α.4: receive — emit Receive 指令（var/source 直接传递）
+            StmtKind::Receive { var, source } => {
+                self.emit(MirInst::Receive {
+                    var: var.clone(),
+                    source: source.clone(),
+                });
+                Ok(())
+            }
+            // α.4: rollback — 返回事务回滚错误
+            StmtKind::Rollback => {
+                self.emit(MirInst::Rollback);
+                Ok(())
+            }
             _ => Err(format!(
                 "lower_stmt: StmtKind {:?} not yet supported (α.2)",
                 std::mem::discriminant(&stmt.kind)

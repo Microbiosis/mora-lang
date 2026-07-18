@@ -22,9 +22,11 @@ use crate::common::BinaryOp;
 use crate::value::Value;
 
 pub mod interp;
+pub mod jit;
 pub mod lower;
 pub mod opt;
 pub mod ssa;
+pub mod typeinfer;
 
 pub use interp::run_mir;
 pub use lower::lower_program;

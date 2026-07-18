@@ -553,16 +553,27 @@ impl Interpreter {
         self.call_method(object, method, args, crate::common::Span::default())
     }
 
-    /// α.2: MIR 解释器的 import 桥。复用 execute.rs 的 execute_import。
-    pub(crate) fn mir_import(&mut self, path: &str) -> Result<(), String> {
+    /// α.3: MIR 解释器的 import 桥。
+    /// 解析 → lowering → run_mir，不依赖 AST 解释器的 execute。
+    pub(crate) fn mir_import(
+        &mut self,
+        path: &str,
+        env: &mut crate::value::Environment,
+    ) -> Result<(), String> {
         match std::fs::read_to_string(path) {
             Ok(source) => {
                 let (imported_ids, imported_arena) = parse_code(&source);
-                for sid in &imported_ids {
-                    if let Some(stmt) = imported_arena.get_stmt(*sid) {
-                        let kind = stmt.kind.clone();
-                        self.execute(&kind, &imported_arena)?;
-                    }
+                let imported_func =
+                    match crate::mir::lower::lower_program(&imported_ids, &imported_arena) {
+                        Ok(f) => f,
+                        Err(e) => return Err(format!("import lowering error: {}", e)),
+                    };
+                // 子 import 的 env 是当前 env 的克隆（与 with 块语义一致）
+                let mut child_env = env.clone();
+                let _ = crate::mir::interp::run_mir(&imported_func, self, &mut child_env)?;
+                // child_env 中的定义合并回父 env
+                for (name, val) in child_env.iter() {
+                    env.define(name, val, false);
                 }
                 Ok(())
             }

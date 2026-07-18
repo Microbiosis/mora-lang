@@ -453,6 +453,30 @@ impl Lowerer {
                 });
                 Ok(())
             }
+            // α.3: 类型别名
+            StmtKind::TypeAlias { name, target, .. } => {
+                self.emit(MirInst::TypeAlias {
+                    name: name.clone(),
+                    target: target.clone(),
+                });
+                Ok(())
+            }
+            // α.3: 枚举定义
+            StmtKind::EnumDef { name, variants, .. } => {
+                self.emit(MirInst::EnumDef {
+                    name: name.clone(),
+                    variants: variants.clone(),
+                });
+                Ok(())
+            }
+            // α.3: 结构体定义
+            StmtKind::StructDef { name, fields, .. } => {
+                self.emit(MirInst::StructDef {
+                    name: name.clone(),
+                    fields: fields.clone(),
+                });
+                Ok(())
+            }
             _ => Err(format!(
                 "lower_stmt: StmtKind {:?} not yet supported (α.2)",
                 std::mem::discriminant(&stmt.kind)

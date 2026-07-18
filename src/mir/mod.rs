@@ -126,6 +126,26 @@ pub enum MirInst {
         body: Box<MirFunction>,
     },
 
+    // ── 类型定义语句（α.3: 与 AST execute 语义一致）──
+
+    /// α.3: 类型别名。定义 `name` → `target` 的字符串映射。
+    TypeAlias {
+        name: String,
+        target: String,
+    },
+
+    /// α.3: 枚举定义。定义 `name` → Dict(variant_name → String)。
+    EnumDef {
+        name: String,
+        variants: Vec<crate::common::EnumVariant>,
+    },
+
+    /// α.3: 结构体定义。定义 `name` → Closure(构造器)。
+    StructDef {
+        name: String,
+        fields: Vec<crate::common::StructField>,
+    },
+
     // ── 控制流（替代 FlowSignal 枚举传返）──
     Label(Label),
     Jump(Label),

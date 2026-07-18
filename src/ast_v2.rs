@@ -317,6 +317,7 @@ pub enum StmtKind {
     With {
         bindings: Vec<(String, NodeId)>,
         body: Vec<NodeId>,
+        jit: bool, // true → with jit { ... } 触发 JIT 编译
     },
 
     // 流式循环

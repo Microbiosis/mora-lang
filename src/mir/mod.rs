@@ -108,9 +108,11 @@ pub enum MirInst {
 
     /// α.2: with 块。bindings 设置 AI config，body 执行后恢复。
     /// 解释器保存/恢复 current_ai_config。
+    /// jit=true 时，block 内容通过 SSA → LLVM → JIT 编译执行。
     WithConfig {
         bindings: Vec<(String, Reg)>,
         body: Box<MirFunction>,
+        jit: bool,
     },
 
     /// α.2: 流式循环。stream_for var in prompt body end

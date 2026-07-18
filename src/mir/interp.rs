@@ -141,7 +141,11 @@ pub fn run_mir(
                 interp.mir_import(path)?;
                 pc += 1;
             }
-            MirInst::WithConfig { bindings, body } => {
+            MirInst::WithConfig {
+                bindings,
+                body,
+                jit,
+            } => {
                 // 保存/恢复 AI config，执行 body MirFunction
                 let binding_vals: Vec<(String, Value)> = bindings
                     .iter()
@@ -149,7 +153,18 @@ pub fn run_mir(
                     .collect();
                 interp.mir_with_config(&binding_vals)?;
                 let mut child_env = env.clone();
-                let result = run_mir(body, interp, &mut child_env)?;
+
+                // α.8: with jit → SSA → LLVM → JIT native 执行
+                // 当前阶段：标记位已传递，实际 JIT 编译后续实现
+                // 暂保持 MIR 解释器路径作为 fallback
+                #[allow(unused_variables)]
+                let result = if *jit {
+                    // TODO: 未来替换为 `run_ssa_jit(ssa, interp, &mut child_env)`
+                    run_mir(body, interp, &mut child_env)
+                } else {
+                    run_mir(body, interp, &mut child_env)
+                };
+                let result = result?;
                 interp.mir_restore_config();
                 let _ = result; // with 块的返回值丢弃（语句语义）
                 pc += 1;

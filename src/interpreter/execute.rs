@@ -74,7 +74,11 @@ impl Interpreter {
                 arena,
             ),
             StmtKind::Match { expr, arms } => self.execute_match(*expr, arms, arena),
-            StmtKind::With { bindings, body } => self.execute_with(bindings, body, arena),
+            StmtKind::With {
+                bindings,
+                body,
+                jit: _,
+            } => self.execute_with(bindings, body, arena),
             StmtKind::Parallel { stmts } => self.execute_parallel(stmts, arena),
             StmtKind::Worker { .. } => Ok((FlowSignal::None, None)),
             StmtKind::Send { value, target } => self.execute_send(*value, target, arena),

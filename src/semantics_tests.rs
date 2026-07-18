@@ -17,13 +17,16 @@ use proptest::prelude::*;
 use std::collections::HashMap;
 
 /// Mora reserved tokens that cannot be used as identifiers (param names, return types, etc.)
+/// Derived from TokenType enum in lexer.rs (all non-Identifier, non-literal, non-operator variants).
 const RESERVED_TOKENS: &[&str] = &[
+    // Core control flow
     "do",
     "end",
     "tool",
     "task",
     "return",
     "if",
+    "then",
     "for",
     "while",
     "match",
@@ -45,19 +48,87 @@ const RESERVED_TOKENS: &[&str] = &[
     "not",
     "and",
     "or",
-    "is_type",
-    "assert",
-    "skip",
+    // Values
+    "true",
+    "false",
+    "nil",
+    // File / IO
+    "import",
+    "export",
+    "save",
+    "load",
+    "read",
+    "write",
+    "append",
+    "read_bytes",
+    "write_bytes",
+    "into",
+    "stream",
+    // Flow control
+    "parallel",
     "break",
     "continue",
-    "parallel",
     "send",
     "receive",
     "channel",
     "spawn",
+    "worker",
+    // Transactions
+    "transaction",
+    "commit",
+    "rollback",
+    "compensation",
+    // Observability
     "observe",
     "route",
     "router",
+    "span",
+    "tags",
+    "record",
+    "trace",
+    "metrics",
+    "otel",
+    // Multi-agent / orchestration
+    "orchestrate",
+    "edges",
+    "loop",
+    "max_rounds",
+    "exit_when",
+    "rounds",
+    "state",
+    "node",
+    "checkpoint",
+    "thread",
+    // Execution model
+    "rewind",
+    "resume",
+    "interrupt",
+    "before",
+    "after",
+    // Dynamic edges
+    "dynamic",
+    "map",
+    "reduce",
+    "fan_in",
+    "fan_out",
+    // Commands
+    "command",
+    "goto",
+    "update",
+    "add",
+    "last",
+    "merge",
+    // Macros
+    "macro",
+    // Eval / Skill
+    "eval",
+    "skill",
+    "expect",
+    "tolerance",
+    // Prompt / Document
+    "prompt",
+    "document",
+    // AI / Memory / Task builtins (commonly used as param names in tests)
     "stream_for",
     "http_get",
     "http_post",
@@ -77,6 +148,13 @@ const RESERVED_TOKENS: &[&str] = &[
     "ai_stream",
     "http_server",
     "agent_run",
+    // Type system
+    "is_type",
+    "assert",
+    "skip",
+    // Dyn + Where
+    "dyn",
+    "where",
 ];
 
 // =============================================================================

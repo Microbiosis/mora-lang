@@ -367,6 +367,11 @@ fn update_lock(pkg_name: &str, url: &str) {
     }
 }
 
+/// 解释器模式：MORA_INTERP=mir 启用 MIR 解释器，默认走 AST 解释器
+fn interpreter_mode() -> String {
+    env::var("MORA_INTERP").unwrap_or_else(|_| "ast".to_string())
+}
+
 fn run_file(path: &str) {
     let source = fs::read_to_string(path).expect("Failed to read file");
 
@@ -380,14 +385,34 @@ fn run_file(path: &str) {
             eprintln!("{}", format_error(err));
         }
         eprintln!("\n{} type error(s) found.", type_errors.len());
-        // v0.05: typeck 失败 exit code 2（区分运行时错误 1）
         process::exit(2);
     }
 
-    let mut interpreter = Interpreter::new();
-    if let Err(e) = interpreter.interpret(&node_ids, &arena) {
-        eprintln!("Runtime error: {}", e);
-        process::exit(1);
+    match interpreter_mode().as_str() {
+        "mir" => {
+            // α.4: MIR 解释器路径
+            let func = match mora::mir::lower::lower_program(&node_ids, &arena) {
+                Ok(f) => f,
+                Err(e) => {
+                    eprintln!("MIR lowering error: {}", e);
+                    process::exit(1);
+                }
+            };
+            let mut interpreter = Interpreter::new();
+            let mut env = interpreter.take_env();
+            if let Err(e) = mora::mir::interp::run_mir(&func, &mut interpreter, &mut env) {
+                eprintln!("Runtime error (MIR): {}", e);
+                process::exit(1);
+            }
+        }
+        _ => {
+            // 默认 AST 解释器
+            let mut interpreter = Interpreter::new();
+            if let Err(e) = interpreter.interpret(&node_ids, &arena) {
+                eprintln!("Runtime error: {}", e);
+                process::exit(1);
+            }
+        }
     }
 }
 

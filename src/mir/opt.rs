@@ -87,9 +87,10 @@ fn const_propagate(ssa: &mut MirSsaFunction) {
             }
         }
         if let Terminator::Return(Some(r)) = &block.terminator
-            && *r > max_dst {
-                max_dst = *r;
-            }
+            && *r > max_dst
+        {
+            max_dst = *r;
+        }
         let mut const_vals: Vec<Option<Value>> = vec![None; max_dst.saturating_add(1)];
 
         for inst in &mut block.insts {
@@ -133,9 +134,10 @@ fn const_propagate(ssa: &mut MirSsaFunction) {
                 _ => None,
             };
             if let Some(src) = src_opt
-                && let Some(ref v) = safe_get(&const_vals, *src) {
-                    const_vals[dst] = Some(v.clone());
-                }
+                && let Some(ref v) = safe_get(&const_vals, *src)
+            {
+                const_vals[dst] = Some(v.clone());
+            }
         }
     }
 }

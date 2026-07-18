@@ -604,6 +604,11 @@ impl Interpreter {
         self.core.current_ai_config = self.core.config_stack.pop().flatten();
     }
 
+    /// 获取可变的当前执行环境（MIR 解释器入口用）
+    pub fn take_env(&mut self) -> Environment {
+        std::mem::take(&mut *self.core.environment.lock())
+    }
+
     pub fn set_trace_enabled(&mut self, enabled: bool) {
         self.ai.trace = TraceCollector::new(enabled);
     }

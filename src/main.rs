@@ -367,9 +367,9 @@ fn update_lock(pkg_name: &str, url: &str) {
     }
 }
 
-/// 解释器模式：MORA_INTERP=mir 启用 MIR 解释器，默认走 AST 解释器
+/// 解释器模式：MORA_INTERP=ast 回退到 AST 解释器，默认走 MIR 解释器（Tier 1）
 fn interpreter_mode() -> String {
-    env::var("MORA_INTERP").unwrap_or_else(|_| "ast".to_string())
+    env::var("MORA_INTERP").unwrap_or_else(|_| "mir".to_string())
 }
 
 fn run_file(path: &str) {
@@ -402,6 +402,11 @@ fn run_file(path: &str) {
             let mut env = interpreter.take_env();
             if let Err(e) = mora::mir::interp::run_mir(&func, &mut interpreter, &mut env) {
                 eprintln!("Runtime error (MIR): {}", e);
+                process::exit(1);
+            }
+            // 执行完顶层语句后查找并调用 main task（与 AST 路径一致）
+            if let Err(e) = mora::mir::interp::run_main_task(&func, &mut interpreter, &mut env) {
+                eprintln!("Runtime error (MIR main): {}", e);
                 process::exit(1);
             }
         }

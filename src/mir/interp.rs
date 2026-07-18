@@ -137,8 +137,8 @@ pub fn run_mir(
                 pc += 1;
             }
             MirInst::Import(path) => {
-                // 委托 AST 解释器的 import 路径
-                interp.mir_import(path)?;
+                // α.3: 走 MIR 路径 — 解析 → lowering → run_mir
+                interp.mir_import(path, env)?;
                 pc += 1;
             }
             MirInst::WithConfig {
@@ -454,4 +454,29 @@ fn self_match_pattern(
     }
     // 未匹配的模式
     false
+}
+
+/// α.3: 查找并执行 main task（与 AST 路径的 interpret() 末尾逻辑一致）。
+/// 扫描 func.body 中的 TaskDef，找到 name="main" 且无参的，执行其 body。
+/// 若不存在或非无参 main 则静默返回 Ok。
+pub fn run_main_task(
+    func: &MirFunction,
+    interp: &mut Interpreter,
+    env: &mut Environment,
+) -> Result<(), String> {
+    let mut main_body: Option<&MirFunction> = None;
+    for inst in &func.body {
+        if let MirInst::TaskDef { name, params, body } = inst
+            && name == "main"
+            && params.is_empty()
+        {
+            main_body = Some(body);
+            break;
+        }
+    }
+    if let Some(main_func) = main_body {
+        let mut main_env = env.clone();
+        let _ = run_mir(main_func, interp, &mut main_env)?;
+    }
+    Ok(())
 }

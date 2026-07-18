@@ -566,6 +566,15 @@ impl Environment {
             Err(format!("undefined variable: {}", name))
         }
     }
+
+    /// 迭代环境中的所有绑定（仅当前层，不含 parent），供 import/子 env 合并用。
+    /// 返回 (name, Value) 的克隆，避免借用临时 MutexGuard。
+    pub fn iter(&self) -> Vec<(String, Value)> {
+        self.values
+            .iter()
+            .map(|(k, v)| (k.clone(), v.lock().clone()))
+            .collect()
+    }
 }
 
 // ─── FlowSignal ──────────────────────────────────────────

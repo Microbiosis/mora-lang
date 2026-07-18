@@ -29,7 +29,7 @@ use crate::trace_collector::TraceCollector;
 ///   OPENAI_API_KEY   — API 密钥
 ///   MORA_AI_BASE_URL — 服务端点 URL
 pub const AI_MODEL_ENV: &str = "MORA_AI_MODEL";
-pub const AI_MODEL_DEFAULT: &str = "gpt-4o-mini";
+pub const AI_MODEL_DEFAULT: &str = "example-model";
 pub const AI_API_KEY_ENV: &str = "OPENAI_API_KEY";
 pub const AI_BASE_URL_ENV: &str = "MORA_AI_BASE_URL";
 pub const AI_BASE_URL_DEFAULT: &str = "https://api.openai.com/v1";

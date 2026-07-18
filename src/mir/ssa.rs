@@ -518,7 +518,11 @@ fn split_into_ssa(
             | MirInst::MatchArm { .. }
             | MirInst::TypeAlias { .. }
             | MirInst::EnumDef { .. }
-            | MirInst::StructDef { .. } => {}
+            | MirInst::StructDef { .. }
+            | MirInst::Transaction { .. }
+            | MirInst::Send { .. }
+            | MirInst::Receive { .. }
+            | MirInst::Rollback => {}
         }
     }
 

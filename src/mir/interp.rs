@@ -284,6 +284,47 @@ pub fn run_mir(
                 // 若出现则跳过（应已由 MatchExpr lowering 纳入嵌套 MirFunction）
                 pc += 1;
             }
+            // α.4: 事务 — body 执行，失败则执行 compensation 后返回错误
+            MirInst::Transaction { body, compensation } => {
+                let mut child_env = env.clone();
+                let result = run_mir(body, interp, &mut child_env);
+                match result {
+                    Ok(_) => {
+                        // 执行成功，child_env 合并回父 env
+                        for (name, val) in child_env.iter() {
+                            env.define(name, val, false);
+                        }
+                        pc += 1;
+                    }
+                    Err(_) => {
+                        // body 执行失败 → 执行 compensation
+                        let mut comp_env = env.clone();
+                        let _ = run_mir(compensation, interp, &mut comp_env);
+                        // compensation 执行完毕后返回事务回滚错误
+                        return Err("Transaction rolled back".to_string());
+                    }
+                }
+            }
+            // α.4: send — 发送值到 worker channel
+            MirInst::Send { value, target } => {
+                let val = regs[*value].clone();
+                if let Some(tx) = interp.core.worker_channels.get(target.as_str()) {
+                    tx.send(val).map_err(|e| format!("Send error: {}", e))?;
+                }
+                pc += 1;
+            }
+            // α.4: receive — 从 worker channel 接收值
+            MirInst::Receive { var, source } => {
+                if let Some(rx) = interp.core.worker_receivers.get(source.as_str()) {
+                    let val = rx.recv().map_err(|e| format!("Receive error: {}", e))?;
+                    env.define(var.clone(), val, false);
+                }
+                pc += 1;
+            }
+            // α.4: rollback — 触发事务回滚
+            MirInst::Rollback => {
+                return Err("Transaction rolled back".to_string());
+            }
         }
     }
     Ok(Value::Nil)

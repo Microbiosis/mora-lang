@@ -146,6 +146,29 @@ pub enum MirInst {
         fields: Vec<crate::common::StructField>,
     },
 
+    // ── 运行时特性（α.4: transaction / worker）──
+
+    /// α.4: 事务。body 执行成功则正常返回；失败则执行 compensation 后返回错误。
+    Transaction {
+        body: Box<MirFunction>,
+        compensation: Box<MirFunction>,
+    },
+
+    /// α.4: send — 发送值到 worker channel（target 是 channel 名称）。
+    Send {
+        value: Reg,
+        target: String,
+    },
+
+    /// α.4: receive — 从 worker channel 接收值并绑定到 var。
+    Receive {
+        var: String,
+        source: String,
+    },
+
+    /// α.4: rollback — 触发事务回滚（返回 "Transaction rolled back" 错误）。
+    Rollback,
+
     // ── 控制流（替代 FlowSignal 枚举传返）──
     Label(Label),
     Jump(Label),

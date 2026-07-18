@@ -663,7 +663,6 @@ fn mir_ssa_roundtrip_if() {
 }
 
 #[test]
-#[ignore = "construct 对无 Label 指令的 MIR（如 for-loop）CFG 构建有 bug，需要重构 resolve_jump_target 为范围查找"]
 fn mir_ssa_roundtrip_for_loop() {
     assert_roundtrip("for x in [1, 2, 3]\n  let y = x\nend");
 }

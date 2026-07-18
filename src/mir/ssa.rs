@@ -263,6 +263,8 @@ fn find_block_starts(body: &[MirInst], label_to_pos: &HashMap<usize, usize>) -> 
         starts.insert(pos);
     }
 
+    let body_len = body.len();
+
     for (i, inst) in body.iter().enumerate() {
         let is_term = matches!(
             inst,
@@ -273,7 +275,7 @@ fn find_block_starts(body: &[MirInst], label_to_pos: &HashMap<usize, usize>) -> 
                 | MirInst::Break(_)
                 | MirInst::Continue(_)
         );
-        if is_term && i + 1 < body.len() {
+        if is_term && i + 1 < body_len {
             starts.insert(i + 1);
         }
 
@@ -286,7 +288,11 @@ fn find_block_starts(body: &[MirInst], label_to_pos: &HashMap<usize, usize>) -> 
             _ => vec![],
         };
         for lbl in lbls {
-            if let Some(pos) = label_to_pos.get(&lbl) {
+            // α.0 lowering 不 emit Label 指令：Jump/Break/Continue 的 label 即 body 索引
+            // 直接将跳转目标位置作为基本块起点插入（注释："α.0 不 emit Label 指令（label 即索引）"）
+            if lbl < body_len && lbl > 0 {
+                starts.insert(lbl);
+            } else if let Some(pos) = label_to_pos.get(&lbl) {
                 starts.insert(*pos);
             }
         }

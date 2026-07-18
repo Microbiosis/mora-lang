@@ -79,7 +79,11 @@ impl TypeChecker {
             StmtKind::Match { expr, arms } => {
                 self.check_match_stmt(*expr, arms, arena, symbols);
             }
-            StmtKind::With { bindings, body } => {
+            StmtKind::With {
+                bindings,
+                body,
+                jit: _,
+            } => {
                 self.check_with_stmt(bindings, body, arena, symbols);
             }
             StmtKind::Parallel { stmts } | StmtKind::MacroDef { body: stmts, .. } => {

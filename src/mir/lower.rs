@@ -347,7 +347,11 @@ impl Lowerer {
                 Ok(())
             }
             // α.2: with 块 — 保存/恢复 AI config
-            StmtKind::With { bindings, body } => {
+            StmtKind::With {
+                bindings,
+                body,
+                jit,
+            } => {
                 let binding_regs: Vec<(String, Reg)> = bindings
                     .iter()
                     .map(|(k, v)| self.lower_expr(*v, arena).map(|r| (k.clone(), r)))
@@ -360,6 +364,7 @@ impl Lowerer {
                 self.emit(MirInst::WithConfig {
                     bindings: binding_regs,
                     body: Box::new(body_mir),
+                    jit: *jit,
                 });
                 Ok(())
             }

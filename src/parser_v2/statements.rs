@@ -299,6 +299,35 @@ impl ParserV2 {
         let span = self.span_of_current();
         self.advance(); // consume 'with'
 
+        // α.8: 检查 `with jit { ... }` 语法
+        if self.match_token(&[TokenType::Jit]) {
+            self.consume(&TokenType::LBrace, "Expected '{' after 'jit'");
+
+            while self.check(&TokenType::Newline) {
+                self.advance();
+            }
+
+            let mut body = Vec::new();
+            while !self.check(&TokenType::RBrace) && !self.is_at_end() {
+                if self.check(&TokenType::Newline) {
+                    self.advance();
+                    continue;
+                }
+                if let Some(stmt_id) = self.declaration() {
+                    body.push(stmt_id);
+                }
+            }
+            self.consume(&TokenType::RBrace, "Expected '}' to close jit block");
+
+            let kind = StmtKind::With {
+                bindings: Vec::new(),
+                body,
+                jit: true,
+            };
+            return self.arena.alloc_stmt(kind, span);
+        }
+
+        // 常规 with 块：with key = value, ... body end
         let mut bindings = Vec::new();
         loop {
             let key = self.consume_identifier("Expected config key");
@@ -326,7 +355,11 @@ impl ParserV2 {
         }
         self.consume(&TokenType::End, "Expected 'end'");
 
-        let kind = StmtKind::With { bindings, body };
+        let kind = StmtKind::With {
+            bindings,
+            body,
+            jit: false,
+        };
         self.arena.alloc_stmt(kind, span)
     }
 

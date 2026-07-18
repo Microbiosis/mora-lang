@@ -91,6 +91,7 @@ pub enum TokenType {
     Add,        // '@add' 语义
     Last,       // '@last' 语义 (默认)
     Merge,      // '@merge' 语义
+    Jit,        // 'jit' (with jit { ... })
     // 注意: HTTP 方法 (GET/POST/PUT/DELETE/PATCH) 不作关键字
     // —— 保持 Identifier,显式 API Router.route() 按字符串匹配
     Identifier(String),
@@ -946,6 +947,8 @@ impl Lexer {
             "add" => TokenType::Add,
             "last" => TokenType::Last,
             "merge" => TokenType::Merge,
+            // v0.53: JIT 编译触发
+            "jit" => TokenType::Jit,
             // v0.27: document 块语句（与 prompt "x" do end 同款）
             // 但允许 `document.parse(...)` 形式:仅当下一个 token 是字符串字面量
             // (块语句起始)时识别为 Document 关键字,否则退化为 Identifier,

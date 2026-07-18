@@ -515,7 +515,10 @@ fn split_into_ssa(
             | MirInst::WithConfig { .. }
             | MirInst::StreamFor { .. }
             | MirInst::MatchExpr { .. }
-            | MirInst::MatchArm { .. } => {}
+            | MirInst::MatchArm { .. }
+            | MirInst::TypeAlias { .. }
+            | MirInst::EnumDef { .. }
+            | MirInst::StructDef { .. } => {}
         }
     }
 

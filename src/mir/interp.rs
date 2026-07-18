@@ -132,6 +132,34 @@ pub fn run_mir(
                 let _ = &regs[*src];
                 pc += 1;
             }
+            // α.3: 类型别名 — env 中定义 name → String(target)
+            MirInst::TypeAlias { name, target } => {
+                env.define(name.clone(), Value::String(target.clone()), false);
+                pc += 1;
+            }
+            // α.3: 枚举定义 — env 中定义 name → Dict(variant → String)
+            MirInst::EnumDef { name, variants } => {
+                let mut enum_map = std::collections::HashMap::new();
+                for v in variants {
+                    enum_map.insert(v.name.clone(), Value::String(v.name.clone()));
+                }
+                env.define(name.clone(), Value::Dict(enum_map), false);
+                pc += 1;
+            }
+            // α.3: 结构体定义 — env 中定义 name → Closure(构造器)
+            MirInst::StructDef { name, fields } => {
+                let field_names: Vec<String> = fields.iter().map(|f| f.name.clone()).collect();
+                env.define(
+                    name.clone(),
+                    Value::Closure {
+                        params: field_names,
+                        env: crate::value::EnvRef::from_arc_mutex(interp.core.environment.clone()),
+                        v2_node_id: None,
+                    },
+                    false,
+                );
+                pc += 1;
+            }
             MirInst::TaskDef { .. } => {
                 // task 定义已在 run_mir 入口扫描注册，此处跳过
                 pc += 1;

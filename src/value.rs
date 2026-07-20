@@ -154,8 +154,9 @@ pub enum Value {
     Task {
         name: String,
         params: Vec<String>,
-        /// v2 body: 存储 arena 中的 NodeId 索引
-        v2_body_ids: Vec<usize>,
+        /// α.10: MIR-built task 体（α.7/α.8 trait/impl/skill 由 MIR lowering 填）。
+        /// 调用方一律走 run_mir；不再保留 v2 arena fallback。
+        mir_body: std::sync::Arc<crate::mir::MirFunction>,
     },
     /// v0.54: 工具声明 — 可被 AI 调用的命名工具
     Tool {
@@ -163,8 +164,8 @@ pub enum Value {
         description: String,
         params: Vec<String>,
         return_type: Option<String>,
-        /// v2 body: 存储 arena 中的 NodeId 索引
-        v2_body_ids: Vec<usize>,
+        /// α.10: MIR-built tool body。
+        mir_body: std::sync::Arc<crate::mir::MirFunction>,
     },
     Closure {
         params: Vec<String>,
@@ -172,8 +173,10 @@ pub enum Value {
         /// instead of Arc<Mutex<Environment>>. Callers convert via
         /// EnvRef::from_arc_mutex(arc) for legacy Arc<Mutex<>> sources.
         env: EnvRef,
-        /// v2 模式: 闭包表达式在 arena 中的 NodeId
-        v2_node_id: Option<usize>,
+        /// α.10/α.11: MIR-built 闭包体。所有 closure 必须有 body；
+        /// dispatch 走 run_mir 不再有 arena fallback（AGENTS_CODE_MODIFICATION §28）。
+        /// Arc 而非 Rc 以保留 Value: Send + Sync（http_server 跨 task 共享 Value）。
+        mir_body: std::sync::Arc<crate::mir::MirFunction>,
     },
     Builtin(BuiltinKind),
     // v10: 多轮对话对象

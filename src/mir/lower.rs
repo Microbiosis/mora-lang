@@ -18,6 +18,24 @@ pub fn lower_program(stmt_ids: &[NodeId], arena: &AstArena) -> Result<MirFunctio
     Ok(l.finish())
 }
 
+/// α.11: 单表达式 lowering。返回一个含单个 Expr 指令序列的 MirFunction，
+/// 末尾追加 Return(dst) 让 run_mir 返回表达式的值。
+/// 用于从 orchestrator / trait_dispatch 等替代 self.evaluate(*node_id, arena)。
+pub fn lower_expr_only(expr_id: NodeId, arena: &AstArena) -> Result<MirFunction, String> {
+    let mut l = Lowerer::new();
+    let dst = l.lower_expr(expr_id, arena)?;
+    l.emit(MirInst::Return(Some(dst)));
+    Ok(l.finish())
+}
+
+/// α.11: 单语句 lowering（用于 call_value_inner / call_task_inner 的 arena 替代）。
+/// 末尾追加 Return 最后一个寄存器的值（如果 stmt 是 Expr）。
+pub fn lower_stmt_only(stmt_id: NodeId, arena: &AstArena) -> Result<MirFunction, String> {
+    let mut l = Lowerer::new();
+    l.lower_stmt(stmt_id, arena)?;
+    Ok(l.finish())
+}
+
 struct Lowerer {
     next_reg: Reg,
     insts: Vec<MirInst>,
@@ -55,6 +73,7 @@ impl Lowerer {
 
     // ── 表达式 lowering：返回结果所在的寄存器 ──
 
+    #[allow(unreachable_patterns)]
     fn lower_expr(&mut self, eid: NodeId, arena: &AstArena) -> Result<Reg, String> {
         let expr = arena
             .get_expr(eid)
@@ -171,8 +190,45 @@ impl Lowerer {
                 });
                 Ok(dst)
             }
+            // α.10: 闭包字面量 — 递归 lower body 成嵌套 MirFunction（独立寄存器空间）。
+            // 模板与 TaskDef 一致：return_type 字段被丢弃（typeck 独立处理）。
+            ExprKind::Closure {
+                params,
+                return_type: _,
+                body,
+            } => {
+                let param_names: Vec<String> = params.iter().map(|(n, _)| n.clone()).collect();
+                let mut body_lowerer = Lowerer::new();
+                for sid in body {
+                    body_lowerer.lower_stmt(*sid, arena)?;
+                }
+                let body_mir = body_lowerer.finish();
+                let dst = self.alloc_reg();
+                self.emit(MirInst::Closure {
+                    dst,
+                    params: param_names,
+                    body: Box::new(body_mir),
+                });
+                Ok(dst)
+            }
+            // α.12: `expr as dyn Trait` → MirInst::DynTrait
+            ExprKind::DynTrait {
+                expr,
+                trait_generics,
+                trait_name,
+            } => {
+                let src = self.lower_expr(*expr, arena)?;
+                let dst = self.alloc_reg();
+                self.emit(MirInst::DynTrait {
+                    dst,
+                    src,
+                    trait_generics: trait_generics.clone(),
+                    trait_name: trait_name.clone(),
+                });
+                Ok(dst)
+            }
             _ => Err(format!(
-                "lower_expr: ExprKind {:?} not yet supported (α.1)",
+                "lower_expr: ExprKind {:?} not yet supported (α.10)",
                 std::mem::discriminant(&expr.kind)
             )),
         }
@@ -180,6 +236,7 @@ impl Lowerer {
 
     // ── 语句 lowering ──
 
+    #[allow(unreachable_patterns)]
     fn lower_stmt(&mut self, sid: NodeId, arena: &AstArena) -> Result<(), String> {
         let stmt = arena
             .get_stmt(sid)
@@ -517,10 +574,335 @@ impl Lowerer {
                 self.emit(MirInst::Rollback);
                 Ok(())
             }
-            _ => Err(format!(
-                "lower_stmt: StmtKind {:?} not yet supported (α.2)",
-                std::mem::discriminant(&stmt.kind)
-            )),
+            // α.5: macro def — 注册宏到环境（body 内容不 lower，宏在运行期展开）
+            StmtKind::MacroDef {
+                name,
+                params,
+                body: _,
+            } => {
+                self.emit(MirInst::MacroDef {
+                    name: name.clone(),
+                    params: params.clone(),
+                });
+                Ok(())
+            }
+            // α.5: commit — no-op
+            StmtKind::Commit => Ok(()),
+            // α.5: worker — 并发 worker（顺序执行 body）
+            StmtKind::Worker { name, body } => {
+                let mut body_lowerer = Lowerer::new();
+                for s in body {
+                    body_lowerer.lower_stmt(*s, arena)?;
+                }
+                let body_mir = body_lowerer.finish();
+                self.emit(MirInst::Worker {
+                    name: name.clone(),
+                    body: Box::new(body_mir),
+                });
+                Ok(())
+            }
+            // α.5: route — 路由声明（不实现，解释器返回错误）
+            StmtKind::Route { name, target: _ } => {
+                self.emit(MirInst::Route(name.clone()));
+                Ok(())
+            }
+            // α.5: observe — 可观测性块（执行 body，配置记录但不副作用）
+            StmtKind::Observe { config, body } => {
+                let config_str = match config {
+                    crate::ast_v2::ObserveConfig::Trace => "trace".to_string(),
+                    crate::ast_v2::ObserveConfig::Metrics => "metrics".to_string(),
+                    crate::ast_v2::ObserveConfig::Otel { endpoint: _ } => "otel".to_string(),
+                };
+                let mut body_lowerer = Lowerer::new();
+                for s in body {
+                    body_lowerer.lower_stmt(*s, arena)?;
+                }
+                let body_mir = body_lowerer.finish();
+                self.emit(MirInst::Observe {
+                    config: config_str,
+                    body: Box::new(body_mir),
+                });
+                Ok(())
+            }
+            // α.5: span — 追踪 span（执行 body，name 记录但不执行实际追踪）
+            StmtKind::Span {
+                name,
+                attributes: _,
+                body,
+            } => {
+                let mut body_lowerer = Lowerer::new();
+                for s in body {
+                    body_lowerer.lower_stmt(*s, arena)?;
+                }
+                let body_mir = body_lowerer.finish();
+                self.emit(MirInst::Span {
+                    name: name.clone(),
+                    body: Box::new(body_mir),
+                });
+                Ok(())
+            }
+            // α.5: record_tokens — 记录 token 输入输出（no-op）
+            StmtKind::RecordTokens { input, output } => {
+                let input_str = format!("{}", input.0);
+                let output_str = format!("{}", output.0);
+                self.emit(MirInst::RecordTokens {
+                    input: input_str,
+                    output: output_str,
+                });
+                Ok(())
+            }
+            // α.6: save — 将 value 序列化为文件
+            StmtKind::Save { path, value } => {
+                let path_reg = self.lower_expr(*path, arena)?;
+                let val_reg = self.lower_expr(*value, arena)?;
+                self.emit(MirInst::Save {
+                    path: path_reg,
+                    value: val_reg,
+                });
+                Ok(())
+            }
+            // α.6: load — 从文件加载 JSON 值
+            StmtKind::Load { path, var } => {
+                let path_reg = self.lower_expr(*path, arena)?;
+                self.emit(MirInst::Load {
+                    path: path_reg,
+                    var: var.clone(),
+                });
+                Ok(())
+            }
+            // α.6: read_file — 读取文件为字符串
+            StmtKind::ReadFile { path, var } => {
+                let path_reg = self.lower_expr(*path, arena)?;
+                self.emit(MirInst::ReadFile {
+                    path: path_reg,
+                    var: var.clone(),
+                });
+                Ok(())
+            }
+            // α.6: write_file — 将 content 写入文件
+            StmtKind::WriteFile { path, content } => {
+                let path_reg = self.lower_expr(*path, arena)?;
+                let content_reg = self.lower_expr(*content, arena)?;
+                self.emit(MirInst::WriteFile {
+                    path: path_reg,
+                    content: content_reg,
+                });
+                Ok(())
+            }
+            // α.6: append_file — 将 content 追加到文件
+            StmtKind::AppendFile { path, content } => {
+                let path_reg = self.lower_expr(*path, arena)?;
+                let content_reg = self.lower_expr(*content, arena)?;
+                self.emit(MirInst::AppendFile {
+                    path: path_reg,
+                    content: content_reg,
+                });
+                Ok(())
+            }
+            // α.6: read_bytes_file — 读取文件为字节数组
+            StmtKind::ReadBytesFile { path, var } => {
+                let path_reg = self.lower_expr(*path, arena)?;
+                self.emit(MirInst::ReadBytesFile {
+                    path: path_reg,
+                    var: var.clone(),
+                });
+                Ok(())
+            }
+            // α.6: write_bytes_file — 将 hex 字节写入文件
+            StmtKind::WriteBytesFile { path, content } => {
+                let path_reg = self.lower_expr(*path, arena)?;
+                let content_reg = self.lower_expr(*content, arena)?;
+                self.emit(MirInst::WriteBytesFile {
+                    path: path_reg,
+                    content: content_reg,
+                });
+                Ok(())
+            }
+            // α.7: trait def — 注册 trait 到 trait_registry + 默认实现
+            StmtKind::TraitDef {
+                name,
+                generics: _,
+                parents,
+                methods,
+                trait_where: _,
+            } => {
+                // α.11: prelower 每个 method body 成 MirFunction（与 methods 并行）。
+                let method_bodies: Vec<crate::mir::MirFunction> = methods
+                    .iter()
+                    .map(|m| {
+                        let mut l = Lowerer::new();
+                        for sid in &m.body {
+                            l.lower_stmt(*sid, arena)?;
+                        }
+                        Ok::<_, String>(l.finish())
+                    })
+                    .collect::<Result<_, _>>()?;
+                self.emit(MirInst::TraitDef {
+                    name: name.clone(),
+                    parents: parents.clone(),
+                    methods: methods.clone(),
+                    method_bodies,
+                });
+                Ok(())
+            }
+            // α.7: impl def — 注册 impl 到 impl_table + 方法到环境
+            StmtKind::ImplDef {
+                generics: _,
+                trait_generics,
+                trait_name,
+                for_type,
+                for_generics,
+                where_clause: _,
+                methods,
+            } => {
+                // α.11: prelower method bodies。
+                let method_bodies: Vec<crate::mir::MirFunction> = methods
+                    .iter()
+                    .map(|m| {
+                        let mut l = Lowerer::new();
+                        for sid in &m.body {
+                            l.lower_stmt(*sid, arena)?;
+                        }
+                        Ok::<_, String>(l.finish())
+                    })
+                    .collect::<Result<_, _>>()?;
+                self.emit(MirInst::ImplDef {
+                    trait_name: trait_name.clone(),
+                    trait_generics: trait_generics.clone(),
+                    for_type: for_type.clone(),
+                    for_generics: for_generics.clone(),
+                    methods: methods.clone(),
+                    method_bodies,
+                });
+                Ok(())
+            }
+            // α.8: orchestrate — 编排执行
+            StmtKind::Orchestrate {
+                input_var,
+                result_var,
+                kind,
+            } => {
+                use crate::ast_v2::OrchestrateKind;
+                let kind_str = match kind {
+                    OrchestrateKind::Sequential { .. } => "sequential".to_string(),
+                    OrchestrateKind::Graph { .. } => "graph".to_string(),
+                    OrchestrateKind::Loop { .. } => "loop".to_string(),
+                    OrchestrateKind::Pregel { .. } => "pregel".to_string(),
+                };
+                self.emit(MirInst::Orchestrate {
+                    input_var: input_var.clone(),
+                    result_var: result_var.clone(),
+                    kind: kind_str,
+                });
+                Ok(())
+            }
+            // α.8: eval — 断言测试
+            StmtKind::Eval {
+                name,
+                given,
+                expects,
+                tolerance,
+                replay_path,
+            } => {
+                let given_reg = self.lower_expr(*given, arena)?;
+                let expect_regs: Vec<Reg> = expects
+                    .iter()
+                    .map(|e| self.lower_expr(*e, arena))
+                    .collect::<Result<_, _>>()?;
+                self.emit(MirInst::Eval {
+                    name: name.clone(),
+                    given_reg,
+                    expects: expect_regs,
+                    tolerance: *tolerance,
+                    replay_path: replay_path.clone(),
+                });
+                Ok(())
+            }
+            // α.8: skill def — 构建 Skill Dict 到环境
+            StmtKind::SkillDef {
+                name,
+                description,
+                version,
+                requires,
+                tasks,
+                verify,
+            } => {
+                // α.11: prelower 每个 task body。
+                let task_bodies: Vec<crate::mir::MirFunction> = tasks
+                    .iter()
+                    .map(|t| {
+                        let mut l = Lowerer::new();
+                        for sid in &t.body {
+                            l.lower_stmt(*sid, arena)?;
+                        }
+                        Ok::<_, String>(l.finish())
+                    })
+                    .collect::<Result<_, _>>()?;
+                // α.11: prelower verify body。
+                let verify_body = if let Some(v) = verify {
+                    let mut l = Lowerer::new();
+                    for sid in &v.body {
+                        l.lower_stmt(*sid, arena)?;
+                    }
+                    Some(l.finish())
+                } else {
+                    None
+                };
+                self.emit(MirInst::SkillDef {
+                    name: name.clone(),
+                    description: description.clone(),
+                    version: version.clone(),
+                    requires: requires.clone(),
+                    tasks: tasks.clone(),
+                    task_bodies,
+                    verify: verify.clone(),
+                    verify_body,
+                });
+                Ok(())
+            }
+            // α.8: prompt section — 扫描 body 构建 PromptSection
+            StmtKind::PromptSection { name, body } => {
+                let mut body_lowerer = Lowerer::new();
+                for s in body {
+                    body_lowerer.lower_stmt(*s, arena)?;
+                }
+                let body_mir = body_lowerer.finish();
+                self.emit(MirInst::PromptSection {
+                    name: name.clone(),
+                    body: Box::new(body_mir),
+                });
+                Ok(())
+            }
+            // α.8: prompt set / prompt read — 在 prompt section 内部，不直接出现在顶层
+            // （这些由 prompt section 内部处理，顶层出现时当作 no-op）
+            StmtKind::PromptSet { key: _, value: _ } => Ok(()),
+            StmtKind::PromptRead(_path) => Ok(()),
+            // α.8: document section — 扫描 body 构建 DocumentSection
+            StmtKind::DocumentSection { name, body } => {
+                let mut body_lowerer = Lowerer::new();
+                for s in body {
+                    body_lowerer.lower_stmt(*s, arena)?;
+                }
+                let body_mir = body_lowerer.finish();
+                self.emit(MirInst::DocumentSection {
+                    name: name.clone(),
+                    body: Box::new(body_mir),
+                });
+                Ok(())
+            }
+            // α.8: document set / document read — 在 document section 内部处理
+            StmtKind::DocumentSet { key: _, value: _ } => Ok(()),
+            StmtKind::DocumentRead(_path) => Ok(()),
+            // α.9: 所有 StmtKind 变体均已被覆盖，此处不应出现
+            other => {
+                use std::mem;
+                // 用 _ 模式静默匹配任何遗漏变体（如果将来新增）
+                // 但编译期确保 unreachable
+                Err(format!(
+                    "lower_stmt: unexpected StmtKind variant: {:?}",
+                    mem::discriminant(other)
+                ))
+            }
         }
     }
 

@@ -142,7 +142,11 @@ mod tests {
         let closure = Value::Closure {
             params: vec!["x".to_string()],
             env: crate::value::EnvRef(Box::<crate::value::Environment>::default()),
-            v2_node_id: None,
+            mir_body: std::sync::Arc::new(crate::mir::MirFunction {
+                params: vec!["x".to_string()],
+                body: Vec::new(),
+                n_regs: 0,
+            }),
         };
         r.register("script.handler", MockHandler::Script(closure));
         assert_eq!(r.count(), 1);

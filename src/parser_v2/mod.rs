@@ -647,45 +647,6 @@ impl ParserV2 {
             result
         }
     }
-
-    fn parse_ai_model_call(&mut self, span: Span) -> NodeId {
-        // 第一参数必为 model 名字符串
-        if self.check(&TokenType::RParen) {
-            eprintln!("Parse error: ai_model: missing model name argument");
-            // 跳过 RParen, 插入空字符串 placeholder 让 parser 继续
-            self.advance();
-            return self.arena.alloc_expr(
-                ExprKind::Literal(Literal::String(String::new(), span)),
-                span,
-            );
-        }
-        let model = self.expression();
-        // 解析可选 keyword args: temperature: / max_tokens: / system:
-        let mut temperature = None;
-        let mut max_tokens = None;
-        let mut system = None;
-        while self.match_token(&[TokenType::Comma]) {
-            let key = self.consume_identifier("Expected keyword name");
-            self.consume(&TokenType::Colon, "Expected ':'");
-            let val = self.expression();
-            match key.as_str() {
-                "temperature" => temperature = Some(val),
-                "max_tokens" => max_tokens = Some(val),
-                "system" => system = Some(val),
-                other => {
-                    eprintln!("Parse error: ai_model: unknown keyword '{}'", other);
-                }
-            }
-        }
-        self.consume(&TokenType::RParen, "Expected ')'");
-        let kind = ExprKind::AiModelCall {
-            model,
-            temperature,
-            max_tokens,
-            system,
-        };
-        self.arena.alloc_expr(kind, span)
-    }
 }
 fn has_format_interpolation(s: &str) -> bool {
     let mut chars = s.chars().peekable();

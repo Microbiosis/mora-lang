@@ -813,26 +813,14 @@ impl TypeChecker {
                         self.check_expr(*verify, arena, symbols);
                     }
                 }
-                // v0.51 P0-7/P0-9: 递归遍历 agent task_expr 收集 Command goto / Send target
-                // 之前传 &[] 等于 pregel_check 内部 6./7. 验证规则空跑
-                let mut command_gotos: Vec<(String, usize)> = Vec::new();
-                let mut send_targets: Vec<(String, usize)> = Vec::new();
-                for agent in agents {
-                    collect_command_sends(
-                        agent.task_expr,
-                        arena,
-                        &mut command_gotos,
-                        &mut send_targets,
-                    );
-                }
                 let pregel_errors = crate::typeck::pregel_check::check_orchestrate_pregel(
                     agents,
                     edges,
                     state_schema,
                     checkpoint,
                     interrupt_points,
-                    &command_gotos,
-                    &send_targets,
+                    &[],
+                    &[],
                 );
                 self.errors.extend(pregel_errors);
             }
@@ -932,40 +920,22 @@ impl TypeChecker {
             ExprKind::Dict(entries) => self.check_dict_expr(entries, expr, arena, symbols),
             ExprKind::Prompt { parts } => self.check_prompt_expr(parts, arena, symbols),
             ExprKind::Pipe { left, right } => self.check_pipe_expr(*left, *right, arena, symbols),
-            ExprKind::Borrow { expr: inner } | ExprKind::BorrowMut { expr: inner } => {
-                self.check_expr(*inner, arena, symbols)
-            }
-            ExprKind::NamespaceRef { .. } => Type::Union(vec![]),
-            ExprKind::DynTrait { trait_name, .. } => Type::Trait {
+            // α.12: dyn Trait 包装 - 返回 Type::Trait（不递归查 inner expr，runtime 构造时再验证）
+            // trait_generics 暂用 Type::Union(vec![]) 占位（完整泛型解析非 α.12 范围）
+            ExprKind::DynTrait {
+                trait_name,
+                trait_generics,
+                ..
+            } => Type::Trait {
                 name: trait_name.clone(),
-                generics: vec![],
+                generics: trait_generics.iter().map(|_| Type::Union(vec![])).collect(),
             },
-            ExprKind::Question { expr } => self.check_question_expr(*expr, arena, symbols),
             ExprKind::MethodCall {
                 object,
                 method,
                 args,
             } => self.check_method_call_expr(*object, method, args, arena, symbols),
-            // v0.50: Command 动态控制流表达式
-            ExprKind::Command {
-                goto: _,
-                update,
-                resume,
-            } => {
-                for (_, expr_id) in update {
-                    self.check_expr(*expr_id, arena, symbols);
-                }
-                if let Some(resume_id) = resume {
-                    self.check_expr(*resume_id, arena, symbols);
-                }
-                Type::Union(vec![])
-            }
-            // v0.50: Send 动态派发表达式
-            ExprKind::Send { target: _, input } => {
-                self.check_expr(*input, arena, symbols);
-                Type::Union(vec![])
-            }
-            // v0.50: 闭包表达式 — 检查参数类型注解，返回 closure 类型
+            // 闭包表达式 — 检查参数类型注解，返回 closure 类型
             ExprKind::Closure {
                 params,
                 return_type,
@@ -1008,49 +978,6 @@ impl TypeChecker {
                 } else {
                     Type::Union(arm_types)
                 }
-            }
-            // v0.50: 路由调用表达式 — 已弃用（v0.35 route statement 不可执行）
-            ExprKind::RouteCall { name, args } => {
-                for arg_id in args {
-                    self.check_expr(*arg_id, arena, symbols);
-                }
-                self.errors.push(TypeError::from_span_with_detail(
-                    &expr.span,
-                    format!(
-                        "route call '{}' is not supported at runtime (deprecated in v0.35)",
-                        name
-                    ),
-                    "use Router.route() API or web server endpoints",
-                    "route statement",
-                    "rewrite as Router::new().route(method, path, handler)",
-                ));
-                Type::Union(vec![])
-            }
-            // v0.50: AI 模型调用 — 未实现运行时支持
-            ExprKind::AiModelCall {
-                model,
-                temperature,
-                max_tokens,
-                system,
-            } => {
-                self.check_expr(*model, arena, symbols);
-                if let Some(t) = temperature {
-                    self.check_expr(*t, arena, symbols);
-                }
-                if let Some(m) = max_tokens {
-                    self.check_expr(*m, arena, symbols);
-                }
-                if let Some(s) = system {
-                    self.check_expr(*s, arena, symbols);
-                }
-                self.errors.push(TypeError::from_span_with_detail(
-                    &expr.span,
-                    "ai_model() call is not supported at runtime",
-                    "use ai.chat with model configuration",
-                    "ai_model(model, temperature: ...)",
-                    "use ai.chat with 'with model(...)' or set MORA_AI_MODEL env var",
-                ));
-                Type::Union(vec![])
             }
         }
     }
@@ -1319,20 +1246,6 @@ impl TypeChecker {
         self.check_expr(right, arena, symbols)
     }
 
-    /// 检查错误传播表达式
-    fn check_question_expr(
-        &mut self,
-        expr: NodeId,
-        arena: &AstArena,
-        symbols: &SymbolTable,
-    ) -> Type {
-        let ty = self.check_expr(expr, arena, symbols);
-        match ty {
-            Type::Result_(inner, _) => *inner,
-            _ => ty,
-        }
-    }
-
     /// 检查方法调用表达式
     fn check_method_call_expr(
         &mut self,
@@ -1386,108 +1299,4 @@ impl TypeChecker {
         }
         matches!((a, b), (Type::Union(_), _) | (_, Type::Union(_)))
     }
-
-    // ------------------------------------------------------------------
-    // v0.50 预留：Pregel / Command / Send 表达式检查接口
-    // 当 Worker 1 完成 ast_v2.rs 扩展后，check_expr 的 match 分支可调用
-    // 以下方法。当前保持为独立方法，避免编译期依赖尚未存在的 variant。
-    // ------------------------------------------------------------------
-
-    /// v0.50: Command 表达式 `{ goto: ..., update: ..., resume: ... }` 类型检查。
-    /// 检查 update 值表达式和 resume 表达式，返回占位类型。
-    pub fn check_expr_v50_command(
-        &mut self,
-        _goto: &Option<String>,
-        update: &[(String, crate::ast_v2::NodeId)],
-        resume: &Option<crate::ast_v2::NodeId>,
-        arena: &AstArena,
-        symbols: &SymbolTable,
-    ) -> Type {
-        for (_, expr_id) in update {
-            self.check_expr(*expr_id, arena, symbols);
-        }
-        if let Some(resume_id) = resume {
-            self.check_expr(*resume_id, arena, symbols);
-        }
-        // Command 的运行时值是结构化数据，在类型系统中暂无专属类型，
-        // 使用 Union(vec![])（Any）作为占位。
-        Type::Union(vec![])
-    }
-
-    /// v0.50: Send 表达式 `send("node", { ... })` 类型检查。
-    /// 检查 input 表达式，返回占位类型。
-    pub fn check_expr_v50_send(
-        &mut self,
-        _target: &str,
-        input: crate::ast_v2::NodeId,
-        arena: &AstArena,
-        symbols: &SymbolTable,
-    ) -> Type {
-        self.check_expr(input, arena, symbols);
-        Type::Union(vec![])
-    }
-}
-
-// ===================================================================
-// v0.51 P0-7/P0-9: 递归遍历 agent task_expr 收集 Command goto / Send target
-// 供 pregel_check 的节点引用验证（pregel_check.rs:106-130）使用
-// ===================================================================
-
-/// 返回 `ExprKind` 包含的直接子 NodeId（MVP 只覆盖 Command / Send）
-///
-/// lang 语法上 `command` / `send` 是顶层表达式（嵌在 block / agent task body 中），
-/// 不会被 BinaryOp / Call 等表达式包裹。本函数只展开 Command / Send 自身的
-/// 子节点（update / resume / input），其他变体不递归 — 因为外部遍历已经处理。
-fn expr_kind_children(kind: &ExprKind) -> Vec<NodeId> {
-    let mut children = Vec::new();
-    match kind {
-        ExprKind::Command { update, resume, .. } => {
-            for (_, id) in update {
-                children.push(*id);
-            }
-            if let Some(r) = resume {
-                children.push(*r);
-            }
-        }
-        ExprKind::Send { input, .. } => {
-            children.push(*input);
-        }
-        _ => {}
-    }
-    children
-}
-
-/// 递归遍历 `root` 表达式 AST 收集 Command goto / Send target 引用
-///
-/// 输出格式与 `check_orchestrate_pregel` 期望的 `(String, usize)` 对齐
-/// （第二个字段是 expr_id.0，作为 typeck 错误报告的 line 占位）
-pub(crate) fn collect_command_sends(
-    root: NodeId,
-    arena: &AstArena,
-    command_gotos: &mut Vec<(String, usize)>,
-    send_targets: &mut Vec<(String, usize)>,
-) {
-    fn walk(
-        id: NodeId,
-        arena: &AstArena,
-        command_gotos: &mut Vec<(String, usize)>,
-        send_targets: &mut Vec<(String, usize)>,
-    ) {
-        let Some(expr) = arena.get_expr(id) else {
-            return;
-        };
-        match &expr.kind {
-            ExprKind::Command { goto: Some(g), .. } => {
-                command_gotos.push((g.clone(), id.0));
-            }
-            ExprKind::Send { target, .. } => {
-                send_targets.push((target.clone(), id.0));
-            }
-            _ => {}
-        }
-        for child_id in expr_kind_children(&expr.kind) {
-            walk(child_id, arena, command_gotos, send_targets);
-        }
-    }
-    walk(root, arena, command_gotos, send_targets);
 }

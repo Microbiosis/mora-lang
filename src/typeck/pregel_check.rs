@@ -276,47 +276,6 @@ fn check_agent_name_uniqueness(agents: &[OrchestrateAgent], errors: &mut Vec<Typ
 }
 
 // ===================================================================
-// 兼容接口：为 check.rs 的 ExprKind::Command / Send 预留
-// 当 check_expr 直接处理这些 variant 后，以下方法可逐步移除。
-// ===================================================================
-
-/// v0.50 预留：Command 表达式 `{ goto: ..., update: ..., resume: ... }` 类型检查。
-/// 检查 update 值表达式和 resume 表达式，返回占位类型。
-///
-/// 当前 `check_expr` 已直接处理 `ExprKind::Command`，此方法保留供外部调用者使用。
-pub fn check_command_placeholder(
-    _goto: &Option<String>,
-    update: &[(String, crate::ast_v2::NodeId)],
-    resume: &Option<crate::ast_v2::NodeId>,
-    type_checker: &mut crate::typeck::TypeChecker,
-    arena: &crate::ast_v2::AstArena,
-    symbols: &crate::typeck::SymbolTable,
-) -> crate::typeck::Type {
-    for (_, expr_id) in update {
-        type_checker.check_expr(*expr_id, arena, symbols);
-    }
-    if let Some(resume_id) = resume {
-        type_checker.check_expr(*resume_id, arena, symbols);
-    }
-    crate::typeck::Type::Union(vec![])
-}
-
-/// v0.50 预留：Send 表达式 `send("node", { ... })` 类型检查。
-/// 检查 input 表达式，返回占位类型。
-///
-/// 当前 `check_expr` 已直接处理 `ExprKind::Send`，此方法保留供外部调用者使用。
-pub fn check_send_placeholder(
-    _target: &str,
-    input: crate::ast_v2::NodeId,
-    type_checker: &mut crate::typeck::TypeChecker,
-    arena: &crate::ast_v2::AstArena,
-    symbols: &crate::typeck::SymbolTable,
-) -> crate::typeck::Type {
-    type_checker.check_expr(input, arena, symbols);
-    crate::typeck::Type::Union(vec![])
-}
-
-// ===================================================================
 // 单元测试
 // ===================================================================
 

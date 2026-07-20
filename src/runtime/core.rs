@@ -1,18 +1,17 @@
 //! v0.52 ADR-001: CoreRuntime — 语言执行必需的薄核心
 //!
-//! 从 Interpreter god object 抽出的 8 个核心执行字段（globals/environment/tool_registry/
-//! v2_arena/current_ai_config/config_stack/worker_channels/worker_receivers），
+//! 从 Interpreter god object 抽出的 7 个核心执行字段（globals/environment/tool_registry/
+//! current_ai_config/config_stack/worker_channels/worker_receivers），
 //! 是解释器运行所必需的最小状态容器。
 
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::ast_v2::AstArena;
 use crate::interpreter::{AiConfigValue, ToolDef};
 use crate::value::{Environment, Value};
 
-/// 语言执行必需的薄核心（8 字段）。
+/// 语言执行必需的薄核心（7 字段）。
 /// 注：ToolDef 不含 Debug，所以 CoreRuntime 不 derive Debug。
 #[derive(Clone)]
 pub struct CoreRuntime {
@@ -22,8 +21,6 @@ pub struct CoreRuntime {
     pub(crate) environment: Arc<Mutex<Environment>>,
     /// 工具注册表（MCP / builtin tool 的运行时注册）
     pub(crate) tool_registry: Arc<HashMap<String, ToolDef>>,
-    /// v2 AST arena — 在 interpret 期间存储，供 call_value 执行 v2 闭包
-    pub(crate) v2_arena: Option<Arc<AstArena>>,
     /// 当前 with 块 set 的 AiConfig 值
     pub(crate) current_ai_config: Option<AiConfigValue>,
     /// with 块 config 保存/恢复栈（MIR 解释器用）
@@ -41,7 +38,6 @@ impl Default for CoreRuntime {
             globals: env.clone(),
             environment: env,
             tool_registry: Arc::new(HashMap::new()),
-            v2_arena: None,
             current_ai_config: None,
             config_stack: Vec::new(),
             worker_channels: HashMap::new(),
@@ -65,12 +61,6 @@ mod tests {
     fn core_tool_registry_empty() {
         let core = CoreRuntime::default();
         assert!(core.tool_registry.is_empty());
-    }
-
-    #[test]
-    fn core_v2_arena_default_none() {
-        let core = CoreRuntime::default();
-        assert!(core.v2_arena.is_none());
     }
 
     #[test]

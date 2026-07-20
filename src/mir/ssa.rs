@@ -516,13 +516,40 @@ fn split_into_ssa(
             | MirInst::StreamFor { .. }
             | MirInst::MatchExpr { .. }
             | MirInst::MatchArm { .. }
+            | MirInst::Closure { .. }
             | MirInst::TypeAlias { .. }
             | MirInst::EnumDef { .. }
             | MirInst::StructDef { .. }
             | MirInst::Transaction { .. }
             | MirInst::Send { .. }
             | MirInst::Receive { .. }
-            | MirInst::Rollback => {}
+            | MirInst::Rollback
+            // α.5: 宏/运行时/可观测性 — SSA 中跳过
+            | MirInst::MacroDef { .. }
+            | MirInst::Commit
+            | MirInst::Worker { .. }
+            | MirInst::Route(_)
+            | MirInst::Observe { .. }
+            | MirInst::Span { .. }
+            | MirInst::RecordTokens { .. }
+            // α.6: 文件 I/O — SSA 中跳过
+            | MirInst::Save { .. }
+            | MirInst::Load { .. }
+            | MirInst::ReadFile { .. }
+            | MirInst::WriteFile { .. }
+            | MirInst::AppendFile { .. }
+            | MirInst::ReadBytesFile { .. }
+            | MirInst::WriteBytesFile { .. }
+            // α.7: 类型系统 — SSA 中跳过
+            | MirInst::TraitDef { .. }
+            | MirInst::ImplDef { .. }
+            // α.8: 高级特性 — SSA 中跳过
+            | MirInst::Orchestrate { .. }
+            | MirInst::Eval { .. }
+            | MirInst::SkillDef { .. }
+            | MirInst::PromptSection { .. }
+            | MirInst::DocumentSection { .. } => {}
+            | MirInst::DynTrait { .. } => {}
         }
     }
 

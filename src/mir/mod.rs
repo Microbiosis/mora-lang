@@ -94,6 +94,23 @@ pub enum MirInst {
         body: Box<MirFunction>,
     },
 
+    /// α.10: 闭包字面量。body 是嵌套 MirFunction（独立寄存器空间），
+    /// 解释器构造 Value::Closure { mir_body: Arc<MirFunction> }。
+    /// 调用时 dispatch 直接走 run_mir。
+    Closure {
+        dst: Reg,
+        params: Vec<String>,
+        body: Box<MirFunction>,
+    },
+    /// α.12: dyn Trait 包装。解释器构造 Value::TraitObject { data, trait_name }。
+    /// vtable 派发由  处理（call_method 命中 TraitObject 分支）。
+    DynTrait {
+        dst: Reg,
+        src: Reg,
+        trait_generics: Vec<String>,
+        trait_name: String,
+    },
+
     /// α.2: tool 定义。body 是嵌套 MirFunction；params/return_type 用于 schema。
     /// 解释器注册为 Value::Tool 到 environment + ToolDef 到 tool_registry。
     ToolDef {
@@ -127,7 +144,6 @@ pub enum MirInst {
     },
 
     // ── 类型定义语句（α.3: 与 AST execute 语义一致）──
-
     /// α.3: 类型别名。定义 `name` → `target` 的字符串映射。
     TypeAlias {
         name: String,
@@ -146,8 +162,14 @@ pub enum MirInst {
         fields: Vec<crate::common::StructField>,
     },
 
-    // ── 运行时特性（α.4: transaction / worker）──
+    // ── 宏定义（α.5: 与 AST execute_macro_def 语义一致）──
+    /// α.5: macro def — 注册 Value::Macro(name, params) 到环境。
+    MacroDef {
+        name: String,
+        params: Vec<String>,
+    },
 
+    // ── 运行时特性（α.4: transaction / worker）──
     /// α.4: 事务。body 执行成功则正常返回；失败则执行 compensation 后返回错误。
     Transaction {
         body: Box<MirFunction>,
@@ -168,6 +190,145 @@ pub enum MirInst {
 
     /// α.4: rollback — 触发事务回滚（返回 "Transaction rolled back" 错误）。
     Rollback,
+
+    /// α.5: worker — 并发 worker。body 顺序执行（与 AST 语义一致）。
+    Worker {
+        name: String,
+        body: Box<MirFunction>,
+    },
+
+    /// α.5: commit — 事务提交（no-op，与 AST 语义一致）。
+    Commit,
+
+    /// α.5: route — 路由声明（不实现，返回错误）。
+    Route(String),
+
+    /// α.5: observe — 可观测性块。执行 body，配置信息记录但无副作用。
+    Observe {
+        config: String,
+        body: Box<MirFunction>,
+    },
+
+    /// α.5: span — 追踪 span。执行 body，name 记录但不执行实际追踪。
+    Span {
+        name: String,
+        body: Box<MirFunction>,
+    },
+
+    /// α.5: record_tokens — 记录 token 输入输出（no-op）。
+    RecordTokens {
+        input: String,
+        output: String,
+    },
+
+    // ── 文件 I/O（α.6: Save/Load/ReadFile/WriteFile/AppendFile/ReadBytesFile/WriteBytesFile）──
+    /// α.6: save — 将 value 序列化为文件。
+    Save {
+        path: Reg,
+        value: Reg,
+    },
+
+    /// α.6: load — 从文件加载 JSON 值并绑定到 var。
+    Load {
+        path: Reg,
+        var: String,
+    },
+
+    /// α.6: read_file — 读取文件为字符串，绑定到 var。
+    ReadFile {
+        path: Reg,
+        var: String,
+    },
+
+    /// α.6: write_file — 将 content 写入文件。
+    WriteFile {
+        path: Reg,
+        content: Reg,
+    },
+
+    /// α.6: append_file — 将 content 追加到文件。
+    AppendFile {
+        path: Reg,
+        content: Reg,
+    },
+
+    /// α.6: read_bytes_file — 读取文件为字节数组，绑定到 var。
+    ReadBytesFile {
+        path: Reg,
+        var: String,
+    },
+
+    /// α.6: write_bytes_file — 将 hex 字节写入文件。
+    WriteBytesFile {
+        path: Reg,
+        content: Reg,
+    },
+
+    // ── 类型系统（α.7: TraitDef/ImplDef）──
+    /// α.7: trait def — 注册 trait 到 trait_registry，并注册默认实现。
+    /// method_bodies 长度与 methods 一致；body 为空的 method 对应位置为 dummy MirFunction。
+    TraitDef {
+        name: String,
+        parents: Vec<String>,
+        methods: Vec<crate::ast_v2::TraitMethod>,
+        /// α.11: prelowered method bodies (parallel to methods)，让默认实现走 run_mir。
+        method_bodies: Vec<MirFunction>,
+    },
+
+    /// α.7: impl def — 注册 impl 到 impl_table，并将方法注册到环境。
+    ImplDef {
+        trait_name: String,
+        trait_generics: Vec<String>,
+        for_type: String,
+        for_generics: Vec<String>,
+        methods: Vec<crate::ast_v2::FnDef>,
+        /// α.11: prelowered method bodies (parallel to methods)，让 impl 方法走 run_mir。
+        method_bodies: Vec<MirFunction>,
+    },
+
+    // ── 高级特性（α.8: orchestrate/skill/prompt/document/eval）──
+    /// α.8: orchestrate — 编排执行，结果绑定到 result_var。
+    /// input_var 为输入变量名，kind 为编排类型字符串。
+    Orchestrate {
+        input_var: String,
+        result_var: String,
+        kind: String,
+    },
+
+    /// α.8: eval — 断言测试：给定 given 值，检查 expects 表达式。
+    Eval {
+        name: String,
+        given_reg: Reg,
+        expects: Vec<Reg>,
+        tolerance: Option<f64>,
+        replay_path: Option<String>,
+    },
+
+    /// α.8: skill def — 构建 Skill Dict（name/description/version/requires/tasks/verify）到环境。
+    SkillDef {
+        name: String,
+        description: Option<String>,
+        version: Option<String>,
+        requires: Vec<String>,
+        tasks: Vec<crate::ast_v2::SkillTask>,
+        /// α.11: prelowered task bodies (parallel to tasks)。
+        task_bodies: Vec<MirFunction>,
+        verify: Option<crate::ast_v2::SkillVerify>,
+        /// α.11: prelowered verify body。
+        verify_body: Option<MirFunction>,
+    },
+
+    /// α.8: prompt section — 扫描 body，构建 Value::PromptSection 到环境。
+    PromptSection {
+        name: String,
+        body: Box<MirFunction>,
+    },
+
+    /// α.8: document section — 扫描 body，构建 Value::DocumentSection 到环境。
+    DocumentSection {
+        name: String,
+        body: Box<MirFunction>,
+    },
 
     // ── 控制流（替代 FlowSignal 枚举传返）──
     Label(Label),

@@ -1095,28 +1095,48 @@ impl Interpreter {
 
     pub(crate) fn call_value(&mut self, value: &Value, args: Vec<Value>) -> Result<Value, String> {
         match value {
-            Value::Closure { v2_node_id, .. } => {
-                if v2_node_id.is_some() {
-                    if let Some(ref arena) = self.core.v2_arena.clone() {
-                        return self.call_value_inner(value, args, arena);
-                    }
-                    return Err("v2 closure requires arena".to_string());
-                }
-                Err("v1 closure not supported in v2 mode".to_string())
-            }
-            Value::Task { v2_body_ids, .. } if v2_body_ids.is_empty() => {
-                Err("v1 task not supported in v2 mode".to_string())
-            }
-            Value::Task {
+            // α.10: MIR-built closure — 走 run_mir。
+            Value::Closure {
+                mir_body,
                 params,
-                v2_body_ids,
+                env,
                 ..
             } => {
-                if let Some(ref arena) = self.core.v2_arena.clone() {
-                    return self.call_task_inner(params, v2_body_ids, args, arena);
+                if args.len() < params.len() {
+                    return Err(format!(
+                        "closure expects {} args, got {}",
+                        params.len(),
+                        args.len()
+                    ));
                 }
-                Err("v2 task requires arena".to_string())
+                let mut child_env = Environment::with_parent_of(std::sync::Arc::new(
+                    parking_lot::Mutex::new(env.0.as_ref().clone()),
+                ));
+                for (i, param) in params.iter().enumerate() {
+                    let val = args.get(i).cloned().unwrap_or(Value::Nil);
+                    child_env.define(param.clone(), val, false);
+                }
+                crate::mir::interp::run_mir(mir_body, self, &mut child_env)
             }
+            // α.11: MIR-built task — 走 run_mir。
+            Value::Task {
+                mir_body, params, ..
+            } => {
+                if args.len() < params.len() {
+                    return Err(format!(
+                        "task expects {} args, got {}",
+                        params.len(),
+                        args.len()
+                    ));
+                }
+                let mut child_env = Environment::with_parent_of(self.core.environment.clone());
+                for (i, param) in params.iter().enumerate() {
+                    let val = args.get(i).cloned().unwrap_or(Value::Nil);
+                    child_env.define(param.clone(), val, false);
+                }
+                crate::mir::interp::run_mir(mir_body, self, &mut child_env)
+            }
+            // α.10: Compose/Partial 链路递归 call_value。
             Value::Compose(funcs) => {
                 let mut result = args;
                 for f in funcs {
@@ -1128,168 +1148,6 @@ impl Interpreter {
                 let mut all_args = partial_args.clone();
                 all_args.extend(args);
                 self.call_value(func, all_args)
-            }
-            _ => Err(format!("Value is not callable: {}", value)),
-        }
-    }
-
-    /// v2 版 call_task —— 通过 arena 执行 task body
-    pub(super) fn call_task_inner(
-        &mut self,
-        params: &[String],
-        body_ids: &[usize],
-        args: Vec<Value>,
-        arena: &crate::ast_v2::AstArena,
-    ) -> Result<Value, String> {
-        let call_env = Arc::new(Mutex::new(Environment::with_parent_of(
-            self.core.environment.clone(),
-        )));
-        // v0.35 (P0-C4): surface arity errors instead of silently nil-filling.
-        if args.len() < params.len() {
-            return Err(format!(
-                "task expects {} args, got {}",
-                params.len(),
-                args.len()
-            ));
-        }
-        for (i, param) in params.iter().enumerate() {
-            let value = args
-                .get(i)
-                .cloned()
-                .ok_or_else(|| format!("missing arg for parameter '{}'", param))?;
-            call_env.lock().define(param.clone(), value, false);
-        }
-        let prev_env = self.core.environment.clone();
-        self.core.environment = call_env;
-        // 单表达式 body：直接返回表达式值（与 closure 行为一致）
-        if body_ids.len() == 1
-            && let Some(stmt) = arena.get_stmt(crate::ast_v2::NodeId(body_ids[0]))
-            && let crate::ast_v2::StmtKind::Expr(expr_id) = &stmt.kind
-        {
-            let result = self.evaluate(*expr_id, arena);
-            self.core.environment = prev_env;
-            return result;
-        }
-        for body_idx in body_ids {
-            let body_id = crate::ast_v2::NodeId(*body_idx);
-            if let Some(stmt) = arena.get_stmt(body_id) {
-                let kind = stmt.kind.clone();
-                // v0.52 Bug C 根因修复：跟踪 last_value（与 call_value_inner 闭包逻辑一致）
-                let (signal, _value) = self.execute(&kind, arena)?;
-                match signal {
-                    FlowSignal::None => {}
-                    FlowSignal::Return(val) => {
-                        self.core.environment = prev_env;
-                        return Ok(val);
-                    }
-                    signal => {
-                        self.core.environment = prev_env;
-                        return Err(format!("Unexpected signal in task: {:?}", signal));
-                    }
-                }
-            }
-        }
-        self.core.environment = prev_env;
-        Ok(Value::Nil)
-    }
-
-    /// v2 版 call_value —— 支持通过 arena 执行 v2 闭包
-    pub(crate) fn call_value_inner(
-        &mut self,
-        value: &Value,
-        args: Vec<Value>,
-        arena: &crate::ast_v2::AstArena,
-    ) -> Result<Value, String> {
-        match value {
-            Value::Closure {
-                env, v2_node_id, ..
-            } => {
-                if let Some(node_id) = v2_node_id {
-                    // v2 闭包: 从 arena 获取 body 并执行
-                    let node_id = crate::ast_v2::NodeId(*node_id);
-                    // node_id 可能是 ExprKind::Closure 或 StmtKind 中的闭包表达式
-                    let closure_info = arena.get_expr(node_id).and_then(|expr| {
-                        if let crate::ast_v2::ExprKind::Closure { params, body, .. } = &expr.kind {
-                            Some((params.clone(), body.clone()))
-                        } else {
-                            None
-                        }
-                    });
-                    if let Some((closure_params, closure_body)) = closure_info {
-                        // 使用子环境（避免 mutex 死锁）
-                        let call_env =
-                            Arc::new(Mutex::new(crate::value::Environment::with_parent_of(
-                                Arc::new(Mutex::new((*env.0).clone())),
-                            )));
-                        // 绑定参数 — v0.35 (P0-C4): arity check
-                        if args.len() < closure_params.len() {
-                            return Err(format!(
-                                "closure expects {} args, got {}",
-                                closure_params.len(),
-                                args.len()
-                            ));
-                        }
-                        for (i, (pname, _)) in closure_params.iter().enumerate() {
-                            let val = args
-                                .get(i)
-                                .cloned()
-                                .ok_or_else(|| format!("missing arg for parameter '{}'", pname))?;
-                            call_env.lock().define(pname.clone(), val, false);
-                        }
-                        let prev_env = self.core.environment.clone();
-                        self.core.environment = call_env;
-                        // v0.52 Bug C 根因修复：跟踪 last_value
-                        // pre-existing: body 是 expression stmt 形式（`fn(c,n) n end`）时，
-                        // execute 内部 `StmtKind::Expr` 丢弃 expr value。
-                        // 修复后：execute 返回 (FlowSignal, Option<Value>)，
-                        // 我们跟踪 last Some(value) 作为最终 return value。
-                        let mut last_value: Option<Value> = None;
-                        for body_id in &closure_body {
-                            if let Some(stmt) = arena.get_stmt(*body_id) {
-                                let kind = stmt.kind.clone();
-                                let (signal, value) = self.execute(&kind, arena)?;
-                                if value.is_some() {
-                                    last_value = value;
-                                }
-                                match signal {
-                                    FlowSignal::None => {}
-                                    FlowSignal::Return(val) => {
-                                        self.core.environment = prev_env;
-                                        return Ok(val);
-                                    }
-                                    signal => {
-                                        self.core.environment = prev_env;
-                                        return Err(format!(
-                                            "Unexpected signal in closure: {:?}",
-                                            signal
-                                        ));
-                                    }
-                                }
-                            }
-                        }
-                        self.core.environment = prev_env;
-                        // 优先返回 last_value（裸 expression stmt 的 value），否则 Nil
-                        return Ok(last_value.unwrap_or(Value::Nil));
-                    }
-                    Err(format!("Invalid v2 closure node: {}", node_id.0))
-                } else {
-                    Err("v1 closure not supported in v2 mode".to_string())
-                }
-            }
-            Value::Task { .. } => {
-                Err("v1 task not supported in v2 mode, use call_value".to_string())
-            }
-            Value::Compose(funcs) => {
-                let mut result = args;
-                for f in funcs {
-                    result = vec![self.call_value_inner(f, result, arena)?];
-                }
-                Ok(result.into_iter().next().unwrap_or(Value::Nil))
-            }
-            Value::Partial(func, partial_args) => {
-                let mut all_args = partial_args.clone();
-                all_args.extend(args);
-                self.call_value_inner(func, all_args, arena)
             }
             _ => Err(format!("Value is not callable: {}", value)),
         }

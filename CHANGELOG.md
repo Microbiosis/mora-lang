@@ -2,6 +2,26 @@
 
 All notable changes to Mora will be documented in this file.
 
+## [Unreleased] — Tier 0 → Tier 1 默认解释器切换完成
+
+MIR 解释器（Tier 1）现已接管所有 5 个语言面（语法/语义/类型/标准库/运行时）的生产执行路径。`run_file` / `run_record` / `run_replay` / `run_snapshot` / REPL (`mora --repl`) 均直接调用 `mora::mir::interp::run_mir` + `run_main_task`，不再走 `Interpreter::interpret` / `execute` / `evaluate`。`MORA_INTERP` 环境变量与 `interpreter_mode()` 已删除。
+
+**保留**的 Tier 0 调用面：
+
+1. `tests/mir_differential.rs` — 差分测试（AST 行为作基准）
+2. `Interpreter::mir_call_function` / `mir_call_method` / `mir_import` / `mir_with_config` — MIR 调用 AST builtin 层的桥接
+3. `Interpreter::evaluate` / `call_value_inner` / `call_task_inner` — 仅服务于 builtin 派发
+
+### Added
+- `src/mir/interp.rs`: 新增 `MirSignal` enum 与 `run_mir_with_signal` / `run_main_task_with_signal`，供 REPL 与差分测试观察 Return/Break/Continue 出口。
+- `src/mir/`: α.5-α.8 全套新增 MirInst（MacroDef / Worker / Commit / Route / Observe / Span / RecordTokens / Save / Load / ReadFile / WriteFile / AppendFile / ReadBytesFile / WriteBytesFile / TraitDef / ImplDef / Orchestrate / Eval / SkillDef / PromptSection / DocumentSection），覆盖所有剩余 `StmtKind` 变体。
+- `src/mir/lower.rs`: `lower_stmt` 现已覆盖所有 41 个 `StmtKind` 变体；`#[allow(unreachable_patterns)]` 标注于 catch-all 上。
+- `tests/tier0_replacement.rs`: 7 个集成测试覆盖 syntax / semantics / type-system / stdlib / runtime 五面，断言执行路径不依赖 AST `interpret`/`execute`。
+
+### Changed
+- `src/main.rs`: 删除 `interpreter_mode()` 与 AST fallback；`run_file` / `run_record` / `run_replay` / `run_snapshot` 全部走 MIR lowering。
+- `src/interpreter/mod.rs::run_repl_with`: REPL 现在调用 `mora::mir::lower::lower_program` + `mora::mir::interp::run_mir`，跨行 task 定义通过累积 `MirInst::TaskDef` 维持注册表。
+
 ## [v0.49.0] - 2026-07-07 — 并发安全 + 正确性 + 资源泄漏 (15 fixes)
 
 1 commit; v0.49 audit follow-up (per user request: check simple implementations for high-concurrency / high-pressure correctness).

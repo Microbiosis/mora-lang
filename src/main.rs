@@ -367,11 +367,6 @@ fn update_lock(pkg_name: &str, url: &str) {
     }
 }
 
-/// 解释器模式：MORA_INTERP=ast 回退到 AST 解释器，默认走 MIR 解释器（Tier 1）
-fn interpreter_mode() -> String {
-    env::var("MORA_INTERP").unwrap_or_else(|_| "mir".to_string())
-}
-
 fn run_file(path: &str) {
     let source = fs::read_to_string(path).expect("Failed to read file");
 
@@ -388,36 +383,24 @@ fn run_file(path: &str) {
         process::exit(2);
     }
 
-    match interpreter_mode().as_str() {
-        "mir" => {
-            // α.4: MIR 解释器路径
-            let func = match mora::mir::lower::lower_program(&node_ids, &arena) {
-                Ok(f) => f,
-                Err(e) => {
-                    eprintln!("MIR lowering error: {}", e);
-                    process::exit(1);
-                }
-            };
-            let mut interpreter = Interpreter::new();
-            let mut env = interpreter.take_env();
-            if let Err(e) = mora::mir::interp::run_mir(&func, &mut interpreter, &mut env) {
-                eprintln!("Runtime error (MIR): {}", e);
-                process::exit(1);
-            }
-            // 执行完顶层语句后查找并调用 main task（与 AST 路径一致）
-            if let Err(e) = mora::mir::interp::run_main_task(&func, &mut interpreter, &mut env) {
-                eprintln!("Runtime error (MIR main): {}", e);
-                process::exit(1);
-            }
+    // Tier 1: MIR 解释器是唯一执行引擎
+    let func = match mora::mir::lower::lower_program(&node_ids, &arena) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("MIR lowering error: {}", e);
+            process::exit(1);
         }
-        _ => {
-            // 默认 AST 解释器
-            let mut interpreter = Interpreter::new();
-            if let Err(e) = interpreter.interpret(&node_ids, &arena) {
-                eprintln!("Runtime error: {}", e);
-                process::exit(1);
-            }
-        }
+    };
+    let mut interpreter = Interpreter::new();
+    let mut env = interpreter.take_env();
+    if let Err(e) = mora::mir::interp::run_mir(&func, &mut interpreter, &mut env) {
+        eprintln!("Runtime error (MIR): {}", e);
+        process::exit(1);
+    }
+    // 执行完顶层语句后查找并调用 main task
+    if let Err(e) = mora::mir::interp::run_main_task(&func, &mut interpreter, &mut env) {
+        eprintln!("Runtime error (MIR main): {}", e);
+        process::exit(1);
     }
 }
 
@@ -456,6 +439,15 @@ fn run_record(path: &str, name: &str) {
         process::exit(2);
     }
 
+    // Tier 1: MIR lowering
+    let func = match mora::mir::lower::lower_program(&node_ids, &arena) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("record: MIR lowering error: {}", e);
+            process::exit(1);
+        }
+    };
+
     let rec_path = recording_path(name);
     let mut interpreter = Interpreter::new();
     interpreter.infra_mut().replace_recorder(
@@ -467,9 +459,17 @@ fn run_record(path: &str, name: &str) {
             }
         },
     );
+    let mut env = interpreter.take_env();
 
-    match interpreter.interpret(&node_ids, &arena) {
-        Ok(()) => {
+    match mora::mir::interp::run_mir(&func, &mut interpreter, &mut env) {
+        Ok(_) => {
+            // 执行 main task
+            if let Err(e) = mora::mir::interp::run_main_task(&func, &mut interpreter, &mut env) {
+                let _ = interpreter.infra_mut().recorder().save();
+                eprintln!("Runtime error during record: {}", e);
+                eprintln!("(partial recording saved)");
+                process::exit(1);
+            }
             if let Err(e) = interpreter.infra_mut().recorder().save() {
                 eprintln!("record: save failed: {}", e);
                 process::exit(1);
@@ -503,6 +503,15 @@ fn run_replay(path: &str, name: &str) {
         process::exit(2);
     }
 
+    // Tier 1: MIR lowering
+    let func = match mora::mir::lower::lower_program(&node_ids, &arena) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("replay: MIR lowering error: {}", e);
+            process::exit(1);
+        }
+    };
+
     let rec_path = recording_path(name);
     let mut interpreter = Interpreter::new();
     interpreter.infra_mut().replace_recorder(
@@ -514,9 +523,14 @@ fn run_replay(path: &str, name: &str) {
             }
         },
     );
+    let mut env = interpreter.take_env();
 
-    if let Err(e) = interpreter.interpret(&node_ids, &arena) {
+    if let Err(e) = mora::mir::interp::run_mir(&func, &mut interpreter, &mut env) {
         eprintln!("Runtime error during replay: {}", e);
+        process::exit(1);
+    }
+    if let Err(e) = mora::mir::interp::run_main_task(&func, &mut interpreter, &mut env) {
+        eprintln!("Runtime error during replay main: {}", e);
         process::exit(1);
     }
     println!(
@@ -718,8 +732,23 @@ fn run_snapshot(file: &str, name: &str, update: bool) {
         eprintln!("snapshot: typeck failed");
         process::exit(2);
     }
+
+    // Tier 1: MIR lowering
+    let func = match mora::mir::lower::lower_program(&node_ids, &arena) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("snapshot: MIR lowering error: {}", e);
+            process::exit(1);
+        }
+    };
+
     let mut interpreter = Interpreter::new();
-    if let Err(e) = interpreter.interpret(&node_ids, &arena) {
+    let mut env = interpreter.take_env();
+    if let Err(e) = mora::mir::interp::run_mir(&func, &mut interpreter, &mut env) {
+        eprintln!("snapshot: runtime error: {}", e);
+        process::exit(1);
+    }
+    if let Err(e) = mora::mir::interp::run_main_task(&func, &mut interpreter, &mut env) {
         eprintln!("snapshot: runtime error: {}", e);
         process::exit(1);
     }

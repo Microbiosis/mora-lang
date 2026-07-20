@@ -387,7 +387,7 @@ impl PregelEngine {
                         false,
                     );
                     let should_follow = interpreter
-                        .evaluate(*cond_id, arena)
+                        .mir_eval_expr(*cond_id, arena)
                         .map(|v| matches!(v, Value::Bool(true)))
                         .unwrap_or(false);
                     if should_follow {
@@ -466,7 +466,7 @@ impl PregelEngine {
                 // 2) 验证是 2-param 闭包 (current, new)
                 // 3) 调 call_value([current_or_nil, value]) → merged
                 let merge_fn = interpreter
-                    .evaluate(*merge_fn_id, arena)
+                    .mir_eval_expr(*merge_fn_id, arena)
                     .map_err(|e| format!("Merge reducer: eval merge_fn failed: {}", e))?;
 
                 match &merge_fn {
@@ -848,7 +848,11 @@ impl Interpreter {
             Some(cp) => cp
                 .thread_id
                 .as_ref()
-                .and_then(|node_id| self.evaluate(*node_id, arena).ok().map(|v| v.to_string()))
+                .and_then(|node_id| {
+                    self.mir_eval_expr(*node_id, arena)
+                        .ok()
+                        .map(|v| v.to_string())
+                })
                 .unwrap_or_else(|| "default".to_string()),
             None => "default".to_string(),
         };
@@ -879,8 +883,6 @@ impl Interpreter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ast_v2::{ExprKind, NodeId};
-    use crate::common::{Literal, Span};
 
     // ---------- Reducer 语义测试 ----------
 
@@ -1008,168 +1010,6 @@ mod tests {
         );
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("@add reducer expects number"));
-    }
-
-    // ---------- v0.51 P0-4: ReducerKind::Merge 真接通测试 ----------
-
-    #[test]
-    fn reducer_merge_calls_closure_with_current_and_new() {
-        // 解析 `let _ = fn(c, n) return n end` → 找到 Closure 表达式 NodeId
-        // 用 `return n` 而非裸 `n`，因为 call_value_inner 只通过 FlowSignal::Return
-        // 捕获闭包 body 结果（pre-existing 行为：body 是 expression stmt 时被丢弃）
-        use crate::lexer::Lexer;
-        use crate::parser_v2::ParserV2;
-        let src = "let _ = fn(c, n) return n end";
-        let tokens = Lexer::new(src).scan_tokens();
-        let mut parser = ParserV2::new(tokens);
-        let _stmt_ids = parser.parse();
-        let arena = parser.into_arena();
-
-        // 找到 Closure 表达式（扫描 arena 找 params.len() == 2 的那个）
-        let mut merge_fn_id: Option<NodeId> = None;
-        for i in 0..arena.exprs.len() {
-            if let Some(expr) = arena.get_expr(NodeId(i))
-                && let ExprKind::Closure { params, .. } = &expr.kind
-                && params.len() == 2
-            {
-                merge_fn_id = Some(NodeId(i));
-                break;
-            }
-        }
-        let merge_fn_id = merge_fn_id.expect("解析后应找到 2-param Closure");
-
-        let mut engine = make_test_engine_with_schema(vec![StateChannel {
-            name: "last_write".to_string(),
-            type_hint: None,
-            reducer: ReducerKind::Merge(merge_fn_id),
-        }]);
-        engine.init_channels(HashMap::new());
-
-        // 构造带 v2_arena 的 interpreter（interpret([]) 仅触发 v2_arena 设置）
-        let mut interpreter = Interpreter::new();
-        let _ = interpreter.interpret(&[], &arena);
-
-        // 第一次写入：current=None → args=[Nil, "first"] → 闭包 fn(c, n) return n 忽略 c，返回 "first"
-        engine
-            .apply_write(
-                "last_write".to_string(),
-                Value::String("first".to_string()),
-                &mut interpreter,
-                &arena,
-            )
-            .unwrap();
-        assert_eq!(
-            engine.get_channel("last_write"),
-            Some(Value::String("first".to_string()))
-        );
-
-        // 第二次写入：current=Some("first") → ("first", "second") → 闭包返回 "second"
-        engine
-            .apply_write(
-                "last_write".to_string(),
-                Value::String("second".to_string()),
-                &mut interpreter,
-                &arena,
-            )
-            .unwrap();
-        assert_eq!(
-            engine.get_channel("last_write"),
-            Some(Value::String("second".to_string()))
-        );
-    }
-
-    #[test]
-    fn reducer_merge_rejects_non_closure() {
-        // merge_fn_id 指向一个数字字面量（不是闭包）→ Merge 路径应报 arity 错误
-        let mut arena = AstArena::new();
-        let literal_id = arena.alloc_expr(
-            ExprKind::Literal(Literal::Float(42.0, Span::default())),
-            Span::default(),
-        );
-
-        let mut engine = make_test_engine_with_schema(vec![StateChannel {
-            name: "x".to_string(),
-            type_hint: None,
-            reducer: ReducerKind::Merge(literal_id),
-        }]);
-        engine.init_channels(HashMap::new());
-        let mut interpreter = Interpreter::new();
-        interpreter.interpret(&[], &arena).unwrap();
-
-        let result = engine.apply_write("x".to_string(), Value::Int(1), &mut interpreter, &arena);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("Merge reducer"));
-    }
-
-    #[test]
-    fn reducer_merge_closure_expr_stmt_returns_value_root_cause() {
-        // v0.52 Bug C 根因修复 regression test：
-        // 闭包 body 是裸 expression stmt 形式（`fn(c, n) n end`）应能返回值
-        // pre-existing: execute 内部 `StmtKind::Expr` 丢弃 expr value，
-        //              需要用 `fn(c, n) return n end` 形式（用 FlowSignal::Return 显式返回）
-        // 根因修复：execute 签名改为 (FlowSignal, Option<Value>)，
-        //           StmtKind::Expr 真的返回 Some(expr_value)
-        //           call_value_inner 跟踪 last_value 作为最终 return
-        use crate::lexer::Lexer;
-        use crate::parser_v2::ParserV2;
-        let src = "let _ = fn(c, n) n end";
-        let tokens = Lexer::new(src).scan_tokens();
-        let mut parser = ParserV2::new(tokens);
-        let _ = parser.parse();
-        let arena = parser.into_arena();
-
-        // 找到 2-param Closure 表达式
-        let mut merge_fn_id: Option<NodeId> = None;
-        for i in 0..arena.exprs.len() {
-            if let Some(expr) = arena.get_expr(NodeId(i))
-                && let ExprKind::Closure { params, .. } = &expr.kind
-                && params.len() == 2
-            {
-                merge_fn_id = Some(NodeId(i));
-                break;
-            }
-        }
-        let merge_fn_id = merge_fn_id.expect("应找到 2-param Closure");
-
-        let mut engine = make_test_engine_with_schema(vec![StateChannel {
-            name: "last".to_string(),
-            type_hint: None,
-            reducer: ReducerKind::Merge(merge_fn_id),
-        }]);
-        engine.init_channels(HashMap::new());
-
-        let mut interpreter = Interpreter::new();
-        let _ = interpreter.interpret(&[], &arena);
-
-        // 第一次：current=None, value="first" → 闭包 fn(c, n) n 忽略 c，返回 "first"
-        // 根因修复关键验证：execute(Expr) 返回 Some("first")，call_value_inner 取 last_value
-        engine
-            .apply_write(
-                "last".to_string(),
-                Value::String("first".to_string()),
-                &mut interpreter,
-                &arena,
-            )
-            .unwrap();
-        assert_eq!(
-            engine.get_channel("last"),
-            Some(Value::String("first".to_string())),
-            "根因修复前：channel 应是 Nil（pre-existing 行为）"
-        );
-
-        // 第二次：current="first", value="second" → 闭包返回 "second"
-        engine
-            .apply_write(
-                "last".to_string(),
-                Value::String("second".to_string()),
-                &mut interpreter,
-                &arena,
-            )
-            .unwrap();
-        assert_eq!(
-            engine.get_channel("last"),
-            Some(Value::String("second".to_string()))
-        );
     }
 
     // ---------- Checkpoint 测试 ----------

@@ -2,7 +2,38 @@ use super::*;
 
 impl ParserV2 {
     pub(super) fn expression(&mut self) -> NodeId {
-        self.pipe()
+        let mut expr = self.pipe();
+        // α.12: `expr as dyn Trait<args>` 包装为 ExprKind::DynTrait
+        while self.match_token(&[TokenType::As]) {
+            let span = self.span_of_current();
+            if !self.check(&TokenType::Dyn) {
+                eprintln!("Parse error: 'as' must be followed by 'dyn Trait'");
+                break;
+            }
+            self.advance(); // consume 'dyn'
+            let trait_name = self.consume_identifier("Expected trait name after 'dyn'");
+            let mut trait_generics = Vec::new();
+            if self.check(&TokenType::Less) {
+                self.advance();
+                if !self.check(&TokenType::Greater) {
+                    loop {
+                        let g = self.consume_identifier("Expected generic param");
+                        trait_generics.push(g);
+                        if !self.match_token(&[TokenType::Comma]) {
+                            break;
+                        }
+                    }
+                }
+                self.consume(&TokenType::Greater, "Expected '>' after generics");
+            }
+            let kind = ExprKind::DynTrait {
+                expr,
+                trait_generics,
+                trait_name,
+            };
+            expr = self.arena.alloc_expr(kind, span);
+        }
+        expr
     }
 
     fn pipe(&mut self) -> NodeId {
@@ -55,14 +86,6 @@ impl ParserV2 {
                 // 函数调用
                 let span = self.span_of_current();
                 self.advance();
-                // 检查是否是 ai_model 调用
-                if let Some(e) = self.arena.get_expr(expr)
-                    && let ExprKind::Variable(name) = &e.kind
-                    && name == "ai_model"
-                {
-                    expr = self.parse_ai_model_call(span);
-                    continue;
-                }
                 let mut args = Vec::new();
                 if !self.check(&TokenType::RParen) {
                     // 跳过参数前的换行
@@ -80,24 +103,15 @@ impl ParserV2 {
                 }
                 self.consume(&TokenType::RParen, "Expected ')'");
                 // 检查是否是变量调用
-                if let Some(e) = self.arena.get_expr(expr) {
-                    match &e.kind {
-                        ExprKind::Variable(name) => {
-                            let kind = ExprKind::Call {
-                                callee: name.clone(),
-                                args,
-                            };
-                            expr = self.arena.alloc_expr(kind, span);
-                            continue;
-                        }
-                        ExprKind::NamespaceRef { namespace, name } => {
-                            let callee = format!("{}::{}", namespace, name);
-                            let kind = ExprKind::Call { callee, args };
-                            expr = self.arena.alloc_expr(kind, span);
-                            continue;
-                        }
-                        _ => {}
-                    }
+                if let Some(e) = self.arena.get_expr(expr)
+                    && let ExprKind::Variable(name) = &e.kind
+                {
+                    let kind = ExprKind::Call {
+                        callee: name.clone(),
+                        args,
+                    };
+                    expr = self.arena.alloc_expr(kind, span);
+                    continue;
                 }
             } else if self.check(&TokenType::Dot) {
                 // 方法调用
@@ -131,12 +145,6 @@ impl ParserV2 {
                     object: expr,
                     index,
                 };
-                expr = self.arena.alloc_expr(kind, span);
-            } else if self.check(&TokenType::Question) {
-                // 错误传播
-                self.advance(); // consume '?'
-                let span = self.span_of_current();
-                let kind = ExprKind::Question { expr };
                 expr = self.arena.alloc_expr(kind, span);
             } else {
                 break;
@@ -395,21 +403,7 @@ impl ParserV2 {
                 let generics = self.parse_type_list();
                 ns_or_name = format!("{}<{}>", ns_or_name, generics.join(","));
             }
-            // 检查是否是 NamespaceRef (IDENT::IDENT)
-            if self.match_token(&[TokenType::ColonColon]) {
-                let method = self.consume_identifier("Expected name after '::'");
-                let kind = ExprKind::NamespaceRef {
-                    namespace: ns_or_name,
-                    name: method,
-                };
-                self.arena.alloc_expr(kind, span)
-            } else {
-                self.arena.alloc_expr(ExprKind::Variable(ns_or_name), span)
-            }
-        } else if self.check(&TokenType::Command) {
-            self.command_expression(span)
-        } else if self.check(&TokenType::Send) {
-            self.send_expression(span)
+            self.arena.alloc_expr(ExprKind::Variable(ns_or_name), span)
         } else if self.check(&TokenType::LParen) {
             self.advance();
             let expr = self.expression();
@@ -442,99 +436,6 @@ impl ParserV2 {
             self.arena
                 .alloc_expr(ExprKind::Literal(Literal::Nil(span)), span)
         }
-    }
-
-    /// v0.50: 解析 Command 表达式
-    /// command { goto: "node_name", update: { key: expr }, resume: expr }
-    fn command_expression(&mut self, span: Span) -> NodeId {
-        self.advance(); // consume 'command'
-        self.consume(&TokenType::LBrace, "Expected '{'");
-        let mut goto = None;
-        let mut update = Vec::new();
-        let mut resume = None;
-        while !self.check(&TokenType::RBrace) && !self.is_at_end() {
-            while self.check(&TokenType::Newline) {
-                self.advance();
-            }
-            if self.check(&TokenType::RBrace) || self.is_at_end() {
-                break;
-            }
-            let key = self.consume_identifier("Expected field name");
-            self.consume(&TokenType::Colon, "Expected ':'");
-            match key.as_str() {
-                "goto" => {
-                    if let Some(Token {
-                        token_type: TokenType::String(s),
-                        ..
-                    }) = self.peek().cloned()
-                    {
-                        goto = Some(s);
-                        self.advance();
-                    } else {
-                        eprintln!("Parse error: command.goto expects string literal");
-                        self.expression(); // consume for error recovery
-                    }
-                }
-                "update" => {
-                    self.consume(&TokenType::LBrace, "Expected '{'");
-                    while !self.check(&TokenType::RBrace) && !self.is_at_end() {
-                        while self.check(&TokenType::Newline) {
-                            self.advance();
-                        }
-                        if self.check(&TokenType::RBrace) || self.is_at_end() {
-                            break;
-                        }
-                        let ukey = self.consume_identifier("Expected update key");
-                        self.consume(&TokenType::Colon, "Expected ':'");
-                        let uval = self.expression();
-                        update.push((ukey, uval));
-                        if !self.match_token(&[TokenType::Comma]) {
-                            break;
-                        }
-                    }
-                    self.consume(&TokenType::RBrace, "Expected '}'");
-                }
-                "resume" => {
-                    resume = Some(self.expression());
-                }
-                other => {
-                    eprintln!("Parse error: Unknown command field '{}'", other);
-                    self.expression(); // consume for error recovery
-                }
-            }
-            if !self.match_token(&[TokenType::Comma]) {
-                break;
-            }
-        }
-        self.consume(&TokenType::RBrace, "Expected '}'");
-        let kind = ExprKind::Command {
-            goto,
-            update,
-            resume,
-        };
-        self.arena.alloc_expr(kind, span)
-    }
-
-    /// v0.50: 解析 Send 表达式
-    /// send("target", input_expr)
-    fn send_expression(&mut self, span: Span) -> NodeId {
-        self.advance(); // consume 'send'
-        self.consume(&TokenType::LParen, "Expected '('");
-        let target = if let Some(Token {
-            token_type: TokenType::String(s),
-            ..
-        }) = self.peek().cloned()
-        {
-            self.advance();
-            s
-        } else {
-            self.consume_identifier("Expected target name")
-        };
-        self.consume(&TokenType::Comma, "Expected ','");
-        let input = self.expression();
-        self.consume(&TokenType::RParen, "Expected ')'");
-        let kind = ExprKind::Send { target, input };
-        self.arena.alloc_expr(kind, span)
     }
 
     fn list_literal(&mut self, span: Span) -> NodeId {

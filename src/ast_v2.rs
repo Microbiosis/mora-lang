@@ -130,40 +130,18 @@ pub enum ExprKind {
         arms: Vec<(Pattern, NodeId)>,
     },
 
+    // 动态 trait 标注（α.12）：`expr as dyn Trait` 把 expr 包装为
+    // `Value::TraitObject { trait_name, data: Box<expr> }`；后续通过 vtable
+    // 派发方法调用（dispatch_trait_method）。
+    DynTrait {
+        expr: NodeId,
+        trait_generics: Vec<String>,
+        trait_name: String,
+    },
+
     // 模板字符串
     Prompt {
         parts: Vec<NodeId>,
-    },
-
-    // 路由调用
-    RouteCall {
-        name: String,
-        args: Vec<NodeId>,
-    },
-
-    // AI 模型调用
-    AiModelCall {
-        model: NodeId,
-        temperature: Option<NodeId>,
-        max_tokens: Option<NodeId>,
-        system: Option<NodeId>,
-    },
-
-    // 错误传播
-    Question {
-        expr: NodeId,
-    },
-
-    // 命名空间引用
-    NamespaceRef {
-        namespace: String,
-        name: String,
-    },
-
-    // dyn trait 类型标注
-    DynTrait {
-        generics: Vec<String>,
-        trait_name: String,
     },
 
     // 分组
@@ -174,28 +152,6 @@ pub enum ExprKind {
 
     // 字典字面量
     Dict(Vec<(String, NodeId)>),
-
-    // v0.21: 不可变借用
-    Borrow {
-        expr: NodeId,
-    },
-
-    // v0.21: 可变借用
-    BorrowMut {
-        expr: NodeId,
-    },
-
-    // v0.50: Command 构造表达式
-    Command {
-        goto: Option<String>,
-        update: Vec<(String, NodeId)>,
-        resume: Option<NodeId>,
-    },
-    // v0.50: Send 动态派发
-    Send {
-        target: String,
-        input: NodeId,
-    },
 }
 
 // ===================================================================
@@ -739,12 +695,6 @@ pub fn walk_expr<V: AstVisitor<T>, T>(visitor: &mut V, arena: &AstArena, expr: &
             visitor.visit_expr(arena, expr)
         }
         ExprKind::Grouping(inner) => {
-            if let Some(inner_expr) = arena.get_expr(*inner) {
-                let _ = visitor.visit_expr(arena, inner_expr);
-            }
-            visitor.visit_expr(arena, expr)
-        }
-        ExprKind::Borrow { expr: inner } | ExprKind::BorrowMut { expr: inner } => {
             if let Some(inner_expr) = arena.get_expr(*inner) {
                 let _ = visitor.visit_expr(arena, inner_expr);
             }

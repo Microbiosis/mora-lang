@@ -175,10 +175,6 @@ pub(super) fn collect_references_v2(
                 crate::ast_v2::ExprKind::Grouping(inner) => {
                     walk_expr_v2(*inner, arena, name, refs);
                 }
-                crate::ast_v2::ExprKind::Borrow { expr: inner }
-                | crate::ast_v2::ExprKind::BorrowMut { expr: inner } => {
-                    walk_expr_v2(*inner, arena, name, refs);
-                }
                 _ => {}
             }
         }

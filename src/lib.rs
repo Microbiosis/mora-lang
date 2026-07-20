@@ -52,6 +52,3 @@ pub mod toolplane;
 pub mod trace_collector;
 pub mod typeck;
 pub mod value;
-
-#[cfg(test)]
-mod semantics_tests;

@@ -72,7 +72,11 @@ impl Interpreter {
             Some(cp) => cp
                 .thread_id
                 .as_ref()
-                .and_then(|node_id| self.evaluate(*node_id, arena).ok().map(|v| v.to_string()))
+                .and_then(|node_id| {
+                    self.mir_eval_expr(*node_id, arena)
+                        .ok()
+                        .map(|v| v.to_string())
+                })
                 .unwrap_or_else(|| "default".to_string()),
             None => "default".to_string(),
         };
@@ -195,7 +199,7 @@ impl Interpreter {
                                         false,
                                     );
                                 }
-                                self.evaluate(*cond_id, arena)
+                                self.mir_eval_expr(*cond_id, arena)
                                     .map(|v| matches!(v, Value::Bool(true)))
                                     .unwrap_or(false)
                             }
@@ -247,7 +251,7 @@ impl Interpreter {
                             false,
                         );
                         let should_exit = self
-                            .evaluate(*cond_id, arena)
+                            .mir_eval_expr(*cond_id, arena)
                             .map(|v| matches!(v, Value::Bool(true)))
                             .unwrap_or(false);
                         if should_exit {
@@ -288,7 +292,7 @@ impl Interpreter {
         let prev_config = self.core.current_ai_config.clone();
         if let Some(ref bindings) = agent.with_config {
             for (key, val_id) in bindings {
-                let val = self.evaluate(*val_id, arena)?;
+                let val = self.mir_eval_expr(*val_id, arena)?;
                 match key.as_str() {
                     "model" => {
                         if let Value::String(m) = val {
@@ -312,7 +316,7 @@ impl Interpreter {
         }
 
         // 执行 task 表达式
-        let result = self.evaluate(agent.task_expr, arena)?;
+        let result = self.mir_eval_expr(agent.task_expr, arena)?;
         let mut output = result.to_string();
 
         // verify（如果有的话）
@@ -324,7 +328,7 @@ impl Interpreter {
                     false,
                 );
                 let ok = self
-                    .evaluate(verify_id, arena)
+                    .mir_eval_expr(verify_id, arena)
                     .map(|v| matches!(v, Value::Bool(true)))
                     .unwrap_or(false);
                 if ok {
@@ -341,7 +345,7 @@ impl Interpreter {
                     Value::String(output.clone()),
                     false,
                 );
-                let retry = self.evaluate(agent.task_expr, arena)?;
+                let retry = self.mir_eval_expr(agent.task_expr, arena)?;
                 output = retry.to_string();
             }
         }

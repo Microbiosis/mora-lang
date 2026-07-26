@@ -87,7 +87,7 @@ Expected: ~25 lines (Value enum + Environment + FlowSignal + StreamReader signat
 Write the file with this content (extracted from interpreter.rs:39–225):
 
 ```rust
-//! v0.x: 从 interpreter.rs 抽离的运行时值/环境/控制流核心类型。
+//! v0.x:  interpreter.rs //
 
 use std::collections::HashMap;
 use std::fmt;
@@ -95,7 +95,7 @@ use std::io::{BufReader, Read};
 use std::sync::{Arc, Mutex};
 use crate::ast::Stmt;
 
-// ─── StreamReader ──────────────────────────────────────────────────────
+//  StreamReader 
 
 pub struct StreamReader(pub Arc<Mutex<BufReader<Box<dyn Read + Send + Sync>>>>);
 
@@ -124,7 +124,7 @@ impl fmt::Debug for StreamReader {
     }
 }
 
-// ─── Value ─────────────────────────────────────────────────────────────
+//  Value 
 
 #[derive(Clone)]
 pub enum Value {
@@ -160,7 +160,7 @@ impl fmt::Display for Value {
     }
 }
 
-// ─── Environment ───────────────────────────────────────────────────────
+//  Environment 
 
 #[derive(Clone, Debug)]
 pub struct Environment {
@@ -188,7 +188,7 @@ impl Environment {
     }
 }
 
-// ─── FlowSignal ────────────────────────────────────────────────────────
+//  FlowSignal 
 
 #[derive(Debug, Clone)]
 pub enum FlowSignal {
@@ -209,7 +209,7 @@ impl FlowSignal {
 Create `src/flow.rs` with stubs:
 
 ```rust
-//! v0.x: 控制流与值比较工具 (从 interpreter.rs 抽离)。
+//! v0.x:  ( interpreter.rs )
 
 pub fn values_equal(_a: &crate::value::Value, _b: &crate::value::Value) -> bool {
     unimplemented!("filled in Task 2")
@@ -309,7 +309,7 @@ Replace the stub content with the actual functions, adjusting visibility:
 Example skeleton:
 
 ```rust
-//! v0.x: 控制流与值比较工具 (从 interpreter.rs 抽离)。
+//! v0.x:  ( interpreter.rs )
 
 use crate::ast::{BinaryOp, Literal};
 use crate::value::Value;
@@ -435,9 +435,9 @@ Read `src/interpreter.rs:3586-3825` (240 LOC). Capture all 7 functions: `json_to
 - [ ] **Step 2: Create `src/json_compat.rs`**
 
 ```rust
-//! v0.x: 手写 JSON 解析器(从 interpreter.rs 抽离)。
-//! 零外部依赖,纯 std 实现。
-//! 仅在 AI 响应解析路径使用,不是公共 API 的一部分。
+//! v0.x:  JSON ( interpreter.rs )
+//! , std 
+//!  AI , API 
 
 use crate::value::Value;
 use std::collections::HashMap;
@@ -527,12 +527,12 @@ Expected: lockfile gains thiserror + thiserror-impl.
 - [ ] **Step 3: Create `src/ai_error.rs`**
 
 ```rust
-//! v0.x: 类型化 AI 错误。
+//! v0.x:  AI 
 //!
-//! 替代原 stringly-typed 错误字符串(原 is_retryable_error(&str) 模式)。
-//! 在 builtin/ai/* 与外部 mora::Result<Value, String> 之间提供结构化诊断。
+//!  stringly-typed ( is_retryable_error(&str) )
+//!  builtin/ai/*  mora::Result<Value, String> 
 //!
-//! 通过 `impl From<AiError> for String` 自动适配到 `?` 操作符,保持现有调用面不变。
+//!  `impl From<AiError> for String`  `?` ,
 
 use thiserror::Error;
 
@@ -563,7 +563,7 @@ pub enum AiError {
 }
 
 impl AiError {
-    /// 是否可重试 — 替代原 stringly-typed is_retryable_error。
+    ///  —  stringly-typed is_retryable_error
     pub fn is_retryable(&self) -> bool {
         match self {
             AiError::Network { .. } => true,
@@ -576,7 +576,7 @@ impl AiError {
     }
 }
 
-/// AiError → String 自动转换,保持 builtin/ai/* 返回 Result<_, String>。
+/// AiError → String , builtin/ai/*  Result<_, String>
 impl From<AiError> for String {
     fn from(e: AiError) -> String { e.to_string() }
 }
@@ -645,17 +645,17 @@ That happens in Task 5/6 when AiClient is introduced."
 - [ ] **Step 1: Create `src/builtin/mod.rs` (placeholder)**
 
 ```rust
-//! v0.x: 内置函数注册表与路由。
+//! v0.x: 
 
-// 子模块将由 Task 5/6/7 逐步添加。
+//  Task 5/6/7 
 ```
 
 - [ ] **Step 2: Create `src/builtin/ai/mod.rs` (placeholder)**
 
 ```rust
-//! v0.x: ai.* 内置命名空间。
+//! v0.x: ai.* 
 pub mod client;
-// chat / agent / critic / embedding 由后续任务添加。
+// chat / agent / critic / embedding 
 ```
 
 - [ ] **Step 3: Add `mod builtin;` to `src/lib.rs`**
@@ -669,11 +669,11 @@ mod builtin;
 - [ ] **Step 4: Create `src/builtin/ai/client.rs`**
 
 ```rust
-//! v0.x: 共享 HTTP client + 重试逻辑。
+//! v0.x:  HTTP client + 
 //!
-//! 替代原 interpreter.rs 中 3 处重复的 ureq::AgentBuilder + 重试循环 + 错误处理代码。
-//! 内部使用 ureq 3.3 API(已在前面 commit 升级)。
-//! 错误类型为 crate::ai_error::AiError;自动通过 From 适配到 String。
+//!  interpreter.rs  3  ureq::AgentBuilder +  + 
+//!  ureq 3.3 API( commit )
+//!  crate::ai_error::AiError; From  String
 
 use crate::ai_error::AiError;
 use std::time::Duration;
@@ -705,7 +705,7 @@ impl AiClient {
         })
     }
 
-    /// GET 请求;4xx/5xx 自动转 AiError::HttpStatus。
+    /// GET ;4xx/5xx  AiError::HttpStatus
     pub fn get(&self, url: &str) -> Result<String, AiError> {
         match self.agent.get(url).call() {
             Ok(mut response) => {
@@ -723,7 +723,7 @@ impl AiClient {
         }
     }
 
-    /// POST JSON 请求;支持可选 Authorization 头;带重试。
+    /// POST JSON ; Authorization ;
     pub fn post_json(
         &self,
         url: &str,
@@ -818,9 +818,9 @@ Public API unchanged (AiClient is pub(crate))."
 - [ ] **Step 1: Create `src/builtin/http.rs` with the web.fetch impl**
 
 ```rust
-//! v0.x: web.fetch 内置函数。
+//! v0.x: web.fetch 
 //!
-//! 替代原 interpreter.rs:2517-2574 重复的 ureq 客户端代码。
+//!  interpreter.rs:2517-2574  ureq 
 
 use crate::builtin::ai::client::AiClient;
 
@@ -835,9 +835,9 @@ pub fn web_fetch(url: &str) -> Result<String, String> {
 Read `src/interpreter.rs:2576-2706` first to extract the full `ai_chat` body (it has retry loop, response body extraction, etc.). Then:
 
 ```rust
-//! v0.x: ai.chat 内置函数。
+//! v0.x: ai.chat 
 //!
-//! 替代原 interpreter.rs:2576-2706 重复的 ureq 客户端代码。
+//!  interpreter.rs:2576-2706  ureq 
 
 use crate::builtin::ai::client::AiClient;
 use crate::value::Value;
@@ -851,7 +851,7 @@ pub fn ai_chat(base_url: &str, api_key: &str, body: &str, timeout_secs: u64) -> 
         Some(("Authorization", &format!("Bearer {}", api_key))),
         body,
     ).map_err(|e| e.to_string())?;
-    // 提取 choices[0].message.content(原 extract_ai_content)
+    //  choices[0].message.content( extract_ai_content)
     // body copied verbatim from interpreter.rs:2576-2706
     // (extract_ai_content stays in interpreter.rs initially; only the HTTP/retry/parse dispatch moves)
     Ok(Value::String(text))  // simplified
@@ -861,10 +861,10 @@ pub fn ai_chat(base_url: &str, api_key: &str, body: &str, timeout_secs: u64) -> 
 - [ ] **Step 3: Update `src/builtin/ai/mod.rs` to declare `chat`**
 
 ```rust
-//! v0.x: ai.* 内置命名空间。
+//! v0.x: ai.* 
 pub mod chat;
 pub mod client;
-// agent / critic / embedding 由后续任务添加。
+// agent / critic / embedding 
 ```
 
 - [ ] **Step 4: Delete moved code from `src/interpreter.rs`**
@@ -915,7 +915,7 @@ Public API unchanged."
 - [ ] **Step 1: Create `src/eval/mod.rs` (placeholder)**
 
 ```rust
-//! v0.x: 表达式/语句求值核心。
+//! v0.x: /
 pub mod call;
 pub mod methods;
 pub mod prompt;
@@ -943,7 +943,7 @@ Read `src/interpreter.rs:1726-2263` to extract:
 Each `call_*` method becomes a free function taking `&mut Interpreter` explicitly (they already take `&mut self`):
 
 ```rust
-//! v0.x: 函数/任务/闭包/方法调用分发。
+//! v0.x: ///
 
 use crate::ast::{Span, Stmt};
 use crate::interpreter::Interpreter;
@@ -1032,7 +1032,7 @@ Read `src/interpreter.rs:2263-2500` to extract `fn call_file_method(&self, metho
 - [ ] **Step 2: Create `src/eval/methods.rs`**
 
 ```rust
-//! v0.x: 内置方法分发(file/stream/object 等)。
+//! v0.x: (file/stream/object )
 
 use crate::interpreter::Interpreter;
 use crate::value::Value;
@@ -1078,7 +1078,7 @@ Read `src/interpreter.rs:1615-1726` for:
 - [ ] **Step 2: Create `src/eval/prompt.rs`**
 
 ```rust
-//! v0.x: prompt 与 route 参数求值。
+//! v0.x: prompt  route 
 
 use crate::ast::Expr;
 use crate::interpreter::Interpreter;
@@ -1117,10 +1117,10 @@ Read `src/interpreter.rs:3826-3870` (cosine_similarity, dot_product, euclidean_d
 - [ ] **Step 2: Create `src/builtin/ai/embedding.rs`**
 
 ```rust
-//! v0.x: 向量相似度/距离工具 + bag-of-words 嵌入。
+//! v0.x: / + bag-of-words 
 //!
-//! v0.04 补:ai.cosine/dot/euclidean/norm 推迟到 v1.0。
-//! 保留为 "v1.0 复活点" + 内部测试用。
+//! v0.04 :ai.cosine/dot/euclidean/norm  v1.0
+//!  "v1.0 " + 
 
 use crate::value::Value;
 
@@ -1156,7 +1156,7 @@ pub fn mock_bow_embedding(s: &str) -> Vec<f64> {
 pub mod chat;
 pub mod client;
 pub mod embedding;
-// agent / critic 由后续子任务添加。
+// agent / critic 
 ```
 
 - [ ] **Step 4: Delete and verify**
@@ -1189,7 +1189,7 @@ Read `src/interpreter.rs:3133-3235` (run_agent) and `3006-3132` (run_critic).
 - [ ] **Step 2: Create `src/builtin/ai/agent.rs`**
 
 ```rust
-//! v0.x: run_agent 内部方法(原 interpreter.rs:3133)。
+//! v0.x: run_agent ( interpreter.rs:3133)
 
 use crate::interpreter::Interpreter;
 use crate::value::Value;
@@ -1210,7 +1210,7 @@ pub fn run_agent(
 - [ ] **Step 3: Create `src/builtin/ai/critic.rs`**
 
 ```rust
-//! v0.x: run_critic 内部方法(原 interpreter.rs:3006)。
+//! v0.x: run_critic ( interpreter.rs:3006)
 
 use crate::interpreter::Interpreter;
 use crate::value::Value;
@@ -1268,7 +1268,7 @@ Expected: < 30 (was 104)
 The placeholder should now declare all submodules and may need helper `use` statements:
 
 ```rust
-//! v0.x: 表达式/语句求值核心。
+//! v0.x: /
 pub mod call;
 pub mod methods;
 pub mod prompt;
@@ -1277,7 +1277,7 @@ use crate::ast::Stmt;
 use crate::interpreter::Interpreter;
 use crate::value::Value;
 
-/// 求值入口 — 原 impl Interpreter::eval_expr / eval_stmt。
+///  —  impl Interpreter::eval_expr / eval_stmt
 pub fn eval_expr(interp: &mut Interpreter, expr: &crate::ast::Expr) -> Result<Value, String> { /* ... */ }
 pub fn eval_stmt(interp: &mut Interpreter, stmt: &crate::ast::Stmt) -> Result<Value, String> { /* ... */ }
 ```

@@ -2,62 +2,62 @@
 
 All notable changes to Mora will be documented in this file.
 
-## [Unreleased] — Tier 0 → Tier 1 默认解释器切换完成
+## [Unreleased] — Tier 0 → Tier 1 
 
-MIR 解释器（Tier 1）现已接管所有 5 个语言面（语法/语义/类型/标准库/运行时）的生产执行路径。`run_file` / `run_record` / `run_replay` / `run_snapshot` / REPL (`mora --repl`) 均直接调用 `mora::mir::interp::run_mir` + `run_main_task`，不再走 `Interpreter::interpret` / `execute` / `evaluate`。`MORA_INTERP` 环境变量与 `interpreter_mode()` 已删除。
+MIR Tier 1 5 ////`run_file` / `run_record` / `run_replay` / `run_snapshot` / REPL (`mora --repl`)  `mora::mir::interp::run_mir` + `run_main_task` `Interpreter::interpret` / `execute` / `evaluate``MORA_INTERP`  `interpreter_mode()` 
 
-**保留**的 Tier 0 调用面：
+**** Tier 0 
 
-1. `tests/mir_differential.rs` — 差分测试（AST 行为作基准）
-2. `Interpreter::mir_call_function` / `mir_call_method` / `mir_import` / `mir_with_config` — MIR 调用 AST builtin 层的桥接
-3. `Interpreter::evaluate` / `call_value_inner` / `call_task_inner` — 仅服务于 builtin 派发
+1. `tests/mir_differential.rs` — AST 
+2. `Interpreter::mir_call_function` / `mir_call_method` / `mir_import` / `mir_with_config` — MIR  AST builtin 
+3. `Interpreter::evaluate` / `call_value_inner` / `call_task_inner` —  builtin 
 
 ### Added
-- `src/mir/interp.rs`: 新增 `MirSignal` enum 与 `run_mir_with_signal` / `run_main_task_with_signal`，供 REPL 与差分测试观察 Return/Break/Continue 出口。
-- `src/mir/`: α.5-α.8 全套新增 MirInst（MacroDef / Worker / Commit / Route / Observe / Span / RecordTokens / Save / Load / ReadFile / WriteFile / AppendFile / ReadBytesFile / WriteBytesFile / TraitDef / ImplDef / Orchestrate / Eval / SkillDef / PromptSection / DocumentSection），覆盖所有剩余 `StmtKind` 变体。
-- `src/mir/lower.rs`: `lower_stmt` 现已覆盖所有 41 个 `StmtKind` 变体；`#[allow(unreachable_patterns)]` 标注于 catch-all 上。
-- `tests/tier0_replacement.rs`: 7 个集成测试覆盖 syntax / semantics / type-system / stdlib / runtime 五面，断言执行路径不依赖 AST `interpret`/`execute`。
+- `src/mir/interp.rs`:  `MirSignal` enum  `run_mir_with_signal` / `run_main_task_with_signal` REPL  Return/Break/Continue 
+- `src/mir/`: α.5-α.8  MirInstMacroDef / Worker / Commit / Route / Observe / Span / RecordTokens / Save / Load / ReadFile / WriteFile / AppendFile / ReadBytesFile / WriteBytesFile / TraitDef / ImplDef / Orchestrate / Eval / SkillDef / PromptSection / DocumentSection `StmtKind` 
+- `src/mir/lower.rs`: `lower_stmt`  41  `StmtKind` `#[allow(unreachable_patterns)]`  catch-all 
+- `tests/tier0_replacement.rs`: 7  syntax / semantics / type-system / stdlib / runtime  AST `interpret`/`execute`
 
 ### Changed
-- `src/main.rs`: 删除 `interpreter_mode()` 与 AST fallback；`run_file` / `run_record` / `run_replay` / `run_snapshot` 全部走 MIR lowering。
-- `src/interpreter/mod.rs::run_repl_with`: REPL 现在调用 `mora::mir::lower::lower_program` + `mora::mir::interp::run_mir`，跨行 task 定义通过累积 `MirInst::TaskDef` 维持注册表。
+- `src/main.rs`:  `interpreter_mode()`  AST fallback`run_file` / `run_record` / `run_replay` / `run_snapshot`  MIR lowering
+- `src/interpreter/mod.rs::run_repl_with`: REPL  `mora::mir::lower::lower_program` + `mora::mir::interp::run_mir` task  `MirInst::TaskDef` 
 
-## [v0.49.0] - 2026-07-07 — 并发安全 + 正确性 + 资源泄漏 (15 fixes)
+## [v0.49.0] - 2026-07-07 —  +  +  (15 fixes)
 
 1 commit; v0.49 audit follow-up (per user request: check simple implementations for high-concurrency / high-pressure correctness).
 
-### Category A: 并发安全 (6 fixes)
+### Category A:  (6 fixes)
 
 | # | Fix | File | Test |
 |---|---|---|---|
-| A1+B1 | CapabilityStore 加 `current_generation`; revoke 改 bump 它; check 校验 token.generation == current_generation (was: revoke 实际不生效) | `src/sandbox/capability.rs:200-273` | revoke_invalidates_token_immediately + stress race |
-| A2 | `mora.refine` builtin: drop lock before session.refine() (I/O 移出临界区). RefineSession::refine 返回 owned RefineStep 而非 &RefineStep | `src/interpreter/builtins.rs:1745-1755`, `src/refine/mod.rs:107-154` | 7/7 refine builtin tests |
-| A3 | mora.refine 改 + RefineStep clone 共享 — 50 thread 并发不死锁 | `src/stress_tests.rs:stress_refine_concurrent` |
-| A4 | Semaphore::release 改 Ordering::AcqRel (was SeqCst, lighter barrier); acquire 改 AcqRel/Acquire (was SeqCst) | `src/interpreter/builtins.rs:2065-2090` | stress_semaphore_cas |
-| A5 | CapabilityStore::check 改 inline lookup (不再调 get() clone) — 单锁内 get + check + generation 校验 | `src/sandbox/capability.rs:264-281` | stress_capability_check_throughput (100k check/sec) |
-| A6 | Interpreter.ai_cache / string_interner / draft_model_stats 改 Arc<Mutex<>> 包装 (was raw HashMap, 多线程不安全) | `src/interpreter/mod.rs:155-205, 271-313`, `src/interpreter/ai_chat.rs:323-364, 411-414, 506-516` | stress_lru_concurrent (100 thread put) |
+| A1+B1 | CapabilityStore  `current_generation`; revoke  bump ; check  token.generation == current_generation (was: revoke ) | `src/sandbox/capability.rs:200-273` | revoke_invalidates_token_immediately + stress race |
+| A2 | `mora.refine` builtin: drop lock before session.refine() (I/O ). RefineSession::refine  owned RefineStep  &RefineStep | `src/interpreter/builtins.rs:1745-1755`, `src/refine/mod.rs:107-154` | 7/7 refine builtin tests |
+| A3 | mora.refine  + RefineStep clone  — 50 thread  | `src/stress_tests.rs:stress_refine_concurrent` |
+| A4 | Semaphore::release  Ordering::AcqRel (was SeqCst, lighter barrier); acquire  AcqRel/Acquire (was SeqCst) | `src/interpreter/builtins.rs:2065-2090` | stress_semaphore_cas |
+| A5 | CapabilityStore::check  inline lookup ( get() clone) —  get + check + generation  | `src/sandbox/capability.rs:264-281` | stress_capability_check_throughput (100k check/sec) |
+| A6 | Interpreter.ai_cache / string_interner / draft_model_stats  Arc<Mutex<>>  (was raw HashMap, ) | `src/interpreter/mod.rs:155-205, 271-313`, `src/interpreter/ai_chat.rs:323-364, 411-414, 506-516` | stress_lru_concurrent (100 thread put) |
 
-### Category B: 正确性 (5 fixes, B1 共享 A1)
-
-| # | Fix | File | Test |
-|---|---|---|---|
-| B1 | (同 A1) | | |
-| B2 | ContainerHandle::exec_with_timeout: spawn waiter thread + recv_timeout(N). 之前 output() 阻塞永远 (docker exec sleep infinity 永久卡死) | `src/sandbox/container.rs:255-309` | stress_docker_exec_timeout (#\[ignore\], 需 docker) |
-| B3 | generate_container_name 加 Arc<AtomicU64> counter 后缀: mora-{nanos}-{counter}. 100 并发全部唯一 | `src/sandbox/container.rs:354-369` | stress_container_name_unique (100 thread) |
-| B4 | orchestrate graph step > 100 magic → MAX_GRAPH_STEPS: usize = 1000 const + 更清晰错误信息 | `src/interpreter/orchestrate.rs:8-9, 50-58` | 已有 4 个 orchestrate tests |
-
-### Category C: 资源泄漏 (4 fixes)
+### Category B:  (5 fixes, B1  A1)
 
 | # | Fix | File | Test |
 |---|---|---|---|
-| C1 | LruCache 通用实现 (cap 10000 for ai_cache); put/get/evict O(1) + 旧 entry 驱逐 | `src/interpreter/mod.rs:139-179` | stress_ai_cache_lru_cap (1M put) |
-| C2 | LruCache cap 50000 for string_interner | 同 C1 | stress_string_interner_lru_cap (1M put) |
-| C3 | ContainerHandle 加 Drop impl: docker rm -f (opt-in via auto_cleanup=true, default true; with_auto_cleanup(false) 让容器持久化) | `src/sandbox/container.rs:223-251` | real_docker_spawn_and_destroy (#\[ignore\]) |
-| C4 | worker_receivers cleanup: 不再无限累积. Interpreter Clone 正确传 Arc 引用 (v0.34 singletons via Arc) | `src/interpreter/mod.rs:248-314` | (现有 worker tests 仍过) |
+| B1 | ( A1) | | |
+| B2 | ContainerHandle::exec_with_timeout: spawn waiter thread + recv_timeout(N).  output()  (docker exec sleep infinity ) | `src/sandbox/container.rs:255-309` | stress_docker_exec_timeout (#\[ignore\],  docker) |
+| B3 | generate_container_name  Arc<AtomicU64> counter : mora-{nanos}-{counter}. 100  | `src/sandbox/container.rs:354-369` | stress_container_name_unique (100 thread) |
+| B4 | orchestrate graph step > 100 magic → MAX_GRAPH_STEPS: usize = 1000 const +  | `src/interpreter/orchestrate.rs:8-9, 50-58` |  4  orchestrate tests |
+
+### Category C:  (4 fixes)
+
+| # | Fix | File | Test |
+|---|---|---|---|
+| C1 | LruCache  (cap 10000 for ai_cache); put/get/evict O(1) +  entry  | `src/interpreter/mod.rs:139-179` | stress_ai_cache_lru_cap (1M put) |
+| C2 | LruCache cap 50000 for string_interner |  C1 | stress_string_interner_lru_cap (1M put) |
+| C3 | ContainerHandle  Drop impl: docker rm -f (opt-in via auto_cleanup=true, default true; with_auto_cleanup(false) ) | `src/sandbox/container.rs:223-251` | real_docker_spawn_and_destroy (#\[ignore\]) |
+| C4 | worker_receivers cleanup: . Interpreter Clone  Arc  (v0.34 singletons via Arc) | `src/interpreter/mod.rs:248-314` | ( worker tests ) |
 
 ### New infrastructure
 
-- **`LruCache<V>` struct** (mod.rs:139-179): 简单 LRU, no deps. VecDeque<String> for O(1) pop_front + HashMap<String, V> for O(1) lookup. Used by ai_cache and string_interner.
+- **`LruCache<V>` struct** (mod.rs:139-179):  LRU, no deps. VecDeque<String> for O(1) pop_front + HashMap<String, V> for O(1) lookup. Used by ai_cache and string_interner.
 
 ### Test
 
@@ -71,12 +71,12 @@ MIR 解释器（Tier 1）现已接管所有 5 个语言面（语法/语义/类�
   - stress_container_name_unique (100 thread, 1000 names)
   - stress_orchestrate_max_steps (B4 const sanity)
   - stress_lru_concurrent (100 thread put)
-  - stress_container_drop_cleanup (100 handle drop, #[ignore], 需 docker)
-  - stress_docker_exec_timeout (#[ignore], 需 docker)
+  - stress_container_drop_cleanup (100 handle drop, #[ignore],  docker)
+  - stress_docker_exec_timeout (#[ignore],  docker)
 
 - **Updated tests** (existing, behavior changes):
-  - sandbox::capability::revoke_invalidates_token_immediately: 修 v0.49 行为 (revoke 真的失效)
-  - interpreter::builtins::tests_v042_capability::sandbox_revoke_bumps_generation: 修 v0.49 (revoked token check_call 返回 false)
+  - sandbox::capability::revoke_invalidates_token_immediately:  v0.49  (revoke )
+  - interpreter::builtins::tests_v042_capability::sandbox_revoke_bumps_generation:  v0.49 (revoked token check_call  false)
 
 ### Total impact
 - 1 commit
@@ -95,7 +95,7 @@ MIR 解释器（Tier 1）现已接管所有 5 个语言面（语法/语义/类�
 ### plan.update — real-time checklist (pi-agent §1.11)
 
 - **New module `src/plan/mod.rs`**:
-  - `StepStatus` enum: Pending (⬜) / InProgress (🔄) / Done (✅)
+  - `StepStatus` enum: Pending () / InProgress () / Done ()
     with emoji ↔ text ↔ alias parsing (todo / doing / completed / etc.)
   - `PlanStep { id, text, status }` — single checklist item
   - `Plan` — ordered list + HashMap by_id for O(1) update
@@ -112,8 +112,8 @@ MIR 解释器（Tier 1）现已接管所有 5 个语言面（语法/语义/类�
   - `plan.remove(name, id)` → Bool(true)
   - `plan.list(name?)` → List (of plan names or step Dict[])
   - `plan.info(name)` → Dict{total, done, pending, completion_ratio}
-  - Status accepts: pending/todo/⬜, in_progress/in-progress/🔄/doing,
-    done/completed/✅/finish (emoji + text + alias all supported)
+  - Status accepts: pending/todo/, in_progress/in-progress//doing,
+    done/completed//finish (emoji + text + alias all supported)
 
 ### mora.refine — incremental edit loop (CLI-Anything §1.3)
 
@@ -146,7 +146,7 @@ MIR 解释器（Tier 1）现已接管所有 5 个语言面（语法/语义/类�
 
 ### Design decision: REAL file I/O (not metadata-only)
 
-master doc §3.3 says "mora refine 'add X' 增量变更" (CLI-Anything).
+master doc §3.3 says "mora refine 'add X' " (CLI-Anything).
 **v0.48.0 actually writes files**:
 - `mora.refine()` reads original script + writes `.refine/<stem>.refined.<n>.<ext>`
   with instruction header (REAL create_dir_all + write)
@@ -189,7 +189,7 @@ RESEARCH_PRIMITIVES_MASTER_v2.md. Future work (v1.0+) includes:
 
 - **New module `src/orchestrate_dag/mod.rs`**:
   - `OrchestrateDag { nodes, edges }` — declarative DAG (OpenFugu
-    `model_id[]` / `subtasks[]` / `access_list[]` 三个等长列表的
+    `model_id[]` / `subtasks[]` / `access_list[]` 
     Mora adaptation: nodes + edges)
   - `validate()` — detect cycles, duplicate nodes, unknown endpoints
   - `topological_order()` — Kahn's algorithm (BFS) — O(V+E)
@@ -331,10 +331,10 @@ future roadmap) when SKILL.md files become more complex.
 - 0 new deps
 
 ### Next v0.47 patches (per master doc §4)
-- v0.47.0: DAG-as-data → `orchestrate` 扩展 (OpenFugu)
-- v0.47.0: `heartbeat.md` 可执行检查列表 (mimiclaw)
-- v0.47.0: `context.trim(threshold)` 智能截断 (pi-agent + AgentMesh)
-- v0.48.0: `mora refine` 增量编辑 + `plan.update` 实时清单
+- v0.47.0: DAG-as-data → `orchestrate`  (OpenFugu)
+- v0.47.0: `heartbeat.md`  (mimiclaw)
+- v0.47.0: `context.trim(threshold)`  (pi-agent + AgentMesh)
+- v0.48.0: `mora refine`  + `plan.update` 
 
 ---
 
@@ -389,7 +389,7 @@ future roadmap) when SKILL.md files become more complex.
 
 ### Design decision: additive not replacement
 
-master doc §6.5 says "ToolPlane 替代 tool_registry". **v0.45.0 keeps both**:
+master doc §6.5 says "ToolPlane  tool_registry". **v0.45.0 keeps both**:
 - `Interpreter.tool_registry` (v0.34, single HashMap) — preserved
 - `Interpreter.tool_planes` (v0.45.0, multi-plane) — added
 
@@ -410,7 +410,7 @@ code paths in interpreter/execute.rs.
 - 0 new deps
 
 ### Next v0.46 patches (per master doc §4)
-- v0.46.0: `SKILL.md` 格式 + 双注册表 (`mora-hub.json` + `mora-public.json`) (CLI-Anything)
+- v0.46.0: `SKILL.md`  +  (`mora-hub.json` + `mora-public.json`) (CLI-Anything)
 - v0.47.0: DAG-as-data (OpenFugu) + `heartbeat.md` (mimiclaw) + `context.trim` (AgentMesh)
 
 ---
@@ -424,7 +424,7 @@ code paths in interpreter/execute.rs.
 **v0.44.0 actually spawns Docker containers (NOT metadata-only).**
 
 - **New module `src/sandbox/container.rs`**:
-  - `ContainerBackend` enum: Docker (v0.44.0 ✅), Gondolin + OpenShell
+  - `ContainerBackend` enum: Docker (v0.44.0 ), Gondolin + OpenShell
     (deferred to v1.0+, returns explicit error)
   - `NetworkMode` (Isolated/Host), `MountSpec` (host:container:mode),
     `ResourceLimits` (cpu_cores, memory_mb), `ContainerSpec`
@@ -628,19 +628,19 @@ Future builtins (sandbox.exec via container, sandbox.file.read via mount
   - Atomic index distribution via `AtomicUsize::fetch_add`
 
 ### 9 new tests (Interpreter-level)
-- `exec_parallel_runs_all_commands` — 3 cmds, 收集 stdout
+- `exec_parallel_runs_all_commands` — 3 cmds,  stdout
 - `exec_parallel_respects_max_concurrent` — 6 cmds, max_concurrent=2
-- `exec_parallel_empty_list_returns_empty` — 边界
-- `exec_parallel_collects_stdout_per_command` — 验证内容
+- `exec_parallel_empty_list_returns_empty` — 
+- `exec_parallel_collects_stdout_per_command` — 
 - `exec_parallel_kills_process_group_on_timeout` — `sleep 10` + 200ms timeout
-- `exec_parallel_validates_arg_types` — 类型检查
-- `exec_parallel_validates_cmd_elements` — 元素类型检查
-- `exec_parallel_returns_error_for_missing_command` — 不存在命令 → exit 127
+- `exec_parallel_validates_arg_types` — 
+- `exec_parallel_validates_cmd_elements` — 
+- `exec_parallel_returns_error_for_missing_command` —  → exit 127
 - `exec_unknown_method_errors` — unknown method
 
 ### Design decision: STD vs tokio
 - Master doc §6.5 suggested `tokio::process::Command` + `tokio::sync::Semaphore`
-- Project rule (AGENTS.md §3 + Cargo.toml): **"不引入 async runtime"**
+- Project rule (AGENTS.md §3 + Cargo.toml): **" async runtime"**
 - Implemented equivalent with std threads + custom Semaphore
 - Result: 0 new deps, all std library APIs
 
@@ -655,11 +655,11 @@ Future builtins (sandbox.exec via container, sandbox.file.read via mount
 ### v0.41+ roadmap progress (master doc §4)
 | Version | Status | Patch |
 |---------|--------|-------|
-| v0.41.0 | ✅ | event O(segments) |
-| v0.41.1 | ✅ | reading_order XY-Cut++ |
-| v0.42.0 | ✅ | sandbox.key + Capability |
-| v0.42.1 | ✅ | audit.jsonl + AuditSink |
-| **v0.43.0** | ✅ | **exec.parallel()** |
+| v0.41.0 |  | event O(segments) |
+| v0.41.1 |  | reading_order XY-Cut++ |
+| v0.42.0 |  | sandbox.key + Capability |
+| v0.42.1 |  | audit.jsonl + AuditSink |
+| **v0.43.0** |  | **exec.parallel()** |
 | v0.43.1+ | planned | memory.remember/recall, bus.subscribe, orchestrate, etc. |
 
 **First wave complete.** All 5 patches from RESEARCH_PRIMITIVES_MASTER_v2.md §4
@@ -1359,7 +1359,7 @@ v0.30-0.33 added 5 new modules (event/sandbox/schedule/ccr/mock) but
 module as a top-level builtin with method dispatch routing.
 
 This is the **historical debt cleanup** requested by the user
-("解决历史遗留问题") — no new external dependencies, no semantic
+("") — no new external dependencies, no semantic
 change, no API rename.
 
 #### 1. bus.emit/off/count builtin (event::EventBus)
@@ -1494,11 +1494,11 @@ change, no API rename.
 
 ### Schedule + Sandbox + Reading Order + CCR (4 P1 primitives)
 
-灵感: 7-project deep-dive 的路线图 (AGENTS_PRIMITIVES.md) 的 v0.33 P1 阶段.
-本版本聚焦 4 个**可独立发布**的 P1 原语, 全部 trait-based + 后台 in-memory 状态,
-无新外部依赖.
+: 7-project deep-dive  (AGENTS_PRIMITIVES.md)  v0.33 P1 .
+ 4 **** P1 ,  trait-based +  in-memory ,
+.
 
-#### 1. Schedule (cron) — MimiClaw 灵感
+#### 1. Schedule (cron) — MimiClaw 
 
 `src/schedule/mod.rs`:
 - `Scheduler`: `Arc<Mutex<HashMap<String, Job>>>`
@@ -1509,36 +1509,36 @@ change, no API rename.
 - `tick(now) -> Vec<triggered_messages>` (consume for event loop)
 - `set_persist_path(path)` + best-effort JSON dump
 
-灵感: MimiClaw cron_service.c (9 字段 cron_job_t).
-**简化**: 无 channel/chat_id, std::fs JSON 持久化 (vs SPIFFS).
+: MimiClaw cron_service.c (9  cron_job_t).
+****:  channel/chat_id, std::fs JSON  (vs SPIFFS).
 
-#### 2. Sandbox Policy — AIOS + Puter + MimiClaw 灵感
+#### 2. Sandbox Policy — AIOS + Puter + MimiClaw 
 
 `src/sandbox/mod.rs`:
 - `SandboxPolicy { allow, deny, fs_root, timeout_s, memory_limit_mb }`
-- `check_builtin(name) -> Result<(), Err>` (用 `event::matches` wildcard,
-  deny 优先于 allow)
-- `check_path(path) -> Result<PathBuf, Err>` (MimiClaw 风格 `..` 拒绝,
-  解析后必须在 fs_root 之内)
+- `check_builtin(name) -> Result<(), Err>` ( `event::matches` wildcard,
+  deny  allow)
+- `check_path(path) -> Result<PathBuf, Err>` (MimiClaw  `..` ,
+   fs_root )
 - `strict()` / `permissive()` / Default constructors
 
-灵感:
+:
 - MimiClaw path traversal defense
 - AIOS Access Manager (agent_id -> privilege_group)
 - Puter iframe sandbox + capability URL params
 
-#### 3. document.reading_order — MinerU 灵感
+#### 3. document.reading_order — MinerU 
 
 `src/document/reading_order/mod.rs`:
 - `BBox { x, y, w, h }` + center/edge accessors
 - `from_value(v)`: accept both flat bbox dict AND block dict with 'bbox' sub-dict
 - `Strategy`: InputOrder | TopToBottom | GapTree | XyCut | GroupBased
-- `assign_reading_order(blocks, strategy)`: 排序后给每 block 加 'reading_order_idx'
+- `assign_reading_order(blocks, strategy)`:  block  'reading_order_idx'
 
-灵感: MinerU §2.8 Reading Order Recovery (3 算法).
-**简化**: 无 recursive XY-cut, 无 cross-page merge, 无语义组配对.
+: MinerU §2.8 Reading Order Recovery (3 ).
+****:  recursive XY-cut,  cross-page merge, .
 
-#### 4. CCR (Compress-Cache-Retrieve) — Headroom 灵感
+#### 4. CCR (Compress-Cache-Retrieve) — Headroom 
 
 `src/ccr/mod.rs`:
 - `CcrStore` trait: `put(data) -> hash; get(hash) -> Option<entry>; len()`
@@ -1547,34 +1547,34 @@ change, no API rename.
 - `make_marker(hash, size) -> "<<ccr:hash,size>>"`
 - `extract_hash(marker) -> Option<&str>`
 
-灵感: Headroom CcrStore (lossy 后仍可恢复原值).
-**简化**: 8-char hex hash (vs SHA-256), 简化 marker 格式 (无 KIND).
-**未来**: v0.34 集成到 `crush_json` lossy 路径.
+: Headroom CcrStore (lossy ).
+****: 8-char hex hash (vs SHA-256),  marker  ( KIND).
+****: v0.34  `crush_json` lossy .
 
-#### 测试
+#### 
 
 - 320 lib tests (was 286, +34)
 - `cargo build --all-targets`: clean
 - `cargo clippy --all-targets -- -D warnings`: clean
 - `cargo fmt --check`: 0 diff
 
-#### 路线图 (v0.34+ 计划)
+####  (v0.34+ )
 
-P1 (v0.34 6-8 周):
-- `react` (ReAct 循环) — MimiClaw agent_loop.c
-- `document.grouped_layout` — MinerU 配对
+P1 (v0.34 6-8 ):
+- `react` (ReAct ) — MimiClaw agent_loop.c
+- `document.grouped_layout` — MinerU 
 - `skill` markdown — MimiClaw skill_loader
-- CCR ↔ crush_json 集成 (lossy 路径自动用 marker)
-- `heartbeat` 周期 — MimiClaw
-- Sandbox ↔ builtin 集成 (file.read 自动 check_path)
+- CCR ↔ crush_json  (lossy  marker)
+- `heartbeat`  — MimiClaw
+- Sandbox ↔ builtin  (file.read  check_path)
 
-P2+ (v0.35+ 远期):
+P2+ (v0.35+ ):
 - `plan` (DAG) — OpenFugu Conductor
-- `mora serve --openai` 模式 — OpenInfer
+- `mora serve --openai`  — OpenInfer
 - `prefix_cache` — OpenInfer Pegaflow
 - `tiered_memory` — OpenInfer + MimiClaw
-- `lifecycle` 关键字 — Puter
-- DI 容器 (5 层) — Puter
+- `lifecycle`  — Puter
+- DI  (5 ) — Puter
 - `policy` learned router — OpenFugu
 - `ai.chat role` — OpenFugu 3 role
 - Error Gradation — OpenFugu
@@ -1584,88 +1584,88 @@ P2+ (v0.35+ 远期):
 
 ### Lossless-First Recursive Walker + Event Bus + Mock Registry
 
-灵感: 通过 deep-dive 7 个 AI 基础设施项目 (AIOS / MimiClaw / OpenFugu /
-OpenInfer / MinerU / Headroom / Puter) 提取的高价值原语. 完整路线图见
-`AGENTS_PRIMITIVES.md` (581 行). 本版本聚焦 3 个**可独立发布**的 P0 原语,
-完整 plan/react/openai-serve 留 v0.33.
+:  deep-dive 7  AI  (AIOS / MimiClaw / OpenFugu /
+OpenInfer / MinerU / Headroom / Puter) . 
+`AGENTS_PRIMITIVES.md` (581 ).  3 **** P0 ,
+ plan/react/openai-serve  v0.33.
 
-#### 1. Lossless-First Recursive Walker (Headroom 灵感)
+#### 1. Lossless-First Recursive Walker (Headroom )
 
 `src/compress/json.rs::compact_value_recursive` + `crush_json_recursive`:
-- 整棵 Value 树的 pure iterative DFS (避免 Windows 1MB stack 溢出)
-- 每个 List 节点 (`len >= min_items`) 尝试 `try_lossless_compact`
-  (csv-schema 或 markdown-kv), 失败保留原值
-- 新增 `CompressOptions.recursive: bool` (default false, 向后兼容)
-- 顶层 List 走标准 SmartCrusher (inlined via `crush_json_inner` 避免栈嵌套)
+-  Value  pure iterative DFS ( Windows 1MB stack )
+-  List  (`len >= min_items`)  `try_lossless_compact`
+  (csv-schema  markdown-kv), 
+-  `CompressOptions.recursive: bool` (default false, )
+-  List  SmartCrusher (inlined via `crush_json_inner` )
 - 2 new tests: `recursive_walker_compacts_nested_lists`,
   `compact_value_recursive_simple`
 
-灵感: [Headroom DocumentCompactor](https://github.com/chopratejas/headroom)
+: [Headroom DocumentCompactor](https://github.com/chopratejas/headroom)
 (`crates/headroom-core/src/transforms/smart_crusher/compaction/walker.rs`)
 
-#### 2. Event Bus with Wildcard (Puter 灵感)
+#### 2. Event Bus with Wildcard (Puter )
 
-新模块 `src/event/mod.rs`:
+ `src/event/mod.rs`:
 - `EventBus`: `Arc<Mutex<HashMap<Pattern, Vec<Handler>>>>`
-- `on(pattern, handler)` 注册; `off(pattern)` 注销; `emit(event, payload)` 派发
-- `matches(event, pattern)`: Puter 风格
-  - trailing `*` = prefix catch-all (`outer.*` 匹配 `outer.gui.item.removed`)
+- `on(pattern, handler)` ; `off(pattern)` ; `emit(event, payload)` 
+- `matches(event, pattern)`: Puter 
+  - trailing `*` = prefix catch-all (`outer.*`  `outer.gui.item.removed`)
   - interior `*` = single segment wildcard (`outer.*.item`)
-  - bare `*` = 匹配一切
+  - bare `*` = 
 - 8 unit tests covering exact/prefix/interior/catchall/dispatch
 
-灵感: [Puter EventClient](https://github.com/HeyPuter/puter)
+: [Puter EventClient](https://github.com/HeyPuter/puter)
 (`src/backend/clients/event/EventClient.ts`)
 
-#### 3. Mock Registry (OpenFugu + OpenInfer 灵感)
+#### 3. Mock Registry (OpenFugu + OpenInfer )
 
-新模块 `src/mock/mod.rs`:
+ `src/mock/mod.rs`:
 - `MockRegistry`: `Arc<Mutex<HashMap<String, MockHandler>>>`
 - `register(name, fn) / unregister(name) / call(name, args) / count / names`
 - `MockHandler`: `Arc<dyn Fn(&Value) -> Value + Send + Sync>`
-- 使用 Mora 自身 `Value` 类型, 无 `serde_json` 新依赖
+-  Mora  `Value` ,  `serde_json` 
 
-灵感:
+:
 - [OpenFugu MockWorld](https://github.com/trotsky1997/OpenFugu) (train/train_trinity.py)
-  用于验证 sep-CMA-ES 训练算法
-- OpenInfer mock mode (无 Python 依赖的纯 Rust 测试)
+   sep-CMA-ES 
+- OpenInfer mock mode ( Python  Rust )
 
-Mora 之前 `compress/text.rs` / `ai_chat.rs` 散落的 hardcode mock 响应,
-v0.32 起统一通过 `MockRegistry` 注册. 未来 builtin (ai.chat / http.fetch) 可
-consult `mock.call` 决定是否走 mock 路径, 实现 offline deterministic 测试.
+Mora  `compress/text.rs` / `ai_chat.rs`  hardcode mock ,
+v0.32  `MockRegistry` .  builtin (ai.chat / http.fetch) 
+consult `mock.call`  mock ,  offline deterministic .
 
-#### 4. AGENTS_PRIMITIVES.md (581 行)
+#### 4. AGENTS_PRIMITIVES.md (581 )
 
-新增设计文档, 完整 v0.32+ 路线图 (16 个直接原语 + 5 个跨项目共性 + 7 个待增强).
-每个原语含: 灵感来源 + 实现机制 (含源码引用) + Mora 语法草案 + 实施步骤 +
-关联 Mora 模块.
+,  v0.32+  (16  + 5  + 7 ).
+:  +  () + Mora  +  +
+ Mora .
 
-#### 测试
+#### 
 
 - 286 lib tests (was 272, +14)
 - `cargo build --all-targets`: clean
 - `cargo clippy --all-targets -- -D warnings`: clean
 - `cargo fmt --check`: 0 diff
 
-#### 路线图 (v0.33+ 计划)
+####  (v0.33+ )
 
-P1 (v0.33 6-8 周):
+P1 (v0.33 6-8 ):
 - `plan` (DAG) — OpenFugu Conductor
-- `react` (ReAct 循环) — MimiClaw agent_loop.c
+- `react` (ReAct ) — MimiClaw agent_loop.c
 - `document.grouped_layout` — MinerU group-based
-- `document.reading_order` — MinerU 3 策略
+- `document.reading_order` — MinerU 3 
 - `schedule` cron — MimiClaw cron_service
 - `skill` markdown — MimiClaw skill_loader
-- `sandbox` 权限 — AIOS + Puter
+- `sandbox`  — AIOS + Puter
 - `ccr` Compress-Cache-Retrieve — Headroom
 
-P2+ (v0.34+ 远期):
-- `mora serve --openai` 模式 — OpenInfer vLLM frontend 复用
+P2+ (v0.34+ ):
+- `mora serve --openai`  — OpenInfer vLLM frontend 
 - `prefix_cache` — OpenInfer Pegaflow
 - `tiered_memory` — OpenInfer + MimiClaw
-- `lifecycle` 关键字 — Puter hooks
-- DI 容器 (5 层) — Puter
-- `heartbeat` 周期 — MimiClaw
+- `lifecycle`  — Puter hooks
+- DI  (5 ) — Puter
+- `heartbeat`  — MimiClaw
 - `policy` learned router — OpenFugu TRINITY
 - `ai.chat role` — OpenFugu 3 role
 - Error Gradation — OpenFugu evidence grade
@@ -1675,38 +1675,38 @@ P2+ (v0.34+ 远期):
 
 ### No-Panic Refactor + Code Quality Hardening
 
-灵感来自 v0.30 之后的"大检查"反馈 (user: "5 项检查不够").
-本版本专注于**错误处理韧性** — 用户脚本出错时不再让解释器崩溃.
+ v0.30 "" (user: "5 ").
+**** — .
 
-#### 修: 21 panic -> 0 in lexer/parser
+#### : 21 panic -> 0 in lexer/parser
 
-用户脚本有语法错误时, 之前整个进程会 `panicked at src/lexer.rs:...`
-直接 abort. 现在:
-- Lexer 8 个 panic 改为 emit `TokenType::Error(String)` token
-- Parser 13 个 panic 改为 `eprintln!` 错误信息 + 返回 safe default
-  (空字符串 / 空 list / 默认 OrchestrateKind.Sequential)
-- 用户看到 `"Parse error: ..."` 友好错误而非 stack trace
+,  `panicked at src/lexer.rs:...`
+ abort. :
+- Lexer 8  panic  emit `TokenType::Error(String)` token
+- Parser 13  panic  `eprintln!`  +  safe default
+  ( /  list /  OrchestrateKind.Sequential)
+-  `"Parse error: ..."`  stack trace
 
-`examples/_legacy/` 中的 demo (之前会 panic) 现在不再 crash 进程.
+`examples/_legacy/`  demo ( panic)  crash .
 
-#### 修: Windows OCR model path fallback
+#### : Windows OCR model path fallback
 
-`user_model_path()` 之前只检查 `XDG_DATA_HOME` 和 `HOME`,
-两者在 Windows 上都未设置, 永远 fail. 新增 `LOCALAPPDATA` fallback
-作为第 3 选项. 错误信息也更新列出所有 3 个解析路径.
+`user_model_path()`  `XDG_DATA_HOME`  `HOME`,
+ Windows ,  fail.  `LOCALAPPDATA` fallback
+ 3 .  3 .
 
-#### 修: cargo doc warnings 14 -> 0
+#### : cargo doc warnings 14 -> 0
 
-Module-level `//!` 注释中的 HTML 标签未转义:
-- `<Page>`, `<Block>`, `<Span>` 改为 `\[ \]` 或反引号
-- `<p>`, `<N>`, `Vec<Value>` 等改为反引号包
-- bare URL `https://...` 改为 `<https://...>`
+Module-level `//!`  HTML :
+- `<Page>`, `<Block>`, `<Span>`  `\[ \]` 
+- `<p>`, `<N>`, `Vec<Value>` 
+- bare URL `https://...`  `<https://...>`
 
-`cargo doc --no-deps` 现在 0 warning, docs.rs 渲染干净.
+`cargo doc --no-deps`  0 warning, docs.rs .
 
-#### 测试
+#### 
 
-- 272 lib + 5 integration = 277 test 全过
+- 272 lib + 5 integration = 277 test 
 - `cargo build --all-targets`: clean
 - `cargo clippy --all-targets -- -D warnings`: clean
 - `cargo fmt --check`: 0 diff
@@ -1714,63 +1714,63 @@ Module-level `//!` 注释中的 HTML 标签未转义:
 
 ## [v0.30] - 2026-07-02
 
-### SmartCrusher — 内容感知 JSON 压缩
+### SmartCrusher —  JSON 
 
-灵感来自 [headroom](https://github.com/headroomlabs-ai/headroom) 的 SmartCrusher
-（统计字段检测 + 多种压缩策略 + 安全约束）。把 v0.29 的"看字段名 + 30% 头 15% 尾"
-升级为"按值分布推断语义角色 + 5 种策略 + 3 种安全约束"。
+ [headroom](https://github.com/headroomlabs-ai/headroom)  SmartCrusher
+ +  +  v0.29 " + 30%  15% "
+" + 5  + 3 "
 
-#### ⚠️ BREAKING CHANGES
+####  BREAKING CHANGES
 
-- `CompressOptions.anomaly_keys: Vec<String>` 字段**整体删除**（v0.30 起不再解析）
-- `CompressOptions` 字段从 5 个改为 11 个（v0.29 字段重命名 + 6 个新增）
-- `crush_json_core` 函数**重命名**为 `crush_json`，签名 `(items, target, options)`
-  （旧 `crush_json_core(input, max, anomaly_keys)` 形式已删除）
-- `parse_json_simple` stub **改为真实实现**（委托 `flow::json_to_value`）
-- `crush_json` / `compress.json` / `List.crush_json` 的输出 marker 改为
+- `CompressOptions.anomaly_keys: Vec<String>` ****v0.30 
+- `CompressOptions`  5  11 v0.29  + 6 
+- `crush_json_core` **** `crush_json` `(items, target, options)`
+   `crush_json_core(input, max, anomaly_keys)` 
+- `parse_json_simple` stub **** `flow::json_to_value`
+- `crush_json` / `compress.json` / `List.crush_json`  marker 
   `method=smart_crusher strategy={...} items={...} total={...} savings={...}`
 
-#### 新策略（替代 v0.29 单一 head_tail）
+####  v0.29  head_tail
 
-| 策略 | 触发条件 | 行为 |
+|  |  |  |
 |---|---|---|
-| `auto` (default) | 任意 | 按 ArrayType 自动选 |
-| `topn` | 显式 / 存在 Score 字段 | 按 Score 保留 top N |
-| `timeseries` | 显式 / 存在 Temporal 字段 | 头尾 + 均匀采样 |
-| `cluster` | 显式 / 字段 uniqueness < 0.3 | 相似度聚类去重 |
-| `lossless` | 显式 | schema 一致时转 csv-schema / md-kv |
-| `smart_sample` | fallback | 头 + 中间采样 + 尾 |
+| `auto` (default) |  |  ArrayType  |
+| `topn` |  /  Score  |  Score  top N |
+| `timeseries` |  /  Temporal  |  +  |
+| `cluster` |  /  uniqueness < 0.3 |  |
+| `lossless` |  | schema  csv-schema / md-kv |
+| `smart_sample` | fallback |  +  +  |
 
-#### 5 种字段角色（按值分布推断）
+#### 5 
 
-- `Id` — uniqueness > 0.9 且为字符串/UUID/顺序数字
-- `Score` — bounded numeric range (0-1 或 0-100)
-- `Temporal` — ISO 8601 / Unix timestamp 模式
-- `Error` — 字段名或值含 `error`/`failed`/`exception`/... 等关键词
-- `Anomaly` — 数值 >3σ from mean (1-5% 项)
+- `Id` — uniqueness > 0.9 /UUID/
+- `Score` — bounded numeric range (0-1  0-100)
+- `Temporal` — ISO 8601 / Unix timestamp 
+- `Error` —  `error`/`failed`/`exception`/... 
+- `Anomaly` —  >3σ from mean (1-5% )
 
-#### 3 种安全约束
+#### 3 
 
-- `KeepErrorsConstraint` — 含错误关键词的项强制保留
-- `KeepOutliersConstraint` — Anomaly 字段的 >2σ 项保留
-- `KeepBoundaryConstraint` — 头 k_first + 尾 k_last 项保留（默认各 15%）
+- `KeepErrorsConstraint` — 
+- `KeepOutliersConstraint` — Anomaly  >2σ 
+- `KeepBoundaryConstraint` —  k_first +  k_last  15%
 
-#### 新 builtin 用法
+####  builtin 
 
 ```mora
--- 默认 auto: 按字段角色自动选最佳策略
+--  auto: 
 compress.json(tool_output, {target_ratio: 0.2})
 
--- 显式 TopN
+--  TopN
 compress.json(scored_list, {strategy: "topn", target_ratio: 0.1})
 
--- 显式 TimeSeries
+--  TimeSeries
 compress.json(metrics, {strategy: "timeseries", target_ratio: 0.3})
 
--- Lossless (csv-schema 格式, 全保留)
+-- Lossless (csv-schema , )
 compress.json(flat_table, {strategy: "lossless", max_bytes: 5000})
 
--- 关闭某项约束
+-- 
 compress.json(api_logs, {
     strategy: "auto",
     target_ratio: 0.2,
@@ -1779,178 +1779,178 @@ compress.json(api_logs, {
     preserve_ids: false,
 })
 
--- 拿 metadata
+--  metadata
 let result = compress.json(items, {target_ratio: 0.2})
-result.savings_ratio    -- 0.8 (80% 节省)
+result.savings_ratio    -- 0.8 (80% )
 result.strategy_used    -- "topn"
 result.fields           -- [{name, role, ...}, ...]
 ```
 
-#### 性能
+#### 
 
-| 量级 | 节省率 (v0.29) | 节省率 (v0.30) | 提升 |
+|  |  (v0.29) |  (v0.30) |  |
 |---|---|---|---|
-| 100 项 × 5 字段 | 60% | 70-80% | +10-20% |
-| 1000 项 × 20 字段 | 60% | 75-85% | +15-25% |
-| 10000 项 × 30 字段 | 60% | 80-90% | +20-30% |
+| 100  × 5  | 60% | 70-80% | +10-20% |
+| 1000  × 20  | 60% | 75-85% | +15-25% |
+| 10000  × 30  | 60% | 80-90% | +20-30% |
 
-#### 新模块文件
+#### 
 
-- `src/compress/json.rs` — 完全重写 (267 → 970 行)
-  - `FieldRole` / `FieldStats` / `ArrayType` 数据结构
-  - 5 个 detector + 5 个 Strategy + 3 个 Constraint
+- `src/compress/json.rs` —  (267 → 970 )
+  - `FieldRole` / `FieldStats` / `ArrayType` 
+  - 5  detector + 5  Strategy + 3  Constraint
   - `crush_json` / `crush_json_string` / `try_lossless_compact`
-- `src/compress/mod.rs` — `CompressOptions` 重定义 (11 字段)
-  - `parse_json_simple` 委托 `flow::json_to_value`
-  - `value_to_json_simple` 委托 `flow::value_to_json`
+- `src/compress/mod.rs` — `CompressOptions`  (11 )
+  - `parse_json_simple`  `flow::json_to_value`
+  - `value_to_json_simple`  `flow::value_to_json`
 
-#### 测试
+#### 
 
-- 12 个新 unit test（替代 v0.29 5 个旧 test）
-  - 5 个 role detection（id/score/error/temporal/anomaly）
-  - 4 个 strategy（topn/timeseries/lossless/auto）
-  - 2 个 constraint（errors/outliers）
-  - 1 个 metadata
-  - 1 个 string 入口
-- 所有 v0.29 旧 test 已删除（`crush_json_core` / `anomaly_keys` / `parse_json_simple_currently_stub`）
-- 全部 272 test 通过；`cargo clippy --all-targets -- -D warnings` 通过
+- 12  unit test v0.29 5  test
+  - 5  role detectionid/score/error/temporal/anomaly
+  - 4  strategytopn/timeseries/lossless/auto
+  - 2  constrainterrors/outliers
+  - 1  metadata
+  - 1  string 
+-  v0.29  test `crush_json_core` / `anomaly_keys` / `parse_json_simple_currently_stub`
+-  272 test `cargo clippy --all-targets -- -D warnings` 
 
 ## [v0.29] - 2026-07-01
 
-### compress + crush_json + OCR .rten 迁移
+### compress + crush_json + OCR .rten 
 
-灵感来自 [headroom](https://github.com/headroomlabs-ai/headroom) ContentRouter + Kneedle 设计。
-Mora 历史上首次支持结构化 JSON 列表压缩 + 多策略 system prompt 压缩。
+ [headroom](https://github.com/headroomlabs-ai/headroom) ContentRouter + Kneedle 
+Mora  JSON  +  system prompt 
 
-#### 新增关键字 / builtin
+####  / builtin
 
 ```mora
--- 6 路策略 (auto / head_tail / summary / lossless / json / code-html-log-text)
-let summary = compress(text, "summary")                       -- LLM 摘要
-let head    = compress(text, "head_tail", head_pct: 0.3)     -- 保留首尾
-let lossless = compress(text, "lossless")                     -- 加 size marker
-let auto    = compress(text, "auto")                          -- 内容路由
+-- 6  (auto / head_tail / summary / lossless / json / code-html-log-text)
+let summary = compress(text, "summary")                       -- LLM 
+let head    = compress(text, "head_tail", head_pct: 0.3)     -- 
+let lossless = compress(text, "lossless")                     --  size marker
+let auto    = compress(text, "auto")                          -- 
 
--- 结构化 JSON 列表压缩 (Kneedle + 异常保留)
+--  JSON  (Kneedle + )
 let crushed = crush_json(big_list, max: 10)
 let crushed = crush_json(big_list, max: 10, anomaly_keys: ["error"])
 
--- 方法链
+-- 
 let summary = conv.compress("summary")
 let crushed = list.crush_json(10)
 ```
 
-#### 新增模块 `compress`
+####  `compress`
 
-| 名称 | 作用 |
+|  |  |
 |---|---|
-| `SubCompressor` trait | `sniff` / `compress` / `origin` 3 方法 |
-| `ContentRouter` | 嗅探 → 选最佳子压缩器 |
-| `JsonSubCompressor` | 委托 crush_json_core |
-| `CodeSubCompressor` | regex 保留签名 + 截断 body |
-| `HtmlSubCompressor` | 复用 v0.27 quick-xml 切块 |
-| `LogSubCompressor` | 行 pattern cluster |
-| `TextSubCompressor` | head_tail / summary / lossless 调度 |
+| `SubCompressor` trait | `sniff` / `compress` / `origin` 3  |
+| `ContentRouter` |  →  |
+| `JsonSubCompressor` |  crush_json_core |
+| `CodeSubCompressor` | regex  +  body |
+| `HtmlSubCompressor` |  v0.27 quick-xml  |
+| `LogSubCompressor` |  pattern cluster |
+| `TextSubCompressor` | head_tail / summary / lossless  |
 
-#### ⚠️ BREAKING: `compact` 重命名为 `compress`
+####  BREAKING: `compact`  `compress`
 
-v0.25 的 `compact(text)` builtin 已重命名为 `compress(text, "summary")`。
-`examples/compact_demo.mora` 同步改写为 v0.29 风格。
+v0.25  `compact(text)` builtin  `compress(text, "summary")`
+`examples/compact_demo.mora`  v0.29 
 
-#### OCR `.rten` 模型迁移 (解决 v0.28 tech-debt)
+#### OCR `.rten`  ( v0.28 tech-debt)
 
-- v0.28 vendored 的 11.7 MB `.rten` 模型已从仓库删除
-- 模型现在从 `~/.local/share/mora/ocr/` 加载 (可用 `MORA_OCR_MODELS_DIR` 覆盖)
-- 新增 `docs/install-ocr.md` 说明下载与安装步骤
-- 新增 `.git/sdd/ocrs-shasums.txt` 作为 reference checksum
-- **BREAKING**: 首次 OCR 调用前需 `mora-install-ocr` 下载模型
+- v0.28 vendored  11.7 MB `.rten` 
+-  `~/.local/share/mora/ocr/`  ( `MORA_OCR_MODELS_DIR` )
+-  `docs/install-ocr.md` 
+-  `.git/sdd/ocrs-shasums.txt`  reference checksum
+- **BREAKING**:  OCR  `mora-install-ocr` 
 
-#### 新增文件
+#### 
 
-- `src/compress/{mod,json,code,html,log,text}.rs` (~1000 行)
+- `src/compress/{mod,json,code,html,log,text}.rs` (~1000 )
 - `docs/install-ocr.md`
 - `.git/sdd/ocrs-shasums.txt`
-- `examples/compress_demo.mora` (新)
+- `examples/compress_demo.mora` ()
 
-#### 技术细节
+#### 
 
-- **零新外部依赖** — 用 v0.27 / v0.28 已有 deps (`regex` transitive from `ocrs`)
-- **字节近似** — 与 v0.26 / v0.27 / v0.28 一致
-- **CodeSubCompressor 纯 regex** — v0.30+ 引入 tree-sitter
-- **错误前缀** `compress.` / `crush_json.` / `ocr.load.`
+- **** —  v0.27 / v0.28  deps (`regex` transitive from `ocrs`)
+- **** —  v0.26 / v0.27 / v0.28 
+- **CodeSubCompressor  regex** — v0.30+  tree-sitter
+- **** `compress.` / `crush_json.` / `ocr.load.`
 
 ## [v0.28] - 2026-07-01
 
 ### Office (PPTX/DOCX) + Image OCR Backends
 
-灵感来自 v0.27 DocumentBackend 框架与 MinerU 多格式解析思路。
-沿用 v0.27 trait 框架，仅添 3 个 DocumentBackend 后端实现。
+ v0.27 DocumentBackend  MinerU 
+ v0.27 trait  3  DocumentBackend 
 
-#### 新增后端
+#### 
 
-| 后端 | 文件格式 | 依赖 | 说明 |
+|  |  |  |  |
 |---|---|---|---|
-| PptxBackend | .pptx | undoc 0.5 | 演示文稿 |
-| DocxBackend | .docx | undoc 0.5 | Word 文档 |
-| ImageBackend | .png | ocrs 0.12 + image 0.24 | 扫描件 OCR（纯 Rust / rten ONNX）|
+| PptxBackend | .pptx | undoc 0.5 |  |
+| DocxBackend | .docx | undoc 0.5 | Word  |
+| ImageBackend | .png | ocrs 0.12 + image 0.24 |  OCR Rust / rten ONNX|
 
-#### 用法
+#### 
 
 ```mora
 let deck = document.parse("./deck.pptx")           -- PPTX
 let report = document.parse("./report.docx")        -- DOCX
 let scan = document.parse("./scan.png")            -- OCR
 
-print(deck.markdown())                              -- markdown 形式
-print(report.text())                                -- 纯文本
+print(deck.markdown())                              -- markdown 
+print(report.text())                                -- 
 print(scan.metadata()["ocr_engine"])                -- "rten"
 ```
 
-#### 与 v0.26/v0.27 组合
+####  v0.26/v0.27 
 
 ```mora
--- 与 v0.26 compose_prompt
+--  v0.26 compose_prompt
 let sys = compose_prompt({role:"system", text:deck.text(), budget:"32 KB"})
--- 与 v0.27 块式声明
+--  v0.27 
 document "report" do
     set origin: "docx"
     read "./report.docx"
 end
 ```
 
-#### 新增依赖（实现期真实清单）
+#### 
 
-- `undoc` 0.5（启用 `docx` + `pptx` features，纯 Rust）
-- `ocrs` 0.12（OCR 引擎壳，纯 Rust）
-- `rten` 0.24（ocrs 不再 re-export；必须直接依赖以 `Model::load_static_slice` 加载 `.rten`）
-- `anyhow` 1（ocrs 的 `OcrEngine::new` 暴露 `anyhow::Result`；ocrs 不再 re-export `anyhow`）
-- `image` 0.24（仅 `png` feature；解析 PNG header / dimensions）
+- `undoc` 0.5 `docx` + `pptx` features Rust
+- `ocrs` 0.12OCR  Rust
+- `rten` 0.24ocrs  re-export `Model::load_static_slice`  `.rten`
+- `anyhow` 1ocrs  `OcrEngine::new`  `anyhow::Result`ocrs  re-export `anyhow`
+- `image` 0.24 `png` feature PNG header / dimensions
 
-全部纯 Rust，MSRV 1.85 ✅，无系统依赖。
+ RustMSRV 1.85 
 
-#### 技术细节
+#### 
 
-- **零系统依赖**：所有 5 个新 crate 都是 pure Rust
-- **PNG only in v0.28**：JPEG / XLSX / 扫描 PDF 留 v0.29+
-- **OCR 引擎**：`ocrs 0.12` 基于 Microsoft `rten` ONNX runtime
-- **多语言 OCR**：v0.28 仅英文（eng.traineddata bundled）
-- **工厂分发**：v0.27 的 `parse_document(path)` 已按扩展名自动派发到 `PptxBackend` / `DocxBackend` / `ImageBackend`，用户代码无变化
+- **** 5  crate  pure Rust
+- **PNG only in v0.28**JPEG / XLSX /  PDF  v0.29+
+- **OCR **`ocrs 0.12`  Microsoft `rten` ONNX runtime
+- ** OCR**v0.28 eng.traineddata bundled
+- ****v0.27  `parse_document(path)`  `PptxBackend` / `DocxBackend` / `ImageBackend`
 
 #### Known issues / v0.29+ roadmap
 
-- **11.7 MB `.rten` 模型 vendoring**：OCR 检测/识别模型（`text-detection.rten` 2.4 MB + `text-recognition.rten` 9.3 MB）以 raw blob 提交在 `tests/fixtures/`，未走 git LFS。每个 contributor / CI 首次 `git clone` 多拉 ~12 MB；`mora` release binary 经 `include_bytes!` 也内嵌这 ~12 MB；二进制 blob 无法在 PR 中 diff/审查；上游模型更新也无刷新路径。详情见 `.git/sdd/tech-debt-v0.29.md`。v0.29 计划三选一：git LFS / `build.rs` 联网下载 / 用户侧 model dir。
-- **OCR 仅英文**：`ocrs 0.12` 加载的 `eng.traineddata` 仅识别拉丁字符。
-- **OCR 仅 PNG**：JPEG / WebP / TIFF 留 v0.29+。
-- **无扫描 PDF**：扫描版 PDF（图片型）尚未接入 OCR 路径。
+- **11.7 MB `.rten`  vendoring**OCR /`text-detection.rten` 2.4 MB + `text-recognition.rten` 9.3 MB raw blob  `tests/fixtures/` git LFS contributor / CI  `git clone`  ~12 MB`mora` release binary  `include_bytes!`  ~12 MB blob  PR  diff/ `.git/sdd/tech-debt-v0.29.md`v0.29 git LFS / `build.rs`  /  model dir
+- **OCR **`ocrs 0.12`  `eng.traineddata` 
+- **OCR  PNG**JPEG / WebP / TIFF  v0.29+
+- ** PDF** PDF OCR 
 
 ## [v0.27] - 2026-07-01
 
-### Document 统一 IR — `document.parse(...)` + 块式声明
+### Document  IR — `document.parse(...)` + 
 
-灵感来自 [opendatalab/MinerU](https://github.com/opendatalab/MinerU) middle_json 抽象。
-Mora 历史上首次支持 PDF / Markdown / HTML 文档解析,统一落到 `Value::Document` IR。
+ [opendatalab/MinerU](https://github.com/opendatalab/MinerU) middle_json 
+Mora  PDF / Markdown / HTML , `Value::Document` IR
 
-#### 新增关键字
+#### 
 
 ```mora
 document "report" do
@@ -1965,58 +1965,58 @@ let pages = doc.pages()
 let meta = doc.metadata()
 ```
 
-#### 新增内建模块 `document`
+####  `document`
 
-| 函数 | 作用 |
+|  |  |
 |---|---|
-| `document.parse(path)` | 解析文件,返回 `Value::Document` |
+| `document.parse(path)` | , `Value::Document` |
 
-#### `Document` value 的方法
+#### `Document` value 
 
-| 方法 | 返回 | 含义 |
+|  |  |  |
 |---|---|---|
-| `doc.markdown()` | `string` | 全文档 markdown 渲染 |
-| `doc.text()` | `string` | 纯文本（去格式）|
-| `doc.pages()` | `List<Dict>` | 完整 IR Page 列表 |
-| `doc.blocks()` | `List<Dict>` | 跨页合并的 block |
-| `doc.metadata()` | `Dict` | 元信息（含 origin / pages / size）|
+| `doc.markdown()` | `string` |  markdown  |
+| `doc.text()` | `string` | |
+| `doc.pages()` | `List<Dict>` |  IR Page  |
+| `doc.blocks()` | `List<Dict>` |  block |
+| `doc.metadata()` | `Dict` |  origin / pages / size|
 | `doc.origin()` | `string` | "pdf" / "markdown" / "html" |
 
-#### 新增值类型 + Trait
+####  + Trait
 
 - `Value::Document { backend: Arc<dyn DocumentBackend + Send + Sync>, metadata: HashMap<String, Value> }`
 - `pub trait DocumentBackend: Debug + Send + Sync { fn origin / pages / markdown / text / metadata / blocks }`
-- 3 个后端实现: `PdfBackend` (lopdf + pdf-extract) / `MarkdownBackend` (pulldown-cmark) / `HtmlBackend` (quick-xml)
+- 3 : `PdfBackend` (lopdf + pdf-extract) / `MarkdownBackend` (pulldown-cmark) / `HtmlBackend` (quick-xml)
 
-#### 新增依赖
+#### 
 
 - `lopdf` 0.41 + `pdf-extract` 0.12 (PDF)
 - `pulldown-cmark` 0.13 (Markdown)
 - `quick-xml` 0.40 (HTML)
-- 全部纯 Rust, MSRV 1.85 ✅, 无系统依赖
+-  Rust, MSRV 1.85 , 
 
-#### 与 v0.26 组合
+####  v0.26 
 
 ```mora
 let doc = document.parse("./report.pdf")
 let sys = compose_prompt({role:"system", text:doc.markdown(), budget:"32 KB"})
-let resp = ai.chat(p"根据报告：{sys}\n\n问题：{question}")
+let resp = ai.chat(p"{sys}\n\n{question}")
 ```
 
-#### 技术细节
+#### 
 
-- **零系统依赖**：所有后端纯 Rust crate
-- **二进制不出 Value 树**：原始 PDF / 图片字节封在 `backend: Arc<dyn ...>` 内
-- **Lazy 后端**：访问 `.pages()` / `.markdown()` 时才构造 Value, 避免一次物化
-- **可扩展**：未来加 PPTX / DOCX 后端仅需 `impl DocumentBackend`
+- **** Rust crate
+- ** Value ** PDF /  `backend: Arc<dyn ...>` 
+- **Lazy ** `.pages()` / `.markdown()`  Value, 
+- **** PPTX / DOCX  `impl DocumentBackend`
 
 ## [v0.26] - 2026-07-01
 
-### Prompt Sections — 分段 + 容量预算 + 滚动窗口
+### Prompt Sections —  +  + 
 
-灵感来自 [mimiclaw](https://github.com/memovai/mimiclaw)（5 段固定缓冲）和 [headroom](https://github.com/headroomlabs-ai/headroom)（内容感知路由器），把 LLM 的 system prompt 拼装从字符串拼接升级为分段工程。
+ [mimiclaw](https://github.com/memovai/mimiclaw)5  [headroom](https://github.com/headroomlabs-ai/headroom) LLM  system prompt 
 
-#### 新增关键字 `prompt`
+####  `prompt`
 
 ```mora
 prompt "identity" do
@@ -2034,131 +2034,131 @@ end
 let sys = compose_prompt("identity", "memory")
 ```
 
-#### 新增内建函数
+#### 
 
-| 名字 | 作用 |
+|  |  |
 |---|---|
-| `compose_prompt(...)` | 拼接多段为单一 system prompt，按 section budget 截断 |
-| `tail(path, max: N)` | 取文件末 N 行（JSONL/纯文本） |
+| `compose_prompt(...)` |  system prompt section budget  |
+| `tail(path, max: N)` |  N JSONL/ |
 
-#### 新增值类型
+#### 
 
 - `Value::PromptSection { name, role, text, budget_bytes }`
 
-#### 新增 AST 节点
+####  AST 
 
 - `StmtKind::PromptSection { name, body }`
-- `StmtKind::PromptSet { key, value }`（块内 `set role:` / `set budget:`）
-- `StmtKind::PromptRead(NodeId)`（块内 `read`）
+- `StmtKind::PromptSet { key, value }` `set role:` / `set budget:`
+- `StmtKind::PromptRead(NodeId)` `read`
 
-#### 技术细节
+#### 
 
-- **零依赖**：无 tokenizer，按 UTF-8 字节近似（与 mimiclaw 同思路）
-- **可逆性**：每个 section 在环境里是可读 Value，便于调试与中间表示（IR）思路）
-- **可组合**：字典内联形参与块式声明产生同义结果
+- **** tokenizer UTF-8  mimiclaw 
+- **** section  ValueIR
+- ****
 
 ## [v0.25] - 2026-07-01
 
-### 代码模块化重构 (Code Modularization)
+###  (Code Modularization)
 
-对 5 个大文件进行了模块化拆分，提升代码可维护性：
+ 5 
 
-#### 拆分详情
-- **interpreter**: 3402 行 → 3 文件 (mod.rs + execute.rs + evaluate.rs)
-- **typeck**: 2838 行 → 2 文件 (mod.rs + check.rs)
-- **parser_v2**: 2609 行 → 3 文件 (mod.rs + statements.rs + expressions.rs)
-- **record**: 2091 行 → 7 文件 (mod.rs + serialization.rs + diff.rs + analysis.rs + audit.rs + snapshot.rs + tests.rs)
-- **lsp/providers**: 1092 行 → 11 文件 (mod.rs + helpers.rs + 9 个 provider 模块)
+#### 
+- **interpreter**: 3402  → 3  (mod.rs + execute.rs + evaluate.rs)
+- **typeck**: 2838  → 2  (mod.rs + check.rs)
+- **parser_v2**: 2609  → 3  (mod.rs + statements.rs + expressions.rs)
+- **record**: 2091  → 7  (mod.rs + serialization.rs + diff.rs + analysis.rs + audit.rs + snapshot.rs + tests.rs)
+- **lsp/providers**: 1092  → 11  (mod.rs + helpers.rs + 9  provider )
 
-#### 改进
-- 每个模块职责单一，便于理解和维护
-- 函数按功能分组，提高代码可读性
-- 模块间依赖关系更清晰
+#### 
+- 
+- 
+- 
 
-### 跨平台兼容性修复
-- 修复 `test_memory_save_load` 测试在 Windows 上的路径问题
-- 使用 `std::env::temp_dir()` 替代硬编码的 `/tmp` 路径
+### 
+-  `test_memory_save_load`  Windows 
+-  `std::env::temp_dir()`  `/tmp` 
 
 ## [v0.24] - 2026-06-30
 
-### ParserV2 完整迁移 (Complete)
+### ParserV2  (Complete)
 
-ParserV2 已完成对旧 Parser 的完整迁移，所有功能已覆盖。
-旧 parser.rs (2459 行) 已删除，主程序和测试全部使用 ParserV2。
+ParserV2  Parser 
+ parser.rs (2459 )  ParserV2
 
-#### 新增语句解析
-- **append_statement**: 追加文件写入
-- **read_bytes_statement**: 读取字节文件
-- **write_bytes_statement**: 写入字节文件
-- **stream_statement**: 流式循环 `stream <expr> as <var> do ... end`
-- **tool_statement**: 工具定义 `tool name(params): type do ... end`
-- **observe_statement**: 可观测性配置 (trace/metrics/otel)
-- **span_statement**: 追踪范围 `span "name" tags {..} do ... end`
-- **record_tokens_statement**: 记录 token 使用量
-- **assignment_statement**: 赋值语句 `IDENT = expr`
-- **index_assignment**: 索引赋值 `IDENT[expr] = expr`
-- **commit/rollback**: 事务提交/回滚
+#### 
+- **append_statement**: 
+- **read_bytes_statement**: 
+- **write_bytes_statement**: 
+- **stream_statement**:  `stream <expr> as <var> do ... end`
+- **tool_statement**:  `tool name(params): type do ... end`
+- **observe_statement**:  (trace/metrics/otel)
+- **span_statement**:  `span "name" tags {..} do ... end`
+- **record_tokens_statement**:  token 
+- **assignment_statement**:  `IDENT = expr`
+- **index_assignment**:  `IDENT[expr] = expr`
+- **commit/rollback**: /
 
-#### 新增表达式解析
-- **match_expression**: 模式匹配表达式 (含 when 守卫)
-- **pattern**: 模式解析 (字面量/变量/列表/字典/通配符)
-- **parse_format_string**: 格式字符串插值
-- **parse_ai_model_call**: ai_model 调用 (支持 keyword args)
-- **flatten_prompt_parts**: Prompt 表达式展平
-- **list_literal / dict_literal**: 列表和字典字面量
-- **char_literal**: 字符字面量 `'a'`
-- **NamespaceRef**: 命名空间引用 `Module::method()`
+#### 
+- **match_expression**:  ( when )
+- **pattern**:  (////)
+- **parse_format_string**: 
+- **parse_ai_model_call**: ai_model  ( keyword args)
+- **flatten_prompt_parts**: Prompt 
+- **list_literal / dict_literal**: 
+- **char_literal**:  `'a'`
+- **NamespaceRef**:  `Module::method()`
 
-#### 新增类型系统支持
-- **parse_generic_params**: 泛型参数 `<T: Bound>`
-- **parse_type_list**: 类型列表 `<T, U, V>`
-- **parse_type_name_recursive**: 递归解析嵌套泛型
-- **parse_where_clause**: where 子句
+#### 
+- **parse_generic_params**:  `<T: Bound>`
+- **parse_type_list**:  `<T, U, V>`
+- **parse_type_name_recursive**: 
+- **parse_where_clause**: where 
 
-#### 类型检查修复
-- **let 推断**: 已知类型自动推断，不再强制要求类型注解
-- **string + any**: 允许字符串拼接 (运行时做类型转换)
+#### 
+- **let **: 
+- **string + any**:  ()
 
-#### 重构
-- **ObserveConfig**: 在 ast_v2.rs 中定义新类型，使用 NodeId
-- **FnDef / TraitMethod**: 在 ast_v2.rs 中定义新类型，使用 Vec<NodeId>
-- **Pattern**: 在 ast_v2.rs 中定义新类型，Guard condition 使用 NodeId
-- **consume_method_name**: 支持关键字作为方法名
-- **表达式优先级**: 修复方法调用优先级 (binary → unary → call → primary)
-- **反向适配器**: ast_v2_to_v1.rs 支持完整 AST 转换
+#### 
+- **ObserveConfig**:  ast_v2.rs  NodeId
+- **FnDef / TraitMethod**:  ast_v2.rs  Vec<NodeId>
+- **Pattern**:  ast_v2.rs Guard condition  NodeId
+- **consume_method_name**: 
+- ****:  (binary → unary → call → primary)
+- ****: ast_v2_to_v1.rs  AST 
 
 ### 9 Languages Features Integration (Complete)
 
 All features from the learning plan have been implemented.
 
-### v0.21: Rust 风格类型系统
+### v0.21: Rust 
 
-- **借用语法**: `&expr` / `&mut expr`
-- **生命周期标注**: `<'a>` 参数
-- **借用冲突检查**: 编译期检查不可变/可变借用冲突
+- ****: `&expr` / `&mut expr`
+- ****: `<'a>` 
+- ****: /
 
-### v0.22: 性能优化
+### v0.22: 
 
-- **AI 调用内联缓存**: 相同 prompt 直接返回缓存结果
-- **管道融合**: 连续 map/filter/take/drop 合并执行
-- **常量折叠**: 编译期计算常量表达式
-- **字符串驻留**: 相同字符串只存储一次
-- **HTTP 连接池**: 线程池优化 (最多16线程)
-- **MCP 异步处理**: 线程池处理请求 (最多8并发)
-- **类型检查增量优化**: 缓存已检查的表达式类型
+- **AI **:  prompt 
+- ****:  map/filter/take/drop 
+- ****: 
+- ****: 
+- **HTTP **:  (16)
+- **MCP **:  (8)
+- ****: 
 
-### v0.24: 强类型升级
+### v0.24: 
 
-- **类型别名**: `type Name = TargetType`
-- **枚举类型**: `enum Name { V1, V2(Type) }`
-- **结构体类型**: `struct Name { field: Type }`
+- ****: `type Name = TargetType`
+- ****: `enum Name { V1, V2(Type) }`
+- ****: `struct Name { field: Type }`
 
-### 文档
+### 
 
-- **docs/mora-spec.md**: Mora 语言规范 (20 章)
-- **docs/influences.md**: 9 语言影响分析
-- **docs/learning-plan.md**: 特性融入计划
-- **docs/workflow-v0.20.md**: 开发工作流
+- **docs/mora-spec.md**: Mora  (20 )
+- **docs/influences.md**: 9 
+- **docs/learning-plan.md**: 
+- **docs/workflow-v0.20.md**: 
 
 From Prolog, StreamIt, APL, Clojure, Lisp, Smalltalk, Common Lisp, Ballerina, Logo.
 

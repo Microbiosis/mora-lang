@@ -4,22 +4,22 @@
 [![Release](https://img.shields.io/github/v/release/Microbiosis/mora-lang)](https://github.com/Microbiosis/mora-lang/releases/latest)
 [![CI](https://github.com/Microbiosis/mora-lang/actions/workflows/ci.yml/badge.svg)](https://github.com/Microbiosis/mora-lang/actions/workflows/ci.yml)
 
-**Mora** 是一门面向 **AI-native 自动化**的脚本语言——一段代码同时描述 LLM 调用、HTTP/MCP 服务、长期记忆、多 Agent 协作与可观测。
+**Mora**  **AI-native **—— LLM HTTP/MCP  Agent 
 
-**v0.51** 核心特性：
-- `p"..."` 模板表达式触发 AI 调用；`ai.chat` / `ai.embed` / `ai.critic` / `ai.retry` 内置
-- 同步解释执行（v0.52+ 编译到 MIR 字节码 提速 10×）
-- 0 外部 JSON/serde 依赖（手写 JSON Value + 序列化器，零外部锁）
-- 4 门禁全过：build / **606 测试** / fmt / clippy `-D warnings`
+**v0.51** 
+- `p"..."`  AI `ai.chat` / `ai.embed` / `ai.critic` / `ai.retry` 
+- v0.52+  MIR   10×
+- 0  JSON/serde  JSON Value + 
+- 4 build / **606 ** / fmt / clippy `-D warnings`
 
-**v0.50** 新增：Pregel BSP 编排引擎（21 个新关键字：`state` / `node` / `channel` / `checkpoint` / `command` / `send` / `interrupt` / `rewind` / ...），支持 LangGraph 风格 multi-agent + checkpoint 回溯。
+**v0.50** Pregel BSP 21 `state` / `node` / `channel` / `checkpoint` / `command` / `send` / `interrupt` / `rewind` / ... LangGraph  multi-agent + checkpoint 
 
-**v0.45** 起：ToolPlane Core/Extension adapter、MIR α.0 解释器（α.2 Import/Parallel/With 已接通）、SHA-256 hash-chained audit log。
+**v0.45** ToolPlane Core/Extension adapterMIR α.0 α.2 Import/Parallel/With SHA-256 hash-chained audit log
 
-[完整架构文档](docs/ARCHITECTURE.md) · [CHANGELOG](CHANGELOG.md) · [设计影响](docs/influences.md)
+[](docs/ARCHITECTURE.md) · [CHANGELOG](CHANGELOG.md) · [](docs/influences.md)
 
 ```mora
--- 一段代码 = HTTP + MCP + 可观测 (v0.04)
+--  = HTTP + MCP +  (v0.04)
 observe trace
 
 route fast: ai_model("gpt-4o-mini", temperature: 0.7)
@@ -33,7 +33,7 @@ serve as http on port 3000 do
   POST "/chat" -> fn(req)
     span "user_chat" tags {path: "/chat"} do
       let text = req["body"]["text"]
-      let answer = deep(p"用 deep 模型回答: {text}")
+      let answer = deep(p" deep : {text}")
       record_tokens(120, answer.len())
       return answer
     end
@@ -46,14 +46,14 @@ serve as mcp do
   end
 end
 
--- 跑 mora script.mora
+--  mora script.mora
 ```
 
-## 安装
+## 
 
-从 [Releases](https://github.com/Microbiosis/mora-lang/releases/latest) 下载对应平台的二进制包（包含 `mora` + `mora-lsp`），解压后即可使用。
+ [Releases](https://github.com/Microbiosis/mora-lang/releases/latest)  `mora` + `mora-lsp`
 
-| 平台 | 文件 |
+|  |  |
 |------|------|
 | Windows x86_64 | `mora-x86_64-pc-windows-msvc.zip` |
 | Linux x86_64 (glibc) | `mora-x86_64-unknown-linux-gnu.tar.gz` |
@@ -61,139 +61,139 @@ end
 | macOS Intel | `mora-x86_64-apple-darwin.tar.gz` |
 | macOS Apple Silicon | `mora-aarch64-apple-darwin.tar.gz` |
 
-可选：将 `mora` 所在目录加入系统 PATH，即可在任意位置运行 `mora` 命令。
+ `mora`  PATH `mora` 
 
-## 使用
+## 
 
 ```bash
-# 运行脚本
+# 
 mora script.mora
 
-# 交互式 REPL
+#  REPL
 mora --repl
 
-# 仅类型检查（不运行）
+# 
 mora --check script.mora
 
-# 启动 LSP 语言服务（供编辑器调用）
+#  LSP 
 mora-lsp
 
-# 从源码编译（需要 Rust 环境）
+#  Rust 
 cargo build --release
 ```
 
-## 语言特性
+## 
 
-### 基础语法
+### 
 
-| 特性 | 语法 |
+|  |  |
 |------|------|
-| 变量 | `let x = 1`，`let s: string = "你好"` |
-| 函数 | `task foo(x: string): string ... end` |
-| 闭包 | `fn(x) return x + 1 end` |
-| 列表 | `[1, 2, 3]`，`list.map(fn)`，`list.filter(fn)`，`list.reduce(fn, init)` |
-| 字典 | `{key: val}`，`dict.get("key")` |
-| 字符串 | `.len()`、`.upper()`、`.lower()`、`.trim()`、`.split()`、`.contains()`、`.replace()` |
-| 流程控制 | `if/then/end`、`for x in list/end`、`match expr with/end` |
-| 管道运算符 | `data \|> func()` |
-| 并行执行 | `parallel ... end` |
-| 模块系统 | `import "path"`，`export let/task` |
+|  | `let x = 1``let s: string = ""` |
+|  | `task foo(x: string): string ... end` |
+|  | `fn(x) return x + 1 end` |
+|  | `[1, 2, 3]``list.map(fn)``list.filter(fn)``list.reduce(fn, init)` |
+|  | `{key: val}``dict.get("key")` |
+|  | `.len()``.upper()``.lower()``.trim()``.split()``.contains()``.replace()` |
+|  | `if/then/end``for x in list/end``match expr with/end` |
+|  | `data \|> func()` |
+|  | `parallel ... end` |
+|  | `import "path"``export let/task` |
 
-### v0.16-v0.24 新特性
+### v0.16-v0.24 
 
-| 版本 | 特性 | 来源 | 语法 |
+|  |  |  |  |
 |------|------|------|------|
-| **v0.16** | 守卫条件 | Prolog | `match n with x when x > 0 -> ... end` |
-| **v0.16** | 列表 rest | Prolog | `let [head, ...tail] = [1, 2, 3]` |
-| **v0.17** | 管道闭包 | StreamIt | `5 \|> fn(x) return x * 2 end` |
-| **v0.17** | 窗口聚合 | StreamIt | `[1,2,3,4,5].window(3)` |
-| **v0.17** | 数组操作 | APL | `.shape()`、`.flatten()`、`.transpose()`、`.reshape()` |
-| **v0.17** | 广播算术 | APL | `[1,2,3] * 2` → `[2,4,6]` |
-| **v0.18** | 组合函数 | Clojure | `compose(f, g, h)` |
-| **v0.18** | 部分应用 | Lisp | `partial(add, 10)` |
-| **v0.19** | 原子引用 | Clojure | `atom(0)`、`swap()`、`deref()` |
-| **v0.19** | Worker 并发 | Ballerina | `parallel worker w1 ... end end` |
-| **v0.19** | 事务支持 | Ballerina | `transaction ... compensation ... end` |
-| **v0.20** | 运行时反射 | Smalltalk | `type_of()`、`is_instance()`、`methods_of()` |
-| **v0.20** | 用户宏 | Common Lisp | `macro name(params) ... end` |
-| **v0.21** | 借用语法 | Rust | `&expr`、`&mut expr` |
-| **v0.21** | 生命周期 | Rust | `<'a>` 参数 |
-| **v0.22** | AI 缓存 | 优化 | 相同 prompt 直接返回缓存 |
-| **v0.22** | 管道融合 | 优化 | 连续操作合并执行 |
-| **v0.22** | 常量折叠 | 优化 | 编译期计算 |
-| **v0.24** | 类型别名 | 强类型 | `type Name = TargetType` |
-| **v0.24** | 枚举类型 | 强类型 | `enum Name { V1, V2(Type) }` |
-| **v0.24** | 结构体类型 | 强类型 | `struct Name { field: Type }` |
+| **v0.16** |  | Prolog | `match n with x when x > 0 -> ... end` |
+| **v0.16** |  rest | Prolog | `let [head, ...tail] = [1, 2, 3]` |
+| **v0.17** |  | StreamIt | `5 \|> fn(x) return x * 2 end` |
+| **v0.17** |  | StreamIt | `[1,2,3,4,5].window(3)` |
+| **v0.17** |  | APL | `.shape()``.flatten()``.transpose()``.reshape()` |
+| **v0.17** |  | APL | `[1,2,3] * 2` → `[2,4,6]` |
+| **v0.18** |  | Clojure | `compose(f, g, h)` |
+| **v0.18** |  | Lisp | `partial(add, 10)` |
+| **v0.19** |  | Clojure | `atom(0)``swap()``deref()` |
+| **v0.19** | Worker  | Ballerina | `parallel worker w1 ... end end` |
+| **v0.19** |  | Ballerina | `transaction ... compensation ... end` |
+| **v0.20** |  | Smalltalk | `type_of()``is_instance()``methods_of()` |
+| **v0.20** |  | Common Lisp | `macro name(params) ... end` |
+| **v0.21** |  | Rust | `&expr``&mut expr` |
+| **v0.21** |  | Rust | `<'a>`  |
+| **v0.22** | AI  |  |  prompt  |
+| **v0.22** |  |  |  |
+| **v0.22** |  |  |  |
+| **v0.24** |  |  | `type Name = TargetType` |
+| **v0.24** |  |  | `enum Name { V1, V2(Type) }` |
+| **v0.24** |  |  | `struct Name { field: Type }` |
 
-### 标准库
+### 
 
-| 模块 | 功能 |
+|  |  |
 |------|------|
-| `json.*` | `json.parse(text)`，`json.stringify(value)` |
-| `web.*` | `web.fetch(url)`（真实 HTTP，基于 ureq） |
-| `file.*` | `read_text/write_text/append_text/read_bytes/write_bytes`、`exists/is_file/is_dir/size/list/mkdir/remove/rename/copy/touch`、`cwd/chdir/home_dir/join/abs/basename/dirname/extname` |
-| 持久化 | `save "file.json", value`，`load "file.json", var` |
-| 文件语法糖 | `read "a.txt" into x`，`write "a.txt", content`，`append "a.txt", content` |
+| `json.*` | `json.parse(text)``json.stringify(value)` |
+| `web.*` | `web.fetch(url)` HTTP ureq |
+| `file.*` | `read_text/write_text/append_text/read_bytes/write_bytes``exists/is_file/is_dir/size/list/mkdir/remove/rename/copy/touch``cwd/chdir/home_dir/join/abs/basename/dirname/extname` |
+|  | `save "file.json", value``load "file.json", var` |
+|  | `read "a.txt" into x``write "a.txt", content``append "a.txt", content` |
 
-### v1.0 方向与项目哲学
+### v1.0 
 
-Mora **永远不会到达 v1.0**,但**永远在逼近 v1.0**。
+Mora ** v1.0**,** v1.0**
 
-- v1.0 的方向是真实的:形式化语义、Hindley-Milner 推断、向量嵌入、长期记忆、SemVer API 稳定性等
-- 这些方向的工作**持续在做**,从 v0.13 起每个版本都推进一部分
-- 因为 v1.0 不到达,所以这些工作**永远做不完,永远在优化**
-- 这是项目基因的一部分 —— 不是"以后再说"的托词,是"现在就在做但永远在路上"的诚实
+- v1.0 :Hindley-Milner SemVer API 
+- ****, v0.13 
+-  v1.0 ,**,**
+-  —— "",""
 
-表中标 🔄 的项 = 正在逼近 v1.0 但仍在演进,不代表"推迟",代表"持续优化方向"。
+   =  v1.0 ,"",""
 
-### AI 调用
+### AI 
 
-> ⚠️ **v0.04 不兼容 v0.03**。下列 v0.03 builtin **已删除**，
-> 调用会得到运行时错误 `Unknown method: ai.xxx` / `Unknown method: memory.xxx`：
+>  **v0.04  v0.03** v0.03 builtin ****
+>  `Unknown method: ai.xxx` / `Unknown method: memory.xxx`
 >
 > - `ai.chat` / `ai.stream` / `ai.tool` / `ai.route` / `ai.budget` / `ai.usage`
 > - `ai.embed` / `ai.cosine` / `ai.dot` / `ai.euclidean` / `ai.norm` / `ai.search`
 > - `memory.store` / `memory.recall` / `memory.forget` / `memory.clear` / `memory.list` / `memory.len`
 >
-> 替代见下表。
+> 
 
-v0.04 把 AI 调用做成语法原语（`p"..."` / `with` / `stream` / `tool` / `catch e: AiError`）。
-`ai.create` 和 `agent.critic` 仍保留，按值接收，不按方法调用风格。
+v0.04  AI `p"..."` / `with` / `stream` / `tool` / `catch e: AiError`
+`ai.create`  `agent.critic` 
 
-| 特性 | 语法 | v0.04 状态 |
+|  |  | v0.04  |
 |------|------|-----------|
-| AI 对话 | `p"hello"` | ✅ 表达式 |
-| 多轮对话 | `let conv = ai.create("model"); conv.chat("...")` | ✅ 保留 |
-| 流式输出 | `for token in ai.stream(p"...")` | ✅ 保留（注：mock 模式按字符拆 token，v0.04.1 跟进真实 SSE） |
-| 工具调用 | `tool name(args): T do ... end` | ✅ 顶层语句 |
-| 上下文配置 | `with model = "..." / budget = N` | ✅ 块语句 |
-| AI 错误 | `try ... catch e: AiError` | ✅ 类型化错误，注入 dict `{message, code, retryable, attempts, cause}` |
-| 显式 token 计数 | `record_tokens(input, output)` | ✅ 顶层语句 |
-| 向量嵌入 | `ai.embed(text \| list)` | 🔄 逼近 v1.0 持续方向 |
-| 向量运算 | `ai.cosine/dot/euclidean/norm` | 🔄 逼近 v1.0 持续方向 |
-| 语义检索 | `ai.search(query, corpus, k?)` | 🔄 逼近 v1.0 持续方向 |
-| 多模型路由 | `route fast: ai_model("gpt-4o-mini")` | ✅ 块语句（旧写法 `route fast: "gpt-4o-mini"` 仍兼容） |
-| Token 预算 | `with budget = N` + `observe trace` | ✅ 由 `with` 配置 + observe metrics 替代 |
-| Token 用量查询 | `observe trace` / `observe metrics` 块内置 | ✅ 由 observe 块 metrics 替代 `ai.usage()` |
-| 长期记忆 | `memory.store/recall/forget/...` | 🔄 逼近 v1.0 持续方向 |
-| Agent 编排 | `agent.create(name, config).run(task)` | ✅ 保留 |
-| 输出评估 | `agent.critic(text)` / `agent.critic(text, ctx)` | ✅ 保留 |
+| AI  | `p"hello"` |   |
+|  | `let conv = ai.create("model"); conv.chat("...")` |   |
+|  | `for token in ai.stream(p"...")` |  mock  tokenv0.04.1  SSE |
+|  | `tool name(args): T do ... end` |   |
+|  | `with model = "..." / budget = N` |   |
+| AI  | `try ... catch e: AiError` |   dict `{message, code, retryable, attempts, cause}` |
+|  token  | `record_tokens(input, output)` |   |
+|  | `ai.embed(text \| list)` |   v1.0  |
+|  | `ai.cosine/dot/euclidean/norm` |   v1.0  |
+|  | `ai.search(query, corpus, k?)` |   v1.0  |
+|  | `route fast: ai_model("gpt-4o-mini")` |   `route fast: "gpt-4o-mini"`  |
+| Token  | `with budget = N` + `observe trace` |   `with`  + observe metrics  |
+| Token  | `observe trace` / `observe metrics`  |   observe  metrics  `ai.usage()` |
+|  | `memory.store/recall/forget/...` |   v1.0  |
+| Agent  | `agent.create(name, config).run(task)` |   |
+|  | `agent.critic(text)` / `agent.critic(text, ctx)` |   |
 
-## 环境变量
+## 
 
-| 变量 | 说明 | 默认值 |
+|  |  |  |
 |------|------|--------|
-| `OPENAI_API_KEY` | 启用真实 AI 调用 | （空 = mock 模式） |
-| `MORA_AI_MODEL` | AI 模型名称 | `gpt-4o-mini` |
-| `MORA_AI_BASE_URL` | API 端点地址 | `https://api.openai.com/v1` |
-| `MORA_EMBED_MODEL` | Embedding 模型 | `text-embedding-3-small` |
-| `MORA_NO_TYPECK` | 设为 `1` 跳过静态类型检查 | （空 = 启用） |
+| `OPENAI_API_KEY` |  AI  |  = mock  |
+| `MORA_AI_MODEL` | AI  | `gpt-4o-mini` |
+| `MORA_AI_BASE_URL` | API  | `https://api.openai.com/v1` |
+| `MORA_EMBED_MODEL` | Embedding  | `text-embedding-3-small` |
+| `MORA_NO_TYPECK` |  `1`  |  =  |
 
-## 云服务部署
+## 
 
-v0.04 把 HTTP server、MCP server、可观测放进语言层。脚本可以同时起 HTTP + MCP + trace。
+v0.04  HTTP serverMCP server HTTP + MCP + trace
 
-### `serve` 块
+### `serve` 
 
 ```mora
 observe trace
@@ -203,7 +203,7 @@ route deep: "gpt-4o"
 
 serve as http on port 3000 do
   GET "/health" -> fn(req) return {status: "ok"} end
-  POST "/chat"  -> fn(req) return deep(p"用 deep 回答: {req.body.text}") end
+  POST "/chat"  -> fn(req) return deep(p" deep : {req.body.text}") end
 end
 
 serve as mcp do
@@ -213,20 +213,20 @@ serve as mcp do
 end
 ```
 
-跑 `mora script.mora` 同时起 HTTP (3000) + MCP (stdio) + trace。
+ `mora script.mora`  HTTP (3000) + MCP (stdio) + trace
 
-| 协议 | 关键字 | 用途 |
+|  |  |  |
 |------|--------|------|
-| HTTP | `serve as http on port N` | REST API (动态路由) |
+| HTTP | `serve as http on port N` | REST API () |
 
-**v0.11 起**：HTTP server 启动时如果 `port N` 被占，会自动试 `N+1, N+2, N+3`（最多 4 个端口），
-并设置 `SO_REUSEADDR`（允许重用 TIME_WAIT 状态的端口）。如果 4 个端口都被占，server 启动失败。
-控制台会打印实际监听的端口，例如 `[serve] requested port 3000 unavailable, using 3001 instead`。
-| MCP | `serve as mcp` | Claude Desktop 等 MCP 客户端 |
-| REPL | `serve as repl` | 进入交互式 REPL |
-| Stdio | `serve as stdio` | echo 占位（v0.04.1 跟进自定义协议） |
+**v0.11 **HTTP server  `port N`  `N+1, N+2, N+3` 4 
+ `SO_REUSEADDR` TIME_WAIT  4 server 
+ `[serve] requested port 3000 unavailable, using 3001 instead`
+| MCP | `serve as mcp` | Claude Desktop  MCP  |
+| REPL | `serve as repl` |  REPL |
+| Stdio | `serve as stdio` | echo v0.04.1  |
 
-### `route` 块 (模型绑定)
+### `route`  ()
 
 ```mora
 route fast: "gpt-4o-mini"
@@ -236,9 +236,9 @@ let s = fast(p"summarize: {text}")
 let a = deep(p"analyze: {question}")
 ```
 
-`fast(p"...")` 自动绑到 `gpt-4o-mini`, `deep(p"...")` 绑到 `gpt-4o`。
+`fast(p"...")`  `gpt-4o-mini`, `deep(p"...")`  `gpt-4o`
 
-### `observe` / `span` 块 (可观测)
+### `observe` / `span`  ()
 
 ```mora
 observe trace
@@ -250,88 +250,88 @@ span "user_request" tags {user_id: u.id} do
 end
 ```
 
-`observe` 启用 trace, `span` RAII 风格的子块。`record_tokens` 显式计 token。
+`observe`  trace, `span` RAII `record_tokens`  token
 
-## 静态类型检查
+## 
 
-Mora v11 在解释执行前自动做一遍轻量静态类型检查。
+Mora v11 
 
 ```mora
-let name: string = "mora"          -- ✅ 匹配
-let age: number = "thirty"         -- ❌ typeck: string → number
+let name: string = "mora"          --  
+let age: number = "thirty"         --  typeck: string → number
 task add(a: number, b: number): number
   return a + b
 end
-add(1, 2)                          -- ✅
-add(1)                             -- ❌ 期望 2 个参数
-add("x", 2)                        -- ❌ 参数 1 期望 number
+add(1, 2)                          -- 
+add(1)                             --   2 
+add("x", 2)                        --   1  number
 ```
 
-**规则**：
-- 多错误一次报告（不首个终止）
-- 每条错误带行号（`Type error at line N: ...`）
-- 未知类型 / 跨模块 task 视为 Any，不强制检查
-- `MORA_NO_TYPECK=1` 跳过 typeck，让动态行为生效
+****
+- 
+- `Type error at line N: ...`
+-  /  task  Any
+- `MORA_NO_TYPECK=1`  typeck
 
-## LSP 语言服务
+## LSP 
 
-`mora-lsp` binary 提供 IDE 支持。JSON-RPC 帧解析、JSON 序列化手写。
+`mora-lsp` binary  IDE JSON-RPC JSON 
 
 ```bash
-# 启动 LSP server（用编辑器配置为 LSP 启动命令）
+#  LSP server LSP 
 mora-lsp
 ```
 
-**支持能力**（与 `initialize` 响应中的 capabilities 一致）：
-- `textDocumentSync`（full sync）
-- `hover` — 悬停看变量/task 类型签名
-- `completion` — 关键字 + 变量 + task + builtin
+**** `initialize`  capabilities 
+- `textDocumentSync`full sync
+- `hover` — /task 
+- `completion` —  +  + task + builtin
 - `definition` — go-to-definition
-- `references` — 查找所有引用
-- `documentSymbol` — 大纲
-- `documentFormatting` + `documentRangeFormatting` — 基础缩进格式化
-- `rename` — 跨引用重命名
-- `semanticTokens` — 语法高亮增强
-- `foldingRange` — if/for/task 块折叠
-- `publishDiagnostics` — typeck 错误推送
+- `references` — 
+- `documentSymbol` — 
+- `documentFormatting` + `documentRangeFormatting` — 
+- `rename` — 
+- `semanticTokens` — 
+- `foldingRange` — if/for/task 
+- `publishDiagnostics` — typeck 
 
-**端到端测试**：`cargo run --example lsp_smoke` 会启动 `mora-lsp` 子进程 + 模拟 LSP 客户端，验证 typeck diagnostics / hover / completion。
+****`cargo run --example lsp_smoke`  `mora-lsp`  +  LSP  typeck diagnostics / hover / completion
 
-## 编辑器集成
+## 
 
-详见 [editors/](./editors/README.md)。提供 6 个主流编辑器的即用配置：
+ [editors/](./editors/README.md) 6 
 
-| 编辑器 | 难度 | 关键文件 |
+|  |  |  |
 |--------|------|----------|
-| [VS Code](./editors/vscode/) | 中（VSIX） | `package.json` + TextMate grammar |
-| [Neovim](./editors/neovim/) | 低 | `lua/mora-lsp.lua` |
-| [Helix](./editors/helix/) | 低 | `languages.toml` |
-| [Sublime Text](./editors/sublime/) | 低 | `mora.sublime-settings` |
-| [Vim](./editors/vim/) | 低 | `ftplugin/mora.vim` |
-| [Emacs](./editors/emacs/) | 低 | `mora-mode.el` |
+| [VS Code](./editors/vscode/) | VSIX | `package.json` + TextMate grammar |
+| [Neovim](./editors/neovim/) |  | `lua/mora-lsp.lua` |
+| [Helix](./editors/helix/) |  | `languages.toml` |
+| [Sublime Text](./editors/sublime/) |  | `mora.sublime-settings` |
+| [Vim](./editors/vim/) |  | `ftplugin/mora.vim` |
+| [Emacs](./editors/emacs/) |  | `mora-mode.el` |
 
-CI 自动构建多平台 mora + mora-lsp 二进制并发布到 GitHub Releases（见 `.github/workflows/release.yml`）。
+CI  mora + mora-lsp  GitHub Releases `.github/workflows/release.yml`
 
-## 架构
+## 
 
 ```
-源码 .mora → 词法分析器 → Token 流 → ParserV2 → ASTv2 ─┬─→ 反向适配器 → AST → 解释器 → Value
-                                                        │    ├── ai.stream/chat/tool/route/budget
-                                                        │    ├── memory.store/recall
-                                                        │    ├── agent.create().run()
-                                                        │    └── web.fetch / json.* / file.*
-                                                        ├─→ 类型检查器 → 错误报告
-                                                        └─→ LSP 语言服务 → 编辑器
+ .mora →  → Token  → ParserV2 → ASTv2 →  → AST →  → Value
+                                                             ai.stream/chat/tool/route/budget
+                                                             memory.store/recall
+                                                             agent.create().run()
+                                                             web.fetch / json.* / file.*
+                                                        →  → 
+                                                        → LSP  → 
 ```
 
-- **词法分析器**（`src/lexer.rs`）—— 手写字符扫描器，token 携带行号+列号
-- **解析器**（`src/parser_v2.rs`）—— 递归下降，Arena 分配，直接输出 ast_v2 节点
-- **AST v2**（`src/ast_v2.rs`）—— NodeId 引用，类型信息保留，Pattern/ObserveConfig/FnDef 独立定义
-- **反向适配器**（`src/ast_v2_to_v1.rs`）—— 将 ast_v2 转换为旧 ast，供解释器使用
-- **解释器**（`src/interpreter.rs`）—— 树遍历执行，AI 原生内置模块
-- **类型检查器**（`src/typeck.rs`）—— 编译期静态检查，多错误一次报告
-- **LSP 服务**（`src/lsp/`）—— 手写 JSON-RPC，hover/completion/rename/diagnostics
+- ****`src/lexer.rs`—— token +
+- ****`src/parser_v2.rs`—— Arena  ast_v2 
+- **AST v2**`src/ast_v2.rs`—— NodeId Pattern/ObserveConfig/FnDef 
+- ****`src/ast_v2_to_v1.rs`——  ast_v2  ast
+- ****`src/interpreter.rs`—— AI 
+- ****`src/typeck.rs`—— 
+- **LSP **`src/lsp/`——  JSON-RPChover/completion/rename/diagnostics
 
-## 许可证
+## 
 
 BSD-3-Clause

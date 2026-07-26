@@ -1,69 +1,69 @@
-# Interpreter Facade 拆分（ADR-001）实施计划
+# Interpreter Facade ADR-001
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** 完成 ADR-001 完整实施，将 `Interpreter` god object（33 字段 / 43 行 Clone）拆为薄核心 + 6 个 Domain Facade，推动 **Plateau A 结构债清偿** 退出门。
+**Goal:**  ADR-001  `Interpreter` god object33  / 43  Clone + 6  Domain Facade **Plateau A ** 
 
-**Architecture:** 按 ADR-001 §1 BC 边界拆为 6 facade（`InfraRuntime` / `AiRuntime` / `OrchRuntime` / `PersistRuntime` / `SandboxRuntime` / `RegistryRuntime`） + 1 薄核心 `CoreRuntime`。`Interpreter` 只保留 7 个 facade 字段（`pub(crate)`），所有业务字段变 private。跨 facade 协作通过显式依赖注入（`&mut AiRuntime` 等），返回 owned 数据避免 borrow 摩擦。8 个独立 commit，每 commit 抽 1 facade（最后 1 commit 拆 `builtins.rs`），每 commit 含 3-5 个 facade 单元测试。
+**Architecture:**  ADR-001 §1 BC  6 facade`InfraRuntime` / `AiRuntime` / `OrchRuntime` / `PersistRuntime` / `SandboxRuntime` / `RegistryRuntime` + 1  `CoreRuntime``Interpreter`  7  facade `pub(crate)` private facade `&mut AiRuntime`  owned  borrow 8  commit commit  1 facade 1 commit  `builtins.rs` commit  3-5  facade 
 
-**Tech Stack:** Rust 2024 edition / 现有 `Interpreter` / `Arc<Mutex<>>` 模式 / 现有 613 tests 基础 / `#[cfg(test)]` 单元测试 / `cargo test --all` + `cargo clippy --all-targets --all-features -- -D warnings`
+**Tech Stack:** Rust 2024 edition /  `Interpreter` / `Arc<Mutex<>>`  /  613 tests  / `#[cfg(test)]`  / `cargo test --all` + `cargo clippy --all-targets --all-features -- -D warnings`
 
 **Spec:** [`../specs/2026-07-09-interpreter-facade.md`](../specs/2026-07-09-interpreter-facade.md)
 
 ---
 
-## 文件结构（前置：commit 1 后落地）
+## commit 1 
 
-新增/修改：
+/
 
 ```
 src/
-├── runtime/                          ← 新建（commit 1 起逐步填充）
-│   ├── mod.rs                        ← 新建（commit 1）
-│   ├── core.rs                       ← 新建（commit 7）
-│   ├── ai.rs                         ← 新建（commit 2）
-│   ├── orch.rs                       ← 新建（commit 3）
-│   ├── persist.rs                    ← 新建（commit 4）
-│   ├── sandbox.rs                    ← 新建（commit 5）
-│   ├── registry.rs                   ← 新建（commit 6）
-│   └── infra.rs                      ← 新建（commit 1）
-├── interpreter/
-│   ├── mod.rs                        ← 修改（8 commits 累积）
-│   ├── builtins/                     ← 新建（commit 8）
-│   │   ├── mod.rs
-│   │   ├── file.rs
-│   │   ├── sandbox.rs
-│   │   ├── ai.rs
-│   │   ├── memory.rs
-│   │   ├── schedule.rs
-│   │   ├── json.rs
-│   │   ├── document.rs
-│   │   ├── toolplane.rs
-│   │   └── mora.rs
-│   ├── builtins.rs                   ← commit 8 删除
-│   └── dispatch.rs                   ← commit 8 拆 MethodDispatch trait
+ runtime/                          ← commit 1 
+    mod.rs                        ← commit 1
+    core.rs                       ← commit 7
+    ai.rs                         ← commit 2
+    orch.rs                       ← commit 3
+    persist.rs                    ← commit 4
+    sandbox.rs                    ← commit 5
+    registry.rs                   ← commit 6
+    infra.rs                      ← commit 1
+ interpreter/
+    mod.rs                        ← 8 commits 
+    builtins/                     ← commit 8
+       mod.rs
+       file.rs
+       sandbox.rs
+       ai.rs
+       memory.rs
+       schedule.rs
+       json.rs
+       document.rs
+       toolplane.rs
+       mora.rs
+    builtins.rs                   ← commit 8 
+    dispatch.rs                   ← commit 8  MethodDispatch trait
 ```
 
 ---
 
-## Task 1: 抽 `InfraRuntime` facade
+## Task 1:  `InfraRuntime` facade
 
 **Files:**
 - Create: `src/runtime/mod.rs`
 - Create: `src/runtime/infra.rs`
-- Modify: `src/interpreter/mod.rs:203-326`（移除 InfraRuntime 字段 + 调整 new/Clone）
-- Modify: 所有访问 `interp.recorder` / `interp.string_interner` / `interp.ai_cache` / `interp.bus` / `interp.scheduler` 的点（约 30+ 处）
+- Modify: `src/interpreter/mod.rs:203-326` InfraRuntime  +  new/Clone
+- Modify:  `interp.recorder` / `interp.string_interner` / `interp.ai_cache` / `interp.bus` / `interp.scheduler`  30+ 
 
-**注意**：本计划给出**关键 sub-task** 与代码骨架（避免数千行 plan）。执行时按需展开。
+****** sub-task**  plan
 
-### Task 1.1: 创建 `src/runtime/mod.rs`
+### Task 1.1:  `src/runtime/mod.rs`
 
-- [ ] **Step 1: 写空 mod 声明**
+- [ ] **Step 1:  mod **
 
 ```rust
-//! v0.52 ADR-001: 6 Domain Facade 容器模块
+//! v0.52 ADR-001: 6 Domain Facade 
 //!
-//! 每个 facade 是一个 BC 的状态 + 行为封装：
+//!  facade  BC  + 
 //! - AiRuntime       (BC3)
 //! - OrchRuntime     (BC4)
 //! - PersistRuntime  (BC5)
@@ -71,7 +71,7 @@ src/
 //! - RegistryRuntime (BC8)
 //! - InfraRuntime    (BC9)
 //!
-//! 跨 facade 协作通过显式依赖注入（参数传 &mut facade），避免 borrow 摩擦。
+//!  facade  &mut facade borrow 
 
 pub mod ai;
 pub mod core;
@@ -82,17 +82,17 @@ pub mod registry;
 pub mod sandbox;
 ```
 
-- [ ] **Step 2: 编译验证**
+- [ ] **Step 2: **
 
 Run: `cd "D:/Github/mora-lang" && cargo build --all-targets 2>&1 | tail -5`
-Expected: 失败（ai/core/orch/persist/registry/sandbox 还没建）— 这是预期的，下一步建。
+Expected: ai/core/orch/persist/registry/sandbox — 
 
-### Task 1.2: 创建 `src/runtime/infra.rs`（最小可用版本）
+### Task 1.2:  `src/runtime/infra.rs`
 
-- [ ] **Step 1: 写 InfraRuntime struct + Default + 单元测试骨架**
+- [ ] **Step 1:  InfraRuntime struct + Default + **
 
 ```rust
-//! v0.52 ADR-001: InfraRuntime — BC9 (scheduling + 字符串驻留 + recorder)
+//! v0.52 ADR-001: InfraRuntime — BC9 (scheduling +  + recorder)
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -124,13 +124,13 @@ impl Default for InfraRuntime {
 }
 
 impl InfraRuntime {
-    /// 构造带指定 thread_id 的 recorder
+    ///  thread_id  recorder
     pub fn with_recorder_thread(mut self, thread_id: String) -> Self {
         self.recorder = Recorder::new_off().with_thread(thread_id);
         self
     }
 
-    /// 字符串驻留（去重）
+    /// 
     pub fn intern_string(&self, val: Value) -> u64 {
         self.string_interner.lock().put(val)
     }
@@ -172,74 +172,74 @@ mod tests {
 }
 ```
 
-> **注意**：具体字段类型（`RecordState` / `LruCache::new` / `Recorder::new_off()`）需要从 `src/interpreter/mod.rs:139-179` 和 `src/record/mod.rs` 实际定义确认。执行时按需调整。
+> ****`RecordState` / `LruCache::new` / `Recorder::new_off()` `src/interpreter/mod.rs:139-179`  `src/record/mod.rs` 
 
-- [ ] **Step 2: 在 mod.rs 加 `pub mod infra;`**
+- [ ] **Step 2:  mod.rs  `pub mod infra;`**
 
-（已在 1.1 Step 1 中加入）
+ 1.1 Step 1 
 
-- [ ] **Step 3: 编译验证 infra.rs 单独**
+- [ ] **Step 3:  infra.rs **
 
 Run: `cd "D:/Github/mora-lang" && cargo build -p mora --lib 2>&1 | tail -20`
-Expected: 可能因其他 facade 缺而失败 — 临时方案：建空 stub（见 1.3）。
+Expected:  facade  —  stub 1.3
 
-### Task 1.3: 建 5 个 facade 空 stub（让编译过）
+### Task 1.3:  5  facade  stub
 
-- [ ] **Step 1: 在 `src/runtime/` 建 ai.rs / orch.rs / persist.rs / sandbox.rs / registry.rs / core.rs 空文件**
+- [ ] **Step 1:  `src/runtime/`  ai.rs / orch.rs / persist.rs / sandbox.rs / registry.rs / core.rs **
 
-每个文件最小内容：
+
 
 ```rust
-//! Stub — 待对应 commit 填充
+//! Stub —  commit 
 ```
 
-- [ ] **Step 2: 编译**
+- [ ] **Step 2: **
 
 Run: `cd "D:/Github/mora-lang" && cargo build --all-targets 2>&1 | tail -5`
-Expected: PASS（可能有些 unused warning）
+Expected: PASS unused warning
 
-### Task 1.4: 把 Interpreter 的 InfraRuntime 字段迁出
+### Task 1.4:  Interpreter  InfraRuntime 
 
-- [ ] **Step 1: 修改 `Interpreter` struct**
+- [ ] **Step 1:  `Interpreter` struct**
 
-在 `src/interpreter/mod.rs:203-275` 移除：
+ `src/interpreter/mod.rs:203-275` 
 - `recorder: crate::record::Recorder`
 - `string_interner: std::sync::Arc<Mutex<LruCache<Value>>>`
 - `ai_cache: std::sync::Arc<Mutex<LruCache<String>>>`
 - `bus: crate::event::EventBus`
 - `scheduler: crate::schedule::Scheduler`
 
-替换为：
+
 ```rust
 pub(crate) infra: crate::runtime::infra::InfraRuntime,
 ```
 
-- [ ] **Step 2: 修改 `Interpreter::new()`**
+- [ ] **Step 2:  `Interpreter::new()`**
 
-把字段初始化改成：
+
 ```rust
 infra: InfraRuntime::default(),
 ```
 
-- [ ] **Step 3: 修改 `Clone for Interpreter`**
+- [ ] **Step 3:  `Clone for Interpreter`**
 
-`recorder: crate::record::Recorder::new_off()` → `infra: InfraRuntime::default()`（注：Clone 改成全用 default，因为这些字段共享 Arc）
-> **更优**：保留 `infra` 的 Clone（内部 Arc clone 仍是 O(1)）
+`recorder: crate::record::Recorder::new_off()` → `infra: InfraRuntime::default()`Clone  default Arc
+> **** `infra`  Clone Arc clone  O(1)
 
-实际用：
+
 ```rust
 infra: self.infra.clone(),
 ```
 
-- [ ] **Step 4: 改所有访问点（grep 后批量）**
+- [ ] **Step 4: grep **
 
 Run: `cd "D:/Github/mora-lang" && grep -rn "self.recorder\|self.string_interner\|self.ai_cache\|self.bus\|self.scheduler" src/ --include="*.rs" 2>&1 | head -30`
 
-对每个匹配点改为 `self.infra.recorder` / `self.infra.string_interner` / `self.infra.ai_cache` / `self.infra.bus` / `self.infra.scheduler`。
+ `self.infra.recorder` / `self.infra.string_interner` / `self.infra.ai_cache` / `self.infra.bus` / `self.infra.scheduler`
 
-> **若某个 facade 方法需要其他 facade**：通过 `&Interpreter` 拿（按 spec §2.3 模式）。
+> ** facade  facade** `&Interpreter`  spec §2.3 
 
-- [ ] **Step 5: 跑 4 门禁**
+- [ ] **Step 5:  4 **
 
 ```bash
 cd "D:/Github/mora-lang"
@@ -249,22 +249,22 @@ cargo fmt --check 2>&1 | head -3
 cargo clippy --all-targets --all-features -- -D warnings 2>&1 | tail -3
 ```
 
-Expected: 全部 PASS；测试数 ≥ 618（613 现有 + 5 新增 InfraRuntime unit）
+Expected:  PASS ≥ 618613  + 5  InfraRuntime unit
 
 - [ ] **Step 6: Commit**
 
 ```bash
 cd "D:/Github/mora-lang"
 git add src/runtime/ src/interpreter/mod.rs
-git commit -m "refactor(ADR-001): 抽 InfraRuntime facade
+git commit -m "refactor(ADR-001):  InfraRuntime facade
 
-- 新增 src/runtime/{mod,infra}.rs
-- Interpreter 移除 recorder/string_interner/ai_cache/bus/scheduler 5 字段
-- 替换为 pub(crate) infra: InfraRuntime
-- 30+ 访问点改为 self.infra.xxx
-- 5 个 InfraRuntime 单元测试
+-  src/runtime/{mod,infra}.rs
+- Interpreter  recorder/string_interner/ai_cache/bus/scheduler 5 
+-  pub(crate) infra: InfraRuntime
+- 30+  self.infra.xxx
+- 5  InfraRuntime 
 
-验证：
+
   cargo build --all-targets  PASS
   cargo test --all          618+ passed / 0 failed / 14 ignored
   cargo fmt --check         PASS
@@ -273,109 +273,109 @@ git commit -m "refactor(ADR-001): 抽 InfraRuntime facade
 
 ---
 
-## Task 2-6: 抽 AiRuntime / OrchRuntime / PersistRuntime / SandboxRuntime / RegistryRuntime
+## Task 2-6:  AiRuntime / OrchRuntime / PersistRuntime / SandboxRuntime / RegistryRuntime
 
-**每个 facade 1 个独立 commit**，模式与 Task 1 完全相同（建 facade 文件 → 改 Interpreter 字段 → 改访问点 → 跑 4 门禁 → commit）。
+** facade 1  commit** Task 1  facade  →  Interpreter  →  →  4  → commit
 
-### Task 2: 抽 AiRuntime
+### Task 2:  AiRuntime
 
-**Files:** `src/runtime/ai.rs` 新建 / `src/interpreter/mod.rs` 改 9 字段 / ~50 访问点
+**Files:** `src/runtime/ai.rs`  / `src/interpreter/mod.rs`  9  / ~50 
 
-字段（按 spec §2.2）：
+ spec §2.2
 - `model_routes: HashMap<String, RouteConfig>`
 - `token_budget: Option<TokenBudget>`
 - `token_usage: TokenUsage`
 - `trace: TraceCollector`
 - `context_window: ContextWindow`
 - `speculative_verifier: SpeculativeVerifier`
-- `cache_warmer: CacheWarmer`（**`#[allow(dead_code)]` 保留**）
+- `cache_warmer: CacheWarmer`**`#[allow(dead_code)]` **
 - `draft_model_stats: Arc<Mutex<HashMap<String, (usize, usize)>>>`
 
-> **重要**：`trace: TraceCollector` 是 `pub` 字段 — 抽到 facade 后变 `pub(crate)`。外部访问点改为 `interp.ai.trace`。
+> ****`trace: TraceCollector`  `pub`  —  facade  `pub(crate)` `interp.ai.trace`
 
-AiRuntime 方法示例：
+AiRuntime 
 - `record_token(input, output)`
 - `get_cached(prompt_hash) -> Option<String>`
 - `cache_response(prompt_hash, response)`
 
-测试（5 个）：
+5 
 - `default_ai_routes_empty`
 - `token_budget_set_and_get`
 - `token_usage_increments`
 - `trace_records_event`
 - `ai_cache_put_and_get`
 
-### Task 3: 抽 OrchRuntime
+### Task 3:  OrchRuntime
 
-**Files:** `src/runtime/orch.rs` 新建 / Interpreter 改 3 字段 / ~20 访问点
+**Files:** `src/runtime/orch.rs`  / Interpreter  3  / ~20 
 
-字段：
+
 - `plans: Arc<Mutex<HashMap<String, Plan>>>`
 - `refine_registry: Arc<Mutex<RefineRegistry>>`
 - `skill_registry: Arc<Mutex<SkillRegistry>>`
 
-OrchRuntime 方法示例：
+OrchRuntime 
 - `plan_create(name, steps)`
 - `plan_update(name, updates)`
 - `skill_load(path)` / `skill_install(path)`
 
-测试（5 个）：
+5 
 - `plans_default_empty`
 - `refine_registry_default`
 - `skill_registry_default`
 - `plan_create_returns_name`
 - `refine_registry_registers_session`
 
-### Task 4: 抽 PersistRuntime
+### Task 4:  PersistRuntime
 
-**Files:** `src/runtime/persist.rs` 新建 / Interpreter 改 3 字段 / ~10 访问点
+**Files:** `src/runtime/persist.rs`  / Interpreter  3  / ~10 
 
-字段：
+
 - `audit_sink: Arc<dyn AuditSink>`
 - `markdown_memory_dir: Option<PathBuf>`
 - `checkpoint_saver: Option<Arc<dyn CheckpointSaver>>`
 
-PersistRuntime 方法示例：
+PersistRuntime 
 - `save_checkpoint(thread_id, checkpoint)`
 - `load_checkpoint(thread_id) -> Option<Checkpoint>`
 - `audit_event(event)`
 
-测试（3 个）：
+3 
 - `default_persist_null_sink`
 - `markdown_memory_dir_default_none`
 - `checkpoint_saver_default_none`
 
-### Task 5: 抽 SandboxRuntime
+### Task 5:  SandboxRuntime
 
-**Files:** `src/runtime/sandbox.rs` 新建 / Interpreter 改 4 字段 / ~20 访问点
+**Files:** `src/runtime/sandbox.rs`  / Interpreter  4  / ~20 
 
-字段：
+
 - `sandbox: SandboxPolicy`
 - `container: Arc<Mutex<Option<ContainerHandle>>>`
 - `tool_planes: Arc<Mutex<ToolPlaneRegistry>>`
-- 注：capability 字段在 `src/sandbox/capability.rs` 是 module-level state，需要查实际归属
+- capability  `src/sandbox/capability.rs`  module-level state
 
-> **风险**：`ContainerHandle` 含 Drop impl（v0.49 C3 fix），拆出时不能破坏 Drop 语义。
+> ****`ContainerHandle`  Drop implv0.49 C3 fix Drop 
 
-测试（5 个）：
+5 
 - `default_sandbox_policy`
 - `container_default_none`
 - `tool_planes_default_has_core`
 - `sandbox_validate_path` (safe path)
 - `sandbox_validate_path_rejected` (escape attempt)
 
-### Task 6: 抽 RegistryRuntime
+### Task 6:  RegistryRuntime
 
-**Files:** `src/runtime/registry.rs` 新建 / Interpreter 改 5 字段 / ~30 访问点
+**Files:** `src/runtime/registry.rs`  / Interpreter  5  / ~30 
 
-字段：
+
 - `trait_registry: Arc<HashMap<String, TraitInfo>>`
 - `impl_table: Arc<HashMap<String, Vec<String>>>`
 - `mock_registry: MockRegistry`
 - `ccr_store: InMemoryCcrStore`
 - `memory_store: HashMap<String, Value>`
 
-测试（5 个）：
+5 
 - `default_registry_empty_traits`
 - `mock_registry_default`
 - `ccr_store_default_empty`
@@ -384,18 +384,18 @@ PersistRuntime 方法示例：
 
 ---
 
-## Task 7: 抽 CoreRuntime + Interpreter 薄化
+## Task 7:  CoreRuntime + Interpreter 
 
-**Files:** `src/runtime/core.rs` 新建 / `src/interpreter/mod.rs` 大改 / 12 个 pub 字段全 private / Clone 改写
+**Files:** `src/runtime/core.rs`  / `src/interpreter/mod.rs`  / 12  pub  private / Clone 
 
-**这是最重的一步** — 6 字段（globals/environment/tool_registry/v2_arena/current_ai_config/config_stack） + Interpreter 改成纯 facade holder。
+**** — 6 globals/environment/tool_registry/v2_arena/current_ai_config/config_stack + Interpreter  facade holder
 
-### Task 7.1: 建 CoreRuntime
+### Task 7.1:  CoreRuntime
 
-- [ ] **Step 1: 写 `src/runtime/core.rs`**
+- [ ] **Step 1:  `src/runtime/core.rs`**
 
 ```rust
-//! v0.52 ADR-001: CoreRuntime — 语言执行必需的薄核心
+//! v0.52 ADR-001: CoreRuntime — 
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -427,9 +427,9 @@ impl Default for CoreRuntime {
 }
 ```
 
-### Task 7.2: 改 Interpreter 字段
+### Task 7.2:  Interpreter 
 
-- [ ] **Step 1: 替换 6 字段为 `core: CoreRuntime`**
+- [ ] **Step 1:  6  `core: CoreRuntime`**
 
 ```rust
 pub struct Interpreter {
@@ -443,7 +443,7 @@ pub struct Interpreter {
 }
 ```
 
-- [ ] **Step 2: 简化 Clone**
+- [ ] **Step 2:  Clone**
 
 ```rust
 impl Clone for Interpreter {
@@ -461,20 +461,20 @@ impl Clone for Interpreter {
 }
 ```
 
-**应 ≤ 10 行**（vs 当前 43 行）。
+** ≤ 10 **vs  43 
 
-### Task 7.3: 改所有 12 个原 pub 字段访问
+### Task 7.3:  12  pub 
 
-- [ ] **Step 1: grep 找所有访问点**
+- [ ] **Step 1: grep **
 
 ```bash
 cd "D:/Github/mora-lang"
 grep -rn "interp\.recorder\|interp\.trace\|interp\.trait_registry\|interp\.impl_table\|interp\.audit_sink\|interp\.markdown_memory_dir\|interp\.container\|interp\.tool_planes\|interp\.skill_registry\|interp\.plans\|interp\.refine_registry\|interp\.checkpoint_saver" src/ --include="*.rs" 2>&1 | head -40
 ```
 
-- [ ] **Step 2: 批量改**
+- [ ] **Step 2: **
 
-| 旧 | 新 |
+|  |  |
 |----|----|
 | `interp.recorder` | `interp.infra.recorder` |
 | `interp.trace` | `interp.ai.trace` |
@@ -489,13 +489,13 @@ grep -rn "interp\.recorder\|interp\.trace\|interp\.trait_registry\|interp\.impl_
 | `interp.refine_registry` | `interp.orch.refine_registry` |
 | `interp.checkpoint_saver` | `interp.persist.checkpoint_saver` |
 
-- [ ] **Step 3: 跑 4 门禁 + commit**
+- [ ] **Step 3:  4  + commit**
 
-（与 Task 1 相同模式）
+ Task 1 
 
-### Task 7.4: 加 CoreRuntime 单元测试（5-10 个）
+### Task 7.4:  CoreRuntime 5-10 
 
-- [ ] **Step 1: 写测试**
+- [ ] **Step 1: **
 
 ```rust
 #[cfg(test)]
@@ -505,7 +505,7 @@ mod tests {
     #[test]
     fn core_default_globals_and_env_share() {
         let core = CoreRuntime::default();
-        // globals 和 environment 初始指向同一个 Arc
+        // globals  environment  Arc
         assert!(Arc::ptr_eq(&core.globals, &core.environment));
     }
 
@@ -521,33 +521,33 @@ mod tests {
         assert!(core.v2_arena.is_none());
     }
 
-    // ... 更多
+    // ... 
 }
 ```
 
 ---
 
-## Task 8: 拆 `builtins.rs` 多文件 + MethodDispatch trait
+## Task 8:  `builtins.rs`  + MethodDispatch trait
 
-**Files:** 删除 `src/interpreter/builtins.rs` / 新建 `src/interpreter/builtins/{mod,file,sandbox,ai,memory,schedule,json,document,toolplane,mora}.rs` / 改 `src/interpreter/dispatch.rs` 引入 `MethodDispatch` trait
+**Files:**  `src/interpreter/builtins.rs` /  `src/interpreter/builtins/{mod,file,sandbox,ai,memory,schedule,json,document,toolplane,mora}.rs` /  `src/interpreter/dispatch.rs`  `MethodDispatch` trait
 
-### Task 8.1: 分析当前 `builtins.rs` 的方法分类
+### Task 8.1:  `builtins.rs` 
 
-- [ ] **Step 1: grep `call_xxx_method` 找所有 builtin dispatch 函数**
+- [ ] **Step 1: grep `call_xxx_method`  builtin dispatch **
 
 ```bash
 cd "D:/Github/mora-lang"
 grep -n "pub fn call_.*_method" src/interpreter/builtins.rs | head -50
 ```
 
-> **预期发现**：`call_file_method` / `call_sandbox_method` / `call_ai_method` / `call_memory_method` / `call_schedule_method` / `call_json_method` / `call_document_method` / `call_toolplane_method` / `call_mora_method` 等 20-30 个 dispatch 函数。
+> ****`call_file_method` / `call_sandbox_method` / `call_ai_method` / `call_memory_method` / `call_schedule_method` / `call_json_method` / `call_document_method` / `call_toolplane_method` / `call_mora_method`  20-30  dispatch 
 
-### Task 8.2: 定义 `MethodDispatch` trait
+### Task 8.2:  `MethodDispatch` trait
 
-- [ ] **Step 1: 在 `src/interpreter/dispatch.rs` 加 trait**
+- [ ] **Step 1:  `src/interpreter/dispatch.rs`  trait**
 
 ```rust
-//! v0.52 ADR-001: MethodDispatch trait — 统一 builtin dispatch 入口
+//! v0.52 ADR-001: MethodDispatch trait —  builtin dispatch 
 
 use crate::interpreter::Interpreter;
 use crate::value::Value;
@@ -558,15 +558,15 @@ pub trait MethodDispatch {
 }
 ```
 
-> **实现细节**：每个 `call_xxx_method` 函数改成实现 `MethodDispatch` 的 struct 的 method。然后 dispatch 入口（`src/interpreter/mod.rs` 现有 dispatch 逻辑）改成遍历 trait impls。
+> **** `call_xxx_method`  `MethodDispatch`  struct  method dispatch `src/interpreter/mod.rs`  dispatch  trait impls
 
-### Task 8.3: 拆文件
+### Task 8.3: 
 
-- [ ] **Step 1: 按 builtin 类型拆 8-10 个子文件**
+- [ ] **Step 1:  builtin  8-10 **
 
-每个 `call_xxx_method` 函数（200-500 行）迁到对应子文件。`builtins.rs` 删除。
+ `call_xxx_method` 200-500 `builtins.rs` 
 
-例如 `src/interpreter/builtins/file.rs`:
+ `src/interpreter/builtins/file.rs`:
 ```rust
 //! v0.52 ADR-001: file.* builtin dispatch
 
@@ -579,21 +579,21 @@ pub struct FileDispatch;
 impl MethodDispatch for FileDispatch {
     fn method_name(&self) -> &'static str { "file" }
     fn call(&self, interp: &mut Interpreter, args: Vec<Value>) -> Result<Value, String> {
-        // ... 现有 call_file_method 逻辑
+        // ...  call_file_method 
     }
 }
 ```
 
-- [ ] **Step 2: 跑 4 门禁 + commit**
+- [ ] **Step 2:  4  + commit**
 
-> **预期问题**：本 commit 改动面大（5000+ LOC 拆 8 文件），需要多次 cargo build 调整。
+> **** commit 5000+ LOC  8  cargo build 
 
-### Task 8.4: 为每个 builtin 子文件加单元测试
+### Task 8.4:  builtin 
 
-- [ ] **Step 1: 写 10-20 个 builtin 单元测试**
+- [ ] **Step 1:  10-20  builtin **
 
 ```rust
-// src/interpreter/builtins/file.rs 末尾
+// src/interpreter/builtins/file.rs 
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -606,42 +606,42 @@ mod tests {
         assert!(result.is_err());
     }
 
-    // ... 更多（每个 builtin 文件 2-3 个测试）
+    // ...  builtin  2-3 
 }
 ```
 
 ---
 
-## 验收检查表
+## 
 
-- [ ] Task 1：InfraRuntime 抽出 + 5 unit + 4 门禁全绿 + commit
-- [ ] Task 2：AiRuntime 抽出 + 5 unit + 4 门禁全绿 + commit
-- [ ] Task 3：OrchRuntime 抽出 + 5 unit + 4 门禁全绿 + commit
-- [ ] Task 4：PersistRuntime 抽出 + 3 unit + 4 门禁全绿 + commit
-- [ ] Task 5：SandboxRuntime 抽出 + 5 unit + 4 门禁全绿 + commit
-- [ ] Task 6：RegistryRuntime 抽出 + 5 unit + 4 门禁全绿 + commit
-- [ ] Task 7：CoreRuntime 抽出 + Interpreter 薄化（≤ 7 字段 / Clone ≤ 10 行 / 12 pub 全 private）+ 5-10 unit + commit
-- [ ] Task 8：builtins.rs 拆为 ≤ 400 LOC 子文件 + MethodDispatch trait + 10-20 unit + commit
-- [ ] 总测试：650+ passed / 0 failed
-- [ ] ADR-001 状态更新：Proposed → Accepted
-- [ ] CHANGELOG.md v0.52 章节记录破坏性变更
+- [ ] Task 1InfraRuntime  + 5 unit + 4  + commit
+- [ ] Task 2AiRuntime  + 5 unit + 4  + commit
+- [ ] Task 3OrchRuntime  + 5 unit + 4  + commit
+- [ ] Task 4PersistRuntime  + 3 unit + 4  + commit
+- [ ] Task 5SandboxRuntime  + 5 unit + 4  + commit
+- [ ] Task 6RegistryRuntime  + 5 unit + 4  + commit
+- [ ] Task 7CoreRuntime  + Interpreter ≤ 7  / Clone ≤ 10  / 12 pub  private+ 5-10 unit + commit
+- [ ] Task 8builtins.rs  ≤ 400 LOC  + MethodDispatch trait + 10-20 unit + commit
+- [ ] 650+ passed / 0 failed
+- [ ] ADR-001 Proposed → Accepted
+- [ ] CHANGELOG.md v0.52 
 
 ---
 
-## 回退策略
+## 
 
-每个 commit 独立可回退：
+ commit 
 ```bash
-git reset --hard HEAD~1   # 撤回最近 1 个 facade
-git reset --hard HEAD~n   # 撤回最近 n 个 facade
+git reset --hard HEAD~1   #  1  facade
+git reset --hard HEAD~n   #  n  facade
 ```
 
-如发现某 facade 拆错，整段 revert 该 commit 即可，不影响后续 facade 抽取。
+ facade  revert  commit  facade 
 
 ---
 
-**Plan 完成。** 两种执行方式：
-1. **Subagent-Driven (推荐)** — 我每 task 派 1 个 subagent，task 之间 review
-2. **Inline Execution** — 在当前 session 直接 batch 执行
+**Plan ** 
+1. **Subagent-Driven ()** —  task  1  subagenttask  review
+2. **Inline Execution** —  session  batch 
 
-请选择。
+

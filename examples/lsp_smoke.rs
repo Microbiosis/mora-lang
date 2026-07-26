@@ -1,14 +1,14 @@
-//! Mora LSP 端到端测试（不依赖真实编辑器）
+//! Mora LSP
 //!
-//! 这个 binary 模拟一个最小 LSP 客户端：
-//!   1. 启动 mora-lsp 子进程
-//!   2. 发送 initialize 请求
-//!   3. 发送 initialized 通知
-//!   4. 发送 textDocument/didOpen 触发 typeck
-//!   5. 读 publishDiagnostics
-//!   6. 发送 shutdown + exit
+//!  binary  LSP
+//!   1.  mora-lsp
+//!   2.  initialize
+//!   3.  initialized
+//!   4.  textDocument/didOpen  typeck
+//!   5.  publishDiagnostics
+//!   6.  shutdown + exit
 //!
-//! 用 cargo run --example lsp_smoke 跑（依赖已编译的 mora-lsp）
+//!  cargo run --example lsp_smoke  mora-lsp
 
 use std::io::{BufReader, Read, Write};
 use std::process::{Command, Stdio};
@@ -63,8 +63,8 @@ fn main() {
         "expected publishDiagnostics"
     );
     assert!(
-        diag.contains("type mismatch"),
-        "expected type mismatch error"
+        diag.contains("Type mismatch") || diag.contains("type mismatch"),
+        "expected type mismatch diagnostic"
     );
 
     // 5. hover at line 0, char 4 (x identifier)
@@ -109,7 +109,7 @@ fn write_msg<W: Write>(w: &mut W, body: &str) -> std::io::Result<()> {
 }
 
 fn read_msg<R: Read>(r: &mut R) -> String {
-    // 读 header：按行（每行以 \r\n 结束）直到空行
+    //  header \r\n
     let mut content_length: Option<usize> = None;
     let mut line = String::new();
     let mut byte = [0u8; 1];
@@ -128,7 +128,7 @@ fn read_msg<R: Read>(r: &mut R) -> String {
             }
         }
         if line.is_empty() {
-            // 空行 = header 结束
+            //  = header
             break;
         }
         if let Some((name, value)) = line.split_once(':')

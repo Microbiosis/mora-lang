@@ -1,40 +1,40 @@
-# Mora v0.32+ 原语路线图 — 从 7 个 AI 基础设施项目提取
+# Mora v0.32+  —  7  AI 
 
-> **目的**: 通过深度源码分析 7 个 AI 基础设施项目 (AIOS, MimiClaw, OpenFugu, OpenInfer, MinerU, Headroom, Puter),
-> 提取**实现原理**, 映射到 Mora 语言原语, 形成 v0.32+ 演进路线图.
+> ****:  7  AI  (AIOS, MimiClaw, OpenFugu, OpenInfer, MinerU, Headroom, Puter),
+> ****,  Mora ,  v0.32+ .
 >
-> **方法**: 不仅看 README, 深入分析源码 / 架构 / 关键算法 (如 OpenFugu 的 sep-CMA-ES + SVF, Headroom 的
-> Rust SmartCrusher 端口, MinerU 的 group-based layout + reading order, Puter 的 5 层 DI + Event Bus).
+> ****:  README,  /  /  ( OpenFugu  sep-CMA-ES + SVF, Headroom 
+> Rust SmartCrusher , MinerU  group-based layout + reading order, Puter  5  DI + Event Bus).
 >
-> **项目基线**: Mora v0.31 (SmartCrusher 完整 + no-panic refactor), 已有 `compress / document / mcp /
-> http_server / orchestrate / event (v0.31+)` 等模块.
+> ****: Mora v0.31 (SmartCrusher  + no-panic refactor),  `compress / document / mcp /
+> http_server / orchestrate / event (v0.31+)` .
 
 ---
 
-## 0. 项目调研摘要
+## 0. 
 
-| 项目 | 核心机制 | Mora 现状差距 |
+|  |  | Mora  |
 |---|---|---|
-| **AIOS** | 中央调度器 (FIFO/RR) + Tool Manager hashmap 冲突锁 + LLM Core 抽象 (3 后端) + Context snapshot | 缺调度器/冲突锁/统一 LLM 接口 |
-| **MimiClaw** | ReAct agent loop + message bus (统一入口) + cron (6 字段 struct) + heartbeat (周期性 checklist) + tool/skill 区分 | 缺 ReAct 内置、cron、heartbeat、skill |
-| **OpenFugu** | Policy-over-models (19K 参数 router) + per-turn role (Worker/Thinker/Verifier) + DAG-as-data + evidence grading | Mora `orchestrate` 是 imperative, 缺 DAG 数据结构 |
-| **OpenInfer** | "Stitch together" 架构 (复用 vLLM frontend) + feature-gated kernels + Pegaflow KV 分层 + prefix cache | Mora 缺 OpenAI 兼容 serve + prefix cache |
-| **MinerU** | Group-based layout (fig-caption 配对) + 3 reading order 策略 (XY-cut / gap-tree / group) + multimodal specialist + lossless-first 短路 | Mora `document` 缺 grouped layout + reading order |
-| **Headroom** | ContentRouter + SmartCrusher (statistical 字段检测) + CCR (Compress-Cache-Retrieve) + DocumentCompactor recursive walker + CcrStore trait | Mora v0.30 SmartCrusher 基础版, 缺 CCR + recursive walker |
-| **Puter** | 5 层 DI 容器 (clients/drivers/stores/services/controllers) + lifecycle hooks + EventClient wildcard (outer.*) + Service Extension 注册 | Mora 缺 DI + lifecycle + wildcard event + token compression |
+| **AIOS** |  (FIFO/RR) + Tool Manager hashmap  + LLM Core  (3 ) + Context snapshot | // LLM  |
+| **MimiClaw** | ReAct agent loop + message bus () + cron (6  struct) + heartbeat ( checklist) + tool/skill  |  ReAct cronheartbeatskill |
+| **OpenFugu** | Policy-over-models (19K  router) + per-turn role (Worker/Thinker/Verifier) + DAG-as-data + evidence grading | Mora `orchestrate`  imperative,  DAG  |
+| **OpenInfer** | "Stitch together"  ( vLLM frontend) + feature-gated kernels + Pegaflow KV  + prefix cache | Mora  OpenAI  serve + prefix cache |
+| **MinerU** | Group-based layout (fig-caption ) + 3 reading order  (XY-cut / gap-tree / group) + multimodal specialist + lossless-first  | Mora `document`  grouped layout + reading order |
+| **Headroom** | ContentRouter + SmartCrusher (statistical ) + CCR (Compress-Cache-Retrieve) + DocumentCompactor recursive walker + CcrStore trait | Mora v0.30 SmartCrusher ,  CCR + recursive walker |
+| **Puter** | 5  DI  (clients/drivers/stores/services/controllers) + lifecycle hooks + EventClient wildcard (outer.*) + Service Extension  | Mora  DI + lifecycle + wildcard event + token compression |
 
 ---
 
-## 1. 直接源自某个项目的高价值原语
+## 1. 
 
-### 1.1 `plan` 原语 — 灵感 OpenFugu Conductor (P0)
+### 1.1 `plan`  —  OpenFugu Conductor (P0)
 
-**机制**: Conductor LLM 在单次 forward pass 发射完整 workflow DAG: 3 个等长 list
-`model_id[N] / subtasks[N] / access_list[N][prev_indices]`. `access_list[i]` 只引用
-前序步骤, 强制拓扑有效. Executor 按 `t=0..N-1` 顺序执行, 每步收集
-`access_list[t]` 索引的输出作为 context.
+****: Conductor LLM  forward pass  workflow DAG: 3  list
+`model_id[N] / subtasks[N] / access_list[N][prev_indices]`. `access_list[i]` 
+, . Executor  `t=0..N-1` , 
+`access_list[t]`  context.
 
-**Mora 语法** (草案):
+**Mora ** ():
 ```mora
 let dag = plan {
     workers: ["gpt-4o", "claude-sonnet", "deepseek-coder"]
@@ -45,72 +45,72 @@ let dag = plan {
         { worker: 0, task: p"Write final report", depends: [2] }
     ]
 }
-let report = dag.execute()  # 按拓扑序执行, 注入依赖输出
+let report = dag.execute()  # , 
 ```
 
-**实施**:
-- `src/plan/mod.rs` 新模块
-- `plan` 关键字 + `dag.execute()` builtin
-- 解析 `workers: [...]` + `steps: [...]` AST
-- Runner 按 `depends` 拓扑排序
-- 每个 step 调对应 worker 的 LLM, prompt 注入依赖 step 的输出
+****:
+- `src/plan/mod.rs` 
+- `plan`  + `dag.execute()` builtin
+-  `workers: [...]` + `steps: [...]` AST
+- Runner  `depends` 
+-  step  worker  LLM, prompt  step 
 
-**复用 Mora 现有**: `orchestrate` 可作为 `plan` 的简化版 (sequential/loop)
+** Mora **: `orchestrate`  `plan`  (sequential/loop)
 
 ---
 
-### 1.2 `react` 原语 — 灵感 MimiClaw ReAct Loop (P0)
+### 1.2 `react`  —  MimiClaw ReAct Loop (P0)
 
-**机制**: MimiClaw `agent_loop.c` 实现 ReAct:
-- `MIMI_AGENT_MAX_TOOL_ITER=10` (最多 10 轮思考-行动循环)
-- `MIMI_MAX_TOOL_CALLS=4` (单次响应最多 4 个 tool call)
-- 每轮: 调 LLM → 解析 tool_use → 执行工具 → 把 tool_result 注入下一轮 context
-- `Working Status` 先发"thinking…"占位消息
+****: MimiClaw `agent_loop.c`  ReAct:
+- `MIMI_AGENT_MAX_TOOL_ITER=10` ( 10 -)
+- `MIMI_MAX_TOOL_CALLS=4` ( 4  tool call)
+- :  LLM →  tool_use →  →  tool_result  context
+- `Working Status` "thinking…"
 
-**Mora 语法** (草案):
+**Mora ** ():
 ```mora
 let agent = react {
     system: p"You are a research assistant",
     tools: [web_search, calc, file_read],
-    max_iter: 10,        # 最多 10 轮
-    max_tools_per_turn: 4, # 单次响应最多 4 个 tool call
+    max_iter: 10,        #  10 
+    max_tools_per_turn: 4, #  4  tool call
     working_status: p"thinking...",
 }
 
 let answer = agent.run("What's the population of Tokyo?")
-# 内部自动: 调 LLM → 触发 web_search → 注入结果 → 调 LLM → 触发 calc → ... → 最终回答
+# :  LLM →  web_search →  →  LLM →  calc → ... → 
 ```
 
-**实施**:
-- `src/react/mod.rs` 新模块
-- `react` 表达式 / `react.run(question)` builtin
-- 复用 `ai_infra::CacheWarmer` (v0.24 已写但 dead_code) 缓存 tool 结果
-- 复用 `prompt_section` 模块拼装 system prompt
+****:
+- `src/react/mod.rs` 
+- `react`  / `react.run(question)` builtin
+-  `ai_infra::CacheWarmer` (v0.24  dead_code)  tool 
+-  `prompt_section`  system prompt
 
-**Mora 现状**: 用户用 AI 必须自己写 `while iter < 10 { ... }` 循环 — `react` 内置后零代码
+**Mora **:  AI  `while iter < 10 { ... }`  — `react` 
 
 ---
 
-### 1.3 `event` wildcard — 灵感 Puter EventClient (P0)
+### 1.3 `event` wildcard —  Puter EventClient (P0)
 
-**机制**: Puter `EventClient.emit("outer.gui.item.removed")` 触发所有匹配 listener:
-- 精确 `outer.gui.item.removed`
+****: Puter `EventClient.emit("outer.gui.item.removed")`  listener:
+-  `outer.gui.item.removed`
 - `outer.gui.item.*` (single-segment wildcard)
 - `outer.gui.*` 
 - `outer.*` (catch-all)
 
-Extension 自动注册 listener (`extension.on(event, handler)`).
+Extension  listener (`extension.on(event, handler)`).
 
-**Mora 现状** (v0.31): `bus.emit("file.changed")` + `bus.on("file.*")` — 已有 dot prefix,
-**缺**: segment wildcard `*`. Puter 用它做 cache invalidation (`fs.last-change:<user_id>`),
-Mora 可用于 "tool 完成时触发 metric 更新" `tool.*.completed → metric.update`.
+**Mora ** (v0.31): `bus.emit("file.changed")` + `bus.on("file.*")` —  dot prefix,
+****: segment wildcard `*`. Puter  cache invalidation (`fs.last-change:<user_id>`),
+Mora  "tool  metric " `tool.*.completed → metric.update`.
 
-**实施**:
-- `src/event/bus.rs` 扩展 matcher 支持 `*` segment
-- 加 `bus.emit_and_wait("event", payload)` 同步 await 版本
-- 加 `bus.priority("event", prio)` listener 优先级
+****:
+- `src/event/bus.rs`  matcher  `*` segment
+-  `bus.emit_and_wait("event", payload)`  await 
+-  `bus.priority("event", prio)` listener 
 
-**Mora 语法** (草案):
+**Mora ** ():
 ```mora
 bus.on("tool.*.completed", fn(name, result) {
     metric.increment("tool_calls", {tool: name})
@@ -122,24 +122,24 @@ bus.on("ai.chat.*", fn(conv, msg) {
 
 ---
 
-### 1.4 `document.grouped_layout` — 灵感 MinerU Group-based Layout (P1)
+### 1.4 `document.grouped_layout` —  MinerU Group-based Layout (P1)
 
-**机制**: MinerU 不用 "每个块独立", 而是用 **group**:
-- figure + caption 配对为 1 个 group
-- table + title + footnote 配对
-- molecule + identifier 配对
-- Group 作为 layout tree 的内部节点, 跨页跨列保留语义
+****: MinerU  "",  **group**:
+- figure + caption  1  group
+- table + title + footnote 
+- molecule + identifier 
+- Group  layout tree , 
 
-**Mora 现状**: `document.parse` 返回 flat `[{block}, {block}, ...]`, 丢 caption-table 关联.
+**Mora **: `document.parse`  flat `[{block}, {block}, ...]`,  caption-table .
 
-**实施**:
-- `src/document/grouped.rs` 新模块
-- 复用 `DocumentBackend` trait
-- 加 `GroupedDocument` struct
-- 用 bbox 重叠度 + 距离启发式配对
-- 加 `group.to_rag_chunks()` builtin 输出 RAG-ready 块
+****:
+- `src/document/grouped.rs` 
+-  `DocumentBackend` trait
+-  `GroupedDocument` struct
+-  bbox  + 
+-  `group.to_rag_chunks()` builtin  RAG-ready 
 
-**Mora 语法** (草案):
+**Mora ** ():
 ```mora
 let doc = document.parse("paper.pdf", {group: true})
 let chunks = doc.grouped.to_rag_chunks()  # [chunk_with_caption+table+footnote, ...]
@@ -147,21 +147,21 @@ let chunks = doc.grouped.to_rag_chunks()  # [chunk_with_caption+table+footnote, 
 
 ---
 
-### 1.5 `document.reading_order` — 灵感 MinerU 3 策略 (P1)
+### 1.5 `document.reading_order` —  MinerU 3  (P1)
 
-**机制**: MinerU 3 reading order 算法:
-1. **XY-cut**: 递归按 dominant whitespace 划分, 生成 binary reading tree
-2. **Gap-tree**: 用 inter-block whitespace + 几何接近度 + 对齐线索
-3. **Group-based**: 用 group 内 caption-figure 等语义关联 (与 1.4 配合)
+****: MinerU 3 reading order :
+1. **XY-cut**:  dominant whitespace ,  binary reading tree
+2. **Gap-tree**:  inter-block whitespace +  + 
+3. **Group-based**:  group  caption-figure  ( 1.4 )
 
-**Mora 现状**: `document.text()` 按物理顺序, 多列 PDF 乱序
+**Mora **: `document.text()` ,  PDF 
 
-**实施**:
-- `src/document/reading_order.rs` 新模块
-- 3 算法可单独调用或 chain
-- 输出 `Block { content, bbox, reading_order_idx }` 列表
+****:
+- `src/document/reading_order.rs` 
+- 3  chain
+-  `Block { content, bbox, reading_order_idx }` 
 
-**Mora 语法** (草案):
+**Mora ** ():
 ```mora
 let doc = document.parse("paper.pdf")
 let ordered = doc.reading_order({strategy: "xycut + group"})
@@ -169,22 +169,22 @@ let ordered = doc.reading_order({strategy: "xycut + group"})
 
 ---
 
-### 1.6 `schedule` 原语 — 灵感 MimiClaw Cron (P1)
+### 1.6 `schedule`  —  MimiClaw Cron (P1)
 
-**机制**: MimiClaw `cron_job_t` 6 字段:
+****: MimiClaw `cron_job_t` 6 :
 - `id` (8-char hex) / `name` (32 char) / `kind` (EVERY/AT) /
   `interval_s` / `at_epoch` / `message` / `channel` / `chat_id` / `delete_after_run`
-- 60s tick loop, JSON 持久化
+- 60s tick loop, JSON 
 
-**Mora 现状**: 0
+**Mora **: 0
 
-**实施**:
-- `src/schedule/mod.rs` 新模块
+****:
+- `src/schedule/mod.rs` 
 - `schedule` builtin + `list_jobs` + `remove_job`
-- 复用 `bus` 触发 (`bus.emit("schedule.tick", job)`)
-- 复用 `Conversation` 或新 struct
+-  `bus`  (`bus.emit("schedule.tick", job)`)
+-  `Conversation`  struct
 
-**Mora 语法** (草案):
+**Mora ** ():
 ```mora
 let id = schedule({
     name: "daily_summary",
@@ -193,19 +193,19 @@ let id = schedule({
     message: p"Generate daily summary of news"
 })
 schedule.list()        # [{id, name, ...}, ...]
-schedule.remove(id)    # 删除
+schedule.remove(id)    # 
 ```
 
 ---
 
-### 1.7 `heartbeat` 原语 — 灵感 MimiClaw Heartbeat Service (P2)
+### 1.7 `heartbeat`  —  MimiClaw Heartbeat Service (P2)
 
-**机制**: 30min 周期扫描 `HEARTBEAT.md` checklist, 发现 `[ ]` (未完成) 触发 agent.
-关键: 周期性 file scan, 不需 cron 注册, **让 agent 主动起来做事**.
+****: 30min  `HEARTBEAT.md` checklist,  `[ ]` ()  agent.
+:  file scan,  cron , ** agent **.
 
-**Mora 现状**: 0
+**Mora **: 0
 
-**Mora 语法** (草案):
+**Mora ** ():
 ```mora
 heartbeat({
     file: "TODO.md",
@@ -216,46 +216,46 @@ heartbeat({
 
 ---
 
-### 1.8 `skill` 原语 — 灵感 MimiClaw Skills (P1)
+### 1.8 `skill`  —  MimiClaw Skills (P1)
 
-**机制**: Skills = `/spiffs/skills/*.md` markdown 教学文件. Tool = C function (atomic action),
-Skill = markdown workflow. 关键设计:
+****: Skills = `/spiffs/skills/*.md` markdown . Tool = C function (atomic action),
+Skill = markdown workflow. :
 - Title + Description (H1) + Steps + Examples
-- `extract_title/description` 解析器只注入 summary 到 system prompt
-- 按需 read_file 全文 (节省 context)
+- `extract_title/description`  summary  system prompt
+-  read_file  ( context)
 
-**Mora 现状**: 0 (有 `tool_def` 但无 skill)
+**Mora **: 0 ( `tool_def`  skill)
 
-**实施**:
-- `src/skill/mod.rs` 新模块
+****:
+- `src/skill/mod.rs` 
 - `skill.load("./skills/")` builtin
-- `skill.list()` 返回 title + description 索引
-- `skill.read(name)` 全文
-- `skill.inject_summary(system_prompt)` 拼到 prompt
+- `skill.list()`  title + description 
+- `skill.read(name)` 
+- `skill.inject_summary(system_prompt)`  prompt
 
-**Mora 语法** (草案):
+**Mora ** ():
 ```mora
 let sys = skill.inject_summary(p"You are an assistant")
-# sys 现在含 "- **Daily Briefing**: ... (read with: skill.read('daily-briefing'))"
+# sys  "- **Daily Briefing**: ... (read with: skill.read('daily-briefing'))"
 ```
 
 ---
 
-### 1.9 `sandbox` 原语 — 灵感 AIOS + Puter (P1)
+### 1.9 `sandbox`  —  AIOS + Puter (P1)
 
-**机制**:
+****:
 - **AIOS Access Manager**: hashmap agent_id → privilege_group
-- **Puter iframe sandbox**: 显式 `allow-popups-to-escape-sandbox` + URL 限制
-- **MimiClaw path validation**: read_file/write_file 拒绝 `..` 路径
+- **Puter iframe sandbox**:  `allow-popups-to-escape-sandbox` + URL 
+- **MimiClaw path validation**: read_file/write_file  `..` 
 
-**Mora 现状**: 0
+**Mora **: 0
 
-**实施**:
-- `src/sandbox/mod.rs` 新模块
-- `sandbox` 块 + `tool.with_sandbox(allow, deny)` builtin
-- 强制 `file.read` / `file.write` 路径 validate
+****:
+- `src/sandbox/mod.rs` 
+- `sandbox`  + `tool.with_sandbox(allow, deny)` builtin
+-  `file.read` / `file.write`  validate
 
-**Mora 语法** (草案):
+**Mora ** ():
 ```mora
 sandbox("agent_smith", {
     allow: ["memory.*", "ai.chat(mock)"],
@@ -268,81 +268,81 @@ sandbox("agent_smith", {
 
 ---
 
-### 1.10 `policy` 原语 — 灵感 AIOS LLM Core + OpenFugu TRINITY (P2)
+### 1.10 `policy`  —  AIOS LLM Core + OpenFugu TRINITY (P2)
 
-**机制**: OpenFugu TRINITY 用 19K 参数 router 学习 "which worker for which query". 训
-练用 sep-CMA-ES (gradient-free, 离散路由决策). Mora 缺 LLM routing policy.
+****: OpenFugu TRINITY  19K  router  "which worker for which query". 
+ sep-CMA-ES (gradient-free, ). Mora  LLM routing policy.
 
-**实施**:
-- `src/policy/mod.rs` 新模块
+****:
+- `src/policy/mod.rs` 
 - `policy.train(router, dataset)` builtin
 - `policy.predict(query, workers) → worker_id` builtin
-- 复用 Mora `route` + `orchestrate` 抽象
+-  Mora `route` + `orchestrate` 
 
 ---
 
-### 1.11 `ccr` 原语 — 灵感 Headroom Compress-Cache-Retrieve (P1)
+### 1.11 `ccr`  —  Headroom Compress-Cache-Retrieve (P1)
 
-**机制**: Headroom 关键的 "lossy but recoverable" 设计:
-- Lossless 路径失败 → Lossy 路径, **原值存档到 CcrStore**
-- 输出含 `<<ccr:HASH,KIND,SIZE>>` marker (12-char SHA-256 hex + kind + size)
-- LLM 通过 tool call 拉回原值 (`headroom_retrieve`)
+****: Headroom  "lossy but recoverable" :
+- Lossless  → Lossy , ** CcrStore**
+-  `<<ccr:HASH,KIND,SIZE>>` marker (12-char SHA-256 hex + kind + size)
+- LLM  tool call  (`headroom_retrieve`)
 - CcrStore trait: InMemory (default) / Redis / S3
 
-**Mora 现状**: 0 (v0.30 SmartCrusher 是 lossless-first 但无 CCR)
+**Mora **: 0 (v0.30 SmartCrusher  lossless-first  CCR)
 
-**实施**:
+****:
 - `src/ccr/store.rs` (trait + InMemoryCcrStore impl)
-- 扩展 `crush_json` 内部: lossy 路径自动写 CcrStore
+-  `crush_json` : lossy  CcrStore
 - `mora.ccr.retrieve("HASH")` builtin
 
-**Mora 语法** (草案):
+**Mora ** ():
 ```mora
 let r = compress.smart_json(big_data, {target_ratio: 0.1})
-# 输出含 <<ccr:abc123def456,kv,42>> marker
+#  <<ccr:abc123def456,kv,42>> marker
 let original = mora.ccr.retrieve("abc123def456")
 ```
 
 ---
 
-### 1.12 `prefix_cache` builtin — 灵感 OpenInfer (P2)
+### 1.12 `prefix_cache` builtin —  OpenInfer (P2)
 
-**机制**: OpenInfer warm prefix cache — 相同 prompt prefix 直接命中 KV cache, TTFT 大幅降低.
-**Mora 现状**: 0
+****: OpenInfer warm prefix cache —  prompt prefix  KV cache, TTFT .
+**Mora **: 0
 
-**实施**:
-- `src/ai/prefix_cache.rs` 新模块
+****:
+- `src/ai/prefix_cache.rs` 
 - `mora.ai.prefix_cache({capacity: 1000})` builtin
-- 缓存 key = `p"..."` 模板编译后 hash
-- 命中时跳过 prompt template parsing
+-  key = `p"..."`  hash
+-  prompt template parsing
 
 ---
 
-### 1.13 `mora serve --openai` 模式 — 灵感 OpenInfer (P1)
+### 1.13 `mora serve --openai`  —  OpenInfer (P1)
 
-**机制**: OpenInfer 复用 vLLM Rust frontend (OpenAI 协议). Mora 现在有手写 HTTP server,
-缺 OpenAI 兼容 endpoint — 让任何 OpenAI SDK / LangChain / LlamaIndex 直接调 mora 脚本.
+****: OpenInfer  vLLM Rust frontend (OpenAI ). Mora  HTTP server,
+ OpenAI  endpoint —  OpenAI SDK / LangChain / LlamaIndex  mora .
 
-**实施**:
-- `src/http_server.rs` 加 `/v1/chat/completions` 路由
-- 转 Mora 内部 AI call
-- 单 binary 命令: `mora serve script.mora --port 8080 --openai`
+****:
+- `src/http_server.rs`  `/v1/chat/completions` 
+-  Mora  AI call
+-  binary : `mora serve script.mora --port 8080 --openai`
 
-**Mora 语法** (命令行):
+**Mora ** ():
 ```bash
 $ mora serve --openai examples/agent.mora --port 8080
-# 等价于启动 http://localhost:8080/v1/chat/completions
-# 任何 OpenAI SDK 直接调
+#  http://localhost:8080/v1/chat/completions
+#  OpenAI SDK 
 ```
 
 ---
 
-### 1.14 `ai.chat` with role — 灵感 OpenFugu TRINITY (P1)
+### 1.14 `ai.chat` with role —  OpenFugu TRINITY (P1)
 
-**机制**: OpenFugu TRINITY 用 3 role: Worker (干活的) / Thinker (思考的) / Verifier (验证的).
-Mora 当前 `ai.chat` 无 role 概念.
+****: OpenFugu TRINITY  3 role: Worker () / Thinker () / Verifier ().
+Mora  `ai.chat`  role .
 
-**Mora 语法** (草案):
+**Mora ** ():
 ```mora
 let worker_out = ai.chat(p"Code: {task}", role: "worker")
 let think_out = ai.chat(p"Verify worker output: {worker_out}", role: "thinker")
@@ -351,28 +351,28 @@ let verif_out = ai.chat(p"Accept? y/n: {think_out}", role: "verifier")
 
 ---
 
-### 1.15 `tiered_memory` builtin — 灵感 OpenInfer Pegaflow + MimiClaw SPIFFS (P2)
+### 1.15 `tiered_memory` builtin —  OpenInfer Pegaflow + MimiClaw SPIFFS (P2)
 
-**机制**: Pegaflow KV cache 分层 HBM→DRAM→SSD→RDMA. MimiClaw 用 SPIFFS (flash) 作
-persistent storage. Mora `Conversation` 已有 hot/warm 思路, 缺统一接口.
+****: Pegaflow KV cache  HBM→DRAM→SSD→RDMA. MimiClaw  SPIFFS (flash) 
+persistent storage. Mora `Conversation`  hot/warm , .
 
-**实施**:
-- `src/memory/tiered.rs` 新模块
+****:
+- `src/memory/tiered.rs` 
 - `tiered_memory({hot: ram, warm: file, cold: s3})` builtin
-- 自动按 LRU 迁移
+-  LRU 
 
 ---
 
-### 1.16 `lifecycle` 关键字 — 灵感 Puter (P2)
+### 1.16 `lifecycle`  —  Puter (P2)
 
-**机制**: Puter 3 lifecycle hook:
-- `onServerStart()`: server 启动后 (DB migration, timer start)
-- `onServerPrepareShutdown()`: 停接受新请求
-- `onServerShutdown()`: 关闭连接
+****: Puter 3 lifecycle hook:
+- `onServerStart()`: server  (DB migration, timer start)
+- `onServerPrepareShutdown()`: 
+- `onServerShutdown()`: 
 
-**Mora 现状**: 0
+**Mora **: 0
 
-**Mora 语法** (草案):
+**Mora ** ():
 ```mora
 lifecycle {
     on_start: {
@@ -388,21 +388,21 @@ lifecycle {
 
 ---
 
-## 2. 跨项目共性原语
+## 2. 
 
-### 2.1 DI 容器 — Puter 5 层 (P3)
+### 2.1 DI  — Puter 5  (P3)
 
-**机制**: `clients → drivers → stores → services → controllers`, 严格单向依赖.
-Service 通过构造器注入.
+****: `clients → drivers → stores → services → controllers`, .
+Service .
 
-**Mora 现状**: 0 (Mora 模块化是 file-level, 无 runtime DI)
+**Mora **: 0 (Mora  file-level,  runtime DI)
 
-**实施**:
-- `src/di/container.rs` 新模块
+****:
+- `src/di/container.rs` 
 - `di.register("db", db_instance)` builtin
-- `di.resolve("auth")` 注入 service
+- `di.resolve("auth")`  service
 
-**Mora 语法** (草案):
+**Mora ** ():
 ```mora
 let container = di.new()
 container.register("db", db.sqlite("app.db"))
@@ -416,17 +416,17 @@ let auth = container.get("auth")
 
 ### 2.2 Error Gradation — OpenFugu evidence grade (P3)
 
-**机制**: OpenFugu 用 6 级 evidence grade (🟢 EXEC / 🔵 CODE / 🟣 DATA / 🟡 DOC / 🟠 INFER / 🔴 DARK)
-标记每条 claim 的可信度.
+****: OpenFugu  6  evidence grade (🟢 EXEC /  CODE / 🟣 DATA / 🟡 DOC / 🟠 INFER /  DARK)
+ claim .
 
-**Mora 现状**: 0
+**Mora **: 0
 
-**实施**:
-- `src/diagnostics/grade.rs` 新模块
+****:
+- `src/diagnostics/grade.rs` 
 - `let g = grade.claim("Mora is fast", based_on: ["bench 10s", "test pass"])` builtin
-- 输出 `[grade: 🟢 confidence 0.95]`
+-  `[grade: 🟢 confidence 0.95]`
 
-**Mora 语法** (草案):
+**Mora ** ():
 ```mora
 let g = grade.claim("crush_json saves 80% tokens",
     based_on: [
@@ -440,17 +440,17 @@ print(g)  # "🟢 EXEC (high confidence: bench + e2e verified)"
 
 ### 2.3 Lossless-First recursive walker — Headroom + MinerU (P0)
 
-**机制**: Headroom `DocumentCompactor.walk` 递归遍历整个 JSON 树找可压缩点.
-MinerU 默认 fast mode 是 "lossless" (有 text layer 就直接 extract), 失败才 OCR.
+****: Headroom `DocumentCompactor.walk`  JSON .
+MinerU  fast mode  "lossless" ( text layer  extract),  OCR.
 
-**Mora 现状**: v0.30 SmartCrusher 只处理 top-level List. 嵌套 object/array 里的 list 不压缩.
+**Mora **: v0.30 SmartCrusher  top-level List.  object/array  list .
 
-**实施**:
-- 扩展 `crush_json` 接受 nested 结构
-- 加 `try_lossless_compact_nested` builtin
-- 输出 compact 格式 (csv-schema, markdown-kv)
+****:
+-  `crush_json`  nested 
+-  `try_lossless_compact_nested` builtin
+-  compact  (csv-schema, markdown-kv)
 
-**Mora 语法** (草案):
+**Mora ** ():
 ```mora
 let nested = {
     "user_data": [
@@ -460,122 +460,122 @@ let nested = {
     "metadata": {...}
 }
 let r = compress.smart_json(nested, {recursive: true})
-# 默认走 lossless compaction, 失败才 lossy + CCR
+#  lossless compaction,  lossy + CCR
 ```
 
 ---
 
-### 2.4 Mock 模式统一接口 — OpenFugu + OpenInfer (P0)
+### 2.4 Mock  — OpenFugu + OpenInfer (P0)
 
-**机制**: OpenFugu `--mock` mode 训练 sep-CMA-ES 验证算法. OpenInfer 不引入 torch,
-全用 Rust mock 测. Mora 已有 mock AI 模式 (OpenAI 不可用时返回 stub), 但分散在多处.
+****: OpenFugu `--mock` mode  sep-CMA-ES . OpenInfer  torch,
+ Rust mock . Mora  mock AI  (OpenAI  stub), .
 
-**Mora 现状**: `AiConfig` 默认 mock 模式, 但 `compress_demo.mora` 之类的 demo 没法跑
+**Mora **: `AiConfig`  mock ,  `compress_demo.mora`  demo 
 
-**实施**:
-- `src/mock/registry.rs` 统一 mock 接口
+****:
+- `src/mock/registry.rs`  mock 
 - `mock.register("ai.chat", fn(prompt) { return "[mock response]" })`
-- `mock.mode("ai")` 启用 AI 模拟
+- `mock.mode("ai")`  AI 
 
 ---
 
 ### 2.5 Cross-page merge — MinerU (P2)
 
-**机制**: MinerU cross-page consolidation: 同段落跨页合并, 表格跨页续接, 反应图跨页.
+****: MinerU cross-page consolidation: , , .
 
-**Mora 现状**: 0
+**Mora **: 0
 
-**实施**:
-- `src/document/cross_page.rs` 新模块
-- 复用 `grouped_layout` (1.4)
+****:
+- `src/document/cross_page.rs` 
+-  `grouped_layout` (1.4)
 - `doc.merge_cross_page()` builtin
 
 ---
 
-## 3. Mora 已有但待增强
+## 3. Mora 
 
-| 原语 | 现状 | 增强方向 | 灵感 |
+|  |  |  |  |
 |---|---|---|---|
-| `compress.json` | v0.30 SmartCrusher | 加 DocumentCompactor recursive walker | Headroom |
-| `event` | v0.31 dot-separated | 加 wildcard `outer.*` | Puter |
-| `memory.store/recall` | 基础 hashmap | 加 tiered (hot/warm/cold) | OpenInfer + MimiClaw |
-| `document.parse` | 6 backend | 加 grouped layout + reading order | MinerU |
-| `ai.chat` | mock 模式 | 加 role 参数 | OpenFugu |
-| `route` | 3 model 静态 | 加 learned policy | OpenFugu + AIOS |
-| `tool_def` | 静态注册 | 加 sandbox 权限 | AIOS + Puter |
+| `compress.json` | v0.30 SmartCrusher |  DocumentCompactor recursive walker | Headroom |
+| `event` | v0.31 dot-separated |  wildcard `outer.*` | Puter |
+| `memory.store/recall` |  hashmap |  tiered (hot/warm/cold) | OpenInfer + MimiClaw |
+| `document.parse` | 6 backend |  grouped layout + reading order | MinerU |
+| `ai.chat` | mock  |  role  | OpenFugu |
+| `route` | 3 model  |  learned policy | OpenFugu + AIOS |
+| `tool_def` |  |  sandbox  | AIOS + Puter |
 
 ---
 
-## 4. 实施路线图
+## 4. 
 
-### v0.32 (近期) — 4-6 周
-- [ ] **#1.1 plan (DAG)** — 1.5 周
-- [ ] **#1.2 react (ReAct 循环)** — 1.5 周
-- [ ] **#1.3 event wildcard** — 0.5 周
-- [ ] **#1.13 OpenAI 兼容 serve** — 1 周
-- [ ] **#2.3 Lossless-First recursive walker** — 1 周
-- [ ] **#2.4 Mock 模式统一** — 0.5 周
+### v0.32 () — 4-6 
+- [ ] **#1.1 plan (DAG)** — 1.5 
+- [ ] **#1.2 react (ReAct )** — 1.5 
+- [ ] **#1.3 event wildcard** — 0.5 
+- [ ] **#1.13 OpenAI  serve** — 1 
+- [ ] **#2.3 Lossless-First recursive walker** — 1 
+- [ ] **#2.4 Mock ** — 0.5 
 
-### v0.33 — 6-8 周
-- [ ] **#1.4 document.grouped_layout** — 2 周
-- [ ] **#1.5 document.reading_order** — 2 周
-- [ ] **#1.6 schedule cron** — 1 周
-- [ ] **#1.8 skill** — 1 周
-- [ ] **#1.9 sandbox** — 1 周
-- [ ] **#1.11 ccr** — 1.5 周
+### v0.33 — 6-8 
+- [ ] **#1.4 document.grouped_layout** — 2 
+- [ ] **#1.5 document.reading_order** — 2 
+- [ ] **#1.6 schedule cron** — 1 
+- [ ] **#1.8 skill** — 1 
+- [ ] **#1.9 sandbox** — 1 
+- [ ] **#1.11 ccr** — 1.5 
 
-### v0.34+ 远期
-- [ ] **#1.7 heartbeat** — 0.5 周
-- [ ] **#1.10 policy** — 2 周
-- [ ] **#1.12 prefix_cache** — 1 周
-- [ ] **#1.14 ai.chat role** — 0.5 周
-- [ ] **#1.15 tiered_memory** — 1.5 周
-- [ ] **#1.16 lifecycle** — 0.5 周
-- [ ] **#2.1 DI 容器** — 2 周
-- [ ] **#2.2 Error Gradation** — 1 周
-- [ ] **#2.5 cross-page merge** — 1.5 周
-
----
-
-## 5. 设计原则 (贯穿所有原语)
-
-1. **复用优先**: 优先扩展 Mora 现有模块 (compress / document / event / memory), 不创造平行体系
-2. **0 新外部依赖**: 与 v0.29 Global Constraint 一致 (z-score 用 stdlib, Pegaflow-style tiered 用现有 file API)
-3. **正交性**: 每个新原语可独立启用, 互不依赖
-4. **可观测**: 所有 builtin 产出 `trace` / `observe` 兼容事件
-5. **可测试**: 每个新 builtin 必须有 unit + e2e test
-6. **Mora 风格**: 英文关键字, 错误信息中英双语
-7. **panic 0 容忍**: 复用 v0.31 panic refactor 模式, lexer/parser 不允许 panic
-8. **module 化**: 新原语独立 `src/<name>/mod.rs`, 不进主 lib.rs
+### v0.34+ 
+- [ ] **#1.7 heartbeat** — 0.5 
+- [ ] **#1.10 policy** — 2 
+- [ ] **#1.12 prefix_cache** — 1 
+- [ ] **#1.14 ai.chat role** — 0.5 
+- [ ] **#1.15 tiered_memory** — 1.5 
+- [ ] **#1.16 lifecycle** — 0.5 
+- [ ] **#2.1 DI ** — 2 
+- [ ] **#2.2 Error Gradation** — 1 
+- [ ] **#2.5 cross-page merge** — 1.5 
 
 ---
 
-## 6. 与 Mora 现状的兼容性
+## 5.  ()
 
-按 AGENTS.md 规则 **"不维护旧版本兼容"**: v0.32+ 可直接 breaking change 现有 API.
-但 v0.30 SmartCrusher 已是 recent breaking change, v0.32 主要是**新增**, 不破坏 v0.30 已有 API.
+1. ****:  Mora  (compress / document / event / memory), 
+2. **0 **:  v0.29 Global Constraint  (z-score  stdlib, Pegaflow-style tiered  file API)
+3. ****: , 
+4. ****:  builtin  `trace` / `observe` 
+5. ****:  builtin  unit + e2e test
+6. **Mora **: , 
+7. **panic 0 **:  v0.31 panic refactor , lexer/parser  panic
+8. **module **:  `src/<name>/mod.rs`,  lib.rs
 
-**不破坏**:
-- `compress.text / json / summary` 字符串策略
-- `ai.chat / ai.stream / p"..."` AI 原语
+---
+
+## 6.  Mora 
+
+ AGENTS.md  **""**: v0.32+  breaking change  API.
+ v0.30 SmartCrusher  recent breaking change, v0.32 ****,  v0.30  API.
+
+****:
+- `compress.text / json / summary` 
+- `ai.chat / ai.stream / p"..."` AI 
 - `document.parse` 6 backend
-- `mcp_server / http_server / lsp` 服务
+- `mcp_server / http_server / lsp` 
 
-**可能破坏**:
-- `event` 关键字 — dot-separated 语义保留, 加 `*` wildcard 是扩展
-- `ai.AiConfig` 结构 — 加 `role` 字段是 optional, 默认不变
-- `tool_def` — 加 `sandbox` 块是 optional
+****:
+- `event`  — dot-separated ,  `*` wildcard 
+- `ai.AiConfig`  —  `role`  optional, 
+- `tool_def` —  `sandbox`  optional
 
 ---
 
-## 7. 关键参考链接
+## 7. 
 
-| 项目 | 链接 | 关键源码 |
+|  |  |  |
 |---|---|---|
 | AIOS | https://github.com/agiresearch/AIOS | `aios_kernel/scheduler/`, `aios_kernel/llm_cores/` |
 | MimiClaw | https://github.com/memovai/mimiclaw | `main/agent/agent_loop.c`, `main/cron/cron_service.c`, `main/skills/skill_loader.c` |
 | OpenFugu | https://github.com/trotsky1997/OpenFugu | `openfugu/mini.py` (FuguRouter), `openfugu/ultra.py` (ConductorExecutor) |
-| OpenInfer | https://open-infer.org/blog/openinfer-010/ | vLLM Rust frontend, Pegaflow KV 分层 |
+| OpenInfer | https://open-infer.org/blog/openinfer-010/ | vLLM Rust frontend, Pegaflow KV  |
 | MinerU | https://arxiv.org/html/2512.15098v2 | §2.2 Group-based Layout, §2.8 Reading Order |
 | Headroom | https://github.com/chopratejas/headroom | `crates/headroom-core/src/transforms/smart_crusher/` |
 | Puter | https://github.com/HeyPuter/puter | `src/backend/server.ts`, `src/backend/clients/event/EventClient.ts` |

@@ -41,6 +41,7 @@ pub mod mcp_server;
 pub mod mir;
 pub mod mock;
 pub mod parser_v2;
+pub mod parser_v3;
 pub mod plan;
 pub mod record;
 pub mod refine;

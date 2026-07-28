@@ -12,6 +12,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 use crate::common::BinaryOp;
 use crate::mir::ssa::{BlockId, MirSsaFunction, SsaInst, SsaReg, Terminator};
+use crate::mir::{MirFunction, MirInst};
 use crate::value::Value;
 
 type LicmpOps = Vec<(BlockId, Vec<(SsaReg, SsaInst)>, HashSet<BlockId>)>;
@@ -986,4 +987,32 @@ fn tail_call_optimize(ssa: &mut MirSsaFunction) {
             }
         }
     }
+}
+
+// ── Orchestrate-specific optimizations (v0.55) ──
+
+/// 合并连续重复的 orchestrate 指令（superstep fusion）
+///
+/// 当 body 中出现两个连续的 Orchestrate 且 kind 完全相同时，
+/// 第二个视为冗余，被移除。
+pub fn superstep_fusion(func: &mut MirFunction) {
+    let mut i = 0;
+    while i + 1 < func.body.len() {
+        if let (
+            MirInst::Orchestrate { kind: kind1, .. },
+            MirInst::Orchestrate { kind: kind2, .. },
+        ) = (&func.body[i], &func.body[i + 1])
+        {
+            if kind1 == kind2 {
+                func.body.remove(i + 1);
+                continue; // re-check current position with new neighbor
+            }
+        }
+        i += 1;
+    }
+}
+
+/// 运行所有 Pregel 优化 pass（当前仅 superstep_fusion）
+pub fn optimize_pregel(func: &mut MirFunction) {
+    superstep_fusion(func);
 }

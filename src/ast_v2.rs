@@ -544,7 +544,7 @@ pub enum DynamicKind {
 }
 
 /// v0.25: Skill 中的任务定义
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SkillTask {
     pub name: String,
     pub params: Vec<(String, Option<String>)>,
@@ -553,7 +553,7 @@ pub struct SkillTask {
 }
 
 /// v0.25: Skill 中的验证函数
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SkillVerify {
     pub params: Vec<(String, Option<String>)>,
     pub body: Vec<NodeId>,

@@ -578,7 +578,7 @@ pub fn run_mir(
                 // 明确报错的 stub：orchestrate 块类型层（typeck::pregel_check）已通过 schema 校验，
                 // 但运行期 BSP 执行引擎尚未接入 MIR 路径。当前一律返回错误，避免 silent stub 输出错误结果。
                 return Err(format!(
-                    "orchestrate({}) is not yet executable in MIR interpreter (input_var={}, result_var={})",
+                    "orchestrate({:?}) is not yet executable in MIR interpreter (input_var={}, result_var={})",
                     kind, input_var, result_var,
                 ));
             }

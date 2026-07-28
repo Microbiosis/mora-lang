@@ -783,16 +783,23 @@ impl Lowerer {
                 kind,
             } => {
                 use crate::ast_v2::OrchestrateKind;
-                let kind_str = match kind {
-                    OrchestrateKind::Sequential { .. } => "sequential".to_string(),
-                    OrchestrateKind::Graph { .. } => "graph".to_string(),
-                    OrchestrateKind::Loop { .. } => "loop".to_string(),
-                    OrchestrateKind::Pregel { .. } => "pregel".to_string(),
-                };
+                let kind: Box<crate::mir::expr::MirOrchestrateKind> = Box::new(match kind {
+                    OrchestrateKind::Sequential { .. } => crate::mir::expr::MirOrchestrateKind::Sequential { agents: vec![] },
+                    OrchestrateKind::Graph { .. } => crate::mir::expr::MirOrchestrateKind::Graph { agents: vec![], edges: vec![] },
+                    OrchestrateKind::Loop { .. } => crate::mir::expr::MirOrchestrateKind::Loop { agents: vec![], rounds: None, exit_when: None },
+                    OrchestrateKind::Pregel { .. } => crate::mir::expr::MirOrchestrateKind::Pregel {
+                        agents: vec![],
+                        edges: vec![],
+                        state_schema: vec![],
+                        checkpoint: None,
+                        interrupt_points: vec![],
+                        adjacency: std::collections::HashMap::new(),
+                    },
+                });
                 self.emit(MirInst::Orchestrate {
                     input_var: input_var.clone(),
                     result_var: result_var.clone(),
-                    kind: kind_str,
+                    kind,
                 });
                 Ok(())
             }
@@ -955,4 +962,220 @@ impl Lowerer {
             }
         }
     }
+}
+
+// ── MirExpr-based lowering (v0.55: V3 pipeline) ──
+
+use crate::mir::expr::MirExpr;
+
+/// 对 MirExpr 列表做类型检查（v0.55 占位：返回空错误列表）
+pub fn typecheck_mir_exprs(_exprs: &mut [MirExpr]) -> Vec<crate::typeck::TypeError> {
+    // TODO: implement HM type inference on MirExpr tree
+    vec![]
+}
+
+/// 将 MirExpr 列表 lowering 为 MirFunction（v0.55 占位：遍历生成 MIR 指令）
+pub fn lower_mir_exprs(exprs: &[MirExpr]) -> Result<MirFunction, String> {
+    // 使用现有 Lowerer 将每个 MirExpr 转为 MIR 指令
+    // 当前简化：只处理最基本的表达式
+    let mut body: Vec<MirInst> = Vec::new();
+    let mut n_regs: usize = 0;
+
+    for expr in exprs {
+        let (insts, nr) = lower_mir_expr(expr)?;
+        body.extend(insts);
+        n_regs = n_regs.max(nr);
+    }
+
+    Ok(MirFunction {
+        params: vec![],
+        body,
+        n_regs,
+    })
+}
+
+/// 单个 MirExpr lowering（递归）
+fn lower_mir_expr(expr: &MirExpr) -> Result<(Vec<MirInst>, usize), String> {
+    use crate::mir::expr::{
+        MirCallee, MirExprKind, MirOrchestrateKind,
+    };
+    use crate::common::Literal;
+
+    let mut insts: Vec<MirInst> = Vec::new();
+    let mut n_regs: usize = 0;
+    let dst = n_regs;
+    n_regs += 1;
+
+    match &expr.kind {
+        MirExprKind::Literal(Literal::Int(v, _)) => {
+            insts.push(MirInst::Const(dst, crate::value::Value::Int(*v)));
+        }
+        MirExprKind::Literal(Literal::Float(v, _)) => {
+            insts.push(MirInst::Const(dst, crate::value::Value::Float(*v)));
+        }
+        MirExprKind::Literal(Literal::String(v, _)) => {
+            insts.push(MirInst::Const(dst, crate::value::Value::String(v.clone())));
+        }
+        MirExprKind::Literal(Literal::Bool(v, _)) => {
+            insts.push(MirInst::Const(dst, crate::value::Value::Bool(*v)));
+        }
+        MirExprKind::Variable(name) => {
+            insts.push(MirInst::Var(dst, name.clone()));
+        }
+        MirExprKind::Binary { left, op, right } => {
+            let (mut l_insts, l_regs) = lower_mir_expr(left)?;
+            let l_dst = n_regs;
+            n_regs += l_regs;
+            insts.extend(l_insts);
+
+            let (mut r_insts, r_regs) = lower_mir_expr(right)?;
+            let r_dst = n_regs;
+            n_regs += r_regs;
+            insts.extend(r_insts);
+
+            insts.push(MirInst::BinaryOp(dst, l_dst, op.clone(), r_dst));
+        }
+        MirExprKind::Call { callee, args } => {
+            let callee_name = match callee {
+                MirCallee::Name(n) => n.clone(),
+                MirCallee::Var(n) => n.clone(),
+                _ => "unknown".to_string(),
+            };
+            let mut arg_regs: Vec<usize> = Vec::new();
+            for arg in args {
+                let (mut a_insts, a_regs) = lower_mir_expr(arg)?;
+                let a_dst = n_regs;
+                n_regs += a_regs;
+                insts.extend(a_insts);
+                arg_regs.push(a_dst);
+            }
+            insts.push(MirInst::Call(dst, callee_name, arg_regs));
+        }
+        MirExprKind::If { cond, then, r#else } => {
+            // Simplified If lowering: evaluate cond, then evaluate both branches,
+            // and use a simple approach (no Copy instruction needed)
+            let (mut c_insts, c_regs) = lower_mir_expr(cond)?;
+            let c_dst = n_regs;
+            n_regs += c_regs;
+            insts.extend(c_insts);
+
+            // Use JumpIfNot to skip then branch
+            let skip_then = insts.len() + 2; // placeholder
+            insts.push(MirInst::JumpIfNot(c_dst, skip_then));
+
+            // Then branch — assign result directly to dst
+            let (t_insts, t_regs) = lower_mir_expr(then)?;
+            let then_start = insts.len();
+            // Fix the JumpIfNot target
+            insts[then_start - 1] = MirInst::JumpIfNot(c_dst, then_start + t_insts.len() + 2);
+            insts.extend(t_insts);
+            // Use Assign to a temp name for the then result
+            let then_dst = (n_regs + t_regs) - 1;
+            n_regs += t_regs;
+            insts.push(MirInst::Assign("__if_result".to_string(), then_dst));
+            let end_jump = insts.len();
+            insts.push(MirInst::Jump(0)); // placeholder for end
+
+            // Else branch
+            let else_start = insts.len();
+            if let Some(else_expr) = r#else {
+                let (e_insts, e_regs) = lower_mir_expr(else_expr)?;
+                let e_dst = n_regs;
+                n_regs += e_regs;
+                insts.extend(e_insts);
+                insts.push(MirInst::Assign("__if_result".to_string(), e_dst));
+            }
+
+            // Fix end jump target
+            let end_pos = insts.len();
+            if end_jump < insts.len() {
+                insts[end_jump] = MirInst::Jump(end_pos);
+            }
+            // Read result back
+            insts.push(MirInst::Var(dst, "__if_result".to_string()));
+        }
+        MirExprKind::LetBinding {
+            name, value, init_body, ..
+        } => {
+            let (mut v_insts, v_regs) = lower_mir_expr(value)?;
+            let v_dst = n_regs;
+            n_regs += v_regs;
+            insts.extend(v_insts);
+            insts.push(MirInst::Define(name.clone(), v_dst));
+
+            let (mut b_insts, b_regs) = lower_mir_expr(init_body)?;
+            let b_dst = n_regs;
+            n_regs += b_regs;
+            insts.extend(b_insts);
+            insts.push(MirInst::Define("__let_result".to_string(), b_dst));
+            insts.push(MirInst::Var(dst, "__let_result".to_string()));
+        }
+        MirExprKind::Orchestrate {
+            input_var,
+            result_var,
+            kind,
+        } => {
+            insts.push(MirInst::Orchestrate {
+                input_var: input_var.clone(),
+                result_var: result_var.clone(),
+                kind: kind.clone(),
+            });
+        }
+        MirExprKind::TypeAlias { name, target } => {
+            insts.push(MirInst::TypeAlias {
+                name: name.clone(),
+                target: target.name(),
+            });
+        }
+        MirExprKind::EnumDef { name, variants } => {
+            insts.push(MirInst::EnumDef {
+                name: name.clone(),
+                variants: vec![], // simplified: pass empty variants for now
+            });
+        }
+        MirExprKind::StructDef { name, fields } => {
+            insts.push(MirInst::StructDef {
+                name: name.clone(),
+                fields: vec![], // simplified
+            });
+        }
+        MirExprKind::Import(path) => {
+            insts.push(MirInst::Import(path.clone()));
+        }
+        MirExprKind::MacroDef { name, params } => {
+            insts.push(MirInst::MacroDef {
+                name: name.clone(),
+                params: params.clone(),
+            });
+        }
+        MirExprKind::Expr(inner) => {
+            let (mut i_insts, _i_regs) = lower_mir_expr(inner)?;
+            insts.extend(i_insts);
+            insts.push(MirInst::Expr(dst));
+        }
+        MirExprKind::Sequence(exprs) => {
+            for e in exprs {
+                let (mut s_insts, s_regs) = lower_mir_expr(e)?;
+                n_regs += s_regs;
+                insts.extend(s_insts);
+            }
+        }
+        MirExprKind::Return(val) => {
+            if let Some(v) = val {
+                let (mut r_insts, r_regs) = lower_mir_expr(v)?;
+                let r_dst = n_regs;
+                n_regs += r_regs;
+                insts.extend(r_insts);
+                insts.push(MirInst::Return(Some(r_dst)));
+            } else {
+                insts.push(MirInst::Return(None));
+            }
+        }
+        // Catch-all for remaining variants
+        _ => {
+            insts.push(MirInst::Const(dst, crate::value::Value::Nil));
+        }
+    }
+
+    Ok((insts, n_regs))
 }

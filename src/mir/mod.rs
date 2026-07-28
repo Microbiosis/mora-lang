@@ -30,6 +30,7 @@ pub mod ssa;
 pub mod typeinfer;
 
 pub use interp::run_mir;
+pub use expr::MirExpr;
 // lower_program removed in Phase A (v0.55) — use lower_mir_exprs instead
 
 /// 虚拟寄存器索引（无限数量，lowering 时计数器分配）
@@ -39,7 +40,7 @@ pub type Reg = usize;
 pub type Label = usize;
 
 /// 一个 MIR 函数 = 一段脚本或一个 task body
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct MirFunction {
     pub params: Vec<String>,
     pub body: Vec<MirInst>,
@@ -47,7 +48,7 @@ pub struct MirFunction {
 }
 
 /// MIR 指令（α.0 + α.1 子集）
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum MirInst {
     // ── 值指令（产生结果到 dst 寄存器）──
     Const(Reg, Value),
@@ -289,11 +290,11 @@ pub enum MirInst {
 
     // ── 高级特性（α.8: orchestrate/skill/prompt/document/eval）──
     /// α.8: orchestrate — 编排执行，结果绑定到 result_var。
-    /// input_var 为输入变量名，kind 为编排类型字符串。
+    /// input_var 为输入变量名，kind 为结构化编排类型。
     Orchestrate {
         input_var: String,
         result_var: String,
-        kind: String,
+        kind: Box<crate::mir::expr::MirOrchestrateKind>,
     },
 
     /// α.8: eval — 断言测试：给定 given 值，检查 expects 表达式。

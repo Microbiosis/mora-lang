@@ -21,6 +21,7 @@
 use crate::common::BinaryOp;
 use crate::value::Value;
 
+pub mod expr;
 pub mod interp;
 pub mod jit;
 pub mod lower;
@@ -29,7 +30,7 @@ pub mod ssa;
 pub mod typeinfer;
 
 pub use interp::run_mir;
-pub use lower::lower_program;
+// lower_program removed in Phase A (v0.55) — use lower_mir_exprs instead
 
 /// 虚拟寄存器索引（无限数量，lowering 时计数器分配）
 pub type Reg = usize;

@@ -1,0 +1,131 @@
+#version = "v0.53"
+
+# HM Type Inference Demo - Mora-lang
+# Enable with: MORA_HM=1 cargo run -- hm_basic_example.mora
+
+# ===================================================================
+# Example 1: Basic Literal Inference
+# ===================================================================
+
+let x = 42
+let pi = 3.14159
+let greeting = "Hello, HM!"
+let is_active = true
+let empty = nil
+
+print("x =", x)          # inferred as int
+print("pi =", pi)        # inferred as float
+print("greeting =", greeting) # inferred as string
+print("is_active =", is_active) # inferred as bool
+
+# ===================================================================
+# Example 2: Binary Operations with Constraint Checking
+# ===================================================================
+
+let sum = x + 10         # int + int → int (OK)
+let difference = x - 5   # int - int → int (OK)
+let product = x * 2      # int * int → int (OK)
+
+# print(sum / 2)         # Would infer: float / int → ERROR!
+
+# Comparison operators return bool
+let is_greater = x > 10  # returns bool
+let equals_ten = (x == 10)  # returns bool
+
+print("sum =", sum)
+print("difference =", difference)
+print("product =", product)
+print("is_greater =", is_greater)
+
+# ===================================================================
+# Example 3: Closure Type Inference
+# ===================================================================
+
+# Simple closure: num -> num + 1
+let add_one = num => {
+    return num + 1
+}
+
+# Apply the closure
+let result1 = add_one(x)
+print("add_one(42) =", result1)  # should be 43
+
+# Double function
+let double = n => n * 2
+print("double(21) =", double(21))
+
+# Triple parameter closure
+let add_three = a b c => a + b + c
+print("add_three(10, 15, 20) =", add_three(10, 15, 20))
+
+# ===================================================================
+# Example 4: Higher-Order Functions & Polymorphism
+# ===================================================================
+
+# Identity function - gets polymorphic type via let-generalization
+let identity = x => x
+
+print("identity(42) =", identity(42))       # infers arg is int
+print("identity(pi) =", identity(pi))       # infers arg is float
+
+# Apply a function twice
+let apply_twice = f x => f(f(x))
+
+print("apply_twice(add_one)(10) =", apply_twice(add_one)(10))
+# Should output 12 (10 + 1 + 1)
+
+# ===================================================================
+# Example 5: Nested Closures (Closures returning Closures)
+# ===================================================================
+
+# Curried addition
+let curried_add = a => b => a + b
+
+let add_five = curried_add(5)
+print("curried_add(5, 10) =", curried_add(5)(10))  # Should be 15
+print("add_five(17) =", add_five(17))              # Should be 22
+
+# ===================================================================
+# Example 6: Multi-line Expression Bodies
+# ===================================================================
+
+let compute = x => {
+    let y = x * 2
+    let z = y + 3
+    let w = z * z
+    return w
+}
+
+print("compute(4) =", compute(4))  # ((4*2)+3)^2 = 11^2 = 121
+
+# ===================================================================
+# Example 7: List Construction (Basic Test)
+# ===================================================================
+
+let numbers = [1, 2, 3, 4, 5]  # Should infer list<int>
+let floats = [1.1, 2.2, 3.3]   # Should infer list<float>
+
+print("numbers =", numbers)
+print("floats =", floats)
+
+# ===================================================================
+# Example 8: Dictionary Construction (Basic Test)
+# ===================================================================
+
+let simple_dict = {key: "value"}
+let mixed_dict = {str_key: "string", int_val: 42}
+
+print("simple_dict =", simple_dict)
+print("mixed_dict =", mixed_dict)
+
+# ===================================================================
+# Verification
+# ===================================================================
+
+assert_int(sum)
+assert_float(product)
+assert_bool(is_greater)
+assert_int(result1)
+
+print("\n✅ All basic type inference tests passed!")
+print("Run more examples in: examples/hm_inference_examples.md")

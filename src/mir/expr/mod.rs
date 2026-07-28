@@ -48,8 +48,10 @@
 //! ⏳ v0.56: Complete AST v2 removal
 
 use crate::common::{BinaryOp, Literal, Span};
+use crate::mir::MirFunction;
 use crate::typeck::Type;
 use crate::value::Value;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 // ===================================================================
@@ -296,6 +298,36 @@ pub enum MirExprKind {
         result_var: String,
         kind: Box<MirOrchestrateKind>,
     },
+
+    /// Type alias: `type Bytes = number`
+    TypeAlias {
+        name: String,
+        target: Type,
+    },
+
+    /// Enum definition: `enum Color Red Green Blue end`
+    EnumDef {
+        name: String,
+        variants: Vec<String>,
+    },
+
+    /// Struct definition: `struct Point x: number y: number end`
+    StructDef {
+        name: String,
+        fields: Vec<(String, Type)>,
+    },
+
+    /// Import statement: `import "std/io"`
+    Import(String),
+
+    /// Macro definition: `macro greet(name) ... end`
+    MacroDef {
+        name: String,
+        params: Vec<String>,
+    },
+
+    /// Sequence of expressions (blocks with multiple statements)
+    Sequence(Vec<MirExpr>),
 }
 
 // ===================================================================
@@ -452,6 +484,7 @@ pub enum MirOrchestrateKind {
         state_schema: Vec<MirStateChannel>,
         checkpoint: Option<MirCheckpointConfig>,
         interrupt_points: Vec<MirInterruptPoint>,
+        adjacency: HashMap<String, Vec<String>>,
     },
 }
 
@@ -461,7 +494,12 @@ pub struct MirAgentDef {
     pub name: String,
     pub task_expr: MirExpr,
     pub verify_expr: Option<MirExpr>,
-    pub with_config: Option<std::collections::HashMap<String, MirExpr>>,
+    pub with_config: Option<HashMap<String, MirExpr>>,
+
+    /// Pre-lowered task body (populated during lowering, starts empty)
+    pub task_body: MirFunction,
+    /// Task expression in MIR form (consumed during lowering, set to None)
+    pub task_mir_expr: Option<MirExpr>,
 }
 
 ///  Edge definition in orchestrate graph
@@ -469,9 +507,8 @@ pub struct MirAgentDef {
 pub struct MirEdgeDef {
     pub from: String,
     pub to: String,
-    pub condition: Option<MirExpr>,
-    pub transform: Option<MirExpr>,
-    pub dynamic: Option<MirExpr>,
+    pub condition_expr: Option<MirExpr>,
+    pub condition_body: Option<MirFunction>,
 }
 
 // ===================================================================

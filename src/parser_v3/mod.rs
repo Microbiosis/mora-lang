@@ -6,6 +6,7 @@
 use crate::common::{BinaryOp, Literal, Span};
 use crate::lexer::{Token, TokenType};
 use crate::mir::expr::*;
+use crate::mir::{MirFunction, MirInst};
 
 ///  ParserV3 - Clean-room MIR parser with no AST legacy baggage
 pub struct ParserV3 {
@@ -260,8 +261,11 @@ impl ParserV3 {
         }
 
         // Support wildcard pattern _
-        if self.match_token_exact(TokenType::Wildcard) {
-            return Some(crate::mir::expr::Pattern::Wildcard);
+        if let TokenType::Identifier(ref name) = self.peek()?.token_type {
+            if name == "_" {
+                self.advance();
+                return Some(crate::mir::expr::Pattern::Wildcard);
+            }
         }
 
         // Support literal patterns by converting them to Pattern::Literal
@@ -421,11 +425,13 @@ impl ParserV3 {
                     MirOrchestrateAgent {
                         name: "default".to_string(),
                         with_config: None,
-                    task_expr: MirExpr::lit(
-                        crate::common::Literal::Nil(start_span),
-                        start_span,
-                    ),
+                        task_expr: MirExpr::lit(
+                            crate::common::Literal::Nil(start_span),
+                            start_span,
+                        ),
                         verify_expr: None,
+                        task_body: MirFunction { params: vec![], body: vec![], n_regs: 0 },
+                        task_mir_expr: None,
                     }
                 });
                 MirOrchestrateKind::Loop {
@@ -508,6 +514,8 @@ impl ParserV3 {
             with_config: None,
             task_expr: body,
             verify_expr: None,
+            task_body: MirFunction { params: vec![], body: vec![], n_regs: 0 },
+            task_mir_expr: None,
         })
     }
 
@@ -566,9 +574,8 @@ impl ParserV3 {
         Some(MirOrchestrateEdge {
             from,
             to,
-            condition,
-            transform: None,
-            dynamic: None,
+            condition_expr: condition,
+            condition_body: None,
         })
     }
 
@@ -607,8 +614,13 @@ impl ParserV3 {
             self.parse_assignment()?
         };
 
-        // Optional else branch
-        let else_branch = if self.match_token_exact(TokenType::Else) {
+        // Optional else branch (check for Identifier("else") since 'else' is not a keyword token)
+        let else_branch = if self
+            .peek()
+            .map(|t| matches!(&t.token_type, TokenType::Identifier(s) if s == "else"))
+            .unwrap_or(false)
+        {
+            self.advance(); // consume 'else'
             Some(self.parse_assignment()?)
         } else {
             None
@@ -673,9 +685,15 @@ impl ParserV3 {
     /// Parse while loop expressions.
     /// Syntax: `while cond { body }`
     fn parse_while_loop(&mut self) -> Option<MirExpr> {
-        if !self.match_token_exact(TokenType::While) {
+        // Check for Identifier("while") since 'while' is not a keyword token
+        if !self
+            .peek()
+            .map(|t| matches!(&t.token_type, TokenType::Identifier(s) if s == "while"))
+            .unwrap_or(false)
+        {
             return None;
         }
+        self.advance(); // consume 'while'
 
         let expr_span = self.span_of_current();
 
@@ -801,39 +819,13 @@ impl ParserV3 {
     }
 
     fn parse_or(&mut self) -> Option<MirExpr> {
-        let mut left = self.parse_and()?;
-
-        while let Some(_op) = self.consume_binary_op(&[TokenType::Or]) {
-            let right = self.parse_and()?;
-            left = MirExpr {
-                kind: MirExprKind::Or {
-                    left: Box::new(left),
-                    right: Box::new(right),
-                },
-                span: self.span_of_current(),
-                ty: None,
-            };
-        }
-
-        Some(left)
+        // NOTE: `||` token not yet defined in lexer (v0.55), fall through to parse_and
+        self.parse_and()
     }
 
     fn parse_and(&mut self) -> Option<MirExpr> {
-        let mut left = self.parse_equality()?;
-
-        while let Some(_op) = self.consume_binary_op(&[TokenType::And]) {
-            let right = self.parse_equality()?;
-            left = MirExpr {
-                kind: MirExprKind::And {
-                    left: Box::new(left),
-                    right: Box::new(right),
-                },
-                span: self.span_of_current(),
-                ty: None,
-            };
-        }
-
-        Some(left)
+        // NOTE: `&&` token not yet defined in lexer (v0.55), fall through to parse_equality
+        self.parse_equality()
     }
 
     fn parse_equality(&mut self) -> Option<MirExpr> {

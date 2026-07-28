@@ -45,6 +45,8 @@ pub enum Type {
     Float,
     Bool,
     Nil,
+    /// 任意类型（推断不出时的退路，或显式 `any` 标注）
+    Any,
     /// v0.x: 列表类型携带元素类型（`list<T>`）
     List(Box<Type>),
     /// v0.x: 字典类型携带键值类型（`dict<K, V>`）
@@ -121,6 +123,7 @@ impl Type {
             Type::Float => "float".to_string(),
             Type::Bool => "bool".to_string(),
             Type::Nil => "nil".to_string(),
+            Type::Any => "any".to_string(),
             Type::List(elem) => format!("list<{}>", elem.name()),
             Type::Dict(k, v) => format!("dict<{}, {}>", k.name(), v.name()),
             Type::Task => "task".to_string(),
@@ -1145,6 +1148,16 @@ impl TypeChecker {
     }
 }
 
+// ===================================================================
+// v0.55: MirExpr-based type checking (V3 pipeline)
+// ===================================================================
+
+/// 对 MirExpr 列表执行类型检查（占位：返回空错误列表）
+pub fn check_program_mir(_exprs: &[crate::mir::expr::MirExpr]) -> Vec<TypeError> {
+    // TODO: implement HM type inference on MirExpr tree
+    vec![]
+}
+
 #[cfg(test)]
 mod tests {
     //! v0.12 typeck 测试套件 —— 中档强类型方向
@@ -2043,7 +2056,7 @@ end
                 | Type::Macro
                 | Type::PromptSection
                 | Type::Document => true,
-                // Type::Any 已不存在, 这里不需要 arm
+                Type::Any => true,
             };
         }
     }

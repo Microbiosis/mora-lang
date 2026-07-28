@@ -41,6 +41,13 @@ pub fn parse_code(source: &str) -> (Vec<crate::ast_v2::NodeId>, crate::ast_v2::A
     (node_ids, arena)
 }
 
+/// v0.55: 使用 ParserV3 解析代码，返回 MirExpr 列表（纯 MIR，零 AST 依赖）
+pub fn parse_code_v3(source: &str) -> Result<Vec<crate::mir::expr::MirExpr>, String> {
+    let tokens = Lexer::new(source).scan_tokens();
+    let parser = crate::parser_v3::ParserV3::new(tokens);
+    parser.parse().map_err(|e| format!("{:?}", e))
+}
+
 pub use crate::value::{Environment, FlowSignal, StreamReader, Value};
 
 // v10 HTTP 超时配置

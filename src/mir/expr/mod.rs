@@ -605,6 +605,17 @@ pub struct MirStateChannel {
     pub reducer: MirReducerKind,
 }
 
+///  Pregel configuration bundle (v0.57: MIR-native engine entry)
+#[derive(Debug, Clone, PartialEq)]
+pub struct MirPregelConfig {
+    pub agents: Vec<MirAgentDef>,
+    pub edges: Vec<MirEdgeDef>,
+    pub state_schema: Vec<MirStateChannel>,
+    pub checkpoint: Option<MirCheckpointConfig>,
+    pub interrupt_points: Vec<MirInterruptPoint>,
+    pub adjacency: HashMap<String, Vec<String>>,
+}
+
 ///  Builtin operation (placeholder for typeck)
 #[derive(Debug, Clone, PartialEq)]
 pub enum BuiltinOp {

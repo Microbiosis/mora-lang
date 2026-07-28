@@ -8,10 +8,13 @@
 
 use crate::flow::eval_binary;
 use crate::interpreter::Interpreter;
+use crate::interpreter::mir_pregel_engine::MirPregelEngine;
+use crate::mir::expr::{MirOrchestrateKind, MirPregelConfig};
 use crate::value::{Environment, Value};
 
 use super::{MirFunction, MirInst};
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 /// MIR 解释器执行一个 MirFunction，返回最后的表达式值或 Return 值
@@ -569,18 +572,50 @@ pub fn run_mir(
                 }
                 pc += 1;
             }
-            // α.8: orchestrate — 编排执行（占位：实际编排由 AST 路径处理）
+            // α.8: orchestrate — MIR-native Pregel 执行
             MirInst::Orchestrate {
                 input_var,
                 result_var,
                 kind,
             } => {
-                // 明确报错的 stub：orchestrate 块类型层（typeck::pregel_check）已通过 schema 校验，
-                // 但运行期 BSP 执行引擎尚未接入 MIR 路径。当前一律返回错误，避免 silent stub 输出错误结果。
-                return Err(format!(
-                    "orchestrate({:?}) is not yet executable in MIR interpreter (input_var={}, result_var={})",
-                    kind, input_var, result_var,
-                ));
+                match kind.as_ref() {
+                    MirOrchestrateKind::Pregel {
+                        agents,
+                        edges,
+                        state_schema,
+                        checkpoint,
+                        interrupt_points,
+                        adjacency,
+                    } => {
+                        let config = MirPregelConfig {
+                            agents: agents.clone(),
+                            edges: edges.clone(),
+                            state_schema: state_schema.clone(),
+                            checkpoint: checkpoint.clone(),
+                            interrupt_points: interrupt_points.clone(),
+                            adjacency: adjacency.clone(),
+                        };
+                        let mut engine = MirPregelEngine::new(config);
+                        // 初始化 input channel
+                        let input_val = match env.get(input_var) {
+                            Some(v) => v.clone(),
+                            None => Value::Nil,
+                        };
+                        let mut initial = HashMap::new();
+                        initial.insert(input_var.clone(), input_val);
+                        engine.init_channels(initial);
+                        // 执行 BSP 循环
+                        let result = engine.run(interp)?;
+                        env.define(result_var.clone(), result, false);
+                    }
+                    other => {
+                        return Err(format!(
+                            "orchestrate({:?}) not yet supported in MIR interpreter",
+                            other
+                        ));
+                    }
+                }
+                pc += 1;
             }
             // α.8: eval — 断言测试
             MirInst::Eval {

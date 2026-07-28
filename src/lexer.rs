@@ -121,6 +121,7 @@ pub enum TokenType {
     // v0.31: 词法错误时 emit (不 panic), 携带错误信息
     Error(String),
     Arrow,
+    FatArrow, // v0.55: `=>` 用于 match arm
     // v0.06.2: ? 操作符（expr? 传播 Result 错误）
     Question,
     // v0.07.1: :: 操作符（Namespace qualification like Router::new）
@@ -434,6 +435,13 @@ impl Lexer {
                         line: start_line,
                         column: start_col,
                     })
+                } else if self.match_char('>') {
+                    // v0.55: `=>` fat arrow for match arms
+                    Some(Token {
+                        token_type: TokenType::FatArrow,
+                        line: start_line,
+                        column: start_col,
+                    })
                 } else {
                     Some(Token {
                         token_type: TokenType::Assign,
@@ -544,12 +552,7 @@ impl Lexer {
                     Some(self.identifier_from(start_line, start_col))
                 } else if c == '@' {
                     // v0.30: `@` 装饰符 (e.g. @start, @exit 用于 graph node label)
-                    // 把 @ 后跟的标识符作为整体 identifier 处理 (含 @ 前缀)
-                    self.advance(); // 消费 @
-                    let mut name = String::from("@");
-                    while self.peek().is_ascii_alphanumeric() || self.peek() == '_' {
-                        name.push(self.advance());
-                    }
+                    // 只 emit `@` 本身——parser 自行 consume_identifier 取节点名
                     Some(Token {
                         token_type: TokenType::At,
                         line: start_line,

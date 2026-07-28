@@ -24,7 +24,6 @@ fn parse_v3(source: &str) -> Vec<mora::mir::expr::MirExpr> {
 // ===================================================================
 
 #[test]
-#[ignore = "requires parser_v3 orchestrate grammar support"]
 fn v3_parse_orchestrate_sequential() {
     let exprs = parse_v3(r#"
 orchestrate sequential input -> result
@@ -53,7 +52,6 @@ end
 }
 
 #[test]
-#[ignore = "requires parser_v3 orchestrate grammar support"]
 fn v3_parse_orchestrate_pregel() {
     let exprs = parse_v3(r#"
 orchestrate pregel input -> result

@@ -4,9 +4,10 @@
 //! This is the final parser implementation that completely replaces Parser v2.
 
 use crate::common::{BinaryOp, Literal, Span};
-use crate::lexer::{Token, TokenType};
+use crate::lexer::{Token, TokenType, Lexer};
 use crate::mir::expr::*;
-use crate::mir::{MirFunction, MirInst};
+use crate::mir::MirFunction;
+use std::collections::HashMap;
 
 ///  ParserV3 - Clean-room MIR parser with no AST legacy baggage
 pub struct ParserV3 {
@@ -27,6 +28,11 @@ impl ParserV3 {
         while !self.is_at_end() {
             // Skip blank lines / multiple newlines
             while self.match_token(&[TokenType::Newline]) {}
+
+            if self.is_at_end() {
+                break;
+            }
+
             // Guard against regressions where a successful parse does not
             // advance the token cursor.
             guard += 1;
@@ -137,6 +143,23 @@ impl ParserV3 {
             return Some(expr);
         }
 
+        // Try type/enum/struct/import/macro definitions
+        if let Some(expr) = self.parse_type_alias() {
+            return Some(expr);
+        }
+        if let Some(expr) = self.parse_enum_def() {
+            return Some(expr);
+        }
+        if let Some(expr) = self.parse_struct_def() {
+            return Some(expr);
+        }
+        if let Some(expr) = self.parse_import_statement() {
+            return Some(expr);
+        }
+        if let Some(expr) = self.parse_macro_def() {
+            return Some(expr);
+        }
+
         // Try orchestrate next (before assignment, it's a top-level construct)
         if let Some(expr) = self.parse_orchestrate_statement() {
             return Some(expr);
@@ -223,8 +246,8 @@ impl ParserV3 {
         // Parse pattern on left side of =>
         let pattern = self.parse_pattern()?;
 
-        // Must have => arrow
-        if !self.match_token_exact(TokenType::Arrow) {
+        // Must have => fat arrow (v0.55: now a proper token)
+        if !self.match_token_exact(TokenType::FatArrow) {
             return None;
         }
 
@@ -252,20 +275,20 @@ impl ParserV3 {
     /// - Guard clauses: `pattern if condition` → Pattern::Guard { ... }
     /// - Or patterns: `A | B` → Need new Pattern variant
     fn parse_pattern(&mut self) -> Option<crate::mir::expr::Pattern> {
+        // Check for wildcard pattern `_` first (before generic identifier check)
+        if let TokenType::Identifier(ref name) = self.peek()?.token_type {
+            if name == "_" {
+                self.advance();
+                return Some(crate::mir::expr::Pattern::Wildcard);
+            }
+        }
+
         // Check if current token is an identifier (variable name)
         let is_identifier = matches!(self.peek()?.token_type, TokenType::Identifier(_));
 
         if is_identifier {
             let name = self.consume_identifier("Expected pattern")?;
             return Some(crate::mir::expr::Pattern::Variable(name));
-        }
-
-        // Support wildcard pattern _
-        if let TokenType::Identifier(ref name) = self.peek()?.token_type {
-            if name == "_" {
-                self.advance();
-                return Some(crate::mir::expr::Pattern::Wildcard);
-            }
         }
 
         // Support literal patterns by converting them to Pattern::Literal
@@ -331,15 +354,15 @@ impl ParserV3 {
 
         let start_span = self.span_of_current();
 
-        // Parse kind: sequential | loop | graph
+        // Parse kind: sequential | loop | graph | pregel
         let kind_str = if self.check(&TokenType::Loop) {
             self.advance();
             "loop".to_string()
         } else {
-            let name = self.consume_identifier("Expected orchestrate kind (sequential/loop/graph)")?;
-            if name != "sequential" && name != "graph" {
+            let name = self.consume_identifier("Expected orchestrate kind (sequential/loop/graph/pregel)")?;
+            if name != "sequential" && name != "graph" && name != "pregel" {
                 eprintln!(
-                    "Parse error: Expected orchestrate kind (sequential/loop/graph) at line {}",
+                    "Parse error: Expected orchestrate kind (sequential/loop/graph/pregel) at line {}",
                     self.current_line()
                 );
                 return None;
@@ -441,6 +464,14 @@ impl ParserV3 {
                 }
             }
             "graph" => MirOrchestrateKind::Graph { agents, edges },
+            "pregel" => MirOrchestrateKind::Pregel {
+                agents,
+                edges,
+                state_schema: vec![],
+                checkpoint: None,
+                interrupt_points: vec![],
+                adjacency: HashMap::new(),
+            },
             _ => MirOrchestrateKind::Sequential { agents },
         };
 
@@ -497,7 +528,7 @@ impl ParserV3 {
         };
 
         // => body expression
-        if !self.match_token_exact(TokenType::Arrow) {
+        if !self.match_token_exact(TokenType::FatArrow) {
             self.current = saved;
             return None;
         }
@@ -509,13 +540,14 @@ impl ParserV3 {
             }
         };
 
+        let task_mir = Some(body.clone());
         Some(MirOrchestrateAgent {
             name,
             with_config: None,
             task_expr: body,
             verify_expr: None,
             task_body: MirFunction { params: vec![], body: vec![], n_regs: 0 },
-            task_mir_expr: None,
+            task_mir_expr: task_mir,
         })
     }
 
@@ -579,8 +611,50 @@ impl ParserV3 {
         })
     }
 
+    /// Parse a block body: multiple newline-separated expressions until RBrace/End.
+    /// Returns a Sequence if multiple expressions, or the single expression if just one.
+    fn parse_block_body(&mut self) -> Option<MirExpr> {
+        let span = self.span_of_current();
+        let mut exprs = Vec::new();
+
+        loop {
+            // Skip leading newlines
+            while self.match_token(&[TokenType::Newline]) {}
+
+            // Check for end of block
+            if self.is_at_end()
+                || self.check(&TokenType::RBrace)
+                || self.check(&TokenType::End)
+            {
+                break;
+            }
+
+            if let Some(e) = self.parse_assignment() {
+                exprs.push(e);
+            } else {
+                // Can't parse — skip token to make progress
+                self.advance();
+            }
+
+            // Consume trailing newline or comma
+            let _ = self.match_token(&[TokenType::Newline, TokenType::Comma]);
+        }
+
+        if exprs.is_empty() {
+            return None;
+        }
+        if exprs.len() == 1 {
+            return Some(exprs.into_iter().next().unwrap());
+        }
+        Some(MirExpr {
+            kind: MirExprKind::Sequence(exprs),
+            span,
+            ty: None,
+        })
+    }
+
     /// Parse if/else expressions.
-    /// Supports two syntax styles:
+    /// Supports three syntax styles:
     /// 1. Expression style: `if cond then expr else else_expr`
     /// 2. Block style: `if cond { then_expr } else { else_expr }`
     /// The `then` keyword is optional when using block syntax `{`.
@@ -595,39 +669,55 @@ impl ParserV3 {
         // Parse condition expression
         let cond = self.parse_expression()?;
 
-        // Check for 'then' keyword or opening brace (block syntax)
-        let has_then =
-            self.match_token_exact(TokenType::Then) || self.match_token_exact(TokenType::LBrace);
+        // Three syntax styles:
+        // 1. `if cond then expr else expr`  (then keyword, expression syntax)
+        // 2. `if cond { expr } else { expr }`  (brace block syntax)
+        // 3. `if cond then expr else expr end`  (then keyword with end terminator)
 
-        if !has_then {
-            return None;
+        if self.match_token_exact(TokenType::Then) {
+            // Expression syntax: if cond then expr [else expr] [end]
+            let then_branch = self.parse_assignment()?;
+
+            let else_branch = if self
+                .peek()
+                .map(|t| matches!(&t.token_type, TokenType::Identifier(s) if s == "else"))
+                .unwrap_or(false)
+            {
+                self.advance(); // consume 'else'
+                Some(self.parse_assignment()?)
+            } else {
+                None
+            };
+
+            // Optional 'end' terminator
+            let _ = self.match_token(&[TokenType::End]);
+
+            return Some(MirExpr::if_else(cond, then_branch, else_branch, expr_span));
         }
 
-        // Parse then-branch based on syntax style
-        let then_branch = if self.match_token_exact(TokenType::LBrace) {
-            // Block syntax: if cond { ... }
-            let then_expr = self.parse_expression()?;
+        if self.match_token_exact(TokenType::LBrace) {
+            // Brace block syntax: if cond { then } [else { else }]
+            let then_branch = self.parse_block_body()?;
             self.consume(TokenType::RBrace, "Expected closing brace '}}'")?;
-            then_expr
-        } else {
-            // Expression syntax: if cond then expr
-            self.parse_assignment()?
-        };
 
-        // Optional else branch (check for Identifier("else") since 'else' is not a keyword token)
-        let else_branch = if self
-            .peek()
-            .map(|t| matches!(&t.token_type, TokenType::Identifier(s) if s == "else"))
-            .unwrap_or(false)
-        {
-            self.advance(); // consume 'else'
-            Some(self.parse_assignment()?)
-        } else {
-            None
-        };
+            let else_branch = if self
+                .peek()
+                .map(|t| matches!(&t.token_type, TokenType::Identifier(s) if s == "else"))
+                .unwrap_or(false)
+            {
+                self.advance(); // consume 'else'
+                self.consume(TokenType::LBrace, "Expected '{' after 'else'")?;
+                let else_expr = self.parse_block_body()?;
+                self.consume(TokenType::RBrace, "Expected closing brace '}}' after else")?;
+                Some(else_expr)
+            } else {
+                None
+            };
 
-        // Construct if/else expression node
-        Some(MirExpr::if_else(cond, then_branch, else_branch, expr_span))
+            return Some(MirExpr::if_else(cond, then_branch, else_branch, expr_span));
+        }
+
+        None
     }
 
     /// Parse for loop expressions.
@@ -654,22 +744,20 @@ impl ParserV3 {
         // Parse iterable expression
         let iterable = self.parse_assignment()?;
 
-        // Expect block
-        if !self.match_token_exact(TokenType::LBrace) {
-            eprintln!(
-                "Parse error: Expected '{{' after 'for' iterable at line {}",
-                self.current_line()
-            );
-            return None;
-        }
-
-        // Parse body expression (skip leading newlines)
-        let _ = self.match_token(&[TokenType::Newline]);
-        let body = self.parse_assignment()?;
-
-        // Skip newlines and expect closing brace
-        let _ = self.match_token(&[TokenType::Newline]);
-        self.consume(TokenType::RBrace, "Expected '}' after for loop body")?;
+        // Accept both brace block { ... } and end-terminated block:
+        //   for i in items { body }
+        //   for i in items\n body end
+        let body = if self.match_token_exact(TokenType::LBrace) {
+            let b = self.parse_block_body()?;
+            self.consume(TokenType::RBrace, "Expected '}' after for loop body")?;
+            b
+        } else {
+            // end-terminated block syntax
+            let _ = self.match_token(&[TokenType::Newline]);
+            let b = self.parse_block_body()?;
+            self.consume(TokenType::End, "Expected 'end' after for loop body")?;
+            b
+        };
 
         Some(MirExpr {
             kind: MirExprKind::Loop {
@@ -700,22 +788,20 @@ impl ParserV3 {
         // Parse condition expression
         let cond = self.parse_assignment()?;
 
-        // Expect block
-        if !self.match_token_exact(TokenType::LBrace) {
-            eprintln!(
-                "Parse error: Expected '{{' after 'while' condition at line {}",
-                self.current_line()
-            );
-            return None;
-        }
-
-        // Parse body expression (skip leading newlines)
-        let _ = self.match_token(&[TokenType::Newline]);
-        let body = self.parse_assignment()?;
-
-        // Skip newlines and expect closing brace
-        let _ = self.match_token(&[TokenType::Newline]);
-        self.consume(TokenType::RBrace, "Expected '}' after while loop body")?;
+        // Accept both brace block { ... } and end-terminated block:
+        //   while cond { body }
+        //   while cond\n body end
+        let body = if self.match_token_exact(TokenType::LBrace) {
+            let b = self.parse_block_body()?;
+            self.consume(TokenType::RBrace, "Expected '}' after while loop body")?;
+            b
+        } else {
+            // end-terminated block syntax
+            let _ = self.match_token(&[TokenType::Newline]);
+            let b = self.parse_block_body()?;
+            self.consume(TokenType::End, "Expected 'end' after while loop body")?;
+            b
+        };
 
         Some(MirExpr {
             kind: MirExprKind::While {
@@ -819,13 +905,53 @@ impl ParserV3 {
     }
 
     fn parse_or(&mut self) -> Option<MirExpr> {
-        // NOTE: `||` token not yet defined in lexer (v0.55), fall through to parse_and
-        self.parse_and()
+        let span = self.span_of_current();
+        let mut left = self.parse_and()?;
+
+        // Check for 'or' keyword (identifier "or")
+        while self
+            .peek()
+            .map(|t| matches!(&t.token_type, TokenType::Identifier(s) if s == "or"))
+            .unwrap_or(false)
+        {
+            self.advance(); // consume 'or'
+            let right = self.parse_and()?;
+            left = MirExpr {
+                kind: MirExprKind::Or {
+                    left: Box::new(left),
+                    right: Box::new(right),
+                },
+                span,
+                ty: None,
+            };
+        }
+
+        Some(left)
     }
 
     fn parse_and(&mut self) -> Option<MirExpr> {
-        // NOTE: `&&` token not yet defined in lexer (v0.55), fall through to parse_equality
-        self.parse_equality()
+        let span = self.span_of_current();
+        let mut left = self.parse_equality()?;
+
+        // Check for 'and' keyword (identifier "and")
+        while self
+            .peek()
+            .map(|t| matches!(&t.token_type, TokenType::Identifier(s) if s == "and"))
+            .unwrap_or(false)
+        {
+            self.advance(); // consume 'and'
+            let right = self.parse_equality()?;
+            left = MirExpr {
+                kind: MirExprKind::And {
+                    left: Box::new(left),
+                    right: Box::new(right),
+                },
+                span,
+                ty: None,
+            };
+        }
+
+        Some(left)
     }
 
     fn parse_equality(&mut self) -> Option<MirExpr> {
@@ -880,7 +1006,23 @@ impl ParserV3 {
     }
 
     fn parse_unary(&mut self) -> Option<MirExpr> {
-        // Check for unary minus
+        let span = self.span_of_current();
+
+        // Check for 'not' keyword (identifier "not")
+        if self
+            .peek()
+            .map(|t| matches!(&t.token_type, TokenType::Identifier(s) if s == "not"))
+            .unwrap_or(false)
+        {
+            self.advance(); // consume 'not'
+            let operand = self.parse_unary()?;
+            // not x = 0 == x → false if x is truthy
+            let zero = MirExpr::lit(Literal::Int(0, span), span);
+            let negated = MirExpr::binop(BinaryOp::Equal, zero, operand, span);
+            return Some(negated);
+        }
+
+        // Check for unary minus or bang (!)
         if self.check(&TokenType::Minus) || self.check(&TokenType::Bang) {
             let _op = self.advance()?;
             let operand = self.parse_unary()?;
@@ -894,7 +1036,44 @@ impl ParserV3 {
             return Some(negated);
         }
 
-        self.parse_call()
+        let expr = self.parse_call()?;
+
+        // Check for 'as dyn Trait' suffix
+        if self.check(&TokenType::As) {
+            self.advance(); // consume 'as'
+            if self.check(&TokenType::Dyn) {
+                self.advance(); // consume 'dyn'
+                let trait_name = self.consume_identifier("Expected trait name after 'dyn'")?;
+                // Optional generics: <Type, ...>
+                let generics = if self.check(&TokenType::Less) {
+                    self.advance();
+                    let mut gens = Vec::new();
+                    loop {
+                        if let Some(ty) = self.parse_type_annotation() {
+                            gens.push(ty);
+                        }
+                        if !self.match_token(&[TokenType::Comma]) {
+                            break;
+                        }
+                    }
+                    self.consume(TokenType::Greater, "Expected '>' after generics")?;
+                    gens
+                } else {
+                    Vec::new()
+                };
+                return Some(MirExpr {
+                    kind: MirExprKind::DynTrait {
+                        expr: Box::new(expr),
+                        trait_name,
+                        generics,
+                    },
+                    span,
+                    ty: None,
+                });
+            }
+        }
+
+        Some(expr)
     }
 
     fn parse_call(&mut self) -> Option<MirExpr> {
@@ -951,6 +1130,7 @@ impl ParserV3 {
     /// Syntax: `lhs |> rhs`
     /// The rhs is typically a function call. This is left-associative:
     /// `a |> b |> c` means `c(b(a))`.
+    #[allow(dead_code)]
     fn parse_pipe(&mut self) -> Option<MirExpr> {
         let mut left = self.parse_call()?;
 
@@ -1076,7 +1256,7 @@ impl ParserV3 {
                     }
                 }
                 self.consume(TokenType::RParen, "Expected ')' after parameters")?;
-                if !self.match_token_exact(TokenType::Arrow) {
+                if !self.match_token_exact(TokenType::FatArrow) {
                     eprintln!(
                         "Parse error: Expected '=>' after closure params at line {}",
                         self.current_line()
@@ -1099,14 +1279,22 @@ impl ParserV3 {
         let span = self.span_of_current();
         let tok = self.advance()?;
 
-        // Extract string content from TokenType::String variant
-        let content = match &tok.token_type {
-            TokenType::String(s) => s.clone(),
-            TokenType::PromptString(s) => s.clone(),
-            _ => return None,
-        };
-
-        Some(MirExpr::lit(Literal::String(content, span), span))
+        match tok.token_type {
+            TokenType::String(ref s) => {
+                Some(MirExpr::lit(Literal::String(s.clone(), span), span))
+            }
+            TokenType::PromptString(ref s) => {
+                // Parse prompt string: p"text {expr} more {expr}"
+                // Split into parts: literal strings and interpolated expressions
+                let parts = parse_prompt_parts(s, span);
+                Some(MirExpr {
+                    kind: MirExprKind::Prompt { parts },
+                    span,
+                    ty: None,
+                })
+            }
+            _ => None,
+        }
     }
 
     fn parse_list(&mut self) -> Option<MirExpr> {
@@ -1185,6 +1373,156 @@ impl ParserV3 {
                 None
             }
         }
+    }
+
+    /// Parse type alias: `type Name = TargetType`
+    fn parse_type_alias(&mut self) -> Option<MirExpr> {
+        if !self.match_token_exact(TokenType::Type) {
+            return None;
+        }
+        let span = self.span_of_current();
+        let name = self.consume_identifier("Expected type name after 'type'")?;
+        self.consume(TokenType::Assign, "Expected '=' after type alias name")?;
+        let target = self.parse_type_annotation()?;
+        let _ = self.match_token(&[TokenType::Newline]);
+        Some(MirExpr {
+            kind: MirExprKind::TypeAlias { name, target },
+            span,
+            ty: None,
+        })
+    }
+
+    /// Parse enum definition: `enum Name\n  Variant1\n  Variant2\nend`
+    fn parse_enum_def(&mut self) -> Option<MirExpr> {
+        if !self.match_token_exact(TokenType::Enum) {
+            return None;
+        }
+        let span = self.span_of_current();
+        let name = self.consume_identifier("Expected enum name after 'enum'")?;
+        let _ = self.match_token(&[TokenType::Newline]);
+
+        let mut variants = Vec::new();
+        loop {
+            while self.match_token(&[TokenType::Newline]) {}
+            if self.is_at_end() || self.check(&TokenType::End) {
+                if self.check(&TokenType::End) {
+                    self.advance();
+                }
+                break;
+            }
+            if let Some(v) = self.consume_identifier("Expected variant name") {
+                variants.push(v);
+            }
+        }
+        Some(MirExpr {
+            kind: MirExprKind::EnumDef { name, variants },
+            span,
+            ty: None,
+        })
+    }
+
+    /// Parse struct definition: `struct Name\n  field1: Type\n  field2: Type\nend`
+    fn parse_struct_def(&mut self) -> Option<MirExpr> {
+        if !self.match_token_exact(TokenType::Struct) {
+            return None;
+        }
+        let span = self.span_of_current();
+        let name = self.consume_identifier("Expected struct name after 'struct'")?;
+        let _ = self.match_token(&[TokenType::Newline]);
+
+        let mut fields = Vec::new();
+        loop {
+            while self.match_token(&[TokenType::Newline]) {}
+            if self.is_at_end() || self.check(&TokenType::End) {
+                if self.check(&TokenType::End) {
+                    self.advance();
+                }
+                break;
+            }
+            if let Some(field_name) = self.consume_identifier("Expected field name") {
+                self.consume(TokenType::Colon, "Expected ':' after field name")?;
+                if let Some(field_type) = self.parse_type_annotation() {
+                    fields.push((field_name, field_type));
+                }
+            }
+        }
+        Some(MirExpr {
+            kind: MirExprKind::StructDef { name, fields },
+            span,
+            ty: None,
+        })
+    }
+
+    /// Parse import statement: `import "path/to/module"`
+    fn parse_import_statement(&mut self) -> Option<MirExpr> {
+        if !self.match_token_exact(TokenType::Import) {
+            return None;
+        }
+        let span = self.span_of_current();
+        // Expect a string literal
+        let path = match self.peek()?.token_type {
+            TokenType::String(ref s) => {
+                let p = s.clone();
+                self.advance();
+                p
+            }
+            _ => {
+                eprintln!(
+                    "Parse error: Expected string after 'import' at line {}",
+                    self.current_line()
+                );
+                return None;
+            }
+        };
+        let _ = self.match_token(&[TokenType::Newline]);
+        Some(MirExpr {
+            kind: MirExprKind::Import(path),
+            span,
+            ty: None,
+        })
+    }
+
+    /// Parse macro definition: `macro name(param1, param2)\n  body\nend`
+    fn parse_macro_def(&mut self) -> Option<MirExpr> {
+        if !self.match_token_exact(TokenType::Macro) {
+            return None;
+        }
+        let span = self.span_of_current();
+        let name = self.consume_identifier("Expected macro name after 'macro'")?;
+
+        // Optional params
+        let mut params = Vec::new();
+        if self.match_token_exact(TokenType::LParen) {
+            while !self.check(&TokenType::RParen) && !self.is_at_end() {
+                if let Some(p) = self.consume_identifier("Expected parameter name") {
+                    params.push(p);
+                }
+                if !self.match_token(&[TokenType::Comma]) {
+                    break;
+                }
+            }
+            self.consume(TokenType::RParen, "Expected ')' after macro params")?;
+        }
+
+        let _ = self.match_token(&[TokenType::Newline]);
+
+        // Skip body until 'end'
+        loop {
+            while self.match_token(&[TokenType::Newline]) {}
+            if self.is_at_end() || self.check(&TokenType::End) {
+                if self.check(&TokenType::End) {
+                    self.advance();
+                }
+                break;
+            }
+            self.advance(); // skip body tokens
+        }
+
+        Some(MirExpr {
+            kind: MirExprKind::MacroDef { name, params },
+            span,
+            ty: None,
+        })
     }
 
     // ===================================================================
@@ -1329,6 +1667,66 @@ fn match_to_string(expr: &MirExpr) -> String {
         MirExprKind::Literal(lit) => format!("{:?}", lit),
         _ => "expr".to_string(),
     }
+}
+
+/// Parse prompt string content into MirExpr parts (standalone, no &self borrow).
+/// `p"hello {name}"` → [Literal("hello "), Variable("name")]
+fn parse_prompt_parts(content: &str, span: Span) -> Vec<MirExpr> {
+    let mut parts = Vec::new();
+    let mut current_text = String::new();
+    let mut chars = content.chars().peekable();
+
+    while let Some(c) = chars.next() {
+        if c == '{' {
+            // Flush accumulated text as a literal part
+            if !current_text.is_empty() {
+                parts.push(MirExpr::lit(
+                    Literal::String(current_text.clone(), span),
+                    span,
+                ));
+                current_text.clear();
+            }
+            // Collect expression text until matching '}'
+            let mut expr_text = String::new();
+            let mut depth = 1;
+            while let Some(&ec) = chars.peek() {
+                chars.next();
+                if ec == '{' {
+                    depth += 1;
+                    expr_text.push(ec);
+                } else if ec == '}' {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                    expr_text.push(ec);
+                } else {
+                    expr_text.push(ec);
+                }
+            }
+            // Parse the expression text via sub-lexer+parser
+            if !expr_text.is_empty() {
+                let mut lexer = Lexer::new(&expr_text);
+                let tokens = lexer.scan_tokens();
+                let mut parser = ParserV3::new(tokens);
+                if let Some(expr) = parser.parse_assignment() {
+                    parts.push(expr);
+                }
+            }
+        } else {
+            current_text.push(c);
+        }
+    }
+
+    // Flush remaining text
+    if !current_text.is_empty() || parts.is_empty() {
+        parts.push(MirExpr::lit(
+            Literal::String(current_text, span),
+            span,
+        ));
+    }
+
+    parts
 }
 
 // Add grouping helper - build grouped expression as identity

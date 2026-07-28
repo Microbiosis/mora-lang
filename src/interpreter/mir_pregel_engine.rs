@@ -16,8 +16,10 @@ use std::sync::Arc;
 use crate::checkpoint::{Checkpoint, SendTask};
 use crate::interpreter::Interpreter;
 use crate::mir::expr::{
-    MirInterruptPoint, MirInterruptWhen, MirPregelConfig, MirReducerKind,
+    MirAgentDef, MirEdgeDef, MirInterruptPoint, MirInterruptWhen, MirPregelConfig,
+    MirReducerKind, MirStateChannel,
 };
+use crate::mir::MirFunction;
 use crate::value::Value;
 
 /// Interrupt 回调签名
@@ -283,8 +285,8 @@ pub fn run(&mut self, interpreter: &mut Interpreter) -> Result<Value, String> {
                 };
                 Value::Float(cur_num + new_num)
             }
-            MirReducerKind::Merge(_, _body_opt) => {
-                // v0.57: body 在 second 字段 — TODO 实际调用 run_mir(body, ...)
+            MirReducerKind::Merge(_merge_expr) => {
+                // v0.57: merge body stored in MirExpr — TODO 实际调用 run_mir(body, ...)
                 current.unwrap_or(value)
             }
             // v0.57: 其他 reducer 类型当前未在 V3 pipeline 触发
@@ -365,7 +367,7 @@ fn value_to_json_string(v: &Value) -> String {
 mod tests {
     use super::*;
     use crate::mir::MirFunction;
-    use crate::mir::expr::{MirAgentDef, MirEdgeDef, MirStateChannel};
+    use crate::mir::expr::{MirAgentDef, MirEdgeDef, MirExpr, MirStateChannel};
 
     fn empty_mir_function() -> MirFunction {
         MirFunction {
@@ -378,12 +380,14 @@ mod tests {
     fn make_agent(name: &str) -> MirAgentDef {
         MirAgentDef {
             name: name.to_string(),
-            task_mir_expr: None,
-            verify_mir_expr: None,
+            task_expr: MirExpr::lit(
+                crate::common::Literal::Nil(crate::common::Span::new(1, 1)),
+                crate::common::Span::new(1, 1),
+            ),
+            verify_expr: None,
             with_config: None,
-            reads_channels: Vec::new(),
             task_body: empty_mir_function(),
-            verify_body: None,
+            task_mir_expr: None,
         }
     }
 

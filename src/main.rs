@@ -6,7 +6,6 @@ use std::path::Path;
 use std::process;
 
 use mora::ast_v2::AstArena;
-use mora::ast_v2::NodeId;
 use mora::interpreter::Interpreter;
 use mora::lexer::Lexer;
 use mora::mir::expr::MirExpr;

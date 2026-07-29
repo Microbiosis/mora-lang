@@ -371,10 +371,13 @@ impl Server {
     // Diagnostics（typeck → LSP Diagnostic）
     // ---------------------------------------------------------------
     fn check_diagnostics(&self, text: &str) -> Vec<Diagnostic> {
-        use crate::typeck;
+        use crate::mir::lower::typecheck_mir_exprs;
 
-        let (node_ids, arena) = crate::interpreter::parse_code(text);
-        let errs = typeck::check_program(&node_ids, &arena);
+        let mut exprs = match crate::interpreter::parse_code_v3(text) {
+            Ok(e) => e,
+            Err(_) => return Vec::new(),
+        };
+        let errs = typecheck_mir_exprs(&mut exprs);
         errs.into_iter()
             .map(|e| {
                 // v0.05: line/column 都是 1-based (typeck)，LSP 是 0-based

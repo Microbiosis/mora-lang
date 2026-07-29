@@ -12,7 +12,7 @@ use mora::lexer::Lexer;
 use mora::mir::expr::MirExpr;
 use mora::parser_v3::ParserV3;
 use mora::record::{self, Mode};
-use mora::typeck::{self, format_error};
+use mora::typeck::format_error;
 
 /// 使用 ParserV3 解析代码（直接 MirExpr 输出，零 AST 依赖）
 fn parse_with_v3(source: &str) -> Vec<MirExpr> {

@@ -30,24 +30,17 @@ pub mod ssa;
 pub mod typeinfer;
 
 pub use interp::run_mir;
-pub use expr::MirExpr;
-// lower_program removed in Phase A (v0.55) — use lower_mir_exprs instead
+/// α.0: Import MirExpr — MIR expression tree (single source of truth)
+pub use expr::{MirExpr, TypedMirExpr, MirFunction, MirStmt, MirOrchestrateKind};
+pub use expr::{Literal, PromptPart, AIConfig, MatchArm, DagNode};
+pub use expr::{lit_literal, lit_string, lit_int, lit_float, lit_bool, lit_nil};
+pub use expr::pregel_types::*; // Import Pregel types
 
 /// 虚拟寄存器索引（无限数量，lowering 时计数器分配）
 pub type Reg = usize;
 
 /// 跳转目标（body 中的指令索引）
 pub type Label = usize;
-
-/// 一个 MIR 函数 = 一段脚本或一个 task body
-#[derive(Debug, Clone, PartialEq)]
-pub struct MirFunction {
-    pub params: Vec<String>,
-    pub body: Vec<MirInst>,
-    pub n_regs: usize,
-}
-
-/// MIR 指令（α.0 + α.1 子集）
 #[derive(Debug, Clone, PartialEq)]
 pub enum MirInst {
     // ── 值指令（产生结果到 dst 寄存器）──

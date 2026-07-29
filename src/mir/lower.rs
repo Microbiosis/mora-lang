@@ -79,24 +79,24 @@ impl Lowerer {
             .get_expr(eid)
             .ok_or_else(|| format!("lower_expr: NodeId {} not in arena", eid.0))?;
         match &expr.kind {
-            ExprKind::Literal(lit) => {
+            MirExpr::Literal(lit) => {
                 let dst = self.alloc_reg();
                 self.emit(MirInst::Const(dst, literal_to_value_static(lit)));
                 Ok(dst)
             }
-            ExprKind::Variable(name) => {
+            MirExpr::Variable(name) => {
                 let dst = self.alloc_reg();
                 self.emit(MirInst::Var(dst, name.clone()));
                 Ok(dst)
             }
-            ExprKind::Binary { left, op, right } => {
+            MirExpr::Binary { left, op, right } => {
                 let l = self.lower_expr(*left, arena)?;
                 let r = self.lower_expr(*right, arena)?;
                 let dst = self.alloc_reg();
                 self.emit(MirInst::BinaryOp(dst, l, op.clone(), r));
                 Ok(dst)
             }
-            ExprKind::Call { callee, args } => {
+            MirExpr::Call { callee, args } => {
                 let arg_regs: Vec<Reg> = args
                     .iter()
                     .map(|a| self.lower_expr(*a, arena))
@@ -105,12 +105,12 @@ impl Lowerer {
                 self.emit(MirInst::Call(dst, callee.clone(), arg_regs));
                 Ok(dst)
             }
-            ExprKind::Grouping(inner) => {
+            MirExpr::Grouping(inner) => {
                 // 分组表达式：透传内部表达式
                 self.lower_expr(*inner, arena)
             }
             // α.1: 列表字面量
-            ExprKind::List(items) => {
+            MirExpr::List(items) => {
                 let item_regs: Vec<Reg> = items
                     .iter()
                     .map(|i| self.lower_expr(*i, arena))
@@ -120,7 +120,7 @@ impl Lowerer {
                 Ok(dst)
             }
             // α.1: 字典字面量（key 是 String，val 是 NodeId）
-            ExprKind::Dict(pairs) => {
+            MirExpr::Dict(pairs) => {
                 let pair_regs: Vec<(String, Reg)> = pairs
                     .iter()
                     .map(|(k, v)| self.lower_expr(*v, arena).map(|r| (k.clone(), r)))
@@ -130,7 +130,7 @@ impl Lowerer {
                 Ok(dst)
             }
             // α.1: 索引 obj[idx]
-            ExprKind::Index { object, index } => {
+            MirExpr::Index { object, index } => {
                 let obj_reg = self.lower_expr(*object, arena)?;
                 let idx_reg = self.lower_expr(*index, arena)?;
                 let dst = self.alloc_reg();
@@ -138,7 +138,7 @@ impl Lowerer {
                 Ok(dst)
             }
             // α.1: 方法调用 recv.method(args)
-            ExprKind::MethodCall {
+            MirExpr::MethodCall {
                 object,
                 method,
                 args,
@@ -153,7 +153,7 @@ impl Lowerer {
                 Ok(dst)
             }
             // α.1: 管道 lhs |> rhs（rhs 是可调用表达式，通常是 Variable 或 Call）
-            ExprKind::Pipe { left, right } => {
+            MirExpr::Pipe { left, right } => {
                 let lhs_reg = self.lower_expr(*left, arena)?;
                 let rhs_reg = self.lower_expr(*right, arena)?;
                 let dst = self.alloc_reg();
@@ -161,7 +161,7 @@ impl Lowerer {
                 Ok(dst)
             }
             // α.1: p"..." 模板拼接（不触发 AI，只拼接字符串）
-            ExprKind::Prompt { parts } => {
+            MirExpr::Prompt { parts } => {
                 let part_regs: Vec<Reg> = parts
                     .iter()
                     .map(|p| self.lower_expr(*p, arena))
@@ -171,7 +171,7 @@ impl Lowerer {
                 Ok(dst)
             }
             // α.2: 模式匹配表达式——lowering 为 MatchExpr 指令
-            ExprKind::Match { expr, arms } => {
+            MirExpr::Match { expr, arms } => {
                 let val_reg = self.lower_expr(*expr, arena)?;
                 let match_arms: Vec<(String, Option<Reg>, Box<MirFunction>, Reg)> = arms
                     .iter()
@@ -192,7 +192,7 @@ impl Lowerer {
             }
             // α.10: 闭包字面量 — 递归 lower body 成嵌套 MirFunction（独立寄存器空间）。
             // 模板与 TaskDef 一致：return_type 字段被丢弃（typeck 独立处理）。
-            ExprKind::Closure {
+            MirExpr::Closure {
                 params,
                 return_type: _,
                 body,
@@ -212,7 +212,7 @@ impl Lowerer {
                 Ok(dst)
             }
             // α.12: `expr as dyn Trait` → MirInst::DynTrait
-            ExprKind::DynTrait {
+            MirExpr::DynTrait {
                 expr,
                 trait_generics,
                 trait_name,
@@ -1028,51 +1028,50 @@ impl MirExprLowerer {
 
     /// Lower expression → returns result register
     fn lower_expr(&mut self, expr: &MirExpr) -> Result<Reg, String> {
-        use crate::mir::expr::{MirCallee, MirExprKind};
         use crate::common::Literal;
 
         match &expr.kind {
-            // ── Literals ──
-            MirExprKind::Literal(Literal::Int(v, _)) => {
+        // ── Literals ──
+        MirExpr::Literal(crate::common::Literal::Int(v, _)) => {
                 let dst = self.alloc_reg();
                 self.emit(MirInst::Const(dst, crate::value::Value::Int(*v)));
                 Ok(dst)
             }
-            MirExprKind::Literal(Literal::Float(v, _)) => {
+            MirExpr::Literal(crate::common::Literal::Float(v, _)) => {
                 let dst = self.alloc_reg();
                 self.emit(MirInst::Const(dst, crate::value::Value::Float(*v)));
                 Ok(dst)
             }
-            MirExprKind::Literal(Literal::String(v, _)) => {
+                        MirExpr::Literal(crate::common::Literal::String(v, _)) => {
                 let dst = self.alloc_reg();
                 self.emit(MirInst::Const(dst, crate::value::Value::String(v.clone())));
                 Ok(dst)
             }
-            MirExprKind::Literal(Literal::Bool(v, _)) => {
+                        MirExpr::Literal(crate::common::Literal::Bool(v, _)) => {
                 let dst = self.alloc_reg();
                 self.emit(MirInst::Const(dst, crate::value::Value::Bool(*v)));
                 Ok(dst)
             }
-            MirExprKind::Literal(Literal::Char(c, _)) => {
+                        MirExpr::Literal(crate::common::Literal::Char(c, _)) => {
                 let dst = self.alloc_reg();
                 self.emit(MirInst::Const(dst, crate::value::Value::Char(*c)));
                 Ok(dst)
             }
-            MirExprKind::Literal(Literal::Nil(_)) => {
+                        MirExpr::Literal(crate::common::Literal::Nil(_)) => {
                 let dst = self.alloc_reg();
                 self.emit(MirInst::Const(dst, crate::value::Value::Nil));
                 Ok(dst)
             }
 
             // ── Variables ──
-            MirExprKind::Variable(name) => {
+                        MirExpr::Variable(name) => {
                 let dst = self.alloc_reg();
                 self.emit(MirInst::Var(dst, name.clone()));
                 Ok(dst)
             }
 
             // ── Binary operations ──
-            MirExprKind::Binary { left, op, right } => {
+                        MirExpr::Binary { left, op, right } => {
                 let l = self.lower_expr(left)?;
                 let r = self.lower_expr(right)?;
                 let dst = self.alloc_reg();
@@ -1081,7 +1080,7 @@ impl MirExprLowerer {
             }
 
             // ── Logical And/Or (short-circuit) ──
-            MirExprKind::And { left, right } => {
+                        MirExpr::And { left, right } => {
                 let l = self.lower_expr(left)?;
                 let dst = self.alloc_reg();
                 // If left is false, skip right
@@ -1094,7 +1093,7 @@ impl MirExprLowerer {
                 // If short-circuited, dst is false (copy l)
                 Ok(dst)
             }
-            MirExprKind::Or { left, right } => {
+                        MirExpr::Or { left, right } => {
                 let l = self.lower_expr(left)?;
                 let dst = self.alloc_reg();
                 // If left is true, skip right
@@ -1108,13 +1107,9 @@ impl MirExprLowerer {
             }
 
             // ── Function calls ──
-            MirExprKind::Call { callee, args } => {
-                let callee_name = match callee {
-                    MirCallee::Name(n) => n.clone(),
-                    MirCallee::Var(n) => n.clone(),
-                    MirCallee::Method(obj, method) => format!("{}_{}", obj, method),
-                    _ => "unknown".to_string(),
-                };
+                        MirExpr::Call { callee, args } => {
+                // TODO: Implement proper callee extraction during migration
+                let callee_name = "call".to_string();
                 let mut arg_regs: Vec<Reg> = Vec::new();
                 for arg in args {
                     let r = self.lower_expr(arg)?;
@@ -1126,7 +1121,7 @@ impl MirExprLowerer {
             }
 
             // ── Method calls ──
-            MirExprKind::MethodCall { receiver, method, args } => {
+                        MirExpr::MethodCall { receiver, method, args } => {
                 let recv_reg = self.lower_expr(receiver)?;
                 let mut arg_regs: Vec<Reg> = Vec::new();
                 for arg in args {
@@ -1139,7 +1134,7 @@ impl MirExprLowerer {
             }
 
             // ── Pipe ──
-            MirExprKind::Pipe { lhs, rhs } => {
+                        MirExpr::Pipe { lhs, rhs } => {
                 let lhs_reg = self.lower_expr(lhs)?;
                 let rhs_reg = self.lower_expr(rhs)?;
                 let dst = self.alloc_reg();
@@ -1148,7 +1143,7 @@ impl MirExprLowerer {
             }
 
             // ── Collections ──
-            MirExprKind::List(items) => {
+                        MirExpr::List(items) => {
                 let mut item_regs: Vec<Reg> = Vec::new();
                 for item in items {
                     let r = self.lower_expr(item)?;
@@ -1158,7 +1153,7 @@ impl MirExprLowerer {
                 self.emit(MirInst::ListLit(dst, item_regs));
                 Ok(dst)
             }
-            MirExprKind::Dict(entries) => {
+                        MirExpr::Dict(entries) => {
                 let mut pair_regs: Vec<(String, Reg)> = Vec::new();
                 for (key, val) in entries {
                     let r = self.lower_expr(val)?;
@@ -1170,14 +1165,14 @@ impl MirExprLowerer {
             }
 
             // ── If/Else ──
-            MirExprKind::If { cond, then, r#else } => {
+                        MirExpr::If { cond, then_branch, else_branch } => {
                 let c = self.lower_expr(cond)?;
                 // JumpIfNot to else branch
                 self.emit(MirInst::JumpIfNot(c, 0)); // placeholder
                 let jumpifnot_idx = self.insts.len() - 1;
 
                 // Then branch
-                let then_dst = self.lower_expr(then)?;
+                let then_dst = self.lower_expr(then_branch)?;
                 let dst = self.alloc_reg();
                 self.emit(MirInst::Assign("__if_result".to_string(), then_dst));
                 // Jump to end
@@ -1187,7 +1182,7 @@ impl MirExprLowerer {
                 // Else branch
                 let else_start = self.insts.len();
                 self.patch_label_at(jumpifnot_idx, else_start);
-                if let Some(else_expr) = r#else {
+                if let Some(else_expr) = else_branch {
                     let else_dst = self.lower_expr(else_expr)?;
                     self.emit(MirInst::Assign("__if_result".to_string(), else_dst));
                 } else {
@@ -1201,7 +1196,7 @@ impl MirExprLowerer {
             }
 
             // ── Match ──
-            MirExprKind::Match { scrutinee, arms } => {
+            MirExpr::Match { scrutinee, arms } => {
                 let val_reg = self.lower_expr(scrutinee)?;
                 let match_arms: Vec<(String, Option<Reg>, Box<MirFunction>, Reg)> = arms
                     .iter()
@@ -1222,7 +1217,7 @@ impl MirExprLowerer {
             }
 
             // ── For loop ──
-            MirExprKind::Loop { var, iterable, body } => {
+            MirExpr::Loop { var, iterable, body } => {
                 use crate::value::Value;
                 let iter_reg = self.lower_expr(iterable)?;
                 // i = 0
@@ -1277,7 +1272,7 @@ impl MirExprLowerer {
             }
 
             // ── While loop ──
-            MirExprKind::While { cond, body } => {
+            MirExpr::While { cond, body } => {
                 let loop_label = self.insts.len();
                 let c = self.lower_expr(cond)?;
                 self.emit(MirInst::JumpIfNot(c, 0)); // placeholder
@@ -1306,7 +1301,7 @@ impl MirExprLowerer {
             }
 
             // ── Closure ──
-            MirExprKind::Closure { params, body, .. } => {
+                        MirExpr::Closure { params, body } => {
                 let param_names: Vec<String> = params.iter().map(|p| p.name.clone()).collect();
                 let mut body_lowerer = MirExprLowerer::new();
                 let body_dst = body_lowerer.lower_expr(body)?;
@@ -1322,7 +1317,7 @@ impl MirExprLowerer {
             }
 
             // ── FnDef ──
-            MirExprKind::FnDef { name, params, body, .. } => {
+            MirExpr::FnDef { name, params, body, .. } => {
                 let param_names: Vec<String> = params.iter().map(|p| p.name.clone()).collect();
                 let mut body_lowerer = MirExprLowerer::new();
                 let body_dst = body_lowerer.lower_expr(body)?;
@@ -1338,7 +1333,7 @@ impl MirExprLowerer {
             }
 
             // ── DynTrait ──
-            MirExprKind::DynTrait { expr, trait_name, generics } => {
+            MirExpr::DynTrait { expr, trait_name, generics } => {
                 let src = self.lower_expr(expr)?;
                 let dst = self.alloc_reg();
                 let generic_strs: Vec<String> = generics.iter().map(|t| t.name()).collect();
@@ -1352,7 +1347,7 @@ impl MirExprLowerer {
             }
 
             // ── Prompt ──
-            MirExprKind::Prompt { parts } => {
+            MirExpr::Prompt { parts } => {
                 let mut part_regs: Vec<Reg> = Vec::new();
                 for part in parts {
                     let r = self.lower_expr(part)?;
@@ -1364,7 +1359,7 @@ impl MirExprLowerer {
             }
 
             // ── Let binding ──
-            MirExprKind::LetBinding { name, value, init_body, .. } => {
+            MirExpr::LetBinding { name, value, init_body, .. } => {
                 let v_dst = self.lower_expr(value)?;
                 self.emit(MirInst::Define(name.clone(), v_dst));
                 let b_dst = self.lower_expr(init_body)?;
@@ -1375,14 +1370,14 @@ impl MirExprLowerer {
             }
 
             // ── Assignment ──
-            MirExprKind::Assign { target, value } => {
+            MirExpr::Assign { target, value } => {
                 let v = self.lower_expr(value)?;
                 self.emit(MirInst::Assign(target.clone(), v));
                 Ok(v)
             }
 
             // ── IndexAssign ──
-            MirExprKind::IndexAssign { object, index, value } => {
+            MirExpr::IndexAssign { object, index, value } => {
                 let obj = self.lower_expr(object)?;
                 let idx = self.lower_expr(index)?;
                 let val = self.lower_expr(value)?;
@@ -1393,14 +1388,14 @@ impl MirExprLowerer {
             }
 
             // ── Expr (discard result) ──
-            MirExprKind::Expr(inner) => {
+            MirExpr::Expr(inner) => {
                 let r = self.lower_expr(inner)?;
                 self.emit(MirInst::Expr(r));
                 Ok(r)
             }
 
             // ── Sequence ──
-            MirExprKind::Sequence(exprs) => {
+            MirExpr::Sequence(exprs) => {
                 let mut last_dst = 0;
                 for e in exprs {
                     last_dst = self.lower_expr(e)?;
@@ -1409,7 +1404,7 @@ impl MirExprLowerer {
             }
 
             // ── Return / Break / Continue ──
-            MirExprKind::Return(val) => {
+            MirExpr::Return(val) => {
                 match val {
                     Some(v) => {
                         let r = self.lower_expr(v)?;
@@ -1423,14 +1418,14 @@ impl MirExprLowerer {
                 self.emit(MirInst::Const(dst, crate::value::Value::Nil));
                 Ok(dst)
             }
-            MirExprKind::Break(_label) => {
+            MirExpr::Break(_label) => {
                 let (_, brk) = self.loop_stack.last().copied().ok_or("Break outside loop")?;
                 self.emit(MirInst::Break(brk));
                 let dst = self.alloc_reg();
                 self.emit(MirInst::Const(dst, crate::value::Value::Nil));
                 Ok(dst)
             }
-            MirExprKind::Continue(_label) => {
+            MirExpr::Continue(_label) => {
                 let (cont, _) = self.loop_stack.last().copied().ok_or("Continue outside loop")?;
                 self.emit(MirInst::Continue(cont));
                 let dst = self.alloc_reg();
@@ -1439,7 +1434,7 @@ impl MirExprLowerer {
             }
 
             // ── Orchestrate ──
-            MirExprKind::Orchestrate { input_var, result_var, kind } => {
+            MirExpr::Orchestrate { input_var, result_var, kind } => {
                 self.emit(MirInst::Orchestrate {
                     input_var: input_var.clone(),
                     result_var: result_var.clone(),
@@ -1451,7 +1446,7 @@ impl MirExprLowerer {
             }
 
             // ── Type definitions ──
-            MirExprKind::TypeAlias { name, target } => {
+            MirExpr::TypeAlias { name, target } => {
                 self.emit(MirInst::TypeAlias {
                     name: name.clone(),
                     target: target.name(),
@@ -1460,7 +1455,7 @@ impl MirExprLowerer {
                 self.emit(MirInst::Const(dst, crate::value::Value::Nil));
                 Ok(dst)
             }
-            MirExprKind::EnumDef { name, variants } => {
+            MirExpr::EnumDef { name, variants } => {
                 let evs: Vec<crate::common::EnumVariant> = variants
                     .iter()
                     .map(|v| crate::common::EnumVariant { name: v.clone(), data: None })
@@ -1473,7 +1468,7 @@ impl MirExprLowerer {
                 self.emit(MirInst::Const(dst, crate::value::Value::Nil));
                 Ok(dst)
             }
-            MirExprKind::StructDef { name, fields } => {
+            MirExpr::StructDef { name, fields } => {
                 let sfs: Vec<crate::common::StructField> = fields
                     .iter()
                     .map(|(fname, ftype)| crate::common::StructField {
@@ -1491,13 +1486,13 @@ impl MirExprLowerer {
             }
 
             // ── Import / Macro ──
-            MirExprKind::Import(path) => {
+            MirExpr::Import(path) => {
                 self.emit(MirInst::Import(path.clone()));
                 let dst = self.alloc_reg();
                 self.emit(MirInst::Const(dst, crate::value::Value::Nil));
                 Ok(dst)
             }
-            MirExprKind::MacroDef { name, params } => {
+            MirExpr::MacroDef { name, params } => {
                 self.emit(MirInst::MacroDef {
                     name: name.clone(),
                     params: params.clone(),
@@ -1508,7 +1503,7 @@ impl MirExprLowerer {
             }
 
             // ── Grouping (transparent) ──
-            MirExprKind::Grouping(inner) => {
+            MirExpr::Grouping(inner) => {
                 self.lower_expr(inner)
             }
         }
@@ -1517,35 +1512,8 @@ impl MirExprLowerer {
 
 /// Convert MirExpr Pattern to string representation for MatchExpr
 fn mir_pattern_to_string(pattern: &crate::mir::expr::Pattern) -> String {
-    use crate::mir::expr::Pattern;
     match pattern {
-        Pattern::Wildcard => "_".to_string(),
-        Pattern::Variable(name) => name.clone(),
-        Pattern::Literal(lit) => match lit {
-            crate::common::Literal::String(s, _) => format!("str:{}", s),
-            crate::common::Literal::Char(c, _) => format!("char:{}", c),
-            crate::common::Literal::Int(i, _) => format!("int:{}", i),
-            crate::common::Literal::Float(f, _) => format!("float:{}", f),
-            crate::common::Literal::Bool(b, _) => format!("bool:{}", b),
-            crate::common::Literal::Nil(_) => "nil".to_string(),
-        },
-        Pattern::Tuple(items) => {
-            let parts: Vec<String> = items.iter().map(mir_pattern_to_string).collect();
-            format!("tuple:({})", parts.join(","))
-        }
-        Pattern::List { head, tail } => {
-            format!("list:[{}|{}]", mir_pattern_to_string(head), mir_pattern_to_string(tail))
-        }
-        Pattern::Dict { required, rest } => {
-            let fields: Vec<String> = required
-                .iter()
-                .map(|(k, v)| format!("{}:{}", k, mir_pattern_to_string(v)))
-                .collect();
-            let rest_str = if *rest { ",.." } else { "" };
-            format!("dict:{{{}}}", fields.join(",") + rest_str)
-        }
-        Pattern::TypeAscription { name, pattern } => {
-            format!("{}:{}", name, mir_pattern_to_string(pattern))
-        }
+        crate::mir::expr::Pattern::Wildcard => "_".to_string(),
+        crate::mir::expr::Pattern::Variable(name) => name.clone(),
     }
 }

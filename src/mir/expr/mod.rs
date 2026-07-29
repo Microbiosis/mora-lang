@@ -525,37 +525,41 @@ pub type MirOrchestrateEdge = MirEdgeDef;
 // Placeholder types for future MIR features
 // ===================================================================
 
-///  Trait method definition (placeholder for α.7)
+///  Trait method definition
 #[derive(Debug, Clone, PartialEq)]
 pub struct MirTraitMethod {
     pub name: String,
     pub params: Vec<Param>,
     pub return_type: Option<String>,
+    pub body: Option<MirFunction>,
 }
 
-///  Function definition in impl block (placeholder for α.7)
+///  Function definition in impl block
 #[derive(Debug, Clone, PartialEq)]
 pub struct MirFnDef {
     pub name: String,
     pub params: Vec<Param>,
     pub return_type: Option<String>,
+    pub body: Option<MirFunction>,
 }
 
-///  Skill task definition (placeholder for α.8)
+///  Skill task definition
 #[derive(Debug, Clone, PartialEq)]
 pub struct MirSkillTask {
     pub name: String,
     pub description: Option<String>,
     pub params: Vec<Param>,
+    pub body: Option<MirFunction>,
 }
 
-///  Skill verification definition (placeholder for α.8)
+///  Skill verification definition
 #[derive(Debug, Clone, PartialEq)]
 pub struct MirSkillVerify {
     pub name: String,
     pub given: Vec<String>,
     pub expects: Vec<String>,
     pub params: Vec<Param>,
+    pub body: Option<MirFunction>,
 }
 
 ///  Checkpoint configuration (placeholder for v0.50)

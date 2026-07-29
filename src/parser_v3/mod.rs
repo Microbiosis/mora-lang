@@ -88,6 +88,13 @@ impl ParserV3 {
             } else {
                 return None;
             };
+            // Consume optional task body terminator (only when parse_block_body
+            // stopped at an explicit `end` keyword rather than EOF / `}`).
+            if !matches!(body.kind, MirExprKind::Sequence(_) | MirExprKind::FnDef { .. })
+                && self.check(&TokenType::End)
+            {
+                self.advance();
+            }
             return Some(MirExpr {
                 kind: MirExprKind::FnDef {
                     name,
@@ -637,7 +644,28 @@ impl ParserV3 {
                 break;
             }
 
-            if let Some(e) = self.parse_assignment() {
+            // Try assign; if not, try one of the statement-level constructs
+            // (if/for/while/match/return).
+            let stmt = self.parse_assignment().or_else(|| {
+                // Identify a leading construct keyword and dispatch
+                let tok = self.peek()?.token_type.clone();
+                let handled = match tok {
+                    TokenType::If => self.parse_if_expression(),
+                    TokenType::For => self.parse_for_loop(),
+                    _ => {
+                        // 'while' is identifier-based (no TokenType::While), but
+                        // try the loop parser if the next token is "while"
+                        if let TokenType::Identifier(ref n) = tok {
+                            if n == "while" {
+                                return self.parse_while_loop();
+                            }
+                        }
+                        None
+                    }
+                };
+                handled
+            });
+            if let Some(e) = stmt {
                 exprs.push(e);
             } else {
                 // Can't parse — skip token to make progress

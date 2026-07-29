@@ -502,9 +502,17 @@ pub fn run_mir(
                     .iter()
                     .map(|m| TraitMethodSig {
                         name: m.name.clone(),
-                        params: m.params.clone(),
+                        params: m
+                            .params
+                            .iter()
+                            .map(|p| (p.name.clone(), p.type_hint.as_ref().map(|t| t.name())))
+                            .collect(),
                         return_type: m.return_type.clone(),
-                        has_self: m.params.first().map(|(n, _)| n == "self").unwrap_or(false),
+                        has_self: m
+                            .params
+                            .first()
+                            .map(|p| p.name == "self")
+                            .unwrap_or(false),
                     })
                     .collect();
                 Arc::make_mut(&mut interp.registry.trait_registry).insert(
@@ -515,9 +523,9 @@ pub fn run_mir(
                         methods: method_sigs,
                     },
                 );
-                // α.11: 注册默认实现 — 使用 prelowered MirFunction body。
+                // v0.55: 注册默认实现 — 使用 prelowered MirFunction body (Option<MirFunction>)。
                 for (m, body) in methods.iter().zip(method_bodies.iter()) {
-                    if !m.body.is_empty() {
+                    if let Some(mfn) = &m.body {
                         let key = crate::interpreter::default_impl_method_key(
                             name,
                             &Vec::<String>::new(),
@@ -527,9 +535,9 @@ pub fn run_mir(
                             key,
                             Value::Task {
                                 name: m.name.clone(),
-                                params: m.params.iter().map(|(n, _)| n.clone()).collect(),
+                                params: m.params.iter().map(|p| p.name.clone()).collect(),
 
-                                mir_body: std::sync::Arc::new(body.clone()),
+                                mir_body: std::sync::Arc::new(mfn.clone()),
                             },
                             false,
                         );
@@ -550,7 +558,7 @@ pub fn run_mir(
                     .entry(trait_name.to_string())
                     .or_default()
                     .push(for_type.to_string());
-                // α.11: 使用 prelowered MirFunction body。
+                // v0.55: 使用 prelowered MirFunction body (Option<MirFunction>)。
                 for (m, body) in methods.iter().zip(method_bodies.iter()) {
                     let key = crate::interpreter::impl_method_key(
                         trait_name,
@@ -559,16 +567,19 @@ pub fn run_mir(
                         for_generics,
                         &m.name,
                     );
-                    env.define(
-                        key,
-                        Value::Task {
-                            name: m.name.clone(),
-                            params: m.params.iter().map(|(n, _)| n.clone()).collect(),
+                    let _ = body; // body is prelowered MirFunction (parallel to m.body)
+                    if let Some(mfn) = &m.body {
+                        env.define(
+                            key,
+                            Value::Task {
+                                name: m.name.clone(),
+                                params: m.params.iter().map(|p| p.name.clone()).collect(),
 
-                            mir_body: std::sync::Arc::new(body.clone()),
-                        },
-                        false,
-                    );
+                                mir_body: std::sync::Arc::new(mfn.clone()),
+                            },
+                            false,
+                        );
+                    }
                 }
                 pc += 1;
             }
@@ -671,31 +682,36 @@ pub fn run_mir(
                 let req_list: Vec<Value> =
                     requires.iter().map(|r| Value::String(r.clone())).collect();
                 skill_meta.insert("requires".to_string(), Value::List(req_list));
-                // α.11: 将每个 task 存储为 Skill Dict 中的可调用值，使用 prelowered body。
+                // v0.55: 将每个 task 存储为 Skill Dict 中的可调用值，使用 prelowered body。
                 for (task, body) in tasks.iter().zip(task_bodies.iter()) {
-                    skill_meta.insert(
-                        task.name.clone(),
-                        Value::Task {
-                            name: task.name.clone(),
-                            params: task.params.iter().map(|(n, _)| n.clone()).collect(),
+                    let _ = body; // body is prelowered MirFunction (parallel to task.body)
+                    if let Some(mfn) = &task.body {
+                        skill_meta.insert(
+                            task.name.clone(),
+                            Value::Task {
+                                name: task.name.clone(),
+                                params: task.params.iter().map(|p| p.name.clone()).collect(),
 
-                            mir_body: std::sync::Arc::new(body.clone()),
-                        },
-                    );
+                                mir_body: std::sync::Arc::new(mfn.clone()),
+                            },
+                        );
+                    }
                 }
                 // 注册 verify 函数（如果有）
                 if let Some(v) = verify {
                     let verify_params: Vec<String> =
-                        v.params.iter().map(|(n, _)| n.clone()).collect();
-                    // α.11: 防御性 fallback — handler body 为 None 时构造空函数。
-                    // match 上下文是 &MirInst::SkillDef，所以 verify_body 是 &Option<MirFunction>，
-                    // 用 * 解引用后再 unwrap_or_else 消费 Option 拿 owned MirFunction。
+                        v.params.iter().map(|p| p.name.clone()).collect();
+                    // v0.55: handler body 来自 v.body (Option<MirFunction>)，防御性 fallback。
                     let empty_body = crate::mir::MirFunction {
                         params: verify_params.clone(),
                         body: Vec::new(),
                         n_regs: 0,
                     };
-                    let verify_mir_body = (*verify_body).clone().unwrap_or(empty_body);
+                    let verify_mir_body =
+                        v.body.clone().unwrap_or(empty_body);
+                    // 注意: handler 预 lower 的 verify_body 参数已被 v.body 替代,
+                    // 参数化时 verify_body 仍由 SKillDef 携带 (作冗余).
+                    let _ = verify_body;
                     skill_meta.insert(
                         "verify".to_string(),
                         Value::Task {

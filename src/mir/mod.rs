@@ -267,37 +267,35 @@ pub enum MirInst {
     },
 
     // ── 类型系统（α.7: TraitDef/ImplDef）──
-    /// α.7: trait def — 注册 trait 到 trait_registry，并注册默认实现。
-    /// method_bodies 长度与 methods 一致；body 为空的 method 对应位置为 dummy MirFunction。
+    /// v0.55: trait def — 完全 MIR-native，methods 是 MirTraitMethod 而非 ast_v2::TraitMethod。
     TraitDef {
         name: String,
         parents: Vec<String>,
-        methods: Vec<crate::ast_v2::TraitMethod>,
-        /// α.11: prelowered method bodies (parallel to methods)，让默认实现走 run_mir。
+        methods: Vec<crate::mir::expr::MirTraitMethod>,
+        /// prelowered method bodies (parallel to methods)，让默认实现走 run_mir。
         method_bodies: Vec<MirFunction>,
     },
 
-    /// α.7: impl def — 注册 impl 到 impl_table，并将方法注册到环境。
+    /// v0.55: impl def — 完全 MIR-native。
     ImplDef {
         trait_name: String,
         trait_generics: Vec<String>,
         for_type: String,
         for_generics: Vec<String>,
-        methods: Vec<crate::ast_v2::FnDef>,
-        /// α.11: prelowered method bodies (parallel to methods)，让 impl 方法走 run_mir。
+        methods: Vec<crate::mir::expr::MirFnDef>,
+        /// prelowered method bodies (parallel to methods)。
         method_bodies: Vec<MirFunction>,
     },
 
     // ── 高级特性（α.8: orchestrate/skill/prompt/document/eval）──
-    /// α.8: orchestrate — 编排执行，结果绑定到 result_var。
-    /// input_var 为输入变量名，kind 为结构化编排类型。
+    /// v0.55: orchestrate — 编排执行。
     Orchestrate {
         input_var: String,
         result_var: String,
         kind: Box<crate::mir::expr::MirOrchestrateKind>,
     },
 
-    /// α.8: eval — 断言测试：给定 given 值，检查 expects 表达式。
+    /// α.8: eval — 断言测试。
     Eval {
         name: String,
         given_reg: Reg,
@@ -306,16 +304,16 @@ pub enum MirInst {
         replay_path: Option<String>,
     },
 
-    /// α.8: skill def — 构建 Skill Dict（name/description/version/requires/tasks/verify）到环境。
+    /// v0.55: skill def — 完全 MIR-native。
     SkillDef {
         name: String,
         description: Option<String>,
         version: Option<String>,
         requires: Vec<String>,
-        tasks: Vec<crate::ast_v2::SkillTask>,
-        /// α.11: prelowered task bodies (parallel to tasks)。
+        tasks: Vec<crate::mir::expr::MirSkillTask>,
+        /// prelowered task bodies (parallel to tasks)。
         task_bodies: Vec<MirFunction>,
-        verify: Option<crate::ast_v2::SkillVerify>,
+        verify: Option<crate::mir::expr::MirSkillVerify>,
         /// α.11: prelowered verify body。
         verify_body: Option<MirFunction>,
     },

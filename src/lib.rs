@@ -13,7 +13,7 @@
 pub const VERSION: &str = env!("MORAGIT_VERSION");
 
 pub mod ai_infra;
-pub mod ast_v2;
+// v0.55: ast_v2 module deleted — all paths use mir/expr MirExpr
 // v0.42.1: Audit Sink — SHA-256 hash-chained JSONL (loongclaw-inspired)
 pub mod audit;
 // v0.45.0: ToolPlane Core/Extension adapter (loongclaw tool.rs pattern)
@@ -40,7 +40,6 @@ pub mod lsp;
 pub mod mcp_server;
 pub mod mir;
 pub mod mock;
-pub mod parser_v2;
 pub mod parser_v3;
 pub mod plan;
 pub mod record;

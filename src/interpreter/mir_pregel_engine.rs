@@ -15,19 +15,21 @@ use std::sync::Arc;
 
 use crate::checkpoint::{Checkpoint, SendTask};
 use crate::interpreter::Interpreter;
-// TODO: Pregel orchestration types will be defined during migration
+use crate::mir::expr::{
+    MirAgentDef, MirEdgeDef, MirInterruptPoint, MirInterruptWhen, MirPregelConfig,
+    MirReducerKind, MirStateChannel,
+};
+use crate::mir::MirFunction;
 use crate::value::Value;
-use crate::mir::expr::MirReducerKind;
 
-/// Interrupt callback (TODO: Replace with proper type)
-pub type MirInterruptCallback = Arc<dyn Fn(&str, crate::mir::expr::MirInterruptWhen) -> bool>;
+/// Interrupt 回调签名
+pub type MirInterruptCallback = Arc<dyn Fn(&str, MirInterruptWhen) -> bool>;
 
 /// Pregel 引擎 BSP 循环状态
-// TODO: Migrate to MirExpr-native orchestration types
 pub struct MirPregelEngine {
-    config: String, // TODO: Replace with proper Pregel configuration type
+    config: MirPregelConfig,
     agents_by_name: HashMap<String, usize>,
-    state_reducers: HashMap<String, String>, // TODO: Replace with proper ReducerKind
+    state_reducers: HashMap<String, MirReducerKind>,
 
     channels: HashMap<String, Value>,
     channel_versions: HashMap<String, u64>,
@@ -42,12 +44,22 @@ pub struct MirPregelEngine {
 
 impl MirPregelEngine {
     /// 构造 MIR-native Pregel 引擎
-    // TODO: Implement proper constructor with real Pregel configuration type
-    pub fn new(_config: String) -> Self { // Placeholder for migration
+    pub fn new(config: MirPregelConfig) -> Self {
+        let agents_by_name = config
+            .agents
+            .iter()
+            .enumerate()
+            .map(|(i, a)| (a.name.clone(), i))
+            .collect();
+        let state_reducers = config
+            .state_schema
+            .iter()
+            .map(|ch| (ch.name.clone(), ch.reducer.clone()))
+            .collect();
         Self {
-            config: String::new(),
-            agents_by_name: HashMap::new(),
-            state_reducers: HashMap::new(),
+            config,
+            agents_by_name,
+            state_reducers,
             channels: HashMap::new(),
             channel_versions: HashMap::new(),
             versions_seen: HashMap::new(),
@@ -110,9 +122,9 @@ pub fn run(&mut self, interpreter: &mut Interpreter) -> Result<Value, String> {
 
             // interrupt before
             for node_name in &to_execute {
-                for ip in &self.collect_interrupts(node_name, crate::mir::expr::MirInterruptWhen::Before) {
+                for ip in &self.collect_interrupts(node_name, MirInterruptWhen::Before) {
                     if let Some(cb) = &self.interrupt_before
-                        && !cb(&ip.node_name, crate::mir::expr::MirInterruptWhen::Before)
+                        && !cb(&ip.node_name, MirInterruptWhen::Before)
                     {
                         return Err(format!("interrupted at {}", ip.node_name));
                     }
@@ -191,9 +203,9 @@ pub fn run(&mut self, interpreter: &mut Interpreter) -> Result<Value, String> {
 
             // interrupt after
             for node_name in &to_execute {
-                for ip in &self.collect_interrupts(node_name, crate::mir::expr::MirInterruptWhen::After) {
+                for ip in &self.collect_interrupts(node_name, MirInterruptWhen::After) {
                     if let Some(cb) = &self.interrupt_after
-                        && !cb(&ip.node_name, crate::mir::expr::MirInterruptWhen::After)
+                        && !cb(&ip.node_name, MirInterruptWhen::After)
                     {
                         return Err(format!("interrupted after {}", ip.node_name));
                     }
@@ -299,10 +311,16 @@ pub fn run(&mut self, interpreter: &mut Interpreter) -> Result<Value, String> {
     pub fn collect_interrupts(
         &self,
         node_name: &str,
-        when: crate::mir::expr::MirInterruptWhen,
-    ) -> Vec<crate::mir::expr::MirInterruptPoint> {
-        // Placeholder - will be implemented during Pregel migration
-        vec![]
+        when: MirInterruptWhen,
+    ) -> Vec<&MirInterruptPoint> {
+        self.config
+            .interrupt_points
+            .iter()
+            .filter(|ip| {
+                ip.node_name == node_name
+                    && std::mem::discriminant(&ip.when) == std::mem::discriminant(&when)
+            })
+            .collect()
     }
 
     /// 构建 checkpoint 快照
@@ -324,8 +342,7 @@ pub fn run(&mut self, interpreter: &mut Interpreter) -> Result<Value, String> {
     }
 
     /// 访问 config（用于测试与序列化）
-    // TODO: Return proper type during migration
-    pub fn config(&self) -> &String {
+    pub fn config(&self) -> &MirPregelConfig {
         &self.config
     }
 }
@@ -349,7 +366,8 @@ fn value_to_json_string(v: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-        use crate::mir::expr::{MirAgentDef, MirEdgeDef, MirExpr, MirStateChannel};
+    use crate::mir::MirFunction;
+    use crate::mir::expr::{MirAgentDef, MirEdgeDef, MirExpr, MirStateChannel};
 
     fn empty_mir_function() -> MirFunction {
         MirFunction {

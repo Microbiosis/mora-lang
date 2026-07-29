@@ -3555,17 +3555,17 @@ mod tests_v044_container_real {
 
 #[cfg(test)]
 mod tests_v044_orchestrate_validate {
-    #![allow(unused_mut)]
-    use crate::ast_v2::NodeId;
     use crate::lexer::Lexer;
-    use crate::parser_v2::ParserV2;
+    use crate::mir::expr::MirExpr;
+    use crate::parser_v3::ParserV3;
 
-    /// v0.44.0: orchestrate block syntax validation (already implemented v0.25)
-    fn parse(src: &str) -> (crate::ast_v2::AstArena, Vec<NodeId>) {
+    /// v0.44.0: orchestrate block syntax validation (ParserV3 path)
+    fn parse(src: &str) -> Vec<MirExpr> {
         let tokens = Lexer::new(src).scan_tokens();
-        let mut parser = ParserV2::new(tokens);
-        let node_ids = parser.parse();
-        (parser.into_arena(), node_ids)
+        let mut parser = ParserV3::new(tokens);
+        parser
+            .parse()
+            .unwrap_or_else(|e| panic!("ParserV3 failed: {:?}", e))
     }
 
     #[test]
@@ -3576,8 +3576,8 @@ task main()
     agent a(x) => "a:" + x
     agent b(x) => "b:" + x
 "#;
-        let (_arena, node_ids) = parse(src);
-        assert!(!node_ids.is_empty());
+        let exprs = parse(src);
+        assert!(!exprs.is_empty());
     }
 
     #[test]
@@ -3588,8 +3588,8 @@ task main()
     on: x == "done"
     agent a(x) => x
 "#;
-        let (_arena, node_ids) = parse(src);
-        assert!(!node_ids.is_empty());
+        let exprs = parse(src);
+        assert!(!exprs.is_empty());
     }
 
     #[test]
@@ -3602,8 +3602,8 @@ task main()
     a -> @exit
     b -> @exit
 "#;
-        let (_arena, node_ids) = parse(src);
-        assert!(!node_ids.is_empty());
+        let exprs = parse(src);
+        assert!(!exprs.is_empty());
     }
 }
 

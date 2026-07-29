@@ -6,15 +6,15 @@
 
 use mora::interpreter::Interpreter;
 use mora::mir::interp::{run_main_task, run_mir};
-use mora::mir::lower::lower_program;
+use mora::mir::lower::{lower_mir_exprs, typecheck_mir_exprs};
 
 fn run_via_mir(source: &str) -> Result<(), String> {
-    let (node_ids, arena) = mora::interpreter::parse_code(source);
-    let type_errs = mora::typeck::check_program(&node_ids, &arena);
+    let mut exprs = mora::interpreter::parse_code_v3(source)?;
+    let type_errs = typecheck_mir_exprs(&mut exprs);
     if !type_errs.is_empty() {
         return Err(format!("typeck: {} error(s)", type_errs.len()));
     }
-    let func = lower_program(&node_ids, &arena)?;
+    let func = lower_mir_exprs(&exprs)?;
     let mut interp = Interpreter::new();
     let mut env = interp.take_env();
     run_mir(&func, &mut interp, &mut env)?;

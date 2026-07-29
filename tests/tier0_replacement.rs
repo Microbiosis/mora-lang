@@ -10,18 +10,14 @@
 use mora::interpreter::Interpreter;
 use mora::mir::MirFunction;
 use mora::mir::interp::{run_main_task, run_mir};
-use mora::mir::lower::lower_program;
+use mora::mir::lower::{lower_mir_exprs, typecheck_mir_exprs};
 use mora::value::{FlowSignal, Value};
-
-fn parse(source: &str) -> (Vec<mora::ast_v2::NodeId>, mora::ast_v2::AstArena) {
-    mora::interpreter::parse_code(source)
-}
 
 /// 公共执行入口：parse → typeck → lower → run_mir → run_main_task
 /// 这是 `src/main.rs::run_file()` 的纯库版本，可被测试独立调用。
 fn run_via_mir(source: &str) -> Result<(), String> {
-    let (node_ids, arena) = parse(source);
-    let type_errs = mora::typeck::check_program(&node_ids, &arena);
+    let mut exprs = mora::interpreter::parse_code_v3(source)?;
+    let type_errs = typecheck_mir_exprs(&mut exprs);
     if !type_errs.is_empty() {
         return Err(format!(
             "typeck: {} error(s); first = {}",
@@ -29,7 +25,7 @@ fn run_via_mir(source: &str) -> Result<(), String> {
             type_errs[0].message
         ));
     }
-    let func: MirFunction = lower_program(&node_ids, &arena)?;
+    let func: MirFunction = lower_mir_exprs(&exprs)?;
     let mut interp = Interpreter::new();
     let mut env = interp.take_env();
     run_mir(&func, &mut interp, &mut env)?;

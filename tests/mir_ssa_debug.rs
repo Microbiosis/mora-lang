@@ -1,10 +1,10 @@
-use mora::mir::lower::lower_program;
+use mora::mir::lower::lower_mir_exprs;
 use mora::mir::ssa::{construct, deconstruct};
 
 #[test]
 fn debug_mir_dump() {
-    let (node_ids, arena) = mora::interpreter::parse_code("let x = 1 + 2");
-    let orig = lower_program(&node_ids, &arena).expect("lowering failed");
+    let exprs = mora::interpreter::parse_code_v3("let x = 1 + 2").expect("parse failed");
+    let orig = lower_mir_exprs(&exprs).expect("lowering failed");
     println!("=== MIR (n_regs={}) ===", orig.n_regs);
     for (i, inst) in orig.body.iter().enumerate() {
         println!("  {}: {:?}", i, inst);

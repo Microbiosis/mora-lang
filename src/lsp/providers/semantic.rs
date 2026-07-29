@@ -1,137 +1,98 @@
-use super::helpers::*;
+use std::collections::HashMap;
+
+use super::parsed_doc_v3;
 use crate::lsp::json::Value;
 use crate::lsp::server::DocumentState;
-use std::collections::{BTreeMap, HashMap};
 
-pub fn semantic_tokens(docs: &HashMap<String, DocumentState>, params: &Value) -> Value {
+const TOKEN_KIND_VARIABLE: f64 = 13.0;
+const TOKEN_KIND_STRING: f64 = 12.0;
+const TOKEN_KIND_NUMBER: f64 = 10.0;
+const TOKEN_KIND_FUNCTION: f64 = 9.0;
+
+pub fn semantic_tokens_v3(docs: &HashMap<String, DocumentState>, params: &Value) -> Value {
     let uri = match params
         .get("textDocument")
         .and_then(|t| t.get("uri"))
         .and_then(|u| u.as_str())
     {
         Some(s) => s,
-        None => {
-            return Value::Object({
-                let mut m = BTreeMap::new();
-                m.insert("data".to_string(), Value::Array(vec![]));
-                m
-            });
-        }
+        None => return Value::Array(vec![]),
     };
-    let text = match docs.get(uri) {
-        Some(d) => d.text.clone(),
-        None => {
-            return Value::Object({
-                let mut m = BTreeMap::new();
-                m.insert("data".to_string(), Value::Array(vec![]));
-                m
-            });
-        }
+    let (_text, exprs) = match parsed_doc_v3::parsed_doc_v3(docs, uri) {
+        Some(pair) => pair,
+        None => return Value::Array(vec![]),
     };
 
-    let mut data: Vec<u32> = Vec::new();
-    let mut last_line = 0u32;
-    let mut last_col = 0u32;
-
-    // Token 分类：keyword / type / function / variable / string / number / comment
-    let tokens = crate::lexer::Lexer::new(&text).scan_tokens();
-    use crate::lexer::TokenType;
-    for tok in &tokens {
-        // v0.51: 修 col 硬编码 0 — LSP semantic tokens 走 delta encoding,
-        // 起点列必须真实, 否则所有 token 都对齐到行首. 用 tok.column.
-        let (line, col) = (tok.line, tok.column as u32);
-        let token_type = match &tok.token_type {
-            TokenType::Let | TokenType::Task | TokenType::If | TokenType::Then | TokenType::End |
-            TokenType::For | TokenType::In | TokenType::Return |
-            TokenType::Fn | TokenType::True | TokenType::False | TokenType::Nil | TokenType::Match |
-            TokenType::WithKeyword | TokenType::Save | TokenType::Load | TokenType::Import |
-            TokenType::Parallel | TokenType::Read | TokenType::Write | TokenType::Append |
-            TokenType::ReadBytes | TokenType::WriteBytes | TokenType::Into | TokenType::Export |
-            // v0.04.0: AI 原语关键字
-            TokenType::Stream | TokenType::Tool | TokenType::Break | TokenType::Continue |
-            // v0.08: trait 系统关键字
-            TokenType::Trait | TokenType::Impl | TokenType::Dyn | TokenType::Self_ => 0,  // keyword
-            TokenType::String(_) => 3,  // string
-            TokenType::Float(_) => 4,  // number
-            _ => continue,
-        };
-        let len = token_len(&tok.token_type) as u32;
-        let dl = (line as u32).saturating_sub(last_line);
-        let dc = if dl == 0 {
-            (col).saturating_sub(last_col)
-        } else {
-            col
-        };
-        data.push(dl);
-        data.push(dc);
-        data.push(token_type);
-        data.push(0); // modifiers
-        data.push(len);
-        last_line = line as u32;
-        last_col = col;
+    let mut data: Vec<f64> = Vec::new();
+    let mut last_line = 0usize;
+    let mut last_col = 0usize;
+    for expr in exprs {
+        emit_tokens(&expr, &mut data, &mut last_line, &mut last_col);
     }
-
-    // 给已知任务名加 function token (使用 v2)
-    let (_text2, stmt_ids, arena) = parsed_doc_v2(docs, uri).unwrap_or_default();
-    for stmt_id in &stmt_ids {
-        if let Some(stmt) = arena.get_stmt(*stmt_id) {
-            if let crate::ast_v2::StmtKind::TaskDef { name, .. } = &stmt.kind {
-                let span = &stmt.span;
-                let line = span.line.saturating_sub(1) as u32;
-                let col = span.column.saturating_sub(1) as u32;
-                let dl = line.saturating_sub(last_line);
-                let dc = if dl == 0 {
-                    col.saturating_sub(last_col)
-                } else {
-                    col
-                };
-                data.push(dl);
-                data.push(dc);
-                data.push(1); // function
-                data.push(0);
-                data.push(name.len() as u32);
-                last_line = line;
-                last_col = col;
-            }
-            if let crate::ast_v2::StmtKind::Let { name, .. } = &stmt.kind {
-                let span = &stmt.span;
-                let line = span.line.saturating_sub(1) as u32;
-                let col = span.column.saturating_sub(1) as u32;
-                let dl = line.saturating_sub(last_line);
-                let dc = if dl == 0 {
-                    col.saturating_sub(last_col)
-                } else {
-                    col
-                };
-                data.push(dl);
-                data.push(dc);
-                data.push(2); // variable
-                data.push(0);
-                data.push(name.len() as u32);
-                last_line = line;
-                last_col = col;
-            }
-        }
-    }
-
-    let mut m = BTreeMap::new();
+    let mut m = std::collections::BTreeMap::new();
     m.insert(
         "data".to_string(),
-        Value::Array(data.into_iter().map(|n| Value::Number(n as f64)).collect()),
+        Value::Array(data.into_iter().map(Value::Number).collect()),
     );
+    let _ = uri;
     Value::Object(m)
 }
 
-fn token_len(tt: &crate::lexer::TokenType) -> usize {
-    use crate::lexer::TokenType;
-    match tt {
-        TokenType::String(s) => s.len() + 2,
-        TokenType::Float(n) => n.to_string().len(),
-        TokenType::Identifier(s) => s.len(),
-        _ => format!("{:?}", tt).len(),
+fn emit_tokens(
+    expr: &crate::mir::MirExpr,
+    out: &mut Vec<f64>,
+    last_line: &mut usize,
+    last_col: &mut usize,
+) {
+    use crate::mir::expr::MirExprKind;
+    let line = expr.span.line.saturating_sub(1);
+    let col = expr.span.column.saturating_sub(1);
+    let kind = match &expr.kind {
+        MirExprKind::Variable(_) => TOKEN_KIND_VARIABLE,
+        MirExprKind::Literal(crate::common::Literal::String(_, _)) => TOKEN_KIND_STRING,
+        MirExprKind::Literal(crate::common::Literal::Int(_, _))
+        | MirExprKind::Literal(crate::common::Literal::Float(_, _)) => TOKEN_KIND_NUMBER,
+        MirExprKind::Call { .. } => TOKEN_KIND_FUNCTION,
+        _ => 0.0,
+    };
+    if kind > 0.0 {
+        push_token(out, last_line, last_col, line, col, kind);
     }
+    parsed_doc_v3::walk_mir_expr(expr, &mut |e| {
+        let l = e.span.line.saturating_sub(1);
+        let c = e.span.column.saturating_sub(1);
+        let k = match &e.kind {
+            MirExprKind::Variable(_) => TOKEN_KIND_VARIABLE,
+            MirExprKind::Literal(crate::common::Literal::String(_, _)) => TOKEN_KIND_STRING,
+            MirExprKind::Literal(crate::common::Literal::Int(_, _))
+            | MirExprKind::Literal(crate::common::Literal::Float(_, _)) => TOKEN_KIND_NUMBER,
+            MirExprKind::Call { .. } => TOKEN_KIND_FUNCTION,
+            _ => 0.0,
+        };
+        if k > 0.0 {
+            push_token(out, last_line, last_col, l, c, k);
+        }
+    });
 }
 
-// ===================================================================
-// Folding range
-// ===================================================================
+fn push_token(
+    out: &mut Vec<f64>,
+    last_line: &mut usize,
+    last_col: &mut usize,
+    line: usize,
+    col: usize,
+    kind: f64,
+) {
+    let delta_line = line as isize - *last_line as isize;
+    let delta_col = if delta_line == 0 {
+        col as isize - *last_col as isize
+    } else {
+        col as isize
+    };
+    out.push(delta_line as f64);
+    out.push(delta_col as f64);
+    out.push(1.0); // length
+    out.push(kind);
+    *last_line = line;
+    *last_col = col;
+}

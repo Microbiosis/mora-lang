@@ -1,11 +1,10 @@
-use super::helpers::*;
+use std::collections::HashMap;
+
+use super::parsed_doc_v3;
 use crate::lsp::json::Value;
 use crate::lsp::server::DocumentState;
-use std::collections::{BTreeMap, HashMap};
 
-/// v0.24: folding_range 使用 ast_v2
-#[allow(dead_code)]
-pub fn folding_range_v2(docs: &HashMap<String, DocumentState>, params: &Value) -> Value {
+pub fn folding_range_v3(docs: &HashMap<String, DocumentState>, params: &Value) -> Value {
     let uri = match params
         .get("textDocument")
         .and_then(|t| t.get("uri"))
@@ -14,69 +13,60 @@ pub fn folding_range_v2(docs: &HashMap<String, DocumentState>, params: &Value) -
         Some(s) => s,
         None => return Value::Array(vec![]),
     };
-    let (_text, stmt_ids, arena) = match parsed_doc_v2(docs, uri) {
-        Some(t) => t,
+    let (_text, exprs) = match parsed_doc_v3::parsed_doc_v3(docs, uri) {
+        Some(pair) => pair,
         None => return Value::Array(vec![]),
     };
 
-    let mut out = Vec::new();
-    for stmt_id in &stmt_ids {
-        if let Some(stmt) = arena.get_stmt(*stmt_id) {
-            match &stmt.kind {
-                crate::ast_v2::StmtKind::If { then_branch, .. } => {
-                    if let Some(last_id) = then_branch.last()
-                        && let Some(last_stmt) = arena.get_stmt(*last_id)
-                    {
-                        let mut m = BTreeMap::new();
-                        m.insert(
-                            "startLine".to_string(),
-                            Value::Number(stmt.span.line as f64 - 1.0),
-                        );
-                        m.insert(
-                            "endLine".to_string(),
-                            Value::Number(last_stmt.span.line as f64 - 1.0),
-                        );
-                        m.insert("kind".to_string(), Value::String_("region".to_string()));
-                        out.push(Value::Object(m));
-                    }
-                }
-                crate::ast_v2::StmtKind::For { body, .. } => {
-                    if let Some(last_id) = body.last()
-                        && let Some(last_stmt) = arena.get_stmt(*last_id)
-                    {
-                        let mut m = BTreeMap::new();
-                        m.insert(
-                            "startLine".to_string(),
-                            Value::Number(stmt.span.line as f64 - 1.0),
-                        );
-                        m.insert(
-                            "endLine".to_string(),
-                            Value::Number(last_stmt.span.line as f64 - 1.0),
-                        );
-                        m.insert("kind".to_string(), Value::String_("region".to_string()));
-                        out.push(Value::Object(m));
-                    }
-                }
-                crate::ast_v2::StmtKind::TaskDef { body, .. } => {
-                    if let Some(last_id) = body.last()
-                        && let Some(last_stmt) = arena.get_stmt(*last_id)
-                    {
-                        let mut m = BTreeMap::new();
-                        m.insert(
-                            "startLine".to_string(),
-                            Value::Number(stmt.span.line as f64 - 1.0),
-                        );
-                        m.insert(
-                            "endLine".to_string(),
-                            Value::Number(last_stmt.span.line as f64 - 1.0),
-                        );
-                        m.insert("kind".to_string(), Value::String_("region".to_string()));
-                        out.push(Value::Object(m));
-                    }
-                }
-                _ => {}
+    let mut ranges: Vec<Value> = Vec::new();
+    for expr in exprs {
+        collect_folds(&expr, &mut ranges);
+    }
+    Value::Array(ranges)
+}
+
+fn collect_folds(expr: &crate::mir::MirExpr, out: &mut Vec<Value>) {
+    use crate::mir::expr::MirExprKind;
+    match &expr.kind {
+        MirExprKind::If { then, r#else, .. } => {
+            let end_line = r#else
+                .as_ref()
+                .map(|e| e.span.line)
+                .unwrap_or(then.span.line);
+            if end_line > expr.span.line {
+                out.push(make_range(expr.span.line, end_line));
+            }
+            collect_folds(then, out);
+            if let Some(e) = r#else {
+                collect_folds(e, out);
             }
         }
+        MirExprKind::Match { arms, .. } => {
+            let end_line = arms
+                .iter()
+                .map(|a| a.body.span.line)
+                .max()
+                .unwrap_or(expr.span.line);
+            if end_line > expr.span.line {
+                out.push(make_range(expr.span.line, end_line));
+            }
+            for arm in arms {
+                collect_folds(&arm.body, out);
+            }
+        }
+        MirExprKind::FnDef { body, .. } | MirExprKind::Closure { body, .. } => {
+            if body.span.line > expr.span.line {
+                out.push(make_range(expr.span.line, body.span.line));
+            }
+            collect_folds(body, out);
+        }
+        _ => {}
     }
-    Value::Array(out)
+}
+
+fn make_range(start_line: usize, end_line: usize) -> Value {
+    let mut m = std::collections::BTreeMap::new();
+    m.insert("startLine".to_string(), Value::Number(start_line as f64));
+    m.insert("endLine".to_string(), Value::Number(end_line as f64));
+    Value::Object(m)
 }

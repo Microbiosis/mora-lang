@@ -300,7 +300,7 @@ impl Server {
             .docs
             .lock()
             .map_err(|_| "docs mutex poisoned".to_string())?;
-        super::providers::hover_v2(&docs, &params)
+        super::providers::hover_v3(&docs, &params)
     }
 
     fn handle_completion(&self, params: Value) -> Result<Value, String> {
@@ -308,7 +308,7 @@ impl Server {
             .docs
             .lock()
             .map_err(|_| "docs mutex poisoned".to_string())?;
-        Ok(super::providers::completion_v2(&docs, &params))
+        Ok(super::providers::completion_v3(&docs, &params))
     }
 
     fn handle_definition(&self, params: Value) -> Result<Value, String> {
@@ -316,7 +316,7 @@ impl Server {
             .docs
             .lock()
             .map_err(|_| "docs mutex poisoned".to_string())?;
-        Ok(super::providers::definition_v2(&docs, &params))
+        Ok(super::providers::definition_v3(&docs, &params))
     }
 
     fn handle_references(&self, params: Value) -> Result<Value, String> {
@@ -324,7 +324,7 @@ impl Server {
             .docs
             .lock()
             .map_err(|_| "docs mutex poisoned".to_string())?;
-        Ok(super::providers::references_v2(&docs, &params))
+        Ok(super::providers::references_v3(&docs, &params))
     }
 
     fn handle_document_symbol(&self, params: Value) -> Result<Value, String> {
@@ -332,7 +332,7 @@ impl Server {
             .docs
             .lock()
             .map_err(|_| "docs mutex poisoned".to_string())?;
-        Ok(super::providers::document_symbol_v2(&docs, &params))
+        Ok(super::providers::document_symbol_v3(&docs, &params))
     }
 
     fn handle_formatting(&self, params: Value, range: bool) -> Result<Value, String> {
@@ -348,7 +348,7 @@ impl Server {
             .docs
             .lock()
             .map_err(|_| "docs mutex poisoned".to_string())?;
-        Ok(super::providers::rename_v2(&docs, &params))
+        Ok(super::providers::rename_v3(&docs, &params))
     }
 
     fn handle_semantic_tokens(&self, params: Value) -> Result<Value, String> {
@@ -356,7 +356,7 @@ impl Server {
             .docs
             .lock()
             .map_err(|_| "docs mutex poisoned".to_string())?;
-        Ok(super::providers::semantic_tokens(&docs, &params))
+        Ok(super::providers::semantic_tokens_v3(&docs, &params))
     }
 
     fn handle_folding_range(&self, params: Value) -> Result<Value, String> {
@@ -364,7 +364,7 @@ impl Server {
             .docs
             .lock()
             .map_err(|_| "docs mutex poisoned".to_string())?;
-        Ok(super::providers::folding_range_v2(&docs, &params))
+        Ok(super::providers::folding_range_v3(&docs, &params))
     }
 
     // ---------------------------------------------------------------

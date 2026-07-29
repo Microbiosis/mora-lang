@@ -1,10 +1,11 @@
-use super::helpers::*;
-use crate::lsp::json::Value;
-use crate::lsp::server::DocumentState;
 use std::collections::{BTreeMap, HashMap};
 
-#[allow(dead_code)]
-pub fn definition_v2(docs: &HashMap<String, DocumentState>, params: &Value) -> Value {
+use super::parsed_doc_v3;
+use super::parsed_doc_v3::{position_to_offset, ident_at_offset};
+use crate::lsp::json::Value;
+use crate::lsp::server::DocumentState;
+
+pub fn definition_v3(docs: &HashMap<String, DocumentState>, params: &Value) -> Value {
     let uri = match params
         .get("textDocument")
         .and_then(|t| t.get("uri"))
@@ -20,8 +21,8 @@ pub fn definition_v2(docs: &HashMap<String, DocumentState>, params: &Value) -> V
     let line = pos.get("line").and_then(|n| n.as_i64()).unwrap_or(0) as usize;
     let col = pos.get("character").and_then(|n| n.as_i64()).unwrap_or(0) as usize;
 
-    let (text, stmt_ids, arena) = match parsed_doc_v2(docs, uri) {
-        Some(t) => t,
+    let (text, exprs) = match parsed_doc_v3::parsed_doc_v3(docs, uri) {
+        Some(pair) => pair,
         None => return Value::Array(vec![]),
     };
     let offset = position_to_offset(&text, line, col);
@@ -30,10 +31,10 @@ pub fn definition_v2(docs: &HashMap<String, DocumentState>, params: &Value) -> V
         None => return Value::Array(vec![]),
     };
 
-    let defs = collect_definitions_v2(&stmt_ids, &arena);
+    let defs = parsed_doc_v3::collect_definitions_v3(&exprs);
     let mut locations: Vec<Value> = Vec::new();
-    if let Some(positions) = defs.get(&ident) {
-        for (l, c) in positions {
+    for (name, span) in defs {
+        if name == ident {
             let mut m = BTreeMap::new();
             m.insert("uri".to_string(), Value::String_(uri.to_string()));
             m.insert(
@@ -44,8 +45,8 @@ pub fn definition_v2(docs: &HashMap<String, DocumentState>, params: &Value) -> V
                         "start".to_string(),
                         Value::Object({
                             let mut s = BTreeMap::new();
-                            s.insert("line".to_string(), Value::Number(*l as f64 - 1.0));
-                            s.insert("character".to_string(), Value::Number(*c as f64 - 1.0));
+                            s.insert("line".to_string(), Value::Number(span.line as f64));
+                            s.insert("character".to_string(), Value::Number(span.column as f64));
                             s
                         }),
                     );
@@ -53,10 +54,10 @@ pub fn definition_v2(docs: &HashMap<String, DocumentState>, params: &Value) -> V
                         "end".to_string(),
                         Value::Object({
                             let mut s = BTreeMap::new();
-                            s.insert("line".to_string(), Value::Number(*l as f64 - 1.0));
+                            s.insert("line".to_string(), Value::Number(span.line as f64));
                             s.insert(
                                 "character".to_string(),
-                                Value::Number(*c as f64 - 1.0 + ident.len() as f64),
+                                Value::Number((span.column + ident.len()) as f64),
                             );
                             s
                         }),
@@ -69,7 +70,3 @@ pub fn definition_v2(docs: &HashMap<String, DocumentState>, params: &Value) -> V
     }
     Value::Array(locations)
 }
-
-// ===================================================================
-// References
-// ===================================================================

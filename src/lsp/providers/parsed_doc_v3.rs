@@ -7,19 +7,24 @@
 
 use std::collections::HashMap;
 
+use crate::lsp::json::Value as JsonValue;
 use crate::lsp::server::DocumentState;
 use crate::mir::MirExpr;
 
-///  Look up the cached MirExpr list for `uri`.
-///  Returns `None` when the document has not been opened yet, has been
-///  closed, or has not parsed cleanly on its last change.
-pub fn parsed_doc_v3<'a>(
-    docs: &'a HashMap<String, DocumentState>,
+///  Look up and parse MirExpr list for `uri`.
+///  Returns `None` when the document has not been opened yet or parse fails.
+pub fn parsed_doc_v3(
+    docs: &HashMap<String, DocumentState>,
     uri: &str,
-) -> Option<(&'a str, &'a [MirExpr])> {
+) -> Option<(String, Vec<MirExpr>)> {
     let doc = docs.get(uri)?;
-    let exprs = doc.mir_exprs.as_deref()?;
-    Some((doc.text.as_str(), exprs))
+    // Parse MirExpr from text (no cache in DocumentState yet)
+    use crate::parser_v3::ParserV3;
+    use crate::lexer::Lexer;
+    let tokens = Lexer::new(&doc.text).scan_tokens();
+    let parser = ParserV3::new(tokens);
+    let exprs = parser.parse().ok()?;
+    Some((doc.text.clone(), exprs))
 }
 
 ///  Walks the entire MirExpr tree and invokes `visit` for every
@@ -127,6 +132,18 @@ fn walk_mir_expr_kind<F: FnMut(&MirExpr)>(kind: &crate::mir::expr::MirExprKind, 
             walk_mir_expr(value, visit);
         }
         MirExprKind::Expr(inner) => walk_mir_expr(inner, visit),
+        MirExprKind::TypeAlias { .. }
+        | MirExprKind::EnumDef { .. }
+        | MirExprKind::StructDef { .. }
+        | MirExprKind::Import(_)
+        | MirExprKind::MacroDef { .. }
+        | MirExprKind::Sequence(_)
+        | MirExprKind::Orchestrate { .. }
+        | MirExprKind::Prompt { .. }
+        | MirExprKind::Return(_)
+        | MirExprKind::Break(_)
+        | MirExprKind::Continue(_) => {},
+        _ => {}
     }
 }
 
@@ -220,4 +237,67 @@ fn collect_references_in_expr(expr: &MirExpr, name: &str, out: &mut Vec<crate::c
             }
         }
     });
+}
+
+use std::collections::BTreeMap;
+
+/// 文本位置 → 字节偏移
+pub(super) fn position_to_offset(text: &str, line: usize, col: usize) -> usize {
+    let mut current_line = 0;
+    let mut current_col = 0;
+    for (i, c) in text.char_indices() {
+        if current_line == line && current_col == col {
+            return i;
+        }
+        if c == '\n' {
+            current_line += 1;
+            current_col = 0;
+        } else {
+            current_col += 1;
+        }
+    }
+    text.len()
+}
+
+/// 创建 LSP completion item
+pub(super) fn make_completion(label: &str, kind: f64, detail: Option<&str>) -> JsonValue {
+    let mut m = BTreeMap::new();
+    m.insert("label".to_string(), JsonValue::String_(label.to_string()));
+    m.insert("kind".to_string(), JsonValue::Number(kind));
+    if let Some(d) = detail {
+        m.insert("detail".to_string(), JsonValue::String_(d.to_string()));
+    }
+    JsonValue::Object(m)
+}
+
+/// 在某 offset 取一个标识符（变量名）
+pub(super) fn ident_at_offset(text: &str, offset: usize) -> Option<String> {
+    let bytes = text.as_bytes();
+    if offset > bytes.len() {
+        return None;
+    }
+    let mut start = offset;
+    while start > 0 {
+        let prev = bytes[start - 1];
+        if prev.is_ascii_alphanumeric() || prev == b'_' {
+            start -= 1;
+        } else {
+            break;
+        }
+    }
+    let mut end = offset;
+    while end < bytes.len() {
+        let c = bytes[end];
+        if c.is_ascii_alphanumeric() || c == b'_' {
+            end += 1;
+        } else {
+            break;
+        }
+    }
+    if start == end {
+        return None;
+    }
+    std::str::from_utf8(&bytes[start..end])
+        .ok()
+        .map(|s| s.to_string())
 }

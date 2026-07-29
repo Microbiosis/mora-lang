@@ -9,12 +9,12 @@
 use crate::flow::eval_binary;
 use crate::interpreter::Interpreter;
 use crate::interpreter::mir_pregel_engine::MirPregelEngine;
-use crate::mir::expr::{MirOrchestrateKind, MirPregelConfig};
+// TODO: Pregel orchestration types will be defined during migration
 use crate::value::{Environment, Value};
 
 use super::{MirFunction, MirInst};
 
-use std::collections::HashMap;
+
 use std::sync::Arc;
 
 /// MIR 解释器执行一个 MirFunction，返回最后的表达式值或 Return 值
@@ -579,39 +579,10 @@ pub fn run_mir(
                 kind,
             } => {
                 match kind.as_ref() {
-                    MirOrchestrateKind::Pregel {
-                        agents,
-                        edges,
-                        state_schema,
-                        checkpoint,
-                        interrupt_points,
-                        adjacency,
-                    } => {
-                        let config = MirPregelConfig {
-                            agents: agents.clone(),
-                            edges: edges.clone(),
-                            state_schema: state_schema.clone(),
-                            checkpoint: checkpoint.clone(),
-                            interrupt_points: interrupt_points.clone(),
-                            adjacency: adjacency.clone(),
-                        };
-                        let mut engine = MirPregelEngine::new(config);
-                        // 初始化 input channel
-                        let input_val = match env.get(input_var) {
-                            Some(v) => v.clone(),
-                            None => Value::Nil,
-                        };
-                        let mut initial = HashMap::new();
-                        initial.insert(input_var.clone(), input_val);
-                        engine.init_channels(initial);
-                        // 执行 BSP 循环
-                        let result = engine.run(interp)?;
-                        env.define(result_var.clone(), result, false);
-                    }
-                    other => {
+                    // TODO: Implement proper Pregel orchestration during migration
+                    _ => {
                         return Err(format!(
-                            "orchestrate({:?}) not yet supported in MIR interpreter",
-                            other
+                            "orchestrate not yet supported in MIR interpreter - will be migrated to MirExpr-native implementation"
                         ));
                     }
                 }

@@ -47,6 +47,11 @@ pub fn parse_code_v3(source: &str) -> Result<Vec<crate::mir::expr::MirExpr>, Str
     parser.parse().map_err(|e| format!("{:?}", e))
 }
 
+/// 内部 v3 解析辅助（不暴露 Result — mir_import / REPL 失败 panic-out）
+fn parse_v3_internal(source: &str) -> Vec<crate::mir::expr::MirExpr> {
+    parse_code_v3(source).expect("ParserV3 failed")
+}
+
 pub use crate::value::{Environment, FlowSignal, StreamReader, Value};
 
 // v10 HTTP 超时配置
@@ -566,9 +571,11 @@ impl Interpreter {
     ) -> Result<(), String> {
         match std::fs::read_to_string(path) {
             Ok(source) => {
-                let (imported_ids, imported_arena) = parse_code(&source);
+                let mut imported_exprs = parse_v3_internal(&source);
+                let _type_errs =
+                    crate::mir::lower::typecheck_mir_exprs(&mut imported_exprs);
                 let imported_func =
-                    match crate::mir::lower::lower_program(&imported_ids, &imported_arena) {
+                    match crate::mir::lower::lower_mir_exprs(&imported_exprs) {
                         Ok(f) => f,
                         Err(e) => return Err(format!("import lowering error: {}", e)),
                     };
@@ -655,7 +662,7 @@ impl Interpreter {
     /// 接收外部 &mut Interpreter 保留 setup 代码的 state
     pub fn run_repl_with(interp: &mut Interpreter) {
         use crate::mir::interp::run_mir;
-        use crate::mir::lower::lower_program;
+        use crate::mir::lower::{lower_mir_exprs, typecheck_mir_exprs};
         use crate::mir::{MirFunction, MirInst};
         use std::io::{self, BufRead, Write};
 
@@ -684,13 +691,14 @@ impl Interpreter {
                 break;
             }
 
-            let (node_ids, arena) = parse_code(trimmed);
+            let node_ids = parse_v3_internal(trimmed);
             if node_ids.is_empty() {
                 continue;
             }
 
             // v0.35 (P0-C1): REPL also type-checks (other entry points do).
-            let type_errs = crate::typeck::check_program(&node_ids, &arena);
+            let mut exprs = node_ids;
+            let type_errs = typecheck_mir_exprs(&mut exprs);
             if !type_errs.is_empty() {
                 for e in type_errs {
                     eprintln!("type error: {}", e.message);
@@ -698,7 +706,7 @@ impl Interpreter {
                 continue;
             }
 
-            let func = match lower_program(&node_ids, &arena) {
+            let func = match lower_mir_exprs(&exprs) {
                 Ok(func) => func,
                 Err(e) => {
                     eprintln!("MIR lowering error: {}", e);

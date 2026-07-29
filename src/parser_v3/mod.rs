@@ -88,11 +88,9 @@ impl ParserV3 {
             } else {
                 return None;
             };
-            // Consume optional task body terminator (only when parse_block_body
-            // stopped at an explicit `end` keyword rather than EOF / `}`).
-            if !matches!(body.kind, MirExprKind::Sequence(_) | MirExprKind::FnDef { .. })
-                && self.check(&TokenType::End)
-            {
+            // Consume the trailing `end` keyword when the body was parsed by
+            // parse_block_body (which stops at End/RBrace/EOF).
+            if self.check(&TokenType::End) {
                 self.advance();
             }
             return Some(MirExpr {

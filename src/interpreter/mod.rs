@@ -31,15 +31,6 @@ pub const AI_API_KEY_ENV: &str = "OPENAI_API_KEY";
 pub const AI_BASE_URL_ENV: &str = "MORA_AI_BASE_URL";
 pub const AI_BASE_URL_DEFAULT: &str = "https://api.openai.com/v1";
 
-/// 使用 ParserV2 解析代码，返回 v2 AST (node_ids + arena)
-pub fn parse_code(source: &str) -> (Vec<crate::ast_v2::NodeId>, crate::ast_v2::AstArena) {
-    let tokens = Lexer::new(source).scan_tokens();
-    let mut parser_v2 = crate::parser_v2::ParserV2::new(tokens);
-    let node_ids = parser_v2.parse();
-    let arena = parser_v2.into_arena();
-    (node_ids, arena)
-}
-
 /// v0.55: 使用 ParserV3 解析代码，返回 MirExpr 列表（纯 MIR，零 AST 依赖）
 pub fn parse_code_v3(source: &str) -> Result<Vec<crate::mir::expr::MirExpr>, String> {
     let tokens = Lexer::new(source).scan_tokens();

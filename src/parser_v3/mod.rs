@@ -68,12 +68,20 @@ impl ParserV3 {
         if self.match_token_exact(TokenType::Task) {
             let name = self.consume_identifier("Expected task name")?;
             self.consume(TokenType::LParen, "Expected '(' after task name")?;
+            let mut params = Vec::new();
             while !self.check(&TokenType::RParen) && !self.is_at_end() {
-                self.advance();
+                if let Some(pname) = self.consume_identifier("Expected parameter name") {
+                    params.push(Param { name: pname, type_hint: None, default: None });
+                }
+                if !self.match_token(&[TokenType::Comma]) {
+                    break;
+                }
             }
             self.consume(TokenType::RParen, "Expected ')' after task params")?;
             let _ = self.match_token(&[TokenType::Newline]);
             let body = if let Some(expr) = self.parse_orchestrate_statement() {
+                expr
+            } else if let Some(expr) = self.parse_block_body() {
                 expr
             } else if let Some(expr) = self.parse_assignment() {
                 expr
@@ -83,7 +91,7 @@ impl ParserV3 {
             return Some(MirExpr {
                 kind: MirExprKind::FnDef {
                     name,
-                    params: Vec::new(),
+                    params,
                     return_type: None,
                     body: Box::new(body),
                 },
@@ -1195,6 +1203,10 @@ impl ParserV3 {
             }
             TokenType::String(_) => {
                 // parse_string_literal advances internally
+                self.parse_string_literal()
+            }
+            TokenType::PromptString(_) => {
+                // p"..." template: same handler as String
                 self.parse_string_literal()
             }
             TokenType::True => {

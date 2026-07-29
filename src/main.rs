@@ -9,18 +9,19 @@ use mora::ast_v2::AstArena;
 use mora::ast_v2::NodeId;
 use mora::interpreter::Interpreter;
 use mora::lexer::Lexer;
-use mora::parser_v2::ParserV2;
+use mora::mir::expr::MirExpr;
+use mora::parser_v3::ParserV3;
 use mora::record::{self, Mode};
 use mora::typeck::{self, format_error};
 
-/// 使用 ParserV2 解析代码，直接返回 v2 AST
-fn parse_with_v2(source: &str) -> (Vec<NodeId>, AstArena) {
+/// 使用 ParserV3 解析代码（直接 MirExpr 输出，零 AST 依赖）
+fn parse_with_v3(source: &str) -> Vec<MirExpr> {
     let mut lexer = Lexer::new(source);
     let tokens = lexer.scan_tokens();
-    let mut parser_v2 = ParserV2::new(tokens);
-    let node_ids = parser_v2.parse();
-    let arena = parser_v2.into_arena();
-    (node_ids, arena)
+    let parser = ParserV3::new(tokens);
+    parser
+        .parse()
+        .unwrap_or_else(|e| panic!("parse_with_v3 failed: {:?}", e))
 }
 
 fn main() {
@@ -370,11 +371,11 @@ fn update_lock(pkg_name: &str, url: &str) {
 fn run_file(path: &str) {
     let source = fs::read_to_string(path).expect("Failed to read file");
 
-    // 使用 ParserV2 解析，直接走 v2 路径
-    let (node_ids, arena) = parse_with_v2(&source);
+    // v0.55: ParserV3 → MirExpr 路径（零 AST 依赖）
+    let mut exprs = parse_with_v3(&source);
 
-    // v0.13: 静态类型检查必走, 无 env skip
-    let type_errors = typeck::check_program(&node_ids, &arena);
+    // 类型检查 (HM 推断)
+    let type_errors = mora::mir::lower::typecheck_mir_exprs(&mut exprs);
     if !type_errors.is_empty() {
         for err in &type_errors {
             eprintln!("{}", format_error(err));
@@ -384,7 +385,7 @@ fn run_file(path: &str) {
     }
 
     // Tier 1: MIR 解释器是唯一执行引擎
-    let func = match mora::mir::lower::lower_program(&node_ids, &arena) {
+    let func = match mora::mir::lower::lower_mir_exprs(&exprs) {
         Ok(f) => f,
         Err(e) => {
             eprintln!("MIR lowering error: {}", e);
@@ -428,9 +429,9 @@ fn run_record(path: &str, name: &str) {
         process::exit(1);
     });
 
-    let (node_ids, arena) = parse_with_v2(&source);
+    let mut exprs = parse_with_v3(&source);
 
-    let type_errors = typeck::check_program(&node_ids, &arena);
+    let type_errors = mora::mir::lower::typecheck_mir_exprs(&mut exprs);
     if !type_errors.is_empty() {
         for err in &type_errors {
             eprintln!("{}", format_error(err));
@@ -440,7 +441,7 @@ fn run_record(path: &str, name: &str) {
     }
 
     // Tier 1: MIR lowering
-    let func = match mora::mir::lower::lower_program(&node_ids, &arena) {
+    let func = match mora::mir::lower::lower_mir_exprs(&exprs) {
         Ok(f) => f,
         Err(e) => {
             eprintln!("record: MIR lowering error: {}", e);
@@ -492,9 +493,9 @@ fn run_replay(path: &str, name: &str) {
         process::exit(1);
     });
 
-    let (node_ids, arena) = parse_with_v2(&source);
+    let mut exprs = parse_with_v3(&source);
 
-    let type_errors = typeck::check_program(&node_ids, &arena);
+    let type_errors = mora::mir::lower::typecheck_mir_exprs(&mut exprs);
     if !type_errors.is_empty() {
         for err in &type_errors {
             eprintln!("{}", format_error(err));
@@ -504,7 +505,7 @@ fn run_replay(path: &str, name: &str) {
     }
 
     // Tier 1: MIR lowering
-    let func = match mora::mir::lower::lower_program(&node_ids, &arena) {
+    let func = match mora::mir::lower::lower_mir_exprs(&exprs) {
         Ok(f) => f,
         Err(e) => {
             eprintln!("replay: MIR lowering error: {}", e);
@@ -723,8 +724,8 @@ fn run_snapshot(file: &str, name: &str, update: bool) {
         eprintln!("snapshot: failed to read {}", file);
         process::exit(1);
     });
-    let (node_ids, arena) = parse_with_v2(&source);
-    let type_errors = typeck::check_program(&node_ids, &arena);
+    let mut exprs = parse_with_v3(&source);
+    let type_errors = mora::mir::lower::typecheck_mir_exprs(&mut exprs);
     if !type_errors.is_empty() {
         for err in &type_errors {
             eprintln!("{}", format_error(err));
@@ -734,7 +735,7 @@ fn run_snapshot(file: &str, name: &str, update: bool) {
     }
 
     // Tier 1: MIR lowering
-    let func = match mora::mir::lower::lower_program(&node_ids, &arena) {
+    let func = match mora::mir::lower::lower_mir_exprs(&exprs) {
         Ok(f) => f,
         Err(e) => {
             eprintln!("snapshot: MIR lowering error: {}", e);
@@ -999,11 +1000,11 @@ fn truncate(s: &str, max: usize) -> String {
 fn run_check(path: &str) {
     let source = fs::read_to_string(path).expect("Failed to read file");
 
-    let (node_ids, arena) = parse_with_v2(&source);
+    let mut exprs = parse_with_v3(&source);
 
-    let type_errors = typeck::check_program(&node_ids, &arena);
+    let type_errors = mora::mir::lower::typecheck_mir_exprs(&mut exprs);
     if type_errors.is_empty() {
-        println!("No type errors found. ({} statements)", node_ids.len());
+        println!("No type errors found. ({} expressions)", exprs.len());
     } else {
         for err in &type_errors {
             eprintln!("{}", format_error(err));

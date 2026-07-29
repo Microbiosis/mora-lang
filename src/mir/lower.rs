@@ -18,16 +18,6 @@ pub fn lower_program(stmt_ids: &[NodeId], arena: &AstArena) -> Result<MirFunctio
     Ok(l.finish())
 }
 
-/// α.11: 单表达式 lowering。返回一个含单个 Expr 指令序列的 MirFunction，
-/// 末尾追加 Return(dst) 让 run_mir 返回表达式的值。
-/// 用于从 orchestrator / trait_dispatch 等替代 self.evaluate(*node_id, arena)。
-pub fn lower_expr_only(expr_id: NodeId, arena: &AstArena) -> Result<MirFunction, String> {
-    let mut l = Lowerer::new();
-    let dst = l.lower_expr(expr_id, arena)?;
-    l.emit(MirInst::Return(Some(dst)));
-    Ok(l.finish())
-}
-
 /// α.11: 单语句 lowering（用于 call_value_inner / call_task_inner 的 arena 替代）。
 /// 末尾追加 Return 最后一个寄存器的值（如果 stmt 是 Expr）。
 pub fn lower_stmt_only(stmt_id: NodeId, arena: &AstArena) -> Result<MirFunction, String> {

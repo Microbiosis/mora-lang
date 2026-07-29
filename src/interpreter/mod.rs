@@ -629,17 +629,8 @@ impl Interpreter {
     }
 
     /// α.11: 通过 MIR 解释器求值单个 AST 表达式。
-    /// 用于从 orchestrator / trait_dispatch 等替代 `self.evaluate(*node_id, arena)`。
-    /// 与 `mir::lower::lower_expr_only` + `run_mir` 等价，但封装 env/重置逻辑。
-    pub fn mir_eval_expr(
-        &mut self,
-        expr_id: crate::ast_v2::NodeId,
-        arena: &crate::ast_v2::AstArena,
-    ) -> Result<Value, String> {
-        let func = crate::mir::lower::lower_expr_only(expr_id, arena)?;
-        let mut env = self.core.environment.lock().clone();
-        crate::mir::interp::run_mir(&func, self, &mut env)
-    }
+    /// 注：原 `mir_eval_expr` (走 lower_expr_only + ast_v2) 在 v0.55 删除 — 无外部调用者。
+    /// 改用纯 MIR 路径请调用 `crate::mir::lower::lower_mir_exprs` + `run_mir`。
 
     /// v0.22: 字符串驻留 - 相同字符串只存储一次
     pub fn intern_string(&mut self, s: String) -> Value {

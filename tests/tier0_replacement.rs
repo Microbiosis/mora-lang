@@ -69,7 +69,7 @@ end
 }
 
 // ─── 3. 类型系统 (type system) ──────────────────────────────────────
-// typeck::check_program 必须在 MIR 路径之前通过，验证解耦。
+// mir::lower::typecheck_mir_exprs 必须在 MIR 路径之前通过，验证解耦。
 // type alias + enum 经 MIR 落到 env（α.3）。
 // 注：脚本内多个 task 跨 task 调用时，MIR task 注册表只覆盖同一 func body；
 // 单 task 内联 if/return 同样能验证类型→MIR 链。

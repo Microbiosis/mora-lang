@@ -8,6 +8,8 @@ mod trait_dispatch;
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::env;
+
+use crate::checkpoint::Checkpoint;
 use std::fs;
 use std::io::{BufRead, BufReader, Read};
 use std::sync::Arc;
@@ -511,6 +513,15 @@ impl Interpreter {
             Ok(cp.channel_values)
         } else {
             Err("No checkpoint saver configured".to_string())
+        }
+    }
+
+    /// v0.63: Load the full latest checkpoint for the given thread.
+    pub fn load_checkpoint(&self, thread_id: &str) -> Result<Option<Checkpoint>, String> {
+        if let Some(ref saver) = self.persist.checkpoint_saver {
+            saver.load(thread_id, None)
+        } else {
+            Ok(None)
         }
     }
 

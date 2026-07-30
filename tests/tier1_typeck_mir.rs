@@ -74,7 +74,6 @@ fn match_arms_unify_cleanly() {
 }
 
 #[test]
-#[ignore = "requires HM type inference on MirExpr tree"]
 fn unbound_variable_produces_diagnostic() {
     let src = "let x = missing";
     let exprs = parse_code_v3(src).expect("parse should succeed (parser doesn't typecheck)");
@@ -110,7 +109,6 @@ fn nested_let_and_call() {
 }
 
 #[test]
-#[ignore = "requires HM type inference on MirExpr tree"]
 fn type_errors_contain_span_information() {
     // Each diagnostic should carry line / column so CLI and LSP can
     // surface it.

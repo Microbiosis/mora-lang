@@ -157,15 +157,46 @@ impl CostModel for TokenEstimate {
                 };
                 50 + n_agents as u32 * 30
             }
-            // 任务/工具/Skill 定义不计
+            // 任务/工具/Skill 定义不计（元数据）
             MirInst::TaskDef { .. } => 0,
             MirInst::TraitDef { .. } => 0,
             MirInst::ImplDef { .. } => 0,
             MirInst::SkillDef { .. } => 0,
             MirInst::ToolDef { .. } => 0,
             MirInst::Closure { .. } => 0,
-            // 其他未分类
-            _ => 1,
+            // 类型宏定义：不计（编译时元数据）
+            MirInst::TypeAlias { .. } => 0,
+            MirInst::EnumDef { .. } => 0,
+            MirInst::StructDef { .. } => 0,
+            MirInst::MacroDef { .. } => 0,
+            // 可观测性块：按嵌套 body 计费
+            MirInst::Observe { body, .. } => {
+                body.body.iter().map(|i| self.inst_cost(i)).sum::<u32>() + 10
+            }
+            MirInst::Span { body, .. } => {
+                body.body.iter().map(|i| self.inst_cost(i)).sum::<u32>() + 5
+            }
+            // Token 记录：按 content 长度计费
+            MirInst::RecordTokens { input, output } => {
+                (input.chars().count() / 4 + 1) as u32
+                    + (output.chars().count() / 4 + 1) as u32
+            }
+            // Prompt/Document section：递归 body
+            MirInst::PromptSection { body, .. } => {
+                body.body.iter().map(|i| self.inst_cost(i)).sum::<u32>()
+            }
+            MirInst::DocumentSection { body, .. } => {
+                body.body.iter().map(|i| self.inst_cost(i)).sum::<u32>()
+            }
+            // DynTrait 包装：轻量运行时操作
+            MirInst::DynTrait { .. } => 3,
+            // Eval 断言：按 expects 计费
+            MirInst::Eval { expects, .. } => {
+                5 + expects.len() as u32 * 3
+            }
+            // 未实现/无操作指令
+            MirInst::Route(_) => 1,
+            MirInst::Label(_) => 0,
         }
     }
 }
@@ -278,5 +309,91 @@ mod tests {
             }),
         };
         assert!(cost.inst_cost(&large) > cost.inst_cost(&small));
+    }
+
+    // ========== Phase H.7 测试：新指令 token 估算 ==========
+
+    #[test]
+    fn test_eval_cost_scales_with_expects() {
+        let cost = TokenEstimate;
+        let single = MirInst::Eval {
+            name: "t".to_string(),
+            given_reg: 0,
+            expects: vec![0],
+            tolerance: None,
+            replay_path: None,
+        };
+        let multi = MirInst::Eval {
+            name: "t".to_string(),
+            given_reg: 0,
+            expects: vec![0, 1, 2, 3, 4],
+            tolerance: None,
+            replay_path: None,
+        };
+        assert!(cost.inst_cost(&multi) > cost.inst_cost(&single));
+    }
+
+    #[test]
+    fn test_record_tokens_cost_by_length() {
+        let cost = TokenEstimate;
+        let small = MirInst::RecordTokens {
+            input: "hi".to_string(),
+            output: "ok".to_string(),
+        };
+        let large = MirInst::RecordTokens {
+            input: "this is a long input string".to_string(),
+            output: "this is a long output string".to_string(),
+        };
+        assert!(cost.inst_cost(&large) > cost.inst_cost(&small));
+    }
+
+    #[test]
+    fn test_observe_includes_nested_body() {
+        let cost = TokenEstimate;
+        let empty_body = MirInst::Observe {
+            config: "{}".to_string(),
+            body: Box::new(crate::mir::MirFunction {
+                params: vec![],
+                body: vec![],
+                n_regs: 0,
+            }),
+        };
+        let populated = MirInst::Observe {
+            config: "{}".to_string(),
+            body: Box::new(crate::mir::MirFunction {
+                params: vec![],
+                body: vec![
+                    MirInst::Const(0, Value::Int(42)),
+                    MirInst::Const(1, Value::Int(99)),
+                ],
+                n_regs: 2,
+            }),
+        };
+        assert!(
+            cost.inst_cost(&populated) > cost.inst_cost(&empty_body),
+            "Observe with populated body should cost more than empty"
+        );
+    }
+
+    #[test]
+    fn test_dyntrait_lightweight() {
+        let cost = TokenEstimate;
+        let dt = MirInst::DynTrait {
+            dst: 0,
+            src: 1,
+            trait_generics: vec![],
+            trait_name: "Display".to_string(),
+        };
+        assert_eq!(cost.inst_cost(&dt), 3);
+    }
+
+    #[test]
+    fn test_definitions_cost_zero() {
+        let cost = TokenEstimate;
+        assert_eq!(cost.inst_cost(&MirInst::TypeAlias {
+            name: "T".to_string(),
+            target: "Int".to_string(),
+        }), 0);
+        assert_eq!(cost.inst_cost(&MirInst::Label(0)), 0);
     }
 }

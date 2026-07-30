@@ -30,6 +30,11 @@ pub mod optimize;
 pub mod ssa;
 pub mod typeinfer;
 
+// v0.59: DAG IR — dataflow analysis from linear MIR
+pub mod dag;
+pub mod dag_interp;
+pub mod handlers;
+
 pub use interp::run_mir;
 pub use expr::MirExpr;
 // lower_program removed in Phase A (v0.55) — use lower_mir_exprs instead

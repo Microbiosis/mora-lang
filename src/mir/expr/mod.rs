@@ -50,7 +50,7 @@
 use crate::common::{BinaryOp, Literal, Span};
 use crate::mir::MirFunction;
 use crate::typeck::Type;
-use crate::value::Value;
+use crate::value::{MergeStrategy, Value};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -599,6 +599,29 @@ pub enum MirReducerKind {
     Product,
     Concat,
     Custom(String),
+}
+
+/// v0.60: Map Pregel reducer to CRDT merge strategy.
+///
+/// `Merge`, `Sum`, `Product`, `Concat`, and `Custom` have no direct
+/// static mapping and return `None` — these require custom execution.
+///
+/// NOTE: `Append` maps to `MergeStrategy::Append` for Environment-level
+/// merges (two-dict merge), but the Pregel engine handles `Append`
+/// separately in `apply_write()` with stream-accumulation semantics
+/// (push individual writes into a list). The two paths are intentionally
+/// different.
+impl MirReducerKind {
+    pub fn to_merge_strategy(&self) -> Option<MergeStrategy> {
+        match self {
+            MirReducerKind::Last => Some(MergeStrategy::LastWriteWins),
+            MirReducerKind::Append => Some(MergeStrategy::Append),
+            MirReducerKind::Add => Some(MergeStrategy::Add),
+            MirReducerKind::Merge(_) | MirReducerKind::Sum
+            | MirReducerKind::Product | MirReducerKind::Concat
+            | MirReducerKind::Custom(_) => None,
+        }
+    }
 }
 
 ///  State channel definition (placeholder for v0.50)

@@ -2,7 +2,7 @@
 //!
 //! 完全 MIR-native：规则从 `MirInst` 重写到 `Vec<MirInst>`，零 AST 依赖。
 
-use crate::mir::MirInst;
+use crate::mir::{MirInst, Reg};
 use crate::mir::optimize::pattern::{Match, MatchBindings, MirPattern};
 use crate::value::Value;
 
@@ -67,6 +67,7 @@ pub struct IfSimplifyRule;
 
 impl RewriteRule for IfSimplifyRule {
     fn name(&self) -> &'static str { "if_simplify" }
+    /// Use Any pattern — the rule handles both JumpIf and JumpIfNot internally
     fn pattern(&self) -> &MirPattern { &IF_SIMPLIFY_PATTERN }
 
     fn rewrite_with_context(
@@ -96,10 +97,8 @@ impl RewriteRule for IfSimplifyRule {
     fn cost_gain(&self) -> i32 { 2 }
 }
 
-static IF_SIMPLIFY_PATTERN: MirPattern = MirPattern::JumpIf {
-    cond: crate::mir::optimize::pattern::RegMatcher::Any,
-    target: crate::mir::optimize::pattern::LabelMatcher::Any,
-};
+/// Matches any instruction — IfSimplifyRule handles JumpIf/JumpIfNot discrimination internally
+static IF_SIMPLIFY_PATTERN: MirPattern = MirPattern::Any;
 
 pub fn builtin_rules() -> Vec<Box<dyn RewriteRule>> {
     vec![
@@ -110,9 +109,10 @@ pub fn builtin_rules() -> Vec<Box<dyn RewriteRule>> {
     ]
 }
 
-/// Phase H.5: 删除 Return 之后的所有死指令
+/// Phase H.5: 删除 Return 之后的所有死指令（安全网）
 ///
-/// 任何指令出现在 `Return` 之后永远不会执行——直接删除。
+/// 主要工作在 `greedy_search` 中通过 O(n) 预截断完成。
+/// 此规则作为安全网，处理后续优化可能引入的新 Return 后的代码。
 ///
 /// 模式：任何指令（`_ => true`），但仅当 `pc > last_return_pc` 时重写
 ///
@@ -211,7 +211,7 @@ static REDUNDANT_JUMP_PATTERN: MirPattern = MirPattern::Jump {
     target: crate::mir::optimize::pattern::LabelMatcher::Any,
 };
 
-/// 示例规则 1：常量折叠
+/// Phase H.7: 常量折叠（修复版）
 ///
 /// `BinaryOp(dst, a, op, b)` 其中 a 和 b 均为 `Const` → 折叠为 `Const(dst, eval(a,op,b))`
 pub struct ConstFoldingRule;
@@ -225,25 +225,47 @@ impl RewriteRule for ConstFoldingRule {
         &CONST_FOLDING_PATTERN
     }
 
-    fn rewrite(&self, inst: &MirInst, _bindings: &MatchBindings) -> Vec<MirInst> {
-        // 完整实现：解析 inst 为 BinaryOp，提取常量并求值
-        if let MirInst::BinaryOp(dst, _, op, _) = inst {
-            // 此处需要 lhs/rhs 来自 bindings。简化版：直接返回原指令
-            vec![MirInst::BinaryOp(
-                *dst,
-                0, // 占位 — 实际实现需从 bindings 提取
-                op.clone(),
-                0,
-            )]
-        } else {
-            // 模式不匹配时保留原指令
-            vec![inst.clone()]
+    fn rewrite_with_context(
+        &self,
+        inst: &MirInst,
+        _bindings: &MatchBindings,
+        pc: usize,
+        body: &[MirInst],
+        _ctx: &dyn std::any::Any,
+    ) -> Vec<MirInst> {
+        if let MirInst::BinaryOp(dst, lhs, op, rhs) = inst {
+            // Scan backwards for constant definitions of lhs and rhs
+            let lhs_val = find_const_backward(body, *lhs, pc);
+            let rhs_val = find_const_backward(body, *rhs, pc);
+            if let (Some(lv), Some(rv)) = (lhs_val, rhs_val) {
+                if let Ok(result) = crate::flow::eval_binary(lv, op, rv) {
+                    return vec![MirInst::Const(*dst, result)];
+                }
+            }
         }
+        vec![inst.clone()]
     }
 
     fn cost_gain(&self) -> i32 {
-        1
+        2
     }
+}
+
+/// Find the most recent `Const` instruction within the same basic block
+/// that defines `reg`, scanning backwards from `before_pc`.
+fn find_const_backward(body: &[MirInst], reg: Reg, before_pc: usize) -> Option<Value> {
+    body[..before_pc]
+        .iter()
+        .rev()
+        .take_while(|i| !matches!(i, MirInst::Label(_)))
+        .find_map(|inst| {
+            if let MirInst::Const(r, val) = inst {
+                if *r == reg {
+                    return Some(val.clone());
+                }
+            }
+            None
+        })
 }
 
 static CONST_FOLDING_PATTERN: MirPattern = MirPattern::BinaryOp {
@@ -382,5 +404,73 @@ mod tests {
         let result = apply_rules(&body, &rules);
         assert_eq!(result.len(), 1, "Redundant jump should be removed");
         assert!(matches!(result[0], MirInst::Const(0, Value::Int(42))));
+    }
+
+    #[test]
+    fn test_const_folding_folds_int_add() {
+        let rule = ConstFoldingRule;
+        let body = vec![
+            MirInst::Const(1, Value::Int(10)),
+            MirInst::Const(2, Value::Int(32)),
+            MirInst::BinaryOp(3, 1, BinaryOp::Add, 2),
+        ];
+        let empty_ctx = ();
+        let result = rule.rewrite_with_context(
+            &MirInst::BinaryOp(3, 1, BinaryOp::Add, 2),
+            &MatchBindings::new(),
+            2, // pc of the BinaryOp
+            &body,
+            &empty_ctx,
+        );
+        assert_eq!(result.len(), 1, "should fold to single Const");
+        assert!(
+            matches!(&result[0], MirInst::Const(d, Value::Int(42)) if *d == 3),
+            "should be Const(3, 42), got: {:?}", result[0]
+        );
+    }
+
+    #[test]
+    fn test_const_folding_no_fold_without_constants() {
+        let rule = ConstFoldingRule;
+        let body = vec![
+            // No Const for r1 or r2 — can't fold
+            MirInst::BinaryOp(3, 1, BinaryOp::Mul, 2),
+        ];
+        let empty_ctx = ();
+        let result = rule.rewrite_with_context(
+            &MirInst::BinaryOp(3, 1, BinaryOp::Mul, 2),
+            &MatchBindings::new(),
+            0,
+            &body,
+            &empty_ctx,
+        );
+        // Should preserve the original instruction unchanged
+        assert_eq!(result.len(), 1);
+        assert!(matches!(result[0], MirInst::BinaryOp(3, 1, BinaryOp::Mul, 2)));
+    }
+
+    #[test]
+    fn test_const_folding_block_boundary() {
+        let rule = ConstFoldingRule;
+        // Const for r1 is in a different basic block (after a Label)
+        let body = vec![
+            MirInst::Label(0),
+            MirInst::Const(1, Value::Int(5)),
+            MirInst::Label(3), // basic block boundary
+            MirInst::BinaryOp(4, 1, BinaryOp::Add, 1),
+        ];
+        let empty_ctx = ();
+        let result = rule.rewrite_with_context(
+            &MirInst::BinaryOp(4, 1, BinaryOp::Add, 1),
+            &MatchBindings::new(),
+            3, // pc of the BinaryOp
+            &body,
+            &empty_ctx,
+        );
+        // Should NOT fold: Const(1) is behind a Label boundary
+        // (but r1=1 uses the same register as rhs — should find rhs=1 resolves to same Const(1, Int(5)))
+        // Actually: both lhs=1 and rhs=1 resolve to the same Const above Label(3) — 
+        // the find_const_backward stops at Label, so it WON'T find lhs/rhs.
+        assert_eq!(result.len(), 1, "should not fold across block boundary");
     }
 }

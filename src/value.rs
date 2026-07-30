@@ -458,12 +458,150 @@ fn fmt_inner(f: &mut std::fmt::Formatter<'_>, v: &Value, depth: usize) -> std::f
     }
 }
 
+// ─── Merge Strategy ─────────────────────────────────────────
+/// v0.59: CRDT-inspired merge strategies for concurrent state.
+///
+/// When two environments (or state channels) write to the same key,
+/// the merge strategy determines how the values are combined.
+#[derive(Debug, Clone, PartialEq)]
+pub enum MergeStrategy {
+    /// Child overwrites parent (classic last-write-wins).
+    LastWriteWins,
+    /// List: concatenate. String: concatenate. Other: LWW.
+    Append,
+    /// Int/Float: numeric addition. Other: LWW.
+    Add,
+    /// Dict: key-level merge (child keys win on conflict).
+    DictUnion,
+}
+
+impl Value {
+    /// Merge two values using the given strategy.
+    /// Falls back to `LastWriteWins` if the strategy doesn't apply
+    /// to the value types.
+    pub fn merge(parent: Value, child: Value, strategy: &MergeStrategy) -> Value {
+        match strategy {
+            MergeStrategy::LastWriteWins => child,
+            MergeStrategy::Append => match (parent, child) {
+                (Value::List(mut a), Value::List(b)) => { a.extend(b); Value::List(a) }
+                (Value::String(a), Value::String(b)) => Value::String(a + &b),
+                (_, child) => child, // fallback: LWW
+            },
+            MergeStrategy::Add => match (parent, child) {
+                (Value::Int(a), Value::Int(b)) => Value::Int(a + b),
+                (Value::Float(a), Value::Float(b)) => Value::Float(a + b),
+                (_, child) => child,
+            },
+            MergeStrategy::DictUnion => match (parent, child) {
+                (Value::Dict(mut a), Value::Dict(b)) => {
+                    for (k, v) in b { a.insert(k, v); }
+                    Value::Dict(a)
+                }
+                (_, child) => child,
+            },
+        }
+    }
+}
+
+// ─── Vector Clock ─────────────────────────────────────────
+/// v0.61: Vector clock for causal consistency in concurrent environments.
+///
+/// Maps agent/node name → logical counter. Used to detect concurrent
+/// (non-causally-ordered) modifications during environment merges.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct VectorClock {
+    entries: HashMap<String, u64>,
+}
+
+impl VectorClock {
+    /// Increment this agent's counter by 1.
+    pub fn tick(&mut self, agent: &str) {
+        *self.entries.entry(agent.to_string()).or_insert(0) += 1;
+    }
+
+    /// Merge another clock: take the maximum counter for each agent.
+    pub fn merge(&mut self, other: &VectorClock) {
+        for (k, &v) in &other.entries {
+            let e = self.entries.entry(k.clone()).or_insert(0);
+            *e = (*e).max(v);
+        }
+    }
+
+    /// True if `a` happened-before `b` (strict partial order).
+    ///
+    /// Condition: ∀k: a[k] ≤ b[k] AND ∃k: a[k] < b[k].
+    pub fn happened_before(a: &VectorClock, b: &VectorClock) -> bool {
+        let mut has_strict = false;
+        for k in a.entries.keys().chain(b.entries.keys()) {
+            let av = a.entries.get(k).copied().unwrap_or(0);
+            let bv = b.entries.get(k).copied().unwrap_or(0);
+            if av > bv { return false; }
+            if av < bv { has_strict = true; }
+        }
+        has_strict
+    }
+
+    /// True if neither clock happened-before the other.
+    ///
+    /// Two clocks are concurrent when they have conflicting information —
+    /// each has at least one counter greater than the other.
+    /// Equal clocks (same causal history) are NOT concurrent.
+    pub fn concurrent(a: &VectorClock, b: &VectorClock) -> bool {
+        a != b && !Self::happened_before(a, b) && !Self::happened_before(b, a)
+    }
+
+    /// True if this clock has no entries (freshly created).
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// v0.63: Serialize to a Dict for checkpoint storage.
+    pub fn to_dict(&self) -> HashMap<String, Value> {
+        self.entries.iter()
+            .map(|(k, &v)| (k.clone(), Value::Int(v as i64)))
+            .collect()
+    }
+
+    /// v0.63: Deserialize from a Dict (checkpoint restore).
+    pub fn from_dict(d: &HashMap<String, Value>) -> Self {
+        let entries: HashMap<String, u64> = d.iter()
+            .filter_map(|(k, v)| {
+                match v {
+                    Value::Int(n) => Some((k.clone(), *n as u64)),
+                    Value::Float(n) => Some((k.clone(), *n as u64)),
+                    _ => None,
+                }
+            })
+            .collect();
+        VectorClock { entries }
+    }
+}
+
+// ─── Conflict ──────────────────────────────────────────────
+
+/// v0.61: Detected write-write conflict during environment merge.
+///
+/// Captured when two environments modified the same key with
+/// concurrent clocks (neither happened-before the other).
+#[derive(Debug, Clone)]
+pub struct Conflict {
+    pub key: String,
+    pub parent_value: Value,
+    pub child_value: Value,
+    pub parent_clock: VectorClock,
+    pub child_clock: VectorClock,
+}
+
 // ─── Environment ─────────────────────────────────────────
 #[derive(Debug, Clone)]
 pub struct Environment {
     pub values: HashMap<String, Arc<Mutex<Value>>>,
     pub exports: HashMap<String, Arc<Mutex<Value>>>,
     pub parent: Option<Arc<Mutex<Environment>>>,
+    /// v0.61: Per-binding version clocks (which agent modified each key).
+    pub versions: HashMap<String, VectorClock>,
+    /// v0.61: This environment's own vector clock.
+    pub clock: VectorClock,
 }
 
 impl Default for Environment {
@@ -478,6 +616,8 @@ impl Environment {
             values: HashMap::new(),
             exports: HashMap::new(),
             parent: None,
+            versions: HashMap::new(),
+            clock: VectorClock::default(),
         }
     }
 
@@ -486,6 +626,8 @@ impl Environment {
             values: HashMap::new(),
             exports: HashMap::new(),
             parent: Some(parent),
+            versions: HashMap::new(),
+            clock: VectorClock::default(),
         }
     }
 
@@ -498,6 +640,8 @@ impl Environment {
     pub fn define(&mut self, name: String, value: Value, exported: bool) {
         let arc = Arc::new(Mutex::new(value.clone()));
         self.values.insert(name.clone(), arc.clone());
+        // v0.61: record the current clock for this binding
+        self.versions.insert(name.clone(), self.clock.clone());
         if exported {
             self.exports.insert(name, arc);
         }
@@ -516,9 +660,18 @@ impl Environment {
     pub fn assign(&mut self, name: &str, value: Value) -> bool {
         if let Some(arc) = self.values.get(name) {
             *arc.lock() = value;
+            // v0.61: update the version clock for this binding
+            self.versions.insert(name.to_string(), self.clock.clone());
             true
         } else if let Some(parent) = &self.parent {
-            parent.lock().assign(name, value)
+            let result = parent.lock().assign(name, value);
+            // v0.64: Bug fix — also update local clock for parent-scope writes.
+            // Without this, concurrent modifications through the parent chain
+            // would carry stale clocks and fail conflict detection.
+            if result {
+                self.versions.insert(name.to_string(), self.clock.clone());
+            }
+            result
         } else {
             false
         }
@@ -578,6 +731,100 @@ impl Environment {
             .map(|(k, v)| (k.clone(), v.lock().clone()))
             .collect()
     }
+
+    /// v0.59: Merge bindings from a child environment into this one.
+    ///
+    /// For each binding in `child`, if the key already exists in `self`,
+    /// the values are merged using the given strategy. Otherwise the
+    /// child binding is defined as new.
+    ///
+    /// v0.61: Also merges per-binding version clocks and the environment-level clock.
+    pub fn merge_from(&mut self, child: &Environment, strategy: &MergeStrategy) {
+        for (name, child_val) in values_iter(child) {
+            match self.values.get(&name) {
+                Some(parent_arc) => {
+                    let parent_val = parent_arc.lock().clone();
+                    let merged = Value::merge(parent_val, child_val, strategy);
+                    *parent_arc.lock() = merged;
+                    // Merge version clock for this binding
+                    if let Some(child_v) = child.versions.get(&name) {
+                        self.versions.entry(name.clone())
+                            .or_default()
+                            .merge(child_v);
+                    }
+                }
+                None => {
+                    // Carry over child's version clock before moving `name`
+                    let child_ver = child.versions.get(&name).cloned();
+                    self.define(name.clone(), child_val, false);
+                    if let Some(child_v) = child_ver {
+                        self.versions.insert(name, child_v);
+                    }
+                }
+            }
+        }
+        self.clock.merge(&child.clock);
+    }
+
+    /// v0.60: Merge bindings with per-key strategies.
+    ///
+    /// Keys listed in `strategies` use their specific strategy; all
+    /// other keys fall back to `default`.
+    ///
+    /// v0.61: Returns detected write-write conflicts (concurrent clocks).
+    /// Also merges per-binding version clocks.
+    pub fn merge_from_with_strategies(
+        &mut self,
+        child: &Environment,
+        strategies: &HashMap<String, MergeStrategy>,
+        default: &MergeStrategy,
+    ) -> Vec<Conflict> {
+        let mut conflicts = Vec::new();
+        for (name, child_val) in values_iter(child) {
+            let strategy = strategies.get(&name).unwrap_or(default);
+            match self.values.get(&name) {
+                Some(parent_arc) => {
+                    let parent_clock = self.versions.get(&name).cloned().unwrap_or_default();
+                    let child_clock = child.versions.get(&name).cloned().unwrap_or_default();
+
+                    // Detect concurrent modifications
+                    if !parent_clock.is_empty() && !child_clock.is_empty()
+                        && VectorClock::concurrent(&parent_clock, &child_clock)
+                    {
+                        conflicts.push(Conflict {
+                            key: name.clone(),
+                            parent_value: parent_arc.lock().clone(),
+                            child_value: child_val.clone(),
+                            parent_clock: parent_clock.clone(),
+                            child_clock: child_clock.clone(),
+                        });
+                    }
+
+                    let parent_val = parent_arc.lock().clone();
+                    let merged = Value::merge(parent_val, child_val, strategy);
+                    *parent_arc.lock() = merged;
+                    // Merge clocks: take max per agent
+                    let mut merged_clock = parent_clock;
+                    merged_clock.merge(&child_clock);
+                    self.versions.insert(name.clone(), merged_clock);
+                }
+                None => {
+                    // v0.61: new binding — carry over child's clock
+                    if let Some(child_v) = child.versions.get(&name) {
+                        self.versions.insert(name.clone(), child_v.clone());
+                    }
+                    self.define(name, child_val, false);
+                }
+            }
+        }
+        self.clock.merge(&child.clock);
+        conflicts
+    }
+}
+
+/// Iterate bindings from an Environment without consuming it.
+fn values_iter(env: &Environment) -> Vec<(String, Value)> {
+    env.values.iter().map(|(k, v)| (k.clone(), v.lock().clone())).collect()
 }
 
 // ─── FlowSignal ──────────────────────────────────────────
@@ -720,5 +967,191 @@ mod tests {
         let arc = Arc::new(Mutex::new(e));
         let r = EnvRef::from_arc_mutex(arc);
         assert_eq!(r.env().get("x"), Some(Value::String("y".to_string())));
+    }
+
+    // ─── Merge tests ──────────────────────────────────────────
+
+    #[test]
+    fn merge_add_ints() {
+        assert_eq!(Value::merge(Value::Int(5), Value::Int(3), &MergeStrategy::Add), Value::Int(8));
+    }
+
+    #[test]
+    fn merge_add_floats() {
+        assert_eq!(Value::merge(Value::Float(1.5), Value::Float(2.5), &MergeStrategy::Add), Value::Float(4.0));
+    }
+
+    #[test]
+    fn merge_append_lists() {
+        assert_eq!(
+            Value::merge(Value::List(vec![Value::Int(1)]), Value::List(vec![Value::Int(2)]), &MergeStrategy::Append),
+            Value::List(vec![Value::Int(1), Value::Int(2)])
+        );
+    }
+
+    #[test]
+    fn merge_append_strings() {
+        assert_eq!(
+            Value::merge(Value::String("a".into()), Value::String("b".into()), &MergeStrategy::Append),
+            Value::String("ab".into())
+        );
+    }
+
+    #[test]
+    fn merge_dict_union() {
+        let mut a = HashMap::new(); a.insert("x".into(), Value::Int(1));
+        let mut b = HashMap::new(); b.insert("y".into(), Value::Int(2));
+        let mut expected = HashMap::new();
+        expected.insert("x".into(), Value::Int(1));
+        expected.insert("y".into(), Value::Int(2));
+        assert_eq!(Value::merge(Value::Dict(a), Value::Dict(b), &MergeStrategy::DictUnion), Value::Dict(expected));
+    }
+
+    #[test]
+    fn merge_lww_is_child_wins() {
+        assert_eq!(Value::merge(Value::Int(1), Value::Int(99), &MergeStrategy::LastWriteWins), Value::Int(99));
+    }
+
+    #[test]
+    fn merge_fallback_to_lww() {
+        // String + Int with Add strategy — can't add, falls back to child
+        assert_eq!(Value::merge(Value::String("x".into()), Value::Int(42), &MergeStrategy::Add), Value::Int(42));
+    }
+
+    #[test]
+    fn env_merge_from_new_bindings() {
+        let mut parent = Environment::new();
+        parent.define("a".into(), Value::Int(1), false);
+        let mut child = Environment::new();
+        child.define("b".into(), Value::Int(2), false);
+        parent.merge_from(&child, &MergeStrategy::LastWriteWins);
+        assert_eq!(parent.get("a"), Some(Value::Int(1)));
+        assert_eq!(parent.get("b"), Some(Value::Int(2)));
+    }
+
+    #[test]
+    fn env_merge_from_conflict_uses_strategy() {
+        let mut parent = Environment::new();
+        parent.define("x".into(), Value::Int(5), false);
+        let mut child = Environment::new();
+        child.define("x".into(), Value::Int(3), false);
+        parent.merge_from(&child, &MergeStrategy::Add);
+        assert_eq!(parent.get("x"), Some(Value::Int(8)));
+    }
+
+    #[test]
+    fn env_merge_with_per_key_strategies() {
+        let mut parent = Environment::new();
+        parent.define("counter".into(), Value::Int(100), false);
+        parent.define("log".into(), Value::List(vec![]), false);
+        parent.define("name".into(), Value::String("alice".into()), false);
+
+        let mut child = Environment::new();
+        child.define("counter".into(), Value::Int(5), false);
+        child.define("log".into(), Value::List(vec![Value::String("msg1".into())]), false);
+        child.define("name".into(), Value::String("bob".into()), false);
+        child.define("new_key".into(), Value::Int(42), false);
+
+        let mut strategies: HashMap<String, MergeStrategy> = HashMap::new();
+        strategies.insert("counter".into(), MergeStrategy::Add);
+        strategies.insert("log".into(), MergeStrategy::Append);
+        // "name" not in strategies → uses default (LWW)
+
+        parent.merge_from_with_strategies(&child, &strategies, &MergeStrategy::LastWriteWins);
+
+        // counter: 100 + 5 = 105 (Add strategy)
+        assert_eq!(parent.get("counter"), Some(Value::Int(105)));
+        // log: [] ++ ["msg1"] = ["msg1"] (Append strategy)
+        assert_eq!(parent.get("log"), Some(Value::List(vec![Value::String("msg1".into())])));
+        // name: LWW → child wins (not in strategies map)
+        assert_eq!(parent.get("name"), Some(Value::String("bob".into())));
+        // new_key: new binding, defined directly
+        assert_eq!(parent.get("new_key"), Some(Value::Int(42)));
+    }
+
+    // ─── VectorClock tests ───────────────────────────────────────
+
+    #[test]
+    fn vector_clock_tick_increments() {
+        let mut c = VectorClock::default();
+        c.tick("agent-a");
+        c.tick("agent-a");
+        c.tick("agent-b");
+        assert_eq!(c.entries.get("agent-a"), Some(&2));
+        assert_eq!(c.entries.get("agent-b"), Some(&1));
+    }
+
+    #[test]
+    fn vector_clock_merge_takes_max() {
+        let mut a = VectorClock::default();
+        a.tick("x"); // x=1
+        let mut b = VectorClock::default();
+        b.tick("y"); // y=1
+        b.tick("x");
+        b.tick("x"); // x=2
+        a.merge(&b);
+        assert_eq!(a.entries.get("x"), Some(&2)); // max(1,2)=2
+        assert_eq!(a.entries.get("y"), Some(&1)); // max(0,1)=1
+    }
+
+    #[test]
+    fn vector_clock_happened_before() {
+        let mut a = VectorClock::default();
+        a.tick("x"); // {x:1}
+        let mut b = a.clone();
+        b.tick("x"); // {x:2}
+        // a happened-before b: a[x]=1 ≤ b[x]=2, and strict
+        assert!(VectorClock::happened_before(&a, &b));
+        assert!(!VectorClock::happened_before(&b, &a));
+    }
+
+    #[test]
+    fn vector_clock_concurrent_detection() {
+        let mut a = VectorClock::default();
+        a.tick("x"); // {x:1}
+        let mut b = VectorClock::default();
+        b.tick("y"); // {y:1}
+        // Neither happened-before the other
+        assert!(VectorClock::concurrent(&a, &b));
+        assert!(!VectorClock::happened_before(&a, &b));
+        assert!(!VectorClock::happened_before(&b, &a));
+    }
+
+    #[test]
+    fn vector_clock_equal_is_not_concurrent() {
+        let mut a = VectorClock::default();
+        a.tick("x");
+        let b = a.clone();
+        // Equal clocks: not concurrent (happened-before requires strict <)
+        assert!(!VectorClock::concurrent(&a, &b));
+    }
+
+    #[test]
+    fn vector_clock_empty_is_not_concurrent() {
+        let a = VectorClock::default();
+        let mut b = VectorClock::default();
+        b.tick("x");
+        // Empty clock is trivially ≤ any other clock
+        assert!(!VectorClock::concurrent(&a, &b));
+    }
+
+    #[test]
+    fn vector_clock_to_from_dict_roundtrip() {
+        let mut c = VectorClock::default();
+        c.tick("agent-a");
+        c.tick("agent-a");
+        c.tick("agent-b");
+        let dict = c.to_dict();
+        let restored = VectorClock::from_dict(&dict);
+        assert_eq!(c, restored);
+        assert_eq!(restored.entries.get("agent-a"), Some(&2));
+        assert_eq!(restored.entries.get("agent-b"), Some(&1));
+    }
+
+    #[test]
+    fn vector_clock_from_dict_handles_empty() {
+        let dict: HashMap<String, Value> = HashMap::new();
+        let c = VectorClock::from_dict(&dict);
+        assert!(c.is_empty());
     }
 }

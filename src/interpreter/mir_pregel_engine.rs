@@ -8,22 +8,43 @@
 //!
 //! Batch D3 将切换调用方；D4 删除旧 `orchestrate_v2::PregelEngine`。
 //!
+//! # Versioning Systems (v0.65)
+//!
+//! This module uses two complementary version-tracking mechanisms:
+//!
+//! - **`channel_versions`** (per-channel `u64`): Monotonic write counter for
+//!   delta-input construction. Answers "has channel X been written since node Y
+//!   last looked?" Used by `build_node_input()`. Checkpointed via `Checkpoint`.
+//!
+//! - **`Environment::versions`** (per-binding `VectorClock`): Causal ordering
+//!   for write-write conflict detection. Answers "did agents A and B modify
+//!   this key concurrently?" Used by `merge_from_with_strategies()`. NOT
+//!   checkpointed (derived from agent execution, not persisted).
+//!
+//! These systems track different things and are intentionally separate.
+//! `channel_versions` is a change-detection mechanism; `VectorClock` is a
+//! causal-ordering mechanism. Do not unify them.
+//!
 //! 当前为骨架（Batch D2）：定义结构 + 接口，内部逻辑先用 TODO 标记。
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::checkpoint::{Checkpoint, SendTask};
+use crate::checkpoint::{Checkpoint, CheckpointSaver, SendTask};
 use crate::interpreter::Interpreter;
 use crate::mir::expr::{
     MirAgentDef, MirEdgeDef, MirInterruptPoint, MirInterruptWhen, MirPregelConfig,
     MirReducerKind, MirStateChannel,
 };
 use crate::mir::MirFunction;
-use crate::value::Value;
+use crate::value::{Conflict, MergeStrategy, Value};
 
 /// Interrupt 回调签名
 pub type MirInterruptCallback = Arc<dyn Fn(&str, MirInterruptWhen) -> bool>;
+
+/// v0.62: Conflict callback — invoked for each detected write-write conflict.
+/// Return `true` to continue the BSP run, `false` to abort.
+pub type MirConflictCallback = Arc<dyn Fn(&Conflict) -> bool>;
 
 /// Pregel 引擎 BSP 循环状态
 pub struct MirPregelEngine {
@@ -37,9 +58,18 @@ pub struct MirPregelEngine {
 
     pending_sends: Vec<SendTask>,
 
+    /// v0.61: Concurrent write-write conflicts detected during BSP execution.
+    pub conflicts: Vec<Conflict>,
+
     max_steps: usize,
     interrupt_before: Option<MirInterruptCallback>,
     interrupt_after: Option<MirInterruptCallback>,
+    /// v0.62: Invoked for each write-write conflict detected during merge.
+    conflict_callback: Option<MirConflictCallback>,
+    /// v0.63: Current super-step (for checkpoint/restore).
+    pub current_step: usize,
+    /// v0.64: Optional checkpoint persistence backend.
+    saver: Option<Arc<dyn CheckpointSaver>>,
 }
 
 impl MirPregelEngine {
@@ -64,9 +94,13 @@ impl MirPregelEngine {
             channel_versions: HashMap::new(),
             versions_seen: HashMap::new(),
             pending_sends: Vec::new(),
+            conflicts: Vec::new(),
             max_steps: 1000,
             interrupt_before: None,
             interrupt_after: None,
+            conflict_callback: None,
+            current_step: 0,
+            saver: None,
         }
     }
 
@@ -82,6 +116,19 @@ impl MirPregelEngine {
 
     pub fn with_interrupt_after_callback(mut self, cb: MirInterruptCallback) -> Self {
         self.interrupt_after = Some(cb);
+        self
+    }
+
+    /// v0.62: Set a callback invoked for each detected write-write conflict.
+    /// Return `true` to continue, `false` to abort the BSP run.
+    pub fn with_conflict_callback(mut self, cb: MirConflictCallback) -> Self {
+        self.conflict_callback = Some(cb);
+        self
+    }
+
+    /// v0.64: Set a checkpoint saver for auto-persistence.
+    pub fn with_checkpoint_saver(mut self, saver: Arc<dyn CheckpointSaver>) -> Self {
+        self.saver = Some(saver);
         self
     }
 
@@ -103,10 +150,11 @@ impl MirPregelEngine {
 pub fn run(&mut self, interpreter: &mut Interpreter) -> Result<Value, String> {
         use std::collections::HashSet;
 
-        let mut step: usize = 0;
+        // v0.63: current_step is initialized in new() and may be set by restore_checkpoint.
+        // Do NOT reset to 0 here — that would negate checkpoint restore.
         let mut active_nodes: Vec<String> = vec!["@start".to_string()];
 
-        while !active_nodes.is_empty() && step < self.max_steps {
+        while !active_nodes.is_empty() && self.current_step < self.max_steps {
             // ---------- 1. PLAN ----------
             let mut to_execute: Vec<String> = Vec::new();
             for node in &active_nodes {
@@ -181,8 +229,32 @@ pub fn run(&mut self, interpreter: &mut Interpreter) -> Result<Value, String> {
                 }
 
                 let mut env = interpreter.core.environment.lock().clone();
+                // v0.61: Tick vector clock for this agent
+                env.clock.tick(node_name);
                 let result = crate::mir::interp::run_mir(&agent.task_body, interpreter, &mut env)
                     .map_err(|e| format!("Pregel node '{}': {}", node_name, e))?;
+
+                // v0.60: Merge agent environment back into shared environment.
+                // Uses per-channel reducer strategies for conflict resolution.
+                // v0.61: Collects write-write conflicts detected via vector clocks.
+                let strategies = self.build_per_key_strategies();
+                let conflicts = interpreter.core.environment.lock()
+                    .merge_from_with_strategies(&env, &strategies, &MergeStrategy::LastWriteWins);
+                #[allow(clippy::collapsible_if)]
+                if !conflicts.is_empty() {
+                    // v0.62: Invoke conflict callback (if set)
+                    if let Some(cb) = &self.conflict_callback {
+                        for conflict in &conflicts {
+                            if !cb(conflict) {
+                                return Err(format!(
+                                    "Pregel: conflict callback aborted at key '{}' (node '{}')",
+                                    conflict.key, node_name
+                                ));
+                            }
+                        }
+                    }
+                    self.conflicts.extend(conflicts);
+                }
 
                 // 简单解析：result 是值时写入 result 通道
                 let result_str = result.to_string();
@@ -214,7 +286,20 @@ pub fn run(&mut self, interpreter: &mut Interpreter) -> Result<Value, String> {
 
             // ---------- 4. ADVANCE ----------
             active_nodes = next_active.into_iter().collect();
-            step += 1;
+            self.current_step += 1;
+
+            // v0.63: Auto-save checkpoint if configured
+            if let Some(ref cp_cfg) = self.config.checkpoint {
+                if let Some(interval) = cp_cfg.interval {
+                    if self.current_step % interval as usize == 0 {
+                        let cp = self.build_checkpoint();
+                        if let Some(ref saver) = self.saver {
+                            let thread_id = cp.thread_id.clone();
+                            saver.save(&thread_id, &cp)?;
+                        }
+                    }
+                }
+            }
         }
 
         // 返回 result 通道
@@ -243,12 +328,12 @@ pub fn run(&mut self, interpreter: &mut Interpreter) -> Result<Value, String> {
         }
     }
 
-    /// 应用写入 — 通过 MirReducerKind
+    /// 应用写入 — 通过 Value::merge() 统一 CRDT 路径
     pub fn apply_write(
         &mut self,
         channel: String,
         value: Value,
-        _interpreter: &mut Interpreter,
+        interpreter: &mut Interpreter,
     ) -> Result<(), String> {
         let reducer = self
             .state_reducers
@@ -257,54 +342,64 @@ pub fn run(&mut self, interpreter: &mut Interpreter) -> Result<Value, String> {
             .unwrap_or(MirReducerKind::Last);
 
         let current = self.channels.get(&channel).cloned();
-        let new_value = match reducer {
-            MirReducerKind::Last => value,
-            MirReducerKind::Append => {
-                let mut list = match current {
-                    Some(Value::List(l)) => l,
-                    _ => Vec::new(),
-                };
-                list.push(value);
-                Value::List(list)
-            }
-            MirReducerKind::Add => {
-                let cur_num = match &current {
-                    Some(Value::Float(n)) => *n,
-                    Some(Value::Int(n)) => *n as f64,
-                    _ => 0.0,
-                };
-                let new_num = match &value {
-                    Value::Float(n) => *n,
-                    Value::Int(n) => *n as f64,
-                    _ => {
-                        return Err(format!(
-                            "Pregel @add reducer expects number, got {:?}",
-                            value
-                        ));
-                    }
-                };
-                Value::Float(cur_num + new_num)
-            }
-            MirReducerKind::Merge(_merge_expr) => {
-                // v0.57: merge body stored in MirExpr — TODO 实际调用 run_mir(body, ...)
-                current.unwrap_or(value)
-            }
-            // v0.57: 其他 reducer 类型当前未在 V3 pipeline 触发
-            MirReducerKind::Sum | MirReducerKind::Product | MirReducerKind::Concat => {
-                return Err(format!(
-                    "Pregel reducer {:?} not yet implemented in MIR-native engine",
-                    reducer
-                ));
-            }
-            MirReducerKind::Custom(_) => {
-                // v0.57: Custom reducer 暂走 Last 行为
-                value
-            }
+
+        // Pregel Append: accumulate individual writes into a list.
+        // Different from MergeStrategy::Append which extends two lists.
+        if reducer == MirReducerKind::Append {
+            let mut list = match current {
+                Some(Value::List(l)) => l,
+                Some(v) => vec![v],
+                None => Vec::new(),
+            };
+            list.push(value);
+            let new_value = Value::List(list);
+            self.channels.insert(channel.clone(), new_value);
+            *self.channel_versions.entry(channel).or_insert(0) += 1;
+            return Ok(());
+        }
+
+        let new_value = match reducer.to_merge_strategy() {
+            Some(strategy) => match current {
+                Some(cur) => Value::merge(cur, value, &strategy),
+                None => value,
+            },
+            None => match reducer {
+                MirReducerKind::Merge(merge_expr) => {
+                    // v0.62: Execute the merge body with `current` and `incoming`.
+                    let merge_fn = crate::mir::lower::lower_mir_exprs(&[merge_expr.clone()])
+                        .map_err(|e| format!("Pregel merge body lowering failed: {}", e))?;
+                    let mut merge_env = interpreter.core.environment.lock().clone();
+                    merge_env.define("current".into(), current.unwrap_or(Value::Nil), false);
+                    merge_env.define("incoming".into(), value, false);
+                    crate::mir::interp::run_mir(&merge_fn, interpreter, &mut merge_env)
+                        .map_err(|e| format!("Pregel merge body execution failed: {}", e))?
+                }
+                MirReducerKind::Sum | MirReducerKind::Product | MirReducerKind::Concat => {
+                    return Err(format!(
+                        "Pregel reducer {:?} not yet implemented in MIR-native engine",
+                        reducer
+                    ));
+                }
+                MirReducerKind::Custom(_) => value,
+                // Static reducers already handled by to_merge_strategy() above
+                _ => value,
+            },
         };
 
         self.channels.insert(channel.clone(), new_value);
         *self.channel_versions.entry(channel).or_insert(0) += 1;
         Ok(())
+    }
+
+    /// v0.60: Build per-key merge strategies from state schema.
+    pub fn build_per_key_strategies(&self) -> HashMap<String, MergeStrategy> {
+        let mut map = HashMap::new();
+        for channel in &self.config.state_schema {
+            if let Some(strategy) = channel.reducer.to_merge_strategy() {
+                map.insert(channel.name.clone(), strategy);
+            }
+        }
+        map
     }
 
     /// 收集指定节点的中断点
@@ -323,12 +418,15 @@ pub fn run(&mut self, interpreter: &mut Interpreter) -> Result<Value, String> {
             .collect()
     }
 
-    /// 构建 checkpoint 快照
-    pub fn build_checkpoint(&self, step: usize) -> Checkpoint {
-        // v0.57: 从 state 构造 Checkpoint
+    /// v0.63: Build a checkpoint snapshot of current engine state.
+    pub fn build_checkpoint(&self) -> Checkpoint {
+        let thread_id = self.config.checkpoint.as_ref()
+            .and_then(|c| c.thread_id.as_ref())
+            .map(|_| "pregel")  // MirExpr evaluation deferred; use config presence as signal
+            .unwrap_or("default");
         Checkpoint::new(
-            "default".to_string(),
-            step,
+            thread_id.to_string(),
+            self.current_step,
             self.channels.clone(),
             self.channel_versions.clone(),
             self.versions_seen.clone(),
@@ -337,8 +435,13 @@ pub fn run(&mut self, interpreter: &mut Interpreter) -> Result<Value, String> {
     }
 
     /// 从 checkpoint 恢复
-    pub fn restore_checkpoint(&mut self, _cp: &Checkpoint) {
-        // TODO: 从 cp 恢复 channels/channel_versions
+    /// v0.63: Restore engine state from a checkpoint.
+    pub fn restore_checkpoint(&mut self, cp: &Checkpoint) {
+        self.channels = cp.channel_values.clone();
+        self.channel_versions = cp.channel_versions.clone();
+        self.versions_seen = cp.versions_seen.clone();
+        self.pending_sends = cp.pending_sends.clone();
+        self.current_step = cp.step;
     }
 
     /// 访问 config（用于测试与序列化）

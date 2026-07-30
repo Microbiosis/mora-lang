@@ -499,10 +499,14 @@ impl ParserV3 {
         })
     }
 
-    /// Peek at current token and check if it's an Identifier with the given name.
+    /// Peek at current token and check if it matches the given name.
+    /// Works for both regular Identifier tokens and reserved-word tokens.
     fn peek_is_identifier(&self, name: &str) -> bool {
         self.peek()
-            .map(|t| matches!(&t.token_type, TokenType::Identifier(s) if s == name))
+            .map(|t| {
+                matches!(&t.token_type, TokenType::Identifier(s) if s == name)
+                    || token_to_identifier_name(&t.token_type) == Some(name)
+            })
             .unwrap_or(false)
     }
 
@@ -723,7 +727,8 @@ impl ParserV3 {
                 None
             };
 
-            // Optional 'end' terminator
+            // Optional 'end' terminator (skip any intermediate newlines)
+            while self.match_token(&[TokenType::Newline]) {}
             let _ = self.match_token(&[TokenType::End]);
 
             return Some(MirExpr::if_else(cond, then_branch, else_branch, expr_span));
@@ -1141,6 +1146,16 @@ impl ParserV3 {
                     self.span_of_current(),
                 );
             }
+            // v0.58: static dispatch / namespace qualification — `Type::method(args)`
+            else if self.match_token_exact(TokenType::ColonColon) {
+                let method_name = self.consume_identifier("Expected method name after '::'")?;
+                // Form qualified name "McpServer::new" — the interpreter dispatches
+                // on the full qualified name as a single callable.
+                let old_name = match_to_string(&callee);
+                let qualified = format!("{}::{}", old_name, method_name);
+                callee = MirExpr::var(qualified, self.span_of_current());
+                // Continue loop: next token `(` will be handled as a function call.
+            }
             // Indexing: array[index] or dict[key]
             else if self.check(&TokenType::LBracket) {
                 self.advance(); // consume '['
@@ -1272,7 +1287,8 @@ impl ParserV3 {
             // Keywords and other constructs
             TokenType::Fn => {
                 self.advance();
-                // Closure: fn(params) => body
+                // Closure: fn(params) => body       (expression body)
+                //          fn(params) body end      (block body)
                 if !self.match_token_exact(TokenType::LParen) {
                     eprintln!(
                         "Parse error: Expected '(' after 'fn' at line {}",
@@ -1294,15 +1310,18 @@ impl ParserV3 {
                     }
                 }
                 self.consume(TokenType::RParen, "Expected ')' after parameters")?;
-                if !self.match_token_exact(TokenType::FatArrow) {
-                    eprintln!(
-                        "Parse error: Expected '=>' after closure params at line {}",
-                        self.current_line()
-                    );
-                    return None;
+
+                // v0.58: support both `=> expr` (FatArrow) and block body
+                if self.match_token_exact(TokenType::FatArrow) {
+                    // Expression body: fn(params) => body
+                    let body = self.parse_assignment()?;
+                    Some(MirExpr::closure(params, body, span))
+                } else {
+                    // Block body: fn(params) body end
+                    let body = self.parse_block_body()?;
+                    self.consume(TokenType::End, "Expected 'end' after closure body")?;
+                    Some(MirExpr::closure(params, body, span))
                 }
-                let body = self.parse_assignment()?;
-                Some(MirExpr::closure(params, body, span))
             }
             _ => None,
         }
@@ -1640,6 +1659,16 @@ impl ParserV3 {
                 self.advance();
                 Some(name)
             }
+            // v0.58: accept reserved-word tokens that are valid in identifier
+            // positions (method names, variable names after `.` or `::`).
+            Some(ref tok) => {
+                if let Some(name) = token_to_identifier_name(&tok.token_type) {
+                    self.advance();
+                    return Some(name.to_string());
+                }
+                eprintln!("Parse error: {} at line {}", message, self.current_line());
+                None
+            }
             _ => {
                 eprintln!("Parse error: {} at line {}", message, self.current_line());
                 None
@@ -1697,6 +1726,100 @@ impl std::fmt::Display for ParseError {
 }
 
 impl std::error::Error for ParseError {}
+
+/// v0.58: map reserved-word tokens back to their identifier strings.
+/// This is needed because the lexer tokenizes `tool`, `task`, etc. as
+/// dedicated token types, but they can appear in identifier positions
+/// (method names, variable references after `.` or `::`).
+fn token_to_identifier_name(tt: &TokenType) -> Option<&'static str> {
+    match tt {
+        TokenType::Tool => Some("tool"),
+        TokenType::Task => Some("task"),
+        TokenType::Fn => Some("fn"),
+        TokenType::Let => Some("let"),
+        TokenType::If => Some("if"),
+        TokenType::Then => Some("then"),
+        TokenType::Match => Some("match"),
+        TokenType::Return => Some("return"),
+        TokenType::For => Some("for"),
+        TokenType::Break => Some("break"),
+        TokenType::Continue => Some("continue"),
+        TokenType::End => Some("end"),
+        TokenType::In => Some("in"),
+        TokenType::WithKeyword => Some("with"),
+        TokenType::Import => Some("import"),
+        TokenType::Type => Some("type"),
+        TokenType::Enum => Some("enum"),
+        TokenType::Struct => Some("struct"),
+        TokenType::Macro => Some("macro"),
+        TokenType::Impl => Some("impl"),
+        TokenType::Trait => Some("trait"),
+        TokenType::Skill => Some("skill"),
+        TokenType::Worker => Some("worker"),
+        TokenType::Send => Some("send"),
+        TokenType::Receive => Some("receive"),
+        TokenType::Observe => Some("observe"),
+        TokenType::Transaction => Some("transaction"),
+        TokenType::Rollback => Some("rollback"),
+        TokenType::Commit => Some("commit"),
+        TokenType::Eval => Some("eval"),
+        TokenType::Stream => Some("stream"),
+        TokenType::Span => Some("span"),
+        TokenType::Loop => Some("loop"),
+        TokenType::Orchestrate => Some("orchestrate"),
+        TokenType::Prompt => Some("prompt"),
+        TokenType::Resume => Some("resume"),
+        TokenType::Rewind => Some("rewind"),
+        TokenType::Save => Some("save"),
+        TokenType::Load => Some("load"),
+        TokenType::Read => Some("read"),
+        TokenType::Write => Some("write"),
+        TokenType::Append => Some("append"),
+        TokenType::ReadBytes => Some("read_bytes"),
+        TokenType::WriteBytes => Some("write_bytes"),
+        TokenType::Trace => Some("trace"),
+        TokenType::Metrics => Some("metrics"),
+        TokenType::Route => Some("route"),
+        TokenType::Map => Some("map"),
+        TokenType::Reduce => Some("reduce"),
+        TokenType::State => Some("state"),
+        TokenType::Channel => Some("channel"),
+        TokenType::Thread => Some("thread"),
+        TokenType::Dynamic => Some("dynamic"),
+        TokenType::Merge => Some("merge"),
+        TokenType::Update => Some("update"),
+        TokenType::Tags => Some("tags"),
+        TokenType::Expect => Some("expect"),
+        TokenType::Tolerance => Some("tolerance"),
+        TokenType::Into => Some("into"),
+        TokenType::Export => Some("export"),
+        TokenType::Otel => Some("otel"),
+        TokenType::Record => Some("record"),
+        TokenType::Goto => Some("goto"),
+        TokenType::As => Some("as"),
+        TokenType::Where => Some("where"),
+        TokenType::Do => Some("do"),
+        TokenType::Node => Some("node"),
+        TokenType::Edges => Some("edges"),
+        TokenType::Parallel => Some("parallel"),
+        TokenType::FanIn => Some("fan_in"),
+        TokenType::FanOut => Some("fan_out"),
+        TokenType::MaxRounds => Some("max_rounds"),
+        TokenType::Rounds => Some("rounds"),
+        TokenType::Checkpoint => Some("checkpoint"),
+        TokenType::Interrupt => Some("interrupt"),
+        TokenType::ExitWhen => Some("exit_when"),
+        TokenType::Before => Some("before"),
+        TokenType::After => Some("after"),
+        TokenType::Last => Some("last"),
+        TokenType::Command => Some("command"),
+        TokenType::Document => Some("document"),
+        TokenType::Dyn => Some("dyn"),
+        TokenType::Compensation => Some("compensation"),
+        TokenType::Jit => Some("jit"),
+        _ => None,
+    }
+}
 
 // Helper function to convert MirExpr to string (for method name generation)
 fn match_to_string(expr: &MirExpr) -> String {

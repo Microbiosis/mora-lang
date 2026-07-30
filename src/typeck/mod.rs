@@ -25,6 +25,10 @@
 // v0.55: typeck V2 模块 (mod check, mod pregel_check) 已删除。
 // 类型检查的唯一入口: `check_program_mir` (mod check_mir)。
 
+pub mod check_mir;
+pub mod dispatch;
+pub mod hm;
+
 use std::collections::{HashMap, HashSet};
 
 // v1 AST types no longer imported — all v2 paths use ast_v2 / common
@@ -110,6 +114,8 @@ pub enum Type {
     PromptSection,
     /// v0.27: Document unified IR (Arc<dyn DocumentBackend>)
     Document,
+    /// v0.55: HM type variable (char key, fresh in inference, unified during solve)
+    TypeVar(char),
 } // ← close pub enum Type
 
 impl Type {
@@ -151,6 +157,7 @@ impl Type {
             Type::Macro => "macro".to_string(),
             Type::PromptSection => "prompt_section".to_string(),
             Type::Document => "document".to_string(),
+            Type::TypeVar(c) => format!("'{}", c),
             // v0.13: Union 类型显示为 "T1 | T2 | T3"
             Type::Union(members) => {
                 if members.is_empty() {
@@ -1032,8 +1039,6 @@ fn type_to_hint_string(ty: &Type) -> String {
 // v0.55: MirExpr-based type checking (V3 pipeline)
 // ===================================================================
 
-/// 对 MirExpr 列表执行类型检查（占位：返回空错误列表）
-pub fn check_program_mir(_exprs: &[crate::mir::expr::MirExpr]) -> Vec<TypeError> {
-    // TODO: implement HM type inference on MirExpr tree
-    vec![]
-}
+// Re-exported from `check_mir` — the single entry point for HM inference.
+pub use check_mir::check_program_mir;
+pub use check_mir::check_program_mir_with_types;

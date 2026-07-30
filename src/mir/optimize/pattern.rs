@@ -15,16 +15,24 @@ use crate::value::Value;
 ///
 /// 每种 pattern 描述一类指令结构。例如：
 /// - `Const { dst, value }` 匹配 `MirInst::Const(dst, value)`
+/// - `ConstBool { dst, value }` 匹配 `MirInst::Const(dst, Bool(v))`
 /// - `BinaryOp { dst, op, lhs, rhs }` 匹配 `MirInst::BinaryOp(dst, lhs, op, rhs)`
 /// - `Jump { target }` 匹配 `MirInst::Jump(target)`
+/// - `Call { dst, name }` 匹配 `MirInst::Call(dst, name, _)`
+/// - `Label { target }` 匹配 `MirInst::Label(target)`
 #[derive(Debug, Clone, PartialEq)]
 pub enum MirPattern {
     /// 匹配任意指令（用于 body-level pass 如 DeadAfterReturn）
     Any,
-    /// `MirInst::Const(dst, value)`
+    /// `MirInst::Const(dst, value)` — 匹配任意常量
     Const {
         dst: RegMatcher,
         value: ValueMatcher,
+    },
+    /// `MirInst::Const(dst, Bool(v))` — 专门匹配布尔常量
+    ConstBool {
+        dst: RegMatcher,
+        value: bool,
     },
     /// `MirInst::BinaryOp(dst, lhs, op, rhs)`
     BinaryOp {
@@ -47,6 +55,14 @@ pub enum MirPattern {
     },
     /// `MirInst::Return(value)` — `value` 为 `Option<Reg>`
     Return { value: RegOptMatcher },
+    /// `MirInst::Call(dst, name, args)` — 函数调用
+    Call {
+        dst: RegMatcher,
+        name: CallNameMatcher,
+        args: RegsMatcher,
+    },
+    /// `MirInst::Label(target)` — 基本块边界标记
+    Label { target: LabelMatcher },
 }
 
 /// Match 模式：捕获变量绑定
@@ -185,6 +201,24 @@ pub enum OpMatcher {
     Exact(BinaryOp),
 }
 
+/// Call name matcher — 匹配调用目标名称
+#[derive(Debug, Clone, PartialEq)]
+pub enum CallNameMatcher {
+    /// 匹配任意函数名（不绑定）
+    Any,
+    /// 匹配并绑定为 name
+    Bind(String),
+    /// 匹配特定函数名（精确比较）
+    Exact(String),
+}
+
+/// Regs matcher — 匹配寄存器列表（用于 Call args）
+#[derive(Debug, Clone, PartialEq)]
+pub enum RegsMatcher {
+    /// 匹配任意参数列表
+    Any,
+}
+
 /// Pattern matching trait
 pub trait Match {
     /// 尝试匹配一条 MIR 指令，返回 Some(bindings) 或 None
@@ -196,6 +230,16 @@ impl Match for MirPattern {
         match (self, inst) {
             // Any: 匹配任意指令（用于 body-pass 规则如 DeadAfterReturn）
             (MirPattern::Any, _) => Some(MatchBindings::new()),
+            (
+                MirPattern::ConstBool { dst: dst_m, value },
+                MirInst::Const(dst, Value::Bool(v)),
+            ) if *v == *value => {
+                let mut b = MatchBindings::new();
+                if let Some(name) = dst_m.match_and_bind(*dst) {
+                    b.insert(name, BindingValue::Reg(*dst));
+                }
+                Some(b)
+            }
             (
                 MirPattern::Const {
                     dst: dst_m,
@@ -273,6 +317,30 @@ impl Match for MirPattern {
                 }
                 Some(b)
             }
+            (
+                MirPattern::Call {
+                    dst: dst_m,
+                    name: name_m,
+                    args: _args_m,
+                },
+                MirInst::Call(dst, name, _args),
+            ) => {
+                let mut b = MatchBindings::new();
+                if let Some(n) = dst_m.match_and_bind(*dst) {
+                    b.insert(n, BindingValue::Reg(*dst));
+                }
+                if let Some(n) = name_m.match_and_bind(name) {
+                    b.insert(n, BindingValue::Value(Value::String(name.clone())));
+                }
+                Some(b)
+            }
+            (MirPattern::Label { target: t_m }, MirInst::Label(target)) => {
+                let mut b = MatchBindings::new();
+                if let Some(name) = t_m.match_and_bind(*target) {
+                    b.insert(name, BindingValue::Label(*target));
+                }
+                Some(b)
+            }
             _ => None,
         }
     }
@@ -325,6 +393,26 @@ impl OpMatcher {
             OpMatcher::Bind(name) => Some(name.clone()),
             OpMatcher::Exact(o) if o == op => None,
             OpMatcher::Exact(_) => None,
+        }
+    }
+}
+
+impl CallNameMatcher {
+    fn match_and_bind(&self, name: &str) -> Option<String> {
+        match self {
+            CallNameMatcher::Any => None,
+            CallNameMatcher::Bind(n) => Some(n.clone()),
+            CallNameMatcher::Exact(n) if n == name => None,
+            CallNameMatcher::Exact(_) => None,
+        }
+    }
+}
+
+impl RegsMatcher {
+    #[allow(unused)]
+    fn match_and_bind(&self, _args: &[Reg]) -> Option<String> {
+        match self {
+            RegsMatcher::Any => None,
         }
     }
 }

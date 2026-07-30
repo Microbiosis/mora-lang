@@ -46,6 +46,22 @@ pub fn greedy_search(
     let mut applied_rules: Vec<String> = Vec::new();
     let mut iterations = 0;
 
+    // Phase H.5 optimization: pre-truncate dead code after the last Return.
+    // This runs in O(n) once instead of O(n²) via the rule scan loop.
+    if let Some(last_return) = current
+        .iter()
+        .rposition(|i| matches!(i, MirInst::Return(_)))
+    {
+        if last_return + 1 < current.len() {
+            current.truncate(last_return + 1);
+            applied_rules.push(format!(
+                "dead_after_return (pre-truncated {} insts)",
+                current.len().saturating_sub(last_return + 1)
+            ));
+            current_cost = cost.body_cost(&current);
+        }
+    }
+
     while iterations < max_iter {
         iterations += 1;
         let mut best: Option<(usize, String, u32, Vec<MirInst>)> = None; // (pc, rule, gain, new_insts)

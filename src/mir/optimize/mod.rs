@@ -53,13 +53,18 @@
 //! 见 `pattern.rs::RegMatcher` / `ssa_pattern.rs::SsaRegMatcher` 注释中的 TODO 标记。
 
 pub mod cost;
+pub mod dag_rule;
+pub mod dag_search;
 pub mod pattern;
 pub mod rule;
 pub mod search;
 pub mod ssa_pattern;
 
 use crate::mir::MirFunction;
-use crate::mir::optimize::cost::InstructionCount;
+use crate::mir::dag::MirDag;
+use crate::mir::optimize::cost::TokenEstimate;
+use crate::mir::optimize::dag_rule::{AlgebraicSimplifyDagRule, ConstFoldingDagRule, CseDagRule, DeadNodeDagRule, DagRewriteRule};
+use crate::mir::optimize::dag_search::dag_search_staged;
 use crate::mir::optimize::rule::builtin_rules;
 use crate::mir::optimize::search::greedy_search;
 
@@ -68,7 +73,7 @@ use crate::mir::optimize::search::greedy_search;
 /// 使用内置规则库 + 默认 cost model，贪心搜索最多 50 轮。
 pub fn apply_rules(func: &mut MirFunction) {
     let rules = builtin_rules();
-    let cost = InstructionCount;
+    let cost = TokenEstimate;
     let result = greedy_search(&func.body, &rules, &cost, 50);
     func.body = result.body;
     func.n_regs = func.n_regs.max(
@@ -90,4 +95,25 @@ pub fn apply_rules(func: &mut MirFunction) {
             }
         }).max().unwrap_or(0),
     );
+}
+
+/// v0.60: Staged DAG-level optimization pass.
+///
+/// Rules are grouped into four stages, applied in order:
+/// 1. Algebraic simplification — cheap, enables further folding
+/// 2. Constant folding — eliminates known computation
+/// 3. Common subexpression elimination — removes duplicates
+/// 4. Dead node removal — cleanup
+///
+/// Dirty-tracking ensures only nodes whose inputs changed are re-checked.
+/// Convergence: outer loop repeats until no stage produces a change.
+pub fn dag_optimize(dag: &mut MirDag) {
+    let stages: Vec<Vec<Box<dyn DagRewriteRule>>> = vec![
+        vec![Box::new(AlgebraicSimplifyDagRule)],
+        vec![Box::new(ConstFoldingDagRule)],
+        vec![Box::new(CseDagRule)],
+        vec![Box::new(DeadNodeDagRule)],
+    ];
+    let cost = TokenEstimate;
+    dag_search_staged(dag, &stages, &cost);
 }

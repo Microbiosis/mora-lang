@@ -4,6 +4,7 @@
 
 use crate::mir::MirInst;
 use crate::mir::optimize::pattern::{Match, MatchBindings, MirPattern};
+use crate::value::Value;
 
 /// 重写规则 trait
 ///
@@ -60,10 +61,51 @@ pub trait RewriteRule {
 }
 
 /// 规则库 — 集中管理所有规则
+
+/// Phase H.6: If 简化 — 常量条件的 JumpIf/JumpIfNot 折叠
+pub struct IfSimplifyRule;
+
+impl RewriteRule for IfSimplifyRule {
+    fn name(&self) -> &'static str { "if_simplify" }
+    fn pattern(&self) -> &MirPattern { &IF_SIMPLIFY_PATTERN }
+
+    fn rewrite_with_context(
+        &self, inst: &MirInst, _bindings: &MatchBindings,
+        pc: usize, body: &[MirInst], _ctx: &dyn std::any::Any,
+    ) -> Vec<MirInst> {
+        let (cond_reg, target, is_not) = match inst {
+            MirInst::JumpIf(cond, t) => (*cond, *t, false),
+            MirInst::JumpIfNot(cond, t) => (*cond, *t, true),
+            _ => return vec![inst.clone()],
+        };
+        let const_val = body[..pc].iter().rev().find_map(|prev| {
+            if let MirInst::Const(r, Value::Bool(v)) = prev {
+                if *r == cond_reg { return Some(*v); }
+            }
+            None
+        });
+        match const_val {
+            Some(true) if !is_not => vec![MirInst::Jump(target)],
+            Some(false) if !is_not => Vec::new(),
+            Some(true) if is_not => Vec::new(),
+            Some(false) if is_not => vec![MirInst::Jump(target)],
+            _ => vec![inst.clone()],
+        }
+    }
+
+    fn cost_gain(&self) -> i32 { 2 }
+}
+
+static IF_SIMPLIFY_PATTERN: MirPattern = MirPattern::JumpIf {
+    cond: crate::mir::optimize::pattern::RegMatcher::Any,
+    target: crate::mir::optimize::pattern::LabelMatcher::Any,
+};
+
 pub fn builtin_rules() -> Vec<Box<dyn RewriteRule>> {
     vec![
         Box::new(ConstFoldingRule),
         Box::new(RedundantJumpRule),
+        Box::new(IfSimplifyRule),
         Box::new(DeadAfterReturnRule),
     ]
 }
@@ -278,10 +320,11 @@ mod tests {
     #[test]
     fn test_builtin_rules_contains_three() {
         let rules = builtin_rules();
-        assert_eq!(rules.len(), 3, "const_folding + redundant_jump + dead_after_return");
+        assert_eq!(rules.len(), 4, "const_folding + redundant_jump + if_simplify + dead_after_return");
         let names: Vec<&str> = rules.iter().map(|r| r.name()).collect();
         assert!(names.contains(&"const_folding"));
         assert!(names.contains(&"redundant_jump"));
+        assert!(names.contains(&"if_simplify"));
         assert!(names.contains(&"dead_after_return"));
     }
 

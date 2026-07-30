@@ -35,6 +35,16 @@ pub enum MirPattern {
     },
     /// `MirInst::Jump(target)`
     Jump { target: LabelMatcher },
+    /// `MirInst::JumpIf(cond_reg, target)`
+    JumpIf {
+        cond: RegMatcher,
+        target: LabelMatcher,
+    },
+    /// `MirInst::JumpIfNot(cond_reg, target)`
+    JumpIfNot {
+        cond: RegMatcher,
+        target: LabelMatcher,
+    },
     /// `MirInst::Return(value)` — `value` 为 `Option<Reg>`
     Return { value: RegOptMatcher },
 }
@@ -228,6 +238,26 @@ impl Match for MirPattern {
             }
             (MirPattern::Jump { target: t_m }, MirInst::Jump(target)) => {
                 let mut b = MatchBindings::new();
+                if let Some(name) = t_m.match_and_bind(*target) {
+                    b.insert(name, BindingValue::Label(*target));
+                }
+                Some(b)
+            }
+            (MirPattern::JumpIf { cond: c_m, target: t_m }, MirInst::JumpIf(cond, target)) => {
+                let mut b = MatchBindings::new();
+                if let Some(name) = c_m.match_and_bind(*cond) {
+                    b.insert(name, BindingValue::Reg(*cond));
+                }
+                if let Some(name) = t_m.match_and_bind(*target) {
+                    b.insert(name, BindingValue::Label(*target));
+                }
+                Some(b)
+            }
+            (MirPattern::JumpIfNot { cond: c_m, target: t_m }, MirInst::JumpIfNot(cond, target)) => {
+                let mut b = MatchBindings::new();
+                if let Some(name) = c_m.match_and_bind(*cond) {
+                    b.insert(name, BindingValue::Reg(*cond));
+                }
                 if let Some(name) = t_m.match_and_bind(*target) {
                     b.insert(name, BindingValue::Label(*target));
                 }

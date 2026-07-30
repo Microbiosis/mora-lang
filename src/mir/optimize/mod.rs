@@ -57,3 +57,37 @@ pub mod pattern;
 pub mod rule;
 pub mod search;
 pub mod ssa_pattern;
+
+use crate::mir::MirFunction;
+use crate::mir::optimize::cost::InstructionCount;
+use crate::mir::optimize::rule::builtin_rules;
+use crate::mir::optimize::search::greedy_search;
+
+/// 对 MirFunction.body 应用 Cascades 优化 pass
+///
+/// 使用内置规则库 + 默认 cost model，贪心搜索最多 50 轮。
+pub fn apply_rules(func: &mut MirFunction) {
+    let rules = builtin_rules();
+    let cost = InstructionCount;
+    let result = greedy_search(&func.body, &rules, &cost, 50);
+    func.body = result.body;
+    func.n_regs = func.n_regs.max(
+        func.body.iter().map(|inst| {
+            match inst {
+                crate::mir::MirInst::Const(r, _)
+                | crate::mir::MirInst::Var(r, _)
+                | crate::mir::MirInst::BinaryOp(r, ..)
+                | crate::mir::MirInst::Call(r, ..)
+                | crate::mir::MirInst::Expr(r)
+                | crate::mir::MirInst::Index(r, ..)
+                | crate::mir::MirInst::IndexAssign(r, ..)
+                | crate::mir::MirInst::MethodCall(r, ..)
+                | crate::mir::MirInst::Pipe(r, ..)
+                | crate::mir::MirInst::Prompt(r, ..)
+                | crate::mir::MirInst::ListLit(r, ..)
+                | crate::mir::MirInst::DictLit(r, ..) => r + 1,
+                _ => 0,
+            }
+        }).max().unwrap_or(0),
+    );
+}

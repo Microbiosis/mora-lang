@@ -33,11 +33,6 @@ pub enum MirPattern {
     },
     /// `MirInst::Jump(target)`
     Jump { target: LabelMatcher },
-    /// `MirInst::Copy(dst, src)`
-    Copy {
-        dst: RegMatcher,
-        src: RegMatcher,
-    },
     /// `MirInst::Return(value)` — `value` 为 `Option<Reg>`
     Return { value: RegOptMatcher },
 }
@@ -231,19 +226,6 @@ impl Match for MirPattern {
                 let mut b = MatchBindings::new();
                 if let Some(name) = t_m.match_and_bind(*target) {
                     b.insert(name, BindingValue::Label(*target));
-                }
-                Some(b)
-            }
-            (
-                MirPattern::Copy { dst: dst_m, src: src_m },
-                MirInst::Copy(dst, src),
-            ) => {
-                let mut b = MatchBindings::new();
-                if let Some(name) = dst_m.match_and_bind(*dst) {
-                    b.insert(name, BindingValue::Reg(*dst));
-                }
-                if let Some(name) = src_m.match_and_bind(*src) {
-                    b.insert(name, BindingValue::Reg(*src));
                 }
                 Some(b)
             }

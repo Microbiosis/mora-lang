@@ -204,16 +204,18 @@ mod tests {
             (0..n)
                 .map(|i| MirAgentDef {
                     name: format!("a{}", i),
-                    task_mir_expr: None,
-                    verify_mir_expr: None,
+                    task_expr: crate::mir::expr::MirExpr::lit(
+                        crate::common::Literal::Nil(crate::common::Span::new(1, 1)),
+                        crate::common::Span::new(1, 1),
+                    ),
+                    verify_expr: None,
                     with_config: None,
-                    reads_channels: Vec::new(),
                     task_body: crate::mir::MirFunction {
                         params: Vec::new(),
                         body: Vec::new(),
                         n_regs: 0,
                     },
-                    verify_body: None,
+                    task_mir_expr: None,
                 })
                 .collect()
         };

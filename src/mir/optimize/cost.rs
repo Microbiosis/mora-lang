@@ -101,10 +101,53 @@ impl CostModel for TokenEstimate {
             // List/Dict 字面量
             MirInst::ListLit(_, items) => 2 + items.len() as u32,
             MirInst::DictLit(_, entries) => 2 + entries.len() as u32,
-            // 控制流：基本
+            // 控制流
             MirInst::Return(_) => 1,
             MirInst::Jump(_) | MirInst::JumpIf(_, _) | MirInst::JumpIfNot(_, _) => 1,
-            // 编排：50 + agents
+            MirInst::Break(_) | MirInst::Continue(_) => 1,
+            // 变量操作
+            MirInst::Define(_, _) => 2,
+            MirInst::Assign(_, _) => 2,
+            MirInst::Expr(_) => 1,
+            // 索引
+            MirInst::Index(_, _, _) => 3,
+            MirInst::IndexAssign(_, _, _) => 4,
+            // MethodCall / Pipe
+            MirInst::Pipe(_, _, _) => 10,
+            // 匹配
+            MirInst::MatchExpr { val, arms } => {
+                5 + arms.len() as u32 * 10
+            }
+            MirInst::MatchArm { cond_reg, body } => {
+                let body_cost = body.body.iter().map(|i| self.inst_cost(i)).sum::<u32>();
+                if cond_reg.is_some() { body_cost + 5 } else { body_cost }
+            }
+            // With/Stream
+            MirInst::WithConfig { bindings, body, .. } => {
+                bindings.len() as u32 * 5 + body.body.iter().map(|i| self.inst_cost(i)).sum::<u32>()
+            }
+            MirInst::StreamFor { prompt_reg: _, var: _, body } => {
+                20 + body.body.iter().map(|i| self.inst_cost(i)).sum::<u32>()
+            }
+            // 事务
+            MirInst::Transaction { body, compensation } => {
+                let body_sum = body.body.iter().map(|i| self.inst_cost(i)).sum::<u32>();
+                let comp_sum = compensation.body.iter().map(|i| self.inst_cost(i)).sum::<u32>();
+                body_sum + comp_sum + 20
+            }
+            MirInst::Rollback | MirInst::Commit => 1,
+            // Actor 消息
+            MirInst::Send { .. } => 3,
+            MirInst::Receive { .. } => 3,
+            // Worker
+            MirInst::Worker { body, .. } => body.body.iter().map(|i| self.inst_cost(i)).sum::<u32>() + 5,
+            // I/O
+            MirInst::Import(_) => 100, // 文件导入开销
+            MirInst::Save { .. } | MirInst::Load { .. }
+            | MirInst::ReadFile { .. } | MirInst::WriteFile { .. }
+            | MirInst::AppendFile { .. } | MirInst::ReadBytesFile { .. }
+            | MirInst::WriteBytesFile { .. } => 50,
+            // 编排
             MirInst::Orchestrate { kind, .. } => {
                 let n_agents = match kind.as_ref() {
                     crate::mir::expr::MirOrchestrateKind::Sequential { agents } => agents.len(),

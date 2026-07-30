@@ -26,6 +26,7 @@ pub mod interp;
 pub mod jit;
 pub mod lower;
 pub mod opt;
+pub mod optimize;
 pub mod ssa;
 pub mod typeinfer;
 

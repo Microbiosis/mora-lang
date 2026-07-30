@@ -64,7 +64,6 @@ pub trait RewriteRule {
 /// Phase H.2 扩展：新增 `RedundantJumpRule`（Phase H.2 实战示例）。
 pub fn builtin_rules() -> Vec<Box<dyn RewriteRule>> {
     vec![
-        Box::new(DeadAssignRule),
         Box::new(ConstFoldingRule),
         Box::new(RedundantJumpRule),
     ]
@@ -121,37 +120,7 @@ static REDUNDANT_JUMP_PATTERN: MirPattern = MirPattern::Jump {
     target: crate::mir::optimize::pattern::LabelMatcher::Any,
 };
 
-/// 示例规则 1：删除 `Assign(dst, src)` 当 dst 后续未被使用时
-///
-/// 注：完整 DCE 需要数据流分析。本规则作为接口演示。
-pub struct DeadAssignRule;
-
-impl RewriteRule for DeadAssignRule {
-    fn name(&self) -> &'static str {
-        "dead_assign"
-    }
-
-    fn pattern(&self) -> &MirPattern {
-        // 此规则仅作接口演示；完整实现见 mir/opt.rs::dead_code_elim
-        &DEAD_ASSIGN_PATTERN
-    }
-
-    fn rewrite(&self, _inst: &MirInst, _bindings: &MatchBindings) -> Vec<MirInst> {
-        // 删除指令
-        Vec::new()
-    }
-
-    fn cost_gain(&self) -> i32 {
-        1
-    }
-}
-
-static DEAD_ASSIGN_PATTERN: MirPattern = MirPattern::Copy {
-    dst: crate::mir::optimize::pattern::RegMatcher::Any,
-    src: crate::mir::optimize::pattern::RegMatcher::Any,
-};
-
-/// 示例规则 2：常量折叠
+/// 示例规则 1：常量折叠
 ///
 /// `BinaryOp(dst, a, op, b)` 其中 a 和 b 均为 `Const` → 折叠为 `Const(dst, eval(a,op,b))`
 pub struct ConstFoldingRule;
@@ -223,12 +192,10 @@ mod tests {
     use crate::value::Value;
 
     #[test]
-    fn test_dead_assign_rule_rewrites_copy_to_empty() {
-        let rule = DeadAssignRule;
-        let inst = MirInst::Copy(0, 1);
-        let bindings = MatchBindings::new();
-        let result = rule.rewrite(&inst, &bindings);
-        assert!(result.is_empty(), "DeadAssignRule should delete the instruction");
+    fn test_dead_assign_rule_removed() {
+        // DeadAssignRule removed in v0.55 — MirInst::Copy no longer exists
+        let rules = builtin_rules();
+        assert!(!rules.is_empty(), "at least one rule should exist");
     }
 
     #[test]
@@ -260,11 +227,10 @@ mod tests {
     }
 
     #[test]
-    fn test_builtin_rules_contains_three() {
+    fn test_builtin_rules_contains_two() {
         let rules = builtin_rules();
-        assert_eq!(rules.len(), 3);
+        assert_eq!(rules.len(), 2, "const_folding + redundant_jump");
         let names: Vec<&str> = rules.iter().map(|r| r.name()).collect();
-        assert!(names.contains(&"dead_assign"));
         assert!(names.contains(&"const_folding"));
         assert!(names.contains(&"redundant_jump"));
     }

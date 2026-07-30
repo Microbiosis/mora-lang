@@ -24,7 +24,10 @@ pub fn lower_mir_exprs(exprs: &[MirExpr]) -> Result<MirFunction, String> {
     for expr in exprs {
         let _dst = l.lower_expr(expr)?;
     }
-    Ok(l.finish())
+    let mut func = l.finish();
+    // v0.58: Cascades 优化 pass
+    crate::mir::optimize::apply_rules(&mut func);
+    Ok(func)
 }
 
 /// MirExpr → MIR 指令 lowering（v0.55 完整版）

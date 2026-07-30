@@ -268,42 +268,40 @@ pub fn h_macro_def(env: &mut Environment, name: &str, params: &[String]) {
     );
 }
 
+/// v0.68: Unified isolated-block execution.
+///
+/// Clones `env`, runs `body` in the clone, then merges the child's changes
+/// back into the parent using the interpreter's current merge strategies.
+/// Returns the body's final value AND any merge conflicts (currently
+/// discarded by callers; reserved for future observability hooks).
+fn run_isolated(
+    interp: &mut Interpreter,
+    env: &mut Environment,
+    body: &MirFunction,
+) -> Result<(crate::value::Value, Vec<crate::value::Conflict>), String> {
+    let mut child_env = env.clone();
+    let result = run_mir(body, interp, &mut child_env)?;
+    let strategies = interp.current_merge_strategies();
+    let conflicts = match strategies.as_ref() {
+        Some(s) => env.merge_from_with_strategies(
+            &child_env, s, &crate::value::MergeStrategy::LastWriteWins,
+        ),
+        None => {
+            env.merge_from(&child_env, &crate::value::MergeStrategy::LastWriteWins);
+            Vec::new()
+        }
+    };
+    Ok((result, conflicts))
+}
+
 pub fn h_transaction(
     interp: &mut Interpreter,
     env: &mut Environment,
     body: &MirFunction,
     compensation: &MirFunction,
 ) -> Result<Flow, String> {
-    // v0.67: Pull CRDT merge strategies from interpreter state (if set via
-    // `Interpreter::set_merge_strategies`). Falls back to LWW if None.
-    let strategies = interp.current_merge_strategies();
-    h_transaction_with_strategies(interp, env, body, compensation, strategies.as_ref())
-}
-
-/// v0.65: CRDT-aware transaction with optional per-key merge strategies.
-fn h_transaction_with_strategies(
-    interp: &mut Interpreter,
-    env: &mut Environment,
-    body: &MirFunction,
-    compensation: &MirFunction,
-    strategies: Option<&HashMap<String, crate::value::MergeStrategy>>,
-) -> Result<Flow, String> {
-    let mut child_env = env.clone();
-    let result = run_mir(body, interp, &mut child_env);
-    match result {
-        Ok(_) => {
-            match strategies {
-                Some(s) => {
-                    let _conflicts = env.merge_from_with_strategies(
-                        &child_env, s, &crate::value::MergeStrategy::LastWriteWins,
-                    );
-                }
-                None => {
-                    env.merge_from(&child_env, &crate::value::MergeStrategy::LastWriteWins);
-                }
-            }
-            Ok(Flow::Continue)
-        }
+    match run_isolated(interp, env, body) {
+        Ok(_) => Ok(Flow::Continue),
         Err(_) => {
             let mut comp_env = env.clone();
             let _ = run_mir(compensation, interp, &mut comp_env);
@@ -343,32 +341,7 @@ pub fn h_worker(
     env: &mut Environment,
     body: &MirFunction,
 ) -> Result<(), String> {
-    // v0.67: Pull CRDT merge strategies from interpreter state.
-    let strategies = interp.current_merge_strategies();
-    h_worker_with_strategies(interp, env, body, strategies.as_ref())
-}
-
-/// v0.65: CRDT-aware worker with optional per-key merge strategies.
-fn h_worker_with_strategies(
-    interp: &mut Interpreter,
-    env: &mut Environment,
-    body: &MirFunction,
-    strategies: Option<&HashMap<String, crate::value::MergeStrategy>>,
-) -> Result<(), String> {
-    let mut child_env = env.clone();
-    let result = run_mir(body, interp, &mut child_env);
-    if result.is_ok() {
-        match strategies {
-            Some(s) => {
-                let _conflicts = env.merge_from_with_strategies(
-                    &child_env, s, &crate::value::MergeStrategy::LastWriteWins,
-                );
-            }
-            None => {
-                env.merge_from(&child_env, &crate::value::MergeStrategy::LastWriteWins);
-            }
-        }
-    }
+    let _ = run_isolated(interp, env, body)?;
     Ok(())
 }
 
@@ -377,8 +350,10 @@ pub fn h_observe(
     env: &mut Environment,
     body: &MirFunction,
 ) -> Result<(), String> {
-    let mut child_env = env.clone();
-    let _ = run_mir(body, interp, &mut child_env)?;
+    // v0.68: Bug fix — was discarding child_env mutations. Now merges
+    // via run_isolated so observability side-effects (trace vars, span
+    // markers) are actually visible.
+    let _ = run_isolated(interp, env, body)?;
     Ok(())
 }
 
@@ -387,8 +362,8 @@ pub fn h_span(
     env: &mut Environment,
     body: &MirFunction,
 ) -> Result<(), String> {
-    let mut child_env = env.clone();
-    let _ = run_mir(body, interp, &mut child_env)?;
+    // v0.68: Bug fix — same as h_observe.
+    let _ = run_isolated(interp, env, body)?;
     Ok(())
 }
 

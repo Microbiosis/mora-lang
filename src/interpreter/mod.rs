@@ -533,6 +533,22 @@ impl Interpreter {
         }
     }
 
+    /// v0.67: Set per-key CRDT merge strategies for the next transaction/worker.
+    /// Subsequent `h_transaction` / `h_worker` invocations will use
+    /// `merge_from_with_strategies` with this map. Pass `None` to revert to
+    /// the hardcoded LWW fallback.
+    pub fn set_merge_strategies(
+        &mut self,
+        strategies: Option<HashMap<String, crate::value::MergeStrategy>>,
+    ) {
+        self.core.current_merge_strategies = strategies;
+    }
+
+    /// v0.67: Get a clone of the current merge strategies (used by handlers).
+    pub fn current_merge_strategies(&self) -> Option<HashMap<String, crate::value::MergeStrategy>> {
+        self.core.current_merge_strategies.clone()
+    }
+
     #[allow(dead_code)]
     pub fn get_globals(&self) -> Arc<Mutex<Environment>> {
         self.core.globals.clone()

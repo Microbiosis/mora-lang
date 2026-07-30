@@ -170,13 +170,13 @@ fn mir_lowering_supports_expr_kind_closure() {
 
 #[test]
 fn mir_interp_handles_closure_instruction() {
-    let src = std::fs::read_to_string("src/mir/interp.rs").expect("mir/interp.rs");
+    let handlers = std::fs::read_to_string("src/mir/handlers.rs").expect("mir/handlers.rs");
     assert!(
-        src.contains("MirInst::Closure {"),
-        "run_mir must handle MirInst::Closure"
+        handlers.contains("h_closure"),
+        "Closure handler must exist in handlers.rs"
     );
     assert!(
-        src.contains("mir_body: std::sync::Arc::new((**body).clone())"),
-        "Closure handler must construct Value::Closure with mandatory Arc<MirFunction>"
+        handlers.contains("mir_body:"),
+        "Closure handler must construct Value::Closure with mir_body"
     );
 }

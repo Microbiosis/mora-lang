@@ -236,6 +236,13 @@ impl HMInference {
             | MirExprKind::Continue(_) => Ok(Type::Nil),
             MirExprKind::IndexAssign { .. } => Ok(Type::Nil),
             MirExprKind::Expr(inner) => self.infer_expr(inner),
+            // v0.55: top-level declarations — no scalar result type.
+            MirExprKind::TypeAlias { .. }
+            | MirExprKind::EnumDef { .. }
+            | MirExprKind::StructDef { .. }
+            | MirExprKind::Import(_)
+            | MirExprKind::MacroDef { .. }
+            | MirExprKind::Sequence { .. } => Ok(Type::Nil),
         }
     }
 
@@ -339,12 +346,9 @@ impl HMInference {
                     .push(Constraint::Eq(Box::new(left_ty), Box::new(right_ty)));
                 Ok(Type::Bool)
             }
-            Or | And => {
-                // v0.55: logical operators require bool operands and
-                // return bool. The actual short-circuit lowering is done
-                // in lower.rs; here we just validate operand types.
-                Ok(Type::Bool)
-            }
+            // v0.55: Or/And are MirExprKind variants (short-circuit),
+            // handled directly in infer_expr, not BinaryOp variants.
+            _ => Ok(result_ty),
         }
     }
 

@@ -94,3 +94,14 @@ fn full_program_with_let_if_match_parses() {
     let _ = parse_code_v3("if 1 < 2 then 3 else 4").expect("if/else expression should parse");
     let _ = parse_code_v3("match 1 { 1 => 10, _ => 20 }").expect("match expression should parse");
 }
+
+// v0.58: Verify ColonColon + keyword-as-identifier + fn block body all work
+#[test]
+fn mcp_server_patterns_parse() {
+    // :: namespace qualification
+    parse_code_v3("let mcp = McpServer::new()").expect(":: should parse");
+    // keyword 'tool' used as method name after '.'
+    parse_code_v3("mcp.tool(\"search\", {query: \"s\"}, fn(x) => x)").expect("method chain should parse");
+    // fn with block body (end-terminated)
+    parse_code_v3("fn(x)\n  return x\nend").expect("fn block body should parse");
+}

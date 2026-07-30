@@ -19,6 +19,8 @@ use crate::value::Value;
 /// - `Jump { target }` 匹配 `MirInst::Jump(target)`
 #[derive(Debug, Clone, PartialEq)]
 pub enum MirPattern {
+    /// 匹配任意指令（用于 body-level pass 如 DeadAfterReturn）
+    Any,
     /// `MirInst::Const(dst, value)`
     Const {
         dst: RegMatcher,
@@ -182,6 +184,8 @@ pub trait Match {
 impl Match for MirPattern {
     fn matches(&self, inst: &MirInst) -> Option<MatchBindings> {
         match (self, inst) {
+            // Any: 匹配任意指令（用于 body-pass 规则如 DeadAfterReturn）
+            (MirPattern::Any, _) => Some(MatchBindings::new()),
             (
                 MirPattern::Const {
                     dst: dst_m,

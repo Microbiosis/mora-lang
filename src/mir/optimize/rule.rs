@@ -60,14 +60,63 @@ pub trait RewriteRule {
 }
 
 /// 规则库 — 集中管理所有规则
-///
-/// Phase H.2 扩展：新增 `RedundantJumpRule`（Phase H.2 实战示例）。
 pub fn builtin_rules() -> Vec<Box<dyn RewriteRule>> {
     vec![
         Box::new(ConstFoldingRule),
         Box::new(RedundantJumpRule),
+        Box::new(DeadAfterReturnRule),
     ]
 }
+
+/// Phase H.5: 删除 Return 之后的所有死指令
+///
+/// 任何指令出现在 `Return` 之后永远不会执行——直接删除。
+///
+/// 模式：任何指令（`_ => true`），但仅当 `pc > last_return_pc` 时重写
+///
+/// 收益：消除 N 条死指令（N = body.len() - return_idx - 1）
+pub struct DeadAfterReturnRule;
+
+impl RewriteRule for DeadAfterReturnRule {
+    fn name(&self) -> &'static str {
+        "dead_after_return"
+    }
+
+    fn pattern(&self) -> &MirPattern {
+        // 通配模式 — 匹配任何指令
+        &WILDCARD_PATTERN
+    }
+
+    fn rewrite_with_context(
+        &self,
+        _inst: &MirInst,
+        _bindings: &MatchBindings,
+        pc: usize,
+        body: &[MirInst],
+        _ctx: &dyn std::any::Any,
+    ) -> Vec<MirInst> {
+        // 找到最后一个 Return 的位置
+        let last_return = body.iter().enumerate()
+            .rev()
+            .find(|(_, inst)| matches!(inst, MirInst::Return(_)))
+            .map(|(i, _)| i);
+
+        // 如果当前指令在最后一个 Return 之后 → 删除
+        if let Some(ret_idx) = last_return {
+            if pc > ret_idx {
+                return Vec::new();
+            }
+        }
+        // 否则保留
+        vec![_inst.clone()]
+    }
+
+    fn cost_gain(&self) -> i32 {
+        1
+    }
+}
+
+static WILDCARD_PATTERN: MirPattern = MirPattern::Any;
 
 /// Phase H.2: 冗余 Jump 消除
 ///
@@ -227,12 +276,13 @@ mod tests {
     }
 
     #[test]
-    fn test_builtin_rules_contains_two() {
+    fn test_builtin_rules_contains_three() {
         let rules = builtin_rules();
-        assert_eq!(rules.len(), 2, "const_folding + redundant_jump");
+        assert_eq!(rules.len(), 3, "const_folding + redundant_jump + dead_after_return");
         let names: Vec<&str> = rules.iter().map(|r| r.name()).collect();
         assert!(names.contains(&"const_folding"));
         assert!(names.contains(&"redundant_jump"));
+        assert!(names.contains(&"dead_after_return"));
     }
 
     // ========== RedundantJumpRule 测试（Phase H.2）==========

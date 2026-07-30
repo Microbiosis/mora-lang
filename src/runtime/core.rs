@@ -25,6 +25,10 @@ pub struct CoreRuntime {
     pub(crate) current_ai_config: Option<AiConfigValue>,
     /// with 块 config 保存/恢复栈（MIR 解释器用）
     pub(crate) config_stack: Vec<Option<AiConfigValue>>,
+    /// v0.67: 当前 transaction/worker 的 CRDT 合并策略。
+    /// 设值时 `h_transaction`/`h_worker` 使用 `merge_from_with_strategies`；
+    /// 为 None 时回退到硬编码 LWW。
+    pub(crate) current_merge_strategies: Option<std::collections::HashMap<String, crate::value::MergeStrategy>>,
     /// Worker 并发 channels（sender 端）
     pub(crate) worker_channels: HashMap<String, crossbeam_channel::Sender<Value>>,
     /// Worker 并发 channels（receiver 端）
@@ -40,6 +44,7 @@ impl Default for CoreRuntime {
             tool_registry: Arc::new(HashMap::new()),
             current_ai_config: None,
             config_stack: Vec::new(),
+            current_merge_strategies: None,
             worker_channels: HashMap::new(),
             worker_receivers: HashMap::new(),
         }

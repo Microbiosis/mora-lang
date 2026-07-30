@@ -274,8 +274,10 @@ pub fn h_transaction(
     body: &MirFunction,
     compensation: &MirFunction,
 ) -> Result<Flow, String> {
-    // v0.65: For now, transactions use LWW. Future: accept per-key strategies.
-    h_transaction_with_strategies(interp, env, body, compensation, None)
+    // v0.67: Pull CRDT merge strategies from interpreter state (if set via
+    // `Interpreter::set_merge_strategies`). Falls back to LWW if None.
+    let strategies = interp.current_merge_strategies();
+    h_transaction_with_strategies(interp, env, body, compensation, strategies.as_ref())
 }
 
 /// v0.65: CRDT-aware transaction with optional per-key merge strategies.
@@ -341,7 +343,9 @@ pub fn h_worker(
     env: &mut Environment,
     body: &MirFunction,
 ) -> Result<(), String> {
-    h_worker_with_strategies(interp, env, body, None)
+    // v0.67: Pull CRDT merge strategies from interpreter state.
+    let strategies = interp.current_merge_strategies();
+    h_worker_with_strategies(interp, env, body, strategies.as_ref())
 }
 
 /// v0.65: CRDT-aware worker with optional per-key merge strategies.

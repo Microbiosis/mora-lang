@@ -36,6 +36,7 @@ use crate::mir::expr::{
     MirAgentDef, MirEdgeDef, MirInterruptPoint, MirInterruptWhen, MirPregelConfig,
     MirReducerKind, MirStateChannel,
 };
+use crate::mir::expr::MirExpr;
 use crate::mir::MirFunction;
 use crate::value::{Conflict, MergeStrategy, Value};
 
@@ -70,6 +71,62 @@ pub struct MirPregelEngine {
     pub current_step: usize,
     /// v0.64: Optional checkpoint persistence backend.
     saver: Option<Arc<dyn CheckpointSaver>>,
+}
+
+/// v0.67: Numeric accumulator for Sum/Product. First write initializes
+/// to the op identity (`0` for `+`, `1` for `*`). Subsequent writes fold.
+/// Mixed Int/Float promoted via `eval_binary`.
+fn accumulator_reduce(
+    current: Option<Value>,
+    incoming: Value,
+    op: &str,
+) -> Result<Value, String> {
+    let identity = match op {
+        "+" => Value::Int(0),
+        "*" => Value::Int(1),
+        _ => return Err(format!("Unknown accumulator op: {}", op)),
+    };
+    let cur = current.unwrap_or(identity);
+    match op {
+        "+" => crate::flow::eval_binary(cur, &crate::common::BinaryOp::Add, incoming),
+        "*" => crate::flow::eval_binary(cur, &crate::common::BinaryOp::Mul, incoming),
+        _ => Err(format!("Unknown accumulator op: {}", op)),
+    }
+}
+
+/// v0.67: Concat reducer — append incoming string to current.
+/// Non-string incoming values are stringified via Display.
+fn concat_reduce(current: Option<Value>, incoming: Value) -> Result<Value, String> {
+    let cur = match current {
+        Some(Value::String(s)) => s,
+        Some(v) => format!("{}", v),
+        None => String::new(),
+    };
+    let inc = match incoming {
+        Value::String(s) => s,
+        v => format!("{}", v),
+    };
+    Ok(Value::String(cur + &inc))
+}
+
+/// v0.67: Try to parse a Custom reducer's String payload as a MirExpr
+/// heuristic: integer → IntLit, anything else → Variable reference.
+fn parse_custom_merge_expr(s: &str) -> crate::mir::expr::MirExpr {
+    use crate::common::{Literal, Span};
+    let span = Span::default();
+    if let Ok(n) = s.parse::<i64>() {
+        MirExpr {
+            kind: crate::mir::expr::MirExprKind::Literal(Literal::Int(n, span)),
+            span,
+            ty: None,
+        }
+    } else {
+        MirExpr {
+            kind: crate::mir::expr::MirExprKind::Variable(s.to_string()),
+            span,
+            ty: None,
+        }
+    }
 }
 
 impl MirPregelEngine {
@@ -374,13 +431,23 @@ pub fn run(&mut self, interpreter: &mut Interpreter) -> Result<Value, String> {
                     crate::mir::interp::run_mir(&merge_fn, interpreter, &mut merge_env)
                         .map_err(|e| format!("Pregel merge body execution failed: {}", e))?
                 }
-                MirReducerKind::Sum | MirReducerKind::Product | MirReducerKind::Concat => {
-                    return Err(format!(
-                        "Pregel reducer {:?} not yet implemented in MIR-native engine",
-                        reducer
-                    ));
+                // v0.67: Sum — accumulate numeric writes (first write initializes).
+                MirReducerKind::Sum => accumulator_reduce(current, value, "+")?,
+                // v0.67: Product — fold numeric writes multiplicatively.
+                MirReducerKind::Product => accumulator_reduce(current, value, "*")?,
+                // v0.67: Concat — append strings (or stringify-then-append for non-strings).
+                MirReducerKind::Concat => concat_reduce(current, value)?,
+                // v0.67: Custom — execute user body via Custom merge expression.
+                MirReducerKind::Custom(merge_expr) => {
+                    let expr = parse_custom_merge_expr(merge_expr.as_str());
+                    let merge_fn = crate::mir::lower::lower_mir_exprs(&[expr])
+                        .map_err(|e| format!("Pregel custom body lowering failed: {}", e))?;
+                    let mut merge_env = interpreter.core.environment.lock().clone();
+                    merge_env.define("current".into(), current.unwrap_or(Value::Nil), false);
+                    merge_env.define("incoming".into(), value, false);
+                    crate::mir::interp::run_mir(&merge_fn, interpreter, &mut merge_env)
+                        .map_err(|e| format!("Pregel custom body execution failed: {}", e))?
                 }
-                MirReducerKind::Custom(_) => value,
                 // Static reducers already handled by to_merge_strategy() above
                 _ => value,
             },
@@ -589,5 +656,64 @@ mod tests {
             }
             other => panic!("expected List, got {:?}", other),
         }
+    }
+
+    /// v0.67: Sum reducer accumulates numeric writes
+    #[test]
+    fn mir_pregel_engine_apply_write_sum() {
+        let config = MirPregelConfig {
+            agents: vec![], edges: vec![],
+            state_schema: vec![MirStateChannel {
+                name: "total".into(), ty: "Int".into(),
+                reducer: MirReducerKind::Sum,
+            }],
+            checkpoint: None, interrupt_points: vec![],
+            adjacency: HashMap::new(),
+        };
+        let mut engine = MirPregelEngine::new(config);
+        let mut interp = crate::interpreter::Interpreter::new();
+        engine.apply_write("total".into(), Value::Int(10), &mut interp).unwrap();
+        engine.apply_write("total".into(), Value::Int(32), &mut interp).unwrap();
+        engine.apply_write("total".into(), Value::Int(8), &mut interp).unwrap();
+        assert_eq!(engine.channels.get("total"), Some(&Value::Int(50)));
+    }
+
+    /// v0.67: Product reducer multiplies across writes
+    #[test]
+    fn mir_pregel_engine_apply_write_product() {
+        let config = MirPregelConfig {
+            agents: vec![], edges: vec![],
+            state_schema: vec![MirStateChannel {
+                name: "acc".into(), ty: "Int".into(),
+                reducer: MirReducerKind::Product,
+            }],
+            checkpoint: None, interrupt_points: vec![],
+            adjacency: HashMap::new(),
+        };
+        let mut engine = MirPregelEngine::new(config);
+        let mut interp = crate::interpreter::Interpreter::new();
+        engine.apply_write("acc".into(), Value::Int(2), &mut interp).unwrap();
+        engine.apply_write("acc".into(), Value::Int(3), &mut interp).unwrap();
+        engine.apply_write("acc".into(), Value::Int(4), &mut interp).unwrap();
+        assert_eq!(engine.channels.get("acc"), Some(&Value::Int(24)));
+    }
+
+    /// v0.67: Concat reducer accumulates strings
+    #[test]
+    fn mir_pregel_engine_apply_write_concat() {
+        let config = MirPregelConfig {
+            agents: vec![], edges: vec![],
+            state_schema: vec![MirStateChannel {
+                name: "log".into(), ty: "String".into(),
+                reducer: MirReducerKind::Concat,
+            }],
+            checkpoint: None, interrupt_points: vec![],
+            adjacency: HashMap::new(),
+        };
+        let mut engine = MirPregelEngine::new(config);
+        let mut interp = crate::interpreter::Interpreter::new();
+        engine.apply_write("log".into(), Value::String("hello".into()), &mut interp).unwrap();
+        engine.apply_write("log".into(), Value::String(" world".into()), &mut interp).unwrap();
+        assert_eq!(engine.channels.get("log"), Some(&Value::String("hello world".into())));
     }
 }

@@ -55,6 +55,18 @@ impl PersistRuntime {
         self.audit_sink.write(event)?;
         self.audit_sink.flush()
     }
+
+    /// v0.66: Inject a checkpoint saver (e.g. `MemorySaver`) so the Pregel
+    /// engine can persist snapshots during BSP execution.
+    pub fn set_checkpoint_saver(&mut self, saver: Arc<dyn CheckpointSaver>) {
+        self.checkpoint_saver = Some(saver);
+    }
+
+    /// v0.66: Get a clone of the current checkpoint saver, if any.
+    /// Used by `h_orchestrate` to wire the saver into `MirPregelEngine`.
+    pub fn checkpoint_saver(&self) -> Option<Arc<dyn CheckpointSaver>> {
+        self.checkpoint_saver.clone()
+    }
 }
 
 #[cfg(test)]
@@ -91,5 +103,17 @@ mod tests {
         // 验证两者独立但 audit_sink 共享
         assert!(p2.checkpoint_saver.is_none());
         assert!(p2.markdown_memory_dir.is_none());
+    }
+
+    #[test]
+    fn set_and_get_checkpoint_saver() {
+        use crate::checkpoint::MemorySaver;
+        let mut persist = PersistRuntime::default();
+        assert!(persist.checkpoint_saver().is_none());
+        let saver: Arc<dyn crate::checkpoint::CheckpointSaver> = Arc::new(MemorySaver::new());
+        persist.set_checkpoint_saver(saver.clone());
+        let got = persist.checkpoint_saver().expect("saver should be set");
+        // Same Arc identity → wrapping the same backend
+        assert!(Arc::ptr_eq(&got, &saver));
     }
 }

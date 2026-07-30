@@ -567,6 +567,12 @@ pub fn h_orchestrate(
             };
             let mut engine = MirPregelEngine::new(config);
 
+            // v0.66: Wire PersistRuntime's checkpoint saver into the engine
+            // so the auto-save block in BSP ADVANCE actually persists.
+            if let Some(saver) = interp.persist.checkpoint_saver() {
+                engine = engine.with_checkpoint_saver(saver);
+            }
+
             // v0.63: Resume from checkpoint if available
             let thread_id = "pregel"; // matches build_checkpoint default
             if let Ok(Some(cp)) = interp.load_checkpoint(thread_id) {

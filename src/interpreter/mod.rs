@@ -525,6 +525,14 @@ impl Interpreter {
         }
     }
 
+    /// v0.66: Persist a checkpoint to the configured saver.
+    pub fn save_checkpoint(&self, thread_id: &str, cp: &Checkpoint) -> Result<(), String> {
+        match self.persist.checkpoint_saver() {
+            Some(saver) => saver.save(thread_id, cp),
+            None => Err("No checkpoint saver configured".to_string()),
+        }
+    }
+
     #[allow(dead_code)]
     pub fn get_globals(&self) -> Arc<Mutex<Environment>> {
         self.core.globals.clone()

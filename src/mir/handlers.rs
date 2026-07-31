@@ -572,6 +572,7 @@ pub fn h_orchestrate(
                 checkpoint: checkpoint.clone(), interrupt_points: interrupt_points.clone(),
                 adjacency: adjacency.clone(),
                 aggregators: Vec::new(),
+                master_compute: None,
             };
             let mut engine = MirPregelEngine::new(config);
 

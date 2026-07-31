@@ -468,6 +468,7 @@ impl ParserV3 {
                         verify_expr: None,
                         task_body: MirFunction { params: vec![], body: vec![], n_regs: 0 },
                         task_mir_expr: None,
+                        combiner_body: None,
                     }
                 });
                 MirOrchestrateKind::Loop {
@@ -565,6 +566,7 @@ impl ParserV3 {
             verify_expr: None,
             task_body: MirFunction { params: vec![], body: vec![], n_regs: 0 },
             task_mir_expr: task_mir,
+            combiner_body: None,
         })
     }
 

@@ -500,6 +500,11 @@ pub struct MirAgentDef {
     pub task_body: MirFunction,
     /// Task expression in MIR form (consumed during lowering, set to None)
     pub task_mir_expr: Option<MirExpr>,
+
+    /// v0.72: Pre-lowered combiner body. When multiple sends target this
+    /// vertex, the engine folds them with `(current, incoming) -> Value`
+    /// before delivering. Identity (default): last-write-wins (current = incoming).
+    pub combiner_body: Option<MirFunction>,
 }
 
 ///  Edge definition in orchestrate graph
@@ -645,6 +650,10 @@ pub struct MirPregelConfig {
     /// a value via `h_aggregate(name, value)`; the engine reduces across
     /// all contributions per step and exposes the result as `aggregator_<name>`.
     pub aggregators: Vec<MirAggregatorDef>,
+    /// v0.72: Centralized coordinator hook. Runs once per super-step after
+    /// UPDATE and before ADVANCE. Used for global coordination logic
+    /// (e.g., dynamic topology decisions based on aggregator state).
+    pub master_compute: Option<MirFunction>,
 }
 
 /// v0.71: Aggregator definition (per-super-step global reducer).

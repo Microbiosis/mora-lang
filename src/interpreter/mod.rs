@@ -4,6 +4,7 @@ mod builtins;
 mod dispatch;
 pub(crate) mod mir_pregel_engine;
 mod trait_dispatch;
+pub(crate) mod worker_pool;
 
 use parking_lot::Mutex;
 use std::collections::HashMap;

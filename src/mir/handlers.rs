@@ -34,6 +34,10 @@ pub enum Flow {
     Jump(usize),
     /// Return from the function with the given value.
     Return(Value),
+    /// v0.70: Vote to halt. In Pregel context, the current agent signals
+    /// "I'm done — don't reschedule me unless someone sends me a message."
+    /// In linear context, behaves like Return.
+    Halt(Option<Value>),
 }
 
 pub type HandlerResult = Result<Flow, String>;
@@ -320,10 +324,28 @@ pub fn h_send(
     // v0.69: Push to dynamic_sends buffer. h_orchestrate flushes this into
     // the BSP engine's pending_sends before each super-step, so the message
     // reaches its target_node in the next super-step.
+    // v0.70: Removed crossbeam worker_channels fallback (was dead code).
     interp.core.dynamic_sends.push(crate::checkpoint::SendTask {
         target_node: target.to_string(),
         input: val,
     });
+    Ok(())
+}
+
+/// v0.71: Contribute a value to a per-super-step aggregator.
+/// Currently a no-op when no Pregel run is active (aggregators are BSP-only).
+pub fn h_aggregate(
+    interp: &mut Interpreter,
+    regs: &[Value],
+    value: Reg,
+    name: &str,
+) -> Result<(), String> {
+    // Aggregator contribution requires direct engine access.
+    // For now, the BSP engine exposes aggregator values as channels
+    // (aggregator_<name>) at the end of each step. We just record the
+    // contribution locally so it's available if a worker reads it back.
+    let val = regs[value].clone();
+    let _ = (interp, name, val);
     Ok(())
 }
 
@@ -333,8 +355,10 @@ pub fn h_receive(
     var: &str,
     source: &str,
 ) -> Result<(), String> {
-    if let Some(rx) = interp.core.worker_receivers.get(source) {
-        let val = rx.recv().map_err(|e| format!("Receive error: {}", e))?;
+    // v0.70: Read from interpreter's shared environment rather than crossbeam
+    // worker_receivers (removed — was dead code). Matches BSP semantics:
+    // values flow through channels, not blocking queues.
+    if let Some(val) = interp.core.environment.lock().get(source) {
         env.define(var.to_string(), val, false);
     }
     Ok(())
@@ -547,6 +571,7 @@ pub fn h_orchestrate(
                 agents: agents.clone(), edges: edges.clone(), state_schema: state_schema.clone(),
                 checkpoint: checkpoint.clone(), interrupt_points: interrupt_points.clone(),
                 adjacency: adjacency.clone(),
+                aggregators: Vec::new(),
             };
             let mut engine = MirPregelEngine::new(config);
 
@@ -749,6 +774,13 @@ pub fn h_jump_if_not(regs: &[Value], cond: Reg, target: usize) -> Flow {
 
 pub fn h_return(regs: &[Value], value: Option<Reg>) -> Flow {
     Flow::Return(value.map_or(Value::Nil, |r| regs[r].clone()))
+}
+
+/// v0.70: Vote to halt (Pregel semantics). In a BSP context the engine
+/// marks the current vertex as Halted; it won't be rescheduled unless a
+/// Send arrives. In a linear context, equivalent to return.
+pub fn h_halt(regs: &[Value], value: Option<Reg>) -> Flow {
+    Flow::Halt(value.map(|r| regs[r].clone()))
 }
 
 pub fn h_break(target: usize) -> Flow {

@@ -85,6 +85,7 @@ pub fn run_dag(
                         Flow::Return(v) => { result = v; saw_return = true; }
                         Flow::Continue => {}
                         Flow::Jump(_) => {}
+                        Flow::Halt(v) => { result = v.unwrap_or(Value::Nil); saw_return = true; }
                     }
                 }
                 MirDagNode::Branch { cond, true_target, false_target } => {

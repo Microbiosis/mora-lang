@@ -1,18 +1,20 @@
 //! v0.52 ADR-001: CoreRuntime — 语言执行必需的薄核心
 //!
-//! 从 Interpreter god object 抽出的 7 个核心执行字段（globals/environment/tool_registry/
-//! current_ai_config/config_stack/worker_channels/worker_receivers），
+//! 从 Interpreter god object 抽出的核心执行字段（globals/environment/tool_registry/
+//! current_ai_config/config_stack/current_merge_strategies/dynamic_sends），
 //! 是解释器运行所必需的最小状态容器。
+//!
+//! v0.70: 移除了 `worker_channels` / `worker_receivers` 死代码分支。
+//! 消息传递通过 `dynamic_sends`（BSP Send API，v0.69 接通）完成。
 
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::interpreter::{AiConfigValue, ToolDef};
-use crate::value::{Environment, Value};
-use crate::checkpoint::SendTask;
+use crate::value::{Environment, Value, MergeStrategy};
 
-/// 语言执行必需的薄核心（7 字段）。
+/// 语言执行必需的薄核心。
 /// 注：ToolDef 不含 Debug，所以 CoreRuntime 不 derive Debug。
 #[derive(Clone)]
 pub struct CoreRuntime {
@@ -29,16 +31,12 @@ pub struct CoreRuntime {
     /// v0.67: 当前 transaction/worker 的 CRDT 合并策略。
     /// 设值时 `h_transaction`/`h_worker` 使用 `merge_from_with_strategies`；
     /// 为 None 时回退到硬编码 LWW。
-    pub(crate) current_merge_strategies: Option<std::collections::HashMap<String, crate::value::MergeStrategy>>,
+    pub(crate) current_merge_strategies: Option<HashMap<String, MergeStrategy>>,
     /// v0.69: Dynamic sends buffer. `h_send` pushes here; `h_orchestrate`
     /// flushes into the BSP engine's pending_sends at the start of each
     /// super-step. Lets agents route messages at runtime without direct
     /// access to the engine.
     pub(crate) dynamic_sends: Vec<crate::checkpoint::SendTask>,
-    /// Worker 并发 channels（sender 端）
-    pub(crate) worker_channels: HashMap<String, crossbeam_channel::Sender<Value>>,
-    /// Worker 并发 channels（receiver 端）
-    pub(crate) worker_receivers: HashMap<String, crossbeam_channel::Receiver<Value>>,
 }
 
 impl Default for CoreRuntime {
@@ -52,8 +50,6 @@ impl Default for CoreRuntime {
             config_stack: Vec::new(),
             current_merge_strategies: None,
             dynamic_sends: Vec::new(),
-            worker_channels: HashMap::new(),
-            worker_receivers: HashMap::new(),
         }
     }
 }
@@ -88,10 +84,9 @@ mod tests {
     }
 
     #[test]
-    fn core_worker_channels_empty() {
+    fn core_dynamic_sends_default_empty() {
         let core = CoreRuntime::default();
-        assert!(core.worker_channels.is_empty());
-        assert!(core.worker_receivers.is_empty());
+        assert!(core.dynamic_sends.is_empty());
     }
 
     #[test]

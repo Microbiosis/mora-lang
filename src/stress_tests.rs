@@ -13,7 +13,7 @@
 //! - C1: ai_cache LRU cap=10000 (1M distinct keys)
 //! - C2: string_interner LRU cap=50000 (1M distinct strings)
 //! - C3: ContainerHandle Drop cleanup (100 handle drop)
-//! - C4: worker_receivers cleanup (100 worker exit)
+//! - C4: dynamic_sends buffer cleanup (100 orchestrate cycles)
 //!
 //! Note: B2, B3, C3 require Docker daemon. Use:
 //!   cargo test -- --ignored stress_tests --nocapture

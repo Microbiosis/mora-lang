@@ -4,9 +4,9 @@
 //! This is the final parser implementation that completely replaces Parser v2.
 
 use crate::common::{BinaryOp, Literal, Span};
-use crate::lexer::{Token, TokenType, Lexer};
-use crate::mir::expr::*;
+use crate::lexer::{Lexer, Token, TokenType};
 use crate::mir::MirFunction;
+use crate::mir::expr::*;
 use std::collections::HashMap;
 
 ///  ParserV3 - Clean-room MIR parser with no AST legacy baggage
@@ -71,7 +71,11 @@ impl ParserV3 {
             let mut params = Vec::new();
             while !self.check(&TokenType::RParen) && !self.is_at_end() {
                 if let Some(pname) = self.consume_identifier("Expected parameter name") {
-                    params.push(Param { name: pname, type_hint: None, default: None });
+                    params.push(Param {
+                        name: pname,
+                        type_hint: None,
+                        default: None,
+                    });
                 }
                 if !self.match_token(&[TokenType::Comma]) {
                     break;
@@ -101,7 +105,6 @@ impl ParserV3 {
                     body: Box::new(body),
                 },
                 span: start_span,
-                ty: None,
             });
         }
 
@@ -124,7 +127,6 @@ impl ParserV3 {
                     init_body: Box::new(nil),
                 },
                 span: start_span,
-                ty: None,
             });
         }
 
@@ -248,7 +250,6 @@ impl ParserV3 {
                 arms,
             },
             span: expr_span,
-            ty: None,
         })
     }
 
@@ -372,7 +373,8 @@ impl ParserV3 {
             self.advance();
             "loop".to_string()
         } else {
-            let name = self.consume_identifier("Expected orchestrate kind (sequential/loop/graph/pregel)")?;
+            let name = self
+                .consume_identifier("Expected orchestrate kind (sequential/loop/graph/pregel)")?;
             if name != "sequential" && name != "graph" && name != "pregel" {
                 eprintln!(
                     "Parse error: Expected orchestrate kind (sequential/loop/graph/pregel) at line {}",
@@ -457,8 +459,10 @@ impl ParserV3 {
         let kind = match kind_str.as_str() {
             "sequential" => MirOrchestrateKind::Sequential { agents },
             "loop" => {
-                let agent = agents.into_iter().next().unwrap_or_else(|| {
-                    MirOrchestrateAgent {
+                let agent = agents
+                    .into_iter()
+                    .next()
+                    .unwrap_or_else(|| MirOrchestrateAgent {
                         name: "default".to_string(),
                         with_config: None,
                         task_expr: MirExpr::lit(
@@ -466,11 +470,14 @@ impl ParserV3 {
                             start_span,
                         ),
                         verify_expr: None,
-                        task_body: MirFunction { params: vec![], body: vec![], n_regs: 0 },
+                        task_body: MirFunction {
+                            params: vec![],
+                            body: vec![],
+                            n_regs: 0,
+                        },
                         task_mir_expr: None,
                         combiner_body: None,
-                    }
-                });
+                    });
                 MirOrchestrateKind::Loop {
                     agents: vec![agent],
                     rounds: Some(1000),
@@ -496,7 +503,6 @@ impl ParserV3 {
                 kind: Box::new(kind),
             },
             span: start_span,
-            ty: None,
         })
     }
 
@@ -536,7 +542,10 @@ impl ParserV3 {
                     break;
                 }
             }
-            if self.consume(TokenType::RParen, "Expected ')' after parameters").is_none() {
+            if self
+                .consume(TokenType::RParen, "Expected ')' after parameters")
+                .is_none()
+            {
                 self.current = saved;
                 return None;
             }
@@ -564,7 +573,11 @@ impl ParserV3 {
             with_config: None,
             task_expr: body,
             verify_expr: None,
-            task_body: MirFunction { params: vec![], body: vec![], n_regs: 0 },
+            task_body: MirFunction {
+                params: vec![],
+                body: vec![],
+                n_regs: 0,
+            },
             task_mir_expr: task_mir,
             combiner_body: None,
         })
@@ -641,10 +654,7 @@ impl ParserV3 {
             while self.match_token(&[TokenType::Newline]) {}
 
             // Check for end of block
-            if self.is_at_end()
-                || self.check(&TokenType::RBrace)
-                || self.check(&TokenType::End)
-            {
+            if self.is_at_end() || self.check(&TokenType::RBrace) || self.check(&TokenType::End) {
                 break;
             }
 
@@ -689,7 +699,6 @@ impl ParserV3 {
         Some(MirExpr {
             kind: MirExprKind::Sequence(exprs),
             span,
-            ty: None,
         })
     }
 
@@ -807,7 +816,6 @@ impl ParserV3 {
                 body: Box::new(body),
             },
             span: expr_span,
-            ty: None,
         })
     }
 
@@ -850,7 +858,6 @@ impl ParserV3 {
                 body: Box::new(body),
             },
             span: expr_span,
-            ty: None,
         })
     }
 
@@ -878,7 +885,6 @@ impl ParserV3 {
                 Some(MirExpr {
                     kind: MirExprKind::Return(value.map(Box::new)),
                     span,
-                    ty: None,
                 })
             }
             TokenType::Break => {
@@ -892,7 +898,6 @@ impl ParserV3 {
                 Some(MirExpr {
                     kind: MirExprKind::Break(label.unwrap_or_default()),
                     span,
-                    ty: None,
                 })
             }
             TokenType::Continue => {
@@ -906,7 +911,6 @@ impl ParserV3 {
                 Some(MirExpr {
                     kind: MirExprKind::Continue(label.unwrap_or_default()),
                     span,
-                    ty: None,
                 })
             }
             _ => None,
@@ -934,7 +938,6 @@ impl ParserV3 {
                         value: Box::new(value),
                     },
                     span,
-                    ty: None,
                 });
             }
 
@@ -963,7 +966,6 @@ impl ParserV3 {
                     right: Box::new(right),
                 },
                 span,
-                ty: None,
             };
         }
 
@@ -988,7 +990,6 @@ impl ParserV3 {
                     right: Box::new(right),
                 },
                 span,
-                ty: None,
             };
         }
 
@@ -1109,7 +1110,6 @@ impl ParserV3 {
                         generics,
                     },
                     span,
-                    ty: None,
                 });
             }
         }
@@ -1192,7 +1192,10 @@ impl ParserV3 {
             let right_name = match_to_string(&right);
             let right_span = right.span;
             let args = match right.kind {
-                MirExprKind::Call { callee: MirCallee::Name(_name), mut args } => {
+                MirExprKind::Call {
+                    callee: MirCallee::Name(_name),
+                    mut args,
+                } => {
                     // If right is already a call, prepend left as first arg
                     args.insert(0, left);
                     args
@@ -1339,9 +1342,7 @@ impl ParserV3 {
         let tok = self.advance()?;
 
         match tok.token_type {
-            TokenType::String(ref s) => {
-                Some(MirExpr::lit(Literal::String(s.clone(), span), span))
-            }
+            TokenType::String(ref s) => Some(MirExpr::lit(Literal::String(s.clone(), span), span)),
             TokenType::PromptString(ref s) => {
                 // Parse prompt string: p"text {expr} more {expr}"
                 // Split into parts: literal strings and interpolated expressions
@@ -1349,7 +1350,6 @@ impl ParserV3 {
                 Some(MirExpr {
                     kind: MirExprKind::Prompt { parts },
                     span,
-                    ty: None,
                 })
             }
             _ => None,
@@ -1447,7 +1447,6 @@ impl ParserV3 {
         Some(MirExpr {
             kind: MirExprKind::TypeAlias { name, target },
             span,
-            ty: None,
         })
     }
 
@@ -1476,7 +1475,6 @@ impl ParserV3 {
         Some(MirExpr {
             kind: MirExprKind::EnumDef { name, variants },
             span,
-            ty: None,
         })
     }
 
@@ -1508,7 +1506,6 @@ impl ParserV3 {
         Some(MirExpr {
             kind: MirExprKind::StructDef { name, fields },
             span,
-            ty: None,
         })
     }
 
@@ -1537,7 +1534,6 @@ impl ParserV3 {
         Some(MirExpr {
             kind: MirExprKind::Import(path),
             span,
-            ty: None,
         })
     }
 
@@ -1580,7 +1576,6 @@ impl ParserV3 {
         Some(MirExpr {
             kind: MirExprKind::MacroDef { name, params },
             span,
-            ty: None,
         })
     }
 
@@ -1883,10 +1878,7 @@ fn parse_prompt_parts(content: &str, span: Span) -> Vec<MirExpr> {
 
     // Flush remaining text
     if !current_text.is_empty() || parts.is_empty() {
-        parts.push(MirExpr::lit(
-            Literal::String(current_text, span),
-            span,
-        ));
+        parts.push(MirExpr::lit(Literal::String(current_text, span), span));
     }
 
     parts

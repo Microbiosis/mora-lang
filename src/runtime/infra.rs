@@ -3,8 +3,8 @@
 use std::sync::{Arc, Mutex};
 
 use crate::event::EventBus;
-use crate::interpreter::LruCache;
 use crate::record::Recorder;
+use crate::runtime::types::LruCache;
 use crate::schedule::Scheduler;
 use crate::value::Value;
 

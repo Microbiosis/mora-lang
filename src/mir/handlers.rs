@@ -12,18 +12,19 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use crate::checkpoint::Checkpoint;
 use crate::common::BinaryOp;
 use crate::flow::eval_binary;
-use crate::interpreter::Interpreter;
-use crate::checkpoint::Checkpoint;
-use crate::mir::interp::{build_task_registry, index_value, run_mir, self_match_pattern};
 use crate::mir::expr::{MirOrchestrateKind, MirPregelConfig};
+use crate::mir::host::MirHost;
+use crate::mir::interp::{build_task_registry, index_value, run_mir, self_match_pattern};
 use crate::mir::{MirFunction, MirInst, Reg};
+use crate::runtime::types::{TraitInfo, TraitMethodSig};
 use crate::value::{Environment, Value};
 
-use super::interp::value_to_string;
 use super::interp::index_assign_value;
 use super::interp::is_truthy;
+use super::interp::value_to_string;
 
 /// What the linear interpreter should do after a handler runs.
 #[derive(Debug)]
@@ -73,7 +74,7 @@ pub fn h_call(
     name: &str,
     args: &[Reg],
     task_registry: &HashMap<&str, (&[String], &MirFunction)>,
-    interp: &mut Interpreter,
+    interp: &mut dyn MirHost,
     env: &mut Environment,
 ) -> Result<(), String> {
     let arg_vals: Vec<Value> = args.iter().map(|r| regs[*r].clone()).collect();
@@ -126,7 +127,7 @@ pub fn h_method_call(
     receiver: Reg,
     method: &str,
     args: &[Reg],
-    interp: &mut Interpreter,
+    interp: &mut dyn MirHost,
 ) -> Result<(), String> {
     let recv_val = regs[receiver].clone();
     let arg_vals: Vec<Value> = args.iter().map(|r| regs[*r].clone()).collect();
@@ -139,7 +140,7 @@ pub fn h_pipe(
     dst: Reg,
     lhs: Reg,
     rhs: Reg,
-    interp: &mut Interpreter,
+    interp: &mut dyn MirHost,
 ) -> Result<(), String> {
     let lhs_val = regs[lhs].clone();
     let rhs_val = regs[rhs].clone();
@@ -160,11 +161,11 @@ pub fn h_closure(
     dst: Reg,
     params: &[String],
     body: &MirFunction,
-    interp: &Interpreter,
+    interp: &dyn MirHost,
 ) {
     let closure = Value::Closure {
         params: params.to_vec(),
-        env: crate::value::EnvRef::from_arc_mutex(interp.core.environment.clone()),
+        env: crate::value::EnvRef::from_arc_mutex(interp.environment()),
         mir_body: Arc::new(body.clone()),
     };
     regs[dst] = closure;
@@ -217,23 +218,24 @@ pub fn h_struct_def(env: &mut Environment, name: &str, fields: &[crate::common::
         name.to_string(),
         Value::Dict(HashMap::from([(
             "__struct_fields__".to_string(),
-            Value::List(field_names.iter().map(|s| Value::String(s.clone())).collect()),
+            Value::List(
+                field_names
+                    .iter()
+                    .map(|s| Value::String(s.clone()))
+                    .collect(),
+            ),
         )])),
         false,
     );
 }
 
-pub fn h_import(
-    interp: &mut Interpreter,
-    env: &mut Environment,
-    path: &str,
-) -> Result<(), String> {
+pub fn h_import(interp: &mut dyn MirHost, env: &mut Environment, path: &str) -> Result<(), String> {
     interp.mir_import(path, env)?;
     Ok(())
 }
 
 pub fn h_with_config(
-    interp: &mut Interpreter,
+    interp: &mut dyn MirHost,
     env: &mut Environment,
     regs: &[Value],
     bindings: &[(String, Reg)],
@@ -253,7 +255,10 @@ pub fn h_with_config(
         match crate::mir::jit::run_jit(&ssa, interp, &mut child_env) {
             Ok(v) => v,
             Err(e) => {
-                eprintln!("JIT compilation failed ({}), falling back to MIR interpreter", e);
+                eprintln!(
+                    "JIT compilation failed ({}), falling back to MIR interpreter",
+                    e
+                );
                 run_mir(body, interp, &mut child_env)?
             }
         }
@@ -267,7 +272,10 @@ pub fn h_with_config(
 pub fn h_macro_def(env: &mut Environment, name: &str, params: &[String]) {
     env.define(
         name.to_string(),
-        Value::Macro { name: name.to_string(), params: params.to_vec() },
+        Value::Macro {
+            name: name.to_string(),
+            params: params.to_vec(),
+        },
         false,
     );
 }
@@ -279,7 +287,7 @@ pub fn h_macro_def(env: &mut Environment, name: &str, params: &[String]) {
 /// Returns the body's final value AND any merge conflicts (currently
 /// discarded by callers; reserved for future observability hooks).
 fn run_isolated(
-    interp: &mut Interpreter,
+    interp: &mut dyn MirHost,
     env: &mut Environment,
     body: &MirFunction,
 ) -> Result<(crate::value::Value, Vec<crate::value::Conflict>), String> {
@@ -288,7 +296,9 @@ fn run_isolated(
     let strategies = interp.current_merge_strategies();
     let conflicts = match strategies.as_ref() {
         Some(s) => env.merge_from_with_strategies(
-            &child_env, s, &crate::value::MergeStrategy::LastWriteWins,
+            &child_env,
+            s,
+            &crate::value::MergeStrategy::LastWriteWins,
         ),
         None => {
             env.merge_from(&child_env, &crate::value::MergeStrategy::LastWriteWins);
@@ -299,7 +309,7 @@ fn run_isolated(
 }
 
 pub fn h_transaction(
-    interp: &mut Interpreter,
+    interp: &mut dyn MirHost,
     env: &mut Environment,
     body: &MirFunction,
     compensation: &MirFunction,
@@ -315,7 +325,7 @@ pub fn h_transaction(
 }
 
 pub fn h_send(
-    interp: &mut Interpreter,
+    interp: &mut dyn MirHost,
     regs: &[Value],
     value: Reg,
     target: &str,
@@ -325,7 +335,7 @@ pub fn h_send(
     // the BSP engine's pending_sends before each super-step, so the message
     // reaches its target_node in the next super-step.
     // v0.70: Removed crossbeam worker_channels fallback (was dead code).
-    interp.core.dynamic_sends.push(crate::checkpoint::SendTask {
+    interp.dynamic_sends().push(crate::checkpoint::SendTask {
         target_node: target.to_string(),
         input: val,
     });
@@ -335,7 +345,7 @@ pub fn h_send(
 /// v0.71: Contribute a value to a per-super-step aggregator.
 /// Currently a no-op when no Pregel run is active (aggregators are BSP-only).
 pub fn h_aggregate(
-    interp: &mut Interpreter,
+    interp: &mut dyn MirHost,
     regs: &[Value],
     value: Reg,
     name: &str,
@@ -350,7 +360,7 @@ pub fn h_aggregate(
 }
 
 pub fn h_receive(
-    interp: &mut Interpreter,
+    interp: &mut dyn MirHost,
     env: &mut Environment,
     var: &str,
     source: &str,
@@ -358,14 +368,14 @@ pub fn h_receive(
     // v0.70: Read from interpreter's shared environment rather than crossbeam
     // worker_receivers (removed — was dead code). Matches BSP semantics:
     // values flow through channels, not blocking queues.
-    if let Some(val) = interp.core.environment.lock().get(source) {
+    if let Some(val) = interp.environment().lock().get(source) {
         env.define(var.to_string(), val, false);
     }
     Ok(())
 }
 
 pub fn h_worker(
-    interp: &mut Interpreter,
+    interp: &mut dyn MirHost,
     env: &mut Environment,
     body: &MirFunction,
 ) -> Result<(), String> {
@@ -374,7 +384,7 @@ pub fn h_worker(
 }
 
 pub fn h_observe(
-    interp: &mut Interpreter,
+    interp: &mut dyn MirHost,
     env: &mut Environment,
     body: &MirFunction,
 ) -> Result<(), String> {
@@ -386,7 +396,7 @@ pub fn h_observe(
 }
 
 pub fn h_span(
-    interp: &mut Interpreter,
+    interp: &mut dyn MirHost,
     env: &mut Environment,
     body: &MirFunction,
 ) -> Result<(), String> {
@@ -396,7 +406,7 @@ pub fn h_span(
 }
 
 pub fn h_save(
-    interp: &mut Interpreter,
+    interp: &mut dyn MirHost,
     regs: &[Value],
     path: Reg,
     value: Reg,
@@ -411,7 +421,7 @@ pub fn h_save(
 }
 
 pub fn h_load(
-    interp: &mut Interpreter,
+    interp: &mut dyn MirHost,
     env: &mut Environment,
     regs: &[Value],
     path: Reg,
@@ -424,7 +434,7 @@ pub fn h_load(
 }
 
 pub fn h_read_file(
-    interp: &mut Interpreter,
+    interp: &mut dyn MirHost,
     env: &mut Environment,
     regs: &[Value],
     path: Reg,
@@ -437,7 +447,7 @@ pub fn h_read_file(
 }
 
 pub fn h_write_file(
-    interp: &mut Interpreter,
+    interp: &mut dyn MirHost,
     regs: &[Value],
     path: Reg,
     content: Reg,
@@ -452,7 +462,7 @@ pub fn h_write_file(
 }
 
 pub fn h_append_file(
-    interp: &mut Interpreter,
+    interp: &mut dyn MirHost,
     regs: &[Value],
     path: Reg,
     content: Reg,
@@ -467,7 +477,7 @@ pub fn h_append_file(
 }
 
 pub fn h_read_bytes_file(
-    interp: &mut Interpreter,
+    interp: &mut dyn MirHost,
     env: &mut Environment,
     regs: &[Value],
     path: Reg,
@@ -480,7 +490,7 @@ pub fn h_read_bytes_file(
 }
 
 pub fn h_write_bytes_file(
-    interp: &mut Interpreter,
+    interp: &mut dyn MirHost,
     regs: &[Value],
     path: Reg,
     content: Reg,
@@ -495,43 +505,57 @@ pub fn h_write_bytes_file(
 }
 
 pub fn h_trait_def(
-    interp: &mut Interpreter,
+    interp: &mut dyn MirHost,
     env: &mut Environment,
     name: &str,
     parents: &[String],
     methods: &[crate::mir::expr::MirTraitMethod],
     method_bodies: &[MirFunction],
 ) -> Result<(), String> {
-    use crate::interpreter::TraitInfo;
-    use crate::interpreter::TraitMethodSig;
     let sigs: Vec<TraitMethodSig> = methods
         .iter()
         .map(|m| TraitMethodSig {
             name: m.name.clone(),
-            params: m.params.iter().map(|p| (p.name.clone(), p.type_hint.as_ref().map(|t| t.name()))).collect(),
+            params: m
+                .params
+                .iter()
+                .map(|p| (p.name.clone(), p.type_hint.as_ref().map(|t| t.name())))
+                .collect(),
             return_type: m.return_type.clone(),
             has_self: m.params.first().map(|p| p.name == "self").unwrap_or(false),
         })
         .collect();
-    Arc::make_mut(&mut interp.registry.trait_registry).insert(
+    Arc::make_mut(interp.trait_registry()).insert(
         name.to_string(),
-        TraitInfo { name: name.to_string(), parents: parents.to_vec(), methods: sigs },
+        TraitInfo {
+            name: name.to_string(),
+            parents: parents.to_vec(),
+            methods: sigs,
+        },
     );
     for (m, body) in methods.iter().zip(method_bodies.iter()) {
         if let Some(mfn) = &m.body {
-            let key = crate::interpreter::default_impl_method_key(name, &Vec::<String>::new(), &m.name);
-            env.define(key, Value::Task {
-                name: m.name.clone(),
-                params: m.params.iter().map(|p| p.name.clone()).collect(),
-                mir_body: Arc::new(mfn.clone()),
-            }, false);
+            let key = crate::runtime::types::default_impl_method_key(
+                name,
+                &Vec::<String>::new(),
+                &m.name,
+            );
+            env.define(
+                key,
+                Value::Task {
+                    name: m.name.clone(),
+                    params: m.params.iter().map(|p| p.name.clone()).collect(),
+                    mir_body: Arc::new(mfn.clone()),
+                },
+                false,
+            );
         }
     }
     Ok(())
 }
 
 pub fn h_impl_def(
-    interp: &mut Interpreter,
+    interp: &mut dyn MirHost,
     env: &mut Environment,
     trait_name: &str,
     trait_generics: &[String],
@@ -540,36 +564,56 @@ pub fn h_impl_def(
     methods: &[crate::mir::expr::MirFnDef],
     method_bodies: &[MirFunction],
 ) -> Result<(), String> {
-    Arc::make_mut(&mut interp.registry.impl_table)
+    Arc::make_mut(interp.impl_table())
         .entry(trait_name.to_string())
         .or_default()
         .push(for_type.to_string());
     for (m, _body) in methods.iter().zip(method_bodies.iter()) {
         if let Some(mfn) = &m.body {
-            let key = crate::interpreter::impl_method_key(trait_name, trait_generics, for_type, for_generics, &m.name);
-            env.define(key, Value::Task {
-                name: m.name.clone(),
-                params: m.params.iter().map(|p| p.name.clone()).collect(),
-                mir_body: Arc::new(mfn.clone()),
-            }, false);
+            let key = crate::runtime::types::impl_method_key(
+                trait_name,
+                trait_generics,
+                for_type,
+                for_generics,
+                &m.name,
+            );
+            env.define(
+                key,
+                Value::Task {
+                    name: m.name.clone(),
+                    params: m.params.iter().map(|p| p.name.clone()).collect(),
+                    mir_body: Arc::new(mfn.clone()),
+                },
+                false,
+            );
         }
     }
     Ok(())
 }
 
 pub fn h_orchestrate(
-    interp: &mut Interpreter,
+    interp: &mut dyn MirHost,
     env: &mut Environment,
     input_var: &str,
     result_var: &str,
     kind: &MirOrchestrateKind,
 ) -> Result<(), String> {
-    use crate::interpreter::mir_pregel_engine::MirPregelEngine;
+    use crate::pregel::MirPregelEngine;
     match kind {
-        MirOrchestrateKind::Pregel { agents, edges, state_schema, checkpoint, interrupt_points, adjacency } => {
+        MirOrchestrateKind::Pregel {
+            agents,
+            edges,
+            state_schema,
+            checkpoint,
+            interrupt_points,
+            adjacency,
+        } => {
             let config = MirPregelConfig {
-                agents: agents.clone(), edges: edges.clone(), state_schema: state_schema.clone(),
-                checkpoint: checkpoint.clone(), interrupt_points: interrupt_points.clone(),
+                agents: agents.clone(),
+                edges: edges.clone(),
+                state_schema: state_schema.clone(),
+                checkpoint: checkpoint.clone(),
+                interrupt_points: interrupt_points.clone(),
                 adjacency: adjacency.clone(),
                 aggregators: Vec::new(),
                 master_compute: None,
@@ -578,7 +622,7 @@ pub fn h_orchestrate(
 
             // v0.66: Wire PersistRuntime's checkpoint saver into the engine
             // so the auto-save block in BSP ADVANCE actually persists.
-            if let Some(saver) = interp.persist.checkpoint_saver() {
+            if let Some(saver) = interp.checkpoint_saver() {
                 engine = engine.with_checkpoint_saver(saver);
             }
 
@@ -606,19 +650,27 @@ pub fn h_orchestrate(
             }));
 
             // v0.69: Flush dynamic_sends into engine before run
-            let pending = std::mem::take(&mut interp.core.dynamic_sends);
+            let pending = std::mem::take(interp.dynamic_sends());
             engine.flush_pending_sends(pending);
             let result = engine.run(interp)?;
 
             // v0.62: Expose conflicts as a structured list
-            let conflict_list: Vec<Value> = captured.lock().iter().map(|c| {
-                let mut d: HashMap<String, Value> = HashMap::new();
-                d.insert("key".into(), Value::String(c.key.clone()));
-                d.insert("parent_value".into(), c.parent_value.clone());
-                d.insert("child_value".into(), c.child_value.clone());
-                Value::Dict(d)
-            }).collect();
-            env.define(format!("{}_conflicts", result_var), Value::List(conflict_list), false);
+            let conflict_list: Vec<Value> = captured
+                .lock()
+                .iter()
+                .map(|c| {
+                    let mut d: HashMap<String, Value> = HashMap::new();
+                    d.insert("key".into(), Value::String(c.key.clone()));
+                    d.insert("parent_value".into(), c.parent_value.clone());
+                    d.insert("child_value".into(), c.child_value.clone());
+                    Value::Dict(d)
+                })
+                .collect();
+            env.define(
+                format!("{}_conflicts", result_var),
+                Value::List(conflict_list),
+                false,
+            );
             env.define(result_var.to_string(), result, false);
             Ok(())
         }
@@ -648,7 +700,10 @@ pub fn h_eval(
             given_val == expect_val
         };
         if !pass {
-            return Err(format!("eval '{}': assertion failed: given {:?}, expected {:?}", name, given_val, expect_val));
+            return Err(format!(
+                "eval '{}': assertion failed: given {:?}, expected {:?}",
+                name, given_val, expect_val
+            ));
         }
     }
     eprintln!("eval '{}': PASSED", name);
@@ -668,34 +723,51 @@ pub fn h_skill_def(
 ) {
     let mut meta = HashMap::new();
     meta.insert("name".to_string(), Value::String(name.to_string()));
-    if let Some(d) = description { meta.insert("description".to_string(), Value::String(d.clone())); }
-    if let Some(v) = version { meta.insert("version".to_string(), Value::String(v.clone())); }
-    meta.insert("requires".to_string(), Value::List(requires.iter().map(|r| Value::String(r.clone())).collect()));
+    if let Some(d) = description {
+        meta.insert("description".to_string(), Value::String(d.clone()));
+    }
+    if let Some(v) = version {
+        meta.insert("version".to_string(), Value::String(v.clone()));
+    }
+    meta.insert(
+        "requires".to_string(),
+        Value::List(requires.iter().map(|r| Value::String(r.clone())).collect()),
+    );
     for (task, _body) in tasks.iter().zip(task_bodies.iter()) {
         if let Some(mfn) = &task.body {
-            meta.insert(task.name.clone(), Value::Task {
-                name: task.name.clone(),
-                params: task.params.iter().map(|p| p.name.clone()).collect(),
-                mir_body: Arc::new(mfn.clone()),
-            });
+            meta.insert(
+                task.name.clone(),
+                Value::Task {
+                    name: task.name.clone(),
+                    params: task.params.iter().map(|p| p.name.clone()).collect(),
+                    mir_body: Arc::new(mfn.clone()),
+                },
+            );
         }
     }
     if let Some(v) = verify {
         let vp: Vec<String> = v.params.iter().map(|p| p.name.clone()).collect();
-        let empty = MirFunction { params: vp.clone(), body: Vec::new(), n_regs: 0 };
+        let empty = MirFunction {
+            params: vp.clone(),
+            body: Vec::new(),
+            n_regs: 0,
+        };
         let verify_mir = v.body.clone().unwrap_or(empty);
         let _ = verify_body;
-        meta.insert("verify".to_string(), Value::Task {
-            name: "verify".to_string(),
-            params: vp,
-            mir_body: Arc::new(verify_mir),
-        });
+        meta.insert(
+            "verify".to_string(),
+            Value::Task {
+                name: "verify".to_string(),
+                params: vp,
+                mir_body: Arc::new(verify_mir),
+            },
+        );
     }
     env.define(name.to_string(), Value::Dict(meta), false);
 }
 
 pub fn h_prompt_section(
-    interp: &mut Interpreter,
+    interp: &mut dyn MirHost,
     env: &mut Environment,
     body: &MirFunction,
 ) -> Result<(), String> {
@@ -705,7 +777,7 @@ pub fn h_prompt_section(
 }
 
 pub fn h_document_section(
-    interp: &mut Interpreter,
+    interp: &mut dyn MirHost,
     env: &mut Environment,
     body: &MirFunction,
 ) -> Result<(), String> {
@@ -715,7 +787,7 @@ pub fn h_document_section(
 }
 
 pub fn h_match_expr(
-    interp: &mut Interpreter,
+    interp: &mut dyn MirHost,
     env: &mut Environment,
     regs: &mut [Value],
     val: Reg,
@@ -740,7 +812,7 @@ pub fn h_match_expr(
 }
 
 pub fn h_stream_for(
-    interp: &mut Interpreter,
+    interp: &mut dyn MirHost,
     env: &mut Environment,
     _body: &MirFunction,
 ) -> Result<(), String> {
@@ -825,7 +897,9 @@ impl MirInst {
             MirInst::BinaryOp(_, lhs, _, rhs) => vec![*lhs, *rhs],
             MirInst::Call(_, _, args) => args.clone(),
             MirInst::MethodCall(_, receiver, _, args) => {
-                let mut v = vec![*receiver]; v.extend(args); v
+                let mut v = vec![*receiver];
+                v.extend(args);
+                v
             }
             MirInst::ListLit(_, items) => items.clone(),
             MirInst::DictLit(_, entries) => entries.iter().map(|(_, r)| *r).collect(),
@@ -835,7 +909,11 @@ impl MirInst {
             MirInst::Prompt(_, parts) => parts.clone(),
             MirInst::MatchExpr { val, arms } => {
                 let mut v = vec![*val];
-                for arm in arms { if let Some(g) = arm.1 { v.push(g); } }
+                for arm in arms {
+                    if let Some(g) = arm.1 {
+                        v.push(g);
+                    }
+                }
                 v
             }
             MirInst::MatchArm { cond_reg, .. } => cond_reg.map(|r| vec![r]).unwrap_or_default(),
@@ -860,40 +938,97 @@ impl MirInst {
             MirInst::WriteBytesFile { path, content } => vec![*path, *content],
             MirInst::Eval { given_reg, .. } => vec![*given_reg],
             MirInst::WithConfig { bindings, .. } => bindings.iter().map(|(_, r)| *r).collect(),
-            MirInst::TaskDef { .. } | MirInst::ToolDef { .. } | MirInst::Import(_)
-            | MirInst::StreamFor { .. } | MirInst::TypeAlias { .. } | MirInst::EnumDef { .. }
-            | MirInst::StructDef { .. } | MirInst::MacroDef { .. } | MirInst::Transaction { .. }
-            | MirInst::Rollback | MirInst::Worker { .. } | MirInst::Commit | MirInst::Route(_)
-            | MirInst::Observe { .. } | MirInst::Span { .. } | MirInst::RecordTokens { .. }
-            | MirInst::TraitDef { .. } | MirInst::ImplDef { .. } | MirInst::Orchestrate { .. }
-            | MirInst::SkillDef { .. } | MirInst::PromptSection { .. } | MirInst::DocumentSection { .. }
-            | MirInst::Label(_) | MirInst::Jump(_) | MirInst::Break(_) | MirInst::Continue(_)
+            MirInst::TaskDef { .. }
+            | MirInst::ToolDef { .. }
+            | MirInst::Import(_)
+            | MirInst::StreamFor { .. }
+            | MirInst::TypeAlias { .. }
+            | MirInst::EnumDef { .. }
+            | MirInst::StructDef { .. }
+            | MirInst::MacroDef { .. }
+            | MirInst::Transaction { .. }
+            | MirInst::Rollback
+            | MirInst::Worker { .. }
+            | MirInst::Commit
+            | MirInst::Route(_)
+            | MirInst::Observe { .. }
+            | MirInst::Span { .. }
+            | MirInst::RecordTokens { .. }
+            | MirInst::TraitDef { .. }
+            | MirInst::ImplDef { .. }
+            | MirInst::Orchestrate { .. }
+            | MirInst::SkillDef { .. }
+            | MirInst::PromptSection { .. }
+            | MirInst::DocumentSection { .. }
+            | MirInst::Label(_)
+            | MirInst::Jump(_)
+            | MirInst::Break(_)
+            | MirInst::Continue(_)
             | MirInst::Halt(_) => vec![],
         }
     }
 
     pub fn is_effect(&self) -> bool {
         match self {
-            MirInst::Define(_, _) | MirInst::Assign(_, _) | MirInst::Expr(_)
-            | MirInst::IndexAssign(_, _, _) | MirInst::Send { .. } | MirInst::Receive { .. }
-            | MirInst::Rollback | MirInst::Commit | MirInst::Save { .. } | MirInst::Load { .. }
-            | MirInst::ReadFile { .. } | MirInst::WriteFile { .. } | MirInst::AppendFile { .. }
-            | MirInst::ReadBytesFile { .. } | MirInst::WriteBytesFile { .. }
-            | MirInst::Orchestrate { .. } | MirInst::RecordTokens { .. } | MirInst::Eval { .. }
-            | MirInst::Import(_) | MirInst::TypeAlias { .. } | MirInst::EnumDef { .. }
-            | MirInst::StructDef { .. } | MirInst::MacroDef { .. } | MirInst::TraitDef { .. }
-            | MirInst::ImplDef { .. } | MirInst::TaskDef { .. } | MirInst::ToolDef { .. }
-            | MirInst::SkillDef { .. } | MirInst::Route(_) | MirInst::WithConfig { .. }
-            | MirInst::Transaction { .. } | MirInst::Worker { .. } | MirInst::Observe { .. }
-            | MirInst::Span { .. } | MirInst::PromptSection { .. } | MirInst::DocumentSection { .. }
-            | MirInst::StreamFor { .. } | MirInst::Return(_) | MirInst::Halt(_) => true,
-            MirInst::Const(_, _) | MirInst::Var(_, _) | MirInst::BinaryOp(_, _, _, _)
-            | MirInst::Call(_, _, _) | MirInst::MethodCall(_, _, _, _) | MirInst::ListLit(_, _)
-            | MirInst::DictLit(_, _) | MirInst::Index(_, _, _) | MirInst::Pipe(_, _, _)
-            | MirInst::Prompt(_, _) | MirInst::MatchExpr { .. } | MirInst::MatchArm { .. }
-            | MirInst::Closure { .. } | MirInst::DynTrait { .. } | MirInst::Label(_)
-            | MirInst::Jump(_) | MirInst::JumpIf(_, _) | MirInst::JumpIfNot(_, _)
-            | MirInst::Break(_) | MirInst::Continue(_) => false,
+            MirInst::Define(_, _)
+            | MirInst::Assign(_, _)
+            | MirInst::Expr(_)
+            | MirInst::IndexAssign(_, _, _)
+            | MirInst::Send { .. }
+            | MirInst::Receive { .. }
+            | MirInst::Rollback
+            | MirInst::Commit
+            | MirInst::Save { .. }
+            | MirInst::Load { .. }
+            | MirInst::ReadFile { .. }
+            | MirInst::WriteFile { .. }
+            | MirInst::AppendFile { .. }
+            | MirInst::ReadBytesFile { .. }
+            | MirInst::WriteBytesFile { .. }
+            | MirInst::Orchestrate { .. }
+            | MirInst::RecordTokens { .. }
+            | MirInst::Eval { .. }
+            | MirInst::Import(_)
+            | MirInst::TypeAlias { .. }
+            | MirInst::EnumDef { .. }
+            | MirInst::StructDef { .. }
+            | MirInst::MacroDef { .. }
+            | MirInst::TraitDef { .. }
+            | MirInst::ImplDef { .. }
+            | MirInst::TaskDef { .. }
+            | MirInst::ToolDef { .. }
+            | MirInst::SkillDef { .. }
+            | MirInst::Route(_)
+            | MirInst::WithConfig { .. }
+            | MirInst::Transaction { .. }
+            | MirInst::Worker { .. }
+            | MirInst::Observe { .. }
+            | MirInst::Span { .. }
+            | MirInst::PromptSection { .. }
+            | MirInst::DocumentSection { .. }
+            | MirInst::StreamFor { .. }
+            | MirInst::Return(_)
+            | MirInst::Halt(_) => true,
+            MirInst::Const(_, _)
+            | MirInst::Var(_, _)
+            | MirInst::BinaryOp(_, _, _, _)
+            | MirInst::Call(_, _, _)
+            | MirInst::MethodCall(_, _, _, _)
+            | MirInst::ListLit(_, _)
+            | MirInst::DictLit(_, _)
+            | MirInst::Index(_, _, _)
+            | MirInst::Pipe(_, _, _)
+            | MirInst::Prompt(_, _)
+            | MirInst::MatchExpr { .. }
+            | MirInst::MatchArm { .. }
+            | MirInst::Closure { .. }
+            | MirInst::DynTrait { .. }
+            | MirInst::Label(_)
+            | MirInst::Jump(_)
+            | MirInst::JumpIf(_, _)
+            | MirInst::JumpIfNot(_, _)
+            | MirInst::Break(_)
+            | MirInst::Continue(_) => false,
         }
     }
 }
@@ -905,65 +1040,259 @@ impl MirInst {
 pub fn dispatch(
     inst: &MirInst,
     regs: &mut [Value],
-    interp: &mut Interpreter,
+    interp: &mut dyn MirHost,
     env: &mut Environment,
     task_registry: &HashMap<&str, (&[String], &MirFunction)>,
 ) -> Result<Flow, String> {
     match inst {
         // ── Pure value ──
-        MirInst::Const(dst, v) => { h_const(regs, *dst, v); Ok(Flow::Continue) }
-        MirInst::Var(dst, name) => { h_var(regs, *dst, name, env); Ok(Flow::Continue) }
-        MirInst::BinaryOp(dst, l, op, r) => { h_binary_op(regs, *dst, *l, op, *r)?; Ok(Flow::Continue) }
-        MirInst::Call(dst, name, args) => { h_call(regs, *dst, name, args, task_registry, interp, env)?; Ok(Flow::Continue) }
-        MirInst::ListLit(dst, items) => { h_list_lit(regs, *dst, items); Ok(Flow::Continue) }
-        MirInst::DictLit(dst, entries) => { h_dict_lit(regs, *dst, entries); Ok(Flow::Continue) }
-        MirInst::Index(dst, obj, idx) => { h_index(regs, *dst, *obj, *idx)?; Ok(Flow::Continue) }
-        MirInst::MethodCall(dst, recv, method, args) => { h_method_call(regs, *dst, *recv, method, args, interp)?; Ok(Flow::Continue) }
-        MirInst::Pipe(dst, lhs, rhs) => { h_pipe(regs, *dst, *lhs, *rhs, interp)?; Ok(Flow::Continue) }
-        MirInst::Prompt(dst, parts) => { h_prompt(regs, *dst, parts); Ok(Flow::Continue) }
-        MirInst::Closure { dst, params, body } => { h_closure(regs, *dst, params, body, interp); Ok(Flow::Continue) }
-        MirInst::DynTrait { dst, src, trait_generics, trait_name } => { h_dyn_trait(regs, *dst, *src, trait_name, trait_generics); Ok(Flow::Continue) }
-        MirInst::MatchExpr { val, arms } => { h_match_expr(interp, env, regs, *val, arms)?; Ok(Flow::Continue) }
+        MirInst::Const(dst, v) => {
+            h_const(regs, *dst, v);
+            Ok(Flow::Continue)
+        }
+        MirInst::Var(dst, name) => {
+            h_var(regs, *dst, name, env);
+            Ok(Flow::Continue)
+        }
+        MirInst::BinaryOp(dst, l, op, r) => {
+            h_binary_op(regs, *dst, *l, op, *r)?;
+            Ok(Flow::Continue)
+        }
+        MirInst::Call(dst, name, args) => {
+            h_call(regs, *dst, name, args, task_registry, interp, env)?;
+            Ok(Flow::Continue)
+        }
+        MirInst::ListLit(dst, items) => {
+            h_list_lit(regs, *dst, items);
+            Ok(Flow::Continue)
+        }
+        MirInst::DictLit(dst, entries) => {
+            h_dict_lit(regs, *dst, entries);
+            Ok(Flow::Continue)
+        }
+        MirInst::Index(dst, obj, idx) => {
+            h_index(regs, *dst, *obj, *idx)?;
+            Ok(Flow::Continue)
+        }
+        MirInst::MethodCall(dst, recv, method, args) => {
+            h_method_call(regs, *dst, *recv, method, args, interp)?;
+            Ok(Flow::Continue)
+        }
+        MirInst::Pipe(dst, lhs, rhs) => {
+            h_pipe(regs, *dst, *lhs, *rhs, interp)?;
+            Ok(Flow::Continue)
+        }
+        MirInst::Prompt(dst, parts) => {
+            h_prompt(regs, *dst, parts);
+            Ok(Flow::Continue)
+        }
+        MirInst::Closure { dst, params, body } => {
+            h_closure(regs, *dst, params, body, interp);
+            Ok(Flow::Continue)
+        }
+        MirInst::DynTrait {
+            dst,
+            src,
+            trait_generics,
+            trait_name,
+        } => {
+            h_dyn_trait(regs, *dst, *src, trait_name, trait_generics);
+            Ok(Flow::Continue)
+        }
+        MirInst::MatchExpr { val, arms } => {
+            h_match_expr(interp, env, regs, *val, arms)?;
+            Ok(Flow::Continue)
+        }
 
         // ── Side effects ──
-        MirInst::Define(name, src) => { h_define(env, name, regs, *src); Ok(Flow::Continue) }
-        MirInst::Assign(name, src) => { h_assign(env, name, regs, *src); Ok(Flow::Continue) }
+        MirInst::Define(name, src) => {
+            h_define(env, name, regs, *src);
+            Ok(Flow::Continue)
+        }
+        MirInst::Assign(name, src) => {
+            h_assign(env, name, regs, *src);
+            Ok(Flow::Continue)
+        }
         MirInst::Expr(_) => Ok(Flow::Continue),
-        MirInst::IndexAssign(obj, idx, val) => { h_index_assign(regs, *obj, *idx, *val)?; Ok(Flow::Continue) }
-        MirInst::TypeAlias { name, target } => { h_type_alias(env, name, target); Ok(Flow::Continue) }
-        MirInst::EnumDef { name, variants } => { h_enum_def(env, name, variants); Ok(Flow::Continue) }
-        MirInst::StructDef { name, fields } => { h_struct_def(env, name, fields); Ok(Flow::Continue) }
-        MirInst::Import(path) => { h_import(interp, env, path)?; Ok(Flow::Continue) }
-        MirInst::WithConfig { bindings, body, jit } => { h_with_config(interp, env, regs, bindings, body, *jit)?; Ok(Flow::Continue) }
-        MirInst::MacroDef { name, params } => { h_macro_def(env, name, params); Ok(Flow::Continue) }
-        MirInst::Transaction { body, compensation } => h_transaction(interp, env, body, compensation),
-        MirInst::Send { value, target } => { h_send(interp, regs, *value, target)?; Ok(Flow::Continue) }
-        MirInst::Receive { var, source } => { h_receive(interp, env, var, source)?; Ok(Flow::Continue) }
+        MirInst::IndexAssign(obj, idx, val) => {
+            h_index_assign(regs, *obj, *idx, *val)?;
+            Ok(Flow::Continue)
+        }
+        MirInst::TypeAlias { name, target } => {
+            h_type_alias(env, name, target);
+            Ok(Flow::Continue)
+        }
+        MirInst::EnumDef { name, variants } => {
+            h_enum_def(env, name, variants);
+            Ok(Flow::Continue)
+        }
+        MirInst::StructDef { name, fields } => {
+            h_struct_def(env, name, fields);
+            Ok(Flow::Continue)
+        }
+        MirInst::Import(path) => {
+            h_import(interp, env, path)?;
+            Ok(Flow::Continue)
+        }
+        MirInst::WithConfig {
+            bindings,
+            body,
+            jit,
+        } => {
+            h_with_config(interp, env, regs, bindings, body, *jit)?;
+            Ok(Flow::Continue)
+        }
+        MirInst::MacroDef { name, params } => {
+            h_macro_def(env, name, params);
+            Ok(Flow::Continue)
+        }
+        MirInst::Transaction { body, compensation } => {
+            h_transaction(interp, env, body, compensation)
+        }
+        MirInst::Send { value, target } => {
+            h_send(interp, regs, *value, target)?;
+            Ok(Flow::Continue)
+        }
+        MirInst::Receive { var, source } => {
+            h_receive(interp, env, var, source)?;
+            Ok(Flow::Continue)
+        }
         MirInst::Rollback => Err("Transaction rolled back".to_string()),
         MirInst::Commit => Ok(Flow::Continue),
-        MirInst::Worker { name: _, body } => { h_worker(interp, env, body)?; Ok(Flow::Continue) }
+        MirInst::Worker { name: _, body } => {
+            h_worker(interp, env, body)?;
+            Ok(Flow::Continue)
+        }
         MirInst::Route(name) => Err(format!("route '{}' not implemented", name)),
-        MirInst::Observe { config: _, body } => { h_observe(interp, env, body)?; Ok(Flow::Continue) }
-        MirInst::Span { name: _, body } => { h_span(interp, env, body)?; Ok(Flow::Continue) }
+        MirInst::Observe { config: _, body } => {
+            h_observe(interp, env, body)?;
+            Ok(Flow::Continue)
+        }
+        MirInst::Span { name: _, body } => {
+            h_span(interp, env, body)?;
+            Ok(Flow::Continue)
+        }
         MirInst::RecordTokens { .. } => Ok(Flow::Continue),
-        MirInst::Save { path, value } => { h_save(interp, regs, *path, *value)?; Ok(Flow::Continue) }
-        MirInst::Load { path, var } => { h_load(interp, env, regs, *path, var)?; Ok(Flow::Continue) }
-        MirInst::ReadFile { path, var } => { h_read_file(interp, env, regs, *path, var)?; Ok(Flow::Continue) }
-        MirInst::WriteFile { path, content } => { h_write_file(interp, regs, *path, *content)?; Ok(Flow::Continue) }
-        MirInst::AppendFile { path, content } => { h_append_file(interp, regs, *path, *content)?; Ok(Flow::Continue) }
-        MirInst::ReadBytesFile { path, var } => { h_read_bytes_file(interp, env, regs, *path, var)?; Ok(Flow::Continue) }
-        MirInst::WriteBytesFile { path, content } => { h_write_bytes_file(interp, regs, *path, *content)?; Ok(Flow::Continue) }
-        MirInst::TraitDef { name, parents, methods, method_bodies } => { h_trait_def(interp, env, name, parents, methods, method_bodies)?; Ok(Flow::Continue) }
-        MirInst::ImplDef { trait_name, trait_generics, for_type, for_generics, methods, method_bodies } => { h_impl_def(interp, env, trait_name, trait_generics, for_type, for_generics, methods, method_bodies)?; Ok(Flow::Continue) }
-        MirInst::Orchestrate { input_var, result_var, kind } => { h_orchestrate(interp, env, input_var, result_var, kind)?; Ok(Flow::Continue) }
-        MirInst::Eval { name, given_reg, expects, tolerance, .. } => { h_eval(regs, env, name, *given_reg, expects, tolerance)?; Ok(Flow::Continue) }
-        MirInst::SkillDef { name, description, version, requires, tasks, task_bodies, verify, verify_body } => { h_skill_def(env, name, description, version, requires, tasks, task_bodies, verify, verify_body); Ok(Flow::Continue) }
-        MirInst::PromptSection { name: _, body } => { h_prompt_section(interp, env, body)?; Ok(Flow::Continue) }
-        MirInst::DocumentSection { name: _, body } => { h_document_section(interp, env, body)?; Ok(Flow::Continue) }
-        MirInst::StreamFor { prompt_reg: _, var: _, body } => { h_stream_for(interp, env, body)?; Ok(Flow::Continue) }
+        MirInst::Save { path, value } => {
+            h_save(interp, regs, *path, *value)?;
+            Ok(Flow::Continue)
+        }
+        MirInst::Load { path, var } => {
+            h_load(interp, env, regs, *path, var)?;
+            Ok(Flow::Continue)
+        }
+        MirInst::ReadFile { path, var } => {
+            h_read_file(interp, env, regs, *path, var)?;
+            Ok(Flow::Continue)
+        }
+        MirInst::WriteFile { path, content } => {
+            h_write_file(interp, regs, *path, *content)?;
+            Ok(Flow::Continue)
+        }
+        MirInst::AppendFile { path, content } => {
+            h_append_file(interp, regs, *path, *content)?;
+            Ok(Flow::Continue)
+        }
+        MirInst::ReadBytesFile { path, var } => {
+            h_read_bytes_file(interp, env, regs, *path, var)?;
+            Ok(Flow::Continue)
+        }
+        MirInst::WriteBytesFile { path, content } => {
+            h_write_bytes_file(interp, regs, *path, *content)?;
+            Ok(Flow::Continue)
+        }
+        MirInst::TraitDef {
+            name,
+            parents,
+            methods,
+            method_bodies,
+        } => {
+            h_trait_def(interp, env, name, parents, methods, method_bodies)?;
+            Ok(Flow::Continue)
+        }
+        MirInst::ImplDef {
+            trait_name,
+            trait_generics,
+            for_type,
+            for_generics,
+            methods,
+            method_bodies,
+        } => {
+            h_impl_def(
+                interp,
+                env,
+                trait_name,
+                trait_generics,
+                for_type,
+                for_generics,
+                methods,
+                method_bodies,
+            )?;
+            Ok(Flow::Continue)
+        }
+        MirInst::Orchestrate {
+            input_var,
+            result_var,
+            kind,
+        } => {
+            h_orchestrate(interp, env, input_var, result_var, kind)?;
+            Ok(Flow::Continue)
+        }
+        MirInst::Eval {
+            name,
+            given_reg,
+            expects,
+            tolerance,
+            ..
+        } => {
+            h_eval(regs, env, name, *given_reg, expects, tolerance)?;
+            Ok(Flow::Continue)
+        }
+        MirInst::SkillDef {
+            name,
+            description,
+            version,
+            requires,
+            tasks,
+            task_bodies,
+            verify,
+            verify_body,
+        } => {
+            h_skill_def(
+                env,
+                name,
+                description,
+                version,
+                requires,
+                tasks,
+                task_bodies,
+                verify,
+                verify_body,
+            );
+            Ok(Flow::Continue)
+        }
+        MirInst::PromptSection { name: _, body } => {
+            h_prompt_section(interp, env, body)?;
+            Ok(Flow::Continue)
+        }
+        MirInst::DocumentSection { name: _, body } => {
+            h_document_section(interp, env, body)?;
+            Ok(Flow::Continue)
+        }
+        MirInst::StreamFor {
+            prompt_reg: _,
+            var: _,
+            body,
+        } => {
+            h_stream_for(interp, env, body)?;
+            Ok(Flow::Continue)
+        }
 
         // ── Control flow + no-ops ──
-        MirInst::TaskDef { .. } | MirInst::ToolDef { .. } | MirInst::MatchArm { .. } | MirInst::Label(_) => Ok(Flow::Continue),
+        MirInst::TaskDef { .. }
+        | MirInst::ToolDef { .. }
+        | MirInst::MatchArm { .. }
+        | MirInst::Label(_) => Ok(Flow::Continue),
         MirInst::Jump(lbl) => Ok(h_jump(*lbl)),
         MirInst::JumpIf(cond, lbl) => Ok(h_jump_if(regs, *cond, *lbl)),
         MirInst::JumpIfNot(cond, lbl) => Ok(h_jump_if_not(regs, *cond, *lbl)),

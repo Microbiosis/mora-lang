@@ -3,14 +3,16 @@
 //! pc 循环执行 MirFunction。控制流用 Jump/Return/Break/Continue 直接改 pc，
 //! 替代 AST 解释器的 FlowSignal 枚举层层传返。
 //!
-//! α.0 复用现有 Interpreter 的 call_function / eval_binary，不重写 builtins。
+//! α.0 复用现有宿主（MirHost）的 call_function / eval_binary，不重写 builtins。
 //! 这样 MIR 解释器只替代"执行引擎"，AI/transport/sandbox facade 不受影响。
+//!
+//! v0.75.x: 参数类型从 `&mut Interpreter` 改为 `&mut dyn MirHost`（mir/host.rs），
+//! 解耦 mir ↔ interpreter 双向依赖。Interpreter 实现 MirHost。
 
 use crate::flow::eval_binary;
-use crate::interpreter::Interpreter;
-use crate::interpreter::mir_pregel_engine::MirPregelEngine;
 use crate::mir::expr::{MirOrchestrateKind, MirPregelConfig};
 use crate::mir::handlers::Flow;
+use crate::mir::host::MirHost;
 use crate::value::{Environment, Value};
 
 use super::{MirFunction, MirInst};
@@ -41,7 +43,7 @@ pub fn build_task_registry<'a>(
 ///   dag_analyze(func) → add_sequential_edges() → run_dag()
 pub fn run_mir(
     func: &MirFunction,
-    interp: &mut Interpreter,
+    interp: &mut dyn MirHost,
     env: &mut Environment,
 ) -> Result<Value, String> {
     Ok(run_mir_with_signal(func, interp, env)?.1)
@@ -247,7 +249,7 @@ pub fn self_match_pattern(
 /// 若不存在或非无参 main 则静默返回 Ok。
 pub fn run_main_task(
     func: &MirFunction,
-    interp: &mut Interpreter,
+    interp: &mut dyn MirHost,
     env: &mut Environment,
 ) -> Result<(), String> {
     let mut main_body: Option<&MirFunction> = None;
@@ -293,7 +295,7 @@ pub enum MirSignal {
 /// Halted。现在通过 `run_dag_with_signal` 真正传播 Return/Halt。
 pub fn run_mir_with_signal(
     func: &MirFunction,
-    interp: &mut Interpreter,
+    interp: &mut dyn MirHost,
     env: &mut Environment,
 ) -> Result<(MirSignal, Value), String> {
     let mut dag = crate::mir::dag::dag_analyze(func);
@@ -306,7 +308,7 @@ pub fn run_mir_with_signal(
 /// main task 中允许出现显式 `return value`——返回它的值；否则返回 Value::Nil。
 pub fn run_main_task_with_signal(
     func: &MirFunction,
-    interp: &mut Interpreter,
+    interp: &mut dyn MirHost,
     env: &mut Environment,
 ) -> Result<(MirSignal, Value), String> {
     let mut main_body: Option<&MirFunction> = None;

@@ -19,3 +19,4 @@ pub mod orch;
 pub mod persist;
 pub mod registry;
 pub mod sandbox;
+pub mod types;

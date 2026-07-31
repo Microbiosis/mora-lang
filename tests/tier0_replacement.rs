@@ -152,14 +152,24 @@ end
 
 // ─── 6. 守门：mir_call_function / run_main_task 入口签名稳定 ─────────
 // 防止后续重构意外删除 Tier 1 公共 API。
+// v0.75.x: 宿主参数从 `&mut Interpreter` 变为 `&mut dyn MirHost`（解耦
+// mir ↔ interpreter 双向依赖的契约变更），此处同步更新。
 #[allow(clippy::type_complexity)]
 #[test]
 fn tier1_public_api_is_stable() {
     // 这些函数必须在 `mora::mir::interp` 中存在并接受这些参数；
     // 若签名漂移，编译期就会失败——这就是稳定的契约。
     let _fns_exist: (
-        fn(&MirFunction, &mut Interpreter, &mut mora::value::Environment) -> Result<Value, String>,
-        fn(&MirFunction, &mut Interpreter, &mut mora::value::Environment) -> Result<(), String>,
+        fn(
+            &MirFunction,
+            &mut dyn mora::mir::host::MirHost,
+            &mut mora::value::Environment,
+        ) -> Result<Value, String>,
+        fn(
+            &MirFunction,
+            &mut dyn mora::mir::host::MirHost,
+            &mut mora::value::Environment,
+        ) -> Result<(), String>,
     ) = (run_mir, run_main_task);
 }
 

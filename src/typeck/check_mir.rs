@@ -24,7 +24,10 @@ pub fn check_program_mir(exprs: &[MirExpr]) -> Vec<TypeError> {
         .collect()
 }
 
-///  Same as [`check_program_mir`] but returns the typed `MirExpr` tree.
+///  Same as [`check_program_mir`]. Kept as a thin wrapper for callers
+///  that expect a `(errors, exprs)` shape; the returned expressions are
+///  the input untouched (no per-node type annotations are attached to
+///  `MirExpr` — type info is exposed only via `TypeError` diagnostics).
 pub fn check_program_mir_with_types(exprs: &[MirExpr]) -> (Vec<TypeError>, Vec<MirExpr>) {
     let errors = check_program_mir(exprs);
     (errors, exprs.to_vec())
@@ -83,7 +86,6 @@ mod tests {
                     init_body: Box::new(MirExpr::var("x".to_string(), Span::default())),
                 },
                 span: Span::default(),
-                ty: None,
             },
             MirExpr::var("x".to_string(), Span::default()),
         ];

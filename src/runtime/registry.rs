@@ -6,8 +6,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::ccr::InMemoryCcrStore;
-use crate::interpreter::TraitInfo;
 use crate::mock::MockRegistry;
+use crate::runtime::types::TraitInfo;
 use crate::value::Value;
 
 #[derive(Clone)]
@@ -59,7 +59,7 @@ impl RegistryRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::interpreter::TraitMethodSig;
+    use crate::runtime::types::TraitMethodSig;
 
     fn make_trait_info() -> TraitInfo {
         TraitInfo {

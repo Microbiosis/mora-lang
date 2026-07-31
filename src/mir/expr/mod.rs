@@ -66,9 +66,6 @@ pub struct MirExpr {
 
     /// Source location for error messages and LSP
     pub span: Span,
-
-    /// Type after inference (optional until type checking phase)
-    pub ty: Option<Type>,
 }
 
 impl MirExpr {
@@ -77,7 +74,6 @@ impl MirExpr {
         Self {
             kind: MirExprKind::Literal(lit),
             span,
-            ty: None,
         }
     }
 
@@ -86,7 +82,6 @@ impl MirExpr {
         Self {
             kind: MirExprKind::Variable(name.into()),
             span,
-            ty: None,
         }
     }
 
@@ -99,7 +94,6 @@ impl MirExpr {
                 right: Box::new(right),
             },
             span,
-            ty: None,
         }
     }
 
@@ -108,7 +102,6 @@ impl MirExpr {
         Self {
             kind: MirExprKind::Call { callee, args },
             span,
-            ty: None,
         }
     }
 
@@ -124,7 +117,6 @@ impl MirExpr {
                 }),
             },
             span,
-            ty: None,
         }
     }
 
@@ -133,7 +125,6 @@ impl MirExpr {
         Self {
             kind: MirExprKind::List(items),
             span,
-            ty: None,
         }
     }
 
@@ -142,7 +133,6 @@ impl MirExpr {
         Self {
             kind: MirExprKind::Dict(entries),
             span,
-            ty: None,
         }
     }
 
@@ -155,7 +145,6 @@ impl MirExpr {
                 r#else: r#else.map(Box::new),
             },
             span,
-            ty: None,
         }
     }
 }
@@ -422,10 +411,7 @@ pub enum Pattern {
         rest: bool,
     },
     /// Type ascription: `x: Type`
-    TypeAscription {
-        name: String,
-        pattern: Box<Pattern>,
-    },
+    TypeAscription { name: String, pattern: Box<Pattern> },
 }
 
 // ===================================================================
@@ -622,8 +608,10 @@ impl MirReducerKind {
             MirReducerKind::Last => Some(MergeStrategy::LastWriteWins),
             MirReducerKind::Append => Some(MergeStrategy::Append),
             MirReducerKind::Add => Some(MergeStrategy::Add),
-            MirReducerKind::Merge(_) | MirReducerKind::Sum
-            | MirReducerKind::Product | MirReducerKind::Concat
+            MirReducerKind::Merge(_)
+            | MirReducerKind::Sum
+            | MirReducerKind::Product
+            | MirReducerKind::Concat
             | MirReducerKind::Custom(_) => None,
         }
     }

@@ -2,9 +2,8 @@ mod ai_chat;
 mod ai_helpers;
 mod builtins;
 mod dispatch;
-pub(crate) mod mir_pregel_engine;
 mod trait_dispatch;
-pub(crate) mod worker_pool;
+// v0.75.x: MirPregelEngine + WorkerPool 已迁至 src/pregel/（解耦 mir ↔ interpreter 循环）
 
 use parking_lot::Mutex;
 use std::collections::HashMap;
@@ -115,107 +114,12 @@ fn retry_sleep_ms(attempt: u32, base_ms: u64) -> u64 {
     (exp as i64 + offset).max(0) as u64
 }
 
-/// v0.09: 注册 impl method 时用的 key（含泛型签名）
-/// 格式: __impl_<Trait>_<TraitGen>_<ForType>_<ForGen>_<method>
-///   TraitGen / ForGen 用类型名（如 "Number" / "String"），简化版（v0.09 不含 typeck 类型）
-///
-/// 重要: 同一 trait 不同实例化产生不同 key，避免冲突
-///   Container<number> vs Container<string> → 不同 key
-pub(crate) fn impl_method_key(
-    trait_name: &str,
-    trait_generics: &[String], // v0.09 新增：trait 实例化的泛型
-    for_type: &str,
-    for_generics: &[String], // v0.09 新增：for_type 的泛型
-    method: &str,
-) -> String {
-    let tg = trait_generics.join(",");
-    let fg = for_generics.join(",");
-    format!(
-        "__impl_{}_{}_{}_{}_{}",
-        trait_name, tg, for_type, fg, method
-    )
-}
-
-/// v0.09: 默认实现的 key（self 类型 = trait 名）
-/// 格式: __impl_<Trait>_<TraitGen>_<method>
-pub(crate) fn default_impl_method_key(
-    trait_name: &str,
-    trait_generics: &[String], // v0.09 新增
-    method: &str,
-) -> String {
-    let tg = trait_generics.join(",");
-    format!("__impl_{}_{}_{}", trait_name, tg, method)
-}
-
 /// v0.08.5: BFS 收集 trait + 全部祖先的方法名（去重、防循环）
 /// 用于：构造 trait instance 时的完整性检查（与 dispatch 保持一致）
 ///
 /// 参数 trait_registry 是 trait 元数据表（self.registry.trait_registry 借用）
 ///
-/// v0.49.0 (C1+C2): 简单 LRU cache (insertion-order, no hash map to keep 0 deps).
-/// `cap` 上限, 超过 evict 最旧. `Arc<Mutex<>>` for thread-safe shared access.
-pub struct LruCache<V> {
-    cap: usize,
-    /// ordered entries (oldest first) for O(1) pop_front on evict
-    order: std::collections::VecDeque<String>,
-    map: std::collections::HashMap<String, V>,
-}
-
-impl<V: Clone> LruCache<V> {
-    pub fn new(cap: usize) -> Self {
-        Self {
-            cap,
-            order: std::collections::VecDeque::new(),
-            map: std::collections::HashMap::new(),
-        }
-    }
-
-    /// 真正的 LRU get：命中后把 key 移到 order 末尾（最新）
-    pub fn get(&mut self, key: &str) -> Option<V> {
-        if self.map.contains_key(key) {
-            // 刷新访问顺序
-            if let Some(pos) = self.order.iter().position(|k| k == key) {
-                self.order.remove(pos);
-                self.order.push_back(key.to_string());
-            }
-            self.map.get(key).cloned()
-        } else {
-            None
-        }
-    }
-
-    /// 插入或更新. 超 cap 时 evict 最旧.
-    pub fn put(&mut self, key: String, value: V) {
-        if self.map.contains_key(&key) {
-            // 更新 — 刷新 order 为最新
-            if let Some(pos) = self.order.iter().position(|k| k == &key) {
-                self.order.remove(pos);
-            }
-            self.order.push_back(key.clone());
-            self.map.insert(key, value);
-            return;
-        }
-        if self.map.len() >= self.cap {
-            // evict oldest
-            if let Some(oldest) = self.order.pop_front() {
-                self.map.remove(&oldest);
-            }
-        }
-        self.order.push_back(key.clone());
-        self.map.insert(key, value);
-    }
-
-    pub fn len(&self) -> usize {
-        self.map.len()
-    }
-    pub fn is_empty(&self) -> bool {
-        self.map.is_empty()
-    }
-    pub fn cap(&self) -> usize {
-        self.cap
-    }
-}
-
+/// v0.75.x: LruCache 已下沉到 runtime/types.rs，经下方 re-export 引用。
 pub struct Interpreter {
     /// v0.52 ADR-001: CoreRuntime — 核心执行字段（globals/environment/tool_registry/
     /// current_ai_config/config_stack/current_merge_strategies/dynamic_sends）。
@@ -240,25 +144,16 @@ pub struct Interpreter {
     pub(crate) orch: crate::runtime::orch::OrchRuntime,
 }
 
-/// v0.06: with 块字段 (不经过 env 变量)
-/// v0.52 ADR-001: pub 让 CoreRuntime (runtime/core.rs) 可引用
-#[derive(Clone, Debug, Default)]
-#[allow(dead_code)]
-pub struct AiConfigValue {
-    model: Option<String>,
-    temperature: Option<f64>,
-    max_tokens: Option<usize>,
-    budget: Option<usize>,
-    per_call: Option<usize>,
-    system: Option<String>,
-    /// v0.15: mock 响应队列 (with mock_llm = ["resp1", "resp2"])
-    mock_responses: Option<Vec<String>>,
-    /// v0.24: 投机执行配置
-    speculative: Option<bool>,
-    draft_model: Option<String>,
-    /// v0.54: tool 绑定 — with tools: ["read_file", "run_cmd"]
-    tool_names: Option<Vec<String>>,
-}
+// v0.75.x: 共享数据类型（AiConfigValue/LruCache/RouteConfig/TokenBudget/TokenUsage/
+// ToolDef/TraitInfo/TraitMethodSig）与 trait key 辅助函数（impl_method_key /
+// default_impl_method_key）已下沉到 runtime/types.rs。
+// 此处 re-export 保持既有路径兼容（mir/、stress_tests.rs、interpreter 子模块
+// 继续 use crate::interpreter::* 均不受影响）。
+pub use crate::runtime::types::{
+    AiConfigValue, LruCache, RouteConfig, TokenBudget, TokenUsage, ToolDef, TraitInfo,
+    TraitMethodSig,
+};
+pub(crate) use crate::runtime::types::{default_impl_method_key, impl_method_key};
 
 // v0.04: 显式实现 Clone 而非 derive
 // v0.52 ADR-001: Interpreter 已薄化为 7 个 facade holder，Clone 简化
@@ -276,75 +171,71 @@ impl Clone for Interpreter {
     }
 }
 
-/// Token 预算配置
-// v0.52 ADR-001: pub 让 src/runtime/ai.rs 可访问（抽 AiRuntime 用）
-#[derive(Debug, Clone)]
-pub struct TokenBudget {
-    total: usize,
-    /// 每次调用 token 上限（v0.15 接入 track_tokens）
-    per_call: Option<usize>,
-    alert_threshold: f64, // 0.0-1.0，超过此比例时告警
-}
+// v0.75.x: MirHost — MIR 解释器宿主抽象（mir/host.rs）。
+// 解耦 mir ↔ interpreter 双向依赖：mir 侧只依赖 trait，Interpreter 实现之。
+// 各方法委托既有固有方法/字段；固有方法同名时 `self.method()` 优先固有，
+// 无递归风险。
+impl crate::mir::host::MirHost for Interpreter {
+    fn mir_call_function(&mut self, name: &str, args: Vec<Value>) -> Result<Value, String> {
+        Interpreter::mir_call_function(self, name, args)
+    }
 
-/// Token 消耗统计
-// v0.52 ADR-001: pub struct + pub fields 让 src/runtime/ai.rs 可访问
-#[derive(Debug, Clone, Default)]
-pub struct TokenUsage {
-    pub input: usize,
-    pub output: usize,
-}
+    fn mir_call_method(
+        &mut self,
+        object: Value,
+        method: &str,
+        args: Vec<Value>,
+    ) -> Result<Value, String> {
+        Interpreter::mir_call_method(self, object, method, args)
+    }
 
-/// 模型路由配置
-// v0.52 ADR-001: pub 让 src/runtime/ai.rs 可访问
-#[derive(Debug, Clone)]
-pub struct RouteConfig {
-    model: String,
-    base_url: String,
-    api_key: String,
-    /// 单次请求 max_tokens（v0.15 接入 real_ai_chat_with_tools）
-    max_tokens: Option<usize>,
-    /// 系统提示词覆盖（v0.15 接入 real_ai_chat_with_tools）
-    system: Option<String>,
-    /// 温度覆盖（v0.15 接入 real_ai_chat_with_tools）
-    temperature: Option<f64>,
-    /// v0.24: 路由优先级 (越小越优先)
-    #[allow(dead_code)] // 未来扩展用
-    priority: u32,
-    /// v0.24: 路由健康状态
-    #[allow(dead_code)] // 未来扩展用
-    healthy: bool,
-}
+    fn call_value(&mut self, value: &Value, args: Vec<Value>) -> Result<Value, String> {
+        self.call_value(value, args)
+    }
 
-// 记忆条目 — v0.04补: 字段已删 (RFC §4.1 memory.* 推迟到 v1.0)
+    fn mir_import(&mut self, path: &str, env: &mut Environment) -> Result<(), String> {
+        Interpreter::mir_import(self, path, env)
+    }
 
-/// 工具定义（注册时存储）
-#[derive(Clone)]
-pub struct ToolDef {
-    pub name: String,
-    pub description: String,
-    pub parameters: String, // JSON Schema 字符串
-    pub handler: Value,     // Closure
-}
+    fn mir_with_config(&mut self, bindings: &[(String, Value)]) -> Result<(), String> {
+        Interpreter::mir_with_config(self, bindings)
+    }
 
-/// v0.08: trait 注册条目
-/// v0.08.4: 加 parents 字段实现 trait 继承
-#[derive(Clone, Debug)]
-pub struct TraitInfo {
-    pub name: String,
-    pub parents: Vec<String>,
-    pub methods: Vec<TraitMethodSig>,
-}
+    fn mir_restore_config(&mut self) {
+        Interpreter::mir_restore_config(self)
+    }
 
-/// v0.08: trait 方法签名
-/// v0.08.5 任务 1: 加 has_self 字段——trait method 第一个参数是 self 时为 true，
-/// 否则为 false（self-less 方法）。self-less 调度时不传 receiver。
-#[derive(Clone, Debug)]
-pub struct TraitMethodSig {
-    pub name: String,
-    pub params: Vec<(String, Option<String>)>,
-    pub return_type: Option<String>,
-    /// 第一个参数是否为 `self`（决定 dispatch 时是否传 receiver.clone()）
-    pub has_self: bool,
+    fn current_merge_strategies(&self) -> Option<HashMap<String, crate::value::MergeStrategy>> {
+        self.current_merge_strategies()
+    }
+
+    fn environment(&self) -> Arc<parking_lot::Mutex<Environment>> {
+        self.core.environment.clone()
+    }
+
+    fn dynamic_sends(&mut self) -> &mut Vec<crate::checkpoint::SendTask> {
+        &mut self.core.dynamic_sends
+    }
+
+    fn checkpoint_saver(&self) -> Option<Arc<dyn crate::checkpoint::CheckpointSaver>> {
+        self.persist.checkpoint_saver()
+    }
+
+    fn load_checkpoint(&self, thread_id: &str) -> Result<Option<Checkpoint>, String> {
+        self.load_checkpoint(thread_id)
+    }
+
+    fn trait_registry(&mut self) -> &mut Arc<HashMap<String, TraitInfo>> {
+        &mut self.registry.trait_registry
+    }
+
+    fn impl_table(&mut self) -> &mut Arc<HashMap<String, Vec<String>>> {
+        &mut self.registry.impl_table
+    }
+
+    fn clone_box(&self) -> Box<dyn crate::mir::host::MirHost + Send> {
+        Box::new(self.clone())
+    }
 }
 
 /// 结构化聊天消息（用于支持 tool_calls）
@@ -598,13 +489,11 @@ impl Interpreter {
         match std::fs::read_to_string(path) {
             Ok(source) => {
                 let mut imported_exprs = parse_v3_internal(&source);
-                let _type_errs =
-                    crate::mir::lower::typecheck_mir_exprs(&mut imported_exprs);
-                let imported_func =
-                    match crate::mir::lower::lower_mir_exprs(&imported_exprs) {
-                        Ok(f) => f,
-                        Err(e) => return Err(format!("import lowering error: {}", e)),
-                    };
+                let _type_errs = crate::mir::lower::typecheck_mir_exprs(&mut imported_exprs);
+                let imported_func = match crate::mir::lower::lower_mir_exprs(&imported_exprs) {
+                    Ok(f) => f,
+                    Err(e) => return Err(format!("import lowering error: {}", e)),
+                };
                 // 子 import 的 env 是当前 env 的克隆（与 with 块语义一致）
                 let mut child_env = env.clone();
                 let _ = crate::mir::interp::run_mir(&imported_func, self, &mut child_env)?;

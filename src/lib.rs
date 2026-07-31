@@ -42,6 +42,7 @@ pub mod mir;
 pub mod mock;
 pub mod parser_v3;
 pub mod plan;
+pub mod pregel;
 pub mod record;
 pub mod refine;
 pub mod runtime;

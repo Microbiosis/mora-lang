@@ -2,6 +2,51 @@
 
 All notable changes to Mora will be documented in this file.
 
+## [v0.75.4] — 2026-07-31 — Pregel 消息计数 + 提前失败校验
+
+按「他山之石」分析（石 2：Apache Giraph 的 message counter + barrier 精神 — 在超步边界确认每条消息都有合法接收者并统计消息量）。BSP barrier 在 mora 已天然存在（每超步 `pending_sends.drain` 全量分发），故只补齐可观测性与提前校验。
+
+### Changed
+- `src/pregel/mod.rs`：
+  - `EngineStats` 新增 `pub messages_sent: usize` — 每超步 ADVANCE 分发的 SendTask 总量（derive Default 自动初始化，向后兼容）。
+  - **提前失败校验**：ADVANCE 对 send 到未定义节点的消息立即报错（`"Pregel: send to undefined node 'xxx' (defined agents: ...)"`），而非延迟到下一超步 EXEC 才报 `undefined agent`。错误信息含 target 与已定义 agents 列表。
+  - 不设 `messages_received` — BSP 保证 sent == received 天然成立。
+- 新增 2 测试：`advance_rejects_send_to_undefined_node`（失败发生在第一超步 ADVANCE，steps==0）、`messages_sent_tracks_advance_delivery`（a→b send 图，统计消息）。
+
+### Tests
+- 556 通过 / 0 失败（pregel 模块 22 个测试全绿）。clippy `-D warnings` error 数与基线持平（89）。
+
+## [v0.75.3] — 2026-07-31 — Pregel 增量 step 快照（StepUndo）
+
+按「他山之石」分析（石 1：Flink Chandy-Lamport 增量 checkpoint 思想 — 只记录变更而非全量快照）消除 `MirPregelEngine::run()` 每步全量克隆热点。
+
+### Changed
+- `src/pregel/mod.rs`：
+  - 新增 `StepUndo`（undo log）— 只记录 EXEC 会修改的引擎状态（`pending_sends`），替代每步全量 `build_checkpoint()`。
+  - `begin_step()`：`fault_tolerance == 0`（默认）时返回 `None` — 此前每步 `build_checkpoint()` 克隆全部 `channels`/`channel_versions`/`versions_seen`/`pending_sends`，在默认配置从未被读取，纯浪费。
+  - `rollback_step()`：还原 `pending_sends`；`vertex_state`/`aggregator_acc` 走「清空 + config initials 重建」— 与 `restore_checkpoint` 语义一致。
+  - 依据：retry 只重跑 EXEC，而 EXEC 对 `channels` 等零写入（UPDATE 阶段在 retry 循环之外）；每步快照成本从 O(全量 channels) 降为 O(pending_sends)。
+  - `build_checkpoint`/`restore_checkpoint` 保留不动（`h_orchestrate` 跨 run resume 与 auto-save 仍用）。
+- 新增 2 测试：`begin_step_skipped_when_no_fault_tolerance`、`step_undo_rolls_back_pending_sends`。
+
+### Tests
+- 554 通过 / 0 失败（pregel 模块 20 个测试全绿）。clippy `-D warnings` error 数与基线持平（89）。
+
+## [v0.75.2] — 2026-07-31 — Scheduler O(1) 时间索引（Timing Wheel）
+
+按「他山之石」分析（石 3：Linux Kernel / Varnish 的分层定时轮盘，落地为 tokio 同思路的稀疏 BTreeMap 时间索引）优化 `Scheduler::tick`。
+
+### Changed
+- `src/schedule/mod.rs`：新增 `buckets: BTreeMap<u64, Vec<String>>` 到期时间索引（next_fire_epoch → job ids）。
+  - `add`：计算 next_fire（Every = now + interval，At = at_epoch）并入桶。
+  - `tick(now)`：`buckets.range(..=now)` 直接取走到期桶，从 O(全部 job) 降为 O(到期项)；对 now 大跳跃免疫（零空推进）。
+  - `remove`：只删 jobs（事实来源），桶内 id 由 tick 惰性清理。
+- 语义 100% 不变：Every 非对齐（`last_run = now`）、At 触发即删、一次 tick 不补触发积压周期。
+- 新增 3 测试：`tick_large_schedule_only_processes_due`（1000 job 只处理到期桶）、`lazy_removal_bucket_cleanup`、`at_job_not_rescheduled`。
+
+### Tests
+- 552 通过 / 0 失败（schedule 模块 17 个测试全绿）。clippy `-D warnings` error 数与基线持平（89）。
+
 ## [v0.75.1] — 2026-07-31 — P0 架构债务修复（内部重构，无行为变更）
 
 按全项目架构审查（architecture-reviewer）确认的 3 项 P0 阻塞项修复，打破 `runtime/` ↔ `interpreter/`、`mir/` ↔ `interpreter/` 两处双向依赖循环并清理越层耦合。

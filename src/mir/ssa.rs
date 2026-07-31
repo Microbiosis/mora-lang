@@ -826,14 +826,12 @@ fn rename_variables(blocks: &mut [BasicBlock], phi_map: &HashMap<(BlockId, SsaRe
         }
 
         for inst in &mut block.insts {
-            // Define 只是变量声明，不是值定义——它的 src 不参与 rename，也不推入 stack
-            // 真实值由后续的 Assign 提供
-            if let SsaInst::Define(_, _src) = inst {
-                // 给 Define 分配新的 dst，但不修改 src，也不推入 rename_stack
-                let new_dst = reg_counter;
-                reg_counter += 1;
-                set_dst(inst, new_dst);
-                // src 保持不变（它是原始 MIR 中的寄存器编号，不是 SSA 版本）
+            // v0.75.7: Define/Assign 的第二字段是「被赋值值的来源寄存器」（读），
+            // 不是 dst — 只 resolve src，不重编号、不推 stack。
+            // 此前 Define 既跳过 resolve 又 set_dst 覆盖（把 src 当 dst 重编号），
+            // deconstruct 时映射错乱 → 优化后返回值丢失。
+            if let SsaInst::Define(_, _) | SsaInst::Assign(_, _) = inst {
+                rename_reads(inst, &rename_stack); // resolve src
                 continue;
             }
             rename_reads(inst, &rename_stack);
@@ -943,8 +941,9 @@ fn rename_reads(inst: &mut SsaInst, stack: &[Vec<SsaReg>]) {
         SsaInst::Copy(_, src) => *src = resolve(*src, stack),
         SsaInst::Assign(_, src) => *src = resolve(*src, stack),
         SsaInst::Expr(src) => *src = resolve(*src, stack),
-        // Define 的 src 是原始 MIR 寄存器编号，不参与 SSA rename
-        SsaInst::Define(_, _) => {}
+        // v0.75.7: Define 的 src 也是寄存器读，参与 rename（此前跳过 →
+        // deconstruct 映射错乱）。与 Assign 一致。
+        SsaInst::Define(_, src) => *src = resolve(*src, stack),
         SsaInst::Var(_, _) | SsaInst::Const(_, _) => {}
     }
 }

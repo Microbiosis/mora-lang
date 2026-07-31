@@ -21,6 +21,7 @@
 use crate::common::BinaryOp;
 use crate::value::Value;
 
+pub mod cache;
 pub mod expr;
 pub mod host;
 pub mod interp;

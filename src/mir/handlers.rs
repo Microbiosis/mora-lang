@@ -84,7 +84,8 @@ pub fn h_call(
             let val = arg_vals.get(i).cloned().unwrap_or(Value::Nil);
             child_env.define(param.clone(), val, false);
         }
-        run_mir(body, interp, &mut child_env)?
+        // v0.75.9: 包裹 Arc 走全局 DAG 缓存（task body 借自指令表）
+        run_mir(&Arc::new((*body).clone()), interp, &mut child_env)?
     } else {
         interp.mir_call_function(name, arg_vals)?
     };
@@ -259,11 +260,13 @@ pub fn h_with_config(
                     "JIT compilation failed ({}), falling back to MIR interpreter",
                     e
                 );
-                run_mir(body, interp, &mut child_env)?
+                // v0.75.9: 包裹 Arc 走全局 DAG 缓存
+                run_mir(&Arc::new((*body).clone()), interp, &mut child_env)?
             }
         }
     } else {
-        run_mir(body, interp, &mut child_env)?
+        // v0.75.9: 包裹 Arc 走全局 DAG 缓存
+        run_mir(&Arc::new((*body).clone()), interp, &mut child_env)?
     };
     interp.mir_restore_config();
     Ok(())
@@ -292,7 +295,8 @@ fn run_isolated(
     body: &MirFunction,
 ) -> Result<(crate::value::Value, Vec<crate::value::Conflict>), String> {
     let mut child_env = env.clone();
-    let result = run_mir(body, interp, &mut child_env)?;
+    // v0.75.9: 包裹 Arc 走全局 DAG 缓存
+    let result = run_mir(&Arc::new((*body).clone()), interp, &mut child_env)?;
     let strategies = interp.current_merge_strategies();
     let conflicts = match strategies.as_ref() {
         Some(s) => env.merge_from_with_strategies(
@@ -318,7 +322,8 @@ pub fn h_transaction(
         Ok(_) => Ok(Flow::Continue),
         Err(_) => {
             let mut comp_env = env.clone();
-            let _ = run_mir(compensation, interp, &mut comp_env);
+            // v0.75.9: 包裹 Arc 走全局 DAG 缓存
+            let _ = run_mir(&Arc::new((*compensation).clone()), interp, &mut comp_env);
             Err("Transaction rolled back".to_string())
         }
     }
@@ -772,7 +777,8 @@ pub fn h_prompt_section(
     body: &MirFunction,
 ) -> Result<(), String> {
     let mut child_env = env.clone();
-    let _ = run_mir(body, interp, &mut child_env);
+    // v0.75.9: 包裹 Arc 走全局 DAG 缓存
+    let _ = run_mir(&Arc::new((*body).clone()), interp, &mut child_env);
     Ok(())
 }
 
@@ -782,7 +788,8 @@ pub fn h_document_section(
     body: &MirFunction,
 ) -> Result<(), String> {
     let mut child_env = env.clone();
-    let _ = run_mir(body, interp, &mut child_env);
+    // v0.75.9: 包裹 Arc 走全局 DAG 缓存
+    let _ = run_mir(&Arc::new((*body).clone()), interp, &mut child_env);
     Ok(())
 }
 
@@ -797,7 +804,8 @@ pub fn h_match_expr(
     let mut matched = false;
     for (pat_str, cond_reg, arm_func, output_reg) in arms {
         if self_match_pattern(&val_val, pat_str, cond_reg.as_ref().map(|r| &regs[*r]), env) {
-            let result = run_mir(arm_func, interp, env)?;
+            // v0.75.9: 包裹 Arc 走全局 DAG 缓存（arm body 借自指令表）
+            let result = run_mir(&Arc::new((**arm_func).clone()), interp, env)?;
             regs[*output_reg] = result;
             matched = true;
             break;
@@ -817,7 +825,8 @@ pub fn h_stream_for(
     _body: &MirFunction,
 ) -> Result<(), String> {
     let mut child_env = env.clone();
-    let _ = run_mir(_body, interp, &mut child_env)?;
+    // v0.75.9: 包裹 Arc 走全局 DAG 缓存
+    let _ = run_mir(&Arc::new((*_body).clone()), interp, &mut child_env)?;
     Ok(())
 }
 

@@ -2,6 +2,27 @@
 
 All notable changes to Mora will be documented in this file.
 
+## [v0.75.9] — 2026-08-01 — 函数调用 DAG 全局缓存 + deps.rs 死代码清理
+
+（用户选「全链路三步」中的前两步；第三步「完整寄存器级增量」经探索确认需改 `build_node_input` 注入方式（channel 拆独立 env var，破坏所有现有 agent 的 input 读取语义），且 deps.rs 增量模型与 MirDag 执行模型不兼容 — 收益 < 破坏成本，不纳入。）
+
+### Added — 全局 DAG 缓存（src/mir/cache.rs，新增）
+- `DagCache` + 全局静态 `DAG_CACHE`（`OnceLock`，进程级线程安全）：`MirFunction → 优化后 MirDag` 跨调用缓存，key = `Arc::as_ptr` 指针地址（body 构造后不可变，项目内无 `Arc::get_mut` 改写，同 Arc 即同 DAG）。
+- 构建路径 = `dag_analyze → dag_optimize → prune_sequence_edges`（与 `run_mir_with_signal` 原路径一致）；容量上限 128，满则整体清空（简单 LRU 近似，防无限增长）。
+- 新增 3 测试：`same_arc_hits_different_arc_rebuilds` / `clear_forces_rebuild` / `cached_dag_runs_same_result`。
+
+### Changed — run_mir 签名 `&MirFunction` → `&Arc<MirFunction>`（签名传播，编译期全量暴露）
+- `run_mir` / `run_mir_with_signal` / `run_main_task` / `run_main_task_with_signal` / `run_mir_dag` 全部改收 `&Arc<MirFunction>`；`run_mir_with_signal` 内建 DAG 改走全局缓存，不再每次全量重建。
+- 调用方更新：dispatch.rs Closure/Task（`mir_body` 已是 Arc，零改）；handlers.rs 9 处（h_call task body / h_with_config / run_isolated / h_transaction compensation / h_prompt_section / h_document_section / h_match_expr / h_stream_for，`Arc::new((*x).clone())`）；interpreter/mod.rs import + REPL；main.rs 4 组 run_mir+run_main_task 共享同一 Arc（同一缓存项）；pregel 6 处 + 顺序/并行 EXEC。
+- pregel `agent_dag_cache` 移除（引擎本地缓存 → 全局缓存统一；Closure/Task/REPL/pregel 共用一套，同 Arc 同 DAG）。原 `cached_agent_dag_is_idempotent` 测试改写为 `global_dag_cache_is_idempotent`（独立 DagCache 实例）。
+- `TaskDef` body 克隆进 Arc 后走缓存（task main 执行不再每次重建）。
+
+### Removed — src/mir/deps.rs（601 行未编译死代码）
+- 未注册（`mir/mod.rs` 无 `mod deps`）、grep 零引用；功能与 `MirDag`（指令级 DAG + 控制流边）重复。注册编译 ≈ 引入第二套数据流系统（维护双份），且 `mark_dirty/recompute_dirty` 寄存器级增量与 dag_interp `reg_ready/exec_count` 模型不兼容。
+
+### Tests
+- 575 通过 / 0 失败（+3，lib）。`closure_reused_across_calls_via_mir` 为 pre-existing 失败（parse error，clean tree 同样失败，与本次无关）。clippy `-D warnings` error 数与基线持平（87）。
+
 ## [v0.75.8] — 2026-08-01 — refine 多候选生成 + Pregel 增量执行 v1
 
 ### Changed — refine 多候选生成（src/refine/mod.rs + src/interpreter/builtins/mod.rs）

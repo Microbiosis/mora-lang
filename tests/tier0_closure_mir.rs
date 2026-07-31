@@ -18,8 +18,10 @@ fn run_via_mir(source: &str) -> Result<(), String> {
     let func = lower_mir_exprs(&exprs)?;
     let mut interp = Interpreter::new();
     let mut env = interp.take_env();
-    run_mir(&func, &mut interp, &mut env)?;
-    run_main_task(&func, &mut interp, &mut env)
+    // v0.75.9: 包裹 Arc 走全局 DAG 缓存
+    let func_arc = std::sync::Arc::new(func);
+    run_mir(&func_arc, &mut interp, &mut env)?;
+    run_main_task(&func_arc, &mut interp, &mut env)
 }
 
 // ─── 1. 闭包字面量定义 + 调用走 MIR ──────────────────────────────────

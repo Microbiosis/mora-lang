@@ -28,8 +28,10 @@ fn run_via_mir(source: &str) -> Result<(), String> {
     let func: MirFunction = lower_mir_exprs(&exprs)?;
     let mut interp = Interpreter::new();
     let mut env = interp.take_env();
-    run_mir(&func, &mut interp, &mut env)?;
-    run_main_task(&func, &mut interp, &mut env)
+    // v0.75.9: 包裹 Arc 走全局 DAG 缓存（run_mir + run_main_task 共享同一项）
+    let func_arc = std::sync::Arc::new(func);
+    run_mir(&func_arc, &mut interp, &mut env)?;
+    run_main_task(&func_arc, &mut interp, &mut env)
 }
 
 // ─── 1. 语法 (syntax) ───────────────────────────────────────────────
@@ -154,6 +156,8 @@ end
 // 防止后续重构意外删除 Tier 1 公共 API。
 // v0.75.x: 宿主参数从 `&mut Interpreter` 变为 `&mut dyn MirHost`（解耦
 // mir ↔ interpreter 双向依赖的契约变更），此处同步更新。
+// v0.75.9: 函数参数从 `&MirFunction` 变为 `&Arc<MirFunction>`（走全局
+// DAG 缓存，key = Arc 指针）。
 #[allow(clippy::type_complexity)]
 #[test]
 fn tier1_public_api_is_stable() {
@@ -161,12 +165,12 @@ fn tier1_public_api_is_stable() {
     // 若签名漂移，编译期就会失败——这就是稳定的契约。
     let _fns_exist: (
         fn(
-            &MirFunction,
+            &std::sync::Arc<MirFunction>,
             &mut dyn mora::mir::host::MirHost,
             &mut mora::value::Environment,
         ) -> Result<Value, String>,
         fn(
-            &MirFunction,
+            &std::sync::Arc<MirFunction>,
             &mut dyn mora::mir::host::MirHost,
             &mut mora::value::Environment,
         ) -> Result<(), String>,

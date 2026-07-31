@@ -189,6 +189,13 @@ impl MirPregelEngine {
         self
     }
 
+    /// v0.69: Drain an external buffer of pending SendTasks into the engine.
+    /// Called by `h_orchestrate` before each super-step to inject messages
+    /// produced by `h_send` (which has no direct engine access).
+    pub fn flush_pending_sends(&mut self, sends: Vec<SendTask>) {
+        self.pending_sends.extend(sends);
+    }
+
     /// 初始化 channels（设置 input 通道初值）
     pub fn init_channels(&mut self, initial: HashMap<String, Value>) {
         for (k, v) in initial {
@@ -205,7 +212,7 @@ impl MirPregelEngine {
 /// 3. UPDATE：应用 reducer
 /// 4. ADVANCE：处理 send tasks + 决定下一跳
 pub fn run(&mut self, interpreter: &mut Interpreter) -> Result<Value, String> {
-        use std::collections::HashSet;
+    use std::collections::HashSet;
 
         // v0.63: current_step is initialized in new() and may be set by restore_checkpoint.
         // Do NOT reset to 0 here — that would negate checkpoint restore.
@@ -342,6 +349,14 @@ pub fn run(&mut self, interpreter: &mut Interpreter) -> Result<Value, String> {
             }
 
             // ---------- 4. ADVANCE ----------
+            // v0.69: Dynamic Send delivery — target nodes become active in
+            // the next super-step and their `input` channel carries the payload.
+            // Multiple sends to the same target → last-write-wins on input.
+            for send in self.pending_sends.drain(..) {
+                self.channels.insert("input".to_string(), send.input);
+                *self.channel_versions.entry("input".to_string()).or_insert(0) += 1;
+                next_active.insert(send.target_node);
+            }
             active_nodes = next_active.into_iter().collect();
             self.current_step += 1;
 

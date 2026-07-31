@@ -10,6 +10,7 @@ use std::sync::Arc;
 
 use crate::interpreter::{AiConfigValue, ToolDef};
 use crate::value::{Environment, Value};
+use crate::checkpoint::SendTask;
 
 /// 语言执行必需的薄核心（7 字段）。
 /// 注：ToolDef 不含 Debug，所以 CoreRuntime 不 derive Debug。
@@ -29,6 +30,11 @@ pub struct CoreRuntime {
     /// 设值时 `h_transaction`/`h_worker` 使用 `merge_from_with_strategies`；
     /// 为 None 时回退到硬编码 LWW。
     pub(crate) current_merge_strategies: Option<std::collections::HashMap<String, crate::value::MergeStrategy>>,
+    /// v0.69: Dynamic sends buffer. `h_send` pushes here; `h_orchestrate`
+    /// flushes into the BSP engine's pending_sends at the start of each
+    /// super-step. Lets agents route messages at runtime without direct
+    /// access to the engine.
+    pub(crate) dynamic_sends: Vec<crate::checkpoint::SendTask>,
     /// Worker 并发 channels（sender 端）
     pub(crate) worker_channels: HashMap<String, crossbeam_channel::Sender<Value>>,
     /// Worker 并发 channels（receiver 端）
@@ -45,6 +51,7 @@ impl Default for CoreRuntime {
             current_ai_config: None,
             config_stack: Vec::new(),
             current_merge_strategies: None,
+            dynamic_sends: Vec::new(),
             worker_channels: HashMap::new(),
             worker_receivers: HashMap::new(),
         }

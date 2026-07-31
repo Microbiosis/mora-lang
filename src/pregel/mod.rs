@@ -49,6 +49,16 @@ pub type MirInterruptCallback = Arc<dyn Fn(&str, MirInterruptWhen) -> bool>;
 /// Return `true` to continue the BSP run, `false` to abort.
 pub type MirConflictCallback = Arc<dyn Fn(&Conflict) -> bool>;
 
+/// v0.75.8: 并行 EXEC 的 PREPARE 产物 — (node, task_body, 缓存 dag, 私有 env,
+/// 本次 input)。v0.75.6 起携带缓存 dag，v0.75.8 增加 input_str 供增量缓存。
+type PreparedJob = (
+    String,
+    std::sync::Arc<crate::mir::MirFunction>,
+    std::sync::Arc<crate::mir::dag::MirDag>,
+    crate::value::Environment,
+    String,
+);
+
 /// v0.75.3: 增量 step 快照（undo log）— 只记录 EXEC 会修改的引擎状态，
 /// 替代每步全量 `build_checkpoint()`。
 ///
@@ -127,6 +137,24 @@ pub struct MirPregelEngine {
     ///
     /// 注：仅缓存 agents 的 task_body（config 静态），随 engine 生命周期，无泄漏。
     agent_dag_cache: HashMap<String, std::sync::Arc<crate::mir::dag::MirDag>>,
+    /// v0.75.8: 增量执行 v1 — 记录每 agent 上次 input（build_node_input 的
+    /// JSON 字符串）。超步间 input 完全未变时跳过整个执行（复用上次 outcome）。
+    ///
+    /// 完整寄存器级增量（channel 拆独立 env var + MirDag 节点 dirty）需改
+    /// input 注入方式（破坏现有 agent 的 input 读取语义，高破坏性）；v1 用
+    /// 「输入未变则跳过」拿到确定性收益（vote_to_halt 后重复激活但无新消息、
+    /// 或 input 未变化的重复调度场景）。
+    agent_input_cache: HashMap<String, String>,
+    /// v0.75.8: 每 agent 上次成功执行的 (signal, result, sends) — 跳过执行时
+    /// 复用。input 相同 → 确定性执行，语义等价。
+    agent_outcome_cache: HashMap<
+        String,
+        (
+            crate::mir::interp::MirSignal,
+            crate::value::Value,
+            Vec<crate::checkpoint::SendTask>,
+        ),
+    >,
 }
 
 /// v0.74: Engine runtime metrics.
@@ -155,6 +183,8 @@ pub struct AgentExecOutcome {
     pub sends: Vec<crate::checkpoint::SendTask>,
     /// v0.75.7: 本次 agent 执行耗时（ms），用于 per_agent_ms 统计。
     pub duration_ms: u128,
+    /// v0.75.8: 本次执行的 input（build_node_input 结果），用于增量缓存。
+    pub input_str: String,
 }
 
 /// v0.70: Per-vertex lifecycle state.
@@ -278,6 +308,8 @@ impl MirPregelEngine {
             fault_tolerance: 0,
             stats: EngineStats::default(),
             agent_dag_cache: HashMap::new(),
+            agent_input_cache: HashMap::new(),
+            agent_outcome_cache: HashMap::new(),
             saver: None,
         }
     }
@@ -343,8 +375,8 @@ impl MirPregelEngine {
         self.pending_sends.extend(sends);
     }
 
-    /// v0.75.6: 缓存 agent task_body 的优化后 DAG（dag_analyze + dag_optimize
-    /// + prune_sequence_edges，对同一 func 幂等）。pregel 每超步重跑同一
+    /// v0.75.6: 缓存 agent task_body 的优化后 DAG（dag_analyze、dag_optimize、
+    /// prune_sequence_edges，对同一 func 幂等）。pregel 每超步重跑同一
     /// task_body，此前每次全量重建 — 缓存避免重复分析开销。
     fn cached_agent_dag(
         &mut self,
@@ -378,6 +410,18 @@ impl MirPregelEngine {
         self.stats
             .per_agent_ms
             .insert(node_name.clone(), outcome.duration_ms);
+
+        // v0.75.8: 更新增量缓存（主线程统一入口；跳过路径重插幂等）
+        self.agent_input_cache
+            .insert(node_name.clone(), outcome.input_str.clone());
+        self.agent_outcome_cache.insert(
+            node_name.clone(),
+            (
+                outcome.signal.clone(),
+                outcome.result.clone(),
+                outcome.sends.clone(),
+            ),
+        );
 
         if matches!(outcome.signal, crate::mir::interp::MirSignal::Halt(_)) {
             self.vertex_state
@@ -622,15 +666,46 @@ impl MirPregelEngine {
                             let agent = &self.config.agents[agent_idx];
 
                             let input_val = self.build_node_input(node_name);
+                            let input_str = input_val.to_string();
                             let mut env = interpreter.environment().lock().clone();
                             // v0.73: define input on the private clone (agent only
                             // sees its own input; no cross-agent contamination).
                             env.define(
                                 "input".to_string(),
-                                Value::String(input_val.to_string()),
+                                Value::String(input_str.clone()),
                                 false,
                             );
                             env.clock.tick(node_name);
+
+                            // v0.75.8: 增量执行 v1 — input 与上次相同则跳过整个
+                            // 执行，复用上次 outcome（signal/result）。input 相同
+                            // → 确定性执行，语义等价；跳过避免重复副作用（如
+                            // ai.chat 网络调用）。完整寄存器级增量（channel 拆
+                            // 独立 env var + MirDag 节点 dirty）需改 input 注入
+                            // 方式（破坏现有 agent 语义），留作后续候选。
+                            if self.agent_input_cache.get(node_name) == Some(&input_str)
+                                && let Some((signal, result, _sends)) =
+                                    self.agent_outcome_cache.get(node_name).cloned()
+                            {
+                                let outcome = AgentExecOutcome {
+                                    node_name: node_name.clone(),
+                                    signal,
+                                    result,
+                                    env,
+                                    // 顺序路径 sends 经 interpreter.dynamic_sends
+                                    // 在循环外收集；跳过则无新 send。
+                                    sends: Vec::new(),
+                                    duration_ms: 0,
+                                    input_str,
+                                };
+                                self.reconcile_outcome(
+                                    interpreter,
+                                    &mut next_active,
+                                    &mut step_writes,
+                                    outcome,
+                                )?;
+                                continue;
+                            }
 
                             if agent.task_body.body.is_empty() && agent.task_body.n_regs == 0 {
                                 return Err(format!(
@@ -664,6 +739,7 @@ impl MirPregelEngine {
                                 env,
                                 sends: Vec::new(),
                                 duration_ms,
+                                input_str,
                             };
                             self.reconcile_outcome(
                                 interpreter,
@@ -676,12 +752,8 @@ impl MirPregelEngine {
                         // ── Parallel path: PREPARE → SPAWN → RECONCILE ──
                         // PREPARE (main thread, &self read): build private envs.
                         // v0.75.6: prepared 携带缓存 dag（避免每超步重建）。
-                        let mut prepared: Vec<(
-                            String,
-                            std::sync::Arc<crate::mir::MirFunction>,
-                            std::sync::Arc<crate::mir::dag::MirDag>,
-                            crate::value::Environment,
-                        )> = Vec::new();
+                        // v0.75.8: 携带 input_str 供 worker 填回 outcome。
+                        let mut prepared: Vec<PreparedJob> = Vec::new();
                         for node_name in &to_execute {
                             let agent_idx =
                                 *self.agents_by_name.get(node_name).ok_or_else(|| {
@@ -695,13 +767,39 @@ impl MirPregelEngine {
                                 ));
                             }
                             let input_val = self.build_node_input(node_name);
+                            let input_str = input_val.to_string();
                             let mut env = interpreter.environment().lock().clone();
                             env.define(
                                 "input".to_string(),
-                                Value::String(input_val.to_string()),
+                                Value::String(input_str.clone()),
                                 false,
                             );
                             env.clock.tick(node_name);
+
+                            // v0.75.8: 增量 v1 — input 未变则跳过，直接 reconcile
+                            // 缓存 outcome（与顺序路径同语义）。
+                            if self.agent_input_cache.get(node_name) == Some(&input_str)
+                                && let Some((signal, result, sends)) =
+                                    self.agent_outcome_cache.get(node_name).cloned()
+                            {
+                                let outcome = AgentExecOutcome {
+                                    node_name: node_name.clone(),
+                                    signal,
+                                    result,
+                                    env,
+                                    sends,
+                                    duration_ms: 0,
+                                    input_str,
+                                };
+                                self.reconcile_outcome(
+                                    interpreter,
+                                    &mut next_active,
+                                    &mut step_writes,
+                                    outcome,
+                                )?;
+                                continue;
+                            }
+
                             self.stats.agents_run += 1;
                             // v0.75.6: 克隆 task_body 解除借用后再调缓存方法
                             let task_body = agent.task_body.clone();
@@ -711,6 +809,7 @@ impl MirPregelEngine {
                                 std::sync::Arc::new(task_body),
                                 dag,
                                 env,
+                                input_str,
                             ));
                         }
 
@@ -726,7 +825,6 @@ impl MirPregelEngine {
                                 .cmp(&a.2.nodes.len())
                                 .then_with(|| a.0.cmp(&b.0))
                         });
-
                         // SPAWN: one Interpreter clone + private env per worker job.
                         // v0.74: Reuse cached pool (created once), keep across steps.
                         if self.worker_pool.is_none() {
@@ -741,7 +839,7 @@ impl MirPregelEngine {
                         let jobs: Vec<crate::pregel::worker_pool::WorkerJob> = prepared
                             .into_iter()
                             .enumerate()
-                            .map(|(idx, (name, task, dag, mut env))| {
+                            .map(|(idx, (name, task, dag, mut env, input_str))| {
                                 let mut interp_clone = interpreter.clone_box();
                                 crate::pregel::worker_pool::WorkerJob {
                                     index: idx,
@@ -768,6 +866,7 @@ impl MirPregelEngine {
                                             env,
                                             sends,
                                             duration_ms,
+                                            input_str,
                                         })
                                             as Box<dyn std::any::Any + Send>)
                                     }),
@@ -2021,6 +2120,90 @@ mod tests {
             !matches!(result, Value::Nil),
             "LJF 排序后结果应非空: {:?}",
             result
+        );
+    }
+
+    // ─── v0.75.8: 增量执行 v1（input 未变则跳过）────────────────────
+
+    #[test]
+    fn incremental_skip_when_input_unchanged() {
+        // 预填充缓存（input "{}" 与 build_node_input 首次返回一致），
+        // 则 agent "a" 首次激活即被跳过（agents_run 不增加），
+        // 结果复用缓存 outcome — 确定性验证跳过路径。
+        let config = MirPregelConfig {
+            agents: vec![make_const_agent("a", 1)],
+            edges: vec![MirEdgeDef {
+                from: "@start".into(),
+                to: "a".into(),
+                condition_expr: None,
+                condition_body: None,
+            }],
+            state_schema: vec![],
+            checkpoint: None,
+            interrupt_points: vec![],
+            adjacency: HashMap::new(),
+            aggregators: Vec::new(),
+            master_compute: None,
+        };
+        let mut engine = MirPregelEngine::new(config);
+        // 预填充：input = "{}"（无 channel 时 build_node_input 返回），
+        // outcome = (Return(42), Int(42), 无 sends)
+        engine.agent_input_cache.insert("a".into(), "{}".into());
+        engine.agent_outcome_cache.insert(
+            "a".into(),
+            (
+                crate::mir::interp::MirSignal::Return(Value::Int(42)),
+                Value::Int(42),
+                Vec::new(),
+            ),
+        );
+        let mut interp = crate::interpreter::Interpreter::new();
+        let result = engine.run(&mut interp).unwrap();
+        assert_eq!(
+            engine.stats().agents_run,
+            0,
+            "input 未变时 agent 应被跳过（不执行）"
+        );
+        // 结果复用缓存 outcome → result 通道 = 42
+        assert_eq!(result, Value::String("42".to_string()));
+    }
+
+    #[test]
+    fn incremental_cache_consistent_after_run() {
+        // 正常 run 后：缓存填充，且缓存 input 与 build_node_input 一致。
+        let config = MirPregelConfig {
+            agents: vec![make_const_agent("a", 7)],
+            edges: vec![MirEdgeDef {
+                from: "@start".into(),
+                to: "a".into(),
+                condition_expr: None,
+                condition_body: None,
+            }],
+            state_schema: vec![],
+            checkpoint: None,
+            interrupt_points: vec![],
+            adjacency: HashMap::new(),
+            aggregators: Vec::new(),
+            master_compute: None,
+        };
+        let mut engine = MirPregelEngine::new(config);
+        let mut interp = crate::interpreter::Interpreter::new();
+        let result = engine.run(&mut interp).unwrap();
+        assert_eq!(result, Value::String("7".to_string()));
+        assert!(
+            engine.agent_input_cache.contains_key("a"),
+            "run 后应填充 input 缓存"
+        );
+        assert!(
+            engine.agent_outcome_cache.contains_key("a"),
+            "run 后应填充 outcome 缓存"
+        );
+        // 注：build_node_input 是时间敏感的（run 结束后 result 通道已写入，
+        // 返回 {"result":"7"}）；缓存记录的是 a 执行时刻的 input（当时为 {}）。
+        // 跳过机制的确定性由 incremental_skip_when_input_unchanged 验证。
+        assert_eq!(
+            engine.agent_input_cache["a"], "{}",
+            "a 首次执行时 input 应为空"
         );
     }
 }

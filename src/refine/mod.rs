@@ -104,9 +104,25 @@ impl RefineSession {
     ///
     /// v0.49.0 (A2): refine 返回 owned RefineStep (was &RefineStep)
     /// 让 caller drop lock before consuming result (避免锁 + I/O 一起)
-    /// v0.49.0 (A2): refine 返回 owned RefineStep (was &RefineStep)
-    /// 让 caller drop lock before consuming result (避免锁 + I/O 一起)
     pub fn refine(&mut self, instruction: &str) -> Result<RefineStep, String> {
+        let steps = self.refine_many(instruction, 1)?;
+        Ok(steps.into_iter().next().unwrap())
+    }
+
+    /// v0.75.8: 多候选生成 — 对同一 instruction 生成 N 个独立候选副本
+    /// （<stem>.refined.<n>.<a|b|c...>），每个带各自的指令头，均记录为
+    /// 同一次迭代的候选（iteration 相同）。返回各候选的 RefineStep。
+    ///
+    /// `count` 校验：1..=26（候选后缀 a..z）。`refine()` 等价于
+    /// `refine_many(instruction, 1)`。
+    pub fn refine_many(
+        &mut self,
+        instruction: &str,
+        count: usize,
+    ) -> Result<Vec<RefineStep>, String> {
+        if count == 0 || count > 26 {
+            return Err(format!("refine_many: count must be 1..=26, got {}", count));
+        }
         let n = self.steps.len() + 1;
         std::fs::create_dir_all(&self.refine_dir)
             .map_err(|e| format!("create_dir_all {}: {}", self.refine_dir.display(), e))?;
@@ -124,35 +140,55 @@ impl RefineSession {
             .extension()
             .and_then(|s| s.to_str())
             .unwrap_or("mora");
-        let refined_filename = format!("{}.refined.{}.{}", stem, n, ext);
-        let refined_path = self.refine_dir.join(&refined_filename);
-
-        // 真实写副本 (含 instruction 注释行)
-        let instruction_header = format!("# --- INSTRUCTION (refine iter {}): {}", n, instruction);
-        let refined_content = format!("{}\n{}\n", instruction_header, original);
-
-        std::fs::write(&refined_path, &refined_content)
-            .map_err(|e| format!("write {}: {}", refined_path.display(), e))?;
-
-        // 简单 diff: line counts
         let original_lines = original.lines().count();
-        let refined_lines = refined_content.lines().count();
-        let added = refined_lines.saturating_sub(original_lines);
-        let removed = original_lines.saturating_sub(refined_lines);
 
-        let step = RefineStep {
-            iteration: n,
-            script_path: self.script_path.clone(),
-            refined_path: refined_path.clone(),
-            instruction: instruction.to_string(),
-            original_bytes: original.len(),
-            refined_bytes: refined_content.len(),
-            diff_lines_added: added,
-            diff_lines_removed: removed,
-            timestamp: std::time::SystemTime::now(),
-        };
-        self.steps.push(step);
-        Ok(self.steps.last().unwrap().clone())
+        let mut steps = Vec::with_capacity(count);
+        for i in 0..count {
+            // 候选后缀 a, b, c, ...（count ≤ 26）。count=1（refine() 兼容路径）
+            // 不带后缀，保持 `<stem>.refined.<n>.<ext>` 旧文件名格式不变。
+            let refined_filename = if count == 1 {
+                format!("{}.refined.{}.{}", stem, n, ext)
+            } else {
+                let suffix = (b'a' + i as u8) as char;
+                format!("{}.refined.{}.{}.{}", stem, n, suffix, ext)
+            };
+            let refined_path = self.refine_dir.join(&refined_filename);
+
+            // 真实写副本 (含 instruction 注释行)
+            let instruction_header = if count == 1 {
+                format!("# --- INSTRUCTION (refine iter {}): {}", n, instruction)
+            } else {
+                let suffix = (b'a' + i as u8) as char;
+                format!(
+                    "# --- INSTRUCTION (refine iter {} candidate {}): {}",
+                    n, suffix, instruction
+                )
+            };
+            let refined_content = format!("{}\n{}\n", instruction_header, original);
+
+            std::fs::write(&refined_path, &refined_content)
+                .map_err(|e| format!("write {}: {}", refined_path.display(), e))?;
+
+            // 简单 diff: line counts
+            let refined_lines = refined_content.lines().count();
+            let added = refined_lines.saturating_sub(original_lines);
+            let removed = original_lines.saturating_sub(refined_lines);
+
+            let step = RefineStep {
+                iteration: n,
+                script_path: self.script_path.clone(),
+                refined_path: refined_path.clone(),
+                instruction: instruction.to_string(),
+                original_bytes: original.len(),
+                refined_bytes: refined_content.len(),
+                diff_lines_added: added,
+                diff_lines_removed: removed,
+                timestamp: std::time::SystemTime::now(),
+            };
+            self.steps.push(step.clone());
+            steps.push(step);
+        }
+        Ok(steps)
     }
 
     pub fn latest_step(&self) -> Option<&RefineStep> {
@@ -282,6 +318,59 @@ mod tests {
         let mut session = RefineSession::new(std::path::Path::new("/nonexistent/foo.mora"));
         let err = session.refine("test").expect_err("should fail");
         assert!(err.contains("read"), "got: {}", err);
+    }
+
+    // ─── v0.75.8: 多候选生成 ──────────────────────────────────────
+
+    #[test]
+    fn refine_many_creates_n_candidates() {
+        let script = write_temp_script("many.mora", "original\n");
+        let mut session = RefineSession::new(&script);
+        let steps = session.refine_many("add greeting", 3).unwrap();
+        assert_eq!(steps.len(), 3, "应生成 3 个候选");
+        // 候选文件存在且带 a/b/c 后缀
+        for (i, step) in steps.iter().enumerate() {
+            let suffix = (b'a' + i as u8) as char;
+            assert!(
+                step.refined_path
+                    .to_string_lossy()
+                    .ends_with(&format!(".{}.mora", suffix)),
+                "候选文件应带 {} 后缀: {}",
+                suffix,
+                step.refined_path.display()
+            );
+            assert!(step.refined_path.exists());
+            assert_eq!(step.iteration, 1, "同一次迭代的候选 iteration 相同");
+        }
+        // 内容含候选注释头
+        let content = std::fs::read_to_string(&steps[0].refined_path).unwrap();
+        assert!(content.contains("candidate a"), "got: {}", content);
+        let _ = std::fs::remove_dir_all(script.parent().unwrap());
+    }
+
+    #[test]
+    fn refine_many_validates_count() {
+        let script = write_temp_script("many_err.mora", "x\n");
+        let mut session = RefineSession::new(&script);
+        assert!(session.refine_many("x", 0).is_err());
+        assert!(session.refine_many("x", 27).is_err());
+        let _ = std::fs::remove_dir_all(script.parent().unwrap());
+    }
+
+    #[test]
+    fn refine_single_keeps_legacy_filename() {
+        // count=1（refine() 兼容路径）保持旧文件名格式 <stem>.refined.<n>.mora
+        let script = write_temp_script("legacy.mora", "x\n");
+        let mut session = RefineSession::new(&script);
+        let step = session.refine("v1").unwrap();
+        assert!(
+            step.refined_path
+                .to_string_lossy()
+                .ends_with("legacy.refined.1.mora"),
+            "got: {}",
+            step.refined_path.display()
+        );
+        let _ = std::fs::remove_dir_all(script.parent().unwrap());
     }
 
     #[test]

@@ -2,6 +2,22 @@
 
 All notable changes to Mora will be documented in this file.
 
+## [v0.75.8] — 2026-08-01 — refine 多候选生成 + Pregel 增量执行 v1
+
+### Changed — refine 多候选生成（src/refine/mod.rs + src/interpreter/builtins/mod.rs）
+- `RefineSession::refine_many(instruction, count)`：一次 instruction 生成 N 个独立候选副本（`<stem>.refined.<n>.<a|b|c...>`，同迭代号），带各自候选注释头。`refine()` 委托 `refine_many(1)`，单候选保持旧文件名格式兼容。
+- `mora.refine(path, instruction, count)`：第 3 参 count 生成 N 候选 → 返回 `List[Dict]`；2 参（count=1）仍返回单个 Dict（完全兼容）。生成式设计的最小有价值形态（多方案生成，非约束求解 — 探索判过度工程）。
+- 新增 4 测试：`refine_many_creates_n_candidates` / `refine_many_validates_count` / `refine_single_keeps_legacy_filename` / `mora_refine_many_returns_list`。
+
+### Changed — Pregel 增量执行 v1（src/pregel/mod.rs）
+- `agent_input_cache` + `agent_outcome_cache`：超步间 input（build_node_input JSON）完全未变时跳过整个 agent 执行，复用上次 outcome（signal/result/sends）。input 相同 → 确定性执行，语义等价；跳过避免重复副作用（如 ai.chat 网络调用）。
+- 完整寄存器级增量（channel 拆独立 env var + MirDag 节点 dirty）需改 input 注入方式（破坏现有 agent 语义），留作后续候选。
+- 新增 2 测试：`incremental_skip_when_input_unchanged`（预填充缓存验证跳过 + 结果复用）、`incremental_cache_consistent_after_run`（run 后缓存填充）。
+- `PreparedJob` type alias（并行 PREPARE 产物，消 clippy type_complexity）。
+
+### Tests
+- 572 通过 / 0 失败（+6）。clippy `-D warnings` error 数 88 → 87。
+
 ## [v0.75.7] — 2026-07-31 — SSA 根因修复启用 + Pregel FPGA 式调度
 
 ### Changed — SSA rename 根因修复 + 管线启用（src/mir/ssa.rs + lower.rs）

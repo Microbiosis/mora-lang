@@ -89,6 +89,31 @@ pub struct MirPregelEngine {
     /// super-step semantics: agents see step-start state, writes merge
     /// after join.
     pub parallelism: usize,
+    /// v0.74: Cached worker pool, reused across super-steps (created lazily
+    /// on the first parallel EXEC). Rebuilding on every step would discard
+    /// any balancing/health state.
+    pub worker_pool: Option<crate::interpreter::worker_pool::WorkerPool>,
+    /// v0.74: Per-step deadline for parallel EXEC (default None = no limit).
+    /// On timeout the step is treated as a fault and retried per
+    /// `fault_tolerance`. Timed-out worker threads are leaked (no
+    /// cooperative cancellation); the pool is rebuilt on the next step.
+    pub step_timeout: Option<std::time::Duration>,
+    /// v0.74: Fault-tolerance retry count (default 0 = off).
+    /// When a step fails, the engine restores the step-start checkpoint
+    /// and re-runs up to `fault_tolerance` times.
+    pub fault_tolerance: usize,
+    /// v0.74: Runtime stats (steps, agents run, retries, timeouts, ms).
+    pub stats: EngineStats,
+}
+
+/// v0.74: Engine runtime metrics.
+#[derive(Debug, Default, Clone)]
+pub struct EngineStats {
+    pub steps: usize,
+    pub agents_run: usize,
+    pub retries: usize,
+    pub timeouts: usize,
+    pub total_ms: u128,
 }
 
 /// v0.73: Per-agent outcome collected from a worker (parallel EXEC) or
@@ -219,6 +244,10 @@ impl MirPregelEngine {
             combiner_bodies,
             master_compute,
             parallelism: 1,
+            worker_pool: None,
+            step_timeout: None,
+            fault_tolerance: 0,
+            stats: EngineStats::default(),
             saver: None,
         }
     }
@@ -256,6 +285,25 @@ impl MirPregelEngine {
     pub fn with_parallelism(mut self, n: usize) -> Self {
         self.parallelism = n.max(1);
         self
+    }
+
+    /// v0.74: Enable fault tolerance — retry a failed super-step up to
+    /// `max_retries` times by restoring the step-start checkpoint.
+    pub fn with_fault_tolerance(mut self, max_retries: usize) -> Self {
+        self.fault_tolerance = max_retries;
+        self
+    }
+
+    /// v0.74: Set a per-super-step deadline for parallel EXEC. On timeout
+    /// the step is treated as a fault and retried (see `with_fault_tolerance`).
+    pub fn with_step_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.step_timeout = Some(timeout);
+        self
+    }
+
+    /// v0.74: Access engine runtime stats.
+    pub fn stats(&self) -> &EngineStats {
+        &self.stats
     }
 
     /// v0.69: Drain an external buffer of pending SendTasks into the engine.
@@ -470,8 +518,24 @@ pub fn run(&mut self, interpreter: &mut Interpreter) -> Result<Value, String> {
 
             let mut writes: Vec<(String, String, Value)> = Vec::new();
 
-            // v0.73: EXEC — sequential (parallelism=1) or parallel.
-            if self.parallelism <= 1 {
+            // v0.74: Step-level fault tolerance. Snapshot step-start state,
+            // run EXEC, and on failure restore + retry up to fault_tolerance.
+            let step_start = self.build_checkpoint();
+            let mut exec_result: Result<(), String> = Ok(());
+
+            for attempt in 0..=self.fault_tolerance {
+                if attempt > 0 {
+                    // Restore step-start state and re-run the step.
+                    self.stats.retries += 1;
+                    self.restore_checkpoint(&step_start);
+                    // Re-run EXEC from the restored state.
+                    self.worker_pool = None; // discard any leaked threads
+                }
+
+                // v0.73: EXEC — sequential (parallelism=1) or parallel.
+                let mut step_writes: Vec<(String, String, Value)> = Vec::new();
+                exec_result = (|| {
+                if self.parallelism <= 1 {
                 // ── Sequential path: inline, current behavior ──
                 for node_name in &to_execute {
                     let agent_idx = *self.agents_by_name.get(node_name).ok_or_else(|| {
@@ -493,6 +557,8 @@ pub fn run(&mut self, interpreter: &mut Interpreter) -> Result<Value, String> {
                         ));
                     }
 
+                    self.stats.agents_run += 1;
+
                     let (signal, result) = crate::mir::interp::run_mir_with_signal(
                         &agent.task_body, interpreter, &mut env,
                     ).map_err(|e| format!("Pregel node '{}': {}", node_name, e))?;
@@ -504,9 +570,9 @@ pub fn run(&mut self, interpreter: &mut Interpreter) -> Result<Value, String> {
                         env,
                         sends: Vec::new(),
                     };
-                    self.reconcile_outcome(interpreter, &mut next_active, &mut writes, outcome)?;
+                    self.reconcile_outcome(interpreter, &mut next_active, &mut step_writes, outcome)?;
                 }
-            } else {
+                } else {
                 // ── Parallel path: PREPARE → SPAWN → RECONCILE ──
                 // PREPARE (main thread, &self read): build private envs.
                 let mut prepared: Vec<(
@@ -529,6 +595,7 @@ pub fn run(&mut self, interpreter: &mut Interpreter) -> Result<Value, String> {
                     let mut env = interpreter.core.environment.lock().clone();
                     env.define("input".to_string(), Value::String(input_val.to_string()), false);
                     env.clock.tick(node_name);
+                    self.stats.agents_run += 1;
                     prepared.push((
                         node_name.clone(),
                         std::sync::Arc::new(agent.task_body.clone()),
@@ -537,7 +604,13 @@ pub fn run(&mut self, interpreter: &mut Interpreter) -> Result<Value, String> {
                 }
 
                 // SPAWN: one Interpreter clone + private env per worker job.
-                let pool = crate::interpreter::worker_pool::WorkerPool::new(self.parallelism);
+                // v0.74: Reuse cached pool (created once), keep across steps.
+                if self.worker_pool.is_none() {
+                    self.worker_pool =
+                        Some(crate::interpreter::worker_pool::WorkerPool::new(self.parallelism));
+                }
+                let pool = self.worker_pool.as_ref()
+                    .ok_or("Pregel: worker pool missing")?;
                 let jobs: Vec<crate::interpreter::worker_pool::WorkerJob> = prepared
                     .into_iter()
                     .enumerate()
@@ -548,34 +621,67 @@ pub fn run(&mut self, interpreter: &mut Interpreter) -> Result<Value, String> {
                             task: Box::new(move || {
                                 let (signal, result) = crate::mir::interp::run_mir_with_signal(
                                     &task, &mut interp_clone, &mut env,
-                                ).map_err(|e| format!("Pregel node '{}': {}", name, e))
-                                .unwrap_or_else(|e| panic!("{}", e));
+                                ).map_err(|e| format!("Pregel node '{}': {}", name, e))?;
                                 let sends = std::mem::take(&mut interp_clone.core.dynamic_sends);
-                                Box::new(AgentExecOutcome {
+                                Ok(Box::new(AgentExecOutcome {
                                     node_name: name,
                                     signal,
                                     result,
                                     env,
                                     sends,
-                                }) as Box<dyn std::any::Any + Send>
+                                }) as Box<dyn std::any::Any + Send>)
                             }),
                         }
                     })
                     .collect();
-                let outcomes = pool.run_batch(jobs);
+
+                // v0.74: Run batch with optional per-step timeout. On timeout
+                // the step is treated as a fault and retried (fault_tolerance).
+                let started = std::time::Instant::now();
+                let batch = pool.run_batch_with_timeout(jobs, self.step_timeout)
+                    .map_err(|e| format!("Pregel parallel EXEC: {}", e))?;
+                self.stats.total_ms += started.elapsed().as_millis();
+
+                if batch.timed_out {
+                    self.stats.timeouts += 1;
+                    // Drop the pool (leaked timed-out worker threads) and
+                    // force a fresh one on the next step.
+                    self.worker_pool = None;
+                    return Err(format!(
+                        "Pregel: super-step {} timed out after {:?}",
+                        self.current_step, self.step_timeout
+                    ));
+                }
+                let outcomes = batch.outcomes;
 
                 // RECONCILE (main thread, index order = deterministic).
                 for out in outcomes {
                     let outcome: AgentExecOutcome =
                         *out.value.downcast::<AgentExecOutcome>()
                             .map_err(|_| "Pregel: worker outcome type mismatch".to_string())?;
-                    self.reconcile_outcome(interpreter, &mut next_active, &mut writes, outcome)?;
+                    self.reconcile_outcome(interpreter, &mut next_active, &mut step_writes, outcome)?;
+                }
+                }
+
+                // v0.73: Flush intra-run sends so a step-N send reaches step-N+1.
+                let sends = std::mem::take(&mut interpreter.core.dynamic_sends);
+                self.flush_pending_sends(sends);
+                Ok(())
+                })();
+                // end retryable exec closure
+
+                if exec_result.is_ok() {
+                    writes = step_writes;
+                    break;
+                }
+                // Else: retry loop will restore checkpoint and re-run.
+                if attempt == self.fault_tolerance {
+                    break;
                 }
             }
-
-            // v0.73: Flush intra-run sends so a step-N send reaches step-N+1.
-            let sends = std::mem::take(&mut interpreter.core.dynamic_sends);
-            self.flush_pending_sends(sends);
+            if let Err(e) = exec_result {
+                return Err(e);
+            }
 
             // ---------- 3. UPDATE ----------
             for (_node, channel, value) in writes {
@@ -648,6 +754,7 @@ pub fn run(&mut self, interpreter: &mut Interpreter) -> Result<Value, String> {
                 agents.iter().position(|a| &a.name == n).unwrap_or(usize::MAX)
             });
             self.current_step += 1;
+            self.stats.steps += 1;
 
             // v0.63: Auto-save checkpoint if configured
             if let Some(ref cp_cfg) = self.config.checkpoint {
@@ -657,6 +764,15 @@ pub fn run(&mut self, interpreter: &mut Interpreter) -> Result<Value, String> {
                         if let Some(ref saver) = self.saver {
                             let thread_id = cp.thread_id.clone();
                             saver.save(&thread_id, &cp)?;
+                            // v0.74: Retention — prune oldest checkpoints
+                            // beyond max_checkpoints (default: keep all).
+                            if let Some(max_cp) = cp_cfg.max_checkpoints {
+                                let mut ids = saver.list(&thread_id)?;
+                                while ids.len() > max_cp {
+                                    let oldest = ids.remove(0);
+                                    saver.delete(&thread_id, &oldest)?;
+                                }
+                            }
                         }
                     }
                 }
@@ -813,6 +929,13 @@ pub fn run(&mut self, interpreter: &mut Interpreter) -> Result<Value, String> {
         self.versions_seen = cp.versions_seen.clone();
         self.pending_sends = cp.pending_sends.clone();
         self.current_step = cp.step;
+        // v0.74: Restore clears vertex_state — re-running the step rebuilds
+        // it from the agents' signals. Aggregators reset to config initials.
+        self.vertex_state.clear();
+        self.aggregator_acc.clear();
+        for (name, initial) in self.aggregator_initial_snapshot() {
+            self.aggregator_acc.insert(name, initial);
+        }
     }
 
     /// 访问 config（用于测试与序列化）
@@ -1123,5 +1246,81 @@ mod tests {
         engine.run(&mut interp).unwrap();
         assert_eq!(engine.vertex_state.get("a"), Some(&VertexState::Active));
         assert_eq!(engine.vertex_state.get("b"), Some(&VertexState::Active));
+    }
+
+    // ─── v0.74: Fault tolerance tests ─────────────────────────────
+
+    /// Parallel EXEC with a failing agent returns Err (not hang).
+    #[test]
+    fn parallel_agent_error_propagates() {
+        // Agent "a" task_body errors: Int + Float is a strict-mode type
+        // error in eval_binary → run_mir returns Err.
+        let failing_body = MirFunction {
+            params: Vec::new(),
+            body: vec![
+                MirInst::Const(0, Value::Int(1)),
+                MirInst::Const(1, Value::Float(2.5)),
+                MirInst::BinaryOp(2, 0, crate::common::BinaryOp::Add, 1),
+                MirInst::Return(Some(2)),
+            ],
+            n_regs: 3,
+        };
+        let config = MirPregelConfig {
+            agents: vec![
+                MirAgentDef {
+                    name: "a".into(),
+                    task_expr: MirExpr::lit(
+                        crate::common::Literal::Nil(crate::common::Span::new(1, 1)),
+                        crate::common::Span::new(1, 1),
+                    ),
+                    verify_expr: None,
+                    with_config: None,
+                    task_body: failing_body,
+                    task_mir_expr: None,
+                    combiner_body: None,
+                },
+            ],
+            edges: vec![
+                MirEdgeDef { from: "@start".into(), to: "a".into(), condition_expr: None, condition_body: None },
+            ],
+            state_schema: vec![],
+            checkpoint: None,
+            interrupt_points: vec![],
+            adjacency: HashMap::new(),
+            aggregators: Vec::new(),
+            master_compute: None,
+        };
+        let mut engine = MirPregelEngine::new(config).with_parallelism(2);
+        let mut interp = crate::interpreter::Interpreter::new();
+        let err = engine.run(&mut interp).unwrap_err();
+        assert!(err.contains("Pregel node 'a'"), "error must identify the agent, got: {}", err);
+    }
+
+    /// Fault tolerance runs cleanly; stats reflect steps/agents.
+    /// Note: `@start` occupies one empty super-step, so with 1 agent the
+    /// total is 2 steps (start → agent a).
+    #[test]
+    fn fault_tolerance_runs_and_stats() {
+        let config = MirPregelConfig {
+            agents: vec![make_const_agent("a", 7)],
+            edges: vec![
+                MirEdgeDef { from: "@start".into(), to: "a".into(), condition_expr: None, condition_body: None },
+            ],
+            state_schema: vec![],
+            checkpoint: None,
+            interrupt_points: vec![],
+            adjacency: HashMap::new(),
+            aggregators: Vec::new(),
+            master_compute: None,
+        };
+        let mut engine = MirPregelEngine::new(config)
+            .with_parallelism(2)
+            .with_fault_tolerance(3);
+        let mut interp = crate::interpreter::Interpreter::new();
+        let result = engine.run(&mut interp).unwrap();
+        assert_eq!(result, Value::String("7".to_string()));
+        assert_eq!(engine.stats().steps, 2, "@start empty step + agent a");
+        assert_eq!(engine.stats().agents_run, 1);
+        assert_eq!(engine.stats().retries, 0, "no failures expected");
     }
 }

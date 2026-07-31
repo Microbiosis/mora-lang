@@ -1777,19 +1777,35 @@ impl Interpreter {
                 }
                 let script = std::path::PathBuf::from(args[0].to_string());
                 let instruction = args[1].to_string();
+                // v0.75.8: 可选第 3 参 count — 生成 N 个候选副本（多方案生成）。
+                // 2 参（count=1）返回单个 Dict（行为不变）；3 参返回 List[Dict]。
+                let count = if let Some(Value::Float(n)) = args.get(2) {
+                    *n as usize
+                } else {
+                    1
+                };
                 // v0.49.0 (A2): drop lock before file I/O.
                 // get_or_create 只创建空 session (无 I/O); refine 是 I/O 在锁外
-                let step = {
+                let steps = {
                     let mut registry = self
                         .orch
                         .refine_registry
                         .lock()
                         .expect("refine_registry poisoned");
                     let session = registry.get_or_create(&script);
-                    session.refine(&instruction)
+                    session.refine_many(&instruction, count)
                 }
                 .map_err(|e| format!("mora.refine: {}", e))?;
-                Ok(Value::Dict(step.to_dict()))
+                if count == 1 {
+                    Ok(Value::Dict(steps.into_iter().next().unwrap().to_dict()))
+                } else {
+                    Ok(Value::List(
+                        steps
+                            .into_iter()
+                            .map(|s| Value::Dict(s.to_dict()))
+                            .collect(),
+                    ))
+                }
             }
             "refine_info" => {
                 if args.is_empty() {
@@ -4574,6 +4590,47 @@ mod tests_v048_refine {
                 _ => panic!("expected Dict"),
             }
         }
+        let _ = std::fs::remove_dir_all(script.parent().unwrap());
+    }
+
+    /// v0.75.8: mora.refine 第 3 参 count → 返回 List[Dict]（多候选）
+    #[test]
+    fn mora_refine_many_returns_list() {
+        let mut interp = Interpreter::new();
+        let script = write_temp_script("many.mora", "x\n");
+        let result = interp
+            .call_mora_method(
+                "refine",
+                &[
+                    Value::String(script.to_string_lossy().to_string()),
+                    Value::String("add variants".to_string()),
+                    Value::Float(3.0),
+                ],
+            )
+            .expect("refine_many");
+        match result {
+            Value::List(items) => {
+                assert_eq!(items.len(), 3, "3 个候选");
+                for item in &items {
+                    match item {
+                        Value::Dict(d) => assert!(d.contains_key("refined")),
+                        _ => panic!("expected Dict in List"),
+                    }
+                }
+            }
+            _ => panic!("expected List for 3-arg refine"),
+        }
+        // 2 参仍返回单个 Dict（兼容）
+        let single = interp
+            .call_mora_method(
+                "refine",
+                &[
+                    Value::String(script.to_string_lossy().to_string()),
+                    Value::String("again".to_string()),
+                ],
+            )
+            .expect("refine 2-arg");
+        assert!(matches!(single, Value::Dict(_)), "2 参应返回 Dict");
         let _ = std::fs::remove_dir_all(script.parent().unwrap());
     }
 

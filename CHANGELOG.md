@@ -2,6 +2,25 @@
 
 All notable changes to Mora will be documented in this file.
 
+## [v0.75.5] — 2026-07-31 — Cascades 择优 + G-Set CRDT 语义
+
+两项独立增强（据「他山之石」第 3 号——数据库优化器 Cascades/Volcano 框架，与第 8 号——CRDT 冲突-free 数据结构）。
+
+### Changed — Cascades 同 stage 择优（src/mir/optimize/dag_search.rs）
+- `dag_search_staged` 同 stage 内从「第一个 delta>0 就 break」改为「收集本节点所有可应用重写，选 cost delta 最大的应用」——规则匹配与代价评估分离（Cascades 核心精神）。
+- 安全性：所有规则 `rewrite` 只读返回 owned `DagRewrite`，候选收集期间 dag 不变。
+- 新增测试 `staged_picks_highest_gain_in_stage`：测试局部低收益规则与 ConstFolding 同 stage，断言择优选中折叠（delta=2）而非先匹配的小 gain（delta=1）。
+
+### Changed — G-Set（grow-only set）CRDT 语义
+- `src/value.rs`：`MergeStrategy` 新增 `GrowOnlySet` 变体 — List 并集（只加新元素）/ Dict key 级并集（child 的 key 仅在 parent 缺失时插入）/ 其他 LWW。`Value::merge` 加对应 arm。
+- `src/mir/expr/mod.rs`：`MirReducerKind` 新增 `GrowOnly` 变体，`to_merge_strategy` 映射到 `MergeStrategy::GrowOnlySet`——pregel `state_schema` 可声明 grow-only 通道。
+- 影响面：`to_merge_strategy` 是唯一 exhaustive match（已加 arm）；pregel `apply_write` 的 catch-all 不受影响。
+- 新增测试：`merge_grow_only_set_lists` / `merge_grow_only_set_dicts` / `merge_grow_only_set_fallback_lww` / `env_merge_with_grow_only_set_strategy` / `to_merge_strategy_maps_reducers`。
+- 顺带修正 value.rs 两处既有 vector_clock 测试缩进（fmt 合规）。
+
+### Tests
+- 562 通过 / 0 失败（+6 新增）。clippy `-D warnings` error 数 89 → 88。
+
 ## [v0.75.4] — 2026-07-31 — Pregel 消息计数 + 提前失败校验
 
 按「他山之石」分析（石 2：Apache Giraph 的 message counter + barrier 精神 — 在超步边界确认每条消息都有合法接收者并统计消息量）。BSP barrier 在 mora 已天然存在（每超步 `pending_sends.drain` 全量分发），故只补齐可观测性与提前校验。

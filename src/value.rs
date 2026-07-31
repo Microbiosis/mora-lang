@@ -473,6 +473,9 @@ pub enum MergeStrategy {
     Add,
     /// Dict: key-level merge (child keys win on conflict).
     DictUnion,
+    /// v0.75.5: G-Set（grow-only set）— List: 并集（只加新元素）；
+    /// Dict: key 级并集（child 的 key 仅在 parent 缺失时插入）；其他 LWW。
+    GrowOnlySet,
 }
 
 impl Value {
@@ -483,7 +486,10 @@ impl Value {
         match strategy {
             MergeStrategy::LastWriteWins => child,
             MergeStrategy::Append => match (parent, child) {
-                (Value::List(mut a), Value::List(b)) => { a.extend(b); Value::List(a) }
+                (Value::List(mut a), Value::List(b)) => {
+                    a.extend(b);
+                    Value::List(a)
+                }
                 (Value::String(a), Value::String(b)) => Value::String(a + &b),
                 (_, child) => child, // fallback: LWW
             },
@@ -494,10 +500,29 @@ impl Value {
             },
             MergeStrategy::DictUnion => match (parent, child) {
                 (Value::Dict(mut a), Value::Dict(b)) => {
-                    for (k, v) in b { a.insert(k, v); }
+                    for (k, v) in b {
+                        a.insert(k, v);
+                    }
                     Value::Dict(a)
                 }
                 (_, child) => child,
+            },
+            MergeStrategy::GrowOnlySet => match (parent, child) {
+                (Value::List(mut a), Value::List(b)) => {
+                    for item in b {
+                        if !a.contains(&item) {
+                            a.push(item);
+                        }
+                    }
+                    Value::List(a)
+                }
+                (Value::Dict(mut a), Value::Dict(b)) => {
+                    for (k, v) in b {
+                        a.entry(k).or_insert(v);
+                    }
+                    Value::Dict(a)
+                }
+                (_, child) => child, // fallback: LWW
             },
         }
     }
@@ -535,8 +560,12 @@ impl VectorClock {
         for k in a.entries.keys().chain(b.entries.keys()) {
             let av = a.entries.get(k).copied().unwrap_or(0);
             let bv = b.entries.get(k).copied().unwrap_or(0);
-            if av > bv { return false; }
-            if av < bv { has_strict = true; }
+            if av > bv {
+                return false;
+            }
+            if av < bv {
+                has_strict = true;
+            }
         }
         has_strict
     }
@@ -557,20 +586,20 @@ impl VectorClock {
 
     /// v0.63: Serialize to a Dict for checkpoint storage.
     pub fn to_dict(&self) -> HashMap<String, Value> {
-        self.entries.iter()
+        self.entries
+            .iter()
             .map(|(k, &v)| (k.clone(), Value::Int(v as i64)))
             .collect()
     }
 
     /// v0.63: Deserialize from a Dict (checkpoint restore).
     pub fn from_dict(d: &HashMap<String, Value>) -> Self {
-        let entries: HashMap<String, u64> = d.iter()
-            .filter_map(|(k, v)| {
-                match v {
-                    Value::Int(n) => Some((k.clone(), *n as u64)),
-                    Value::Float(n) => Some((k.clone(), *n as u64)),
-                    _ => None,
-                }
+        let entries: HashMap<String, u64> = d
+            .iter()
+            .filter_map(|(k, v)| match v {
+                Value::Int(n) => Some((k.clone(), *n as u64)),
+                Value::Float(n) => Some((k.clone(), *n as u64)),
+                _ => None,
             })
             .collect();
         VectorClock { entries }
@@ -748,7 +777,8 @@ impl Environment {
                     *parent_arc.lock() = merged;
                     // Merge version clock for this binding
                     if let Some(child_v) = child.versions.get(&name) {
-                        self.versions.entry(name.clone())
+                        self.versions
+                            .entry(name.clone())
                             .or_default()
                             .merge(child_v);
                     }
@@ -788,7 +818,8 @@ impl Environment {
                     let child_clock = child.versions.get(&name).cloned().unwrap_or_default();
 
                     // Detect concurrent modifications
-                    if !parent_clock.is_empty() && !child_clock.is_empty()
+                    if !parent_clock.is_empty()
+                        && !child_clock.is_empty()
                         && VectorClock::concurrent(&parent_clock, &child_clock)
                     {
                         conflicts.push(Conflict {
@@ -824,7 +855,10 @@ impl Environment {
 
 /// Iterate bindings from an Environment without consuming it.
 fn values_iter(env: &Environment) -> Vec<(String, Value)> {
-    env.values.iter().map(|(k, v)| (k.clone(), v.lock().clone())).collect()
+    env.values
+        .iter()
+        .map(|(k, v)| (k.clone(), v.lock().clone()))
+        .collect()
 }
 
 // ─── FlowSignal ──────────────────────────────────────────
@@ -973,18 +1007,28 @@ mod tests {
 
     #[test]
     fn merge_add_ints() {
-        assert_eq!(Value::merge(Value::Int(5), Value::Int(3), &MergeStrategy::Add), Value::Int(8));
+        assert_eq!(
+            Value::merge(Value::Int(5), Value::Int(3), &MergeStrategy::Add),
+            Value::Int(8)
+        );
     }
 
     #[test]
     fn merge_add_floats() {
-        assert_eq!(Value::merge(Value::Float(1.5), Value::Float(2.5), &MergeStrategy::Add), Value::Float(4.0));
+        assert_eq!(
+            Value::merge(Value::Float(1.5), Value::Float(2.5), &MergeStrategy::Add),
+            Value::Float(4.0)
+        );
     }
 
     #[test]
     fn merge_append_lists() {
         assert_eq!(
-            Value::merge(Value::List(vec![Value::Int(1)]), Value::List(vec![Value::Int(2)]), &MergeStrategy::Append),
+            Value::merge(
+                Value::List(vec![Value::Int(1)]),
+                Value::List(vec![Value::Int(2)]),
+                &MergeStrategy::Append
+            ),
             Value::List(vec![Value::Int(1), Value::Int(2)])
         );
     }
@@ -992,30 +1036,120 @@ mod tests {
     #[test]
     fn merge_append_strings() {
         assert_eq!(
-            Value::merge(Value::String("a".into()), Value::String("b".into()), &MergeStrategy::Append),
+            Value::merge(
+                Value::String("a".into()),
+                Value::String("b".into()),
+                &MergeStrategy::Append
+            ),
             Value::String("ab".into())
         );
     }
 
     #[test]
     fn merge_dict_union() {
-        let mut a = HashMap::new(); a.insert("x".into(), Value::Int(1));
-        let mut b = HashMap::new(); b.insert("y".into(), Value::Int(2));
+        let mut a = HashMap::new();
+        a.insert("x".into(), Value::Int(1));
+        let mut b = HashMap::new();
+        b.insert("y".into(), Value::Int(2));
         let mut expected = HashMap::new();
         expected.insert("x".into(), Value::Int(1));
         expected.insert("y".into(), Value::Int(2));
-        assert_eq!(Value::merge(Value::Dict(a), Value::Dict(b), &MergeStrategy::DictUnion), Value::Dict(expected));
+        assert_eq!(
+            Value::merge(Value::Dict(a), Value::Dict(b), &MergeStrategy::DictUnion),
+            Value::Dict(expected)
+        );
     }
 
     #[test]
     fn merge_lww_is_child_wins() {
-        assert_eq!(Value::merge(Value::Int(1), Value::Int(99), &MergeStrategy::LastWriteWins), Value::Int(99));
+        assert_eq!(
+            Value::merge(Value::Int(1), Value::Int(99), &MergeStrategy::LastWriteWins),
+            Value::Int(99)
+        );
     }
 
     #[test]
     fn merge_fallback_to_lww() {
         // String + Int with Add strategy — can't add, falls back to child
-        assert_eq!(Value::merge(Value::String("x".into()), Value::Int(42), &MergeStrategy::Add), Value::Int(42));
+        assert_eq!(
+            Value::merge(
+                Value::String("x".into()),
+                Value::Int(42),
+                &MergeStrategy::Add
+            ),
+            Value::Int(42)
+        );
+    }
+
+    // ─── v0.75.5: G-Set（grow-only set）───
+
+    #[test]
+    fn merge_grow_only_set_lists() {
+        // 并集：parent ∪ child，只加新元素
+        assert_eq!(
+            Value::merge(
+                Value::List(vec![Value::Int(1), Value::Int(2)]),
+                Value::List(vec![Value::Int(2), Value::Int(3)]),
+                &MergeStrategy::GrowOnlySet
+            ),
+            Value::List(vec![Value::Int(1), Value::Int(2), Value::Int(3)])
+        );
+    }
+
+    #[test]
+    fn merge_grow_only_set_dicts() {
+        // key 级并集：child 的 key 仅在 parent 缺失时插入，不覆盖已存在 key
+        let parent = Value::Dict([("a".to_string(), Value::Int(1))].into_iter().collect());
+        let child = Value::Dict(
+            [
+                ("a".to_string(), Value::Int(99)),
+                ("b".to_string(), Value::Int(2)),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        let merged = Value::merge(parent, child, &MergeStrategy::GrowOnlySet);
+        let map = match merged {
+            Value::Dict(m) => m,
+            _ => panic!("expected dict"),
+        };
+        assert_eq!(map.get("a"), Some(&Value::Int(1)), "已存在 key 不被覆盖");
+        assert_eq!(map.get("b"), Some(&Value::Int(2)));
+    }
+
+    #[test]
+    fn merge_grow_only_set_fallback_lww() {
+        // 非 List/Dict 走 child（与 Append/Add 的 fallback 模式一致）
+        assert_eq!(
+            Value::merge(Value::Int(1), Value::Int(42), &MergeStrategy::GrowOnlySet),
+            Value::Int(42)
+        );
+    }
+
+    #[test]
+    fn env_merge_with_grow_only_set_strategy() {
+        let mut parent = Environment::new();
+        parent.define(
+            "tags".into(),
+            Value::List(vec![Value::String("a".into())]),
+            false,
+        );
+        let mut child = Environment::new();
+        child.define(
+            "tags".into(),
+            Value::List(vec![Value::String("a".into()), Value::String("b".into())]),
+            false,
+        );
+        let mut strategies = HashMap::new();
+        strategies.insert("tags".to_string(), MergeStrategy::GrowOnlySet);
+        parent.merge_from_with_strategies(&child, &strategies, &MergeStrategy::LastWriteWins);
+        assert_eq!(
+            parent.get("tags"),
+            Some(Value::List(vec![
+                Value::String("a".into()),
+                Value::String("b".into())
+            ]))
+        );
     }
 
     #[test]
@@ -1048,7 +1182,11 @@ mod tests {
 
         let mut child = Environment::new();
         child.define("counter".into(), Value::Int(5), false);
-        child.define("log".into(), Value::List(vec![Value::String("msg1".into())]), false);
+        child.define(
+            "log".into(),
+            Value::List(vec![Value::String("msg1".into())]),
+            false,
+        );
         child.define("name".into(), Value::String("bob".into()), false);
         child.define("new_key".into(), Value::Int(42), false);
 
@@ -1062,7 +1200,10 @@ mod tests {
         // counter: 100 + 5 = 105 (Add strategy)
         assert_eq!(parent.get("counter"), Some(Value::Int(105)));
         // log: [] ++ ["msg1"] = ["msg1"] (Append strategy)
-        assert_eq!(parent.get("log"), Some(Value::List(vec![Value::String("msg1".into())])));
+        assert_eq!(
+            parent.get("log"),
+            Some(Value::List(vec![Value::String("msg1".into())]))
+        );
         // name: LWW → child wins (not in strategies map)
         assert_eq!(parent.get("name"), Some(Value::String("bob".into())));
         // new_key: new binding, defined directly

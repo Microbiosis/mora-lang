@@ -847,6 +847,8 @@ impl MirInst {
             MirInst::JumpIf(cond, _) | MirInst::JumpIfNot(cond, _) => vec![*cond],
             MirInst::Return(Some(r)) => vec![*r],
             MirInst::Return(None) => vec![],
+            MirInst::Halt(Some(r)) => vec![*r],
+            MirInst::Halt(None) => vec![],
             MirInst::Send { value, .. } => vec![*value],
             MirInst::Receive { .. } => vec![],
             MirInst::Save { path, value } => vec![*path, *value],
@@ -865,7 +867,8 @@ impl MirInst {
             | MirInst::Observe { .. } | MirInst::Span { .. } | MirInst::RecordTokens { .. }
             | MirInst::TraitDef { .. } | MirInst::ImplDef { .. } | MirInst::Orchestrate { .. }
             | MirInst::SkillDef { .. } | MirInst::PromptSection { .. } | MirInst::DocumentSection { .. }
-            | MirInst::Label(_) | MirInst::Jump(_) | MirInst::Break(_) | MirInst::Continue(_) => vec![],
+            | MirInst::Label(_) | MirInst::Jump(_) | MirInst::Break(_) | MirInst::Continue(_)
+            | MirInst::Halt(_) => vec![],
         }
     }
 
@@ -883,7 +886,7 @@ impl MirInst {
             | MirInst::SkillDef { .. } | MirInst::Route(_) | MirInst::WithConfig { .. }
             | MirInst::Transaction { .. } | MirInst::Worker { .. } | MirInst::Observe { .. }
             | MirInst::Span { .. } | MirInst::PromptSection { .. } | MirInst::DocumentSection { .. }
-            | MirInst::StreamFor { .. } | MirInst::Return(_) => true,
+            | MirInst::StreamFor { .. } | MirInst::Return(_) | MirInst::Halt(_) => true,
             MirInst::Const(_, _) | MirInst::Var(_, _) | MirInst::BinaryOp(_, _, _, _)
             | MirInst::Call(_, _, _) | MirInst::MethodCall(_, _, _, _) | MirInst::ListLit(_, _)
             | MirInst::DictLit(_, _) | MirInst::Index(_, _, _) | MirInst::Pipe(_, _, _)
@@ -965,6 +968,7 @@ pub fn dispatch(
         MirInst::JumpIf(cond, lbl) => Ok(h_jump_if(regs, *cond, *lbl)),
         MirInst::JumpIfNot(cond, lbl) => Ok(h_jump_if_not(regs, *cond, *lbl)),
         MirInst::Return(r) => Ok(h_return(regs, *r)),
+        MirInst::Halt(r) => Ok(h_halt(regs, *r)),
         MirInst::Break(lbl) => Ok(h_break(*lbl)),
         MirInst::Continue(lbl) => Ok(h_continue(*lbl)),
     }

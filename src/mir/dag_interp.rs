@@ -37,6 +37,21 @@ pub fn run_dag(
     interp: &mut Interpreter,
     env: &mut Environment,
 ) -> Result<Value, String> {
+    Ok(run_dag_with_signal(dag, func, interp, env)?.1)
+}
+
+/// v0.75: `run_dag` 的信号感知变体。
+///
+/// 返回 `(MirSignal, Value)`。此前 `run_mir_with_signal` 无条件包装成
+/// `MirSignal::Return`，导致 `Flow::Halt`（vote_to_halt）信号被丢弃、
+/// 引擎永远无法将顶点置为 Halted。此变体真正传播 Return/Halt 信号。
+pub fn run_dag_with_signal(
+    dag: &MirDag,
+    func: &MirFunction,
+    interp: &mut Interpreter,
+    env: &mut Environment,
+) -> Result<(mir_interp::MirSignal, Value), String> {
+    use mir_interp::MirSignal;
     let task_registry = mir_interp::build_task_registry(&func.body);
     let mut regs: Vec<Value> = vec![Value::Nil; dag.n_regs];
     let mut reg_ready: Vec<bool> = vec![false; dag.n_regs];
@@ -47,6 +62,7 @@ pub fn run_dag(
     const MAX_STEPS: u32 = 10000;
     let mut step = 0;
     let mut result: Value = Value::Nil;
+    let mut signal: MirSignal = MirSignal::None;
 
     while !active.is_empty() && step < MAX_STEPS {
         step += 1;
@@ -82,10 +98,10 @@ pub fn run_dag(
                     let flow = handlers::dispatch(inst, &mut regs, interp, env, &task_registry)?;
                     if let Some(d) = inst.dst() { reg_ready[d] = true; result = regs[d].clone(); }
                     match flow {
-                        Flow::Return(v) => { result = v; saw_return = true; }
+                        Flow::Return(v) => { signal = MirSignal::Return(v.clone()); result = v; saw_return = true; }
                         Flow::Continue => {}
                         Flow::Jump(_) => {}
-                        Flow::Halt(v) => { result = v.unwrap_or(Value::Nil); saw_return = true; }
+                        Flow::Halt(v) => { signal = MirSignal::Halt(v.clone()); result = v.unwrap_or(Value::Nil); saw_return = true; }
                     }
                 }
                 MirDagNode::Branch { cond, true_target, false_target } => {
@@ -119,7 +135,7 @@ pub fn run_dag(
         active = next_active;
     }
 
-    Ok(result)
+    Ok((signal, result))
 }
 
 fn node_ready(node: &MirDagNode, reg_ready: &[bool]) -> bool {

@@ -44,10 +44,7 @@ pub fn run_mir(
     interp: &mut Interpreter,
     env: &mut Environment,
 ) -> Result<Value, String> {
-    let mut dag = crate::mir::dag::dag_analyze(func);
-    crate::mir::optimize::dag_optimize(&mut dag);
-    dag.prune_sequence_edges();
-    crate::mir::dag_interp::run_dag(&dag, func, interp, env)
+    Ok(run_mir_with_signal(func, interp, env)?.1)
 }
 
 /// α.1: 索引操作 List[i] / Dict[key] / String[i]
@@ -290,15 +287,19 @@ pub enum MirSignal {
 
 /// α.10: 与 `run_mir` 等价，但返回 `(MirSignal, Value)`，保留信号。
 /// REPL/差分测试用此观测控制流出口；生产路径仍走 `run_mir`。
+///
+/// v0.75: 修复 — 此前无条件返回 `MirSignal::Return`，丢弃 `Flow::Halt`
+/// （vote_to_halt）信号，导致 Pregel 引擎的 vertex_state 永远无法置为
+/// Halted。现在通过 `run_dag_with_signal` 真正传播 Return/Halt。
 pub fn run_mir_with_signal(
     func: &MirFunction,
     interp: &mut Interpreter,
     env: &mut Environment,
 ) -> Result<(MirSignal, Value), String> {
-    let value = run_mir(func, interp, env)?;
-    // run_mir 成功路径只可能在 pc 走完 body（MirSignal::None）或命中 Return(Some/None)。
-    // Break/Continue 在循环 lowering 中已被消除（落到 Label + Jump），不会从 run_mir 顶层逃逸。
-    Ok((MirSignal::Return(value.clone()), value))
+    let mut dag = crate::mir::dag::dag_analyze(func);
+    crate::mir::optimize::dag_optimize(&mut dag);
+    dag.prune_sequence_edges();
+    crate::mir::dag_interp::run_dag_with_signal(&dag, func, interp, env)
 }
 
 /// α.10: `run_main_task` 的信号感知变体。

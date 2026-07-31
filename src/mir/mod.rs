@@ -342,6 +342,9 @@ pub enum MirInst {
     JumpIf(Reg, Label),
     JumpIfNot(Reg, Label),
     Return(Option<Reg>),
+    /// v0.75: vote_to_halt — agent 主动声明"我完成了，除非收到 Send 否则
+    /// 不再被调度"。BSP 引擎据此将顶点置为 Halted。线性上下文中等价于 Return。
+    Halt(Option<Reg>),
     /// α.1: break 到指定 label（循环出口）
     Break(Label),
     /// α.1: continue 到指定 label（循环增量处）

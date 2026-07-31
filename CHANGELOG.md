@@ -2,6 +2,28 @@
 
 All notable changes to Mora will be documented in this file.
 
+## [v0.75.10] — 2026-08-01 — 寄存器级增量（DagExecMemo + 加法注入）+ 修复 v0.75.9 缓存失效
+
+（第三步「完整寄存器级增量」落地，采用非破坏 C 路径：保留 `input` 契约 + 加法注入逐 channel var + 纯节点记忆化。计划中记录的破坏性路径 B — 删除 `input` 契约、全量 dirty 传播 — 会破坏所有现有 agent 读取语义，未采用。）
+
+### Added — 寄存器级增量执行器（src/mir/dag_interp.rs）
+- `DagExecMemo`：跨调用/超步状态化 memo — 只对「可证明纯计算」节点（白名单：`Const/BinaryOp/ListLit/DictLit/Index/Expr`，零 env 读取、零副作用、输出 = 输入函数）按「输入寄存器值相等」跳过执行、复用上次输出。副作用/env 读取节点（Var/Call/Prompt/Send/Define/Assign/...）永远重跑 — 保守白名单保证增量安全。
+- `run_dag_with_signal_memo`：memo 变体；`run_dag_with_signal` 委托它（每次新 memo = 无增量，语义与旧实现完全一致）。记忆按输入值而非超步号判断 → fault-retry 回滚后仍正确。
+- `DagExecMemo::skipped_nodes/executed_nodes`（可观测性）+ `is_empty`（并行 RECONCILE 区分跳过路径）。
+- 新增 3 单测：`memo_second_run_skips_pure_nodes` / `memo_input_change_forces_recompute` / `memo_var_not_skipped`（Var 不在白名单，永不跳过）。
+
+### Added — Pregel 加法注入（src/pregel/mod.rs，C 路径）
+- `inject_channel_inputs`：保留 `input`（delta JSON）契约，另把每个已变更 channel 注入为 `input_<channel>` env var（typed Value，非 JSON 字符串）。旧 agent 读 `input` 完全无感；新 agent 读细粒度 var 获得真正寄存器级感知（例：消息 channel 名为 `input` → `input_input`）。
+- 顺序路径接入 memo 执行；`AgentExecOutcome.nodes_executed`（worker/跳过路径为 0）。
+- 新增 2 集成测试：`register_memo_skips_pure_nodes_on_reactivation`（多超步 send 链，b 二次激活纯前缀跳过 + 稳定 Arc 断言）、`channel_input_var_injected_additively`（input_input 细粒度注入，input 契约缓存保留）。
+
+### Fixed — v0.75.9 全局 DAG 缓存失效 bug
+- 根因：v0.75.9 每超步 `Arc::new(agent.task_body.clone())` → 指针每次不同 → 全局缓存（key = `Arc::as_ptr`）跨超步永远 miss，DAG 每步全量重建（v0.75.6 引擎本地缓存的收益被丢弃）。
+- 修复：`stable_task_arc`（engine 生命周期持有 agent task_body 的稳定 Arc，`task_arcs` 字段）→ 跨超步同一指针，缓存真正命中；同 Arc 锚定 memo 记录。pregel 6 处 run_mir 调用点也改走稳定 Arc（cond_body/master/combiner/merge_fn 由调用方持有）。
+
+### Tests
+- 580 通过 / 0 失败（+5：dag_interp memo 3 + pregel 2）。`closure_reused_across_calls_via_mir` 为 pre-existing 失败（parse error，clean tree 同样失败，与本次无关）。clippy `-D warnings` error 数 87 → 86（净 -1，改动文件零新增）。
+
 ## [v0.75.9] — 2026-08-01 — 函数调用 DAG 全局缓存 + deps.rs 死代码清理
 
 （用户选「全链路三步」中的前两步；第三步「完整寄存器级增量」经探索确认需改 `build_node_input` 注入方式（channel 拆独立 env var，破坏所有现有 agent 的 input 读取语义），且 deps.rs 增量模型与 MirDag 执行模型不兼容 — 收益 < 破坏成本，不纳入。）

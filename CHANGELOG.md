@@ -2,6 +2,36 @@
 
 All notable changes to Mora will be documented in this file.
 
+## [v0.75.1] — 2026-07-31 — P0 架构债务修复（内部重构，无行为变更）
+
+按全项目架构审查（architecture-reviewer）确认的 3 项 P0 阻塞项修复，打破 `runtime/` ↔ `interpreter/`、`mir/` ↔ `interpreter/` 两处双向依赖循环并清理越层耦合。
+
+### Changed — 类型下沉（runtime ↔ interpreter 解耦）
+- 新增 `src/runtime/types.rs`：`AiConfigValue` / `LruCache` / `RouteConfig` / `TokenBudget` / `TokenUsage` / `ToolDef` / `TraitInfo` / `TraitMethodSig` 及 `impl_method_key` / `default_impl_method_key` 从 `interpreter/mod.rs` 下沉到 runtime 侧（字段可见性 `pub(crate)`）。
+- `interpreter/mod.rs` 保留 re-export（`pub use crate::runtime::types::{...}`）保持既有路径兼容；`runtime/core.rs` / `ai.rs` / `infra.rs` / `registry.rs` 改 `use crate::runtime::types::*`。
+- 验收：`grep -rn "crate::interpreter" src/runtime/` 为空。
+
+### Changed — MirHost 抽象（mir ↔ interpreter 解耦）
+- 新增 `src/mir/host.rs`：`MirHost` trait 定义 MIR 解释器所需宿主能力（方法桥 / config / checkpoint / environment / dynamic_sends / trait registry / `clone_box`）。
+- `Interpreter` 实现 `MirHost`（委托既有固有方法，`clone_box` = `self.clone()`）。
+- `mir/interp.rs` / `mir/handlers.rs` / `mir/dag_interp.rs` / `mir/jit.rs` 宿主参数从 `&mut Interpreter` 改为 `&mut dyn MirHost`。
+- 验收：`grep -rn "crate::interpreter" src/mir/ src/pregel/`（生产代码）为空。
+
+### Changed — MirPregelEngine 归位（结构错位修复）
+- `interpreter/mir_pregel_engine.rs` → `src/pregel/mod.rs`；`interpreter/worker_pool.rs` → `src/pregel/worker_pool.rs`（git mv，历史保留）。
+- `MirPregelEngine::run` / `reconcile_outcome` / `apply_write` 宿主参数改为 `&mut dyn MirHost`；内部字段访问改 trait 方法；并行 worker 克隆宿主改用 `clone_box()`。
+- 注：原 P0 计划的「MirPregelEngine 迁移」原属 P2，因 `h_orchestrate` 依赖其路径而并入本次（否则 mir → interpreter 循环无法完全打破）。
+
+### Changed — 移除 MirExpr 死字段
+- `MirExpr.ty: Option<Type>`（`src/mir/expr/mod.rs`）为从未被写入/读取的死字段（构造器恒 `None`，`typeck/hm` 的 memo 快速路径永不触发），整体移除并删除 30+ 处 `ty: None` 构造行。
+- `typeck/hm/mod.rs` / `typeck/check_mir.rs` 修正声称「写回 ty」的误导性注释；`check_program_mir_with_types` 保留为薄透传（语义澄清）。
+- 删除依赖 memo 行为的测试 `tests/tier1_typeck_mir.rs::typed_mir_expr_zero_handled`；更新 `tests/tier2_mir_expr_pipeline.rs` 与 `tests/tier0_replacement.rs` 的公共 API 守门签名（宿主参数改为 `&mut dyn MirHost`）。
+- 注意：`MirExprKind` 变体中的类型注解（`LetBinding::type_hint` / `Param::type_hint` / `StructDef::fields` 等）为活跃功能，保留不动。
+
+### Tests
+- 549 通过 / 0 失败（既有失败 `tier0_closure_mir::closure_reused_across_calls_via_mir` 为 pre-existing，干净树同样失败，非本次引入）。
+- clippy `-D warnings` error 数从基线 95 → 89；`cargo fmt --check` 通过。
+
 ## [Unreleased] — Tier 0 → Tier 1 
 
 MIR Tier 1 5 ////`run_file` / `run_record` / `run_replay` / `run_snapshot` / REPL (`mora --repl`)  `mora::mir::interp::run_mir` + `run_main_task` `Interpreter::interpret` / `execute` / `evaluate``MORA_INTERP`  `interpreter_mode()` 

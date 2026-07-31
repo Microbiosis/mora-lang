@@ -11,8 +11,8 @@ use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::interpreter::{AiConfigValue, ToolDef};
-use crate::value::{Environment, Value, MergeStrategy};
+use crate::runtime::types::{AiConfigValue, ToolDef};
+use crate::value::{Environment, MergeStrategy, Value};
 
 /// 语言执行必需的薄核心。
 /// 注：ToolDef 不含 Debug，所以 CoreRuntime 不 derive Debug。

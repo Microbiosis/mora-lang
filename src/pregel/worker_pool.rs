@@ -6,7 +6,7 @@
 //! (dynamic work-stealing = partition) with results collected and
 //! re-sorted by original index (the join = barrier).
 
-use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
@@ -80,7 +80,10 @@ impl WorkerPool {
                         match job {
                             Some(job) => {
                                 let outcome = match (job.task)() {
-                                    Ok(value) => Ok(WorkerOutcome { index: job.index, value }),
+                                    Ok(value) => Ok(WorkerOutcome {
+                                        index: job.index,
+                                        value,
+                                    }),
                                     Err(e) => Err(e),
                                 };
                                 let _ = msg.res_tx.send(outcome);
@@ -91,7 +94,11 @@ impl WorkerPool {
                 }
             }));
         }
-        WorkerPool { tx: Some(tx), workers, num_workers }
+        WorkerPool {
+            tx: Some(tx),
+            workers,
+            num_workers,
+        }
     }
 
     /// Run a batch of jobs, blocking until all complete, returning
@@ -115,7 +122,10 @@ impl WorkerPool {
     ) -> Result<BatchResult, String> {
         let total = jobs.len();
         if total == 0 {
-            return Ok(BatchResult { outcomes: Vec::new(), timed_out: false });
+            return Ok(BatchResult {
+                outcomes: Vec::new(),
+                timed_out: false,
+            });
         }
         let (res_tx, res_rx) = channel::<Result<WorkerOutcome, String>>();
         let shared_jobs = Arc::new(Mutex::new(jobs));
@@ -146,7 +156,8 @@ impl WorkerPool {
                         return Err("worker pool channel disconnected".to_string());
                     }
                 },
-                None => res_rx.recv()
+                None => res_rx
+                    .recv()
                     .map_err(|_| "worker pool channel closed".to_string()),
             };
             match recv {
@@ -157,7 +168,10 @@ impl WorkerPool {
         }
         // Sort by index to restore deterministic order.
         outcomes.sort_by_key(|o| o.index);
-        Ok(BatchResult { outcomes, timed_out })
+        Ok(BatchResult {
+            outcomes,
+            timed_out,
+        })
     }
 
     pub fn num_workers(&self) -> usize {
@@ -187,7 +201,10 @@ mod tests {
         let jobs: Vec<WorkerJob> = (0..32)
             .map(|i| WorkerJob {
                 index: i,
-                task: Box::new(move || Ok(Box::new(crate::value::Value::Int(i as i64)) as Box<dyn std::any::Any + Send>)),
+                task: Box::new(move || {
+                    Ok(Box::new(crate::value::Value::Int(i as i64))
+                        as Box<dyn std::any::Any + Send>)
+                }),
             })
             .collect();
         let outcomes = pool.run_batch(jobs).unwrap();
@@ -212,12 +229,18 @@ mod tests {
         let jobs: Vec<WorkerJob> = (0..8)
             .map(|i| WorkerJob {
                 index: i,
-                task: Box::new(move || Ok(Box::new(crate::value::Value::Int(i as i64 * 10)) as Box<dyn std::any::Any + Send>)),
+                task: Box::new(move || {
+                    Ok(Box::new(crate::value::Value::Int(i as i64 * 10))
+                        as Box<dyn std::any::Any + Send>)
+                }),
             })
             .collect();
         let outcomes = pool.run_batch(jobs).unwrap();
         assert_eq!(outcomes.len(), 8);
-        let v = outcomes[7].value.downcast_ref::<crate::value::Value>().unwrap();
+        let v = outcomes[7]
+            .value
+            .downcast_ref::<crate::value::Value>()
+            .unwrap();
         assert_eq!(*v, crate::value::Value::Int(70));
     }
 
@@ -243,16 +266,16 @@ mod tests {
     #[test]
     fn pool_timeout_reports_timed_out() {
         let pool = WorkerPool::new(2);
-        let jobs: Vec<WorkerJob> = vec![
-            WorkerJob {
-                index: 0,
-                task: Box::new(|| {
-                    std::thread::sleep(std::time::Duration::from_millis(200));
-                    Ok(Box::new(1u8))
-                }),
-            },
-        ];
-        let res = pool.run_batch_with_timeout(jobs, Some(std::time::Duration::from_millis(20))).unwrap();
+        let jobs: Vec<WorkerJob> = vec![WorkerJob {
+            index: 0,
+            task: Box::new(|| {
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                Ok(Box::new(1u8))
+            }),
+        }];
+        let res = pool
+            .run_batch_with_timeout(jobs, Some(std::time::Duration::from_millis(20)))
+            .unwrap();
         assert!(res.timed_out, "short deadline must report timeout");
         assert!(res.outcomes.is_empty(), "timed-out job has no outcome");
     }

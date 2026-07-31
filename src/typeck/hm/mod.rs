@@ -119,9 +119,10 @@ impl HMInference {
     }
 
     /// Drive inference across an entire MirExpr program. Returns the
-    /// list of collected diagnostics; the inferred type annotations
-    /// are written back to each `MirExpr.ty` field for downstream
-    /// consumers (LSP hover, CLI `--check`).
+    /// list of collected diagnostics. (Inferred types are surfaced via
+    /// `TypeError` diagnostics only; there is no per-node type cache on
+    /// `MirExpr` — see `mir/expr` — so inference always runs from the
+    /// expression tree itself.)
     pub fn infer_program(&mut self, exprs: &[MirExpr]) -> Vec<TypeError> {
         let mut errors: Vec<TypeError> = Vec::new();
         for expr in exprs {
@@ -136,12 +137,6 @@ impl HMInference {
     }
 
     pub fn infer_expr(&mut self, expr: &MirExpr) -> Result<Type, Vec<TypeError>> {
-        // Memoize pre-typed expressions (e.g. carried over from a
-        // previous pass). This is the only fast path the inference
-        // engine offers today.
-        if let Some(ref ty) = expr.ty {
-            return Ok(ty.clone());
-        }
         match &expr.kind {
             MirExprKind::Literal(lit) => Ok(infer_lit(lit)),
             MirExprKind::Variable(name) => self.infer_var(name, expr.span),
@@ -206,8 +201,7 @@ impl HMInference {
                 // v0.55: While lowering produces nil at the MIR level.
                 Ok(Type::Nil)
             }
-            MirExprKind::Or { left, right }
-            | MirExprKind::And { left, right } => {
+            MirExprKind::Or { left, right } | MirExprKind::And { left, right } => {
                 let left_ty = self.infer_expr(left)?;
                 let right_ty = self.infer_expr(right)?;
                 let _op_name = if matches!(expr.kind, MirExprKind::Or { .. }) {
@@ -231,9 +225,9 @@ impl HMInference {
                 }
                 Ok(Type::Bool)
             }
-            MirExprKind::Return(_)
-            | MirExprKind::Break(_)
-            | MirExprKind::Continue(_) => Ok(Type::Nil),
+            MirExprKind::Return(_) | MirExprKind::Break(_) | MirExprKind::Continue(_) => {
+                Ok(Type::Nil)
+            }
             MirExprKind::IndexAssign { .. } => Ok(Type::Nil),
             MirExprKind::Expr(inner) => self.infer_expr(inner),
             // v0.55: top-level declarations — no scalar result type.
@@ -670,7 +664,6 @@ mod tests {
                 init_body: Box::new(MirExpr::var("x".to_string(), Span::default())),
             },
             span: Span::default(),
-            ty: None,
         };
         hm.infer_expr(&expr).unwrap();
         assert_eq!(hm.env.get("x"), Some(&Type::Int));
@@ -708,7 +701,6 @@ mod tests {
                 arms,
             },
             span: Span::default(),
-            ty: None,
         };
         hm.infer_expr(&expr).unwrap();
         assert!(

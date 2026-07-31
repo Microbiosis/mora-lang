@@ -174,9 +174,8 @@ fn v3_lower_dict_produces_dict_lit() {
 // ===================================================================
 
 #[test]
-fn v3_typecheck_then_lower_preserves_types() {
+fn v3_typecheck_then_lower_succeeds() {
     let mut exprs = parse_v3("let x = 42");
-    assert!(exprs[0].ty.is_none(), "pre-condition: no type yet");
 
     let _errors = typecheck_mir_exprs(&mut exprs);
 
@@ -697,30 +696,21 @@ let x = 1"#;
 fn v3_builtin_print_parses() {
     let exprs = parse_v3(r#"print("hello")"#);
     assert_eq!(exprs.len(), 1);
-    assert!(matches!(
-        exprs[0].kind,
-        MirExprKind::Call { .. }
-    ));
+    assert!(matches!(exprs[0].kind, MirExprKind::Call { .. }));
 }
 
 #[test]
 fn v3_builtin_len_parses() {
     let exprs = parse_v3(r#"len("hello")"#);
     assert_eq!(exprs.len(), 1);
-    assert!(matches!(
-        exprs[0].kind,
-        MirExprKind::Call { .. }
-    ));
+    assert!(matches!(exprs[0].kind, MirExprKind::Call { .. }));
 }
 
 #[test]
 fn v3_builtin_range_parses() {
     let exprs = parse_v3(r#"range(1, 10, 1)"#);
     assert_eq!(exprs.len(), 1);
-    assert!(matches!(
-        exprs[0].kind,
-        MirExprKind::Call { .. }
-    ));
+    assert!(matches!(exprs[0].kind, MirExprKind::Call { .. }));
 }
 
 #[test]

@@ -6,7 +6,6 @@
 //! and the LSP server.
 
 use mora::interpreter::parse_code_v3;
-use mora::mir::expr::{MirExpr, MirExprKind};
 use mora::typeck::TypeError;
 use mora::typeck::check_program_mir;
 
@@ -118,21 +117,4 @@ fn type_errors_contain_span_information() {
     assert!(!errs.is_empty());
     let err = first_err(&errs);
     assert!(err.line >= 1, "line should be 1-based, got {}", err.line);
-}
-
-#[test]
-fn typed_mir_expr_zero_handled() {
-    // Pre-typed expressions (e.g., from a previous pass) should be
-    // short-circuited. The HM engine today only memoises if `ty` is
-    // already `Some`, so passing an already-typed expression should
-    // not error.
-    let typed = MirExpr {
-        kind: MirExprKind::Variable("anything".to_string()),
-        span: mora::common::Span::default(),
-        ty: Some(mora::typeck::Type::Int),
-    };
-    let errs = check_program_mir(&[typed]);
-    // The pre-typed var will be returned from `infer_expr` before the
-    // env lookup, so we expect no diagnostic.
-    assert!(errs.is_empty(), "pre-typed var should skip env lookup");
 }

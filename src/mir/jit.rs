@@ -24,7 +24,7 @@ use crate::value::{Environment, Value};
 #[cfg(feature = "jit")]
 pub fn run_jit(
     _ssa: &MirSsaFunction,
-    _interp: &mut crate::interpreter::Interpreter,
+    _interp: &mut dyn crate::mir::host::MirHost,
     _env: &mut Environment,
 ) -> Result<Value, String> {
     // TODO: 实现实际 SSA → LLVM IR → JIT 编译
@@ -56,7 +56,7 @@ pub fn run_jit(
 #[cfg(not(feature = "jit"))]
 pub fn run_jit(
     _ssa: &MirSsaFunction,
-    _interp: &mut crate::interpreter::Interpreter,
+    _interp: &mut dyn crate::mir::host::MirHost,
     _env: &mut Environment,
 ) -> Result<Value, String> {
     Err("JIT compiler not available (build with --features jit and LLVM 17)".to_string())

@@ -31,14 +31,16 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::checkpoint::{Checkpoint, CheckpointSaver, SendTask};
-use crate::interpreter::Interpreter;
-use crate::mir::expr::{
-    MirAgentDef, MirEdgeDef, MirInterruptPoint, MirInterruptWhen, MirPregelConfig,
-    MirReducerKind, MirStateChannel,
-};
-use crate::mir::expr::MirExpr;
 use crate::mir::MirFunction;
+use crate::mir::expr::MirExpr;
+use crate::mir::expr::{
+    MirAgentDef, MirEdgeDef, MirInterruptPoint, MirInterruptWhen, MirPregelConfig, MirReducerKind,
+    MirStateChannel,
+};
+use crate::mir::host::MirHost;
 use crate::value::{Conflict, MergeStrategy, Value};
+
+pub mod worker_pool;
 
 /// Interrupt 回调签名
 pub type MirInterruptCallback = Arc<dyn Fn(&str, MirInterruptWhen) -> bool>;
@@ -92,7 +94,7 @@ pub struct MirPregelEngine {
     /// v0.74: Cached worker pool, reused across super-steps (created lazily
     /// on the first parallel EXEC). Rebuilding on every step would discard
     /// any balancing/health state.
-    pub worker_pool: Option<crate::interpreter::worker_pool::WorkerPool>,
+    pub worker_pool: Option<crate::pregel::worker_pool::WorkerPool>,
     /// v0.74: Per-step deadline for parallel EXEC (default None = no limit).
     /// On timeout the step is treated as a fault and retried per
     /// `fault_tolerance`. Timed-out worker threads are leaked (no
@@ -138,11 +140,7 @@ pub enum VertexState {
 /// v0.67: Numeric accumulator for Sum/Product. First write initializes
 /// to the op identity (`0` for `+`, `1` for `*`). Subsequent writes fold.
 /// Mixed Int/Float promoted via `eval_binary`.
-fn accumulator_reduce(
-    current: Option<Value>,
-    incoming: Value,
-    op: &str,
-) -> Result<Value, String> {
+fn accumulator_reduce(current: Option<Value>, incoming: Value, op: &str) -> Result<Value, String> {
     let identity = match op {
         "+" => Value::Int(0),
         "*" => Value::Int(1),
@@ -180,13 +178,11 @@ fn parse_custom_merge_expr(s: &str) -> crate::mir::expr::MirExpr {
         MirExpr {
             kind: crate::mir::expr::MirExprKind::Literal(Literal::Int(n, span)),
             span,
-            ty: None,
         }
     } else {
         MirExpr {
             kind: crate::mir::expr::MirExprKind::Variable(s.to_string()),
             span,
-            ty: None,
         }
     }
 }
@@ -219,10 +215,14 @@ impl MirPregelEngine {
             .agents
             .iter()
             .filter_map(|a| {
-                a.combiner_body.as_ref().map(|b| (a.name.clone(), std::sync::Arc::new(b.clone())))
+                a.combiner_body
+                    .as_ref()
+                    .map(|b| (a.name.clone(), std::sync::Arc::new(b.clone())))
             })
             .collect();
-        let master_compute = config.master_compute.as_ref()
+        let master_compute = config
+            .master_compute
+            .as_ref()
             .map(|b| std::sync::Arc::new(b.clone()));
         Self {
             config,
@@ -318,7 +318,7 @@ impl MirPregelEngine {
     /// deterministic in parallel mode).
     fn reconcile_outcome(
         &mut self,
-        interpreter: &mut Interpreter,
+        host: &mut dyn MirHost,
         next_active: &mut std::collections::HashSet<String>,
         writes: &mut Vec<(String, String, Value)>,
         outcome: AgentExecOutcome,
@@ -326,15 +326,20 @@ impl MirPregelEngine {
         let node_name = outcome.node_name.clone();
 
         if matches!(outcome.signal, crate::mir::interp::MirSignal::Halt(_)) {
-            self.vertex_state.insert(node_name.clone(), VertexState::Halted);
+            self.vertex_state
+                .insert(node_name.clone(), VertexState::Halted);
         } else {
-            self.vertex_state.insert(node_name.clone(), VertexState::Active);
+            self.vertex_state
+                .insert(node_name.clone(), VertexState::Active);
         }
 
         // Merge agent env back into shared env (conflict detection).
         let strategies = self.build_per_key_strategies();
-        let conflicts = interpreter.core.environment.lock()
-            .merge_from_with_strategies(&outcome.env, &strategies, &MergeStrategy::LastWriteWins);
+        let conflicts = host.environment().lock().merge_from_with_strategies(
+            &outcome.env,
+            &strategies,
+            &MergeStrategy::LastWriteWins,
+        );
         if !conflicts.is_empty() {
             if let Some(cb) = &self.conflict_callback {
                 for conflict in &conflicts {
@@ -351,16 +356,19 @@ impl MirPregelEngine {
 
         // result → result channel
         let result_str = outcome.result.to_string();
-        writes.push((node_name.clone(), "result".to_string(), Value::String(result_str)));
+        writes.push((
+            node_name.clone(),
+            "result".to_string(),
+            Value::String(result_str),
+        ));
 
         // Static edges → next hop (with condition evaluation).
         for edge in &self.config.edges {
             if edge.from == node_name && edge.to != "@exit" {
                 if let Some(cond_body) = &edge.condition_body {
-                    let mut cond_env = interpreter.core.environment.lock().clone();
-                    let cond_val = crate::mir::interp::run_mir(
-                        cond_body, interpreter, &mut cond_env,
-                    ).unwrap_or(Value::Bool(false));
+                    let mut cond_env = host.environment().lock().clone();
+                    let cond_val = crate::mir::interp::run_mir(cond_body, host, &mut cond_env)
+                        .unwrap_or(Value::Bool(false));
                     if !crate::flow::is_truthy(&cond_val) {
                         continue;
                     }
@@ -376,7 +384,9 @@ impl MirPregelEngine {
 
     /// v0.71: Snapshot of aggregator initial values (from config).
     fn aggregator_initial_snapshot(&self) -> Vec<(String, Value)> {
-        self.config.aggregators.iter()
+        self.config
+            .aggregators
+            .iter()
             .map(|a| (a.name.clone(), a.initial.clone()))
             .collect()
     }
@@ -384,10 +394,14 @@ impl MirPregelEngine {
     /// v0.71: Contribute a value to a per-super-step aggregator.
     /// Called by `h_aggregate`.
     pub fn aggregator_contribute(&mut self, name: &str, value: Value) -> Result<(), String> {
-        let reducer = self.aggregator_reducer.get(name)
+        let reducer = self
+            .aggregator_reducer
+            .get(name)
             .ok_or_else(|| format!("Unknown aggregator: {}", name))?
             .clone();
-        let acc = self.aggregator_acc.entry(name.to_string())
+        let acc = self
+            .aggregator_acc
+            .entry(name.to_string())
             .or_insert_with(|| match reducer {
                 crate::mir::expr::AggregatorKind::Add => Value::Int(0),
                 crate::mir::expr::AggregatorKind::Max => value.clone(),
@@ -396,12 +410,18 @@ impl MirPregelEngine {
                 crate::mir::expr::AggregatorKind::Concat => Value::String(String::new()),
             });
         *acc = match reducer {
-            crate::mir::expr::AggregatorKind::Add => {
-                crate::flow::eval_binary(std::mem::replace(acc, Value::Int(0)), &crate::common::BinaryOp::Add, value)?
-            }
+            crate::mir::expr::AggregatorKind::Add => crate::flow::eval_binary(
+                std::mem::replace(acc, Value::Int(0)),
+                &crate::common::BinaryOp::Add,
+                value,
+            )?,
             crate::mir::expr::AggregatorKind::Max => {
                 let cur = acc.clone();
-                match crate::flow::eval_binary(value.clone(), &crate::common::BinaryOp::Greater, cur) {
+                match crate::flow::eval_binary(
+                    value.clone(),
+                    &crate::common::BinaryOp::Greater,
+                    cur,
+                ) {
                     Ok(Value::Bool(true)) => value, // incoming > current → keep incoming
                     _ => acc.clone(),               // else keep current (incl. equal)
                 }
@@ -434,15 +454,15 @@ impl MirPregelEngine {
         }
     }
 
-/// v0.57: 入口 — 执行 BSP 循环（完整实现）
-///
-/// 阶段：
-/// 1. PLAN：决定本轮激活的节点
-/// 2. EXEC：调用 pre-lowered task_body
-/// 3. UPDATE：应用 reducer
-/// 4. ADVANCE：处理 send tasks + 决定下一跳
-pub fn run(&mut self, interpreter: &mut Interpreter) -> Result<Value, String> {
-    use std::collections::HashSet;
+    /// v0.57: 入口 — 执行 BSP 循环（完整实现）
+    ///
+    /// 阶段：
+    /// 1. PLAN：决定本轮激活的节点
+    /// 2. EXEC：调用 pre-lowered task_body
+    /// 3. UPDATE：应用 reducer
+    /// 4. ADVANCE：处理 send tasks + 决定下一跳
+    pub fn run(&mut self, interpreter: &mut dyn MirHost) -> Result<Value, String> {
+        use std::collections::HashSet;
 
         // v0.63: current_step is initialized in new() and may be set by restore_checkpoint.
         // Do NOT reset to 0 here — that would negate checkpoint restore.
@@ -463,12 +483,8 @@ pub fn run(&mut self, interpreter: &mut Interpreter) -> Result<Value, String> {
                 }
                 // v0.70: Halted vertices are only rescheduled when targeted
                 // by a Send — vote_to_halt semantics.
-                let is_halted = matches!(
-                    self.vertex_state.get(node),
-                    Some(VertexState::Halted)
-                );
-                let targeted_by_send = self.pending_sends.iter()
-                    .any(|s| s.target_node == *node);
+                let is_halted = matches!(self.vertex_state.get(node), Some(VertexState::Halted));
+                let targeted_by_send = self.pending_sends.iter().any(|s| s.target_node == *node);
                 if is_halted && !targeted_by_send {
                     continue;
                 }
@@ -491,10 +507,7 @@ pub fn run(&mut self, interpreter: &mut Interpreter) -> Result<Value, String> {
             // ---------- 2. EXEC ----------
             // 记录激活节点的 snapshots
             for node_name in &to_execute {
-                let snapshot = self
-                    .versions_seen
-                    .entry(node_name.clone())
-                    .or_default();
+                let snapshot = self.versions_seen.entry(node_name.clone()).or_default();
                 for (channel, version) in &self.channel_versions {
                     snapshot.entry(channel.clone()).or_insert(*version);
                 }
@@ -508,11 +521,10 @@ pub fn run(&mut self, interpreter: &mut Interpreter) -> Result<Value, String> {
                     if edge.from == *active_node && edge.to != "@exit" {
                         // v0.71: Evaluate edge condition if present.
                         if let Some(cond_body) = &edge.condition_body {
-                            let mut cond_env =
-                                interpreter.core.environment.lock().clone();
-                            let cond_val = crate::mir::interp::run_mir(
-                                cond_body, interpreter, &mut cond_env,
-                            ).unwrap_or(Value::Bool(false));
+                            let mut cond_env = interpreter.environment().lock().clone();
+                            let cond_val =
+                                crate::mir::interp::run_mir(cond_body, interpreter, &mut cond_env)
+                                    .unwrap_or(Value::Bool(false));
                             if !crate::flow::is_truthy(&cond_val) {
                                 continue;
                             }
@@ -541,138 +553,173 @@ pub fn run(&mut self, interpreter: &mut Interpreter) -> Result<Value, String> {
                 // v0.73: EXEC — sequential (parallelism=1) or parallel.
                 let mut step_writes: Vec<(String, String, Value)> = Vec::new();
                 exec_result = (|| {
-                if self.parallelism <= 1 {
-                // ── Sequential path: inline, current behavior ──
-                for node_name in &to_execute {
-                    let agent_idx = *self.agents_by_name.get(node_name).ok_or_else(|| {
-                        format!("Pregel: undefined agent '{}'", node_name)
-                    })?;
-                    let agent = &self.config.agents[agent_idx];
+                    if self.parallelism <= 1 {
+                        // ── Sequential path: inline, current behavior ──
+                        for node_name in &to_execute {
+                            let agent_idx =
+                                *self.agents_by_name.get(node_name).ok_or_else(|| {
+                                    format!("Pregel: undefined agent '{}'", node_name)
+                                })?;
+                            let agent = &self.config.agents[agent_idx];
 
-                    let input_val = self.build_node_input(node_name);
-                    let mut env = interpreter.core.environment.lock().clone();
-                    // v0.73: define input on the private clone (agent only
-                    // sees its own input; no cross-agent contamination).
-                    env.define("input".to_string(), Value::String(input_val.to_string()), false);
-                    env.clock.tick(node_name);
+                            let input_val = self.build_node_input(node_name);
+                            let mut env = interpreter.environment().lock().clone();
+                            // v0.73: define input on the private clone (agent only
+                            // sees its own input; no cross-agent contamination).
+                            env.define(
+                                "input".to_string(),
+                                Value::String(input_val.to_string()),
+                                false,
+                            );
+                            env.clock.tick(node_name);
 
-                    if agent.task_body.body.is_empty() && agent.task_body.n_regs == 0 {
-                        return Err(format!(
-                            "Pregel: agent '{}' has empty task_body (lowering missing)",
-                            node_name
-                        ));
-                    }
+                            if agent.task_body.body.is_empty() && agent.task_body.n_regs == 0 {
+                                return Err(format!(
+                                    "Pregel: agent '{}' has empty task_body (lowering missing)",
+                                    node_name
+                                ));
+                            }
 
-                    self.stats.agents_run += 1;
+                            self.stats.agents_run += 1;
 
-                    let (signal, result) = crate::mir::interp::run_mir_with_signal(
-                        &agent.task_body, interpreter, &mut env,
-                    ).map_err(|e| format!("Pregel node '{}': {}", node_name, e))?;
+                            let (signal, result) = crate::mir::interp::run_mir_with_signal(
+                                &agent.task_body,
+                                interpreter,
+                                &mut env,
+                            )
+                            .map_err(|e| format!("Pregel node '{}': {}", node_name, e))?;
 
-                    let outcome = AgentExecOutcome {
-                        node_name: node_name.clone(),
-                        signal,
-                        result,
-                        env,
-                        sends: Vec::new(),
-                    };
-                    self.reconcile_outcome(interpreter, &mut next_active, &mut step_writes, outcome)?;
-                }
-                } else {
-                // ── Parallel path: PREPARE → SPAWN → RECONCILE ──
-                // PREPARE (main thread, &self read): build private envs.
-                let mut prepared: Vec<(
-                    String,
-                    std::sync::Arc<crate::mir::MirFunction>,
-                    crate::value::Environment,
-                )> = Vec::new();
-                for node_name in &to_execute {
-                    let agent_idx = *self.agents_by_name.get(node_name).ok_or_else(|| {
-                        format!("Pregel: undefined agent '{}'", node_name)
-                    })?;
-                    let agent = &self.config.agents[agent_idx];
-                    if agent.task_body.body.is_empty() && agent.task_body.n_regs == 0 {
-                        return Err(format!(
-                            "Pregel: agent '{}' has empty task_body (lowering missing)",
-                            node_name
-                        ));
-                    }
-                    let input_val = self.build_node_input(node_name);
-                    let mut env = interpreter.core.environment.lock().clone();
-                    env.define("input".to_string(), Value::String(input_val.to_string()), false);
-                    env.clock.tick(node_name);
-                    self.stats.agents_run += 1;
-                    prepared.push((
-                        node_name.clone(),
-                        std::sync::Arc::new(agent.task_body.clone()),
-                        env,
-                    ));
-                }
-
-                // SPAWN: one Interpreter clone + private env per worker job.
-                // v0.74: Reuse cached pool (created once), keep across steps.
-                if self.worker_pool.is_none() {
-                    self.worker_pool =
-                        Some(crate::interpreter::worker_pool::WorkerPool::new(self.parallelism));
-                }
-                let pool = self.worker_pool.as_ref()
-                    .ok_or("Pregel: worker pool missing")?;
-                let jobs: Vec<crate::interpreter::worker_pool::WorkerJob> = prepared
-                    .into_iter()
-                    .enumerate()
-                    .map(|(idx, (name, task, mut env))| {
-                        let mut interp_clone = interpreter.clone();
-                        crate::interpreter::worker_pool::WorkerJob {
-                            index: idx,
-                            task: Box::new(move || {
-                                let (signal, result) = crate::mir::interp::run_mir_with_signal(
-                                    &task, &mut interp_clone, &mut env,
-                                ).map_err(|e| format!("Pregel node '{}': {}", name, e))?;
-                                let sends = std::mem::take(&mut interp_clone.core.dynamic_sends);
-                                Ok(Box::new(AgentExecOutcome {
-                                    node_name: name,
-                                    signal,
-                                    result,
-                                    env,
-                                    sends,
-                                }) as Box<dyn std::any::Any + Send>)
-                            }),
+                            let outcome = AgentExecOutcome {
+                                node_name: node_name.clone(),
+                                signal,
+                                result,
+                                env,
+                                sends: Vec::new(),
+                            };
+                            self.reconcile_outcome(
+                                interpreter,
+                                &mut next_active,
+                                &mut step_writes,
+                                outcome,
+                            )?;
                         }
-                    })
-                    .collect();
+                    } else {
+                        // ── Parallel path: PREPARE → SPAWN → RECONCILE ──
+                        // PREPARE (main thread, &self read): build private envs.
+                        let mut prepared: Vec<(
+                            String,
+                            std::sync::Arc<crate::mir::MirFunction>,
+                            crate::value::Environment,
+                        )> = Vec::new();
+                        for node_name in &to_execute {
+                            let agent_idx =
+                                *self.agents_by_name.get(node_name).ok_or_else(|| {
+                                    format!("Pregel: undefined agent '{}'", node_name)
+                                })?;
+                            let agent = &self.config.agents[agent_idx];
+                            if agent.task_body.body.is_empty() && agent.task_body.n_regs == 0 {
+                                return Err(format!(
+                                    "Pregel: agent '{}' has empty task_body (lowering missing)",
+                                    node_name
+                                ));
+                            }
+                            let input_val = self.build_node_input(node_name);
+                            let mut env = interpreter.environment().lock().clone();
+                            env.define(
+                                "input".to_string(),
+                                Value::String(input_val.to_string()),
+                                false,
+                            );
+                            env.clock.tick(node_name);
+                            self.stats.agents_run += 1;
+                            prepared.push((
+                                node_name.clone(),
+                                std::sync::Arc::new(agent.task_body.clone()),
+                                env,
+                            ));
+                        }
 
-                // v0.74: Run batch with optional per-step timeout. On timeout
-                // the step is treated as a fault and retried (fault_tolerance).
-                let started = std::time::Instant::now();
-                let batch = pool.run_batch_with_timeout(jobs, self.step_timeout)
-                    .map_err(|e| format!("Pregel parallel EXEC: {}", e))?;
-                self.stats.total_ms += started.elapsed().as_millis();
+                        // SPAWN: one Interpreter clone + private env per worker job.
+                        // v0.74: Reuse cached pool (created once), keep across steps.
+                        if self.worker_pool.is_none() {
+                            self.worker_pool = Some(crate::pregel::worker_pool::WorkerPool::new(
+                                self.parallelism,
+                            ));
+                        }
+                        let pool = self
+                            .worker_pool
+                            .as_ref()
+                            .ok_or("Pregel: worker pool missing")?;
+                        let jobs: Vec<crate::pregel::worker_pool::WorkerJob> = prepared
+                            .into_iter()
+                            .enumerate()
+                            .map(|(idx, (name, task, mut env))| {
+                                let mut interp_clone = interpreter.clone_box();
+                                crate::pregel::worker_pool::WorkerJob {
+                                    index: idx,
+                                    task: Box::new(move || {
+                                        let (signal, result) =
+                                            crate::mir::interp::run_mir_with_signal(
+                                                &task,
+                                                interp_clone.as_mut(),
+                                                &mut env,
+                                            )
+                                            .map_err(
+                                                |e| format!("Pregel node '{}': {}", name, e),
+                                            )?;
+                                        let sends = std::mem::take(interp_clone.dynamic_sends());
+                                        Ok(Box::new(AgentExecOutcome {
+                                            node_name: name,
+                                            signal,
+                                            result,
+                                            env,
+                                            sends,
+                                        })
+                                            as Box<dyn std::any::Any + Send>)
+                                    }),
+                                }
+                            })
+                            .collect();
 
-                if batch.timed_out {
-                    self.stats.timeouts += 1;
-                    // Drop the pool (leaked timed-out worker threads) and
-                    // force a fresh one on the next step.
-                    self.worker_pool = None;
-                    return Err(format!(
-                        "Pregel: super-step {} timed out after {:?}",
-                        self.current_step, self.step_timeout
-                    ));
-                }
-                let outcomes = batch.outcomes;
+                        // v0.74: Run batch with optional per-step timeout. On timeout
+                        // the step is treated as a fault and retried (fault_tolerance).
+                        let started = std::time::Instant::now();
+                        let batch = pool
+                            .run_batch_with_timeout(jobs, self.step_timeout)
+                            .map_err(|e| format!("Pregel parallel EXEC: {}", e))?;
+                        self.stats.total_ms += started.elapsed().as_millis();
 
-                // RECONCILE (main thread, index order = deterministic).
-                for out in outcomes {
-                    let outcome: AgentExecOutcome =
-                        *out.value.downcast::<AgentExecOutcome>()
-                            .map_err(|_| "Pregel: worker outcome type mismatch".to_string())?;
-                    self.reconcile_outcome(interpreter, &mut next_active, &mut step_writes, outcome)?;
-                }
-                }
+                        if batch.timed_out {
+                            self.stats.timeouts += 1;
+                            // Drop the pool (leaked timed-out worker threads) and
+                            // force a fresh one on the next step.
+                            self.worker_pool = None;
+                            return Err(format!(
+                                "Pregel: super-step {} timed out after {:?}",
+                                self.current_step, self.step_timeout
+                            ));
+                        }
+                        let outcomes = batch.outcomes;
 
-                // v0.73: Flush intra-run sends so a step-N send reaches step-N+1.
-                let sends = std::mem::take(&mut interpreter.core.dynamic_sends);
-                self.flush_pending_sends(sends);
-                Ok(())
+                        // RECONCILE (main thread, index order = deterministic).
+                        for out in outcomes {
+                            let outcome: AgentExecOutcome = *out
+                                .value
+                                .downcast::<AgentExecOutcome>()
+                                .map_err(|_| "Pregel: worker outcome type mismatch".to_string())?;
+                            self.reconcile_outcome(
+                                interpreter,
+                                &mut next_active,
+                                &mut step_writes,
+                                outcome,
+                            )?;
+                        }
+                    }
+
+                    // v0.73: Flush intra-run sends so a step-N send reaches step-N+1.
+                    let sends = std::mem::take(interpreter.dynamic_sends());
+                    self.flush_pending_sends(sends);
+                    Ok(())
                 })();
                 // end retryable exec closure
 
@@ -696,15 +743,19 @@ pub fn run(&mut self, interpreter: &mut Interpreter) -> Result<Value, String> {
 
             // v0.71: Publish aggregator results as channels for next step.
             for (name, value) in &self.aggregator_acc {
-                self.channels.insert(format!("aggregator_{}", name), value.clone());
-                *self.channel_versions.entry(format!("aggregator_{}", name)).or_insert(0) += 1;
+                self.channels
+                    .insert(format!("aggregator_{}", name), value.clone());
+                *self
+                    .channel_versions
+                    .entry(format!("aggregator_{}", name))
+                    .or_insert(0) += 1;
             }
 
             // v0.72: Master.compute — runs once per super-step after UPDATE.
             // Used for global coordination (e.g., dynamic topology changes,
             // aggregation-based decisions).
             if let Some(master) = self.master_compute.clone() {
-                let mut master_env = interpreter.core.environment.lock().clone();
+                let mut master_env = interpreter.environment().lock().clone();
                 let _ = crate::mir::interp::run_mir(&master, interpreter, &mut master_env);
             }
 
@@ -728,13 +779,17 @@ pub fn run(&mut self, interpreter: &mut Interpreter) -> Result<Value, String> {
             let mut by_target: std::collections::HashMap<String, Vec<crate::value::Value>> =
                 std::collections::HashMap::new();
             for send in self.pending_sends.drain(..) {
-                by_target.entry(send.target_node).or_default().push(send.input);
+                by_target
+                    .entry(send.target_node)
+                    .or_default()
+                    .push(send.input);
             }
             for (target, messages) in by_target {
-                let final_value = if let Some(combiner) = self.combiner_bodies.get(&target).cloned() {
+                let final_value = if let Some(combiner) = self.combiner_bodies.get(&target).cloned()
+                {
                     let mut acc = messages[0].clone();
                     for incoming in &messages[1..] {
-                        let mut env = interpreter.core.environment.lock().clone();
+                        let mut env = interpreter.environment().lock().clone();
                         env.define("current".into(), acc.clone(), false);
                         env.define("incoming".into(), incoming.clone(), false);
                         match crate::mir::interp::run_mir(&combiner, interpreter, &mut env) {
@@ -747,7 +802,10 @@ pub fn run(&mut self, interpreter: &mut Interpreter) -> Result<Value, String> {
                     messages.last().cloned().unwrap_or(Value::Nil)
                 };
                 self.channels.insert("input".to_string(), final_value);
-                *self.channel_versions.entry("input".to_string()).or_insert(0) += 1;
+                *self
+                    .channel_versions
+                    .entry("input".to_string())
+                    .or_insert(0) += 1;
                 next_active.insert(target);
             }
             active_nodes = next_active.into_iter().collect();
@@ -757,7 +815,10 @@ pub fn run(&mut self, interpreter: &mut Interpreter) -> Result<Value, String> {
             // parallel EXEC produce order-dependent results).
             let agents = &self.config.agents;
             active_nodes.sort_by_key(|n| {
-                agents.iter().position(|a| &a.name == n).unwrap_or(usize::MAX)
+                agents
+                    .iter()
+                    .position(|a| &a.name == n)
+                    .unwrap_or(usize::MAX)
             });
             self.current_step += 1;
             self.stats.steps += 1;
@@ -794,10 +855,7 @@ pub fn run(&mut self, interpreter: &mut Interpreter) -> Result<Value, String> {
         let snapshot = self.versions_seen.get(node_name);
         let mut parts: Vec<String> = Vec::new();
         for (channel, version) in &self.channel_versions {
-            let seen_version = snapshot
-                .and_then(|s| s.get(channel))
-                .copied()
-                .unwrap_or(0);
+            let seen_version = snapshot.and_then(|s| s.get(channel)).copied().unwrap_or(0);
             if *version > seen_version
                 && let Some(v) = self.channels.get(channel)
             {
@@ -816,7 +874,7 @@ pub fn run(&mut self, interpreter: &mut Interpreter) -> Result<Value, String> {
         &mut self,
         channel: String,
         value: Value,
-        interpreter: &mut Interpreter,
+        interpreter: &mut dyn MirHost,
     ) -> Result<(), String> {
         let reducer = self
             .state_reducers
@@ -851,7 +909,7 @@ pub fn run(&mut self, interpreter: &mut Interpreter) -> Result<Value, String> {
                     // v0.62: Execute the merge body with `current` and `incoming`.
                     let merge_fn = crate::mir::lower::lower_mir_exprs(&[merge_expr.clone()])
                         .map_err(|e| format!("Pregel merge body lowering failed: {}", e))?;
-                    let mut merge_env = interpreter.core.environment.lock().clone();
+                    let mut merge_env = interpreter.environment().lock().clone();
                     merge_env.define("current".into(), current.unwrap_or(Value::Nil), false);
                     merge_env.define("incoming".into(), value, false);
                     crate::mir::interp::run_mir(&merge_fn, interpreter, &mut merge_env)
@@ -868,7 +926,7 @@ pub fn run(&mut self, interpreter: &mut Interpreter) -> Result<Value, String> {
                     let expr = parse_custom_merge_expr(merge_expr.as_str());
                     let merge_fn = crate::mir::lower::lower_mir_exprs(&[expr])
                         .map_err(|e| format!("Pregel custom body lowering failed: {}", e))?;
-                    let mut merge_env = interpreter.core.environment.lock().clone();
+                    let mut merge_env = interpreter.environment().lock().clone();
                     merge_env.define("current".into(), current.unwrap_or(Value::Nil), false);
                     merge_env.define("incoming".into(), value, false);
                     crate::mir::interp::run_mir(&merge_fn, interpreter, &mut merge_env)
@@ -913,9 +971,12 @@ pub fn run(&mut self, interpreter: &mut Interpreter) -> Result<Value, String> {
 
     /// v0.63: Build a checkpoint snapshot of current engine state.
     pub fn build_checkpoint(&self) -> Checkpoint {
-        let thread_id = self.config.checkpoint.as_ref()
+        let thread_id = self
+            .config
+            .checkpoint
+            .as_ref()
             .and_then(|c| c.thread_id.as_ref())
-            .map(|_| "pregel")  // MirExpr evaluation deferred; use config presence as signal
+            .map(|_| "pregel") // MirExpr evaluation deferred; use config presence as signal
             .unwrap_or("default");
         Checkpoint::new(
             thread_id.to_string(),
@@ -1105,21 +1166,30 @@ mod tests {
     #[test]
     fn mir_pregel_engine_apply_write_sum() {
         let config = MirPregelConfig {
-            agents: vec![], edges: vec![],
+            agents: vec![],
+            edges: vec![],
             state_schema: vec![MirStateChannel {
-                name: "total".into(), ty: "Int".into(),
+                name: "total".into(),
+                ty: "Int".into(),
                 reducer: MirReducerKind::Sum,
             }],
-            checkpoint: None, interrupt_points: vec![],
+            checkpoint: None,
+            interrupt_points: vec![],
             adjacency: HashMap::new(),
             aggregators: Vec::new(),
             master_compute: None,
         };
         let mut engine = MirPregelEngine::new(config);
         let mut interp = crate::interpreter::Interpreter::new();
-        engine.apply_write("total".into(), Value::Int(10), &mut interp).unwrap();
-        engine.apply_write("total".into(), Value::Int(32), &mut interp).unwrap();
-        engine.apply_write("total".into(), Value::Int(8), &mut interp).unwrap();
+        engine
+            .apply_write("total".into(), Value::Int(10), &mut interp)
+            .unwrap();
+        engine
+            .apply_write("total".into(), Value::Int(32), &mut interp)
+            .unwrap();
+        engine
+            .apply_write("total".into(), Value::Int(8), &mut interp)
+            .unwrap();
         assert_eq!(engine.channels.get("total"), Some(&Value::Int(50)));
     }
 
@@ -1127,21 +1197,30 @@ mod tests {
     #[test]
     fn mir_pregel_engine_apply_write_product() {
         let config = MirPregelConfig {
-            agents: vec![], edges: vec![],
+            agents: vec![],
+            edges: vec![],
             state_schema: vec![MirStateChannel {
-                name: "acc".into(), ty: "Int".into(),
+                name: "acc".into(),
+                ty: "Int".into(),
                 reducer: MirReducerKind::Product,
             }],
-            checkpoint: None, interrupt_points: vec![],
+            checkpoint: None,
+            interrupt_points: vec![],
             adjacency: HashMap::new(),
             aggregators: Vec::new(),
             master_compute: None,
         };
         let mut engine = MirPregelEngine::new(config);
         let mut interp = crate::interpreter::Interpreter::new();
-        engine.apply_write("acc".into(), Value::Int(2), &mut interp).unwrap();
-        engine.apply_write("acc".into(), Value::Int(3), &mut interp).unwrap();
-        engine.apply_write("acc".into(), Value::Int(4), &mut interp).unwrap();
+        engine
+            .apply_write("acc".into(), Value::Int(2), &mut interp)
+            .unwrap();
+        engine
+            .apply_write("acc".into(), Value::Int(3), &mut interp)
+            .unwrap();
+        engine
+            .apply_write("acc".into(), Value::Int(4), &mut interp)
+            .unwrap();
         assert_eq!(engine.channels.get("acc"), Some(&Value::Int(24)));
     }
 
@@ -1149,21 +1228,31 @@ mod tests {
     #[test]
     fn mir_pregel_engine_apply_write_concat() {
         let config = MirPregelConfig {
-            agents: vec![], edges: vec![],
+            agents: vec![],
+            edges: vec![],
             state_schema: vec![MirStateChannel {
-                name: "log".into(), ty: "String".into(),
+                name: "log".into(),
+                ty: "String".into(),
                 reducer: MirReducerKind::Concat,
             }],
-            checkpoint: None, interrupt_points: vec![],
+            checkpoint: None,
+            interrupt_points: vec![],
             adjacency: HashMap::new(),
             aggregators: Vec::new(),
             master_compute: None,
         };
         let mut engine = MirPregelEngine::new(config);
         let mut interp = crate::interpreter::Interpreter::new();
-        engine.apply_write("log".into(), Value::String("hello".into()), &mut interp).unwrap();
-        engine.apply_write("log".into(), Value::String(" world".into()), &mut interp).unwrap();
-        assert_eq!(engine.channels.get("log"), Some(&Value::String("hello world".into())));
+        engine
+            .apply_write("log".into(), Value::String("hello".into()), &mut interp)
+            .unwrap();
+        engine
+            .apply_write("log".into(), Value::String(" world".into()), &mut interp)
+            .unwrap();
+        assert_eq!(
+            engine.channels.get("log"),
+            Some(&Value::String("hello world".into()))
+        );
     }
 
     // ─── v0.73: Parallelism tests ─────────────────────────────────
@@ -1199,13 +1288,20 @@ mod tests {
     #[test]
     fn parallel_matches_sequential_result() {
         let config = MirPregelConfig {
-            agents: vec![
-                make_const_agent("a", 10),
-                make_const_agent("b", 20),
-            ],
+            agents: vec![make_const_agent("a", 10), make_const_agent("b", 20)],
             edges: vec![
-                MirEdgeDef { from: "@start".into(), to: "a".into(), condition_expr: None, condition_body: None },
-                MirEdgeDef { from: "@start".into(), to: "b".into(), condition_expr: None, condition_body: None },
+                MirEdgeDef {
+                    from: "@start".into(),
+                    to: "a".into(),
+                    condition_expr: None,
+                    condition_body: None,
+                },
+                MirEdgeDef {
+                    from: "@start".into(),
+                    to: "b".into(),
+                    condition_expr: None,
+                    condition_body: None,
+                },
             ],
             state_schema: vec![],
             checkpoint: None,
@@ -1232,13 +1328,20 @@ mod tests {
     #[test]
     fn parallel_tracks_vertex_state() {
         let config = MirPregelConfig {
-            agents: vec![
-                make_const_agent("a", 1),
-                make_const_agent("b", 2),
-            ],
+            agents: vec![make_const_agent("a", 1), make_const_agent("b", 2)],
             edges: vec![
-                MirEdgeDef { from: "@start".into(), to: "a".into(), condition_expr: None, condition_body: None },
-                MirEdgeDef { from: "@start".into(), to: "b".into(), condition_expr: None, condition_body: None },
+                MirEdgeDef {
+                    from: "@start".into(),
+                    to: "a".into(),
+                    condition_expr: None,
+                    condition_body: None,
+                },
+                MirEdgeDef {
+                    from: "@start".into(),
+                    to: "b".into(),
+                    condition_expr: None,
+                    condition_body: None,
+                },
             ],
             state_schema: vec![],
             checkpoint: None,
@@ -1272,23 +1375,24 @@ mod tests {
             n_regs: 3,
         };
         let config = MirPregelConfig {
-            agents: vec![
-                MirAgentDef {
-                    name: "a".into(),
-                    task_expr: MirExpr::lit(
-                        crate::common::Literal::Nil(crate::common::Span::new(1, 1)),
-                        crate::common::Span::new(1, 1),
-                    ),
-                    verify_expr: None,
-                    with_config: None,
-                    task_body: failing_body,
-                    task_mir_expr: None,
-                    combiner_body: None,
-                },
-            ],
-            edges: vec![
-                MirEdgeDef { from: "@start".into(), to: "a".into(), condition_expr: None, condition_body: None },
-            ],
+            agents: vec![MirAgentDef {
+                name: "a".into(),
+                task_expr: MirExpr::lit(
+                    crate::common::Literal::Nil(crate::common::Span::new(1, 1)),
+                    crate::common::Span::new(1, 1),
+                ),
+                verify_expr: None,
+                with_config: None,
+                task_body: failing_body,
+                task_mir_expr: None,
+                combiner_body: None,
+            }],
+            edges: vec![MirEdgeDef {
+                from: "@start".into(),
+                to: "a".into(),
+                condition_expr: None,
+                condition_body: None,
+            }],
             state_schema: vec![],
             checkpoint: None,
             interrupt_points: vec![],
@@ -1299,7 +1403,11 @@ mod tests {
         let mut engine = MirPregelEngine::new(config).with_parallelism(2);
         let mut interp = crate::interpreter::Interpreter::new();
         let err = engine.run(&mut interp).unwrap_err();
-        assert!(err.contains("Pregel node 'a'"), "error must identify the agent, got: {}", err);
+        assert!(
+            err.contains("Pregel node 'a'"),
+            "error must identify the agent, got: {}",
+            err
+        );
     }
 
     /// Fault tolerance runs cleanly; stats reflect steps/agents.
@@ -1309,9 +1417,12 @@ mod tests {
     fn fault_tolerance_runs_and_stats() {
         let config = MirPregelConfig {
             agents: vec![make_const_agent("a", 7)],
-            edges: vec![
-                MirEdgeDef { from: "@start".into(), to: "a".into(), condition_expr: None, condition_body: None },
-            ],
+            edges: vec![MirEdgeDef {
+                from: "@start".into(),
+                to: "a".into(),
+                condition_expr: None,
+                condition_body: None,
+            }],
             state_schema: vec![],
             checkpoint: None,
             interrupt_points: vec![],
@@ -1336,30 +1447,28 @@ mod tests {
     fn vote_to_halt_marks_vertex_halted() {
         let halt_body = MirFunction {
             params: Vec::new(),
-            body: vec![
-                MirInst::Const(0, Value::Int(99)),
-                MirInst::Halt(Some(0)),
-            ],
+            body: vec![MirInst::Const(0, Value::Int(99)), MirInst::Halt(Some(0))],
             n_regs: 1,
         };
         let config = MirPregelConfig {
-            agents: vec![
-                MirAgentDef {
-                    name: "a".into(),
-                    task_expr: MirExpr::lit(
-                        crate::common::Literal::Nil(crate::common::Span::new(1, 1)),
-                        crate::common::Span::new(1, 1),
-                    ),
-                    verify_expr: None,
-                    with_config: None,
-                    task_body: halt_body,
-                    task_mir_expr: None,
-                    combiner_body: None,
-                },
-            ],
-            edges: vec![
-                MirEdgeDef { from: "@start".into(), to: "a".into(), condition_expr: None, condition_body: None },
-            ],
+            agents: vec![MirAgentDef {
+                name: "a".into(),
+                task_expr: MirExpr::lit(
+                    crate::common::Literal::Nil(crate::common::Span::new(1, 1)),
+                    crate::common::Span::new(1, 1),
+                ),
+                verify_expr: None,
+                with_config: None,
+                task_body: halt_body,
+                task_mir_expr: None,
+                combiner_body: None,
+            }],
+            edges: vec![MirEdgeDef {
+                from: "@start".into(),
+                to: "a".into(),
+                condition_expr: None,
+                condition_body: None,
+            }],
             state_schema: vec![],
             checkpoint: None,
             interrupt_points: vec![],
@@ -1372,26 +1481,33 @@ mod tests {
         let result = engine.run(&mut interp).unwrap();
         // Halt(Some(0)) returns the register value (99).
         assert_eq!(result, Value::String("99".to_string()));
-        assert_eq!(engine.vertex_state.get("a"), Some(&VertexState::Halted),
-            "agent ending in Halt must be marked Halted");
+        assert_eq!(
+            engine.vertex_state.get("a"),
+            Some(&VertexState::Halted),
+            "agent ending in Halt must be marked Halted"
+        );
     }
 
     /// v0.75: Aggregator Max/Min reduce correctly (was identity before).
     #[test]
     fn aggregator_max_min_work() {
         let mut engine = MirPregelEngine::new(MirPregelConfig {
-            agents: vec![], edges: vec![],
+            agents: vec![],
+            edges: vec![],
             state_schema: vec![],
-            checkpoint: None, interrupt_points: vec![],
+            checkpoint: None,
+            interrupt_points: vec![],
             adjacency: HashMap::new(),
             aggregators: vec![
                 crate::mir::expr::MirAggregatorDef {
-                    name: "hi".into(), ty: "Int".into(),
+                    name: "hi".into(),
+                    ty: "Int".into(),
                     initial: Value::Int(0),
                     reducer: crate::mir::expr::AggregatorKind::Max,
                 },
                 crate::mir::expr::MirAggregatorDef {
-                    name: "lo".into(), ty: "Int".into(),
+                    name: "lo".into(),
+                    ty: "Int".into(),
                     initial: Value::Int(i64::MAX),
                     reducer: crate::mir::expr::AggregatorKind::Min,
                 },

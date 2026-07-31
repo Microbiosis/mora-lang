@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use crate::ai_infra::{CacheWarmer, ContextWindow, SpeculativeVerifier};
-use crate::interpreter::{RouteConfig, TokenBudget, TokenUsage};
+use crate::runtime::types::{RouteConfig, TokenBudget, TokenUsage};
 use crate::trace_collector::TraceCollector;
 
 // 注：TraceCollector 没 derive Debug，所以 AiRuntime 也不 derive Debug

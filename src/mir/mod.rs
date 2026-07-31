@@ -22,6 +22,7 @@ use crate::common::BinaryOp;
 use crate::value::Value;
 
 pub mod expr;
+pub mod host;
 pub mod interp;
 pub mod jit;
 pub mod lower;
@@ -35,8 +36,8 @@ pub mod dag;
 pub mod dag_interp;
 pub mod handlers;
 
-pub use interp::run_mir;
 pub use expr::MirExpr;
+pub use interp::run_mir;
 // lower_program removed in Phase A (v0.55) — use lower_mir_exprs instead
 
 /// 虚拟寄存器索引（无限数量，lowering 时计数器分配）

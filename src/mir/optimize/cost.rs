@@ -103,6 +103,7 @@ impl CostModel for TokenEstimate {
             MirInst::DictLit(_, entries) => 2 + entries.len() as u32,
             // 控制流
             MirInst::Return(_) => 1,
+            MirInst::Halt(_) => 1,
             MirInst::Jump(_) | MirInst::JumpIf(_, _) | MirInst::JumpIfNot(_, _) => 1,
             MirInst::Break(_) | MirInst::Continue(_) => 1,
             // 变量操作

@@ -368,6 +368,11 @@ fn split_into_ssa(
             MirInst::Return(r) => {
                 return (ssa_insts, Terminator::Return(r.map(|r| r as SsaReg)));
             }
+            MirInst::Halt(r) => {
+                // v0.75: vote_to_halt 在 SSA 线性上下文中等价于 Return
+                // （BSP 引擎的 Halt 语义只在 MirPregelEngine 里消费）。
+                return (ssa_insts, Terminator::Return(r.map(|r| r as SsaReg)));
+            }
             MirInst::Jump(l) => {
                 let target =
                     resolve_jump_target(*l, label_to_bid, start_to_bid, bid, false, total_body_len);

@@ -240,7 +240,7 @@ impl MirPregelEngine {
             current_step: 0,
             vertex_state: HashMap::new(),
             aggregator_acc: HashMap::new(),
-            aggregator_reducer: HashMap::new(),
+            aggregator_reducer,
             combiner_bodies,
             master_compute,
             parallelism: 1,
@@ -400,12 +400,18 @@ impl MirPregelEngine {
                 crate::flow::eval_binary(std::mem::replace(acc, Value::Int(0)), &crate::common::BinaryOp::Add, value)?
             }
             crate::mir::expr::AggregatorKind::Max => {
-                let cmp = crate::flow::eval_binary(value.clone(), &crate::common::BinaryOp::Greater, std::mem::replace(acc, Value::Int(0))).unwrap_or(Value::Bool(false));
-                if matches!(cmp, Value::Bool(true)) { value } else { value }
+                let cur = acc.clone();
+                match crate::flow::eval_binary(value.clone(), &crate::common::BinaryOp::Greater, cur) {
+                    Ok(Value::Bool(true)) => value, // incoming > current → keep incoming
+                    _ => acc.clone(),               // else keep current (incl. equal)
+                }
             }
             crate::mir::expr::AggregatorKind::Min => {
-                let cmp = crate::flow::eval_binary(value.clone(), &crate::common::BinaryOp::Less, std::mem::replace(acc, Value::Int(0))).unwrap_or(Value::Bool(false));
-                if matches!(cmp, Value::Bool(true)) { value } else { value }
+                let cur = acc.clone();
+                match crate::flow::eval_binary(value.clone(), &crate::common::BinaryOp::Less, cur) {
+                    Ok(Value::Bool(true)) => value, // incoming < current → keep incoming
+                    _ => acc.clone(),               // else keep current (incl. equal)
+                }
             }
             crate::mir::expr::AggregatorKind::Last => value,
             crate::mir::expr::AggregatorKind::Concat => {
@@ -1322,5 +1328,86 @@ mod tests {
         assert_eq!(engine.stats().steps, 2, "@start empty step + agent a");
         assert_eq!(engine.stats().agents_run, 1);
         assert_eq!(engine.stats().retries, 0, "no failures expected");
+    }
+
+    /// v0.75: vote_to_halt — an agent whose task_body ends with MirInst::Halt
+    /// must be marked Halted in vertex_state (signal actually propagates now).
+    #[test]
+    fn vote_to_halt_marks_vertex_halted() {
+        let halt_body = MirFunction {
+            params: Vec::new(),
+            body: vec![
+                MirInst::Const(0, Value::Int(99)),
+                MirInst::Halt(Some(0)),
+            ],
+            n_regs: 1,
+        };
+        let config = MirPregelConfig {
+            agents: vec![
+                MirAgentDef {
+                    name: "a".into(),
+                    task_expr: MirExpr::lit(
+                        crate::common::Literal::Nil(crate::common::Span::new(1, 1)),
+                        crate::common::Span::new(1, 1),
+                    ),
+                    verify_expr: None,
+                    with_config: None,
+                    task_body: halt_body,
+                    task_mir_expr: None,
+                    combiner_body: None,
+                },
+            ],
+            edges: vec![
+                MirEdgeDef { from: "@start".into(), to: "a".into(), condition_expr: None, condition_body: None },
+            ],
+            state_schema: vec![],
+            checkpoint: None,
+            interrupt_points: vec![],
+            adjacency: HashMap::new(),
+            aggregators: Vec::new(),
+            master_compute: None,
+        };
+        let mut engine = MirPregelEngine::new(config);
+        let mut interp = crate::interpreter::Interpreter::new();
+        let result = engine.run(&mut interp).unwrap();
+        // Halt(Some(0)) returns the register value (99).
+        assert_eq!(result, Value::String("99".to_string()));
+        assert_eq!(engine.vertex_state.get("a"), Some(&VertexState::Halted),
+            "agent ending in Halt must be marked Halted");
+    }
+
+    /// v0.75: Aggregator Max/Min reduce correctly (was identity before).
+    #[test]
+    fn aggregator_max_min_work() {
+        let mut engine = MirPregelEngine::new(MirPregelConfig {
+            agents: vec![], edges: vec![],
+            state_schema: vec![],
+            checkpoint: None, interrupt_points: vec![],
+            adjacency: HashMap::new(),
+            aggregators: vec![
+                crate::mir::expr::MirAggregatorDef {
+                    name: "hi".into(), ty: "Int".into(),
+                    initial: Value::Int(0),
+                    reducer: crate::mir::expr::AggregatorKind::Max,
+                },
+                crate::mir::expr::MirAggregatorDef {
+                    name: "lo".into(), ty: "Int".into(),
+                    initial: Value::Int(i64::MAX),
+                    reducer: crate::mir::expr::AggregatorKind::Min,
+                },
+            ],
+            master_compute: None,
+        });
+        let mut interp = crate::interpreter::Interpreter::new();
+
+        // Max: contribute 5 then 42 → 42
+        engine.aggregator_contribute("hi", Value::Int(5)).unwrap();
+        engine.aggregator_contribute("hi", Value::Int(42)).unwrap();
+        assert_eq!(engine.aggregator_acc.get("hi"), Some(&Value::Int(42)));
+
+        // Min: contribute 100 then 7 → 7
+        engine.aggregator_contribute("lo", Value::Int(100)).unwrap();
+        engine.aggregator_contribute("lo", Value::Int(7)).unwrap();
+        assert_eq!(engine.aggregator_acc.get("lo"), Some(&Value::Int(7)));
     }
 }

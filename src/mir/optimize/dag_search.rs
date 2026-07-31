@@ -99,34 +99,40 @@ pub fn dag_search_staged(
                 }
                 opt.dirty[node_id] = false; // we're checking it now
 
+                // v0.75.5: Cascades 择优 — 收集本节点所有可应用重写（rule.rewrite
+                // 只读返回 owned DagRewrite，不改 dag），选 cost delta 最大的应用。
+                // 此前同 stage 内是"第一个 delta>0 就 break"，可能选中次优重写。
+                let mut best: Option<(i32, DagRewrite)> = None;
                 for rule in stage {
                     let node = &dag.nodes[node_id]; // re-borrow after dirty=false
-                    if rule.matches(node_id, node, dag) {
-                        if let Some(rw) = rule.rewrite(node_id, dag) {
-                            // Compute cost delta
-                            let old_cost = rw.removed.iter()
-                                .map(|&id| node_cost(&dag.nodes[id], cost))
-                                .sum::<u32>();
-                            let new_cost = rw.added.iter()
-                                .map(|n| dag_node_cost(n, cost))
-                                .sum::<u32>();
-                            let delta = old_cost as i32 - new_cost as i32;
-
-                            if delta > 0 {
-                                // Extend dirty/exec_count for any new nodes
-                                let new_count = dag.nodes.len() + rw.added.len();
-                                opt.dirty.resize(new_count, true);
-                                opt.exec_count.resize(new_count, 0);
-
-                                apply_rewrite(dag, rw);
-                                opt.exec_count[node_id] += 1;
-                                // Re-mark the rewritten node and its consumers
-                                opt.mark_dirty(node_id, dag);
-                                any_change = true;
-                                break; // node was modified, move to next node
-                            }
+                    if !rule.matches(node_id, node, dag) {
+                        continue;
+                    }
+                    if let Some(rw) = rule.rewrite(node_id, dag) {
+                        // Compute cost delta
+                        let old_cost = rw
+                            .removed
+                            .iter()
+                            .map(|&id| node_cost(&dag.nodes[id], cost))
+                            .sum::<u32>();
+                        let new_cost = rw.added.iter().map(|n| dag_node_cost(n, cost)).sum::<u32>();
+                        let delta = old_cost as i32 - new_cost as i32;
+                        if delta > 0 && best.as_ref().is_none_or(|(bd, _)| delta > *bd) {
+                            best = Some((delta, rw));
                         }
                     }
+                }
+                if let Some((_delta, rw)) = best {
+                    // Extend dirty/exec_count for any new nodes
+                    let new_count = dag.nodes.len() + rw.added.len();
+                    opt.dirty.resize(new_count, true);
+                    opt.exec_count.resize(new_count, 0);
+
+                    apply_rewrite(dag, rw);
+                    opt.exec_count[node_id] += 1;
+                    // Re-mark the rewritten node and its consumers
+                    opt.mark_dirty(node_id, dag);
+                    any_change = true;
                 }
             }
         }
@@ -141,23 +147,30 @@ pub fn dag_search_staged(
 
 /// Run DAG rewrite rules until convergence, using cost deltas
 /// from the provided cost model. (Legacy: single flat rule set.)
-pub fn dag_search(dag: &mut MirDag, rules: &[Box<dyn DagRewriteRule>], cost: &dyn CostModel, max_iter: u32) {
+pub fn dag_search(
+    dag: &mut MirDag,
+    rules: &[Box<dyn DagRewriteRule>],
+    cost: &dyn CostModel,
+    max_iter: u32,
+) {
     for _iter in 0..max_iter {
         let mut best: Option<(NodeId, DagRewrite, i32)> = None;
 
         for node_id in 0..dag.nodes.len() {
-            if dag.nodes[node_id].is_removed() { continue; }
+            if dag.nodes[node_id].is_removed() {
+                continue;
+            }
             let node = &dag.nodes[node_id];
             for rule in rules {
                 if rule.matches(node_id, node, dag) {
                     if let Some(rw) = rule.rewrite(node_id, dag) {
                         // Compute actual cost delta
-                        let old_cost = rw.removed.iter()
+                        let old_cost = rw
+                            .removed
+                            .iter()
                             .map(|&id| node_cost(&dag.nodes[id], cost))
                             .sum::<u32>();
-                        let new_cost = rw.added.iter()
-                            .map(|n| dag_node_cost(n, cost))
-                            .sum::<u32>();
+                        let new_cost = rw.added.iter().map(|n| dag_node_cost(n, cost)).sum::<u32>();
                         let delta = old_cost as i32 - new_cost as i32;
                         if delta > best.as_ref().map(|b| b.2).unwrap_or(0) {
                             best = Some((node_id, rw, delta));
@@ -187,7 +200,11 @@ fn apply_rewrite(dag: &mut MirDag, rw: DagRewrite) {
     // 2. Add new edges (remap `from=0` placeholders to `new_base`)
     for (from, to, kind) in rw.added_edges {
         let actual_from = if from == 0 { new_base } else { from };
-        dag.edges.push(crate::mir::dag::MirDagEdge { from: actual_from, to, kind });
+        dag.edges.push(crate::mir::dag::MirDagEdge {
+            from: actual_from,
+            to,
+            kind,
+        });
     }
 
     // 3. Mark removed nodes
@@ -197,7 +214,8 @@ fn apply_rewrite(dag: &mut MirDag, rw: DagRewrite) {
 
     // 4. Remove edges to/from removed nodes
     let removed_set: HashSet<NodeId> = rw.removed.iter().copied().collect();
-    dag.edges.retain(|e| !removed_set.contains(&e.from) && !removed_set.contains(&e.to));
+    dag.edges
+        .retain(|e| !removed_set.contains(&e.from) && !removed_set.contains(&e.to));
 
     // 5. Recompute entry/exit
     let mut has_incoming: HashSet<NodeId> = HashSet::new();
@@ -244,8 +262,17 @@ mod tests {
     use crate::value::Value;
 
     fn make_dag(body: Vec<MirInst>) -> MirDag {
-        let n = body.iter().filter_map(|i| i.dst()).max().map(|r| r + 1).unwrap_or(1);
-        let func = MirFunction { params: vec![], body, n_regs: n };
+        let n = body
+            .iter()
+            .filter_map(|i| i.dst())
+            .max()
+            .map(|r| r + 1)
+            .unwrap_or(1);
+        let func = MirFunction {
+            params: vec![],
+            body,
+            n_regs: n,
+        };
         dag::dag_analyze(&func)
     }
 
@@ -256,15 +283,18 @@ mod tests {
             MirInst::Const(1, Value::Int(32)),
             MirInst::BinaryOp(2, 0, BinaryOp::Add, 1),
         ]);
-        let rules: Vec<Box<dyn DagRewriteRule>> = vec![
-            Box::new(ConstFoldingDagRule),
-            Box::new(DeadNodeDagRule),
-        ];
+        let rules: Vec<Box<dyn DagRewriteRule>> =
+            vec![Box::new(ConstFoldingDagRule), Box::new(DeadNodeDagRule)];
         let before = dag.nodes.iter().filter(|n| !n.is_removed()).count();
         let cost = InstructionCount;
         dag_search(&mut dag, &rules, &cost, 10);
         let after = dag.nodes.iter().filter(|n| !n.is_removed()).count();
-        assert!(after < before, "nodes should decrease after folding: {} -> {}", before, after);
+        assert!(
+            after < before,
+            "nodes should decrease after folding: {} -> {}",
+            before,
+            after
+        );
     }
 
     #[test]
@@ -281,8 +311,8 @@ mod tests {
     // ─── Staged search tests ───────────────────────────────────────
 
     use crate::mir::optimize::dag_rule::{
-        AlgebraicSimplifyDagRule, ConstFoldingDagRule as CfRule,
-        CseDagRule, DeadNodeDagRule as DnRule,
+        AlgebraicSimplifyDagRule, ConstFoldingDagRule as CfRule, CseDagRule,
+        DeadNodeDagRule as DnRule,
     };
 
     #[test]
@@ -302,7 +332,12 @@ mod tests {
         let cost = TokenEstimate;
         dag_search_staged(&mut dag, &stages, &cost);
         let after = dag.nodes.iter().filter(|n| !n.is_removed()).count();
-        assert!(after <= before, "staged should not increase node count: {} -> {}", before, after);
+        assert!(
+            after <= before,
+            "staged should not increase node count: {} -> {}",
+            before,
+            after
+        );
     }
 
     #[test]
@@ -312,10 +347,10 @@ mod tests {
         let mut dag = make_dag(vec![
             MirInst::Const(0, Value::Int(5)),
             MirInst::Const(1, Value::Int(0)),
-            MirInst::BinaryOp(2, 0, BinaryOp::Add, 1),   // x+0 → x
+            MirInst::BinaryOp(2, 0, BinaryOp::Add, 1), // x+0 → x
             MirInst::Const(3, Value::Int(2)),
             MirInst::Const(4, Value::Int(3)),
-            MirInst::BinaryOp(5, 3, BinaryOp::Add, 4),   // 2+3 → 5
+            MirInst::BinaryOp(5, 3, BinaryOp::Add, 4), // 2+3 → 5
         ]);
         let stages: Vec<Vec<Box<dyn DagRewriteRule>>> = vec![
             vec![Box::new(AlgebraicSimplifyDagRule)],
@@ -329,7 +364,11 @@ mod tests {
         // After const fold: r5 becomes Const(5)
         let active: Vec<_> = dag.nodes.iter().filter(|n| !n.is_removed()).collect();
         // We should have fewer nodes than the original 6
-        assert!(active.len() < 6, "nodes should decrease with cascading: {}", active.len());
+        assert!(
+            active.len() < 6,
+            "nodes should decrease with cascading: {}",
+            active.len()
+        );
     }
 
     #[test]
@@ -340,7 +379,7 @@ mod tests {
             MirInst::Const(0, Value::Int(2)),
             MirInst::Const(1, Value::Int(3)),
             MirInst::BinaryOp(2, 0, BinaryOp::Add, 1),
-            MirInst::BinaryOp(3, 0, BinaryOp::Add, 1),  // same inputs as r2
+            MirInst::BinaryOp(3, 0, BinaryOp::Add, 1), // same inputs as r2
         ]);
         let stages: Vec<Vec<Box<dyn DagRewriteRule>>> = vec![
             vec![Box::new(AlgebraicSimplifyDagRule)],
@@ -350,11 +389,26 @@ mod tests {
         ];
         let cost = TokenEstimate;
         dag_search_staged(&mut dag, &stages, &cost);
-        let binops: Vec<_> = dag.nodes.iter()
-            .filter(|n| matches!(n, MirDagNode::Compute { inst: MirInst::BinaryOp(..), .. }))
+        let binops: Vec<_> = dag
+            .nodes
+            .iter()
+            .filter(|n| {
+                matches!(
+                    n,
+                    MirDagNode::Compute {
+                        inst: MirInst::BinaryOp(..),
+                        ..
+                    }
+                )
+            })
             .filter(|n| !n.is_removed())
             .collect();
-        assert_eq!(binops.len(), 0, "all BinaryOps should be folded, got {}", binops.len());
+        assert_eq!(
+            binops.len(),
+            0,
+            "all BinaryOps should be folded, got {}",
+            binops.len()
+        );
     }
 
     #[test]
@@ -380,8 +434,8 @@ mod tests {
         let mut dag = make_dag(vec![
             MirInst::Const(0, Value::Int(10)),
             MirInst::Const(1, Value::Int(20)),
-            MirInst::BinaryOp(2, 0, BinaryOp::Add, 1),   // entry
-            MirInst::BinaryOp(3, 0, BinaryOp::Add, 1),    // duplicate → CSE removes
+            MirInst::BinaryOp(2, 0, BinaryOp::Add, 1), // entry
+            MirInst::BinaryOp(3, 0, BinaryOp::Add, 1), // duplicate → CSE removes
         ]);
         let before = dag.nodes.iter().filter(|n| !n.is_removed()).count();
         let stages: Vec<Vec<Box<dyn DagRewriteRule>>> = vec![
@@ -394,7 +448,85 @@ mod tests {
         dag_search_staged(&mut dag, &stages, &cost);
         let after = dag.nodes.iter().filter(|n| !n.is_removed()).count();
         // CSE should remove the duplicate BinaryOp
-        assert!(after < before, "CSE should remove duplicate: {} -> {}", before, after);
+        assert!(
+            after < before,
+            "CSE should remove duplicate: {} -> {}",
+            before,
+            after
+        );
     }
 
+    // ─── v0.75.5: Cascades 同 stage 择优 ──────────────────────────
+
+    /// 测试用低收益规则：匹配 BinaryOp，只移除自身（InstructionCount delta=1）。
+    /// 用于证明同 stage 内选 max delta 而非"先匹配先应用"。
+    struct TestSmallGainRule;
+
+    impl DagRewriteRule for TestSmallGainRule {
+        fn name(&self) -> &'static str {
+            "test_small_gain"
+        }
+
+        fn matches(&self, _node_id: NodeId, node: &MirDagNode, _dag: &MirDag) -> bool {
+            matches!(
+                node,
+                MirDagNode::Compute {
+                    inst: MirInst::BinaryOp(..),
+                    ..
+                }
+            )
+        }
+
+        fn rewrite(&self, node_id: NodeId, _dag: &MirDag) -> Option<DagRewrite> {
+            Some(DagRewrite {
+                added: vec![],
+                removed: vec![node_id],
+                added_edges: vec![],
+            })
+        }
+
+        fn cost_gain(&self) -> i32 {
+            1
+        }
+    }
+
+    #[test]
+    fn staged_picks_highest_gain_in_stage() {
+        // r0=2, r1=3, r2=r0+r1（r2 是 exit，无 out edge，小 gain 规则移除无副作用）。
+        // 同 stage 内两个可应用规则：
+        //   TestSmallGainRule（数组在前）：移除 r2 → delta=1，剩 r0,r1（后由 dead 清理）
+        //   ConstFoldingDagRule：折叠为 Const(5)，移除 r0,r1,r2 → delta=2
+        // Cascades 择优应选中 ConstFolding（最大 delta）。
+        let mut dag = make_dag(vec![
+            MirInst::Const(0, Value::Int(2)),
+            MirInst::Const(1, Value::Int(3)),
+            MirInst::BinaryOp(2, 0, BinaryOp::Add, 1),
+        ]);
+        let stages: Vec<Vec<Box<dyn DagRewriteRule>>> = vec![vec![
+            Box::new(TestSmallGainRule),
+            Box::new(ConstFoldingDagRule),
+            Box::new(DeadNodeDagRule),
+        ]];
+        let cost = InstructionCount;
+        dag_search_staged(&mut dag, &stages, &cost);
+        let active: Vec<_> = dag.nodes.iter().filter(|n| !n.is_removed()).collect();
+        // ConstFold 折叠 r2 → Const(5)（1 节点）；小 gain 路径会先删 r2 剩 2 节点。
+        assert_eq!(
+            active.len(),
+            1,
+            "应择优选中 ConstFolding（delta=2）而非 TestSmallGain（delta=1），剩 {} 节点",
+            active.len()
+        );
+        assert!(
+            matches!(
+                active[0],
+                MirDagNode::Compute {
+                    inst: MirInst::Const(2, Value::Int(5)),
+                    ..
+                }
+            ),
+            "剩余节点应为折叠后的 Const(5), got {:?}",
+            active[0]
+        );
+    }
 }

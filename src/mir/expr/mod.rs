@@ -585,6 +585,9 @@ pub enum MirReducerKind {
     Last,
     Append,
     Add,
+    /// v0.75.5: G-Set（grow-only set）— 通道上并集累积（List/Dict 语义），
+    /// 对应 `MergeStrategy::GrowOnlySet`。
+    GrowOnly,
     Merge(MirExpr),
     Sum,
     Product,
@@ -608,6 +611,7 @@ impl MirReducerKind {
             MirReducerKind::Last => Some(MergeStrategy::LastWriteWins),
             MirReducerKind::Append => Some(MergeStrategy::Append),
             MirReducerKind::Add => Some(MergeStrategy::Add),
+            MirReducerKind::GrowOnly => Some(MergeStrategy::GrowOnlySet),
             MirReducerKind::Merge(_)
             | MirReducerKind::Sum
             | MirReducerKind::Product
@@ -671,4 +675,43 @@ pub enum BuiltinOp {
     Not,
     Length,
     // Add more as needed
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::value::MergeStrategy;
+
+    #[test]
+    fn to_merge_strategy_maps_reducers() {
+        assert_eq!(
+            MirReducerKind::Last.to_merge_strategy(),
+            Some(MergeStrategy::LastWriteWins)
+        );
+        assert_eq!(
+            MirReducerKind::Append.to_merge_strategy(),
+            Some(MergeStrategy::Append)
+        );
+        assert_eq!(
+            MirReducerKind::Add.to_merge_strategy(),
+            Some(MergeStrategy::Add)
+        );
+        // v0.75.5: G-Set reducer 映射到 grow-only set 策略
+        assert_eq!(
+            MirReducerKind::GrowOnly.to_merge_strategy(),
+            Some(MergeStrategy::GrowOnlySet)
+        );
+        // 自定义 reducer 无静态映射
+        assert_eq!(
+            MirReducerKind::Merge(MirExpr::var("x", Span::default())).to_merge_strategy(),
+            None
+        );
+        assert_eq!(MirReducerKind::Sum.to_merge_strategy(), None);
+        assert_eq!(MirReducerKind::Product.to_merge_strategy(), None);
+        assert_eq!(MirReducerKind::Concat.to_merge_strategy(), None);
+        assert_eq!(
+            MirReducerKind::Custom("fn".into()).to_merge_strategy(),
+            None
+        );
+    }
 }

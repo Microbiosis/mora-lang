@@ -134,10 +134,8 @@ pub struct MirPregelEngine {
     /// v0.75.8: 增量执行 v1 — 记录每 agent 上次 input（build_node_input 的
     /// JSON 字符串）。超步间 input 完全未变时跳过整个执行（复用上次 outcome）。
     ///
-    /// 完整寄存器级增量（channel 拆独立 env var + MirDag 节点 dirty）需改
-    /// input 注入方式（破坏现有 agent 的 input 读取语义，高破坏性）；v1 用
-    /// 「输入未变则跳过」拿到确定性收益（vote_to_halt 后重复激活但无新消息、
-    /// 或 input 未变化的重复调度场景）。
+    /// v0.75.10: 寄存器级增量（memo）在其之上细化 — input 未变整体跳过，
+    /// input 变了但部分纯节点输入未变则节点级跳过。v1 语义不变。
     agent_input_cache: HashMap<String, String>,
     /// v0.75.8: 每 agent 上次成功执行的 (signal, result, sends) — 跳过执行时
     /// 复用。input 相同 → 确定性执行，语义等价。
@@ -149,6 +147,18 @@ pub struct MirPregelEngine {
             Vec<crate::checkpoint::SendTask>,
         ),
     >,
+    /// v0.75.10: 每 agent 的寄存器级增量 memo（跨超步保持）— 纯节点按输入
+    /// 值相等跳过执行。与 `agent_dag_cache` 生命周期一致：仅缓存 agents 的
+    /// task_body（config 静态），随 engine 生命周期，无泄漏。
+    ///
+    /// 同时是 task_body 的稳定 Arc 持有者：`task_arcs` 以 engine 生命周期
+    /// 保持 `Arc<MirFunction>`，跨超步复用同一 Arc → 全局 DAG 缓存（key =
+    /// Arc 指针）真正命中（v0.75.9 每超步新建 Arc 导致缓存失效，本次修复）。
+    task_arcs: HashMap<String, std::sync::Arc<crate::mir::MirFunction>>,
+    /// v0.75.10: 并行路径的 memo 带回 — 并行 worker 内联执行，无 memo；
+    /// worker 返回实际执行节点数，主线程（RECONCILE）用它区分「跳过路径的
+    /// 空 memo」→ 不覆盖增量 memo（覆盖会丢失上一超步的记忆）。
+    agent_memos: HashMap<String, crate::mir::dag_interp::DagExecMemo>,
 }
 
 /// v0.74: Engine runtime metrics.
@@ -179,6 +189,11 @@ pub struct AgentExecOutcome {
     pub duration_ms: u128,
     /// v0.75.8: 本次执行的 input（build_node_input 结果），用于增量缓存。
     pub input_str: String,
+    /// v0.75.10: 本次实际执行的 DAG 节点数（寄存器级增量观测）。
+    /// 并行路径 worker 内联执行（无 memo），该值用于区分「跳过路径的空 memo」
+    /// — RECONCILE 时 nodes_executed == 0 → 不覆盖增量 memo（保持上一超步
+    /// 的记忆，下一超步可继续跳过）。
+    pub nodes_executed: usize,
 }
 
 /// v0.70: Per-vertex lifecycle state.
@@ -303,6 +318,8 @@ impl MirPregelEngine {
             stats: EngineStats::default(),
             agent_input_cache: HashMap::new(),
             agent_outcome_cache: HashMap::new(),
+            task_arcs: HashMap::new(),
+            agent_memos: HashMap::new(),
             saver: None,
         }
     }
@@ -366,6 +383,46 @@ impl MirPregelEngine {
     /// produced by `h_send` (which has no direct engine access).
     pub fn flush_pending_sends(&mut self, sends: Vec<SendTask>) {
         self.pending_sends.extend(sends);
+    }
+
+    /// v0.75.10: 返回 agent task_body 的稳定 Arc（跨超步保持）。
+    ///
+    /// 修复 v0.75.9 缓存失效 bug：此前每超步 `Arc::new(agent.task_body.clone())`
+    /// → 指针每次不同 → 全局 DAG 缓存（key = Arc::as_ptr）跨超步永远 miss，
+    /// DAG 每步全量重建（v0.75.6 引擎本地缓存的收益被丢弃）。engine 生命周期
+    /// 持有同一 Arc → 缓存真正命中；同时是 memo 记录稳定的锚点。
+    ///
+    /// 仅缓存 agents 的 task_body（config 静态，随 engine 生命周期，无泄漏）。
+    fn stable_task_arc(&mut self, node_name: &str) -> std::sync::Arc<crate::mir::MirFunction> {
+        if let Some(a) = self.task_arcs.get(node_name) {
+            return a.clone();
+        }
+        let Some(agent_idx) = self.agents_by_name.get(node_name).copied() else {
+            return std::sync::Arc::new(crate::mir::MirFunction {
+                params: Vec::new(),
+                body: Vec::new(),
+                n_regs: 0,
+            });
+        };
+        let arc = std::sync::Arc::new(self.config.agents[agent_idx].task_body.clone());
+        self.task_arcs.insert(node_name.to_string(), arc.clone());
+        arc
+    }
+
+    /// v0.75.10: 加法注入 — 在单个 `input` delta JSON 契约之外，把每个
+    /// 已变更 channel 另注入为 `input_<channel>` env var。旧 agent 读
+    /// `input` 完全不受影响（纯加法）；新 agent 可读细粒度 var 获得
+    /// 真正寄存器级感知。
+    fn inject_channel_inputs(env: &mut crate::value::Environment, node_name: &str, engine: &Self) {
+        let snapshot = engine.versions_seen.get(node_name);
+        for (channel, version) in &engine.channel_versions {
+            let seen_version = snapshot.and_then(|s| s.get(channel)).copied().unwrap_or(0);
+            if *version > seen_version
+                && let Some(v) = engine.channels.get(channel)
+            {
+                env.define(format!("input_{}", channel), v.clone(), false);
+            }
+        }
     }
 
     /// v0.73: Reconcile one agent outcome back into engine state.
@@ -658,14 +715,18 @@ impl MirPregelEngine {
                                 Value::String(input_str.clone()),
                                 false,
                             );
+                            // v0.75.10: 加法注入 — 保留 `input` 契约，另注入
+                            // 逐 channel 变更 var（input_<channel>）。旧 agent 无感。
+                            Self::inject_channel_inputs(&mut env, node_name, self);
                             env.clock.tick(node_name);
 
                             // v0.75.8: 增量执行 v1 — input 与上次相同则跳过整个
                             // 执行，复用上次 outcome（signal/result）。input 相同
                             // → 确定性执行，语义等价；跳过避免重复副作用（如
-                            // ai.chat 网络调用）。完整寄存器级增量（channel 拆
-                            // 独立 env var + MirDag 节点 dirty）需改 input 注入
-                            // 方式（破坏现有 agent 语义），留作后续候选。
+                            // ai.chat 网络调用）。
+                            // v0.75.10: 寄存器级增量（memo）在 v1 之上细化 —
+                            // input 未变整体跳过；input 变了但部分纯节点输入
+                            // 未变则节点级跳过（run_dag_with_signal_memo）。
                             if self.agent_input_cache.get(node_name) == Some(&input_str)
                                 && let Some((signal, result, _sends)) =
                                     self.agent_outcome_cache.get(node_name).cloned()
@@ -680,6 +741,8 @@ impl MirPregelEngine {
                                     sends: Vec::new(),
                                     duration_ms: 0,
                                     input_str,
+                                    // 跳过路径：无实际执行（v0.75.10）。
+                                    nodes_executed: 0,
                                 };
                                 self.reconcile_outcome(
                                     interpreter,
@@ -697,26 +760,35 @@ impl MirPregelEngine {
                                 ));
                             }
                             // v0.75.6: 克隆 task_body 解除对 self.config 的借用
-                            // v0.75.9: 先包 Arc（agent.task_body 是裸 MirFunction），
-                            // 再查全局缓存；run_dag 与缓存共用同一 Arc。
-                            let task_body = std::sync::Arc::new(agent.task_body.clone());
+                            // v0.75.10: 稳定 Arc（engine 生命周期保持）— 全局
+                            // DAG 缓存（key = Arc 指针）跨超步真正命中（修复
+                            // v0.75.9 每超步新建 Arc 的缓存失效）；同 Arc 锚定
+                            // 寄存器级增量 memo 记录。
+                            let task_body = self.stable_task_arc(node_name);
+                            let mut memo = self.agent_memos.remove(node_name).unwrap_or_default();
 
                             self.stats.agents_run += 1;
 
-                            // v0.75.9: 全局 DAG 缓存（mir::cache，key = Arc 指针）—
-                            // 取代引擎本地 agent_dag_cache，Closure/Task/REPL 共用
+                            // v0.75.9: 全局 DAG 缓存（mir::cache）— 取代引擎
+                            // 本地 agent_dag_cache，Closure/Task/REPL 共用
                             // v0.75.7: 计时 per-agent 耗时（FPGA 调度可观测性）
                             let dag =
                                 crate::mir::cache::global_dag_cache().get_or_build(&task_body);
                             let started = std::time::Instant::now();
-                            let (signal, result) = crate::mir::dag_interp::run_dag_with_signal(
-                                dag.as_ref(),
-                                task_body.as_ref(),
-                                interpreter,
-                                &mut env,
-                            )
-                            .map_err(|e| format!("Pregel node '{}': {}", node_name, e))?;
+                            // v0.75.10: 寄存器级增量执行 — 纯节点输入与上次
+                            // 相等则跳过；副作用/env 读取节点永远重跑。
+                            let (signal, result) =
+                                crate::mir::dag_interp::run_dag_with_signal_memo(
+                                    dag.as_ref(),
+                                    task_body.as_ref(),
+                                    &mut memo,
+                                    interpreter,
+                                    &mut env,
+                                )
+                                .map_err(|e| format!("Pregel node '{}': {}", node_name, e))?;
                             let duration_ms = started.elapsed().as_millis();
+                            let nodes_executed = memo.executed_nodes;
+                            self.agent_memos.insert(node_name.clone(), memo);
 
                             let outcome = AgentExecOutcome {
                                 node_name: node_name.clone(),
@@ -726,6 +798,7 @@ impl MirPregelEngine {
                                 sends: Vec::new(),
                                 duration_ms,
                                 input_str,
+                                nodes_executed,
                             };
                             self.reconcile_outcome(
                                 interpreter,
@@ -760,6 +833,8 @@ impl MirPregelEngine {
                                 Value::String(input_str.clone()),
                                 false,
                             );
+                            // v0.75.10: 加法注入（input_<channel>），旧 agent 无感
+                            Self::inject_channel_inputs(&mut env, node_name, self);
                             env.clock.tick(node_name);
 
                             // v0.75.8: 增量 v1 — input 未变则跳过，直接 reconcile
@@ -776,6 +851,9 @@ impl MirPregelEngine {
                                     sends,
                                     duration_ms: 0,
                                     input_str,
+                                    // 跳过路径：无实际执行；并行 worker 内联执行
+                                    // 也无 memo，本字段仅用于统计（此处为 0）。
+                                    nodes_executed: 0,
                                 };
                                 self.reconcile_outcome(
                                     interpreter,
@@ -788,9 +866,9 @@ impl MirPregelEngine {
 
                             self.stats.agents_run += 1;
                             // v0.75.6: 克隆 task_body 解除借用
-                            // v0.75.9: 先包 Arc（agent.task_body 是裸 MirFunction），
-                            // 再查全局缓存；PreparedJob 与缓存共用同一 Arc。
-                            let task_body = std::sync::Arc::new(agent.task_body.clone());
+                            // v0.75.10: 稳定 Arc（engine 生命周期保持）— 全局
+                            // DAG 缓存跨超步命中（修复 v0.75.9 缓存失效）。
+                            let task_body = self.stable_task_arc(node_name);
                             let dag =
                                 crate::mir::cache::global_dag_cache().get_or_build(&task_body);
                             prepared.push((node_name.clone(), task_body, dag, env, input_str));
@@ -850,6 +928,9 @@ impl MirPregelEngine {
                                             sends,
                                             duration_ms,
                                             input_str,
+                                            // v0.75.10: worker 内联执行（无 memo），
+                                            // 该字段仅作统计。
+                                            nodes_executed: 0,
                                         })
                                             as Box<dyn std::any::Any + Send>)
                                     }),
@@ -2185,6 +2266,232 @@ mod tests {
         assert_eq!(
             engine.agent_input_cache["a"], "{}",
             "a 首次执行时 input 应为空"
+        );
+    }
+
+    // ─── v0.75.10: 寄存器级增量（memo + 稳定 Arc + 加法注入）───────────
+
+    /// 构造自定义 task_body 的 agent。
+    fn make_custom_agent(name: &str, body: MirFunction) -> MirAgentDef {
+        MirAgentDef {
+            name: name.to_string(),
+            task_expr: MirExpr::lit(
+                crate::common::Literal::Nil(crate::common::Span::new(1, 1)),
+                crate::common::Span::new(1, 1),
+            ),
+            verify_expr: None,
+            with_config: None,
+            task_body: body,
+            task_mir_expr: None,
+            combiner_body: None,
+        }
+    }
+
+    #[test]
+    fn register_memo_skips_pure_nodes_on_reactivation() {
+        // a1 (step1) 向 a2 和 b 发消息；a2 (step2) 向 b 发消息 → b 跑两次，
+        // 两次 input 不同（v1 不整体跳过），但 b 的纯前缀 Const 输入未变 →
+        // 寄存器级 memo 跳过 Const。这是 v1（input 未变才跳过）覆盖不到的场景。
+        let a1 = make_custom_agent(
+            "a1",
+            MirFunction {
+                params: Vec::new(),
+                body: vec![
+                    MirInst::Const(0, Value::Int(1)),
+                    MirInst::Send {
+                        value: 0,
+                        target: "a2".into(),
+                    },
+                    MirInst::Send {
+                        value: 0,
+                        target: "b".into(),
+                    },
+                    MirInst::Return(Some(0)),
+                ],
+                n_regs: 1,
+            },
+        );
+        let a2 = make_custom_agent(
+            "a2",
+            MirFunction {
+                params: Vec::new(),
+                body: vec![
+                    MirInst::Const(0, Value::Int(2)),
+                    MirInst::Send {
+                        value: 0,
+                        target: "b".into(),
+                    },
+                    MirInst::Return(Some(0)),
+                ],
+                n_regs: 1,
+            },
+        );
+        // b 含纯前缀 Const(100) + 非纯 Var(input) + Return — 第二次运行应跳过 Const。
+        let b = make_custom_agent(
+            "b",
+            MirFunction {
+                params: Vec::new(),
+                body: vec![
+                    MirInst::Const(0, Value::Int(100)),
+                    MirInst::Var(1, "input".to_string()),
+                    MirInst::Return(Some(0)),
+                ],
+                n_regs: 2,
+            },
+        );
+        let config = MirPregelConfig {
+            agents: vec![a1, a2, b],
+            edges: vec![
+                MirEdgeDef {
+                    from: "@start".into(),
+                    to: "a1".into(),
+                    condition_expr: None,
+                    condition_body: None,
+                },
+                MirEdgeDef {
+                    from: "a1".into(),
+                    to: "a2".into(),
+                    condition_expr: None,
+                    condition_body: None,
+                },
+                MirEdgeDef {
+                    from: "a1".into(),
+                    to: "b".into(),
+                    condition_expr: None,
+                    condition_body: None,
+                },
+                MirEdgeDef {
+                    from: "a2".into(),
+                    to: "b".into(),
+                    condition_expr: None,
+                    condition_body: None,
+                },
+            ],
+            state_schema: vec![],
+            checkpoint: None,
+            interrupt_points: vec![],
+            adjacency: HashMap::new(),
+            aggregators: Vec::new(),
+            master_compute: None,
+        };
+        let mut engine = MirPregelEngine::new(config);
+        let mut interp = crate::interpreter::Interpreter::new();
+        let _ = engine.run(&mut interp).unwrap();
+        assert!(
+            engine.stats().steps >= 3,
+            "a1→a2→b 链路应至少 3 超步: {}",
+            engine.stats().steps
+        );
+        // b 跑两次（step2 input {}、step3 input {"input":2}）→ 第二次纯前缀跳过。
+        // executed_nodes 只统计纯节点（Const），run1 执行 1 次后 run2/run3 全跳。
+        let memo = engine.agent_memos.get("b").expect("b 应积累 memo");
+        assert!(
+            memo.skipped_nodes >= 1,
+            "b 二次运行时 Const 纯节点应被跳过 (skipped={})",
+            memo.skipped_nodes
+        );
+        assert_eq!(memo.executed_nodes, 1, "Const 只实际执行一次（run1）");
+        // 稳定 Arc：跨超步同一指针（全局 DAG 缓存真正命中的前提）
+        let arc = engine.task_arcs.get("b").cloned().expect("b 应有稳定 Arc");
+        assert!(
+            std::sync::Arc::ptr_eq(&arc, &engine.task_arcs["b"]),
+            "task_arcs 应跨超步稳定"
+        );
+    }
+
+    #[test]
+    fn channel_input_var_injected_additively() {
+        // C 路径：保留 `input` 契约，另注入 `input_<channel>`。delta 语义：
+        // 首次激活的 snapshot 记录当前版本（同版本无 delta），**再次激活**且
+        // 有新消息时才可见 — 两个 sender 依次给 b 发消息，b 第二次激活读
+        // input_b 拿到细粒度 typed 值。
+        let a1 = make_custom_agent(
+            "a1",
+            MirFunction {
+                params: Vec::new(),
+                body: vec![
+                    MirInst::Const(0, Value::Int(11)),
+                    MirInst::Send {
+                        value: 0,
+                        target: "b".into(),
+                    },
+                    MirInst::Return(Some(0)),
+                ],
+                n_regs: 1,
+            },
+        );
+        let a2 = make_custom_agent(
+            "a2",
+            MirFunction {
+                params: Vec::new(),
+                body: vec![
+                    MirInst::Const(0, Value::Int(22)),
+                    MirInst::Send {
+                        value: 0,
+                        target: "b".into(),
+                    },
+                    MirInst::Return(Some(0)),
+                ],
+                n_regs: 1,
+            },
+        );
+        // b 读 input_input（消息 channel 名就是 "input"；逐 channel 细粒度
+        // var = input_<channel>；`input` 契约仍保留）
+        let b = make_custom_agent(
+            "b",
+            MirFunction {
+                params: Vec::new(),
+                body: vec![
+                    MirInst::Var(0, "input_input".to_string()),
+                    MirInst::Return(Some(0)),
+                ],
+                n_regs: 1,
+            },
+        );
+        let config = MirPregelConfig {
+            agents: vec![a1, a2, b],
+            edges: vec![
+                MirEdgeDef {
+                    from: "@start".into(),
+                    to: "a1".into(),
+                    condition_expr: None,
+                    condition_body: None,
+                },
+                MirEdgeDef {
+                    from: "a1".into(),
+                    to: "a2".into(),
+                    condition_expr: None,
+                    condition_body: None,
+                },
+                MirEdgeDef {
+                    from: "a1".into(),
+                    to: "b".into(),
+                    condition_expr: None,
+                    condition_body: None,
+                },
+                MirEdgeDef {
+                    from: "a2".into(),
+                    to: "b".into(),
+                    condition_expr: None,
+                    condition_body: None,
+                },
+            ],
+            state_schema: vec![],
+            checkpoint: None,
+            interrupt_points: vec![],
+            adjacency: HashMap::new(),
+            aggregators: Vec::new(),
+            master_compute: None,
+        };
+        let mut engine = MirPregelEngine::new(config);
+        let mut interp = crate::interpreter::Interpreter::new();
+        let result = engine.run(&mut interp).unwrap();
+        // b 第二次激活（step3）input_b = Int(22)（a2 的消息，last-write-wins）
+        assert_eq!(result, Value::String("22".to_string()));
+        // input 契约仍保留（b 的 input 缓存被填充）
+        assert!(
+            engine.agent_input_cache.contains_key("b"),
+            "旧 input 契约缓存应保留"
         );
     }
 }

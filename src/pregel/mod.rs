@@ -49,6 +49,21 @@ pub type MirInterruptCallback = Arc<dyn Fn(&str, MirInterruptWhen) -> bool>;
 /// Return `true` to continue the BSP run, `false` to abort.
 pub type MirConflictCallback = Arc<dyn Fn(&Conflict) -> bool>;
 
+/// v0.75.3: 增量 step 快照（undo log）— 只记录 EXEC 会修改的引擎状态，
+/// 替代每步全量 `build_checkpoint()`。
+///
+/// 契约（EXEC 期间不写 channels）：retry 只重跑 EXEC 闭包，而 EXEC 对
+/// `channels` / `channel_versions` / `versions_seen` 零写入（UPDATE 阶段
+/// `apply_write` 在 retry 循环之外才执行），失败回滚无需恢复它们。
+/// Flink 增量 checkpoint 思想的本地形态：只记录自上次以来的变更。
+///
+/// 若未来 EXEC 开始写 channels（如 UPDATE 提前到 retry 循环内），本结构
+/// 需扩展为惰性记录 `old_channels: Option<HashMap<String, Value>>`。
+struct StepUndo {
+    /// EXEC 通过 `flush_pending_sends` 修改；失败时还原。
+    old_pending_sends: Vec<SendTask>,
+}
+
 /// Pregel 引擎 BSP 循环状态
 pub struct MirPregelEngine {
     config: MirPregelConfig,
@@ -116,6 +131,9 @@ pub struct EngineStats {
     pub retries: usize,
     pub timeouts: usize,
     pub total_ms: u128,
+    /// v0.75.4: 累计发送的消息条数（每个超步 ADVANCE 分发的 SendTask 总量）。
+    /// BSP 保证全部送达，故不设 messages_received（sent == received 天然成立）。
+    pub messages_sent: usize,
 }
 
 /// v0.73: Per-agent outcome collected from a worker (parallel EXEC) or
@@ -538,14 +556,19 @@ impl MirPregelEngine {
 
             // v0.74: Step-level fault tolerance. Snapshot step-start state,
             // run EXEC, and on failure restore + retry up to fault_tolerance.
-            let step_start = self.build_checkpoint();
+            // v0.75.3: 增量快照（StepUndo）— 只记录 EXEC 会改的状态；
+            // fault_tolerance == 0 时为零成本（此前每步全量 build_checkpoint
+            // 在默认配置从未被读取，纯浪费）。
+            let step_start = self.begin_step();
             let mut exec_result: Result<(), String> = Ok(());
 
             for attempt in 0..=self.fault_tolerance {
                 if attempt > 0 {
                     // Restore step-start state and re-run the step.
                     self.stats.retries += 1;
-                    self.restore_checkpoint(&step_start);
+                    if let Some(ref undo) = step_start {
+                        self.rollback_step(undo);
+                    }
                     // Re-run EXEC from the restored state.
                     self.worker_pool = None; // discard any leaked threads
                 }
@@ -785,6 +808,17 @@ impl MirPregelEngine {
                     .push(send.input);
             }
             for (target, messages) in by_target {
+                // v0.75.4: 提前失败 — send 到未定义节点在消息分发点立即报错，
+                // 而非延迟到下一超步 EXEC 才崩溃（Giraph message-ACK 精神：
+                // 确认每条消息都有合法接收者）。
+                if !self.agents_by_name.contains_key(&target) {
+                    return Err(format!(
+                        "Pregel: send to undefined node '{}' (defined agents: {:?})",
+                        target,
+                        self.agents_by_name.keys().collect::<Vec<_>>()
+                    ));
+                }
+                self.stats.messages_sent += messages.len();
                 let final_value = if let Some(combiner) = self.combiner_bodies.get(&target).cloned()
                 {
                     let mut acc = messages[0].clone();
@@ -998,6 +1032,27 @@ impl MirPregelEngine {
         self.current_step = cp.step;
         // v0.74: Restore clears vertex_state — re-running the step rebuilds
         // it from the agents' signals. Aggregators reset to config initials.
+        self.vertex_state.clear();
+        self.aggregator_acc.clear();
+        for (name, initial) in self.aggregator_initial_snapshot() {
+            self.aggregator_acc.insert(name, initial);
+        }
+    }
+
+    /// v0.75.3: 每步开始时记录增量 undo。`fault_tolerance == 0` 时返回
+    /// `None`（零成本 — 此前的每步全量 `build_checkpoint()` 在默认配置
+    /// 从未被读取，纯浪费）。
+    fn begin_step(&mut self) -> Option<StepUndo> {
+        (self.fault_tolerance > 0).then(|| StepUndo {
+            old_pending_sends: self.pending_sends.clone(),
+        })
+    }
+
+    /// v0.75.3: 失败回滚 — 还原 EXEC 修改的状态。与 `restore_checkpoint`
+    /// 对 vertex_state / aggregator_acc 的处理语义一致（清空 + 从 config
+    /// initials 重建）；channels 等在 EXEC 期间不变，无需恢复。
+    fn rollback_step(&mut self, undo: &StepUndo) {
+        self.pending_sends = undo.old_pending_sends.clone();
         self.vertex_state.clear();
         self.aggregator_acc.clear();
         for (name, initial) in self.aggregator_initial_snapshot() {
@@ -1525,5 +1580,184 @@ mod tests {
         engine.aggregator_contribute("lo", Value::Int(100)).unwrap();
         engine.aggregator_contribute("lo", Value::Int(7)).unwrap();
         assert_eq!(engine.aggregator_acc.get("lo"), Some(&Value::Int(7)));
+    }
+
+    // ─── v0.75.3: StepUndo 增量 step 快照 ─────────────────────────
+
+    #[test]
+    fn begin_step_skipped_when_no_fault_tolerance() {
+        // 默认 fault_tolerance == 0 → begin_step 为零成本（None）。
+        let config = MirPregelConfig {
+            agents: vec![make_const_agent("a", 1)],
+            edges: vec![MirEdgeDef {
+                from: "@start".into(),
+                to: "a".into(),
+                condition_expr: None,
+                condition_body: None,
+            }],
+            state_schema: vec![],
+            checkpoint: None,
+            interrupt_points: vec![],
+            adjacency: HashMap::new(),
+            aggregators: Vec::new(),
+            master_compute: None,
+        };
+        let mut engine = MirPregelEngine::new(config.clone());
+        assert!(engine.begin_step().is_none());
+
+        let mut engine_ft = MirPregelEngine::new(config).with_fault_tolerance(3);
+        assert!(engine_ft.begin_step().is_some());
+    }
+
+    #[test]
+    fn step_undo_rolls_back_pending_sends() {
+        // begin_step → EXEC 增发 pending_sends + 改 vertex_state/aggregator_acc
+        // → rollback_step 还原 pending_sends，vertex_state 清空、
+        // aggregator_acc 回到 config initials（与 restore_checkpoint 语义一致）。
+        let config = MirPregelConfig {
+            agents: vec![make_const_agent("a", 1)],
+            edges: vec![MirEdgeDef {
+                from: "@start".into(),
+                to: "a".into(),
+                condition_expr: None,
+                condition_body: None,
+            }],
+            state_schema: vec![],
+            checkpoint: None,
+            interrupt_points: vec![],
+            adjacency: HashMap::new(),
+            aggregators: vec![crate::mir::expr::MirAggregatorDef {
+                name: "sum".into(),
+                ty: "Int".into(),
+                initial: Value::Int(0),
+                reducer: crate::mir::expr::AggregatorKind::Add,
+            }],
+            master_compute: None,
+        };
+        let mut engine = MirPregelEngine::new(config).with_fault_tolerance(2);
+
+        // 步初：一条 pending send（前一步遗留）
+        engine.flush_pending_sends(vec![SendTask {
+            target_node: "b".into(),
+            input: Value::Int(7),
+        }]);
+        let undo = engine.begin_step().expect("ft > 0 时应有 undo");
+
+        // EXEC 增发 + 改状态
+        engine.flush_pending_sends(vec![SendTask {
+            target_node: "c".into(),
+            input: Value::Int(9),
+        }]);
+        engine.vertex_state.insert("a".into(), VertexState::Halted);
+        engine.aggregator_contribute("sum", Value::Int(5)).unwrap();
+        assert_eq!(engine.pending_sends.len(), 2);
+        assert_eq!(engine.aggregator_acc.get("sum"), Some(&Value::Int(5)));
+
+        // 回滚
+        engine.rollback_step(&undo);
+        assert_eq!(engine.pending_sends.len(), 1, "增发的 send 被还原");
+        assert_eq!(engine.pending_sends[0].target_node, "b");
+        assert!(engine.vertex_state.is_empty());
+        assert_eq!(
+            engine.aggregator_acc.get("sum"),
+            Some(&Value::Int(0)),
+            "aggregator 回到 config initial"
+        );
+    }
+
+    // ─── v0.75.4: 消息计数 + 提前失败校验 ─────────────────────────
+
+    #[test]
+    fn advance_rejects_send_to_undefined_node() {
+        // send 到未定义节点在 ADVANCE（消息分发点）立即报错，而非延迟到
+        // 下一超步 EXEC 才崩溃。Giraph message-ACK 精神：提前确认每条
+        // 消息都有合法接收者。
+        let config = MirPregelConfig {
+            agents: vec![make_const_agent("a", 1)],
+            edges: vec![MirEdgeDef {
+                from: "@start".into(),
+                to: "a".into(),
+                condition_expr: None,
+                condition_body: None,
+            }],
+            state_schema: vec![],
+            checkpoint: None,
+            interrupt_points: vec![],
+            adjacency: HashMap::new(),
+            aggregators: Vec::new(),
+            master_compute: None,
+        };
+        let mut engine = MirPregelEngine::new(config);
+        // 手工注入一条发往未知节点的消息（等价于某 agent send 到 "ghost"）
+        engine.flush_pending_sends(vec![SendTask {
+            target_node: "ghost".into(),
+            input: Value::Int(1),
+        }]);
+        let mut interp = crate::interpreter::Interpreter::new();
+        let err = engine.run(&mut interp).unwrap_err();
+        assert!(
+            err.contains("undefined node 'ghost'"),
+            "错误应指明未知节点, got: {}",
+            err
+        );
+        assert!(err.contains("a"), "错误应列出已定义 agents, got: {}", err);
+        assert_eq!(
+            engine.stats().steps,
+            0,
+            "失败发生在第一超步 ADVANCE（steps 自增之前），未进入任何 EXEC"
+        );
+    }
+
+    #[test]
+    fn messages_sent_tracks_advance_delivery() {
+        // 图 a →(send)→ b：a 的 task_body 用 MirInst::Send 发消息给 b。
+        // 超步边界 ADVANCE 应统计到消息，且 b 因收到消息被再次激活。
+        let send_body = MirFunction {
+            params: Vec::new(),
+            body: vec![
+                MirInst::Const(0, Value::Int(42)),
+                MirInst::Send {
+                    value: 0,
+                    target: "b".into(),
+                },
+                MirInst::Return(Some(0)),
+            ],
+            n_regs: 1,
+        };
+        let agent_a = MirAgentDef {
+            name: "a".into(),
+            task_expr: MirExpr::lit(
+                crate::common::Literal::Nil(crate::common::Span::new(1, 1)),
+                crate::common::Span::new(1, 1),
+            ),
+            verify_expr: None,
+            with_config: None,
+            task_body: send_body,
+            task_mir_expr: None,
+            combiner_body: None,
+        };
+        let config = MirPregelConfig {
+            agents: vec![agent_a, make_const_agent("b", 7)],
+            edges: vec![MirEdgeDef {
+                from: "@start".into(),
+                to: "a".into(),
+                condition_expr: None,
+                condition_body: None,
+            }],
+            state_schema: vec![],
+            checkpoint: None,
+            interrupt_points: vec![],
+            adjacency: HashMap::new(),
+            aggregators: Vec::new(),
+            master_compute: None,
+        };
+        let mut engine = MirPregelEngine::new(config);
+        let mut interp = crate::interpreter::Interpreter::new();
+        engine.run(&mut interp).unwrap();
+        assert!(
+            engine.stats().messages_sent >= 1,
+            "a 的 send 应在超步边界被统计: {}",
+            engine.stats().messages_sent
+        );
     }
 }

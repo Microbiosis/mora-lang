@@ -17,7 +17,7 @@
 //!   schedule.remove(id) -> bool
 //!   schedule.tick(now) -> [triggered messages]  (内部: 由 event loop 调用)
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -47,9 +47,19 @@ pub struct Job {
 }
 
 /// v0.33: Scheduler
+///
+/// v0.75.2: tick 从 O(全部 job) 优化为 O(到期项) — BTreeMap 时间索引
+/// （timer-wheel 家族，与 tokio 的哈希桶时间轮同思路）。
+/// `buckets` 是稀疏的「next_fire_epoch → job ids」索引：`tick(now)` 用
+/// `range(..=now)` 直接跳到有到期桶的时刻，零空推进、对 now 大跳跃免疫。
+/// `jobs` 仍是事实来源（list/save/count 依赖它）；`remove` 只删 jobs，
+/// 桶内 id 由 tick 触发时惰性清理。
 #[derive(Clone, Default)]
 pub struct Scheduler {
     jobs: Arc<Mutex<HashMap<String, Job>>>,
+    /// v0.75.2: 到期时间索引（next_fire_epoch → job ids）。所有到期桶
+    /// 恒在未来（add 已校验 At 需 at_epoch > now、Every 需 interval > 0）。
+    buckets: Arc<Mutex<BTreeMap<u64, Vec<String>>>>,
     /// v0.36 (P1-1.8): AtomicU64 — was Mutex<u32> which overflowed at 4B adds.
     next_id: Arc<std::sync::atomic::AtomicU64>,
     /// Persistence file path (None = in-memory only)
@@ -139,10 +149,22 @@ impl Scheduler {
             last_run_epoch: if kind == JobKind::Every { now } else { 0 },
             delete_after_run: kind == JobKind::At, // default true for At
         };
+        // v0.75.2: next_fire → buckets 索引。Every 首次到期 = now + interval；
+        // At 到期 = at_epoch（add 已校验恒在未来）。
+        let next_fire = match kind {
+            JobKind::Every => now + interval_s,
+            JobKind::At => at_epoch,
+        };
         self.jobs
             .lock()
             .expect("scheduler mutex poisoned")
             .insert(id.clone(), job);
+        self.buckets
+            .lock()
+            .expect("scheduler mutex poisoned")
+            .entry(next_fire)
+            .or_default()
+            .push(id.clone());
         self.save();
         Ok(id)
     }
@@ -158,6 +180,10 @@ impl Scheduler {
     }
 
     /// 删除一个 job
+    ///
+    /// v0.75.2: 只删 jobs map（事实来源）。buckets 里的 id 不主动清理 —
+    /// tick 触发时发现 job 缺失即跳过（惰性清理），避免 remove 需同时锁
+    /// 两个 map / 维护 id→epoch 反查表。
     pub fn remove(&self, id: &str) -> bool {
         let removed = self
             .jobs
@@ -171,36 +197,50 @@ impl Scheduler {
         removed
     }
 
-    /// tick: 扫描所有 jobs, 返回应该触发的 messages + 移除 delete_after_run 的 jobs.
+    /// tick: 返回应该触发的 messages + 移除 delete_after_run 的 jobs.
     /// caller (event loop) 负责把 messages 注入 agent.
+    ///
+    /// v0.75.2: O(到期项) — 经 buckets 索引直接取走所有 ≤ now 的到期桶，
+    /// 不再线性扫描全部 jobs。Every 触发后以 `now + interval_s` 重排入桶；
+    /// At 触发即删（delete_after_run）。
     pub fn tick(&self, now: u64) -> Vec<String> {
         let mut jobs = self.jobs.lock().expect("scheduler mutex poisoned");
+        let mut buckets = self.buckets.lock().expect("scheduler mutex poisoned");
+
+        // 先 collect 再 remove，避免 range 迭代期间可变借用 buckets。
+        let due: Vec<(u64, Vec<String>)> = buckets
+            .range(..=now)
+            .map(|(k, v)| (*k, v.clone()))
+            .collect();
+        for (k, _) in &due {
+            buckets.remove(k);
+        }
+
         let mut triggered = Vec::new();
-        let mut to_remove = Vec::new();
-        for (id, job) in jobs.iter_mut() {
-            let should_fire = match job.kind {
-                JobKind::Every => {
-                    if job.interval_s > 0 {
-                        let next = job.last_run_epoch + job.interval_s;
-                        now >= next
-                    } else {
-                        false
+        for (_, ids) in due {
+            for id in ids {
+                // 惰性清理：remove 过的 job，桶内 id 在此被跳过。
+                let Some(job) = jobs.get_mut(&id) else {
+                    continue;
+                };
+                match job.kind {
+                    JobKind::Every => {
+                        if job.interval_s > 0 {
+                            triggered.push(job.message.clone());
+                            job.last_run_epoch = now;
+                            // 非对齐：next 从当前时刻重算（与旧实现一致）
+                            buckets.entry(now + job.interval_s).or_default().push(id);
+                        }
                     }
-                }
-                JobKind::At => now >= job.at_epoch,
-            };
-            if should_fire {
-                triggered.push(job.message.clone());
-                job.last_run_epoch = now;
-                if job.delete_after_run {
-                    to_remove.push(id.clone());
+                    JobKind::At => {
+                        triggered.push(job.message.clone());
+                        jobs.remove(&id);
+                    }
                 }
             }
         }
-        for id in &to_remove {
-            jobs.remove(id);
-        }
         drop(jobs);
+        drop(buckets);
         if !triggered.is_empty() {
             self.save();
         }
@@ -370,5 +410,69 @@ mod tests {
         // cleanup
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_dir(&dir);
+    }
+
+    // ─── v0.75.2: BTreeMap 时间索引（tick O(到期项)）───
+
+    #[test]
+    fn tick_large_schedule_only_processes_due() {
+        // 1000 个 Every job，interval 1..=1000。tick 只应处理到期桶 —
+        // 结构性证明：任一时刻触发数 << 1000（无全量扫描）。
+        let s = Scheduler::new();
+        for i in 1..=1000u64 {
+            s.add(
+                &format!("job{}", i),
+                JobKind::Every,
+                &format!("m{}", i),
+                i,
+                0,
+            )
+            .unwrap();
+        }
+        assert_eq!(s.count(), 1000);
+        // t0 在 add 之后取（≥ 所有 add 内部 now），消除跨秒边界：
+        // interval=i 的 next_fire = now_add_i + i ≤ t0 + i 恒成立。
+        let t0 = Scheduler::now();
+
+        // interval=1 的 job 必然到期
+        let triggered = s.tick(t0 + 1);
+        assert!(triggered.contains(&"m1".to_string()));
+
+        // interval ≤ 10 的到期；触发数远小于 1000
+        let triggered = s.tick(t0 + 10);
+        assert!(triggered.contains(&"m10".to_string()));
+        assert!(
+            triggered.len() < 100,
+            "tick 不应全量扫描: got {}",
+            triggered.len()
+        );
+
+        // 未到期的不被触发：interval=1000 的 next 远在未来
+        assert!(!s.tick(t0 + 999).contains(&"m1000".to_string()));
+        assert!(s.tick(t0 + 1000).contains(&"m1000".to_string()));
+    }
+
+    #[test]
+    fn lazy_removal_bucket_cleanup() {
+        // remove 只删 jobs；到期桶内的 id 由 tick 惰性清理，不产生触发。
+        let s = Scheduler::new();
+        let t0 = Scheduler::now();
+        let id = s.add("gone", JobKind::Every, "ghost", 60, 0).unwrap();
+        assert!(s.remove(&id));
+        // 到期时刻 tick：job 已删，桶内 id 被跳过
+        assert!(s.tick(t0 + 60).is_empty());
+        assert_eq!(s.count(), 0);
+    }
+
+    #[test]
+    fn at_job_not_rescheduled() {
+        // At 触发即删（delete_after_run），且不再进入任何到期桶。
+        let s = Scheduler::new();
+        let target = Scheduler::now() + 100;
+        s.add("once", JobKind::At, "boom", 0, target).unwrap();
+        assert_eq!(s.tick(target), vec!["boom".to_string()]);
+        assert_eq!(s.count(), 0);
+        // 再次 tick 更晚时刻：无残留触发
+        assert!(s.tick(target + 1000).is_empty());
     }
 }

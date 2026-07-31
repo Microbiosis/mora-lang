@@ -482,21 +482,19 @@ impl Interpreter {
     }
 
     /// v0.51: 回溯到指定检查点之前的步骤（rewind）
-    /// checkpoint id 格式: `cp-{thread_id}-{step}`
+    /// v0.74: 修复 — checkpoint id 是 UUID，不再按 `cp-{thread_id}-{step}` 解析。
+    /// 改为读取每个 checkpoint 的 `step` 字段判断是否删除。
     pub fn rewind(&mut self, thread_id: &str, before_step: usize) -> Result<(), String> {
         if let Some(ref saver) = self.persist.checkpoint_saver {
             let checkpoints = saver.list(thread_id)?;
-            // 解析 `cp-{thread_id}-{step}` 提取 step
-            let thread_prefix = format!("cp-{}-", thread_id);
-            let to_remove: Vec<String> = checkpoints
-                .into_iter()
-                .filter(|id| {
-                    id.starts_with(&thread_prefix) && {
-                        let step_str = id.trim_start_matches(&thread_prefix);
-                        step_str.parse::<usize>().unwrap_or(0) >= before_step
+            let mut to_remove: Vec<String> = Vec::new();
+            for id in checkpoints {
+                if let Some(cp) = saver.load(thread_id, Some(&id))? {
+                    if cp.step >= before_step {
+                        to_remove.push(id);
                     }
-                })
-                .collect();
+                }
+            }
             for id in to_remove {
                 saver.delete(thread_id, &id)?;
             }

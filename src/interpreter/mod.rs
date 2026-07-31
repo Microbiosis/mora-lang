@@ -496,7 +496,12 @@ impl Interpreter {
                 };
                 // 子 import 的 env 是当前 env 的克隆（与 with 块语义一致）
                 let mut child_env = env.clone();
-                let _ = crate::mir::interp::run_mir(&imported_func, self, &mut child_env)?;
+                // v0.75.9: 包裹 Arc 走全局 DAG 缓存
+                let _ = crate::mir::interp::run_mir(
+                    &std::sync::Arc::new(imported_func),
+                    self,
+                    &mut child_env,
+                )?;
                 // child_env 中的定义合并回父 env
                 for (name, val) in child_env.iter() {
                     env.define(name, val, false);
@@ -637,7 +642,8 @@ impl Interpreter {
                 n_regs: func.n_regs,
             };
 
-            match run_mir(&run_func, interp, &mut env) {
+            // v0.75.9: 包裹 Arc 走全局 DAG 缓存（REPL 每行新建 func，天然独立缓存项）
+            match run_mir(&std::sync::Arc::new(run_func), interp, &mut env) {
                 Ok(value) => {
                     if !matches!(value, Value::Nil) {
                         println!("= {}", value);

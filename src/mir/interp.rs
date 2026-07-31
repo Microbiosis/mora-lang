@@ -15,7 +15,7 @@ use crate::mir::handlers::Flow;
 use crate::mir::host::MirHost;
 use crate::value::{Environment, Value};
 
-use super::{MirFunction, MirInst};
+use super::{MirFunction, MirInst, cache};
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -41,8 +41,11 @@ pub fn build_task_registry<'a>(
 /// v0.59: 现在通过 DAG 分析 + 强制 Sequence 边退化为线性执行，
 /// 与 `run_dag` 共享同一套 handler 函数。等价于:
 ///   dag_analyze(func) → add_sequential_edges() → run_dag()
+///
+/// v0.75.9: 接收 `&Arc<MirFunction>` — 优化后 DAG 走全局缓存
+/// （`cache::DAG_CACHE`，key = Arc 指针），同 Arc 跨调用复用。
 pub fn run_mir(
-    func: &MirFunction,
+    func: &Arc<MirFunction>,
     interp: &mut dyn MirHost,
     env: &mut Environment,
 ) -> Result<Value, String> {
@@ -247,24 +250,27 @@ pub fn self_match_pattern(
 /// α.3: 查找并执行 main task（与 AST 路径的 interpret() 末尾逻辑一致）。
 /// 扫描 func.body 中的 TaskDef，找到 name="main" 且无参的，执行其 body。
 /// 若不存在或非无参 main 则静默返回 Ok。
+///
+/// v0.75.9: 接收 `&Arc<MirFunction>`；TaskDef body 克隆进 Arc 以便走
+/// `run_mir` 的全局 DAG 缓存。
 pub fn run_main_task(
-    func: &MirFunction,
+    func: &Arc<MirFunction>,
     interp: &mut dyn MirHost,
     env: &mut Environment,
 ) -> Result<(), String> {
-    let mut main_body: Option<&MirFunction> = None;
+    let mut main_body: Option<Arc<MirFunction>> = None;
     for inst in &func.body {
         if let MirInst::TaskDef { name, params, body } = inst
             && name == "main"
             && params.is_empty()
         {
-            main_body = Some(body);
+            main_body = Some(Arc::new((**body).clone()));
             break;
         }
     }
     if let Some(main_func) = main_body {
         let mut main_env = env.clone();
-        let _ = run_mir(main_func, interp, &mut main_env)?;
+        let _ = run_mir(&main_func, interp, &mut main_env)?;
     }
     Ok(())
 }
@@ -293,31 +299,33 @@ pub enum MirSignal {
 /// v0.75: 修复 — 此前无条件返回 `MirSignal::Return`，丢弃 `Flow::Halt`
 /// （vote_to_halt）信号，导致 Pregel 引擎的 vertex_state 永远无法置为
 /// Halted。现在通过 `run_dag_with_signal` 真正传播 Return/Halt。
+///
+/// v0.75.9: 接收 `&Arc<MirFunction>`，优化后 DAG 走全局缓存
+/// （`cache::global_dag_cache().get_or_build`），同一 Arc 跨调用复用，
+/// 不再每次 `dag_analyze + dag_optimize + prune_sequence_edges` 全量重建。
 pub fn run_mir_with_signal(
-    func: &MirFunction,
+    func: &Arc<MirFunction>,
     interp: &mut dyn MirHost,
     env: &mut Environment,
 ) -> Result<(MirSignal, Value), String> {
-    let mut dag = crate::mir::dag::dag_analyze(func);
-    crate::mir::optimize::dag_optimize(&mut dag);
-    dag.prune_sequence_edges();
+    let dag = cache::global_dag_cache().get_or_build(func);
     crate::mir::dag_interp::run_dag_with_signal(&dag, func, interp, env)
 }
 
 /// α.10: `run_main_task` 的信号感知变体。
 /// main task 中允许出现显式 `return value`——返回它的值；否则返回 Value::Nil。
 pub fn run_main_task_with_signal(
-    func: &MirFunction,
+    func: &Arc<MirFunction>,
     interp: &mut dyn MirHost,
     env: &mut Environment,
 ) -> Result<(MirSignal, Value), String> {
-    let mut main_body: Option<&MirFunction> = None;
+    let mut main_body: Option<Arc<MirFunction>> = None;
     for inst in &func.body {
         if let MirInst::TaskDef { name, params, body } = inst
             && name == "main"
             && params.is_empty()
         {
-            main_body = Some(body);
+            main_body = Some(Arc::new((**body).clone()));
             break;
         }
     }
@@ -325,6 +333,6 @@ pub fn run_main_task_with_signal(
         return Ok((MirSignal::None, Value::Nil));
     };
     let mut main_env = env.clone();
-    let value = run_mir(main_func, interp, &mut main_env)?;
+    let value = run_mir(&main_func, interp, &mut main_env)?;
     Ok((MirSignal::Return(value.clone()), value))
 }

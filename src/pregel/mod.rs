@@ -131,12 +131,6 @@ pub struct MirPregelEngine {
     pub fault_tolerance: usize,
     /// v0.74: Runtime stats (steps, agents run, retries, timeouts, ms).
     pub stats: EngineStats,
-    /// v0.75.6: 缓存 agent task_body 的优化后 DAG（dag_analyze、dag_optimize、
-    /// prune_sequence_edges，对同一 func 幂等）。pregel 每超步重跑同一
-    /// task_body，此前每次全量重建 — 缓存避免重复分析开销。
-    ///
-    /// 注：仅缓存 agents 的 task_body（config 静态），随 engine 生命周期，无泄漏。
-    agent_dag_cache: HashMap<String, std::sync::Arc<crate::mir::dag::MirDag>>,
     /// v0.75.8: 增量执行 v1 — 记录每 agent 上次 input（build_node_input 的
     /// JSON 字符串）。超步间 input 完全未变时跳过整个执行（复用上次 outcome）。
     ///
@@ -307,7 +301,6 @@ impl MirPregelEngine {
             step_timeout: None,
             fault_tolerance: 0,
             stats: EngineStats::default(),
-            agent_dag_cache: HashMap::new(),
             agent_input_cache: HashMap::new(),
             agent_outcome_cache: HashMap::new(),
             saver: None,
@@ -373,25 +366,6 @@ impl MirPregelEngine {
     /// produced by `h_send` (which has no direct engine access).
     pub fn flush_pending_sends(&mut self, sends: Vec<SendTask>) {
         self.pending_sends.extend(sends);
-    }
-
-    /// v0.75.6: 缓存 agent task_body 的优化后 DAG（dag_analyze、dag_optimize、
-    /// prune_sequence_edges，对同一 func 幂等）。pregel 每超步重跑同一
-    /// task_body，此前每次全量重建 — 缓存避免重复分析开销。
-    fn cached_agent_dag(
-        &mut self,
-        name: &str,
-        task: &crate::mir::MirFunction,
-    ) -> std::sync::Arc<crate::mir::dag::MirDag> {
-        if let Some(d) = self.agent_dag_cache.get(name) {
-            return d.clone();
-        }
-        let mut dag = crate::mir::dag::dag_analyze(task);
-        crate::mir::optimize::dag_optimize(&mut dag);
-        dag.prune_sequence_edges();
-        let dag = std::sync::Arc::new(dag);
-        self.agent_dag_cache.insert(name.to_string(), dag.clone());
-        dag
     }
 
     /// v0.73: Reconcile one agent outcome back into engine state.
@@ -465,8 +439,13 @@ impl MirPregelEngine {
             if edge.from == node_name && edge.to != "@exit" {
                 if let Some(cond_body) = &edge.condition_body {
                     let mut cond_env = host.environment().lock().clone();
-                    let cond_val = crate::mir::interp::run_mir(cond_body, host, &mut cond_env)
-                        .unwrap_or(Value::Bool(false));
+                    // v0.75.9: 包裹 Arc 走全局 DAG 缓存
+                    let cond_val = crate::mir::interp::run_mir(
+                        &std::sync::Arc::new(cond_body.clone()),
+                        host,
+                        &mut cond_env,
+                    )
+                    .unwrap_or(Value::Bool(false));
                     if !crate::flow::is_truthy(&cond_val) {
                         continue;
                     }
@@ -620,9 +599,13 @@ impl MirPregelEngine {
                         // v0.71: Evaluate edge condition if present.
                         if let Some(cond_body) = &edge.condition_body {
                             let mut cond_env = interpreter.environment().lock().clone();
-                            let cond_val =
-                                crate::mir::interp::run_mir(cond_body, interpreter, &mut cond_env)
-                                    .unwrap_or(Value::Bool(false));
+                            // v0.75.9: 包裹 Arc 走全局 DAG 缓存
+                            let cond_val = crate::mir::interp::run_mir(
+                                &std::sync::Arc::new(cond_body.clone()),
+                                interpreter,
+                                &mut cond_env,
+                            )
+                            .unwrap_or(Value::Bool(false));
                             if !crate::flow::is_truthy(&cond_val) {
                                 continue;
                             }
@@ -713,19 +696,22 @@ impl MirPregelEngine {
                                     node_name
                                 ));
                             }
-                            // v0.75.6: 克隆 task_body 解除对 self.config 的借用，
-                            // 再调用 &mut self 的缓存方法（避免 E0502）。
-                            let task_body = agent.task_body.clone();
+                            // v0.75.6: 克隆 task_body 解除对 self.config 的借用
+                            // v0.75.9: 先包 Arc（agent.task_body 是裸 MirFunction），
+                            // 再查全局缓存；run_dag 与缓存共用同一 Arc。
+                            let task_body = std::sync::Arc::new(agent.task_body.clone());
 
                             self.stats.agents_run += 1;
 
-                            // v0.75.6: 用缓存 dag 执行（避免每超步重建）
+                            // v0.75.9: 全局 DAG 缓存（mir::cache，key = Arc 指针）—
+                            // 取代引擎本地 agent_dag_cache，Closure/Task/REPL 共用
                             // v0.75.7: 计时 per-agent 耗时（FPGA 调度可观测性）
-                            let dag = self.cached_agent_dag(node_name, &task_body);
+                            let dag =
+                                crate::mir::cache::global_dag_cache().get_or_build(&task_body);
                             let started = std::time::Instant::now();
                             let (signal, result) = crate::mir::dag_interp::run_dag_with_signal(
                                 dag.as_ref(),
-                                &task_body,
+                                task_body.as_ref(),
                                 interpreter,
                                 &mut env,
                             )
@@ -801,16 +787,13 @@ impl MirPregelEngine {
                             }
 
                             self.stats.agents_run += 1;
-                            // v0.75.6: 克隆 task_body 解除借用后再调缓存方法
-                            let task_body = agent.task_body.clone();
-                            let dag = self.cached_agent_dag(node_name, &task_body);
-                            prepared.push((
-                                node_name.clone(),
-                                std::sync::Arc::new(task_body),
-                                dag,
-                                env,
-                                input_str,
-                            ));
+                            // v0.75.6: 克隆 task_body 解除借用
+                            // v0.75.9: 先包 Arc（agent.task_body 是裸 MirFunction），
+                            // 再查全局缓存；PreparedJob 与缓存共用同一 Arc。
+                            let task_body = std::sync::Arc::new(agent.task_body.clone());
+                            let dag =
+                                crate::mir::cache::global_dag_cache().get_or_build(&task_body);
+                            prepared.push((node_name.clone(), task_body, dag, env, input_str));
                         }
 
                         // v0.75.7: Longest-Job-First 排序 — 按 DAG 复杂度
@@ -949,6 +932,7 @@ impl MirPregelEngine {
             // aggregation-based decisions).
             if let Some(master) = self.master_compute.clone() {
                 let mut master_env = interpreter.environment().lock().clone();
+                // v0.75.9: master_compute 已是 Arc，直接走全局 DAG 缓存
                 let _ = crate::mir::interp::run_mir(&master, interpreter, &mut master_env);
             }
 
@@ -996,6 +980,7 @@ impl MirPregelEngine {
                         let mut env = interpreter.environment().lock().clone();
                         env.define("current".into(), acc.clone(), false);
                         env.define("incoming".into(), incoming.clone(), false);
+                        // v0.75.9: combiner_bodies 已是 Arc，直接走全局 DAG 缓存
                         match crate::mir::interp::run_mir(&combiner, interpreter, &mut env) {
                             Ok(v) => acc = v,
                             Err(_) => acc = incoming.clone(), // fallback: LWW
@@ -1116,8 +1101,13 @@ impl MirPregelEngine {
                     let mut merge_env = interpreter.environment().lock().clone();
                     merge_env.define("current".into(), current.unwrap_or(Value::Nil), false);
                     merge_env.define("incoming".into(), value, false);
-                    crate::mir::interp::run_mir(&merge_fn, interpreter, &mut merge_env)
-                        .map_err(|e| format!("Pregel merge body execution failed: {}", e))?
+                    // v0.75.9: 包裹 Arc 走全局 DAG 缓存
+                    crate::mir::interp::run_mir(
+                        &std::sync::Arc::new(merge_fn),
+                        interpreter,
+                        &mut merge_env,
+                    )
+                    .map_err(|e| format!("Pregel merge body execution failed: {}", e))?
                 }
                 // v0.67: Sum — accumulate numeric writes (first write initializes).
                 MirReducerKind::Sum => accumulator_reduce(current, value, "+")?,
@@ -1133,8 +1123,13 @@ impl MirPregelEngine {
                     let mut merge_env = interpreter.environment().lock().clone();
                     merge_env.define("current".into(), current.unwrap_or(Value::Nil), false);
                     merge_env.define("incoming".into(), value, false);
-                    crate::mir::interp::run_mir(&merge_fn, interpreter, &mut merge_env)
-                        .map_err(|e| format!("Pregel custom body execution failed: {}", e))?
+                    // v0.75.9: 包裹 Arc 走全局 DAG 缓存
+                    crate::mir::interp::run_mir(
+                        &std::sync::Arc::new(merge_fn),
+                        interpreter,
+                        &mut merge_env,
+                    )
+                    .map_err(|e| format!("Pregel custom body execution failed: {}", e))?
                 }
                 // Static reducers already handled by to_merge_strategy() above
                 _ => value,
@@ -1931,31 +1926,17 @@ mod tests {
         );
     }
 
-    // ─── v0.75.6: task_body DAG 缓存 ──────────────────────────────
+    // ─── v0.75.9: 全局 DAG 缓存（取代引擎本地 agent_dag_cache）──────────
 
     #[test]
-    fn cached_agent_dag_is_idempotent() {
-        // 同一 task_body 两次缓存调用返回结构一致的 dag（幂等）。
+    fn global_dag_cache_is_idempotent() {
+        // 同一 task_body 的 Arc 两次缓存调用返回同一个 Arc（缓存命中）。
+        // 全局缓存 = mir::cache::DAG_CACHE，pregel/Closure/REPL 共用。
         let agent = make_const_agent("a", 7);
-        let config = MirPregelConfig {
-            agents: vec![agent.clone()],
-            edges: vec![MirEdgeDef {
-                from: "@start".into(),
-                to: "a".into(),
-                condition_expr: None,
-                condition_body: None,
-            }],
-            state_schema: vec![],
-            checkpoint: None,
-            interrupt_points: vec![],
-            adjacency: HashMap::new(),
-            aggregators: Vec::new(),
-            master_compute: None,
-        };
-        let mut engine = MirPregelEngine::new(config);
-        let d1 = engine.cached_agent_dag("a", &agent.task_body);
-        let d2 = engine.cached_agent_dag("a", &agent.task_body);
-        // 缓存命中：两次应是同一个 Arc（结构一致）
+        let body = std::sync::Arc::new(agent.task_body);
+        let cache = crate::mir::cache::DagCache::new();
+        let d1 = cache.get_or_build(&body);
+        let d2 = cache.get_or_build(&body);
         assert!(std::sync::Arc::ptr_eq(&d1, &d2), "重复调用应命中缓存");
         assert_eq!(d1.nodes.len(), d2.nodes.len());
         assert_eq!(d1.edges.len(), d2.edges.len());

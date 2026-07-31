@@ -12,7 +12,8 @@ fn run_dag_path(source: &str) -> Result<(), String> {
     let func = lower_mir_exprs(&exprs)?;
     let mut interp = Interpreter::new();
     let mut env = interp.take_env();
-    mora::mir::dag_interp::run_mir_dag(&func, &mut interp, &mut env)?;
+    // v0.75.9: 包裹 Arc（run_mir_dag 签名变更，走全局 DAG 缓存）
+    mora::mir::dag_interp::run_mir_dag(&std::sync::Arc::new(func), &mut interp, &mut env)?;
     Ok(())
 }
 
@@ -20,7 +21,8 @@ fn run_dag_path(source: &str) -> Result<(), String> {
 fn dag_pure_computation_no_crash() {
     run_dag_path("let x = 1 + 2\nlet y = x * 3").expect("pure computation via DAG");
     run_dag_path("let a = [10, 20, 30]\nlen(a)").expect("list + builtin via DAG");
-    run_dag_path("let s = \"hello\"\nlet t = \"world\"\ns + \" \" + t").expect("string concat via DAG");
+    run_dag_path("let s = \"hello\"\nlet t = \"world\"\ns + \" \" + t")
+        .expect("string concat via DAG");
 }
 
 #[test]
@@ -39,7 +41,8 @@ fn dag_compress_demo_no_crash() {
     let mut interp = Interpreter::new();
     let mut env = interp.take_env();
     // Just run the top-level DAG body, then main task via linear
-    match mora::mir::dag_interp::run_mir_dag(&func, &mut interp, &mut env) {
+    // v0.75.9: 包裹 Arc（run_mir_dag 签名变更）
+    match mora::mir::dag_interp::run_mir_dag(&std::sync::Arc::new(func), &mut interp, &mut env) {
         Ok(v) => eprintln!("DAG result: {:?}", v),
         Err(e) => eprintln!("DAG error (expected during compress mock): {}", e),
     }

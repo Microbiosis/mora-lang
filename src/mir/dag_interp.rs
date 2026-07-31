@@ -8,6 +8,7 @@
 //! execution, making `run_mir ≡ run_dag`.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use crate::mir::dag::{EdgeKind, MirDag, MirDagNode};
 use crate::mir::handlers::{self, Flow};
@@ -17,7 +18,7 @@ use crate::mir::{MirFunction, MirInst};
 use crate::value::{Environment, Value};
 
 pub fn run_mir_dag(
-    func: &MirFunction,
+    func: &Arc<MirFunction>,
     interp: &mut dyn MirHost,
     env: &mut Environment,
 ) -> Result<Value, String> {
@@ -201,7 +202,8 @@ mod tests {
         };
         let mut interp = Interpreter::new();
         let mut env = interp.take_env();
-        run_mir_dag(&func, &mut interp, &mut env)
+        // v0.75.9: 包裹 Arc（run_mir_dag 签名变更）
+        run_mir_dag(&Arc::new(func), &mut interp, &mut env)
     }
 
     #[test]

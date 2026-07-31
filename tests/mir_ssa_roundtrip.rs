@@ -32,8 +32,10 @@ fn optimize_without_panic(source: &str, level: OptLevel) {
     // deconstruct 后仍可执行（不 panic）
     let mut interp = Interpreter::new();
     let mut env = interp.take_env();
-    let _ = run_mir(&func, &mut interp, &mut env);
-    let _ = run_main_task(&func, &mut interp, &mut env);
+    // v0.75.9: 包裹 Arc 走全局 DAG 缓存
+    let func_arc = std::sync::Arc::new(func);
+    let _ = run_mir(&func_arc, &mut interp, &mut env);
+    let _ = run_main_task(&func_arc, &mut interp, &mut env);
 }
 
 /// 对 task 内显式 return 的程序，验证优化前后返回值一致。
@@ -46,8 +48,10 @@ fn assert_task_equiv(source: &str) {
         }
         let mut interp = Interpreter::new();
         let mut env = interp.take_env();
-        let v = run_mir(&func, &mut interp, &mut env)?;
-        run_main_task(&func, &mut interp, &mut env)?;
+        // v0.75.9: 包裹 Arc 走全局 DAG 缓存
+        let func_arc = std::sync::Arc::new(func);
+        let v = run_mir(&func_arc, &mut interp, &mut env)?;
+        run_main_task(&func_arc, &mut interp, &mut env)?;
         Ok(v)
     };
     let baseline = run(None);
@@ -108,7 +112,8 @@ fn assert_top_level_equiv(source: &str) {
         }
         let mut interp = Interpreter::new();
         let mut env = interp.take_env();
-        run_mir(&func, &mut interp, &mut env)
+        // v0.75.9: 包裹 Arc 走全局 DAG 缓存
+        run_mir(&std::sync::Arc::new(func), &mut interp, &mut env)
     };
     let baseline = run(None);
     let basic = run(Some(OptLevel::Basic));

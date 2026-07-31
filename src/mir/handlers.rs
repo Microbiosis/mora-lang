@@ -317,9 +317,13 @@ pub fn h_send(
     target: &str,
 ) -> Result<(), String> {
     let val = regs[value].clone();
-    if let Some(tx) = interp.core.worker_channels.get(target) {
-        tx.send(val).map_err(|e| format!("Send error: {}", e))?;
-    }
+    // v0.69: Push to dynamic_sends buffer. h_orchestrate flushes this into
+    // the BSP engine's pending_sends before each super-step, so the message
+    // reaches its target_node in the next super-step.
+    interp.core.dynamic_sends.push(crate::checkpoint::SendTask {
+        target_node: target.to_string(),
+        input: val,
+    });
     Ok(())
 }
 
@@ -575,6 +579,9 @@ pub fn h_orchestrate(
                 true // always continue
             }));
 
+            // v0.69: Flush dynamic_sends into engine before run
+            let pending = std::mem::take(&mut interp.core.dynamic_sends);
+            engine.flush_pending_sends(pending);
             let result = engine.run(interp)?;
 
             // v0.62: Expose conflicts as a structured list

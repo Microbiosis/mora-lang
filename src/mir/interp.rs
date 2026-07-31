@@ -283,6 +283,9 @@ pub enum MirSignal {
     Break,
     /// `continue label`。
     Continue,
+    /// v0.70: Vote to halt — agent signals completion. In BSP context
+    /// marks the vertex as Halted. Equivalent to Return in linear context.
+    Halt(Option<Value>),
 }
 
 /// α.10: 与 `run_mir` 等价，但返回 `(MirSignal, Value)`，保留信号。

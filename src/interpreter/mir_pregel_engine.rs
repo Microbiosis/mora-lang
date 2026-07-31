@@ -71,6 +71,23 @@ pub struct MirPregelEngine {
     pub current_step: usize,
     /// v0.64: Optional checkpoint persistence backend.
     saver: Option<Arc<dyn CheckpointSaver>>,
+    /// v0.70: Per-vertex state for vote_to_halt semantics.
+    /// Active: scheduled normally. Halted: only rescheduled when a Send arrives.
+    pub vertex_state: HashMap<String, VertexState>,
+    /// v0.71: Per-super-step aggregator accumulator. Reset at the start
+    /// of each step, reduced at the end, exposed as channels.
+    pub aggregator_acc: HashMap<String, Value>,
+    /// v0.71: Final reducer applied to aggregator_acc each super-step.
+    pub aggregator_reducer: HashMap<String, crate::mir::expr::AggregatorKind>,
+}
+
+/// v0.70: Per-vertex lifecycle state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VertexState {
+    /// Default: scheduled when active_nodes has it OR a Send targets it.
+    Active,
+    /// Halted: only rescheduled when a Send targets it (vote_to_halt).
+    Halted,
 }
 
 /// v0.67: Numeric accumulator for Sum/Product. First write initializes
@@ -143,6 +160,16 @@ impl MirPregelEngine {
             .iter()
             .map(|ch| (ch.name.clone(), ch.reducer.clone()))
             .collect();
+        let aggregator_initial: HashMap<String, Value> = config
+            .aggregators
+            .iter()
+            .map(|a| (a.name.clone(), a.initial.clone()))
+            .collect();
+        let aggregator_reducer: HashMap<String, crate::mir::expr::AggregatorKind> = config
+            .aggregators
+            .iter()
+            .map(|a| (a.name.clone(), a.reducer.clone()))
+            .collect();
         Self {
             config,
             agents_by_name,
@@ -157,6 +184,9 @@ impl MirPregelEngine {
             interrupt_after: None,
             conflict_callback: None,
             current_step: 0,
+            vertex_state: HashMap::new(),
+            aggregator_acc: HashMap::new(),
+            aggregator_reducer: HashMap::new(),
             saver: None,
         }
     }
@@ -196,6 +226,52 @@ impl MirPregelEngine {
         self.pending_sends.extend(sends);
     }
 
+    /// v0.71: Snapshot of aggregator initial values (from config).
+    fn aggregator_initial_snapshot(&self) -> Vec<(String, Value)> {
+        self.config.aggregators.iter()
+            .map(|a| (a.name.clone(), a.initial.clone()))
+            .collect()
+    }
+
+    /// v0.71: Contribute a value to a per-super-step aggregator.
+    /// Called by `h_aggregate`.
+    pub fn aggregator_contribute(&mut self, name: &str, value: Value) -> Result<(), String> {
+        let reducer = self.aggregator_reducer.get(name)
+            .ok_or_else(|| format!("Unknown aggregator: {}", name))?
+            .clone();
+        let acc = self.aggregator_acc.entry(name.to_string())
+            .or_insert_with(|| match reducer {
+                crate::mir::expr::AggregatorKind::Add => Value::Int(0),
+                crate::mir::expr::AggregatorKind::Max => value.clone(),
+                crate::mir::expr::AggregatorKind::Min => value.clone(),
+                crate::mir::expr::AggregatorKind::Last => value.clone(),
+                crate::mir::expr::AggregatorKind::Concat => Value::String(String::new()),
+            });
+        *acc = match reducer {
+            crate::mir::expr::AggregatorKind::Add => {
+                crate::flow::eval_binary(std::mem::replace(acc, Value::Int(0)), &crate::common::BinaryOp::Add, value)?
+            }
+            crate::mir::expr::AggregatorKind::Max => {
+                let cmp = crate::flow::eval_binary(value.clone(), &crate::common::BinaryOp::Greater, std::mem::replace(acc, Value::Int(0))).unwrap_or(Value::Bool(false));
+                if matches!(cmp, Value::Bool(true)) { value } else { value }
+            }
+            crate::mir::expr::AggregatorKind::Min => {
+                let cmp = crate::flow::eval_binary(value.clone(), &crate::common::BinaryOp::Less, std::mem::replace(acc, Value::Int(0))).unwrap_or(Value::Bool(false));
+                if matches!(cmp, Value::Bool(true)) { value } else { value }
+            }
+            crate::mir::expr::AggregatorKind::Last => value,
+            crate::mir::expr::AggregatorKind::Concat => {
+                let prev = std::mem::replace(acc, Value::String(String::new()));
+                let new = match prev {
+                    Value::String(s) => format!("{}{}", s, value),
+                    _ => format!("{}{}", prev, value),
+                };
+                Value::String(new)
+            }
+        };
+        Ok(())
+    }
+
     /// 初始化 channels（设置 input 通道初值）
     pub fn init_channels(&mut self, initial: HashMap<String, Value>) {
         for (k, v) in initial {
@@ -219,15 +295,30 @@ pub fn run(&mut self, interpreter: &mut Interpreter) -> Result<Value, String> {
         let mut active_nodes: Vec<String> = vec!["@start".to_string()];
 
         while !active_nodes.is_empty() && self.current_step < self.max_steps {
+            // v0.71: Reset aggregators at start of each step.
+            // Agents contribute via h_aggregate; we reduce at end of step.
+            for (name, initial) in &self.aggregator_initial_snapshot() {
+                self.aggregator_acc.insert(name.clone(), initial.clone());
+            }
+
             // ---------- 1. PLAN ----------
             let mut to_execute: Vec<String> = Vec::new();
             for node in &active_nodes {
                 if node == "@start" {
                     continue;
                 }
-                if self.agents_by_name.contains_key(node)
-                    || self.pending_sends.iter().any(|s| s.target_node == *node)
-                {
+                // v0.70: Halted vertices are only rescheduled when targeted
+                // by a Send — vote_to_halt semantics.
+                let is_halted = matches!(
+                    self.vertex_state.get(node),
+                    Some(VertexState::Halted)
+                );
+                let targeted_by_send = self.pending_sends.iter()
+                    .any(|s| s.target_node == *node);
+                if is_halted && !targeted_by_send {
+                    continue;
+                }
+                if self.agents_by_name.contains_key(node) || targeted_by_send {
                     to_execute.push(node.clone());
                 }
             }
@@ -261,6 +352,19 @@ pub fn run(&mut self, interpreter: &mut Interpreter) -> Result<Value, String> {
             for active_node in &active_nodes {
                 for edge in &self.config.edges {
                     if edge.from == *active_node && edge.to != "@exit" {
+                        // v0.71: Evaluate edge condition if present.
+                        // Default to active if no condition. Skip edge if
+                        // condition returns falsy.
+                        if let Some(cond_body) = &edge.condition_body {
+                            let mut cond_env =
+                                interpreter.core.environment.lock().clone();
+                            let cond_val = crate::mir::interp::run_mir(
+                                cond_body, interpreter, &mut cond_env,
+                            ).unwrap_or(Value::Bool(false));
+                            if !crate::flow::is_truthy(&cond_val) {
+                                continue;
+                            }
+                        }
                         next_active.insert(edge.to.clone());
                     }
                 }
@@ -295,8 +399,17 @@ pub fn run(&mut self, interpreter: &mut Interpreter) -> Result<Value, String> {
                 let mut env = interpreter.core.environment.lock().clone();
                 // v0.61: Tick vector clock for this agent
                 env.clock.tick(node_name);
-                let result = crate::mir::interp::run_mir(&agent.task_body, interpreter, &mut env)
-                    .map_err(|e| format!("Pregel node '{}': {}", node_name, e))?;
+                let (signal, result) = crate::mir::interp::run_mir_with_signal(
+                    &agent.task_body, interpreter, &mut env,
+                ).map_err(|e| format!("Pregel node '{}': {}", node_name, e))?;
+
+                // v0.70: vote_to_halt — mark vertex as Halted; will only
+                // be rescheduled when a Send arrives.
+                if matches!(signal, crate::mir::interp::MirSignal::Halt(_)) {
+                    self.vertex_state.insert(node_name.clone(), VertexState::Halted);
+                } else {
+                    self.vertex_state.insert(node_name.clone(), VertexState::Active);
+                }
 
                 // v0.60: Merge agent environment back into shared environment.
                 // Uses per-channel reducer strategies for conflict resolution.
@@ -327,6 +440,17 @@ pub fn run(&mut self, interpreter: &mut Interpreter) -> Result<Value, String> {
                 // 静态边 → 下一跳
                 for edge in &self.config.edges {
                     if edge.from == *node_name && edge.to != "@exit" {
+                        // v0.71: Edge condition evaluation (same as PLAN phase).
+                        if let Some(cond_body) = &edge.condition_body {
+                            let mut cond_env =
+                                interpreter.core.environment.lock().clone();
+                            let cond_val = crate::mir::interp::run_mir(
+                                cond_body, interpreter, &mut cond_env,
+                            ).unwrap_or(Value::Bool(false));
+                            if !crate::flow::is_truthy(&cond_val) {
+                                continue;
+                            }
+                        }
                         next_active.insert(edge.to.clone());
                     }
                 }
@@ -335,6 +459,12 @@ pub fn run(&mut self, interpreter: &mut Interpreter) -> Result<Value, String> {
             // ---------- 3. UPDATE ----------
             for (_node, channel, value) in writes {
                 self.apply_write(channel, value, interpreter)?;
+            }
+
+            // v0.71: Publish aggregator results as channels for next step.
+            for (name, value) in &self.aggregator_acc {
+                self.channels.insert(format!("aggregator_{}", name), value.clone());
+                *self.channel_versions.entry(format!("aggregator_{}", name)).or_insert(0) += 1;
             }
 
             // interrupt after
@@ -594,6 +724,7 @@ mod tests {
             checkpoint: None,
             interrupt_points: vec![],
             adjacency: HashMap::new(),
+            aggregators: Vec::new(),
         };
         let engine = MirPregelEngine::new(config);
         assert_eq!(engine.config().agents.len(), 1);
@@ -609,6 +740,7 @@ mod tests {
             checkpoint: None,
             interrupt_points: vec![],
             adjacency: HashMap::new(),
+            aggregators: Vec::new(),
         };
         let mut engine = MirPregelEngine::new(config);
         let mut interp = crate::interpreter::Interpreter::new();
@@ -629,6 +761,7 @@ mod tests {
             checkpoint: None,
             interrupt_points: vec![],
             adjacency: HashMap::new(),
+            aggregators: Vec::new(),
         };
         let mut engine = MirPregelEngine::new(config);
         let mut interp = crate::interpreter::Interpreter::new();
@@ -654,6 +787,7 @@ mod tests {
             checkpoint: None,
             interrupt_points: vec![],
             adjacency: HashMap::new(),
+            aggregators: Vec::new(),
         };
         let mut engine = MirPregelEngine::new(config);
         let mut interp = crate::interpreter::Interpreter::new();
@@ -684,6 +818,7 @@ mod tests {
             }],
             checkpoint: None, interrupt_points: vec![],
             adjacency: HashMap::new(),
+            aggregators: Vec::new(),
         };
         let mut engine = MirPregelEngine::new(config);
         let mut interp = crate::interpreter::Interpreter::new();
@@ -704,6 +839,7 @@ mod tests {
             }],
             checkpoint: None, interrupt_points: vec![],
             adjacency: HashMap::new(),
+            aggregators: Vec::new(),
         };
         let mut engine = MirPregelEngine::new(config);
         let mut interp = crate::interpreter::Interpreter::new();
@@ -724,6 +860,7 @@ mod tests {
             }],
             checkpoint: None, interrupt_points: vec![],
             adjacency: HashMap::new(),
+            aggregators: Vec::new(),
         };
         let mut engine = MirPregelEngine::new(config);
         let mut interp = crate::interpreter::Interpreter::new();

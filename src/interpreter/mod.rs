@@ -216,8 +216,9 @@ impl<V: Clone> LruCache<V> {
 }
 
 pub struct Interpreter {
-    /// v0.52 ADR-001: CoreRuntime — 8 个核心执行字段（globals/environment/tool_registry/
-    /// v2_arena/current_ai_config/config_stack/worker_channels/worker_receivers）
+    /// v0.52 ADR-001: CoreRuntime — 核心执行字段（globals/environment/tool_registry/
+    /// current_ai_config/config_stack/current_merge_strategies/dynamic_sends）。
+    /// v0.70 移除了 worker_channels/worker_receivers 死代码分支。
     pub(crate) core: crate::runtime::core::CoreRuntime,
     /// v0.52 ADR-001: RegistryRuntime facade — BC8 (trait_registry + impl_table + mock_registry +
     /// ccr_store + memory_store)

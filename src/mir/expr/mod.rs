@@ -641,6 +641,29 @@ pub struct MirPregelConfig {
     pub checkpoint: Option<MirCheckpointConfig>,
     pub interrupt_points: Vec<MirInterruptPoint>,
     pub adjacency: HashMap<String, Vec<String>>,
+    /// v0.71: Per-super-step global aggregators. Each agent can contribute
+    /// a value via `h_aggregate(name, value)`; the engine reduces across
+    /// all contributions per step and exposes the result as `aggregator_<name>`.
+    pub aggregators: Vec<MirAggregatorDef>,
+}
+
+/// v0.71: Aggregator definition (per-super-step global reducer).
+#[derive(Debug, Clone, PartialEq)]
+pub struct MirAggregatorDef {
+    pub name: String,
+    pub ty: String,
+    pub initial: Value,
+    /// Per-step reducer: Add, Max, Min, Last, Concat.
+    pub reducer: AggregatorKind,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum AggregatorKind {
+    Add,
+    Max,
+    Min,
+    Last,
+    Concat,
 }
 
 ///  Builtin operation (placeholder for typeck)

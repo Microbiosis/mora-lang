@@ -79,6 +79,11 @@ pub struct MirPregelEngine {
     pub aggregator_acc: HashMap<String, Value>,
     /// v0.71: Final reducer applied to aggregator_acc each super-step.
     pub aggregator_reducer: HashMap<String, crate::mir::expr::AggregatorKind>,
+    /// v0.72: Per-agent combiner body for pre-delivery message folding.
+    pub combiner_bodies: HashMap<String, std::sync::Arc<crate::mir::MirFunction>>,
+    /// v0.72: Master coordinator hook — runs once per super-step after
+    /// UPDATE, before ADVANCE.
+    pub master_compute: Option<std::sync::Arc<crate::mir::MirFunction>>,
 }
 
 /// v0.70: Per-vertex lifecycle state.
@@ -170,6 +175,15 @@ impl MirPregelEngine {
             .iter()
             .map(|a| (a.name.clone(), a.reducer.clone()))
             .collect();
+        let combiner_bodies: HashMap<String, std::sync::Arc<crate::mir::MirFunction>> = config
+            .agents
+            .iter()
+            .filter_map(|a| {
+                a.combiner_body.as_ref().map(|b| (a.name.clone(), std::sync::Arc::new(b.clone())))
+            })
+            .collect();
+        let master_compute = config.master_compute.as_ref()
+            .map(|b| std::sync::Arc::new(b.clone()));
         Self {
             config,
             agents_by_name,
@@ -187,6 +201,8 @@ impl MirPregelEngine {
             vertex_state: HashMap::new(),
             aggregator_acc: HashMap::new(),
             aggregator_reducer: HashMap::new(),
+            combiner_bodies,
+            master_compute,
             saver: None,
         }
     }
@@ -467,6 +483,14 @@ pub fn run(&mut self, interpreter: &mut Interpreter) -> Result<Value, String> {
                 *self.channel_versions.entry(format!("aggregator_{}", name)).or_insert(0) += 1;
             }
 
+            // v0.72: Master.compute — runs once per super-step after UPDATE.
+            // Used for global coordination (e.g., dynamic topology changes,
+            // aggregation-based decisions).
+            if let Some(master) = self.master_compute.clone() {
+                let mut master_env = interpreter.core.environment.lock().clone();
+                let _ = crate::mir::interp::run_mir(&master, interpreter, &mut master_env);
+            }
+
             // interrupt after
             for node_name in &to_execute {
                 for ip in &self.collect_interrupts(node_name, MirInterruptWhen::After) {
@@ -481,11 +505,33 @@ pub fn run(&mut self, interpreter: &mut Interpreter) -> Result<Value, String> {
             // ---------- 4. ADVANCE ----------
             // v0.69: Dynamic Send delivery — target nodes become active in
             // the next super-step and their `input` channel carries the payload.
-            // Multiple sends to the same target → last-write-wins on input.
+            // v0.72: Combiners — multiple sends to the same target are folded
+            // via the target's combiner_body (current, incoming) -> Value
+            // before delivery. Default behavior (no combiner) = last-write-wins.
+            let mut by_target: std::collections::HashMap<String, Vec<crate::value::Value>> =
+                std::collections::HashMap::new();
             for send in self.pending_sends.drain(..) {
-                self.channels.insert("input".to_string(), send.input);
+                by_target.entry(send.target_node).or_default().push(send.input);
+            }
+            for (target, messages) in by_target {
+                let final_value = if let Some(combiner) = self.combiner_bodies.get(&target).cloned() {
+                    let mut acc = messages[0].clone();
+                    for incoming in &messages[1..] {
+                        let mut env = interpreter.core.environment.lock().clone();
+                        env.define("current".into(), acc.clone(), false);
+                        env.define("incoming".into(), incoming.clone(), false);
+                        match crate::mir::interp::run_mir(&combiner, interpreter, &mut env) {
+                            Ok(v) => acc = v,
+                            Err(_) => acc = incoming.clone(), // fallback: LWW
+                        }
+                    }
+                    acc
+                } else {
+                    messages.last().cloned().unwrap_or(Value::Nil)
+                };
+                self.channels.insert("input".to_string(), final_value);
                 *self.channel_versions.entry("input".to_string()).or_insert(0) += 1;
-                next_active.insert(send.target_node);
+                next_active.insert(target);
             }
             active_nodes = next_active.into_iter().collect();
             self.current_step += 1;
@@ -703,6 +749,7 @@ mod tests {
             with_config: None,
             task_body: empty_mir_function(),
             task_mir_expr: None,
+            combiner_body: None,
         }
     }
 
@@ -725,6 +772,7 @@ mod tests {
             interrupt_points: vec![],
             adjacency: HashMap::new(),
             aggregators: Vec::new(),
+            master_compute: None,
         };
         let engine = MirPregelEngine::new(config);
         assert_eq!(engine.config().agents.len(), 1);
@@ -741,6 +789,7 @@ mod tests {
             interrupt_points: vec![],
             adjacency: HashMap::new(),
             aggregators: Vec::new(),
+            master_compute: None,
         };
         let mut engine = MirPregelEngine::new(config);
         let mut interp = crate::interpreter::Interpreter::new();
@@ -762,6 +811,7 @@ mod tests {
             interrupt_points: vec![],
             adjacency: HashMap::new(),
             aggregators: Vec::new(),
+            master_compute: None,
         };
         let mut engine = MirPregelEngine::new(config);
         let mut interp = crate::interpreter::Interpreter::new();
@@ -788,6 +838,7 @@ mod tests {
             interrupt_points: vec![],
             adjacency: HashMap::new(),
             aggregators: Vec::new(),
+            master_compute: None,
         };
         let mut engine = MirPregelEngine::new(config);
         let mut interp = crate::interpreter::Interpreter::new();
@@ -819,6 +870,7 @@ mod tests {
             checkpoint: None, interrupt_points: vec![],
             adjacency: HashMap::new(),
             aggregators: Vec::new(),
+            master_compute: None,
         };
         let mut engine = MirPregelEngine::new(config);
         let mut interp = crate::interpreter::Interpreter::new();
@@ -840,6 +892,7 @@ mod tests {
             checkpoint: None, interrupt_points: vec![],
             adjacency: HashMap::new(),
             aggregators: Vec::new(),
+            master_compute: None,
         };
         let mut engine = MirPregelEngine::new(config);
         let mut interp = crate::interpreter::Interpreter::new();
@@ -861,6 +914,7 @@ mod tests {
             checkpoint: None, interrupt_points: vec![],
             adjacency: HashMap::new(),
             aggregators: Vec::new(),
+            master_compute: None,
         };
         let mut engine = MirPregelEngine::new(config);
         let mut interp = crate::interpreter::Interpreter::new();

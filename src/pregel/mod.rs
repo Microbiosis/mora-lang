@@ -121,6 +121,11 @@ pub struct MirPregelEngine {
     pub fault_tolerance: usize,
     /// v0.74: Runtime stats (steps, agents run, retries, timeouts, ms).
     pub stats: EngineStats,
+    /// v0.75.6: 缓存 agent task_body 的优化后 DAG（dag_analyze + dag_optimize
+    /// + prune_sequence_edges，对同一 func 幂等）。pregel 每超步重跑同一
+    /// task_body，此前每次全量重建 — 缓存避免重复分析开销。
+    /// 仅缓存 agents 的 task_body（config 静态），随 engine 生命周期，无泄漏。
+    agent_dag_cache: HashMap<String, std::sync::Arc<crate::mir::dag::MirDag>>,
 }
 
 /// v0.74: Engine runtime metrics.
@@ -266,6 +271,7 @@ impl MirPregelEngine {
             step_timeout: None,
             fault_tolerance: 0,
             stats: EngineStats::default(),
+            agent_dag_cache: HashMap::new(),
             saver: None,
         }
     }
@@ -329,6 +335,25 @@ impl MirPregelEngine {
     /// produced by `h_send` (which has no direct engine access).
     pub fn flush_pending_sends(&mut self, sends: Vec<SendTask>) {
         self.pending_sends.extend(sends);
+    }
+
+    /// v0.75.6: 缓存 agent task_body 的优化后 DAG（dag_analyze + dag_optimize
+    /// + prune_sequence_edges，对同一 func 幂等）。pregel 每超步重跑同一
+    /// task_body，此前每次全量重建 — 缓存避免重复分析开销。
+    fn cached_agent_dag(
+        &mut self,
+        name: &str,
+        task: &crate::mir::MirFunction,
+    ) -> std::sync::Arc<crate::mir::dag::MirDag> {
+        if let Some(d) = self.agent_dag_cache.get(name) {
+            return d.clone();
+        }
+        let mut dag = crate::mir::dag::dag_analyze(task);
+        crate::mir::optimize::dag_optimize(&mut dag);
+        dag.prune_sequence_edges();
+        let dag = std::sync::Arc::new(dag);
+        self.agent_dag_cache.insert(name.to_string(), dag.clone());
+        dag
     }
 
     /// v0.73: Reconcile one agent outcome back into engine state.
@@ -602,11 +627,17 @@ impl MirPregelEngine {
                                     node_name
                                 ));
                             }
+                            // v0.75.6: 克隆 task_body 解除对 self.config 的借用，
+                            // 再调用 &mut self 的缓存方法（避免 E0502）。
+                            let task_body = agent.task_body.clone();
 
                             self.stats.agents_run += 1;
 
-                            let (signal, result) = crate::mir::interp::run_mir_with_signal(
-                                &agent.task_body,
+                            // v0.75.6: 用缓存 dag 执行（避免每超步重建）
+                            let dag = self.cached_agent_dag(node_name, &task_body);
+                            let (signal, result) = crate::mir::dag_interp::run_dag_with_signal(
+                                dag.as_ref(),
+                                &task_body,
                                 interpreter,
                                 &mut env,
                             )
@@ -629,9 +660,11 @@ impl MirPregelEngine {
                     } else {
                         // ── Parallel path: PREPARE → SPAWN → RECONCILE ──
                         // PREPARE (main thread, &self read): build private envs.
+                        // v0.75.6: prepared 携带缓存 dag（避免每超步重建）。
                         let mut prepared: Vec<(
                             String,
                             std::sync::Arc<crate::mir::MirFunction>,
+                            std::sync::Arc<crate::mir::dag::MirDag>,
                             crate::value::Environment,
                         )> = Vec::new();
                         for node_name in &to_execute {
@@ -655,9 +688,13 @@ impl MirPregelEngine {
                             );
                             env.clock.tick(node_name);
                             self.stats.agents_run += 1;
+                            // v0.75.6: 克隆 task_body 解除借用后再调缓存方法
+                            let task_body = agent.task_body.clone();
+                            let dag = self.cached_agent_dag(node_name, &task_body);
                             prepared.push((
                                 node_name.clone(),
-                                std::sync::Arc::new(agent.task_body.clone()),
+                                std::sync::Arc::new(task_body),
+                                dag,
                                 env,
                             ));
                         }
@@ -676,13 +713,15 @@ impl MirPregelEngine {
                         let jobs: Vec<crate::pregel::worker_pool::WorkerJob> = prepared
                             .into_iter()
                             .enumerate()
-                            .map(|(idx, (name, task, mut env))| {
+                            .map(|(idx, (name, task, dag, mut env))| {
                                 let mut interp_clone = interpreter.clone_box();
                                 crate::pregel::worker_pool::WorkerJob {
                                     index: idx,
                                     task: Box::new(move || {
+                                        // v0.75.6: 用缓存 dag 执行（避免每超步重建）
                                         let (signal, result) =
-                                            crate::mir::interp::run_mir_with_signal(
+                                            crate::mir::dag_interp::run_dag_with_signal(
+                                                dag.as_ref(),
                                                 &task,
                                                 interp_clone.as_mut(),
                                                 &mut env,
@@ -1758,6 +1797,95 @@ mod tests {
             engine.stats().messages_sent >= 1,
             "a 的 send 应在超步边界被统计: {}",
             engine.stats().messages_sent
+        );
+    }
+
+    // ─── v0.75.6: task_body DAG 缓存 ──────────────────────────────
+
+    #[test]
+    fn cached_agent_dag_is_idempotent() {
+        // 同一 task_body 两次缓存调用返回结构一致的 dag（幂等）。
+        let agent = make_const_agent("a", 7);
+        let config = MirPregelConfig {
+            agents: vec![agent.clone()],
+            edges: vec![MirEdgeDef {
+                from: "@start".into(),
+                to: "a".into(),
+                condition_expr: None,
+                condition_body: None,
+            }],
+            state_schema: vec![],
+            checkpoint: None,
+            interrupt_points: vec![],
+            adjacency: HashMap::new(),
+            aggregators: Vec::new(),
+            master_compute: None,
+        };
+        let mut engine = MirPregelEngine::new(config);
+        let d1 = engine.cached_agent_dag("a", &agent.task_body);
+        let d2 = engine.cached_agent_dag("a", &agent.task_body);
+        // 缓存命中：两次应是同一个 Arc（结构一致）
+        assert!(std::sync::Arc::ptr_eq(&d1, &d2), "重复调用应命中缓存");
+        assert_eq!(d1.nodes.len(), d2.nodes.len());
+        assert_eq!(d1.edges.len(), d2.edges.len());
+    }
+
+    #[test]
+    fn multi_step_run_uses_cached_dag() {
+        // 多超步图（a send→b）：run 后 stats.steps >= 2，且结果非空 —
+        // 缓存路径与未缓存语义一致（此前 parallel_matches_sequential 等
+        // 回归已覆盖单路径，此处验证多超步 + 缓存组合不破坏结果）。
+        let send_body = MirFunction {
+            params: Vec::new(),
+            body: vec![
+                MirInst::Const(0, Value::Int(42)),
+                MirInst::Send {
+                    value: 0,
+                    target: "b".into(),
+                },
+                MirInst::Return(Some(0)),
+            ],
+            n_regs: 1,
+        };
+        let agent_a = MirAgentDef {
+            name: "a".into(),
+            task_expr: MirExpr::lit(
+                crate::common::Literal::Nil(crate::common::Span::new(1, 1)),
+                crate::common::Span::new(1, 1),
+            ),
+            verify_expr: None,
+            with_config: None,
+            task_body: send_body,
+            task_mir_expr: None,
+            combiner_body: None,
+        };
+        let config = MirPregelConfig {
+            agents: vec![agent_a, make_const_agent("b", 7)],
+            edges: vec![MirEdgeDef {
+                from: "@start".into(),
+                to: "a".into(),
+                condition_expr: None,
+                condition_body: None,
+            }],
+            state_schema: vec![],
+            checkpoint: None,
+            interrupt_points: vec![],
+            adjacency: HashMap::new(),
+            aggregators: Vec::new(),
+            master_compute: None,
+        };
+        let mut engine = MirPregelEngine::new(config);
+        let mut interp = crate::interpreter::Interpreter::new();
+        let result = engine.run(&mut interp).unwrap();
+        assert!(
+            engine.stats().steps >= 2,
+            "a send→b 应至少两个超步: {}",
+            engine.stats().steps
+        );
+        assert!(
+            !matches!(result, Value::Nil),
+            "多超步 + 缓存路径应产出非空结果, got: {:?}",
+            result
         );
     }
 }

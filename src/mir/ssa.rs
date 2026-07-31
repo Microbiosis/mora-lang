@@ -1245,7 +1245,13 @@ pub fn deconstruct(ssa: &MirSsaFunction) -> MirFunction {
                 MirInst::JumpIfNot(map_reg(*cond), *f)
             }
             Terminator::JumpIfNot(cond, _t, f) => MirInst::JumpIfNot(map_reg(*cond), *f),
-            Terminator::Return(reg) => MirInst::Return(reg.map(map_reg)),
+            // v0.75.6: `Return(None)` 不发射 — Mora 无显式 return 时由
+            // run_mir 隐式返回「最后产生 dst 的指令」，发射 `Return(None)`
+            // 会在块首就短路（顶层块 Label 后第一条指令即 Return(None)），
+            // 使隐式返回载体永远无法执行 → 返回值变成 Nil（SSA 等价性
+            // 测试抓到的语义 bug）。丢弃后线性执行自然落到最后一条指令。
+            Terminator::Return(None) => MirInst::Label(usize::MAX), // skipped below
+            Terminator::Return(Some(r)) => MirInst::Return(Some(map_reg(*r))),
             Terminator::Break(t) if *t >= num_blocks => MirInst::Return(None),
             Terminator::Break(t) => MirInst::Break(*t),
             Terminator::Continue(t) if *t >= num_blocks => MirInst::Return(None),
@@ -1279,11 +1285,13 @@ pub fn deconstruct(ssa: &MirSsaFunction) -> MirFunction {
         }
 
         // 3. terminator
-        block_insts.push(terminator_to_plain(
-            &block.terminator,
-            &ssa_to_plain,
-            num_blocks,
-        ));
+        // v0.75.6: `Return(None)` 经 terminator_to_plain 映射为
+        // `Label(usize::MAX)` 占位，此处跳过 — 丢弃该指令（线性执行
+        // 自然隐式返回最后产生值，与 baseline 语义一致）。
+        let term = terminator_to_plain(&block.terminator, &ssa_to_plain, num_blocks);
+        if !matches!(term, MirInst::Label(id) if id == usize::MAX) {
+            block_insts.push(term);
+        }
 
         blocks_body.push(block_insts);
     }

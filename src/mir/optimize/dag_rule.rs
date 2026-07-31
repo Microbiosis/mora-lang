@@ -56,14 +56,14 @@ fn const_value(node: &MirDagNode) -> Option<&Value> {
 /// Find incoming Data edges to `node_id` for a specific register.
 fn find_data_source(dag: &MirDag, node_id: NodeId, reg: Reg) -> Option<NodeId> {
     dag.edges.iter().find_map(|e| {
-        if e.to == node_id {
-            if let EdgeKind::Data { reg: r } = e.kind {
-                if r == reg {
-                    return Some(e.from);
-                }
-            }
+        if e.to == node_id
+            && let EdgeKind::Data { reg: r } = e.kind
+            && r == reg
+        {
+            Some(e.from)
+        } else {
+            None
         }
-        None
     })
 }
 
@@ -122,7 +122,9 @@ impl DagRewriteRule for ConstFoldingDagRule {
 
         let out_edges: Vec<(NodeId, NodeId, EdgeKind)> = dag.edges.iter()
             .filter(|e| e.from == node_id)
-            .map(|e| (0, e.to, e.kind.clone()))
+            // v0.75.6: placeholder 用 usize::MAX（此前用 0，与「节点 0 是合法 id」
+            // 冲突 — 含变量操作数的真实代码会触发 index out of bounds）。
+            .map(|e| (usize::MAX, e.to, e.kind.clone()))
             .collect();
 
         let mut removed = vec![node_id];

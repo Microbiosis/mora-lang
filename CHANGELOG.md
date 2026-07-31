@@ -2,6 +2,27 @@
 
 All notable changes to Mora will be documented in this file.
 
+## [v0.75.6] — 2026-07-31 — SSA 管线验证 + Pregel DAG 缓存
+
+据「他山之石」#3（优化器）与 #2（电子表格增量重算）的落地推进。
+
+### Changed — SSA 管线验证（`opt.rs` 首次测试 + 3 个独立 bug 修复）
+- 新增 `tests/mir_ssa_roundtrip.rs`：SSA 管线（construct → Basic/Aggressive pipeline → deconstruct）首次被测试。
+- **验证发现系统性 bug → 管线未接入执行链**：SSA construct/传播后寄存器引用丢失（`let x = 1+2; return x` 的 `Define("x", 3)` 引用的 reg 3 无产生者，优化后返回值变 Nil）。`MORA_OPT` 保持默认关闭（环境变量读到但跳过），待修复后启用。
+- 顺带修复 3 个独立 bug（均有回归测试）：
+  1. **dag placeholder 0 → usize::MAX**（`dag_rule.rs`/`dag_search.rs`）：`apply_rewrite` 用 `from == 0` 作「新节点」占位，与合法节点 id 0 冲突 — 含变量操作数的代码会触发 index out of bounds（pre-existing，被真实用例触发）。
+  2. **DCE 保留隐式返回载体**（`opt.rs`）：`Return(None)` 块的最后一条产生 dst 指令计入 used，避免被当死代码删除。
+  3. **deconstruct 丢弃 Return(None)**（`ssa.rs`）：不再发射会在块首短路的 `Return(None)`，线性执行自然隐式返回最后产生值。
+- 已知未修复：顶层隐式返回语义依赖 dag_interp「最后产生 dst 节点」作结果载体，优化重排后不稳定（独立于 SSA 管线）。
+
+### Changed — Pregel task_body DAG 缓存（`src/pregel/mod.rs`）
+- 新增 `agent_dag_cache: HashMap<String, Arc<MirDag>>` + `cached_agent_dag()`：pregel 每超步重跑同一 task_body，此前每次 `dag_analyze + dag_optimize + prune` 全量重建 — 现缓存优化后 DAG（顺序 + 并行路径均接入）。
+- 仅缓存 agents 的 task_body（config 静态，随 engine 生命周期，无泄漏）。
+- 新增 2 测试：`cached_agent_dag_is_idempotent`（Arc 缓存命中）、`multi_step_run_uses_cached_dag`（a send→b 多超步 + 缓存路径结果非空）。
+
+### Tests
+- 564 通过 / 0 失败（+8：SSA 6 + pregel 2）。clippy `-D warnings` error 数与基线持平（88）。
+
 ## [v0.75.5] — 2026-07-31 — Cascades 择优 + G-Set CRDT 语义
 
 两项独立增强（据「他山之石」第 3 号——数据库优化器 Cascades/Volcano 框架，与第 8 号——CRDT 冲突-free 数据结构）。

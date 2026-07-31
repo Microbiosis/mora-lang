@@ -86,11 +86,7 @@ pub fn dag_search_staged(
             // Reset dirty for this stage: all unremoved nodes should be
             // checked by this stage's rules (different stages = different rules).
             for (i, node) in dag.nodes.iter().enumerate() {
-                if node.is_removed() {
-                    opt.dirty[i] = false;
-                } else {
-                    opt.dirty[i] = true;
-                }
+                opt.dirty[i] = !node.is_removed();
             }
 
             for node_id in 0..dag.nodes.len() {
@@ -197,9 +193,11 @@ fn apply_rewrite(dag: &mut MirDag, rw: DagRewrite) {
         dag.nodes.push(node);
     }
 
-    // 2. Add new edges (remap `from=0` placeholders to `new_base`)
+    // 2. Add new edges (remap `usize::MAX` placeholders to `new_base`).
+    //    v0.75.6: placeholder 由 0 改为 usize::MAX — 节点 0 是合法 id，
+    //    旧实现会在含变量操作数的图上触发 index out of bounds。
     for (from, to, kind) in rw.added_edges {
-        let actual_from = if from == 0 { new_base } else { from };
+        let actual_from = if from == usize::MAX { new_base } else { from };
         dag.edges.push(crate::mir::dag::MirDagEdge {
             from: actual_from,
             to,

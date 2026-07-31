@@ -27,6 +27,13 @@ pub fn lower_mir_exprs(exprs: &[MirExpr]) -> Result<MirFunction, String> {
     let mut func = l.finish();
     // v0.58: Cascades 优化 pass
     crate::mir::optimize::apply_rules(&mut func);
+    // v0.75.7: SSA 优化管线（MORA_OPT=1/2 启用，默认关闭 — 热路径零开销）。
+    // rename 根因修复后（Define/Assign src 参与 rename），等价性测试全绿，
+    // 环境变量从此真正生效。
+    let opt_level = crate::mir::ssa::OptLevel::from_env();
+    if opt_level.enabled() {
+        crate::mir::opt::optimize(&mut func, opt_level);
+    }
     Ok(func)
 }
 

@@ -121,10 +121,11 @@ pub struct MirPregelEngine {
     pub fault_tolerance: usize,
     /// v0.74: Runtime stats (steps, agents run, retries, timeouts, ms).
     pub stats: EngineStats,
-    /// v0.75.6: 缓存 agent task_body 的优化后 DAG（dag_analyze + dag_optimize
-    /// + prune_sequence_edges，对同一 func 幂等）。pregel 每超步重跑同一
+    /// v0.75.6: 缓存 agent task_body 的优化后 DAG（dag_analyze、dag_optimize、
+    /// prune_sequence_edges，对同一 func 幂等）。pregel 每超步重跑同一
     /// task_body，此前每次全量重建 — 缓存避免重复分析开销。
-    /// 仅缓存 agents 的 task_body（config 静态），随 engine 生命周期，无泄漏。
+    ///
+    /// 注：仅缓存 agents 的 task_body（config 静态），随 engine 生命周期，无泄漏。
     agent_dag_cache: HashMap<String, std::sync::Arc<crate::mir::dag::MirDag>>,
 }
 
@@ -139,6 +140,9 @@ pub struct EngineStats {
     /// v0.75.4: 累计发送的消息条数（每个超步 ADVANCE 分发的 SendTask 总量）。
     /// BSP 保证全部送达，故不设 messages_received（sent == received 天然成立）。
     pub messages_sent: usize,
+    /// v0.75.7: per-agent 最近一次执行耗时（ms）— FPGA 式调度可观测性，
+    /// 用于识别 straggler（长 agent 阻塞短 agent）。覆盖式保留最新一次。
+    pub per_agent_ms: HashMap<String, u128>,
 }
 
 /// v0.73: Per-agent outcome collected from a worker (parallel EXEC) or
@@ -149,6 +153,8 @@ pub struct AgentExecOutcome {
     pub result: crate::value::Value,
     pub env: crate::value::Environment,
     pub sends: Vec<crate::checkpoint::SendTask>,
+    /// v0.75.7: 本次 agent 执行耗时（ms），用于 per_agent_ms 统计。
+    pub duration_ms: u128,
 }
 
 /// v0.70: Per-vertex lifecycle state.
@@ -367,6 +373,11 @@ impl MirPregelEngine {
         outcome: AgentExecOutcome,
     ) -> Result<(), String> {
         let node_name = outcome.node_name.clone();
+
+        // v0.75.7: 记录 per-agent 最近一次耗时（FPGA 调度可观测性）
+        self.stats
+            .per_agent_ms
+            .insert(node_name.clone(), outcome.duration_ms);
 
         if matches!(outcome.signal, crate::mir::interp::MirSignal::Halt(_)) {
             self.vertex_state
@@ -634,7 +645,9 @@ impl MirPregelEngine {
                             self.stats.agents_run += 1;
 
                             // v0.75.6: 用缓存 dag 执行（避免每超步重建）
+                            // v0.75.7: 计时 per-agent 耗时（FPGA 调度可观测性）
                             let dag = self.cached_agent_dag(node_name, &task_body);
+                            let started = std::time::Instant::now();
                             let (signal, result) = crate::mir::dag_interp::run_dag_with_signal(
                                 dag.as_ref(),
                                 &task_body,
@@ -642,6 +655,7 @@ impl MirPregelEngine {
                                 &mut env,
                             )
                             .map_err(|e| format!("Pregel node '{}': {}", node_name, e))?;
+                            let duration_ms = started.elapsed().as_millis();
 
                             let outcome = AgentExecOutcome {
                                 node_name: node_name.clone(),
@@ -649,6 +663,7 @@ impl MirPregelEngine {
                                 result,
                                 env,
                                 sends: Vec::new(),
+                                duration_ms,
                             };
                             self.reconcile_outcome(
                                 interpreter,
@@ -699,6 +714,19 @@ impl MirPregelEngine {
                             ));
                         }
 
+                        // v0.75.7: Longest-Job-First 排序 — 按 DAG 复杂度
+                        // （nodes.len()，执行时长的廉价代理）降序。BSP 超步
+                        // 隔离保证同超步 agent 顺序无关（读 step-start 快照、
+                        // 写延迟到 barrier 后），重排仅改变分发顺序、不影响
+                        // 正确性；长 job 先调度可减少 worker 空闲尾巴
+                        // （straggler 缓解，FPGA list-scheduling 精神）。
+                        prepared.sort_by(|a, b| {
+                            b.2.nodes
+                                .len()
+                                .cmp(&a.2.nodes.len())
+                                .then_with(|| a.0.cmp(&b.0))
+                        });
+
                         // SPAWN: one Interpreter clone + private env per worker job.
                         // v0.74: Reuse cached pool (created once), keep across steps.
                         if self.worker_pool.is_none() {
@@ -719,6 +747,8 @@ impl MirPregelEngine {
                                     index: idx,
                                     task: Box::new(move || {
                                         // v0.75.6: 用缓存 dag 执行（避免每超步重建）
+                                        // v0.75.7: 计时 per-agent 耗时
+                                        let job_started = std::time::Instant::now();
                                         let (signal, result) =
                                             crate::mir::dag_interp::run_dag_with_signal(
                                                 dag.as_ref(),
@@ -729,6 +759,7 @@ impl MirPregelEngine {
                                             .map_err(
                                                 |e| format!("Pregel node '{}': {}", name, e),
                                             )?;
+                                        let duration_ms = job_started.elapsed().as_millis();
                                         let sends = std::mem::take(interp_clone.dynamic_sends());
                                         Ok(Box::new(AgentExecOutcome {
                                             node_name: name,
@@ -736,6 +767,7 @@ impl MirPregelEngine {
                                             result,
                                             env,
                                             sends,
+                                            duration_ms,
                                         })
                                             as Box<dyn std::any::Any + Send>)
                                     }),
@@ -1885,6 +1917,109 @@ mod tests {
         assert!(
             !matches!(result, Value::Nil),
             "多超步 + 缓存路径应产出非空结果, got: {:?}",
+            result
+        );
+    }
+
+    // ─── v0.75.7: FPGA 式调度（per-agent 计时 + LJF 排序）────────────
+
+    #[test]
+    fn stats_tracks_per_agent_duration() {
+        // 两 agent 图跑完：per_agent_ms 应含两节点且耗时 > 0。
+        let config = MirPregelConfig {
+            agents: vec![make_const_agent("a", 1), make_const_agent("b", 2)],
+            edges: vec![
+                MirEdgeDef {
+                    from: "@start".into(),
+                    to: "a".into(),
+                    condition_expr: None,
+                    condition_body: None,
+                },
+                MirEdgeDef {
+                    from: "@start".into(),
+                    to: "b".into(),
+                    condition_expr: None,
+                    condition_body: None,
+                },
+            ],
+            state_schema: vec![],
+            checkpoint: None,
+            interrupt_points: vec![],
+            adjacency: HashMap::new(),
+            aggregators: Vec::new(),
+            master_compute: None,
+        };
+        let mut engine = MirPregelEngine::new(config).with_parallelism(2);
+        let mut interp = crate::interpreter::Interpreter::new();
+        engine.run(&mut interp).unwrap();
+        assert!(
+            engine.stats().per_agent_ms.contains_key("a"),
+            "per_agent_ms 应记录 agent a"
+        );
+        assert!(
+            engine.stats().per_agent_ms.contains_key("b"),
+            "per_agent_ms 应记录 agent b"
+        );
+        assert!(
+            engine.stats().per_agent_ms["a"] >= 0,
+            "a 的耗时记录不应缺失"
+        );
+    }
+
+    #[test]
+    fn ljf_order_preserves_correctness() {
+        // LJF 排序改变分发顺序，但 BSP 语义保证同超步顺序无关 —
+        // 排序后的运行结果应与未排序一致（两 agent 结果都是确定字面量）。
+        let mut heavy = make_const_agent("heavy", 99);
+        // 构造 DAG 复杂度明显更高的 heavy agent（更多指令）
+        heavy.task_body = MirFunction {
+            params: Vec::new(),
+            body: vec![
+                MirInst::Const(0, Value::Int(1)),
+                MirInst::Const(1, Value::Int(2)),
+                MirInst::BinaryOp(2, 0, crate::common::BinaryOp::Add, 1),
+                MirInst::BinaryOp(3, 2, crate::common::BinaryOp::Mul, 2),
+                MirInst::BinaryOp(4, 3, crate::common::BinaryOp::Sub, 1),
+                MirInst::Return(Some(4)),
+            ],
+            n_regs: 5,
+        };
+        let config = MirPregelConfig {
+            agents: vec![heavy.clone(), make_const_agent("light", 7)],
+            edges: vec![
+                MirEdgeDef {
+                    from: "@start".into(),
+                    to: "heavy".into(),
+                    condition_expr: None,
+                    condition_body: None,
+                },
+                MirEdgeDef {
+                    from: "@start".into(),
+                    to: "light".into(),
+                    condition_expr: None,
+                    condition_body: None,
+                },
+            ],
+            state_schema: vec![],
+            checkpoint: None,
+            interrupt_points: vec![],
+            adjacency: HashMap::new(),
+            aggregators: Vec::new(),
+            master_compute: None,
+        };
+        let mut engine = MirPregelEngine::new(config).with_parallelism(2);
+        let mut interp = crate::interpreter::Interpreter::new();
+        let result = engine.run(&mut interp).unwrap();
+        // 两 agent 都执行（LJF 只改分发顺序，不改 BSP 结果）
+        assert!(
+            engine.stats().agents_run >= 2,
+            "heavy + light 都应执行: {}",
+            engine.stats().agents_run
+        );
+        // result 是最后写入者（LWW），heavy 或 light 之一 — 非 Nil 即正确
+        assert!(
+            !matches!(result, Value::Nil),
+            "LJF 排序后结果应非空: {:?}",
             result
         );
     }

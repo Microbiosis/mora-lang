@@ -94,6 +94,52 @@ fn task_arithmetic_equiv() {
     assert_task_equiv("task main()\n  let x = 1 + 2\n  print(x)\n  return x\nend\n");
 }
 
+// ─── 3. 顶层显式 return 等价性（v0.75.7 rename 修复后应成立）─────────
+
+/// 对顶层显式 return 的程序，验证优化前后返回值一致。
+/// v0.75.6 曾因 Define src 未参与 rename（寄存器引用丢失）而失败；
+/// v0.75.7 修复后此场景必须等价。
+fn assert_top_level_equiv(source: &str) {
+    let run = |level: Option<OptLevel>| -> Result<mora::value::Value, String> {
+        let exprs = parse_code_v3(source).expect("parse");
+        let mut func: MirFunction = lower_mir_exprs(&exprs).expect("lower");
+        if let Some(l) = level {
+            mora::mir::opt::optimize(&mut func, l);
+        }
+        let mut interp = Interpreter::new();
+        let mut env = interp.take_env();
+        run_mir(&func, &mut interp, &mut env)
+    };
+    let baseline = run(None);
+    let basic = run(Some(OptLevel::Basic));
+    let aggressive = run(Some(OptLevel::Aggressive));
+    assert_eq!(
+        basic, baseline,
+        "Basic 改变顶层结果: baseline={:?} basic={:?}",
+        baseline, basic
+    );
+    assert_eq!(
+        aggressive, baseline,
+        "Aggressive 改变顶层结果: baseline={:?} aggressive={:?}",
+        baseline, aggressive
+    );
+}
+
+#[test]
+fn top_level_const_fold_equiv() {
+    assert_top_level_equiv("let x = 1 + 2\nreturn x\n");
+}
+
+#[test]
+fn top_level_variable_equiv() {
+    assert_top_level_equiv("let x = 10\nlet y = x + 5\nreturn y\n");
+}
+
+#[test]
+fn top_level_reassignment_equiv() {
+    assert_top_level_equiv("let x = 1\nx = x + 1\nx = x + 1\nreturn x\n");
+}
+
 #[test]
 fn task_loop_equiv() {
     assert_task_equiv(

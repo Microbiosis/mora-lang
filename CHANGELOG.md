@@ -2,6 +2,21 @@
 
 All notable changes to Mora will be documented in this file.
 
+## [v0.75.7] — 2026-07-31 — SSA 根因修复启用 + Pregel FPGA 式调度
+
+### Changed — SSA rename 根因修复 + 管线启用（src/mir/ssa.rs + lower.rs）
+- **根因修复**：`rename_variables`/`rename_reads` 对 `Define`/`Assign` 的 src（来源寄存器）跳过 rename 解析，且 `Define` 的 src 被误当 dst 重编号 → deconstruct 映射错乱，优化后返回值丢失变 Nil。修复：Define/Assign 的 src 经 `rename_stack` 解析，且不重编号（第二字段是读，不是写）。
+- **管线接入** `lower_mir_exprs`：`MORA_OPT=1/2` 启用 SSA 优化（默认关闭，热路径零开销）——环境变量自 v0.56 设计以来首次真正生效。
+- `tests/mir_ssa_roundtrip.rs` 升级：新增 3 个顶层显式 return 严格等价性断言（此前因寄存器 bug 失败），全绿。
+
+### Changed — Pregel FPGA 式调度（src/pregel/mod.rs）
+- **可观测性**：`EngineStats.per_agent_ms: HashMap<String, u128>` + `AgentExecOutcome.duration_ms` — 顺序/并行路径计时，RECONCILE 记录（识别 straggler）。
+- **Longest-Job-First 排序**：PREPARE 后按 DAG 复杂度（nodes.len()）降序。BSP 超步隔离保证同超步顺序无关（读 step-start 快照、写延迟到 barrier 后），重排仅改分发顺序、不影响正确性；长 job 先调度减少 worker 空闲尾巴（FPGA list-scheduling 精神）。
+- 新增 2 测试：`stats_tracks_per_agent_duration`、`ljf_order_preserves_correctness`。
+
+### Tests
+- 566 通过 / 0 失败（+2）。clippy `-D warnings` error 数与基线持平（88）。
+
 ## [v0.75.6] — 2026-07-31 — SSA 管线验证 + Pregel DAG 缓存
 
 据「他山之石」#3（优化器）与 #2（电子表格增量重算）的落地推进。

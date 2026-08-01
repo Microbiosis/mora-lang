@@ -45,7 +45,7 @@ fn parse_v3_internal(source: &str) -> Vec<crate::mir::expr::MirExpr> {
     parse_code_v3(source).expect("ParserV3 failed")
 }
 
-pub use crate::value::{Environment, FlowSignal, StreamReader, Value};
+pub use crate::value::{Environment, StreamReader, Value};
 
 // v10 HTTP 超时配置
 const HTTP_READ_TIMEOUT_SECS: u64 = 30;
@@ -803,6 +803,3 @@ fn mock_bow_embedding(s: &str) -> Vec<f64> {
 // - Stmt::Return 永远返回 Return(val)
 // - call_task/call_closure 把 Return(val) 提取出来作为函数返回值；
 //   顶层 main 的 Return(val) 被 interpret 静默忽略（Mora 没有 main 返回值概念）
-
-// FlowSignal is now in value.rs
-// Re-exported above via pub use crate::value::*;

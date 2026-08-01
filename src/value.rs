@@ -861,39 +861,6 @@ fn values_iter(env: &Environment) -> Vec<(String, Value)> {
         .collect()
 }
 
-// ─── FlowSignal ──────────────────────────────────────────
-/// 控制流信号
-#[derive(Debug)]
-pub enum FlowSignal {
-    None,
-    Return(Value),
-    Break,
-    Continue,
-    /// v0.51: Pregel HITL 中断 — 引擎在 interrupt before/after 点暂停，
-    /// 由外部调用者决定如何恢复。
-    Interrupt {
-        node: String,
-        when: String,
-        channels: std::collections::HashMap<String, Value>,
-    },
-}
-
-impl FlowSignal {
-    pub fn into_value(self) -> Value {
-        match self {
-            FlowSignal::None => Value::Nil,
-            FlowSignal::Return(v) => v,
-            FlowSignal::Break => Value::Nil,
-            FlowSignal::Continue => Value::Nil,
-            FlowSignal::Interrupt { .. } => Value::Nil,
-        }
-    }
-
-    pub fn is_return(&self) -> bool {
-        matches!(self, FlowSignal::Return(_))
-    }
-}
-
 // ─── Binding (v0.21: 所有权语义) ───────────────────────
 /// 变量绑定状态，支持移动语义
 #[derive(Debug, Clone)]

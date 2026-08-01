@@ -4,14 +4,14 @@
 //! 跳过 `Interpreter::interpret/execute/evaluate/call_value_inner/call_task_inner`，
 //! 以证明所有 5 个语言面（语法/语义/类型/标准库/运行时）都通过 MIR 解释器执行。
 //!
-//! 配套的 AST 行为基准保留在 `tests/mir_differential.rs` —— 该文件作为
-//! 回归保护继续引用 AST 解释器，是唯一允许保留的 Tier 0 活跃调用方。
+//! Tier 0 AST 执行器已移除（v0.55 ParserV3 替换 AST 解释器）；本文件直接走
+//! MIR 路径，不依赖任何 AST 活跃调用方。
 
 use mora::interpreter::Interpreter;
 use mora::mir::MirFunction;
 use mora::mir::interp::{run_main_task, run_mir};
 use mora::mir::lower::{lower_mir_exprs, typecheck_mir_exprs};
-use mora::value::{FlowSignal, Value};
+use mora::value::Value;
 
 /// 公共执行入口：parse → typeck → lower → run_mir → run_main_task
 /// 这是 `src/main.rs::run_file()` 的纯库版本，可被测试独立调用。
@@ -176,7 +176,3 @@ fn tier1_public_api_is_stable() {
         ) -> Result<(), String>,
     ) = (run_mir, run_main_task);
 }
-
-// 抑制 FlowSignal 未使用警告（differential / 单元测试未来需要）
-#[allow(dead_code)]
-const _FLOW_SIGNAL_PRESENT: FlowSignal = FlowSignal::None;

@@ -44,6 +44,19 @@ impl Signature {
 ///  outside so both checkers can read it without contention.
 pub fn builtin_signatures() -> Vec<(String, Signature)> {
     vec![
+        // v0.75.23: M 原语 merge_with(key, strategy) — 声明 per-key CRDT
+        // 合并策略（append/add/dict_union/grow_only_set/lww），作用于其后的
+        // worker/transaction/observe 块合并。
+        (
+            "merge_with".to_string(),
+            Signature::new(
+                vec![
+                    ("key".to_string(), Type::String),
+                    ("strategy".to_string(), Type::String),
+                ],
+                Type::Nil,
+            ),
+        ),
         // v0.13: print(x) accepts any printable primitive and returns nil.
         (
             "print".to_string(),

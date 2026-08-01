@@ -1020,10 +1020,11 @@ impl ParserV3 {
     }
 
     fn parse_equality(&mut self) -> Option<MirExpr> {
-        let mut left = self.parse_comparison()?;
+        // v0.75.21: pipe 优先级低于 equality — `a == b |> f` = `a == f(b)`
+        let mut left = self.parse_pipe()?;
 
         while let Some(op) = self.consume_binary_op(&[TokenType::Equal, TokenType::NotEqual]) {
-            let right = self.parse_comparison()?;
+            let right = self.parse_pipe()?;
             left = MirExpr::binop(op, left, right, self.span_of_current());
         }
 
@@ -1205,32 +1206,37 @@ impl ParserV3 {
     /// Parse pipe expressions: `expr |> func` or `expr |> func(args)`
     /// Syntax: `lhs |> rhs`
     /// The rhs is typically a function call. This is left-associative:
-    /// `a |> b |> c` means `c(b(a))`.
-    #[allow(dead_code)]
+    /// v0.75.21: `|>` 管道语法接入 — 挂在 `parse_equality` 之下、
+    /// `parse_comparison` 之上（优先级低于 equality：`a == b |> f` =
+    /// `a == f(b)`）。操作数是 comparison 级（`1 + 2 |> f` = `f(1 + 2)`，
+    /// 算术先于管道）。`a |> b |> c` 链式 → `c(b(a))`。
     fn parse_pipe(&mut self) -> Option<MirExpr> {
-        let mut left = self.parse_call()?;
+        let mut left = self.parse_comparison()?;
 
         while self.match_token_exact(TokenType::Pipe) {
-            let right = self.parse_call()?;
+            let right = self.parse_comparison()?;
             // Pipe: left |> right becomes right(left)
             // Build as a call where left is the first argument to right
-            let right_name = match_to_string(&right);
             let right_span = right.span;
-            let args = match right.kind {
+            // v0.75.21: 修复 Call 分支的 callee 名丢失 — 此前 `right_name =
+            // match_to_string(&right)` 对 Call 变体返回 "expr"，`x |> f(a)`
+            // 会产出 `Call(Name("expr"), [x, a])`。改为保留分支内的真名。
+            let (callee, args) = match right.kind {
                 MirExprKind::Call {
-                    callee: MirCallee::Name(_name),
+                    callee: MirCallee::Name(name),
                     mut args,
                 } => {
                     // If right is already a call, prepend left as first arg
                     args.insert(0, left);
-                    args
+                    (MirCallee::Name(name), args)
                 }
                 _ => {
                     // If right is not a call, treat it as a function with left as arg
-                    vec![left]
+                    let name = match_to_string(&right);
+                    (MirCallee::Name(name), vec![left])
                 }
             };
-            left = MirExpr::call(MirCallee::Name(right_name), args, right_span);
+            left = MirExpr::call(callee, args, right_span);
         }
 
         Some(left)

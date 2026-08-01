@@ -2,6 +2,42 @@
 
 All notable changes to Mora will be documented in this file.
 
+## [v0.75.21] — 2026-08-01 — pipe `|>` 语法接入 + callee 名修复
+
+（v0.75.20 树收敛时发现的同族残留：`|>` 全链路死代码——lexer `Pipe` token
+存在、`parse_pipe` 从未挂接进优先级链（pre-existing 限制）、树变体已删。
+本次补齐「词法→语法→树」链路。）
+
+### Changed — `|>` 接入优先级链（src/parser_v3/mod.rs）
+- `parse_pipe` 挂进 `parse_equality`（低于 equality、高于 comparison）：
+  - `1 + 2 |> f` = `f(1 + 2)`（算术先于管道）；
+  - `3 == 3 |> f` = `3 == f(3)`（equality 先于管道）；
+  - `a |> b |> c` 链式 = `c(b(a))`。
+- 移除 `#[allow(dead_code)]`（函数不再死代码）。
+- 脱糖语义不变：`left |> right` → `Call(right, [left])`；typeck 走
+  `infer_call`、lower 走 `MirInst::Call`。
+
+### Fixed — `x |> f(a)` 的 callee 名丢失（src/parser_v3/mod.rs）
+- 此前 `right_name = match_to_string(&right)` 对 `Call` 变体返回 `"expr"`，
+  `x |> f(a)` 产出 `Call(Name("expr"), [x, a])`——callee 名丢失。
+- 改为在 Call 分支内保留真名 `f`：`Call(Name("f"), [x, a])`。
+- 该 bug 仅当 `parse_pipe` 被调用时存在——pipe 死代码期间不可达；
+  本次挂接使其暴露并同批修复。
+
+### Added — 测试（tier1_typeck_mir.rs）
+- `pipe_syntax_hooked_into_precedence`：task 管道（脱糖后 typeck 干净）。
+- `pipe_keeps_call_callee_name`：`10 |> add(5)` 不产出 Name("expr")。
+- `pipe_token_now_parses_after_hookup`：取代 v0.75.20 的「应报错」断言
+  ——pre-existing 限制已修复，锁定解析成功的新状态。
+
+### 验证
+- 端到端：`3 |> double |> double` = 12、`10 |> add(5)` = 15、
+  `1 + 2 |> double` = 6（优先级正确）exit 0。
+- Bool 算术边界（`3 == 3 |> double` → "Operands must be numbers"）为
+  运行时既有限制（直接 `double(true)` 同样报错），非 pipe 引入。
+- clippy `-D warnings` 0 / fmt 零 diff。
+- 全测试 682 通过（+2），4 failed = tier2 pre-existing（基线同样失败）。
+
 ## [v0.75.20] — 2026-08-01 — MirExpr 树对内收敛：删除死变体 Pipe/Grouping/Expr
 
 （去 AST 化收敛第 2 步，执行 docs/de-ast-boundary.md §3 增量路径的

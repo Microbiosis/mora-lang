@@ -202,15 +202,6 @@ impl MirExprLowerer {
                 Ok(dst)
             }
 
-            // ── Pipe ──
-            MirExprKind::Pipe { lhs, rhs } => {
-                let lhs_reg = self.lower_expr(lhs)?;
-                let rhs_reg = self.lower_expr(rhs)?;
-                let dst = self.alloc_reg();
-                self.emit(MirInst::Pipe(dst, lhs_reg, rhs_reg));
-                Ok(dst)
-            }
-
             // ── Collections ──
             MirExprKind::List(items) => {
                 let mut item_regs: Vec<Reg> = Vec::new();
@@ -486,12 +477,8 @@ impl MirExprLowerer {
             }
 
             // ── Expr (discard result) ──
-            MirExprKind::Expr(inner) => {
-                let r = self.lower_expr(inner)?;
-                self.emit(MirInst::Expr(r));
-                Ok(r)
-            }
-
+            // v0.75.20: MirExprKind::Expr 已删（死变体，parser 零构造）；
+            // MirInst::Expr 作为运算原语保留（手工构造可达，运行时语义不变）。
             // ── Sequence ──
             MirExprKind::Sequence(exprs) => {
                 let mut last_dst = 0;
@@ -613,10 +600,9 @@ impl MirExprLowerer {
                 let dst = self.alloc_reg();
                 self.emit(MirInst::Const(dst, crate::value::Value::Nil));
                 Ok(dst)
-            }
-
-            // ── Grouping (transparent) ──
-            MirExprKind::Grouping(inner) => self.lower_expr(inner),
+            } // ── Grouping (transparent) ──
+              // v0.75.20: MirExprKind::Grouping 已删（mir_group 恒等函数，
+              // 从未产出包裹节点；括号仅作优先级，parse 时不建节点）。
         }
     }
 }

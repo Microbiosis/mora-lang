@@ -54,10 +54,6 @@ fn walk_mir_expr_kind<F: FnMut(&MirExpr)>(kind: &crate::mir::expr::MirExprKind, 
                 walk_mir_expr(arg, visit);
             }
         }
-        MirExprKind::Pipe { lhs, rhs } => {
-            walk_mir_expr(lhs, visit);
-            walk_mir_expr(rhs, visit);
-        }
         MirExprKind::Closure { body, .. } => walk_mir_expr(body, visit),
         MirExprKind::FnDef { body, .. } => walk_mir_expr(body, visit),
         MirExprKind::Match { scrutinee, arms } => {
@@ -89,7 +85,6 @@ fn walk_mir_expr_kind<F: FnMut(&MirExpr)>(kind: &crate::mir::expr::MirExprKind, 
                 walk_mir_expr(part, visit);
             }
         }
-        MirExprKind::Grouping(inner) => walk_mir_expr(inner, visit),
         MirExprKind::LetBinding {
             value, init_body, ..
         } => {
@@ -129,7 +124,6 @@ fn walk_mir_expr_kind<F: FnMut(&MirExpr)>(kind: &crate::mir::expr::MirExprKind, 
             walk_mir_expr(index, visit);
             walk_mir_expr(value, visit);
         }
-        MirExprKind::Expr(inner) => walk_mir_expr(inner, visit),
         MirExprKind::TypeAlias { .. }
         | MirExprKind::EnumDef { .. }
         | MirExprKind::StructDef { .. }

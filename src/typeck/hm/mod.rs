@@ -257,7 +257,6 @@ impl HMInference {
                 method,
                 args,
             } => self.infer_method_call(receiver, method, args, expr.span),
-            MirExprKind::Pipe { lhs, rhs } => self.infer_pipe(lhs, rhs, expr.span),
             MirExprKind::Closure { params, body, .. } => {
                 self.infer_closure(params, body.as_ref(), expr.span)
             }
@@ -282,7 +281,6 @@ impl HMInference {
                 }
                 Ok(Type::String)
             }
-            MirExprKind::Grouping(inner) => self.infer_expr(inner),
             MirExprKind::LetBinding {
                 name,
                 type_hint,
@@ -337,7 +335,6 @@ impl HMInference {
                 Ok(Type::Nil)
             }
             MirExprKind::IndexAssign { .. } => Ok(Type::Nil),
-            MirExprKind::Expr(inner) => self.infer_expr(inner),
             // v0.55: top-level declarations — no scalar result type.
             MirExprKind::TypeAlias { .. }
             | MirExprKind::EnumDef { .. }
@@ -586,19 +583,8 @@ impl HMInference {
         Ok(return_ty)
     }
 
-    fn infer_pipe(
-        &mut self,
-        lhs: &MirExpr,
-        rhs: &MirExpr,
-        span: Span,
-    ) -> Result<Type, Vec<TypeError>> {
-        // lhs |> rhs desugars to rhs(lhs); rhs must be a callable whose
-        // first parameter matches lhs.
-        let _ = self.infer_expr(lhs)?;
-        let _ = self.infer_expr(rhs)?;
-        let _ = span;
-        Ok(Type::Any)
-    }
+    // v0.75.20: infer_pipe 已删——MirExprKind::Pipe 死变体移除，`|>` 在
+    // parse_pipe 脱糖为 Call（right(left)），HM 走 infer_call。
 
     fn infer_closure(
         &mut self,

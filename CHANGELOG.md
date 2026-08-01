@@ -2,6 +2,40 @@
 
 All notable changes to Mora will be documented in this file.
 
+## [v0.75.27] — 2026-08-01 — 审计收尾：DAG 缓存解耦 + Cascades cost_gain/memo 激活
+
+（三路审计剩余项的收尾。三项中一项经实证**否决**——见下。）
+
+### 否决 — P2a dynamic_sends → per-target 队列（审计建议不采纳）
+- 实证：`SendTask { target_node, input }` **已是 per-target**；pregel 消费端按
+  target 过滤（mod.rs:617 `any(|s| s.target_node == *node)`）与分组投递
+  （:1037 `entry(send.target_node)`）。`h_receive` 的「读环境变量」是 BSP
+  设计意图（v0.70 注释：values flow through channels, not blocking queues）。
+- 否决理由：改 HashMap 是重构存储形态不改行为；`SendTask` 是 checkpoint
+  持久化单元；为改而改违反最小修改原则。
+
+### Changed — P2b DAG_CACHE 全局单例解耦（src/mir/interp.rs）
+- 新增 `run_mir_with_signal_cached(func, interp, env, dag_cache)` 可注入
+  缓存变体；`run_mir_with_signal` 委托给它（默认全局缓存）。
+- 意义：测试/多租户可传独立 `DagCache` 隔离缓存状态（跨测试泄漏的注入
+  点）；全局共享行为不变（pregel 并行 worker 共享是特性）。
+
+### Changed — P3 Cascades 等价计划枚举（src/mir/optimize/search.rs）
+- **`RewriteRule::cost_gain()` 接入**：数据驱动 gain 相同时用规则作者的
+  静态估计打破平局——该 trait 方法 v0.75.5 引入后**从未被消费**（出生即死，
+  与 ai_infra 同类），本次激活。
+- **等价重写 memo**（Cascades Group 记忆内核）：重写是纯函数（ctx 空），
+  同一 (规则, 指令形态) 在 body 内多次出现时只计算一次，跨轮复用；
+  行为等价（memo 只消除重复计算，不改变最终优化结果）。
+
+### Added — 测试
+- `test_rewrite_memo_reuses_equivalent_shapes`：重复形态 body 收敛到与
+  单形态控制组一致的 cost（行为等价性守卫）。
+
+### 验证
+- 全测试 **695 通过 / 0 失败**（+1）。
+- clippy `-D warnings` 0 / fmt 零 diff。
+
 ## [v0.75.26] — 2026-08-01 — P0 语义定夺：StreamFor 死原语移除（方向 1/2/5 钥匙）
 
 （三路审计共识的 P0：StreamFor 是「悬挂指令」——`MirInst::StreamFor {

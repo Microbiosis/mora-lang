@@ -185,17 +185,17 @@ pub enum MirInst {
     },
 
     /// α.4: send — 发送值到 worker channel（target 是 channel 名称）。
+    /// v0.75.31: Send 保留（写独立 dynamic_sends 缓冲，不污染变量环境；
+    /// pregel 引擎的 pending_sends/combiner/ADVANCE 投递机制是活的）。
     Send {
         value: Reg,
         target: String,
     },
 
-    /// α.4: receive — 从 worker channel 接收值并绑定到 var。
-    Receive {
-        var: String,
-        source: String,
-    },
-
+    // v0.75.31: Receive 已删除 — 语义漂移的死原语：h_receive 读共享
+    // Environment 当消息源（把「变量作用域」当「消息队列」）；MirInst::
+    // Receive 全仓零构造（src+tests）。pregel 的接收由引擎 input_<channel>
+    // 注入实现（非 Receive 指令）。Message 语义统一由引擎投递。
     /// α.4: rollback — 触发事务回滚（返回 "Transaction rolled back" 错误）。
     Rollback,
 

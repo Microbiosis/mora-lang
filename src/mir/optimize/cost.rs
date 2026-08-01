@@ -51,10 +51,7 @@ impl TokenEstimate {
             Value::String(s) => (s.chars().count() / 4 + 1) as u32,
             Value::List(items) => {
                 // 列表：2 (括号) + sum(items) + 1 per separator
-                2 + items
-                    .iter()
-                    .map(|v| self.value_cost(v))
-                    .sum::<u32>()
+                2 + items.iter().map(|v| self.value_cost(v)).sum::<u32>()
                     + items.len().saturating_sub(1) as u32
             }
             Value::Dict(pairs) => {
@@ -116,24 +113,32 @@ impl CostModel for TokenEstimate {
             // MethodCall / Pipe
             MirInst::Pipe(_, _, _) => 10,
             // 匹配
-            MirInst::MatchExpr { val, arms } => {
-                5 + arms.len() as u32 * 10
-            }
+            MirInst::MatchExpr { val: _, arms } => 5 + arms.len() as u32 * 10,
             MirInst::MatchArm { cond_reg, body } => {
                 let body_cost = body.body.iter().map(|i| self.inst_cost(i)).sum::<u32>();
-                if cond_reg.is_some() { body_cost + 5 } else { body_cost }
+                if cond_reg.is_some() {
+                    body_cost + 5
+                } else {
+                    body_cost
+                }
             }
             // With/Stream
             MirInst::WithConfig { bindings, body, .. } => {
                 bindings.len() as u32 * 5 + body.body.iter().map(|i| self.inst_cost(i)).sum::<u32>()
             }
-            MirInst::StreamFor { prompt_reg: _, var: _, body } => {
-                20 + body.body.iter().map(|i| self.inst_cost(i)).sum::<u32>()
-            }
+            MirInst::StreamFor {
+                prompt_reg: _,
+                var: _,
+                body,
+            } => 20 + body.body.iter().map(|i| self.inst_cost(i)).sum::<u32>(),
             // 事务
             MirInst::Transaction { body, compensation } => {
                 let body_sum = body.body.iter().map(|i| self.inst_cost(i)).sum::<u32>();
-                let comp_sum = compensation.body.iter().map(|i| self.inst_cost(i)).sum::<u32>();
+                let comp_sum = compensation
+                    .body
+                    .iter()
+                    .map(|i| self.inst_cost(i))
+                    .sum::<u32>();
                 body_sum + comp_sum + 20
             }
             MirInst::Rollback | MirInst::Commit => 1,
@@ -141,12 +146,17 @@ impl CostModel for TokenEstimate {
             MirInst::Send { .. } => 3,
             MirInst::Receive { .. } => 3,
             // Worker
-            MirInst::Worker { body, .. } => body.body.iter().map(|i| self.inst_cost(i)).sum::<u32>() + 5,
+            MirInst::Worker { body, .. } => {
+                body.body.iter().map(|i| self.inst_cost(i)).sum::<u32>() + 5
+            }
             // I/O
             MirInst::Import(_) => 100, // 文件导入开销
-            MirInst::Save { .. } | MirInst::Load { .. }
-            | MirInst::ReadFile { .. } | MirInst::WriteFile { .. }
-            | MirInst::AppendFile { .. } | MirInst::ReadBytesFile { .. }
+            MirInst::Save { .. }
+            | MirInst::Load { .. }
+            | MirInst::ReadFile { .. }
+            | MirInst::WriteFile { .. }
+            | MirInst::AppendFile { .. }
+            | MirInst::ReadBytesFile { .. }
             | MirInst::WriteBytesFile { .. } => 50,
             // 编排
             MirInst::Orchestrate { kind, .. } => {
@@ -179,8 +189,7 @@ impl CostModel for TokenEstimate {
             }
             // Token 记录：按 content 长度计费
             MirInst::RecordTokens { input, output } => {
-                (input.chars().count() / 4 + 1) as u32
-                    + (output.chars().count() / 4 + 1) as u32
+                (input.chars().count() / 4 + 1) as u32 + (output.chars().count() / 4 + 1) as u32
             }
             // Prompt/Document section：递归 body
             MirInst::PromptSection { body, .. } => {
@@ -192,9 +201,7 @@ impl CostModel for TokenEstimate {
             // DynTrait 包装：轻量运行时操作
             MirInst::DynTrait { .. } => 3,
             // Eval 断言：按 expects 计费
-            MirInst::Eval { expects, .. } => {
-                5 + expects.len() as u32 * 3
-            }
+            MirInst::Eval { expects, .. } => 5 + expects.len() as u32 * 3,
             // 未实现/无操作指令
             MirInst::Route(_) => 1,
             MirInst::Label(_) => 0,
@@ -392,10 +399,13 @@ mod tests {
     #[test]
     fn test_definitions_cost_zero() {
         let cost = TokenEstimate;
-        assert_eq!(cost.inst_cost(&MirInst::TypeAlias {
-            name: "T".to_string(),
-            target: "Int".to_string(),
-        }), 0);
+        assert_eq!(
+            cost.inst_cost(&MirInst::TypeAlias {
+                name: "T".to_string(),
+                target: "Int".to_string(),
+            }),
+            0
+        );
         assert_eq!(cost.inst_cost(&MirInst::Label(0)), 0);
     }
 }

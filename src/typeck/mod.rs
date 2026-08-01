@@ -904,67 +904,6 @@ impl TypeChecker {
 // 辅助函数
 // ===================================================================
 
-/// 给定方法名和接收者类型，返回方法的返回类型
-fn method_return_type(receiver: &Type, method: &str) -> Type {
-    // v0.x: list<T> 的方法返回类型，元素类型从 receiver 提取
-    if let Type::List(elem) = receiver {
-        match method {
-            "map" | "filter" => return Type::List(elem.clone()),
-            "push" => return Type::List(elem.clone()),
-            // reduce/pop/get 的返回类型不依赖元素类型，仍为 Any
-            "reduce" | "pop" | "get" => return Type::Union(vec![]),
-            "len" => return Type::Float,
-            _ => {} // fall through to fallback
-        }
-    }
-    // v0.x: dict<K, V> 的方法返回类型
-    if let Type::Dict(k, v) = receiver {
-        match method {
-            // v0.35 (P0-C3): runtime may return Nil on missing key, so the
-            // static return type must reflect that: V | Nil.
-            "get" => return Type::Union(vec![v.as_ref().clone(), Type::Nil]),
-            "set" => return Type::Dict(k.clone(), v.clone()),
-            "keys" => return Type::List(k.clone()),
-            "values" => return Type::List(v.clone()),
-            "len" => return Type::Float,
-            _ => {} // fall through to fallback
-        }
-    }
-    method_return_type_fallback(receiver, method)
-}
-
-/// 通用方法返回类型（不依赖 list/dict 元素类型）
-fn method_return_type_fallback(receiver: &Type, method: &str) -> Type {
-    match (receiver, method) {
-        (Type::String, "len") => Type::Float,
-        (Type::String, "upper" | "lower" | "trim" | "replace") => Type::String,
-        (Type::String, "starts_with" | "ends_with" | "contains") => Type::Bool,
-        (Type::String, "split") => Type::List(Box::new(Type::String)),
-        (Type::Conversation, "chat") => Type::Union(vec![]),
-        (Type::Conversation, "history" | "len") => Type::List(Box::new(Type::Union(vec![]))),
-        (Type::Conversation, "model") => Type::String,
-        // v0.06: ai.chat(prompt, cfg) — 虚线调用, 接收者 ai (AiModule) 的方法
-        (Type::AiModule, "chat") => Type::AiResult,
-        // v0.06: AiConfig 链式方法 (builder pattern)
-        (Type::AiConfig, "model") => Type::AiConfig,
-        (Type::AiConfig, "temperature") => Type::AiConfig,
-        (Type::AiConfig, "max_tokens") => Type::AiConfig,
-        (Type::AiConfig, "system") => Type::AiConfig,
-        (Type::AiConfig, "budget") => Type::AiConfig,
-        // v0.06.3: Router 链式方法
-        (Type::Router, "route") => Type::Router,
-        (Type::Router, "listen") => Type::Nil,
-        // v0.06.6: McpServer 链式方法
-        (Type::McpServer, "tool") => Type::McpServer,
-        (Type::McpServer, "serve") => Type::Nil,
-        // v0.06.3: HttpRequest 方法
-        (Type::HttpRequest, "json") => Type::Union(vec![]), // ~Result<T, ParseError>
-        (Type::Union(_), _) => Type::Union(vec![]),
-        (_, "len") => Type::Float, // 通用 len
-        _ => Type::Union(vec![]),
-    }
-}
-
 /// v0.10 修复: 在 type hint 字符串中替换 trait 泛型参数名
 ///   `substitute_type_hint("T", {T: number})` → `Some("float")`
 ///   `substitute_type_hint("Boxed<T>", {T: number})` → `Some("Boxed<number>")`

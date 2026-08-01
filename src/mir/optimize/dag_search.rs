@@ -158,19 +158,19 @@ pub fn dag_search(
             }
             let node = &dag.nodes[node_id];
             for rule in rules {
-                if rule.matches(node_id, node, dag) {
-                    if let Some(rw) = rule.rewrite(node_id, dag) {
-                        // Compute actual cost delta
-                        let old_cost = rw
-                            .removed
-                            .iter()
-                            .map(|&id| node_cost(&dag.nodes[id], cost))
-                            .sum::<u32>();
-                        let new_cost = rw.added.iter().map(|n| dag_node_cost(n, cost)).sum::<u32>();
-                        let delta = old_cost as i32 - new_cost as i32;
-                        if delta > best.as_ref().map(|b| b.2).unwrap_or(0) {
-                            best = Some((node_id, rw, delta));
-                        }
+                if rule.matches(node_id, node, dag)
+                    && let Some(rw) = rule.rewrite(node_id, dag)
+                {
+                    // Compute actual cost delta
+                    let old_cost = rw
+                        .removed
+                        .iter()
+                        .map(|&id| node_cost(&dag.nodes[id], cost))
+                        .sum::<u32>();
+                    let new_cost = rw.added.iter().map(|n| dag_node_cost(n, cost)).sum::<u32>();
+                    let delta = old_cost as i32 - new_cost as i32;
+                    if delta > best.as_ref().map(|b| b.2).unwrap_or(0) {
+                        best = Some((node_id, rw, delta));
                     }
                 }
             }

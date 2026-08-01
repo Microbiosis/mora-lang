@@ -339,10 +339,9 @@ impl HMInference {
                 self.constraints
                     .push(Constraint::Eq(Box::new(left_ty), Box::new(right_ty)));
                 Ok(Type::Bool)
-            }
-            // v0.55: Or/And are MirExprKind variants (short-circuit),
-            // handled directly in infer_expr, not BinaryOp variants.
-            _ => Ok(result_ty),
+            } // v0.55: Or/And are MirExprKind variants (short-circuit),
+              // handled directly in infer_expr, not BinaryOp variants.
+              // BinaryOp 已穷尽（11 变体全部覆盖）— 无需 `_` 兜底。
         }
     }
 

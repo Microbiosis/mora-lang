@@ -35,6 +35,11 @@ pub struct HttpRequest {
 /// 动态路由条目: (pattern, handler) — pattern 支持 :param
 pub type RouteTable = Arc<tokio::sync::RwLock<HashMap<(String, String), Value>>>;
 
+/// handler 执行超时（秒）。v0.50.0 P0-4：handler 内 Mora 代码阻塞上限，
+/// 超时返回 504。Mora 脚本 I/O（web.fetch 等）含自身 60s 读超时，此值
+/// 作为 handler 总墙钟上限。
+const HANDLER_TIMEOUT_SECS: u64 = 60;
+
 /// v0.06.4: 尝试匹配路径参数 — 返回 Some(params) 或 None
 fn match_path_pattern(pattern: &str, actual: &str) -> Option<HashMap<String, String>> {
     let pat_segs: Vec<&str> = pattern.trim_matches('/').split('/').collect();
@@ -203,14 +208,14 @@ async fn handle_connection(
             let handle = tokio::task::spawn_blocking(move || {
                 invoke_handler(handler_value, &req_for_task, interp_clone)
             });
-            match timeout(Duration::from_secs(60), handle).await {
+            match timeout(Duration::from_secs(HANDLER_TIMEOUT_SECS), handle).await {
                 Ok(Ok(Ok(value))) => {
                     let json = value_to_json_string(&value);
                     (200, json)
                 }
                 Ok(Ok(Err(e))) => (500, json_error(&format!("handler error: {}", e))),
                 Ok(Err(_)) => (500, json_error("handler panicked")),
-                Err(_) => (504, json_error("handler timeout after 60s")),
+                Err(_) => (504, json_error("handler timeout")),
             }
         }
         None => (

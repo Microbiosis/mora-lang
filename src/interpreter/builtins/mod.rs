@@ -3578,7 +3578,7 @@ mod tests_v044_orchestrate_validate {
     /// v0.44.0: orchestrate block syntax validation (ParserV3 path)
     fn parse(src: &str) -> Vec<MirExpr> {
         let tokens = Lexer::new(src).scan_tokens();
-        let mut parser = ParserV3::new(tokens);
+        let parser = ParserV3::new(tokens);
         parser
             .parse()
             .unwrap_or_else(|e| panic!("ParserV3 failed: {:?}", e))

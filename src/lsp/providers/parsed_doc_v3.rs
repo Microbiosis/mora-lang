@@ -19,8 +19,8 @@ pub fn parsed_doc_v3(
 ) -> Option<(String, Vec<MirExpr>)> {
     let doc = docs.get(uri)?;
     // Parse MirExpr from text (no cache in DocumentState yet)
-    use crate::parser_v3::ParserV3;
     use crate::lexer::Lexer;
+    use crate::parser_v3::ParserV3;
     let tokens = Lexer::new(&doc.text).scan_tokens();
     let parser = ParserV3::new(tokens);
     let exprs = parser.parse().ok()?;
@@ -110,8 +110,7 @@ fn walk_mir_expr_kind<F: FnMut(&MirExpr)>(kind: &crate::mir::expr::MirExprKind, 
             walk_mir_expr(cond, visit);
             walk_mir_expr(body, visit);
         }
-        MirExprKind::Or { left, right }
-        | MirExprKind::And { left, right } => {
+        MirExprKind::Or { left, right } | MirExprKind::And { left, right } => {
             walk_mir_expr(left, visit);
             walk_mir_expr(right, visit);
         }
@@ -120,8 +119,7 @@ fn walk_mir_expr_kind<F: FnMut(&MirExpr)>(kind: &crate::mir::expr::MirExprKind, 
                 walk_mir_expr(v, visit);
             }
         }
-        MirExprKind::Break(_)
-        | MirExprKind::Continue(_) => {}
+        MirExprKind::Break(_) | MirExprKind::Continue(_) => {}
         MirExprKind::IndexAssign {
             object,
             index,
@@ -137,13 +135,7 @@ fn walk_mir_expr_kind<F: FnMut(&MirExpr)>(kind: &crate::mir::expr::MirExprKind, 
         | MirExprKind::StructDef { .. }
         | MirExprKind::Import(_)
         | MirExprKind::MacroDef { .. }
-        | MirExprKind::Sequence(_)
-        | MirExprKind::Orchestrate { .. }
-        | MirExprKind::Prompt { .. }
-        | MirExprKind::Return(_)
-        | MirExprKind::Break(_)
-        | MirExprKind::Continue(_) => {},
-        _ => {}
+        | MirExprKind::Sequence(_) => {}
     }
 }
 
@@ -162,7 +154,7 @@ fn walk_mir_orchestrate(
                     visit(v);
                 }
                 if let Some(cfg) = &a.with_config {
-                    for (_, e) in cfg {
+                    for e in cfg.values() {
                         visit(e);
                     }
                 }
@@ -177,7 +169,7 @@ fn walk_mir_orchestrate(
                     visit(v);
                 }
                 if let Some(cfg) = &agent.with_config {
-                    for (_, e) in cfg {
+                    for e in cfg.values() {
                         visit(e);
                     }
                 }
@@ -231,10 +223,10 @@ pub fn collect_references_v3(exprs: &[MirExpr], name: &str) -> Vec<crate::common
 
 fn collect_references_in_expr(expr: &MirExpr, name: &str, out: &mut Vec<crate::common::Span>) {
     walk_mir_expr(expr, &mut |e| {
-        if let crate::mir::expr::MirExprKind::Variable(n) = &e.kind {
-            if n == name {
-                out.push(e.span);
-            }
+        if let crate::mir::expr::MirExprKind::Variable(n) = &e.kind
+            && n == name
+        {
+            out.push(e.span);
         }
     });
 }

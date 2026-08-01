@@ -56,6 +56,9 @@ pub struct MirFunction {
 }
 
 /// MIR 指令（α.0 + α.1 子集）
+// 允许 large_enum_variant：ImplDef / SkillDef 携带完整函数体（Vec<MirFunction> /
+// Option<MirFunction>），属于 IR 设计，改 Box 需大面积改构造/匹配，收益不高。
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq)]
 pub enum MirInst {
     // ── 值指令（产生结果到 dst 寄存器）──

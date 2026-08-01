@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::runtime::types::{AiConfigValue, ToolDef};
-use crate::value::{Environment, MergeStrategy, Value};
+use crate::value::{Environment, MergeStrategy};
 
 /// 语言执行必需的薄核心。
 /// 注：ToolDef 不含 Debug，所以 CoreRuntime 不 derive Debug。
@@ -57,6 +57,7 @@ impl Default for CoreRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::value::Value;
 
     #[test]
     fn core_default_globals_and_env_share() {

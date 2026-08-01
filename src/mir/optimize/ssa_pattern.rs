@@ -89,17 +89,23 @@ impl SsaBindings {
     }
 
     pub fn get_value(&self, key: &str) -> Option<&Value> {
-        self.bindings.iter().find(|(k, _)| k == key).and_then(|(_, v)| match v {
-            SsaBindingValue::Value(v) => Some(v),
-            _ => None,
-        })
+        self.bindings
+            .iter()
+            .find(|(k, _)| k == key)
+            .and_then(|(_, v)| match v {
+                SsaBindingValue::Value(v) => Some(v),
+                _ => None,
+            })
     }
 
     pub fn get_op(&self, key: &str) -> Option<&BinaryOp> {
-        self.bindings.iter().find(|(k, _)| k == key).and_then(|(_, v)| match v {
-            SsaBindingValue::Op(o) => Some(o),
-            _ => None,
-        })
+        self.bindings
+            .iter()
+            .find(|(k, _)| k == key)
+            .and_then(|(_, v)| match v {
+                SsaBindingValue::Op(o) => Some(o),
+                _ => None,
+            })
     }
 }
 
@@ -166,7 +172,7 @@ impl SsaRegMatcher {
 }
 
 impl ValueMatcher {
-    fn match_and_bind(&self, value: &Value) -> Option<String> {
+    fn match_and_bind(&self, _value: &Value) -> Option<String> {
         match self {
             ValueMatcher::Any => None,
             ValueMatcher::Bind(name) => Some(name.clone()),
@@ -176,7 +182,7 @@ impl ValueMatcher {
 }
 
 impl OpMatcher {
-    fn match_and_bind(&self, op: &BinaryOp) -> Option<String> {
+    fn match_and_bind(&self, _op: &BinaryOp) -> Option<String> {
         match self {
             OpMatcher::Any => None,
             OpMatcher::Bind(name) => Some(name.clone()),
@@ -205,12 +211,11 @@ impl<'a> SsaConstFoldingRule<'a> {
     /// 返回 Some(new_inst) 表示应替换为 new_inst；
     /// 返回 None 表示无可应用重写。
     pub fn try_fold(&self, inst: &SsaInst) -> Option<SsaInst> {
-        if let SsaInst::BinaryOp(dst, l, op, r) = inst {
-            if let (Some(lv), Some(rv)) = (self.const_values.get(l), self.const_values.get(r)) {
-                if let Ok(v) = crate::flow::eval_binary(lv.clone(), op, rv.clone()) {
-                    return Some(SsaInst::Const(*dst, v));
-                }
-            }
+        if let SsaInst::BinaryOp(dst, l, op, r) = inst
+            && let (Some(lv), Some(rv)) = (self.const_values.get(l), self.const_values.get(r))
+            && let Ok(v) = crate::flow::eval_binary(lv.clone(), op, rv.clone())
+        {
+            return Some(SsaInst::Const(*dst, v));
         }
         None
     }
@@ -221,7 +226,7 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
-    fn make_const_folding(const_values: &HashMap<SsaReg, Value>) -> SsaConstFoldingRule {
+    fn make_const_folding(const_values: &HashMap<SsaReg, Value>) -> SsaConstFoldingRule<'_> {
         SsaConstFoldingRule::new(const_values)
     }
 

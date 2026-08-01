@@ -8,6 +8,11 @@ use crate::runtime::types::LruCache;
 use crate::schedule::Scheduler;
 use crate::value::Value;
 
+/// 字符串驻留 LRU 容量上限（v0.22 起；50k 条 ≈ 脚本生命周期内常量字符串去重）
+const STRING_INTERNER_CAPACITY: usize = 50_000;
+/// AI 调用结果 LRU 缓存容量上限（v0.49.0 C1；10k 条 ≈ 长会话内重复 prompt 命中）
+const AI_CACHE_CAPACITY: usize = 10_000;
+
 /// v0.52 ADR-001: InfraRuntime — BC9
 ///
 /// 注：Recorder 不实现 Clone（pre-existing，per-thread 状态）。
@@ -37,8 +42,8 @@ impl Default for InfraRuntime {
     fn default() -> Self {
         Self {
             recorder: Recorder::new_off(),
-            string_interner: Arc::new(Mutex::new(LruCache::new(50000))),
-            ai_cache: Arc::new(Mutex::new(LruCache::new(10000))),
+            string_interner: Arc::new(Mutex::new(LruCache::new(STRING_INTERNER_CAPACITY))),
+            ai_cache: Arc::new(Mutex::new(LruCache::new(AI_CACHE_CAPACITY))),
             bus: EventBus::new(),
             scheduler: Scheduler::default(),
         }

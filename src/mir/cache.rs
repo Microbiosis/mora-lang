@@ -38,8 +38,10 @@ pub fn global_dag_cache() -> &'static DagCache {
 
 /// `MirFunction` → 优化后 `MirDag` 的缓存。
 /// 缓存项持有 func 强引用（见模块注释，v0.75.11 指针复用修复）。
+type DagCacheEntry = (Arc<MirFunction>, Arc<MirDag>);
+
 pub struct DagCache {
-    entries: Mutex<HashMap<usize, (Arc<MirFunction>, Arc<MirDag>)>>,
+    entries: Mutex<HashMap<usize, DagCacheEntry>>,
 }
 
 impl DagCache {
@@ -76,6 +78,14 @@ impl DagCache {
             .lock()
             .expect("DagCache entries poisoned")
             .len()
+    }
+
+    /// 当前缓存是否为空（测试/诊断用）。
+    pub fn is_empty(&self) -> bool {
+        self.entries
+            .lock()
+            .expect("DagCache entries poisoned")
+            .is_empty()
     }
 
     /// 测试辅助：清空缓存。

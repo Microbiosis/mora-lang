@@ -31,12 +31,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::checkpoint::{Checkpoint, CheckpointSaver, SendTask};
-use crate::mir::MirFunction;
 use crate::mir::expr::MirExpr;
-use crate::mir::expr::{
-    MirAgentDef, MirEdgeDef, MirInterruptPoint, MirInterruptWhen, MirPregelConfig, MirReducerKind,
-    MirStateChannel,
-};
+use crate::mir::expr::{MirInterruptPoint, MirInterruptWhen, MirPregelConfig, MirReducerKind};
 use crate::mir::host::MirHost;
 use crate::value::{Conflict, MergeStrategy, Value};
 
@@ -269,7 +265,7 @@ impl MirPregelEngine {
             .iter()
             .map(|ch| (ch.name.clone(), ch.reducer.clone()))
             .collect();
-        let aggregator_initial: HashMap<String, Value> = config
+        let _aggregator_initial: HashMap<String, Value> = config
             .aggregators
             .iter()
             .map(|a| (a.name.clone(), a.initial.clone()))
@@ -989,9 +985,7 @@ impl MirPregelEngine {
                     break;
                 }
             }
-            if let Err(e) = exec_result {
-                return Err(e);
-            }
+            exec_result?;
 
             // ---------- 3. UPDATE ----------
             for (_node, channel, value) in writes {
@@ -1094,22 +1088,21 @@ impl MirPregelEngine {
             self.stats.steps += 1;
 
             // v0.63: Auto-save checkpoint if configured
-            if let Some(ref cp_cfg) = self.config.checkpoint {
-                if let Some(interval) = cp_cfg.interval {
-                    if self.current_step % interval as usize == 0 {
-                        let cp = self.build_checkpoint();
-                        if let Some(ref saver) = self.saver {
-                            let thread_id = cp.thread_id.clone();
-                            saver.save(&thread_id, &cp)?;
-                            // v0.74: Retention — prune oldest checkpoints
-                            // beyond max_checkpoints (default: keep all).
-                            if let Some(max_cp) = cp_cfg.max_checkpoints {
-                                let mut ids = saver.list(&thread_id)?;
-                                while ids.len() > max_cp {
-                                    let oldest = ids.remove(0);
-                                    saver.delete(&thread_id, &oldest)?;
-                                }
-                            }
+            if let Some(ref cp_cfg) = self.config.checkpoint
+                && let Some(interval) = cp_cfg.interval
+                && self.current_step.is_multiple_of(interval as usize)
+            {
+                let cp = self.build_checkpoint();
+                if let Some(ref saver) = self.saver {
+                    let thread_id = cp.thread_id.clone();
+                    saver.save(&thread_id, &cp)?;
+                    // v0.74: Retention — prune oldest checkpoints
+                    // beyond max_checkpoints (default: keep all).
+                    if let Some(max_cp) = cp_cfg.max_checkpoints {
+                        let mut ids = saver.list(&thread_id)?;
+                        while ids.len() > max_cp {
+                            let oldest = ids.remove(0);
+                            saver.delete(&thread_id, &oldest)?;
                         }
                     }
                 }
@@ -1177,8 +1170,9 @@ impl MirPregelEngine {
             None => match reducer {
                 MirReducerKind::Merge(merge_expr) => {
                     // v0.62: Execute the merge body with `current` and `incoming`.
-                    let merge_fn = crate::mir::lower::lower_mir_exprs(&[merge_expr.clone()])
-                        .map_err(|e| format!("Pregel merge body lowering failed: {}", e))?;
+                    let merge_fn =
+                        crate::mir::lower::lower_mir_exprs(std::slice::from_ref(&merge_expr))
+                            .map_err(|e| format!("Pregel merge body lowering failed: {}", e))?;
                     let mut merge_env = interpreter.environment().lock().clone();
                     merge_env.define("current".into(), current.unwrap_or(Value::Nil), false);
                     merge_env.define("incoming".into(), value, false);
@@ -1815,7 +1809,6 @@ mod tests {
             ],
             master_compute: None,
         });
-        let mut interp = crate::interpreter::Interpreter::new();
 
         // Max: contribute 5 then 42 → 42
         engine.aggregator_contribute("hi", Value::Int(5)).unwrap();
@@ -2120,10 +2113,6 @@ mod tests {
         assert!(
             engine.stats().per_agent_ms.contains_key("b"),
             "per_agent_ms 应记录 agent b"
-        );
-        assert!(
-            engine.stats().per_agent_ms["a"] >= 0,
-            "a 的耗时记录不应缺失"
         );
     }
 

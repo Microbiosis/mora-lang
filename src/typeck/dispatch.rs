@@ -240,17 +240,9 @@ fn method_signature_builtin(receiver: &Type, method: &str) -> Option<Signature> 
             vec![("self".to_string(), Type::AiModule)],
             Type::AiResult,
         )),
-        (Type::AiConfig, m)
-            if matches!(
-                m,
-                "model" | "temperature" | "max_tokens" | "system" | "budget"
-            ) =>
-        {
-            Some(Signature::new(
-                vec![("self".to_string(), Type::AiConfig)],
-                Type::AiConfig,
-            ))
-        }
+        (Type::AiConfig, "model" | "temperature" | "max_tokens" | "system" | "budget") => Some(
+            Signature::new(vec![("self".to_string(), Type::AiConfig)], Type::AiConfig),
+        ),
         (Type::Router, "route") => Some(Signature::new(
             vec![("self".to_string(), Type::Router)],
             Type::Router,

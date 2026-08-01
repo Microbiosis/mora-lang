@@ -8,9 +8,9 @@
 //! MIR 路径，不依赖任何 AST 活跃调用方。
 
 use mora::interpreter::Interpreter;
-use mora::mir::{MirFunction, MirInst};
 use mora::mir::interp::{run_main_task, run_mir};
 use mora::mir::lower::{lower_mir_exprs, typecheck_mir_exprs};
+use mora::mir::{MirFunction, MirInst};
 use mora::value::Value;
 
 /// 公共执行入口：parse → typeck → lower → run_mir → run_main_task
@@ -157,7 +157,10 @@ fn runtime_transaction_rollback_path_via_mir() {
     // h_transaction 执行 compensation 并返回 "Transaction rolled back"。
     let body = mora::mir::MirFunction {
         params: Vec::new(),
-        body: vec![MirInst::Const(0, mora::value::Value::Int(1)), MirInst::Rollback],
+        body: vec![
+            MirInst::Const(0, mora::value::Value::Int(1)),
+            MirInst::Rollback,
+        ],
         n_regs: 1,
     };
     let compensation = mora::mir::MirFunction {

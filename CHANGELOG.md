@@ -2,6 +2,49 @@
 
 All notable changes to Mora will be documented in this file.
 
+## [v0.75.28] — 2026-08-01 — 方向 1/2/4/5/7 剩余项裁决与落地
+
+（三路审计剩余项：信号传播、变量级增量、资源槽位、约束原语。经实证后
+两项落地、三项否决——每项裁决都有源码证据。）
+
+### 落地 — 方向 2 变量级增量重算（行为守卫 + 实证）
+- **实证**：DagExecMemo 的「输入值相等跳过」已实现变量级增量——
+  Var（非纯，每次重跑读 env）→ 受影响下游纯节点输入变 → 重算；
+  未受影响下游输入相等 → memo 跳过。白名单保守排除 Var 是正确设计。
+- 新增 `dag_integration.rs` 守卫测试 `memo_incremental_reruns_affected_
+  dependencies_only`：改 env 依赖后第二次 run——未受影响下游被跳过
+  （delta_skipped > 0）且受影响链重算（delta_executed > 0）。
+
+### 落地 — 方向 7 约束原语骨架激活（master_compute）
+- **实证**：master_compute（v0.72 每超步全局协调钩子）+ aggregators +
+  vote_to_halt 构成「每步评估目标 + 收敛」骨架，但 master_compute 在全部
+  测试里为 None（零激活），且其**失败被 eprintln warn 吞掉**（协调钩子
+  失败引擎静默跑错语义）。
+- **修复**：master_compute 失败改为 `?` 传播（错误不再吞——与吞异常审计
+  约束一致）。
+- 新增激活守卫测试 `master_compute_runs_and_failure_propagates`：正常
+  钩子引擎成功；失败钩子错误冒泡。
+
+### 否决 — 方向 1 信号传播（双向赋值）
+- 实证：增量重算已由「输入值驱动」实现（方向 2 落地项）；EDA 式「变量
+  值变化 → 依赖表达式自动重求值」的实时双向传播需全新执行模型
+  （信号网 + 时钟），非当前线性/DAG 执行器的增量改造。不新建 watchers
+  （最小修改原则）。
+
+### 否决 — 方向 4 资源槽位（FPGA 列表调度扩展）
+- 实证：`parallelism` 即槽位上限（`WorkerPool::new(parallelism)` = N 逻辑
+  单元，共享队列排队 = 有限资源 + 排队）；LJF 排序 v0.75.7 已实现
+  （注释明言「FPGA list-scheduling 精神」）。扩展资源约束模型
+  （LUT/BRAM 槽位）超出当前 worker 语义，为改而改。
+
+### 否决 — 方向 5 DSP 波导（时间步进流式）
+- 依据 v0.75.26 定夺：StreamFor 已删，「流式语义若需 MIR 指令级支持，
+  重新设计而非复活旧形状」；AI 流式已有 `stream: true` 参数路径。
+
+### 验证
+- 全测试 **697 通过 / 0 失败**（+2：memo 增量守卫 + master_compute 激活）。
+- clippy `-D warnings` 0 / fmt 零 diff。
+
 ## [v0.75.27] — 2026-08-01 — 审计收尾：DAG 缓存解耦 + Cascades cost_gain/memo 激活
 
 （三路审计剩余项的收尾。三项中一项经实证**否决**——见下。）

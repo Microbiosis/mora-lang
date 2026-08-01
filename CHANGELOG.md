@@ -2,6 +2,36 @@
 
 All notable changes to Mora will be documented in this file.
 
+## [v0.75.22] — 2026-08-01 — tier2 4 个 pre-existing 测试修复（常量折叠 vs 无优化断言）
+
+（此前全测试基线「678/680/682 通过 + 4 failed」的 4 个失败全部清零——
+本 commit 后全测试首次全绿。）
+
+### 根因（实证）
+4 个失败测试断言的指令形态（`BinaryOp`/`JumpIfNot`/`Jump`）在 **v0.55 时代
+「无优化」的假设下编写**，但 v0.58 引入 Cascades 优化 pass（`lower_mir_exprs`
+内 `apply_rules`）后，**常量输入会被常量折叠**：
+
+- `1 + 2` → 折叠为 `Const(3.0)`（无 `BinaryOp`）
+- `if true { 1 } else { 2 }` → 折叠为直落 `Assign`（无 `JumpIfNot`/`Jump`）
+- `while true { 1 }` → 折叠为 `Const(1) + Jump(0)`（无 `JumpIfNot`）
+
+dump 实证：变量条件（`a + b` / `let c = true; if c` / `let i = 0; while i < 5`）
+时指令形态全部保留——断言语义正确，问题仅在测试用了常量输入。
+
+### Changed — tests/tier2_mir_expr_pipeline.rs（4 个测试）
+- `v3_lower_binary_produces_binary_op`：`1 + 2` → `let a = 1; let b = 2; a + b`
+- `v3_lower_if_produces_jump_instructions`：`if true` → `let c = true; if c`
+- `v3_lower_while_produces_loop_instructions`：`while true` → `while i < 5`
+- `v3_lower_while_produces_jumpifnot`：同上
+
+各测试补注释说明根因（常量折叠导致断言失败的机制），防止未来误判为
+回归。
+
+### 验证
+- 全测试 **686 通过 / 0 失败**（首次全绿）。
+- clippy `-D warnings` 0 / fmt 零 diff。
+
 ## [v0.75.21] — 2026-08-01 — pipe `|>` 语法接入 + callee 名修复
 
 （v0.75.20 树收敛时发现的同族残留：`|>` 全链路死代码——lexer `Pipe` token

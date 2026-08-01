@@ -121,7 +121,9 @@ fn v3_lower_literal_produces_const() {
 
 #[test]
 fn v3_lower_binary_produces_binary_op() {
-    let exprs = parse_v3("1 + 2");
+    // v0.75.22: 常量输入（`1 + 2`）会被 v0.58 Cascades 常量折叠成
+    // Const(3.0)——断言 BinaryOp 将失败。改用变量操作数以保留指令。
+    let exprs = parse_v3("let a = 1\nlet b = 2\na + b");
     let func = lower_mir_exprs(&exprs).expect("lowering should succeed");
     assert!(func.body.iter().any(|inst| matches!(
         inst,
@@ -260,8 +262,9 @@ end
 
 #[test]
 fn v3_lower_if_produces_jump_instructions() {
-    // ParserV3 uses brace syntax: if cond { then } else { else }
-    let exprs = parse_v3("if true { 1 } else { 2 }");
+    // v0.75.22: 常量条件（`if true`）会被 v0.58 Cascades 折叠为无跳转
+    // 的直落指令（仅 Assign + Var）。改用变量条件以保留跳转指令。
+    let exprs = parse_v3("let c = true\nif c { 1 } else { 2 }");
     let func = lower_mir_exprs(&exprs).expect("lowering should succeed");
     assert!(
         func.body
@@ -277,7 +280,10 @@ fn v3_lower_if_produces_jump_instructions() {
 
 #[test]
 fn v3_lower_while_produces_loop_instructions() {
-    let exprs = parse_v3("while true { 1 }");
+    // v0.75.22: 常量条件（`while true`）被 v0.58 Cascades 折叠为
+    // Const(1) + Jump(0) 死循环直落——断言 JumpIfNot 将失败。
+    // 改用变量条件以保留循环跳转指令。
+    let exprs = parse_v3("let i = 0\nwhile i < 5 { i }");
     let func = lower_mir_exprs(&exprs).expect("lowering should succeed");
     assert!(
         func.body
@@ -447,7 +453,9 @@ fn v3_lower_for_produces_loop_insts() {
 
 #[test]
 fn v3_lower_while_produces_jumpifnot() {
-    let exprs = parse_v3("while true { 1 }");
+    // v0.75.22: 同 `v3_lower_while_produces_loop_instructions`——常量条件
+    // 被折叠；改用变量条件保留 JumpIfNot。
+    let exprs = parse_v3("let i = 0\nwhile i < 5 { i }");
     let func = lower_mir_exprs(&exprs).expect("lowering should succeed");
     assert!(
         func.body

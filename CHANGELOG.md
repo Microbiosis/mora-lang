@@ -2,6 +2,21 @@
 
 All notable changes to Mora will be documented in this file.
 
+## [v0.75.13] — 2026-08-01 — 约束审计 P1（失效注释清理 + 无意义命名）
+
+对 AGENTS_CODE_MODIFICATION.md §4（清晰度提升）的达标清理。
+
+### Removed — 失效注释（src/interpreter/mod.rs）
+- 删除描述已删除代码的注释：`AI_STREAM_TIMEOUT_SECS 已删除（create_ai_stream 是 dead code）`。
+- 删除迁移残留：`Value/Environment is now in value.rs` + re-export 提示（re-export 在 mod.rs:48 已存在，注释脱节）。
+- 删除实现历史：`trait impl method 注册名集中生成…收敛到这两个函数`（其后实际是 ai_retry 配置函数，引用目标已不存在）。
+
+### Changed — 无意义命名（src/mir/ssa.rs）
+- SSA Copy 指令的临时变量 `tmp` ×4 → `copy_var`（自解释：Copy 的临时寄存器名）。纯改名，零语义变化。
+
+### Tests
+- 580 通过 / 0 失败（无新增，纯清理）。clippy `-D warnings` error 数与基线持平（85）。
+
 ## [v0.75.12] — 2026-08-01 — pre-existing 缺陷修复（缓存指针复用 + parser let + 测试幻影断言）
 
 承接 v0.75.11 清理时暴露的 pre-existing 问题批量修复。

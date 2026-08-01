@@ -51,19 +51,6 @@ pub use crate::value::{Environment, StreamReader, Value};
 const HTTP_READ_TIMEOUT_SECS: u64 = 30;
 const HTTP_WRITE_TIMEOUT_SECS: u64 = 10;
 const AI_READ_TIMEOUT_SECS: u64 = 60;
-// v0.08.5 cleanup: AI_STREAM_TIMEOUT_SECS 已删除（create_ai_stream 是 dead code）
-
-// Value enum is now in value.rs
-// Re-exported above via pub use crate::value::*;
-
-// Environment is now in value.rs
-// Re-exported above via pub use crate::value::*;
-
-// ===================================================================
-// v0.08.5: trait impl method 注册名集中生成
-// 之前散落在 6 处 format!("__impl_{}_{}_{}", ...)，改命名规则要 6 处同步
-// 现在收敛到这两个函数
-// ===================================================================
 
 /// v0.10: AI 调用 retry 配置（环境变量可覆盖）
 /// MORA_AI_RETRY_MAX: 最大重试次数（默认 3，总计 4 次请求）

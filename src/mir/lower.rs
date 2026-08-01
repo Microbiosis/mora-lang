@@ -179,10 +179,31 @@ impl MirExprLowerer {
 
             // ── Function calls ──
             MirExprKind::Call { callee, args } => {
+                // v0.75.33: MirCallee::Method（`obj.method(args)`）走
+                // MirInst::MethodCall — ParserV3 把 receiver 作为第一个参数
+                // 传入，此处弹出作为 receiver 寄存器。此前拼 "obj_method"
+                // mangled 字符串 → interpreter 查不到该名字 →
+                // "Undefined function or task"（循环体真正执行后暴露）。
+                if let MirCallee::Method(_obj, method) = callee {
+                    let mut arg_regs: Vec<Reg> = Vec::new();
+                    for arg in args {
+                        let r = self.lower_expr(arg)?;
+                        arg_regs.push(r);
+                    }
+                    if let Some(recv_reg) = arg_regs.first().copied() {
+                        let dst = self.alloc_reg();
+                        self.emit(MirInst::MethodCall(
+                            dst,
+                            recv_reg,
+                            method.clone(),
+                            arg_regs[1..].to_vec(),
+                        ));
+                        return Ok(dst);
+                    }
+                }
                 let callee_name = match callee {
                     MirCallee::Name(n) => n.clone(),
                     MirCallee::Var(n) => n.clone(),
-                    MirCallee::Method(obj, method) => format!("{}_{}", obj, method),
                     _ => "unknown".to_string(),
                 };
                 let mut arg_regs: Vec<Reg> = Vec::new();

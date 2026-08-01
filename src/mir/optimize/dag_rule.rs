@@ -21,6 +21,11 @@ pub struct DagRewrite {
     /// reference either existing node ids or a new node's position
     /// within `added` (shifted by `dag.nodes.len()`).
     pub added_edges: Vec<(NodeId, NodeId, EdgeKind)>,
+    /// v0.75.33: 寄存器重命名 — CSE 合并不同 dst 的节点时，把旧 dst 的
+    /// 消费者引用改写到新 dst。dag_interp 按 input_regs（寄存器号）
+    /// 取数、不按 Data 边，仅重定向边会让旧 dst 失去 producer → 消费者
+    /// 永不 ready。`Some((old, new))` 表示把 old 重命名为 new。
+    pub reg_rename: Option<(Reg, Reg)>,
 }
 
 impl DagRewrite {
@@ -29,6 +34,7 @@ impl DagRewrite {
             added: vec![],
             removed: vec![],
             added_edges: vec![],
+            reg_rename: None,
         }
     }
 }
@@ -150,6 +156,7 @@ impl DagRewriteRule for ConstFoldingDagRule {
             added: vec![new_node],
             removed,
             added_edges: out_edges,
+            reg_rename: None,
         })
     }
 
@@ -183,11 +190,40 @@ impl DagRewriteRule for DeadNodeDagRule {
         if has_outgoing {
             return None;
         }
+        // v0.75.33: 控制流入口保护 — 被任意控制边（Control/ControlIfTrue/
+        // ControlIfFalse）target 引用的节点即使无数据出边也**不能删**：
+        // dag_search 删节点只清边、不修补引用者的 target 指针，删除后
+        // target 悬垂 → 执行器跳进 Removed 死路。循环退出目标（for 循环后
+        // 的 Const 占位）是典型：被 JumpIf true_target 引用、无出边。
+        if is_control_target(node_id, dag) {
+            return None;
+        }
+        // v0.75.33: 活跃 use 保护 — 节点的 dst reg 若被其他存活节点作为
+        // input 消费，删除会让消费者 reg 永无生产者（node_ready 恒 false，
+        // 执行卡死）。典型：`Const(7, Nil)` 是 `Assign("__let_result", 7)`
+        // 的输入 def，无出边但被 use → DCE 误删导致循环后执行卡死。
+        let dst = match &dag.nodes[node_id] {
+            MirDagNode::Compute { dst, .. } => *dst,
+            _ => return None,
+        };
+        let has_live_use = dag.nodes.iter().enumerate().any(|(i, n)| {
+            i != node_id
+                && !n.is_removed()
+                && match n {
+                    MirDagNode::Compute { input_regs, .. } => input_regs.contains(&dst),
+                    MirDagNode::Effect { inst } => inst.input_regs().contains(&dst),
+                    _ => false,
+                }
+        });
+        if has_live_use {
+            return None;
+        }
 
         Some(DagRewrite {
             added: vec![],
             removed: vec![node_id],
             added_edges: vec![],
+            reg_rename: None,
         })
     }
 
@@ -213,11 +249,22 @@ impl DagRewriteRule for CseDagRule {
     }
 
     fn rewrite(&self, node_id: NodeId, dag: &MirDag) -> Option<DagRewrite> {
+        let (dst_b, _) = match &dag.nodes[node_id] {
+            MirDagNode::Compute { dst, .. } => (*dst, ()),
+            _ => return None,
+        };
         let node = dag.nodes.get(node_id)?;
         let _node_inst = match node {
             MirDagNode::Compute { inst, .. } => inst,
             _ => return None,
         };
+
+        // v0.75.33: 控制流入口保护 — 被 Branch/Jump target 引用的节点不参与
+        // CSE 合并（合并=删除 + 重定向出边，但不修补入边指针 → target 悬垂）。
+        // 循环退出目标（for 后的 Const 占位）是典型受害者。
+        if is_control_target(node_id, dag) {
+            return None;
+        }
 
         // Scan prior nodes for an equivalent one
         for prev_id in 0..node_id {
@@ -230,6 +277,14 @@ impl DagRewriteRule for CseDagRule {
 
             if nodes_equivalent(&dag.nodes[prev_id], node, prev_id, node_id, dag) {
                 // Found equivalent — redirect outgoing edges from node_id to prev_id
+                // v0.75.33: 合并不同 dst 的节点必须重命名 — dag_interp 按
+                // input_regs（寄存器号）取数，不按 Data 边；只重定向边会让
+                // dst_b 失去 producer。reg_rename 由 apply_rewrite 全局改写
+                // 消费者的 input_regs（Compute/Effect/Branch/Phi + Data 边）。
+                let dst_a = match &dag.nodes[prev_id] {
+                    MirDagNode::Compute { dst, .. } => *dst,
+                    _ => unreachable!("nodes_equivalent only matches Compute"),
+                };
                 let out_edges: Vec<(NodeId, NodeId, EdgeKind)> = dag
                     .edges
                     .iter()
@@ -241,6 +296,7 @@ impl DagRewriteRule for CseDagRule {
                     added: vec![],
                     removed: vec![node_id],
                     added_edges: out_edges,
+                    reg_rename: Some((dst_b, dst_a)),
                 });
             }
         }
@@ -254,6 +310,21 @@ impl DagRewriteRule for CseDagRule {
 
 /// Check if two Compute nodes are structurally equivalent:
 /// same instruction type + same data sources.
+/// v0.75.33: 控制流入口判定 — 该节点是否被任意控制边（Control/
+/// ControlIfTrue/ControlIfFalse）作为 target 引用。被引用的节点是控制流
+/// 入口：删除会导致引用者的 target 指针悬垂（dag_search 删节点不清指针）。
+fn is_control_target(node_id: NodeId, dag: &MirDag) -> bool {
+    dag.edges.iter().any(|e| {
+        e.to == node_id
+            && matches!(
+                e.kind,
+                crate::mir::dag::EdgeKind::Control
+                    | crate::mir::dag::EdgeKind::ControlIfTrue
+                    | crate::mir::dag::EdgeKind::ControlIfFalse
+            )
+    })
+}
+
 fn nodes_equivalent(
     a: &MirDagNode,
     b: &MirDagNode,
@@ -401,6 +472,7 @@ impl DagRewriteRule for AlgebraicSimplifyDagRule {
                 }],
                 removed,
                 added_edges: vec![],
+                reg_rename: None,
             }),
             ReplaceWith::ReplaceWithSource(reg, Some(src_id)) => {
                 let out_edges: Vec<(NodeId, NodeId, EdgeKind)> = dag
@@ -413,6 +485,7 @@ impl DagRewriteRule for AlgebraicSimplifyDagRule {
                     added: vec![],
                     removed,
                     added_edges: out_edges,
+                    reg_rename: None,
                 })
             }
             _ => None,

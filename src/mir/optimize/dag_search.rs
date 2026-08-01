@@ -212,8 +212,106 @@ fn apply_rewrite(dag: &mut MirDag, rw: DagRewrite) {
 
     // 4. Remove edges to/from removed nodes
     let removed_set: HashSet<NodeId> = rw.removed.iter().copied().collect();
+
+    // 4a. v0.75.33: Sequence 缝合 — removed 节点若位于线性链中间
+    // （如 let 占位 Const 被 CSE 合并进等价节点），直接删边会断开保序链
+    // （Define → 占位 → 下一语句 之间的 Sequence 断裂 → 后续 Var 提前
+    // 执行读脏值，如 `let c = 5` 后 `let d = c + 1` 的 Var(c) 抢跑）。
+    // 收集 removed 节点的 Sequence 前驱/后继，补「前驱→后继」跳过 removed，
+    // 保持线性执行顺序。
+    let seq_preds: Vec<NodeId> = dag
+        .edges
+        .iter()
+        .filter(|e| {
+            !removed_set.contains(&e.from)
+                && removed_set.contains(&e.to)
+                && matches!(e.kind, crate::mir::dag::EdgeKind::Sequence)
+        })
+        .map(|e| e.from)
+        .collect();
+    let seq_succs: Vec<NodeId> = dag
+        .edges
+        .iter()
+        .filter(|e| {
+            removed_set.contains(&e.from)
+                && !removed_set.contains(&e.to)
+                && matches!(e.kind, crate::mir::dag::EdgeKind::Sequence)
+        })
+        .map(|e| e.to)
+        .collect();
+    for &a in &seq_preds {
+        for &b in &seq_succs {
+            dag.edges.push(crate::mir::dag::MirDagEdge {
+                from: a,
+                to: b,
+                kind: crate::mir::dag::EdgeKind::Sequence,
+            });
+        }
+    }
     dag.edges
         .retain(|e| !removed_set.contains(&e.from) && !removed_set.contains(&e.to));
+
+    // 4b. v0.75.33: 寄存器重命名 — CSE 合并不同 dst 的节点后，dag_interp
+    // 按 input_regs 取数（不按 Data 边），必须把存活消费者的寄存器引用
+    // 从旧 dst 改写到新 dst，否则旧 dst 失去 producer → 消费者永不 ready。
+    // 示例：`Const(Nil)` 占位节点 dst=7 被合并进 dst=4 的等价节点后，
+    // `Assign("__let_result", 7)` 的 input_regs 里的 7 必须改为 4。
+    if let Some((old_reg, new_reg)) = rw.reg_rename {
+        for node in dag.nodes.iter_mut() {
+            if node.is_removed() {
+                continue;
+            }
+            match node {
+                MirDagNode::Compute { inst, input_regs, .. } => {
+                    *inst = inst.map_regs(&mut |r| {
+                        if r == old_reg {
+                            new_reg
+                        } else {
+                            r
+                        }
+                    });
+                    for r in input_regs.iter_mut() {
+                        if *r == old_reg {
+                            *r = new_reg;
+                        }
+                    }
+                }
+                MirDagNode::Effect { inst } => {
+                    *inst = inst.map_regs(&mut |r| {
+                        if r == old_reg {
+                            new_reg
+                        } else {
+                            r
+                        }
+                    });
+                }
+                MirDagNode::Branch { cond, .. } => {
+                    if *cond == old_reg {
+                        *cond = new_reg;
+                    }
+                }
+                MirDagNode::Phi { reg, sources } => {
+                    if *reg == old_reg {
+                        *reg = new_reg;
+                    }
+                    for (_, src) in sources.iter_mut() {
+                        if *src == old_reg {
+                            *src = new_reg;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        // 同步改写 Data 边上的寄存器号，保持「边 / input_regs」一致。
+        for e in dag.edges.iter_mut() {
+            if let crate::mir::dag::EdgeKind::Data { reg } = &mut e.kind
+                && *reg == old_reg
+            {
+                *reg = new_reg;
+            }
+        }
+    }
 
     // 5. Recompute entry/exit
     let mut has_incoming: HashSet<NodeId> = HashSet::new();
@@ -480,6 +578,7 @@ mod tests {
                 added: vec![],
                 removed: vec![node_id],
                 added_edges: vec![],
+                reg_rename: None,
             })
         }
 
@@ -525,6 +624,72 @@ mod tests {
             ),
             "剩余节点应为折叠后的 Const(5), got {:?}",
             active[0]
+        );
+    }
+
+    // ─── v0.75.33: CSE 寄存器重命名回归 ─────────────────────────────
+
+    /// 两个不同 dst 的等价 Const 被 CSE 合并后，消费者的 input_regs 必须
+    /// 从旧 dst 改写为新 dst。dag_interp 按 input_regs（寄存器号）取数、
+    /// 不按 Data 边；旧实现在 SSA 下合并不同 dst 节点只重定向边，导致
+    /// 被合并的 dst 失去 producer → 消费者永不 ready（`let x = 1` 后
+    /// 再 `let x = 2` 的占位 Const 是典型受害者，见 for/while 循环的
+    /// 尾部 `__let_result` 占位）。
+    #[test]
+    fn cse_renames_consumer_regs_on_merge() {
+        let mut dag = make_dag(vec![
+            MirInst::Const(4, Value::Nil),   // n0: let 占位（dst=4）
+            MirInst::Assign("__let_result".into(), 4), // n1: 消费 reg4
+            MirInst::Const(7, Value::Nil),   // n2: 第二个 let 占位（dst=7）
+            MirInst::Assign("__let_result".into(), 7), // n3: 消费 reg7
+        ]);
+        let stages: Vec<Vec<Box<dyn DagRewriteRule>>> = vec![vec![Box::new(CseDagRule)]];
+        dag_search_staged(&mut dag, &stages, &InstructionCount);
+
+        // 等价的两个 Nil Const 合并：n2（dst=7）被删，n0（dst=4）存活。
+        assert!(dag.nodes[0].is_removed() || dag.nodes[2].is_removed());
+        let removed_dst = if dag.nodes[0].is_removed() { 4 } else { 7 };
+
+        // 没有任何存活消费者引用被删除节点的 dst — rename 必须已生效。
+        for (id, node) in dag.nodes.iter().enumerate() {
+            if node.is_removed() {
+                continue;
+            }
+            match node {
+                MirDagNode::Effect { inst } => {
+                    for r in inst.input_regs() {
+                        assert_ne!(
+                            r, removed_dst,
+                            "Effect n{id} 仍引用被删节点的 dst={removed_dst}（CSE rename 未生效）"
+                        );
+                    }
+                }
+                MirDagNode::Compute { input_regs, .. } => {
+                    for r in input_regs {
+                        assert_ne!(
+                            *r, removed_dst,
+                            "Compute n{id} 仍引用被删节点的 dst={removed_dst}"
+                        );
+                    }
+                }
+                _ => {}
+            }
+        }
+        // 两个 Assign（n1/n3）必须都引用存活的 dst — 原 reg7 消费者已重命名。
+        let assign_regs: Vec<usize> = dag
+            .nodes
+            .iter()
+            .filter_map(|n| match n {
+                MirDagNode::Effect {
+                    inst: MirInst::Assign(_, r),
+                } => Some(*r),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(assign_regs.len(), 2, "两个 Assign 都应存活");
+        assert!(
+            assign_regs.iter().all(|&r| r != removed_dst),
+            "Assign 寄存器应全部重命名离被删 dst: {assign_regs:?}"
         );
     }
 }

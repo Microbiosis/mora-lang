@@ -480,10 +480,13 @@ fn v3_parse_method_call() {
 fn v3_lower_method_call_produces_call() {
     let exprs = parse_v3("obj.method(1, 2)");
     let func = lower_mir_exprs(&exprs).expect("lowering should succeed");
-    // obj.method(1,2) lowers to Call("obj_method", ...)
+    // v0.75.33: obj.method(1,2) lowers to MirInst::MethodCall(dst, receiver, "method", args)。
+    // 此前拼 "obj_method" mangled 字符串 → interpreter 查不到该名字 →
+    // "Undefined function or task"（循环体真正执行后暴露；闭包 Dict 方法
+    // ops.mul(x) 是其实际受害者）。
     assert!(func.body.iter().any(|inst| matches!(
         inst,
-        MirInst::Call(_, name, _) if name == "obj_method"
+        MirInst::MethodCall(_, _, method, _) if method == "method"
     )));
 }
 

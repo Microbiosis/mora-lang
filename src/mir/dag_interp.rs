@@ -6,6 +6,18 @@
 //!
 //! With `dag.add_sequential_edges()`, this degenerates to linear
 //! execution, making `run_mir ≡ run_dag`.
+//!
+//! # 执行边界（v0.75.33）
+//!
+//! 本解释器为 **pregel 顶点执行** 设计：BSP 引擎逐超步调用，顶点内
+//! 无 `MirInst` 循环（迭代在引擎层）。因此：
+//! - 无循环的直线/分支程序：正确（Sequence 前驱判定保证 Define/Var 顺序）。
+//! - 含 `MirInst` 循环（for/while 降级到 JumpIf 回边）的程序：**不保证** —
+//!   `reg_ready` 一旦置 true 永久保持，循环内重执行节点靠寄存器依赖的
+//!   排序失效，effect 可能读上一轮的值。含循环的程序走线性 `run_mir`
+//!   （生产路径，main.rs/REPL/import 全部走线性）。
+//! - 优化器（CSE/DeadNode/ConstFolding）删除/合并节点时不得破坏控制目标
+//!   与寄存器消费者（dag_rule/dag_search 的 guard + reg_rename 负责）。
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -110,6 +122,8 @@ pub fn run_dag_with_signal_memo(
     let mut reg_ready: Vec<bool> = vec![false; dag.n_regs];
     let mut active: Vec<usize> = dag.entry.clone();
     let mut exec_count: Vec<usize> = vec![0; dag.nodes.len()];
+    // v0.75.33: 每节点是否已执行 — Sequence 前驱就绪判定用（见 ready 过滤）。
+    let mut executed: Vec<bool> = vec![false; dag.nodes.len()];
 
     const MAX_EXECUTIONS: usize = 500;
     const MAX_STEPS: u32 = 10000;
@@ -122,7 +136,20 @@ pub fn run_dag_with_signal_memo(
 
         let ready: Vec<usize> = active
             .iter()
-            .filter(|&&n| exec_count[n] < MAX_EXECUTIONS && node_ready(&dag.nodes[n], &reg_ready))
+            .filter(|&&n| {
+                exec_count[n] < MAX_EXECUTIONS
+                    && node_ready(&dag.nodes[n], &reg_ready)
+                    // v0.75.33: Sequence 前驱必须已执行 — 仅 data-ready 不够：
+                    // 无输入寄存器的节点（Var/Define 等）一激活即可执行，若其
+                    // Sequence 前驱（如 Define 语句）仍在本波未执行，会提前
+                    // 读脏值。示例：`let c = 5` 的 Define(c) 与下一句
+                    // `let d = c + 1` 的 Var(c) 同波就绪 → Var(c) 先跑读 Nil。
+                    && dag.edges.iter().all(|e| {
+                        e.to != n
+                            || !matches!(e.kind, crate::mir::dag::EdgeKind::Sequence)
+                            || executed[e.from]
+                    })
+            })
             .copied()
             .collect();
 
@@ -142,11 +169,21 @@ pub fn run_dag_with_signal_memo(
         let mut next_active: Vec<usize> = Vec::new();
         let mut saw_return = false;
 
+        // v0.75.33: 统一去重 — 本 wave 已执行的节点（ready）不再被重调度；
+        // Branch/Jump handler 的 push 与 scan 的 push 共用同一 pushed 标记，
+        // 防止同 wave 重复执行（此前 scan 会把 25→26 的 Sequence 边把已执行的
+        // n26 重新推入 → body 链每轮重复激活、归纳变量漂移 → 越界）。
+        let mut pushed: Vec<bool> = vec![false; dag.nodes.len()];
+        for &n in &ready {
+            pushed[n] = true;
+        }
+
         for &node_id in &ready {
             exec_count[node_id] += 1;
             if exec_count[node_id] > MAX_EXECUTIONS {
                 return Err(format!("DAG node {} loop", node_id));
             }
+            executed[node_id] = true;
 
             match &dag.nodes[node_id] {
                 MirDagNode::Compute { inst, .. } | MirDagNode::Effect { inst } => {
@@ -209,16 +246,23 @@ pub fn run_dag_with_signal_memo(
                     true_target,
                     false_target,
                 } => {
-                    if crate::flow::is_truthy(&regs[*cond]) {
-                        if let Some(t) = true_target {
-                            next_active.push(*t);
-                        }
-                    } else if let Some(f) = false_target {
-                        next_active.push(*f);
+                    let chosen = if crate::flow::is_truthy(&regs[*cond]) {
+                        true_target
+                    } else {
+                        false_target
+                    };
+                    if let Some(t) = chosen
+                        && !pushed[*t]
+                    {
+                        pushed[*t] = true;
+                        next_active.push(*t);
                     }
                 }
                 MirDagNode::Jump { target } => {
-                    if let Some(t) = target {
+                    if let Some(t) = target
+                        && !pushed[*t]
+                    {
+                        pushed[*t] = true;
                         next_active.push(*t);
                     }
                 }
@@ -230,9 +274,23 @@ pub fn run_dag_with_signal_memo(
             break;
         }
 
-        let mut pushed: Vec<bool> = vec![false; dag.nodes.len()];
+        // 边传播：只调度本 wave 已执行节点的消费者（Branch/Jump 的转移
+        // 已由 handler 决定，见下）。`pushed` 在 wave 开头创建并标记了
+        // ready 节点，scan 不会把已执行/已调度的节点重复推入。
         for edge in &dag.edges {
             if ready.contains(&edge.from) {
+                // v0.75.33: 分支/Jump 节点的控制转移完全由 handler 决定
+                // （Branch 只推选中的 target、Jump 只推 target）。此处若再
+                // 无条件推送其出边，会把两个分支目标都激活 — exit 与 body
+                // 同 wave 竞态执行（after-loop 读脏值、body 用越界 i 再跑）。
+                // 示例：for 循环 i==len 时 exit 被推 27、body 同时被
+                // ControlIfFalse/Sequence 推 19 → Index 越界 OOB。
+                if matches!(
+                    dag.nodes[edge.from],
+                    MirDagNode::Branch { .. } | MirDagNode::Jump { .. }
+                ) {
+                    continue;
+                }
                 let should_push = match &edge.kind {
                     EdgeKind::Data { reg } => reg_ready[*reg],
                     _ => is_control_edge(&edge.kind) || matches!(edge.kind, EdgeKind::Sequence),

@@ -2,6 +2,68 @@
 
 All notable changes to Mora will be documented in this file.
 
+## [v0.75.34] — 2026-08-02 — DAG 循环执行修复（CSE 重命名 + 块内全序 + 方法调用）
+
+（清剩余缺口 b：循环在 DAG 执行路径上不累加/提前读脏值。根因跨 6 层，
+全部是优化器/构建器/解释器三层叠加的结构缺陷，其中 4 层此前被「循环体
+不执行」掩盖——探索阶段激活循环后逐一暴露。）
+
+### Fixed — 优化器删除节点破坏消费者/控制目标（dag_rule.rs / dag_search.rs）
+- **CSE 合并不同 dst 节点导致悬垂（根因 A）**：两个等价 `Const(Nil)` 占位
+  （dst=4 / dst=7）被合并时只重定向 Data 边，不改写消费者的 `input_regs`
+  （寄存器号）→ 被合并的 dst 失去 producer → 消费者永不 ready。
+  **修复**：CSE 统一 dst + 新增 `DagRewrite.reg_rename`，`apply_rewrite`
+  全局重映射 Compute/Effect/Branch/Phi 的寄存器引用 + Data 边寄存器号
+  （新增 `MirInst::map_regs` 输入重映射工具）。
+- **Sequence 缝合**：removed 节点位于线性链中间（let 占位被 CSE 合并）时，
+  删边断开保序链 → 后续 Var 提前执行。**修复**：收集 removed 节点的
+  Sequence 前驱/后继补边跳过。
+- **控制目标保护**：CSE/DeadNode 删除被 Branch/Jump target 引用的节点 →
+  target 悬垂。**修复**：`is_control_target` guard（v0.75.33 已含，CSE 补全）。
+
+### Fixed — DAG 构建器破坏基本块顺序（dag.rs）
+- **根因 B：`prune_sequence_edges` 裁剪 Compute 保序边**：只保留
+  Effect-Source 的 Sequence 边，删掉 Compute（Var/Const/Index 读 env）之间
+  的保序边以「暴露 ILP」——但 `dag_interp` 顺序执行 ready 列表（ILP 从未
+  实现），裁剪只破坏保序：`Var(total)` 提前于 `Define(total)` 执行读脏值、
+  循环 exit 后代码不可达。**修复**：`dag_analyze` 建基本块内全序
+  （每节点与前驱连 Sequence，控制转移处不连），`prune_sequence_edges` 保留
+  所有 Sequence 边（no-op 保正确性）。
+
+### Fixed — 解释器调度（dag_interp.rs）
+- **Branch/Jump 双目标激活**：edge-scan 无条件推送 Branch/Jump 出边，
+  两个分支目标同 wave 竞态（exit 读脏值 + body 用越界 i 再跑 → OOB）。
+  **修复**：控制转移完全由 handler 决定（只推选中的 target）。
+- **Sequence 前驱就绪判定**：无输入寄存器的节点（Var/Define）一激活即可
+  执行，若其 Sequence 前驱未执行会提前读脏值。**修复**：ready 过滤要求
+  Sequence 前驱已执行（`executed` 标记）。
+- **wave 去重**：ready 节点标记 pushed，Branch/Jump handler 与 scan 共用，
+  防止同 wave 重复执行。
+
+### Fixed — 方法调用 mangled 名（lower.rs）
+- **根因 C：`ops.mul(x)` 拼成 `Call("ops_mul", ...)`**：ParserV3 正确产出
+  `MirCallee::Method`，但 lower 的 Call 分支拼 "obj_method" 字符串 →
+  interpreter 查不到该名字 → "Undefined function or task"（循环体真正执行
+  后暴露；闭包 Dict 方法 ops.mul(x) 是实际受害者）。**修复**：
+  `MirCallee::Method` 走 `MirInst::MethodCall`（receiver 弹出为接收者）。
+
+### Added — 回归测试
+- `cse_renames_consumer_regs_on_merge`（dag_search.rs）：CSE 合并后消费者
+  input_regs 不引用被删 dst。
+- `prune_preserves_block_order`（dag.rs）：prune 保留块内全序。
+- tier2 `v3_lower_method_call_produces_call` 更新断言：MethodCall 而非
+  mangled Call。
+
+### 验证
+- 全集成套件通过（dag_integration / tier0_replacement / tier0_closure_mir /
+  tier1_typeck_mir / tier2_mir_expr_pipeline / parser_v3_* 等 14 套件）。
+- mir 单元 83 通过 / 0 失败。
+- clippy `-D warnings` 0。
+- 手工验证：`for i in items { sum += i }` 输出 6、`range(0,10,1)` 累加输出 45
+  （此前 "nil"/"3"/OOB）。
+- 注：`cargo test --lib` 全量在 `schedule::tests::persistence_roundtrip`
+  挂起——stash 对照确认**预存在**（与本次改动无关），单测通过。
+
 ## [v0.75.33] — 2026-08-02 — ConstFolding 正确性修复（归纳变量 + 重定义）
 
 （清剩余缺口 a：循环累加返回 0 的根因。探索阶段激活 orchestrate 测试时暴露

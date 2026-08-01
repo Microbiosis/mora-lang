@@ -107,6 +107,15 @@ pub enum OptLevel {
 }
 
 impl OptLevel {
+    /// `MORA_OPT` 环境变量 → 优化等级（v0.75.7 引入的渐进式启用开关）：
+    /// - 未设置 / `MORA_OPT=0` → `None`（默认）— 热路径零开销；
+    ///   优化 pass（SSA rename/支配树）未证明对所有程序安全前，默认关闭
+    ///   作可回退逃生舱（I5 约束：C2 手写 / 优化失败可回退）。
+    /// - `MORA_OPT=1` → `Basic`（CP/CopyProp/DCE/GVN 基础管线）。
+    /// - `>= 2` → `Aggressive`（叠加 LICM/LSR/TCO）。
+    ///
+    /// 这是 v0.x 的渐进式启用机制：优化器经测试证明安全后，应提升为显式
+    /// 编译选项（类似 rustc `-O`）而非进程环境变量（v1.0 演进项）。
     pub fn from_env() -> OptLevel {
         std::env::var("MORA_OPT")
             .ok()

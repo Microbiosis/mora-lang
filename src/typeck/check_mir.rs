@@ -59,7 +59,8 @@ fn hm_to_external(err: HmError) -> TypeError {
         }
         UnificationFailure { span, .. }
         | OccursCheck { span, .. }
-        | GeneralizationFailed { span, .. } => span.map(|s| s.line).unwrap_or(0),
+        | GeneralizationFailed { span, .. }
+        | InvalidLiteral { span, .. } => span.map(|s| s.line).unwrap_or(0),
         HmDisabled => 0,
     };
     let message = err.to_string();

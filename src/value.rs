@@ -478,6 +478,22 @@ pub enum MergeStrategy {
     GrowOnlySet,
 }
 
+impl MergeStrategy {
+    /// v0.75.24: 策略名 → 枚举的单一事实来源（替代运行时/typeck 各自的
+    /// 硬编码字符串 match）。`merge_with(key, strategy)` 的运行时解析与
+    /// typeck 字面量校验都走这里。
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "lww" | "last_write_wins" => Some(Self::LastWriteWins),
+            "append" => Some(Self::Append),
+            "add" => Some(Self::Add),
+            "dict_union" => Some(Self::DictUnion),
+            "grow_only_set" => Some(Self::GrowOnlySet),
+            _ => None,
+        }
+    }
+}
+
 impl Value {
     /// Merge two values using the given strategy.
     /// Falls back to `LastWriteWins` if the strategy doesn't apply

@@ -41,6 +41,15 @@ pub enum TypeError {
         reason: String,
         span: Option<Span>,
     },
+
+    /// v0.75.24: 内置参数的字面量非法值（编译期校验）。
+    /// 例：`merge_with("x", "bogus")` — 非法策略名在 typeck 阶段拦截，
+    /// 不再留到运行时。
+    InvalidLiteral {
+        what: String,
+        value: String,
+        span: Option<Span>,
+    },
 }
 
 impl std::fmt::Display for TypeError {
@@ -91,6 +100,14 @@ impl std::fmt::Display for TypeError {
             }
             TypeError::GeneralizationFailed { reason, span } => {
                 write!(f, "Generalization failed: {}", reason)?;
+                if let Some(s) = span {
+                    write!(f, " at line {}, column {}", s.line, s.column)
+                } else {
+                    Ok(())
+                }
+            }
+            TypeError::InvalidLiteral { what, value, span } => {
+                write!(f, "Invalid {} literal '{}'", what, value)?;
                 if let Some(s) = span {
                     write!(f, " at line {}, column {}", s.line, s.column)
                 } else {

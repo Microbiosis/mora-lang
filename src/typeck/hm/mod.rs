@@ -514,6 +514,22 @@ impl HMInference {
             .map(|a| self.infer_expr(a))
             .collect::<Result<Vec<_>, _>>()?;
 
+        // v0.75.24: merge_with(key, strategy) 的策略名字面量编译期校验 —
+        // 非法策略（静态字符串）在 typeck 阶段拦截，不再留到运行时
+        // （动态传入的变量仍由运行时 MergeStrategy::from_name 兜底）。
+        if let MirCallee::Name(name) = callee
+            && name == "merge_with"
+            && let Some(MirExprKind::Literal(crate::common::Literal::String(s, _))) =
+                args.get(1).map(|a| &a.kind)
+            && crate::value::MergeStrategy::from_name(s).is_none()
+        {
+            return Err(vec![TypeError::InvalidLiteral {
+                what: "merge_with strategy".to_string(),
+                value: s.clone(),
+                span: Some(span),
+            }]);
+        }
+
         if let Some(sig) = self.closure_sig(&callee_ty).cloned() {
             if sig.arity != arg_types.len() {
                 return Err(vec![TypeError::ArityMismatch {

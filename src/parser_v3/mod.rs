@@ -87,10 +87,8 @@ impl ParserV3 {
                 expr
             } else if let Some(expr) = self.parse_block_body() {
                 expr
-            } else if let Some(expr) = self.parse_assignment() {
-                expr
             } else {
-                return None;
+                self.parse_assignment()?
             };
             // Consume the trailing `end` keyword when the body was parsed by
             // parse_block_body (which stops at End/RBrace/EOF).
@@ -108,26 +106,10 @@ impl ParserV3 {
             });
         }
 
-        if self.match_token_exact(TokenType::Let) {
-            let name = self.consume_identifier("Expected variable name after 'let'")?;
-            let type_hint = if self.match_token_exact(TokenType::Colon) {
-                Some(self.parse_type_annotation()?)
-            } else {
-                None
-            };
-            self.consume(TokenType::Assign, "Expected '=' after variable name")?;
-            let value = self.parse_assignment()?;
-            let nil = MirExpr::lit(Literal::Nil(start_span), start_span);
-            let _ = self.match_token(&[TokenType::Newline]);
-            return Some(MirExpr {
-                kind: MirExprKind::LetBinding {
-                    name,
-                    type_hint,
-                    value: Box::new(value),
-                    init_body: Box::new(nil),
-                },
-                span: start_span,
-            });
+        // v0.75.11: `let` 即必须成功（helper 已消费 let；中途失败不能
+        // fallback 到其它语句，否则 token 错位会静默返回 Ok）。
+        if self.check(&TokenType::Let) {
+            return self.parse_let_binding();
         }
 
         // Handle simple expressions as statements
@@ -196,9 +178,10 @@ impl ParserV3 {
     /// - Variable patterns (identifiers)
     /// - Literal patterns (true, false, numbers, strings, nil)
     /// - Guard conditions on arms are reserved for v0.55+
+    ///
     /// Future enhancements (v0.55+):
     /// - Tuple/list/dict destructuring patterns
-    /// - Guard clauses after =>  
+    /// - Guard clauses after =>
     /// - Pattern matching on traits and enums
     fn parse_match_expression(&mut self) -> Option<MirExpr> {
         if !self.match_token_exact(TokenType::Match) {
@@ -643,6 +626,40 @@ impl ParserV3 {
         })
     }
 
+    /// v0.75.11: `let name[: type] = value` 绑定（复用型 helper）。
+    ///
+    /// 此前块体内（task/if/for 的 parse_block_body）只试 parse_assignment +
+    /// if/for/while — `let` 关键字不匹配任何分支，被 advance() 跳过 → 余下的
+    /// `n = 5` 被解析成 `Assign` → `env.assign` 对未定义变量静默返回 false
+    /// （n 变 Nil），导致 task 内 let 变量后续比较/builtin 全错。顶层路径
+    /// （parse_expression_statement）有 let 分支；抽出本 helper 让块体同样
+    /// 正确生成 `MirExprKind::LetBinding`（lower 发 `MirInst::Define`）。
+    fn parse_let_binding(&mut self) -> Option<MirExpr> {
+        let span = self.span_of_current();
+        if !self.match_token_exact(TokenType::Let) {
+            return None;
+        }
+        let name = self.consume_identifier("Expected variable name after 'let'")?;
+        let type_hint = if self.match_token_exact(TokenType::Colon) {
+            Some(self.parse_type_annotation()?)
+        } else {
+            None
+        };
+        self.consume(TokenType::Assign, "Expected '=' after variable name")?;
+        let value = self.parse_assignment()?;
+        let nil = MirExpr::lit(Literal::Nil(span), span);
+        let _ = self.match_token(&[TokenType::Newline]);
+        Some(MirExpr {
+            kind: MirExprKind::LetBinding {
+                name,
+                type_hint,
+                value: Box::new(value),
+                init_body: Box::new(nil),
+            },
+            span,
+        })
+    }
+
     /// Parse a block body: multiple newline-separated expressions until RBrace/End.
     /// Returns a Sequence if multiple expressions, or the single expression if just one.
     fn parse_block_body(&mut self) -> Option<MirExpr> {
@@ -658,27 +675,33 @@ impl ParserV3 {
                 break;
             }
 
-            // Try assign; if not, try one of the statement-level constructs
-            // (if/for/while/match/return).
-            let stmt = self.parse_assignment().or_else(|| {
-                // Identify a leading construct keyword and dispatch
-                let tok = self.peek()?.token_type.clone();
-                let handled = match tok {
-                    TokenType::If => self.parse_if_expression(),
-                    TokenType::For => self.parse_for_loop(),
-                    _ => {
-                        // 'while' is identifier-based (no TokenType::While), but
-                        // try the loop parser if the next token is "while"
-                        if let TokenType::Identifier(ref n) = tok {
-                            if n == "while" {
-                                return self.parse_while_loop();
+            // v0.75.11: `let` 优先且必须成功（helper 已消费 let，失败不
+            // fallback — 避免未知注解等错误被错位解析成 Assign）。
+            let stmt = if self.check(&TokenType::Let) {
+                self.parse_let_binding()
+            } else {
+                // Try assign; if not, try one of the statement-level constructs
+                // (if/for/while/match/return).
+                self.parse_assignment().or_else(|| {
+                    // Identify a leading construct keyword and dispatch
+                    let tok = self.peek()?.token_type.clone();
+                    let handled = match tok {
+                        TokenType::If => self.parse_if_expression(),
+                        TokenType::For => self.parse_for_loop(),
+                        _ => {
+                            // 'while' is identifier-based (no TokenType::While), but
+                            // try the loop parser if the next token is "while"
+                            if let TokenType::Identifier(ref n) = tok {
+                                if n == "while" {
+                                    return self.parse_while_loop();
+                                }
                             }
+                            None
                         }
-                        None
-                    }
-                };
-                handled
-            });
+                    };
+                    handled
+                })
+            };
             if let Some(e) = stmt {
                 exprs.push(e);
             } else {

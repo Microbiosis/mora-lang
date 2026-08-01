@@ -8,7 +8,7 @@
 //! MIR 路径，不依赖任何 AST 活跃调用方。
 
 use mora::interpreter::Interpreter;
-use mora::mir::MirFunction;
+use mora::mir::{MirFunction, MirInst};
 use mora::mir::interp::{run_main_task, run_mir};
 use mora::mir::lower::{lower_mir_exprs, typecheck_mir_exprs};
 use mora::value::Value;
@@ -55,15 +55,15 @@ end
 // 完整跨 task 调用在 Tier 2 阶段补齐。
 #[test]
 fn semantics_control_flow_runs_via_mir() {
+    // v0.75.11: `if ... then` 要求 then 与分支同行（表达式语法）；
+    // 块式 if 用 brace 形态 `if cond { ... }`。
     let src = r#"
 task main()
   let total = 0
   for i in range(0, 10, 1)
     let total = total + i
   end
-  if total > 0 then
-    print("positive")
-  end
+  if total > 0 { print("positive") }
   print("sum=" + total)
 end
 "#;
@@ -83,12 +83,8 @@ type Bytes = number
 task main()
   let n = 5
   let label = "zero"
-  if n > 0 then
-    let label = "positive"
-  end
-  if n < 0 then
-    let label = "negative"
-  end
+  if n > 0 { let label = "positive" }
+  if n < 0 { let label = "negative" }
   print(label)
 end
 "#;
@@ -116,34 +112,71 @@ end
 // ─── 5. 运行时 (runtime) ───────────────────────────────────────────
 // Transaction 走 MirInst::Transaction——成功路径合并 child_env，失败路径
 // 触发 compensation 后返回 "Transaction rolled back"。
+//
+// v0.75.11: transaction 语法无前端（lexer 有 token，parser 无解析，
+// MirExprKind 无变体）— 与 MirInst::Transaction 无前端可达的现状一致。
+// 测试改为直接构造 MirInst（不经 parser），验证 handler 语义本体。
 #[test]
 fn runtime_transaction_success_path_via_mir() {
-    let src = r#"
-task main()
-  transaction
-    let x = 1 + 1
-    print("ok=" + x)
-  compensation
-    print("never")
-  end
-end
-"#;
-    run_via_mir(src).expect("transaction success path via MIR");
+    // 成功路径：body 正常执行（Const + Define），compensation 不触发。
+    let body = mora::mir::MirFunction {
+        params: Vec::new(),
+        body: vec![
+            MirInst::Const(0, mora::value::Value::Int(2)),
+            MirInst::Define("x".to_string(), 0),
+        ],
+        n_regs: 1,
+    };
+    let compensation = mora::mir::MirFunction {
+        params: Vec::new(),
+        body: vec![MirInst::Const(0, mora::value::Value::Int(0))],
+        n_regs: 1,
+    };
+    let func = MirFunction {
+        params: Vec::new(),
+        body: vec![MirInst::Transaction {
+            body: Box::new(body),
+            compensation: Box::new(compensation),
+        }],
+        n_regs: 1,
+    };
+    let mut interp = Interpreter::new();
+    let mut env = interp.take_env();
+    let func_arc = std::sync::Arc::new(func);
+    run_mir(&func_arc, &mut interp, &mut env).expect("transaction success path via MIR");
+    assert_eq!(
+        env.get("x"),
+        Some(mora::value::Value::Int(2)),
+        "成功路径应把 body 的 Define 合并回 env"
+    );
 }
 
 #[test]
 fn runtime_transaction_rollback_path_via_mir() {
-    let src = r#"
-task main()
-  transaction
-    print("body start")
-    rollback
-  compensation
-    print("rolled back")
-  end
-end
-"#;
-    let result = run_via_mir(src);
+    // 回滚路径：body 内 MirInst::Rollback → dispatch 返回 Err →
+    // h_transaction 执行 compensation 并返回 "Transaction rolled back"。
+    let body = mora::mir::MirFunction {
+        params: Vec::new(),
+        body: vec![MirInst::Const(0, mora::value::Value::Int(1)), MirInst::Rollback],
+        n_regs: 1,
+    };
+    let compensation = mora::mir::MirFunction {
+        params: Vec::new(),
+        body: vec![MirInst::Const(0, mora::value::Value::Int(99))],
+        n_regs: 1,
+    };
+    let func = MirFunction {
+        params: Vec::new(),
+        body: vec![MirInst::Transaction {
+            body: Box::new(body),
+            compensation: Box::new(compensation),
+        }],
+        n_regs: 1,
+    };
+    let mut interp = Interpreter::new();
+    let mut env = interp.take_env();
+    let func_arc = std::sync::Arc::new(func);
+    let result = run_mir(&func_arc, &mut interp, &mut env);
     assert!(result.is_err(), "rollback must surface as Err");
     assert!(
         result.as_ref().err().unwrap().contains("rolled back"),

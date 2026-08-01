@@ -10,6 +10,12 @@
 //! 不同 Arc 包裹同一内容（如 SSA 优化产物每次新建）则各自独立构建 —
 //! 内容相等性不在缓存契约内。
 //!
+//! v0.75.11 修复：缓存项**同时持有 `Arc<MirFunction>` 强引用**（二元组
+//! `(Arc<MirFunction>, Arc<MirDag>)`）。此前只存 dag，key 指针在 func_arc
+//! drop 后会被 allocator 复用 → 不同函数撞同地址 → 命中错误 DAG（pregel
+//! 并行单元测试全量并发时暴露：`Const(42)` 的 body 被 `Const(10)` 的调用
+//! 命中）。持有强引用后指针永不复用，同指针必然同内容。
+//!
 //! 容量上限 128：满则整体清空（简单可预测的 LRU 近似，防无限增长）。
 
 use std::collections::HashMap;
@@ -31,8 +37,9 @@ pub fn global_dag_cache() -> &'static DagCache {
 }
 
 /// `MirFunction` → 优化后 `MirDag` 的缓存。
+/// 缓存项持有 func 强引用（见模块注释，v0.75.11 指针复用修复）。
 pub struct DagCache {
-    entries: Mutex<HashMap<usize, Arc<MirDag>>>,
+    entries: Mutex<HashMap<usize, (Arc<MirFunction>, Arc<MirDag>)>>,
 }
 
 impl DagCache {
@@ -48,7 +55,7 @@ impl DagCache {
     pub fn get_or_build(&self, func_arc: &Arc<MirFunction>) -> Arc<MirDag> {
         let key = Arc::as_ptr(func_arc) as usize;
         let mut entries = self.entries.lock().expect("DagCache entries poisoned");
-        if let Some(dag) = entries.get(&key) {
+        if let Some((_, dag)) = entries.get(&key) {
             return dag.clone();
         }
         let mut dag = dag_analyze(func_arc);
@@ -58,7 +65,8 @@ impl DagCache {
         if entries.len() >= MAX_ENTRIES {
             entries.clear();
         }
-        entries.insert(key, dag.clone());
+        // v0.75.11: 持有 func 强引用 — key 指针永不复用（同指针必然同内容）。
+        entries.insert(key, (func_arc.clone(), dag.clone()));
         dag
     }
 

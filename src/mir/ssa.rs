@@ -1192,10 +1192,10 @@ pub fn deconstruct(ssa: &MirSsaFunction) -> MirFunction {
                 ));
             }
             SsaInst::Copy(dst, src) => {
-                // Copy src reg to dst reg: Assign(tmp, src) + Var(dst, tmp)
-                let tmp = next_tmp_name(tmp_name_counter, tmp_names);
-                out.push(MirInst::Assign(tmp.clone(), map_reg(*src)));
-                out.push(MirInst::Var(map_reg(*dst), tmp));
+                // Copy src reg to dst reg: Assign(copy_var, src) + Var(dst, copy_var)
+                let copy_var = next_tmp_name(tmp_name_counter, tmp_names);
+                out.push(MirInst::Assign(copy_var.clone(), map_reg(*src)));
+                out.push(MirInst::Var(map_reg(*dst), copy_var));
             }
             SsaInst::Define(name, src) => {
                 out.push(MirInst::Define(name.clone(), map_reg(*src)));
@@ -1325,10 +1325,10 @@ pub fn deconstruct(ssa: &MirSsaFunction) -> MirFunction {
         // 在 terminator 之前插入 copy 指令（逆序保持顺序）
         for (dst_p, src_ssa) in copies.iter().rev() {
             let src_p = map_ssa(&mut ssa_to_plain, &mut next_plain_reg, *src_ssa);
-            // Copy: Assign(tmp, src) + Var(dst, tmp)
-            let tmp = next_tmp_name(&mut tmp_name_counter, &mut tmp_names);
-            target.insert(term_idx, MirInst::Assign(tmp.clone(), src_p));
-            target.insert(term_idx, MirInst::Var(*dst_p, tmp));
+            // Copy: Assign(copy_var, src) + Var(dst, copy_var)
+            let copy_var = next_tmp_name(&mut tmp_name_counter, &mut tmp_names);
+            target.insert(term_idx, MirInst::Assign(copy_var.clone(), src_p));
+            target.insert(term_idx, MirInst::Var(*dst_p, copy_var));
         }
     }
 

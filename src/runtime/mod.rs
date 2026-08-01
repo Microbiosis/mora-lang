@@ -13,6 +13,9 @@
 // v0.52 ADR-001: facade 模块 — Interpreter 字段 pub 让 binary crate 访问
 // 后续 Task 7 阶段会考虑加 accessor
 pub mod ai;
+// v0.75.25: 活 AI 基础设施（ContextWindow/SpeculativeVerifier/CacheWarmer）
+// 自 src/ai_infra.rs 迁入；12 个出生即死的规划类型随旧文件删除
+pub mod ai_infra;
 pub mod core;
 pub mod infra;
 pub mod orch;

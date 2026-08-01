@@ -35,6 +35,14 @@ impl TypeEnv {
         self.bindings.get(name)
     }
 
+    /// v0.75.18: 导出全部绑定（跨模块 import 符号表合并用）。
+    pub fn all_bindings(&self) -> Vec<(String, Type)> {
+        self.bindings
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
+    }
+
     /// Check if a variable is bound
     pub fn contains(&self, name: &str) -> bool {
         self.bindings.contains_key(name)

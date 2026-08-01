@@ -2,6 +2,55 @@
 
 All notable changes to Mora will be documented in this file.
 
+## [v0.75.18] — 2026-08-01 — 静态类型 M3：跨模块 import 符号表
+
+（类型系统补齐第 3 模块。此前 `MirExprKind::Import` 在 typeck 返回 Nil 被
+完全忽略——`b.mora import "a.mora"; print(x)` 时 x 报 UnboundVariable
+（运行时可用、类型检查炸）。）
+
+### Added — src/typeck/imports.rs（新模块）
+- `collect_imported_symbols`：typeck 阶段预扫描顶层 `import "path"`，递归解析
+  目标文件（`visited: HashSet<PathBuf>` 防环，`a → b → a` 不重复展开），
+  提取顶层符号合并进 HM env。
+- `extract_module_symbols`：`let` 绑定用目标模块自身的 HM 推断结果
+  （含 let-generalization 与显式注解）登记；`task`（FnDef）→ `Closure`；
+  `struct`/`enum` → `Any` 占位；`type Alias = T` → 目标类型。
+- 传递 import：递归时先把子 import 的符号预合并进目标模块的 HM env，
+  模块自己的 `let` 引用其 import 的符号也能正确推断。
+- `sanitize`：合并前退化闭包身份 TypeVar / 未解析 TypeVar（`forall<'a>.'a`
+  闭包身份 → `Closure`、结构型泛型内部 TypeVar → `Any`），避免跨模块
+  closure_sigs 侧表键冲突。
+
+### Changed — check_mir.rs（唯一接入点）
+- `check_program_mir` 在 HM 推断前合并 import 符号。所有入口（main.rs 5 处
+  run_file/run_record/run_replay/run_snapshot/run_check + REPL + mir_import）
+  都经此函数——零调用点改动，运行时语义不变。
+- import 文件读取/解析失败产出一条 import error 诊断（与运行时
+  `mir_import` 的 hard error 语义一致）；缺失文件不再静默 Any。
+
+### Changed — hm/env.rs
+- 新增 `TypeEnv::all_bindings()`（导出全部绑定供符号表合并）。
+
+### 路径语义
+- 与运行时 `mir_import` 完全一致（cwd 相对，`read_to_string(path)`），
+  `mora --check` 与运行时对同一 import 的解析不分叉。
+
+### Added — 测试 + fixture
+- `tests/fixtures/mod_a.mora`：`let greeting: string` / `let answer: int = 42i` /
+  `task plus(a, b)` 顶层符号。
+- `tier1_typeck_mir.rs` 新增 3 个：`import_symbol_resolved_in_typecheck`
+  （import 后引用 greeting/answer 无 UnboundVariable）、
+  `import_symbol_type_checked`（import 的 string 符号 + 数字报类型错误）、
+  `import_missing_file_reports_error`（缺失文件报 import error）。
+- 端到端验证：`mora /tmp/use_mod.mora` 打印 hi/42（exit 0）；
+  `mora --check` 无错误；`greeting + 1` 1 个类型错误（exit 2）。
+
+### 验证
+- `cargo check --all-targets` 0 error / clippy `-D warnings` 0 / fmt 零 diff。
+- lib 测试 526 通过（跳过 sandbox/exec_parallel 慢测试）；tier1 25 通过。
+- 全测试 678 通过（+3），4 failed = tier2_mir_expr_pipeline pre-existing
+  （M1 baseline cefbe99 上同样失败，与本模块无关）。
+
 ## [v0.75.17] — 2026-08-01 — 静态类型 M2：泛型（ForAll + let-generalization + parser 泛型注解）
 
 （类型系统补齐第 2 模块。M1 后 generalize.rs 仍是 dead code stub——注释

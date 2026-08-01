@@ -2,6 +2,22 @@
 
 All notable changes to Mora will be documented in this file.
 
+## [v0.75.11] — 2026-08-01 — AST 残余低风险清理
+
+去 AST 化收尾：删除死类型 + 幻影注释 + 注释脱节，零语义变更。
+
+### Removed
+- **`FlowSignal`（src/value.rs）**：v2 AST 解释器的控制流信号枚举，v0.55 去 AST 后成为死代码 — 生产零引用（仅 `interpreter/mod.rs:48` 一处 re-export + 测试占位），`into_value`/`is_return` 全项目零调用；`FlowSignal::Interrupt`（"Pregel HITL"）从无构造/消费（HITL 实际由 `MirInterruptCallback`/`interrupt_points` 实现）。`MirSignal`（interp.rs）不受影响 — pregel 生产使用。
+- **`interpreter/mod.rs:48` re-export**：去掉 `FlowSignal`（`Environment`/`StreamReader`/`Value` 生产使用，保留）。
+- **`tests/tier0_replacement.rs`**：删除 `_FLOW_SIGNAL_PRESENT` 占位常量 + 其 `#[allow(dead_code)]` 注释。
+
+### Fixed
+- **`tests/tier0_replacement.rs` 幻影引用**：注释称「配套的 AST 行为基准保留在 `tests/mir_differential.rs`」— 该文件从未建立（PHASE_ALPHA_IR_DESIGN.md 中为未完成待办）。改为如实描述：Tier 0 AST 执行器已移除，测试直接走 MIR。
+- **`interpreter/mod.rs:807-808` 过时注释**（引用已删除的 FlowSignal）。
+
+### Tests
+- 580 通过 / 0 失败（无新增）。clippy `-D warnings` error 数与基线持平（86）。
+
 ## [v0.75.10] — 2026-08-01 — 寄存器级增量（DagExecMemo + 加法注入）+ 修复 v0.75.9 缓存失效
 
 （第三步「完整寄存器级增量」落地，采用非破坏 C 路径：保留 `input` 契约 + 加法注入逐 channel var + 纯节点记忆化。计划中记录的破坏性路径 B — 删除 `input` 契约、全量 dirty 传播 — 会破坏所有现有 agent 读取语义，未采用。）

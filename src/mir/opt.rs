@@ -56,7 +56,9 @@ pub struct LoopStrengthReductionPass;
 pub struct TailCallOptPass;
 
 impl SsaPass for ConstPropPass {
-    fn name(&self) -> &'static str { "const_prop" }
+    fn name(&self) -> &'static str {
+        "const_prop"
+    }
     fn run(&self, ssa: &mut MirSsaFunction) -> bool {
         let before = count_instructions(ssa);
         const_propagate(ssa);
@@ -65,7 +67,9 @@ impl SsaPass for ConstPropPass {
 }
 
 impl SsaPass for CopyPropPass {
-    fn name(&self) -> &'static str { "copy_prop" }
+    fn name(&self) -> &'static str {
+        "copy_prop"
+    }
     fn run(&self, ssa: &mut MirSsaFunction) -> bool {
         let before = count_instructions(ssa);
         copy_propagate(ssa);
@@ -74,7 +78,9 @@ impl SsaPass for CopyPropPass {
 }
 
 impl SsaPass for DeadCodeElimPass {
-    fn name(&self) -> &'static str { "dce" }
+    fn name(&self) -> &'static str {
+        "dce"
+    }
     fn run(&self, ssa: &mut MirSsaFunction) -> bool {
         let before = count_instructions(ssa);
         dead_code_elim(ssa);
@@ -83,7 +89,9 @@ impl SsaPass for DeadCodeElimPass {
 }
 
 impl SsaPass for GvnPass {
-    fn name(&self) -> &'static str { "gvn" }
+    fn name(&self) -> &'static str {
+        "gvn"
+    }
     fn run(&self, ssa: &mut MirSsaFunction) -> bool {
         let before = count_instructions(ssa);
         global_value_numbering(ssa);
@@ -92,7 +100,9 @@ impl SsaPass for GvnPass {
 }
 
 impl SsaPass for LicmPass {
-    fn name(&self) -> &'static str { "licm" }
+    fn name(&self) -> &'static str {
+        "licm"
+    }
     fn run(&self, ssa: &mut MirSsaFunction) -> bool {
         let before = count_instructions(ssa);
         loop_invariant_motion(ssa);
@@ -101,7 +111,9 @@ impl SsaPass for LicmPass {
 }
 
 impl SsaPass for LoopStrengthReductionPass {
-    fn name(&self) -> &'static str { "loop_strength_reduction" }
+    fn name(&self) -> &'static str {
+        "loop_strength_reduction"
+    }
     fn run(&self, ssa: &mut MirSsaFunction) -> bool {
         let before = count_instructions(ssa);
         loop_strength_reduction(ssa);
@@ -110,7 +122,9 @@ impl SsaPass for LoopStrengthReductionPass {
 }
 
 impl SsaPass for TailCallOptPass {
-    fn name(&self) -> &'static str { "tail_call_opt" }
+    fn name(&self) -> &'static str {
+        "tail_call_opt"
+    }
     fn run(&self, ssa: &mut MirSsaFunction) -> bool {
         let before = count_instructions(ssa);
         tail_call_optimize(ssa);
@@ -310,11 +324,7 @@ fn dead_code_elim(ssa: &mut MirSsaFunction) {
             Terminator::Return(None) => {
                 if let Some(last_dst) = block.insts.iter().rev().find_map(|inst| {
                     let d = ssa_dst(inst);
-                    if d > 0 {
-                        Some(d)
-                    } else {
-                        None
-                    }
+                    if d > 0 { Some(d) } else { None }
                 }) {
                     used.insert(last_dst);
                 }
@@ -1149,15 +1159,12 @@ fn tail_call_optimize(ssa: &mut MirSsaFunction) {
 pub fn superstep_fusion(func: &mut MirFunction) {
     let mut i = 0;
     while i + 1 < func.body.len() {
-        if let (
-            MirInst::Orchestrate { kind: kind1, .. },
-            MirInst::Orchestrate { kind: kind2, .. },
-        ) = (&func.body[i], &func.body[i + 1])
+        if let (MirInst::Orchestrate { kind: kind1, .. }, MirInst::Orchestrate { kind: kind2, .. }) =
+            (&func.body[i], &func.body[i + 1])
+            && kind1 == kind2
         {
-            if kind1 == kind2 {
-                func.body.remove(i + 1);
-                continue; // re-check current position with new neighbor
-            }
+            func.body.remove(i + 1);
+            continue; // re-check current position with new neighbor
         }
         i += 1;
     }

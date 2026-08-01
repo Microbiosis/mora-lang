@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, HashMap};
 
 use super::parsed_doc_v3;
-use super::parsed_doc_v3::{position_to_offset, ident_at_offset};
+use super::parsed_doc_v3::{ident_at_offset, position_to_offset};
 use crate::lsp::json::Value;
 use crate::lsp::server::DocumentState;
 

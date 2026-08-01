@@ -11,7 +11,7 @@ fn parse_file(path: &str) -> usize {
         std::fs::read_to_string(path).unwrap_or_else(|e| panic!("cannot read {}: {}", path, e));
     let mut lexer = Lexer::new(&source);
     let tokens = lexer.scan_tokens();
-    let mut parser = ParserV3::new(tokens);
+    let parser = ParserV3::new(tokens);
     parser
         .parse()
         .unwrap_or_else(|e| panic!("parse failed for {}: {:?}", path, e))

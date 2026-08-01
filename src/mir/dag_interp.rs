@@ -311,7 +311,6 @@ mod tests {
     use super::*;
     use crate::common::BinaryOp;
     use crate::interpreter::Interpreter;
-    use crate::mir::host::MirHost;
     use crate::mir::{MirFunction, MirInst};
     use crate::value::Value;
 

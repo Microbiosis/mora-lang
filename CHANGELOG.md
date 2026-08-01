@@ -2,6 +2,33 @@
 
 All notable changes to Mora will be documented in this file.
 
+## [v0.75.14] — 2026-08-01 — 约束审计 P2+P3-1（clippy 清零 + fmt 零 diff + magic numbers）
+
+对 AGENTS_CODE_MODIFICATION.md §2/§3 的达标清理。**clippy `-D warnings` 从 85 → 0，rustfmt 从 150 diff → 0**（历史最高门槛，首次达标）。
+
+### Changed — magic numbers 提取常量（审计报告 5 处 + 2）
+- `src/runtime/infra.rs`：`STRING_INTERNER_CAPACITY`（50k）/ `AI_CACHE_CAPACITY`（10k）。
+- `src/http_server.rs`：`HANDLER_TIMEOUT_SECS`（60）。
+- `src/mir/interp.rs`：`FLOAT_PATTERN_EPSILON`（1e-9）。
+- `src/compress/mod.rs`：`SMART_CRUSHER_TARGET_DIVISOR`（200）。
+
+### Changed — clippy 85 → 0（机械修复 + 语义修复）
+- 机械：collapsible_if ×20、unused import/mut ×8、doc 格式 ×6、`--fix` 自动批量。
+- 语义（读上下文判断后修，未用 allow 掩盖）：unreachable pattern ×9（`parsed_doc_v3` 重复 arm、`handlers` Halt 重复、`typeck/hm` `_` 兜底——均删冗余，部分改穷尽 match 让编译器守卫新增变体）；dead code ×6（`dag_rule` incoming_edges/node_dst、`typeck` method_return_type 副本、`dag` successors/label 字段）；`dag.rs` JumpIf/JumpIfNot 相同分支合并、range loop 改 enumerate、len>=1 → !is_empty；`typeck/dispatch` redundant guard 简化；`core.rs` 测试补 Value import。
+- 合理保留（记录理由）：`MirInst` large_enum_variant、`h_impl_def`/`h_skill_def` too_many_arguments、`DagCache` 补 is_empty。
+
+### Changed — fmt 150 diff → 0
+- 全量 `cargo fmt`（40 文件，含 pre-existing 格式债 + clippy 修复后的新格式）。
+
+### Tests
+- 580 通过 / 0 失败（lib）。唯一失败仍为 tier2 4 个 pre-existing lowering 语义断言（clean 基线同样失败，另有候选）。
+
+### 审计报告状态更新
+- **无意义命名 / 失效注释**：✅ 达标（P1）。
+- **magic numbers**：✅ 达标（P2-1）。
+- **`#[deprecated]` 标注**：✅ 修正——项目不保留新旧并存接口（v0.75.9 直接改签名 + CHANGELOG 记录），政策与现状匹配，无标注对象。
+- **clippy / rustfmt**：✅ 首次达标。
+
 ## [v0.75.13] — 2026-08-01 — 约束审计 P1（失效注释清理 + 无意义命名）
 
 对 AGENTS_CODE_MODIFICATION.md §4（清晰度提升）的达标清理。

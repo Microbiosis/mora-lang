@@ -30,10 +30,7 @@ pub enum MirPattern {
         value: ValueMatcher,
     },
     /// `MirInst::Const(dst, Bool(v))` — 专门匹配布尔常量
-    ConstBool {
-        dst: RegMatcher,
-        value: bool,
-    },
+    ConstBool { dst: RegMatcher, value: bool },
     /// `MirInst::BinaryOp(dst, lhs, op, rhs)`
     BinaryOp {
         dst: RegMatcher,
@@ -105,10 +102,13 @@ impl MatchBindings {
 
     /// 按名称查询 Value 绑定
     pub fn get_value(&self, key: &str) -> Option<&Value> {
-        self.bindings.iter().find(|(k, _)| k == key).and_then(|(_, v)| match v {
-            BindingValue::Value(v) => Some(v),
-            _ => None,
-        })
+        self.bindings
+            .iter()
+            .find(|(k, _)| k == key)
+            .and_then(|(_, v)| match v {
+                BindingValue::Value(v) => Some(v),
+                _ => None,
+            })
     }
 
     /// 按名称查询 Label 绑定
@@ -124,10 +124,13 @@ impl MatchBindings {
 
     /// 按名称查询 BinaryOp 绑定
     pub fn get_op(&self, key: &str) -> Option<&BinaryOp> {
-        self.bindings.iter().find(|(k, _)| k == key).and_then(|(_, v)| match v {
-            BindingValue::Op(o) => Some(o),
-            _ => None,
-        })
+        self.bindings
+            .iter()
+            .find(|(k, _)| k == key)
+            .and_then(|(_, v)| match v {
+                BindingValue::Op(o) => Some(o),
+                _ => None,
+            })
     }
 
     /// 按名称查询 Option<Reg> 绑定
@@ -230,10 +233,9 @@ impl Match for MirPattern {
         match (self, inst) {
             // Any: 匹配任意指令（用于 body-pass 规则如 DeadAfterReturn）
             (MirPattern::Any, _) => Some(MatchBindings::new()),
-            (
-                MirPattern::ConstBool { dst: dst_m, value },
-                MirInst::Const(dst, Value::Bool(v)),
-            ) if *v == *value => {
+            (MirPattern::ConstBool { dst: dst_m, value }, MirInst::Const(dst, Value::Bool(v)))
+                if *v == *value =>
+            {
                 let mut b = MatchBindings::new();
                 if let Some(name) = dst_m.match_and_bind(*dst) {
                     b.insert(name, BindingValue::Reg(*dst));
@@ -287,17 +289,13 @@ impl Match for MirPattern {
                 }
                 Some(b)
             }
-            (MirPattern::JumpIf { cond: c_m, target: t_m }, MirInst::JumpIf(cond, target)) => {
-                let mut b = MatchBindings::new();
-                if let Some(name) = c_m.match_and_bind(*cond) {
-                    b.insert(name, BindingValue::Reg(*cond));
-                }
-                if let Some(name) = t_m.match_and_bind(*target) {
-                    b.insert(name, BindingValue::Label(*target));
-                }
-                Some(b)
-            }
-            (MirPattern::JumpIfNot { cond: c_m, target: t_m }, MirInst::JumpIfNot(cond, target)) => {
+            (
+                MirPattern::JumpIf {
+                    cond: c_m,
+                    target: t_m,
+                },
+                MirInst::JumpIf(cond, target),
+            ) => {
                 let mut b = MatchBindings::new();
                 if let Some(name) = c_m.match_and_bind(*cond) {
                     b.insert(name, BindingValue::Reg(*cond));
@@ -308,9 +306,22 @@ impl Match for MirPattern {
                 Some(b)
             }
             (
-                MirPattern::Return { value: v_m },
-                MirInst::Return(value),
+                MirPattern::JumpIfNot {
+                    cond: c_m,
+                    target: t_m,
+                },
+                MirInst::JumpIfNot(cond, target),
             ) => {
+                let mut b = MatchBindings::new();
+                if let Some(name) = c_m.match_and_bind(*cond) {
+                    b.insert(name, BindingValue::Reg(*cond));
+                }
+                if let Some(name) = t_m.match_and_bind(*target) {
+                    b.insert(name, BindingValue::Label(*target));
+                }
+                Some(b)
+            }
+            (MirPattern::Return { value: v_m }, MirInst::Return(value)) => {
                 let mut b = MatchBindings::new();
                 if let Some(name) = v_m.match_and_bind(*value) {
                     b.insert(name, BindingValue::RegOpt(*value));

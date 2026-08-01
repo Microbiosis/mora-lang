@@ -45,7 +45,7 @@ impl TypeEnv {
         // Collect all type variable identifiers from all types
         let mut free_vars = Vec::new();
 
-        for (_, ty) in &self.bindings {
+        for ty in self.bindings.values() {
             free_vars.extend(collect_type_vars(ty));
         }
 

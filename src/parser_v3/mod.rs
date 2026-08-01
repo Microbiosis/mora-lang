@@ -265,19 +265,19 @@ impl ParserV3 {
     /// - Variable names: `x` → Pattern::Variable("x".to_string())
     /// - Literal values: `true`, `false`, `123`, `"string"`, `nil` → Pattern::Literal(_)
     /// - Wildcard: `_` → Pattern::Wildcard
-    /// Reserved for v0.55+:
-    /// - Tuple patterns: `(a, b)` → Pattern::Tuple(...)
-    /// - List patterns: `[head, ..tail]` → Pattern::List { ... }
-    /// - Dict patterns: `{key: value}` → Pattern::Dict { ... }
-    /// - Guard clauses: `pattern if condition` → Pattern::Guard { ... }
-    /// - Or patterns: `A | B` → Need new Pattern variant
+    /// - Reserved for v0.55+:
+    ///   - Tuple patterns: `(a, b)` → Pattern::Tuple(...)
+    ///   - List patterns: `[head, ..tail]` → Pattern::List { ... }
+    ///   - Dict patterns: `{key: value}` → Pattern::Dict { ... }
+    ///   - Guard clauses: `pattern if condition` → Pattern::Guard { ... }
+    ///   - Or patterns: `A | B` → Need new Pattern variant
     fn parse_pattern(&mut self) -> Option<crate::mir::expr::Pattern> {
         // Check for wildcard pattern `_` first (before generic identifier check)
-        if let TokenType::Identifier(ref name) = self.peek()?.token_type {
-            if name == "_" {
-                self.advance();
-                return Some(crate::mir::expr::Pattern::Wildcard);
-            }
+        if let TokenType::Identifier(ref name) = self.peek()?.token_type
+            && name == "_"
+        {
+            self.advance();
+            return Some(crate::mir::expr::Pattern::Wildcard);
         }
 
         // Check if current token is an identifier (variable name)
@@ -421,11 +421,11 @@ impl ParserV3 {
             }
 
             // Try agent definition: agent name(params) => expr
-            if self.peek_is_identifier("agent") {
-                if let Some(agent) = self.parse_agent_def() {
-                    agents.push(agent);
-                    continue;
-                }
+            if self.peek_is_identifier("agent")
+                && let Some(agent) = self.parse_agent_def()
+            {
+                agents.push(agent);
+                continue;
             }
 
             // Try edge definition: @start -> a, a -> @exit, @start -> b on: cond
@@ -685,21 +685,21 @@ impl ParserV3 {
                 self.parse_assignment().or_else(|| {
                     // Identify a leading construct keyword and dispatch
                     let tok = self.peek()?.token_type.clone();
-                    let handled = match tok {
+
+                    match tok {
                         TokenType::If => self.parse_if_expression(),
                         TokenType::For => self.parse_for_loop(),
                         _ => {
                             // 'while' is identifier-based (no TokenType::While), but
                             // try the loop parser if the next token is "while"
-                            if let TokenType::Identifier(ref n) = tok {
-                                if n == "while" {
-                                    return self.parse_while_loop();
-                                }
+                            if let TokenType::Identifier(ref n) = tok
+                                && n == "while"
+                            {
+                                return self.parse_while_loop();
                             }
                             None
                         }
-                    };
-                    handled
+                    }
                 })
             };
             if let Some(e) = stmt {
@@ -729,8 +729,8 @@ impl ParserV3 {
     /// Supports three syntax styles:
     /// 1. Expression style: `if cond then expr else else_expr`
     /// 2. Block style: `if cond { then_expr } else { else_expr }`
-    /// The `then` keyword is optional when using block syntax `{`.
-    /// The `else` branch is optional in both styles.
+    ///    The `then` keyword is optional when using block syntax `{`.
+    ///    The `else` branch is optional in both styles.
     fn parse_if_expression(&mut self) -> Option<MirExpr> {
         if !self.match_token_exact(TokenType::If) {
             return None;
@@ -1306,9 +1306,7 @@ impl ParserV3 {
                 self.advance(); // consume '('
                 let inner = self.parse_expression()?;
                 let paren_parsed = self.consume(TokenType::RParen, "Expected ')'");
-                if paren_parsed.is_none() {
-                    return None; // parse_primary returns Option, not Result
-                }
+                paren_parsed?;
                 Some(mir_group(inner))
             }
 

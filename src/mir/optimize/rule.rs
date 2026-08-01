@@ -2,8 +2,8 @@
 //!
 //! 完全 MIR-native：规则从 `MirInst` 重写到 `Vec<MirInst>`，零 AST 依赖。
 
-use crate::mir::{MirInst, Reg};
 use crate::mir::optimize::pattern::{Match, MatchBindings, MirPattern};
+use crate::mir::{MirInst, Reg};
 use crate::value::Value;
 
 /// 重写规则 trait
@@ -61,18 +61,25 @@ pub trait RewriteRule {
 }
 
 /// 规则库 — 集中管理所有规则
-
 /// Phase H.6: If 简化 — 常量条件的 JumpIf/JumpIfNot 折叠
 pub struct IfSimplifyRule;
 
 impl RewriteRule for IfSimplifyRule {
-    fn name(&self) -> &'static str { "if_simplify" }
+    fn name(&self) -> &'static str {
+        "if_simplify"
+    }
     /// Use Any pattern — the rule handles both JumpIf and JumpIfNot internally
-    fn pattern(&self) -> &MirPattern { &IF_SIMPLIFY_PATTERN }
+    fn pattern(&self) -> &MirPattern {
+        &IF_SIMPLIFY_PATTERN
+    }
 
     fn rewrite_with_context(
-        &self, inst: &MirInst, _bindings: &MatchBindings,
-        pc: usize, body: &[MirInst], _ctx: &dyn std::any::Any,
+        &self,
+        inst: &MirInst,
+        _bindings: &MatchBindings,
+        pc: usize,
+        body: &[MirInst],
+        _ctx: &dyn std::any::Any,
     ) -> Vec<MirInst> {
         let (cond_reg, target, is_not) = match inst {
             MirInst::JumpIf(cond, t) => (*cond, *t, false),
@@ -80,8 +87,10 @@ impl RewriteRule for IfSimplifyRule {
             _ => return vec![inst.clone()],
         };
         let const_val = body[..pc].iter().rev().find_map(|prev| {
-            if let MirInst::Const(r, Value::Bool(v)) = prev {
-                if *r == cond_reg { return Some(*v); }
+            if let MirInst::Const(r, Value::Bool(v)) = prev
+                && *r == cond_reg
+            {
+                return Some(*v);
             }
             None
         });
@@ -94,7 +103,9 @@ impl RewriteRule for IfSimplifyRule {
         }
     }
 
-    fn cost_gain(&self) -> i32 { 2 }
+    fn cost_gain(&self) -> i32 {
+        2
+    }
 }
 
 /// Matches any instruction — IfSimplifyRule handles JumpIf/JumpIfNot discrimination internally
@@ -138,16 +149,18 @@ impl RewriteRule for DeadAfterReturnRule {
         _ctx: &dyn std::any::Any,
     ) -> Vec<MirInst> {
         // 找到最后一个 Return 的位置
-        let last_return = body.iter().enumerate()
+        let last_return = body
+            .iter()
+            .enumerate()
             .rev()
             .find(|(_, inst)| matches!(inst, MirInst::Return(_)))
             .map(|(i, _)| i);
 
         // 如果当前指令在最后一个 Return 之后 → 删除
-        if let Some(ret_idx) = last_return {
-            if pc > ret_idx {
-                return Vec::new();
-            }
+        if let Some(ret_idx) = last_return
+            && pc > ret_idx
+        {
+            return Vec::new();
         }
         // 否则保留
         vec![_inst.clone()]
@@ -192,11 +205,12 @@ impl RewriteRule for RedundantJumpRule {
         _ctx: &dyn std::any::Any,
     ) -> Vec<MirInst> {
         // 检查是否是 Jump(target) 且 target == pc + 1
-        if let MirInst::Jump(target) = inst {
-            if *target == pc + 1 && *target < body.len() {
-                // 是冗余 jump：跳转到下一条 → 删除
-                return Vec::new();
-            }
+        if let MirInst::Jump(target) = inst
+            && *target == pc + 1
+            && *target < body.len()
+        {
+            // 是冗余 jump：跳转到下一条 → 删除
+            return Vec::new();
         }
         // 不匹配：保留原指令
         vec![inst.clone()]
@@ -237,10 +251,10 @@ impl RewriteRule for ConstFoldingRule {
             // Scan backwards for constant definitions of lhs and rhs
             let lhs_val = find_const_backward(body, *lhs, pc);
             let rhs_val = find_const_backward(body, *rhs, pc);
-            if let (Some(lv), Some(rv)) = (lhs_val, rhs_val) {
-                if let Ok(result) = crate::flow::eval_binary(lv, op, rv) {
-                    return vec![MirInst::Const(*dst, result)];
-                }
+            if let (Some(lv), Some(rv)) = (lhs_val, rhs_val)
+                && let Ok(result) = crate::flow::eval_binary(lv, op, rv)
+            {
+                return vec![MirInst::Const(*dst, result)];
             }
         }
         vec![inst.clone()]
@@ -259,10 +273,10 @@ fn find_const_backward(body: &[MirInst], reg: Reg, before_pc: usize) -> Option<V
         .rev()
         .take_while(|i| !matches!(i, MirInst::Label(_)))
         .find_map(|inst| {
-            if let MirInst::Const(r, val) = inst {
-                if *r == reg {
-                    return Some(val.clone());
-                }
+            if let MirInst::Const(r, val) = inst
+                && *r == reg
+            {
+                return Some(val.clone());
             }
             None
         })
@@ -328,10 +342,7 @@ mod tests {
     #[test]
     fn test_apply_rules_preserves_unmatched() {
         let rules = builtin_rules();
-        let body = vec![
-            MirInst::Const(0, Value::Int(42)),
-            MirInst::Jump(1_usize),
-        ];
+        let body = vec![MirInst::Const(0, Value::Int(42)), MirInst::Jump(1_usize)];
         let result = apply_rules(&body, &rules);
         // ConstFoldingRule 不匹配 Const → 保留
         // DeadAssignRule 不匹配 Const → 保留
@@ -342,7 +353,11 @@ mod tests {
     #[test]
     fn test_builtin_rules_contains_three() {
         let rules = builtin_rules();
-        assert_eq!(rules.len(), 4, "const_folding + redundant_jump + if_simplify + dead_after_return");
+        assert_eq!(
+            rules.len(),
+            4,
+            "const_folding + redundant_jump + if_simplify + dead_after_return"
+        );
         let names: Vec<&str> = rules.iter().map(|r| r.name()).collect();
         assert!(names.contains(&"const_folding"));
         assert!(names.contains(&"redundant_jump"));
@@ -365,9 +380,17 @@ mod tests {
         // body[0] = Jump(1)，body[1] = ... → Jump(1) 是冗余
         let body = vec![MirInst::Jump(1), MirInst::Const(0, Value::Int(42))];
         let empty_ctx = ();
-        let result =
-            rule.rewrite_with_context(&MirInst::Jump(1), &MatchBindings::new(), 0, &body, &empty_ctx);
-        assert!(result.is_empty(), "Jump to next instruction should be deleted");
+        let result = rule.rewrite_with_context(
+            &MirInst::Jump(1),
+            &MatchBindings::new(),
+            0,
+            &body,
+            &empty_ctx,
+        );
+        assert!(
+            result.is_empty(),
+            "Jump to next instruction should be deleted"
+        );
     }
 
     #[test]
@@ -380,8 +403,13 @@ mod tests {
             MirInst::Const(1, Value::Int(42)),
         ];
         let empty_ctx = ();
-        let result =
-            rule.rewrite_with_context(&MirInst::Jump(2), &MatchBindings::new(), 0, &body, &empty_ctx);
+        let result = rule.rewrite_with_context(
+            &MirInst::Jump(2),
+            &MatchBindings::new(),
+            0,
+            &body,
+            &empty_ctx,
+        );
         assert_eq!(result.len(), 1, "Real jump should be preserved");
     }
 
@@ -391,8 +419,13 @@ mod tests {
         // body[0] = Jump(5) 但 body 长度仅 2 → 越界 → 保留
         let body = vec![MirInst::Jump(5), MirInst::Const(0, Value::Int(42))];
         let empty_ctx = ();
-        let result =
-            rule.rewrite_with_context(&MirInst::Jump(5), &MatchBindings::new(), 0, &body, &empty_ctx);
+        let result = rule.rewrite_with_context(
+            &MirInst::Jump(5),
+            &MatchBindings::new(),
+            0,
+            &body,
+            &empty_ctx,
+        );
         assert_eq!(result.len(), 1, "Out-of-bounds jump should be preserved");
     }
 
@@ -425,7 +458,8 @@ mod tests {
         assert_eq!(result.len(), 1, "should fold to single Const");
         assert!(
             matches!(&result[0], MirInst::Const(d, Value::Int(42)) if *d == 3),
-            "should be Const(3, 42), got: {:?}", result[0]
+            "should be Const(3, 42), got: {:?}",
+            result[0]
         );
     }
 
@@ -446,7 +480,10 @@ mod tests {
         );
         // Should preserve the original instruction unchanged
         assert_eq!(result.len(), 1);
-        assert!(matches!(result[0], MirInst::BinaryOp(3, 1, BinaryOp::Mul, 2)));
+        assert!(matches!(
+            result[0],
+            MirInst::BinaryOp(3, 1, BinaryOp::Mul, 2)
+        ));
     }
 
     #[test]
@@ -469,7 +506,7 @@ mod tests {
         );
         // Should NOT fold: Const(1) is behind a Label boundary
         // (but r1=1 uses the same register as rhs — should find rhs=1 resolves to same Const(1, Int(5)))
-        // Actually: both lhs=1 and rhs=1 resolve to the same Const above Label(3) — 
+        // Actually: both lhs=1 and rhs=1 resolve to the same Const above Label(3) —
         // the find_const_backward stops at Label, so it WON'T find lhs/rhs.
         assert_eq!(result.len(), 1, "should not fold across block boundary");
     }

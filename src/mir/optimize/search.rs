@@ -51,15 +51,14 @@ pub fn greedy_search(
     if let Some(last_return) = current
         .iter()
         .rposition(|i| matches!(i, MirInst::Return(_)))
+        && last_return + 1 < current.len()
     {
-        if last_return + 1 < current.len() {
-            current.truncate(last_return + 1);
-            applied_rules.push(format!(
-                "dead_after_return (pre-truncated {} insts)",
-                current.len().saturating_sub(last_return + 1)
-            ));
-            current_cost = cost.body_cost(&current);
-        }
+        current.truncate(last_return + 1);
+        applied_rules.push(format!(
+            "dead_after_return (pre-truncated {} insts)",
+            current.len().saturating_sub(last_return + 1)
+        ));
+        current_cost = cost.body_cost(&current);
     }
 
     while iterations < max_iter {
@@ -122,7 +121,7 @@ pub fn greedy_search(
 mod tests {
     use super::*;
     use crate::mir::optimize::cost::{InstructionCount, TokenEstimate};
-    use crate::mir::optimize::rule::{builtin_rules, RedundantJumpRule};
+    use crate::mir::optimize::rule::{RedundantJumpRule, builtin_rules};
     use crate::value::Value;
 
     #[test]
@@ -143,7 +142,10 @@ mod tests {
         let rules = builtin_rules();
         let cost = InstructionCount;
         let result = greedy_search(&body, &rules, &cost, 5);
-        assert_eq!(result.iterations, 1, "Should converge immediately (no rules apply)");
+        assert_eq!(
+            result.iterations, 1,
+            "Should converge immediately (no rules apply)"
+        );
         assert_eq!(result.original_cost, result.final_cost);
     }
 
@@ -164,10 +166,7 @@ mod tests {
     #[test]
     fn test_greedy_search_respects_max_iter() {
         // 构造一个永远会匹配的 body（确保 max_iter 生效）
-        let body = vec![
-            MirInst::Jump(1),
-            MirInst::Const(0, Value::Int(1)),
-        ];
+        let body = vec![MirInst::Jump(1), MirInst::Const(0, Value::Int(1))];
         let rules: Vec<Box<dyn RewriteRule>> = vec![Box::new(RedundantJumpRule)];
         let cost = InstructionCount;
         let result = greedy_search(&body, &rules, &cost, 3);

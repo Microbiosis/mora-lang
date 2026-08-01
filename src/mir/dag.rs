@@ -13,7 +13,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
-use crate::mir::{Label, MirInst, MirFunction, Reg};
+use crate::mir::{Label, MirFunction, MirInst, Reg};
 
 /// Unique identifier for a DAG node.
 pub type NodeId = usize;
@@ -48,9 +48,7 @@ pub enum MirDagNode {
     },
     /// Side-effecting operation (Define, Assign, I/O, etc.).
     /// Must be executed in order — creates Sequence edges.
-    Effect {
-        inst: MirInst,
-    },
+    Effect { inst: MirInst },
     /// Control-flow branch point (JumpIf / JumpIfNot).
     Branch {
         cond: Reg,
@@ -58,18 +56,14 @@ pub enum MirDagNode {
         false_target: Option<NodeId>,
     },
     /// Unconditional jump to another node.
-    Jump {
-        target: Option<NodeId>,
-    },
+    Jump { target: Option<NodeId> },
     /// Phi node at a basic block boundary (SSA concept, placeholder).
     Phi {
         reg: Reg,
         sources: Vec<(NodeId, Reg)>,
     },
     /// Placeholder for labels (mapping Label→NodeId).
-    Label {
-        label: Label,
-    },
+    Label { label: Label },
     /// Tombstone for nodes removed during DAG optimization.
     Removed,
 }
@@ -116,10 +110,6 @@ struct BasicBlock {
     start: usize,
     /// Index after the last instruction (exclusive).
     end: usize,
-    /// Indices of successor blocks.
-    successors: Vec<usize>,
-    /// Label at the block entry, if any.
-    label: Option<Label>,
 }
 
 /// Partition `body` into basic blocks.
@@ -154,10 +144,10 @@ fn partition_blocks(body: &[MirInst]) -> Vec<BasicBlock> {
             | MirInst::JumpIfNot(_, _)
             | MirInst::Return(_)
             | MirInst::Break(_)
-            | MirInst::Continue(_) => {
-                if pc + 1 < body.len() {
-                    starts.insert(pc + 1);
-                }
+            | MirInst::Continue(_)
+                if pc + 1 < body.len() =>
+            {
+                starts.insert(pc + 1);
             }
             _ => {}
         }
@@ -176,43 +166,7 @@ fn partition_blocks(body: &[MirInst]) -> Vec<BasicBlock> {
             body.len()
         };
 
-        // Determine successors from the last instruction (terminator)
-        let last_inst = &body[end - 1];
-        let successors = match last_inst {
-            MirInst::Jump(target) => {
-                vec![*target]
-            }
-            MirInst::JumpIf(_, target) | MirInst::JumpIfNot(_, target) => {
-                // Two successors: the jump target, and fall-through (next block)
-                let mut succs = vec![*target];
-                if end < body.len() {
-                    succs.push(end); // fall-through = next block
-                }
-                succs
-            }
-            MirInst::Return(_) => vec![],
-            MirInst::Break(target) | MirInst::Continue(target) => vec![*target],
-            _ => {
-                // Not a terminator — fall-through to next block
-                if end < body.len() {
-                    vec![end]
-                } else {
-                    vec![]
-                }
-            }
-        };
-
-        let label = match &body[start] {
-            MirInst::Label(l) => Some(*l),
-            _ => None,
-        };
-
-        blocks.push(BasicBlock {
-            start,
-            end,
-            successors,
-            label,
-        });
+        blocks.push(BasicBlock { start, end });
     }
 
     blocks
@@ -239,23 +193,13 @@ pub fn dag_analyze(func: &MirFunction) -> MirDag {
         let mut block_first_node: Option<NodeId> = None;
         let mut prev_effect_node: Option<NodeId> = None;
 
-        for pc in blk.start..blk.end {
-            let inst = &body[pc];
-
+        for (pc, inst) in body.iter().enumerate().take(blk.end).skip(blk.start) {
             // Create the node (Branch cond is set to 0 temporarily, patched below)
             let node = if inst.is_effect() {
-                MirDagNode::Effect {
-                    inst: inst.clone(),
-                }
+                MirDagNode::Effect { inst: inst.clone() }
             } else if matches!(inst, MirInst::Jump(_)) {
                 MirDagNode::Jump { target: None }
-            } else if matches!(inst, MirInst::JumpIf(_, _)) {
-                MirDagNode::Branch {
-                    cond: 0,
-                    true_target: None,
-                    false_target: None,
-                }
-            } else if matches!(inst, MirInst::JumpIfNot(_, _)) {
+            } else if matches!(inst, MirInst::JumpIf(_, _) | MirInst::JumpIfNot(_, _)) {
                 MirDagNode::Branch {
                     cond: 0,
                     true_target: None,
@@ -270,9 +214,7 @@ pub fn dag_analyze(func: &MirFunction) -> MirDag {
                     input_regs: inst.input_regs(),
                 }
             } else {
-                MirDagNode::Effect {
-                    inst: inst.clone(),
-                }
+                MirDagNode::Effect { inst: inst.clone() }
             };
 
             // Push the node first, then patch Branch cond in-place
@@ -286,12 +228,12 @@ pub fn dag_analyze(func: &MirFunction) -> MirDag {
             }
 
             // Patch Branch nodes with the actual cond register (now mutable via nodes[idx])
-            if matches!(inst, MirInst::JumpIf(_, _) | MirInst::JumpIfNot(_, _)) {
-                if let MirDagNode::Branch { ref mut cond, .. } = nodes[idx] {
-                    match inst {
-                        MirInst::JumpIf(c, _) | MirInst::JumpIfNot(c, _) => *cond = *c,
-                        _ => {}
-                    }
+            if matches!(inst, MirInst::JumpIf(_, _) | MirInst::JumpIfNot(_, _))
+                && let MirDagNode::Branch { ref mut cond, .. } = nodes[idx]
+            {
+                match inst {
+                    MirInst::JumpIf(c, _) | MirInst::JumpIfNot(c, _) => *cond = *c,
+                    _ => {}
                 }
             }
 
@@ -335,7 +277,7 @@ pub fn dag_analyze(func: &MirFunction) -> MirDag {
                     }
                 }
             }
-            MirInst::JumpIf(cond, target) => {
+            MirInst::JumpIf(_cond, target) => {
                 if let Some(&target_id) = label_to_node.get(target) {
                     edges.push(MirDagEdge {
                         from: *node_id,
@@ -343,7 +285,8 @@ pub fn dag_analyze(func: &MirFunction) -> MirDag {
                         kind: EdgeKind::ControlIfTrue,
                     });
                     if let MirDagNode::Branch {
-                        ref mut true_target, ..
+                        ref mut true_target,
+                        ..
                     } = nodes[*node_id]
                     {
                         *true_target = Some(target_id);
@@ -366,7 +309,7 @@ pub fn dag_analyze(func: &MirFunction) -> MirDag {
                     }
                 }
             }
-            MirInst::JumpIfNot(cond, target) => {
+            MirInst::JumpIfNot(_cond, target) => {
                 if let Some(&target_id) = label_to_node.get(target) {
                     edges.push(MirDagEdge {
                         from: *node_id,
@@ -417,7 +360,7 @@ pub fn dag_analyze(func: &MirFunction) -> MirDag {
         // Track the last effect node for sequential ordering
         let mut last_effect: Option<NodeId> = None;
 
-        for pc in blk.start..blk.end {
+        for (pc, inst) in body.iter().enumerate().take(blk.end).skip(blk.start) {
             let Some(&node_id) = pc_to_node.get(&pc) else {
                 continue;
             };
@@ -426,7 +369,7 @@ pub fn dag_analyze(func: &MirFunction) -> MirDag {
 
             // For Compute AND Effect nodes that read registers (Define, Assign, etc.):
             // connect their input regs to definitions
-            let node_input_regs = body[pc].input_regs();
+            let node_input_regs = inst.input_regs();
             if !node_input_regs.is_empty() {
                 for &input_reg in &node_input_regs {
                     if let Some(&(def_node, _def_pc)) = reg_deps.get(&input_reg) {
@@ -440,14 +383,14 @@ pub fn dag_analyze(func: &MirFunction) -> MirDag {
             }
 
             // For Branch nodes: connect cond register
-            if let MirDagNode::Branch { cond, .. } = node {
-                if let Some(&(def_node, _def_pc)) = reg_deps.get(cond) {
-                    edges.push(MirDagEdge {
-                        from: def_node,
-                        to: node_id,
-                        kind: EdgeKind::Data { reg: *cond },
-                    });
-                }
+            if let MirDagNode::Branch { cond, .. } = node
+                && let Some(&(def_node, _def_pc)) = reg_deps.get(cond)
+            {
+                edges.push(MirDagEdge {
+                    from: def_node,
+                    to: node_id,
+                    kind: EdgeKind::Data { reg: *cond },
+                });
             }
 
             // Register the definition from this node (if any)
@@ -574,20 +517,42 @@ pub fn topological_order(dag: &MirDag) -> Option<Vec<NodeId>> {
 
 impl std::fmt::Display for MirDag {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        writeln!(f, "MirDag {{ n_nodes={}, n_edges={}, n_regs={} }}", self.nodes.len(), self.edges.len(), self.n_regs)?;
+        writeln!(
+            f,
+            "MirDag {{ n_nodes={}, n_edges={}, n_regs={} }}",
+            self.nodes.len(),
+            self.edges.len(),
+            self.n_regs
+        )?;
         writeln!(f, "  entry: {:?}", self.entry)?;
         writeln!(f, "  exit: {:?}", self.exit)?;
         writeln!(f, "  nodes:")?;
         for (i, node) in self.nodes.iter().enumerate() {
             match node {
-                MirDagNode::Compute { inst: _, dst, input_regs } => {
-                    writeln!(f, "    [{}] Compute dst=r{} inputs={:?}", i, dst, input_regs)?;
+                MirDagNode::Compute {
+                    inst: _,
+                    dst,
+                    input_regs,
+                } => {
+                    writeln!(
+                        f,
+                        "    [{}] Compute dst=r{} inputs={:?}",
+                        i, dst, input_regs
+                    )?;
                 }
                 MirDagNode::Effect { inst: _ } => {
                     writeln!(f, "    [{}] Effect", i)?;
                 }
-                MirDagNode::Branch { cond, true_target, false_target } => {
-                    writeln!(f, "    [{}] Branch cond=r{} true={:?} false={:?}", i, cond, true_target, false_target)?;
+                MirDagNode::Branch {
+                    cond,
+                    true_target,
+                    false_target,
+                } => {
+                    writeln!(
+                        f,
+                        "    [{}] Branch cond=r{} true={:?} false={:?}",
+                        i, cond, true_target, false_target
+                    )?;
                 }
                 MirDagNode::Jump { target } => {
                     writeln!(f, "    [{}] Jump target={:?}", i, target)?;
@@ -636,7 +601,9 @@ impl MirDag {
         for edge in &self.edges {
             has_incoming.insert(edge.to);
         }
-        self.entry = (0..n).filter(|&i| !self.nodes[i].is_removed() && !has_incoming.contains(&i)).collect();
+        self.entry = (0..n)
+            .filter(|&i| !self.nodes[i].is_removed() && !has_incoming.contains(&i))
+            .collect();
     }
 
     /// Add Sequence edges between consecutive nodes in each basic block.
@@ -753,7 +720,10 @@ mod tests {
             .iter()
             .filter(|e| matches!(e.kind, EdgeKind::Control))
             .collect();
-        assert!(!control_edges.is_empty(), "should have control edges from Jump");
+        assert!(
+            !control_edges.is_empty(),
+            "should have control edges from Jump"
+        );
     }
 
     #[test]
@@ -772,7 +742,7 @@ mod tests {
             .filter(|e| e.kind == EdgeKind::Sequence)
             .collect();
         assert!(
-            seq_edges.len() >= 1,
+            !seq_edges.is_empty(),
             "Effects should create Sequence edges to subsequent nodes (found {})",
             seq_edges.len()
         );
@@ -807,7 +777,10 @@ mod tests {
         // At minimum: r0 and r1 (no deps) in level 0,
         // r2 depends on r0,r1 → level 1,
         // r3 depends on r2 → level 2+
-        assert!(levels.len() >= 2, "dependent chain should span multiple levels");
+        assert!(
+            levels.len() >= 2,
+            "dependent chain should span multiple levels"
+        );
     }
 
     #[test]
@@ -824,17 +797,22 @@ mod tests {
         let mut dag_seq = dag_analyze(&func);
         dag_seq.add_sequential_edges();
         let levels_linear = topological_sort(&dag_seq).unwrap();
-        assert!(levels_linear.len() > levels_before.len(),
+        assert!(
+            levels_linear.len() > levels_before.len(),
             "sequential edges increase level count: before={} after={}",
-            levels_before.len(), levels_linear.len());
+            levels_before.len(),
+            levels_linear.len()
+        );
 
         // After pruning: two Consts should be in same level
         let mut dag_pruned = dag_analyze(&func);
         dag_pruned.prune_sequence_edges();
         let levels_pruned = topological_sort(&dag_pruned).unwrap();
-        assert!(levels_pruned.len() <= 2,
+        assert!(
+            levels_pruned.len() <= 2,
             "pruned DAG should have <=2 levels (Consts parallel), got {}",
-            levels_pruned.len());
+            levels_pruned.len()
+        );
     }
 
     #[test]

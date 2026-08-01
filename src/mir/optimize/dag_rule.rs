@@ -6,7 +6,6 @@
 //! a `DagRewrite` that describes which nodes to add, remove, and
 //! which edges to redirect.
 
-use crate::common::BinaryOp;
 use crate::mir::dag::{EdgeKind, MirDag, MirDagEdge, MirDagNode, NodeId};
 use crate::mir::{MirInst, Reg};
 use crate::value::Value;
@@ -26,7 +25,11 @@ pub struct DagRewrite {
 
 impl DagRewrite {
     pub fn empty() -> Self {
-        DagRewrite { added: vec![], removed: vec![], added_edges: vec![] }
+        DagRewrite {
+            added: vec![],
+            removed: vec![],
+            added_edges: vec![],
+        }
     }
 }
 
@@ -40,7 +43,9 @@ pub trait DagRewriteRule {
     /// Produce a rewrite for the given node, or None if not applicable.
     fn rewrite(&self, node_id: NodeId, dag: &MirDag) -> Option<DagRewrite>;
 
-    fn cost_gain(&self) -> i32 { 1 }
+    fn cost_gain(&self) -> i32 {
+        1
+    }
 }
 
 // ─── Helpers ────────────────────────────────────────────────────────
@@ -48,7 +53,10 @@ pub trait DagRewriteRule {
 /// Find the value of a Const node, if it is one.
 fn const_value(node: &MirDagNode) -> Option<&Value> {
     match node {
-        MirDagNode::Compute { inst: MirInst::Const(_, v), .. } => Some(v),
+        MirDagNode::Compute {
+            inst: MirInst::Const(_, v),
+            ..
+        } => Some(v),
         _ => None,
     }
 }
@@ -69,20 +77,10 @@ fn find_data_source(dag: &MirDag, node_id: NodeId, reg: Reg) -> Option<NodeId> {
 
 /// Find all outgoing Data edges from `node_id`.
 fn outgoing_data_edges(dag: &MirDag, node_id: NodeId) -> Vec<&MirDagEdge> {
-    dag.edges.iter().filter(|e| e.from == node_id && matches!(e.kind, EdgeKind::Data { .. })).collect()
-}
-
-/// Find all incoming edges to `node_id`.
-fn incoming_edges(dag: &MirDag, node_id: NodeId) -> Vec<&MirDagEdge> {
-    dag.edges.iter().filter(|e| e.to == node_id).collect()
-}
-
-/// Find the destination register of a Compute node.
-fn node_dst(node: &MirDagNode) -> Option<Reg> {
-    match node {
-        MirDagNode::Compute { dst, .. } => Some(*dst),
-        _ => None,
-    }
+    dag.edges
+        .iter()
+        .filter(|e| e.from == node_id && matches!(e.kind, EdgeKind::Data { .. }))
+        .collect()
 }
 
 // ─── Rule 1: Constant Folding on DAG ────────────────────────────────
@@ -92,16 +90,27 @@ fn node_dst(node: &MirDagNode) -> Option<Reg> {
 pub struct ConstFoldingDagRule;
 
 impl DagRewriteRule for ConstFoldingDagRule {
-    fn name(&self) -> &'static str { "dag_const_folding" }
+    fn name(&self) -> &'static str {
+        "dag_const_folding"
+    }
 
     fn matches(&self, _node_id: NodeId, node: &MirDagNode, _dag: &MirDag) -> bool {
-        matches!(node, MirDagNode::Compute { inst: MirInst::BinaryOp(..), .. })
+        matches!(
+            node,
+            MirDagNode::Compute {
+                inst: MirInst::BinaryOp(..),
+                ..
+            }
+        )
     }
 
     fn rewrite(&self, node_id: NodeId, dag: &MirDag) -> Option<DagRewrite> {
         let node = dag.nodes.get(node_id)?;
         let (dst, lhs_reg, op, rhs_reg) = match node {
-            MirDagNode::Compute { inst: MirInst::BinaryOp(d, l, o, r), .. } => (d, l, o, r),
+            MirDagNode::Compute {
+                inst: MirInst::BinaryOp(d, l, o, r),
+                ..
+            } => (d, l, o, r),
             _ => return None,
         };
 
@@ -120,7 +129,9 @@ impl DagRewriteRule for ConstFoldingDagRule {
             input_regs: vec![],
         };
 
-        let out_edges: Vec<(NodeId, NodeId, EdgeKind)> = dag.edges.iter()
+        let out_edges: Vec<(NodeId, NodeId, EdgeKind)> = dag
+            .edges
+            .iter()
             .filter(|e| e.from == node_id)
             // v0.75.6: placeholder 用 usize::MAX（此前用 0，与「节点 0 是合法 id」
             // 冲突 — 含变量操作数的真实代码会触发 index out of bounds）。
@@ -128,13 +139,23 @@ impl DagRewriteRule for ConstFoldingDagRule {
             .collect();
 
         let mut removed = vec![node_id];
-        if outgoing_data_edges(dag, lhs_src).len() <= 1 { removed.push(lhs_src); }
-        if outgoing_data_edges(dag, rhs_src).len() <= 1 { removed.push(rhs_src); }
+        if outgoing_data_edges(dag, lhs_src).len() <= 1 {
+            removed.push(lhs_src);
+        }
+        if outgoing_data_edges(dag, rhs_src).len() <= 1 {
+            removed.push(rhs_src);
+        }
 
-        Some(DagRewrite { added: vec![new_node], removed, added_edges: out_edges })
+        Some(DagRewrite {
+            added: vec![new_node],
+            removed,
+            added_edges: out_edges,
+        })
     }
 
-    fn cost_gain(&self) -> i32 { 2 }
+    fn cost_gain(&self) -> i32 {
+        2
+    }
 }
 
 // ─── Rule 2: Dead Node Removal on DAG ───────────────────────────────
@@ -145,7 +166,9 @@ impl DagRewriteRule for ConstFoldingDagRule {
 pub struct DeadNodeDagRule;
 
 impl DagRewriteRule for DeadNodeDagRule {
-    fn name(&self) -> &'static str { "dag_dead_node" }
+    fn name(&self) -> &'static str {
+        "dag_dead_node"
+    }
 
     fn matches(&self, _node_id: NodeId, node: &MirDagNode, _dag: &MirDag) -> bool {
         matches!(node, MirDagNode::Compute { .. })
@@ -153,14 +176,24 @@ impl DagRewriteRule for DeadNodeDagRule {
 
     fn rewrite(&self, node_id: NodeId, dag: &MirDag) -> Option<DagRewrite> {
         // Don't remove exit nodes (they carry the function's result)
-        if dag.exit.contains(&node_id) { return None; }
+        if dag.exit.contains(&node_id) {
+            return None;
+        }
         let has_outgoing = dag.edges.iter().any(|e| e.from == node_id);
-        if has_outgoing { return None; }
+        if has_outgoing {
+            return None;
+        }
 
-        Some(DagRewrite { added: vec![], removed: vec![node_id], added_edges: vec![] })
+        Some(DagRewrite {
+            added: vec![],
+            removed: vec![node_id],
+            added_edges: vec![],
+        })
     }
 
-    fn cost_gain(&self) -> i32 { 1 }
+    fn cost_gain(&self) -> i32 {
+        1
+    }
 }
 
 // ─── Rule 3: Common Subexpression Elimination on DAG ────────────────
@@ -170,7 +203,9 @@ impl DagRewriteRule for DeadNodeDagRule {
 pub struct CseDagRule;
 
 impl DagRewriteRule for CseDagRule {
-    fn name(&self) -> &'static str { "dag_cse" }
+    fn name(&self) -> &'static str {
+        "dag_cse"
+    }
 
     fn matches(&self, _node_id: NodeId, node: &MirDagNode, _dag: &MirDag) -> bool {
         // Any pure Compute node is a candidate
@@ -186,12 +221,18 @@ impl DagRewriteRule for CseDagRule {
 
         // Scan prior nodes for an equivalent one
         for prev_id in 0..node_id {
-            if prev_id == node_id { break; }
-            if dag.nodes[prev_id].is_removed() { continue; }
+            if prev_id == node_id {
+                break;
+            }
+            if dag.nodes[prev_id].is_removed() {
+                continue;
+            }
 
             if nodes_equivalent(&dag.nodes[prev_id], node, prev_id, node_id, dag) {
                 // Found equivalent — redirect outgoing edges from node_id to prev_id
-                let out_edges: Vec<(NodeId, NodeId, EdgeKind)> = dag.edges.iter()
+                let out_edges: Vec<(NodeId, NodeId, EdgeKind)> = dag
+                    .edges
+                    .iter()
                     .filter(|e| e.from == node_id)
                     .map(|e| (prev_id, e.to, e.kind.clone()))
                     .collect();
@@ -206,31 +247,53 @@ impl DagRewriteRule for CseDagRule {
         None
     }
 
-    fn cost_gain(&self) -> i32 { 2 }
+    fn cost_gain(&self) -> i32 {
+        2
+    }
 }
 
 /// Check if two Compute nodes are structurally equivalent:
 /// same instruction type + same data sources.
-fn nodes_equivalent(a: &MirDagNode, b: &MirDagNode, a_id: NodeId, b_id: NodeId, dag: &MirDag) -> bool {
+fn nodes_equivalent(
+    a: &MirDagNode,
+    b: &MirDagNode,
+    a_id: NodeId,
+    b_id: NodeId,
+    dag: &MirDag,
+) -> bool {
     let (inst_a, _dst_a, inputs_a) = match a {
-        MirDagNode::Compute { inst, dst, input_regs } => (inst, dst, input_regs),
+        MirDagNode::Compute {
+            inst,
+            dst,
+            input_regs,
+        } => (inst, dst, input_regs),
         _ => return false,
     };
     let (inst_b, _dst_b, inputs_b) = match b {
-        MirDagNode::Compute { inst, dst, input_regs } => (inst, dst, input_regs),
+        MirDagNode::Compute {
+            inst,
+            dst,
+            input_regs,
+        } => (inst, dst, input_regs),
         _ => return false,
     };
 
-    if inputs_a.len() != inputs_b.len() { return false; }
+    if inputs_a.len() != inputs_b.len() {
+        return false;
+    }
 
     // Same instruction category?
-    if !same_inst_category(inst_a, inst_b) { return false; }
+    if !same_inst_category(inst_a, inst_b) {
+        return false;
+    }
 
     // Same data sources for each input register?
     for (&reg_a, &reg_b) in inputs_a.iter().zip(inputs_b.iter()) {
         let src_a = find_data_source(dag, a_id, reg_a);
         let src_b = find_data_source(dag, b_id, reg_b);
-        if src_a != src_b { return false; }
+        if src_a != src_b {
+            return false;
+        }
     }
 
     true
@@ -262,16 +325,27 @@ enum ReplaceWith {
 pub struct AlgebraicSimplifyDagRule;
 
 impl DagRewriteRule for AlgebraicSimplifyDagRule {
-    fn name(&self) -> &'static str { "dag_algebraic" }
+    fn name(&self) -> &'static str {
+        "dag_algebraic"
+    }
 
     fn matches(&self, _node_id: NodeId, node: &MirDagNode, _dag: &MirDag) -> bool {
-        matches!(node, MirDagNode::Compute { inst: MirInst::BinaryOp(..), .. })
+        matches!(
+            node,
+            MirDagNode::Compute {
+                inst: MirInst::BinaryOp(..),
+                ..
+            }
+        )
     }
 
     fn rewrite(&self, node_id: NodeId, dag: &MirDag) -> Option<DagRewrite> {
         let node = dag.nodes.get(node_id)?;
         let (dst, lhs_reg, op, rhs_reg) = match node {
-            MirDagNode::Compute { inst: MirInst::BinaryOp(d, l, o, r), .. } => (d, l, o, r),
+            MirDagNode::Compute {
+                inst: MirInst::BinaryOp(d, l, o, r),
+                ..
+            } => (d, l, o, r),
             _ => return None,
         };
 
@@ -284,37 +358,70 @@ impl DagRewriteRule for AlgebraicSimplifyDagRule {
         use crate::common::BinaryOp::*;
         let (replacement, removed) = match (op, lhs_val, rhs_val) {
             // x + 0 → x
-            (Add, Some(Value::Int(0)), _) => (ReplaceWith::ReplaceWithSource(*rhs_reg, rhs_src), vec![node_id]),
-            (Add, _, Some(Value::Int(0))) => (ReplaceWith::ReplaceWithSource(*lhs_reg, lhs_src), vec![node_id]),
+            (Add, Some(Value::Int(0)), _) => (
+                ReplaceWith::ReplaceWithSource(*rhs_reg, rhs_src),
+                vec![node_id],
+            ),
+            (Add, _, Some(Value::Int(0))) => (
+                ReplaceWith::ReplaceWithSource(*lhs_reg, lhs_src),
+                vec![node_id],
+            ),
             // x * 1 → x
-            (Mul, Some(Value::Int(1)), _) => (ReplaceWith::ReplaceWithSource(*rhs_reg, rhs_src), vec![node_id]),
-            (Mul, _, Some(Value::Int(1))) => (ReplaceWith::ReplaceWithSource(*lhs_reg, lhs_src), vec![node_id]),
+            (Mul, Some(Value::Int(1)), _) => (
+                ReplaceWith::ReplaceWithSource(*rhs_reg, rhs_src),
+                vec![node_id],
+            ),
+            (Mul, _, Some(Value::Int(1))) => (
+                ReplaceWith::ReplaceWithSource(*lhs_reg, lhs_src),
+                vec![node_id],
+            ),
             // x * 0 → 0
-            (Mul, Some(Value::Int(0)), _) => (ReplaceWith::ReplaceWithConst(*dst, Value::Int(0)), vec![node_id]),
-            (Mul, _, Some(Value::Int(0))) => (ReplaceWith::ReplaceWithConst(*dst, Value::Int(0)), vec![node_id]),
+            (Mul, Some(Value::Int(0)), _) => (
+                ReplaceWith::ReplaceWithConst(*dst, Value::Int(0)),
+                vec![node_id],
+            ),
+            (Mul, _, Some(Value::Int(0))) => (
+                ReplaceWith::ReplaceWithConst(*dst, Value::Int(0)),
+                vec![node_id],
+            ),
             // x - 0 → x
-            (Sub, _, Some(Value::Int(0))) => (ReplaceWith::ReplaceWithSource(*lhs_reg, lhs_src), vec![node_id]),
+            (Sub, _, Some(Value::Int(0))) => (
+                ReplaceWith::ReplaceWithSource(*lhs_reg, lhs_src),
+                vec![node_id],
+            ),
             _ => return None,
         };
 
         match replacement {
             ReplaceWith::ReplaceWithConst(d, v) => Some(DagRewrite {
-                added: vec![MirDagNode::Compute { inst: MirInst::Const(d, v), dst: d, input_regs: vec![] }],
+                added: vec![MirDagNode::Compute {
+                    inst: MirInst::Const(d, v),
+                    dst: d,
+                    input_regs: vec![],
+                }],
                 removed,
                 added_edges: vec![],
             }),
             ReplaceWith::ReplaceWithSource(reg, Some(src_id)) => {
-                let out_edges: Vec<(NodeId, NodeId, EdgeKind)> = dag.edges.iter()
+                let out_edges: Vec<(NodeId, NodeId, EdgeKind)> = dag
+                    .edges
+                    .iter()
                     .filter(|e| e.from == node_id)
                     .map(|e| (src_id, e.to, EdgeKind::Data { reg }))
                     .collect();
-                Some(DagRewrite { added: vec![], removed, added_edges: out_edges })
+                Some(DagRewrite {
+                    added: vec![],
+                    removed,
+                    added_edges: out_edges,
+                })
             }
             _ => None,
         }
     }
 
-    fn cost_gain(&self) -> i32 { 2 }
+    fn cost_gain(&self) -> i32 {
+        2
+    }
 }
 
 // ─── Tests ──────────────────────────────────────────────────────────
@@ -322,12 +429,22 @@ impl DagRewriteRule for AlgebraicSimplifyDagRule {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::common::BinaryOp;
     use crate::mir::dag;
     use crate::mir::{MirFunction, MirInst};
 
     fn make_dag(body: Vec<MirInst>) -> MirDag {
-        let n = body.iter().filter_map(|i| i.dst()).max().map(|r| r + 1).unwrap_or(1);
-        let func = MirFunction { params: vec![], body, n_regs: n };
+        let n = body
+            .iter()
+            .filter_map(|i| i.dst())
+            .max()
+            .map(|r| r + 1)
+            .unwrap_or(1);
+        let func = MirFunction {
+            params: vec![],
+            body,
+            n_regs: n,
+        };
         dag::dag_analyze(&func)
     }
 
@@ -340,7 +457,19 @@ mod tests {
             MirInst::BinaryOp(2, 0, BinaryOp::Add, 1),
         ]);
         // Find the BinaryOp node
-        let binop_id = dag.nodes.iter().position(|n| matches!(n, MirDagNode::Compute { inst: MirInst::BinaryOp(..), .. })).unwrap();
+        let binop_id = dag
+            .nodes
+            .iter()
+            .position(|n| {
+                matches!(
+                    n,
+                    MirDagNode::Compute {
+                        inst: MirInst::BinaryOp(..),
+                        ..
+                    }
+                )
+            })
+            .unwrap();
 
         let rule = ConstFoldingDagRule;
         let rw = rule.rewrite(binop_id, &dag).expect("should fold constants");
@@ -348,7 +477,10 @@ mod tests {
         assert!(rw.removed.contains(&binop_id), "should remove BinaryOp");
         // The new node should be a Const with value 42
         match &rw.added[0] {
-            MirDagNode::Compute { inst: MirInst::Const(_, v), .. } => {
+            MirDagNode::Compute {
+                inst: MirInst::Const(_, v),
+                ..
+            } => {
                 assert_eq!(*v, Value::Int(42));
             }
             _ => panic!("expected Const node"),
@@ -363,9 +495,24 @@ mod tests {
             MirInst::Const(1, Value::Int(10)),
             MirInst::BinaryOp(2, 0, BinaryOp::Add, 1),
         ]);
-        let binop_id = dag.nodes.iter().position(|n| matches!(n, MirDagNode::Compute { inst: MirInst::BinaryOp(..), .. })).unwrap();
+        let binop_id = dag
+            .nodes
+            .iter()
+            .position(|n| {
+                matches!(
+                    n,
+                    MirDagNode::Compute {
+                        inst: MirInst::BinaryOp(..),
+                        ..
+                    }
+                )
+            })
+            .unwrap();
         let rule = ConstFoldingDagRule;
-        assert!(rule.rewrite(binop_id, &dag).is_none(), "should not fold non-const lhs");
+        assert!(
+            rule.rewrite(binop_id, &dag).is_none(),
+            "should not fold non-const lhs"
+        );
     }
 
     #[test]
@@ -378,10 +525,19 @@ mod tests {
             MirInst::BinaryOp(3, 0, BinaryOp::Add, 1),
         ]);
         // BinaryOp at r3 (node with dst=3) should be eliminated
-        let dup_id = dag.nodes.iter().position(|n| matches!(n, MirDagNode::Compute { dst: 3, .. })).unwrap();
+        let dup_id = dag
+            .nodes
+            .iter()
+            .position(|n| matches!(n, MirDagNode::Compute { dst: 3, .. }))
+            .unwrap();
         let rule = CseDagRule;
-        let rw = rule.rewrite(dup_id, &dag).expect("should eliminate duplicate");
-        assert!(rw.removed.contains(&dup_id), "should remove the duplicate BinaryOp");
+        let rw = rule
+            .rewrite(dup_id, &dag)
+            .expect("should eliminate duplicate");
+        assert!(
+            rw.removed.contains(&dup_id),
+            "should remove the duplicate BinaryOp"
+        );
     }
 
     #[test]
@@ -390,11 +546,18 @@ mod tests {
             MirInst::Const(0, Value::Int(10)),
             MirInst::Const(1, Value::Int(20)),
             MirInst::BinaryOp(2, 0, BinaryOp::Add, 1),
-            MirInst::BinaryOp(3, 0, BinaryOp::Mul, 1),  // different op
+            MirInst::BinaryOp(3, 0, BinaryOp::Mul, 1), // different op
         ]);
-        let dup_id = dag.nodes.iter().position(|n| matches!(n, MirDagNode::Compute { dst: 3, .. })).unwrap();
+        let dup_id = dag
+            .nodes
+            .iter()
+            .position(|n| matches!(n, MirDagNode::Compute { dst: 3, .. }))
+            .unwrap();
         let rule = CseDagRule;
-        assert!(rule.rewrite(dup_id, &dag).is_none(), "different ops should not be eliminated");
+        assert!(
+            rule.rewrite(dup_id, &dag).is_none(),
+            "different ops should not be eliminated"
+        );
     }
 
     #[test]
@@ -405,7 +568,11 @@ mod tests {
             MirInst::Const(1, Value::Int(0)),
             MirInst::BinaryOp(2, 0, BinaryOp::Add, 1),
         ]);
-        let binop_id = dag.nodes.iter().position(|n| matches!(n, MirDagNode::Compute { dst: 2, .. })).unwrap();
+        let binop_id = dag
+            .nodes
+            .iter()
+            .position(|n| matches!(n, MirDagNode::Compute { dst: 2, .. }))
+            .unwrap();
         let rule = AlgebraicSimplifyDagRule;
         let rw = rule.rewrite(binop_id, &dag).expect("x+0 should simplify");
         assert!(rw.removed.contains(&binop_id), "should remove the add");
@@ -418,7 +585,11 @@ mod tests {
             MirInst::Const(1, Value::Int(1)),
             MirInst::BinaryOp(2, 0, BinaryOp::Mul, 1),
         ]);
-        let binop_id = dag.nodes.iter().position(|n| matches!(n, MirDagNode::Compute { dst: 2, .. })).unwrap();
+        let binop_id = dag
+            .nodes
+            .iter()
+            .position(|n| matches!(n, MirDagNode::Compute { dst: 2, .. }))
+            .unwrap();
         let rule = AlgebraicSimplifyDagRule;
         let rw = rule.rewrite(binop_id, &dag).expect("x*1 should simplify");
         assert!(rw.removed.contains(&binop_id));
@@ -431,12 +602,21 @@ mod tests {
             MirInst::Const(1, Value::Int(0)),
             MirInst::BinaryOp(2, 0, BinaryOp::Mul, 1),
         ]);
-        let binop_id = dag.nodes.iter().position(|n| matches!(n, MirDagNode::Compute { dst: 2, .. })).unwrap();
+        let binop_id = dag
+            .nodes
+            .iter()
+            .position(|n| matches!(n, MirDagNode::Compute { dst: 2, .. }))
+            .unwrap();
         let rule = AlgebraicSimplifyDagRule;
-        let rw = rule.rewrite(binop_id, &dag).expect("x*0 should simplify to 0");
+        let rw = rule
+            .rewrite(binop_id, &dag)
+            .expect("x*0 should simplify to 0");
         assert_eq!(rw.added.len(), 1);
         match &rw.added[0] {
-            MirDagNode::Compute { inst: MirInst::Const(_, v), .. } => assert_eq!(*v, Value::Int(0)),
+            MirDagNode::Compute {
+                inst: MirInst::Const(_, v),
+                ..
+            } => assert_eq!(*v, Value::Int(0)),
             _ => panic!("expected Const(0)"),
         }
     }

@@ -10,6 +10,10 @@
 
 use std::sync::Arc;
 
+/// SmartCrusher json 策略的目标大小除数：`target = max_bytes / 200`
+/// （即目标 ≈ 原文的 1/200，经验压缩比兜底）。与 target_ratio 二选一。
+const SMART_CRUSHER_TARGET_DIVISOR: usize = 200;
+
 /// v0.30: 压缩选项 (跨子压缩器共享)
 #[derive(Debug, Clone)]
 pub struct CompressOptions {
@@ -256,7 +260,7 @@ pub fn compress_top(
     if strategy == "json" {
         // 优先按 max_bytes 推 target; 否则按 target_ratio 推; 兜底 N/2
         let target = if let Some(mb) = options.max_bytes {
-            (mb / 200).max(1)
+            (mb / SMART_CRUSHER_TARGET_DIVISOR).max(1)
         } else if let Some(ratio) = options.target_ratio {
             let n = match input {
                 crate::value::Value::List(l) => l.len(),

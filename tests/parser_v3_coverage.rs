@@ -6,7 +6,6 @@
 //! - `obj.method(args)`         (MethodCall，V3 编码为 Call("obj_method", [obj, ...]))
 //! - `expr[idx]`                (Index，V3 编码为 Call("expr_index", [expr, idx]))
 
-
 fn parse_v3(source: &str) -> Vec<mora::mir::expr::MirExpr> {
     let mut lexer = mora::lexer::Lexer::new(source);
     let tokens = lexer.scan_tokens();

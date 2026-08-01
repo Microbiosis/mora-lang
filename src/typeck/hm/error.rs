@@ -5,7 +5,10 @@ use crate::common::Span;
 ///  Hindley-Milner Type Inference Errors
 #[derive(Debug, Clone)]
 pub enum TypeError {
-    UnboundVariable { name: String, span: Span },
+    UnboundVariable {
+        name: String,
+        span: Span,
+    },
 
     ArityMismatch {
         expected: usize,
@@ -13,7 +16,10 @@ pub enum TypeError {
         span: Span,
     },
 
-    NotAClosure { found: String, span: Span },
+    NotAClosure {
+        found: String,
+        span: Span,
+    },
 
     UnificationFailure {
         expected: String,
@@ -31,7 +37,10 @@ pub enum TypeError {
     /// HM
     HmDisabled,
 
-    GeneralizationFailed { reason: String, span: Option<Span> },
+    GeneralizationFailed {
+        reason: String,
+        span: Option<Span>,
+    },
 }
 
 impl std::fmt::Display for TypeError {

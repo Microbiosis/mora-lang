@@ -89,7 +89,8 @@ fn full_program_with_let_if_match_parses() {
     // Each construct is parsed independently; combining all of them in a
     // single top-level program would require the if/match statement forms
     // that the v0.55 minimal grammar intentionally leaves out.
-    let exprs = parse_code_v3("let x = 1 + 2\nlet y = x * 3").expect("two let bindings should parse");
+    let exprs =
+        parse_code_v3("let x = 1 + 2\nlet y = x * 3").expect("two let bindings should parse");
     assert_eq!(exprs.len(), 2, "two let bindings = 2 top-level exprs");
     let _ = parse_code_v3("if 1 < 2 then 3 else 4").expect("if/else expression should parse");
     let _ = parse_code_v3("match 1 { 1 => 10, _ => 20 }").expect("match expression should parse");
@@ -101,7 +102,8 @@ fn mcp_server_patterns_parse() {
     // :: namespace qualification
     parse_code_v3("let mcp = McpServer::new()").expect(":: should parse");
     // keyword 'tool' used as method name after '.'
-    parse_code_v3("mcp.tool(\"search\", {query: \"s\"}, fn(x) => x)").expect("method chain should parse");
+    parse_code_v3("mcp.tool(\"search\", {query: \"s\"}, fn(x) => x)")
+        .expect("method chain should parse");
     // fn with block body (end-terminated)
     parse_code_v3("fn(x)\n  return x\nend").expect("fn block body should parse");
 }

@@ -12,12 +12,11 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::checkpoint::Checkpoint;
 use crate::common::BinaryOp;
 use crate::flow::eval_binary;
 use crate::mir::expr::{MirOrchestrateKind, MirPregelConfig};
 use crate::mir::host::MirHost;
-use crate::mir::interp::{build_task_registry, index_value, run_mir, self_match_pattern};
+use crate::mir::interp::{index_value, run_mir, self_match_pattern};
 use crate::mir::{MirFunction, MirInst, Reg};
 use crate::runtime::types::{TraitInfo, TraitMethodSig};
 use crate::value::{Environment, Value};
@@ -538,7 +537,7 @@ pub fn h_trait_def(
             methods: sigs,
         },
     );
-    for (m, body) in methods.iter().zip(method_bodies.iter()) {
+    for (m, _body) in methods.iter().zip(method_bodies.iter()) {
         if let Some(mfn) = &m.body {
             let key = crate::runtime::types::default_impl_method_key(
                 name,
@@ -559,6 +558,7 @@ pub fn h_trait_def(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn h_impl_def(
     interp: &mut dyn MirHost,
     env: &mut Environment,
@@ -715,6 +715,7 @@ pub fn h_eval(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn h_skill_def(
     env: &mut Environment,
     name: &str,
@@ -811,10 +812,8 @@ pub fn h_match_expr(
             break;
         }
     }
-    if !matched {
-        if let Some((_pat, _cond, _func, output_reg)) = arms.first() {
-            regs[*output_reg] = Value::Nil;
-        }
+    if !matched && let Some((_pat, _cond, _func, output_reg)) = arms.first() {
+        regs[*output_reg] = Value::Nil;
     }
     Ok(())
 }
@@ -972,8 +971,7 @@ impl MirInst {
             | MirInst::Label(_)
             | MirInst::Jump(_)
             | MirInst::Break(_)
-            | MirInst::Continue(_)
-            | MirInst::Halt(_) => vec![],
+            | MirInst::Continue(_) => vec![],
         }
     }
 

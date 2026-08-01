@@ -6,7 +6,7 @@
 //! (dynamic work-stealing = partition) with results collected and
 //! re-sorted by original index (the join = barrier).
 
-use std::sync::mpsc::{Receiver, Sender, channel};
+use std::sync::mpsc::{Sender, channel};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 

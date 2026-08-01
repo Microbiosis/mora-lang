@@ -63,7 +63,9 @@ pub mod ssa_pattern;
 use crate::mir::MirFunction;
 use crate::mir::dag::MirDag;
 use crate::mir::optimize::cost::TokenEstimate;
-use crate::mir::optimize::dag_rule::{AlgebraicSimplifyDagRule, ConstFoldingDagRule, CseDagRule, DeadNodeDagRule, DagRewriteRule};
+use crate::mir::optimize::dag_rule::{
+    AlgebraicSimplifyDagRule, ConstFoldingDagRule, CseDagRule, DagRewriteRule, DeadNodeDagRule,
+};
 use crate::mir::optimize::dag_search::dag_search_staged;
 use crate::mir::optimize::rule::builtin_rules;
 use crate::mir::optimize::search::greedy_search;
@@ -77,8 +79,9 @@ pub fn apply_rules(func: &mut MirFunction) {
     let result = greedy_search(&func.body, &rules, &cost, 50);
     func.body = result.body;
     func.n_regs = func.n_regs.max(
-        func.body.iter().map(|inst| {
-            match inst {
+        func.body
+            .iter()
+            .map(|inst| match inst {
                 crate::mir::MirInst::Const(r, _)
                 | crate::mir::MirInst::Var(r, _)
                 | crate::mir::MirInst::BinaryOp(r, ..)
@@ -92,8 +95,9 @@ pub fn apply_rules(func: &mut MirFunction) {
                 | crate::mir::MirInst::ListLit(r, ..)
                 | crate::mir::MirInst::DictLit(r, ..) => r + 1,
                 _ => 0,
-            }
-        }).max().unwrap_or(0),
+            })
+            .max()
+            .unwrap_or(0),
     );
 }
 

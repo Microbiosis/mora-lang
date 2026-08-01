@@ -1,7 +1,7 @@
 use std::collections::{BTreeSet, HashMap};
 
 use super::parsed_doc_v3;
-use super::parsed_doc_v3::{make_completion};
+use super::parsed_doc_v3::make_completion;
 use crate::lsp::json::Value;
 use crate::lsp::server::DocumentState;
 

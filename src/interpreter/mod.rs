@@ -367,10 +367,10 @@ impl Interpreter {
             let checkpoints = saver.list(thread_id)?;
             let mut to_remove: Vec<String> = Vec::new();
             for id in checkpoints {
-                if let Some(cp) = saver.load(thread_id, Some(&id))? {
-                    if cp.step >= before_step {
-                        to_remove.push(id);
-                    }
+                if let Some(cp) = saver.load(thread_id, Some(&id))?
+                    && cp.step >= before_step
+                {
+                    to_remove.push(id);
                 }
             }
             for id in to_remove {
@@ -545,7 +545,6 @@ impl Interpreter {
     /// α.11: 通过 MIR 解释器求值单个 AST 表达式。
     /// 注：原 `mir_eval_expr` (走 lower_expr_only + ast_v2) 在 v0.55 删除 — 无外部调用者。
     /// 改用纯 MIR 路径请调用 `crate::mir::lower::lower_mir_exprs` + `run_mir`。
-
     /// v0.22: 字符串驻留 - 相同字符串只存储一次
     pub fn intern_string(&mut self, s: String) -> Value {
         // v0.49.0 (C2): LRU cache + lock (was unbounded HashMap direct access)

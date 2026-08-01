@@ -9,9 +9,6 @@
 //! v0.75.x: 参数类型从 `&mut Interpreter` 改为 `&mut dyn MirHost`（mir/host.rs），
 //! 解耦 mir ↔ interpreter 双向依赖。Interpreter 实现 MirHost。
 
-use crate::flow::eval_binary;
-use crate::mir::expr::{MirOrchestrateKind, MirPregelConfig};
-use crate::mir::handlers::Flow;
 use crate::mir::host::MirHost;
 use crate::value::{Environment, Value};
 
@@ -20,11 +17,13 @@ use super::{MirFunction, MirInst, cache};
 use std::collections::HashMap;
 use std::sync::Arc;
 
+/// float 模式匹配容差（`pat_str = "float:x"` 时 |实际 - x| < 此值判等）。
+/// 与 eval 的 tolerance 语义一致：浮点比较用 epsilon 而非 ==。
+const FLOAT_PATTERN_EPSILON: f64 = 1e-9;
+
 /// Build a task registry from a MirFunction body.
 /// Maps task name → (parameter names, body function).
-pub fn build_task_registry<'a>(
-    body: &'a [MirInst],
-) -> HashMap<&'a str, (&'a [String], &'a MirFunction)> {
+pub fn build_task_registry(body: &[MirInst]) -> HashMap<&str, (&[String], &MirFunction)> {
     body.iter()
         .filter_map(|inst| {
             if let MirInst::TaskDef { name, params, body } = inst {
@@ -175,7 +174,7 @@ pub fn self_match_pattern(
         && let Value::Float(f) = val
         && let Ok(n) = suffix.parse::<f64>()
     {
-        return (f - n).abs() < 1e-9;
+        return (f - n).abs() < FLOAT_PATTERN_EPSILON;
     }
     // str 模式: str:hello
     if let Some(suffix) = pat_str.strip_prefix("str:")

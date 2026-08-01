@@ -263,14 +263,33 @@ fn freed_reserved_words_usable_as_identifiers() {
 }
 
 #[test]
-fn pipe_token_unconnected_to_parser_preserved() {
-    // v0.75.20: MirExprKind::Pipe 树变体已删（pipe 脱糖函数 parse_pipe 未挂接
-    // 进 parse_assignment 优先级链，`|>` 目前解析报错——pre-existing parser
-    // 限制，与本次树收敛无关，行为与基线一致）。本测试锁定诚实状态，防止
-    // 树收敛意外改变词法行为。
+fn pipe_token_now_parses_after_hookup() {
+    // v0.75.20: 记录 `|>` 未接入 parse 优先级链（pre-existing parser 限制，
+    // `parse_pipe` 死代码，树变体被删时行为与基线一致）。
+    // v0.75.21: 该限制已修复——parse_pipe 挂进 parse_equality，`|>` 解析成功。
+    // 此测试取代 v0.75.20 的「应报错」断言，锁定修复后的诚实状态。
     let src = "let double = fn(x) x * 2 end\nlet y = 5 |> double";
     assert!(
-        parse_code_v3(src).is_err(),
-        "`|>` 未接入 parse 优先级链（pre-existing），应与基线一致报错"
+        parse_code_v3(src).is_ok(),
+        "`|>` 已接入 parse 优先级链（v0.75.21），应解析成功"
     );
+}
+
+#[test]
+fn pipe_syntax_hooked_into_precedence() {
+    // v0.75.21: `|>` 接入 parse_equality 之下（优先级低于 equality、
+    // 高于 comparison）。脱糖为 Call(right, [left])，typeck 走 infer_call。
+    let src = "task double(x)\n  x * 2\nend\ntask add(a, b)\n  a + b\nend\nlet y = 5 |> double\nlet z = 10 |> add(5)\nlet w = 1 + 2 |> double";
+    let exprs = parse_code_v3(src).expect("parse should succeed");
+    assert!(check_program_mir(&exprs).is_empty());
+}
+
+#[test]
+fn pipe_keeps_call_callee_name() {
+    // v0.75.21: 修复 `x |> f(a)` 的 callee 名丢失 bug — 此前 match_to_string
+    // 对 Call 变体返回 "expr"，产出 Call(Name("expr"), [x, a])。
+    // 现在保留分支内真名（f），typeck 不会把它当未知调用。
+    let src = "task add(a, b)\n  a + b\nend\nlet y = 10 |> add(5)";
+    let exprs = parse_code_v3(src).expect("parse should succeed");
+    assert!(check_program_mir(&exprs).is_empty());
 }

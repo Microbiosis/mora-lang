@@ -365,21 +365,6 @@ pub fn h_aggregate(
     Ok(())
 }
 
-pub fn h_receive(
-    interp: &mut dyn MirHost,
-    env: &mut Environment,
-    var: &str,
-    source: &str,
-) -> Result<(), String> {
-    // v0.70: Read from interpreter's shared environment rather than crossbeam
-    // worker_receivers (removed — was dead code). Matches BSP semantics:
-    // values flow through channels, not blocking queues.
-    if let Some(val) = interp.environment().lock().get(source) {
-        env.define(var.to_string(), val, false);
-    }
-    Ok(())
-}
-
 pub fn h_worker(
     interp: &mut dyn MirHost,
     env: &mut Environment,
@@ -929,7 +914,6 @@ impl MirInst {
             MirInst::Halt(Some(r)) => vec![*r],
             MirInst::Halt(None) => vec![],
             MirInst::Send { value, .. } => vec![*value],
-            MirInst::Receive { .. } => vec![],
             MirInst::Save { path, value } => vec![*path, *value],
             MirInst::Load { path, .. } => vec![*path],
             MirInst::ReadFile { path, .. } => vec![*path],
@@ -974,7 +958,6 @@ impl MirInst {
             | MirInst::Expr(_)
             | MirInst::IndexAssign(_, _, _)
             | MirInst::Send { .. }
-            | MirInst::Receive { .. }
             | MirInst::Rollback
             | MirInst::Commit
             | MirInst::Save { .. }
@@ -1149,10 +1132,6 @@ pub fn dispatch(
         }
         MirInst::Send { value, target } => {
             h_send(interp, regs, *value, target)?;
-            Ok(Flow::Continue)
-        }
-        MirInst::Receive { var, source } => {
-            h_receive(interp, env, var, source)?;
             Ok(Flow::Continue)
         }
         MirInst::Rollback => Err("Transaction rolled back".to_string()),

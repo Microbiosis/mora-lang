@@ -2,6 +2,40 @@
 
 All notable changes to Mora will be documented in this file.
 
+## [v0.75.31] — 2026-08-01 — 语义漂移修复：删除 MirInst::Receive 死原语
+
+（回应「两个 env 会不会混淆」的第三层面——`Environment` 语义漂移。实证
+修正了此前的判断：pregel 主力消息通道（`dynamic_sends` 缓冲 + `input_
+<channel>` 注入）都**不**碰共享 Environment——真正的漂移只有一处：`h_
+receive` 读共享 env 当消息源（把「变量作用域」当「消息队列」），而它是
+零构造的死路径。裁决：删除。）
+
+### 实证（修正此前说法）
+- 主力通道（活）：`h_send` → `dynamic_sends` 缓冲（handlers.rs:333）→
+  pregel `pending_sends` → ADVANCE 按 target 投递 + `input_<channel>` 注入
+  agent 私有 env —— **不污染共享 Environment**。
+- 漂移点（死）：`h_receive` 从 `interp.environment()` 读值当消息源
+  （handlers.rs:368）；`MirInst::Receive` **全仓零构造**（src+tests）——
+  StreamFor 同族（语法先行、语义未接的残余）。
+
+### Removed — MirInst::Receive（4 文件 6 处）
+- `src/mir/mod.rs`：变体删除（注释记录删除原因与替代机制）。
+- `src/mir/handlers.rs`：`h_receive` 函数 + dispatch 分支 + `input_regs`/
+  `is_effect` 列表成员。
+- `src/mir/ssa.rs`：跳过列表 2 处成员。
+- `src/mir/optimize/cost.rs`：cost 分支。
+- 删除即验证：cargo check 一次通过。
+- `MirInst::Send` 保留（写独立缓冲，语义正确）。
+
+### 意义
+- 语义漂移消除：`Environment` 回归「变量作用域」单一职责——不再有任何
+  代码把它当消息队列读。Message 语义统一由引擎投递（`input_<channel>`）。
+- 与 v0.75.19/20/26 的收敛线一致：悬浮原语逐个定夺。
+
+### 验证
+- 全测试 **698 通过 / 0 失败**（pregel 消息路径不变——主力通道未动）。
+- clippy `-D warnings` 0 / fmt 零 diff。
+
 ## [v0.75.30] — 2026-08-01 — MORA_OPT 提升为显式编译选项 `--opt=N` + SSA 声明透传修复
 
 （v0.75.29 注释的演进项落地：「优化等级应成为编译命令的一等参数」。CLI

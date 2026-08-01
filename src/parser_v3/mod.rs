@@ -1427,6 +1427,53 @@ impl ParserV3 {
         match &tok.token_type {
             TokenType::Identifier(name) => {
                 let lower = name.to_lowercase();
+                // v0.75.17: 泛型注解 `<...>` — `List<int>` / `dict<string, any>`
+                // 递归解析参数后构造带元素/键值类型的类型（此前只接受单标识符，
+                // `List<int>` 报 "unsupported type annotation"）。
+                // 双 token lookahead：identifier 后紧跟 '<'（如 `List<int>`）。
+                if matches!(
+                    self.tokens.get(self.current + 1).map(|t| &t.token_type),
+                    Some(TokenType::Less)
+                ) {
+                    // 消费 identifier 与 '<'（advance 越过 identifier 后
+                    // current 停在 '<'，需再 match 掉 '<' 才到首个参数）。
+                    self.advance();
+                    self.advance();
+                    let mut args: Vec<Type> = Vec::new();
+                    loop {
+                        args.push(self.parse_type_annotation()?);
+                        if self.match_token(&[TokenType::Comma]) {
+                            continue;
+                        }
+                        break;
+                    }
+                    if !self.match_token(&[TokenType::Greater]) {
+                        eprintln!(
+                            "Parse error: expected '>' after generic type arguments at line {}",
+                            self.current_line()
+                        );
+                        return None;
+                    }
+                    return match lower.as_str() {
+                        "list" => Some(Type::List(Box::new(
+                            args.into_iter().next().unwrap_or(Type::Any),
+                        ))),
+                        "dict" => {
+                            let mut it = args.into_iter();
+                            let k = it.next().unwrap_or(Type::Any);
+                            let v = it.next().unwrap_or(Type::Any);
+                            Some(Type::Dict(Box::new(k), Box::new(v)))
+                        }
+                        other => {
+                            eprintln!(
+                                "Parse error: unsupported generic type annotation '{}' at line {}",
+                                other,
+                                self.current_line()
+                            );
+                            None
+                        }
+                    };
+                }
                 let ty = match lower.as_str() {
                     "int" | "number" => Type::Int,
                     "float" => Type::Float,

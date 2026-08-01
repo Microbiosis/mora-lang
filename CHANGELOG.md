@@ -2,6 +2,56 @@
 
 All notable changes to Mora will be documented in this file.
 
+## [v0.75.17] — 2026-08-01 — 静态类型 M2：泛型（ForAll + let-generalization + parser 泛型注解）
+
+（类型系统补齐第 2 模块。M1 后 generalize.rs 仍是 dead code stub——注释
+"can't represent ∀ without changing Type enum"；Type 枚举无泛型量化变体；
+parser 注解只接受单标识符。本模块补齐真泛型。）
+
+### Changed — Type::ForAll 变体（src/typeck/mod.rs）
+- 新增 `ForAll(Vec<char>, Box<Type>)`：∀α₁...αₙ. τ，let-generalization 的产物。
+- `name()` 显示 `forall<'a, 'b>. τ`；`compatible_with` 对 ForAll 与内层同判。
+
+### Changed — 真量化 + 实例化（src/typeck/hm/generalize.rs）
+- `generalize` 不再 stub：空 env 下 `'a` → `ForAll(['a], 'a)`、`list<'a>` →
+  `ForAll(['a], list<'a>)`；env 已含的变量不量化（标准 HM 规则）。
+- 新增 `instantiate`（自由函数版）：ForAll → fresh TypeVar 展开。
+
+### Changed — let-generalization 接入（src/typeck/hm/mod.rs + env.rs）
+- `infer_let` / `infer_let_typed` 在 `env.add` 前调 generalize。
+- `infer_var` / `Call(Var)` / `infer_assign` 命中 ForAll 时实例化。
+- closure 身份变量特殊处理：被量化的身份变量映射到 fresh 变量，`closure_sigs`
+  侧表签名复制一份、内部 TypeVar 全部重命名——`let f = fn(x) x; f(1); f("s")`
+  每次调用得到独立单形化副本，互不冲突（此前闭包共享同一组 TypeVar 约束会报
+  "expected int, got string"）。
+- `TypeEnv::free_variables` / `collect_type_vars` 走 ForAll 内层。
+
+### Changed — ForAll 合一/替换（src/typeck/hm/unify.rs）
+- `unify`：ForAll 与任何类型合一 → 剥壳后与内层合一（防御；正常路径 env.get
+  已实例化）。
+- `apply` / `contains_typevar` 递归进 ForAll 内层。
+
+### Added — parser 泛型注解 `<...>`（src/parser_v3/mod.rs）
+- `List<int>` / `dict<string, any>` 递归解析泛型参数（双 token lookahead：
+  identifier 后跟 `<`）。此前 `let x: List<int> = ...` 报 "unsupported type
+  annotation"。
+
+### Added — 测试
+- `generalize.rs` 单测 9 个：量化（identity、list、env-bound 跳过）、实例化
+  （ForAll 展开、非 ForAll 透传）、自由变量收集。
+- `tier1_typeck_mir.rs` 新增 5 个：`let_identity_polymorphic`（id(1) + id("s")
+  均通过）、`let_polymorphic_list_and_pair`、`generic_type_annotation_list_int_parses`
+  （`List<int> = [1i, 2i]`）、`generic_type_annotation_list_float_parses`、
+  `generic_annotation_mismatch_reported`（`List<string> = [1i, 2i]` 报错）。
+- 注：无后缀数字字面量 lexer 产出 Float（v0.38 数值塔分离），Int 需 `i` 后缀
+  （`1i`）——测试按此语义编写。
+
+### 验证
+- `cargo check --all-targets` 0 error / clippy `-D warnings` 0 / fmt 零 diff。
+- lib 测试 526 通过（跳过 sandbox/exec_parallel 慢测试）；tier1 22 通过。
+- 全测试 675 通过，4 failed = tier2_mir_expr_pipeline pre-existing
+  （M1 baseline cefbe99 上同样失败，与本模块无关）。
+
 ## [v0.75.16] — 2026-08-01 — 静态类型 M1：方法调用类型推断 + 列表/字典元素保留
 
 （类型系统补齐第 1 模块。探索确认 Mora 已具备 HM 推断 + 编译期拦截，真缺口模块化推进。）

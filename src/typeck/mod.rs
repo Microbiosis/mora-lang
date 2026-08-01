@@ -116,6 +116,9 @@ pub enum Type {
     Document,
     /// v0.55: HM type variable (char key, fresh in inference, unified during solve)
     TypeVar(char),
+    /// v0.75.17: 泛型量化 ∀α₁...αₙ. τ — let-generalization 的产物。
+    /// 命中 env 时由 instantiate 替换为 fresh TypeVar（标准 HM 规则）。
+    ForAll(Vec<char>, Box<Type>),
 } // ← close pub enum Type
 
 impl Type {
@@ -158,6 +161,11 @@ impl Type {
             Type::PromptSection => "prompt_section".to_string(),
             Type::Document => "document".to_string(),
             Type::TypeVar(c) => format!("'{}", c),
+            // v0.75.17: 泛型量化显示为 "forall<'a, 'b>. τ"（let-generalization 产物）
+            Type::ForAll(vars, inner) => {
+                let names: Vec<String> = vars.iter().map(|v| format!("'{}", v)).collect();
+                format!("forall<{}>. {}", names.join(", "), inner.name())
+            }
             // v0.13: Union 类型显示为 "T1 | T2 | T3"
             Type::Union(members) => {
                 if members.is_empty() {
@@ -308,6 +316,14 @@ impl Type {
                 return true;
             }
             return members.iter().any(|m| m.compatible_with(expected));
+        }
+        // v0.75.17: ForAll 类型 — 与内层类型同兼容性判断（命中 env 时已实例化，
+        // 此处仅作防御：泛型值兼容任意实例）。
+        if let Type::ForAll(_, inner) = self {
+            return inner.compatible_with(expected);
+        }
+        if let Type::ForAll(_, inner) = expected {
+            return self.compatible_with(inner);
         }
         // v0.13: Result<T1, E1> 兼容 Result<T2, E2> 当 T1==T2 且 E1==E2 (真正同构)
         if let (Type::Result_(t1, e1), Type::Result_(t2, e2)) = (self, expected) {

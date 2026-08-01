@@ -156,3 +156,62 @@ fn list_map_keeps_int_elements_clean() {
     let exprs = parse_code_v3(src).expect("parse");
     assert!(check_program_mir(&exprs).is_empty());
 }
+
+#[test]
+fn let_identity_polymorphic() {
+    // v0.75.17: let-generalization — `let id = fn(x) x` 量化为
+    // ∀'a. 'a → 'a。两次调用单形化为不同实例，Int/String 不冲突。
+    let src = "let id = fn(x) x end\nid(1)\nid(\"s\")";
+    let exprs = parse_code_v3(src).expect("parse");
+    assert!(
+        check_program_mir(&exprs).is_empty(),
+        "identity 两次调用（Int 和 String）应都通过（let-polymorphism）"
+    );
+}
+
+#[test]
+fn let_polymorphic_list_and_pair() {
+    // 泛型闭包作用于列表与比较运算：单形化实例互不干扰。
+    let src =
+        "let id = fn(x) x end\nlet a = id([1, 2])\nlet b = id(\"hi\")\nlet c = [id(3)]\nc[0] == 3";
+    let exprs = parse_code_v3(src).expect("parse");
+    assert!(check_program_mir(&exprs).is_empty());
+}
+
+#[test]
+fn generic_type_annotation_list_int_parses() {
+    // v0.75.17: parser 泛型注解 — `let x: List<int> = [1i, 2i]` 应解析成功
+    // 且类型检查通过。注：无后缀数字字面量 lexer 产出 Float（数值塔分离），
+    // 整数需 `i` 后缀（如 `1i`）才得到 Int 类型。
+    let src = "let x: List<int> = [1i, 2i]";
+    let exprs = parse_code_v3(src).expect("parse should succeed");
+    assert!(check_program_mir(&exprs).is_empty());
+}
+
+#[test]
+fn generic_type_annotation_list_float_parses() {
+    // 无后缀数字 → Float：List<float> 注解与 [1, 2] 合一。
+    let src = "let x: List<float> = [1, 2]";
+    let exprs = parse_code_v3(src).expect("parse should succeed");
+    assert!(check_program_mir(&exprs).is_empty());
+}
+
+#[test]
+fn generic_type_annotation_dict_string_any_parses() {
+    // dict<string, any> 注解：any 值合一宽松，应通过。
+    let src = "let d: dict<string, any> = {\"k\": 1}";
+    let exprs = parse_code_v3(src).expect("parse should succeed");
+    assert!(check_program_mir(&exprs).is_empty());
+}
+
+#[test]
+fn generic_annotation_mismatch_reported() {
+    // List<string> 注解 + [1i, 2i]（List<Int>）→ 合一失败应报错。
+    let src = "let x: List<string> = [1i, 2i]";
+    let exprs = parse_code_v3(src).expect("parse should succeed");
+    let errs = check_program_mir(&exprs);
+    assert!(
+        !errs.is_empty(),
+        "List<string> 注解与 List<Int> 值应报类型错误"
+    );
+}

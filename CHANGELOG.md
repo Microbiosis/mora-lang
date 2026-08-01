@@ -2,6 +2,31 @@
 
 All notable changes to Mora will be documented in this file.
 
+## [v0.75.12] — 2026-08-01 — pre-existing 缺陷修复（缓存指针复用 + parser let + 测试幻影断言）
+
+承接 v0.75.11 清理时暴露的 pre-existing 问题批量修复。
+
+### Fixed — DagCache 指针复用 bug（src/mir/cache.rs）
+- 根因：v0.75.9 缓存项只存 `Arc<MirDag>`（key = `Arc::as_ptr`），不持有 func 强引用 → func_arc drop 后指针被 allocator 复用 → 不同函数撞同地址命中错误 DAG。pregel 并行单元测试全量并发时偶发暴露（`Const(42)` 的 body 被 `Const(10)` 命中，结果 20≠42）。
+- 修复：缓存项改二元组 `(Arc<MirFunction>, Arc<MirDag>)` — 持有 func 强引用，指针永不复用，同指针必然同内容。全量 3 轮并发验证稳定。
+
+### Fixed — ParserV3 块体内 `let` → `Assign` 语义 bug（src/parser_v3/mod.rs）
+- 根因：`parse_block_body` 只试 parse_assignment + if/for/while — `let` 关键字不匹配任何分支被 advance() 跳过 → 余下 `n = 5` 解析成 `Assign` → `env.assign` 对未定义变量静默 false（n=Nil）→ task 内 let 变量后续比较/builtin 全错。
+- 修复：抽 `parse_let_binding` helper，块体 `let` 优先且必须成功（`if check(Let)` 分支），顶层复用。同时顺带修好 tier2 `v3_pipeline_multiple_statements_runs`（原 clean 5 失败 → 4）。
+- 未扩 AST：复用现有 `MirExprKind::LetBinding`（lower 已发 `MirInst::Define`）。
+
+### Fixed — 测试幻影断言（指向去 AST 化时已删除的文件/代码）
+- `tier0_dyntrait` 3 个：读 `src/parser_v2/expressions.rs` / `src/typeck/check.rs`（均不存在）→ 改指真实落点（lexer token 表 + MirExprKind::DynTrait + handlers dispatch）；删无法成立的 typeck 断言。
+- `tier0_trait_mir` 3 个：断言 `StmtKind::TraitDef/ImplDef/SkillDef {`（v0.55 前旧 AST lowering 名）→ 改指 handlers.rs 的 mir_body 填充计数（5 处）。
+- `tier0_closure_mir` `closure_reused_across_calls_via_mir`：原源码 `if ... then\n`（then 独占行，parser 不支持，从诞生起解析失败）→ 改真闭包 + Dict 方法调用驱动多次执行（Mora 无 `f(args)` 名字调用语法；Dict 方法调用路径 dispatch.rs 分发到 Value::Closure）。
+
+### Fixed — tier0_replacement 测试源码
+- 2 个 `if cond then\n...`（then 独占行）→ brace 形态 `if cond { ... }`。
+- 2 个 transaction 测试：transaction 语法无前端（lexer 有 token、parser 无解析、MirExprKind 无变体）→ 改直接构造 `MirInst::Transaction`/`MirInst::Rollback` 验证 handler 语义（不经 parser）。
+
+### Tests
+- 580 通过 / 0 失败（lib，3 轮并发稳定）。**pre-existing 失败从 9 个减至 4 个**（tier2 lowering 语义缺陷：`1+2` 常量折叠 vs BinaryOp 断言、`if true` 无 JumpIfNot、`while true` 无条件回跳死循环 — clean 基线同样失败，属 lowering 语义问题，超出清理范围，留作后续候选）。clippy `-D warnings` 87 → 85（净 -2）。
+
 ## [v0.75.11] — 2026-08-01 — AST 残余低风险清理
 
 去 AST 化收尾：删除死类型 + 幻影注释 + 注释脱节，零语义变更。

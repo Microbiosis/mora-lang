@@ -74,10 +74,12 @@ fn dyntrait_lowering_emits_instruction() {
 
 #[test]
 fn dyntrait_interp_constructs_trait_object() {
-    let src = std::fs::read_to_string("src/mir/interp.rs").expect("mir/interp.rs");
+    // α.12 起 DynTrait 指令由 handlers.rs 的 dispatch 处理（interp.rs 只
+    // 驱动执行顺序，不再内联指令逻辑）。
+    let src = std::fs::read_to_string("src/mir/handlers.rs").expect("mir/handlers.rs");
     assert!(
         src.contains("MirInst::DynTrait {"),
-        "run_mir must handle MirInst::DynTrait"
+        "dispatch must handle MirInst::DynTrait"
     );
     assert!(
         src.contains("Value::TraitObject {"),
@@ -87,27 +89,20 @@ fn dyntrait_interp_constructs_trait_object() {
 
 #[test]
 fn dyntrait_parser_supports_as_dyn() {
-    let src =
-        std::fs::read_to_string("src/parser_v2/expressions.rs").expect("parser expressions.rs");
+    // 去 AST 化后无 parser_v2/expressions.rs — `as`/`dyn` 关键字在 lexer
+    // 映射表，DynTrait 节点在 MirExprKind（ParserV3 → lower 前端）。
+    let lexer_src = std::fs::read_to_string("src/lexer.rs").expect("lexer.rs");
     assert!(
-        src.contains("TokenType::As"),
-        "parser must consume 'as' keyword"
+        lexer_src.contains("TokenType::As"),
+        "lexer must map 'as' keyword"
     );
     assert!(
-        src.contains("TokenType::Dyn"),
-        "parser must consume 'dyn' keyword"
+        lexer_src.contains("TokenType::Dyn"),
+        "lexer must map 'dyn' keyword"
     );
+    let expr_src = std::fs::read_to_string("src/mir/expr/mod.rs").expect("mir/expr/mod.rs");
     assert!(
-        src.contains("ExprKind::DynTrait"),
-        "parser must construct ExprKind::DynTrait"
-    );
-}
-
-#[test]
-fn dyntrait_typeck_returns_trait_type() {
-    let src = std::fs::read_to_string("src/typeck/check.rs").expect("typeck/check.rs");
-    assert!(
-        src.contains("ExprKind::DynTrait"),
-        "typeck must handle ExprKind::DynTrait"
+        expr_src.contains("DynTrait {"),
+        "MirExprKind::DynTrait must exist"
     );
 }

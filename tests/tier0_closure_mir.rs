@@ -46,17 +46,22 @@ end
 #[test]
 fn closure_reused_across_calls_via_mir() {
     // 验证 MIR built closure 可被多次调用（EnvRef captured env 不被破坏）。
-    // 用 for 循环驱动多次调用：构造 list，遍历它。
+    // Mora 无 `f(args)` 名字调用语法（Call 指令只查 builtin 表），闭包经
+    // Dict 方法调用路径分发：`dict.method(args)` → dispatch 查 Dict 找到
+    // Value::Closure → call_value → run_mir（dispatch.rs:736-749）。
+    // 用 for 循环驱动多次调用。
+    //
+    // 注：原测试源码用 `if s == 60 then\n  print(...)\nend`（then 独占行）
+    // — ParserV3 的 `if then` 要求 then 与分支同行，该形态从诞生起就
+    // 解析失败（pre-existing，v0.75.11 修复为可解析形态）。
     let src = r#"
 task main()
-  let xs = [10, 20, 30]
-  let s = 0
-  for x in xs
-    let s = s + x
+  let ops = {"mul": fn(x) x * 2 end}
+  let total = 0
+  for x in [10, 20, 30]
+    total = total + ops.mul(x)
   end
-  if s == 60 then
-    print("ok")
-  end
+  print(total)
 end
 "#;
     run_via_mir(src).expect("repeated MIR execution path must work");

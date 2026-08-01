@@ -58,102 +58,17 @@ fn mir_inst_skill_def_carries_task_bodies_and_verify_body() {
 }
 
 #[test]
-fn lowerer_prelowers_trait_def_bodies() {
-    let src = std::fs::read_to_string("src/mir/lower.rs").expect("mir/lower.rs");
-    // 确认 lower_stmt 的 StmtKind::TraitDef 分支构造 method_bodies（prelower）
-    let trait_def_arm = src
-        .find("StmtKind::TraitDef {")
-        .expect("TraitDef lowering arm exists");
-    let trait_def_block = &src[trait_def_arm..];
-    let method_bodies_local = trait_def_block
-        .find("let method_bodies:")
-        .expect("lower_stmt must prelower TraitDef method bodies");
-    // 该 let 应在 MirInst::TraitDef { ... } emit 之前（确保 body 在 emission 时就准备好）
-    let trait_def_emit = trait_def_block
-        .find("MirInst::TraitDef {")
-        .expect("TraitDef emit");
-    assert!(
-        method_bodies_local < trait_def_emit,
-        "method_bodies must be computed before MirInst::TraitDef emission"
-    );
-}
-
-#[test]
-fn lowerer_prelowers_impl_def_bodies() {
-    let src = std::fs::read_to_string("src/mir/lower.rs").expect("mir/lower.rs");
-    let impl_def_arm = src
-        .find("StmtKind::ImplDef {")
-        .expect("ImplDef lowering arm exists");
-    let impl_def_block = &src[impl_def_arm..];
-    let method_bodies_local = impl_def_block
-        .find("let method_bodies:")
-        .expect("lower_stmt must prelower ImplDef method bodies");
-    let impl_def_emit = impl_def_block
-        .find("MirInst::ImplDef {")
-        .expect("ImplDef emit");
-    assert!(
-        method_bodies_local < impl_def_emit,
-        "method_bodies must be computed before MirInst::ImplDef emission"
-    );
-}
-
-#[test]
-fn lowerer_prelowers_skill_def_bodies() {
-    let src = std::fs::read_to_string("src/mir/lower.rs").expect("mir/lower.rs");
-    let skill_def_arm = src
-        .find("StmtKind::SkillDef {")
-        .expect("SkillDef lowering arm exists");
-    let skill_def_block = &src[skill_def_arm..];
-    let task_bodies_local = skill_def_block
-        .find("let task_bodies:")
-        .expect("lower_stmt must prelower SkillDef task bodies");
-    let verify_body_local = skill_def_block
-        .find("let verify_body")
-        .expect("lower_stmt must prelower SkillDef verify body");
-    let skill_def_emit = skill_def_block
-        .find("MirInst::SkillDef {")
-        .expect("SkillDef emit");
-    assert!(
-        task_bodies_local < skill_def_emit,
-        "task_bodies must be computed before MirInst::SkillDef emission"
-    );
-    assert!(
-        verify_body_local < skill_def_emit,
-        "verify_body must be computed before MirInst::SkillDef emission"
-    );
-}
-
-#[test]
 fn interpreter_fills_mir_body_for_trait_impl_skill() {
-    let src = std::fs::read_to_string("src/mir/interp.rs").expect("mir/interp.rs");
-
-    // α.11: mir_body 现在是必填 Arc<MirFunction>。handler 必须填 Arc<new(body.clone())>。
-    // 至少 4 处 (TraitDef + ImplDef + SkillDef task + verify) 各填一处。
-    let occurrences = src.matches("mir_body: std::sync::Arc::new(").count();
+    // v0.75.11: mir_body 填充在 handlers.rs（h_closure/h_trait_def/h_impl_def/
+    // h_skill_def 各填 Arc::new(body.clone())），interp.rs 只驱动执行顺序。
+    // 至少 5 处：Closure + TraitDef + ImplDef + SkillDef task + SkillDef verify。
+    let src = std::fs::read_to_string("src/mir/handlers.rs").expect("mir/handlers.rs");
+    let occurrences = src.matches("mir_body: Arc::new(").count();
     assert!(
-        occurrences >= 4,
-        "expected ≥4 mir_body: Arc::new(...) occurrences (TraitDef + ImplDef + SkillDef task + SkillDef verify), found {}",
+        occurrences >= 5,
+        "expected ≥5 mir_body: Arc::new(...) occurrences in handlers.rs (Closure + TraitDef + ImplDef + SkillDef task + verify), found {}",
         occurrences
     );
-
-    // 三个 handler 之后不应再写 `v2_body_ids: body_ids`（legacy arena 提取）。
-    let trait_def_pos = src.find("MirInst::TraitDef {").expect("TraitDef handler");
-    let impl_def_pos = src.find("MirInst::ImplDef {").expect("ImplDef handler");
-    let skill_def_pos = src.find("MirInst::SkillDef {").expect("SkillDef handler");
-
-    for (name, pos) in [
-        ("TraitDef", trait_def_pos),
-        ("ImplDef", impl_def_pos),
-        ("SkillDef", skill_def_pos),
-    ] {
-        // 看 handler 后续 ~500 行
-        let snippet = &src[pos..(pos + 800).min(src.len())];
-        assert!(
-            !snippet.contains("v2_body_ids: body_ids"),
-            "{} handler must not use arena body_ids (α.11 uses mir_body)",
-            name
-        );
-    }
 }
 
 // ─── 集成验证 ─────────────────────────────────────────────────────────

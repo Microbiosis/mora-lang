@@ -2,6 +2,50 @@
 
 All notable changes to Mora will be documented in this file.
 
+## [v0.75.19] — 2026-08-01 — 语法面收敛：移除 59 个无前端可达的死关键字
+
+（去 AST 化残余的直接来源，收敛第 1 步。架构诊断：约 20 个 MirInst 变体
+无前端可达——lexer 关键字表已有 stream/route/observe/span/worker/... 的
+token，但 ParserV3 不解析它们 → token 落入 `token_to_identifier_name()`
+标识符 fallback。语法面既没删干净、也没接完。运行时原语集与 MirInst
+执行语义完全不变——原语经手工构造 MirFunction / Pregel API 驱动，
+与词面解耦。）
+
+### Removed — lexer 死关键字（src/lexer.rs）
+- `TokenType` 移除 59 个无解析可达的变体：`Export`/`Parallel`/`WithKeyword`/
+  `Save`/`Load`/`Into`/`Read`/`Write`/`Append`/`ReadBytes`/`WriteBytes`/
+  `Stream`/`Tool`/`Route`/`Observe`/`Span`/`Tags`/`Record`/`Trace`/`Metrics`/
+  `Otel`/`Worker`/`Transaction`/`Commit`/`Rollback`/`Compensation`/`Trait`/
+  `Impl`/`Where`/`Edges`/`ExitWhen`/`Rounds`/`Eval`/`Skill`/`Expect`/
+  `Tolerance`/`State`/`Node`/`Channel`/`Checkpoint`/`Rewind`/`Resume`/
+  `Thread`/`Dynamic`/`Map`/`Reduce`/`FanIn`/`FanOut`/`Interrupt`/`Before`/
+  `After`/`Command`/`Send`/`Goto`/`Update`/`Add`/`Last`/`Merge`/`Jit`。
+- `identifier_from` 关键字表同步删除对应映射；剩余 27 个真解析关键字：
+  let/task/if/then/end/return/true/false/nil/for/in/import/match/fn/as/do/
+  break/continue/macro/dyn/Self/type/enum/struct/orchestrate/loop/max_rounds/
+  prompt + 上下文词 document。
+- 词面 `stream`/`route`/`observe`/`span`/`worker`/`transaction`/`tool`/... 回归
+  普通标识符：声明位、表达式位**全位置一致**可用。此前经 fallback 在声明位
+  静默冒充标识符、表达式位报错（行为不一致）。
+
+### Removed — parser fallback 表同步（src/parser_v3/mod.rs）
+- `token_to_identifier_name` 收缩为存活 token 的 arm（删除的 token 无 arm
+  可引用，否则编译报错——删除即验证）。
+
+### 原则执行
+- 向后不兼容是设计特权，不是技术债务：词面回归标识符是**语义改进**
+  （用户可写 `let stream = ...`），不兼容仅对依赖死关键字的悬浮语法。
+- 语法面（lexer+parser）与运行时原语集（MirInst+handlers）解耦：原语
+  是架构，词面是接入点。删除词面不触碰原语。
+
+### 验证
+- 删除即验证：cargo check 一次通过（token 无引用）。
+- clippy `-D warnings` 0 / fmt 零 diff。
+- 全测试 679 通过（+1 `freed_reserved_words_usable_as_identifiers`），
+  4 failed = tier2 pre-existing（M1 baseline cefbe99 同样失败）。
+- 端到端：`let stream = "s"` 等 6 个新词作变量，`mora` 运行打印拼接结果
+  exit 0。
+
 ## [v0.75.18] — 2026-08-01 — 静态类型 M3：跨模块 import 符号表
 
 （类型系统补齐第 3 模块。此前 `MirExprKind::Import` 在 typeck 返回 Nil 被

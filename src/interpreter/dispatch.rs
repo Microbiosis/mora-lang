@@ -64,6 +64,40 @@ impl Interpreter {
             }
         }
         match name {
+            // v0.75.23: M 原语 `merge_with(key, strategy)` — 为随后的 worker /
+            // transaction / observe 块声明该 key 的 per-key CRDT 合并策略
+            // （读侧 run_isolated 已接 current_merge_strategies；此前写侧无
+            // 生产者，恒为 LWW fallback）。strategy ∈ append/add/dict_union/
+            // grow_only_set/lww。
+            "merge_with" => {
+                let key = match args.first() {
+                    Some(Value::String(s)) => s.clone(),
+                    _ => return Err("merge_with(key, strategy) expects string key".to_string()),
+                };
+                let strat = match args.get(1) {
+                    Some(Value::String(s)) => s.as_str(),
+                    _ => {
+                        return Err("merge_with(key, strategy) expects string strategy".to_string());
+                    }
+                };
+                let ms = match strat {
+                    "append" => crate::value::MergeStrategy::Append,
+                    "add" => crate::value::MergeStrategy::Add,
+                    "dict_union" => crate::value::MergeStrategy::DictUnion,
+                    "grow_only_set" => crate::value::MergeStrategy::GrowOnlySet,
+                    "lww" | "last_write_wins" => crate::value::MergeStrategy::LastWriteWins,
+                    _ => {
+                        return Err(format!(
+                            "merge_with: unknown strategy '{}' (append/add/dict_union/grow_only_set/lww)",
+                            strat
+                        ));
+                    }
+                };
+                let mut strategies = self.current_merge_strategies().unwrap_or_default();
+                strategies.insert(key, ms);
+                self.set_merge_strategies(Some(strategies));
+                Ok(Value::Nil)
+            }
             "print" => {
                 let msg = args
                     .into_iter()
@@ -1211,5 +1245,75 @@ fn parse_budget_dispatch(v: Value, ctx: &str) -> Result<usize, String> {
             "{}: budget must be string or number, got {:?}",
             ctx, other
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::interpreter::Interpreter;
+
+    #[test]
+    fn merge_with_builtin_sets_per_key_strategy() {
+        // v0.75.23: merge_with(key, strategy) 写侧 — 解析策略名并插入
+        // current_merge_strategies（读侧 run_isolated 已接；此前无生产者）。
+        let mut interp = Interpreter::new();
+        interp
+            .call_function(
+                "merge_with",
+                vec![
+                    Value::String("x".to_string()),
+                    Value::String("grow_only_set".to_string()),
+                ],
+                Span::default(),
+            )
+            .expect("merge_with should succeed");
+        let strategies = interp.current_merge_strategies().expect("strategies set");
+        assert_eq!(
+            strategies.get("x"),
+            Some(&crate::value::MergeStrategy::GrowOnlySet)
+        );
+    }
+
+    #[test]
+    fn merge_with_accumulates_multiple_keys() {
+        let mut interp = Interpreter::new();
+        for (k, s) in [
+            ("a", "append"),
+            ("b", "add"),
+            ("c", "dict_union"),
+            ("d", "lww"),
+        ] {
+            interp
+                .call_function(
+                    "merge_with",
+                    vec![Value::String(k.to_string()), Value::String(s.to_string())],
+                    Span::default(),
+                )
+                .expect("merge_with should succeed");
+        }
+        let strategies = interp.current_merge_strategies().expect("strategies set");
+        assert_eq!(strategies.len(), 4, "多次调用应累积 per-key 策略");
+        assert_eq!(
+            strategies.get("a"),
+            Some(&crate::value::MergeStrategy::Append)
+        );
+        assert_eq!(strategies.get("b"), Some(&crate::value::MergeStrategy::Add));
+    }
+
+    #[test]
+    fn merge_with_unknown_strategy_errors() {
+        let mut interp = Interpreter::new();
+        let err = interp
+            .call_function(
+                "merge_with",
+                vec![
+                    Value::String("x".to_string()),
+                    Value::String("bogus".to_string()),
+                ],
+                Span::default(),
+            )
+            .unwrap_err();
+        assert!(err.contains("unknown strategy"), "got: {}", err);
     }
 }

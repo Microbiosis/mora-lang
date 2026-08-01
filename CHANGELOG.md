@@ -2,6 +2,42 @@
 
 All notable changes to Mora will be documented in this file.
 
+## [v0.75.23] — 2026-08-01 — per-key CRDT 合并策略：merge_with 写侧接线（方向 8 激活）
+
+（三路只读审计后执行 P1。实证发现：`value.rs` 已有完整 CRDT 骨架——
+`VectorClock` + `MergeStrategy`（LastWriteWins/Append/Add/DictUnion/
+GrowOnlySet）+ `Conflict` 检测；`run_isolated`（handlers.rs:297-305）**读侧**
+已接 `current_merge_strategies` 做 per-key 合并——但**写侧无生产者**
+（`set_merge_strategies` 全仓零调用者），策略恒为 None → 恒 fallback LWW。
+方向 8 的差距不是「无 CRDT」而是「接线差一根」。）
+
+### Added — `merge_with(key, strategy)` 内置原语
+- **设计**：建模为普通函数调用（走 h_call → mir_call_function → dispatch
+  match + typeck builtin_signatures 既有链路）——**零新 token、零 parser
+  改动**（遵守去 AST 化约束，不把语法树加回来）。语法面是 M 原语的
+  「名空间」，运行时原语是架构。
+- **运行时**（src/interpreter/dispatch.rs）：解析策略名
+  （`append`/`add`/`dict_union`/`grow_only_set`/`lww`）写入
+  `current_merge_strategies`（累积多 key）；未知策略名报错。
+- **typeck**（src/typeck/dispatch.rs）：`builtin_signatures` 加
+  `merge_with(String, String) → Nil` 签名。
+
+### 语义（G-Set 端到端实证）
+两个 Worker 各自 `Define("x", [..])`，`merge_with("x","grow_only_set")` 下
+合并为 `[1,2,3]`（并集去重）；无策略时 LWW fallback → `[2,3]`（后写覆盖）。
+VectorClock 并发检测 → Conflict 上报（现丢弃，留观测钩子）——**真 G-Set
+语义激活**，仅需一个写侧调用。
+
+### Added — 测试（5 个）
+- `interpreter::dispatch::tests`（3）：设置单 key、累积多 key、未知策略报错。
+- `tier0_replacement.rs`（2）：G-Set 并集 vs LWW 覆盖端到端对比
+  （手工构造 Worker 指令，不经 parser——与原语测试同规范）。
+- `tier1_typeck_mir.rs`（1）：`merge_with("x","grow_only_set")` typeck 干净。
+
+### 验证
+- 全测试 **692 通过 / 0 失败**（+6）。
+- clippy `-D warnings` 0 / fmt 零 diff。
+
 ## [v0.75.22] — 2026-08-01 — tier2 4 个 pre-existing 测试修复（常量折叠 vs 无优化断言）
 
 （此前全测试基线「678/680/682 通过 + 4 failed」的 4 个失败全部清零——

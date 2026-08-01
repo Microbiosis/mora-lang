@@ -293,3 +293,12 @@ fn pipe_keeps_call_callee_name() {
     let exprs = parse_code_v3(src).expect("parse should succeed");
     assert!(check_program_mir(&exprs).is_empty());
 }
+
+#[test]
+fn merge_with_builtin_typechecks() {
+    // v0.75.23: merge_with(key, strategy) 内置签名（builtin_signatures）—
+    // 两个 String 参数，返回 Nil。typeck 走 lookup_builtin 应干净通过。
+    let src = "merge_with(\"x\", \"grow_only_set\")";
+    let exprs = parse_code_v3(src).expect("parse");
+    assert!(check_program_mir(&exprs).is_empty());
+}

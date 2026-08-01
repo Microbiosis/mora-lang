@@ -212,3 +212,98 @@ fn tier1_public_api_is_stable() {
         ) -> Result<(), String>,
     ) = (run_mir, run_main_task);
 }
+
+// ─── 6. per-key CRDT 合并策略（v0.75.23）────────────────────────────
+// merge_with(key, strategy) 写 current_merge_strategies；h_worker 的
+// run_isolated 读它做 per-key 合并（无策略 fallback LWW）。
+// GrowOnlySet 下两个 worker 写同一 key 的 List → 并集去重（LWW 会覆盖）。
+
+fn mk_list_worker(items: Vec<f64>) -> MirFunction {
+    let mut body = Vec::new();
+    let mut r = 0;
+    let list_reg = r;
+    r += 1;
+    let mut item_regs = Vec::new();
+    for v in items {
+        body.push(MirInst::Const(r, Value::Float(v)));
+        item_regs.push(r);
+        r += 1;
+    }
+    body.push(MirInst::ListLit(list_reg, item_regs));
+    body.push(MirInst::Define("x".to_string(), list_reg));
+    body.push(MirInst::Halt(None));
+    MirFunction {
+        params: Vec::new(),
+        body,
+        n_regs: r,
+    }
+}
+
+fn wrap_worker(name: &str, body: MirFunction) -> MirFunction {
+    MirFunction {
+        params: Vec::new(),
+        body: vec![
+            MirInst::Worker {
+                name: name.to_string(),
+                body: Box::new(body),
+            },
+            MirInst::Halt(None),
+        ],
+        n_regs: 8,
+    }
+}
+
+#[test]
+fn merge_with_grow_only_set_merges_worker_outputs() {
+    let mut interp = Interpreter::new();
+    let mut env = interp.take_env();
+    // merge_with("x", "grow_only_set") 的等价语义（写侧内置名单测见
+    // interpreter::dispatch::tests）
+    interp.set_merge_strategies(Some(std::collections::HashMap::from([(
+        "x".to_string(),
+        mora::value::MergeStrategy::GrowOnlySet,
+    )])));
+
+    let w1 = std::sync::Arc::new(wrap_worker("w1", mk_list_worker(vec![1.0, 2.0])));
+    run_mir(&w1, &mut interp, &mut env).expect("worker1 run");
+    let w2 = std::sync::Arc::new(wrap_worker("w2", mk_list_worker(vec![2.0, 3.0])));
+    run_mir(&w2, &mut interp, &mut env).expect("worker2 run");
+
+    let vals: Vec<f64> = match env.get("x") {
+        Some(Value::List(l)) => l
+            .iter()
+            .map(|v| match v {
+                Value::Float(f) => *f,
+                other => panic!("expected float, got {:?}", other),
+            })
+            .collect(),
+        other => panic!("expected List, got {:?}", other),
+    };
+    assert_eq!(
+        vals,
+        vec![1.0, 2.0, 3.0],
+        "GrowOnlySet 应并集去重（LWW 下会是 [2,3]）"
+    );
+}
+
+#[test]
+fn merge_with_lww_default_overwrites() {
+    // 无策略时 run_isolated fallback LWW：后写覆盖（对比 G-Set 语义）。
+    let mut interp = Interpreter::new();
+    let mut env = interp.take_env();
+    let w1 = std::sync::Arc::new(wrap_worker("w1", mk_list_worker(vec![1.0, 2.0])));
+    run_mir(&w1, &mut interp, &mut env).expect("worker1 run");
+    let w2 = std::sync::Arc::new(wrap_worker("w2", mk_list_worker(vec![2.0, 3.0])));
+    run_mir(&w2, &mut interp, &mut env).expect("worker2 run");
+    let vals: Vec<f64> = match env.get("x") {
+        Some(Value::List(l)) => l
+            .iter()
+            .map(|v| match v {
+                Value::Float(f) => *f,
+                _ => panic!("float"),
+            })
+            .collect(),
+        _ => panic!("list"),
+    };
+    assert_eq!(vals, vec![2.0, 3.0], "默认 LWW 应后写覆盖");
+}

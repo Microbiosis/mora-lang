@@ -820,16 +820,7 @@ pub fn h_match_expr(
     Ok(())
 }
 
-pub fn h_stream_for(
-    interp: &mut dyn MirHost,
-    env: &mut Environment,
-    _body: &MirFunction,
-) -> Result<(), String> {
-    let mut child_env = env.clone();
-    // v0.75.9: 包裹 Arc 走全局 DAG 缓存
-    let _ = run_mir(&Arc::new((*_body).clone()), interp, &mut child_env)?;
-    Ok(())
-}
+// v0.75.26: h_stream_for 已删（StreamFor 死原语移除，见 MirInst 定义注释）。
 
 // ═══════════════════════════════════════════════════════════════════
 // Control flow handlers
@@ -951,7 +942,6 @@ impl MirInst {
             MirInst::TaskDef { .. }
             | MirInst::ToolDef { .. }
             | MirInst::Import(_)
-            | MirInst::StreamFor { .. }
             | MirInst::TypeAlias { .. }
             | MirInst::EnumDef { .. }
             | MirInst::StructDef { .. }
@@ -1015,7 +1005,6 @@ impl MirInst {
             | MirInst::Span { .. }
             | MirInst::PromptSection { .. }
             | MirInst::DocumentSection { .. }
-            | MirInst::StreamFor { .. }
             | MirInst::Return(_)
             | MirInst::Halt(_) => true,
             MirInst::Const(_, _)
@@ -1286,14 +1275,6 @@ pub fn dispatch(
         }
         MirInst::DocumentSection { name: _, body } => {
             h_document_section(interp, env, body)?;
-            Ok(Flow::Continue)
-        }
-        MirInst::StreamFor {
-            prompt_reg: _,
-            var: _,
-            body,
-        } => {
-            h_stream_for(interp, env, body)?;
             Ok(Flow::Continue)
         }
 

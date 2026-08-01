@@ -147,14 +147,9 @@ pub enum MirInst {
         jit: bool,
     },
 
-    /// α.2: 流式循环。stream_for var in prompt body end
-    /// prompt_reg 为字符串表达式，body 是嵌套 MirFunction。
-    /// 解释器流式执行（逐 token 触发 AI）。
-    StreamFor {
-        prompt_reg: Reg,
-        var: String,
-        body: Box<MirFunction>,
-    },
+    // v0.75.26: StreamFor 已删除——死原语（零构造点、零测试引用、语义被
+    // ai.chat 的 stream:true 参数路径取代；handler 空转：prompt_reg/var 被忽略、
+    // body 仅执行一次并丢弃）。流式语义若需 MIR 指令级支持，重新设计而非复活旧形状。
 
     // ── 类型定义语句（α.3: 与 AST execute 语义一致）──
     /// α.3: 类型别名。定义 `name` → `target` 的字符串映射。

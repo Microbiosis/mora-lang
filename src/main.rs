@@ -40,6 +40,9 @@ fn main() {
                 println!();
                 println!("Usage:");
                 println!("  mora <file.mora>           Run a script");
+                println!(
+                    "  mora --opt=1 file.mora     Run with SSA optimization (0=off/1=basic/>=2=aggressive)"
+                );
                 println!("  mora --repl                Interactive REPL");
                 println!("  mora --check <file>        Type check only");
                 println!();
@@ -74,6 +77,20 @@ fn main() {
         return;
     }
 
+    // v0.75.30: 显式编译选项 `--opt=N`（0=关/1=Basic/>=2=Aggressive）—
+    // 从环境变量提升为 CLI 一等参数，供 run_file/run_record/run_replay/
+    // run_snapshot 四个编译入口使用。未指定 → None → 各入口走 env 兜底。
+    // 剥掉 flag 后重组 args，后续 match 逻辑不变（`--opt` 只在 args[1]，
+    // 不进入子命令参数）。
+    let opt_level: Option<mora::mir::ssa::OptLevel> = args
+        .get(1)
+        .and_then(|a| a.strip_prefix("--opt="))
+        .and_then(mora::mir::ssa::OptLevel::from_arg);
+    let mut args = args;
+    if opt_level.is_some() {
+        args.remove(1);
+    }
+
     match args[1].as_str() {
         "--repl" => run_repl(),
         "--check" => {
@@ -96,7 +113,7 @@ fn main() {
                 eprintln!("Usage: mora run <file.mora>");
                 process::exit(1);
             }
-            run_file(&args[2]);
+            run_file(&args[2], opt_level);
         }
         // v0.14/v0.15: 录制 / 重放 / 对比 / list / stats / timeline
         "record" => {
@@ -204,7 +221,7 @@ fn main() {
                         eprintln!("Usage: mora record <file.mora> <name>");
                         process::exit(1);
                     }
-                    run_record(&args[2], &args[3]);
+                    run_record(&args[2], &args[3], opt_level);
                 }
             }
         }
@@ -216,14 +233,14 @@ fn main() {
             let file = &args[2];
             let name = &args[3];
             let update = args.iter().any(|a| a == "--update");
-            run_snapshot(file, name, update);
+            run_snapshot(file, name, update, opt_level);
         }
         "replay" => {
             if args.len() < 4 {
                 eprintln!("Usage: mora replay <file.mora> <name>");
                 process::exit(1);
             }
-            run_replay(&args[2], &args[3]);
+            run_replay(&args[2], &args[3], opt_level);
         }
         "diff" => {
             if args.len() < 4 {
@@ -255,7 +272,7 @@ fn main() {
                 }
             }
         }
-        _ => run_file(&args[1]),
+        _ => run_file(&args[1], opt_level),
     }
 }
 
@@ -366,7 +383,7 @@ fn update_lock(pkg_name: &str, url: &str) {
     }
 }
 
-fn run_file(path: &str) {
+fn run_file(path: &str, opt_level: Option<mora::mir::ssa::OptLevel>) {
     let source = fs::read_to_string(path).expect("Failed to read file");
 
     // v0.55: ParserV3 → MirExpr 路径（零 AST 依赖）
@@ -383,7 +400,12 @@ fn run_file(path: &str) {
     }
 
     // Tier 1: MIR 解释器是唯一执行引擎
-    let func = match mora::mir::lower::lower_mir_exprs(&exprs) {
+    // v0.75.30: 显式 `--opt` 优先，未指定走 env 兜底（lower_mir_exprs）。
+    let lowered = match opt_level {
+        Some(level) => mora::mir::lower::lower_mir_exprs_with_opt(&exprs, level),
+        None => mora::mir::lower::lower_mir_exprs(&exprs),
+    };
+    let func = match lowered {
         Ok(f) => f,
         Err(e) => {
             eprintln!("MIR lowering error: {}", e);
@@ -423,7 +445,7 @@ fn recording_path(name: &str) -> std::path::PathBuf {
     p
 }
 
-fn run_record(path: &str, name: &str) {
+fn run_record(path: &str, name: &str, opt_level: Option<mora::mir::ssa::OptLevel>) {
     let source = fs::read_to_string(path).unwrap_or_else(|_| {
         eprintln!("record: failed to read {}", path);
         process::exit(1);
@@ -441,7 +463,12 @@ fn run_record(path: &str, name: &str) {
     }
 
     // Tier 1: MIR lowering
-    let func = match mora::mir::lower::lower_mir_exprs(&exprs) {
+    // v0.75.30: 显式 `--opt` 优先，未指定走 env 兜底。
+    let lowered = match opt_level {
+        Some(level) => mora::mir::lower::lower_mir_exprs_with_opt(&exprs, level),
+        None => mora::mir::lower::lower_mir_exprs(&exprs),
+    };
+    let func = match lowered {
         Ok(f) => f,
         Err(e) => {
             eprintln!("record: MIR lowering error: {}", e);
@@ -494,7 +521,7 @@ fn run_record(path: &str, name: &str) {
     }
 }
 
-fn run_replay(path: &str, name: &str) {
+fn run_replay(path: &str, name: &str, opt_level: Option<mora::mir::ssa::OptLevel>) {
     let source = fs::read_to_string(path).unwrap_or_else(|_| {
         eprintln!("replay: failed to read {}", path);
         process::exit(1);
@@ -512,7 +539,12 @@ fn run_replay(path: &str, name: &str) {
     }
 
     // Tier 1: MIR lowering
-    let func = match mora::mir::lower::lower_mir_exprs(&exprs) {
+    // v0.75.30: 显式 `--opt` 优先，未指定走 env 兜底。
+    let lowered = match opt_level {
+        Some(level) => mora::mir::lower::lower_mir_exprs_with_opt(&exprs, level),
+        None => mora::mir::lower::lower_mir_exprs(&exprs),
+    };
+    let func = match lowered {
         Ok(f) => f,
         Err(e) => {
             eprintln!("replay: MIR lowering error: {}", e);
@@ -728,7 +760,7 @@ fn snapshot_path(name: &str) -> std::path::PathBuf {
     p
 }
 
-fn run_snapshot(file: &str, name: &str, update: bool) {
+fn run_snapshot(file: &str, name: &str, update: bool, opt_level: Option<mora::mir::ssa::OptLevel>) {
     let source = fs::read_to_string(file).unwrap_or_else(|_| {
         eprintln!("snapshot: failed to read {}", file);
         process::exit(1);
@@ -744,7 +776,12 @@ fn run_snapshot(file: &str, name: &str, update: bool) {
     }
 
     // Tier 1: MIR lowering
-    let func = match mora::mir::lower::lower_mir_exprs(&exprs) {
+    // v0.75.30: 显式 `--opt` 优先，未指定走 env 兜底。
+    let lowered = match opt_level {
+        Some(level) => mora::mir::lower::lower_mir_exprs_with_opt(&exprs, level),
+        None => mora::mir::lower::lower_mir_exprs(&exprs),
+    };
+    let func = match lowered {
         Ok(f) => f,
         Err(e) => {
             eprintln!("snapshot: MIR lowering error: {}", e);

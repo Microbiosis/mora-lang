@@ -32,6 +32,11 @@ pub struct MirSsaFunction {
     pub entry: BlockId,
     /// α.8: 每个 SSA 寄存器的推断类型（用于 JIT 编译）
     pub types: Vec<RegType>,
+    /// v0.75.30: 声明型指令透传 — construct 中被跳过（SSA 不优化声明）的
+    /// 指令（TaskDef/ToolDef/Import/StructDef/...）原样收集，deconstruct 时
+    /// 还原到 body 头部。此前这些指令被丢弃 → `--opt` 下 task main 消失
+    /// （MORA_OPT=1 默认关掩盖了该 bug，CLI 显式化后暴露）。
+    pub passthrough: Vec<MirInst>,
 }
 
 /// α.8: SSA 寄存器的推断类型
@@ -107,6 +112,17 @@ pub enum OptLevel {
 }
 
 impl OptLevel {
+    /// v0.75.30: CLI 显式编译选项 `--opt=N` 解析（与 `from_env` 共享 0/1/2
+    /// 语义）。`mora --opt=1 file.mora` 显式指定优化等级；返回 `None` 表示
+    /// 未指定（调用方走 env 兜底）。
+    pub fn from_arg(value: &str) -> Option<OptLevel> {
+        value.parse::<u32>().ok().map(|n| match n {
+            0 => OptLevel::None,
+            1 => OptLevel::Basic,
+            _ => OptLevel::Aggressive,
+        })
+    }
+
     /// `MORA_OPT` 环境变量 → 优化等级（v0.75.7 引入的渐进式启用开关）：
     /// - 未设置 / `MORA_OPT=0` → `None`（默认）— 热路径零开销；
     ///   优化 pass（SSA rename/支配树）未证明对所有程序安全前，默认关闭
@@ -114,17 +130,14 @@ impl OptLevel {
     /// - `MORA_OPT=1` → `Basic`（CP/CopyProp/DCE/GVN 基础管线）。
     /// - `>= 2` → `Aggressive`（叠加 LICM/LSR/TCO）。
     ///
-    /// 这是 v0.x 的渐进式启用机制：优化器经测试证明安全后，应提升为显式
-    /// 编译选项（类似 rustc `-O`）而非进程环境变量（v1.0 演进项）。
+    /// v0.75.30: 显式编译选项提升 — CLI `--opt=N` 优先（见
+    /// `lower_mir_exprs_with_opt`），env 仅作动态路径（REPL/import/pregel）
+    /// 的兜底。v1.0 演进：优化等级应成为编译命令的一等参数（类似 rustc
+    /// `-O`），env 最终退役。
     pub fn from_env() -> OptLevel {
         std::env::var("MORA_OPT")
             .ok()
-            .and_then(|v| v.parse().ok())
-            .map(|n| match n {
-                0 => OptLevel::None,
-                1 => OptLevel::Basic,
-                _ => OptLevel::Aggressive,
-            })
+            .and_then(|v| OptLevel::from_arg(&v))
             .unwrap_or(OptLevel::None)
     }
 
@@ -165,8 +178,18 @@ pub fn construct(func: &MirFunction) -> MirSsaFunction {
             }],
             entry: 0,
             types: Vec::new(),
+            passthrough: Vec::new(),
         };
     }
+
+    // v0.75.30: 声明型指令透传 — 原样保留跳过列表中的指令（TaskDef 等），
+    // deconstruct 时还原。此前被丢弃 → `--opt` 下 task main 消失。
+    let passthrough: Vec<MirInst> = func
+        .body
+        .iter()
+        .filter(|i| is_ssa_passthrough(i))
+        .cloned()
+        .collect();
 
     let label_to_pos = find_label_targets(&func.body);
     let block_starts = find_block_starts(&func.body, &label_to_pos);
@@ -268,6 +291,7 @@ pub fn construct(func: &MirFunction) -> MirSsaFunction {
         blocks,
         entry: 0,
         types: Vec::new(), // 由 typeinfer 后续填充
+        passthrough,
     }
 }
 
@@ -567,6 +591,50 @@ fn split_into_ssa(
     }
 
     (ssa_insts, Terminator::Return(None))
+}
+
+/// v0.75.30: 声明型指令 — SSA 构造跳过（不优化声明），deconstruct 还原。
+/// 与 `split_into_ssa` 的跳过列表同源（单点谓词，防两处漂移）。
+fn is_ssa_passthrough(inst: &MirInst) -> bool {
+    matches!(
+        inst,
+        MirInst::TaskDef { .. }
+            | MirInst::ToolDef { .. }
+            | MirInst::Import(_)
+            | MirInst::WithConfig { .. }
+            | MirInst::MatchExpr { .. }
+            | MirInst::MatchArm { .. }
+            | MirInst::Closure { .. }
+            | MirInst::TypeAlias { .. }
+            | MirInst::EnumDef { .. }
+            | MirInst::StructDef { .. }
+            | MirInst::Transaction { .. }
+            | MirInst::Send { .. }
+            | MirInst::Receive { .. }
+            | MirInst::Rollback
+            | MirInst::MacroDef { .. }
+            | MirInst::Commit
+            | MirInst::Worker { .. }
+            | MirInst::Route(_)
+            | MirInst::Observe { .. }
+            | MirInst::Span { .. }
+            | MirInst::RecordTokens { .. }
+            | MirInst::Save { .. }
+            | MirInst::Load { .. }
+            | MirInst::ReadFile { .. }
+            | MirInst::WriteFile { .. }
+            | MirInst::AppendFile { .. }
+            | MirInst::ReadBytesFile { .. }
+            | MirInst::WriteBytesFile { .. }
+            | MirInst::TraitDef { .. }
+            | MirInst::ImplDef { .. }
+            | MirInst::Orchestrate { .. }
+            | MirInst::Eval { .. }
+            | MirInst::SkillDef { .. }
+            | MirInst::PromptSection { .. }
+            | MirInst::DocumentSection { .. }
+            | MirInst::DynTrait { .. }
+    )
 }
 
 #[allow(clippy::needless_range_loop)]
@@ -1370,7 +1438,9 @@ pub fn deconstruct(ssa: &MirSsaFunction) -> MirFunction {
 
     MirFunction {
         params: ssa.params.iter().map(|(name, _)| name.clone()).collect(),
-        body,
+        // v0.75.30: 还原声明型指令（TaskDef 等）到 body 头部 — 此前被 SSA
+        // 丢弃导致 `--opt` 下 task main 消失。
+        body: ssa.passthrough.iter().cloned().chain(body).collect(),
         n_regs: next_plain_reg,
     }
 }

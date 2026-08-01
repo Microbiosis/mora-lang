@@ -215,3 +215,35 @@ fn generic_annotation_mismatch_reported() {
         "List<string> 注解与 List<Int> 值应报类型错误"
     );
 }
+
+#[test]
+fn import_symbol_resolved_in_typecheck() {
+    // v0.75.18: import 目标文件的顶层符号在 typeck 阶段预解析（M3 符号表）—
+    // 引用 greeting（string）、answer（int）不报 UnboundVariable。
+    // 注：cargo test 的 cwd 是 crate 根，import 相对路径与运行时一致。
+    let src = "import \"tests/fixtures/mod_a.mora\"\nlet s = greeting\nlet n = answer\nprint(s)";
+    let exprs = parse_code_v3(src).expect("parse");
+    assert!(
+        check_program_mir(&exprs).is_empty(),
+        "import 符号应被解析，无 UnboundVariable"
+    );
+}
+
+#[test]
+fn import_symbol_type_checked() {
+    // 导入的 greeting 是 string（精确类型）：与数字运算应报类型错误。
+    let src = "import \"tests/fixtures/mod_a.mora\"\nlet s = greeting\ns + 1";
+    let exprs = parse_code_v3(src).expect("parse");
+    let errs = check_program_mir(&exprs);
+    assert!(!errs.is_empty(), "import 的 string 符号 + 数字应报类型错误");
+}
+
+#[test]
+fn import_missing_file_reports_error() {
+    // 缺失的 import 文件 → typeck 阶段产出 import error 诊断
+    // （与运行时 mir_import 的 hard error 语义一致）。
+    let src = "import \"tests/fixtures/does_not_exist.mora\"\nprint(1)";
+    let exprs = parse_code_v3(src).expect("parse");
+    let errs = check_program_mir(&exprs);
+    assert!(!errs.is_empty(), "缺失 import 文件应报 import error");
+}

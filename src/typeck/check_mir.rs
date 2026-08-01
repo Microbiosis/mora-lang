@@ -4,6 +4,12 @@
 //! directly off `&[MirExpr]` and returns the collected diagnostics. It
 //! is the single source of truth for CLI `mora --check` and LSP
 //! `textDocument/publishDiagnostics`.
+//!
+//! v0.75.18: 模块感知 — 顶层 `import "path"` 的目标文件符号在 typeck
+//! 阶段预解析（visited 防环）并合并进 HM env，import 的符号不再报
+//! UnboundVariable。路径解析与运行时 `mir_import` 一致（cwd 相对）。
+
+use std::collections::HashSet;
 
 use crate::mir::MirExpr;
 
@@ -18,10 +24,20 @@ use super::hm::TypeError as HmError;
 ///  variables, arity mismatches, unification failures).
 pub fn check_program_mir(exprs: &[MirExpr]) -> Vec<TypeError> {
     let mut hm = HMInference::new();
-    hm.infer_program(exprs)
-        .into_iter()
-        .map(hm_to_external)
-        .collect()
+    let mut errors: Vec<TypeError> = Vec::new();
+
+    // v0.75.18: 预扫描 import 目标文件的顶层符号并合并进 env
+    let mut visited: HashSet<std::path::PathBuf> = HashSet::new();
+    let mut import_errors: Vec<TypeError> = Vec::new();
+    for (name, ty) in
+        super::imports::collect_imported_symbols(exprs, &mut visited, &mut import_errors)
+    {
+        hm.env.add(name, ty);
+    }
+    errors.extend(import_errors);
+
+    errors.extend(hm.infer_program(exprs).into_iter().map(hm_to_external));
+    errors
 }
 
 ///  Same as [`check_program_mir`]. Kept as a thin wrapper for callers

@@ -1,0 +1,6 @@
+let greeting: string = "hi"
+let answer: int = 42i
+let scale = 2.5
+task plus(a, b)
+  a + b
+end

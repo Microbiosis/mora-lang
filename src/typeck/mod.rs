@@ -17,9 +17,8 @@
 //! - 变量引用 vs 作用域
 //!
 //! 不做：
-//! - 跨模块 import 的 symbol table（import 解析时类型仍为 Any）
-//! - 列表/字典元素类型推断（Mora 列表是异构容器）
-//! - generic / union 类型
+//! - 列表/字典元素类型推断（Mora 列表是异构容器）——注：v0.75.16 M1 已做
+//!   方法签名级元素类型保留，此处指字面量级不再扩展
 //! - 控制流敏感的类型缩窄
 
 // v0.55: typeck V2 模块 (mod check, mod pregel_check) 已删除。
@@ -28,6 +27,8 @@
 pub mod check_mir;
 pub mod dispatch;
 pub mod hm;
+/// v0.75.18: 跨模块 import 符号表（typeck 阶段预扫描合并）
+pub mod imports;
 
 use std::collections::{HashMap, HashSet};
 

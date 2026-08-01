@@ -2,6 +2,32 @@
 
 All notable changes to Mora will be documented in this file.
 
+## [v0.75.33] — 2026-08-02 — ConstFolding 正确性修复（归纳变量 + 重定义）
+
+（清剩余缺口 a：循环累加返回 0 的根因。探索阶段激活 orchestrate 测试时暴露
+`sum = sum + i` 恒 0 —— 顺藤摸到优化器折叠 bug，独立修复。）
+
+### Fixed — find_const_backward / ConstFoldingRule（src/mir/optimize/rule.rs）
+- **根因 1（重定义）**：`find_const_backward` 只回溯到 `Label` 边界找
+  `Const`——但 for 循环 lowering **不插 Label**，回溯穿过整个循环体找到
+  循环前 `Const(i, 0)` 初始化，把 `i = i + 1` 错折成 `i = 1`。
+  **修复**：遇到最近定义点（`inst.dst() == reg`）即停止——非 Const 返回
+  None（该 reg 已被重新定义，更早的 Const 失效）。
+- **根因 2（归纳变量）**：`i = i + 1` 的 dst == lhs（loop-carried
+  dependence），回溯只能找到初始化值，折叠必错。**修复**：`dst ∈
+  {lhs, rhs}` 的 BinaryOp 直接跳过折叠（保守正确）。
+
+### Added — 回归测试（rule.rs +2）
+- `test_const_folding_skips_induction_variable`：`i = i + 1` 保留 BinaryOp。
+- `test_const_folding_stops_at_redefinition`：reg 重定义后不折叠。
+
+### 验证
+- 全测试 **707 通过 / 0 失败**（+2）。
+- clippy `-D warnings` 0 / fmt 零 diff。
+- 注：修复后循环从输出 "0" 变 "nil"——折叠 bug 已修（不再错折恒值），
+  但暴露了第二个独立缺陷：DAG 执行器对含 BackEdge 程序的循环执行问题
+  （pre-existing，stash 对照确认与折叠无关），专项处理（缺口 b）。
+
 ## [v0.75.32] — 2026-08-02 — 去 AST 化终局阶段 1：修复 pregel 降级缺失
 
 （多阶段终局第 1 阶段：MirExpr → witness + parser 直接 emit 的前置障碍清理。

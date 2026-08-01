@@ -248,6 +248,13 @@ impl RewriteRule for ConstFoldingRule {
         _ctx: &dyn std::any::Any,
     ) -> Vec<MirInst> {
         if let MirInst::BinaryOp(dst, lhs, op, rhs) = inst {
+            // v0.75.33: 归纳变量保护 — `i = i + 1`（dst 出现在自身输入，
+            // loop-carried dependence）绝不能折叠：回溯能找到「最近 Const」
+            // 只有初始化值（如 Const(i, 0)），折叠会把归纳变量变恒值，
+            // 破坏循环语义。非自依赖（a + b，a/b 非本指令写回）才安全。
+            if dst == lhs || dst == rhs {
+                return vec![inst.clone()];
+            }
             // Scan backwards for constant definitions of lhs and rhs
             let lhs_val = find_const_backward(body, *lhs, pc);
             let rhs_val = find_const_backward(body, *rhs, pc);
@@ -267,19 +274,31 @@ impl RewriteRule for ConstFoldingRule {
 
 /// Find the most recent `Const` instruction within the same basic block
 /// that defines `reg`, scanning backwards from `before_pc`.
+/// Find the most recent `Const` instruction within the same basic block
+/// that defines `reg`, scanning backwards from `before_pc`.
+///
+/// v0.75.33 正确性修复：此前只回溯到 `Label` 边界并找 `Const`——但 for 循环
+/// lowering **不插 Label**，回溯会穿过整个循环体找到循环前的 `Const(i, 0)`
+/// 初始化，把 `i = i + 1` 错折成 `i = 1`（循环恒值 bug）。现在遇到**最近
+/// 的定义点**（`inst.dst() == reg`）即停止：是 `Const` 才取，非 `Const`
+/// （BinaryOp/Var 等重新定义）返回 None —— 前面的 Const 已失效。
 fn find_const_backward(body: &[MirInst], reg: Reg, before_pc: usize) -> Option<Value> {
-    body[..before_pc]
-        .iter()
-        .rev()
-        .take_while(|i| !matches!(i, MirInst::Label(_)))
-        .find_map(|inst| {
-            if let MirInst::Const(r, val) = inst
-                && *r == reg
-            {
-                return Some(val.clone());
-            }
-            None
-        })
+    for inst in body[..before_pc].iter().rev() {
+        if matches!(inst, MirInst::Label(_)) {
+            break;
+        }
+        if let Some(dst) = inst.dst()
+            && dst == reg
+        {
+            // 最近的定义点：Const 才有效，否则该 reg 被重新定义、前面失效
+            return if let MirInst::Const(_, val) = inst {
+                Some(val.clone())
+            } else {
+                None
+            };
+        }
+    }
+    None
 }
 
 static CONST_FOLDING_PATTERN: MirPattern = MirPattern::BinaryOp {
@@ -509,5 +528,43 @@ mod tests {
         // Actually: both lhs=1 and rhs=1 resolve to the same Const above Label(3) —
         // the find_const_backward stops at Label, so it WON'T find lhs/rhs.
         assert_eq!(result.len(), 1, "should not fold across block boundary");
+    }
+
+    #[test]
+    fn test_const_folding_skips_induction_variable() {
+        // v0.75.33: `i = i + 1`（dst == lhs，loop-carried）绝不能折叠 —
+        // 回溯能找到最近 Const(i, 0) 初始化，折叠会把归纳变量变恒值。
+        let rule = ConstFoldingRule;
+        let empty_ctx = ();
+        let body = vec![
+            MirInst::Const(10, Value::Int(0)),            // i = 0 (init)
+            MirInst::BinaryOp(10, 10, BinaryOp::Add, 12), // i = i + 1
+        ];
+        let result =
+            rule.rewrite_with_context(&body[1], &MatchBindings::new(), 1, &body, &empty_ctx);
+        assert_eq!(result.len(), 1, "归纳变量（dst==lhs）绝不能折叠");
+        assert!(
+            matches!(&result[0], MirInst::BinaryOp(..)),
+            "应保留 BinaryOp，而非折叠成 Const"
+        );
+    }
+
+    #[test]
+    fn test_const_folding_stops_at_redefinition() {
+        // v0.75.33: find_const_backward 遇到最近定义点（非 Const）即失效 —
+        // reg 被重新定义后，更早的 Const 不再有效。
+        let rule = ConstFoldingRule;
+        let empty_ctx = ();
+        let body = vec![
+            MirInst::Const(5, Value::Int(100)),        // x = 100 (early)
+            MirInst::BinaryOp(5, 5, BinaryOp::Add, 6), // x = x + y (redefine)
+            MirInst::BinaryOp(7, 5, BinaryOp::Add, 8), // z = x + w — x 已被重定义
+        ];
+        // 对 pc=2 的 BinaryOp(7, 5, +, 8)：lhs=5 最近定义是 BinaryOp(5,...)
+        // 非 Const → find_const_backward 返回 None → 不折叠
+        let result =
+            rule.rewrite_with_context(&body[2], &MatchBindings::new(), 2, &body, &empty_ctx);
+        assert_eq!(result.len(), 1, "x 被重定义后不应折叠");
+        assert!(matches!(&result[0], MirInst::BinaryOp(..)));
     }
 }

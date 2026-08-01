@@ -469,7 +469,9 @@ fn run_record(path: &str, name: &str) {
             // 执行 main task
             if let Err(e) = mora::mir::interp::run_main_task(&func_arc, &mut interpreter, &mut env)
             {
-                let _ = interpreter.infra_mut().recorder().save();
+                if let Err(e) = interpreter.infra_mut().recorder().save() {
+                    eprintln!("[warn] partial recording save failed: {}", e);
+                }
                 eprintln!("Runtime error during record: {}", e);
                 eprintln!("(partial recording saved)");
                 process::exit(1);
@@ -482,7 +484,9 @@ fn run_record(path: &str, name: &str) {
             println!("✓ recorded {} events -> {}", n, rec_path.display());
         }
         Err(e) => {
-            let _ = interpreter.infra_mut().recorder().save();
+            if let Err(e) = interpreter.infra_mut().recorder().save() {
+                eprintln!("[warn] partial recording save failed: {}", e);
+            }
             eprintln!("Runtime error during record: {}", e);
             eprintln!("(partial recording saved)");
             process::exit(1);
@@ -767,8 +771,10 @@ fn run_snapshot(file: &str, name: &str, update: bool) {
         let snap = record::create_snapshot(name, &current_events);
         let content = record::snapshot_to_jsonl(&snap);
         let dir = snapshots_dir();
-        if !dir.exists() {
-            let _ = fs::create_dir_all(&dir);
+        if !dir.exists()
+            && let Err(e) = fs::create_dir_all(&dir)
+        {
+            eprintln!("[warn] snapshot: failed to create dir {}: {}", dir.display(), e);
         }
         if let Err(e) = fs::write(&snap_file, &content) {
             eprintln!("snapshot: failed to write {}: {}", snap_file.display(), e);

@@ -322,7 +322,9 @@ pub fn h_transaction(
         Err(_) => {
             let mut comp_env = env.clone();
             // v0.75.9: 包裹 Arc 走全局 DAG 缓存
-            let _ = run_mir(&Arc::new((*compensation).clone()), interp, &mut comp_env);
+            if let Err(e) = run_mir(&Arc::new((*compensation).clone()), interp, &mut comp_env) {
+                eprintln!("[warn] transaction compensation failed: {}", e);
+            }
             Err("Transaction rolled back".to_string())
         }
     }

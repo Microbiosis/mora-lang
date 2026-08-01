@@ -2,6 +2,24 @@
 
 All notable changes to Mora will be documented in this file.
 
+## [v0.75.15] — 2026-08-01 — 约束审计 P3-2（吞异常分类审计）
+
+对 AGENTS_CODE_MODIFICATION.md §2「禁止吞异常」的全量审计（~200 处命中：`let _ =` 130 + `.ok()` 50 + `Err(_)` 20）。
+
+### Changed — 应传播 9 处改为显式记录（best-effort 不再静默）
+- `src/interpreter/ai_chat.rs` ×2：`track_tokens` 失败 → `eprintln`（token 预算失效可见）。
+- `src/main.rs` ×3：partial recording save / snapshot 目录创建失败 → `eprintln`。
+- `src/mir/handlers.rs`：transaction compensation 失败 → `eprintln`（回滚不完整可见）。
+- `src/pregel/mod.rs`：master_compute 失败 → `eprintln`（全局协调静默失效可见）。
+- `src/pregel/worker_pool.rs` ×2：worker 结果 send / batch 广播失败 → `eprintln`。
+
+### 保留（有意忽略，~130 处，记录理由）
+- best-effort 副作用（recorder/trace 失败不阻塞主流程）、cleanup/补偿（Drop impl 内 docker/taskkill/remove_file）、`#[cfg(test)]` 简化、env 缺省降级（MORA_AI_RETRY_* 缺省即默认值）、combiner 失败回退 LWW（已有 `// fallback: LWW` 注释）。
+
+### Tests
+- interpreter 98 / pregel 30 / 其余零回归。clippy 0 / fmt 0 / build 通过。
+- 注：`runtime::sandbox::tests::clone_shares_container_arc` 为 pre-existing 慢测试（隔离 89s，与本次无关）。
+
 ## [v0.75.14] — 2026-08-01 — 约束审计 P2+P3-1（clippy 清零 + fmt 零 diff + magic numbers）
 
 对 AGENTS_CODE_MODIFICATION.md §2/§3 的达标清理。**clippy `-D warnings` 从 85 → 0，rustfmt 从 150 diff → 0**（历史最高门槛，首次达标）。

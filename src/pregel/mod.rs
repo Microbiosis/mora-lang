@@ -1005,12 +1005,13 @@ impl MirPregelEngine {
             // v0.72: Master.compute — runs once per super-step after UPDATE.
             // Used for global coordination (e.g., dynamic topology changes,
             // aggregation-based decisions).
+            // v0.75.28: master_compute 失败错误传播 — 此前 eprintln warn
+            // 静默继续（吞错误；协调钩子失败可能让引擎跑出错误语义而不自知）。
+            // 与「吞异常审计」约束一致：协调钩子是全局控制点，失败必须冒泡。
             if let Some(master) = self.master_compute.clone() {
                 let mut master_env = interpreter.environment().lock().clone();
                 // v0.75.9: master_compute 已是 Arc，直接走全局 DAG 缓存
-                if let Err(e) = crate::mir::interp::run_mir(&master, interpreter, &mut master_env) {
-                    eprintln!("[warn] pregel master_compute failed: {}", e);
-                }
+                crate::mir::interp::run_mir(&master, interpreter, &mut master_env)?;
             }
 
             // interrupt after
@@ -1738,6 +1739,77 @@ mod tests {
         assert_eq!(engine.stats().retries, 0, "no failures expected");
     }
 
+    // ─── v0.75.28: Master.compute 激活守卫（方向 7 约束原语骨架）───────
+    // master_compute（v0.72 每超步全局协调钩子）+ aggregators + vote_to_halt
+    // 构成「每步评估目标 + 收敛」骨架；此前该钩子从未被任何测试激活
+    // （全部 None）。本测试激活执行路径并锁定失败传播（v0.75.28 修复：
+    // 此前失败被 eprintln warn 吞掉）。
+
+    #[test]
+    fn master_compute_runs_and_failure_propagates() {
+        // 正常 master_compute（Const Nil 恒成功）→ engine.run 成功。
+        let ok_master = MirFunction {
+            params: Vec::new(),
+            body: vec![MirInst::Const(0, Value::Nil), MirInst::Return(None)],
+            n_regs: 1,
+        };
+        let config = MirPregelConfig {
+            agents: vec![make_const_agent("a", 1)],
+            edges: vec![MirEdgeDef {
+                from: "@start".into(),
+                to: "a".into(),
+                condition_expr: None,
+                condition_body: None,
+            }],
+            state_schema: vec![],
+            checkpoint: None,
+            interrupt_points: vec![],
+            adjacency: HashMap::new(),
+            aggregators: Vec::new(),
+            master_compute: Some(ok_master),
+        };
+        let mut engine = MirPregelEngine::new(config);
+        let mut interp = crate::interpreter::Interpreter::new();
+        let result = engine.run(&mut interp);
+        assert!(
+            result.is_ok(),
+            "正常 master_compute 应让引擎运行成功: {:?}",
+            result
+        );
+
+        // 失败 master_compute（Call 未知函数 → run_mir Err）→ engine.run
+        // 必须传播错误（此前 eprintln warn 静默继续）。
+        let bad_master = MirFunction {
+            params: Vec::new(),
+            body: vec![MirInst::Call(0, "__no_such_fn__".to_string(), Vec::new())],
+            n_regs: 1,
+        };
+        let config_bad = MirPregelConfig {
+            agents: vec![make_const_agent("a", 1)],
+            edges: vec![MirEdgeDef {
+                from: "@start".into(),
+                to: "a".into(),
+                condition_expr: None,
+                condition_body: None,
+            }],
+            state_schema: vec![],
+            checkpoint: None,
+            interrupt_points: vec![],
+            adjacency: HashMap::new(),
+            aggregators: Vec::new(),
+            master_compute: Some(bad_master),
+        };
+        let mut engine_bad = MirPregelEngine::new(config_bad);
+        let mut interp_bad = crate::interpreter::Interpreter::new();
+        let err = engine_bad
+            .run(&mut interp_bad)
+            .expect_err("master_compute 失败应传播（不再被 eprintln warn 吞掉）");
+        assert!(
+            err.contains("__no_such_fn__") || err.contains("function"),
+            "错误信息应含失败原因: {}",
+            err
+        );
+    }
     /// v0.75: vote_to_halt — an agent whose task_body ends with MirInst::Halt
     /// must be marked Halted in vertex_state (signal actually propagates now).
     #[test]

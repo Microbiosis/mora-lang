@@ -2,6 +2,48 @@
 
 All notable changes to Mora will be documented in this file.
 
+## [v0.75.20] — 2026-08-01 — MirExpr 树对内收敛：删除死变体 Pipe/Grouping/Expr
+
+（去 AST 化收敛第 2 步，执行 docs/de-ast-boundary.md §3 增量路径的
+「纯语法包裹 / 死形态」段。MirExprKind 33 → 30 变体。）
+
+### Removed — MirExprKind 死变体（src/mir/expr/mod.rs）
+- `Pipe`：零构造——parser 的 `parse_pipe` 从未挂接进 `parse_assignment`
+  优先级链（`|>` 词法 token 存在但未接入语法，pre-existing），且 parse_pipe
+  自身已把 pipe 脱糖为 `Call(right, [left])`。树形态与其脱糖产物重复。
+- `Grouping`：零构造——`mir_group` helper 是恒等函数（`fn mir_group(inner)
+  = inner`），从未产出包裹节点；括号仅作优先级，parse 时不建节点。
+- `Expr(Box<MirExpr>)`：零构造——「作为语句执行、丢弃结果」的无操作包裹，
+  从未被 parser 产出。
+
+### Changed — 消费臂同步删除（4 文件）
+- `src/mir/lower.rs`：删 `Pipe`/`Grouping`/`Expr` 三个 lower 臂
+  （各臂唯一职责是穿透/发指令）。
+- `src/typeck/hm/mod.rs`：删三个 infer 臂 + `infer_pipe` 死函数
+  （pipe 已脱糖为 Call，HM 走 `infer_call`）。
+- `src/lsp/providers/parsed_doc_v3.rs`：`walk_mir_expr` 删三个遍历臂。
+- 删除即验证：cargo check 一次通过（9 处引用全部清理）。
+
+### 保留 — MirInst 原语集不动
+- `MirInst::Pipe` / `MirInst::Expr` **保留**为运算原语（手工构造可达，
+  与 StreamFor/Route 同列——扩展空间预留）。运行时执行语义（handlers /
+  ssa / cost）零改动。本次仅收敛编译前端树形态，原语是架构、不动。
+
+### 新增发现（同族残留，另行处理）
+- `|>` 全链路为死代码：lexer `Pipe` token → `parse_pipe`（未挂接）→
+  已删树变体。pipe 语法接入属 parser 层工作（pre-existing 限制），
+  不在本 commit 范围。
+
+### Added — 测试
+- `pipe_token_unconnected_to_parser_preserved`：锁定诚实状态——`|>` 解析
+  失败与基线一致（经 stash 比对实证），防止树收敛意外改变词法行为。
+
+### 验证
+- 删除即验证：cargo check 一次通过（9 处引用全清）。
+- clippy `-D warnings` 0 / fmt 零 diff。
+- 全测试 680 通过（+1），4 failed = tier2 pre-existing
+  （M1 baseline cefbe99 同样失败，与本次无关）。
+
 ## [v0.75.19] — 2026-08-01 — 语法面收敛：移除 59 个无前端可达的死关键字
 
 （去 AST 化残余的直接来源，收敛第 1 步。架构诊断：约 20 个 MirInst 变体

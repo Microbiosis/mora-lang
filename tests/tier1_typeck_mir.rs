@@ -261,3 +261,16 @@ fn freed_reserved_words_usable_as_identifiers() {
         "移除的保留词应作为普通标识符工作"
     );
 }
+
+#[test]
+fn pipe_token_unconnected_to_parser_preserved() {
+    // v0.75.20: MirExprKind::Pipe 树变体已删（pipe 脱糖函数 parse_pipe 未挂接
+    // 进 parse_assignment 优先级链，`|>` 目前解析报错——pre-existing parser
+    // 限制，与本次树收敛无关，行为与基线一致）。本测试锁定诚实状态，防止
+    // 树收敛意外改变词法行为。
+    let src = "let double = fn(x) x * 2 end\nlet y = 5 |> double";
+    assert!(
+        parse_code_v3(src).is_err(),
+        "`|>` 未接入 parse 优先级链（pre-existing），应与基线一致报错"
+    );
+}

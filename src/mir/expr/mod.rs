@@ -177,11 +177,6 @@ pub enum MirExprKind {
         args: Vec<MirExpr>,
     },
 
-    Pipe {
-        lhs: Box<MirExpr>,
-        rhs: Box<MirExpr>, // Usually a call expression
-    },
-
     // Functions/Closures
     Closure {
         params: Vec<Param>,
@@ -250,8 +245,6 @@ pub enum MirExprKind {
         parts: Vec<MirExpr>,
     },
 
-    Grouping(Box<MirExpr>),
-
     // Binding & Mutation
     LetBinding {
         name: String,
@@ -271,9 +264,6 @@ pub enum MirExprKind {
         index: Box<MirExpr>,
         value: Box<MirExpr>,
     },
-
-    /// Execute expression as statement (discard result)
-    Expr(Box<MirExpr>),
 
     /// Return from function
     Return(Option<Box<MirExpr>>),

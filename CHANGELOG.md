@@ -2,6 +2,38 @@
 
 All notable changes to Mora will be documented in this file.
 
+## [v0.75.29] — 2026-08-01 — MORA_HM 僵尸删除 + MORA_OPT 文档化
+
+（回应「为什么编程语言项目有设置环境变量的东西」——实证全仓 14 个环境
+变量分三类：外部集成（OCR/AI/CORS）正当、用户目录解析（HOME/USERPROFILE）
+标准、语言内部行为开关（MORA_OPT）合理、僵尸（MORA_HM）误导。本 commit
+清僵尸 + 文档化。）
+
+### Removed — MORA_HM 僵尸（3 处）
+- **实证**：错误消息提示「Set MORA_HM=1 to enable」（error.rs:99），但全
+  仓库无人读取该变量；`TypeError::HmDisabled` 变体从未被构造（仅定义 +
+  Display + 行号映射，零构造点）——比僵尸提示字符串更彻底，是死变体。
+- 删除：`HmDisabled` 变体 + Display 分支 + check_mir.rs 行号映射分支。
+- 删除即验证：cargo check 一次通过，`MORA_HM`/`HmDisabled` 全仓零残留。
+
+### Changed — MORA_OPT 文档化（src/mir/ssa.rs）
+- `from_env` 补权威注释：`MORA_OPT` 语义（未设/0=None 默认零开销、
+  1=Basic、>=2=Aggressive）、存在理由（v0.75.7 渐进式启用：SSA 优化未
+  证明对所有程序安全前默认关，作 I5 可回退逃生舱）、演进方向（v1.0 应
+  提升为显式编译选项而非环境变量）。
+- 保留现状（默认关闭 = 零成本抽象姿态），不调整行为。
+
+### 环境变量分类清单（审计沉淀，代码外）
+- 正当外部集成：MORA_OCR_MODELS_DIR / MORA_AI_MODEL / MORA_AI_BASE_URL /
+  MORA_AI_RETRY_MAX / MORA_AI_RETRY_BASE_MS / MORA_CORS_ORIGIN
+- 标准用户目录：HOME / USERPROFILE / LOCALAPPDATA / XDG_DATA_HOME
+- 语言内部开关（已文档化）：MORA_OPT / MORA_MEMORY_DIR
+- 已删除僵尸：MORA_HM
+
+### 验证
+- 全测试 **697 通过 / 0 失败**。
+- clippy `-D warnings` 0 / fmt 零 diff。
+
 ## [v0.75.28] — 2026-08-01 — 方向 1/2/4/5/7 剩余项裁决与落地
 
 （三路审计剩余项：信号传播、变量级增量、资源槽位、约束原语。经实证后

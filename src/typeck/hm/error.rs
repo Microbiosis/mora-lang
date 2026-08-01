@@ -34,9 +34,6 @@ pub enum TypeError {
         span: Option<Span>,
     },
 
-    /// HM
-    HmDisabled,
-
     GeneralizationFailed {
         reason: String,
         span: Option<Span>,
@@ -94,9 +91,6 @@ impl std::fmt::Display for TypeError {
                 } else {
                     Ok(())
                 }
-            }
-            TypeError::HmDisabled => {
-                write!(f, "HM type inference disabled. Set MORA_HM=1 to enable")
             }
             TypeError::GeneralizationFailed { reason, span } => {
                 write!(f, "Generalization failed: {}", reason)?;

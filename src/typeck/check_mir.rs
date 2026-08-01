@@ -61,7 +61,6 @@ fn hm_to_external(err: HmError) -> TypeError {
         | OccursCheck { span, .. }
         | GeneralizationFailed { span, .. }
         | InvalidLiteral { span, .. } => span.map(|s| s.line).unwrap_or(0),
-        HmDisabled => 0,
     };
     let message = err.to_string();
     TypeError::with_detail(line, message, "", "", "")

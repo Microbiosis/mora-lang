@@ -1163,10 +1163,12 @@ impl ParserV3 {
                     args = self.parse_argument_list().ok()?;
                 }
 
-                // Build a method call as: method(object, arg1, arg2...)
+                // v0.75.16: 产出 MirCallee::Method（此前降成 Name("obj_method")
+                // 让 typeck 无法走 method_signature 推断；lower 层仍拼
+                // "obj_method" 字符串，runtime 分发不变）。
                 let old_callee = callee.clone();
                 callee = MirExpr::call(
-                    MirCallee::Name(format!("{}_{}", match_to_string(&old_callee), method_name)),
+                    MirCallee::Method(match_to_string(&old_callee), method_name),
                     std::iter::once(old_callee).chain(args).collect(),
                     self.span_of_current(),
                 );

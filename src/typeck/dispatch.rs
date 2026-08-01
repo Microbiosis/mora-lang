@@ -176,24 +176,55 @@ pub fn method_signature(receiver: &Type, method: &str) -> Option<Signature> {
 
 fn method_signature_builtin(receiver: &Type, method: &str) -> Option<Signature> {
     match (receiver, method) {
-        (Type::List(_), "map" | "filter" | "push") => Some(Signature::new(
-            vec![("self".to_string(), receiver.clone())],
-            Type::List(Box::new(Type::Any)),
+        // v0.75.16: 保留 List 元素类型（此前 map/filter/push 返回 List<Any>、
+        // reduce/pop/get 返回 Any — 元素类型信息丢失）。
+        // v0.75.16: 保留 List 元素类型。map/filter 接收闭包参数（M2 前
+        // 用 Any 宽松约束）；push 接收元素参数（elem 类型）。
+        (Type::List(elem), "map" | "filter") => Some(Signature::new(
+            vec![
+                ("self".to_string(), receiver.clone()),
+                ("f".to_string(), Type::Any),
+            ],
+            Type::List(elem.clone()),
         )),
-        (Type::List(_), "reduce" | "pop" | "get") => Some(Signature::new(
+        (Type::List(elem), "push") => Some(Signature::new(
+            vec![
+                ("self".to_string(), receiver.clone()),
+                ("value".to_string(), elem.as_ref().clone()),
+            ],
+            Type::List(elem.clone()),
+        )),
+        (Type::List(elem), "pop") => Some(Signature::new(
             vec![("self".to_string(), receiver.clone())],
-            Type::Any,
+            (**elem).clone(),
+        )),
+        // get 接收 index（Int）
+        (Type::List(elem), "get") => Some(Signature::new(
+            vec![
+                ("self".to_string(), receiver.clone()),
+                ("index".to_string(), Type::Int),
+            ],
+            (**elem).clone(),
         )),
         (Type::List(_), "len") => Some(Signature::new(
             vec![("self".to_string(), receiver.clone())],
             Type::Float,
         )),
+        // get 接收 key（String）；返回 Union<V, Nil>（v0.75.16 unify 成员合一）
         (Type::Dict(_, v), "get") => Some(Signature::new(
-            vec![("self".to_string(), receiver.clone())],
+            vec![
+                ("self".to_string(), receiver.clone()),
+                ("key".to_string(), Type::String),
+            ],
             Type::Union(vec![v.as_ref().clone(), Type::Nil]),
         )),
+        // set 接收 key + value
         (Type::Dict(k, v), "set") => Some(Signature::new(
-            vec![("self".to_string(), receiver.clone())],
+            vec![
+                ("self".to_string(), receiver.clone()),
+                ("key".to_string(), k.as_ref().clone()),
+                ("value".to_string(), v.as_ref().clone()),
+            ],
             Type::Dict(k.clone(), v.clone()),
         )),
         (Type::Dict(k, _), "keys") => Some(Signature::new(
@@ -332,10 +363,11 @@ mod tests {
     }
 
     #[test]
-    fn list_map_arity_is_one() {
+    fn list_map_arity_is_two() {
+        // v0.75.16: map 接收闭包参数（receiver + f = 2 参）。
         assert_eq!(
             method_arity(&Type::List(Box::new(Type::Any)), "map"),
-            Some(1)
+            Some(2)
         );
     }
 

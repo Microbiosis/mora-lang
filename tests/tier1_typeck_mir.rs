@@ -118,3 +118,41 @@ fn type_errors_contain_span_information() {
     let err = first_err(&errs);
     assert!(err.line >= 1, "line should be 1-based, got {}", err.line);
 }
+
+// ─── v0.75.16 M1: 列表/字典方法签名保留元素类型 ─────────────────────
+
+#[test]
+fn dict_get_union_unifies_with_member() {
+    // v0.75.16: `d.get(k)` 返回 Union<V, Nil>。M1 前 unify 不处理 Union
+    // （遇 Union 报 UnificationFailure）——`v == 1` 应通过成员合一。
+    let src = "let d = {\"k\": 1}\nlet v = d.get(\"k\")\nv == 1";
+    let exprs = parse_code_v3(src).expect("parse");
+    assert!(
+        check_program_mir(&exprs).is_empty(),
+        "Union<V, Nil> 与 Int 合一应通过（成员合一）"
+    );
+}
+
+#[test]
+fn list_get_exposes_element_type_error() {
+    // v0.75.16: `list.get` 返回元素类型（此前返回 Any）。String 元素 + Int
+    // 运算应报错——元素类型信息让类型错误被检出（此前 Any 静默放过）。
+    let src = "let xs = [\"a\", \"b\"]\nlet y = xs.get(0)\ny + 1";
+    let exprs = parse_code_v3(src).expect("parse");
+    let errs = check_program_mir(&exprs);
+    assert!(
+        !errs.is_empty(),
+        "String 元素 + Int 应报类型错误（list.get 保留元素类型）"
+    );
+}
+
+#[test]
+fn list_map_keeps_int_elements_clean() {
+    // map 后元素类型保持 Int：与 Int 运算、比较应通过。
+    // 注：同行闭包字面量 `fn(x) x*2` 不在 map 参数位解析（pre-existing
+    // parser 限制）— 用命名闭包 + map(f) 形态。
+    let src =
+        "let f = fn(x) x * 2 end\nlet xs = [1, 2, 3]\nlet ys = xs.map(f)\nlet z = ys[0]\nz + 1";
+    let exprs = parse_code_v3(src).expect("parse");
+    assert!(check_program_mir(&exprs).is_empty());
+}

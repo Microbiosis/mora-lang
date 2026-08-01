@@ -80,13 +80,12 @@ impl Interpreter {
                         return Err("merge_with(key, strategy) expects string strategy".to_string());
                     }
                 };
-                let ms = match strat {
-                    "append" => crate::value::MergeStrategy::Append,
-                    "add" => crate::value::MergeStrategy::Add,
-                    "dict_union" => crate::value::MergeStrategy::DictUnion,
-                    "grow_only_set" => crate::value::MergeStrategy::GrowOnlySet,
-                    "lww" | "last_write_wins" => crate::value::MergeStrategy::LastWriteWins,
-                    _ => {
+                // v0.75.24: 策略名解析收敛到 MergeStrategy::from_name
+                // （单一事实来源；typeck 对字面量参数已做编译期校验，此处
+                // 运行时兜底动态用法）。
+                let ms = match crate::value::MergeStrategy::from_name(strat) {
+                    Some(s) => s,
+                    None => {
                         return Err(format!(
                             "merge_with: unknown strategy '{}' (append/add/dict_union/grow_only_set/lww)",
                             strat

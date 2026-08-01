@@ -302,3 +302,22 @@ fn merge_with_builtin_typechecks() {
     let exprs = parse_code_v3(src).expect("parse");
     assert!(check_program_mir(&exprs).is_empty());
 }
+
+#[test]
+fn merge_with_invalid_strategy_literal_rejected_at_compile_time() {
+    // v0.75.24: merge_with(key, strategy) 的策略名字面量编译期校验 —
+    // 非法策略在 typeck 阶段拦截（InvalidLiteral），不再留到运行时。
+    let src = "merge_with(\"x\", \"bogus\")";
+    let exprs = parse_code_v3(src).expect("parse");
+    let errs = check_program_mir(&exprs);
+    assert!(!errs.is_empty(), "非法策略名字面量应在 typeck 阶段报错");
+}
+
+#[test]
+fn merge_with_dynamic_strategy_passes_typecheck() {
+    // 动态传入的策略（非字面量）无法静态校验 — typeck 放行，
+    // 由运行时 MergeStrategy::from_name 兜底（unknown → 运行时错误）。
+    let src = "let s = \"append\"\nmerge_with(\"x\", s)";
+    let exprs = parse_code_v3(src).expect("parse");
+    assert!(check_program_mir(&exprs).is_empty());
+}

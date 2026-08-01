@@ -2,6 +2,47 @@
 
 All notable changes to Mora will be documented in this file.
 
+## [v0.75.24] — 2026-08-01 — 策略名硬编码收敛：单一事实来源 + 编译期静态校验
+
+（回应「为什么还需要有硬编码」——策略名解析在 dispatch.rs 的字符串 match
+是「脚本源码 → Rust 枚举」的转换边界，当初为遵守去 AST 化约束（不引入
+枚举字面量语法）选字符串表达。但非法策略留到运行时炸与 Mora 的静态强类型
+定位冲突。本 commit 把硬编码收敛为单一事实来源，并把非法字面量前移到
+typeck 编译期拦截。）
+
+### Changed — 策略名 → 枚举的单一事实来源（src/value.rs）
+- 新增 `MergeStrategy::from_name(&str) -> Option<Self>`——`lww`/`last_write_wins`/
+  `append`/`add`/`dict_union`/`grow_only_set`。运行时解析与 typeck 字面量
+  校验都走它，不再有两处字符串 match。
+
+### Changed — 运行时改用 from_name（src/interpreter/dispatch.rs）
+- `merge_with` 的策略名 match 替换为 `MergeStrategy::from_name` 调用
+  （错误信息不变，行为不变——保留运行时兜底以覆盖动态传入的变量策略）。
+
+### Added — typeck 编译期静态校验（src/typeck/hm/）
+- `TypeError::InvalidLiteral { what, value, span }` 新变体（error.rs +
+  Display + check_mir.rs 行号映射）。
+- `infer_call`：`merge_with` 的第二个参数为**字符串字面量**时，用
+  `from_name` 校验——非法策略编译期报错（`mora` exit 2），不再留到运行时；
+  动态传入（变量）的策略放行，由运行时兜底。
+
+### 语义
+- `merge_with("x", "bogus")` → typeck 阶段 `Invalid merge_with strategy
+  literal 'bogus'`（此前运行时才报 unknown strategy）。
+- 单一事实来源：新增策略只需改 `from_name` 一处（运行时 + typeck 同步生效）。
+
+### Added — 测试（tier1_typeck_mir.rs +2）
+- `merge_with_invalid_strategy_literal_rejected_at_compile_time`：非法字面量
+  编译期报错。
+- `merge_with_dynamic_strategy_passes_typecheck`：动态变量策略放行（运行时
+  兜底）。
+- dispatch 单测（unknown strategy 运行时错误路径）保持通过。
+
+### 验证
+- 端到端：`merge_with("x","bogus")` → `mora` exit 2（1 type error）。
+- 全测试 **694 通过 / 0 失败**（+2）。
+- clippy `-D warnings` 0 / fmt 零 diff。
+
 ## [v0.75.23] — 2026-08-01 — per-key CRDT 合并策略：merge_with 写侧接线（方向 8 激活）
 
 （三路只读审计后执行 P1。实证发现：`value.rs` 已有完整 CRDT 骨架——

@@ -36,6 +36,9 @@ impl Substitution {
             crate::typeck::Type::Result_(ok, err) => {
                 crate::typeck::Type::Result_(Box::new(self.apply(ok)), Box::new(self.apply(err)))
             }
+            crate::typeck::Type::Union(members) => {
+                crate::typeck::Type::Union(members.iter().map(|m| self.apply(m)).collect())
+            }
             _ => ty.clone(),
         }
     }
@@ -169,6 +172,11 @@ fn unify(
         (crate::typeck::Type::Nil, crate::typeck::Type::Nil) => Ok(subst.clone()),
         (crate::typeck::Type::Any, crate::typeck::Type::Any) => Ok(subst.clone()),
 
+        // v0.75.16: Any 是 top type — 与任何类型合一成功（"未知类型"语义）。
+        // 修复：`ys[0]` 降成 `Call(Name("ys_index"))`（receiver_operation 糖），
+        // typeck 当未知调用时把 arg 约束到 callee_ty=Any，此前无 (X, Any) arm 报错。
+        (crate::typeck::Type::Any, _) | (_, crate::typeck::Type::Any) => Ok(subst.clone()),
+
         // Compound types
         (crate::typeck::Type::List(elem1), crate::typeck::Type::List(elem2)) => {
             unify(elem1, elem2, subst)
@@ -180,6 +188,38 @@ fn unify(
         (crate::typeck::Type::Result_(ok1, err1), crate::typeck::Type::Result_(ok2, err2)) => {
             let s1 = unify(ok1, ok2, subst)?;
             unify(err1, err2, &s1)
+        }
+
+        // v0.75.16: Union 合一 — 任一成员与另一侧匹配即通过（dict.get 返回
+        // Union<V, Nil>；`d.get("k") == x` 需允许 x 与 V 或 Nil 之一合一）。
+        // 防膨胀：成员为空或含 Any 时直接视为 Any（退化成功）。
+        (crate::typeck::Type::Union(members), other)
+        | (other, crate::typeck::Type::Union(members)) => {
+            if members.is_empty()
+                || members
+                    .iter()
+                    .any(|m| matches!(m, crate::typeck::Type::Any))
+            {
+                Ok(subst.clone())
+            } else {
+                // 任一成员成功合一即可；全部失败则报第一个失败
+                let mut first_err: Option<TypeError> = None;
+                for m in members {
+                    match unify(m, other, subst) {
+                        Ok(s) => return Ok(s),
+                        Err(e) => {
+                            if first_err.is_none() {
+                                first_err = Some(e);
+                            }
+                        }
+                    }
+                }
+                Err(first_err.unwrap_or(TypeError::UnificationFailure {
+                    expected: format_type(&t1),
+                    got: format_type(&t2),
+                    span: None,
+                }))
+            }
         }
 
         // Mismatch
@@ -200,6 +240,7 @@ fn contains_typevar(ty: &crate::typeck::Type, var: char) -> bool {
         crate::typeck::Type::Result_(ok, err) => {
             contains_typevar(ok, var) || contains_typevar(err, var)
         }
+        crate::typeck::Type::Union(members) => members.iter().any(|m| contains_typevar(m, var)),
         _ => false,
     }
 }

@@ -356,7 +356,27 @@ impl HMInference {
             MirCallee::Var(var_name) => self.env.get(var_name).cloned().unwrap_or(Type::Any),
             MirCallee::Evaluated(expr) => self.infer_expr(expr)?,
             MirCallee::Builtin(op) => self.builtin_type(op)?,
-            MirCallee::Method(_, _) => Type::Any,
+            // v0.75.16: Method 调用（parser 现产出 MirCallee::Method）— 走
+            // method_signature 推断（receiver 类型 + 参数约束 + 返回类型）。
+            MirCallee::Method(_, _) => {
+                // 第一个 arg 是 receiver 表达式；构造临时 MethodCall 语义。
+                // 直接委托 infer_method_call：receiver = args[0], 后续为参数。
+                let (recv, method_args) = match args.split_first() {
+                    Some((r, rest)) => (r, rest),
+                    None => {
+                        return Err(vec![TypeError::ArityMismatch {
+                            expected: 1,
+                            actual: 0,
+                            span,
+                        }]);
+                    }
+                };
+                let method = match callee {
+                    MirCallee::Method(_, m) => m.clone(),
+                    _ => unreachable!(),
+                };
+                return self.infer_method_call(recv, &method, method_args, span);
+            }
         };
         let arg_types: Vec<Type> = args
             .iter()

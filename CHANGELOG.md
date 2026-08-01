@@ -2,6 +2,23 @@
 
 All notable changes to Mora will be documented in this file.
 
+## [v0.75.16] — 2026-08-01 — 静态类型 M1：方法调用类型推断 + 列表/字典元素保留
+
+（类型系统补齐第 1 模块。探索确认 Mora 已具备 HM 推断 + 编译期拦截，真缺口模块化推进。）
+
+### Changed — parser 产出 MirCallee::Method（src/parser_v3/mod.rs）
+- `obj.method(args)` 此前降成 `Call(Name("obj_method"))` 字符串糖 → typeck 当未知调用（infer_call else 分支 `Eq(arg, Any)` 报 UnificationFailure），`method_signature` 表完全没被走到。改为产出 `MirCallee::Method(obj, method)`（lower 层仍拼 "obj_method" 字符串，runtime 分发不变），typeck 走 `method_signature` 推断。
+
+### Changed — typeck 方法调用推断（src/typeck/hm/mod.rs + dispatch.rs）
+- `infer_call` 的 `MirCallee::Method` 分支：委托 `infer_method_call`（receiver + 参数约束 + 返回类型）。
+- `method_signature_builtin` 保留元素类型：`list.map/filter` 返回 `List(elem)`（此前 `List<Any>`）、`push` 返回 `List(elem)`、`pop/get` 返回 `elem`（此前 `Any`）；`dict.get`/`set` 补 key/value 参数。
+- `unify`：`Type::Union` 成员合一（`dict.get` 返回 `Union<V,Nil>` 可与成员合一）；**`Any` 作为 top type**（与任意类型合一成功 — 修复 `ys[0]` 降成 `Call(Name("ys_index"))` 时未知调用约束报错）。
+
+### Tests
+- `tests/tier1_typeck_mir.rs` +3：`dict_get_union_unifies_with_member` / `list_get_exposes_element_type_error`（String 元素 + Int 运算被检出）/ `list_map_keeps_int_elements_clean`。
+- `src/typeck/dispatch.rs` 单测：`list_map_arity_is_one` → `list_map_arity_is_two`（map 现接收闭包参数）。
+- 566 通过 / 0 失败（跳 14 个 pre-existing sandbox 慢测试）。clippy 0 / fmt 零 diff（M1 文件）。
+
 ## [v0.75.15] — 2026-08-01 — 约束审计 P3-2（吞异常分类审计）
 
 对 AGENTS_CODE_MODIFICATION.md §2「禁止吞异常」的全量审计（~200 处命中：`let _ =` 130 + `.ok()` 50 + `Err(_)` 20）。

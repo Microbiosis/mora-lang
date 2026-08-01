@@ -12,7 +12,7 @@
 /// 所有引用 `mora::VERSION` 或 `env!("MORAGIT_VERSION")` 的位置同步更新。
 pub const VERSION: &str = env!("MORAGIT_VERSION");
 
-pub mod ai_infra;
+// v0.75.25: ai_infra 活类型迁至 runtime::ai_infra；12 个死类型随旧文件删除
 // v0.55: ast_v2 module deleted — all paths use mir/expr MirExpr
 // v0.42.1: Audit Sink — SHA-256 hash-chained JSONL (loongclaw-inspired)
 pub mod audit;

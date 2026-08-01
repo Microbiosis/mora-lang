@@ -5,7 +5,9 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use crate::ai_infra::{CacheWarmer, ContextWindow, SpeculativeVerifier};
+// v0.75.25: 活类型自 src/ai_infra.rs 迁至 runtime::ai_infra（12 个死类型
+// 随旧文件删除）
+use crate::runtime::ai_infra::{CacheWarmer, ContextWindow, SpeculativeVerifier};
 use crate::runtime::types::{RouteConfig, TokenBudget, TokenUsage};
 use crate::trace_collector::TraceCollector;
 

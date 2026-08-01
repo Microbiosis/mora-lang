@@ -2,6 +2,40 @@
 
 All notable changes to Mora will be documented in this file.
 
+## [v0.75.25] — 2026-08-01 — ai_infra 清理：3 活类型迁入 runtime，12 死类型删除
+
+（回应「这些代码为什么出现、历史遗留问题是什么」——先 git 考古实证再动手：
+`src/ai_infra.rs` 在 v0.25（98c8c37，「feat: v0.25 新功能」大特性批次：Multi-Agent
+orchestrate/Eval/Skill/Memory+Context Compaction）引入 15 个 AI 基础设施类型——
+**规划图景，从未接入任何执行路径**（`-S` 追踪调用点历史零记录，出生即死）。
+v0.52 ADR-001（32aa1ee「抽 AiRuntime facade」）重构时，其中 3 个被**误当成状态**
+搬进 `AiRuntime` 字段，成为只构造、零方法调用的死字段——这就是「为什么还在」：
+不是它们在服务，而是一次结构重构把死代码当活资产继承了。）
+
+### 审计教训（诚实记录）
+- 首轮按**类型名** grep 判 3 个类型为死——**漏了字段访问**（`self.ai.context_window`
+  不出现类型名）。编译器（E0609）与 ai_chat.rs 调用点
+  （`add_message`/`needs_compression`/`compress`/`verify`/`get_cached`）证实它们
+  **活着**。死代码判定必须以「类型名 × 字段访问 × 调用点」三通道核对。
+
+### Changed — 迁移 3 个活类型（src/runtime/ai_infra.rs 新文件）
+- `ContextWindow`（ai.chat 消息滑动窗口 + 压缩）、`SpeculativeVerifier`（推测
+  解码验证）、`CacheWarmer`（prompt→response 缓存）自 `src/ai_infra.rs` 迁入
+  `runtime::ai_infra`，去除 `#[allow(dead_code)]`（它们现在是活的）。
+- `AiRuntime` 字段不变；`use` 路径更新。
+
+### Removed — 删除 12 个死类型 + 旧文件（src/ai_infra.rs，783 行）
+- `AdaptiveTemperature`/`LoadBalancer`/`SmartCacheEviction`/`EvictionStrategy`/
+  `ModelSwitcher`/`ModelBenchmark`/`AiCallTracer`/`CallSpan`/`AdaptiveBatchSize`/
+  `ModelPerformanceVisualizer`/`CostOptimizer`/`RetryPolicy`——全仓库
+  （src + tests）零引用，实证出生即死。`lib.rs` 移除 `pub mod ai_infra`。
+
+### 验证
+- 删除即验证：cargo check 一次通过（编译器证实无隐藏引用）。
+- 12 死类型名 src+tests 零残留（仅新文件注释记录清单）。
+- 全测试 **694 通过 / 0 失败**（活类型迁移行为不变）。
+- clippy `-D warnings` 0 / fmt 零 diff。
+
 ## [v0.75.24] — 2026-08-01 — 策略名硬编码收敛：单一事实来源 + 编译期静态校验
 
 （回应「为什么还需要有硬编码」——策略名解析在 dispatch.rs 的字符串 match

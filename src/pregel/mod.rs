@@ -1008,7 +1008,9 @@ impl MirPregelEngine {
             if let Some(master) = self.master_compute.clone() {
                 let mut master_env = interpreter.environment().lock().clone();
                 // v0.75.9: master_compute 已是 Arc，直接走全局 DAG 缓存
-                let _ = crate::mir::interp::run_mir(&master, interpreter, &mut master_env);
+                if let Err(e) = crate::mir::interp::run_mir(&master, interpreter, &mut master_env) {
+                    eprintln!("[warn] pregel master_compute failed: {}", e);
+                }
             }
 
             // interrupt after

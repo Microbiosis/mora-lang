@@ -86,7 +86,9 @@ impl WorkerPool {
                                     }),
                                     Err(e) => Err(e),
                                 };
-                                let _ = msg.res_tx.send(outcome);
+                                if let Err(e) = msg.res_tx.send(outcome) {
+                                    eprintln!("[warn] worker pool: failed to send outcome: {}", e);
+                                }
                             }
                             None => break, // queue drained → wait for next batch
                         }
@@ -133,10 +135,12 @@ impl WorkerPool {
         // shared queue. Sending N copies means no worker misses the batch.
         if let Some(tx) = &self.tx {
             for _ in 0..self.num_workers {
-                let _ = tx.send(BatchMsg {
+                if let Err(e) = tx.send(BatchMsg {
                     jobs: shared_jobs.clone(),
                     res_tx: res_tx.clone(),
-                });
+                }) {
+                    eprintln!("[warn] worker pool: failed to broadcast batch: {}", e);
+                }
             }
         }
         drop(res_tx); // workers hold their own clones

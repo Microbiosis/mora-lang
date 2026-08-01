@@ -522,7 +522,9 @@ impl Interpreter {
                     match text_result {
                         Ok(text) if status < 400 => {
                             let (input, output) = Self::extract_usage(&text);
-                            let _ = self.track_tokens(input, output);
+                            if let Err(e) = self.track_tokens(input, output) {
+                                eprintln!("[warn] ai.chat: failed to track tokens: {}", e);
+                            }
                             let result = self
                                 .extract_ai_content(&text)
                                 .unwrap_or(Value::String(text.clone()));
@@ -663,7 +665,9 @@ impl Interpreter {
 
             // 解析响应
             let (input, output) = Self::extract_usage(&response_text);
-            let _ = self.track_tokens(input, output);
+            if let Err(e) = self.track_tokens(input, output) {
+                eprintln!("[warn] ai.chat: failed to track tokens: {}", e);
+            }
             let (content, tool_calls) = Self::extract_chat_response(&response_text)?;
 
             if tool_calls.is_empty() {

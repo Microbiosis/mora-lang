@@ -639,18 +639,6 @@ impl MirDag {
             if from_is_label || to_is_label {
                 continue;
             }
-            // v0.75.33: 不在控制转移节点（Branch/Jump）之后继续线性链。
-            // 全局 i→i+1 链会穿过分支/回边（如 18→19 body、26→27 exit），
-            // wave 调度器会因此：① 每轮把 body 链重复激活（双执行）；
-            // ② 循环未退出就把 exit（27）随 26→27 Sequence 推入 → 读脏值。
-            // 控制转移由 Branch/Jump handler 决定（dag_interp 只推选中的
-            // target），线性链只覆盖基本块内部的直线代码。
-            if matches!(
-                self.nodes[i],
-                MirDagNode::Branch { .. } | MirDagNode::Jump { .. }
-            ) {
-                continue;
-            }
             self.edges.push(MirDagEdge {
                 from: i,
                 to: j,

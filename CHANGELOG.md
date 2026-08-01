@@ -2,6 +2,38 @@
 
 All notable changes to Mora will be documented in this file.
 
+## [v0.75.26] — 2026-08-01 — P0 语义定夺：StreamFor 死原语移除（方向 1/2/5 钥匙）
+
+（三路审计共识的 P0：StreamFor 是「悬挂指令」——`MirInst::StreamFor {
+prompt_reg, var, body }` 的 handler 空转（prompt_reg/var 被 `_` 忽略、body
+仅执行一次并丢弃），是「语法先行、语义未接」的最后幸存者。语义定夺 = 删除。）
+
+### 定夺依据（实证，四通道）
+1. **零构造点**：全仓（src + tests）无任何代码构造 `MirInst::StreamFor`。
+2. **零测试引用**：tests 无 StreamFor。
+3. **语义已被取代**：AI 流式实际走 `ai.chat` 的 `stream: true` 参数
+   （ai_chat.rs 流式响应路径），与 StreamFor 指令无关。
+4. **空转 handler**：`h_stream_for` 克隆 env、`run_mir` body 一次、丢弃结果
+   ——不产生任何可观察效应（尽管 `is_effect()` 标 true）。
+
+### Removed — StreamFor（4 文件 6 处）
+- `src/mir/mod.rs`：`MirInst::StreamFor` 变体删除（留注释记录：若未来需 MIR
+  指令级流式语义，重新设计而非复活旧形状）。
+- `src/mir/handlers.rs`：`h_stream_for` 函数 + dispatch 分支 + `is_effect`/
+  `input_regs` 两处 list 成员删除。
+- `src/mir/ssa.rs`：SSA 跳过列表成员删除。
+- `src/mir/optimize/cost.rs`：cost 分支删除。
+- 删除即验证：cargo check 一次通过。
+
+### 意义
+- 「语法先行、语义未接」的语法面残余清零（继 v0.75.19 关键字、
+  v0.75.20 树变体、v0.75.21 pipe 之后，最后一个悬挂指令定夺）。
+- 运行能力零变化：StreamFor 本就空转，删除不触碰任何可观察行为。
+
+### 验证
+- 全测试 **694 通过 / 0 失败**。
+- clippy `-D warnings` 0 / fmt 零 diff。
+
 ## [v0.75.25] — 2026-08-01 — ai_infra 清理：3 活类型迁入 runtime，12 死类型删除
 
 （回应「这些代码为什么出现、历史遗留问题是什么」——先 git 考古实证再动手：

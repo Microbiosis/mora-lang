@@ -126,11 +126,6 @@ impl CostModel for TokenEstimate {
             MirInst::WithConfig { bindings, body, .. } => {
                 bindings.len() as u32 * 5 + body.body.iter().map(|i| self.inst_cost(i)).sum::<u32>()
             }
-            MirInst::StreamFor {
-                prompt_reg: _,
-                var: _,
-                body,
-            } => 20 + body.body.iter().map(|i| self.inst_cost(i)).sum::<u32>(),
             // 事务
             MirInst::Transaction { body, compensation } => {
                 let body_sum = body.body.iter().map(|i| self.inst_cost(i)).sum::<u32>();

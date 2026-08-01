@@ -518,7 +518,6 @@ fn split_into_ssa(
             | MirInst::ToolDef { .. }
             | MirInst::Import(_)
             | MirInst::WithConfig { .. }
-            | MirInst::StreamFor { .. }
             | MirInst::MatchExpr { .. }
             | MirInst::MatchArm { .. }
             | MirInst::Closure { .. }

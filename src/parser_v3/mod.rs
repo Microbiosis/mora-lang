@@ -551,16 +551,21 @@ impl ParserV3 {
         };
 
         let task_mir = Some(body.clone());
+        // v0.75.32: 修复 task_expr → task_body 降级缺失 — 此前 task_body 恒空
+        // （pregel 执行报 "lowering missing"）。产出时立即 lower 填入；
+        // 失败兜底为空（保持旧行为，pregel 端仍会报真降级错误）。
+        let lowered_body = crate::mir::lower::lower_mir_exprs(std::slice::from_ref(&body))
+            .unwrap_or_else(|_| MirFunction {
+                params: vec![],
+                body: vec![],
+                n_regs: 0,
+            });
         Some(MirOrchestrateAgent {
             name,
             with_config: None,
             task_expr: body,
             verify_expr: None,
-            task_body: MirFunction {
-                params: vec![],
-                body: vec![],
-                n_regs: 0,
-            },
+            task_body: lowered_body,
             task_mir_expr: task_mir,
             combiner_body: None,
         })

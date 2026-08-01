@@ -2,6 +2,32 @@
 
 All notable changes to Mora will be documented in this file.
 
+## [v0.75.32] — 2026-08-02 — 去 AST 化终局阶段 1：修复 pregel 降级缺失
+
+（多阶段终局第 1 阶段：MirExpr → witness + parser 直接 emit 的前置障碍清理。
+计划已批准，见 docs/de-ast-boundary.md §3 增量路径。）
+
+### Fixed — pregel task_expr → task_body 降级缺失（src/parser_v3/mod.rs）
+- **根因**：`parse_orchestrate_agent` 产出 `task_expr: body` 但 `task_body`
+  恒空（parser_v3/mod.rs:559-563），pregel 执行报 "lowering missing"
+  （pregel/mod.rs:752）。orchestrate 测试全 `#[ignore]` 掩盖了该缺口。
+- **修复**：产出 agent 时立即 `lower_mir_exprs(std::slice::from_ref(&body))`
+  填 `task_body`；失败兜底为空（保持旧行为）。
+
+### Changed — 激活 orchestrate 测试（tests/orchestrate_v3_pipeline.rs）
+- 激活 7 个（2 通过 10 忽略 → 9 通过 3 忽略）：两个 lower 结构测试 +
+  `v3_pipeline_orchestrate_pregel_runs`（**经 parser 的 orchestrate pregel
+  端到端可执行**）+ if/let/match/task 端到端。
+- 3 个 ignore 标注真实原因（非笼统旧标注）：
+  - `v3_pipeline_orchestrate_sequential_runs` — h_orchestrate 只实现
+    Pregel，Sequential 走 "not yet supported"（handlers.rs:669，功能缺口）。
+  - `v3_pipeline_for/while_loop_runs` — **pre-existing 循环累加 bug**
+    （`sum = sum + i` 返回 0，独立运行 /tmp/for.mora 亦复现）。
+
+### 验证
+- 全测试 **705 通过 / 0 失败**（+7）。
+- clippy `-D warnings` 0 / fmt 零 diff。
+
 ## [v0.75.31] — 2026-08-01 — 语义漂移修复：删除 MirInst::Receive 死原语
 
 （回应「两个 env 会不会混淆」的第三层面——`Environment` 语义漂移。实证

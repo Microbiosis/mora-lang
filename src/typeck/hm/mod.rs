@@ -11,7 +11,7 @@
 //! Public entry point: [`check_program_mir`] (re-exported from
 //! `crate::typeck`).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::common::Span;
 use crate::mir::expr::{BuiltinOp, MirCallee, MirExpr, MirExprKind, Param};
@@ -92,6 +92,114 @@ impl HMInference {
         match ty {
             Type::TypeVar(c) => self.closure_sigs.get(c),
             _ => None,
+        }
+    }
+
+    /// v0.75.17: 展开 env 中命中的 ForAll（标准 HM let-polymorphism 展开）。
+    ///
+    /// 特殊处理 closure 身份变量：被量化的身份变量映射到 fresh 变量，且其
+    /// closure_sigs 侧表签名随之复制一份、内部 TypeVar 全部重命名 — 这样
+    /// `let f = fn(x) x; f(1); f("s")` 每次调用得到一份独立的单形化副本，
+    /// 而不是共享同一组约束导致 Int/String 冲突。
+    pub fn instantiate_type(&mut self, ty: &Type) -> Type {
+        match ty {
+            Type::ForAll(vars, inner) => {
+                let quantified: HashSet<char> = vars.iter().cloned().collect();
+                // 被量化的 closure 身份变量 → fresh 身份变量（sig 同步复制）
+                let mut remap: HashMap<char, char> = HashMap::new();
+                for v in vars {
+                    if let Some(sig) = self.closure_sigs.get(v).cloned() {
+                        let fresh = self.fresh_type_var_id();
+                        // 先重命名签名内部变量（每次实例化一份 fresh 副本 →
+                        // 单形化，两次调用互不冲突），再登记进侧表。
+                        let params: Vec<Type> =
+                            sig.params.iter().map(|p| self.rename_ty(p)).collect();
+                        let return_type = self.rename_ty(&sig.return_type);
+                        self.closure_sigs.insert(
+                            fresh,
+                            ClosureSig {
+                                arity: sig.arity,
+                                params,
+                                return_type,
+                            },
+                        );
+                        remap.insert(*v, fresh);
+                    }
+                }
+                self.instantiate_ty(inner, &quantified, &remap)
+            }
+            _ => ty.clone(),
+        }
+    }
+
+    /// 递归替换类型中出现的所有 TypeVar（每次实例化一份独立副本）。
+    fn rename_ty(&mut self, ty: &Type) -> Type {
+        match ty {
+            Type::TypeVar(_) => Type::TypeVar(self.fresh_type_var_id()),
+            Type::List(elem) => Type::List(Box::new(self.rename_ty(elem))),
+            Type::Dict(k, v) => {
+                Type::Dict(Box::new(self.rename_ty(k)), Box::new(self.rename_ty(v)))
+            }
+            Type::Result_(ok, err) => {
+                Type::Result_(Box::new(self.rename_ty(ok)), Box::new(self.rename_ty(err)))
+            }
+            Type::Union(members) => {
+                Type::Union(members.iter().map(|m| self.rename_ty(m)).collect())
+            }
+            Type::ForAll(vs, inner) => Type::ForAll(vs.clone(), Box::new(self.rename_ty(inner))),
+            _ => ty.clone(),
+        }
+    }
+
+    /// 把 ForAll 内层 τ 中被量化的 TypeVar 替换为 fresh 变量（未量化的保留）。
+    fn instantiate_ty(
+        &mut self,
+        ty: &Type,
+        quantified: &HashSet<char>,
+        remap: &HashMap<char, char>,
+    ) -> Type {
+        match ty {
+            Type::TypeVar(c) => {
+                if quantified.contains(c) {
+                    match remap.get(c) {
+                        // 被量化的 closure 身份变量 → 已复制的 fresh 身份
+                        Some(fresh) => Type::TypeVar(*fresh),
+                        // 普通量化变量 → 全新 fresh（每次使用单形化）
+                        None => Type::TypeVar(self.fresh_type_var_id()),
+                    }
+                } else {
+                    Type::TypeVar(*c)
+                }
+            }
+            Type::List(elem) => Type::List(Box::new(self.instantiate_ty(elem, quantified, remap))),
+            Type::Dict(k, v) => Type::Dict(
+                Box::new(self.instantiate_ty(k, quantified, remap)),
+                Box::new(self.instantiate_ty(v, quantified, remap)),
+            ),
+            Type::Result_(ok, err) => Type::Result_(
+                Box::new(self.instantiate_ty(ok, quantified, remap)),
+                Box::new(self.instantiate_ty(err, quantified, remap)),
+            ),
+            Type::Union(members) => Type::Union(
+                members
+                    .iter()
+                    .map(|m| self.instantiate_ty(m, quantified, remap))
+                    .collect(),
+            ),
+            // v0.75.17: 嵌套 ForAll — 内层量化变量冻结（遮蔽外层，不展开）
+            Type::ForAll(inner_vars, inner) => {
+                let shadowed: HashSet<char> = inner_vars.iter().cloned().collect();
+                let active: HashSet<char> = quantified
+                    .iter()
+                    .filter(|c| !shadowed.contains(c))
+                    .cloned()
+                    .collect();
+                Type::ForAll(
+                    inner_vars.clone(),
+                    Box::new(self.instantiate_ty(inner, &active, remap)),
+                )
+            }
+            _ => ty.clone(),
         }
     }
 
@@ -247,9 +355,13 @@ impl HMInference {
         span: Span,
     ) -> Result<Type, Vec<TypeError>> {
         let value_ty = self.infer_expr(value)?;
-        self.env.add(name.to_string(), value_ty.clone());
+        // v0.75.17: let-generalization — 量化为不在 env 中的自由变量
+        // （标准 HM：Γ ⊢ let x = e in body : ∀α₁...αₙ.τ，其中
+        // {α₁...αₙ} = FV(τ) \ FV(Γ)）。
+        let gen_ty = generalize::generalize(&value_ty, &self.env.free_variables());
+        self.env.add(name.to_string(), gen_ty.clone());
         let _ = span;
-        Ok(value_ty)
+        Ok(gen_ty)
     }
 
     fn infer_let_typed(
@@ -269,9 +381,12 @@ impl HMInference {
                 Box::new(value_ty.clone()),
             ));
         }
-        self.env.add(name.to_string(), type_hint.clone());
+        // v0.75.17: 显式注解同样做 let-generalization（注解含自由变量时
+        // 量化为 ForAll；`List<int>` 等具体注解无自由变量，原样登记）。
+        let gen_hint = generalize::generalize(type_hint, &self.env.free_variables());
+        self.env.add(name.to_string(), gen_hint.clone());
         let _ = span;
-        Ok(type_hint.clone())
+        Ok(gen_hint)
     }
 
     fn infer_assign(
@@ -283,6 +398,11 @@ impl HMInference {
         let value_ty = self.infer_expr(value)?;
         let current = self.env.get(target).cloned();
         if let Some(existing) = current {
+            // v0.75.17: 命中 ForAll 时先实例化再合一（赋值的 LHS 是单形实例）
+            let existing = match existing {
+                Type::ForAll(_, _) => self.instantiate_type(&existing),
+                other => other,
+            };
             self.constraints.push(Constraint::Eq(
                 Box::new(existing),
                 Box::new(value_ty.clone()),
@@ -296,8 +416,14 @@ impl HMInference {
         Ok(value_ty)
     }
 
-    fn infer_var(&self, name: &str, span: Span) -> Result<Type, Vec<TypeError>> {
+    fn infer_var(&mut self, name: &str, span: Span) -> Result<Type, Vec<TypeError>> {
         match self.env.get(name) {
+            // v0.75.17: env 命中 ForAll → 实例化（let-polymorphism 展开）。
+            // 可变借用问题：先克隆 env 条目，再走 &mut self 的实例化路径。
+            Some(ty) if matches!(ty, Type::ForAll(_, _)) => {
+                let ty = ty.clone();
+                Ok(self.instantiate_type(&ty))
+            }
             Some(ty) => Ok(ty.clone()),
             None => Err(vec![TypeError::UnboundVariable {
                 name: name.to_string(),
@@ -353,7 +479,15 @@ impl HMInference {
     ) -> Result<Type, Vec<TypeError>> {
         let callee_ty = match callee {
             MirCallee::Name(name) => self.builtin_callee_ty(name).unwrap_or(Type::Any),
-            MirCallee::Var(var_name) => self.env.get(var_name).cloned().unwrap_or(Type::Any),
+            // v0.75.17: Var 命中 ForAll 时实例化（`let f = fn(x) x; f(1); f("s")`）
+            MirCallee::Var(var_name) => match self.env.get(var_name) {
+                Some(ty) if matches!(ty, Type::ForAll(_, _)) => {
+                    let ty = ty.clone();
+                    self.instantiate_type(&ty)
+                }
+                Some(ty) => ty.clone(),
+                None => Type::Any,
+            },
             MirCallee::Evaluated(expr) => self.infer_expr(expr)?,
             MirCallee::Builtin(op) => self.builtin_type(op)?,
             // v0.75.16: Method 调用（parser 现产出 MirCallee::Method）— 走

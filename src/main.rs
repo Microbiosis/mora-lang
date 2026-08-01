@@ -774,7 +774,11 @@ fn run_snapshot(file: &str, name: &str, update: bool) {
         if !dir.exists()
             && let Err(e) = fs::create_dir_all(&dir)
         {
-            eprintln!("[warn] snapshot: failed to create dir {}: {}", dir.display(), e);
+            eprintln!(
+                "[warn] snapshot: failed to create dir {}: {}",
+                dir.display(),
+                e
+            );
         }
         if let Err(e) = fs::write(&snap_file, &content) {
             eprintln!("snapshot: failed to write {}: {}", snap_file.display(), e);

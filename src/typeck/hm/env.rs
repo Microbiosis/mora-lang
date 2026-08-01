@@ -89,6 +89,9 @@ fn collect_type_vars(ty: &Type) -> Vec<char> {
             vars.extend(collect_type_vars(err_ty));
             vars
         }
+        // v0.75.17: ForAll 内层仍是自由变量的来源（量化的变量自身是绑定，
+        // 但内层嵌套的自由变量要计入 FV(Γ) 用于外层 let-generalization）。
+        Type::ForAll(_, inner_ty) => collect_type_vars(inner_ty),
         _ => Vec::new(),
     }
 }

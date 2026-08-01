@@ -39,6 +39,11 @@ impl Substitution {
             crate::typeck::Type::Union(members) => {
                 crate::typeck::Type::Union(members.iter().map(|m| self.apply(m)).collect())
             }
+            // v0.75.17: ForAll 内层应用替换（量化变量自身不会被替换 — 它们
+            // 与活跃 TypeVar 命名空间隔离；替换只作用于内层 τ 中的自由变量）。
+            crate::typeck::Type::ForAll(vars, inner) => {
+                crate::typeck::Type::ForAll(vars.clone(), Box::new(self.apply(inner)))
+            }
             _ => ty.clone(),
         }
     }
@@ -177,6 +182,11 @@ fn unify(
         // typeck 当未知调用时把 arg 约束到 callee_ty=Any，此前无 (X, Any) arm 报错。
         (crate::typeck::Type::Any, _) | (_, crate::typeck::Type::Any) => Ok(subst.clone()),
 
+        // v0.75.17: ForAll — 防御性合一（正常路径在 env.get 已实例化，
+        // 泛型值不会以 ForAll 形态进入约束；若进入，与内层合一）。
+        (crate::typeck::Type::ForAll(_, inner), other)
+        | (other, crate::typeck::Type::ForAll(_, inner)) => unify(inner, other, subst),
+
         // Compound types
         (crate::typeck::Type::List(elem1), crate::typeck::Type::List(elem2)) => {
             unify(elem1, elem2, subst)
@@ -241,6 +251,9 @@ fn contains_typevar(ty: &crate::typeck::Type, var: char) -> bool {
             contains_typevar(ok, var) || contains_typevar(err, var)
         }
         crate::typeck::Type::Union(members) => members.iter().any(|m| contains_typevar(m, var)),
+        // v0.75.17: ForAll 内层递归（量化变量与活跃 TypeVar 命名空间隔离，
+        // 递归可查内层嵌套的自由变量）。
+        crate::typeck::Type::ForAll(_, inner) => contains_typevar(inner, var),
         _ => false,
     }
 }

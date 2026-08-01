@@ -18,8 +18,13 @@ pub fn typecheck_mir_exprs(_exprs: &mut [MirExpr]) -> Vec<crate::typeck::TypeErr
     crate::typeck::check_program_mir(_exprs)
 }
 
-/// 将 MirExpr 列表 lowering 为 MirFunction
-pub fn lower_mir_exprs(exprs: &[MirExpr]) -> Result<MirFunction, String> {
+/// v0.75.30: 显式编译选项变体 — 调用方（CLI 编译入口）显式指定优化等级，
+/// 不读环境变量。语义与 `lower_mir_exprs` 完全一致，仅优化等级来源不同。
+/// REPL/import/pregel 等动态路径继续走 `lower_mir_exprs`（env 兜底）。
+pub fn lower_mir_exprs_with_opt(
+    exprs: &[MirExpr],
+    opt_level: crate::mir::ssa::OptLevel,
+) -> Result<MirFunction, String> {
     let mut l = MirExprLowerer::new();
     for expr in exprs {
         let _dst = l.lower_expr(expr)?;
@@ -27,14 +32,19 @@ pub fn lower_mir_exprs(exprs: &[MirExpr]) -> Result<MirFunction, String> {
     let mut func = l.finish();
     // v0.58: Cascades 优化 pass
     crate::mir::optimize::apply_rules(&mut func);
-    // v0.75.7: SSA 优化管线（MORA_OPT=1/2 启用，默认关闭 — 热路径零开销）。
-    // rename 根因修复后（Define/Assign src 参与 rename），等价性测试全绿，
-    // 环境变量从此真正生效。
-    let opt_level = crate::mir::ssa::OptLevel::from_env();
+    // v0.75.7: SSA 优化管线（显式等级 or MORA_OPT=1/2 启用，默认关闭 —
+    // 热路径零开销）。rename 根因修复后（Define/Assign src 参与 rename），
+    // 等价性测试全绿。
     if opt_level.enabled() {
         crate::mir::opt::optimize(&mut func, opt_level);
     }
     Ok(func)
+}
+
+/// 将 MirExpr 列表 lowering 为 MirFunction（env 兜底：CLI 未显式 `--opt`
+/// 时沿用 MORA_OPT — REPL/import/pregel 等无编译命令的动态路径）。
+pub fn lower_mir_exprs(exprs: &[MirExpr]) -> Result<MirFunction, String> {
+    lower_mir_exprs_with_opt(exprs, crate::mir::ssa::OptLevel::from_env())
 }
 
 /// MirExpr → MIR 指令 lowering（v0.55 完整版）

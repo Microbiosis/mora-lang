@@ -184,3 +184,28 @@ fn deconstruct_skips_return_none() {
         "deconstruct 不得发射 Return(None)（顶层隐式返回语义）"
     );
 }
+
+// ─── v0.75.30 回归：SSA 声明透传（--opt 显式化暴露的 bug）──────────────
+
+#[test]
+fn taskdef_survives_ssa_optimization() {
+    // SSA construct 曾丢弃声明型指令（TaskDef 等）→ `--opt` 下 task main
+    // 消失（MORA_OPT=1 默认关掩盖；CLI 显式化后暴露）。结构断言：
+    // 优化后 func.body 必须仍含 TaskDef。
+    let source = "task main()\n  print(1 + 2)\nend\n";
+    let exprs = parse_code_v3(source).expect("parse");
+    let mut func = lower_mir_exprs(&exprs).expect("lower");
+    assert!(
+        func.body
+            .iter()
+            .any(|i| matches!(i, mora::mir::MirInst::TaskDef { .. })),
+        "baseline: 无优化时 TaskDef 存在"
+    );
+    mora::mir::opt::optimize(&mut func, OptLevel::Aggressive);
+    assert!(
+        func.body
+            .iter()
+            .any(|i| matches!(i, mora::mir::MirInst::TaskDef { .. })),
+        "SSA 优化后 TaskDef 必须保留（声明透传）"
+    );
+}

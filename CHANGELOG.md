@@ -2,6 +2,36 @@
 
 All notable changes to Mora will be documented in this file.
 
+## [v0.75.30] — 2026-08-01 — MORA_OPT 提升为显式编译选项 `--opt=N` + SSA 声明透传修复
+
+（v0.75.29 注释的演进项落地：「优化等级应成为编译命令的一等参数」。CLI
+显式化不仅完成提升，还暴露并修复了一个被默认关闭掩盖的真实 SSA bug。）
+
+### Added — CLI 显式编译选项 `--opt=N`（src/main.rs + ssa.rs + lower.rs）
+- `mora --opt=1 file.mora` 显式指定优化等级（0=关/1=Basic/>=2=Aggressive），
+  `--opt` 紧跟可执行名、不进入子命令参数。
+- `OptLevel::from_arg`（与 from_env 共享 0/1/2 语义）；`lower_mir_exprs_with_
+  opt`（显式等级变体）；`run_file/run_record/run_replay/run_snapshot` 四个
+  编译入口穿透。未指定 → env 兜底（REPL/import/pregel 动态路径不变）。
+- --help 更新。
+
+### Fixed — SSA 声明型指令透传（src/mir/ssa.rs，真实 bug）
+- **根因**：SSA construct 跳过声明型指令（TaskDef/ToolDef/Import/StructDef/
+  全部 effect 指令），deconstruct 无从恢复 → 优化后 `func.body = [Label(0)]`，
+  **task main 消失**（print 无输出）。`MORA_OPT=1` 默认关闭掩盖；`--opt`
+  显式化立即暴露。
+- **修复**：`MirSsaFunction` 加 `passthrough: Vec<MirInst>` 字段；construct
+  收集（新 `is_ssa_passthrough` 谓词，与 split_into_ssa 跳过列表单点同源防
+  漂移）；deconstruct 还原到 body 头部。
+- **回归测试**：`mir_ssa_roundtrip.rs` 加 `taskdef_survives_ssa_optimization`
+  （结构断言 TaskDef 优化后存活）——现有 `assert_task_equiv` 有盲区（只
+  断言顶层返回值，main 内副作用未被覆盖），结构断言补上。
+
+### 验证
+- 端到端：`--opt=1` / `--opt=2` / `MORA_OPT=1` 三路径 task main 均输出 3。
+- 全测试 **698 通过 / 0 失败**（+1 回归守卫）。
+- clippy `-D warnings` 0 / fmt 零 diff。
+
 ## [v0.75.29] — 2026-08-01 — MORA_HM 僵尸删除 + MORA_OPT 文档化
 
 （回应「为什么编程语言项目有设置环境变量的东西」——实证全仓 14 个环境

@@ -10,6 +10,8 @@
 //! 4. 应用并重复
 //! 5. 直到无改进或达到 max_iter
 
+use std::collections::HashMap;
+
 use crate::mir::MirInst;
 use crate::mir::optimize::cost::CostModel;
 use crate::mir::optimize::pattern::Match;
@@ -64,29 +66,54 @@ pub fn greedy_search(
     while iterations < max_iter {
         iterations += 1;
         let mut best: Option<(usize, String, u32, Vec<MirInst>)> = None; // (pc, rule, gain, new_insts)
+        // v0.75.27: cost_gain() 接入 — 数据驱动 gain 相同时的 tiebreaker
+        // （此前该 trait 方法定义后从未被消费，出生即死）。
+        let mut best_rule_gain: i32 = 0;
+        // v0.75.27: 等价重写 memo（Cascades Group 记忆内核）— 重写是纯函数
+        // （ctx 为空），同一 (规则, 指令形态) 在 body 内多次出现时只计算一次。
+        // 跨轮有效（本循环重扫全 body），减少重复 rewrite + cost 计算。
+        let mut rewrite_memo: HashMap<(usize, String), Vec<MirInst>> = HashMap::new();
 
         // 扫描所有 (pc, rule) 对
         for (pc, inst) in current.iter().enumerate() {
-            for rule in rules {
+            for (rule_idx, rule) in rules.iter().enumerate() {
                 if rule.pattern().matches(inst).is_some() {
-                    let bindings = rule.pattern().matches(inst).unwrap();
-                    let new_insts = rule.rewrite_with_context(
-                        inst,
-                        &bindings,
-                        pc,
-                        &current,
-                        &(), // empty ctx
-                    );
+                    let memo_key = (rule_idx, format!("{:?}", inst));
+                    let new_insts = match rewrite_memo.get(&memo_key) {
+                        Some(cached) => cached.clone(),
+                        None => {
+                            let bindings = rule.pattern().matches(inst).unwrap();
+                            let computed = rule.rewrite_with_context(
+                                inst,
+                                &bindings,
+                                pc,
+                                &current,
+                                &(), // empty ctx
+                            );
+                            rewrite_memo.insert(memo_key, computed.clone());
+                            computed
+                        }
+                    };
                     let new_cost: u32 = new_insts.iter().map(|i| cost.inst_cost(i)).sum();
                     let inst_cost = cost.inst_cost(inst);
                     let gain = inst_cost.saturating_sub(new_cost);
                     if gain > 0 {
-                        if let Some((_, _, best_gain, _)) = &best {
-                            if gain > *best_gain {
-                                best = Some((pc, rule.name().to_string(), gain, new_insts));
+                        let candidate = (pc, rule.name().to_string(), gain, new_insts);
+                        match &best {
+                            Some((_, _, best_gain, _)) => {
+                                // 数据驱动 gain 更高，或 gain 相同时规则作者
+                                // 的静态估计更大（cost_gain tiebreaker）
+                                if gain > *best_gain
+                                    || (gain == *best_gain && rule.cost_gain() > best_rule_gain)
+                                {
+                                    best = Some(candidate);
+                                    best_rule_gain = rule.cost_gain();
+                                }
                             }
-                        } else {
-                            best = Some((pc, rule.name().to_string(), gain, new_insts));
+                            None => {
+                                best = Some(candidate);
+                                best_rule_gain = rule.cost_gain();
+                            }
                         }
                     }
                 }
@@ -181,5 +208,38 @@ mod tests {
         let cost = InstructionCount;
         let result = greedy_search(&body, &rules, &cost, 5);
         assert!(!result.applied_rules.is_empty());
+    }
+
+    #[test]
+    fn test_rewrite_memo_reuses_equivalent_shapes() {
+        // v0.75.27: 等价重写 memo — 同一 (规则, 指令形态) 在 body 内多次
+        // 出现时只重写一次、复用结果。行为等价性：memo 不改变最终优化结果，
+        // 只消除重复 rewrite/cost 计算。
+        // RedundantJumpRule 仅在 target == pc + 1（跳转到下一条）时删除 —
+        // body 构造按此语义（Jump(1)@0 冗余、Jump(3)@2 冗余）。
+        let body = vec![
+            MirInst::Jump(1),
+            MirInst::Const(0, Value::Int(1)),
+            MirInst::Jump(3),
+            MirInst::Const(1, Value::Int(2)),
+        ];
+        let rules = builtin_rules();
+        let cost = InstructionCount;
+        let multi = greedy_search(&body, &rules, &cost, 10);
+        // greedy 每轮应用 best 一个：首轮删一个冗余 Jump（gain=1），
+        // 左移后另一 Jump 的 target 不再等于 pc+1 → 保留。
+        // 期望：3 条指令（Const, Jump, Const）。
+        assert_eq!(
+            multi.final_cost, 3,
+            "one redundant jump eliminated per pass"
+        );
+        // 行为等价对照：无重复形态的等价 body 收敛到同一 cost。
+        let control = greedy_search(
+            &[MirInst::Jump(1), MirInst::Const(0, Value::Int(1))],
+            &rules,
+            &cost,
+            10,
+        );
+        assert_eq!(control.final_cost, 1, "single-jump body: 1 Const remains");
     }
 }

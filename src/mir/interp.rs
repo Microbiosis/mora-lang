@@ -302,12 +302,29 @@ pub enum MirSignal {
 /// v0.75.9: 接收 `&Arc<MirFunction>`，优化后 DAG 走全局缓存
 /// （`cache::global_dag_cache().get_or_build`），同一 Arc 跨调用复用，
 /// 不再每次 `dag_analyze + dag_optimize + prune_sequence_edges` 全量重建。
+/// v0.75.9: 接收 `&Arc<MirFunction>`，优化后 DAG 走全局缓存
+/// （`cache::global_dag_cache().get_or_build`），同一 Arc 跨调用复用，
+/// 不再每次 `dag_analyze + dag_optimize + prune_sequence_edges` 全量重建。
+///
+/// v0.75.27: 委托给 `run_mir_with_signal_cached`（全局缓存为默认注入）。
 pub fn run_mir_with_signal(
     func: &Arc<MirFunction>,
     interp: &mut dyn MirHost,
     env: &mut Environment,
 ) -> Result<(MirSignal, Value), String> {
-    let dag = cache::global_dag_cache().get_or_build(func);
+    run_mir_with_signal_cached(func, interp, env, cache::global_dag_cache())
+}
+
+/// v0.75.27: 可注入缓存变体 — 测试/多租户可传独立 `DagCache` 实例隔离
+/// 缓存状态（全局 OnceLock 解耦的注入点）。行为与 `run_mir_with_signal`
+/// 完全一致，仅缓存来源不同。
+pub fn run_mir_with_signal_cached(
+    func: &Arc<MirFunction>,
+    interp: &mut dyn MirHost,
+    env: &mut Environment,
+    dag_cache: &cache::DagCache,
+) -> Result<(MirSignal, Value), String> {
+    let dag = dag_cache.get_or_build(func);
     crate::mir::dag_interp::run_dag_with_signal(&dag, func, interp, env)
 }
 

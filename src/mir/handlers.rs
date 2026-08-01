@@ -951,6 +951,144 @@ impl MirInst {
         }
     }
 
+    /// 输入寄存器重映射 — CSE 合并不同 dst 的节点后，把消费者的输入
+    /// 寄存器引用从旧 dst 改写为新 dst（dag_interp 按 input_regs 取数，
+    /// 不按 Data 边）。只映射输入位置，dst 不参与。嵌套函数体
+    /// （Closure/TaskDef/... 的 Box<MirFunction>）寄存器空间独立，不改写。
+    pub fn map_regs(&self, f: &mut impl FnMut(Reg) -> Reg) -> MirInst {
+        let mut m = |r: Reg| f(r);
+        match self {
+            MirInst::Const(r, v) => MirInst::Const(*r, v.clone()),
+            MirInst::Var(r, name) => MirInst::Var(*r, name.clone()),
+            MirInst::BinaryOp(r, l, op, rr) => {
+                MirInst::BinaryOp(*r, m(*l), op.clone(), m(*rr))
+            }
+            MirInst::Call(r, name, args) => {
+                MirInst::Call(*r, name.clone(), args.iter().map(|a| m(*a)).collect())
+            }
+            MirInst::ListLit(r, items) => {
+                MirInst::ListLit(*r, items.iter().map(|i| m(*i)).collect())
+            }
+            MirInst::DictLit(r, entries) => MirInst::DictLit(
+                *r,
+                entries.iter().map(|(k, v)| (k.clone(), m(*v))).collect(),
+            ),
+            MirInst::Index(r, obj, idx) => MirInst::Index(*r, m(*obj), m(*idx)),
+            MirInst::IndexAssign(obj, idx, val) => {
+                MirInst::IndexAssign(m(*obj), m(*idx), m(*val))
+            }
+            MirInst::MethodCall(r, recv, name, args) => MirInst::MethodCall(
+                *r,
+                m(*recv),
+                name.clone(),
+                args.iter().map(|a| m(*a)).collect(),
+            ),
+            MirInst::Pipe(r, lhs, rhs) => MirInst::Pipe(*r, m(*lhs), m(*rhs)),
+            MirInst::Prompt(r, parts) => {
+                MirInst::Prompt(*r, parts.iter().map(|p| m(*p)).collect())
+            }
+            MirInst::MatchExpr { val, arms } => MirInst::MatchExpr {
+                val: m(*val),
+                arms: arms
+                    .iter()
+                    .map(|(p, g, body, out)| (p.clone(), g.map(&mut m), body.clone(), *out))
+                    .collect(),
+            },
+            MirInst::Define(name, r) => MirInst::Define(name.clone(), m(*r)),
+            MirInst::Assign(name, r) => MirInst::Assign(name.clone(), m(*r)),
+            MirInst::Expr(r) => MirInst::Expr(m(*r)),
+            MirInst::MatchArm { cond_reg, body } => MirInst::MatchArm {
+                cond_reg: cond_reg.map(m),
+                body: body.clone(),
+            },
+            MirInst::TaskDef { .. } => self.clone(),
+            MirInst::Closure { .. } => self.clone(),
+            MirInst::DynTrait { dst, src, trait_generics, trait_name } => MirInst::DynTrait {
+                dst: *dst,
+                src: m(*src),
+                trait_generics: trait_generics.clone(),
+                trait_name: trait_name.clone(),
+            },
+            MirInst::ToolDef { .. } => self.clone(),
+            MirInst::Import(_) => self.clone(),
+            MirInst::WithConfig { bindings, body, jit } => MirInst::WithConfig {
+                bindings: bindings
+                    .iter()
+                    .map(|(k, v)| (k.clone(), m(*v)))
+                    .collect(),
+                body: body.clone(),
+                jit: *jit,
+            },
+            MirInst::TypeAlias { .. } => self.clone(),
+            MirInst::EnumDef { .. } => self.clone(),
+            MirInst::StructDef { .. } => self.clone(),
+            MirInst::MacroDef { .. } => self.clone(),
+            MirInst::Transaction { .. } => self.clone(),
+            MirInst::Send { value, target } => MirInst::Send {
+                value: m(*value),
+                target: target.clone(),
+            },
+            MirInst::Rollback => MirInst::Rollback,
+            MirInst::Worker { .. } => self.clone(),
+            MirInst::Commit => MirInst::Commit,
+            MirInst::Route(_) => self.clone(),
+            MirInst::Observe { .. } => self.clone(),
+            MirInst::Span { .. } => self.clone(),
+            MirInst::RecordTokens { .. } => self.clone(),
+            MirInst::Save { path, value } => MirInst::Save {
+                path: m(*path),
+                value: m(*value),
+            },
+            MirInst::Load { path, var } => MirInst::Load {
+                path: m(*path),
+                var: var.clone(),
+            },
+            MirInst::ReadFile { path, var } => MirInst::ReadFile {
+                path: m(*path),
+                var: var.clone(),
+            },
+            MirInst::WriteFile { path, content } => MirInst::WriteFile {
+                path: m(*path),
+                content: m(*content),
+            },
+            MirInst::AppendFile { path, content } => MirInst::AppendFile {
+                path: m(*path),
+                content: m(*content),
+            },
+            MirInst::ReadBytesFile { path, var } => MirInst::ReadBytesFile {
+                path: m(*path),
+                var: var.clone(),
+            },
+            MirInst::WriteBytesFile { path, content } => MirInst::WriteBytesFile {
+                path: m(*path),
+                content: m(*content),
+            },
+            MirInst::TraitDef { .. } => self.clone(),
+            MirInst::ImplDef { .. } => self.clone(),
+            MirInst::Orchestrate { .. } => self.clone(),
+            MirInst::Eval { name, given_reg, expects, tolerance, replay_path } => {
+                MirInst::Eval {
+                    name: name.clone(),
+                    given_reg: m(*given_reg),
+                    expects: expects.iter().map(|e| m(*e)).collect(),
+                    tolerance: *tolerance,
+                    replay_path: replay_path.clone(),
+                }
+            }
+            MirInst::SkillDef { .. } => self.clone(),
+            MirInst::PromptSection { .. } => self.clone(),
+            MirInst::DocumentSection { .. } => self.clone(),
+            MirInst::Label(l) => MirInst::Label(*l),
+            MirInst::Jump(l) => MirInst::Jump(*l),
+            MirInst::JumpIf(cond, l) => MirInst::JumpIf(m(*cond), *l),
+            MirInst::JumpIfNot(cond, l) => MirInst::JumpIfNot(m(*cond), *l),
+            MirInst::Return(r) => MirInst::Return(r.map(m)),
+            MirInst::Halt(r) => MirInst::Halt(r.map(m)),
+            MirInst::Break(l) => MirInst::Break(*l),
+            MirInst::Continue(l) => MirInst::Continue(*l),
+        }
+    }
+
     pub fn is_effect(&self) -> bool {
         match self {
             MirInst::Define(_, _)

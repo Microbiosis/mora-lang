@@ -191,7 +191,7 @@ pub fn dag_analyze(func: &MirFunction) -> MirDag {
     // Step 1: Create nodes for every instruction
     for blk in &blocks {
         let mut block_first_node: Option<NodeId> = None;
-        let mut prev_effect_node: Option<NodeId> = None;
+        let mut prev_node: Option<NodeId> = None;
 
         for (pc, inst) in body.iter().enumerate().take(blk.end).skip(blk.start) {
             // Create the node (Branch cond is set to 0 temporarily, patched below)
@@ -241,16 +241,20 @@ pub fn dag_analyze(func: &MirFunction) -> MirDag {
                 block_first_node = Some(idx);
             }
 
-            // Connect sequential side-effect chain
-            if inst.is_effect() {
-                if let Some(prev) = prev_effect_node {
-                    edges.push(MirDagEdge {
-                        from: prev,
-                        to: idx,
-                        kind: EdgeKind::Sequence,
-                    });
-                }
-                prev_effect_node = Some(idx);
+            // v0.75.33: 基本块内全序 — 每个节点（含 Compute）与前一个节点
+            // 连 Sequence，不只 Effect 对。Compute（Var/Const/Index）读 env
+            // 或依赖前序语句的值，若只给 Effect 保序，Compute 会提前执行
+            // 读脏值（`let total = 0` 后 `Var(total)` 抢跑读 Nil）。
+            // 块间（控制转移处）不连 — 由 Branch/Jump handler 决定激活。
+            if let Some(prev) = prev_node {
+                edges.push(MirDagEdge {
+                    from: prev,
+                    to: idx,
+                    kind: EdgeKind::Sequence,
+                });
+            }
+            if !matches!(inst, MirInst::Label(_)) {
+                prev_node = Some(idx);
             }
         }
 
@@ -261,11 +265,19 @@ pub fn dag_analyze(func: &MirFunction) -> MirDag {
 
     // Step 2: Resolve control flow edges
     // Patch Jump targets
+    // v0.75.33: 跳转目标解析 = Label 优先，裸 pc 兜底 — lower 的 for/while
+    // 循环用 pc 数字做 Jump 目标（不插 Label）；此前只查 label_to_node 导致
+    // 循环跳转全部 patch 失败（Jump{target:None} → 循环控制流断裂）。
+    // 目标可能是 Label（SSA/手写）或 pc（循环 lowering）。
     for (pc, node_id) in &pc_to_node {
         let inst = &body[*pc];
         match inst {
             MirInst::Jump(target) => {
-                if let Some(&target_id) = label_to_node.get(target) {
+                let target_id = label_to_node
+                    .get(target)
+                    .or_else(|| pc_to_node.get(target))
+                    .copied();
+                if let Some(target_id) = target_id {
                     edges.push(MirDagEdge {
                         from: *node_id,
                         to: target_id,
@@ -278,7 +290,11 @@ pub fn dag_analyze(func: &MirFunction) -> MirDag {
                 }
             }
             MirInst::JumpIf(_cond, target) => {
-                if let Some(&target_id) = label_to_node.get(target) {
+                let target_id = label_to_node
+                    .get(target)
+                    .or_else(|| pc_to_node.get(target))
+                    .copied();
+                if let Some(target_id) = target_id {
                     edges.push(MirDagEdge {
                         from: *node_id,
                         to: target_id,
@@ -310,7 +326,11 @@ pub fn dag_analyze(func: &MirFunction) -> MirDag {
                 }
             }
             MirInst::JumpIfNot(_cond, target) => {
-                if let Some(&target_id) = label_to_node.get(target) {
+                let target_id = label_to_node
+                    .get(target)
+                    .or_else(|| pc_to_node.get(target))
+                    .copied();
+                if let Some(target_id) = target_id {
                     edges.push(MirDagEdge {
                         from: *node_id,
                         to: target_id,
@@ -577,24 +597,17 @@ impl std::fmt::Display for MirDag {
 }
 
 impl MirDag {
-    /// Remove redundant Sequence edges between pure Compute nodes.
+    /// 保留基本块内全序的 Sequence 边（no-op，v0.75.33 起 dag_analyze
+    /// 已建完整块内链）。
     ///
-    /// Data edges already encode register-level dependencies, so
-    /// Sequence edges between two Compute nodes add no information
-    /// and only force unnecessary serialization.
-    ///
-    /// After pruning, independent instructions naturally fall into
-    /// the same topological level, exposing instruction-level
-    /// parallelism (the "electronic spreadsheet" model).
+    /// v0.75.33 起不再裁剪：旧实现只保留 Effect-Source 的 Sequence 边，
+    /// 删掉 Compute 之间的保序边以「暴露指令级并行」——但 dag_interp 顺序
+    /// 执行 ready 列表（ILP 从未实现），裁剪只破坏 Compute 的保序
+    /// （`Var(total)` 提前于 `Define(total)` 执行读脏值、循环 exit 后
+    /// 代码不可达），零收益。控制转移处的顺序由 Branch/Jump handler
+    /// 决定（dag_interp 跳过 Branch/Jump 出边），不受此影响。
     pub fn prune_sequence_edges(&mut self) {
-        self.edges.retain(|e| {
-            if e.kind != EdgeKind::Sequence {
-                return true;
-            }
-            // Keep Sequence edges originating from Effect nodes
-            // (side effects must be ordered).
-            matches!(self.nodes[e.from], MirDagNode::Effect { .. })
-        });
+        // Sequence 边全保留 — 基本块内全序是正确性要求，不是可裁剪优化。
         // Recompute entry
         let n = self.nodes.len();
         let mut has_incoming: HashSet<NodeId> = HashSet::new();
@@ -624,6 +637,18 @@ impl MirDag {
             let from_is_label = matches!(self.nodes[i], MirDagNode::Label { .. });
             let to_is_label = matches!(self.nodes[j], MirDagNode::Label { .. });
             if from_is_label || to_is_label {
+                continue;
+            }
+            // v0.75.33: 不在控制转移节点（Branch/Jump）之后继续线性链。
+            // 全局 i→i+1 链会穿过分支/回边（如 18→19 body、26→27 exit），
+            // wave 调度器会因此：① 每轮把 body 链重复激活（双执行）；
+            // ② 循环未退出就把 exit（27）随 26→27 Sequence 推入 → 读脏值。
+            // 控制转移由 Branch/Jump handler 决定（dag_interp 只推选中的
+            // target），线性链只覆盖基本块内部的直线代码。
+            if matches!(
+                self.nodes[i],
+                MirDagNode::Branch { .. } | MirDagNode::Jump { .. }
+            ) {
                 continue;
             }
             self.edges.push(MirDagEdge {
@@ -750,7 +775,9 @@ mod tests {
 
     #[test]
     fn topological_sort_linear_dag() {
-        // No dependencies between consts — should all be in one level
+        // v0.75.33: 块内全序 — 三个 const 无数据依赖，但 dag_analyze 建
+        // 块内全序 Sequence 边（Compute 读 env/前序语句值，提前执行读脏值；
+        // ILP 从未在 dag_interp 实现 — 顺序执行 ready 列表）。断言顺序保持。
         let func = make_func(vec![
             MirInst::Const(0, Value::Int(1)),
             MirInst::Const(1, Value::Int(2)),
@@ -758,9 +785,9 @@ mod tests {
         ]);
         let dag = dag_analyze(&func);
         let levels = topological_sort(&dag).expect("should have valid topo sort");
-        // All three nodes are independent — one level
-        assert_eq!(levels.len(), 1, "independent consts should be in one level");
-        assert_eq!(levels[0].len(), 3);
+        // 全序链：每节点一层，共 3 层
+        assert_eq!(levels.len(), 3, "block-internal full order → 3 levels");
+        assert_eq!(levels[0].len(), 1);
     }
 
     #[test]
@@ -784,8 +811,11 @@ mod tests {
     }
 
     #[test]
-    fn prune_exposes_parallelism() {
-        // r0=10, r1=32, r2=r0+r1 — Consts independent, should be in same level
+    fn prune_preserves_block_order() {
+        // v0.75.33: prune 保留块内全序（旧实现裁剪 Compute 之间 Sequence，
+        // 导致 Var/Compute 提前执行读脏值；ILP 从未在 dag_interp 实现 —
+        // 顺序执行 ready 列表，裁剪零收益）。
+        // r0=10, r1=32, r2=r0+r1 — 全序链 3 层，prune 后仍 3 层。
         let func = make_func(vec![
             MirInst::Const(0, Value::Int(10)),
             MirInst::Const(1, Value::Int(32)),
@@ -793,26 +823,24 @@ mod tests {
         ]);
         let dag = dag_analyze(&func);
         let levels_before = topological_sort(&dag).unwrap();
-        // With sequential edges: every node in its own level
-        let mut dag_seq = dag_analyze(&func);
-        dag_seq.add_sequential_edges();
-        let levels_linear = topological_sort(&dag_seq).unwrap();
-        assert!(
-            levels_linear.len() > levels_before.len(),
-            "sequential edges increase level count: before={} after={}",
-            levels_before.len(),
-            levels_linear.len()
-        );
+        assert_eq!(levels_before.len(), 3, "block-internal full order → 3 levels");
 
-        // After pruning: two Consts should be in same level
+        // prune_sequence_edges 保留所有 Sequence 边（no-op 保留正确性）。
         let mut dag_pruned = dag_analyze(&func);
         dag_pruned.prune_sequence_edges();
         let levels_pruned = topological_sort(&dag_pruned).unwrap();
-        assert!(
-            levels_pruned.len() <= 2,
-            "pruned DAG should have <=2 levels (Consts parallel), got {}",
+        assert_eq!(
+            levels_pruned.len(), 3,
+            "prune 保留全序链 → 仍 3 levels, got {}",
             levels_pruned.len()
         );
+        // 全序链被保持 — 无「并行化」裁剪。
+        let seq_count = dag_pruned
+            .edges
+            .iter()
+            .filter(|e| e.kind == EdgeKind::Sequence)
+            .count();
+        assert_eq!(seq_count, 2, "3 节点全序链应有 2 条 Sequence 边");
     }
 
     #[test]

@@ -12,86 +12,27 @@ pub enum TokenType {
     For,
     In,
     Import,
-    Export,
-    Parallel,
     Match,
-    WithKeyword,
-    Save,
-    Load,
     Fn,
-    Into,
     As,
     Do,
-    Read,
-    Write,
-    Append,
-    ReadBytes,
-    WriteBytes,
-    Stream,
-    Tool,
     Break,
     Continue,
     // v0.06.7: 移除 v0.04 云服务原生关键字 Serve/Http/Mcp/Repl/Stdio/On
     // 云服务走显式 API: Router::new() / McpServer::new()
-    Route,
-    Observe,
-    Span,
-    Tags,
-    Record,
-    Trace,
-    Metrics,
-    Otel,
-    // v0.19: Worker 并发关键字
-    Worker,
-    Send,    // ->
-    Receive, // <-
-    // v0.19: 事务关键字
-    Transaction,
-    Commit,
-    Rollback,
-    Compensation,
+    // v0.75.19: 语法面收敛 — 移除无前端可达的死关键字（lexer 有 token、
+    // ParserV3 不解析、MirInst 由手工构造驱动；运行时原语集不变）。
     // v0.20: 宏关键字
     Macro,
     // v0.25: Multi-Agent 协调关键字
     Orchestrate,
-    Edges,
     Loop,
     MaxRounds,
-    ExitWhen,
-    Rounds,
-    // v0.25: Eval + Skill 关键字
-    Eval,
-    Skill,
-    Expect,
-    Tolerance,
     // v0.26: prompt section 块 — 用于声明一段 system prompt 分段
     // 注意：与 p"..." 模板字符串(prompt_string)互不干扰,后者必须在 'p"' 双字符触发
     Prompt,
     // v0.27: Document 块（与 prompt 块语义类似）
     Document,
-    // v0.50: 状态与执行模型关键字
-    State,      // 'state' (orchestrate 内)
-    Node,       // 'node' (orchestrate 内)
-    Channel,    // 'channel' (orchestrate 内)
-    Checkpoint, // 'checkpoint' (orchestrate decorator)
-    Rewind,     // 'rewind' (builtin)
-    Resume,     // 'resume' (builtin)
-    Thread,     // 'thread' (checkpoint thread_id)
-    Dynamic,    // 'dynamic' (edge 修饰)
-    Map,        // 'map' (dynamic 类型)
-    Reduce,     // 'reduce' (dynamic 类型)
-    FanIn,      // 'fan_in' (JoinNode)
-    FanOut,     // 'fan_out' (parallel worker)
-    Interrupt,  // 'interrupt' (HITL 暂停点)
-    Before,     // 'before' (interrupt 位置)
-    After,      // 'after' (interrupt 位置)
-    Command,    // 'command' (返回类型)
-    Goto,       // 'goto' (command 字段)
-    Update,     // 'update' (command 字段)
-    Add,        // '@add' 语义
-    Last,       // '@last' 语义 (默认)
-    Merge,      // '@merge' 语义
-    Jit,        // 'jit' (with jit { ... })
     // 注意: HTTP 方法 (GET/POST/PUT/DELETE/PATCH) 不作关键字
     // —— 保持 Identifier,显式 API Router.route() 按字符串匹配
     Identifier(String),
@@ -126,13 +67,9 @@ pub enum TokenType {
     Question,
     // v0.07.1: :: 操作符（Namespace qualification like Router::new）
     ColonColon,
-    // v0.08: trait / impl / dyn / Self
-    Trait,
-    Impl,
+    // v0.08: dyn / Self
     Dyn,
     Self_,
-    // v0.09: where 子句关键字（trait/impl 末尾的约束）
-    Where,
     // v0.23: 类型系统增强
     Type,   // type 关键字
     Enum,   // enum 关键字
@@ -863,50 +800,20 @@ impl Lexer {
             "try" => TokenType::Identifier("try".to_string()),
             "catch" => TokenType::Identifier("catch".to_string()),
             "import" => TokenType::Import,
-            "export" => TokenType::Export,
-            "parallel" => TokenType::Parallel,
             "match" => TokenType::Match,
-            "with" => TokenType::WithKeyword,
-            "save" => TokenType::Save,
-            "load" => TokenType::Load,
             "fn" => TokenType::Fn,
-            "into" => TokenType::Into,
-            "read" => TokenType::Read,
-            "write" => TokenType::Write,
-            "append" => TokenType::Append,
-            "read_bytes" => TokenType::ReadBytes,
-            "write_bytes" => TokenType::WriteBytes,
             "as" => TokenType::As,
             "do" => TokenType::Do,
             "on" => TokenType::Identifier("on".to_string()),
-            "stream" => TokenType::Stream,
-            "tool" => TokenType::Tool,
             "break" => TokenType::Break,
             "continue" => TokenType::Continue,
             // v0.06.7: serve/as/mcp/repl/stdio/http/on 不再是关键字——移除
-            "route" => TokenType::Route,
-            "observe" => TokenType::Observe,
-            "span" => TokenType::Span,
-            "tags" => TokenType::Tags,
-            "record" => TokenType::Record,
             "repl" => TokenType::Identifier("repl".to_string()),
             "stdio" => TokenType::Identifier("stdio".to_string()),
             "mcp" => TokenType::Identifier("mcp".to_string()),
             "http" => TokenType::Identifier("http".to_string()),
-            "trace" => TokenType::Trace,
-            "metrics" => TokenType::Metrics,
-            "otel" => TokenType::Otel,
-            // v0.19: Worker 并发
-            "worker" => TokenType::Worker,
-            "transaction" => TokenType::Transaction,
-            "commit" => TokenType::Commit,
-            "rollback" => TokenType::Rollback,
-            "compensation" => TokenType::Compensation,
             "macro" => TokenType::Macro,
-            // v0.08: trait 系统
-            "trait" => TokenType::Trait,
-            "impl" => TokenType::Impl,
-            "where" => TokenType::Where,
+            // v0.08: dyn / Self
             "dyn" => TokenType::Dyn,
             "Self" => TokenType::Self_,
             // v0.23: 类型系统增强
@@ -915,43 +822,10 @@ impl Lexer {
             "struct" => TokenType::Struct,
             // v0.25: Multi-Agent 协调
             "orchestrate" => TokenType::Orchestrate,
-            "edges" => TokenType::Edges,
             "loop" => TokenType::Loop,
             "max_rounds" => TokenType::MaxRounds,
-            "exit_when" => TokenType::ExitWhen,
-            "rounds" => TokenType::Rounds,
-            // v0.25: Eval + Skill (description/version/requires/verify/given/replay 是上下文关键字)
-            "eval" => TokenType::Eval,
-            "skill" => TokenType::Skill,
-            "expect" => TokenType::Expect,
-            "tolerance" => TokenType::Tolerance,
             // v0.26: prompt 块语句（与 p"..." 模板字符串互不干扰）
             "prompt" => TokenType::Prompt,
-            // v0.50: 状态与执行模型关键字
-            "state" => TokenType::State,
-            "node" => TokenType::Node,
-            "channel" => TokenType::Channel,
-            "checkpoint" => TokenType::Checkpoint,
-            "rewind" => TokenType::Rewind,
-            "resume" => TokenType::Resume,
-            "thread" => TokenType::Thread,
-            "dynamic" => TokenType::Dynamic,
-            "map" => TokenType::Map,
-            "reduce" => TokenType::Reduce,
-            "fan_in" => TokenType::FanIn,
-            "fan_out" => TokenType::FanOut,
-            "interrupt" => TokenType::Interrupt,
-            "before" => TokenType::Before,
-            "after" => TokenType::After,
-            "command" => TokenType::Command,
-            "send" => TokenType::Send,
-            "goto" => TokenType::Goto,
-            "update" => TokenType::Update,
-            "add" => TokenType::Add,
-            "last" => TokenType::Last,
-            "merge" => TokenType::Merge,
-            // v0.53: JIT 编译触发
-            "jit" => TokenType::Jit,
             // v0.27: document 块语句（与 prompt "x" do end 同款）
             // 但允许 `document.parse(...)` 形式:仅当下一个 token 是字符串字面量
             // (块语句起始)时识别为 Document 关键字,否则退化为 Identifier,

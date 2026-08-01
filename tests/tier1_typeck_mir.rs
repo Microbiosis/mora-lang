@@ -247,3 +247,17 @@ fn import_missing_file_reports_error() {
     let errs = check_program_mir(&exprs);
     assert!(!errs.is_empty(), "缺失 import 文件应报 import error");
 }
+
+#[test]
+fn freed_reserved_words_usable_as_identifiers() {
+    // v0.75.19: 语法面收敛 — 无前端可达的死关键字从 lexer 关键字表移除，
+    // 这些词（stream/route/observe/span/worker/transaction/...）回归普通标识符。
+    // 此前它们经 token_to_identifier_name fallback 在声明位静默冒充标识符、
+    // 表达式位报错（行为不一致）；现在全位置一致可用。
+    let src = "let stream = \"s\"\nlet route = \"r\"\nlet observe = stream\nlet span = route\nlet worker = observe\nlet transaction = span\nprint(stream + route + observe + span + worker + transaction)";
+    let exprs = parse_code_v3(src).expect("parse");
+    assert!(
+        check_program_mir(&exprs).is_empty(),
+        "移除的保留词应作为普通标识符工作"
+    );
+}

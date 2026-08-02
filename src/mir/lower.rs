@@ -322,7 +322,7 @@ impl MirExprLowerer {
                 let match_arms: Vec<(String, Option<Reg>, Box<MirFunction>, Reg)> = arms
                     .iter()
                     .map(|arm| {
-                        let pat_str = mir_pattern_to_string(&arm.pattern);
+                        let pat_str = pattern_to_string(&arm.pattern);
                         let mut body_lowerer = MirExprLowerer::new();
                         let arm_val_reg = body_lowerer.lower_expr(&arm.body)?;
                         body_lowerer.emit(MirInst::Return(Some(arm_val_reg)));
@@ -670,8 +670,9 @@ impl MirExprLowerer {
     }
 }
 
-/// Convert MirExpr Pattern to string representation for MatchExpr
-fn mir_pattern_to_string(pattern: &crate::mir::expr::Pattern) -> String {
+/// Convert MirExpr Pattern to string representation for MatchExpr.
+/// v0.75.40: pub — ParserV3 单遍编译（emit_match_arm）复用同一序列化。
+pub fn pattern_to_string(pattern: &crate::mir::expr::Pattern) -> String {
     use crate::mir::expr::Pattern;
     match pattern {
         Pattern::Wildcard => "_".to_string(),
@@ -685,26 +686,26 @@ fn mir_pattern_to_string(pattern: &crate::mir::expr::Pattern) -> String {
             crate::common::Literal::Nil(_) => "nil".to_string(),
         },
         Pattern::Tuple(items) => {
-            let parts: Vec<String> = items.iter().map(mir_pattern_to_string).collect();
+            let parts: Vec<String> = items.iter().map(pattern_to_string).collect();
             format!("tuple:({})", parts.join(","))
         }
         Pattern::List { head, tail } => {
             format!(
                 "list:[{}|{}]",
-                mir_pattern_to_string(head),
-                mir_pattern_to_string(tail)
+                pattern_to_string(head),
+                pattern_to_string(tail)
             )
         }
         Pattern::Dict { required, rest } => {
             let fields: Vec<String> = required
                 .iter()
-                .map(|(k, v)| format!("{}:{}", k, mir_pattern_to_string(v)))
+                .map(|(k, v)| format!("{}:{}", k, pattern_to_string(v)))
                 .collect();
             let rest_str = if *rest { ",.." } else { "" };
             format!("dict:{{{}}}", fields.join(",") + rest_str)
         }
         Pattern::TypeAscription { name, pattern } => {
-            format!("{}:{}", name, mir_pattern_to_string(pattern))
+            format!("{}:{}", name, pattern_to_string(pattern))
         }
     }
 }

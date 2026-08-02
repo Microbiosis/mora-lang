@@ -2,6 +2,16 @@
 
 All notable changes to Mora will be documented in this file.
 
+## [v0.75.41] — 2026-08-02 — LSP 诊断切 compile（阶段 3 Step 4 收尾）
+
+（LSP `check_diagnostics` 从 parse→typecheck_mir_exprs 双阶段切到
+`ParserV3::compile` + `check_program_witnesses` — 执行路径最后一个
+MirExpr 桥接消费点消失；MirExpr 仅剩「数据构造类型」角色。）
+
+### Changed — src/lsp/server.rs
+- `check_diagnostics`：compile 直接产出 witness，typeck 直接消费；
+  删 `parse_code_v3` + `typecheck_mir_exprs` 依赖。
+
 ## [v0.75.40] — 2026-08-02 — 执行入口切 compile + typeck witness 单实现（阶段 3 Step 4a）
 
 （单遍编译落地：全部执行入口从 parse→lower 双阶段切到

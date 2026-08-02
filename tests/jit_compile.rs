@@ -25,10 +25,6 @@ fn fbinop(dst: usize, a: usize, op: mora::common::BinaryOp, b: usize) -> MirInst
     MirInst::BinaryOp(dst, a, op, b)
 }
 
-fn lit(i: i64) -> MirInst {
-    MirInst::Const(0, Value::Int(i))
-}
-
 /// 构造单 BinaryOp 函数体：[r0=a, r1=b, r2=op]。
 fn binop_func(a: f64, op: mora::common::BinaryOp, b: f64) -> MirFunction {
     MirFunction {
@@ -134,19 +130,7 @@ fn jit_equiv_folded_constants() {
 /// 不可编译子集 → run_jit 必须 Err（回落解释器）。
 #[test]
 fn jit_rejects_uncompilable() {
-    // Int×Int 算术（i64 语义超出 v1）
-    let func = MirFunction {
-        params: Vec::new(),
-        body: vec![
-            lit(0),
-            MirInst::Const(1, Value::Int(2)),
-            fbinop(2, 0, mora::common::BinaryOp::Add, 1),
-        ],
-        n_regs: 3,
-    };
-    assert!(run_jit_of(&func).is_err(), "Int×Int 应拒绝");
-
-    // Mod（无 SSE2 fmod）
+    // Float Mod（无 fmod 模板）→ 编译期拒绝
     let func_mod = MirFunction {
         params: Vec::new(),
         body: vec![
@@ -156,12 +140,119 @@ fn jit_rejects_uncompilable() {
         ],
         n_regs: 3,
     };
-    assert!(run_jit_of(&func_mod).is_err(), "Mod 应拒绝");
+    assert!(run_jit_of(&func_mod).is_err(), "Float Mod 应拒绝");
+
+    // Mixed 类型（Int + Float）
+    let func_mixed = MirFunction {
+        params: Vec::new(),
+        body: vec![
+            MirInst::Const(0, Value::Int(1)),
+            MirInst::Const(1, Value::Float(2.0)),
+            fbinop(2, 0, mora::common::BinaryOp::Add, 1),
+        ],
+        n_regs: 3,
+    };
+    assert!(run_jit_of(&func_mixed).is_err(), "Mixed 应拒绝");
 
     // 变量/定义/调用
     for src in ["let x = 1", "print(1)", "1.5 + 2.5\nprint(3)"] {
         let exprs = parse_code_v3(src).expect("parse should succeed");
         let func = lower_mir_exprs(&exprs).expect("lower should succeed");
         assert!(run_jit_of(&func).is_err(), "JIT 应拒绝不可编译程序: {src}");
+    }
+}
+
+/// 手工构造的 Int 算术（复刻解释器分裂语义：Add=i64 直接、Sub/Mul/Div=
+/// f64 round-trip）：JIT == 解释器。
+#[test]
+fn jit_equiv_manual_int_arith() {
+    for (a, op, b) in [
+        (4i64, mora::common::BinaryOp::Add, 5i64),
+        (10, mora::common::BinaryOp::Sub, 3),
+        (4, mora::common::BinaryOp::Mul, 5),
+        (20, mora::common::BinaryOp::Div, 4),
+        (7, mora::common::BinaryOp::Div, 2), // round-trip：3.5 → round → 4
+        (1, mora::common::BinaryOp::Div, 0), // 除零：inf → 饱和 i64::MAX
+        (-1, mora::common::BinaryOp::Div, 0), // -inf → 饱和 i64::MIN
+                                             // 注：`i64::MAX + 1` 不进等价测试 —— 解释器 Add(Int) 用直接 i64
+                                             // 加法，debug 构建溢出 panic（既有行为）；JIT 用 x86 add wrap 与
+                                             // release 解释器一致。此处验证 wrap 与 release 语义（不 panic）。
+    ] {
+        let func = MirFunction {
+            params: Vec::new(),
+            body: vec![
+                MirInst::Const(0, Value::Int(a)),
+                MirInst::Const(1, Value::Int(b)),
+                fbinop(2, 0, op.clone(), 1),
+            ],
+            n_regs: 3,
+        };
+        let jit_val =
+            run_jit_of(&func).unwrap_or_else(|e| panic!("JIT failed for {a} {op:?} {b}: {e}"));
+        let mir_val = run_interp(&func).expect("interp should run");
+        assert_eq!(jit_val, mir_val, "JIT != interp for {a} {op:?} {b}");
+    }
+}
+
+/// Add(Int) 溢出 wrap 语义（JIT x86 add = release 解释器 wrap）。
+#[test]
+fn jit_int_add_wraps() {
+    let func = MirFunction {
+        params: Vec::new(),
+        body: vec![
+            MirInst::Const(0, Value::Int(i64::MAX)),
+            MirInst::Const(1, Value::Int(1)),
+            fbinop(2, 0, mora::common::BinaryOp::Add, 1),
+        ],
+        n_regs: 3,
+    };
+    let jit_val = run_jit_of(&func).expect("JIT should compile Add");
+    // i64 直接加法 wrap：MAX + 1 = MIN
+    assert_eq!(jit_val, Value::Int(i64::MIN), "Add 溢出应 wrap");
+}
+
+/// 手工构造的 Int Mod（Rust 浮点余数截断语义）：JIT == 解释器。
+#[test]
+fn jit_equiv_manual_int_mod() {
+    for (a, b) in [(17i64, 5i64), (-17, 5), (17, -5), (-17, -5), (0, 5), (7, 3)] {
+        let func = MirFunction {
+            params: Vec::new(),
+            body: vec![
+                MirInst::Const(0, Value::Int(a)),
+                MirInst::Const(1, Value::Int(b)),
+                fbinop(2, 0, mora::common::BinaryOp::Mod, 1),
+            ],
+            n_regs: 3,
+        };
+        let jit_val = run_jit_of(&func).unwrap_or_else(|e| panic!("JIT failed for {a} % {b}: {e}"));
+        let mir_val = run_interp(&func).expect("interp should run");
+        assert_eq!(jit_val, mir_val, "JIT != interp for {a} % {b}");
+    }
+}
+
+/// 手工构造的 Int 比较（a as f64 op b as f64）：JIT == 解释器。
+#[test]
+fn jit_equiv_manual_int_cmp() {
+    for (a, op, b) in [
+        (1i64, mora::common::BinaryOp::Less, 2i64),
+        (3, mora::common::BinaryOp::GreaterEqual, 3),
+        (4, mora::common::BinaryOp::Equal, 4),
+        (4, mora::common::BinaryOp::NotEqual, 5),
+        (2, mora::common::BinaryOp::Greater, 5),
+        (2, mora::common::BinaryOp::LessEqual, 1),
+    ] {
+        let func = MirFunction {
+            params: Vec::new(),
+            body: vec![
+                MirInst::Const(0, Value::Int(a)),
+                MirInst::Const(1, Value::Int(b)),
+                fbinop(2, 0, op.clone(), 1),
+            ],
+            n_regs: 3,
+        };
+        let jit_val =
+            run_jit_of(&func).unwrap_or_else(|e| panic!("JIT failed for {a} {op:?} {b}: {e}"));
+        let mir_val = run_interp(&func).expect("interp should run");
+        assert_eq!(jit_val, mir_val, "JIT != interp for {a} {op:?} {b}");
     }
 }

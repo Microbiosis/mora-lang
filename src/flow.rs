@@ -260,6 +260,10 @@ where
 pub fn values_equal(a: &Value, b: &Value) -> bool {
     match (a, b) {
         (Value::Nil, Value::Nil) => true,
+        // v0.75.44: Int 分支 — v0.38 numeric tower 引入 Int 变体时漏加，
+        // 导致 `4 == 4` 恒 false。Mixed 数字（Int vs Float）仍 false
+        // （跨类型不相等，与 numeric_op strict 语义一致）。
+        (Value::Int(a), Value::Int(b)) => a == b,
         (Value::Float(a), Value::Float(b)) => a == b,
         (Value::String(a), Value::String(b)) => a == b,
         (Value::Bool(a), Value::Bool(b)) => a == b,
@@ -717,6 +721,19 @@ mod tests {
     fn numeric_cmp_int_lt() {
         let v = numeric_cmp(Value::Int(1), Value::Int(2), |a, b| a < b).unwrap();
         assert_eq!(v, Value::Bool(true));
+    }
+
+    /// v0.75.44: eval_binary Equal(Int, Int) — values_equal 的 Int 分支
+    /// （v0.38 引入 Int 变体时漏加，`4 == 4` 曾恒 false）。
+    #[test]
+    fn eval_binary_int_equal() {
+        let v = eval_binary(Value::Int(4), &BinaryOp::Equal, Value::Int(4)).unwrap();
+        assert_eq!(v, Value::Bool(true));
+        let v2 = eval_binary(Value::Int(4), &BinaryOp::Equal, Value::Int(5)).unwrap();
+        assert_eq!(v2, Value::Bool(false));
+        // Mixed 数字不相等（strict 语义）
+        let v3 = eval_binary(Value::Int(4), &BinaryOp::Equal, Value::Float(4.0)).unwrap();
+        assert_eq!(v3, Value::Bool(false));
     }
 
     /// v0.38: numeric_cmp Float == Float.

@@ -2,6 +2,34 @@
 
 All notable changes to Mora will be documented in this file.
 
+## [v0.75.44] — 2026-08-02 — JIT 扩展：W^X + Int 算术 + Mod（阶段 5 后续 A/B）
+
+### Changed — W^X 双阶段可执行内存（src/mir/jit.rs）
+- `ExecMem::alloc` → `alloc_rw`（RW 写入）+ `make_exec`（VirtualProtect/
+  mprotect 切 RX）。生成代码拷入后立即收口，杜绝 RWX 页。
+- `try_compile` 末尾改 `alloc_rw → copy → make_exec` 序列。
+
+### Added — Int 算术 / Mod / 比较模板（精确复刻解释器分裂语义）
+- **Add**：eval_binary Int+Int **直接 i64 加法**（x86 add wrap，与 release
+  解释器一致；debug 解释器溢出 panic 为既存行为）。
+- **Sub/Mul/Div**：numeric_op **f64 round-trip** — cvtsi2sd → SSE 运算 →
+  roundsd（half-away）→ cvtsd2si + **范围检查饱和**（comisd 2^63 阈值：
+  ≥2^63 → i64::MAX、nan → 0、其余直转 — 与 Rust `as i64` 语义一致）。
+- **Mod**：`a - trunc(a/b)*b` 序列（roundsd mode 3 trunc）+ roundsd + 饱和。
+- **Int 比较**：`a as f64 op b as f64`（cvtsi2sd + comisd 寄存器形式）。
+- 类型线性跟踪升级为 Int/Float 双型；Mixed 拒绝回落。
+
+### Fixed — flow.rs::values_equal 缺 Int 分支（v0.38 遗留 bug）
+- `4 == 4` 恒 false（numeric tower 引入 Int 时漏加分支）。补 Int 分支
+  + 测试（含 Mixed 数字不相等语义）。
+
+### 模板调试实录（objdump 反汇编锁定，9/9 差分测试守护）
+- `movq xmm1, rdx` / `comisd` 的 modrm **mod=00 内存形式**误用（解引用
+  非法地址 AV）→ mod=11 寄存器形式。
+- `comisd xmm0, xmm1` modrm 操作数方向（Intel 第一操作数在 reg 字段）。
+- REX：movabs rdx 的 R=1 错配（成 r10）、8 位寄存器操作 W 位。
+- 跳转偏移逐字节核算（comisd 4/5 字节、xor 3 字节差异）。
+
 ## [v0.75.43] — 2026-08-02 — copy-and-patch JIT（阶段 5 落地，零 LLVM 依赖）
 
 （JIT 路线最终形态：**手写机器码模板 + 可执行内存拼接**，CPython

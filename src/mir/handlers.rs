@@ -996,9 +996,7 @@ impl MirInst {
         match self {
             MirInst::Const(r, v) => MirInst::Const(*r, v.clone()),
             MirInst::Var(r, name) => MirInst::Var(*r, name.clone()),
-            MirInst::BinaryOp(r, l, op, rr) => {
-                MirInst::BinaryOp(*r, m(*l), op.clone(), m(*rr))
-            }
+            MirInst::BinaryOp(r, l, op, rr) => MirInst::BinaryOp(*r, m(*l), op.clone(), m(*rr)),
             MirInst::Call(r, name, args) => {
                 MirInst::Call(*r, name.clone(), args.iter().map(|a| m(*a)).collect())
             }
@@ -1010,9 +1008,7 @@ impl MirInst {
                 entries.iter().map(|(k, v)| (k.clone(), m(*v))).collect(),
             ),
             MirInst::Index(r, obj, idx) => MirInst::Index(*r, m(*obj), m(*idx)),
-            MirInst::IndexAssign(obj, idx, val) => {
-                MirInst::IndexAssign(m(*obj), m(*idx), m(*val))
-            }
+            MirInst::IndexAssign(obj, idx, val) => MirInst::IndexAssign(m(*obj), m(*idx), m(*val)),
             MirInst::MethodCall(r, recv, name, args) => MirInst::MethodCall(
                 *r,
                 m(*recv),
@@ -1020,9 +1016,7 @@ impl MirInst {
                 args.iter().map(|a| m(*a)).collect(),
             ),
             MirInst::Pipe(r, lhs, rhs) => MirInst::Pipe(*r, m(*lhs), m(*rhs)),
-            MirInst::Prompt(r, parts) => {
-                MirInst::Prompt(*r, parts.iter().map(|p| m(*p)).collect())
-            }
+            MirInst::Prompt(r, parts) => MirInst::Prompt(*r, parts.iter().map(|p| m(*p)).collect()),
             MirInst::MatchExpr { val, arms } => MirInst::MatchExpr {
                 val: m(*val),
                 arms: arms
@@ -1039,7 +1033,12 @@ impl MirInst {
             },
             MirInst::TaskDef { .. } => self.clone(),
             MirInst::Closure { .. } => self.clone(),
-            MirInst::DynTrait { dst, src, trait_generics, trait_name } => MirInst::DynTrait {
+            MirInst::DynTrait {
+                dst,
+                src,
+                trait_generics,
+                trait_name,
+            } => MirInst::DynTrait {
                 dst: *dst,
                 src: m(*src),
                 trait_generics: trait_generics.clone(),
@@ -1047,11 +1046,12 @@ impl MirInst {
             },
             MirInst::ToolDef { .. } => self.clone(),
             MirInst::Import(_) => self.clone(),
-            MirInst::WithConfig { bindings, body, jit } => MirInst::WithConfig {
-                bindings: bindings
-                    .iter()
-                    .map(|(k, v)| (k.clone(), m(*v)))
-                    .collect(),
+            MirInst::WithConfig {
+                bindings,
+                body,
+                jit,
+            } => MirInst::WithConfig {
+                bindings: bindings.iter().map(|(k, v)| (k.clone(), m(*v))).collect(),
                 body: body.clone(),
                 jit: *jit,
             },
@@ -1102,15 +1102,19 @@ impl MirInst {
             MirInst::TraitDef { .. } => self.clone(),
             MirInst::ImplDef { .. } => self.clone(),
             MirInst::Orchestrate { .. } => self.clone(),
-            MirInst::Eval { name, given_reg, expects, tolerance, replay_path } => {
-                MirInst::Eval {
-                    name: name.clone(),
-                    given_reg: m(*given_reg),
-                    expects: expects.iter().map(|e| m(*e)).collect(),
-                    tolerance: *tolerance,
-                    replay_path: replay_path.clone(),
-                }
-            }
+            MirInst::Eval {
+                name,
+                given_reg,
+                expects,
+                tolerance,
+                replay_path,
+            } => MirInst::Eval {
+                name: name.clone(),
+                given_reg: m(*given_reg),
+                expects: expects.iter().map(|e| m(*e)).collect(),
+                tolerance: *tolerance,
+                replay_path: replay_path.clone(),
+            },
             MirInst::SkillDef { .. } => self.clone(),
             MirInst::PromptSection { .. } => self.clone(),
             MirInst::DocumentSection { .. } => self.clone(),

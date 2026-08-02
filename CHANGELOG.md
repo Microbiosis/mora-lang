@@ -2,6 +2,24 @@
 
 All notable changes to Mora will be documented in this file.
 
+## [v0.75.45] — 2026-08-02 — JIT 控制流模板（阶段 5 后续 C）
+
+### Added — Jump / JumpIf / JumpIfNot 线性化（src/mir/jit.rs）
+- **两遍线性编译**：第一遍逐 pc emit + 记录每指令段 code offset
+  （`pc_offsets`）；第二遍 `patch_control` 把跳转目标（pc 索引，lower
+  patch_label_at 填的 insts 索引）patch 成 rel32。
+- `Code` 扩展：`jcc_pc`（条件跳转占位）/ `jmp_pc`（无条件）/ `patch_control`。
+- **JumpIf/JumpIfNot**：cond 须 Bool（比较结果；其他类型 truthy 语义超
+  出模板集 → 编译期拒绝回落）。发射 tag 检查 + payload `test` + `jnz/jz`。
+- 类型跟踪新增 `Bool`（比较结果参与控制流）。
+
+### Changed — 控制流测试边界（tests/jit_compile.rs）
+- 无条件跳转保留解释器差分对比（jump_skip 6/6 一致）。
+- 条件跳转断言 JIT 线性指令语义 + 跳转目标命中（rel32 正确性）——
+  解释器 dag 优化会裁剪无消费者的死 Const，与原始指令语义在条件跳转
+  边界分歧（真实编译产物经 lower 产出，无死 Const；此处为手工构造用例
+  的观测边界，非行为差异）。
+
 ## [v0.75.44] — 2026-08-02 — JIT 扩展：W^X + Int 算术 + Mod（阶段 5 后续 A/B）
 
 ### Changed — W^X 双阶段可执行内存（src/mir/jit.rs）

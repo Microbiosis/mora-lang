@@ -39,34 +39,34 @@ pub fn semantic_tokens_v3(docs: &HashMap<String, DocumentState>, params: &Value)
 }
 
 fn emit_tokens(
-    expr: &crate::mir::MirExpr,
+    expr: &crate::mir::witness::MirWitness,
     out: &mut Vec<f64>,
     last_line: &mut usize,
     last_col: &mut usize,
 ) {
-    use crate::mir::expr::MirExprKind;
+    use crate::mir::witness::WitnessKind;
     let line = expr.span.line.saturating_sub(1);
     let col = expr.span.column.saturating_sub(1);
     let kind = match &expr.kind {
-        MirExprKind::Variable(_) => TOKEN_KIND_VARIABLE,
-        MirExprKind::Literal(crate::common::Literal::String(_, _)) => TOKEN_KIND_STRING,
-        MirExprKind::Literal(crate::common::Literal::Int(_, _))
-        | MirExprKind::Literal(crate::common::Literal::Float(_, _)) => TOKEN_KIND_NUMBER,
-        MirExprKind::Call { .. } => TOKEN_KIND_FUNCTION,
+        WitnessKind::Variable(_) => TOKEN_KIND_VARIABLE,
+        WitnessKind::Literal(crate::common::Literal::String(_, _)) => TOKEN_KIND_STRING,
+        WitnessKind::Literal(crate::common::Literal::Int(_, _))
+        | WitnessKind::Literal(crate::common::Literal::Float(_, _)) => TOKEN_KIND_NUMBER,
+        WitnessKind::Call { .. } => TOKEN_KIND_FUNCTION,
         _ => 0.0,
     };
     if kind > 0.0 {
         push_token(out, last_line, last_col, line, col, kind);
     }
-    parsed_doc_v3::walk_mir_expr(expr, &mut |e| {
+    parsed_doc_v3::walk_witness(expr, &mut |e| {
         let l = e.span.line.saturating_sub(1);
         let c = e.span.column.saturating_sub(1);
         let k = match &e.kind {
-            MirExprKind::Variable(_) => TOKEN_KIND_VARIABLE,
-            MirExprKind::Literal(crate::common::Literal::String(_, _)) => TOKEN_KIND_STRING,
-            MirExprKind::Literal(crate::common::Literal::Int(_, _))
-            | MirExprKind::Literal(crate::common::Literal::Float(_, _)) => TOKEN_KIND_NUMBER,
-            MirExprKind::Call { .. } => TOKEN_KIND_FUNCTION,
+            WitnessKind::Variable(_) => TOKEN_KIND_VARIABLE,
+            WitnessKind::Literal(crate::common::Literal::String(_, _)) => TOKEN_KIND_STRING,
+            WitnessKind::Literal(crate::common::Literal::Int(_, _))
+            | WitnessKind::Literal(crate::common::Literal::Float(_, _)) => TOKEN_KIND_NUMBER,
+            WitnessKind::Call { .. } => TOKEN_KIND_FUNCTION,
             _ => 0.0,
         };
         if k > 0.0 {

@@ -36,7 +36,10 @@ pub fn check_program_mir(exprs: &[MirExpr]) -> Vec<TypeError> {
     }
     errors.extend(import_errors);
 
-    errors.extend(hm.infer_program(exprs).into_iter().map(hm_to_external));
+    // v0.75.38: HM 推断消费 MirWitness（轻量树骨架）。parse 层仍产出
+    // MirExpr，此处桥接转换；阶段 3 parser 直接产出 witness 时去掉转换。
+    let witnesses = crate::mir::witness::MirWitness::from_exprs(exprs);
+    errors.extend(hm.infer_program(&witnesses).into_iter().map(hm_to_external));
     errors
 }
 

@@ -25,10 +25,10 @@ pub fn folding_range_v3(docs: &HashMap<String, DocumentState>, params: &Value) -
     Value::Array(ranges)
 }
 
-fn collect_folds(expr: &crate::mir::MirExpr, out: &mut Vec<Value>) {
-    use crate::mir::expr::MirExprKind;
+fn collect_folds(expr: &crate::mir::witness::MirWitness, out: &mut Vec<Value>) {
+    use crate::mir::witness::WitnessKind;
     match &expr.kind {
-        MirExprKind::If { then, r#else, .. } => {
+        WitnessKind::If { then, r#else, .. } => {
             let end_line = r#else
                 .as_ref()
                 .map(|e| e.span.line)
@@ -41,7 +41,7 @@ fn collect_folds(expr: &crate::mir::MirExpr, out: &mut Vec<Value>) {
                 collect_folds(e, out);
             }
         }
-        MirExprKind::Match { arms, .. } => {
+        WitnessKind::Match { arms, .. } => {
             let end_line = arms
                 .iter()
                 .map(|a| a.body.span.line)
@@ -54,7 +54,7 @@ fn collect_folds(expr: &crate::mir::MirExpr, out: &mut Vec<Value>) {
                 collect_folds(&arm.body, out);
             }
         }
-        MirExprKind::FnDef { body, .. } | MirExprKind::Closure { body, .. } => {
+        WitnessKind::FnDef { body, .. } | WitnessKind::Closure { body, .. } => {
             if body.span.line > expr.span.line {
                 out.push(make_range(expr.span.line, body.span.line));
             }

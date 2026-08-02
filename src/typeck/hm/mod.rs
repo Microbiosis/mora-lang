@@ -1,12 +1,12 @@
-//! v0.55: Hindley-Milner Type Inference for MirExpr.
+//! v0.55: Hindley-Milner Type Inference for MirWitness.
 //!
-//! This module is the MirExpr-native replacement of the ast_v2-based
+//! This module is the MirWitness-native replacement of the ast_v2-based
 //! `typeck::check_program` pipeline. The earlier v0.53 prototype still
 //! referenced `NodeId` / `AstArena` and silently no-op'd any closure type
 //! check because `Type::Closure` is a unit variant. The current rewrite
-//! drives inference directly off `&MirExpr`, tracks closure signatures in
+//! drives inference directly off `&MirWitness`, tracks closure signatures in
 //! a side table keyed by a fresh `Type::TypeVar`, and covers every
-//! `MirExprKind` variant.
+//! `WitnessKind` variant.
 //!
 //! Public entry point: [`check_program_mir`] (re-exported from
 //! `crate::typeck`).
@@ -14,7 +14,8 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::common::Span;
-use crate::mir::expr::{BuiltinOp, MirCallee, MirExpr, MirExprKind, Param};
+use crate::mir::expr::BuiltinOp;
+use crate::mir::witness::{MirWitness, WitnessArm, WitnessCallee, WitnessKind, WitnessParam};
 use crate::typeck::Type;
 
 pub mod env;
@@ -227,12 +228,12 @@ impl HMInference {
         }
     }
 
-    /// Drive inference across an entire MirExpr program. Returns the
+    /// Drive inference across an entire MirWitness program. Returns the
     /// list of collected diagnostics. (Inferred types are surfaced via
     /// `TypeError` diagnostics only; there is no per-node type cache on
-    /// `MirExpr` — see `mir/expr` — so inference always runs from the
+    /// `MirWitness` — see `mir/expr` — so inference always runs from the
     /// expression tree itself.)
-    pub fn infer_program(&mut self, exprs: &[MirExpr]) -> Vec<TypeError> {
+    pub fn infer_program(&mut self, exprs: &[MirWitness]) -> Vec<TypeError> {
         let mut errors: Vec<TypeError> = Vec::new();
         for expr in exprs {
             if let Err(mut errs) = self.infer_expr(expr) {
@@ -245,44 +246,44 @@ impl HMInference {
         errors
     }
 
-    pub fn infer_expr(&mut self, expr: &MirExpr) -> Result<Type, Vec<TypeError>> {
+    pub fn infer_expr(&mut self, expr: &MirWitness) -> Result<Type, Vec<TypeError>> {
         match &expr.kind {
-            MirExprKind::Literal(lit) => Ok(infer_lit(lit)),
-            MirExprKind::Variable(name) => self.infer_var(name, expr.span),
-            MirExprKind::Binary { left, op, right } => {
+            WitnessKind::Literal(lit) => Ok(infer_lit(lit)),
+            WitnessKind::Variable(name) => self.infer_var(name, expr.span),
+            WitnessKind::Binary { left, op, right } => {
                 self.infer_binop(op, left.as_ref(), right.as_ref(), expr.span)
             }
-            MirExprKind::Call { callee, args } => self.infer_call(callee, args, expr.span),
-            MirExprKind::MethodCall {
+            WitnessKind::Call { callee, args } => self.infer_call(callee, args, expr.span),
+            WitnessKind::MethodCall {
                 receiver,
                 method,
                 args,
             } => self.infer_method_call(receiver, method, args, expr.span),
-            MirExprKind::Closure { params, body, .. } => {
+            WitnessKind::Closure { params, body, .. } => {
                 self.infer_closure(params, body.as_ref(), expr.span)
             }
-            MirExprKind::FnDef { params, body, .. } => {
+            WitnessKind::FnDef { params, body, .. } => {
                 self.infer_fn_def(params, body.as_ref(), expr.span)
             }
-            MirExprKind::Match { scrutinee, arms } => {
+            WitnessKind::Match { scrutinee, arms } => {
                 self.infer_match(scrutinee.as_ref(), arms, expr.span)
             }
-            MirExprKind::If { cond, then, r#else } => {
+            WitnessKind::If { cond, then, r#else } => {
                 self.infer_if(cond.as_ref(), then.as_ref(), r#else.as_deref(), expr.span)
             }
-            MirExprKind::List(items) => self.infer_list(items, expr.span),
-            MirExprKind::Dict(entries) => self.infer_dict(entries, expr.span),
-            MirExprKind::DynTrait { expr, .. } => {
+            WitnessKind::List(items) => self.infer_list(items, expr.span),
+            WitnessKind::Dict(entries) => self.infer_dict(entries, expr.span),
+            WitnessKind::DynTrait { expr, .. } => {
                 // v0.55: dyn Trait is opaque; defer to inner expression.
                 self.infer_expr(expr)
             }
-            MirExprKind::Prompt { parts } => {
+            WitnessKind::Prompt { parts } => {
                 for p in parts {
                     let _ = self.infer_expr(p)?;
                 }
                 Ok(Type::String)
             }
-            MirExprKind::LetBinding {
+            WitnessKind::LetBinding {
                 name,
                 type_hint,
                 value,
@@ -291,10 +292,10 @@ impl HMInference {
                 Some(hint) => self.infer_let_typed(name, hint, value.as_ref(), expr.span),
                 None => self.infer_let(name, value.as_ref(), expr.span),
             },
-            MirExprKind::Assign { target, value } => {
+            WitnessKind::Assign { target, value } => {
                 self.infer_assign(target, value.as_ref(), expr.span)
             }
-            MirExprKind::Orchestrate {
+            WitnessKind::Orchestrate {
                 input_var,
                 result_var,
                 ..
@@ -308,18 +309,18 @@ impl HMInference {
                 self.env.add(result_var.clone(), Type::Any);
                 Ok(Type::Nil)
             }
-            MirExprKind::Loop { .. } => {
+            WitnessKind::Loop { .. } => {
                 // v0.55: Loop lowering produces nil at the MIR level.
                 Ok(Type::Nil)
             }
-            MirExprKind::While { .. } => {
+            WitnessKind::While { .. } => {
                 // v0.55: While lowering produces nil at the MIR level.
                 Ok(Type::Nil)
             }
-            MirExprKind::Or { left, right } | MirExprKind::And { left, right } => {
+            WitnessKind::Or { left, right } | WitnessKind::And { left, right } => {
                 let left_ty = self.infer_expr(left)?;
                 let right_ty = self.infer_expr(right)?;
-                let _op_name = if matches!(expr.kind, MirExprKind::Or { .. }) {
+                let _op_name = if matches!(expr.kind, WitnessKind::Or { .. }) {
                     "or"
                 } else {
                     "and"
@@ -340,24 +341,24 @@ impl HMInference {
                 }
                 Ok(Type::Bool)
             }
-            MirExprKind::Return(_) | MirExprKind::Break(_) | MirExprKind::Continue(_) => {
+            WitnessKind::Return(_) | WitnessKind::Break(_) | WitnessKind::Continue(_) => {
                 Ok(Type::Nil)
             }
-            MirExprKind::IndexAssign { .. } => Ok(Type::Nil),
+            WitnessKind::IndexAssign { .. } => Ok(Type::Nil),
             // v0.55: top-level declarations — no scalar result type.
-            MirExprKind::TypeAlias { .. }
-            | MirExprKind::EnumDef { .. }
-            | MirExprKind::StructDef { .. }
-            | MirExprKind::Import(_)
-            | MirExprKind::MacroDef { .. }
-            | MirExprKind::Sequence { .. } => Ok(Type::Nil),
+            WitnessKind::TypeAlias { .. }
+            | WitnessKind::EnumDef { .. }
+            | WitnessKind::StructDef { .. }
+            | WitnessKind::Import(_)
+            | WitnessKind::MacroDef { .. }
+            | WitnessKind::Sequence { .. } => Ok(Type::Nil),
         }
     }
 
     fn infer_let(
         &mut self,
         name: &str,
-        value: &MirExpr,
+        value: &MirWitness,
         span: Span,
     ) -> Result<Type, Vec<TypeError>> {
         let value_ty = self.infer_expr(value)?;
@@ -374,7 +375,7 @@ impl HMInference {
         &mut self,
         name: &str,
         type_hint: &Type,
-        value: &MirExpr,
+        value: &MirWitness,
         span: Span,
     ) -> Result<Type, Vec<TypeError>> {
         let value_ty = self.infer_expr(value)?;
@@ -398,7 +399,7 @@ impl HMInference {
     fn infer_assign(
         &mut self,
         target: &str,
-        value: &MirExpr,
+        value: &MirWitness,
         span: Span,
     ) -> Result<Type, Vec<TypeError>> {
         let value_ty = self.infer_expr(value)?;
@@ -441,8 +442,8 @@ impl HMInference {
     fn infer_binop(
         &mut self,
         op: &crate::common::BinaryOp,
-        left: &MirExpr,
-        right: &MirExpr,
+        left: &MirWitness,
+        right: &MirWitness,
         span: Span,
     ) -> Result<Type, Vec<TypeError>> {
         use crate::common::BinaryOp::*;
@@ -471,7 +472,7 @@ impl HMInference {
                 self.constraints
                     .push(Constraint::Eq(Box::new(left_ty), Box::new(right_ty)));
                 Ok(Type::Bool)
-            } // v0.55: Or/And are MirExprKind variants (short-circuit),
+            } // v0.55: Or/And are WitnessKind variants (short-circuit),
               // handled directly in infer_expr, not BinaryOp variants.
               // BinaryOp 已穷尽（11 变体全部覆盖）— 无需 `_` 兜底。
         }
@@ -479,14 +480,14 @@ impl HMInference {
 
     fn infer_call(
         &mut self,
-        callee: &MirCallee,
-        args: &[MirExpr],
+        callee: &WitnessCallee,
+        args: &[MirWitness],
         span: Span,
     ) -> Result<Type, Vec<TypeError>> {
         let callee_ty = match callee {
-            MirCallee::Name(name) => self.builtin_callee_ty(name).unwrap_or(Type::Any),
+            WitnessCallee::Name(name) => self.builtin_callee_ty(name).unwrap_or(Type::Any),
             // v0.75.17: Var 命中 ForAll 时实例化（`let f = fn(x) x; f(1); f("s")`）
-            MirCallee::Var(var_name) => match self.env.get(var_name) {
+            WitnessCallee::Var(var_name) => match self.env.get(var_name) {
                 Some(ty) if matches!(ty, Type::ForAll(_, _)) => {
                     let ty = ty.clone();
                     self.instantiate_type(&ty)
@@ -494,11 +495,11 @@ impl HMInference {
                 Some(ty) => ty.clone(),
                 None => Type::Any,
             },
-            MirCallee::Evaluated(expr) => self.infer_expr(expr)?,
-            MirCallee::Builtin(op) => self.builtin_type(op)?,
-            // v0.75.16: Method 调用（parser 现产出 MirCallee::Method）— 走
+            WitnessCallee::Evaluated(expr) => self.infer_expr(expr)?,
+            WitnessCallee::Builtin(op) => self.builtin_type(op)?,
+            // v0.75.16: Method 调用（parser 现产出 WitnessCallee::Method）— 走
             // method_signature 推断（receiver 类型 + 参数约束 + 返回类型）。
-            MirCallee::Method(_, _) => {
+            WitnessCallee::Method(_, _) => {
                 // 第一个 arg 是 receiver 表达式；构造临时 MethodCall 语义。
                 // 直接委托 infer_method_call：receiver = args[0], 后续为参数。
                 let (recv, method_args) = match args.split_first() {
@@ -512,7 +513,7 @@ impl HMInference {
                     }
                 };
                 let method = match callee {
-                    MirCallee::Method(_, m) => m.clone(),
+                    WitnessCallee::Method(_, m) => m.clone(),
                     _ => unreachable!(),
                 };
                 return self.infer_method_call(recv, &method, method_args, span);
@@ -526,9 +527,9 @@ impl HMInference {
         // v0.75.24: merge_with(key, strategy) 的策略名字面量编译期校验 —
         // 非法策略（静态字符串）在 typeck 阶段拦截，不再留到运行时
         // （动态传入的变量仍由运行时 MergeStrategy::from_name 兜底）。
-        if let MirCallee::Name(name) = callee
+        if let WitnessCallee::Name(name) = callee
             && name == "merge_with"
-            && let Some(MirExprKind::Literal(crate::common::Literal::String(s, _))) =
+            && let Some(WitnessKind::Literal(crate::common::Literal::String(s, _))) =
                 args.get(1).map(|a| &a.kind)
             && crate::value::MergeStrategy::from_name(s).is_none()
         {
@@ -572,9 +573,9 @@ impl HMInference {
 
     fn infer_method_call(
         &mut self,
-        receiver: &MirExpr,
+        receiver: &MirWitness,
         method: &str,
-        args: &[MirExpr],
+        args: &[MirWitness],
         span: Span,
     ) -> Result<Type, Vec<TypeError>> {
         let recv_ty = self.infer_expr(receiver)?;
@@ -608,13 +609,13 @@ impl HMInference {
         Ok(return_ty)
     }
 
-    // v0.75.20: infer_pipe 已删——MirExprKind::Pipe 死变体移除，`|>` 在
+    // v0.75.20: infer_pipe 已删——WitnessKind::Pipe 死变体移除，`|>` 在
     // parse_pipe 脱糖为 Call（right(left)），HM 走 infer_call。
 
     fn infer_closure(
         &mut self,
-        params: &[Param],
-        body: &MirExpr,
+        params: &[WitnessParam],
+        body: &MirWitness,
         span: Span,
     ) -> Result<Type, Vec<TypeError>> {
         let saved_env = self.env.clone();
@@ -634,8 +635,8 @@ impl HMInference {
 
     fn infer_fn_def(
         &mut self,
-        params: &[Param],
-        body: &MirExpr,
+        params: &[WitnessParam],
+        body: &MirWitness,
         span: Span,
     ) -> Result<Type, Vec<TypeError>> {
         // fn name(params) = body  is treated like an immediately-bound
@@ -646,8 +647,8 @@ impl HMInference {
 
     fn infer_match(
         &mut self,
-        scrutinee: &MirExpr,
-        arms: &[crate::mir::expr::MatchArm],
+        scrutinee: &MirWitness,
+        arms: &[WitnessArm],
         span: Span,
     ) -> Result<Type, Vec<TypeError>> {
         let _ = self.infer_expr(scrutinee)?;
@@ -668,9 +669,9 @@ impl HMInference {
 
     fn infer_if(
         &mut self,
-        cond: &MirExpr,
-        then_branch: &MirExpr,
-        else_branch: Option<&MirExpr>,
+        cond: &MirWitness,
+        then_branch: &MirWitness,
+        else_branch: Option<&MirWitness>,
         span: Span,
     ) -> Result<Type, Vec<TypeError>> {
         let _ = self.infer_expr(cond)?;
@@ -689,7 +690,7 @@ impl HMInference {
         Ok(result)
     }
 
-    fn infer_list(&mut self, items: &[MirExpr], span: Span) -> Result<Type, Vec<TypeError>> {
+    fn infer_list(&mut self, items: &[MirWitness], span: Span) -> Result<Type, Vec<TypeError>> {
         let elem_ty = self.fresh_type_var();
         for item in items {
             let ty = self.infer_expr(item)?;
@@ -702,7 +703,7 @@ impl HMInference {
 
     fn infer_dict(
         &mut self,
-        entries: &[(String, MirExpr)],
+        entries: &[(String, MirWitness)],
         span: Span,
     ) -> Result<Type, Vec<TypeError>> {
         let k_ty = Type::String;
@@ -793,10 +794,15 @@ fn infer_lit(lit: &crate::common::Literal) -> Type {
 mod tests {
     use super::*;
     use crate::common::{Literal, Span};
-    use crate::mir::expr::{MatchArm, Param, Pattern};
+    use crate::mir::witness::{
+        MirWitness, WitnessArm, WitnessCallee, WitnessKind, WitnessParam, WitnessPattern,
+    };
 
-    fn lit_int(n: i64) -> MirExpr {
-        MirExpr::lit(Literal::Int(n, Span::default()), Span::default())
+    fn lit_int(n: i64) -> MirWitness {
+        MirWitness {
+            kind: WitnessKind::Literal(Literal::Int(n, Span::default())),
+            span: Span::default(),
+        }
     }
 
     #[test]
@@ -809,7 +815,10 @@ mod tests {
     #[test]
     fn unbound_variable_produces_diagnostic() {
         let mut hm = HMInference::new();
-        let expr = MirExpr::var("missing".to_string(), Span::default());
+        let expr = MirWitness {
+            kind: WitnessKind::Variable("missing".to_string()),
+            span: Span::default(),
+        };
         let err = hm.infer_expr(&expr).unwrap_err();
         assert!(matches!(
             err.as_slice(),
@@ -820,12 +829,15 @@ mod tests {
     #[test]
     fn let_binding_registers_env() {
         let mut hm = HMInference::new();
-        let expr = MirExpr {
-            kind: MirExprKind::LetBinding {
+        let expr = MirWitness {
+            kind: WitnessKind::LetBinding {
                 name: "x".to_string(),
                 type_hint: None,
                 value: Box::new(lit_int(1)),
-                init_body: Box::new(MirExpr::var("x".to_string(), Span::default())),
+                init_body: Box::new(MirWitness {
+                    kind: WitnessKind::Variable("x".to_string()),
+                    span: Span::default(),
+                }),
             },
             span: Span::default(),
         };
@@ -836,7 +848,14 @@ mod tests {
     #[test]
     fn if_branches_unify() {
         let mut hm = HMInference::new();
-        let expr = MirExpr::if_else(lit_int(1), lit_int(2), Some(lit_int(3)), Span::default());
+        let expr = MirWitness {
+            kind: WitnessKind::If {
+                cond: Box::new(lit_int(1)),
+                then: Box::new(lit_int(2)),
+                r#else: Some(Box::new(lit_int(3))),
+            },
+            span: Span::default(),
+        };
         hm.infer_expr(&expr).unwrap();
         assert!(
             hm.solve_constraints().is_ok(),
@@ -848,19 +867,19 @@ mod tests {
     fn match_arms_unify() {
         let mut hm = HMInference::new();
         let arms = vec![
-            MatchArm {
-                pattern: Pattern::Literal(Literal::Int(1, Span::default())),
+            WitnessArm {
+                pattern: WitnessPattern::Literal(Literal::Int(1, Span::default())),
                 guard: None,
                 body: lit_int(10),
             },
-            MatchArm {
-                pattern: Pattern::Wildcard,
+            WitnessArm {
+                pattern: WitnessPattern::Wildcard,
                 guard: None,
                 body: lit_int(20),
             },
         ];
-        let expr = MirExpr {
-            kind: MirExprKind::Match {
+        let expr = MirWitness {
+            kind: WitnessKind::Match {
                 scrutinee: Box::new(lit_int(1)),
                 arms,
             },
@@ -876,22 +895,27 @@ mod tests {
     #[test]
     fn closure_call_arity_check() {
         let mut hm = HMInference::new();
-        let param = Param {
+        let param = WitnessParam {
             name: "x".to_string(),
             type_hint: Some(Type::Int),
             default: None,
         };
         let closure_ty = hm.infer_closure(
             &[param],
-            &MirExpr::var("x".to_string(), Span::default()),
+            &MirWitness {
+                kind: WitnessKind::Variable("x".to_string()),
+                span: Span::default(),
+            },
             Span::default(),
         );
         let closure_ty = closure_ty.unwrap();
-        let call = MirExpr::call(
-            MirCallee::Var("c".to_string()),
-            vec![lit_int(7), lit_int(8)],
-            Span::default(),
-        );
+        let call = MirWitness {
+            kind: WitnessKind::Call {
+                callee: WitnessCallee::Var("c".to_string()),
+                args: vec![lit_int(7), lit_int(8)],
+            },
+            span: Span::default(),
+        };
         let _ = closure_ty; // Just check the compile
         let _ = call;
     }

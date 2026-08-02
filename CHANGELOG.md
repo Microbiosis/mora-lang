@@ -2,6 +2,40 @@
 
 All notable changes to Mora will be documented in this file.
 
+## [v0.75.38] — 2026-08-02 — MirWitness 轻量树骨架（去 AST 化阶段 2）
+
+（MirExpr → MirWitness 终局的阶段 2：定义 witness 骨架 + typeck/LSP
+消费面迁移。阶段 3/4 parser 直接 emit、删 MirExpr 执行语义。）
+
+### Added — src/mir/witness.rs（+~470 行）
+- `MirWitness { kind: WitnessKind, span }` — 轻量树骨架，**无执行语义**。
+- `WitnessKind` 镜像 `MirExprKind` 全部 30 变体（独立枚举，阶段 3/4
+  消除 MirExpr 时胜出）。
+- 复合类型同步镜像：`WitnessCallee`/`WitnessArm`/`WitnessParam`/
+  `WitnessPattern`/`WitnessOrchestrateKind`/`WitnessAgentDef`/`WitnessEdgeDef`。
+- `from_expr` 递归转换（30 变体逐一映射）+ 3 个往返一致性单元测试。
+
+### Removed — Closure.captured_env（src/mir/expr/mod.rs）
+- `MirExprKind::Closure` 删 `captured_env: Arc<EnvSnapshot>` + 删
+  `EnvSnapshot` struct — 全仓库零消费死字段（仅内部构造，typeck/lower/
+  parser 均不读取；闭包捕获在运行时由 handler 实现）。
+
+### Changed — typeck 消费 witness（src/typeck/）
+- `infer_expr`/`infer_call`/`infer_method_call`/`infer_closure`/`infer_match`
+  等 30 分支改消费 `WitnessKind`（机械替换）。
+- `check_program_mir` 入口桥接：`MirExpr` → `from_exprs` → witness
+  （parse 层仍产出 MirExpr，main.rs 4 处 pipeline 零改动）。
+- `imports.rs` 的 infer_program 调用点同步桥接。
+
+### Changed — LSP 消费 witness（src/lsp/providers/）
+- `parsed_doc_v3` 返回 `Vec<MirWitness>`；`walk_mir_expr` → `walk_witness`。
+- folding / semantic / completion / definition / rename 五 provider
+  经共享 helper 一处迁移全通。
+
+### 验证
+- mir 单元 86（+3 witness）、tier0/1/2、orchestrate 12、LSP 8 全绿。
+- clippy 0 / fmt 0。
+
 ## [v0.75.37] — 2026-08-02 — 生产 unwrap 清理 + typeck 死代码移除（审查报告既存项）
 
 （依据架构审查报告 3.3–3.6 与改进建议 P2-3，清理既存质量问题。

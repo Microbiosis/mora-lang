@@ -47,48 +47,78 @@ pub fn lower_mir_exprs(exprs: &[MirExpr]) -> Result<MirFunction, String> {
     lower_mir_exprs_with_opt(exprs, crate::mir::ssa::OptLevel::from_env())
 }
 
-/// MirExpr → MIR 指令 lowering（v0.55 完整版）
-struct MirExprLowerer {
-    next_reg: Reg,
-    insts: Vec<MirInst>,
+/// v0.75.39: 共享 emit 机制 — MirExprLowerer 与 ParserV3 单遍编译共用。
+///
+/// alloc_reg（bump 分配）/ emit（Vec push）/ patch_label_at（label 回填）
+/// 是三个自包含原语，不依赖 MirExpr 任何执行语义。阶段 3 parser 直接
+/// emit 时复用同一套机制（label 即 insts 索引，patch 即覆盖）。
+#[derive(Default)]
+pub struct EmitContext {
+    pub next_reg: Reg,
+    pub insts: Vec<MirInst>,
     /// 循环上下文栈: (continue_label, break_label)
-    loop_stack: Vec<(Label, Label)>,
+    pub loop_stack: Vec<(Label, Label)>,
 }
 
-impl MirExprLowerer {
-    fn new() -> Self {
-        Self {
-            next_reg: 0,
-            insts: Vec::new(),
-            loop_stack: Vec::new(),
-        }
+impl EmitContext {
+    pub fn new() -> Self {
+        Self::default()
     }
 
-    fn finish(self) -> MirFunction {
-        MirFunction {
-            params: vec![],
-            body: self.insts,
-            n_regs: self.next_reg,
-        }
-    }
-
-    fn alloc_reg(&mut self) -> Reg {
+    pub fn alloc_reg(&mut self) -> Reg {
         let r = self.next_reg;
         self.next_reg += 1;
         r
     }
 
-    fn emit(&mut self, inst: MirInst) {
+    pub fn emit(&mut self, inst: MirInst) {
         self.insts.push(inst);
     }
 
-    fn patch_label_at(&mut self, idx: usize, label: Label) {
+    pub fn patch_label_at(&mut self, idx: usize, label: Label) {
         match &mut self.insts[idx] {
             MirInst::JumpIfNot(_, lbl) | MirInst::JumpIf(_, lbl) | MirInst::Jump(lbl) => {
                 *lbl = label;
             }
             _ => {}
         }
+    }
+
+    pub fn finish(self) -> MirFunction {
+        MirFunction {
+            params: vec![],
+            body: self.insts,
+            n_regs: self.next_reg,
+        }
+    }
+}
+
+/// MirExpr → MIR 指令 lowering（v0.55 完整版）
+struct MirExprLowerer {
+    emit: EmitContext,
+}
+
+impl MirExprLowerer {
+    fn new() -> Self {
+        Self {
+            emit: EmitContext::new(),
+        }
+    }
+
+    fn alloc_reg(&mut self) -> Reg {
+        self.emit.alloc_reg()
+    }
+
+    fn emit(&mut self, inst: MirInst) {
+        self.emit.emit(inst);
+    }
+
+    fn patch_label_at(&mut self, idx: usize, label: Label) {
+        self.emit.patch_label_at(idx, label);
+    }
+
+    fn finish(self) -> MirFunction {
+        self.emit.finish()
     }
 
     /// Lower expression → returns result register
@@ -151,10 +181,10 @@ impl MirExprLowerer {
                 let dst = self.alloc_reg();
                 // If left is false, skip right
                 self.emit(MirInst::JumpIfNot(l, 0)); // placeholder
-                let jump_idx = self.insts.len() - 1;
+                let jump_idx = self.emit.insts.len() - 1;
                 let r = self.lower_expr(right)?;
                 self.emit(MirInst::BinaryOp(dst, l, crate::common::BinaryOp::Equal, r));
-                let end = self.insts.len();
+                let end = self.emit.insts.len();
                 self.patch_label_at(jump_idx, end);
                 // If short-circuited, dst is false (copy l)
                 Ok(dst)
@@ -164,7 +194,7 @@ impl MirExprLowerer {
                 let dst = self.alloc_reg();
                 // If left is true, skip right
                 self.emit(MirInst::JumpIf(l, 0)); // placeholder
-                let jump_idx = self.insts.len() - 1;
+                let jump_idx = self.emit.insts.len() - 1;
                 let r = self.lower_expr(right)?;
                 self.emit(MirInst::BinaryOp(
                     dst,
@@ -172,7 +202,7 @@ impl MirExprLowerer {
                     crate::common::BinaryOp::NotEqual,
                     r,
                 ));
-                let end = self.insts.len();
+                let end = self.emit.insts.len();
                 self.patch_label_at(jump_idx, end);
                 Ok(dst)
             }
@@ -260,7 +290,7 @@ impl MirExprLowerer {
                 let c = self.lower_expr(cond)?;
                 // JumpIfNot to else branch
                 self.emit(MirInst::JumpIfNot(c, 0)); // placeholder
-                let jumpifnot_idx = self.insts.len() - 1;
+                let jumpifnot_idx = self.emit.insts.len() - 1;
 
                 // Then branch
                 let then_dst = self.lower_expr(then)?;
@@ -268,10 +298,10 @@ impl MirExprLowerer {
                 self.emit(MirInst::Assign("__if_result".to_string(), then_dst));
                 // Jump to end
                 self.emit(MirInst::Jump(0)); // placeholder
-                let jump_end_idx = self.insts.len() - 1;
+                let jump_end_idx = self.emit.insts.len() - 1;
 
                 // Else branch
-                let else_start = self.insts.len();
+                let else_start = self.emit.insts.len();
                 self.patch_label_at(jumpifnot_idx, else_start);
                 if let Some(else_expr) = r#else {
                     let else_dst = self.lower_expr(else_expr)?;
@@ -280,7 +310,7 @@ impl MirExprLowerer {
                     self.emit(MirInst::Assign("__if_result".to_string(), 0));
                 }
                 // End
-                let end = self.insts.len();
+                let end = self.emit.insts.len();
                 self.patch_label_at(jump_end_idx, end);
                 self.emit(MirInst::Var(dst, "__if_result".to_string()));
                 Ok(dst)
@@ -326,7 +356,7 @@ impl MirExprLowerer {
                 self.emit(MirInst::Const(one_reg, Value::Int(1)));
 
                 // loop_label: continue target
-                let loop_label = self.insts.len();
+                let loop_label = self.emit.insts.len();
                 // cond = i >= len
                 let cond_reg = self.alloc_reg();
                 self.emit(MirInst::BinaryOp(
@@ -337,7 +367,7 @@ impl MirExprLowerer {
                 ));
                 // if cond: goto end
                 self.emit(MirInst::JumpIf(cond_reg, 0));
-                let exit_jump_idx = self.insts.len() - 1;
+                let exit_jump_idx = self.emit.insts.len() - 1;
 
                 // x = iter[i]
                 let x_reg = self.alloc_reg();
@@ -345,11 +375,11 @@ impl MirExprLowerer {
                 self.emit(MirInst::Define(var.clone(), x_reg));
 
                 // body
-                let body_start = self.insts.len();
-                self.loop_stack.push((loop_label, 0));
+                let body_start = self.emit.insts.len();
+                self.emit.loop_stack.push((loop_label, 0));
                 let _ = self.lower_expr(body)?;
-                self.loop_stack.pop();
-                let body_end = self.insts.len();
+                self.emit.loop_stack.pop();
+                let body_end = self.emit.insts.len();
 
                 // incr: i = i + 1; goto loop
                 self.emit(MirInst::BinaryOp(
@@ -361,11 +391,11 @@ impl MirExprLowerer {
                 self.emit(MirInst::Jump(loop_label));
 
                 // end_label: break target
-                let end_label = self.insts.len();
+                let end_label = self.emit.insts.len();
                 self.patch_label_at(exit_jump_idx, end_label);
                 // Patch break labels in body
                 for i in body_start..body_end {
-                    match &mut self.insts[i] {
+                    match &mut self.emit.insts[i] {
                         MirInst::Break(lbl) => *lbl = end_label,
                         MirInst::Continue(lbl) => *lbl = loop_label,
                         _ => {}
@@ -378,23 +408,23 @@ impl MirExprLowerer {
 
             // ── While loop ──
             MirExprKind::While { cond, body } => {
-                let loop_label = self.insts.len();
+                let loop_label = self.emit.insts.len();
                 let c = self.lower_expr(cond)?;
                 self.emit(MirInst::JumpIfNot(c, 0)); // placeholder
-                let exit_jump_idx = self.insts.len() - 1;
+                let exit_jump_idx = self.emit.insts.len() - 1;
 
-                let body_start = self.insts.len();
-                self.loop_stack.push((loop_label, 0));
+                let body_start = self.emit.insts.len();
+                self.emit.loop_stack.push((loop_label, 0));
                 let _ = self.lower_expr(body)?;
-                self.loop_stack.pop();
-                let body_end = self.insts.len();
+                self.emit.loop_stack.pop();
+                let body_end = self.emit.insts.len();
 
                 self.emit(MirInst::Jump(loop_label));
-                let end_label = self.insts.len();
+                let end_label = self.emit.insts.len();
                 self.patch_label_at(exit_jump_idx, end_label);
                 // Patch break/continue
                 for i in body_start..body_end {
-                    match &mut self.insts[i] {
+                    match &mut self.emit.insts[i] {
                         MirInst::Break(lbl) => *lbl = end_label,
                         MirInst::Continue(lbl) => *lbl = loop_label,
                         _ => {}
@@ -536,6 +566,7 @@ impl MirExprLowerer {
             }
             MirExprKind::Break(_label) => {
                 let (_, brk) = self
+                    .emit
                     .loop_stack
                     .last()
                     .copied()
@@ -547,6 +578,7 @@ impl MirExprLowerer {
             }
             MirExprKind::Continue(_label) => {
                 let (cont, _) = self
+                    .emit
                     .loop_stack
                     .last()
                     .copied()

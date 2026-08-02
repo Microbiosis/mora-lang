@@ -20,6 +20,20 @@ impl ParserV3 {
         Self { tokens, current: 0 }
     }
 
+    /// v0.75.39: 单遍编译入口（阶段 3 融合 lower 的目标形态）。
+    ///
+    /// 当前实现：parse → lower → from_exprs（现路径桥接），验证接口形状；
+    /// 阶段 3 逐步融合后，此函数直接 emit MirInst + 并行产出 witness，
+    /// MirExpr 中间层消失。差分测试锁定 compile 与 parse→lower 等价。
+    pub fn compile(source: &str) -> Result<(crate::mir::MirFunction, Vec<crate::mir::witness::MirWitness>), String> {
+        use crate::lexer::Lexer;
+        let tokens = Lexer::new(source).scan_tokens();
+        let exprs = ParserV3::new(tokens).parse().map_err(|e| e.0)?;
+        let func = crate::mir::lower::lower_mir_exprs(&exprs)?;
+        let witnesses = crate::mir::witness::MirWitness::from_exprs(&exprs);
+        Ok((func, witnesses))
+    }
+
     /// Parse complete program into Vec<MirExpr>
     pub fn parse(mut self) -> Result<Vec<MirExpr>, ParseError> {
         let mut exprs = Vec::new();

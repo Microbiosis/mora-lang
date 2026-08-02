@@ -2,6 +2,51 @@
 
 All notable changes to Mora will be documented in this file.
 
+## [v0.75.43] — 2026-08-02 — copy-and-patch JIT（阶段 5 落地，零 LLVM 依赖）
+
+（JIT 路线最终形态：**手写机器码模板 + 可执行内存拼接**，CPython
+3.13+/PEP 744 模式。v0.75.34-37 的 inkwell/LLVM 依赖彻底删除 —
+`--all-features` 恢复可编译（此前本机直接编译失败）。）
+
+### Removed — LLVM 依赖（Cargo.toml）
+- 删 `jit = ["dep:inkwell"]` feature + `[dependencies.inkwell]`（LLVM
+  22 绑定，Windows 需 MSYS2 系统库，本机不可用）。jit.rs 从「LLVM 占位
+  stub」重写为纯 std 实现，**零外部依赖始终编译**。
+
+### Added — copy-and-patch JIT 核心（src/mir/jit.rs，+430 行）
+- **ExecMem**：VirtualAlloc（Windows）/ mmap（unix）可执行内存，零依赖
+  W^X 取舍：直接 PAGE_EXECUTE_READWRITE（v1 模板，可后续改双阶段）。
+- **JitValue**：`{tag, payload}` 16 字节 repr(C) 槽，标签联合
+  （Int/Float/Bool/Nil）。
+- **Code 发射器**：x86-64 字节序列 + 跳转 patch 簿（copy 模板 + patch
+  寄存器位移/常量立即数/相对偏移）。
+- **v1 可编译子集**：`Const`（立即数）+ `BinaryOp` **Float×Float**
+  （SSE2 addsd/subsd/mulsd/divsd + comisd/setcc 比较）。**Float 除零 =
+  IEEE inf、NaN 比较 = false（NotEqual 例外 = true）**，与解释器语义
+  精确一致。
+- **bail 机制**：类型不匹配（动态）→ 生成代码置 `state.bail` 跳回 →
+  run_jit 返回 Err → 调用方回落 run_mir。
+- **编译期拒绝**：Int×Int 算术（i64 round 语义）/ Mod（无 fmod）/
+  Var/Define/调用/效果/控制流 → 直接 Err（解释器兜底语义正确性）。
+- **平台**：Windows x64 / SysV 双调用约定（rcx/rdi 区分）；非 x86-64
+  编译期拒绝回落。
+
+### Changed — 调用面（src/mir/handlers.rs）
+- `h_with_config` jit 分支：删 SSA 构造 + typeinfer，直接
+  `run_jit(body, ...)`；Err 回落 run_mir（行为语义不变）。
+
+### Added — 差分测试（tests/jit_compile.rs，5 测试）
+- 手工构造 MirFunction（绕过 lower 常量折叠）测模板发射：Float 算术
+  （含除零 inf）、6 比较操作符、NaN 全矩阵（comisd 无序路径）。
+- lower 折叠输入全链路一致性（常量折叠后全 Const）。
+- 不可编译子集拒绝（Int×Int / Mod / Var / 调用）。
+
+### 修复（模板调试实录，cargo test 锁定）
+- jnp NaN 修正不可靠（PF 仅无序时置位）→ 改 setb∧sete（ZF∧CF 无歧义）。
+- `movq r11,xmm1` REX 错位（0x49 扩 rm 而非 reg）→ 弃用 SSE 方案。
+- 8 位寄存器操作 REX：`and r8b,r9b` 需 0x45（W 必须 0；0x4E 变 64 位
+  and、0x0A/0x0E 非 REX 前缀）+ reg 位 → 污染 rcx 的 arg 指针崩溃。
+
 ## [v0.75.42] — 2026-08-02 — 运行态零 AST 收尾（阶段 4）
 
 （阶段 4 探查结论 + 清理：MirExpr **无求值器**（v0.55 已删执行语义），

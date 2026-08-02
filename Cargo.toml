@@ -91,15 +91,6 @@ proptest = "1.7"
 
 [features]
 checkpoint-sqlite = ["rusqlite"]
-# α.8: JIT 编译（SSA → LLVM IR → native）
-jit = ["dep:inkwell"]
-
-[dependencies.inkwell]
-# v0.75.34: LLVM 17 → 22 升级 — inkwell 0.5 → 0.9（feature 命名 llvm17-0 → llvm22-1）。
-# 无 API 迁移成本：jit.rs 中 inkwell 仅注释占位（run_jit 返回 Err），零活调用。
-# 动机：llvm-sys 170 在 Windows 需 LLVM 17 系统库（本机仅有 LLVM 22），
-# 升级后 `cargo clippy --all-features` 可在本机运行（MSYS2 llvm 22.1.x 提供 llvm-config）。
-version = "0.9"
-default-features = false
-features = ["llvm22-1"]
-optional = true
+# v0.75.43: copy-and-patch JIT 零外部依赖（纯 std + 手写机器码模板），
+# 无 feature gate — 始终编译，未覆盖指令自动回落 MIR 解释器。
+# （v0.75.34 前的 jit = ["dep:inkwell"] LLVM 路线已废弃删除。）

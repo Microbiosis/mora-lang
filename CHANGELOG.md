@@ -2,6 +2,49 @@
 
 All notable changes to Mora will be documented in this file.
 
+## [v0.75.36] — 2026-08-02 — inkwell 升级 LLVM 17→22（占位）+ JIT 路线转向 copy-and-patch
+
+### Changed — inkwell 0.5 → 0.9（Cargo.toml / Cargo.lock）
+- `llvm17-0` → `llvm22-1` feature，llvm-sys 170 → 221。零 API 迁移成本
+  （jit.rs 的 inkwell 全在注释占位，`run_jit` 是返回 Err 的 stub，无活调用）。
+- 动机：llvm-sys 170 在 Windows 需 LLVM 17 系统库（本机仅有 LLVM 22），
+  且所有 Windows 预编译 LLVM 分发不含 `llvm-config`（llvm-sys 构建必需），
+  本地 `--all-features` 编译不了 jit——这是长期状态，非本次引入。
+- **保留为占位**：验证 `--all-features` 交给 CI（ubuntu apt 有 LLVM 22，
+  CI 已配置该命令）。jit.rs 错误提示文本同步更新为 LLVM 22。
+
+### Changed — JIT 路线决策（调研 CPython 3.13+/PEP 744 后）
+- 现状：mora 后端 = MIR 字节码解释器（ParserV3 → MirInst → run_mir），
+  零 LLVM 运行时依赖。`jit` feature 是 stub。
+- **新路线：copy-and-patch JIT**（CPython 3.13+ 采用，PEP 744/836）。
+  把每个 MirInst 预编译成机器码模板（blob），运行时拼接+打补丁 —
+  **运行时零 LLVM 依赖**（LLVM 仅构建期工具），生成代码比 LLVM -O0
+  快两个数量级。契合「运行时最小化 + 零成本抽象默认」哲学。
+- 影响：mora 的 JIT 不需要背巨型 LLVM 依赖；inkwell 升级仅作过渡占位，
+  新路线落地时移除。本变更记录决策依据（AGENTS.md 信息搜索实证）。
+
+## [v0.75.35] — 2026-08-02 — Sequential orchestrate pipeline 执行（缺口 c 完成）
+
+（阶段 1「清剩余缺口」收官：b 与 c 均已修复，orchestrate 12/12 全绿。）
+
+### Added — h_orchestrate Sequential 分支（src/mir/handlers.rs）
+- pipeline 语义：agent task_body 按声明顺序执行，前输出作后输入
+  （`input` 变量契约，沿用 pregel 注入方式），最终 result 写入 result_var。
+  每 agent 独立 env 克隆，agent 期间 define 的变量合并回父 env
+  （与 pregel reconcile_outcome 写回语义一致）。
+- 此前 `MirOrchestrateKind::Sequential` 走 "not yet supported"（handlers.rs:669
+  只实现 Pregel）。
+
+### Fixed — typeck orchestrate 变量声明（src/typeck/hm/mod.rs）
+- `orchestrate ... input -> result` 语义上声明 input_var/result_var，但
+  `infer_expr` 只返回 Nil 不登记变量 → CLI 路径引用 result 报
+  UnboundVariable（测试走 run_mir 绕过 typeck 未暴露）。登记为 Any。
+
+### Tests
+- 激活 3 个被 ignore 的测试：Sequential 执行、for/while 循环累加
+  （缺口 b 修复后累加正确，输出 6/45 而非 0/nil）。
+- orchestrate 12/12、tier1_typeck 32/32、tier2 62/62、clippy 0。
+
 ## [v0.75.34] — 2026-08-02 — DAG 循环执行修复（CSE 重命名 + 块内全序 + 方法调用）
 
 （清剩余缺口 b：循环在 DAG 执行路径上不累加/提前读脏值。根因跨 6 层，

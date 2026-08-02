@@ -1,13 +1,12 @@
-//! v0.55: Parser V3 / MirExpr LSP data accessor.
+//! v0.55: Parser V3 / MirWitness LSP data accessor.
 //!
-//! `parsed_doc_v3` is the MirExpr counterpart of the historical
+//! `parsed_doc_v3` is the MirWitness counterpart of the historical
 //! `parsed_doc_v2` helper. Every LSP provider in this folder should pull
 //! its parsed data through this function so the cache, the parser, and
 //! the typeck layer stay in sync.
 //!
-//! v0.75.38: 消费面迁移至 MirWitness（轻量树骨架）。parse 层仍产出
-//! MirExpr，此处经 `from_exprs` 桥接转换为 witness；阶段 3 parser
-//! 直接产出 witness 时去掉转换。
+//! v0.75.42: 单遍编译 — ParserV3::compile 直接产出 witness（零 MirExpr
+//! 桥接），解析失败返回 None（与旧 parse 路径一致）。
 
 use std::collections::HashMap;
 
@@ -22,13 +21,8 @@ pub fn parsed_doc_v3(
     uri: &str,
 ) -> Option<(String, Vec<MirWitness>)> {
     let doc = docs.get(uri)?;
-    // Parse MirExpr from text (no cache in DocumentState yet)
-    use crate::lexer::Lexer;
-    use crate::parser_v3::ParserV3;
-    let tokens = Lexer::new(&doc.text).scan_tokens();
-    let parser = ParserV3::new(tokens);
-    let exprs = parser.parse().ok()?;
-    Some((doc.text.clone(), MirWitness::from_exprs(&exprs)))
+    let (_, witnesses) = crate::parser_v3::ParserV3::compile(&doc.text).ok()?;
+    Some((doc.text.clone(), witnesses))
 }
 
 ///  Walks the entire MirWitness tree and invokes `visit` for every

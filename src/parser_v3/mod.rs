@@ -1762,7 +1762,6 @@ impl ParserV3 {
                             body: vec![],
                             n_regs: 0,
                         },
-                        task_mir_expr: None,
                         combiner_body: None,
                     });
                 MirOrchestrateKind::Loop {
@@ -1854,7 +1853,6 @@ impl ParserV3 {
             }
         };
 
-        let task_mir = Some(body.clone());
         // v0.75.32: 修复 task_expr → task_body 降级缺失 — 此前 task_body 恒空
         // （pregel 执行报 "lowering missing"）。产出时立即 lower 填入；
         // 失败兜底为空（保持旧行为，pregel 端仍会报真降级错误）。
@@ -1870,7 +1868,6 @@ impl ParserV3 {
             task_expr: body,
             verify_expr: None,
             task_body: lowered_body,
-            task_mir_expr: task_mir,
             combiner_body: None,
         })
     }

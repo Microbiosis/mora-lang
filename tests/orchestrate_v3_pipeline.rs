@@ -45,8 +45,6 @@ end
                 MirOrchestrateKind::Sequential { agents } => {
                     assert_eq!(agents.len(), 1);
                     assert_eq!(agents[0].name, "a");
-                    // v0.55: agent body MirExpr is preserved
-                    assert!(agents[0].task_mir_expr.is_some());
                     // v0.75.32: task_body 在 parse 阶段即被 lower 填充（此前恒空，
                     // pregel 报 "lowering missing"）。语义与旧 ignore 测试的
                     // 「lower 后非空」断言一致，仅时间点提前。
@@ -85,7 +83,6 @@ end
                 MirOrchestrateKind::Pregel { agents, edges, .. } => {
                     assert_eq!(agents.len(), 1);
                     assert_eq!(agents[0].name, "a");
-                    assert!(agents[0].task_mir_expr.is_some());
                     assert_eq!(edges.len(), 1);
                     assert_eq!(edges[0].from, "@start");
                     assert_eq!(edges[0].to, "a");
@@ -145,9 +142,6 @@ end
                     !agents[1].task_body.body.is_empty(),
                     "agent 'b' task_body should be lowered"
                 );
-                // v0.75.32: task_mir_expr 在 lower 中零消费（透传保留 Some）—
-                // 该字段为设计占位，无消费者；断言反映真实行为而非旧设计意图。
-                assert!(agents[0].task_mir_expr.is_some());
             }
             _ => panic!("expected Sequential kind"),
         }

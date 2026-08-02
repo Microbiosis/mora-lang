@@ -291,7 +291,6 @@ mod tests {
                         body: Vec::new(),
                         n_regs: 0,
                     },
-                    task_mir_expr: None,
                     combiner_body: None,
                 })
                 .collect()

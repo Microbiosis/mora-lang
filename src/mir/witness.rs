@@ -483,7 +483,6 @@ pub struct WitnessAgentDef {
     pub verify_expr: Option<MirWitness>,
     pub with_config: Option<std::collections::HashMap<String, MirWitness>>,
     pub task_body: MirFunction,
-    pub task_mir_expr: Option<MirExpr>,
     pub combiner_body: Option<MirFunction>,
 }
 
@@ -499,7 +498,6 @@ impl WitnessAgentDef {
                     .collect()
             }),
             task_body: agent.task_body.clone(),
-            task_mir_expr: agent.task_mir_expr.clone(),
             combiner_body: agent.combiner_body.clone(),
         }
     }

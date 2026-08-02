@@ -2,6 +2,31 @@
 
 All notable changes to Mora will be documented in this file.
 
+## [v0.75.37] — 2026-08-02 — 生产 unwrap 清理 + typeck 死代码移除（审查报告既存项）
+
+（依据架构审查报告 3.3–3.6 与改进建议 P2-3，清理既存质量问题。
+不涉及行为变更——所有替换等价，死代码移除由编译验证。）
+
+### Changed — 生产代码 unwrap → expect（AGENTS.md §3）
+- `trace_collector.rs` 10 处 `.lock().unwrap()` → `.expect("trace collector
+  poisoned")`：std Mutex 中毒后无恢复路径，是最高频连锁 panic 风险点。
+- `worker_pool.rs` 2 处（rx/queue 锁）：worker 线程内中毒致线程退出。
+- `orchestrate_dag/mod.rs` 2 处 `get_mut().unwrap()` → expect（validate()
+  已保证结构不变量）。
+- `mir/ssa.rs` 3 处 `last().unwrap()` → expect（is_empty 前置检查）。
+- `parser_v3/mod.rs`、`compress/json.rs` 各 1 处 → expect。
+- `typeck/hm/mod.rs` `solve_constraints`：消除「if let Err 后 else 重复
+  solve + unwrap」的重复调用，改单次 match。
+
+### Removed — typeck/mod.rs 死代码（-395 行）
+- `TypeChecker` / `LifetimeEnv` / `BorrowChecker` / `TraitTypeDef` /
+  `substitute_type_hint` / `type_to_hint_string`（~400 行，零外部调用，
+  唯一入口 `check_program_mir` 存活）。移除 12 处 `#[allow(dead_code)]`。
+
+### 验证
+- clippy 0 / fmt 0 / 编译全绿。
+- tier1_typeck 32、tier2 62、parser_v3_coverage 4 通过。
+
 ## [v0.75.36] — 2026-08-02 — inkwell 升级 LLVM 17→22（占位）+ JIT 路线转向 copy-and-patch
 
 ### Changed — inkwell 0.5 → 0.9（Cargo.toml / Cargo.lock）

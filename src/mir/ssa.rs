@@ -922,13 +922,13 @@ fn rename_variables(blocks: &mut [BasicBlock], phi_map: &HashMap<(BlockId, SsaRe
             Terminator::JumpIf(cond, _, _) | Terminator::JumpIfNot(cond, _, _) => {
                 let old = *cond;
                 if old < rename_stack.len() && !rename_stack[old].is_empty() {
-                    *cond = *rename_stack[old].last().unwrap();
+                    *cond = *rename_stack[old].last().expect("is_empty checked above");
                 }
             }
             Terminator::Return(Some(reg)) => {
                 let old = *reg;
                 if old < rename_stack.len() && !rename_stack[old].is_empty() {
-                    *reg = *rename_stack[old].last().unwrap();
+                    *reg = *rename_stack[old].last().expect("is_empty checked above");
                 }
             }
             _ => {}
@@ -963,7 +963,7 @@ fn set_dst(inst: &mut SsaInst, d: SsaReg) {
 fn rename_reads(inst: &mut SsaInst, stack: &[Vec<SsaReg>]) {
     fn resolve(reg: SsaReg, stack: &[Vec<SsaReg>]) -> SsaReg {
         if reg < stack.len() && !stack[reg].is_empty() {
-            *stack[reg].last().unwrap()
+            *stack[reg].last().expect("is_empty checked above")
         } else {
             reg
         }

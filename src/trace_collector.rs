@@ -71,12 +71,12 @@ impl TraceCollector {
     }
 
     pub fn is_enabled(&self) -> bool {
-        self.inner.lock().unwrap().enabled
+        self.inner.lock().expect("trace collector poisoned").enabled
     }
 
     /// 开始一个 span
     pub fn start_span(&self, name: &str, _attributes: HashMap<String, String>) -> SpanHandle {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().expect("trace collector poisoned");
         if !inner.enabled {
             return SpanHandle {
                 trace_id: String::new(),
@@ -100,13 +100,13 @@ impl TraceCollector {
 
     /// v0.04 Slice 3: 启用/禁用 trace (不丢已有 spans)
     pub fn set_enabled(&self, enabled: bool) {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().expect("trace collector poisoned");
         inner.enabled = enabled;
     }
 
     /// v0.04 Slice 3: 设置 OTEL endpoint
     pub fn set_otel_endpoint(&self, endpoint: String) {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().expect("trace collector poisoned");
         inner.otel_endpoint = Some(endpoint);
     }
 
@@ -117,7 +117,7 @@ impl TraceCollector {
         status: SpanStatus,
         attributes: HashMap<String, String>,
     ) {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().expect("trace collector poisoned");
         if !inner.enabled {
             return;
         }
@@ -137,14 +137,14 @@ impl TraceCollector {
 
     /// 记录 token 消耗
     pub fn record_tokens(&self, input: u64, output: u64) {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().expect("trace collector poisoned");
         inner.metrics.total_input_tokens += input;
         inner.metrics.total_output_tokens += output;
     }
 
     /// 记录调用
     pub fn record_call(&self, call_type: &str, latency: Duration, success: bool) {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().expect("trace collector poisoned");
         inner.metrics.total_calls += 1;
         match call_type {
             "ai.chat" => inner.metrics.ai_chat_calls += 1,
@@ -163,12 +163,16 @@ impl TraceCollector {
 
     /// 获取指标快照
     pub fn get_metrics(&self) -> Metrics {
-        self.inner.lock().unwrap().metrics.clone()
+        self.inner
+            .lock()
+            .expect("trace collector poisoned")
+            .metrics
+            .clone()
     }
 
     /// 获取所有 spans（JSON 数组格式）
     pub fn get_spans_json(&self) -> String {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner.lock().expect("trace collector poisoned");
         let spans: Vec<String> = inner.spans.iter().map(|s| {
             let attrs: Vec<String> = s.attributes.iter()
                 .map(|(k, v)| format!("\"{}\":\"{}\"", escape_json(k), escape_json(v)))
@@ -188,7 +192,7 @@ impl TraceCollector {
 
     /// 导出为 OpenTelemetry JSON 格式
     pub fn export_otel_json(&self) -> String {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner.lock().expect("trace collector poisoned");
         let spans: Vec<String> = inner.spans.iter().map(|s| {
             format!(
                 r#"{{"name":"{}","traceId":"{}","spanId":"{}","startTimeUnixNano":"0","endTimeUnixNano":"{}","status":{{"code":"{}"}}}}"#,

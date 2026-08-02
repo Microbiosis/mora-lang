@@ -4,19 +4,23 @@
 //! `parsed_doc_v2` helper. Every LSP provider in this folder should pull
 //! its parsed data through this function so the cache, the parser, and
 //! the typeck layer stay in sync.
+//!
+//! v0.75.38: 消费面迁移至 MirWitness（轻量树骨架）。parse 层仍产出
+//! MirExpr，此处经 `from_exprs` 桥接转换为 witness；阶段 3 parser
+//! 直接产出 witness 时去掉转换。
 
 use std::collections::HashMap;
 
 use crate::lsp::json::Value as JsonValue;
 use crate::lsp::server::DocumentState;
-use crate::mir::MirExpr;
+use crate::mir::witness::{MirWitness, WitnessKind, WitnessOrchestrateKind};
 
-///  Look up and parse MirExpr list for `uri`.
+///  Look up and parse MirWitness list for `uri`.
 ///  Returns `None` when the document has not been opened yet or parse fails.
 pub fn parsed_doc_v3(
     docs: &HashMap<String, DocumentState>,
     uri: &str,
-) -> Option<(String, Vec<MirExpr>)> {
+) -> Option<(String, Vec<MirWitness>)> {
     let doc = docs.get(uri)?;
     // Parse MirExpr from text (no cache in DocumentState yet)
     use crate::lexer::Lexer;
@@ -24,124 +28,115 @@ pub fn parsed_doc_v3(
     let tokens = Lexer::new(&doc.text).scan_tokens();
     let parser = ParserV3::new(tokens);
     let exprs = parser.parse().ok()?;
-    Some((doc.text.clone(), exprs))
+    Some((doc.text.clone(), MirWitness::from_exprs(&exprs)))
 }
 
-///  Walks the entire MirExpr tree and invokes `visit` for every
-///  [`MirExpr`] node. Used by the references, rename, and semantic
+///  Walks the entire MirWitness tree and invokes `visit` for every
+///  [`MirWitness`] node. Used by the references, rename, and semantic
 ///  providers to avoid recursive duplication.
-pub fn walk_mir_expr<F: FnMut(&MirExpr)>(expr: &MirExpr, visit: &mut F) {
+pub fn walk_witness<F: FnMut(&MirWitness)>(expr: &MirWitness, visit: &mut F) {
     visit(expr);
-    walk_mir_expr_kind(&expr.kind, visit);
+    walk_witness_kind(&expr.kind, visit);
 }
 
-fn walk_mir_expr_kind<F: FnMut(&MirExpr)>(kind: &crate::mir::expr::MirExprKind, visit: &mut F) {
-    use crate::mir::expr::MirExprKind;
+fn walk_witness_kind<F: FnMut(&MirWitness)>(kind: &WitnessKind, visit: &mut F) {
     match kind {
-        MirExprKind::Literal(_) | MirExprKind::Variable(_) => {}
-        MirExprKind::Binary { left, right, .. } => {
-            walk_mir_expr(left, visit);
-            walk_mir_expr(right, visit);
+        WitnessKind::Literal(_) | WitnessKind::Variable(_) => {}
+        WitnessKind::Binary { left, right, .. } => {
+            walk_witness(left, visit);
+            walk_witness(right, visit);
         }
-        MirExprKind::Call { args, .. } => {
+        WitnessKind::Call { args, .. } => {
             for arg in args {
-                walk_mir_expr(arg, visit);
+                walk_witness(arg, visit);
             }
         }
-        MirExprKind::MethodCall { receiver, args, .. } => {
-            walk_mir_expr(receiver, visit);
+        WitnessKind::MethodCall { receiver, args, .. } => {
+            walk_witness(receiver, visit);
             for arg in args {
-                walk_mir_expr(arg, visit);
+                walk_witness(arg, visit);
             }
         }
-        MirExprKind::Closure { body, .. } => walk_mir_expr(body, visit),
-        MirExprKind::FnDef { body, .. } => walk_mir_expr(body, visit),
-        MirExprKind::Match { scrutinee, arms } => {
-            walk_mir_expr(scrutinee, visit);
+        WitnessKind::Closure { body, .. } => walk_witness(body, visit),
+        WitnessKind::FnDef { body, .. } => walk_witness(body, visit),
+        WitnessKind::Match { scrutinee, arms } => {
+            walk_witness(scrutinee, visit);
             for arm in arms {
-                walk_mir_expr(&arm.body, visit);
+                walk_witness(&arm.body, visit);
             }
         }
-        MirExprKind::If { cond, then, r#else } => {
-            walk_mir_expr(cond, visit);
-            walk_mir_expr(then, visit);
+        WitnessKind::If { cond, then, r#else } => {
+            walk_witness(cond, visit);
+            walk_witness(then, visit);
             if let Some(e) = r#else {
-                walk_mir_expr(e, visit);
+                walk_witness(e, visit);
             }
         }
-        MirExprKind::List(items) => {
+        WitnessKind::List(items) => {
             for item in items {
-                walk_mir_expr(item, visit);
+                walk_witness(item, visit);
             }
         }
-        MirExprKind::Dict(entries) => {
+        WitnessKind::Dict(entries) => {
             for (_, value) in entries {
-                walk_mir_expr(value, visit);
+                walk_witness(value, visit);
             }
         }
-        MirExprKind::DynTrait { expr, .. } => walk_mir_expr(expr, visit),
-        MirExprKind::Prompt { parts } => {
+        WitnessKind::DynTrait { expr, .. } => walk_witness(expr, visit),
+        WitnessKind::Prompt { parts } => {
             for part in parts {
-                walk_mir_expr(part, visit);
+                walk_witness(part, visit);
             }
         }
-        MirExprKind::LetBinding {
+        WitnessKind::LetBinding {
             value, init_body, ..
         } => {
-            walk_mir_expr(value, visit);
-            walk_mir_expr(init_body, visit);
+            walk_witness(value, visit);
+            walk_witness(init_body, visit);
         }
-        MirExprKind::Assign { value, .. } => walk_mir_expr(value, visit),
-        MirExprKind::Orchestrate { kind, .. } => walk_mir_orchestrate(kind, visit),
-        MirExprKind::Loop {
-            var: _,
-            iterable,
-            body,
-        } => {
-            walk_mir_expr(iterable, visit);
-            walk_mir_expr(body, visit);
+        WitnessKind::Assign { value, .. } => walk_witness(value, visit),
+        WitnessKind::Orchestrate { kind, .. } => walk_witness_orchestrate(kind, visit),
+        WitnessKind::Loop { iterable, body, .. } => {
+            walk_witness(iterable, visit);
+            walk_witness(body, visit);
         }
-        MirExprKind::While { cond, body } => {
-            walk_mir_expr(cond, visit);
-            walk_mir_expr(body, visit);
+        WitnessKind::While { cond, body } => {
+            walk_witness(cond, visit);
+            walk_witness(body, visit);
         }
-        MirExprKind::Or { left, right } | MirExprKind::And { left, right } => {
-            walk_mir_expr(left, visit);
-            walk_mir_expr(right, visit);
+        WitnessKind::Or { left, right } | WitnessKind::And { left, right } => {
+            walk_witness(left, visit);
+            walk_witness(right, visit);
         }
-        MirExprKind::Return(value) => {
+        WitnessKind::Return(value) => {
             if let Some(v) = value {
-                walk_mir_expr(v, visit);
+                walk_witness(v, visit);
             }
         }
-        MirExprKind::Break(_) | MirExprKind::Continue(_) => {}
-        MirExprKind::IndexAssign {
+        WitnessKind::Break(_) | WitnessKind::Continue(_) => {}
+        WitnessKind::IndexAssign {
             object,
             index,
             value,
         } => {
-            walk_mir_expr(object, visit);
-            walk_mir_expr(index, visit);
-            walk_mir_expr(value, visit);
+            walk_witness(object, visit);
+            walk_witness(index, visit);
+            walk_witness(value, visit);
         }
-        MirExprKind::TypeAlias { .. }
-        | MirExprKind::EnumDef { .. }
-        | MirExprKind::StructDef { .. }
-        | MirExprKind::Import(_)
-        | MirExprKind::MacroDef { .. }
-        | MirExprKind::Sequence(_) => {}
+        WitnessKind::TypeAlias { .. }
+        | WitnessKind::EnumDef { .. }
+        | WitnessKind::StructDef { .. }
+        | WitnessKind::Import(_)
+        | WitnessKind::MacroDef { .. }
+        | WitnessKind::Sequence(_) => {}
     }
 }
 
-fn walk_mir_orchestrate(
-    kind: &crate::mir::expr::MirOrchestrateKind,
-    visit: &mut dyn FnMut(&MirExpr),
-) {
-    use crate::mir::expr::MirOrchestrateKind;
+fn walk_witness_orchestrate(kind: &WitnessOrchestrateKind, visit: &mut dyn FnMut(&MirWitness)) {
     match kind {
-        MirOrchestrateKind::Sequential { agents }
-        | MirOrchestrateKind::Graph { agents, .. }
-        | MirOrchestrateKind::Pregel { agents, .. } => {
+        WitnessOrchestrateKind::Sequential { agents }
+        | WitnessOrchestrateKind::Graph { agents, .. }
+        | WitnessOrchestrateKind::Pregel { agents, .. } => {
             for a in agents {
                 visit(&a.task_expr);
                 if let Some(v) = &a.verify_expr {
@@ -154,7 +149,7 @@ fn walk_mir_orchestrate(
                 }
             }
         }
-        MirOrchestrateKind::Loop {
+        WitnessOrchestrateKind::Loop {
             agents, exit_when, ..
         } => {
             for agent in agents {
@@ -177,7 +172,7 @@ fn walk_mir_orchestrate(
 
 ///  Collect every `(name, span)` pair introduced by `let` bindings or
 ///  `fn` definitions in the program. Used by completion/definition/hover.
-pub fn collect_definitions_v3(exprs: &[MirExpr]) -> Vec<(String, crate::common::Span)> {
+pub fn collect_definitions_v3(exprs: &[MirWitness]) -> Vec<(String, crate::common::Span)> {
     let mut out = Vec::new();
     for expr in exprs {
         collect_definitions_in_expr(expr, &mut out);
@@ -185,21 +180,21 @@ pub fn collect_definitions_v3(exprs: &[MirExpr]) -> Vec<(String, crate::common::
     out
 }
 
-fn collect_definitions_in_expr(expr: &MirExpr, out: &mut Vec<(String, crate::common::Span)>) {
+fn collect_definitions_in_expr(expr: &MirWitness, out: &mut Vec<(String, crate::common::Span)>) {
     match &expr.kind {
-        crate::mir::expr::MirExprKind::LetBinding { name, .. } => {
+        WitnessKind::LetBinding { name, .. } => {
             out.push((name.clone(), expr.span));
         }
-        crate::mir::expr::MirExprKind::FnDef { name, .. } => {
+        WitnessKind::FnDef { name, .. } => {
             out.push((name.clone(), expr.span));
         }
         _ => {}
     }
-    walk_mir_expr(expr, &mut |e| match &e.kind {
-        crate::mir::expr::MirExprKind::LetBinding { name, .. } => {
+    walk_witness(expr, &mut |e| match &e.kind {
+        WitnessKind::LetBinding { name, .. } => {
             out.push((name.clone(), e.span));
         }
-        crate::mir::expr::MirExprKind::FnDef { name, .. } => {
+        WitnessKind::FnDef { name, .. } => {
             out.push((name.clone(), e.span));
         }
         _ => {}
@@ -207,7 +202,7 @@ fn collect_definitions_in_expr(expr: &MirExpr, out: &mut Vec<(String, crate::com
 }
 
 ///  Collect every read site of `name` across the program.
-pub fn collect_references_v3(exprs: &[MirExpr], name: &str) -> Vec<crate::common::Span> {
+pub fn collect_references_v3(exprs: &[MirWitness], name: &str) -> Vec<crate::common::Span> {
     let mut out = Vec::new();
     for expr in exprs {
         collect_references_in_expr(expr, name, &mut out);
@@ -215,9 +210,9 @@ pub fn collect_references_v3(exprs: &[MirExpr], name: &str) -> Vec<crate::common
     out
 }
 
-fn collect_references_in_expr(expr: &MirExpr, name: &str, out: &mut Vec<crate::common::Span>) {
-    walk_mir_expr(expr, &mut |e| {
-        if let crate::mir::expr::MirExprKind::Variable(n) = &e.kind
+fn collect_references_in_expr(expr: &MirWitness, name: &str, out: &mut Vec<crate::common::Span>) {
+    walk_witness(expr, &mut |e| {
+        if let WitnessKind::Variable(n) = &e.kind
             && n == name
         {
             out.push(e.span);

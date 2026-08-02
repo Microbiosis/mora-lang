@@ -37,7 +37,8 @@ fn extract_module_symbols(exprs: &[MirExpr], pre: &[(String, Type)]) -> Vec<(Str
     for (name, ty) in pre {
         hm.env.add(name.clone(), ty.clone());
     }
-    let _ = hm.infer_program(exprs); // 模块内部错误不在此冒泡（与运行时
+    // v0.75.38: HM 推断消费 MirWitness（桥接转换；parse 层仍产出 MirExpr）
+    let _ = hm.infer_program(&crate::mir::witness::MirWitness::from_exprs(exprs)); // 模块内部错误不在此冒泡（与运行时
     // mir_import 的 `let _type_errs` 一致）
     for (name, ty) in hm.env.all_bindings() {
         syms.push((name, sanitize(&ty)));

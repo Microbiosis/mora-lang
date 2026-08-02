@@ -52,7 +52,6 @@ use crate::mir::MirFunction;
 use crate::typeck::Type;
 use crate::value::{MergeStrategy, Value};
 use std::collections::HashMap;
-use std::sync::Arc;
 
 // ===================================================================
 // Core Expression Types
@@ -111,10 +110,6 @@ impl MirExpr {
             kind: MirExprKind::Closure {
                 params,
                 body: Box::new(body),
-                captured_env: Arc::new(EnvSnapshot {
-                    captured_names: vec![],
-                    captured_values: vec![],
-                }),
             },
             span,
         }
@@ -178,11 +173,11 @@ pub enum MirExprKind {
     },
 
     // Functions/Closures
+    /// v0.75.38: captured_env 已删除 — 全仓库零消费死字段（仅内部构造，
+    /// typeck/lower/parser 均不读取；闭包捕获在运行时由 handler 实现）。
     Closure {
         params: Vec<Param>,
         body: Box<MirExpr>,
-        /// Captured environment snapshot (for closures crossing scopes)
-        captured_env: Arc<EnvSnapshot>,
     },
 
     /// Nested function definition (not closure - has its own scope)
@@ -340,13 +335,6 @@ impl From<MirStmt> for MirInstOrExpr {
 // ===================================================================
 //
 // This module provides MirExpr-native replacements for AST v2 types.
-
-///  Environment snapshot for closures
-#[derive(Debug, Clone, PartialEq)]
-pub struct EnvSnapshot {
-    pub captured_names: Vec<String>,
-    pub captured_values: Vec<Value>,
-}
 
 ///  Function/method call target
 #[derive(Debug, Clone, PartialEq)]

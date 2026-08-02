@@ -1350,7 +1350,6 @@ mod tests {
             verify_expr: None,
             with_config: None,
             task_body: empty_mir_function(),
-            task_mir_expr: None,
             combiner_body: None,
         }
     }
@@ -1573,7 +1572,6 @@ mod tests {
                 ],
                 n_regs: 1,
             },
-            task_mir_expr: None,
             combiner_body: None,
         }
     }
@@ -1682,7 +1680,6 @@ mod tests {
                 verify_expr: None,
                 with_config: None,
                 task_body: failing_body,
-                task_mir_expr: None,
                 combiner_body: None,
             }],
             edges: vec![MirEdgeDef {
@@ -1829,7 +1826,6 @@ mod tests {
                 verify_expr: None,
                 with_config: None,
                 task_body: halt_body,
-                task_mir_expr: None,
                 combiner_body: None,
             }],
             edges: vec![MirEdgeDef {
@@ -2046,7 +2042,6 @@ mod tests {
             verify_expr: None,
             with_config: None,
             task_body: send_body,
-            task_mir_expr: None,
             combiner_body: None,
         };
         let config = MirPregelConfig {
@@ -2116,7 +2111,6 @@ mod tests {
             verify_expr: None,
             with_config: None,
             task_body: send_body,
-            task_mir_expr: None,
             combiner_body: None,
         };
         let config = MirPregelConfig {
@@ -2345,7 +2339,6 @@ mod tests {
             verify_expr: None,
             with_config: None,
             task_body: body,
-            task_mir_expr: None,
             combiner_body: None,
         }
     }

@@ -2,6 +2,37 @@
 
 All notable changes to Mora will be documented in this file.
 
+## [v0.75.42] — 2026-08-02 — 运行态零 AST 收尾（阶段 4）
+
+（阶段 4 探查结论 + 清理：MirExpr **无求值器**（v0.55 已删执行语义），
+运行路径（compile → MirInst → run_mir）零 MirExpr；本次清理最后一处
+LSP 桥接 + 唯一冗余 MirExpr 数据字段。）
+
+### Changed — LSP 零 MirExpr 桥接（src/lsp/providers/parsed_doc_v3.rs）
+- `parsed_doc_v3` 从 `parser.parse()`（MirExpr）+ `from_exprs` 桥接切到
+  `ParserV3::compile` 直接产出 witness — LSP 全部 provider 数据源
+  （folding/semantic/references/rename）不再经 MirExpr 中间层。
+
+### Removed — `MirAgentDef.task_mir_expr`（冗余设计占位）
+- **src/mir/expr/mod.rs**：删 `task_mir_expr: Option<MirExpr>` 字段
+  （v0.75.32 注释自证「lower 中零消费，透传保留 Some」——纯冗余）。
+- **src/mir/witness.rs**：`WitnessAgentDef` 同步删（witness 不再挂
+  MirExpr，轻量树骨架纯度恢复）。
+- **src/parser_v3/mod.rs**：删 `task_mir = Some(body.clone())` 构造 +
+  两处字段初始化（parse_agent_def / orchestrate loop 分支）。
+- **src/pregel/mod.rs**：7 处测试构造初始化删除。
+- **src/mir/optimize/cost.rs**：make_agents 构造同步。
+- **tests/orchestrate_v3_pipeline.rs**：3 处断言删除（is_some + 占位
+  注释），task_body 非空断言保留。
+
+### 架构结论（阶段 4 终局）
+- **运行态零 AST 已达成**：MirExpr 无求值器，compile 直接 emit 指令，
+  执行路径（CLI/REPL/import/LSP/pregel）全程不触碰 MirExpr 树。
+- MirExpr 保留为「数据构造类型」：orchestrate agent 语义数据
+  （task_expr/verify_expr/with_config/exit_when/condition_expr）由
+  parser 构造、witness 镜像（from_expr 转轻量树）、LSP 遍历消费 —
+  无执行语义，阶段 3/4 目标范围内不删。
+
 ## [v0.75.41] — 2026-08-02 — LSP 诊断切 compile（阶段 3 Step 4 收尾）
 
 （LSP `check_diagnostics` 从 parse→typecheck_mir_exprs 双阶段切到

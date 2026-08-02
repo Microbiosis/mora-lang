@@ -462,9 +462,6 @@ pub struct MirAgentDef {
 
     /// Pre-lowered task body (populated during lowering, starts empty)
     pub task_body: MirFunction,
-    /// Task expression in MIR form (consumed during lowering, set to None)
-    pub task_mir_expr: Option<MirExpr>,
-
     /// v0.72: Pre-lowered combiner body. When multiple sends target this
     /// vertex, the engine folds them with `(current, incoming) -> Value`
     /// before delivering. Identity (default): last-write-wins (current = incoming).

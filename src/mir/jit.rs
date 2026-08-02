@@ -20,8 +20,16 @@
 //!     b as f64`。
 //!
 //! 编译期拒绝（回落解释器）：Mixed 类型、Var/Define/调用/效果/控制流、
-//!   其他架构。拒绝总是 Err —— 调用方（h_with_config）回落 `run_mir`，
-//!   语义正确性永远由解释器兜底，JIT 只是加速器。
+//!   其他架构。拒绝总是 [`JitError`]（分类可审计）—— 调用方
+//!   （h_with_config）回落 `run_mir`，语义正确性永远由解释器兜底，
+//!   JIT 只是加速器。
+//!
+//! ## 错误分类（v0.75.50，JitError）
+//! - `CompileReject`：模板集未覆盖（指令/类型/平台/跳转越界）→ 编译期
+//!   即知，稳定可预测
+//! - `GuardFail`：运行期类型标签守卫失败（生成代码置 bail）→ 为
+//!   LuaJIT 式 snapshot/side-exit 打基础
+//! - `InternalInvariant`：基础设施破坏（可执行内存/W^X 失败）→ 环境问题
 //!
 //! ## 寄存器表示
 //! 生成代码操作 `regs: *mut JitValue` 数组（每个槽固定 16 字节，repr(C)
@@ -668,20 +676,186 @@ fn emit_binop_float_cmp(code: &mut Code, dst: Reg, a: Reg, op: crate::common::Bi
     code.store_bool(dst);
 }
 
-/// 线性编译门（两遍）：body ∈ {Const, 同型 BinaryOp, Jump, JumpIf, JumpIfNot}
+// ===================================================================
+// 模板契约（v0.75.50：TemplateSpec + verifier-first，Cranelift 思想）
+// ===================================================================
+
+/// 寄存器线性类型（编译期跟踪；比较结果 Bool 不再参与算术）。
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Ty {
+    Int,
+    Float,
+    Bool,
+}
+
+/// 模板契约 — 每条可编译指令的（操作数类型 → 结果类型）声明。
+/// 单一来源判定：`try_compile` 的 BinaryOp 分支经 `template_for_binary`
+/// 取契约，再分发给对应 emit 函数 —— 新增模板必须先在此登记
+/// （否则 verifier 拒绝，emit 分支只是契约的执行面）。
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum TemplateSpec {
+    ConstInt,
+    ConstFloat,
+    ConstBool,
+    BinopFloatArith, // addsd/subsd/mulsd/divsd → Float
+    BinopFloatCmp,   // comisd+setcc → Bool
+    BinopIntAdd,     // i64 直接加 → Int
+    BinopIntArith,   // f64 round-trip（Sub/Mul/Div）→ Int
+    BinopIntMod,     // trunc 余数序列 → Int
+    BinopIntCmp,     // as f64 比较 → Bool
+    Jump,
+    JumpIf, // cond 须 Bool
+}
+
+impl TemplateSpec {
+    fn result_type(self) -> Option<Ty> {
+        match self {
+            TemplateSpec::ConstInt
+            | TemplateSpec::BinopIntAdd
+            | TemplateSpec::BinopIntArith
+            | TemplateSpec::BinopIntMod => Some(Ty::Int),
+            TemplateSpec::ConstFloat | TemplateSpec::BinopFloatArith => Some(Ty::Float),
+            TemplateSpec::ConstBool | TemplateSpec::BinopFloatCmp | TemplateSpec::BinopIntCmp => {
+                Some(Ty::Bool)
+            }
+            TemplateSpec::Jump | TemplateSpec::JumpIf => None,
+        }
+    }
+}
+
+/// 单一来源判定：BinaryOp 的（操作数类型, op）→ 模板契约。
+/// 返回 None 表示模板集未覆盖（编译期拒绝回落解释器）。
+fn template_for_binary(
+    is_int: bool,
+    is_float: bool,
+    op: &crate::common::BinaryOp,
+) -> Option<TemplateSpec> {
+    if is_float {
+        match op {
+            crate::common::BinaryOp::Add
+            | crate::common::BinaryOp::Sub
+            | crate::common::BinaryOp::Mul
+            | crate::common::BinaryOp::Div => Some(TemplateSpec::BinopFloatArith),
+            crate::common::BinaryOp::Equal
+            | crate::common::BinaryOp::NotEqual
+            | crate::common::BinaryOp::Greater
+            | crate::common::BinaryOp::Less
+            | crate::common::BinaryOp::GreaterEqual
+            | crate::common::BinaryOp::LessEqual => Some(TemplateSpec::BinopFloatCmp),
+            crate::common::BinaryOp::Mod => None, // 无 fmod 模板
+        }
+    } else if is_int {
+        match op {
+            crate::common::BinaryOp::Add => Some(TemplateSpec::BinopIntAdd),
+            crate::common::BinaryOp::Sub
+            | crate::common::BinaryOp::Mul
+            | crate::common::BinaryOp::Div => Some(TemplateSpec::BinopIntArith),
+            crate::common::BinaryOp::Mod => Some(TemplateSpec::BinopIntMod),
+            crate::common::BinaryOp::Equal
+            | crate::common::BinaryOp::NotEqual
+            | crate::common::BinaryOp::Greater
+            | crate::common::BinaryOp::Less
+            | crate::common::BinaryOp::GreaterEqual
+            | crate::common::BinaryOp::LessEqual => Some(TemplateSpec::BinopIntCmp),
+        }
+    } else {
+        None
+    }
+}
+
+/// verifier-first 预检（Cranelift 思想）：编译前独立校验 body 的模板
+/// 合规性（寄存器范围 + 类型可推导 + 指令在契约表内），返回首违例。
+/// 与 emit 逻辑分离 —— 判定单一来源（spec），发射只是执行面。
+fn verify_linear(func: &MirFunction) -> Result<(), JitError> {
+    if func.body.is_empty() {
+        return Err(JitError::CompileReject("empty body".into()));
+    }
+    let mut types: Vec<Option<Ty>> = vec![None; func.n_regs];
+    for inst in &func.body {
+        match inst {
+            MirInst::Const(dst, v) => {
+                if *dst >= func.n_regs {
+                    return Err(JitError::CompileReject(format!(
+                        "Const dst out of range ({dst}, n_regs={})",
+                        func.n_regs
+                    )));
+                }
+                let spec = match v {
+                    Value::Int(_) => TemplateSpec::ConstInt,
+                    Value::Float(_) => TemplateSpec::ConstFloat,
+                    Value::Bool(_) => TemplateSpec::ConstBool,
+                    _ => {
+                        return Err(JitError::CompileReject(format!(
+                            "Const value not compilable: {v:?}"
+                        )));
+                    }
+                };
+                types[*dst] = spec.result_type();
+            }
+            MirInst::BinaryOp(dst, a, op, b) => {
+                if *dst >= func.n_regs || *a >= func.n_regs || *b >= func.n_regs {
+                    return Err(JitError::CompileReject(format!(
+                        "BinaryOp register out of range (dst={dst} a={a} b={b}, n_regs={})",
+                        func.n_regs
+                    )));
+                }
+                let (is_int, is_float) = match (types[*a], types[*b]) {
+                    (Some(Ty::Int), Some(Ty::Int)) => (true, false),
+                    (Some(Ty::Float), Some(Ty::Float)) => (false, true),
+                    (ta, tb) => {
+                        return Err(JitError::CompileReject(format!(
+                            "BinaryOp operand types not tracked ({ta:?}, {tb:?})"
+                        )));
+                    }
+                };
+                let spec = template_for_binary(is_int, is_float, op).ok_or_else(|| {
+                    JitError::CompileReject(format!(
+                        "BinaryOp not in template set ({is_int} Int / {is_float} Float, op={op:?})"
+                    ))
+                })?;
+                types[*dst] = spec.result_type();
+            }
+            MirInst::Jump(_) => {
+                let _spec = TemplateSpec::Jump;
+            }
+            MirInst::JumpIf(cond, _) | MirInst::JumpIfNot(cond, _) => {
+                if *cond >= func.n_regs {
+                    return Err(JitError::CompileReject(format!(
+                        "JumpIf cond register out of range ({cond}, n_regs={})",
+                        func.n_regs
+                    )));
+                }
+                if types[*cond] != Some(Ty::Bool) {
+                    return Err(JitError::CompileReject(format!(
+                        "JumpIf cond must be Bool (got {:?})",
+                        types[*cond]
+                    )));
+                }
+                let _spec = TemplateSpec::JumpIf;
+            }
+            inst => {
+                return Err(JitError::CompileReject(format!(
+                    "instruction not in template set: {inst:?}"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// 才编译。跳转目标是 pc 索引（lower patch_label_at 填的 insts 索引）。
-/// 返回 (可执行代码, 结果寄存器)。
-fn try_compile(func: &MirFunction) -> Option<(ExecMem, Reg)> {
-    if func.body.is_empty() || !cfg!(target_arch = "x86_64") {
-        return None;
+/// 返回 `Ok((可执行代码, 结果寄存器))` 或编译期拒绝原因。
+fn try_compile(func: &MirFunction) -> Result<(ExecMem, Reg), JitError> {
+    if func.body.is_empty() {
+        return Err(JitError::CompileReject("empty body".into()));
     }
-    // 寄存器类型线性跟踪（Int / Float / Bool；比较结果 Bool 不再参与算术）。
-    #[derive(Clone, Copy, PartialEq)]
-    enum Ty {
-        Int,
-        Float,
-        Bool,
+    if !cfg!(target_arch = "x86_64") {
+        return Err(JitError::CompileReject(
+            "unsupported architecture (x86-64 only)".into(),
+        ));
     }
+    // verifier-first：先独立校验契约合规性，再发射（判定/发射分离）。
+    verify_linear(func)?;
     let mut types: Vec<Option<Ty>> = vec![None; func.n_regs];
     let mut code = Code::new();
     // 第一遍：逐 pc emit + 记录每指令段的 code offset。
@@ -693,7 +867,9 @@ fn try_compile(func: &MirFunction) -> Option<(ExecMem, Reg)> {
         match inst {
             MirInst::Const(dst, v) => {
                 if !emit_const(&mut code, *dst, v) {
-                    return None;
+                    return Err(JitError::CompileReject(format!(
+                        "Const value not compilable: {v:?}"
+                    )));
                 }
                 types[*dst] = match v {
                     Value::Int(_) => Some(Ty::Int),
@@ -705,46 +881,52 @@ fn try_compile(func: &MirFunction) -> Option<(ExecMem, Reg)> {
             }
             MirInst::BinaryOp(dst, a, op, b) => {
                 if *dst >= func.n_regs || *a >= func.n_regs || *b >= func.n_regs {
-                    return None;
+                    return Err(JitError::CompileReject(format!(
+                        "BinaryOp register out of range (dst={dst} a={a} b={b}, n_regs={})",
+                        func.n_regs
+                    )));
                 }
                 let (is_int, is_float) = match (types[*a], types[*b]) {
                     (Some(Ty::Int), Some(Ty::Int)) => (true, false),
                     (Some(Ty::Float), Some(Ty::Float)) => (false, true),
-                    _ => return None,
+                    _ => {
+                        return Err(JitError::CompileReject(format!(
+                            "BinaryOp operand types not tracked ({a:?}, {b:?})"
+                        )));
+                    }
                 };
-                let arith = matches!(
-                    op,
-                    crate::common::BinaryOp::Add
-                        | crate::common::BinaryOp::Sub
-                        | crate::common::BinaryOp::Mul
-                        | crate::common::BinaryOp::Div
-                );
-                let cmp = matches!(
-                    op,
-                    crate::common::BinaryOp::Equal
-                        | crate::common::BinaryOp::NotEqual
-                        | crate::common::BinaryOp::Greater
-                        | crate::common::BinaryOp::Less
-                        | crate::common::BinaryOp::GreaterEqual
-                        | crate::common::BinaryOp::LessEqual
-                );
-                if is_float && cmp {
-                    emit_binop_float_cmp(&mut code, *dst, *a, op.clone(), *b);
-                    types[*dst] = Some(Ty::Bool);
-                } else if is_int && cmp {
-                    emit_binop_int_cmp(&mut code, *dst, *a, op.clone(), *b);
-                    types[*dst] = Some(Ty::Bool);
-                } else if is_float && arith {
-                    emit_binop_float(&mut code, *dst, *a, op.clone(), *b);
-                    types[*dst] = Some(Ty::Float);
-                } else if is_int && arith {
-                    emit_binop_int(&mut code, *dst, *a, op.clone(), *b);
-                    types[*dst] = Some(Ty::Int);
-                } else if is_int && matches!(op, crate::common::BinaryOp::Mod) {
-                    emit_binop_int_mod(&mut code, *dst, *a, *b);
-                    types[*dst] = Some(Ty::Int);
-                } else {
-                    return None; // Float Mod（无 fmod 模板）等
+                // 契约单一来源：spec 已由 verifier 确认，此处仅分发发射。
+                let spec = template_for_binary(is_int, is_float, op).ok_or_else(|| {
+                    JitError::CompileReject(format!(
+                        "BinaryOp not in template set ({is_int} Int / {is_float} Float, op={op:?})"
+                    ))
+                })?;
+                match spec {
+                    TemplateSpec::BinopFloatArith => {
+                        emit_binop_float(&mut code, *dst, *a, op.clone(), *b);
+                        types[*dst] = Some(Ty::Float);
+                    }
+                    TemplateSpec::BinopFloatCmp => {
+                        emit_binop_float_cmp(&mut code, *dst, *a, op.clone(), *b);
+                        types[*dst] = Some(Ty::Bool);
+                    }
+                    TemplateSpec::BinopIntAdd => {
+                        emit_binop_int(&mut code, *dst, *a, op.clone(), *b);
+                        types[*dst] = Some(Ty::Int);
+                    }
+                    TemplateSpec::BinopIntArith => {
+                        emit_binop_int(&mut code, *dst, *a, op.clone(), *b);
+                        types[*dst] = Some(Ty::Int);
+                    }
+                    TemplateSpec::BinopIntMod => {
+                        emit_binop_int_mod(&mut code, *dst, *a, *b);
+                        types[*dst] = Some(Ty::Int);
+                    }
+                    TemplateSpec::BinopIntCmp => {
+                        emit_binop_int_cmp(&mut code, *dst, *a, op.clone(), *b);
+                        types[*dst] = Some(Ty::Bool);
+                    }
+                    _ => unreachable!("verify_linear 已确认 BinaryOp 只能命中上述模板"),
                 }
                 last_dst = Some(*dst);
             }
@@ -755,12 +937,18 @@ fn try_compile(func: &MirFunction) -> Option<(ExecMem, Reg)> {
             }
             MirInst::JumpIf(cond, target) | MirInst::JumpIfNot(cond, target) => {
                 if *cond >= func.n_regs {
-                    return None;
+                    return Err(JitError::CompileReject(format!(
+                        "JumpIf cond register out of range ({cond}, n_regs={})",
+                        func.n_regs
+                    )));
                 }
                 // v1：cond 必须是 Bool（比较结果）；其他类型 truthy 语义
                 // 超出模板集 → 编译期拒绝回落解释器。
                 if types[*cond] != Some(Ty::Bool) {
-                    return None;
+                    return Err(JitError::CompileReject(format!(
+                        "JumpIf cond must be Bool (got {:?})",
+                        types[*cond]
+                    )));
                 }
                 let (cc, not) = if matches!(inst, MirInst::JumpIf(..)) {
                     (0x85u8, false) // jnz（truthy 跳）
@@ -778,43 +966,86 @@ fn try_compile(func: &MirFunction) -> Option<(ExecMem, Reg)> {
                 code.extend(&[0x48, 0x85, 0xD2]); // test rdx, rdx
                 code.jcc_pc(cc, *target);
             }
-            _ => return None, // 任何未覆盖指令 → 回落解释器
+            inst => {
+                return Err(JitError::CompileReject(format!(
+                    "instruction not in template set: {inst:?}"
+                )));
+            }
         }
     }
 
-    let last_dst = last_dst?;
+    let last_dst = last_dst.ok_or_else(|| {
+        JitError::CompileReject("no result-producing instruction (empty linear body)".into())
+    })?;
     // 正常出口：xor eax,eax; ret
     code.extend(&[0x31, 0xC0, 0xC3]);
     // 第二遍：patch 控制流跳转（目标 pc → code offset）。
     if !code.patch_control(&pc_offsets) {
-        return None;
+        return Err(JitError::CompileReject(
+            "control-flow jump target out of range".into(),
+        ));
     }
     let bytes = code.finish_bail(&emit_bail_block());
     // W^X：先 RW 写入，再切 RX（见 ExecMem::make_exec）。
-    let mut mem = ExecMem::alloc_rw(bytes.len())?;
+    let mut mem = ExecMem::alloc_rw(bytes.len())
+        .ok_or_else(|| JitError::InternalInvariant("executable memory allocation failed".into()))?;
     unsafe {
         std::ptr::copy_nonoverlapping(bytes.as_ptr(), mem.ptr, bytes.len());
     }
-    mem.make_exec().ok()?;
-    Some((mem, last_dst))
+    mem.make_exec().map_err(JitError::InternalInvariant)?;
+    Ok((mem, last_dst))
 }
 
 // ===================================================================
 // 入口
 // ===================================================================
 
-/// copy-and-patch JIT：对纯线性 Float 子集编译执行，其余回落解释器。
+/// JIT 编译/执行结果分类（v0.75.50，为 LuaJIT 式 snapshot/side-exit 打基础）。
+/// 调用方（h_with_config）回落解释器时按分类记录诊断，而非笼统 Err：
+/// - `CompileReject`：模板集未覆盖（指令/类型/平台）→ 编译期即知，稳定可预测
+/// - `GuardFail`：运行期守卫失败（类型标签动态不匹配，生成代码置 bail）→
+///   未来可映射 snapshot/side-exit（重编译换专门化模板）
+/// - `InternalInvariant`：基础设施破坏（可执行内存/W^X 失败）→ 环境问题，
+///   非程序语义
+#[derive(Debug, Clone, PartialEq)]
+pub enum JitError {
+    CompileReject(String),
+    GuardFail(String),
+    InternalInvariant(String),
+}
+
+impl JitError {
+    pub fn message(&self) -> &str {
+        match self {
+            JitError::CompileReject(m)
+            | JitError::GuardFail(m)
+            | JitError::InternalInvariant(m) => m,
+        }
+    }
+}
+
+impl std::fmt::Display for JitError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            JitError::CompileReject(m) => write!(f, "CompileReject: {m}"),
+            JitError::GuardFail(m) => write!(f, "GuardFail: {m}"),
+            JitError::InternalInvariant(m) => write!(f, "InternalInvariant: {m}"),
+        }
+    }
+}
+
+impl std::error::Error for JitError {}
+
+/// copy-and-patch JIT：对纯线性数字子集编译执行，其余回落解释器。
 ///
-/// `Err` = 不可编译或执行中 bail（类型不匹配）— 调用方回落 `run_mir`
-/// （语义正确性由解释器兜底）。
+/// `Err` = 编译期拒绝 / 运行期守卫失败 / 基础设施失败 — 调用方回落
+/// `run_mir`（语义正确性由解释器兜底）。
 pub fn run_jit(
     func: &MirFunction,
     _interp: &mut dyn MirHost,
     _env: &mut Environment,
-) -> Result<Value, String> {
-    let Some((mem, last_dst)) = try_compile(func) else {
-        return Err("jit: not compilable (v1 linear Float subset)".to_string());
-    };
+) -> Result<Value, JitError> {
+    let (mem, last_dst) = try_compile(func)?;
     let mut regs: Vec<JitValue> = vec![JitValue::nil(); func.n_regs];
     let mut state = JitState {
         regs: regs.as_mut_ptr(),
@@ -828,6 +1059,8 @@ pub fn run_jit(
     if rc == 0 && state.bail == 0 {
         Ok(jit_to_value(regs[last_dst]))
     } else {
-        Err("jit: bail (type mismatch)".to_string())
+        Err(JitError::GuardFail(
+            "runtime type-tag guard failed (bail)".into(),
+        ))
     }
 }

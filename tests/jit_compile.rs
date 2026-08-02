@@ -47,7 +47,7 @@ fn run_interp(func: &MirFunction) -> Result<Value, String> {
 fn run_jit_of(func: &MirFunction) -> Result<Value, String> {
     let mut interp = Interpreter::new();
     let mut env = interp.take_env();
-    run_jit(func, &mut interp, &mut env)
+    run_jit(func, &mut interp, &mut env).map_err(|e| e.to_string())
 }
 
 /// 手工构造的 Float 算术：JIT == 解释器。
@@ -463,4 +463,46 @@ fn jit_with_config_falls_back() {
         env_mir.iter().len(),
         "JIT 回落与解释器 env 终态应一致"
     );
+}
+
+/// BailInfo 分类（v0.75.50）：编译期拒绝 vs 运行期守卫失败可区分。
+#[test]
+fn jit_error_classification() {
+    fn run(func: &MirFunction) -> Result<Value, mora::mir::jit::JitError> {
+        let mut interp = Interpreter::new();
+        let mut env = interp.take_env();
+        run_jit(func, &mut interp, &mut env)
+    }
+    // CompileReject：含 Define（模板集未覆盖）
+    let reject = MirFunction {
+        params: Vec::new(),
+        body: vec![
+            MirInst::Const(0, Value::Int(1)),
+            MirInst::Define("x".to_string(), 0),
+        ],
+        n_regs: 1,
+    };
+    match run(&reject) {
+        Err(mora::mir::jit::JitError::CompileReject(msg)) => {
+            assert!(!msg.is_empty(), "CompileReject 应携带原因");
+        }
+        other => panic!("含 Define 应 CompileReject，got {other:?}"),
+    }
+    // 不可编译值类型（String Const）→ CompileReject
+    let reject_str = MirFunction {
+        params: Vec::new(),
+        body: vec![MirInst::Const(0, Value::String("hi".into()))],
+        n_regs: 1,
+    };
+    match run(&reject_str) {
+        Err(mora::mir::jit::JitError::CompileReject(_)) => {}
+        other => panic!("String Const 应 CompileReject，got {other:?}"),
+    }
+    // 成功路径 → Ok（不为 Err）
+    let ok = MirFunction {
+        params: Vec::new(),
+        body: vec![MirInst::Const(0, Value::Int(42))],
+        n_regs: 1,
+    };
+    assert!(run(&ok).is_ok(), "纯 Const 应成功编译执行");
 }

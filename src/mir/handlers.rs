@@ -250,9 +250,9 @@ pub fn h_with_config(
     let mut child_env = env.clone();
 
     let _result = if jit {
-        let mut ssa = crate::mir::ssa::construct(body);
-        crate::mir::typeinfer::infer_types(&mut ssa);
-        match crate::mir::jit::run_jit(&ssa, interp, &mut child_env) {
+        // v0.75.43: copy-and-patch JIT（零 LLVM）— 直接编译 MirFunction，
+        // 未覆盖指令回落解释器（run_jit Err → run_mir）。
+        match crate::mir::jit::run_jit(body, interp, &mut child_env) {
             Ok(v) => v,
             Err(e) => {
                 eprintln!(

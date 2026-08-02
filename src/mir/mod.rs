@@ -142,7 +142,8 @@ pub enum MirInst {
 
     /// α.2: with 块。bindings 设置 AI config，body 执行后恢复。
     /// 解释器保存/恢复 current_ai_config。
-    /// jit=true 时，block 内容通过 SSA → LLVM → JIT 编译执行。
+    /// v0.75.43: jit=true 时 body 经 copy-and-patch JIT（纯线性 Int 子集）
+    /// 编译执行，未覆盖指令回落 run_mir。
     WithConfig {
         bindings: Vec<(String, Reg)>,
         body: Box<MirFunction>,

@@ -367,7 +367,7 @@ pub enum WitnessPattern {
 }
 
 impl WitnessPattern {
-    fn from_pattern(p: &Pattern) -> WitnessPattern {
+    pub fn from_pattern(p: &Pattern) -> WitnessPattern {
         match p {
             Pattern::Wildcard => WitnessPattern::Wildcard,
             Pattern::Variable(n) => WitnessPattern::Variable(n.clone()),
@@ -438,7 +438,7 @@ pub enum WitnessOrchestrateKind {
 }
 
 impl WitnessOrchestrateKind {
-    fn from_kind(kind: &MirOrchestrateKind) -> WitnessOrchestrateKind {
+    pub fn from_kind(kind: &MirOrchestrateKind) -> WitnessOrchestrateKind {
         match kind {
             MirOrchestrateKind::Sequential { agents } => WitnessOrchestrateKind::Sequential {
                 agents: agents.iter().map(WitnessAgentDef::from_agent).collect(),

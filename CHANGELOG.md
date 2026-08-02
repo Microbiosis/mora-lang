@@ -2,6 +2,40 @@
 
 All notable changes to Mora will be documented in this file.
 
+## [v0.75.39] — 2026-08-02 — witness 嵌套化（阶段 3 Step 3d）
+
+（ParserV3 单遍编译的 witness 精化：compile() 产出的 MirWitness 从
+扁平 push 改为**递归嵌套树**，emit 时直接构建。差分测试断言从
+「非空」收紧为「顶层 witness 数 == 顶层 expr 数」。）
+
+### Changed — src/parser_v3/mod.rs（emit 家族全 _w 化）
+- **表达式类**：`emit_expr_w`/`emit_or_w`/`emit_and_w`/`emit_equality_w`/
+  `emit_pipe_w`/`emit_comparison_w`/`emit_term_w`/`emit_factor_w`/
+  `emit_unary_w`/`emit_call_w`/`emit_call_tail_w`/`emit_arg_list_w`/
+  `emit_primary_w`/`emit_list_w`/`emit_dict_w` — 返回 `(Reg, MirWitness)`
+  递归构建嵌套树（Binary/Or/And/Call/MethodCall/Index/Closure/List/Dict/
+  Prompt 均嵌套子节点）。
+- **语句类**：`emit_let_w`/`emit_fn_def_w`/`emit_return_break_continue_w`/
+  `emit_type_alias_w`/`emit_enum_def_w`/`emit_struct_def_w`/`emit_import_w`/
+  `emit_macro_def_w`/`emit_if_w`/`emit_loop_w`/`emit_while_w`/`emit_match_w`/
+  `emit_match_arm_w`/`emit_orchestrate_w` — 返回对应 WitnessKind。
+- **块语义**：`emit_block_w` + `block_witness` — 块内语句列表折叠为
+  单条 witness 或 `Sequence`（与旧 parse_block_body 语义一致）。
+- **compile 收集**：`emit_program` 改走 `emit_statement_w`，每条顶层
+  语句 push 一个嵌套 witness；`emit_statement` 等 32 个旧薄包装
+  （`Option<Reg>`/`Option<()>` 版）全部删除 — 消除 dead_code。
+- **match arm**：`EmittedMatchArm` 结构体取代五元组返回
+  （type_complexity）。
+- 修 7 处 span 循环重赋值 + 1 处 unused_mut（clippy 归零）。
+
+### Changed — src/mir/witness.rs
+- `WitnessPattern::from_pattern` / `WitnessOrchestrateKind::from_kind`
+  改 pub（parser_v3 emit 路径复用）。
+
+### Changed — tests/compile_differential.rs
+- witness 断言从「非空」收紧为 `witnesses.len() == exprs.len()`
+  （顶层语句 ↔ 顶层 expr 一一对应）。
+
 ## [v0.75.38] — 2026-08-02 — MirWitness 轻量树骨架（去 AST 化阶段 2）
 
 （MirExpr → MirWitness 终局的阶段 2：定义 witness 骨架 + typeck/LSP

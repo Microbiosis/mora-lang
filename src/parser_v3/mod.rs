@@ -6,7 +6,7 @@
 use crate::common::{BinaryOp, Literal, Span};
 use crate::lexer::{Lexer, Token, TokenType};
 use crate::mir::expr::*;
-use crate::mir::witness::{MirWitness, WitnessKind};
+use crate::mir::witness::{MirWitness, WitnessKind, WitnessParam};
 use crate::mir::{MirFunction, MirInst, Reg};
 use std::collections::HashMap;
 
@@ -72,14 +72,12 @@ impl ParserV3 {
                 .map(|_: ParseError| ())
                 .map_err(|e| e.0);
             }
-            let span = self.span_of_current();
-            match self.emit_statement() {
-                Some(_) => {}
+            match self.emit_statement_w() {
+                Some(w) => self.witnesses.push(w),
                 None => {
                     return Err(format!("Failed to parse at line {}", self.current_line()));
                 }
             }
-            let _ = span;
         }
         Ok(())
     }
@@ -92,79 +90,64 @@ impl ParserV3 {
     // 寄存器 Reg（表达式）或 ()（语句）。
 
     /// 顶层语句分发 — 镜像 parse_expression_statement。
-    fn emit_statement(&mut self) -> Option<()> {
+    /// 顶层语句 → witness（嵌套树，emit 时直接构建）。
+    fn emit_statement_w(&mut self) -> Option<MirWitness> {
         match self.peek()?.token_type {
-            TokenType::Task => self.emit_fn_def(),
-            TokenType::Let => self.emit_let(),
-            TokenType::Match => {
-                let _ = self.emit_match()?;
-                Some(())
-            }
-            TokenType::If => {
-                let _ = self.emit_if()?;
-                Some(())
-            }
-            TokenType::For => {
-                let _ = self.emit_loop()?;
-                Some(())
-            }
-            TokenType::Identifier(ref s) if s == "while" => {
-                let _ = self.emit_while()?;
-                Some(())
-            }
+            TokenType::Task => self.emit_fn_def_w(),
+            TokenType::Let => self.emit_let_w(),
+            TokenType::Match => self.emit_match_w().map(|(_, w)| w),
+            TokenType::If => self.emit_if_w().map(|(_, w)| w),
+            TokenType::For => self.emit_loop_w().map(|(_, w)| w),
+            TokenType::Identifier(ref s) if s == "while" => self.emit_while_w().map(|(_, w)| w),
             TokenType::Return | TokenType::Break | TokenType::Continue => {
-                self.emit_return_break_continue()
+                self.emit_return_break_continue_w()
             }
-            TokenType::Type => self.emit_type_alias(),
-            TokenType::Enum => self.emit_enum_def(),
-            TokenType::Struct => self.emit_struct_def(),
-            TokenType::Import => self.emit_import(),
-            TokenType::Macro => self.emit_macro_def(),
-            TokenType::Orchestrate => self.emit_orchestrate(),
+            TokenType::Type => self.emit_type_alias_w(),
+            TokenType::Enum => self.emit_enum_def_w(),
+            TokenType::Struct => self.emit_struct_def_w(),
+            TokenType::Import => self.emit_import_w(),
+            TokenType::Macro => self.emit_macro_def_w(),
+            TokenType::Orchestrate => self.emit_orchestrate_w(),
             _ => {
                 // 表达式语句（赋值/字面量/调用等）
-                let _reg = self.emit_expr()?;
-                Some(())
+                self.emit_expr_w().map(|(_, w)| w)
             }
         }
     }
 
-    /// 表达式入口 — 镜像 parse_assignment（含赋值检测）。
-    fn emit_expr(&mut self) -> Option<Reg> {
+    /// 表达式入口（witness 嵌套版）— 镜像 parse_assignment（含赋值检测）。
+    fn emit_expr_w(&mut self) -> Option<(Reg, MirWitness)> {
         if matches!(self.peek()?.token_type, TokenType::Identifier(_)) {
             let ident_start = self.current;
             let name = self.consume_identifier("Expected variable name")?;
 
             if self.match_token(&[TokenType::Assign]) {
-                let v = self.emit_expr()?;
+                let (v, v_w) = self.emit_expr_w()?;
                 let span = self.span_of_current();
                 self.emit.emit(MirInst::Assign(name.clone(), v));
-                self.witnesses.push(MirWitness {
+                let w = MirWitness {
                     kind: WitnessKind::Assign {
                         target: name,
-                        value: Box::new(MirWitness {
-                            kind: WitnessKind::Variable(String::new()),
-                            span,
-                        }),
+                        value: Box::new(v_w),
                     },
                     span,
-                });
-                return Some(v);
+                };
+                return Some((v, w));
             }
             self.current = ident_start;
         }
-        self.emit_or()
+        self.emit_or_w()
     }
 
-    fn emit_or(&mut self) -> Option<Reg> {
-        let mut left = self.emit_and()?;
+    fn emit_or_w(&mut self) -> Option<(Reg, MirWitness)> {
+        let (mut left, mut left_w) = self.emit_and_w()?;
         while self
             .peek()
             .map(|t| matches!(&t.token_type, TokenType::Identifier(s) if s == "or"))
             .unwrap_or(false)
         {
             self.advance();
-            let right = self.emit_and()?;
+            let (right, right_w) = self.emit_and_w()?;
             let dst = self.emit.alloc_reg();
             let l = left;
             self.emit.emit(MirInst::JumpIf(l, 0));
@@ -174,20 +157,28 @@ impl ParserV3 {
                 .emit(MirInst::BinaryOp(dst, l, BinaryOp::NotEqual, r));
             let end = self.emit.insts.len();
             self.emit.patch_label_at(jump_idx, end);
+            let span = self.span_of_current();
+            left_w = MirWitness {
+                kind: WitnessKind::Or {
+                    left: Box::new(left_w),
+                    right: Box::new(right_w),
+                },
+                span,
+            };
             left = dst;
         }
-        Some(left)
+        Some((left, left_w))
     }
 
-    fn emit_and(&mut self) -> Option<Reg> {
-        let mut left = self.emit_equality()?;
+    fn emit_and_w(&mut self) -> Option<(Reg, MirWitness)> {
+        let (mut left, mut left_w) = self.emit_equality_w()?;
         while self
             .peek()
             .map(|t| matches!(&t.token_type, TokenType::Identifier(s) if s == "and"))
             .unwrap_or(false)
         {
             self.advance();
-            let right = self.emit_equality()?;
+            let (right, right_w) = self.emit_equality_w()?;
             let dst = self.emit.alloc_reg();
             let l = left;
             self.emit.emit(MirInst::JumpIfNot(l, 0));
@@ -197,72 +188,130 @@ impl ParserV3 {
                 .emit(MirInst::BinaryOp(dst, l, BinaryOp::Equal, r));
             let end = self.emit.insts.len();
             self.emit.patch_label_at(jump_idx, end);
+            let span = self.span_of_current();
+            left_w = MirWitness {
+                kind: WitnessKind::And {
+                    left: Box::new(left_w),
+                    right: Box::new(right_w),
+                },
+                span,
+            };
             left = dst;
         }
-        Some(left)
+        Some((left, left_w))
     }
 
-    fn emit_equality(&mut self) -> Option<Reg> {
-        let mut left = self.emit_pipe()?;
+    fn emit_equality_w(&mut self) -> Option<(Reg, MirWitness)> {
+        let (mut left, mut left_w) = self.emit_pipe_w()?;
         while let Some(op) = self.consume_binary_op(&[TokenType::Equal, TokenType::NotEqual]) {
-            let right = self.emit_pipe()?;
-            left = self.emit_binop(op, left, right);
+            let (right, right_w) = self.emit_pipe_w()?;
+            let dst = self.emit.alloc_reg();
+            self.emit
+                .emit(MirInst::BinaryOp(dst, left, op.clone(), right));
+            let span = self.span_of_current();
+            left_w = MirWitness {
+                kind: WitnessKind::Binary {
+                    left: Box::new(left_w),
+                    op,
+                    right: Box::new(right_w),
+                },
+                span,
+            };
+            left = dst;
         }
-        Some(left)
+        Some((left, left_w))
     }
 
-    fn emit_pipe(&mut self) -> Option<Reg> {
-        let mut left = self.emit_comparison()?;
+    fn emit_pipe_w(&mut self) -> Option<(Reg, MirWitness)> {
+        let (mut left, mut left_w) = self.emit_comparison_w()?;
         while self.match_token_exact(TokenType::Pipe) {
-            let rhs = self.emit_comparison()?;
+            let (rhs, rhs_w) = self.emit_comparison_w()?;
             let dst = self.emit.alloc_reg();
             self.emit.emit(MirInst::Pipe(dst, left, rhs));
+            let span = self.span_of_current();
+            left_w = MirWitness {
+                kind: WitnessKind::Call {
+                    callee: crate::mir::witness::WitnessCallee::Name("|>".to_string()),
+                    args: vec![left_w, rhs_w],
+                },
+                span,
+            };
             left = dst;
         }
-        Some(left)
+        Some((left, left_w))
     }
 
-    fn emit_comparison(&mut self) -> Option<Reg> {
-        let mut left = self.emit_term()?;
+    fn emit_comparison_w(&mut self) -> Option<(Reg, MirWitness)> {
+        let (mut left, mut left_w) = self.emit_term_w()?;
         while let Some(op) = self.consume_binary_op(&[
             TokenType::Less,
             TokenType::Greater,
             TokenType::LessEqual,
             TokenType::GreaterEqual,
         ]) {
-            let right = self.emit_term()?;
-            left = self.emit_binop(op, left, right);
+            let (right, right_w) = self.emit_term_w()?;
+            let dst = self.emit.alloc_reg();
+            self.emit
+                .emit(MirInst::BinaryOp(dst, left, op.clone(), right));
+            let span = self.span_of_current();
+            left_w = MirWitness {
+                kind: WitnessKind::Binary {
+                    left: Box::new(left_w),
+                    op,
+                    right: Box::new(right_w),
+                },
+                span,
+            };
+            left = dst;
         }
-        Some(left)
+        Some((left, left_w))
     }
 
-    fn emit_term(&mut self) -> Option<Reg> {
-        let mut left = self.emit_factor()?;
+    fn emit_term_w(&mut self) -> Option<(Reg, MirWitness)> {
+        let (mut left, mut left_w) = self.emit_factor_w()?;
         while let Some(op) = self.consume_binary_op(&[TokenType::Minus, TokenType::Plus]) {
-            let right = self.emit_factor()?;
-            left = self.emit_binop(op, left, right);
+            let (right, right_w) = self.emit_factor_w()?;
+            let dst = self.emit.alloc_reg();
+            self.emit
+                .emit(MirInst::BinaryOp(dst, left, op.clone(), right));
+            let span = self.span_of_current();
+            left_w = MirWitness {
+                kind: WitnessKind::Binary {
+                    left: Box::new(left_w),
+                    op,
+                    right: Box::new(right_w),
+                },
+                span,
+            };
+            left = dst;
         }
-        Some(left)
+        Some((left, left_w))
     }
 
-    fn emit_factor(&mut self) -> Option<Reg> {
-        let mut left = self.emit_unary()?;
+    fn emit_factor_w(&mut self) -> Option<(Reg, MirWitness)> {
+        let (mut left, mut left_w) = self.emit_unary_w()?;
         while let Some(op) =
             self.consume_binary_op(&[TokenType::Star, TokenType::Slash, TokenType::Percent])
         {
-            let right = self.emit_unary()?;
-            left = self.emit_binop(op, left, right);
+            let (right, right_w) = self.emit_unary_w()?;
+            let dst = self.emit.alloc_reg();
+            self.emit
+                .emit(MirInst::BinaryOp(dst, left, op.clone(), right));
+            let span = self.span_of_current();
+            left_w = MirWitness {
+                kind: WitnessKind::Binary {
+                    left: Box::new(left_w),
+                    op,
+                    right: Box::new(right_w),
+                },
+                span,
+            };
+            left = dst;
         }
-        Some(left)
+        Some((left, left_w))
     }
 
-    fn emit_binop(&mut self, op: BinaryOp, l: Reg, r: Reg) -> Reg {
-        let dst = self.emit.alloc_reg();
-        self.emit.emit(MirInst::BinaryOp(dst, l, op, r));
-        dst
-    }
-
-    fn emit_unary(&mut self) -> Option<Reg> {
+    fn emit_unary_w(&mut self) -> Option<(Reg, MirWitness)> {
         let span = self.span_of_current();
 
         // 'not' keyword → 0 == x
@@ -272,194 +321,264 @@ impl ParserV3 {
             .unwrap_or(false)
         {
             self.advance();
-            let operand = self.emit_unary()?;
+            let (operand, operand_w) = self.emit_unary_w()?;
             let zero = self.emit.alloc_reg();
             self.emit
                 .emit(MirInst::Const(zero, crate::value::Value::Int(0)));
-            return Some(self.emit_binop(BinaryOp::Equal, zero, operand));
+            let dst = self.emit.alloc_reg();
+            self.emit
+                .emit(MirInst::BinaryOp(dst, zero, BinaryOp::Equal, operand));
+            let w = MirWitness {
+                kind: WitnessKind::Binary {
+                    left: Box::new(MirWitness {
+                        kind: WitnessKind::Literal(Literal::Int(0, span)),
+                        span,
+                    }),
+                    op: BinaryOp::Equal,
+                    right: Box::new(operand_w),
+                },
+                span,
+            };
+            return Some((dst, w));
         }
 
         // Unary minus / bang
         if self.match_token(&[TokenType::Minus, TokenType::Bang]) {
             // 镜像 parse_unary：-x → 0 - x；!x → 0 == x（truthiness）
-            let operand = self.emit_unary()?;
+            let (operand, operand_w) = self.emit_unary_w()?;
             let zero = self.emit.alloc_reg();
             self.emit
                 .emit(MirInst::Const(zero, crate::value::Value::Int(0)));
-            let _ = span;
-            return Some(self.emit_binop(BinaryOp::Sub, zero, operand));
+            let dst = self.emit.alloc_reg();
+            self.emit
+                .emit(MirInst::BinaryOp(dst, zero, BinaryOp::Sub, operand));
+            let w = MirWitness {
+                kind: WitnessKind::Binary {
+                    left: Box::new(MirWitness {
+                        kind: WitnessKind::Literal(Literal::Int(0, span)),
+                        span,
+                    }),
+                    op: BinaryOp::Sub,
+                    right: Box::new(operand_w),
+                },
+                span,
+            };
+            return Some((dst, w));
         }
 
-        self.emit_call()
+        let (r, w) = self.emit_call_w()?;
+        Some((r, w))
     }
 
-    /// 调用链 — 镜像 parse_call（函数/方法/索引/DynTrait）。
-    fn emit_call(&mut self) -> Option<Reg> {
+    /// 调用链（witness 嵌套版）— 镜像 parse_call（函数/方法/索引/DynTrait）。
+    fn emit_call_w(&mut self) -> Option<(Reg, MirWitness)> {
         // 函数名调用：`name(args)` — 与 lower Call 一致（不 emit Var 加载）。
         if let TokenType::Identifier(name) = self.peek()?.token_type.clone() {
             let save = self.current;
+            let span = self.span_of_current();
             self.advance();
             if self.match_token_exact(TokenType::LParen) {
-                let args = self.emit_arg_list()?;
+                let (args, arg_wits) = self.emit_arg_list_w()?;
                 let dst = self.emit.alloc_reg();
-                self.emit.emit(MirInst::Call(dst, name, args));
-                return self.emit_call_tail(dst);
+                self.emit.emit(MirInst::Call(dst, name.clone(), args));
+                let w = MirWitness {
+                    kind: WitnessKind::Call {
+                        callee: crate::mir::witness::WitnessCallee::Name(name),
+                        args: arg_wits,
+                    },
+                    span,
+                };
+                // 后缀链（方法/索引）可能改写 witness
+                return self.emit_call_tail_w(dst, w);
             }
             self.current = save; // 非调用，回退走 primary
         }
 
-        let callee_reg = self.emit_primary()?;
-        self.emit_call_tail(callee_reg)
+        let (callee_reg, callee_w) = self.emit_primary_w()?;
+        self.emit_call_tail_w(callee_reg, callee_w)
     }
 
-    /// 后缀链：方法调用 obj.m(args) / 索引 obj[idx]。
-    fn emit_call_tail(&mut self, mut callee_reg: Reg) -> Option<Reg> {
+    /// 后缀链（witness 嵌套版）：方法调用 obj.m(args) / 索引 obj[idx]。
+    fn emit_call_tail_w(
+        &mut self,
+        mut callee_reg: Reg,
+        mut callee_w: MirWitness,
+    ) -> Option<(Reg, MirWitness)> {
         loop {
             if self.match_token_exact(TokenType::Dot) {
                 let method_name = self.consume_identifier("Expected method name")?;
+                let span = self.span_of_current();
                 let mut args = Vec::new();
+                let mut arg_wits = Vec::new();
                 if self.match_token_exact(TokenType::LParen) {
-                    args = self.emit_arg_list()?;
+                    let (a, aw) = self.emit_arg_list_w()?;
+                    args = a;
+                    arg_wits = aw;
                 }
                 let dst = self.emit.alloc_reg();
-                self.emit
-                    .emit(MirInst::MethodCall(dst, callee_reg, method_name, args));
+                self.emit.emit(MirInst::MethodCall(
+                    dst,
+                    callee_reg,
+                    method_name.clone(),
+                    args,
+                ));
                 callee_reg = dst;
+                callee_w = MirWitness {
+                    kind: WitnessKind::MethodCall {
+                        receiver: Box::new(callee_w),
+                        method: method_name,
+                        args: arg_wits,
+                    },
+                    span,
+                };
             } else if self.match_token_exact(TokenType::LBracket) {
                 // Indexing: obj[idx]
-                let idx = self.emit_expr()?;
+                let span = self.span_of_current();
+                let (idx, idx_w) = self.emit_expr_w()?;
                 self.consume(TokenType::RBracket, "Expected ']' after index")?;
                 let dst = self.emit.alloc_reg();
                 self.emit.emit(MirInst::Index(dst, callee_reg, idx));
                 callee_reg = dst;
+                callee_w = MirWitness {
+                    kind: WitnessKind::Call {
+                        callee: crate::mir::witness::WitnessCallee::Name("[]".to_string()),
+                        args: vec![callee_w, idx_w],
+                    },
+                    span,
+                };
             } else {
                 break;
             }
         }
-        Some(callee_reg)
+        Some((callee_reg, callee_w))
     }
 
-    fn emit_arg_list(&mut self) -> Option<Vec<Reg>> {
+    fn emit_arg_list_w(&mut self) -> Option<(Vec<Reg>, Vec<MirWitness>)> {
         let mut args = Vec::new();
+        let mut wits = Vec::new();
         while !self.check(&TokenType::RParen) && !self.is_at_end() {
-            if let Some(r) = self.emit_expr() {
+            if let Some((r, w)) = self.emit_expr_w() {
                 args.push(r);
+                wits.push(w);
             }
             if !self.match_token(&[TokenType::Comma]) {
                 break;
             }
         }
         self.consume(TokenType::RParen, "Expected ')'")?;
-        Some(args)
+        Some((args, wits))
     }
 
     /// 主表达式 — 镜像 parse_primary。
-    fn emit_primary(&mut self) -> Option<Reg> {
+    /// 主表达式 — 镜像 parse_primary。返回 (结果寄存器, 嵌套 witness)。
+    /// v0.75.41: witness 递归构建（子节点嵌进父节点，typeck/LSP 消费树形）。
+    fn emit_primary_w(&mut self) -> Option<(Reg, MirWitness)> {
         let token = self.peek().cloned()?;
         let span = crate::common::Span::new(token.line, token.column);
 
-        match token.token_type {
+        let (reg, wit) = match token.token_type {
             TokenType::Int(val) => {
                 self.advance();
                 let dst = self.emit.alloc_reg();
                 self.emit
                     .emit(MirInst::Const(dst, crate::value::Value::Int(val)));
-                self.witnesses.push(MirWitness {
+                let w = MirWitness {
                     kind: WitnessKind::Literal(Literal::Int(val, span)),
                     span,
-                });
-                Some(dst)
+                };
+                (dst, w)
             }
             TokenType::Float(val) => {
                 self.advance();
                 let dst = self.emit.alloc_reg();
                 self.emit
                     .emit(MirInst::Const(dst, crate::value::Value::Float(val)));
-                self.witnesses.push(MirWitness {
+                let w = MirWitness {
                     kind: WitnessKind::Literal(Literal::Float(val, span)),
                     span,
-                });
-                Some(dst)
+                };
+                (dst, w)
             }
             TokenType::String(ref s) => {
                 let dst = self.emit.alloc_reg();
                 self.emit
                     .emit(MirInst::Const(dst, crate::value::Value::String(s.clone())));
                 self.advance();
-                self.witnesses.push(MirWitness {
+                let w = MirWitness {
                     kind: WitnessKind::Literal(Literal::String(s.clone(), span)),
                     span,
-                });
-                Some(dst)
+                };
+                (dst, w)
             }
             TokenType::PromptString(ref s) => {
                 self.advance();
-                // p"..." 拆分为 parts 再 emit Prompt
+                // p"..." 拆分为 parts 再 emit Prompt（parts 是纯树，非 token 流）
                 let parts = parse_prompt_parts(s, span);
                 let mut part_regs = Vec::new();
                 let mut part_wits = Vec::new();
                 for part in &parts {
-                    part_regs.push(self.emit_expr_witness(part)?);
-                    part_wits.push(MirWitness::from_expr(part));
+                    let (r, w) = self.emit_expr_witness_w(part)?;
+                    part_regs.push(r);
+                    part_wits.push(w);
                 }
                 let dst = self.emit.alloc_reg();
                 self.emit.emit(MirInst::Prompt(dst, part_regs));
-                self.witnesses.push(MirWitness {
+                let w = MirWitness {
                     kind: WitnessKind::Prompt { parts: part_wits },
                     span,
-                });
-                Some(dst)
+                };
+                (dst, w)
             }
             TokenType::True => {
                 self.advance();
                 let dst = self.emit.alloc_reg();
                 self.emit
                     .emit(MirInst::Const(dst, crate::value::Value::Bool(true)));
-                self.witnesses.push(MirWitness {
+                let w = MirWitness {
                     kind: WitnessKind::Literal(Literal::Bool(true, span)),
                     span,
-                });
-                Some(dst)
+                };
+                (dst, w)
             }
             TokenType::False => {
                 self.advance();
                 let dst = self.emit.alloc_reg();
                 self.emit
                     .emit(MirInst::Const(dst, crate::value::Value::Bool(false)));
-                self.witnesses.push(MirWitness {
+                let w = MirWitness {
                     kind: WitnessKind::Literal(Literal::Bool(false, span)),
                     span,
-                });
-                Some(dst)
+                };
+                (dst, w)
             }
             TokenType::Nil => {
                 self.advance();
                 let dst = self.emit.alloc_reg();
                 self.emit
                     .emit(MirInst::Const(dst, crate::value::Value::Nil));
-                self.witnesses.push(MirWitness {
+                let w = MirWitness {
                     kind: WitnessKind::Literal(Literal::Nil(span)),
                     span,
-                });
-                Some(dst)
+                };
+                (dst, w)
             }
             TokenType::Identifier(name) => {
                 self.advance();
                 let dst = self.emit.alloc_reg();
                 self.emit.emit(MirInst::Var(dst, name.clone()));
-                self.witnesses.push(MirWitness {
+                let w = MirWitness {
                     kind: WitnessKind::Variable(name),
                     span,
-                });
-                Some(dst)
+                };
+                (dst, w)
             }
-            TokenType::LBracket => self.emit_list(),
-            TokenType::LBrace => self.emit_dict(),
+            TokenType::LBracket => return self.emit_list_w(),
+            TokenType::LBrace => return self.emit_dict_w(),
             TokenType::LParen => {
                 self.advance();
-                let inner = self.emit_expr()?;
+                let (inner, w) = self.emit_expr_w()?;
                 self.consume(TokenType::RParen, "Expected ')'")?;
-                Some(inner)
+                (inner, w)
             }
             TokenType::Fn => {
                 self.advance();
@@ -483,40 +602,77 @@ impl ParserV3 {
                 // 子上下文：闭包体是独立寄存器空间（镜像 lower Closure 分支）
                 let parent =
                     std::mem::replace(&mut self.emit, crate::mir::lower::EmitContext::new());
-                let body_reg = if self.match_token_exact(TokenType::FatArrow) {
-                    self.emit_expr()?
+                let (body_reg, _body_w) = if self.match_token_exact(TokenType::FatArrow) {
+                    self.emit_expr_w()?
                 } else {
-                    let b = self.emit_expr()?;
+                    let (b, w) = self.emit_expr_w()?;
                     self.consume(TokenType::End, "Expected 'end' after closure body")?;
-                    b
+                    (b, w)
                 };
                 self.emit.emit(MirInst::Return(Some(body_reg)));
                 let body_mir = std::mem::replace(&mut self.emit, parent).finish();
                 let dst = self.emit.alloc_reg();
                 let param_names: Vec<String> = params.iter().map(|p| p.name.clone()).collect();
+                let param_wits: Vec<crate::mir::witness::WitnessParam> = params
+                    .iter()
+                    .map(|p| crate::mir::witness::WitnessParam {
+                        name: p.name.clone(),
+                        type_hint: p.type_hint.clone(),
+                        default: None,
+                    })
+                    .collect();
                 self.emit.emit(MirInst::Closure {
                     dst,
                     params: param_names,
                     body: Box::new(body_mir),
                 });
-                Some(dst)
+                let w = MirWitness {
+                    kind: WitnessKind::Closure {
+                        params: param_wits,
+                        body: Box::new(MirWitness {
+                            kind: WitnessKind::Sequence(vec![]),
+                            span,
+                        }),
+                    },
+                    span,
+                };
+                (dst, w)
+            }
+            _ => return None,
+        };
+        Some((reg, wit))
+    }
+
+    /// 旧签名薄包装：只取寄存器（不建嵌套 witness）。
+    /// 辅助：把已构造的 MirExpr（prompt parts：Literal/String 或 Variable）
+    /// emit 成指令 + 返回嵌套 witness。
+    fn emit_expr_witness_w(&mut self, expr: &MirExpr) -> Option<(Reg, MirWitness)> {
+        let wit = MirWitness::from_expr(expr);
+        match &expr.kind {
+            MirExprKind::Literal(Literal::String(s, _)) => {
+                let dst = self.emit.alloc_reg();
+                self.emit
+                    .emit(MirInst::Const(dst, crate::value::Value::String(s.clone())));
+                Some((dst, wit))
+            }
+            MirExprKind::Variable(name) => {
+                let dst = self.emit.alloc_reg();
+                self.emit.emit(MirInst::Var(dst, name.clone()));
+                Some((dst, wit))
             }
             _ => None,
         }
     }
 
-    /// 辅助：把已构造的 MirExpr 转成 witness 并 emit（部分场景复用旧树）。
-    fn emit_expr_witness(&mut self, _expr: &MirExpr) -> Option<Reg> {
-        // 占位：prompt parts 场景（3d 完整实现）
-        None
-    }
-
-    fn emit_list(&mut self) -> Option<Reg> {
+    fn emit_list_w(&mut self) -> Option<(Reg, MirWitness)> {
+        let span = self.span_of_current();
         self.consume(TokenType::LBracket, "Expected '['")?;
         let mut items = Vec::new();
+        let mut item_wits = Vec::new();
         while !self.check(&TokenType::RBracket) && !self.is_at_end() {
-            if let Some(item) = self.emit_expr() {
+            if let Some((item, wit)) = self.emit_expr_w() {
                 items.push(item);
+                item_wits.push(wit);
             }
             if !self.match_token(&[TokenType::Comma]) {
                 break;
@@ -525,17 +681,24 @@ impl ParserV3 {
         self.consume(TokenType::RBracket, "Expected ']'")?;
         let dst = self.emit.alloc_reg();
         self.emit.emit(MirInst::ListLit(dst, items));
-        Some(dst)
+        let w = MirWitness {
+            kind: WitnessKind::List(item_wits),
+            span,
+        };
+        Some((dst, w))
     }
 
-    fn emit_dict(&mut self) -> Option<Reg> {
+    fn emit_dict_w(&mut self) -> Option<(Reg, MirWitness)> {
+        let span = self.span_of_current();
         self.consume(TokenType::LBrace, "Expected '{'")?;
         let mut entries = Vec::new();
+        let mut entry_wits = Vec::new();
         while !self.check(&TokenType::RBrace) && !self.is_at_end() {
             if let Some(key) = self.emit_dict_key() {
                 self.consume(TokenType::Colon, "Expected ':' after dict key")?;
-                if let Some(value) = self.emit_expr() {
-                    entries.push((key, value));
+                if let Some((value, wit)) = self.emit_expr_w() {
+                    entries.push((key.clone(), value));
+                    entry_wits.push((key, wit));
                 }
             }
             if !self.match_token(&[TokenType::Comma]) {
@@ -545,7 +708,11 @@ impl ParserV3 {
         self.consume(TokenType::RBrace, "Expected '}'")?;
         let dst = self.emit.alloc_reg();
         self.emit.emit(MirInst::DictLit(dst, entries));
-        Some(dst)
+        let w = MirWitness {
+            kind: WitnessKind::Dict(entry_wits),
+            span,
+        };
+        Some((dst, w))
     }
 
     fn emit_dict_key(&mut self) -> Option<String> {
@@ -568,17 +735,18 @@ impl ParserV3 {
 
     // ── 语句 emit ──
 
-    fn emit_let(&mut self) -> Option<()> {
+    fn emit_let_w(&mut self) -> Option<MirWitness> {
+        let span = self.span_of_current();
         self.advance(); // 'let'
         let name = self.consume_identifier("Expected variable name after 'let'")?;
-        let _type_hint = if self.match_token_exact(TokenType::Colon) {
+        let type_hint = if self.match_token_exact(TokenType::Colon) {
             self.parse_type_annotation()
         } else {
             None
         };
         self.consume(TokenType::Assign, "Expected '=' in let binding")?;
-        let v = self.emit_expr()?;
-        self.emit.emit(MirInst::Define(name, v));
+        let (v, v_w) = self.emit_expr_w()?;
+        self.emit.emit(MirInst::Define(name.clone(), v));
         // init_body = Nil（与 lower LetBinding 一致：Const(Nil) → Assign → Var）
         let b_dst = self.emit.alloc_reg();
         self.emit
@@ -588,10 +756,23 @@ impl ParserV3 {
         let dst = self.emit.alloc_reg();
         self.emit
             .emit(MirInst::Var(dst, "__let_result".to_string()));
-        Some(())
+        let nil_w = MirWitness {
+            kind: WitnessKind::Literal(Literal::Nil(span)),
+            span,
+        };
+        Some(MirWitness {
+            kind: WitnessKind::LetBinding {
+                name,
+                type_hint,
+                value: Box::new(v_w),
+                init_body: Box::new(nil_w),
+            },
+            span,
+        })
     }
 
-    fn emit_fn_def(&mut self) -> Option<()> {
+    fn emit_fn_def_w(&mut self) -> Option<MirWitness> {
+        let span = self.span_of_current();
         self.advance(); // 'task'
         let name = self.consume_identifier("Expected task name")?;
         self.consume(TokenType::LParen, "Expected '(' after task name")?;
@@ -607,31 +788,50 @@ impl ParserV3 {
         self.consume(TokenType::RParen, "Expected ')' after parameters")?;
         // 子上下文：函数体是独立寄存器空间（镜像 lower FnDef 分支）
         let parent = std::mem::replace(&mut self.emit, crate::mir::lower::EmitContext::new());
-        let body_reg = if self.match_token_exact(TokenType::Newline) {
+        let (body_reg, body_w) = if self.match_token_exact(TokenType::Newline) {
+            let mut stmt_wits = Vec::new();
             let mut last = 0;
             while self.match_token(&[TokenType::Newline]) {}
             while !self.check(&TokenType::End) && !self.is_at_end() {
-                let r = self.emit_statement_expr()?;
+                let (r, w) = self.emit_statement_expr_w()?;
                 last = r;
+                stmt_wits.push(w);
                 while self.match_token(&[TokenType::Newline]) {}
             }
             self.consume(TokenType::End, "Expected 'end' after task body")?;
-            last
+            (last, Self::block_witness(stmt_wits, span))
         } else {
-            self.emit_expr()?
+            self.emit_expr_w()?
         };
         self.emit.emit(MirInst::Return(Some(body_reg)));
         let body_mir = std::mem::replace(&mut self.emit, parent).finish();
         self.emit.emit(MirInst::TaskDef {
-            name,
-            params,
+            name: name.clone(),
+            params: params.clone(),
             body: Box::new(body_mir),
         });
-        Some(())
+        let w_params = params
+            .iter()
+            .map(|p| WitnessParam {
+                name: p.clone(),
+                type_hint: None,
+                default: None,
+            })
+            .collect();
+        Some(MirWitness {
+            kind: WitnessKind::FnDef {
+                name,
+                params: w_params,
+                return_type: None,
+                body: Box::new(body_w),
+            },
+            span,
+        })
     }
 
-    fn emit_return_break_continue(&mut self) -> Option<()> {
+    fn emit_return_break_continue_w(&mut self) -> Option<MirWitness> {
         let token = self.peek()?.token_type.clone();
+        let span = self.span_of_current();
         match token {
             TokenType::Return => {
                 self.advance();
@@ -641,14 +841,21 @@ impl ParserV3 {
                 {
                     None
                 } else {
-                    self.emit_expr()
+                    self.emit_expr_w().map(|(_, w)| Box::new(w))
                 };
-                self.emit.emit(MirInst::Return(value));
-                Some(())
+                self.emit.emit(MirInst::Return(value.as_ref().map(|_| 0)));
+                Some(MirWitness {
+                    kind: WitnessKind::Return(value),
+                    span,
+                })
             }
             TokenType::Break => {
                 self.advance();
-                let _label = self.consume_identifier("Expected label after 'break'");
+                let label = if matches!(self.peek()?.token_type, TokenType::Identifier(_)) {
+                    self.consume_identifier("Expected label after 'break'")?
+                } else {
+                    String::new()
+                };
                 let (_, brk) = self
                     .emit
                     .loop_stack
@@ -657,11 +864,18 @@ impl ParserV3 {
                     .ok_or("Break outside loop")
                     .ok()?;
                 self.emit.emit(MirInst::Break(brk));
-                Some(())
+                Some(MirWitness {
+                    kind: WitnessKind::Break(label),
+                    span,
+                })
             }
             TokenType::Continue => {
                 self.advance();
-                let _label = self.consume_identifier("Expected label after 'continue'");
+                let label = if matches!(self.peek()?.token_type, TokenType::Identifier(_)) {
+                    self.consume_identifier("Expected label after 'continue'")?
+                } else {
+                    String::new()
+                };
                 let (cont, _) = self
                     .emit
                     .loop_stack
@@ -670,28 +884,36 @@ impl ParserV3 {
                     .ok_or("Continue outside loop")
                     .ok()?;
                 self.emit.emit(MirInst::Continue(cont));
-                Some(())
+                Some(MirWitness {
+                    kind: WitnessKind::Continue(label),
+                    span,
+                })
             }
             _ => None,
         }
     }
 
-    fn emit_type_alias(&mut self) -> Option<()> {
+    fn emit_type_alias_w(&mut self) -> Option<MirWitness> {
+        let span = self.span_of_current();
         self.advance(); // 'type'
         let name = self.consume_identifier("Expected type name")?;
         self.consume(TokenType::Assign, "Expected '=' in type alias")?;
         let target = self.parse_type_annotation()?;
         self.emit.emit(MirInst::TypeAlias {
-            name,
+            name: name.clone(),
             target: target.name(),
         });
         let dst = self.emit.alloc_reg();
         self.emit
             .emit(MirInst::Const(dst, crate::value::Value::Nil));
-        Some(())
+        Some(MirWitness {
+            kind: WitnessKind::TypeAlias { name, target },
+            span,
+        })
     }
 
-    fn emit_enum_def(&mut self) -> Option<()> {
+    fn emit_enum_def_w(&mut self) -> Option<MirWitness> {
+        let span = self.span_of_current();
         self.advance(); // 'enum'
         let name = self.consume_identifier("Expected enum name")?;
         let mut variants = Vec::new();
@@ -713,16 +935,20 @@ impl ParserV3 {
             })
             .collect();
         self.emit.emit(MirInst::EnumDef {
-            name,
+            name: name.clone(),
             variants: evs,
         });
         let dst = self.emit.alloc_reg();
         self.emit
             .emit(MirInst::Const(dst, crate::value::Value::Nil));
-        Some(())
+        Some(MirWitness {
+            kind: WitnessKind::EnumDef { name, variants },
+            span,
+        })
     }
 
-    fn emit_struct_def(&mut self) -> Option<()> {
+    fn emit_struct_def_w(&mut self) -> Option<MirWitness> {
+        let span = self.span_of_current();
         self.advance(); // 'struct'
         let name = self.consume_identifier("Expected struct name")?;
         let mut fields = Vec::new();
@@ -746,24 +972,35 @@ impl ParserV3 {
                 type_hint: ftype.name(),
             })
             .collect();
-        self.emit.emit(MirInst::StructDef { name, fields: sfs });
+        self.emit.emit(MirInst::StructDef {
+            name: name.clone(),
+            fields: sfs,
+        });
         let dst = self.emit.alloc_reg();
         self.emit
             .emit(MirInst::Const(dst, crate::value::Value::Nil));
-        Some(())
+        Some(MirWitness {
+            kind: WitnessKind::StructDef { name, fields },
+            span,
+        })
     }
 
-    fn emit_import(&mut self) -> Option<()> {
+    fn emit_import_w(&mut self) -> Option<MirWitness> {
+        let span = self.span_of_current();
         self.advance(); // 'import'
         let path = self.consume_identifier("Expected import path")?;
-        self.emit.emit(MirInst::Import(path));
+        self.emit.emit(MirInst::Import(path.clone()));
         let dst = self.emit.alloc_reg();
         self.emit
             .emit(MirInst::Const(dst, crate::value::Value::Nil));
-        Some(())
+        Some(MirWitness {
+            kind: WitnessKind::Import(path),
+            span,
+        })
     }
 
-    fn emit_macro_def(&mut self) -> Option<()> {
+    fn emit_macro_def_w(&mut self) -> Option<MirWitness> {
+        let span = self.span_of_current();
         self.advance(); // 'macro'
         let name = self.consume_identifier("Expected macro name")?;
         let mut params = Vec::new();
@@ -783,20 +1020,27 @@ impl ParserV3 {
             self.advance();
         }
         self.consume(TokenType::End, "Expected 'end' after macro")?;
-        self.emit.emit(MirInst::MacroDef { name, params });
+        self.emit.emit(MirInst::MacroDef {
+            name: name.clone(),
+            params: params.clone(),
+        });
         let dst = self.emit.alloc_reg();
         self.emit
             .emit(MirInst::Const(dst, crate::value::Value::Nil));
-        Some(())
+        Some(MirWitness {
+            kind: WitnessKind::MacroDef { name, params },
+            span,
+        })
     }
 
-    fn emit_if(&mut self) -> Option<Reg> {
+    fn emit_if_w(&mut self) -> Option<(Reg, MirWitness)> {
+        let span = self.span_of_current();
         self.advance(); // 'if'
-        let cond = self.emit_expr()?;
+        let (cond, cond_w) = self.emit_expr_w()?;
         // 镜像 lower If 分支（__if_result + JumpIfNot + Jump + patch）
         self.emit.emit(MirInst::JumpIfNot(cond, 0));
         let jumpifnot_idx = self.emit.insts.len() - 1;
-        let then_reg = self.emit_block()?;
+        let (then_reg, then_w) = self.emit_block_w()?;
         let dst = self.emit.alloc_reg();
         self.emit
             .emit(MirInst::Assign("__if_result".to_string(), then_reg));
@@ -804,62 +1048,97 @@ impl ParserV3 {
         let jump_end_idx = self.emit.insts.len() - 1;
         let else_start = self.emit.insts.len();
         self.emit.patch_label_at(jumpifnot_idx, else_start);
-        if self
+        let else_w = if self
             .peek()
             .map(|t| matches!(&t.token_type, TokenType::Identifier(s) if s == "else"))
             .unwrap_or(false)
         {
             self.advance();
-            let else_reg = self.emit_block()?;
+            let (else_reg, w) = self.emit_block_w()?;
             self.emit
                 .emit(MirInst::Assign("__if_result".to_string(), else_reg));
+            Some(Box::new(w))
         } else {
             self.emit
                 .emit(MirInst::Assign("__if_result".to_string(), 0));
-        }
+            None
+        };
         let end = self.emit.insts.len();
         self.emit.patch_label_at(jump_end_idx, end);
         self.emit.emit(MirInst::Var(dst, "__if_result".to_string()));
-        Some(dst)
+        let w = MirWitness {
+            kind: WitnessKind::If {
+                cond: Box::new(cond_w),
+                then: Box::new(then_w),
+                r#else: else_w,
+            },
+            span,
+        };
+        Some((dst, w))
     }
 
-    /// emit 一个块（{} 或换行到 end），返回块最后一条的结果寄存器。
-    fn emit_block(&mut self) -> Option<Reg> {
+    /// emit 一个块（{} 或换行到 end），返回 (最后结果寄存器, 块 witness)。
+    /// 块 witness：单条语句取该语句的 witness；多条语句嵌套为 Sequence。
+    fn emit_block_w(&mut self) -> Option<(Reg, MirWitness)> {
+        let span = self.span_of_current();
+        let mut stmt_wits = Vec::new();
+        let mut last = 0;
         if self.match_token_exact(TokenType::LBrace) {
-            let mut last = 0;
             while !self.check(&TokenType::RBrace) && !self.is_at_end() {
-                let r = self.emit_statement_expr()?;
+                let (r, w) = self.emit_statement_expr_w()?;
                 last = r;
+                stmt_wits.push(w);
             }
             self.consume(TokenType::RBrace, "Expected '}' after block")?;
-            Some(last)
         } else {
             // 换行到 end
-            let mut last = 0;
             while self.match_token(&[TokenType::Newline]) {}
             while !self.check(&TokenType::End) && !self.is_at_end() {
-                let r = self.emit_statement_expr()?;
+                let (r, w) = self.emit_statement_expr_w()?;
                 last = r;
+                stmt_wits.push(w);
                 while self.match_token(&[TokenType::Newline]) {}
             }
             self.consume(TokenType::End, "Expected 'end' after block")?;
-            Some(last)
+        }
+        Some((last, Self::block_witness(stmt_wits, span)))
+    }
+
+    /// 块/函数体的语句列表 → 单条则直出，多条嵌套为 Sequence。
+    fn block_witness(stmt_wits: Vec<MirWitness>, span: Span) -> MirWitness {
+        if stmt_wits.len() == 1 {
+            stmt_wits.into_iter().next().expect("len==1 verified above")
+        } else if stmt_wits.is_empty() {
+            MirWitness {
+                kind: WitnessKind::Sequence(Vec::new()),
+                span,
+            }
+        } else {
+            MirWitness {
+                kind: WitnessKind::Sequence(stmt_wits),
+                span,
+            }
         }
     }
 
-    /// 块内语句 → 结果寄存器（表达式语句返回其 dst，其余返回 0）。
-    fn emit_statement_expr(&mut self) -> Option<Reg> {
-        // 简化：块内先只支持表达式语句（完整融合时扩展）
-        let r = self.emit_expr()?;
-        Some(r)
+    /// 块内语句 → (结果寄存器, witness)（表达式语句返回其 dst，其余返回 0）。
+    fn emit_statement_expr_w(&mut self) -> Option<(Reg, MirWitness)> {
+        match self.peek()?.token_type.clone() {
+            TokenType::Return | TokenType::Break | TokenType::Continue => {
+                let w = self.emit_return_break_continue_w()?;
+                Some((0, w))
+            }
+            _ => self.emit_expr_w(),
+        }
     }
 
-    fn emit_loop(&mut self) -> Option<Reg> {
+    fn emit_loop_w(&mut self) -> Option<(Reg, MirWitness)> {
         // 'for' var 'in' iterable newline body 'end'（镜像 lower Loop）
+        let span = self.span_of_current();
         self.advance(); // 'for'
         let var = self.consume_identifier("Expected loop variable")?;
         self.consume(TokenType::In, "Expected 'in' in for loop")?;
-        let iter_reg = self.emit_expr()?;
+        let (iter_reg, iter_w) = self.emit_expr_w()?;
         use crate::value::Value;
         let i_reg = self.emit.alloc_reg();
         self.emit.emit(MirInst::Const(i_reg, Value::Int(0)));
@@ -882,11 +1161,11 @@ impl ParserV3 {
 
         let x_reg = self.emit.alloc_reg();
         self.emit.emit(MirInst::Index(x_reg, iter_reg, i_reg));
-        self.emit.emit(MirInst::Define(var, x_reg));
+        self.emit.emit(MirInst::Define(var.clone(), x_reg));
 
         let body_start = self.emit.insts.len();
         self.emit.loop_stack.push((loop_label, 0));
-        let _ = self.emit_block()?;
+        let (_, body_w) = self.emit_block_w()?;
         self.emit.loop_stack.pop();
         let body_end = self.emit.insts.len();
 
@@ -904,19 +1183,28 @@ impl ParserV3 {
         }
         let dst = self.emit.alloc_reg();
         self.emit.emit(MirInst::Const(dst, Value::Nil));
-        Some(dst)
+        let w = MirWitness {
+            kind: WitnessKind::Loop {
+                var,
+                iterable: Box::new(iter_w),
+                body: Box::new(body_w),
+            },
+            span,
+        };
+        Some((dst, w))
     }
 
-    fn emit_while(&mut self) -> Option<Reg> {
+    fn emit_while_w(&mut self) -> Option<(Reg, MirWitness)> {
+        let span = self.span_of_current();
         self.advance(); // 'while'
         let loop_label = self.emit.insts.len();
-        let c = self.emit_expr()?;
+        let (c, cond_w) = self.emit_expr_w()?;
         self.emit.emit(MirInst::JumpIfNot(c, 0));
         let exit_jump_idx = self.emit.insts.len() - 1;
 
         let body_start = self.emit.insts.len();
         self.emit.loop_stack.push((loop_label, 0));
-        let _ = self.emit_block()?;
+        let (_, body_w) = self.emit_block_w()?;
         self.emit.loop_stack.pop();
         let body_end = self.emit.insts.len();
 
@@ -933,17 +1221,27 @@ impl ParserV3 {
         let dst = self.emit.alloc_reg();
         self.emit
             .emit(MirInst::Const(dst, crate::value::Value::Nil));
-        Some(dst)
+        let w = MirWitness {
+            kind: WitnessKind::While {
+                cond: Box::new(cond_w),
+                body: Box::new(body_w),
+            },
+            span,
+        };
+        Some((dst, w))
     }
 
-    fn emit_match(&mut self) -> Option<Reg> {
+    fn emit_match_w(&mut self) -> Option<(Reg, MirWitness)> {
+        let span = self.span_of_current();
         self.advance(); // 'match'
-        let val_reg = self.emit_expr()?;
+        let (val_reg, scrutinee_w) = self.emit_expr_w()?;
         self.consume(TokenType::LBrace, "Expected '{' after match subject")?;
         let mut arms = Vec::new();
+        let mut arm_wits = Vec::new();
         while !self.check(&TokenType::RBrace) && !self.is_at_end() {
-            if let Some(arm) = self.emit_match_arm() {
-                arms.push(arm);
+            if let Some(arm) = self.emit_match_arm_w() {
+                arms.push((arm.pat_str, arm.guard, arm.body_mir, arm.val_reg));
+                arm_wits.push(arm.witness);
                 let _ = self.match_token(&[TokenType::Comma]);
             } else {
                 self.advance();
@@ -952,46 +1250,50 @@ impl ParserV3 {
         self.consume(TokenType::RBrace, "Expected '}' after match arms")?;
         let dst = self.emit.alloc_reg();
         self.emit.emit(MirInst::MatchExpr { val: val_reg, arms });
-        Some(dst)
+        let w = MirWitness {
+            kind: WitnessKind::Match {
+                scrutinee: Box::new(scrutinee_w),
+                arms: arm_wits,
+            },
+            span,
+        };
+        Some((dst, w))
     }
 
-    fn emit_match_arm(&mut self) -> Option<(String, Option<Reg>, Box<MirFunction>, Reg)> {
+    fn emit_match_arm_w(&mut self) -> Option<EmittedMatchArm> {
         let pattern = self.emit_pattern()?;
         self.consume(TokenType::FatArrow, "Expected '=>' in match arm")?;
         // 子上下文：arm body 是独立寄存器空间（镜像 lower Match 分支）
         let parent = std::mem::replace(&mut self.emit, crate::mir::lower::EmitContext::new());
-        let arm_val_reg = self.emit_expr()?;
+        let (arm_val_reg, body_w) = self.emit_expr_w()?;
         self.emit.emit(MirInst::Return(Some(arm_val_reg)));
         let body_mir = std::mem::replace(&mut self.emit, parent).finish();
         let pat_str = crate::mir::lower::pattern_to_string(&pattern);
-        Some((pat_str, None, Box::new(body_mir), arm_val_reg))
+        let witness = crate::mir::witness::WitnessArm {
+            pattern: crate::mir::witness::WitnessPattern::from_pattern(&pattern),
+            guard: None,
+            body: body_w,
+        };
+        Some(EmittedMatchArm {
+            pat_str,
+            guard: None,
+            body_mir: Box::new(body_mir),
+            val_reg: arm_val_reg,
+            witness,
+        })
     }
 
     fn emit_pattern(&mut self) -> Option<crate::mir::expr::Pattern> {
-        // 简化：先支持 _ 通配和字面量（完整融合时读完整 pattern）
-        if matches!(self.peek()?.token_type, TokenType::Identifier(ref n) if n == "_") {
-            self.advance();
-            return Some(crate::mir::expr::Pattern::Wildcard);
-        }
-        let tok = self.peek().cloned()?;
-        match tok.token_type {
-            TokenType::Int(v) => {
-                self.advance();
-                Some(crate::mir::expr::Pattern::Literal(Literal::Int(
-                    v,
-                    crate::common::Span::new(tok.line, tok.column),
-                )))
-            }
-            _ => None,
-        }
+        // 复用完整 pattern 解析器（通配/字面量/变量/元组/列表/dict/类型标注）
+        self.parse_pattern()
     }
 
-    fn emit_orchestrate(&mut self) -> Option<()> {
+    fn emit_orchestrate_w(&mut self) -> Option<MirWitness> {
         // 复用旧解析器构造 kind（含预 lower 的 task_body）— orchestrate 是
         // 数据构造指令，运行时引擎执行，不参与递归 emit（与 lower 的
         // MirExprKind::Orchestrate 分支一致：emit inst + Const(Nil)）。
+        let span = self.span_of_current();
         let expr = self.parse_orchestrate_statement()?;
-        let expr_clone = expr.clone();
         if let MirExprKind::Orchestrate {
             input_var,
             result_var,
@@ -1007,8 +1309,16 @@ impl ParserV3 {
             self.emit
                 .emit(MirInst::Const(dst, crate::value::Value::Nil));
             // witness：从构造的 MirExpr 转换（含嵌套 agent 树）
-            self.witnesses.push(MirWitness::from_expr(&expr_clone));
-            Some(())
+            Some(MirWitness {
+                kind: WitnessKind::Orchestrate {
+                    input_var,
+                    result_var,
+                    kind: Box::new(crate::mir::witness::WitnessOrchestrateKind::from_kind(
+                        &kind,
+                    )),
+                },
+                span,
+            })
         } else {
             None
         }
@@ -2786,6 +3096,16 @@ impl ParserV3 {
             _ => None,
         }
     }
+}
+
+/// emit_match_arm_w 的产出：指令侧 (pat_str/guard/body_mir/val_reg)
+/// + witness 侧 WitnessArm。结构体分组避免五元组返回（type_complexity）。
+struct EmittedMatchArm {
+    pat_str: String,
+    guard: Option<Reg>,
+    body_mir: Box<MirFunction>,
+    val_reg: Reg,
+    witness: crate::mir::witness::WitnessArm,
 }
 
 #[derive(Debug)]

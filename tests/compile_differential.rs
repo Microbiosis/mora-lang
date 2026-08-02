@@ -29,14 +29,13 @@ fn assert_compile_equivalent(source: &str) {
         new_func.params, old_func.params,
         "compile 与 parse→lower 参数不等价\nsource: {source}"
     );
-    // witness 同步产出（阶段 3 中间态：emit 路径扁平 push，含嵌套叶子；
-    // 阶段 4 精化为嵌套树后此断言收紧为顶层计数相等）。
-    assert!(
-        !witnesses.is_empty(),
-        "compile 应产出 witness\nsource: {source}"
+    // witness 同步产出（嵌套树）：每个顶层语句一个 witness，
+    // 与 parse→lower 的顶层 expr 数一致（阶段 3 目标形态）。
+    assert_eq!(
+        witnesses.len(),
+        exprs.len(),
+        "compile 的顶层 witness 数应与顶层 expr 数一致\nsource: {source}"
     );
-    // body 指令等价是核心守卫（语义锁定）；witness 数仅要求非空。
-    let _ = exprs.len();
 }
 
 #[test]
@@ -78,4 +77,10 @@ fn compile_equivalent_orchestrate() {
 #[test]
 fn compile_equivalent_match() {
     assert_compile_equivalent("match 42 {\n  _ => \"default\"\n}");
+}
+
+#[test]
+fn compile_equivalent_prompt() {
+    assert_compile_equivalent("print(p\"hello {name}\")");
+    assert_compile_equivalent("let msg = p\"score: {n} points\"\nprint(msg)");
 }

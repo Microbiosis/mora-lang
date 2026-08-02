@@ -195,11 +195,8 @@ end
 // ===================================================================
 
 #[test]
-// v0.75.32: 降级缺失已修复（task_body 现被 lower 填充），但 Sequential 执行
-// 在 h_orchestrate 走 "not yet supported"（handlers.rs:669 只实现 Pregel）—
-// 功能缺口，超出本阶段范围；Pregel 端到端（v3_pipeline_orchestrate_pregel_runs）
-// 已激活并通过。
-#[ignore = "h_orchestrate Sequential execution not yet supported (v0.75.32)"]
+// v0.75.34: Sequential orchestrate 执行已实现（handlers.rs h_orchestrate
+// Sequential 分支 — pipeline 语义，task_body 顺序执行，前输出即后输入）。
 fn v3_pipeline_orchestrate_sequential_runs() {
     let exprs = parse_v3(
         r#"
@@ -299,7 +296,6 @@ if flag then "yes" else "no" end
 // pre-existing 执行 bug（被旧 ignore 掩盖），与本阶段无关；独立运行
 // /tmp/for.mora 亦复现。
 #[test]
-#[ignore = "pre-existing: loop accumulation returns 0 in MIR exec (v0.75.32)"]
 fn v3_pipeline_for_loop_runs() {
     let exprs = parse_v3(
         r#"
@@ -320,7 +316,6 @@ sum
 
 // v0.75.32: 同 for 循环 — pre-existing 累加 bug，与本阶段无关。
 #[test]
-#[ignore = "pre-existing: loop accumulation returns 0 in MIR exec (v0.75.32)"]
 fn v3_pipeline_while_loop_runs() {
     let exprs = parse_v3(
         r#"

@@ -666,6 +666,42 @@ pub fn h_orchestrate(
             env.define(result_var.to_string(), result, false);
             Ok(())
         }
+        MirOrchestrateKind::Sequential { agents } => {
+            // v0.75.34: Sequential orchestrate 执行 — 按声明顺序逐个执行
+            // agent 的 prelowered task_body，前一个 agent 的输出作为下一个
+            // 的输入（pipeline），最终结果写入 result_var。
+            // 输入注入沿用 pregel 契约：`input` 变量（input_var 的当前值）。
+            let mut input_val = env.get(input_var).unwrap_or(Value::Nil);
+            let mut result = Value::Nil;
+            for agent in agents {
+                if agent.task_body.body.is_empty() && agent.task_body.n_regs == 0 {
+                    return Err(format!(
+                        "orchestrate: agent '{}' has empty task_body (lowering missing)",
+                        agent.name
+                    ));
+                }
+                // 每 agent 独立 env（克隆父级）：input 定义在私有副本上，
+                // 避免跨 agent 污染；副作用写回见下方合并。
+                let mut agent_env = env.clone();
+                agent_env.define("input".to_string(), input_val.clone(), false);
+                agent_env.clock.tick(&agent.name);
+                result = crate::mir::interp::run_mir(
+                    &std::sync::Arc::new(agent.task_body.clone()),
+                    interp,
+                    &mut agent_env,
+                )?;
+                // agent 期间 define 的变量合并回父 env（与 pregel 引擎
+                // reconcile_outcome 的写回语义一致）。
+                for (name, val) in agent_env.iter() {
+                    if env.get(&name).is_none() {
+                        env.define(name, val, false);
+                    }
+                }
+                input_val = result.clone();
+            }
+            env.define(result_var.to_string(), result, false);
+            Ok(())
+        }
         other => Err(format!("orchestrate({:?}) not yet supported", other)),
     }
 }

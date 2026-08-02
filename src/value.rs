@@ -495,6 +495,30 @@ impl MergeStrategy {
 }
 
 impl Value {
+    /// 返回值可用的方法名列表（`methods_of(value)` builtin 用）。
+    /// v0.75.47: 从 flow.rs::get_methods_for_value 下沉 —— 内禀属性贴近
+    /// 数据定义（Lua 5.4 元表同源思想），dispatch 不再跨模块查方法表。
+    pub fn methods(&self) -> Vec<String> {
+        let names: &[&str] = match self {
+            Value::String(_) => &[
+                "len", "upper", "lower", "trim", "starts_with", "ends_with",
+                "contains", "split", "replace", "json",
+            ],
+            Value::List(_) => &[
+                "push", "pop", "get", "len", "map", "filter", "reduce", "take",
+                "drop", "window", "batch", "shape", "flatten", "transpose", "reshape",
+            ],
+            Value::Dict(_) => &["get", "set", "keys", "values", "len", "json"],
+            Value::Conversation { .. } => &["chat", "history", "clear", "model", "len"],
+            Value::Stream { .. } => &["collect", "is_done"],
+            Value::Router { .. } => &["route", "listen"],
+            Value::McpServer { .. } => &["tool", "serve"],
+            Value::Agent { .. } => &["run", "name", "max_steps"],
+            _ => &[],
+        };
+        names.iter().map(|s| s.to_string()).collect()
+    }
+
     /// Merge two values using the given strategy.
     /// Falls back to `LastWriteWins` if the strategy doesn't apply
     /// to the value types.
@@ -599,6 +623,8 @@ impl VectorClock {
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
+
+
 
     /// v0.63: Serialize to a Dict for checkpoint storage.
     pub fn to_dict(&self) -> HashMap<String, Value> {

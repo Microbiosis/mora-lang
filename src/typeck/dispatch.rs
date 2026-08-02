@@ -2,10 +2,12 @@
 //!
 //! This module is the single source of truth for built-in functions,
 //! type-level operators (binary, comparison), and method-dispatch
-//! tables. Both the v2 [`crate::typeck::TypeChecker`] and the v0.55
-//! Hindley-Milner engine in [`crate::typeck::hm`] consume the same
-//! `Signatures` so a `Router::new()` registered here is recognized by
-//! both checkers.
+//! tables. The v0.55 Hindley-Milner engine in [`crate::typeck::hm`]
+//! consumes the `Signatures` so a `Router::new()` registered here is
+//! recognized by the checker.
+//!
+//! v0.75.47: 移除对已删除 v2 `TypeChecker` 的引用（v0.55 去 AST 化时
+//! 删除，注释残留；此处不再引该类型以免 rustdoc broken link）。
 //!
 //! It is also where `method_return_type` lives, which used to live in
 //! `typeck::mod` and was the source of a back-reference from

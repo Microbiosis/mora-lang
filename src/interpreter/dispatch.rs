@@ -1149,7 +1149,7 @@ impl Interpreter {
                     let val = args.get(i).cloned().unwrap_or(Value::Nil);
                     child_env.define(param.clone(), val, false);
                 }
-                crate::mir::interp::run_mir(mir_body, self, &mut child_env)
+                crate::mir::vm::run_mir(mir_body, self, &mut child_env)
             }
             // α.11: MIR-built task — 走 run_mir。
             Value::Task {
@@ -1167,7 +1167,7 @@ impl Interpreter {
                     let val = args.get(i).cloned().unwrap_or(Value::Nil);
                     child_env.define(param.clone(), val, false);
                 }
-                crate::mir::interp::run_mir(mir_body, self, &mut child_env)
+                crate::mir::vm::run_mir(mir_body, self, &mut child_env)
             }
             // α.10: Compose/Partial 链路递归 call_value。
             Value::Compose(funcs) => {

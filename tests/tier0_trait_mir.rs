@@ -5,8 +5,8 @@
 //! 走 run_mir，不回退到 arena-based call_task_inner AST 路径。
 
 use mora::interpreter::Interpreter;
-use mora::mir::interp::{run_main_task, run_mir};
 use mora::mir::lower::{lower_mir_exprs, typecheck_mir_exprs};
+use mora::mir::vm::{run_main_task, run_mir};
 
 fn run_via_mir(source: &str) -> Result<(), String> {
     let mut exprs = mora::interpreter::parse_code_v3(source)?;

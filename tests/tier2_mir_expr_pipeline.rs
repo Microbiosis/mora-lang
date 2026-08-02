@@ -6,8 +6,8 @@
 use mora::interpreter::Interpreter;
 use mora::lexer::Lexer;
 use mora::mir::expr::MirExprKind;
-use mora::mir::interp::{run_main_task, run_mir};
 use mora::mir::lower::{lower_mir_exprs, typecheck_mir_exprs};
+use mora::mir::vm::{run_main_task, run_mir};
 use mora::mir::{MirFunction, MirInst};
 use mora::parser_v3::ParserV3;
 use mora::value::Value;

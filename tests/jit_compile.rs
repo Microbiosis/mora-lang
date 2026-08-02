@@ -11,9 +11,9 @@
 //! （回落解释器，语义由解释器锁定）。
 
 use mora::interpreter::{Interpreter, parse_code_v3};
-use mora::mir::interp::run_mir;
 use mora::mir::jit::run_jit;
 use mora::mir::lower::lower_mir_exprs;
+use mora::mir::vm::run_mir;
 use mora::mir::{MirFunction, MirInst};
 use mora::value::Value;
 

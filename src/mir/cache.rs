@@ -153,7 +153,7 @@ mod tests {
         // 直建路径（baseline）
         let mut interp = Interpreter::new();
         let mut env = interp.take_env();
-        let baseline = crate::mir::interp::run_mir(&func, &mut interp, &mut env)
+        let baseline = crate::mir::vm::run_mir(&func, &mut interp, &mut env)
             .expect("baseline run should succeed");
 
         // 缓存路径
@@ -161,13 +161,9 @@ mod tests {
         let dag = cache.get_or_build(&func);
         let mut interp = Interpreter::new();
         let mut env = interp.take_env();
-        let (_, cached) = crate::mir::dag_interp::run_dag_with_signal(
-            dag.as_ref(),
-            func.as_ref(),
-            &mut interp,
-            &mut env,
-        )
-        .expect("cached run should succeed");
+        let (_, cached) =
+            crate::mir::vm::run_dag_with_signal(dag.as_ref(), func.as_ref(), &mut interp, &mut env)
+                .expect("cached run should succeed");
         assert_eq!(cached, baseline);
     }
 }

@@ -47,9 +47,8 @@ fn main() {
     for _ in 0..N {
         let mut interp = mora::interpreter::Interpreter::new();
         let mut env = interp.take_env();
-        let _ =
-            mora::mir::interp::run_mir(&std::sync::Arc::new(func.clone()), &mut interp, &mut env)
-                .unwrap();
+        let _ = mora::mir::vm::run_mir(&std::sync::Arc::new(func.clone()), &mut interp, &mut env)
+            .unwrap();
     }
     let mir_elapsed = start.elapsed();
 

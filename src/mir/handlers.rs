@@ -16,14 +16,14 @@ use crate::common::BinaryOp;
 use crate::flow::eval_binary;
 use crate::mir::expr::{MirOrchestrateKind, MirPregelConfig};
 use crate::mir::host::MirHost;
-use crate::mir::interp::{index_value, run_mir, self_match_pattern};
+use crate::mir::vm::{index_value, run_mir, self_match_pattern};
 use crate::mir::{MirFunction, MirInst, Reg};
 use crate::runtime::types::{TraitInfo, TraitMethodSig};
 use crate::value::{Environment, Value};
 
-use super::interp::index_assign_value;
-use super::interp::is_truthy;
-use super::interp::value_to_string;
+use super::vm::index_assign_value;
+use super::vm::is_truthy;
+use super::vm::value_to_string;
 
 /// What the linear interpreter should do after a handler runs.
 #[derive(Debug)]
@@ -685,7 +685,7 @@ pub fn h_orchestrate(
                 let mut agent_env = env.clone();
                 agent_env.define("input".to_string(), input_val.clone(), false);
                 agent_env.clock.tick(&agent.name);
-                result = crate::mir::interp::run_mir(
+                result = crate::mir::vm::run_mir(
                     &std::sync::Arc::new(agent.task_body.clone()),
                     interp,
                     &mut agent_env,

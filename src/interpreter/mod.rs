@@ -476,7 +476,7 @@ impl Interpreter {
                 // 子 import 的 env 是当前 env 的克隆（与 with 块语义一致）
                 let mut child_env = env.clone();
                 // v0.75.9: 包裹 Arc 走全局 DAG 缓存
-                let _ = crate::mir::interp::run_mir(
+                let _ = crate::mir::vm::run_mir(
                     &std::sync::Arc::new(imported_func),
                     self,
                     &mut child_env,
@@ -559,7 +559,7 @@ impl Interpreter {
     /// 与 main.rs::run_repl 行为一致：循环读 stdin, 逐行 tokenize+parse+lower+run_mir
     /// 接收外部 &mut Interpreter 保留 setup 代码的 state
     pub fn run_repl_with(interp: &mut Interpreter) {
-        use crate::mir::interp::run_mir;
+        use crate::mir::vm::run_mir;
         use crate::mir::{MirFunction, MirInst};
         use std::io::{self, BufRead, Write};
 

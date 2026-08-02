@@ -4,8 +4,8 @@
 //! 构造 Value::TraitObject 包内嵌 expr。
 
 use mora::interpreter::Interpreter;
-use mora::mir::interp::{run_main_task, run_mir};
 use mora::mir::lower::{lower_mir_exprs, typecheck_mir_exprs};
+use mora::mir::vm::{run_main_task, run_mir};
 
 fn run_via_mir(source: &str) -> Result<(), String> {
     let mut exprs = mora::interpreter::parse_code_v3(source)?;

@@ -13,7 +13,7 @@ fn run_dag_path(source: &str) -> Result<(), String> {
     let mut interp = Interpreter::new();
     let mut env = interp.take_env();
     // v0.75.9: 包裹 Arc（run_mir_dag 签名变更，走全局 DAG 缓存）
-    mora::mir::dag_interp::run_mir_dag(&std::sync::Arc::new(func), &mut interp, &mut env)?;
+    mora::mir::vm::run_mir_dag(&std::sync::Arc::new(func), &mut interp, &mut env)?;
     Ok(())
 }
 
@@ -42,7 +42,7 @@ fn dag_compress_demo_no_crash() {
     let mut env = interp.take_env();
     // Just run the top-level DAG body, then main task via linear
     // v0.75.9: 包裹 Arc（run_mir_dag 签名变更）
-    match mora::mir::dag_interp::run_mir_dag(&std::sync::Arc::new(func), &mut interp, &mut env) {
+    match mora::mir::vm::run_mir_dag(&std::sync::Arc::new(func), &mut interp, &mut env) {
         Ok(v) => eprintln!("DAG result: {:?}", v),
         Err(e) => eprintln!("DAG error (expected during compress mock): {}", e),
     }
@@ -61,7 +61,7 @@ fn memo_incremental_reruns_affected_dependencies_only() {
     // b 链、跳过 d 链的纯节点。
     use mora::mir::MirFunction;
     use mora::mir::cache::global_dag_cache;
-    use mora::mir::dag_interp::{DagExecMemo, run_dag_with_signal_memo};
+    use mora::mir::vm::{DagExecMemo, run_dag_with_signal_memo};
     use mora::value::Value;
     use std::sync::Arc;
 

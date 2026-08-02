@@ -415,12 +415,12 @@ fn run_file(path: &str, opt_level: Option<mora::mir::ssa::OptLevel>) {
     let mut env = interpreter.take_env();
     // v0.75.9: 包裹 Arc 走全局 DAG 缓存（run_mir + run_main_task 共享同一项）
     let func_arc = std::sync::Arc::new(func);
-    if let Err(e) = mora::mir::interp::run_mir(&func_arc, &mut interpreter, &mut env) {
+    if let Err(e) = mora::mir::vm::run_mir(&func_arc, &mut interpreter, &mut env) {
         eprintln!("Runtime error (MIR): {}", e);
         process::exit(1);
     }
     // 执行完顶层语句后查找并调用 main task
-    if let Err(e) = mora::mir::interp::run_main_task(&func_arc, &mut interpreter, &mut env) {
+    if let Err(e) = mora::mir::vm::run_main_task(&func_arc, &mut interpreter, &mut env) {
         eprintln!("Runtime error (MIR main): {}", e);
         process::exit(1);
     }
@@ -476,11 +476,10 @@ fn run_record(path: &str, name: &str, opt_level: Option<mora::mir::ssa::OptLevel
 
     // v0.75.9: 包裹 Arc 走全局 DAG 缓存
     let func_arc = std::sync::Arc::new(func);
-    match mora::mir::interp::run_mir(&func_arc, &mut interpreter, &mut env) {
+    match mora::mir::vm::run_mir(&func_arc, &mut interpreter, &mut env) {
         Ok(_) => {
             // 执行 main task
-            if let Err(e) = mora::mir::interp::run_main_task(&func_arc, &mut interpreter, &mut env)
-            {
+            if let Err(e) = mora::mir::vm::run_main_task(&func_arc, &mut interpreter, &mut env) {
                 if let Err(e) = interpreter.infra_mut().recorder().save() {
                     eprintln!("[warn] partial recording save failed: {}", e);
                 }
@@ -538,11 +537,11 @@ fn run_replay(path: &str, name: &str, opt_level: Option<mora::mir::ssa::OptLevel
 
     // v0.75.9: 包裹 Arc 走全局 DAG 缓存
     let func_arc = std::sync::Arc::new(func);
-    if let Err(e) = mora::mir::interp::run_mir(&func_arc, &mut interpreter, &mut env) {
+    if let Err(e) = mora::mir::vm::run_mir(&func_arc, &mut interpreter, &mut env) {
         eprintln!("Runtime error during replay: {}", e);
         process::exit(1);
     }
-    if let Err(e) = mora::mir::interp::run_main_task(&func_arc, &mut interpreter, &mut env) {
+    if let Err(e) = mora::mir::vm::run_main_task(&func_arc, &mut interpreter, &mut env) {
         eprintln!("Runtime error during replay main: {}", e);
         process::exit(1);
     }
@@ -750,11 +749,11 @@ fn run_snapshot(file: &str, name: &str, update: bool, opt_level: Option<mora::mi
     let mut env = interpreter.take_env();
     // v0.75.9: 包裹 Arc 走全局 DAG 缓存
     let func_arc = std::sync::Arc::new(func);
-    if let Err(e) = mora::mir::interp::run_mir(&func_arc, &mut interpreter, &mut env) {
+    if let Err(e) = mora::mir::vm::run_mir(&func_arc, &mut interpreter, &mut env) {
         eprintln!("snapshot: runtime error: {}", e);
         process::exit(1);
     }
-    if let Err(e) = mora::mir::interp::run_main_task(&func_arc, &mut interpreter, &mut env) {
+    if let Err(e) = mora::mir::vm::run_main_task(&func_arc, &mut interpreter, &mut env) {
         eprintln!("snapshot: runtime error: {}", e);
         process::exit(1);
     }

@@ -6,8 +6,8 @@
 //! evaluate/execute (call_value_inner / call_task_inner AST 路径)。
 
 use mora::interpreter::Interpreter;
-use mora::mir::interp::{run_main_task, run_mir};
 use mora::mir::lower::{lower_mir_exprs, typecheck_mir_exprs};
+use mora::mir::vm::{run_main_task, run_mir};
 
 fn run_via_mir(source: &str) -> Result<(), String> {
     let mut exprs = mora::interpreter::parse_code_v3(source)?;
@@ -126,7 +126,7 @@ fn dispatch_call_value_mir_branch_takes_priority() {
     // α.11: mir_body 现在是必填 Arc<MirFunction>（不再是 Option<>）。
     // dispatch 必须直接走 run_mir，不能回退到 arena。
     assert!(
-        block.contains("crate::mir::interp::run_mir("),
+        block.contains("crate::mir::vm::run_mir("),
         "dispatch::call_value must call run_mir directly (Tier 1 dispatch)"
     );
     assert!(

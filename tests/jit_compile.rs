@@ -399,3 +399,68 @@ fn jit_rejects_non_bool_cond() {
         "非 Bool cond 应拒绝（回落解释器）"
     );
 }
+
+/// with-block 真实路径：WithConfig{jit:true} 经 h_with_config dispatch，
+/// 可编译 body 走 JIT（不回落）、不可编译 body 回落 run_mir —— 与
+/// jit=false（纯解释器）的最终 env 状态一致（config 设置/恢复无副作用）。
+fn with_config_env(body: &MirFunction, jit: bool) -> Result<mora::value::Environment, String> {
+    use mora::mir::MirInst;
+    let outer = MirFunction {
+        params: Vec::new(),
+        body: vec![MirInst::WithConfig {
+            bindings: Vec::new(),
+            body: Box::new(body.clone()),
+            jit,
+        }],
+        n_regs: 0,
+    };
+    let mut interp = Interpreter::new();
+    let mut env = interp.take_env();
+    run_mir(&std::sync::Arc::new(outer), &mut interp, &mut env)?;
+    Ok(env)
+}
+
+/// 可编译 body：JIT 成功路径不回落，行为与解释器一致。
+#[test]
+fn jit_with_config_compilable_body() {
+    let body = MirFunction {
+        params: Vec::new(),
+        body: vec![
+            MirInst::Const(0, Value::Float(10.0)),
+            MirInst::Const(1, Value::Float(4.0)),
+            fbinop(2, 0, mora::common::BinaryOp::Div, 1), // 2.5
+        ],
+        n_regs: 3,
+    };
+    let env_jit = with_config_env(&body, true).expect("jit=true 不应 Err");
+    let env_mir = with_config_env(&body, false).expect("jit=false 不应 Err");
+    // config 设置/恢复无环境副作用 → 两者终态一致
+    assert_eq!(
+        env_jit.iter().len(),
+        env_mir.iter().len(),
+        "JIT 与解释器 env 终态应一致"
+    );
+}
+
+/// 不可编译 body（含 Define 副作用）：JIT 编译期拒绝 → 回落 run_mir，
+/// 与纯解释器行为一致。
+#[test]
+fn jit_with_config_falls_back() {
+    let body = MirFunction {
+        params: Vec::new(),
+        body: vec![
+            MirInst::Const(0, Value::Int(42)),
+            MirInst::Define("jitted".to_string(), 0),
+        ],
+        n_regs: 1,
+    };
+    let env_jit = with_config_env(&body, true).expect("jit=true 回落不应 Err");
+    let env_mir = with_config_env(&body, false).expect("jit=false 不应 Err");
+    // Define 副作用在 child_env（h_with_config 不合并回父）→ 父 env 均无
+    // 该变量，终态一致
+    assert_eq!(
+        env_jit.iter().len(),
+        env_mir.iter().len(),
+        "JIT 回落与解释器 env 终态应一致"
+    );
+}

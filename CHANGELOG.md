@@ -2,6 +2,28 @@
 
 All notable changes to Mora will be documented in this file.
 
+## [v0.75.53] — 2026-08-03 — Phase 2 架构重构 P9：main.rs 拆 cli/（D6 单文件惯例）
+
+main.rs 从 1117 行瘦身至 415 行——CLI 子命令整体迁入 lib crate 的
+`src/cli/`（SQLite VDBE 单文件弹合惯例，与 P7 builtins 拆 domain 同风格）。
+
+### cli/ 模块（lib 侧）
+- `src/cli/mod.rs`：`compile_and_opt` 单遍编译入口 + 8 个共享 helpers
+  （recordings_dir/recording_path/snapshots_dir/snapshot_path/format_duration/
+  format_size/format_ts/truncate）
+- `src/cli/record.rs`：record 组 10 命令（record/replay/diff/list/stats/
+  export/audit/report/timeline/snapshot）
+- `src/cli/mcp.rs`：mcp 组 3 命令（tool-list/tool-search/toolsets）
+- main.rs 仅保留 dispatch + run_file/run_check/run_repl + install/banner
+
+### 验证
+- 全量测试 790 绿（skip 3 个 Windows 环境挂起测试，基线一致）
+- clippy --all-targets --all-features -D warnings 0；fmt 0
+- 冒烟：16 个 CLI 路径逐一验证（run/check/record/replay/diff/list/stats/
+  timeline/export/audit/report/snapshot/mcp×3）——含无分号语法（v3 语言
+  以换行为语句分隔，`;` 非本语言语法，examples/ 为 v0.03 旧语法）
+- 纯代码搬移 + 路径改写（mora:: → crate::），零行为变更
+
 ## [v0.75.50] — 2026-08-03 — JIT 收口三件事（调研驱动）
 
 （直接回应调研「jit.rs 将成 God Object」的最高风险：模板契约可审计化

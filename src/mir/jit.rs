@@ -9,15 +9,19 @@
 //! ## v1 子集（诚实边界）
 //! 可编译的指令集：
 //! - `Const(reg, Int/Float/Bool/Nil)` — 立即数写入寄存器槽
-//! - `BinaryOp(d, a, op, b)` 其中 a/b 线性分析证明为 **Float** — 原生
-//!   SSE2 double 算术（Add/Sub/Mul/Div）+ 比较（Equal/NotEqual/Greater/
-//!   Less/GreaterEqual/LessEqual）。Float 除零 = IEEE inf、NaN 比较 = false，
-//!   与解释器（flow::eval_binary / values_equal）语义精确一致。
+//! - `BinaryOp(d, a, op, b)` 其中 a/b 线性分析证明为**同型数字**：
+//!   - **Float×Float** — SSE2 double 算术（addsd/subsd/mulsd/divsd）+
+//!     比较（comisd/setcc）。Float 除零 = IEEE inf、NaN 比较 = false
+//!     （NotEqual = true），与解释器精确一致。
+//!   - **Int×Int** — 精确复刻解释器 `numeric_op` 的 **f64 round-trip**
+//!     （`((a as f64) op (b as f64)).round() as i64`）：cvtsi2sd → 运算 →
+//!     roundsd（half-away）→ cvtsd2si（越界饱和）。Mod 用
+//!     `a - trunc(a/b)*b` 序列复刻 Rust 浮点余数。比较 = `a as f64 op
+//!     b as f64`。
 //!
-//! 编译期拒绝（回落解释器）：Int×Int 算术（i64 精确语义需 round 对齐，
-//!   v1 不冒险）、Mod（无 SSE2 fmod）、Var/Define/调用/效果/控制流、
-//!   Mixed 类型、其他架构。拒绝总是 Err —— 调用方（h_with_config）回落
-//!   `run_mir`，语义正确性永远由解释器兜底，JIT 只是加速器。
+//! 编译期拒绝（回落解释器）：Mixed 类型、Var/Define/调用/效果/控制流、
+//!   其他架构。拒绝总是 Err —— 调用方（h_with_config）回落 `run_mir`，
+//!   语义正确性永远由解释器兜底，JIT 只是加速器。
 //!
 //! ## 寄存器表示
 //! 生成代码操作 `regs: *mut JitValue` 数组（每个槽固定 16 字节，repr(C)
@@ -97,16 +101,17 @@ fn jit_to_value(v: JitValue) -> Value {
 // ExecMem — 可执行内存（零外部依赖）
 // ===================================================================
 
-/// 可执行内存缓冲区。生成代码拷入后经 `ptr()` 转函数指针调用。
+/// 可执行内存缓冲区（W^X 双阶段：alloc_rw 写入 → make_exec 切 RX）。
+/// 生成代码拷入并经 make_exec 后，`as_fn_ptr` 转函数指针调用。
 struct ExecMem {
     ptr: *mut u8,
-    // 仅 unix munmap 释放需要长度（windows VirtualFree 免长）。
-    #[cfg_attr(not(unix), allow(dead_code))]
+    // 仅 unix munmap/mprotect 需要长度（windows VirtualFree 免长）。
     len: usize,
 }
 
 impl ExecMem {
-    fn alloc(len: usize) -> Option<ExecMem> {
+    /// 阶段 1：RW 内存（写入生成代码，不可执行）。
+    fn alloc_rw(len: usize) -> Option<ExecMem> {
         let len = len.max(1);
         #[cfg(target_os = "windows")]
         {
@@ -121,13 +126,13 @@ impl ExecMem {
             }
             const MEM_COMMIT: u32 = 0x1000;
             const MEM_RESERVE: u32 = 0x2000;
-            const PAGE_EXECUTE_READWRITE: u32 = 0x40;
+            const PAGE_READWRITE: u32 = 0x04;
             let p = unsafe {
                 VirtualAlloc(
                     std::ptr::null_mut(),
                     len,
                     MEM_COMMIT | MEM_RESERVE,
-                    PAGE_EXECUTE_READWRITE,
+                    PAGE_READWRITE,
                 )
             };
             if p.is_null() {
@@ -153,14 +158,13 @@ impl ExecMem {
             }
             const PROT_READ: i32 = 1;
             const PROT_WRITE: i32 = 2;
-            const PROT_EXEC: i32 = 4;
             const MAP_PRIVATE: i32 = 2;
             const MAP_ANONYMOUS: i32 = 0x20;
             let p = unsafe {
                 mmap(
                     std::ptr::null_mut(),
                     len,
-                    PROT_READ | PROT_WRITE | PROT_EXEC,
+                    PROT_READ | PROT_WRITE,
                     MAP_PRIVATE | MAP_ANONYMOUS,
                     -1,
                     0,
@@ -176,6 +180,52 @@ impl ExecMem {
         {
             let _ = len;
             None
+        }
+    }
+
+    /// 阶段 2：RW → RX（W^X 收口；写入完成后调用，之后不可再写）。
+    fn make_exec(&mut self) -> Result<(), String> {
+        #[cfg(target_os = "windows")]
+        {
+            unsafe extern "system" {
+                fn VirtualProtect(
+                    lp_address: *mut std::os::raw::c_void,
+                    dw_size: usize,
+                    fl_new_protect: u32,
+                    lpfl_old_protect: *mut u32,
+                ) -> i32;
+            }
+            const PAGE_EXECUTE_READ: u32 = 0x20;
+            let mut old: u32 = 0;
+            let rc = unsafe {
+                VirtualProtect(
+                    self.ptr as *mut std::os::raw::c_void,
+                    self.len,
+                    PAGE_EXECUTE_READ,
+                    &mut old,
+                )
+            };
+            if rc == 0 {
+                return Err("VirtualProtect failed (W^X)".to_string());
+            }
+            Ok(())
+        }
+        #[cfg(unix)]
+        {
+            unsafe extern "C" {
+                fn mprotect(addr: *mut u8, len: usize, prot: i32) -> i32;
+            }
+            const PROT_READ: i32 = 1;
+            const PROT_EXEC: i32 = 4;
+            let rc = unsafe { mprotect(self.ptr, self.len, PROT_READ | PROT_EXEC) };
+            if rc != 0 {
+                return Err("mprotect failed (W^X)".to_string());
+            }
+            Ok(())
+        }
+        #[cfg(not(any(windows, unix)))]
+        {
+            Err("W^X not supported on this platform".to_string())
         }
     }
 
@@ -252,10 +302,16 @@ impl Code {
         self.buf.extend_from_slice(bytes);
     }
 
-    /// `jne rel32`（占位 0，收尾时 patch 到 bail 块）。
-    fn jne_bail(&mut self) {
-        self.extend(&[0x0F, 0x85, 0, 0, 0, 0]);
+    /// `jcc rel32`（占位 0，收尾时 patch 到 bail 块）。cc 为 0F 8x 后缀：
+    /// 0x85=jne / 0x83=jae / 0x8A=jp。
+    fn jcc_bail(&mut self, cc: u8) {
+        self.extend(&[0x0F, cc, 0, 0, 0, 0]);
         self.patches.push(self.buf.len() - 4);
+    }
+
+    /// 类型不匹配 → bail（jne）。
+    fn jne_bail(&mut self) {
+        self.jcc_bail(0x85);
     }
 
     fn disp(reg: Reg, payload: bool) -> i32 {
@@ -268,6 +324,50 @@ impl Code {
         self.extend(&[0x48, 0x8B, 0x01]); // mov rax, [rcx]
         #[cfg(all(unix, not(target_os = "windows")))]
         self.extend(&[0x48, 0x8B, 0x07]); // mov rax, [rdi]
+    }
+
+    /// `cvtsi2sd xmm0, [rax+disp]` — Int payload → double。
+    fn load_int_xmm0(&mut self, reg: Reg) {
+        self.extend(&[0xF2, 0x0F, 0x2A, 0x80]);
+        self.extend(&Self::disp(reg, true).to_le_bytes());
+    }
+
+    /// `cvtsi2sd xmm1, [rax+disp]`。
+    fn load_int_xmm1(&mut self, reg: Reg) {
+        self.extend(&[0xF2, 0x0F, 0x2A, 0x88]);
+        self.extend(&Self::disp(reg, true).to_le_bytes());
+    }
+
+    /// `mov qword [rax+disp], r11` — 写 Int payload。
+    fn store_payload_r11(&mut self, reg: Reg) {
+        self.extend(&[0x4C, 0x89, 0x98]);
+        self.extend(&Self::disp(reg, true).to_le_bytes());
+    }
+
+    fn int_saturate(&mut self) {
+        // comisd xmm0, xmm0（判 nan：无序 → PF）
+        self.extend(&[0x66, 0x0F, 0x2F, 0xC0]);
+        self.extend(&[0x7A, 28]); // jp L_nan（next=0x88 → +28 = 0xa4）
+        // movabs rdx, 0x43E0000000000000（2^63 的 double 位模式 = i64 上限）
+        self.extend(&[0x48, 0xBA, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xE0, 0x43]);
+        // movq xmm1, rdx（modrm=0xCA：mod=11 寄存器形式；0x0A 是 mod=00 的
+        // (%rdx) 内存形式 —— objdump 证实解码为 movq (%rdx),%xmm1，运行时
+        // 解引用 0x43E0... 非法地址 → AV）
+        self.extend(&[0x66, 0x48, 0x0F, 0x6E, 0xCA]);
+        // comisd xmm0, xmm1（modrm=0xC1：mod=11、reg=0→xmm0 第一操作数、
+        // rm=1→xmm1 第二操作数 → Intel comisd xmm0,xmm1 即比较 xmm0 vs
+        // xmm1。0xC8 是 reg=xmm1 → Intel comisd xmm1,xmm0 比较 2^63 vs
+        // xmm0 → 恒 CF=0 → 恒跳 L_max → 全 MAX，objdump 已证实）
+        self.extend(&[0x66, 0x0F, 0x2F, 0xC1]); // comisd xmm0, xmm1（xmm0>=2^63 → CF=0）
+        self.extend(&[0x73, 12]); // jnc L_max（+12 → 40；xmm0>=2^63 → MAX）
+        self.extend(&[0xF2, 0x4C, 0x0F, 0x2D, 0xD8]); // cvtsd2si r11, xmm0（-2^63<=x<2^63 无溢出）
+        self.extend(&[0xEB, 15]); // jmp done（+15 → 50）
+        // L_nan(35)：
+        self.extend(&[0x4D, 0x31, 0xDB]); // xor r11, r11（nan → 0）
+        self.extend(&[0xEB, 10]); // jmp done（+10 → 50）
+        // L_max(40)：
+        self.extend(&[0x49, 0xBB, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x7F]); // movabs r11, i64::MAX
+        // done(50)：
     }
 
     /// `mov qword [rax+disp], imm32` — 写 tag（tag 恒 < 2^31）。
@@ -391,6 +491,98 @@ fn emit_binop_float(code: &mut Code, dst: Reg, a: Reg, op: crate::common::Binary
     code.store_xmm0_mem(dst);
 }
 
+/// Int 算术（复刻解释器**分裂语义**）：
+/// - Add：eval_binary Int+Int **直接 i64 加法**（`a + b`，溢出 wrap ——
+///   x86 add 天然 64 位 wrap；debug 解释器会 panic，release 与 JIT 一致）。
+/// - Sub/Mul/Div：numeric_op **f64 round-trip**
+///   （`((a as f64) op (b as f64)).round() as i64`）：cvtsi2sd → 运算 →
+///   roundsd（half-away）→ cvtsd2si（范围检查饱和）。
+///
+/// 除零（Div）：a as f64 / 0 = ±inf → roundsd 保持 inf → cvtsd2si 饱和
+/// i64::MIN/MAX，与解释器 `(inf).round() as i64` 一致。
+fn emit_binop_int(code: &mut Code, dst: Reg, a: Reg, op: crate::common::BinaryOp, b: Reg) {
+    code.load_regs();
+    code.cmp_tag(a, TAG_INT);
+    code.jne_bail();
+    code.cmp_tag(b, TAG_INT);
+    code.jne_bail();
+    if matches!(op, crate::common::BinaryOp::Add) {
+        // i64 直接加法：mov r11, [a+8]; add r11, [b+8]
+        code.extend(&[0x4C, 0x8B, 0x98]);
+        code.buf.extend(&Code::disp(a, true).to_le_bytes()); // mov r11, [a+8]
+        code.extend(&[0x4C, 0x03, 0x98]);
+        code.buf.extend(&Code::disp(b, true).to_le_bytes()); // add r11, [b+8]
+        code.store_tag(dst, TAG_INT);
+        code.store_payload_r11(dst);
+        return;
+    }
+    code.load_int_xmm0(a);
+    code.load_int_xmm1(b);
+    let opcode = match op {
+        crate::common::BinaryOp::Sub => 0x5C, // subsd
+        crate::common::BinaryOp::Mul => 0x59, // mulsd
+        crate::common::BinaryOp::Div => 0x5E, // divsd
+        _ => unreachable!("non-arith op"),
+    };
+    code.extend(&[0xF2, 0x0F, opcode, 0xC1]); // xmm0 op xmm1（rm=xmm1）
+    code.extend(&[0x66, 0x0F, 0x3A, 0x0B, 0xC0, 0x00]); // roundsd xmm0, xmm0, 0
+    code.extend(&[0xF2, 0x4C, 0x0F, 0x2D, 0xD8]); // cvtsd2si r11, xmm0
+    code.int_saturate();
+    code.store_tag(dst, TAG_INT);
+    code.store_payload_r11(dst);
+}
+
+/// Int Mod（精确复刻解释器 `(af % bf).round() as i64`，Rust 浮点 % =
+/// 截断余数 `a - trunc(a/b)*b`）。SSE2：div → roundsd mode 3（trunc）→
+/// mul → 重载 a 相减 → roundsd mode 0 → cvtsd2si。
+fn emit_binop_int_mod(code: &mut Code, dst: Reg, a: Reg, b: Reg) {
+    code.load_regs();
+    code.cmp_tag(a, TAG_INT);
+    code.jne_bail();
+    code.cmp_tag(b, TAG_INT);
+    code.jne_bail();
+    code.load_int_xmm0(a); // xmm0 = a
+    code.load_int_xmm1(b); // xmm1 = b
+    code.extend(&[0xF2, 0x0F, 0x5E, 0xC1]); // divsd xmm0, xmm1 → a/b
+    code.extend(&[0x66, 0x0F, 0x3A, 0x0B, 0xC0, 0x03]); // roundsd xmm0, xmm0, 3 → trunc(a/b)
+    code.extend(&[0xF2, 0x0F, 0x59, 0xC1]); // mulsd xmm0, xmm1 → trunc(a/b)*b
+    code.load_int_xmm1(a); // xmm1 = a（重读，覆盖 b）
+    code.extend(&[0xF2, 0x0F, 0x5C, 0xC8]); // subsd xmm1, xmm0 → a - trunc(a/b)*b
+    code.extend(&[0x66, 0x0F, 0x3A, 0x0B, 0xC9, 0x00]); // roundsd xmm1, xmm1, 0
+    code.extend(&[0xF2, 0x4C, 0x0F, 0x2D, 0xD9]); // cvtsd2si r11, xmm1
+    code.extend(&[0x66, 0x0F, 0x28, 0xC1]); // movaps xmm0, xmm1（饱和判别读 xmm0）
+    code.int_saturate();
+    code.store_tag(dst, TAG_INT);
+    code.store_payload_r11(dst);
+}
+
+/// Int 比较（精确复刻解释器 numeric_cmp Int 分支 `a as f64 op b as f64`）。
+/// 无 NaN 修正（Int→f64 恒有序）。
+fn emit_binop_int_cmp(code: &mut Code, dst: Reg, a: Reg, op: crate::common::BinaryOp, b: Reg) {
+    code.load_regs();
+    code.cmp_tag(a, TAG_INT);
+    code.jne_bail();
+    code.cmp_tag(b, TAG_INT);
+    code.jne_bail();
+    code.load_int_xmm0(a);
+    code.load_int_xmm1(b);
+    code.extend(&[0x66, 0x0F, 0x2F, 0xC1]); // comisd xmm0, xmm1（寄存器形式）
+    // 清 eax 需在 comisd 后 setcc 前？不行——setcc 前清 eax 会毁标志。
+    // 直接 setcc al + movzx（高位残留用 movzx 清，见 Float cmp 同款）。
+    let setcc = match op {
+        crate::common::BinaryOp::Equal => 0x94,        // sete
+        crate::common::BinaryOp::NotEqual => 0x95,     // setne
+        crate::common::BinaryOp::Less => 0x92,         // setb
+        crate::common::BinaryOp::LessEqual => 0x96,    // setbe
+        crate::common::BinaryOp::Greater => 0x97,      // seta
+        crate::common::BinaryOp::GreaterEqual => 0x93, // setae
+        _ => unreachable!("non-compare op"),
+    };
+    code.setcc_al(setcc);
+    code.extend(&[0x0F, 0xB6, 0xC0]); // movzx eax, al
+    code.store_bool(dst);
+}
+
 /// 编译 Float 比较（结果 Bool）。NaN → false（comisd 无序 + jp 修正）。
 fn emit_binop_float_cmp(code: &mut Code, dst: Reg, a: Reg, op: crate::common::BinaryOp, b: Reg) {
     code.load_regs();
@@ -440,14 +632,19 @@ fn emit_binop_float_cmp(code: &mut Code, dst: Reg, a: Reg, op: crate::common::Bi
     code.store_bool(dst);
 }
 
-/// 线性编译门：body 全部 ∈ {Const, Float BinaryOp} 才编译。
+/// 线性编译门：body 全部 ∈ {Const, 同型 BinaryOp} 才编译。
 /// 返回 (可执行代码, 结果寄存器)。
 fn try_compile(func: &MirFunction) -> Option<(ExecMem, Reg)> {
     if func.body.is_empty() || !cfg!(target_arch = "x86_64") {
         return None;
     }
-    // 寄存器类型线性跟踪（v1：仅 Float 参与 BinaryOp）。
-    let mut types: Vec<bool> = vec![false; func.n_regs]; // true = Float
+    // 寄存器类型线性跟踪（Int / Float；比较结果 Bool 不再参与后续 BinaryOp）。
+    #[derive(Clone, Copy, PartialEq)]
+    enum Ty {
+        Int,
+        Float,
+    }
+    let mut types: Vec<Option<Ty>> = vec![None; func.n_regs];
     let mut code = Code::new();
     let mut last_dst: Option<Reg> = None;
 
@@ -457,37 +654,56 @@ fn try_compile(func: &MirFunction) -> Option<(ExecMem, Reg)> {
                 if !emit_const(&mut code, *dst, v) {
                     return None;
                 }
-                types[*dst] = matches!(v, Value::Float(_));
+                types[*dst] = match v {
+                    Value::Int(_) => Some(Ty::Int),
+                    Value::Float(_) => Some(Ty::Float),
+                    _ => None,
+                };
                 last_dst = Some(*dst);
             }
             MirInst::BinaryOp(dst, a, op, b) => {
                 if *dst >= func.n_regs || *a >= func.n_regs || *b >= func.n_regs {
                     return None;
                 }
-                // v1：仅 Float×Float（Int 算术的 i64 精确语义 / Mod 的 fmod
-                // 超出 v1 模板集，编译期拒绝回落解释器）。
-                if !types[*a] || !types[*b] {
-                    return None;
-                }
-                match op {
+                // 同型（Int×Int / Float×Float）才编译；Mixed/未跟踪拒绝。
+                let (is_int, is_float) = match (types[*a], types[*b]) {
+                    (Some(Ty::Int), Some(Ty::Int)) => (true, false),
+                    (Some(Ty::Float), Some(Ty::Float)) => (false, true),
+                    _ => return None,
+                };
+                let arith = matches!(
+                    op,
                     crate::common::BinaryOp::Add
-                    | crate::common::BinaryOp::Sub
-                    | crate::common::BinaryOp::Mul
-                    | crate::common::BinaryOp::Div => {
-                        emit_binop_float(&mut code, *dst, *a, op.clone(), *b);
-                        types[*dst] = true;
-                    }
+                        | crate::common::BinaryOp::Sub
+                        | crate::common::BinaryOp::Mul
+                        | crate::common::BinaryOp::Div
+                );
+                let cmp = matches!(
+                    op,
                     crate::common::BinaryOp::Equal
-                    | crate::common::BinaryOp::NotEqual
-                    | crate::common::BinaryOp::Greater
-                    | crate::common::BinaryOp::Less
-                    | crate::common::BinaryOp::GreaterEqual
-                    | crate::common::BinaryOp::LessEqual => {
-                        emit_binop_float_cmp(&mut code, *dst, *a, op.clone(), *b);
-                        types[*dst] = false; // Bool
-                    }
-                    // Mod：无 SSE2 fmod → 编译期拒绝
-                    crate::common::BinaryOp::Mod => return None,
+                        | crate::common::BinaryOp::NotEqual
+                        | crate::common::BinaryOp::Greater
+                        | crate::common::BinaryOp::Less
+                        | crate::common::BinaryOp::GreaterEqual
+                        | crate::common::BinaryOp::LessEqual
+                );
+                if is_float && cmp {
+                    emit_binop_float_cmp(&mut code, *dst, *a, op.clone(), *b);
+                    types[*dst] = None; // Bool
+                } else if is_int && cmp {
+                    emit_binop_int_cmp(&mut code, *dst, *a, op.clone(), *b);
+                    types[*dst] = None; // Bool
+                } else if is_float && arith {
+                    emit_binop_float(&mut code, *dst, *a, op.clone(), *b);
+                    types[*dst] = Some(Ty::Float);
+                } else if is_int && arith {
+                    emit_binop_int(&mut code, *dst, *a, op.clone(), *b);
+                    types[*dst] = Some(Ty::Int);
+                } else if is_int && matches!(op, crate::common::BinaryOp::Mod) {
+                    emit_binop_int_mod(&mut code, *dst, *a, *b);
+                    types[*dst] = Some(Ty::Int);
+                } else {
+                    return None; // Float Mod（无 fmod 模板）等
                 }
                 last_dst = Some(*dst);
             }
@@ -499,10 +715,12 @@ fn try_compile(func: &MirFunction) -> Option<(ExecMem, Reg)> {
     // 正常出口：xor eax,eax; ret
     code.extend(&[0x31, 0xC0, 0xC3]);
     let bytes = code.finish_bail(&emit_bail_block());
-    let mem = ExecMem::alloc(bytes.len())?;
+    // W^X：先 RW 写入，再切 RX（见 ExecMem::make_exec）。
+    let mut mem = ExecMem::alloc_rw(bytes.len())?;
     unsafe {
         std::ptr::copy_nonoverlapping(bytes.as_ptr(), mem.ptr, bytes.len());
     }
+    mem.make_exec().ok()?;
     Some((mem, last_dst))
 }
 

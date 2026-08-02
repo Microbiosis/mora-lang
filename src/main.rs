@@ -6,20 +6,32 @@ use std::path::Path;
 use std::process;
 
 use mora::interpreter::Interpreter;
-use mora::lexer::Lexer;
-use mora::mir::expr::MirExpr;
 use mora::parser_v3::ParserV3;
 use mora::record::{self, Mode};
 use mora::typeck::format_error;
 
-/// 使用 ParserV3 解析代码（直接 MirExpr 输出，零 AST 依赖）
-fn parse_with_v3(source: &str) -> Vec<MirExpr> {
-    let mut lexer = Lexer::new(source);
-    let tokens = lexer.scan_tokens();
-    let parser = ParserV3::new(tokens);
-    parser
-        .parse()
-        .unwrap_or_else(|e| panic!("parse_with_v3 failed: {:?}", e))
+/// v0.75.40: 单遍编译 + 优化 — 取代 parse→lower 双阶段。
+/// ParserV3::compile 直接 emit MirInst + 并行产出 witness；优化语义与
+/// lower_mir_exprs_with_opt 完全一致（cascades apply_rules 恒跑 + SSA opt
+/// 显式 --opt 优先，未指定走 env 兜底）。调用方各自做 witness typecheck
+/// 并保留原有错误消息。
+fn compile_and_opt(
+    source: &str,
+    opt_level: Option<mora::mir::ssa::OptLevel>,
+) -> (mora::mir::MirFunction, Vec<mora::mir::witness::MirWitness>) {
+    let (mut func, witnesses) =
+        ParserV3::compile(source).unwrap_or_else(|e| panic!("compile_and_opt failed: {e}"));
+    // v0.58: Cascades 优化 pass（同 lower_mir_exprs_with_opt）
+    mora::mir::optimize::apply_rules(&mut func);
+    // v0.75.7: SSA 优化管线（显式等级 or env）
+    let level = match opt_level {
+        Some(l) => l,
+        None => mora::mir::ssa::OptLevel::from_env(),
+    };
+    if level.enabled() {
+        mora::mir::opt::optimize(&mut func, level);
+    }
+    (func, witnesses)
 }
 
 fn main() {
@@ -386,11 +398,11 @@ fn update_lock(pkg_name: &str, url: &str) {
 fn run_file(path: &str, opt_level: Option<mora::mir::ssa::OptLevel>) {
     let source = fs::read_to_string(path).expect("Failed to read file");
 
-    // v0.55: ParserV3 → MirExpr 路径（零 AST 依赖）
-    let mut exprs = parse_with_v3(&source);
+    // v0.75.40: 单遍编译（compile 直接 emit MirInst + witness）
+    let (func, witnesses) = compile_and_opt(&source, opt_level);
 
-    // 类型检查 (HM 推断)
-    let type_errors = mora::mir::lower::typecheck_mir_exprs(&mut exprs);
+    // 类型检查 (HM 推断) — 消费 witness（零 MirExpr）
+    let type_errors = mora::typeck::check_mir::check_program_witnesses(&witnesses);
     if !type_errors.is_empty() {
         for err in &type_errors {
             eprintln!("{}", format_error(err));
@@ -399,19 +411,6 @@ fn run_file(path: &str, opt_level: Option<mora::mir::ssa::OptLevel>) {
         process::exit(2);
     }
 
-    // Tier 1: MIR 解释器是唯一执行引擎
-    // v0.75.30: 显式 `--opt` 优先，未指定走 env 兜底（lower_mir_exprs）。
-    let lowered = match opt_level {
-        Some(level) => mora::mir::lower::lower_mir_exprs_with_opt(&exprs, level),
-        None => mora::mir::lower::lower_mir_exprs(&exprs),
-    };
-    let func = match lowered {
-        Ok(f) => f,
-        Err(e) => {
-            eprintln!("MIR lowering error: {}", e);
-            process::exit(1);
-        }
-    };
     let mut interpreter = Interpreter::new();
     let mut env = interpreter.take_env();
     // v0.75.9: 包裹 Arc 走全局 DAG 缓存（run_mir + run_main_task 共享同一项）
@@ -451,9 +450,9 @@ fn run_record(path: &str, name: &str, opt_level: Option<mora::mir::ssa::OptLevel
         process::exit(1);
     });
 
-    let mut exprs = parse_with_v3(&source);
+    let (func, witnesses) = compile_and_opt(&source, opt_level);
 
-    let type_errors = mora::mir::lower::typecheck_mir_exprs(&mut exprs);
+    let type_errors = mora::typeck::check_mir::check_program_witnesses(&witnesses);
     if !type_errors.is_empty() {
         for err in &type_errors {
             eprintln!("{}", format_error(err));
@@ -461,20 +460,6 @@ fn run_record(path: &str, name: &str, opt_level: Option<mora::mir::ssa::OptLevel
         eprintln!("record: typeck failed, abort");
         process::exit(2);
     }
-
-    // Tier 1: MIR lowering
-    // v0.75.30: 显式 `--opt` 优先，未指定走 env 兜底。
-    let lowered = match opt_level {
-        Some(level) => mora::mir::lower::lower_mir_exprs_with_opt(&exprs, level),
-        None => mora::mir::lower::lower_mir_exprs(&exprs),
-    };
-    let func = match lowered {
-        Ok(f) => f,
-        Err(e) => {
-            eprintln!("record: MIR lowering error: {}", e);
-            process::exit(1);
-        }
-    };
 
     let rec_path = recording_path(name);
     let mut interpreter = Interpreter::new();
@@ -527,9 +512,9 @@ fn run_replay(path: &str, name: &str, opt_level: Option<mora::mir::ssa::OptLevel
         process::exit(1);
     });
 
-    let mut exprs = parse_with_v3(&source);
+    let (func, witnesses) = compile_and_opt(&source, opt_level);
 
-    let type_errors = mora::mir::lower::typecheck_mir_exprs(&mut exprs);
+    let type_errors = mora::typeck::check_mir::check_program_witnesses(&witnesses);
     if !type_errors.is_empty() {
         for err in &type_errors {
             eprintln!("{}", format_error(err));
@@ -537,20 +522,6 @@ fn run_replay(path: &str, name: &str, opt_level: Option<mora::mir::ssa::OptLevel
         eprintln!("replay: typeck failed, abort");
         process::exit(2);
     }
-
-    // Tier 1: MIR lowering
-    // v0.75.30: 显式 `--opt` 优先，未指定走 env 兜底。
-    let lowered = match opt_level {
-        Some(level) => mora::mir::lower::lower_mir_exprs_with_opt(&exprs, level),
-        None => mora::mir::lower::lower_mir_exprs(&exprs),
-    };
-    let func = match lowered {
-        Ok(f) => f,
-        Err(e) => {
-            eprintln!("replay: MIR lowering error: {}", e);
-            process::exit(1);
-        }
-    };
 
     let rec_path = recording_path(name);
     let mut interpreter = Interpreter::new();
@@ -765,8 +736,8 @@ fn run_snapshot(file: &str, name: &str, update: bool, opt_level: Option<mora::mi
         eprintln!("snapshot: failed to read {}", file);
         process::exit(1);
     });
-    let mut exprs = parse_with_v3(&source);
-    let type_errors = mora::mir::lower::typecheck_mir_exprs(&mut exprs);
+    let (func, witnesses) = compile_and_opt(&source, opt_level);
+    let type_errors = mora::typeck::check_mir::check_program_witnesses(&witnesses);
     if !type_errors.is_empty() {
         for err in &type_errors {
             eprintln!("{}", format_error(err));
@@ -774,20 +745,6 @@ fn run_snapshot(file: &str, name: &str, update: bool, opt_level: Option<mora::mi
         eprintln!("snapshot: typeck failed");
         process::exit(2);
     }
-
-    // Tier 1: MIR lowering
-    // v0.75.30: 显式 `--opt` 优先，未指定走 env 兜底。
-    let lowered = match opt_level {
-        Some(level) => mora::mir::lower::lower_mir_exprs_with_opt(&exprs, level),
-        None => mora::mir::lower::lower_mir_exprs(&exprs),
-    };
-    let func = match lowered {
-        Ok(f) => f,
-        Err(e) => {
-            eprintln!("snapshot: MIR lowering error: {}", e);
-            process::exit(1);
-        }
-    };
 
     let mut interpreter = Interpreter::new();
     let mut env = interpreter.take_env();
@@ -1054,11 +1011,11 @@ fn truncate(s: &str, max: usize) -> String {
 fn run_check(path: &str) {
     let source = fs::read_to_string(path).expect("Failed to read file");
 
-    let mut exprs = parse_with_v3(&source);
+    let (_, witnesses) = ParserV3::compile(&source).expect("Failed to compile");
 
-    let type_errors = mora::mir::lower::typecheck_mir_exprs(&mut exprs);
+    let type_errors = mora::typeck::check_mir::check_program_witnesses(&witnesses);
     if type_errors.is_empty() {
-        println!("No type errors found. ({} expressions)", exprs.len());
+        println!("No type errors found. ({} expressions)", witnesses.len());
     } else {
         for err in &type_errors {
             eprintln!("{}", format_error(err));

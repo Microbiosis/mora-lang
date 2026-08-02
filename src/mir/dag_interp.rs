@@ -7,15 +7,16 @@
 //! With `dag.add_sequential_edges()`, this degenerates to linear
 //! execution, making `run_mir ≡ run_dag`.
 //!
-//! # 执行边界（v0.75.33）
+//! # 执行边界（v0.75.33，v0.75.36 修正）
 //!
-//! 本解释器为 **pregel 顶点执行** 设计：BSP 引擎逐超步调用，顶点内
-//! 无 `MirInst` 循环（迭代在引擎层）。因此：
+//! 本解释器为 **pregel 顶点执行 + 生产主路径** 双用途：pregel BSP 引擎
+//! 逐超步调用，同时 `run_mir`（main.rs/REPL/import）经 `run_dag_with_signal`
+//! 也走本解释器——**生产路径全部经过 DAG 解释器，不存在「循环走线性
+//! fallback」**。
 //! - 无循环的直线/分支程序：正确（Sequence 前驱判定保证 Define/Var 顺序）。
-//! - 含 `MirInst` 循环（for/while 降级到 JumpIf 回边）的程序：**不保证** —
-//!   `reg_ready` 一旦置 true 永久保持，循环内重执行节点靠寄存器依赖的
-//!   排序失效，effect 可能读上一轮的值。含循环的程序走线性 `run_mir`
-//!   （生产路径，main.rs/REPL/import 全部走线性）。
+//! - 含 `MirInst` 循环（for/while 降级到 JumpIf 回边）的程序：v0.75.34 起
+//!   正确（块内全序 + 控制转移 handler 决定 + wave 去重），循环累加验证
+//!   输出 6/45。回归保护：`tests/tier0_replacement.rs`、`orchestrate_v3_pipeline.rs`。
 //! - 优化器（CSE/DeadNode/ConstFolding）删除/合并节点时不得破坏控制目标
 //!   与寄存器消费者（dag_rule/dag_search 的 guard + reg_rename 负责）。
 

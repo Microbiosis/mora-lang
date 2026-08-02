@@ -262,13 +262,11 @@ fn apply_rewrite(dag: &mut MirDag, rw: DagRewrite) {
                 continue;
             }
             match node {
-                MirDagNode::Compute { inst, input_regs, .. } => {
+                MirDagNode::Compute {
+                    inst, input_regs, ..
+                } => {
                     *inst = inst.map_regs(&mut |r| {
-                        if r == old_reg {
-                            new_reg
-                        } else {
-                            r
-                        }
+                        if r == old_reg { new_reg } else { r }
                     });
                     for r in input_regs.iter_mut() {
                         if *r == old_reg {
@@ -278,11 +276,7 @@ fn apply_rewrite(dag: &mut MirDag, rw: DagRewrite) {
                 }
                 MirDagNode::Effect { inst } => {
                     *inst = inst.map_regs(&mut |r| {
-                        if r == old_reg {
-                            new_reg
-                        } else {
-                            r
-                        }
+                        if r == old_reg { new_reg } else { r }
                     });
                 }
                 MirDagNode::Branch { cond, .. } => {
@@ -638,9 +632,9 @@ mod tests {
     #[test]
     fn cse_renames_consumer_regs_on_merge() {
         let mut dag = make_dag(vec![
-            MirInst::Const(4, Value::Nil),   // n0: let 占位（dst=4）
+            MirInst::Const(4, Value::Nil),             // n0: let 占位（dst=4）
             MirInst::Assign("__let_result".into(), 4), // n1: 消费 reg4
-            MirInst::Const(7, Value::Nil),   // n2: 第二个 let 占位（dst=7）
+            MirInst::Const(7, Value::Nil),             // n2: 第二个 let 占位（dst=7）
             MirInst::Assign("__let_result".into(), 7), // n3: 消费 reg7
         ]);
         let stages: Vec<Vec<Box<dyn DagRewriteRule>>> = vec![vec![Box::new(CseDagRule)]];

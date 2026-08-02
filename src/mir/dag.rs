@@ -811,14 +811,19 @@ mod tests {
         ]);
         let dag = dag_analyze(&func);
         let levels_before = topological_sort(&dag).unwrap();
-        assert_eq!(levels_before.len(), 3, "block-internal full order → 3 levels");
+        assert_eq!(
+            levels_before.len(),
+            3,
+            "block-internal full order → 3 levels"
+        );
 
         // prune_sequence_edges 保留所有 Sequence 边（no-op 保留正确性）。
         let mut dag_pruned = dag_analyze(&func);
         dag_pruned.prune_sequence_edges();
         let levels_pruned = topological_sort(&dag_pruned).unwrap();
         assert_eq!(
-            levels_pruned.len(), 3,
+            levels_pruned.len(),
+            3,
             "prune 保留全序链 → 仍 3 levels, got {}",
             levels_pruned.len()
         );

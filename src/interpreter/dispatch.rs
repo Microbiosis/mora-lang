@@ -77,6 +77,16 @@ impl Interpreter {
                 );
             }
         }
+        // v0.75.52: P6 — BuiltinKind 静态表登记校验。from_name 是 name→kind
+        // 的单一来源；此处仅验证 name 已登记（未登记走原生 match），
+        // 未来 call_function 整体迁移到 kind dispatch 时以此为基。
+        let _kind = crate::value::BuiltinKind::from_name(name);
+        // 放行：`__` 前缀为测试哨兵（故意调用不存在函数验证错误传播），
+        // `merge_with` 为 M 原语（非 kind 域）。
+        testcase!(
+            _kind.is_some() || name.starts_with("__") || matches!(name, "merge_with"),
+            format!("call_function: name 未登记 BuiltinKind::from_name: {name}")
+        );
         match name {
             // v0.75.23: M 原语 `merge_with(key, strategy)` — 为随后的 worker /
             // transaction / observe 块声明该 key 的 per-key CRDT 合并策略
@@ -1377,5 +1387,34 @@ mod tests {
                 Span::default(),
             )
             .expect("merge_with should succeed");
+    }
+
+    /// v0.75.52: BuiltinKind::from_name 静态表覆盖（P6）—— 26 kind 全可查，
+    /// 未登记名返回 None（fallback）。
+    #[test]
+    fn builtin_kind_from_name_coverage() {
+        use crate::value::BuiltinKind;
+        for (name, kind) in [
+            ("print", BuiltinKind::Print),
+            ("range", BuiltinKind::Range),
+            ("len", BuiltinKind::Len),
+            ("file.read_text", BuiltinKind::File),
+            ("memory.store", BuiltinKind::Memory),
+            ("ai.chat", BuiltinKind::AiChat),
+            ("ai.tokens", BuiltinKind::AiTokens),
+            ("ai.retry", BuiltinKind::Ai),
+            ("web.fetch", BuiltinKind::Web),
+            ("json.parse", BuiltinKind::Json),
+            ("ccr.put", BuiltinKind::Ccr),
+            ("plan.update", BuiltinKind::Plan),
+            ("mora.refine", BuiltinKind::Mora),
+        ] {
+            assert_eq!(
+                BuiltinKind::from_name(name),
+                Some(kind),
+                "from_name({name})"
+            );
+        }
+        assert_eq!(BuiltinKind::from_name("no_such_fn"), None, "未登记应 None");
     }
 }

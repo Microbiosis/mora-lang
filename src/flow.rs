@@ -345,51 +345,6 @@ pub fn value_type_name(value: &Value) -> &'static str {
     type_name(value)
 }
 
-/// 返回值可用的方法名列表
-pub fn get_methods_for_value(value: &Value) -> Vec<String> {
-    match value {
-        Value::String(_) => vec![
-            "len",
-            "upper",
-            "lower",
-            "trim",
-            "starts_with",
-            "ends_with",
-            "contains",
-            "split",
-            "replace",
-            "json",
-        ],
-        Value::List(_) => vec![
-            "push",
-            "pop",
-            "get",
-            "len",
-            "map",
-            "filter",
-            "reduce",
-            "take",
-            "drop",
-            "window",
-            "batch",
-            "shape",
-            "flatten",
-            "transpose",
-            "reshape",
-        ],
-        Value::Dict(_) => vec!["get", "set", "keys", "values", "len", "json"],
-        Value::Conversation { .. } => vec!["chat", "history", "clear", "model", "len"],
-        Value::Stream { .. } => vec!["collect", "is_done"],
-        Value::Router { .. } => vec!["route", "listen"],
-        Value::McpServer { .. } => vec!["tool", "serve"],
-        Value::Agent { .. } => vec!["run", "name", "max_steps"],
-        _ => vec![],
-    }
-    .into_iter()
-    .map(|s| s.to_string())
-    .collect()
-}
-
 /// JSON 字符串转 Value
 pub fn json_to_value(json: &str) -> Result<Value, String> {
     let trimmed = json.trim();

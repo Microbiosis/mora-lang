@@ -722,7 +722,7 @@ impl ParserV3 {
             return None;
         }
         if exprs.len() == 1 {
-            return Some(exprs.into_iter().next().unwrap());
+            return Some(exprs.into_iter().next().expect("len==1 verified above"));
         }
         Some(MirExpr {
             kind: MirExprKind::Sequence(exprs),

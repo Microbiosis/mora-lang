@@ -210,13 +210,14 @@ impl HMInference {
         let mut subst = Substitution::new();
         let mut errors: Vec<TypeError> = Vec::new();
         for constraint in self.constraints.drain(..) {
-            if let Err(err) = unify::solve(&constraint, &subst) {
-                errors.push(err);
-                // Continue with a fresh substitution so a single bad
-                // program does not abort the whole analysis.
-                subst = Substitution::new();
-            } else {
-                subst = unify::solve(&constraint, &subst).unwrap();
+            match unify::solve(&constraint, &subst) {
+                Ok(new_subst) => subst = new_subst,
+                Err(err) => {
+                    errors.push(err);
+                    // Continue with a fresh substitution so a single bad
+                    // program does not abort the whole analysis.
+                    subst = Substitution::new();
+                }
             }
         }
         if errors.is_empty() {

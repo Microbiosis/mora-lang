@@ -1101,7 +1101,10 @@ pub fn compact_value_recursive(value: &Value, min_items: usize) -> (Value, usize
     }
 
     debug_assert_eq!(results.len(), 1, "post-order DFS must yield 1 root result");
-    results.into_iter().next().unwrap()
+    results
+        .into_iter()
+        .next()
+        .expect("post-order DFS must yield 1 root result (debug_assert verified)")
 }
 
 // ──────────────────── 字符串入口（解析后调用 crush_json） ────────────────────

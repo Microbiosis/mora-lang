@@ -60,7 +60,10 @@ impl OrchestrateDag {
             in_degree.insert(n.as_str(), 0);
         }
         for (_, to) in &self.edges {
-            *in_degree.get_mut(to.as_str()).unwrap() += 1;
+            // validate() 已保证 to ∈ nodes，此处为结构不变量
+            *in_degree
+                .get_mut(to.as_str())
+                .expect("topological_order: edge target not in nodes (validate passed)") += 1;
         }
 
         // 起点: in_degree == 0
@@ -85,7 +88,9 @@ impl OrchestrateDag {
             order.push(n.to_string());
             if let Some(tos) = edges_by_from.get(n) {
                 for to in tos {
-                    let d = in_degree.get_mut(to).unwrap();
+                    let d = in_degree.get_mut(to).expect(
+                        "topological_order: edge target missing in_degree (validate passed)",
+                    );
                     *d -= 1;
                     if *d == 0 {
                         queue.push_back(to);

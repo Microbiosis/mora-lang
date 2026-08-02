@@ -67,14 +67,14 @@ impl WorkerPool {
                 loop {
                     // Block for the next batch (releases mutex while waiting).
                     let msg = {
-                        let guard = rx.lock().unwrap();
+                        let guard = rx.lock().expect("worker pool rx poisoned");
                         guard.recv()
                     };
                     let Ok(msg) = msg else { break }; // channel closed → exit
                     // Grab jobs from the shared queue until empty.
                     loop {
                         let job = {
-                            let mut queue = msg.jobs.lock().unwrap();
+                            let mut queue = msg.jobs.lock().expect("worker pool queue poisoned");
                             queue.pop()
                         };
                         match job {

@@ -2,6 +2,35 @@
 
 All notable changes to Mora will be documented in this file.
 
+## [v0.75.47-49] — 2026-08-03 — 架构收口 Phase 1（调研驱动，P1-P5）
+
+（架构审查 × 跨界调研合并计划的零风险立即项，每项独立 commit、
+差分/全量测试锁行为。P1-P3 在 v0.75.47、P4 在 v0.75.48、P5 在 v0.75.49。）
+
+### P1 — 统一 value_type_name（src/compress/json.rs）
+- 删手写 6 变体 JSON 投影 match，复用 `flow::type_name` + 仅 3 个 JSON
+  专名映射（list→array / dict→object / nil→null），语义对 JSON 输入不变。
+
+### P2 — Value::methods() 下沉（src/value.rs / src/interpreter/dispatch.rs）
+- `get_methods_for_value` 从 flow.rs 移到 `value.rs::impl Value::methods()`
+  （Lua 5.4 元表「内禀属性贴近数据定义」思想）。dispatch 的 `methods_of`
+  builtin 直接 `value.methods()`，全仓旧函数清零。
+
+### P3 — 清 v2 TypeChecker 死引用（src/typeck/dispatch.rs）
+- 模块注释仍引用 v0.55 已删的 v2 `TypeChecker`，修正为「HM 单一检查器」。
+
+### P4 — interp.rs + dag_interp.rs → vm.rs（src/mir/）
+- SQLite VDBE 单文件惯例：`run_mir` / `run_mir_with_signal` / `MirSignal` /
+  `run_dag_with_signal*` 合并为 `vm.rs`（931 行，模块内部引用去别名化）。
+- 全部外部引用统一 `crate::mir::vm::`（main/REPL/import/pregel/tests/
+  jit_bench 14 处）。
+
+### P5 — testcase! 宏 + 分支插桩（src/interpreter/dispatch.rs）
+- SQLite `testcase()` 同款宏：debug 构建断言分支守卫命中 + 携带分支名，
+  release 零开销。插桩 `len`（list/string/dict）与 `merge_with`（key/
+  strategy）守卫，覆盖测试验证插桩分支真实可达 —— 覆盖意图自文档化，
+  为 P6（BuiltinId 静态表）铺路。
+
 ## [v0.75.46] — 2026-08-02 — JIT with-block 真实路径验证（阶段 5 后续 D）
 
 ### Added — 真实路径验证（tests/jit_compile.rs + examples/jit_bench.rs）

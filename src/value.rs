@@ -114,6 +114,55 @@ impl std::fmt::Display for BuiltinKind {
     }
 }
 
+impl BuiltinKind {
+    /// v0.75.52: 静态查找表（P6）— 调用名 → BuiltinKind 的单一来源。
+    /// 覆盖裸函数（print/len/range）与 domain 前缀（file.*/ai.chat 等）
+    /// 的 kind 登记；未登记返回 None（dispatch 走原生 match fallback）。
+    pub fn from_name(name: &str) -> Option<BuiltinKind> {
+        // 裸函数
+        match name {
+            "print" => return Some(BuiltinKind::Print),
+            "range" => return Some(BuiltinKind::Range),
+            "len" => return Some(BuiltinKind::Len),
+            _ => {}
+        }
+        // domain 前缀
+        let prefix = name.split('.').next().unwrap_or(name);
+        Some(match prefix {
+            "web" => BuiltinKind::Web,
+            "json" => BuiltinKind::Json,
+            "file" => BuiltinKind::File,
+            "memory" => BuiltinKind::Memory,
+            "bus" => BuiltinKind::Bus,
+            "sandbox" => BuiltinKind::Sandbox,
+            "schedule" => BuiltinKind::Schedule,
+            "ccr" => BuiltinKind::Ccr,
+            "mock" => BuiltinKind::Mock,
+            "ai" => {
+                if name.starts_with("ai.chat") {
+                    BuiltinKind::AiChat
+                } else if name.starts_with("ai.tokens") {
+                    BuiltinKind::AiTokens
+                } else {
+                    BuiltinKind::Ai
+                }
+            }
+            "agent" => BuiltinKind::Agent,
+            "document" => BuiltinKind::Document,
+            "compress" => BuiltinKind::Compress,
+            "crush_json" => BuiltinKind::CrushJson,
+            "tail" => BuiltinKind::Tail,
+            "compose_prompt" => BuiltinKind::ComposePrompt,
+            "exec" => BuiltinKind::Exec,
+            "toolplane" => BuiltinKind::Toolplane,
+            "skill" => BuiltinKind::Skill,
+            "plan" => BuiltinKind::Plan,
+            "mora" => BuiltinKind::Mora,
+            _ => return None,
+        })
+    }
+}
+
 /// v0.40: Immutable Environment snapshot for closure captures.
 ///
 /// Wraps a Box<Environment>. Unlike the legacy Arc<Mutex<Environment>>,

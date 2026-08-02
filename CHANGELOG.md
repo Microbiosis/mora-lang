@@ -2,6 +2,22 @@
 
 All notable changes to Mora will be documented in this file.
 
+## [v0.75.46] — 2026-08-02 — JIT with-block 真实路径验证（阶段 5 后续 D）
+
+### Added — 真实路径验证（tests/jit_compile.rs + examples/jit_bench.rs）
+- **with-config 差分测试**：`WithConfig{jit:true}` 经 `h_with_config`
+  dispatch 走 `run_jit` —— 可编译 body 成功不回落、不可编译 body（含
+  Define 副作用）编译期拒绝回落 `run_mir`；两者与 jit=false 的 env
+  终态一致（config 设置/恢复无副作用）。
+- **benchmark example**（`cargo run --release --example jit_bench`）：
+  纯 Float 算术函数 1M 次执行对比。
+
+### Benchmark（本机 release，如实记录）
+- `JIT: 14.5s vs MIR: 17.5s → 1.21x`。v1 单轮 = 编译（ExecMem 分配 +
+  代码生成）+ 执行，with-block 每轮重编译，编译开销主导（1.21x 反映
+  真实路径成本）。持续加速路径：ExecMem 复用缓存 / 编译结果 memo
+  （当前以-block 语义每轮新鲜编译，属 v1 已知边界）。
+
 ## [v0.75.45] — 2026-08-02 — JIT 控制流模板（阶段 5 后续 C）
 
 ### Added — Jump / JumpIf / JumpIfNot 线性化（src/mir/jit.rs）

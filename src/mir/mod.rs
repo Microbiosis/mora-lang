@@ -24,7 +24,6 @@ use crate::value::Value;
 pub mod cache;
 pub mod expr;
 pub mod host;
-pub mod interp;
 pub mod jit;
 pub mod lower;
 pub mod opt;
@@ -36,11 +35,11 @@ pub mod witness;
 
 // v0.59: DAG IR — dataflow analysis from linear MIR
 pub mod dag;
-pub mod dag_interp;
 pub mod handlers;
+pub mod vm;
 
 pub use expr::MirExpr;
-pub use interp::run_mir;
+pub use vm::run_mir;
 // lower_program removed in Phase A (v0.55) — use lower_mir_exprs instead
 
 /// 虚拟寄存器索引（无限数量，lowering 时计数器分配）

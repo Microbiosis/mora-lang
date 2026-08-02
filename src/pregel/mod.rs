@@ -138,7 +138,7 @@ pub struct MirPregelEngine {
     agent_outcome_cache: HashMap<
         String,
         (
-            crate::mir::interp::MirSignal,
+            crate::mir::vm::MirSignal,
             crate::value::Value,
             Vec<crate::checkpoint::SendTask>,
         ),
@@ -154,7 +154,7 @@ pub struct MirPregelEngine {
     /// v0.75.10: 并行路径的 memo 带回 — 并行 worker 内联执行，无 memo；
     /// worker 返回实际执行节点数，主线程（RECONCILE）用它区分「跳过路径的
     /// 空 memo」→ 不覆盖增量 memo（覆盖会丢失上一超步的记忆）。
-    agent_memos: HashMap<String, crate::mir::dag_interp::DagExecMemo>,
+    agent_memos: HashMap<String, crate::mir::vm::DagExecMemo>,
 }
 
 /// v0.74: Engine runtime metrics.
@@ -177,7 +177,7 @@ pub struct EngineStats {
 /// inline (sequential EXEC). Everything needed by RECONCILE.
 pub struct AgentExecOutcome {
     pub node_name: String,
-    pub signal: crate::mir::interp::MirSignal,
+    pub signal: crate::mir::vm::MirSignal,
     pub result: crate::value::Value,
     pub env: crate::value::Environment,
     pub sends: Vec<crate::checkpoint::SendTask>,
@@ -450,7 +450,7 @@ impl MirPregelEngine {
             ),
         );
 
-        if matches!(outcome.signal, crate::mir::interp::MirSignal::Halt(_)) {
+        if matches!(outcome.signal, crate::mir::vm::MirSignal::Halt(_)) {
             self.vertex_state
                 .insert(node_name.clone(), VertexState::Halted);
         } else {
@@ -493,7 +493,7 @@ impl MirPregelEngine {
                 if let Some(cond_body) = &edge.condition_body {
                     let mut cond_env = host.environment().lock().clone();
                     // v0.75.9: 包裹 Arc 走全局 DAG 缓存
-                    let cond_val = crate::mir::interp::run_mir(
+                    let cond_val = crate::mir::vm::run_mir(
                         &std::sync::Arc::new(cond_body.clone()),
                         host,
                         &mut cond_env,
@@ -653,7 +653,7 @@ impl MirPregelEngine {
                         if let Some(cond_body) = &edge.condition_body {
                             let mut cond_env = interpreter.environment().lock().clone();
                             // v0.75.9: 包裹 Arc 走全局 DAG 缓存
-                            let cond_val = crate::mir::interp::run_mir(
+                            let cond_val = crate::mir::vm::run_mir(
                                 &std::sync::Arc::new(cond_body.clone()),
                                 interpreter,
                                 &mut cond_env,
@@ -773,15 +773,14 @@ impl MirPregelEngine {
                             let started = std::time::Instant::now();
                             // v0.75.10: 寄存器级增量执行 — 纯节点输入与上次
                             // 相等则跳过；副作用/env 读取节点永远重跑。
-                            let (signal, result) =
-                                crate::mir::dag_interp::run_dag_with_signal_memo(
-                                    dag.as_ref(),
-                                    task_body.as_ref(),
-                                    &mut memo,
-                                    interpreter,
-                                    &mut env,
-                                )
-                                .map_err(|e| format!("Pregel node '{}': {}", node_name, e))?;
+                            let (signal, result) = crate::mir::vm::run_dag_with_signal_memo(
+                                dag.as_ref(),
+                                task_body.as_ref(),
+                                &mut memo,
+                                interpreter,
+                                &mut env,
+                            )
+                            .map_err(|e| format!("Pregel node '{}': {}", node_name, e))?;
                             let duration_ms = started.elapsed().as_millis();
                             let nodes_executed = memo.executed_nodes;
                             self.agent_memos.insert(node_name.clone(), memo);
@@ -904,16 +903,13 @@ impl MirPregelEngine {
                                         // v0.75.6: 用缓存 dag 执行（避免每超步重建）
                                         // v0.75.7: 计时 per-agent 耗时
                                         let job_started = std::time::Instant::now();
-                                        let (signal, result) =
-                                            crate::mir::dag_interp::run_dag_with_signal(
-                                                dag.as_ref(),
-                                                &task,
-                                                interp_clone.as_mut(),
-                                                &mut env,
-                                            )
-                                            .map_err(
-                                                |e| format!("Pregel node '{}': {}", name, e),
-                                            )?;
+                                        let (signal, result) = crate::mir::vm::run_dag_with_signal(
+                                            dag.as_ref(),
+                                            &task,
+                                            interp_clone.as_mut(),
+                                            &mut env,
+                                        )
+                                        .map_err(|e| format!("Pregel node '{}': {}", name, e))?;
                                         let duration_ms = job_started.elapsed().as_millis();
                                         let sends = std::mem::take(interp_clone.dynamic_sends());
                                         Ok(Box::new(AgentExecOutcome {
@@ -1011,7 +1007,7 @@ impl MirPregelEngine {
             if let Some(master) = self.master_compute.clone() {
                 let mut master_env = interpreter.environment().lock().clone();
                 // v0.75.9: master_compute 已是 Arc，直接走全局 DAG 缓存
-                crate::mir::interp::run_mir(&master, interpreter, &mut master_env)?;
+                crate::mir::vm::run_mir(&master, interpreter, &mut master_env)?;
             }
 
             // interrupt after
@@ -1059,7 +1055,7 @@ impl MirPregelEngine {
                         env.define("current".into(), acc.clone(), false);
                         env.define("incoming".into(), incoming.clone(), false);
                         // v0.75.9: combiner_bodies 已是 Arc，直接走全局 DAG 缓存
-                        match crate::mir::interp::run_mir(&combiner, interpreter, &mut env) {
+                        match crate::mir::vm::run_mir(&combiner, interpreter, &mut env) {
                             Ok(v) => acc = v,
                             Err(_) => acc = incoming.clone(), // fallback: LWW
                         }
@@ -1180,7 +1176,7 @@ impl MirPregelEngine {
                     merge_env.define("current".into(), current.unwrap_or(Value::Nil), false);
                     merge_env.define("incoming".into(), value, false);
                     // v0.75.9: 包裹 Arc 走全局 DAG 缓存
-                    crate::mir::interp::run_mir(
+                    crate::mir::vm::run_mir(
                         &std::sync::Arc::new(merge_fn),
                         interpreter,
                         &mut merge_env,
@@ -1202,7 +1198,7 @@ impl MirPregelEngine {
                     merge_env.define("current".into(), current.unwrap_or(Value::Nil), false);
                     merge_env.define("incoming".into(), value, false);
                     // v0.75.9: 包裹 Arc 走全局 DAG 缓存
-                    crate::mir::interp::run_mir(
+                    crate::mir::vm::run_mir(
                         &std::sync::Arc::new(merge_fn),
                         interpreter,
                         &mut merge_env,
@@ -2271,7 +2267,7 @@ mod tests {
         engine.agent_outcome_cache.insert(
             "a".into(),
             (
-                crate::mir::interp::MirSignal::Return(Value::Int(42)),
+                crate::mir::vm::MirSignal::Return(Value::Int(42)),
                 Value::Int(42),
                 Vec::new(),
             ),

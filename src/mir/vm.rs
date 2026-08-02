@@ -1,34 +1,397 @@
-//! v0.59: DAG-aware MIR interpreter.
+//! v0.75.47: VM 执行内核 — 由 interp.rs + dag_interp.rs 合并而成
+//! （SQLite VDBE 单文件惯例，P4）。
 //!
-//! Executes a `MirDag` using a BSP super-step model. All instruction
-//! logic is delegated to `handlers::dispatch()`. The DAG layer only
-//! controls execution ORDER: topological + BSP super-steps.
+//! - interp 部分：`run_mir` / `run_mir_with_signal` / `MirSignal` /
+//!   `build_task_registry` / `run_main_task` / 索引与模式匹配辅助。
+//! - dag_interp 部分：`run_dag_with_signal*` — BSP 超步模型，生产主路径。
+//!   `run_mir ≡ run_dag`（dag.add_sequential_edges 后退化线性）。
 //!
-//! With `dag.add_sequential_edges()`, this degenerates to linear
-//! execution, making `run_mir ≡ run_dag`.
+//! 模块引用：外部统一 `crate::mir::vm::`（旧 `mir::interp::` /
+//! `mir::dag_interp::` 已合并，见 CHANGELOG v0.75.47）。
+
+//! MIR 解释器（α.0）
 //!
-//! # 执行边界（v0.75.33，v0.75.36 修正）
+//! pc 循环执行 MirFunction。控制流用 Jump/Return/Break/Continue 直接改 pc，
+//! 替代 AST 解释器的 FlowSignal 枚举层层传返。
 //!
-//! 本解释器为 **pregel 顶点执行 + 生产主路径** 双用途：pregel BSP 引擎
-//! 逐超步调用，同时 `run_mir`（main.rs/REPL/import）经 `run_dag_with_signal`
-//! 也走本解释器——**生产路径全部经过 DAG 解释器，不存在「循环走线性
-//! fallback」**。
-//! - 无循环的直线/分支程序：正确（Sequence 前驱判定保证 Define/Var 顺序）。
-//! - 含 `MirInst` 循环（for/while 降级到 JumpIf 回边）的程序：v0.75.34 起
-//!   正确（块内全序 + 控制转移 handler 决定 + wave 去重），循环累加验证
-//!   输出 6/45。回归保护：`tests/tier0_replacement.rs`、`orchestrate_v3_pipeline.rs`。
-//! - 优化器（CSE/DeadNode/ConstFolding）删除/合并节点时不得破坏控制目标
-//!   与寄存器消费者（dag_rule/dag_search 的 guard + reg_rename 负责）。
+//! α.0 复用现有宿主（MirHost）的 call_function / eval_binary，不重写 builtins。
+//! 这样 MIR 解释器只替代"执行引擎"，AI/transport/sandbox facade 不受影响。
+//!
+//! v0.75.x: 参数类型从 `&mut Interpreter` 改为 `&mut dyn MirHost`（mir/host.rs），
+//! 解耦 mir ↔ interpreter 双向依赖。Interpreter 实现 MirHost。
+
+use crate::mir::host::MirHost;
+use crate::value::{Environment, Value};
+
+use super::{MirFunction, MirInst, cache};
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
+/// float 模式匹配容差（`pat_str = "float:x"` 时 |实际 - x| < 此值判等）。
+/// 与 eval 的 tolerance 语义一致：浮点比较用 epsilon 而非 ==。
+const FLOAT_PATTERN_EPSILON: f64 = 1e-9;
+
+/// Build a task registry from a MirFunction body.
+/// Maps task name → (parameter names, body function).
+pub fn build_task_registry(body: &[MirInst]) -> HashMap<&str, (&[String], &MirFunction)> {
+    body.iter()
+        .filter_map(|inst| {
+            if let MirInst::TaskDef { name, params, body } = inst {
+                Some((name.as_str(), (params.as_slice(), body.as_ref())))
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+/// MIR 解释器执行一个 MirFunction，返回最后的表达式值或 Return 值。
+///
+/// v0.59: 现在通过 DAG 分析 + 强制 Sequence 边退化为线性执行，
+/// 与 `run_dag` 共享同一套 handler 函数。等价于:
+///   dag_analyze(func) → add_sequential_edges() → run_dag()
+///
+/// v0.75.9: 接收 `&Arc<MirFunction>` — 优化后 DAG 走全局缓存
+/// （`cache::DAG_CACHE`，key = Arc 指针），同 Arc 跨调用复用。
+pub fn run_mir(
+    func: &Arc<MirFunction>,
+    interp: &mut dyn MirHost,
+    env: &mut Environment,
+) -> Result<Value, String> {
+    Ok(run_mir_with_signal(func, interp, env)?.1)
+}
+
+/// α.1: 索引操作 List[i] / Dict[key] / String[i]
+pub fn index_value(obj: &Value, idx: &Value) -> Result<Value, String> {
+    match (obj, idx) {
+        (Value::List(list), Value::Int(i)) => {
+            let i = *i as usize;
+            list.get(i)
+                .cloned()
+                .ok_or_else(|| format!("index {} out of bounds (len {})", i, list.len()))
+        }
+        (Value::List(list), Value::Float(n)) => {
+            let i = *n as usize;
+            list.get(i)
+                .cloned()
+                .ok_or_else(|| format!("index {} out of bounds (len {})", i, list.len()))
+        }
+        (Value::Dict(map), Value::String(key)) => Ok(map.get(key).cloned().unwrap_or(Value::Nil)),
+        (Value::String(s), Value::Int(i)) => {
+            let i = *i as usize;
+            s.chars().nth(i).map(Value::Char).ok_or_else(|| {
+                format!(
+                    "string index {} out of bounds (len {})",
+                    i,
+                    s.chars().count()
+                )
+            })
+        }
+        _ => Err(format!("cannot index {:?} with {:?}", obj, idx)),
+    }
+}
+
+/// α.1: Value 转字符串（p"..." 拼接用，与 AST 解释器 evaluate_prompt 语义一致）
+pub fn value_to_string(v: &Value) -> String {
+    match v {
+        Value::String(s) => s.clone(),
+        Value::Int(i) => i.to_string(),
+        Value::Float(f) => f.to_string(),
+        Value::Bool(b) => b.to_string(),
+        Value::Nil => "nil".to_string(),
+        Value::Char(c) => c.to_string(),
+        other => format!("{:?}", other),
+    }
+}
+
+pub fn is_truthy(v: &Value) -> bool {
+    match v {
+        Value::Bool(b) => *b,
+        Value::Nil => false,
+        Value::Float(n) => *n != 0.0,
+        Value::Int(i) => *i != 0,
+        Value::String(s) => !s.is_empty(),
+        _ => true,
+    }
+}
+
+/// α.2: 索引赋值 obj[idx] = val（就地修改）
+pub fn index_assign_value(obj: &mut Value, idx: &Value, val: &Value) -> Result<(), String> {
+    match (obj, idx) {
+        (Value::List(list), Value::Int(i)) => {
+            let i = *i as usize;
+            if i >= list.len() {
+                Err(format!("index {} out of bounds (len {})", i, list.len()))
+            } else {
+                list[i] = val.clone();
+                Ok(())
+            }
+        }
+        (Value::List(list), Value::Float(n)) => {
+            let i = *n as usize;
+            if i >= list.len() {
+                Err(format!("index {} out of bounds (len {})", i, list.len()))
+            } else {
+                list[i] = val.clone();
+                Ok(())
+            }
+        }
+        (Value::Dict(map), Value::String(key)) => {
+            map.insert(key.clone(), val.clone());
+            Ok(())
+        }
+        _ => Err("cannot index assign with given object and index".to_string()),
+    }
+}
+
+/// α.2: MIR 模式匹配（简化版）
+/// pat_str 来自 pattern_to_string 的序列化结果
+pub fn self_match_pattern(
+    val: &Value,
+    pat_str: &str,
+    _cond_reg: Option<&Value>,
+    env: &mut Environment,
+) -> bool {
+    // 通配符匹配任意值
+    if pat_str == "_" {
+        return true;
+    }
+    // 变量模式：纯标识符（无 ":" 前缀）匹配任意值，绑定到 env
+    if !pat_str.contains(':') {
+        env.define(pat_str.to_string(), val.clone(), false);
+        return true;
+    }
+    // nil 模式
+    if pat_str == "nil" {
+        return matches!(val, Value::Nil);
+    }
+    // bool 模式
+    if pat_str == "bool:true" {
+        return matches!(val, Value::Bool(true));
+    }
+    if pat_str == "bool:false" {
+        return matches!(val, Value::Bool(false));
+    }
+    // int 模式: int:42
+    if let Some(suffix) = pat_str.strip_prefix("int:")
+        && let Value::Int(i) = val
+        && let Ok(n) = suffix.parse::<i64>()
+    {
+        return i == &n;
+    }
+    // float 模式: float:3.14
+    if let Some(suffix) = pat_str.strip_prefix("float:")
+        && let Value::Float(f) = val
+        && let Ok(n) = suffix.parse::<f64>()
+    {
+        return (f - n).abs() < FLOAT_PATTERN_EPSILON;
+    }
+    // str 模式: str:hello
+    if let Some(suffix) = pat_str.strip_prefix("str:")
+        && let Value::String(s) = val
+    {
+        return s == suffix;
+    }
+    // 列表模式: list:[p1,p2,...]
+    if pat_str == "list:[]" {
+        return matches!(val, Value::List(items) if items.is_empty());
+    }
+    if let Some(inner) = pat_str
+        .strip_prefix("list:[")
+        .and_then(|s| s.strip_suffix(']'))
+    {
+        if let Value::List(items) = val {
+            let pats: Vec<&str> = if inner.is_empty() {
+                Vec::new()
+            } else {
+                inner.split(',').collect()
+            };
+            if items.len() != pats.len() {
+                return false;
+            }
+            return items
+                .iter()
+                .zip(pats.iter())
+                .all(|(item, pat)| self_match_pattern(item, pat, None, env));
+        }
+        return false;
+    }
+    // 字典模式: dict:{k1:v1,k2:v2,...}
+    if pat_str == "dict:{}" {
+        return matches!(val, Value::Dict(map) if map.is_empty());
+    }
+    if let Some(inner) = pat_str
+        .strip_prefix("dict:{")
+        .and_then(|s| s.strip_suffix('}'))
+    {
+        if let Value::Dict(map) = val {
+            let pairs: Vec<&str> = if inner.is_empty() {
+                Vec::new()
+            } else {
+                inner.split(',').collect()
+            };
+            return pairs.iter().all(|pair| {
+                if let Some((k, v)) = pair.split_once(':') {
+                    map.get(k)
+                        .map(|item| self_match_pattern(item, v, None, env))
+                        .unwrap_or(false)
+                } else {
+                    false
+                }
+            });
+        }
+        return false;
+    }
+    // 守卫模式: guard:inner — 只检查内部模式匹配
+    if let Some(inner) = pat_str.strip_prefix("guard:") {
+        return self_match_pattern(val, inner, _cond_reg, env);
+    }
+    // 字符模式: char:c
+    if let Some(suffix) = pat_str.strip_prefix("char:")
+        && let Value::Char(c) = val
+    {
+        return *c == suffix.chars().next().unwrap_or('\0');
+    }
+    // 未匹配的模式
+    false
+}
+
+/// α.3: 查找并执行 main task（与 AST 路径的 interpret() 末尾逻辑一致）。
+/// 扫描 func.body 中的 TaskDef，找到 name="main" 且无参的，执行其 body。
+/// 若不存在或非无参 main 则静默返回 Ok。
+///
+/// v0.75.9: 接收 `&Arc<MirFunction>`；TaskDef body 克隆进 Arc 以便走
+/// `run_mir` 的全局 DAG 缓存。
+pub fn run_main_task(
+    func: &Arc<MirFunction>,
+    interp: &mut dyn MirHost,
+    env: &mut Environment,
+) -> Result<(), String> {
+    let mut main_body: Option<Arc<MirFunction>> = None;
+    for inst in &func.body {
+        if let MirInst::TaskDef { name, params, body } = inst
+            && name == "main"
+            && params.is_empty()
+        {
+            main_body = Some(Arc::new((**body).clone()));
+            break;
+        }
+    }
+    if let Some(main_func) = main_body {
+        let mut main_env = env.clone();
+        let _ = run_mir(&main_func, interp, &mut main_env)?;
+    }
+    Ok(())
+}
+
+/// α.10: 控制流信号（与 AST `FlowSignal` 同形）。
+/// REPL 与 differential test 用来观察 Return/Break/Continue 出口；
+/// 主路径 `run_mir` 直接返回 `Result<Value, String>`，不暴露信号。
+#[derive(Debug, Clone, PartialEq)]
+pub enum MirSignal {
+    /// 正常落到函数末尾，无显式 return。
+    None,
+    /// 显式 `return value`。
+    Return(Value),
+    /// `break label`。
+    Break,
+    /// `continue label`。
+    Continue,
+    /// v0.70: Vote to halt — agent signals completion. In BSP context
+    /// marks the vertex as Halted. Equivalent to Return in linear context.
+    Halt(Option<Value>),
+}
+
+/// α.10: 与 `run_mir` 等价，但返回 `(MirSignal, Value)`，保留信号。
+/// REPL/差分测试用此观测控制流出口；生产路径仍走 `run_mir`。
+///
+/// v0.75: 修复 — 此前无条件返回 `MirSignal::Return`，丢弃 `Flow::Halt`
+/// （vote_to_halt）信号，导致 Pregel 引擎的 vertex_state 永远无法置为
+/// Halted。现在通过 `run_dag_with_signal` 真正传播 Return/Halt。
+///
+/// v0.75.9: 接收 `&Arc<MirFunction>`，优化后 DAG 走全局缓存
+/// （`cache::global_dag_cache().get_or_build`），同一 Arc 跨调用复用，
+/// 不再每次 `dag_analyze + dag_optimize + prune_sequence_edges` 全量重建。
+/// v0.75.9: 接收 `&Arc<MirFunction>`，优化后 DAG 走全局缓存
+/// （`cache::global_dag_cache().get_or_build`），同一 Arc 跨调用复用，
+/// 不再每次 `dag_analyze + dag_optimize + prune_sequence_edges` 全量重建。
+///
+/// v0.75.27: 委托给 `run_mir_with_signal_cached`（全局缓存为默认注入）。
+pub fn run_mir_with_signal(
+    func: &Arc<MirFunction>,
+    interp: &mut dyn MirHost,
+    env: &mut Environment,
+) -> Result<(MirSignal, Value), String> {
+    run_mir_with_signal_cached(func, interp, env, cache::global_dag_cache())
+}
+
+/// v0.75.27: 可注入缓存变体 — 测试/多租户可传独立 `DagCache` 实例隔离
+/// 缓存状态（全局 OnceLock 解耦的注入点）。行为与 `run_mir_with_signal`
+/// 完全一致，仅缓存来源不同。
+pub fn run_mir_with_signal_cached(
+    func: &Arc<MirFunction>,
+    interp: &mut dyn MirHost,
+    env: &mut Environment,
+    dag_cache: &cache::DagCache,
+) -> Result<(MirSignal, Value), String> {
+    let dag = dag_cache.get_or_build(func);
+    crate::mir::vm::run_dag_with_signal(&dag, func, interp, env)
+}
+
+/// α.10: `run_main_task` 的信号感知变体。
+/// main task 中允许出现显式 `return value`——返回它的值；否则返回 Value::Nil。
+pub fn run_main_task_with_signal(
+    func: &Arc<MirFunction>,
+    interp: &mut dyn MirHost,
+    env: &mut Environment,
+) -> Result<(MirSignal, Value), String> {
+    let mut main_body: Option<Arc<MirFunction>> = None;
+    for inst in &func.body {
+        if let MirInst::TaskDef { name, params, body } = inst
+            && name == "main"
+            && params.is_empty()
+        {
+            main_body = Some(Arc::new((**body).clone()));
+            break;
+        }
+    }
+    let Some(main_func) = main_body else {
+        return Ok((MirSignal::None, Value::Nil));
+    };
+    let mut main_env = env.clone();
+    let value = run_mir(&main_func, interp, &mut main_env)?;
+    Ok((MirSignal::Return(value.clone()), value))
+}
+
+// ===================================================================
+// v0.59: DAG-aware MIR interpreter（原 dag_interp.rs）
+// ===================================================================
+// v0.59 部分（原 dag_interp.rs 模块文档，已并入 vm.rs）：
+// v0.59: DAG-aware MIR interpreter.
+//
+// Executes a `MirDag` using a BSP super-step model. All instruction
+// logic is delegated to `handlers::dispatch()`. The DAG layer only
+// controls execution ORDER: topological + BSP super-steps.
+//
+// With `dag.add_sequential_edges()`, this degenerates to linear
+// execution, making `run_mir ≡ run_dag`.
+//
+// # 执行边界（v0.75.33，v0.75.36 修正）
+//
+// 本解释器为 **pregel 顶点执行 + 生产主路径** 双用途：pregel BSP 引擎
+// 逐超步调用，同时 `run_mir`（main.rs/REPL/import）经 `run_dag_with_signal`
+// 也走本解释器——**生产路径全部经过 DAG 解释器，不存在「循环走线性
+// fallback」**。
+// - 无循环的直线/分支程序：正确（Sequence 前驱判定保证 Define/Var 顺序）。
+// - 含 `MirInst` 循环（for/while 降级到 JumpIf 回边）的程序：v0.75.34 起
+//   正确（块内全序 + 控制转移 handler 决定 + wave 去重），循环累加验证
+//   输出 6/45。回归保护：`tests/tier0_replacement.rs`、`orchestrate_v3_pipeline.rs`。
+// - 优化器（CSE/DeadNode/ConstFolding）删除/合并节点时不得破坏控制目标
+//   与寄存器消费者（dag_rule/dag_search 的 guard + reg_rename 负责）。
+
 use crate::mir::dag::{EdgeKind, MirDag, MirDagNode};
 use crate::mir::handlers::{self, Flow};
-use crate::mir::host::MirHost;
-use crate::mir::interp as mir_interp;
-use crate::mir::{MirFunction, MirInst};
-use crate::value::{Environment, Value};
 
 /// v0.75.10: 寄存器级增量执行器状态（跨调用/超步记忆化）。
 ///
@@ -116,9 +479,9 @@ pub fn run_dag_with_signal_memo(
     memo: &mut DagExecMemo,
     interp: &mut dyn MirHost,
     env: &mut Environment,
-) -> Result<(mir_interp::MirSignal, Value), String> {
-    use mir_interp::MirSignal;
-    let task_registry = mir_interp::build_task_registry(&func.body);
+) -> Result<(MirSignal, Value), String> {
+    use MirSignal;
+    let task_registry = build_task_registry(&func.body);
     let mut regs: Vec<Value> = vec![Value::Nil; dag.n_regs];
     let mut reg_ready: Vec<bool> = vec![false; dag.n_regs];
     let mut active: Vec<usize> = dag.entry.clone();
@@ -316,7 +679,7 @@ pub fn run_mir_dag(
     let dag = crate::mir::dag::dag_analyze(func);
     let val = run_dag(&dag, func, interp, env)?;
     if func.body.iter().any(|i| matches!(i, MirInst::TaskDef { name, params, .. } if name == "main" && params.is_empty())) {
-        mir_interp::run_main_task(func, interp, env)?;
+        run_main_task(func, interp, env)?;
     }
     Ok(val)
 }
@@ -343,7 +706,7 @@ pub fn run_dag_with_signal(
     func: &MirFunction,
     interp: &mut dyn MirHost,
     env: &mut Environment,
-) -> Result<(mir_interp::MirSignal, Value), String> {
+) -> Result<(MirSignal, Value), String> {
     run_dag_with_signal_memo(dag, func, &mut DagExecMemo::new(), interp, env)
 }
 

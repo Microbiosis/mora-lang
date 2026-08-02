@@ -20,9 +20,9 @@
 
 use mora::interpreter::{Interpreter, parse_code_v3};
 use mora::mir::MirFunction;
-use mora::mir::interp::{run_main_task, run_mir};
 use mora::mir::lower::lower_mir_exprs;
 use mora::mir::ssa::OptLevel;
+use mora::mir::vm::{run_main_task, run_mir};
 
 /// 应用 SSA 优化（不 panic 即通过 — 管线正确性由等价性测试治理）。
 fn optimize_without_panic(source: &str, level: OptLevel) {

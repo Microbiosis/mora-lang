@@ -8,8 +8,8 @@ use mora::interpreter::Interpreter;
 use mora::lexer::Lexer;
 use mora::mir::MirInst;
 use mora::mir::expr::{MirExprKind, MirOrchestrateKind};
-use mora::mir::interp::run_mir;
 use mora::mir::lower::lower_mir_exprs;
+use mora::mir::vm::run_mir;
 use mora::parser_v3::ParserV3;
 
 fn parse_v3(source: &str) -> Vec<mora::mir::expr::MirExpr> {

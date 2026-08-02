@@ -1,6 +1,6 @@
 //! Tier 0 → Tier 1 替换集成测试
 //!
-//! 这套测试直接调用 `mora::mir::interp::run_mir` + `run_main_task`，
+//! 这套测试直接调用 `mora::mir::vm::run_mir` + `run_main_task`，
 //! 跳过 `Interpreter::interpret/execute/evaluate/call_value_inner/call_task_inner`，
 //! 以证明所有 5 个语言面（语法/语义/类型/标准库/运行时）都通过 MIR 解释器执行。
 //!
@@ -8,8 +8,8 @@
 //! MIR 路径，不依赖任何 AST 活跃调用方。
 
 use mora::interpreter::Interpreter;
-use mora::mir::interp::{run_main_task, run_mir};
 use mora::mir::lower::{lower_mir_exprs, typecheck_mir_exprs};
+use mora::mir::vm::{run_main_task, run_mir};
 use mora::mir::{MirFunction, MirInst};
 use mora::value::Value;
 

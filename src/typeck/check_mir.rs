@@ -18,11 +18,10 @@ use super::hm::HMInference;
 
 use super::hm::TypeError as HmError;
 
-///  Run HM inference across the program and return any diagnostics.
-///  The function is total: a successful return is `Vec::new()`, a failed
-///  program returns one or more `TypeError` entries (e.g. unbound
-///  variables, arity mismatches, unification failures).
-pub fn check_program_mir(exprs: &[MirExpr]) -> Vec<TypeError> {
+///  Run HM inference across the program (witness 输入) and return any
+///  diagnostics. 阶段 3 目标形态：parse 直接产出 witness，typeck 直接
+/// 消费 witness（零 MirExpr 桥接）。
+pub fn check_program_witnesses(witnesses: &[crate::mir::witness::MirWitness]) -> Vec<TypeError> {
     let mut hm = HMInference::new();
     let mut errors: Vec<TypeError> = Vec::new();
 
@@ -30,17 +29,25 @@ pub fn check_program_mir(exprs: &[MirExpr]) -> Vec<TypeError> {
     let mut visited: HashSet<std::path::PathBuf> = HashSet::new();
     let mut import_errors: Vec<TypeError> = Vec::new();
     for (name, ty) in
-        super::imports::collect_imported_symbols(exprs, &mut visited, &mut import_errors)
+        super::imports::collect_imported_symbols(witnesses, &mut visited, &mut import_errors)
     {
         hm.env.add(name, ty);
     }
     errors.extend(import_errors);
 
-    // v0.75.38: HM 推断消费 MirWitness（轻量树骨架）。parse 层仍产出
-    // MirExpr，此处桥接转换；阶段 3 parser 直接产出 witness 时去掉转换。
-    let witnesses = crate::mir::witness::MirWitness::from_exprs(exprs);
-    errors.extend(hm.infer_program(&witnesses).into_iter().map(hm_to_external));
+    errors.extend(hm.infer_program(witnesses).into_iter().map(hm_to_external));
     errors
+}
+
+///  Run HM inference across the program and return any diagnostics.
+///  The function is total: a successful return is `Vec::new()`, a failed
+///  program returns one or more `TypeError` entries (e.g. unbound
+///  variables, arity mismatches, unification failures).
+///
+/// v0.75.40: exprs 版保留为测试兼容桥接（LSP/既有调用方仍产出 MirExpr）；
+/// 执行路径已切到 [`check_program_witnesses`]。
+pub fn check_program_mir(exprs: &[MirExpr]) -> Vec<TypeError> {
+    check_program_witnesses(&crate::mir::witness::MirWitness::from_exprs(exprs))
 }
 
 ///  Same as [`check_program_mir`]. Kept as a thin wrapper for callers

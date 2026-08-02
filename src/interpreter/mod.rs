@@ -40,11 +40,6 @@ pub fn parse_code_v3(source: &str) -> Result<Vec<crate::mir::expr::MirExpr>, Str
     parser.parse().map_err(|e| format!("{:?}", e))
 }
 
-/// 内部 v3 解析辅助（不暴露 Result — mir_import / REPL 失败 panic-out）
-fn parse_v3_internal(source: &str) -> Vec<crate::mir::expr::MirExpr> {
-    parse_code_v3(source).expect("ParserV3 failed")
-}
-
 pub use crate::value::{Environment, StreamReader, Value};
 
 // v10 HTTP 超时配置
@@ -467,7 +462,8 @@ impl Interpreter {
     }
 
     /// α.3: MIR 解释器的 import 桥。
-    /// 解析 → lowering → run_mir，不依赖 AST 解释器的 execute。
+    /// 编译 → run_mir，不依赖 AST 解释器的 execute。
+    /// v0.75.40: ParserV3::compile 直接产出指令 + witness（单遍编译）。
     pub(crate) fn mir_import(
         &mut self,
         path: &str,
@@ -475,12 +471,8 @@ impl Interpreter {
     ) -> Result<(), String> {
         match std::fs::read_to_string(path) {
             Ok(source) => {
-                let mut imported_exprs = parse_v3_internal(&source);
-                let _type_errs = crate::mir::lower::typecheck_mir_exprs(&mut imported_exprs);
-                let imported_func = match crate::mir::lower::lower_mir_exprs(&imported_exprs) {
-                    Ok(f) => f,
-                    Err(e) => return Err(format!("import lowering error: {}", e)),
-                };
+                let (imported_func, witnesses) = crate::parser_v3::ParserV3::compile(&source)?;
+                let _type_errs = crate::typeck::check_mir::check_program_witnesses(&witnesses);
                 // 子 import 的 env 是当前 env 的克隆（与 with 块语义一致）
                 let mut child_env = env.clone();
                 // v0.75.9: 包裹 Arc 走全局 DAG 缓存
@@ -568,7 +560,6 @@ impl Interpreter {
     /// 接收外部 &mut Interpreter 保留 setup 代码的 state
     pub fn run_repl_with(interp: &mut Interpreter) {
         use crate::mir::interp::run_mir;
-        use crate::mir::lower::{lower_mir_exprs, typecheck_mir_exprs};
         use crate::mir::{MirFunction, MirInst};
         use std::io::{self, BufRead, Write};
 
@@ -597,28 +588,25 @@ impl Interpreter {
                 break;
             }
 
-            let node_ids = parse_v3_internal(trimmed);
-            if node_ids.is_empty() {
+            let (func, witnesses) = match crate::parser_v3::ParserV3::compile(trimmed) {
+                Ok(pair) => pair,
+                Err(e) => {
+                    eprintln!("parse error: {}", e);
+                    continue;
+                }
+            };
+            if func.body.is_empty() {
                 continue;
             }
 
             // v0.35 (P0-C1): REPL also type-checks (other entry points do).
-            let mut exprs = node_ids;
-            let type_errs = typecheck_mir_exprs(&mut exprs);
+            let type_errs = crate::typeck::check_mir::check_program_witnesses(&witnesses);
             if !type_errs.is_empty() {
                 for e in type_errs {
                     eprintln!("type error: {}", e.message);
                 }
                 continue;
             }
-
-            let func = match lower_mir_exprs(&exprs) {
-                Ok(func) => func,
-                Err(e) => {
-                    eprintln!("MIR lowering error: {}", e);
-                    continue;
-                }
-            };
 
             let mut body = repl_task_defs.clone();
             body.extend(func.body.clone());

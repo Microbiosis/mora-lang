@@ -2,6 +2,37 @@
 
 All notable changes to Mora will be documented in this file.
 
+## [v0.75.40] — 2026-08-02 — 执行入口切 compile + typeck witness 单实现（阶段 3 Step 4a）
+
+（单遍编译落地：全部执行入口从 parse→lower 双阶段切到
+`ParserV3::compile`（直接 emit MirInst + 并行产出 witness）。typeck
+改消费 witness（零 MirExpr 桥接）。）
+
+### Changed — 执行入口（src/main.rs / src/interpreter/mod.rs）
+- **main.rs**：`parse_with_v3`（parse→lower）删除，新增 `compile_and_opt`
+  统一编译辅助（compile + cascades apply_rules + SSA opt，语义与
+  `lower_mir_exprs_with_opt` 一致）。`run_file`/`run_record`/`run_replay`/
+  `run_snapshot`/`run_check` 全切 compile + witness typeck。
+- **REPL**（run_repl_with）：逐行改 `ParserV3::compile` + witness
+  typecheck，空 body 跳过。
+- **mir_import**：compile 直接产出指令 + witness，删 parse→lower 双阶段。
+- 删 `parse_v3_internal`（唯一内部 parse 辅助，已无调用）。
+
+### Changed — typeck witness 单实现（src/typeck/）
+- `check_program_witnesses(&[MirWitness])` — 新主入口，直接消费
+  witness（import 预扫描 + HM 推断）。
+- `check_program_mir(&[MirExpr])` — 降为桥接（from_exprs → witness），
+  保留给 LSP/测试（仍产出 MirExpr 的路径）。
+- `imports.rs`：`extract_module_symbols`/`collect_imported_symbols` 改
+  消费 `[MirWitness]`，模块 import 递归走 `ParserV3::compile`。
+
+### 架构边界（Step 4b 结论）
+- `MirExprLowerer`/`lower_mir_exprs` **保留** — orchestrate agent body
+  （parse_agent_def）与 pregel merge 表达式是编译期/运行期显式**数据
+  构造**，仍需「MirExpr 数据 → 指令」转换。MirExpr 从「执行路径中间
+  表示」降级为「数据构造类型」；执行入口已全切 compile。
+- 差分测试（compile vs parse→lower）继续为 compile 正确性守卫。
+
 ## [v0.75.39] — 2026-08-02 — witness 嵌套化（阶段 3 Step 3d）
 
 （ParserV3 单遍编译的 witness 精化：compile() 产出的 MirWitness 从

@@ -16,11 +16,11 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
 
-use crate::mir::expr::{MirExpr, MirExprKind};
+use crate::mir::witness::{MirWitness, WitnessKind};
 use crate::typeck::Type;
 use crate::typeck::TypeError;
 
-/// 从一个模块的 MirExpr 列表提取其顶层符号类型。
+/// 从一个模块的 witness 列表提取其顶层符号类型。
 ///
 /// - `let` 绑定：用该模块自身的 HM 推断结果（含 generalize）登记；
 ///   闭包身份 / 未解析 TypeVar 经 [`sanitize`] 退化为安全类型。
@@ -29,7 +29,10 @@ use crate::typeck::TypeError;
 ///
 /// `pre` 是嵌套 import 已收集的符号，先合并进本模块 HM env —— 这样模块
 /// 自己的 `let` 引用其 import 的符号时也能正确推断（传递 import 支持）。
-fn extract_module_symbols(exprs: &[MirExpr], pre: &[(String, Type)]) -> Vec<(String, Type)> {
+///
+/// v0.75.40: 消费 MirWitness（parse 层直接产出；exprs 版由 check_program_mir
+/// 桥接 from_exprs 后进入本函数，单一实现）。
+fn extract_module_symbols(witnesses: &[MirWitness], pre: &[(String, Type)]) -> Vec<(String, Type)> {
     let mut syms: Vec<(String, Type)> = Vec::new();
 
     // 1) let 绑定精确类型（模块自身的推断 + generalization）
@@ -37,21 +40,20 @@ fn extract_module_symbols(exprs: &[MirExpr], pre: &[(String, Type)]) -> Vec<(Str
     for (name, ty) in pre {
         hm.env.add(name.clone(), ty.clone());
     }
-    // v0.75.38: HM 推断消费 MirWitness（桥接转换；parse 层仍产出 MirExpr）
-    let _ = hm.infer_program(&crate::mir::witness::MirWitness::from_exprs(exprs)); // 模块内部错误不在此冒泡（与运行时
+    let _ = hm.infer_program(witnesses); // 模块内部错误不在此冒泡（与运行时
     // mir_import 的 `let _type_errs` 一致）
     for (name, ty) in hm.env.all_bindings() {
         syms.push((name, sanitize(&ty)));
     }
 
     // 2) 显式声明名称登记（不在 HM env 中）
-    for e in exprs {
-        match &e.kind {
-            MirExprKind::FnDef { name, .. } => syms.push((name.clone(), Type::Closure)),
-            MirExprKind::StructDef { name, .. } | MirExprKind::EnumDef { name, .. } => {
+    for w in witnesses {
+        match &w.kind {
+            WitnessKind::FnDef { name, .. } => syms.push((name.clone(), Type::Closure)),
+            WitnessKind::StructDef { name, .. } | WitnessKind::EnumDef { name, .. } => {
                 syms.push((name.clone(), Type::Any));
             }
-            MirExprKind::TypeAlias { name, target } => {
+            WitnessKind::TypeAlias { name, target } => {
                 syms.push((name.clone(), target.clone()));
             }
             _ => {}
@@ -86,13 +88,13 @@ fn sanitize(ty: &Type) -> Type {
 /// `mir_import` 的 hard error 语义一致）。返回的符号对直接 `env.add` 进
 /// 目标 HM 环境。
 pub fn collect_imported_symbols(
-    exprs: &[MirExpr],
+    witnesses: &[MirWitness],
     visited: &mut HashSet<PathBuf>,
     errors: &mut Vec<TypeError>,
 ) -> Vec<(String, Type)> {
     let mut out: Vec<(String, Type)> = Vec::new();
-    for e in exprs {
-        if let MirExprKind::Import(path) = &e.kind {
+    for w in witnesses {
+        if let WitnessKind::Import(path) = &w.kind {
             let path = path.clone();
             match std::fs::read_to_string(&path) {
                 Ok(source) => {
@@ -101,12 +103,13 @@ pub fn collect_imported_symbols(
                     if !visited.insert(canon) {
                         continue; // 已在栈上（a → b → a 环），跳过
                     }
-                    match crate::interpreter::parse_code_v3(&source) {
-                        Ok(module_exprs) => {
+                    match crate::parser_v3::ParserV3::compile(&source) {
+                        Ok((_, module_witnesses)) => {
                             // 先递归子 import（收集符号供本模块推断预合并），
                             // 再提取本模块符号（传递 import 支持）
-                            let nested = collect_imported_symbols(&module_exprs, visited, errors);
-                            out.extend(extract_module_symbols(&module_exprs, &nested));
+                            let nested =
+                                collect_imported_symbols(&module_witnesses, visited, errors);
+                            out.extend(extract_module_symbols(&module_witnesses, &nested));
                             out.extend(nested);
                         }
                         Err(parse_err) => errors.push(TypeError::new(

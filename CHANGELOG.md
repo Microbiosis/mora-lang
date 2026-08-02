@@ -2,6 +2,37 @@
 
 All notable changes to Mora will be documented in this file.
 
+## [v0.75.50] — 2026-08-03 — JIT 收口三件事（调研驱动）
+
+（直接回应调研「jit.rs 将成 God Object」的最高风险：模板契约可审计化
++ 错误分类结构化 + 文档事实修正。为 LuaJIT 式 snapshot/side-exit 打基础。）
+
+### JitError 结构化错误（src/mir/jit.rs）
+- `run_jit`/`try_compile` 从 `Result<Value, String>` → `Result<_, JitError>`：
+  - `CompileReject` — 模板集未覆盖（指令/类型/平台/跳转越界），编译期
+    即知稳定可预测
+  - `GuardFail` — 运行期类型标签守卫失败（生成代码置 bail），未来可映射
+    snapshot/side-exit
+  - `InternalInvariant` — 基础设施破坏（可执行内存/W^X 失败），非程序语义
+- `h_with_config` 回落诊断自动携带分类（Display 实现）；测试
+  `run_jit_of` 映射 `to_string()`。
+
+### TemplateSpec + verifier-first（src/mir/jit.rs）
+- `TemplateSpec` 枚举声明全部可编译模板契约（Const×3 / Binop 6 类 /
+  Jump / JumpIf）+ `result_type()` 单一来源。
+- `template_for_binary(is_int, is_float, op) → Option<TemplateSpec>` —
+  BinaryOp 的（类型×op → 模板）判定收敛，try_compile 与 verify_linear
+  共用（新增模板须先登记契约，否则 verifier 拒绝）。
+- `verify_linear` verifier-first 预检（Cranelift 思想）：编译前独立校验
+  寄存器范围 + 类型可推导 + 指令在契约表内，判定（spec）与发射（emit）
+  分离。
+
+### AGENTS.md 编译管线事实修正
+- 生产主路径标注为单遍编译 `source → Lexer → ParserV3::compile →
+  MirFunction<MirInst> + MirWitness → witness typecheck → MIR optimize →
+  DAG → vm::run_mir`（v0.75.40+）；旧 `parse → MirExpr → lower` 标注为
+  历史/兼容路径；执行内核指向 vm.rs + jit.rs。
+
 ## [v0.75.47-49] — 2026-08-03 — 架构收口 Phase 1（调研驱动，P1-P5）
 
 （架构审查 × 跨界调研合并计划的零风险立即项，每项独立 commit、

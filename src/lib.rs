@@ -16,6 +16,8 @@ pub const VERSION: &str = env!("MORAGIT_VERSION");
 // v0.55: ast_v2 module deleted — all paths use mir/expr MirExpr
 // v0.42.1: Audit Sink — SHA-256 hash-chained JSONL (loongclaw-inspired)
 pub mod audit;
+// v0.75.53: CLI 子命令（record + mcp + 共享编译/路径辅助，从 main.rs 拆出）
+pub mod cli;
 // v0.45.0: ToolPlane Core/Extension adapter (loongclaw tool.rs pattern)
 pub mod ccr;
 // v0.50: Checkpoint persistence layer (Memory + SQLite)

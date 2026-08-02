@@ -293,10 +293,18 @@ impl HMInference {
             MirExprKind::Assign { target, value } => {
                 self.infer_assign(target, value.as_ref(), expr.span)
             }
-            MirExprKind::Orchestrate { .. } => {
-                // v0.x: orchestrate is a multi-agent top-level construct that
-                // does not have a sensible scalar type at this layer. Return a
-                // placeholder until full orchestrate type-checking lands.
+            MirExprKind::Orchestrate {
+                input_var,
+                result_var,
+                ..
+            } => {
+                // v0.75.34: orchestrate 在语义上声明 input_var / result_var
+                //（`orchestrate ... input -> result`）— 登记为 Any 类型，
+                // 避免后续引用 result 报 UnboundVariable。此前返回 Nil 但
+                // 不登记变量，pregel/sequential 路径经 CLI 都会撞此缺口
+                //（测试走 run_mir 绕过 typeck 未暴露）。
+                self.env.add(input_var.clone(), Type::Any);
+                self.env.add(result_var.clone(), Type::Any);
                 Ok(Type::Nil)
             }
             MirExprKind::Loop { .. } => {

@@ -285,9 +285,13 @@ struct JitState {
 // ===================================================================
 
 /// 字节流 + 跳转 patch 位置簿。
+/// - `patches`：类型 bail 的 jcc 占位（patch 到 bail 块）。
+/// - `ctrl_patches`：(patch_pos, target_pc) — 控制流跳转占位
+///   （第二遍 patch 到目标指令段的 code offset）。
 struct Code {
     buf: Vec<u8>,
     patches: Vec<usize>,
+    ctrl_patches: Vec<(usize, usize)>,
 }
 
 impl Code {
@@ -295,6 +299,7 @@ impl Code {
         Code {
             buf: Vec::new(),
             patches: Vec::new(),
+            ctrl_patches: Vec::new(),
         }
     }
 
@@ -312,6 +317,37 @@ impl Code {
     /// 类型不匹配 → bail（jne）。
     fn jne_bail(&mut self) {
         self.jcc_bail(0x85);
+    }
+
+    /// 控制流条件跳转（`jcc rel32` 占位，目标 pc 第二遍 patch）。
+    /// cc：0x84=jz / 0x85=jnz（rel32 的 0F 8x 后缀）。
+    fn jcc_pc(&mut self, cc: u8, target_pc: usize) {
+        self.extend(&[0x0F, cc, 0, 0, 0, 0]);
+        self.ctrl_patches.push((self.buf.len() - 4, target_pc));
+    }
+
+    /// 无条件 `jmp rel32` 占位（目标 pc 第二遍 patch）。
+    fn jmp_pc(&mut self, target_pc: usize) {
+        self.extend(&[0xE9, 0, 0, 0, 0]);
+        self.ctrl_patches.push((self.buf.len() - 4, target_pc));
+    }
+
+    /// 第二遍：把控制流跳转占位 patch 到目标 pc 的 code offset。
+    /// `pc_offsets[pc]` = 该指令段在 buf 中的起始位置。
+    fn patch_control(&mut self, pc_offsets: &[usize]) -> bool {
+        for &(pos, target_pc) in &self.ctrl_patches {
+            let target_off = match pc_offsets.get(target_pc) {
+                Some(&o) => o as i64,
+                None => return false, // 目标 pc 越界（label 未解析）
+            };
+            let rel = target_off - (pos as i64 + 4);
+            let rel32 = match i32::try_from(rel) {
+                Ok(v) => v,
+                Err(_) => return false, // 跳转超出 ±2GB（v1 线性子集不可能）
+            };
+            self.buf[pos..pos + 4].copy_from_slice(&rel32.to_le_bytes());
+        }
+        true
     }
 
     fn disp(reg: Reg, payload: bool) -> i32 {
@@ -632,23 +668,28 @@ fn emit_binop_float_cmp(code: &mut Code, dst: Reg, a: Reg, op: crate::common::Bi
     code.store_bool(dst);
 }
 
-/// 线性编译门：body 全部 ∈ {Const, 同型 BinaryOp} 才编译。
+/// 线性编译门（两遍）：body ∈ {Const, 同型 BinaryOp, Jump, JumpIf, JumpIfNot}
+/// 才编译。跳转目标是 pc 索引（lower patch_label_at 填的 insts 索引）。
 /// 返回 (可执行代码, 结果寄存器)。
 fn try_compile(func: &MirFunction) -> Option<(ExecMem, Reg)> {
     if func.body.is_empty() || !cfg!(target_arch = "x86_64") {
         return None;
     }
-    // 寄存器类型线性跟踪（Int / Float；比较结果 Bool 不再参与后续 BinaryOp）。
+    // 寄存器类型线性跟踪（Int / Float / Bool；比较结果 Bool 不再参与算术）。
     #[derive(Clone, Copy, PartialEq)]
     enum Ty {
         Int,
         Float,
+        Bool,
     }
     let mut types: Vec<Option<Ty>> = vec![None; func.n_regs];
     let mut code = Code::new();
+    // 第一遍：逐 pc emit + 记录每指令段的 code offset。
+    let mut pc_offsets: Vec<usize> = Vec::with_capacity(func.body.len());
     let mut last_dst: Option<Reg> = None;
 
     for inst in &func.body {
+        pc_offsets.push(code.buf.len());
         match inst {
             MirInst::Const(dst, v) => {
                 if !emit_const(&mut code, *dst, v) {
@@ -657,6 +698,7 @@ fn try_compile(func: &MirFunction) -> Option<(ExecMem, Reg)> {
                 types[*dst] = match v {
                     Value::Int(_) => Some(Ty::Int),
                     Value::Float(_) => Some(Ty::Float),
+                    Value::Bool(_) => Some(Ty::Bool),
                     _ => None,
                 };
                 last_dst = Some(*dst);
@@ -665,7 +707,6 @@ fn try_compile(func: &MirFunction) -> Option<(ExecMem, Reg)> {
                 if *dst >= func.n_regs || *a >= func.n_regs || *b >= func.n_regs {
                     return None;
                 }
-                // 同型（Int×Int / Float×Float）才编译；Mixed/未跟踪拒绝。
                 let (is_int, is_float) = match (types[*a], types[*b]) {
                     (Some(Ty::Int), Some(Ty::Int)) => (true, false),
                     (Some(Ty::Float), Some(Ty::Float)) => (false, true),
@@ -689,10 +730,10 @@ fn try_compile(func: &MirFunction) -> Option<(ExecMem, Reg)> {
                 );
                 if is_float && cmp {
                     emit_binop_float_cmp(&mut code, *dst, *a, op.clone(), *b);
-                    types[*dst] = None; // Bool
+                    types[*dst] = Some(Ty::Bool);
                 } else if is_int && cmp {
                     emit_binop_int_cmp(&mut code, *dst, *a, op.clone(), *b);
-                    types[*dst] = None; // Bool
+                    types[*dst] = Some(Ty::Bool);
                 } else if is_float && arith {
                     emit_binop_float(&mut code, *dst, *a, op.clone(), *b);
                     types[*dst] = Some(Ty::Float);
@@ -707,6 +748,36 @@ fn try_compile(func: &MirFunction) -> Option<(ExecMem, Reg)> {
                 }
                 last_dst = Some(*dst);
             }
+            MirInst::Jump(target) => {
+                code.jmp_pc(*target);
+                // 无条件跳转后不再有可编译后续（v1 线性子集：jmp 后必是
+                // 目标块或结尾；last_dst 保留跳转前的值）。
+            }
+            MirInst::JumpIf(cond, target) | MirInst::JumpIfNot(cond, target) => {
+                if *cond >= func.n_regs {
+                    return None;
+                }
+                // v1：cond 必须是 Bool（比较结果）；其他类型 truthy 语义
+                // 超出模板集 → 编译期拒绝回落解释器。
+                if types[*cond] != Some(Ty::Bool) {
+                    return None;
+                }
+                let (cc, not) = if matches!(inst, MirInst::JumpIf(..)) {
+                    (0x85u8, false) // jnz（truthy 跳）
+                } else {
+                    (0x84, true) // jz（falsy 跳）
+                };
+                let _ = not;
+                // 读 cond payload → test → jcc target
+                code.load_regs();
+                code.cmp_tag(*cond, TAG_BOOL);
+                code.jne_bail(); // 类型安全（编译期已验证，运行时防御）
+                // mov rdx, [rax+cond+8]（payload）
+                code.extend(&[0x48, 0x8B, 0x90]);
+                code.buf.extend(&Code::disp(*cond, true).to_le_bytes());
+                code.extend(&[0x48, 0x85, 0xD2]); // test rdx, rdx
+                code.jcc_pc(cc, *target);
+            }
             _ => return None, // 任何未覆盖指令 → 回落解释器
         }
     }
@@ -714,6 +785,10 @@ fn try_compile(func: &MirFunction) -> Option<(ExecMem, Reg)> {
     let last_dst = last_dst?;
     // 正常出口：xor eax,eax; ret
     code.extend(&[0x31, 0xC0, 0xC3]);
+    // 第二遍：patch 控制流跳转（目标 pc → code offset）。
+    if !code.patch_control(&pc_offsets) {
+        return None;
+    }
     let bytes = code.finish_bail(&emit_bail_block());
     // W^X：先 RW 写入，再切 RX（见 ExecMem::make_exec）。
     let mut mem = ExecMem::alloc_rw(bytes.len())?;

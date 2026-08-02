@@ -1121,22 +1121,23 @@ pub fn crush_json_string(
         other => {
             return Err(format!(
                 "crush.json: expected JSON array, got {}",
-                value_type_name(&other)
+                json_type_name(&other)
             ));
         }
     };
     Ok(crush_json(&items, target, options))
 }
 
-fn value_type_name(v: &Value) -> &'static str {
+/// JSON 视角类型名（错误消息用）。复用 flow::type_name（String→string /
+/// Float→float / Bool→bool 与 JSON 名天然一致），仅映射 3 个 JSON 专名
+/// （list→array / dict→object / nil→null）。v0.75.47: 消除与 flow 版
+/// value_type_name 的撞名重复（旧版手写 6 变体 match）。
+fn json_type_name(v: &Value) -> &'static str {
     match v {
-        Value::String(_) => "string",
-        Value::Float(_) => "float",
-        Value::Bool(_) => "bool",
-        Value::Nil => "null",
         Value::List(_) => "array",
         Value::Dict(_) => "object",
-        _ => "other",
+        Value::Nil => "null",
+        _ => crate::flow::type_name(v),
     }
 }
 
@@ -1168,7 +1169,7 @@ impl crate::compress::SubCompressor for JsonSubCompressor {
             _ => {
                 return Err(format!(
                     "crush.json: expected JSON array, got {}",
-                    value_type_name(&parsed)
+                    json_type_name(&parsed)
                 ));
             }
         };

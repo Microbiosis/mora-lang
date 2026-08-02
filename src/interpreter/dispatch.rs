@@ -211,7 +211,7 @@ impl Interpreter {
             // v0.20: methods_of(value) → 返回方法名列表
             "methods_of" => {
                 let value = args.first().ok_or("methods_of() requires 1 argument")?;
-                let methods = get_methods_for_value(value);
+                let methods = value.methods();
                 Ok(Value::List(
                     methods.into_iter().map(Value::String).collect(),
                 ))

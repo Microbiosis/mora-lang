@@ -47,7 +47,7 @@ pub fn run_jit(
     // Ok(Value::Float(unsafe { fn_ptr() }))
 
     Err(
-        "JIT compiler requires LLVM system library (enable 'jit' feature with LLVM 17 installed)"
+        "JIT compiler requires LLVM system library (enable 'jit' feature with LLVM 22 installed)"
             .to_string(),
     )
 }
@@ -59,7 +59,7 @@ pub fn run_jit(
     _interp: &mut dyn crate::mir::host::MirHost,
     _env: &mut Environment,
 ) -> Result<Value, String> {
-    Err("JIT compiler not available (build with --features jit and LLVM 17)".to_string())
+    Err("JIT compiler not available (build with --features jit and LLVM 22)".to_string())
 }
 
 /// α.8: 注册 LLVM 内置函数原型（用于 SSA 中的 Call 指令）

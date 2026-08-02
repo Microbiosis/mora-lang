@@ -501,12 +501,33 @@ impl Value {
     pub fn methods(&self) -> Vec<String> {
         let names: &[&str] = match self {
             Value::String(_) => &[
-                "len", "upper", "lower", "trim", "starts_with", "ends_with",
-                "contains", "split", "replace", "json",
+                "len",
+                "upper",
+                "lower",
+                "trim",
+                "starts_with",
+                "ends_with",
+                "contains",
+                "split",
+                "replace",
+                "json",
             ],
             Value::List(_) => &[
-                "push", "pop", "get", "len", "map", "filter", "reduce", "take",
-                "drop", "window", "batch", "shape", "flatten", "transpose", "reshape",
+                "push",
+                "pop",
+                "get",
+                "len",
+                "map",
+                "filter",
+                "reduce",
+                "take",
+                "drop",
+                "window",
+                "batch",
+                "shape",
+                "flatten",
+                "transpose",
+                "reshape",
             ],
             Value::Dict(_) => &["get", "set", "keys", "values", "len", "json"],
             Value::Conversation { .. } => &["chat", "history", "clear", "model", "len"],
@@ -623,8 +644,6 @@ impl VectorClock {
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
-
-
 
     /// v0.63: Serialize to a Dict for checkpoint storage.
     pub fn to_dict(&self) -> HashMap<String, Value> {

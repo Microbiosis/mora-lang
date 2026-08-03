@@ -2,6 +2,20 @@
 
 All notable changes to Mora will be documented in this file.
 
+## [v0.75.67] — 2026-08-03 — ai_chat.rs real_ai_chat_inner 提取 send_with_retry
+
+real_ai_chat_inner（303 → 178 行）— 构造/发送两阶段分离：
+
+- 前置段保留：空消息/上下文窗口/mock/投机执行/内联缓存/预热队列
+  （均提前 return）
+- `send_with_retry`（130 行）提取：请求构造（messages JSON/body 拼
+  temperature/url/agent）+ 发送重试（exponential backoff + jitter + token
+  追踪 + LRU 缓存写）
+- cache_key（inner 局部）作参数传入（方法内 LRU 写需要）
+- 纯提取零行为变更（逐行搬移 + cache_key 传参）
+
+验证：全量 790 绿 + clippy `-D warnings` 0 + fmt 0。
+
 ## [v0.75.66] — 2026-08-03 — dispatch.rs call_function 按 name 提取（God Function 拆分）
 
 call_function（473 行巨型 match）按 name 提取为 18 个 `call_builtin_*`

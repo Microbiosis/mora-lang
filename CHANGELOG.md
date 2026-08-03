@@ -2,6 +2,21 @@
 
 All notable changes to Mora will be documented in this file.
 
+## [v0.75.56] — 2026-08-03 — mir/handlers.rs 拆 inst.rs（模块化）
+
+handlers.rs（1451 → 895 行）按两部分拆分子模块，纯搬移零行为变更：
+
+- `inst.rs`（585）：MirInst metadata（dst/input_regs/map_regs/is_effect）+
+  dispatch 指令级分派（v0.59 起线性/DAG 解释器共享）
+- handlers.rs 保留 h_* 函数库 + Flow + 共享定义
+- 依赖方向单向 inst → handlers（dispatch 调 h_*），无循环
+- 路径兼容：handlers.rs re-export dispatch + mod.rs `pub use inst::*`
+
+测试同步：tier0_dyntrait 的 dispatch 源码断言改查 inst.rs（拆后新位置；
+h_dyn_trait 仍在 handlers.rs）。行为未变，仅测试耦合的实现位置更新。
+
+验证：全量 790 绿（skip 3 个 Windows 挂起基线）+ clippy 0 + fmt 0。
+
 ## [v0.75.55] — 2026-08-03 — compress/json.rs 分层拆子模块（模块化）
 
 SmartCrusher 按既有四层结构拆分子模块，纯搬移零行为变更：

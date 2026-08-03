@@ -602,12 +602,14 @@ impl ParserV3 {
                 // 子上下文：闭包体是独立寄存器空间（镜像 lower Closure 分支）
                 let parent =
                     std::mem::replace(&mut self.emit, crate::mir::lower::EmitContext::new());
+                // v0.75.78: 非 FatArrow 闭包体走 emit_block_w（镜像 parse 侧
+                // parse_block_body）— 支持多语句与嵌套构造（if/for/match/let）。
+                // 修复前用 emit_expr_w：`fn(n) if n<=1 {..} else {..} end` 解析失败。
+                // emit_block_w 已消费 End，无需外部 consume。
                 let (body_reg, _body_w) = if self.match_token_exact(TokenType::FatArrow) {
                     self.emit_expr_w()?
                 } else {
-                    let (b, w) = self.emit_expr_w()?;
-                    self.consume(TokenType::End, "Expected 'end' after closure body")?;
-                    (b, w)
+                    self.emit_block_w()?
                 };
                 self.emit.emit(MirInst::Return(Some(body_reg)));
                 let body_mir = std::mem::replace(&mut self.emit, parent).finish();
@@ -1084,10 +1086,16 @@ impl ParserV3 {
         let mut stmt_wits = Vec::new();
         let mut last = 0;
         if self.match_token_exact(TokenType::LBrace) {
+            // v0.75.78: 与 parse_block_body/else 分支对称 —— 块内语句间允许
+            // 换行（`if c {\n  stmt\n}`）。修复前 `{` 后不跳换行，多行
+            // brace 块在 compile 主路径解析失败（旧 parse 路径可解析，
+            // 差分测试只覆盖单行 if，未暴露）。
+            while self.match_token(&[TokenType::Newline]) {}
             while !self.check(&TokenType::RBrace) && !self.is_at_end() {
                 let (r, w) = self.emit_statement_expr_w()?;
                 last = r;
                 stmt_wits.push(w);
+                while self.match_token(&[TokenType::Newline]) {}
             }
             self.consume(TokenType::RBrace, "Expected '}' after block")?;
         } else {
@@ -1122,12 +1130,23 @@ impl ParserV3 {
     }
 
     /// 块内语句 → (结果寄存器, witness)（表达式语句返回其 dst，其余返回 0）。
+    /// 嵌套语句级分发 — 镜像 parse 侧语句级构造分发（Let 优先 > Match > If > For > While）。
+    /// v0.75.78: 补齐 Let/If/Match/For/While 分发 — 修复前嵌套上下文（task 体、
+    /// 闭包体、for 体）中这些构造直接落 emit_expr_w → 解析失败（compile
+    /// 主路径自 v0.75.40 起缺此分发，旧 parse 路径支持）。
     fn emit_statement_expr_w(&mut self) -> Option<(Reg, MirWitness)> {
+        if self.check(&TokenType::Let) {
+            return self.emit_let_w().map(|w| (0, w));
+        }
         match self.peek()?.token_type.clone() {
             TokenType::Return | TokenType::Break | TokenType::Continue => {
                 let w = self.emit_return_break_continue_w()?;
                 Some((0, w))
             }
+            TokenType::Match => self.emit_match_w(),
+            TokenType::If => self.emit_if_w(),
+            TokenType::For => self.emit_loop_w(),
+            TokenType::Identifier(n) if n == "while" => self.emit_while_w(),
             _ => self.emit_expr_w(),
         }
     }

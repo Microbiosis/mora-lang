@@ -2,6 +2,32 @@
 
 All notable changes to Mora will be documented in this file.
 
+## [v0.75.78] — 2026-08-04 — compile 主路径嵌套构造缺口修复
+
+实际 exe 运行嵌套控制流暴露 compile 主路径（v0.75.40+）的解析缺口——
+旧 parse 路径支持、compile 解析失败的形态，三处对称修复：
+
+- **emit_block_w `{` 分支不跳换行**：`if c {\n stmt\n}` 多行 brace 块在
+  compile 主路径解析失败（旧路径可解析，差分测试只覆盖单行 if 未暴露）。
+  补前导/尾部换行跳过，与 else 分支、parse_block_body 对称。
+- **emit_statement_expr_w 缺构造分发**：task 体/闭包体/for 体内 if/for/
+  while/match/let 直接落 emit_expr_w → 解析失败。补齐语句级分发，镜像
+  parse 侧（Let 优先 > Match > If > For > While）。
+- **非 FatArrow 闭包体改用 emit_block_w**：`fn(n) if n<=1 {..} else {..} end`
+  走 emit_block_w（镜像 parse_block_body），支持多语句与嵌套构造。
+
+回归测试：compile_differential 新增 compile_equivalent_nested_constructs
+（差分等价，锁定交集形态）+ compile_run_nested_constructs（task 体 if
+运行回归）。验证：全量测试绿（docker 依赖 skip）+ clippy `-D warnings` 0
++ fmt 0。
+
+已知 pre-existing（与本次无关，两条路径行为一致）：
+- 顶层 `task` def 的 n_regs 差 1（lower 为无 dst 的 TaskDef 分配死寄存器，
+  body 指令序列一致）。
+- 闭包 `fn(n) if c {1} else {0} end` 的 else 值经 DAG 执行丢失（`pick(0)`
+  返回 nil 而非 0）——DAG 对 Var（读 env）与 Assign（写 env）之间缺 env
+  依赖边，走线性解释器可正确执行。属 DAG 执行器独立缺陷，待后续修复。
+
 ## [v0.75.77] — 2026-08-03 — 环境经参数单一传递（去全局槽/回落形态）
 
 v0.75.76 的修复采用「h_call 执行 env 直查 + 其余回落 mir_call_function」

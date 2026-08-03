@@ -568,10 +568,8 @@ fn split_into_ssa(
             | MirInst::MacroDef { .. }
             | MirInst::Commit
             | MirInst::Worker { .. }
-            | MirInst::Route(_)
             | MirInst::Observe { .. }
             | MirInst::Span { .. }
-            | MirInst::RecordTokens { .. }
             // α.6: 文件 I/O — SSA 中跳过
             | MirInst::Save { .. }
             | MirInst::Load { .. }
@@ -617,10 +615,8 @@ fn is_ssa_passthrough(inst: &MirInst) -> bool {
             | MirInst::MacroDef { .. }
             | MirInst::Commit
             | MirInst::Worker { .. }
-            | MirInst::Route(_)
             | MirInst::Observe { .. }
             | MirInst::Span { .. }
-            | MirInst::RecordTokens { .. }
             | MirInst::Save { .. }
             | MirInst::Load { .. }
             | MirInst::ReadFile { .. }

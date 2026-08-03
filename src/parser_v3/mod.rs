@@ -99,6 +99,12 @@ impl ParserV3 {
             TokenType::If => self.emit_if_w().map(|(_, w)| w),
             TokenType::For => self.emit_loop_w().map(|(_, w)| w),
             TokenType::Identifier(ref s) if s == "while" => self.emit_while_w().map(|(_, w)| w),
+            // v0.75.81: 事务家族 + eval 断言（顶层同嵌套分发）
+            TokenType::Identifier(ref s)
+                if s == "transaction" || s == "commit" || s == "rollback" || s == "eval" =>
+            {
+                self.emit_statement_expr_w().map(|(_, w)| w)
+            }
             TokenType::Return | TokenType::Break | TokenType::Continue => {
                 self.emit_return_break_continue_w()
             }
@@ -1135,6 +1141,9 @@ impl ParserV3 {
     /// v0.75.78: 补齐 Let/If/Match/For/While 分发 — 修复前嵌套上下文（task 体、
     /// 闭包体、for 体）中这些构造直接落 emit_expr_w → 解析失败（compile
     /// 主路径自 v0.75.40 起缺此分发，旧 parse 路径支持）。
+    /// v0.75.81: 事务家族（transaction/commit/rollback）+ eval 断言接入
+    /// 语句分发（lexer 无对应关键字，经 peek_is_identifier 识别，try/while
+    /// 先例）。
     fn emit_statement_expr_w(&mut self) -> Option<(Reg, MirWitness)> {
         if self.check(&TokenType::Let) {
             return self.emit_let_w().map(|w| (0, w));
@@ -1148,6 +1157,28 @@ impl ParserV3 {
             TokenType::If => self.emit_if_w(),
             TokenType::For => self.emit_loop_w(),
             TokenType::Identifier(n) if n == "while" => self.emit_while_w(),
+            TokenType::Identifier(n) if n == "transaction" => self.emit_transaction_w(),
+            TokenType::Identifier(n) if n == "eval" => self.emit_eval_w(),
+            TokenType::Identifier(n) if n == "commit" => {
+                let span = self.span_of_current();
+                self.advance(); // 'commit'
+                self.emit.emit(MirInst::Commit);
+                let w = MirWitness {
+                    kind: WitnessKind::Sequence(vec![]),
+                    span,
+                };
+                Some((0, w))
+            }
+            TokenType::Identifier(n) if n == "rollback" => {
+                let span = self.span_of_current();
+                self.advance(); // 'rollback'
+                self.emit.emit(MirInst::Rollback);
+                let w = MirWitness {
+                    kind: WitnessKind::Sequence(vec![]),
+                    span,
+                };
+                Some((0, w))
+            }
             _ => self.emit_expr_w(),
         }
     }
@@ -1249,6 +1280,116 @@ impl ParserV3 {
             span,
         };
         Some((dst, w))
+    }
+
+    /// v0.75.81: 事务块（spec 9.3, Ballerina 启发）。
+    ///
+    /// ```mora
+    /// transaction
+    ///   <body 语句，可含 commit / rollback>
+    /// [compensation
+    ///   <补偿语句>]
+    /// end
+    /// ```
+    ///
+    /// 镜像 h_transaction 语义：body 独立寄存器空间（子上下文），
+    /// body 内 `rollback` 经 MirInst::Rollback 返回 Err → run_isolated 得
+    /// Err → 执行 compensation 后抛 "Transaction rolled back"；`commit`
+    /// 为 no-op（MirInst::Commit → Ok）。body 终止于 `compensation` 或 `end`。
+    /// witness = Sequence(body + compensation 语句)（无值语句，typeck 得 Nil）。
+    fn emit_transaction_w(&mut self) -> Option<(Reg, MirWitness)> {
+        let span = self.span_of_current();
+        self.advance(); // 'transaction'
+        // 子上下文：事务体是独立寄存器空间（镜像 lower/closure/task 分支）
+        let parent = std::mem::replace(&mut self.emit, crate::mir::lower::EmitContext::new());
+        let mut body_wits = Vec::new();
+        let mut last = 0;
+        while self.match_token(&[TokenType::Newline]) {}
+        while !self.check(&TokenType::End)
+            && !self.peek_is_identifier("compensation")
+            && !self.is_at_end()
+        {
+            let (r, w) = self.emit_statement_expr_w()?;
+            last = r;
+            body_wits.push(w);
+            while self.match_token(&[TokenType::Newline]) {}
+        }
+        self.emit.emit(MirInst::Return(Some(last)));
+        let body_mir = std::mem::replace(&mut self.emit, parent).finish();
+
+        // compensation 段（可选）：`compensation` 后语句循环到 `end`
+        let comp_mir = if self.peek_is_identifier("compensation") {
+            self.advance(); // 'compensation'
+            let parent2 = std::mem::replace(&mut self.emit, crate::mir::lower::EmitContext::new());
+            let mut comp_wits = Vec::new();
+            let mut comp_last = 0;
+            while self.match_token(&[TokenType::Newline]) {}
+            while !self.check(&TokenType::End) && !self.is_at_end() {
+                let (r, w) = self.emit_statement_expr_w()?;
+                comp_last = r;
+                comp_wits.push(w);
+                while self.match_token(&[TokenType::Newline]) {}
+            }
+            self.emit.emit(MirInst::Return(Some(comp_last)));
+            let cm = std::mem::replace(&mut self.emit, parent2).finish();
+            body_wits.extend(comp_wits);
+            cm
+        } else {
+            MirFunction {
+                params: vec![],
+                body: vec![],
+                n_regs: 0,
+            }
+        };
+        self.consume(TokenType::End, "Expected 'end' after transaction")?;
+
+        self.emit.emit(MirInst::Transaction {
+            body: Box::new(body_mir),
+            compensation: Box::new(comp_mir),
+        });
+        let w = MirWitness {
+            kind: WitnessKind::Sequence(body_wits),
+            span,
+        };
+        Some((0, w))
+    }
+
+    /// v0.75.81: eval 断言语句（α.8 Eval 原语前端，v0.25 Agent 行为回归测试）。
+    ///
+    /// ```mora
+    /// eval ["name"] given_expr, expect1, expect2, ...
+    /// ```
+    /// 首 token 为字符串字面量时作为断言名；given 与各 expect 为表达式。
+    /// 经 h_eval 执行：given 与每个 expect 逐一比较（tolerance 未设），
+    /// 任一不等报错（断言失败）。witness = 空 Sequence（无值语句）。
+    fn emit_eval_w(&mut self) -> Option<(Reg, MirWitness)> {
+        let span = self.span_of_current();
+        self.advance(); // 'eval'
+        let token = self.peek().cloned()?;
+        let name = if let TokenType::String(s) = token.token_type {
+            self.advance();
+            s
+        } else {
+            String::new()
+        };
+        let (given_reg, _) = self.emit_expr_w()?;
+        let mut expects = Vec::new();
+        while self.match_token(&[TokenType::Comma]) {
+            let (r, _) = self.emit_expr_w()?;
+            expects.push(r);
+        }
+        self.emit.emit(MirInst::Eval {
+            name,
+            given_reg,
+            expects,
+            tolerance: None,
+            replay_path: None,
+        });
+        let w = MirWitness {
+            kind: WitnessKind::Sequence(vec![]),
+            span,
+        };
+        Some((0, w))
     }
 
     fn emit_match_w(&mut self) -> Option<(Reg, MirWitness)> {

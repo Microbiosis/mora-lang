@@ -12,6 +12,10 @@
 //! v0.75.79: 新增 Copy(dst, src) 纯寄存器拷贝 — if 表达式结果寄存器化
 //! （不再经 env 临时名 `__if_result` 传递）。
 //!
+//! v0.75.81: Transaction / Rollback / Commit 经事务块前端激活（spec 9.3）；
+//! Eval（断言原语）经 eval 语句前端激活。RecordTokens / Route 已删除 —
+//! token 记录由 TraceCollector / AiRuntime 承担，路由由 Value::Router 承担。
+//!
 //! v0.75.26: StreamFor 已删除 — 死原语（零构造点、零测试引用、语义被
 //! ai.chat 的 stream:true 参数路径取代；handler 空转：prompt_reg/var 被忽略、
 //! body 仅执行一次并丢弃）。流式语义若需 MIR 指令级支持，重新设计而非复活旧形状。
@@ -213,12 +217,12 @@ pub enum MirInst {
         body: Box<MirFunction>,
     },
 
-    /// α.5: commit — 事务提交（no-op，与 AST 语义一致）。
+    /// α.5: commit — 事务提交（no-op，事务块内语句，spec 9.3）。
     Commit,
 
-    /// α.5: route — 路由声明（不实现，返回错误）。
-    Route(String),
-
+    // v0.75.81: Route 已删除 — 死原语（零构造点）。路由由显式 API
+    // `Value::Router` + `.route()`/`.listen()` 方法（dispatch.rs）承担，
+    // 与 v0.06.7 的 serve/http 关键字移除同一收敛方向。
     /// α.5: observe — 可观测性块。执行 body，配置信息记录但无副作用。
     Observe {
         config: String,
@@ -231,11 +235,10 @@ pub enum MirInst {
         body: Box<MirFunction>,
     },
 
-    /// α.5: record_tokens — 记录 token 输入输出（no-op）。
-    RecordTokens {
-        input: String,
-        output: String,
-    },
+    // v0.75.81: RecordTokens 已删除 — 死原语（零构造点）。token 记录由
+    // `TraceCollector::record_tokens`（trace_collector.rs）+ `AiRuntime::
+    // record_tokens`（runtime/ai.rs）承担，AI 调用后真实记录（ai_helpers.rs）。
+    // 与 v0.75.26 StreamFor 删除同一先例：语义被运行时路径取代。
 
     // ── 文件 I/O（α.6: Save/Load/ReadFile/WriteFile/AppendFile/ReadBytesFile/WriteBytesFile）──
     /// α.6: save — 将 value 序列化为文件。

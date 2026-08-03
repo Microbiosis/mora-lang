@@ -2,6 +2,18 @@
 
 All notable changes to Mora will be documented in this file.
 
+## [v0.75.69] — 2026-08-03 — lexer.rs simple_token 收敛
+
+next_token 的 33 处 `Some(Token { token_type, line, column })` 构造
+（line/column 恒为 start_line/start_col）→ 提取 `simple_token` 辅助：
+
+- 覆盖 12 单字符简单分支 + 21 多字符/嵌套分支（含 DotDotDot 深嵌套）
+- `Lifetime(lifetime)` 带 payload 变体一并收敛（simple_token 收 TokenType 值）
+- next_token 303 → 220 行；lexer.rs 848 → 726 行
+- 纯等价替换（33 处字段完全一致，正则断言 33 全覆盖）
+
+验证：全量 790 绿 + clippy `-D warnings` 0 + fmt 0。
+
 ## [v0.75.68] — 2026-08-03 — ai_chat HTTP 构造收敛（ai_chat_url + ai_agent）
 
 三处 AI API HTTP 段重复收敛（仅零风险项，错误消息是契约不动）：

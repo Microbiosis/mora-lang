@@ -2,6 +2,18 @@
 
 All notable changes to Mora will be documented in this file.
 
+## [v0.75.59] — 2026-08-03 — document/reading_order 拆 xy_cut.rs（模块化）
+
+reading_order/mod.rs（1159 → 856 行）拆出 XY-Cut++ 算法实现：
+
+- `xy_cut.rs`（314）— XY-Cut++ 排序（递归投影-轮廓分裂 + cross-layout
+  处理）+ 5 个算法常量（BETA/DENSITY/OVERLAP/MIN_OVERLAP_COUNT/MIN_GAP）
+- mod.rs 保留 BBox/Strategy 定义 + assign_reading_order 主入口 + 测试区
+- xy_cut 区零 Value 依赖（纯 BBox/Vec 几何计算）；const 归属算法域随迁
+
+纯搬移零行为变更。验证：全量 790 绿（skip 3 个 Windows 挂起基线）+
+clippy 0 + fmt 0。
+
 ## [v0.75.58] — 2026-08-03 — mir/ssa.rs 拆 ssa/deconstruct.rs（模块化）
 
 ssa.rs（1444 → 1035 行）construct/deconstruct 两阶段拆分：

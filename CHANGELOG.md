@@ -2,6 +2,20 @@
 
 All notable changes to Mora will be documented in this file.
 
+## [v0.75.62] — 2026-08-03 — value.rs 拆 value/display.rs（模块化）
+
+value.rs（1376 → 1213 行）拆出纯格式化段：
+
+- `value/display.rs`（169）— impl std::fmt::Display for Value + fmt_inner
+  （深度限制递归格式化，NaN/Inf 安全 v0.36）
+- 边界：Display 区零 BuiltinKind/Environment 依赖，fmt_inner 仅区内
+  自调用——最干净段落
+- 单文件模块 → 目录模块；impl 在子模块内实现父模块类型（同 crate
+  允许），Display trait 全局可见，外部零改动
+
+纯搬移零行为变更。验证：全量 790 绿（skip 3 个 Windows 挂起基线）+
+clippy 0 + fmt 0。
+
 ## [v0.75.61] — 2026-08-03 — mir/vm.rs 拆 vm/dag.rs（模块化）
 
 vm.rs（923 → 565 行）线性/DAG 双语义段拆分：

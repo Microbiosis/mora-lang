@@ -18,10 +18,12 @@ use crate::mir::expr::BuiltinOp;
 use crate::mir::witness::{MirWitness, WitnessArm, WitnessCallee, WitnessKind, WitnessParam};
 use crate::typeck::Type;
 
+mod builtin; // v0.75.70: builtin 类型推断（自 mod.rs 拆出）
 pub mod env;
 pub mod error;
 pub mod generalize;
-pub mod unify;
+mod infer;
+pub mod unify; // v0.75.70: infer_* 方法族（自 mod.rs 拆出）
 
 pub use error::TypeError;
 
@@ -134,7 +136,7 @@ impl HMInference {
     }
 
     /// 递归替换类型中出现的所有 TypeVar（每次实例化一份独立副本）。
-    fn rename_ty(&mut self, ty: &Type) -> Type {
+    pub(super) fn rename_ty(&mut self, ty: &Type) -> Type {
         match ty {
             Type::TypeVar(_) => Type::TypeVar(self.fresh_type_var_id()),
             Type::List(elem) => Type::List(Box::new(self.rename_ty(elem))),
@@ -153,7 +155,7 @@ impl HMInference {
     }
 
     /// 把 ForAll 内层 τ 中被量化的 TypeVar 替换为 fresh 变量（未量化的保留）。
-    fn instantiate_ty(
+    pub(super) fn instantiate_ty(
         &mut self,
         ty: &Type,
         quantified: &HashSet<char>,
@@ -354,428 +356,6 @@ impl HMInference {
             | WitnessKind::Sequence { .. } => Ok(Type::Nil),
         }
     }
-
-    fn infer_let(
-        &mut self,
-        name: &str,
-        value: &MirWitness,
-        span: Span,
-    ) -> Result<Type, Vec<TypeError>> {
-        let value_ty = self.infer_expr(value)?;
-        // v0.75.17: let-generalization — 量化为不在 env 中的自由变量
-        // （标准 HM：Γ ⊢ let x = e in body : ∀α₁...αₙ.τ，其中
-        // {α₁...αₙ} = FV(τ) \ FV(Γ)）。
-        let gen_ty = generalize::generalize(&value_ty, &self.env.free_variables());
-        self.env.add(name.to_string(), gen_ty.clone());
-        let _ = span;
-        Ok(gen_ty)
-    }
-
-    fn infer_let_typed(
-        &mut self,
-        name: &str,
-        type_hint: &Type,
-        value: &MirWitness,
-        span: Span,
-    ) -> Result<Type, Vec<TypeError>> {
-        let value_ty = self.infer_expr(value)?;
-        // v0.55: validate the user-supplied `let x: T = ...` annotation
-        // against the value's inferred type. Tolerant: Type::Any
-        // annotations always succeed.
-        if !matches!(type_hint, Type::Any) {
-            self.constraints.push(Constraint::Eq(
-                Box::new(type_hint.clone()),
-                Box::new(value_ty.clone()),
-            ));
-        }
-        // v0.75.17: 显式注解同样做 let-generalization（注解含自由变量时
-        // 量化为 ForAll；`List<int>` 等具体注解无自由变量，原样登记）。
-        let gen_hint = generalize::generalize(type_hint, &self.env.free_variables());
-        self.env.add(name.to_string(), gen_hint.clone());
-        let _ = span;
-        Ok(gen_hint)
-    }
-
-    fn infer_assign(
-        &mut self,
-        target: &str,
-        value: &MirWitness,
-        span: Span,
-    ) -> Result<Type, Vec<TypeError>> {
-        let value_ty = self.infer_expr(value)?;
-        let current = self.env.get(target).cloned();
-        if let Some(existing) = current {
-            // v0.75.17: 命中 ForAll 时先实例化再合一（赋值的 LHS 是单形实例）
-            let existing = match existing {
-                Type::ForAll(_, _) => self.instantiate_type(&existing),
-                other => other,
-            };
-            self.constraints.push(Constraint::Eq(
-                Box::new(existing),
-                Box::new(value_ty.clone()),
-            ));
-        } else {
-            return Err(vec![TypeError::UnboundVariable {
-                name: target.to_string(),
-                span,
-            }]);
-        }
-        Ok(value_ty)
-    }
-
-    fn infer_var(&mut self, name: &str, span: Span) -> Result<Type, Vec<TypeError>> {
-        match self.env.get(name) {
-            // v0.75.17: env 命中 ForAll → 实例化（let-polymorphism 展开）。
-            // 可变借用问题：先克隆 env 条目，再走 &mut self 的实例化路径。
-            Some(ty) if matches!(ty, Type::ForAll(_, _)) => {
-                let ty = ty.clone();
-                Ok(self.instantiate_type(&ty))
-            }
-            Some(ty) => Ok(ty.clone()),
-            None => Err(vec![TypeError::UnboundVariable {
-                name: name.to_string(),
-                span,
-            }]),
-        }
-    }
-
-    fn infer_binop(
-        &mut self,
-        op: &crate::common::BinaryOp,
-        left: &MirWitness,
-        right: &MirWitness,
-        span: Span,
-    ) -> Result<Type, Vec<TypeError>> {
-        use crate::common::BinaryOp::*;
-        let left_ty = self.infer_expr(left)?;
-        let right_ty = self.infer_expr(right)?;
-        let result_ty = self.fresh_type_var();
-        match op {
-            Add | Sub | Mul | Div | Mod => {
-                self.constraints.push(Constraint::Eq(
-                    Box::new(left_ty.clone()),
-                    Box::new(result_ty.clone()),
-                ));
-                self.constraints.push(Constraint::Eq(
-                    Box::new(right_ty.clone()),
-                    Box::new(result_ty.clone()),
-                ));
-                let _ = span;
-                Ok(result_ty)
-            }
-            Equal | NotEqual => {
-                self.constraints
-                    .push(Constraint::Eq(Box::new(left_ty), Box::new(right_ty)));
-                Ok(Type::Bool)
-            }
-            Greater | Less | GreaterEqual | LessEqual => {
-                self.constraints
-                    .push(Constraint::Eq(Box::new(left_ty), Box::new(right_ty)));
-                Ok(Type::Bool)
-            } // v0.55: Or/And are WitnessKind variants (short-circuit),
-              // handled directly in infer_expr, not BinaryOp variants.
-              // BinaryOp 已穷尽（11 变体全部覆盖）— 无需 `_` 兜底。
-        }
-    }
-
-    fn infer_call(
-        &mut self,
-        callee: &WitnessCallee,
-        args: &[MirWitness],
-        span: Span,
-    ) -> Result<Type, Vec<TypeError>> {
-        let callee_ty = match callee {
-            WitnessCallee::Name(name) => self.builtin_callee_ty(name).unwrap_or(Type::Any),
-            // v0.75.17: Var 命中 ForAll 时实例化（`let f = fn(x) x; f(1); f("s")`）
-            WitnessCallee::Var(var_name) => match self.env.get(var_name) {
-                Some(ty) if matches!(ty, Type::ForAll(_, _)) => {
-                    let ty = ty.clone();
-                    self.instantiate_type(&ty)
-                }
-                Some(ty) => ty.clone(),
-                None => Type::Any,
-            },
-            WitnessCallee::Evaluated(expr) => self.infer_expr(expr)?,
-            WitnessCallee::Builtin(op) => self.builtin_type(op)?,
-            // v0.75.16: Method 调用（parser 现产出 WitnessCallee::Method）— 走
-            // method_signature 推断（receiver 类型 + 参数约束 + 返回类型）。
-            WitnessCallee::Method(_, _) => {
-                // 第一个 arg 是 receiver 表达式；构造临时 MethodCall 语义。
-                // 直接委托 infer_method_call：receiver = args[0], 后续为参数。
-                let (recv, method_args) = match args.split_first() {
-                    Some((r, rest)) => (r, rest),
-                    None => {
-                        return Err(vec![TypeError::ArityMismatch {
-                            expected: 1,
-                            actual: 0,
-                            span,
-                        }]);
-                    }
-                };
-                let method = match callee {
-                    WitnessCallee::Method(_, m) => m.clone(),
-                    _ => unreachable!(),
-                };
-                return self.infer_method_call(recv, &method, method_args, span);
-            }
-        };
-        let arg_types: Vec<Type> = args
-            .iter()
-            .map(|a| self.infer_expr(a))
-            .collect::<Result<Vec<_>, _>>()?;
-
-        // v0.75.24: merge_with(key, strategy) 的策略名字面量编译期校验 —
-        // 非法策略（静态字符串）在 typeck 阶段拦截，不再留到运行时
-        // （动态传入的变量仍由运行时 MergeStrategy::from_name 兜底）。
-        if let WitnessCallee::Name(name) = callee
-            && name == "merge_with"
-            && let Some(WitnessKind::Literal(crate::common::Literal::String(s, _))) =
-                args.get(1).map(|a| &a.kind)
-            && crate::value::MergeStrategy::from_name(s).is_none()
-        {
-            return Err(vec![TypeError::InvalidLiteral {
-                what: "merge_with strategy".to_string(),
-                value: s.clone(),
-                span: Some(span),
-            }]);
-        }
-
-        if let Some(sig) = self.closure_sig(&callee_ty).cloned() {
-            if sig.arity != arg_types.len() {
-                return Err(vec![TypeError::ArityMismatch {
-                    expected: sig.arity,
-                    actual: arg_types.len(),
-                    span,
-                }]);
-            }
-            for (param_ty, arg_ty) in sig.params.iter().zip(arg_types.iter()) {
-                self.constraints.push(Constraint::Eq(
-                    Box::new(param_ty.clone()),
-                    Box::new(arg_ty.clone()),
-                ));
-            }
-            Ok(sig.return_type)
-        } else {
-            // Unknown callee type: introduce a fresh return and
-            // constrain all argument slots to be compatible with
-            // whatever the callee happens to be.
-            let ret = self.fresh_type_var();
-            for arg_ty in &arg_types {
-                self.constraints.push(Constraint::Eq(
-                    Box::new(arg_ty.clone()),
-                    Box::new(callee_ty.clone()),
-                ));
-            }
-            let _ = ret.clone();
-            Ok(ret)
-        }
-    }
-
-    fn infer_method_call(
-        &mut self,
-        receiver: &MirWitness,
-        method: &str,
-        args: &[MirWitness],
-        span: Span,
-    ) -> Result<Type, Vec<TypeError>> {
-        let recv_ty = self.infer_expr(receiver)?;
-        let arg_types: Vec<Type> = args
-            .iter()
-            .map(|a| self.infer_expr(a))
-            .collect::<Result<Vec<_>, _>>()?;
-
-        // v0.55: enforce arity from the dispatch table. The signature
-        // already includes `self` as its first parameter, so the user
-        // arity we compare against is `sig.params.len() - 1`.
-        if let Some(sig) = crate::typeck::dispatch::method_signature(&recv_ty, method) {
-            let user_arity = sig.params.len().saturating_sub(1);
-            if user_arity != arg_types.len() {
-                return Err(vec![TypeError::ArityMismatch {
-                    expected: user_arity,
-                    actual: arg_types.len(),
-                    span,
-                }]);
-            }
-            for (param, arg_ty) in sig.params.iter().skip(1).zip(arg_types.iter()) {
-                self.constraints.push(Constraint::Eq(
-                    Box::new(param.1.clone()),
-                    Box::new(arg_ty.clone()),
-                ));
-            }
-        }
-
-        let return_ty = crate::typeck::dispatch::method_return_type(&recv_ty, method);
-        let _ = span;
-        Ok(return_ty)
-    }
-
-    // v0.75.20: infer_pipe 已删——WitnessKind::Pipe 死变体移除，`|>` 在
-    // parse_pipe 脱糖为 Call（right(left)），HM 走 infer_call。
-
-    fn infer_closure(
-        &mut self,
-        params: &[WitnessParam],
-        body: &MirWitness,
-        span: Span,
-    ) -> Result<Type, Vec<TypeError>> {
-        let saved_env = self.env.clone();
-        let param_types: Vec<Type> = params
-            .iter()
-            .map(|p| p.type_hint.clone().unwrap_or_else(|| self.fresh_type_var()))
-            .collect();
-        for (p, ty) in params.iter().zip(param_types.iter()) {
-            self.env.add(p.name.clone(), ty.clone());
-        }
-        let body_ty = self.infer_expr(body)?;
-        self.env = saved_env;
-        let id = self.fresh_closure(param_types, body_ty);
-        let _ = span;
-        Ok(id)
-    }
-
-    fn infer_fn_def(
-        &mut self,
-        params: &[WitnessParam],
-        body: &MirWitness,
-        span: Span,
-    ) -> Result<Type, Vec<TypeError>> {
-        // fn name(params) = body  is treated like an immediately-bound
-        // closure; the name registration is the caller's responsibility.
-        let _ = span;
-        self.infer_closure(params, body, span)
-    }
-
-    fn infer_match(
-        &mut self,
-        scrutinee: &MirWitness,
-        arms: &[WitnessArm],
-        span: Span,
-    ) -> Result<Type, Vec<TypeError>> {
-        let _ = self.infer_expr(scrutinee)?;
-        let mut result_ty: Option<Type> = None;
-        for arm in arms {
-            let arm_ty = self.infer_expr(&arm.body)?;
-            match result_ty {
-                None => result_ty = Some(arm_ty),
-                Some(ref mut ty) => {
-                    self.constraints
-                        .push(Constraint::Eq(Box::new(ty.clone()), Box::new(arm_ty)));
-                }
-            }
-        }
-        let _ = span;
-        Ok(result_ty.unwrap_or(Type::Any))
-    }
-
-    fn infer_if(
-        &mut self,
-        cond: &MirWitness,
-        then_branch: &MirWitness,
-        else_branch: Option<&MirWitness>,
-        span: Span,
-    ) -> Result<Type, Vec<TypeError>> {
-        let _ = self.infer_expr(cond)?;
-        let then_ty = self.infer_expr(then_branch)?;
-        let result = if let Some(e) = else_branch {
-            let else_ty = self.infer_expr(e)?;
-            // Both branches must produce the same type.
-            self.constraints
-                .push(Constraint::Eq(Box::new(then_ty.clone()), Box::new(else_ty)));
-            then_ty
-        } else {
-            // No else branch: the if-expression yields `then_ty | nil`.
-            Type::Union(vec![then_ty.clone(), Type::Nil])
-        };
-        let _ = span;
-        Ok(result)
-    }
-
-    fn infer_list(&mut self, items: &[MirWitness], span: Span) -> Result<Type, Vec<TypeError>> {
-        let elem_ty = self.fresh_type_var();
-        for item in items {
-            let ty = self.infer_expr(item)?;
-            self.constraints
-                .push(Constraint::Eq(Box::new(elem_ty.clone()), Box::new(ty)));
-        }
-        let _ = span;
-        Ok(Type::List(Box::new(elem_ty)))
-    }
-
-    fn infer_dict(
-        &mut self,
-        entries: &[(String, MirWitness)],
-        span: Span,
-    ) -> Result<Type, Vec<TypeError>> {
-        let k_ty = Type::String;
-        let v_ty = self.fresh_type_var();
-        for (_, value) in entries {
-            let ty = self.infer_expr(value)?;
-            self.constraints
-                .push(Constraint::Eq(Box::new(v_ty.clone()), Box::new(ty)));
-        }
-        let _ = span;
-        Ok(Type::Dict(Box::new(k_ty), Box::new(v_ty)))
-    }
-
-    fn builtin_callee_ty(&mut self, name: &str) -> Option<Type> {
-        // v0.55: prefer the canonical dispatch registry for the
-        // canonical arity / return type, but mint fresh type variables
-        // for every parameter so the HM unifier can still infer
-        // concrete argument types instead of being pinned to a Union
-        // annotation.
-        if let Some(sig) = crate::typeck::dispatch::lookup_builtin(name) {
-            let param_count = sig.params.len();
-            let param_types: Vec<Type> = (0..param_count).map(|_| self.fresh_type_var()).collect();
-            return Some(self.fresh_closure(param_types, sig.return_type.clone()));
-        }
-        match name {
-            "print" => {
-                let arg = self.fresh_type_var();
-                let ret = Type::Nil;
-                Some(self.fresh_closure(vec![arg], ret))
-            }
-            "len" => {
-                let arg = self.fresh_type_var();
-                Some(self.fresh_closure(vec![arg], Type::Int))
-            }
-            "str" => {
-                let arg = self.fresh_type_var();
-                Some(self.fresh_closure(vec![arg], Type::String))
-            }
-            "int" => Some(self.fresh_closure(vec![Type::String], Type::Int)),
-            "float" => {
-                let arg = self.fresh_type_var();
-                Some(self.fresh_closure(vec![arg], Type::Float))
-            }
-            "bool" => {
-                let arg = self.fresh_type_var();
-                Some(self.fresh_closure(vec![arg], Type::Bool))
-            }
-            "range" => {
-                let a = self.fresh_type_var();
-                let b = self.fresh_type_var();
-                let c = self.fresh_type_var();
-                let elem = self.fresh_type_var();
-                Some(self.fresh_closure(vec![a, b, c], Type::List(Box::new(elem))))
-            }
-            _ => None,
-        }
-    }
-
-    fn builtin_type(&mut self, op: &BuiltinOp) -> Result<Type, Vec<TypeError>> {
-        match op {
-            BuiltinOp::Print => {
-                let arg = self.fresh_type_var();
-                Ok(self.fresh_closure(vec![arg], Type::Nil))
-            }
-            BuiltinOp::Assert => Ok(self.fresh_closure(vec![Type::Bool], Type::Nil)),
-            BuiltinOp::Not => Ok(self.fresh_closure(vec![Type::Bool], Type::Bool)),
-            BuiltinOp::Length => {
-                let arg = self.fresh_type_var();
-                Ok(self.fresh_closure(vec![arg], Type::Int))
-            }
-        }
-    }
 }
 
 fn infer_lit(lit: &crate::common::Literal) -> Type {
@@ -798,7 +378,7 @@ mod tests {
         MirWitness, WitnessArm, WitnessCallee, WitnessKind, WitnessParam, WitnessPattern,
     };
 
-    fn lit_int(n: i64) -> MirWitness {
+    pub(super) fn lit_int(n: i64) -> MirWitness {
         MirWitness {
             kind: WitnessKind::Literal(Literal::Int(n, Span::default())),
             span: Span::default(),
@@ -806,14 +386,14 @@ mod tests {
     }
 
     #[test]
-    fn literal_int_infers_to_int() {
+    pub(super) fn literal_int_infers_to_int() {
         let mut hm = HMInference::new();
         let ty = hm.infer_expr(&lit_int(7)).unwrap();
         assert_eq!(ty, Type::Int);
     }
 
     #[test]
-    fn unbound_variable_produces_diagnostic() {
+    pub(super) fn unbound_variable_produces_diagnostic() {
         let mut hm = HMInference::new();
         let expr = MirWitness {
             kind: WitnessKind::Variable("missing".to_string()),
@@ -827,7 +407,7 @@ mod tests {
     }
 
     #[test]
-    fn let_binding_registers_env() {
+    pub(super) fn let_binding_registers_env() {
         let mut hm = HMInference::new();
         let expr = MirWitness {
             kind: WitnessKind::LetBinding {
@@ -846,7 +426,7 @@ mod tests {
     }
 
     #[test]
-    fn if_branches_unify() {
+    pub(super) fn if_branches_unify() {
         let mut hm = HMInference::new();
         let expr = MirWitness {
             kind: WitnessKind::If {
@@ -864,7 +444,7 @@ mod tests {
     }
 
     #[test]
-    fn match_arms_unify() {
+    pub(super) fn match_arms_unify() {
         let mut hm = HMInference::new();
         let arms = vec![
             WitnessArm {
@@ -893,7 +473,7 @@ mod tests {
     }
 
     #[test]
-    fn closure_call_arity_check() {
+    pub(super) fn closure_call_arity_check() {
         let mut hm = HMInference::new();
         let param = WitnessParam {
             name: "x".to_string(),

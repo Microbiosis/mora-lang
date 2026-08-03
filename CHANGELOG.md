@@ -2,6 +2,18 @@
 
 All notable changes to Mora will be documented in this file.
 
+## [v0.75.71] — 2026-08-03 — 代码风格统一：opt pass 文件头 // → //!
+
+代码风格审计发现 v0.75.60 拆 opt.rs 时 5 个 pass 文件头用了普通注释
+`//` 而非模块文档 `//!`——其余 30 个拆出文件（cli/inst/vm::dag/
+infer 等）全部是 `//!`。
+
+修正：copy/loops/pregel_opt/simple/tailcall 头部 `//` → `//!`，
+与全仓拆出文件惯例统一。纯注释风格，零行为变化。
+
+验证：全量 790 绿 + clippy `-D warnings` 0 + fmt 0；28 个拆出文件
+头部全部 `//!` 确认。
+
 ## [v0.75.70] — 2026-08-03 — typeck/hm 拆 infer.rs + builtin.rs
 
 hm/mod.rs（922 → 502 行）`impl HMInference` 按方法组拆分子模块（D6

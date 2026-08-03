@@ -1,8 +1,11 @@
 //! v0.75.51: ccr.* builtin 实现 — 从 builtins/mod.rs 拆出（P7，
 //! Rhai register_plugin/Koto workspace 思想：按 domain 拆分，mod.rs 仅
 //! 聚合）。方法语义与拆分前完全一致。
+//!
+//! v0.75.54: 自包含 trait 导入（此前经 mod.rs 顶层 use 隐式继承）。
 
 use super::*;
+use crate::ccr::CcrStore;
 use crate::value::Value;
 
 impl Interpreter {

@@ -2,6 +2,22 @@
 
 All notable changes to Mora will be documented in this file.
 
+## [v0.75.76] — 2026-08-03 — 实际运行修复两 bug
+
+编译 mora.exe 实际运行综合脚本暴露两个真实 bug（全量测试未覆盖）：
+
+- **P6 登记守卫误拦用户函数**：call_function 顶层 testcase! 断言
+  `_kind.is_some()`，用户自定义函数 `_kind.is_none()` → debug 构建 panic。
+  校验点移至 `_` 兜底分支（builtin 名落兜底才告警，用户函数合法落兜底）。
+- **顶层绑定对裸函数调用不可见**：take_env 移出 core.environment（空壳），
+  run_mir 的 h_define 写私有 env 参数，而 call_function 兜底查 core →
+  `let f=fn...; f(5)` 报 Undefined。修复：h_call 先用执行 env 查用户
+  callable（与 h_define 同容器、无锁），其余回落 mir_call_function。
+  弃 active_env 槽方案（parking_lot 不可重入锁 → 死锁，已回退）。
+
+回归测试：compile_differential 新增 compile_bare_user_function_call。
+验证：全量 791 绿 + 实际 exe 综合脚本全过 + clippy `-D warnings` 0 + fmt 0。
+
 ## [v0.75.75] — 2026-08-03 — 分隔符横幅全仓统一
 
 D7 分隔符统一——4 种字符（`=` `─` `-` `═`）收敛为 2 种语义：

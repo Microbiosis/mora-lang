@@ -238,13 +238,9 @@ impl Interpreter {
             escaped_model, msgs_json
         );
 
-        let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
+        let url = Self::ai_chat_url(base_url);
 
-        let agent: ureq::Agent = ureq::Agent::config_builder()
-            .timeout_global(Some(Duration::from_secs(30)))
-            .http_status_as_error(false)
-            .build()
-            .into();
+        let agent = Self::ai_agent(30, None);
 
         match agent
             .post(&url)
@@ -491,7 +487,7 @@ impl Interpreter {
         }
         body.push('}');
 
-        let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
+        let url = Self::ai_chat_url(base_url);
 
         // v0.22: 流式响应优化 - 添加 stream 参数
         let use_stream = self
@@ -507,12 +503,7 @@ impl Interpreter {
         }
 
         // v0.x: ureq 3.3 — ConfigBuilder + http_status_as_error(false) 以保留 4xx/5xx 响应体
-        let agent: ureq::Agent = ureq::Agent::config_builder()
-            .timeout_global(Some(Duration::from_secs(AI_READ_TIMEOUT_SECS)))
-            .timeout_send_body(Some(Duration::from_secs(HTTP_WRITE_TIMEOUT_SECS)))
-            .http_status_as_error(false)
-            .build()
-            .into();
+        let agent = Self::ai_agent(AI_READ_TIMEOUT_SECS, Some(HTTP_WRITE_TIMEOUT_SECS));
 
         // v0.10: retry 循环（exponential backoff + jitter）
         let max_retries = ai_retry_max();
@@ -587,6 +578,24 @@ impl Interpreter {
         }
         Err("ai.chat: retry loop exited without result".to_string())
     }
+
+    /// v0.75.68: AI API 请求 URL（chat/completions）。
+    fn ai_chat_url(base_url: &str) -> String {
+        format!("{}/chat/completions", base_url.trim_end_matches('/'))
+    }
+
+    /// v0.75.68: AI API ureq agent 构造 — 保留各调用方超时差异
+    /// （call_ai_api 单超时 30s；send_with_retry/with_tools 双超时）。
+    fn ai_agent(read_timeout_secs: u64, write_timeout_secs: Option<u64>) -> ureq::Agent {
+        let mut b = ureq::Agent::config_builder()
+            .timeout_global(Some(Duration::from_secs(read_timeout_secs)))
+            .http_status_as_error(false);
+        if let Some(w) = write_timeout_secs {
+            b = b.timeout_send_body(Some(Duration::from_secs(w)));
+        }
+        b.build().into()
+    }
+
     /// 带工具调用的 AI 对话（支持 tool_calls 自动循环）
     pub(super) fn real_ai_chat_with_tools(
         &mut self,
@@ -636,14 +645,9 @@ impl Interpreter {
             // 闭合 JSON
             body.push('}');
 
-            let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
+            let url = Self::ai_chat_url(base_url);
             // v0.x: ureq 3.3 — ConfigBuilder + http_status_as_error(false) 以保留 4xx/5xx 响应体
-            let agent: ureq::Agent = ureq::Agent::config_builder()
-                .timeout_global(Some(Duration::from_secs(AI_READ_TIMEOUT_SECS)))
-                .timeout_send_body(Some(Duration::from_secs(HTTP_WRITE_TIMEOUT_SECS)))
-                .http_status_as_error(false)
-                .build()
-                .into();
+            let agent = Self::ai_agent(AI_READ_TIMEOUT_SECS, Some(HTTP_WRITE_TIMEOUT_SECS));
 
             // v0.x: ureq 3.3 — send_string → send(&body);Status 变体移除,改由响应 status 判定
             // .set() → .header()

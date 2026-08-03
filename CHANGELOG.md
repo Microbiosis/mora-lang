@@ -2,6 +2,21 @@
 
 All notable changes to Mora will be documented in this file.
 
+## [v0.75.60] — 2026-08-03 — mir/opt.rs 拆 5 个 pass 文件（模块化）
+
+opt.rs（1176 → 208 行）按 SSA pass 组拆分子模块（D6 单文件惯例）：
+
+- `simple.rs`（335）— ConstProp/DeadCodeElim/Gvn + ssa_dst 共享辅助
+- `loops.rs`（464）— Licm/LoopStrengthReduction + loop 分析辅助
+- `copy.rs`（102）— CopyProp + next_free_reg / LsrOps 类型
+- `tailcall.rs`（60）— TailCallOpt
+- `pregel_opt.rs`（23）— superstep_fusion / optimize_pregel
+- opt.rs 骨架：SsaPass 定义/impl + pipeline 组装 + optimize/run_pipeline
+- 跨文件依赖经 pub(super) + 显式 use（loops↔copy 双向，同 crate 允许）
+
+纯搬移零行为变更。验证：全量 790 绿（skip 3 个 Windows 挂起基线）+
+clippy 0 + fmt 0。
+
 ## [v0.75.59] — 2026-08-03 — document/reading_order 拆 xy_cut.rs（模块化）
 
 reading_order/mod.rs（1159 → 856 行）拆出 XY-Cut++ 算法实现：

@@ -2,6 +2,20 @@
 
 All notable changes to Mora will be documented in this file.
 
+## [v0.75.58] — 2026-08-03 — mir/ssa.rs 拆 ssa/deconstruct.rs（模块化）
+
+ssa.rs（1444 → 1035 行）construct/deconstruct 两阶段拆分：
+
+- `ssa.rs` 保留 SSA 构造（基本块划分/支配树/phi 插入/变量重命名）+ 类型定义
+- `ssa/deconstruct.rs`（409）— deconstruct（phi → copy，SSA → MIR-plain）
+  + map_ssa/next_tmp_name/ssa_inst_to_plain/terminator_to_plain 私有辅助
+- 单文件模块 → 目录模块；`pub use deconstruct::deconstruct` 保持
+  `ssa::deconstruct` 路径（opt.rs 调用点零改动）
+- deconstruct 区仅用 HashMap/HashSet + 3 个 crate 类型，导入自包含
+
+纯搬移零行为变更。验证：全量 790 绿（skip 3 个 Windows 挂起基线）+
+clippy 0 + fmt 0。
+
 ## [v0.75.57] — 2026-08-03 — pregel run() 提取 execute_step（模块化）
 
 `run()`（522 → 214 行）BSP 超步循环瘦身 — 最大块 EXEC（314 行，含

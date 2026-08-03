@@ -2,6 +2,37 @@
 
 All notable changes to Mora will be documented in this file.
 
+## [v0.75.80] — 2026-08-04 — 整洁度修复：去静默 Nil 与空函数哨兵
+
+architecture-reviewer 代码整洁度审查（只读）驱动，修复 2 项掩盖缺陷 +
+8 项无行为变更清理：
+
+**🔴 掩盖缺陷（必须修）**
+- **Macro 调用静默返回 Nil**：Value::Macro 只存 name+params（宏体被
+  parser 词法级跳过），调用方拿到静默 Nil 无错误无展开（spec 11.5 承诺
+  宏是用户特性）。修复：显式返回 `macro 'name' expansion not implemented`
+  错误——功能缺失显性暴露，不再伪装成成功 Nil。
+- **orchestrate agent task_body lowering 兜底空函数**：lower 失败被
+  `unwrap_or_else` 吞成空 MirFunction 哨兵（具体错误丢失，下游泛化为
+  "lowering missing"）。修复：lower 错误上抛（eprintln 定位），agent
+  定义失败使整个 orchestrate 语句失败（compile 报错），不再静默跳过
+  产生残缺图。空函数哨兵协议清零。
+
+**🟢 清理（无行为变更）**
+- vm.rs：删除 run_mir_with_signal doc 中逐字重复的 v0.75.9 缓存段落
+- mir/mod.rs：补 DynTrait 注释空缺口（vtable 派发 → dispatch_trait_method）；
+  模块头更新（删已删除的 StreamFor 与 v2 AST 对照段，补 Copy 指令说明）
+- pregel/mod.rs：模块头重写（删已不存在的 orchestrate_v2 引用与"骨架
+  TODO"表述，更新为实际能力描述）
+- lib.rs：模块头更新（"ast" 已删，改列实际模块）
+- stress_tests.rs：删除无副作用残留行 `let _ = Duration::from_secs(5)`
+- build.rs：重写汉字丢失的注释（历史版本同样损坏，按代码实际行为恢复）
+- mir/vm.rs is_truthy：注释标明与 flow::is_truthy 的 List/Dict 判空语义
+  差异（收敛前防误改，收敛属设计决策）
+
+验证：全量测试绿（docker 依赖 skip）+ exe 实测 Macro 调用报显式错误 +
+clippy `-D warnings` 0 + fmt 0。
+
 ## [v0.75.79] — 2026-08-04 — if 结果寄存器化 + TaskDef 死寄存器清除
 
 修复 v0.75.78 记录的 pre-existing 两项（双路径行为一致缺陷）：

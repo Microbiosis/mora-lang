@@ -1745,11 +1745,14 @@ impl ParserV3 {
             }
 
             // Try agent definition: agent name(params) => expr
-            if self.peek_is_identifier("agent")
-                && let Some(agent) = self.parse_agent_def()
-            {
-                agents.push(agent);
-                continue;
+            // v0.75.80: 命中 `agent` 关键字但解析失败（含 task_body lowering
+            // 失败）视为整个 orchestrate 语句失败 —— 不再静默跳过产生残缺图。
+            if self.peek_is_identifier("agent") {
+                if let Some(agent) = self.parse_agent_def() {
+                    agents.push(agent);
+                    continue;
+                }
+                return None;
             }
 
             // Try edge definition: @start -> a, a -> @exit, @start -> b on: cond
@@ -1874,14 +1877,17 @@ impl ParserV3 {
         };
 
         // v0.75.32: 修复 task_expr → task_body 降级缺失 — 此前 task_body 恒空
-        // （pregel 执行报 "lowering missing"）。产出时立即 lower 填入；
-        // 失败兜底为空（保持旧行为，pregel 端仍会报真降级错误）。
-        let lowered_body = crate::mir::lower::lower_mir_exprs(std::slice::from_ref(&body))
-            .unwrap_or_else(|_| MirFunction {
-                params: vec![],
-                body: vec![],
-                n_regs: 0,
-            });
+        // （pregel 执行报 "lowering missing"）。产出时立即 lower 填入。
+        // v0.75.80: lower 失败不再兜底空函数哨兵 —— 具体错误上抛，agent
+        // 定义整体失败（调用点据此使整个 orchestrate 语句失败，compile 报错）。
+        let lowered_body = match crate::mir::lower::lower_mir_exprs(std::slice::from_ref(&body)) {
+            Ok(f) => f,
+            Err(e) => {
+                eprintln!("Parse error: orchestrate agent '{name}' task_body lowering failed: {e}");
+                self.current = saved;
+                return None;
+            }
+        };
         Some(MirOrchestrateAgent {
             name,
             with_config: None,

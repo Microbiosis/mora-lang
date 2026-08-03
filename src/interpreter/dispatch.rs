@@ -517,16 +517,12 @@ impl Interpreter {
                 | Value::Closure { .. }
                 | Value::Compose(_)
                 | Value::Partial(_, _) => self.call_value(&value, args),
-                Value::Macro { params, .. } => {
-                    let env = Arc::new(Mutex::new(Environment::with_parent_of(
-                        self.core.environment.clone(),
-                    )));
-                    for (i, param) in params.iter().enumerate() {
-                        let value = args.get(i).cloned().unwrap_or(Value::Nil);
-                        env.lock().define(param.clone(), value, false);
-                    }
-                    // Macro body 在 v2 模式下通过 arena 执行，此处简化返回 Nil
-                    Ok(Value::Nil)
+                // v0.75.80: 宏展开未实现 — 显式报错而非静默 Nil。
+                // 此前 Value::Macro 只存 name+params（value.rs），宏体在
+                // parser 词法级跳过（parse_macro_def），调用方拿到静默 Nil
+                // 无错误无展开（spec 11.5 承诺宏是用户特性，属功能缺失被掩盖）。
+                Value::Macro { name, .. } => {
+                    Err(format!("macro '{}' expansion not implemented", name))
                 }
                 _ => Err(format!("'{}' is not callable", name)),
             }

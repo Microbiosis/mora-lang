@@ -1,12 +1,13 @@
-//! v0.57: MIR-native Pregel 引擎（Batch D2 — 与 orchestrate_v2.rs 并行存在）
+//! v0.57: MIR-native Pregel 引擎（BSP 超步执行器）
 //!
-//! 与 `orchestrate_v2::PregelEngine` 功能等价，但：
-//! - 直接消费 `Mir*` 类型（`MirAgentDef`/`MirEdgeDef`/...），无 ast_compat 桥接
+//! 直接消费 `Mir*` 类型（`MirAgentDef`/`MirEdgeDef`/...），无 ast_compat 桥接：
 //! - `task_body`/`verify_body`/`condition_body`/`merge_body`/`thread_id_body`
 //!   均内嵌在对应 MIR-native 字段中，无需额外 HashMap
 //! - 零 `AstArena`/`NodeId` 依赖
 //!
-//! Batch D3 将切换调用方；D4 删除旧 `orchestrate_v2::PregelEngine`。
+//! 引擎经 `MirInst::Orchestrate`（Pregel 变体）驱动，支持超步循环、
+//! vote_to_halt 收敛、Aggregator、Combiner、故障恢复（checkpoint）、
+//! 节点重平衡与统计。见 `MirPregelEngine` 与 `pregel_opt`（超步融合优化）。
 //!
 //! # Versioning Systems (v0.65)
 //!
@@ -24,8 +25,6 @@
 //! These systems track different things and are intentionally separate.
 //! `channel_versions` is a change-detection mechanism; `VectorClock` is a
 //! causal-ordering mechanism. Do not unify them.
-//!
-//! 当前为骨架（Batch D2）：定义结构 + 接口，内部逻辑先用 TODO 标记。
 
 use std::collections::HashMap;
 use std::sync::Arc;

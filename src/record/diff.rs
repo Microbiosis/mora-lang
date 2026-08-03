@@ -1,3 +1,5 @@
+//! v0.25: record diff — diff_recordings（两录制事件对比，DiffLine 渲染）。
+
 use super::*;
 
 pub fn diff_recordings(a_events: &[Event], b_events: &[Event]) -> Vec<DiffLine> {

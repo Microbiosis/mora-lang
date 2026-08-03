@@ -331,7 +331,7 @@ body
 
         let mut reg = SkillRegistry::new();
         reg.set_public_registry(path.clone());
-        let count = reg.load_public_registry().expect("load");
+        let count = reg.load_public_registry().expect("load 调用应成功");
         assert!(
             count >= 1,
             "should find at least 1 name/description pair, got {}",

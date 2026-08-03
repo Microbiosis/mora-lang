@@ -1,3 +1,5 @@
+//! v0.25: LSP document symbol provider（符号大纲）。
+
 use std::collections::{BTreeMap, HashMap};
 
 use super::parsed_doc_v3;

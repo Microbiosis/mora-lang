@@ -1,3 +1,5 @@
+//! v0.25: record 脱敏审计 — redact_secrets/audit_recording + moraignore 策略解析。
+
 use super::*;
 
 pub fn redact_secrets(s: &str) -> String {

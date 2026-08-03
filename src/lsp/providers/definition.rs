@@ -1,3 +1,5 @@
+//! v0.25: LSP definition provider（跳转定义）。
+
 use std::collections::{BTreeMap, HashMap};
 
 use super::parsed_doc_v3;

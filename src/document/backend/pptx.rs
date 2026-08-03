@@ -237,7 +237,7 @@ mod tests {
     fn parses_real_pptx() {
         let path = format!("{}/tests/fixtures/sample.pptx", env!("CARGO_MANIFEST_DIR"));
         let bytes = std::fs::read(&path).expect("fixture file");
-        let backend = PptxBackend::from_bytes(bytes).expect("parse");
+        let backend = PptxBackend::from_bytes(bytes).expect("parse 调用应成功");
         assert_eq!(backend.origin(), "pptx");
         assert!(
             backend.slide_count >= 2,

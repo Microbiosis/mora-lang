@@ -147,8 +147,8 @@ mod tests {
     #[test]
     fn cached_dag_runs_same_result() {
         let source = "let acc = 0\nfor i in [1, 2, 3]\n  acc = acc + i\nend\nreturn acc\n";
-        let exprs = parse_code_v3(source).expect("parse");
-        let func: Arc<MirFunction> = Arc::new(lower_mir_exprs(&exprs).expect("lower"));
+        let exprs = parse_code_v3(source).expect("parse 调用应成功");
+        let func: Arc<MirFunction> = Arc::new(lower_mir_exprs(&exprs).expect("lower 调用应成功"));
 
         // 直建路径（baseline）
         let mut interp = Interpreter::new();

@@ -1,3 +1,5 @@
+//! v0.25: LSP hover provider（悬停信息）。
+
 use std::collections::{BTreeMap, HashMap};
 
 use super::parsed_doc_v3;

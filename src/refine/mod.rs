@@ -260,7 +260,7 @@ mod tests {
         let script = write_temp_script("demo.mora", "task main()\n  print(\"hi\")\n");
         let mut session = RefineSession::new(&script);
         let refine_dir = session.refine_dir.clone();
-        let step = session.refine("add greeting").expect("refine");
+        let step = session.refine("add greeting").expect("refine 调用应成功");
         assert_eq!(step.iteration, 1);
 
         // 验证 .refine 目录被创建 (REAL mkdir)

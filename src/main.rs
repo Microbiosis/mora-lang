@@ -1,3 +1,6 @@
+//! v0.01: CLI 二进制入口 — dispatch + run_file/run_check/run_repl + install/banner。
+//! v0.75.53: record/mcp 子命令已迁 lib 侧 cli/，本文件仅保留执行入口与分派。
+
 // mod ast; mod interpreter; ... 现在由 src/lib.rs 暴露
 
 use std::env;

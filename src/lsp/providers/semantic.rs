@@ -1,3 +1,5 @@
+//! v0.25: LSP semantic tokens provider（语义高亮）。
+
 use std::collections::HashMap;
 
 use super::parsed_doc_v3;

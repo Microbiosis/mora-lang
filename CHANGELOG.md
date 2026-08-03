@@ -2,6 +2,21 @@
 
 All notable changes to Mora will be documented in this file.
 
+## [v0.75.82] — 2026-08-04 — 删 typeinfer 死模块（活替代 = witness typeck）
+
+按「先查相同作用不同名字，有替代则删」原则处置 typeinfer 死模块：
+
+- **infer_types（typeinfer.rs, 302 行）零调用者**：全仓无引用，从未接入
+  JIT（jit.rs 用自有局部类型跟踪）。注释承诺的「由 typeinfer 后续填充」
+  未兑现。
+- **MirSsaFunction.types 字段零读取**：构造点（ssa.rs construct 两处）恒
+  `Vec::new()`。**RegType enum 唯一消费者是 typeinfer**，随模块删除。
+- 活替代：类型推断的活机制是 **witness typeck**（typeck/hm，compile
+  主路径 `check_program_witnesses`）——同 v0.75.81 RecordTokens/Route
+  删除先例（语义被运行时路径取代，死代码不留空承诺）。
+
+验证：全量测试绿（docker 依赖 skip）+ clippy `-D warnings` 0 + fmt 0。
+
 ## [v0.75.81] — 2026-08-04 — 死指令处置：删 2 有替代 + 建 2 前端
 
 按「先查相同作用不同名字，无则构造前端」原则处置 4 个死 MirInst：

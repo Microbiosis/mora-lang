@@ -2,6 +2,23 @@
 
 All notable changes to Mora will be documented in this file.
 
+## [v0.75.65] — 2026-08-03 — dispatch.rs call_method 按类型提取（God Function 拆分）
+
+call_method（644 行巨型 match）按 Value 类型提取为 10 个私有方法，主干
+保留类型分派（D6 惯例）：
+
+- `call_method_{list,dict,builtin,string,stream,router,mcp,document}`：
+  值语义传参
+- `call_method_conversation` / `call_method_agent`：arm 移动 object +
+  方法内 let-else 解构（refutable 模式）；conversation 的 compress arm
+  重建对象（compress_top 需完整 Value），agent 用 object 参数避开
+  clippy too_many_arguments
+- builtin 分支（22 个 (kind, method) 组合）包 `match (kind, method)`
+- TraitObject 早退与 `_` 兜底不变
+
+行为等价：全量 790 绿 + clippy `-D warnings` 0 + fmt 0；冒烟 List/String/
+Dict 方法正常。主干 644 → ~40 行，每类型方法可独立演进。
+
 ## [v0.75.64] — 2026-08-03 — 约束审计：生产代码裸 unwrap 清零
 
 AGENTS.md「生产代码避免 unwrap()」审计——扫描全部 35 个模块化会话

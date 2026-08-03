@@ -77,12 +77,11 @@ pub fn greedy_search(
         // 扫描所有 (pc, rule) 对
         for (pc, inst) in current.iter().enumerate() {
             for (rule_idx, rule) in rules.iter().enumerate() {
-                if rule.pattern().matches(inst).is_some() {
+                if let Some(bindings) = rule.pattern().matches(inst) {
                     let memo_key = (rule_idx, format!("{:?}", inst));
                     let new_insts = match rewrite_memo.get(&memo_key) {
                         Some(cached) => cached.clone(),
                         None => {
-                            let bindings = rule.pattern().matches(inst).unwrap();
                             let computed = rule.rewrite_with_context(
                                 inst,
                                 &bindings,

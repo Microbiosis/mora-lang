@@ -225,7 +225,9 @@ impl DocumentBackend for HtmlBackend {
                     if current_kind.is_some() && is_block_tag(&name) {
                         let text = current_text.trim();
                         if !text.is_empty() {
-                            let kind = current_kind.take().unwrap();
+                            let kind = current_kind
+                                .take()
+                                .expect("html: current_kind set by outer is_some check");
                             blocks.push(make_block(&kind, text));
                         } else {
                             current_kind = None;

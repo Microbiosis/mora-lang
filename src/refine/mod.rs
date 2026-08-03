@@ -106,7 +106,10 @@ impl RefineSession {
     /// 让 caller drop lock before consuming result (避免锁 + I/O 一起)
     pub fn refine(&mut self, instruction: &str) -> Result<RefineStep, String> {
         let steps = self.refine_many(instruction, 1)?;
-        Ok(steps.into_iter().next().unwrap())
+        steps
+            .into_iter()
+            .next()
+            .ok_or_else(|| "refine: refine_many(1) returned no step".to_string())
     }
 
     /// v0.75.8: 多候选生成 — 对同一 instruction 生成 N 个独立候选副本

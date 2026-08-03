@@ -84,3 +84,27 @@ fn compile_equivalent_prompt() {
     assert_compile_equivalent("print(p\"hello {name}\")");
     assert_compile_equivalent("let msg = p\"score: {n} points\"\nprint(msg)");
 }
+
+/// v0.75.76: 回归测试 — 顶层 `let f` 绑定 + 裸函数调用（compile 主路径）。
+/// 修复前：take_env 移出 core.environment 后 h_define 写 run_mir 的 env 参数，
+/// 而 call_function 兜底查 core（空壳）→ `f(5)` 报 "Undefined function or task"。
+/// 修复：h_call 用执行 env 直查用户 callable（与 h_define 同容器），无锁、无死锁。
+#[test]
+fn compile_bare_user_function_call() {
+    let src = "let f = fn(x) x * 2 end\nprint(f(5))";
+    let (func, witnesses) = ParserV3::compile(src).expect("compile should succeed");
+    let type_errors = mora::typeck::check_mir::check_program_witnesses(&witnesses);
+    assert!(
+        type_errors.is_empty(),
+        "typeck should pass: {:?}",
+        type_errors
+    );
+
+    let mut interp = mora::interpreter::Interpreter::new();
+    let mut env = interp.take_env();
+    let func_arc = std::sync::Arc::new(func);
+    mora::mir::vm::run_mir(&func_arc, &mut interp, &mut env)
+        .expect("run_mir should not fail (no Undefined function panic)");
+    mora::mir::vm::run_main_task(&func_arc, &mut interp, &mut env)
+        .expect("run_main_task should succeed");
+}

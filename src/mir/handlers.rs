@@ -95,6 +95,19 @@ pub fn h_call(
         }
         // v0.75.9: 包裹 Arc 走全局 DAG 缓存（task body 借自指令表）
         run_mir(&Arc::new((*body).clone()), interp, &mut child_env)?
+    } else if let Some(callable) = env.get(name) {
+        // v0.75.76: 用户自定义函数/闭包直查执行 env（与 h_define 同一容器）。
+        // 修复 `let f = fn(x) x*2 end; f(5)` 顶层绑定对 call_function 不可见
+        // （take_env 移出 core.environment 后 call_builtin_fallback 查 core 空壳）。
+        // callable 值（Closure/Task/Compose/Partial）走 call_value；其余（含
+        // Macro、非 callable 值）回落 mir_call_function 保持 builtin/P6 语义。
+        match callable {
+            Value::Task { .. }
+            | Value::Closure { .. }
+            | Value::Compose(_)
+            | Value::Partial(_, _) => interp.call_value(&callable, arg_vals)?,
+            _ => interp.mir_call_function(name, arg_vals)?,
+        }
     } else {
         interp.mir_call_function(name, arg_vals)?
     };

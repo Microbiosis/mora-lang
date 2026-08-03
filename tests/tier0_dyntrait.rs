@@ -74,15 +74,16 @@ fn dyntrait_lowering_emits_instruction() {
 
 #[test]
 fn dyntrait_interp_constructs_trait_object() {
-    // α.12 起 DynTrait 指令由 handlers.rs 的 dispatch 处理（interp.rs 只
-    // 驱动执行顺序，不再内联指令逻辑）。
-    let src = std::fs::read_to_string("src/mir/handlers.rs").expect("mir/handlers.rs");
+    // v0.75.56: dispatch 拆至 inst.rs；h_dyn_trait 仍在 handlers.rs。
+    // （此前两者都在 handlers.rs。）
+    let inst_src = std::fs::read_to_string("src/mir/inst.rs").expect("mir/inst.rs");
     assert!(
-        src.contains("MirInst::DynTrait {"),
+        inst_src.contains("MirInst::DynTrait {"),
         "dispatch must handle MirInst::DynTrait"
     );
+    let handlers_src = std::fs::read_to_string("src/mir/handlers.rs").expect("mir/handlers.rs");
     assert!(
-        src.contains("Value::TraitObject {"),
+        handlers_src.contains("Value::TraitObject {"),
         "DynTrait handler must construct Value::TraitObject"
     );
 }

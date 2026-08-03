@@ -106,6 +106,16 @@ pub struct Lexer {
 }
 
 impl Lexer {
+    /// v0.75.69: 单 token 构造辅助 — 消除 33 处重复的 Token { line, column } 构造
+    /// （line/column 恒为 start_line/start_col，多字符 token 由 *_from 处理）。
+    fn simple_token(token_type: TokenType, line: usize, column: usize) -> Option<Token> {
+        Some(Token {
+            token_type,
+            line,
+            column,
+        })
+    }
+
     pub fn new(source: &str) -> Self {
         Self {
             source: source.chars().collect(),
@@ -214,11 +224,7 @@ impl Lexer {
 
         let c = self.advance();
         match c {
-            '+' => Some(Token {
-                token_type: TokenType::Plus,
-                line: start_line,
-                column: start_col,
-            }),
+            '+' => Self::simple_token(TokenType::Plus, start_line, start_col),
             '-' => {
                 if self.match_char('-') {
                     while self.peek() != '\n' && !self.is_at_end() {
@@ -226,107 +232,39 @@ impl Lexer {
                     }
                     self.next_token()
                 } else if self.match_char('>') {
-                    Some(Token {
-                        token_type: TokenType::Arrow,
-                        line: start_line,
-                        column: start_col,
-                    })
+                    Self::simple_token(TokenType::Arrow, start_line, start_col)
                 } else {
-                    Some(Token {
-                        token_type: TokenType::Minus,
-                        line: start_line,
-                        column: start_col,
-                    })
+                    Self::simple_token(TokenType::Minus, start_line, start_col)
                 }
             }
-            '*' => Some(Token {
-                token_type: TokenType::Star,
-                line: start_line,
-                column: start_col,
-            }),
-            '/' => Some(Token {
-                token_type: TokenType::Slash,
-                line: start_line,
-                column: start_col,
-            }),
-            '%' => Some(Token {
-                token_type: TokenType::Percent,
-                line: start_line,
-                column: start_col,
-            }),
-            '(' => Some(Token {
-                token_type: TokenType::LParen,
-                line: start_line,
-                column: start_col,
-            }),
-            ')' => Some(Token {
-                token_type: TokenType::RParen,
-                line: start_line,
-                column: start_col,
-            }),
-            '[' => Some(Token {
-                token_type: TokenType::LBracket,
-                line: start_line,
-                column: start_col,
-            }),
-            ']' => Some(Token {
-                token_type: TokenType::RBracket,
-                line: start_line,
-                column: start_col,
-            }),
-            '{' => Some(Token {
-                token_type: TokenType::LBrace,
-                line: start_line,
-                column: start_col,
-            }),
-            '}' => Some(Token {
-                token_type: TokenType::RBrace,
-                line: start_line,
-                column: start_col,
-            }),
+            '*' => Self::simple_token(TokenType::Star, start_line, start_col),
+            '/' => Self::simple_token(TokenType::Slash, start_line, start_col),
+            '%' => Self::simple_token(TokenType::Percent, start_line, start_col),
+            '(' => Self::simple_token(TokenType::LParen, start_line, start_col),
+            ')' => Self::simple_token(TokenType::RParen, start_line, start_col),
+            '[' => Self::simple_token(TokenType::LBracket, start_line, start_col),
+            ']' => Self::simple_token(TokenType::RBracket, start_line, start_col),
+            '{' => Self::simple_token(TokenType::LBrace, start_line, start_col),
+            '}' => Self::simple_token(TokenType::RBrace, start_line, start_col),
             '.' => {
                 if self.match_char('.') && self.match_char('.') {
                     // '...' 三个点 → DotDotDot
-                    Some(Token {
-                        token_type: TokenType::DotDotDot,
-                        line: start_line,
-                        column: start_col,
-                    })
+                    Self::simple_token(TokenType::DotDotDot, start_line, start_col)
                 } else {
-                    Some(Token {
-                        token_type: TokenType::Dot,
-                        line: start_line,
-                        column: start_col,
-                    })
+                    Self::simple_token(TokenType::Dot, start_line, start_col)
                 }
             }
-            ',' => Some(Token {
-                token_type: TokenType::Comma,
-                line: start_line,
-                column: start_col,
-            }),
+            ',' => Self::simple_token(TokenType::Comma, start_line, start_col),
             ':' => {
                 if self.match_char(':') {
-                    Some(Token {
-                        token_type: TokenType::ColonColon,
-                        line: start_line,
-                        column: start_col,
-                    })
+                    Self::simple_token(TokenType::ColonColon, start_line, start_col)
                 } else {
-                    Some(Token {
-                        token_type: TokenType::Colon,
-                        line: start_line,
-                        column: start_col,
-                    })
+                    Self::simple_token(TokenType::Colon, start_line, start_col)
                 }
             }
             '|' => {
                 if self.match_char('>') {
-                    Some(Token {
-                        token_type: TokenType::Pipe,
-                        line: start_line,
-                        column: start_col,
-                    })
+                    Self::simple_token(TokenType::Pipe, start_line, start_col)
                 } else {
                     Some(self.error_token(
                         start_line,
@@ -337,97 +275,49 @@ impl Lexer {
             }
             '>' => {
                 if self.match_char('=') {
-                    Some(Token {
-                        token_type: TokenType::GreaterEqual,
-                        line: start_line,
-                        column: start_col,
-                    })
+                    Self::simple_token(TokenType::GreaterEqual, start_line, start_col)
                 } else {
-                    Some(Token {
-                        token_type: TokenType::Greater,
-                        line: start_line,
-                        column: start_col,
-                    })
+                    Self::simple_token(TokenType::Greater, start_line, start_col)
                 }
             }
             '<' => {
                 if self.match_char('=') {
-                    Some(Token {
-                        token_type: TokenType::LessEqual,
-                        line: start_line,
-                        column: start_col,
-                    })
+                    Self::simple_token(TokenType::LessEqual, start_line, start_col)
                 } else {
-                    Some(Token {
-                        token_type: TokenType::Less,
-                        line: start_line,
-                        column: start_col,
-                    })
+                    Self::simple_token(TokenType::Less, start_line, start_col)
                 }
             }
             '=' => {
                 if self.match_char('=') {
-                    Some(Token {
-                        token_type: TokenType::Equal,
-                        line: start_line,
-                        column: start_col,
-                    })
+                    Self::simple_token(TokenType::Equal, start_line, start_col)
                 } else if self.match_char('>') {
                     // v0.55: `=>` fat arrow for match arms
-                    Some(Token {
-                        token_type: TokenType::FatArrow,
-                        line: start_line,
-                        column: start_col,
-                    })
+                    Self::simple_token(TokenType::FatArrow, start_line, start_col)
                 } else {
-                    Some(Token {
-                        token_type: TokenType::Assign,
-                        line: start_line,
-                        column: start_col,
-                    })
+                    Self::simple_token(TokenType::Assign, start_line, start_col)
                 }
             }
             '!' => {
                 if self.match_char('=') {
-                    Some(Token {
-                        token_type: TokenType::NotEqual,
-                        line: start_line,
-                        column: start_col,
-                    })
+                    Self::simple_token(TokenType::NotEqual, start_line, start_col)
                 } else {
                     // v0.30: `!` 作为前缀操作符 (逻辑非), 在 parser 阶段处理
                     // (mora 同时支持 `not` 关键字, 两者等价)
-                    Some(Token {
-                        token_type: TokenType::Bang,
-                        line: start_line,
-                        column: start_col,
-                    })
+                    Self::simple_token(TokenType::Bang, start_line, start_col)
                 }
             }
             // v0.06.2: ? 操作符
-            '?' => Some(Token {
-                token_type: TokenType::Question,
-                line: start_line,
-                column: start_col,
-            }),
+            '?' => Self::simple_token(TokenType::Question, start_line, start_col),
             // v0.21: & 借用操作符
             '&' => {
                 if self.match_char('m') && self.peek() == 'u' {
                     // '&mut' 可变借用
                     self.advance(); // consume 'u'
                     self.advance(); // consume 't'
-                    Some(Token {
-                        token_type: TokenType::AmpMut,
-                        line: start_line,
-                        column: start_col,
-                    })
+                    Self::simple_token(TokenType::AmpMut, start_line, start_col)
                 } else {
                     // '&' 不可变借用
-                    Some(Token {
-                        token_type: TokenType::Amp,
-                        line: start_line,
-                        column: start_col,
-                    })
+                    Self::simple_token(TokenType::Amp, start_line, start_col)
                 }
             }
             '"' => Some(self.string_from(start_line, start_col)),
@@ -454,11 +344,7 @@ impl Lexer {
                         while self.peek().is_ascii_alphanumeric() || self.peek() == '_' {
                             lifetime.push(self.advance());
                         }
-                        Some(Token {
-                            token_type: TokenType::Lifetime(lifetime),
-                            line: start_line,
-                            column: start_col,
-                        })
+                        Self::simple_token(TokenType::Lifetime(lifetime), start_line, start_col)
                     } else {
                         // 字符 'x'
                         Some(self.char_from(start_line, start_col))
@@ -471,11 +357,7 @@ impl Lexer {
             '\n' => {
                 self.line += 1;
                 self.column = 1;
-                Some(Token {
-                    token_type: TokenType::Newline,
-                    line: start_line,
-                    column: start_col,
-                })
+                Self::simple_token(TokenType::Newline, start_line, start_col)
             }
             _ => {
                 if c.is_ascii_digit() {
@@ -490,11 +372,7 @@ impl Lexer {
                 } else if c == '@' {
                     // v0.30: `@` 装饰符 (e.g. @start, @exit 用于 graph node label)
                     // 只 emit `@` 本身——parser 自行 consume_identifier 取节点名
-                    Some(Token {
-                        token_type: TokenType::At,
-                        line: start_line,
-                        column: start_col,
-                    })
+                    Self::simple_token(TokenType::At, start_line, start_col)
                 } else {
                     Some(self.error_token(
                         start_line,

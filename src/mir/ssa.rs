@@ -31,8 +31,6 @@ pub struct MirSsaFunction {
     pub params: Vec<(String, SsaReg)>,
     pub blocks: Vec<BasicBlock>,
     pub entry: BlockId,
-    /// α.8: 每个 SSA 寄存器的推断类型（用于 JIT 编译）
-    pub types: Vec<RegType>,
     /// v0.75.30: 声明型指令透传 — construct 中被跳过（SSA 不优化声明）的
     /// 指令（TaskDef/ToolDef/Import/StructDef/...）原样收集，deconstruct 时
     /// 还原到 body 头部。此前这些指令被丢弃 → `--opt` 下 task main 消失
@@ -40,18 +38,10 @@ pub struct MirSsaFunction {
     pub passthrough: Vec<MirInst>,
 }
 
-/// α.8: SSA 寄存器的推断类型
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum RegType {
-    Void,
-    Int,
-    Float,
-    Bool,
-    String,
-    List(Box<RegType>), // list<T>
-    Dict(Vec<RegType>), // dict: (key_type, val_type)
-    Any,                // dyn 类型，不可特化
-}
+// v0.75.82: RegType 已删除 — 死类型推断（零消费者）。infer_types 全仓
+// 零调用者、types 字段零读取、从未接入 JIT（jit.rs 用自有局部类型跟踪）。
+// 类型推断的活机制是 witness typeck（typeck/hm，compile 主路径
+// check_program_witnesses）— 与 v0.75.81 RecordTokens/Route 删除同一先例。
 
 /// 基本块：phi + 纯值指令 + terminator
 #[derive(Debug, Clone)]
@@ -178,7 +168,6 @@ pub fn construct(func: &MirFunction) -> MirSsaFunction {
                 succs: Vec::new(),
             }],
             entry: 0,
-            types: Vec::new(),
             passthrough: Vec::new(),
         };
     }
@@ -291,7 +280,6 @@ pub fn construct(func: &MirFunction) -> MirSsaFunction {
             .collect(),
         blocks,
         entry: 0,
-        types: Vec::new(), // 由 typeinfer 后续填充
         passthrough,
     }
 }

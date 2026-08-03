@@ -31,7 +31,6 @@ pub mod lower;
 pub mod opt;
 pub mod optimize;
 pub mod ssa;
-pub mod typeinfer;
 // v0.75.38: MirWitness 轻量树骨架（typeck/LSP 消费面，去 AST 化中间层）
 pub mod witness;
 

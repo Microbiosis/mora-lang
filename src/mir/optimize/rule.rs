@@ -383,7 +383,7 @@ mod tests {
         assert!(names.contains(&"dead_after_return"));
     }
 
-    // ========== RedundantJumpRule 测试（Phase H.2）==========
+    // ─ RedundantJumpRule 测试（Phase H.2） ────
 
     #[test]
     fn test_redundant_jump_pattern_matches() {

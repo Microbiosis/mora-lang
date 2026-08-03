@@ -462,7 +462,7 @@ mod tests {
         assert_eq!(Type::Float.name(), "float");
     }
 
-    // ===== v0.52 regression: json_to_value 空格 bug =====
+    // ─ v0.52 regression: json_to_value 空格 bug ────
     // pre-existing: parse_json_value 在 line 414 trim_start() 但 return 的 consumed
     // 不含 trim 字节数，导致 dict 内有空格时解析错位（"Expected ',' in dict"）
     // 这是 v0.51 P0-3 修 Send 派发时发现的（见 src/runtime/infra.rs:extract_send_tasks

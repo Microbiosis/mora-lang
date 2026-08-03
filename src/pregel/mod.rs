@@ -605,7 +605,7 @@ impl MirPregelEngine {
                 self.aggregator_acc.insert(name.clone(), initial.clone());
             }
 
-            // ---------- 1. PLAN ----------
+            // ─ 1. PLAN ──────
             let mut to_execute: Vec<String> = Vec::new();
             for node in &active_nodes {
                 if node == "@start" {
@@ -634,7 +634,7 @@ impl MirPregelEngine {
                 }
             }
 
-            // ---------- 2. EXEC ----------
+            // ─ 2. EXEC ──────
             // 记录激活节点的 snapshots
             for node_name in &to_execute {
                 let snapshot = self.versions_seen.entry(node_name.clone()).or_default();
@@ -671,7 +671,7 @@ impl MirPregelEngine {
             // v0.75.57: EXEC 段提取至 execute_step（BSP 超步执行 + fault tolerance）
             let writes = self.execute_step(interpreter, &to_execute, &mut next_active)?;
 
-            // ---------- 3. UPDATE ----------
+            // ─ 3. UPDATE ────
             for (_node, channel, value) in writes {
                 self.apply_write(channel, value, interpreter)?;
             }
@@ -709,7 +709,7 @@ impl MirPregelEngine {
                 }
             }
 
-            // ---------- 4. ADVANCE ----------
+            // ─ 4. ADVANCE ────
             // v0.69: Dynamic Send delivery — target nodes become active in
             // the next super-step and their `input` channel carries the payload.
             // v0.72: Combiners — multiple sends to the same target are folded

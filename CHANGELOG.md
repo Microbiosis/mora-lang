@@ -2,6 +2,21 @@
 
 All notable changes to Mora will be documented in this file.
 
+## [v0.75.61] — 2026-08-03 — mir/vm.rs 拆 vm/dag.rs（模块化）
+
+vm.rs（923 → 565 行）线性/DAG 双语义段拆分：
+
+- vm.rs 保留线性区：run_mir / run_mir_with_signal / MirSignal /
+  build_task_registry / run_main_task / 索引与模式匹配辅助
+- `vm/dag.rs`（373）— DAG 超步执行器（BSP 超步模型，生产主路径）：
+  run_dag* / DagExecMemo / is_memoizable_pure / node_ready / is_control_edge
+- 单文件模块 → 目录模块；`pub use dag::*` 保持 `vm::run_dag*` /
+  `vm::DagExecMemo` 路径（P4 对外契约不变，cache.rs/pregel/tests 零改动）
+- 依赖单向 dag → super（线性区）+ crate::mir::dag（类型）；无循环
+
+纯搬移零行为变更。验证：全量 790 绿（skip 3 个 Windows 挂起基线）+
+clippy 0 + fmt 0。
+
 ## [v0.75.60] — 2026-08-03 — mir/opt.rs 拆 5 个 pass 文件（模块化）
 
 opt.rs（1176 → 208 行）按 SSA pass 组拆分子模块（D6 单文件惯例）：

@@ -160,8 +160,13 @@ impl Clone for Interpreter {
 // 各方法委托既有固有方法/字段；固有方法同名时 `self.method()` 优先固有，
 // 无递归风险。
 impl crate::mir::host::MirHost for Interpreter {
-    fn mir_call_function(&mut self, name: &str, args: Vec<Value>) -> Result<Value, String> {
-        Interpreter::mir_call_function(self, name, args)
+    fn mir_call_function(
+        &mut self,
+        name: &str,
+        args: Vec<Value>,
+        env: &Environment,
+    ) -> Result<Value, String> {
+        Interpreter::mir_call_function(self, name, args, env)
     }
 
     fn mir_call_method(
@@ -445,12 +450,15 @@ impl Interpreter {
 
     /// α.0: MIR 解释器的函数调用桥。复用 dispatch.rs 的 call_function。
     /// pub(crate) 让 mir::interp 能调用，不暴露给 crate 外。
+    /// `env` = 当前执行环境：call_function 兜底查用户函数的单一来源
+    /// （v0.75.76 起不再查询宿主全局环境，避免 take_env 双环境分歧）。
     pub(crate) fn mir_call_function(
         &mut self,
         name: &str,
         args: Vec<Value>,
+        env: &Environment,
     ) -> Result<Value, String> {
-        self.call_function(name, args, crate::common::Span::default())
+        self.call_function(name, args, env, crate::common::Span::default())
     }
 
     /// α.1: MIR 解释器的方法调用桥。复用 dispatch.rs 的 call_method。

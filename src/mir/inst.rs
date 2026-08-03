@@ -382,7 +382,7 @@ pub fn dispatch(
             Ok(Flow::Continue)
         }
         MirInst::Closure { dst, params, body } => {
-            h_closure(regs, *dst, params, body, interp);
+            h_closure(regs, *dst, params, body, env);
             Ok(Flow::Continue)
         }
         MirInst::DynTrait {
@@ -465,7 +465,7 @@ pub fn dispatch(
         }
         MirInst::RecordTokens { .. } => Ok(Flow::Continue),
         MirInst::Save { path, value } => {
-            h_save(interp, regs, *path, *value)?;
+            h_save(interp, env, regs, *path, *value)?;
             Ok(Flow::Continue)
         }
         MirInst::Load { path, var } => {
@@ -477,11 +477,11 @@ pub fn dispatch(
             Ok(Flow::Continue)
         }
         MirInst::WriteFile { path, content } => {
-            h_write_file(interp, regs, *path, *content)?;
+            h_write_file(interp, env, regs, *path, *content)?;
             Ok(Flow::Continue)
         }
         MirInst::AppendFile { path, content } => {
-            h_append_file(interp, regs, *path, *content)?;
+            h_append_file(interp, env, regs, *path, *content)?;
             Ok(Flow::Continue)
         }
         MirInst::ReadBytesFile { path, var } => {
@@ -489,7 +489,7 @@ pub fn dispatch(
             Ok(Flow::Continue)
         }
         MirInst::WriteBytesFile { path, content } => {
-            h_write_bytes_file(interp, regs, *path, *content)?;
+            h_write_bytes_file(interp, env, regs, *path, *content)?;
             Ok(Flow::Continue)
         }
         MirInst::TraitDef {

@@ -22,8 +22,15 @@ use crate::value::{Environment, MergeStrategy, Value};
 ///
 /// `Interpreter` 是主实现（见 `interpreter/mod.rs`）；测试可提供轻量假实现。
 pub trait MirHost {
-    /// 函数调用桥（`h_call` fallback、file.* 内建等）。
-    fn mir_call_function(&mut self, name: &str, args: Vec<Value>) -> Result<Value, String>;
+    /// 函数调用桥（`h_call` task 分支之外的用户函数/builtin 调用）。
+    /// `env` 为当前执行环境（call_function 兜底查找用户函数的单一来源——
+    /// v0.75.76：不查询宿主全局环境，杜绝 take_env 空壳造成的双环境分歧）。
+    fn mir_call_function(
+        &mut self,
+        name: &str,
+        args: Vec<Value>,
+        env: &Environment,
+    ) -> Result<Value, String>;
     /// 方法调用桥（`h_method_call`）。
     fn mir_call_method(
         &mut self,

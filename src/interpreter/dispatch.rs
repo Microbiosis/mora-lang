@@ -47,6 +47,7 @@ impl Interpreter {
         &mut self,
         name: &str,
         args: Vec<Value>,
+        env: &Environment,
         call_site: Span,
     ) -> Result<Value, String> {
         // v0.08.2: Trait::new("ForType") —— 构造 trait instance
@@ -112,7 +113,7 @@ impl Interpreter {
                         "call_function: builtin 名 {name} 落入兜底（BuiltinKind::from_name 登记与 match 不一致）"
                     )
                 );
-                self.call_builtin_fallback(name, args)
+                self.call_builtin_fallback(name, args, env)
             }
         }
     }
@@ -501,9 +502,15 @@ impl Interpreter {
         }
         Ok(Value::String(buf))
     }
-    fn call_builtin_fallback(&mut self, name: &str, args: Vec<Value>) -> Result<Value, String> {
-        // 先 clone 出值，释放 borrow，避免借用冲突
-        let looked_up = self.core.environment.lock().get(name).clone();
+    fn call_builtin_fallback(
+        &mut self,
+        name: &str,
+        args: Vec<Value>,
+        env: &Environment,
+    ) -> Result<Value, String> {
+        // v0.75.76: 用户函数查找源为执行 env（经参数单一传递，与 h_define
+        // 同一容器）——不再查询宿主全局环境（take_env 空壳问题根除）。
+        let looked_up = env.get(name).clone();
         if let Some(value) = looked_up {
             match value {
                 Value::Task { .. }
@@ -1508,6 +1515,7 @@ mod tests {
         // v0.75.23: merge_with(key, strategy) 写侧 — 解析策略名并插入
         // current_merge_strategies（读侧 run_isolated 已接；此前无生产者）。
         let mut interp = Interpreter::new();
+        let env = interp.take_env();
         interp
             .call_function(
                 "merge_with",
@@ -1515,6 +1523,7 @@ mod tests {
                     Value::String("x".to_string()),
                     Value::String("grow_only_set".to_string()),
                 ],
+                &env,
                 Span::default(),
             )
             .expect("merge_with should succeed");
@@ -1528,6 +1537,7 @@ mod tests {
     #[test]
     fn merge_with_accumulates_multiple_keys() {
         let mut interp = Interpreter::new();
+        let env = interp.take_env();
         for (k, s) in [
             ("a", "append"),
             ("b", "add"),
@@ -1538,6 +1548,7 @@ mod tests {
                 .call_function(
                     "merge_with",
                     vec![Value::String(k.to_string()), Value::String(s.to_string())],
+                    &env,
                     Span::default(),
                 )
                 .expect("merge_with should succeed");
@@ -1554,6 +1565,7 @@ mod tests {
     #[test]
     fn merge_with_unknown_strategy_errors() {
         let mut interp = Interpreter::new();
+        let env = interp.take_env();
         let err = interp
             .call_function(
                 "merge_with",
@@ -1561,6 +1573,7 @@ mod tests {
                     Value::String("x".to_string()),
                     Value::String("bogus".to_string()),
                 ],
+                &env,
                 Span::default(),
             )
             .unwrap_err();
@@ -1574,19 +1587,26 @@ mod tests {
     #[test]
     fn testcase_instrumented_branches_reachable() {
         let mut interp = Interpreter::new();
+        let env = interp.take_env();
         // len: list / string / dict 三分支
         let n = interp
-            .call_function("len", vec![Value::List(vec![])], Span::default())
+            .call_function("len", vec![Value::List(vec![])], &env, Span::default())
             .unwrap();
         assert_eq!(n, Value::Int(0));
         let n = interp
-            .call_function("len", vec![Value::String("ab".into())], Span::default())
+            .call_function(
+                "len",
+                vec![Value::String("ab".into())],
+                &env,
+                Span::default(),
+            )
             .unwrap();
         assert_eq!(n, Value::Int(2));
         let n = interp
             .call_function(
                 "len",
                 vec![Value::Dict(Default::default())],
+                &env,
                 Span::default(),
             )
             .unwrap();
@@ -1596,6 +1616,7 @@ mod tests {
             .call_function(
                 "merge_with",
                 vec![Value::String("k".into()), Value::String("append".into())],
+                &env,
                 Span::default(),
             )
             .expect("merge_with should succeed");

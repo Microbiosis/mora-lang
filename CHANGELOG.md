@@ -2,6 +2,19 @@
 
 All notable changes to Mora will be documented in this file.
 
+## [v0.75.68] — 2026-08-03 — ai_chat HTTP 构造收敛（ai_chat_url + ai_agent）
+
+三处 AI API HTTP 段重复收敛（仅零风险项，错误消息是契约不动）：
+
+- `ai_chat_url(base_url)`：3 处 URL 构造（chat/completions）→ 1 个辅助
+- `ai_agent(read_timeout, Option<write_timeout>)`：3 处 agent 构建 → 1 个
+  辅助，参数保留各调用方超时差异（call_ai_api 单超时 30s；
+  send_with_retry/with_tools 双超时）→ 零行为变化
+- 不合并 post+send 传输内核：错误前缀是 `is_retryable_error` 契约
+  （interpreter/mod.rs 依赖 `"ai.chat: API error HTTP"` / `"network error"`）
+
+纯提取零行为变更。验证：全量 790 绿 + clippy `-D warnings` 0 + fmt 0。
+
 ## [v0.75.67] — 2026-08-03 — ai_chat.rs real_ai_chat_inner 提取 send_with_retry
 
 real_ai_chat_inner（303 → 178 行）— 构造/发送两阶段分离：

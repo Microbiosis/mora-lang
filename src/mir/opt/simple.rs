@@ -1,5 +1,5 @@
-// v0.75.60: 自 opt.rs 按 pass 组拆出（D6 单文件惯例）。
-// ConstProp / DeadCodeElim / Gvn 三个 pass 实现 + 共享辅助。
+//! v0.75.60: 自 opt.rs 按 pass 组拆出（D6 单文件惯例）。
+//! ConstProp / DeadCodeElim / Gvn 三个 pass 实现 + 共享辅助。
 
 use std::collections::{HashMap, HashSet};
 

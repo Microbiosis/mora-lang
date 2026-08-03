@@ -1,5 +1,5 @@
-// v0.75.60: 自 opt.rs 按 pass 组拆出（D6 单文件惯例）。
-// Licm / LoopStrengthReduction 两个 pass 实现 + loop 分析辅助。
+//! v0.75.60: 自 opt.rs 按 pass 组拆出（D6 单文件惯例）。
+//! Licm / LoopStrengthReduction 两个 pass 实现 + loop 分析辅助。
 
 use std::collections::{HashSet, VecDeque};
 

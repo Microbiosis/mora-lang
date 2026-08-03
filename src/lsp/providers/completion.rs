@@ -1,3 +1,5 @@
+//! v0.25: LSP completion provider（补全建议）。
+
 use std::collections::{BTreeSet, HashMap};
 
 use super::parsed_doc_v3;

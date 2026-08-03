@@ -1,3 +1,5 @@
+//! v0.25: LSP rename provider（重命名）。
+
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use super::parsed_doc_v3;

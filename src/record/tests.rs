@@ -1,3 +1,5 @@
+//! v0.25: record 单元测试（录制/重放/审计/快照回路）。
+
 use crate::record::*;
 use std::env;
 use std::fs;

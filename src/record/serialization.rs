@@ -1,3 +1,5 @@
+//! v0.25: record 序列化 — 事件 JSONL 编解码 + hash_prompt。
+
 use super::*;
 use std::path::Path;
 

@@ -437,7 +437,7 @@ mod tests_v0431_memory_bus {
             .unwrap();
         let recalled = interp
             .call_memory_method("recall_markdown", &[Value::String("notes".to_string())])
-            .expect("recall");
+            .expect("recall 调用应成功");
         match recalled {
             Value::String(s) => assert!(s.contains("remember this"), "got: {}", s),
             other => panic!("expected String, got: {:?}", other),
@@ -452,7 +452,7 @@ mod tests_v0431_memory_bus {
         interp.persist.markdown_memory_dir = Some(dir.clone());
         let result = interp
             .call_memory_method("recall_markdown", &[Value::String("nope".to_string())])
-            .expect("recall");
+            .expect("recall 调用应成功");
         assert_eq!(result, Value::String(String::new()));
         teardown_memory_dir(&dir);
     }
@@ -482,7 +482,7 @@ mod tests_v0431_memory_bus {
             .unwrap();
         let list = interp
             .call_memory_method("list_markdown", &[])
-            .expect("list");
+            .expect("list 调用应成功");
         match list {
             Value::List(items) => {
                 let cats: Vec<String> = items
@@ -517,7 +517,7 @@ mod tests_v0431_memory_bus {
         // 通过现有 recall (HashMap-backed) 应能查到
         let recalled = interp
             .call_memory_method("recall", &[Value::String("md:k".to_string())])
-            .expect("recall");
+            .expect("recall 调用应成功");
         match recalled {
             Value::String(s) => assert_eq!(s, "v"),
             other => panic!("expected String, got: {:?}", other),

@@ -1,3 +1,5 @@
+//! v0.25: LSP references provider（引用查找）。
+
 use std::collections::{BTreeMap, HashMap};
 
 use super::parsed_doc_v3;

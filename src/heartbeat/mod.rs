@@ -198,7 +198,7 @@ mod tests {
         let content = "# Heartbeat\n\n- [x] first done\n- [ ] second pending\n- [x] third done\n";
         std::fs::write(&path, content).unwrap();
 
-        let report = load_heartbeat(&path).expect("load");
+        let report = load_heartbeat(&path).expect("load 调用应成功");
         assert_eq!(report.total, 3);
         assert_eq!(report.done, 2);
         assert_eq!(report.pending, 1);

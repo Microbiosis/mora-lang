@@ -1,3 +1,5 @@
+//! v0.01: 词法分析器 — TokenType 枚举 + Token/Lexer（单字符 token 经 simple_token 收敛，v0.75.69）。
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum TokenType {
     Let,

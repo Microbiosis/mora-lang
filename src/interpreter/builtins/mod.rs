@@ -115,7 +115,7 @@ mod tests_v042_capability {
         let mut interp = Interpreter::new();
         let token_id = interp
             .call_sandbox_method("key", &[Value::String("file.read".to_string())])
-            .expect("issue");
+            .expect("issue 调用应成功");
         let err = interp
             .call_sandbox_method(
                 "check_call",
@@ -130,7 +130,7 @@ mod tests_v042_capability {
         let mut interp = Interpreter::new();
         let token_id = interp
             .call_sandbox_method("key", &[Value::String("file.read".to_string())])
-            .expect("issue");
+            .expect("issue 调用应成功");
         let token_id_num = match &token_id {
             Value::Float(n) => *n as u64,
             _ => panic!("expected Number"),
@@ -148,7 +148,7 @@ mod tests_v042_capability {
         // revoke
         let revoked = interp
             .call_sandbox_method("revoke", std::slice::from_ref(&token_id))
-            .expect("revoke");
+            .expect("revoke 调用应成功");
         assert_eq!(revoked, Value::Bool(true));
 
         // v0.49.0: generation 在 store 全局 bump (不放在 token 上)
@@ -205,7 +205,9 @@ mod tests_v042_capability {
     fn sandbox_old_methods_still_work() {
         // v0.42.0 增补不应破坏 v0.33-0.41 的 sandbox.mode / check_builtin / check_path
         let mut interp = Interpreter::new();
-        let mode = interp.call_sandbox_method("mode", &[]).expect("mode");
+        let mode = interp
+            .call_sandbox_method("mode", &[])
+            .expect("mode 应生效");
         assert!(matches!(mode, Value::String(_)));
 
         let cb = interp
@@ -328,16 +330,16 @@ mod tests_v0421_audit {
                         Value::Nil,
                     ],
                 )
-                .expect("emit");
+                .expect("emit 调用应成功");
         }
         let flushed = interp
             .call_sandbox_method("audit_flush", &[])
-            .expect("flush");
+            .expect("flush 调用应成功");
         assert_eq!(flushed, Value::Bool(true));
 
         let verified = interp
             .call_sandbox_method("audit_verify", &[])
-            .expect("verify");
+            .expect("verify 调用应成功");
         assert_eq!(verified, Value::Bool(true));
 
         let _ = std::fs::remove_file(&path);
@@ -361,11 +363,11 @@ mod tests_v0421_audit {
                         Value::Nil,
                     ],
                 )
-                .expect("emit");
+                .expect("emit 调用应成功");
         }
         interp
             .call_sandbox_method("audit_flush", &[])
-            .expect("flush");
+            .expect("flush 调用应成功");
         assert_eq!(
             interp.call_sandbox_method("audit_verify", &[]).unwrap(),
             Value::Bool(true)
@@ -424,10 +426,10 @@ mod tests_v0421_audit {
                     Value::String("{\"cap\":\"file.read\"}".to_string()),
                 ],
             )
-            .expect("emit");
+            .expect("emit 调用应成功");
         interp
             .call_sandbox_method("audit_flush", &[])
-            .expect("flush");
+            .expect("flush 调用应成功");
 
         // 验证文件存在且包含期望字段
         let content = std::fs::read_to_string(&path).unwrap();
@@ -590,7 +592,7 @@ mod tests_v044_container_real {
         // clear → 真 docker rm -f
         let cleared = interp
             .call_sandbox_method("container_clear", &[])
-            .expect("clear");
+            .expect("clear 调用应成功");
         assert_eq!(cleared, Value::Bool(true));
 
         // 验证 container 真的没了
@@ -707,7 +709,9 @@ mod tests_v045_toolplane {
     #[test]
     fn tool_plane_create_default_core_planes_exist() {
         let mut interp = Interpreter::new();
-        let list = interp.call_toolplane_method("list", &[]).expect("list");
+        let list = interp
+            .call_toolplane_method("list", &[])
+            .expect("list 调用应成功");
         match list {
             Value::List(names) => {
                 let names_v: Vec<String> = names
@@ -741,15 +745,15 @@ mod tests_v045_toolplane {
                     Value::String("extension".to_string()),
                 ],
             )
-            .expect("create");
+            .expect("create 调用应成功");
         assert_eq!(result, Value::Bool(true));
 
         let info = interp
             .call_toolplane_method("info", &[Value::String("user_plane".to_string())])
-            .expect("info");
+            .expect("info 调用应成功");
         match info {
             Value::Dict(d) => {
-                let kind = d.get("kind").expect("kind");
+                let kind = d.get("kind").expect("kind 字段应存在");
                 match kind {
                     Value::String(s) => assert_eq!(s, "extension"),
                     other => panic!("expected extension kind, got: {:?}", other),
@@ -808,7 +812,7 @@ mod tests_v045_toolplane {
                     Value::String("mytool".to_string()),
                 ],
             )
-            .expect("find");
+            .expect("find 调用应成功");
         match found {
             Value::Dict(d) => {
                 let desc = d.get("description").expect("description");
@@ -881,12 +885,12 @@ mod tests_v045_toolplane {
             .unwrap();
         let removed = interp
             .call_toolplane_method("remove", &[Value::String("p".to_string())])
-            .expect("remove");
+            .expect("remove 调用应成功");
         assert_eq!(removed, Value::Bool(true));
 
         let info = interp
             .call_toolplane_method("info", &[Value::String("p".to_string())])
-            .expect("info");
+            .expect("info 调用应成功");
         assert_eq!(info, Value::Nil);
     }
 }
@@ -907,7 +911,7 @@ mod tests_v045_ai {
                 "retry",
                 &[Value::String("5".to_string()), Value::Float(100.0)],
             )
-            .expect("retry");
+            .expect("retry 调用应成功");
         match result {
             Value::Dict(d) => {
                 let attempts = d.get("attempts").expect("attempts");
@@ -944,7 +948,7 @@ mod tests_v045_ai {
                     Value::String("exponential".to_string()),
                 ],
             )
-            .expect("retry");
+            .expect("retry 调用应成功");
         match result {
             Value::Dict(d) => {
                 let schedule = d.get("schedule").expect("schedule");
@@ -979,7 +983,7 @@ mod tests_v045_ai {
         for role in ["worker", "thinker", "verifier"] {
             let result = interp
                 .call_ai_method("role", &[Value::String(role.to_string())])
-                .expect("role");
+                .expect("role 调用应成功");
             match result {
                 Value::String(s) => assert_eq!(s, role),
                 _ => panic!("expected String"),
@@ -993,7 +997,7 @@ mod tests_v045_ai {
         let mut interp = Interpreter::new();
         let result = interp
             .call_ai_method("role", &[Value::String("explorer".to_string())])
-            .expect("role");
+            .expect("role 调用应成功");
         match result {
             Value::String(s) => assert_eq!(s, "explorer"),
             _ => panic!("expected String"),
@@ -1046,7 +1050,9 @@ mod tests_v046_skill {
     #[test]
     fn skill_list_empty_by_default() {
         let mut interp = Interpreter::new();
-        let list = interp.call_skill_method("list", &[]).expect("list");
+        let list = interp
+            .call_skill_method("list", &[])
+            .expect("list 调用应成功");
         match list {
             Value::List(items) => assert_eq!(items.len(), 0),
             other => panic!("expected List, got: {:?}", other),
@@ -1075,7 +1081,9 @@ This is the body of my-skill.
             .expect("install");
         assert_eq!(result, Value::Bool(true));
 
-        let list = interp.call_skill_method("list", &[]).expect("list");
+        let list = interp
+            .call_skill_method("list", &[])
+            .expect("list 调用应成功");
         match list {
             Value::List(items) => {
                 let names: Vec<String> = items
@@ -1114,10 +1122,10 @@ Find things here.
             .unwrap();
         let found = interp
             .call_skill_method("find", &[Value::String("finder-skill".to_string())])
-            .expect("find");
+            .expect("find 调用应成功");
         match found {
             Value::Dict(d) => {
-                let name = d.get("name").expect("name");
+                let name = d.get("name").expect("name 字段应存在");
                 match name {
                     Value::String(s) => assert_eq!(s, "finder-skill"),
                     _ => panic!("expected name String"),
@@ -1132,7 +1140,7 @@ Find things here.
                     Value::String(s) => assert_eq!(s, "find.*"),
                     _ => panic!("expected trigger String"),
                 }
-                let body = d.get("body").expect("body");
+                let body = d.get("body").expect("body 字段应存在");
                 match body {
                     Value::String(s) => assert!(s.contains("Find things here")),
                     _ => panic!("expected body String"),
@@ -1147,7 +1155,7 @@ Find things here.
         let mut interp = Interpreter::new();
         let found = interp
             .call_skill_method("find", &[Value::String("nope".to_string())])
-            .expect("find");
+            .expect("find 调用应成功");
         assert_eq!(found, Value::Nil);
     }
 
@@ -1165,10 +1173,12 @@ This skill was loaded from a real file on disk.
 
         let result = interp
             .call_skill_method("load", &[Value::String(path.to_string_lossy().to_string())])
-            .expect("load");
+            .expect("load 调用应成功");
         assert_eq!(result, Value::Bool(true));
 
-        let list = interp.call_skill_method("list", &[]).expect("list");
+        let list = interp
+            .call_skill_method("list", &[])
+            .expect("list 调用应成功");
         match list {
             Value::List(items) => {
                 let names: Vec<String> = items
@@ -1185,10 +1195,10 @@ This skill was loaded from a real file on disk.
 
         let found = interp
             .call_skill_method("find", &[Value::String("file-loaded".to_string())])
-            .expect("find");
+            .expect("find 调用应成功");
         match found {
             Value::Dict(d) => {
-                let src = d.get("source").expect("source");
+                let src = d.get("source").expect("source 字段应存在");
                 match src {
                     Value::String(s) => assert!(s.contains("file-loaded.md"), "got: {}", s),
                     _ => panic!("expected source path String"),
@@ -1234,7 +1244,7 @@ body
         assert_eq!(removed, Value::Bool(true));
         let found = interp
             .call_skill_method("find", &[Value::String("temp".to_string())])
-            .expect("find");
+            .expect("find 调用应成功");
         assert_eq!(found, Value::Nil);
     }
 
@@ -1319,10 +1329,12 @@ mod tests_v048_plan {
                 "create",
                 &[Value::String("myplan".to_string()), Value::List(steps)],
             )
-            .expect("create");
+            .expect("create 调用应成功");
         assert_eq!(name, Value::String("myplan".to_string()));
 
-        let list = interp.call_plan_method("list", &[]).expect("list");
+        let list = interp
+            .call_plan_method("list", &[])
+            .expect("list 调用应成功");
         match list {
             Value::List(items) => {
                 let names: Vec<String> = items
@@ -1363,15 +1375,15 @@ mod tests_v048_plan {
                 "update",
                 &[Value::String("p".to_string()), Value::List(updates)],
             )
-            .expect("update");
+            .expect("update 调用应成功");
         assert_eq!(result, Value::Bool(true));
 
         let info = interp
             .call_plan_method("info", &[Value::String("p".to_string())])
-            .expect("info");
+            .expect("info 调用应成功");
         match info {
             Value::Dict(d) => {
-                let done = d.get("done").expect("done");
+                let done = d.get("done").expect("done 字段应存在");
                 match done {
                     Value::Float(n) => assert_eq!(*n, 1.0),
                     _ => panic!("expected Number"),
@@ -1458,7 +1470,7 @@ mod tests_v048_plan {
                     Value::String("A".to_string()),
                 ],
             )
-            .expect("add");
+            .expect("add 调用应成功");
         assert_eq!(added, Value::Bool(true));
         let removed = interp
             .call_plan_method(
@@ -1468,7 +1480,7 @@ mod tests_v048_plan {
                     Value::String("a".to_string()),
                 ],
             )
-            .expect("remove");
+            .expect("remove 调用应成功");
         assert_eq!(removed, Value::Bool(true));
     }
 
@@ -1495,7 +1507,7 @@ mod tests_v048_plan {
                 assert_eq!(items.len(), 1);
                 match &items[0] {
                     Value::Dict(d) => {
-                        let emoji = d.get("emoji").expect("emoji");
+                        let emoji = d.get("emoji").expect("emoji 字段应存在");
                         match emoji {
                             Value::String(s) => assert_eq!(s, "⬜"), // pending default
                             _ => panic!("expected emoji String"),
@@ -1534,15 +1546,15 @@ mod tests_v048_plan {
             .unwrap();
         let info = interp
             .call_plan_method("info", &[Value::String("p".to_string())])
-            .expect("info");
+            .expect("info 调用应成功");
         match info {
             Value::Dict(d) => {
-                let total = d.get("total").expect("total");
+                let total = d.get("total").expect("total 字段应存在");
                 match total {
                     Value::Float(n) => assert_eq!(*n, 2.0),
                     _ => panic!("expected Number"),
                 }
-                let done = d.get("done").expect("done");
+                let done = d.get("done").expect("done 字段应存在");
                 match done {
                     Value::Float(n) => assert_eq!(*n, 1.0),
                     _ => panic!("expected Number"),
@@ -1552,7 +1564,7 @@ mod tests_v048_plan {
                     Value::Float(n) => assert_eq!(*n, 1.0),
                     _ => panic!("expected Number"),
                 }
-                let ratio = d.get("completion_ratio").expect("ratio");
+                let ratio = d.get("completion_ratio").expect("ratio 字段应存在");
                 match ratio {
                     Value::Float(n) => assert_eq!(*n, 0.5),
                     _ => panic!("expected Number"),
@@ -1609,7 +1621,7 @@ mod tests_v048_refine {
                     Value::String("add greeting".to_string()),
                 ],
             )
-            .expect("refine");
+            .expect("refine 调用应成功");
         match result {
             Value::Dict(d) => {
                 let iter = d.get("iteration").expect("iteration");
@@ -1651,7 +1663,7 @@ mod tests_v048_refine {
                         Value::String(format!("iter {}", i)),
                     ],
                 )
-                .expect("refine");
+                .expect("refine 调用应成功");
             match result {
                 Value::Dict(d) => {
                     let iter = d.get("iteration").expect("iteration");
@@ -1769,7 +1781,7 @@ mod tests_v048_refine {
                     Value::Float(1.0),
                 ],
             )
-            .expect("iter 1");
+            .expect("第 1 轮迭代应完成");
         match info {
             Value::Dict(d) => {
                 let inst = d.get("instruction").expect("instruction");
@@ -1881,7 +1893,7 @@ mod tests_v047_dag {
         ];
         let result = interp
             .call_ai_method("dag", &[Value::List(nodes), Value::List(edges)])
-            .expect("dag");
+            .expect("dag 调用应成功");
         match result {
             Value::List(items) => {
                 let names: Vec<String> = items
@@ -1950,7 +1962,7 @@ mod tests_v047_dag {
         ];
         let result = interp
             .call_ai_method("dag", &[Value::List(nodes), Value::List(edges)])
-            .expect("dag");
+            .expect("dag 调用应成功");
         match result {
             Value::List(items) => {
                 let names: Vec<String> = items
@@ -1976,7 +1988,7 @@ mod tests_v047_dag {
         ];
         let result = interp
             .call_ai_method("dag", &[Value::List(nodes), Value::List(vec![])])
-            .expect("dag");
+            .expect("dag 调用应成功");
         match result {
             Value::List(items) => assert_eq!(items.len(), 2),
             _ => panic!("expected List"),
@@ -2035,12 +2047,12 @@ mod tests_v047_heartbeat {
             .expect("heartbeat");
         match result {
             Value::Dict(d) => {
-                let total = d.get("total").expect("total");
+                let total = d.get("total").expect("total 字段应存在");
                 match total {
                     Value::Float(n) => assert_eq!(*n, 4.0),
                     _ => panic!("expected Number"),
                 }
-                let done = d.get("done").expect("done");
+                let done = d.get("done").expect("done 字段应存在");
                 match done {
                     Value::Float(n) => assert_eq!(*n, 2.0),
                     _ => panic!("expected Number"),
@@ -2050,7 +2062,7 @@ mod tests_v047_heartbeat {
                     Value::Float(n) => assert_eq!(*n, 2.0),
                     _ => panic!("expected Number"),
                 }
-                let ratio = d.get("completion_ratio").expect("ratio");
+                let ratio = d.get("completion_ratio").expect("ratio 字段应存在");
                 match ratio {
                     Value::Float(n) => assert_eq!(*n, 0.5),
                     _ => panic!("expected Number"),
@@ -2097,7 +2109,7 @@ mod tests_v047_heartbeat {
             .expect("heartbeat");
         match result {
             Value::Dict(d) => {
-                let total = d.get("total").expect("total");
+                let total = d.get("total").expect("total 字段应存在");
                 match total {
                     Value::Float(n) => assert_eq!(*n, 0.0),
                     _ => panic!("expected Number"),
@@ -2135,13 +2147,13 @@ mod tests_v047_heartbeat {
             .expect("heartbeat");
         match result {
             Value::Dict(d) => {
-                let items = d.get("items").expect("items");
+                let items = d.get("items").expect("items 字段应存在");
                 match items {
                     Value::List(items) => {
                         assert_eq!(items.len(), 2);
                         match &items[0] {
                             Value::Dict(item) => {
-                                let done = item.get("done").expect("done");
+                                let done = item.get("done").expect("done 字段应存在");
                                 assert_eq!(*done, Value::Bool(true));
                             }
                             _ => panic!("expected Dict"),

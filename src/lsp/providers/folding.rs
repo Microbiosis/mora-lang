@@ -1,3 +1,5 @@
+//! v0.25: LSP folding provider（折叠范围）。
+
 use std::collections::HashMap;
 
 use super::parsed_doc_v3;

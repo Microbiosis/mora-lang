@@ -1,3 +1,5 @@
+//! v0.25: record 快照/报告 — create_snapshot/diff_snapshot/generate_report。
+
 use super::serialization::{esc, event_to_jsonl};
 use super::*;
 

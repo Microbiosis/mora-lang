@@ -1,3 +1,5 @@
+//! v0.25: record 分析 — 录制列表/统计（list_recordings/compute_stats 等）。
+
 use super::serialization::{event_to_jsonl, load_jsonl};
 use super::*;
 use std::path::Path;

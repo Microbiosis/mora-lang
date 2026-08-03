@@ -247,7 +247,7 @@ mod tests {
     fn parses_real_docx() {
         let path = format!("{}/tests/fixtures/sample.docx", env!("CARGO_MANIFEST_DIR"));
         let bytes = std::fs::read(&path).expect("fixture file");
-        let backend = DocxBackend::from_bytes(bytes).expect("parse");
+        let backend = DocxBackend::from_bytes(bytes).expect("parse 调用应成功");
         assert_eq!(backend.origin(), "docx");
         assert!(
             backend.paragraph_count >= 2,

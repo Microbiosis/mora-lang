@@ -1,3 +1,5 @@
+//! v0.25: Interpreter 聚合模块 — ai_chat/builtins/dispatch/trait_dispatch 子模块 + Interpreter 主体（MirHost 实现）。
+
 mod ai_chat;
 mod ai_helpers;
 mod builtins;

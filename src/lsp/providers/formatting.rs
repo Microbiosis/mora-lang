@@ -1,3 +1,5 @@
+//! v0.25: LSP formatting provider（格式化）。
+
 use crate::lsp::json::Value;
 use crate::lsp::server::DocumentState;
 use std::collections::{BTreeMap, HashMap};

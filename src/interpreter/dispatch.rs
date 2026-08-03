@@ -88,432 +88,436 @@ impl Interpreter {
             format!("call_function: name 未登记 BuiltinKind::from_name: {name}")
         );
         match name {
-            // v0.75.23: M 原语 `merge_with(key, strategy)` — 为随后的 worker /
-            // transaction / observe 块声明该 key 的 per-key CRDT 合并策略
-            // （读侧 run_isolated 已接 current_merge_strategies；此前写侧无
-            // 生产者，恒为 LWW fallback）。strategy ∈ append/add/dict_union/
-            // grow_only_set/lww。
-            "merge_with" => {
-                let key = match args.first() {
-                    Some(Value::String(s)) => {
-                        testcase!(true, "merge_with: string key");
-                        s.clone()
-                    }
-                    _ => return Err("merge_with(key, strategy) expects string key".to_string()),
-                };
-                let strat = match args.get(1) {
-                    Some(Value::String(s)) => {
-                        testcase!(true, "merge_with: string strategy");
-                        s.as_str()
-                    }
-                    _ => {
-                        return Err("merge_with(key, strategy) expects string strategy".to_string());
-                    }
-                };
-                // v0.75.24: 策略名解析收敛到 MergeStrategy::from_name
-                // （单一事实来源；typeck 对字面量参数已做编译期校验，此处
-                // 运行时兜底动态用法）。
-                let ms = match crate::value::MergeStrategy::from_name(strat) {
-                    Some(s) => s,
-                    None => {
-                        return Err(format!(
-                            "merge_with: unknown strategy '{}' (append/add/dict_union/grow_only_set/lww)",
-                            strat
-                        ));
-                    }
-                };
-                let mut strategies = self.current_merge_strategies().unwrap_or_default();
-                strategies.insert(key, ms);
-                self.set_merge_strategies(Some(strategies));
-                Ok(Value::Nil)
+            "merge_with" => self.call_builtin_merge_with(args),
+            "print" => self.call_builtin_print(args),
+            "range" => self.call_builtin_range(args),
+            "len" => self.call_builtin_len(args),
+            "compose" => self.call_builtin_compose(args),
+            "partial" => self.call_builtin_partial(args),
+            "atom" => self.call_builtin_atom(args),
+            "swap" => self.call_builtin_swap(args),
+            "deref" => self.call_builtin_deref(args),
+            "type_of" => self.call_builtin_type_of(args),
+            "is_instance" => self.call_builtin_is_instance(args),
+            "methods_of" => self.call_builtin_methods_of(args),
+            "compress" => self.call_builtin_compress(args),
+            "crush_json" => self.call_builtin_crush_json(args),
+            "batch_chat" => self.call_builtin_batch_chat(args),
+            "into" => self.call_builtin_into(args),
+            "tail" => self.call_builtin_tail(args),
+            "compose_prompt" => self.call_builtin_compose_prompt(args),
+            _ => self.call_builtin_fallback(name, args),
+        }
+    }
+
+    fn call_builtin_merge_with(&mut self, args: Vec<Value>) -> Result<Value, String> {
+        let key = match args.first() {
+            Some(Value::String(s)) => {
+                testcase!(true, "merge_with: string key");
+                s.clone()
             }
-            "print" => {
-                let msg = args
-                    .into_iter()
-                    .map(|v| v.to_string())
-                    .collect::<Vec<_>>()
-                    .join("\t");
-                println!("{}", msg);
-                Ok(Value::Nil)
+            _ => return Err("merge_with(key, strategy) expects string key".to_string()),
+        };
+        let strat = match args.get(1) {
+            Some(Value::String(s)) => {
+                testcase!(true, "merge_with: string strategy");
+                s.as_str()
             }
-            "range" => {
-                let start = args
-                    .first()
-                    .and_then(|v| match v {
-                        Value::Float(n) => Some(*n as i64),
-                        _ => None,
-                    })
-                    .unwrap_or(0);
-                let end = args
-                    .get(1)
-                    .and_then(|v| match v {
-                        Value::Float(n) => Some(*n as i64),
-                        _ => None,
-                    })
-                    .unwrap_or(start);
-                let step = args
-                    .get(2)
-                    .and_then(|v| match v {
-                        Value::Float(n) => Some(*n as i64),
-                        _ => None,
-                    })
-                    .unwrap_or(1);
-                let mut items = Vec::new();
-                let mut i = start;
-                while i < end {
-                    items.push(Value::Float(i as f64));
-                    i += step;
+            _ => {
+                return Err("merge_with(key, strategy) expects string strategy".to_string());
+            }
+        };
+        // v0.75.24: 策略名解析收敛到 MergeStrategy::from_name
+        // （单一事实来源；typeck 对字面量参数已做编译期校验，此处
+        // 运行时兜底动态用法）。
+        let ms = match crate::value::MergeStrategy::from_name(strat) {
+            Some(s) => s,
+            None => {
+                return Err(format!(
+                    "merge_with: unknown strategy '{}' (append/add/dict_union/grow_only_set/lww)",
+                    strat
+                ));
+            }
+        };
+        let mut strategies = self.current_merge_strategies().unwrap_or_default();
+        strategies.insert(key, ms);
+        self.set_merge_strategies(Some(strategies));
+        Ok(Value::Nil)
+    }
+
+    fn call_builtin_print(&mut self, args: Vec<Value>) -> Result<Value, String> {
+        let msg = args
+            .into_iter()
+            .map(|v| v.to_string())
+            .collect::<Vec<_>>()
+            .join("\t");
+        println!("{}", msg);
+        Ok(Value::Nil)
+    }
+
+    fn call_builtin_range(&mut self, args: Vec<Value>) -> Result<Value, String> {
+        let start = args
+            .first()
+            .and_then(|v| match v {
+                Value::Float(n) => Some(*n as i64),
+                _ => None,
+            })
+            .unwrap_or(0);
+        let end = args
+            .get(1)
+            .and_then(|v| match v {
+                Value::Float(n) => Some(*n as i64),
+                _ => None,
+            })
+            .unwrap_or(start);
+        let step = args
+            .get(2)
+            .and_then(|v| match v {
+                Value::Float(n) => Some(*n as i64),
+                _ => None,
+            })
+            .unwrap_or(1);
+        let mut items = Vec::new();
+        let mut i = start;
+        while i < end {
+            items.push(Value::Float(i as f64));
+            i += step;
+        }
+        Ok(Value::List(items))
+    }
+
+    fn call_builtin_len(&mut self, args: Vec<Value>) -> Result<Value, String> {
+        let len = match args.first() {
+            Some(Value::List(list)) => {
+                testcase!(true, "len: list");
+                list.len()
+            }
+            Some(Value::String(s)) => {
+                testcase!(true, "len: string");
+                s.len()
+            }
+            Some(Value::Dict(map)) => {
+                testcase!(true, "len: dict");
+                map.len()
+            }
+            _ => return Err("len() expects a list, string, or dict".to_string()),
+        };
+        Ok(Value::Int(len as i64))
+    }
+
+    fn call_builtin_compose(&mut self, args: Vec<Value>) -> Result<Value, String> {
+        if args.is_empty() {
+            return Err("compose() requires at least 1 argument".to_string());
+        }
+        // 返回一个特殊的 Compose 值
+        Ok(Value::Compose(args))
+    }
+
+    fn call_builtin_partial(&mut self, args: Vec<Value>) -> Result<Value, String> {
+        if args.is_empty() {
+            return Err("partial() requires at least 1 argument (the function)".to_string());
+        }
+        let func = args[0].clone();
+        let partial_args: Vec<Value> = args[1..].to_vec();
+        Ok(Value::Partial(Box::new(func), partial_args))
+    }
+
+    fn call_builtin_atom(&mut self, args: Vec<Value>) -> Result<Value, String> {
+        let value = args.first().cloned().unwrap_or(Value::Nil);
+        Ok(Value::Atom(Arc::new(Mutex::new(value))))
+    }
+
+    fn call_builtin_swap(&mut self, args: Vec<Value>) -> Result<Value, String> {
+        if args.len() < 2 {
+            return Err("swap() requires 2 arguments: atom and function".to_string());
+        }
+        match &args[0] {
+            Value::Atom(arc) => {
+                let func = &args[1];
+                let old = arc.lock().clone();
+                let new_val = self.call_value(func, vec![old])?;
+                *arc.lock() = new_val.clone();
+                Ok(new_val)
+            }
+            _ => Err("swap() first argument must be an atom".to_string()),
+        }
+    }
+
+    fn call_builtin_deref(&mut self, args: Vec<Value>) -> Result<Value, String> {
+        let value = args.first().ok_or("deref() requires 1 argument")?;
+        match value {
+            Value::Atom(arc) => Ok(arc.lock().clone()),
+            _ => Err("deref() argument must be an atom".to_string()),
+        }
+    }
+
+    fn call_builtin_type_of(&mut self, args: Vec<Value>) -> Result<Value, String> {
+        let value = args.first().ok_or("type_of() requires 1 argument")?;
+        Ok(Value::String(value_type_name(value).to_string()))
+    }
+
+    fn call_builtin_is_instance(&mut self, args: Vec<Value>) -> Result<Value, String> {
+        if args.len() < 2 {
+            return Err("is_instance() requires 2 arguments".to_string());
+        }
+        let value = &args[0];
+        let type_name = match &args[1] {
+            Value::String(s) => s.as_str(),
+            _ => return Err("is_instance() second argument must be a string".to_string()),
+        };
+        Ok(Value::Bool(value_type_name(value) == type_name))
+    }
+
+    fn call_builtin_methods_of(&mut self, args: Vec<Value>) -> Result<Value, String> {
+        let value = args.first().ok_or("methods_of() requires 1 argument")?;
+        let methods = value.methods();
+        Ok(Value::List(
+            methods.into_iter().map(Value::String).collect(),
+        ))
+    }
+
+    fn call_builtin_compress(&mut self, args: Vec<Value>) -> Result<Value, String> {
+        if args.len() < 2 {
+            return Err("compress() requires 2 arguments: input and strategy".to_string());
+        }
+        let strategy = match &args[1] {
+            Value::String(s) => s.clone(),
+            other => {
+                return Err(format!(
+                    "compress: strategy must be a string, got {:?}",
+                    other
+                ));
+            }
+        };
+        let options_val = args
+            .get(2)
+            .cloned()
+            .unwrap_or(Value::Dict(Default::default()));
+        let opts_base = crate::compress::options_from_value(&options_val)?;
+        let opts = crate::compress::CompressOptions {
+            strategy: strategy.clone(),
+            ..opts_base
+        };
+        crate::compress::compress_top(&args[0], &strategy, &opts)
+    }
+
+    fn call_builtin_crush_json(&mut self, args: Vec<Value>) -> Result<Value, String> {
+        if args.len() < 2 {
+            return Err("crush_json() requires 2 arguments: input and max".to_string());
+        }
+        let max_items = match &args[1] {
+            Value::Float(n) => {
+                if *n < 0.0 {
+                    return Err("crush_json: max must be non-negative".to_string());
                 }
-                Ok(Value::List(items))
+                *n as usize
             }
-            "len" => {
-                let len = match args.first() {
-                    Some(Value::List(list)) => {
-                        testcase!(true, "len: list");
-                        list.len()
+            other => {
+                return Err(format!("crush_json: max must be a number, got {:?}", other));
+            }
+        };
+        let options_val = args
+            .get(2)
+            .cloned()
+            .unwrap_or(Value::Dict(Default::default()));
+        let opts = crate::compress::options_from_value(&options_val)?;
+        let items = match &args[0] {
+            Value::List(l) => l.clone(),
+            _ => {
+                return Err("crush_json: expected List as first argument".to_string());
+            }
+        };
+        let result = crate::compress::crush_json(&items, max_items, &opts);
+        let json = crate::compress::value_to_json_simple(&Value::List(result.items.clone()));
+        Ok(Value::String(format!(
+            "{}\n<compressed:method=smart_crusher strategy={} items={} total={} savings={:.2}>",
+            json, result.strategy_used, result.items_kept, result.items_total, result.savings_ratio
+        )))
+    }
+
+    fn call_builtin_batch_chat(&mut self, args: Vec<Value>) -> Result<Value, String> {
+        let prompts = args
+            .first()
+            .ok_or("batch_chat() requires 1 argument (list of prompts)")?;
+        match prompts {
+            Value::List(items) => {
+                let mut results = Vec::new();
+                for item in items {
+                    let prompt = match item {
+                        Value::String(s) => s.clone(),
+                        other => other.to_string(),
+                    };
+                    let model = std::env::var(AI_MODEL_ENV)
+                        .unwrap_or_else(|_| AI_MODEL_DEFAULT.to_string());
+                    let result = Self::do_ai_chat(self, &model, &prompt)?;
+                    results.push(result);
+                }
+                Ok(Value::List(results))
+            }
+            _ => Err("batch_chat() argument must be a list".to_string()),
+        }
+    }
+
+    fn call_builtin_into(&mut self, args: Vec<Value>) -> Result<Value, String> {
+        if args.len() < 2 {
+            return Err("into() requires 2 arguments: collection and function".to_string());
+        }
+        let collection = args[0].clone();
+        let transform = args[1].clone();
+        match collection {
+            Value::List(list) => {
+                let mut result = Vec::new();
+                for item in list {
+                    let mapped = self.call_value(&transform, vec![item])?;
+                    match mapped {
+                        Value::List(items) => result.extend(items),
+                        other => result.push(other),
                     }
-                    Some(Value::String(s)) => {
-                        testcase!(true, "len: string");
-                        s.len()
-                    }
-                    Some(Value::Dict(map)) => {
-                        testcase!(true, "len: dict");
-                        map.len()
-                    }
-                    _ => return Err("len() expects a list, string, or dict".to_string()),
-                };
-                Ok(Value::Int(len as i64))
-            }
-            // v0.17: compose(f1, f2, f3) → fn(x) = f3(f2(f1(x)))
-            "compose" => {
-                if args.is_empty() {
-                    return Err("compose() requires at least 1 argument".to_string());
                 }
-                // 返回一个特殊的 Compose 值
-                Ok(Value::Compose(args))
+                Ok(Value::List(result))
             }
-            // v0.18: partial(fn, args...) → 部分应用
-            "partial" => {
-                if args.is_empty() {
-                    return Err("partial() requires at least 1 argument (the function)".to_string());
+            _ => Err("into() first argument must be a list".to_string()),
+        }
+    }
+
+    fn call_builtin_tail(&mut self, args: Vec<Value>) -> Result<Value, String> {
+        if args.len() < 2 {
+            return Err("tail() requires 2 arguments: path and max".to_string());
+        }
+        let path = match &args[0] {
+            Value::String(s) => s.clone(),
+            other => {
+                return Err(format!(
+                    "tail() first argument must be a string path, got {:?}",
+                    other
+                ));
+            }
+        };
+        let max: usize = match &args[1] {
+            Value::Float(n) => {
+                if *n < 0.0 {
+                    return Err("tail() max must be non-negative".to_string());
                 }
-                let func = args[0].clone();
-                let partial_args: Vec<Value> = args[1..].to_vec();
-                Ok(Value::Partial(Box::new(func), partial_args))
+                *n as usize
             }
-            // v0.19: atom(value) → 创建可变引用
-            "atom" => {
-                let value = args.first().cloned().unwrap_or(Value::Nil);
-                Ok(Value::Atom(Arc::new(Mutex::new(value))))
-            }
-            // v0.19: swap(atom, fn) → 原子更新
-            "swap" => {
-                if args.len() < 2 {
-                    return Err("swap() requires 2 arguments: atom and function".to_string());
-                }
-                match &args[0] {
-                    Value::Atom(arc) => {
-                        let func = &args[1];
-                        let old = arc.lock().clone();
-                        let new_val = self.call_value(func, vec![old])?;
-                        *arc.lock() = new_val.clone();
-                        Ok(new_val)
-                    }
-                    _ => Err("swap() first argument must be an atom".to_string()),
-                }
-            }
-            // v0.19: deref(atom) → 读取引用值
-            "deref" => {
-                let value = args.first().ok_or("deref() requires 1 argument")?;
-                match value {
-                    Value::Atom(arc) => Ok(arc.lock().clone()),
-                    _ => Err("deref() argument must be an atom".to_string()),
-                }
-            }
-            // v0.20: type_of(value) → 返回类型名
-            "type_of" => {
-                let value = args.first().ok_or("type_of() requires 1 argument")?;
-                Ok(Value::String(value_type_name(value).to_string()))
-            }
-            // v0.20: is_instance(value, type_name) → 类型检查
-            "is_instance" => {
-                if args.len() < 2 {
-                    return Err("is_instance() requires 2 arguments".to_string());
-                }
-                let value = &args[0];
-                let type_name = match &args[1] {
-                    Value::String(s) => s.as_str(),
-                    _ => return Err("is_instance() second argument must be a string".to_string()),
-                };
-                Ok(Value::Bool(value_type_name(value) == type_name))
-            }
-            // v0.20: methods_of(value) → 返回方法名列表
-            "methods_of" => {
-                let value = args.first().ok_or("methods_of() requires 1 argument")?;
-                let methods = value.methods();
-                Ok(Value::List(
-                    methods.into_iter().map(Value::String).collect(),
-                ))
-            }
-            // v0.29: compress(input, strategy, options?) -> string 6 路策略压缩
-            "compress" => {
-                if args.len() < 2 {
-                    return Err("compress() requires 2 arguments: input and strategy".to_string());
-                }
-                let strategy = match &args[1] {
-                    Value::String(s) => s.clone(),
-                    other => {
-                        return Err(format!(
-                            "compress: strategy must be a string, got {:?}",
-                            other
-                        ));
-                    }
-                };
-                let options_val = args
-                    .get(2)
-                    .cloned()
-                    .unwrap_or(Value::Dict(Default::default()));
-                let opts_base = crate::compress::options_from_value(&options_val)?;
-                let opts = crate::compress::CompressOptions {
-                    strategy: strategy.clone(),
-                    ..opts_base
-                };
-                crate::compress::compress_top(&args[0], &strategy, &opts)
-            }
-            // v0.29: crush_json(input, max, options?) -> string Kneedle + 异常保留
-            "crush_json" => {
-                if args.len() < 2 {
-                    return Err("crush_json() requires 2 arguments: input and max".to_string());
-                }
-                let max_items = match &args[1] {
-                    Value::Float(n) => {
-                        if *n < 0.0 {
-                            return Err("crush_json: max must be non-negative".to_string());
-                        }
-                        *n as usize
-                    }
-                    other => {
-                        return Err(format!("crush_json: max must be a number, got {:?}", other));
-                    }
-                };
-                let options_val = args
-                    .get(2)
-                    .cloned()
-                    .unwrap_or(Value::Dict(Default::default()));
-                let opts = crate::compress::options_from_value(&options_val)?;
-                let items = match &args[0] {
-                    Value::List(l) => l.clone(),
-                    _ => {
-                        return Err("crush_json: expected List as first argument".to_string());
-                    }
-                };
-                let result = crate::compress::crush_json(&items, max_items, &opts);
-                let json =
-                    crate::compress::value_to_json_simple(&Value::List(result.items.clone()));
-                Ok(Value::String(format!(
-                    "{}\n<compressed:method=smart_crusher strategy={} items={} total={} savings={:.2}>",
-                    json,
-                    result.strategy_used,
-                    result.items_kept,
-                    result.items_total,
-                    result.savings_ratio
-                )))
-            }
-            // v0.24: batch_chat(prompts) -> list<string> 批量 AI 调用
-            "batch_chat" => {
-                let prompts = args
-                    .first()
-                    .ok_or("batch_chat() requires 1 argument (list of prompts)")?;
-                match prompts {
-                    Value::List(items) => {
-                        let mut results = Vec::new();
-                        for item in items {
-                            let prompt = match item {
-                                Value::String(s) => s.clone(),
-                                other => other.to_string(),
-                            };
-                            let model = std::env::var(AI_MODEL_ENV)
-                                .unwrap_or_else(|_| AI_MODEL_DEFAULT.to_string());
-                            let result = Self::do_ai_chat(self, &model, &prompt)?;
-                            results.push(result);
-                        }
-                        Ok(Value::List(results))
-                    }
-                    _ => Err("batch_chat() argument must be a list".to_string()),
-                }
-            }
-            // v0.17: into(collection, fn) → 应用 fn 到集合的每个元素
-            "into" => {
-                if args.len() < 2 {
-                    return Err("into() requires 2 arguments: collection and function".to_string());
-                }
-                let collection = args[0].clone();
-                let transform = args[1].clone();
-                match collection {
-                    Value::List(list) => {
-                        let mut result = Vec::new();
-                        for item in list {
-                            let mapped = self.call_value(&transform, vec![item])?;
-                            match mapped {
-                                Value::List(items) => result.extend(items),
-                                other => result.push(other),
-                            }
-                        }
-                        Ok(Value::List(result))
-                    }
-                    _ => Err("into() first argument must be a list".to_string()),
-                }
-            }
-            // v0.06.3: Router::new() builtin
-            "Router::new" => Ok(Value::Router {
-                routes: Arc::new(Mutex::new(Vec::new())),
-            }),
-            // v0.06.6: McpServer::new() builtin
-            "McpServer::new" => Ok(Value::McpServer { tools: Vec::new() }),
-            // v0.26: tail(path, max: N) builtin — 读文件末 N 行(JSONL/纯文本皆可)
-            "tail" => {
-                if args.len() < 2 {
-                    return Err("tail() requires 2 arguments: path and max".to_string());
-                }
-                let path = match &args[0] {
-                    Value::String(s) => s.clone(),
-                    other => {
-                        return Err(format!(
-                            "tail() first argument must be a string path, got {:?}",
-                            other
-                        ));
-                    }
-                };
-                let max: usize = match &args[1] {
-                    Value::Float(n) => {
-                        if *n < 0.0 {
-                            return Err("tail() max must be non-negative".to_string());
-                        }
-                        *n as usize
-                    }
-                    _ => return Err("tail() second argument 'max' must be a number".to_string()),
-                };
-                let content = std::fs::read_to_string(&path)
-                    .map_err(|e| format!("tail() cannot read '{}': {}", path, e))?;
-                let lines: Vec<&str> = content.lines().collect();
-                let start = if lines.len() > max {
-                    lines.len() - max
-                } else {
-                    0
-                };
-                let tail_str = lines[start..].join("\n");
-                Ok(Value::String(tail_str))
-            }
-            // v0.26: compose_prompt(...) builtin — 把多个 section 拼成 system prompt
-            // 入参形态: (a) 已声明的 section name(String)
-            //          (b) 字典 {role, text, budget}
-            //          (c) 直接的 Value::PromptSection
-            "compose_prompt" => {
-                if args.is_empty() {
-                    return Err("compose_prompt() requires at least 1 section".to_string());
-                }
-                let mut buf = String::new();
-                for arg in args {
-                    let (name, role, text, budget_bytes) = match arg {
-                        Value::String(section_name) => {
-                            // 从环境查 section
-                            let looked_up = self.core.environment.lock().get(&section_name);
-                            match looked_up {
-                                Some(Value::PromptSection {
-                                    name,
-                                    role,
-                                    text,
-                                    budget_bytes,
-                                }) => (name, role, text, budget_bytes),
-                                Some(other) => {
-                                    return Err(format!(
-                                        "compose_prompt: '{}' is not a prompt section (got {:?})",
-                                        section_name, other
-                                    ));
-                                }
-                                None => {
-                                    return Err(format!(
-                                        "compose_prompt: section '{}' not defined (use 'prompt \"{}\" do ... end' first)",
-                                        section_name, section_name
-                                    ));
-                                }
-                            }
-                        }
-                        Value::Dict(map) => {
-                            let role = map.get("role").and_then(|v| match v {
-                                Value::String(s) => Some(s.clone()),
-                                _ => None,
-                            });
-                            let text_val = map
-                                .get("text")
-                                .cloned()
-                                .unwrap_or(Value::String(String::new()));
-                            let budget = if let Some(b) = map.get("budget") {
-                                Some(parse_budget_dispatch(b.clone(), "budget")?)
-                            } else {
-                                None
-                            };
-                            ("<inline>".to_string(), role, Box::new(text_val), budget)
-                        }
-                        Value::PromptSection {
+            _ => return Err("tail() second argument 'max' must be a number".to_string()),
+        };
+        let content = std::fs::read_to_string(&path)
+            .map_err(|e| format!("tail() cannot read '{}': {}", path, e))?;
+        let lines: Vec<&str> = content.lines().collect();
+        let start = if lines.len() > max {
+            lines.len() - max
+        } else {
+            0
+        };
+        let tail_str = lines[start..].join("\n");
+        Ok(Value::String(tail_str))
+    }
+
+    fn call_builtin_compose_prompt(&mut self, args: Vec<Value>) -> Result<Value, String> {
+        if args.is_empty() {
+            return Err("compose_prompt() requires at least 1 section".to_string());
+        }
+        let mut buf = String::new();
+        for arg in args {
+            let (name, role, text, budget_bytes) = match arg {
+                Value::String(section_name) => {
+                    // 从环境查 section
+                    let looked_up = self.core.environment.lock().get(&section_name);
+                    match looked_up {
+                        Some(Value::PromptSection {
                             name,
                             role,
                             text,
                             budget_bytes,
-                        } => (name, role, text, budget_bytes),
-                        other => {
+                        }) => (name, role, text, budget_bytes),
+                        Some(other) => {
                             return Err(format!(
-                                "compose_prompt: section must be name, dict, or PromptSection (got {:?})",
-                                other
+                                "compose_prompt: '{}' is not a prompt section (got {:?})",
+                                section_name, other
                             ));
                         }
-                    };
-                    // 应用 budget 截断
-                    let resolved_text = text_to_string(&text);
-                    let truncated = match budget_bytes {
-                        Some(b) if resolved_text.len() > b => {
-                            let mut t = resolved_text.into_bytes();
-                            t.truncate(b);
-                            String::from_utf8_lossy(&t).into_owned()
+                        None => {
+                            return Err(format!(
+                                "compose_prompt: section '{}' not defined (use 'prompt \"{}\" do ... end' first)",
+                                section_name, section_name
+                            ));
                         }
-                        _ => resolved_text,
-                    };
-                    // 拼接
-                    if let Some(r) = &role {
-                        buf.push_str(&format!("\n## {} ({})\n\n", name, r));
+                    }
+                }
+                Value::Dict(map) => {
+                    let role = map.get("role").and_then(|v| match v {
+                        Value::String(s) => Some(s.clone()),
+                        _ => None,
+                    });
+                    let text_val = map
+                        .get("text")
+                        .cloned()
+                        .unwrap_or(Value::String(String::new()));
+                    let budget = if let Some(b) = map.get("budget") {
+                        Some(parse_budget_dispatch(b.clone(), "budget")?)
                     } else {
-                        buf.push_str(&format!("\n## {}\n\n", name));
-                    }
-                    buf.push_str(&truncated);
+                        None
+                    };
+                    ("<inline>".to_string(), role, Box::new(text_val), budget)
                 }
-                Ok(Value::String(buf))
-            }
-            _ => {
-                // 先 clone 出值，释放 borrow，避免借用冲突
-                let looked_up = self.core.environment.lock().get(name).clone();
-                if let Some(value) = looked_up {
-                    match value {
-                        Value::Task { .. }
-                        | Value::Closure { .. }
-                        | Value::Compose(_)
-                        | Value::Partial(_, _) => self.call_value(&value, args),
-                        Value::Macro { params, .. } => {
-                            let env = Arc::new(Mutex::new(Environment::with_parent_of(
-                                self.core.environment.clone(),
-                            )));
-                            for (i, param) in params.iter().enumerate() {
-                                let value = args.get(i).cloned().unwrap_or(Value::Nil);
-                                env.lock().define(param.clone(), value, false);
-                            }
-                            // Macro body 在 v2 模式下通过 arena 执行，此处简化返回 Nil
-                            Ok(Value::Nil)
-                        }
-                        _ => Err(format!("'{}' is not callable", name)),
-                    }
-                } else {
-                    Err(format!("Undefined function or task: {}", name))
+                Value::PromptSection {
+                    name,
+                    role,
+                    text,
+                    budget_bytes,
+                } => (name, role, text, budget_bytes),
+                other => {
+                    return Err(format!(
+                        "compose_prompt: section must be name, dict, or PromptSection (got {:?})",
+                        other
+                    ));
                 }
+            };
+            // 应用 budget 截断
+            let resolved_text = text_to_string(&text);
+            let truncated = match budget_bytes {
+                Some(b) if resolved_text.len() > b => {
+                    let mut t = resolved_text.into_bytes();
+                    t.truncate(b);
+                    String::from_utf8_lossy(&t).into_owned()
+                }
+                _ => resolved_text,
+            };
+            // 拼接
+            if let Some(r) = &role {
+                buf.push_str(&format!("\n## {} ({})\n\n", name, r));
+            } else {
+                buf.push_str(&format!("\n## {}\n\n", name));
             }
+            buf.push_str(&truncated);
+        }
+        Ok(Value::String(buf))
+    }
+    fn call_builtin_fallback(&mut self, name: &str, args: Vec<Value>) -> Result<Value, String> {
+        // 先 clone 出值，释放 borrow，避免借用冲突
+        let looked_up = self.core.environment.lock().get(name).clone();
+        if let Some(value) = looked_up {
+            match value {
+                Value::Task { .. }
+                | Value::Closure { .. }
+                | Value::Compose(_)
+                | Value::Partial(_, _) => self.call_value(&value, args),
+                Value::Macro { params, .. } => {
+                    let env = Arc::new(Mutex::new(Environment::with_parent_of(
+                        self.core.environment.clone(),
+                    )));
+                    for (i, param) in params.iter().enumerate() {
+                        let value = args.get(i).cloned().unwrap_or(Value::Nil);
+                        env.lock().define(param.clone(), value, false);
+                    }
+                    // Macro body 在 v2 模式下通过 arena 执行，此处简化返回 Nil
+                    Ok(Value::Nil)
+                }
+                _ => Err(format!("'{}' is not callable", name)),
+            }
+        } else {
+            Err(format!("Undefined function or task: {}", name))
         }
     }
 

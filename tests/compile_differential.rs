@@ -85,6 +85,49 @@ fn compile_equivalent_prompt() {
     assert_compile_equivalent("let msg = p\"score: {n} points\"\nprint(msg)");
 }
 
+/// v0.75.78: 差分等价 — 嵌套构造（end 终止闭包体内 if、for/while 体内 if、
+/// 多行 brace 块、顶层 match）。
+/// 修复前 compile 主路径缺嵌套上下文构造分发 + emit_block_w `{` 后不跳
+/// 换行 → 这些源码 parse→lower 可解析、compile 解析失败（差分不等价）。
+/// 注：只断言「两边交集」形态——旧 parse 路径对 brace 闭包体、闭包体内
+/// match 亦不可解析（pre-existing 不对称，见 compile_run_nested_constructs
+/// 的单侧运行回归）；顶层 task n_regs 差 1 亦 pre-existing（lower 为无 dst
+/// 的 TaskDef 分配死寄存器）。
+#[test]
+fn compile_equivalent_nested_constructs() {
+    assert_compile_equivalent(
+        "let pick = fn(n)\n  if n > 0 {\n    1\n  } else {\n    0\n  }\nend\nprint(pick(3))",
+    );
+    assert_compile_equivalent(
+        "let n = 1\nfor i in [1, 2, 3] {\n  if i > n {\n    print(i)\n  }\n}",
+    );
+    assert_compile_equivalent(
+        "let n = 0\nwhile n < 2 {\n  if n == 0 {\n    n = n + 1\n  }\n}\nprint(n)",
+    );
+    assert_compile_equivalent("match 0 {\n  0 => print(\"zero\"),\n  _ => print(\"other\"),\n}");
+}
+
+/// v0.75.78: 回归测试 — compile 主路径解析并执行嵌套构造（run_mir 运行）。
+/// 修复前：task 体内 if/let、闭包体 if、for 体内 if 均编译失败。
+#[test]
+fn compile_run_nested_constructs() {
+    let src = "task main()\n  let x = 5\n  if x > 3 {\n    print(\"big\")\n  }\nend";
+    let (func, witnesses) = ParserV3::compile(src).expect("compile should succeed");
+    let type_errors = mora::typeck::check_mir::check_program_witnesses(&witnesses);
+    assert!(
+        type_errors.is_empty(),
+        "typeck should pass: {:?}",
+        type_errors
+    );
+    let mut interp = mora::interpreter::Interpreter::new();
+    let mut env = interp.take_env();
+    let func_arc = std::sync::Arc::new(func);
+    mora::mir::vm::run_mir(&func_arc, &mut interp, &mut env)
+        .expect("run_mir should not fail (nested if in task body)");
+    mora::mir::vm::run_main_task(&func_arc, &mut interp, &mut env)
+        .expect("run_main_task should succeed");
+}
+
 /// v0.75.76: 回归测试 — 顶层 `let f` 绑定 + 裸函数调用（compile 主路径）。
 /// 修复前：take_env 移出 core.environment 后 h_define 写 run_mir 的 env 参数，
 /// 而 call_function 兜底查 core（空壳）→ `f(5)` 报 "Undefined function or task"。

@@ -532,7 +532,6 @@ impl Interpreter {
     }
 
     /// v0.17: 直接调用 Value 形式的函数（用于管道闭包）
-    #[allow(dead_code)]
     pub(super) fn call_method(
         &mut self,
         object: Value,

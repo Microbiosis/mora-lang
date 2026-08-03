@@ -2,6 +2,21 @@
 
 All notable changes to Mora will be documented in this file.
 
+## [v0.75.74] — 2026-08-03 — import 顺序全仓统一 super-first
+
+用户明确「风格一定要统一」——撤销 v0.75.73「同簇同序」决策，全仓
+统一为 super-first（std → super → crate，与 rustfmt 强制 glob 方向
+一致、31 文件既有惯例）：
+
+- 10 个 crate-first 文件重排：mir/handlers,inst,ssa,ssa/deconstruct,
+  vm,vm/dag,opt/{copy,simple,tailcall} + typeck/check_mir
+- 语句级重排（跨行 use 语句整体移动，不拆行），纯 use 移动零行为变化
+- 事故与修复：首版脚本误删 vm/dag.rs 顶部 20 行解释器语义注释（执行
+  边界文档）——git checkout HEAD 恢复 + 手动重排 use 保留注释；其余
+  9 文件核查 0 注释删除
+- 验证：40 个含 super+crate 文件 0 违规同向 + 全量 790 绿 + clippy
+  `-D warnings` 0 + fmt 0
+
 ## [v0.75.73] — 2026-08-03 — 风格审计 D4/D5/D6 落地
 
 - **D6 模块头补全（18 文件）**：lexer/main（v0.01）+ interpreter/mod +

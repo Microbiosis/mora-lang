@@ -2,6 +2,22 @@
 
 All notable changes to Mora will be documented in this file.
 
+## [v0.75.75] — 2026-08-03 — 分隔符横幅全仓统一
+
+D7 分隔符统一——4 种字符（`=` `─` `-` `═`）收敛为 2 种语义：
+
+- 纯分隔线（`-`/`═`，无文字）→ `=`（24 处：checkpoint/lsp/server/
+  handlers×6）
+- 带文字标题横幅（`=text=`、`-text-`）→ `─text─`（10 处：pregel 的
+  PLAN/EXEC/UPDATE/ADVANCE 段标 + flow/reading_order/event/cost/rule
+  测试标题）
+- 全仓残留分布：纯 `=` 102 处 + 带文字 `─` 128 处，零 `-`/`═` 纯分隔、
+  零混用
+- 排除：lexer.rs 中文破折号正文、main.rs `--version` 参数注释（非横幅）
+
+验证：34 删 = 34 增全横幅字符（白名单脚本，零代码改动）+ 全量 790 绿
++ clippy `-D warnings` 0 + fmt 0。
+
 ## [v0.75.74] — 2026-08-03 — import 顺序全仓统一 super-first
 
 用户明确「风格一定要统一」——撤销 v0.75.73「同簇同序」决策，全仓

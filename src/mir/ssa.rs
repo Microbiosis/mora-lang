@@ -474,6 +474,9 @@ fn split_into_ssa(
             MirInst::Var(dst, name) => {
                 ssa_insts.push(SsaInst::Var(*dst as SsaReg, name.clone()));
             }
+            MirInst::Copy(dst, src) => {
+                ssa_insts.push(SsaInst::Copy(*dst as SsaReg, *src as SsaReg));
+            }
             MirInst::BinaryOp(dst, l, op, r) => {
                 ssa_insts.push(SsaInst::BinaryOp(
                     *dst as SsaReg,

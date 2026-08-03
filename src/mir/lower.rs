@@ -288,14 +288,16 @@ impl MirExprLowerer {
             // ── If/Else ──
             MirExprKind::If { cond, then, r#else } => {
                 let c = self.lower_expr(cond)?;
-                // JumpIfNot to else branch
+                // v0.75.79: 与 compile 主路径对称 — if 结果经寄存器传递
+                // （Copy dst=src），不再经 env 临时名 `__if_result`（Assign
+                // 写未定义变量静默失败，分支值丢失）。
                 self.emit(MirInst::JumpIfNot(c, 0)); // placeholder
                 let jumpifnot_idx = self.emit.insts.len() - 1;
 
                 // Then branch
                 let then_dst = self.lower_expr(then)?;
                 let dst = self.alloc_reg();
-                self.emit(MirInst::Assign("__if_result".to_string(), then_dst));
+                self.emit(MirInst::Copy(dst, then_dst));
                 // Jump to end
                 self.emit(MirInst::Jump(0)); // placeholder
                 let jump_end_idx = self.emit.insts.len() - 1;
@@ -305,14 +307,15 @@ impl MirExprLowerer {
                 self.patch_label_at(jumpifnot_idx, else_start);
                 if let Some(else_expr) = r#else {
                     let else_dst = self.lower_expr(else_expr)?;
-                    self.emit(MirInst::Assign("__if_result".to_string(), else_dst));
+                    self.emit(MirInst::Copy(dst, else_dst));
                 } else {
-                    self.emit(MirInst::Assign("__if_result".to_string(), 0));
+                    let nil_reg = self.alloc_reg();
+                    self.emit(MirInst::Const(nil_reg, crate::value::Value::Nil));
+                    self.emit(MirInst::Copy(dst, nil_reg));
                 }
                 // End
                 let end = self.emit.insts.len();
                 self.patch_label_at(jump_end_idx, end);
-                self.emit(MirInst::Var(dst, "__if_result".to_string()));
                 Ok(dst)
             }
 
@@ -460,13 +463,15 @@ impl MirExprLowerer {
                 let body_dst = body_lowerer.lower_expr(body)?;
                 body_lowerer.emit(MirInst::Return(Some(body_dst)));
                 let body_mir = body_lowerer.finish();
-                let dst = self.alloc_reg();
+                // v0.75.79: TaskDef 无 dst 字段 — 不分配死寄存器（顶层结果被
+                // lower_mir_exprs_with_opt 的 `_dst` 丢弃）。修复前 alloc_reg
+                // 使 n_regs 比 compile 主路径多 1（差分等价断言暴露）。
                 self.emit(MirInst::TaskDef {
                     name: name.clone(),
                     params: param_names,
                     body: Box::new(body_mir),
                 });
-                Ok(dst)
+                Ok(0)
             }
 
             // ── DynTrait ──

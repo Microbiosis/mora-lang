@@ -91,8 +91,7 @@ fn compile_equivalent_prompt() {
 /// 换行 → 这些源码 parse→lower 可解析、compile 解析失败（差分不等价）。
 /// 注：只断言「两边交集」形态——旧 parse 路径对 brace 闭包体、闭包体内
 /// match 亦不可解析（pre-existing 不对称，见 compile_run_nested_constructs
-/// 的单侧运行回归）；顶层 task n_regs 差 1 亦 pre-existing（lower 为无 dst
-/// 的 TaskDef 分配死寄存器）。
+/// 的单侧运行回归）。
 #[test]
 fn compile_equivalent_nested_constructs() {
     assert_compile_equivalent(
@@ -105,6 +104,19 @@ fn compile_equivalent_nested_constructs() {
         "let n = 0\nwhile n < 2 {\n  if n == 0 {\n    n = n + 1\n  }\n}\nprint(n)",
     );
     assert_compile_equivalent("match 0 {\n  0 => print(\"zero\"),\n  _ => print(\"other\"),\n}");
+}
+
+/// v0.75.79: 差分等价 — 顶层 task 定义 + if-else 结果（Copy 指令）。
+/// 修复 A 前：lower 为无 dst 的 TaskDef 分配死寄存器（n_regs 差 1）；
+/// 修复 B 前：if 结果经 env 临时名 `__if_result` 传递（Assign 写未定义
+/// 变量静默失败）→ 值语义与指令序列均不等价。
+#[test]
+fn compile_equivalent_top_level_task_and_if_value() {
+    assert_compile_equivalent("task main()\n  print(1)\nend");
+    assert_compile_equivalent(
+        "task main()\n  let x = 5\n  if x > 3 {\n    print(\"big\")\n  }\nend",
+    );
+    assert_compile_equivalent("let pick = fn(n) if n > 0 { 1 } else { 0 } end\nprint(pick(3))");
 }
 
 /// v0.75.78: 回归测试 — compile 主路径解析并执行嵌套构造（run_mir 运行）。
@@ -126,6 +138,28 @@ fn compile_run_nested_constructs() {
         .expect("run_mir should not fail (nested if in task body)");
     mora::mir::vm::run_main_task(&func_arc, &mut interp, &mut env)
         .expect("run_main_task should succeed");
+}
+
+/// v0.75.79: 回归测试 — if-else 表达式值经寄存器传递（Copy 指令，运行验证）。
+/// 修复前：if 结果经 env 临时名 `__if_result` 传递（Assign 写未定义变量
+/// 静默失败）→ `fn(n) if c {1} else {0} end` 的 else 值丢失（pick(0) 返回
+/// Nil 而非 0）。修复后：分支值经 Copy 直写公共 dst，无 env 依赖。
+#[test]
+fn compile_run_if_value_passed_by_register() {
+    let src = "let pick = fn(n) if n > 0 { 1 } else { 0 } end\nprint(pick(3))\nprint(pick(0))";
+    let (func, witnesses) = ParserV3::compile(src).expect("compile should succeed");
+    let type_errors = mora::typeck::check_mir::check_program_witnesses(&witnesses);
+    assert!(
+        type_errors.is_empty(),
+        "typeck should pass: {:?}",
+        type_errors
+    );
+    let mut interp = mora::interpreter::Interpreter::new();
+    let mut env = interp.take_env();
+    let func_arc = std::sync::Arc::new(func);
+    mora::mir::vm::run_mir(&func_arc, &mut interp, &mut env).expect("run_mir should not fail");
+    mora::mir::vm::run_main_task(&func_arc, &mut interp, &mut env)
+        .expect("run_main_task should succeed (if-else value must not be lost)");
 }
 
 /// v0.75.76: 回归测试 — 顶层 `let f` 绑定 + 裸函数调用（compile 主路径）。

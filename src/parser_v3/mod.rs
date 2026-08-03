@@ -1039,13 +1039,14 @@ impl ParserV3 {
         let span = self.span_of_current();
         self.advance(); // 'if'
         let (cond, cond_w) = self.emit_expr_w()?;
-        // 镜像 lower If 分支（__if_result + JumpIfNot + Jump + patch）
+        // v0.75.79: if 结果经寄存器传递（Copy dst=src）——不再经 env 临时名
+        // `__if_result`（Assign 写未定义变量静默失败，分支值丢失）。
+        // 分支值写各自 reg，尾端 Copy 到公共 dst，跳转使仅选中分支可达。
         self.emit.emit(MirInst::JumpIfNot(cond, 0));
         let jumpifnot_idx = self.emit.insts.len() - 1;
         let (then_reg, then_w) = self.emit_block_w()?;
         let dst = self.emit.alloc_reg();
-        self.emit
-            .emit(MirInst::Assign("__if_result".to_string(), then_reg));
+        self.emit.emit(MirInst::Copy(dst, then_reg));
         self.emit.emit(MirInst::Jump(0));
         let jump_end_idx = self.emit.insts.len() - 1;
         let else_start = self.emit.insts.len();
@@ -1057,17 +1058,17 @@ impl ParserV3 {
         {
             self.advance();
             let (else_reg, w) = self.emit_block_w()?;
-            self.emit
-                .emit(MirInst::Assign("__if_result".to_string(), else_reg));
+            self.emit.emit(MirInst::Copy(dst, else_reg));
             Some(Box::new(w))
         } else {
+            let nil_reg = self.emit.alloc_reg();
             self.emit
-                .emit(MirInst::Assign("__if_result".to_string(), 0));
+                .emit(MirInst::Const(nil_reg, crate::value::Value::Nil));
+            self.emit.emit(MirInst::Copy(dst, nil_reg));
             None
         };
         let end = self.emit.insts.len();
         self.emit.patch_label_at(jump_end_idx, end);
-        self.emit.emit(MirInst::Var(dst, "__if_result".to_string()));
         let w = MirWitness {
             kind: WitnessKind::If {
                 cond: Box::new(cond_w),

@@ -419,7 +419,7 @@ mod tests {
         assert_eq!(counter.load(Ordering::SeqCst), 1); // unchanged
     }
 
-    // ===== v0.41.0 P0: O(segments) indexed matching tests =====
+    // ─ v0.41.0 P0: O(segments) indexed matching tests ────
 
     #[test]
     fn classify_pattern_routes_correctly() {

@@ -234,7 +234,7 @@ mod tests {
         assert!(call_cost > const_cost);
     }
 
-    // ========== Phase H.4 测试：值内容 token 估算 ==========
+    // ─ Phase H.4 测试：值内容 token 估算 ────
 
     #[test]
     fn test_value_cost_string_length() {
@@ -313,7 +313,7 @@ mod tests {
         assert!(cost.inst_cost(&large) > cost.inst_cost(&small));
     }
 
-    // ========== Phase H.7 测试：新指令 token 估算 ==========
+    // ─ Phase H.7 测试：新指令 token 估算 ────
 
     #[test]
     fn test_eval_cost_scales_with_expects() {

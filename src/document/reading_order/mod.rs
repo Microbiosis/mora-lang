@@ -568,7 +568,7 @@ mod tests {
         }
     }
 
-    // ===== v0.41.1: XyCutPlusPlus (MinerU XY-Cut++) 测试 =====
+    // ─ v0.41.1: XyCutPlusPlus (MinerU XY-Cut++) 测试 ────
 
     fn extract_texts(out: &[Value]) -> Vec<String> {
         out.iter()

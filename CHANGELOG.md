@@ -2,6 +2,21 @@
 
 All notable changes to Mora will be documented in this file.
 
+## [v0.75.70] — 2026-08-03 — typeck/hm 拆 infer.rs + builtin.rs
+
+hm/mod.rs（922 → 502 行）`impl HMInference` 按方法组拆分子模块（D6
+多 impl 块惯例，与 builtins 同款）：
+
+- `infer.rs`（373）— infer_* 方法族（let/assign/var/binop/call/method_call/
+  closure/fn_def/match/if/list/dict）
+- `builtin.rs`（66）— builtin_callee_ty + builtin_type（op 类型推断）
+- mod.rs 保留基础设施（fresh_type_var/instantiate/solve_constraints/
+  infer_program/infer_expr 入口）
+- 跨文件方法可见性经 `pub(super)` 统一（24 处批量，仅 4 空格缩进顶层
+  方法，本地 fn 不受影响）
+
+纯搬移零行为变更。验证：全量 790 绿 + clippy `-D warnings` 0 + fmt 0。
+
 ## [v0.75.69] — 2026-08-03 — lexer.rs simple_token 收敛
 
 next_token 的 33 处 `Some(Token { token_type, line, column })` 构造

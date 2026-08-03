@@ -2,6 +2,20 @@
 
 All notable changes to Mora will be documented in this file.
 
+## [v0.75.57] — 2026-08-03 — pregel run() 提取 execute_step（模块化）
+
+`run()`（522 → 214 行）BSP 超步循环瘦身 — 最大块 EXEC（314 行，含
+fault tolerance 重试 + 顺序/并行双路径）提取为独立方法：
+
+- `execute_step(&mut self, interpreter, to_execute, &mut next_active)`
+  → `Result<Vec<writes>>`：BEGIN → 重试循环 → flush sends；UPDATE 段消费
+- run() 保留超步骨架：PLAN → execute_step → UPDATE → master_compute →
+  ADVANCE → checkpoint
+- 纯提取零行为变更（逐行一致）；仅 borrow 适配（`&to_execute` 借用、
+  next_active 闭包 reborrow）
+
+验证：全量 790 绿（skip 3 个 Windows 挂起基线）+ clippy 0 + fmt 0。
+
 ## [v0.75.56] — 2026-08-03 — mir/handlers.rs 拆 inst.rs（模块化）
 
 handlers.rs（1451 → 895 行）按两部分拆分子模块，纯搬移零行为变更：

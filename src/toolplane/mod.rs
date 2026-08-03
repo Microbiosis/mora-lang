@@ -151,9 +151,10 @@ impl ToolPlaneRegistry {
 /// v0.45.0: 全局默认 planes — 注册两个 core planes (ai, sandbox)
 pub fn default_registry() -> ToolPlaneRegistry {
     let mut reg = ToolPlaneRegistry::new();
-    reg.create_plane("ai".to_string(), PlaneKind::Core).unwrap();
+    reg.create_plane("ai".to_string(), PlaneKind::Core)
+        .expect("toolplane: register core plane 'ai' failed");
     reg.create_plane("sandbox".to_string(), PlaneKind::Core)
-        .unwrap();
+        .expect("toolplane: register core plane 'sandbox' failed");
     reg
 }
 

@@ -17,22 +17,22 @@ impl Interpreter {
             "create" => {
                 let name = args
                     .first()
-                    .ok_or("tool.plane.create: requires name")?
+                    .ok_or("toolplane.create: requires name")?
                     .to_string();
                 let kind_str = args
                     .get(1)
                     .map(|v| v.to_string())
                     .unwrap_or_else(|| "extension".to_string());
                 let kind = crate::toolplane::PlaneKind::parse(&kind_str)
-                    .ok_or_else(|| format!("tool.plane.create: unknown kind '{}'", kind_str))?;
+                    .ok_or_else(|| format!("toolplane.create: unknown kind '{}'", kind_str))?;
                 reg.create_plane(name, kind)
-                    .map_err(|e| format!("tool.plane.create: {}", e))?;
+                    .map_err(|e| format!("toolplane.create: {}", e))?;
                 Ok(Value::Bool(true))
             }
             "register" => {
                 if args.len() < 4 {
                     return Err(
-                        "tool.plane.register: requires 4 args (plane, tool, desc, params)"
+                        "toolplane.register: requires 4 args (plane, tool, desc, params)"
                             .to_string(),
                     );
                 }
@@ -41,7 +41,7 @@ impl Interpreter {
                 let description = args[2].to_string();
                 let parameters = args[3].to_string();
                 let plane = reg.get_plane_mut(&plane_name).ok_or_else(|| {
-                    format!("tool.plane.register: plane '{}' not found", plane_name)
+                    format!("toolplane.register: plane '{}' not found", plane_name)
                 })?;
                 plane
                     .register(crate::toolplane::ToolSpec {
@@ -49,17 +49,17 @@ impl Interpreter {
                         description,
                         parameters,
                     })
-                    .map_err(|e| format!("tool.plane.register: {}", e))?;
+                    .map_err(|e| format!("toolplane.register: {}", e))?;
                 Ok(Value::Bool(true))
             }
             "unregister" => {
                 if args.len() < 2 {
-                    return Err("tool.plane.unregister: requires 2 args (plane, tool)".to_string());
+                    return Err("toolplane.unregister: requires 2 args (plane, tool)".to_string());
                 }
                 let plane_name = args[0].to_string();
                 let tool_name = args[1].to_string();
                 let plane = reg.get_plane_mut(&plane_name).ok_or_else(|| {
-                    format!("tool.plane.unregister: plane '{}' not found", plane_name)
+                    format!("toolplane.unregister: plane '{}' not found", plane_name)
                 })?;
                 let removed = plane.unregister(&tool_name);
                 Ok(Value::Bool(removed.is_some()))
@@ -71,10 +71,10 @@ impl Interpreter {
             "list_tools" => {
                 let plane_name = args
                     .first()
-                    .ok_or("tool.plane.list_tools: requires plane name")?
+                    .ok_or("toolplane.list_tools: requires plane name")?
                     .to_string();
                 let plane = reg.get_plane(&plane_name).ok_or_else(|| {
-                    format!("tool.plane.list_tools: plane '{}' not found", plane_name)
+                    format!("toolplane.list_tools: plane '{}' not found", plane_name)
                 })?;
                 let mut names: Vec<String> = plane.tools.keys().cloned().collect();
                 names.sort();
@@ -83,7 +83,7 @@ impl Interpreter {
             "info" => {
                 let plane_name = args
                     .first()
-                    .ok_or("tool.plane.info: requires plane name")?
+                    .ok_or("toolplane.info: requires plane name")?
                     .to_string();
                 match reg.get_plane(&plane_name) {
                     Some(plane) => {
@@ -104,7 +104,7 @@ impl Interpreter {
             }
             "find" => {
                 if args.len() < 2 {
-                    return Err("tool.plane.find: requires 2 args (plane, tool)".to_string());
+                    return Err("toolplane.find: requires 2 args (plane, tool)".to_string());
                 }
                 let plane_name = args[0].to_string();
                 let tool_name = args[1].to_string();
@@ -129,12 +129,12 @@ impl Interpreter {
             "remove" => {
                 let plane_name = args
                     .first()
-                    .ok_or("tool.plane.remove: requires plane name")?
+                    .ok_or("toolplane.remove: requires plane name")?
                     .to_string();
                 let removed = reg.remove_plane(&plane_name);
                 Ok(Value::Bool(removed.is_some()))
             }
-            _ => Err(format!("tool.plane.{}: unknown method", method)),
+            _ => Err(format!("toolplane.{}: unknown method", method)),
         }
     }
 }

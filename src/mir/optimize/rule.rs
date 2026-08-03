@@ -315,8 +315,7 @@ pub fn apply_rules(body: &[MirInst], rules: &[Box<dyn RewriteRule>]) -> Vec<MirI
     for (pc, inst) in body.iter().enumerate() {
         let mut replaced = false;
         for rule in rules {
-            if rule.pattern().matches(inst).is_some() {
-                let bindings = rule.pattern().matches(inst).unwrap();
+            if let Some(bindings) = rule.pattern().matches(inst) {
                 let new_insts = rule.rewrite_with_context(inst, &bindings, pc, body, &empty_ctx);
                 out.extend(new_insts);
                 replaced = true;

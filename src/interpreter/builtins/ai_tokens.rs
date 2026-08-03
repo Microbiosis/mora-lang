@@ -1,4 +1,4 @@
-//! v0.75.51: ai_tokens.* builtin 实现 — 从 builtins/mod.rs 拆出（P7，
+//! v0.75.51: ai.tokens.* builtin 实现 — 从 builtins/mod.rs 拆出（P7，
 //! Rhai register_plugin/Koto workspace 思想：按 domain 拆分，mod.rs 仅
 //! 聚合）。方法语义与拆分前完全一致。
 

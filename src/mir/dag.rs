@@ -503,7 +503,9 @@ pub fn topological_sort(dag: &MirDag) -> Option<Vec<Vec<NodeId>>> {
         let level_size = queue.len();
 
         for _ in 0..level_size {
-            let node = queue.pop_front().unwrap();
+            let node = queue
+                .pop_front()
+                .expect("dag: queue drained within level_size iteration");
             current_level.push(node);
             visited.insert(node);
 

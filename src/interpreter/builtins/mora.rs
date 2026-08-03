@@ -36,7 +36,13 @@ impl Interpreter {
                 }
                 .map_err(|e| format!("mora.refine: {}", e))?;
                 if count == 1 {
-                    Ok(Value::Dict(steps.into_iter().next().unwrap().to_dict()))
+                    Ok(Value::Dict(
+                        steps
+                            .into_iter()
+                            .next()
+                            .expect("mora.refine: refine_many(1) returned no step")
+                            .to_dict(),
+                    ))
                 } else {
                     Ok(Value::List(
                         steps

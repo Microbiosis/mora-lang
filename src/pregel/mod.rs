@@ -668,320 +668,8 @@ impl MirPregelEngine {
                 }
             }
 
-            let mut writes: Vec<(String, String, Value)> = Vec::new();
-
-            // v0.74: Step-level fault tolerance. Snapshot step-start state,
-            // run EXEC, and on failure restore + retry up to fault_tolerance.
-            // v0.75.3: 增量快照（StepUndo）— 只记录 EXEC 会改的状态；
-            // fault_tolerance == 0 时为零成本（此前每步全量 build_checkpoint
-            // 在默认配置从未被读取，纯浪费）。
-            let step_start = self.begin_step();
-            let mut exec_result: Result<(), String> = Ok(());
-
-            for attempt in 0..=self.fault_tolerance {
-                if attempt > 0 {
-                    // Restore step-start state and re-run the step.
-                    self.stats.retries += 1;
-                    if let Some(ref undo) = step_start {
-                        self.rollback_step(undo);
-                    }
-                    // Re-run EXEC from the restored state.
-                    self.worker_pool = None; // discard any leaked threads
-                }
-
-                // v0.73: EXEC — sequential (parallelism=1) or parallel.
-                let mut step_writes: Vec<(String, String, Value)> = Vec::new();
-                exec_result = (|| {
-                    if self.parallelism <= 1 {
-                        // ── Sequential path: inline, current behavior ──
-                        for node_name in &to_execute {
-                            let agent_idx =
-                                *self.agents_by_name.get(node_name).ok_or_else(|| {
-                                    format!("Pregel: undefined agent '{}'", node_name)
-                                })?;
-                            let agent = &self.config.agents[agent_idx];
-
-                            let input_val = self.build_node_input(node_name);
-                            let input_str = input_val.to_string();
-                            let mut env = interpreter.environment().lock().clone();
-                            // v0.73: define input on the private clone (agent only
-                            // sees its own input; no cross-agent contamination).
-                            env.define(
-                                "input".to_string(),
-                                Value::String(input_str.clone()),
-                                false,
-                            );
-                            // v0.75.10: 加法注入 — 保留 `input` 契约，另注入
-                            // 逐 channel 变更 var（input_<channel>）。旧 agent 无感。
-                            Self::inject_channel_inputs(&mut env, node_name, self);
-                            env.clock.tick(node_name);
-
-                            // v0.75.8: 增量执行 v1 — input 与上次相同则跳过整个
-                            // 执行，复用上次 outcome（signal/result）。input 相同
-                            // → 确定性执行，语义等价；跳过避免重复副作用（如
-                            // ai.chat 网络调用）。
-                            // v0.75.10: 寄存器级增量（memo）在 v1 之上细化 —
-                            // input 未变整体跳过；input 变了但部分纯节点输入
-                            // 未变则节点级跳过（run_dag_with_signal_memo）。
-                            if self.agent_input_cache.get(node_name) == Some(&input_str)
-                                && let Some((signal, result, _sends)) =
-                                    self.agent_outcome_cache.get(node_name).cloned()
-                            {
-                                let outcome = AgentExecOutcome {
-                                    node_name: node_name.clone(),
-                                    signal,
-                                    result,
-                                    env,
-                                    // 顺序路径 sends 经 interpreter.dynamic_sends
-                                    // 在循环外收集；跳过则无新 send。
-                                    sends: Vec::new(),
-                                    duration_ms: 0,
-                                    input_str,
-                                    // 跳过路径：无实际执行（v0.75.10）。
-                                    nodes_executed: 0,
-                                };
-                                self.reconcile_outcome(
-                                    interpreter,
-                                    &mut next_active,
-                                    &mut step_writes,
-                                    outcome,
-                                )?;
-                                continue;
-                            }
-
-                            if agent.task_body.body.is_empty() && agent.task_body.n_regs == 0 {
-                                return Err(format!(
-                                    "Pregel: agent '{}' has empty task_body (lowering missing)",
-                                    node_name
-                                ));
-                            }
-                            // v0.75.6: 克隆 task_body 解除对 self.config 的借用
-                            // v0.75.10: 稳定 Arc（engine 生命周期保持）— 全局
-                            // DAG 缓存（key = Arc 指针）跨超步真正命中（修复
-                            // v0.75.9 每超步新建 Arc 的缓存失效）；同 Arc 锚定
-                            // 寄存器级增量 memo 记录。
-                            let task_body = self.stable_task_arc(node_name);
-                            let mut memo = self.agent_memos.remove(node_name).unwrap_or_default();
-
-                            self.stats.agents_run += 1;
-
-                            // v0.75.9: 全局 DAG 缓存（mir::cache）— 取代引擎
-                            // 本地 agent_dag_cache，Closure/Task/REPL 共用
-                            // v0.75.7: 计时 per-agent 耗时（FPGA 调度可观测性）
-                            let dag =
-                                crate::mir::cache::global_dag_cache().get_or_build(&task_body);
-                            let started = std::time::Instant::now();
-                            // v0.75.10: 寄存器级增量执行 — 纯节点输入与上次
-                            // 相等则跳过；副作用/env 读取节点永远重跑。
-                            let (signal, result) = crate::mir::vm::run_dag_with_signal_memo(
-                                dag.as_ref(),
-                                task_body.as_ref(),
-                                &mut memo,
-                                interpreter,
-                                &mut env,
-                            )
-                            .map_err(|e| format!("Pregel node '{}': {}", node_name, e))?;
-                            let duration_ms = started.elapsed().as_millis();
-                            let nodes_executed = memo.executed_nodes;
-                            self.agent_memos.insert(node_name.clone(), memo);
-
-                            let outcome = AgentExecOutcome {
-                                node_name: node_name.clone(),
-                                signal,
-                                result,
-                                env,
-                                sends: Vec::new(),
-                                duration_ms,
-                                input_str,
-                                nodes_executed,
-                            };
-                            self.reconcile_outcome(
-                                interpreter,
-                                &mut next_active,
-                                &mut step_writes,
-                                outcome,
-                            )?;
-                        }
-                    } else {
-                        // ── Parallel path: PREPARE → SPAWN → RECONCILE ──
-                        // PREPARE (main thread, &self read): build private envs.
-                        // v0.75.6: prepared 携带缓存 dag（避免每超步重建）。
-                        // v0.75.8: 携带 input_str 供 worker 填回 outcome。
-                        let mut prepared: Vec<PreparedJob> = Vec::new();
-                        for node_name in &to_execute {
-                            let agent_idx =
-                                *self.agents_by_name.get(node_name).ok_or_else(|| {
-                                    format!("Pregel: undefined agent '{}'", node_name)
-                                })?;
-                            let agent = &self.config.agents[agent_idx];
-                            if agent.task_body.body.is_empty() && agent.task_body.n_regs == 0 {
-                                return Err(format!(
-                                    "Pregel: agent '{}' has empty task_body (lowering missing)",
-                                    node_name
-                                ));
-                            }
-                            let input_val = self.build_node_input(node_name);
-                            let input_str = input_val.to_string();
-                            let mut env = interpreter.environment().lock().clone();
-                            env.define(
-                                "input".to_string(),
-                                Value::String(input_str.clone()),
-                                false,
-                            );
-                            // v0.75.10: 加法注入（input_<channel>），旧 agent 无感
-                            Self::inject_channel_inputs(&mut env, node_name, self);
-                            env.clock.tick(node_name);
-
-                            // v0.75.8: 增量 v1 — input 未变则跳过，直接 reconcile
-                            // 缓存 outcome（与顺序路径同语义）。
-                            if self.agent_input_cache.get(node_name) == Some(&input_str)
-                                && let Some((signal, result, sends)) =
-                                    self.agent_outcome_cache.get(node_name).cloned()
-                            {
-                                let outcome = AgentExecOutcome {
-                                    node_name: node_name.clone(),
-                                    signal,
-                                    result,
-                                    env,
-                                    sends,
-                                    duration_ms: 0,
-                                    input_str,
-                                    // 跳过路径：无实际执行；并行 worker 内联执行
-                                    // 也无 memo，本字段仅用于统计（此处为 0）。
-                                    nodes_executed: 0,
-                                };
-                                self.reconcile_outcome(
-                                    interpreter,
-                                    &mut next_active,
-                                    &mut step_writes,
-                                    outcome,
-                                )?;
-                                continue;
-                            }
-
-                            self.stats.agents_run += 1;
-                            // v0.75.6: 克隆 task_body 解除借用
-                            // v0.75.10: 稳定 Arc（engine 生命周期保持）— 全局
-                            // DAG 缓存跨超步命中（修复 v0.75.9 缓存失效）。
-                            let task_body = self.stable_task_arc(node_name);
-                            let dag =
-                                crate::mir::cache::global_dag_cache().get_or_build(&task_body);
-                            prepared.push((node_name.clone(), task_body, dag, env, input_str));
-                        }
-
-                        // v0.75.7: Longest-Job-First 排序 — 按 DAG 复杂度
-                        // （nodes.len()，执行时长的廉价代理）降序。BSP 超步
-                        // 隔离保证同超步 agent 顺序无关（读 step-start 快照、
-                        // 写延迟到 barrier 后），重排仅改变分发顺序、不影响
-                        // 正确性；长 job 先调度可减少 worker 空闲尾巴
-                        // （straggler 缓解，FPGA list-scheduling 精神）。
-                        prepared.sort_by(|a, b| {
-                            b.2.nodes
-                                .len()
-                                .cmp(&a.2.nodes.len())
-                                .then_with(|| a.0.cmp(&b.0))
-                        });
-                        // SPAWN: one Interpreter clone + private env per worker job.
-                        // v0.74: Reuse cached pool (created once), keep across steps.
-                        if self.worker_pool.is_none() {
-                            self.worker_pool = Some(crate::pregel::worker_pool::WorkerPool::new(
-                                self.parallelism,
-                            ));
-                        }
-                        let pool = self
-                            .worker_pool
-                            .as_ref()
-                            .ok_or("Pregel: worker pool missing")?;
-                        let jobs: Vec<crate::pregel::worker_pool::WorkerJob> = prepared
-                            .into_iter()
-                            .enumerate()
-                            .map(|(idx, (name, task, dag, mut env, input_str))| {
-                                let mut interp_clone = interpreter.clone_box();
-                                crate::pregel::worker_pool::WorkerJob {
-                                    index: idx,
-                                    task: Box::new(move || {
-                                        // v0.75.6: 用缓存 dag 执行（避免每超步重建）
-                                        // v0.75.7: 计时 per-agent 耗时
-                                        let job_started = std::time::Instant::now();
-                                        let (signal, result) = crate::mir::vm::run_dag_with_signal(
-                                            dag.as_ref(),
-                                            &task,
-                                            interp_clone.as_mut(),
-                                            &mut env,
-                                        )
-                                        .map_err(|e| format!("Pregel node '{}': {}", name, e))?;
-                                        let duration_ms = job_started.elapsed().as_millis();
-                                        let sends = std::mem::take(interp_clone.dynamic_sends());
-                                        Ok(Box::new(AgentExecOutcome {
-                                            node_name: name,
-                                            signal,
-                                            result,
-                                            env,
-                                            sends,
-                                            duration_ms,
-                                            input_str,
-                                            // v0.75.10: worker 内联执行（无 memo），
-                                            // 该字段仅作统计。
-                                            nodes_executed: 0,
-                                        })
-                                            as Box<dyn std::any::Any + Send>)
-                                    }),
-                                }
-                            })
-                            .collect();
-
-                        // v0.74: Run batch with optional per-step timeout. On timeout
-                        // the step is treated as a fault and retried (fault_tolerance).
-                        let started = std::time::Instant::now();
-                        let batch = pool
-                            .run_batch_with_timeout(jobs, self.step_timeout)
-                            .map_err(|e| format!("Pregel parallel EXEC: {}", e))?;
-                        self.stats.total_ms += started.elapsed().as_millis();
-
-                        if batch.timed_out {
-                            self.stats.timeouts += 1;
-                            // Drop the pool (leaked timed-out worker threads) and
-                            // force a fresh one on the next step.
-                            self.worker_pool = None;
-                            return Err(format!(
-                                "Pregel: super-step {} timed out after {:?}",
-                                self.current_step, self.step_timeout
-                            ));
-                        }
-                        let outcomes = batch.outcomes;
-
-                        // RECONCILE (main thread, index order = deterministic).
-                        for out in outcomes {
-                            let outcome: AgentExecOutcome = *out
-                                .value
-                                .downcast::<AgentExecOutcome>()
-                                .map_err(|_| "Pregel: worker outcome type mismatch".to_string())?;
-                            self.reconcile_outcome(
-                                interpreter,
-                                &mut next_active,
-                                &mut step_writes,
-                                outcome,
-                            )?;
-                        }
-                    }
-
-                    // v0.73: Flush intra-run sends so a step-N send reaches step-N+1.
-                    let sends = std::mem::take(interpreter.dynamic_sends());
-                    self.flush_pending_sends(sends);
-                    Ok(())
-                })();
-                // end retryable exec closure
-
-                if exec_result.is_ok() {
-                    writes = step_writes;
-                    break;
-                }
-                // Else: retry loop will restore checkpoint and re-run.
-                if attempt == self.fault_tolerance {
-                    break;
-                }
-            }
-            exec_result?;
+            // v0.75.57: EXEC 段提取至 execute_step（BSP 超步执行 + fault tolerance）
+            let writes = self.execute_step(interpreter, &to_execute, &mut next_active)?;
 
             // ---------- 3. UPDATE ----------
             for (_node, channel, value) in writes {
@@ -1110,6 +798,322 @@ impl MirPregelEngine {
 
         // 返回 result 通道
         Ok(self.channels.get("result").cloned().unwrap_or(Value::Nil))
+    }
+
+    /// v0.75.57: EXEC 段提取（run() 内最大块）— BSP 超步执行 + fault tolerance
+    /// 重试。顺序路径内联；并行路径经 WorkerPool（PREPARE → SPAWN → RECONCILE）。
+    /// 返回本超步产生的 writes（UPDATE 段消费）。
+    fn execute_step(
+        &mut self,
+        interpreter: &mut dyn MirHost,
+        to_execute: &[String],
+        next_active: &mut std::collections::HashSet<String>,
+    ) -> Result<Vec<(String, String, Value)>, String> {
+        let mut writes: Vec<(String, String, Value)> = Vec::new();
+
+        // v0.74: Step-level fault tolerance. Snapshot step-start state,
+        // run EXEC, and on failure restore + retry up to fault_tolerance.
+        // v0.75.3: 增量快照（StepUndo）— 只记录 EXEC 会改的状态；
+        // fault_tolerance == 0 时为零成本（此前每步全量 build_checkpoint
+        // 在默认配置从未被读取，纯浪费）。
+        let step_start = self.begin_step();
+        let mut exec_result: Result<(), String> = Ok(());
+
+        for attempt in 0..=self.fault_tolerance {
+            if attempt > 0 {
+                // Restore step-start state and re-run the step.
+                self.stats.retries += 1;
+                if let Some(ref undo) = step_start {
+                    self.rollback_step(undo);
+                }
+                // Re-run EXEC from the restored state.
+                self.worker_pool = None; // discard any leaked threads
+            }
+
+            // v0.73: EXEC — sequential (parallelism=1) or parallel.
+            let mut step_writes: Vec<(String, String, Value)> = Vec::new();
+            exec_result = (|| {
+                if self.parallelism <= 1 {
+                    // ── Sequential path: inline, current behavior ──
+                    for node_name in to_execute {
+                        let agent_idx = *self
+                            .agents_by_name
+                            .get(node_name)
+                            .ok_or_else(|| format!("Pregel: undefined agent '{}'", node_name))?;
+                        let agent = &self.config.agents[agent_idx];
+
+                        let input_val = self.build_node_input(node_name);
+                        let input_str = input_val.to_string();
+                        let mut env = interpreter.environment().lock().clone();
+                        // v0.73: define input on the private clone (agent only
+                        // sees its own input; no cross-agent contamination).
+                        env.define("input".to_string(), Value::String(input_str.clone()), false);
+                        // v0.75.10: 加法注入 — 保留 `input` 契约，另注入
+                        // 逐 channel 变更 var（input_<channel>）。旧 agent 无感。
+                        Self::inject_channel_inputs(&mut env, node_name, self);
+                        env.clock.tick(node_name);
+
+                        // v0.75.8: 增量执行 v1 — input 与上次相同则跳过整个
+                        // 执行，复用上次 outcome（signal/result）。input 相同
+                        // → 确定性执行，语义等价；跳过避免重复副作用（如
+                        // ai.chat 网络调用）。
+                        // v0.75.10: 寄存器级增量（memo）在 v1 之上细化 —
+                        // input 未变整体跳过；input 变了但部分纯节点输入
+                        // 未变则节点级跳过（run_dag_with_signal_memo）。
+                        if self.agent_input_cache.get(node_name) == Some(&input_str)
+                            && let Some((signal, result, _sends)) =
+                                self.agent_outcome_cache.get(node_name).cloned()
+                        {
+                            let outcome = AgentExecOutcome {
+                                node_name: node_name.clone(),
+                                signal,
+                                result,
+                                env,
+                                // 顺序路径 sends 经 interpreter.dynamic_sends
+                                // 在循环外收集；跳过则无新 send。
+                                sends: Vec::new(),
+                                duration_ms: 0,
+                                input_str,
+                                // 跳过路径：无实际执行（v0.75.10）。
+                                nodes_executed: 0,
+                            };
+                            self.reconcile_outcome(
+                                interpreter,
+                                next_active,
+                                &mut step_writes,
+                                outcome,
+                            )?;
+                            continue;
+                        }
+
+                        if agent.task_body.body.is_empty() && agent.task_body.n_regs == 0 {
+                            return Err(format!(
+                                "Pregel: agent '{}' has empty task_body (lowering missing)",
+                                node_name
+                            ));
+                        }
+                        // v0.75.6: 克隆 task_body 解除对 self.config 的借用
+                        // v0.75.10: 稳定 Arc（engine 生命周期保持）— 全局
+                        // DAG 缓存（key = Arc 指针）跨超步真正命中（修复
+                        // v0.75.9 每超步新建 Arc 的缓存失效）；同 Arc 锚定
+                        // 寄存器级增量 memo 记录。
+                        let task_body = self.stable_task_arc(node_name);
+                        let mut memo = self.agent_memos.remove(node_name).unwrap_or_default();
+
+                        self.stats.agents_run += 1;
+
+                        // v0.75.9: 全局 DAG 缓存（mir::cache）— 取代引擎
+                        // 本地 agent_dag_cache，Closure/Task/REPL 共用
+                        // v0.75.7: 计时 per-agent 耗时（FPGA 调度可观测性）
+                        let dag = crate::mir::cache::global_dag_cache().get_or_build(&task_body);
+                        let started = std::time::Instant::now();
+                        // v0.75.10: 寄存器级增量执行 — 纯节点输入与上次
+                        // 相等则跳过；副作用/env 读取节点永远重跑。
+                        let (signal, result) = crate::mir::vm::run_dag_with_signal_memo(
+                            dag.as_ref(),
+                            task_body.as_ref(),
+                            &mut memo,
+                            interpreter,
+                            &mut env,
+                        )
+                        .map_err(|e| format!("Pregel node '{}': {}", node_name, e))?;
+                        let duration_ms = started.elapsed().as_millis();
+                        let nodes_executed = memo.executed_nodes;
+                        self.agent_memos.insert(node_name.clone(), memo);
+
+                        let outcome = AgentExecOutcome {
+                            node_name: node_name.clone(),
+                            signal,
+                            result,
+                            env,
+                            sends: Vec::new(),
+                            duration_ms,
+                            input_str,
+                            nodes_executed,
+                        };
+                        self.reconcile_outcome(
+                            interpreter,
+                            next_active,
+                            &mut step_writes,
+                            outcome,
+                        )?;
+                    }
+                } else {
+                    // ── Parallel path: PREPARE → SPAWN → RECONCILE ──
+                    // PREPARE (main thread, &self read): build private envs.
+                    // v0.75.6: prepared 携带缓存 dag（避免每超步重建）。
+                    // v0.75.8: 携带 input_str 供 worker 填回 outcome。
+                    let mut prepared: Vec<PreparedJob> = Vec::new();
+                    for node_name in to_execute {
+                        let agent_idx = *self
+                            .agents_by_name
+                            .get(node_name)
+                            .ok_or_else(|| format!("Pregel: undefined agent '{}'", node_name))?;
+                        let agent = &self.config.agents[agent_idx];
+                        if agent.task_body.body.is_empty() && agent.task_body.n_regs == 0 {
+                            return Err(format!(
+                                "Pregel: agent '{}' has empty task_body (lowering missing)",
+                                node_name
+                            ));
+                        }
+                        let input_val = self.build_node_input(node_name);
+                        let input_str = input_val.to_string();
+                        let mut env = interpreter.environment().lock().clone();
+                        env.define("input".to_string(), Value::String(input_str.clone()), false);
+                        // v0.75.10: 加法注入（input_<channel>），旧 agent 无感
+                        Self::inject_channel_inputs(&mut env, node_name, self);
+                        env.clock.tick(node_name);
+
+                        // v0.75.8: 增量 v1 — input 未变则跳过，直接 reconcile
+                        // 缓存 outcome（与顺序路径同语义）。
+                        if self.agent_input_cache.get(node_name) == Some(&input_str)
+                            && let Some((signal, result, sends)) =
+                                self.agent_outcome_cache.get(node_name).cloned()
+                        {
+                            let outcome = AgentExecOutcome {
+                                node_name: node_name.clone(),
+                                signal,
+                                result,
+                                env,
+                                sends,
+                                duration_ms: 0,
+                                input_str,
+                                // 跳过路径：无实际执行；并行 worker 内联执行
+                                // 也无 memo，本字段仅用于统计（此处为 0）。
+                                nodes_executed: 0,
+                            };
+                            self.reconcile_outcome(
+                                interpreter,
+                                next_active,
+                                &mut step_writes,
+                                outcome,
+                            )?;
+                            continue;
+                        }
+
+                        self.stats.agents_run += 1;
+                        // v0.75.6: 克隆 task_body 解除借用
+                        // v0.75.10: 稳定 Arc（engine 生命周期保持）— 全局
+                        // DAG 缓存跨超步命中（修复 v0.75.9 缓存失效）。
+                        let task_body = self.stable_task_arc(node_name);
+                        let dag = crate::mir::cache::global_dag_cache().get_or_build(&task_body);
+                        prepared.push((node_name.clone(), task_body, dag, env, input_str));
+                    }
+
+                    // v0.75.7: Longest-Job-First 排序 — 按 DAG 复杂度
+                    // （nodes.len()，执行时长的廉价代理）降序。BSP 超步
+                    // 隔离保证同超步 agent 顺序无关（读 step-start 快照、
+                    // 写延迟到 barrier 后），重排仅改变分发顺序、不影响
+                    // 正确性；长 job 先调度可减少 worker 空闲尾巴
+                    // （straggler 缓解，FPGA list-scheduling 精神）。
+                    prepared.sort_by(|a, b| {
+                        b.2.nodes
+                            .len()
+                            .cmp(&a.2.nodes.len())
+                            .then_with(|| a.0.cmp(&b.0))
+                    });
+                    // SPAWN: one Interpreter clone + private env per worker job.
+                    // v0.74: Reuse cached pool (created once), keep across steps.
+                    if self.worker_pool.is_none() {
+                        self.worker_pool = Some(crate::pregel::worker_pool::WorkerPool::new(
+                            self.parallelism,
+                        ));
+                    }
+                    let pool = self
+                        .worker_pool
+                        .as_ref()
+                        .ok_or("Pregel: worker pool missing")?;
+                    let jobs: Vec<crate::pregel::worker_pool::WorkerJob> = prepared
+                        .into_iter()
+                        .enumerate()
+                        .map(|(idx, (name, task, dag, mut env, input_str))| {
+                            let mut interp_clone = interpreter.clone_box();
+                            crate::pregel::worker_pool::WorkerJob {
+                                index: idx,
+                                task: Box::new(move || {
+                                    // v0.75.6: 用缓存 dag 执行（避免每超步重建）
+                                    // v0.75.7: 计时 per-agent 耗时
+                                    let job_started = std::time::Instant::now();
+                                    let (signal, result) = crate::mir::vm::run_dag_with_signal(
+                                        dag.as_ref(),
+                                        &task,
+                                        interp_clone.as_mut(),
+                                        &mut env,
+                                    )
+                                    .map_err(|e| format!("Pregel node '{}': {}", name, e))?;
+                                    let duration_ms = job_started.elapsed().as_millis();
+                                    let sends = std::mem::take(interp_clone.dynamic_sends());
+                                    Ok(Box::new(AgentExecOutcome {
+                                        node_name: name,
+                                        signal,
+                                        result,
+                                        env,
+                                        sends,
+                                        duration_ms,
+                                        input_str,
+                                        // v0.75.10: worker 内联执行（无 memo），
+                                        // 该字段仅作统计。
+                                        nodes_executed: 0,
+                                    })
+                                        as Box<dyn std::any::Any + Send>)
+                                }),
+                            }
+                        })
+                        .collect();
+
+                    // v0.74: Run batch with optional per-step timeout. On timeout
+                    // the step is treated as a fault and retried (fault_tolerance).
+                    let started = std::time::Instant::now();
+                    let batch = pool
+                        .run_batch_with_timeout(jobs, self.step_timeout)
+                        .map_err(|e| format!("Pregel parallel EXEC: {}", e))?;
+                    self.stats.total_ms += started.elapsed().as_millis();
+
+                    if batch.timed_out {
+                        self.stats.timeouts += 1;
+                        // Drop the pool (leaked timed-out worker threads) and
+                        // force a fresh one on the next step.
+                        self.worker_pool = None;
+                        return Err(format!(
+                            "Pregel: super-step {} timed out after {:?}",
+                            self.current_step, self.step_timeout
+                        ));
+                    }
+                    let outcomes = batch.outcomes;
+
+                    // RECONCILE (main thread, index order = deterministic).
+                    for out in outcomes {
+                        let outcome: AgentExecOutcome =
+                            *out.value
+                                .downcast::<AgentExecOutcome>()
+                                .map_err(|_| "Pregel: worker outcome type mismatch".to_string())?;
+                        self.reconcile_outcome(
+                            interpreter,
+                            next_active,
+                            &mut step_writes,
+                            outcome,
+                        )?;
+                    }
+                }
+
+                // v0.73: Flush intra-run sends so a step-N send reaches step-N+1.
+                let sends = std::mem::take(interpreter.dynamic_sends());
+                self.flush_pending_sends(sends);
+                Ok(())
+            })();
+            // end retryable exec closure
+
+            if exec_result.is_ok() {
+                writes = step_writes;
+                break;
+            }
+            // Else: retry loop will restore checkpoint and re-run.
+            if attempt == self.fault_tolerance {
+                break;
+            }
+        }
+        exec_result?;
+        Ok(writes)
     }
 
     /// 构建节点输入 — 序列化 channels

@@ -108,3 +108,28 @@ fn compile_bare_user_function_call() {
     mora::mir::vm::run_main_task(&func_arc, &mut interp, &mut env)
         .expect("run_main_task should succeed");
 }
+
+/// v0.75.77: 回归测试 — 闭包捕获顶层绑定（compile 主路径）。
+/// 修复前：h_closure 用 interp.environment()（宿主全局槽）捕获闭包环境，
+/// take_env 移空后捕获到空壳 → 闭包体 `x + base` 查不到 base（
+/// "Operands must be two numbers..." / Undefined）。修复：h_closure 捕获
+/// 执行 env 参数（与 h_define 同一容器，单一来源），无全局槽读取。
+#[test]
+fn compile_closure_captures_top_level_binding() {
+    let src = "let base = 10\nlet offset = fn(x) x + base end\nprint(offset(5))";
+    let (func, witnesses) = ParserV3::compile(src).expect("compile should succeed");
+    let type_errors = mora::typeck::check_mir::check_program_witnesses(&witnesses);
+    assert!(
+        type_errors.is_empty(),
+        "typeck should pass: {:?}",
+        type_errors
+    );
+
+    let mut interp = mora::interpreter::Interpreter::new();
+    let mut env = interp.take_env();
+    let func_arc = std::sync::Arc::new(func);
+    mora::mir::vm::run_mir(&func_arc, &mut interp, &mut env)
+        .expect("run_mir should not fail (closure must see captured base)");
+    mora::mir::vm::run_main_task(&func_arc, &mut interp, &mut env)
+        .expect("run_main_task should succeed");
+}

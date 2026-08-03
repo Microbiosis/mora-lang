@@ -96,20 +96,18 @@ pub fn h_call(
         // v0.75.9: 包裹 Arc 走全局 DAG 缓存（task body 借自指令表）
         run_mir(&Arc::new((*body).clone()), interp, &mut child_env)?
     } else if let Some(callable) = env.get(name) {
-        // v0.75.76: 用户自定义函数/闭包直查执行 env（与 h_define 同一容器）。
-        // 修复 `let f = fn(x) x*2 end; f(5)` 顶层绑定对 call_function 不可见
-        // （take_env 移出 core.environment 后 call_builtin_fallback 查 core 空壳）。
-        // callable 值（Closure/Task/Compose/Partial）走 call_value；其余（含
-        // Macro、非 callable 值）回落 mir_call_function 保持 builtin/P6 语义。
+        // v0.75.76: 用户自定义 callable（Closure/Task/Compose/Partial）在
+        // 执行 env 中直调（与 h_define 同一容器，无回落）；其余名（builtin、
+        // 未定义等）统一经 mir_call_function —— 单一 env 传递，无回退分支。
         match callable {
             Value::Task { .. }
             | Value::Closure { .. }
             | Value::Compose(_)
             | Value::Partial(_, _) => interp.call_value(&callable, arg_vals)?,
-            _ => interp.mir_call_function(name, arg_vals)?,
+            _ => interp.mir_call_function(name, arg_vals, env)?,
         }
     } else {
-        interp.mir_call_function(name, arg_vals)?
+        interp.mir_call_function(name, arg_vals, env)?
     };
     regs[dst] = result;
     Ok(())
@@ -184,11 +182,14 @@ pub fn h_closure(
     dst: Reg,
     params: &[String],
     body: &MirFunction,
-    interp: &dyn MirHost,
+    env: &Environment,
 ) {
+    // v0.75.77: 闭包捕获执行 env（与 h_define 写入同一容器，单一来源）——
+    // 不再读 interp.environment() 宿主全局槽（take_env 移空后捕获到空壳，
+    // 顶层绑定 base 对闭包不可见：`let base=10; let f=fn(x) x+base end`）。
     let closure = Value::Closure {
         params: params.to_vec(),
-        env: crate::value::EnvRef::from_arc_mutex(interp.environment()),
+        env: crate::value::EnvRef(Box::new(env.clone())),
         mir_body: Arc::new(body.clone()),
     };
     regs[dst] = closure;
@@ -421,6 +422,7 @@ pub fn h_span(
 
 pub fn h_save(
     interp: &mut dyn MirHost,
+    env: &Environment,
     regs: &[Value],
     path: Reg,
     value: Reg,
@@ -430,6 +432,7 @@ pub fn h_save(
     interp.mir_call_function(
         "file.write_text",
         vec![Value::String(path_str), Value::String(value_str)],
+        env,
     )?;
     Ok(())
 }
@@ -442,7 +445,7 @@ pub fn h_load(
     var: &str,
 ) -> Result<(), String> {
     let path_str = value_to_string(&regs[path]);
-    let content = interp.mir_call_function("file.read_text", vec![Value::String(path_str)])?;
+    let content = interp.mir_call_function("file.read_text", vec![Value::String(path_str)], env)?;
     env.define(var.to_string(), content, false);
     Ok(())
 }
@@ -455,13 +458,14 @@ pub fn h_read_file(
     var: &str,
 ) -> Result<(), String> {
     let path_str = value_to_string(&regs[path]);
-    let content = interp.mir_call_function("file.read_text", vec![Value::String(path_str)])?;
+    let content = interp.mir_call_function("file.read_text", vec![Value::String(path_str)], env)?;
     env.define(var.to_string(), content, false);
     Ok(())
 }
 
 pub fn h_write_file(
     interp: &mut dyn MirHost,
+    env: &Environment,
     regs: &[Value],
     path: Reg,
     content: Reg,
@@ -471,12 +475,14 @@ pub fn h_write_file(
     interp.mir_call_function(
         "file.write_text",
         vec![Value::String(path_str), Value::String(content_str)],
+        env,
     )?;
     Ok(())
 }
 
 pub fn h_append_file(
     interp: &mut dyn MirHost,
+    env: &Environment,
     regs: &[Value],
     path: Reg,
     content: Reg,
@@ -486,6 +492,7 @@ pub fn h_append_file(
     interp.mir_call_function(
         "file.append_text",
         vec![Value::String(path_str), Value::String(content_str)],
+        env,
     )?;
     Ok(())
 }
@@ -498,13 +505,14 @@ pub fn h_read_bytes_file(
     var: &str,
 ) -> Result<(), String> {
     let path_str = value_to_string(&regs[path]);
-    let bytes = interp.mir_call_function("file.read_bytes", vec![Value::String(path_str)])?;
+    let bytes = interp.mir_call_function("file.read_bytes", vec![Value::String(path_str)], env)?;
     env.define(var.to_string(), bytes, false);
     Ok(())
 }
 
 pub fn h_write_bytes_file(
     interp: &mut dyn MirHost,
+    env: &Environment,
     regs: &[Value],
     path: Reg,
     content: Reg,
@@ -514,6 +522,7 @@ pub fn h_write_bytes_file(
     interp.mir_call_function(
         "file.write_bytes",
         vec![Value::String(path_str), content_val],
+        env,
     )?;
     Ok(())
 }

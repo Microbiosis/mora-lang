@@ -2,6 +2,28 @@
 
 All notable changes to Mora will be documented in this file.
 
+## [v0.75.77] — 2026-08-03 — 环境经参数单一传递（去全局槽/回落形态）
+
+v0.75.76 的修复采用「h_call 执行 env 直查 + 其余回落 mir_call_function」
+的双路径形态。按项目「不允许兜底/回落代码」原则重构为单一来源——
+执行环境经参数贯穿所有调用桥：
+
+- **MirHost::mir_call_function 增 `env` 参数**：trait 签名、Interpreter
+  impl、`call_function`/`call_builtin_fallback` 全部改为从参数取执行环境，
+  不再查询宿主全局槽。file.* handler（save/load/read/write/append/
+  read_bytes/write_bytes）同步补 env 参数传递。
+- **h_closure 闭包捕获修复（新 bug）**：h_closure 原用 `interp.environment()`
+  （宿主全局槽）捕获闭包环境——take_env 移空后捕获到空壳，闭包体查不到
+  顶层绑定（`let base=10; let f=fn(x) x+base end; f(5)` 运行时
+  "Operands must be two numbers..."）。现捕获执行 env 参数（与 h_define
+  同一容器），全局槽读取清零。
+- 兜底分支语义收敛：h_call 的 `env.get(name)` 命中 callable 走 call_value，
+  其余（builtin/未定义）统一经 mir_call_function(env) —— 无回落，单一传递链。
+
+回归测试：compile_differential 新增 compile_closure_captures_top_level_binding。
+验证：全量 791+ 绿（docker 依赖测试因 daemon 不可达 skip，pre-existing）+ 实际
+exe 综合脚本全过 + clippy `-D warnings` 0 + fmt 0。
+
 ## [v0.75.76] — 2026-08-03 — 实际运行修复两 bug
 
 编译 mora.exe 实际运行综合脚本暴露两个真实 bug（全量测试未覆盖）：

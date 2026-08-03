@@ -2,6 +2,21 @@
 
 All notable changes to Mora will be documented in this file.
 
+## [v0.75.66] — 2026-08-03 — dispatch.rs call_function 按 name 提取（God Function 拆分）
+
+call_function（473 行巨型 match）按 name 提取为 18 个 `call_builtin_*`
+私有方法（统一签名 `&mut self + args`），主干保留 name → 方法分派：
+
+- merge_with/print/range/len/compose/partial/atom/swap/deref/type_of/
+  is_instance/methods_of/compress/crush_json/batch_chat/into/tail/
+  compose_prompt
+- 兜底分支（环境查值 → call_value / Macro 展开）提取为
+  `call_builtin_fallback(name, args)`，match 补 `_` arm
+- 原行提取不做手动缩进（rustfmt 统一），避免 v0.75.65 textwrap 缩进事故
+- Trait::new 早退 + P6 BuiltinKind 登记校验保留
+
+行为等价：全量 790 绿 + clippy `-D warnings` 0 + fmt 0；冒烟 print 正常。
+
 ## [v0.75.65] — 2026-08-03 — dispatch.rs call_method 按类型提取（God Function 拆分）
 
 call_method（644 行巨型 match）按 Value 类型提取为 10 个私有方法，主干

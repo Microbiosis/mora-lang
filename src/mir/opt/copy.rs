@@ -1,5 +1,5 @@
-// v0.75.60: 自 opt.rs 按 pass 组拆出（D6 单文件惯例）。
-// CopyProp pass 实现 + next_free_reg / replace_reg_in_terminator 辅助。
+//! v0.75.60: 自 opt.rs 按 pass 组拆出（D6 单文件惯例）。
+//! CopyProp pass 实现 + next_free_reg / replace_reg_in_terminator 辅助。
 
 use crate::mir::ssa::{MirSsaFunction, SsaInst, SsaReg, Terminator};
 

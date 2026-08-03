@@ -1,5 +1,5 @@
-// v0.75.60: 自 opt.rs 按 pass 组拆出（D6 单文件惯例）。
-// Pregel 专属优化：superstep_fusion + optimize_pregel。
+//! v0.75.60: 自 opt.rs 按 pass 组拆出（D6 单文件惯例）。
+//! Pregel 专属优化：superstep_fusion + optimize_pregel。
 
 use crate::mir::{MirFunction, MirInst};
 

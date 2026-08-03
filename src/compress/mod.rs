@@ -139,9 +139,12 @@ impl ContentRouter {
 
 // 子压缩器子模块 (Tasks 3-5 填充)
 pub mod code; // Task 4 填充
+mod constraints; // v0.75.55: JSON 压缩分层拆分子模块
+mod detect; // v0.75.55: JSON 压缩分层拆分子模块
 pub mod html; // Task 4 填充
 pub mod json; // Task 2 填充
 pub mod log; // Task 4 填充
+mod strategies; // v0.75.55: JSON 压缩分层拆分子模块
 pub mod text; // Task 3 填充
 
 // v0.30: re-export SmartCrusher 主入口

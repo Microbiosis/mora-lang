@@ -77,16 +77,10 @@ impl Interpreter {
                 );
             }
         }
-        // v0.75.52: P6 — BuiltinKind 静态表登记校验。from_name 是 name→kind
-        // 的单一来源；此处仅验证 name 已登记（未登记走原生 match），
-        // 未来 call_function 整体迁移到 kind dispatch 时以此为基。
+        // v0.75.52: P6 — BuiltinKind 静态表登记校验（校验点已移至 `_` 兜底
+        // 分支，v0.75.76：顶层断言误拦用户自定义函数）。from_name 是 name→kind
+        // 的单一来源；此处仅取 kind 供兜底分支判定。
         let _kind = crate::value::BuiltinKind::from_name(name);
-        // 放行：`__` 前缀为测试哨兵（故意调用不存在函数验证错误传播），
-        // `merge_with` 为 M 原语（非 kind 域）。
-        testcase!(
-            _kind.is_some() || name.starts_with("__") || matches!(name, "merge_with"),
-            format!("call_function: name 未登记 BuiltinKind::from_name: {name}")
-        );
         match name {
             "merge_with" => self.call_builtin_merge_with(args),
             "print" => self.call_builtin_print(args),
@@ -106,7 +100,20 @@ impl Interpreter {
             "into" => self.call_builtin_into(args),
             "tail" => self.call_builtin_tail(args),
             "compose_prompt" => self.call_builtin_compose_prompt(args),
-            _ => self.call_builtin_fallback(name, args),
+            _ => {
+                // v0.75.76: P6 登记校验移至兜底分支——此前顶层 testcase! 断言
+                // `_kind.is_some()` 误拦用户自定义函数（_kind.is_none() 落兜底
+                // 环境查找），实际运行 `let f = fn(x) x*2 end; f(1)` 即 panic。
+                // 正确语义：builtin 名不得落兜底（登记与 match 漂移），
+                // 非 builtin（用户函数/哨兵/merge）合法落兜底。
+                testcase!(
+                    _kind.is_none() || name.starts_with("__") || matches!(name, "merge_with"),
+                    format!(
+                        "call_function: builtin 名 {name} 落入兜底（BuiltinKind::from_name 登记与 match 不一致）"
+                    )
+                );
+                self.call_builtin_fallback(name, args)
+            }
         }
     }
 

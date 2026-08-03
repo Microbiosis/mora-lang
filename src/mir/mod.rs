@@ -36,6 +36,8 @@ pub mod witness;
 // v0.59: DAG IR — dataflow analysis from linear MIR
 pub mod dag;
 pub mod handlers;
+mod inst; // v0.75.56: MirInst metadata + dispatch（经 handlers::inst re-export）
+pub use inst::*; // 保持 crate::mir::dst() 等旧路径
 pub mod vm;
 
 pub use expr::MirExpr;

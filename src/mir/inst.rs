@@ -32,6 +32,7 @@ impl MirInst {
         match self {
             MirInst::Const(r, _) => Some(*r),
             MirInst::Var(r, _) => Some(*r),
+            MirInst::Copy(r, _) => Some(*r),
             MirInst::BinaryOp(r, _, _, _) => Some(*r),
             MirInst::Call(r, _, _) => Some(*r),
             MirInst::MethodCall(r, _, _, _) => Some(*r),
@@ -52,6 +53,7 @@ impl MirInst {
         match self {
             MirInst::Const(_, _) => vec![],
             MirInst::Var(_, _) => vec![],
+            MirInst::Copy(_, src) => vec![*src],
             MirInst::BinaryOp(_, lhs, _, rhs) => vec![*lhs, *rhs],
             MirInst::Call(_, _, args) => args.clone(),
             MirInst::MethodCall(_, receiver, _, args) => {
@@ -132,6 +134,7 @@ impl MirInst {
         match self {
             MirInst::Const(r, v) => MirInst::Const(*r, v.clone()),
             MirInst::Var(r, name) => MirInst::Var(*r, name.clone()),
+            MirInst::Copy(r, src) => MirInst::Copy(*r, m(*src)),
             MirInst::BinaryOp(r, l, op, rr) => MirInst::BinaryOp(*r, m(*l), op.clone(), m(*rr)),
             MirInst::Call(r, name, args) => {
                 MirInst::Call(*r, name.clone(), args.iter().map(|a| m(*a)).collect())
@@ -306,6 +309,7 @@ impl MirInst {
             | MirInst::Halt(_) => true,
             MirInst::Const(_, _)
             | MirInst::Var(_, _)
+            | MirInst::Copy(_, _)
             | MirInst::BinaryOp(_, _, _, _)
             | MirInst::Call(_, _, _)
             | MirInst::MethodCall(_, _, _, _)
@@ -347,6 +351,10 @@ pub fn dispatch(
         }
         MirInst::Var(dst, name) => {
             h_var(regs, *dst, name, env);
+            Ok(Flow::Continue)
+        }
+        MirInst::Copy(dst, src) => {
+            regs[*dst] = regs[*src].clone();
             Ok(Flow::Continue)
         }
         MirInst::BinaryOp(dst, l, op, r) => {

@@ -67,6 +67,11 @@ pub enum MirInst {
     // ── 值指令（产生结果到 dst 寄存器）──
     Const(Reg, Value),
     Var(Reg, String),
+    /// v0.75.79: 寄存器拷贝 dst = regs[src]（纯计算，零 env 访问）。
+    /// 表达式合并结果用：if/match 的分支值经 Copy 直写公共 dst，
+    /// 不再经 env 临时名（`__if_result`）传递 —— Assign 写未定义变量
+    /// 静默失败（env.assign 找不到绑定返回 false）导致分支值丢失。
+    Copy(Reg, Reg),
     BinaryOp(Reg, Reg, BinaryOp, Reg),
     /// 函数调用。callee 是名字（ExprKind::Call 的 callee 是 String），非寄存器
     Call(Reg, String, Vec<Reg>),

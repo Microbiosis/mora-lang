@@ -2,6 +2,26 @@
 
 All notable changes to Mora will be documented in this file.
 
+## [v0.75.79] — 2026-08-04 — if 结果寄存器化 + TaskDef 死寄存器清除
+
+修复 v0.75.78 记录的 pre-existing 两项（双路径行为一致缺陷）：
+
+- **if 结果值丢失**：if-else 表达式经 env 临时名 `__if_result` 传递——
+  该名从未 Define，`Environment::assign` 写未定义绑定返回 false 静默失败，
+  else 分支值丢失（`fn(n) if c {1} else {0} end` 的 pick(0) 返回 Nil）。
+  修复：新增纯计算指令 `MirInst::Copy(dst, src)`，分支值经 Copy 直写公共
+  dst（寄存器化，零 env 依赖），跳转使仅选中分支可达。`__if_result` 从
+  emit（parser_v3）与 lower 同时移除，差分等价保持。MatchExpr 无此问题
+  （arm 结果直接写 dst）。
+- **顶层 task n_regs 差 1**：lower 的 FnDef 分支为无 dst 字段的 TaskDef
+  指令分配死寄存器（`let _dst = lower_expr` 丢弃）。修复：TaskDef 不再
+  alloc_reg，返回 0。差分等价断言此前仅避开顶层 task，现直接覆盖。
+
+回归测试：compile_differential 新增 compile_equivalent_top_level_task_and_if_value
+（差分等价：顶层 task + if 值指令序列/n_regs）+ compile_run_if_value_passed_by_register
+（运行回归：pick(3)=1、pick(0)=0）。验证：全量测试绿（docker 依赖 skip）+
+clippy `-D warnings` 0 + fmt 0。
+
 ## [v0.75.78] — 2026-08-04 — compile 主路径嵌套构造缺口修复
 
 实际 exe 运行嵌套控制流暴露 compile 主路径（v0.75.40+）的解析缺口——

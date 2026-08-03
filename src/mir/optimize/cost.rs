@@ -82,6 +82,7 @@ impl CostModel for TokenEstimate {
             // 基础值指令：值本身的 token 成本
             MirInst::Const(_, v) => self.value_cost(v),
             MirInst::Var(_, _) => 1,
+            MirInst::Copy(_, _) => 1,
             // 二元运算：常量输入 → 可折叠为 Const
             MirInst::BinaryOp(_, _, _, _) => 3, // 折叠前 3 token，折叠后 1 token
             // 函数调用：name + args 的 token 总和

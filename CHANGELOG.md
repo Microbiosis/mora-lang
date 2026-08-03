@@ -2,6 +2,23 @@
 
 All notable changes to Mora will be documented in this file.
 
+## [v0.75.55] — 2026-08-03 — compress/json.rs 分层拆子模块（模块化）
+
+SmartCrusher 按既有四层结构拆分子模块，纯搬移零行为变更：
+
+- `detect.rs`（301）：字段角色检测器（extract_field_stats/detect_field_role/
+  detect_{id,score,temporal,error,anomaly}）+ ArrayType 判定
+- `strategies.rs`（202）：5 种压缩策略（TopN/TimeSeries/ClusterSample/
+  SmartSample/Lossless）+ apply_all/finalize
+- `constraints.rs`（123）：3 种安全约束（KeepErrors/KeepOutliers/
+  KeepBoundary）+ z-score 异常检测
+- `json.rs`（1516→921）：保留共享定义（FieldRole/FieldStats/ArrayType/
+  Strategy/Constraint/CrushResult/ERROR_KEYWORDS）+ 主入口 + 测试区
+- 依赖方向 detect ← strategies ← constraints 单向下行；pub re-export 不变
+
+验证：全量 790 绿（skip 3 个 Windows 挂起基线）+ compress 30 测试全绿 +
+clippy 0 + fmt 0。
+
 ## [v0.75.54] — 2026-08-03 — builtins/mod.rs 残余拆分（模块化收尾）
 
 P7 拆 domain 遗留两处结构问题，本次清零：

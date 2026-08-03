@@ -1,9 +1,9 @@
 //! v0.75.60: 自 opt.rs 按 pass 组拆出（D6 单文件惯例）。
 //! TailCallOpt pass 实现。
 
-use crate::mir::ssa::MirSsaFunction;
-
 use super::*;
+
+use crate::mir::ssa::MirSsaFunction;
 
 pub(super) fn tail_call_optimize(ssa: &mut MirSsaFunction) {
     // 收集尾调用位置（先只读，再写入，避免借位冲突）

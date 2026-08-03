@@ -1,11 +1,13 @@
 //! v0.75.60: 自 opt.rs 按 pass 组拆出（D6 单文件惯例）。
 //! CopyProp pass 实现 + next_free_reg / replace_reg_in_terminator 辅助。
 
-use crate::mir::ssa::{MirSsaFunction, SsaInst, SsaReg, Terminator};
-
 use super::loops::apply_reg_replace;
+
 use super::simple::ssa_dst;
+
 use super::*;
+
+use crate::mir::ssa::{MirSsaFunction, SsaInst, SsaReg, Terminator};
 
 pub(super) fn next_free_reg(ssa: &MirSsaFunction) -> SsaReg {
     let mut max_reg = 0;

@@ -5,11 +5,11 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use super::{MirSignal, build_task_registry, run_main_task};
+
 use crate::mir::host::MirHost;
 use crate::mir::{MirFunction, MirInst};
 use crate::value::{Environment, Value};
-
-use super::{MirSignal, build_task_registry, run_main_task};
 
 // v0.59: DAG-aware MIR interpreter（原 dag_interp.rs）
 // ===================================================================

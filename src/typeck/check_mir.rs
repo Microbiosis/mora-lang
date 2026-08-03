@@ -11,12 +11,13 @@
 
 use std::collections::HashSet;
 
-use crate::mir::MirExpr;
-
 use super::TypeError;
+
 use super::hm::HMInference;
 
 use super::hm::TypeError as HmError;
+
+use crate::mir::MirExpr;
 
 ///  Run HM inference across the program (witness 输入) and return any
 ///  diagnostics. 阶段 3 目标形态：parse 直接产出 witness，typeck 直接

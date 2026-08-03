@@ -20,14 +20,13 @@
 //! v0.75.x: 参数类型从 `&mut Interpreter` 改为 `&mut dyn MirHost`（mir/host.rs），
 //! 解耦 mir ↔ interpreter 双向依赖。Interpreter 实现 MirHost。
 
-use crate::mir::host::MirHost;
-use crate::value::{Environment, Value};
-
-use super::{MirFunction, MirInst, cache};
-
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use super::{MirFunction, MirInst, cache};
+
+use crate::mir::host::MirHost;
+use crate::value::{Environment, Value};
 /// float 模式匹配容差（`pat_str = "float:x"` 时 |实际 - x| < 此值判等）。
 /// 与 eval 的 tolerance 语义一致：浮点比较用 epsilon 而非 ==。
 const FLOAT_PATTERN_EPSILON: f64 = 1e-9;

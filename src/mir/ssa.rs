@@ -13,10 +13,11 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
-use crate::common::BinaryOp;
-use crate::value::Value;
-
 use super::{MirFunction, MirInst};
+
+use crate::common::BinaryOp;
+
+use crate::value::Value;
 
 /// SSA 寄存器（每个定义点分配唯一版本号）
 pub type SsaReg = usize;

@@ -4,9 +4,9 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::mir::{MirFunction, MirInst};
-
 use super::{BlockId, MirSsaFunction, SsaInst, SsaReg, Terminator};
+
+use crate::mir::{MirFunction, MirInst};
 
 /// 寄存器复制方案：
 /// - SSA Copy(dst, src) → MIR: 通过 `Define`+`Var` 或 `Assign`+`Var` 中转

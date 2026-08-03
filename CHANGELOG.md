@@ -2,6 +2,20 @@
 
 All notable changes to Mora will be documented in this file.
 
+## [v0.75.73] — 2026-08-03 — 风格审计 D4/D5/D6 落地
+
+- **D6 模块头补全（18 文件）**：lexer/main（v0.01）+ interpreter/mod +
+  record×7 + lsp/providers×9（v0.25）——版本溯源 + 功能描述，与全仓
+  `//!` 惯例统一
+- **D5 expect 短消息补全（69 处/8 文件）**：32 个唯一短消息值（find/
+  list/parse/issue 等）改带语义消息。全部位于测试代码，改善 panic 定位
+- **D4 import 顺序定调**：实测格局 31 super-first（interpreter/lsp/
+  compress/cli 簇）+ 9 crate-first（mir 系）。唯一异类 mir/lower.rs
+  对齐到 crate-first——mir 系 9 文件全同向，interpreter 系 31 文件
+  不动（同簇同序，零跨簇强制）
+
+验证：全量 790 绿 + clippy `-D warnings` 0 + fmt 0。
+
 ## [v0.75.72] — 2026-08-03 — 架构审查修复：生产 unwrap 清零 + 前缀对齐
 
 architecture-reviewer 复查纠正 v0.75.64 审计范围偏差（35 会话文件 ≠ 全仓）：

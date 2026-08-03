@@ -182,10 +182,6 @@ impl CostModel for TokenEstimate {
             MirInst::Span { body, .. } => {
                 body.body.iter().map(|i| self.inst_cost(i)).sum::<u32>() + 5
             }
-            // Token 记录：按 content 长度计费
-            MirInst::RecordTokens { input, output } => {
-                (input.chars().count() / 4 + 1) as u32 + (output.chars().count() / 4 + 1) as u32
-            }
             // Prompt/Document section：递归 body
             MirInst::PromptSection { body, .. } => {
                 body.body.iter().map(|i| self.inst_cost(i)).sum::<u32>()
@@ -197,8 +193,7 @@ impl CostModel for TokenEstimate {
             MirInst::DynTrait { .. } => 3,
             // Eval 断言：按 expects 计费
             MirInst::Eval { expects, .. } => 5 + expects.len() as u32 * 3,
-            // 未实现/无操作指令
-            MirInst::Route(_) => 1,
+            // 无操作指令
             MirInst::Label(_) => 0,
         }
     }
@@ -337,15 +332,21 @@ mod tests {
     }
 
     #[test]
-    fn test_record_tokens_cost_by_length() {
+    fn test_eval_cost_by_expects_count() {
         let cost = TokenEstimate;
-        let small = MirInst::RecordTokens {
-            input: "hi".to_string(),
-            output: "ok".to_string(),
+        let small = MirInst::Eval {
+            name: "e1".to_string(),
+            given_reg: 0,
+            expects: vec![1],
+            tolerance: None,
+            replay_path: None,
         };
-        let large = MirInst::RecordTokens {
-            input: "this is a long input string".to_string(),
-            output: "this is a long output string".to_string(),
+        let large = MirInst::Eval {
+            name: "e2".to_string(),
+            given_reg: 0,
+            expects: vec![1, 2, 3],
+            tolerance: None,
+            replay_path: None,
         };
         assert!(cost.inst_cost(&large) > cost.inst_cost(&small));
     }

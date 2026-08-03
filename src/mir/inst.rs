@@ -108,10 +108,8 @@ impl MirInst {
             | MirInst::Rollback
             | MirInst::Worker { .. }
             | MirInst::Commit
-            | MirInst::Route(_)
             | MirInst::Observe { .. }
             | MirInst::Span { .. }
-            | MirInst::RecordTokens { .. }
             | MirInst::TraitDef { .. }
             | MirInst::ImplDef { .. }
             | MirInst::Orchestrate { .. }
@@ -206,10 +204,8 @@ impl MirInst {
             MirInst::Rollback => MirInst::Rollback,
             MirInst::Worker { .. } => self.clone(),
             MirInst::Commit => MirInst::Commit,
-            MirInst::Route(_) => self.clone(),
             MirInst::Observe { .. } => self.clone(),
             MirInst::Span { .. } => self.clone(),
-            MirInst::RecordTokens { .. } => self.clone(),
             MirInst::Save { path, value } => MirInst::Save {
                 path: m(*path),
                 value: m(*value),
@@ -285,7 +281,6 @@ impl MirInst {
             | MirInst::ReadBytesFile { .. }
             | MirInst::WriteBytesFile { .. }
             | MirInst::Orchestrate { .. }
-            | MirInst::RecordTokens { .. }
             | MirInst::Eval { .. }
             | MirInst::Import(_)
             | MirInst::TypeAlias { .. }
@@ -297,7 +292,6 @@ impl MirInst {
             | MirInst::TaskDef { .. }
             | MirInst::ToolDef { .. }
             | MirInst::SkillDef { .. }
-            | MirInst::Route(_)
             | MirInst::WithConfig { .. }
             | MirInst::Transaction { .. }
             | MirInst::Worker { .. }
@@ -462,7 +456,6 @@ pub fn dispatch(
             h_worker(interp, env, body)?;
             Ok(Flow::Continue)
         }
-        MirInst::Route(name) => Err(format!("route '{}' not implemented", name)),
         MirInst::Observe { config: _, body } => {
             h_observe(interp, env, body)?;
             Ok(Flow::Continue)
@@ -471,7 +464,6 @@ pub fn dispatch(
             h_span(interp, env, body)?;
             Ok(Flow::Continue)
         }
-        MirInst::RecordTokens { .. } => Ok(Flow::Continue),
         MirInst::Save { path, value } => {
             h_save(interp, env, regs, *path, *value)?;
             Ok(Flow::Continue)

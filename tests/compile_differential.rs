@@ -210,3 +210,74 @@ fn compile_closure_captures_top_level_binding() {
     mora::mir::vm::run_main_task(&func_arc, &mut interp, &mut env)
         .expect("run_main_task should succeed");
 }
+
+/// v0.75.81: 回归测试 — 事务块 commit 路径（compile 主路径运行）。
+/// 前端：transaction 块 + commit 语句（spec 9.3）。commit 为 no-op，
+/// body 正常执行（h_transaction run_isolated 得 Ok）。
+#[test]
+fn compile_run_transaction_commit() {
+    let src = "transaction\n  print(\"tx-body\")\n  commit\nend\nprint(\"done\")";
+    let (func, witnesses) = ParserV3::compile(src).expect("compile should succeed");
+    let type_errors = mora::typeck::check_mir::check_program_witnesses(&witnesses);
+    assert!(
+        type_errors.is_empty(),
+        "typeck should pass: {:?}",
+        type_errors
+    );
+    let mut interp = mora::interpreter::Interpreter::new();
+    let mut env = interp.take_env();
+    let func_arc = std::sync::Arc::new(func);
+    mora::mir::vm::run_mir(&func_arc, &mut interp, &mut env).expect("run_mir should not fail");
+    mora::mir::vm::run_main_task(&func_arc, &mut interp, &mut env)
+        .expect("run_main_task should succeed (commit path)");
+}
+
+/// v0.75.81: 回归测试 — 事务块 rollback + compensation 路径。
+/// rollback 使 h_transaction 执行 compensation 后抛 "Transaction rolled back"。
+#[test]
+fn compile_run_transaction_rollback() {
+    let src =
+        "transaction\n  rollback\ncompensation\n  print(\"compensated\")\nend\nprint(\"after\")";
+    let (func, _w) = ParserV3::compile(src).expect("compile should succeed");
+    let mut interp = mora::interpreter::Interpreter::new();
+    let mut env = interp.take_env();
+    let func_arc = std::sync::Arc::new(func);
+    // 顶层 transaction：Rollback 使 h_transaction 执行 compensation 后
+    // 抛错，经 run_mir 上抛（run_main_task 不达）。
+    let err = mora::mir::vm::run_mir(&func_arc, &mut interp, &mut env)
+        .expect_err("rollback must surface Transaction rolled back");
+    assert!(
+        err.contains("Transaction rolled back"),
+        "unexpected error: {}",
+        err
+    );
+}
+
+/// v0.75.81: 回归测试 — eval 断言语句（α.8 Eval 原语前端）。
+/// 语法：`eval ["name"] given_expr, expect1, expect2, ...`。
+/// 通过断言（given == expect）正常返回；失败断言返回错误。
+#[test]
+fn compile_run_eval_assertion() {
+    let src = "eval \"sanity\" 2 + 2, 4\nprint(\"ok\")";
+    let (func, _w) = ParserV3::compile(src).expect("compile should succeed");
+    let mut interp = mora::interpreter::Interpreter::new();
+    let mut env = interp.take_env();
+    let func_arc = std::sync::Arc::new(func);
+    mora::mir::vm::run_mir(&func_arc, &mut interp, &mut env).expect("run_mir should not fail");
+    mora::mir::vm::run_main_task(&func_arc, &mut interp, &mut env)
+        .expect("run_main_task should succeed (eval passes)");
+
+    // 失败断言：given != expect → 错误上抛（顶层语句，经 run_mir 上抛）
+    let src_bad = "eval \"bad\" 2 + 2, 5";
+    let (func_bad, _w2) = ParserV3::compile(src_bad).expect("compile should succeed");
+    let mut interp2 = mora::interpreter::Interpreter::new();
+    let mut env2 = interp2.take_env();
+    let arc2 = std::sync::Arc::new(func_bad);
+    let err = mora::mir::vm::run_mir(&arc2, &mut interp2, &mut env2)
+        .expect_err("failing eval must surface assertion error");
+    assert!(
+        err.contains("assertion failed"),
+        "unexpected error: {}",
+        err
+    );
+}

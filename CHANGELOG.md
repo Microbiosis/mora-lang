@@ -2,6 +2,36 @@
 
 All notable changes to Mora will be documented in this file.
 
+## [v0.75.81] — 2026-08-04 — 死指令处置：删 2 有替代 + 建 2 前端
+
+按「先查相同作用不同名字，无则构造前端」原则处置 4 个死 MirInst：
+
+**删除（有活替代，StreamFor 先例）**
+- **RecordTokens**：token 记录由 `TraceCollector::record_tokens`（trace_
+  collector.rs）+ `AiRuntime::record_tokens`（runtime/ai.rs）承担，AI
+  调用后真实记录（ai_helpers.rs）。从 enum + 6 张 match 表清除。
+- **Route**：路由由显式 API `Value::Router` + `.route()`/`.listen()`
+  （dispatch.rs）承担（v0.06.7 serve/http 关键字移除同一收敛方向）。
+
+**构造前端（无替代）**
+- **事务块（spec 9.3, Ballerina 启发）**：`transaction ... commit | rollback
+  [compensation ...] end` — 激活长期零构造的 Transaction/Rollback/Commit。
+  commit = no-op；rollback 使 h_transaction 执行 compensation 后抛
+  "Transaction rolled back"。顶层与嵌套（task 体）均可解析。
+- **eval 断言语句（α.8 Eval 原语前端，v0.25 Agent 行为回归测试）**：
+  `eval ["name"] given_expr, expect1, ...` — 经 h_eval 逐一比较，任一
+  不等报断言错误。tolerance/replay_path 保留（语法未暴露，Engine 可用）。
+
+实现：witness 复用 WitnessKind::Sequence（零新增变体，typeck/LSP 零改动）；
+transaction/commit/rollback/eval 经 peek_is_identifier 识别（lexer 不加
+关键字，try/while 先例）。cost.rs 死指令计费臂删除，RecordTokens 成本
+测试改为 Eval 等价测试。
+
+回归测试：compile_differential 新增 compile_run_transaction_commit /
+compile_run_transaction_rollback / compile_run_eval_assertion（含失败断言）。
+验证：全量测试绿（docker 依赖 skip）+ exe 实测（tx commit/rollback/
+compensation、eval 通过/失败）+ clippy `-D warnings` 0 + fmt 0。
+
 ## [v0.75.80] — 2026-08-04 — 整洁度修复：去静默 Nil 与空函数哨兵
 
 architecture-reviewer 代码整洁度审查（只读）驱动，修复 2 项掩盖缺陷 +

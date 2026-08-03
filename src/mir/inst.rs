@@ -6,10 +6,6 @@
 
 use std::collections::HashMap;
 
-use crate::mir::host::MirHost;
-use crate::mir::{MirFunction, MirInst, Reg};
-use crate::value::{Environment, Value};
-
 use super::handlers::{
     Flow, h_append_file, h_assign, h_binary_op, h_break, h_call, h_closure, h_const, h_continue,
     h_define, h_dict_lit, h_document_section, h_dyn_trait, h_enum_def, h_eval, h_halt, h_impl_def,
@@ -19,6 +15,12 @@ use super::handlers::{
     h_span, h_struct_def, h_trait_def, h_transaction, h_type_alias, h_var, h_with_config, h_worker,
     h_write_bytes_file, h_write_file,
 };
+
+use crate::mir::host::MirHost;
+
+use crate::mir::{MirFunction, MirInst, Reg};
+
+use crate::value::{Environment, Value};
 
 // ─── MirInst metadata — single source of truth ──────────────────────
 // v0.59: dst(), input_regs(), is_effect() + dispatch() all in one file.

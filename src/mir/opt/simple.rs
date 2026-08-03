@@ -3,10 +3,11 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::common::BinaryOp;
-use crate::value::Value;
-
 use super::*;
+
+use crate::common::BinaryOp;
+
+use crate::value::Value;
 
 pub(super) fn ssa_dst(inst: &SsaInst) -> SsaReg {
     match inst {

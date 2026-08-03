@@ -10,20 +10,30 @@
 //! - Control flow: return `Flow::Jump(label)` or `Flow::Return(value)`
 
 use std::collections::HashMap;
+
 use std::sync::Arc;
 
-use crate::common::BinaryOp;
-use crate::flow::eval_binary;
-use crate::mir::expr::{MirOrchestrateKind, MirPregelConfig};
-use crate::mir::host::MirHost;
-use crate::mir::vm::{index_value, run_mir, self_match_pattern};
-use crate::mir::{MirFunction, Reg};
-use crate::runtime::types::{TraitInfo, TraitMethodSig};
-use crate::value::{Environment, Value};
-
 use super::vm::index_assign_value;
+
 use super::vm::is_truthy;
+
 use super::vm::value_to_string;
+
+use crate::common::BinaryOp;
+
+use crate::flow::eval_binary;
+
+use crate::mir::expr::{MirOrchestrateKind, MirPregelConfig};
+
+use crate::mir::host::MirHost;
+
+use crate::mir::vm::{index_value, run_mir, self_match_pattern};
+
+use crate::mir::{MirFunction, Reg};
+
+use crate::runtime::types::{TraitInfo, TraitMethodSig};
+
+use crate::value::{Environment, Value};
 
 /// What the linear interpreter should do after a handler runs.
 #[derive(Debug)]

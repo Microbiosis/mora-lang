@@ -2,6 +2,20 @@
 
 All notable changes to Mora will be documented in this file.
 
+## [v0.75.63] — 2026-08-03 — flow.rs 拆 flow/json.rs（模块化）
+
+flow.rs（773 → 521 行）拆出独立 JSON 编解码器：
+
+- `flow/json.rs`（259）— json_to_value（手写递归解析：list/dict/bool/
+  null/number/string + skip_ws）+ value_to_json（序列化）
+- 边界：JSON 段零 flow 依赖（纯 Value 转换，只用 Value + HashMap）
+- `pub use json::{json_to_value, value_to_json}` 保持 flow:: 路径
+  （8 个外部调用方零改动）
+- 单文件模块 → 目录模块
+
+纯搬移零行为变更。验证：全量 790 绿（skip 3 个 Windows 挂起基线）+
+clippy 0 + fmt 0。
+
 ## [v0.75.62] — 2026-08-03 — value.rs 拆 value/display.rs（模块化）
 
 value.rs（1376 → 1213 行）拆出纯格式化段：

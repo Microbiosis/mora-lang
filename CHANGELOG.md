@@ -2,6 +2,27 @@
 
 All notable changes to Mora will be documented in this file.
 
+## [v0.75.54] — 2026-08-03 — builtins/mod.rs 残余拆分（模块化收尾）
+
+P7 拆 domain 遗留两处结构问题，本次清零：
+
+- **生产代码归属错位**：markdown 辅助函数（markdown_memory_dir/remember/
+  recall/list + 日期工具，203 行）住在 mod.rs 却只被 memory.rs 使用 →
+  迁 memory.rs
+- **实现与入口分离**：exec_parallel/ParallelResult/Semaphore 等 375 行实现
+  留在 mod.rs，call_exec_method 入口已在 exec.rs → 迁 exec.rs
+
+迁移明细：
+- `memory.rs`（144→527）：markdown 辅助 + memory 部分 7 测试
+- `exec.rs`（15→616）：exec 实现 + tests_v043_exec 9 测试
+- `event.rs`（87→179）：bus 测试迁入（6 测试）
+- `mod.rs`（3319→2242）：**残余生产代码清零**，仅剩历史测试聚合
+- `ccr.rs`：+`use crate::ccr::CcrStore` 自包含（此前经 mod.rs 顶层 use
+  隐式继承，唯一非纯搬移改动，语义等价）
+
+验证：全量 790 绿（skip 3 个 Windows 挂起基线）+ 迁移 45 测试全绿 +
+clippy 0 + fmt 0；memory/exec 冒烟与 HEAD 行为一致。
+
 ## [v0.75.53] — 2026-08-03 — Phase 2 架构重构 P9：main.rs 拆 cli/（D6 单文件惯例）
 
 main.rs 从 1117 行瘦身至 415 行——CLI 子命令整体迁入 lib crate 的

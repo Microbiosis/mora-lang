@@ -3,20 +3,18 @@
 //! 寄存器式线性指令序列。AST → MIR lowering 产物，也是 MIR 解释器执行格式。
 //! SSA 构造 pass（MIR-plain → MIR-ssa）在 α.3 加入，此处先只有 MIR-plain。
 //!
-//! α.0 覆盖范围：Const / Var / BinaryOp / Call / Define / Assign /
+//! α.0 覆盖范围：Const / Var / Copy / BinaryOp / Call / Define / Assign /
 //! IndexAssign / Expr / Label / Jump / JumpIf / JumpIfNot / Return / Break /
 //! Continue / ListLit / DictLit / Index / MethodCall / Pipe / Prompt /
-//! MatchArm / TaskDef / ToolDef / Import / WithConfig / StreamFor
+//! MatchArm / TaskDef / ToolDef / Import / WithConfig
+//! （StreamFor 已于 v0.75.26 删除，见下）
 //!
-//! 对应 AST：
-//! - ExprKind: Literal/Variable/Binary/Pipe/Call/MethodCall/Index/Closure/Match/
-//!   Prompt/RouteCall/AiModelCall/Question/NamespaceRef/DynTrait/Grouping/List/
-//!   Dict/Borrow/BorrowMut/Command/Send (22 variants)
-//! - StmtKind: Let/Assign/IndexAssign/TaskDef/If/For/Return/Import/Parallel/Match/
-//!   Save/Load/ReadFile/WriteFile/AppendFile/ReadBytesFile/WriteBytesFile/Expr/
-//!   With/StreamFor/ToolDef/Break/Continue/Route/Observe/Span/RecordTokens/TraitDef/
-//!   ImplDef/Worker/Send/Receive/Transaction/Commit/Rollback/MacroDef/TypeAlias/
-//!   Export/ReExport (37 variants)
+//! v0.75.79: 新增 Copy(dst, src) 纯寄存器拷贝 — if 表达式结果寄存器化
+//! （不再经 env 临时名 `__if_result` 传递）。
+//!
+//! v0.75.26: StreamFor 已删除 — 死原语（零构造点、零测试引用、语义被
+//! ai.chat 的 stream:true 参数路径取代；handler 空转：prompt_reg/var 被忽略、
+//! body 仅执行一次并丢弃）。流式语义若需 MIR 指令级支持，重新设计而非复活旧形状。
 
 use crate::common::BinaryOp;
 use crate::value::Value;
@@ -124,7 +122,8 @@ pub enum MirInst {
         body: Box<MirFunction>,
     },
     /// α.12: dyn Trait 包装。解释器构造 Value::TraitObject { data, trait_name }。
-    /// vtable 派发由  处理（call_method 命中 TraitObject 分支）。
+    /// vtable 派发由 call_method 的 TraitObject 分支经 dispatch_trait_method
+    /// 处理。
     DynTrait {
         dst: Reg,
         src: Reg,

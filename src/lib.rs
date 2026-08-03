@@ -1,6 +1,6 @@
 //! Mora 标准库（v11+ 拆出）
 //!
-//! 暴露 lexer / parser / ast / interpreter / typeck / lsp 六个模块，
+//! 暴露 lexer / parser_v3 / interpreter / typeck / mir / lsp 等模块，
 //! 让 CLI binary（src/main.rs）和 LSP server binary（src/bin/lsp.rs）共享。
 
 /// v0.51: 版本号叙事的单一真相源。

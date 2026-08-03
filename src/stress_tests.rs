@@ -367,6 +367,5 @@ mod tests {
         }
         // 100 threads * 100 puts = 10000 puts on 1000-cap cache → cap enforced
         assert_eq!(cache.lock().unwrap().len(), 1000);
-        let _ = Duration::from_secs(5);
     }
 }

@@ -104,6 +104,12 @@ pub fn value_to_string(v: &Value) -> String {
     }
 }
 
+/// 值真值判定（MIR 线性执行：h_jump_if / h_jump_if_not）。
+///
+/// 注意与 `crate::flow::is_truthy` 的语义差异：本实现 List/Dict 恒真
+/// （不判空），而 flow 版对 List/Dict 判非空（`!l.is_empty()`）——后者
+/// 用于 DAG Branch 条件（vm/dag.rs）。两处语义分叉是历史残留，收敛前
+/// 修改任一方必须同步另一方并更新对应测试。
 pub fn is_truthy(v: &Value) -> bool {
     match v {
         Value::Bool(b) => *b,
@@ -309,9 +315,6 @@ pub enum MirSignal {
 /// （vote_to_halt）信号，导致 Pregel 引擎的 vertex_state 永远无法置为
 /// Halted。现在通过 `run_dag_with_signal` 真正传播 Return/Halt。
 ///
-/// v0.75.9: 接收 `&Arc<MirFunction>`，优化后 DAG 走全局缓存
-/// （`cache::global_dag_cache().get_or_build`），同一 Arc 跨调用复用，
-/// 不再每次 `dag_analyze + dag_optimize + prune_sequence_edges` 全量重建。
 /// v0.75.9: 接收 `&Arc<MirFunction>`，优化后 DAG 走全局缓存
 /// （`cache::global_dag_cache().get_or_build`），同一 Arc 跨调用复用，
 /// 不再每次 `dag_analyze + dag_optimize + prune_sequence_edges` 全量重建。

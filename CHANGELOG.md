@@ -2,6 +2,21 @@
 
 All notable changes to Mora will be documented in this file.
 
+## [v0.75.64] — 2026-08-03 — 约束审计：生产代码裸 unwrap 清零
+
+AGENTS.md「生产代码避免 unwrap()」审计——扫描全部 35 个模块化会话
+创建/修改文件：
+
+- 生产代码仅 1 处裸 unwrap：`loops.rs:45 pre_header.unwrap()`（licm
+  pass，v0.75.6 既有代码，v0.75.60 搬移时未顺手修）
+- 其余全部位于 `#[cfg(test)]` 测试区（测试 unwrap 为 Rust 惯例，不违反
+  生产代码约束）
+- 修复：is_none 检查 + unwrap 合并为 let-else（行为等价：None →
+  continue），消除双重判断与 panic 面
+
+验证：全量 790 绿（skip 3 个 Windows 挂起基线）+ opt 60 测试绿 +
+clippy `-D warnings` 0 + fmt 0。
+
 ## [v0.75.63] — 2026-08-03 — flow.rs 拆 flow/json.rs（模块化）
 
 flow.rs（773 → 521 行）拆出独立 JSON 编解码器：

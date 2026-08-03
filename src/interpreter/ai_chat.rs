@@ -443,6 +443,20 @@ impl Interpreter {
             return Ok(Value::String(cached.clone()));
         }
 
+        self.send_with_retry(messages, api_key, model, base_url, &cache_key)
+    }
+
+    /// v0.75.67: 请求发送 + retry 循环（从 real_ai_chat_inner 拆出）。
+    /// 构造（messages JSON/body/url/agent）与发送（exponential backoff + jitter）
+    /// 两阶段分离；返回成功响应或带重试的错误。
+    fn send_with_retry(
+        &mut self,
+        messages: &[(String, String)],
+        api_key: &str,
+        model: &str,
+        base_url: &str,
+        cache_key: &str,
+    ) -> Result<Value, String> {
         // 构建 messages JSON 数组
         let msgs_json: String = messages
             .iter()
@@ -536,7 +550,7 @@ impl Interpreter {
                                     .ai_cache
                                     .lock()
                                     .expect("ai_cache poisoned")
-                                    .put(cache_key.clone(), s.clone());
+                                    .put(cache_key.to_string(), s.clone());
                             }
                             return Ok(result);
                         }
@@ -573,7 +587,6 @@ impl Interpreter {
         }
         Err("ai.chat: retry loop exited without result".to_string())
     }
-
     /// 带工具调用的 AI 对话（支持 tool_calls 自动循环）
     pub(super) fn real_ai_chat_with_tools(
         &mut self,

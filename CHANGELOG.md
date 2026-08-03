@@ -2,6 +2,21 @@
 
 All notable changes to Mora will be documented in this file.
 
+## [v0.75.72] — 2026-08-03 — 架构审查修复：生产 unwrap 清零 + 前缀对齐
+
+architecture-reviewer 复查纠正 v0.75.64 审计范围偏差（35 会话文件 ≠ 全仓）：
+
+- **生产裸 unwrap 全仓清零（8 处）**：rule.rs/search.rs 冗余双查合并为
+  `if let`；mora.rs/refine/mod.rs（ok_or 无 panic 面）/toolplane/mod.rs/
+  dag.rs/html.rs 补 expect/ok_or。校验：全仓 src/ 非测试范围 = 0
+- **错误前缀对齐**：toolplane.rs `tool.plane.*` → `toolplane.*`（14 处，
+  与 from_name 分派键一致）；ai_tokens.rs 头 `ai_tokens.*` → `ai.tokens.*`
+- **import 分组定调**：不强制统一——实测两簇各自 100% 自洽（mir 系
+  9 文件 crate-first、interpreter 系 31 文件 super-first），强统一改 40
+  文件零收益，保持按簇惯例
+
+验证：全量 790 绿 + clippy `-D warnings` 0 + fmt 0。
+
 ## [v0.75.71] — 2026-08-03 — 代码风格统一：opt pass 文件头 // → //!
 
 代码风格审计发现 v0.75.60 拆 opt.rs 时 5 个 pass 文件头用了普通注释

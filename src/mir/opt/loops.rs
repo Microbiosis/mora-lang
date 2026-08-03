@@ -38,11 +38,10 @@ pub(super) fn loop_invariant_motion(ssa: &mut MirSsaFunction) {
             continue;
         }
 
-        let pre_header = find_pre_header(&ssa.blocks, header, &dominated, &natural_loop);
-        if pre_header.is_none() {
+        let Some(pre_header) = find_pre_header(&ssa.blocks, header, &dominated, &natural_loop)
+        else {
             continue;
-        }
-        let pre_header = pre_header.unwrap();
+        };
 
         // 收集 loop 内定义的 reg 集合
         let mut loop_defs: HashSet<SsaReg> = HashSet::new();

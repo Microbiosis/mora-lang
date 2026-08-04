@@ -250,6 +250,7 @@ fn run_single_cmd(
     // 进程组隔离 (mini-swe-agent v1 风格, 防止 orphaned 进程)
     #[cfg(unix)]
     {
+        use std::os::unix::process::CommandExt;
         // SAFETY: pre_exec 在 fork 后, exec 前执行
         // 仅调用 libc::setpgid, 不分配内存, 不持有锁
         unsafe {

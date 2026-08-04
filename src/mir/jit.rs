@@ -985,7 +985,13 @@ fn try_compile(func: &MirFunction) -> Result<(ExecMem, Reg), JitError> {
             "control-flow jump target out of range".into(),
         ));
     }
-    let bytes = code.finish_bail(&emit_bail_block());
+    // emit_bail_block 仅在 x86_64 上定义；aarch64 上空 bail 块不会执行——
+    // L853 cfg!(target_arch) 提前 return CompileReject，runtime 不可达。
+    #[cfg(target_arch = "x86_64")]
+    let bail_bytes: &[u8] = &emit_bail_block();
+    #[cfg(not(target_arch = "x86_64"))]
+    let bail_bytes: &[u8] = &[];
+    let bytes = code.finish_bail(bail_bytes);
     // W^X：先 RW 写入，再切 RX（见 ExecMem::make_exec）。
     let mut mem = ExecMem::alloc_rw(bytes.len())
         .ok_or_else(|| JitError::InternalInvariant("executable memory allocation failed".into()))?;

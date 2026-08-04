@@ -626,7 +626,6 @@ pub fn h_orchestrate(
     result_var: &str,
     kind: &MirOrchestrateKind,
 ) -> Result<(), String> {
-    use crate::pregel::MirPregelEngine;
     match kind {
         MirOrchestrateKind::Pregel {
             agents,
@@ -646,61 +645,22 @@ pub fn h_orchestrate(
                 aggregators: Vec::new(),
                 master_compute: None,
             };
-            let mut engine = MirPregelEngine::new(config);
-
-            // v0.66: Wire PersistRuntime's checkpoint saver into the engine
-            // so the auto-save block in BSP ADVANCE actually persists.
-            if let Some(saver) = interp.checkpoint_saver() {
-                engine = engine.with_checkpoint_saver(saver);
-            }
-
-            // v0.63: Resume from checkpoint if available
-            let thread_id = "pregel"; // matches build_checkpoint default
-            if let Ok(Some(cp)) = interp.load_checkpoint(thread_id) {
-                engine.restore_checkpoint(&cp);
-            }
-
-            // Only init channels if starting fresh (not restored)
-            if engine.current_step == 0 {
-                let input_val = env.get(input_var).unwrap_or(Value::Nil);
-                let mut initial = HashMap::new();
-                initial.insert(input_var.to_string(), input_val);
-                engine.init_channels(initial);
-            }
-
-            // v0.62: Collect conflicts via callback for exposure in result
-            let captured: std::sync::Arc<parking_lot::Mutex<Vec<crate::value::Conflict>>> =
-                std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
-            let cb_captured = captured.clone();
-            engine = engine.with_conflict_callback(std::sync::Arc::new(move |c| {
-                cb_captured.lock().push(c.clone());
-                true // always continue
-            }));
-
-            // v0.69: Flush dynamic_sends into engine before run
-            let pending = std::mem::take(interp.dynamic_sends());
-            engine.flush_pending_sends(pending);
-            let result = engine.run(interp)?;
-
-            // v0.62: Expose conflicts as a structured list
-            let conflict_list: Vec<Value> = captured
-                .lock()
-                .iter()
-                .map(|c| {
-                    let mut d: HashMap<String, Value> = HashMap::new();
-                    d.insert("key".into(), Value::String(c.key.clone()));
-                    d.insert("parent_value".into(), c.parent_value.clone());
-                    d.insert("child_value".into(), c.child_value.clone());
-                    Value::Dict(d)
-                })
-                .collect();
-            env.define(
-                format!("{}_conflicts", result_var),
-                Value::List(conflict_list),
-                false,
-            );
-            env.define(result_var.to_string(), result, false);
-            Ok(())
+            run_pregel_config(interp, env, config, input_var, result_var)
+        }
+        // v0.75.84: MoA（Mixture-of-Agents，arXiv:2406.04692）— 展开为
+        // pregel 图：每层 L = [N 个 proposer 并行 ai.chat] → [聚合 agent
+        // 综合]。proposer 结果经 aggregate（Concat）提交，聚合 agent 读
+        // input_aggregator_layer_{L}_responses 综合；聚合结果写 result
+        // channel，下一层 proposer 读上一层的 responses channel 继续。
+        // 复用 v0.75.83 aggregate 缓冲通道 + pregel BSP，零新引擎机制。
+        MirOrchestrateKind::Moa {
+            layers,
+            proposers,
+            aggregator,
+            prompt,
+        } => {
+            let config = build_moa_config(*layers, proposers, aggregator, prompt, input_var)?;
+            run_pregel_config(interp, env, config, input_var, result_var)
         }
         MirOrchestrateKind::Sequential { agents } => {
             // v0.75.34: Sequential orchestrate 执行 — 按声明顺序逐个执行
@@ -739,6 +699,420 @@ pub fn h_orchestrate(
             Ok(())
         }
         other => Err(format!("orchestrate({:?}) not yet supported", other)),
+    }
+}
+
+/// v0.75.84: pregel 图执行公共路径（Pregel / Moa 共用）。
+/// 从 h_orchestrate Pregel 分支提取：checkpoint 恢复、input 通道初始化、
+/// 冲突回调、dynamic_sends flush、run、result 绑定。
+fn run_pregel_config(
+    interp: &mut dyn MirHost,
+    env: &mut Environment,
+    config: crate::mir::expr::MirPregelConfig,
+    input_var: &str,
+    result_var: &str,
+) -> Result<(), String> {
+    use crate::pregel::MirPregelEngine;
+    let mut engine = MirPregelEngine::new(config);
+
+    // v0.75.84: 注入执行环境（含 builtin ai 等）— pregel agent 的 env
+    // 单一来源；不注入时回落 interpreter.environment()（单测路径）。
+    // `__moa_input` 携带 input_var 原始值（agent env 的 `input` 是 pregel
+    // delta JSON，MoA 首层 proposer 的 `{input}` 插值需要真值）。
+    let mut base_env = env.clone();
+    if let Some(v) = env.get(input_var) {
+        base_env.define("__moa_input".to_string(), v, false);
+    }
+    engine = engine.with_base_env(std::sync::Arc::new(parking_lot::Mutex::new(base_env)));
+
+    // v0.66: Wire PersistRuntime's checkpoint saver into the engine
+    // so the auto-save block in BSP ADVANCE actually persists.
+    if let Some(saver) = interp.checkpoint_saver() {
+        engine = engine.with_checkpoint_saver(saver);
+    }
+
+    // v0.63: Resume from checkpoint if available
+    let thread_id = "pregel"; // matches build_checkpoint default
+    if let Ok(Some(cp)) = interp.load_checkpoint(thread_id) {
+        engine.restore_checkpoint(&cp);
+    }
+
+    // Only init channels if starting fresh (not restored)
+    if engine.current_step == 0 {
+        let input_val = env.get(input_var).unwrap_or(Value::Nil);
+        let mut initial = HashMap::new();
+        initial.insert(input_var.to_string(), input_val);
+        engine.init_channels(initial);
+    }
+
+    // v0.62: Collect conflicts via callback for exposure in result
+    let captured: std::sync::Arc<parking_lot::Mutex<Vec<crate::value::Conflict>>> =
+        std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let cb_captured = captured.clone();
+    engine = engine.with_conflict_callback(std::sync::Arc::new(move |c| {
+        cb_captured.lock().push(c.clone());
+        true // always continue
+    }));
+
+    // v0.69: Flush dynamic_sends into engine before run
+    let pending = std::mem::take(interp.dynamic_sends());
+    engine.flush_pending_sends(pending);
+    let result = engine.run(interp)?;
+
+    // v0.62: Expose conflicts as a structured list
+    let conflict_list: Vec<Value> = captured
+        .lock()
+        .iter()
+        .map(|c| {
+            let mut d: HashMap<String, Value> = HashMap::new();
+            d.insert("key".into(), Value::String(c.key.clone()));
+            d.insert("parent_value".into(), c.parent_value.clone());
+            d.insert("child_value".into(), c.child_value.clone());
+            Value::Dict(d)
+        })
+        .collect();
+    env.define(
+        format!("{}_conflicts", result_var),
+        Value::List(conflict_list),
+        false,
+    );
+    env.define(result_var.to_string(), result, false);
+    Ok(())
+}
+
+// ─── v0.75.84: MoA（Mixture-of-Agents）pregel 图展开 ─────────────────
+// 每层 L（1..=layers）：
+//   超步 1: N 个 proposer agent 并行 `ai.chat(prompt_L, {model})` →
+//           aggregate layer_{L}_responses（Concat）→ result channel
+//   超步 2: 聚合 agent 读 input_aggregator_layer_{L}_responses，
+//           `ai.chat(Synthesize: {responses}, {model: aggregator})` → result
+// 边：@start → p_{1}_*；p_{L}_i → agg_L；agg_L → p_{L+1}_*；agg_layers → @exit
+// 末层聚合结果 = engine.run 返回的 result channel。
+// task_body 指令经 Rust 侧构造（MirInst 序列，与 parser emit 语义一致）。
+
+/// 构造 MoA 展开的 pregel 图配置。
+fn build_moa_config(
+    layers: usize,
+    proposers: &[String],
+    aggregator: &str,
+    prompt: &crate::mir::expr::MirExpr,
+    input_var: &str,
+) -> Result<crate::mir::expr::MirPregelConfig, String> {
+    use crate::mir::expr::{MirEdgeDef, MirPregelConfig};
+    if proposers.is_empty() {
+        return Err("moa: proposers list must not be empty".to_string());
+    }
+    if layers == 0 {
+        return Err("moa: layers must be >= 1".to_string());
+    }
+
+    let mut agents = Vec::new();
+    let mut edges = Vec::new();
+
+    // 首层 proposer 接入 @start；层间经聚合 agent 传递。
+    for l in 1..=layers {
+        for (i, model) in proposers.iter().enumerate() {
+            let pname = format!("p_{}_{}", l, i + 1);
+            let body = build_proposer_body(l, i, model, prompt, input_var);
+            agents.push(crate::mir::expr::MirAgentDef {
+                name: pname.clone(),
+                task_expr: prompt.clone(),
+                verify_expr: None,
+                with_config: None,
+                task_body: body,
+                combiner_body: None,
+            });
+            // 边：首层从 @start，其余层从前一层聚合 agent
+            let from = if l == 1 {
+                "@start".to_string()
+            } else {
+                format!("agg_{}", l - 1)
+            };
+            edges.push(MirEdgeDef {
+                from,
+                to: pname.clone(),
+                condition_expr: None,
+                condition_body: None,
+            });
+            // 每 proposer → 本层聚合 agent
+            edges.push(MirEdgeDef {
+                from: pname,
+                to: format!("agg_{}", l),
+                condition_expr: None,
+                condition_body: None,
+            });
+        }
+        // 聚合 agent：读 layer_{L}_response_*（proposer Define 合并进共享 env）
+        let aname = format!("agg_{}", l);
+        let body = build_aggregator_body(l, aggregator, proposers.len());
+        agents.push(crate::mir::expr::MirAgentDef {
+            name: aname.clone(),
+            task_expr: prompt.clone(),
+            verify_expr: None,
+            with_config: None,
+            task_body: body,
+            combiner_body: None,
+        });
+        // 末层聚合 → @exit；其余层 → 下一层 proposer（上面边已建）
+        if l == layers {
+            edges.push(MirEdgeDef {
+                from: aname,
+                to: "@exit".to_string(),
+                condition_expr: None,
+                condition_body: None,
+            });
+        }
+    }
+
+    Ok(MirPregelConfig {
+        agents,
+        edges,
+        state_schema: vec![],
+        checkpoint: None,
+        interrupt_points: vec![],
+        adjacency: HashMap::new(),
+        // v0.75.84: MoA 走共享 env 合并投递（reconcile 将 proposer Define 的
+        // layer_*_response_* 合并回共享 env，聚合 agent 经 parent 链读取）—
+        // 版本快照机制对首次执行不投递 delta 通道，aggregate 通道路径不可靠。
+        aggregators: Vec::new(),
+        master_compute: None,
+    })
+}
+
+/// proposer task_body：
+///   prompt → ai.chat(prompt, {model}) → Define(layer_{L}_response_{idx})
+///   结果经 reconcile_outcome 合并回共享 env，聚合 agent 经 parent 链读取
+///   （版本快照机制对首次执行不投递 delta 通道，共享 env 合并是可靠路径）。
+fn build_proposer_body(
+    layer: usize,
+    proposer_idx: usize,
+    model: &str,
+    prompt: &crate::mir::expr::MirExpr,
+    input_var: &str,
+) -> MirFunction {
+    let mut body: Vec<crate::mir::MirInst> = Vec::new();
+    let mut nxt = 0usize;
+    let alloc = |nxt: &mut usize| {
+        let r = *nxt;
+        *nxt += 1;
+        r
+    };
+
+    // 所有层：先把 `input` 覆盖为 __moa_input（base_env 注入的 input_var
+    // 原始值）—— pregel 把 `input` 注入为 delta JSON，用户 prompt 的
+    // `{input}` 插值需要真值。
+    let input_val_reg = alloc(&mut nxt);
+    body.push(crate::mir::MirInst::Var(
+        input_val_reg,
+        "__moa_input".to_string(),
+    ));
+    body.push(crate::mir::MirInst::Define(
+        "input".to_string(),
+        input_val_reg,
+    ));
+
+    let prompt_reg = if layer == 1 {
+        // L=1: 用户 prompt 表达式 lower 的指令序列放 body 开头（寄存器从 0）。
+        let lowered = crate::mir::lower::lower_mir_exprs(std::slice::from_ref(prompt))
+            .unwrap_or_else(|_| MirFunction {
+                params: vec![],
+                body: vec![],
+                n_regs: 0,
+            });
+        body.extend(lowered.body.iter().cloned());
+        nxt = nxt.max(lowered.n_regs);
+        lowered
+            .body
+            .last()
+            .and_then(|i| i.dst())
+            .unwrap_or_else(|| {
+                let r = alloc(&mut nxt);
+                body.push(crate::mir::MirInst::Const(r, Value::String(String::new())));
+                r
+            })
+    } else {
+        // L>1: 用户 prompt + 前层聚合结果（agg_{L-1} Define 的 agg_result_{L-1}）
+        let lowered = crate::mir::lower::lower_mir_exprs(std::slice::from_ref(prompt))
+            .unwrap_or_else(|_| MirFunction {
+                params: vec![],
+                body: vec![],
+                n_regs: 0,
+            });
+        body.extend(lowered.body.iter().cloned());
+        nxt = nxt.max(lowered.n_regs);
+        let user_prompt_reg = lowered
+            .body
+            .last()
+            .and_then(|i| i.dst())
+            .unwrap_or_else(|| {
+                let r = alloc(&mut nxt);
+                body.push(crate::mir::MirInst::Const(r, Value::String(String::new())));
+                r
+            });
+        let sep = alloc(&mut nxt);
+        body.push(crate::mir::MirInst::Const(
+            sep,
+            Value::String("\n\nPrevious layer response: ".to_string()),
+        ));
+        let prev = alloc(&mut nxt);
+        body.push(crate::mir::MirInst::Var(
+            prev,
+            format!("agg_result_{}", layer - 1),
+        ));
+        let joined = alloc(&mut nxt);
+        body.push(crate::mir::MirInst::BinaryOp(
+            joined,
+            user_prompt_reg,
+            crate::common::BinaryOp::Add,
+            sep,
+        ));
+        let joined2 = alloc(&mut nxt);
+        body.push(crate::mir::MirInst::BinaryOp(
+            joined2,
+            joined,
+            crate::common::BinaryOp::Add,
+            prev,
+        ));
+        joined2
+    };
+
+    let ai_reg = alloc(&mut nxt);
+    body.push(crate::mir::MirInst::Var(ai_reg, "ai".to_string()));
+
+    let dict_reg = alloc(&mut nxt);
+    let mut cfg = HashMap::new();
+    cfg.insert("model".to_string(), Value::String(model.to_string()));
+    body.push(crate::mir::MirInst::Const(dict_reg, Value::Dict(cfg)));
+
+    let res_reg = alloc(&mut nxt);
+    body.push(crate::mir::MirInst::MethodCall(
+        res_reg,
+        ai_reg,
+        "chat".to_string(),
+        vec![prompt_reg, dict_reg],
+    ));
+
+    // v0.75.84: 结果 Define 到私有 env → reconcile 合并回共享 env
+    //（聚合 agent 读取的唯一可靠路径；版本快照对首次执行不投递 delta）。
+    // 1-based 命名（聚合侧按 "1. " 编号展示）。
+    body.push(crate::mir::MirInst::Define(
+        format!("layer_{}_response_{}", layer, proposer_idx + 1),
+        res_reg,
+    ));
+
+    let _ = input_var;
+    MirFunction {
+        params: vec![],
+        body,
+        n_regs: nxt.max(1),
+    }
+}
+
+/// 聚合 agent task_body：
+///   读 layer_{L}_response_{1..N}（proposer Define 合并进共享 env）→ 拼接 →
+///   ai.chat("Synthesize...: " + responses, {model}) → Define(agg_result_L)
+///   （末层聚合结果 = engine.run 返回的 result channel = agg_layers 的 result）。
+fn build_aggregator_body(layer: usize, aggregator: &str, n_proposers: usize) -> MirFunction {
+    let mut body: Vec<crate::mir::MirInst> = Vec::new();
+    let mut nxt = 0usize;
+    let alloc = |nxt: &mut usize| {
+        let r = *nxt;
+        *nxt += 1;
+        r
+    };
+
+    // 拼接所有 proposer 响应："1. {r1}\n2. {r2}..."
+    let mut responses_reg: Option<Reg> = None;
+    for i in 0..n_proposers {
+        let num = alloc(&mut nxt);
+        body.push(crate::mir::MirInst::Const(
+            num,
+            Value::String(format!("{}. ", i + 1)),
+        ));
+        let var = alloc(&mut nxt);
+        body.push(crate::mir::MirInst::Var(
+            var,
+            format!("layer_{}_response_{}", layer, i + 1),
+        ));
+        let joined = alloc(&mut nxt);
+        body.push(crate::mir::MirInst::BinaryOp(
+            joined,
+            num,
+            crate::common::BinaryOp::Add,
+            var,
+        ));
+        responses_reg = match responses_reg {
+            None => Some(joined),
+            Some(prev) => {
+                let nl = alloc(&mut nxt);
+                body.push(crate::mir::MirInst::Const(
+                    nl,
+                    Value::String("\n".to_string()),
+                ));
+                let sep = alloc(&mut nxt);
+                body.push(crate::mir::MirInst::BinaryOp(
+                    sep,
+                    prev,
+                    crate::common::BinaryOp::Add,
+                    nl,
+                ));
+                let acc = alloc(&mut nxt);
+                body.push(crate::mir::MirInst::BinaryOp(
+                    acc,
+                    sep,
+                    crate::common::BinaryOp::Add,
+                    joined,
+                ));
+                Some(acc)
+            }
+        };
+    }
+    let responses_reg = responses_reg.unwrap_or_else(|| {
+        let r = alloc(&mut nxt);
+        body.push(crate::mir::MirInst::Const(r, Value::String(String::new())));
+        r
+    });
+
+    let c1 = alloc(&mut nxt);
+    body.push(crate::mir::MirInst::Const(
+        c1,
+        Value::String("Synthesize these responses into a single high-quality answer: ".to_string()),
+    ));
+    let prompt_reg = alloc(&mut nxt);
+    body.push(crate::mir::MirInst::BinaryOp(
+        prompt_reg,
+        c1,
+        crate::common::BinaryOp::Add,
+        responses_reg,
+    ));
+
+    let ai_reg = alloc(&mut nxt);
+    body.push(crate::mir::MirInst::Var(ai_reg, "ai".to_string()));
+
+    let dict_reg = alloc(&mut nxt);
+    let mut cfg = HashMap::new();
+    cfg.insert("model".to_string(), Value::String(aggregator.to_string()));
+    body.push(crate::mir::MirInst::Const(dict_reg, Value::Dict(cfg)));
+
+    let res_reg = alloc(&mut nxt);
+    body.push(crate::mir::MirInst::MethodCall(
+        res_reg,
+        ai_reg,
+        "chat".to_string(),
+        vec![prompt_reg, dict_reg],
+    ));
+
+    // 聚合结果 Define → 共享 env（L>1 proposer 读取 agg_result_{L-1}；
+    // 末层结果经 reconcile 写 result channel，engine.run 返回）。
+    body.push(crate::mir::MirInst::Define(
+        format!("agg_result_{}", layer),
+        res_reg,
+    ));
+
+    MirFunction {
+        params: vec![],
+        body,
+        n_regs: nxt.max(1),
     }
 }
 

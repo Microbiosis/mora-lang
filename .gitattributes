@@ -1,0 +1,9 @@
+# Binary fixtures must not be touched by line-ending normalization.
+# CI windows-latest runner previously failed with
+# `lopdf load error: couldn't parse input: invalid file trailer`
+# because GitHub's checkout@v4 normalized line endings on the runner,
+# corrupting the PDF trailer (PDFs are byte-sensitive: trailer dictionary,
+# startxref offset, and %%EOF marker must match exactly).
+#
+# Marking the file `binary` tells git to copy it as-is on every platform.
+tests/fixtures/sample.pdf binary

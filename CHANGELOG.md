@@ -2,6 +2,48 @@
 
 All notable changes to Mora will be documented in this file.
 
+## [v0.75.84] — 2026-08-04 — MoA（Mixture-of-Agents）集成
+
+在 Mora 语言中集成 MoA 架构（arXiv:2406.04692, Together AI 2024）——
+分层多模型协作：每层 N 个不同 LLM 并行生成 → 聚合器 LLM 综合 → 传下一层。
+基于 pregel BSP 引擎（并行 EXEC + 超步）展开，零新引擎机制。
+
+**语言形态**：
+```mora
+orchestrate moa input -> result
+  layers: 2
+  proposers: ["gpt-4o", "claude-3", "llama-3"]
+  aggregator: "gpt-4o"
+  prompt: p"Answer: {input}"
+end
+```
+
+**三个提交**：
+- **feat(ai)**：补回 ai.chat dispatch arm + model 参数（v0.37 typed
+  BuiltinKind 重构后 `(AiChat,"chat")` arm 缺失，`ai.chat(...)` 运行时必报
+  "Unknown method"）——MoA 每层多模型并行调用的硬前置。typeck 同步：
+  infer_var 识别全局内置对象 ai（→AiModule），ai.chat 签名补 prompt 参数，
+  infer_method_call 允许尾部 dict 配置参数（{model}）。
+- **feat(mir)**：MirOrchestrateKind::Moa 变体 + orchestrate moa 语法
+  （layers/proposers/aggregator/prompt 字段解析）。
+- **feat(mir)**：h_orchestrate Moa 分支展开为 pregel 图。每层 proposer
+  并行 ai.chat(prompt, {model}) → Define 结果 → reconcile 合并共享 env →
+  聚合 agent 读并 ai.chat 综合 → agg_result_{L} → 下一层 proposer →
+  末层聚合结果 = result。
+
+**探索暴露并修复的 pre-existing**：
+- pregel 依赖 interpreter.environment()（CLI take_env 后空壳）→ 新增
+  base_env 注入（exec_env 单一来源，v0.75.76+ 约定），reconcile 合并
+  目标同源——修复后 pregel agent 能读到 builtin ai 等。
+- MoA 层间值传递走共享 env 合并（版本快照机制对首次执行不投递 delta
+  通道，aggregate 通道路径不可靠）。
+- 首层 prompt {input} 插值需真值：注入 __moa_input（input_var 原始值）
+  覆盖 pregel 的 delta JSON 契约。
+
+验证：exe 实测 2 层 2 proposer 全链路（真 input → L1 并行 → 聚合 → L2
+→ FINAL）+ compile_run_moa_layered 回归（typeck + run_mir mock 路径）。
+全量测试绿 + clippy `-D warnings` 0 + fmt 0。
+
 ## [v0.75.83] — 2026-08-04 — h_aggregate 断头接线 + is_truthy 收敛
 
 修复 reviewer 记录的两个设计缺陷项：

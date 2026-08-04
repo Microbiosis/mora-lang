@@ -363,3 +363,33 @@ fn compile_run_ai_chat_builtin() {
     mora::mir::vm::run_main_task(&arc2, &mut interp2, &mut env2)
         .expect("run_main_task should succeed");
 }
+
+/// v0.75.84: 回归测试 — MoA（Mixture-of-Agents）端到端（无 key mock 模式）。
+/// orchestrate moa 声明 → h_orchestrate 展开为 pregel 图：每层 proposer
+/// 并行 ai.chat → 聚合 agent 综合 → 层间传递 → 末层聚合结果 = result。
+/// 验证：2 层 2 proposer，input 真值注入（{input} 插值），result 非空。
+#[test]
+fn compile_run_moa_layered() {
+    let src = "let input = \"plan a trip\"\norchestrate moa input -> result\n  layers: 2\n  proposers: [\"gpt-4o\", \"claude-3\"]\n  aggregator: \"gpt-4o\"\n  prompt: p\"Answer: {input}\"\nend\nprint(result)";
+    let (func, witnesses) = ParserV3::compile(src).expect("compile should succeed");
+    let type_errors = mora::typeck::check_mir::check_program_witnesses(&witnesses);
+    assert!(
+        type_errors.is_empty(),
+        "typeck should pass: {:?}",
+        type_errors
+    );
+    let mut interp = mora::interpreter::Interpreter::new();
+    let mut env = interp.take_env();
+    let func_arc = std::sync::Arc::new(func);
+    mora::mir::vm::run_mir(&func_arc, &mut interp, &mut env).expect("run_mir should not fail");
+    mora::mir::vm::run_main_task(&func_arc, &mut interp, &mut env)
+        .expect("run_main_task should succeed (MoA end-to-end)");
+    // run_mir 后 result 应已被 h_orchestrate 绑定（含真 input 的 mock 响应）
+    let result = env.get("result").expect("result should be defined");
+    let s = result.to_string();
+    assert!(
+        s.contains("plan a trip") || s.contains("Synthesize"),
+        "result should carry MoA output, got: {}",
+        s
+    );
+}

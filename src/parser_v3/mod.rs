@@ -1846,16 +1846,17 @@ impl ParserV3 {
 
         let start_span = self.span_of_current();
 
-        // Parse kind: sequential | loop | graph | pregel
+        // Parse kind: sequential | loop | graph | pregel | moa
         let kind_str = if self.check(&TokenType::Loop) {
             self.advance();
             "loop".to_string()
         } else {
-            let name = self
-                .consume_identifier("Expected orchestrate kind (sequential/loop/graph/pregel)")?;
-            if name != "sequential" && name != "graph" && name != "pregel" {
+            let name = self.consume_identifier(
+                "Expected orchestrate kind (sequential/loop/graph/pregel/moa)",
+            )?;
+            if name != "sequential" && name != "graph" && name != "pregel" && name != "moa" {
                 eprintln!(
-                    "Parse error: Expected orchestrate kind (sequential/loop/graph/pregel) at line {}",
+                    "Parse error: Expected orchestrate kind (sequential/loop/graph/pregel/moa) at line {}",
                     self.current_line()
                 );
                 return None;
@@ -1875,6 +1876,11 @@ impl ParserV3 {
         let mut agents: Vec<MirOrchestrateAgent> = Vec::new();
         let mut edges: Vec<MirOrchestrateEdge> = Vec::new();
         let mut exit_when: Option<MirExpr> = None;
+        // v0.75.84: MoA 声明字段（kind == "moa"）
+        let mut moa_layers: Option<usize> = None;
+        let mut moa_proposers: Vec<String> = Vec::new();
+        let mut moa_aggregator: Option<String> = None;
+        let mut moa_prompt: Option<MirExpr> = None;
 
         loop {
             // Skip blank lines
@@ -1888,6 +1894,56 @@ impl ParserV3 {
             if self.check(&TokenType::End) {
                 self.advance();
                 break;
+            }
+
+            // v0.75.84: MoA 字段声明（layers / proposers / aggregator / prompt）
+            if kind_str == "moa" {
+                let is_moa_field = self.peek_is_identifier("layers")
+                    || self.peek_is_identifier("proposers")
+                    || self.peek_is_identifier("aggregator")
+                    || self.peek_is_identifier("prompt");
+                if is_moa_field {
+                    let field = self.consume_identifier("Expected moa field")?;
+                    self.consume(TokenType::Colon, "Expected ':' after moa field")?;
+                    match field.as_str() {
+                        "layers" => {
+                            let tok = self.advance()?;
+                            // v0.38 numeric tower：整数字面量词法为 Float
+                            let n = match tok.token_type {
+                                TokenType::Float(f) => f.max(1.0) as usize,
+                                TokenType::Int(i) => i.max(1) as usize,
+                                _ => return None,
+                            };
+                            moa_layers = Some(n);
+                        }
+                        "proposers" => {
+                            if !self.match_token_exact(TokenType::LBracket) {
+                                return None;
+                            }
+                            while !self.check(&TokenType::RBracket) && !self.is_at_end() {
+                                if let TokenType::String(s) = self.peek().cloned()?.token_type {
+                                    self.advance();
+                                    moa_proposers.push(s);
+                                }
+                                if !self.match_token(&[TokenType::Comma]) {
+                                    break;
+                                }
+                            }
+                            self.consume(TokenType::RBracket, "Expected ']' after proposers")?;
+                        }
+                        "aggregator" => {
+                            if let TokenType::String(s) = self.peek().cloned()?.token_type {
+                                self.advance();
+                                moa_aggregator = Some(s);
+                            }
+                        }
+                        "prompt" => {
+                            moa_prompt = self.parse_assignment();
+                        }
+                        _ => return None,
+                    }
+                    continue;
+                }
             }
 
             // Skip max_rounds: N (loop header property)
@@ -1973,6 +2029,24 @@ impl ParserV3 {
                 interrupt_points: vec![],
                 adjacency: HashMap::new(),
             },
+            // v0.75.84: MoA — 声明参数直接构造（展开在 h_orchestrate）。
+            "moa" => {
+                let layers = moa_layers.unwrap_or(2);
+                let proposers = if moa_proposers.is_empty() {
+                    vec!["gpt-4o".to_string()]
+                } else {
+                    moa_proposers
+                };
+                let aggregator = moa_aggregator.unwrap_or_else(|| proposers[0].clone());
+                let prompt =
+                    moa_prompt.unwrap_or_else(|| MirExpr::var("input".to_string(), start_span));
+                MirOrchestrateKind::Moa {
+                    layers,
+                    proposers,
+                    aggregator,
+                    prompt,
+                }
+            }
             _ => MirOrchestrateKind::Sequential { agents },
         };
 

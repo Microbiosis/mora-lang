@@ -450,6 +450,21 @@ pub enum MirOrchestrateKind {
         interrupt_points: Vec<MirInterruptPoint>,
         adjacency: HashMap<String, Vec<String>>,
     },
+    /// v0.75.84: MoA（Mixture-of-Agents，arXiv:2406.04692）— 分层多模型协作。
+    /// 每层 N 个 proposer LLM 并行生成 → 聚合器 LLM 综合 → 传下一层。
+    /// `h_orchestrate` 展开为 pregel 图（每层 proposer 并行 + 聚合 agent，
+    /// 静态边层间传递），零新引擎机制。
+    Moa {
+        /// MoA 层数（论文：l 层，通常 2-3 层；末层单聚合器）。
+        layers: usize,
+        /// 每层 proposer 模型列表（同层复用；论文 n 个异构模型并行）。
+        proposers: Vec<String>,
+        /// 聚合器模型（每层聚合 + 末层最终输出）。
+        aggregator: String,
+        /// 初始 prompt（MoA 每层基于前层输出的「原文」继续；聚合 prompt
+        /// 由引擎按 Aggregate-and-Synthesize 模板生成）。
+        prompt: MirExpr,
+    },
 }
 
 ///  Agent definition in orchestrate

@@ -161,6 +161,10 @@ impl CostModel for TokenEstimate {
                     crate::mir::expr::MirOrchestrateKind::Loop { agents, .. } => agents.len(),
                     crate::mir::expr::MirOrchestrateKind::Graph { agents, .. } => agents.len(),
                     crate::mir::expr::MirOrchestrateKind::Pregel { agents, .. } => agents.len(),
+                    // v0.75.84: MoA 展开为 layers×(proposers+1) 个 agent
+                    crate::mir::expr::MirOrchestrateKind::Moa {
+                        layers, proposers, ..
+                    } => layers * (proposers.len() + 1),
                 };
                 50 + n_agents as u32 * 30
             }

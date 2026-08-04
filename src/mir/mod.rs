@@ -203,6 +203,14 @@ pub enum MirInst {
         target: String,
     },
 
+    /// v0.75.83: aggregate — 向 per-super-step 聚合器贡献值。
+    /// 经 h_aggregate push 到 MirHost 缓冲，Pregel 引擎超步末收集归约
+    /// （与 Send/dynamic_sends 同构；引擎侧 aggregator_contribute 归约）。
+    Aggregate {
+        name: String,
+        value: Reg,
+    },
+
     // v0.75.31: Receive 已删除 — 语义漂移的死原语：h_receive 读共享
     // Environment 当消息源（把「变量作用域」当「消息队列」）；MirInst::
     // Receive 全仓零构造（src+tests）。pregel 的接收由引擎 input_<channel>

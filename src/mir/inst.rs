@@ -7,10 +7,10 @@
 use std::collections::HashMap;
 
 use super::handlers::{
-    Flow, h_append_file, h_assign, h_binary_op, h_break, h_call, h_closure, h_const, h_continue,
-    h_define, h_dict_lit, h_document_section, h_dyn_trait, h_enum_def, h_eval, h_halt, h_impl_def,
-    h_import, h_index, h_index_assign, h_jump, h_jump_if, h_jump_if_not, h_list_lit, h_load,
-    h_macro_def, h_match_expr, h_method_call, h_observe, h_orchestrate, h_pipe, h_prompt,
+    Flow, h_aggregate, h_append_file, h_assign, h_binary_op, h_break, h_call, h_closure, h_const,
+    h_continue, h_define, h_dict_lit, h_document_section, h_dyn_trait, h_enum_def, h_eval, h_halt,
+    h_impl_def, h_import, h_index, h_index_assign, h_jump, h_jump_if, h_jump_if_not, h_list_lit,
+    h_load, h_macro_def, h_match_expr, h_method_call, h_observe, h_orchestrate, h_pipe, h_prompt,
     h_prompt_section, h_read_bytes_file, h_read_file, h_return, h_save, h_send, h_skill_def,
     h_span, h_struct_def, h_trait_def, h_transaction, h_type_alias, h_var, h_with_config, h_worker,
     h_write_bytes_file, h_write_file,
@@ -88,6 +88,7 @@ impl MirInst {
             MirInst::Halt(Some(r)) => vec![*r],
             MirInst::Halt(None) => vec![],
             MirInst::Send { value, .. } => vec![*value],
+            MirInst::Aggregate { value, .. } => vec![*value],
             MirInst::Save { path, value } => vec![*path, *value],
             MirInst::Load { path, .. } => vec![*path],
             MirInst::ReadFile { path, .. } => vec![*path],
@@ -201,6 +202,10 @@ impl MirInst {
                 value: m(*value),
                 target: target.clone(),
             },
+            MirInst::Aggregate { name, value } => MirInst::Aggregate {
+                name: name.clone(),
+                value: m(*value),
+            },
             MirInst::Rollback => MirInst::Rollback,
             MirInst::Worker { .. } => self.clone(),
             MirInst::Commit => MirInst::Commit,
@@ -271,6 +276,7 @@ impl MirInst {
             | MirInst::Expr(_)
             | MirInst::IndexAssign(_, _, _)
             | MirInst::Send { .. }
+            | MirInst::Aggregate { .. }
             | MirInst::Rollback
             | MirInst::Commit
             | MirInst::Save { .. }
@@ -448,6 +454,10 @@ pub fn dispatch(
         }
         MirInst::Send { value, target } => {
             h_send(interp, regs, *value, target)?;
+            Ok(Flow::Continue)
+        }
+        MirInst::Aggregate { name, value } => {
+            h_aggregate(interp, regs, *value, name)?;
             Ok(Flow::Continue)
         }
         MirInst::Rollback => Err("Transaction rolled back".to_string()),

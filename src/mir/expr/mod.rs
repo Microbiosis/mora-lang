@@ -642,6 +642,15 @@ pub enum AggregatorKind {
     Concat,
 }
 
+/// v0.75.83: 聚合器贡献 — agent 经 `aggregate name, value` 语句提交，
+/// h_aggregate push 到 MirHost 缓冲，Pregel 引擎超步末收集并经
+/// aggregator_contribute 归约（与 SendTask/dynamic_sends 同构）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct AggregatorContribution {
+    pub name: String,
+    pub value: Value,
+}
+
 ///  Builtin operation (placeholder for typeck)
 #[derive(Debug, Clone, PartialEq)]
 pub enum BuiltinOp {

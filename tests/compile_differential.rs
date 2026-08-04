@@ -281,3 +281,44 @@ fn compile_run_eval_assertion() {
         err
     );
 }
+
+/// v0.75.83: 回归测试 — aggregate 语句前端 + 缓冲接线。
+/// 语法：`aggregate name, value_expr`。compile 主路径 emit MirInst::Aggregate，
+/// 经 h_aggregate push 到 MirHost 缓冲（与 dynamic_sends 同构）。引擎收集
+/// 点在 pregel 超步 UPDATE 后（aggregator_contribute 归约）。
+#[test]
+fn compile_run_aggregate_statement() {
+    use mora::mir::host::MirHost;
+    let src = "aggregate sum, 2 + 3\naggregate sum, 10";
+    let (func, _w) = ParserV3::compile(src).expect("compile should succeed");
+    let mut interp = mora::interpreter::Interpreter::new();
+    let mut env = interp.take_env();
+    let func_arc = std::sync::Arc::new(func);
+    mora::mir::vm::run_mir(&func_arc, &mut interp, &mut env).expect("run_mir should not fail");
+    let contribs = MirHost::aggregator_contributions(&mut interp);
+    assert_eq!(
+        contribs.len(),
+        2,
+        "two aggregate statements must buffer two contributions"
+    );
+    assert_eq!(contribs[0].name, "sum");
+    assert_eq!(contribs[0].value, mora::value::Value::Float(5.0));
+    assert_eq!(contribs[1].value, mora::value::Value::Float(10.0));
+}
+
+/// v0.75.83: 回归测试 — is_truthy 收敛（MIR 条件分支单一真值源）。
+/// 修复前：vm::is_truthy（List/Dict 恒真）与 flow::is_truthy（判空）分叉，
+/// 且 flow 版缺 Int 分支（Int(0) 落 `_ => true` 误判真）。收敛后 flow 版
+/// 为唯一实现：Nil/Int(0)/Float(0.0)/空 String/空 List/空 Dict 均 falsy。
+#[test]
+fn compile_run_truthiness_converged() {
+    // 空 List 作 if 条件 → falsy（此前 DAG 路径 flow 版已判空；线性路径
+    // vm 版恒真分叉，现已统一）
+    let src = "if [] { error(\"empty list should be falsy\") }\nprint(\"empty-list-falsy\")";
+    let (func, _w) = ParserV3::compile(src).expect("compile should succeed");
+    let mut interp = mora::interpreter::Interpreter::new();
+    let mut env = interp.take_env();
+    let arc = std::sync::Arc::new(func);
+    mora::mir::vm::run_mir(&arc, &mut interp, &mut env).expect("run_mir should not fail");
+    mora::mir::vm::run_main_task(&arc, &mut interp, &mut env).expect("empty list must be falsy");
+}

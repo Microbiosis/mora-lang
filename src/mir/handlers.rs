@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use super::vm::index_assign_value;
 
-use super::vm::is_truthy;
+use crate::flow::is_truthy;
 
 use super::vm::value_to_string;
 
@@ -380,12 +380,16 @@ pub fn h_aggregate(
     value: Reg,
     name: &str,
 ) -> Result<(), String> {
-    // Aggregator contribution requires direct engine access.
-    // For now, the BSP engine exposes aggregator values as channels
-    // (aggregator_<name>) at the end of each step. We just record the
-    // contribution locally so it's available if a worker reads it back.
-    let val = regs[value].clone();
-    let _ = (interp, name, val);
+    // v0.75.83: 向 per-super-step 聚合器贡献值。agent 无法直接访问引擎，
+    // 经 MirHost 缓冲提交（与 h_send → dynamic_sends 同构）；Pregel 引擎
+    // 超步末 mem::take 收集并经 aggregator_contribute 归约，结果以
+    // aggregator_<name> channel 暴露给下一超步。
+    interp
+        .aggregator_contributions()
+        .push(crate::mir::expr::AggregatorContribution {
+            name: name.to_string(),
+            value: regs[value].clone(),
+        });
     Ok(())
 }
 

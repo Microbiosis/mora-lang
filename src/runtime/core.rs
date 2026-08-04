@@ -37,6 +37,10 @@ pub struct CoreRuntime {
     /// super-step. Lets agents route messages at runtime without direct
     /// access to the engine.
     pub(crate) dynamic_sends: Vec<crate::checkpoint::SendTask>,
+    /// v0.75.83: BSP 聚合器贡献缓冲。`h_aggregate` pushes here; pregel
+    /// 引擎超步末收集并经 aggregator_contribute 归约（与 dynamic_sends
+    /// 同构 —— agent 无法直接访问引擎）。
+    pub(crate) aggregator_contributions: Vec<crate::mir::expr::AggregatorContribution>,
 }
 
 impl Default for CoreRuntime {
@@ -50,6 +54,7 @@ impl Default for CoreRuntime {
             config_stack: Vec::new(),
             current_merge_strategies: None,
             dynamic_sends: Vec::new(),
+            aggregator_contributions: Vec::new(),
         }
     }
 }

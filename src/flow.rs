@@ -7,11 +7,17 @@
 use crate::common::{BinaryOp, Literal};
 use crate::value::Value;
 
-/// 判断值是否为真
+/// 判断值是否为真 — MIR 条件分支的单一真值源（v0.75.83 收敛）。
+///
+/// 语义：Bool 取自身；Nil/Int(0)/Float(0.0)/空 String/空 List/空 Dict 为
+/// falsy；其余为 truthy。此前存在两份实现：本函数（缺 Int 分支，Int(0)
+/// 落 `_ => true` 误判为真）与 mir/vm.rs 版（List/Dict 恒真，空容器误判
+/// 为真）——两处语义分叉是隐蔽 bug 温床，已收敛为本单一实现。
 pub fn is_truthy(value: &Value) -> bool {
     match value {
         Value::Nil => false,
         Value::Bool(b) => *b,
+        Value::Int(i) => *i != 0,
         Value::Float(n) => *n != 0.0,
         Value::String(s) => !s.is_empty(),
         Value::List(l) => !l.is_empty(),

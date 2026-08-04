@@ -15,6 +15,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::checkpoint::{Checkpoint, CheckpointSaver, SendTask};
+use crate::mir::expr::AggregatorContribution;
 use crate::runtime::types::TraitInfo;
 use crate::value::{Environment, MergeStrategy, Value};
 
@@ -52,6 +53,10 @@ pub trait MirHost {
     fn environment(&self) -> Arc<parking_lot::Mutex<Environment>>;
     /// BSP send 缓冲（`h_send` push / `h_orchestrate` flush）。
     fn dynamic_sends(&mut self) -> &mut Vec<SendTask>;
+    /// v0.75.83: BSP 聚合器贡献缓冲（`h_aggregate` push / pregel 超步末
+    /// 收集归约）。与 dynamic_sends 同构 —— agent 无法直接访问引擎，
+    /// 经宿主缓冲提交贡献。
+    fn aggregator_contributions(&mut self) -> &mut Vec<AggregatorContribution>;
     /// checkpoint saver（`h_orchestrate` 注入 Pregel 引擎）。
     fn checkpoint_saver(&self) -> Option<Arc<dyn CheckpointSaver>>;
     /// 从 saver 恢复 checkpoint（`h_orchestrate`）。

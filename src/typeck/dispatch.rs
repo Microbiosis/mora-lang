@@ -283,7 +283,13 @@ fn method_signature_builtin(receiver: &Type, method: &str) -> Option<Signature> 
             Type::String,
         )),
         (Type::AiModule, "chat") => Some(Signature::new(
-            vec![("self".to_string(), Type::AiModule)],
+            // v0.75.84: ai.chat(prompt[, {model: "..."}]) — prompt 必选；
+            // 可选 dict 参数不受 arity 强制（infer_method_call 只核对
+            // user_arity，多传不报）。
+            vec![
+                ("self".to_string(), Type::AiModule),
+                ("prompt".to_string(), Type::String),
+            ],
             Type::AiResult,
         )),
         (Type::AiConfig, "model" | "temperature" | "max_tokens" | "system" | "budget") => Some(

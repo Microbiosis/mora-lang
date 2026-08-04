@@ -82,10 +82,19 @@ impl HMInference {
                 Ok(self.instantiate_type(&ty))
             }
             Some(ty) => Ok(ty.clone()),
-            None => Err(vec![TypeError::UnboundVariable {
-                name: name.to_string(),
-                span,
-            }]),
+            // v0.75.84: 全局内置对象名（ai/web/json/file/memory/agent）——
+            // 非变量绑定，typeck 识别为对应模块类型（ai → AiModule 等）。
+            // 此前 `ai.chat(...)` 报 "Unbound variable 'ai'"（运行时 arm
+            // v0.75.84 补回后 typeck 仍是缺口）。
+            None => match name {
+                "ai" => Ok(Type::AiModule),
+                "agent" => Ok(Type::Agent),
+                n if crate::flow::is_builtin_object(n) => Ok(Type::Any),
+                _ => Err(vec![TypeError::UnboundVariable {
+                    name: name.to_string(),
+                    span,
+                }]),
+            },
         }
     }
 
@@ -237,9 +246,16 @@ impl HMInference {
         // v0.55: enforce arity from the dispatch table. The signature
         // already includes `self` as its first parameter, so the user
         // arity we compare against is `sig.params.len() - 1`.
+        // v0.75.84: 尾部 dict 配置参数（ai.chat(prompt, {model: ...})）为
+        // 可选——arity 下限是签名 user 参数数，多传 dict 不报 ArityMismatch。
         if let Some(sig) = crate::typeck::dispatch::method_signature(&recv_ty, method) {
             let user_arity = sig.params.len().saturating_sub(1);
-            if user_arity != arg_types.len() {
+            let extra_configurable = arg_types
+                .iter()
+                .skip(user_arity)
+                .all(|t| matches!(t, Type::Dict(_, _)));
+            if arg_types.len() < user_arity || (arg_types.len() > user_arity && !extra_configurable)
+            {
                 return Err(vec![TypeError::ArityMismatch {
                     expected: user_arity,
                     actual: arg_types.len(),

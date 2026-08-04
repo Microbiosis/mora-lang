@@ -322,3 +322,44 @@ fn compile_run_truthiness_converged() {
     mora::mir::vm::run_mir(&arc, &mut interp, &mut env).expect("run_mir should not fail");
     mora::mir::vm::run_main_task(&arc, &mut interp, &mut env).expect("empty list must be falsy");
 }
+
+/// v0.75.84: 回归测试 — ai.chat dispatch arm + model 参数（MoA 硬前置）。
+/// 修复前：call_method_builtin 无 (AiChat, "chat") arm → "Unknown method"；
+/// typeck infer_var 不识别全局内置对象 ai → "Unbound variable 'ai'"。
+/// 现 ai.chat(prompt) / ai.chat(prompt, {model}) 经 typeck + run_mir（无
+/// key mock 模式返回 [Mock response for: prompt]）。
+#[test]
+fn compile_run_ai_chat_builtin() {
+    let src = "let r = ai.chat(\"hello\")\nprint(r)";
+    let (func, witnesses) = ParserV3::compile(src).expect("compile should succeed");
+    let type_errors = mora::typeck::check_mir::check_program_witnesses(&witnesses);
+    assert!(
+        type_errors.is_empty(),
+        "typeck should pass (ai is builtin object): {:?}",
+        type_errors
+    );
+    let mut interp = mora::interpreter::Interpreter::new();
+    let mut env = interp.take_env();
+    let arc = std::sync::Arc::new(func);
+    mora::mir::vm::run_mir(&arc, &mut interp, &mut env)
+        .expect("run_mir should not fail (ai.chat mock)");
+    mora::mir::vm::run_main_task(&arc, &mut interp, &mut env)
+        .expect("run_main_task should succeed");
+
+    // 带 model dict 配置参数
+    let src2 = "let r = ai.chat(\"hi\", {model: \"gpt-4o\"})\nprint(r)";
+    let (func2, witnesses2) = ParserV3::compile(src2).expect("compile should succeed");
+    let type_errors2 = mora::typeck::check_mir::check_program_witnesses(&witnesses2);
+    assert!(
+        type_errors2.is_empty(),
+        "typeck should pass (dict config arg): {:?}",
+        type_errors2
+    );
+    let mut interp2 = mora::interpreter::Interpreter::new();
+    let mut env2 = interp2.take_env();
+    let arc2 = std::sync::Arc::new(func2);
+    mora::mir::vm::run_mir(&arc2, &mut interp2, &mut env2)
+        .expect("run_mir should not fail (ai.chat with model)");
+    mora::mir::vm::run_main_task(&arc2, &mut interp2, &mut env2)
+        .expect("run_main_task should succeed");
+}

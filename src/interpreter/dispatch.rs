@@ -946,6 +946,28 @@ impl Interpreter {
             (BuiltinKind::Mock, _) => self.call_mock_method(method, &args),
             // v0.34: ai.tokens — expose TokenUsage counters (mini-swe-agent cost tracking)
             (BuiltinKind::AiChat, "tokens") => Ok(Value::Builtin(BuiltinKind::AiTokens)),
+            // v0.75.84: ai.chat(prompt[, {model: "..."}]) — 补回运行时 dispatch arm。
+            // v0.37 typed BuiltinKind 重构后此 arm 缺失，`ai.chat(...)` 落
+            // `_ => Err("Unknown method")`；MoA 的每层多模型并行依赖它。
+            // model 可选：dict 参数 {model} 优先于 env（MORA_AI_MODEL）。
+            (BuiltinKind::AiChat, "chat") => {
+                let prompt = match args.first() {
+                    Some(Value::String(s)) => s.clone(),
+                    Some(other) => other.to_string(),
+                    None => return Err("ai.chat requires a prompt argument".to_string()),
+                };
+                let model = match args.get(1) {
+                    Some(Value::Dict(d)) => match d.get("model") {
+                        Some(Value::String(m)) => m.clone(),
+                        _ => std::env::var(AI_MODEL_ENV)
+                            .unwrap_or_else(|_| AI_MODEL_DEFAULT.to_string()),
+                    },
+                    _ => {
+                        std::env::var(AI_MODEL_ENV).unwrap_or_else(|_| AI_MODEL_DEFAULT.to_string())
+                    }
+                };
+                Self::do_ai_chat(self, &model, &prompt)
+            }
             (BuiltinKind::AiTokens, _) => self.call_ai_tokens_method(method, &args),
             (BuiltinKind::Agent, "create") => {
                 // agent.create("name", {tools: [...], model: "deep", max_steps: 10, system: "..."})

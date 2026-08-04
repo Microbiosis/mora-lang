@@ -2,6 +2,15 @@
 
 All notable changes to Mora will be documented in this file.
 
+**关于历史版本（v0.30 及更早）**：2026-08-04 编码错误清理前，v0.30
+及更早条目的中文短语被 AI 生成阶段的渲染 bug 替换为 4 连星号占位符。
+本版本已切除 v0.30 → v0.13 共 22 个损坏条目（4,000+ 处占位），
+保留 v0.31 → v0.75.85 共 115 个完整可读条目（含 v0.33/v0.32/v0.31
+段内 8 处零星占位的最小修改修复）。
+
+需要查阅 v0.13 → v0.30 历史的请通过 `git log --grep='v0\.' --reverse`
+按 commit 主题回溯；该区间仅作为工程债处理记录保留在 git 历史中。
+
 ## [v0.75.85] — 2026-08-04 — MoE（Mixture-of-Experts）集成
 
 在 Mora 语言中集成 MoE 架构（Shazeer 2017 稀疏门控）——**稀疏激活**：
@@ -1992,11 +2001,9 @@ parser 注解只接受单标识符。本模块补齐真泛型。）
 
 ## [Unreleased] — Tier 0 → Tier 1 
 
-MIR Tier 1 5 ////`run_file` / `run_record` / `run_replay` / `run_snapshot` / REPL (`mora --repl`)  `mora::mir::interp::run_mir` + `run_main_task` `Interpreter::interpret` / `execute` / `evaluate``MORA_INTERP`  `interpreter_mode()` 
+MIR Tier 1 5 ////`run_file` / `run_record` / `run_replay` / `run_snapshot` / REPL (`mora --repl`)  `mora::mir::interp::run_mir` + `run_main_task` `Interpreter::interpret` / `execute` / `evaluate``MORA_INTERP`  `interpreter_mode()`
 
-**** Tier 0 
-
-1. `tests/mir_differential.rs` — AST 
+1. `tests/mir_differential.rs` — AST
 2. `Interpreter::mir_call_function` / `mir_call_method` / `mir_import` / `mir_with_config` — MIR  AST builtin 
 3. `Interpreter::evaluate` / `call_value_inner` / `call_task_inner` —  builtin 
 
@@ -3483,7 +3490,6 @@ change, no API rename.
 ### Schedule + Sandbox + Reading Order + CCR (4 P1 primitives)
 
 : 7-project deep-dive  (AGENTS_PRIMITIVES.md)  v0.33 P1 .
- 4 **** P1 ,  trait-based +  in-memory ,
 .
 
 #### 1. Schedule (cron) — MimiClaw 
@@ -3498,7 +3504,7 @@ change, no API rename.
 - `set_persist_path(path)` + best-effort JSON dump
 
 : MimiClaw cron_service.c (9  cron_job_t).
-****:  channel/chat_id, std::fs JSON  (vs SPIFFS).
+借鉴: 用 channel/chat_id，std::fs 持久化 JSON (vs SPIFFS).
 
 #### 2. Sandbox Policy — AIOS + Puter + MimiClaw 
 
@@ -3524,7 +3530,7 @@ change, no API rename.
 - `assign_reading_order(blocks, strategy)`:  block  'reading_order_idx'
 
 : MinerU §2.8 Reading Order Recovery (3 ).
-****:  recursive XY-cut,  cross-page merge, .
+借鉴: recursive XY-cut, cross-page merge, sliding window.
 
 #### 4. CCR (Compress-Cache-Retrieve) — Headroom 
 
@@ -3536,8 +3542,8 @@ change, no API rename.
 - `extract_hash(marker) -> Option<&str>`
 
 : Headroom CcrStore (lossy ).
-****: 8-char hex hash (vs SHA-256),  marker  ( KIND).
-****: v0.34  `crush_json` lossy .
+借鉴: 8-char hex hash (vs SHA-256), 用 marker 标识 token (vs uuid KIND).
+借鉴: v0.34 引入 crush_json lossy 压缩.
 
 #### 
 
@@ -3574,7 +3580,7 @@ P2+ (v0.35+ ):
 
 :  deep-dive 7  AI  (AIOS / MimiClaw / OpenFugu /
 OpenInfer / MinerU / Headroom / Puter) . 
-`AGENTS_PRIMITIVES.md` (581 ).  3 **** P0 ,
+`AGENTS_PRIMITIVES.md` (581 行). 记录 3 项 P0 借鉴,
  plan/react/openai-serve  v0.33.
 
 #### 1. Lossless-First Recursive Walker (Headroom )
@@ -3664,7 +3670,6 @@ P2+ (v0.34+ ):
 ### No-Panic Refactor + Code Quality Hardening
 
  v0.30 "" (user: "5 ").
-**** — .
 
 #### : 21 panic -> 0 in lexer/parser
 
@@ -3700,544 +3705,3 @@ Module-level `//!`  HTML :
 - `cargo fmt --check`: 0 diff
 - `cargo doc --no-deps`: 0 warning
 
-## [v0.30] - 2026-07-02
-
-### SmartCrusher —  JSON 
-
- [headroom](https://github.com/headroomlabs-ai/headroom)  SmartCrusher
- +  +  v0.29 " + 30%  15% "
-" + 5  + 3 "
-
-####  BREAKING CHANGES
-
-- `CompressOptions.anomaly_keys: Vec<String>` ****v0.30 
-- `CompressOptions`  5  11 v0.29  + 6 
-- `crush_json_core` **** `crush_json` `(items, target, options)`
-   `crush_json_core(input, max, anomaly_keys)` 
-- `parse_json_simple` stub **** `flow::json_to_value`
-- `crush_json` / `compress.json` / `List.crush_json`  marker 
-  `method=smart_crusher strategy={...} items={...} total={...} savings={...}`
-
-####  v0.29  head_tail
-
-|  |  |  |
-|---|---|---|
-| `auto` (default) |  |  ArrayType  |
-| `topn` |  /  Score  |  Score  top N |
-| `timeseries` |  /  Temporal  |  +  |
-| `cluster` |  /  uniqueness < 0.3 |  |
-| `lossless` |  | schema  csv-schema / md-kv |
-| `smart_sample` | fallback |  +  +  |
-
-#### 5 
-
-- `Id` — uniqueness > 0.9 /UUID/
-- `Score` — bounded numeric range (0-1  0-100)
-- `Temporal` — ISO 8601 / Unix timestamp 
-- `Error` —  `error`/`failed`/`exception`/... 
-- `Anomaly` —  >3σ from mean (1-5% )
-
-#### 3 
-
-- `KeepErrorsConstraint` — 
-- `KeepOutliersConstraint` — Anomaly  >2σ 
-- `KeepBoundaryConstraint` —  k_first +  k_last  15%
-
-####  builtin 
-
-```mora
---  auto: 
-compress.json(tool_output, {target_ratio: 0.2})
-
---  TopN
-compress.json(scored_list, {strategy: "topn", target_ratio: 0.1})
-
---  TimeSeries
-compress.json(metrics, {strategy: "timeseries", target_ratio: 0.3})
-
--- Lossless (csv-schema , )
-compress.json(flat_table, {strategy: "lossless", max_bytes: 5000})
-
--- 
-compress.json(api_logs, {
-    strategy: "auto",
-    target_ratio: 0.2,
-    preserve_errors: true,
-    preserve_outliers: true,
-    preserve_ids: false,
-})
-
---  metadata
-let result = compress.json(items, {target_ratio: 0.2})
-result.savings_ratio    -- 0.8 (80% )
-result.strategy_used    -- "topn"
-result.fields           -- [{name, role, ...}, ...]
-```
-
-#### 
-
-|  |  (v0.29) |  (v0.30) |  |
-|---|---|---|---|
-| 100  × 5  | 60% | 70-80% | +10-20% |
-| 1000  × 20  | 60% | 75-85% | +15-25% |
-| 10000  × 30  | 60% | 80-90% | +20-30% |
-
-#### 
-
-- `src/compress/json.rs` —  (267 → 970 )
-  - `FieldRole` / `FieldStats` / `ArrayType` 
-  - 5  detector + 5  Strategy + 3  Constraint
-  - `crush_json` / `crush_json_string` / `try_lossless_compact`
-- `src/compress/mod.rs` — `CompressOptions`  (11 )
-  - `parse_json_simple`  `flow::json_to_value`
-  - `value_to_json_simple`  `flow::value_to_json`
-
-#### 
-
-- 12  unit test v0.29 5  test
-  - 5  role detectionid/score/error/temporal/anomaly
-  - 4  strategytopn/timeseries/lossless/auto
-  - 2  constrainterrors/outliers
-  - 1  metadata
-  - 1  string 
--  v0.29  test `crush_json_core` / `anomaly_keys` / `parse_json_simple_currently_stub`
--  272 test `cargo clippy --all-targets -- -D warnings` 
-
-## [v0.29] - 2026-07-01
-
-### compress + crush_json + OCR .rten 
-
- [headroom](https://github.com/headroomlabs-ai/headroom) ContentRouter + Kneedle 
-Mora  JSON  +  system prompt 
-
-####  / builtin
-
-```mora
--- 6  (auto / head_tail / summary / lossless / json / code-html-log-text)
-let summary = compress(text, "summary")                       -- LLM 
-let head    = compress(text, "head_tail", head_pct: 0.3)     -- 
-let lossless = compress(text, "lossless")                     --  size marker
-let auto    = compress(text, "auto")                          -- 
-
---  JSON  (Kneedle + )
-let crushed = crush_json(big_list, max: 10)
-let crushed = crush_json(big_list, max: 10, anomaly_keys: ["error"])
-
--- 
-let summary = conv.compress("summary")
-let crushed = list.crush_json(10)
-```
-
-####  `compress`
-
-|  |  |
-|---|---|
-| `SubCompressor` trait | `sniff` / `compress` / `origin` 3  |
-| `ContentRouter` |  →  |
-| `JsonSubCompressor` |  crush_json_core |
-| `CodeSubCompressor` | regex  +  body |
-| `HtmlSubCompressor` |  v0.27 quick-xml  |
-| `LogSubCompressor` |  pattern cluster |
-| `TextSubCompressor` | head_tail / summary / lossless  |
-
-####  BREAKING: `compact`  `compress`
-
-v0.25  `compact(text)` builtin  `compress(text, "summary")`
-`examples/compact_demo.mora`  v0.29 
-
-#### OCR `.rten`  ( v0.28 tech-debt)
-
-- v0.28 vendored  11.7 MB `.rten` 
--  `~/.local/share/mora/ocr/`  ( `MORA_OCR_MODELS_DIR` )
--  `docs/install-ocr.md` 
--  `.git/sdd/ocrs-shasums.txt`  reference checksum
-- **BREAKING**:  OCR  `mora-install-ocr` 
-
-#### 
-
-- `src/compress/{mod,json,code,html,log,text}.rs` (~1000 )
-- `docs/install-ocr.md`
-- `.git/sdd/ocrs-shasums.txt`
-- `examples/compress_demo.mora` ()
-
-#### 
-
-- **** —  v0.27 / v0.28  deps (`regex` transitive from `ocrs`)
-- **** —  v0.26 / v0.27 / v0.28 
-- **CodeSubCompressor  regex** — v0.30+  tree-sitter
-- **** `compress.` / `crush_json.` / `ocr.load.`
-
-## [v0.28] - 2026-07-01
-
-### Office (PPTX/DOCX) + Image OCR Backends
-
- v0.27 DocumentBackend  MinerU 
- v0.27 trait  3  DocumentBackend 
-
-#### 
-
-|  |  |  |  |
-|---|---|---|---|
-| PptxBackend | .pptx | undoc 0.5 |  |
-| DocxBackend | .docx | undoc 0.5 | Word  |
-| ImageBackend | .png | ocrs 0.12 + image 0.24 |  OCR Rust / rten ONNX|
-
-#### 
-
-```mora
-let deck = document.parse("./deck.pptx")           -- PPTX
-let report = document.parse("./report.docx")        -- DOCX
-let scan = document.parse("./scan.png")            -- OCR
-
-print(deck.markdown())                              -- markdown 
-print(report.text())                                -- 
-print(scan.metadata()["ocr_engine"])                -- "rten"
-```
-
-####  v0.26/v0.27 
-
-```mora
---  v0.26 compose_prompt
-let sys = compose_prompt({role:"system", text:deck.text(), budget:"32 KB"})
---  v0.27 
-document "report" do
-    set origin: "docx"
-    read "./report.docx"
-end
-```
-
-#### 
-
-- `undoc` 0.5 `docx` + `pptx` features Rust
-- `ocrs` 0.12OCR  Rust
-- `rten` 0.24ocrs  re-export `Model::load_static_slice`  `.rten`
-- `anyhow` 1ocrs  `OcrEngine::new`  `anyhow::Result`ocrs  re-export `anyhow`
-- `image` 0.24 `png` feature PNG header / dimensions
-
- RustMSRV 1.85 
-
-#### 
-
-- **** 5  crate  pure Rust
-- **PNG only in v0.28**JPEG / XLSX /  PDF  v0.29+
-- **OCR **`ocrs 0.12`  Microsoft `rten` ONNX runtime
-- ** OCR**v0.28 eng.traineddata bundled
-- ****v0.27  `parse_document(path)`  `PptxBackend` / `DocxBackend` / `ImageBackend`
-
-#### Known issues / v0.29+ roadmap
-
-- **11.7 MB `.rten`  vendoring**OCR /`text-detection.rten` 2.4 MB + `text-recognition.rten` 9.3 MB raw blob  `tests/fixtures/` git LFS contributor / CI  `git clone`  ~12 MB`mora` release binary  `include_bytes!`  ~12 MB blob  PR  diff/ `.git/sdd/tech-debt-v0.29.md`v0.29 git LFS / `build.rs`  /  model dir
-- **OCR **`ocrs 0.12`  `eng.traineddata` 
-- **OCR  PNG**JPEG / WebP / TIFF  v0.29+
-- ** PDF** PDF OCR 
-
-## [v0.27] - 2026-07-01
-
-### Document  IR — `document.parse(...)` + 
-
- [opendatalab/MinerU](https://github.com/opendatalab/MinerU) middle_json 
-Mora  PDF / Markdown / HTML , `Value::Document` IR
-
-#### 
-
-```mora
-document "report" do
-    set origin: "pdf"
-    set max_pages: 3
-    read "./q3-report.pdf"
-end
-
-let doc = document.parse("./q3-report.pdf")
-let md  = doc.markdown()
-let pages = doc.pages()
-let meta = doc.metadata()
-```
-
-####  `document`
-
-|  |  |
-|---|---|
-| `document.parse(path)` | , `Value::Document` |
-
-#### `Document` value 
-
-|  |  |  |
-|---|---|---|
-| `doc.markdown()` | `string` |  markdown  |
-| `doc.text()` | `string` | |
-| `doc.pages()` | `List<Dict>` |  IR Page  |
-| `doc.blocks()` | `List<Dict>` |  block |
-| `doc.metadata()` | `Dict` |  origin / pages / size|
-| `doc.origin()` | `string` | "pdf" / "markdown" / "html" |
-
-####  + Trait
-
-- `Value::Document { backend: Arc<dyn DocumentBackend + Send + Sync>, metadata: HashMap<String, Value> }`
-- `pub trait DocumentBackend: Debug + Send + Sync { fn origin / pages / markdown / text / metadata / blocks }`
-- 3 : `PdfBackend` (lopdf + pdf-extract) / `MarkdownBackend` (pulldown-cmark) / `HtmlBackend` (quick-xml)
-
-#### 
-
-- `lopdf` 0.41 + `pdf-extract` 0.12 (PDF)
-- `pulldown-cmark` 0.13 (Markdown)
-- `quick-xml` 0.40 (HTML)
--  Rust, MSRV 1.85 , 
-
-####  v0.26 
-
-```mora
-let doc = document.parse("./report.pdf")
-let sys = compose_prompt({role:"system", text:doc.markdown(), budget:"32 KB"})
-let resp = ai.chat(p"{sys}\n\n{question}")
-```
-
-#### 
-
-- **** Rust crate
-- ** Value ** PDF /  `backend: Arc<dyn ...>` 
-- **Lazy ** `.pages()` / `.markdown()`  Value, 
-- **** PPTX / DOCX  `impl DocumentBackend`
-
-## [v0.26] - 2026-07-01
-
-### Prompt Sections —  +  + 
-
- [mimiclaw](https://github.com/memovai/mimiclaw)5  [headroom](https://github.com/headroomlabs-ai/headroom) LLM  system prompt 
-
-####  `prompt`
-
-```mora
-prompt "identity" do
-    set role: "system"
-    set budget: "256 B"
-    read "./SOUL.md"
-end
-
-prompt "memory" do
-    set role: "system"
-    set budget: "8 KB"
-    tail("./sessions/today.jsonl", max: 20)
-end
-
-let sys = compose_prompt("identity", "memory")
-```
-
-#### 
-
-|  |  |
-|---|---|
-| `compose_prompt(...)` |  system prompt section budget  |
-| `tail(path, max: N)` |  N JSONL/ |
-
-#### 
-
-- `Value::PromptSection { name, role, text, budget_bytes }`
-
-####  AST 
-
-- `StmtKind::PromptSection { name, body }`
-- `StmtKind::PromptSet { key, value }` `set role:` / `set budget:`
-- `StmtKind::PromptRead(NodeId)` `read`
-
-#### 
-
-- **** tokenizer UTF-8  mimiclaw 
-- **** section  ValueIR
-- ****
-
-## [v0.25] - 2026-07-01
-
-###  (Code Modularization)
-
- 5 
-
-#### 
-- **interpreter**: 3402  → 3  (mod.rs + execute.rs + evaluate.rs)
-- **typeck**: 2838  → 2  (mod.rs + check.rs)
-- **parser_v2**: 2609  → 3  (mod.rs + statements.rs + expressions.rs)
-- **record**: 2091  → 7  (mod.rs + serialization.rs + diff.rs + analysis.rs + audit.rs + snapshot.rs + tests.rs)
-- **lsp/providers**: 1092  → 11  (mod.rs + helpers.rs + 9  provider )
-
-#### 
-- 
-- 
-- 
-
-### 
--  `test_memory_save_load`  Windows 
--  `std::env::temp_dir()`  `/tmp` 
-
-## [v0.24] - 2026-06-30
-
-### ParserV2  (Complete)
-
-ParserV2  Parser 
- parser.rs (2459 )  ParserV2
-
-#### 
-- **append_statement**: 
-- **read_bytes_statement**: 
-- **write_bytes_statement**: 
-- **stream_statement**:  `stream <expr> as <var> do ... end`
-- **tool_statement**:  `tool name(params): type do ... end`
-- **observe_statement**:  (trace/metrics/otel)
-- **span_statement**:  `span "name" tags {..} do ... end`
-- **record_tokens_statement**:  token 
-- **assignment_statement**:  `IDENT = expr`
-- **index_assignment**:  `IDENT[expr] = expr`
-- **commit/rollback**: /
-
-#### 
-- **match_expression**:  ( when )
-- **pattern**:  (////)
-- **parse_format_string**: 
-- **parse_ai_model_call**: ai_model  ( keyword args)
-- **flatten_prompt_parts**: Prompt 
-- **list_literal / dict_literal**: 
-- **char_literal**:  `'a'`
-- **NamespaceRef**:  `Module::method()`
-
-#### 
-- **parse_generic_params**:  `<T: Bound>`
-- **parse_type_list**:  `<T, U, V>`
-- **parse_type_name_recursive**: 
-- **parse_where_clause**: where 
-
-#### 
-- **let **: 
-- **string + any**:  ()
-
-#### 
-- **ObserveConfig**:  ast_v2.rs  NodeId
-- **FnDef / TraitMethod**:  ast_v2.rs  Vec<NodeId>
-- **Pattern**:  ast_v2.rs Guard condition  NodeId
-- **consume_method_name**: 
-- ****:  (binary → unary → call → primary)
-- ****: ast_v2_to_v1.rs  AST 
-
-### 9 Languages Features Integration (Complete)
-
-All features from the learning plan have been implemented.
-
-### v0.21: Rust 
-
-- ****: `&expr` / `&mut expr`
-- ****: `<'a>` 
-- ****: /
-
-### v0.22: 
-
-- **AI **:  prompt 
-- ****:  map/filter/take/drop 
-- ****: 
-- ****: 
-- **HTTP **:  (16)
-- **MCP **:  (8)
-- ****: 
-
-### v0.24: 
-
-- ****: `type Name = TargetType`
-- ****: `enum Name { V1, V2(Type) }`
-- ****: `struct Name { field: Type }`
-
-### 
-
-- **docs/mora-spec.md**: Mora  (20 )
-- **docs/influences.md**: 9 
-- **docs/learning-plan.md**: 
-- **docs/workflow-v0.20.md**: 
-
-From Prolog, StreamIt, APL, Clojure, Lisp, Smalltalk, Common Lisp, Ballerina, Logo.
-
-#### Pattern Matching Enhancement (Prolog)
-- **Match guard conditions**: `match n with x when x > 0 -> ... end`
-- **List rest pattern**: `[head, ...tail] = [1, 2, 3]`
-- **Dict partial match**: `{name: n} = {"name": "Alice", "age": 30}`
-
-#### Pipe & Stream (StreamIt + APL)
-- **Pipe with closure**: `5 |> fn(x) return x * 2 end`
-- **Window aggregation**: `[1,2,3,4,5].window(3)` → `[[1,2,3],[2,3,4],[3,4,5]]`
-- **Batch processing**: `[1,2,3,4,5].batch(3)` → `[[1,2,3],[4,5,6],[7]]`
-- **Array operations**: `.shape()`, `.flatten()`, `.transpose()`, `.reshape()`
-- **Broadcast arithmetic**: `[1,2,3] * 2` → `[2,4,6]`
-
-#### Functional Core (Clojure + Lisp)
-- **Compose**: `compose(f, g, h)` → composed function
-- **Take/Drop**: `[1,2,3].take(2)` → `[1,2]`, `[1,2,3].drop(1)` → `[2,3]`
-- **Partial application**: `partial(add, 10)` → partial applied function
-
-#### Concurrency (Clojure)
-- **Atom**: `atom(0)` → mutable reference
-- **Swap**: `swap(counter, fn(n) return n + 1 end)`
-- **Deref**: `deref(counter)` → current value
-
-#### Reflection (Smalltalk)
-- **type_of**: `type_of(42)` → `"number"`
-- **is_instance**: `is_instance("hello", "string")` → `true`
-- **methods_of**: `methods_of([1,2])` → `["push","pop","map",...]`
-- **Message chain**: Router methods return self for chaining
-
-### Statistics
-- **Tests**: 147 → 178 (+31)
-- **Code**: +7010 / -1517 lines
-
-## [v0.15] - 2026-06-28
-
-### AI Config Integration
-
-- **TokenBudget.per_call**: Per-call token limit check
-- **real_ai_chat_with_tools**: Now reads temperature/max_tokens/system from config
-- **Route config**: RouteConfig settings now applied to AI calls
-- **with mock_llm**: Mock LLM response queue for testing
-
-### Record CLI Extension
-
-- **mora record list**: List all recordings
-- **mora record stats**: Show recording statistics
-- **mora record timeline**: Show call timeline
-- **mora record export**: Export JSONL/Markdown
-- **mora record audit**: Secret scanning with .moraignore
-- **mora record report**: Evidence report generation
-- **mora snapshot**: Snapshot testing for regression
-
-### Documentation
-
-- **docs/mora-spec.md**: Mora Language Specification (20 chapters)
-- **docs/influences.md**: 9 Languages Influence Analysis
-- **docs/learning-plan.md**: Feature Integration Plan
-
-### Statistics
-- **Tests**: 126 → 147 (+21)
-
-## [v0.14] - 2026-06-27
-
-### Record/Replay/Diff CLI
-
-- **mora record**: Record AI calls to JSONL
-- **mora replay**: Replay recordings deterministically
-- **mora diff**: Compare two recordings
-
-### Statistics
-- **Tests**: 121 → 126 (+5)
-
-## [v0.13] - 2026-06-26
-
-### Breaking Changes
-
-- Removed `Type::Any` variant
-- Removed Walrus syntax (`:=`)
-
-### Statistics
-- **Tests**: 113 → 121 (+8)
-
----
-
-## Version History
-
-| Version | Date | Tests | Key Features |
-|---------|------|-------|--------------|
-| v0.20 | 2026-06-28 | 178 | 9 languages integration |
-| v0.15 | 2026-06-28 | 147 | AI config + record CLI |
-| v0.14 | 2026-06-27 | 126 | record/replay/diff |
-| v0.13 | 2026-06-26 | 121 | Remove Type::Any |

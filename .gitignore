@@ -40,3 +40,8 @@ test_output.txt
 # AI tool caches
 .codex/
 .qoder/
+
+# AI 审计 / 检测报告 (会话级产物，不应入仓)
+ARCHITECTURE_BUG_DETECTION_REPORT_*.md
+scripts/audit_stats.py
+scripts/audit_*.py

@@ -5,9 +5,6 @@
 //! cfg! 提前 return CompileReject。本文件所有测试都假设 JIT 实际能跑出
 //! 结果，与 aarch64 行为不兼容——加 `#![cfg(target_arch = "x86_64")]`
 //! 让 aarch64 runner 完全跳过整个测试 binary（cargo 编译级别，不 fail）。
-#![cfg(target_arch = "x86_64")]
-
-
 //!
 //! 守卫：JIT（run_jit 原生执行）与 MIR 解释器（run_mir）对同一程序产出
 //! **相同的 Value**。两类输入：
@@ -18,7 +15,9 @@
 //!
 //! 不可编译子集（Int×Int 算术 / Mod / Var / 调用等）→ run_jit 返回 Err
 //! （回落解释器，语义由解释器锁定）。
-//!
+
+#![cfg(target_arch = "x86_64")]
+
 //! v0.75.85（aarch64 兼容）：copy-and-patch JIT 当前仅支持 x86_64 机器码模板，
 //! aarch64 上 `try_compile` cfg! 提前 return CompileReject。这些测试期望 JIT
 //! 实际执行出结果，加 cfg 守卫避免在 aarch64 上整体失败。

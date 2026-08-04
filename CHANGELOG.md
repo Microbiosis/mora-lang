@@ -2,6 +2,61 @@
 
 All notable changes to Mora will be documented in this file.
 
+## [v0.75.85] — 2026-08-04 — MoE（Mixture-of-Experts）集成
+
+在 Mora 语言中集成 MoE 架构（Shazeer 2017 稀疏门控）——**稀疏激活**：
+router 按输入给专家打分 → top-k 只激活高分专家（其余不跑）→ 加权组合。
+与 MoA 的区别：MoA 全部专家并行 + LLM 聚合综合（协作）；MoE 稀疏执行 +
+数值加权（稀疏）。基于 MoA 基建（orchestrate 声明式编排），顺序单轮，
+零新引擎机制。
+
+**语言形态**（专家内联定义 + 语言面 router）：
+```mora
+let input = 10
+orchestrate moe input -> result
+  experts: {
+    "expert_a": fn(x) x * 2 end,        # 函数专家 → 数值输出
+    "expert_b": fn(x) x + 1 end,
+    "expert_c": {model: "gpt-4o"}       # 模型专家 → String 输出
+  }
+  router: fn(x) { {"expert_a": 0.7, "expert_b": 0.2, "expert_c": 0.1} }
+  top_k: 2                               # 稀疏：只激活 top-2 高分专家
+  prompt: p"Answer: {input}"            # 模型专家的 prompt（含 {input} 插值）
+end
+print(result)
+```
+
+**执行模型**（h_orchestrate Moe 分支，顺序单轮）：
+1. router 语言面 fn 打分 → Dict(专家名 → 分数)
+2. top-k 稀疏激活（最高分 top_k 个，其余不执行）
+3. 激活专家执行（input 注入）：
+   - 函数专家 → `call_value(fn, [input])` → 数值/任意 Value
+   - 模型专家 → `ai.chat(prompt, {model})` → String
+4. 加权组合（**引擎侧 Rust**，Float 自由，不受语言数值塔 Int+Float 约束）：
+   - 激活输出全为数值 → Σ(weightᵢ × outᵢ)，weightᵢ = scoreᵢ/top-k 分和（归一化）
+   - 含 String（模型专家）→ top-1 选择（最高分专家输出）
+
+**提交**：
+- **feat(mir)**：MirOrchestrateKind::Moe 变体 + orchestrate moe 语法
+  （experts 内联 dict / router FatArrow / top_k / prompt 字段解析）。
+- **feat(mir)**：h_orchestrate Moe 分支端到端——run_moe / run_moe_expert /
+  combine_moe_outputs（全数值归一化加权求和，含 String 退化 top-1）。
+- **chore(cleanup)**：补删 typeinfer.rs 死文件（v0.75.82 af70149 仅摘除
+  mod.rs 模块声明，文件残留未删）。
+
+**回归测试**（compile_differential）：
+- `compile_run_moe_weighted_sum`：0.7×20+0.3×11 = 17.3 断言。
+- `compile_run_moe_sparse_and_model_expert`：top_k=1 稀疏只跑 expert_a→20；
+  模型专家（mock 模式）top-1 选择。
+
+**设计取舍**：
+- **专家并行**：本轮顺序执行（MoE 单轮线性）；并行是增强点（复用 pregel
+  worker_pool 或 with_parallelism），语言面暴露并行度后续加。
+- **模型专家加权退化**：ai.chat 返回 String，加权求和无意义 → 自动退化
+  top-1 选择；纯数值 MoE 才有真加权（与用户确认的方案一致）。
+- **router 确定性**：router 是普通语言面 fn，typeck 检查、mock 可测，
+  无 AI 依赖。
+
 ## [v0.75.84] — 2026-08-04 — MoA（Mixture-of-Agents）集成
 
 在 Mora 语言中集成 MoA 架构（arXiv:2406.04692, Together AI 2024）——

@@ -320,7 +320,15 @@ mod tests {
     fn refine_nonexistent_script_errors() {
         let mut session = RefineSession::new(std::path::Path::new("/nonexistent/foo.mora"));
         let err = session.refine("test").expect_err("should fail");
-        assert!(err.contains("read"), "got: {}", err);
+        // refine() 先 create_dir_all 再 read_to_string；平台差异决定先报哪个：
+        //   - Linux:  create_dir_all /nonexistent/foo.refine → Permission denied (13)
+        //   - Windows: create_dir_all 可写 /nonexistent/foo.refine → read → not found
+        // 断言重点：refine 必须对不存在脚本返回错误（错误类型与平台无关）。
+        assert!(
+            err.contains("create_dir_all") || err.contains("read"),
+            "got: {}",
+            err
+        );
     }
 
     // ─── v0.75.8: 多候选生成 ──────────────────────────────────────

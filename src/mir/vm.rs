@@ -104,22 +104,10 @@ pub fn value_to_string(v: &Value) -> String {
     }
 }
 
-/// 值真值判定（MIR 线性执行：h_jump_if / h_jump_if_not）。
-///
-/// 注意与 `crate::flow::is_truthy` 的语义差异：本实现 List/Dict 恒真
-/// （不判空），而 flow 版对 List/Dict 判非空（`!l.is_empty()`）——后者
-/// 用于 DAG Branch 条件（vm/dag.rs）。两处语义分叉是历史残留，收敛前
-/// 修改任一方必须同步另一方并更新对应测试。
-pub fn is_truthy(v: &Value) -> bool {
-    match v {
-        Value::Bool(b) => *b,
-        Value::Nil => false,
-        Value::Float(n) => *n != 0.0,
-        Value::Int(i) => *i != 0,
-        Value::String(s) => !s.is_empty(),
-        _ => true,
-    }
-}
+// v0.75.83: vm::is_truthy 已删除 — 与 flow::is_truthy 语义分叉（本实现
+// List/Dict 恒真，flow 版判非空；且 flow 版缺 Int 分支致 Int(0) 误判真）。
+// 收敛为单一实现：crate::flow::is_truthy（MIR 条件分支唯一真值源），
+// handlers 的 h_jump_if/h_jump_if_not 与 DAG Branch 共用。
 
 /// α.2: 索引赋值 obj[idx] = val（就地修改）
 pub fn index_assign_value(obj: &mut Value, idx: &Value, val: &Value) -> Result<(), String> {

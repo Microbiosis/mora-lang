@@ -551,6 +551,7 @@ fn split_into_ssa(
             | MirInst::StructDef { .. }
             | MirInst::Transaction { .. }
             | MirInst::Send { .. }
+            | MirInst::Aggregate { .. }
             | MirInst::Rollback
             // α.5: 宏/运行时/可观测性 — SSA 中跳过
             | MirInst::MacroDef { .. }
@@ -599,6 +600,7 @@ fn is_ssa_passthrough(inst: &MirInst) -> bool {
             | MirInst::StructDef { .. }
             | MirInst::Transaction { .. }
             | MirInst::Send { .. }
+            | MirInst::Aggregate { .. }
             | MirInst::Rollback
             | MirInst::MacroDef { .. }
             | MirInst::Commit

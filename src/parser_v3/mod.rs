@@ -101,7 +101,11 @@ impl ParserV3 {
             TokenType::Identifier(ref s) if s == "while" => self.emit_while_w().map(|(_, w)| w),
             // v0.75.81: 事务家族 + eval 断言（顶层同嵌套分发）
             TokenType::Identifier(ref s)
-                if s == "transaction" || s == "commit" || s == "rollback" || s == "eval" =>
+                if s == "transaction"
+                    || s == "commit"
+                    || s == "rollback"
+                    || s == "eval"
+                    || s == "aggregate" =>
             {
                 self.emit_statement_expr_w().map(|(_, w)| w)
             }
@@ -1159,6 +1163,7 @@ impl ParserV3 {
             TokenType::Identifier(n) if n == "while" => self.emit_while_w(),
             TokenType::Identifier(n) if n == "transaction" => self.emit_transaction_w(),
             TokenType::Identifier(n) if n == "eval" => self.emit_eval_w(),
+            TokenType::Identifier(n) if n == "aggregate" => self.emit_aggregate_w(),
             TokenType::Identifier(n) if n == "commit" => {
                 let span = self.span_of_current();
                 self.advance(); // 'commit'
@@ -1384,6 +1389,31 @@ impl ParserV3 {
             expects,
             tolerance: None,
             replay_path: None,
+        });
+        let w = MirWitness {
+            kind: WitnessKind::Sequence(vec![]),
+            span,
+        };
+        Some((0, w))
+    }
+
+    /// v0.75.83: aggregate 语句 — 向 per-super-step 聚合器贡献值。
+    ///
+    /// ```mora
+    /// aggregate name, value_expr
+    /// ```
+    /// name 为聚合器名（引擎 config.aggregators 声明，reducer Add/Max/Min/
+    /// Last/Concat）；value_expr 为贡献值。经 h_aggregate push 到 MirHost
+    /// 缓冲，Pregel 引擎超步末收集归约。witness = 空 Sequence（无值语句）。
+    fn emit_aggregate_w(&mut self) -> Option<(Reg, MirWitness)> {
+        let span = self.span_of_current();
+        self.advance(); // 'aggregate'
+        let name = self.consume_identifier("Expected aggregator name after 'aggregate'")?;
+        self.consume(TokenType::Comma, "Expected ',' after aggregator name")?;
+        let (value_reg, _) = self.emit_expr_w()?;
+        self.emit.emit(MirInst::Aggregate {
+            name,
+            value: value_reg,
         });
         let w = MirWitness {
             kind: WitnessKind::Sequence(vec![]),

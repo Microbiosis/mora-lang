@@ -140,6 +140,7 @@ impl CostModel for TokenEstimate {
             MirInst::Rollback | MirInst::Commit => 1,
             // Actor 消息
             MirInst::Send { .. } => 3,
+            MirInst::Aggregate { .. } => 3,
             // Worker
             MirInst::Worker { body, .. } => {
                 body.body.iter().map(|i| self.inst_cost(i)).sum::<u32>() + 5

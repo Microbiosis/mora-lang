@@ -675,6 +675,14 @@ impl MirPregelEngine {
                 self.apply_write(channel, value, interpreter)?;
             }
 
+            // v0.75.83: 收集 agent 经 aggregate 语句提交的贡献（MirHost 缓冲，
+            // 与 dynamic_sends 同构）→ aggregator_contribute 归约。
+            // 此前 h_aggregate 为空操作，语言层 → 引擎的贡献通道断头。
+            let contributions = std::mem::take(interpreter.aggregator_contributions());
+            for contrib in contributions {
+                self.aggregator_contribute(&contrib.name, contrib.value)?;
+            }
+
             // v0.71: Publish aggregator results as channels for next step.
             for (name, value) in &self.aggregator_acc {
                 self.channels

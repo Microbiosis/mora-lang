@@ -206,6 +206,10 @@ impl crate::mir::host::MirHost for Interpreter {
         &mut self.core.dynamic_sends
     }
 
+    fn aggregator_contributions(&mut self) -> &mut Vec<crate::mir::expr::AggregatorContribution> {
+        &mut self.core.aggregator_contributions
+    }
+
     fn checkpoint_saver(&self) -> Option<Arc<dyn crate::checkpoint::CheckpointSaver>> {
         self.persist.checkpoint_saver()
     }

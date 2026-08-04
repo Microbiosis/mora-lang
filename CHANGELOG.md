@@ -2,6 +2,28 @@
 
 All notable changes to Mora will be documented in this file.
 
+## [v0.75.83] — 2026-08-04 — h_aggregate 断头接线 + is_truthy 收敛
+
+修复 reviewer 记录的两个设计缺陷项：
+
+- **h_aggregate 断头**：注释声称"被 h_aggregate 调用"的 aggregator_contribute
+  实际无语言层入口（h_aggregate 空操作 `let _ = (interp, name, val)`）。
+  修复（与 h_send/dynamic_sends 同构）：新增 `MirInst::Aggregate{name, value}`
+  + 语句前端 `aggregate name, value_expr`（emit 顶层/嵌套双分发，witness 复用
+  Sequence）+ MirHost 缓冲 `aggregator_contributions()`（CoreRuntime 字段），
+  h_aggregate push，Pregel 引擎超步 UPDATE 后 `mem::take` 收集并经
+  aggregator_contribute 归约，结果以 aggregator_<name> channel 暴露下一超步。
+  语言层 → 引擎贡献通道从此连通。
+- **is_truthy 双实现收敛**：vm::is_truthy（List/Dict 恒真）与 flow::is_truthy
+  （判空）语义分叉，且 flow 版缺 Int 分支（Int(0) 落 `_ => true` 误判真）。
+  收敛为单一实现 flow::is_truthy（补 Int 分支；Nil/Int(0)/Float(0.0)/空
+  String/空 List/空 Dict 均 falsy），删除 vm::is_truthy，handlers 的
+  h_jump_if/h_jump_if_not 与 DAG Branch、dispatch filter 全部指向同一实现。
+
+回归测试：compile_differential 新增 compile_run_aggregate_statement（缓冲
+收集断言）+ compile_run_truthiness_converged（空 List falsy）。验证：全量
+测试绿（docker 依赖 skip）+ clippy `-D warnings` 0 + fmt 0。
+
 ## [v0.75.82] — 2026-08-04 — 删 typeinfer 死模块（活替代 = witness typeck）
 
 按「先查相同作用不同名字，有替代则删」原则处置 typeinfer 死模块：

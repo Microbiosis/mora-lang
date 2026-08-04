@@ -662,6 +662,17 @@ pub fn h_orchestrate(
             let config = build_moa_config(*layers, proposers, aggregator, prompt, input_var)?;
             run_pregel_config(interp, env, config, input_var, result_var)
         }
+        // v0.75.85: MoE（Mixture-of-Experts，Shazeer 2017 稀疏门控）— 单轮
+        // 线性流程：router 打分 → top-k 稀疏激活 → 专家执行 → 加权组合。
+        // 顺序执行（MoE 无超步，不用 pregel 图）。
+        MirOrchestrateKind::Moe {
+            experts,
+            router,
+            top_k,
+            prompt,
+        } => run_moe(
+            interp, env, experts, router, *top_k, prompt, input_var, result_var,
+        ),
         MirOrchestrateKind::Sequential { agents } => {
             // v0.75.34: Sequential orchestrate 执行 — 按声明顺序逐个执行
             // agent 的 prelowered task_body，前一个 agent 的输出作为下一个
@@ -699,6 +710,203 @@ pub fn h_orchestrate(
             Ok(())
         }
         other => Err(format!("orchestrate({:?}) not yet supported", other)),
+    }
+}
+
+// ─── v0.75.85: MoE（Mixture-of-Experts）执行 ───────────────────────
+// 稀疏门控（Shazeer 2017）：router 语言面 fn 打分 → top-k 稀疏激活 →
+// 专家执行 → 加权组合。顺序单轮，无超步。
+// 组合规则（引擎侧 Rust，Float 自由，不受语言数值塔约束）：
+//   激活专家输出全为数值 → Σ(weightᵢ × outᵢ)，weightᵢ = scoreᵢ/top-k 分和
+//   （归一化 softmax 权重）。
+//   含 String（模型专家）→ top-1 选择（最高分专家输出）——加权求和无意义。
+
+/// 执行 MoE：router 打分 → top-k → 专家执行 → 加权组合 → result_var 绑定。
+#[allow(clippy::too_many_arguments)] // 与 h_eval 同型（orchestrate 执行签名簇）
+fn run_moe(
+    interp: &mut dyn MirHost,
+    env: &mut Environment,
+    experts: &[crate::mir::expr::MirMoeExpert],
+    router: &crate::mir::expr::MirExpr,
+    top_k: usize,
+    prompt: &crate::mir::expr::MirExpr,
+    input_var: &str,
+    result_var: &str,
+) -> Result<(), String> {
+    if experts.is_empty() {
+        return Err("moe: experts must not be empty".to_string());
+    }
+    if top_k == 0 {
+        return Err("moe: top_k must be >= 1".to_string());
+    }
+
+    let input_val = env.get(input_var).unwrap_or(Value::Nil);
+
+    // 1. router 执行（语言面 fn）→ 分数 dict
+    let router_val = eval_expr_value(interp, env, router)?;
+    let scores = match interp.call_value(&router_val, vec![input_val.clone()])? {
+        Value::Dict(d) => d,
+        other => {
+            return Err(format!(
+                "moe: router must return a Dict of expert scores, got {:?}",
+                other
+            ));
+        }
+    };
+
+    // 2. top-k 稀疏：按分数降序取前 top_k 个专家
+    let mut scored: Vec<(String, f64)> = Vec::new();
+    for (name, score) in &scores {
+        let s = value_to_f64(score).ok_or_else(|| {
+            format!(
+                "moe: router score for '{}' must be a number, got {:?}",
+                name, score
+            )
+        })?;
+        scored.push((name.clone(), s));
+    }
+    scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    scored.truncate(top_k);
+    if scored.is_empty() {
+        return Err("moe: router returned no scores".to_string());
+    }
+
+    // 3. 激活专家执行
+    let mut outputs: Vec<(String, f64, Value)> = Vec::new(); // (name, score, output)
+    let mut score_sum = 0.0f64;
+    for (name, score) in &scored {
+        let expert = experts
+            .iter()
+            .find(|e| &e.name == name)
+            .ok_or_else(|| format!("moe: router referenced unknown expert '{}'", name))?;
+        let out = run_moe_expert(interp, env, expert, &input_val, prompt)?;
+        score_sum += *score;
+        outputs.push((name.clone(), *score, out));
+    }
+
+    // 4. 加权组合
+    let result = combine_moe_outputs(&outputs, score_sum);
+    env.define(result_var.to_string(), result, false);
+    Ok(())
+}
+
+/// 执行单个专家：函数专家 call_value(fn, [input])；模型专家 ai.chat。
+fn run_moe_expert(
+    interp: &mut dyn MirHost,
+    env: &mut Environment,
+    expert: &crate::mir::expr::MirMoeExpert,
+    input_val: &Value,
+    prompt: &crate::mir::expr::MirExpr,
+) -> Result<Value, String> {
+    let def_val = eval_expr_value(interp, env, &expert.def)?;
+    match def_val {
+        // 函数专家：Closure/Task/Compose/Partial → call_value
+        Value::Closure { .. } | Value::Task { .. } | Value::Compose(_) | Value::Partial(_, _) => {
+            interp.call_value(&def_val, vec![input_val.clone()])
+        }
+        // 模型专家：{model: "..."} → ai.chat(prompt, {model})
+        Value::Dict(d) => {
+            let model = match d.get("model") {
+                Some(Value::String(m)) => m.clone(),
+                _ => {
+                    return Err(format!(
+                        "moe: expert '{}' dict must have a 'model' string key",
+                        expert.name
+                    ));
+                }
+            };
+            // prompt 表达式 → 值（含 {input} 插值，经 env 的 input 变量）
+            let prompt_val = eval_expr_value(interp, env, prompt)?;
+            let prompt_str = match prompt_val {
+                Value::String(s) => s,
+                other => other.to_string(),
+            };
+            // ai.chat 是方法调用（ai.chat(prompt, {model})），经 env 的
+            // ai builtin + MethodCall 指令执行。
+            let mut body: Vec<crate::mir::MirInst> = Vec::new();
+            let mut nxt = 0usize;
+            let ai_r = 0;
+            body.push(crate::mir::MirInst::Var(ai_r, "ai".to_string()));
+            nxt += 1;
+            let prompt_r = nxt;
+            body.push(crate::mir::MirInst::Const(
+                prompt_r,
+                Value::String(prompt_str),
+            ));
+            nxt += 1;
+            let dict_r = nxt;
+            let mut cfg = HashMap::new();
+            cfg.insert("model".to_string(), Value::String(model));
+            body.push(crate::mir::MirInst::Const(dict_r, Value::Dict(cfg)));
+            nxt += 1;
+            let res_r = nxt;
+            body.push(crate::mir::MirInst::MethodCall(
+                res_r,
+                ai_r,
+                "chat".to_string(),
+                vec![prompt_r, dict_r],
+            ));
+            nxt += 1;
+            let body_fn = MirFunction {
+                params: vec![],
+                body,
+                n_regs: nxt,
+            };
+            let mut expert_env = env.clone();
+            crate::mir::vm::run_mir(&std::sync::Arc::new(body_fn), interp, &mut expert_env)
+        }
+        other => Err(format!(
+            "moe: expert '{}' must be a function or {{model: \"...\"}} dict, got {:?}",
+            expert.name, other
+        )),
+    }
+}
+
+/// 组合：全数值 → 归一化加权求和；含 String → top-1 选择。
+fn combine_moe_outputs(outputs: &[(String, f64, Value)], score_sum: f64) -> Value {
+    let all_numeric = outputs
+        .iter()
+        .all(|(_, _, o)| matches!(o, Value::Int(_) | Value::Float(_)));
+    if all_numeric && score_sum > 0.0 {
+        let mut acc = 0.0f64;
+        for (_, score, out) in outputs {
+            let v = match out {
+                Value::Int(i) => *i as f64,
+                Value::Float(f) => *f,
+                _ => 0.0,
+            };
+            let w = score / score_sum;
+            acc += w * v;
+        }
+        Value::Float(acc)
+    } else {
+        // 含 String（模型专家）→ top-1（输出已按分数降序）
+        outputs
+            .first()
+            .map(|(_, _, o)| o.clone())
+            .unwrap_or(Value::Nil)
+    }
+}
+
+/// 执行 MirExpr → Value（lower 单表达式 + run_mir）。
+/// 闭包构造经 h_closure（run_mir 内）产出 Value::Closure；dict 经 h_dict_lit。
+fn eval_expr_value(
+    interp: &mut dyn MirHost,
+    env: &mut Environment,
+    expr: &crate::mir::expr::MirExpr,
+) -> Result<Value, String> {
+    let lowered = crate::mir::lower::lower_mir_exprs(std::slice::from_ref(expr))
+        .map_err(|e| format!("moe: expert/router lowering failed: {}", e))?;
+    let mut inner_env = env.clone();
+    crate::mir::vm::run_mir(&std::sync::Arc::new(lowered), interp, &mut inner_env)
+}
+
+/// Value → f64（router 分数解析；Int/Float 均接受）。
+fn value_to_f64(v: &Value) -> Option<f64> {
+    match v {
+        Value::Int(i) => Some(*i as f64),
+        Value::Float(f) => Some(*f),
+        _ => None,
     }
 }
 

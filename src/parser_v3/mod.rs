@@ -1852,11 +1852,16 @@ impl ParserV3 {
             "loop".to_string()
         } else {
             let name = self.consume_identifier(
-                "Expected orchestrate kind (sequential/loop/graph/pregel/moa)",
+                "Expected orchestrate kind (sequential/loop/graph/pregel/moa/moe)",
             )?;
-            if name != "sequential" && name != "graph" && name != "pregel" && name != "moa" {
+            if name != "sequential"
+                && name != "graph"
+                && name != "pregel"
+                && name != "moa"
+                && name != "moe"
+            {
                 eprintln!(
-                    "Parse error: Expected orchestrate kind (sequential/loop/graph/pregel/moa) at line {}",
+                    "Parse error: Expected orchestrate kind (sequential/loop/graph/pregel/moa/moe) at line {}",
                     self.current_line()
                 );
                 return None;
@@ -1881,6 +1886,11 @@ impl ParserV3 {
         let mut moa_proposers: Vec<String> = Vec::new();
         let mut moa_aggregator: Option<String> = None;
         let mut moa_prompt: Option<MirExpr> = None;
+        // v0.75.85: MoE 声明字段（kind == "moe"）
+        let mut moe_experts: Vec<crate::mir::expr::MirMoeExpert> = Vec::new();
+        let mut moe_router: Option<MirExpr> = None;
+        let mut moe_top_k: Option<usize> = None;
+        let mut moe_prompt: Option<MirExpr> = None;
 
         loop {
             // Skip blank lines
@@ -1939,6 +1949,61 @@ impl ParserV3 {
                         }
                         "prompt" => {
                             moa_prompt = self.parse_assignment();
+                        }
+                        _ => return None,
+                    }
+                    continue;
+                }
+            }
+
+            // v0.75.85: MoE 字段声明（experts / router / top_k / prompt）
+            if kind_str == "moe" {
+                let is_moe_field = self.peek_is_identifier("experts")
+                    || self.peek_is_identifier("router")
+                    || self.peek_is_identifier("top_k")
+                    || self.peek_is_identifier("prompt");
+                if is_moe_field {
+                    let field = self.consume_identifier("Expected moe field")?;
+                    self.consume(TokenType::Colon, "Expected ':' after moe field")?;
+                    match field.as_str() {
+                        "experts" => {
+                            if !self.match_token_exact(TokenType::LBrace) {
+                                return None;
+                            }
+                            while !self.check(&TokenType::RBrace) && !self.is_at_end() {
+                                while self.match_token(&[TokenType::Newline]) {}
+                                let name = match self.peek().cloned()?.token_type {
+                                    TokenType::String(s) => {
+                                        self.advance();
+                                        s
+                                    }
+                                    _ => return None,
+                                };
+                                self.consume(TokenType::Colon, "Expected ':' after expert name")?;
+                                if let Some(def) = self.parse_assignment() {
+                                    moe_experts.push(crate::mir::expr::MirMoeExpert { name, def });
+                                }
+                                while self.match_token(&[TokenType::Newline]) {}
+                                if !self.match_token(&[TokenType::Comma]) {
+                                    break;
+                                }
+                            }
+                            self.consume(TokenType::RBrace, "Expected '}' after experts")?;
+                        }
+                        "router" => {
+                            moe_router = self.parse_assignment();
+                        }
+                        "top_k" => {
+                            let tok = self.advance()?;
+                            let n = match tok.token_type {
+                                TokenType::Float(f) => f.max(1.0) as usize,
+                                TokenType::Int(i) => i.max(1) as usize,
+                                _ => return None,
+                            };
+                            moe_top_k = Some(n);
+                        }
+                        "prompt" => {
+                            moe_prompt = self.parse_assignment();
                         }
                         _ => return None,
                     }
@@ -2044,6 +2109,20 @@ impl ParserV3 {
                     layers,
                     proposers,
                     aggregator,
+                    prompt,
+                }
+            }
+            // v0.75.85: MoE — 声明参数直接构造（执行在 h_orchestrate）。
+            "moe" => {
+                let router =
+                    moe_router.unwrap_or_else(|| MirExpr::var("input".to_string(), start_span));
+                let top_k = moe_top_k.unwrap_or(2);
+                let prompt =
+                    moe_prompt.unwrap_or_else(|| MirExpr::var("input".to_string(), start_span));
+                MirOrchestrateKind::Moe {
+                    experts: moe_experts,
+                    router,
+                    top_k,
                     prompt,
                 }
             }

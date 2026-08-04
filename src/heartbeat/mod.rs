@@ -34,10 +34,9 @@ impl HeartbeatItem {
             (true, t.to_string())
         } else if let Some(t) = rest.strip_prefix("[] ") {
             (false, t.to_string())
-        } else if let Some(t) = rest.strip_prefix("[ ] ") {
-            (false, t.to_string())
         } else {
-            return None;
+            let t = rest.strip_prefix("[ ] ")?;
+            (false, t.to_string())
         };
         Some(HeartbeatItem {
             text,

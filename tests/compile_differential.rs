@@ -393,3 +393,67 @@ fn compile_run_moa_layered() {
         s
     );
 }
+
+/// v0.75.85: 回归测试 — MoE 数值加权求和（稀疏门控）。
+/// router 打分 → top-k 激活 → Σ(weightᵢ × expertᵢ(input))。
+/// 验证 0.7×20 + 0.3×11 = 17.3。
+#[test]
+fn compile_run_moe_weighted_sum() {
+    let src = "let input = 10\norchestrate moe input -> result\n  experts: {\n    \"expert_a\": fn(x) x * 2 end,\n    \"expert_b\": fn(x) x + 1 end\n  }\n  router: fn(x) => {\"expert_a\": 0.7, \"expert_b\": 0.3}\n  top_k: 2\nend\nprint(result)";
+    let (func, witnesses) = ParserV3::compile(src).expect("compile should succeed");
+    let type_errors = mora::typeck::check_mir::check_program_witnesses(&witnesses);
+    assert!(
+        type_errors.is_empty(),
+        "typeck should pass: {:?}",
+        type_errors
+    );
+    let mut interp = mora::interpreter::Interpreter::new();
+    let mut env = interp.take_env();
+    let func_arc = std::sync::Arc::new(func);
+    mora::mir::vm::run_mir(&func_arc, &mut interp, &mut env).expect("run_mir should not fail");
+    mora::mir::vm::run_main_task(&func_arc, &mut interp, &mut env)
+        .expect("run_main_task should succeed (MoE weighted sum)");
+    let result = env.get("result").expect("result should be defined");
+    let s = result.to_string();
+    assert!(s.contains("17.3"), "0.7*20 + 0.3*11 = 17.3, got: {}", s);
+}
+
+/// v0.75.85: 回归测试 — MoE top_k 稀疏激活 + 模型专家 top-1 退化。
+/// top_k=1 只跑最高分专家（expert_b 不执行）；含模型专家时加权求和无
+/// 意义 → top-1 选择（mock 模式返回确定性响应）。
+#[test]
+fn compile_run_moe_sparse_and_model_expert() {
+    // 稀疏：top_k=1 只跑 expert_a（0.9），expert_b（x+100）不执行
+    let src = "let input = 10\norchestrate moe input -> result\n  experts: {\n    \"expert_a\": fn(x) x * 2 end,\n    \"expert_b\": fn(x) x + 100 end\n  }\n  router: fn(x) => {\"expert_a\": 0.9, \"expert_b\": 0.1}\n  top_k: 1\nend\nprint(result)";
+    let (func, _w) = ParserV3::compile(src).expect("compile should succeed");
+    let mut interp = mora::interpreter::Interpreter::new();
+    let mut env = interp.take_env();
+    let arc = std::sync::Arc::new(func);
+    mora::mir::vm::run_mir(&arc, &mut interp, &mut env).expect("run_mir should not fail");
+    mora::mir::vm::run_main_task(&arc, &mut interp, &mut env)
+        .expect("run_main_task should succeed (sparse)");
+    let result = env.get("result").expect("result should be defined");
+    assert_eq!(
+        result.to_string(),
+        "20",
+        "top_k=1 should only run expert_a (2*10), got: {}",
+        result
+    );
+
+    // 模型专家混合：含 String 输出 → top-1 选择（最高分模型专家）
+    let src2 = "let input = \"hi\"\norchestrate moe input -> result\n  experts: {\n    \"fn_exp\": fn(x) 42 end,\n    \"model_exp\": {model: \"gpt-4o\"}\n  }\n  router: fn(x) => {\"fn_exp\": 0.2, \"model_exp\": 0.8}\n  top_k: 2\n  prompt: p\"Answer: {input}\"\nend\nprint(result)";
+    let (func2, _w2) = ParserV3::compile(src2).expect("compile should succeed");
+    let mut interp2 = mora::interpreter::Interpreter::new();
+    let mut env2 = interp2.take_env();
+    let arc2 = std::sync::Arc::new(func2);
+    mora::mir::vm::run_mir(&arc2, &mut interp2, &mut env2).expect("run_mir should not fail");
+    mora::mir::vm::run_main_task(&arc2, &mut interp2, &mut env2)
+        .expect("run_main_task should succeed (model expert)");
+    let result2 = env2.get("result").expect("result2 should be defined");
+    let s2 = result2.to_string();
+    assert!(
+        s2.contains("Mock response for: Answer: hi"),
+        "model expert (top-1) should win, got: {}",
+        s2
+    );
+}

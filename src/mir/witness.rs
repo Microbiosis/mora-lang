@@ -442,6 +442,13 @@ pub enum WitnessOrchestrateKind {
         aggregator: String,
         prompt: Box<MirWitness>,
     },
+    /// v0.75.85: MoE（Mixture-of-Experts）— 稀疏门控声明。
+    Moe {
+        experts: Vec<MirWitness>,
+        router: Box<MirWitness>,
+        top_k: usize,
+        prompt: Box<MirWitness>,
+    },
 }
 
 impl WitnessOrchestrateKind {
@@ -488,6 +495,21 @@ impl WitnessOrchestrateKind {
                 layers: *layers,
                 proposers: proposers.clone(),
                 aggregator: aggregator.clone(),
+                prompt: Box::new(MirWitness::from_expr(prompt)),
+            },
+            // v0.75.85: MoE — 稀疏门控（router 打分 → top-k → 加权）。
+            MirOrchestrateKind::Moe {
+                experts,
+                router,
+                top_k,
+                prompt,
+            } => WitnessOrchestrateKind::Moe {
+                experts: experts
+                    .iter()
+                    .map(|e| MirWitness::from_expr(&e.def))
+                    .collect(),
+                router: Box::new(MirWitness::from_expr(router)),
+                top_k: *top_k,
                 prompt: Box::new(MirWitness::from_expr(prompt)),
             },
         }

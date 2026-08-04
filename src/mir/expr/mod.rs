@@ -465,6 +465,30 @@ pub enum MirOrchestrateKind {
         /// 由引擎按 Aggregate-and-Synthesize 模板生成）。
         prompt: MirExpr,
     },
+    /// v0.75.85: MoE（Mixture-of-Experts，Shazeer 2017 稀疏门控）— 稀疏激活。
+    /// router 语言面 fn 打分 → top-k 稀疏（只跑被选专家）→ 加权组合
+    /// （引擎侧 Float 自由，不受语言数值塔约束）。与 MoA 的区别：MoA 全
+    /// 部专家跑 + LLM 聚合综合（协作）；MoE 只跑部分专家 + 数值加权（稀疏）。
+    Moe {
+        /// 专家定义：名 → 函数闭包（fn(x) → number）或模型配置
+        /// （{model: "..."}，输出 String）。见 MirMoeExpert。
+        experts: Vec<MirMoeExpert>,
+        /// 路由器（门控）：语言面 fn(x) → Dict(专家名 → 分数)。
+        router: MirExpr,
+        /// 稀疏度：只激活分数最高 top_k 个专家（标准配置 2，k=1 可行）。
+        top_k: usize,
+        /// 模型专家的 prompt（含 {input} 插值）。
+        prompt: MirExpr,
+    },
+}
+
+/// v0.75.85: MoE 专家定义 — 名 + 定义表达式。
+/// def 执行后为 Value::Closure（函数专家，数值输出）或 Value::Dict
+/// （{model: "..."}，模型专家，String 输出）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct MirMoeExpert {
+    pub name: String,
+    pub def: MirExpr,
 }
 
 ///  Agent definition in orchestrate

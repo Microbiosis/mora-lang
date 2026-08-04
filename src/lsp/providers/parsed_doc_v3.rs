@@ -165,6 +165,19 @@ fn walk_witness_orchestrate(kind: &WitnessOrchestrateKind, visit: &mut dyn FnMut
         WitnessOrchestrateKind::Moa { prompt, .. } => {
             visit(prompt);
         }
+        // v0.75.85: MoE — router/prompt/专家定义参与 walk。
+        WitnessOrchestrateKind::Moe {
+            experts,
+            router,
+            prompt,
+            ..
+        } => {
+            visit(router);
+            visit(prompt);
+            for e in experts {
+                visit(e);
+            }
+        }
     }
 }
 

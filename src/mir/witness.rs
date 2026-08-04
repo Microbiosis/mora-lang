@@ -435,6 +435,13 @@ pub enum WitnessOrchestrateKind {
         interrupt_points: Vec<crate::mir::expr::MirInterruptPoint>,
         adjacency: std::collections::HashMap<String, Vec<String>>,
     },
+    /// v0.75.84: MoA（Mixture-of-Agents）— 分层多模型协作声明。
+    Moa {
+        layers: usize,
+        proposers: Vec<String>,
+        aggregator: String,
+        prompt: Box<MirWitness>,
+    },
 }
 
 impl WitnessOrchestrateKind {
@@ -470,6 +477,18 @@ impl WitnessOrchestrateKind {
                 checkpoint: checkpoint.clone(),
                 interrupt_points: interrupt_points.clone(),
                 adjacency: adjacency.clone(),
+            },
+            // v0.75.84: MoA — 编译到 pregel 图，witness 记录声明参数。
+            MirOrchestrateKind::Moa {
+                layers,
+                proposers,
+                aggregator,
+                prompt,
+            } => WitnessOrchestrateKind::Moa {
+                layers: *layers,
+                proposers: proposers.clone(),
+                aggregator: aggregator.clone(),
+                prompt: Box::new(MirWitness::from_expr(prompt)),
             },
         }
     }

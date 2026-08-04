@@ -161,6 +161,10 @@ fn walk_witness_orchestrate(kind: &WitnessOrchestrateKind, visit: &mut dyn FnMut
                 visit(e);
             }
         }
+        // v0.75.84: MoA — prompt 表达式参与 walk（LSP 语义/折叠）。
+        WitnessOrchestrateKind::Moa { prompt, .. } => {
+            visit(prompt);
+        }
     }
 }
 

@@ -30,9 +30,9 @@ an HTTP server and an MCP server.
   `MirFunction<MirInst>` + `MirWitness` → witness typecheck → MIR
   optimize → DAG → `vm::run_mir`; copy-and-patch JIT always compiled
   (v0.75.43, no feature gate).
-- **HM type inference** — Hindley-Milner inference opt-in via
-  `MORA_HM=1`; default witness-based typecheck on by default
-  (`MORA_NO_TYPECK=1` to skip).
+- **HM type inference** — Hindley-Milner inference is the default
+  type checker (`src/typeck/hm/`); v0.75.29 removed the dead
+  `MORA_HM=1` opt-in switch. `MORA_NO_TYPECK=1` skips typecheck.
 - **LSP server (`mora-lsp`)** — hover / completion / definition /
   references / rename / semanticTokens / foldingRange /
   publishDiagnostics over stdio JSON-RPC 2.0.
@@ -188,8 +188,8 @@ Run with `mora script.mora` — both HTTP (3000) and MCP (stdio) come up.
 | `MORA_AI_MODEL`      | Default AI model      | `gpt-4o-mini` |
 | `MORA_AI_BASE_URL`   | AI base URL           | `https://api.openai.com/v1` |
 | `MORA_EMBED_MODEL`   | Embedding model       | `text-embedding-3-small` |
-| `MORA_NO_TYPECK`     | `1` skips type check  | unset → enabled |
-| `MORA_HM`            | `1` enables HM inference | unset → witness typecheck only |
+| `MORA_NO_TYPECK`     | `1` skips type check  | unset → HM inference enabled |
+| `MORA_OPT`           | SSA optimization level (`0`/`1`/`2`) | unset → no opt |
 
 ## Server modes
 
@@ -323,7 +323,7 @@ Key modules under `src/`:
 - `parser_v3/` — Arena-based MIR expression builder (v0.55)
 - `mir/` — SSA IR + DAG + copy-and-patch JIT (v0.75.43) + `witness` typeck
 - `interpreter/` — value runtime, AI builtins (`ai_chat.rs` + `builtins/`)
-- `typeck/` — HM inference (`MORA_HM=1`) + witness checker
+- `typeck/` — HM inference (default type checker, `src/typeck/hm/`) + `witness` checker
 - `lsp/` — JSON-RPC server + 9 providers
 - `pregel/` — v0.50 BSP worker pool
 - `checkpoint/` — v0.50 Memory + SQLite persistence (optional `checkpoint-sqlite` feature)
@@ -339,7 +339,7 @@ Run any file with `mora path/to/file.mora`:
 
 - `mcp_server_demo.mora` — MCP tool registration + serve
 - `compress_demo.mora` / `compress_smart_demo.mora` / `compact_demo.mora` — v0.29/v0.30 compress + SmartCrusher
-- `hm_basic_demo.mora` — HM type inference walk-through (set `MORA_HM=1`)
+- `hm_basic_demo.mora` — HM type inference walk-through (HM is the default type checker)
 - `integration_v0_34.mora` — bus / sandbox / schedule / ccr / mock builtin tour
 - `jit_bench.rs` — `cargo run --release --example jit_bench` (JIT vs interpreter)
 - `lsp_smoke.rs` / `lsp_v04_smoke.py` — LSP end-to-end

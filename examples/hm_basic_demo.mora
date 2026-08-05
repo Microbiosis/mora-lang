@@ -1,7 +1,8 @@
-#version = "v0.53"
-
 # HM Type Inference Demo - Mora-lang
-# Enable with: MORA_HM=1 cargo run -- hm_basic_example.mora
+# HM inference is the default type checker (no flag needed since v0.75.29
+# removed the dead MORA_HM=1 switch — see CHANGELOG v0.75.29).
+#
+# Run:  cargo run -- examples/hm_basic_demo.mora
 
 # ===================================================================
 # Example 1: Basic Literal Inference

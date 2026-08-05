@@ -4,14 +4,12 @@ This directory contains example programs demonstrating the **Hindley-Milner type
 
 ## Setup
 
-To enable HM inference, set the `MORA_HM` environment variable:
+HM inference is the default type checker for all Mora scripts (no flag needed
+since v0.75.29 removed the dead `MORA_HM=1` switch — see CHANGELOG v0.75.29).
+Run any example directly:
 
 ```bash
-# Windows PowerShell
-$env:MORA_HM="1"; cargo run -- examples/hm_inference.mora
-
-# Unix/macOS
-MORA_HM=1 cargo run -- examples/hm_inference.mora
+cargo run -- examples/hm_basic_demo.mora
 ```
 
 ## Examples
@@ -258,7 +256,7 @@ Examples that should trigger type inference errors:
 # apply_three_args(x => x * 2)  # Closure takes 1 arg, but 3 provided
 
 # The HM inference system should report these with span information
-print("Run this file with MORA_HM=1 to see type errors")
+print("Run this file directly — HM inference is the default type checker")
 ```
 
 ---
@@ -268,7 +266,6 @@ print("Run this file with MORA_HM=1 to see type errors")
 ### Run all examples:
 ```powershell
 cd examples
-$env:MORA_HM="1"
 foreach ($file in Get-ChildItem "*.mora") {
     Write-Host "Testing $($file.Name)..."
     cargo run -- $file.FullName
@@ -277,7 +274,6 @@ foreach ($file in Get-ChildItem "*.mora") {
 
 ### Specific test:
 ```powershell
-$env:MORA_HM="1"
 cargo run -- hm_basic_inference.mora
 ```
 
@@ -342,7 +338,7 @@ To add new examples:
 2. Include version comment at top
 3. Add comprehensive comments explaining the concept
 4. Document expected type inlines and potential errors
-5. Test with `MORA_HM=1` to verify correct behavior
+5. Run `cargo run -- file.mora` to verify correct behavior (HM is the default)
 
 ---
 

@@ -481,6 +481,105 @@ mod tests {
 
     use crate::typeck::check_union;
 
+    // ─── v0.75.86: HMInference::diagnosed 双向 fallback 抑制 ───
+
+    use crate::common::Span;
+    use crate::mir::witness::{MirWitness, WitnessKind};
+    use crate::typeck::hm::HMInference;
+
+    fn lit_witness(n: i64) -> MirWitness {
+        MirWitness {
+            kind: WitnessKind::Literal(crate::common::Literal::Int(n, Span::default())),
+            span: Span::new(1, 0),
+        }
+    }
+
+    fn var_witness(name: &str, line: usize, column: usize) -> MirWitness {
+        MirWitness {
+            kind: WitnessKind::Variable(name.to_string()),
+            span: Span::new(line, column),
+        }
+    }
+
+    #[test]
+    fn diagnosed_empty_set() {
+        // 新建 HMInference 没有节点被诊断
+        let hm = HMInference::new();
+        let w = lit_witness(42);
+        assert!(!hm.is_diagnosed(&w));
+    }
+
+    #[test]
+    fn diagnosed_mark_and_query() {
+        let mut hm = HMInference::new();
+        let w = lit_witness(42);
+        // 标记前 false
+        assert!(!hm.is_diagnosed(&w));
+        // 标记后 true
+        hm.mark_diagnosed(&w);
+        assert!(hm.is_diagnosed(&w));
+        // 另一个未标记的 witness（不同行）仍 false
+        let w2 = var_witness("y", 2, 0);
+        assert!(!hm.is_diagnosed(&w2));
+    }
+
+    #[test]
+    fn diagnosed_distinguishes_position() {
+        // 同一表达式不同位置 → 视为不同节点
+        let mut hm = HMInference::new();
+        let w1 = var_witness("x", 1, 5);
+        let w2 = var_witness("y", 2, 5); // 同样 kind（Variable）但 line 不同
+        hm.mark_diagnosed(&w1);
+        assert!(hm.is_diagnosed(&w1));
+        assert!(!hm.is_diagnosed(&w2));
+    }
+
+    #[test]
+    fn diagnosed_distinguishes_kind() {
+        // 同一位置不同 kind → 视为不同节点
+        let mut hm = HMInference::new();
+        let lit = MirWitness {
+            kind: WitnessKind::Literal(crate::common::Literal::Int(42, Span::default())),
+            span: Span::new(1, 0),
+        };
+        let var = MirWitness {
+            kind: WitnessKind::Variable("x".to_string()),
+            span: Span::new(1, 0),
+        };
+        // 同一 line/column 不同 kind（Literal vs Variable）—— 应互不干扰
+        hm.mark_diagnosed(&lit);
+        assert!(hm.is_diagnosed(&lit));
+        assert!(!hm.is_diagnosed(&var));
+        hm.mark_diagnosed(&var);
+        assert!(hm.is_diagnosed(&var));
+    }
+
+    #[test]
+    fn diagnosed_at_query_works() {
+        // is_diagnosed_at 便捷查询：给定 (line, column, kind_discriminant)
+        let mut hm = HMInference::new();
+        let w = var_witness("x", 5, 10);
+        hm.mark_diagnosed(&w);
+        let disc = std::mem::discriminant::<WitnessKind>(&w.kind);
+        assert!(hm.is_diagnosed_at(5, 10, disc));
+        // 不同 line → false
+        assert!(!hm.is_diagnosed_at(6, 10, disc));
+        // 不同 column → false
+        assert!(!hm.is_diagnosed_at(5, 11, disc));
+    }
+
+    #[test]
+    fn diagnosed_duplicate_mark_idempotent() {
+        // 同一节点重复 mark → HashSet 保证幂等
+        let mut hm = HMInference::new();
+        let w = lit_witness(1);
+        hm.mark_diagnosed(&w);
+        hm.mark_diagnosed(&w);
+        hm.mark_diagnosed(&w);
+        assert_eq!(hm.diagnosed.len(), 1);
+        assert!(hm.is_diagnosed(&w));
+    }
+
     #[test]
     fn check_union_empty_matches_anything() {
         // 空 Union = any element type 占位 —— 兼容任何 actual

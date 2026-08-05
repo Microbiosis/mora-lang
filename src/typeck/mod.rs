@@ -373,6 +373,111 @@ impl Type {
         // v0.08.5: Type::Struct 已删除，统一为 Type::Trait 注册
         self == expected
     }
+
+    /// v0.75.86: 非对称 subtype 关系 `self <: super`。
+    ///
+    /// 与 [`compatible_with`](Self::compatible_with) 的关键区别：
+    /// `compatible_with` 是**对称**关系（任一边匹配即 true），
+    /// `subtype_of` 是**单向**子类型——`A <: B` 不蕴含 `B <: A`。
+    ///
+    /// 实现策略：
+    ///   1. 所有 `compatible_with` 的现有 arm 复用（`Any` top type、
+    ///      `ForAll` 内层、容器递归、Trait 同构、Union 任一成员、`Result`
+    ///      同构、`Nil` 自反）
+    ///   2. 新增 `Concrete <: Trait` ——`Concrete { traits, .. }` 的 traits
+    ///      列表中任一与 super 同构即 subtype（实现 trait 即 subtype）
+    ///   3. 新增 `TraitObject <: Trait` ——dyn trait object 视为 trait 的
+    ///      运行时载体（`TraitObject { trait_name, generics, .. }` 与 super
+    ///      name 一致 + generics 兼容即 subtype）
+    ///   4. 末尾 `self == expected` 兜底（同构严格相等是 subtype）
+    ///
+    /// 应用：双向定型 check 模式核心 — `actual <: expected ?`。
+    /// `compatible_with` 保留对称语义给 HM 合一（双向算法需要任一
+    /// 方向兼容即可 unify），`subtype_of` 给定向检查用。
+    pub fn subtype_of(&self, super_ty: &Type) -> bool {
+        // === 复用 compatible_with 全部 arm ===
+        // Any 是 top type —— 与任何类型兼容（自然 subtype 任何）
+        if matches!(self, Type::Any) || matches!(super_ty, Type::Any) {
+            return true;
+        }
+        // v0.75.17: ForAll 类型——泛型值命中 env 时已实例化，此处防御
+        if let Type::ForAll(_, inner) = self {
+            return inner.subtype_of(super_ty);
+        }
+        if let Type::ForAll(_, inner) = super_ty {
+            return self.subtype_of(inner);
+        }
+        // v0.13: Union subtype——任一成员 subtype super_ty 即可（保守）
+        if let Type::Union(members) = self {
+            if members.is_empty() {
+                // 空 Union = "any element type" 占位，subtype 任何
+                return true;
+            }
+            return members.iter().any(|m| m.subtype_of(super_ty));
+        }
+        // super 是 Union 时，self 必须 subtype 任一成员（与
+        // compatible_with 一致——但保守方向）
+        if let Type::Union(members) = super_ty {
+            if members.is_empty() {
+                return true;
+            }
+            return members.iter().any(|m| self.subtype_of(m));
+        }
+        // Result<T1, E1> subtype Result<T2, E2> 当 T1<:T2 && E1<:E2
+        if let (Type::Result_(t1, e1), Type::Result_(t2, e2)) = (self, super_ty) {
+            return t1.subtype_of(t2) && e1.subtype_of(e2);
+        }
+        // List<T1> subtype List<T2> 当 T1<:T2
+        if let (Type::List(a), Type::List(b)) = (self, super_ty) {
+            return a.subtype_of(b);
+        }
+        // Dict<K1, V1> subtype Dict<K2, V2>
+        if let (Type::Dict(k1, v1), Type::Dict(k2, v2)) = (self, super_ty) {
+            return k1.subtype_of(k2) && v1.subtype_of(v2);
+        }
+        // Nil 仅 subtype Nil（v0.12 后门 2 关闭）
+        match (self, super_ty) {
+            (Type::Nil, Type::Nil) => return true,
+            (Type::Nil, _) | (_, Type::Nil) => return false,
+            _ => {}
+        }
+        // === subtype 新增 arm ===
+        // Concrete subtype Trait：实现 trait 即 subtype trait
+        if let (Type::Concrete { traits, .. }, Type::Trait { .. }) = (self, super_ty) {
+            return traits.iter().any(|t| t.subtype_of(super_ty));
+        }
+        // TraitObject subtype Trait：dyn object 视为 trait 的运行时载体
+        //
+        // 当前 TraitObject 是 unit variant（无 trait_name/generics 字段——
+        // trait 信息存在 `Value::TraitObject` 运行时值里，类型系统层面
+        // 不可达）。真正的 dyn: 语法未实现（parser_v3/mod.rs 无 dyn: 解析），
+        // 此处兜底：TraitObject 不 subtype 任何具体 Trait。后续若解析器
+        // 加 dyn: 语法、扩展 `Type::TraitObject { trait_name, generics }`，
+        // 此 arm 升级为 trait_name + generics 同构判断。
+        if matches!(self, Type::TraitObject) && matches!(super_ty, Type::Trait { .. }) {
+            return false;
+        }
+        // === 现有 compatible_with 的 Trait 同构 arm ===
+        if let (
+            Type::Trait {
+                name: a,
+                generics: ga,
+            },
+            Type::Trait {
+                name: b,
+                generics: gb,
+            },
+        ) = (self, super_ty)
+        {
+            if a != b || ga.len() != gb.len() {
+                return false;
+            }
+            // 严格 subtype：ga 必须逐元素 <: gb（保守方向）
+            return ga.iter().zip(gb.iter()).all(|(x, y)| x.subtype_of(y));
+        }
+        // 兜底：同构严格相等
+        self == super_ty
+    }
 }
 
 /// v0.13: 判断类型是否是空 Union (即原 Any 占位)

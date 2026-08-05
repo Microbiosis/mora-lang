@@ -429,12 +429,12 @@ mod tests {
         // 此处防御——ForAll 是「所有实例化」的上界，递归到内层是保守策略）
         let inner = Type::Int;
         let forall = Type::ForAll(vec!['a'], Box::new(inner.clone()));
-        assert!(forall.subtype_of(&Type::Int));   // ForAll<α.Int> <: Int 当 Int <: Int
-        assert!(forall.subtype_of(&Type::Any));   // ForAll<α.Int> <: Any
+        assert!(forall.subtype_of(&Type::Int)); // ForAll<α.Int> <: Int 当 Int <: Int
+        assert!(forall.subtype_of(&Type::Any)); // ForAll<α.Int> <: Any
         // 反向：T subtype ForAll<α.U> 当 T subtype U 成立（α 重新实例化为 T 自身）——
         // 这与 HM 标准的「T 是 ForAll 的实例」匹配：Int 是 ForAll<α.Int> 的实例
         // （α 绑定为 Int 后，body 退化为 Int）。
-        assert!(inner.subtype_of(&forall));         // Int subtype ForAll<α.Int>
+        assert!(inner.subtype_of(&forall)); // Int subtype ForAll<α.Int>
         // String 不 subtype ForAll<α.Int>（String 不 <: Int）
         assert!(!Type::String.subtype_of(&forall));
     }
@@ -475,5 +475,65 @@ mod tests {
                 a, b
             );
         }
+    }
+
+    // ─── v0.75.86: check_union 双向 check helper ───
+
+    use crate::typeck::check_union;
+
+    #[test]
+    fn check_union_empty_matches_anything() {
+        // 空 Union = any element type 占位 —— 兼容任何 actual
+        assert!(check_union(&Type::Int, &Type::Union(vec![])).is_ok());
+        assert!(check_union(&Type::String, &Type::Union(vec![])).is_ok());
+    }
+
+    #[test]
+    fn check_union_member_matches() {
+        // Union[String, Int] —— Int 是成员之一
+        let union_ty = Type::Union(vec![Type::String, Type::Int]);
+        assert!(check_union(&Type::Int, &union_ty).is_ok());
+        assert!(check_union(&Type::String, &union_ty).is_ok());
+    }
+
+    #[test]
+    fn check_union_member_subtype() {
+        // Union[Comparable] —— Concrete 实现 Comparable 即可匹配
+        let comparable = trait_ty("Comparable", vec![Type::Int]);
+        let union_ty = Type::Union(vec![comparable.clone()]);
+        let int_val = concrete("MyInt", vec![Type::Int], vec![comparable]);
+        assert!(check_union(&int_val, &union_ty).is_ok());
+    }
+
+    #[test]
+    fn check_union_no_member_matches_returns_err_msg() {
+        // Union[String, Int] —— Float 不是成员
+        let union_ty = Type::Union(vec![Type::String, Type::Int]);
+        let err = check_union(&Type::Float, &union_ty).unwrap_err();
+        // 错误信息应包含「expected subtype of」+ 第一个失败成员 + 实际类型
+        // Type Debug 输出（unit-like 变体）：Type::String → "String"、Type::Float → "Float"
+        // （Debug 不加引号——Type::String 输出是 `String` 不是 `"String"`）
+        assert!(err.contains("expected subtype of"));
+        assert!(err.contains("String"));
+        assert!(err.contains("Float"));
+    }
+
+    #[test]
+    fn check_union_picks_first_failing_member() {
+        // 即使 String 在 Union 头部（优先匹配），Float 不匹配任何成员时
+        // 错误信息包含**第一个**成员 String（保守报告）
+        let union_ty = Type::Union(vec![Type::String, Type::Int, Type::Bool]);
+        let err = check_union(&Type::Float, &union_ty).unwrap_err();
+        assert!(err.contains("String")); // 第一个成员
+        assert!(!err.contains("Bool")); // 不应包含 Bool
+    }
+
+    #[test]
+    fn check_union_misuse_returns_err() {
+        // 设计错误：expected 不是 Union 时返回描述性错误而非 panic
+        let result = check_union(&Type::Int, &Type::Int);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.contains("misuse"));
     }
 }

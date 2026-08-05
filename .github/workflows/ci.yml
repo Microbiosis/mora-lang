@@ -207,6 +207,8 @@ jobs:
 
       - name: Test snapshot
         run: |
-          echo 'task main() print("hello") end' > /tmp/test.mora
+          # v0.55+ ParserV3 requires Newline before task body; single-line
+          # `task main() print(...) end` is not accepted. Use multi-line form.
+          printf 'task main()\n  print("hello")\nend\n' > /tmp/test.mora
           ./target/release/mora snapshot /tmp/test.mora test-snap --update
           ./target/release/mora snapshot /tmp/test.mora test-snap

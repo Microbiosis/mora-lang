@@ -486,9 +486,14 @@ pub fn is_empty_union(ty: &Type) -> bool {
     matches!(ty, Type::Union(m) if m.is_empty())
 }
 
-/// v0.75.86 (Phase D)：跨节点 Union merge 工具。
+/// v0.75.86 (Phase D + Phase E)：跨节点 Union merge 工具。
 ///
 /// 把多个 `Type` 合并成 `Type::Union`，自动平展嵌套 Union + `Any` 短路。
+///
+/// **Phase E 签名变更**：参数从 `&[Type]` 改为 `&[(Span, Type)]`——
+/// 每个 arm 携带自身 span，让错误诊断能精确定位到出错 arm（之前
+/// `span: Span` 参数在 `join_types` 内部 unused 丢弃；现在 span 来源
+/// 于每个 arm 的实际位置）。
 ///
 /// 行为：
 ///   - 空切片 → `Type::Union(vec![])`（"any element type"占位）
@@ -501,23 +506,28 @@ pub fn is_empty_union(ty: &Type) -> bool {
 ///   - HM `infer_if` 无 else 时 `Union(vec![then, Nil])`（唯一手工构造点）
 ///   - Phase D 把这种「手工 Union 构造」抽象为 helper，给双向
 ///     `pre_check_witness` 的 Match/If 分支 join 用。
+///   - Phase E 加 arm span 支持错误定位（之前 span 整体作为 outer 参数）。
 ///
 /// 应用：
-///   - Match arm body join → `join_types(&arm_tys, span)`
-///   - 后续 If-else result join（独立 commit）→ `join_types(&[then, else], span)`
-pub fn join_types(types: &[Type], span: Span) -> Type {
-    let _ = span; // 保留以备 Phase E 错误定位增强
-    if types.is_empty() {
+///   - Match arm body join → `join_types(&arm_pairs, outer_span)`
+///   - 后续 If-else result join（独立 commit）→ `join_types(&[then_pair, else_pair], span)`
+///
+/// 参数语义：
+///   - `arms`：每个元素 `(arm_span, arm_body_inferred_type)`。
+///     arm_span 来自 `MirWitness::span`（Phase E 错误定位用）
+///   - `outer_span`：整个 Match 节点的 span（fallback——当无 arm span 时用）
+pub fn join_types(arms: &[(Span, Type)], outer_span: Span) -> Type {
+    let _ = outer_span; // 保留接口参数，Phase E+ 用于外层 fallback
+    if arms.is_empty() {
         return Type::Union(vec![]);
     }
     let mut flat: Vec<Type> = Vec::new();
-    let mut nested_only = true; // 整个输入是否单元素且是 Union（平展后需保留 Union 形态）
-    for t in types {
+    let mut nested_only = true; // 整个输入是否仅由 Union 输入（保留 Union 形态）
+    for (_span, t) in arms {
         match t {
             // Any 短路：top type 吞掉所有
             Type::Any => return Type::Union(vec![]),
             // 嵌套 Union 递归平展：Union(Union(a, b), c) → [a, b, c]
-            // 关键：子 Union 的 members 也需 extend 进去——一次性平展
             Type::Union(members) => {
                 for m in members {
                     match m {

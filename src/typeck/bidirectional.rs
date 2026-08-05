@@ -12,7 +12,7 @@
 //!
 //! Phase A 范围（本次提交）：
 //!   - `BidirectionalChecker<'a>` 结构 + `Mode` 枚举
-//!   - `check_against(&MirWitness, expected: &Type) -> Result<Type, TypeError>` 入口
+//!   - `check_against(&MirWitness, expected: &Type, hint: Option<String>) -> Result<Type, TypeError>` 入口
 //!   - `synth` 模式转发 HM
 //!   - `pre_check_program` 演示：递归 witness 树并在关键节点触发 check
 //!   - 不替换任何 HM 代码 —— HM 行为 100% 保留
@@ -94,7 +94,16 @@ impl<'a> BidirectionalChecker<'a> {
     ///
     /// 成功 → Ok(synthesized_type)（仍调 HM 推类型供后续约束用）
     /// 失败 → 标记已诊断 + Err(TypeError)
-    pub fn check_against(&mut self, w: &MirWitness, expected: &Type) -> Result<Type, TypeError> {
+    ///
+    /// Phase E：`hint` 参数让 Match 拦截把 joined arm types 写入 hint
+    /// 字段，用户看到「expected subtype of Union(Int, String)」的精确信息。
+    /// 其他调用方传 `None`（默认行为与 Phase B/C 一致）。
+    pub fn check_against(
+        &mut self,
+        w: &MirWitness,
+        expected: &Type,
+        hint: Option<String>,
+    ) -> Result<Type, TypeError> {
         self.nodes_visited += 1;
         // 简易 check：调 HM 推类型 + subtype 验证
         let synth_ty = self.hm.infer_expr(w).map_err(|errs| {
@@ -109,7 +118,7 @@ impl<'a> BidirectionalChecker<'a> {
         if !synth_ty.subtype_of(expected) {
             // 标记此节点已诊断 —— 防止 HM 跑完后报重复错误
             self.hm.mark_diagnosed(w);
-            return Err(format_mismatch_error(&synth_ty, expected, w.span));
+            return Err(format_mismatch_error(&synth_ty, expected, w.span, hint));
         }
         Ok(synth_ty)
     }
@@ -155,7 +164,8 @@ impl<'a> BidirectionalChecker<'a> {
                     // 标注的 type_hint 必须 subtype 自身（自反检查）
                     if !hint.subtype_of(hint) {
                         self.hm.mark_diagnosed(w);
-                        self.errors.push(format_mismatch_error(hint, hint, w.span));
+                        self.errors
+                            .push(format_mismatch_error(hint, hint, w.span, None));
                     }
                 }
             }
@@ -185,7 +195,7 @@ impl<'a> BidirectionalChecker<'a> {
                 } else {
                     // 逐 arg check against expected_params[i]
                     for (arg, expected_ty) in args.iter().zip(expected_params.iter()) {
-                        if let Err(e) = self.check_against(arg, expected_ty) {
+                        if let Err(e) = self.check_against(arg, expected_ty, None) {
                             self.errors.push(e);
                         }
                     }
@@ -200,7 +210,7 @@ impl<'a> BidirectionalChecker<'a> {
         // === Phase C：If 条件 check against bool ===
         if let WitnessKind::If { cond, then, r#else } = &w.kind {
             // cond 应是 bool
-            if let Err(e) = self.check_against(cond, &Type::Bool) {
+            if let Err(e) = self.check_against(cond, &Type::Bool, None) {
                 self.errors.push(e);
             }
             // then/else 在 Phase C 简单跳过 join（多分支 join 是 Phase D 工作）
@@ -230,21 +240,29 @@ impl<'a> BidirectionalChecker<'a> {
                 }
             };
             // Pass 2：每 arm body 用 scrutinee subtype check
-            let mut arm_tys: Vec<Type> = Vec::new();
+            // 收集 arm_pairs 供 join_types；同时用 hint 把 joined 类型
+            // 写入失败的 TypeError——Phase E 错误诊断改进
+            let mut arm_pairs: Vec<(Span, Type)> = Vec::new();
             for arm in arms {
-                if let Err(e) = self.check_against(&arm.body, &scrutinee_ty) {
-                    self.errors.push(e);
-                }
                 if let Ok(t) = self.synth(&arm.body) {
-                    arm_tys.push(t);
+                    arm_pairs.push((arm.body.span, t));
                 }
                 if let Some(g) = &arm.guard {
                     self.pre_check_witness(g);
                 }
             }
-            // arm result join（Union merge）—— 本 commit 仅记录 joined
-            // type，错误诊断留 Phase E
-            let _joined = join_types(&arm_tys, w.span);
+            // 第一轮后：所有 arm 类型已知——计算 joined type
+            let joined = join_types(&arm_pairs, w.span);
+            let hint = Some(format!("match arms join to `{:?}`", joined));
+            // 第二轮：对每个 arm body 用 scrutinee subtype check
+            // 失败时错误带 joined hint——用户能看到
+            // 「expected Int, got String, hint: match arms join to Int | String」
+            for arm in arms {
+                if let Err(mut e) = self.check_against(&arm.body, &scrutinee_ty, None) {
+                    e.hint = hint.clone();
+                    self.errors.push(e);
+                }
+            }
             return;
         }
         // === Phase C：LetBinding type_hint check against value inferred type ===
@@ -253,7 +271,7 @@ impl<'a> BidirectionalChecker<'a> {
         } = &w.kind
         {
             if let Some(hint) = type_hint
-                && let Err(e) = self.check_against(value, hint)
+                && let Err(e) = self.check_against(value, hint, None)
             {
                 self.errors.push(e);
             }
@@ -404,7 +422,15 @@ impl<'a> BidirectionalChecker<'a> {
 ///
 /// 返顶层公开 [`TypeError`]（与 [`crate::typeck::hm::TypeError`] 不同——
 /// `hm::TypeError` 是 HM 内部枚举，hm_to_external 决定如何转换）。
-pub fn format_mismatch_error(actual: &Type, expected: &Type, span: Span) -> TypeError {
+///
+/// Phase E：`hint` 参数可选，Match 拦截把 joined arm types 写入 hint，
+/// 让用户看到「expected subtype of Union(Int, String)」的精确信息。
+pub fn format_mismatch_error(
+    actual: &Type,
+    expected: &Type,
+    span: Span,
+    hint: Option<String>,
+) -> TypeError {
     let message = format!(
         "type mismatch: expected `{:?}`, got `{:?}`",
         expected, actual
@@ -413,6 +439,7 @@ pub fn format_mismatch_error(actual: &Type, expected: &Type, span: Span) -> Type
     e.column = span.column;
     e.expected = Some(format!("{:?}", expected));
     e.actual = Some(format!("{:?}", actual));
+    e.hint = hint;
     e
 }
 
@@ -483,7 +510,7 @@ mod tests {
         let mut checker = BidirectionalChecker::new(&mut hm);
         let w = lit_witness(42, 1, 0);
         // Int <: Int (自反) — 应成功
-        let result = checker.check_against(&w, &Type::Int);
+        let result = checker.check_against(&w, &Type::Int, None);
         assert!(result.is_ok());
     }
 
@@ -492,7 +519,7 @@ mod tests {
         let mut hm = HMInference::new();
         let mut checker = BidirectionalChecker::new(&mut hm);
         let w = lit_witness(42, 1, 0);
-        let result = checker.check_against(&w, &Type::Float);
+        let result = checker.check_against(&w, &Type::Float, None);
         assert!(result.is_err());
     }
 
@@ -502,7 +529,7 @@ mod tests {
         let mut checker = BidirectionalChecker::new(&mut hm);
         let w = lit_witness(42, 1, 0);
         // check 失败应标记
-        let _ = checker.check_against(&w, &Type::Float);
+        let _ = checker.check_against(&w, &Type::Float, None);
         assert!(hm.is_diagnosed(&w));
     }
 
@@ -866,5 +893,81 @@ mod tests {
         checker.pre_check_program(&[w]);
         // arm body 节点应被 mark_diagnosed（line 5 col 16 + Literal kind）
         assert!(hm.is_diagnosed(&arm1_body));
+    }
+
+    // ─── v0.75.86 (Phase E)：Match 错误诊断含 joined arm types hint ───
+
+    #[test]
+    fn phase_e_match_error_hint_contains_joined_types() {
+        // match scrutinee(42) { 1 => "str" 2 => 99 }
+        //   scrutinee 推断 Int
+        //   arm1 "str" (String) — 不 subtype Int
+        //   arm2 99 (Int) — subtype Int 通过
+        // joined arm types = Union([String, Int])
+        // 错误 hint 应包含 "match arms join to" + "String" + "Int"
+        let mut hm = HMInference::new();
+        let mut checker = BidirectionalChecker::new(&mut hm);
+        let scrutinee = lit_witness(42, 5, 6);
+        use crate::common::Literal;
+        use crate::mir::witness::WitnessPattern;
+        let w = match_two_arms_witness(
+            scrutinee,
+            WitnessPattern::Literal(Literal::Int(1, Span::new(0, 0))),
+            lit_witness_str("str"), // arm1: String（与 scrutinee Int 不 subtype）
+            WitnessPattern::Literal(Literal::Int(2, Span::new(0, 0))),
+            lit_witness(99, 5, 28), // arm2: Int（与 scrutinee Int subtype 通过）
+        );
+        checker.pre_check_program(&[w]);
+        // 至少 1 个错误（arm1 "str" 失配）
+        assert!(!checker.errors.is_empty());
+        // 找到 type mismatch 错误
+        let mismatch = checker
+            .errors
+            .iter()
+            .find(|e| e.message.contains("type mismatch"))
+            .expect("expected a type mismatch error");
+        // hint 字段非空且含 joined 类型信息
+        let hint = mismatch
+            .hint
+            .as_deref()
+            .expect("expected hint to be populated for Phase E Match errors");
+        assert!(
+            hint.contains("match arms join to"),
+            "hint should describe joined arms, got: {}",
+            hint
+        );
+        // joined 类型含 String + Int
+        assert!(
+            hint.contains("String"),
+            "hint should contain String, got: {}",
+            hint
+        );
+        assert!(
+            hint.contains("Int"),
+            "hint should contain Int, got: {}",
+            hint
+        );
+    }
+
+    #[test]
+    fn phase_e_match_all_arms_correct_no_hint_needed() {
+        // match scrutinee(42) { 1 => 10 2 => 20 }——所有 arm body 都 Int
+        //   subtype scrutinee(Int) 通过
+        // 错误列表应为空（双向不报）
+        let mut hm = HMInference::new();
+        let mut checker = BidirectionalChecker::new(&mut hm);
+        let scrutinee = lit_witness(42, 5, 6);
+        use crate::common::Literal;
+        use crate::mir::witness::WitnessPattern;
+        let w = match_two_arms_witness(
+            scrutinee,
+            WitnessPattern::Literal(Literal::Int(1, Span::new(0, 0))),
+            lit_witness(10, 5, 16),
+            WitnessPattern::Literal(Literal::Int(2, Span::new(0, 0))),
+            lit_witness(20, 5, 28),
+        );
+        checker.pre_check_program(&[w]);
+        // 全部 Int subtype scrutinee Int —— 不报
+        assert!(checker.errors.is_empty());
     }
 }

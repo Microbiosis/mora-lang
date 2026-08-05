@@ -642,21 +642,27 @@ mod tests {
     #[test]
     fn join_types_empty_yields_empty_union() {
         // 空切片 → Union(vec![])（"any element type"占位）
-        let result = join_types(&[], Span::default());
+        let result = join_types(&[] as &[(Span, Type)], Span::default());
         assert_eq!(result, Type::Union(vec![]));
     }
 
     #[test]
     fn join_types_singleton_returns_type_itself() {
         // 单个类型 → 该类型本身（不退化为 Union）
-        let result = join_types(&[Type::Int], Span::default());
+        let result = join_types(&[(Span::default(), Type::Int)], Span::default());
         assert_eq!(result, Type::Int);
     }
 
     #[test]
     fn join_types_two_distinct_yields_union() {
         // 两个不同类型 → Union(vec![t1, t2])
-        let result = join_types(&[Type::Int, Type::String], Span::default());
+        let result = join_types(
+            &[
+                (Span::default(), Type::Int),
+                (Span::default(), Type::String),
+            ],
+            Span::default(),
+        );
         assert_eq!(result, Type::Union(vec![Type::Int, Type::String]));
     }
 
@@ -667,7 +673,7 @@ mod tests {
             Type::Union(vec![Type::Int, Type::Float]),
             Type::String,
         ]);
-        let result = join_types(&[nested], Span::default());
+        let result = join_types(&[(Span::default(), nested)], Span::default());
         assert_eq!(
             result,
             Type::Union(vec![Type::Int, Type::Float, Type::String])
@@ -677,10 +683,17 @@ mod tests {
     #[test]
     fn join_types_any_short_circuits() {
         // 任一含 Any → Union(vec![])（Any 是 top type 吞掉）
-        let result = join_types(&[Type::Int, Type::Any, Type::String], Span::default());
+        let result = join_types(
+            &[
+                (Span::default(), Type::Int),
+                (Span::default(), Type::Any),
+                (Span::default(), Type::String),
+            ],
+            Span::default(),
+        );
         assert_eq!(result, Type::Union(vec![]));
         // 纯 Any 切片
-        let result = join_types(&[Type::Any], Span::default());
+        let result = join_types(&[(Span::default(), Type::Any)], Span::default());
         assert_eq!(result, Type::Union(vec![]));
     }
 }

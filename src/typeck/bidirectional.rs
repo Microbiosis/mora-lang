@@ -24,6 +24,7 @@ use crate::mir::witness::{MirWitness, WitnessKind};
 use crate::typeck::Type;
 use crate::typeck::TypeError;
 use crate::typeck::hm::HMInference;
+use crate::typeck::join_types;
 
 /// v0.75.86: 双向定型模式状态机。
 ///
@@ -210,6 +211,42 @@ impl<'a> BidirectionalChecker<'a> {
             }
             return;
         }
+        // === Phase D：Match scrutinee → arm body check ===
+        if let WitnessKind::Match { scrutinee, arms } = &w.kind {
+            // Synth scrutinee 类型（pass 1）
+            let scrutinee_ty = match self.synth(scrutinee) {
+                Ok(t) => t,
+                Err(_) => {
+                    // scrutinee 推断失败 —— HM 已报；双向不重复，
+                    // 仍递归子节点（保守 synth）
+                    self.pre_check_witness(scrutinee);
+                    for a in arms {
+                        self.recurse_witness(&a.body);
+                        if let Some(g) = &a.guard {
+                            self.pre_check_witness(g);
+                        }
+                    }
+                    return;
+                }
+            };
+            // Pass 2：每 arm body 用 scrutinee subtype check
+            let mut arm_tys: Vec<Type> = Vec::new();
+            for arm in arms {
+                if let Err(e) = self.check_against(&arm.body, &scrutinee_ty) {
+                    self.errors.push(e);
+                }
+                if let Ok(t) = self.synth(&arm.body) {
+                    arm_tys.push(t);
+                }
+                if let Some(g) = &arm.guard {
+                    self.pre_check_witness(g);
+                }
+            }
+            // arm result join（Union merge）—— 本 commit 仅记录 joined
+            // type，错误诊断留 Phase E
+            let _joined = join_types(&arm_tys, w.span);
+            return;
+        }
         // === Phase C：LetBinding type_hint check against value inferred type ===
         if let WitnessKind::LetBinding {
             type_hint, value, ..
@@ -390,6 +427,15 @@ mod tests {
         MirWitness {
             kind: WitnessKind::Literal(Literal::Int(n, Span::new(0, 0))),
             span: Span::new(line, col),
+        }
+    }
+
+    fn lit_witness_str(s: &str) -> MirWitness {
+        // placeholder line/col — actual position doesn't matter for the
+        // body-type test
+        MirWitness {
+            kind: WitnessKind::Literal(Literal::String(s.to_string(), Span::new(0, 0))),
+            span: Span::new(5, 16),
         }
     }
 
@@ -703,5 +749,122 @@ mod tests {
         checker.pre_check_program(std::slice::from_ref(&w));
         // value 节点应被 mark_diagnosed（line 1 col 12 + Literal kind）
         assert!(hm.is_diagnosed(&value));
+    }
+
+    // ─── v0.75.86 (Phase D)：Match scrutinee → arm body check ───
+
+    /// 构造 `match scrutinee { pattern1 => body1, pattern2 => body2 }`
+    /// 注意：WitnessPattern::Literal 是匹配 scrutinee 字面量，
+    ///       arm body 是普通 witness（已构造的 lit_witness 等）
+    fn match_two_arms_witness(
+        scrutinee: MirWitness,
+        arm1_pattern: crate::mir::witness::WitnessPattern,
+        arm1_body: MirWitness,
+        arm2_pattern: crate::mir::witness::WitnessPattern,
+        arm2_body: MirWitness,
+    ) -> MirWitness {
+        use crate::mir::witness::WitnessArm;
+        MirWitness {
+            kind: WitnessKind::Match {
+                scrutinee: Box::new(scrutinee),
+                arms: vec![
+                    WitnessArm {
+                        pattern: arm1_pattern,
+                        guard: None,
+                        body: arm1_body,
+                    },
+                    WitnessArm {
+                        pattern: arm2_pattern,
+                        guard: None,
+                        body: arm2_body,
+                    },
+                ],
+            },
+            span: Span::new(5, 0),
+        }
+    }
+
+    #[test]
+    fn phase_d_match_arm_body_subtype_mismatch_reports() {
+        // match scrutinee(42) { 1 => "string", "x" => 42 }
+        //   scrutinee 推断为 Int（Literal）
+        //   arm1 body "string" — String 不 <: Int —— 应报 mismatch
+        let mut hm = HMInference::new();
+        let mut checker = BidirectionalChecker::new(&mut hm);
+        let scrutinee = lit_witness(42, 5, 6);
+        use crate::common::Literal;
+        use crate::mir::witness::WitnessPattern;
+        let w = match_two_arms_witness(
+            scrutinee,
+            WitnessPattern::Literal(Literal::Int(1, Span::new(0, 0))),
+            lit_witness_str("str"), // arm1 body — String
+            WitnessPattern::Literal(Literal::String("x".to_string(), Span::new(0, 0))),
+            lit_witness(42, 5, 24), // arm2 body — Int
+                                    // match scrutinee 是 Int 字面量，但 pattern 1=Int 1 / pattern 2=String "x"
+                                    // HM 在 match 上推断不严格（模式匹配不要求 cover 全部），
+                                    // 但双向会用 scrutinee 类型(Int) check arm1 body("str")——String 不 subtype Int
+        );
+        checker.pre_check_program(&[w]);
+        // 至少 1 个 type mismatch（String body vs Int scrutinee）
+        assert!(
+            !checker.errors.is_empty(),
+            "expected at least one mismatch, got {:?}",
+            checker.errors
+        );
+        let e = &checker.errors[0];
+        // 错误 message 含 type mismatch
+        assert!(e.message.contains("type mismatch"));
+        // expected 字段有内容（Int）
+        assert!(e.expected.is_some());
+    }
+
+    #[test]
+    fn phase_d_match_arm_body_correct_type_passes() {
+        // match scrutinee(42) { 1 => "a", "x" => "b" }——两个 arm body 都是 String
+        //   scrutinee Int, arm bodies String —— String 不 <: Int 应报，
+        //   但本测试测的是双向检查「能跑出错误」——用两 Int arm body 测通过
+        let mut hm = HMInference::new();
+        let mut checker = BidirectionalChecker::new(&mut hm);
+        let scrutinee = lit_witness(42, 5, 6);
+        use crate::common::Literal;
+        use crate::mir::witness::WitnessPattern;
+        // arm1 body = Int (subtype scrutinee Int, 通过)
+        // arm2 body = Int (subtype scrutinee Int, 通过)
+        let w = match_two_arms_witness(
+            scrutinee,
+            WitnessPattern::Literal(Literal::Int(1, Span::new(0, 0))),
+            lit_witness(10, 5, 16), // arm1 body Int
+            WitnessPattern::Literal(Literal::Int(2, Span::new(0, 0))),
+            lit_witness(20, 5, 28), // arm2 body Int
+        );
+        checker.pre_check_program(&[w]);
+        // arm body 都是 Int，与 scrutinee(Int) 一致 —— 不报 mismatch
+        assert!(
+            checker.errors.is_empty(),
+            "expected no errors, got {:?}",
+            checker.errors
+        );
+    }
+
+    #[test]
+    fn phase_d_match_marks_diagnosed() {
+        // match scrutinee(42) { 1 => "str" }——arm body String 不 <: Int scrutinee
+        // mark_diagnosed 应在 arm body 节点触发
+        let mut hm = HMInference::new();
+        let mut checker = BidirectionalChecker::new(&mut hm);
+        let scrutinee = lit_witness(42, 5, 6);
+        use crate::common::Literal;
+        use crate::mir::witness::WitnessPattern;
+        let arm1_body = lit_witness_str("bad");
+        let w = match_two_arms_witness(
+            scrutinee,
+            WitnessPattern::Literal(Literal::Int(1, Span::new(0, 0))),
+            arm1_body.clone(),
+            WitnessPattern::Literal(Literal::Int(2, Span::new(0, 0))),
+            arm1_body.clone(),
+        );
+        checker.pre_check_program(&[w]);
+        // arm body 节点应被 mark_diagnosed（line 5 col 16 + Literal kind）
+        assert!(hm.is_diagnosed(&arm1_body));
     }
 }

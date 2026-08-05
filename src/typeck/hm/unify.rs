@@ -480,6 +480,7 @@ mod tests {
     // ─── v0.75.86: check_union 双向 check helper ───
 
     use crate::typeck::check_union;
+    use crate::typeck::join_types;
 
     // ─── v0.75.86: HMInference::diagnosed 双向 fallback 抑制 ───
 
@@ -634,5 +635,52 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(err.contains("misuse"));
+    }
+
+    // ─── v0.75.86 (Phase D)：join_types 跨节点 Union merge ───
+
+    #[test]
+    fn join_types_empty_yields_empty_union() {
+        // 空切片 → Union(vec![])（"any element type"占位）
+        let result = join_types(&[], Span::default());
+        assert_eq!(result, Type::Union(vec![]));
+    }
+
+    #[test]
+    fn join_types_singleton_returns_type_itself() {
+        // 单个类型 → 该类型本身（不退化为 Union）
+        let result = join_types(&[Type::Int], Span::default());
+        assert_eq!(result, Type::Int);
+    }
+
+    #[test]
+    fn join_types_two_distinct_yields_union() {
+        // 两个不同类型 → Union(vec![t1, t2])
+        let result = join_types(&[Type::Int, Type::String], Span::default());
+        assert_eq!(result, Type::Union(vec![Type::Int, Type::String]));
+    }
+
+    #[test]
+    fn join_types_nested_union_flattens() {
+        // Union(Union(a, b), c) → Union(a, b, c) 平展
+        let nested = Type::Union(vec![
+            Type::Union(vec![Type::Int, Type::Float]),
+            Type::String,
+        ]);
+        let result = join_types(&[nested], Span::default());
+        assert_eq!(
+            result,
+            Type::Union(vec![Type::Int, Type::Float, Type::String])
+        );
+    }
+
+    #[test]
+    fn join_types_any_short_circuits() {
+        // 任一含 Any → Union(vec![])（Any 是 top type 吞掉）
+        let result = join_types(&[Type::Int, Type::Any, Type::String], Span::default());
+        assert_eq!(result, Type::Union(vec![]));
+        // 纯 Any 切片
+        let result = join_types(&[Type::Any], Span::default());
+        assert_eq!(result, Type::Union(vec![]));
     }
 }

@@ -486,6 +486,64 @@ pub fn is_empty_union(ty: &Type) -> bool {
     matches!(ty, Type::Union(m) if m.is_empty())
 }
 
+/// v0.75.86 (Phase D)：跨节点 Union merge 工具。
+///
+/// 把多个 `Type` 合并成 `Type::Union`，自动平展嵌套 Union + `Any` 短路。
+///
+/// 行为：
+///   - 空切片 → `Type::Union(vec![])`（"any element type"占位）
+///   - 单个类型 → 该类型本身
+///   - 多类型 → `Type::Union(vec![t1, t2, ...])`（去重：单成员时退化为成员）
+///   - 嵌套 `Union(a, Union(b, c))` → `Union(a, b, c)`（平展）
+///   - 含 `Any` → `Type::Union(vec![])`（Any 是 top type，合并结果即"any"）
+///
+/// 设计参考：
+///   - HM `infer_if` 无 else 时 `Union(vec![then, Nil])`（唯一手工构造点）
+///   - Phase D 把这种「手工 Union 构造」抽象为 helper，给双向
+///     `pre_check_witness` 的 Match/If 分支 join 用。
+///
+/// 应用：
+///   - Match arm body join → `join_types(&arm_tys, span)`
+///   - 后续 If-else result join（独立 commit）→ `join_types(&[then, else], span)`
+pub fn join_types(types: &[Type], span: Span) -> Type {
+    let _ = span; // 保留以备 Phase E 错误定位增强
+    if types.is_empty() {
+        return Type::Union(vec![]);
+    }
+    let mut flat: Vec<Type> = Vec::new();
+    let mut nested_only = true; // 整个输入是否单元素且是 Union（平展后需保留 Union 形态）
+    for t in types {
+        match t {
+            // Any 短路：top type 吞掉所有
+            Type::Any => return Type::Union(vec![]),
+            // 嵌套 Union 递归平展：Union(Union(a, b), c) → [a, b, c]
+            // 关键：子 Union 的 members 也需 extend 进去——一次性平展
+            Type::Union(members) => {
+                for m in members {
+                    match m {
+                        // 递归：再内层的 Union 也展开
+                        Type::Union(inner) => flat.extend(inner.iter().cloned()),
+                        _ => flat.push(m.clone()),
+                    }
+                }
+            }
+            _ => {
+                nested_only = false;
+                flat.push(t.clone());
+            }
+        }
+    }
+    if flat.is_empty() {
+        Type::Union(vec![])
+    } else if flat.len() == 1 && !nested_only {
+        // 单成员退化：join_types(&[Int]) → Int（不是 Union(vec![Int])）
+        flat.pop().unwrap()
+    } else {
+        // 多成员 OR 整个输入是单 Union（平展后仍为 Union 形态）
+        Type::Union(flat)
+    }
+}
+
 /// v0.75.86: Union 双向 check helper —— 为双向定型 check 模式服务。
 ///
 /// 复用 [`Type::subtype_of`] 的 Union arm（保守方向：任一成员 subtype 即 OK），

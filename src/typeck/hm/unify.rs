@@ -300,4 +300,180 @@ mod tests {
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), TypeError::OccursCheck { .. }));
     }
+
+    // ─── v0.75.86: Type::subtype_of（非对称 subtype 关系）──
+
+    fn trait_ty(name: &str, generics: Vec<Type>) -> Type {
+        Type::Trait {
+            name: name.to_string(),
+            generics,
+        }
+    }
+
+    fn concrete(name: &str, generics: Vec<Type>, traits: Vec<Type>) -> Type {
+        Type::Concrete {
+            name: name.to_string(),
+            generics,
+            traits,
+        }
+    }
+
+    #[test]
+    fn subtype_any_is_top() {
+        // Any 是 top type —— 与任何 subtype 关系成立
+        assert!(Type::Any.subtype_of(&Type::Int));
+        assert!(Type::String.subtype_of(&Type::Any));
+        assert!(Type::Any.subtype_of(&Type::Any));
+    }
+
+    #[test]
+    fn subtype_is_asymmetric() {
+        // 关键不变量：A <: B 不蕴含 B <: A（区别于 compatible_with）
+        assert!(Type::Int.subtype_of(&Type::Int));
+        // Int 不 subtype String（同构严格相等——同构即 subtype，但不互通）
+        assert!(!Type::Int.subtype_of(&Type::String));
+        assert!(!Type::String.subtype_of(&Type::Int));
+    }
+
+    #[test]
+    fn subtype_concrete_impls_trait() {
+        // Concrete 实现 trait → Concrete subtype Trait
+        let comparable = trait_ty("Comparable", vec![Type::Int]);
+        let int_val = concrete("MyInt", vec![Type::Int], vec![comparable.clone()]);
+        assert!(int_val.subtype_of(&comparable));
+        // 反向不成立：Trait 不 subtype Concrete
+        assert!(!comparable.subtype_of(&int_val));
+    }
+
+    #[test]
+    fn subtype_concrete_with_no_trait_fails() {
+        // Concrete 没有实现 super Trait → 不 subtype
+        let comparable = trait_ty("Comparable", vec![Type::Int]);
+        let bare = concrete("Plain", vec![Type::Int], vec![]);
+        assert!(!bare.subtype_of(&comparable));
+    }
+
+    #[test]
+    fn subtype_concrete_recurses_into_traits_list() {
+        // Concrete.traits 含多个 Trait——任一匹配即 subtype
+        let show = trait_ty("Show", vec![]);
+        let eq = trait_ty("Eq", vec![Type::Int]);
+        let val = concrete("Widget", vec![], vec![show.clone(), eq.clone()]);
+        assert!(val.subtype_of(&show));
+        assert!(val.subtype_of(&eq));
+    }
+
+    #[test]
+    fn subtype_trait_same_name_generics() {
+        // Trait<A> subtype Trait<B> 当 A subtype B（递归到 element）
+        let a = trait_ty("Container", vec![Type::Int]);
+        let b = trait_ty("Container", vec![Type::Int]);
+        // 同名 + 同 arity + 同 element → subtype（对称同构）
+        assert!(a.subtype_of(&b));
+        assert!(b.subtype_of(&a));
+        // 容器递归：A<Concrete<...>> subtype A<Trait> 通过 Concrete<:Trait
+        // 用真实类型 Foo（trait）和 ConcreteFoo（实现 Foo 的具体类型）
+        let foo = trait_ty("Foo", vec![]);
+        let concrete_foo = concrete("ConcreteFoo", vec![], vec![foo.clone()]);
+        let container_concrete = trait_ty("Container", vec![concrete_foo]);
+        let container_trait = trait_ty("Container", vec![foo]);
+        assert!(container_concrete.subtype_of(&container_trait));
+    }
+
+    #[test]
+    fn subtype_list_recurses_into_element() {
+        // List<Concrete> subtype List<Trait> 当 Concrete subtype Trait
+        let comparable = trait_ty("Comparable", vec![Type::Int]);
+        let int_val = concrete("MyInt", vec![Type::Int], vec![comparable.clone()]);
+        let list_concrete = Type::List(Box::new(int_val));
+        let list_trait = Type::List(Box::new(comparable));
+        assert!(list_concrete.subtype_of(&list_trait));
+        // 反向不成立
+        assert!(!list_trait.subtype_of(&list_concrete));
+    }
+
+    #[test]
+    fn subtype_dict_recurses() {
+        // Dict<Concrete, ...> subtype Dict<Trait, ...>
+        let comparable = trait_ty("Comparable", vec![]);
+        let key_concrete = concrete("MyKey", vec![], vec![comparable.clone()]);
+        let d1 = Type::Dict(Box::new(key_concrete), Box::new(Type::Int));
+        let d2 = Type::Dict(Box::new(comparable), Box::new(Type::Int));
+        assert!(d1.subtype_of(&d2));
+    }
+
+    #[test]
+    fn subtype_union_member_matches() {
+        // Union(m1, m2) subtype T 当任一 m subtype T
+        let comparable = trait_ty("Comparable", vec![Type::Int]);
+        let val = concrete("V", vec![Type::Int], vec![comparable.clone()]);
+        let union_ty = Type::Union(vec![Type::String, val.clone()]);
+        // Union 含 V，V subtype Comparable → Union subtype Comparable
+        assert!(union_ty.subtype_of(&comparable));
+        // 反向：Comparable 不 subtype Union[String, V]（Union 成员是 String
+        // 和 V，Comparable 都不是——保守方向 false）
+        assert!(!comparable.subtype_of(&union_ty));
+    }
+
+    #[test]
+    fn subtype_nil_only_self() {
+        assert!(Type::Nil.subtype_of(&Type::Nil));
+        // Nil 不 subtype 其他类型（v0.12 后门 2 关闭）
+        assert!(!Type::Nil.subtype_of(&Type::Int));
+        assert!(!Type::String.subtype_of(&Type::Nil));
+    }
+
+    #[test]
+    fn subtype_forall_recurses_inner() {
+        // ForAll<α.τ> subtype T 当 τ subtype T（命中 env 时已实例化，
+        // 此处防御——ForAll 是「所有实例化」的上界，递归到内层是保守策略）
+        let inner = Type::Int;
+        let forall = Type::ForAll(vec!['a'], Box::new(inner.clone()));
+        assert!(forall.subtype_of(&Type::Int));   // ForAll<α.Int> <: Int 当 Int <: Int
+        assert!(forall.subtype_of(&Type::Any));   // ForAll<α.Int> <: Any
+        // 反向：T subtype ForAll<α.U> 当 T subtype U 成立（α 重新实例化为 T 自身）——
+        // 这与 HM 标准的「T 是 ForAll 的实例」匹配：Int 是 ForAll<α.Int> 的实例
+        // （α 绑定为 Int 后，body 退化为 Int）。
+        assert!(inner.subtype_of(&forall));         // Int subtype ForAll<α.Int>
+        // String 不 subtype ForAll<α.Int>（String 不 <: Int）
+        assert!(!Type::String.subtype_of(&forall));
+    }
+
+    #[test]
+    fn subtype_trait_object_does_not_match_trait_yet() {
+        // TraitObject 与 Trait 不是同 enum variant，subtype 退化兜底
+        // — 真正的 dyn: 语法未实现，此路径为未来扩展预留。
+        // 当前行为：TraitObject 与任何 Trait 不 subtype（仅同构兜底）。
+        let comparable = trait_ty("Comparable", vec![Type::Int]);
+        let obj = Type::TraitObject;
+        assert!(!obj.subtype_of(&comparable));
+        assert!(!comparable.subtype_of(&obj));
+    }
+
+    #[test]
+    fn subtype_existing_compatible_is_preserved() {
+        // subtype_of 的对称化形式（subtype_of(a,b) || subtype_of(b,a)）
+        // 应等价于 compatible_with(a,b) —— 这是这次重构的兼容性保证
+        let cases: Vec<(Type, Type)> = vec![
+            (Type::Int, Type::Int),
+            (Type::String, Type::String),
+            (
+                Type::List(Box::new(Type::Int)),
+                Type::List(Box::new(Type::Int)),
+            ),
+            (
+                Type::Dict(Box::new(Type::String), Box::new(Type::Int)),
+                Type::Dict(Box::new(Type::String), Box::new(Type::Int)),
+            ),
+        ];
+        for (a, b) in cases {
+            let symmetric = a.subtype_of(&b) || b.subtype_of(&a);
+            let compatible = a.compatible_with(&b);
+            assert_eq!(
+                symmetric, compatible,
+                "subtype symmetrization ≠ compatible_with for ({:?}, {:?})",
+                a, b
+            );
+        }
+    }
 }

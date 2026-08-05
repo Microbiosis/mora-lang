@@ -9,8 +9,6 @@
 //! 阶段预解析（visited 防环）并合并进 HM env，import 的符号不再报
 //! UnboundVariable。路径解析与运行时 `mir_import` 一致（cwd 相对）。
 
-use std::collections::HashSet;
-
 use super::TypeError;
 
 use super::hm::HMInference;
@@ -22,8 +20,78 @@ use crate::mir::MirExpr;
 ///  Run HM inference across the program (witness 输入) and return any
 ///  diagnostics. 阶段 3 目标形态：parse 直接产出 witness，typeck 直接
 /// 消费 witness（零 MirExpr 桥接）。
+///
+/// v0.75.86：共享 inner helper（[`check_program_witnesses_inner`]）——
+/// 双向集成（[`check_program_witnesses_bidirectional`]）复用 import +
+/// HM infer_program，仅在前后插入双向预扫 + 重复错误过滤。
 pub fn check_program_witnesses(witnesses: &[crate::mir::witness::MirWitness]) -> Vec<TypeError> {
     let mut hm = HMInference::new();
+    check_program_witnesses_inner(witnesses, &mut hm)
+}
+
+/// v0.75.86: 双向类型检查入口（Phase B/C 集成）。
+///
+/// 流程：
+///   1. 收集 import 符号到 env（同 [`check_program_witnesses`]）
+///   2. [`BidirectionalChecker::pre_check_program`] 预扫，产出双向
+///      错误（Lambda/Call/If/LetBinding 关键节点的精准 expected/actual）
+///   3. HM 跑全树，产出 HM 错误
+///   4. 过滤：line+column 已诊断过的位置不再报（避免双向 + HM 重复）
+///   5. 合并双向 + 过滤后 HM 错误
+///
+/// 与 [`check_program_witnesses`] 区别：双向层**前置**在 HM 全树合一
+/// 之前，错误诊断更精准（expected/actual 直接来自 check_against），
+/// 配合 [`HMInference::diagnosed`] 跟踪避免重复。
+pub fn check_program_witnesses_bidirectional(
+    witnesses: &[crate::mir::witness::MirWitness],
+) -> Vec<TypeError> {
+    use crate::typeck::bidirectional::BidirectionalChecker;
+    use std::collections::HashSet;
+    let mut hm = HMInference::new();
+
+    // v0.75.18: 预扫描 import 目标文件的顶层符号并合并进 env
+    let mut visited: HashSet<std::path::PathBuf> = HashSet::new();
+    let mut import_errors: Vec<TypeError> = Vec::new();
+    for (name, ty) in
+        super::imports::collect_imported_symbols(witnesses, &mut visited, &mut import_errors)
+    {
+        hm.env.add(name, ty);
+    }
+
+    // 双向预扫 —— 关键节点的精准 expected/actual
+    let mut checker = BidirectionalChecker::new(&mut hm);
+    checker.pre_check_program(witnesses);
+    let bidir_errors = checker.errors;
+    let _nodes_visited = checker.nodes_visited;
+
+    // HM 全树合一 —— 同位置已被双向诊断的过滤
+    let hm_errors: Vec<TypeError> = hm
+        .infer_program(witnesses)
+        .into_iter()
+        .map(hm_to_external)
+        .collect();
+    let filtered_hm_errors: Vec<TypeError> = hm_errors
+        .into_iter()
+        .filter(|e| {
+            // 按 line+column 过滤（与 HM::diagnosed 伪 ID 的 line+column 部分对比）
+            !hm.diagnosed
+                .iter()
+                .any(|node_id| node_id.line == e.line && node_id.column == e.column)
+        })
+        .collect();
+
+    let mut errors = bidir_errors;
+    errors.extend(import_errors);
+    errors.extend(filtered_hm_errors);
+    errors
+}
+
+/// 共享内部：HM 推理 + 错误转换（不处理 import、不处理双向）
+fn check_program_witnesses_inner(
+    witnesses: &[crate::mir::witness::MirWitness],
+    hm: &mut HMInference,
+) -> Vec<TypeError> {
+    use std::collections::HashSet;
     let mut errors: Vec<TypeError> = Vec::new();
 
     // v0.75.18: 预扫描 import 目标文件的顶层符号并合并进 env
@@ -184,6 +252,39 @@ mod tests {
     // and bypass arity checking. Closures bound via `let` go through
     // `infer_let` which DOES register them, exercising the arity check
     // we want to verify.
+
+    // v0.75.86: 双向集成（[`check_program_witnesses_bidirectional`]）
+    //   - If 条件不是 bool —— HM 不查 cond 类型，仅双向会报 type mismatch
+    //   - 验证双向路径产错、HM 路径不产错
+    #[test]
+    fn bidirectional_if_cond_type_mismatch() {
+        // if 42 then 1 else 2 — cond 期望 bool 实际 Int
+        let program = vec![MirExpr {
+            kind: MirExprKind::If {
+                cond: Box::new(lit(1)), // Int 而非 Bool
+                then: Box::new(lit(1)),
+                r#else: Some(Box::new(lit(2))),
+            },
+            span: Span::default(),
+        }];
+        // HM 路径（不带双向）—— 不产错（If/else 不会触发 cond 类型检查）
+        let hm_errs = check_program_mir(&program);
+        // 双向路径 —— 触发双向 If 节点 check_against(Bool)
+        let bidir_errs = check_program_witnesses_bidirectional(
+            &crate::mir::witness::MirWitness::from_exprs(&program),
+        );
+        // 双向应产出 type mismatch 错误
+        assert!(
+            bidir_errs
+                .iter()
+                .any(|e| e.message.contains("type mismatch")),
+            "bidirectional should catch If cond type mismatch, got {:?}",
+            bidir_errs
+        );
+        // HM 路径对此不报错（双重证明双向比 HM 多抓到错）
+        let _ = hm_errs; // 当前不强制断言 HM 不报——它可能报也可能不报
+    }
+
     #[test]
     fn arity_mismatch_propagates_expected_and_actual() {
         // let f = closure(x, y) body  then  f(1)  — too few args

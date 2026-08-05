@@ -126,14 +126,18 @@ impl<'a> BidirectionalChecker<'a> {
         self.hm.infer_expr(w)
     }
 
-    /// v0.75.86: 双向预扫入口（Phase A 当前覆盖 1 个节点）
+    /// v0.75.86: 双向预扫入口
     ///
     /// 遍历 witness 树，在**关键节点**前置双向检查；其它节点
     /// 仍由 HM 在 `infer_program` 阶段处理（保留现有行为）。
     ///
-    /// 当前覆盖：Lambda 参数的 `type_hint` 与 body inferred 类型
-    /// 的**自反**验证（subtype 自反是 subtype 的最简形式）——
-    /// Phase A 仅做 demo，Phase B/C 扩展更复杂节点。
+    /// 覆盖（Phase A 骨架）：
+    ///     - Lambda 参数 `type_hint` 自反 check
+    /// 覆盖（Phase B）：
+    ///     - Call 实参 check against `callee` 的 `sig.params[i]`
+    /// 覆盖（Phase C）：
+    ///     - If 条件 check against `bool`
+    ///     - LetBinding `type_hint` check against value 推断类型
     pub fn pre_check_program(&mut self, witnesses: &[MirWitness]) {
         for w in witnesses {
             self.pre_check_witness(w);
@@ -143,7 +147,7 @@ impl<'a> BidirectionalChecker<'a> {
     /// 递归遍历 witness 树
     fn pre_check_witness(&mut self, w: &MirWitness) {
         self.nodes_visited += 1;
-        // 关键节点：Closure 参数 type_hint 自反 check
+        // === Phase A：Closure 参数 type_hint 自反 check ===
         if let WitnessKind::Closure { params, body } = &w.kind {
             for p in params {
                 if let Some(hint) = &p.type_hint {
@@ -156,9 +160,95 @@ impl<'a> BidirectionalChecker<'a> {
             }
             // 递归 body（保守 synth）
             self.pre_check_witness(body);
-        } else {
-            // 通用递归：所有有子节点的 variant
-            self.recurse_witness(w);
+            return;
+        }
+        // === Phase B：Call 实参双向 check against callee.sig.params[i] ===
+        if let WitnessKind::Call { callee, args } = &w.kind {
+            // 提取 callee 期望参数类型（仅对 Var/Name 形式 sig 可查）
+            if let Some(expected_params) = self.lookup_callee_params(callee) {
+                // arity 校验
+                if expected_params.len() != args.len() {
+                    self.hm.mark_diagnosed(w);
+                    // 顶层 TypeError 是 struct，构造携带 arity 诊断
+                    // 信息（expected/actual 字段）而非裸 enum 变体
+                    let msg = format!(
+                        "expected {} arguments, got {}",
+                        expected_params.len(),
+                        args.len()
+                    );
+                    let mut e = TypeError::new(w.span.line, msg);
+                    e.column = w.span.column;
+                    e.expected = Some(expected_params.len().to_string());
+                    e.actual = Some(args.len().to_string());
+                    self.errors.push(e);
+                } else {
+                    // 逐 arg check against expected_params[i]
+                    for (arg, expected_ty) in args.iter().zip(expected_params.iter()) {
+                        if let Err(e) = self.check_against(arg, expected_ty) {
+                            self.errors.push(e);
+                        }
+                    }
+                }
+            }
+            // 无论 callee 形式，递归子节点
+            for a in args {
+                self.pre_check_witness(a);
+            }
+            return;
+        }
+        // === Phase C：If 条件 check against bool ===
+        if let WitnessKind::If { cond, then, r#else } = &w.kind {
+            // cond 应是 bool
+            if let Err(e) = self.check_against(cond, &Type::Bool) {
+                self.errors.push(e);
+            }
+            // then/else 在 Phase C 简单跳过 join（多分支 join 是 Phase D 工作）
+            self.pre_check_witness(cond);
+            self.pre_check_witness(then);
+            if let Some(e) = r#else {
+                self.pre_check_witness(e);
+            }
+            return;
+        }
+        // === Phase C：LetBinding type_hint check against value inferred type ===
+        if let WitnessKind::LetBinding {
+            type_hint, value, ..
+        } = &w.kind
+        {
+            if let Some(hint) = type_hint
+                && let Err(e) = self.check_against(value, hint)
+            {
+                self.errors.push(e);
+            }
+            // 递归 value + init_body
+            self.pre_check_witness(value);
+            if let WitnessKind::LetBinding { init_body, .. } = &w.kind {
+                self.pre_check_witness(init_body);
+            }
+            return;
+        }
+        // 通用递归：所有有子节点的 variant
+        self.recurse_witness(w);
+    }
+
+    /// Phase B 辅助：查 callee 的 closure sig 参数列表。
+    /// 返回 None 当 callee 不是已知 closure（Name 走 builtin，Var 在 env 中未找到，
+    /// 或 Evaluated 表达式无法静态分析）—— 保守行为：跳过双向 check。
+    fn lookup_callee_params(
+        &self,
+        callee: &crate::mir::witness::WitnessCallee,
+    ) -> Option<Vec<Type>> {
+        use crate::mir::witness::WitnessCallee;
+        match callee {
+            WitnessCallee::Var(name) => {
+                // 从 env 查 Var 绑定的类型
+                let ty = self.hm.env.get(name)?;
+                // closure_sig 只在 Type::TypeVar 形态有效
+                let sig = self.hm.closure_sig(ty)?;
+                Some(sig.params.clone())
+            }
+            // Name/Evaluated/Builtin/Method —— 暂未实现查 builtin/method sig
+            _ => None,
         }
     }
 
@@ -408,5 +498,210 @@ mod tests {
         checker.pre_check_program(&[w]);
         // 至少 3 个节点（root + left + right）
         assert!(checker.nodes_visited >= 3);
+    }
+
+    // ─── Phase B：Call 实参双向 check ───
+
+    #[test]
+    fn phase_b_call_arg_correct_type_passes() {
+        // 正确：f(42) — arg 是 Int，callee 期望 Int
+        let mut hm = HMInference::new();
+        // 手工 add 闭包到 env（绕过闭包绑定 let 解析复杂）
+        // 用 closure_sig 注册一个 Int→Int 函数
+        let sig_placeholder = hm.fresh_type_var_id();
+        hm.closure_sigs.insert(
+            sig_placeholder,
+            crate::typeck::hm::ClosureSig {
+                params: vec![Type::Int],
+                return_type: Type::Int,
+                arity: 1,
+            },
+        );
+        // var "f" 绑定的类型：用 sig_placeholder 这个 TypeVar（让 closure_sig 能查到）
+        hm.env.add("f".to_string(), Type::TypeVar(sig_placeholder));
+        let mut checker = BidirectionalChecker::new(&mut hm);
+        // f(42) —— Call
+        let call = MirWitness {
+            kind: WitnessKind::Call {
+                callee: crate::mir::witness::WitnessCallee::Var("f".to_string()),
+                args: vec![lit_witness(42, 1, 0)],
+            },
+            span: Span::new(1, 0),
+        };
+        checker.pre_check_program(&[call]);
+        // 正确 arg type：不应有错
+        assert!(
+            checker.errors.is_empty(),
+            "expected no errors, got {:?}",
+            checker.errors
+        );
+    }
+
+    #[test]
+    fn phase_b_call_arg_wrong_type_reports() {
+        // 错误：f("string") — 但 arg 是 int literal（强转时 typeck 阶段
+        // 实际只能测 Int vs Int 失配，String 字面量 witness 难构造）
+        // 简化：arg = Float —— 用 Type::Float 期望
+        // 期待：f(3.14) 应报 type mismatch
+        let mut hm = HMInference::new();
+        let sig_placeholder = hm.fresh_type_var_id();
+        hm.closure_sigs.insert(
+            sig_placeholder,
+            crate::typeck::hm::ClosureSig {
+                params: vec![Type::Int],
+                return_type: Type::Int,
+                arity: 1,
+            },
+        );
+        hm.env.add("f".to_string(), Type::TypeVar(sig_placeholder));
+        // 先配置所有 hm（避免之后 &mut hm 借用冲突）
+        // g 的 closure sig：sig_id 既作 closure_sigs key 也作 env 中 g 的 TypeVar
+        let sig_g = hm.fresh_type_var_id();
+        hm.closure_sigs.insert(
+            sig_g,
+            crate::typeck::hm::ClosureSig {
+                params: vec![Type::Float], // 期望 Float
+                return_type: Type::Float,
+                arity: 1,
+            },
+        );
+        hm.env.add("g".to_string(), Type::TypeVar(sig_g));
+        // 现在 hm 配置完成，构造 checker
+        let mut checker = BidirectionalChecker::new(&mut hm);
+        // g(42) — Int <: Float 失败
+        let call = MirWitness {
+            kind: WitnessKind::Call {
+                callee: crate::mir::witness::WitnessCallee::Var("g".to_string()),
+                args: vec![lit_witness(42, 1, 0)],
+            },
+            span: Span::new(1, 0),
+        };
+        checker.pre_check_program(&[call]);
+        // 应有 1 个 type mismatch 错误
+        assert!(!checker.errors.is_empty(), "expected mismatch error");
+        let e = &checker.errors[0];
+        assert!(e.expected.is_some(), "expected field should be populated");
+        assert!(e.actual.is_some(), "actual field should be populated");
+    }
+
+    #[test]
+    fn phase_b_call_arity_mismatch_reports() {
+        // f(1, 2) — 但 f 期望 1 个 arg
+        let mut hm = HMInference::new();
+        let sig = hm.fresh_type_var_id();
+        hm.closure_sigs.insert(
+            sig,
+            crate::typeck::hm::ClosureSig {
+                params: vec![Type::Int],
+                return_type: Type::Int,
+                arity: 1,
+            },
+        );
+        hm.env.add("f".to_string(), Type::TypeVar(sig));
+        let mut checker = BidirectionalChecker::new(&mut hm);
+        let call = MirWitness {
+            kind: WitnessKind::Call {
+                callee: crate::mir::witness::WitnessCallee::Var("f".to_string()),
+                args: vec![lit_witness(1, 1, 0), lit_witness(2, 1, 4)],
+            },
+            span: Span::new(1, 0),
+        };
+        checker.pre_check_program(&[call]);
+        // 应有 1 个 arity mismatch
+        assert_eq!(checker.errors.len(), 1);
+        let e = &checker.errors[0];
+        assert!(e.message.contains("expected 1"));
+        assert!(e.message.contains("got 2"));
+        assert!(e.expected.as_deref() == Some("1"));
+        assert!(e.actual.as_deref() == Some("2"));
+    }
+
+    // ─── Phase C：If 条件 + LetBinding ───
+
+    #[test]
+    fn phase_c_if_cond_int_reports() {
+        // if 42 then ... else ... — cond 期望 bool 但实际 Int
+        let mut hm = HMInference::new();
+        let mut checker = BidirectionalChecker::new(&mut hm);
+        let w = MirWitness {
+            kind: WitnessKind::If {
+                cond: Box::new(lit_witness(42, 1, 3)),
+                then: Box::new(lit_witness(1, 1, 10)),
+                r#else: Some(Box::new(lit_witness(2, 1, 18))),
+            },
+            span: Span::new(1, 0),
+        };
+        checker.pre_check_program(&[w]);
+        // cond 期望 bool 但收到 Int —— 应报 mismatch
+        assert!(!checker.errors.is_empty());
+        let e = &checker.errors[0];
+        assert!(e.message.contains("type mismatch"));
+        assert!(e.expected.as_deref() == Some("Bool"));
+    }
+
+    #[test]
+    fn phase_c_let_with_matching_type_passes() {
+        // let x: Int = 42 —— value 推断 Int subtype Int（标注）通过
+        let mut hm = HMInference::new();
+        let mut checker = BidirectionalChecker::new(&mut hm);
+        let w = MirWitness {
+            kind: WitnessKind::LetBinding {
+                name: "x".to_string(),
+                type_hint: Some(Type::Int),
+                value: Box::new(lit_witness(42, 1, 12)),
+                init_body: Box::new(lit_witness(0, 1, 16)),
+            },
+            span: Span::new(1, 0),
+        };
+        checker.pre_check_program(&[w]);
+        assert!(
+            checker.errors.is_empty(),
+            "expected no errors, got {:?}",
+            checker.errors
+        );
+    }
+
+    #[test]
+    fn phase_c_let_with_mismatched_type_reports() {
+        // let x: Float = 42 — 标注 Float 但 value 是 Int（subtype 失败）
+        let mut hm = HMInference::new();
+        let mut checker = BidirectionalChecker::new(&mut hm);
+        let w = MirWitness {
+            kind: WitnessKind::LetBinding {
+                name: "x".to_string(),
+                type_hint: Some(Type::Float),
+                value: Box::new(lit_witness(42, 1, 12)),
+                init_body: Box::new(lit_witness(0, 1, 16)),
+            },
+            span: Span::new(1, 0),
+        };
+        checker.pre_check_program(&[w]);
+        // 应报 type mismatch
+        assert!(!checker.errors.is_empty());
+        let e = &checker.errors[0];
+        assert!(e.message.contains("type mismatch"));
+        assert!(e.expected.as_deref() == Some("Float"));
+        assert!(e.actual.as_deref() == Some("Int"));
+    }
+
+    #[test]
+    fn phase_c_let_marks_diagnosed() {
+        // let 失败时双向应 mark_diagnosed value 节点（check_against 在 value 触发）
+        let mut hm = HMInference::new();
+        let mut checker = BidirectionalChecker::new(&mut hm);
+        let value = lit_witness(42, 1, 12);
+        let init_body = lit_witness(0, 1, 16);
+        let w = MirWitness {
+            kind: WitnessKind::LetBinding {
+                name: "x".to_string(),
+                type_hint: Some(Type::Float),
+                value: Box::new(value.clone()),
+                init_body: Box::new(init_body.clone()),
+            },
+            span: Span::new(1, 0),
+        };
+        checker.pre_check_program(std::slice::from_ref(&w));
+        // value 节点应被 mark_diagnosed（line 1 col 12 + Literal kind）
+        assert!(hm.is_diagnosed(&value));
     }
 }

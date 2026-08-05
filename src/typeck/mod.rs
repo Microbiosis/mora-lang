@@ -24,6 +24,7 @@
 // v0.55: typeck V2 模块 (mod check, mod pregel_check) 已删除。
 // 类型检查的唯一入口: `check_program_mir` (mod check_mir)。
 
+pub mod bidirectional; // v0.75.86: 双向类型检查骨架入口（Phase A）
 pub mod check_mir;
 pub mod dispatch;
 pub mod hm;

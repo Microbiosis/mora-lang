@@ -485,6 +485,58 @@ pub fn is_empty_union(ty: &Type) -> bool {
     matches!(ty, Type::Union(m) if m.is_empty())
 }
 
+/// v0.75.86: Union 双向 check helper —— 为双向定型 check 模式服务。
+///
+/// 复用 [`Type::subtype_of`] 的 Union arm（保守方向：任一成员 subtype 即 OK），
+/// 不引入新规则。当 check 失败时，收集**第一个失败成员**的 expected/actual
+/// 配对作为 [`TypeError`]，供 LSP `publishDiagnostics` 结构化输出。
+///
+/// 与 [`Type::compatible_with`] 的语义差异：
+///   - `compatible_with(Union(m), T)`: 任一 m compatible T
+///   - `check_union(actual, expected_union)`: 任一 m subtype T —— `subtype_of`
+///     比 `compatible_with` 严格（**非对称**）
+///
+/// 行号/列号由调用方在 Span 上下文填入（典型用法见
+/// `check_mir.rs::hm_to_external` 的 TypeError 构造）。
+///
+/// 典型用法（双向 check 模式）：
+/// ```ignore
+/// match expected {
+///     Type::Union(_) => check_union(&actual, expected)?,
+///     _ if actual.subtype_of(expected) => Ok(()),
+///     _ => Err("mismatch".to_string()),
+/// }
+/// ```
+///
+/// 错误字符串格式：`"expected subtype of <member>, got <actual>"`，
+/// 内部用 [`Type`] 的 `Debug` 输出（v0.13 Display impl 仅是设计目标，
+/// 实际未实现；Debug 覆盖所有 variant 字段）。
+/// 调用方可自行包装为 [`TypeError`]（行号/列号由调用方注入）。
+pub fn check_union(actual: &Type, expected: &Type) -> Result<(), String> {
+    let Type::Union(members) = expected else {
+        // 设计错误：调用方应在 dispatch 之前 match expected 是 Union。
+        // 返回描述性错误而非 panic——上层 match 错误会自己 panic。
+        return Err(format!(
+            "check_union misuse: expected must be Union, got {:?}",
+            expected
+        ));
+    };
+    if members.is_empty() {
+        // 空 Union = "any element type" 占位 —— 兼容任何
+        return Ok(());
+    }
+    // 任一成员 subtype 即可；第一个失败成员用于诊断
+    for m in members {
+        if actual.subtype_of(m) {
+            return Ok(());
+        }
+    }
+    Err(format!(
+        "expected subtype of `{:?}`, got `{:?}`",
+        members[0], actual,
+    ))
+}
+
 /// 检查是否是已知的内置类型名（大小写不敏感）
 pub fn is_known_type(name: &str) -> bool {
     let lower = name.to_lowercase();

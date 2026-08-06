@@ -467,10 +467,15 @@ mod tests {
 
     // v0.75.86: 完整 HM span 化集成测试 — 任何 typeck 错误 line > 0
     //
-    // Step 1 调研结论：剩 7 处 `let _ = span;` 全是不报错路径
-    // （let-generalization / closure / fn / binop / list elem / dict value /
-    //   if no-else）——不影响 typeck 错误位置报告。本测试断言：
-    //   任何报错错误 line > 0（不再出现 line 0）。
+    // 调研结论（按真实报错路径分类）：
+    //   - d7f35f9: infer_let_typed (let-with-hint 错)
+    //   - 2e50a5b: infer_match / infer_if (分支不一致)
+    //   - 本 commit: infer_binop / infer_list / infer_dict (元素不一致)
+    // 剩 4 处 `let _ = span;` 全是不报错路径：
+    //   - infer_let: let-generalization 成功不报错
+    //   - infer_closure / infer_fn_def: 闭包/fn 构造不报错
+    //   - infer_method_call: method_return_type 失败不报错（返 Any）
+    //   - infer_if no-else: 无 Eq 失败（Union 自动构造）
     #[test]
     fn all_typeck_errors_have_real_line() {
         use crate::common::Span;
@@ -501,5 +506,67 @@ mod tests {
                 e
             );
         }
+    }
+
+    // v0.75.86: binop 元素类型不一致应报真实行号
+    #[test]
+    fn binop_type_mismatch_uses_real_line() {
+        use crate::common::Span;
+        // 1 + "str" —— Int + String
+        // infer_binop 提前 span 报 UnificationFailure
+        let program = vec![MirExpr {
+            kind: MirExprKind::Binary {
+                left: Box::new(MirExpr::lit(
+                    crate::common::Literal::Int(1, Span::new(1, 4)),
+                    Span::new(1, 4),
+                )),
+                op: crate::common::BinaryOp::Add,
+                right: Box::new(MirExpr::lit(
+                    crate::common::Literal::String("str".to_string(), Span::new(1, 8)),
+                    Span::new(1, 8),
+                )),
+            },
+            span: Span::new(1, 0),
+        }];
+        let errs = check_program_mir(&program);
+        assert!(!errs.is_empty());
+        let e = &errs[0];
+        assert!(
+            e.line > 0,
+            "binop mismatch should have real line, got {}",
+            e.line
+        );
+    }
+
+    // v0.75.86: list elem 类型不一致应报真实行号
+    #[test]
+    fn list_elem_type_mismatch_uses_real_line() {
+        use crate::common::Span;
+        // [1, "str", 3] —— Int + String 元素类型不一致
+        let program = vec![MirExpr::list(
+            vec![
+                MirExpr::lit(
+                    crate::common::Literal::Int(1, Span::new(1, 4)),
+                    Span::new(1, 4),
+                ),
+                MirExpr::lit(
+                    crate::common::Literal::String("str".to_string(), Span::new(1, 8)),
+                    Span::new(1, 8),
+                ),
+                MirExpr::lit(
+                    crate::common::Literal::Int(3, Span::new(1, 16)),
+                    Span::new(1, 16),
+                ),
+            ],
+            Span::new(1, 0),
+        )];
+        let errs = check_program_mir(&program);
+        assert!(!errs.is_empty());
+        let e = &errs[0];
+        assert!(
+            e.line > 0,
+            "list elem mismatch should have real line, got {}",
+            e.line
+        );
     }
 }

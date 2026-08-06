@@ -65,6 +65,11 @@ pub fn check_program_witnesses_bidirectional(
     let _nodes_visited = checker.nodes_visited;
 
     // HM 全树合一 —— 同位置已被双向诊断的过滤
+    // Phase G 调研结论：按 (line, column, kind) 三元组过滤不可行
+    // —— 双向 mark_diagnosed 标记的是 witness kind (Literal/Call/...)，
+    // HM error kind 是 TypeError 枚举 variant (UnboundVariable/...)，
+    // 两层 kind 维度不对应（同位置 witness kind 唯一但 HM error kind
+    // 可能有多个）。退而按 line+column 二元组过滤（Phase A 已有）。
     let hm_errors: Vec<TypeError> = hm
         .infer_program(witnesses)
         .into_iter()
@@ -256,6 +261,7 @@ mod tests {
     // v0.75.86: 双向集成（[`check_program_witnesses_bidirectional`]）
     //   - If 条件不是 bool —— HM 不查 cond 类型，仅双向会报 type mismatch
     //   - 验证双向路径产错、HM 路径不产错
+
     #[test]
     fn bidirectional_if_cond_type_mismatch() {
         // if 42 then 1 else 2 — cond 期望 bool 实际 Int

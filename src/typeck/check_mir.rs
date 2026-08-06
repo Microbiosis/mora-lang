@@ -337,4 +337,40 @@ mod tests {
             e.actual
         );
     }
+
+    // v0.75.86: 修 HM span bug —— let with type_hint 不一致应报
+    // 真实行号而非 line 0。覆盖 infer_let_typed 提前用 span 报错的路径。
+    #[test]
+    fn let_with_type_hint_mismatch_uses_real_line() {
+        // `let x: Int = "hello"` —— value 是 String，type_hint 是 Int
+        // 修前 line 0；修后 line 1, column 5
+        use crate::common::Span;
+        let program = vec![MirExpr {
+            kind: MirExprKind::LetBinding {
+                name: "x".to_string(),
+                type_hint: Some(crate::typeck::Type::Int),
+                value: Box::new(MirExpr::lit(
+                    crate::common::Literal::String("hello".to_string(), Span::new(1, 5)),
+                    Span::new(1, 5),
+                )),
+                init_body: Box::new(MirExpr::var("x".to_string(), Span::new(2, 0))),
+            },
+            span: Span::new(1, 0),
+        }];
+        let errs = check_program_mir(&program);
+        // 至少 1 个 type mismatch 错（line 0 是 pre-existing bug 不应再出现）
+        assert!(!errs.is_empty(), "expected at least one error, got none");
+        let mismatch = errs
+            .iter()
+            .find(|e| e.message.contains("Type mismatch"))
+            .expect("expected type mismatch error");
+        assert_eq!(
+            mismatch.line, 1,
+            "line should be 1, got {} (line 0 = bug)",
+            mismatch.line
+        );
+        // column 来自 `let` 表达式整体 span（line 1, column 0 = let 关键字位置）
+        // ——验证 span 整体透传非 0 即可，不严格断言 column
+        assert_eq!(mismatch.column, 0, "column should be 0 (let keyword), got {}", mismatch.column);
+    }
 }

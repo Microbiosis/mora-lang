@@ -1,0 +1,20 @@
+-- test_v0_75_85_bidirectional.mora
+-- 验证双向类型检查端到端（commit be7cab2 + 9ff7db8 + f0d484a）
+--
+-- 跑法：
+--   ./target/release/mora.exe test_v0_75_85_bidirectional.mora
+--   ./target/release/mora.exe --check test_v0_75_85_bidirectional.mora
+--
+-- 注意：Mora v0.75.85 typeck 默认走 HM inference。**双向 check 默认未启用**
+-- （Phase A 入口 check_program_witnesses_bidirectional 存在但 CLI 未接线）。
+-- 测试目标：HM + typeck 路径能产出 expected/actual 诊断（与双向共享
+-- TypeError 结构）。
+--
+-- 旧注释保留：
+-- -- test_v0_75_85_bidirectional.mora
+-- -- 验证双向类型检查端到端
+-- -- 测试目标 commit be7cab2 + 9ff7db8 + f0d484a
+
+-- ─── 1. let type_hint mismatch（Phase C 双向行为）───
+let x: int = "hello"
+print(x)

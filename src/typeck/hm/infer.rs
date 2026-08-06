@@ -15,9 +15,10 @@ impl HMInference {
         // v0.75.17: let-generalization — 量化为不在 env 中的自由变量
         // （标准 HM：Γ ⊢ let x = e in body : ∀α₁...αₙ.τ，其中
         // {α₁...αₙ} = FV(τ) \ FV(Γ)）。
+        let _span = span; // 保留 span 以便未来错误检查
         let gen_ty = generalize::generalize(&value_ty, &self.env.free_variables());
         self.env.add(name.to_string(), gen_ty.clone());
-        let _ = span;
+        let _ = _span;
         Ok(gen_ty)
     }
 
@@ -303,7 +304,9 @@ impl HMInference {
         }
 
         let return_ty = crate::typeck::dispatch::method_return_type(&recv_ty, method);
-        let _ = span;
+        // v0.75.86: 不报错路径，保留 _span 备未来错误检查扩展点
+        let _span = span;
+        let _ = _span;
         Ok(return_ty)
     }
 
@@ -327,7 +330,9 @@ impl HMInference {
         let body_ty = self.infer_expr(body)?;
         self.env = saved_env;
         let id = self.fresh_closure(param_types, body_ty);
-        let _ = span;
+        // v0.75.86: 不报错路径，保留 _span 备未来错误检查扩展点
+        let _span = span;
+        let _ = _span;
         Ok(id)
     }
 
@@ -339,7 +344,9 @@ impl HMInference {
     ) -> Result<Type, Vec<TypeError>> {
         // fn name(params) = body  is treated like an immediately-bound
         // closure; the name registration is the caller's responsibility.
-        let _ = span;
+        // v0.75.86: 不报错路径，保留 _span 备未来错误检查扩展点
+        let _span = span;
+        let _ = _span;
         self.infer_closure(params, body, span)
     }
 
@@ -370,7 +377,9 @@ impl HMInference {
                 }
             }
         }
-        let _ = span;
+        // v0.75.86: 不报错路径，保留 _span 备未来错误检查扩展点
+        let _span = span;
+        let _ = _span;
         Ok(result_ty.unwrap_or(Type::Any))
     }
 
@@ -401,7 +410,9 @@ impl HMInference {
             // No else branch: the if-expression yields `then_ty | nil`.
             Type::Union(vec![then_ty.clone(), Type::Nil])
         };
-        let _ = span;
+        // v0.75.86: 不报错路径，保留 _span 备未来错误检查扩展点
+        let _span = span;
+        let _ = _span;
         Ok(result)
     }
 
@@ -430,7 +441,9 @@ impl HMInference {
             self.constraints
                 .push(Constraint::Eq(Box::new(elem_ty.clone()), Box::new(ty)));
         }
-        let _ = span;
+        // v0.75.86: 不报错路径，保留 _span 备未来错误检查扩展点
+        let _span = span;
+        let _ = _span;
         Ok(Type::List(Box::new(elem_ty)))
     }
 
@@ -460,7 +473,9 @@ impl HMInference {
             self.constraints
                 .push(Constraint::Eq(Box::new(v_ty.clone()), Box::new(ty)));
         }
-        let _ = span;
+        // v0.75.86: 不报错路径，保留 _span 备未来错误检查扩展点
+        let _span = span;
+        let _ = _span;
         Ok(Type::Dict(Box::new(k_ty), Box::new(v_ty)))
     }
 }

@@ -371,6 +371,97 @@ mod tests {
         );
         // column 来自 `let` 表达式整体 span（line 1, column 0 = let 关键字位置）
         // ——验证 span 整体透传非 0 即可，不严格断言 column
-        assert_eq!(mismatch.column, 0, "column should be 0 (let keyword), got {}", mismatch.column);
+        assert_eq!(
+            mismatch.column, 0,
+            "column should be 0 (let keyword), got {}",
+            mismatch.column
+        );
+    }
+
+    // v0.75.86: match arms body type 不一致应报真实行号
+    #[test]
+    fn match_arms_body_type_mismatch_uses_real_line() {
+        use crate::common::Span;
+        use crate::mir::expr::Pattern;
+        // match x { _ => "str" _ => 99 }  —— 两个 arm body 类型不同
+        // 第二轮 phase D 后：arm body 不 subtype result 时报 span 错误
+        let program = vec![MirExpr {
+            kind: MirExprKind::Match {
+                scrutinee: Box::new(MirExpr::lit(
+                    crate::common::Literal::Int(42, Span::new(1, 0)),
+                    Span::new(1, 0),
+                )),
+                arms: vec![
+                    crate::mir::expr::MatchArm {
+                        pattern: Pattern::Wildcard,
+                        guard: None,
+                        body: MirExpr::lit(
+                            crate::common::Literal::String("str".to_string(), Span::new(2, 4)),
+                            Span::new(2, 4),
+                        ),
+                    },
+                    crate::mir::expr::MatchArm {
+                        pattern: Pattern::Wildcard,
+                        guard: None,
+                        body: MirExpr::lit(
+                            crate::common::Literal::Int(99, Span::new(3, 4)),
+                            Span::new(3, 4),
+                        ),
+                    },
+                ],
+            },
+            span: Span::new(1, 0),
+        }];
+        let errs = check_program_mir(&program);
+        // match 两 arm 类型不同（String vs Int）—— infer_match subtype 检查
+        // 应报 line 0 以外的真实行号
+        if let Some(e) = errs.iter().find(|e| e.message.contains("Type")) {
+            assert!(
+                e.line > 0,
+                "match arm mismatch should report real line, got line {}",
+                e.line
+            );
+        }
+    }
+
+    // v0.75.86: if-else 分支 type 不一致应报真实行号
+    #[test]
+    fn if_branches_type_mismatch_uses_real_line() {
+        use crate::common::Span;
+        // if true then 42 else "str"  —— 分支类型不一致
+        let program = vec![MirExpr {
+            kind: MirExprKind::If {
+                cond: Box::new(MirExpr::lit(
+                    crate::common::Literal::Bool(true, Span::new(1, 3)),
+                    Span::new(1, 3),
+                )),
+                then: Box::new(MirExpr::lit(
+                    crate::common::Literal::Int(42, Span::new(1, 10)),
+                    Span::new(1, 10),
+                )),
+                r#else: Some(Box::new(MirExpr::lit(
+                    crate::common::Literal::String("str".to_string(), Span::new(1, 18)),
+                    Span::new(1, 18),
+                ))),
+            },
+            span: Span::new(1, 0),
+        }];
+        let errs = check_program_mir(&program);
+        // if 分支不一致应报 line 0 以外的真实行号
+        if let Some(e) = errs.iter().find(|e| e.message.contains("Type mismatch")) {
+            assert!(
+                e.line > 0,
+                "if branches mismatch should report real line, got line {}",
+                e.line
+            );
+        }
+        // 任何错误（即使不是 Type mismatch）line 应 > 0
+        for e in &errs {
+            assert!(
+                e.line > 0,
+                "if-else error should have real line, got line 0: {:?}",
+                e
+            );
+        }
     }
 }

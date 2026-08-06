@@ -33,6 +33,16 @@ impl HMInference {
         // against the value's inferred type. Tolerant: Type::Any
         // annotations always succeed.
         if !matches!(type_hint, Type::Any) {
+            // v0.75.86: 提前用 span 报不一致——不等 solve_constraints 兜底
+            // (原代码只 push Constraint 到 constraints 一致性队列，span 在
+            // 合一失败时被丢弃 → typeck 错误统一报 line 0)
+            if !value_ty.compatible_with(type_hint) {
+                return Err(vec![TypeError::UnificationFailure {
+                    expected: format!("{:?}", type_hint),
+                    got: format!("{:?}", value_ty),
+                    span: Some(span),
+                }]);
+            }
             self.constraints.push(Constraint::Eq(
                 Box::new(type_hint.clone()),
                 Box::new(value_ty.clone()),

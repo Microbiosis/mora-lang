@@ -121,6 +121,14 @@ impl HMInference {
         let result_ty = self.fresh_type_var();
         match op {
             Add | Sub | Mul | Div | Mod => {
+                // v0.75.86: 提前用 span 报不一致（避免 line 0）
+                if !left_ty.compatible_with(&right_ty) {
+                    return Err(vec![TypeError::UnificationFailure {
+                        expected: format!("{:?}", left_ty),
+                        got: format!("{:?}", right_ty),
+                        span: Some(span),
+                    }]);
+                }
                 self.constraints.push(Constraint::Eq(
                     Box::new(left_ty.clone()),
                     Box::new(result_ty.clone()),
@@ -133,11 +141,25 @@ impl HMInference {
                 Ok(result_ty)
             }
             Equal | NotEqual => {
+                if !left_ty.compatible_with(&right_ty) {
+                    return Err(vec![TypeError::UnificationFailure {
+                        expected: format!("{:?}", left_ty),
+                        got: format!("{:?}", right_ty),
+                        span: Some(span),
+                    }]);
+                }
                 self.constraints
                     .push(Constraint::Eq(Box::new(left_ty), Box::new(right_ty)));
                 Ok(Type::Bool)
             }
             Greater | Less | GreaterEqual | LessEqual => {
+                if !left_ty.compatible_with(&right_ty) {
+                    return Err(vec![TypeError::UnificationFailure {
+                        expected: format!("{:?}", left_ty),
+                        got: format!("{:?}", right_ty),
+                        span: Some(span),
+                    }]);
+                }
                 self.constraints
                     .push(Constraint::Eq(Box::new(left_ty), Box::new(right_ty)));
                 Ok(Type::Bool)
@@ -389,8 +411,22 @@ impl HMInference {
         span: Span,
     ) -> Result<Type, Vec<TypeError>> {
         let elem_ty = self.fresh_type_var();
+        let mut first_ty: Option<Type> = None;
         for item in items {
             let ty = self.infer_expr(item)?;
+            // v0.75.86: 提前用 span 报 list elem type 不一致（避免 line 0）
+            if let Some(prev) = &first_ty
+                && !ty.compatible_with(prev)
+            {
+                return Err(vec![TypeError::UnificationFailure {
+                    expected: format!("{:?}", prev),
+                    got: format!("{:?}", ty),
+                    span: Some(span),
+                }]);
+            }
+            if first_ty.is_none() {
+                first_ty = Some(ty.clone());
+            }
             self.constraints
                 .push(Constraint::Eq(Box::new(elem_ty.clone()), Box::new(ty)));
         }
@@ -405,8 +441,22 @@ impl HMInference {
     ) -> Result<Type, Vec<TypeError>> {
         let k_ty = Type::String;
         let v_ty = self.fresh_type_var();
+        let mut first_v: Option<Type> = None;
         for (_, value) in entries {
             let ty = self.infer_expr(value)?;
+            // v0.75.86: 提前用 span 报 dict value type 不一致（避免 line 0）
+            if let Some(prev) = &first_v
+                && !ty.compatible_with(prev)
+            {
+                return Err(vec![TypeError::UnificationFailure {
+                    expected: format!("{:?}", prev),
+                    got: format!("{:?}", ty),
+                    span: Some(span),
+                }]);
+            }
+            if first_v.is_none() {
+                first_v = Some(ty.clone());
+            }
             self.constraints
                 .push(Constraint::Eq(Box::new(v_ty.clone()), Box::new(ty)));
         }

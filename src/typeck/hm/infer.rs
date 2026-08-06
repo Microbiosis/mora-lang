@@ -334,6 +334,15 @@ impl HMInference {
             match result_ty {
                 None => result_ty = Some(arm_ty),
                 Some(ref mut ty) => {
+                    // v0.75.86: 提前用 span 报 arm body type 不一致——
+                    // 不等 solve_constraints 兜底（约束无 span 关联 → line 0）
+                    if !arm_ty.subtype_of(ty) {
+                        return Err(vec![TypeError::UnificationFailure {
+                            expected: format!("{:?}", ty),
+                            got: format!("{:?}", arm_ty),
+                            span: Some(span),
+                        }]);
+                    }
                     self.constraints
                         .push(Constraint::Eq(Box::new(ty.clone()), Box::new(arm_ty)));
                 }
@@ -355,6 +364,14 @@ impl HMInference {
         let result = if let Some(e) = else_branch {
             let else_ty = self.infer_expr(e)?;
             // Both branches must produce the same type.
+            // v0.75.86: 提前用 span 报不一致（避免 line 0）
+            if !else_ty.subtype_of(&then_ty) {
+                return Err(vec![TypeError::UnificationFailure {
+                    expected: format!("{:?}", then_ty),
+                    got: format!("{:?}", else_ty),
+                    span: Some(span),
+                }]);
+            }
             self.constraints
                 .push(Constraint::Eq(Box::new(then_ty.clone()), Box::new(else_ty)));
             then_ty

@@ -464,4 +464,42 @@ mod tests {
             );
         }
     }
+
+    // v0.75.86: 完整 HM span 化集成测试 — 任何 typeck 错误 line > 0
+    //
+    // Step 1 调研结论：剩 7 处 `let _ = span;` 全是不报错路径
+    // （let-generalization / closure / fn / binop / list elem / dict value /
+    //   if no-else）——不影响 typeck 错误位置报告。本测试断言：
+    //   任何报错错误 line > 0（不再出现 line 0）。
+    #[test]
+    fn all_typeck_errors_have_real_line() {
+        use crate::common::Span;
+        // 综合场景：let-with-hint 错 + UnboundVariable 错
+        let program = vec![
+            MirExpr {
+                kind: MirExprKind::LetBinding {
+                    name: "x".to_string(),
+                    type_hint: Some(crate::typeck::Type::Int),
+                    value: Box::new(MirExpr::lit(
+                        crate::common::Literal::String("str".to_string(), Span::new(1, 12)),
+                        Span::new(1, 12),
+                    )),
+                    init_body: Box::new(MirExpr::var("x".to_string(), Span::new(1, 0))),
+                },
+                span: Span::new(1, 0),
+            },
+            MirExpr::var("nonexistent".to_string(), Span::new(2, 5)),
+        ];
+        let errs = check_program_mir(&program);
+        // 至少 2 个错
+        assert!(errs.len() >= 2, "expected >= 2 errors, got {}", errs.len());
+        // 任何错 line > 0
+        for e in &errs {
+            assert!(
+                e.line > 0,
+                "any typeck error should have real line, got line 0: {:?}",
+                e
+            );
+        }
+    }
 }

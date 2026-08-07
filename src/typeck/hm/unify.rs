@@ -440,14 +440,24 @@ mod tests {
     }
 
     #[test]
-    fn subtype_trait_object_does_not_match_trait_yet() {
-        // TraitObject 与 Trait 不是同 enum variant，subtype 退化兜底
-        // — 真正的 dyn: 语法未实现，此路径为未来扩展预留。
-        // 当前行为：TraitObject 与任何 Trait 不 subtype（仅同构兜底）。
+    fn subtype_trait_object_matches_trait_with_same_name_generics() {
+        // v0.75.86: TraitObject subtype Trait 升级为 trait_name + generics
+        // 同构判断（之前 unit variant 返 false 是 stub）。
         let comparable = trait_ty("Comparable", vec![Type::Int]);
-        let obj = Type::TraitObject;
-        assert!(!obj.subtype_of(&comparable));
-        assert!(!comparable.subtype_of(&obj));
+        // name 不匹配 → false
+        let obj_other = Type::TraitObject {
+            trait_name: "Other".to_string(),
+            generics: vec![],
+        };
+        assert!(!obj_other.subtype_of(&comparable));
+        // name + generics 匹配 → true
+        let obj_match = Type::TraitObject {
+            trait_name: "Comparable".to_string(),
+            generics: vec![Type::Int],
+        };
+        assert!(obj_match.subtype_of(&comparable));
+        // 反向不成立
+        assert!(!comparable.subtype_of(&obj_match));
     }
 
     #[test]

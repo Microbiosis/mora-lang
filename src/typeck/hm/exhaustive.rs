@@ -22,22 +22,39 @@
 use crate::common::Literal;
 use crate::mir::witness::{WitnessArm, WitnessPattern};
 
-/// v0.75.86: 检查 match arms 是否覆盖 Int literal 空间。
+/// v0.75.86: 检查 match arms 是否覆盖某种 Literal 类型空间。
 ///
 /// 返回 `Some(range_desc)` 若缺失；返回 `None` 若覆盖。
 ///
 /// range_desc 是 `0, 1, ..., N (total <N> int values missing)` 形式
 /// 用于错误报告（保守报 "其他 Int 值"——Mora Int 范围无界）。
 pub fn int_literal_arms_missing(arms: &[WitnessArm]) -> Option<String> {
-    // 收集所有 Int literal pattern
-    let mut covered: Vec<i64> = Vec::new();
+    literal_arms_missing(arms, LiteralKind::Int).map(|desc| format!("int<{}>", desc))
+}
+
+/// v0.75.86: Float literal exhaustiveness
+pub fn float_literal_arms_missing(arms: &[WitnessArm]) -> Option<String> {
+    literal_arms_missing(arms, LiteralKind::Float).map(|desc| format!("float<{}>", desc))
+}
+
+/// v0.75.86: String literal exhaustiveness
+pub fn string_literal_arms_missing(arms: &[WitnessArm]) -> Option<String> {
+    literal_arms_missing(arms, LiteralKind::String).map(|desc| format!("string<{}>", desc))
+}
+
+/// v0.75.86: Bool literal exhaustiveness
+pub fn bool_literal_arms_missing(arms: &[WitnessArm]) -> Option<String> {
+    literal_arms_missing(arms, LiteralKind::Bool).map(|desc| format!("bool<{}>", desc))
+}
+
+/// v0.75.86: 通用 literal exhaustiveness（4 种可枚举字面量）
+fn literal_arms_missing(arms: &[WitnessArm], kind: LiteralKind) -> Option<String> {
+    let mut covered_count = 0usize;
+    let mut covered_examples: Vec<String> = Vec::new();
     let mut has_covering_pattern = false;
 
     for arm in arms {
         match &arm.pattern {
-            // Wildcard / Variable / Tuple / List / Dict / TypeAscription
-            // 任何 pattern 视为覆盖（保守：Mora 是动态类型，这些
-            // pattern 可匹配任何值）
             WitnessPattern::Wildcard
             | WitnessPattern::Variable(_)
             | WitnessPattern::Tuple(_)
@@ -46,18 +63,28 @@ pub fn int_literal_arms_missing(arms: &[WitnessArm]) -> Option<String> {
                 has_covering_pattern = true;
             }
             WitnessPattern::TypeAscription { pattern, .. } => {
-                // 递归解开——内层 pattern 若是 Literal(Int) 收集；
-                // 否则视为覆盖
-                if !has_covering_pattern {
-                    collect_or_mark_covered(pattern, &mut covered, &mut has_covering_pattern);
+                if let Some(c) = count_or_cover(pattern, kind) {
+                    if c.covering {
+                        has_covering_pattern = true;
+                    } else {
+                        covered_count += c.count;
+                        for ex in c.examples {
+                            if covered_examples.len() < 5 {
+                                covered_examples.push(ex);
+                            }
+                        }
+                    }
+                } else {
+                    has_covering_pattern = true;
                 }
             }
             WitnessPattern::Literal(lit) => {
-                if let Literal::Int(n, _) = lit {
-                    covered.push(*n);
+                if matches_literal_kind(lit, kind) {
+                    covered_count += 1;
+                    if covered_examples.len() < 5 {
+                        covered_examples.push(format!("{:?}", lit));
+                    }
                 } else {
-                    // 非 Int literal（Float/String/Bool/...）
-                    // 视为覆盖——保守不报错
                     has_covering_pattern = true;
                 }
             }
@@ -67,39 +94,70 @@ pub fn int_literal_arms_missing(arms: &[WitnessArm]) -> Option<String> {
     if has_covering_pattern {
         return None;
     }
-
-    if covered.is_empty() {
-        // arms 全是非覆盖 pattern（无 Int literal 也无 wildcard...）
-        // ——保守不报（避免误报）
+    if covered_count == 0 {
         return None;
     }
-
-    // 覆盖了部分 Int literal——报告未覆盖范围
-    // 按 AGENTS.md §6 最小修改：保守报 "其他 Int 值"
-    Some(format!(
-        "(covered: {:?}; other int values not covered)",
-        covered
-    ))
+    Some(format!("covered: {:?}", covered_examples))
 }
 
-/// 递归 helper：展开 TypeAscription 嵌套的 pattern
-fn collect_or_mark_covered(pat: &WitnessPattern, covered: &mut Vec<i64>, has_covering: &mut bool) {
+/// v0.75.86: literal kind
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum LiteralKind {
+    Int,
+    Float,
+    String,
+    Bool,
+}
+
+fn matches_literal_kind(lit: &Literal, kind: LiteralKind) -> bool {
+    matches!(
+        (lit, kind),
+        (Literal::Int(_, _), LiteralKind::Int)
+            | (Literal::Float(_, _), LiteralKind::Float)
+            | (Literal::String(_, _), LiteralKind::String)
+            | (Literal::Bool(_, _), LiteralKind::Bool)
+    )
+}
+
+/// v0.75.86: 递归收集
+fn count_or_cover(pat: &WitnessPattern, kind: LiteralKind) -> Option<CoverInfo> {
     match pat {
         WitnessPattern::Wildcard
         | WitnessPattern::Variable(_)
         | WitnessPattern::Tuple(_)
         | WitnessPattern::List { .. }
-        | WitnessPattern::Dict { .. } => {
-            *has_covering = true;
+        | WitnessPattern::Dict { .. } => Some(CoverInfo::covering()),
+        WitnessPattern::Literal(lit) => {
+            if matches_literal_kind(lit, kind) {
+                Some(CoverInfo::literal(format!("{:?}", lit)))
+            } else {
+                None
+            }
         }
-        WitnessPattern::Literal(Literal::Int(n, _)) => {
-            covered.push(*n);
+        WitnessPattern::TypeAscription { pattern, .. } => count_or_cover(pattern, kind),
+    }
+}
+
+#[derive(Debug)]
+struct CoverInfo {
+    covering: bool,
+    count: usize,
+    examples: Vec<String>,
+}
+
+impl CoverInfo {
+    fn covering() -> Self {
+        Self {
+            covering: true,
+            count: 0,
+            examples: Vec::new(),
         }
-        WitnessPattern::Literal(_) => {
-            *has_covering = true;
-        }
-        WitnessPattern::TypeAscription { pattern, .. } => {
-            collect_or_mark_covered(pattern, covered, has_covering);
+    }
+    fn literal(example: String) -> Self {
+        Self {
+            covering: false,
+            count: 1,
+            examples: vec![example],
         }
     }
 }

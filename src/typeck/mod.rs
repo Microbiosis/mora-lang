@@ -103,7 +103,13 @@ pub enum Type {
     /// v0.03: Agent (name + tool_names + model_route + max_steps + system)
     Agent,
     /// v0.08.5: Trait object carrier (for_type + trait_name + generics + data)
-    TraitObject,
+    /// v0.75.86: 扩展 trait_name + generics 字段——subtype_of 升级为
+    /// trait_name + generics 同构判断（之前 unit variant 返 false 是 stub）。
+    /// 对应运行时 [`Value::TraitObject`] 包含 dyn dispatch 信息。
+    TraitObject {
+        trait_name: String,
+        generics: Vec<Type>,
+    },
     /// v0.17: Compose pipeline (arity = number of functions)
     Compose,
     /// v0.18: Partial application (boxed origin + how many args applied)
@@ -155,7 +161,24 @@ impl Type {
             Type::Concrete { .. } => "concrete".to_string(),
             // v0.36: 8 new variants
             Type::Agent => "agent".to_string(),
-            Type::TraitObject => "trait_object".to_string(),
+            Type::TraitObject {
+                trait_name,
+                generics,
+            } => {
+                if generics.is_empty() {
+                    format!("dyn {}", trait_name)
+                } else {
+                    format!(
+                        "dyn {}<{}>",
+                        trait_name,
+                        generics
+                            .iter()
+                            .map(|t| t.name())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                }
+            }
             Type::Compose => "compose".to_string(),
             Type::Partial => "partial".to_string(),
             Type::Atom => "atom".to_string(),
@@ -454,9 +477,23 @@ impl Type {
         // 不可达）。真正的 dyn: 语法未实现（parser_v3/mod.rs 无 dyn: 解析），
         // 此处兜底：TraitObject 不 subtype 任何具体 Trait。后续若解析器
         // 加 dyn: 语法、扩展 `Type::TraitObject { trait_name, generics }`，
-        // 此 arm 升级为 trait_name + generics 同构判断。
-        if matches!(self, Type::TraitObject) && matches!(super_ty, Type::Trait { .. }) {
-            return false;
+        // TraitObject subtype Trait：v0.75.86 升级为 trait_name + generics
+        // 同构判断（之前 unit variant 返 false 是 stub）。
+        if let (
+            Type::TraitObject {
+                trait_name: tn1,
+                generics: g1,
+            },
+            Type::Trait {
+                name: n2,
+                generics: g2,
+            },
+        ) = (self, super_ty)
+        {
+            if tn1 != n2 || g1.len() != g2.len() {
+                return false;
+            }
+            return g1.iter().zip(g2.iter()).all(|(a, b)| a.subtype_of(b));
         }
         // === 现有 compatible_with 的 Trait 同构 arm ===
         if let (

@@ -357,6 +357,9 @@ impl HMInference {
         span: Span,
     ) -> Result<Type, Vec<TypeError>> {
         let _ = self.infer_expr(scrutinee)?;
+        // v0.75.86: match exhaustiveness 检查不在此处（TypeError 类型
+        // 不匹配——此函数返 hm::TypeError enum，exhaustive 需返 typeck::TypeError
+        // struct）。改在 check_mir.rs 顶层调 exhaustive::int_literal_arms_missing。
         let mut result_ty: Option<Type> = None;
         for arm in arms {
             let arm_ty = self.infer_expr(&arm.body)?;

@@ -3087,6 +3087,38 @@ impl ParserV3 {
         use crate::typeck::Type;
         let tok = self.peek().cloned()?;
         match &tok.token_type {
+            // v0.75.86: `dyn Foo` / `dyn Container<number>` — 显式 dyn trait
+            // 注解。`dyn` 是 lexer 关键字（src/lexer.rs:73），与 `from_hint("dyn:Foo")`
+            // 路径产出同一 `Type::Trait{name, generics}`，HM typeck 0 改动。
+            TokenType::Dyn => {
+                self.advance(); // 吃 'dyn'
+                let name = self.consume_identifier("Expected trait name after 'dyn'")?;
+                let generics = if self.match_token(&[TokenType::Less]) {
+                    let mut g: Vec<Type> = Vec::new();
+                    loop {
+                        g.push(self.parse_type_annotation()?);
+                        if !self.match_token(&[TokenType::Comma]) {
+                            break;
+                        }
+                    }
+                    if !self.match_token(&[TokenType::Greater]) {
+                        eprintln!(
+                            "Parse error: expected '>' in dyn trait generics at line {}",
+                            self.current_line()
+                        );
+                        return None;
+                    }
+                    g
+                } else {
+                    Vec::new()
+                };
+                // v0.75.86: `dyn Foo<...>` 注解产 Type::TraitObject（v0.08
+                // 注解路径返回 unit TraitObject 是 stub——本次升级）
+                Some(Type::TraitObject {
+                    trait_name: name,
+                    generics,
+                })
+            }
             TokenType::Identifier(name) => {
                 let lower = name.to_lowercase();
                 // v0.75.17: 泛型注解 `<...>` — `List<int>` / `dict<string, any>`

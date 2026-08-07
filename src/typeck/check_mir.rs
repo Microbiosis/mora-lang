@@ -123,13 +123,31 @@ fn collect_match_exhaustive_recursive(
 ) {
     use crate::mir::witness::WitnessKind;
     if let WitnessKind::Match { scrutinee, arms } = &w.kind {
-        if let Some(missing) = crate::typeck::hm::exhaustive::int_literal_arms_missing(arms) {
-            let mut e = TypeError::new(
-                w.span.line,
-                format!("non-exhaustive patterns: missing int value(s) {}", missing),
-            );
-            e.column = w.span.column;
-            errors.push(e);
+        // v0.75.86: 4 种 literal 类型（Int/Float/String/Bool）独立检查
+        // ——任一缺失都报（不互相覆盖）
+        use crate::typeck::hm::exhaustive::{
+            bool_literal_arms_missing, float_literal_arms_missing, int_literal_arms_missing,
+            string_literal_arms_missing,
+        };
+        type Checker = fn(&[crate::mir::witness::WitnessArm]) -> Option<String>;
+        let checkers: [(&str, Checker); 4] = [
+            ("int", int_literal_arms_missing as Checker),
+            ("float", float_literal_arms_missing as Checker),
+            ("string", string_literal_arms_missing as Checker),
+            ("bool", bool_literal_arms_missing as Checker),
+        ];
+        for (kind_name, checker) in &checkers {
+            if let Some(missing) = checker(arms) {
+                let mut e = TypeError::new(
+                    w.span.line,
+                    format!(
+                        "non-exhaustive patterns: missing {} value(s) {}",
+                        kind_name, missing
+                    ),
+                );
+                e.column = w.span.column;
+                errors.push(e);
+            }
         }
         // 继续递归 scrutinee + arm body（嵌套 match 也要检查）
         collect_match_exhaustive_recursive(scrutinee, errors);

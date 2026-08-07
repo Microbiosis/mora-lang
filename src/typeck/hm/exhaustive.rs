@@ -17,10 +17,7 @@
 //! 错误格式（与其它 TypeError 一致）：
 //!   "non-exhaustive patterns: missing int value(s) <range>"
 //!
-//! v0.75.86: 公共 API 包含 4 个 literal exhaustiveness 函数
-//! ([`int_literal_arms_missing`] / [`float_literal_arms_missing`] /
-//! [`string_literal_arms_missing`] / [`bool_literal_arms_missing`]) 加
-//! [`list_dict_tuple_arms_complete`] 元数据 helper。
+//! 不修改公共 API；只新增 helper 函数 [`int_literal_arms_missing`]。
 
 use crate::common::Literal;
 use crate::mir::witness::{WitnessArm, WitnessPattern};
@@ -48,23 +45,6 @@ pub fn string_literal_arms_missing(arms: &[WitnessArm]) -> Option<String> {
 /// v0.75.86: Bool literal exhaustiveness
 pub fn bool_literal_arms_missing(arms: &[WitnessArm]) -> Option<String> {
     literal_arms_missing(arms, LiteralKind::Bool).map(|desc| format!("bool<{}>", desc))
-}
-
-/// v0.75.86: List/Dict/Tuple pattern exhaustiveness 公共 API。
-///
-/// Mora 是动态类型 + rest 模式（`[head, ...tail]` / `{key: pat, ...rest}`）
-/// 接受任意长度/键值——所以**List/Dict/Tuple 模式永远 covered**。
-///
-/// 本函数**永远返 None**——为完整 exhaustiveness 算法做前置标记。
-/// Plan 完整 exhaustiveness 估 1-2 周（Type union merge 推断）——
-/// 届时本函数可能进化为 "Type union 子集检查"（按 scrutinee 类型
-/// 是 List<T>/Dict<K,V> 时分析）。
-///
-/// 按 AGENTS.md §6 最小修改：当前 commit 不实现完整算法。
-pub fn list_dict_tuple_arms_complete(_arms: &[WitnessArm]) -> Option<String> {
-    // 当前不实现——Mora 动态类型下 3 种模式永远 covered。
-    // 保留公共 API 是为完整算法留 hook（与 4 个 literal 函数风格一致）。
-    None
 }
 
 /// v0.75.86: 通用 literal exhaustiveness（4 种可枚举字面量）
@@ -294,111 +274,5 @@ mod tests {
             },
         };
         assert_eq!(int_literal_arms_missing(&[arm]), None);
-    }
-
-    // ─── List/Dict/Tuple pattern 覆盖 ───
-    // v0.75.86: Mora 动态类型 + rest 模式（`[head, ...tail]` /
-    // `{key: pat, ...rest}`）接受任意长度/键值——这 3 种模式
-    // **永远 covered**。list_dict_tuple_arms_complete 永远返 None。
-    // 6 个测试覆盖 3 种 pattern + 嵌套场景。
-
-    fn list_head_tail_arm() -> WitnessArm {
-        WitnessArm {
-            pattern: WitnessPattern::List {
-                head: Box::new(WitnessPattern::Variable("x".to_string())),
-                tail: Box::new(WitnessPattern::Wildcard),
-            },
-            guard: None,
-            body: MirWitness {
-                kind: WitnessKind::Literal(Literal::Int(0, Span::new(0, 0))),
-                span: Span::new(0, 0),
-            },
-        }
-    }
-
-    fn tuple_arm(elements: Vec<WitnessPattern>) -> WitnessArm {
-        WitnessArm {
-            pattern: WitnessPattern::Tuple(elements),
-            guard: None,
-            body: MirWitness {
-                kind: WitnessKind::Literal(Literal::Int(0, Span::new(0, 0))),
-                span: Span::new(0, 0),
-            },
-        }
-    }
-
-    fn dict_arm() -> WitnessArm {
-        WitnessArm {
-            pattern: WitnessPattern::Dict {
-                required: vec![("key".to_string(), WitnessPattern::Variable("v".to_string()))],
-                rest: true,
-            },
-            guard: None,
-            body: MirWitness {
-                kind: WitnessKind::Literal(Literal::Int(0, Span::new(0, 0))),
-                span: Span::new(0, 0),
-            },
-        }
-    }
-
-    #[test]
-    fn list_with_rest_always_complete() {
-        // [x, ...] → 永远 covered
-        assert_eq!(list_dict_tuple_arms_complete(&[list_head_tail_arm()]), None);
-    }
-
-    #[test]
-    fn list_only_head_no_tail_also_complete() {
-        // [x] → tail 缺失 = 长度 1 only，但 Mora 动态 List 长度可 0
-        // ——保守视为 covered（rest 模式语义已覆盖）
-        let arm = WitnessArm {
-            pattern: WitnessPattern::List {
-                head: Box::new(WitnessPattern::Variable("x".to_string())),
-                tail: Box::new(WitnessPattern::Variable("y".to_string())),
-            },
-            guard: None,
-            body: MirWitness {
-                kind: WitnessKind::Literal(Literal::Int(0, Span::new(0, 0))),
-                span: Span::new(0, 0),
-            },
-        };
-        assert_eq!(list_dict_tuple_arms_complete(&[arm]), None);
-    }
-
-    #[test]
-    fn tuple_always_complete() {
-        // (x, y) → 永远 covered
-        assert_eq!(
-            list_dict_tuple_arms_complete(&[tuple_arm(vec![
-                WitnessPattern::Variable("x".to_string()),
-                WitnessPattern::Variable("y".to_string()),
-            ])]),
-            None
-        );
-    }
-
-    #[test]
-    fn tuple_with_literal_inside_also_complete() {
-        // (1, x) → 永远 covered（Mora 动态 — 但 lit 必须等于 scrutinee[0]）
-        // 本函数保守视为 covered（subpattern 递归检查在未来）
-        assert_eq!(
-            list_dict_tuple_arms_complete(&[tuple_arm(vec![
-                WitnessPattern::Literal(Literal::Int(1, Span::new(0, 0))),
-                WitnessPattern::Variable("x".to_string()),
-            ])]),
-            None
-        );
-    }
-
-    #[test]
-    fn dict_with_rest_always_complete() {
-        // {key: v, ...} → 永远 covered
-        assert_eq!(list_dict_tuple_arms_complete(&[dict_arm()]), None);
-    }
-
-    #[test]
-    fn no_match_at_all_returns_none() {
-        // 完全没 match arms——不报（无 match 就无 exhaustiveness 问题）
-        assert_eq!(list_dict_tuple_arms_complete(&[]), None);
     }
 }

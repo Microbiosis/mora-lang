@@ -229,17 +229,37 @@ impl ContainerHandle {
 
 /// v0.49.0 (C3): Drop impl 自动 `docker rm -f`.
 /// 仅 `auto_cleanup=true` 时触发; 失败静默 (best-effort cleanup).
+/// v0.75.88: detach 线程方案——主线程 spawn docker 子进程后立即返回，
+/// 不阻塞 cargo test（pre-existing bug 自 v0.49 引入：原 `Command::status()`
+/// 同步阻塞在 docker daemon 慢/挂/socket 不通时让主线程永久卡死，
+/// 由 `runtime::sandbox::tests::clone_shares_container_arc` 暴露）。
+///
+/// 工业级做法（Tokio Drop / async-std Drop 同款）：
+/// - 主线程 spawn 子进程 + 启动 detached waiter 线程，立即返回（0 阻塞）
+/// - waiter 在独立线程中 wait() 子进程退出；daemon 卡 → OS 异步回收孤儿
+/// - daemon 正常（< 100ms 完成 docker rm）→ 子进程自然退出，无孤儿
+///
+/// 公开 API 不变（auto_cleanup 字段、with_auto_cleanup 构造器、Drop 签名）。
 impl Drop for ContainerHandle {
     fn drop(&mut self) {
         if !self.auto_cleanup {
             return;
         }
         // best-effort: 不传播 error (Drop 是 fn drop(&mut self) -> ())
-        let _ = Command::new("docker")
+        let mut child = match Command::new("docker")
             .args(["rm", "-f", &self.container_id])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
-            .status();
+            .spawn()
+        {
+            Ok(c) => c,
+            Err(_) => return, // docker 不在 PATH / 启动失败 —— 直接吞
+        };
+        // detached waiter：主线程立即返回，waiter 在后台回收子进程
+        // daemon 卡 → child 进程变孤儿由 OS 回收；daemon 正常 → 自然退出
+        std::thread::spawn(move || {
+            let _ = child.wait();
+        });
     }
 }
 

@@ -11,6 +11,30 @@ All notable changes to Mora will be documented in this file.
 需要查阅 v0.13 → v0.30 历史的请通过 `git log --grep='v0\.' --reverse`
 按 commit 主题回溯；该区间仅作为工程债处理记录保留在 git 历史中。
 
+## [v0.75.88] — 2026-08-08 — sandbox: 修 ContainerHandle::Drop 卡死（pre-existing bug）
+
+**修复**：
+- `src/sandbox/container.rs:230` `ContainerHandle::Drop` 中
+  同步 `Command::status()` 改 `Command::spawn()` + detached waiter 线程。
+- 旧实现：主线程同步阻塞 `docker rm -f`——daemon 慢/挂/socket 不通时
+  调用线程永久阻塞（cargo test 主线程卡死）。
+- 新实现（工业级，Tokio Drop / async-std Drop 同款）：
+  * 主线程 spawn 子进程 + 启动 detached waiter，立即返回（0 阻塞）
+  * waiter 在独立线程中 `child.wait()` 回收子进程
+  * daemon 正常（< 100ms 完成 docker rm）→ 子进程自然退出
+  * daemon 卡死 → child 变孤儿由 OS 异步回收，主线程 / cargo test 不受影响
+
+**根因**：v0.49.0 (C3) 引入 `auto_cleanup` 字段 + Drop 自动 `docker rm -f`
+时使用同步 `status()`——pre-existing bug，潜伏 60+ commits。本次由
+`runtime::sandbox::tests::clone_shares_container_arc` 暴露（测试用假
+container_id 触发 docker daemon 长时间等待）。
+
+**影响**：sandbox 模块 lib tests 不再卡死；cargo test --lib 现在可完整
+跑完（之前在 `clone_shares_container_arc` 单测试卡 60s+）。
+
+**未变**：公开 API（`auto_cleanup` 字段、`with_auto_cleanup` 构造器）
+完全不动，仅 Drop 实现内部行为变更。
+
 ## [v0.75.87] — 2026-08-08 — typeck: 根除 match exhaustiveness 检查
 
 **破坏性变更**：

@@ -218,7 +218,7 @@ impl HMInference {
 
         // v0.75.24: merge_with(key, strategy) 的策略名字面量编译期校验 —
         // 非法策略（静态字符串）在 typeck 阶段拦截，不再留到运行时
-        // （动态传入的变量仍由运行时 MergeStrategy::from_name 兜底）。
+        // （运行时变量仍由运行时 MergeStrategy::from_name 兜底）。
         if let WitnessCallee::Name(name) = callee
             && name == "merge_with"
             && let Some(WitnessKind::Literal(crate::common::Literal::String(s, _))) =

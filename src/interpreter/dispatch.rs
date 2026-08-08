@@ -137,7 +137,7 @@ impl Interpreter {
         };
         // v0.75.24: 策略名解析收敛到 MergeStrategy::from_name
         // （单一事实来源；typeck 对字面量参数已做编译期校验，此处
-        // 运行时兜底动态用法）。
+        // 运行时兜底未类型化用法）。
         let ms = match crate::value::MergeStrategy::from_name(strat) {
             Some(s) => s,
             None => {

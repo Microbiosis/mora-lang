@@ -279,7 +279,7 @@ impl Drop for ExecMem {
 // 运行时状态（生成代码通过 arg 寄存器接收）
 // ===================================================================
 
-/// 生成函数的入参状态。`bail != 0` 表示生成代码遇到动态失败，
+/// 生成函数的入参状态。`bail != 0` 表示生成代码遇到运行时类型不匹配，
 /// 调用方回落解释器。offset 布局与生成代码中的位移常量一致。
 #[repr(C)]
 struct JitState {
@@ -1009,7 +1009,7 @@ fn try_compile(func: &MirFunction) -> Result<(ExecMem, Reg), JitError> {
 /// JIT 编译/执行结果分类（v0.75.50，为 LuaJIT 式 snapshot/side-exit 打基础）。
 /// 调用方（h_with_config）回落解释器时按分类记录诊断，而非笼统 Err：
 /// - `CompileReject`：模板集未覆盖（指令/类型/平台）→ 编译期即知，稳定可预测
-/// - `GuardFail`：运行期守卫失败（类型标签动态不匹配，生成代码置 bail）→
+/// - `GuardFail`：运行期守卫失败（类型标签运行时不匹配，生成代码置 bail）→
 ///   未来可映射 snapshot/side-exit（重编译换专门化模板）
 /// - `InternalInvariant`：基础设施破坏（可执行内存/W^X 失败）→ 环境问题，
 ///   非程序语义

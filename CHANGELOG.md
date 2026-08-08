@@ -11,6 +11,23 @@ All notable changes to Mora will be documented in this file.
 需要查阅 v0.13 → v0.30 历史的请通过 `git log --grep='v0\.' --reverse`
 按 commit 主题回溯；该区间仅作为工程债处理记录保留在 git 历史中。
 
+## [v0.75.90] — 2026-08-08 — docs: 修正「动态」修辞不严谨用法
+
+**修复**（6 处源码 + 1 处测试）：
+- `src/interpreter/dispatch.rs:140` 「运行时兜底动态用法」→「运行时兜底未类型化用法」
+- `src/mir/jit.rs:282` 「生成代码遇到动态失败」→「生成代码遇到运行时类型不匹配」
+- `src/mir/jit.rs:1012` 「类型标签动态不匹配」→「类型标签运行时不匹配」
+- `src/mir/lower.rs:23` 「REPL/import/pregel 等动态路径」→「REPL/import/pregel 等未走编译命令的入口」
+- `src/mir/lower.rs:45` 「无编译命令的动态路径」→「无显式编译命令的入口」
+- `src/mir/ssa.rs:125` 「env 仅作动态路径（REPL/import/pregel）」→「env 仅作未走编译命令入口（REPL/import/pregel）」
+- `src/typeck/hm/infer.rs:221` 「动态传入的变量」→「运行时变量」
+- `tests/tier1_typeck_mir.rs:318` 「动态传入的策略」→「运行时传入的策略」
+
+**保留**（2 处「动态」语义正确）：
+- `src/http_server.rs:3, 35` 「动态路由表」「动态路由条目」——指 runtime 注册的路由表，是真正的 dynamic 含义，非类型系统错说。
+
+**未变**：Mora 静态类型性质、v0.75.89 修字结论、所有代码行为。
+
 ## [v0.75.89] — 2026-08-08 — typeck: 修模块头注释错说「Mora 是动态语言」
 
 **修复**：

@@ -315,7 +315,7 @@ fn merge_with_invalid_strategy_literal_rejected_at_compile_time() {
 
 #[test]
 fn merge_with_dynamic_strategy_passes_typecheck() {
-    // 动态传入的策略（非字面量）无法静态校验 — typeck 放行，
+    // 运行时传入的策略（非字面量）无法静态校验 — typeck 放行，
     // 由运行时 MergeStrategy::from_name 兜底（unknown → 运行时错误）。
     let src = "let s = \"append\"\nmerge_with(\"x\", s)";
     let exprs = parse_code_v3(src).expect("parse");

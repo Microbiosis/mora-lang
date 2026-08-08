@@ -20,7 +20,7 @@ pub fn typecheck_mir_exprs(_exprs: &mut [MirExpr]) -> Vec<crate::typeck::TypeErr
 
 /// v0.75.30: 显式编译选项变体 — 调用方（CLI 编译入口）显式指定优化等级，
 /// 不读环境变量。语义与 `lower_mir_exprs` 完全一致，仅优化等级来源不同。
-/// REPL/import/pregel 等动态路径继续走 `lower_mir_exprs`（env 兜底）。
+/// REPL/import/pregel 等未走编译命令的入口继续走 `lower_mir_exprs`（env 兜底）。
 pub fn lower_mir_exprs_with_opt(
     exprs: &[MirExpr],
     opt_level: crate::mir::ssa::OptLevel,
@@ -42,7 +42,7 @@ pub fn lower_mir_exprs_with_opt(
 }
 
 /// 将 MirExpr 列表 lowering 为 MirFunction（env 兜底：CLI 未显式 `--opt`
-/// 时沿用 MORA_OPT — REPL/import/pregel 等无编译命令的动态路径）。
+/// 时沿用 MORA_OPT — REPL/import/pregel 等无显式编译命令的入口）。
 pub fn lower_mir_exprs(exprs: &[MirExpr]) -> Result<MirFunction, String> {
     lower_mir_exprs_with_opt(exprs, crate::mir::ssa::OptLevel::from_env())
 }

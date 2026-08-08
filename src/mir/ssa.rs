@@ -122,7 +122,7 @@ impl OptLevel {
     /// - `>= 2` → `Aggressive`（叠加 LICM/LSR/TCO）。
     ///
     /// v0.75.30: 显式编译选项提升 — CLI `--opt=N` 优先（见
-    /// `lower_mir_exprs_with_opt`），env 仅作动态路径（REPL/import/pregel）
+    /// `lower_mir_exprs_with_opt`），env 仅作未走编译命令入口（REPL/import/pregel）
     /// 的兜底。v1.0 演进：优化等级应成为编译命令的一等参数（类似 rustc
     /// `-O`），env 最终退役。
     pub fn from_env() -> OptLevel {

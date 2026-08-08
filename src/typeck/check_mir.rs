@@ -24,14 +24,10 @@ use crate::mir::MirExpr;
 /// v0.75.86：共享 inner helper（[`check_program_witnesses_inner`]）——
 /// 双向集成（[`check_program_witnesses_bidirectional`]）复用 import +
 /// HM infer_program，仅在前后插入双向预扫 + 重复错误过滤。
-/// v0.75.86: match exhaustiveness 检查也包含——独立于 HM 推理路径
-/// （返回 typeck::TypeError struct 而非 hm::TypeError enum）。
+/// v0.75.87: match exhaustiveness 检查已根除（保留 HM 推理路径）。
 pub fn check_program_witnesses(witnesses: &[crate::mir::witness::MirWitness]) -> Vec<TypeError> {
     let mut hm = HMInference::new();
-    let mut errors = check_program_witnesses_inner(witnesses, &mut hm);
-    // v0.75.86: match exhaustiveness——单独收集（HM 错误类型不混）
-    errors.extend(collect_match_exhaustive_errors(witnesses));
-    errors
+    check_program_witnesses_inner(witnesses, &mut hm)
 }
 
 /// v0.75.86: 双向类型检查入口（Phase B/C 集成）。
@@ -69,12 +65,6 @@ pub fn check_program_witnesses_bidirectional(
     let bidir_errors = checker.errors;
     let _nodes_visited = checker.nodes_visited;
 
-    // v0.75.86: match exhaustiveness 检查——独立于 HM 推理路径
-    // （HM infer_match 返 hm::TypeError enum，exhaustive 返 typeck::TypeError
-    // struct——类型不混）。遍历 witness 树调
-    // exhaustive::int_literal_arms_missing。
-    let exhaustive_errors: Vec<TypeError> = collect_match_exhaustive_errors(witnesses);
-
     // HM 全树合一 —— 同位置已被双向诊断的过滤
     // Phase G 调研结论：按 (line, column, kind) 三元组过滤不可行
     // —— 双向 mark_diagnosed 标记的是 witness kind (Literal/Call/...)，
@@ -99,163 +89,7 @@ pub fn check_program_witnesses_bidirectional(
     let mut errors = bidir_errors;
     errors.extend(import_errors);
     errors.extend(filtered_hm_errors);
-    errors.extend(exhaustive_errors);
     errors
-}
-
-/// v0.75.86: 递归遍历 witness 树收集 match 节点的 exhaustiveness 错误。
-///
-/// 委托 [`crate::typeck::hm::exhaustive::int_literal_arms_missing`]——只检查
-/// Int literal arm 覆盖度（保守不实现 type union 推断）。
-fn collect_match_exhaustive_errors(
-    witnesses: &[crate::mir::witness::MirWitness],
-) -> Vec<TypeError> {
-    let mut errors = Vec::new();
-    for w in witnesses {
-        collect_match_exhaustive_recursive(w, &mut errors);
-    }
-    errors
-}
-
-fn collect_match_exhaustive_recursive(
-    w: &crate::mir::witness::MirWitness,
-    errors: &mut Vec<TypeError>,
-) {
-    use crate::mir::witness::WitnessKind;
-    if let WitnessKind::Match { scrutinee, arms } = &w.kind {
-        // v0.75.86: 4 种 literal 类型（Int/Float/String/Bool）独立检查
-        // ——任一缺失都报（不互相覆盖）
-        use crate::typeck::hm::exhaustive::{
-            bool_literal_arms_missing, float_literal_arms_missing, int_literal_arms_missing,
-            string_literal_arms_missing,
-        };
-        type Checker = fn(&[crate::mir::witness::WitnessArm]) -> Option<String>;
-        let checkers: [(&str, Checker); 4] = [
-            ("int", int_literal_arms_missing as Checker),
-            ("float", float_literal_arms_missing as Checker),
-            ("string", string_literal_arms_missing as Checker),
-            ("bool", bool_literal_arms_missing as Checker),
-        ];
-        for (kind_name, checker) in &checkers {
-            if let Some(missing) = checker(arms) {
-                let mut e = TypeError::new(
-                    w.span.line,
-                    format!(
-                        "non-exhaustive patterns: missing {} value(s) {}",
-                        kind_name, missing
-                    ),
-                );
-                e.column = w.span.column;
-                errors.push(e);
-            }
-        }
-        // 继续递归 scrutinee + arm body（嵌套 match 也要检查）
-        collect_match_exhaustive_recursive(scrutinee, errors);
-        for arm in arms {
-            collect_match_exhaustive_recursive(&arm.body, errors);
-        }
-    } else {
-        // 通用递归——简化版：仅递归直接子节点 witness
-        // Orchestrate/TypeAlias/EnumDef/StructDef/Import/MacroDef/Loop/While
-        // 的 body 在 MirExpr 阶段通过 from_kind 处理，witness 阶段结构
-        // 不同（多 variants）——本 helper 不递归 Orchestrate 的 kind 内部
-        // （orchestrate 含 agent 列表，与 match 关系弱）。
-        // 保守选择：仅递归单 witness 子节点。
-        match &w.kind {
-            WitnessKind::Literal(_)
-            | WitnessKind::Variable(_)
-            | WitnessKind::MacroDef { .. }
-            | WitnessKind::TypeAlias { .. }
-            | WitnessKind::EnumDef { .. }
-            | WitnessKind::StructDef { .. }
-            | WitnessKind::Import(_)
-            | WitnessKind::Orchestrate { .. }
-            | WitnessKind::Return(None)
-            | WitnessKind::Break(_)
-            | WitnessKind::Continue(_) => {
-                // 无子节点（或不递归）
-            }
-            WitnessKind::Match { .. } => {
-                unreachable!("Match 已在 fn 入口 if let 处理")
-            }
-            WitnessKind::Binary { left, right, .. } => {
-                collect_match_exhaustive_recursive(left, errors);
-                collect_match_exhaustive_recursive(right, errors);
-            }
-            WitnessKind::Call { args, .. } => {
-                for a in args {
-                    collect_match_exhaustive_recursive(a, errors);
-                }
-            }
-            WitnessKind::MethodCall { receiver, args, .. } => {
-                collect_match_exhaustive_recursive(receiver, errors);
-                for a in args {
-                    collect_match_exhaustive_recursive(a, errors);
-                }
-            }
-            WitnessKind::Closure { body, .. } | WitnessKind::FnDef { body, .. } => {
-                collect_match_exhaustive_recursive(body, errors);
-            }
-            WitnessKind::If { cond, then, r#else } => {
-                collect_match_exhaustive_recursive(cond, errors);
-                collect_match_exhaustive_recursive(then, errors);
-                if let Some(e) = r#else {
-                    collect_match_exhaustive_recursive(e, errors);
-                }
-            }
-            WitnessKind::List(items) => {
-                for i in items {
-                    collect_match_exhaustive_recursive(i, errors);
-                }
-            }
-            WitnessKind::Dict(entries) => {
-                for (_k, v) in entries {
-                    collect_match_exhaustive_recursive(v, errors);
-                }
-            }
-            WitnessKind::DynTrait { expr, .. } => {
-                collect_match_exhaustive_recursive(expr, errors);
-            }
-            WitnessKind::Prompt { parts } => {
-                for p in parts {
-                    collect_match_exhaustive_recursive(p, errors);
-                }
-            }
-            WitnessKind::LetBinding {
-                value, init_body, ..
-            } => {
-                collect_match_exhaustive_recursive(value, errors);
-                collect_match_exhaustive_recursive(init_body, errors);
-            }
-            WitnessKind::Assign { value, .. } => {
-                collect_match_exhaustive_recursive(value, errors);
-            }
-            WitnessKind::Loop { body, .. } | WitnessKind::While { body, .. } => {
-                collect_match_exhaustive_recursive(body, errors);
-            }
-            WitnessKind::Or { left, right } | WitnessKind::And { left, right } => {
-                collect_match_exhaustive_recursive(left, errors);
-                collect_match_exhaustive_recursive(right, errors);
-            }
-            WitnessKind::Return(Some(e)) => {
-                collect_match_exhaustive_recursive(e, errors);
-            }
-            WitnessKind::IndexAssign {
-                object,
-                index,
-                value,
-            } => {
-                collect_match_exhaustive_recursive(object, errors);
-                collect_match_exhaustive_recursive(index, errors);
-                collect_match_exhaustive_recursive(value, errors);
-            }
-            WitnessKind::Sequence(stmts) => {
-                for s in stmts {
-                    collect_match_exhaustive_recursive(s, errors);
-                }
-            }
-        }
-    }
 }
 
 /// 共享内部：HM 推理 + 错误转换（不处理 import、不处理双向）
@@ -734,79 +568,6 @@ mod tests {
             e.line > 0,
             "list elem mismatch should have real line, got {}",
             e.line
-        );
-    }
-
-    // v0.75.86: match exhaustiveness 检查
-    // `match x { 1 => ... }` —— 单一 Int literal 非 exhaustive
-    #[test]
-    fn match_int_literal_only_arm_is_non_exhaustive() {
-        use crate::common::Span;
-        use crate::mir::expr::{MatchArm, Pattern};
-        // 构造 match x { 1 => "a" _ => "b" }——含 Wildcard 应完整
-        let program_with_wildcard = vec![MirExpr {
-            kind: MirExprKind::Match {
-                scrutinee: Box::new(MirExpr::var("x".to_string(), Span::new(1, 6))),
-                arms: vec![
-                    MatchArm {
-                        pattern: Pattern::Literal(crate::common::Literal::Int(1, Span::new(0, 0))),
-                        guard: None,
-                        body: MirExpr::lit(
-                            crate::common::Literal::String("a".to_string(), Span::new(0, 0)),
-                            Span::new(0, 0),
-                        ),
-                    },
-                    MatchArm {
-                        pattern: Pattern::Wildcard,
-                        guard: None,
-                        body: MirExpr::lit(
-                            crate::common::Literal::String("b".to_string(), Span::new(0, 0)),
-                            Span::new(0, 0),
-                        ),
-                    },
-                ],
-            },
-            span: Span::new(1, 0),
-        }];
-        // Wildcard arm 覆盖 — 不应报 exhaustiveness
-        let errs = check_program_mir(&program_with_wildcard);
-        let has_exhaustive_err = errs.iter().any(|e| e.message.contains("non-exhaustive"));
-        assert!(
-            !has_exhaustive_err,
-            "wildcard arm should make match exhaustive"
-        );
-    }
-
-    // v0.75.86: match exhaustiveness 检查
-    // `match x { 1 => "a" }` —— 单一 Int literal 非 exhaustive
-    #[test]
-    fn match_int_literal_only_arm_reports_non_exhaustive() {
-        use crate::common::Span;
-        use crate::mir::expr::{MatchArm, Pattern};
-        // 构造 match x { 1 => "a" }——单一 Int literal 应报 exhaustiveness
-        let program = vec![MirExpr {
-            kind: MirExprKind::Match {
-                scrutinee: Box::new(MirExpr::var("x".to_string(), Span::new(1, 6))),
-                arms: vec![MatchArm {
-                    pattern: Pattern::Literal(crate::common::Literal::Int(1, Span::new(0, 0))),
-                    guard: None,
-                    body: MirExpr::lit(
-                        crate::common::Literal::String("a".to_string(), Span::new(0, 0)),
-                        Span::new(0, 0),
-                    ),
-                }],
-            },
-            span: Span::new(1, 0),
-        }];
-        let errs = check_program_mir(&program);
-        let exhaustive_err = errs
-            .iter()
-            .find(|e| e.message.contains("non-exhaustive"))
-            .expect("expected non-exhaustive error");
-        assert!(
-            exhaustive_err.line > 0,
-            "non-exhaustive error should have real line, got line {}",
-            exhaustive_err.line
         );
     }
 }

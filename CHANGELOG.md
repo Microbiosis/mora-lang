@@ -11,6 +11,34 @@ All notable changes to Mora will be documented in this file.
 需要查阅 v0.13 → v0.30 历史的请通过 `git log --grep='v0\.' --reverse`
 按 commit 主题回溯；该区间仅作为工程债处理记录保留在 git 历史中。
 
+## [v0.75.87] — 2026-08-08 — typeck: 根除 match exhaustiveness 检查
+
+**破坏性变更**：
+- 删除 `src/typeck/hm/exhaustive.rs`（278 行）——4 个 `*_literal_arms_missing`
+  公共函数、`literal_arms_missing` helper、`LiteralKind` 枚举、`CoverInfo`
+  结构、`matches_literal_kind`/`count_or_cover` 全部删除，连同 7 个单元测试。
+- 删除 `src/typeck/hm/mod.rs` 中 `pub mod exhaustive;` 模块声明。
+- 删除 `src/typeck/check_mir.rs` 中 exhaustiveness 链路：
+  * `check_program_witnesses` / `check_program_witnesses_bidirectional`
+    内 4 处 exhaustiveness 调用点
+  * `collect_match_exhaustive_errors` 函数（9 行）
+  * `collect_match_exhaustive_recursive` 通用 witness 树遍历器（116 行，
+    含 31 个 WitnessKind 分支）——根除 exhaustiveness 调用点后无任何 caller，
+    按 AGENTS.md §6「无 caller 的死代码直接删」原则一并根除
+  * 2 个 `match_int_literal_only_arm` 集成测试
+- 删除 `src/typeck/hm/infer.rs:360-362` 关于 exhaustive 模块位置的 dangling 注释。
+
+**根因**：v0.75.86 引入的 match exhaustiveness 算法基于错误前提
+（按字面量类型报 "其他 Int 值" 等），对 List/Dict/Tuple pattern 的精确
+分析需要 type union merge 推断（估 1-2 周）。当前实现属于
+「装饰性兼容层」——既不能给出精确分析，又给后续引入制造认知负担。
+按 AGENTS.md §6 最小修改原则 + 「无正确实现就不留 hook」
+直接根除，不留 stub。
+
+**未来路径**（不在本次 commit 范围）：若重新引入 exhaustiveness 检查，
+须基于 HM unification + type union merge 推断；算法至少覆盖
+List/Dict 的精确长度/键值分析与 Tuple 元素 subpattern 递归。
+
 ## [v0.75.85] — 2026-08-04 — MoE（Mixture-of-Experts）集成
 
 在 Mora 语言中集成 MoE 架构（Shazeer 2017 稀疏门控）——**稀疏激活**：

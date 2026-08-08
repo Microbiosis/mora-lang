@@ -21,7 +21,6 @@ use crate::typeck::Type;
 mod builtin; // v0.75.70: builtin 类型推断（自 mod.rs 拆出）
 pub mod env;
 pub mod error;
-pub mod exhaustive; // v0.75.86: match exhaustiveness 检查（Int literal 覆盖度）
 pub mod generalize;
 mod infer;
 pub mod unify; // v0.75.70: infer_* 方法族（自 mod.rs 拆出）

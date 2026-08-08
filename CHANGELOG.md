@@ -11,6 +11,27 @@ All notable changes to Mora will be documented in this file.
 需要查阅 v0.13 → v0.30 历史的请通过 `git log --grep='v0\.' --reverse`
 按 commit 主题回溯；该区间仅作为工程债处理记录保留在 git 历史中。
 
+## [v0.75.89] — 2026-08-08 — typeck: 修模块头注释错说「Mora 是动态语言」
+
+**修复**：
+- `src/typeck/mod.rs:6-7` 头注释原文：
+  ```
+  - 可选类型：Mora 是动态语言，无 hint 时走推断；推断不出来视为 Any
+  - 不破坏现有行为：未标注类型的代码继续动态执行
+  ```
+- 改为：
+  ```
+  - 可选类型注解：Mora 是渐进式静态类型语言（spec §3.1）——无注解时走 HM Hindley-Milner 推断；推断不出来视为 Any
+  - 不破坏现有行为：未标注类型注解的代码继续走默认推断路径
+  ```
+
+**根因**：pre-existing 错说——`docs/mora-spec.md:3/42/225`、`docs/influences.md:66`
+（Common Lisp 反向借鉴）、CHANGELOG v0.75.16 「静态类型 M1」均明确 Mora 是
+「可选类型注解的渐进式静态类型语言」，HM Hindley-Milner 是唯一检查器（v0.55+）。
+模块头注释与 spec/influences/CHANGELOG 严重不符。
+
+**未变**：模块功能、检查器、行为完全不变——仅模块头文档注释修字。
+
 ## [v0.75.88] — 2026-08-08 — sandbox: 修 ContainerHandle::Drop 卡死（pre-existing bug）
 
 **修复**：

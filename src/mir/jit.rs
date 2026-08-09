@@ -281,6 +281,11 @@ impl Drop for ExecMem {
 
 /// 生成函数的入参状态。`bail != 0` 表示生成代码遇到运行时类型不匹配，
 /// 调用方回落解释器。offset 布局与生成代码中的位移常量一致。
+///
+/// v0.76.03: 注意——JIT 路径**不**依赖 typeck::Type::Any（架构审查报告
+/// v0.75.90 🟡 警告级风险 11 「JIT 假设 Any fallback」在 v0.75.43 copy-and-patch
+/// 上线时已被正确规避）。JIT 用 JitValue::nil() 作为 codegen 兜底（与 typeck
+/// Any 不同的事——AGENTS.md §7 防止按名字归类）。
 #[repr(C)]
 struct JitState {
     regs: *mut JitValue,
@@ -1013,6 +1018,9 @@ fn try_compile(func: &MirFunction) -> Result<(ExecMem, Reg), JitError> {
 ///   未来可映射 snapshot/side-exit（重编译换专门化模板）
 /// - `InternalInvariant`：基础设施破坏（可执行内存/W^X 失败）→ 环境问题，
 ///   非程序语义
+///
+/// v0.76.03: GuardFail 是"运行期类型不匹配"——JitValue::nil() 是 codegen
+/// 兜底值，**与** `typeck::Type::Any` **无关**。AGENTS.md §7 防止按名字归类。
 #[derive(Debug, Clone, PartialEq)]
 pub enum JitError {
     CompileReject(String),

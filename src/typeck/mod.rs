@@ -53,6 +53,11 @@ pub enum Type {
     Nil,
     /// 任意类型（推断不出时的退路，或显式 `any` 标注）
     Any,
+    /// v0.75.91: 未知类型逃逸标签 — HM 推断 / parser / import 解析失败时的
+    /// 兜底；与 `Any` 区别：`Any` 是 strict top type（仅在 subtype_of /
+    /// unify 路径与所有类型兼容），`Unknown` 在所有路径都是「不可判定」标
+    /// 记。详见 `docs/decisions/any-vs-unknown.md`（v0.75.91）。
+    Unknown,
     /// v0.x: 列表类型携带元素类型（`list<T>`）
     List(Box<Type>),
     /// v0.x: 字典类型携带键值类型（`dict<K, V>`）
@@ -141,6 +146,7 @@ impl Type {
             Type::Bool => "bool".to_string(),
             Type::Nil => "nil".to_string(),
             Type::Any => "any".to_string(),
+            Type::Unknown => "unknown".to_string(),
             Type::List(elem) => format!("list<{}>", elem.name()),
             Type::Dict(k, v) => format!("dict<{}, {}>", k.name(), v.name()),
             Type::Task => "task".to_string(),

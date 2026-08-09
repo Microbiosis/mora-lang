@@ -389,8 +389,8 @@ impl HMInference {
                 // 避免后续引用 result 报 UnboundVariable。此前返回 Nil 但
                 // 不登记变量，pregel/sequential 路径经 CLI 都会撞此缺口
                 //（测试走 run_mir 绕过 typeck 未暴露）。
-                self.env.add(input_var.clone(), Type::Any);
-                self.env.add(result_var.clone(), Type::Any);
+                self.env.add(input_var.clone(), Type::Unknown);
+                self.env.add(result_var.clone(), Type::Unknown);
                 Ok(Type::Nil)
             }
             WitnessKind::Loop { .. } => {

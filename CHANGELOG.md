@@ -11,6 +11,36 @@ All notable changes to Mora will be documented in this file.
 需要查阅 v0.13 → v0.30 历史的请通过 `git log --grep='v0\.' --reverse`
 按 commit 主题回溯；该区间仅作为工程债处理记录保留在 git 历史中。
 
+## [v0.75.91] — 2026-08-08 — typeck: 拆分 `Type::Any` 为 `Any` (top type) + `Unknown` (escape hatch)
+
+**审计先行**：v0.75.90 全仓 grep `Type::Any` 共 39 处，分类为
+- 🟢 A 类 top type 真用：8 处（`subtype_of`、`unify`、`join_types` 路径）
+- 🟡 B 类逃逸标签兜底：22 处（HM 推断失败 / parser 兜底 / import fallback / builtin unknown）
+- 🔴 C 类边界矛盾：9 处（spec注释与代码行为冲突——`compatible_with` 注释说 "Any 总兼容" 但代码无 Any 分支）
+
+**破坏性变更**：
+- `Type` 枚举新增 `Unknown` variant（`src/typeck/mod.rs:55` 之后）
+- 22 处 B 类全部改为 `Type::Unknown`：
+  * `parser_v3` "unknown" 关键字 + list<>/dict<> 元素类型兜底（3 处）
+  * `hm/infer.rs` 4 处 builtin callee / Var / result_ty 兜底
+  * `hm/mod.rs` 2 处 orchestrate input_var / result_var 注册
+  * `imports.rs` 2 处 EnumDef/StructDef 跨模块 + sanitize TypeVar
+  * `dispatch.rs` 5 处 Conversation.chat / history / HttpRequest.json / fallback
+- `dispatch.rs:324` `method_signature_via_type` 同时检查 Any + Unknown（test `unknown_method_returns_none` 修复）
+
+**保留**（22 处 Any，全部为 A 类 top type 真用）：
+- `Type::Any` 字面量解析（`parser_v3/mod.rs:3178`）
+- `subtype_of` / `compatible_with` / `unify` / `join_types` 路径（`unify.rs:178,183,211`、`mod.rs:148,430,572`）
+- 测试断言（`unify.rs:324-326,433,699,706`）
+- polymorphic builtin 签名 `str/float/bool(x: any) → ...`（`dispatch.rs:113,123,128`）
+- `let x: any = ...` 用户显式 any注解容忍（`infer.rs:34-36`）
+- `dispatch.rs:201` `List.map/filter` 闭包参数 Any（polymorphic）
+- `dispatch.rs:324` 检查 `ret == Any` 判断「未知签名」（含 Any + Unknown）
+
+**根因**：v0.55 以来 `Type::Any` 实际是**逃逸标签**（HM 推断失败时静默通过），但 spec 注释把它描述为「top type」（仅在 `subtype_of` 与 `unify` 路径与所有类型兼容），两个语义在 `compatible_with` 路径下**实际不一致**——`compatible_with(Any, Int) == false`（无 Any 检查分支，走兜底 `self == expected`），与 `subtype_of(Any, Int) == true` 相反。审计显示这一矛盾潜伏 20+ commits。
+
+**未来路径**（不在本次范围）：`Unknown` 在 HM `unify` 路径**保留 fail-fast**（与 Any top 区分），后续 LSP 可对 `Unknown` 触发「补全类型注解」quickfix；`Any` 在 `compatible_with` 路径的真正 top 语义可在后续单独 PR 引入（影响面可控）。
+
 ## [v0.75.90] — 2026-08-08 — docs: 修正「动态」修辞不严谨用法
 
 **修复**（6 处源码 + 1 处测试）：

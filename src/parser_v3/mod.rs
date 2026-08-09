@@ -3150,12 +3150,12 @@ impl ParserV3 {
                     }
                     return match lower.as_str() {
                         "list" => Some(Type::List(Box::new(
-                            args.into_iter().next().unwrap_or(Type::Any),
+                            args.into_iter().next().unwrap_or(Type::Unknown),
                         ))),
                         "dict" => {
                             let mut it = args.into_iter();
-                            let k = it.next().unwrap_or(Type::Any);
-                            let v = it.next().unwrap_or(Type::Any);
+                            let k = it.next().unwrap_or(Type::Unknown);
+                            let v = it.next().unwrap_or(Type::Unknown);
                             Some(Type::Dict(Box::new(k), Box::new(v)))
                         }
                         other => {
@@ -3176,6 +3176,7 @@ impl ParserV3 {
                     "bool" => Type::Bool,
                     "nil" => Type::Nil,
                     "any" => Type::Any,
+                    "unknown" => Type::Unknown,
                     other => {
                         eprintln!(
                             "Parse error: unsupported type annotation '{}' at line {}",

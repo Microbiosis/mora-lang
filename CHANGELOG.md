@@ -11,6 +11,22 @@ All notable changes to Mora will be documented in this file.
 需要查阅 v0.13 → v0.30 历史的请通过 `git log --grep='v0\.' --reverse`
 按 commit 主题回溯；该区间仅作为工程债处理记录保留在 git 历史中。
 
+## [v0.75.92] — 2026-08-08 — typeck: `Unknown` 显式 fail-fast 分支
+
+**修复**（`Unknown` 显式语义 vs `Any` top type）：
+- `src/typeck/mod.rs:336-341` `compatible_with` 加 `Unknown` 短路——任意一边 Unknown 返 false（fail-fast）
+- `src/typeck/mod.rs:434-439` `subtype_of` 加 `Unknown` 短路——同上；但保留 `Unknown <: Any`（Any 仍 top type）
+- `src/typeck/mod.rs:584-585` `join_types` 加 `Unknown` 短路——返 `Unknown`（与 `Any` 短路 `Union(vec![])` **语义不同**）
+- `src/typeck/hm/unify.rs:185-193` `unify` 加 `Unknown` 报错——`(Unknown, _) | (_, Unknown) | (Unknown, Unknown)` 都返 `TypeError::UnificationFailure`
+
+**根因**：v0.75.91 拆分 `Type::Any` 为 `Any` (top type) + `Unknown` (escape hatch) 后，`Unknown` 在 `subtype_of`/`compatible_with`/`unify`/`join_types` 路径下**全部走兜底**——`compatible_with(Unknown, Int) == false`（兜底 self == expected 失败）、`unify(Unknown, Int) == Err`（兜底兜底不匹配）。这意味着 v0.75.91 拆分**未带来行为变化**——仅是注释与代码语义对齐。
+
+**fail-fast 语义**：v0.75.92 让 `Unknown` 在四条核心路径显式分支，与 v0.75.91「Unknown 是『未知类型』标记」语义一致——既不是 top type（与 Any 不同），也不参与隐式合一成功（与 v0.75.91 拆分前 Any 的兜底行为相反）。
+
+**测试**：3 个新测试（`unknown_fails_subtype_with_any_type` / `unknown_unifies_fails` / `join_types_with_unknown_short_circuits_to_unknown`）覆盖 4 条路径的 fail-fast 行为，v0.75.91 拆分未被任何测试覆盖——本次同步补齐。
+
+**未变**：`Any` 仍 strict top type（`subtype_of` line 430 / `unify` line 183）；22 处 B 类转 `Unknown` 不变；polymorphic builtin 签名（str/float/bool/map/filter 闭包参数）保留 `Any`。
+
 ## [v0.75.91] — 2026-08-08 — typeck: 拆分 `Type::Any` 为 `Any` (top type) + `Unknown` (escape hatch)
 
 **审计先行**：v0.75.90 全仓 grep `Type::Any` 共 39 处，分类为

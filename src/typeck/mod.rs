@@ -333,6 +333,12 @@ impl Type {
     /// 类型兼容：Any 总兼容；Result<T,E> 与 Ok/Err 兼容
     /// v0.13: Union 类型支持 —— A ∈ union(expected) 或 expected ∈ union(self)
     pub fn compatible_with(&self, expected: &Type) -> bool {
+        // v0.75.92: Unknown fail-fast — 不参与任何兼容判断（与 Any 不同，
+        // Any 是 top type；Unknown 是「无法判定」标记）。调用方应通过 env/closure_sigs
+        // TypeVar 推断得到精确类型，或在 builtin/import 兜底处显式产出 Unknown。
+        if matches!(self, Type::Unknown) || matches!(expected, Type::Unknown) {
+            return false;
+        }
         // v0.13: Union 兼容 —— self 是 union, expected 是 union 任一成员
         if let Type::Union(members) = expected {
             // 空 Union = "any element type" (兼容任何)
@@ -429,6 +435,11 @@ impl Type {
         // Any 是 top type —— 与任何类型兼容（自然 subtype 任何）
         if matches!(self, Type::Any) || matches!(super_ty, Type::Any) {
             return true;
+        }
+        // v0.75.92: Unknown fail-fast — 不参与任何 subtype 判断
+        // （与 Any 区分：Any top type 任意 subtype；Unknown 未知 type 拒绝）
+        if matches!(self, Type::Unknown) || matches!(super_ty, Type::Unknown) {
+            return false;
         }
         // v0.75.17: ForAll 类型——泛型值命中 env 时已实例化，此处防御
         if let Type::ForAll(_, inner) = self {
@@ -570,6 +581,8 @@ pub fn join_types(arms: &[(Span, Type)], outer_span: Span) -> Type {
         match t {
             // Any 短路：top type 吞掉所有
             Type::Any => return Type::Union(vec![]),
+            // v0.75.92: Unknown fail-fast — 不参与 join（Unknown 不是合法类型）
+            Type::Unknown => return Type::Unknown,
             // 嵌套 Union 递归平展：Union(Union(a, b), c) → [a, b, c]
             Type::Union(members) => {
                 for m in members {

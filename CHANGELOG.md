@@ -11,6 +11,43 @@ All notable changes to Mora will be documented in this file.
 需要查阅 v0.13 → v0.30 历史的请通过 `git log --grep='v0\.' --reverse`
 按 commit 主题回溯；该区间仅作为工程债处理记录保留在 git 历史中。
 
+## [v0.76.03] — 2026-08-10 — jit: 检视 Any fallback 风险项（结论：已规避，注释同步）
+
+**目的**（架构审查报告 v0.75.90 🟡 警告级风险 11）：
+> JIT 路径假设 Any fallback
+> → 与 typeck 重构正交但需同步
+
+**调研结论**（v0.76.03）：
+- 架构审查报告 v0.75.90 标记的「JIT 假设 Any fallback」**在 v0.75.43 copy-and-patch JIT 上线时已被正确规避**
+- `src/mir/jit.rs` 0 处 `Type::Any` 引用 —— JIT 路径**不**依赖 typeck::Type 枚举
+- JIT 用独立 `JitValue`（16 字节 repr(C) 标签联合）+ `JitValue::nil()` 作为 codegen 兜底
+- `const_to_jit` 编译期拒绝未知值（`_ => None`）；`jit_to_value` 静默 fallback（`_ => Value::Nil`）
+
+**变更**（仅文档，无代码改动）：
+- `src/mir/jit.rs:282` `JitState` doc comment 加 v0.76.03 注释：
+  * 明确说明「JIT 路径**不**依赖 typeck::Type::Any」
+  * JitValue::nil() 是 codegen 兜底值——与 typeck Any 是不同的事
+  * 引用 AGENTS.md §7 防止按名字归类
+- `src/mir/jit.rs:1012` `JitError::GuardFail` doc comment 加 v0.76.03 注释：
+  * GuardFail 是「运行期类型不匹配」
+  * JitValue::nil() 兜底与 typeck::Type::Any **无关**（AGENTS.md §7）
+
+**未变**：
+- JIT 任何 codegen 逻辑（`const_to_jit` / `jit_to_value` / `JitState` / `JitError` 行为零变化）
+- typeck 路径（v0.75.91-92 Any/Unknown fail-fast）
+- 双向 fallback 抑制（v0.75.94 DiagFilter）
+
+**风险消除**：
+- 架构审查报告 v0.75.90 🟡 警告级风险 11 实际**不成立**——v0.75.43 已规避
+- 此 commit 仅为**注释同步**（AGENTS.md §7 按做什么分类硬约束）——未来读代码的人不会按名字归类
+
+**测试**：683 passed; 0 failed; 13 ignored（与 v0.76.02 完全一致——零行为变化）
+
+**下一步路径**（不在本次范围）：
+- 若发现 JIT 路径有真实 `Type::Any` 依赖，单独 commit
+- 继续 MoraError 推进（v0.76.04: checkpoint/* 5+ 处）
+- 继续 record schema 元数据层
+
 ## [v0.76.02] — 2026-08-09 — typeck: WitnessPattern 5 变体 typeck 增量
 
 **目的**（架构审查报告 v0.75.90 🟡 警告级风险）：

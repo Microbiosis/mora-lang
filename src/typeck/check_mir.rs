@@ -62,8 +62,13 @@ pub fn check_program_witnesses_bidirectional(
     // 双向预扫 —— 关键节点的精准 expected/actual
     let mut checker = BidirectionalChecker::new(&mut hm);
     checker.pre_check_program(witnesses);
-    let bidir_errors = checker.errors;
+    // v0.75.94: 拆开 checker（drop 后才能用 hm）——
+    // 提取 errors / diag 两个 owned 字段，剩余字段（mode_stack / nodes_visited
+    // / hm 借用）随 checker drop 释放
+    let bidir_errors = std::mem::take(&mut checker.errors);
     let _nodes_visited = checker.nodes_visited;
+    let diag = std::mem::take(&mut checker.diag);
+    drop(checker); // 释放 &mut hm 借用
 
     // HM 全树合一 —— 同位置已被双向诊断的过滤
     // Phase G 调研结论：按 (line, column, kind) 三元组过滤不可行
@@ -79,10 +84,9 @@ pub fn check_program_witnesses_bidirectional(
     let filtered_hm_errors: Vec<TypeError> = hm_errors
         .into_iter()
         .filter(|e| {
-            // 按 line+column 过滤（与 HM::diagnosed 伪 ID 的 line+column 部分对比）
-            !hm.diagnosed
-                .iter()
-                .any(|node_id| node_id.line == e.line && node_id.column == e.column)
+            // v0.75.94: DiagFilter owned 实例过滤
+            // 按 line+column 过滤（与 DiagFilter::diagnosed 伪 ID 的 line+column 部分对比）
+            !diag.is_diagnosed_at_line_column(e.line, e.column)
         })
         .collect();
 

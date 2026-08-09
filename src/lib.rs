@@ -20,6 +20,8 @@ pub mod audit;
 pub mod cli;
 // v0.45.0: ToolPlane Core/Extension adapter (loongclaw tool.rs pattern)
 pub mod ccr;
+// v0.75.98: MoraError —— 全仓统一错误枚举（v0.91 错误统一计划首次落地）
+pub mod error;
 // v0.50: Checkpoint persistence layer (Memory + SQLite)
 pub mod checkpoint;
 // v0.46.0: MoraSkillSpec + dual registry (CLI-Anything SKILL.md pattern)

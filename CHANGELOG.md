@@ -11,6 +11,47 @@ All notable changes to Mora will be documented in this file.
 需要查阅 v0.13 → v0.30 历史的请通过 `git log --grep='v0\.' --reverse`
 按 commit 主题回溯；该区间仅作为工程债处理记录保留在 git 历史中。
 
+## [v0.75.98] — 2026-08-08 — error: MoraError 统一错误类型（v0.91 计划首次落地）
+
+**目的**（架构审查报告 v0.75.90 🟡 警告级风险 1）：
+> `Result<T, String>` 不统一——`typeck/check_union`、`flow.rs`、`http_server.rs`、
+> `checkpoint/*` 全模块、`document/*` 全模块、`compress/*` 全模块
+> （全仓 `grep "Result<.*String>"` 267 处）
+> → 错误聚合（按 kind 维度去重）在跨模块边界断裂
+
+**变更**：
+- 新建 `src/error.rs`：
+  * `pub enum MoraError { Typeck(String), Io(String), Serialization(String), Other(String) }`
+  * `impl Display` / `impl std::error::Error` / `impl From<String>` / `impl From<&str>`
+  * 6 个测试（每个 variant + 2 个 From impl）
+- `src/lib.rs` 声明 `pub mod error;`
+- `src/typeck/hm/util.rs` `check_union` 签名从 `Result<(), String>` → `Result<(), MoraError>`：
+  * misuse 分支：`Err(format!(...))` → `Err(MoraError::Typeck(format!(...)))`
+  * mismatch 分支同上
+  * 测试 3 处 `err.contains(...)` → `err.to_string().contains(...)`（MoraError 无 contains）
+- 现有 7 个独立 Error 类型（`TypeError` / `HMTypeError` / `AuditError` /
+  `SandboxError` / `JitError` / `ParseError` / `KeepErrorsConstraint`）继续保留
+  ——不破坏向后兼容
+
+**测试**：676 passed; 0 failed; 13 ignored（670 旧 + 6 新增 MoraError 测试）
+
+**收益**：
+- 267 处 `Result<T, String>` 的「冰山第一角」已动——`check_union` 是 typeck
+  路径最显眼的 String 返回（架构审查报告点名）
+- `MoraError` API 设计落地验证——后续 261 处可逐步迁移
+- 错误聚合可以按 `MoraError::Typeck` vs `MoraError::Io` 等 kind 维度去重
+
+**未变（保留向后兼容）**：
+- 7 个独立 Error 类型继续存在
+- 任何 `Result<T, String>` 路径暂时不迁移（待 v0.75.99+ 逐步覆盖）
+- v0.91 完整统一计划（统一所有 Result + 字段结构化）保留为后续 commit
+
+**下一步路径**（不在本次范围）：
+- v0.75.99: `flow.rs` 3 处 `Result<T, String>` 改 `MoraError`
+- v0.76.00: `http_server.rs` 1 处 + `checkpoint/*` 5+ 处
+- v0.76.01+: `document/*` 20+ 处 + `compress/*` 6+ 处
+- v0.76.10: 全仓 `Result<T, String>` < 5 处（保留 escape hatch）
+
 ## [v0.75.97] — 2026-08-08 — typeck: 抽 `instantiate_if_forall` helper 统一 ForAll 实例化
 
 **目的**（架构审查报告 v0.75.90 🟡 警告级风险 3）：

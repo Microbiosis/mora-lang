@@ -24,6 +24,7 @@ use crate::mir::witness::{MirWitness, WitnessKind};
 use crate::typeck::Type;
 use crate::typeck::TypeError;
 use crate::typeck::hm::HMInference;
+use crate::typeck::hm::diag::DiagFilter;
 use crate::typeck::join_types;
 
 /// v0.75.86: 双向定型模式状态机。
@@ -59,6 +60,9 @@ pub struct BidirectionalChecker<'a> {
     pub errors: Vec<TypeError>,
     /// 调试用：双向预扫覆盖的节点数
     pub nodes_visited: usize,
+    /// v0.75.94: 双向定型专用「已诊断节点」跟踪器——替代 v0.75.86 起的
+    /// `HMInference::diagnosed` 字段。HMInference 公共 API 已回归纯粹 HM 状态。
+    pub diag: DiagFilter,
 }
 
 impl<'a> BidirectionalChecker<'a> {
@@ -70,6 +74,7 @@ impl<'a> BidirectionalChecker<'a> {
             mode_stack: Vec::new(),
             errors: Vec::new(),
             nodes_visited: 0,
+            diag: DiagFilter::default(),
         }
     }
 
@@ -117,7 +122,8 @@ impl<'a> BidirectionalChecker<'a> {
         })?;
         if !synth_ty.subtype_of(expected) {
             // 标记此节点已诊断 —— 防止 HM 跑完后报重复错误
-            self.hm.mark_diagnosed(w);
+            // v0.75.94: 改持 DiagFilter（不再污染 HMInference 公共 API）
+            self.diag.mark_diagnosed(w);
             return Err(format_mismatch_error(&synth_ty, expected, w.span, hint));
         }
         Ok(synth_ty)
@@ -165,7 +171,7 @@ impl<'a> BidirectionalChecker<'a> {
                     let inner = hint.to_type();
                     // 标注的 type_hint 必须 subtype 自身（自反检查）
                     if !inner.subtype_of(inner) {
-                        self.hm.mark_diagnosed(w);
+                        self.diag.mark_diagnosed(w);
                         self.errors
                             .push(format_mismatch_error(inner, inner, w.span, None));
                     }
@@ -181,7 +187,7 @@ impl<'a> BidirectionalChecker<'a> {
             if let Some(expected_params) = self.lookup_callee_params(callee) {
                 // arity 校验
                 if expected_params.len() != args.len() {
-                    self.hm.mark_diagnosed(w);
+                    self.diag.mark_diagnosed(w);
                     // 顶层 TypeError 是 struct，构造携带 arity 诊断
                     // 信息（expected/actual 字段）而非裸 enum 变体
                     let msg = format!(
@@ -560,7 +566,8 @@ mod tests {
         let w = lit_witness(42, 1, 0);
         // check 失败应标记
         let _ = checker.check_against(&w, &Type::Float, None);
-        assert!(hm.is_diagnosed(&w));
+        // v0.75.94: DiagFilter 替代 HMInference.diagnosed
+        assert!(checker.diag.is_diagnosed(&w));
     }
 
     #[test]
@@ -805,7 +812,8 @@ mod tests {
         };
         checker.pre_check_program(std::slice::from_ref(&w));
         // value 节点应被 mark_diagnosed（line 1 col 12 + Literal kind）
-        assert!(hm.is_diagnosed(&value));
+        // v0.75.94: DiagFilter 替代 HMInference.diagnosed
+        assert!(checker.diag.is_diagnosed(&value));
     }
 
     // ─── v0.75.86 (Phase D)：Match scrutinee → arm body check ───
@@ -922,7 +930,8 @@ mod tests {
         );
         checker.pre_check_program(&[w]);
         // arm body 节点应被 mark_diagnosed（line 5 col 16 + Literal kind）
-        assert!(hm.is_diagnosed(&arm1_body));
+        // v0.75.94: DiagFilter 替代 HMInference.diagnosed
+        assert!(checker.diag.is_diagnosed(&arm1_body));
     }
 
     // ─── v0.75.86 (Phase E)：Match 错误诊断含 joined arm types hint ───

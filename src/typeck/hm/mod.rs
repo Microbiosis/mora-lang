@@ -19,6 +19,7 @@ use crate::mir::witness::{MirWitness, WitnessArm, WitnessCallee, WitnessKind, Wi
 use crate::typeck::Type;
 
 mod builtin; // v0.75.70: builtin 类型推断（自 mod.rs 拆出）
+pub mod diag; // v0.75.94: DiagFilter + WitnessNodeId（自 mod.rs 抽离）
 pub mod env;
 pub mod error;
 pub mod generalize;
@@ -54,93 +55,19 @@ pub struct HMInference {
     /// Stack of in-scope closure names introduced by FnDef so that a
     /// recursive function can refer to itself.
     pub fn_scope: Vec<String>,
-    /// v0.75.86: 双向 fallback 抑制 —— 记录已被双向 check 模式诊断过
-    /// 的 witness 节点（伪 ID = `(line, column, kind_discriminant)`）。
-    /// HM 跑完后调用方可按 `is_diagnosed(witness)` 过滤已诊断节点的
-    /// `TypeError`，避免双向 fallback 路径产生重复错误。
-    ///
-    /// 节点 ID 选择 `(line, column, kind_discriminant)` 而非真正的
-    /// `NodeId`：witness 树当前**未携带节点 ID**（v0.55 MirWitness 重写
-    /// 时未继承 `NodeId`——见本文件顶部注释），引入新字段会改动
-    /// 公共 API；用 span + kind 三元组作伪 ID 足够防 fallback 重复
-    /// （同一位置同一 kind 的 witness 在 HM 跑完整树时不应重复产生错误）。
-    ///
-    /// 应用场景（Phase A 双向叠加层）：
-    /// ```ignore
-    /// // 双向 check 失败
-    /// if !actual.subtype_of(&expected) {
-    ///     hm.mark_diagnosed(witness);  // 标记此节点已诊断
-    ///     return Err(format_mismatch(actual, expected));
-    /// }
-    /// // HM 全跑后
-    /// errors.retain(|e| !hm.is_diagnosed_at(e.line, e.column, ...));
-    /// ```
-    pub diagnosed: HashSet<WitnessNodeId>,
+    // v0.75.94: 移除 `diagnosed: HashSet<WitnessNodeId>` 字段 + 3 个方法
+    // (`mark_diagnosed` / `is_diagnosed` / `is_diagnosed_at`) —— 抽离到
+    // `crate::typeck::hm::diag::DiagFilter`（双向定型专用基础设施）。
+    // HM 公共 API 回归到 v0.75.86 之前的纯粹 HM 状态。
 }
 
-/// v0.75.86: Witness 节点伪 ID —— (line, column, kind_discriminant)。
-///
-/// 详细设计见 [`HMInference::diagnosed`] 字段注释。当前 `MirWitness`
-/// 公共结构（`src/mir/witness.rs`）未携带 `NodeId` 字段（v0.55
-/// 改造时未继承），所以用 span + kind 三元组作伪 ID。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct WitnessNodeId {
-    pub line: usize,
-    pub column: usize,
-    /// `WitnessKind` 的 discriminant 数字（`std::mem::discriminant`）
-    /// ——同一位置不同 kind 视为不同节点
-    kind: std::mem::Discriminant<WitnessKind>,
-}
-
-impl WitnessNodeId {
-    /// 从 `MirWitness` 构造伪 ID
-    pub fn from_witness(w: &MirWitness) -> Self {
-        Self {
-            line: w.span.line,
-            column: w.span.column,
-            kind: std::mem::discriminant(&w.kind),
-        }
-    }
-    /// 从 (line, column, kind) 三元组构造（用于查表）
-    pub fn from_parts(
-        line: usize,
-        column: usize,
-        kind: std::mem::Discriminant<WitnessKind>,
-    ) -> Self {
-        Self { line, column, kind }
-    }
-}
+// v0.75.94: 重新导出 WitnessNodeId（抽离到 diag 子模块）以保留外部 API
+// 路径兼容。调用方可以继续 `use crate::typeck::hm::WitnessNodeId`。
+pub use diag::WitnessNodeId;
 
 impl HMInference {
     pub fn new() -> Self {
         Self::default()
-    }
-
-    /// v0.75.86: 标记 witness 节点为「已诊断」—— 双向 fallback 抑制
-    /// 机制。调用方在双向 check 模式产出错误后调用此方法，
-    /// [`hm_to_external`](crate::typeck::check_mir::hm_to_external) 之后
-    /// 可用 [`is_diagnosed`](Self::is_diagnosed) 过滤重复错误。
-    pub fn mark_diagnosed(&mut self, w: &MirWitness) {
-        self.diagnosed.insert(WitnessNodeId::from_witness(w));
-    }
-
-    /// v0.75.86: 查询 witness 节点是否已被标记为「已诊断」。
-    pub fn is_diagnosed(&self, w: &MirWitness) -> bool {
-        self.diagnosed.contains(&WitnessNodeId::from_witness(w))
-    }
-
-    /// v0.75.86: 便捷查询——给定 (line, column, kind_discriminant)
-    /// 元组判断是否已诊断。供 `hm_to_external` 过滤用（它只有 line/column
-    /// 字段，需要从 `TypeError` 反查 `WitnessKind` 可能有损耗；
-    /// 此 API 保留作为 escape hatch）。
-    pub fn is_diagnosed_at(
-        &self,
-        line: usize,
-        column: usize,
-        kind: std::mem::Discriminant<WitnessKind>,
-    ) -> bool {
-        self.diagnosed
-            .contains(&WitnessNodeId::from_parts(line, column, kind))
     }
 
     /// Mint a fresh type variable identifier.

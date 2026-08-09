@@ -11,6 +11,50 @@ All notable changes to Mora will be documented in this file.
 需要查阅 v0.13 → v0.30 历史的请通过 `git log --grep='v0\.' --reverse`
 按 commit 主题回溯；该区间仅作为工程债处理记录保留在 git 历史中。
 
+## [v0.75.94] — 2026-08-08 — typeck: `HMInference::diagnosed` 抽离为 `DiagFilter`
+
+**目的**（架构审查报告 v0.75.90 🔴 阻断级风险 1）：
+> 双向 `diagnosed` 字段污染 HMInference 公共 API（`src/typeck/hm/mod.rs:78`）
+> → 重构 HMInference 时若误删 `diagnosed`，双向 fallback 抑制逻辑崩溃
+> → 把 `diagnosed` 下沉到独立辅助结构（如 `DiagFilter`），HMInference 只保留 HM 字段
+
+**变更**：
+- 新建 `src/typeck/hm/diag.rs`：
+  * `WitnessNodeId` 结构（line/column/kind 三元组伪 ID）
+  * `DiagFilter` 结构（持 `HashSet<WitnessNodeId>`）
+  * 4 个方法：`mark_diagnosed` / `is_diagnosed` / `is_diagnosed_at` / `is_diagnosed_at_line_column`
+- `src/typeck/hm/mod.rs`：
+  * 移除 `diagnosed: HashSet<WitnessNodeId>` 字段
+  * 移除 `mark_diagnosed` / `is_diagnosed` / `is_diagnosed_at` 3 个方法
+  * HMInference 公共 API 回归到纯粹 HM 状态
+  * `WitnessNodeId` 重新导出到 `crate::typeck::hm::WitnessNodeId`（路径兼容）
+- `src/typeck/bidirectional.rs`：
+  * `BidirectionalChecker` 新增 `diag: DiagFilter` 字段
+  * 3 处 `self.hm.mark_diagnosed(w)` → `self.diag.mark_diagnosed(w)`
+  * 3 处测试 `hm.is_diagnosed` → `checker.diag.is_diagnosed`
+- `src/typeck/check_mir.rs`：
+  * `check_program_witnesses_bidirectional` 拆分 `bidir_errors` + `diag` owned 实例
+  * `drop(checker)` 释放 &mut hm 借用后再调 `hm.infer_program`
+  * HM error 过滤：`hm.diagnosed` → `diag.is_diagnosed_at_line_column(line, col)`
+- `src/typeck/hm/unify.rs`：
+  * 删除 6 个诊断测试 + `lit_witness` / `var_witness` helpers
+  * 迁移到 `src/typeck/hm/diag.rs::tests`（DiagFilter 是新主人）
+
+**测试**：
+- 6 个迁过来的测试 + 4 个新增 = **10 个 DiagFilter 测试**
+- 旧 HM 诊断测试 6 个删除（被 diag 测试替代）
+- 0 回归：664 → **668 passed; 0 failed; 13 ignored**（净增 4 测试）
+
+**收益**：
+- HMInference 公共 API 纯粹化（移除双向专用基础设施污染）
+- 未来 HM 重构无需保留 `diagnosed` 字段
+- 双向代码路径与 HM 代码路径**彻底解耦**——DiagFilter 是双向的生命周期，BidirectionalChecker drop 时自动释放
+
+**未变**：
+- `WitnessNodeId` API（`from_witness` / `from_parts` / `kind` 字段）
+- `BidirectionalChecker::hm` 借用保持（`&mut HMInference`）
+- check_mir.rs `check_program_witnesses`（仅 HM，无双向）的错误路径不变
+
 ## [v0.75.93] — 2026-08-08 — mir: 抽离 `TypeHint` 边界类型（6 处 `Type` → `TypeHint` wrapper）
 
 **目的**（架构审查报告 v0.75.90 🔴 阻断级风险 3）：

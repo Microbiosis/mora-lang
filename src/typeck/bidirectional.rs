@@ -161,11 +161,13 @@ impl<'a> BidirectionalChecker<'a> {
         if let WitnessKind::Closure { params, body } = &w.kind {
             for p in params {
                 if let Some(hint) = &p.type_hint {
+                    // v0.75.93: TypeHint 边界 → 调 to_type() 取回 typeck::Type
+                    let inner = hint.to_type();
                     // 标注的 type_hint 必须 subtype 自身（自反检查）
-                    if !hint.subtype_of(hint) {
+                    if !inner.subtype_of(inner) {
                         self.hm.mark_diagnosed(w);
                         self.errors
-                            .push(format_mismatch_error(hint, hint, w.span, None));
+                            .push(format_mismatch_error(inner, inner, w.span, None));
                     }
                 }
             }
@@ -298,7 +300,7 @@ impl<'a> BidirectionalChecker<'a> {
         } = &w.kind
         {
             if let Some(hint) = type_hint
-                && let Err(e) = self.check_against(value, hint, None)
+                && let Err(e) = self.check_against(value, hint.to_type(), None)
             {
                 self.errors.push(e);
             }
@@ -474,6 +476,7 @@ pub fn format_mismatch_error(
 mod tests {
     use super::*;
     use crate::common::{BinaryOp, Literal, Span};
+    use crate::mir::hint::TypeHint;
     use crate::mir::witness::{MirWitness, WitnessKind, WitnessParam};
     // 注意：mir::expr::BinaryOp 是私有 re-export，测试用 common::BinaryOp
 
@@ -502,7 +505,7 @@ mod tests {
             kind: WitnessKind::Closure {
                 params: vec![WitnessParam {
                     name: param_name.to_string(),
-                    type_hint: Some(param_hint),
+                    type_hint: Some(TypeHint::from_type(param_hint)),
                     default: None,
                 }],
                 body: Box::new(body),
@@ -747,7 +750,7 @@ mod tests {
         let w = MirWitness {
             kind: WitnessKind::LetBinding {
                 name: "x".to_string(),
-                type_hint: Some(Type::Int),
+                type_hint: Some(TypeHint::from_type(Type::Int)),
                 value: Box::new(lit_witness(42, 1, 12)),
                 init_body: Box::new(lit_witness(0, 1, 16)),
             },
@@ -769,7 +772,7 @@ mod tests {
         let w = MirWitness {
             kind: WitnessKind::LetBinding {
                 name: "x".to_string(),
-                type_hint: Some(Type::Float),
+                type_hint: Some(TypeHint::from_type(Type::Float)),
                 value: Box::new(lit_witness(42, 1, 12)),
                 init_body: Box::new(lit_witness(0, 1, 16)),
             },
@@ -794,7 +797,7 @@ mod tests {
         let w = MirWitness {
             kind: WitnessKind::LetBinding {
                 name: "x".to_string(),
-                type_hint: Some(Type::Float),
+                type_hint: Some(TypeHint::from_type(Type::Float)),
                 value: Box::new(value.clone()),
                 init_body: Box::new(init_body.clone()),
             },

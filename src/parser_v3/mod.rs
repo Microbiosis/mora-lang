@@ -629,7 +629,10 @@ impl ParserV3 {
                     .iter()
                     .map(|p| crate::mir::witness::WitnessParam {
                         name: p.name.clone(),
-                        type_hint: p.type_hint.clone(),
+                        type_hint: p
+                            .type_hint
+                            .clone()
+                            .map(crate::mir::hint::TypeHint::from_type),
                         default: None,
                     })
                     .collect();
@@ -775,7 +778,7 @@ impl ParserV3 {
         Some(MirWitness {
             kind: WitnessKind::LetBinding {
                 name,
-                type_hint,
+                type_hint: type_hint.map(crate::mir::hint::TypeHint::from_type),
                 value: Box::new(v_w),
                 init_body: Box::new(nil_w),
             },
@@ -919,7 +922,10 @@ impl ParserV3 {
         self.emit
             .emit(MirInst::Const(dst, crate::value::Value::Nil));
         Some(MirWitness {
-            kind: WitnessKind::TypeAlias { name, target },
+            kind: WitnessKind::TypeAlias {
+                name,
+                target: crate::mir::hint::TypeHint::from_type(target),
+            },
             span,
         })
     }
@@ -992,7 +998,13 @@ impl ParserV3 {
         self.emit
             .emit(MirInst::Const(dst, crate::value::Value::Nil));
         Some(MirWitness {
-            kind: WitnessKind::StructDef { name, fields },
+            kind: WitnessKind::StructDef {
+                name,
+                fields: fields
+                    .into_iter()
+                    .map(|(n, t)| (n, crate::mir::hint::TypeHint::from_type(t)))
+                    .collect(),
+            },
             span,
         })
     }

@@ -54,7 +54,7 @@ fn extract_module_symbols(witnesses: &[MirWitness], pre: &[(String, Type)]) -> V
                 syms.push((name.clone(), Type::Unknown));
             }
             WitnessKind::TypeAlias { name, target } => {
-                syms.push((name.clone(), target.clone()));
+                syms.push((name.clone(), target.to_type().clone()));
             }
             _ => {}
         }

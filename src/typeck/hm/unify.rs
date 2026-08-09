@@ -734,8 +734,8 @@ mod tests {
 
     #[test]
     fn unknown_unifies_fails() {
-        use crate::typeck::hm::unify::unify;
         use crate::typeck::hm::unify::Substitution;
+        use crate::typeck::hm::unify::unify;
         let subst = Substitution::new();
         // Unknown 与任何类型合一都应失败
         assert!(unify(&Type::Unknown, &Type::Int, &subst).is_err());

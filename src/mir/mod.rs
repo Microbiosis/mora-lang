@@ -25,6 +25,7 @@ use crate::value::Value;
 
 pub mod cache;
 pub mod expr;
+pub mod hint;
 pub mod host;
 pub mod jit;
 pub mod lower;

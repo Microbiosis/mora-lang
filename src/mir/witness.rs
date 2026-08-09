@@ -81,7 +81,9 @@ impl WitnessKind {
             } => WitnessKind::FnDef {
                 name: name.clone(),
                 params: params.iter().map(WitnessParam::from_param).collect(),
-                return_type: return_type.clone(),
+                return_type: return_type
+                    .clone()
+                    .map(crate::mir::hint::TypeHint::from_type),
                 body: Box::new(MirWitness::from_expr(body)),
             },
             MirExprKind::Match { scrutinee, arms } => WitnessKind::Match {
@@ -130,7 +132,11 @@ impl WitnessKind {
             } => WitnessKind::DynTrait {
                 expr: Box::new(MirWitness::from_expr(expr)),
                 trait_name: trait_name.clone(),
-                generics: generics.clone(),
+                generics: generics
+                    .iter()
+                    .cloned()
+                    .map(crate::mir::hint::TypeHint::from_type)
+                    .collect(),
             },
             MirExprKind::Prompt { parts } => WitnessKind::Prompt {
                 parts: parts.iter().map(MirWitness::from_expr).collect(),
@@ -142,7 +148,7 @@ impl WitnessKind {
                 init_body,
             } => WitnessKind::LetBinding {
                 name: name.clone(),
-                type_hint: type_hint.clone(),
+                type_hint: type_hint.clone().map(crate::mir::hint::TypeHint::from_type),
                 value: Box::new(MirWitness::from_expr(value)),
                 init_body: Box::new(MirWitness::from_expr(init_body)),
             },
@@ -175,7 +181,7 @@ impl WitnessKind {
             },
             MirExprKind::TypeAlias { name, target } => WitnessKind::TypeAlias {
                 name: name.clone(),
-                target: target.clone(),
+                target: crate::mir::hint::TypeHint::from_type(target.clone()),
             },
             MirExprKind::EnumDef { name, variants } => WitnessKind::EnumDef {
                 name: name.clone(),
@@ -183,7 +189,10 @@ impl WitnessKind {
             },
             MirExprKind::StructDef { name, fields } => WitnessKind::StructDef {
                 name: name.clone(),
-                fields: fields.clone(),
+                fields: fields
+                    .iter()
+                    .map(|(n, t)| (n.clone(), crate::mir::hint::TypeHint::from_type(t.clone())))
+                    .collect(),
             },
             MirExprKind::Import(path) => WitnessKind::Import(path.clone()),
             MirExprKind::MacroDef { name, params } => WitnessKind::MacroDef {
@@ -223,7 +232,7 @@ pub enum WitnessKind {
     FnDef {
         name: String,
         params: Vec<WitnessParam>,
-        return_type: Option<crate::typeck::Type>,
+        return_type: Option<crate::mir::hint::TypeHint>,
         body: Box<MirWitness>,
     },
     Match {
@@ -257,14 +266,14 @@ pub enum WitnessKind {
     DynTrait {
         expr: Box<MirWitness>,
         trait_name: String,
-        generics: Vec<crate::typeck::Type>,
+        generics: Vec<crate::mir::hint::TypeHint>,
     },
     Prompt {
         parts: Vec<MirWitness>,
     },
     LetBinding {
         name: String,
-        type_hint: Option<crate::typeck::Type>,
+        type_hint: Option<crate::mir::hint::TypeHint>,
         value: Box<MirWitness>,
         init_body: Box<MirWitness>,
     },
@@ -287,7 +296,7 @@ pub enum WitnessKind {
     },
     TypeAlias {
         name: String,
-        target: crate::typeck::Type,
+        target: crate::mir::hint::TypeHint,
     },
     EnumDef {
         name: String,
@@ -295,7 +304,7 @@ pub enum WitnessKind {
     },
     StructDef {
         name: String,
-        fields: Vec<(String, crate::typeck::Type)>,
+        fields: Vec<(String, crate::mir::hint::TypeHint)>,
     },
     Import(String),
     MacroDef {
@@ -398,7 +407,7 @@ impl WitnessPattern {
 #[derive(Debug, Clone, PartialEq)]
 pub struct WitnessParam {
     pub name: String,
-    pub type_hint: Option<crate::typeck::Type>,
+    pub type_hint: Option<crate::mir::hint::TypeHint>,
     pub default: Option<MirWitness>,
 }
 
@@ -406,7 +415,10 @@ impl WitnessParam {
     fn from_param(p: &Param) -> WitnessParam {
         WitnessParam {
             name: p.name.clone(),
-            type_hint: p.type_hint.clone(),
+            type_hint: p
+                .type_hint
+                .clone()
+                .map(crate::mir::hint::TypeHint::from_type),
             default: p.default.as_ref().map(MirWitness::from_expr),
         }
     }

@@ -11,6 +11,43 @@ All notable changes to Mora will be documented in this file.
 需要查阅 v0.13 → v0.30 历史的请通过 `git log --grep='v0\.' --reverse`
 按 commit 主题回溯；该区间仅作为工程债处理记录保留在 git 历史中。
 
+## [v0.75.93] — 2026-08-08 — mir: 抽离 `TypeHint` 边界类型（6 处 `Type` → `TypeHint` wrapper）
+
+**目的**（架构审查报告 v0.75.90 🔴 阻断级风险 3）：
+> MirWitness 5 个 `typeck::Type` 字段硬编码在 mir 层（实际是6处）
+> → 重构 typeck::Type 枚举变体时 hint vs inferred 边界模糊
+> → 抽出 `crate::mir::hint::TypeHint` 中间类型，witness 持 TypeHint 而非 typeck::Type
+
+**变更**：
+- `src/mir/hint.rs` 新增：`TypeHint(pub crate::typeck::Type)` wrapper + `from_type/to_type/into_type/From impl/Display`
+- `src/mir/mod.rs` 声明 `pub mod hint;`
+- `src/mir/witness.rs` 6 处 `crate::typeck::Type` → `crate::mir::hint::TypeHint`：
+  * `WitnessParam.type_hint` + `from_param` 包装
+  * `WitnessKind::FnDef.return_type`
+  * `WitnessKind::DynTrait.generics`
+  * `WitnessKind::LetBinding.type_hint`
+  * `WitnessKind::TypeAlias.target`
+  * `WitnessKind::StructDef.fields`
+- `src/typeck/hm/infer.rs:25` `infer_let_typed` 签名改 `type_hint: &TypeHint`；调用 `to_type()` 取出 typeck::Type
+- `src/typeck/hm/infer.rs:325` closure params map `to_type().clone()`
+- `src/typeck/bidirectional.rs` Phase A + Phase C `to_type()` 转换 + 测试构造点（line 500/750/772/797）
+- `src/typeck/imports.rs:57` TypeAlias.target → `target.to_type().clone()`
+- `src/parser_v3/mod.rs` 4 处（line 632/778/922/995）参数 / LetBinding / TypeAlias / StructDef 构造点改 `TypeHint::from_type()`
+
+**测试**：
+- 3 个新增（`hint.rs` 内）：`from_type_roundtrip` / `from_impl` / `display_uses_inner_name`
+- 0 回归：661 → **664 passed; 0 failed; 13 ignored**
+
+**收益**：
+- 未来 typeck 重构（变体增减、语义细化）只需修改 TypeHint 内部 + `from_type/to_type` 两函数
+- 爆炸半径从 6 处（witness.rs + parser_v3 + typeck）降为 1 处（hint.rs）
+- 表达式层（MirExpr）仍持 `crate::typeck::Type`——本次不动 MirExpr（架构审查报告 D 选项「极小/小/中等」三档的极小档仅 WitnessParam 即可，但完整 D 选项要求 6 处全抽离）
+
+**未变**：
+- MirExpr.Param.type_hint / MirExprKind 各种 target 仍持 `crate::typeck::Type`（Expression 层架构边界）
+- HM 推断路径不变（继续产出 `crate::typeck::Type`）
+- Any/Unknown v0.75.91-92 fail-fast 语义不变
+
 ## [v0.75.92] — 2026-08-08 — typeck: `Unknown` 显式 fail-fast 分支
 
 **修复**（`Unknown` 显式语义 vs `Any` top type）：

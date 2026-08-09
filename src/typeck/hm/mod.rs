@@ -559,7 +559,7 @@ mod tests {
         let mut hm = HMInference::new();
         let param = WitnessParam {
             name: "x".to_string(),
-            type_hint: Some(Type::Int),
+            type_hint: Some(crate::mir::hint::TypeHint::from_type(Type::Int)),
             default: None,
         };
         let closure_ty = hm.infer_closure(

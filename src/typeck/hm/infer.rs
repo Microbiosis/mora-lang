@@ -100,7 +100,7 @@ impl HMInference {
             None => match name {
                 "ai" => Ok(Type::AiModule),
                 "agent" => Ok(Type::Agent),
-                n if crate::flow::is_builtin_object(n) => Ok(Type::Any),
+                n if crate::flow::is_builtin_object(n) => Ok(Type::Unknown),
                 _ => Err(vec![TypeError::UnboundVariable {
                     name: name.to_string(),
                     span,
@@ -177,7 +177,7 @@ impl HMInference {
         span: Span,
     ) -> Result<Type, Vec<TypeError>> {
         let callee_ty = match callee {
-            WitnessCallee::Name(name) => self.builtin_callee_ty(name).unwrap_or(Type::Any),
+            WitnessCallee::Name(name) => self.builtin_callee_ty(name).unwrap_or(Type::Unknown),
             // v0.75.17: Var 命中 ForAll 时实例化（`let f = fn(x) x; f(1); f("s")`）
             WitnessCallee::Var(var_name) => match self.env.get(var_name) {
                 Some(ty) if matches!(ty, Type::ForAll(_, _)) => {
@@ -185,7 +185,7 @@ impl HMInference {
                     self.instantiate_type(&ty)
                 }
                 Some(ty) => ty.clone(),
-                None => Type::Any,
+                None => Type::Unknown,
             },
             WitnessCallee::Evaluated(expr) => self.infer_expr(expr)?,
             WitnessCallee::Builtin(op) => self.builtin_type(op)?,
@@ -380,7 +380,7 @@ impl HMInference {
         // v0.75.86: 不报错路径，保留 _span 备未来错误检查扩展点
         let _span = span;
         let _ = _span;
-        Ok(result_ty.unwrap_or(Type::Any))
+        Ok(result_ty.unwrap_or(Type::Unknown))
     }
 
     pub(super) fn infer_if(

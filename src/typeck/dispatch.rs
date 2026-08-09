@@ -272,11 +272,11 @@ fn method_signature_builtin(receiver: &Type, method: &str) -> Option<Signature> 
         )),
         (Type::Conversation, "chat") => Some(Signature::new(
             vec![("self".to_string(), Type::Conversation)],
-            Type::Any,
+            Type::Unknown,
         )),
         (Type::Conversation, "history" | "len") => Some(Signature::new(
             vec![("self".to_string(), Type::Conversation)],
-            Type::List(Box::new(Type::Any)),
+            Type::List(Box::new(Type::Unknown)),
         )),
         (Type::Conversation, "model") => Some(Signature::new(
             vec![("self".to_string(), Type::Conversation)],
@@ -313,7 +313,7 @@ fn method_signature_builtin(receiver: &Type, method: &str) -> Option<Signature> 
         )),
         (Type::HttpRequest, "json") => Some(Signature::new(
             vec![("self".to_string(), Type::HttpRequest)],
-            Type::Any,
+            Type::Unknown,
         )),
         _ => None,
     }
@@ -321,7 +321,9 @@ fn method_signature_builtin(receiver: &Type, method: &str) -> Option<Signature> 
 
 fn method_signature_via_type(receiver: &Type, method: &str) -> Option<Signature> {
     let ret = method_return_type(receiver, method);
-    if matches!(ret, Type::Any) {
+    // v0.75.91: top type (Any) 与 escape hatch (Unknown) 都不算「已知签名」，
+    // 都应 None —— 调用方走 fallback 路径（unknown_method_returns_none 测试）
+    if matches!(ret, Type::Any) || matches!(ret, Type::Unknown) {
         None
     } else {
         Some(Signature::new(
@@ -343,12 +345,12 @@ pub fn method_return_type(receiver: &Type, method: &str) -> Type {
 
 fn method_return_type_fallback(receiver: &Type, method: &str) -> Type {
     if let Type::Union(_) = receiver {
-        return Type::Any;
+        return Type::Unknown;
     }
     if method == "len" {
         return Type::Float;
     }
-    Type::Any
+    Type::Unknown
 }
 
 #[cfg(test)]
@@ -387,7 +389,7 @@ mod tests {
     fn list_map_arity_is_two() {
         // v0.75.16: map 接收闭包参数（receiver + f = 2 参）。
         assert_eq!(
-            method_arity(&Type::List(Box::new(Type::Any)), "map"),
+            method_arity(&Type::List(Box::new(Type::Unknown)), "map"),
             Some(2)
         );
     }

@@ -51,7 +51,7 @@ fn extract_module_symbols(witnesses: &[MirWitness], pre: &[(String, Type)]) -> V
         match &w.kind {
             WitnessKind::FnDef { name, .. } => syms.push((name.clone(), Type::Closure)),
             WitnessKind::StructDef { name, .. } | WitnessKind::EnumDef { name, .. } => {
-                syms.push((name.clone(), Type::Any));
+                syms.push((name.clone(), Type::Unknown));
             }
             WitnessKind::TypeAlias { name, target } => {
                 syms.push((name.clone(), target.clone()));
@@ -69,7 +69,7 @@ fn extract_module_symbols(witnesses: &[MirWitness], pre: &[(String, Type)]) -> V
 /// （如 `list<'a>`）保留结构，内部 TypeVar 退化为 `Any`。
 fn sanitize(ty: &Type) -> Type {
     match ty {
-        Type::TypeVar(_) => Type::Any,
+        Type::TypeVar(_) => Type::Unknown,
         Type::ForAll(vars, inner) => match inner.as_ref() {
             Type::TypeVar(_) => Type::Closure,
             _ => Type::ForAll(vars.clone(), Box::new(sanitize(inner))),

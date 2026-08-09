@@ -11,6 +11,35 @@ All notable changes to Mora will be documented in this file.
 需要查阅 v0.13 → v0.30 历史的请通过 `git log --grep='v0\.' --reverse`
 按 commit 主题回溯；该区间仅作为工程债处理记录保留在 git 历史中。
 
+## [v0.75.96] — 2026-08-08 — typeck: `check_union` / `join_types` 抽离到 `hm::util` 子模块
+
+**目的**（架构审查报告 v0.75.90 🔴 阻断级风险 4）：
+> `check_union` / `join_types` 是 Foundation 但被 `hm::unify.rs` 测试反向引用（`unify.rs:492-499` 测试代码 `use crate::typeck::check_union; use crate::typeck::join_types;`，Foundation ↔ Kernel 跨层调用）
+> → 重构 `join_types` 签名（v0.75.86 已扩 `&[(Span,Type)]`）时，`unify.rs` 测试需同步改
+> → 把 `check_union` / `join_types` 移到 `typeck::hm::util` 子模块，避免 Foundation ↔ Kernel 跨层
+
+**变更**：
+- 新建 `src/typeck/hm/util.rs`：
+  * `pub fn check_union(actual: &Type, expected: &Type) -> Result<(), String>`（v0.75.86 起原 typeck::mod.rs:640）
+  * `pub fn join_types(arms: &[(Span, Type)], outer_span: Span) -> Type`（v0.75.86 起原 typeck::mod.rs:573）
+  * 13 个迁移测试（6 check_union + 7 join_types）
+- `src/typeck/hm/mod.rs`：`pub mod util;` 声明
+- `src/typeck/mod.rs`：删除原 `check_union` / `join_types` 实现 + 函数体（保留 doc comment 作为指针）
+- `src/typeck/bidirectional.rs`：`use crate::typeck::join_types;` → `use crate::typeck::hm::util::join_types;`
+- `src/typeck/hm/unify.rs`：删除 9 个 check_union / join_types 测试（迁到 util.rs）；删除 unused `Span` import + stale 注释
+
+**测试**：668 passed; 0 failed; 13 ignored（与 v0.75.95 完全一致）
+
+**收益**：
+- Foundation ↔ Kernel 跨层调用消除——`hm::unify.rs` 测试不再反向 `use crate::typeck::check_union`
+- HM 内部 helper 集中管理（`hm::util`）
+- 双向路径导入语义清晰（`hm::util::join_types` 而非顶层 `typeck::join_types`）
+
+**未变**：
+- `check_union` / `join_types` 签名 / 行为完全保持
+- `Result<(), String>` 返回类型（保留 v0.91 错误统一计划前的现状）
+- 4 个 `unknown_*` 测试保留在 `hm::unify.rs::tests`（与 util::tests 不重复）
+
 ## [v0.75.95] — 2026-08-08 — typeck: 双向调用方切换（5 个调用点 → 8 个）
 
 **目的**（架构审查报告 v0.75.90 🔴 阻断级风险 6）：

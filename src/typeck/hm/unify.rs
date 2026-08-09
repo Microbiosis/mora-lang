@@ -182,6 +182,16 @@ fn unify(
         // typeck 当未知调用时把 arg 约束到 callee_ty=Any，此前无 (X, Any) arm 报错。
         (crate::typeck::Type::Any, _) | (_, crate::typeck::Type::Any) => Ok(subst.clone()),
 
+        // v0.75.92: Unknown fail-fast — 与任何类型合一都失败（v0.75.91 引入的
+        // 逃逸标签；fail-fast 语义迫使调用方用 TypeVar 推断路径产出精确类型）。
+        (crate::typeck::Type::Unknown, _) | (_, crate::typeck::Type::Unknown) => {
+            Err(crate::typeck::hm::error::TypeError::UnificationFailure {
+                expected: format!("{:?}", ty1),
+                got: format!("{:?}", ty2),
+                span: None,
+            })
+        }
+
         // v0.75.17: ForAll — 防御性合一（正常路径在 env.get 已实例化，
         // 泛型值不会以 ForAll 形态进入约束；若进入，与内层合一）。
         (crate::typeck::Type::ForAll(_, inner), other)
@@ -705,5 +715,51 @@ mod tests {
         // 纯 Any 切片
         let result = join_types(&[(Span::default(), Type::Any)], Span::default());
         assert_eq!(result, Type::Union(vec![]));
+    }
+
+    // v0.75.92: Unknown fail-fast — 不参与 subtype / compatible / unify / join
+    #[test]
+    fn unknown_fails_subtype_with_any_type() {
+        // Unknown 不 subtype Int / String / Bool 等任何具体类型
+        assert!(!Type::Unknown.subtype_of(&Type::Int));
+        assert!(!Type::Unknown.subtype_of(&Type::String));
+        assert!(!Type::Bool.subtype_of(&Type::Unknown));
+        // Unknown 不兼容任何具体类型
+        assert!(!Type::Unknown.compatible_with(&Type::Int));
+        assert!(!Type::Float.compatible_with(&Type::Unknown));
+        // 与 Any 区分：Any 仍然 top type
+        assert!(Type::Any.subtype_of(&Type::Int));
+        assert!(Type::Unknown.subtype_of(&Type::Any)); // Unknown <: Any (top)
+    }
+
+    #[test]
+    fn unknown_unifies_fails() {
+        use crate::typeck::hm::unify::unify;
+        use crate::typeck::hm::unify::Substitution;
+        let subst = Substitution::new();
+        // Unknown 与任何类型合一都应失败
+        assert!(unify(&Type::Unknown, &Type::Int, &subst).is_err());
+        assert!(unify(&Type::Int, &Type::Unknown, &subst).is_err());
+        // Unknown 与 Unknown 合一也失败
+        assert!(unify(&Type::Unknown, &Type::Unknown, &subst).is_err());
+        // 但 Any 与 Any 合一仍然成功
+        assert!(unify(&Type::Any, &Type::Any, &subst).is_ok());
+    }
+
+    #[test]
+    fn join_types_with_unknown_short_circuits_to_unknown() {
+        // v0.75.92: 含 Unknown → 短路返 Unknown（与 Any 短路 Union(vec![]) 不同）
+        let result = join_types(
+            &[
+                (Span::default(), Type::Int),
+                (Span::default(), Type::Unknown),
+                (Span::default(), Type::String),
+            ],
+            Span::default(),
+        );
+        assert_eq!(result, Type::Unknown);
+        // 纯 Unknown 切片
+        let result = join_types(&[(Span::default(), Type::Unknown)], Span::default());
+        assert_eq!(result, Type::Unknown);
     }
 }

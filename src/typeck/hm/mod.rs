@@ -25,6 +25,7 @@ pub mod error;
 pub mod generalize;
 mod infer;
 pub mod unify; // v0.75.70: infer_* 方法族（自 mod.rs 拆出）
+pub mod util; // v0.75.96: check_union / join_types（自 typeck::mod.rs 抽离）
 
 pub use error::TypeError;
 

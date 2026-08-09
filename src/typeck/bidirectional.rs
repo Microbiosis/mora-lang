@@ -25,7 +25,7 @@ use crate::typeck::Type;
 use crate::typeck::TypeError;
 use crate::typeck::hm::HMInference;
 use crate::typeck::hm::diag::DiagFilter;
-use crate::typeck::join_types;
+use crate::typeck::hm::util::join_types;
 
 /// v0.75.86: 双向定型模式状态机。
 ///

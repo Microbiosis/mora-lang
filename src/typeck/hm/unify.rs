@@ -271,7 +271,6 @@ fn contains_typevar(ty: &crate::typeck::Type, var: char) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::common::Span;
     use crate::typeck::Type;
 
     #[test]
@@ -498,174 +497,11 @@ mod tests {
         }
     }
 
-    // ─── v0.75.86: check_union 双向 check helper ───
-
-    use crate::typeck::check_union;
-    use crate::typeck::join_types;
-
     // ─── v0.75.86: HMInference::diagnosed 双向 fallback 抑制 ───
     // v0.75.94: 诊断测试（`diagnosed_*` 系列6 个 + helper `lit_witness`/`var_witness`）
     // 已迁到 [`crate::typeck::hm::diag::tests`]——DiagFilter 是新主人。
 
-    #[test]
-    fn check_union_empty_matches_anything() {
-        // 空 Union = any element type 占位 —— 兼容任何 actual
-        assert!(check_union(&Type::Int, &Type::Union(vec![])).is_ok());
-        assert!(check_union(&Type::String, &Type::Union(vec![])).is_ok());
-    }
-
-    #[test]
-    fn check_union_member_matches() {
-        // Union[String, Int] —— Int 是成员之一
-        let union_ty = Type::Union(vec![Type::String, Type::Int]);
-        assert!(check_union(&Type::Int, &union_ty).is_ok());
-        assert!(check_union(&Type::String, &union_ty).is_ok());
-    }
-
-    #[test]
-    fn check_union_member_subtype() {
-        // Union[Comparable] —— Concrete 实现 Comparable 即可匹配
-        let comparable = trait_ty("Comparable", vec![Type::Int]);
-        let union_ty = Type::Union(vec![comparable.clone()]);
-        let int_val = concrete("MyInt", vec![Type::Int], vec![comparable]);
-        assert!(check_union(&int_val, &union_ty).is_ok());
-    }
-
-    #[test]
-    fn check_union_no_member_matches_returns_err_msg() {
-        // Union[String, Int] —— Float 不是成员
-        let union_ty = Type::Union(vec![Type::String, Type::Int]);
-        let err = check_union(&Type::Float, &union_ty).unwrap_err();
-        // 错误信息应包含「expected subtype of」+ 第一个失败成员 + 实际类型
-        // Type Debug 输出（unit-like 变体）：Type::String → "String"、Type::Float → "Float"
-        // （Debug 不加引号——Type::String 输出是 `String` 不是 `"String"`）
-        assert!(err.contains("expected subtype of"));
-        assert!(err.contains("String"));
-        assert!(err.contains("Float"));
-    }
-
-    #[test]
-    fn check_union_picks_first_failing_member() {
-        // 即使 String 在 Union 头部（优先匹配），Float 不匹配任何成员时
-        // 错误信息包含**第一个**成员 String（保守报告）
-        let union_ty = Type::Union(vec![Type::String, Type::Int, Type::Bool]);
-        let err = check_union(&Type::Float, &union_ty).unwrap_err();
-        assert!(err.contains("String")); // 第一个成员
-        assert!(!err.contains("Bool")); // 不应包含 Bool
-    }
-
-    #[test]
-    fn check_union_misuse_returns_err() {
-        // 设计错误：expected 不是 Union 时返回描述性错误而非 panic
-        let result = check_union(&Type::Int, &Type::Int);
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert!(err.contains("misuse"));
-    }
-
-    // ─── v0.75.86 (Phase D)：join_types 跨节点 Union merge ───
-
-    #[test]
-    fn join_types_empty_yields_empty_union() {
-        // 空切片 → Union(vec![])（"any element type"占位）
-        let result = join_types(&[] as &[(Span, Type)], Span::default());
-        assert_eq!(result, Type::Union(vec![]));
-    }
-
-    #[test]
-    fn join_types_singleton_returns_type_itself() {
-        // 单个类型 → 该类型本身（不退化为 Union）
-        let result = join_types(&[(Span::default(), Type::Int)], Span::default());
-        assert_eq!(result, Type::Int);
-    }
-
-    #[test]
-    fn join_types_two_distinct_yields_union() {
-        // 两个不同类型 → Union(vec![t1, t2])
-        let result = join_types(
-            &[
-                (Span::default(), Type::Int),
-                (Span::default(), Type::String),
-            ],
-            Span::default(),
-        );
-        assert_eq!(result, Type::Union(vec![Type::Int, Type::String]));
-    }
-
-    #[test]
-    fn join_types_nested_union_flattens() {
-        // Union(Union(a, b), c) → Union(a, b, c) 平展
-        let nested = Type::Union(vec![
-            Type::Union(vec![Type::Int, Type::Float]),
-            Type::String,
-        ]);
-        let result = join_types(&[(Span::default(), nested)], Span::default());
-        assert_eq!(
-            result,
-            Type::Union(vec![Type::Int, Type::Float, Type::String])
-        );
-    }
-
-    #[test]
-    fn join_types_any_short_circuits() {
-        // 任一含 Any → Union(vec![])（Any 是 top type 吞掉）
-        let result = join_types(
-            &[
-                (Span::default(), Type::Int),
-                (Span::default(), Type::Any),
-                (Span::default(), Type::String),
-            ],
-            Span::default(),
-        );
-        assert_eq!(result, Type::Union(vec![]));
-        // 纯 Any 切片
-        let result = join_types(&[(Span::default(), Type::Any)], Span::default());
-        assert_eq!(result, Type::Union(vec![]));
-    }
-
-    // v0.75.92: Unknown fail-fast — 不参与 subtype / compatible / unify / join
-    #[test]
-    fn unknown_fails_subtype_with_any_type() {
-        // Unknown 不 subtype Int / String / Bool 等任何具体类型
-        assert!(!Type::Unknown.subtype_of(&Type::Int));
-        assert!(!Type::Unknown.subtype_of(&Type::String));
-        assert!(!Type::Bool.subtype_of(&Type::Unknown));
-        // Unknown 不兼容任何具体类型
-        assert!(!Type::Unknown.compatible_with(&Type::Int));
-        assert!(!Type::Float.compatible_with(&Type::Unknown));
-        // 与 Any 区分：Any 仍然 top type
-        assert!(Type::Any.subtype_of(&Type::Int));
-        assert!(Type::Unknown.subtype_of(&Type::Any)); // Unknown <: Any (top)
-    }
-
-    #[test]
-    fn unknown_unifies_fails() {
-        use crate::typeck::hm::unify::Substitution;
-        use crate::typeck::hm::unify::unify;
-        let subst = Substitution::new();
-        // Unknown 与任何类型合一都应失败
-        assert!(unify(&Type::Unknown, &Type::Int, &subst).is_err());
-        assert!(unify(&Type::Int, &Type::Unknown, &subst).is_err());
-        // Unknown 与 Unknown 合一也失败
-        assert!(unify(&Type::Unknown, &Type::Unknown, &subst).is_err());
-        // 但 Any 与 Any 合一仍然成功
-        assert!(unify(&Type::Any, &Type::Any, &subst).is_ok());
-    }
-
-    #[test]
-    fn join_types_with_unknown_short_circuits_to_unknown() {
-        // v0.75.92: 含 Unknown → 短路返 Unknown（与 Any 短路 Union(vec![]) 不同）
-        let result = join_types(
-            &[
-                (Span::default(), Type::Int),
-                (Span::default(), Type::Unknown),
-                (Span::default(), Type::String),
-            ],
-            Span::default(),
-        );
-        assert_eq!(result, Type::Unknown);
-        // 纯 Unknown 切片
-        let result = join_types(&[(Span::default(), Type::Unknown)], Span::default());
-        assert_eq!(result, Type::Unknown);
-    }
+    // v0.75.92: Unknown fail-fast 测试在 [`crate::typeck::hm::unify::tests`] 已有
+    // （unknown_fails_subtype_with_any_type / unknown_unifies_fails /
+    // join_types_with_unknown_short_circuits_to_unknown）。
 }

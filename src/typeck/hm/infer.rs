@@ -69,11 +69,8 @@ impl HMInference {
         let value_ty = self.infer_expr(value)?;
         let current = self.env.get(target).cloned();
         if let Some(existing) = current {
-            // v0.75.17: 命中 ForAll 时先实例化再合一（赋值的 LHS 是单形实例）
-            let existing = match existing {
-                Type::ForAll(_, _) => self.instantiate_type(&existing),
-                other => other,
-            };
+            // v0.75.97: 命中 ForAll 时先实例化再合一（赋值的 LHS 是单形实例）
+            let existing = self.instantiate_if_forall(&existing);
             self.constraints.push(Constraint::Eq(
                 Box::new(existing),
                 Box::new(value_ty.clone()),
@@ -181,15 +178,14 @@ impl HMInference {
     ) -> Result<Type, Vec<TypeError>> {
         let callee_ty = match callee {
             WitnessCallee::Name(name) => self.builtin_callee_ty(name).unwrap_or(Type::Unknown),
-            // v0.75.17: Var 命中 ForAll 时实例化（`let f = fn(x) x; f(1); f("s")`）
-            WitnessCallee::Var(var_name) => match self.env.get(var_name) {
-                Some(ty) if matches!(ty, Type::ForAll(_, _)) => {
-                    let ty = ty.clone();
-                    self.instantiate_type(&ty)
+            // v0.75.97: Var 命中 ForAll 时实例化（`let f = fn(x) x; f(1); f("s")`）
+            WitnessCallee::Var(var_name) => {
+                let ty_opt = self.env.get(var_name).cloned();
+                match ty_opt {
+                    Some(ty) => self.instantiate_if_forall(&ty),
+                    None => Type::Unknown,
                 }
-                Some(ty) => ty.clone(),
-                None => Type::Unknown,
-            },
+            }
             WitnessCallee::Evaluated(expr) => self.infer_expr(expr)?,
             WitnessCallee::Builtin(op) => self.builtin_type(op)?,
             // v0.75.16: Method 调用（parser 现产出 WitnessCallee::Method）— 走

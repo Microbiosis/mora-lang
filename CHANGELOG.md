@@ -11,6 +11,38 @@ All notable changes to Mora will be documented in this file.
 需要查阅 v0.13 → v0.30 历史的请通过 `git log --grep='v0\.' --reverse`
 按 commit 主题回溯；该区间仅作为工程债处理记录保留在 git 历史中。
 
+## [v0.75.97] — 2026-08-08 — typeck: 抽 `instantiate_if_forall` helper 统一 ForAll 实例化
+
+**目的**（架构审查报告 v0.75.90 🟡 警告级风险 3）：
+> `Type::ForAll` 实例化在 `infer_var` 与 `infer_call` 各有一份（`infer.rs:91-93, 182-186`）
+> → 强类型化要求 let-polymorphism 一致语义，但两处实例化路径可能漂移
+> → 抽 `instantiate_forall` helper 统一实例化规则
+
+**变更**：
+- `src/typeck/hm/mod.rs` 新增 `HMInference::instantiate_if_forall(&Type) -> Type`：
+  * 若 ForAll 则调 `instantiate_type` 实例化（fresh 副本）
+  * 否则直接 clone 返回
+  * 封装「命中 env 后实例化」通用模式
+- `src/typeck/hm/infer.rs`：
+  * `infer_var`（line 73-77 6 行）→ 3 行 `self.instantiate_if_forall(&existing)`
+  * `infer_call`（line 185-189 5 行）→ 1 行（外加 env.get 借出处理）
+  * 两处 `match ForAll` 模式消除
+- 加 2 个测试（`hm/mod.rs::tests`）：
+  * `instantiate_if_forall_returns_input_when_not_forall` — 非 ForAll 输入 no-op
+  * `instantiate_if_forall_produces_fresh_copy_when_forall` — ForAll 实例化两次产出独立 TypeVar
+
+**测试**：670 passed; 0 failed; 13 ignored（与 v0.75.96 完全一致 + 2 新增）
+
+**收益**：
+- 两处 `match ForAll` 模式统一为单次 helper 调用
+- let-polymorphism 实例化语义集中管理——未来 HM 调整只需改 helper
+- infer.rs 减少 ~7 行重复 match 代码
+
+**未变**：
+- `instantiate_type` 保留（helper 内部仍用）——`instantiate_if_forall` 是其语义封装
+- ForAll 量化 / closure 身份变量映射 / closure_sigs 复制行为不变
+- HM 推断路径 / Any/Unknown / DiagFilter 全部不变
+
 ## [v0.75.96] — 2026-08-08 — typeck: `check_union` / `join_types` 抽离到 `hm::util` 子模块
 
 **目的**（架构审查报告 v0.75.90 🔴 阻断级风险 4）：

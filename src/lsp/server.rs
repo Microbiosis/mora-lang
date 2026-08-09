@@ -376,7 +376,7 @@ impl Server {
             Ok(pair) => pair,
             Err(_) => return Vec::new(),
         };
-        let errs = crate::typeck::check_mir::check_program_witnesses(&witnesses);
+        let errs = crate::typeck::check_mir::check_program_witnesses_bidirectional(&witnesses);
         errs.into_iter()
             .map(|e| {
                 // v0.05: line/column 都是 1-based (typeck)，LSP 是 0-based

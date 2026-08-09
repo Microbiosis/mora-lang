@@ -11,6 +11,33 @@ All notable changes to Mora will be documented in this file.
 需要查阅 v0.13 → v0.30 历史的请通过 `git log --grep='v0\.' --reverse`
 按 commit 主题回溯；该区间仅作为工程债处理记录保留在 git 历史中。
 
+## [v0.75.95] — 2026-08-08 — typeck: 双向调用方切换（5 个调用点 → 8 个）
+
+**目的**（架构审查报告 v0.75.90 🔴 阻断级风险 6）：
+> `check_program_witnesses_bidirectional` 零调用方（无 grep 命中）
+> → 强类型化若启用双向，外部 8 个调用点全部需要切换
+> → 强类型化前必须先把所有 `check_program_witnesses` 调用方切到 `_bidirectional` 版本（一次性 PR）
+
+**变更**：8 个调用点全部从 `check_program_witnesses` 切换到 `check_program_witnesses_bidirectional`：
+- `src/main.rs:392, 421` — CLI `--check` 主入口 + match v0.75.87 验证文件
+- `src/cli/record.rs:15, 76, 281` — CLI record 子命令（3 处）
+- `src/lsp/server.rs:379` — LSP diagnostics 推送
+- `src/interpreter/mod.rs:489, 617` — REPL + import 路径（2 处）
+
+**测试**：
+- 668 passed; 0 failed; 13 ignored（与 v0.75.94 完全一致，零回归）
+- `_bidirectional` 路径从 v0.75.86 起零调用方 → 现在 8 个调用方进入生产路径
+- DiagFilter 过滤（v0.75.94 抽离）在生产中验证：测试套件不报回归 = 双向 fallback 抑制正确
+
+**保留**：
+- `check_program_witnesses` 函数本身未删除（escape hatch——若双向路径报错可回退）
+- `check_program_witnesses_inner` 未改动（共享内部）
+
+**未变**：
+- HM 推断路径（继续产出 `crate::typeck::Type`）
+- Any/Unknown v0.75.91-92 fail-fast 语义
+- DiagFilter 双向 fallback 抑制机制（v0.75.94）
+
 ## [v0.75.94] — 2026-08-08 — typeck: `HMInference::diagnosed` 抽离为 `DiagFilter`
 
 **目的**（架构审查报告 v0.75.90 🔴 阻断级风险 1）：

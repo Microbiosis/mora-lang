@@ -217,8 +217,10 @@ fn accumulator_reduce(current: Option<Value>, incoming: Value, op: &str) -> Resu
     };
     let cur = current.unwrap_or(identity);
     match op {
-        "+" => crate::flow::eval_binary(cur, &crate::common::BinaryOp::Add, incoming),
-        "*" => crate::flow::eval_binary(cur, &crate::common::BinaryOp::Mul, incoming),
+        "+" => crate::flow::eval_binary(cur, &crate::common::BinaryOp::Add, incoming)
+            .map_err(|e| e.to_string()),
+        "*" => crate::flow::eval_binary(cur, &crate::common::BinaryOp::Mul, incoming)
+            .map_err(|e| e.to_string()),
         _ => Err(format!("Unknown accumulator op: {}", op)),
     }
 }

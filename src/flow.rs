@@ -5,6 +5,7 @@
 //! Re-exported in interpreter.rs via `use crate::flow::*;`
 
 use crate::common::{BinaryOp, Literal};
+use crate::error::MoraError;
 use crate::value::Value;
 
 /// 判断值是否为真 — MIR 条件分支的单一真值源（v0.75.83 收敛）。
@@ -32,10 +33,14 @@ pub fn is_builtin_object(name: &str) -> bool {
 }
 
 /// 期望值为字符串，带上下文信息
-pub fn expect_string(value: Value, context: &str) -> Result<String, String> {
+/// v0.76.00: 返回 `Result<String, MoraError>`（MoraError 统一计划推进）。
+pub fn expect_string(value: Value, context: &str) -> Result<String, MoraError> {
     match value {
         Value::String(s) => Ok(s),
-        other => Err(format!("{}: expected string, got {:?}", context, other)),
+        other => Err(MoraError::Other(format!(
+            "{}: expected string, got {:?}",
+            context, other
+        ))),
     }
 }
 
@@ -102,7 +107,8 @@ pub fn is_pipe_method(name: &str) -> bool {
 /// 二元操作求值
 ///
 /// v0.38 (C5): addition follows the same Rust-strict promotion rules.
-pub fn eval_binary(left: Value, op: &BinaryOp, right: Value) -> Result<Value, String> {
+/// v0.76.00: 返回 `Result<Value, MoraError>`（MoraError 统一计划推进）。
+pub fn eval_binary(left: Value, op: &BinaryOp, right: Value) -> Result<Value, MoraError> {
     match op {
         BinaryOp::Add => match (&left, &right) {
             // Strict: Int+Int -> Int
@@ -111,7 +117,7 @@ pub fn eval_binary(left: Value, op: &BinaryOp, right: Value) -> Result<Value, St
             (Value::Float(a), Value::Float(b)) => Ok(Value::Float(a + b)),
             // Mixed -> error
             (Value::Int(_), Value::Float(_)) | (Value::Float(_), Value::Int(_)) => {
-                Err("operator '+' requires both operands to be same numeric type (Int or Float, Rust-strict mode)".to_string())
+                Err(MoraError::Other("operator '+' requires both operands to be same numeric type (Int or Float, Rust-strict mode)".to_string()))
             }
             (Value::String(a), Value::String(b)) => Ok(Value::String(format!("{}{}", a, b))),
             // 字符串 + 任意类型 → 自动转字符串拼接
@@ -161,7 +167,7 @@ pub fn eval_binary(left: Value, op: &BinaryOp, right: Value) -> Result<Value, St
                     .collect();
                 Ok(Value::List(result))
             }
-            _ => Err("Operands must be two numbers, two strings, or two lists".to_string()),
+            _ => Err(MoraError::Other("Operands must be two numbers, two strings, or two lists".to_string())),
         },
         BinaryOp::Sub => numeric_op(left, right, |a, b| a - b),
         BinaryOp::Mul => numeric_op(left, right, |a, b| a * b),
@@ -182,7 +188,9 @@ pub fn eval_binary(left: Value, op: &BinaryOp, right: Value) -> Result<Value, St
 /// - `Int + Int = Int`        (pure integer arithmetic)
 /// - `Float + Float = Float`  (pure float arithmetic)
 /// - `Int + Float` / `Float + Int` -> strict type error
-pub fn numeric_op<F>(left: Value, right: Value, op: F) -> Result<Value, String>
+///
+/// v0.76.00: 返回 `Result<Value, MoraError>`（MoraError 统一计划推进）。
+pub fn numeric_op<F>(left: Value, right: Value, op: F) -> Result<Value, MoraError>
 where
     F: Fn(f64, f64) -> f64,
 {
@@ -198,10 +206,10 @@ where
         // Strict: Float+Float -> Float
         (Float(a), Float(b)) => Ok(Float(op(a, b))),
         // Mixed types -> strict error
-        (Int(_), Float(_)) | (Float(_), Int(_)) => Err(
+        (Int(_), Float(_)) | (Float(_), Int(_)) => Err(MoraError::Other(
             "numeric operator does not accept mixed Int and Float operands (Rust-strict mode)"
                 .to_string(),
-        ),
+        )),
         // v0.17: 广播操作 - list op number
         (Value::List(list), Value::Float(scalar)) => {
             let result: Vec<Value> = list
@@ -227,7 +235,11 @@ where
         // v0.17: 广播操作 - list op list (逐元素)
         (Value::List(a), Value::List(b)) => {
             if a.len() != b.len() {
-                return Err(format!("List length mismatch: {} vs {}", a.len(), b.len()));
+                return Err(MoraError::Other(format!(
+                    "List length mismatch: {} vs {}",
+                    a.len(),
+                    b.len()
+                )));
             }
             let result: Vec<Value> = a
                 .iter()
@@ -239,14 +251,15 @@ where
                 .collect();
             Ok(Value::List(result))
         }
-        _ => Err("Operands must be numbers".to_string()),
+        _ => Err(MoraError::Other("Operands must be numbers".to_string())),
     }
 }
 
 /// 数值比较辅助
 ///
 /// v0.38: Int/Int compare as i64, Float/Float as f64, mixed -> error.
-pub fn numeric_cmp<F>(left: Value, right: Value, op: F) -> Result<Value, String>
+/// v0.76.00: 返回 `Result<Value, MoraError>`（MoraError 统一计划推进）。
+pub fn numeric_cmp<F>(left: Value, right: Value, op: F) -> Result<Value, MoraError>
 where
     F: Fn(f64, f64) -> bool,
 {
@@ -254,11 +267,11 @@ where
     match (left, right) {
         (Int(a), Int(b)) => Ok(Bool(op(a as f64, b as f64))),
         (Float(a), Float(b)) => Ok(Bool(op(a, b))),
-        (Int(_), Float(_)) | (Float(_), Int(_)) => Err(
+        (Int(_), Float(_)) | (Float(_), Int(_)) => Err(MoraError::Other(
             "numeric comparison does not accept mixed Int and Float operands (Rust-strict mode)"
                 .to_string(),
-        ),
-        _ => Err("Operands must be numbers".to_string()),
+        )),
+        _ => Err(MoraError::Other("Operands must be numbers".to_string())),
     }
 }
 

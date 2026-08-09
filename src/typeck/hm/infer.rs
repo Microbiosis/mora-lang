@@ -3,6 +3,7 @@
 //! closure/fn_def/match/if/list/dict。基础设施与 infer_expr 入口仍在 mod.rs。
 
 use super::*;
+use crate::mir::hint::TypeHint;
 
 impl HMInference {
     pub(super) fn infer_let(
@@ -25,33 +26,35 @@ impl HMInference {
     pub(super) fn infer_let_typed(
         &mut self,
         name: &str,
-        type_hint: &Type,
+        type_hint: &TypeHint,
         value: &MirWitness,
         span: Span,
     ) -> Result<Type, Vec<TypeError>> {
         let value_ty = self.infer_expr(value)?;
+        // v0.75.93: TypeHint 边界 → to_type() 取回 typeck::Type
+        let ty_inner = type_hint.to_type();
         // v0.55: validate the user-supplied `let x: T = ...` annotation
         // against the value's inferred type. Tolerant: Type::Any
         // annotations always succeed.
-        if !matches!(type_hint, Type::Any) {
+        if !matches!(ty_inner, Type::Any) {
             // v0.75.86: 提前用 span 报不一致——不等 solve_constraints 兜底
             // (原代码只 push Constraint 到 constraints 一致性队列，span 在
             // 合一失败时被丢弃 → typeck 错误统一报 line 0)
-            if !value_ty.compatible_with(type_hint) {
+            if !value_ty.compatible_with(ty_inner) {
                 return Err(vec![TypeError::UnificationFailure {
-                    expected: format!("{:?}", type_hint),
+                    expected: format!("{:?}", ty_inner),
                     got: format!("{:?}", value_ty),
                     span: Some(span),
                 }]);
             }
             self.constraints.push(Constraint::Eq(
-                Box::new(type_hint.clone()),
+                Box::new(ty_inner.clone()),
                 Box::new(value_ty.clone()),
             ));
         }
         // v0.75.17: 显式注解同样做 let-generalization（注解含自由变量时
         // 量化为 ForAll；`List<int>` 等具体注解无自由变量，原样登记）。
-        let gen_hint = generalize::generalize(type_hint, &self.env.free_variables());
+        let gen_hint = generalize::generalize(ty_inner, &self.env.free_variables());
         self.env.add(name.to_string(), gen_hint.clone());
         let _ = span;
         Ok(gen_hint)
@@ -322,7 +325,12 @@ impl HMInference {
         let saved_env = self.env.clone();
         let param_types: Vec<Type> = params
             .iter()
-            .map(|p| p.type_hint.clone().unwrap_or_else(|| self.fresh_type_var()))
+            .map(|p| {
+                p.type_hint
+                    .as_ref()
+                    .map(|h| h.to_type().clone())
+                    .unwrap_or_else(|| self.fresh_type_var())
+            })
             .collect();
         for (p, ty) in params.iter().zip(param_types.iter()) {
             self.env.add(p.name.clone(), ty.clone());

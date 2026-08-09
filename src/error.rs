@@ -91,6 +91,16 @@ impl From<&str> for MoraError {
     }
 }
 
+// v0.76.00: 反向 From impl——支持 caller 端 `?` 自动转换
+// 现有 `Result<T, String>` caller（如 handlers.rs:73 + pregel/mod.rs 多处）
+// 调 `eval_binary(...)`（现返 MoraError）时 `?` 自动从 MoraError → String。
+// 等到 caller 全部改完 Result<T, MoraError> 后可删除。
+impl From<MoraError> for String {
+    fn from(e: MoraError) -> Self {
+        e.to_string()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

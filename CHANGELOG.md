@@ -11,6 +11,49 @@ All notable changes to Mora will be documented in this file.
 需要查阅 v0.13 → v0.30 历史的请通过 `git log --grep='v0\.' --reverse`
 按 commit 主题回溯；该区间仅作为工程债处理记录保留在 git 历史中。
 
+## [v0.76.00] — 2026-08-08 — error: MoraError 推进（flow.rs 4 函数 + 18 caller 适配）
+
+**目的**（延续 v0.75.98/99）：MoraError 统一计划第三次推进——从 typeck / http_server / compress
+扩展到 **flow.rs 4 个核心函数**（expect_string / eval_binary / numeric_op / numeric_cmp），
+对应架构审查报告「🟡 警告级风险 1」最大爆炸半径项。
+
+**变更**：
+- `src/flow.rs`：
+  * 4 个函数签名 `Result<T, String>` → `Result<T, MoraError>`
+  * 7 处 `Err(format!...)` / `Err("...".to_string())` 改 `Err(MoraError::Other(...))`
+- `src/error.rs` 新增 `impl From<MoraError> for String`（反向 From）：
+  * 现有 `Result<T, String>` caller 用 `?` 自动 MoraError → String
+  * 等所有 caller 改完 Result<T, MoraError> 后可删除
+- `src/pregel/mod.rs` 2 处 caller 适配（`.map_err(|e| e.to_string())`，match arm 不能 `?`）：
+  * line 220-221 accumulator_reduce match arm
+- `src/mir/handlers.rs:73` `h_arith`（`?` 自动转换 via From impl）——**零代码改动**
+- `src/mir/opt/*` 3 处 + `mir/optimize/rule.rs` 1 处 + `mir/optimize/ssa_pattern.rs` 1 处
+  + `pregel/mod.rs:571,578,589` block 内 `?` 自动转换 ——**零代码改动**
+
+**保留**：
+- 7 个独立 Error 类型继续保留向后兼容
+- 任何 `Result<T, String>` 路径（未迁移）
+- 任何 trait / interface 签名
+- 任何 `Result<_, String>` 直接返回的模块（`src/checkpoint/*` / `src/document/*` / `src/compress/*` 内部）
+
+**测试**：676 passed; 0 failed; 13 ignored（与 v0.75.99 完全一致——零回归）
+
+**收益**：
+- MoraError 覆盖：1 → 9 处（check_union + invoke_handler + extract_text +
+  options_from_value + compress_top + expect_string + eval_binary + numeric_op + numeric_cmp）
+- 全仓 267 处 `Result<T, String>` → 254 处（13 处迁移——4 个新核心函数 + 9 个新 caller）
+- 实际 caller 18 个比架构审查报告估的 59 个少（多数是 flow.rs 内部 numeric_op/numeric_cmp 互调，外部 caller 集中在 pregel/handlers/mir/opt）
+
+**未变**：
+- 任何 `Result<T, String>` 路径（剩余 254 处）
+- 任何公开 Error 类型
+- 任何 trait / interface 签名
+
+**下一步路径**：
+- v0.76.01: `src/checkpoint/*` 5+ 处 + `src/document/*` 20+ 处
+- v0.76.02+: `src/compress/*` 内部 8 处（trait Compress::compress 接口签名）
+- v0.76.10: 全仓 `Result<T, String>` < 200 处
+
 ## [v0.75.99] — 2026-08-08 — error: MoraError 推进（http_server + compress public API）
 
 **目的**（延续 v0.75.98）：MoraError 统一计划第二次推进——从 typeck 路径扩展

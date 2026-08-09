@@ -30,6 +30,7 @@
 //! - 4 个 `check_union_*` 测试 + 1 个 `join_types_*` 测试语义保留
 
 use crate::common::Span;
+use crate::error::MoraError;
 use crate::typeck::Type;
 
 /// v0.75.86: Union 双向 check helper —— 为双向定型 check 模式服务。
@@ -59,14 +60,17 @@ use crate::typeck::Type;
 /// 内部用 [`Type`] 的 `Debug` 输出（v0.13 Display impl 仅是设计目标，
 /// 实际未实现；Debug 覆盖所有 variant 字段）。
 /// 调用方可自行包装为 [`crate::typeck::TypeError`]（行号/列号由调用方注入）。
-pub fn check_union(actual: &Type, expected: &Type) -> Result<(), String> {
+///
+/// v0.75.98: 返回类型从 `Result<(), String>` 改为 `Result<(), MoraError>`——
+/// MoraError 统一计划首次落地（typeck 路径）。错误归类为 [`MoraError::Typeck`]。
+pub fn check_union(actual: &Type, expected: &Type) -> Result<(), MoraError> {
     let Type::Union(members) = expected else {
         // 设计错误：调用方应在 dispatch 之前 match expected 是 Union。
         // 返回描述性错误而非 panic——上层 match 错误会自己 panic。
-        return Err(format!(
+        return Err(MoraError::Typeck(format!(
             "check_union misuse: expected must be Union, got {:?}",
             expected
-        ));
+        )));
     };
     if members.is_empty() {
         // 空 Union = "any element type" 占位 —— 兼容任何
@@ -78,10 +82,10 @@ pub fn check_union(actual: &Type, expected: &Type) -> Result<(), String> {
             return Ok(());
         }
     }
-    Err(format!(
+    Err(MoraError::Typeck(format!(
         "expected subtype of `{:?}`, got `{:?}`",
         members[0], actual,
-    ))
+    )))
 }
 
 /// v0.75.86: 把多条 arm body 类型合并为单一 Union（双向 Phase E）。
@@ -164,8 +168,10 @@ mod tests {
     fn check_union_no_member_matches_returns_err_msg() {
         let union_ty = Type::Union(vec![Type::Int, Type::String]);
         let err = check_union(&Type::Float, &union_ty).unwrap_err();
-        assert!(err.contains("expected subtype of"));
-        assert!(err.contains("got"));
+        // v0.75.98: MoraError 替代 String——通过 Display 检查子串
+        let msg = err.to_string();
+        assert!(msg.contains("expected subtype of"));
+        assert!(msg.contains("got"));
     }
 
     #[test]
@@ -173,13 +179,14 @@ mod tests {
         let union_ty = Type::Union(vec![Type::Int, Type::String]);
         let err = check_union(&Type::Float, &union_ty).unwrap_err();
         // 第一个 failing member 是 Int（Float subtype Float OK 但 Float <: Int 失败）
-        assert!(err.contains("Int"));
+        assert!(err.to_string().contains("Int"));
     }
 
     #[test]
     fn check_union_misuse_returns_err_when_expected_not_union() {
         let err = check_union(&Type::Int, &Type::Int).unwrap_err();
-        assert!(err.contains("check_union misuse"));
+        // v0.75.98: 通过 Display 检查 misuse 字符串
+        assert!(err.to_string().contains("check_union misuse"));
     }
 
     // ─── join_types 测试 ───

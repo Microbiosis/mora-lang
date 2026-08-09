@@ -486,7 +486,8 @@ impl Interpreter {
         match std::fs::read_to_string(path) {
             Ok(source) => {
                 let (imported_func, witnesses) = crate::parser_v3::ParserV3::compile(&source)?;
-                let _type_errs = crate::typeck::check_mir::check_program_witnesses(&witnesses);
+                let _type_errs =
+                    crate::typeck::check_mir::check_program_witnesses_bidirectional(&witnesses);
                 // 子 import 的 env 是当前 env 的克隆（与 with 块语义一致）
                 let mut child_env = env.clone();
                 // v0.75.9: 包裹 Arc 走全局 DAG 缓存
@@ -614,7 +615,8 @@ impl Interpreter {
             }
 
             // v0.35 (P0-C1): REPL also type-checks (other entry points do).
-            let type_errs = crate::typeck::check_mir::check_program_witnesses(&witnesses);
+            let type_errs =
+                crate::typeck::check_mir::check_program_witnesses_bidirectional(&witnesses);
             if !type_errs.is_empty() {
                 for e in type_errs {
                     eprintln!("type error: {}", e.message);

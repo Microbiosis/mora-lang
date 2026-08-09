@@ -12,7 +12,7 @@ pub fn run_record(path: &str, name: &str, opt_level: Option<crate::mir::ssa::Opt
 
     let (func, witnesses) = compile_and_opt(&source, opt_level);
 
-    let type_errors = crate::typeck::check_mir::check_program_witnesses(&witnesses);
+    let type_errors = crate::typeck::check_mir::check_program_witnesses_bidirectional(&witnesses);
     if !type_errors.is_empty() {
         for err in &type_errors {
             eprintln!("{}", format_error(err));
@@ -73,7 +73,7 @@ pub fn run_replay(path: &str, name: &str, opt_level: Option<crate::mir::ssa::Opt
 
     let (func, witnesses) = compile_and_opt(&source, opt_level);
 
-    let type_errors = crate::typeck::check_mir::check_program_witnesses(&witnesses);
+    let type_errors = crate::typeck::check_mir::check_program_witnesses_bidirectional(&witnesses);
     if !type_errors.is_empty() {
         for err in &type_errors {
             eprintln!("{}", format_error(err));
@@ -278,7 +278,7 @@ pub fn run_snapshot(
         process::exit(1);
     });
     let (func, witnesses) = compile_and_opt(&source, opt_level);
-    let type_errors = crate::typeck::check_mir::check_program_witnesses(&witnesses);
+    let type_errors = crate::typeck::check_mir::check_program_witnesses_bidirectional(&witnesses);
     if !type_errors.is_empty() {
         for err in &type_errors {
             eprintln!("{}", format_error(err));

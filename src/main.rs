@@ -388,8 +388,8 @@ fn run_file(path: &str, opt_level: Option<mora::mir::ssa::OptLevel>) {
     // v0.75.40: 单遍编译（compile 直接 emit MirInst + witness）
     let (func, witnesses) = mora::cli::compile_and_opt(&source, opt_level);
 
-    // 类型检查 (HM 推断) — 消费 witness（零 MirExpr）
-    let type_errors = mora::typeck::check_mir::check_program_witnesses(&witnesses);
+    // 类型检查 (HM 推断 + 双向) — v0.75.95: 切到 _bidirectional 启用双向叠加层
+    let type_errors = mora::typeck::check_mir::check_program_witnesses_bidirectional(&witnesses);
     if !type_errors.is_empty() {
         for err in &type_errors {
             eprintln!("{}", format_error(err));
@@ -418,7 +418,7 @@ fn run_check(path: &str) {
 
     let (_, witnesses) = ParserV3::compile(&source).expect("Failed to compile");
 
-    let type_errors = mora::typeck::check_mir::check_program_witnesses(&witnesses);
+    let type_errors = mora::typeck::check_mir::check_program_witnesses_bidirectional(&witnesses);
     if type_errors.is_empty() {
         println!("No type errors found. ({} expressions)", witnesses.len());
     } else {

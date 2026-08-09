@@ -10,6 +10,8 @@
 
 use std::sync::Arc;
 
+use crate::error::MoraError;
+
 /// SmartCrusher json 策略的目标大小除数：`target = max_bytes / 200`
 /// （即目标 ≈ 原文的 1/200，经验压缩比兜底）。与 target_ratio 二选一。
 const SMART_CRUSHER_TARGET_DIVISOR: usize = 200;
@@ -157,7 +159,10 @@ pub use json::{ArrayType, CrushResult, FieldRole, FieldStats, crush_json, crush_
 /// - `Value::Conversation { messages, .. }` → 每条格式化为 `role: content`, 用 `\n` 连接
 /// - `Value::List` 项是 `Value::Dict{role, content}` → 同样格式化为 `role: content`
 /// - 其它 → 错误
-pub fn extract_text(input: &crate::value::Value) -> Result<String, String> {
+///
+/// v0.75.99: 返回 `Result<String, MoraError>`。错误归类为 MoraError::Other
+/// （extract 通用，不属 typeck/io/serialization）。
+pub fn extract_text(input: &crate::value::Value) -> Result<String, MoraError> {
     use crate::value::Value;
     match input {
         Value::String(s) => Ok(s.clone()),
@@ -187,17 +192,16 @@ pub fn extract_text(input: &crate::value::Value) -> Result<String, String> {
             }
             Ok(lines.join("\n"))
         }
-        other => Err(format!(
+        other => Err(MoraError::Other(format!(
             "compress: expected Conversation / list of {{role, content}} / string, got {}",
             value_type_simple(other)
-        )),
+        ))),
     }
 }
 
-/// v0.30: 从 `Value::Dict` 构建 `CompressOptions`。
-///
 /// 部分字段缺失或类型不匹配时**静默跳过**(不报错) — 调用方可任意选择传入哪些 options。
-pub fn options_from_value(v: &crate::value::Value) -> Result<CompressOptions, String> {
+/// v0.75.99: 返回 `Result<CompressOptions, MoraError>`。
+pub fn options_from_value(v: &crate::value::Value) -> Result<CompressOptions, MoraError> {
     use crate::value::Value;
     let mut opts = CompressOptions::default();
     if let Value::Dict(map) = v {
@@ -254,11 +258,13 @@ pub fn options_from_value(v: &crate::value::Value) -> Result<CompressOptions, St
 /// - `"summary"`        → TextSubCompressor (mock LLM, 真实 LLM 留 v0.30)
 /// - `"lossless"`       → TextSubCompressor (原文本 + original_size marker)
 /// - 其它               → 报错
+///
+/// v0.75.99: 返回 `Result<Value, MoraError>`（MoraError 统一计划推进）。
 pub fn compress_top(
     input: &crate::value::Value,
     strategy: &str,
     options: &CompressOptions,
-) -> Result<crate::value::Value, String> {
+) -> Result<crate::value::Value, MoraError> {
     // "json" strategy 不走文本路径, 直接用原始 input 调 SmartCrusher
     if strategy == "json" {
         // 优先按 max_bytes 推 target; 否则按 target_ratio 推; 兜底 N/2
@@ -279,10 +285,10 @@ pub fn compress_top(
         let items = match input {
             crate::value::Value::List(l) => l.clone(),
             _ => {
-                return Err(format!(
+                return Err(MoraError::Other(format!(
                     "compress.json: expected List, got {}",
                     value_type_simple(input)
-                ));
+                )));
             }
         };
         let result = crush_json(&items, target, options);
@@ -311,7 +317,10 @@ pub fn compress_top(
             let out = text_comp.compress(&text, max_bytes, options)?;
             Ok(crate::value::Value::String(out))
         }
-        other => Err(format!("compress: unknown strategy '{}'", other)),
+        other => Err(MoraError::Other(format!(
+            "compress: unknown strategy '{}'",
+            other
+        ))),
     }
 }
 

@@ -301,12 +301,13 @@ impl Interpreter {
             .get(2)
             .cloned()
             .unwrap_or(Value::Dict(Default::default()));
-        let opts_base = crate::compress::options_from_value(&options_val)?;
+        let opts_base =
+            crate::compress::options_from_value(&options_val).map_err(|e| e.to_string())?; // v0.75.99: MoraError → String 转换
         let opts = crate::compress::CompressOptions {
             strategy: strategy.clone(),
             ..opts_base
         };
-        crate::compress::compress_top(&args[0], &strategy, &opts)
+        crate::compress::compress_top(&args[0], &strategy, &opts).map_err(|e| e.to_string())
     }
 
     fn call_builtin_crush_json(&mut self, args: Vec<Value>) -> Result<Value, String> {
@@ -328,7 +329,7 @@ impl Interpreter {
             .get(2)
             .cloned()
             .unwrap_or(Value::Dict(Default::default()));
-        let opts = crate::compress::options_from_value(&options_val)?;
+        let opts = crate::compress::options_from_value(&options_val).map_err(|e| e.to_string())?; // v0.75.99: MoraError → String 转换
         let items = match &args[0] {
             Value::List(l) => l.clone(),
             _ => {
@@ -1125,6 +1126,7 @@ impl Interpreter {
                     &strategy,
                     &opts,
                 )
+                .map_err(|e| e.to_string())
             }
             _ => Err(format!("Conversation has no method: {}", method)),
         }

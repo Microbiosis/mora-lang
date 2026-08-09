@@ -11,6 +11,50 @@ All notable changes to Mora will be documented in this file.
 需要查阅 v0.13 → v0.30 历史的请通过 `git log --grep='v0\.' --reverse`
 按 commit 主题回溯；该区间仅作为工程债处理记录保留在 git 历史中。
 
+## [v0.75.99] — 2026-08-08 — error: MoraError 推进（http_server + compress public API）
+
+**目的**（延续 v0.75.98）：MoraError 统一计划第二次推进——从 typeck 路径扩展
+到 http_server + compress public API（caller 集中于 dispatch.rs）。
+
+**变更**：
+- `src/http_server.rs`：
+  * `invoke_handler` 签名 `Result<Value, String>` → `Result<Value, MoraError>`
+  * 内部 `interp.call_value(...)` 返回 `Result<Value, String>`，需 `.map_err(MoraError::Other)` 透传
+- `src/compress/mod.rs` 3 个公开函数改 MoraError：
+  * `extract_text(input) -> Result<String, MoraError>`（MoraError::Other）
+  * `options_from_value(v) -> Result<CompressOptions, MoraError>`（MoraError::Other）
+  * `compress_top(input, strategy, options) -> Result<Value, MoraError>`（MoraError::Other）
+- `src/interpreter/dispatch.rs` 3 处 caller 适配（`.map_err(|e| e.to_string())?`）：
+  * `options_from_value(&options_val)?` → `.map_err(|e| e.to_string())?`
+  * 2 处 `compress_top(...)?` 同上
+
+**保留**：
+- `src/flow.rs` 4 个函数（`expect_string` / `eval_binary` / `numeric_op` / `numeric_cmp`）——
+  59 个 caller，爆炸半径大，**v0.76.00 单独 commit**
+- `src/compress/*` 内部 8 处（`html.rs:38` / `json.rs:522,570` / `log.rs:72` /
+  `code.rs:57` / `text.rs:91,124` / `mod.rs:84`）—— trait Compress::compress 接口
+  保留 `Result<_, String>`（5 个实现签名爆炸），不破坏向后兼容
+- 7 个独立 Error 类型（`TypeError` / `HMTypeError` / `AuditError` / `SandboxError` /
+  `JitError` / `ParseError` / `KeepErrorsConstraint`）继续保留
+
+**测试**：676 passed; 0 failed; 13 ignored（与 v0.75.98 完全一致）
+
+**收益**：
+- MoraError 覆盖：1 → 4 处（check_union + invoke_handler + extract_text +
+  options_from_value + compress_top）
+- 全仓 267 处 `Result<T, String>` → 263 处（5 处迁移）
+- dispatch.rs 作为「caller adapter」模式成型（任何 future MoraError 路径
+  只需一处 .map_err 透传）
+
+**未变**：
+- `check_union` 之外的所有 Result<T, String> 路径
+- 任何公开 Error 类型
+- 任何 trait / interface 签名
+
+**下一步路径**（不在本次范围）：
+- v0.76.00: `src/flow.rs` 4 个函数 + 59 个 caller 适配
+- v0.76.01+: `src/checkpoint/*` 5+ 处 + `src/document/*` 20+ 处
+
 ## [v0.75.98] — 2026-08-08 — error: MoraError 统一错误类型（v0.91 计划首次落地）
 
 **目的**（架构审查报告 v0.75.90 🟡 警告级风险 1）：

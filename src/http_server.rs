@@ -18,6 +18,7 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::{Duration, timeout};
 
+use crate::error::MoraError;
 use crate::interpreter::{Interpreter, Value};
 use crate::lsp::json::{Value as JsonValue, to_string as json_to_string};
 
@@ -213,7 +214,7 @@ async fn handle_connection(
                     let json = value_to_json_string(&value);
                     (200, json)
                 }
-                Ok(Ok(Err(e))) => (500, json_error(&format!("handler error: {}", e))),
+                Ok(Ok(Err(e))) => (500, json_error(&format!("handler error: {}", e))), // v0.75.99: MoraError Display 透传
                 Ok(Err(_)) => (500, json_error("handler panicked")),
                 Err(_) => (504, json_error("handler timeout")),
             }
@@ -229,11 +230,13 @@ async fn handle_connection(
 
 /// 调 Mora 闭包,把 request 包装成 dict 传入. 附加 .json() / .text() 方法
 /// 在 spawn_blocking 中执行，使用 blocking_write() 获取 interpreter 锁
+/// v0.75.99: 返回 `Result<Value, MoraError>`（MoraError 统一计划推进）——
+/// 1 个外部 caller（line 209）+ 1 个内部 caller（line 216 JSON 错误格式）。
 fn invoke_handler(
     handler: Value,
     req: &HttpRequest,
     interpreter: Arc<tokio::sync::RwLock<Interpreter>>,
-) -> Result<Value, String> {
+) -> Result<Value, MoraError> {
     // 构造 req dict
     let mut req_dict = HashMap::new();
     req_dict.insert("method".to_string(), Value::String(req.method.clone()));
@@ -256,7 +259,9 @@ fn invoke_handler(
 
     // 调闭包: handler(req_dict)
     let mut interp = interpreter.blocking_write();
-    interp.call_value(&handler, vec![req_value])
+    interp
+        .call_value(&handler, vec![req_value])
+        .map_err(MoraError::Other) // v0.75.99: String → MoraError::Other
 }
 
 /// 解析 body 字符串为 Value

@@ -145,6 +145,22 @@ impl HMInference {
         }
     }
 
+    /// v0.75.97: 如果 `ty` 是 `Type::ForAll` 则实例化（每次 fresh 副本），
+    /// 否则原样返回。封装「命中 env 后实例化」通用模式——
+    /// `infer_var`（赋值 LHS 单形化）与 `infer_call`（Var callee 单形化）
+    /// 两个调用点共享此语义。
+    ///
+    /// 与 [`instantiate_type`](Self::instantiate_type) 区别：
+    ///   - `instantiate_type`: 无条件 match ForAll（已是 ForAll 才展开）
+    ///   - `instantiate_if_forall`: 若 ForAll 则实例化，否则直接 clone 返回
+    ///     （省去 caller 写 match 的开销 + 集中单形化语义）
+    pub fn instantiate_if_forall(&mut self, ty: &Type) -> Type {
+        match ty {
+            Type::ForAll(_, _) => self.instantiate_type(ty),
+            _ => ty.clone(),
+        }
+    }
+
     /// 递归替换类型中出现的所有 TypeVar（每次实例化一份独立副本）。
     pub(super) fn rename_ty(&mut self, ty: &Type) -> Type {
         match ty {
@@ -508,5 +524,37 @@ mod tests {
         };
         let _ = closure_ty; // Just check the compile
         let _ = call;
+    }
+
+    // v0.75.97: instantiate_if_forall helper 测试
+    #[test]
+    fn instantiate_if_forall_returns_input_when_not_forall() {
+        // 非 ForAll 类型直接 clone 返回（no-op）
+        let mut hm = HMInference::new();
+        let int_ty = Type::Int;
+        let result = hm.instantiate_if_forall(&int_ty);
+        assert_eq!(result, Type::Int);
+        // 复合类型（List/Dict）也不变
+        let list_ty = Type::List(Box::new(Type::Int));
+        let result = hm.instantiate_if_forall(&list_ty);
+        assert_eq!(result, Type::List(Box::new(Type::Int)));
+    }
+
+    #[test]
+    fn instantiate_if_forall_produces_fresh_copy_when_forall() {
+        // ForAll 输入 → 每次实例化一份 fresh 副本（标准 HM let-polymorphism）
+        // 关键不变量：内层 TypeVar 名字必须 fresh（不等同于原 vars）
+        let mut hm = HMInference::new();
+        // 构造 ForAll['a].TypeVar('a) — 最简单的泛型量化
+        let forall = Type::ForAll(vec!['a'], Box::new(Type::TypeVar('a')));
+        let result1 = hm.instantiate_if_forall(&forall);
+        let result2 = hm.instantiate_if_forall(&forall);
+        // 两次调用产出独立 TypeVar（名字不同）
+        match (&result1, &result2) {
+            (Type::TypeVar(c1), Type::TypeVar(c2)) => {
+                assert_ne!(c1, c2, "两次实例化必须产出 fresh TypeVar");
+            }
+            _ => panic!("expected TypeVar after instantiate"),
+        }
     }
 }

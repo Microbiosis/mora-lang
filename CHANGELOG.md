@@ -11,6 +11,82 @@ All notable changes to Mora will be documented in this file.
 需要查阅 v0.13 → v0.30 历史的请通过 `git log --grep='v0\.' --reverse`
 按 commit 主题回溯；该区间仅作为工程债处理记录保留在 git 历史中。
 
+## [v0.76.02] — 2026-08-09 — typeck: WitnessPattern 5 变体 typeck 增量
+
+**目的**（架构审查报告 v0.75.90 🟡 警告级风险）：
+> `WitnessPattern` 5 变体（Tuple / List / Dict / TypeAscription / Variable）
+> typeck 路径完全是 0 行——`infer_match` 忽略 arm.pattern
+> → 强类型化若启用双向，外部 8 个调用点（v0.75.95 切到 _bidirectional）
+>    全部需要切换
+> → 风险高（v0.75.87 撤除 match exhaustiveness 前车之鉴）：不覆盖全可能重蹈撤除
+
+**变更**：
+- `src/typeck/hm/infer.rs`：
+  * 新增 `infer_pattern(&WitnessPattern, &Type, Span) -> Result<(), Vec<TypeError>>`
+  * `infer_match` 改造：在 `infer_expr(&arm.body)` 之前先 `self.infer_pattern(&arm.pattern, &scrutinee_ty, span)?`
+  * 5 变体分支：
+    - **Wildcard / Variable / Literal**: no-op
+    - **Tuple**: 元素数必须 = scrutinee 元素数（Mora Type enum 无 Tuple variant——
+      实际使用是 List scrutinee 上的"按位置解构"；保守路径：非 List 视为 1 元素）
+    - **List { head, tail }**: head/tail 共享 scrutinee 元素类型推断
+    - **Dict { required, rest }**: required 键 value subpattern 推断；rest 仅 bool 标记（v0.76.02 最小版本不动 rest 子 pattern）
+    - **TypeAscription { name, pattern }**: name 必须 `is_known_type`；pattern 在 scrutinee 上下文下递归
+- 加 7 个测试（`hm/infer.rs::tests`）：
+  * `pattern_wildcard_always_succeeds`
+  * `pattern_variable_always_succeeds`
+  * `pattern_tuple_non_list_scrutinee_errors`
+  * `pattern_list_head_tail_succeeds`
+  * `pattern_dict_required_keys_succeeds`
+  * `pattern_typeascription_unknown_name_errors`
+  * `pattern_typeascription_known_name_succeeds`
+
+**测试**：683 passed; 0 failed; 13 ignored（676 旧 + 7 新增 = 683）
+
+**收益**：
+- 5 变体 typeck 路径 0 行 → 完整覆盖
+- match pattern 类型检查基石建立（v0.75.87 撤除 match exhaustiveness 后
+  第一次有完整 typeck 链路）
+- 7 个测试覆盖核心路径（Wildcard/Variable/Literal no-op + Tuple/List/
+  Dict/TypeAscription 实际推断）
+
+**未变**：
+- infer_match arm body type 检查逻辑（line 372-381）
+- any/Unknown v0.75.91-92 fail-fast 语义
+- 现有双向 fallback 抑制机制（DiagFilter，v0.75.94）
+- WitnessParam typeck 检查路径
+- tuple pattern 的"按位置解构"完整语义（v0.76.02 最小版本仅元素数验证）
+
+**下一步路径**（不在本次范围）：
+- v0.76.03: Dict rest 子 pattern 完整推断
+- v0.76.04: Tuple pattern 按 List 元素位置 subpattern 推断
+- v0.76.05: v0.75.87 撤除 match exhaustiveness 复检（5 变体 + fallback 机制已就位）
+- v0.76.10: 完整 match pattern 类型检查上线
+
+## [v0.76.01] — 2026-08-09 — docs/decisions: LLM Config Cascade 草案
+
+**目的**：借鉴 NOOA 5 级 cascade 思想（`@stone-from-other-hills` 调研确认），
+为 Mora `route / observe / record / replay` 字面量设计显式 5 级配置 cascade：
+1. inline literal → 2. call-site override → 3. module default →
+4. project.toml → 5. env var
+
+**变更**：
+- 新建 `docs/decisions/llm-config-cascade.md`（force-add，`docs/` 被 .gitignore）：
+  * 目标 / 5 级映射 / 采纳制（不强制）/ 关键设计决策
+  * 4 个风险等级 + MoraError::ConfigNotFound 错误路径
+  * 关联：no-borrowed-constraints / diag-filter-extraction / 架构审查报告
+  * 关闭条件：实现 / 拒绝 / 4 年未动
+
+**未变**：
+- 现有 `route / observe / record / replay` 字面量签名
+- 现有 env var 读路径
+- 7 个独立 Error 类型
+- HM 推断 + 双向定型
+
+**下一步路径**：
+- v0.76.02: 实现 `MoraError::ConfigNotFound` + AIBound 标签（如采纳）
+- v0.76.03: 实现 cascade 解析（如采纳）
+- v0.76.04: 实现 `doc()` builtin（如采纳）
+
 ## [v0.76.00] — 2026-08-08 — error: MoraError 推进（flow.rs 4 函数 + 18 caller 适配）
 
 **目的**（延续 v0.75.98/99）：MoraError 统一计划第三次推进——从 typeck / http_server / compress

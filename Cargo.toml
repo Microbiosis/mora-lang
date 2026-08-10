@@ -80,7 +80,8 @@ pdf-extract = "0.12"
 # Markdown 后端
 pulldown-cmark = "0.13"
 # HTML 后端
-quick-xml = "0.40"
+# v0.76.07: 升级 quick-xml ≥ 0.41（Mimosa 扫描：2 个 HIGH CVE 修复）
+quick-xml = "0.41"
 # v0.50: Checkpoint persistence (Worker 3)
 uuid = { version = "1", features = ["v4"] }
 rusqlite = { version = "0.32", optional = true, features = ["bundled"] }

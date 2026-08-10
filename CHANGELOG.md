@@ -11,6 +11,47 @@ All notable changes to Mora will be documented in this file.
 需要查阅 v0.13 → v0.30 历史的请通过 `git log --grep='v0\.' --reverse`
 按 commit 主题回溯；该区间仅作为工程债处理记录保留在 git 历史中。
 
+## [v0.76.07] — 2026-08-10 — deps: 修复 Mimosa 扫描依赖漏洞（quick-xml + crossbeam-epoch）
+
+**目的**：Mimosa 依赖审计报告 P0/P1：
+- P0: 升级 quick-xml ≥ 0.41（2 个 HIGH CVE）
+- P1: 升级 crossbeam-epoch ≥ 0.9.20（MEDIUM CVE）
+- P2: 评估 undoc / lopdf / ocrs 升级
+
+**变更**：
+- `Cargo.toml`：`quick-xml = "0.40"` → `"0.41"`
+- `Cargo.lock`（`cargo update -p crossbeam-epoch`）：
+  * `crossbeam-epoch 0.9.18` → `0.9.20`（MEDIUM CVE 修复）
+  * `quick-xml 0.40.1` → `0.41.0`（HIGH CVE 修复，2 个）
+
+**评估**（P2 项）：
+- `undoc 0.5.2` → **不升**：0.5 → 0.8 跨 major API 破坏（feature flags 重命名如 `/docx`），保守
+  副作用：`undoc 0.5.2` 仍依赖 transitive `quick-xml 0.37.5`（HIGH CVE）——该 0.37.5 链通过 undoc 唯一**未能完全消除**
+- `ocrs 0.12.2` → **不升**：已是最新（cargo search 验证）
+- `lopdf 0.42` → **不升**：Mimosa 报告 P2 评估级；lopdf 0.42 本身不依赖 quick-xml（PDF 处理无 XML）
+
+**测试**：687 passed; 0 failed; 13 ignored（与 v0.76.06 完全一致——零行为变化）
+
+**风险**：
+- `undoc` 仍依赖 `quick-xml 0.37.5`（transitive CVE 未完全消除）—— 后续 `undoc` 大版本迁移时
+  必须同时升级 `quick-xml` 链。Mimosa 下次扫描时这条会再次出现。
+- `undoc` API 0.5 → 0.8 跨 major 改动面：docx/pptx feature API 重命名——按 §6「最小修改」原则
+  暂不主动迁移，等 `undoc` 0.5 不可维护或 API 必须用时再 v0.76.x 单独 commit。
+
+**未变**：
+- 任何 Mora 代码（v0.76.06 record replay warning 仍是 HEAD）
+- 7 条🔴阻断 + 5 条🟡警告 + 3 条🟢建议——架构审查报告 v0.75.90 全部状态
+- 7 个独立 Error 类型
+- typeck/HM/Mir/VM/JIT 路径
+
+**采纳制**（延续 `docs/decisions/no-borrowed-constraints.md`）：
+- Mimosa 报告 P0/P1 修复执行（安全维护必需）
+- Mimosa P2 评估保留（不升跨 major 依赖——避免引入借鉴项目硬约束）
+
+**下一步路径**：
+- 下次 Mimosa 扫描验证 quick-xml 0.37.5 transitive 是否通过 `undoc` 持续残留
+- `undoc` 0.8 迁移（v0.77.0+ 单独 commit，feature API 重命名适配）
+
 ## [v0.76.06] — 2026-08-10 — record: replay 签名漂移 warning
 
 **目的**（延续 v0.76.05）：

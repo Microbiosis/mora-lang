@@ -124,6 +124,8 @@ pub struct Recorder {
     // kind: "ai.chat" | "web.fetch"
     // key: model+prompt_hash (ai) 或 url (web)
     index: HashMap<(String, String), RecordedResponse>,
+    /// v0.76.06: 签名漂移 warning 收集（replay 时签名不匹配 push 警告）
+    pub warnings: Vec<String>,
 }
 
 impl Recorder {
@@ -133,6 +135,7 @@ impl Recorder {
             events: Vec::new(),
             next_id: 1,
             index: HashMap::new(),
+            warnings: Vec::new(),
         }
     }
 
@@ -151,6 +154,7 @@ impl Recorder {
             events: Vec::new(),
             next_id: 1,
             index: HashMap::new(),
+            warnings: Vec::new(),
         })
     }
 
@@ -167,6 +171,7 @@ impl Recorder {
             events,
             next_id: 0,
             index,
+            warnings: Vec::new(),
         })
     }
 
@@ -195,12 +200,12 @@ impl Recorder {
     }
 
     /// 重放: 查找 ai.chat 的录制响应
-    /// 重放: 查找 ai.chat 的录制响应
     /// v0.76.05: `current_arg_signature` 为当前函数签名（typeck::Type 可读化）。
-    /// 与录制时的签名不匹配时返 None（按"签名漂移 = 当作没匹配"原则，
-    /// v0.76.07 单独 commit 加显式 warning）。
+    /// 与录制时的签名不匹配时返 None（按"签名漂移 = 当作没匹配"原则）。
+    /// v0.76.06: 签名漂移时 push warning 到 `self.warnings`（不报 error——
+    /// 静默返 None 用户的体验与 v0.76.05 一致，但能看到 warning）。
     pub fn lookup_ai_chat(
-        &self,
+        &mut self,
         model: &str,
         prompt: &str,
         current_arg_signature: &str,
@@ -212,6 +217,11 @@ impl Recorder {
         let rec = self.index.get(&("ai.chat".to_string(), key))?;
         // v0.76.05: 签名校验——录制与当前签名不一致 = 不匹配
         if rec.arg_signature != current_arg_signature {
+            // v0.76.06: 签名漂移 warning
+            self.warnings.push(format!(
+                "ai.chat({}) 签名漂移: 录制 '{}' vs 当前 '{}'",
+                model, rec.arg_signature, current_arg_signature
+            ));
             return None;
         }
         Some(rec.clone())
@@ -219,8 +229,9 @@ impl Recorder {
 
     /// 重放: 查找 web.fetch 的录制响应
     /// v0.76.05: 同上——`current_arg_signature` 签名校验
+    /// v0.76.06: 同上——签名漂移时 push warning
     pub fn lookup_web_fetch(
-        &self,
+        &mut self,
         url: &str,
         current_arg_signature: &str,
     ) -> Option<RecordedResponse> {
@@ -232,6 +243,11 @@ impl Recorder {
             .get(&("web.fetch".to_string(), url.to_string()))?;
         // v0.76.05: 签名校验
         if rec.arg_signature != current_arg_signature {
+            // v0.76.06: 签名漂移 warning
+            self.warnings.push(format!(
+                "web.fetch({}) 签名漂移: 录制 '{}' vs 当前 '{}'",
+                url, rec.arg_signature, current_arg_signature
+            ));
             return None;
         }
         Some(rec.clone())

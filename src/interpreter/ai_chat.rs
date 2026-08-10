@@ -170,7 +170,7 @@ impl Interpreter {
             .map(|(role, content)| format!("{}: {}", role, content))
             .collect::<Vec<_>>()
             .join("\n");
-        if let Some(rec) = self.infra.recorder.lookup_ai_chat(
+        if let Some(rec) = self.infra.recorder_mut().lookup_ai_chat(
             model,
             &prompt_text,
             "ai.chat(model: string, prompt: string) -> string",

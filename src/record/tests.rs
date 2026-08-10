@@ -62,7 +62,7 @@ fn record_roundtrip() {
     r.save().unwrap();
 
     // load + replay
-    let r2 = Recorder::new_replay(path.clone()).unwrap();
+    let mut r2 = Recorder::new_replay(path.clone()).unwrap();
     assert!(r2.mode().is_replay());
     assert_eq!(r2.events().len(), 3);
     // lookup ai.chat
@@ -98,7 +98,7 @@ fn replay_missing_returns_none() {
     );
     r.save().unwrap();
 
-    let r2 = Recorder::new_replay(path.clone()).unwrap();
+    let mut r2 = Recorder::new_replay(path.clone()).unwrap();
     // 询问不同 prompt → 找不到
     let resp = r2.lookup_ai_chat("gpt-4o", "second", "test_sig");
     assert!(resp.is_none());
@@ -706,7 +706,7 @@ fn schema_lookup_ai_chat_mismatch_returns_none() {
         "ai.chat(model: string, prompt: string) -> string".into(),
     );
     r.save().unwrap();
-    let r2 = Recorder::new_replay(path).unwrap();
+    let mut r2 = Recorder::new_replay(path).unwrap();
     // 当前签名与录制签名不同 → 返 None
     let resp = r2.lookup_ai_chat(
         "gpt-4o",
@@ -732,7 +732,7 @@ fn schema_lookup_ai_chat_match_returns_some() {
         "ai.chat(model: string, prompt: string) -> string".into(),
     );
     r.save().unwrap();
-    let r2 = Recorder::new_replay(path).unwrap();
+    let mut r2 = Recorder::new_replay(path).unwrap();
     let resp = r2.lookup_ai_chat(
         "gpt-4o",
         "hello",
@@ -755,10 +755,42 @@ fn schema_lookup_web_fetch_mismatch_returns_none() {
         "web.fetch(url: string, opts: Dict) -> string".into(),
     );
     r.save().unwrap();
-    let r2 = Recorder::new_replay(path).unwrap();
+    let mut r2 = Recorder::new_replay(path).unwrap();
     let resp = r2.lookup_web_fetch(
         "https://x.com",
         "web.fetch(url: string, headers: Dict, opts: Dict) -> string",
     );
     assert!(resp.is_none(), "签名不匹配应返 None");
+}
+
+#[test]
+fn schema_mismatch_pushes_warning() {
+    // v0.76.06: 签名漂移时不仅返 None，还 push warning 到 self.warnings
+    let path = schema_test_path("warning");
+    let mut r = Recorder::new_record(path.clone()).unwrap();
+    r.record_ai_chat(
+        "gpt-4o".into(),
+        "hello".into(),
+        "world".into(),
+        10,
+        5,
+        100,
+        None,
+        "ai.chat(model: string, prompt: string) -> string".into(),
+    );
+    r.save().unwrap();
+    let mut r2 = Recorder::new_replay(path).unwrap();
+    assert!(r2.warnings.is_empty(), "replay 开始时无 warning");
+    let resp = r2.lookup_ai_chat(
+        "gpt-4o",
+        "hello",
+        "ai.chat(model: string, prompt: string, options: Dict) -> string",
+    );
+    assert!(resp.is_none(), "签名不匹配应返 None");
+    assert_eq!(r2.warnings.len(), 1, "签名漂移应 push 1 个 warning");
+    assert!(
+        r2.warnings[0].contains("签名漂移"),
+        "warning 应含「签名漂移」"
+    );
+    assert!(r2.warnings[0].contains("gpt-4o"), "warning 应含模型名");
 }

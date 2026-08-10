@@ -27,6 +27,7 @@ fn recorder_off_is_noop() {
         1,
         100,
         None,
+        "test_sig".to_string(),
     );
     assert_eq!(r.events().len(), 0); // off 模式不录制
 }
@@ -46,6 +47,7 @@ fn record_roundtrip() {
         7,
         123,
         None,
+        "test_sig".to_string(),
     );
     r.record_web_fetch(
         "https://example.com/api".to_string(),
@@ -54,6 +56,7 @@ fn record_roundtrip() {
         1024,
         45,
         None,
+        "test_sig".to_string(),
     );
     r.record_note("test note".to_string());
     r.save().unwrap();
@@ -91,6 +94,7 @@ fn replay_missing_returns_none() {
         1,
         50,
         None,
+        "test_sig".to_string(),
     );
     r.save().unwrap();
 
@@ -123,11 +127,29 @@ fn diff_identical_recordings() {
     let _ = fs::remove_file(&path_b);
 
     let mut a = Recorder::new_record(path_a.clone()).unwrap();
-    a.record_ai_chat("m".into(), "p".into(), "r".into(), 1, 1, 10, None);
+    a.record_ai_chat(
+        "m".into(),
+        "p".into(),
+        "r".into(),
+        1,
+        1,
+        10,
+        None,
+        "test_sig".to_string(),
+    );
     a.save().unwrap();
 
     let mut b = Recorder::new_record(path_b.clone()).unwrap();
-    b.record_ai_chat("m".into(), "p".into(), "r".into(), 1, 1, 10, None);
+    b.record_ai_chat(
+        "m".into(),
+        "p".into(),
+        "r".into(),
+        1,
+        1,
+        10,
+        None,
+        "test_sig".to_string(),
+    );
     b.save().unwrap();
 
     let ra = Recorder::new_replay(path_a.clone()).unwrap();
@@ -156,6 +178,7 @@ fn diff_changed_response() {
         1,
         10,
         None,
+        "test_sig".to_string(),
     );
     a.save().unwrap();
 
@@ -168,6 +191,7 @@ fn diff_changed_response() {
         2,
         20,
         None,
+        "test_sig".to_string(),
     );
     b.save().unwrap();
 
@@ -192,7 +216,16 @@ fn diff_only_in_b() {
     a.save().unwrap(); // empty
 
     let mut b = Recorder::new_record(path_b.clone()).unwrap();
-    b.record_ai_chat("m".into(), "p".into(), "r".into(), 1, 1, 10, None);
+    b.record_ai_chat(
+        "m".into(),
+        "p".into(),
+        "r".into(),
+        1,
+        1,
+        10,
+        None,
+        "test_sig".to_string(),
+    );
     b.save().unwrap();
 
     let ra = Recorder::new_replay(path_a.clone()).unwrap();
@@ -230,7 +263,16 @@ fn list_recordings_finds_files() {
     let mut path = dir.clone();
     path.push("test-rec.jsonl");
     let mut r = Recorder::new_record(path).unwrap();
-    r.record_ai_chat("m".into(), "p".into(), "r".into(), 1, 1, 10, None);
+    r.record_ai_chat(
+        "m".into(),
+        "p".into(),
+        "r".into(),
+        1,
+        1,
+        10,
+        None,
+        "test_sig".to_string(),
+    );
     r.save().unwrap();
 
     let result = list_recordings(&dir).unwrap();
@@ -246,7 +288,16 @@ fn compute_stats_basic() {
     let path = tmp_path("stats");
     let _ = fs::remove_file(&path);
     let mut r = Recorder::new_record(path.clone()).unwrap();
-    r.record_ai_chat("gpt-4o".into(), "p".into(), "r".into(), 100, 50, 200, None);
+    r.record_ai_chat(
+        "gpt-4o".into(),
+        "p".into(),
+        "r".into(),
+        100,
+        50,
+        200,
+        None,
+        "test_sig".to_string(),
+    );
     r.record_ai_chat(
         "gpt-4o".into(),
         "p2".into(),
@@ -255,8 +306,17 @@ fn compute_stats_basic() {
         100,
         300,
         None,
+        "test_sig".to_string(),
     );
-    r.record_web_fetch("https://x.com".into(), "GET".into(), 200, 1024, 50, None);
+    r.record_web_fetch(
+        "https://x.com".into(),
+        "GET".into(),
+        200,
+        1024,
+        50,
+        None,
+        "test_sig".to_string(),
+    );
     r.record_note("test".into());
     r.save().unwrap();
 
@@ -295,6 +355,7 @@ fn export_jsonl_roundtrip() {
         tokens_out: 5,
         latency_ms: 100,
         error: None,
+        arg_signature: "".into(),
     }];
     let jsonl = export_recording(&events, &ExportFormat::Jsonl, "test");
     assert!(jsonl.contains("\"kind\":\"ai.chat\""));
@@ -314,6 +375,7 @@ fn export_markdown_has_table() {
         tokens_out: 5,
         latency_ms: 100,
         error: None,
+        arg_signature: "".into(),
     }];
     let md = export_recording(&events, &ExportFormat::Markdown, "test");
     assert!(md.contains("# Recording: test"));
@@ -351,6 +413,7 @@ fn snapshot_roundtrip() {
         tokens_out: 5,
         latency_ms: 100,
         error: None,
+        arg_signature: "".into(),
     }];
     let snap = create_snapshot("test", &events);
     let jsonl = snapshot_to_jsonl(&snap);
@@ -373,6 +436,7 @@ fn snapshot_diff_match() {
         tokens_out: 5,
         latency_ms: 100,
         error: None,
+        arg_signature: "".into(),
     }];
     let snap = create_snapshot("test", &events);
     let diffs = diff_snapshot(&snap, &events);
@@ -393,6 +457,7 @@ fn snapshot_diff_changed() {
         tokens_out: 5,
         latency_ms: 100,
         error: None,
+        arg_signature: "".into(),
     }];
     let events_b = vec![Event::AiChat {
         id: 1,
@@ -405,6 +470,7 @@ fn snapshot_diff_changed() {
         tokens_out: 10,
         latency_ms: 200,
         error: None,
+        arg_signature: "".into(),
     }];
     let snap = create_snapshot("test", &events_a);
     let diffs = diff_snapshot(&snap, &events_b);
@@ -429,6 +495,7 @@ fn snapshot_diff_missing_event() {
             tokens_out: 5,
             latency_ms: 100,
             error: None,
+            arg_signature: "".into(),
         },
         Event::Note {
             id: 2,
@@ -447,6 +514,7 @@ fn snapshot_diff_missing_event() {
         tokens_out: 5,
         latency_ms: 100,
         error: None,
+        arg_signature: "".into(),
     }];
     let snap = create_snapshot("test", &events_a);
     let diffs = diff_snapshot(&snap, &events_b);
@@ -470,6 +538,7 @@ fn generate_report_basic() {
         tokens_out: 5,
         latency_ms: 100,
         error: None,
+        arg_signature: "".into(),
     }];
     let report = generate_report(
         &events,
@@ -515,6 +584,7 @@ fn audit_recording_clean() {
         tokens_out: 5,
         latency_ms: 100,
         error: None,
+        arg_signature: "".into(),
     }];
     let findings = audit_recording(&events, &[]);
     assert_eq!(findings.len(), 0);
@@ -533,6 +603,7 @@ fn audit_recording_finds_sk_key() {
         tokens_out: 5,
         latency_ms: 100,
         error: None,
+        arg_signature: "".into(),
     }];
     let findings = audit_recording(&events, &[]);
     assert!(!findings.is_empty());
@@ -552,6 +623,7 @@ fn audit_recording_respects_ignore_rules() {
         tokens_out: 5,
         latency_ms: 100,
         error: None,
+        arg_signature: "".into(),
     }];
     let rules = vec![IgnoreRule::Pattern("sk-".to_string())];
     let findings = audit_recording(&events, &rules);
@@ -579,6 +651,7 @@ fn build_timeline_basic() {
             tokens_out: 5,
             latency_ms: 100,
             error: None,
+            arg_signature: "".into(),
         },
         Event::Note {
             id: 2,

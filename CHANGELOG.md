@@ -11,6 +11,48 @@ All notable changes to Mora will be documented in this file.
 需要查阅 v0.13 → v0.30 历史的请通过 `git log --grep='v0\.' --reverse`
 按 commit 主题回溯；该区间仅作为工程债处理记录保留在 git 历史中。
 
+## [v0.76.04] — 2026-08-10 — record: arg_signature 元数据（typeck::Type 可读化签名）
+
+**目的**（架构审查报告 v0.75.90 🟡 警告级风险）：
+> record 不验证类型 replay 完整性
+> → 加 record::Schema 元数据层（带 typeck::Type hash），replay 时校验
+> → 为 LSP signature help / 跨脚本类型传播奠基
+
+**变更**：
+- `src/record/mod.rs` `Event::AiChat` + `Event::WebFetch` 加字段：
+  * `arg_signature: String`（typeck::Type 可读化签名）
+  * 例如 `"ai.chat(model: string, prompt: string) -> string"`
+  * `"web.fetch(url: string, opts: Dict) -> string"`
+- `src/interpreter/ai_chat.rs` 4 处 caller 适配（3 处 `record_ai_chat` + 1 处 `record_web_fetch`）
+- `src/record/serialization.rs` 反序列化时 `arg_signature` 字段读取（旧 JSONL 记录无此字段→空串兼容）
+- `src/record/tests.rs` 测试夹具加 arg_signature 参数
+
+**v0.76.04 最小版本**（按 §6 最小修改原则）：
+- `arg_signature` 仅**记录**——**不**强制 replay 时校验（v0.76.04+ 后续 commit 单独加）
+- 不引入 typeck::Type 稳定 hash 函数（Mora 当前 typeck::Type 无 hash 实现）
+- 不改 lookup_ai_chat / lookup_web_fetch 接口（向后兼容）
+- 反序列化旧记录无 arg_signature 字段→空串兼容（无损）
+
+**测试**：683 passed; 0 failed; 13 ignored（与 v0.76.03 一致——零回归）
+
+**收益**：
+- 录制元数据完整化（未来可序列化到 JSONL 当 LSP signature help 基础）
+- 风险路径识别（用户改函数签名后能看出录制时签名 vs 当前签名 diff）
+- 为后续 v0.76.05+「replay 时签名校验」奠基
+
+**未变**：
+- 任何 `Result<T, String>` 路径（仍用 String error——MoraError 推进后续 commit）
+- record 核心 `record / lookup_* / save` 接口签名
+- 反序列化 JSONL 格式（旧记录完全兼容）
+- 7 个独立 Error 类型
+- record/replay 时间线、analysis、audit、diff、snapshot 行为零变化
+
+**下一步路径**（不在本次范围）：
+- v0.76.05: replay 时签名校验（lookup_ai_chat 加 current_arg_signature 参数，不匹配返 None + 警告）
+- v0.76.06: typeck::Type::hash 实现 + arg_signature 改用 typeck hash 而非手工字符串
+- v0.76.07: arg_signature 序列化到 JSONL（向后兼容旧记录）
+- v0.76.10: 完整 record::Schema 元数据层上线（hash + version + arg + return）
+
 ## [v0.76.03] — 2026-08-10 — jit: 检视 Any fallback 风险项（结论：已规避，注释同步）
 
 **目的**（架构审查报告 v0.75.90 🟡 警告级风险 11）：

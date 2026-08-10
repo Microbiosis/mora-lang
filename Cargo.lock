@@ -203,6 +203,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "cfb"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d8a4f8e55be323b378facfcf1f06aa97f6ec17cf4ac84fb17325093aaf62da41"
+dependencies = [
+ "byteorder",
+ "fnv",
+ "uuid",
+]
+
+[[package]]
 name = "cff-parser"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -976,7 +987,7 @@ dependencies = [
  "pdf-extract",
  "proptest",
  "pulldown-cmark",
- "quick-xml 0.41.0",
+ "quick-xml",
  "rten",
  "rusqlite",
  "sha2 0.10.9",
@@ -1228,16 +1239,6 @@ name = "quick-error"
 version = "1.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a1d01941d82fa2ab50be1e79e6714289dd7cde78eba4c074bc5a4374f650dfe0"
-
-[[package]]
-name = "quick-xml"
-version = "0.37.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "331e97a1af0bf59823e6eadffe373d7b27f485be8748f71471c662c1f269b7fb"
-dependencies = [
- "memchr",
- "serde",
-]
 
 [[package]]
 name = "quick-xml"
@@ -1858,15 +1859,23 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "eaea85b334db583fe3274d12b4cd1880032beab409c0d774be044d4480ab9a94"
 
 [[package]]
-name = "undoc"
-version = "0.5.2"
+name = "uncore"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "52facf7bfa5b449b1ffd4e534aa3dfe89203ee2765a3c55f832a39ac29bdc88e"
+checksum = "a7b3c5d5402af48b31a5631b055de44fe97ddede8f7876c36b2e6ea23e1dd503"
+
+[[package]]
+name = "undoc"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a80bad1ed6a84d19bfe1690c7866aaef5970101716b4c367bd4759bba4a5fe25"
 dependencies = [
- "quick-xml 0.37.5",
+ "cfb",
+ "quick-xml",
  "serde",
  "serde_json",
  "thiserror",
+ "uncore",
  "unicode-normalization",
  "unicode-width",
  "zip",

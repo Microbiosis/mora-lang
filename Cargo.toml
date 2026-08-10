@@ -75,7 +75,8 @@ anyhow = "1"
 image = { version = "0.24", default-features = false, features = ["png"] }
 # v0.27: Document 统一 IR
 # PDF 后端
-lopdf = "0.42"
+# v0.76.08: 升级 lopdf 0.42 → 0.44（Mimosa P2 评估级——minor 跳，零跨 major 风险）
+lopdf = "0.44"
 pdf-extract = "0.12"
 # Markdown 后端
 pulldown-cmark = "0.13"

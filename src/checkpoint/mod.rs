@@ -1,6 +1,6 @@
 //! v0.50: Checkpoint persistence layer for Pregel BSP execution engine.
 //!
-//! Provides `CheckpointSaver` trait with two backends:
+//! v0.76.10: `Result<_, String>` → `Result<_, MoraError>`（MoraError 统一计划推进）
 //! - `MemorySaver`: in-memory storage for testing and ephemeral workflows
 //! - `SqliteSaver` (feature `checkpoint-sqlite`): file-backed durable storage
 //!
@@ -8,6 +8,7 @@
 //! hand-written via `flow::value_to_json` / `flow::json_to_value` to avoid
 //! introducing a serde dependency (consistent with v0.11+ design).
 
+use crate::error::MoraError;
 use crate::flow::{json_to_value, value_to_json};
 use crate::value::Value;
 use std::collections::HashMap;
@@ -288,7 +289,7 @@ impl Checkpoint {
 /// Pregel engine threads via `Arc<dyn CheckpointSaver>`.
 pub trait CheckpointSaver: Send + Sync {
     /// Persist a checkpoint.
-    fn save(&self, thread_id: &str, checkpoint: &Checkpoint) -> Result<(), String>;
+    fn save(&self, thread_id: &str, checkpoint: &Checkpoint) -> Result<(), MoraError>;
 
     /// Load a checkpoint by ID. If `checkpoint_id` is `None`, returns the
     /// latest checkpoint for the thread (highest `step`).
@@ -296,13 +297,13 @@ pub trait CheckpointSaver: Send + Sync {
         &self,
         thread_id: &str,
         checkpoint_id: Option<&str>,
-    ) -> Result<Option<Checkpoint>, String>;
+    ) -> Result<Option<Checkpoint>, MoraError>;
 
     /// List all checkpoint IDs for a thread, ordered by step ascending.
-    fn list(&self, thread_id: &str) -> Result<Vec<String>, String>;
+    fn list(&self, thread_id: &str) -> Result<Vec<String>, MoraError>;
 
     /// Delete a checkpoint by ID.
-    fn delete(&self, thread_id: &str, checkpoint_id: &str) -> Result<(), String>;
+    fn delete(&self, thread_id: &str, checkpoint_id: &str) -> Result<(), MoraError>;
 }
 
 // ============================================================
@@ -317,7 +318,7 @@ pub fn rewind(
     saver: &dyn CheckpointSaver,
     thread_id: &str,
     before_step: usize,
-) -> Result<(), String> {
+) -> Result<(), MoraError> {
     let ids = saver.list(thread_id)?;
     for id in ids {
         if let Some(cp) = saver.load(thread_id, Some(&id))?

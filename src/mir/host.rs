@@ -60,7 +60,10 @@ pub trait MirHost {
     /// checkpoint saver（`h_orchestrate` 注入 Pregel 引擎）。
     fn checkpoint_saver(&self) -> Option<Arc<dyn CheckpointSaver>>;
     /// 从 saver 恢复 checkpoint（`h_orchestrate`）。
-    fn load_checkpoint(&self, thread_id: &str) -> Result<Option<Checkpoint>, String>;
+    fn load_checkpoint(
+        &self,
+        thread_id: &str,
+    ) -> Result<Option<Checkpoint>, crate::error::MoraError>;
     /// trait 注册表（`h_trait_def` 用 `Arc::make_mut` 写入）。
     fn trait_registry(&mut self) -> &mut Arc<HashMap<String, TraitInfo>>;
     /// impl 表（`h_impl_def` 用 `Arc::make_mut` 写入）。

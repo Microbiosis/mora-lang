@@ -16,6 +16,7 @@
 //! ```
 
 use super::{Checkpoint, CheckpointSaver};
+use crate::error::MoraError;
 use parking_lot::Mutex;
 use rusqlite::OptionalExtension;
 
@@ -27,8 +28,8 @@ impl SqliteSaver {
     /// Open (or create) a SQLite database at `path` and initialise the schema.
     ///
     /// Use `":memory:"` for an in-memory database (useful in tests).
-    pub fn new(path: &str) -> Result<Self, String> {
-        let conn = rusqlite::Connection::open(path).map_err(|e| e.to_string())?;
+    pub fn new(path: &str) -> Result<Self, MoraError> {
+        let conn = rusqlite::Connection::open(path).map_err(|e| MoraError::Other(e.to_string()))?;
         conn.execute(
             "CREATE TABLE IF NOT EXISTS checkpoints (
                 thread_id     TEXT NOT NULL,
@@ -41,7 +42,7 @@ impl SqliteSaver {
             )",
             rusqlite::params![],
         )
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| MoraError::Other(e.to_string()))?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -49,7 +50,7 @@ impl SqliteSaver {
 }
 
 impl CheckpointSaver for SqliteSaver {
-    fn save(&self, thread_id: &str, checkpoint: &Checkpoint) -> Result<(), String> {
+    fn save(&self, thread_id: &str, checkpoint: &Checkpoint) -> Result<(), MoraError> {
         let data_json = checkpoint.to_json()?;
         let conn = self.conn.lock();
         conn.execute(
@@ -65,7 +66,7 @@ impl CheckpointSaver for SqliteSaver {
                 checkpoint.timestamp_ms as i64,
             ],
         )
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| MoraError::Other(e.to_string()))?;
         Ok(())
     }
 
@@ -73,7 +74,7 @@ impl CheckpointSaver for SqliteSaver {
         &self,
         thread_id: &str,
         checkpoint_id: Option<&str>,
-    ) -> Result<Option<Checkpoint>, String> {
+    ) -> Result<Option<Checkpoint>, MoraError> {
         let conn = self.conn.lock();
         let data_json: Option<String> = if let Some(id) = checkpoint_id {
             conn.query_row(
@@ -106,7 +107,7 @@ impl CheckpointSaver for SqliteSaver {
         }
     }
 
-    fn list(&self, thread_id: &str) -> Result<Vec<String>, String> {
+    fn list(&self, thread_id: &str) -> Result<Vec<String>, MoraError> {
         let conn = self.conn.lock();
         let mut stmt = conn
             .prepare(
@@ -114,23 +115,23 @@ impl CheckpointSaver for SqliteSaver {
                  WHERE thread_id = ?1
                  ORDER BY step ASC",
             )
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| MoraError::Other(e.to_string()))?;
         let ids: Vec<String> = stmt
             .query_map(rusqlite::params![thread_id], |row| row.get(0))
             .map_err(|e| e.to_string())?
             .collect::<Result<Vec<String>, _>>()
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| MoraError::Other(e.to_string()))?;
         Ok(ids)
     }
 
-    fn delete(&self, thread_id: &str, checkpoint_id: &str) -> Result<(), String> {
+    fn delete(&self, thread_id: &str, checkpoint_id: &str) -> Result<(), MoraError> {
         let conn = self.conn.lock();
         conn.execute(
             "DELETE FROM checkpoints
              WHERE thread_id = ?1 AND id = ?2",
             rusqlite::params![thread_id, checkpoint_id],
         )
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| MoraError::Other(e.to_string()))?;
         Ok(())
     }
 }

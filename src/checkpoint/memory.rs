@@ -1,6 +1,7 @@
 //! v0.50: MemorySaver — in-memory checkpoint storage for testing and ephemeral workflows.
 
 use super::{Checkpoint, CheckpointSaver};
+use crate::error::MoraError;
 use parking_lot::Mutex;
 use std::collections::HashMap;
 
@@ -27,7 +28,7 @@ impl MemorySaver {
 }
 
 impl CheckpointSaver for MemorySaver {
-    fn save(&self, thread_id: &str, checkpoint: &Checkpoint) -> Result<(), String> {
+    fn save(&self, thread_id: &str, checkpoint: &Checkpoint) -> Result<(), MoraError> {
         let mut guard = self.checkpoints.lock();
         let entry = guard.entry(thread_id.to_string()).or_default();
         entry.push(checkpoint.clone());
@@ -38,7 +39,7 @@ impl CheckpointSaver for MemorySaver {
         &self,
         thread_id: &str,
         checkpoint_id: Option<&str>,
-    ) -> Result<Option<Checkpoint>, String> {
+    ) -> Result<Option<Checkpoint>, MoraError> {
         let guard = self.checkpoints.lock();
         let entry = match guard.get(thread_id) {
             None => return Ok(None),
@@ -55,7 +56,7 @@ impl CheckpointSaver for MemorySaver {
         }
     }
 
-    fn list(&self, thread_id: &str) -> Result<Vec<String>, String> {
+    fn list(&self, thread_id: &str) -> Result<Vec<String>, MoraError> {
         let guard = self.checkpoints.lock();
         let entry = match guard.get(thread_id) {
             None => return Ok(vec![]),
@@ -74,7 +75,7 @@ impl CheckpointSaver for MemorySaver {
         Ok(ids)
     }
 
-    fn delete(&self, thread_id: &str, checkpoint_id: &str) -> Result<(), String> {
+    fn delete(&self, thread_id: &str, checkpoint_id: &str) -> Result<(), MoraError> {
         let mut guard = self.checkpoints.lock();
         if let Some(entry) = guard.get_mut(thread_id) {
             entry.retain(|cp| cp.id != checkpoint_id);

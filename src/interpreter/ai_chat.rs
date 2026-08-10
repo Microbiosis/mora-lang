@@ -58,7 +58,11 @@ impl Interpreter {
 
     pub(super) fn real_web_fetch(&mut self, url: &str) -> Result<Value, String> {
         // v0.14: 重放模式优先返回录制响应 (deterministic)
-        if let Some(rec) = self.infra.recorder.lookup_web_fetch(url)
+        // v0.76.05: 签名校验——传当前函数签名 arg_signature
+        if let Some(rec) = self
+            .infra
+            .recorder
+            .lookup_web_fetch(url, "web.fetch(url: string, opts: Dict) -> string")
             && let Some(status) = rec.status
         {
             return Ok(Value::String(format!(
@@ -166,7 +170,11 @@ impl Interpreter {
             .map(|(role, content)| format!("{}: {}", role, content))
             .collect::<Vec<_>>()
             .join("\n");
-        if let Some(rec) = self.infra.recorder.lookup_ai_chat(model, &prompt_text) {
+        if let Some(rec) = self.infra.recorder.lookup_ai_chat(
+            model,
+            &prompt_text,
+            "ai.chat(model: string, prompt: string) -> string",
+        ) {
             return Ok(Value::String(rec.response));
         }
 

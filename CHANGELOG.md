@@ -11,6 +11,48 @@ All notable changes to Mora will be documented in this file.
 需要查阅 v0.13 → v0.30 历史的请通过 `git log --grep='v0\.' --reverse`
 按 commit 主题回溯；该区间仅作为工程债处理记录保留在 git 历史中。
 
+## [v0.76.05] — 2026-08-10 — record: replay 签名校验（Schema 元数据应用）
+
+**目的**（延续 v0.76.04 record::Schema 元数据层路径）：
+v0.76.04 仅录制 arg_signature，replay 时不强制校验。
+v0.76.05 补 replay 校验：函数签名漂移时按"签名不匹配 = 当作没匹配"原则返 None。
+
+**变更**：
+- `src/record/mod.rs`：
+  * `RecordedResponse` 加 `arg_signature: String` 字段（v0.76.04 隐式——v0.76.05 显式）
+  * `lookup_ai_chat` 加 `current_arg_signature: &str` 参数 + 签名校验
+  * `lookup_web_fetch` 同上
+  * 校验不匹配 → 返 None（**不**报 error——按"签名漂移 = 当作没匹配"原则）
+- `src/record/serialization.rs`：
+  * `event_to_replay_entry` 构造 `RecordedResponse` 时传入 `arg_signature`
+  * `event_to_jsonl` 序列化 `arg_signature` 字段到 JSONL
+  * 反序列化时读取 `arg_signature`（旧记录无此字段→`unwrap_or_default()` 空串兼容）
+- `src/interpreter/ai_chat.rs` 2 处 caller 适配（lookup 传签名）
+- `src/record/tests.rs` 4 处 lookup 适配 + 3 个新 Schema 校验测试
+
+**测试**：686 passed; 0 failed; 13 ignored（683 旧 + 3 新 Schema 校验 = 686）
+
+**新测试**：
+- `schema_lookup_ai_chat_mismatch_returns_none`——签名漂移返 None
+- `schema_lookup_ai_chat_match_returns_some`——签名匹配返 Some
+- `schema_lookup_web_fetch_mismatch_returns_none`——web.fetch 同样校验
+
+**收益**：
+- record::Schema 元数据层**完整应用**：录制 + 序列化 + replay 校验全链路
+- 用户改函数签名后能立刻看到 replay 不匹配（无需错误）
+- 未来 typeck::Type::hash 实现后可平滑升级——`arg_signature` 改用 typeck hash
+
+**未变**：
+- 任何 `Result<T, String>` 路径（仍用 String error）
+- 7 个独立 Error 类型
+- record/replay 时间线、analysis、audit、diff、snapshot 行为零变化
+- 公共 Record/Replay 接口（`new_record` / `new_replay` / `new_off`）
+
+**下一步路径**（不在本次范围）：
+- v0.76.06: typeck::Type::hash 实现 + arg_signature 改用 typeck hash
+- v0.76.07: replay 签名漂移时显式 warning（v0.76.05 仅静默返 None）
+- v0.76.10: 完整 record::Schema 元数据层（hash + version + arg + return）
+
 ## [v0.76.04] — 2026-08-10 — record: arg_signature 元数据（typeck::Type 可读化签名）
 
 **目的**（架构审查报告 v0.75.90 🟡 警告级风险）：

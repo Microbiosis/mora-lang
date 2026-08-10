@@ -26,11 +26,12 @@ pub(super) fn event_to_jsonl(ev: &Event) -> String {
             tokens_out,
             latency_ms,
             error,
-            // v0.76.04: arg_signature 暂不序列化到 JSONL（仅 record 端保留）
+            // v0.76.05: 序列化 arg_signature 到 JSONL（replay 校验依赖）
+            arg_signature,
             ..
         } => {
             let mut s = format!(
-                r#"{{"kind":"ai.chat","id":{},"ts_ms":{},"model":"{}","prompt_hash":"{}","prompt_preview":"{}","response":"{}","tokens_in":{},"tokens_out":{},"latency_ms":{}"#,
+                r#"{{"kind":"ai.chat","id":{},"ts_ms":{},"model":"{}","prompt_hash":"{}","prompt_preview":"{}","response":"{}","tokens_in":{},"tokens_out":{},"latency_ms":{},"arg_signature":"{}""#,
                 id,
                 ts_ms,
                 esc(model),
@@ -39,7 +40,8 @@ pub(super) fn event_to_jsonl(ev: &Event) -> String {
                 esc(response),
                 tokens_in,
                 tokens_out,
-                latency_ms
+                latency_ms,
+                esc(arg_signature)
             );
             if let Some(e) = error {
                 s.push_str(&format!(r#","error":"{}""#, esc(e)));
@@ -56,18 +58,20 @@ pub(super) fn event_to_jsonl(ev: &Event) -> String {
             body_len,
             latency_ms,
             error,
-            // v0.76.04: arg_signature 暂不序列化
+            // v0.76.05: 序列化 arg_signature
+            arg_signature,
             ..
         } => {
             let mut s = format!(
-                r#"{{"kind":"web.fetch","id":{},"ts_ms":{},"url":"{}","method":"{}","status":{},"body_len":{},"latency_ms":{}"#,
+                r#"{{"kind":"web.fetch","id":{},"ts_ms":{},"url":"{}","method":"{}","status":{},"body_len":{},"latency_ms":{},"arg_signature":"{}""#,
                 id,
                 ts_ms,
                 esc(url),
                 method,
                 status,
                 body_len,
-                latency_ms
+                latency_ms,
+                esc(arg_signature)
             );
             if let Some(e) = error {
                 s.push_str(&format!(r#","error":"{}""#, esc(e)));
@@ -113,6 +117,7 @@ pub(super) fn event_to_replay_entry(ev: &Event) -> Option<(String, String, Recor
             tokens_out,
             latency_ms,
             error,
+            arg_signature,
             ..
         } => {
             if error.is_some() {
@@ -128,6 +133,8 @@ pub(super) fn event_to_replay_entry(ev: &Event) -> Option<(String, String, Recor
                     latency_ms: *latency_ms,
                     status: None,
                     body_len: None,
+                    // v0.76.05: 录制时签名 → replay 校验用
+                    arg_signature: arg_signature.clone(),
                 },
             ))
         }
@@ -137,6 +144,7 @@ pub(super) fn event_to_replay_entry(ev: &Event) -> Option<(String, String, Recor
             body_len,
             latency_ms,
             error,
+            arg_signature,
             ..
         } => {
             if error.is_some() {
@@ -152,6 +160,8 @@ pub(super) fn event_to_replay_entry(ev: &Event) -> Option<(String, String, Recor
                     latency_ms: *latency_ms,
                     status: Some(*status),
                     body_len: Some(*body_len),
+                    // v0.76.05: 录制时签名
+                    arg_signature: arg_signature.clone(),
                 },
             ))
         }

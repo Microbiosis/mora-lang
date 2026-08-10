@@ -214,7 +214,10 @@ impl crate::mir::host::MirHost for Interpreter {
         self.persist.checkpoint_saver()
     }
 
-    fn load_checkpoint(&self, thread_id: &str) -> Result<Option<Checkpoint>, String> {
+    fn load_checkpoint(
+        &self,
+        thread_id: &str,
+    ) -> Result<Option<Checkpoint>, crate::error::MoraError> {
         self.load_checkpoint(thread_id)
     }
 
@@ -401,7 +404,10 @@ impl Interpreter {
     }
 
     /// v0.63: Load the full latest checkpoint for the given thread.
-    pub fn load_checkpoint(&self, thread_id: &str) -> Result<Option<Checkpoint>, String> {
+    pub fn load_checkpoint(
+        &self,
+        thread_id: &str,
+    ) -> Result<Option<Checkpoint>, crate::error::MoraError> {
         if let Some(ref saver) = self.persist.checkpoint_saver {
             saver.load(thread_id, None)
         } else {
@@ -410,10 +416,16 @@ impl Interpreter {
     }
 
     /// v0.66: Persist a checkpoint to the configured saver.
-    pub fn save_checkpoint(&self, thread_id: &str, cp: &Checkpoint) -> Result<(), String> {
+    pub fn save_checkpoint(
+        &self,
+        thread_id: &str,
+        cp: &Checkpoint,
+    ) -> Result<(), crate::error::MoraError> {
         match self.persist.checkpoint_saver() {
             Some(saver) => saver.save(thread_id, cp),
-            None => Err("No checkpoint saver configured".to_string()),
+            None => Err(crate::error::MoraError::Other(
+                "No checkpoint saver configured".to_string(),
+            )),
         }
     }
 

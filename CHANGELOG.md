@@ -11,6 +11,45 @@ All notable changes to Mora will be documented in this file.
 需要查阅 v0.13 → v0.30 历史的请通过 `git log --grep='v0\.' --reverse`
 按 commit 主题回溯；该区间仅作为工程债处理记录保留在 git 历史中。
 
+## [v0.76.10] — 2026-08-11 — error: MoraError 推进（checkpoint/* 全模块）
+
+**目的**（延续 v0.75.98-99 + v0.76.00）：MoraError 统一计划第 5 次推进——
+`src/checkpoint/*` 全模块 `Result<T, String>` → `Result<T, MoraError>`。
+
+**变更**：
+- `src/checkpoint/mod.rs`：
+  * `CheckpointSaver` trait 4 个方法签名 `Result<_, String>` → `Result<_, MoraError>`
+  * `rewind` 公开函数签名同步
+  * `use crate::error::MoraError;` 加 import
+- `src/checkpoint/memory.rs`：
+  * `MemorySaver` 4 个 impl 方法签名同步
+  * `use crate::error::MoraError;` 加 import
+- `src/checkpoint/sqlite.rs`：
+  * `SqliteSaver::new` + 4 个 impl 方法签名同步
+  * 5 处 `.map_err(|e| e.to_string())` → `.map_err(|e| MoraError::Other(e.to_string()))`
+    （rusqlite::Error → String 转换）
+- `src/mir/host.rs`：`MirHost` trait `load_checkpoint` 签名同步
+- `src/interpreter/mod.rs`：
+  * `pub fn load_checkpoint` + `pub fn save_checkpoint` 2 个公开方法签名
+  * 私有 `fn load_checkpoint` trait 实现
+
+**测试**：687 passed; 0 failed; 13 ignored（与 v0.76.09 完全一致——零行为变化）
+
+**收益**：
+- checkpoint 全模块（trait + 2 实现 + interpreter 4 个公开/私有方法）错误统一到 MoraError
+- 全仓 267 处 → **262 处** `Result<T, String>`（累计 5 处迁移：v0.75.98/99 + v0.76.00 + v0.76.10）
+
+**未变**：
+- 任何 `Result<T, String>` 路径（剩 262 处，集中在 `src/document/*` + `src/compress/*` 内部）
+- 7 个独立 Error 类型
+- typeck/HM/Mir/VM/JIT 路径
+- record::Schema 元数据（v0.76.04-06 record replay warning 仍是 HEAD）
+
+**未做**（与本 commit 范围拆分）：
+- record warnings CLI 退出时打印（v0.76.11 单独 commit）
+- `src/document/*` `Result<T, String>` 迁移（v0.76.12 单独 commit）
+- `src/compress/*` 内部 8 处（v0.76.13 单独 commit）
+
 ## [v0.76.09] — 2026-08-11 — deps: 升级 undoc 0.5 → 0.8（跨 3 major 零代码改动）
 
 **目的**：v0.76.08 评估"不升"是错误的保守判断——实际 undoc 0.5 → 0.8

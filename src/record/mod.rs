@@ -60,6 +60,10 @@ impl Mode {
 }
 
 /// 单个录制事件 —— JSONL 一行
+///
+/// v0.76.04: 加 `arg_signature` 字段——录制时记录函数签名（typeck::Type
+/// 可读化），replay 时校验当前函数签名是否与录制一致，避免签名漂移导致
+/// 拿错响应。
 #[derive(Clone, Debug)]
 pub enum Event {
     /// ai.chat 调用
@@ -74,6 +78,8 @@ pub enum Event {
         tokens_out: usize,
         latency_ms: u128,
         error: Option<String>,
+        /// v0.76.04: 函数签名（typeck::Type 可读化）— replay 时校验
+        arg_signature: String,
     },
     /// web.fetch 调用
     WebFetch {
@@ -85,6 +91,8 @@ pub enum Event {
         body_len: usize,
         latency_ms: u128,
         error: Option<String>,
+        /// v0.76.04: 函数签名（typeck::Type 可读化）— replay 时校验
+        arg_signature: String,
     },
     /// 用户/系统 note
     Note {
@@ -252,6 +260,8 @@ impl Recorder {
         tokens_out: usize,
         latency_ms: u128,
         error: Option<String>,
+        // v0.76.04: typeck::Type 可读化签名（参数 + 返回类型 Debug 串）
+        arg_signature: String,
     ) {
         if !self.mode.is_record() {
             return;
@@ -270,10 +280,12 @@ impl Recorder {
             tokens_out,
             latency_ms,
             error,
+            arg_signature,
         });
     }
 
     /// 便利: 录制 web.fetch 事件
+    #[allow(clippy::too_many_arguments)]
     pub fn record_web_fetch(
         &mut self,
         url: String,
@@ -282,6 +294,8 @@ impl Recorder {
         body_len: usize,
         latency_ms: u128,
         error: Option<String>,
+        // v0.76.04: typeck::Type 可读化签名
+        arg_signature: String,
     ) {
         if !self.mode.is_record() {
             return;
@@ -296,6 +310,7 @@ impl Recorder {
             body_len,
             latency_ms,
             error,
+            arg_signature,
         });
     }
 

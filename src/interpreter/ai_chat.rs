@@ -108,6 +108,7 @@ impl Interpreter {
                     Ok(Value::String(text))
                 };
                 // v0.14: 录制成功 fetch (status + body_len)
+                // v0.76.04: arg_signature = 函数签名可读化 (web.fetch(url, opts) -> string)
                 self.infra.recorder.record_web_fetch(
                     url.to_string(),
                     "GET".to_string(),
@@ -119,6 +120,7 @@ impl Interpreter {
                     } else {
                         None
                     },
+                    "web.fetch(url: string, opts: Dict) -> string".to_string(),
                 );
                 result
             }
@@ -126,6 +128,7 @@ impl Interpreter {
             // 其余失败(HostNotFound/Protocol 等)统一兜底
             Err(e) => {
                 let err_str = format!("web.fetch: network error for {}: {}", url, e);
+                // v0.76.04: arg_signature = web.fetch 签名可读化
                 self.infra.recorder.record_web_fetch(
                     url.to_string(),
                     "GET".to_string(),
@@ -133,6 +136,7 @@ impl Interpreter {
                     0,
                     started.elapsed().as_millis(),
                     Some(err_str.clone()),
+                    "web.fetch(url: string, opts: Dict) -> string".to_string(),
                 );
                 Err(err_str)
             }
@@ -195,6 +199,7 @@ impl Interpreter {
         };
         let tokens_in_approx = prompt_text.len() / 4;
         let tokens_out_approx = resp_str.len() / 4;
+        // v0.76.04: arg_signature = ai.chat 签名可读化
         self.infra.recorder.record_ai_chat(
             model.to_string(),
             prompt_text,
@@ -207,6 +212,7 @@ impl Interpreter {
             } else {
                 None
             },
+            "ai.chat(model: string, prompt: string) -> string".to_string(),
         );
         result
     }
@@ -300,6 +306,7 @@ impl Interpreter {
             // 模拟 token 估算
             let tokens_in = messages.iter().map(|(_, c)| c.len()).sum::<usize>() / 4;
             let tokens_out = response.len() / 4;
+            // v0.76.04: arg_signature = ai.chat 签名可读化
             self.infra.recorder.record_ai_chat(
                 model.to_string(),
                 messages
@@ -312,6 +319,7 @@ impl Interpreter {
                 tokens_out,
                 0, // mock 无延迟
                 None,
+                "ai.chat(model: string, prompt: string) -> string".to_string(),
             );
             return Ok(Value::String(response));
         }

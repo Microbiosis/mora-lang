@@ -26,6 +26,8 @@ pub(super) fn event_to_jsonl(ev: &Event) -> String {
             tokens_out,
             latency_ms,
             error,
+            // v0.76.04: arg_signature 暂不序列化到 JSONL（仅 record 端保留）
+            ..
         } => {
             let mut s = format!(
                 r#"{{"kind":"ai.chat","id":{},"ts_ms":{},"model":"{}","prompt_hash":"{}","prompt_preview":"{}","response":"{}","tokens_in":{},"tokens_out":{},"latency_ms":{}"#,
@@ -54,6 +56,8 @@ pub(super) fn event_to_jsonl(ev: &Event) -> String {
             body_len,
             latency_ms,
             error,
+            // v0.76.04: arg_signature 暂不序列化
+            ..
         } => {
             let mut s = format!(
                 r#"{{"kind":"web.fetch","id":{},"ts_ms":{},"url":"{}","method":"{}","status":{},"body_len":{},"latency_ms":{}"#,
@@ -257,6 +261,8 @@ pub(super) fn parse_event_line(line: &str) -> Option<Event> {
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(0),
             error: fields.get("error").cloned(),
+            // v0.76.04: 反序列化 arg_signature（旧记录无此字段→空串兼容）
+            arg_signature: fields.get("arg_signature").cloned().unwrap_or_default(),
         }),
         "web.fetch" => Some(Event::WebFetch {
             id: fields.get("id").and_then(|s| s.parse().ok()).unwrap_or(0),
@@ -279,6 +285,7 @@ pub(super) fn parse_event_line(line: &str) -> Option<Event> {
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(0),
             error: fields.get("error").cloned(),
+            arg_signature: fields.get("arg_signature").cloned().unwrap_or_default(),
         }),
         "note" => Some(Event::Note {
             id: fields.get("id").and_then(|s| s.parse().ok()).unwrap_or(0),

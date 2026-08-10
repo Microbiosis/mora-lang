@@ -11,6 +11,44 @@ All notable changes to Mora will be documented in this file.
 需要查阅 v0.13 → v0.30 历史的请通过 `git log --grep='v0\.' --reverse`
 按 commit 主题回溯；该区间仅作为工程债处理记录保留在 git 历史中。
 
+## [v0.76.08] — 2026-08-11 — deps: 升级 lopdf 0.42 → 0.44（修正 v0.76.07 评估错误）
+
+**目的**：v0.76.07 评估 lopdf 错写"不升"——实际 0.42 → 0.44 minor 跳零跨 major 风险，
+v0.76.07 漏判。重新评估后升 lopdf 0.44.0。
+
+**变更**：
+- `Cargo.toml`：`lopdf = "0.42"` → `"0.44"`
+- `Cargo.lock`（`cargo build` 自动）：`lopdf 0.42.0` → `0.44.0`
+
+**v0.76.07 修正**：
+- 当时评估错误——认为 lopdf 0.42 → 0.44 是跨 major 升级
+- 实际是 minor 跳（0.42 → 0.43 → 0.44），无 API 破坏
+- 0.42 → 0.44 变更**不含** quick-xml 依赖（PDF 处理无 XML 解析）
+- 升级零风险——立即执行
+
+**评估结论**（v0.76.08 重新审视）：
+| 依赖 | 当前 | 最新 | 决定 | 理由 |
+|---|---|---|---|---|
+| `undoc` | 0.5.2 | 0.8.0 | **不升** | 跨 3 个 major（0.5→0.6→0.7→0.8），API 重大变更（feature /docx 重命名）|
+| **`lopdf`** | 0.42.0 | **0.44.0** | **✅ 升** | minor 跳，零跨 major 风险 |
+| `ocrs` | 0.12.2 | 0.12.2 | **不升** | 已是最新 |
+
+**测试**：687 passed; 0 failed; 13 ignored（与 v0.76.07 完全一致——零行为变化）
+
+**残留风险**：
+- `undoc 0.5.2` 仍依赖 transitive `quick-xml 0.37.5`（HIGH CVE 链未消除）——v0.77.x 单独 commit 处理
+- `undoc 0.8` 迁移需 feature API 重命名适配（`/docx` 等）
+
+**未变**：
+- 任何 Mora 代码（v0.76.06 record replay warning 仍是 HEAD）
+- 7 条🔴阻断 + 5 条🟡警告 + 3 条🟢建议——架构审查报告 v0.75.90 全部状态
+- 7 个独立 Error 类型
+- typeck/HM/Mir/VM/JIT 路径
+
+**下一步路径**：
+- v0.77.x: undoc 0.8 迁移（跨 major 适配 + 消除 quick-xml 0.37.5 transitive）
+- 下次 Mimosa 扫描验证 lopdf 升级后状态
+
 ## [v0.76.07] — 2026-08-10 — deps: 修复 Mimosa 扫描依赖漏洞（quick-xml + crossbeam-epoch）
 
 **目的**：Mimosa 依赖审计报告 P0/P1：

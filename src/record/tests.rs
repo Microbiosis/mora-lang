@@ -66,13 +66,13 @@ fn record_roundtrip() {
     assert!(r2.mode().is_replay());
     assert_eq!(r2.events().len(), 3);
     // lookup ai.chat
-    let resp = r2.lookup_ai_chat("gpt-4o", "hello");
+    let resp = r2.lookup_ai_chat("gpt-4o", "hello", "test_sig");
     assert!(resp.is_some());
     let resp = resp.unwrap();
     assert_eq!(resp.response, "world");
     assert_eq!(resp.tokens_in, 5);
     // lookup web.fetch
-    let wresp = r2.lookup_web_fetch("https://example.com/api");
+    let wresp = r2.lookup_web_fetch("https://example.com/api", "test_sig");
     assert!(wresp.is_some());
     let wresp = wresp.unwrap();
     assert_eq!(wresp.status, Some(200));
@@ -100,13 +100,13 @@ fn replay_missing_returns_none() {
 
     let r2 = Recorder::new_replay(path.clone()).unwrap();
     // 询问不同 prompt → 找不到
-    let resp = r2.lookup_ai_chat("gpt-4o", "second");
+    let resp = r2.lookup_ai_chat("gpt-4o", "second", "test_sig");
     assert!(resp.is_none());
     // 询问不同 model → 找不到
-    let resp = r2.lookup_ai_chat("gpt-4o-mini", "first");
+    let resp = r2.lookup_ai_chat("gpt-4o-mini", "first", "test_sig");
     assert!(resp.is_none());
     // 询问 web.fetch 不存在 url
-    let resp = r2.lookup_web_fetch("https://nope.com");
+    let resp = r2.lookup_web_fetch("https://nope.com", "test_sig");
     assert!(resp.is_none());
 
     let _ = fs::remove_file(&path);
@@ -679,4 +679,86 @@ fn new_record_creates_parent_dir() {
     assert!(p.parent().unwrap().exists());
 
     let _ = fs::remove_dir_all(p.parent().unwrap());
+}
+
+// v0.76.05: Schema 校验测试——arg_signature 不匹配时返 None
+
+fn schema_test_path(name: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("mora_schema_test_{}", name));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    dir.join("rec.jsonl")
+}
+
+#[test]
+fn schema_lookup_ai_chat_mismatch_returns_none() {
+    // 录制用签名 A，replay 用签名 B → 应返 None（不报 error）
+    let path = schema_test_path("ai_mismatch");
+    let mut r = Recorder::new_record(path.clone()).unwrap();
+    r.record_ai_chat(
+        "gpt-4o".into(),
+        "hello".into(),
+        "world".into(),
+        10,
+        5,
+        100,
+        None,
+        "ai.chat(model: string, prompt: string) -> string".into(),
+    );
+    r.save().unwrap();
+    let r2 = Recorder::new_replay(path).unwrap();
+    // 当前签名与录制签名不同 → 返 None
+    let resp = r2.lookup_ai_chat(
+        "gpt-4o",
+        "hello",
+        "ai.chat(model: string, prompt: string, options: Dict) -> string",
+    );
+    assert!(resp.is_none(), "签名不匹配应返 None");
+}
+
+#[test]
+fn schema_lookup_ai_chat_match_returns_some() {
+    // 录制与 replay 用同签名 → 返 Some
+    let path = schema_test_path("ai_match");
+    let mut r = Recorder::new_record(path.clone()).unwrap();
+    r.record_ai_chat(
+        "gpt-4o".into(),
+        "hello".into(),
+        "world".into(),
+        10,
+        5,
+        100,
+        None,
+        "ai.chat(model: string, prompt: string) -> string".into(),
+    );
+    r.save().unwrap();
+    let r2 = Recorder::new_replay(path).unwrap();
+    let resp = r2.lookup_ai_chat(
+        "gpt-4o",
+        "hello",
+        "ai.chat(model: string, prompt: string) -> string",
+    );
+    assert!(resp.is_some(), "签名匹配应返 Some");
+}
+
+#[test]
+fn schema_lookup_web_fetch_mismatch_returns_none() {
+    let path = schema_test_path("web_mismatch");
+    let mut r = Recorder::new_record(path.clone()).unwrap();
+    r.record_web_fetch(
+        "https://x.com".into(),
+        "GET".into(),
+        200,
+        1024,
+        50,
+        None,
+        "web.fetch(url: string, opts: Dict) -> string".into(),
+    );
+    r.save().unwrap();
+    let r2 = Recorder::new_replay(path).unwrap();
+    let resp = r2.lookup_web_fetch(
+        "https://x.com",
+        "web.fetch(url: string, headers: Dict, opts: Dict) -> string",
+    );
+    assert!(resp.is_none(), "签名不匹配应返 None");
 }

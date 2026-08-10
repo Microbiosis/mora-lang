@@ -111,6 +111,8 @@ pub struct RecordedResponse {
     pub latency_ms: u128,
     pub status: Option<u16>,     // for web.fetch
     pub body_len: Option<usize>, // for web.fetch
+    /// v0.76.05: 录制时的函数签名（typeck::Type 可读化）——replay 校验用
+    pub arg_signature: String,
 }
 
 /// Recorder 主结构 —— 持有 mode + 累积事件 + 索引 (重放用)
@@ -193,22 +195,46 @@ impl Recorder {
     }
 
     /// 重放: 查找 ai.chat 的录制响应
-    pub fn lookup_ai_chat(&self, model: &str, prompt: &str) -> Option<RecordedResponse> {
+    /// 重放: 查找 ai.chat 的录制响应
+    /// v0.76.05: `current_arg_signature` 为当前函数签名（typeck::Type 可读化）。
+    /// 与录制时的签名不匹配时返 None（按"签名漂移 = 当作没匹配"原则，
+    /// v0.76.07 单独 commit 加显式 warning）。
+    pub fn lookup_ai_chat(
+        &self,
+        model: &str,
+        prompt: &str,
+        current_arg_signature: &str,
+    ) -> Option<RecordedResponse> {
         if !self.mode.is_replay() {
             return None;
         }
         let key = format!("{}|{}", model, hash_prompt(prompt));
-        self.index.get(&("ai.chat".to_string(), key)).cloned()
+        let rec = self.index.get(&("ai.chat".to_string(), key))?;
+        // v0.76.05: 签名校验——录制与当前签名不一致 = 不匹配
+        if rec.arg_signature != current_arg_signature {
+            return None;
+        }
+        Some(rec.clone())
     }
 
     /// 重放: 查找 web.fetch 的录制响应
-    pub fn lookup_web_fetch(&self, url: &str) -> Option<RecordedResponse> {
+    /// v0.76.05: 同上——`current_arg_signature` 签名校验
+    pub fn lookup_web_fetch(
+        &self,
+        url: &str,
+        current_arg_signature: &str,
+    ) -> Option<RecordedResponse> {
         if !self.mode.is_replay() {
             return None;
         }
-        self.index
-            .get(&("web.fetch".to_string(), url.to_string()))
-            .cloned()
+        let rec = self
+            .index
+            .get(&("web.fetch".to_string(), url.to_string()))?;
+        // v0.76.05: 签名校验
+        if rec.arg_signature != current_arg_signature {
+            return None;
+        }
+        Some(rec.clone())
     }
 
     /// 录制模式: 把累积事件 flush 到 JSONL 文件

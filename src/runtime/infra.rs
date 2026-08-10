@@ -73,6 +73,11 @@ impl InfraRuntime {
         &self.recorder
     }
 
+    /// v0.76.06: 可变 recorder 借用（lookup push warning 需 &mut self）
+    pub fn recorder_mut(&mut self) -> &mut Recorder {
+        &mut self.recorder
+    }
+
     /// 替换 recorder（main.rs 需要整体替换 recorder 实例）
     pub fn replace_recorder(&mut self, recorder: Recorder) {
         self.recorder = recorder;

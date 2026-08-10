@@ -11,6 +11,45 @@ All notable changes to Mora will be documented in this file.
 需要查阅 v0.13 → v0.30 历史的请通过 `git log --grep='v0\.' --reverse`
 按 commit 主题回溯；该区间仅作为工程债处理记录保留在 git 历史中。
 
+## [v0.76.06] — 2026-08-10 — record: replay 签名漂移 warning
+
+**目的**（延续 v0.76.05）：
+v0.76.05 签名漂移时静默返 None 用户无感。
+v0.76.06 加显式 warning 收集——用户可看到「这个调用录制时签名与当前不同」。
+
+**变更**：
+- `src/record/mod.rs` `Recorder` 加 `pub warnings: Vec<String>` 字段
+- 三处构造（`new_off` / `new_record` / `new_replay`）初始化 `warnings: Vec::new()`
+- `lookup_ai_chat` / `lookup_web_fetch` 签名改 `&mut self`（vs 之前 `&self`）
+  * 签名漂移时 `self.warnings.push(format!(...))` push 警告
+  * 仍返 None（保留 v0.76.05 "签名漂移 = 当作没匹配" 语义）
+- `src/runtime/infra.rs` 加 `recorder_mut(&mut self) -> &mut Recorder` accessor
+- `src/interpreter/ai_chat.rs` lookup 改调 `recorder_mut()`
+- `src/record/tests.rs` 5 处 `let r2 = Recorder::new_replay` 改 `let mut r2`（lookup 需 &mut self）
+
+**测试**：
+- 687 passed; 0 failed; 13 ignored（686 旧 + 1 新 `schema_mismatch_pushes_warning` = 687）
+- 新增 `schema_mismatch_pushes_warning`：
+  * 录制用签名 A，replay 用签名 B → 返 None + push 1 warning
+  * warning 含「签名漂移」+ 模型名
+  * replay 开始时无 warning（每次 lookup 累积）
+
+**收益**：
+- 用户改函数签名后能立刻看到 warning（不再"静默失败"）
+- warnings 字段 `pub` 暴露——上层（CLI、LSP）可主动打印
+- 与 v0.75.43 copy-and-patch JIT `JitError` 暴露模式一致
+
+**未变**：
+- 任何 `Result<T, String>` 路径（warnings 收集仍用 String）
+- 7 个独立 Error 类型
+- record/replay 时间线、analysis、audit、diff、snapshot 行为
+- 公共 Record/Replay 接口（`new_record` / `new_replay` / `new_off`）
+
+**下一步路径**（不在本次范围）：
+- v0.76.07: typeck::Type::hash + arg_signature 改用 typeck hash（更稳定）
+- v0.76.08: warnings 在 CLI 退出时打印（避免 caller 主动检查）
+- v0.76.10: 完整 record::Schema 元数据层（hash + version + arg + return）
+
 ## [v0.76.05] — 2026-08-10 — record: replay 签名校验（Schema 元数据应用）
 
 **目的**（延续 v0.76.04 record::Schema 元数据层路径）：

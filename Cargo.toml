@@ -59,7 +59,9 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time",
 # v0.42.1: sha2 for SHA-256 hash chain in AuditSink (audit.jsonl)
 sha2 = "0.10"
 # v0.28: Office (PPTX/DOCX) + Image OCR backends (all pure Rust)
-undoc = { version = "0.5", default-features = false, features = ["docx", "pptx"] }
+# v0.76.09: 升级 undoc 0.5 → 0.8（跨 3 major——Mora 仅用 DocxParser/PptxParser/Block::Paragraph，
+# 这些 API 在 0.5→0.8 路径稳定——ErrorKind/CleanupOptions/Table 渲染变更对 Mora 无影响）
+undoc = { version = "0.8", default-features = false, features = ["docx", "pptx"] }
 ocrs = "0.12"
 # v0.28 Task 6: ocrs does not re-export `rten`, but `OcrEngine::new` requires
 # pre-loaded `rten::Model` instances for the detection + recognition models.

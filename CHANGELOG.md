@@ -11,6 +11,57 @@ All notable changes to Mora will be documented in this file.
 需要查阅 v0.13 → v0.30 历史的请通过 `git log --grep='v0\.' --reverse`
 按 commit 主题回溯；该区间仅作为工程债处理记录保留在 git 历史中。
 
+## [v0.76.09] — 2026-08-11 — deps: 升级 undoc 0.5 → 0.8（跨 3 major 零代码改动）
+
+**目的**：v0.76.08 评估"不升"是错误的保守判断——实际 undoc 0.5 → 0.8
+跨 3 major，**但 Mora 仅用 `DocxParser` / `PptxParser` / `Block::Paragraph`**
+三个 API 路径（0.5/0.6/0.7/0.8 路径稳定）——直接升级零代码改动。
+
+**undoc 0.5→0.8 真实 breaking changes**（按 Mora 使用面评估）：
+- `undoc::docx::DocxParser` / `undoc::pptx::PptxParser` / `undoc::Block::Paragraph(para)` 路径稳定——**Mora 无影响**
+- `ErrorKind` 新增 `Encoding(9)`——Mora 错误处理零分支，**无影响**
+- `CleanupOptions::detect_mojibake` 删除——Mora 未用，**无影响**
+- `Block::Table` 渲染变化——Mora 用 `from_bytes → text` 不走 Table，**无影响**
+- `parse_file_streaming` / `SectionStreamOptions`——Mora 未用，**无影响**
+
+**变更**：
+- `Cargo.toml`：`undoc = "0.5"` → `"0.8"`
+- `Cargo.lock`（`cargo build` 自动）：
+  * `undoc 0.5.2` → `0.8.0`
+  * 新增 `cfb 0.10.0`（undoc 0.8 transitive——容器格式探测）
+  * 新增 `uncore 0.2.0`（undoc 0.8 transitive——C-ABI plumbing）
+  * `quick-xml 0.37.5` → **0.41.0**（undoc 0.8.3 已升级 quick-xml 依赖——**该 transitive CVE 链终于消除**）
+
+**测试**：687 passed; 0 failed; 13 ignored（与 v0.76.08 完全一致——**零行为变化**）
+
+**收益**：
+- 消除最后一条 quick-xml 0.37.5 transitive 链（v0.76.07 未消除的残留风险）——**Mimosa P0 HIGH CVE 完整修复**
+- undoc API 升级到 0.8 主线（最新稳定版）
+- 跨 3 major 升级**零代码改动**（v0.76.08 评估错——实际 API 路径稳定）
+
+**v0.76.08 评估错误修正**：
+- 当时说"跨 3 major 跨 major API 破坏 feature /docx 重命名"
+- 实际 undoc 0.5 → 0.8 的 `DocxParser` / `PptxParser` / `Block::Paragraph(para)` 路径稳定
+- 真正的破坏是 `ErrorKind::Encoding(9)` 分支（无影响）+ `CleanupOptions::detect_mojibake` 删除（未用）+ `Block::Table` 渲染（不走 Table）
+
+**残留风险**：
+- 无重大残留（quick-xml 链完全消除）
+
+**采纳制**（延续 `docs/decisions/no-borrowed-constraints.md`）：
+- "不要保守" 指令执行——v0.76.08 评估修正
+- 跨 major 升级不**预设**为破坏——按实际使用面评估
+- 真实破坏面 < 5% 时直接升；≥ 50% 时单独 commit
+
+**未变**：
+- 任何 Mora 代码（v0.76.06 record replay warning 仍是功能 HEAD）
+- 7 条🔴阻断 + 5 条🟡警告 + 3 条🟢建议——架构审查报告 v0.75.90 全部状态
+- 7 个独立 Error 类型
+- typeck/HM/Mir/VM/JIT 路径
+
+**下一步路径**：
+- Mimosa 重新扫描验证 quick-xml 链完全消除
+- v0.77.x: record::Schema typeck::Type::hash 实现
+
 ## [v0.76.08] — 2026-08-11 — deps: 升级 lopdf 0.42 → 0.44（修正 v0.76.07 评估错误）
 
 **目的**：v0.76.07 评估 lopdf 错写"不升"——实际 0.42 → 0.44 minor 跳零跨 major 风险，

@@ -127,6 +127,13 @@ impl CostModel for TokenEstimate {
             MirInst::WithConfig { bindings, body, .. } => {
                 bindings.len() as u32 * 5 + body.body.iter().map(|i| self.inst_cost(i)).sum::<u32>()
             }
+            // v0.80: algebraic effects — Perform 算 1 token 时成本（handler dispatch 算外部）
+            MirInst::Perform { .. } => 1,
+            // Handle 块成本 = body + handler（递归求和）
+            MirInst::Handle { body, handler, .. } => {
+                body.body.iter().map(|i| self.inst_cost(i)).sum::<u32>()
+                    + handler.body.iter().map(|i| self.inst_cost(i)).sum::<u32>()
+            }
             // 事务
             MirInst::Transaction { body, compensation } => {
                 let body_sum = body.body.iter().map(|i| self.inst_cost(i)).sum::<u32>();

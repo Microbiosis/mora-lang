@@ -122,7 +122,9 @@ fn walk_witness_kind<F: FnMut(&MirWitness)>(kind: &WitnessKind, visit: &mut F) {
         | WitnessKind::StructDef { .. }
         | WitnessKind::Import(_)
         | WitnessKind::MacroDef { .. }
-        | WitnessKind::Sequence(_) => {}
+        | WitnessKind::Sequence(_)
+        | WitnessKind::Perform { .. }
+        | WitnessKind::Handle { .. } => {}
     }
 }
 

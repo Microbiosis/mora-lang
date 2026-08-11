@@ -26,6 +26,8 @@ pub mod generalize;
 mod infer;
 pub mod unify; // v0.75.70: infer_* 方法族（自 mod.rs 拆出）
 pub mod util; // v0.75.96: check_union / join_types（自 typeck::mod.rs 抽离）
+// v0.80: 行多态 HM unification（Stage 2/4 algebraic effects 落地）
+pub mod row;
 
 pub use error::TypeError;
 
@@ -379,7 +381,9 @@ impl HMInference {
             | WitnessKind::StructDef { .. }
             | WitnessKind::Import(_)
             | WitnessKind::MacroDef { .. }
-            | WitnessKind::Sequence { .. } => Ok(Type::Nil),
+            | WitnessKind::Sequence { .. }
+            | WitnessKind::Perform { .. }
+            | WitnessKind::Handle { .. } => Ok(Type::Nil),
         }
     }
 }

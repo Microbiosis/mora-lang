@@ -355,7 +355,11 @@ impl<'a> BidirectionalChecker<'a> {
             | WitnessKind::EnumDef { .. }
             | WitnessKind::StructDef { .. }
             | WitnessKind::MacroDef { .. }
-            | WitnessKind::Sequence(_) => {}
+            | WitnessKind::Sequence(_)
+            // v0.80: algebraic effects — Perform/Handle 的子节点（args/body/handler）
+            // 由 pre_check_witness 单独递归，本路径无需处理。
+            | WitnessKind::Perform { .. }
+            | WitnessKind::Handle { .. } => {}
             // 二元操作
             WitnessKind::Binary { left, right, .. } => {
                 self.pre_check_witness(left);

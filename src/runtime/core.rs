@@ -16,7 +16,8 @@ use crate::value::{Environment, MergeStrategy};
 
 /// 语言执行必需的薄核心。
 /// 注：ToolDef 不含 Debug，所以 CoreRuntime 不 derive Debug。
-#[derive(Clone)]
+// v0.80: CoreRuntime 不再 derive Clone —— EffectHandler 是 move-only trait object，
+// 整个 EffectRegistry 不可 Clone。手动 impl Clone（克隆时 effect_handlers 取空）。
 pub struct CoreRuntime {
     /// 全局变量环境
     pub(crate) globals: Arc<Mutex<Environment>>,
@@ -41,6 +42,10 @@ pub struct CoreRuntime {
     /// 引擎超步末收集并经 aggregator_contribute 归约（与 dynamic_sends
     /// 同构 —— agent 无法直接访问引擎）。
     pub(crate) aggregator_contributions: Vec<crate::mir::expr::AggregatorContribution>,
+    /// v0.80: algebraic effects handler 注册表（Stage 2/4 落地）。
+    /// MirHost trait 的 `perform_effect / install/take/restore_effect_handler`
+    /// 全部作用于本字段。嵌套 handle 块走 take+restore 栈模式。
+    pub(crate) effect_handlers: crate::runtime::effect::EffectRegistry,
 }
 
 impl Default for CoreRuntime {
@@ -55,6 +60,28 @@ impl Default for CoreRuntime {
             current_merge_strategies: None,
             dynamic_sends: Vec::new(),
             aggregator_contributions: Vec::new(),
+            effect_handlers: crate::runtime::effect::EffectRegistry::default(),
+        }
+    }
+}
+
+// v0.80: 手动 Clone impl —— 不能 derive Clone（EffectHandler: !Clone）。
+// effect_handlers 克隆时取空（move semantics —— handler 留在原实例）。
+// 语义：Pregel worker 复制 → 子线程没有已注册的 handler（body 直接 perform 会
+// 报 unhandled effect）。这是 conservative 默认；后续 Stage 2.x 可支持 handler
+// 共享（Arc<dyn EffectHandler> 引用计数）。
+impl Clone for CoreRuntime {
+    fn clone(&self) -> Self {
+        Self {
+            globals: self.globals.clone(),
+            environment: self.environment.clone(),
+            tool_registry: self.tool_registry.clone(),
+            current_ai_config: self.current_ai_config.clone(),
+            config_stack: self.config_stack.clone(),
+            current_merge_strategies: self.current_merge_strategies.clone(),
+            dynamic_sends: self.dynamic_sends.clone(),
+            aggregator_contributions: self.aggregator_contributions.clone(),
+            effect_handlers: crate::runtime::effect::EffectRegistry::default(),
         }
     }
 }

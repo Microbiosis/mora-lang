@@ -109,6 +109,12 @@ impl ParserV3 {
             {
                 self.emit_statement_expr_w().map(|(_, w)| w)
             }
+            // v0.80: algebraic effects 完整语法（Stage 2/4 落地）
+            //   handle Effect { body } { handler } end
+            //   perform Effect(args)
+            // 不引入新 TokenType（不抢旧 identifier），与 transaction/eval 同模式。
+            TokenType::Identifier(ref s) if s == "handle" => self.emit_handle_w(),
+            TokenType::Identifier(ref s) if s == "perform" => self.emit_perform_w(),
             TokenType::Return | TokenType::Break | TokenType::Continue => {
                 self.emit_return_break_continue_w()
             }
@@ -1019,6 +1025,61 @@ impl ParserV3 {
             .emit(MirInst::Const(dst, crate::value::Value::Nil));
         Some(MirWitness {
             kind: WitnessKind::Import(path),
+            span,
+        })
+    }
+
+    /// v0.80: perform Effect(arg1, arg2, ...) 解析。
+    ///
+    /// syntax: `perform EffectName(args)?` — args 是 `emit_expr_w` 列表。
+    /// 不引入新 TokenType（按 Identifier 路径分发，避免抢旧 identifier）。
+    /// Stage 2.x 升级：未生效 perform 编译期 typeck 拦截（Stage 2.3 row-poly HM）。
+    fn emit_perform_w(&mut self) -> Option<MirWitness> {
+        let span = self.span_of_current();
+        self.advance(); // 'perform'
+        let effect = self.consume_identifier("Expected effect name after 'perform'")?;
+        let mut args: Vec<MirWitness> = Vec::new();
+        if self.match_token_exact(TokenType::LParen) {
+            if !self.check(&TokenType::RParen) {
+                loop {
+                    let (_, w) = self.emit_expr_w()?;
+                    args.push(w);
+                    if !self.match_token(&[TokenType::Comma]) {
+                        break;
+                    }
+                }
+            }
+            self.consume(TokenType::RParen, "Expected ')' after perform args")?;
+        }
+        Some(MirWitness {
+            kind: WitnessKind::Perform { effect, args },
+            span,
+        })
+    }
+
+    /// v0.80: handle Effect { body } { handler } 完整解析 + 嵌套 EmitContext 切换。
+    ///
+    /// syntax: `handle Effect { body_stmts } { handler_stmts } end`（花括号形式）。
+    /// body 与 handler 各自独立 EmitContext（独立寄存器空间），与 TaskDef 一致。
+    /// 不引入新 TokenType（按 Identifier 路径分发）。
+    /// Stage 2.x 升级：handler 可使用 `resume k resume-value` 续名续 + 标 typing。
+    fn emit_handle_w(&mut self) -> Option<MirWitness> {
+        let span = self.span_of_current();
+        self.advance(); // 'handle'
+        let effect = self.consume_identifier("Expected effect name after 'handle'")?;
+        self.consume(TokenType::LBrace, "Expected '{' after effect name")?;
+        let (_, body_w) = self.emit_block_w()?;
+        self.consume(TokenType::RBrace, "Expected '}' after handle body")?;
+        self.consume(TokenType::LBrace, "Expected '{' for handler block")?;
+        let (_, handler_w) = self.emit_block_w()?;
+        self.consume(TokenType::RBrace, "Expected '}' after handler block")?;
+        Some(MirWitness {
+            kind: WitnessKind::Handle {
+                effect,
+                body: Box::new(body_w),
+                handler: Box::new(handler_w),
+                k_param: "resume".to_string(),
+            },
             span,
         })
     }

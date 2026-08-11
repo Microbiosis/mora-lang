@@ -9,11 +9,11 @@ use std::collections::HashMap;
 use super::handlers::{
     Flow, h_aggregate, h_append_file, h_assign, h_binary_op, h_break, h_call, h_closure, h_const,
     h_continue, h_define, h_dict_lit, h_document_section, h_dyn_trait, h_enum_def, h_eval, h_halt,
-    h_impl_def, h_import, h_index, h_index_assign, h_jump, h_jump_if, h_jump_if_not, h_list_lit,
-    h_load, h_macro_def, h_match_expr, h_method_call, h_observe, h_orchestrate, h_pipe, h_prompt,
-    h_prompt_section, h_read_bytes_file, h_read_file, h_return, h_save, h_send, h_skill_def,
-    h_span, h_struct_def, h_trait_def, h_transaction, h_type_alias, h_var, h_with_config, h_worker,
-    h_write_bytes_file, h_write_file,
+    h_handle, h_impl_def, h_import, h_index, h_index_assign, h_jump, h_jump_if, h_jump_if_not,
+    h_list_lit, h_load, h_macro_def, h_match_expr, h_method_call, h_observe, h_orchestrate,
+    h_perform, h_pipe, h_prompt, h_prompt_section, h_read_bytes_file, h_read_file, h_return,
+    h_save, h_send, h_skill_def, h_span, h_struct_def, h_trait_def, h_transaction, h_type_alias,
+    h_var, h_with_config, h_worker, h_write_bytes_file, h_write_file,
 };
 
 use crate::mir::host::MirHost;
@@ -43,6 +43,10 @@ impl MirInst {
             MirInst::Pipe(r, _, _) => Some(*r),
             MirInst::Prompt(r, _) => Some(*r),
             MirInst::MatchExpr { arms, .. } => arms.last().map(|a| a.3),
+            MirInst::Perform { dst, .. } => Some(*dst),
+            // Handle 是语句（不产生值），唯一写入 dst 的是 handler 末尾的 resume 续
+            // 续名——该续名由 h_handle 自己 emit Const(dst, ...) 而非 Handle 自身。
+            MirInst::Handle { .. } => None,
             MirInst::Closure { dst, .. } => Some(*dst),
             MirInst::DynTrait { dst, .. } => Some(*dst),
             _ => None,
@@ -56,6 +60,10 @@ impl MirInst {
             MirInst::Copy(_, src) => vec![*src],
             MirInst::BinaryOp(_, lhs, _, rhs) => vec![*lhs, *rhs],
             MirInst::Call(_, _, args) => args.clone(),
+            MirInst::Perform { args, .. } => args.clone(),
+            // Handle: body 与 handler 用独立 reg 空间（已 box 化），不读外层任何 reg。
+            // k_dst 是 output reg（handler 末尾 resume 续 的返回值），由 h_handle 写。
+            MirInst::Handle { .. } => vec![],
             MirInst::MethodCall(_, receiver, _, args) => {
                 let mut v = vec![*receiver];
                 v.extend(args);
@@ -138,6 +146,21 @@ impl MirInst {
             MirInst::Call(r, name, args) => {
                 MirInst::Call(*r, name.clone(), args.iter().map(|a| m(*a)).collect())
             }
+            // Perform: dst 不映射（SSA 自行管理），args 全部映射。
+            MirInst::Perform { dst, effect, args } => MirInst::Perform {
+                dst: *dst,
+                effect: effect.clone(),
+                args: args.iter().map(|a| m(*a)).collect(),
+            },
+            // Handle: body 和 handler 是独立 reg 空间（不递归 map）。
+            // k_param 是 handler 内的 resume 续名（handler body 内部管理）。
+            MirInst::Handle { effect, body, handler, k_param, k_dst } => MirInst::Handle {
+                effect: effect.clone(),
+                body: body.clone(),
+                handler: handler.clone(),
+                k_param: k_param.clone(),
+                k_dst: *k_dst,
+            },
             MirInst::ListLit(r, items) => {
                 MirInst::ListLit(*r, items.iter().map(|i| m(*i)).collect())
             }
@@ -281,6 +304,11 @@ impl MirInst {
             | MirInst::Commit
             | MirInst::Save { .. }
             | MirInst::Load { .. }
+            // Perform 触发 effect — 必然有副作用（即便 handler 解释为纯函数）。
+            | MirInst::Perform { .. }
+            // Handle 是语句（安装/卸载 handler），但本身不产生外部副作用。
+            // 真正的 effect 来源是 body 内的 Perform 指令。
+            | MirInst::Handle { .. }
             | MirInst::ReadFile { .. }
             | MirInst::WriteFile { .. }
             | MirInst::AppendFile { .. }
@@ -443,6 +471,20 @@ pub fn dispatch(
             jit,
         } => {
             h_with_config(interp, env, regs, bindings, body, *jit)?;
+            Ok(Flow::Continue)
+        }
+        MirInst::Perform { dst, effect, args } => {
+            h_perform(regs, *dst, effect, args, interp)?;
+            Ok(Flow::Continue)
+        }
+        MirInst::Handle {
+            effect,
+            body,
+            handler,
+            k_param,
+            k_dst,
+        } => {
+            h_handle(interp, env, regs, effect, body, handler, k_param.as_str(), *k_dst)?;
             Ok(Flow::Continue)
         }
         MirInst::MacroDef { name, params } => {

@@ -1,0 +1,3 @@
+task main()
+  print(10i + 32i)
+end

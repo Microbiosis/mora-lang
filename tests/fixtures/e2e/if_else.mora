@@ -1,0 +1,4 @@
+task main()
+  let x = 5i
+  if x > 0i { print(1i) } else { print(0i) }
+end

@@ -1,0 +1,9 @@
+task main()
+  let x = 5i
+  let y = 10i
+  if x > 0i {
+    if y > 0i { print(1i) } else { print(2i) }
+  } else {
+    print(3i)
+  }
+end

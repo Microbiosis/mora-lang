@@ -1,4 +1,8 @@
-//! Tier 0 trait/impl/skill 升级合约测试
+//! Trait / impl / skill MIR dispatch 路径测试 (v0.77 重命名自 tier0_trait_mir.rs)
+//!
+//! v0.77 重构：删除 4 个 source-grep 静态合约测试（MirInst::TraitDef.method_bodies
+//! 存在性、MirInst::SkillDef.task_bodies 存在性等 — 任何重命名都会假阳性断裂）。
+//! 保留 1 个 runtime 集成测试。
 //!
 //! α.11 起，MirInst::TraitDef / ImplDef / SkillDef 携带 prelowered MirFunction
 //! body（method_bodies / task_bodies / verify_body），dispatch 见 mir_body: Some
@@ -21,54 +25,6 @@ fn run_via_mir(source: &str) -> Result<(), String> {
     let func_arc = std::sync::Arc::new(func);
     run_mir(&func_arc, &mut interp, &mut env)?;
     run_main_task(&func_arc, &mut interp, &mut env)
-}
-
-// ─── 静态合约 ─────────────────────────────────────────────────────────
-
-#[test]
-fn mir_inst_trait_def_carries_method_bodies() {
-    let src = std::fs::read_to_string("src/mir/mod.rs").expect("mir/mod.rs");
-    assert!(
-        src.contains("method_bodies: Vec<MirFunction>"),
-        "MirInst::TraitDef must carry method_bodies: Vec<MirFunction>"
-    );
-}
-
-#[test]
-fn mir_inst_impl_def_carries_method_bodies() {
-    let src = std::fs::read_to_string("src/mir/mod.rs").expect("mir/mod.rs");
-    // ImplDef 也必须含 method_bodies 字段
-    assert!(
-        src.contains("method_bodies: Vec<MirFunction>"),
-        "MirInst::ImplDef must carry method_bodies: Vec<MirFunction>"
-    );
-}
-
-#[test]
-fn mir_inst_skill_def_carries_task_bodies_and_verify_body() {
-    let src = std::fs::read_to_string("src/mir/mod.rs").expect("mir/mod.rs");
-    assert!(
-        src.contains("task_bodies: Vec<MirFunction>"),
-        "MirInst::SkillDef must carry task_bodies"
-    );
-    assert!(
-        src.contains("verify_body: Option<MirFunction>"),
-        "MirInst::SkillDef must carry verify_body"
-    );
-}
-
-#[test]
-fn interpreter_fills_mir_body_for_trait_impl_skill() {
-    // v0.75.11: mir_body 填充在 handlers.rs（h_closure/h_trait_def/h_impl_def/
-    // h_skill_def 各填 Arc::new(body.clone())），interp.rs 只驱动执行顺序。
-    // 至少 5 处：Closure + TraitDef + ImplDef + SkillDef task + SkillDef verify。
-    let src = std::fs::read_to_string("src/mir/handlers.rs").expect("mir/handlers.rs");
-    let occurrences = src.matches("mir_body: Arc::new(").count();
-    assert!(
-        occurrences >= 5,
-        "expected ≥5 mir_body: Arc::new(...) occurrences in handlers.rs (Closure + TraitDef + ImplDef + SkillDef task + verify), found {}",
-        occurrences
-    );
 }
 
 // ─── 集成验证 ─────────────────────────────────────────────────────────
@@ -94,3 +50,9 @@ end
 "#;
     run_via_mir(src).expect("trait/impl/skill registration does not crash base run_mir");
 }
+
+// 注：v0.77 之前 §静态合约 4 个测试是 source-grep（assert!(src.contains(...))），
+// 任何改名都会假阳性断裂、零 runtime 保护 — 已删除。
+// 静态合约（MirInst::TraitDef.method_bodies 存在、SkillDef.task_bodies 存在、
+// 5+ 处 mir_body 填充）现在由 E2E tests/e2e.rs 镜像 main.rs::run_file 调用栈
+// 的真实端到端断言承担。

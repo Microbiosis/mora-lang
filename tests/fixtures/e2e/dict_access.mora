@@ -1,0 +1,4 @@
+task main()
+  let d = {"a": 1i, "b": 2i}
+  print(d["a"] + d["b"])
+end

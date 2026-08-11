@@ -1,0 +1,2 @@
+let ops = {"add": fn(a, b) a + b end}
+print(ops.add(2i, 3i))

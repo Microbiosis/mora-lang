@@ -359,3 +359,179 @@ match 42 {
     let ret = run_mir(&std::sync::Arc::new(func), &mut interp, &mut env).unwrap();
     assert_eq!(ret.to_string(), "default");
 }
+
+// ===================================================================
+// v0.77: 从 tests/mir_orchestrate_lowering.rs 合并 — 5 个测试
+// 验证 MirInst::Orchestrate 结构化 kind + superstep_fusion + optimize_pregel。
+// 这些是 MirOrchestrateKind API 契约 + 超步融合优化 pass 的白盒保护。
+// ===================================================================
+
+#[test]
+fn orchestrate_kind_is_structured_not_string() {
+    // 验证类型：MirInst::Orchestrate 携带 Box<MirOrchestrateKind>，
+    // 若有人误回退到 `kind: String`，本测试将编译失败。
+    let kind = MirOrchestrateKind::Pregel {
+        agents: vec![],
+        edges: vec![],
+        state_schema: vec![],
+        checkpoint: None,
+        interrupt_points: vec![],
+        adjacency: std::collections::HashMap::new(),
+    };
+    let inst = MirInst::Orchestrate {
+        input_var: "input".to_string(),
+        result_var: "result".to_string(),
+        kind: Box::new(kind),
+    };
+
+    match inst {
+        MirInst::Orchestrate { kind, .. } => {
+            assert!(matches!(kind.as_ref(), MirOrchestrateKind::Pregel { .. }));
+        }
+        _ => panic!("expected Orchestrate variant"),
+    }
+}
+
+#[test]
+fn orchestrate_all_kinds_constructible() {
+    // 验证全部四种 orchestrate kind 都能构造并装箱
+    let _seq = Box::new(MirOrchestrateKind::Sequential { agents: vec![] });
+    let _loop = Box::new(MirOrchestrateKind::Loop {
+        agents: vec![],
+        rounds: Some(10),
+        exit_when: None,
+    });
+    let _graph = Box::new(MirOrchestrateKind::Graph {
+        agents: vec![],
+        edges: vec![],
+    });
+    let _pregel = Box::new(MirOrchestrateKind::Pregel {
+        agents: vec![],
+        edges: vec![],
+        state_schema: vec![],
+        checkpoint: None,
+        interrupt_points: vec![],
+        adjacency: std::collections::HashMap::new(),
+    });
+}
+
+#[test]
+fn superstep_fusion_removes_consecutive_duplicate_orchestrates() {
+    // 构造两个连续的相同 Pregel orchestrate
+    let kind = MirOrchestrateKind::Pregel {
+        agents: vec![],
+        edges: vec![],
+        state_schema: vec![],
+        checkpoint: None,
+        interrupt_points: vec![],
+        adjacency: std::collections::HashMap::new(),
+    };
+
+    let mut func = mora::mir::MirFunction {
+        params: vec![],
+        body: vec![
+            MirInst::Orchestrate {
+                input_var: "input".to_string(),
+                result_var: "result".to_string(),
+                kind: Box::new(kind.clone()),
+            },
+            MirInst::Orchestrate {
+                input_var: "input".to_string(),
+                result_var: "result".to_string(),
+                kind: Box::new(kind),
+            },
+            MirInst::Const(0, mora::value::Value::Int(42)), // trailing instruction
+        ],
+        n_regs: 1,
+        ..Default::default()
+    };
+
+    mora::mir::opt::superstep_fusion(&mut func);
+
+    let orchestrate_count = func
+        .body
+        .iter()
+        .filter(|inst| matches!(inst, MirInst::Orchestrate { .. }))
+        .count();
+    assert_eq!(
+        orchestrate_count, 1,
+        "expected 1 orchestrate after fusion, got {}",
+        orchestrate_count
+    );
+    assert_eq!(
+        func.body.len(),
+        2,
+        "expected 2 instructions after fusion, got {}",
+        func.body.len()
+    );
+}
+
+#[test]
+fn superstep_fusion_preserves_different_orchestrates() {
+    // 构造两个不同的 Pregel orchestrate（edges 不同）
+    let kind1 = MirOrchestrateKind::Pregel {
+        agents: vec![],
+        edges: vec![],
+        state_schema: vec![],
+        checkpoint: None,
+        interrupt_points: vec![],
+        adjacency: std::collections::HashMap::new(),
+    };
+    let kind2 = MirOrchestrateKind::Pregel {
+        agents: vec![],
+        edges: vec![mora::mir::expr::MirEdgeDef {
+            from: "a".to_string(),
+            to: "b".to_string(),
+            condition_expr: None,
+            condition_body: None,
+        }],
+        state_schema: vec![],
+        checkpoint: None,
+        interrupt_points: vec![],
+        adjacency: std::collections::HashMap::new(),
+    };
+
+    let mut func = mora::mir::MirFunction {
+        params: vec![],
+        body: vec![
+            MirInst::Orchestrate {
+                input_var: "input".to_string(),
+                result_var: "r1".to_string(),
+                kind: Box::new(kind1),
+            },
+            MirInst::Orchestrate {
+                input_var: "input".to_string(),
+                result_var: "r2".to_string(),
+                kind: Box::new(kind2),
+            },
+        ],
+        n_regs: 0,
+        ..Default::default()
+    };
+
+    mora::mir::opt::superstep_fusion(&mut func);
+
+    let orchestrate_count = func
+        .body
+        .iter()
+        .filter(|inst| matches!(inst, MirInst::Orchestrate { .. }))
+        .count();
+    assert_eq!(
+        orchestrate_count, 2,
+        "expected 2 orchestrates preserved, got {}",
+        orchestrate_count
+    );
+}
+
+#[test]
+fn optimize_pregel_runs_all_passes() {
+    // 验证 optimize_pregel 不 panic（即使 body 中没有 orchestrate）
+    let mut func = mora::mir::MirFunction {
+        params: vec![],
+        body: vec![MirInst::Const(0, mora::value::Value::Int(1))],
+        n_regs: 1,
+        ..Default::default()
+    };
+    mora::mir::opt::optimize_pregel(&mut func);
+    assert_eq!(func.body.len(), 1);
+}

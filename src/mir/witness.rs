@@ -199,6 +199,22 @@ impl WitnessKind {
                 name: name.clone(),
                 params: params.clone(),
             },
+            // v0.80: algebraic effects witness 转换
+            MirExprKind::Perform { effect, args } => WitnessKind::Perform {
+                effect: effect.clone(),
+                args: args.iter().map(MirWitness::from_expr).collect(),
+            },
+            MirExprKind::Handle {
+                effect,
+                body,
+                handler,
+                k_param,
+            } => WitnessKind::Handle {
+                effect: effect.clone(),
+                body: Box::new(MirWitness::from_expr(body)),
+                handler: Box::new(MirWitness::from_expr(handler)),
+                k_param: k_param.clone(),
+            },
             MirExprKind::Sequence(exprs) => {
                 WitnessKind::Sequence(exprs.iter().map(MirWitness::from_expr).collect())
             }
@@ -307,6 +323,19 @@ pub enum WitnessKind {
         fields: Vec<(String, crate::mir::hint::TypeHint)>,
     },
     Import(String),
+    // v0.80: algebraic effects witness（Stage 2/4 落地）。
+    //   Perform: 触发一个具名 effect。
+    //   Handle: 安装 handler 围栏。
+    Perform {
+        effect: String,
+        args: Vec<MirWitness>,
+    },
+    Handle {
+        effect: String,
+        body: Box<MirWitness>,
+        handler: Box<MirWitness>,
+        k_param: String,
+    },
     MacroDef {
         name: String,
         params: Vec<String>,

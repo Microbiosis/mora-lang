@@ -547,6 +547,12 @@ fn split_into_ssa(
             | MirInst::MatchArm { .. }
             | MirInst::Closure { .. }
             | MirInst::TypeAlias { .. }
+            // v0.80: algebraic effects — Perform/Handle 不进入 SSA 线性化（v0.75
+            // 已知 SSA 对 Send/WithConfig 等 effectful 指令同样 pass-through，
+            // 后续 Stage 2.x 升级到 multi-shot continuation 时，这里要
+            // 单独处理 —— 当前保持 pass-through 行为）。
+            | MirInst::Perform { .. }
+            | MirInst::Handle { .. }
             | MirInst::EnumDef { .. }
             | MirInst::StructDef { .. }
             | MirInst::Transaction { .. }
@@ -596,6 +602,12 @@ fn is_ssa_passthrough(inst: &MirInst) -> bool {
             | MirInst::MatchArm { .. }
             | MirInst::Closure { .. }
             | MirInst::TypeAlias { .. }
+            // v0.80: algebraic effects — Perform/Handle 不进入 SSA 线性化（v0.75
+            // 已知 SSA 对 Send/WithConfig 等 effectful 指令同样 pass-through，
+            // 后续 Stage 2.x 升级到 multi-shot continuation 时，这里要
+            // 单独处理 —— 当前保持 pass-through 行为）。
+            | MirInst::Perform { .. }
+            | MirInst::Handle { .. }
             | MirInst::EnumDef { .. }
             | MirInst::StructDef { .. }
             | MirInst::Transaction { .. }

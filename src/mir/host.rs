@@ -72,4 +72,28 @@ pub trait MirHost {
     /// object-safe：返回 `Box<dyn MirHost + Send>`，让 `dyn MirHost` 也能被
     /// 复制进 worker 线程（`Interpreter` 实现 = `self.clone()`）。
     fn clone_box(&self) -> Box<dyn MirHost + Send>;
+
+    // ── v0.80: algebraic effects 完整接口（Stage 2/4 落地）──
+    //
+    // v0.80 设计契约：
+    // - perform_effect: body 内的 Perform 指令统一调用。
+    //   返回 Some(reply) = handler 已处理；None = 未处理（编译期漏检）。
+    // - install/take/restore_effect_handler: handle 块的注册表操作。
+    //   take+restore 配对使用，支持嵌套 handle（Stack 模型）。
+    //
+    // 实现位于 interpreter/mod.rs::Interpreter — 通过 CoreRuntime::effect_handlers
+    // HashMap<String, Box<dyn EffectHandler>> 存储。
+    // EffectHandler trait 在 src/runtime/effect.rs。
+    fn perform_effect(&mut self, effect: &str, args: Vec<Value>) -> Option<Value>;
+    fn install_effect_handler(
+        &mut self,
+        effect: String,
+        handler: Box<dyn crate::runtime::effect::EffectHandler>,
+    );
+    fn take_effect_handler(&mut self, effect: &str) -> Option<Box<dyn crate::runtime::effect::EffectHandler>>;
+    fn restore_effect_handler(
+        &mut self,
+        effect: String,
+        prev: Option<Box<dyn crate::runtime::effect::EffectHandler>>,
+    );
 }

@@ -132,6 +132,12 @@ pub enum Type {
     /// v0.75.17: 泛型量化 ∀α₁...αₙ. τ — let-generalization 的产物。
     /// 命中 env 时由 instantiate 替换为 fresh TypeVar（标准 HM 规则）。
     ForAll(Vec<char>, Box<Type>),
+    /// v0.80: 函数类型带 effect row（Stage 2/4 algebraic effects 的类型基础）。
+    /// `fn (T) -> U ! {Ai, Fs}` — input type → output type with effect row。
+    /// Koka 风格：`Arrow(input, output, EffectRow)`。
+    /// 与 ForAll 的区别：ForAll 跨函数泛型量化；Arrow 标记具体函数类型的 effect。
+    /// 老 `Closure` / `Task` 类型视为 `Arrow(_, _, Empty)`。
+    Arrow(Box<Type>, Box<Type>, crate::mir::effect::EffectRow),
 } // ← close pub enum Type
 
 impl Type {
@@ -196,6 +202,15 @@ impl Type {
             Type::ForAll(vars, inner) => {
                 let names: Vec<String> = vars.iter().map(|v| format!("'{}", v)).collect();
                 format!("forall<{}>. {}", names.join(", "), inner.name())
+            }
+            // v0.80: 函数类型带 effect row —— `fn (T) -> U ! {Ai, Fs}` 形式。
+            Type::Arrow(input, output, row) => {
+                let row_str = row.to_string();
+                if row_str == "pure" {
+                    format!("fn ({}) -> {}", input.name(), output.name())
+                } else {
+                    format!("fn ({}) -> {} ! {{ {} }}", input.name(), output.name(), row_str)
+                }
             }
             // v0.13: Union 类型显示为 "T1 | T2 | T3"
             Type::Union(members) => {

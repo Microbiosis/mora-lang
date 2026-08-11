@@ -11,7 +11,9 @@
 // ── MirExpr-based lowering (v0.55: V3 pipeline) ──
 
 use super::{Label, MirFunction, MirInst, Reg};
-use crate::mir::expr::MirExpr;
+use crate::mir::expr::{MirExpr, MirExprKind};
+use crate::mir::witness::MirWitness;
+use crate::value::Value;
 
 /// 对 MirExpr 列表做类型检查（委托 check_program_mir HM 推断引擎）
 pub fn typecheck_mir_exprs(_exprs: &mut [MirExpr]) -> Vec<crate::typeck::TypeError> {
@@ -159,6 +161,29 @@ impl MirExprLowerer {
             _ => return,
         };
         self.effects.extend(label);
+    }
+
+    /// v0.80: helper for handle block — lower a MirExpr as a block (sequence of statements).
+    /// Used when we need to emit a sub-MirFunction body (each block has its own EmitContext).
+    /// Returns (last_reg, witness) — same as emit_block_w in parser_v3.
+    fn emit_block_via_expr_w(&mut self, expr: &MirExpr) -> Result<(Reg, MirWitness), String> {
+        // Sequence expression: lower each statement; last reg is the result.
+        let MirExprKind::Sequence(stmts) = &expr.kind else {
+            // Single expression (e.g., `handle Ef { print(1) } { print("k") }`)
+            // — wrap as a single-statement sequence.
+            return self
+                .lower_expr(expr)
+                .map(|r| (r, empty_witness_for_expr(expr)));
+        };
+        let mut last_reg = 0;
+        let stmt_wits: Vec<MirWitness> = Vec::new();
+        for stmt in stmts {
+            let reg = self.lower_expr(stmt)?;
+            last_reg = reg;
+            // The witness isn't preserved at this lowering stage (it's stored elsewhere).
+            let _ = stmt_wits;
+        }
+        Ok((last_reg, empty_witness_for_expr(expr)))
     }
 
     /// Lower expression → returns result register
@@ -713,6 +738,72 @@ impl MirExprLowerer {
                 let dst = self.alloc_reg();
                 self.emit(MirInst::Const(dst, crate::value::Value::Nil));
                 Ok(dst)
+            }
+            // v0.80: algebraic effects lowering（Stage 2/4 落地）。
+            //
+            // Perform:
+            //   按顺序 lower 每个 arg → Vec<Reg>，
+            //   emit MirInst::Perform(dst, effect_name, arg_regs)。
+            //   与 Call 不同：Perform 不查询宿主全局环境（builtin.dispatch），
+            //   effect handler 必须由 handle 块安装（编译期 + 运行期双重检查）。
+            MirExprKind::Perform { effect, args } => {
+                let mut arg_regs = Vec::new();
+                for arg in args {
+                    let r = self.lower_expr(arg)?;
+                    arg_regs.push(r);
+                }
+                let dst = self.alloc_reg();
+                self.emit(MirInst::Perform {
+                    dst,
+                    effect: effect.clone(),
+                    args: arg_regs,
+                });
+                Ok(dst)
+            }
+            // Handle:
+            //   1. 每个子 block（body + handler）独立 EmitContext（独立寄存器空间）
+            //   2. 内部 emit 完 Const(dst, ...) 表达 body 末尾表达式的值
+            //   3. emit MirInst::Handle { dst, body_mir, handler_mir, k_param, k_dst }
+            //   注：第一版 handler 写死与 body 等价；Stage 2.x 升级到 multi-shot
+            //   continuation 时 handler 与 body 分离。
+            MirExprKind::Handle {
+                effect,
+                body,
+                handler,
+                k_param,
+            } => {
+                // body 块独立 EmitContext（独立寄存器空间）
+                let body_outer = std::mem::replace(&mut self.emit, EmitContext::new());
+                let (body_reg, body_w) = self.emit_block_via_expr_w(body)?;
+                let body_inner = std::mem::replace(&mut self.emit, body_outer);
+                let body_mir = {
+                    let mut tmp = MirExprLowerer::new();
+                    tmp.emit = body_inner;
+                    tmp.finish()
+                };
+
+                // handler 块独立 EmitContext
+                let handler_outer = std::mem::replace(&mut self.emit, EmitContext::new());
+                let (handler_reg, handler_w) = self.emit_block_via_expr_w(handler)?;
+                let handler_inner = std::mem::replace(&mut self.emit, handler_outer);
+                let handler_mir = {
+                    let mut tmp = MirExprLowerer::new();
+                    tmp.emit = handler_inner;
+                    tmp.finish()
+                };
+
+                // 顶层 emit：Handle 指令 + 末尾 Const(nil) 作为返回值
+                let k_dst = self.alloc_reg();
+                self.emit.emit(MirInst::Handle {
+                    effect: effect.clone(),
+                    body: Box::new(body_mir),
+                    handler: Box::new(handler_mir),
+                    k_param: k_param.clone(),
+                    k_dst,
+                });
+                self.emit.emit(MirInst::Const(k_dst, Value::Nil));
+                let _ = (body_reg, handler_reg, body_w, handler_w);
+                Ok(k_dst)
             } // ── Grouping (transparent) ──
               // v0.75.20: MirExprKind::Grouping 已删（mir_group 恒等函数，
               // 从未产出包裹节点；括号仅作优先级，parse 时不建节点）。
@@ -722,6 +813,19 @@ impl MirExprLowerer {
 
 /// Convert MirExpr Pattern to string representation for MatchExpr.
 /// v0.75.40: pub — ParserV3 单遍编译（emit_match_arm）复用同一序列化。
+/// v0.80: 占位 MirWitness —— handle 块嵌套 lowering 时，body/handler 块
+/// 的 witness 由 parser 产生，但 lower 阶段我们只 emit IR（MirInst），
+/// 不重复构建 witness —— 返回一个 Nil 字面量 witness 作 placeholder。
+/// Stage 2.x 升级可走 witness-level emit 重构。
+fn empty_witness_for_expr(expr: &MirExpr) -> MirWitness {
+    MirWitness {
+        kind: crate::mir::witness::WitnessKind::Literal(
+            crate::common::Literal::Nil(expr.span),
+        ),
+        span: expr.span,
+    }
+}
+
 pub fn pattern_to_string(pattern: &crate::mir::expr::Pattern) -> String {
     use crate::mir::expr::Pattern;
     match pattern {

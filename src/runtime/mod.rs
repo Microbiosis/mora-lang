@@ -17,6 +17,8 @@ pub mod ai;
 // 自 src/ai_infra.rs 迁入；12 个出生即死的规划类型随旧文件删除
 pub mod ai_infra;
 pub mod core;
+// v0.80: EffectHandler trait + EffectRegistry（Stage 2/4 algebraic effects 落地）
+pub mod effect;
 pub mod infra;
 pub mod orch;
 pub mod persist;

@@ -177,6 +177,59 @@ pub enum MirInst {
         jit: bool,
     },
 
+    // v0.80: 代数效应（Stage 2/4 落地）— Koka-style perform/handle。
+    //
+    // 设计合约（与 docs/fp-impl-roadmap.md §2.1 一致）：
+    //
+    // **Perform**: 执行一个具名 effect。
+    // - `dst`: 返回值寄存器（None 表示 effect 无返回值）。
+    // - `effect`: effect 标签（字符串），例如 "Ai", "Fs", "Bsp"。
+    //   与 EffectRow::Cons(head, ...) 中的 head 同名。
+    // - `args`: 参数寄存器列表（解释器从 regs[args[i]] 取值）。
+    //
+    // 运行时机制：
+    // 1. 解释器从 regs[args[i]] 取所有参数值为 Vec<Value>
+    // 2. 调用 interp.perform_effect(effect, args) → Option<Value>
+    //    - 若有 handle 块已安装 handler → handler 处理
+    //    - 否则返回 None → 编译期漏检报错（unhandled effect: ...）
+    // 3. 结果写入 regs[dst]
+    //
+    // **Handle**: 安装 effect handler（围栏式 delimited binding）。
+    // - `effect`: 拦截的 effect 标签
+    // - `body`: handler 管辖的子 MirFunction（解释器递归执行）
+    // - `handler`: handler 实现的子 MirFunction（解释器递归执行）
+    // - `k_param`: 在 handler 中 resume 续名的参数名（如同 lambda 参数）
+    // - `k_dst`: resume 调用的结果寄存器（handler 末尾的 resume "k" 续名）
+    //
+    // 运行时机制（delimited continuation）：
+    // 1. 保存当前环境的 clone 给 body
+    // 2. install_effect_handler(effect, this_handler)
+    // 3. execute body via run_mir
+    // 4. 卸载 handler（restore_effect_handler）
+    //
+    // 类型约束（Stage 2.2 强制）：
+    // - body 必须有 EffectRow 包含 `effect` 标签
+    // - handler 必须是 Arrow(args, return_type, EffectRow') 形式
+    // - 整个 handle 块的 effect = body.effects - {effect} + handler.effects
+    //
+    // 与 Koka/Eff/Frank 的差异：
+    // - Koka: handlers 是普通函数 +
+    //   resume 可多次调用（multi-shot）；本实现第一版是 single-shot
+    // - Frank: handler 是普通函数（无特殊语法）；本实现 handler 是 MirFunction
+    // - 共同点：handler 是 first-class value，可在栈上 install/take/restore
+    Perform {
+        dst: Reg,
+        effect: String,
+        args: Vec<Reg>,
+    },
+    Handle {
+        effect: String,
+        body: Box<MirFunction>,
+        handler: Box<MirFunction>,
+        k_param: String,
+        k_dst: Reg,
+    },
+
     // v0.75.26: StreamFor 已删除——死原语（零构造点、零测试引用、语义被
     // ai.chat 的 stream:true 参数路径取代；handler 空转：prompt_reg/var 被忽略、
     // body 仅执行一次并丢弃）。流式语义若需 MIR 指令级支持，重新设计而非复活旧形状。

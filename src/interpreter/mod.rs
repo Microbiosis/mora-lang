@@ -194,6 +194,47 @@ impl crate::mir::host::MirHost for Interpreter {
         Interpreter::mir_restore_config(self)
     }
 
+    // v0.80: algebraic effects 完整接口（Stage 2/4 落地）。
+    //
+    // 这些方法桥接到 CoreRuntime::effect_handlers（EffectRegistry）。
+    // 完整语义见 src/runtime/effect.rs 与 src/mir/handlers.rs::h_perform/h_handle。
+fn perform_effect(&mut self, effect: &str, args: Vec<Value>) -> Option<Value> {
+    // 取出栈顶 handler（move 出以释放借用），再访问 env。
+    let mut handler = {
+        let core = &mut self.core.effect_handlers;
+        core.take(effect)?
+    };
+    let body_env = Arc::new(Mutex::new(self.environment().lock().clone()));
+    let k_dst = 0;
+    let result = handler.perform(args, body_env, k_dst);
+    // 还原（perform 不是消费性：take 只是临时释放借用）
+    self.core.effect_handlers.install(effect.to_string(), handler);
+    result.ok()
+}
+
+    fn install_effect_handler(
+        &mut self,
+        effect: String,
+        handler: Box<dyn crate::runtime::effect::EffectHandler>,
+    ) {
+        self.core.effect_handlers.install(effect, handler);
+    }
+
+    fn take_effect_handler(
+        &mut self,
+        effect: &str,
+    ) -> Option<Box<dyn crate::runtime::effect::EffectHandler>> {
+        self.core.effect_handlers.take(effect)
+    }
+
+    fn restore_effect_handler(
+        &mut self,
+        effect: String,
+        prev: Option<Box<dyn crate::runtime::effect::EffectHandler>>,
+    ) {
+        self.core.effect_handlers.restore(effect, prev);
+    }
+
     fn current_merge_strategies(&self) -> Option<HashMap<String, crate::value::MergeStrategy>> {
         self.current_merge_strategies()
     }

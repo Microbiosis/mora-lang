@@ -8,9 +8,13 @@ use std::collections::HashMap;
 use super::error::TypeError;
 
 ///  A substitution maps type variables to concrete types
+/// v0.80: 同时映射 row 变量（EffectRow::Var 的 String 名）到具体 row。
 #[derive(Debug, Clone)]
 pub struct Substitution {
     mapping: HashMap<char, crate::typeck::Type>,
+    /// v0.80: row 变量绑定（EffectRow 共享 typeck 命名空间，但用 String 名而非 char。
+    /// 原因：EffectRow::Var(String) 是公开类型，char 转换会引起兼容成本）。
+    row_mapping: HashMap<String, crate::mir::effect::EffectRow>,
 }
 
 impl Substitution {
@@ -18,7 +22,19 @@ impl Substitution {
     pub fn new() -> Self {
         Self {
             mapping: HashMap::new(),
+            row_mapping: HashMap::new(),
         }
+    }
+
+    /// v0.80: row var 查询（String 键，与 EffectRow::Var(String) 同空间）。
+    pub fn lookup_row(&self, name: &str) -> Option<&crate::mir::effect::EffectRow> {
+        self.row_mapping.get(name)
+    }
+
+    /// v0.80: row var 绑定（直接覆盖，不做 occur check — Phase 2 仅用于
+    /// builtin 累积（已被 lower 阶段解析），后期 row-poly HM 加 occur check）。
+    pub fn bind_row(&mut self, name: String, row: crate::mir::effect::EffectRow) {
+        self.row_mapping.insert(name, row);
     }
 
     /// Apply substitution to a type (replace all type variables)
@@ -63,6 +79,7 @@ impl Substitution {
         new_mapping.insert(var, ty);
         Ok(Self {
             mapping: new_mapping,
+            row_mapping: self.row_mapping.clone(),
         })
     }
 
@@ -77,6 +94,7 @@ impl Substitution {
 
         Self {
             mapping: new_mapping,
+            row_mapping: self.row_mapping.clone(),
         }
     }
 }

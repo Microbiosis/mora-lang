@@ -300,6 +300,26 @@ pub enum MirExprKind {
         params: Vec<String>,
     },
 
+    /// v0.80: algebraic effects expression forms（Stage 2/4 落地）。
+    ///
+    /// Perform: `perform Effect(args)` — 触发一个具名 effect。
+    /// Parse-time 校验：args 必须表达式（by MirExpr 二级树）。
+    /// Lowering 后 emit `MirInst::Perform(dst, effect, args)`。
+    Perform {
+        effect: String,
+        args: Vec<MirExpr>,
+    },
+
+    /// Handle: `handle Effect { body } { handler }` — 安装 effect handler。
+    /// body 与 handler 都是 MirExpr 块 lowering 出的 MirFunction。
+    /// Stage 2.x 升级：handler 可使用 `resume "k" resume-value` 续名续。
+    Handle {
+        effect: String,
+        body: Box<MirExpr>,
+        handler: Box<MirExpr>,
+        k_param: String,
+    },
+
     /// Sequence of expressions (blocks with multiple statements)
     Sequence(Vec<MirExpr>),
 }

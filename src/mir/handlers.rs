@@ -295,6 +295,83 @@ pub fn h_with_config(
     Ok(())
 }
 
+// v0.80: algebraic effects 的完整实现（Stage 2/4 Stage 2.5 落地）。
+//
+// 设计：perform/handle 走单遍解释（single-shot continuation）。
+// handler 是 first-class MirFunction，由 interp 的 effect_handler 注册表管理。
+// handle 块进入时 install_effect_handler，退出时 restore（嵌套 handle 栈）。
+//
+// 完整契约（与 docs/fp-impl-roadmap.md §2.3 一致）：
+// - h_perform: 从 args 取值，调用 interp.perform_effect(effect, args)
+//   → Option<Value>。None = 编译期漏检（handler 未安装）。
+// - h_handle: install handler → 执行 body → restore handler。
+//   body 内的 perform X 调用都路由到该 handler。
+//   handler 末尾的 resume "k" 续名（标准做法是 h_handle 隐式 emit Const(dst, ...)）
+//   写结果到 k_dst；当前实现为第一版 single-shot，handler 最后一句表达式自动 resume 一次。
+pub fn h_perform(
+    regs: &mut [Value],
+    dst: Reg,
+    effect: &str,
+    args: &[Reg],
+    interp: &mut dyn crate::mir::host::MirHost,
+) -> Result<(), String> {
+    let arg_vals: Vec<Value> = args.iter().map(|r| regs[*r].clone()).collect();
+    match interp.perform_effect(effect, arg_vals) {
+        Some(reply) => {
+            regs[dst] = reply;
+            Ok(())
+        }
+        None => Err(format!(
+            "unhandled effect: {} (no handle block in scope; this is a compile-time error that should have been caught by typeck)",
+            effect
+        )),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn h_handle(
+    interp: &mut dyn crate::mir::host::MirHost,
+    env: &mut crate::value::Environment,
+    regs: &mut [Value],
+    effect: &str,
+    body: &crate::mir::MirFunction,
+    handler: &crate::mir::MirFunction,
+    k_param: &str,
+    k_dst: Reg,
+) -> Result<(), String> {
+    // 1. 保存当前 handler（嵌套 handle 栈）
+    let prev_handler = interp.take_effect_handler(effect);
+
+    // 2. 安装新 handler
+    interp.install_effect_handler(
+        effect.to_string(),
+        Box::new(crate::runtime::effect::HandlerClosure {
+            effect: effect.to_string(),
+            handler_mir: std::sync::Arc::new(handler.clone()),
+            body_arc: std::sync::Arc::new(body.clone()),
+            env: std::sync::Arc::new(parking_lot::Mutex::new(env.clone())),
+            k_param: k_param.to_string(),
+        }),
+    );
+
+    // 3. 执行 body（独立 env 克隆）
+    let mut body_env = env.clone();
+    let body_arc = std::sync::Arc::new(body.clone());
+    let result = crate::mir::vm::run_mir(&body_arc, interp, &mut body_env);
+
+    // 4. 恢复 handler（无论 body 成功/失败）
+    interp.restore_effect_handler(effect.to_string(), prev_handler);
+
+    // 5. 写结果：body 末尾表达式的值（如果有）
+    match result {
+        Ok(v) => {
+            regs[k_dst] = v;
+            Ok(())
+        }
+        Err(e) => Err(e),
+    }
+}
+
 pub fn h_macro_def(env: &mut Environment, name: &str, params: &[String]) {
     env.define(
         name.to_string(),

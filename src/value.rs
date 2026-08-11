@@ -9,6 +9,10 @@ use std::collections::HashMap;
 use std::io::BufReader;
 use std::sync::Arc;
 
+// v0.78: HAMT persistent map（feature = "persistent_env" 时挂入 Environment）
+#[cfg(feature = "persistent_env")]
+pub mod persistent;
+
 // v1 Stmt 已移除 — Value::Task/Closure 不再持有 body
 
 // ─── StreamReader ─────────────────────────────────────────
@@ -579,6 +583,14 @@ pub struct Environment {
     pub versions: HashMap<String, VectorClock>,
     /// v0.61: This environment's own vector clock.
     pub clock: VectorClock,
+    /// v0.78: 可选 HAMT 镜像 — `feature = "persistent_env"` 时填充。
+    /// 闭包捕获、agent state undo/redo 时使用纯不可变版本。
+    /// 默认 None（零开销，opt-in）。
+    #[cfg(feature = "persistent_env")]
+    pub persistent_mirror: Option<persistent::PersistentMap>,
+    /// v0.78: 没有 persistent_env feature 时的占位（保持 struct 布局不变）。
+    #[cfg(not(feature = "persistent_env"))]
+    pub persistent_mirror: Option<()>,
 }
 
 impl Default for Environment {
@@ -595,6 +607,7 @@ impl Environment {
             parent: None,
             versions: HashMap::new(),
             clock: VectorClock::default(),
+            persistent_mirror: None,
         }
     }
 
@@ -605,6 +618,7 @@ impl Environment {
             parent: Some(parent),
             versions: HashMap::new(),
             clock: VectorClock::default(),
+            persistent_mirror: None,
         }
     }
 

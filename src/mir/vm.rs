@@ -380,6 +380,7 @@ mod tests {
             params: vec![],
             body,
             n_regs,
+            ..Default::default()
         };
         let mut interp = Interpreter::new();
         let mut env = interp.take_env();
@@ -451,6 +452,7 @@ mod tests {
             params: vec![],
             body: body.clone(),
             n_regs,
+            ..Default::default()
         };
         let dag = crate::mir::dag::dag_analyze(&func);
         let mut memo = DagExecMemo::new();
@@ -495,11 +497,13 @@ mod tests {
             params: vec![],
             body: body.clone(),
             n_regs,
+            ..Default::default()
         });
         let func = MirFunction {
             params: vec![],
             body,
             n_regs,
+            ..Default::default()
         };
         let mut memo = DagExecMemo::new();
         let run = |env_val: i64, memo: &mut DagExecMemo| -> Value {
@@ -530,11 +534,13 @@ mod tests {
             params: vec![],
             body: body.clone(),
             n_regs,
+            ..Default::default()
         });
         let func = MirFunction {
             params: vec![],
             body,
             n_regs,
+            ..Default::default()
         };
         let mut memo = DagExecMemo::new();
         let run = |memo: &mut DagExecMemo| -> Value {

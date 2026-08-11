@@ -851,6 +851,7 @@ fn run_moe_expert(
                 params: vec![],
                 body,
                 n_regs: nxt,
+                ..Default::default()
             };
             let mut expert_env = env.clone();
             crate::mir::vm::run_mir(&std::sync::Arc::new(body_fn), interp, &mut expert_env)
@@ -1126,6 +1127,7 @@ fn build_proposer_body(
                 params: vec![],
                 body: vec![],
                 n_regs: 0,
+                ..Default::default()
             });
         body.extend(lowered.body.iter().cloned());
         nxt = nxt.max(lowered.n_regs);
@@ -1145,6 +1147,7 @@ fn build_proposer_body(
                 params: vec![],
                 body: vec![],
                 n_regs: 0,
+                ..Default::default()
             });
         body.extend(lowered.body.iter().cloned());
         nxt = nxt.max(lowered.n_regs);
@@ -1213,6 +1216,7 @@ fn build_proposer_body(
         params: vec![],
         body,
         n_regs: nxt.max(1),
+        ..Default::default()
     }
 }
 
@@ -1321,6 +1325,7 @@ fn build_aggregator_body(layer: usize, aggregator: &str, n_proposers: usize) -> 
         params: vec![],
         body,
         n_regs: nxt.max(1),
+        ..Default::default()
     }
 }
 
@@ -1398,6 +1403,7 @@ pub fn h_skill_def(
             params: vp.clone(),
             body: Vec::new(),
             n_regs: 0,
+            ..Default::default()
         };
         let verify_mir = v.body.clone().unwrap_or(empty);
         let _ = verify_body;

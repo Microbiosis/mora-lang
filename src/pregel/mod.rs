@@ -425,6 +425,7 @@ impl MirPregelEngine {
                 params: Vec::new(),
                 body: Vec::new(),
                 n_regs: 0,
+                ..Default::default()
             });
         };
         let arc = std::sync::Arc::new(self.config.agents[agent_idx].task_body.clone());
@@ -1375,7 +1376,8 @@ mod tests {
             params: Vec::new(),
             body: Vec::new(),
             n_regs: 0,
-        }
+        
+            ..Default::default()}
     }
 
     fn make_agent(name: &str) -> MirAgentDef {
@@ -1609,7 +1611,8 @@ mod tests {
                     MirInst::Return(Some(0)),
                 ],
                 n_regs: 1,
-            },
+            
+            ..Default::default()},
             combiner_body: None,
         }
     }
@@ -1707,7 +1710,8 @@ mod tests {
                 MirInst::Return(Some(2)),
             ],
             n_regs: 3,
-        };
+        
+            ..Default::default()};
         let config = MirPregelConfig {
             agents: vec![MirAgentDef {
                 name: "a".into(),
@@ -1787,7 +1791,8 @@ mod tests {
             params: Vec::new(),
             body: vec![MirInst::Const(0, Value::Nil), MirInst::Return(None)],
             n_regs: 1,
-        };
+        
+            ..Default::default()};
         let config = MirPregelConfig {
             agents: vec![make_const_agent("a", 1)],
             edges: vec![MirEdgeDef {
@@ -1818,7 +1823,8 @@ mod tests {
             params: Vec::new(),
             body: vec![MirInst::Call(0, "__no_such_fn__".to_string(), Vec::new())],
             n_regs: 1,
-        };
+        
+            ..Default::default()};
         let config_bad = MirPregelConfig {
             agents: vec![make_const_agent("a", 1)],
             edges: vec![MirEdgeDef {
@@ -1853,7 +1859,8 @@ mod tests {
             params: Vec::new(),
             body: vec![MirInst::Const(0, Value::Int(99)), MirInst::Halt(Some(0))],
             n_regs: 1,
-        };
+        
+            ..Default::default()};
         let config = MirPregelConfig {
             agents: vec![MirAgentDef {
                 name: "a".into(),
@@ -2070,6 +2077,7 @@ mod tests {
                 MirInst::Return(Some(0)),
             ],
             n_regs: 1,
+            ..Default::default()
         };
         let agent_a = MirAgentDef {
             name: "a".into(),
@@ -2139,6 +2147,7 @@ mod tests {
                 MirInst::Return(Some(0)),
             ],
             n_regs: 1,
+            ..Default::default()
         };
         let agent_a = MirAgentDef {
             name: "a".into(),
@@ -2239,7 +2248,8 @@ mod tests {
                 MirInst::Return(Some(4)),
             ],
             n_regs: 5,
-        };
+        
+            ..Default::default()};
         let config = MirPregelConfig {
             agents: vec![heavy.clone(), make_const_agent("light", 7)],
             edges: vec![
@@ -2403,6 +2413,7 @@ mod tests {
                     MirInst::Return(Some(0)),
                 ],
                 n_regs: 1,
+                ..Default::default()
             },
         );
         let a2 = make_custom_agent(
@@ -2418,6 +2429,7 @@ mod tests {
                     MirInst::Return(Some(0)),
                 ],
                 n_regs: 1,
+                ..Default::default()
             },
         );
         // b 含纯前缀 Const(100) + 非纯 Var(input) + Return — 第二次运行应跳过 Const。
@@ -2431,7 +2443,8 @@ mod tests {
                     MirInst::Return(Some(0)),
                 ],
                 n_regs: 2,
-            },
+            
+            ..Default::default()},
         );
         let config = MirPregelConfig {
             agents: vec![a1, a2, b],
@@ -2512,6 +2525,7 @@ mod tests {
                     MirInst::Return(Some(0)),
                 ],
                 n_regs: 1,
+                ..Default::default()
             },
         );
         let a2 = make_custom_agent(
@@ -2527,6 +2541,7 @@ mod tests {
                     MirInst::Return(Some(0)),
                 ],
                 n_regs: 1,
+                ..Default::default()
             },
         );
         // b 读 input_input（消息 channel 名就是 "input"；逐 channel 细粒度
@@ -2540,7 +2555,8 @@ mod tests {
                     MirInst::Return(Some(0)),
                 ],
                 n_regs: 1,
-            },
+            
+            ..Default::default()},
         );
         let config = MirPregelConfig {
             agents: vec![a1, a2, b],

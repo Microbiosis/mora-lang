@@ -1356,6 +1356,7 @@ impl ParserV3 {
                 params: vec![],
                 body: vec![],
                 n_regs: 0,
+                ..Default::default()
             }
         };
         self.consume(TokenType::End, "Expected 'end' after transaction")?;
@@ -2088,6 +2089,7 @@ impl ParserV3 {
                             params: vec![],
                             body: vec![],
                             n_regs: 0,
+                            ..Default::default()
                         },
                         combiner_body: None,
                     });

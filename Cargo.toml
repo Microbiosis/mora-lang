@@ -95,6 +95,9 @@ proptest = "1.7"
 
 [features]
 checkpoint-sqlite = ["rusqlite"]
+# v0.78: HAMT Environment — opt-in persistent state for agent undo/redo,
+# closure capture, time-travel debugging. Default OFF（零运行时开销）。
+persistent_env = []
 # v0.75.43: copy-and-patch JIT 零外部依赖（纯 std + 手写机器码模板），
 # 无 feature gate — 始终编译，未覆盖指令自动回落 MIR 解释器。
 # （v0.75.34 前的 jit = ["dep:inkwell"] LLVM 路线已废弃删除。）

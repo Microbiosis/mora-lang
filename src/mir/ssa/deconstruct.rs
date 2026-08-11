@@ -415,5 +415,6 @@ pub fn deconstruct(ssa: &MirSsaFunction) -> MirFunction {
         // 丢弃导致 `--opt` 下 task main 消失。
         body: ssa.passthrough.iter().cloned().chain(body).collect(),
         n_regs: next_plain_reg,
+        ..Default::default()
     }
 }

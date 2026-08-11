@@ -24,6 +24,8 @@ use crate::common::BinaryOp;
 use crate::value::Value;
 
 pub mod cache;
+// v0.78: EffectRow — algebraic effect 的类型表示（Stage 1/4 落地）
+pub mod effect;
 pub mod expr;
 pub mod hint;
 pub mod host;
@@ -58,6 +60,22 @@ pub struct MirFunction {
     pub params: Vec<String>,
     pub body: Vec<MirInst>,
     pub n_regs: usize,
+    /// v0.78: 累积的 effect row。Empty = pure (backward-compatible default)。
+    /// lowering 时由 mir/lower.rs::MirExprLowerer::classify_call_effect 累积。
+    /// 阶段 2 引入 Type::Arrow 时，本字段与 HM 类型系统对接。
+    pub effects: effect::EffectRow,
+}
+
+impl Default for MirFunction {
+    #[allow(clippy::derivable_impls)]
+    fn default() -> Self {
+        Self {
+            params: Vec::new(),
+            body: Vec::new(),
+            n_regs: 0,
+            effects: effect::EffectRow::default(),
+        }
+    }
 }
 
 /// MIR 指令（α.0 + α.1 子集）

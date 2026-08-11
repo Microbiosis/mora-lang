@@ -137,15 +137,16 @@ jobs:
 
       - name: Run example scripts
         run: |
-          # v0.36: examples/* in repo root + select items from _legacy/ that
-          # still parse. Skip others.
+          # v0.77: 去掉 `|| true` — examples 必须真跑通才能让 CI 绿。
+          # 任何 demo 回归都会被这条命令捕获（之前会被吞错）。
+          # examples/_legacy/ 已删除（v0.77 测试重构）。
           for f in examples/integration_v0_34.mora \
                    examples/compact_demo.mora \
                    examples/compress_demo.mora \
                    examples/compress_smart_demo.mora \
                    examples/mcp_server_demo.mora; do
             echo "=== $f ==="
-            ./target/release/mora "$f" || true
+            ./target/release/mora "$f"
           done
 
   lsp:

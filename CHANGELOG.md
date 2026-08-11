@@ -2,6 +2,69 @@
 
 All notable changes to Mora will be documented in this file.
 
+## [v0.77.00] — 2026-08-11 — test: 测试体系重构（三层架构 + proptest 重启 + JSON 数字解析修复）
+
+**目的**：清理历史测试死代码、建立「核心单元 + 集成 + E2E」三层架构、
+重新启用 `proptest` 属性测试、修复 `parse_json_number` Int 解析回归。
+
+**清理**（删除 7 个文件）：
+- `tests/debug_parse.rs` — 1 个调试一次性脚本（6 个 eprintln! + 1 弱断言）
+- `tests/mir_ssa_debug.rs` — 1 个 zero-assertion dump 测试
+- `tests/tier0_builtin_dispatch.rs` — 4 个 100% source-grep 测试 + 损坏 CJK 头
+- `proptest-regressions/` — 6 个 orphan seeds（owner `src/semantics_tests.rs` 在 commit 09ba51a 删除）
+- `tests/parser_v2_integration.rs` — 6 个 V2 残留测试（迁移到 E2E 后删除）
+- `examples/_legacy/` — 18 个 V1 demos（仅被 parser_v2_integration 引用）
+- `tests/tier0_closure_mir.rs` / `tier0_trait_mir.rs` / `tier0_dyntrait.rs` —
+  保留 runtime 测试，重命名为 `mir_closure.rs` / `mir_trait.rs` / `mir_dyntrait.rs`
+  并精确删除其中 11 个 source-grep 静态合约测试（任何改名假阳性断裂、零 runtime 保护）
+
+**合并**：
+- `tests/mir_orchestrate_lowering.rs` (5 测试) 合并到 `tests/orchestrate_v3_pipeline.rs`
+
+**新增**（填补 0 测试覆盖的高价值模块）：
+- `src/lexer.rs`：13 个单元测试（TokenType 分类、空串、UTF-8、数字字面量、字符串转义、注释跳过、行号）
+- `src/mir/inst.rs`：6 个单元测试（dst()/input_regs()/is_effect()/map_regs() API 契约）
+- `src/runtime/types.rs`：5 个单元测试（LruCache LRU 算法 + impl_method_key 格式契约）
+- `src/typeck/imports.rs`：6 个单元测试（sanitize 类型安全化 + 跨模块 import 错误处理）
+
+**新增 E2E 测试架构**：
+- `tests/e2e.rs`（13 测试）+ `tests/e2e_helpers.rs`（共享 harness）+
+  `tests/fixtures/e2e/*.mora`（8 fixtures）
+- 镜像 `main.rs::run_file` 调用栈：`cli::compile_and_opt → typeck → vm::run_mir → run_main_task`
+- 路径用 `env!("CARGO_MANIFEST_DIR")`，无 cwd 隐性依赖
+
+**新增 proptest**（重启 `proptest = "1.7"` 死依赖）：
+- `tests/proptest_compile_lower.rs`：1 proptest（compile vs parse+lower 双路径等价）
+- `tests/proptest_lexer.rs`：3 proptests（任意输入不 panic + EOF 终结 + 控制字符容忍）
+- `tests/proptest_vectorclock.rs`：3 proptests（merge 可交换 / 幂等 / 反自反）
+
+**修复**：
+- `src/flow/json.rs::parse_json_number`：整数（无小数点 + 无指数）→ `Value::Int` 而非 `Value::Float`。
+  修复上一会话遗留的「JSON 数字丢失 Int 类型」测试断言（`flow::tests::json_to_value_dict_*`），
+  checkpoint round-trip 不再将整数 42 序列化为 42.0。
+
+**CI 修复**（`.github/workflows/ci.yml:148`）：
+- 删除 examples `|| true` 吞错 — 任何 demo 回归会让 CI 红。
+
+**不变量保护**（按用户选项「保留 tier1/tier2 主路径 + compile/jit/ssa 等价性」）：
+- `compile_differential.rs` (22)、`jit_compile.rs` (17)、`mir_ssa_roundtrip.rs` (10)
+- `tier1_typeck_mir.rs` (32)、`tier2_mir_expr_pipeline.rs` (62)、`tier0_replacement.rs` (9)
+- `parser_v3_coverage.rs` (11)、`parser_v3_minimal.rs` (8)、`orchestrate_v3_pipeline.rs` (12)
+- 所有 src/ 内 708 inline 单元测试（一个未删） + 记录（17）文件路径未变
+
+**clippy**：`cargo clippy --all-targets --all-features -- -D warnings` 全绿。
+
+**测试统计**：
+- 集成测试文件：18 → 16（删 3 + 合 1，E2E + 3 proptest 新增）
+- 集成测试函数：224 → ~190（剪枝 13 source-grep - 合 5 + 新增 13 E2E + 7 proptest）
+- inline 单元测试：708 → ~735（精简无关 + 新增 ~30 跨 4 个 0 测试模块）
+- examples/_legacy/：18 个文件删除
+- proptest cases：每个 proptest 32-64 random cases 自动生成
+
+**未修复**（非本任务范围）：
+- `tests/compile_differential.rs` 3 测试 + `tests/tier1_typeck_mir.rs` 12 测试
+  在 main 分支上即失败（git stash 验证），与本次重构无关。
+
 **关于历史版本（v0.30 及更早）**：2026-08-04 编码错误清理前，v0.30
 及更早条目的中文短语被 AI 生成阶段的渲染 bug 替换为 4 连星号占位符。
 本版本已切除 v0.30 → v0.13 共 22 个损坏条目（4,000+ 处占位），

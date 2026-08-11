@@ -23,6 +23,7 @@ fn bench_func() -> MirFunction {
             MirInst::BinaryOp(6, 5, mora::common::BinaryOp::Div, 3), // 9.33
         ],
         n_regs: 7,
+        ..Default::default()
     }
 }
 

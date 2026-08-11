@@ -293,7 +293,8 @@ mod tests {
                         params: Vec::new(),
                         body: Vec::new(),
                         n_regs: 0,
-                    },
+                    
+            ..Default::default()},
                     combiner_body: None,
                 })
                 .collect()
@@ -367,7 +368,8 @@ mod tests {
                 params: vec![],
                 body: vec![],
                 n_regs: 0,
-            }),
+            
+            ..Default::default()}),
         };
         let populated = MirInst::Observe {
             config: "{}".to_string(),
@@ -378,7 +380,8 @@ mod tests {
                     MirInst::Const(1, Value::Int(99)),
                 ],
                 n_regs: 2,
-            }),
+            
+            ..Default::default()}),
         };
         assert!(
             cost.inst_cost(&populated) > cost.inst_cost(&empty_body),

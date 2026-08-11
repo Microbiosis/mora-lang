@@ -362,7 +362,8 @@ mod tests {
             params: vec![],
             body,
             n_regs: n,
-        };
+        
+            ..Default::default()};
         dag::dag_analyze(&func)
     }
 

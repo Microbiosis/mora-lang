@@ -675,6 +675,7 @@ mod tests {
             params: vec![],
             body,
             n_regs,
+            ..Default::default()
         }
     }
 

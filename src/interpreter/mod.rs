@@ -642,6 +642,7 @@ impl Interpreter {
                 params: Vec::new(),
                 body,
                 n_regs: func.n_regs,
+                ..Default::default()
             };
 
             // v0.75.9: 包裹 Arc 走全局 DAG 缓存（REPL 每行新建 func，天然独立缓存项）

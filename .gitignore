@@ -45,3 +45,7 @@ test_output.txt
 ARCHITECTURE_BUG_DETECTION_REPORT_*.md
 scripts/audit_stats.py
 scripts/audit_*.py
+
+# Mimosa 安全扫描缓存 (会话级产物，不应入仓)
+.mimosa/
+tests/.mimosa/

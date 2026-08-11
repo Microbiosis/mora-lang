@@ -126,12 +126,14 @@ fn runtime_transaction_success_path_via_mir() {
             MirInst::Define("x".to_string(), 0),
         ],
         n_regs: 1,
-    };
+    
+            ..Default::default()};
     let compensation = mora::mir::MirFunction {
         params: Vec::new(),
         body: vec![MirInst::Const(0, mora::value::Value::Int(0))],
         n_regs: 1,
-    };
+    
+            ..Default::default()};
     let func = MirFunction {
         params: Vec::new(),
         body: vec![MirInst::Transaction {
@@ -139,6 +141,7 @@ fn runtime_transaction_success_path_via_mir() {
             compensation: Box::new(compensation),
         }],
         n_regs: 1,
+        ..Default::default()
     };
     let mut interp = Interpreter::new();
     let mut env = interp.take_env();
@@ -162,12 +165,14 @@ fn runtime_transaction_rollback_path_via_mir() {
             MirInst::Rollback,
         ],
         n_regs: 1,
-    };
+    
+            ..Default::default()};
     let compensation = mora::mir::MirFunction {
         params: Vec::new(),
         body: vec![MirInst::Const(0, mora::value::Value::Int(99))],
         n_regs: 1,
-    };
+    
+            ..Default::default()};
     let func = MirFunction {
         params: Vec::new(),
         body: vec![MirInst::Transaction {
@@ -175,6 +180,7 @@ fn runtime_transaction_rollback_path_via_mir() {
             compensation: Box::new(compensation),
         }],
         n_regs: 1,
+        ..Default::default()
     };
     let mut interp = Interpreter::new();
     let mut env = interp.take_env();
@@ -236,7 +242,8 @@ fn mk_list_worker(items: Vec<f64>) -> MirFunction {
         params: Vec::new(),
         body,
         n_regs: r,
-    }
+    
+            ..Default::default()}
 }
 
 fn wrap_worker(name: &str, body: MirFunction) -> MirFunction {
@@ -250,6 +257,7 @@ fn wrap_worker(name: &str, body: MirFunction) -> MirFunction {
             MirInst::Halt(None),
         ],
         n_regs: 8,
+        ..Default::default()
     }
 }
 

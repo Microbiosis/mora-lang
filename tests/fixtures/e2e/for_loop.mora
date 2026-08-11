@@ -1,0 +1,7 @@
+task main()
+  let total = 0i
+  for x in [1i, 2i, 3i, 4i, 5i]
+    let total = total + x
+  end
+  print(total)
+end

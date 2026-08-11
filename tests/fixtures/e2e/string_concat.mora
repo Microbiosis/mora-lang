@@ -1,0 +1,5 @@
+task main()
+  let greeting = "hello"
+  let name = "world"
+  print(greeting + ", " + name)
+end

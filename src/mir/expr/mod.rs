@@ -76,6 +76,21 @@ impl MirExpr {
         }
     }
 
+    /// v0.80: 从 MirWitness 反向构造 MirExpr（用于 handle block 的 body/handler
+    /// 独立 lowering：parser 在 emit_handle_w 中调用 lower_block_witness_to_mir）。
+    pub fn from_witness(w: crate::mir::witness::MirWitness) -> Self {
+        // 第一版简化：把 witness 包成 Sequence(MirExpr::from_kind(w.kind))。
+        // MirExprKind 与 WitnessKind 是镜像（v0.55 后定义对齐）。
+        let expr_kind = witness_kind_to_expr_kind(w.kind);
+        Self {
+            kind: MirExprKind::Sequence(vec![Self {
+                kind: expr_kind,
+                span: w.span,
+            }]),
+            span: w.span,
+        }
+    }
+
     /// Create a variable reference
     pub fn var(name: impl Into<String>, span: Span) -> Self {
         Self {
@@ -141,6 +156,161 @@ impl MirExpr {
             },
             span,
         }
+    }
+}
+
+/// v0.80: WitnessKind → MirExprKind 转换（独立 helper — 从已存在的
+/// `MirExprKind::from_kind` 反方向走）。用于 handle block 的 body/handler
+/// 独立 lowering 路径（parser 把 handle block 的 witness 子树包成 MirExpr）。
+///
+/// 第一版（Stage 2.0）：每个 WitnessKind 走最直接的等价 MirExprKind。
+/// 语句型（LetBinding / Return 等）包成 Sequence 内的单条 expression。
+fn witness_kind_to_expr_kind(wk: crate::mir::witness::WitnessKind) -> MirExprKind {
+    use crate::mir::witness::WitnessKind;
+    match wk {
+        // 语句型：序列化为「Sequence([expr_or_stmt])」 —— Stage 2.0 单 statement
+        // 即可（第一版 let x = expr 转为 Expression{ Variable(x) }）。
+        WitnessKind::LetBinding { name, value, init_body, type_hint } => MirExprKind::LetBinding {
+            name,
+            type_hint: type_hint.map(|th| th.0),
+            value: Box::new(MirExpr::from_witness(*value)),
+            init_body: Box::new(MirExpr::from_witness(*init_body)),
+        },
+        // 表达式型：直接转（见 MirExprKind 各 variant 的构造）
+        WitnessKind::Literal(lit) => MirExprKind::Literal(lit),
+        WitnessKind::Variable(name) => MirExprKind::Variable(name),
+        WitnessKind::Binary { left, op, right } => MirExprKind::Binary {
+            left: Box::new(MirExpr::from_witness(*left)),
+            op,
+            right: Box::new(MirExpr::from_witness(*right)),
+        },
+        WitnessKind::And { left, right } => MirExprKind::And {
+            left: Box::new(MirExpr::from_witness(*left)),
+            right: Box::new(MirExpr::from_witness(*right)),
+        },
+        WitnessKind::Or { left, right } => MirExprKind::Or {
+            left: Box::new(MirExpr::from_witness(*left)),
+            right: Box::new(MirExpr::from_witness(*right)),
+        },
+        WitnessKind::Call { callee, args } => {
+            // WitnessCallee → MirCallee 转换
+            let mir_callee = match callee {
+                crate::mir::witness::WitnessCallee::Name(n) => crate::mir::expr::MirCallee::Name(n),
+                crate::mir::witness::WitnessCallee::Var(n) => crate::mir::expr::MirCallee::Var(n),
+                other => crate::mir::expr::MirCallee::Var(format!("{:?}", other)),
+            };
+            MirExprKind::Call {
+                callee: mir_callee,
+                args: args.into_iter().map(MirExpr::from_witness).collect(),
+            }
+        }
+        WitnessKind::MethodCall { receiver, method, args } => MirExprKind::MethodCall {
+            receiver: Box::new(MirExpr::from_witness(*receiver)),
+            method,
+            args: args.into_iter().map(MirExpr::from_witness).collect(),
+        },
+        WitnessKind::Closure { params, body } => {
+            // WitnessParam → expr::Param 转换。
+            // 注：Stage 2.0 第一版忽略 default（MirExpr::Param 有 Box<MirExpr>，
+            // 而 WitnessParam.default 是 Option<MirWitness>；类型不匹配需递归 from_witness）。
+            let mir_params = params
+                .into_iter()
+                .map(|wp| crate::mir::expr::Param {
+                    name: wp.name,
+                    type_hint: wp.type_hint.map(|th| th.0),
+                    default: None,
+                })
+                .collect();
+            MirExprKind::Closure {
+                params: mir_params,
+                body: Box::new(MirExpr::from_witness(*body)),
+            }
+        }
+        WitnessKind::FnDef { name, params, return_type, body } => {
+            let mir_params = params
+                .into_iter()
+                .map(|wp| crate::mir::expr::Param {
+                    name: wp.name,
+                    type_hint: wp.type_hint.map(|th| th.0),
+                    default: None,
+                })
+                .collect();
+            MirExprKind::FnDef {
+                name,
+                params: mir_params,
+                return_type: return_type.map(|th| th.0),
+                body: Box::new(MirExpr::from_witness(*body)),
+            }
+        }
+        WitnessKind::Match { scrutinee, arms } => {
+            // WitnessArm → MatchArm 转换（pattern 已是 WitnessPattern；
+            // 第一版降级为 Wildcard —— 完整 from_pattern 反向是 Stage 2.x 升级内容）。
+            let mir_arms = arms
+                .into_iter()
+                .map(|wa| crate::mir::expr::MatchArm {
+                    pattern: crate::mir::expr::Pattern::Wildcard,
+                    guard: wa.guard.map(MirExpr::from_witness),
+                    body: MirExpr::from_witness(wa.body),
+                })
+                .collect();
+            MirExprKind::Match {
+                scrutinee: Box::new(MirExpr::from_witness(*scrutinee)),
+                arms: mir_arms,
+            }
+        }
+        WitnessKind::If { cond, then, r#else } => MirExprKind::If {
+            cond: Box::new(MirExpr::from_witness(*cond)),
+            then: Box::new(MirExpr::from_witness(*then)),
+            r#else: r#else.map(|b| Box::new(MirExpr::from_witness(*b))),
+        },
+        WitnessKind::List(items) => MirExprKind::List(
+            items.into_iter().map(MirExpr::from_witness).collect(),
+        ),
+        WitnessKind::Dict(entries) => MirExprKind::Dict(
+            entries.into_iter().map(|(k, v)| (k, MirExpr::from_witness(v))).collect(),
+        ),
+        WitnessKind::Prompt { parts } => MirExprKind::Prompt {
+            parts: parts.into_iter().map(MirExpr::from_witness).collect(),
+        },
+        WitnessKind::Loop { var, iterable, body } => MirExprKind::Loop {
+            var,
+            iterable: Box::new(MirExpr::from_witness(*iterable)),
+            body: Box::new(MirExpr::from_witness(*body)),
+        },
+        WitnessKind::While { cond, body } => MirExprKind::While {
+            cond: Box::new(MirExpr::from_witness(*cond)),
+            body: Box::new(MirExpr::from_witness(*body)),
+        },
+        WitnessKind::Return(v) => MirExprKind::Return(
+            v.map(|b| Box::new(MirExpr::from_witness(*b))),
+        ),
+        WitnessKind::Assign { target, value } => MirExprKind::Assign {
+            target,
+            value: Box::new(MirExpr::from_witness(*value)),
+        },
+        WitnessKind::IndexAssign { object, index, value } => MirExprKind::IndexAssign {
+            object: Box::new(MirExpr::from_witness(*object)),
+            index: Box::new(MirExpr::from_witness(*index)),
+            value: Box::new(MirExpr::from_witness(*value)),
+        },
+        // v0.80: algebraic effects —— Perform/Handle 在 v0.80 单遍编译下不再走 lower 路径
+        // （parser emit_handle_w 直接 emit MirInst::Handle），但 WitnessKind 仍携带。
+        WitnessKind::Perform { effect, args } => MirExprKind::Perform {
+            effect,
+            args: args.into_iter().map(MirExpr::from_witness).collect(),
+        },
+        WitnessKind::Handle { effect, body, handler, k_param } => MirExprKind::Handle {
+            effect,
+            body: Box::new(MirExpr::from_witness(*body)),
+            handler: Box::new(MirExpr::from_witness(*handler)),
+            k_param,
+        },
+        // 其他简单 wrapper 类型
+        WitnessKind::Sequence(stmts) => MirExprKind::Sequence(
+            stmts.into_iter().map(MirExpr::from_witness).collect(),
+        ),
+        // fallthrough：未知 variant — 退化为空 sequence（不破坏编译）
+        _ => MirExprKind::Sequence(vec![]),
     }
 }
 

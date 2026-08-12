@@ -1,0 +1,7 @@
+let global_result = "init"
+handle Ai {
+  global_result = perform Ai("hello")
+} {
+  "mocked:" + __arg0
+}
+global_result

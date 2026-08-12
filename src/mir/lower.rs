@@ -97,11 +97,11 @@ impl EmitContext {
 }
 
 /// MirExpr → MIR 指令 lowering（v0.55 完整版）
-struct MirExprLowerer {
+pub(crate) struct MirExprLowerer {
     emit: EmitContext,
     /// v0.78: 累积的 effect row。builtin 调用按前缀分类 → 推 effect label。
     /// 阶段 2 引入 Type::Arrow 时，本字段与 HM 类型系统对接。
-    effects: super::effect::EffectRow,
+    pub(crate) effects: super::effect::EffectRow,
 }
 
 impl MirExprLowerer {
@@ -901,4 +901,29 @@ mod tests {
         assert_eq!(r.len(), 2);
         assert!(r.contains("Bsp"));
     }
+}
+
+/// v0.80 Stage 2.0: handle 块的 body/handler witness → MirFunction。
+//
+// （注：实际定义在文件末尾，clippy items_after_test_module 暂时 #[allow]）
+#[allow(clippy::items_after_test_module)]
+///
+/// 入口：parser 在 emit_handle_w 中独立 lower body_w / handler_w 为独立 MirFunction
+/// （独立 EmitContext = 独立寄存器空间，与 TaskDef 一致）。
+/// 返回的 MirFunction 是 emit 完所有 MIR 后的快照。
+///
+/// 注意：当前实现把 witness 转 Sequence MirExpr 后走 lower_mir_exprs。
+/// 第一版简化：handler 的 effect row 累积与 body 的 effect row 累积独立走
+/// MirExprLowerer（每个新建 lowerer 自己的 effects 字段）。Stage 2.x 升级到
+/// row-poly HM 时，这里需要把 effects 字段写入 MirFunction::effects（Stage 2.1
+/// 已就绪——MirFunction.effects 字段已存在）。
+pub(crate) fn lower_block_witness_to_mir(
+    witness: &crate::mir::witness::MirWitness,
+) -> crate::mir::MirFunction {
+    // 把单个 witness 转 MirExpr（from_witness 桥接），再 lower 成 IR。
+    use crate::mir::expr::MirExpr;
+    let expr = MirExpr::from_witness(witness.clone());
+    let mut l = MirExprLowerer::new();
+    let _ = l.lower_expr(&expr);
+    l.finish()
 }

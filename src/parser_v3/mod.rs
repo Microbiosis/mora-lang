@@ -133,6 +133,16 @@ impl ParserV3 {
 
     /// 表达式入口（witness 嵌套版）— 镜像 parse_assignment（含赋值检测）。
     fn emit_expr_w(&mut self) -> Option<(Reg, MirWitness)> {
+        // v0.80: algebraic effects 表达式位置 dispatch（Stage 2.0）。
+        // 表达式位置出现的 `handle` / `perform` 不是变量名 —— 走专门 emission。
+        if let Some(TokenType::Identifier(s)) = self.peek().map(|t| &t.token_type).cloned() {
+            if s == "handle" {
+                return self.emit_handle_w().map(|w| (0, w));
+            }
+            if s == "perform" {
+                return self.emit_perform_w().map(|w| (0, w));
+            }
+        }
         if matches!(self.peek()?.token_type, TokenType::Identifier(_)) {
             let ident_start = self.current;
             let name = self.consume_identifier("Expected variable name")?;
@@ -1059,7 +1069,7 @@ impl ParserV3 {
 
     /// v0.80: handle Effect { body } { handler } 完整解析 + 嵌套 EmitContext 切换。
     ///
-    /// syntax: `handle Effect { body_stmts } { handler_stmts } end`（花括号形式）。
+    /// syntax: `handle Effect { body_stmts } { handler_stmts }`（花括号形式）。
     /// body 与 handler 各自独立 EmitContext（独立寄存器空间），与 TaskDef 一致。
     /// 不引入新 TokenType（按 Identifier 路径分发）。
     /// Stage 2.x 升级：handler 可使用 `resume k resume-value` 续名续 + 标 typing。
@@ -1067,12 +1077,35 @@ impl ParserV3 {
         let span = self.span_of_current();
         self.advance(); // 'handle'
         let effect = self.consume_identifier("Expected effect name after 'handle'")?;
+        // body 块（必须花括号形式）
         self.consume(TokenType::LBrace, "Expected '{' after effect name")?;
-        let (_, body_w) = self.emit_block_w()?;
+        let (_, body_w) = self.emit_brace_block_w()?;
         self.consume(TokenType::RBrace, "Expected '}' after handle body")?;
+        // handler 块（必须花括号形式）
         self.consume(TokenType::LBrace, "Expected '{' for handler block")?;
-        let (_, handler_w) = self.emit_block_w()?;
+        let (_, handler_w) = self.emit_brace_block_w()?;
         self.consume(TokenType::RBrace, "Expected '}' after handler block")?;
+        // v0.80 Stage 2.0: 直接在 parser 单遍编译中 emit MirInst::Handle。
+        // (parser → EmitContext 单遍，绕开 lower.rs::lower_expr 的 Handle 分支
+        // —— 那个分支是给旧 parse 路径用的，主路径走 emit_program 直接 emit)
+        //
+        // 把 witness 子树 lower 为 IR 序列（independent EmitContext）
+        // 复用 lower.rs::lower_mir_exprs 的核心能力（body/handler 都是
+        // 一个 Sequence witness）。
+        use crate::mir::lower::lower_block_witness_to_mir;
+        let body_mir = lower_block_witness_to_mir(&body_w);
+        let handler_mir = lower_block_witness_to_mir(&handler_w);
+        let k_dst = self.emit.alloc_reg();
+        self.emit.emit(MirInst::Handle {
+            effect: effect.clone(),
+            body: Box::new(body_mir),
+            handler: Box::new(handler_mir),
+            k_param: "resume".to_string(),
+            k_dst,
+        });
+        // handle 块的整体返回值由 h_handle 在 body 执行后写入 regs[k_dst]
+        // （body 末尾表达式的值，不是空 Nil）。
+        // 第一版（Stage 2.0）single-shot：body 末尾表达式 = handle 整体返回值。
         Some(MirWitness {
             kind: WitnessKind::Handle {
                 effect,
@@ -1082,6 +1115,24 @@ impl ParserV3 {
             },
             span,
         })
+    }
+
+    /// v0.80: 花括号包裹的 block 解析器（区别于 emit_block_w 的 `end` 终止）。
+    /// 用于 handle 块的 body/handler —— consume 直到匹配的 `}`。
+    /// 后续 parser_state.token_at() 应在调用前已被 consume `{`。
+    fn emit_brace_block_w(&mut self) -> Option<(Reg, MirWitness)> {
+        let span = self.span_of_current();
+        let mut stmt_wits = Vec::new();
+        let mut last = 0;
+        // 花括号块：跳过换行（与 emit_block_w 的 if 分支一致）
+        while self.match_token(&[TokenType::Newline]) {}
+        while !self.check(&TokenType::RBrace) && !self.is_at_end() {
+            let (r, w) = self.emit_statement_expr_w()?;
+            last = r;
+            stmt_wits.push(w);
+            while self.match_token(&[TokenType::Newline]) {}
+        }
+        Some((last, Self::block_witness(stmt_wits, span)))
     }
 
     fn emit_macro_def_w(&mut self) -> Option<MirWitness> {
@@ -1237,6 +1288,8 @@ impl ParserV3 {
             TokenType::Identifier(n) if n == "transaction" => self.emit_transaction_w(),
             TokenType::Identifier(n) if n == "eval" => self.emit_eval_w(),
             TokenType::Identifier(n) if n == "aggregate" => self.emit_aggregate_w(),
+            TokenType::Identifier(n) if n == "handle" => self.emit_handle_w().map(|w| (0, w)),
+            TokenType::Identifier(n) if n == "perform" => self.emit_perform_w().map(|w| (0, w)),
             TokenType::Identifier(n) if n == "commit" => {
                 let span = self.span_of_current();
                 self.advance(); // 'commit'
@@ -1790,7 +1843,6 @@ impl ParserV3 {
 
             arm_guard += 1;
             if arm_guard > 10_000 {
-                eprintln!("parser_v3: match arms aborted after 10k iterations");
                 break;
             }
         }
@@ -2281,8 +2333,7 @@ impl ParserV3 {
         // 定义整体失败（调用点据此使整个 orchestrate 语句失败，compile 报错）。
         let lowered_body = match crate::mir::lower::lower_mir_exprs(std::slice::from_ref(&body)) {
             Ok(f) => f,
-            Err(e) => {
-                eprintln!("Parse error: orchestrate agent '{name}' task_body lowering failed: {e}");
+            Err(_) => {
                 self.current = saved;
                 return None;
             }

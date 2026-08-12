@@ -135,6 +135,7 @@ fn e2e_fixtures_are_non_empty() {
         "dict_access.mora",
         "match_default.mora",
         "nested_if.mora",
+        "handle_effect.mora",
     ] {
         let content = read_fixture(name);
         assert!(
@@ -172,6 +173,24 @@ fn e2e_all_fixtures_run() {
     ] {
         assert_ok(name);
     }
+}
+
+// ===================================================================
+// 8. v0.80 algebraic effects：handle / perform 端到端可执行
+// ===================================================================
+
+/// perform 必须由 handle 块内的 handler 接管，且返回值 = handler 末尾表达式。
+/// 此测试验证 Stage 2.0 单发语义下整条路径可执行（不是 stub）。
+#[test]
+fn e2e_handle_perform_returns_handler_result() {
+    let (result, _stdout) = assert_ok("handle_effect.mora");
+    // handle 块的 body 把 perform 返回值（handler 末尾表达式 = "mocked:" + __arg0）
+    // 存入 global_result；最后一行 result = global_result 取出来断言。
+    assert_eq!(
+        result.to_string(),
+        "mocked:hello",
+        "handle/perform 端到端语义失败：handler 末尾表达式值未传回 perform"
+    );
 }
 
 // 静默工具 unused import 警告

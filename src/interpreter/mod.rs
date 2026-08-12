@@ -199,16 +199,20 @@ impl crate::mir::host::MirHost for Interpreter {
     // 这些方法桥接到 CoreRuntime::effect_handlers（EffectRegistry）。
     // 完整语义见 src/runtime/effect.rs 与 src/mir/handlers.rs::h_perform/h_handle。
 fn perform_effect(&mut self, effect: &str, args: Vec<Value>) -> Option<Value> {
-    // 取出栈顶 handler（move 出以释放借用），再访问 env。
+    // v0.80 Stage 2.0: 真正的 handler 执行 — HandlerClosure::perform 调 run_mir。
+    //
+    // architectural reason: handler 实际是 MirFunction（handler_mir），必须有
+    // MirHost 才能调 run_mir。EffectHandler::perform 签名带 &mut dyn MirHost。
+    // 第一版（single-shot）：handler 一次性消耗（不还原到栈）。
+    eprintln!("DEBUG perform_effect: effect={} args={:?}", effect, args);
     let mut handler = {
         let core = &mut self.core.effect_handlers;
         core.take(effect)?
     };
-    let body_env = Arc::new(Mutex::new(self.environment().lock().clone()));
-    let k_dst = 0;
-    let result = handler.perform(args, body_env, k_dst);
-    // 还原（perform 不是消费性：take 只是临时释放借用）
-    self.core.effect_handlers.install(effect.to_string(), handler);
+
+    // host 通过 &mut self 传（self 实现 MirHost）。
+    let result = handler.perform_box(self, args);
+    eprintln!("DEBUG perform_effect: result={:?}", result);
     result.ok()
 }
 

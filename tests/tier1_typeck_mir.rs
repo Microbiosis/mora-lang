@@ -5,7 +5,7 @@
 //! and surfaces diagnostics in the shape consumed by CLI `--check`
 //! and the LSP server.
 
-use mora::interpreter::parse_code_v3;
+use mora::parser_v3::parse_code_v3;
 use mora::typeck::TypeError;
 use mora::typeck::check_program_mir;
 

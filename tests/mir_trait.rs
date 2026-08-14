@@ -11,9 +11,10 @@
 use mora::interpreter::Interpreter;
 use mora::mir::lower::{lower_mir_exprs, typecheck_mir_exprs};
 use mora::mir::vm::{run_main_task, run_mir};
+use mora::parser_v3::parse_code_v3;
 
 fn run_via_mir(source: &str) -> Result<(), String> {
-    let mut exprs = mora::interpreter::parse_code_v3(source)?;
+    let mut exprs = parse_code_v3(source)?;
     let type_errs = typecheck_mir_exprs(&mut exprs);
     if !type_errs.is_empty() {
         return Err(format!("typeck: {} error(s)", type_errs.len()));

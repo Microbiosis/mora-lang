@@ -18,7 +18,8 @@
 //! - 顶层隐式返回语义在 dag_interp 中依赖「最后产生 dst 的节点」，
 //!   优化重排后不稳定（独立于 SSA 管线）
 
-use mora::interpreter::{Interpreter, parse_code_v3};
+use mora::interpreter::Interpreter;
+use mora::parser_v3::parse_code_v3;
 use mora::mir::MirFunction;
 use mora::mir::lower::lower_mir_exprs;
 use mora::mir::ssa::OptLevel;

@@ -11,12 +11,13 @@ use mora::interpreter::Interpreter;
 use mora::mir::lower::{lower_mir_exprs, typecheck_mir_exprs};
 use mora::mir::vm::{run_main_task, run_mir};
 use mora::mir::{MirFunction, MirInst};
+use mora::parser_v3::parse_code_v3;
 use mora::value::Value;
 
 /// 公共执行入口：parse → typeck → lower → run_mir → run_main_task
 /// 这是 `src/main.rs::run_file()` 的纯库版本，可被测试独立调用。
 fn run_via_mir(source: &str) -> Result<(), String> {
-    let mut exprs = mora::interpreter::parse_code_v3(source)?;
+    let mut exprs = parse_code_v3(source)?;
     let type_errs = typecheck_mir_exprs(&mut exprs);
     if !type_errs.is_empty() {
         return Err(format!(
@@ -64,7 +65,7 @@ task main()
     let total = total + i
   end
   if total > 0 { print("positive") }
-  print("sum=" + total)
+  print("sum=" + str(total))
 end
 "#;
     run_via_mir(src).expect("control flow must execute via MIR");

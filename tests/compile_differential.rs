@@ -11,7 +11,7 @@ use mora::parser_v3::ParserV3;
 /// 同一源码：compile 与 parse→lower 的 body 指令序列必须一致。
 fn assert_compile_equivalent(source: &str) {
     // 旧路径：parse → lower
-    let exprs = mora::interpreter::parse_code_v3(source).expect("parse should succeed");
+    let exprs = mora::parser_v3::parse_code_v3(source).expect("parse should succeed");
     let old_func = lower_mir_exprs(&exprs).expect("lower should succeed");
 
     // 新路径：compile（阶段 3 目标形态）

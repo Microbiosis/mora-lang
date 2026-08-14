@@ -22,11 +22,12 @@
 //! aarch64 上 `try_compile` cfg! 提前 return CompileReject。这些测试期望 JIT
 //! 实际执行出结果，加 cfg 守卫避免在 aarch64 上整体失败。
 
-use mora::interpreter::{Interpreter, parse_code_v3};
+use mora::interpreter::Interpreter;
 use mora::mir::jit::run_jit;
 use mora::mir::lower::lower_mir_exprs;
 use mora::mir::vm::run_mir;
 use mora::mir::{MirFunction, MirInst};
+use mora::parser_v3::parse_code_v3;
 use mora::value::Value;
 
 fn fconst_at(reg: usize, n: f64) -> MirInst {

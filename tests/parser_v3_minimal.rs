@@ -5,7 +5,7 @@
 //! All tests run through the public `parse_code` entry point so they cover
 //! the entire Parser V3 → MirExpr pipeline that LSP/typeck consume.
 
-use mora::interpreter::parse_code_v3;
+use mora::parser_v3::parse_code_v3;
 use mora::mir::expr::MirExprKind;
 
 fn first_expr(src: &str) -> mora::mir::MirExpr {
@@ -73,7 +73,6 @@ fn if_then_else_parses_to_if_expr() {
 }
 
 #[test]
-#[ignore = "requires parser_v3 match expression grammar"]
 fn match_literal_arms_parse() {
     let expr = first_expr("match 1 { 1 => 10, _ => 20 }");
     match expr.kind {

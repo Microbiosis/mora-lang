@@ -6,9 +6,10 @@
 
 use mora::interpreter::Interpreter;
 use mora::mir::lower::lower_mir_exprs;
+use mora::parser_v3::parse_code_v3;
 
 fn run_dag_path(source: &str) -> Result<(), String> {
-    let exprs = mora::interpreter::parse_code_v3(source)?;
+    let exprs = parse_code_v3(source)?;
     let func = lower_mir_exprs(&exprs)?;
     let mut interp = Interpreter::new();
     let mut env = interp.take_env();
@@ -36,7 +37,7 @@ fn dag_task_with_main_no_crash() {
 fn dag_compress_demo_no_crash() {
     let source = std::fs::read_to_string("examples/compress_demo.mora")
         .expect("should read compress_demo.mora");
-    let exprs = mora::interpreter::parse_code_v3(&source).expect("parse");
+    let exprs = parse_code_v3(&source).expect("parse");
     let func = lower_mir_exprs(&exprs).expect("lower");
     let mut interp = Interpreter::new();
     let mut env = interp.take_env();
@@ -66,7 +67,7 @@ fn memo_incremental_reruns_affected_dependencies_only() {
     use std::sync::Arc;
 
     let src = "print(a)\nlet b = a + 1\nprint(b)\nlet c = 5\nlet d = c + 1\nprint(d)";
-    let exprs = mora::interpreter::parse_code_v3(src).expect("parse");
+    let exprs = parse_code_v3(src).expect("parse");
     let func: Arc<MirFunction> = Arc::new(lower_mir_exprs(&exprs).expect("lower"));
     let dag = global_dag_cache().get_or_build(&func);
     let mut memo = DagExecMemo::new();

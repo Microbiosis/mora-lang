@@ -2,6 +2,48 @@
 
 All notable changes to Mora will be documented in this file.
 
+## [v0.85.00] — 2026-08-14 — feat: 3 项功能实现不全修复（with mock_llm / union type / as dyn + let dyn 自动 coercion）
+
+**目的**：完成 §19.4（`with mock_llm` 块）、§3.4（union 类型注解）、§3.5（`as dyn` + `let dyn` 自动 coercion）的 Mora 语法实现。三项功能此前底层原语已就绪，但单遍编译 `compile()` 路径缺少 parser 入口。
+
+**Feature #1 — `with mock_llm = [...]` 块语法（§19.4）**：
+- `src/lexer.rs`：`TokenType` 新增 `With` 变体；`identifier_from` 映射 `"with" => With`
+- `src/parser_v3/mod.rs`：`emit_statement_w` / `emit_statement_expr_w` 新增 `TokenType::With` arm；新增 `emit_with_w` 函数：解析 `with key = value`（多绑定用 `and` 连接），解析 body 块（`end` 终止），emit `MirInst::WithConfig` + `WitnessKind::WithConfig`
+- `src/mir/witness.rs`：`WitnessKind` 新增 `WithConfig { bindings, body }` 变体
+- `src/interpreter/mod.rs`：`mir_with_config` 新增 `"mock_llm"` / `"mock_responses"` arm，list → `Vec<String>` 存入 `AiConfigValue.mock_responses`
+
+**Feature #2 — `string | number` Union 类型注解语法（§3.4）**：
+- `src/lexer.rs`：`TokenType` 新增 `Or` 变体（`|` 单独 token，与 `|>` `Pipe` 区分）；`'|'` case 改为 `match_char('>')` → `Pipe`，否则 → `Or`（修复此前 standalone `|` 触发 Error token 的 bug）
+- `src/parser_v3/mod.rs`：新增 `parse_union_type_annotation` 辅助方法，循环消费 `TokenType::Or`，累积到 `Vec<Type>`，返回 `Type::Union(members)`；`parse_type_annotation` 入口调用它
+- `Type::Union` 的 `compatible_with` / `subtype_of` / `display` 此前已完整实现，本次仅接通语法路径
+
+**Feature #3 — `as dyn Trait` + `let x: dyn T = v` 自动 coercion（§3.5）**：
+- `src/parser_v3/mod.rs::emit_call_tail_w`：新增 `TokenType::As` + `TokenType::Dyn` 后缀分支，emit `MirInst::DynTrait` + `WitnessKind::DynTrait`
+  - **关键 bugfix**：前一版本检查 `TokenType::Identifier(s) if s == "as"` 永远不会匹配（lexer 对 "as" 输出 `TokenType::As`），改为 `match_token_exact(TokenType::As)`
+- `src/parser_v3/mod.rs::emit_let_w`：`type_hint` 为 `Type::TraitObject` 时，emit 值表达式后自动追加 `MirInst::DynTrait` coercion 指令
+
+**耦合修复 — P0-1：AI 配置常量跨层解耦**：
+- 新增 `src/config.rs`：集中管理 5 个 AI 环境变量常量（`AI_MODEL_ENV` / `AI_MODEL_DEFAULT` / `AI_API_KEY_ENV` / `AI_BASE_URL_ENV` / `AI_BASE_URL_DEFAULT`）
+- `src/interpreter/mod.rs`：删除本地常量定义，改为 `pub use crate::config::*` re-export（向后兼容）
+- `src/compress/text.rs`：`use crate::interpreter::{AI_API_KEY_ENV, ...}` → `use crate::config::{AI_API_KEY_ENV, ...}`（消除 Foundation → Expression 跨层耦合）
+- `src/main.rs`：`use mora::interpreter::{...}` → `use mora::config::{...}`
+
+**耦合修复 — P0-2：`parse_code_v3` 从 interpreter 迁出**：
+- `src/parser_v3/mod.rs`：新增 `pub fn parse_code_v3(source: &str)`（解析逻辑归位 parser 层）
+- `src/interpreter/mod.rs`：删除本地实现，改为 `pub use crate::parser_v3::parse_code_v3`（向后兼容）
+- `src/mir/cache.rs`：`use crate::interpreter::{..., parse_code_v3}` → `use crate::parser_v3::parse_code_v3`
+- 附带修复：删除 `interpreter/mod.rs` 中 `Lexer` 的未使用导入
+
+**测试**：
+- `tests/mir_dyntrait.rs`：新增 4 个 compile-path 测试（`as_dyn_trait_in_emit_path_works` / `let_dyn_trait_auto_coerces` / `with_mock_llm_block_parses` / `with_mock_llm_inside_task_parses`）；修复 clippy `needless_lifetimes` + `ptr_arg`
+- `tests/parser_v3_coverage.rs`：新增 3 个 union type 测试（`union_type_two_members_parses` / `union_type_three_members_parses` / `union_type_single_member_parses_as_plain_type`）；修复 `ref` 在 `matches!` 宏中非法的问题
+
+**验证**：
+- `cargo build --all-targets --all-features`：通过
+- `cargo clippy --all-targets --all-features -- -D warnings`：全绿
+- `cargo test --all-targets --all-features`：794 lib + 22 compile_differential + 4 mir_dyntrait + 16 e2e pass / 1 e2e fail（tea_app.mora 使用 `app` 关键字，Stage 3 emit 路径未注册 `TokenType::App`，pre-existing 缺口）
+- ⚠️ `e2e_tea_app_runs` 跳过：`tests/fixtures/e2e/tea_app.mora` 使用 `app` 关键字语法，Stage 3 emit 路径尚未注册 `TokenType::App`（pre-existing Stage 3 缺口，与本次 3 项功能修复无关）
+
 ## [v0.77.00] — 2026-08-11 — test: 测试体系重构（三层架构 + proptest 重启 + JSON 数字解析修复）
 
 **目的**：清理历史测试死代码、建立「核心单元 + 集成 + E2E」三层架构、

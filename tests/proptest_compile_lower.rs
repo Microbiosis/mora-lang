@@ -24,7 +24,7 @@ proptest! {
         let compile_func: Option<mora::mir::MirFunction> = mora::parser_v3::ParserV3::compile(&src)
             .ok()
             .map(|(f, _)| f);
-        let parse_func: Option<mora::mir::MirFunction> = mora::interpreter::parse_code_v3(&src)
+        let parse_func: Option<mora::mir::MirFunction> = mora::parser_v3::parse_code_v3(&src)
             .ok()
             .and_then(|exprs| mora::mir::lower::lower_mir_exprs(&exprs).ok());
 

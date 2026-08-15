@@ -59,7 +59,6 @@ impl RegistryRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::common::trait_info::TraitMethodSig;
 
     fn make_trait_info() -> TraitInfo {
         TraitInfo {
@@ -119,16 +118,5 @@ mod tests {
         // reg1.trait_registry 是 Arc — 改 reg1 不会影响 reg2（因为 register_trait 创建新 Arc）
         // 改后两者不同 — 这是预期
         assert!(!reg2.trait_registry.contains_key("shared"));
-    }
-
-    // 避免 unused import 警告
-    #[allow(dead_code)]
-    fn _unused() {
-        let _: TraitMethodSig = TraitMethodSig {
-            name: String::new(),
-            has_self: false,
-            params: Vec::new(),
-            return_type: None,
-        };
     }
 }

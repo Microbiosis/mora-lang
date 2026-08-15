@@ -151,34 +151,6 @@ impl HMInference {
         }
     }
 
-    /// 递归替换类型中出现的所有 TypeVar（每次实例化一份独立副本）。
-    /// v0.80: 当前仅被 instantiate_ty 的 Arrow 分支间接使用（通过
-    /// rename_row），ClosureSig 删除后暂无直接调用点。
-    #[allow(dead_code)]
-    pub(super) fn rename_ty(&mut self, ty: &Type) -> Type {
-        match ty {
-            Type::TypeVar(_) => Type::TypeVar(self.fresh_type_var_id()),
-            Type::List(elem) => Type::List(Box::new(self.rename_ty(elem))),
-            Type::Dict(k, v) => {
-                Type::Dict(Box::new(self.rename_ty(k)), Box::new(self.rename_ty(v)))
-            }
-            Type::Result_(ok, err) => {
-                Type::Result_(Box::new(self.rename_ty(ok)), Box::new(self.rename_ty(err)))
-            }
-            Type::Union(members) => {
-                Type::Union(members.iter().map(|m| self.rename_ty(m)).collect())
-            }
-            Type::ForAll(vs, inner) => Type::ForAll(vs.clone(), Box::new(self.rename_ty(inner))),
-            // v0.80: Arrow — 递归重命名 input/output，effect row 走 rename_row。
-            Type::Arrow(input, output, row) => Type::Arrow(
-                Box::new(self.rename_ty(input)),
-                Box::new(self.rename_ty(output)),
-                crate::typeck::hm::row::rename_row(row, &mut self.fresh_vars),
-            ),
-            _ => ty.clone(),
-        }
-    }
-
     /// 把 ForAll 内层 τ 中被量化的 TypeVar 替换为 fresh 变量（未量化的保留）。
     ///
     /// v0.80: remap 从 &HashMap 改为 &mut HashMap — 修复「同一量化变量出现

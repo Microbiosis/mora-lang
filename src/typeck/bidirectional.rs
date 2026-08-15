@@ -83,18 +83,6 @@ impl<'a> BidirectionalChecker<'a> {
         self.mode_stack.last().cloned().unwrap_or(Mode::Synth)
     }
 
-    /// 入栈：进入子节点 mode（Phase B/C 节点级 check 模式切换用）
-    #[allow(dead_code)]
-    pub(crate) fn push_mode(&mut self, m: Mode) {
-        self.mode_stack.push(m);
-    }
-
-    /// 出栈：恢复父节点 mode
-    #[allow(dead_code)]
-    pub(crate) fn pop_mode(&mut self) {
-        self.mode_stack.pop();
-    }
-
     /// v0.75.86: check 模式入口 —— 在 `expected` 类型下验证 witness。
     ///
     /// 成功 → Ok(synthesized_type)（仍调 HM 推类型供后续约束用）
@@ -567,16 +555,6 @@ mod tests {
             Mode::Synth => {}
             Mode::Check(_) => panic!("default mode should be Synth"),
         }
-    }
-
-    #[test]
-    fn mode_stack_push_pop() {
-        let mut hm = HMInference::new();
-        let mut checker = BidirectionalChecker::new(&mut hm);
-        checker.push_mode(Mode::Check(Type::Int));
-        assert!(matches!(checker.current_mode(), Mode::Check(Type::Int)));
-        checker.pop_mode();
-        assert!(matches!(checker.current_mode(), Mode::Synth));
     }
 
     #[test]

@@ -486,11 +486,6 @@ impl Interpreter {
         self.core.current_merge_strategies.clone()
     }
 
-    #[allow(dead_code)]
-    pub fn get_globals(&self) -> Arc<Mutex<Environment>> {
-        self.core.globals.clone()
-    }
-
     pub fn get_tool_registry(&self) -> &HashMap<String, ToolDef> {
         &self.core.tool_registry
     }

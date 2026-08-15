@@ -419,15 +419,6 @@ impl CallNameMatcher {
     }
 }
 
-impl RegsMatcher {
-    #[allow(unused)]
-    fn match_and_bind(&self, _args: &[Reg]) -> Option<String> {
-        match self {
-            RegsMatcher::Any => None,
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

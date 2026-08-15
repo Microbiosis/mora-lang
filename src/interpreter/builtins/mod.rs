@@ -1591,7 +1591,6 @@ mod tests_v048_refine {
     use crate::value::Value;
 
     /// v0.48.0: mora.refine + mora.refine_info + mora.list_refines (CLI-Anything /refine)
-    #[allow(unused_imports)]
     use std::time::UNIX_EPOCH;
 
     fn write_temp_script(name: &str, content: &str) -> std::path::PathBuf {

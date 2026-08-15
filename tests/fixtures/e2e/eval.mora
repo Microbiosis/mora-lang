@@ -1,0 +1,15 @@
+-- v0.86: runtime eval(code) — 从 Mora 代码内部动态执行任意 Mora 源码
+-- 验证 Lisp homoiconicity + eval-apply loop
+task main()
+  let a = eval("2 + 3")
+  print("eval(2+3)=" + a)
+
+  let cond = eval("if true { 1 } else { 0 }")
+  print("eval(if)=" + cond)
+
+  let outer = 42
+  let result = eval("outer + 1")
+  print("eval(outer+1)=" + result)
+
+  print(result)
+end

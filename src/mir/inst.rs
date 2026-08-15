@@ -7,13 +7,15 @@
 use std::collections::HashMap;
 
 use super::handlers::{
-    Flow, h_aggregate, h_append_file, h_assign, h_binary_op, h_break, h_call, h_closure, h_const,
+    Flow, h_aggregate, h_append_file, h_app_def, AppDefArgs, h_assign, h_binary_op, h_break, h_call, h_closure, h_const,
     h_continue, h_define, h_dict_lit, h_document_section, h_dyn_trait, h_enum_def, h_eval, h_halt,
     h_handle, h_impl_def, h_import, h_index, h_index_assign, h_jump, h_jump_if, h_jump_if_not,
-    h_list_lit, h_load, h_macro_def, h_match_expr, h_method_call, h_observe, h_orchestrate,
-    h_perform, h_pipe, h_prompt, h_prompt_section, h_read_bytes_file, h_read_file, h_return,
-    h_save, h_send, h_skill_def, h_span, h_struct_def, h_trait_def, h_transaction, h_type_alias,
-    h_var, h_with_config, h_worker, h_write_bytes_file, h_write_file,
+    h_list_lit, h_load, h_macro_def, h_match_expr, h_method_call, h_model_def, h_msg_def,
+    h_observe, h_orchestrate, h_perform, h_pipe, h_prompt, h_prompt_section, h_read_bytes_file,
+    h_read_file, h_return, h_save, h_send, h_skill_def, h_span, h_struct_def, h_trait_def,
+    h_transaction, h_type_alias, h_update_def, h_var, h_with_config, h_worker,
+    h_write_bytes_file, h_write_file,
+    h_quasiquote,
 };
 
 use crate::mir::host::MirHost;
@@ -49,6 +51,7 @@ impl MirInst {
             MirInst::Handle { .. } => None,
             MirInst::Closure { dst, .. } => Some(*dst),
             MirInst::DynTrait { dst, .. } => Some(*dst),
+            MirInst::Quasiquote { dst, .. } => Some(*dst),
             _ => None,
         }
     }
@@ -112,6 +115,11 @@ impl MirInst {
             | MirInst::TypeAlias { .. }
             | MirInst::EnumDef { .. }
             | MirInst::StructDef { .. }
+            // v0.83: TEA type definitions — no input regs
+            | MirInst::ModelDef { .. }
+            | MirInst::MsgDef { .. }
+            | MirInst::UpdateDef { .. }
+            | MirInst::AppDef { .. }
             | MirInst::MacroDef { .. }
             | MirInst::Transaction { .. }
             | MirInst::Rollback
@@ -128,7 +136,8 @@ impl MirInst {
             | MirInst::Label(_)
             | MirInst::Jump(_)
             | MirInst::Break(_)
-            | MirInst::Continue(_) => vec![],
+            | MirInst::Continue(_)
+            | MirInst::Quasiquote { .. } => vec![],
         }
     }
 
@@ -219,6 +228,30 @@ impl MirInst {
             MirInst::TypeAlias { .. } => self.clone(),
             MirInst::EnumDef { .. } => self.clone(),
             MirInst::StructDef { .. } => self.clone(),
+            // v0.83: TEA type definitions
+            MirInst::ModelDef { .. } => self.clone(),
+            MirInst::MsgDef { .. } => self.clone(),
+            MirInst::UpdateDef { name, params, body } => MirInst::UpdateDef {
+                name: name.clone(),
+                params: params.clone(),
+                body: body.clone(),
+            },
+            // AppDef: nested MirFunctions 不递归 map（独立 reg 空间）
+            MirInst::AppDef {
+                name,
+                model_name,
+                msg_name,
+                init_mir,
+                update_mir,
+                view_mir,
+            } => MirInst::AppDef {
+                name: name.clone(),
+                model_name: model_name.clone(),
+                msg_name: msg_name.clone(),
+                init_mir: init_mir.clone(),
+                update_mir: update_mir.clone(),
+                view_mir: view_mir.clone(),
+            },
             MirInst::MacroDef { .. } => self.clone(),
             MirInst::Transaction { .. } => self.clone(),
             MirInst::Send { value, target } => MirInst::Send {
@@ -289,6 +322,10 @@ impl MirInst {
             MirInst::Halt(r) => MirInst::Halt(r.map(m)),
             MirInst::Break(l) => MirInst::Break(*l),
             MirInst::Continue(l) => MirInst::Continue(*l),
+            MirInst::Quasiquote { dst, segments } => MirInst::Quasiquote {
+                dst: *dst,
+                segments: segments.clone(),
+            },
         }
     }
 
@@ -320,6 +357,11 @@ impl MirInst {
             | MirInst::TypeAlias { .. }
             | MirInst::EnumDef { .. }
             | MirInst::StructDef { .. }
+            // v0.83: TEA definitions modify env (register Type::Tea*)
+            | MirInst::ModelDef { .. }
+            | MirInst::MsgDef { .. }
+            | MirInst::UpdateDef { .. }
+            | MirInst::AppDef { .. }
             | MirInst::MacroDef { .. }
             | MirInst::TraitDef { .. }
             | MirInst::ImplDef { .. }
@@ -355,7 +397,8 @@ impl MirInst {
             | MirInst::JumpIf(_, _)
             | MirInst::JumpIfNot(_, _)
             | MirInst::Break(_)
-            | MirInst::Continue(_) => false,
+            | MirInst::Continue(_)
+            | MirInst::Quasiquote { .. } => false,
         }
     }
 }
@@ -437,11 +480,11 @@ pub fn dispatch(
 
         // ── Side effects ──
         MirInst::Define(name, src) => {
-            h_define(env, name, regs, *src);
+            h_define(interp, env, name, regs, *src);
             Ok(Flow::Continue)
         }
         MirInst::Assign(name, src) => {
-            h_assign(env, name, regs, *src);
+            h_assign(interp, env, name, regs, *src);
             Ok(Flow::Continue)
         }
         MirInst::Expr(_) => Ok(Flow::Continue),
@@ -459,6 +502,39 @@ pub fn dispatch(
         }
         MirInst::StructDef { name, fields } => {
             h_struct_def(env, name, fields);
+            Ok(Flow::Continue)
+        }
+        // v0.83: TEA definition dispatch
+        MirInst::ModelDef { name, fields } => {
+            h_model_def(env, name, fields);
+            Ok(Flow::Continue)
+        }
+        MirInst::MsgDef { name, variants } => {
+            h_msg_def(env, name, variants);
+            Ok(Flow::Continue)
+        }
+        MirInst::UpdateDef { name, params, body } => {
+            h_update_def(env, name, params, body);
+            Ok(Flow::Continue)
+        }
+        MirInst::AppDef {
+            name,
+            model_name,
+            msg_name,
+            init_mir,
+            update_mir,
+            view_mir,
+        } => {
+            h_app_def(AppDefArgs {
+                interp,
+                env,
+                name,
+                model_name,
+                msg_name,
+                init_mir,
+                update_mir,
+                view_mir,
+            });
             Ok(Flow::Continue)
         }
         MirInst::Import(path) => {
@@ -487,8 +563,8 @@ pub fn dispatch(
             h_handle(interp, env, regs, effect, body, handler, k_param.as_str(), *k_dst)?;
             Ok(Flow::Continue)
         }
-        MirInst::MacroDef { name, params } => {
-            h_macro_def(env, name, params);
+        MirInst::MacroDef { name, params, body } => {
+            h_macro_def(env, name, params, body);
             Ok(Flow::Continue)
         }
         MirInst::Transaction { body, compensation } => {
@@ -635,5 +711,9 @@ pub fn dispatch(
         MirInst::Halt(r) => Ok(h_halt(regs, *r)),
         MirInst::Break(lbl) => Ok(h_break(*lbl)),
         MirInst::Continue(lbl) => Ok(h_continue(*lbl)),
+        MirInst::Quasiquote { dst, segments } => {
+            h_quasiquote(regs, *dst, segments)?;
+            Ok(Flow::Continue)
+        }
     }
 }

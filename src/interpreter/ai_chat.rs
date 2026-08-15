@@ -836,13 +836,10 @@ suggestion: <improvement suggestion or "none">"#,
                     model: Some(r.model.clone()),
                     temperature: r.temperature,
                     max_tokens: r.max_tokens,
-                    budget: None,
-                    per_call: None,
                     system: r.system.clone(),
                     mock_responses: None,
                     speculative: None,
                     draft_model: None,
-                    tool_names: None,
                 });
             }
             (key, r.model.clone(), r.base_url.clone())

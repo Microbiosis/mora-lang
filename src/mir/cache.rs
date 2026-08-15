@@ -106,7 +106,8 @@ impl Default for DagCache {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::interpreter::{Interpreter, parse_code_v3};
+    use crate::interpreter::Interpreter;
+    use crate::parser_v3::parse_code_v3;
     use crate::mir::lower::lower_mir_exprs;
 
     fn sample_func(src: &str) -> Arc<MirFunction> {

@@ -20,6 +20,8 @@ pub mod audit;
 pub mod cli;
 // v0.45.0: ToolPlane Core/Extension adapter (loongclaw tool.rs pattern)
 pub mod ccr;
+// v0.85: AI 配置常量集中模块（消除 compress/text.rs → interpreter 的跨层耦合）
+pub mod config;
 // v0.75.98: MoraError —— 全仓统一错误枚举（v0.91 错误统一计划首次落地）
 pub mod error;
 // v0.50: Checkpoint persistence layer (Memory + SQLite)
@@ -57,3 +59,5 @@ pub mod toolplane;
 pub mod trace_collector;
 pub mod typeck;
 pub mod value;
+// v0.83: TEA (The Elm Architecture) — Model/Msg/Update/Cmd 完整架构
+pub mod tea;

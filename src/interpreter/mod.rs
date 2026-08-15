@@ -19,28 +19,14 @@ use std::sync::Arc;
 // v1 AST types no longer imported — all v2 paths use ast_v2 / common
 // v0.52 ADR-001: ai_infra::* 不再需要（ContextWindow/SpeculativeVerifier/CacheWarmer 迁到 src/runtime/ai.rs）
 use crate::flow::*;
-use crate::lexer::Lexer;
 use crate::trace_collector::TraceCollector;
 
-/// AI 模型配置常量（避免硬编码）
-/// 通过环境变量覆盖；未设定时使用默认值。
-///
-/// 环境变量:
-///   MORA_AI_MODEL    — 默认模型名称
-///   OPENAI_API_KEY   — API 密钥
-///   MORA_AI_BASE_URL — 服务端点 URL
-pub const AI_MODEL_ENV: &str = "MORA_AI_MODEL";
-pub const AI_MODEL_DEFAULT: &str = "example-model";
-pub const AI_API_KEY_ENV: &str = "OPENAI_API_KEY";
-pub const AI_BASE_URL_ENV: &str = "MORA_AI_BASE_URL";
-pub const AI_BASE_URL_DEFAULT: &str = "https://api.openai.com/v1";
-
-/// v0.55: 使用 ParserV3 解析代码，返回 MirExpr 列表（纯 MIR，零 AST 依赖）
-pub fn parse_code_v3(source: &str) -> Result<Vec<crate::mir::expr::MirExpr>, String> {
-    let tokens = Lexer::new(source).scan_tokens();
-    let parser = crate::parser_v3::ParserV3::new(tokens);
-    parser.parse().map_err(|e| format!("{:?}", e))
-}
+// v0.85: AI 配置常量已迁至 crate::config（消除跨层耦合）
+pub use crate::config::{
+    AI_API_KEY_ENV, AI_BASE_URL_DEFAULT, AI_BASE_URL_ENV, AI_MODEL_DEFAULT, AI_MODEL_ENV,
+};
+// v0.85: parse_code_v3 已迁至 crate::parser_v3::parse_code_v3（解析逻辑不属解释器层）
+pub use crate::parser_v3::parse_code_v3;
 
 pub use crate::value::{Environment, StreamReader, Value};
 
@@ -129,15 +115,15 @@ pub struct Interpreter {
 }
 
 // v0.75.x: 共享数据类型（AiConfigValue/LruCache/RouteConfig/TokenBudget/TokenUsage/
-// ToolDef/TraitInfo/TraitMethodSig）与 trait key 辅助函数（impl_method_key /
-// default_impl_method_key）已下沉到 runtime/types.rs。
-// 此处 re-export 保持既有路径兼容（mir/、stress_tests.rs、interpreter 子模块
-// 继续 use crate::interpreter::* 均不受影响）。
+// ToolDef）保留在 runtime/types.rs；TraitInfo/TraitMethodSig 及其 key 函数
+// 已下沉到 common/trait_info.rs。此处 re-export 保持既有路径兼容
+// （mir/、stress_tests.rs、interpreter 子模块继续 use crate::interpreter::* 均不受影响）。
 pub use crate::runtime::types::{
-    AiConfigValue, LruCache, RouteConfig, TokenBudget, TokenUsage, ToolDef, TraitInfo,
-    TraitMethodSig,
+    AiConfigValue, LruCache, RouteConfig, TokenBudget, TokenUsage, ToolDef,
 };
-pub(crate) use crate::runtime::types::{default_impl_method_key, impl_method_key};
+pub use crate::common::trait_info::{
+    default_impl_method_key, impl_method_key, TraitInfo, TraitMethodSig,
+};
 
 // v0.04: 显式实现 Clone 而非 derive
 // v0.52 ADR-001: Interpreter 已薄化为 7 个 facade holder，Clone 简化
@@ -237,6 +223,16 @@ fn perform_effect(&mut self, effect: &str, args: Vec<Value>) -> Option<Value> {
         prev: Option<Box<dyn crate::runtime::effect::EffectHandler>>,
     ) {
         self.core.effect_handlers.restore(effect, prev);
+    }
+
+    /// v0.83: 暴露 Recorder 给 MIR handlers——h_define/h_assign/h_send
+    /// 通过 `recorder_mut()` 推 StateMutation/Msg 事件到 Recorder。
+    fn recorder_mut(&mut self) -> Option<&mut crate::record::Recorder> {
+        if self.infra.recorder.is_off() {
+            None
+        } else {
+            Some(&mut self.infra.recorder)
+        }
     }
 
     fn current_merge_strategies(&self) -> Option<HashMap<String, crate::value::MergeStrategy>> {
@@ -585,6 +581,33 @@ impl Interpreter {
                     }
                 }
                 "system" => cfg.system = Some(v.to_string()),
+                // v0.85: mock_llm / mock_responses — 为 with 块内 ai.chat 调用
+                // 注入预配置响应队列（ai_chat.rs:308 消费）。接受 list<string>
+                // 或单个 string 字面量。`with mock_llm = ["resp1", "resp2"]`
+                // 是规格 §19.4 承诺的唯一 Mora 语法入口。
+                "mock_llm" | "mock_responses" => {
+                    match v {
+                        Value::List(items) => {
+                            let strings: Vec<String> = items
+                                .iter()
+                                .filter_map(|it| match it {
+                                    Value::String(s) => Some(s.clone()),
+                                    _ => {
+                                        eprintln!("mock_llm response must be string, skipping");
+                                        None
+                                    }
+                                })
+                                .collect();
+                            if !strings.is_empty() {
+                                cfg.mock_responses = Some(strings);
+                            }
+                        }
+                        Value::String(s) => cfg.mock_responses = Some(vec![s.clone()]),
+                        _ => {
+                            eprintln!("mock_llm expects list<string> or string, got {:?}", v);
+                        }
+                    }
+                }
                 _ => {}
             }
         }
@@ -731,81 +754,6 @@ impl Interpreter {
 }
 
 // 实际接收 strings 的版本（避免 self 借用冲突）
-
-/// v0.04补: ai.embed builtin 移除, 留作 v1.0 复活点
-#[allow(dead_code)]
-fn extract_embeddings(json_text: &str, expected_count: usize) -> Result<Value, String> {
-    let root = json_to_value(json_text)?;
-    let data = if let Value::Dict(map) = root {
-        if let Some(Value::List(d)) = map.get("data") {
-            d.clone()
-        } else {
-            return Err("ai.embed: response missing 'data' array".to_string());
-        }
-    } else {
-        return Err("ai.embed: response is not a JSON object".to_string());
-    };
-
-    if data.len() != expected_count {
-        return Err(format!(
-            "ai.embed: expected {} embeddings, got {}",
-            expected_count,
-            data.len()
-        ));
-    }
-
-    // 按 index 排序，保证顺序
-    let mut indexed: Vec<(usize, Vec<f64>)> = data
-        .into_iter()
-        .map(|item| {
-            if let Value::Dict(m) = item {
-                let index = match m.get("index") {
-                    Some(Value::Float(n)) => *n as usize,
-                    _ => 0,
-                };
-                let vec = match m.get("embedding") {
-                    Some(Value::List(vs)) => vs
-                        .iter()
-                        .filter_map(|v| {
-                            if let Value::Float(n) = v {
-                                Some(*n)
-                            } else {
-                                None
-                            }
-                        })
-                        .collect(),
-                    _ => {
-                        return Err(
-                            "ai.embed: 'embedding' field is not a list of numbers".to_string()
-                        );
-                    }
-                };
-                Ok((index, vec))
-            } else {
-                Err("ai.embed: data item is not an object".to_string())
-            }
-        })
-        .collect::<Result<Vec<_>, String>>()?;
-    indexed.sort_by_key(|(i, _)| *i);
-
-    if expected_count == 1 {
-        // 单条：返回一维 List
-        let vec = match indexed.into_iter().next() {
-            Some((_, v)) => v,
-            None => {
-                return Err("ai.embed: no embeddings were successfully indexed".to_string());
-            }
-        };
-        Ok(Value::List(vec.into_iter().map(Value::Float).collect()))
-    } else {
-        // 批量：返回 List<List>
-        let items: Vec<Value> = indexed
-            .into_iter()
-            .map(|(_, v)| Value::List(v.into_iter().map(Value::Float).collect()))
-            .collect();
-        Ok(Value::List(items))
-    }
-}
 
 /// mock embedding (用于 memory.* 语义检索 mock 模式)
 fn mock_bow_embedding(s: &str) -> Vec<f64> {

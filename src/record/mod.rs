@@ -100,6 +100,25 @@ pub enum Event {
         ts_ms: u128,
         message: String,
     },
+    /// v0.83: TEA-style Msg 事件 — 应用层消息（区别于 ai/web 副作用）。
+    /// channel 路由到 env 的 key（route by name）。
+    /// prior_state_hash 用于 replay 时校验状态一致性。
+    Msg {
+        id: u64,
+        ts_ms: u128,
+        channel: String,
+        payload: crate::value::Value,
+        prior_state_hash: u64,
+    },
+    /// v0.83: state mutation（env diff）— h_define/h_assign/h_send 触发。
+    /// 记录 var 名前后值变化，用于 replay 重放 +time-travel debugging。
+    StateMutation {
+        id: u64,
+        ts_ms: u128,
+        var: String,
+        old: crate::value::Value,
+        new: crate::value::Value,
+    },
 }
 
 /// 重放时匹配的响应
@@ -179,6 +198,11 @@ impl Recorder {
         &self.mode
     }
 
+    /// v0.83: 便捷方法——false 表示 Off（不录制不重放）。
+    pub fn is_off(&self) -> bool {
+        matches!(self.mode, Mode::Off)
+    }
+
     pub fn events(&self) -> &[Event] {
         &self.events
     }
@@ -197,6 +221,37 @@ impl Recorder {
             return;
         }
         self.events.push(event);
+    }
+
+    /// v0.83: 录制 TEA Msg 事件（便捷构造）。
+    pub fn record_msg(&mut self, channel: String, payload: crate::value::Value, prior_state_hash: u64) {
+        let id = self.next_event_id();
+        let ts_ms = Self::now_ms();
+        self.record(Event::Msg {
+            id,
+            ts_ms,
+            channel,
+            payload,
+            prior_state_hash,
+        });
+    }
+
+    /// v0.83: 录制 StateMutation 事件（便捷构造）。
+    pub fn record_state_mutation(
+        &mut self,
+        var: String,
+        old: crate::value::Value,
+        new: crate::value::Value,
+    ) {
+        let id = self.next_event_id();
+        let ts_ms = Self::now_ms();
+        self.record(Event::StateMutation {
+            id,
+            ts_ms,
+            var,
+            old,
+            new,
+        });
     }
 
     /// 重放: 查找 ai.chat 的录制响应

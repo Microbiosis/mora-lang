@@ -15,7 +15,7 @@ use mora::parser_v3::ParserV3;
 fn parse_v3(source: &str) -> Vec<mora::mir::expr::MirExpr> {
     let mut lexer = Lexer::new(source);
     let tokens = lexer.scan_tokens();
-    let parser = ParserV3::new(tokens);
+    let parser = ParserV3::new(tokens, source);
     parser.parse().unwrap_or_default()
 }
 

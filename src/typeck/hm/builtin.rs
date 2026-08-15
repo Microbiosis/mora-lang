@@ -1,7 +1,24 @@
 //! v0.75.70: HM 类型推断 builtin 类型 — 自 hm/mod.rs 拆出（D6 单文件惯例）。
 //! builtin_callee_ty（按名字查 callee 类型）+ builtin_type（op 类型）。
+//!
+//! v0.80: 全部返回 curried Arrow（Type::Arrow）而非 ClosureSig 侧表。
+//! 多参数 builtin 用嵌套 Arrow：`Arrow(A, Arrow(B, C, Empty), Empty)`。
 
 use super::*;
+
+/// v0.80: 构建 curried Arrow 类型。
+/// `curried_arrow([A, B], C, Empty)` → `Arrow(A, Arrow(B, C, Empty), Empty)`
+fn curried_arrow(params: Vec<Type>, ret: Type) -> Type {
+    let mut ty = ret;
+    for p in params.into_iter().rev() {
+        ty = Type::Arrow(
+            Box::new(p),
+            Box::new(ty),
+            crate::mir::effect::EffectRow::Empty,
+        );
+    }
+    ty
+}
 
 impl HMInference {
     pub(super) fn builtin_callee_ty(&mut self, name: &str) -> Option<Type> {
@@ -13,37 +30,36 @@ impl HMInference {
         if let Some(sig) = crate::typeck::dispatch::lookup_builtin(name) {
             let param_count = sig.params.len();
             let param_types: Vec<Type> = (0..param_count).map(|_| self.fresh_type_var()).collect();
-            return Some(self.fresh_closure(param_types, sig.return_type.clone()));
+            return Some(curried_arrow(param_types, sig.return_type.clone()));
         }
         match name {
             "print" => {
                 let arg = self.fresh_type_var();
-                let ret = Type::Nil;
-                Some(self.fresh_closure(vec![arg], ret))
+                Some(curried_arrow(vec![arg], Type::Nil))
             }
             "len" => {
                 let arg = self.fresh_type_var();
-                Some(self.fresh_closure(vec![arg], Type::Int))
+                Some(curried_arrow(vec![arg], Type::Int))
             }
             "str" => {
                 let arg = self.fresh_type_var();
-                Some(self.fresh_closure(vec![arg], Type::String))
+                Some(curried_arrow(vec![arg], Type::String))
             }
-            "int" => Some(self.fresh_closure(vec![Type::String], Type::Int)),
+            "int" => Some(curried_arrow(vec![Type::String], Type::Int)),
             "float" => {
                 let arg = self.fresh_type_var();
-                Some(self.fresh_closure(vec![arg], Type::Float))
+                Some(curried_arrow(vec![arg], Type::Float))
             }
             "bool" => {
                 let arg = self.fresh_type_var();
-                Some(self.fresh_closure(vec![arg], Type::Bool))
+                Some(curried_arrow(vec![arg], Type::Bool))
             }
             "range" => {
                 let a = self.fresh_type_var();
                 let b = self.fresh_type_var();
                 let c = self.fresh_type_var();
                 let elem = self.fresh_type_var();
-                Some(self.fresh_closure(vec![a, b, c], Type::List(Box::new(elem))))
+                Some(curried_arrow(vec![a, b, c], Type::List(Box::new(elem))))
             }
             _ => None,
         }
@@ -53,13 +69,13 @@ impl HMInference {
         match op {
             BuiltinOp::Print => {
                 let arg = self.fresh_type_var();
-                Ok(self.fresh_closure(vec![arg], Type::Nil))
+                Ok(curried_arrow(vec![arg], Type::Nil))
             }
-            BuiltinOp::Assert => Ok(self.fresh_closure(vec![Type::Bool], Type::Nil)),
-            BuiltinOp::Not => Ok(self.fresh_closure(vec![Type::Bool], Type::Bool)),
+            BuiltinOp::Assert => Ok(curried_arrow(vec![Type::Bool], Type::Nil)),
+            BuiltinOp::Not => Ok(curried_arrow(vec![Type::Bool], Type::Bool)),
             BuiltinOp::Length => {
                 let arg = self.fresh_type_var();
-                Ok(self.fresh_closure(vec![arg], Type::Int))
+                Ok(curried_arrow(vec![arg], Type::Int))
             }
         }
     }

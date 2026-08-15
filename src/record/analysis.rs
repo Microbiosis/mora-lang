@@ -73,6 +73,9 @@ fn event_ts(ev: &Event) -> u128 {
         Event::AiChat { ts_ms, .. } => *ts_ms,
         Event::WebFetch { ts_ms, .. } => *ts_ms,
         Event::Note { ts_ms, .. } => *ts_ms,
+        // v0.83: 新增 Msg + StateMutation 变体也支持 ts 提取
+        Event::Msg { ts_ms, .. } => *ts_ms,
+        Event::StateMutation { ts_ms, .. } => *ts_ms,
     }
 }
 
@@ -145,6 +148,8 @@ pub fn compute_stats(events: &[Event]) -> RecordingStats {
             Event::Note { .. } => {
                 stats.note_count += 1;
             }
+            // v0.83: Msg + StateMutation 不进 latency/tokens 统计
+            Event::Msg { .. } | Event::StateMutation { .. } => {}
         }
     }
     stats.models = model_set.into_iter().collect();
@@ -234,6 +239,23 @@ pub fn build_timeline(events: &[Event]) -> Vec<TimelineRow> {
                     status: "-".to_string(),
                 }
             }
+            // v0.83: Msg + StateMutation 简化为 timeline 行
+            Event::Msg { channel, .. } => TimelineRow {
+                seq: i + 1,
+                kind: "msg".to_string(),
+                detail: channel.clone(),
+                tokens: "-".to_string(),
+                latency_ms: 0,
+                status: "-".to_string(),
+            },
+            Event::StateMutation { var, .. } => TimelineRow {
+                seq: i + 1,
+                kind: "state_mutation".to_string(),
+                detail: var.clone(),
+                tokens: "-".to_string(),
+                latency_ms: 0,
+                status: "-".to_string(),
+            },
         })
         .collect()
 }

@@ -15,8 +15,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::checkpoint::{Checkpoint, CheckpointSaver, SendTask};
+use crate::common::trait_info::TraitInfo;
 use crate::mir::expr::AggregatorContribution;
-use crate::runtime::types::TraitInfo;
 use crate::value::{Environment, MergeStrategy, Value};
 
 /// MIR 解释器执行所需的宿主能力。
@@ -96,4 +96,10 @@ pub trait MirHost {
         effect: String,
         prev: Option<Box<dyn crate::runtime::effect::EffectHandler>>,
     );
+
+    /// v0.83: 访问 Recorder（用于 h_define/h_assign/h_send emit StateMutation/Msg）。
+    /// 默认 None——只有 Interpreter 的 Record 模式才会返回 Some。
+    fn recorder_mut(&mut self) -> Option<&mut crate::record::Recorder> {
+        None
+    }
 }

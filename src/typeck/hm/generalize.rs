@@ -105,6 +105,13 @@ fn collect_free_vars(ty: &Type) -> Vec<char> {
         // v0.75.17: ForAll 内层仍是自由变量的来源（量化只消除命名变量自身，
         // 内层嵌套的自由变量仍需收集）。
         Type::ForAll(_, inner) => collect_free_vars(inner),
+        // v0.80: Arrow — 递归收集 input/output 的自由变量。EffectRow::Var
+        // 是 String 命名空间，不收集为 TypeVar(char)。
+        Type::Arrow(input, output, _row) => {
+            let mut vars = collect_free_vars(input);
+            vars.extend(collect_free_vars(output));
+            vars
+        }
         _ => Vec::new(),
     }
 }
@@ -121,6 +128,12 @@ fn rebuild_inner(ty: &Type) -> Type {
         Type::Result_(ok, err) => {
             Type::Result_(Box::new(rebuild_inner(ok)), Box::new(rebuild_inner(err)))
         }
+        // v0.80: Arrow — 递归重建 input/output，effect row 原样保留。
+        Type::Arrow(input, output, row) => Type::Arrow(
+            Box::new(rebuild_inner(input)),
+            Box::new(rebuild_inner(output)),
+            row.clone(),
+        ),
         _ => ty.clone(),
     }
 }

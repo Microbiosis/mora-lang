@@ -10,7 +10,7 @@
 //! - `apply_row(row, subst)`: 把 substitution 应用到 row —— Var 替换为 bound row。
 
 use crate::mir::effect::EffectRow;
-use crate::typeck::TypeError;
+use crate::typeck::hm::error::TypeError;
 
 /// v0.80: row var 命名器 —— 与 typeck::Type::TypeVar(char) 命名空间独立，
 /// row var 用 String（用户可见可读）。
@@ -30,12 +30,24 @@ impl FreshVars {
     }
 }
 
+/// v0.84: row var occur check —— 检查 row var 名是否在 row 中出现。
+/// 用于防止循环绑定（如 `v → Cons("Ai", Var(v))`）。
+pub fn occurs_in_row(name: &str, row: &EffectRow) -> bool {
+    use EffectRow::*;
+    match row {
+        Empty => false,
+        Var(v) => v == name,
+        Cons(_h, t) => occurs_in_row(name, t),
+    }
+}
+
 /// 单步 unify EffectRow。
 ///
 /// 算法骨架（参考 Koka row unification）：
 /// - Empty vs Empty → OK
-/// - Var(v) vs _ → 绑定 v -> 对方（双向同步，保持 typeck::Substitution 双向一致）
-/// - _ vs Var(v) → 同上
+/// - Var(v) vs Var(w) → 同名 OK；都未绑定则单向绑定 v→Var(w)；一方已绑定则递归
+/// - Var(v) vs 非-Var → occur check（v 不在对方 row 中）后单向绑定
+/// - 非-Var vs Var(v) → 同上（v 不在非-Var 方中）
 /// - Empty vs Cons(h, _) → Error: 0 ≠ n
 /// - Cons(h, _) vs Empty → 同上
 /// - Cons(h1, t1) vs Cons(h2, t2) → h1 == h2；递归 t1, t2
@@ -47,32 +59,57 @@ pub fn unify_row(
     use EffectRow::*;
     match (a, b) {
         (Empty, Empty) => Ok(()),
+        // v0.84: 两个 row var —— 区分同名 / 不同名 + occur check
+        (Var(v), Var(w)) => {
+            if v == w {
+                Ok(())
+            } else if let Some(prev) = subst.lookup_row(v) {
+                // v 已绑定：用 bound 值递归
+                let prev = prev.clone();
+                unify_row(&prev, b, subst)
+            } else if let Some(prev) = subst.lookup_row(w) {
+                // w 已绑定：用 bound 值递归
+                let prev = prev.clone();
+                unify_row(a, &prev, subst)
+            } else {
+                // 都未绑定：单向绑定 v → Var(w)（禁止双向写入导致循环）
+                subst.bind_row(v.clone(), EffectRow::Var(w.clone()));
+                Ok(())
+            }
+        }
+        // v0.84: Var(v) vs 非-Var 或 非-Var vs Var(v) —— occur check 后单向绑定
         (Var(v), _) | (_, Var(v)) => {
-            // Already bound? Recurse with bound value.
+            let other = if matches!(a, Var(_)) { b } else { a };
+            // Occur check：v 不能出现在 other row 中（否则循环）
+            if occurs_in_row(v, other) {
+                return Err(TypeError::EffectRowMismatch {
+                    expected: format!("row var `{}`", v),
+                    got: "self-referential row (occurs check)".to_string(),
+                    span: None,
+                });
+            }
             if let Some(prev) = subst.lookup_row(v) {
                 let prev = prev.clone();
-                let b_clone = b.clone();
-                unify_row(&prev, &b_clone, subst)?;
-                let a_clone = if matches!(a, Var(_)) { prev.clone() } else { a.clone() };
-                unify_row(&a_clone, &b_clone, subst)?;
-                Ok(())
+                unify_row(&prev, other, subst)
             } else {
-                let a_owned = a.clone();
-                let b_owned = b.clone();
-                subst.bind_row(v.clone(), a_owned);
-                subst.bind_row(v.clone(), b_owned);
+                subst.bind_row(v.clone(), other.clone());
                 Ok(())
             }
         }
         (Empty, Cons(h, _)) | (Cons(h, _), Empty) => {
-            Err(TypeError::new(0, format!("effect row mismatch: empty vs {{ {} }}", h)))
+            Err(TypeError::EffectRowMismatch {
+                expected: "pure".to_string(),
+                got: format!("{{ {} }}", h),
+                span: None,
+            })
         }
         (Cons(h1, t1), Cons(h2, t2)) => {
             if h1 != h2 {
-                Err(TypeError::new(
-                    0,
-                    format!("effect label mismatch: {} vs {}", h1, h2),
-                ))
+                Err(TypeError::EffectRowMismatch {
+                    expected: h1.clone(),
+                    got: h2.clone(),
+                    span: None,
+                })
             } else {
                 let t1_owned = t1.as_ref().clone();
                 let t2_owned = t2.as_ref().clone();
@@ -83,7 +120,7 @@ pub fn unify_row(
 }
 
 /// 把 row var 绑到具体 row（写入 substitution）。
-/// occur check 在 lookup_row 内部完成。
+/// v0.84: occur check 在 unify_row 内部完成，本函数只写入映射。
 pub fn bind_row(subst: &mut super::unify::Substitution, name: String, row: EffectRow) -> Result<(), TypeError> {
     subst.bind_row(name, row);
     Ok(())
@@ -183,5 +220,87 @@ mod tests {
         if let EffectRow::Var(new_name) = renamed {
             assert_ne!(new_name, "e");
         }
+    }
+
+    #[test]
+    fn unify_same_var_ok() {
+        // v0.84: Var("x") vs Var("x") should succeed (trivial identity)
+        let mut s = subst();
+        let a = EffectRow::Var("x".into());
+        let b = EffectRow::Var("x".into());
+        assert!(unify_row(&a, &b, &mut s).is_ok());
+    }
+
+    #[test]
+    fn unify_two_unbound_vars_binds_one_way() {
+        // v0.84: Var("x") vs Var("y") should bind x→Var(y) only (no dual-bind)
+        let mut s = subst();
+        let a = EffectRow::Var("x".into());
+        let b = EffectRow::Var("y".into());
+        assert!(unify_row(&a, &b, &mut s).is_ok());
+        // x should be bound to Var("y")
+        let bound = s.lookup_row("x").unwrap();
+        assert!(matches!(bound, EffectRow::Var(v) if v == "y"));
+        // y should NOT be bound (no dual-bind)
+        assert!(s.lookup_row("y").is_none());
+    }
+
+    #[test]
+    fn unify_var_with_self_referential_row_fails() {
+        // v0.84: Var("x") vs Cons("Ai", Var("x")) must fail (occurs check)
+        let mut s = subst();
+        let a = EffectRow::Var("x".into());
+        let b = EffectRow::Cons("Ai".into(), Box::new(EffectRow::Var("x".into())));
+        assert!(unify_row(&a, &b, &mut s).is_err());
+    }
+
+    #[test]
+    fn unify_var_with_nested_self_referential_row_fails() {
+        // v0.84: Var("x") vs Cons("Ai", Cons("Fs", Var("x"))) must fail
+        let mut s = subst();
+        let a = EffectRow::Var("x".into());
+        let b = EffectRow::Cons(
+            "Ai".into(),
+            Box::new(EffectRow::Cons("Fs".into(), Box::new(EffectRow::Var("x".into())))),
+        );
+        assert!(unify_row(&a, &b, &mut s).is_err());
+    }
+
+    #[test]
+    fn unify_non_var_with_containing_var_fails() {
+        // v0.84: Cons("Ai", Var("x")) vs Var("x") must fail (x in Cons)
+        let mut s = subst();
+        let a = EffectRow::Cons("Ai".into(), Box::new(EffectRow::Var("x".into())));
+        let b = EffectRow::Var("x".into());
+        assert!(unify_row(&a, &b, &mut s).is_err());
+    }
+
+    #[test]
+    fn unify_bound_var_with_empty() {
+        // v0.84: Var("x") already bound to Empty, unify with Var("y") should bind y→Empty
+        let mut s = subst();
+        s.bind_row("x".into(), EffectRow::Empty);
+        let a = EffectRow::Var("x".into());
+        let b = EffectRow::Var("y".into());
+        assert!(unify_row(&a, &b, &mut s).is_ok());
+        // x still bound to Empty
+        assert!(matches!(s.lookup_row("x").unwrap(), EffectRow::Empty));
+        // y should now be bound to Empty (via recursive unification of Empty vs Var(y))
+        assert!(matches!(s.lookup_row("y").unwrap(), EffectRow::Empty));
+    }
+
+    #[test]
+    fn occurs_in_row_basic() {
+        assert!(!occurs_in_row("x", &EffectRow::Empty));
+        assert!(occurs_in_row("x", &EffectRow::Var("x".into())));
+        assert!(!occurs_in_row("y", &EffectRow::Var("x".into())));
+        assert!(occurs_in_row(
+            "x",
+            &EffectRow::Cons("Ai".into(), Box::new(EffectRow::Var("x".into())))
+        ));
+        assert!(!occurs_in_row(
+            "y",
+            &EffectRow::Cons("Ai".into(), Box::new(EffectRow::Var("x".into())))
+        ));
     }
 }

@@ -3,6 +3,8 @@
 //! 被 ast_v2 和其他模块共同引用的基础类型。
 //! 这些类型不依赖任何 AST 的 StmtKind/ExprKind/NodeId，是纯粹的数据结构。
 
+pub mod trait_info;
+
 /// 源码位置信息：所有需要报错的 AST 节点带 line。
 /// `column` 当前未使用（保留以备后续 LSP / 编辑器支持）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -72,4 +74,13 @@ pub struct EnumVariant {
 pub struct StructField {
     pub name: String,
     pub type_hint: String,
+}
+
+/// v0.83: TEA Msg 变体 — 类似 EnumVariant，但 payload 字段更明确
+///（None = 无 payload，Some(type) = 携带该类型的 payload）
+#[derive(Debug, Clone, PartialEq)]
+pub struct MsgVariant {
+    pub name: String,
+    /// None = unit variant（`Increment`），Some(type) = 带 payload（`SetStep(int)`）
+    pub payload_type: Option<String>,
 }

@@ -101,6 +101,17 @@ impl Interpreter {
             "into" => self.call_builtin_into(args),
             "tail" => self.call_builtin_tail(args),
             "compose_prompt" => self.call_builtin_compose_prompt(args),
+            "eval" => self.call_builtin_eval(args, env),
+            "apply" => self.call_builtin_apply(args),
+            "curry" => self.call_builtin_curry(args),
+            "uncurry" => self.call_builtin_uncurry(args),
+            "cons" => self.call_builtin_cons(args),
+            "car" => self.call_builtin_car(args),
+            "cdr" => self.call_builtin_cdr(args),
+            "quote" => self.call_builtin_quote(args),
+            "gensym" => self.call_builtin_gensym(args),
+            "read" => self.call_builtin_read(args),
+            "macroexpand" => self.call_builtin_macroexpand(args, env),
             _ => {
                 // v0.75.76: P6 登记校验移至兜底分支——此前顶层 testcase! 断言
                 // `_kind.is_some()` 误拦用户自定义函数（_kind.is_none() 落兜底
@@ -503,27 +514,306 @@ impl Interpreter {
         }
         Ok(Value::String(buf))
     }
+    fn call_builtin_eval(&mut self, args: Vec<Value>, env: &Environment) -> Result<Value, String> {
+        // v0.86: runtime eval — 从 Mora 代码内部动态执行任意 Mora 源码。
+        // 这是 Lisp homoiconicity + eval-apply loop 在 Mora 上的落地：
+        //   eval("2 + 3") -> Value::Int(5)
+        //   eval("function foo(x) x*x end") -> Value::Task/Closure
+        // 实现路径：source string -> Lexer -> ParserV3::compile -> run_mir。
+        // 执行环境：子 Environment 以当前调用栈的 env 为 parent（用 parking_lot::Mutex 与
+        // value.rs 中的 Environment 类型一致），这样 eval 内部可以读取当前 scope
+        // 的变量（如 task 内的 let 绑定），但无法修改外层绑定。
+        let source = match args.first() {
+            Some(Value::String(s)) => s.clone(),
+            Some(Value::Code(s)) => s.clone(),
+            _ => {
+                return Err("eval(source: string|code) expects a string or code argument".to_string());
+            }
+        };
+        let (func, _witnesses) = match crate::parser_v3::ParserV3::compile(&source) {
+            Ok(f) => f,
+            Err(e) => return Err(format!("eval: compile error: {}", e)),
+        };
+        let func = std::sync::Arc::new(func);
+        use parking_lot::Mutex;
+        let mut child_env =
+            Environment::with_parent_of(std::sync::Arc::new(Mutex::new(env.clone())));
+        crate::mir::vm::run_mir(&func, self, &mut child_env)
+    }
+
+    // ===================================================================
+    // v0.86: Lisp homoiconicity — apply / curry / uncurry / cons / car / cdr
+    // ===================================================================
+
+    /// v0.86: apply(fn, [args...]) — Lisp apply。将 args 列表展开为独立参数
+    /// 并调用 fn。这是 eval-apply loop 的另一半（eval 已完成）。
+    /// 示例：apply(sum, [1, 2, 3]) == sum(1, 2, 3)
+    fn call_builtin_apply(&mut self, args: Vec<Value>) -> Result<Value, String> {
+        if args.len() < 2 {
+            return Err("apply(fn, [args...]) expects at least 2 arguments".to_string());
+        }
+        let fn_val = &args[0];
+        let arg_list = &args[1];
+        // 提取待展开的参数列表
+        let expanded: Vec<Value> = match arg_list {
+            Value::List(items) => items.clone(),
+            // 单个元素也算作一个参数的"列表"
+            other => vec![other.clone()],
+        };
+        self.call_value(fn_val, expanded)
+    }
+
+    /// v0.86: curry(fn, arity) — 柯里化包装器。
+    /// 返回 Value::Curry(func, arity, bound_args=[])。
+    /// 调用时若参数数 < arity，返回新的 Curry（累积参数）；
+    /// 若参数数 >= arity，调用内部 fn。
+    /// 示例：
+    ///   let f = curry(sum3, 3)
+    ///   f(1)(2)(3) -> 6
+    ///   curry(add, 2)(1)(2) -> 3
+    fn call_builtin_curry(&mut self, args: Vec<Value>) -> Result<Value, String> {
+        if args.len() < 2 {
+            return Err("curry(fn, arity) expects fn and arity".to_string());
+        }
+        let fn_val = args[0].clone();
+        let arity = match &args[1] {
+            Value::Int(n) => *n as usize,
+            Value::Float(n) => *n as usize,
+            _ => return Err("curry: arity must be an integer".to_string()),
+        };
+        if arity == 0 {
+            return Err("curry: arity must be > 0".to_string());
+        }
+        Ok(Value::Curry {
+            func: Box::new(fn_val),
+            arity,
+            bound_args: Vec::new(),
+        })
+    }
+
+    /// v0.86: uncurry(curried_fn) — 解柯里化。
+    /// 若参数是 Curry，返回内部原始 fn；否则原样返回。
+    fn call_builtin_uncurry(&mut self, args: Vec<Value>) -> Result<Value, String> {
+        if args.is_empty() {
+            return Err("uncurry(fn) expects a function argument".to_string());
+        }
+        match &args[0] {
+            Value::Curry { func, .. } => Ok((**func).clone()),
+            _ => Ok(args[0].clone()),
+        }
+    }
+
+    /// v0.86: cons(car, cdr) — Lisp cons cell 构造器。
+    /// 返回 Value::Cons(car, cdr)。
+    /// 示例：cons(1, cons(2, Nil)) -> (1 . (2))
+    fn call_builtin_cons(&mut self, args: Vec<Value>) -> Result<Value, String> {
+        if args.len() < 2 {
+            return Err("cons(car, cdr) expects 2 arguments".to_string());
+        }
+        Ok(Value::Cons {
+            car: Box::new(args[0].clone()),
+            cdr: Box::new(args[1].clone()),
+        })
+    }
+
+    /// v0.86: car(cell) — 提取 cons cell 的头部。
+    /// 对 List 退化为取第一个元素，方便过渡。
+    fn call_builtin_car(&mut self, args: Vec<Value>) -> Result<Value, String> {
+        if args.is_empty() {
+            return Err("car(cell) expects a cons cell or list".to_string());
+        }
+        match &args[0] {
+            Value::Cons { car, .. } => Ok((**car).clone()),
+            Value::List(items) => items
+                .first()
+                .cloned()
+                .ok_or_else(|| "car: empty list has no first element".to_string()),
+            Value::Nil => Err("car: cannot take car of Nil".to_string()),
+            _ => Err(format!("car: expected cons cell or list, got {}", args[0])),
+        }
+    }
+
+    /// v0.86: cdr(cell) — 提取 cons cell 的尾部。
+    /// 对 List 退化为取除第一个元素外的剩余列表。
+    fn call_builtin_cdr(&mut self, args: Vec<Value>) -> Result<Value, String> {
+        if args.is_empty() {
+            return Err("cdr(cell) expects a cons cell or list".to_string());
+        }
+        match &args[0] {
+            Value::Cons { cdr, .. } => Ok((**cdr).clone()),
+            Value::List(items) => Ok(Value::List(items[1..].to_vec())),
+            Value::Nil => Err("cdr: cannot take cdr of Nil".to_string()),
+            _ => Err(format!("cdr: expected cons cell or list, got {}", args[0])),
+        }
+    }
+
+    /// v0.86: quote(s) — Lisp homoiconicity 的第三块基石。
+    ///
+    /// 将源码文本字符串包装为 Value::Code，与 eval 形成往返对：
+    ///   eval(quote(expr)) == expr
+    ///   quote(expr) -> Value::Code("expr")
+    ///
+    /// 注意：`quote(expr)` 语法在解析期已由 emit_quote_w 提取源码文本
+    /// 并以 MirInst::Call(dst, "quote", [Const(String(expr))]) 的形式 emit。
+    /// 本函数是运行时入口：把 Value::String 转换为 Value::Code。
+    fn call_builtin_quote(&mut self, args: Vec<Value>) -> Result<Value, String> {
+        let source = match args.first() {
+            Some(Value::String(s)) => s.clone(),
+            _ => {
+                return Err(
+                    "quote(source: string) expects a string argument".to_string(),
+                );
+            }
+        };
+        Ok(Value::Code(source))
+    }
+
+    // ===================================================================
+    // v0.87: Lisp homoiconicity 三件套补完 — gensym / read / macroexpand
+    // ===================================================================
+
+    /// v0.87: gensym() — 生成唯一符号名。
+    ///
+    /// Lisp 宏系统的核心原语：保证宏展开时引入的新变量名不与用户代码冲突。
+    /// Mora 无 AST 架构下，gensym 返回一个 `Value::String`，形式为 `"g{n}"`，
+    /// 保证同一 Interpreter 实例内唯一（gensym_counter 在 CoreRuntime 上，
+    /// Arc<Mutex<>> 保护，Pregel worker 各自独立）。
+    ///
+    /// 用法：
+    ///   let fresh = gensym()   → "g0"
+    ///   let fresh2 = gensym()  → "g1"
+    ///
+    fn call_builtin_gensym(&mut self, args: Vec<Value>) -> Result<Value, String> {
+        if !args.is_empty() {
+            return Err("gensym() expects no arguments".to_string());
+        }
+        let mut counter = self.core.gensym_counter.lock();
+        let n = *counter;
+        *counter += 1;
+        Ok(Value::String(format!("g{n}")))
+    }
+
+    /// v0.87: read(code_str) — 解析源码字符串为 Value::Code。
+    ///
+    /// 与 quote(expr) 语义等价（Mora 无 AST，两者都是把源码文本作为可执行代码载体）。
+    /// read 是 Lisp 传统的 Reader 层函数（字符流 → 数据），在 Mora 中简化为
+    /// "字符串 → Value::Code" 标记。与 eval() 配对使用：eval(read(code_str)) 等价于 eval(code_str)。
+    ///
+    /// 用法：
+    ///   let code = read("2 + 3")     → Value::Code("2 + 3")
+    ///   eval(read("2 + 3"))          → Value::Int(5)
+    ///   eval(read(read("2 + 3")))    → 嵌套：read 返回 Code，eval 接受 Code
+    ///
+    fn call_builtin_read(&mut self, args: Vec<Value>) -> Result<Value, String> {
+        let source = match args.first() {
+            Some(Value::String(s)) => s.clone(),
+            Some(Value::Code(s)) => s.clone(),
+            _ => {
+                return Err("read(source: string|code) expects a string or code argument".to_string());
+            }
+        };
+        Ok(Value::Code(source))
+    }
+
+    /// v0.87: macroexpand(name, args...) — 展开宏并返回求值结果。
+    ///
+    /// Mora 宏是 by-example（运行时求值）而非 compile-time source 变换。
+    /// macroexpand 执行宏 body（以 args 绑定 params），返回结果作为"展开值"。
+    /// 这对应 CL 中 macroexpand 求值展开形式的语义。
+    ///
+    /// 用法：
+    ///   macro add(a, b)  a + b  end
+    ///   macroexpand("add", [1, 2])   → Value::Int(3)
+    ///
+    ///   macro when(cond, body)  if cond { body } end
+    ///   macroexpand("when", [true, 42])  → Value::Int(42)
+    ///
+    /// 错误路径：
+    ///   - 未定义宏 → "macroexpand: undefined macro 'name'"
+    ///   - 参数不足 → 缺失参数绑定为 Nil
+    ///   - 宏执行错误 → "macro 'name' execution error: ..."
+    ///
+    fn call_builtin_macroexpand(
+        &mut self,
+        args: Vec<Value>,
+        env: &Environment,
+    ) -> Result<Value, String> {
+        let name = match args.first() {
+            Some(Value::String(s)) => s.clone(),
+            _ => {
+                return Err(
+                    "macroexpand(name: string, args...) expects a string name".to_string(),
+                );
+            }
+        };
+        let expr_args: Vec<Value> = if args.len() > 1 {
+            match &args[1] {
+                Value::List(items) => items.clone(),
+                other => vec![other.clone()],
+            }
+        } else {
+            Vec::new()
+        };
+
+        let macro_val = env
+            .get(&name)
+            .ok_or_else(|| format!("macroexpand: undefined macro '{}'", name))?;
+
+        match macro_val {
+            Value::Macro {
+                name: mname,
+                params,
+                body,
+            } => {
+                use parking_lot::Mutex;
+                let mut child_env =
+                    Environment::with_parent_of(std::sync::Arc::new(Mutex::new(env.clone())));
+                for (i, param) in params.iter().enumerate() {
+                    let val = expr_args.get(i).cloned().unwrap_or(Value::Nil);
+                    child_env.define(param.clone(), val, false);
+                }
+                crate::mir::vm::run_mir(&body, self, &mut child_env).map_err(|e| {
+                    format!("macro '{}' expansion error: {}", mname, e)
+                })
+            }
+            _ => Err(format!("macroexpand: '{}' is not a macro", name)),
+        }
+    }
+
     fn call_builtin_fallback(
         &mut self,
         name: &str,
         args: Vec<Value>,
         env: &Environment,
     ) -> Result<Value, String> {
-        // v0.75.76: 用户函数查找源为执行 env（经参数单一传递，与 h_define
-        // 同一容器）——不再查询宿主全局环境（take_env 空壳问题根除）。
         let looked_up = env.get(name).clone();
         if let Some(value) = looked_up {
             match value {
                 Value::Task { .. }
                 | Value::Closure { .. }
                 | Value::Compose(_)
-                | Value::Partial(_, _) => self.call_value(&value, args),
-                // v0.75.80: 宏展开未实现 — 显式报错而非静默 Nil。
-                // 此前 Value::Macro 只存 name+params（value.rs），宏体在
-                // parser 词法级跳过（parse_macro_def），调用方拿到静默 Nil
-                // 无错误无展开（spec 11.5 承诺宏是用户特性，属功能缺失被掩盖）。
-                Value::Macro { name, .. } => {
-                    Err(format!("macro '{}' expansion not implemented", name))
+                | Value::Partial(_, _)
+                | Value::Curry { .. } => self.call_value(&value, args),
+                // v0.83: 宏展开 — 完整实现。宏体是 MIR 函数（由 parser emit_macro_def_w
+                // 经子 EmitContext 编译而来），调用时以 args 绑定 params，在子 env 中
+                // run_mir 执行 body（与 Value::Task 语义同构）。
+                Value::Macro {
+                    name: mname,
+                    params,
+                    body,
+                } => {
+                    // v0.86: 宏体执行的 parent 环境改为当前调用栈 env（而非全局环境），
+                    // 这样宏可以引用同级定义的其他宏和变量（如 square 调 mul）。
+                    use parking_lot::Mutex;
+                    let mut child_env =
+                        Environment::with_parent_of(std::sync::Arc::new(Mutex::new(env.clone())));
+                    for (i, param) in params.iter().enumerate() {
+                        let val = args.get(i).cloned().unwrap_or(Value::Nil);
+                        child_env.define(param.clone(), val, false);
+                    }
+                    crate::mir::vm::run_mir(&body, self, &mut child_env).map_err(|e| {
+                        format!("macro '{}' execution error: {}", mname, e)
+                    })
                 }
                 _ => Err(format!("'{}' is not callable", name)),
             }
@@ -550,7 +840,9 @@ impl Interpreter {
             Value::Builtin(kind) => self.call_method_builtin(kind, method, args),
             Value::Conversation { .. } => self.call_method_conversation(object, method, args),
             Value::String(s) => self.call_method_string(s, method, args),
-            Value::Stream { reader, done } => self.call_method_stream(reader, done, method, args),
+            Value::Stream { reader, done, xform } => {
+                self.call_method_stream(reader, done, xform, method, args)
+            }
             Value::Agent { .. } => self.call_method_agent(object, method, args),
             Value::Router { routes } => self.call_method_router(routes, method, args),
             Value::McpServer { tools } => self.call_method_mcp(tools, method, args),
@@ -1047,6 +1339,9 @@ impl Interpreter {
             (BuiltinKind::Plan, _) => self.call_plan_method(method, &args),
             // v0.48.0: mora.* — meta (refine)
             (BuiltinKind::Mora, _) => self.call_mora_method(method, &args),
+            // v0.83: TEA runtime 与 transducer builtin dispatch
+            (BuiltinKind::Tea, _) => self.call_tea_method(method, &args),
+            (BuiltinKind::Xform, _) => self.call_xform_method(method, &args),
             // v0.45.0: ai.retry / ai.role — top-level AI utilities
             // (chat still handled by existing AiChat dispatch below)
             (BuiltinKind::Ai, _) => self.call_ai_method(method, &args),
@@ -1200,6 +1495,7 @@ impl Interpreter {
         &self,
         reader: StreamReader,
         done: Arc<Mutex<bool>>,
+        xform: Option<Arc<dyn crate::value::transducer::Transducer<String, String>>>,
         method: &str,
         _args: Vec<Value>,
     ) -> Result<Value, String> {
@@ -1208,8 +1504,16 @@ impl Interpreter {
                 let mut result = String::new();
                 if !*done.lock() {
                     let mut guard = reader.lock();
+                    // v0.83: apply transducer to each raw SSE token.
+                    // Arc::get_mut requires unique ownership; if shared
+                    // (other holder exists), fall back to identity.
+                    let mut xform_arc = xform;
                     loop {
-                        match Self::read_next_sse_token(&mut guard) {
+                        let xform_mut: Option<&mut dyn crate::value::transducer::Transducer<String, String>> =
+                            xform_arc.as_mut().and_then(|arc| {
+                                std::sync::Arc::get_mut(arc).map(|t| { t as &mut dyn crate::value::transducer::Transducer<String, String> })
+                            });
+                        match Self::read_next_sse_token(&mut guard, xform_mut) {
                             Ok(Some(token)) => result.push_str(&token),
                             Ok(None) => {
                                 *done.lock() = true;
@@ -1459,6 +1763,20 @@ impl Interpreter {
                 all_args.extend(args);
                 self.call_value(func, all_args)
             }
+            // v0.86: Curry — 累积参数直到 arity 时调用内部函数。
+            Value::Curry { func, arity, bound_args } => {
+                let mut total_args = bound_args.clone();
+                total_args.extend(args);
+                if total_args.len() < *arity {
+                    Ok(Value::Curry {
+                        func: func.clone(),
+                        arity: *arity,
+                        bound_args: total_args,
+                    })
+                } else {
+                    self.call_value(func, total_args)
+                }
+            }
             _ => Err(format!("Value is not callable: {}", value)),
         }
     }
@@ -1660,6 +1978,9 @@ mod tests {
             ("ccr.put", BuiltinKind::Ccr),
             ("plan.update", BuiltinKind::Plan),
             ("mora.refine", BuiltinKind::Mora),
+            // v0.83: TEA runtime 与 transducer builtin 注册
+            ("tea", BuiltinKind::Tea),
+            ("xform", BuiltinKind::Xform),
         ] {
             assert_eq!(
                 BuiltinKind::from_name(name),

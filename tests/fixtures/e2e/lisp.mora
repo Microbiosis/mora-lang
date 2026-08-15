@@ -1,0 +1,61 @@
+-- v0.86: Lisp 特征 E2E 测试
+-- apply / curry / uncurry / cons / car / cdr
+
+task main()
+  -- apply(fn, [args...]) — 将列表展开为独立参数调用函数
+  let sum = fn(a, b, c) => a + b + c
+  let applied = apply(sum, [1, 2, 3])
+  print("apply(sum, [1,2,3])=" + applied)
+
+  -- curry(fn, arity) — 柯里化包装器
+  let add3 = fn(a, b, c) => a + b + c
+  let curried = curry(add3, 3)
+  let partial1 = curried(1)
+  print("curried(1)=" + partial1)
+  let partial2 = partial1(2)
+  print("curried(1)(2)=" + partial2)
+  let done = partial2(3)
+  print("curried(1)(2)(3)=" + done)
+
+  -- uncurry(curried_fn) — 解柯里化
+  let raw = uncurry(curried)
+  print("uncurry(curried)=" + raw)
+
+  -- cons(car, cdr) — Lisp 链式列表
+  let cell = cons(1, cons(2, cons(3, nil)))
+  print("cons(1,cons(2,cons(3,Nil)))=" + cell)
+
+  -- car(cell) — 取头部
+  let head = car(cell)
+  print("car(cons(1,...))=" + head)
+
+  -- cdr(cell) — 取尾部
+  let tail = cdr(cell)
+  print("cdr(cons(1,...))=" + tail)
+
+  -- car + cdr 组合
+  let second = car(cdr(cell))
+  print("car(cdr(cons(1,2,3)))=" + second)
+
+  -- 嵌套 cons
+  let nested = cons(cons(1, 2), cons(3, 4))
+  print("nested=" + nested)
+  let outer_head = car(nested)
+  print("car(nested)=" + outer_head)
+  let inner_head = car(outer_head)
+  print("car(car(nested))=" + inner_head)
+
+  -- quote(expr) — Lisp homoiconicity 第三块基石。
+  -- quote(expr) 在解析期捕获 expr 源码文本，包装为 Value::Code。
+  -- 往返不变式：eval(quote(expr)) == expr。
+  let q1 = quote(2 + 3)
+  print("quote(2+3)=" + q1)
+  let rt = eval(quote(2 + 3))
+  print("eval(quote(2+3))=" + rt)
+  let nested_q = quote(fn(x) x * 2 end)
+  print("quote(fn)=" + nested_q)
+  let rt_fn = eval(quote(fn(x) x * 2 end))
+  print("eval(quote(fn))=" + rt_fn)
+
+  done
+end

@@ -34,13 +34,13 @@ crossbeam-channel = "0.5"
 # 选择 ureq 而非 reqwest 的理由：ureq 同步阻塞，与同步解释器天然契合
 # 不引入 tokio 等 async runtime
 # 注意：v9 零依赖承诺被打破，但守住"不引入 async runtime"的红线
-# v0.x 升级 ureq 2.12 → 3.3
-# 重大变化:
+# v0.x 升级 ureq 2.12 → 3.3:
 #   - AgentBuilder 重写,超时改用 ConfigBuilder.timeout_global
 #   - Error 枚举:Status(u16, Response) → StatusCode(u16) + 多种细粒度变体 (#[non_exhaustive])
 #   - Response::into_string() 移除,改用 .body_mut().read_to_string()
 #   - 升级到 edition 2024 + MSRV 1.85
-ureq = "3.3"
+# v0.85: 升级 ureq 3.3 → 3.4（minor bump，兼容）
+ureq = "3.4"
 # v0.11: libc 用于设置 SO_REUSEADDR（避免 TIME_WAIT 端口占用）
 # 选择 libc 而非 socket2 的理由：libc 是 Rust 几乎必备的 stdlib-like 包，
 # 体积小（编译期常量），且 ureq 自身已经间接依赖 libc
@@ -56,8 +56,8 @@ parking_lot = "0.12"
 # time: tokio::time::timeout
 # sync: tokio::sync::RwLock, Mutex, Semaphore
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "io-util", "io-std"] }
-# v0.42.1: sha2 for SHA-256 hash chain in AuditSink (audit.jsonl)
-sha2 = "0.10"
+# v0.84: 升级 sha2 0.10 → 0.11（digest 0.11，SHA-256 实现无功能变化）
+sha2 = "0.11"
 # v0.28: Office (PPTX/DOCX) + Image OCR backends (all pure Rust)
 # v0.76.09: 升级 undoc 0.5 → 0.8（跨 3 major——Mora 仅用 DocxParser/PptxParser/Block::Paragraph，
 # 这些 API 在 0.5→0.8 路径稳定——ErrorKind/CleanupOptions/Table 渲染变更对 Mora 无影响）
@@ -68,13 +68,18 @@ ocrs = "0.12"
 # We pull rten directly so we can call `rten::Model::load_static_slice` on
 # the `.rten` model files we vendor in `tests/fixtures/`. Pinned to match
 # the version of rten that ocrs 0.12.2 already pulls in transitively.
+# v0.85: 暂不升级 rten 0.24 → 0.25。原因：Mora 调用 `rten::Model::load_file()`
+# 后将返回的 Model 传给 `OcrEngine::new()`（ocrs 0.12.2 API）。两者必须共享
+# 同一 rten 版本——Cargo 多版本共存对"实例跨 crate 传递"无效。ocrs 0.12.2
+# 是最新版（2026-03-27），仍 pin rten 0.24。等 ocrs 释放支持 rten 0.25+ 的版本
+# 后再升级。
 rten = "0.24"
 # v0.28 Task 6: ocrs's public API returns `anyhow::Result<T>` everywhere,
 # but ocrs does not re-export `anyhow` itself — so we depend on it directly
 # to spell out the `OnceLock<anyhow::Result<OcrEngine>>` type and to
 # construct an `anyhow::Result` in `get_or_init`.
 anyhow = "1"
-image = { version = "0.24", default-features = false, features = ["png"] }
+image = { version = "0.25", default-features = false, features = ["png"] }
 # v0.27: Document 统一 IR
 # PDF 后端
 # v0.76.08: 升级 lopdf 0.42 → 0.44（Mimosa P2 评估级——minor 跳，零跨 major 风险）
@@ -87,7 +92,8 @@ pulldown-cmark = "0.13"
 quick-xml = "0.41"
 # v0.50: Checkpoint persistence (Worker 3)
 uuid = { version = "1", features = ["v4"] }
-rusqlite = { version = "0.32", optional = true, features = ["bundled"] }
+# v0.85: 升级 rusqlite 0.32 → 0.40（VTab macro 变更不影响 Mora——未使用 VTab）
+rusqlite = { version = "0.40", optional = true, features = ["bundled"] }
 
 [dev-dependencies]
 # v0.53: property-based testing for formal semantics verification

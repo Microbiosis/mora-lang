@@ -347,7 +347,7 @@ fn command_exists(cmd: &str) -> bool {
 }
 
 fn print_banner() {
-    use mora::interpreter::{AI_API_KEY_ENV, AI_BASE_URL_DEFAULT, AI_BASE_URL_ENV};
+    use mora::config::{AI_API_KEY_ENV, AI_BASE_URL_DEFAULT, AI_BASE_URL_ENV};
     let has_openai_key = env::var(AI_API_KEY_ENV)
         .map(|k| !k.is_empty())
         .unwrap_or(false);

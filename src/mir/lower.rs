@@ -731,9 +731,16 @@ impl MirExprLowerer {
                 Ok(dst)
             }
             MirExprKind::MacroDef { name, params } => {
+                // v0.83: MirExpr 路径不携带 body（历史路径），发空体占位。
                 self.emit(MirInst::MacroDef {
                     name: name.clone(),
                     params: params.clone(),
+                    body: Box::new(crate::mir::MirFunction {
+                        params: Vec::new(),
+                        body: Vec::new(),
+                        n_regs: 0,
+                        effects: Default::default(),
+                    }),
                 });
                 let dst = self.alloc_reg();
                 self.emit(MirInst::Const(dst, crate::value::Value::Nil));
@@ -849,6 +856,19 @@ pub fn pattern_to_string(pattern: &crate::mir::expr::Pattern) -> String {
                 pattern_to_string(head),
                 pattern_to_string(tail)
             )
+        }
+        Pattern::ListVec { elements, rest } => {
+            let parts: Vec<String> =
+                elements.iter().map(pattern_to_string).collect();
+            if let Some(r) = rest {
+                format!(
+                    "list:vector:[{},..{}]",
+                    parts.join(","),
+                    pattern_to_string(r)
+                )
+            } else {
+                format!("list:vector:[{}]", parts.join(","))
+            }
         }
         Pattern::Dict { required, rest } => {
             let fields: Vec<String> = required

@@ -26,6 +26,8 @@ pub enum TokenType {
     // ParserV3 不解析、MirInst 由手工构造驱动；运行时原语集不变）。
     // v0.20: 宏关键字
     Macro,
+    // v0.86: Lisp homoiconicity — quote 冻结表达式为数据，完成 eval-apply-quote 三元组。
+    Quote,
     // v0.25: Multi-Agent 协调关键字
     Orchestrate,
     Loop,
@@ -35,6 +37,9 @@ pub enum TokenType {
     Prompt,
     // v0.27: Document 块（与 prompt 块语义类似）
     Document,
+    // v0.85: with 块（配置桥接）— with mock_llm = [...] end
+    // 与 handle/perform 同模式但显式 TokenType，支持 §1.1 "语言一等公民"。
+    With,
     // 注意: HTTP 方法 (GET/POST/PUT/DELETE/PATCH) 不作关键字
     // —— 保持 Identifier,显式 API Router.route() 按字符串匹配
     Identifier(String),
@@ -57,7 +62,10 @@ pub enum TokenType {
     Less,
     GreaterEqual,
     LessEqual,
-    Pipe,
+    Pipe,  // `|>` pipeline operator
+    // v0.85: standalone `|` — used for union type annotations (`string | number`).
+    // `|` alone = Or; `|>` = Pipe. Distinct tokens to avoid ambiguity.
+    Or,
     // v0.30: `!` 前缀 (逻辑非) 和 `@` 装饰符 (如 @start, @exit graph 节点)
     Bang,
     At,
@@ -72,6 +80,11 @@ pub enum TokenType {
     // v0.08: dyn / Self
     Dyn,
     Self_,
+    // v0.88: Quasiquote — 反引号 quasiquote 语法（Lisp 系 quasiquote/unquote/unquote-splice）。
+    // 反引号 `` ` `` 开始 quasiquote 上下文；逗号在 quasiquote 内语义为 unquote。
+    // CommaComma (`,,`) 在 quasiquote 内为 unquote-splice，在普通上下文中为语法错误。
+    Backtick,
+    CommaComma,
     // v0.23: 类型系统增强
     Type,   // type 关键字
     Enum,   // enum 关键字
@@ -83,7 +96,8 @@ pub enum TokenType {
     LBrace,
     RBrace,
     Dot,
-    DotDotDot, // v0.16: '...' 用于列表 rest 模式
+    DotDot, // v0.87: '..' for list rest pattern
+    DotDotDot, // v0.16: '...' for list rest pattern
     Comma,
     Colon,
     Amp,              // v0.21: '&' 借用
@@ -249,14 +263,27 @@ impl Lexer {
             '{' => Self::simple_token(TokenType::LBrace, start_line, start_col),
             '}' => Self::simple_token(TokenType::RBrace, start_line, start_col),
             '.' => {
-                if self.match_char('.') && self.match_char('.') {
-                    // '...' 三个点 → DotDotDot
-                    Self::simple_token(TokenType::DotDotDot, start_line, start_col)
+                if self.match_char('.') {
+                    if self.match_char('.') {
+                        // '...' 三个点 → DotDotDot
+                        Self::simple_token(TokenType::DotDotDot, start_line, start_col)
+                    } else {
+                        // '..' 两个点 → DotDot
+                        Self::simple_token(TokenType::DotDot, start_line, start_col)
+                    }
                 } else {
                     Self::simple_token(TokenType::Dot, start_line, start_col)
                 }
             }
-            ',' => Self::simple_token(TokenType::Comma, start_line, start_col),
+            ',' => {
+                // v0.88: `,,` → CommaComma（quasiquote unquote-splice）；单 `,` → Comma。
+                if self.match_char(',') {
+                    Self::simple_token(TokenType::CommaComma, start_line, start_col)
+                } else {
+                    Self::simple_token(TokenType::Comma, start_line, start_col)
+                }
+            }
+            '`' => Self::simple_token(TokenType::Backtick, start_line, start_col),
             ':' => {
                 if self.match_char(':') {
                     Self::simple_token(TokenType::ColonColon, start_line, start_col)
@@ -268,11 +295,7 @@ impl Lexer {
                 if self.match_char('>') {
                     Self::simple_token(TokenType::Pipe, start_line, start_col)
                 } else {
-                    Some(self.error_token(
-                        start_line,
-                        start_col,
-                        "Unexpected '|'; did you mean '|>'?",
-                    ))
+                    Self::simple_token(TokenType::Or, start_line, start_col)
                 }
             }
             '>' => {
@@ -693,6 +716,8 @@ impl Lexer {
             "mcp" => TokenType::Identifier("mcp".to_string()),
             "http" => TokenType::Identifier("http".to_string()),
             "macro" => TokenType::Macro,
+            // v0.86: Lisp homoiconicity — quote 冻结表达式为数据
+            "quote" => TokenType::Quote,
             // v0.08: dyn / Self
             "dyn" => TokenType::Dyn,
             "Self" => TokenType::Self_,
@@ -717,6 +742,8 @@ impl Lexer {
                     TokenType::Identifier(value)
                 }
             }
+            // v0.85: with 块（配置桥接）— 与 handle/perform 同语义但显式关键字
+            "with" => TokenType::With,
             _ => TokenType::Identifier(value),
         };
         Token {

@@ -344,6 +344,14 @@ fn value_to_json(v: &Value) -> JsonValue {
         Value::Macro { .. } => JsonValue::String_("<macro>".to_string()),
         Value::PromptSection { .. } => JsonValue::String_("<prompt_section>".to_string()),
         Value::Document { .. } => JsonValue::String_("<document>".to_string()),
+        // v0.83: TEA types — 占位字符串
+        Value::TeaApp(_) => JsonValue::String_("<tea_app>".to_string()),
+        Value::TeaCmd(cmd) => JsonValue::String_(format!("<tea_cmd {:?}>", cmd)),
+        Value::TeaMsg(msg) => JsonValue::String_(format!("<tea_msg {}>", msg.tag)),
+        // v0.86: Curry / Cons / Code — JSON 占位
+        Value::Curry { .. } => JsonValue::String_("<curry>".to_string()),
+        Value::Cons { .. } => JsonValue::String_("<cons>".to_string()),
+        Value::Code(s) => JsonValue::String_(format!("<code {s}>")),
     }
 }
 

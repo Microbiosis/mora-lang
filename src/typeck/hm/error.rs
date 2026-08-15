@@ -47,6 +47,15 @@ pub enum TypeError {
         value: String,
         span: Option<Span>,
     },
+
+    /// v0.80: Effect row unification failure (algebraic effects).
+    /// Two effect rows could not be unified (e.g. different labels, or
+    /// concrete row vs empty).
+    EffectRowMismatch {
+        expected: String,
+        got: String,
+        span: Option<Span>,
+    },
 }
 
 impl std::fmt::Display for TypeError {
@@ -102,6 +111,14 @@ impl std::fmt::Display for TypeError {
             }
             TypeError::InvalidLiteral { what, value, span } => {
                 write!(f, "Invalid {} literal '{}'", what, value)?;
+                if let Some(s) = span {
+                    write!(f, " at line {}, column {}", s.line, s.column)
+                } else {
+                    Ok(())
+                }
+            }
+            TypeError::EffectRowMismatch { expected, got, span } => {
+                write!(f, "Effect row mismatch: expected {}, got {}", expected, got)?;
                 if let Some(s) = span {
                     write!(f, " at line {}, column {}", s.line, s.column)
                 } else {

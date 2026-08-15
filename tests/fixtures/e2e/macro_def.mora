@@ -1,0 +1,14 @@
+-- v0.83: macro 定义 + 展开 E2E 测试
+-- 验证: parser emit_macro_def_w 保留宏体 -> Value::Macro { body }
+--  -> MirHost::call_value -> run_mir(body, &mut child_env)
+macro double(x)
+  x + x
+end
+macro triple(a, b)
+  a + b + a
+end
+let d = double(21i)
+let t = triple(10i, 2i)
+print("double(21)=" + d)
+print("triple(10,2)=" + t)
+d

@@ -39,7 +39,7 @@ use std::io::Cursor;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
-use image::io::Reader as ImageReader;
+use image::ImageReader;
 use ocrs::{ImageSource, OcrEngine, OcrEngineParams};
 
 use crate::document::DocumentBackend;

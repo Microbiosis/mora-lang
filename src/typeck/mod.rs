@@ -77,6 +77,8 @@ pub enum Type {
     AiModule,
     /// v0.06.2: 类型化错误处理 Result<T, E>
     Result_(Box<Type>, Box<Type>),
+    /// v0.83: 元组类型 — `(Model, Cmd)` 等。strong tuple typeck 支持 update 返回。
+    Tuple(Vec<Box<Type>>),
     /// v0.06.3: HTTP 路由构建器
     Router,
     /// v0.06.3: HTTP 请求对象
@@ -133,11 +135,30 @@ pub enum Type {
     /// 命中 env 时由 instantiate 替换为 fresh TypeVar（标准 HM 规则）。
     ForAll(Vec<char>, Box<Type>),
     /// v0.80: 函数类型带 effect row（Stage 2/4 algebraic effects 的类型基础）。
-    /// `fn (T) -> U ! {Ai, Fs}` — input type → output type with effect row。
+    /// `fn(a) -> b ! {Ai, Fs}` — input type → output type with effect row。
     /// Koka 风格：`Arrow(input, output, EffectRow)`。
     /// 与 ForAll 的区别：ForAll 跨函数泛型量化；Arrow 标记具体函数类型的 effect。
     /// 老 `Closure` / `Task` 类型视为 `Arrow(_, _, Empty)`。
     Arrow(Box<Type>, Box<Type>, crate::mir::effect::EffectRow),
+    // ── v0.83: TEA (The Elm Architecture) 类型注解 ──
+    /// Model 类型 — 状态结构（与 Concrete 类似但语义是 Model）
+    TeaModel {
+        name: String,
+        fields: Vec<(String, Box<Type>)>,
+    },
+    /// Msg 类型 — tagged union
+    TeaMsg {
+        name: String,
+        variants: Vec<(String, Option<Box<Type>>)>,
+    },
+    /// App 类型 — 完整 TEA app
+    TeaApp {
+        name: String,
+        model: Box<Type>,
+        msg: Box<Type>,
+        update: Box<Type>,
+        view: Box<Type>,
+    },
 } // ← close pub enum Type
 
 impl Type {
@@ -165,6 +186,11 @@ impl Type {
             Type::AiError => "ai_error".to_string(),
             Type::AiModule => "ai".to_string(),
             Type::Result_(ok, err) => format!("result<{}, {}>", ok.name(), err.name()),
+            // v0.83: Tuple 类型
+            Type::Tuple(types) => {
+                let parts: Vec<String> = types.iter().map(|t| t.name()).collect();
+                format!("({})", parts.join(", "))
+            }
             Type::Router => "router".to_string(),
             Type::HttpRequest => "http_request".to_string(),
             Type::HttpResponse => "http_response".to_string(),
@@ -220,6 +246,25 @@ impl Type {
                 let parts: Vec<String> = members.iter().map(|m| m.name()).collect();
                 parts.join(" | ")
             }
+            // v0.83: TEA type annotations
+            Type::TeaModel { name, fields } => {
+                let parts: Vec<String> = fields
+                    .iter()
+                    .map(|(n, t)| format!("{}: {}", n, t.name()))
+                    .collect();
+                format!("model {} {{ {} }}", name, parts.join(", "))
+            }
+            Type::TeaMsg { name, variants } => {
+                let parts: Vec<String> = variants
+                    .iter()
+                    .map(|(n, payload)| match payload {
+                        Some(t) => format!("{}({})", n, t.name()),
+                        None => n.clone(),
+                    })
+                    .collect();
+                format!("msg {} = {}", name, parts.join(" | "))
+            }
+            Type::TeaApp { name, model, .. } => format!("app<{}: {}>", name, model.name()),
         }
     }
 
@@ -348,11 +393,25 @@ impl Type {
     /// 类型兼容：Any 总兼容；Result<T,E> 与 Ok/Err 兼容
     /// v0.13: Union 类型支持 —— A ∈ union(expected) 或 expected ∈ union(self)
     pub fn compatible_with(&self, expected: &Type) -> bool {
-        // v0.75.92: Unknown fail-fast — 不参与任何兼容判断（与 Any 不同，
-        // Any 是 top type；Unknown 是「无法判定」标记）。调用方应通过 env/closure_sigs
-        // TypeVar 推断得到精确类型，或在 builtin/import 兜底处显式产出 Unknown。
+        // v0.84: Unknown 是「无法判定」标记，但作为 top type 与任何类型兼容——
+        // 让 HM 推断能在一侧为 Unknown 时继续推进（类似 Any，但语义不同：
+        // Any = 类型明确的万能类型，Unknown = 推断器无法判定的占位）。
+        // 与 v0.75.92 的 fail-fast 不同：当时 Unknown 被误当作"无效"，
+        // 但实际它是"尚待推断"，应允许 unification 继续约束。
         if matches!(self, Type::Unknown) || matches!(expected, Type::Unknown) {
-            return false;
+            return true;
+        }
+        // v0.80: Any 是 top type — 与任何类型兼容（包括 TypeVar 推断路径）。
+        // 此前 Any 仅通过 Union(vec![]) 间接兼容，Type::Any 变体本身无 arm。
+        if matches!(self, Type::Any) || matches!(expected, Type::Any) {
+            return true;
+        }
+        // v0.84: TypeVar 可被约束合一指向任何类型 — 与 Unknown 不同（Unknown =
+        // "无法判定"，语义上仍拒绝；TypeVar = "待推断"，语义上接受）。
+        // `infer_binop` 的 Add 分支中，`greeting + ", "` 的返回是 fresh TypeVar，
+        // `+ name`（String）需要 compatible_with(TypeVar) 为 true。
+        if matches!(self, Type::TypeVar(_)) || matches!(expected, Type::TypeVar(_)) {
+            return true;
         }
         // v0.13: Union 兼容 —— self 是 union, expected 是 union 任一成员
         if let Type::Union(members) = expected {
@@ -381,6 +440,14 @@ impl Type {
         if let (Type::Result_(t1, e1), Type::Result_(t2, e2)) = (self, expected) {
             return t1.compatible_with(t2) && e1.compatible_with(e2);
         }
+        // v0.83: Tuple 元素逐一兼容
+        if let (Type::Tuple(a), Type::Tuple(b)) = (self, expected) {
+            if a.len() != b.len() { return false; }
+            for (ta, tb) in a.iter().zip(b.iter()) {
+                if !ta.compatible_with(tb) { return false; }
+            }
+            return true;
+        }
         // v0.x: List<T1> 兼容 List<T2> 当 T1 兼容 T2
         if let (Type::List(a), Type::List(b)) = (self, expected) {
             return a.compatible_with(b);
@@ -388,6 +455,13 @@ impl Type {
         // v0.x: Dict<K1, V1> 兼容 Dict<K2, V2> 当 K 兼容且 V 兼容
         if let (Type::Dict(k1, v1), Type::Dict(k2, v2)) = (self, expected) {
             return k1.compatible_with(k2) && v1.compatible_with(v2);
+        }
+        // v0.83: Dict literal 可赋给 TeaModel/TeaMsg（强类型 typeck）
+        // Dict literal 必须有 tag 字段（TeaMsg）或匹配字段名（TeaModel）
+        // —— 真正的 field-by-field 检查在 infer_let_typed 的 path 里做（用 value.entries）
+        // 这里只做「Dict literal 是 compatible_with TeaModel/TeaMsg」的基础检查
+        if let (Type::Dict(_, _), Type::TeaModel { .. }) | (Type::Dict(_, _), Type::TeaMsg { .. }) = (self, expected) {
+            return true; // 详细检查在 infer_let_typed path
         }
         // v0.08.1: Nil 兼容所有 trait（用于 dyn Trait = nil 占位）
         // v0.12: 后门 2 关闭 —— Nil 仅兼容 Nil, 不再豁免 trait 赋值
@@ -420,6 +494,12 @@ impl Type {
                 }
             }
             return true;
+        }
+        // v0.80: Arrow 兼容 — input/output 递归兼容，effect row 严格相等。
+        // （effect row 的 subsumption 暂用 == 近似；严格 row subsumption 留给
+        // 后续版本。）
+        if let (Type::Arrow(i1, o1, r1), Type::Arrow(i2, o2, r2)) = (self, expected) {
+            return i1.compatible_with(i2) && o1.compatible_with(o2) && r1 == r2;
         }
         // v0.08.5: Type::Struct 已删除，统一为 Type::Trait 注册
         self == expected
@@ -456,6 +536,14 @@ impl Type {
         if matches!(self, Type::Unknown) || matches!(super_ty, Type::Unknown) {
             return false;
         }
+        // v0.84: TypeVar 可被约束合一只指向任何类型 — 不等 solve_constraints 兜底。
+        // `infer_if` / `infer_match` 的 arm/branch 比较中，两侧都是 fresh TypeVar
+        // （如 `print(1i)` 返回的 fresh ret var），它们尚未被合一，此时 subtype_of
+        // 应返回 true（"可能合一"），而非 false（"不兼容"）。严格子类型判断由
+        // constraint solver 在合一阶段完成。
+        if matches!(self, Type::TypeVar(_)) || matches!(super_ty, Type::TypeVar(_)) {
+            return true;
+        }
         // v0.75.17: ForAll 类型——泛型值命中 env 时已实例化，此处防御
         if let Type::ForAll(_, inner) = self {
             return inner.subtype_of(super_ty);
@@ -480,8 +568,16 @@ impl Type {
             return members.iter().any(|m| self.subtype_of(m));
         }
         // Result<T1, E1> subtype Result<T2, E2> 当 T1<:T2 && E1<:E2
-        if let (Type::Result_(t1, e1), Type::Result_(t2, e2)) = (self, super_ty) {
-            return t1.subtype_of(t2) && e1.subtype_of(e2);
+if let (Type::Result_(t1, e1), Type::Result_(t2, e2)) = (self, super_ty) {
+            return t1.subtype_of(t2) && e2.subtype_of(e1);
+        }
+        // v0.83: Tuple 元素逐一 subtype
+        if let (Type::Tuple(a), Type::Tuple(b)) = (self, super_ty) {
+            if a.len() != b.len() { return false; }
+            for (ta, tb) in a.iter().zip(b.iter()) {
+                if !ta.subtype_of(tb) { return false; }
+            }
+            return true;
         }
         // List<T1> subtype List<T2> 当 T1<:T2
         if let (Type::List(a), Type::List(b)) = (self, super_ty) {
@@ -490,6 +586,49 @@ impl Type {
         // Dict<K1, V1> subtype Dict<K2, V2>
         if let (Type::Dict(k1, v1), Type::Dict(k2, v2)) = (self, super_ty) {
             return k1.subtype_of(k2) && v1.subtype_of(v2);
+        }
+        // v0.83: Dict literal subtype TeaModel/TeaMsg（强类型 typeck 基础规则）
+        if let (Type::Dict(_, _), Type::TeaModel { .. }) | (Type::Dict(_, _), Type::TeaMsg { .. }) = (self, super_ty) {
+            return true; // 详细检查在 infer_let_typed
+        }
+        // v0.83: TeaModel subtype TeaModel（同 name + 字段兼容）
+        if let (Type::TeaModel { name: n1, fields: f1 }, Type::TeaModel { name: n2, fields: f2 }) = (self, super_ty) {
+            if n1 != n2 { return false; }
+            // source 可少字段，extra 字段允许；但 target 字段必须 source 也有
+            for (target_name, target_ty) in f2 {
+                let source_match = f1.iter().find(|(n, _)| n == target_name);
+                match source_match {
+                    None => return false,
+                    Some((_, source_ty)) => {
+                        if !source_ty.subtype_of(target_ty) { return false; }
+                    }
+                }
+            }
+            return true;
+        }
+        // v0.83: TeaMsg subtype TeaMsg（同 name + variants 兼容）
+        if let (Type::TeaMsg { name: n1, variants: v1 }, Type::TeaMsg { name: n2, variants: v2 }) = (self, super_ty) {
+            if n1 != n2 { return false; }
+            // source 可少 variants；但 target variant 必 source 也有
+            for (target_name, target_payload) in v2 {
+                let source_match = v1.iter().find(|(n, _)| n == target_name);
+                match source_match {
+                    None => return false,
+                    Some((_, source_payload)) => {
+                        // source payload 必须 subtype target payload
+                        match (source_payload, target_payload) {
+                            (Some(s), Some(t)) => {
+                                if !s.subtype_of(t) { return false; }
+                            }
+                            (None, None) => {}
+                            // source has no payload but target does —— 不兼容
+                            (None, Some(_)) => return false,
+                            (Some(_), None) => return false,
+                        }
+                    }
+                }
+            }
+            return true;
         }
         // Nil 仅 subtype Nil（v0.12 后门 2 关闭）
         match (self, super_ty) {
@@ -544,6 +683,11 @@ impl Type {
             }
             // 严格 subtype：ga 必须逐元素 <: gb（保守方向）
             return ga.iter().zip(gb.iter()).all(|(x, y)| x.subtype_of(y));
+        }
+        // v0.80: Arrow subtype — 参数逆变，返回协变，effect row 严格相等。
+        // （函数子类型标准规则：contravariant in input, covariant in output。）
+        if let (Type::Arrow(i1, o1, r1), Type::Arrow(i2, o2, r2)) = (self, super_ty) {
+            return i2.subtype_of(i1) && o1.subtype_of(o2) && r1 == r2;
         }
         // 兜底：同构严格相等
         self == super_ty

@@ -1,0 +1,57 @@
+-- v0.87: match guard conditions (when)
+task main()
+  let n = 42
+  let result1 = match n {
+    n when n > 0 => "positive"
+    n when n < 0 => "negative"
+    _ => "zero"
+  }
+  print(result1)
+
+  let zero = 0
+  let result2 = match zero {
+    n when n > 0 => "positive"
+    n when n < 0 => "negative"
+    _ => "zero"
+  }
+  print(result2)
+
+  let n3 = 0
+  let result3 = match n3 {
+    n when n > 0 => "positive"
+    n when n < 0 => "negative"
+    _ => "zero"
+  }
+  print(result3)
+
+  let name = "mora"
+  let result4 = match name {
+    s when s.len() > 3 => "long"
+    s when s.len() <= 3 => "short"
+    _ => "?"
+  }
+  print(result4)
+
+  let x = 0
+  let result5 = match x {
+    x when x > 100 => "big"
+    _ => "small"
+  }
+  print(result5)
+
+  let y = 1
+  let result6 = match y {
+    0 => "zero"
+    1 when y == 1 => "one"
+    _ => "other"
+  }
+  print(result6)
+
+  let arr = [1, 2, 3]
+  let result7 = match arr {
+    arr when arr.len() >= 3 => "enough"
+    arr when arr.len() < 3 => "too few"
+    _ => "unknown"
+  }
+  print(result7)
+end

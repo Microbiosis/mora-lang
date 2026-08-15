@@ -1,0 +1,386 @@
+//! v0.83: TEA (The Elm Architecture) — Model/Msg/Update/Cmd 完整架构。
+//!
+//! 设计目标：Stage 3 必须实现完整 TEA 循环（§0.6 硬性要求）：
+//!   - Model（状态容器）— `Type::Concrete { name: "Model", ... }`
+//!   - Msg（消息 tagged union）— `Type::Union([TeaMsg, ...])`
+//!   - Update(Model, Msg) -> (Model, Cmd<Model>)
+//!   - Cmd（命令描述副作用）— `Type::Union([Perform, Batch, None])`
+//!   - View(Model) -> render target（占位 Value）
+//!   - Replay：从 Recorder 还原 Msg 流 + StateMutation diffs
+
+use std::sync::Arc;
+use parking_lot::Mutex;
+
+use crate::value::Value;
+
+/// Cmd（命令）— 描述 update 函数想要触发的副作用。
+///
+/// 设计参考 Elm：Cmd 是数据，不是动作。runtime 解释 Cmd 执行副作用。
+#[derive(Clone, Debug, PartialEq)]
+pub enum Cmd {
+    /// 无操作（update 无副作用时返回）
+    None,
+    /// 批量执行多个命令（顺序执行，前一个失败则中止）
+    Batch(Vec<Cmd>),
+    /// 执行一个具名 effect（对应 algebraic effect）
+    Perform {
+        effect: String,
+        args: Vec<Value>,
+    },
+    /// 触发另一个 Msg（chain update）
+    Dispatch(Box<Value>),
+}
+
+impl Cmd {
+    /// 序列化为 Value 树（Cmd → Value）
+    pub fn to_value(&self) -> Value {
+        match self {
+            Cmd::None => Value::Nil,
+            Cmd::Batch(cmds) => {
+                let items: Vec<Value> = cmds.iter().map(|c| c.to_value()).collect();
+                Value::List(items)
+            }
+            Cmd::Perform { effect, args } => {
+                let mut map = std::collections::HashMap::new();
+                map.insert("kind".to_string(), Value::String("Perform".to_string()));
+                map.insert("effect".to_string(), Value::String(effect.clone()));
+                map.insert(
+                    "args".to_string(),
+                    Value::List(args.clone()),
+                );
+                Value::Dict(map)
+            }
+            Cmd::Dispatch(msg) => {
+                let mut map = std::collections::HashMap::new();
+                map.insert("kind".to_string(), Value::String("Dispatch".to_string()));
+                map.insert("msg".to_string(), msg.as_ref().clone());
+                Value::Dict(map)
+            }
+        }
+    }
+
+    /// 从 Value 树反序列化（用于 replay）
+    pub fn from_value(v: &Value) -> Result<Self, String> {
+        match v {
+            Value::Nil => Ok(Cmd::None),
+            Value::List(items) => {
+                let mut cmds = Vec::new();
+                for item in items {
+                    cmds.push(Self::from_value(item)?);
+                }
+                Ok(Cmd::Batch(cmds))
+            }
+            Value::Dict(map) => {
+                let kind = match map.get("kind") {
+                    Some(Value::String(s)) => s.as_str(),
+                    _ => return Err("Cmd.from_value: missing kind".to_string()),
+                };
+                match kind {
+                    "Perform" => {
+                        let effect = match map.get("effect") {
+                            Some(Value::String(s)) => s.clone(),
+                            _ => return Err("Cmd.from_value: missing effect".to_string()),
+                        };
+                        let args = match map.get("args") {
+                            Some(Value::List(items)) => items.clone(),
+                            _ => Vec::new(),
+                        };
+                        Ok(Cmd::Perform { effect, args })
+                    }
+                    "Dispatch" => {
+                        let msg = match map.get("msg") {
+                            Some(v) => Box::new(v.clone()),
+                            _ => return Err("Cmd.from_value: missing msg".to_string()),
+                        };
+                        Ok(Cmd::Dispatch(msg))
+                    }
+                    other => Err(format!("Cmd.from_value: unknown kind '{}'", other)),
+                }
+            }
+            other => Err(format!("Cmd.from_value: expected List or Dict, got {:?}", other)),
+        }
+    }
+}
+
+/// Msg（消息）— 触发 update 函数调用的输入事件。
+///
+/// 设计为 tagged union：tag 是 variant 名（如 "Increment"），payload 是该 variant 的数据。
+#[derive(Clone, Debug, PartialEq)]
+pub struct Msg {
+    pub tag: String,
+    pub payload: Box<Value>,
+}
+
+impl Msg {
+    pub fn new(tag: impl Into<String>, payload: Value) -> Self {
+        Msg {
+            tag: tag.into(),
+            payload: Box::new(payload),
+        }
+    }
+
+    /// 序列化为 Value 树
+    pub fn to_value(&self) -> Value {
+        let mut map = std::collections::HashMap::new();
+        map.insert("tag".to_string(), Value::String(self.tag.clone()));
+        map.insert("payload".to_string(), self.payload.as_ref().clone());
+        Value::Dict(map)
+    }
+
+    /// 从 Value 树反序列化
+    pub fn from_value(v: &Value) -> Result<Self, String> {
+        match v {
+            Value::Dict(map) => {
+                let tag = match map.get("tag") {
+                    Some(Value::String(s)) => s.clone(),
+                    _ => return Err("Msg.from_value: missing tag".to_string()),
+                };
+                let payload = Box::new(
+                    map.get("payload").cloned().unwrap_or(Value::Nil),
+                );
+                Ok(Msg { tag, payload })
+            }
+            other => Err(format!("Msg.from_value: expected Dict, got {:?}", other)),
+        }
+    }
+}
+
+/// TeaApp Runtime — Model + Msg + Update + View + Cmd 循环的执行引擎。
+///
+/// 字段：
+/// - `model`：当前 Model（Arc<Mutex<>> 以支持可变状态共享）
+/// - `init`：初始化函数 closure（无参数 → 返回初始 Model）
+/// - `update`：update 函数 closure（接收 Model + Msg → 返回新 Model + Cmd）
+/// - `view`：view 函数 closure（接收 Model → 返回 render Value）
+/// - `msg_queue`：待处理的 Msg 队列（FIFO）
+/// - `cmd_queue`：待执行的 Cmd 队列
+///
+/// 并发模型：单个 runtime 同一时刻只有一个 owner 修改 msg_queue/cmd_queue。
+/// 但 model 状态本身在 Arc<Mutex> 后，多消费者可读。
+#[derive(Clone)]
+pub struct TeaApp {
+    /// 内部可变状态（model + msg_queue + cmd_queue）
+    state: Arc<Mutex<TeaState>>,
+    /// init 函数 — `() -> Model`
+    pub init: Value,
+    /// update 函数 — `(Model, Msg) -> (Model, Cmd)`
+    pub update: Value,
+    /// view 函数 — `(Model) -> Value`（占位 render target）
+    pub view: Value,
+}
+
+impl std::fmt::Debug for TeaApp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let state = self.state.lock();
+        f.debug_struct("TeaApp")
+            .field("model", &state.model)
+            .field("msg_queue_len", &state.msg_queue.len())
+            .field("cmd_queue_len", &state.cmd_queue.len())
+            .field("init", &"<fn>")
+            .field("update", &"<fn>")
+            .field("view", &"<fn>")
+            .finish()
+    }
+}
+
+struct TeaState {
+    model: Value,
+    msg_queue: Vec<Msg>,
+    cmd_queue: Vec<Cmd>,
+}
+
+impl TeaApp {
+    /// 创建新 TeaApp（model 未初始化）
+    pub fn new(init: Value, update: Value, view: Value) -> Self {
+        TeaApp {
+            state: Arc::new(Mutex::new(TeaState {
+                model: Value::Nil,
+                msg_queue: Vec::new(),
+                cmd_queue: Vec::new(),
+            })),
+            init,
+            update,
+            view,
+        }
+    }
+
+    /// 获取当前 model（克隆）
+    pub fn model(&self) -> Value {
+        self.state.lock().model.clone()
+    }
+
+    /// 设置 model（直接替换）
+    pub fn set_model(&self, model: Value) {
+        self.state.lock().model = model;
+    }
+
+    /// 派发一个 Msg（追加到队列）
+    pub fn dispatch(&self, msg: Msg) {
+        self.state.lock().msg_queue.push(msg);
+    }
+
+    /// 派发多个 Msg
+    pub fn dispatch_many(&self, msgs: Vec<Msg>) {
+        self.state.lock().msg_queue.extend(msgs);
+    }
+
+    /// 取出待执行的 Cmd 队列（清空）
+    pub fn take_cmds(&self) -> Vec<Cmd> {
+        std::mem::take(&mut self.state.lock().cmd_queue)
+    }
+
+    /// 单步执行：取出队首 Msg，调用 update，更新 model 与 cmd_queue
+    ///
+    /// 返回是否执行了 Msg（false 表示队列空）。
+    /// 注意：update 函数目前以 Value::Closure 形式存储，本阶段通过 builtin
+    /// v0.83: 推进 TEA 循环一步 — 真正调用 update 闭包 (interp.call_value)。
+    ///
+    /// 步骤：
+    /// 1. 从 msg_queue 取一个 Msg
+    /// 2. 构造 args: [model.to_value(), msg.to_value()]
+    /// 3. interp.call_value(&self.update, args) → Result
+    /// 4. 解析返回的 (Model, Cmd) tuple（Value::List [model, cmd]）
+    /// 5. 更新 state.model + cmd_queue
+    ///
+    /// 返回是否执行了 Msg（false 表示队列空）。
+    pub fn step(&self, interp: &mut dyn crate::mir::host::MirHost) -> bool {
+        let msg = {
+            let mut state = self.state.lock();
+            if state.msg_queue.is_empty() {
+                return false;
+            }
+            state.msg_queue.remove(0)
+        };
+        // 构造 update 调用参数
+        let model = self.state.lock().model.clone();
+        let msg_val = msg.to_value();
+        let args = vec![model, msg_val];
+        // 调用 update 闭包
+        match interp.call_value(&self.update, args) {
+            Ok(result) => {
+                // 解析返回的 (Model, Cmd) tuple
+                if let Value::List(items) = result {
+                    if let Some(new_model) = items.first() {
+                        let mut state = self.state.lock();
+                        state.model = new_model.clone();
+                    }
+                    if let Some(cmd_val) = items.get(1)
+                        && let Ok(cmd) = Cmd::from_value(cmd_val)
+                    {
+                        self.cmd_queue_push(cmd);
+                    }
+                }
+                // 更新返回的是裸 model（无 Cmd）—— 也支持
+                else {
+                    let mut state = self.state.lock();
+                    state.model = result;
+                }
+                true
+            }
+            Err(e) => {
+                eprintln!("TeaApp::step: update failed: {}", e);
+                false
+            }
+        }
+    }
+
+    /// 把 cmd 推入 cmd_queue（内部 helper，被 step 使用）
+    fn cmd_queue_push(&self, cmd: Cmd) {
+        let mut state = self.state.lock();
+        state.cmd_queue.push(cmd);
+    }
+
+    /// 运行完整 TEA 循环，直到 msg_queue 和 cmd_queue 都为空。
+    /// 最多执行 max_steps 步（防止无限循环）。
+    ///
+    /// 每步：先消化一个 Msg（step），再 drain 所有 Cmd：
+    /// - `Cmd::None` → skip
+    /// - `Cmd::Batch(cmds)` → 顺序执行每个 sub-cmd
+    /// - `Cmd::Perform{effect, args}` → 调 `interp.perform_effect(effect, args)` 真正执行 effect
+    /// - `Cmd::Dispatch(msg)` → 把 msg 重新 push 到 msg_queue
+    ///
+    /// 返回最终 model。
+    pub fn run_loop(&self, max_steps: usize, interp: &mut dyn crate::mir::host::MirHost) -> Value {
+        for _ in 0..max_steps {
+            let did_step = self.step(interp);
+            // 无论 step 是否推进，都 drain cmd_queue（防止 perform 副作用丢失）
+            self.drain_cmd_queue(interp);
+            if !did_step && self.state.lock().msg_queue.is_empty() {
+                break;
+            }
+        }
+        self.model()
+    }
+
+    /// 排空 cmd_queue，依次执行每个 Cmd。
+    /// v0.83: 真正调用 effect handler（通过 `interp.perform_effect`）。
+    fn drain_cmd_queue(&self, interp: &mut dyn crate::mir::host::MirHost) {
+        let cmds = self.take_cmds();
+        for cmd in cmds {
+            self.execute_cmd(cmd, interp);
+        }
+    }
+
+    /// 执行单个 Cmd —— 递归处理 Batch，dispatch 处理 Msg dispatch，perform 处理 effect。
+    fn execute_cmd(&self, cmd: Cmd, interp: &mut dyn crate::mir::host::MirHost) {
+        match cmd {
+            Cmd::None => {}
+            Cmd::Batch(cmds) => {
+                for c in cmds {
+                    self.execute_cmd(c, interp);
+                }
+            }
+            Cmd::Perform { effect, args } => {
+                // v0.83: 真正调用 effect handler（通过 MirHost::perform_effect）
+                let _ = interp.perform_effect(&effect, args);
+            }
+            Cmd::Dispatch(msg_value) => {
+                // v0.83: 把 msg 重新 push 到 msg_queue（让 update chain 起来）
+                if let Ok(msg) = Msg::from_value(&msg_value) {
+                    self.dispatch(msg);
+                }
+            }
+        }
+    }
+
+    /// 重置 model 到 init 函数的返回值（占位：需要 builtin 集成才能调用 init closure）
+    pub fn reset_with(&self, initial_model: Value) {
+        let mut state = self.state.lock();
+        state.model = initial_model;
+        state.msg_queue.clear();
+        state.cmd_queue.clear();
+    }
+
+    /// v0.84 Phase 4: 自动执行 init closure 获取初始 model。
+    ///
+    /// 在 TeaApp 构造后立即调用此方法，等价于 Elm 架构中
+    /// `init : flags -> (Model, Cmd msg)` 的语义。
+    ///
+    /// - 若 init 返回成功值 → 设置 state.model
+    /// - 若 init 返回 Nil 或调用失败 → 保持 model 为 Value::Nil
+    ///
+    /// 返回是否成功初始化。
+    pub fn initialize(&self, interp: &mut dyn crate::mir::host::MirHost) -> bool {
+        match interp.call_value(&self.init, vec![]) {
+            Ok(model) => {
+                let mut state = self.state.lock();
+                state.model = model;
+                true
+            }
+            Err(_) => false,
+        }
+    }
+}
+
+/// v0.83: TEA Replay Driver — 从 Recorder 还原 Model 状态。
+///
+/// 加载 Recorder 的 Msg + StateMutation events，按时间顺序 replay：
+/// 1. StateMutation events 提供 model 的 diff（var/old/new）
+/// 2. Msg events 提供给 update 的输入序列
+/// 3. 每步校验 prior_state_hash（TEA-style deterministic replay）
+///
+/// 返回重建后的 model 与 replay 过程中的 warnings。
+pub mod replay;
+
+#[cfg(test)]
+mod tests;

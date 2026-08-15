@@ -354,7 +354,17 @@ pub fn type_name(value: &Value) -> &'static str {
         Value::Partial(_, _) => "partial",
         Value::Atom(_) => "atom",
         Value::Macro { .. } => "macro",
+        // v0.86: Curry — 柯里化函数值
+        Value::Curry { .. } => "curry",
+        // v0.86: Cons — Lisp 链式列表单元
+        Value::Cons { .. } => "cons",
+        // v0.86: Code — quote(expr) 捕获的源码文本值
+        Value::Code(_) => "code",
         Value::PromptSection { .. } => "prompt_section",
+        // v0.83: TEA types
+        Value::TeaApp(_) => "tea_app",
+        Value::TeaCmd(_) => "tea_cmd",
+        Value::TeaMsg(_) => "tea_msg",
         Value::Document { .. } => "document",
     }
 }
@@ -409,9 +419,9 @@ mod tests {
         assert!(v.is_err());
     }
 
-    /// v0.38: legacy Number mixed with Float coerces to f64.
+    /// v0.38: Float + Float → Float via numeric_op (补充用例：整数 Float)。
     #[test]
-    fn numeric_tower_number_float_compat() {
+    fn numeric_tower_float_plus_float_integer_values() {
         let l = Value::Float(2.0);
         let r = Value::Float(3.0);
         let v = numeric_op(l, r, |a, b| a + b).unwrap();
@@ -492,9 +502,9 @@ mod tests {
         // 无空格 dict — 应正常解析
         let v = json_to_value(r#"{"a":1,"b":2}"#).unwrap();
         if let Value::Dict(m) = v {
-            // parse_json_number 把 int 解析为 Number(f64)（pre-existing 行为）
-            assert_eq!(m.get("a"), Some(&Value::Float(1.0)));
-            assert_eq!(m.get("b"), Some(&Value::Float(2.0)));
+            // v0.84: parse_json_number 区分 Int/Float — "1" → Int(1), "1.0" → Float(1.0)
+            assert_eq!(m.get("a"), Some(&Value::Int(1)));
+            assert_eq!(m.get("b"), Some(&Value::Int(2)));
         } else {
             panic!("expected Dict");
         }
@@ -506,8 +516,9 @@ mod tests {
         // 修复后期望 pass
         let v = json_to_value(r#"{"a": 1, "b": 2}"#).unwrap();
         if let Value::Dict(m) = v {
-            assert_eq!(m.get("a"), Some(&Value::Float(1.0)));
-            assert_eq!(m.get("b"), Some(&Value::Float(2.0)));
+            // v0.84: Int/Float 类型区分 — " 1" 和 " 2" 解析为 Int
+            assert_eq!(m.get("a"), Some(&Value::Int(1)));
+            assert_eq!(m.get("b"), Some(&Value::Int(2)));
         } else {
             panic!("expected Dict, got {:?}", v);
         }

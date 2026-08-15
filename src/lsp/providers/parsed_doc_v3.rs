@@ -36,6 +36,11 @@ pub fn walk_witness<F: FnMut(&MirWitness)>(expr: &MirWitness, visit: &mut F) {
 fn walk_witness_kind<F: FnMut(&MirWitness)>(kind: &WitnessKind, visit: &mut F) {
     match kind {
         WitnessKind::Literal(_) | WitnessKind::Variable(_) => {}
+        // v0.83: TEA definitions — no nested witnesses to walk
+        WitnessKind::ModelDef { .. }
+        | WitnessKind::MsgDef { .. }
+        | WitnessKind::UpdateDef { .. }
+        | WitnessKind::AppDef { .. } => {}
         WitnessKind::Binary { left, right, .. } => {
             walk_witness(left, visit);
             walk_witness(right, visit);
@@ -125,6 +130,19 @@ fn walk_witness_kind<F: FnMut(&MirWitness)>(kind: &WitnessKind, visit: &mut F) {
         | WitnessKind::Sequence(_)
         | WitnessKind::Perform { .. }
         | WitnessKind::Handle { .. } => {}
+        // v0.85: with 块 — 遍历绑定值与 body
+        WitnessKind::WithConfig { bindings, body } => {
+            for (_, v) in bindings {
+                walk_witness(v, visit);
+            }
+            walk_witness(body, visit);
+        }
+        // v0.88: Quasiquote — 遍历各段（Quote/Unquote/UnquoteSplice）
+        WitnessKind::Quasiquote { segments } => {
+            for seg in segments {
+                walk_witness(seg, visit);
+            }
+        }
     }
 }
 

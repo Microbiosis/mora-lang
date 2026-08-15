@@ -9,7 +9,6 @@
 //! - read_next_sse_token: SSE 流读取
 //! - parse_critic_response: 解析 critic 响应
 //! - mock_critic: mock critic
-//! - create_mock_stream: mock 流
 
 use super::*;
 use crate::value::Value;
@@ -199,8 +198,13 @@ impl Interpreter {
     /// 返回 Ok(Some(token)) — 有新 token
     /// 返回 Ok(None) — 流结束 [DONE]
     /// 返回 Err — 解析错误
+    ///
+    /// v0.83: 加 `xform` 参数 — 产出 raw SSE token 后推入 transducer `step`。
+    /// `Some(token)` 透传，`None` 表示 transducer 终止流（提前返回 None）。
+    /// `None` 的 xform 走 identity（向后兼容）。
     pub(super) fn read_next_sse_token(
         reader: &mut BufReader<Box<dyn Read + Send + Sync>>,
+        mut xform: Option<&mut dyn crate::value::transducer::Transducer<String, String>>,
     ) -> Result<Option<String>, String> {
         loop {
             let mut line = String::new();
@@ -225,6 +229,10 @@ impl Interpreter {
                                 && let Some(Value::String(content)) = delta.get("content")
                                 && !content.is_empty()
                             {
+                                // v0.83: transducer step — 产出 None 表示终止流
+                                if let Some(xf) = xform.as_mut() {
+                                    return Ok(xf.step(content.clone()));
+                                }
                                 return Ok(Some(content.clone()));
                             }
                             // finish_reason 字段出现但无 content，跳过
@@ -339,31 +347,4 @@ impl Interpreter {
     }
 
     // Mock 工具调用（无 API Key 时，调用第一个注册的工具）
-
-    /// v0.04补: mock 流占位, 无 builtin caller, 留作 v1.0 复活点
-    #[allow(dead_code)]
-    pub(super) fn create_mock_stream(prompt: &str) -> Value {
-        let mock_text = format!("[Mock stream for: {}]", prompt);
-        let mut sse_data = String::new();
-        for ch in mock_text.chars() {
-            let escaped = match ch {
-                '\\' => "\\\\".to_string(),
-                '"' => "\\\"".to_string(),
-                '\n' => "\\n".to_string(),
-                _ => ch.to_string(),
-            };
-            sse_data.push_str(&format!(
-                "data: {{\"choices\":[{{\"delta\":{{\"content\":\"{}\"}}}}]}}\n\n",
-                escaped
-            ));
-        }
-        sse_data.push_str("data: [DONE]\n\n");
-
-        let cursor = std::io::Cursor::new(sse_data.into_bytes());
-        let reader: Box<dyn Read + Send + Sync> = Box::new(cursor);
-        Value::Stream {
-            reader: StreamReader::new(BufReader::new(reader)),
-            done: Arc::new(Mutex::new(false)),
-        }
-    }
 }

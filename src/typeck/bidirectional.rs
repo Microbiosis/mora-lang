@@ -111,7 +111,7 @@ impl<'a> BidirectionalChecker<'a> {
     ) -> Result<Type, TypeError> {
         self.nodes_visited += 1;
         // 简易 check：调 HM 推类型 + subtype 验证
-        let synth_ty = self.hm.infer_expr(w).map_err(|errs| {
+        let (synth_ty, _row) = self.hm.infer_expr(w).map_err(|errs| {
             // HM 内部错误：转顶层 TypeError 兜底
             let _msg = errs
                 .into_iter()
@@ -120,6 +120,12 @@ impl<'a> BidirectionalChecker<'a> {
                 .unwrap_or_else(|| "unknown HM error".to_string());
             TypeError::new(w.span.line, format!("type inference failed: {}", _msg))
         })?;
+        // v0.84: expected=Unknown 表示「没有期望类型」占位符，不做
+        // subtype 检查（与 Any top type 不同：Unknown 是"缺失"，不是
+        // "任意"）。直接返回合成类型，不报错误。
+        if matches!(expected, Type::Unknown) {
+            return Ok(synth_ty);
+        }
         if !synth_ty.subtype_of(expected) {
             // 标记此节点已诊断 —— 防止 HM 跑完后报重复错误
             // v0.75.94: 改持 DiagFilter（不再污染 HMInference 公共 API）
@@ -139,7 +145,7 @@ impl<'a> BidirectionalChecker<'a> {
     /// 顶层集成（[`crate::typeck::check_mir`]）用 `hm_to_external` 统一转换。
     pub fn synth(&mut self, w: &MirWitness) -> Result<Type, Vec<crate::typeck::hm::TypeError>> {
         self.nodes_visited += 1;
-        self.hm.infer_expr(w)
+        self.hm.infer_expr(w).map(|(ty, _row)| ty)
     }
 
     /// v0.75.86: 双向预扫入口
@@ -321,9 +327,9 @@ impl<'a> BidirectionalChecker<'a> {
         self.recurse_witness(w);
     }
 
-    /// Phase B 辅助：查 callee 的 closure sig 参数列表。
-    /// 返回 None 当 callee 不是已知 closure（Name 走 builtin，Var 在 env 中未找到，
-    /// 或 Evaluated 表达式无法静态分析）—— 保守行为：跳过双向 check。
+    /// Phase B 辅助：查 callee 的参数类型列表。
+    /// v0.80: 从 Type::Arrow 逐层剥离 param 类型（curried arrow），
+    /// 而非查 ClosureSig 侧表。返回 None 当 callee 不是已知函数类型。
     fn lookup_callee_params(
         &self,
         callee: &crate::mir::witness::WitnessCallee,
@@ -333,9 +339,14 @@ impl<'a> BidirectionalChecker<'a> {
             WitnessCallee::Var(name) => {
                 // 从 env 查 Var 绑定的类型
                 let ty = self.hm.env.get(name)?;
-                // closure_sig 只在 Type::TypeVar 形态有效
-                let sig = self.hm.closure_sig(ty)?;
-                Some(sig.params.clone())
+                // v0.80: 从 Arrow 逐层剥离 param 类型
+                let mut params = Vec::new();
+                let mut current = ty.clone();
+                while let Type::Arrow(input, output, _) = current {
+                    params.push((*input).clone());
+                    current = (*output).clone();
+                }
+                if params.is_empty() { None } else { Some(params) }
             }
             // Name/Evaluated/Builtin/Method —— 暂未实现查 builtin/method sig
             _ => None,
@@ -350,16 +361,27 @@ impl<'a> BidirectionalChecker<'a> {
             | WitnessKind::Variable(_)
             | WitnessKind::Break(_)
             | WitnessKind::Continue(_)
+            // v0.83: TEA 定义无子节点需递归
+            | WitnessKind::ModelDef { .. }
+            | WitnessKind::MsgDef { .. }
+            | WitnessKind::UpdateDef { .. }
+            | WitnessKind::AppDef { .. }
             | WitnessKind::Import(_)
             | WitnessKind::TypeAlias { .. }
             | WitnessKind::EnumDef { .. }
             | WitnessKind::StructDef { .. }
             | WitnessKind::MacroDef { .. }
-            | WitnessKind::Sequence(_)
-            // v0.80: algebraic effects — Perform/Handle 的子节点（args/body/handler）
-            // 由 pre_check_witness 单独递归，本路径无需处理。
-            | WitnessKind::Perform { .. }
-            | WitnessKind::Handle { .. } => {}
+            | WitnessKind::Sequence(_) => {}
+            // v0.80: algebraic effects — Perform/Handle 递归子节点
+            WitnessKind::Perform { args, .. } => {
+                for arg in args {
+                    self.pre_check_witness(arg);
+                }
+            }
+            WitnessKind::Handle { body, handler, .. } => {
+                self.pre_check_witness(body);
+                self.pre_check_witness(handler);
+            }
             // 二元操作
             WitnessKind::Binary { left, right, .. } => {
                 self.pre_check_witness(left);
@@ -450,6 +472,19 @@ impl<'a> BidirectionalChecker<'a> {
                 self.pre_check_witness(object);
                 self.pre_check_witness(index);
                 self.pre_check_witness(value);
+            }
+            WitnessKind::WithConfig { bindings, body } => {
+                // v0.85: with 块 —— 检查每个 binding 的值表达式，再检查 body
+                for (_, w) in bindings {
+                    self.pre_check_witness(w);
+                }
+                self.pre_check_witness(body);
+            }
+            // v0.88: Quasiquote — 检查所有子表达式段（Quote 为常量无需检查）
+            WitnessKind::Quasiquote { segments } => {
+                for seg in segments {
+                    self.pre_check_witness(seg);
+                }
             }
         }
     }
@@ -620,19 +655,15 @@ mod tests {
     fn phase_b_call_arg_correct_type_passes() {
         // 正确：f(42) — arg 是 Int，callee 期望 Int
         let mut hm = HMInference::new();
-        // 手工 add 闭包到 env（绕过闭包绑定 let 解析复杂）
-        // 用 closure_sig 注册一个 Int→Int 函数
-        let sig_placeholder = hm.fresh_type_var_id();
-        hm.closure_sigs.insert(
-            sig_placeholder,
-            crate::typeck::hm::ClosureSig {
-                params: vec![Type::Int],
-                return_type: Type::Int,
-                arity: 1,
-            },
+        // v0.80: 用 Arrow 类型注册函数（ClosureSig 侧表已删除）
+        hm.env.add(
+            "f".to_string(),
+            Type::Arrow(
+                Box::new(Type::Int),
+                Box::new(Type::Int),
+                crate::mir::effect::EffectRow::Empty,
+            ),
         );
-        // var "f" 绑定的类型：用 sig_placeholder 这个 TypeVar（让 closure_sig 能查到）
-        hm.env.add("f".to_string(), Type::TypeVar(sig_placeholder));
         let mut checker = BidirectionalChecker::new(&mut hm);
         // f(42) —— Call
         let call = MirWitness {
@@ -653,33 +684,25 @@ mod tests {
 
     #[test]
     fn phase_b_call_arg_wrong_type_reports() {
-        // 错误：f("string") — 但 arg 是 int literal（强转时 typeck 阶段
-        // 实际只能测 Int vs Int 失配，String 字面量 witness 难构造）
-        // 简化：arg = Float —— 用 Type::Float 期望
-        // 期待：f(3.14) 应报 type mismatch
+        // 错误：g(42) — g 期望 Float 但 arg 是 Int
         let mut hm = HMInference::new();
-        let sig_placeholder = hm.fresh_type_var_id();
-        hm.closure_sigs.insert(
-            sig_placeholder,
-            crate::typeck::hm::ClosureSig {
-                params: vec![Type::Int],
-                return_type: Type::Int,
-                arity: 1,
-            },
+        // v0.80: 用 Arrow 类型注册函数（ClosureSig 侧表已删除）
+        hm.env.add(
+            "f".to_string(),
+            Type::Arrow(
+                Box::new(Type::Int),
+                Box::new(Type::Int),
+                crate::mir::effect::EffectRow::Empty,
+            ),
         );
-        hm.env.add("f".to_string(), Type::TypeVar(sig_placeholder));
-        // 先配置所有 hm（避免之后 &mut hm 借用冲突）
-        // g 的 closure sig：sig_id 既作 closure_sigs key 也作 env 中 g 的 TypeVar
-        let sig_g = hm.fresh_type_var_id();
-        hm.closure_sigs.insert(
-            sig_g,
-            crate::typeck::hm::ClosureSig {
-                params: vec![Type::Float], // 期望 Float
-                return_type: Type::Float,
-                arity: 1,
-            },
+        hm.env.add(
+            "g".to_string(),
+            Type::Arrow(
+                Box::new(Type::Float),
+                Box::new(Type::Float),
+                crate::mir::effect::EffectRow::Empty,
+            ),
         );
-        hm.env.add("g".to_string(), Type::TypeVar(sig_g));
         // 现在 hm 配置完成，构造 checker
         let mut checker = BidirectionalChecker::new(&mut hm);
         // g(42) — Int <: Float 失败
@@ -702,16 +725,15 @@ mod tests {
     fn phase_b_call_arity_mismatch_reports() {
         // f(1, 2) — 但 f 期望 1 个 arg
         let mut hm = HMInference::new();
-        let sig = hm.fresh_type_var_id();
-        hm.closure_sigs.insert(
-            sig,
-            crate::typeck::hm::ClosureSig {
-                params: vec![Type::Int],
-                return_type: Type::Int,
-                arity: 1,
-            },
+        // v0.80: 用 Arrow 类型注册函数（ClosureSig 侧表已删除）
+        hm.env.add(
+            "f".to_string(),
+            Type::Arrow(
+                Box::new(Type::Int),
+                Box::new(Type::Int),
+                crate::mir::effect::EffectRow::Empty,
+            ),
         );
-        hm.env.add("f".to_string(), Type::TypeVar(sig));
         let mut checker = BidirectionalChecker::new(&mut hm);
         let call = MirWitness {
             kind: WitnessKind::Call {

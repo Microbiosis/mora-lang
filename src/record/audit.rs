@@ -179,6 +179,8 @@ pub fn audit_recording(events: &[Event], ignore_rules: &[IgnoreRule]) -> Vec<Aud
             } => (*id, format!("{} {}", prompt_preview, response)),
             Event::WebFetch { id, url, .. } => (*id, url.clone()),
             Event::Note { id, message, .. } => (*id, message.clone()),
+            // v0.83: Msg + StateMutation 不进审计（应用层消息无 secrets）
+            Event::Msg { .. } | Event::StateMutation { .. } => continue,
         };
         // 检查是否被忽略
         let should_ignore = ignore_rules.iter().any(|rule| match rule {

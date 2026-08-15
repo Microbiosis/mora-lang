@@ -555,6 +555,11 @@ fn split_into_ssa(
             | MirInst::Handle { .. }
             | MirInst::EnumDef { .. }
             | MirInst::StructDef { .. }
+            // v0.83: TEA definitions — compile-time only, pass-through
+            | MirInst::ModelDef { .. }
+            | MirInst::MsgDef { .. }
+            | MirInst::UpdateDef { .. }
+            | MirInst::AppDef { .. }
             | MirInst::Transaction { .. }
             | MirInst::Send { .. }
             | MirInst::Aggregate { .. }
@@ -582,6 +587,8 @@ fn split_into_ssa(
             | MirInst::SkillDef { .. }
             | MirInst::PromptSection { .. }
             | MirInst::DocumentSection { .. } => {}
+            // v0.88: Quasiquote — 纯指令，SSA 中跳过
+            | MirInst::Quasiquote { .. } => {}
             | MirInst::DynTrait { .. } => {}
         }
     }
@@ -610,6 +617,11 @@ fn is_ssa_passthrough(inst: &MirInst) -> bool {
             | MirInst::Handle { .. }
             | MirInst::EnumDef { .. }
             | MirInst::StructDef { .. }
+            // v0.83: TEA definitions — compile-time only, pass-through
+            | MirInst::ModelDef { .. }
+            | MirInst::MsgDef { .. }
+            | MirInst::UpdateDef { .. }
+            | MirInst::AppDef { .. }
             | MirInst::Transaction { .. }
             | MirInst::Send { .. }
             | MirInst::Aggregate { .. }

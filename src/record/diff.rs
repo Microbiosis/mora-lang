@@ -85,6 +85,9 @@ fn summarize_event(ev: &Event) -> String {
             }
         }
         Event::Note { message, .. } => format!("note: {}", message),
+        // v0.83: Msg + StateMutation 简化为基本信息
+        Event::Msg { channel, payload, .. } => format!("msg channel={} payload={:?}", channel, payload),
+        Event::StateMutation { var, .. } => format!("state_mutation var={}", var),
     }
 }
 

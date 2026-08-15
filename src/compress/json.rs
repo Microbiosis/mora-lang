@@ -843,7 +843,12 @@ mod tests {
         let json_big = format!(
             "[{}]",
             (0..100)
-                .map(|i| format!(r#"{{"id":{},"score":{}}}"#, i, (i as f64) / 100.0))
+                .map(|i| {
+                    // v0.84: 用 "{:.1}" 确保 score 始终含小数点，
+                    // 避免 parse_json_number 将 "0" 解析为 Int。
+                    // 浮点数字段在 JSON 中应始终输出小数点以保持类型。
+                    format!(r#"{{"id":{},"score":{:.1}}}"#, i, (i as f64) / 100.0)
+                })
                 .collect::<Vec<_>>()
                 .join(",")
         );

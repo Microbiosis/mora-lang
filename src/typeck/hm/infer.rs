@@ -5,6 +5,7 @@
 use super::*;
 use crate::mir::hint::TypeHint;
 use crate::typeck::is_known_type;
+use std::collections::HashSet;
 
 impl HMInference {
     pub(super) fn infer_let(
@@ -12,8 +13,8 @@ impl HMInference {
         name: &str,
         value: &MirWitness,
         span: Span,
-    ) -> Result<Type, Vec<TypeError>> {
-        let value_ty = self.infer_expr(value)?;
+    ) -> Result<(Type, crate::mir::effect::EffectRow), Vec<TypeError>> {
+        let (value_ty, value_row) = self.infer_expr(value)?;
         // v0.75.17: let-generalization — 量化为不在 env 中的自由变量
         // （标准 HM：Γ ⊢ let x = e in body : ∀α₁...αₙ.τ，其中
         // {α₁...αₙ} = FV(τ) \ FV(Γ)）。
@@ -21,7 +22,7 @@ impl HMInference {
         let gen_ty = generalize::generalize(&value_ty, &self.env.free_variables());
         self.env.add(name.to_string(), gen_ty.clone());
         let _ = _span;
-        Ok(gen_ty)
+        Ok((gen_ty, value_row))
     }
 
     pub(super) fn infer_let_typed(
@@ -30,17 +31,28 @@ impl HMInference {
         type_hint: &TypeHint,
         value: &MirWitness,
         span: Span,
-    ) -> Result<Type, Vec<TypeError>> {
-        let value_ty = self.infer_expr(value)?;
-        // v0.75.93: TypeHint 边界 → to_type() 取回 typeck::Type
+    ) -> Result<(Type, crate::mir::effect::EffectRow), Vec<TypeError>> {
         let ty_inner = type_hint.to_type();
+        // v0.83: 提前 field-by-field 验证（如果是 let x: TeaModel = {field: val, ...}）
+        // 必须在 infer_expr 前做检查（infer_expr 把 field 名丢失到 Dict<String, V>）
+        if let (Type::TeaModel { name: target_name, fields: target_fields }, WitnessKind::Dict(entries)) =
+            (&ty_inner, &value.kind)
+        {
+            self.check_dict_against_teamodel(entries, target_name, target_fields, span)?;
+        }
+        // v0.83: 同样支持 let x: TeaMsg = {tag: "Increment"}
+        if let (Type::TeaMsg { name: target_name, variants: target_variants }, WitnessKind::Dict(entries)) =
+            (&ty_inner, &value.kind)
+        {
+            self.check_dict_against_teamsg(entries, target_name, target_variants, span)?;
+        }
+        let (value_ty, value_row) = self.infer_expr(value)?;
+        // v0.75.93: TypeHint 边界 → to_type() 取回 typeck::Type
         // v0.55: validate the user-supplied `let x: T = ...` annotation
         // against the value's inferred type. Tolerant: Type::Any
         // annotations always succeed.
         if !matches!(ty_inner, Type::Any) {
             // v0.75.86: 提前用 span 报不一致——不等 solve_constraints 兜底
-            // (原代码只 push Constraint 到 constraints 一致性队列，span 在
-            // 合一失败时被丢弃 → typeck 错误统一报 line 0)
             if !value_ty.compatible_with(ty_inner) {
                 return Err(vec![TypeError::UnificationFailure {
                     expected: format!("{:?}", ty_inner),
@@ -53,12 +65,131 @@ impl HMInference {
                 Box::new(value_ty.clone()),
             ));
         }
-        // v0.75.17: 显式注解同样做 let-generalization（注解含自由变量时
-        // 量化为 ForAll；`List<int>` 等具体注解无自由变量，原样登记）。
         let gen_hint = generalize::generalize(ty_inner, &self.env.free_variables());
         self.env.add(name.to_string(), gen_hint.clone());
         let _ = span;
-        Ok(gen_hint)
+        Ok((gen_hint, value_row))
+    }
+
+    /// v0.83: 验证 Dict literal 字面量是否匹配 TeaModel 类型
+    /// —— 每个 field 必须在 target 中存在，type 必须 compatible
+    fn check_dict_against_teamodel(
+        &mut self,
+        entries: &[(String, MirWitness)],
+        target_name: &str,
+        target_fields: &[(String, Box<Type>)],
+        span: Span,
+    ) -> Result<(), Vec<TypeError>> {
+        for (target_field_name, target_field_ty) in target_fields {
+            // target field 必须在 entries 中存在
+            let source_match = entries.iter().find(|(n, _)| n == target_field_name);
+            match source_match {
+                None => {
+                    return Err(vec![TypeError::UnificationFailure {
+                        expected: format!("field `{}` in model `{}`", target_field_name, target_name),
+                        got: "<missing>".to_string(),
+                        span: Some(span),
+                    }]);
+                }
+                Some((_, source_value_witness)) => {
+                    // v0.83: 验证 source field 的类型
+                    let (source_field_ty, _) = self.infer_expr(source_value_witness)?;
+                    if !source_field_ty.compatible_with(target_field_ty) {
+                        return Err(vec![TypeError::UnificationFailure {
+                            expected: format!(
+                                "field `{}: {}` in model `{}`",
+                                target_field_name,
+                                target_field_ty.name(),
+                                target_name
+                            ),
+                            got: source_field_ty.name(),
+                            span: Some(span),
+                        }]);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// v0.83: 验证 Dict literal 是否匹配 TeaMsg 类型
+    /// —— tag 字段必须匹配某个 variant，payload 字段 type 必须 compatible
+    fn check_dict_against_teamsg(
+        &mut self,
+        entries: &[(String, MirWitness)],
+        target_name: &str,
+        target_variants: &[(String, Option<Box<Type>>)],
+        span: Span,
+    ) -> Result<(), Vec<TypeError>> {
+        // 提取 tag 字段
+        let tag_entry = entries.iter().find(|(n, _)| n == "tag");
+        let tag_value = match tag_entry {
+            Some((_, tag_witness)) => {
+                if let WitnessKind::Literal(crate::common::Literal::String(s, _)) = &tag_witness.kind {
+                    s.clone()
+                } else {
+                    return Err(vec![TypeError::UnificationFailure {
+                        expected: format!("msg `{}` tag field (String literal)", target_name),
+                        got: format!("{:?}", tag_witness.kind),
+                        span: Some(span),
+                    }]);
+                }
+            }
+            None => {
+                return Err(vec![TypeError::UnificationFailure {
+                    expected: format!("msg `{}` requires `tag` field", target_name),
+                    got: "<missing>".to_string(),
+                    span: Some(span),
+                }]);
+            }
+        };
+        // 查找匹配的 variant
+        let variant = target_variants.iter().find(|(n, _)| n == &tag_value);
+        match variant {
+            None => Err(vec![TypeError::UnificationFailure {
+                expected: format!(
+                    "variant `{}` in msg `{}` (variants: {})",
+                    tag_value,
+                    target_name,
+                    target_variants
+                        .iter()
+                        .map(|(n, _)| n.clone())
+                        .collect::<Vec<_>>()
+                        .join(" | ")
+                ),
+                got: "<unknown>".to_string(),
+                span: Some(span),
+            }]),
+            Some((_, None)) => Ok(()), // unit variant
+            Some((_, Some(payload_ty))) => {
+                // 验证 payload 字段
+                let payload_entry = entries.iter().find(|(n, _)| n == "payload");
+                match payload_entry {
+                    None => Err(vec![TypeError::UnificationFailure {
+                        expected: format!(
+                            "msg `{}` variant `{}` requires `payload` field of type `{}`",
+                            target_name, tag_value, payload_ty.name()
+                        ),
+                        got: "<missing>".to_string(),
+                        span: Some(span),
+                    }]),
+                    Some((_, payload_witness)) => {
+                        let (source_payload_ty, _) = self.infer_expr(payload_witness)?;
+                        if !source_payload_ty.compatible_with(payload_ty) {
+                            return Err(vec![TypeError::UnificationFailure {
+                                expected: format!(
+                                    "msg `{}` variant `{}` payload: `{}`",
+                                    target_name, tag_value, payload_ty.name()
+                                ),
+                                got: source_payload_ty.name(),
+                                span: Some(span),
+                            }]);
+                        }
+                        Ok(())
+                    }
+                }
+            }
+        }
     }
 
     pub(super) fn infer_assign(
@@ -66,8 +197,8 @@ impl HMInference {
         target: &str,
         value: &MirWitness,
         span: Span,
-    ) -> Result<Type, Vec<TypeError>> {
-        let value_ty = self.infer_expr(value)?;
+    ) -> Result<(Type, crate::mir::effect::EffectRow), Vec<TypeError>> {
+        let (value_ty, value_row) = self.infer_expr(value)?;
         let current = self.env.get(target).cloned();
         if let Some(existing) = current {
             // v0.75.97: 命中 ForAll 时先实例化再合一（赋值的 LHS 是单形实例）
@@ -82,7 +213,7 @@ impl HMInference {
                 span,
             }]);
         }
-        Ok(value_ty)
+        Ok((value_ty, value_row))
     }
 
     pub(super) fn infer_var(&mut self, name: &str, span: Span) -> Result<Type, Vec<TypeError>> {
@@ -116,10 +247,11 @@ impl HMInference {
         left: &MirWitness,
         right: &MirWitness,
         span: Span,
-    ) -> Result<Type, Vec<TypeError>> {
+    ) -> Result<(Type, crate::mir::effect::EffectRow), Vec<TypeError>> {
         use crate::common::BinaryOp::*;
-        let left_ty = self.infer_expr(left)?;
-        let right_ty = self.infer_expr(right)?;
+        let (left_ty, left_row) = self.infer_expr(left)?;
+        let (right_ty, right_row) = self.infer_expr(right)?;
+        let merged_row = self.merge_rows(left_row, right_row);
         let result_ty = self.fresh_type_var();
         match op {
             Add | Sub | Mul | Div | Mod => {
@@ -140,7 +272,7 @@ impl HMInference {
                     Box::new(result_ty.clone()),
                 ));
                 let _ = span;
-                Ok(result_ty)
+                Ok((result_ty, merged_row))
             }
             Equal | NotEqual => {
                 if !left_ty.compatible_with(&right_ty) {
@@ -152,7 +284,7 @@ impl HMInference {
                 }
                 self.constraints
                     .push(Constraint::Eq(Box::new(left_ty), Box::new(right_ty)));
-                Ok(Type::Bool)
+                Ok((Type::Bool, merged_row))
             }
             Greater | Less | GreaterEqual | LessEqual => {
                 if !left_ty.compatible_with(&right_ty) {
@@ -164,31 +296,53 @@ impl HMInference {
                 }
                 self.constraints
                     .push(Constraint::Eq(Box::new(left_ty), Box::new(right_ty)));
-                Ok(Type::Bool)
+                Ok((Type::Bool, merged_row))
             } // v0.55: Or/And are WitnessKind variants (short-circuit),
               // handled directly in infer_expr, not BinaryOp variants.
               // BinaryOp 已穷尽（11 变体全部覆盖）— 无需 `_` 兜底。
         }
     }
 
+    /// v0.80: 函数调用推断 — 用 unification 消解 curried Arrow。
+    ///
+    /// 每个参数消耗一层 Arrow：callee_ty 必须与 Arrow(arg_ty, fresh_ret, fresh_eff)
+    /// 合一，然后 callee_ty 更新为 fresh_ret，fresh_eff 累积到总 effect row。
     pub(super) fn infer_call(
         &mut self,
         callee: &WitnessCallee,
         args: &[MirWitness],
         span: Span,
-    ) -> Result<Type, Vec<TypeError>> {
-        let callee_ty = match callee {
-            WitnessCallee::Name(name) => self.builtin_callee_ty(name).unwrap_or(Type::Unknown),
-            // v0.75.97: Var 命中 ForAll 时实例化（`let f = fn(x) x; f(1); f("s")`）
+    ) -> Result<(Type, crate::mir::effect::EffectRow), Vec<TypeError>> {
+        let (mut callee_ty, mut acc_row) = match callee {
+            WitnessCallee::Name(name) => {
+                // v0.84: 先查 env（用户定义函数/闭包），再查 builtin，最后 fresh TypeVar。
+                // 此前只查 builtin_callee_ty，导致 `let f = fn(x) x * 2 end; f(5)` 中
+                // `f` 在 env 里有 Arrow 类型，但 infer_call 查不到 → 兜底 Unknown。
+                // 兜底 Unknown 有副作用：约束 Unknown = Arrow(...) 在 unification 中
+                // fail-fast 报错（line 0）。改为 fresh TypeVar：让 Arrow 分解约束
+                // 自然传播 ret 类型。
+                let ty_opt = self.env.get(name).cloned();
+                let ty = if let Some(t) = ty_opt {
+                    Some(self.instantiate_if_forall(&t))
+                } else {
+                    self.builtin_callee_ty(name)
+                };
+                let ty = ty.unwrap_or_else(|| self.fresh_type_var());
+                (ty, crate::mir::effect::EffectRow::Empty)
+            }
+            // v0.75.97: Var 命中 ForAll 时实例化
             WitnessCallee::Var(var_name) => {
                 let ty_opt = self.env.get(var_name).cloned();
                 match ty_opt {
-                    Some(ty) => self.instantiate_if_forall(&ty),
-                    None => Type::Unknown,
+                    Some(ty) => (self.instantiate_if_forall(&ty), crate::mir::effect::EffectRow::Empty),
+                    None => (self.fresh_type_var(), crate::mir::effect::EffectRow::Empty),
                 }
             }
             WitnessCallee::Evaluated(expr) => self.infer_expr(expr)?,
-            WitnessCallee::Builtin(op) => self.builtin_type(op)?,
+            WitnessCallee::Builtin(op) => {
+                let ty = self.builtin_type(op)?;
+                (ty, crate::mir::effect::EffectRow::Empty)
+            }
             // v0.75.16: Method 调用（parser 现产出 WitnessCallee::Method）— 走
             // method_signature 推断（receiver 类型 + 参数约束 + 返回类型）。
             WitnessCallee::Method(_, _) => {
@@ -211,10 +365,6 @@ impl HMInference {
                 return self.infer_method_call(recv, &method, method_args, span);
             }
         };
-        let arg_types: Vec<Type> = args
-            .iter()
-            .map(|a| self.infer_expr(a))
-            .collect::<Result<Vec<_>, _>>()?;
 
         // v0.75.24: merge_with(key, strategy) 的策略名字面量编译期校验 —
         // 非法策略（静态字符串）在 typeck 阶段拦截，不再留到运行时
@@ -232,35 +382,25 @@ impl HMInference {
             }]);
         }
 
-        if let Some(sig) = self.closure_sig(&callee_ty).cloned() {
-            if sig.arity != arg_types.len() {
-                return Err(vec![TypeError::ArityMismatch {
-                    expected: sig.arity,
-                    actual: arg_types.len(),
-                    span,
-                }]);
-            }
-            for (param_ty, arg_ty) in sig.params.iter().zip(arg_types.iter()) {
-                self.constraints.push(Constraint::Eq(
-                    Box::new(param_ty.clone()),
-                    Box::new(arg_ty.clone()),
-                ));
-            }
-            Ok(sig.return_type)
-        } else {
-            // Unknown callee type: introduce a fresh return and
-            // constrain all argument slots to be compatible with
-            // whatever the callee happens to be.
-            let ret = self.fresh_type_var();
-            for arg_ty in &arg_types {
-                self.constraints.push(Constraint::Eq(
-                    Box::new(arg_ty.clone()),
-                    Box::new(callee_ty.clone()),
-                ));
-            }
-            let _ = ret.clone();
-            Ok(ret)
+        // v0.80: curried Arrow 消解 — 每个参数消耗一层 Arrow。
+        for arg in args {
+            let (arg_ty, arg_row) = self.infer_expr(arg)?;
+            acc_row = self.merge_rows(acc_row, arg_row);
+            let fresh_ret = self.fresh_type_var();
+            let fresh_eff = self.fresh_row_var();
+            let expected = Type::Arrow(
+                Box::new(arg_ty),
+                Box::new(fresh_ret.clone()),
+                fresh_eff.clone(),
+            );
+            self.constraints.push(Constraint::Eq(
+                Box::new(callee_ty.clone()),
+                Box::new(expected),
+            ));
+            callee_ty = fresh_ret;
+            acc_row = self.merge_rows(acc_row, fresh_eff);
         }
+        Ok((callee_ty, acc_row))
     }
 
     pub(super) fn infer_method_call(
@@ -269,12 +409,15 @@ impl HMInference {
         method: &str,
         args: &[MirWitness],
         span: Span,
-    ) -> Result<Type, Vec<TypeError>> {
-        let recv_ty = self.infer_expr(receiver)?;
-        let arg_types: Vec<Type> = args
-            .iter()
-            .map(|a| self.infer_expr(a))
-            .collect::<Result<Vec<_>, _>>()?;
+    ) -> Result<(Type, crate::mir::effect::EffectRow), Vec<TypeError>> {
+        let (recv_ty, recv_row) = self.infer_expr(receiver)?;
+        let mut acc_row = recv_row;
+        let mut arg_types: Vec<Type> = Vec::new();
+        for a in args {
+            let (t, r) = self.infer_expr(a)?;
+            arg_types.push(t);
+            acc_row = self.merge_rows(acc_row, r);
+        }
 
         // v0.55: enforce arity from the dispatch table. The signature
         // already includes `self` as its first parameter, so the user
@@ -307,18 +450,62 @@ impl HMInference {
         // v0.75.86: 不报错路径，保留 _span 备未来错误检查扩展点
         let _span = span;
         let _ = _span;
-        Ok(return_ty)
+        Ok((return_ty, acc_row))
     }
 
     // v0.75.20: infer_pipe 已删——WitnessKind::Pipe 死变体移除，`|>` 在
     // parse_pipe 脱糖为 Call（right(left)），HM 走 infer_call。
+
+    /// v0.80: 闭包推断 — 返回 curried Arrow 类型。
+    ///
+    /// 多参数闭包 `fn(a, b) -> c` 类型为 `Arrow(A, Arrow(B, C, eff), eff)`。
+    /// 闭包定义本身是 pure 的（EffectRow::Empty）——body 的 effects 被捕获
+    /// 到 Arrow 类型的 effect row 字段中。
+    pub(super) fn infer_sequence(
+        &mut self,
+        exprs: &[MirWitness],
+        span: Span,
+    ) -> Result<(Type, crate::mir::effect::EffectRow), Vec<TypeError>> {
+        // v0.84: Sequence 推断 — 依次推断每个子表达式，合并 effect row，
+        // 返回最后一个表达式的类型（类似 let-expr / do-notation 语义）。
+        // 空 Sequence → Type::Nil, EffectRow::Empty。
+        if exprs.is_empty() {
+            let _span = span;
+            let _ = _span;
+            return Ok((Type::Nil, crate::mir::effect::EffectRow::Empty));
+        }
+        let mut acc_row = crate::mir::effect::EffectRow::Empty;
+        let mut last_ty: Option<Type> = None;
+        for expr in exprs {
+            let (ty, row) = self.infer_expr(expr)?;
+            acc_row = self.merge_rows(acc_row, row);
+            last_ty = Some(ty);
+        }
+        let _span = span;
+        let _ = _span;
+        Ok((
+            last_ty.unwrap_or(Type::Nil),
+            acc_row,
+        ))
+    }
 
     pub(super) fn infer_closure(
         &mut self,
         params: &[WitnessParam],
         body: &MirWitness,
         span: Span,
-    ) -> Result<Type, Vec<TypeError>> {
+    ) -> Result<(Type, crate::mir::effect::EffectRow), Vec<TypeError>> {
+        // v0.84: 检查重复参数名——闭包/函数参数不允许同名。
+        let mut seen_names: HashSet<String> = HashSet::new();
+        for p in params {
+            if !seen_names.insert(p.name.clone()) {
+                return Err(vec![TypeError::UnificationFailure {
+                    expected: "distinct parameter names".to_string(),
+                    got: format!("duplicate parameter `{}`", p.name),
+                    span: Some(span),
+                }]);
+            }
+        }
         let saved_env = self.env.clone();
         let param_types: Vec<Type> = params
             .iter()
@@ -332,13 +519,22 @@ impl HMInference {
         for (p, ty) in params.iter().zip(param_types.iter()) {
             self.env.add(p.name.clone(), ty.clone());
         }
-        let body_ty = self.infer_expr(body)?;
+        let (body_ty, body_row) = self.infer_expr(body)?;
         self.env = saved_env;
-        let id = self.fresh_closure(param_types, body_ty);
+        // v0.80: 构建 curried arrow — 从最后一个参数向前包裹。
+        let mut ty = body_ty;
+        for param_ty in param_types.iter().rev() {
+            ty = Type::Arrow(
+                Box::new(param_ty.clone()),
+                Box::new(ty),
+                body_row.clone(),
+            );
+        }
         // v0.75.86: 不报错路径，保留 _span 备未来错误检查扩展点
         let _span = span;
         let _ = _span;
-        Ok(id)
+        // 闭包定义是 pure 的 — body 的 effects 被捕获到 Arrow 类型里。
+        Ok((ty, crate::mir::effect::EffectRow::Empty))
     }
 
     pub(super) fn infer_fn_def(
@@ -346,7 +542,7 @@ impl HMInference {
         params: &[WitnessParam],
         body: &MirWitness,
         span: Span,
-    ) -> Result<Type, Vec<TypeError>> {
+    ) -> Result<(Type, crate::mir::effect::EffectRow), Vec<TypeError>> {
         // fn name(params) = body  is treated like an immediately-bound
         // closure; the name registration is the caller's responsibility.
         // v0.75.86: 不报错路径，保留 _span 备未来错误检查扩展点
@@ -360,14 +556,21 @@ impl HMInference {
         scrutinee: &MirWitness,
         arms: &[WitnessArm],
         span: Span,
-    ) -> Result<Type, Vec<TypeError>> {
-        let scrutinee_ty = self.infer_expr(scrutinee)?;
+    ) -> Result<(Type, crate::mir::effect::EffectRow), Vec<TypeError>> {
+        let (scrutinee_ty, scrutinee_row) = self.infer_expr(scrutinee)?;
+        let mut acc_row = scrutinee_row;
         let mut result_ty: Option<Type> = None;
         for arm in arms {
-            // v0.76.02: pattern typeck 校验——5 变体
-            // (Tuple/List/Dict/TypeAscription/Variable) infer 分支
             self.infer_pattern(&arm.pattern, &scrutinee_ty, span)?;
-            let arm_ty = self.infer_expr(&arm.body)?;
+
+            // v0.87: 将模式绑定变量加入 env，再 infer arm body（与 infer_fn_def
+            // 的 save_env / restore 同构）。不添加则 [a, b, ..rest] => a + b 中
+            // a 被当作 UnboundVariable。
+            let saved_env = self.env.clone();
+            self.add_pattern_bindings(&arm.pattern, &scrutinee_ty, span)?;
+            let (arm_ty, arm_row) = self.infer_expr(&arm.body)?;
+            self.env = saved_env;
+            acc_row = self.merge_rows(acc_row, arm_row);
             match result_ty {
                 None => result_ty = Some(arm_ty),
                 Some(ref mut ty) => {
@@ -388,7 +591,7 @@ impl HMInference {
         // v0.75.86: 不报错路径，保留 _span 备未来错误检查扩展点
         let _span = span;
         let _ = _span;
-        Ok(result_ty.unwrap_or(Type::Unknown))
+        Ok((result_ty.unwrap_or(Type::Unknown), acc_row))
     }
 
     /// v0.76.02: pattern typeck 校验（架构审查报告 🟡 警告级风险——
@@ -454,9 +657,28 @@ impl HMInference {
                     }
                 };
                 self.infer_pattern(head, &elem_ty, span)?;
-                // tail 仍是 List<elem_ty>
                 let rest_list_ty = Type::List(Box::new(elem_ty));
                 self.infer_pattern(tail, &rest_list_ty, span)?;
+                Ok(())
+            }
+            WitnessPattern::ListVec { elements, rest } => {
+                let elem_ty = match scrutinee_ty {
+                    Type::List(e) => e.as_ref().clone(),
+                    _ => {
+                        return Err(vec![TypeError::UnificationFailure {
+                            expected: "List".to_string(),
+                            got: format!("{:?}", scrutinee_ty),
+                            span: Some(span),
+                        }]);
+                    }
+                };
+                for e in elements {
+                    self.infer_pattern(e, &elem_ty, span)?;
+                }
+                if let Some(r) = rest {
+                    let rest_list_ty = Type::List(Box::new(elem_ty));
+                    self.infer_pattern(r, &rest_list_ty, span)?;
+                }
                 Ok(())
             }
             WitnessPattern::Dict { required, rest: _ } => {
@@ -495,17 +717,71 @@ impl HMInference {
         }
     }
 
+    // v0.87: 递归提取模式绑定变量并加入 env。
+    // 每个绑定使用 fresh type var（与 infer_fn_def line 516 一致）——
+    // 避免从 scrutinee_ty 复制 TypeVar 导致多绑定共享同一变量，unify 时
+    // 产生"Cannot unify type variable X with type containing itself"循环。
+    // 约束求解器会根据 arm body 的实际用法将 fresh var 合一到正确类型。
+    fn add_pattern_bindings(
+        &mut self,
+        pattern: &crate::mir::witness::WitnessPattern,
+        _scrutinee_ty: &Type,
+        _span: Span,
+    ) -> Result<(), Vec<TypeError>> {
+        use crate::mir::witness::WitnessPattern;
+        match pattern {
+            WitnessPattern::Wildcard | WitnessPattern::Literal(_) => Ok(()),
+            WitnessPattern::Variable(name) => {
+                let ty = self.fresh_type_var();
+                self.env.add(name.clone(), ty);
+                Ok(())
+            }
+            WitnessPattern::Tuple(items) => {
+                for item in items {
+                    self.add_pattern_bindings(item, _scrutinee_ty, _span)?;
+                }
+                Ok(())
+            }
+            WitnessPattern::List { head, tail } => {
+                self.add_pattern_bindings(head, _scrutinee_ty, _span)?;
+                self.add_pattern_bindings(tail, _scrutinee_ty, _span)?;
+                Ok(())
+            }
+            WitnessPattern::ListVec { elements, rest } => {
+                for e in elements {
+                    self.add_pattern_bindings(e, _scrutinee_ty, _span)?;
+                }
+                if let Some(r) = rest {
+                    self.add_pattern_bindings(r, _scrutinee_ty, _span)?;
+                }
+                Ok(())
+            }
+            WitnessPattern::Dict { required, rest: _ } => {
+                for (_key, value_pat) in required {
+                    self.add_pattern_bindings(value_pat, _scrutinee_ty, _span)?;
+                }
+                Ok(())
+            }
+            WitnessPattern::TypeAscription { name: _name, pattern } => {
+                self.add_pattern_bindings(pattern, _scrutinee_ty, _span)?;
+                Ok(())
+            }
+        }
+    }
+
     pub(super) fn infer_if(
         &mut self,
         cond: &MirWitness,
         then_branch: &MirWitness,
         else_branch: Option<&MirWitness>,
         span: Span,
-    ) -> Result<Type, Vec<TypeError>> {
-        let _ = self.infer_expr(cond)?;
-        let then_ty = self.infer_expr(then_branch)?;
+    ) -> Result<(Type, crate::mir::effect::EffectRow), Vec<TypeError>> {
+        let (_, cond_row) = self.infer_expr(cond)?;
+        let (then_ty, then_row) = self.infer_expr(then_branch)?;
+        let mut acc_row = self.merge_rows(cond_row, then_row);
         let result = if let Some(e) = else_branch {
-            let else_ty = self.infer_expr(e)?;
+            let (else_ty, else_row) = self.infer_expr(e)?;
+            acc_row = self.merge_rows(acc_row, else_row);
             // Both branches must produce the same type.
             // v0.75.86: 提前用 span 报不一致（避免 line 0）
             if !else_ty.subtype_of(&then_ty) {
@@ -525,18 +801,20 @@ impl HMInference {
         // v0.75.86: 不报错路径，保留 _span 备未来错误检查扩展点
         let _span = span;
         let _ = _span;
-        Ok(result)
+        Ok((result, acc_row))
     }
 
     pub(super) fn infer_list(
         &mut self,
         items: &[MirWitness],
         span: Span,
-    ) -> Result<Type, Vec<TypeError>> {
+    ) -> Result<(Type, crate::mir::effect::EffectRow), Vec<TypeError>> {
         let elem_ty = self.fresh_type_var();
+        let mut acc_row = crate::mir::effect::EffectRow::Empty;
         let mut first_ty: Option<Type> = None;
         for item in items {
-            let ty = self.infer_expr(item)?;
+            let (ty, item_row) = self.infer_expr(item)?;
+            acc_row = self.merge_rows(acc_row, item_row);
             // v0.75.86: 提前用 span 报 list elem type 不一致（避免 line 0）
             if let Some(prev) = &first_ty
                 && !ty.compatible_with(prev)
@@ -556,19 +834,21 @@ impl HMInference {
         // v0.75.86: 不报错路径，保留 _span 备未来错误检查扩展点
         let _span = span;
         let _ = _span;
-        Ok(Type::List(Box::new(elem_ty)))
+        Ok((Type::List(Box::new(elem_ty)), acc_row))
     }
 
     pub(super) fn infer_dict(
         &mut self,
         entries: &[(String, MirWitness)],
         span: Span,
-    ) -> Result<Type, Vec<TypeError>> {
+    ) -> Result<(Type, crate::mir::effect::EffectRow), Vec<TypeError>> {
         let k_ty = Type::String;
         let v_ty = self.fresh_type_var();
+        let mut acc_row = crate::mir::effect::EffectRow::Empty;
         let mut first_v: Option<Type> = None;
         for (_, value) in entries {
-            let ty = self.infer_expr(value)?;
+            let (ty, val_row) = self.infer_expr(value)?;
+            acc_row = self.merge_rows(acc_row, val_row);
             // v0.75.86: 提前用 span 报 dict value type 不一致（避免 line 0）
             if let Some(prev) = &first_v
                 && !ty.compatible_with(prev)
@@ -588,7 +868,7 @@ impl HMInference {
         // v0.75.86: 不报错路径，保留 _span 备未来错误检查扩展点
         let _span = span;
         let _ = _span;
-        Ok(Type::Dict(Box::new(k_ty), Box::new(v_ty)))
+        Ok((Type::Dict(Box::new(k_ty), Box::new(v_ty)), acc_row))
     }
 }
 
@@ -596,6 +876,7 @@ impl HMInference {
 mod tests {
     use super::*;
     use crate::common::Span;
+    use crate::mir::MirExpr;
     use crate::mir::witness::WitnessPattern;
 
     // v0.76.02: infer_pattern 5 变体测试
@@ -641,6 +922,46 @@ mod tests {
             &WitnessPattern::List {
                 head: Box::new(WitnessPattern::Wildcard),
                 tail: Box::new(WitnessPattern::Wildcard),
+            },
+            &list_ty,
+            Span::default(),
+        );
+        assert!(r.is_ok());
+    }
+
+    #[test]
+    fn pattern_listvec_rest_succeeds() {
+        // v0.87: ListVec [a, b, ..rest] on List<Int>
+        let mut hm = HMInference::new();
+        let elem_ty = Type::Int;
+        let list_ty = Type::List(Box::new(elem_ty.clone()));
+        let r = hm.infer_pattern(
+            &WitnessPattern::ListVec {
+                elements: vec![
+                    WitnessPattern::Wildcard,
+                    WitnessPattern::Wildcard,
+                ],
+                rest: Some(Box::new(WitnessPattern::Variable("rest".to_string()))),
+            },
+            &list_ty,
+            Span::default(),
+        );
+        assert!(r.is_ok());
+    }
+
+    #[test]
+    fn pattern_listvec_no_rest_succeeds() {
+        // v0.87: ListVec [a, b] (fixed-length) on List<Int>
+        let mut hm = HMInference::new();
+        let elem_ty = Type::Int;
+        let list_ty = Type::List(Box::new(elem_ty.clone()));
+        let r = hm.infer_pattern(
+            &WitnessPattern::ListVec {
+                elements: vec![
+                    WitnessPattern::Wildcard,
+                    WitnessPattern::Wildcard,
+                ],
+                rest: None,
             },
             &list_ty,
             Span::default(),
@@ -696,5 +1017,324 @@ mod tests {
             Span::default(),
         );
         assert!(r.is_ok());
+    }
+
+    // v0.83: Dict literal field-by-field 验证
+
+    fn make_dict_w(entries: Vec<(String, MirExpr)>) -> MirWitness {
+        MirWitness {
+            kind: WitnessKind::Dict(
+                entries
+                    .into_iter()
+                    .map(|(n, e)| (n, MirWitness::from_expr(&e)))
+                    .collect(),
+            ),
+            span: Span::default(),
+        }
+    }
+
+    fn make_int_lit(n: i64) -> MirExpr {
+        MirExpr::lit(crate::common::Literal::Int(n, Span::default()), Span::default())
+    }
+
+    fn make_str_lit(s: &str) -> MirExpr {
+        MirExpr::lit(
+            crate::common::Literal::String(s.to_string(), Span::default()),
+            Span::default(),
+        )
+    }
+
+    fn make_typed_let(
+        type_hint_name: &str,
+        type_hint_fields: Vec<(String, Type)>,
+        dict_entries: Vec<(String, MirExpr)>,
+    ) -> (String, TypeHint, MirWitness) {
+        let ty = Type::TeaModel {
+            name: type_hint_name.to_string(),
+            fields: type_hint_fields
+                .into_iter()
+                .map(|(n, t)| (n, Box::new(t)))
+                .collect(),
+        };
+        let hint = TypeHint::from_type(ty);
+        (type_hint_name.to_string(), hint, make_dict_w(dict_entries))
+    }
+
+    #[test]
+    fn teamodel_dict_literal_validates_field_by_field() {
+        // v0.83: let x: Counter = {count: 0, step: 1} 应该通过
+        let (name, hint, value) = make_typed_let(
+            "Counter",
+            vec![
+                ("count".to_string(), Type::Int),
+                ("step".to_string(), Type::Int),
+            ],
+            vec![
+                ("count".to_string(), make_int_lit(0)),
+                ("step".to_string(), make_int_lit(1)),
+            ],
+        );
+        let mut hm = HMInference::new();
+        let result = hm.infer_let_typed(&name, &hint, &value, Span::default());
+        assert!(result.is_ok(), "完整字段匹配应该通过: {:?}", result);
+    }
+
+    #[test]
+    fn teamodel_dict_literal_missing_field_fails() {
+        // v0.83: let x: Counter = {count: 0} 缺 step 字段 —— 失败
+        let (name, hint, value) = make_typed_let(
+            "Counter",
+            vec![
+                ("count".to_string(), Type::Int),
+                ("step".to_string(), Type::Int),
+            ],
+            vec![("count".to_string(), make_int_lit(0))],
+        );
+        let mut hm = HMInference::new();
+        let result = hm.infer_let_typed(&name, &hint, &value, Span::default());
+        assert!(result.is_err(), "缺 step 字段应该失败");
+    }
+
+    #[test]
+    fn teamodel_dict_literal_field_type_mismatch_fails() {
+        // v0.83: let x: Counter = {count: "0", step: 1} 字段类型不匹配 —— 失败
+        let (name, hint, value) = make_typed_let(
+            "Counter",
+            vec![
+                ("count".to_string(), Type::Int),
+                ("step".to_string(), Type::Int),
+            ],
+            vec![
+                ("count".to_string(), make_str_lit("0")),
+                ("step".to_string(), make_int_lit(1)),
+            ],
+        );
+        let mut hm = HMInference::new();
+        let result = hm.infer_let_typed(&name, &hint, &value, Span::default());
+        assert!(result.is_err(), "字段类型不匹配应该失败");
+    }
+
+    #[test]
+    fn teamsg_dict_literal_validates_variant() {
+        // v0.83: let x: CounterMsg = {tag: "Increment"} 应该通过
+        let ty = Type::TeaMsg {
+            name: "CounterMsg".to_string(),
+            variants: vec![
+                ("Increment".to_string(), None),
+                ("Decrement".to_string(), None),
+                (
+                    "SetStep".to_string(),
+                    Some(Box::new(Type::Int)),
+                ),
+            ],
+        };
+        let hint = TypeHint::from_type(ty);
+        let value = make_dict_w(vec![(
+            "tag".to_string(),
+            make_str_lit("Increment"),
+        )]);
+        let mut hm = HMInference::new();
+        let result = hm.infer_let_typed("x", &hint, &value, Span::default());
+        assert!(result.is_ok(), "已知 variant 应该通过: {:?}", result);
+    }
+
+    #[test]
+    fn teamsg_dict_literal_unknown_variant_fails() {
+        // v0.83: let x: CounterMsg = {tag: "NonExist"} —— 失败
+        let ty = Type::TeaMsg {
+            name: "CounterMsg".to_string(),
+            variants: vec![
+                ("Increment".to_string(), None),
+                ("Decrement".to_string(), None),
+            ],
+        };
+        let hint = TypeHint::from_type(ty);
+        let value = make_dict_w(vec![(
+            "tag".to_string(),
+            make_str_lit("NonExist"),
+        )]);
+        let mut hm = HMInference::new();
+        let result = hm.infer_let_typed("x", &hint, &value, Span::default());
+        assert!(result.is_err(), "未知 variant 应该失败");
+    }
+
+    #[test]
+    fn teamsg_dict_literal_missing_tag_fails() {
+        // v0.83: let x: CounterMsg = {payload: 0} 缺 tag 字段 —— 失败
+        let ty = Type::TeaMsg {
+            name: "CounterMsg".to_string(),
+            variants: vec![("Increment".to_string(), None)],
+        };
+        let hint = TypeHint::from_type(ty);
+        let value = make_dict_w(vec![(
+            "payload".to_string(),
+            make_int_lit(0),
+        )]);
+        let mut hm = HMInference::new();
+        let result = hm.infer_let_typed("x", &hint, &value, Span::default());
+        assert!(result.is_err(), "缺 tag 字段应该失败");
+    }
+
+    // v0.84: Layer 2a — Sequence 推断
+
+    fn make_lit_w(n: i64) -> MirWitness {
+        MirWitness {
+            kind: WitnessKind::Literal(crate::common::Literal::Int(n, Span::default())),
+            span: Span::default(),
+        }
+    }
+
+    fn make_var_w(name: &str) -> MirWitness {
+        MirWitness {
+            kind: WitnessKind::Variable(name.to_string()),
+            span: Span::default(),
+        }
+    }
+
+    #[test]
+    fn sequence_empty_returns_nil() {
+        let mut hm = HMInference::new();
+        let result = hm.infer_sequence(&[], Span::default());
+        assert!(result.is_ok());
+        let (ty, row) = result.unwrap();
+        assert_eq!(ty, Type::Nil);
+        assert!(matches!(row, crate::mir::effect::EffectRow::Empty));
+    }
+
+    #[test]
+    fn sequence_returns_last_expr_type() {
+        let mut hm = HMInference::new();
+        let exprs = vec![make_lit_w(1), make_lit_w(2), make_lit_w(42)];
+        let result = hm.infer_sequence(&exprs, Span::default());
+        assert!(result.is_ok(), "all-int sequence should succeed");
+        // Solve constraints to get concrete types
+        let (ty, _row) = result.unwrap();
+        // After constraint solving, all ints unify to Int
+        let result = hm.instantiate_type(&ty);
+        // The inferred type is a TypeVar that got constrained to Int via
+        // the literal 42. With Unknown-compatible-with, the literals
+        // produce concrete Int types.
+        assert!(
+            matches!(result, Type::Int) || matches!(result, Type::TypeVar(_)),
+            "expected Int or TypeVar, got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn sequence_merges_effect_rows() {
+        let mut hm = HMInference::new();
+        // Two int literals — pure, no effects. Row stays Empty.
+        let exprs = vec![make_lit_w(1), make_lit_w(2)];
+        let result = hm.infer_sequence(&exprs, Span::default());
+        assert!(result.is_ok());
+        let (_ty, row) = result.unwrap();
+        assert!(
+            matches!(row, crate::mir::effect::EffectRow::Empty),
+            "pure sequence should have Empty row"
+        );
+    }
+
+    #[test]
+    fn sequence_with_variable_infer_ok() {
+        let mut hm = HMInference::new();
+        // Register x as Int in env
+        hm.env
+            .add("x".to_string(), crate::typeck::Type::Int);
+        let exprs = vec![make_var_w("x")];
+        let result = hm.infer_sequence(&exprs, Span::default());
+        assert!(result.is_ok(), "variable lookup should succeed");
+        let (ty, _row) = result.unwrap();
+        assert_eq!(ty, Type::Int);
+    }
+
+    // v0.84: Layer 2b — Closure 重复参数检测
+
+    #[test]
+    fn closure_duplicate_param_names_error() {
+        use crate::mir::witness::WitnessParam;
+        let params = vec![
+            WitnessParam {
+                name: "x".to_string(),
+                type_hint: None,
+                default: None,
+            },
+            WitnessParam {
+                name: "x".to_string(), // duplicate
+                type_hint: None,
+                default: None,
+            },
+        ];
+        let body = make_lit_w(1);
+        let mut hm = HMInference::new();
+        let result = hm.infer_closure(&params, &body, Span::default());
+        assert!(result.is_err(), "duplicate param 'x' should error");
+        let errors = result.unwrap_err();
+        assert!(
+            errors.iter().any(|e| {
+                let msg = format!("{:?}", e);
+                msg.contains("duplicate") || msg.contains("x")
+            }),
+            "error should mention duplicate param, got: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn closure_distinct_params_ok() {
+        use crate::mir::witness::WitnessParam;
+        let params = vec![
+            WitnessParam {
+                name: "x".to_string(),
+                type_hint: None,
+                default: None,
+            },
+            WitnessParam {
+                name: "y".to_string(),
+                type_hint: None,
+                default: None,
+            },
+        ];
+        let body = make_lit_w(1);
+        let mut hm = HMInference::new();
+        let result = hm.infer_closure(&params, &body, Span::default());
+        assert!(result.is_ok(), "distinct params should succeed");
+        // Result is Arrow(TypeVar, Arrow(TypeVar, TypeVar, Empty), Empty)
+        let (ty, row) = result.unwrap();
+        assert!(matches!(ty, Type::Arrow(_, _, _)));
+        assert!(matches!(row, crate::mir::effect::EffectRow::Empty));
+    }
+
+    #[test]
+    fn closure_single_param_ok() {
+        use crate::mir::witness::WitnessParam;
+        let params = vec![WitnessParam {
+            name: "x".to_string(),
+            type_hint: None,
+            default: None,
+        }];
+        let body = make_lit_w(42);
+        let mut hm = HMInference::new();
+        let result = hm.infer_closure(&params, &body, Span::default());
+        assert!(result.is_ok());
+        let (ty, row) = result.unwrap();
+        // Single param → Arrow(param, body_ty, row)
+        assert!(matches!(ty, Type::Arrow(_, _, _)));
+        assert!(matches!(row, crate::mir::effect::EffectRow::Empty));
+    }
+
+    #[test]
+    fn closure_type_hint_param_ok() {
+        use crate::mir::witness::WitnessParam;
+        let hint = TypeHint::from_type(Type::Float);
+        let params = vec![WitnessParam {
+            name: "x".to_string(),
+            type_hint: Some(hint),
+            default: None,
+        }];
+        let body = make_lit_w(1);
+        let mut hm = HMInference::new();
+        let result = hm.infer_closure(&params, &body, Span::default());
+        assert!(result.is_ok(), "typed param should succeed");
     }
 }

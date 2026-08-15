@@ -392,7 +392,6 @@ impl Interpreter {
 
 #[cfg(test)]
 mod tests_v043_exec {
-    #![allow(unused_mut)]
     use super::*;
     use crate::value::Value;
 
@@ -404,7 +403,7 @@ mod tests_v043_exec {
 
     #[test]
     fn exec_parallel_runs_all_commands() {
-        let mut interp = Interpreter::new();
+        let interp = Interpreter::new();
         let cmds = vec![cmd("echo a"), cmd("echo b"), cmd("echo c")];
         let result = interp
             .call_exec_method("parallel", &[Value::List(cmds)])
@@ -437,7 +436,7 @@ mod tests_v043_exec {
 
     #[test]
     fn exec_parallel_respects_max_concurrent() {
-        let mut interp = Interpreter::new();
+        let interp = Interpreter::new();
         // 6 个 sleep 1s, max_concurrent=2 → 总时间应该 ~3s (而非 ~1s 或 ~6s)
         // 跳过 perf assertion — 只验证结果正确
         let cmds: Vec<Value> = (0..6).map(|i| cmd(&format!("echo {}", i))).collect();
@@ -471,7 +470,7 @@ mod tests_v043_exec {
 
     #[test]
     fn exec_parallel_empty_list_returns_empty() {
-        let mut interp = Interpreter::new();
+        let interp = Interpreter::new();
         let result = interp
             .call_exec_method("parallel", &[Value::List(vec![])])
             .unwrap();
@@ -480,7 +479,7 @@ mod tests_v043_exec {
 
     #[test]
     fn exec_parallel_collects_stdout_per_command() {
-        let mut interp = Interpreter::new();
+        let interp = Interpreter::new();
         let cmds = vec![cmd("echo line1"), cmd("printf line2"), cmd("echo line3")];
         let result = interp
             .call_exec_method("parallel", &[Value::List(cmds)])
@@ -518,7 +517,7 @@ mod tests_v043_exec {
 
     #[test]
     fn exec_parallel_kills_process_group_on_timeout() {
-        let mut interp = Interpreter::new();
+        let interp = Interpreter::new();
         // "sleep 10" + timeout 200ms → 应报 timeout
         let cmds = vec![cmd("sleep 10")];
         let result = interp
@@ -550,7 +549,7 @@ mod tests_v043_exec {
 
     #[test]
     fn exec_parallel_validates_arg_types() {
-        let mut interp = Interpreter::new();
+        let interp = Interpreter::new();
         let err = interp
             .call_exec_method("parallel", &[Value::Float(42.0)])
             .expect_err("non-list first arg should fail");
@@ -559,7 +558,7 @@ mod tests_v043_exec {
 
     #[test]
     fn exec_parallel_validates_cmd_elements() {
-        let mut interp = Interpreter::new();
+        let interp = Interpreter::new();
         let cmds = vec![cmd("echo ok"), Value::Float(42.0)]; // 第二个不是 string
         let err = interp
             .call_exec_method("parallel", &[Value::List(cmds)])
@@ -570,7 +569,7 @@ mod tests_v043_exec {
     #[test]
     fn exec_parallel_returns_error_for_missing_command() {
         // sh -c 调用不存在的命令 → sh 返回 exit_code=127, stderr "command not found"
-        let mut interp = Interpreter::new();
+        let interp = Interpreter::new();
         let cmds = vec![cmd("this_command_definitely_does_not_exist_xyz")];
         let result = interp
             .call_exec_method("parallel", &[Value::List(cmds)])
@@ -608,7 +607,7 @@ mod tests_v043_exec {
 
     #[test]
     fn exec_unknown_method_errors() {
-        let mut interp = Interpreter::new();
+        let interp = Interpreter::new();
         let err = interp
             .call_exec_method("nonexistent", &[])
             .expect_err("unknown method should fail");

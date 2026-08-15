@@ -86,6 +86,11 @@ impl CostModel for TokenEstimate {
             // 二元运算：常量输入 → 可折叠为 Const
             MirInst::BinaryOp(_, _, _, _) => 3, // 折叠前 3 token，折叠后 1 token
             // 函数调用：name + args 的 token 总和
+            // v0.83: TEA definitions are compile-time only (no runtime cost)
+            MirInst::ModelDef { .. } => 0,
+            MirInst::MsgDef { .. } => 0,
+            MirInst::UpdateDef { .. } => 0,
+            MirInst::AppDef { .. } => 0,
             MirInst::Call(_, name, args) => {
                 let name_cost = (name.chars().count() / 4 + 1) as u32;
                 name_cost + args.len() as u32 + 50 // 50 = 调用框架开销
@@ -207,6 +212,8 @@ impl CostModel for TokenEstimate {
             MirInst::DynTrait { .. } => 3,
             // Eval 断言：按 expects 计费
             MirInst::Eval { expects, .. } => 5 + expects.len() as u32 * 3,
+            // v0.88: Quasiquote — 按段数计费（每段一次拼接）
+            MirInst::Quasiquote { segments, .. } => 3 + segments.len() as u32,
             // 无操作指令
             MirInst::Label(_) => 0,
         }

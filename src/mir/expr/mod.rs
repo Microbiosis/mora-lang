@@ -573,6 +573,12 @@ pub enum Pattern {
         head: Box<Pattern>,
         tail: Box<Pattern>,
     },
+    /// v0.87: List vector pattern: `[a, b, ..rest]` or `[a, b]`.
+    /// `elements` are the prefix patterns; `rest` is an optional rest-variable pattern.
+    ListVec {
+        elements: Vec<Pattern>,
+        rest: Option<Box<Pattern>>,
+    },
     /// Dict pattern: `{key: value, ..}`
     Dict {
         required: Vec<(String, Pattern)>,

@@ -80,16 +80,16 @@ pub fn builtin_signatures() -> Vec<(String, Signature)> {
                 raw_return_type: None,
             },
         ),
-        // range(start, end, step) -> list<number>
+        // range(start, end, step) -> list<int>
         (
             "range".to_string(),
             Signature::new(
                 vec![
-                    ("start".to_string(), Type::Float),
-                    ("end".to_string(), Type::Float),
-                    ("step".to_string(), Type::Float),
+                    ("start".to_string(), Type::Int),
+                    ("end".to_string(), Type::Int),
+                    ("step".to_string(), Type::Int),
                 ],
-                Type::List(Box::new(Type::Float)),
+                Type::List(Box::new(Type::Int)),
             ),
         ),
         // len(x) for string / list / dict

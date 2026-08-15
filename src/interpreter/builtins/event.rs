@@ -79,7 +79,6 @@ impl Interpreter {
 
 #[cfg(test)]
 mod tests_v0431_bus {
-    #![allow(unused_mut)]
     use super::*;
     use crate::value::Value;
 
@@ -87,7 +86,7 @@ mod tests_v0431_bus {
 
     #[test]
     fn bus_subscribe_returns_token() {
-        let mut interp = Interpreter::new();
+        let interp = Interpreter::new();
         let token = interp
             .call_event_method(
                 "subscribe",
@@ -103,7 +102,7 @@ mod tests_v0431_bus {
 
     #[test]
     fn bus_subscribe_validates_pattern() {
-        let mut interp = Interpreter::new();
+        let interp = Interpreter::new();
         let err = interp
             .call_event_method("subscribe", &[Value::Float(42.0)])
             .expect_err("non-string pattern should fail");
@@ -112,7 +111,7 @@ mod tests_v0431_bus {
 
     #[test]
     fn bus_publish_returns_pattern_count() {
-        let mut interp = Interpreter::new();
+        let interp = Interpreter::new();
         // subscribe 2 个
         interp
             .call_event_method("subscribe", &[Value::String("ai.*".to_string())])
@@ -139,7 +138,7 @@ mod tests_v0431_bus {
 
     #[test]
     fn bus_publish_validates_topic() {
-        let mut interp = Interpreter::new();
+        let interp = Interpreter::new();
         let err = interp
             .call_event_method("publish", &[Value::Float(42.0)])
             .expect_err("non-string topic should fail");
@@ -149,7 +148,7 @@ mod tests_v0431_bus {
     #[test]
     fn bus_subscribe_then_publish_wildcard_match() {
         // end-to-end: subscribe "user.*", publish "user.created", 验证 pattern 进入订阅表
-        let mut interp = Interpreter::new();
+        let interp = Interpreter::new();
         interp
             .call_event_method("subscribe", &[Value::String("user.*".to_string())])
             .unwrap();
@@ -165,7 +164,7 @@ mod tests_v0431_bus {
     #[test]
     fn bus_subscribe_uses_existing_pattern_matching() {
         // 验证 subscribe 用的就是 EventBus::on() (已经在 v0.41.0 + v0.41.1 测试覆盖)
-        let mut interp = Interpreter::new();
+        let interp = Interpreter::new();
         interp
             .call_event_method("subscribe", &[Value::String("exact.event".to_string())])
             .unwrap();

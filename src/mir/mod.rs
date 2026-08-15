@@ -253,11 +253,46 @@ pub enum MirInst {
         fields: Vec<crate::common::StructField>,
     },
 
+    // ── v0.83: TEA (The Elm Architecture) 语法层 ──
+    /// Model 定义 — 强类型状态容器（类似 StructDef，但语义是「不可变 Model 容器」）。
+    /// v0.83 阶段 E 注册到 env 为 Type::TeaModel。
+    ModelDef {
+        name: String,
+        fields: Vec<crate::common::StructField>,
+    },
+    /// Msg 定义 — tagged union，每个变体可携带 payload。
+    /// v0.83 阶段 E 注册到 env 为 Type::TeaMsg。
+    MsgDef {
+        name: String,
+        variants: Vec<crate::common::MsgVariant>,
+    },
+    /// Update 函数定义 — `fn(Model, Msg) -> (Model, Cmd)`。
+    /// v0.83 阶段 E 注册到 env 为 Type::TeaUpdate (Type::Arrow with effect row)。
+    UpdateDef {
+        name: String,
+        params: Vec<String>,
+        body: Box<MirFunction>,
+    },
+    /// App 定义 — 完整 TEA app（init/update/view 三个 MirFunction）。
+    /// v0.83 阶段 E 注册到 env 为 Type::TeaApp，构造 Value::TeaApp。
+    AppDef {
+        name: String,
+        model_name: String,
+        msg_name: String,
+        init_mir: Box<MirFunction>,
+        update_mir: Box<MirFunction>,
+        view_mir: Box<MirFunction>,
+    },
+
     // ── 宏定义（α.5: 与 AST execute_macro_def 语义一致）──
-    /// α.5: macro def — 注册 Value::Macro(name, params) 到环境。
+    /// α.5: macro def — 注册 Value::Macro(name, params, body) 到环境。
+    /// body 是宏体的 MIR 编译结果（由 parser_v3 emit_macro_def_w 经子
+    /// EmitContext 编译而来）。调用时以 call_args 绑定 params，在子 env
+    /// 中 run_mir 执行 body（v0.83 完整实现，不再跳过宏体）。
     MacroDef {
         name: String,
         params: Vec<String>,
+        body: Box<MirFunction>,
     },
 
     // ── 运行时特性（α.4: transaction / worker）──
@@ -439,6 +474,38 @@ pub enum MirInst {
     Break(Label),
     /// α.1: continue 到指定 label（循环增量处）
     Continue(Label),
+    /// v0.88: 反引号 quasiquote —— 编译期提取代码段结构，运行时重组为 Mora 源码字符串，
+    /// 返回 `Value::Code`。
+    /// 与 `quote(expr)` 对称：quote 冻结整个源码；quasiquote 选择性冻结。
+    ///
+    /// 实现策略（对齐 Prompt 指令的 register-ref 模式）：
+    /// - emit 阶段：遇到 `` `expr `` → 递归 emit 子表达式，同时建立 QuasiquoteSegment 列表
+    ///   - 静态源码片段 → Quote(src_text)
+    ///   - `,expr` unquote → 先 emit expr → 记录 dst_reg → Unquote(dst_reg)
+    ///   - `,,expr` splice → 先 emit expr → 记录 dst_reg → UnquoteSplice(dst_reg)
+    /// - 执行阶段：h_quasiquote 遍历 segments，Quote 直接拼入，Unquote 取寄存器值
+    ///   经 Mora Display 格式化为代码字符串，UnquoteSplice 取 List 展平为逗号分隔代码。
+    Quasiquote {
+        dst: Reg,
+        segments: Vec<QuasiquoteSegment>,
+    },
+}
+
+/// v0.88: Quasiquote 代码段类型 — 反引号 `` ` `` 内的结构化片段。
+///
+/// 编译期已知边界（emit 阶段构建），运行时按类型求值/拼接。
+/// 语义（Lisp 系）：
+///   - Quote(src)         → 原样保留源码 `src`（静态文字）
+///   - Unquote(reg)       → 读取 `regs[reg]`，经 Mora Display 格式化为代码字符串
+///   - UnquoteSplice(reg) → 读取 `regs[reg]`（期望为 List），展平为 `item1, item2, ...` 代码
+///
+/// Register-ref 设计对齐 Prompt 指令：emit 阶段已求值 unquote 子表达式，
+/// handler 只负责按 register 取数拼接，与 Prompt 的 parts 寄存器列表同构。
+#[derive(Debug, Clone, PartialEq)]
+pub enum QuasiquoteSegment {
+    Quote(String),
+    Unquote(Reg),
+    UnquoteSplice(Reg),
 }
 
 impl MirFunction {

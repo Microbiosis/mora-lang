@@ -13,6 +13,9 @@ use std::sync::Arc;
 #[cfg(feature = "persistent_env")]
 pub mod persistent;
 
+// v0.83: Clojure-style transducers — 流式管道的底层原语
+pub mod transducer;
+
 // v1 Stmt 已移除 — Value::Task/Closure 不再持有 body
 
 // ─── StreamReader ─────────────────────────────────────────
@@ -80,6 +83,12 @@ pub enum BuiltinKind {
     Plan,
     // v0.48.0: mora.* — meta (refine / list-plans) (CLI-Anything /refine)
     Mora,
+    // v0.83: tea.* — TEA runtime (init/update/view/run/replay/send)
+    Tea,
+    // v0.83: xform.* — Clojure-style transducer (map/filter/take/comp)
+    Xform,
+    // v0.86: eval(code) — runtime eval, Mora 源码动态执行（Lisp homoiconicity + eval-apply）
+    Eval,
 }
 
 impl std::fmt::Display for BuiltinKind {
@@ -113,6 +122,9 @@ impl std::fmt::Display for BuiltinKind {
             BuiltinKind::Plan => "Plan::new",
             BuiltinKind::Mora => "Mora::new",
             BuiltinKind::Ai => "Ai::new",
+            BuiltinKind::Tea => "tea",
+            BuiltinKind::Xform => "xform",
+            BuiltinKind::Eval => "eval",
         };
         f.write_str(s)
     }
@@ -128,6 +140,7 @@ impl BuiltinKind {
             "print" => return Some(BuiltinKind::Print),
             "range" => return Some(BuiltinKind::Range),
             "len" => return Some(BuiltinKind::Len),
+            "eval" => return Some(BuiltinKind::Eval),
             _ => {}
         }
         // domain 前缀
@@ -162,6 +175,9 @@ impl BuiltinKind {
             "skill" => BuiltinKind::Skill,
             "plan" => BuiltinKind::Plan,
             "mora" => BuiltinKind::Mora,
+            // v0.83: TEA runtime 与 transducer builtin（无 domain 前缀）
+            "tea" => BuiltinKind::Tea,
+            "xform" => BuiltinKind::Xform,
             _ => return None,
         })
     }
@@ -181,14 +197,6 @@ impl EnvRef {
     /// Returns an immutable reference to the inner Environment.
     pub fn env(&self) -> &Environment {
         &self.0
-    }
-
-    /// v0.40: convert an Arc<Mutex<Environment>> (legacy) into an
-    /// EnvRef snapshot. The snapshot clones the Environment contents
-    /// at capture time and is immutable thereafter.
-    pub fn from_arc_mutex(parent: Arc<Mutex<Environment>>) -> Self {
-        let env_clone = parent.lock().clone();
-        EnvRef(Box::new(env_clone))
     }
 }
 
@@ -224,7 +232,7 @@ pub enum Value {
         params: Vec<String>,
         /// v0.40: env is now EnvRef (Local Rc<RefCell> or Owned Box<Environment>)
         /// instead of Arc<Mutex<Environment>>. Callers convert via
-        /// EnvRef::from_arc_mutex(arc) for legacy Arc<Mutex<>> sources.
+        /// EnvRef::new(env) for closure captures.
         env: EnvRef,
         /// α.10/α.11: MIR-built 闭包体。所有 closure 必须有 body；
         /// dispatch 走 run_mir 不再有 arena fallback（AGENTS_CODE_MODIFICATION §28）。
@@ -243,6 +251,12 @@ pub enum Value {
     Stream {
         reader: StreamReader,
         done: Arc<Mutex<bool>>,
+        /// v0.83: transducer pipeline applied to each token.
+        /// None = identity (current behavior, fully backward-compatible).
+        /// Clojure-style push-based transducer：每个 SSE token 推入 `step`，
+        /// 输出 None 表示终止流。
+        /// 包装在 Arc 中以支持 Value::Clone（多消费者共享同一 transducer）。
+        xform: Option<Arc<dyn transducer::Transducer<String, String>>>,
     },
     // v0.03: Agent 编排
     Agent {
@@ -294,10 +308,14 @@ pub enum Value {
     Partial(Box<Value>, Vec<Value>),
     // v0.19: Atom 可变引用 (Clojure 启发)
     Atom(Arc<Mutex<Value>>),
-    // v0.20: 宏定义 (Common Lisp 启发)
+    // v0.20 / v0.83: 宏定义 (Common Lisp 启发) — 宏体作为 MIR 函数存储。
+    // body 是宏的 MIR 编译体（由 parser_v3 emit_macro_def_w 经子 EmitContext
+    // 编译而来）。宏调用时以 call_args 绑定 params，在子 env 中 run_mir 执行 body。
+    // Arc 而非 Rc 以保留 Value: Send + Sync（与 Value::Closure 同模式）。
     Macro {
         name: String,
         params: Vec<String>,
+        body: std::sync::Arc<crate::mir::MirFunction>,
     },
     // v0.26: Prompt 分段 — 一段有 role / text / byte 预算的 system prompt 片段
     // (灵感: mimiclaw 的 5 段固定缓冲 + headroom 的内容感知压缩器)
@@ -313,6 +331,42 @@ pub enum Value {
         backend: std::sync::Arc<dyn crate::document::DocumentBackend>,
         metadata: std::collections::HashMap<String, Value>,
     },
+    // v0.86: Curry — 函数柯里化（Lisp/Rust closure 启发）。
+    // curry(fn, arity) 产生 Curry；调用时若已绑定参数不足 arity，返回新的 Curry
+    // （累积参数）；足够则调用内部 fn。这是 compose/partial 的补完：
+    // compose 是串行 f∘g∘h，partial 是前向绑定 f(x, ?)，curry 是
+    // 按序分批接收参数（Clojure partial vs. Haskell curry 的区别）。
+    Curry {
+        func: Box<Value>,
+        arity: usize,
+        bound_args: Vec<Value>,
+    },
+    // v0.86: Cons — Lisp 链式列表原语。Value::Cons(car, cdr) 是
+    // Lisp 'cons cell' 的直译；car 是头元素，cdr 是尾部（可嵌套
+    // Cons 形成链表，或 nil 终止）。配合 car()/cdr()/cons() 内置函数
+    // 提供对链表的不可变操作。cdr 为 Nil 时表示单元素列表。
+    Cons {
+        car: Box<Value>,
+        cdr: Box<Value>,
+    },
+    /// v0.86: Lisp homoiconicity — `quote(expr)` captures `expr` as
+    /// a source-text string wrapped in `Code`. Completes the
+    /// eval-apply-quote triad: `eval(s)` compiles+runs; `quote(s)`
+    /// freezes it. The stored string is the raw substring inside
+    /// `quote(...)`, preserving exact user typing.
+    ///
+    /// Round-trip invariant: `eval(quote(expr)) == expr`.
+    Code(String),
+    // v0.83: TEA (The Elm Architecture) — Model/Msg/Update/Cmd 完整架构。
+    //
+    // TeaApp = 完整 TEA runtime：Model 状态 + init/update/view 闭包 + msg_queue + cmd_queue。
+    // Arc<Mutex<TeaApp>> 允许多消费者读 model（view 层），单 owner 修改队列。
+    TeaApp(std::sync::Arc<crate::tea::TeaApp>),
+    // v0.83: TEA Cmd — 描述 update 函数想触发的副作用。
+    // 值化后可在 builtin / record / replay 间无缝传递。
+    TeaCmd(crate::tea::Cmd),
+    // v0.83: TEA Msg — 触发 update 的输入事件（tagged union：tag + payload）。
+    TeaMsg(crate::tea::Msg),
 }
 
 // 手动实现 PartialEq（EnvRef 不支持自动派生）
@@ -342,6 +396,19 @@ impl PartialEq for Value {
                 },
             ) => a == b && ra == rb && ta == tb && ba == bb,
             (Value::Document { metadata: a, .. }, Value::Document { metadata: b, .. }) => a == b,
+            // v0.83: TEA 变体按 Arc 内容比较（TeaApp 内部 Mutex 跳过）
+            (Value::TeaApp(a), Value::TeaApp(b)) => std::ptr::eq(a.as_ref(), b.as_ref()),
+            (Value::TeaCmd(a), Value::TeaCmd(b)) => a == b,
+            (Value::TeaMsg(a), Value::TeaMsg(b)) => a == b,
+            // v0.86: Curry — 按函数/arity/已绑定参数逐一比较。
+            (Value::Curry { func: a, arity: aa, bound_args: ba },
+             Value::Curry { func: b, arity: ab, bound_args: bb }) => {
+                a == b && aa == ab && ba == bb
+            }
+            // v0.86: Cons — 按 car/cdr 结构比较。
+            (Value::Cons { car: a1, cdr: a2 }, Value::Cons { car: b1, cdr: b2 }) => a1 == b1 && a2 == b2,
+            // v0.86: Code — 按 source text 字符串比较。
+            (Value::Code(a), Value::Code(b)) => a == b,
             _ => false,
         }
     }
@@ -920,16 +987,6 @@ mod tests {
         let v = Value::Float(42.5);
         let s = format!("{}", v);
         assert_eq!(s, "42.5");
-    }
-
-    /// v0.40: EnvRef smoke test.
-    #[test]
-    fn envref_from_arc_mutex_roundtrip() {
-        let mut e = Environment::new();
-        e.define("x".to_string(), Value::String("y".to_string()), false);
-        let arc = Arc::new(Mutex::new(e));
-        let r = EnvRef::from_arc_mutex(arc);
-        assert_eq!(r.env().get("x"), Some(Value::String("y".to_string())));
     }
 
     // ─── Merge tests ──────────────────────────────────────────

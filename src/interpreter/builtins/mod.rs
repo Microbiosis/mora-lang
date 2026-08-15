@@ -12,7 +12,8 @@ use super::*;
 
 #[cfg(test)]
 mod tests_v042_capability {
-    #![allow(unused_mut)]
+    // `let mut interp` is needed: tests mutate `interp.persist.audit_sink` etc.
+    // across multiple assertions, though some tests in this module don't mutate.
     use super::*;
     use crate::value::Value;
 
@@ -20,7 +21,7 @@ mod tests_v042_capability {
 
     #[test]
     fn sandbox_key_returns_token_id_number() {
-        let mut interp = Interpreter::new();
+        let interp = Interpreter::new();
         let args = vec![
             Value::String("file.read".to_string()),
             Value::String("web.fetch".to_string()),
@@ -38,7 +39,7 @@ mod tests_v042_capability {
     #[test]
     fn sandbox_key_with_no_caps_returns_token() {
         // 空 args 也是合法: 创建一个空 capability 集合 (拒绝一切)
-        let mut interp = Interpreter::new();
+        let interp = Interpreter::new();
         let token_id = interp
             .call_sandbox_method("key", &[])
             .expect("sandbox.key with no args should succeed");
@@ -55,7 +56,7 @@ mod tests_v042_capability {
 
     #[test]
     fn sandbox_key_rejects_unknown_capability_string() {
-        let mut interp = Interpreter::new();
+        let interp = Interpreter::new();
         let args = vec![Value::String("not.a.real.cap".to_string())];
         let err = interp
             .call_sandbox_method("key", &args)
@@ -66,7 +67,7 @@ mod tests_v042_capability {
 
     #[test]
     fn sandbox_key_rejects_non_string_arg() {
-        let mut interp = Interpreter::new();
+        let interp = Interpreter::new();
         let args = vec![Value::Float(42.0)];
         let err = interp
             .call_sandbox_method("key", &args)
@@ -76,7 +77,7 @@ mod tests_v042_capability {
 
     #[test]
     fn sandbox_check_call_authorizes_granted_capability() {
-        let mut interp = Interpreter::new();
+        let interp = Interpreter::new();
         let token_id = interp
             .call_sandbox_method("key", &[Value::String("file.read".to_string())])
             .expect("issue token");
@@ -100,7 +101,7 @@ mod tests_v042_capability {
 
     #[test]
     fn sandbox_check_call_with_unknown_token_returns_false() {
-        let mut interp = Interpreter::new();
+        let interp = Interpreter::new();
         let result = interp
             .call_sandbox_method(
                 "check_call",
@@ -112,7 +113,7 @@ mod tests_v042_capability {
 
     #[test]
     fn sandbox_check_call_with_unknown_capability_string_errors() {
-        let mut interp = Interpreter::new();
+        let interp = Interpreter::new();
         let token_id = interp
             .call_sandbox_method("key", &[Value::String("file.read".to_string())])
             .expect("issue 调用应成功");
@@ -127,7 +128,7 @@ mod tests_v042_capability {
 
     #[test]
     fn sandbox_revoke_bumps_generation() {
-        let mut interp = Interpreter::new();
+        let interp = Interpreter::new();
         let token_id = interp
             .call_sandbox_method("key", &[Value::String("file.read".to_string())])
             .expect("issue 调用应成功");
@@ -180,7 +181,7 @@ mod tests_v042_capability {
 
     #[test]
     fn sandbox_token_count_tracks_unique_tokens() {
-        let mut interp = Interpreter::new();
+        let interp = Interpreter::new();
         assert_eq!(interp.sandbox.sandbox.capabilities.token_count(), 0);
 
         let _ = interp
@@ -204,7 +205,7 @@ mod tests_v042_capability {
     #[test]
     fn sandbox_old_methods_still_work() {
         // v0.42.0 增补不应破坏 v0.33-0.41 的 sandbox.mode / check_builtin / check_path
-        let mut interp = Interpreter::new();
+        let interp = Interpreter::new();
         let mode = interp
             .call_sandbox_method("mode", &[])
             .expect("mode 应生效");
@@ -219,7 +220,6 @@ mod tests_v042_capability {
 
 #[cfg(test)]
 mod tests_v0421_audit {
-    #![allow(unused_mut)]
     use super::*;
     use crate::audit::{AuditSink, JsonlAuditSink};
     use crate::value::Value;
@@ -290,7 +290,7 @@ mod tests_v0421_audit {
 
     #[test]
     fn audit_emit_validates_arg_types() {
-        let mut interp = Interpreter::new();
+        let interp = Interpreter::new();
         let err = interp
             .call_sandbox_method(
                 "audit_emit",
@@ -302,7 +302,7 @@ mod tests_v0421_audit {
 
     #[test]
     fn audit_emit_validates_arg_count() {
-        let mut interp = Interpreter::new();
+        let interp = Interpreter::new();
         let err = interp
             .call_sandbox_method(
                 "audit_emit",
@@ -396,7 +396,7 @@ mod tests_v0421_audit {
     #[test]
     fn null_sink_default_audit_emit_returns_true() {
         // 默认 NullSink 应接受所有 audit_emit 调用
-        let mut interp = Interpreter::new();
+        let interp = Interpreter::new();
         let result = interp
             .call_sandbox_method(
                 "audit_emit",
@@ -653,7 +653,7 @@ mod tests_v044_orchestrate_validate {
     /// v0.44.0: orchestrate block syntax validation (ParserV3 path)
     fn parse(src: &str) -> Vec<MirExpr> {
         let tokens = Lexer::new(src).scan_tokens();
-        let parser = ParserV3::new(tokens);
+        let parser = ParserV3::new(tokens, src);
         parser
             .parse()
             .unwrap_or_else(|e| panic!("ParserV3 failed: {:?}", e))
@@ -2251,4 +2251,7 @@ mod plan;
 mod sandbox;
 mod schedule;
 mod skill;
+// v0.83: TEA runtime + transducer builtin
+mod tea;
 mod toolplane;
+mod xform;

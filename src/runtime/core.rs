@@ -46,6 +46,10 @@ pub struct CoreRuntime {
     /// MirHost trait 的 `perform_effect / install/take/restore_effect_handler`
     /// 全部作用于本字段。嵌套 handle 块走 take+restore 栈模式。
     pub(crate) effect_handlers: crate::runtime::effect::EffectRegistry,
+    /// v0.87: gensym 计数器。每次 gensym() 调用递增，保证符号名唯一。
+    /// Pregel worker 各自持有独立计数器（Arc clone），宏展开在单 worker 内
+    /// 完成，跨 worker 符号名冲突可接受（gensym 语义仅在宏上下文有意义）。
+    pub(crate) gensym_counter: Arc<Mutex<usize>>,
 }
 
 impl Default for CoreRuntime {
@@ -61,6 +65,7 @@ impl Default for CoreRuntime {
             dynamic_sends: Vec::new(),
             aggregator_contributions: Vec::new(),
             effect_handlers: crate::runtime::effect::EffectRegistry::default(),
+            gensym_counter: Arc::new(Mutex::new(0)),
         }
     }
 }
@@ -82,6 +87,7 @@ impl Clone for CoreRuntime {
             dynamic_sends: self.dynamic_sends.clone(),
             aggregator_contributions: self.aggregator_contributions.clone(),
             effect_handlers: crate::runtime::effect::EffectRegistry::default(),
+            gensym_counter: self.gensym_counter.clone(),
         }
     }
 }

@@ -186,7 +186,62 @@ pub fn self_match_pattern(
     {
         return s == suffix;
     }
-    // 列表模式: list:[p1,p2,...]
+    // v0.87: List vector pattern: list:vector:[p1,p2,...,rest] or list:vector:[p1,p2]
+    if let Some(inner) = pat_str
+        .strip_prefix("list:vector:[")
+        .and_then(|s| s.strip_suffix(']'))
+    {
+        if let Value::List(items) = val {
+            // Parse elements and detect rest marker {..}
+            let parts: Vec<&str> = if inner.is_empty() {
+                Vec::new()
+            } else {
+                inner.split(',').collect()
+            };
+            // Find rest marker ..rest_name (pattern_to_string serializes without braces)
+            let rest_pos = parts
+                .iter()
+                .position(|p| p.starts_with(".."));
+            match rest_pos {
+                Some(pos) => {
+                    // Elements before rest
+                    if items.len() < pos {
+                        return false;
+                    }
+                    // Match prefix elements
+                    for (i, (item, pat)) in items.iter().zip(parts.iter()).enumerate() {
+                        if i == pos {
+                            break;
+                        }
+                        if !self_match_pattern(item, pat, None, env) {
+                            return false;
+                        }
+                    }
+                    // Parse rest variable name from ..rest_name
+                    let rest_name = parts[pos]
+                        .strip_prefix("..")
+                        .unwrap_or(parts[pos]);
+                    if !rest_name.is_empty() {
+                        // Bind the remaining items as a list to the rest variable
+                        env.define(rest_name.to_string(), Value::List(items[pos..].to_vec()), false);
+                    }
+                    return true;
+                }
+                None => {
+                    // No rest — exact length match
+                    if items.len() != parts.len() {
+                        return false;
+                    }
+                    return items
+                        .iter()
+                        .zip(parts.iter())
+                        .all(|(item, pat)| self_match_pattern(item, pat, None, env));
+                }
+            }
+        }
+        return false;
+    }
+    // 列表模式: list:[p1,p2,...] (cons-list format, legacy)
     if pat_str == "list:[]" {
         return matches!(val, Value::List(items) if items.is_empty());
     }
@@ -194,6 +249,10 @@ pub fn self_match_pattern(
         .strip_prefix("list:[")
         .and_then(|s| s.strip_suffix(']'))
     {
+        // Skip cons-list with | separator (legacy)
+        if inner.contains('|') {
+            return false;
+        }
         if let Value::List(items) = val {
             let pats: Vec<&str> = if inner.is_empty() {
                 Vec::new()
@@ -224,6 +283,12 @@ pub fn self_match_pattern(
             } else {
                 inner.split(',').collect()
             };
+            // Handle trailing .. (rest marker)
+            let pairs = if let Some(pos) = pairs.iter().position(|p| p.trim() == "..") {
+                &pairs[..pos]
+            } else {
+                &pairs[..]
+            };
             return pairs.iter().all(|pair| {
                 if let Some((k, v)) = pair.split_once(':') {
                     map.get(k)
@@ -238,7 +303,7 @@ pub fn self_match_pattern(
     }
     // 守卫模式: guard:inner — 只检查内部模式匹配
     if let Some(inner) = pat_str.strip_prefix("guard:") {
-        return self_match_pattern(val, inner, _cond_reg, env);
+        return self_match_pattern(val, inner, None, env);
     }
     // 字符模式: char:c
     if let Some(suffix) = pat_str.strip_prefix("char:")

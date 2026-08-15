@@ -1,0 +1,61 @@
+-- v0.87: match list rest patterns [a, b, ..rest]
+task main()
+  -- Basic rest: first two elements bound, rest collected
+  let nums = [1, 2, 3, 4, 5]
+  let result1 = match nums {
+    [a, b, ..rest] => a + b
+  }
+  print(result1)
+
+  -- Rest with longer prefix
+  let nums2 = [10, 20, 30, 40, 50]
+  let result2 = match nums2 {
+    [a, b, c, ..rest] => a + b + c
+  }
+  print(result2)
+
+  -- Rest is empty list (prefix = full list)
+  let nums3 = [7, 8]
+  let result3 = match nums3 {
+    [a, b, ..rest] => a + b
+  }
+  print(result3)
+
+  -- Single element rest
+  let nums4 = [42]
+  let result4 = match nums4 {
+    [a, ..rest] => a
+  }
+  print(result4)
+
+  -- Two-element list, prefix = first, rest = second
+  let nums5 = [100, 200]
+  let result5 = match nums5 {
+    [a, ..rest] => a + rest[0]
+  }
+  print(result5)
+
+  -- Exact match (no rest) — 3-element list
+  let nums6 = [1, 2, 3]
+  let result6 = match nums6 {
+    [a, b, c] => a + b + c
+    _ => 0
+  }
+  print(result6)
+
+  -- Exact match fails, falls to default
+  let nums7 = [1, 2, 3, 4]
+  let result7 = match nums7 {
+    [a, b, c] => a + b + c
+    _ => 999
+  }
+  print(result7)
+
+  -- Guard combined with list rest
+  let nums8 = [5, 10, 15, 20]
+  let result8 = match nums8 {
+    [a, b, ..rest] when a > 0 => "positive"
+    _ => "other"
+  }
+  print(result8)
+end

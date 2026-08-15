@@ -1,0 +1,72 @@
+-- v0.87: match dict rename patterns ({key: varname})
+task main()
+  -- Basic rename: all string values
+  let person = {name: "Alice", age: "30"}
+  let result1 = match person {
+    {name: n, age: a} => n + " is " + a
+    _ => "unknown"
+  }
+  print(result1)
+
+  -- Rename all fields from a 3-key dict
+  let info = {first: "Bob", last: "Smith", city: "NY"}
+  let result2 = match info {
+    {first: f, last: l, city: c} => f + " " + l + " (" + c + ")"
+    _ => "unknown"
+  }
+  print(result2)
+
+  -- Missing key falls through to default
+  let partial = {name: "Carol"}
+  let result3 = match partial {
+    {name: n, age: a} => n + " is " + a
+    _ => "missing"
+  }
+  print(result3)
+
+  -- Single-key rename
+  let greeting = {msg: "hello"}
+  let result4 = match greeting {
+    {msg: m} => m + " world"
+    _ => "none"
+  }
+  print(result4)
+
+  -- Empty dict pattern match
+  let empty = {}
+  let result5 = match empty {
+    {} => "empty"
+    _ => "not empty"
+  }
+  print(result5)
+
+  -- Non-empty dict does not match empty pattern
+  let nonempty = {x: "1"}
+  let result6 = match nonempty {
+    {} => "empty"
+    _ => "has keys"
+  }
+  print(result6)
+
+  -- Multiple dicts in sequence
+  let p1 = {name: "Dave", age: "25"}
+  let p2 = {name: "Eve", age: "30"}
+  let r1 = match p1 {
+    {name: n, age: a} => n + ":" + a
+    _ => "?"
+  }
+  let r2 = match p2 {
+    {name: n, age: a} => n + ":" + a
+    _ => "?"
+  }
+  print(r1 + " " + r2)
+
+  -- Rename with guard: numeric comparison via parse
+  let young = {name: "Frank", age: "20"}
+  let result7 = match young {
+    {name: n, age: a} when a == "20" => n + " is young"
+    {name: n, age: a} when a == "30" => n + " is old"
+    _ => "unknown"
+  }
+  print(result7)
+end

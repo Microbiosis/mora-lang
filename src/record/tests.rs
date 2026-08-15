@@ -794,3 +794,126 @@ fn schema_mismatch_pushes_warning() {
     );
     assert!(r2.warnings[0].contains("gpt-4o"), "warning 应含模型名");
 }
+
+// ─── v0.83: Msg + StateMutation 事件测试 ───
+
+#[test]
+fn record_msg_event() {
+    let mut r = Recorder::new_off();
+    r.record_msg(
+        "user_input".to_string(),
+        crate::value::Value::String("hello".to_string()),
+        42,
+    );
+    assert_eq!(r.events().len(), 0, "Off 模式不录制");
+}
+
+#[test]
+fn record_state_mutation_event() {
+    let path = tmp_path("state_mutation");
+    let mut r = Recorder::new_record(path.clone()).unwrap();
+    r.record_state_mutation(
+        "x".to_string(),
+        crate::value::Value::Int(0),
+        crate::value::Value::Int(42),
+    );
+    assert_eq!(r.events().len(), 1);
+    match &r.events()[0] {
+        Event::StateMutation { var, old, new, .. } => {
+            assert_eq!(var, "x");
+            assert_eq!(*old, crate::value::Value::Int(0));
+            assert_eq!(*new, crate::value::Value::Int(42));
+        }
+        other => panic!("expected StateMutation, got {:?}", other),
+    }
+    let _ = fs::remove_file(&path);
+}
+
+#[test]
+fn msg_event_serialization_roundtrip() {
+    let path = tmp_path("msg_roundtrip");
+    let mut r = Recorder::new_record(path.clone()).unwrap();
+    r.record_msg(
+        "channel_a".to_string(),
+        crate::value::Value::String("payload".to_string()),
+        12345,
+    );
+    r.save().unwrap();
+    let r2 = Recorder::new_replay(path.clone()).unwrap();
+    assert_eq!(r2.events().len(), 1);
+    match &r2.events()[0] {
+        Event::Msg { channel, payload, prior_state_hash, .. } => {
+            assert_eq!(channel, "channel_a");
+            assert_eq!(*payload, crate::value::Value::String("payload".to_string()),
+                       "payload roundtrip 完整 Value JSON");
+            assert_eq!(*prior_state_hash, 12345);
+        }
+        other => panic!("expected Msg, got {:?}", other),
+    }
+    let _ = fs::remove_file(&path);
+}
+
+#[test]
+fn state_mutation_event_serialization_roundtrip() {
+    let path = tmp_path("sm_roundtrip");
+    let mut r = Recorder::new_record(path.clone()).unwrap();
+    r.record_state_mutation(
+        "var1".to_string(),
+        crate::value::Value::Nil,
+        crate::value::Value::Int(100),
+    );
+    r.save().unwrap();
+    let r2 = Recorder::new_replay(path.clone()).unwrap();
+    assert_eq!(r2.events().len(), 1);
+    match &r2.events()[0] {
+        Event::StateMutation { var, old, new, .. } => {
+            assert_eq!(var, "var1");
+            assert_eq!(*old, crate::value::Value::Nil);
+            // v0.84: JSON roundtrip 保持 Int 类型 — Int(100) → "100" → Int(100)
+            assert_eq!(*new, crate::value::Value::Int(100));
+        }
+        other => panic!("expected StateMutation, got {:?}", other),
+    }
+    let _ = fs::remove_file(&path);
+}
+
+#[test]
+fn recorder_is_off_check() {
+    let r1 = Recorder::new_off();
+    assert!(r1.is_off());
+    let path = tmp_path("not_off");
+    let mut r2 = Recorder::new_record(path.clone()).unwrap();
+    assert!(!r2.is_off());
+    // 写入一个 event 让 file 存在，然后才能 replay
+    r2.record_state_mutation("x".into(), crate::value::Value::Nil, crate::value::Value::Int(1));
+    r2.save().unwrap();
+    let r3 = Recorder::new_replay(path.clone()).unwrap();
+    assert!(!r3.is_off());
+    let _ = fs::remove_file(&path);
+}
+
+#[test]
+fn timeline_includes_msg_and_state_mutation() {
+    let events = vec![
+        Event::Msg {
+            id: 1,
+            ts_ms: 1000,
+            channel: "ch".to_string(),
+            payload: crate::value::Value::Nil,
+            prior_state_hash: 0,
+        },
+        Event::StateMutation {
+            id: 2,
+            ts_ms: 1100,
+            var: "v".to_string(),
+            old: crate::value::Value::Nil,
+            new: crate::value::Value::Nil,
+        },
+    ];
+    let rows = crate::record::analysis::build_timeline(&events);
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].kind, "msg");
+    assert_eq!(rows[0].detail, "ch");
+    assert_eq!(rows[1].kind, "state_mutation");
+    assert_eq!(rows[1].detail, "v");
+}

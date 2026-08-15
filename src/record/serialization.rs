@@ -87,6 +87,40 @@ pub(super) fn event_to_jsonl(ev: &Event) -> String {
                 esc(message)
             )
         }
+        // v0.83: Msg + StateMutation — payload/old/new 序列化为完整 Value JSON
+// （用 flow::value_to_json 而非 Debug 字符串）。旧 JSONL 文件失效。
+        Event::Msg {
+            id,
+            ts_ms,
+            channel,
+            payload,
+            prior_state_hash,
+        } => {
+            format!(
+                r#"{{"kind":"msg","id":{},"ts_ms":{},"channel":"{}","payload":{},"prior_state_hash":{}}}"#,
+                id,
+                ts_ms,
+                esc(channel),
+                crate::flow::value_to_json(payload),
+                prior_state_hash
+            )
+        }
+        Event::StateMutation {
+            id,
+            ts_ms,
+            var,
+            old,
+            new,
+        } => {
+            format!(
+                r#"{{"kind":"state_mutation","id":{},"ts_ms":{},"var":"{}","old":{},"new":{}}}"#,
+                id,
+                ts_ms,
+                esc(var),
+                crate::flow::value_to_json(old),
+                crate::flow::value_to_json(new)
+            )
+        }
     }
 }
 
@@ -166,6 +200,8 @@ pub(super) fn event_to_replay_entry(ev: &Event) -> Option<(String, String, Recor
             ))
         }
         Event::Note { .. } => None,
+        // v0.83: Msg + StateMutation 不进 replay index（应用层消息由 replay_msgs 直接处理）
+        Event::Msg { .. } | Event::StateMutation { .. } => None,
     }
 }
 
@@ -305,6 +341,40 @@ pub(super) fn parse_event_line(line: &str) -> Option<Event> {
                 .unwrap_or(0),
             message: fields.get("message").cloned().unwrap_or_default(),
         }),
+        // v0.83: msg + state_mutation — 解析 channel/payload/var/old/new
+        // payload/old/new 是完整 Value JSON（用 flow::json_to_value 还原）
+        "msg" => Some(Event::Msg {
+            id: fields.get("id").and_then(|s| s.parse().ok()).unwrap_or(0),
+            ts_ms: fields
+                .get("ts_ms")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0),
+            channel: fields.get("channel").cloned().unwrap_or_default(),
+            payload: fields
+                .get("payload")
+                .and_then(|s| parse_json_value_field(s))
+                .unwrap_or(crate::value::Value::Nil),
+            prior_state_hash: fields
+                .get("prior_state_hash")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0),
+        }),
+        "state_mutation" => Some(Event::StateMutation {
+            id: fields.get("id").and_then(|s| s.parse().ok()).unwrap_or(0),
+            ts_ms: fields
+                .get("ts_ms")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0),
+            var: fields.get("var").cloned().unwrap_or_default(),
+            old: fields
+                .get("old")
+                .and_then(|s| parse_json_value_field(s))
+                .unwrap_or(crate::value::Value::Nil),
+            new: fields
+                .get("new")
+                .and_then(|s| parse_json_value_field(s))
+                .unwrap_or(crate::value::Value::Nil),
+        }),
         _ => None,
     }
 }
@@ -339,4 +409,34 @@ pub(super) fn unquote(s: &str) -> String {
     } else {
         trimmed.to_string()
     }
+}
+
+/// v0.83: 解析 JSON value 字段（用于 Msg.payload / StateMutation.old/new）。
+///
+/// 字段格式：`"json value"` （带外层引号）。json_to_value 直接接受
+/// `"hello"` / `{"k":1}` / `[1,2,3]` / `null` / `42.0` 等。
+///
+/// simple comma-split parser 已经去掉了字段值的外层引号，所以我们需要
+/// 把单值（如 `payload`、`42.0`）补回引号再用 json_to_value 解析。
+fn parse_json_value_field(s: &str) -> Option<crate::value::Value> {
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    // 如果已经是完整 JSON 值（object/array/null/true/false/数字），
+    // 直接解析。如果只是 bare 标识符（如 "payload"），加引号。
+    let to_parse = if trimmed.starts_with('{')
+        || trimmed.starts_with('[')
+        || trimmed.starts_with('"')
+        || trimmed == "null"
+        || trimmed == "true"
+        || trimmed == "false"
+        || trimmed.parse::<f64>().is_ok()
+    {
+        trimmed.to_string()
+    } else {
+        // bare 字符串 —— 包成 JSON 字符串
+        format!("\"{}\"", trimmed.replace('\\', "\\\\").replace('"', "\\\""))
+    };
+    crate::flow::json_to_value(&to_parse).ok()
 }

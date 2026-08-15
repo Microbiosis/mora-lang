@@ -17,7 +17,12 @@
 //!   original size (no actual byte reduction).
 //! - unknown strategy: default to `head_tail` with 0.3 / 0.3 splits.
 
+use std::time::Duration;
+
 use crate::compress::{CompressOptions, SubCompressor};
+use crate::config::{AI_API_KEY_ENV, AI_BASE_URL_DEFAULT, AI_BASE_URL_ENV};
+use crate::flow::json_to_value;
+use crate::value::Value;
 
 /// v0.29: 把字节索引向下对齐到最近的 UTF-8 字符边界。
 ///
@@ -79,30 +84,100 @@ pub fn head_tail_impl(content: &str, head_pct: f32, tail_pct: f32, max_bytes: us
     )
 }
 
-/// v0.29: summary 通过 LLM 调用 — **MVP 仅 mock 模式**。
+/// v0.29: summary 通过 LLM 调用。
 ///
-/// v0.29 简化路径:
-/// - 读 `OPENAI_API_KEY` env var; 若为空 → mock 截前 200 字符 + `mock_mode` marker。
-/// - 即使 env var 设置了, v0.29 也仍走 mock 路径 (避免 CI / 离线环境意外调 LLM)。
-///
-/// v0.30+ 真实 LLM 接入计划 (后续 PR, 不在本任务范围):
-/// - 检测 API key 有效 → 调 `real_ai_chat` (复用 v0.25 的 LLM 入口, 详见
-///   `src/interpreter/dispatch.rs`); 失败再 fallback 到 mock + 错误日志。
+/// 路径:
+/// - `OPENAI_API_KEY` 为空 → mock 截前 200 字符 + `mock_mode` marker。
+/// - `OPENAI_API_KEY` 已设置 → 调 Chat Completions API (复用 ureq，保持零 serde 依赖);
+///   调用失败时 eprintln 错误并 fallback 到 mock。
 pub fn summary_llm_impl(content: &str, _max_bytes: usize) -> Result<String, String> {
-    let api_key = std::env::var(crate::interpreter::AI_API_KEY_ENV).unwrap_or_default();
+    let api_key = std::env::var(AI_API_KEY_ENV).unwrap_or_default();
     let preview: String = content.chars().take(200).collect();
+
     if api_key.is_empty() {
-        Ok(format!(
+        return Ok(format!(
             "{}\n<compressed:method=summary mock_mode>",
             preview
+        ));
+    }
+
+    // 有 API key: 尝试真实 LLM 调用
+    let base_url =
+        std::env::var(AI_BASE_URL_ENV).unwrap_or_else(|_| AI_BASE_URL_DEFAULT.to_string());
+    let prompt_len = content.len().min(4000);
+    let prompt =
+        format!("Summarize the following text concisely:\n\n{}", &content[..prompt_len]);
+    if let Ok(summary) = summary_via_llm(&prompt, &api_key, &base_url) {
+        Ok(format!(
+            "{}\n<compressed:method=summary llm>",
+            summary
         ))
     } else {
-        // v0.29: 即使 API key 设置也走 mock, 避免无 LLM 客户端时 panic。
-        // v0.30+ 会改成真实调用 (那时再有 OPENAI_API_KEY 时也确保有网络 / SDK)。
+        eprintln!(
+            "compress.summary: LLM call failed (OPENAI_API_KEY set), falling back to mock"
+        );
         Ok(format!(
             "{}\n<compressed:method=summary mock_mode>",
             preview
         ))
+    }
+}
+
+/// v0.29: 通过 Chat Completions API 执行摘要。
+///
+/// - 手写 JSON 请求体（保持零 serde 依赖原则）
+/// - 用 `json_to_value` 解析响应，提取 `choices[0].message.content`
+/// - 30s 读超时（LLM 推理可能慢）
+fn summary_via_llm(prompt: &str, api_key: &str, base_url: &str) -> Result<String, String> {
+    let escaped_prompt = prompt
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n");
+    let body = format!(
+        r#"{{"model":"gpt-4o-mini","messages":[{{"role":"user","content":"{}"}}]}}"#,
+        escaped_prompt
+    );
+    let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
+
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_global(Some(Duration::from_secs(30)))
+        .http_status_as_error(false)
+        .build()
+        .into();
+
+    match agent
+        .post(&url)
+        .header("Authorization", &format!("Bearer {}", api_key))
+        .header("Content-Type", "application/json")
+        .send(&body)
+    {
+        Ok(mut resp) => {
+            let status = resp.status();
+            let text = resp
+                .body_mut()
+                .read_to_string()
+                .map_err(|e| format!("LLM response read error: {}", e))?;
+            if status.as_u16() >= 400 {
+                return Err(format!(
+                    "LLM API error ({}): {}",
+                    status,
+                    &text[..200.min(text.len())]
+                ));
+            }
+            // 解析响应: choices[0].message.content
+            let root =
+                json_to_value(&text).map_err(|e| format!("LLM response parse error: {}", e))?;
+            if let Value::Dict(map) = root
+                && let Some(Value::List(choices)) = map.get("choices")
+                && let Some(Value::Dict(choice_map)) = choices.first()
+                && let Some(Value::Dict(msg_map)) = choice_map.get("message")
+                && let Some(Value::String(content)) = msg_map.get("content")
+            {
+                return Ok(content.clone());
+            }
+            Err("LLM response: could not extract content".to_string())
+        }
+        Err(e) => Err(format!("LLM API request error: {}", e)),
     }
 }
 

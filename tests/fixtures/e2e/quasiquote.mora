@@ -1,0 +1,27 @@
+-- v0.88: Lisp quasiquote / unquote / unquote-splice
+-- Pure quasiquote 返回 Code 类型，与 quote(expr) 对称
+task main()
+  let q1 = `10+20
+  let r1 = eval(q1)
+  print(r1)
+
+  -- Quasiquote with unquote — ,x 求值后插入源码
+  let x = 5
+  let q2 = `10+,x
+  let r2 = eval(q2)
+  print(r2)
+
+  -- Quasiquote with unquote-splice — ,,items 展开 List
+  let items = [1, 2, 3]
+  let q3 = `,,items
+  print(q3)
+
+  -- 纯 quasiquote — 较长静态字符串
+  let q4 = `hello world
+  print(q4)
+
+  -- 括号深度测试
+  let q5 = `(10+20)
+  let r5 = eval(q5)
+  print(r5)
+end

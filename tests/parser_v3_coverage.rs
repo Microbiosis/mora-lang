@@ -9,7 +9,7 @@
 fn parse_v3(source: &str) -> Vec<mora::mir::expr::MirExpr> {
     let mut lexer = mora::lexer::Lexer::new(source);
     let tokens = lexer.scan_tokens();
-    let parser = mora::parser_v3::ParserV3::new(tokens);
+    let parser = mora::parser_v3::ParserV3::new(tokens, source);
     parser.parse().expect("Parser V3 should succeed")
 }
 
@@ -25,7 +25,6 @@ fn find_kind<'a>(
 // ─── DynTrait ────────────────────────────────────────────────────────
 
 #[test]
-#[ignore = "requires parser_v3 dyntrait/prompt grammar support"]
 fn dyntrait_expr_as_dyn_trait_parses() {
     let exprs = parse_v3("x as dyn Any");
     let kind = find_kind(
@@ -43,7 +42,6 @@ fn dyntrait_expr_as_dyn_trait_parses() {
 }
 
 #[test]
-#[ignore = "requires parser_v3 dyntrait grammar"]
 fn dyntrait_expr_as_dyn_trait_with_generics_parses() {
     let exprs = parse_v3("x as dyn Any");
     let kind = find_kind(
@@ -61,7 +59,6 @@ fn dyntrait_expr_as_dyn_trait_with_generics_parses() {
 }
 
 #[test]
-#[ignore = "requires parser_v3 dyntrait grammar"]
 fn dyntrait_nested_in_let_binding() {
     let exprs = parse_v3("let obj = 42 as dyn Any");
     assert!(!exprs.is_empty());
@@ -70,7 +67,6 @@ fn dyntrait_nested_in_let_binding() {
 // ─── Prompt 模板字符串 ───────────────────────────────────────────────
 
 #[test]
-#[ignore = "requires parser_v3 prompt grammar"]
 fn prompt_literal_without_interpolation_parses() {
     let exprs = parse_v3("p\"hello world\"");
     assert!(
@@ -84,7 +80,6 @@ fn prompt_literal_without_interpolation_parses() {
 }
 
 #[test]
-#[ignore = "requires parser_v3 prompt grammar"]
 fn prompt_with_single_interpolation_parses() {
     let exprs = parse_v3("p\"hello {name}\"");
     let kind = find_kind(
@@ -95,8 +90,7 @@ fn prompt_with_single_interpolation_parses() {
 }
 
 #[test]
-#[ignore = "requires parser_v3 prompt grammar"]
-fn prompt_with_multiple_interpolations_parses() {
+fn prompt_with_multiple_interpolation_parses() {
     let exprs = parse_v3("p\"{a} + {b}\"");
     let kind = find_kind(
         &exprs,
@@ -180,11 +174,68 @@ fn method_call_chained_parses() {
 }
 
 #[test]
-#[ignore = "requires parser_v3 dyntrait grammar"]
 fn dyntrait_then_method_call_parses() {
     let exprs = parse_v3("(x as dyn Any).method()");
     assert!(
         !exprs.is_empty(),
         "dyn trait cast then method call should parse"
     );
+}
+
+// ─── Union type annotation (v0.85) ───────────────────────────────────
+// §3.4: `let x: string | number = ...` — parser accepts pipe-separated union types.
+// The legacy parse() path returns MirExpr::LetBinding with type_hint = Type::Union(...).
+
+#[test]
+fn union_type_two_members_parses() {
+    use mora::mir::expr::MirExprKind;
+    use mora::typeck::Type;
+    let exprs = parse_v3("let x: string | number = 42");
+    assert!(
+        !exprs.is_empty(),
+        "union type annotation should parse"
+    );
+    if let Some(MirExprKind::LetBinding { type_hint, .. }) = exprs.first().map(|e| &e.kind) {
+        assert!(
+            matches!(type_hint, Some(Type::Union(m)) if m.len() == 2),
+            "expected Type::Union with 2 members, got {:?}",
+            type_hint
+        );
+    } else {
+        panic!("expected LetBinding, got {:?}", exprs.first().map(|e| &e.kind));
+    }
+}
+
+#[test]
+fn union_type_three_members_parses() {
+    use mora::mir::expr::MirExprKind;
+    use mora::typeck::Type;
+    let exprs = parse_v3("let x: string | number | bool = true");
+    assert!(
+        !exprs.is_empty(),
+        "union type annotation with 3 members should parse"
+    );
+    if let Some(MirExprKind::LetBinding { type_hint, .. }) = exprs.first().map(|e| &e.kind) {
+        assert!(
+            matches!(type_hint, Some(Type::Union(m)) if m.len() == 3),
+            "expected Type::Union with 3 members, got {:?}",
+            type_hint
+        );
+    } else {
+        panic!("expected LetBinding, got {:?}", exprs.first().map(|e| &e.kind));
+    }
+}
+
+#[test]
+fn union_type_single_member_parses_as_plain_type() {
+    use mora::mir::expr::MirExprKind;
+    use mora::typeck::Type;
+    // A "union" with one member is just a plain type (no Union wrapper).
+    let exprs = parse_v3("let x: int = 42");
+    if let Some(MirExprKind::LetBinding { type_hint, .. }) = exprs.first().map(|e| &e.kind) {
+        assert!(
+            matches!(type_hint, Some(Type::Int)),
+            "single-member union should be a plain Type::Int, not Type::Union",
+        );
+    }
 }

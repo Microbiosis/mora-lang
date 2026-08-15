@@ -79,21 +79,16 @@ impl<V: Clone> LruCache<V> {
 /// v0.52 ADR-001: pub 让 CoreRuntime (runtime/core.rs) 可引用
 /// v0.75.x: 下沉到 runtime/types.rs，字段 pub(crate) 供 interpreter 子模块构造/读取
 #[derive(Clone, Debug, Default)]
-#[allow(dead_code)]
 pub struct AiConfigValue {
     pub(crate) model: Option<String>,
     pub(crate) temperature: Option<f64>,
     pub(crate) max_tokens: Option<usize>,
-    pub(crate) budget: Option<usize>,
-    pub(crate) per_call: Option<usize>,
     pub(crate) system: Option<String>,
     /// v0.15: mock 响应队列 (with mock_llm = ["resp1", "resp2"])
     pub(crate) mock_responses: Option<Vec<String>>,
     /// v0.24: 投机执行配置
     pub(crate) speculative: Option<bool>,
     pub(crate) draft_model: Option<String>,
-    /// v0.54: tool 绑定 — with tools: ["read_file", "run_cmd"]
-    pub(crate) tool_names: Option<Vec<String>>,
 }
 
 /// Token 预算配置
@@ -127,12 +122,6 @@ pub struct RouteConfig {
     pub(crate) system: Option<String>,
     /// 温度覆盖（v0.15 接入 real_ai_chat_with_tools）
     pub(crate) temperature: Option<f64>,
-    /// v0.24: 路由优先级 (越小越优先)
-    #[allow(dead_code)] // 未来扩展用
-    pub(crate) priority: u32,
-    /// v0.24: 路由健康状态
-    #[allow(dead_code)] // 未来扩展用
-    pub(crate) healthy: bool,
 }
 
 /// 工具定义（注册时存储）
@@ -144,55 +133,10 @@ pub struct ToolDef {
     pub handler: Value,     // Closure
 }
 
-/// v0.08: trait 注册条目
-/// v0.08.4: 加 parents 字段实现 trait 继承
-#[derive(Clone, Debug)]
-pub struct TraitInfo {
-    pub name: String,
-    pub parents: Vec<String>,
-    pub methods: Vec<TraitMethodSig>,
-}
-
-/// v0.08: trait 方法签名
-/// v0.08.5 任务 1: 加 has_self 字段——trait method 第一个参数是 self 时为 true，
-/// 否则为 false（self-less 方法）。self-less 调度时不传 receiver。
-#[derive(Clone, Debug)]
-pub struct TraitMethodSig {
-    pub name: String,
-    pub params: Vec<(String, Option<String>)>,
-    pub return_type: Option<String>,
-    /// 第一个参数是否为 `self`（决定 dispatch 时是否传 receiver.clone()）
-    pub has_self: bool,
-}
-
-/// v0.09: 注册 impl method 时用的 key（含泛型签名）
-/// 格式: __impl_<Trait>_<TraitGen>_<ForType>_<ForGen>_<method>
-///   TraitGen / ForGen 用类型名（如 "Number" / "String"），简化版（v0.09 不含 typeck 类型）
-///
-/// 重要: 同一 trait 不同实例化产生不同 key，避免冲突
-///   Container<number> vs Container<string> → 不同 key
-pub(crate) fn impl_method_key(
-    trait_name: &str,
-    trait_generics: &[String], // v0.09 新增：trait 实例化的泛型
-    for_type: &str,
-    for_generics: &[String], // v0.09 新增：for_type 的泛型
-    method: &str,
-) -> String {
-    let tg = trait_generics.join(",");
-    let fg = for_generics.join(",");
-    format!(
-        "__impl_{}_{}_{}_{}_{}",
-        trait_name, tg, for_type, fg, method
-    )
-}
-
-/// v0.09: 默认实现的 key（self 类型 = trait 名）
-/// 格式: __impl_<Trait>_<TraitGen>_<method>
-pub(crate) fn default_impl_method_key(
-    trait_name: &str,
-    trait_generics: &[String], // v0.09 新增
-    method: &str,
-) -> String {
-    let tg = trait_generics.join(",");
-    format!("__impl_{}_{}_{}", trait_name, tg, method)
-}
+/// v0.84 Phase 5: TraitInfo / TraitMethodSig / impl_method_key /
+/// default_impl_method_key 已下沉到 `common/trait_info.rs`，避免 `mir/` →
+/// `runtime/` 的架构耦合。此处 re-export 保持旧路径兼容（现有代码用
+/// `crate::runtime::types::TraitInfo` 等不变），实际类型定义在 common/ 层。
+pub use crate::common::trait_info::{
+    default_impl_method_key, impl_method_key, TraitInfo, TraitMethodSig,
+};

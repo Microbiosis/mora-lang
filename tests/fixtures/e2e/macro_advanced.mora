@@ -1,0 +1,24 @@
+-- v0.86: macro 高级特性 E2E 测试
+-- 覆盖：多参数宏、宏嵌套调用、宏链式组合、递归宏
+macro add(a, b)
+  a + b
+end
+macro mul(a, b)
+  a * b
+end
+macro square(x)
+  mul(x, x)
+end
+macro cube(x)
+  mul(x, square(x))
+end
+macro factorial(n)
+  if n == 1i { 1i } else { mul(n, factorial(n - 1i)) }
+end
+let s4 = square(6i)
+let c3 = cube(3i)
+let f5 = factorial(5i)
+print("square(6)=" + s4)
+print("cube(3)=" + c3)
+print("factorial(5)=" + f5)
+f5

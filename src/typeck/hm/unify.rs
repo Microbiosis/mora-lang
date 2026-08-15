@@ -60,6 +60,12 @@ impl Substitution {
             crate::typeck::Type::ForAll(vars, inner) => {
                 crate::typeck::Type::ForAll(vars.clone(), Box::new(self.apply(inner)))
             }
+            // v0.80: Arrow — 递归替换 input/output，effect row 走 apply_row。
+            crate::typeck::Type::Arrow(input, output, row) => crate::typeck::Type::Arrow(
+                Box::new(self.apply(input)),
+                Box::new(self.apply(output)),
+                crate::typeck::hm::row::apply_row(row, self),
+            ),
             _ => ty.clone(),
         }
     }
@@ -113,6 +119,9 @@ pub enum Constraint {
 
     /// Both types must be numeric (Int or Float) - for arithmetic operations
     Numeric(BinaryConstraint),
+
+    /// v0.80: Two effect rows must unify (row-polymorphic unification).
+    RowEq(crate::mir::effect::EffectRow, crate::mir::effect::EffectRow),
 }
 
 ///  Arithmetic binary operator constraint: both operands must be compatible numeric types
@@ -132,6 +141,7 @@ impl std::fmt::Display for Constraint {
                 format_type(&bc.left),
                 format_type(&bc.right)
             ),
+            Constraint::RowEq(r1, r2) => write!(f, "({} ~ {})", r1, r2),
         }
     }
 }
@@ -149,6 +159,11 @@ pub fn solve(constraint: &Constraint, subst: &Substitution) -> Result<Substituti
             // For now, treat numeric constraints as satisfied if both types resolve to Int or Float
             // TODO: Add proper numeric type checking with subtyping rules
             Ok(subst.clone())
+        }
+        Constraint::RowEq(r1, r2) => {
+            let mut new_subst = subst.clone();
+            crate::typeck::hm::row::unify_row(r1, r2, &mut new_subst)?;
+            Ok(new_subst)
         }
     }
 }
@@ -228,6 +243,15 @@ fn unify(
             unify(err1, err2, &s1)
         }
 
+        // v0.80: Arrow — 函数类型合一：input/output 递归，effect row 走 unify_row。
+        (crate::typeck::Type::Arrow(i1, o1, r1), crate::typeck::Type::Arrow(i2, o2, r2)) => {
+            let s1 = unify(i1, i2, subst)?;
+            let s2 = unify(o1, o2, &s1)?;
+            let mut s3 = s2.clone();
+            crate::typeck::hm::row::unify_row(r1, r2, &mut s3)?;
+            Ok(s3)
+        }
+
         // v0.75.16: Union 合一 — 任一成员与另一侧匹配即通过（dict.get 返回
         // Union<V, Nil>；`d.get("k") == x` 需允许 x 与 V 或 Nil 之一合一）。
         // 防膨胀：成员为空或含 Any 时直接视为 Any（退化成功）。
@@ -282,6 +306,11 @@ fn contains_typevar(ty: &crate::typeck::Type, var: char) -> bool {
         // v0.75.17: ForAll 内层递归（量化变量与活跃 TypeVar 命名空间隔离，
         // 递归可查内层嵌套的自由变量）。
         crate::typeck::Type::ForAll(_, inner) => contains_typevar(inner, var),
+        // v0.80: Arrow — 递归检查 input/output（effect row 的 Var 是 String
+        // 命名空间，与 TypeVar(char) 不同，不参与 occurs check）。
+        crate::typeck::Type::Arrow(input, output, _) => {
+            contains_typevar(input, var) || contains_typevar(output, var)
+        }
         _ => false,
     }
 }
@@ -513,6 +542,103 @@ mod tests {
                 a, b
             );
         }
+    }
+
+    // ─── v0.80: Arrow unification tests ───
+
+    #[test]
+    fn unify_arrow_same_type() {
+        let subst = Substitution::new();
+        let arrow = Type::Arrow(
+            Box::new(Type::Int),
+            Box::new(Type::String),
+            crate::mir::effect::EffectRow::Empty,
+        );
+        let result = unify(&arrow, &arrow, &subst);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn unify_arrow_binds_type_vars() {
+        let subst = Substitution::new();
+        let a = Type::Arrow(
+            Box::new(Type::TypeVar('a')),
+            Box::new(Type::TypeVar('b')),
+            crate::mir::effect::EffectRow::Empty,
+        );
+        let b = Type::Arrow(
+            Box::new(Type::Int),
+            Box::new(Type::String),
+            crate::mir::effect::EffectRow::Empty,
+        );
+        let result = unify(&a, &b, &subst).unwrap();
+        assert_eq!(result.mapping.get(&'a'), Some(&Type::Int));
+        assert_eq!(result.mapping.get(&'b'), Some(&Type::String));
+    }
+
+    #[test]
+    fn unify_arrow_mismatch_fails() {
+        let subst = Substitution::new();
+        let a = Type::Arrow(
+            Box::new(Type::Int),
+            Box::new(Type::String),
+            crate::mir::effect::EffectRow::Empty,
+        );
+        let b = Type::Arrow(
+            Box::new(Type::String),
+            Box::new(Type::String),
+            crate::mir::effect::EffectRow::Empty,
+        );
+        let result = unify(&a, &b, &subst);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn unify_arrow_effect_row_unifies() {
+        let subst = Substitution::new();
+        let row_a = crate::mir::effect::EffectRow::Cons(
+            "Ai".to_string(),
+            Box::new(crate::mir::effect::EffectRow::Empty),
+        );
+        let row_b = crate::mir::effect::EffectRow::Cons(
+            "Ai".to_string(),
+            Box::new(crate::mir::effect::EffectRow::Empty),
+        );
+        let a = Type::Arrow(Box::new(Type::Int), Box::new(Type::Int), row_a);
+        let b = Type::Arrow(Box::new(Type::Int), Box::new(Type::Int), row_b);
+        let result = unify(&a, &b, &subst);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn unify_arrow_different_effect_row_fails() {
+        let subst = Substitution::new();
+        let row_a = crate::mir::effect::EffectRow::Cons(
+            "Ai".to_string(),
+            Box::new(crate::mir::effect::EffectRow::Empty),
+        );
+        let row_b = crate::mir::effect::EffectRow::Cons(
+            "Fs".to_string(),
+            Box::new(crate::mir::effect::EffectRow::Empty),
+        );
+        let a = Type::Arrow(Box::new(Type::Int), Box::new(Type::Int), row_a);
+        let b = Type::Arrow(Box::new(Type::Int), Box::new(Type::Int), row_b);
+        let result = unify(&a, &b, &subst);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn unify_arrow_row_var_binds() {
+        let subst = Substitution::new();
+        let row_var = crate::mir::effect::EffectRow::Var("e".to_string());
+        let row_concrete = crate::mir::effect::EffectRow::Cons(
+            "Ai".to_string(),
+            Box::new(crate::mir::effect::EffectRow::Empty),
+        );
+        let a = Type::Arrow(Box::new(Type::Int), Box::new(Type::Int), row_var);
+        let b = Type::Arrow(Box::new(Type::Int), Box::new(Type::Int), row_concrete);
+        let result = unify(&a, &b, &subst);
+        assert!(result.is_ok());
     }
 
     // ─── v0.75.86: HMInference::diagnosed 双向 fallback 抑制 ───

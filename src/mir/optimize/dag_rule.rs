@@ -371,13 +371,14 @@ fn nodes_equivalent(
 }
 
 /// Check if two instructions are in the same "category" for CSE purposes.
+/// v0.87: Call 和 MethodCall 不在此列表中 — 它们不是可证明纯的（gensym/print/eval 等
+/// 都有副作用），对同名零参数调用做 CSE 会把多次调用合并为一次（v0.87 gensym 全部
+/// 返回 g0 的根因）。is_memoizable_pure 在 vm/dag.rs 有相同的保守白名单策略。
 fn same_inst_category(a: &MirInst, b: &MirInst) -> bool {
     use crate::mir::MirInst;
     match (a, b) {
         (MirInst::Const(_, v1), MirInst::Const(_, v2)) => v1 == v2,
         (MirInst::BinaryOp(_, _, op1, _), MirInst::BinaryOp(_, _, op2, _)) => op1 == op2,
-        (MirInst::Call(_, n1, _), MirInst::Call(_, n2, _)) => n1 == n2,
-        (MirInst::MethodCall(_, _, m1, _), MirInst::MethodCall(_, _, m2, _)) => m1 == m2,
         (MirInst::ListLit(_, _), MirInst::ListLit(_, _)) => true,
         (MirInst::DictLit(_, _), MirInst::DictLit(_, _)) => true,
         (MirInst::Prompt(_, _), MirInst::Prompt(_, _)) => true,

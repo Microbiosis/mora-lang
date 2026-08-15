@@ -1,0 +1,9 @@
+app Counter
+  model: Counter
+  msg: CounterMsg
+  init: 0
+  update: fn(m, msg) => m
+  view: fn(m) => m.count
+end
+
+0

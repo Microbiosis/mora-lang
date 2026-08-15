@@ -58,6 +58,9 @@ pub struct HMInference {
     /// Stack of in-scope closure names introduced by FnDef so that a
     /// recursive function can refer to itself.
     pub fn_scope: Vec<String>,
+    /// v0.80: row-polymorphic fresh var generator (algebraic effects
+    /// EffectRow::Var namer; namespace independent from TypeVar(char)).
+    pub fresh_vars: row::FreshVars,
     // v0.75.94: 移除 `diagnosed: HashSet<WitnessNodeId>` 字段 + 3 个方法
     // (`mark_diagnosed` / `is_diagnosed` / `is_diagnosed_at`) —— 抽离到
     // `crate::typeck::hm::diag::DiagFilter`（双向定型专用基础设施）。
@@ -83,6 +86,12 @@ impl HMInference {
     /// Mint a fresh `Type::TypeVar`.
     pub fn fresh_type_var(&mut self) -> Type {
         Type::TypeVar(self.fresh_type_var_id())
+    }
+
+    /// v0.80: Mint a fresh `EffectRow::Var` for row-polymorphic unification.
+    /// Each call produces a distinct row variable name (rho0, rho1, ...).
+    pub fn fresh_row_var(&mut self) -> crate::mir::effect::EffectRow {
+        crate::mir::effect::EffectRow::Var(self.fresh_vars.row_var(""))
     }
 
     /// Record a fresh closure signature and return the type variable
@@ -112,36 +121,15 @@ impl HMInference {
 
     /// v0.75.17: 展开 env 中命中的 ForAll（标准 HM let-polymorphism 展开）。
     ///
-    /// 特殊处理 closure 身份变量：被量化的身份变量映射到 fresh 变量，且其
-    /// closure_sigs 侧表签名随之复制一份、内部 TypeVar 全部重命名 — 这样
-    /// `let f = fn(x) x; f(1); f("s")` 每次调用得到一份独立的单形化副本，
-    /// 而不是共享同一组约束导致 Int/String 冲突。
+    /// v0.80: 移除 closure 身份复制逻辑（ClosureSig 侧表已删除，Arrow 是
+    /// 自包含类型）。remap 改为 &mut HashMap — 首次遇到量化变量时 mint fresh
+    /// 并插入 remap；后续遇到同一变量时从 remap 取值，保证 param/return 一致。
     pub fn instantiate_type(&mut self, ty: &Type) -> Type {
         match ty {
             Type::ForAll(vars, inner) => {
                 let quantified: HashSet<char> = vars.iter().cloned().collect();
-                // 被量化的 closure 身份变量 → fresh 身份变量（sig 同步复制）
                 let mut remap: HashMap<char, char> = HashMap::new();
-                for v in vars {
-                    if let Some(sig) = self.closure_sigs.get(v).cloned() {
-                        let fresh = self.fresh_type_var_id();
-                        // 先重命名签名内部变量（每次实例化一份 fresh 副本 →
-                        // 单形化，两次调用互不冲突），再登记进侧表。
-                        let params: Vec<Type> =
-                            sig.params.iter().map(|p| self.rename_ty(p)).collect();
-                        let return_type = self.rename_ty(&sig.return_type);
-                        self.closure_sigs.insert(
-                            fresh,
-                            ClosureSig {
-                                arity: sig.arity,
-                                params,
-                                return_type,
-                            },
-                        );
-                        remap.insert(*v, fresh);
-                    }
-                }
-                self.instantiate_ty(inner, &quantified, &remap)
+                self.instantiate_ty(inner, &quantified, &mut remap)
             }
             _ => ty.clone(),
         }
@@ -164,6 +152,9 @@ impl HMInference {
     }
 
     /// 递归替换类型中出现的所有 TypeVar（每次实例化一份独立副本）。
+    /// v0.80: 当前仅被 instantiate_ty 的 Arrow 分支间接使用（通过
+    /// rename_row），ClosureSig 删除后暂无直接调用点。
+    #[allow(dead_code)]
     pub(super) fn rename_ty(&mut self, ty: &Type) -> Type {
         match ty {
             Type::TypeVar(_) => Type::TypeVar(self.fresh_type_var_id()),
@@ -178,25 +169,39 @@ impl HMInference {
                 Type::Union(members.iter().map(|m| self.rename_ty(m)).collect())
             }
             Type::ForAll(vs, inner) => Type::ForAll(vs.clone(), Box::new(self.rename_ty(inner))),
+            // v0.80: Arrow — 递归重命名 input/output，effect row 走 rename_row。
+            Type::Arrow(input, output, row) => Type::Arrow(
+                Box::new(self.rename_ty(input)),
+                Box::new(self.rename_ty(output)),
+                crate::typeck::hm::row::rename_row(row, &mut self.fresh_vars),
+            ),
             _ => ty.clone(),
         }
     }
 
     /// 把 ForAll 内层 τ 中被量化的 TypeVar 替换为 fresh 变量（未量化的保留）。
+    ///
+    /// v0.80: remap 从 &HashMap 改为 &mut HashMap — 修复「同一量化变量出现
+    /// 多次时拿到不同 fresh var」的 bug。首次遇到量化变量时 mint fresh 并插入
+    /// remap；后续遇到同一变量时从 remap 取值，保证 param/return 一致性。
     pub(super) fn instantiate_ty(
         &mut self,
         ty: &Type,
         quantified: &HashSet<char>,
-        remap: &HashMap<char, char>,
+        remap: &mut HashMap<char, char>,
     ) -> Type {
         match ty {
             Type::TypeVar(c) => {
                 if quantified.contains(c) {
                     match remap.get(c) {
-                        // 被量化的 closure 身份变量 → 已复制的 fresh 身份
+                        // 已映射的量化变量 → 复用 fresh 身份
                         Some(fresh) => Type::TypeVar(*fresh),
-                        // 普通量化变量 → 全新 fresh（每次使用单形化）
-                        None => Type::TypeVar(self.fresh_type_var_id()),
+                        // 首次遇到 → mint fresh 并记录映射
+                        None => {
+                            let fresh = self.fresh_type_var_id();
+                            remap.insert(*c, fresh);
+                            Type::TypeVar(fresh)
+                        }
                     }
                 } else {
                     Type::TypeVar(*c)
@@ -230,6 +235,12 @@ impl HMInference {
                     Box::new(self.instantiate_ty(inner, &active, remap)),
                 )
             }
+            // v0.80: Arrow — 递归实例化 input/output，effect row 走 rename_row。
+            Type::Arrow(input, output, row) => Type::Arrow(
+                Box::new(self.instantiate_ty(input, quantified, remap)),
+                Box::new(self.instantiate_ty(output, quantified, remap)),
+                crate::typeck::hm::row::rename_row(row, &mut self.fresh_vars),
+            ),
             _ => ty.clone(),
         }
     }
@@ -276,10 +287,20 @@ impl HMInference {
         errors
     }
 
-    pub fn infer_expr(&mut self, expr: &MirWitness) -> Result<Type, Vec<TypeError>> {
+    /// v0.80: 推断表达式类型 + effect row。
+    ///
+    /// 每个表达式产生 `(Type, EffectRow)` — 类型 + 该表达式可能产生的
+    /// side effect 集合。EffectRow::Empty 表示纯表达式。
+    pub fn infer_expr(
+        &mut self,
+        expr: &MirWitness,
+    ) -> Result<(Type, crate::mir::effect::EffectRow), Vec<TypeError>> {
         match &expr.kind {
-            WitnessKind::Literal(lit) => Ok(infer_lit(lit)),
-            WitnessKind::Variable(name) => self.infer_var(name, expr.span),
+            WitnessKind::Literal(lit) => Ok((infer_lit(lit), crate::mir::effect::EffectRow::Empty)),
+            WitnessKind::Variable(name) => {
+                let ty = self.infer_var(name, expr.span)?;
+                Ok((ty, crate::mir::effect::EffectRow::Empty))
+            }
             WitnessKind::Binary { left, op, right } => {
                 self.infer_binop(op, left.as_ref(), right.as_ref(), expr.span)
             }
@@ -308,10 +329,12 @@ impl HMInference {
                 self.infer_expr(expr)
             }
             WitnessKind::Prompt { parts } => {
+                let mut row = crate::mir::effect::EffectRow::Empty;
                 for p in parts {
-                    let _ = self.infer_expr(p)?;
+                    let (_, r) = self.infer_expr(p)?;
+                    row = self.merge_rows(row, r);
                 }
-                Ok(Type::String)
+                Ok((Type::String, row))
             }
             WitnessKind::LetBinding {
                 name,
@@ -337,24 +360,20 @@ impl HMInference {
                 //（测试走 run_mir 绕过 typeck 未暴露）。
                 self.env.add(input_var.clone(), Type::Unknown);
                 self.env.add(result_var.clone(), Type::Unknown);
-                Ok(Type::Nil)
+                Ok((Type::Nil, crate::mir::effect::EffectRow::Empty))
             }
             WitnessKind::Loop { .. } => {
                 // v0.55: Loop lowering produces nil at the MIR level.
-                Ok(Type::Nil)
+                Ok((Type::Nil, crate::mir::effect::EffectRow::Empty))
             }
             WitnessKind::While { .. } => {
                 // v0.55: While lowering produces nil at the MIR level.
-                Ok(Type::Nil)
+                Ok((Type::Nil, crate::mir::effect::EffectRow::Empty))
             }
             WitnessKind::Or { left, right } | WitnessKind::And { left, right } => {
-                let left_ty = self.infer_expr(left)?;
-                let right_ty = self.infer_expr(right)?;
-                let _op_name = if matches!(expr.kind, WitnessKind::Or { .. }) {
-                    "or"
-                } else {
-                    "and"
-                };
+                let (left_ty, left_row) = self.infer_expr(left)?;
+                let (right_ty, right_row) = self.infer_expr(right)?;
+                let merged = self.merge_rows(left_row, right_row);
                 if !matches!(left_ty, Type::Bool) {
                     return Err(vec![TypeError::UnificationFailure {
                         expected: "bool".to_string(),
@@ -369,21 +388,190 @@ impl HMInference {
                         span: Some(expr.span),
                     }]);
                 }
-                Ok(Type::Bool)
+                Ok((Type::Bool, merged))
             }
             WitnessKind::Return(_) | WitnessKind::Break(_) | WitnessKind::Continue(_) => {
-                Ok(Type::Nil)
+                Ok((Type::Nil, crate::mir::effect::EffectRow::Empty))
             }
-            WitnessKind::IndexAssign { .. } => Ok(Type::Nil),
+            WitnessKind::IndexAssign { .. } => {
+                Ok((Type::Nil, crate::mir::effect::EffectRow::Empty))
+            }
             // v0.55: top-level declarations — no scalar result type.
             WitnessKind::TypeAlias { .. }
             | WitnessKind::EnumDef { .. }
             | WitnessKind::StructDef { .. }
             | WitnessKind::Import(_)
             | WitnessKind::MacroDef { .. }
-            | WitnessKind::Sequence { .. }
-            | WitnessKind::Perform { .. }
-            | WitnessKind::Handle { .. } => Ok(Type::Nil),
+            | WitnessKind::UpdateDef { .. }
+            | WitnessKind::AppDef { .. } => {
+                Ok((Type::Nil, crate::mir::effect::EffectRow::Empty))
+            }
+            // v0.84: Sequence 推断 — 依次推断子表达式，合并 effect row，
+            // 返回最后一个表达式的类型（do-notation 语义）。空 Sequence → Nil。
+            WitnessKind::Sequence(exprs) => self.infer_sequence(exprs, expr.span),
+            // v0.85: with 块 — 推断 bindings（声明/丢弃），body 的 effect row
+            // 直接传播（配置桥接不产生 effect，但 body 可能产生）。
+            WitnessKind::WithConfig { bindings, body } => {
+                let mut row = crate::mir::effect::EffectRow::Empty;
+                for (_, v) in bindings {
+                    let (_, r) = self.infer_expr(v)?;
+                    row = self.merge_rows(row, r);
+                }
+                let (body_ty, body_row) = self.infer_expr(body)?;
+                let merged = self.merge_rows(row, body_row);
+                Ok((body_ty, merged))
+            }
+            // v0.83: TEA definitions — 注册 Type 到 env（typeck 路径可查）
+            WitnessKind::ModelDef { name, fields } => {
+                use crate::typeck::Type;
+                let ty = Type::TeaModel {
+                    name: name.clone(),
+                    fields: fields
+                        .iter()
+                        .map(|(n, t)| (n.clone(), Box::new(t.clone().into_type())))
+                        .collect(),
+                };
+                self.env.add(name.clone(), ty);
+                Ok((Type::Nil, crate::mir::effect::EffectRow::Empty))
+            }
+            WitnessKind::MsgDef { name, variants } => {
+                use crate::typeck::Type;
+                let ty = Type::TeaMsg {
+                    name: name.clone(),
+                    variants: variants
+                        .iter()
+                        .map(|v| {
+                            let payload = v.payload_type.as_ref().map(|t| {
+                                Box::new(Type::Concrete {
+                                    name: t.clone(),
+                                    generics: vec![],
+                                    traits: vec![],
+                                })
+                            });
+                            (v.name.clone(), payload)
+                        })
+                        .collect(),
+                };
+                self.env.add(name.clone(), ty);
+                Ok((Type::Nil, crate::mir::effect::EffectRow::Empty))
+            }
+            // v0.80: Perform — 产生 effect，返回 fresh type var（由 handler 决定具体类型）。
+            WitnessKind::Perform { effect, args } => {
+                self.infer_perform(effect, args, expr.span)
+            }
+            // v0.80: Handle — 捕获 effect，body 的 effect row 中移除被捕获的 effect。
+            WitnessKind::Handle {
+                effect,
+                body,
+                handler,
+                ..
+            } => self.infer_handle(effect, body.as_ref(), handler.as_ref(), expr.span),
+            // v0.88: Quasiquote — 与 quote 对称，返回 String 类型（源码字符串）。
+            // 推断各子表达式（Unquote/UnquoteSplice），合并 effect row；
+            // Quote 段为静态常量不产生 effect。
+            WitnessKind::Quasiquote { segments } => {
+                let mut row = crate::mir::effect::EffectRow::Empty;
+                for seg in segments {
+                    let (_, r) = self.infer_expr(seg)?;
+                    row = self.merge_rows(row, r);
+                }
+                Ok((Type::String, row))
+            }
+        }
+    }
+
+    /// v0.80: 合并两个 effect row（用于二元运算、if 分支等）。
+    ///
+    /// 规则：
+    /// - Empty + x = x（恒等元）
+    /// - Cons(h, t) + x = Cons(h, merge(t, x))（若 h 不在 x 中）
+    /// - Var(v) + x = x + Constraint::RowEq(Var(v), x)（推迟到 solve 阶段）
+    pub(crate) fn merge_rows(
+        &mut self,
+        a: crate::mir::effect::EffectRow,
+        b: crate::mir::effect::EffectRow,
+    ) -> crate::mir::effect::EffectRow {
+        use crate::mir::effect::EffectRow;
+        match (a, b) {
+            (EffectRow::Empty, b) => b,
+            (a, EffectRow::Empty) => a,
+            (EffectRow::Cons(h, t), b) => {
+                if row_contains_concrete(&b, &h) {
+                    self.merge_rows(*t, b)
+                } else {
+                    EffectRow::Cons(h, Box::new(self.merge_rows(*t, b)))
+                }
+            }
+            (EffectRow::Var(v), b) => {
+                self.constraints.push(Constraint::RowEq(
+                    EffectRow::Var(v),
+                    b.clone(),
+                ));
+                b
+            }
+        }
+    }
+
+    /// v0.80: Perform 推断 — 产生 effect，返回 fresh type var。
+    fn infer_perform(
+        &mut self,
+        effect: &str,
+        args: &[MirWitness],
+        _span: Span,
+    ) -> Result<(Type, crate::mir::effect::EffectRow), Vec<TypeError>> {
+        let mut arg_rows = crate::mir::effect::EffectRow::Empty;
+        for arg in args {
+            let (_, row) = self.infer_expr(arg)?;
+            arg_rows = self.merge_rows(arg_rows, row);
+        }
+        let result_ty = self.fresh_type_var();
+        let perform_row = crate::mir::effect::EffectRow::Cons(
+            effect.to_string(),
+            Box::new(crate::mir::effect::EffectRow::Empty),
+        );
+        Ok((result_ty, self.merge_rows(arg_rows, perform_row)))
+    }
+
+    /// v0.80: Handle 推断 — 捕获 effect，body 的 effect row 中移除被捕获的 effect。
+    ///
+    /// handler 体内的 `__arg0`, `__arg1`, ... 是 perform 传参的运行时约定
+    /// （见 `src/runtime/effect.rs`）。类型检查时在 handler 作用域内注册
+    /// 这些变量为 fresh type var，让 handler body 的引用通过 typeck。
+    fn infer_handle(
+        &mut self,
+        effect: &str,
+        body: &MirWitness,
+        handler: &MirWitness,
+        _span: Span,
+    ) -> Result<(Type, crate::mir::effect::EffectRow), Vec<TypeError>> {
+        let (body_ty, body_row) = self.infer_expr(body)?;
+        let residual = self.fresh_row_var();
+        let expected_row = crate::mir::effect::EffectRow::Cons(
+            effect.to_string(),
+            Box::new(residual.clone()),
+        );
+        self.constraints.push(Constraint::RowEq(body_row, expected_row));
+        // v0.80: 注册 handler 参数（__arg0, __arg1, ...）到 env
+        // handler 是 `{ expr }` 形式，其 body 引用 __arg0 等
+        let saved_env = self.env.clone();
+        // 注册 __arg0 为 Any（perform 参数类型在运行时确定，typeck 阶段
+        // 无法静态连接 perform 的 arg 类型到 handler 的 __arg0 —— 需要
+        // effect signature 声明才能精确化，当前用 Any 兜底）。
+        self.env.add("__arg0".to_string(), Type::Any);
+        let (_handler_ty, handler_row) = self.infer_expr(handler)?;
+        self.env = saved_env;
+        Ok((body_ty, self.merge_rows(residual, handler_row)))
+    }
+}
+
+/// v0.80: 检查 effect row 是否包含具体 label（不对 Var 返回 true，
+/// 与 EffectRow::contains 的多态语义不同）。
+fn row_contains_concrete(row: &crate::mir::effect::EffectRow, label: &str) -> bool {
+    match row {
+        crate::mir::effect::EffectRow::Empty => false,
+        crate::mir::effect::EffectRow::Var(_) => false,
+        crate::mir::effect::EffectRow::Cons(h, t) => {
+            h == label || row_contains_concrete(t, label)
         }
     }
 }
@@ -418,8 +606,9 @@ mod tests {
     #[test]
     pub(super) fn literal_int_infers_to_int() {
         let mut hm = HMInference::new();
-        let ty = hm.infer_expr(&lit_int(7)).unwrap();
+        let (ty, row) = hm.infer_expr(&lit_int(7)).unwrap();
         assert_eq!(ty, Type::Int);
+        assert_eq!(row, crate::mir::effect::EffectRow::Empty);
     }
 
     #[test]
@@ -528,6 +717,160 @@ mod tests {
         };
         let _ = closure_ty; // Just check the compile
         let _ = call;
+    }
+
+    // ─── v0.80: perform/handle inference tests ───
+
+    #[test]
+    fn perform_produces_effect_row() {
+        let mut hm = HMInference::new();
+        let expr = MirWitness {
+            kind: WitnessKind::Perform {
+                effect: "Ai".to_string(),
+                args: vec![],
+            },
+            span: Span::default(),
+        };
+        let (ty, row) = hm.infer_expr(&expr).unwrap();
+        // perform returns a fresh type var (concrete type determined by handler)
+        assert!(matches!(ty, Type::TypeVar(_)));
+        // effect row contains "Ai"
+        assert!(row.contains("Ai"));
+    }
+
+    #[test]
+    fn handle_captures_effect() {
+        let mut hm = HMInference::new();
+        let body = MirWitness {
+            kind: WitnessKind::Perform {
+                effect: "Ai".to_string(),
+                args: vec![],
+            },
+            span: Span::default(),
+        };
+        let handler = MirWitness {
+            kind: WitnessKind::Literal(Literal::String("handled".to_string(), Span::default())),
+            span: Span::default(),
+        };
+        let expr = MirWitness {
+            kind: WitnessKind::Handle {
+                effect: "Ai".to_string(),
+                body: Box::new(body),
+                handler: Box::new(handler),
+                k_param: "k".to_string(),
+            },
+            span: Span::default(),
+        };
+        let (ty, row) = hm.infer_expr(&expr).unwrap();
+        // handle returns body type (fresh var from perform)
+        assert!(matches!(ty, Type::TypeVar(_)));
+        // effect row should NOT contain "Ai" (captured by handler)
+        // The residual row is a fresh var (row-polymorphic)
+        assert!(matches!(row, crate::mir::effect::EffectRow::Var(_)));
+    }
+
+    #[test]
+    fn handle_solves_row_constraint() {
+        let mut hm = HMInference::new();
+        let body = MirWitness {
+            kind: WitnessKind::Perform {
+                effect: "Ai".to_string(),
+                args: vec![],
+            },
+            span: Span::default(),
+        };
+        let handler = MirWitness {
+            kind: WitnessKind::Literal(Literal::String("handled".to_string(), Span::default())),
+            span: Span::default(),
+        };
+        let expr = MirWitness {
+            kind: WitnessKind::Handle {
+                effect: "Ai".to_string(),
+                body: Box::new(body),
+                handler: Box::new(handler),
+                k_param: "k".to_string(),
+            },
+            span: Span::default(),
+        };
+        hm.infer_expr(&expr).unwrap();
+        // solve_constraints should succeed — RowEq(body_row, Cons("Ai", residual))
+        // unifies body_row (Cons("Ai", Empty)) with Cons("Ai", residual),
+        // binding residual to Empty.
+        assert!(
+            hm.solve_constraints().is_ok(),
+            "handle should solve row constraint cleanly"
+        );
+    }
+
+    #[test]
+    fn closure_returns_curried_arrow() {
+        let mut hm = HMInference::new();
+        let param = WitnessParam {
+            name: "x".to_string(),
+            type_hint: Some(crate::mir::hint::TypeHint::from_type(Type::Int)),
+            default: None,
+        };
+        let (ty, row) = hm
+            .infer_closure(
+                &[param],
+                &MirWitness {
+                    kind: WitnessKind::Variable("x".to_string()),
+                    span: Span::default(),
+                },
+                Span::default(),
+            )
+            .unwrap();
+        // Closure type should be Arrow(Int, Int, Empty)
+        assert!(
+            matches!(ty, Type::Arrow(_, _, _)),
+            "closure should return Arrow, got {:?}",
+            ty
+        );
+        // Closure definition is pure
+        assert_eq!(row, crate::mir::effect::EffectRow::Empty);
+    }
+
+    #[test]
+    fn closure_two_params_curried() {
+        let mut hm = HMInference::new();
+        let params = vec![
+            WitnessParam {
+                name: "x".to_string(),
+                type_hint: Some(crate::mir::hint::TypeHint::from_type(Type::Int)),
+                default: None,
+            },
+            WitnessParam {
+                name: "y".to_string(),
+                type_hint: Some(crate::mir::hint::TypeHint::from_type(Type::String)),
+                default: None,
+            },
+        ];
+        let (ty, _row) = hm
+            .infer_closure(
+                &params,
+                &MirWitness {
+                    kind: WitnessKind::Variable("x".to_string()),
+                    span: Span::default(),
+                },
+                Span::default(),
+            )
+            .unwrap();
+        // fn(x: Int, y: String) -> Int 应该是 Arrow(Int, Arrow(String, Int, Empty), Empty)
+        match &ty {
+            Type::Arrow(input, output, row) => {
+                assert_eq!(**input, Type::Int);
+                assert_eq!(*row, crate::mir::effect::EffectRow::Empty);
+                match output.as_ref() {
+                    Type::Arrow(inner_input, inner_output, inner_row) => {
+                        assert_eq!(**inner_input, Type::String);
+                        assert_eq!(**inner_output, Type::Int);
+                        assert_eq!(*inner_row, crate::mir::effect::EffectRow::Empty);
+                    }
+                    other => panic!("expected inner Arrow, got {:?}", other),
+                }
+            }
+            other => panic!("expected Arrow, got {:?}", other),
+        }
     }
 
     // v0.75.97: instantiate_if_forall helper 测试

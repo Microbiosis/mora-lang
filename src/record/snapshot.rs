@@ -149,6 +149,21 @@ fn event_to_summary(ev: &Event) -> EventSummary {
             tokens_out: 0,
             has_error: false,
         },
+        // v0.83: Msg + StateMutation 简化为 summary
+        Event::Msg { channel, .. } => EventSummary {
+            kind: "msg".to_string(),
+            key: channel.clone(),
+            tokens_in: 0,
+            tokens_out: 0,
+            has_error: false,
+        },
+        Event::StateMutation { var, .. } => EventSummary {
+            kind: "state_mutation".to_string(),
+            key: var.clone(),
+            tokens_in: 0,
+            tokens_out: 0,
+            has_error: false,
+        },
     }
 }
 

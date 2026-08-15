@@ -21,7 +21,13 @@ impl std::fmt::Display for Value {
                         f.write_str("-inf")
                     }
                 } else {
-                    write!(f, "{}", n)
+                    // v0.87: 区分 Int/Float — 整数 Float（5.0）显示 "5.0" 而非 "5"，
+                    // 与 Language Display 语义一致；带小数的（3.14）原样输出。
+                    if n.fract() == 0.0 {
+                        write!(f, "{:.1}", n)
+                    } else {
+                        write!(f, "{}", n)
+                    }
                 }
             }
             Value::Bool(b) => write!(f, "{}", b),
@@ -110,6 +116,17 @@ impl std::fmt::Display for Value {
             Value::Macro { name, .. } => {
                 write!(f, "<macro {}>", name)
             }
+            // v0.86: Curry — 显示为可调用值，包含已绑定参数数量。
+            Value::Curry { arity, bound_args, .. } => {
+                write!(f, "<curry arity={} bound={}>", arity, bound_args.len())
+            }
+            // v0.86: Cons — 显示为 Lisp 风格的 (car . cdr)。
+            Value::Cons { car, cdr } => match cdr.as_ref() {
+                Value::Nil => write!(f, "({})", car),
+                _ => write!(f, "({} . {})", car, cdr),
+            },
+            // v0.86: Code — 显示为 "code:source_text"，与 eval/quote 配对可读。
+            Value::Code(s) => write!(f, "code:{s}"),
             Value::PromptSection {
                 name,
                 role,
@@ -125,6 +142,21 @@ impl std::fmt::Display for Value {
             Value::Document { backend, .. } => {
                 write!(f, "<document origin=\"{}\">", backend.origin())
             }
+            // v0.83: TEA types — 占位
+            Value::TeaApp(_) => write!(f, "<tea_app>"),
+            Value::TeaCmd(cmd) => match cmd {
+                crate::tea::Cmd::None => write!(f, "Cmd::None"),
+                crate::tea::Cmd::Batch(items) => {
+                    write!(f, "Cmd::Batch(len={})", items.len())
+                }
+                crate::tea::Cmd::Perform { effect, .. } => {
+                    write!(f, "Cmd::Perform({})", effect)
+                }
+                crate::tea::Cmd::Dispatch(msg) => {
+                    write!(f, "Cmd::Dispatch(<{:?}>)", msg)
+                }
+            },
+            Value::TeaMsg(msg) => write!(f, "Msg({:?})", msg.tag),
         }
     }
 }

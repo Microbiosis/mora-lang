@@ -198,6 +198,10 @@ impl WitnessKind {
             MirExprKind::MacroDef { name, params } => WitnessKind::MacroDef {
                 name: name.clone(),
                 params: params.clone(),
+                body: Box::new(MirWitness {
+                    kind: WitnessKind::Sequence(Vec::new()),
+                    span: Default::default(),
+                }),
             },
             // v0.80: algebraic effects witness 转换
             MirExprKind::Perform { effect, args } => WitnessKind::Perform {
@@ -339,8 +343,48 @@ pub enum WitnessKind {
     MacroDef {
         name: String,
         params: Vec<String>,
+        body: Box<MirWitness>,
     },
     Sequence(Vec<MirWitness>),
+    // v0.83: TEA (The Elm Architecture) 语法糖 witness
+    /// Model 定义 — 状态结构（类似 StructDef，但语义是 Model 容器）
+    ModelDef {
+        name: String,
+        fields: Vec<(String, crate::mir::hint::TypeHint)>,
+    },
+    /// Msg 定义 — tagged union（每个变体可携带 payload 类型）
+    MsgDef {
+        name: String,
+        variants: Vec<crate::common::MsgVariant>,
+    },
+    /// Update 函数 — `(Model, Msg) -> (Model, Cmd)`
+    UpdateDef {
+        name: String,
+        params: Vec<crate::mir::witness::WitnessParam>,
+        return_type: Option<crate::mir::hint::TypeHint>,
+        body: Box<MirWitness>,
+    },
+    /// App 定义 — 完整 TEA app
+    AppDef {
+        name: String,
+        model_name: String,
+        msg_name: String,
+        init_w: Box<MirWitness>,
+        update_w: Box<MirWitness>,
+        view_w: Box<MirWitness>,
+    },
+    // v0.85: with 块（配置桥接）— 镜像 MirInst::WithConfig
+    WithConfig {
+        bindings: Vec<(String, MirWitness)>,
+        body: Box<MirWitness>,
+    },
+    // v0.88: Quasiquote（反引号 `expr + ,unquote / ,,unquote-splice）
+    /// segments 用 MirWitness 编码：Quote = Literal(String),
+    /// Unquote = 被求值的子表达式 witness,
+    /// UnquoteSplice = 子表达式 witness + Literal(Boolean("splice")) 标记。
+    Quasiquote {
+        segments: Vec<MirWitness>,
+    },
 }
 
 /// 调用目标 — 镜像 MirCallee。
@@ -394,6 +438,11 @@ pub enum WitnessPattern {
         head: Box<WitnessPattern>,
         tail: Box<WitnessPattern>,
     },
+    /// v0.87: List vector pattern `[a, b, ..rest]`
+    ListVec {
+        elements: Vec<WitnessPattern>,
+        rest: Option<Box<WitnessPattern>>,
+    },
     Dict {
         required: Vec<(String, WitnessPattern)>,
         rest: bool,
@@ -416,6 +465,12 @@ impl WitnessPattern {
             Pattern::List { head, tail } => WitnessPattern::List {
                 head: Box::new(WitnessPattern::from_pattern(head)),
                 tail: Box::new(WitnessPattern::from_pattern(tail)),
+            },
+            Pattern::ListVec { elements, rest } => WitnessPattern::ListVec {
+                elements: elements.iter().map(WitnessPattern::from_pattern).collect(),
+                rest: rest
+                    .as_ref()
+                    .map(|r| Box::new(WitnessPattern::from_pattern(r))),
             },
             Pattern::Dict { required, rest } => WitnessPattern::Dict {
                 required: required

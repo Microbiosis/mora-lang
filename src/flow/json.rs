@@ -172,6 +172,8 @@ fn parse_json_null(s: &str) -> Result<(Value, usize), String> {
 
 fn parse_json_number(s: &str) -> Result<(Value, usize), String> {
     let mut i = 0;
+    let mut has_decimal = false;
+    let mut has_exponent = false;
     if i < s.len() && s.as_bytes()[i] == b'-' {
         i += 1;
     }
@@ -179,12 +181,14 @@ fn parse_json_number(s: &str) -> Result<(Value, usize), String> {
         i += 1;
     }
     if i < s.len() && s.as_bytes()[i] == b'.' {
+        has_decimal = true;
         i += 1;
         while i < s.len() && s.as_bytes()[i].is_ascii_digit() {
             i += 1;
         }
     }
     if i < s.len() && (s.as_bytes()[i] == b'e' || s.as_bytes()[i] == b'E') {
+        has_exponent = true;
         i += 1;
         if i < s.len() && (s.as_bytes()[i] == b'+' || s.as_bytes()[i] == b'-') {
             i += 1;
@@ -194,10 +198,24 @@ fn parse_json_number(s: &str) -> Result<(Value, usize), String> {
         }
     }
     let num_str = &s[..i];
-    let num: f64 = num_str
-        .parse()
-        .map_err(|_| format!("Invalid number: {}", num_str))?;
-    Ok((Value::Float(num), i))
+    // v0.84: 区分整数 vs 浮点数 — 不含小数点和指数时按 Int 解析，
+    // 保持 value_to_json / parse_json_number 的类型对称性。
+    // value_to_json: Int(42) → "42"; Float(42.0) → "42.0"
+    // parse_json_number: "42" → Int(42); "42.0" → Float(42.0)
+    if !has_decimal && !has_exponent {
+        // 整数路径：先尝试 i64，溢出时回退 Float
+        if let Ok(n) = num_str.parse::<i64>() {
+            Ok((Value::Int(n), i))
+        } else {
+            let num: f64 = num_str
+                .parse()
+                .map_err(|_| format!("Invalid number: {}", num_str))?;
+            Ok((Value::Float(num), i))
+        }
+    } else {
+        let num: f64 = num_str.parse().map_err(|_| format!("Invalid number: {}", num_str))?;
+        Ok((Value::Float(num), i))
+    }
 }
 
 /// Value 转 JSON 字符串
@@ -206,10 +224,16 @@ pub fn value_to_json(value: &Value) -> String {
         Value::String(s) => format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\"")),
         Value::Char(c) => format!("\"{}\"", c),
         // v0.38: Int formatted without decimal; Float always shows decimal.
+        // v0.84: Float 必须始终输出小数点，即使 fract() == 0.0（如 42.0 → "42.0"），
+        // 以保持与 parse_json_number 的类型对称性。parse_json_number 对不含小数点的
+        // 数字解析为 Int，含小数点的解析为 Float。若 Float 输出 "42"，反序列化后会
+        // 变成 Int(42)，类型降级不可逆。
         Value::Int(i) => i.to_string(),
         Value::Float(f) => {
+            // 如果 fract() == 0.0，format!("{}", f) 会输出 "42" 无小数点，
+            // 与 Int 不可区分。用 "{:.1}" 强制至少一位小数："42.0"。
             if f.fract() == 0.0 {
-                format!("{:.0}", f)
+                format!("{:.1}", f)
             } else {
                 format!("{}", f)
             }
@@ -251,9 +275,168 @@ pub fn value_to_json(value: &Value) -> String {
         Value::Partial(_, _) => "null".to_string(),
         Value::Atom(arc) => value_to_json(&arc.lock()),
         Value::Macro { .. } => "null".to_string(),
+        // v0.86: Curry — 柯里化函数无法 JSON 表示，用 null 占位。
+        Value::Curry { .. } => "null".to_string(),
+        // v0.86: Cons — 链式列表单元用 null 占位（非标准 JSON 结构）。
+        Value::Cons { .. } => "null".to_string(),
+        // v0.86: Code — 源码文本值用 JSON 字符串表示。
+        Value::Code(s) => value_to_json(&Value::String(s.clone())),
         Value::PromptSection { .. } => "null".to_string(),
         Value::Document { backend, .. } => {
             format!("\"<document origin=\\\"{}\\\">\"", backend.origin())
+        }
+        // v0.83: TEA types — 占位字符串（replay 应通过专用通道恢复）
+        Value::TeaApp(_) => "\"<tea_app>\"".to_string(),
+        Value::TeaCmd(cmd) => match cmd {
+            crate::tea::Cmd::None => "null".to_string(),
+            crate::tea::Cmd::Batch(items) => {
+                let parts: Vec<String> = items
+                    .iter()
+                    .map(|c| value_to_json(&c.to_value()))
+                    .collect();
+                format!("[{}]", parts.join(","))
+            }
+            crate::tea::Cmd::Perform { effect, args } => {
+                let arg_jsons: Vec<String> =
+                    args.iter().map(value_to_json).collect();
+                format!(
+                    "{{\"kind\":\"Perform\",\"effect\":\"{}\",\"args\":[{}}}",
+                    effect,
+                    arg_jsons.join(",")
+                )
+            }
+            crate::tea::Cmd::Dispatch(msg) => format!(
+                "{{\"kind\":\"Dispatch\",\"msg\":{}}}",
+                value_to_json(msg)
+            ),
+        },
+        Value::TeaMsg(msg) => value_to_json(&msg.to_value()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── Int / Float 类型对称性（v0.84） ──
+
+    #[test]
+    fn int_roundtrip_symmetry() {
+        // Int → JSON → Int，类型不变
+        let v = Value::Int(42);
+        let json = value_to_json(&v);
+        assert_eq!(json, "42");
+        let v2 = json_to_value(&json).unwrap();
+        assert_eq!(v2, Value::Int(42));
+    }
+
+    #[test]
+    fn float_with_fraction_roundtrip_symmetry() {
+        // Float(1.5) → JSON → Float(1.5)，类型不变
+        let v = Value::Float(1.5);
+        let json = value_to_json(&v);
+        assert!(json.starts_with("1.5"));
+        let v2 = json_to_value(&json).unwrap();
+        match v2 {
+            Value::Float(f) => assert!((f - 1.5).abs() < 1e-9),
+            other => panic!("expected Float, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn float_integer_value_uses_decimal_point() {
+        // Float(42.0) → "42.0"（含小数点，与 Int(42) → "42" 区分）
+        let v = Value::Float(42.0);
+        let json = value_to_json(&v);
+        assert_eq!(json, "42.0");
+        let v2 = json_to_value(&json).unwrap();
+        match v2 {
+            Value::Float(f) => assert!((f - 42.0).abs() < 1e-9),
+            other => panic!("expected Float, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn negative_int_roundtrip() {
+        // Int(-42) → "-42" → Int(-42)
+        let v = Value::Int(-42);
+        let json = value_to_json(&v);
+        assert_eq!(json, "-42");
+        let v2 = json_to_value(&json).unwrap();
+        assert_eq!(v2, Value::Int(-42));
+    }
+
+    #[test]
+    fn negative_float_roundtrip() {
+        // Float(-1.5) → "-1.5" → Float(-1.5)
+        let v = Value::Float(-1.5);
+        let json = value_to_json(&v);
+        assert!(json.starts_with("-1.5"));
+        let v2 = json_to_value(&json).unwrap();
+        match v2 {
+            Value::Float(f) => assert!((f - (-1.5)).abs() < 1e-9),
+            other => panic!("expected Float, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn zero_int_vs_zero_float_distinct() {
+        // Int(0) → "0" → Int(0)
+        // Float(0.0) → "0.0" → Float(0.0)
+        let ji = value_to_json(&Value::Int(0));
+        let jf = value_to_json(&Value::Float(0.0));
+        assert_eq!(ji, "0");
+        assert_eq!(jf, "0.0");
+        assert_eq!(json_to_value(&ji).unwrap(), Value::Int(0));
+        match json_to_value(&jf).unwrap() {
+            Value::Float(f) => assert!((f - 0.0).abs() < 1e-9),
+            other => panic!("expected Float, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn scientific_notation_parsing_yields_float() {
+        // "1e5" → Float(100000.0)，含 e/E 始终 Float
+        let v = json_to_value("1e5").unwrap();
+        match v {
+            Value::Float(f) => assert!((f - 100000.0).abs() < 1e-6),
+            other => panic!("expected Float, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn large_integer_overflow_falls_back_to_float() {
+        // 超出 i64 范围的大整数 → Float（避免 panic）
+        let v = json_to_value("999999999999999999999").unwrap();
+        match v {
+            Value::Float(_) => {} // 期望 Float
+            other => panic!(
+                "expected Float for overflow integer, got {:?}",
+                other
+            ),
+        }
+    }
+
+    // ── 嵌套结构中 Int/Float 类型保留 ──
+
+    #[test]
+    fn dict_int_value_roundtrip() {
+        use std::collections::HashMap;
+        let mut map = HashMap::new();
+        map.insert("x".to_string(), Value::Int(42));
+        map.insert("y".to_string(), Value::Float(1.5));
+        let v = Value::Dict(map);
+        let json = value_to_json(&v);
+        let v2 = json_to_value(&json).unwrap();
+        match v2 {
+            Value::Dict(m) => {
+                assert_eq!(m.get("x"), Some(&Value::Int(42)));
+                match m.get("y") {
+                    Some(Value::Float(f)) => assert!((f - 1.5).abs() < 1e-9),
+                    other => panic!("expected Float(1.5), got {:?}", other),
+                }
+            }
+            other => panic!("expected Dict, got {:?}", other),
         }
     }
 }

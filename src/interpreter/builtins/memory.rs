@@ -337,7 +337,6 @@ impl Interpreter {
 
 #[cfg(test)]
 mod tests_v0431_memory_bus {
-    #![allow(unused_mut)]
     use super::*;
     use crate::value::Value;
 

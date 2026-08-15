@@ -31,7 +31,7 @@ use crate::mir::vm::{index_value, run_mir, self_match_pattern};
 
 use crate::mir::{MirFunction, Reg};
 
-use crate::runtime::types::{TraitInfo, TraitMethodSig};
+use crate::common::trait_info::{TraitInfo, TraitMethodSig, default_impl_method_key, impl_method_key};
 
 use crate::value::{Environment, Value};
 
@@ -216,12 +216,35 @@ pub fn h_dyn_trait(
 // Side-effect instructions (modify env / interp state)
 // ============================================================
 
-pub fn h_define(env: &mut Environment, name: &str, regs: &[Value], src: Reg) {
-    env.define(name.to_string(), regs[src].clone(), false);
+pub fn h_define(
+    interp: &mut dyn MirHost,
+    env: &mut Environment,
+    name: &str,
+    regs: &[Value],
+    src: Reg,
+) {
+    // v0.83: 录制 StateMutation（前值为 Nil（新变量），后值为 regs[src]）
+    let new_val = regs[src].clone();
+    env.define(name.to_string(), new_val.clone(), false);
+    if let Some(rec) = interp.recorder_mut() {
+        rec.record_state_mutation(name.to_string(), Value::Nil, new_val);
+    }
 }
 
-pub fn h_assign(env: &mut Environment, name: &str, regs: &[Value], src: Reg) {
-    env.assign(name, regs[src].clone());
+pub fn h_assign(
+    interp: &mut dyn MirHost,
+    env: &mut Environment,
+    name: &str,
+    regs: &[Value],
+    src: Reg,
+) {
+    // v0.83: 录制 StateMutation（前值 = env 当前值，后值 = regs[src]）
+    let old_val = env.get(name).unwrap_or(Value::Nil);
+    let new_val = regs[src].clone();
+    env.assign(name, new_val.clone());
+    if let Some(rec) = interp.recorder_mut() {
+        rec.record_state_mutation(name.to_string(), old_val, new_val);
+    }
 }
 
 pub fn h_type_alias(env: &mut Environment, name: &str, target: &str) {
@@ -251,6 +274,138 @@ pub fn h_struct_def(env: &mut Environment, name: &str, fields: &[crate::common::
         )])),
         false,
     );
+}
+
+// v0.83: TEA Model 定义 —— 注册到 env 为 Value::Dict 含 fields 元数据
+// + Type::TeaModel 注解（完整 TEA type 系统在阶段 E）
+pub fn h_model_def(env: &mut Environment, name: &str, fields: &[crate::common::StructField]) {
+    let field_names: Vec<String> = fields.iter().map(|f| f.name.clone()).collect();
+    env.define(
+        name.to_string(),
+        Value::Dict(HashMap::from([
+            ("__model_fields__".to_string(), Value::List(
+                field_names.iter().map(|s| Value::String(s.clone())).collect(),
+            )),
+        ])),
+        false,
+    );
+}
+
+// v0.83: TEA Msg 定义 —— 注册到 env 为 Value::List 含 variants
+pub fn h_msg_def(env: &mut Environment, name: &str, variants: &[crate::common::MsgVariant]) {
+    let variant_names: Vec<Value> = variants
+        .iter()
+        .map(|v| {
+            let mut map = std::collections::HashMap::new();
+            map.insert("name".to_string(), Value::String(v.name.clone()));
+            if let Some(ref t) = v.payload_type {
+                map.insert("payload_type".to_string(), Value::String(t.clone()));
+            }
+            Value::Dict(map)
+        })
+        .collect();
+    env.define(name.to_string(), Value::List(variant_names), false);
+}
+
+// v0.83: TEA Update 函数定义 —— 注册到 env 为 Value::Closure (name 关联)
+// 完整 type: Model × Msg -> (Model, Cmd) 在阶段 E 加 Type::TeaUpdate
+pub fn h_update_def(
+    env: &mut Environment,
+    name: &str,
+    params: &[String],
+    body: &crate::mir::MirFunction,
+) {
+    // 注册到 env：name → Dict { params, body_mir }
+    let mut map = std::collections::HashMap::new();
+    map.insert(
+        "__update_params__".to_string(),
+        Value::List(params.iter().map(|s| Value::String(s.clone())).collect()),
+    );
+    map.insert(
+        "__update_body__".to_string(),
+        Value::String(format!("<MirFunction:{}>", body.params.len())),
+    );
+    env.define(name.to_string(), Value::Dict(map), false);
+}
+
+// v0.83: TEA App 定义 —— 构造完整 TeaApp，存为 Value::TeaApp
+// v0.84 Phase 4: 构造后立即调用 initialize() 自动执行 init closure
+
+/// h_app_def 入参结构（避免 8 参数导致的 clippy too-many-arguments）。
+/// 与 MirInst::AppDef 字段一一对应。
+pub struct AppDefArgs<'a> {
+    pub interp: &'a mut dyn crate::mir::host::MirHost,
+    pub env: &'a mut Environment,
+    pub name: &'a str,
+    pub model_name: &'a str,
+    pub msg_name: &'a str,
+    pub init_mir: &'a crate::mir::MirFunction,
+    pub update_mir: &'a crate::mir::MirFunction,
+    pub view_mir: &'a crate::mir::MirFunction,
+}
+
+pub fn h_app_def(args: AppDefArgs) {
+    use crate::tea::TeaApp;
+    let AppDefArgs {
+        interp,
+        env,
+        name,
+        model_name,
+        msg_name,
+        init_mir,
+        update_mir,
+        view_mir,
+    } = args;
+    // v0.83: 把 init/update/view 转成 Value::Closure —— 完整闭包语义
+    // (Arc<MirFunction> 共享 body，EnvRef 捕获当前 env 支持外层变量)。
+    // init: () -> Model —— 0 个参数
+    let init_closure = Value::Closure {
+        params: Vec::new(),
+        env: crate::value::EnvRef(Box::new(env.clone())),
+        mir_body: Arc::new(init_mir.clone()),
+    };
+    // update: (Model, Msg) -> (Model, Cmd) —— 2 个参数
+    let update_closure = Value::Closure {
+        params: vec!["model".to_string(), "msg".to_string()],
+        env: crate::value::EnvRef(Box::new(env.clone())),
+        mir_body: Arc::new(update_mir.clone()),
+    };
+    // view: (Model) -> Value —— 1 个参数
+    let view_closure = Value::Closure {
+        params: vec!["model".to_string()],
+        env: crate::value::EnvRef(Box::new(env.clone())),
+        mir_body: Arc::new(view_mir.clone()),
+    };
+    let app = TeaApp::new(
+        init_closure.clone(),
+        update_closure.clone(),
+        view_closure.clone(),
+    );
+    // v0.84 Phase 4: 自动执行 init closure 获取初始 model
+    let _ = app.initialize(interp);
+    // 注册到 env：app + 三个独立闭包（供 builtin tea.* 通过 name 调用）
+    env.define(
+        name.to_string(),
+        Value::TeaApp(std::sync::Arc::new(app)),
+        false,
+    );
+    env.define(
+        format!("{}.init", name),
+        init_closure,
+        false,
+    );
+    env.define(
+        format!("{}.update", name),
+        update_closure,
+        false,
+    );
+    env.define(
+        format!("{}.view", name),
+        view_closure,
+        false,
+    );
+    // 引用 model_name/msg_name（供 typeck 后续扩展检查 Model/Msg 字段匹配）
+    let _ = (model_name, msg_name);
 }
 
 pub fn h_import(interp: &mut dyn MirHost, env: &mut Environment, path: &str) -> Result<(), String> {
@@ -316,6 +471,11 @@ pub fn h_perform(
     interp: &mut dyn crate::mir::host::MirHost,
 ) -> Result<(), String> {
     let arg_vals: Vec<Value> = args.iter().map(|r| regs[*r].clone()).collect();
+    // v0.83: 录制 Cmd 事件（perform 是 Cmd::Perform 的运行时派发）
+    if let Some(rec) = interp.recorder_mut() {
+        // 用 Event::Msg 暂存 perform 事件（channel = effect label）
+        rec.record_msg(effect.to_string(), Value::List(arg_vals.clone()), 0);
+    }
     match interp.perform_effect(effect, arg_vals) {
         Some(reply) => {
             regs[dst] = reply;
@@ -372,12 +532,18 @@ pub fn h_handle(
     }
 }
 
-pub fn h_macro_def(env: &mut Environment, name: &str, params: &[String]) {
+pub fn h_macro_def(
+    env: &mut Environment,
+    name: &str,
+    params: &[String],
+    body: &crate::mir::MirFunction,
+) {
     env.define(
         name.to_string(),
         Value::Macro {
             name: name.to_string(),
             params: params.to_vec(),
+            body: std::sync::Arc::new(body.clone()),
         },
         false,
     );
@@ -444,8 +610,13 @@ pub fn h_send(
     // v0.70: Removed crossbeam worker_channels fallback (was dead code).
     interp.dynamic_sends().push(crate::checkpoint::SendTask {
         target_node: target.to_string(),
-        input: val,
+        input: val.clone(),
     });
+    // v0.83: 录制 Msg 事件 — 发送 BSP 消息本身也是 TEA-style 应用层事件
+    if let Some(rec) = interp.recorder_mut() {
+        // prior_state_hash 用 sys time 简化（完整实现见 src/tea/replay.rs）
+        rec.record_msg(target.to_string(), val, 0);
+    }
     Ok(())
 }
 
@@ -639,7 +810,7 @@ pub fn h_trait_def(
     );
     for (m, _body) in methods.iter().zip(method_bodies.iter()) {
         if let Some(mfn) = &m.body {
-            let key = crate::runtime::types::default_impl_method_key(
+            let key = default_impl_method_key(
                 name,
                 &Vec::<String>::new(),
                 &m.name,
@@ -675,7 +846,7 @@ pub fn h_impl_def(
         .push(for_type.to_string());
     for (m, _body) in methods.iter().zip(method_bodies.iter()) {
         if let Some(mfn) = &m.body {
-            let key = crate::runtime::types::impl_method_key(
+            let key = impl_method_key(
                 trait_name,
                 trait_generics,
                 for_type,
@@ -1528,13 +1699,16 @@ pub fn h_match_expr(
     let val_val = regs[val].clone();
     let mut matched = false;
     for (pat_str, cond_reg, arm_func, output_reg) in arms {
-        if self_match_pattern(&val_val, pat_str, cond_reg.as_ref().map(|r| &regs[*r]), env) {
-            // v0.75.9: 包裹 Arc 走全局 DAG 缓存（arm body 借自指令表）
-            let result = run_mir(&Arc::new((**arm_func).clone()), interp, env)?;
-            regs[*output_reg] = result;
-            matched = true;
-            break;
+        if !self_match_pattern(&val_val, pat_str, None, env) {
+            continue;
         }
+        if let Some(guard) = cond_reg && !is_truthy(&regs[*guard]) {
+            continue;
+        }
+        let result = run_mir(&Arc::new((**arm_func).clone()), interp, env)?;
+        regs[*output_reg] = result;
+        matched = true;
+        break;
     }
     if !matched && let Some((_pat, _cond, _func, output_reg)) = arms.first() {
         regs[*output_reg] = Value::Nil;
@@ -1585,6 +1759,51 @@ pub fn h_break(target: usize) -> Flow {
 
 pub fn h_continue(target: usize) -> Flow {
     Flow::Jump(target)
+}
+
+/// v0.88: Quasiquote handler — 按 segments 重组为 Mora 源码字符串。
+///
+/// - Quote(s)     → 直接拼接源码文字 `s`
+/// - Unquote(r)   → 读取 `regs[r]`，经 Mora Display 格式化为代码字符串
+///   例：`x` 的值是 `Int(3)` → 拼接 `"3"`；值是 `String("hello")` → 拼接 `"\"hello\""`
+/// - UnquoteSplice(r) → 读取 `regs[r]`（期望为 List），每个元素经 Display
+///   格式化后用 `", "` 连接，展开为源码片段
+///   例：`[1, 2, 3]` → 拼接 `"1, 2, 3"`
+///
+/// 最终 `dst` 寄存器写入 `Value::Code(重组源码字符串)`，与 `quote(expr)` 返回类型一致。
+pub fn h_quasiquote(
+    regs: &mut [Value],
+    dst: Reg,
+    segments: &[crate::mir::QuasiquoteSegment],
+) -> Result<(), String> {
+    use crate::mir::QuasiquoteSegment::{Quote, Unquote, UnquoteSplice};
+
+    let mut buf = String::new();
+    for seg in segments {
+        match seg {
+            Quote(src) => buf.push_str(src),
+            Unquote(r) => {
+                buf.push_str(&value_to_string(&regs[*r]));
+            }
+            UnquoteSplice(r) => {
+                let val = &regs[*r];
+                match val {
+                    Value::List(items) => {
+                        let parts: Vec<String> = items.iter().map(value_to_string).collect();
+                        buf.push_str(&parts.join(", "));
+                    }
+                    _ => {
+                        return Err(format!(
+                            "unquote_splice: expected List, got {:?}",
+                            val
+                        ))
+                    }
+                }
+            }
+        }
+    }
+    regs[dst] = Value::Code(buf);
+    Ok(())
 }
 
 // v0.75.56: MirInst metadata (dst/input_regs/map_regs/is_effect) + dispatch

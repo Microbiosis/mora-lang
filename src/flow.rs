@@ -32,18 +32,6 @@ pub fn is_builtin_object(name: &str) -> bool {
     matches!(name, "ai" | "web" | "json" | "file" | "memory" | "agent")
 }
 
-/// 期望值为字符串，带上下文信息
-/// v0.76.00: 返回 `Result<String, MoraError>`（MoraError 统一计划推进）。
-pub fn expect_string(value: Value, context: &str) -> Result<String, MoraError> {
-    match value {
-        Value::String(s) => Ok(s),
-        other => Err(MoraError::Other(format!(
-            "{}: expected string, got {:?}",
-            context, other
-        ))),
-    }
-}
-
 /// hex 编码
 pub fn hex_encode(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{:02x}", b)).collect()
@@ -302,28 +290,6 @@ pub fn literal_to_value_static(lit: &Literal) -> Value {
         Literal::Float(f, _) => Value::Float(*f),
         Literal::Bool(b, _) => Value::Bool(*b),
         Literal::Nil(_) => Value::Nil,
-    }
-}
-
-/// 运行时类型检查
-pub fn check_type(value: &Value, hint: &str) -> bool {
-    match (value, hint) {
-        (Value::String(_), "string") => true,
-        (Value::Float(_), "float") => true,
-        (Value::Bool(_), "bool") => true,
-        (Value::Nil, "nil") => true,
-        (Value::List(_), "list") => true,
-        (Value::Dict(_), "dict") => true,
-        (Value::Task { .. }, "task") => true,
-        (Value::Tool { .. }, "tool") => true,
-        (Value::Conversation { .. }, "conversation") => true,
-        (Value::Stream { .. }, "stream") => true,
-        (Value::Agent { .. }, "agent") => true,
-        // v0.08.1: Nil 兼容 dyn Trait 标注（trait 对象占位）
-        (Value::Nil, h) if h.starts_with("dyn:") => true,
-        // v0.08.1: TraitObject 兼容对应的 dyn Trait 标注
-        (Value::TraitObject { .. }, h) if h.starts_with("dyn:") => true,
-        _ => false,
     }
 }
 

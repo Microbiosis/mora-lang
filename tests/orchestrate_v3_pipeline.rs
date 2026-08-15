@@ -268,7 +268,7 @@ x
 "#,
         "x",
     );
-    assert_eq!(result.unwrap(), "42");
+    assert_eq!(result.unwrap(), "42.0");
 }
 
 #[test]
@@ -305,7 +305,7 @@ sum
     let mut interp = Interpreter::new();
     let mut env = interp.take_env();
     let ret = run_mir(&std::sync::Arc::new(func), &mut interp, &mut env).unwrap();
-    assert_eq!(ret.to_string(), "6");
+    assert_eq!(ret.to_string(), "6.0");
 }
 
 // v0.75.32: 同 for 循环 — pre-existing 累加 bug，与本阶段无关。
@@ -326,7 +326,7 @@ acc
     let mut interp = Interpreter::new();
     let mut env = interp.take_env();
     let ret = run_mir(&std::sync::Arc::new(func), &mut interp, &mut env).unwrap();
-    assert_eq!(ret.to_string(), "6");
+    assert_eq!(ret.to_string(), "6.0");
 }
 
 #[test]

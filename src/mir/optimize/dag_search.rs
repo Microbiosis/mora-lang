@@ -139,49 +139,6 @@ pub fn dag_search_staged(
     }
 }
 
-// ─── Legacy: Single-phase greedy search ───────────────────────────────
-
-/// Run DAG rewrite rules until convergence, using cost deltas
-/// from the provided cost model. (Legacy: single flat rule set.)
-pub fn dag_search(
-    dag: &mut MirDag,
-    rules: &[Box<dyn DagRewriteRule>],
-    cost: &dyn CostModel,
-    max_iter: u32,
-) {
-    for _iter in 0..max_iter {
-        let mut best: Option<(NodeId, DagRewrite, i32)> = None;
-
-        for node_id in 0..dag.nodes.len() {
-            if dag.nodes[node_id].is_removed() {
-                continue;
-            }
-            let node = &dag.nodes[node_id];
-            for rule in rules {
-                if rule.matches(node_id, node, dag)
-                    && let Some(rw) = rule.rewrite(node_id, dag)
-                {
-                    // Compute actual cost delta
-                    let old_cost = rw
-                        .removed
-                        .iter()
-                        .map(|&id| node_cost(&dag.nodes[id], cost))
-                        .sum::<u32>();
-                    let new_cost = rw.added.iter().map(|n| dag_node_cost(n, cost)).sum::<u32>();
-                    let delta = old_cost as i32 - new_cost as i32;
-                    if delta > best.as_ref().map(|b| b.2).unwrap_or(0) {
-                        best = Some((node_id, rw, delta));
-                    }
-                }
-            }
-        }
-
-        match best {
-            Some((_node_id, rw, _gain)) => apply_rewrite(dag, rw),
-            None => break,
-        }
-    }
-}
 
 /// Apply a `DagRewrite` to the DAG in-place.
 fn apply_rewrite(dag: &mut MirDag, rw: DagRewrite) {
@@ -365,38 +322,6 @@ mod tests {
         
             ..Default::default()};
         dag::dag_analyze(&func)
-    }
-
-    #[test]
-    fn dag_search_folds_constants() {
-        let mut dag = make_dag(vec![
-            MirInst::Const(0, Value::Int(10)),
-            MirInst::Const(1, Value::Int(32)),
-            MirInst::BinaryOp(2, 0, BinaryOp::Add, 1),
-        ]);
-        let rules: Vec<Box<dyn DagRewriteRule>> =
-            vec![Box::new(ConstFoldingDagRule), Box::new(DeadNodeDagRule)];
-        let before = dag.nodes.iter().filter(|n| !n.is_removed()).count();
-        let cost = InstructionCount;
-        dag_search(&mut dag, &rules, &cost, 10);
-        let after = dag.nodes.iter().filter(|n| !n.is_removed()).count();
-        assert!(
-            after < before,
-            "nodes should decrease after folding: {} -> {}",
-            before,
-            after
-        );
-    }
-
-    #[test]
-    fn dag_search_no_op_on_empty() {
-        let mut dag = make_dag(vec![MirInst::Const(0, Value::Int(42))]);
-        let rules: Vec<Box<dyn DagRewriteRule>> = vec![Box::new(ConstFoldingDagRule)];
-        let before = dag.nodes.iter().filter(|n| !n.is_removed()).count();
-        let cost = InstructionCount;
-        dag_search(&mut dag, &rules, &cost, 10);
-        let after = dag.nodes.iter().filter(|n| !n.is_removed()).count();
-        assert_eq!(before, after, "single Const should not be modified");
     }
 
     // ─── Staged search tests ───────────────────────────────────────

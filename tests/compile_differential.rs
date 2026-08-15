@@ -435,7 +435,7 @@ fn compile_run_moe_sparse_and_model_expert() {
     let result = env.get("result").expect("result should be defined");
     assert_eq!(
         result.to_string(),
-        "20",
+        "20.0",
         "top_k=1 should only run expert_a (2*10), got: {}",
         result
     );

@@ -811,8 +811,51 @@ impl MirExprLowerer {
                 self.emit.emit(MirInst::Const(k_dst, Value::Nil));
                 let _ = (body_reg, handler_reg, body_w, handler_w);
                 Ok(k_dst)
-            } // ── Grouping (transparent) ──
-              // v0.75.20: MirExprKind::Grouping 已删（mir_group 恒等函数，
+            }
+            // v0.88: Quasiquote lowering — MirExpr path's `expr syntax.
+            // QuasiquoteExpr contains MirExpr segments:
+            //   Literal(String(s)) → Quote(s)
+            //   Variable(name) → Unquote(reg)
+            //   Call{Name("splice"), [expr]} → UnquoteSplice(reg)
+            MirExprKind::QuasiquoteExpr(segments) => {
+                let dst = self.alloc_reg();
+                let mut resolved: Vec<crate::mir::QuasiquoteSegment> = Vec::new();
+                for seg in segments {
+                    match &seg.kind {
+                        MirExprKind::Literal(Literal::String(s, _)) => {
+                            resolved.push(crate::mir::QuasiquoteSegment::Quote(s.clone()));
+                        }
+                        MirExprKind::Variable(name) => {
+                            let reg = self.lower_expr(seg)?;
+                            resolved.push(crate::mir::QuasiquoteSegment::Unquote(reg));
+                            let _ = name;
+                        }
+                        MirExprKind::Call {
+                            callee,
+                            args,
+                            ..
+                        } => match callee {
+                            MirCallee::Name(n) if n == "splice" => {
+                                if let Some(arg) = args.first() {
+                                    let reg = self.lower_expr(arg)?;
+                                    resolved.push(crate::mir::QuasiquoteSegment::UnquoteSplice(reg));
+                                }
+                            }
+                            _ => {
+                                let reg = self.lower_expr(seg)?;
+                                resolved.push(crate::mir::QuasiquoteSegment::Unquote(reg));
+                            }
+                        },
+                        _ => {
+                            // Generic expression as unquote
+                            let reg = self.lower_expr(seg)?;
+                            resolved.push(crate::mir::QuasiquoteSegment::Unquote(reg));
+                        }
+                    }
+                }
+                self.emit.emit(MirInst::Quasiquote { dst, segments: resolved });
+                Ok(dst)
+            }
               // 从未产出包裹节点；括号仅作优先级，parse 时不建节点）。
         }
     }

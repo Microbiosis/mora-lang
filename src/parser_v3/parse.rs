@@ -120,6 +120,12 @@ impl ParserV3 {
             return Some(expr);
         }
 
+        // v0.88: quasiquote `expr — must come before parse_assignment
+        // since backtick is not consumed by any other path.
+        if self.check(&TokenType::Backtick) {
+            return self.parse_quasiquote();
+        }
+
         let expr = self.parse_assignment()?;
         let _ = self.match_token(&[TokenType::Newline]);
         Some(expr)
@@ -813,9 +819,9 @@ impl ParserV3 {
             let _ = self.match_token(&[TokenType::Newline, TokenType::Comma]);
         }
 
-        if exprs.is_empty() {
-            return None;
-        }
+    if exprs.is_empty() {
+        return Some(MirExpr::lit(Literal::Nil(span), span));
+    }
         if exprs.len() == 1 {
             return Some(exprs.into_iter().next().expect("len==1"));
         }
@@ -1420,6 +1426,35 @@ impl ParserV3 {
 
     pub(super) fn parse_type_annotation(&mut self) -> Option<crate::typeck::Type> {
         use crate::typeck::Type;
+        // v0.85: 先解析一个基础类型，再收集 `|` 分隔的 union 成员
+        let ty = self.parse_single_type_annotation()?;
+
+        // v0.85: 收集 union 成员 (string | number | bool)
+        let mut members: Vec<Type> = vec![ty];
+        while self.match_token_exact(TokenType::Or) {
+            // 跳过 `|` 后的可选空格/换行
+            let next = self.peek();
+            if next.is_none() {
+                eprintln!(
+                    "Parse error: expected type after '|' at line {}",
+                    self.current_line()
+                );
+                return None;
+            }
+            let member = self.parse_single_type_annotation()?;
+            members.push(member);
+        }
+
+        if members.len() == 1 {
+            Some(members.into_iter().next().unwrap())
+        } else {
+            Some(Type::Union(members))
+        }
+    }
+
+    /// 解析单个类型注解（不含 `|` 联合），内部由 `parse_type_annotation` 调用。
+    fn parse_single_type_annotation(&mut self) -> Option<crate::typeck::Type> {
+        use crate::typeck::Type;
         let tok = self.peek().cloned()?;
         match &tok.token_type {
             TokenType::Dyn => {
@@ -1657,6 +1692,120 @@ impl ParserV3 {
         Some(MirExpr {
             kind: MirExprKind::MacroDef { name, params },
             span,
+        })
+    }
+
+    /// v0.88: quasiquote `` `expr `` — MirExpr path equivalent of emit_quasiquote_w.
+    ///
+    /// Mirrors emit_quasiquote_w's logic: scan tokens, track depth, collect
+    /// segments as MirExprs. Lowering in lower.rs resolves each MirExpr to
+    /// the corresponding QuasiquoteSegment (Quote/Unquote/UnquoteSplice).
+    fn parse_quasiquote(&mut self) -> Option<MirExpr> {
+        let start_span = self.span_of_current();
+        self.consume(TokenType::Backtick, "Expected '`' for quasiquote")?;
+
+        let mut capture_start = match self.peek() {
+            Some(t) => self.source_byte_at(t.line, t.column),
+            None => self.source.len(),
+        };
+
+        let mut segments: Vec<MirExpr> = Vec::new();
+        let mut depth = 0usize;
+
+        'scan: while !self.is_at_end() {
+            let tok = match self.peek() {
+                Some(t) => t,
+                None => break,
+            };
+
+            match &tok.token_type {
+                TokenType::LParen
+                | TokenType::LBracket
+                | TokenType::LBrace
+                | TokenType::Less => {
+                    depth += 1;
+                    self.advance();
+                }
+                TokenType::RParen
+                | TokenType::RBracket
+                | TokenType::RBrace
+                | TokenType::Greater => {
+                    depth = depth.saturating_sub(1);
+                    self.advance();
+                }
+                TokenType::Newline if depth == 0 => {
+                    break;
+                }
+                _ if depth == 0 => {
+                    match &tok.token_type {
+                        TokenType::Comma | TokenType::CommaComma => {
+                            let is_splice =
+                                matches!(&tok.token_type, TokenType::CommaComma);
+
+                            // Flush static text since last capture
+                            let end = self.source_byte_at(tok.line, tok.column);
+                            if end > capture_start {
+                                let text = &self.source[capture_start..end];
+                                if !text.is_empty() {
+                                    segments.push(MirExpr::lit(
+                                        Literal::String(text.to_string(), start_span),
+                                        start_span,
+                                    ));
+                                }
+                            }
+
+                            self.advance();
+                            // Parse the unquote/splice sub-expression
+                            if let Some(sub_expr) = self.parse_expression() {
+                                if is_splice {
+                                    // splice(expr) → Call{Name("splice"), [expr]}
+                                    segments.push(MirExpr {
+                                        kind: MirExprKind::Call {
+                                            callee: MirCallee::Name("splice".to_string()),
+                                            args: vec![sub_expr],
+                                        },
+                                        span: start_span,
+                                    });
+                                } else {
+                                    segments.push(sub_expr);
+                                }
+                            } else {
+                                return None;
+                            }
+                            if let Some(next) = self.peek() {
+                                capture_start =
+                                    self.source_byte_at(next.line, next.column);
+                            }
+                            continue 'scan;
+                        }
+                        _ => {
+                            self.advance();
+                        }
+                    }
+                }
+                _ => {
+                    self.advance();
+                }
+            }
+        }
+
+        // Capture trailing static text
+        if let Some(tok) = self.peek() {
+            let end = self.source_byte_at(tok.line, tok.column);
+            if end > capture_start {
+                let text = &self.source[capture_start..end];
+                if !text.is_empty() {
+                    segments.push(MirExpr::lit(
+                        Literal::String(text.to_string(), start_span),
+                        start_span,
+                    ));
+                }
+            }
+        }
+
+        Some(MirExpr {
+            kind: MirExprKind::QuasiquoteExpr(segments),
+            span: start_span,
         })
     }
 

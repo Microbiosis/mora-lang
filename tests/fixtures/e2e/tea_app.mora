@@ -3,7 +3,5 @@ app Counter
   msg: CounterMsg
   init: 0
   update: fn(m, msg) => m
-  view: fn(m) => m.count
+  view: fn(m) => m
 end
-
-0

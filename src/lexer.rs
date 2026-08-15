@@ -40,6 +40,8 @@ pub enum TokenType {
     // v0.85: with 块（配置桥接）— with mock_llm = [...] end
     // 与 handle/perform 同模式但显式 TokenType，支持 §1.1 "语言一等公民"。
     With,
+    // v0.88: TEA app 块关键字 — app Counter ... end
+    App,
     // 注意: HTTP 方法 (GET/POST/PUT/DELETE/PATCH) 不作关键字
     // —— 保持 Identifier,显式 API Router.route() 按字符串匹配
     Identifier(String),
@@ -744,6 +746,8 @@ impl Lexer {
             }
             // v0.85: with 块（配置桥接）— 与 handle/perform 同语义但显式关键字
             "with" => TokenType::With,
+            // v0.88: TEA app 块关键字
+            "app" => TokenType::App,
             _ => TokenType::Identifier(value),
         };
         Token {

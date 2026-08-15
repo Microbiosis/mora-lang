@@ -222,6 +222,9 @@ impl WitnessKind {
             MirExprKind::Sequence(exprs) => {
                 WitnessKind::Sequence(exprs.iter().map(MirWitness::from_expr).collect())
             }
+            MirExprKind::QuasiquoteExpr(segments) => WitnessKind::Quasiquote {
+                segments: segments.iter().map(MirWitness::from_expr).collect(),
+            },
         }
     }
 }

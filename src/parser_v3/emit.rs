@@ -44,6 +44,8 @@ impl ParserV3 {
             TokenType::If => self.emit_if_w().map(|(_, w)| w),
             TokenType::For => self.emit_loop_w().map(|(_, w)| w),
             TokenType::Identifier(ref s) if s == "while" => self.emit_while_w().map(|(_, w)| w),
+            // v0.88: TEA app 块
+            TokenType::App => self.emit_app_def_w(),
             // v0.75.81: 事务家族 + eval 断言（顶层同嵌套分发）
             TokenType::Identifier(ref s)
                 if s == "transaction"
@@ -1030,6 +1032,16 @@ impl ParserV3 {
             }
             self.consume(TokenType::End, "Expected 'end' after task body")?;
             (last, Self::block_witness(stmt_wits, span))
+        } else if self.check(&TokenType::End) {
+            // Empty body: `task main() end`
+            let nil_reg = self.emit.alloc_reg();
+            self.emit
+                .emit(MirInst::Const(nil_reg, crate::value::Value::Nil));
+            let nil_w = MirWitness {
+                kind: WitnessKind::Literal(Literal::Nil(span)),
+                span,
+            };
+            (Some(nil_reg), nil_w)
         } else {
             let (r, w) = self.emit_expr_w()?;
             (Some(r), w)
@@ -1223,6 +1235,178 @@ impl ParserV3 {
             },
             span,
         })
+    }
+
+    /// v0.88: TEA app 定义 — `app Counter ... end` 完整解析。
+    ///
+    /// syntax:
+    /// ```mora
+    /// app Counter
+    ///   model: Counter
+    ///   msg: CounterMsg
+    ///   init: <expr>
+    ///   update: fn(model, msg) => ...
+    ///   view: fn(model) => ...
+    /// end
+    /// ```
+    ///
+    /// 镜像 h_app_def 语义：model/msg 为 Identifier 绑定到当前 env；
+    /// init/update/view 均作为闭包编译（子 EmitContext），emit MirInst::AppDef。
+    fn emit_app_def_w(&mut self) -> Option<MirWitness> {
+        let span = self.span_of_current();
+        self.advance(); // 'app'
+        let name = self.consume_identifier("Expected app name")?;
+
+        // 子上下文：app 块内部是独立寄存器空间
+        let parent = std::mem::replace(
+            &mut self.emit,
+            crate::mir::lower::EmitContext::new(),
+        );
+
+        let mut model_name = String::new();
+        let mut msg_name = String::new();
+        let mut init_witness = None;
+        let mut update_mir = None;
+        let mut view_mir = None;
+
+        while self.match_token(&[TokenType::Newline]) {}
+        while !self.check(&TokenType::End) && !self.is_at_end() {
+            if let Some(field) = self.consume_identifier("Expected field name") {
+                self.consume(TokenType::Colon, "Expected ':' after field name")?;
+                match field.as_str() {
+                    "model" => {
+                        model_name = self
+                            .consume_identifier("Expected model name")?
+                            .clone();
+                    }
+                    "msg" => {
+                        msg_name = self
+                            .consume_identifier("Expected msg name")?
+                            .clone();
+                    }
+                    "init" => {
+                        init_witness = Some(Box::new(self.emit_expr_w().unwrap_or((0, {
+                            let s = self.span_of_current();
+                            MirWitness {
+                                kind: WitnessKind::Literal(Literal::Nil(s)),
+                                span: s,
+                            }
+                        })).1));
+                    }
+                    "update" => {
+                        update_mir = self.emit_closure_mir("update");
+                    }
+                    "view" => {
+                        view_mir = self.emit_closure_mir("view");
+                    }
+                    _ => {
+                        // skip unknown fields
+                    }
+                }
+            }
+            while self.match_token(&[TokenType::Newline]) {}
+        }
+        self.consume(TokenType::End, "Expected 'end' after app block")?;
+
+        // 将 init 表达式编译为 MirFunction（必须带 Return）
+        let init_mir = init_witness
+            .as_ref()
+            .map(|b| {
+                let mut mir = crate::mir::lower::lower_block_witness_to_mir(b);
+                if mir.body.is_empty() || !matches!(mir.body.last(), Some(MirInst::Return(_))) {
+                    let result_reg = mir.n_regs.saturating_sub(1);
+                    mir.body.push(MirInst::Return(Some(result_reg)));
+                }
+                mir
+            })
+            .unwrap_or_default();
+
+        // 恢复父上下文（app 块内部指令丢弃，仅保留 init/update/view 的 MirFunction）
+        let _ = std::mem::replace(&mut self.emit, parent).finish();
+
+        self.emit.emit(MirInst::AppDef {
+            name: name.clone(),
+            model_name: model_name.clone(),
+            msg_name: msg_name.clone(),
+            init_mir: Box::new(init_mir),
+            update_mir: Box::new(update_mir.unwrap_or_default()),
+            view_mir: Box::new(view_mir.unwrap_or_default()),
+        });
+
+        Some(MirWitness {
+            kind: WitnessKind::AppDef {
+                name: name.clone(),
+                model_name,
+                msg_name,
+                init_w: init_witness.unwrap_or_else(|| {
+                    Box::new(MirWitness {
+                        kind: WitnessKind::Literal(Literal::Nil(span)),
+                        span,
+                    })
+                }),
+                update_w: Box::new(MirWitness {
+                    kind: WitnessKind::Closure {
+                        params: Vec::new(),
+                        body: Box::new(MirWitness {
+                            kind: WitnessKind::Literal(Literal::Nil(span)),
+                            span,
+                        }),
+                    },
+                    span,
+                }),
+                view_w: Box::new(MirWitness {
+                    kind: WitnessKind::Closure {
+                        params: Vec::new(),
+                        body: Box::new(MirWitness {
+                            kind: WitnessKind::Literal(Literal::Nil(span)),
+                            span,
+                        }),
+                    },
+                    span,
+                }),
+            },
+            span,
+        })
+    }
+
+    /// 解析闭包表达式并直接返回其 body 的 MirFunction（用于 app 的 update/view 字段）。
+    /// 支持两种语法：
+    ///   - fn(params) => body
+    ///   - fn(params) block end
+    fn emit_closure_mir(&mut self, _label: &str) -> Option<MirFunction> {
+        // 消耗可选的 fn 关键字
+        let _ = self.match_token_exact(TokenType::Fn);
+        
+        // 子上下文：闭包体是独立寄存器空间
+        let parent = std::mem::replace(&mut self.emit, crate::mir::lower::EmitContext::new());
+
+        // 解析参数列表（可选）
+        let _params: Vec<String> = if self.match_token_exact(TokenType::LParen) {
+            let mut params = Vec::new();
+            while !self.check(&TokenType::RParen) && !self.is_at_end() {
+                if let Some(p) = self.consume_identifier("Expected parameter") {
+                    params.push(p);
+                }
+                if !self.match_token(&[TokenType::Comma]) {
+                    break;
+                }
+            }
+            self.consume(TokenType::RParen, "Expected ')' after params")?;
+            params
+        } else {
+            Vec::new()
+        };
+
+        // 解析闭包体
+        let (body_reg, _body_w) = if self.match_token_exact(TokenType::FatArrow) {
+            self.emit_expr_w()?
+        } else {
+            self.emit_block_w()?
+        };
+
+        self.emit.emit(MirInst::Return(Some(body_reg)));
+        let body_mir = std::mem::replace(&mut self.emit, parent).finish();
+        Some(body_mir)
     }
 
     fn emit_import_w(&mut self) -> Option<MirWitness> {
@@ -1530,6 +1714,7 @@ impl ParserV3 {
             TokenType::Identifier(n) if n == "perform" => self.emit_perform_w().map(|w| (0, w)),
             // v0.85: `with` 配置块（可嵌套在 task body 内）
             TokenType::With => self.emit_with_w().map(|w| (0, w)),
+            TokenType::App => self.emit_app_def_w().map(|w| (0, w)),
             TokenType::Identifier(n) if n == "commit" => {
                 let span = self.span_of_current();
                 self.advance(); // 'commit'

@@ -19,8 +19,7 @@ fn run_mora(source: &str) -> Result<Value, String> {
 #[test]
 fn diag_eval_simple_fn() {
     // Just eval a simple closure and see what it returns
-    let src = r#"let __result = eval("fn(x) x + 1")
-task main() end"#;
+    let src = r#"let __result = eval("fn(x) x + 1")"#;
     let result = run_mora(src).expect("simple eval should succeed");
     println!("diag1: eval('fn(x) x + 1') = {:?}", result);
     // Should be a closure
@@ -34,8 +33,7 @@ task main() end"#;
 fn diag_eval_fn_and_call() {
     // eval a closure and call it
     let src = r#"let f = eval("fn(x) x + 1")
-let __result = f(21)
-task main() end"#;
+let __result = f(21)"#;
     let result = run_mora(src).expect("eval+call should succeed");
     println!("diag2: eval('fn(x) x + 1')(21) = {:?}", result);
     assert_eq!(result.to_string(), "22.0");
@@ -45,8 +43,7 @@ task main() end"#;
 fn diag_eval_fn_inner_call() {
     // eval "fn(f) f(21)" and call with fn(x) x * 2
     let src = r#"let f = eval("fn(f) f(21)")
-let __result = f(fn(x) x * 2)
-task main() end"#;
+let __result = f(fn(x) x * 2)"#;
     let result = run_mora(src).expect("eval inner call should succeed");
     println!("diag3: eval('fn(f) f(21)')(fn(x) x * 2) = {:?}", result);
     assert_eq!(result.to_string(), "42.0");

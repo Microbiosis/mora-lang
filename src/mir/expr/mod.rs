@@ -490,6 +490,17 @@ pub enum MirExprKind {
         k_param: String,
     },
 
+    /// v0.88: Quasiquote — Lisp-style `` `expr `` with unquote/comma.
+    /// MirExpr-level representation for the legacy parse→lower path.
+    /// Each MirExpr in segments represents one quasiquote segment:
+    ///   - Literal(String(s)) → Quote(s) — static source text
+    ///   - Variable(name) → Unquote — resolve name to Reg during lowering
+    ///   - Call{Name("splice"), [expr]} → UnquoteSplice — resolve expr to Reg
+    ///
+    /// The emit path (compile) handles quasiquote directly as MirInst.
+    /// This variant mirrors that for path equivalence (proptest).
+    QuasiquoteExpr(Vec<MirExpr>),
+
     /// Sequence of expressions (blocks with multiple statements)
     Sequence(Vec<MirExpr>),
 }

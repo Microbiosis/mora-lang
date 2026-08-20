@@ -7,7 +7,7 @@ pub mod trait_info;
 
 /// 源码位置信息：所有需要报错的 AST 节点带 line。
 /// `column` 当前未使用（保留以备后续 LSP / 编辑器支持）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct Span {
     pub line: usize,
     pub column: usize,

@@ -27,6 +27,7 @@
 pub mod bidirectional; // v0.75.86: 双向类型检查骨架入口（Phase A）
 pub mod check_mir;
 pub mod dispatch;
+pub mod export;   // v0.89: shadow type table export (Phase 0 EHIR)
 pub mod hm;
 /// v0.75.18: 跨模块 import 符号表（typeck 阶段预扫描合并）
 pub mod imports;

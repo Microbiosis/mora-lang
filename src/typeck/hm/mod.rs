@@ -65,6 +65,12 @@ pub struct HMInference {
     // (`mark_diagnosed` / `is_diagnosed` / `is_diagnosed_at`) —— 抽离到
     // `crate::typeck::hm::diag::DiagFilter`（双向定型专用基础设施）。
     // HM 公共 API 回归到 v0.75.86 之前的纯粹 HM 状态。
+
+    /// v0.89: Shadow type table — captures infer_expr results per witness
+    /// node before substitution. Keyed by Span (unique within a file).
+    /// Used by `export_type_table` to produce a TypeTable without
+    /// modifying infer/unify/bidirectional logic.
+    pub shadow_types: HashMap<Span, (Type, crate::mir::effect::EffectRow)>,
 }
 
 // v0.75.94: 重新导出 WitnessNodeId（抽离到 diag 子模块）以保留外部 API
@@ -217,10 +223,10 @@ impl HMInference {
         }
     }
 
-    /// Solve all collected constraints, mutating internal state. Returns
-    /// the first unification error, or `Ok(())` if all constraints
-    /// unify cleanly.
-    pub fn solve_constraints(&mut self) -> Result<(), Vec<TypeError>> {
+    /// Solve all collected constraints, returning the final Substitution
+    /// and any diagnostics. The Substitution is needed by `export_type_table`
+    /// to resolve type variables in the shadow table.
+    pub fn solve_constraints(&mut self) -> (Substitution, Vec<TypeError>) {
         let mut subst = Substitution::new();
         let mut errors: Vec<TypeError> = Vec::new();
         for constraint in self.constraints.drain(..) {
@@ -234,18 +240,12 @@ impl HMInference {
                 }
             }
         }
-        if errors.is_empty() {
-            Ok(())
-        } else {
-            Err(errors)
-        }
+        (subst, errors)
     }
 
     /// Drive inference across an entire MirWitness program. Returns the
-    /// list of collected diagnostics. (Inferred types are surfaced via
-    /// `TypeError` diagnostics only; there is no per-node type cache on
-    /// `MirWitness` — see `mir/expr` — so inference always runs from the
-    /// expression tree itself.)
+    /// list of collected diagnostics. The internal Substitution is consumed
+    /// to resolve type variables in the shadow type table.
     pub fn infer_program(&mut self, exprs: &[MirWitness]) -> Vec<TypeError> {
         let mut errors: Vec<TypeError> = Vec::new();
         for expr in exprs {
@@ -253,9 +253,8 @@ impl HMInference {
                 errors.append(&mut errs);
             }
         }
-        if let Err(mut errs) = self.solve_constraints() {
-            errors.append(&mut errs);
-        }
+        let (_subst, mut solve_errors) = self.solve_constraints();
+        errors.append(&mut solve_errors);
         errors
     }
 
@@ -267,7 +266,7 @@ impl HMInference {
         &mut self,
         expr: &MirWitness,
     ) -> Result<(Type, crate::mir::effect::EffectRow), Vec<TypeError>> {
-        match &expr.kind {
+        let result = match &expr.kind {
             WitnessKind::Literal(lit) => Ok((infer_lit(lit), crate::mir::effect::EffectRow::Empty)),
             WitnessKind::Variable(name) => {
                 let ty = self.infer_var(name, expr.span)?;
@@ -449,7 +448,13 @@ impl HMInference {
                 }
                 Ok((Type::String, row))
             }
+        };
+        // Shadow capture: store pre-substitution (Type, EffectRow) per witness node.
+        // Keyed by Span (unique within a file). Used by export_type_table.
+        if let Ok(ref pair) = result {
+            self.shadow_types.insert(expr.span, pair.clone());
         }
+        result
     }
 
     /// v0.80: 合并两个 effect row（用于二元运算、if 分支等）。
@@ -628,8 +633,9 @@ mod tests {
             span: Span::default(),
         };
         hm.infer_expr(&expr).unwrap();
+        let (_subst, errors) = hm.solve_constraints();
         assert!(
-            hm.solve_constraints().is_ok(),
+            errors.is_empty(),
             "if(int,int,int) should unify cleanly"
         );
     }
@@ -657,8 +663,9 @@ mod tests {
             span: Span::default(),
         };
         hm.infer_expr(&expr).unwrap();
+        let (_subst, errors) = hm.solve_constraints();
         assert!(
-            hm.solve_constraints().is_ok(),
+            errors.is_empty(),
             "match with uniform arm types should unify"
         );
     }
@@ -768,8 +775,9 @@ mod tests {
         // solve_constraints should succeed — RowEq(body_row, Cons("Ai", residual))
         // unifies body_row (Cons("Ai", Empty)) with Cons("Ai", residual),
         // binding residual to Empty.
+        let (_subst, errors) = hm.solve_constraints();
         assert!(
-            hm.solve_constraints().is_ok(),
+            errors.is_empty(),
             "handle should solve row constraint cleanly"
         );
     }

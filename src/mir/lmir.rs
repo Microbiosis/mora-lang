@@ -184,3 +184,38 @@ impl LmirType {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mem_layout_presets() {
+        assert_eq!(MemLayout::int64().size, 8);
+        assert_eq!(MemLayout::float64().size, 8);
+        assert_eq!(MemLayout::bool().size, 1);
+        assert_eq!(MemLayout::ptr().size, 8);
+    }
+
+    #[test]
+    fn lmir_type_sizes() {
+        assert_eq!(LmirType::Int64.size(), 8);
+        assert_eq!(LmirType::Float64.size(), 8);
+        assert_eq!(LmirType::Bool.size(), 1);
+        assert_eq!(LmirType::Ptr.size(), 8);
+        assert_eq!(LmirType::Bytes(16).size(), 16);
+        assert_eq!(LmirType::Extern("void".to_string()).size(), 0);
+    }
+
+    #[test]
+    fn lmir_type_struct_size() {
+        let s = LmirType::Struct(vec![LmirType::Int64, LmirType::Bool, LmirType::Float64]);
+        assert_eq!(s.size(), 8 + 1 + 8);
+    }
+
+    #[test]
+    fn unbox_strategy_debug() {
+        let s = UnboxStrategy::SmallInline { threshold_bytes: 16 };
+        assert!(format!("{:?}", s).contains("16"));
+    }
+}

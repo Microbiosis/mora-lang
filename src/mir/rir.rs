@@ -182,3 +182,77 @@ impl JitBackend for LegacyJitBackend {
         self.version
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mir::core::{CoreBlock, CoreTerminator};
+    use crate::mir::effect::EffectRow;
+
+    fn dummy_func(name: &str, version: u64) -> CompiledFunction {
+        CompiledFunction {
+            name: name.to_string(),
+            params: vec![],
+            return_type: Type::Nil,
+            effects: EffectRow::Empty,
+            core: CoreFunction {
+                params: vec![],
+                blocks: vec![CoreBlock {
+                    id: 0,
+                    insts: vec![],
+                    terminator: CoreTerminator::Return(None),
+                }],
+                entry: 0,
+                effects: EffectRow::Empty,
+                n_regs: 0,
+            },
+            version,
+        }
+    }
+
+    #[test]
+    fn version_table_register_and_get() {
+        let mut vt = FunctionVersionTable::new();
+        vt.register(dummy_func("foo", 1));
+        let f = vt.get("foo").unwrap();
+        assert_eq!(f.version, 1);
+        assert_eq!(vt.version_count("foo"), 1);
+    }
+
+    #[test]
+    fn version_table_hot_swap() {
+        let mut vt = FunctionVersionTable::new();
+        vt.register(dummy_func("foo", 1));
+        vt.register(dummy_func("foo", 2));
+        assert_eq!(vt.version_count("foo"), 2);
+        assert!(vt.hot_swap("foo"));
+        let f = vt.get("foo").unwrap();
+        assert_eq!(f.version, 2);
+    }
+
+    #[test]
+    fn version_table_missing() {
+        let vt = FunctionVersionTable::new();
+        assert!(vt.get("nonexistent").is_none());
+        assert_eq!(vt.version_count("nonexistent"), 0);
+    }
+
+    #[test]
+    fn layout_table_insert_get() {
+        let mut lt = LayoutTable::new();
+        lt.insert("Int".to_string(), MemLayout::int64());
+        let layout = lt.get("Int").unwrap();
+        assert_eq!(layout.size, 8);
+        assert_eq!(layout.align, 8);
+    }
+
+    #[test]
+    fn legacy_jit_returns_reject() {
+        let jit = LegacyJitBackend::new();
+        let func = dummy_func("test", 1);
+        let layouts = LayoutTable::new();
+        let result = jit.try_compile(&func, &layouts);
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), JitError::CompileReject(_)));
+    }
+}

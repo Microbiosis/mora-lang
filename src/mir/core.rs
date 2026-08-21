@@ -228,3 +228,43 @@ impl EffectLabel {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn effect_label_roundtrip() {
+        for name in &["Ai", "Fs", "Mem", "Net", "Bsp"] {
+            let label = EffectLabel::from_name(name);
+            assert_eq!(label.name(), *name);
+        }
+        let custom = EffectLabel::from_name("MyEffect");
+        assert_eq!(custom.name(), "MyEffect");
+        assert!(matches!(custom, EffectLabel::Custom(_)));
+    }
+
+    #[test]
+    fn core_function_default() {
+        let func = CoreFunction {
+            params: vec![("x".to_string(), Type::Int)],
+            blocks: vec![],
+            entry: 0,
+            effects: EffectRow::Empty,
+            n_regs: 1,
+        };
+        assert_eq!(func.params.len(), 1);
+        assert_eq!(func.n_regs, 1);
+    }
+
+    #[test]
+    fn core_block_terminator() {
+        let block = CoreBlock {
+            id: 0,
+            insts: vec![CoreInst::Const(0, Value::Int(42))],
+            terminator: CoreTerminator::Return(Some(0)),
+        };
+        assert_eq!(block.id, 0);
+        assert_eq!(block.insts.len(), 1);
+    }
+}

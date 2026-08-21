@@ -27,6 +27,8 @@ pub mod cache;
 // v0.78: EffectRow — algebraic effect 的类型表示（Stage 1/4 落地）
 pub mod effect;
 pub mod expr;
+// v0.89: FCFG — 9 层 IR 架构第 1 层（Node<M> 泛型 + 结构化 CFG）
+pub mod fcfg;
 pub mod hint;
 pub mod host;
 pub mod jit;

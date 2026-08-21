@@ -163,14 +163,17 @@ mod tests {
 
     fn count_witness_children(w: &MirWitness) -> usize {
         match &w.kind {
-            WitnessKind::Binary { left, right, .. } => count_witnesses(&[left.as_ref().clone()]) + count_witnesses(&[right.as_ref().clone()]),
-            WitnessKind::Call { args, .. } => args.iter().map(|a| count_witnesses(&[a.clone()])).sum(),
-            WitnessKind::If { cond, then, r#else } => {
-                count_witnesses(&[cond.as_ref().clone()])
-                    + count_witnesses(&[then.as_ref().clone()])
-                    + r#else.as_ref().map_or(0, |e| count_witnesses(&[e.as_ref().clone()]))
+            WitnessKind::Binary { left, right, .. } => {
+                count_witnesses(std::slice::from_ref(left))
+                    + count_witnesses(std::slice::from_ref(right))
             }
-            WitnessKind::LetBinding { value, .. } => count_witnesses(&[value.as_ref().clone()]),
+            WitnessKind::Call { args, .. } => args.iter().map(|a| count_witnesses(std::slice::from_ref(a))).sum(),
+            WitnessKind::If { cond, then, r#else } => {
+                count_witnesses(std::slice::from_ref(cond))
+                    + count_witnesses(std::slice::from_ref(then))
+                    + r#else.as_ref().map_or(0, |e| count_witnesses(std::slice::from_ref(e)))
+            }
+            WitnessKind::LetBinding { value, .. } => count_witnesses(std::slice::from_ref(value)),
             WitnessKind::Sequence(exprs) => count_witnesses(exprs),
             _ => 0,
         }

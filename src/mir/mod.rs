@@ -29,6 +29,8 @@ pub mod effect;
 pub mod expr;
 // v0.89: FCFG — 9 层 IR 架构第 1 层（Node<M> 泛型 + 结构化 CFG）
 pub mod fcfg;
+// v0.89: FCFG → MIR 桥接层（Node<()> 降维为 MirInst 线性序列）
+pub mod fcfg_lower;
 pub mod hint;
 pub mod host;
 pub mod jit;

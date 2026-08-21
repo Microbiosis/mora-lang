@@ -39,6 +39,8 @@ pub mod jit;
 pub mod lower;
 pub mod opt;
 pub mod optimize;
+// v0.89: RIR/JIR — 9 层架构第 7-8 层（运行时 + JIT 接口）
+pub mod rir;
 pub mod ssa;
 // v0.75.38: MirWitness 轻量树骨架（typeck/LSP 消费面，去 AST 化中间层）
 pub mod witness;

@@ -26,11 +26,17 @@ use crate::value::Value;
 pub mod cache;
 // v0.89: CMIR — 9 层架构第 5 层（并发降维：BSP/Agent/SIMD）
 pub mod cmir;
+// v0.89: Core → CMIR 桥接
+pub mod core_to_cmir;
+// v0.89: CMIR → LMIR 桥接
+pub mod cmir_to_lmir;
 // v0.89: Core IR — 9 层架构第 3 层（函数式基元指令集，SSA 100% 覆盖）
 pub mod core;
 // v0.78: EffectRow — algebraic effect 的类型表示（Stage 1/4 落地）
 pub mod effect;
 pub mod expr;
+// v0.89: EHIR → Core 桥接
+pub mod ehir_to_core;
 // v0.89: FCFG — 9 层架构第 1 层（Node<M> 泛型 + 结构化 CFG）
 pub mod fcfg;
 // v0.89: FCFG → MIR 桥接层（Node<()> 降维为 MirInst 线性序列）
@@ -40,6 +46,8 @@ pub mod host;
 pub mod jit;
 // v0.89: LMIR — 9 层架构第 6 层（内存布局降维：Unbox/Alloc/GC/FFI）
 pub mod lmir;
+// v0.89: LMIR → RIR 连接（LayoutTable 填充 + Unbox 接入）
+pub mod lmir_to_rir;
 pub mod lower;
 pub mod opt;
 pub mod optimize;

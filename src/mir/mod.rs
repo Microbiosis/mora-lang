@@ -24,6 +24,8 @@ use crate::common::BinaryOp;
 use crate::value::Value;
 
 pub mod cache;
+// v0.89: Core IR — 9 层架构第 3 层（函数式基元指令集，SSA 100% 覆盖）
+pub mod core;
 // v0.78: EffectRow — algebraic effect 的类型表示（Stage 1/4 落地）
 pub mod effect;
 pub mod expr;

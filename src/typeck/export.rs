@@ -140,4 +140,70 @@ mod tests {
         let issues = verify_type_table(&table);
         assert!(issues.is_empty(), "literal-only table should have no unresolved vars: {:?}", issues);
     }
+
+    /// Helper: compile a .mora source string and return (witness_count, table_size, unresolved_count).
+    fn compile_and_export(source: &str) -> (usize, usize, usize) {
+        let (_func, witnesses) = crate::parser_v3::ParserV3::compile(source)
+            .expect("compile should succeed");
+        let witness_count = count_witnesses(&witnesses);
+        let table = export_type_table(&witnesses);
+        let table_size = table.types.len();
+        let issues = verify_type_table(&table);
+        (witness_count, table_size, issues.len())
+    }
+
+    fn count_witnesses(witnesses: &[MirWitness]) -> usize {
+        let mut count = 0;
+        for w in witnesses {
+            count += 1;
+            count += count_witness_children(w);
+        }
+        count
+    }
+
+    fn count_witness_children(w: &MirWitness) -> usize {
+        match &w.kind {
+            WitnessKind::Binary { left, right, .. } => count_witnesses(&[left.as_ref().clone()]) + count_witnesses(&[right.as_ref().clone()]),
+            WitnessKind::Call { args, .. } => args.iter().map(|a| count_witnesses(&[a.clone()])).sum(),
+            WitnessKind::If { cond, then, r#else } => {
+                count_witnesses(&[cond.as_ref().clone()])
+                    + count_witnesses(&[then.as_ref().clone()])
+                    + r#else.as_ref().map_or(0, |e| count_witnesses(&[e.as_ref().clone()]))
+            }
+            WitnessKind::LetBinding { value, .. } => count_witnesses(&[value.as_ref().clone()]),
+            WitnessKind::Sequence(exprs) => count_witnesses(exprs),
+            _ => 0,
+        }
+    }
+
+    #[test]
+    fn shadow_table_arithmetic() {
+        let source = "task main()\n  print(10i + 32i)\nend";
+        let (witness_count, table_size, unresolved) = compile_and_export(source);
+        assert!(witness_count > 0, "should have witnesses");
+        assert!(table_size > 0, "shadow table should capture types");
+        assert_eq!(unresolved, 0, "arithmetic should have no unresolved vars");
+    }
+
+    #[test]
+    fn shadow_table_function_call() {
+        let source = "let ops = {\"add\": fn(a, b) a + b end}\nprint(ops.add(2i, 3i))";
+        let (witness_count, table_size, unresolved) = compile_and_export(source);
+        assert!(witness_count > 0, "should have witnesses");
+        assert!(table_size > 0, "shadow table should capture types");
+        if unresolved > 0 {
+            eprintln!("NOTE: function_call has {} unresolved TypeVars (expected for polymorphic fns)", unresolved);
+        }
+    }
+
+    #[test]
+    fn shadow_table_handle_effect() {
+        let source = "let global_result = \"init\"\nhandle Ai {\n  global_result = perform Ai(\"hello\")\n} {\n  \"mocked:\" + __arg0\n}\nglobal_result";
+        let (witness_count, table_size, unresolved) = compile_and_export(source);
+        assert!(witness_count > 0, "should have witnesses");
+        assert!(table_size > 0, "shadow table should capture types");
+        if unresolved > 0 {
+            eprintln!("NOTE: handle_effect has {} unresolved TypeVars", unresolved);
+        }
+    }
 }

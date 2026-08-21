@@ -405,6 +405,22 @@ pub struct TypeInfo {
     pub span: Span,
 }
 
+impl TypeInfo {
+    /// 创建带类型的 TypeInfo。
+    pub fn new(ty: Type, effects: EffectRow, span: Span) -> Self {
+        Self { ty, effects, span }
+    }
+
+    /// 创建未知类型的 TypeInfo（TypeAny + Empty effect）。
+    pub fn unknown(span: Span) -> Self {
+        Self {
+            ty: Type::Any,
+            effects: EffectRow::Empty,
+            span,
+        }
+    }
+}
+
 // ===================================================================
 // 类型别名
 // ===================================================================

@@ -9,6 +9,7 @@
 use crate::mir::core::CoreFunction;
 use crate::mir::fcfg::Reg;
 use crate::mir::effect::EffectRow;
+use crate::mir::lmir::MemLayout;
 use crate::typeck::Type;
 
 // ===================================================================
@@ -124,16 +125,8 @@ pub trait JitBackend {
 /// JIR 不感知 Type，只消费 Layout。
 #[derive(Debug, Clone, Default)]
 pub struct LayoutTable {
-    /// 类型名 → 内存布局。
+    /// 类型名 → 内存布局（来自 lmir::MemLayout）。
     layouts: std::collections::HashMap<String, MemLayout>,
-}
-
-/// 内存布局描述。
-#[derive(Debug, Clone)]
-pub struct MemLayout {
-    pub size: usize,
-    pub align: usize,
-    pub fields: Vec<(usize, String)>, // (offset, type_name)
 }
 
 impl LayoutTable {

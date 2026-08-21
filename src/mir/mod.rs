@@ -60,6 +60,17 @@ pub use expr::MirExpr;
 pub use vm::run_mir;
 // lower_program removed in Phase A (v0.55) — use lower_mir_exprs instead
 
+// ── 9 层 IR 架构 re-exports ──
+pub use fcfg::{Block as FcfgBlock, Ehir, Fcfg, Node, TypeInfo};
+pub use fcfg_lower::lower_fcfg;
+pub use core::{CoreBlock, CoreFunction, CoreInst, CoreTerminator};
+pub use cmir::{CmirBlock, CmirNode, ConcurrencyMode};
+pub use lmir::{LmirInst, LmirType, MemLayout};
+pub use rir::{
+    CompiledFunction, FunctionVersionTable, JitBackend, JitEntry, JitError, LayoutTable,
+    LegacyJitBackend,
+};
+
 /// 虚拟寄存器索引（无限数量，lowering 时计数器分配）
 pub type Reg = usize;
 

@@ -294,10 +294,147 @@ fn lower_node(ctx: &mut EmitContext, node: &Fcfg) {
             ctx.emit(MirInst::Expr(*reg));
         }
 
-        // ── 未覆盖的变体：暂时 emit Nop（Nil 常量占位）──
-        _ => {
-            let nop = ctx.alloc_reg();
-            ctx.emit(MirInst::Const(nop, Value::Nil));
+        // ── 声明类（编译期注册，运行时无操作）──
+        Node::EnumDef { name, variants, .. } => {
+            let vars: Vec<crate::common::EnumVariant> = variants
+                .iter()
+                .map(|v| crate::common::EnumVariant {
+                    name: v.name.clone(),
+                    data: v.payload.as_ref().map(|p| p.0.clone()),
+                })
+                .collect();
+            ctx.emit(MirInst::EnumDef {
+                name: name.clone(),
+                variants: vars,
+            });
+        }
+        Node::StructDef { name, fields, .. } => {
+            let flds: Vec<crate::common::StructField> = fields
+                .iter()
+                .map(|(n, t)| crate::common::StructField {
+                    name: n.clone(),
+                    type_hint: t.0.clone(),
+                })
+                .collect();
+            ctx.emit(MirInst::StructDef {
+                name: name.clone(),
+                fields: flds,
+            });
+        }
+        Node::TraitDef { name, methods, .. } => {
+            let meths: Vec<super::expr::MirTraitMethod> = methods
+                .iter()
+                .map(|m| super::expr::MirTraitMethod {
+                    name: m.name.clone(),
+                    params: vec![], // FCFG Param → MirExpr Param 需要额外转换
+                    return_type: m.return_ann.as_ref().map(|r| r.0.clone()),
+                    body: None,
+                })
+                .collect();
+            ctx.emit(MirInst::TraitDef {
+                name: name.clone(),
+                parents: vec![],
+                methods: meths,
+                method_bodies: vec![],
+            });
+        }
+        Node::ImplDef { trait_name, for_type, methods, .. } => {
+            let fndefs: Vec<super::expr::MirFnDef> = methods
+                .iter()
+                .map(|(n, b)| super::expr::MirFnDef {
+                    name: n.clone(),
+                    params: vec![],
+                    return_type: None,
+                    body: Some(lower_block_to_function(ctx, b)),
+                })
+                .collect();
+            ctx.emit(MirInst::ImplDef {
+                trait_name: trait_name.clone(),
+                trait_generics: vec![],
+                for_type: for_type.0.clone(),
+                for_generics: vec![],
+                methods: fndefs,
+                method_bodies: vec![],
+            });
+        }
+        Node::MacroDef { name, params, body, .. } => {
+            let body_mir = lower_block_to_function(ctx, body);
+            ctx.emit(MirInst::MacroDef {
+                name: name.clone(),
+                params: params.clone(),
+                body: Box::new(body_mir),
+            });
+        }
+
+        // ── TEA 定义 ──
+        Node::ModelDef { name, fields, .. } => {
+            let flds: Vec<crate::common::StructField> = fields
+                .iter()
+                .map(|(n, t)| crate::common::StructField {
+                    name: n.clone(),
+                    type_hint: t.0.clone(),
+                })
+                .collect();
+            ctx.emit(MirInst::ModelDef {
+                name: name.clone(),
+                fields: flds,
+            });
+        }
+        Node::MsgDef { name, variants, .. } => {
+            let vars: Vec<crate::common::MsgVariant> = variants
+                .iter()
+                .map(|v| crate::common::MsgVariant {
+                    name: v.name.clone(),
+                    payload_type: v.payload.as_ref().map(|p| p.0.clone()),
+                })
+                .collect();
+            ctx.emit(MirInst::MsgDef {
+                name: name.clone(),
+                variants: vars,
+            });
+        }
+        Node::UpdateDef { name, params, body, .. } => {
+            let param_names: Vec<String> = params.iter().map(|p| p.name.clone()).collect();
+            let body_mir = lower_block_to_function(ctx, body);
+            ctx.emit(MirInst::UpdateDef {
+                name: name.clone(),
+                params: param_names,
+                body: Box::new(body_mir),
+            });
+        }
+        Node::AppDef { name, model, msg, init, update, view, .. } => {
+            let init_mir = lower_block_to_function(ctx, init);
+            let update_mir = lower_block_to_function(ctx, update);
+            let view_mir = lower_block_to_function(ctx, view);
+            ctx.emit(MirInst::AppDef {
+                name: name.clone(),
+                model_name: model.clone(),
+                msg_name: msg.clone(),
+                init_mir: Box::new(init_mir),
+                update_mir: Box::new(update_mir),
+                view_mir: Box::new(view_mir),
+            });
+        }
+
+        // ── 编排 ──
+        Node::Orchestrate { input_var, result_var, .. } => {
+            // FCFG OrchestrateKind → MirOrchestrateKind 转换需要 agent 定义，
+            // 桥接层暂用 Sequential 占位。
+            ctx.emit(MirInst::Orchestrate {
+                input_var: input_var.clone(),
+                result_var: result_var.clone(),
+                kind: Box::new(super::expr::MirOrchestrateKind::Sequential { agents: vec![] }),
+            });
+        }
+
+        // ── 配置块 ──
+        Node::WithConfig { bindings, body, .. } => {
+            let body_mir = lower_block_to_function(ctx, body);
+            ctx.emit(MirInst::WithConfig {
+                bindings: bindings.clone(),
+                body: Box::new(body_mir),
+                jit: false,
+            });
         }
     }
 }

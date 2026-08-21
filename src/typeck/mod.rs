@@ -33,6 +33,10 @@ pub mod hm;
 /// v0.75.18: 跨模块 import 符号表（typeck 阶段预扫描合并）
 pub mod imports;
 
+// ── 9 层 IR 架构 re-exports ──
+pub use annotate::annotate;
+pub use export::{export_type_table, verify_type_table, TypeTable};
+
 use std::collections::HashMap;
 
 // v1 AST types no longer imported — all v2 paths use ast_v2 / common

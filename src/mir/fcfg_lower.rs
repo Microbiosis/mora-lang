@@ -386,11 +386,14 @@ mod tests {
     use super::*;
     use crate::common::{Literal, Span};
 
+    const S: Span = Span { line: 0, column: 0 };
+
     #[test]
     fn lower_literal_node() {
         let nodes = vec![Node::Literal {
             reg: 0,
             value: Literal::Int(42, Span::default()),
+            span: S,
             meta: (),
         }];
         let (insts, n_regs) = lower_fcfg(&nodes);
@@ -412,6 +415,7 @@ mod tests {
             lhs: 0,
             op: BinaryOp::Add,
             rhs: 1,
+            span: S,
             meta: (),
         }];
         let (insts, _) = lower_fcfg(&nodes);
@@ -429,14 +433,13 @@ mod tests {
 
     #[test]
     fn lower_if_node() {
-        // if cond { then_val } else { else_val }
-        // cond = r0 (true), then = r1, else = r2
         let nodes = vec![Node::If {
             cond: 0,
             then: Block {
                 nodes: vec![Node::Literal {
                     reg: 1,
                     value: Literal::Int(1, Span::default()),
+                    span: S,
                     meta: (),
                 }],
                 result: Some(1),
@@ -445,14 +448,15 @@ mod tests {
                 nodes: vec![Node::Literal {
                     reg: 2,
                     value: Literal::Int(2, Span::default()),
+                    span: S,
                     meta: (),
                 }],
                 result: Some(2),
             }),
+            span: S,
             meta: (),
         }];
         let (insts, n_regs) = lower_fcfg(&nodes);
-        // Expected: JumpIfNot(r0, 3), Const(r1, 1), Jump(4), Const(r2, 2)
         assert_eq!(insts.len(), 4, "expected 4 instructions: {:?}", insts);
         assert!(matches!(&insts[0], MirInst::JumpIfNot(0, _)));
         assert!(matches!(&insts[1], MirInst::Const(1, Value::Int(1))));
@@ -468,14 +472,17 @@ mod tests {
                 Node::Literal {
                     reg: 0,
                     value: Literal::Int(1, Span::default()),
+                    span: S,
                     meta: (),
                 },
                 Node::Literal {
                     reg: 1,
                     value: Literal::Int(2, Span::default()),
+                    span: S,
                     meta: (),
                 },
             ],
+            span: S,
             meta: (),
         }];
         let (insts, _) = lower_fcfg(&nodes);

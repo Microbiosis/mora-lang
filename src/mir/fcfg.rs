@@ -28,17 +28,20 @@ use crate::typeck::Type;
 /// - `M = TypeInfo`：EHIR（带类型标签）
 ///
 /// 每个节点有一个 `meta: M` 字段，遍历时可选择性消费或忽略。
+/// `span` 是源码位置，所有层共享（用于错误报告和影子表映射）。
 #[derive(Debug, Clone)]
 pub enum Node<M> {
     // ── 值产生 ──
     Literal {
         reg: Reg,
         value: Literal,
+        span: Span,
         meta: M,
     },
     Variable {
         reg: Reg,
         name: String,
+        span: Span,
         meta: M,
     },
     BinaryOp {
@@ -46,12 +49,14 @@ pub enum Node<M> {
         lhs: Reg,
         op: BinaryOp,
         rhs: Reg,
+        span: Span,
         meta: M,
     },
     Call {
         dst: Reg,
         callee: Reg,
         args: Vec<Reg>,
+        span: Span,
         meta: M,
     },
     MethodCall {
@@ -59,22 +64,26 @@ pub enum Node<M> {
         receiver: Reg,
         method: String,
         args: Vec<Reg>,
+        span: Span,
         meta: M,
     },
     ListLit {
         dst: Reg,
         items: Vec<Reg>,
+        span: Span,
         meta: M,
     },
     DictLit {
         dst: Reg,
         entries: Vec<(String, Reg)>,
+        span: Span,
         meta: M,
     },
     Index {
         dst: Reg,
         obj: Reg,
         idx: Reg,
+        span: Span,
         meta: M,
     },
 
@@ -83,32 +92,39 @@ pub enum Node<M> {
         cond: Reg,
         then: Block<M>,
         else_: Option<Block<M>>,
+        span: Span,
         meta: M,
     },
     While {
         cond: Block<M>,
         body: Block<M>,
+        span: Span,
         meta: M,
     },
     For {
         var: String,
         iter: Reg,
         body: Block<M>,
+        span: Span,
         meta: M,
     },
     Match {
         scrutinee: Reg,
         arms: Vec<MatchArm<M>>,
+        span: Span,
         meta: M,
     },
     Return {
         value: Option<Reg>,
+        span: Span,
         meta: M,
     },
     Break {
+        span: Span,
         meta: M,
     },
     Continue {
+        span: Span,
         meta: M,
     },
 
@@ -118,17 +134,20 @@ pub enum Node<M> {
         type_ann: Option<TypeAnnotation>,
         value: Reg,
         body: Block<M>,
+        span: Span,
         meta: M,
     },
     Assign {
         name: String,
         value: Reg,
+        span: Span,
         meta: M,
     },
     IndexAssign {
         obj: Reg,
         idx: Reg,
         value: Reg,
+        span: Span,
         meta: M,
     },
 
@@ -138,42 +157,50 @@ pub enum Node<M> {
         params: Vec<Param>,
         return_ann: Option<TypeAnnotation>,
         body: Block<M>,
+        span: Span,
         meta: M,
     },
     TypeAlias {
         name: String,
         target: TypeAnnotation,
+        span: Span,
         meta: M,
     },
     EnumDef {
         name: String,
         variants: Vec<Variant>,
+        span: Span,
         meta: M,
     },
     StructDef {
         name: String,
         fields: Vec<(String, TypeAnnotation)>,
+        span: Span,
         meta: M,
     },
     TraitDef {
         name: String,
         methods: Vec<TraitMethod>,
+        span: Span,
         meta: M,
     },
     ImplDef {
         trait_name: String,
         for_type: TypeAnnotation,
         methods: Vec<(String, Block<M>)>,
+        span: Span,
         meta: M,
     },
     Import {
         path: String,
+        span: Span,
         meta: M,
     },
     MacroDef {
         name: String,
         params: Vec<String>,
         body: Block<M>,
+        span: Span,
         meta: M,
     },
 
@@ -181,6 +208,7 @@ pub enum Node<M> {
     Perform {
         effect: String,
         args: Vec<Reg>,
+        span: Span,
         meta: M,
     },
     Handle {
@@ -188,6 +216,7 @@ pub enum Node<M> {
         body: Block<M>,
         handler: Block<M>,
         k_param: String,
+        span: Span,
         meta: M,
     },
 
@@ -195,17 +224,20 @@ pub enum Node<M> {
     ModelDef {
         name: String,
         fields: Vec<(String, TypeAnnotation)>,
+        span: Span,
         meta: M,
     },
     MsgDef {
         name: String,
         variants: Vec<Variant>,
+        span: Span,
         meta: M,
     },
     UpdateDef {
         name: String,
         params: Vec<Param>,
         body: Block<M>,
+        span: Span,
         meta: M,
     },
     AppDef {
@@ -215,6 +247,7 @@ pub enum Node<M> {
         init: Block<M>,
         update: Block<M>,
         view: Block<M>,
+        span: Span,
         meta: M,
     },
 
@@ -222,6 +255,7 @@ pub enum Node<M> {
     Quasiquote {
         dst: Reg,
         segments: Vec<QuasiquoteSegment>,
+        span: Span,
         meta: M,
     },
 
@@ -230,6 +264,7 @@ pub enum Node<M> {
         input_var: String,
         result_var: String,
         kind: OrchestrateKind<M>,
+        span: Span,
         meta: M,
     },
 
@@ -237,18 +272,21 @@ pub enum Node<M> {
     WithConfig {
         bindings: Vec<(String, Reg)>,
         body: Block<M>,
+        span: Span,
         meta: M,
     },
 
     // ── 序列 ──
     Sequence {
         nodes: Vec<Node<M>>,
+        span: Span,
         meta: M,
     },
 
     // ── 表达式语句（丢弃结果）──
     Expr {
         reg: Reg,
+        span: Span,
         meta: M,
     },
 }
@@ -382,3 +420,95 @@ pub type FcfgBlock = Block<()>;
 
 /// EHIR 块。
 pub type EhirBlock = Block<TypeInfo>;
+
+// ===================================================================
+// Node<M> 辅助方法
+// ===================================================================
+
+impl<M> Node<M> {
+    /// 获取节点的源码位置。
+    pub fn span(&self) -> Span {
+        match self {
+            Node::Literal { span, .. }
+            | Node::Variable { span, .. }
+            | Node::BinaryOp { span, .. }
+            | Node::Call { span, .. }
+            | Node::MethodCall { span, .. }
+            | Node::ListLit { span, .. }
+            | Node::DictLit { span, .. }
+            | Node::Index { span, .. }
+            | Node::If { span, .. }
+            | Node::While { span, .. }
+            | Node::For { span, .. }
+            | Node::Match { span, .. }
+            | Node::Return { span, .. }
+            | Node::Break { span, .. }
+            | Node::Continue { span, .. }
+            | Node::Let { span, .. }
+            | Node::Assign { span, .. }
+            | Node::IndexAssign { span, .. }
+            | Node::FnDef { span, .. }
+            | Node::TypeAlias { span, .. }
+            | Node::EnumDef { span, .. }
+            | Node::StructDef { span, .. }
+            | Node::TraitDef { span, .. }
+            | Node::ImplDef { span, .. }
+            | Node::Import { span, .. }
+            | Node::MacroDef { span, .. }
+            | Node::Perform { span, .. }
+            | Node::Handle { span, .. }
+            | Node::ModelDef { span, .. }
+            | Node::MsgDef { span, .. }
+            | Node::UpdateDef { span, .. }
+            | Node::AppDef { span, .. }
+            | Node::Quasiquote { span, .. }
+            | Node::Orchestrate { span, .. }
+            | Node::WithConfig { span, .. }
+            | Node::Sequence { span, .. }
+            | Node::Expr { span, .. } => *span,
+        }
+    }
+
+    /// 获取节点的 meta 引用。
+    pub fn meta(&self) -> &M {
+        match self {
+            Node::Literal { meta, .. }
+            | Node::Variable { meta, .. }
+            | Node::BinaryOp { meta, .. }
+            | Node::Call { meta, .. }
+            | Node::MethodCall { meta, .. }
+            | Node::ListLit { meta, .. }
+            | Node::DictLit { meta, .. }
+            | Node::Index { meta, .. }
+            | Node::If { meta, .. }
+            | Node::While { meta, .. }
+            | Node::For { meta, .. }
+            | Node::Match { meta, .. }
+            | Node::Return { meta, .. }
+            | Node::Break { meta, .. }
+            | Node::Continue { meta, .. }
+            | Node::Let { meta, .. }
+            | Node::Assign { meta, .. }
+            | Node::IndexAssign { meta, .. }
+            | Node::FnDef { meta, .. }
+            | Node::TypeAlias { meta, .. }
+            | Node::EnumDef { meta, .. }
+            | Node::StructDef { meta, .. }
+            | Node::TraitDef { meta, .. }
+            | Node::ImplDef { meta, .. }
+            | Node::Import { meta, .. }
+            | Node::MacroDef { meta, .. }
+            | Node::Perform { meta, .. }
+            | Node::Handle { meta, .. }
+            | Node::ModelDef { meta, .. }
+            | Node::MsgDef { meta, .. }
+            | Node::UpdateDef { meta, .. }
+            | Node::AppDef { meta, .. }
+            | Node::Quasiquote { meta, .. }
+            | Node::Orchestrate { meta, .. }
+            | Node::WithConfig { meta, .. }
+            | Node::Sequence { meta, .. }
+            | Node::Expr { meta, .. } => meta,
+        }
+    }
+}

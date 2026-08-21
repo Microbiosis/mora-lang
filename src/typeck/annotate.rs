@@ -47,9 +47,10 @@ fn annotate_node(node: &Fcfg, table: &TypeTable) -> Node<TypeInfo> {
             span: *span,
             meta: info,
         },
-        Node::Call { dst, callee, args, span, .. } => Node::Call {
+        Node::Call { dst, callee, callee_name, args, span, .. } => Node::Call {
             dst: *dst,
             callee: *callee,
+            callee_name: callee_name.clone(),
             args: args.clone(),
             span: *span,
             meta: info,

@@ -55,6 +55,8 @@ pub enum Node<M> {
     Call {
         dst: Reg,
         callee: Reg,
+        /// 函数名（已知时填充，桥接层直接使用）。
+        callee_name: Option<String>,
         args: Vec<Reg>,
         span: Span,
         meta: M,

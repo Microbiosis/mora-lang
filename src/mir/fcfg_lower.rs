@@ -99,11 +99,11 @@ fn lower_node(ctx: &mut EmitContext, node: &Fcfg) {
         Node::BinaryOp { dst, lhs, op, rhs, .. } => {
             ctx.emit(MirInst::BinaryOp(*dst, *lhs, op.clone(), *rhs));
         }
-        Node::Call { dst, callee, args, .. } => {
-            // FCFG 的 Call 用 Reg 作 callee，但 MirInst::Call 用 String。
-            // 桥接层保留 Reg→String 映射（callee 已在 emit 阶段解析为名称）。
-            // 这里用 format! 作为占位——实际迁移时 callee 应携带名称。
-            ctx.emit(MirInst::Call(*dst, format!("_r{}", callee), args.clone()));
+        Node::Call { dst, callee, callee_name, args, .. } => {
+            let name = callee_name
+                .clone()
+                .unwrap_or_else(|| format!("_r{}", callee));
+            ctx.emit(MirInst::Call(*dst, name, args.clone()));
         }
         Node::MethodCall { dst, receiver, method, args, .. } => {
             ctx.emit(MirInst::MethodCall(*dst, *receiver, method.clone(), args.clone()));

@@ -8,6 +8,27 @@
 //! - Unboxed 原语（Int→i64, Float→f64, Bool→i1 由 LMIR 处理，
 //!   Core 层保持 Value 语义，但指令集已降维为基元）
 //! - 效果行已知（EHIR 已推断，Core 消费 EffectLabel）
+//!
+//! ## CoreInst vs MirInst 覆盖范围
+//!
+//! MirInst 有 50 个变体，CoreInst 有 ~20 个。**44/50 MirInst 变体没有
+//! CoreInst 直接等价物**。这是设计如此，不是缺口：
+//!
+//! | 类别 | MirInst 变体 | Core 处理方式 |
+//! |------|-------------|--------------|
+//! | 声明 | TraitDef/ImplDef/EnumDef/StructDef/TypeAlias | 编译期消失，不进 Core |
+//! | TEA | ModelDef/MsgDef/UpdateDef/AppDef | 编译期注册，不进 Core |
+//! | I/O | Save/Load/ReadFile/WriteFile/... | RIR 层处理 |
+//! | 并发 | Send/Aggregate/Halt/Worker | CMIR 层处理 |
+//! | 元编程 | Quasiquote/MacroDef | 编译期展开 |
+//! | 效果 | Handle (单节点) | EffectInstall + EffectRestore (拆分) |
+//! | 闭包 | TaskDef/Closure | ClosureCreate + ClosureCall |
+//! | 控制流 | Label/Jump/JumpIf/JumpIfNot | Branch/Jump (BlockId) |
+//! | 管道 | Pipe | Call 链 |
+//! | AI | Prompt/PromptSection/DocumentSection | 高层语义，Core 不感知 |
+//!
+//! Core 的职责是**纯 SSA 可优化子集**，而非 MirInst 的全集映射。
+//! 声明/TEA/I/O/并发/元编程等语义由各自层级处理，不经过 Core 优化。
 
 use crate::common::BinaryOp;
 use crate::mir::effect::EffectRow;

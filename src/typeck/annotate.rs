@@ -138,7 +138,8 @@ fn annotate_node(node: &Fcfg, table: &TypeTable) -> Node<TypeInfo> {
             span: *span,
             meta: info,
         },
-        Node::Match { scrutinee, arms, span, .. } => Node::Match {
+        Node::Match { dst, scrutinee, arms, span, .. } => Node::Match {
+            dst: *dst,
             scrutinee: *scrutinee,
             arms: arms.iter().map(|a| annotate_arm(a, table)).collect(),
             span: *span,

@@ -199,8 +199,9 @@ fn build_node(b: &mut FcfgBuilder, w: &MirWitness) -> Node<()> {
                     body: build_block(b, &arm.body),
                 })
                 .collect();
+            let dst = b.alloc();
             Node::Sequence {
-                nodes: vec![scrut_node, Node::Match { scrutinee: scrut_reg, arms: core_arms, span, meta: () }],
+                nodes: vec![scrut_node, Node::Match { dst, scrutinee: scrut_reg, arms: core_arms, span, meta: () }],
                 span,
                 meta: (),
             }
@@ -515,9 +516,9 @@ fn node_result_reg_of(n: &Node<()>) -> Option<Reg> {
         | Node::DictLit { dst: reg, .. }
         | Node::Index { dst: reg, .. }
         | Node::Perform { dst: reg, .. }
+        | Node::Match { dst: reg, .. }
         | Node::Quasiquote { dst: reg, .. } => Some(*reg),
         Node::Sequence { nodes, .. } => nodes.last().and_then(node_result_reg_of),
-        Node::If { .. } => None, // If 的结果在 then/else 块中
         _ => None,
     }
 }

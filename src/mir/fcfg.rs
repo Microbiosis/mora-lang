@@ -150,6 +150,9 @@ pub enum Node<M> {
         meta: M,
     },
     Match {
+        /// match 表达式的统一结果寄存器 — 所有 arm 的 output_reg
+        /// 共用此寄存器（h_match_expr 写入，消费者读取）。
+        dst: Reg,
         scrutinee: Reg,
         arms: Vec<MatchArm<M>>,
         span: Span,

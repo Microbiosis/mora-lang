@@ -73,8 +73,8 @@ fn max_reg_in_node(node: &Fcfg) -> usize {
             max_reg_in_nodes(&cond.nodes).max(max_reg_in_nodes(&body.nodes))
         }
         Node::For { iter, body, .. } => *iter.max(&max_reg_in_nodes(&body.nodes)),
-        Node::Match { scrutinee, arms, .. } => {
-            let mut m = *scrutinee;
+        Node::Match { dst, scrutinee, arms, .. } => {
+            let mut m = *dst.max(scrutinee);
             for arm in arms {
                 m = m.max(max_reg_in_nodes(&arm.body.nodes));
             }
@@ -150,7 +150,7 @@ fn lower_node(ctx: &mut EmitContext, node: &Fcfg) {
         }
         Node::ClosureExpr { dst, params, body, .. } => {
             let param_names: Vec<String> = params.iter().map(|p| p.name.clone()).collect();
-            let body_mir = lower_block_to_function(ctx, body);
+            let body_mir = lower_body_function_with_return(ctx, body);
             ctx.emit(MirInst::Closure {
                 dst: *dst,
                 params: param_names,
@@ -249,8 +249,8 @@ fn lower_node(ctx: &mut EmitContext, node: &Fcfg) {
         }
 
         // ── Match → 单条 MatchExpr（镜像 emit_match_w：嵌套 arm MirFunction）──
-        Node::Match { scrutinee, arms, .. } => {
-            lower_match(ctx, *scrutinee, arms);
+        Node::Match { dst, scrutinee, arms, .. } => {
+            lower_match(ctx, *scrutinee, *dst, arms);
         }
 
         // ── Return/Break/Continue ──
@@ -288,7 +288,7 @@ fn lower_node(ctx: &mut EmitContext, node: &Fcfg) {
         // ── 声明 ──
         Node::FnDef { name, params, body, .. } => {
             let param_names: Vec<String> = params.iter().map(|p| p.name.clone()).collect();
-            let body_mir = lower_block_to_function(ctx, body);
+            let body_mir = lower_body_function_with_return(ctx, body);
             ctx.emit(MirInst::TaskDef {
                 name: name.clone(),
                 params: param_names,
@@ -517,10 +517,23 @@ fn lower_block_to_function(ctx: &mut EmitContext, block: &Block<()>) -> super::M
     sub.finish()
 }
 
+/// 将块降维为带尾部 Return 的 MirFunction（闭包/task/match-arm 体约定 —
+/// 镜像 emit_closure_mir / emit_fn_def_w：body 末尾必须 Return 结果寄存器，
+/// 否则 run_mir 调用闭包时返回 Nil）。Handle body/handler 不走此路径。
+fn lower_body_function_with_return(ctx: &mut EmitContext, block: &Block<()>) -> super::MirFunction {
+    let mut func = lower_block_to_function(ctx, block);
+    if func.body.is_empty() || !matches!(func.body.last(), Some(MirInst::Return(_))) {
+        let result_reg = block.result.unwrap_or_else(|| func.n_regs.saturating_sub(1));
+        func.body.push(MirInst::Return(Some(result_reg)));
+    }
+    func
+}
+
 /// 降维 Match 表达式。
-fn lower_match(ctx: &mut EmitContext, scrutinee: Reg, arms: &[MatchArm<()>]) {
+fn lower_match(ctx: &mut EmitContext, scrutinee: Reg, dst: Reg, arms: &[MatchArm<()>]) {
     // 镜像 emit_match_w：单条 MatchExpr，arm body 为嵌套 MirFunction
-    //（末尾带 Return），pattern 序列化为字符串。
+    //（末尾带 Return）。output_reg 统一为 dst — 所有 arm 写同一寄存器，
+    // 消费者（let/Define/嵌套表达式）读 dst（与 inst.dst() 约定一致）。
     let mir_arms: Vec<(String, Option<Reg>, Box<super::MirFunction>, Reg)> = arms
         .iter()
         .map(|arm| {
@@ -531,11 +544,10 @@ fn lower_match(ctx: &mut EmitContext, scrutinee: Reg, arms: &[MatchArm<()>]) {
                 let result_reg = arm.body.result.unwrap_or(0);
                 body_fn.body.push(MirInst::Return(Some(result_reg)));
             }
-            let val_reg = arm.body.result.unwrap_or(0);
-            (pat_str, arm.guard, Box::new(body_fn), val_reg)
+            (pat_str, arm.guard, Box::new(body_fn), dst)
         })
         .collect();
-    let _dst = ctx.alloc_reg(); // 镜像 emit_match_w：结果寄存器槽位保留
+    let _ = ctx.alloc_reg(); // 镜像 emit_match_w：结果寄存器槽位保留
     ctx.emit(MirInst::MatchExpr { val: scrutinee, arms: mir_arms });
 }
 

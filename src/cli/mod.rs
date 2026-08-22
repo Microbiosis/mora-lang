@@ -28,30 +28,38 @@ pub fn compile_and_opt(
 ) {
     let (mut func, witnesses) =
         ParserV3::compile(source).unwrap_or_else(|e| panic!("compile_and_opt failed: {e}"));
-    // v0.58: Cascades 优化 pass（同 lower_mir_exprs_with_opt）
-    crate::mir::optimize::apply_rules(&mut func);
-    // v0.75.7: SSA 优化管线（显式等级 or env）
+
+    // v0.90.3: 执行器切换 — 9 层管线产出成为生产 MirFunction。
+    //
+    // 流程：
+    //   1. 管线在 apply_rules 之前运行（差分要求 raw-to-raw）
+    //   2. 类别级差分（管线 vs emit.rs 直出）绿 → 管线产出经同一套
+    //      优化（apply_rules + SSA opt）后作为返回值 — 生产执行 9 层代码
+    //   3. 差分红 → 自动回落原管线（不中断编译），DEBUG 模式输出差异
+    //
+    // 等价性保证：tests/nine_layer_differential.rs 19 fixture 双级差分
+    // （类别级 + 执行级）锁定两条管线的语义等价。
+    // MORA_9LAYER=0 可禁用（回落纯原管线）。
     let level = opt_level.unwrap_or_default();
-    if level.enabled() {
-        crate::mir::opt::optimize(&mut func, level);
-    }
-    // v0.90: 9 层管线激活 — witness→FCFG→EHIR→Core→CMIR→LMIR→LayoutTable
-    // 全量运行 + 与原管线差分验证。执行器仍消费 func（Phase 2 切换点）。
-    // MORA_9LAYER=0 可禁用（性能敏感场景）。
     if std::env::var("MORA_9LAYER").map_or(true, |v| v != "0") {
-        let result = crate::mir::pipeline::run_pipeline(&func, &witnesses);
-        // 差分诊断仅在 MORA_9LAYER_DEBUG=1 时输出（不污染正常 stdout）
-        if std::env::var("MORA_9LAYER_DEBUG").is_ok_and(|v| v == "1")
-            && !result.differential_ok
-        {
+        let (result, mut pipeline_func) =
+            crate::mir::pipeline::run_pipeline(&func, &witnesses);
+        if result.differential_ok {
+            // 双侧同序优化 — 管线产出走与原管线完全一致的优化路径
+            crate::mir::optimize::apply_rules(&mut pipeline_func);
+            if level.enabled() {
+                crate::mir::opt::optimize(&mut pipeline_func, level);
+            }
+            return (pipeline_func, witnesses);
+        }
+        if std::env::var("MORA_9LAYER_DEBUG").is_ok_and(|v| v == "1") {
             eprintln!(
-                "[9layer] fcfg={} typed={} core={} cmir={} lmir={} layouts={} | pipeline_mir={} original_mir={}",
+                "[9layer] differential FAILED — falling back to emit.rs path | fcfg={} typed={} core={} cmir={} lmir={} | pipeline_mir={} original_mir={}",
                 result.fcfg_nodes,
                 result.typed_nodes,
                 result.core_insts,
                 result.cmir_nodes,
                 result.lmir_insts,
-                result.layouts,
                 result.pipeline_mir_count,
                 result.original_mir_count
             );
@@ -59,6 +67,12 @@ pub fn compile_and_opt(
                 eprintln!("[9layer] diff: {}", d);
             }
         }
+    }
+
+    // 原管线路径（回落 / MORA_9LAYER=0）
+    crate::mir::optimize::apply_rules(&mut func);
+    if level.enabled() {
+        crate::mir::opt::optimize(&mut func, level);
     }
     (func, witnesses)
 }

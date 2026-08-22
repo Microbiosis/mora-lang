@@ -593,7 +593,9 @@ impl ParserV3 {
                 // parse_block_body）— 支持多语句与嵌套构造（if/for/match/let）。
                 // 修复前用 emit_expr_w：`fn(n) if n<=1 {..} else {..} end` 解析失败。
                 // emit_block_w 已消费 End，无需外部 consume。
-                let (body_reg, _body_w) = if self.match_token_exact(TokenType::FatArrow) {
+                // v0.90.3: 真实 body_w 进入 witness（此前是占位空 Sequence —
+                // witness 树无法重建闭包代码，9 层管线（witness→FCFG）断裂）。
+                let (body_reg, body_w) = if self.match_token_exact(TokenType::FatArrow) {
                     self.emit_expr_w()?
                 } else {
                     self.emit_block_w()?
@@ -621,10 +623,7 @@ impl ParserV3 {
                 let w = MirWitness {
                     kind: WitnessKind::Closure {
                         params: param_wits,
-                        body: Box::new(MirWitness {
-                            kind: WitnessKind::Sequence(vec![]),
-                            span,
-                        }),
+                        body: Box::new(body_w),
                     },
                     span,
                 };

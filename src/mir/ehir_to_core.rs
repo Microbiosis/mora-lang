@@ -237,8 +237,8 @@ fn lower_node(ctx: &mut CoreContext, node: &Ehir) {
             ctx.emit(CoreInst::Jump(loop_start));
             ctx.flush_block(CoreTerminator::Jump(loop_start));
         }
-        Node::Match { scrutinee, arms, .. } => {
-            // 降维为 EnumMatch
+        Node::Match { dst, scrutinee, arms, .. } => {
+            // 降维为 EnumMatch（dst 作为统一结果寄存器透传）
             let core_arms: Vec<EnumMatchArm> = arms
                 .iter()
                 .map(|arm| EnumMatchArm {
@@ -251,6 +251,7 @@ fn lower_node(ctx: &mut CoreContext, node: &Ehir) {
                 scrutinee: *scrutinee,
                 arms: core_arms,
             });
+            let _ = dst;
         }
         Node::Return { value, .. } => {
             ctx.flush_block(CoreTerminator::Return(*value));

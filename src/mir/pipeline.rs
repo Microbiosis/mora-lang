@@ -65,9 +65,9 @@ pub struct PipelineResult {
 /// 运行完整 9 层管线（FCFG → EHIR → Core → CMIR → LMIR → LayoutTable）。
 ///
 /// 输入：ParserV3::compile() 的产出（MirFunction + witnesses）。
-/// 输出：各层统计 + 差分验证结果。
-/// 执行器输入不变 — 本函数是验证性的管线激活。
-pub fn run_pipeline(func: &MirFunction, witnesses: &[MirWitness]) -> PipelineResult {
+/// **必须在 apply_rules 之前调用**（差分要求 raw-to-raw 比较）。
+/// 返回：(统计 + 差分结果, 管线产出的 MirFunction)。
+pub fn run_pipeline(func: &MirFunction, witnesses: &[MirWitness]) -> (PipelineResult, MirFunction) {
     // ── FCFG ──
     let fcfg: Vec<Fcfg> = witness_to_fcfg(witnesses);
     let fcfg_nodes = count_fcfg_nodes(&fcfg);
@@ -93,14 +93,22 @@ pub fn run_pipeline(func: &MirFunction, witnesses: &[MirWitness]) -> PipelineRes
     let _layout_table: LayoutTable = populate_layout_table(&lmir_insts_vec, &layouts_raw);
     let layouts = layouts_raw.len();
 
-    // ── 差分验证：lower_fcfg(fcfg) vs 原 MirFunction ──
-    let (pipeline_mir, _) = lower_fcfg(&fcfg);
-    let pipeline_mir_count = pipeline_mir.len();
+    // ── 管线产出的 MirFunction（执行器切换的输入）──
+    let (pipeline_body, pipeline_n_regs) = lower_fcfg(&fcfg);
+    let pipeline_func = MirFunction {
+        params: vec![],
+        body: pipeline_body.clone(),
+        n_regs: pipeline_n_regs,
+        effects: func.effects.clone(),
+    };
+
+    // ── 差分验证：lower_fcfg(fcfg) vs 原 MirFunction（raw vs raw）──
+    let pipeline_mir_count = pipeline_body.len();
     let original_mir_count = func.body.len();
     let (differential_ok, differential_diffs) =
-        differential_check(&pipeline_mir, &func.body);
+        differential_check(&pipeline_body, &func.body);
 
-    PipelineResult {
+    let result = PipelineResult {
         fcfg_nodes,
         typed_nodes,
         core_insts,
@@ -111,7 +119,8 @@ pub fn run_pipeline(func: &MirFunction, witnesses: &[MirWitness]) -> PipelineRes
         original_mir_count,
         differential_ok,
         differential_diffs,
-    }
+    };
+    (result, pipeline_func)
 }
 
 /// 差分验证：比较新管线（witness→FCFG→lower）与原管线（emit.rs 直出）
@@ -280,10 +289,11 @@ mod tests {
         // 顶层字面量 → LMIR 布局表填充（task 内字面量在嵌套闭包体中）
         let src = "let x = 42i\nlet y = 3.5\nx";
         let (func, witnesses) = crate::parser_v3::ParserV3::compile(src).unwrap();
-        let result = run_pipeline(&func, &witnesses);
+        let (result, pipeline_func) = run_pipeline(&func, &witnesses);
         assert!(result.fcfg_nodes > 0, "FCFG should be non-empty");
         assert!(result.core_insts > 0, "Core should be non-empty");
         assert!(result.layouts > 0, "LayoutTable should be populated (top-level Int/Float consts)");
+        assert!(!pipeline_func.body.is_empty(), "pipeline MirFunction should be non-empty");
     }
 
     #[test]
@@ -291,16 +301,17 @@ mod tests {
         // 嵌套函数体（task 内）— FCFG/Core 仍应非空
         let src = "task main()\n  print(10i + 32i)\nend";
         let (func, witnesses) = crate::parser_v3::ParserV3::compile(src).unwrap();
-        let result = run_pipeline(&func, &witnesses);
+        let (result, pipeline_func) = run_pipeline(&func, &witnesses);
         assert!(result.fcfg_nodes > 0, "FCFG should be non-empty (task body)");
         assert!(result.core_insts > 0, "Core should be non-empty (closure create)");
+        assert!(!pipeline_func.body.is_empty());
     }
 
     #[test]
     fn pipeline_function_call() {
         let src = "let ops = {\"add\": fn(a, b) a + b end}\nprint(ops.add(2i, 3i))";
         let (func, witnesses) = crate::parser_v3::ParserV3::compile(src).unwrap();
-        let result = run_pipeline(&func, &witnesses);
+        let (result, _pipeline_func) = run_pipeline(&func, &witnesses);
         assert!(result.fcfg_nodes > 0);
         assert!(result.typed_nodes > 0, "TypeTable should have entries");
     }
@@ -309,7 +320,7 @@ mod tests {
     fn pipeline_handle_effect() {
         let src = "let g = \"init\"\nhandle Ai {\n  g = perform Ai(\"hello\")\n} {\n  \"m:\" + __arg0\n}\ng";
         let (func, witnesses) = crate::parser_v3::ParserV3::compile(src).unwrap();
-        let result = run_pipeline(&func, &witnesses);
+        let (result, _pipeline_func) = run_pipeline(&func, &witnesses);
         assert!(result.fcfg_nodes > 0);
         assert!(result.core_insts > 0);
     }

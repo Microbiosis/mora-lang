@@ -2,6 +2,114 @@
 
 All notable changes to Mora will be documented in this file.
 
+## [v0.90.04] — 2026-08-23 — fix: Break/Continue label 修补 — 真正确性漏洞修复
+
+**审计发现**：fcfg_lower 的 While/For break/continue label 始终为 0（Break/Continue emit 时 label=0，post-patch 不覆盖，Node::Break 未携带 label）。
+
+**修复**：
+- `Node::Break/Continue` 携带 label 字段（单一信息源）
+- `witness_to_fcfg` While/For 分支 `push_loop(0,1)` 包住 body 递归
+- `fcfg_lower` 直接用节点 label（无独立 loop_stack）
+- `annotate.rs` 透传 label 字段
+
+**执行级验证**：`switch_while_break: total=10`（break at i=5，未修复前静默跳到 0）
+
+**新增 fixture**：`loop_basic.mora` / `loop_break.mora` / `loop_continue.mora` / `loop_for_break.mora`
+
+**测试**：17 executor_switch + 27 组全 OK + clippy 全绿
+
+## [v0.90.03] — 2026-08-22 — feat: 执行器切换 — 9 层管线产出成为生产 MirFunction
+
+**核心改动**：
+- `compile_and_opt` 生产路径切换：管线在 apply_rules 之前运行（差分 raw-to-raw）
+- 类别级差分绿 → 管线产出经同一套优化后作为返回值 — 生产执行 9 层代码
+- 差分红 → 自动回落 emit.rs 直出（不中断编译）
+- `run_pipeline` 签名扩展返回管线 MirFunction
+- `MORA_9LAYER=0` 禁用，`MORA_9LAYER_DEBUG=1` 输出差分诊断
+
+**切换审计发现 3 个语义 bug（全修复）**：
+1. `Node::Match` 缺 dst — match 表达式结果落到 scrutinee 寄存器
+2. 闭包/task 体缺尾部 Return — run_mir 调用闭包返回 Nil
+3. Closure witness body 是占位空 Sequence — witness 树无法重建闭包代码
+
+**测试**：executor_switch 14 tests（arithmetic/let/if/for/handle/function_call/match/macro/nested_closures/dict_operations/match_guard/list_comprehension/chained_methods）
+
+## [v0.90.02] — 2026-08-22 — feat: 执行级差分 19/19 全绿 — 5 个语义 bug 修复
+
+**差分升级**：类别级 + 执行级双级差分（双管线各自 run_mir，last_expr 必须相等）
+
+**执行级差分抓到 5 个类别级完全漏掉的真语义 bug（全修复）**：
+1. `Node::Perform` 缺 dst — perform 结果永远落到 reg 0
+2. 索引特例缺失 — `Call{Name("[]"), [obj, idx]}` ↔ `MirInst::Index`
+3. 模式序列化格式错误 — 运行时匹配器要求前缀式 `int:42` / `list:vector:[a,..rest]`
+4. `wrap_with_cond` 丢弃 If 节点自身 — macro body 内的 if-else 分支全部丢失
+5. fcfg_lower If 缺 Copy 结果合并
+
+**附带**：fcfg_lower bump 分配器种子修复（避开预分配寄存器）
+
+## [v0.90.01] — 2026-08-22 — feat: 差分验证 19/19 全绿 + 3 个既有管线 bug 修复
+
+**差分审计**：全部 19 个 e2e fixture 的 9 层管线 vs 原管线指令序列等价审计
+
+**审计发现的既有 bug（全部修复）**：
+1. `fcfg_lower` Let 缺 `__let_result` 哨兵（两管线形状分歧）
+2. `emit.rs` handle 死代码平铺 — body/handler 指令平铺进主上下文 + 嵌套在 Handle 内 = 双份发射
+3. `emit.rs` app/struct 字段循环死循环 — `consume_identifier` 失败时循环不前进
+
+## [v0.90.00] — 2026-08-22 — feat: 9 层管线激活 — 切换 Phase 1 完成
+
+**新增 `witness_to_fcfg.rs`（715 行）— FCFG 生产者**：
+- MirWitness 树 → Node<()> 全量转换（38 个 WitnessKind 变体）
+- 自底向上 bump 寄存器分配
+- 值产生节点打包 Sequence 保留求值顺序
+- 无需重写 emit.rs，复用现有 witness 产出
+
+**新增 `pipeline.rs`（311 行）— 9 层管线驱动**：
+- `run_pipeline(func, witnesses)` 全链路：witness→FCFG→TypeTable→EHIR→Core→CMIR→LMIR→LayoutTable
+- 差分验证：`lower_fcfg(fcfg)` vs 原 emit.rs 直出 MirFunction
+- PipelineResult 统计各层节点数 + 差分结果
+
+**Node\<M\> 补齐 5 个缺失变体**：Or / And / DynTrait / Prompt / ClosureExpr
+
+**cli::compile_and_opt 生产路径接入**：每次编译全量运行 9 层管线
+
+## [v0.89.00] — 2026-08-21 — feat: 9 层 IR 架构定义 + 四层桥接
+
+**9 层 IR 架构全部定义**：
+| 层 | 文件 | 职责 |
+|---|---|---|
+| FCFG | `fcfg.rs` (384行) + `fcfg_lower.rs` (484行) | 语法→结构化 CFG |
+| EHIR | `annotate.rs` + `export.rs` (~530行) | 类型标注 + 效果行 |
+| Core | `core.rs` (~230行) | 闭包/ADT/Thunk→基元 |
+| CMIR | `cmir.rs` (~175行) | 串行→并发 |
+| LMIR | `lmir.rs` (~186行) | 语义→物理 |
+| RIR | `rir.rs` (~190行) | 运行时自包含 |
+| JIR | `rir.rs` (trait) | 增量 JIT |
+
+**四层桥接**：
+- `ehir_to_core.rs` — EHIR→Core 降维（FnDef→ClosureCreate, Handle→EffectInstall+Restore）
+- `core_to_cmir.rs` — Core→CMIR（纯计算→Pure, 效果→Pure）
+- `cmir_to_lmir.rs` — CMIR→LMIR（Const Int→ConstInt unbox, Nil→skip）
+- `lmir_to_rir.rs` — LMIR→RIR（LayoutTable 填充）
+
+**查缺补漏**：
+- re-exports（mir/mod.rs + typeck/mod.rs）
+- fcfg_lower catch-all 补全（11 个显式 match arm 替代 _ => nop）
+- MemLayout 重复修复（rir.rs 删除重复，统一用 lmir::MemLayout）
+- Call callee_name 字段（消除 Reg→String hack）
+
+## [v0.87.00] — 2026-08-15 — feat: gensym/read/macroexpand + P2 基础层清理
+
+- Lisp homoiconicity：gensym/read/macroexpand 完整实现
+- CoreRuntime.gensym_counter Arc<Mutex<usize>> + 3 dispatch arm + 3 handler
+- 内联闭包解析修复
+- 19 v0.87 测试全过
+
+## [v0.86.00] — 2026-08-15 — refactor: 消除所有 #![allow(dead_code)]
+
+- 语义从底层区分，消除所有 dead_code 允许
+- 清理剩余 #![allow] 和死代码
+
 ## [v0.85.00] — 2026-08-14 — feat: 3 项功能实现不全修复（with mock_llm / union type / as dyn + let dyn 自动 coercion）
 
 **目的**：完成 §19.4（`with mock_llm` 块）、§3.4（union 类型注解）、§3.5（`as dyn` + `let dyn` 自动 coercion）的 Mora 语法实现。三项功能此前底层原语已就绪，但单遍编译 `compile()` 路径缺少 parser 入口。

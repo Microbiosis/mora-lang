@@ -236,7 +236,7 @@ fn lower_node(ctx: &mut EmitContext, node: &Fcfg) {
             ctx.patch_label_at(jump_not_idx, end);
         }
 
-        // ── Match → scrutinee + sequential JumpIf pattern checks ──
+        // ── Match → 单条 MatchExpr（镜像 emit_match_w：嵌套 arm MirFunction）──
         Node::Match { scrutinee, arms, .. } => {
             lower_match(ctx, *scrutinee, arms);
         }
@@ -258,7 +258,13 @@ fn lower_node(ctx: &mut EmitContext, node: &Fcfg) {
         // ── 绑定 ──
         Node::Let { name, value, body, .. } => {
             ctx.emit(MirInst::Define(name.clone(), *value));
+            // 镜像 emit_let_w：init_body（Nil 字面量块）先求值，
+            // 结果经 __let_result 哨兵传出 —— let 表达式的值语义。
             lower_block(ctx, body);
+            let body_result = body.result.unwrap_or(0);
+            ctx.emit(MirInst::Assign("__let_result".to_string(), body_result));
+            let dst = ctx.alloc_reg();
+            ctx.emit(MirInst::Var(dst, "__let_result".to_string()));
         }
         Node::Assign { name, value, .. } => {
             ctx.emit(MirInst::Assign(name.clone(), *value));
@@ -500,52 +506,63 @@ fn lower_block_to_function(ctx: &mut EmitContext, block: &Block<()>) -> super::M
 
 /// 降维 Match 表达式。
 fn lower_match(ctx: &mut EmitContext, scrutinee: Reg, arms: &[MatchArm<()>]) {
-    let mut end_jumps: Vec<usize> = Vec::new();
+    // 镜像 emit_match_w：单条 MatchExpr，arm body 为嵌套 MirFunction
+    //（末尾带 Return），pattern 序列化为字符串。
+    let mir_arms: Vec<(String, Option<Reg>, Box<super::MirFunction>, Reg)> = arms
+        .iter()
+        .map(|arm| {
+            let pat_str = fcfg_pattern_to_string(&arm.pattern);
+            let mut body_fn = lower_block_to_function(ctx, &arm.body);
+            // 镜像 emit_match_arm_w：body 末尾补 Return（结果寄存器）
+            if body_fn.body.is_empty() || !matches!(body_fn.body.last(), Some(MirInst::Return(_))) {
+                let result_reg = arm.body.result.unwrap_or(0);
+                body_fn.body.push(MirInst::Return(Some(result_reg)));
+            }
+            let val_reg = arm.body.result.unwrap_or(0);
+            (pat_str, arm.guard, Box::new(body_fn), val_reg)
+        })
+        .collect();
+    let _dst = ctx.alloc_reg(); // 镜像 emit_match_w：结果寄存器槽位保留
+    ctx.emit(MirInst::MatchExpr { val: scrutinee, arms: mir_arms });
+}
 
-    for (i, arm) in arms.iter().enumerate() {
-        // Pattern check (simplified — literal patterns only for now)
-        let is_last = i == arms.len() - 1;
-        match &arm.pattern {
-            Pattern::Wildcard => {
-                // Always matches — no check needed
+/// fcfg::Pattern → 字符串（镜像 lower.rs::pattern_to_string 的格式）。
+fn fcfg_pattern_to_string(pattern: &Pattern) -> String {
+    match pattern {
+        Pattern::Wildcard => "_".to_string(),
+        Pattern::Variable(name) => name.clone(),
+        Pattern::Literal(lit) => match lit {
+            crate::common::Literal::Int(n, _) => n.to_string(),
+            crate::common::Literal::Float(f, _) => f.to_string(),
+            crate::common::Literal::String(s, _) => format!("\"{}\"", s),
+            crate::common::Literal::Bool(b, _) => b.to_string(),
+            crate::common::Literal::Nil(_) => "nil".to_string(),
+            crate::common::Literal::Char(c, _) => format!("'{}'", c),
+        },
+        Pattern::Tuple(items) => format!(
+            "({})",
+            items.iter().map(fcfg_pattern_to_string).collect::<Vec<_>>().join(", ")
+        ),
+        Pattern::List(items) => format!(
+            "[{}]",
+            items.iter().map(fcfg_pattern_to_string).collect::<Vec<_>>().join(", ")
+        ),
+        Pattern::ListVec { head, tail } => {
+            let mut parts: Vec<String> = head.iter().map(fcfg_pattern_to_string).collect();
+            if let Some(t) = tail {
+                parts.push(format!("..{}", fcfg_pattern_to_string(t)));
             }
-            Pattern::Literal(lit) => {
-                let pat_reg = ctx.alloc_reg();
-                ctx.emit(MirInst::Const(pat_reg, literal_to_value(lit)));
-                let eq_reg = ctx.alloc_reg();
-                ctx.emit(MirInst::BinaryOp(eq_reg, scrutinee, BinaryOp::Equal, pat_reg));
-                if !is_last {
-                    ctx.emit(MirInst::JumpIfNot(eq_reg, 0));
-                    let jump_idx = ctx.insts.len() - 1;
-                    // Body
-                    lower_block(ctx, &arm.body);
-                    if let Some(last) = arm.body.nodes.last() {
-                        // Copy result (simplified)
-                        let _ = last;
-                    }
-                    ctx.emit(MirInst::Jump(0));
-                    end_jumps.push(ctx.insts.len() - 1);
-                    let next_arm = ctx.insts.len();
-                    ctx.patch_label_at(jump_idx, next_arm);
-                } else {
-                    ctx.emit(MirInst::JumpIfNot(eq_reg, 0));
-                    let jump_idx = ctx.insts.len() - 1;
-                    lower_block(ctx, &arm.body);
-                    let end = ctx.insts.len();
-                    ctx.patch_label_at(jump_idx, end);
-                }
-            }
-            _ => {
-                // Other patterns — treat as wildcard for now
-                lower_block(ctx, &arm.body);
-            }
+            format!("[{}]", parts.join(", "))
         }
-    }
-
-    // Patch all end jumps to current position
-    let end = ctx.insts.len();
-    for idx in end_jumps {
-        ctx.patch_label_at(idx, end);
+        Pattern::Dict(entries) => format!(
+            "{{{}}}",
+            entries
+                .iter()
+                .map(|(k, v)| format!("{}: {}", k, fcfg_pattern_to_string(v)))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        Pattern::TypeAscription(inner, ty) => format!("{}: {}", fcfg_pattern_to_string(inner), ty.0),
     }
 }
 

@@ -1,16 +1,9 @@
-model Counter
-  count: int
-  step: int
-end
-
-msg CounterMsg = Increment, Decrement, SetStep(int)
-
 app Counter
   model: Counter
   msg: CounterMsg
   init: {count: 0, step: 1}
-  update: fn(m: Counter, msg: CounterMsg) => (m, Cmd::None)
-  view: fn(m: Counter) => m.count
+  update: fn(m, msg) => m
+  view: fn(m) => m
 end
 
 let app_inst = tea.init({count: 0, step: 1})

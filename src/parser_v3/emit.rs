@@ -1208,6 +1208,9 @@ impl ParserV3 {
                 if let Some(ftype) = self.parse_type_annotation() {
                     fields.push((fname, ftype));
                 }
+            } else {
+                // v0.90 死循环修复：非标识符 token 前进保证进度
+                self.advance();
             }
         }
         self.consume(TokenType::End, "Expected 'end' after struct")?;
@@ -1303,6 +1306,11 @@ impl ParserV3 {
                         // skip unknown fields
                     }
                 }
+            } else {
+                // v0.90 死循环修复：字段值解析失败残留的非标识符 token
+                //（如未支持的元组表达式）—— 前进一 token 保证进度。
+                // 此前此处不前进，app 块内任何解析失败都会死循环。
+                self.advance();
             }
             while self.match_token(&[TokenType::Newline]) {}
         }
@@ -1461,6 +1469,13 @@ impl ParserV3 {
         let span = self.span_of_current();
         self.advance(); // 'handle'
         let effect = self.consume_identifier("Expected effect name after 'handle'")?;
+        // v0.90: 死代码平铺回滚 — brace block 解析经 emit_statement_expr_w
+        // 会把 body/handler 指令平铺进主 EmitContext，但 Handle 携带的是
+        // 嵌套 MirFunction（下方 lower_block_witness_to_mir 独立 lower）。
+        // 平铺副本是死代码（每 handle 浪费 body+handler 条指令，且 handler
+        // 平铺会引用未绑定的 __arg0）。解析后回滚，只保留 witness 子树。
+        let saved_len = self.emit.insts.len();
+        let saved_next_reg = self.emit.next_reg;
         // body 块（必须花括号形式）
         self.consume(TokenType::LBrace, "Expected '{' after effect name")?;
         let (_, body_w) = self.emit_brace_block_w()?;
@@ -1469,9 +1484,12 @@ impl ParserV3 {
         self.consume(TokenType::LBrace, "Expected '{' for handler block")?;
         let (_, handler_w) = self.emit_brace_block_w()?;
         self.consume(TokenType::RBrace, "Expected '}' after handler block")?;
+        // 回滚平铺发射（witness 已捕获，寄存器号复用）
+        self.emit.insts.truncate(saved_len);
+        self.emit.next_reg = saved_next_reg;
         // v0.80 Stage 2.0: 直接在 parser 单遍编译中 emit MirInst::Handle。
         // (parser → EmitContext 单遍，绕开 lower.rs::lower_expr 的 Handle 分支
-        // —— 那个分支是给旧 parse 路径用的，主路径走 emit_program 直接 emit)
+        //  —— 那个分支是给旧 parse 路径用的，主路径走 emit_program 直接 emit)
         //
         // 把 witness 子树 lower 为 IR 序列（independent EmitContext）
         // 复用 lower.rs::lower_mir_exprs 的核心能力（body/handler 都是

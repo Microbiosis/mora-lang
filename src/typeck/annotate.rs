@@ -235,7 +235,8 @@ fn annotate_node(node: &Fcfg, table: &TypeTable) -> Node<TypeInfo> {
         },
 
         // ── 效果 ──
-        Node::Perform { effect, args, span, .. } => Node::Perform {
+        Node::Perform { dst, effect, args, span, .. } => Node::Perform {
+            dst: *dst,
             effect: effect.clone(),
             args: args.clone(),
             span: *span,

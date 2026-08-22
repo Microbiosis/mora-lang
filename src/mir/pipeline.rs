@@ -154,6 +154,11 @@ fn differential_check(
     (diffs.is_empty(), diffs)
 }
 
+/// 提取指令类别（忽略寄存器编号）。差分审计公共入口。
+pub fn inst_category_pub(inst: &crate::mir::MirInst) -> &'static str {
+    inst_category(inst)
+}
+
 /// 提取指令类别（忽略寄存器编号）。
 fn inst_category(inst: &crate::mir::MirInst) -> &'static str {
     use crate::mir::MirInst;

@@ -16,8 +16,14 @@ use crate::value::Value;
 ///
 /// 返回 (instructions, n_regs) — 指令列表和使用的寄存器总数。
 /// n_regs 是所有节点中引用的最大寄存器号 + 1。
+///
+/// 寄存器安全：节点携带 witness_to_fcfg 预分配的寄存器号（0..=max），
+/// 本层的 bump 分配器必须从 max+1 起步 —— 否则哨兵/临时寄存器
+///（__let_result dst、MatchExpr dst、for-loop 索引等）会覆盖
+/// 预分配寄存器中的值。
 pub fn lower_fcfg(nodes: &[Fcfg]) -> (Vec<MirInst>, usize) {
     let mut ctx = EmitContext::new();
+    ctx.next_reg = max_reg_in_nodes(nodes) + 1; // 避开预分配寄存器
     for node in nodes {
         lower_node(&mut ctx, node);
     }
@@ -77,7 +83,7 @@ fn max_reg_in_node(node: &Fcfg) -> usize {
         Node::Let { value, body, .. } => *value.max(&max_reg_in_nodes(&body.nodes)),
         Node::Assign { value, .. } => *value,
         Node::IndexAssign { obj, idx, value, .. } => *obj.max(idx).max(value),
-        Node::Perform { args, .. } => args.iter().fold(0usize, |m, r| m.max(*r)),
+        Node::Perform { dst, args, .. } => args.iter().fold(*dst, |m, r| m.max(*r)),
         Node::Handle { body, handler, .. } => {
             max_reg_in_nodes(&body.nodes).max(max_reg_in_nodes(&handler.nodes))
         }
@@ -161,17 +167,23 @@ fn lower_node(ctx: &mut EmitContext, node: &Fcfg) {
             ctx.emit(MirInst::Index(*dst, *obj, *idx));
         }
 
-        // ── 控制流：If → JumpIfNot + Jump ──
+        // ── 控制流：If → JumpIfNot + Copy 结果合并（镜像 emit 路径）──
         Node::If { cond, then, else_, .. } => {
             ctx.emit(MirInst::JumpIfNot(*cond, 0));
             let jump_not_idx = ctx.insts.len() - 1;
             lower_block(ctx, then);
+            let then_result = then.result.unwrap_or(0);
+            // 结果寄存器：两个分支各 Copy 一次（emit_if 语义）
+            let dst = ctx.alloc_reg();
+            ctx.emit(MirInst::Copy(dst, then_result));
             if let Some(else_block) = else_ {
                 ctx.emit(MirInst::Jump(0));
                 let jump_idx = ctx.insts.len() - 1;
                 let else_start = ctx.insts.len();
                 ctx.patch_label_at(jump_not_idx, else_start);
                 lower_block(ctx, else_block);
+                let else_result = else_block.result.unwrap_or(0);
+                ctx.emit(MirInst::Copy(dst, else_result));
                 let end = ctx.insts.len();
                 ctx.patch_label_at(jump_idx, end);
             } else {
@@ -294,10 +306,9 @@ fn lower_node(ctx: &mut EmitContext, node: &Fcfg) {
         }
 
         // ── 代数效果 ──
-        Node::Perform { effect, args, .. } => {
-            let dst = ctx.alloc_reg();
+        Node::Perform { dst, effect, args, .. } => {
             ctx.emit(MirInst::Perform {
-                dst,
+                dst: *dst,
                 effect: effect.clone(),
                 args: args.clone(),
             });
@@ -500,6 +511,8 @@ fn lower_block_to_function(ctx: &mut EmitContext, block: &Block<()>) -> super::M
     let mut sub = EmitContext::new();
     // Copy loop stack context
     sub.loop_stack = ctx.loop_stack.clone();
+    // 避开块内节点预分配的寄存器（witness_to_fcfg 全局计数器分配）
+    sub.next_reg = max_reg_in_nodes(&block.nodes) + 1;
     lower_block(&mut sub, block);
     sub.finish()
 }
@@ -526,43 +539,46 @@ fn lower_match(ctx: &mut EmitContext, scrutinee: Reg, arms: &[MatchArm<()>]) {
     ctx.emit(MirInst::MatchExpr { val: scrutinee, arms: mir_arms });
 }
 
-/// fcfg::Pattern → 字符串（镜像 lower.rs::pattern_to_string 的格式）。
+/// fcfg::Pattern → 字符串（镜像 lower.rs::pattern_to_string 的运行时
+/// 匹配器格式：`int:42` / `list:vector:[a,..rest]` / `dict:{k:v,..}` 前缀式）。
 fn fcfg_pattern_to_string(pattern: &Pattern) -> String {
     match pattern {
         Pattern::Wildcard => "_".to_string(),
         Pattern::Variable(name) => name.clone(),
         Pattern::Literal(lit) => match lit {
-            crate::common::Literal::Int(n, _) => n.to_string(),
-            crate::common::Literal::Float(f, _) => f.to_string(),
-            crate::common::Literal::String(s, _) => format!("\"{}\"", s),
-            crate::common::Literal::Bool(b, _) => b.to_string(),
+            crate::common::Literal::String(s, _) => format!("str:{}", s),
+            crate::common::Literal::Char(c, _) => format!("char:{}", c),
+            crate::common::Literal::Int(i, _) => format!("int:{}", i),
+            crate::common::Literal::Float(f, _) => format!("float:{}", f),
+            crate::common::Literal::Bool(v, _) => format!("bool:{}", v),
             crate::common::Literal::Nil(_) => "nil".to_string(),
-            crate::common::Literal::Char(c, _) => format!("'{}'", c),
         },
-        Pattern::Tuple(items) => format!(
-            "({})",
-            items.iter().map(fcfg_pattern_to_string).collect::<Vec<_>>().join(", ")
-        ),
-        Pattern::List(items) => format!(
-            "[{}]",
-            items.iter().map(fcfg_pattern_to_string).collect::<Vec<_>>().join(", ")
-        ),
-        Pattern::ListVec { head, tail } => {
-            let mut parts: Vec<String> = head.iter().map(fcfg_pattern_to_string).collect();
-            if let Some(t) = tail {
-                parts.push(format!("..{}", fcfg_pattern_to_string(t)));
-            }
-            format!("[{}]", parts.join(", "))
+        Pattern::Tuple(items) => {
+            let parts: Vec<String> = items.iter().map(fcfg_pattern_to_string).collect();
+            format!("tuple:({})", parts.join(","))
         }
-        Pattern::Dict(entries) => format!(
-            "{{{}}}",
-            entries
+        // fcfg 的 List(Vec) = 元素列表（expr Pattern 无对应 — vector 语义）
+        Pattern::List(items) => {
+            let parts: Vec<String> = items.iter().map(fcfg_pattern_to_string).collect();
+            format!("list:vector:[{}]", parts.join(","))
+        }
+        Pattern::ListVec { head, tail } => {
+            let parts: Vec<String> = head.iter().map(fcfg_pattern_to_string).collect();
+            match tail {
+                Some(t) => format!("list:vector:[{},..{}]", parts.join(","), fcfg_pattern_to_string(t)),
+                None => format!("list:vector:[{}]", parts.join(",")),
+            }
+        }
+        Pattern::Dict(entries) => {
+            let fields: Vec<String> = entries
                 .iter()
-                .map(|(k, v)| format!("{}: {}", k, fcfg_pattern_to_string(v)))
-                .collect::<Vec<_>>()
-                .join(", ")
-        ),
-        Pattern::TypeAscription(inner, ty) => format!("{}: {}", fcfg_pattern_to_string(inner), ty.0),
+                .map(|(k, v)| format!("{}:{}", k, fcfg_pattern_to_string(v)))
+                .collect();
+            format!("dict:{{{}}}", fields.join(","))
+        }
+        Pattern::TypeAscription(inner, ty) => {
+            format!("{}:{}", ty.0, fcfg_pattern_to_string(inner))
+        }
     }
 }
 
@@ -654,11 +670,14 @@ mod tests {
             meta: (),
         }];
         let (insts, n_regs) = lower_fcfg(&nodes);
-        assert_eq!(insts.len(), 4, "expected 4 instructions: {:?}", insts);
+        // 新形状（镜像 emit 路径）：JumpIfNot + Const + Copy + Jump + Const + Copy
+        assert_eq!(insts.len(), 6, "expected 6 instructions: {:?}", insts);
         assert!(matches!(&insts[0], MirInst::JumpIfNot(0, _)));
         assert!(matches!(&insts[1], MirInst::Const(1, Value::Int(1))));
-        assert!(matches!(&insts[2], MirInst::Jump(_)));
-        assert!(matches!(&insts[3], MirInst::Const(2, Value::Int(2))));
+        assert!(matches!(&insts[2], MirInst::Copy(_, 1)));
+        assert!(matches!(&insts[3], MirInst::Jump(_)));
+        assert!(matches!(&insts[4], MirInst::Const(2, Value::Int(2))));
+        assert!(matches!(&insts[5], MirInst::Copy(_, 2)));
         let _ = n_regs;
     }
 

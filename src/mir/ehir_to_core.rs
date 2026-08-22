@@ -288,10 +288,9 @@ fn lower_node(ctx: &mut CoreContext, node: &Ehir) {
         }
 
         // ── 效果 ──
-        Node::Perform { effect, args, .. } => {
-            let dst = ctx.alloc_reg();
+        Node::Perform { dst, effect, args, .. } => {
             ctx.emit(CoreInst::EffectPerform {
-                dst,
+                dst: *dst,
                 label: EffectLabel::from_name(effect),
                 args: args.clone(),
             });

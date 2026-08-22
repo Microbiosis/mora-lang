@@ -247,6 +247,8 @@ pub enum Node<M> {
 
     // ── 代数效果 ──
     Perform {
+        /// perform 表达式的结果寄存器（handler 决定具体值）。
+        dst: Reg,
         effect: String,
         args: Vec<Reg>,
         span: Span,

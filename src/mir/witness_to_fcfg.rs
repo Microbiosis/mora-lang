@@ -16,7 +16,7 @@
 //!                                        ↓
 //!                          ehir_to_core → Core → CMIR → LMIR → RIR
 
-use crate::common::{Literal, Span};
+use crate::common::Literal;
 use crate::mir::fcfg::{
     Block, MatchArm, Node, OrchestrateKind, Param, Pattern, QuasiquoteSegment, Reg, TypeAnnotation,
     Variant,
@@ -133,9 +133,21 @@ fn build_node(b: &mut FcfgBuilder, w: &MirWitness) -> Node<()> {
                 nodes.push(n);
             }
             let dst = b.alloc();
-            nodes.push(Node::Call {
-                dst, callee: callee_reg, callee_name, args: arg_regs, span, meta: (),
-            });
+            // 索引特例：emit.rs 把 obj[idx] 的 witness 编码为
+            // Call{Name("[]"), [obj, idx]} ↔ MirInst::Index。
+            if callee_name.as_deref() == Some("[]") && arg_regs.len() == 2 {
+                nodes.push(Node::Index {
+                    dst,
+                    obj: arg_regs[0],
+                    idx: arg_regs[1],
+                    span,
+                    meta: (),
+                });
+            } else {
+                nodes.push(Node::Call {
+                    dst, callee: callee_reg, callee_name, args: arg_regs, span, meta: (),
+                });
+            }
             Node::Sequence { nodes, span, meta: () }
         }
         WitnessKind::MethodCall { receiver, method, args } => {
@@ -196,11 +208,12 @@ fn build_node(b: &mut FcfgBuilder, w: &MirWitness) -> Node<()> {
         WitnessKind::If { cond, then, r#else } => {
             let cond_node = build_node(b, cond);
             let cond_reg = node_result_reg(&cond_node);
-            let cond_block = Block { nodes: vec![cond_node], result: Some(cond_reg) };
             let then_block = build_block(b, then);
             let else_block = r#else.as_ref().map(|e| build_block(b, e));
-            Node::If { cond: cond_reg, then: then_block, else_: else_block, span, meta: () }
-                .wrap_with_cond(cond_block, span)
+            let if_node = Node::If { cond: cond_reg, then: then_block, else_: else_block, span, meta: () };
+            // Sequence 保留条件求值顺序 + If 节点（此前 wrap_with_cond
+            // 丢弃了 If 自身 — 嵌套体（macro body）的分支全部丢失）
+            Node::Sequence { nodes: vec![cond_node, if_node], span, meta: () }
         }
         WitnessKind::Loop { var, iterable, body } => {
             let iter_node = build_node(b, iterable);
@@ -216,10 +229,8 @@ fn build_node(b: &mut FcfgBuilder, w: &MirWitness) -> Node<()> {
         }
         WitnessKind::While { cond, body } => {
             let cond_block = build_block(b, cond);
-            let cond_reg = cond_block.result.unwrap_or(0);
             let body_block = build_block(b, body);
             Node::While { cond: cond_block, body: body_block, span, meta: () }
-                .wrap_with_cond(Block { nodes: vec![], result: Some(cond_reg) }, span)
         }
         WitnessKind::List(items) => {
             let mut nodes = Vec::new();
@@ -366,7 +377,8 @@ fn build_node(b: &mut FcfgBuilder, w: &MirWitness) -> Node<()> {
                 arg_regs.push(node_result_reg(&n));
                 nodes.push(n);
             }
-            nodes.push(Node::Perform { effect: effect.clone(), args: arg_regs, span, meta: () });
+            let dst = b.alloc();
+            nodes.push(Node::Perform { dst, effect: effect.clone(), args: arg_regs, span, meta: () });
             Node::Sequence { nodes, span, meta: () }
         }
         WitnessKind::Handle { effect, body, handler, k_param } => {
@@ -502,29 +514,11 @@ fn node_result_reg_of(n: &Node<()>) -> Option<Reg> {
         | Node::ListLit { dst: reg, .. }
         | Node::DictLit { dst: reg, .. }
         | Node::Index { dst: reg, .. }
+        | Node::Perform { dst: reg, .. }
         | Node::Quasiquote { dst: reg, .. } => Some(*reg),
         Node::Sequence { nodes, .. } => nodes.last().and_then(node_result_reg_of),
         Node::If { .. } => None, // If 的结果在 then/else 块中
         _ => None,
-    }
-}
-
-/// If/While 的条件求值包装（条件节点先求值，再进入控制流节点）。
-trait WrapWithCond {
-    fn wrap_with_cond(self, _cond_block: Block<()>, span: Span) -> Node<()>;
-}
-
-impl WrapWithCond for Node<()> {
-    fn wrap_with_cond(self, cond_block: Block<()>, _span: Span) -> Node<()> {
-        // If/While 的 Node 变体内部已持有块结构；cond_block 中的前置节点
-        // 需要保留求值顺序 — 打包进 Sequence。
-        let span = self.span();
-        let cond_nodes = cond_block.nodes;
-        if cond_nodes.is_empty() {
-            self
-        } else {
-            Node::Sequence { nodes: cond_nodes, span, meta: () }
-        }
     }
 }
 
@@ -626,7 +620,7 @@ impl MoaTag for OrchestrateKind<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::common::{BinaryOp, Literal};
+    use crate::common::{BinaryOp, Literal, Span};
 
     fn wit_int(n: i64, line: usize) -> MirWitness {
         MirWitness {

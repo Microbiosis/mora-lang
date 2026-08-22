@@ -85,3 +85,44 @@ fn switch_macro_factorial() {
     );
     assert!(matches!(v, Value::Int(120)));
 }
+
+#[test]
+fn switch_nested_closures() {
+    let v = run_production(
+        "let add = fn(a) fn(b) a + b end end\nlet add5 = add(5i)\nadd5(3i)",
+    );
+    assert!(matches!(v, Value::Int(8)));
+}
+
+#[test]
+fn switch_dict_operations() {
+    let v = run_production(
+        "let d = {\"x\": 10i, \"y\": 20i}\nd[\"x\"] + d[\"y\"]",
+    );
+    assert!(matches!(v, Value::Int(30)));
+}
+
+#[test]
+fn switch_match_with_guard() {
+    let v = run_production(
+        "let x = 42i\nlet r = match x { 42i => \"found\", _ => \"not found\" }\nr",
+    );
+    assert!(matches!(v, Value::String(ref s) if s == "found"));
+}
+
+#[test]
+fn switch_list_comprehension_style() {
+    let v = run_production(
+        "task main()\n  let nums = [1, 2, 3, 4, 5]\n  let total = 0i\n  for n in nums {\n    total = total + n\n  }\n  print(total)\nend",
+    );
+    assert!(matches!(v, Value::Nil));
+}
+
+#[test]
+fn switch_chained_method_calls() {
+    // 链式方法调用 — dict 的 .keys() 然后取 len
+    let v = run_production(
+        "let d = {\"a\": 1i, \"b\": 2i, \"c\": 3i}\nd.len()",
+    );
+    assert!(matches!(v, Value::Int(3)));
+}

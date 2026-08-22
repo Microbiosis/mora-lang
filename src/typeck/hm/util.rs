@@ -127,7 +127,7 @@ pub fn join_types(arms: &[(Span, Type)], outer_span: Span) -> Type {
         Type::Union(vec![])
     } else if flat.len() == 1 && !nested_only {
         // 单成员退化：join_types(&[Int]) → Int（不是 Union(vec![Int])）
-        flat.pop().unwrap()
+        flat.pop().expect("flat.len() == 1 verified")
     } else {
         // 多成员 OR 整个输入是单 Union（平展后仍为 Union 形态）
         Type::Union(flat)

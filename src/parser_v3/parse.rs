@@ -1446,7 +1446,7 @@ impl ParserV3 {
         }
 
         if members.len() == 1 {
-            Some(members.into_iter().next().unwrap())
+            Some(members.into_iter().next().expect("members.len() == 1 verified"))
         } else {
             Some(Type::Union(members))
         }

@@ -118,7 +118,22 @@ Token → ParserV3::compile → MirInst[] + MirWitness[]
 
 | 测试组 | 数量 | 覆盖 |
 |--------|------|------|
-| lib tests | 822 | 全量单元测试 |
+| lib tests | 836 | 全量单元测试 |
 | e2e | 23 | 全部 fixture 端到端 |
 | executor_switch | 17 | 生产路径执行验证 |
 | nine_layer_differential | 19 | 双级差分等价 |
+
+## 已知架构层级违反（技术债）
+
+以下违反 AGENTS.md §0.2（Foundation→Kernel→Expression 层级），需要后续重构：
+
+| 违反 | 位置 | 说明 |
+|------|------|------|
+| typeck 依赖 MirExpr | `typeck/check_mir.rs:18` | Foundation 层（类型检查）依赖 Expression 层（MirExpr） |
+| handlers 用 MirExpr | `mir/handlers.rs:978,1047,1140` | Kernel 层（效果处理）用 Expression 层做 dispatch |
+| interpreter 用 MirExpr | `interpreter/builtins/mod.rs:650` | Runtime 层直接引用 Expression 层 |
+| 通配符 re-export | `mir/mod.rs:68` `pub use inst::*` | 命名空间污染 |
+
+**根因**：MirExpr 是旧 parse→lower 路径的产物，9 层架构用 Node<M> 替代。MirExpr 跨层使用是历史遗留，不是设计意图。
+
+**修复路径**：当 9 层管线完全替代旧路径后，MirExpr 可收缩为仅 orchestrate/pregel 数据构造类型，handlers/interpreter 改用 CoreInst 或 Node<TypeInfo>。

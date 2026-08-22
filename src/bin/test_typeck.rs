@@ -9,7 +9,7 @@ fn main() {
         println!("  Witness {}: kind={:?}", i, w.kind);
     }
     println!("\nChecking types...");
-    std::io::Write::flush(&mut std::io::stdout()).unwrap();
+    std::io::Write::flush(&mut std::io::stdout()).expect("stdout flush failed");
     let type_errors = mora::typeck::check_mir::check_program_witnesses(&witnesses);
     if type_errors.is_empty() {
         println!("typeck OK");

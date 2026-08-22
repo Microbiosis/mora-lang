@@ -1,0 +1,11 @@
+let total = 0i
+let i = 0i
+while i < 5i
+  i = i + 1i
+  if i == 3i
+    continue
+  end
+  total = total + i
+end
+print("continue result:", total)
+total + 1000i

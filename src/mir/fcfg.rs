@@ -164,10 +164,14 @@ pub enum Node<M> {
         meta: M,
     },
     Break {
+        /// v0.90.4: 跳转 label（witness_to_fcfg 用 loop_stack 填）。
+        /// fcfg_lower 不再依赖独立 loop_stack（label 由节点携带）。
+        label: usize,
         span: Span,
         meta: M,
     },
     Continue {
+        label: usize,
         span: Span,
         meta: M,
     },

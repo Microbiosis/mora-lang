@@ -1,0 +1,7 @@
+let total = 0i
+let i = 1i
+while i <= 10i {
+  total = total + i
+  i = i + 1i
+end
+total

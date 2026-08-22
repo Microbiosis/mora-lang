@@ -1,0 +1,12 @@
+let total = 0i
+let i = 1i
+let target = 5i
+while i <= 10i
+  if i == target
+    break
+  end
+  total = total + i
+  i = i + 1i
+end
+print("break result:", total)
+total + 1000i

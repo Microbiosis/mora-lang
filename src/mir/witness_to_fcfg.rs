@@ -26,20 +26,46 @@ use crate::mir::witness::{
     MirWitness, WitnessCallee, WitnessKind, WitnessOrchestrateKind, WitnessParam, WitnessPattern,
 };
 
-/// 转换上下文 — bump 寄存器分配器。
+/// 转换上下文 — bump 寄存器分配器 + 循环栈（break/continue 跳转目标）。
 struct FcfgBuilder {
     next_reg: Reg,
+    /// (continue_label, break_label) 栈 — Label=占位（fcfg_lower post-patch）。
+    /// witness_to_fcfg 不分配寄存空间（fcfg 节点不带 label），
+    /// 仅在 While/For/Loop 进入时 push 占位 label，退出时 pop。
+    /// fcfg_lower post-patch 时填入正确 label。
+    loop_stack: Vec<(Label, Label)>,
 }
+
+type Label = usize;
 
 impl FcfgBuilder {
     fn new() -> Self {
-        Self { next_reg: 0 }
+        Self {
+            next_reg: 0,
+            loop_stack: Vec::new(),
+        }
     }
 
     fn alloc(&mut self) -> Reg {
         let r = self.next_reg;
         self.next_reg += 1;
         r
+    }
+
+    fn push_loop(&mut self, continue_label: Label, break_label: Label) {
+        self.loop_stack.push((continue_label, break_label));
+    }
+
+    fn pop_loop(&mut self) {
+        self.loop_stack.pop();
+    }
+
+    fn current_break_label(&self) -> Label {
+        self.loop_stack.last().map_or(0, |&(_, b)| b)
+    }
+
+    fn current_continue_label(&self) -> Label {
+        self.loop_stack.last().map_or(0, |&(c, _)| c)
     }
 }
 
@@ -219,7 +245,10 @@ fn build_node(b: &mut FcfgBuilder, w: &MirWitness) -> Node<()> {
         WitnessKind::Loop { var, iterable, body } => {
             let iter_node = build_node(b, iterable);
             let iter_reg = node_result_reg(&iter_node);
+            // v0.90.4: push loop context — body 内的 break/continue 找当前 loop label
+            b.push_loop(0, 1);
             let body_block = build_block(b, body);
+            b.pop_loop();
             Node::Sequence {
                 nodes: vec![iter_node, Node::For {
                     var: var.clone(), iter: iter_reg, body: body_block, span, meta: (),
@@ -230,7 +259,11 @@ fn build_node(b: &mut FcfgBuilder, w: &MirWitness) -> Node<()> {
         }
         WitnessKind::While { cond, body } => {
             let cond_block = build_block(b, cond);
+            // v0.90.4: push/pop loop_stack 包住 body 递归 — body 内的
+            // Break/Continue 才能找到当前 loop 的 break/continue label。
+            b.push_loop(0, 1);
             let body_block = build_block(b, body);
+            b.pop_loop();
             Node::While { cond: cond_block, body: body_block, span, meta: () }
         }
         WitnessKind::List(items) => {
@@ -336,8 +369,17 @@ fn build_node(b: &mut FcfgBuilder, w: &MirWitness) -> Node<()> {
                 None => Node::Return { value: None, span, meta: () },
             }
         }
-        WitnessKind::Break(_) => Node::Break { span, meta: () },
-        WitnessKind::Continue(_) => Node::Continue { span, meta: () },
+        // v0.90.4: break/continue label 取自当前循环上下文（While/For push）
+        WitnessKind::Break(_) => Node::Break {
+            label: b.current_break_label(),
+            span,
+            meta: (),
+        },
+        WitnessKind::Continue(_) => Node::Continue {
+            label: b.current_continue_label(),
+            span,
+            meta: (),
+        },
         WitnessKind::Orchestrate { input_var, result_var, kind } => {
             let mir_kind = build_orchestrate_kind(b, kind);
             Node::Orchestrate {

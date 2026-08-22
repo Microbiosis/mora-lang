@@ -150,11 +150,13 @@ fn annotate_node(node: &Fcfg, table: &TypeTable) -> Node<TypeInfo> {
             span: *span,
             meta: info,
         },
-        Node::Break { span, .. } => Node::Break {
+        Node::Break { label, span, .. } => Node::Break {
+            label: *label,
             span: *span,
             meta: info,
         },
-        Node::Continue { span, .. } => Node::Continue {
+        Node::Continue { label, span, .. } => Node::Continue {
+            label: *label,
             span: *span,
             meta: info,
         },

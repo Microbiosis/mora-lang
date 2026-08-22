@@ -192,32 +192,32 @@ fn lower_node(ctx: &mut EmitContext, node: &Fcfg) {
             }
         }
 
-        // ── 控制流：While → Label + cond + JumpIfNot + body + Jump ──
+        // ── 控制流：While → Label + cond + JumpIfNot + body + Jump + post-patch ──
         Node::While { cond, body, .. } => {
             let loop_start = ctx.insts.len();
             lower_block(ctx, cond);
             let cond_reg = cond.result.unwrap_or(0);
             ctx.emit(MirInst::JumpIfNot(cond_reg, 0));
             let jump_not_idx = ctx.insts.len() - 1;
-            // Push loop context for break/continue
-            let continue_label = loop_start;
-            let break_placeholder = 0usize; // patched below
-            ctx.loop_stack.push((continue_label, break_placeholder));
+            // v0.90.4: break/continue label 由 witness_to_fcfg 携带（Node::Break.label），
+            // fcfg_lower 不维护独立 loop_stack —— 后修补直接用节点自带的 label。
+            let body_start = ctx.insts.len();
             lower_block(ctx, body);
+            let body_end = ctx.insts.len();
             ctx.emit(MirInst::Jump(loop_start));
             let end = ctx.insts.len();
             ctx.patch_label_at(jump_not_idx, end);
-            // Patch break targets
-            if let Some((_, break_label)) = ctx.loop_stack.pop() {
-                // break_label was placeholder; all Break instructions
-                // in the body were emitted with label 0, patch them now.
-                // Note: this is a simplified approach. A full implementation
-                // would track break instruction indices.
-                let _ = break_label;
+            // 后修补：body 内 Break→end_label（label已正确），Continue→loop_start
+            for i in body_start..body_end {
+                match &mut ctx.insts[i] {
+                    MirInst::Break(lbl) => *lbl = end,
+                    MirInst::Continue(lbl) => *lbl = loop_start,
+                    _ => {}
+                }
             }
         }
 
-        // ── 控制流：For → index-based loop ──
+        // ── 控制流：For → index-based loop + post-patch ──
         Node::For { var, iter, body, .. } => {
             // let __idx = 0
             let idx_reg = ctx.alloc_reg();
@@ -236,16 +236,25 @@ fn lower_node(ctx: &mut EmitContext, node: &Fcfg) {
             let val_reg = ctx.alloc_reg();
             ctx.emit(MirInst::Index(val_reg, *iter, idx_reg));
             ctx.emit(MirInst::Define(var.clone(), val_reg));
-            // body
+            // v0.90.4: break/continue label 由 Node 携带，无独立 loop_stack
+            let body_start = ctx.insts.len();
             lower_block(ctx, body);
+            let body_end = ctx.insts.len();
             // __idx = __idx + 1
             let one_reg = ctx.alloc_reg();
             ctx.emit(MirInst::Const(one_reg, Value::Int(1)));
             ctx.emit(MirInst::BinaryOp(idx_reg, idx_reg, BinaryOp::Add, one_reg));
             ctx.emit(MirInst::Jump(loop_start));
-            // Label: loop_end
             let end = ctx.insts.len();
             ctx.patch_label_at(jump_not_idx, end);
+            // 后修补：body 内 Break→end_label，Continue→loop_start
+            for i in body_start..body_end {
+                match &mut ctx.insts[i] {
+                    MirInst::Break(lbl) => *lbl = end,
+                    MirInst::Continue(lbl) => *lbl = loop_start,
+                    _ => {}
+                }
+            }
         }
 
         // ── Match → 单条 MatchExpr（镜像 emit_match_w：嵌套 arm MirFunction）──
@@ -257,14 +266,13 @@ fn lower_node(ctx: &mut EmitContext, node: &Fcfg) {
         Node::Return { value, .. } => {
             ctx.emit(MirInst::Return(*value));
         }
-        Node::Break { .. } => {
-            // Break target is the break label from loop_stack top
-            let break_label = ctx.loop_stack.last().map_or(0, |&(_, b)| b);
-            ctx.emit(MirInst::Break(break_label));
+        Node::Break { label, .. } => {
+            // v0.90.4: label 由 witness_to_fcfg 携带（While/For push_loop 后填）。
+            // fcfg_lower 无独立 loop_stack——单一信息源：节点本身。
+            ctx.emit(MirInst::Break(*label));
         }
-        Node::Continue { .. } => {
-            let continue_label = ctx.loop_stack.last().map_or(0, |&(c, _)| c);
-            ctx.emit(MirInst::Continue(continue_label));
+        Node::Continue { label, .. } => {
+            ctx.emit(MirInst::Continue(*label));
         }
 
         // ── 绑定 ──

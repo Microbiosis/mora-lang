@@ -46,6 +46,12 @@ fn max_reg_in_node(node: &Fcfg) -> usize {
         Node::MethodCall { dst, receiver, args, .. } => {
             args.iter().fold(*dst.max(receiver), |m, r| m.max(*r))
         }
+        Node::Or { dst, lhs, rhs, .. } | Node::And { dst, lhs, rhs, .. } => {
+            *dst.max(lhs).max(rhs)
+        }
+        Node::DynTrait { dst, src, .. } => *dst.max(src),
+        Node::Prompt { dst, parts, .. } => parts.iter().fold(*dst, |m, r| m.max(*r)),
+        Node::ClosureExpr { dst, body, .. } => *dst.max(&max_reg_in_nodes(&body.nodes)),
         Node::ListLit { dst, items, .. } => items.iter().fold(*dst, |m, r| m.max(*r)),
         Node::DictLit { dst, entries, .. } => entries.iter().fold(*dst, |m, (_, r)| m.max(*r)),
         Node::Index { dst, obj, idx, .. } => *dst.max(obj).max(idx),
@@ -107,6 +113,43 @@ fn lower_node(ctx: &mut EmitContext, node: &Fcfg) {
         }
         Node::MethodCall { dst, receiver, method, args, .. } => {
             ctx.emit(MirInst::MethodCall(*dst, *receiver, method.clone(), args.clone()));
+        }
+        // Or/And → 短路求值（镜像 emit_or_w 的 JumpIf + NotEqual 模式）
+        Node::Or { dst, lhs, rhs, .. } => {
+            let l = *lhs;
+            ctx.emit(MirInst::JumpIf(l, 0));
+            let jump_idx = ctx.insts.len() - 1;
+            ctx.emit(MirInst::BinaryOp(*dst, l, BinaryOp::NotEqual, *rhs));
+            let end = ctx.insts.len();
+            ctx.patch_label_at(jump_idx, end);
+        }
+        Node::And { dst, lhs, rhs, .. } => {
+            let l = *lhs;
+            ctx.emit(MirInst::JumpIfNot(l, 0));
+            let jump_idx = ctx.insts.len() - 1;
+            ctx.emit(MirInst::BinaryOp(*dst, l, BinaryOp::Equal, *rhs));
+            let end = ctx.insts.len();
+            ctx.patch_label_at(jump_idx, end);
+        }
+        Node::DynTrait { dst, src, trait_name, .. } => {
+            ctx.emit(MirInst::DynTrait {
+                dst: *dst,
+                src: *src,
+                trait_generics: vec![],
+                trait_name: trait_name.clone(),
+            });
+        }
+        Node::Prompt { dst, parts, .. } => {
+            ctx.emit(MirInst::Prompt(*dst, parts.clone()));
+        }
+        Node::ClosureExpr { dst, params, body, .. } => {
+            let param_names: Vec<String> = params.iter().map(|p| p.name.clone()).collect();
+            let body_mir = lower_block_to_function(ctx, body);
+            ctx.emit(MirInst::Closure {
+                dst: *dst,
+                params: param_names,
+                body: Box::new(body_mir),
+            });
         }
         Node::ListLit { dst, items, .. } => {
             ctx.emit(MirInst::ListLit(*dst, items.clone()));

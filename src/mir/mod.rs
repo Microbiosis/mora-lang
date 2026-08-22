@@ -49,6 +49,10 @@ pub mod lmir;
 // v0.89: LMIR → RIR 连接（LayoutTable 填充 + Unbox 接入）
 pub mod lmir_to_rir;
 pub mod lower;
+// v0.90: witness → FCFG 转换器（9 层切换的核心：FCFG 生产者）
+pub mod witness_to_fcfg;
+// v0.90: 9 层管线驱动 + 差分验证
+pub mod pipeline;
 pub mod opt;
 pub mod optimize;
 // v0.89: RIR/JIR — 9 层架构第 7-8 层（运行时 + JIT 接口）

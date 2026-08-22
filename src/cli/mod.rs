@@ -35,6 +35,31 @@ pub fn compile_and_opt(
     if level.enabled() {
         crate::mir::opt::optimize(&mut func, level);
     }
+    // v0.90: 9 层管线激活 — witness→FCFG→EHIR→Core→CMIR→LMIR→LayoutTable
+    // 全量运行 + 与原管线差分验证。执行器仍消费 func（Phase 2 切换点）。
+    // MORA_9LAYER=0 可禁用（性能敏感场景）。
+    if std::env::var("MORA_9LAYER").map_or(true, |v| v != "0") {
+        let result = crate::mir::pipeline::run_pipeline(&func, &witnesses);
+        // 差分诊断仅在 MORA_9LAYER_DEBUG=1 时输出（不污染正常 stdout）
+        if std::env::var("MORA_9LAYER_DEBUG").is_ok_and(|v| v == "1")
+            && !result.differential_ok
+        {
+            eprintln!(
+                "[9layer] fcfg={} typed={} core={} cmir={} lmir={} layouts={} | pipeline_mir={} original_mir={}",
+                result.fcfg_nodes,
+                result.typed_nodes,
+                result.core_insts,
+                result.cmir_nodes,
+                result.lmir_insts,
+                result.layouts,
+                result.pipeline_mir_count,
+                result.original_mir_count
+            );
+            for d in &result.differential_diffs {
+                eprintln!("[9layer] diff: {}", d);
+            }
+        }
+    }
     (func, witnesses)
 }
 

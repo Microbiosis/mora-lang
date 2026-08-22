@@ -69,6 +69,45 @@ pub enum Node<M> {
         span: Span,
         meta: M,
     },
+    /// 逻辑或（短路求值）。WitnessKind::Or 对应。
+    Or {
+        dst: Reg,
+        lhs: Reg,
+        rhs: Reg,
+        span: Span,
+        meta: M,
+    },
+    /// 逻辑与（短路求值）。WitnessKind::And 对应。
+    And {
+        dst: Reg,
+        lhs: Reg,
+        rhs: Reg,
+        span: Span,
+        meta: M,
+    },
+    /// dyn Trait 强制转换。WitnessKind::DynTrait 对应。
+    DynTrait {
+        dst: Reg,
+        src: Reg,
+        trait_name: String,
+        span: Span,
+        meta: M,
+    },
+    /// AI prompt 模板 p"..."。WitnessKind::Prompt 对应。
+    Prompt {
+        dst: Reg,
+        parts: Vec<Reg>,
+        span: Span,
+        meta: M,
+    },
+    /// 匿名闭包表达式 fn(x) ... end。WitnessKind::Closure 对应。
+    ClosureExpr {
+        dst: Reg,
+        params: Vec<Param>,
+        body: Block<M>,
+        span: Span,
+        meta: M,
+    },
     ListLit {
         dst: Reg,
         items: Vec<Reg>,
@@ -452,6 +491,11 @@ impl<M> Node<M> {
             | Node::BinaryOp { span, .. }
             | Node::Call { span, .. }
             | Node::MethodCall { span, .. }
+            | Node::Or { span, .. }
+            | Node::And { span, .. }
+            | Node::DynTrait { span, .. }
+            | Node::Prompt { span, .. }
+            | Node::ClosureExpr { span, .. }
             | Node::ListLit { span, .. }
             | Node::DictLit { span, .. }
             | Node::Index { span, .. }
@@ -495,6 +539,11 @@ impl<M> Node<M> {
             | Node::BinaryOp { meta, .. }
             | Node::Call { meta, .. }
             | Node::MethodCall { meta, .. }
+            | Node::Or { meta, .. }
+            | Node::And { meta, .. }
+            | Node::DynTrait { meta, .. }
+            | Node::Prompt { meta, .. }
+            | Node::ClosureExpr { meta, .. }
             | Node::ListLit { meta, .. }
             | Node::DictLit { meta, .. }
             | Node::Index { meta, .. }

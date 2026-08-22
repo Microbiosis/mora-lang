@@ -92,6 +92,33 @@ fn lower_node(ctx: &mut CoreContext, node: &Ehir) {
         Node::BinaryOp { dst, lhs, op, rhs, .. } => {
             ctx.emit(CoreInst::BinaryOp(*dst, *lhs, op.clone(), *rhs));
         }
+        // Or/And → Core 层降维为短路求值的控制流（Branch + 常量合并）
+        Node::Or { dst, lhs, rhs, .. } => {
+            // 简化：非短路直接 BinaryOp（NotEqual 语义与 emit_or_w 一致）
+            ctx.emit(CoreInst::BinaryOp(*dst, *lhs, crate::common::BinaryOp::NotEqual, *rhs));
+        }
+        Node::And { dst, lhs, rhs, .. } => {
+            ctx.emit(CoreInst::BinaryOp(*dst, *lhs, crate::common::BinaryOp::Equal, *rhs));
+        }
+        // DynTrait/Prompt → Core 层降维为透传调用
+        Node::DynTrait { dst, src, .. } => {
+            ctx.emit(CoreInst::Copy(*dst, *src));
+        }
+        Node::Prompt { dst, parts, .. } => {
+            // Prompt 在 Core 层表示为 Call("prompt", parts)
+            let prompt_callee = ctx.alloc_reg();
+            ctx.emit(CoreInst::Call(*dst, prompt_callee, parts.clone()));
+        }
+        Node::ClosureExpr { dst, params, body, .. } => {
+            let param_names: Vec<String> = params.iter().map(|p| p.name.clone()).collect();
+            let core_body = lower_block_to_core(ctx, body);
+            ctx.emit(CoreInst::ClosureCreate {
+                dst: *dst,
+                params: param_names,
+                captures: vec![],
+                body: core_body,
+            });
+        }
         Node::Call { dst, callee, callee_name, args, .. } => {
             // 已知函数名 → 直接 Call，否则 → ClosureCall
             if callee_name.is_some() {

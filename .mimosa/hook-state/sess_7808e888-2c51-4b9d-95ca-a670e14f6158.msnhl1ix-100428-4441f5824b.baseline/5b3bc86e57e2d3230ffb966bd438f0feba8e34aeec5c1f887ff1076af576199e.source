@@ -1,1 +1,0 @@
-window.SIDEBAR_ITEMS = {"enum":["VertexState"],"mod":["worker_pool"],"struct":["AgentExecOutcome","EngineStats","MirPregelEngine"],"type":["MirConflictCallback","MirInterruptCallback"]};

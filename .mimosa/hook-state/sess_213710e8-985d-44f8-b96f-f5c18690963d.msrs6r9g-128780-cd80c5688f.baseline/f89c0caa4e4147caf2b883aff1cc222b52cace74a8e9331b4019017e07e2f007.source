@@ -1,1 +1,0 @@
-window.SIDEBAR_ITEMS = {"enum":["Type"],"fn":["format_error","is_empty_union","is_known_type"],"mod":["check_mir","dispatch","hm","imports"],"struct":["SymbolTable","TypeError"]};

@@ -1,1 +1,0 @@
-window.SIDEBAR_ITEMS = {"enum":["MirInst"],"mod":["cache","dag","dag_interp","expr","handlers","host","interp","jit","lower","opt","optimize","ssa","typeinfer","witness"],"struct":["MirFunction"],"type":["Label","Reg"]};

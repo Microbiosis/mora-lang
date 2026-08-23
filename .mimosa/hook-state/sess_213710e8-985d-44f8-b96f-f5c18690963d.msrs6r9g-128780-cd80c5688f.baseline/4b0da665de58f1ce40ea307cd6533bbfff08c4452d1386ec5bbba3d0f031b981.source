@@ -1,1 +1,0 @@
-window.SIDEBAR_ITEMS = {"struct":["AiConfigValue","LruCache","RouteConfig","TokenBudget","TokenUsage","ToolDef","TraitInfo","TraitMethodSig"]};

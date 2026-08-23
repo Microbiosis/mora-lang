@@ -1,1 +1,0 @@
-window.SIDEBAR_ITEMS = {"enum":["Binding","BuiltinKind","MergeStrategy","Value"],"struct":["Conflict","EnvRef","Environment","StreamReader","VectorClock"]};

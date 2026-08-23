@@ -1,1 +1,0 @@
-window.SIDEBAR_ITEMS = {"fn":["global_dag_cache"],"static":["DAG_CACHE"],"struct":["DagCache"]};

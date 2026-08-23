@@ -1,1 +1,0 @@
-window.SIDEBAR_ITEMS = {"enum":["OptLevel","RegType","SsaInst","Terminator"],"fn":["construct","deconstruct"],"struct":["BasicBlock","MirSsaFunction","Phi"],"type":["BlockId","SsaReg"]};

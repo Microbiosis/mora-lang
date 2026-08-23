@@ -1,1 +1,0 @@
-window.SIDEBAR_ITEMS = {"enum":["ContainerBackend","NetworkMode"],"fn":["generate_container_name","spawn_container"],"struct":["ContainerHandle","ContainerSpec","MountSpec","ResourceLimits"]};

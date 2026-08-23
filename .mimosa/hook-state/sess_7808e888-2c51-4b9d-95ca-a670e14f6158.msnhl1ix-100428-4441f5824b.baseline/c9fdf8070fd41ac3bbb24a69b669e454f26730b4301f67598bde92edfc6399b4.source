@@ -1,1 +1,0 @@
-window.SIDEBAR_ITEMS = {"fn":["completion_v3","definition_v3","document_symbol_v3","folding_range_v3","formatting","hover_v3","references_v3","rename_v3","semantic_tokens_v3"]};

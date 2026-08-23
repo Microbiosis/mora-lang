@@ -1,1 +1,0 @@
-window.SIDEBAR_ITEMS = {"enum":["EdgeKind","MirDagNode"],"fn":["dag_analyze","topological_order","topological_sort"],"struct":["MirDag","MirDagEdge"],"type":["NodeId"]};

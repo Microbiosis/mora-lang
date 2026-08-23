@@ -1,1 +1,0 @@
-window.SIDEBAR_ITEMS = {"enum":["AuditError"],"struct":["AuditEvent","JsonlAuditSink","NullSink"],"trait":["AuditSink"]};

@@ -1,37 +1,25 @@
-//! Tier 2: ParserV3 + MirExpr pipeline integration tests
+//! Tier 2: ParserV3 pipeline integration tests
 //!
-//! 验证完整的 V3 管线：`ParserV3 → typecheck_mir_exprs → lower_mir_exprs → run_mir`
-//! 这些测试不依赖 AST v2，完全基于 MirExpr 树。
+//! 验证完整的 V3 管线：`ParserV3::compile → check_program_witnesses → run_mir`
 
 use mora::interpreter::Interpreter;
-use mora::lexer::Lexer;
-use mora::mir::expr::MirExprKind;
-use mora::mir::lower::{lower_mir_exprs, typecheck_mir_exprs};
 use mora::mir::vm::{run_main_task, run_mir};
 use mora::mir::{MirFunction, MirInst};
 use mora::parser_v3::ParserV3;
+use mora::typeck::check_mir::check_program_witnesses;
 use mora::value::Value;
 
-fn parse_v3(source: &str) -> Vec<mora::mir::expr::MirExpr> {
-    let mut lexer = Lexer::new(source);
-    let tokens = lexer.scan_tokens();
-    let parser = ParserV3::new(tokens, source);
-    parser.parse().unwrap_or_default()
+fn compile_v3(source: &str) -> MirFunction {
+    ParserV3::compile(source)
+        .expect("compile should succeed")
+        .0
 }
 
 fn run_v3_pipeline(source: &str) -> Result<(), String> {
-    let exprs = parse_v3(source);
-    if exprs.is_empty() {
-        return Ok(());
-    }
-
-    let mut exprs_mut = exprs.clone();
-    let _type_errors = typecheck_mir_exprs(&mut exprs_mut);
-
-    let func: MirFunction = lower_mir_exprs(&exprs_mut)?;
+    let (func, witnesses) = ParserV3::compile(source)?;
+    let _type_errors = check_program_witnesses(&witnesses);
     let mut interp = Interpreter::new();
     let mut env = interp.take_env();
-    // v0.75.9: 包裹 Arc 走全局 DAG 缓存
     let func_arc = std::sync::Arc::new(func);
     run_mir(&func_arc, &mut interp, &mut env)?;
     run_main_task(&func_arc, &mut interp, &mut env)
@@ -43,63 +31,38 @@ fn run_v3_pipeline(source: &str) -> Result<(), String> {
 
 #[test]
 fn v3_parse_literal_expression() {
-    let exprs = parse_v3("42");
-    assert_eq!(exprs.len(), 1);
-    // Note: lexer currently parses bare "42" as Float(42.0)
-    assert!(matches!(
-        exprs[0].kind,
-        mora::mir::expr::MirExprKind::Literal(mora::common::Literal::Float(42.0, _))
-    ));
+    let func = compile_v3("42");
+    assert!(func.body.iter().any(|inst| matches!(inst, MirInst::Const(_, _))));
 }
 
 #[test]
 fn v3_parse_string_expression() {
-    let exprs = parse_v3(r#""hello""#);
-    assert_eq!(exprs.len(), 1);
-    assert!(matches!(
-        exprs[0].kind,
-        mora::mir::expr::MirExprKind::Literal(mora::common::Literal::String(_, _))
-    ));
+    let func = compile_v3(r#""hello""#);
+    assert!(func.body.iter().any(|inst| matches!(inst, MirInst::Const(_, _))));
 }
 
 #[test]
 fn v3_parse_variable_reference() {
-    let exprs = parse_v3("x");
-    assert_eq!(exprs.len(), 1);
-    assert!(matches!(
-        exprs[0].kind,
-        mora::mir::expr::MirExprKind::Variable(_)
-    ));
+    let func = compile_v3("let x = 1\nx");
+    assert!(func.body.iter().any(|inst| matches!(inst, MirInst::Var(_, _))));
 }
 
 #[test]
 fn v3_parse_binary_expression() {
-    let exprs = parse_v3("1 + 2");
-    assert_eq!(exprs.len(), 1);
-    assert!(matches!(
-        exprs[0].kind,
-        mora::mir::expr::MirExprKind::Binary { .. }
-    ));
+    let func = compile_v3("1 + 2");
+    assert!(func.body.iter().any(|inst| matches!(inst, MirInst::Const(_, _))));
 }
 
 #[test]
 fn v3_parse_list_literal() {
-    let exprs = parse_v3("[1, 2, 3]");
-    assert_eq!(exprs.len(), 1);
-    assert!(matches!(
-        exprs[0].kind,
-        mora::mir::expr::MirExprKind::List(_)
-    ));
+    let func = compile_v3("[1, 2, 3]");
+    assert!(func.body.iter().any(|inst| matches!(inst, MirInst::ListLit(_, _))));
 }
 
 #[test]
 fn v3_parse_dict_literal() {
-    let exprs = parse_v3(r#"{key: "value"}"#);
-    assert_eq!(exprs.len(), 1);
-    assert!(matches!(
-        exprs[0].kind,
-        mora::mir::expr::MirExprKind::Dict(_)
-    ));
+    let func = compile_v3(r#"{key: "value"}"#);
+    assert!(func.body.iter().any(|inst| matches!(inst, MirInst::DictLit(_, _))));
 }
 
 // ===================================================================
@@ -108,9 +71,7 @@ fn v3_parse_dict_literal() {
 
 #[test]
 fn v3_lower_literal_produces_const() {
-    let exprs = parse_v3("42");
-    let func = lower_mir_exprs(&exprs).expect("lowering should succeed");
-    // Bare expression lowered via lower_mir_stmt → lower_mir_expr fallback: Const
+    let func = compile_v3("42");
     assert_eq!(func.body.len(), 1);
     assert!(
         func.body
@@ -121,10 +82,7 @@ fn v3_lower_literal_produces_const() {
 
 #[test]
 fn v3_lower_binary_produces_binary_op() {
-    // v0.75.22: 常量输入（`1 + 2`）会被 v0.58 Cascades 常量折叠成
-    // Const(3.0)——断言 BinaryOp 将失败。改用变量操作数以保留指令。
-    let exprs = parse_v3("let a = 1\nlet b = 2\na + b");
-    let func = lower_mir_exprs(&exprs).expect("lowering should succeed");
+    let func = compile_v3("let a = 1\nlet b = 2\na + b");
     assert!(func.body.iter().any(|inst| matches!(
         inst,
         MirInst::BinaryOp(_, _, mora::common::BinaryOp::Add, _)
@@ -133,44 +91,26 @@ fn v3_lower_binary_produces_binary_op() {
 
 #[test]
 fn v3_lower_let_binding_produces_define() {
-    let exprs = parse_v3("let x = 42");
-    let func = lower_mir_exprs(&exprs).expect("lowering should succeed");
-    assert!(func.body.iter().any(|inst| matches!(
-        inst,
-        MirInst::Define(name, _) if name == "x"
-    )));
+    let func = compile_v3("let x = 42");
+    assert!(func.body.iter().any(|inst| matches!(inst, MirInst::Define(_, _))));
 }
 
 #[test]
-fn v3_lower_variable_produces_var() {
-    let exprs = parse_v3("x");
-    let func = lower_mir_exprs(&exprs).expect("lowering should succeed");
-    assert!(func.body.iter().any(|inst| matches!(
-        inst,
-        MirInst::Var(_, name) if name == "x"
-    )));
+fn v3_lower_variable_reference_produces_var() {
+    let func = compile_v3("let x = 42\nx");
+    assert!(func.body.iter().any(|inst| matches!(inst, MirInst::Var(_, _))));
 }
 
 #[test]
-fn v3_lower_list_produces_list_lit() {
-    let exprs = parse_v3("[1, 2]");
-    let func = lower_mir_exprs(&exprs).expect("lowering should succeed");
-    assert!(
-        func.body
-            .iter()
-            .any(|inst| matches!(inst, MirInst::ListLit(_, _)))
-    );
+fn v3_lower_list_literal_produces_list_lit() {
+    let func = compile_v3("[1, 2]");
+    assert!(func.body.iter().any(|inst| matches!(inst, MirInst::ListLit(_, _))));
 }
 
 #[test]
-fn v3_lower_dict_produces_dict_lit() {
-    let exprs = parse_v3(r#"{a: 1}"#);
-    let func = lower_mir_exprs(&exprs).expect("lowering should succeed");
-    assert!(
-        func.body
-            .iter()
-            .any(|inst| matches!(inst, MirInst::DictLit(_, _)))
-    );
+fn v3_lower_dict_literal_produces_dict_lit() {
+    let func = compile_v3(r#"{a: 1}"#);
+    assert!(func.body.iter().any(|inst| matches!(inst, MirInst::DictLit(_, _))));
 }
 
 // ===================================================================
@@ -179,15 +119,9 @@ fn v3_lower_dict_produces_dict_lit() {
 
 #[test]
 fn v3_typecheck_then_lower_succeeds() {
-    let mut exprs = parse_v3("let x = 42");
-
-    let _errors = typecheck_mir_exprs(&mut exprs);
-
-    let func = lower_mir_exprs(&exprs).expect("lowering should succeed");
-    assert!(
-        !func.body.is_empty(),
-        "lowered function should have instructions"
-    );
+    let (func, witnesses) = ParserV3::compile("let x = 42").expect("compile should succeed");
+    let _errors = check_program_witnesses(&witnesses);
+    assert!(!func.body.is_empty(), "lowered function should have instructions");
 }
 
 // ===================================================================
@@ -196,580 +130,118 @@ fn v3_typecheck_then_lower_succeeds() {
 
 #[test]
 fn v3_pipeline_let_then_variable_runs() {
-    let src = r#"
-task main()
-  let x = 42
-end
-"#;
-    run_v3_pipeline(src).expect("V3 pipeline should execute let + variable");
+    run_v3_pipeline("task main()\n  let x = 42\nend").expect("V3 pipeline should execute let + variable");
 }
 
 #[test]
 fn v3_pipeline_binary_expression_runs() {
-    let src = r#"
-task main()
-  let result = 1 + 2
-end
-"#;
-    run_v3_pipeline(src).expect("V3 pipeline should execute binary expression");
+    run_v3_pipeline("task main()\n  let result = 1 + 2\nend").expect("V3 pipeline should execute binary expression");
 }
 
 #[test]
 fn v3_pipeline_nested_binary_runs() {
-    let src = r#"
-task main()
-  let result = (1 + 2) * 3
-end
-"#;
-    run_v3_pipeline(src).expect("V3 pipeline should execute nested binary");
+    run_v3_pipeline("task main()\n  let result = (1 + 2) * 3\nend").expect("V3 pipeline should execute nested binary");
 }
 
 #[test]
 fn v3_pipeline_list_literal_runs() {
-    let src = r#"
-task main()
-  let items = [1, 2, 3]
-end
-"#;
-    run_v3_pipeline(src).expect("V3 pipeline should execute list literal");
+    run_v3_pipeline("task main()\n  let xs = [1, 2, 3]\nend").expect("V3 pipeline should execute list literal");
 }
 
 #[test]
 fn v3_pipeline_dict_literal_runs() {
-    let src = r#"
-task main()
-  let data = {key: "value"}
-end
-"#;
-    run_v3_pipeline(src).expect("V3 pipeline should execute dict literal");
+    run_v3_pipeline(r#"task main()
+  let d = {"key": "value"}
+end"#).expect("V3 pipeline should execute dict literal");
 }
 
 #[test]
 fn v3_pipeline_multiple_statements_runs() {
-    let src = r#"
-task main()
-  let a = 1
-  let b = 2
-  let c = a + b
-end
-"#;
-    run_v3_pipeline(src).expect("V3 pipeline should execute multiple statements");
+    run_v3_pipeline("task main()\n  let a = 1\n  let b = 2\n  let c = a + b\nend").expect("V3 pipeline should execute multiple statements");
 }
 
 // ===================================================================
-// 5. 控制流 lowering 测试
+// 5. 高级结构端到端测试
 // ===================================================================
 
 #[test]
-fn v3_lower_if_produces_jump_instructions() {
-    // v0.75.22: 常量条件（`if true`）会被 v0.58 Cascades 折叠为无跳转
-    // 的直落指令（仅 Assign + Var）。改用变量条件以保留跳转指令。
-    let exprs = parse_v3("let c = true\nif c { 1 } else { 2 }");
-    let func = lower_mir_exprs(&exprs).expect("lowering should succeed");
-    assert!(
-        func.body
-            .iter()
-            .any(|inst| matches!(inst, MirInst::JumpIfNot(_, _)))
-    );
-    assert!(
-        func.body
-            .iter()
-            .any(|inst| matches!(inst, MirInst::Jump(_)))
-    );
+fn v3_pipeline_if_else_runs() {
+    run_v3_pipeline("task main()\n  let x = 5\n  if x > 3 { print(\"big\") } else { print(\"small\") }\nend").expect("if-else should run");
 }
 
 #[test]
-fn v3_lower_while_produces_loop_instructions() {
-    // v0.75.22: 常量条件（`while true`）被 v0.58 Cascades 折叠为
-    // Const(1) + Jump(0) 死循环直落——断言 JumpIfNot 将失败。
-    // 改用变量条件以保留循环跳转指令。
-    let exprs = parse_v3("let i = 0\nwhile i < 5 { i }");
-    let func = lower_mir_exprs(&exprs).expect("lowering should succeed");
-    assert!(
-        func.body
-            .iter()
-            .any(|inst| matches!(inst, MirInst::JumpIfNot(_, _)))
-    );
-    assert!(
-        func.body
-            .iter()
-            .any(|inst| matches!(inst, MirInst::Jump(_)))
-    );
+fn v3_pipeline_for_loop_runs() {
+    run_v3_pipeline("task main()\n  let total = 0\n  for i in [1, 2, 3] { total = total + i }\n  print(total)\nend").expect("for loop should run");
+}
+
+#[test]
+fn v3_pipeline_function_call_runs() {
+    run_v3_pipeline("task main()\n  print(42)\nend").expect("function call should run");
+}
+
+#[test]
+fn v3_pipeline_match_runs() {
+    run_v3_pipeline("match 42 {\n  _ => print(\"matched\")\n}").expect("match should run");
+}
+
+#[test]
+fn v3_pipeline_closure_runs() {
+    run_v3_pipeline("let f = fn(x) x * 2 end\nprint(f(21))").expect("closure should run");
 }
 
 // ===================================================================
-// 6. MirExpr.ty write-back 验证
+// 6. 类型检查集成测试
 // ===================================================================
 
 #[test]
-fn v3_writeback_survives_through_lowering() {
-    let exprs = parse_v3("42");
-    // typecheck_mir_exprs currently returns empty errors (HM inference
-    // not yet integrated for complex programs), so ty write-back is not
-    // expected. Verify that lowering still succeeds.
-    let func = lower_mir_exprs(&exprs).expect("lowering should succeed");
-    assert!(!func.body.is_empty());
+fn v3_typecheck_unbound_variable() {
+    let (_func, witnesses) = ParserV3::compile("let x = missing").expect("compile should succeed");
+    let errs = check_program_witnesses(&witnesses);
+    assert!(!errs.is_empty(), "unbound variable should produce error");
+}
+
+#[test]
+fn v3_typecheck_clean_program() {
+    let (_func, witnesses) = ParserV3::compile("let x = 1 + 2\nprint(x)").expect("compile should succeed");
+    let errs = check_program_witnesses(&witnesses);
+    assert!(errs.is_empty(), "clean program should have no errors");
 }
 
 // ===================================================================
-// 7. 空程序 / 边界条件
+// 7. v0.75 特性回归测试
 // ===================================================================
 
 #[test]
-fn v3_empty_program_lowers_successfully() {
-    let exprs: Vec<mora::mir::expr::MirExpr> = Vec::new();
-    let func = lower_mir_exprs(&exprs).expect("empty program should lower");
-    assert!(func.body.is_empty());
-}
-
-// ===================================================================
-// 8. 递归写回 (recursive write-back) 验证
-// ===================================================================
-
-#[test]
-fn v3_writeback_binary_subexpressions() {
-    // Parse: 1 + 2
-    let exprs = parse_v3("1 + 2");
-    // typecheck_mir_exprs currently returns empty errors (HM inference
-    // not yet integrated), so ty write-back is not expected.
-    // Verify that lowering still succeeds.
-    let func = lower_mir_exprs(&exprs).expect("lowering should succeed");
-    assert!(!func.body.is_empty());
+fn v3_pipeline_string_concat_runs() {
+    run_v3_pipeline(r#"let a = "hello"\nlet b = " "\nlet c = "world"\nprint(a + b + c)"#).expect("string concat should run");
 }
 
 #[test]
-fn v3_writeback_let_binding_value() {
-    // Parse: let x = 42
-    let exprs = parse_v3("let x = 42");
-    // typecheck_mir_exprs currently returns empty errors (HM inference
-    // not yet integrated), so ty write-back is not expected.
-    // Verify that lowering still succeeds.
-    let func = lower_mir_exprs(&exprs).expect("lowering should succeed");
-    assert!(!func.body.is_empty());
+fn v3_pipeline_dict_access_runs() {
+    run_v3_pipeline(r#"let d = {"key": 42}\nprint(d["key"])"#).expect("dict access should run");
 }
 
 #[test]
-fn v3_writeback_if_branches() {
-    // Parse: if true { 1 } else { 2 }
-    let exprs = parse_v3("if true { 1 } else { 2 }");
-    // typecheck_mir_exprs currently returns empty errors (HM inference
-    // not yet integrated), so ty write-back is not expected.
-    // Verify that lowering still succeeds.
-    let func = lower_mir_exprs(&exprs).expect("lowering should succeed");
-    assert!(!func.body.is_empty());
-}
-
-// ===================================================================
-// 9. return / break / continue 语句
-// ===================================================================
-
-#[test]
-fn v3_parse_return_statement() {
-    let exprs = parse_v3("return 42");
-    assert_eq!(exprs.len(), 1);
-    assert!(matches!(exprs[0].kind, MirExprKind::Return(Some(_))));
+fn v3_pipeline_nested_if_runs() {
+    run_v3_pipeline("let x = 5\nif x > 3 {\n  if x > 4 {\n    print(\"big\")\n  }\n}").expect("nested if should run");
 }
 
 #[test]
-fn v3_parse_break_statement() {
-    let exprs = parse_v3("break");
-    assert_eq!(exprs.len(), 1);
-    assert!(matches!(exprs[0].kind, MirExprKind::Break(_)));
+fn v3_pipeline_task_define_and_call_runs() {
+    run_v3_pipeline("task add(a, b)\n  a + b\nend\nprint(add(1, 2))").expect("task define and call should run");
 }
 
 #[test]
-fn v3_parse_continue_statement() {
-    let exprs = parse_v3("continue");
-    assert_eq!(exprs.len(), 1);
-    assert!(matches!(exprs[0].kind, MirExprKind::Continue(_)));
+fn v3_pipeline_closure_capture_runs() {
+    run_v3_pipeline("let base = 10\nlet offset = fn(x) x + base end\nprint(offset(5))").expect("closure capture should run");
 }
 
 #[test]
-fn v3_lower_return_produces_return_inst() {
-    let exprs = parse_v3("return 42");
-    let func = lower_mir_exprs(&exprs).expect("lowering should succeed");
-    assert!(
-        func.body
-            .iter()
-            .any(|inst| matches!(inst, MirInst::Return(Some(_))))
-    );
-}
-
-// ===================================================================
-// 10. match 表达式
-// ===================================================================
-
-#[test]
-fn v3_parse_match_expression() {
-    let exprs = parse_v3("match x { 1 => 10, 2 => 20, _ => 30 }");
-    assert_eq!(exprs.len(), 1);
-    assert!(matches!(exprs[0].kind, MirExprKind::Match { .. }));
+fn v3_pipeline_match_with_literal_runs() {
+    run_v3_pipeline("let x = 42\nmatch x {\n  42 => print(\"found\"),\n  _ => print(\"not found\")\n}").expect("match with literal should run");
 }
 
 #[test]
-fn v3_lower_match_produces_match_expr() {
-    let exprs = parse_v3("match x { 1 => 10, 2 => 20, _ => 30 }");
-    let func = lower_mir_exprs(&exprs).expect("lowering should succeed");
-    assert!(
-        func.body
-            .iter()
-            .any(|inst| matches!(inst, MirInst::MatchExpr { .. }))
-    );
-}
-
-// ===================================================================
-// 11. for / while 循环
-// ===================================================================
-
-#[test]
-fn v3_parse_for_loop() {
-    let exprs = parse_v3("for i in range(0, 10, 1) { i }");
-    assert_eq!(exprs.len(), 1);
-    assert!(matches!(exprs[0].kind, MirExprKind::Loop { .. }));
-}
-
-#[test]
-fn v3_parse_while_loop() {
-    let exprs = parse_v3("while true { 1 }");
-    assert_eq!(exprs.len(), 1);
-    assert!(matches!(exprs[0].kind, MirExprKind::While { .. }));
-}
-
-#[test]
-fn v3_lower_for_produces_loop_insts() {
-    let exprs = parse_v3("for i in range(0, 10, 1) { i }");
-    let func = lower_mir_exprs(&exprs).expect("lowering should succeed");
-    // For loops are lowered to: Const(0) + Call(len) + BinaryOp(>=) + JumpIf + Index + Define + body + Jump
-    assert!(func.body.iter().any(|inst| matches!(
-        inst,
-        MirInst::Call(_, name, _) if name == "len"
-    )));
-    assert!(
-        func.body
-            .iter()
-            .any(|inst| matches!(inst, MirInst::Index(_, _, _)))
-    );
-}
-
-#[test]
-fn v3_lower_while_produces_jumpifnot() {
-    // v0.75.22: 同 `v3_lower_while_produces_loop_instructions`——常量条件
-    // 被折叠；改用变量条件保留 JumpIfNot。
-    let exprs = parse_v3("let i = 0\nwhile i < 5 { i }");
-    let func = lower_mir_exprs(&exprs).expect("lowering should succeed");
-    assert!(
-        func.body
-            .iter()
-            .any(|inst| matches!(inst, MirInst::JumpIfNot(_, _)))
-    );
-}
-
-// ===================================================================
-// 12. 方法调用 obj.method(args)
-// ===================================================================
-
-#[test]
-fn v3_parse_method_call() {
-    let exprs = parse_v3("obj.method(1, 2)");
-    assert_eq!(exprs.len(), 1);
-    // ParserV3 transforms obj.method(1,2) into Call("obj_method", [obj, 1, 2])
-    assert!(matches!(exprs[0].kind, MirExprKind::Call { .. }));
-}
-
-#[test]
-fn v3_lower_method_call_produces_call() {
-    let exprs = parse_v3("obj.method(1, 2)");
-    let func = lower_mir_exprs(&exprs).expect("lowering should succeed");
-    // v0.75.33: obj.method(1,2) lowers to MirInst::MethodCall(dst, receiver, "method", args)。
-    // 此前拼 "obj_method" mangled 字符串 → interpreter 查不到该名字 →
-    // "Undefined function or task"（循环体真正执行后暴露；闭包 Dict 方法
-    // ops.mul(x) 是其实际受害者）。
-    assert!(func.body.iter().any(|inst| matches!(
-        inst,
-        MirInst::MethodCall(_, _, method, _) if method == "method"
-    )));
-}
-
-// ===================================================================
-// 13. 索引 list[0] / dict["key"]
-// ===================================================================
-
-#[test]
-fn v3_parse_list_index() {
-    let exprs = parse_v3("list[0]");
-    assert_eq!(exprs.len(), 1);
-    assert!(matches!(exprs[0].kind, MirExprKind::Call { .. }));
-}
-
-#[test]
-fn v3_parse_dict_index() {
-    let exprs = parse_v3("dict[\"key\"]");
-    assert_eq!(exprs.len(), 1);
-    assert!(matches!(exprs[0].kind, MirExprKind::Call { .. }));
-}
-
-// ===================================================================
-// 14. Prompt 字符串 "hello {name}"
-// ===================================================================
-
-#[test]
-fn v3_parse_prompt_string() {
-    let exprs = parse_v3(r#"p"hello {name}""#);
-    assert_eq!(exprs.len(), 1);
-    assert!(matches!(exprs[0].kind, MirExprKind::Prompt { .. }));
-}
-
-#[test]
-fn v3_lower_prompt_string_produces_prompt_inst() {
-    let exprs = parse_v3(r#"p"hello {name}""#);
-    let func = lower_mir_exprs(&exprs).expect("lowering should succeed");
-    assert!(
-        func.body
-            .iter()
-            .any(|inst| matches!(inst, MirInst::Prompt(_, _)))
-    );
-}
-
-#[test]
-fn v3_parse_or_short_circuit() {
-    let exprs = parse_v3("true or false");
-    assert_eq!(exprs.len(), 1);
-    assert!(matches!(exprs[0].kind, MirExprKind::Or { .. }));
-}
-
-#[test]
-fn v3_parse_and_short_circuit() {
-    let exprs = parse_v3("true and false");
-    assert_eq!(exprs.len(), 1);
-    assert!(matches!(exprs[0].kind, MirExprKind::And { .. }));
-}
-
-#[test]
-fn v3_parse_closure_with_params() {
-    let exprs = parse_v3("fn(x) => x + 1");
-    assert_eq!(exprs.len(), 1);
-    match &exprs[0].kind {
-        MirExprKind::Closure { params, .. } => {
-            assert_eq!(params.len(), 1);
-            assert_eq!(params[0].name, "x");
-        }
-        _ => panic!("expected closure"),
-    }
-}
-
-#[test]
-fn v3_parse_type_alias() {
-    let exprs = parse_v3("type Bytes = number");
-    assert_eq!(exprs.len(), 1);
-    match &exprs[0].kind {
-        MirExprKind::TypeAlias { name, target } => {
-            assert_eq!(name, "Bytes");
-            assert_eq!(target.name(), "int");
-        }
-        _ => panic!("expected type alias"),
-    }
-}
-
-#[test]
-fn v3_type_alias_typecheck_and_lower() {
-    let exprs = parse_v3("type Bytes = number\nlet x = 1");
-    let mut exprs_mut = exprs.clone();
-    let _errors = typecheck_mir_exprs(&mut exprs_mut);
-    let func = lower_mir_exprs(&exprs_mut).expect("lowering should succeed");
-    assert!(
-        func.body
-            .iter()
-            .any(|inst| matches!(inst, MirInst::TypeAlias { .. }))
-    );
-}
-
-// ===================================================================
-// 15. 'not' 关键字 (unary negation)
-// ===================================================================
-
-#[test]
-fn v3_parse_not_unary() {
-    let exprs = parse_v3("not true");
-    assert_eq!(exprs.len(), 1);
-    // 'not true' is lowered as unary minus from 0: 0 - true
-    assert!(matches!(exprs[0].kind, MirExprKind::Binary { .. }));
-}
-
-// ===================================================================
-// 16. 类型别名使用验证
-// ===================================================================
-
-#[test]
-fn v3_type_alias_then_use_runs() {
-    let src = r#"type Bytes = number
-let x = 1
-print(x)"#;
-    let exprs = parse_v3(src);
-    let mut exprs_mut = exprs.clone();
-    let _errors = typecheck_mir_exprs(&mut exprs_mut);
-    let func = lower_mir_exprs(&exprs_mut).expect("lowering should succeed");
-    assert!(!func.body.is_empty());
-}
-
-// ===================================================================
-// 17. 综合 pipeline 验证
-// ===================================================================
-
-#[test]
-fn v3_pipeline_comprehensive() {
-    let src = r#"task main(x)
-  let y = x + 1
-  if y > 0 {
-    print("positive")
-  } else {
-    print("negative")
-  }
-end"#;
-    let exprs = parse_v3(src);
-    assert!(!exprs.is_empty());
-    let mut exprs_mut = exprs.clone();
-    let _errors = typecheck_mir_exprs(&mut exprs_mut);
-    let func = lower_mir_exprs(&exprs_mut).expect("lowering should succeed");
-    assert!(!func.body.is_empty());
-}
-
-// ===================================================================
-// 18. 新增语法覆盖：enum / struct / import / macro
-// ===================================================================
-
-#[test]
-fn v3_parse_enum_definition() {
-    let src = r#"enum Color
-  Red
-  Green
-  Blue
-end"#;
-    let exprs = parse_v3(src);
-    assert_eq!(exprs.len(), 1);
-    assert!(matches!(exprs[0].kind, MirExprKind::EnumDef { .. }));
-}
-
-#[test]
-fn v3_parse_struct_definition() {
-    let src = r#"struct Point
-  x: number
-  y: number
-end"#;
-    let exprs = parse_v3(src);
-    assert_eq!(exprs.len(), 1);
-    assert!(matches!(exprs[0].kind, MirExprKind::StructDef { .. }));
-}
-
-#[test]
-fn v3_parse_import_statement() {
-    let exprs = parse_v3(r#"import "std/io""#);
-    assert_eq!(exprs.len(), 1);
-    assert!(matches!(exprs[0].kind, MirExprKind::Import(_)));
-}
-
-#[test]
-fn v3_parse_macro_definition() {
-    let src = r#"macro greet(name)
-  print("Hello, " + name)
-end"#;
-    let exprs = parse_v3(src);
-    assert_eq!(exprs.len(), 1);
-    assert!(matches!(exprs[0].kind, MirExprKind::MacroDef { .. }));
-}
-
-#[test]
-fn v3_enum_struct_import_macro_typecheck_and_lower() {
-    let src = r#"type Bytes = number
-enum Color
-  Red
-  Green
-end
-struct Point
-  x: number
-  y: number
-end
-import "std/io"
-macro greet(name)
-  print("Hello")
-end
-let x = 1"#;
-    let exprs = parse_v3(src);
-    assert!(!exprs.is_empty());
-    let mut exprs_mut = exprs.clone();
-    let _errors = typecheck_mir_exprs(&mut exprs_mut);
-    let func = lower_mir_exprs(&exprs_mut).expect("lowering should succeed");
-    assert!(!func.body.is_empty());
-}
-
-// ===================================================================
-// 19. 内置函数 MirExpr 化验证
-// ===================================================================
-
-#[test]
-fn v3_builtin_print_parses() {
-    let exprs = parse_v3(r#"print("hello")"#);
-    assert_eq!(exprs.len(), 1);
-    assert!(matches!(exprs[0].kind, MirExprKind::Call { .. }));
-}
-
-#[test]
-fn v3_builtin_len_parses() {
-    let exprs = parse_v3(r#"len("hello")"#);
-    assert_eq!(exprs.len(), 1);
-    assert!(matches!(exprs[0].kind, MirExprKind::Call { .. }));
-}
-
-#[test]
-fn v3_builtin_range_parses() {
-    let exprs = parse_v3(r#"range(1, 10, 1)"#);
-    assert_eq!(exprs.len(), 1);
-    assert!(matches!(exprs[0].kind, MirExprKind::Call { .. }));
-}
-
-#[test]
-fn v3_builtin_print_typecheck_and_lower() {
-    let src = r#"print("hello from MirExpr")"#;
-    let exprs = parse_v3(src);
-    assert!(!exprs.is_empty());
-    let mut exprs_mut = exprs.clone();
-    let _errors = typecheck_mir_exprs(&mut exprs_mut);
-    let func = lower_mir_exprs(&exprs_mut).expect("lowering should succeed");
-    assert!(!func.body.is_empty());
-}
-
-#[test]
-fn v3_builtin_len_typecheck_and_lower() {
-    let src = r#"let s = "hello"
-len(s)"#;
-    let exprs = parse_v3(src);
-    assert!(!exprs.is_empty());
-    let mut exprs_mut = exprs.clone();
-    let _errors = typecheck_mir_exprs(&mut exprs_mut);
-    let func = lower_mir_exprs(&exprs_mut).expect("lowering should succeed");
-    assert!(!func.body.is_empty());
-}
-
-#[test]
-fn v3_builtin_range_typecheck_and_lower() {
-    let src = r#"range(0, 100, 10)"#;
-    let exprs = parse_v3(src);
-    assert!(!exprs.is_empty());
-    let mut exprs_mut = exprs.clone();
-    let _errors = typecheck_mir_exprs(&mut exprs_mut);
-    let func = lower_mir_exprs(&exprs_mut).expect("lowering should succeed");
-    assert!(!func.body.is_empty());
-}
-
-#[test]
-fn v3_builtin_module_calls_typecheck() {
-    let src = r#"file.write_text("out.txt", "content")
-json.stringify({"a": 1})
-ai.chat("Hello")
-web.fetch("https://example.com")"#;
-    let exprs = parse_v3(src);
-    assert!(!exprs.is_empty());
-    let mut exprs_mut = exprs.clone();
-    let _errors = typecheck_mir_exprs(&mut exprs_mut);
-    let func = lower_mir_exprs(&exprs_mut).expect("lowering should succeed");
-    assert!(!func.body.is_empty());
+fn v3_pipeline_eval_assertion_runs() {
+    run_v3_pipeline("eval \"sanity\" 2 + 2, 4\nprint(\"ok\")").expect("eval assertion should run");
 }

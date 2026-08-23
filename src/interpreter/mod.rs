@@ -25,8 +25,8 @@ use crate::trace_collector::TraceCollector;
 pub use crate::config::{
     AI_API_KEY_ENV, AI_BASE_URL_DEFAULT, AI_BASE_URL_ENV, AI_MODEL_DEFAULT, AI_MODEL_ENV,
 };
-// v0.85: parse_code_v3 已迁至 crate::parser_v3::parse_code_v3（解析逻辑不属解释器层）
-pub use crate::parser_v3::parse_code_v3;
+// v0.90.5: parse_code_v3 re-export 已删除（兼容桥违反 AGENTS.md §6）
+// 直接使用 crate::parser_v3::parse_code_v3
 
 pub use crate::value::{Environment, StreamReader, Value};
 

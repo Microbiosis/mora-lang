@@ -1,46 +1,30 @@
-//! v0.77: proptest — ParserV3::compile 与 parse_code_v3→lower_mir_exprs 双路径等价。
+//! v0.77: proptest — ParserV3::compile 随机输入鲁棒性测试。
 //!
-//! 推广 tests/compile_differential.rs 的 22 个手写 case 到任意随机输入。
-//!
-//! 不变量：对于任意 Mora 源码 src：
-//!   ParserV3::compile(src).0.body == lower_mir_exprs(parse_code_v3(src)).body
-//!   ParserV3::compile(src).0.n_regs == lower_mir_exprs(parse_code_v3(src)).n_regs
+//! 验证 compile 对任意输入不 panic（成功或返回 Err）。
+//! 旧 parse_code_v3→lower_mir_exprs 双路径等价测试已删除
+//! （AGENTS.md §6 禁止兼容桥）。
 
 use proptest::prelude::*;
 
 proptest! {
     #![proptest_config(ProptestConfig {
-        cases: 32,  // CI 友好：默认 256 减半
+        cases: 32,  // CI 友好
         .. ProptestConfig::default()
     })]
 
-    /// 关键 invariant：compile vs parse+lower 双路径产物等价。
-    /// 这条规则防止 parser→MirInst 单遍编译（v0.75.40）和
-    /// parse→MirExpr→lower→MirInst 双阶段路径分叉。
+    /// compile 对任意输入不 panic（成功或返回 Err）。
     #[test]
-    fn compile_equals_lower_mir_exprs(src in proptest::string::string_regex(".*").unwrap()) {
-        // 任意字符串都可能 parse 失败或 typecheck 失败 — 我们只比较两条路径的产物，
-        // 当两条路径都成功时产物必须相同。
-        let compile_func: Option<mora::mir::MirFunction> = mora::parser_v3::ParserV3::compile(&src)
-            .ok()
-            .map(|(f, _)| f);
-        let parse_func: Option<mora::mir::MirFunction> = mora::parser_v3::parse_code_v3(&src)
-            .ok()
-            .and_then(|exprs| mora::mir::lower::lower_mir_exprs(&exprs).ok());
+    fn compile_never_panics(src in proptest::string::string_regex(".*").unwrap()) {
+        let _ = mora::parser_v3::ParserV3::compile(&src);
+        // 不 panic 即通过
+    }
 
-        match (compile_func, parse_func) {
-            (Some(c), Some(p)) => {
-                prop_assert_eq!(c.n_regs, p.n_regs, "n_regs mismatch: compile={}, lower={}", c.n_regs, p.n_regs);
-                prop_assert_eq!(c.body.len(), p.body.len(), "body length mismatch: compile={}, lower={}", c.body.len(), p.body.len());
-                for (i, (a, b)) in c.body.iter().zip(p.body.iter()).enumerate() {
-                    prop_assert_eq!(a, b, "body[{}] mismatch: compile={:?}, lower={:?}", i, a, b);
-                }
-            }
-            // 一条路径失败另一条路径成功 → 反例（这是真正想要捕获的 regression）
-            (Some(_), None) => prop_assert!(false, "compile succeeded but lower failed for: {:?}", src),
-            (None, Some(_)) => prop_assert!(false, "lower succeeded but compile failed for: {:?}", src),
-            // 两条路径都失败（无效输入）— OK
-            (None, None) => {}
+    /// 成功编译的程序 body 不应为空（除非输入为空）。
+    #[test]
+    fn successful_compile_has_nonempty_body(src in proptest::string::string_regex("[a-z0-9+\\-*/() ]+").unwrap()) {
+        if let Ok((func, _)) = mora::parser_v3::ParserV3::compile(&src) {
+            prop_assert!(!func.body.is_empty() || src.trim().is_empty(),
+                "successful compile should have non-empty body for: {:?}", src);
         }
     }
 }

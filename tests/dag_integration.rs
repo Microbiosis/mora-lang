@@ -5,15 +5,12 @@
 //! delegate the task body to `run_mir` via `run_main_task`.
 
 use mora::interpreter::Interpreter;
-use mora::mir::lower::lower_mir_exprs;
-use mora::parser_v3::parse_code_v3;
+use mora::parser_v3::ParserV3;
 
 fn run_dag_path(source: &str) -> Result<(), String> {
-    let exprs = parse_code_v3(source)?;
-    let func = lower_mir_exprs(&exprs)?;
+    let (func, _witnesses) = ParserV3::compile(source)?;
     let mut interp = Interpreter::new();
     let mut env = interp.take_env();
-    // v0.75.9: 包裹 Arc（run_mir_dag 签名变更，走全局 DAG 缓存）
     mora::mir::vm::run_mir_dag(&std::sync::Arc::new(func), &mut interp, &mut env)?;
     Ok(())
 }
@@ -37,8 +34,7 @@ fn dag_task_with_main_no_crash() {
 fn dag_compress_demo_no_crash() {
     let source = std::fs::read_to_string("examples/compress_demo.mora")
         .expect("should read compress_demo.mora");
-    let exprs = parse_code_v3(&source).expect("parse");
-    let func = lower_mir_exprs(&exprs).expect("lower");
+    let (func, _witnesses) = ParserV3::compile(&source).expect("compile");
     let mut interp = Interpreter::new();
     let mut env = interp.take_env();
     // Just run the top-level DAG body, then main task via linear
@@ -67,8 +63,8 @@ fn memo_incremental_reruns_affected_dependencies_only() {
     use std::sync::Arc;
 
     let src = "print(a)\nlet b = a + 1\nprint(b)\nlet c = 5\nlet d = c + 1\nprint(d)";
-    let exprs = parse_code_v3(src).expect("parse");
-    let func: Arc<MirFunction> = Arc::new(lower_mir_exprs(&exprs).expect("lower"));
+    let (func_raw, _witnesses) = ParserV3::compile(src).expect("compile");
+    let func: Arc<MirFunction> = Arc::new(func_raw);
     let dag = global_dag_cache().get_or_build(&func);
     let mut memo = DagExecMemo::new();
 

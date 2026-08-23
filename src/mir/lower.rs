@@ -6,7 +6,6 @@
 //!
 //! 入口:
 //! - `lower_mir_exprs(exprs: &[MirExpr]) -> Result<MirFunction, String>`
-//! - `typecheck_mir_exprs(exprs: &mut [MirExpr]) -> Vec<TypeError>`
 
 // ── MirExpr-based lowering (v0.55: V3 pipeline) ──
 
@@ -14,11 +13,6 @@ use super::{Label, MirFunction, MirInst, Reg};
 use crate::mir::expr::{MirExpr, MirExprKind};
 use crate::mir::witness::MirWitness;
 use crate::value::Value;
-
-/// 对 MirExpr 列表做类型检查（委托 check_program_mir HM 推断引擎）
-pub fn typecheck_mir_exprs(_exprs: &mut [MirExpr]) -> Vec<crate::typeck::TypeError> {
-    crate::typeck::check_program_mir(_exprs)
-}
 
 /// v0.75.30: 显式编译选项变体 — 调用方（CLI 编译入口）显式指定优化等级，
 /// 不读环境变量。语义与 `lower_mir_exprs` 完全一致，仅优化等级来源不同。

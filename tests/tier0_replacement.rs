@@ -8,17 +8,17 @@
 //! MIR 路径，不依赖任何 AST 活跃调用方。
 
 use mora::interpreter::Interpreter;
-use mora::mir::lower::{lower_mir_exprs, typecheck_mir_exprs};
 use mora::mir::vm::{run_main_task, run_mir};
 use mora::mir::{MirFunction, MirInst};
-use mora::parser_v3::parse_code_v3;
+use mora::parser_v3::ParserV3;
+use mora::typeck::check_mir::check_program_witnesses;
 use mora::value::Value;
 
-/// 公共执行入口：parse → typeck → lower → run_mir → run_main_task
+/// 公共执行入口：compile → typeck → run_mir → run_main_task
 /// 这是 `src/main.rs::run_file()` 的纯库版本，可被测试独立调用。
 fn run_via_mir(source: &str) -> Result<(), String> {
-    let mut exprs = parse_code_v3(source)?;
-    let type_errs = typecheck_mir_exprs(&mut exprs);
+    let (func, witnesses) = ParserV3::compile(source)?;
+    let type_errs = check_program_witnesses(&witnesses);
     if !type_errs.is_empty() {
         return Err(format!(
             "typeck: {} error(s); first = {}",
@@ -26,10 +26,8 @@ fn run_via_mir(source: &str) -> Result<(), String> {
             type_errs[0].message
         ));
     }
-    let func: MirFunction = lower_mir_exprs(&exprs)?;
     let mut interp = Interpreter::new();
     let mut env = interp.take_env();
-    // v0.75.9: 包裹 Arc 走全局 DAG 缓存（run_mir + run_main_task 共享同一项）
     let func_arc = std::sync::Arc::new(func);
     run_mir(&func_arc, &mut interp, &mut env)?;
     run_main_task(&func_arc, &mut interp, &mut env)

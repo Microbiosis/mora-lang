@@ -24,10 +24,9 @@
 
 use mora::interpreter::Interpreter;
 use mora::mir::jit::run_jit;
-use mora::mir::lower::lower_mir_exprs;
 use mora::mir::vm::run_mir;
 use mora::mir::{MirFunction, MirInst};
-use mora::parser_v3::parse_code_v3;
+use mora::parser_v3::ParserV3;
 use mora::value::Value;
 
 fn fconst_at(reg: usize, n: f64) -> MirInst {
@@ -133,8 +132,9 @@ fn jit_equiv_folded_constants() {
         "3 >= 3",
         "1 + 2 * 3",
     ] {
-        let exprs = parse_code_v3(src).expect("parse should succeed");
-        let func = lower_mir_exprs(&exprs).expect("lower should succeed");
+        let (mut func, _witnesses) = ParserV3::compile(src).expect("compile should succeed");
+        // lower_mir_exprs 内部调 apply_rules（常量折叠），ParserV3::compile 不自动优化
+        mora::mir::optimize::apply_rules(&mut func);
         let jit_val = run_jit_of(&func).expect("folded consts should compile");
         let mir_val = run_interp(&func).expect("interp should run");
         assert_eq!(jit_val, mir_val, "JIT != interp for {src}");
@@ -172,8 +172,7 @@ fn jit_rejects_uncompilable() {
 
     // 变量/定义/调用
     for src in ["let x = 1", "print(1)", "1.5 + 2.5\nprint(3)"] {
-        let exprs = parse_code_v3(src).expect("parse should succeed");
-        let func = lower_mir_exprs(&exprs).expect("lower should succeed");
+        let (func, _witnesses) = ParserV3::compile(src).expect("compile should succeed");
         assert!(run_jit_of(&func).is_err(), "JIT 应拒绝不可编译程序: {src}");
     }
 }

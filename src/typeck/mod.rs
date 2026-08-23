@@ -22,7 +22,7 @@
 //! - 控制流敏感的类型缩窄
 
 // v0.55: typeck V2 模块 (mod check, mod pregel_check) 已删除。
-// 类型检查的唯一入口: `check_program_mir` (mod check_mir)。
+// 类型检查入口: `check_program_witnesses` / `check_program_witnesses_bidirectional` (mod check_mir)。
 
 pub mod annotate; // v0.89: TypeAnnotator (FCFG + TypeTable → EHIR)
 pub mod bidirectional; // v0.75.86: 双向类型检查骨架入口（Phase A）
@@ -936,6 +936,6 @@ impl SymbolTable {
 // v0.55: MirExpr-based type checking (V3 pipeline)
 // ===================================================================
 
-// Re-exported from `check_mir` — the single entry point for HM inference.
-pub use check_mir::check_program_mir;
-pub use check_mir::check_program_mir_with_types;
+// v0.90.5: check_program_mir / check_program_mir_with_types 已删除
+// （兼容桥违反 AGENTS.md §6）。类型检查入口统一为
+// check_program_witnesses / check_program_witnesses_bidirectional。

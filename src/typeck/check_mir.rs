@@ -1,7 +1,7 @@
-//! v0.55: Public entry point for MirExpr-native type checking.
+//! v0.55: Public entry point for witness-based type checking.
 //!
-//! `check_program_mir` drives the Hindley-Milner inference engine
-//! directly off `&[MirExpr]` and returns the collected diagnostics. It
+//! `check_program_witnesses` drives the Hindley-Milner inference engine
+//! directly off `&[MirWitness]` and returns the collected diagnostics. It
 //! is the single source of truth for CLI `mora --check` and LSP
 //! `textDocument/publishDiagnostics`.
 //!
@@ -14,8 +14,6 @@ use super::TypeError;
 use super::hm::HMInference;
 
 use super::hm::TypeError as HmError;
-
-use crate::mir::MirExpr;
 
 ///  Run HM inference across the program (witness 输入) and return any
 ///  diagnostics. 阶段 3 目标形态：parse 直接产出 witness，typeck 直接
@@ -118,26 +116,6 @@ fn check_program_witnesses_inner(
     errors
 }
 
-///  Run HM inference across the program and return any diagnostics.
-///  The function is total: a successful return is `Vec::new()`, a failed
-///  program returns one or more `TypeError` entries (e.g. unbound
-///  variables, arity mismatches, unification failures).
-///
-/// v0.75.40: exprs 版保留为测试兼容桥接（LSP/既有调用方仍产出 MirExpr）；
-/// 执行路径已切到 [`check_program_witnesses`]。
-pub fn check_program_mir(exprs: &[MirExpr]) -> Vec<TypeError> {
-    check_program_witnesses(&crate::mir::witness::MirWitness::from_exprs(exprs))
-}
-
-///  Same as [`check_program_mir`]. Kept as a thin wrapper for callers
-///  that expect a `(errors, exprs)` shape; the returned expressions are
-///  the input untouched (no per-node type annotations are attached to
-///  `MirExpr` — type info is exposed only via `TypeError` diagnostics).
-pub fn check_program_mir_with_types(exprs: &[MirExpr]) -> (Vec<TypeError>, Vec<MirExpr>) {
-    let errors = check_program_mir(exprs);
-    (errors, exprs.to_vec())
-}
-
 ///  Convert an internal `hm::TypeError` into the public `typeck::TypeError`
 /// shape consumed by CLI `--check` and LSP diagnostics.
 ///
@@ -216,354 +194,245 @@ fn hm_to_external(err: HmError) -> TypeError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::common::Span;
-    use crate::mir::expr::{MirExpr, MirExprKind};
+    use crate::common::{Literal, Span};
+    use crate::mir::witness::{MirWitness, WitnessKind, WitnessCallee, WitnessArm, WitnessPattern};
 
-    fn lit(n: i64) -> MirExpr {
-        MirExpr::lit(
-            crate::common::Literal::Int(n, Span::default()),
-            Span::default(),
-        )
+    fn lit(n: i64) -> MirWitness {
+        MirWitness {
+            kind: WitnessKind::Literal(Literal::Int(n, Span::default())),
+            span: Span::default(),
+        }
+    }
+
+    fn lit_at(n: i64, line: usize, col: usize) -> MirWitness {
+        MirWitness {
+            kind: WitnessKind::Literal(Literal::Int(n, Span::new(line, col))),
+            span: Span::new(line, col),
+        }
+    }
+
+    fn str_lit_at(s: &str, line: usize, col: usize) -> MirWitness {
+        MirWitness {
+            kind: WitnessKind::Literal(Literal::String(s.to_string(), Span::new(line, col))),
+            span: Span::new(line, col),
+        }
+    }
+
+    fn bool_lit_at(b: bool, line: usize, col: usize) -> MirWitness {
+        MirWitness {
+            kind: WitnessKind::Literal(Literal::Bool(b, Span::new(line, col))),
+            span: Span::new(line, col),
+        }
+    }
+
+    fn var(name: &str) -> MirWitness {
+        MirWitness {
+            kind: WitnessKind::Variable(name.to_string()),
+            span: Span::default(),
+        }
+    }
+
+    fn var_at(name: &str, line: usize, col: usize) -> MirWitness {
+        MirWitness {
+            kind: WitnessKind::Variable(name.to_string()),
+            span: Span::new(line, col),
+        }
     }
 
     #[test]
     fn empty_program_returns_no_errors() {
-        assert!(check_program_mir(&[]).is_empty());
+        assert!(check_program_witnesses(&[]).is_empty());
     }
 
     #[test]
     fn unbound_variable_yields_diagnostic() {
-        let expr = MirExpr::var("missing".to_string(), Span::default());
-        let errs = check_program_mir(&[expr]);
+        let w = var("missing");
+        let errs = check_program_witnesses(&[w]);
         assert!(!errs.is_empty(), "expected at least one diagnostic");
     }
 
     #[test]
     fn let_binding_and_reference_clean() {
         let program = vec![
-            MirExpr {
-                kind: MirExprKind::LetBinding {
+            MirWitness {
+                kind: WitnessKind::LetBinding {
                     name: "x".to_string(),
                     type_hint: None,
                     value: Box::new(lit(42)),
-                    init_body: Box::new(MirExpr::var("x".to_string(), Span::default())),
+                    init_body: Box::new(var("x")),
                 },
                 span: Span::default(),
             },
-            MirExpr::var("x".to_string(), Span::default()),
+            var("x"),
         ];
-        assert!(check_program_mir(&program).is_empty());
+        assert!(check_program_witnesses(&program).is_empty());
     }
 
-    // v0.75.86: hm_to_external must propagate HM typed fields to the
-    // public `expected`/`actual` columns so LSP diagnostics show them.
-    // Before this fix all three columns were empty strings (Some(""))
-    // even when the HM variant carried e.g. `expected: usize, actual: usize`.
-    //
-    // We use `let f = closure(2 args)` form (not `task f` / `FnDef`)
-    // because `infer_fn_def` does not yet register the name into the
-    // HM env — calls to `FnDef`-named functions fall back to `Type::Any`
-    // and bypass arity checking. Closures bound via `let` go through
-    // `infer_let` which DOES register them, exercising the arity check
-    // we want to verify.
-
-    // v0.75.86: 双向集成（[`check_program_witnesses_bidirectional`]）
-    //   - If 条件不是 bool —— HM 不查 cond 类型，仅双向会报 type mismatch
-    //   - 验证双向路径产错、HM 路径不产错
-
+    // v0.75.86: 双向集成 — If 条件不是 bool 时双向报 type mismatch
     #[test]
     fn bidirectional_if_cond_type_mismatch() {
-        // if 42 then 1 else 2 — cond 期望 bool 实际 Int
-        let program = vec![MirExpr {
-            kind: MirExprKind::If {
+        let program = vec![MirWitness {
+            kind: WitnessKind::If {
                 cond: Box::new(lit(1)), // Int 而非 Bool
                 then: Box::new(lit(1)),
                 r#else: Some(Box::new(lit(2))),
             },
             span: Span::default(),
         }];
-        // HM 路径（不带双向）—— 不产错（If/else 不会触发 cond 类型检查）
-        let hm_errs = check_program_mir(&program);
-        // 双向路径 —— 触发双向 If 节点 check_against(Bool)
-        let bidir_errs = check_program_witnesses_bidirectional(
-            &crate::mir::witness::MirWitness::from_exprs(&program),
-        );
-        // 双向应产出 type mismatch 错误
+        let bidir_errs = check_program_witnesses_bidirectional(&program);
         assert!(
-            bidir_errs
-                .iter()
-                .any(|e| e.message.contains("type mismatch")),
+            bidir_errs.iter().any(|e| e.message.contains("type mismatch")),
             "bidirectional should catch If cond type mismatch, got {:?}",
             bidir_errs
         );
-        // HM 路径对此不报错（双重证明双向比 HM 多抓到错）
-        let _ = hm_errs; // 当前不强制断言 HM 不报——它可能报也可能不报
     }
 
     #[test]
     fn arity_mismatch_propagates_expected_and_actual() {
-        // v0.80: curried Arrow 语义下，f(1) 对 2 参数闭包是合法的
-        // 部分应用（partial application），不是 arity mismatch。
-        // 真正的 arity mismatch 发生在「对非函数类型调用」——
-        // 例如 `let x = 42; x(1)` 会报 UnificationFailure（Int 不是 Arrow）。
-        // 本测试验证：调用非函数类型时 typeck 报错。
-        let not_a_fn = MirExpr {
-            kind: MirExprKind::LetBinding {
+        // 调用非函数类型时 typeck 报错
+        let not_a_fn = MirWitness {
+            kind: WitnessKind::LetBinding {
                 name: "x".to_string(),
                 type_hint: None,
                 value: Box::new(lit(42)),
-                init_body: Box::new(MirExpr::var("x".to_string(), Span::default())),
+                init_body: Box::new(var("x")),
             },
             span: Span::default(),
         };
-        let bad_call = MirExpr::call(
-            crate::mir::expr::MirCallee::Var("x".to_string()),
-            vec![lit(1)],
-            Span::default(),
-        );
-        let errs = check_program_mir(&[not_a_fn, bad_call]);
-        assert!(
-            !errs.is_empty(),
-            "expected type error when calling non-function, got none"
-        );
-        // 错误应包含 expected/actual 信息（UnificationFailure 或类似）
+        let bad_call = MirWitness {
+            kind: WitnessKind::Call {
+                callee: WitnessCallee::Var("x".to_string()),
+                args: vec![lit(1)],
+            },
+            span: Span::default(),
+        };
+        let errs = check_program_witnesses(&[not_a_fn, bad_call]);
+        assert!(!errs.is_empty(), "expected type error when calling non-function, got none");
         let e = &errs[0];
         assert!(
             e.expected.is_some() || e.actual.is_some() || !e.message.is_empty(),
-            "error should carry diagnostic info, got {:?}",
-            e
+            "error should carry diagnostic info, got {:?}", e
         );
     }
 
-    // v0.75.86: 修 HM span bug —— let with type_hint 不一致应报
-    // 真实行号而非 line 0。覆盖 infer_let_typed 提前用 span 报错的路径。
+    // v0.75.86: let with type_hint 不一致应报真实行号
     #[test]
     fn let_with_type_hint_mismatch_uses_real_line() {
-        // `let x: Int = "hello"` —— value 是 String，type_hint 是 Int
-        // 修前 line 0；修后 line 1, column 5
-        use crate::common::Span;
-        let program = vec![MirExpr {
-            kind: MirExprKind::LetBinding {
+        let program = vec![MirWitness {
+            kind: WitnessKind::LetBinding {
                 name: "x".to_string(),
-                type_hint: Some(crate::typeck::Type::Int),
-                value: Box::new(MirExpr::lit(
-                    crate::common::Literal::String("hello".to_string(), Span::new(1, 5)),
-                    Span::new(1, 5),
-                )),
-                init_body: Box::new(MirExpr::var("x".to_string(), Span::new(2, 0))),
+                type_hint: Some(crate::mir::hint::TypeHint::from_type(crate::typeck::Type::Int)),
+                value: Box::new(str_lit_at("hello", 1, 5)),
+                init_body: Box::new(var_at("x", 2, 0)),
             },
             span: Span::new(1, 0),
         }];
-        let errs = check_program_mir(&program);
-        // 至少 1 个 type mismatch 错（line 0 是 pre-existing bug 不应再出现）
+        let errs = check_program_witnesses(&program);
         assert!(!errs.is_empty(), "expected at least one error, got none");
-        let mismatch = errs
-            .iter()
-            .find(|e| e.message.contains("Type mismatch"))
+        let mismatch = errs.iter().find(|e| e.message.contains("Type mismatch"))
             .expect("expected type mismatch error");
-        assert_eq!(
-            mismatch.line, 1,
-            "line should be 1, got {} (line 0 = bug)",
-            mismatch.line
-        );
-        // column 来自 `let` 表达式整体 span（line 1, column 0 = let 关键字位置）
-        // ——验证 span 整体透传非 0 即可，不严格断言 column
-        assert_eq!(
-            mismatch.column, 0,
-            "column should be 0 (let keyword), got {}",
-            mismatch.column
-        );
+        assert_eq!(mismatch.line, 1, "line should be 1, got {} (line 0 = bug)", mismatch.line);
+        assert_eq!(mismatch.column, 0, "column should be 0 (let keyword), got {}", mismatch.column);
     }
 
     // v0.75.86: match arms body type 不一致应报真实行号
     #[test]
     fn match_arms_body_type_mismatch_uses_real_line() {
-        use crate::common::Span;
-        use crate::mir::expr::Pattern;
-        // match x { _ => "str" _ => 99 }  —— 两个 arm body 类型不同
-        // 第二轮 phase D 后：arm body 不 subtype result 时报 span 错误
-        let program = vec![MirExpr {
-            kind: MirExprKind::Match {
-                scrutinee: Box::new(MirExpr::lit(
-                    crate::common::Literal::Int(42, Span::new(1, 0)),
-                    Span::new(1, 0),
-                )),
+        let program = vec![MirWitness {
+            kind: WitnessKind::Match {
+                scrutinee: Box::new(lit_at(42, 1, 0)),
                 arms: vec![
-                    crate::mir::expr::MatchArm {
-                        pattern: Pattern::Wildcard,
+                    WitnessArm {
+                        pattern: WitnessPattern::Wildcard,
                         guard: None,
-                        body: MirExpr::lit(
-                            crate::common::Literal::String("str".to_string(), Span::new(2, 4)),
-                            Span::new(2, 4),
-                        ),
+                        body: str_lit_at("str", 2, 4),
                     },
-                    crate::mir::expr::MatchArm {
-                        pattern: Pattern::Wildcard,
+                    WitnessArm {
+                        pattern: WitnessPattern::Wildcard,
                         guard: None,
-                        body: MirExpr::lit(
-                            crate::common::Literal::Int(99, Span::new(3, 4)),
-                            Span::new(3, 4),
-                        ),
+                        body: lit_at(99, 3, 4),
                     },
                 ],
             },
             span: Span::new(1, 0),
         }];
-        let errs = check_program_mir(&program);
-        // match 两 arm 类型不同（String vs Int）—— infer_match subtype 检查
-        // 应报 line 0 以外的真实行号
+        let errs = check_program_witnesses(&program);
         if let Some(e) = errs.iter().find(|e| e.message.contains("Type")) {
-            assert!(
-                e.line > 0,
-                "match arm mismatch should report real line, got line {}",
-                e.line
-            );
+            assert!(e.line > 0, "match arm mismatch should report real line, got line {}", e.line);
         }
     }
 
     // v0.75.86: if-else 分支 type 不一致应报真实行号
     #[test]
     fn if_branches_type_mismatch_uses_real_line() {
-        use crate::common::Span;
-        // if true then 42 else "str"  —— 分支类型不一致
-        let program = vec![MirExpr {
-            kind: MirExprKind::If {
-                cond: Box::new(MirExpr::lit(
-                    crate::common::Literal::Bool(true, Span::new(1, 3)),
-                    Span::new(1, 3),
-                )),
-                then: Box::new(MirExpr::lit(
-                    crate::common::Literal::Int(42, Span::new(1, 10)),
-                    Span::new(1, 10),
-                )),
-                r#else: Some(Box::new(MirExpr::lit(
-                    crate::common::Literal::String("str".to_string(), Span::new(1, 18)),
-                    Span::new(1, 18),
-                ))),
+        let program = vec![MirWitness {
+            kind: WitnessKind::If {
+                cond: Box::new(bool_lit_at(true, 1, 3)),
+                then: Box::new(lit_at(42, 1, 10)),
+                r#else: Some(Box::new(str_lit_at("str", 1, 18))),
             },
             span: Span::new(1, 0),
         }];
-        let errs = check_program_mir(&program);
-        // if 分支不一致应报 line 0 以外的真实行号
+        let errs = check_program_witnesses(&program);
         if let Some(e) = errs.iter().find(|e| e.message.contains("Type mismatch")) {
-            assert!(
-                e.line > 0,
-                "if branches mismatch should report real line, got line {}",
-                e.line
-            );
+            assert!(e.line > 0, "if branches mismatch should report real line, got line {}", e.line);
         }
-        // 任何错误（即使不是 Type mismatch）line 应 > 0
         for e in &errs {
-            assert!(
-                e.line > 0,
-                "if-else error should have real line, got line 0: {:?}",
-                e
-            );
+            assert!(e.line > 0, "if-else error should have real line, got line 0: {:?}", e);
         }
     }
 
-    // v0.75.86: 完整 HM span 化集成测试 — 任何 typeck 错误 line > 0
-    //
-    // 调研结论（按真实报错路径分类）：
-    //   - d7f35f9: infer_let_typed (let-with-hint 错)
-    //   - 2e50a5b: infer_match / infer_if (分支不一致)
-    //   - 本 commit: infer_binop / infer_list / infer_dict (元素不一致)
-    // 剩 4 处 `let _ = span;` 全是不报错路径：
-    //   - infer_let: let-generalization 成功不报错
-    //   - infer_closure / infer_fn_def: 闭包/fn 构造不报错
-    //   - infer_method_call: method_return_type 失败不报错（返 Any）
-    //   - infer_if no-else: 无 Eq 失败（Union 自动构造）
+    // v0.75.86: 完整 HM span 化集成测试
     #[test]
     fn all_typeck_errors_have_real_line() {
-        use crate::common::Span;
-        // 综合场景：let-with-hint 错 + UnboundVariable 错
         let program = vec![
-            MirExpr {
-                kind: MirExprKind::LetBinding {
+            MirWitness {
+                kind: WitnessKind::LetBinding {
                     name: "x".to_string(),
-                    type_hint: Some(crate::typeck::Type::Int),
-                    value: Box::new(MirExpr::lit(
-                        crate::common::Literal::String("str".to_string(), Span::new(1, 12)),
-                        Span::new(1, 12),
-                    )),
-                    init_body: Box::new(MirExpr::var("x".to_string(), Span::new(1, 0))),
+                    type_hint: Some(crate::mir::hint::TypeHint::from_type(crate::typeck::Type::Int)),
+                    value: Box::new(str_lit_at("str", 1, 12)),
+                    init_body: Box::new(var_at("x", 1, 0)),
                 },
                 span: Span::new(1, 0),
             },
-            MirExpr::var("nonexistent".to_string(), Span::new(2, 5)),
+            var_at("nonexistent", 2, 5),
         ];
-        let errs = check_program_mir(&program);
-        // 至少 2 个错
+        let errs = check_program_witnesses(&program);
         assert!(errs.len() >= 2, "expected >= 2 errors, got {}", errs.len());
-        // 任何错 line > 0
         for e in &errs {
-            assert!(
-                e.line > 0,
-                "any typeck error should have real line, got line 0: {:?}",
-                e
-            );
+            assert!(e.line > 0, "any typeck error should have real line, got line 0: {:?}", e);
         }
     }
 
     // v0.75.86: binop 元素类型不一致应报真实行号
     #[test]
     fn binop_type_mismatch_uses_real_line() {
-        use crate::common::Span;
-        // 1 + "str" —— Int + String
-        // infer_binop 提前 span 报 UnificationFailure
-        let program = vec![MirExpr {
-            kind: MirExprKind::Binary {
-                left: Box::new(MirExpr::lit(
-                    crate::common::Literal::Int(1, Span::new(1, 4)),
-                    Span::new(1, 4),
-                )),
+        let program = vec![MirWitness {
+            kind: WitnessKind::Binary {
+                left: Box::new(lit_at(1, 1, 4)),
                 op: crate::common::BinaryOp::Add,
-                right: Box::new(MirExpr::lit(
-                    crate::common::Literal::String("str".to_string(), Span::new(1, 8)),
-                    Span::new(1, 8),
-                )),
+                right: Box::new(str_lit_at("str", 1, 8)),
             },
             span: Span::new(1, 0),
         }];
-        let errs = check_program_mir(&program);
+        let errs = check_program_witnesses(&program);
         assert!(!errs.is_empty());
-        let e = &errs[0];
-        assert!(
-            e.line > 0,
-            "binop mismatch should have real line, got {}",
-            e.line
-        );
+        assert!(errs[0].line > 0, "binop mismatch should have real line, got {}", errs[0].line);
     }
 
     // v0.75.86: list elem 类型不一致应报真实行号
     #[test]
     fn list_elem_type_mismatch_uses_real_line() {
-        use crate::common::Span;
-        // [1, "str", 3] —— Int + String 元素类型不一致
-        let program = vec![MirExpr::list(
-            vec![
-                MirExpr::lit(
-                    crate::common::Literal::Int(1, Span::new(1, 4)),
-                    Span::new(1, 4),
-                ),
-                MirExpr::lit(
-                    crate::common::Literal::String("str".to_string(), Span::new(1, 8)),
-                    Span::new(1, 8),
-                ),
-                MirExpr::lit(
-                    crate::common::Literal::Int(3, Span::new(1, 16)),
-                    Span::new(1, 16),
-                ),
-            ],
-            Span::new(1, 0),
-        )];
-        let errs = check_program_mir(&program);
+        let program = vec![MirWitness {
+            kind: WitnessKind::List(vec![
+                lit_at(1, 1, 4),
+                str_lit_at("str", 1, 8),
+                lit_at(3, 1, 16),
+            ]),
+            span: Span::new(1, 0),
+        }];
+        let errs = check_program_witnesses(&program);
         assert!(!errs.is_empty());
-        let e = &errs[0];
-        assert!(
-            e.line > 0,
-            "list elem mismatch should have real line, got {}",
-            e.line
-        );
+        assert!(errs[0].line > 0, "list elem mismatch should have real line, got {}", errs[0].line);
     }
 }

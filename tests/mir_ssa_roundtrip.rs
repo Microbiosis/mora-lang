@@ -19,21 +19,16 @@
 //!   优化重排后不稳定（独立于 SSA 管线）
 
 use mora::interpreter::Interpreter;
-use mora::parser_v3::parse_code_v3;
-use mora::mir::MirFunction;
-use mora::mir::lower::lower_mir_exprs;
+use mora::parser_v3::ParserV3;
 use mora::mir::ssa::OptLevel;
 use mora::mir::vm::{run_main_task, run_mir};
 
 /// 应用 SSA 优化（不 panic 即通过 — 管线正确性由等价性测试治理）。
 fn optimize_without_panic(source: &str, level: OptLevel) {
-    let exprs = parse_code_v3(source).expect("parse should succeed");
-    let mut func: MirFunction = lower_mir_exprs(&exprs).expect("lower should succeed");
+    let (mut func, _witnesses) = ParserV3::compile(source).expect("compile should succeed");
     mora::mir::opt::optimize(&mut func, level);
-    // deconstruct 后仍可执行（不 panic）
     let mut interp = Interpreter::new();
     let mut env = interp.take_env();
-    // v0.75.9: 包裹 Arc 走全局 DAG 缓存
     let func_arc = std::sync::Arc::new(func);
     let _ = run_mir(&func_arc, &mut interp, &mut env);
     let _ = run_main_task(&func_arc, &mut interp, &mut env);
@@ -42,14 +37,12 @@ fn optimize_without_panic(source: &str, level: OptLevel) {
 /// 对 task 内显式 return 的程序，验证优化前后返回值一致。
 fn assert_task_equiv(source: &str) {
     let run = |level: Option<OptLevel>| -> Result<mora::value::Value, String> {
-        let exprs = parse_code_v3(source).expect("parse");
-        let mut func: MirFunction = lower_mir_exprs(&exprs).expect("lower");
+        let (mut func, _witnesses) = ParserV3::compile(source)?;
         if let Some(l) = level {
             mora::mir::opt::optimize(&mut func, l);
         }
         let mut interp = Interpreter::new();
         let mut env = interp.take_env();
-        // v0.75.9: 包裹 Arc 走全局 DAG 缓存
         let func_arc = std::sync::Arc::new(func);
         let v = run_mir(&func_arc, &mut interp, &mut env)?;
         run_main_task(&func_arc, &mut interp, &mut env)?;
@@ -106,14 +99,12 @@ fn task_arithmetic_equiv() {
 /// v0.75.7 修复后此场景必须等价。
 fn assert_top_level_equiv(source: &str) {
     let run = |level: Option<OptLevel>| -> Result<mora::value::Value, String> {
-        let exprs = parse_code_v3(source).expect("parse");
-        let mut func: MirFunction = lower_mir_exprs(&exprs).expect("lower");
+        let (mut func, _witnesses) = ParserV3::compile(source)?;
         if let Some(l) = level {
             mora::mir::opt::optimize(&mut func, l);
         }
         let mut interp = Interpreter::new();
         let mut env = interp.take_env();
-        // v0.75.9: 包裹 Arc 走全局 DAG 缓存
         run_mir(&std::sync::Arc::new(func), &mut interp, &mut env)
     };
     let baseline = run(None);
@@ -162,8 +153,7 @@ fn dag_algebraic_placeholder_fix_regression() {
     // 时曾触发 index out of bounds。核心回归点 = dag_optimize 不 panic；
     // 变量折叠的具体结果由 dag_rule 单元测试治理，此处不作强断言。
     let source = "let x = 10\nlet y = x + 0\nprint(y)\n";
-    let exprs = parse_code_v3(source).unwrap();
-    let func: MirFunction = lower_mir_exprs(&exprs).unwrap();
+    let (func, _witnesses) = ParserV3::compile(source).unwrap();
     let mut dag = mora::mir::dag::dag_analyze(&func);
     mora::mir::optimize::dag_optimize(&mut dag); // 不得 panic（bug(a) 回归）
 }
@@ -174,8 +164,7 @@ fn deconstruct_skips_return_none() {
     // MirInst::Return(None)，在块首短路导致隐式返回载体不执行。
     // 修复后优化产物不应包含 Return(None)。
     let source = "let x = 42\nprint(x)\n";
-    let exprs = parse_code_v3(source).unwrap();
-    let mut func: MirFunction = lower_mir_exprs(&exprs).unwrap();
+    let (mut func, _witnesses) = ParserV3::compile(source).unwrap();
     mora::mir::opt::optimize(&mut func, OptLevel::Basic);
     assert!(
         !func
@@ -194,8 +183,7 @@ fn taskdef_survives_ssa_optimization() {
     // 消失（MORA_OPT=1 默认关掩盖；CLI 显式化后暴露）。结构断言：
     // 优化后 func.body 必须仍含 TaskDef。
     let source = "task main()\n  print(1 + 2)\nend\n";
-    let exprs = parse_code_v3(source).expect("parse");
-    let mut func = lower_mir_exprs(&exprs).expect("lower");
+    let (mut func, _witnesses) = ParserV3::compile(source).expect("compile");
     assert!(
         func.body
             .iter()

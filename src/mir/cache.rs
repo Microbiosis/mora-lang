@@ -107,12 +107,11 @@ impl Default for DagCache {
 mod tests {
     use super::*;
     use crate::interpreter::Interpreter;
-    use crate::parser_v3::parse_code_v3;
-    use crate::mir::lower::lower_mir_exprs;
+    use crate::parser_v3::ParserV3;
 
     fn sample_func(src: &str) -> Arc<MirFunction> {
-        let exprs = parse_code_v3(src).expect("parse should succeed");
-        Arc::new(lower_mir_exprs(&exprs).expect("lower should succeed"))
+        let (func, _witnesses) = ParserV3::compile(src).expect("compile should succeed");
+        Arc::new(func)
     }
 
     /// 同一 Arc 命中缓存（不重建），不同 Arc 各自构建。
@@ -148,8 +147,8 @@ mod tests {
     #[test]
     fn cached_dag_runs_same_result() {
         let source = "let acc = 0\nfor i in [1, 2, 3]\n  acc = acc + i\nend\nreturn acc\n";
-        let exprs = parse_code_v3(source).expect("parse 调用应成功");
-        let func: Arc<MirFunction> = Arc::new(lower_mir_exprs(&exprs).expect("lower 调用应成功"));
+        let (func_raw, _witnesses) = ParserV3::compile(source).expect("compile");
+        let func: Arc<MirFunction> = Arc::new(func_raw);
 
         // 直建路径（baseline）
         let mut interp = Interpreter::new();

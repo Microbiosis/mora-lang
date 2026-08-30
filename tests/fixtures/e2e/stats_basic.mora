@@ -1,0 +1,38 @@
+-- v0.91: stats.* builtin — 描述性统计
+task main()
+  let xs = [1.0, 2.0, 3.0, 4.0, 5.0]
+
+  -- 函数式 API
+  let total = stats.sum(xs)
+  let avg = stats.mean(xs)
+  let med = stats.median(xs)
+  let sd = stats.stddev(xs)
+  let lo = stats.min(xs)
+  let hi = stats.max(xs)
+
+  -- 方法链 API
+  let total2 = xs.sum()
+  let avg2 = xs.mean()
+  let mn = xs.min()
+  let mx = xs.max()
+
+  -- 直方图
+  let h = stats.histogram(xs, 3)
+
+  -- 排序
+  let shuffled = [3.0, 1.0, 4.0, 1.0, 5.0, 9.0, 2.0, 6.0]
+  let sorted = shuffled.sort()
+
+  print(total)
+  print(avg)
+  print(med)
+  print(sd)
+  print(lo)
+  print(hi)
+  print(total2)
+  print(avg2)
+  print(mn)
+  print(mx)
+  print(h)
+  print(sorted)
+end

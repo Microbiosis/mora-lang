@@ -125,10 +125,12 @@ pub enum Constraint {
 }
 
 ///  Arithmetic binary operator constraint: both operands must be compatible numeric types
+/// v0.90.5: 增加 result 字段 — solver 在校验数值类型后将 result 与 promotion 类型合一。
 #[derive(Debug, Clone)]
 pub struct BinaryConstraint {
     pub left: Box<crate::typeck::Type>,
     pub right: Box<crate::typeck::Type>,
+    pub result: Option<Box<crate::typeck::Type>>,
 }
 
 impl std::fmt::Display for Constraint {
@@ -155,10 +157,76 @@ fn format_type(ty: &crate::typeck::Type) -> String {
 pub fn solve(constraint: &Constraint, subst: &Substitution) -> Result<Substitution, TypeError> {
     match constraint {
         Constraint::Eq(ty1, ty2) => unify(ty1, ty2, subst),
-        Constraint::Numeric(_) => {
-            // For now, treat numeric constraints as satisfied if both types resolve to Int or Float
-            // TODO: Add proper numeric type checking with subtyping rules
-            Ok(subst.clone())
+        Constraint::Numeric(bc) => {
+            // v0.90.5: Numeric type checking with Int/Float promotion.
+            // 1. Resolve TypeVars via substitution
+            // 2. Both must be numeric (Int or Float)
+            // 3. Mixed Int/Float → Float promotion
+            // 4. If result type provided, unify with promoted type
+            let left = subst.apply(&bc.left);
+            let right = subst.apply(&bc.right);
+            let promoted = match (&left, &right) {
+                (crate::typeck::Type::Int, crate::typeck::Type::Int) => crate::typeck::Type::Int,
+                (crate::typeck::Type::Float, crate::typeck::Type::Float) => crate::typeck::Type::Float,
+                (crate::typeck::Type::Int, crate::typeck::Type::Float)
+                | (crate::typeck::Type::Float, crate::typeck::Type::Int) => crate::typeck::Type::Float,
+                // v0.91: BigInt promotion — 任一含 BigInt 时结果 BigInt
+                (crate::typeck::Type::BigInt, crate::typeck::Type::BigInt) => crate::typeck::Type::BigInt,
+                (crate::typeck::Type::Int, crate::typeck::Type::BigInt)
+                | (crate::typeck::Type::BigInt, crate::typeck::Type::Int) => crate::typeck::Type::BigInt,
+                (crate::typeck::Type::Float, crate::typeck::Type::BigInt)
+                | (crate::typeck::Type::BigInt, crate::typeck::Type::Float) => crate::typeck::Type::Float,
+                // TypeVar + numeric → bind TypeVar to numeric type
+                (crate::typeck::Type::TypeVar(v), crate::typeck::Type::Int)
+                | (crate::typeck::Type::Int, crate::typeck::Type::TypeVar(v)) => {
+                    let s = subst.extend(*v, crate::typeck::Type::Int)?;
+                    if let Some(ref result) = bc.result {
+                        return unify(&crate::typeck::Type::Int, result, &s);
+                    }
+                    return Ok(s);
+                }
+                (crate::typeck::Type::TypeVar(v), crate::typeck::Type::Float)
+                | (crate::typeck::Type::Float, crate::typeck::Type::TypeVar(v)) => {
+                    let s = subst.extend(*v, crate::typeck::Type::Float)?;
+                    if let Some(ref result) = bc.result {
+                        return unify(&crate::typeck::Type::Float, result, &s);
+                    }
+                    return Ok(s);
+                }
+                // v0.91: BigInt + TypeVar → bind TypeVar to BigInt
+                (crate::typeck::Type::TypeVar(v), crate::typeck::Type::BigInt)
+                | (crate::typeck::Type::BigInt, crate::typeck::Type::TypeVar(v)) => {
+                    let s = subst.extend(*v, crate::typeck::Type::BigInt)?;
+                    if let Some(ref result) = bc.result {
+                        return unify(&crate::typeck::Type::BigInt, result, &s);
+                    }
+                    return Ok(s);
+                }
+                // TypeVar + 任何类型 — Numeric 约束要求两侧均为已解析数值，
+                // TypeVar 出现在此处说明推断有误（infer_binop guard 应阻止）。
+                (crate::typeck::Type::TypeVar(_), _)
+                | (_, crate::typeck::Type::TypeVar(_)) => {
+                    return Err(crate::typeck::hm::error::TypeError::UnificationFailure {
+                        expected: "numeric type (int or float)".to_string(),
+                        got: format!("{} and {}", format_type(&left), format_type(&right)),
+                        span: None,
+                    });
+                }
+                // Both resolved, not numeric — error
+                _ => {
+                    return Err(crate::typeck::hm::error::TypeError::UnificationFailure {
+                        expected: "numeric type (int or float)".to_string(),
+                        got: format!("{} and {}", format_type(&left), format_type(&right)),
+                        span: None,
+                    });
+                }
+            };
+            // Concrete numeric types (Int/Int, Float/Float, or mixed) — unify result
+            if let Some(ref result) = bc.result {
+                unify(&promoted, result, subst)
+            } else {
+                Ok(subst.clone())
+            }
         }
         Constraint::RowEq(r1, r2) => {
             let mut new_subst = subst.clone();

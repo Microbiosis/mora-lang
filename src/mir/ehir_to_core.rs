@@ -402,6 +402,7 @@ fn literal_to_value(lit: &crate::common::Literal) -> Value {
     match lit {
         crate::common::Literal::Int(n, _) => Value::Int(*n),
         crate::common::Literal::Float(f, _) => Value::Float(*f),
+        crate::common::Literal::BigInt(n, _) => Value::BigInt(n.clone()),
         crate::common::Literal::String(s, _) => Value::String(s.clone()),
         crate::common::Literal::Bool(b, _) => Value::Bool(*b),
         crate::common::Literal::Nil(_) => Value::Nil,

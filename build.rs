@@ -12,8 +12,8 @@
 //!   - document/mod.rs → 版本号引用
 //!
 //! 历史：v0.50 时代曾出现过 "0.04" / "0.1" / "0.1.0" / "v0.25" / "v0.28"
-//! 等不一致版本号，v0.51 起统一由 Cargo.toml 的 `0.0.53` 驱动，release
-//! 构建无需手工同步。
+//! 等不一致版本号，v0.51 起统一由 Cargo.toml 驱动，release 构建无需手工同步。
+//! v0.90.4: Cargo.toml 版本号与 git tag 对齐（从 0.0.53 修正为 0.90.4）。
 
 fn main() {
     let version = std::env::var("CARGO_PKG_VERSION").unwrap_or_else(|_| "0.0.0".to_string());

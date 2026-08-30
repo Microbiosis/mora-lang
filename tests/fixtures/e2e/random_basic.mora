@@ -1,0 +1,26 @@
+-- v0.91: random.* builtin — PRNG（确定性重放）
+task main()
+  -- 确定性：相同种子产生相同序列
+  random.seed(42)
+  let r1 = random.random()
+  let r2 = random.random()
+  let r3 = random.random()
+
+  -- 区间随机
+  let ri = random.rand_int(1, 100)
+  let rf = random.rand_float(0.0, 1.0)
+
+  -- 列表选择与打乱
+  let choices = ["apple", "banana", "cherry", "date"]
+  let pick = random.rand_choice(choices)
+  let xs = [1, 2, 3, 4, 5]
+  let shuf = random.shuffle(xs)
+
+  print(r1)
+  print(r2)
+  print(r3)
+  print(ri)
+  print(rf)
+  print(pick)
+  print(shuf)
+end

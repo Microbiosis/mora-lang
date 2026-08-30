@@ -1,0 +1,27 @@
+-- v0.91: BigInt — 任意精度整数
+task main()
+  -- BigInt 字面量（n 后缀）
+  let big = 99999999999999999999n
+  let small = 42n
+
+  -- 算术：含 BigInt 时结果 BigInt
+  let sum = big + 1n
+  let product = small * small
+
+  -- Int + BigInt → BigInt promotion
+  let mixed = 100 + big
+
+  -- 方法链
+  let abs_val = (-1000000000000n).abs()
+  let to_int_ok = 123n.to_int()
+  let to_float_ok = 999n.to_float()
+
+  print(big)
+  print(small)
+  print(sum)
+  print(product)
+  print(mixed)
+  print(abs_val)
+  print(to_int_ok)
+  print(to_float_ok)
+end

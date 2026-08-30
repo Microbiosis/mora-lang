@@ -568,11 +568,22 @@ mod tests {
     }
 
     #[test]
-    fn check_against_int_literal_vs_float_fails() {
+    fn check_against_int_literal_vs_float_succeeds() {
+        // v0.90.5: Int <: Float 数值提升 — Int literal 可赋给 Float 类型
         let mut hm = HMInference::new();
         let mut checker = BidirectionalChecker::new(&mut hm);
         let w = lit_witness(42, 1, 0);
         let result = checker.check_against(&w, &Type::Float, None);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn check_against_int_literal_vs_string_fails() {
+        // 真正不兼容的类型：Int literal 不能赋给 String
+        let mut hm = HMInference::new();
+        let mut checker = BidirectionalChecker::new(&mut hm);
+        let w = lit_witness(42, 1, 0);
+        let result = checker.check_against(&w, &Type::String, None);
         assert!(result.is_err());
     }
 
@@ -581,8 +592,8 @@ mod tests {
         let mut hm = HMInference::new();
         let mut checker = BidirectionalChecker::new(&mut hm);
         let w = lit_witness(42, 1, 0);
-        // check 失败应标记
-        let _ = checker.check_against(&w, &Type::Float, None);
+        // check 失败应标记 — 用 String（真正不兼容）代替 Float
+        let _ = checker.check_against(&w, &Type::String, None);
         // v0.75.94: DiagFilter 替代 HMInference.diagnosed
         assert!(checker.diag.is_diagnosed(&w));
     }
@@ -662,7 +673,7 @@ mod tests {
 
     #[test]
     fn phase_b_call_arg_wrong_type_reports() {
-        // 错误：g(42) — g 期望 Float 但 arg 是 Int
+        // v0.90.5: g(42) — g 期望 String 但 arg 是 Int（真正不兼容）
         let mut hm = HMInference::new();
         // v0.80: 用 Arrow 类型注册函数（ClosureSig 侧表已删除）
         hm.env.add(
@@ -676,14 +687,14 @@ mod tests {
         hm.env.add(
             "g".to_string(),
             Type::Arrow(
-                Box::new(Type::Float),
-                Box::new(Type::Float),
+                Box::new(Type::String),
+                Box::new(Type::String),
                 crate::mir::effect::EffectRow::Empty,
             ),
         );
         // 现在 hm 配置完成，构造 checker
         let mut checker = BidirectionalChecker::new(&mut hm);
-        // g(42) — Int <: Float 失败
+        // g(42) — Int 与 String 不兼容
         let call = MirWitness {
             kind: WitnessKind::Call {
                 callee: crate::mir::witness::WitnessCallee::Var("g".to_string()),
@@ -777,13 +788,13 @@ mod tests {
 
     #[test]
     fn phase_c_let_with_mismatched_type_reports() {
-        // let x: Float = 42 — 标注 Float 但 value 是 Int（subtype 失败）
+        // v0.90.5: let x: String = 42 — 标注 String 但 value 是 Int（真正不兼容）
         let mut hm = HMInference::new();
         let mut checker = BidirectionalChecker::new(&mut hm);
         let w = MirWitness {
             kind: WitnessKind::LetBinding {
                 name: "x".to_string(),
-                type_hint: Some(TypeHint::from_type(Type::Float)),
+                type_hint: Some(TypeHint::from_type(Type::String)),
                 value: Box::new(lit_witness(42, 1, 12)),
                 init_body: Box::new(lit_witness(0, 1, 16)),
             },
@@ -794,7 +805,7 @@ mod tests {
         assert!(!checker.errors.is_empty());
         let e = &checker.errors[0];
         assert!(e.message.contains("type mismatch"));
-        assert!(e.expected.as_deref() == Some("Float"));
+        assert!(e.expected.as_deref() == Some("String"));
         assert!(e.actual.as_deref() == Some("Int"));
     }
 
@@ -805,10 +816,11 @@ mod tests {
         let mut checker = BidirectionalChecker::new(&mut hm);
         let value = lit_witness(42, 1, 12);
         let init_body = lit_witness(0, 1, 16);
+        // v0.90.5: 用 String（真正不兼容）代替 Float
         let w = MirWitness {
             kind: WitnessKind::LetBinding {
                 name: "x".to_string(),
-                type_hint: Some(TypeHint::from_type(Type::Float)),
+                type_hint: Some(TypeHint::from_type(Type::String)),
                 value: Box::new(value.clone()),
                 init_body: Box::new(init_body.clone()),
             },

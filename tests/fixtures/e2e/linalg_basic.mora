@@ -1,0 +1,31 @@
+-- v0.91: linalg.* builtin — 基础线性代数
+task main()
+  -- 点积
+  let a = [1.0, 2.0, 3.0]
+  let b = [4.0, 5.0, 6.0]
+  let d = linalg.dot(a, b)
+
+  -- 3D 叉积
+  let x = [1.0, 0.0, 0.0]
+  let y = [0.0, 1.0, 0.0]
+  let c = linalg.cross(x, y)
+
+  -- 范数
+  let v = [3.0, 4.0]
+  let n2 = linalg.norm(v)
+
+  -- 矩阵乘（2x3 · 3x2 = 2x2）
+  let m1 = [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]
+  let m2 = [[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]]
+  let mm = linalg.matmul(m1, m2)
+
+  -- 转置
+  let orig = [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]
+  let t = linalg.transpose(orig)
+
+  print(d)
+  print(c)
+  print(n2)
+  print(mm)
+  print(t)
+end

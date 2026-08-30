@@ -30,6 +30,8 @@ impl std::fmt::Display for Value {
                     }
                 }
             }
+            // v0.91: BigInt Display — 直接 to_string
+            Value::BigInt(n) => write!(f, "{}n", n),
             Value::Bool(b) => write!(f, "{}", b),
             Value::Nil => write!(f, "nil"),
             Value::List(items) => {

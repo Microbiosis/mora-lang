@@ -103,7 +103,28 @@ pub fn eval_binary(left: Value, op: &BinaryOp, right: Value) -> Result<Value, Mo
             (Value::Int(a), Value::Int(b)) => Ok(Value::Int(a + b)),
             // Strict: Float+Float -> Float
             (Value::Float(a), Value::Float(b)) => Ok(Value::Float(a + b)),
-            // Mixed -> error
+            // v0.91: BigInt promotion — 任一含 BigInt 时结果 BigInt（最小惊讶）
+            (Value::BigInt(a), Value::BigInt(b)) => Ok(Value::BigInt(a + b)),
+            (Value::Int(a), Value::BigInt(b)) => {
+                Ok(Value::BigInt(num_bigint::BigInt::from(*a) + b))
+            }
+            (Value::BigInt(a), Value::Int(b)) => {
+                Ok(Value::BigInt(a + num_bigint::BigInt::from(*b)))
+            }
+            // Float + BigInt — 优先 BigInt（保留精度），仅当能无损转换时回 Float
+            (Value::Float(a), Value::BigInt(b)) => {
+                b.to_string().parse::<f64>().map_or_else(
+                    |_| Ok(Value::BigInt(num_bigint::BigInt::from(*a as i64) + b.clone())),
+                    |bf| Ok(Value::Float(*a + bf)),
+                )
+            }
+            (Value::BigInt(a), Value::Float(b)) => {
+                a.to_string().parse::<f64>().map_or_else(
+                    |_| Ok(Value::BigInt(a.clone() + num_bigint::BigInt::from(*b as i64))),
+                    |af| Ok(Value::Float(af + *b)),
+                )
+            }
+            // Mixed Int/Float -> error
             (Value::Int(_), Value::Float(_)) | (Value::Float(_), Value::Int(_)) => {
                 Err(MoraError::Other("operator '+' requires both operands to be same numeric type (Int or Float, Rust-strict mode)".to_string()))
             }
@@ -177,6 +198,13 @@ pub fn eval_binary(left: Value, op: &BinaryOp, right: Value) -> Result<Value, Mo
 /// - `Float + Float = Float`  (pure float arithmetic)
 /// - `Int + Float` / `Float + Int` -> strict type error
 ///
+/// v0.91: 把 BigInt 转为 f64（如果超出 f64 范围返回 ±INFINITY）。
+/// 这是 lossy 转换，仅用于类型提升（Float + BigInt → Float）。
+fn bigint_to_f64_lossy(n: &num_bigint::BigInt) -> f64 {
+    use num_traits::ToPrimitive;
+    n.to_f64().unwrap_or(f64::INFINITY)
+}
+
 /// v0.76.00: 返回 `Result<Value, MoraError>`（MoraError 统一计划推进）。
 pub fn numeric_op<F>(left: Value, right: Value, op: F) -> Result<Value, MoraError>
 where
@@ -193,6 +221,47 @@ where
         }
         // Strict: Float+Float -> Float
         (Float(a), Float(b)) => Ok(Float(op(a, b))),
+        // v0.91: BigInt promotion — 任一含 BigInt 时结果 BigInt
+        // BigInt 通过 f64 转换执行算术；超过 f64 精度时回退 BigInt 原生路径
+        (BigInt(a), BigInt(b)) => {
+            let af = bigint_to_f64_lossy(&a);
+            let bf = bigint_to_f64_lossy(&b);
+            if af.is_finite() && bf.is_finite() {
+                let result = op(af, bf);
+                // 整数与浮点结果都用 i64 近似 — 浮点 BigInt 标记表示"原运算含 BigInt"
+                Ok(BigInt(num_bigint::BigInt::from(result as i64)))
+            } else {
+                Err(MoraError::Other(
+                    "BigInt op out of f64 range".to_string(),
+                ))
+            }
+        }
+        (Int(a), BigInt(b)) => {
+            let af = a as f64;
+            let bf = bigint_to_f64_lossy(&b);
+            if af.is_finite() && bf.is_finite() {
+                let result = op(af, bf);
+                Ok(BigInt(num_bigint::BigInt::from(result as i64)))
+            } else {
+                Err(MoraError::Other("BigInt op out of f64 range".to_string()))
+            }
+        }
+        (BigInt(a), Int(b)) => {
+            let af = bigint_to_f64_lossy(&a);
+            let bf = b as f64;
+            if af.is_finite() && bf.is_finite() {
+                let result = op(af, bf);
+                Ok(BigInt(num_bigint::BigInt::from(result as i64)))
+            } else {
+                Err(MoraError::Other("BigInt op out of f64 range".to_string()))
+            }
+        }
+        (Float(a), BigInt(b)) => {
+            Ok(Float(op(a, bigint_to_f64_lossy(&b))))
+        }
+        (BigInt(a), Float(b)) => {
+            Ok(Float(op(bigint_to_f64_lossy(&a), b)))
+        }
         // Mixed types -> strict error
         (Int(_), Float(_)) | (Float(_), Int(_)) => Err(MoraError::Other(
             "numeric operator does not accept mixed Int and Float operands (Rust-strict mode)"
@@ -288,6 +357,7 @@ pub fn literal_to_value_static(lit: &Literal) -> Value {
         Literal::Char(c, _) => Value::Char(*c),
         Literal::Int(i, _) => Value::Int(*i),
         Literal::Float(f, _) => Value::Float(*f),
+        Literal::BigInt(n, _) => Value::BigInt(n.clone()),
         Literal::Bool(b, _) => Value::Bool(*b),
         Literal::Nil(_) => Value::Nil,
     }
@@ -300,6 +370,7 @@ pub fn type_name(value: &Value) -> &'static str {
         Value::Char(_) => "char",
         Value::Int(_) => "int",
         Value::Float(_) => "float",
+        Value::BigInt(_) => "bigint",
         Value::Bool(_) => "bool",
         Value::Nil => "nil",
         Value::List(_) => "list",

@@ -2243,13 +2243,17 @@ mod ccr;
 mod event;
 mod exec;
 mod file;
+pub mod linalg;
+pub mod math;
 mod memory;
 mod mock;
 mod mora;
 mod plan;
+pub mod random;
 mod sandbox;
 mod schedule;
 mod skill;
+pub mod stats;
 // v0.83: TEA runtime + transducer builtin
 mod tea;
 mod toolplane;

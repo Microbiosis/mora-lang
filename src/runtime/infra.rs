@@ -15,8 +15,9 @@ const AI_CACHE_CAPACITY: usize = 10_000;
 
 /// v0.52 ADR-001: InfraRuntime — BC9
 ///
-/// 注：Recorder 不实现 Clone（pre-existing，per-thread 状态）。
-/// Clone 时 recorder 重建为 new_off()（与 `Interpreter::clone` 现有行为一致）。
+/// 注：Recorder 故意不 Clone 内部状态 —— 每个线程维护独立录制流，
+/// Clone 时 recorder 重建为 new_off()（与 `Interpreter::clone` 行为一致）。
+/// 所有字段类型均可 Clone，此限制是语义选择而非技术约束。
 /// Arc<Mutex<LruCache<..>> 字段共享 Arc，scheduler/bus 有 Clone impl。
 pub struct InfraRuntime {
     pub(crate) recorder: Recorder,

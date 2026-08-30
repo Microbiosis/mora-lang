@@ -50,7 +50,8 @@
 //! pub struct GenericPattern<I: InstLike>(...);
 //! ```
 //!
-//! 见 `pattern.rs::RegMatcher` / `ssa_pattern.rs::SsaRegMatcher` 注释中的 TODO 标记。
+//! v0.90.5: pattern.rs::RegMatcher / ssa_pattern.rs::SsaRegMatcher 的泛型化 TODO
+//! 已清除——当前实现已满足 Cascades 优化需求，泛型化推迟到有实际复用场景时。
 
 pub mod cost;
 pub mod dag_rule;

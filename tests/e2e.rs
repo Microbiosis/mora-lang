@@ -228,6 +228,12 @@ fn e2e_all_fixtures_run() {
         "match_list_rest.mora",
         "match_dict_rename.mora",
         "nested_if.mora",
+        // v0.91: 数学原语覆盖
+        "math_basic.mora",
+        "stats_basic.mora",
+        "linalg_basic.mora",
+        "random_basic.mora",
+        "bigint_basic.mora",
     ] {
         assert_ok(name);
     }

@@ -1,0 +1,36 @@
+-- v0.91: math.* builtin — 标量超越函数 + 常量
+task main()
+  -- 常量
+  let pi = math.PI
+  let e = math.E
+
+  -- 三角函数
+  let s = math.sin(0.0)
+  let c = math.cos(0.0)
+
+  -- 对数/指数
+  let lg = math.log(e)
+  let ex = math.exp(1.0)
+
+  -- 取整
+  let fl = math.floor(3.7)
+  let ce = math.ceil(3.2)
+  let rd = math.round(3.5)
+
+  -- 数值方法（x.abs() 与 math.abs(x) 等价）
+  let neg = 0.0 - 3.14    -- 显式减法避免 Int/Float mixed（与 Int 中减法对比）
+  let a = neg.abs()
+  let b = 16.0.sqrt()
+
+  print(pi)
+  print(e)
+  print(s)
+  print(c)
+  print(lg)
+  print(ex)
+  print(fl)
+  print(ce)
+  print(rd)
+  print(a)
+  print(b)
+end

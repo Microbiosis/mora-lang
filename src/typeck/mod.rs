@@ -55,6 +55,10 @@ pub enum Type {
     // v0.38: numeric tower — Int(i64) and Float(f64) as distinct types.
     Int,
     Float,
+    /// v0.91: arbitrary-precision 整数。
+    /// 算术 promotion 规则：含 BigInt 时结果 BigInt。
+    /// 不参与 Int <: Float 提升（避免隐式精度损失）。
+    BigInt,
     Bool,
     Nil,
     /// 任意类型（推断不出时的退路，或显式 `any` 标注）
@@ -176,6 +180,7 @@ impl Type {
             // v0.38: Int and Float distinct.
             Type::Int => "int".to_string(),
             Type::Float => "float".to_string(),
+            Type::BigInt => "bigint".to_string(),
             Type::Bool => "bool".to_string(),
             Type::Nil => "nil".to_string(),
             Type::Any => "any".to_string(),
@@ -280,6 +285,7 @@ impl Type {
             "string" => Type::String,
             "char" => Type::Char,
             "float" | "number" => Type::Float, // v0.x: "number" kept for backwards compatibility
+            "bigint" => Type::BigInt,
             "bool" => Type::Bool,
             "nil" => Type::Nil,
             // v0.50: "any" 应解析为 Union(vec![])（兼容任何类型）
@@ -376,6 +382,7 @@ impl Type {
             "string"
                 | "char"
                 | "float"
+                | "bigint"
                 | "bool"
                 | "nil"
                 | "list"
@@ -506,6 +513,19 @@ impl Type {
         // 后续版本。）
         if let (Type::Arrow(i1, o1, r1), Type::Arrow(i2, o2, r2)) = (self, expected) {
             return i1.compatible_with(i2) && o1.compatible_with(o2) && r1 == r2;
+        }
+        // v0.90.5: 数值类型兼容 — Int 与 Float 在非算术上下文也兼容
+        // （如 let x: float = 42、fn(x: float) f(42)、42 == 3.14）
+        // v0.91: BigInt 故意不参与此规则 — 隐式 BigInt → Float 会丢精度，
+        // 编译器拒绝（用户需显式调用 `.to_float()`）。
+        if (matches!(self, Type::Int) && matches!(expected, Type::Float))
+            || (matches!(self, Type::Float) && matches!(expected, Type::Int))
+        {
+            return true;
+        }
+        // v0.91: BigInt 自反兼容（同类型 BigInt 等于 BigInt）
+        if matches!(self, Type::BigInt) && matches!(expected, Type::BigInt) {
+            return true;
         }
         // v0.08.5: Type::Struct 已删除，统一为 Type::Trait 注册
         self == expected
@@ -694,6 +714,15 @@ if let (Type::Result_(t1, e1), Type::Result_(t2, e2)) = (self, super_ty) {
         // （函数子类型标准规则：contravariant in input, covariant in output。）
         if let (Type::Arrow(i1, o1, r1), Type::Arrow(i2, o2, r2)) = (self, super_ty) {
             return i2.subtype_of(i1) && o1.subtype_of(o2) && r1 == r2;
+        }
+        // v0.90.5: 数值子类型 — Int <: Float（标准数值提升规则）
+        // `let x: float = 42` / `fn(x: float) f(42)` 等场景
+        if matches!(self, Type::Int) && matches!(super_ty, Type::Float) {
+            return true;
+        }
+        // v0.91: BigInt 自反 — BigInt <: BigInt
+        if matches!(self, Type::BigInt) && matches!(super_ty, Type::BigInt) {
+            return true;
         }
         // 兜底：同构严格相等
         self == super_ty

@@ -7,6 +7,17 @@ use crate::mir::hint::TypeHint;
 use crate::typeck::is_known_type;
 use std::collections::HashSet;
 
+/// v0.90.5: 判断类型是否为具体数值类型（Int 或 Float）。
+/// TypeVar 不在此列 — Numeric 约束要求两侧均为已解析数值，
+/// TypeVar 应通过 Eq 约束路径走 unification。
+/// v0.91: BigInt 也是数值类型（Int + BigInt → BigInt promotion）。
+fn is_numeric(ty: &crate::typeck::Type) -> bool {
+    matches!(
+        ty,
+        crate::typeck::Type::Int | crate::typeck::Type::Float | crate::typeck::Type::BigInt
+    )
+}
+
 impl HMInference {
     pub(super) fn infer_let(
         &mut self,
@@ -225,13 +236,16 @@ impl HMInference {
                 Ok(self.instantiate_type(&ty))
             }
             Some(ty) => Ok(ty.clone()),
-            // v0.75.84: 全局内置对象名（ai/web/json/file/memory/agent）——
+// v0.75.84: 全局内置对象名（ai/web/json/file/memory/agent）——
             // 非变量绑定，typeck 识别为对应模块类型（ai → AiModule 等）。
             // 此前 `ai.chat(...)` 报 "Unbound variable 'ai'"（运行时 arm
             // v0.75.84 补回后 typeck 仍是缺口）。
             None => match name {
                 "ai" => Ok(Type::AiModule),
                 "agent" => Ok(Type::Agent),
+                // v0.91: 数学 builtin 模块对象（math/stats/linalg/random）
+                // — 视为 Any 类型，方法分派走 dispatch.rs::call_method_builtin
+                "math" | "stats" | "linalg" | "random" => Ok(Type::Any),
                 n if crate::flow::is_builtin_object(n) => Ok(Type::Unknown),
                 _ => Err(vec![TypeError::UnboundVariable {
                     name: name.to_string(),
@@ -255,23 +269,38 @@ impl HMInference {
         let result_ty = self.fresh_type_var();
         match op {
             Add | Sub | Mul | Div | Mod => {
-                // v0.75.86: 提前用 span 报不一致（避免 line 0）
-                if !left_ty.compatible_with(&right_ty) {
-                    return Err(vec![TypeError::UnificationFailure {
-                        expected: format!("{:?}", left_ty),
-                        got: format!("{:?}", right_ty),
-                        span: Some(span),
-                    }]);
+                // v0.90.5: Numeric constraint — 允许 Int/Float 混合运算，
+                // 结果类型由 numeric promotion 规则决定（Int+Int→Int, 含 Float→Float）。
+                // TypeVar 视为潜在数值类型，推迟到 solve 阶段判定。
+                if !is_numeric(&left_ty) || !is_numeric(&right_ty) {
+                    // 非数值类型：检查 symmetric compatible_with（如 String+String 拼接）
+                    if !left_ty.compatible_with(&right_ty) {
+                        return Err(vec![TypeError::UnificationFailure {
+                            expected: format!("{:?}", left_ty),
+                            got: format!("{:?}", right_ty),
+                            span: Some(span),
+                        }]);
+                    }
+                    // 同类型非数值运算（如 String+String）用 Eq 约束
+                    self.constraints.push(Constraint::Eq(
+                        Box::new(left_ty.clone()),
+                        Box::new(result_ty.clone()),
+                    ));
+                    self.constraints.push(Constraint::Eq(
+                        Box::new(right_ty.clone()),
+                        Box::new(result_ty.clone()),
+                    ));
+                } else {
+                    // 数值类型：用 Numeric 约束（Int/Float promotion 由 solver 处理）
+                    // result 字段让 solver 在校验后自动将 result_ty 与 promotion 类型合一
+                    self.constraints.push(Constraint::Numeric(
+                        super::unify::BinaryConstraint {
+                            left: Box::new(left_ty.clone()),
+                            right: Box::new(right_ty.clone()),
+                            result: Some(Box::new(result_ty.clone())),
+                        },
+                    ));
                 }
-                self.constraints.push(Constraint::Eq(
-                    Box::new(left_ty.clone()),
-                    Box::new(result_ty.clone()),
-                ));
-                self.constraints.push(Constraint::Eq(
-                    Box::new(right_ty.clone()),
-                    Box::new(result_ty.clone()),
-                ));
-                let _ = span;
                 Ok((result_ty, merged_row))
             }
             Equal | NotEqual => {

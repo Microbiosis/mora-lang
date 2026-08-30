@@ -32,6 +32,9 @@ pub enum Literal {
     // v0.38: numeric tower — Int and Float.
     Int(i64, Span),
     Float(f64, Span),
+    // v0.91: BigInt 字面量（来自 `<digits>n` 语法）。
+    // 持有 num_bigint::BigInt 的克隆以避开 parser 与 value 层之间的耦合。
+    BigInt(num_bigint::BigInt, Span),
     Bool(bool, Span),
     Nil(Span),
 }
@@ -50,6 +53,19 @@ pub enum BinaryOp {
     Less,
     GreaterEqual,
     LessEqual,
+}
+
+/// 一元运算符（v0.91）
+///
+/// 此前 `-x` 在 parse/emit 阶段降级为 `0 - x`、`not x` 降级为 `0 == x`。
+/// 引入 enum 是为类型系统明确化（unary 路径有独立 promotion 规则，
+/// 特别是 BigInt/Float/Int 的 unary minus 需要区分行为）。
+#[derive(Debug, Clone, PartialEq)]
+pub enum UnaryOp {
+    /// 取负：`Neg(x) = -x`
+    Neg,
+    /// 逻辑非：`Not(x) = x == 0`（沿用原有 truthiness 语义）
+    Not,
 }
 
 /// 泛型参数（trait/impl/method 的类型参数）

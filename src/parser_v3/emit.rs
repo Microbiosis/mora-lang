@@ -479,6 +479,18 @@ impl ParserV3 {
                 };
                 (dst, w)
             }
+            // v0.91: BigInt 字面量
+            TokenType::BigInt(val) => {
+                self.advance();
+                let dst = self.emit.alloc_reg();
+                self.emit
+                    .emit(MirInst::Const(dst, crate::value::Value::BigInt(val.clone())));
+                let w = MirWitness {
+                    kind: WitnessKind::Literal(Literal::BigInt(val, span)),
+                    span,
+                };
+                (dst, w)
+            }
             TokenType::String(ref s) => {
                 let dst = self.emit.alloc_reg();
                 self.emit

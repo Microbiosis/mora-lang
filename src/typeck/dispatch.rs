@@ -148,6 +148,25 @@ pub fn builtin_signatures() -> Vec<(String, Signature)> {
             "McpServer::new".to_string(),
             Signature::new(vec![], Type::McpServer),
         ),
+        // v0.91: 数学 builtin — math/stats/linalg/random
+        // 这些是 domain prefix 模块，typeck 注册为 marker signature（任意参数→Any）
+        // 实际方法分派由 dispatch.rs::call_method_builtin 处理
+        (
+            "math".to_string(),
+            Signature::new(vec![], Type::Any),
+        ),
+        (
+            "stats".to_string(),
+            Signature::new(vec![], Type::Any),
+        ),
+        (
+            "linalg".to_string(),
+            Signature::new(vec![], Type::Any),
+        ),
+        (
+            "random".to_string(),
+            Signature::new(vec![], Type::Any),
+        ),
     ]
 }
 

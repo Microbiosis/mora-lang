@@ -344,6 +344,11 @@ impl ParserV3 {
                 self.advance();
                 Some(crate::common::Literal::Float(val, self.span_of_current()))
             }
+            // v0.91: BigInt 字面量
+            TokenType::BigInt(val) => {
+                self.advance();
+                Some(crate::common::Literal::BigInt(val, self.span_of_current()))
+            }
             TokenType::String(s) => {
                 self.advance();
                 Some(crate::common::Literal::String(s, self.span_of_current()))
@@ -1294,6 +1299,11 @@ impl ParserV3 {
             TokenType::Float(val) => {
                 self.advance();
                 Some(MirExpr::lit(Literal::Float(val, span), span))
+            }
+            // v0.91: BigInt 字面量
+            TokenType::BigInt(val) => {
+                self.advance();
+                Some(MirExpr::lit(Literal::BigInt(val, span), span))
             }
             TokenType::String(_) => self.parse_string_literal(),
             TokenType::PromptString(_) => self.parse_string_literal(),

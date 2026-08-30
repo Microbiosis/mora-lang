@@ -558,6 +558,7 @@ fn infer_lit(lit: &crate::common::Literal) -> Type {
     match lit {
         Literal::Int(_, _) => Type::Int,
         Literal::Float(_, _) => Type::Float,
+        Literal::BigInt(_, _) => Type::BigInt,
         Literal::String(_, _) => Type::String,
         Literal::Char(_, _) => Type::Char,
         Literal::Bool(_, _) => Type::Bool,

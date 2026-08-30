@@ -197,6 +197,11 @@ impl MirExprLowerer {
                 self.emit(MirInst::Const(dst, crate::value::Value::Float(*v)));
                 Ok(dst)
             }
+            MirExprKind::Literal(Literal::BigInt(v, _)) => {
+                let dst = self.alloc_reg();
+                self.emit(MirInst::Const(dst, crate::value::Value::BigInt(v.clone())));
+                Ok(dst)
+            }
             MirExprKind::Literal(Literal::String(v, _)) => {
                 let dst = self.alloc_reg();
                 self.emit(MirInst::Const(dst, crate::value::Value::String(v.clone())));
@@ -880,6 +885,7 @@ pub fn pattern_to_string(pattern: &crate::mir::expr::Pattern) -> String {
             crate::common::Literal::Char(c, _) => format!("char:{}", c),
             crate::common::Literal::Int(i, _) => format!("int:{}", i),
             crate::common::Literal::Float(f, _) => format!("float:{}", f),
+            crate::common::Literal::BigInt(n, _) => format!("bigint:{}", n),
             crate::common::Literal::Bool(b, _) => format!("bool:{}", b),
             crate::common::Literal::Nil(_) => "nil".to_string(),
         },

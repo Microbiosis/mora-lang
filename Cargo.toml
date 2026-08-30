@@ -1,6 +1,6 @@
 [package]
 name = "mora"
-version = "0.0.53"
+version = "0.90.4"
 # v0.x 升级 ureq 3.3.0 → edition 2024 (ureq 3.3.0 要求 edition 2024 + MSRV 1.85)
 edition = "2024"
 # v0.51: build.rs 注入 MORAGIT_VERSION 给编译期 env!() 用
@@ -94,6 +94,11 @@ quick-xml = "0.41"
 uuid = { version = "1", features = ["v4"] }
 # v0.85: 升级 rusqlite 0.32 → 0.40（VTab macro 变更不影响 Mora——未使用 VTab）
 rusqlite = { version = "0.40", optional = true, features = ["bundled"] }
+# v0.91: num-bigint — 任意精度整数后端（Value::BigInt）。
+# 字面量语法：123n。算术 promotion：Int + BigInt → BigInt（最小惊讶）。
+num-bigint = "0.4"
+# num-traits — BigInt.abs() / signum() 需要的 Signed trait（num-bigint re-export 但路径长）
+num-traits = "0.2"
 
 [dev-dependencies]
 # v0.53: property-based testing for formal semantics verification

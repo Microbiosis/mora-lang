@@ -238,6 +238,8 @@ pub fn value_to_json(value: &Value) -> String {
                 format!("{}", f)
             }
         }
+        // v0.91: BigInt → JSON 数字字符串（保留精度）。
+        Value::BigInt(n) => n.to_string(),
         Value::Bool(b) => b.to_string(),
         Value::Nil => "null".to_string(),
         Value::List(items) => {

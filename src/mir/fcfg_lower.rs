@@ -570,6 +570,7 @@ fn fcfg_pattern_to_string(pattern: &Pattern) -> String {
             crate::common::Literal::Char(c, _) => format!("char:{}", c),
             crate::common::Literal::Int(i, _) => format!("int:{}", i),
             crate::common::Literal::Float(f, _) => format!("float:{}", f),
+            crate::common::Literal::BigInt(n, _) => format!("bigint:{}", n),
             crate::common::Literal::Bool(v, _) => format!("bool:{}", v),
             crate::common::Literal::Nil(_) => "nil".to_string(),
         },
@@ -607,6 +608,7 @@ fn literal_to_value(lit: &crate::common::Literal) -> Value {
     match lit {
         crate::common::Literal::Int(n, _) => Value::Int(*n),
         crate::common::Literal::Float(f, _) => Value::Float(*f),
+        crate::common::Literal::BigInt(n, _) => Value::BigInt(n.clone()),
         crate::common::Literal::String(s, _) => Value::String(s.clone()),
         crate::common::Literal::Bool(b, _) => Value::Bool(*b),
         crate::common::Literal::Nil(_) => Value::Nil,

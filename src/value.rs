@@ -89,6 +89,14 @@ pub enum BuiltinKind {
     Xform,
     // v0.86: eval(code) — runtime eval, Mora 源码动态执行（Lisp homoiconicity + eval-apply）
     Eval,
+    // v0.91: math.* — 标量数学（sin/cos/tan/exp/log/pow/sqrt/abs/floor/ceil/round + PI/E/TAU）
+    Math,
+    // v0.91: stats.* — 统计（sum/mean/median/stddev/var/min/max/histogram/corr/cov）
+    Stats,
+    // v0.91: linalg.* — 线性代数（dot/cross/norm/matmul/transpose）
+    Linalg,
+    // v0.91: random.* — PRNG（random/rand_int/rand_float/rand_choice/seed/shuffle）
+    Random,
 }
 
 impl std::fmt::Display for BuiltinKind {
@@ -125,6 +133,10 @@ impl std::fmt::Display for BuiltinKind {
             BuiltinKind::Tea => "tea",
             BuiltinKind::Xform => "xform",
             BuiltinKind::Eval => "eval",
+            BuiltinKind::Math => "math",
+            BuiltinKind::Stats => "stats",
+            BuiltinKind::Linalg => "linalg",
+            BuiltinKind::Random => "random",
         };
         f.write_str(s)
     }
@@ -178,6 +190,11 @@ impl BuiltinKind {
             // v0.83: TEA runtime 与 transducer builtin（无 domain 前缀）
             "tea" => BuiltinKind::Tea,
             "xform" => BuiltinKind::Xform,
+            // v0.91: 数学四件套（math/stats/linalg/random）
+            "math" => BuiltinKind::Math,
+            "stats" => BuiltinKind::Stats,
+            "linalg" => BuiltinKind::Linalg,
+            "random" => BuiltinKind::Random,
             _ => return None,
         })
     }
@@ -208,6 +225,10 @@ pub enum Value {
     // v0.38: Numeric tower — distinct Int and Float variants.
     Int(i64),
     Float(f64),
+    /// v0.91: arbitrary-precision 整数（num-bigint 后端）。
+    /// 字面量语法：`<digits>n`（如 `123n`、`99999999999999999999999n`）。
+    /// 算术 promotion：任一含 BigInt 时结果为 BigInt（最小惊讶）。
+    BigInt(num_bigint::BigInt),
     Bool(bool),
     Nil,
     List(Vec<Value>),
@@ -376,6 +397,8 @@ impl PartialEq for Value {
             (Value::Nil, Value::Nil) => true,
             (Value::Float(a), Value::Float(b)) => a == b,
             (Value::Int(a), Value::Int(b)) => a == b,
+            // v0.91: BigInt 相等
+            (Value::BigInt(a), Value::BigInt(b)) => a == b,
             (Value::String(a), Value::String(b)) => a == b,
             (Value::Char(a), Value::Char(b)) => a == b,
             (Value::Bool(a), Value::Bool(b)) => a == b,
@@ -486,8 +509,38 @@ impl Value {
                 "flatten",
                 "transpose",
                 "reshape",
+                // v0.91: 列表统计方法（复用 stats.* 函数）
+                "sum",
+                "min",
+                "max",
+                "mean",
+                "median",
+                "stddev",
+                "var",
+                "sort",
             ],
             Value::Dict(_) => &["get", "set", "keys", "values", "len", "json"],
+            Value::Int(_) => &[
+                // v0.91: 整数数学方法
+                "abs", "sign", "floor", "ceil", "round", "sqrt",
+                "sin", "cos", "tan", "exp", "log", "log2", "log10",
+                "to_float",
+            ],
+            Value::Float(_) => &[
+                // v0.91: 浮点数学方法
+                "abs", "sign", "floor", "ceil", "round", "trunc", "fract",
+                "sqrt", "cbrt",
+                "sin", "cos", "tan", "asin", "acos", "atan",
+                "sinh", "cosh", "tanh",
+                "exp", "log", "log2", "log10", "log1p",
+                "is_nan", "is_inf", "is_finite",
+                "to_int",
+            ],
+            Value::BigInt(_) => &[
+                // v0.91: BigInt 数学方法
+                "abs", "sign",
+                "to_int", "to_float",
+            ],
             Value::Conversation { .. } => &["chat", "history", "clear", "model", "len"],
             Value::Stream { .. } => &["collect", "is_done"],
             Value::Router { .. } => &["route", "listen"],
@@ -515,6 +568,26 @@ impl Value {
             MergeStrategy::Add => match (parent, child) {
                 (Value::Int(a), Value::Int(b)) => Value::Int(a + b),
                 (Value::Float(a), Value::Float(b)) => Value::Float(a + b),
+                (Value::BigInt(a), Value::BigInt(b)) => Value::BigInt(a + b),
+                (Value::Int(a), Value::BigInt(b)) => {
+                    Value::BigInt(num_bigint::BigInt::from(a) + b)
+                }
+                (Value::BigInt(a), Value::Int(b)) => {
+                    Value::BigInt(a + num_bigint::BigInt::from(b))
+                }
+                (Value::Float(a), Value::BigInt(b)) => {
+                    // Float + BigInt → Float（如果 b 能转 f64，否则保留 BigInt）
+                    b.to_string().parse::<f64>().map_or_else(
+                        |_| Value::BigInt(num_bigint::BigInt::from(a as i64) + b),
+                        |bf| Value::Float(a + bf),
+                    )
+                }
+                (Value::BigInt(a), Value::Float(b)) => {
+                    a.to_string().parse::<f64>().map_or_else(
+                        |_| Value::BigInt(a + num_bigint::BigInt::from(b as i64)),
+                        |af| Value::Float(af + b),
+                    )
+                }
                 (_, child) => child,
             },
             MergeStrategy::DictUnion => match (parent, child) {

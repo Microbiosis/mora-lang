@@ -316,6 +316,8 @@ fn value_to_json(v: &Value) -> JsonValue {
         // v0.38: Int fits i64; Float and Number use f64.
         Value::Int(i) => JsonValue::Number(*i as f64),
         Value::Float(n) => JsonValue::Number(*n),
+        // v0.91: BigInt → JSON number string（保留精度，JSON 数字本身为 f64）
+        Value::BigInt(n) => JsonValue::String_(n.to_string()),
         Value::String(s) => JsonValue::String_(s.clone()),
         Value::Char(c) => JsonValue::String_(c.to_string()),
         Value::List(items) => JsonValue::Array(items.iter().map(value_to_json).collect()),

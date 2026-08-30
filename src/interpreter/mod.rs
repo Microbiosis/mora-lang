@@ -2,7 +2,7 @@
 
 mod ai_chat;
 mod ai_helpers;
-mod builtins;
+pub mod builtins;
 mod dispatch;
 mod trait_dispatch;
 // v0.75.x: MirPregelEngine + WorkerPool 已迁至 src/pregel/（解耦 mir ↔ interpreter 循环）
@@ -355,6 +355,11 @@ impl Interpreter {
             g.define("plan".to_string(), Value::Builtin(Bk::Plan), false);
             // v0.48.0: mora.* — meta (refine)
             g.define("mora".to_string(), Value::Builtin(Bk::Mora), false);
+            // v0.91: math/stats/linalg/random 四件套（数学 builtin）
+            g.define("math".to_string(), Value::Builtin(Bk::Math), false);
+            g.define("stats".to_string(), Value::Builtin(Bk::Stats), false);
+            g.define("linalg".to_string(), Value::Builtin(Bk::Linalg), false);
+            g.define("random".to_string(), Value::Builtin(Bk::Random), false);
         }
         Self {
             core: crate::runtime::core::CoreRuntime {

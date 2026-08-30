@@ -52,6 +52,9 @@ pub enum TokenType {
     // v0.38: numeric tower — Int and Float tokens.
     Int(i64),
     Float(f64),
+    // v0.91: BigInt 字面量 — `<digits>n` 后缀
+    // 持有 num_bigint::BigInt 直接解析（避免 i64 范围限制）
+    BigInt(num_bigint::BigInt),
     Plus,
     Minus,
     Star,
@@ -599,9 +602,10 @@ impl Lexer {
             }
         }
         // v0.38: detect `i` / `u` / `f` / `I` suffix for Int/Number/Float.
+        // v0.91: 加 `n` / `N` 后缀 → BigInt 字面量
         let mut value: String = self.source[start..self.current].iter().collect();
         let mut suffix: Option<char> = None;
-        if matches!(self.peek(), 'i' | 'I' | 'u' | 'U' | 'f' | 'F') {
+        if matches!(self.peek(), 'i' | 'I' | 'u' | 'U' | 'f' | 'F' | 'n' | 'N') {
             suffix = Some(self.advance());
             // Optional width: 8/16/32/64.
             while self.peek().is_ascii_digit() {
@@ -661,6 +665,23 @@ impl Lexer {
                         }
                     };
                     TokenType::Float(num)
+                }
+                // v0.91: BigInt 字面量 `<digits>n` — 任意精度
+                'n' | 'N' => {
+                    let digits: String = value
+                        .chars()
+                        .take_while(|c| c.is_ascii_digit() || *c == '-')
+                        .collect();
+                    match digits.parse::<num_bigint::BigInt>() {
+                        Ok(n) => TokenType::BigInt(n),
+                        Err(_) => {
+                            return self.error_token(
+                                start_line,
+                                start_col,
+                                &format!("Invalid bigint literal: {}", value),
+                            );
+                        }
+                    }
                 }
                 _ => unreachable!(),
             }

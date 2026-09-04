@@ -35,6 +35,8 @@ pub mod core;
 // v0.78: EffectRow — algebraic effect 的类型表示（Stage 1/4 落地）
 pub mod effect;
 pub mod expr;
+// v0.91: orchestrate runtime types — 从 expr 层迁出，独立模块。
+pub mod orchestrate;
 // v0.89: EHIR → Core 桥接
 pub mod ehir_to_core;
 // v0.89: FCFG — 9 层架构第 1 层（Node<M> 泛型 + 结构化 CFG）

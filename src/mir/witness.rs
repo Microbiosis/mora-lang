@@ -590,6 +590,8 @@ impl WitnessOrchestrateKind {
                 proposers,
                 aggregator,
                 prompt,
+                prompt_fn: _,
+                ..
             } => WitnessOrchestrateKind::Moa {
                 layers: *layers,
                 proposers: proposers.clone(),
@@ -602,6 +604,9 @@ impl WitnessOrchestrateKind {
                 router,
                 top_k,
                 prompt,
+                router_fn: _,
+                prompt_fn: _,
+                ..
             } => WitnessOrchestrateKind::Moe {
                 experts: experts
                     .iter()

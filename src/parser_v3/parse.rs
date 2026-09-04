@@ -491,7 +491,11 @@ impl ParserV3 {
                                 };
                                 self.consume(TokenType::Colon, "Expected ':' after expert name")?;
                                 if let Some(def) = self.parse_assignment() {
-                                    moe_experts.push(crate::mir::expr::MirMoeExpert { name, def });
+                                    let def_fn = match crate::mir::lower::lower_mir_exprs(std::slice::from_ref(&def)) {
+                                        Ok(f) => f,
+                                        Err(_) => return None,
+                                    };
+                                    moe_experts.push(crate::mir::expr::MirMoeExpert { name, def, def_fn });
                                 }
                                 while self.match_token(&[TokenType::Newline]) {}
                                 if !self.match_token(&[TokenType::Comma]) {
@@ -602,24 +606,39 @@ impl ParserV3 {
                 let aggregator = moa_aggregator.unwrap_or_else(|| proposers[0].clone());
                 let prompt =
                     moa_prompt.unwrap_or_else(|| MirExpr::var("input".to_string(), start_span));
+                let prompt_fn = match crate::mir::lower::lower_mir_exprs(std::slice::from_ref(&prompt)) {
+                    Ok(f) => f,
+                    Err(_) => return None,
+                };
                 MirOrchestrateKind::Moa {
                     layers,
                     proposers,
                     aggregator,
                     prompt,
+                    prompt_fn,
                 }
             }
             "moe" => {
                 let router =
                     moe_router.unwrap_or_else(|| MirExpr::var("input".to_string(), start_span));
+                let router_fn = match crate::mir::lower::lower_mir_exprs(std::slice::from_ref(&router)) {
+                    Ok(f) => f,
+                    Err(_) => return None,
+                };
                 let top_k = moe_top_k.unwrap_or(2);
                 let prompt =
                     moe_prompt.unwrap_or_else(|| MirExpr::var("input".to_string(), start_span));
+                let prompt_fn = match crate::mir::lower::lower_mir_exprs(std::slice::from_ref(&prompt)) {
+                    Ok(f) => f,
+                    Err(_) => return None,
+                };
                 MirOrchestrateKind::Moe {
                     experts: moe_experts,
                     router,
                     top_k,
                     prompt,
+                    router_fn,
+                    prompt_fn,
                 }
             }
             _ => MirOrchestrateKind::Sequential { agents },

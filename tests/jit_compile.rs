@@ -54,7 +54,12 @@ fn binop_func(a: f64, op: mora::common::BinaryOp, b: f64) -> MirFunction {
 fn run_interp(func: &MirFunction) -> Result<Value, String> {
     let mut interp = Interpreter::new();
     let mut env = interp.take_env();
-    run_mir(&std::sync::Arc::new(func.clone()), &mut interp, &mut env)
+    run_mir(
+        &std::sync::Arc::new(func.clone()),
+        &mut interp,
+        &mut env,
+        &mut mora::mir::effect::Effects::new(),
+    )
 }
 
 fn run_jit_of(func: &MirFunction) -> Result<Value, String> {
@@ -443,7 +448,7 @@ fn with_config_env(body: &MirFunction, jit: bool) -> Result<mora::value::Environ
     };
     let mut interp = Interpreter::new();
     let mut env = interp.take_env();
-    run_mir(&std::sync::Arc::new(outer), &mut interp, &mut env)?;
+    run_mir(&std::sync::Arc::new(outer), &mut interp, &mut env, &mut mora::mir::effect::Effects::new())?;
     Ok(env)
 }
 

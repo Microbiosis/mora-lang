@@ -1,29 +1,29 @@
-//! MirExpr → MIR lowering (v0.55: V3 pipeline only)
+//! MirWitness → MIR lowering (v0.92: witness-canonical 入口)
 //!
-//! 全部 lowering 从 `Vec<MirExpr>` 直接构造 `MirFunction`。
+//! v0.92: 全部 lowering 从 `Vec<MirWitness>` 直接构造 `MirFunction`。
 //! 老的 `lower_program(&[NodeId], &AstArena)` (AST v2 路径) 在 v0.55 删除。
 //! 老的 `Lowerer` struct (882 行遗留实现) 在 v0.55 删除。
+//! 老的 `MirExpr` 桥接在 v0.92 删除——所有调用方已迁移到 `lower_mir_witnesses`。
 //!
 //! 入口:
-//! - `lower_mir_exprs(exprs: &[MirExpr]) -> Result<MirFunction, String>`
+//! - `lower_mir_witnesses(witnesses: &[MirWitness]) -> Result<MirFunction, String>`
+//! - `lower_mir_witnesses_with_opt(...)` — 显式 opt 等级变体
 
-// ── MirExpr-based lowering (v0.55: V3 pipeline) ──
+// ── Witness-based lowering (v0.92 canonical) ──
 
 use super::{Label, MirFunction, MirInst, Reg};
-use crate::mir::expr::{MirExpr, MirExprKind};
-use crate::mir::witness::MirWitness;
+use crate::mir::witness::{MirWitness, WitnessCallee, WitnessKind};
 use crate::value::Value;
 
 /// v0.75.30: 显式编译选项变体 — 调用方（CLI 编译入口）显式指定优化等级，
-/// 不读环境变量。语义与 `lower_mir_exprs` 完全一致，仅优化等级来源不同。
-/// REPL/import/pregel 等未走编译命令的入口继续走 `lower_mir_exprs`（env 兜底）。
-pub fn lower_mir_exprs_with_opt(
-    exprs: &[MirExpr],
+/// 不读环境变量。语义与 `lower_mir_witnesses` 完全一致，仅优化等级来源不同。
+pub fn lower_mir_witnesses_with_opt(
+    witnesses: &[MirWitness],
     opt_level: crate::mir::ssa::OptLevel,
 ) -> Result<MirFunction, String> {
-    let mut l = MirExprLowerer::new();
-    for expr in exprs {
-        let _dst = l.lower_expr(expr)?;
+    let mut l = WitnessLowerer::new();
+    for w in witnesses {
+        let _dst = l.lower_witness(w)?;
     }
     let mut func = l.finish();
     // v0.58: Cascades 优化 pass
@@ -37,13 +37,13 @@ pub fn lower_mir_exprs_with_opt(
     Ok(func)
 }
 
-/// 将 MirExpr 列表 lowering 为 MirFunction（env 兜底：CLI 未显式 `--opt`
+/// 将 MirWitness 列表 lowering 为 MirFunction（env 兜底：CLI 未显式 `--opt`
 /// 时沿用 MORA_OPT — REPL/import/pregel 等无显式编译命令的入口）。
-pub fn lower_mir_exprs(exprs: &[MirExpr]) -> Result<MirFunction, String> {
-    lower_mir_exprs_with_opt(exprs, crate::mir::ssa::OptLevel::from_env())
+pub fn lower_mir_witnesses(witnesses: &[MirWitness]) -> Result<MirFunction, String> {
+    lower_mir_witnesses_with_opt(witnesses, crate::mir::ssa::OptLevel::from_env())
 }
 
-/// v0.75.39: 共享 emit 机制 — MirExprLowerer 与 ParserV3 单遍编译共用。
+/// v0.75.39: 共享 emit 机制 — WitnessLowerer 与 ParserV3 单遍编译共用。
 ///
 /// alloc_reg（bump 分配）/ emit（Vec push）/ patch_label_at（label 回填）
 /// 是三个自包含原语，不依赖 MirExpr 任何执行语义。阶段 3 parser 直接
@@ -90,15 +90,15 @@ impl EmitContext {
     }
 }
 
-/// MirExpr → MIR 指令 lowering（v0.55 完整版）
-pub(crate) struct MirExprLowerer {
+/// MirWitness → MIR 指令 lowering（v0.92: 直接消费 WitnessKind）
+pub(crate) struct WitnessLowerer {
     emit: EmitContext,
     /// v0.78: 累积的 effect row。builtin 调用按前缀分类 → 推 effect label。
     /// 阶段 2 引入 Type::Arrow 时，本字段与 HM 类型系统对接。
     pub(crate) effects: super::effect::EffectRow,
 }
 
-impl MirExprLowerer {
+impl WitnessLowerer {
     fn new() -> Self {
         Self {
             emit: EmitContext::new(),
@@ -157,109 +157,98 @@ impl MirExprLowerer {
         self.effects.extend(label);
     }
 
-    /// v0.80: helper for handle block — lower a MirExpr as a block (sequence of statements).
+    /// v0.92: helper for handle block — lower a MirWitness as a block.
     /// Used when we need to emit a sub-MirFunction body (each block has its own EmitContext).
     /// Returns (last_reg, witness) — same as emit_block_w in parser_v3.
-    fn emit_block_via_expr_w(&mut self, expr: &MirExpr) -> Result<(Reg, MirWitness), String> {
+    fn emit_block_via_witness_w(&mut self, w: &MirWitness) -> Result<(Reg, MirWitness), String> {
         // Sequence expression: lower each statement; last reg is the result.
-        let MirExprKind::Sequence(stmts) = &expr.kind else {
-            // Single expression (e.g., `handle Ef { print(1) } { print("k") }`)
-            // — wrap as a single-statement sequence.
-            return self
-                .lower_expr(expr)
-                .map(|r| (r, empty_witness_for_expr(expr)));
+        let WitnessKind::Sequence(stmts) = &w.kind else {
+            // Single expression — wrap as a single-statement sequence.
+            return self.lower_witness(w).map(|r| (r, empty_witness_for_span(w.span)));
         };
         let mut last_reg = 0;
-        let stmt_wits: Vec<MirWitness> = Vec::new();
         for stmt in stmts {
-            let reg = self.lower_expr(stmt)?;
-            last_reg = reg;
-            // The witness isn't preserved at this lowering stage (it's stored elsewhere).
-            let _ = stmt_wits;
+            last_reg = self.lower_witness(stmt)?;
         }
-        Ok((last_reg, empty_witness_for_expr(expr)))
+        Ok((last_reg, empty_witness_for_span(w.span)))
     }
 
-    /// Lower expression → returns result register
-    fn lower_expr(&mut self, expr: &MirExpr) -> Result<Reg, String> {
+    /// Lower witness → returns result register
+    fn lower_witness(&mut self, w: &MirWitness) -> Result<Reg, String> {
         use crate::common::Literal;
-        use crate::mir::expr::{MirCallee, MirExprKind};
 
-        match &expr.kind {
+        match &w.kind {
             // ── Literals ──
-            MirExprKind::Literal(Literal::Int(v, _)) => {
+            WitnessKind::Literal(Literal::Int(v, _)) => {
                 let dst = self.alloc_reg();
                 self.emit(MirInst::Const(dst, crate::value::Value::Int(*v)));
                 Ok(dst)
             }
-            MirExprKind::Literal(Literal::Float(v, _)) => {
+            WitnessKind::Literal(Literal::Float(v, _)) => {
                 let dst = self.alloc_reg();
                 self.emit(MirInst::Const(dst, crate::value::Value::Float(*v)));
                 Ok(dst)
             }
-            MirExprKind::Literal(Literal::BigInt(v, _)) => {
+            WitnessKind::Literal(Literal::BigInt(v, _)) => {
                 let dst = self.alloc_reg();
                 self.emit(MirInst::Const(dst, crate::value::Value::BigInt(v.clone())));
                 Ok(dst)
             }
-            MirExprKind::Literal(Literal::String(v, _)) => {
+            WitnessKind::Literal(Literal::String(v, _)) => {
                 let dst = self.alloc_reg();
                 self.emit(MirInst::Const(dst, crate::value::Value::String(v.clone())));
                 Ok(dst)
             }
-            MirExprKind::Literal(Literal::Bool(v, _)) => {
+            WitnessKind::Literal(Literal::Bool(v, _)) => {
                 let dst = self.alloc_reg();
                 self.emit(MirInst::Const(dst, crate::value::Value::Bool(*v)));
                 Ok(dst)
             }
-            MirExprKind::Literal(Literal::Char(c, _)) => {
+            WitnessKind::Literal(Literal::Char(c, _)) => {
                 let dst = self.alloc_reg();
                 self.emit(MirInst::Const(dst, crate::value::Value::Char(*c)));
                 Ok(dst)
             }
-            MirExprKind::Literal(Literal::Nil(_)) => {
+            WitnessKind::Literal(Literal::Nil(_)) => {
                 let dst = self.alloc_reg();
                 self.emit(MirInst::Const(dst, crate::value::Value::Nil));
                 Ok(dst)
             }
 
             // ── Variables ──
-            MirExprKind::Variable(name) => {
+            WitnessKind::Variable(name) => {
                 let dst = self.alloc_reg();
                 self.emit(MirInst::Var(dst, name.clone()));
                 Ok(dst)
             }
 
             // ── Binary operations ──
-            MirExprKind::Binary { left, op, right } => {
-                let l = self.lower_expr(left)?;
-                let r = self.lower_expr(right)?;
+            WitnessKind::Binary { left, op, right } => {
+                let l = self.lower_witness(left)?;
+                let r = self.lower_witness(right)?;
                 let dst = self.alloc_reg();
                 self.emit(MirInst::BinaryOp(dst, l, op.clone(), r));
                 Ok(dst)
             }
 
             // ── Logical And/Or (short-circuit) ──
-            MirExprKind::And { left, right } => {
-                let l = self.lower_expr(left)?;
+            WitnessKind::And { left, right } => {
+                let l = self.lower_witness(left)?;
                 let dst = self.alloc_reg();
-                // If left is false, skip right
                 self.emit(MirInst::JumpIfNot(l, 0)); // placeholder
                 let jump_idx = self.emit.insts.len() - 1;
-                let r = self.lower_expr(right)?;
+                let r = self.lower_witness(right)?;
                 self.emit(MirInst::BinaryOp(dst, l, crate::common::BinaryOp::Equal, r));
                 let end = self.emit.insts.len();
                 self.patch_label_at(jump_idx, end);
-                // If short-circuited, dst is false (copy l)
                 Ok(dst)
             }
-            MirExprKind::Or { left, right } => {
-                let l = self.lower_expr(left)?;
+            WitnessKind::Or { left, right } => {
+                let l = self.lower_witness(left)?;
                 let dst = self.alloc_reg();
-                // If left is true, skip right
                 self.emit(MirInst::JumpIf(l, 0)); // placeholder
                 let jump_idx = self.emit.insts.len() - 1;
-                let r = self.lower_expr(right)?;
+                let r = self.lower_witness(right)?;
                 self.emit(MirInst::BinaryOp(
                     dst,
                     l,
@@ -272,16 +261,14 @@ impl MirExprLowerer {
             }
 
             // ── Function calls ──
-            MirExprKind::Call { callee, args } => {
-                // v0.75.33: MirCallee::Method（`obj.method(args)`）走
+            WitnessKind::Call { callee, args } => {
+                // v0.75.33: WitnessCallee::Method（`obj.method(args)`）走
                 // MirInst::MethodCall — ParserV3 把 receiver 作为第一个参数
-                // 传入，此处弹出作为 receiver 寄存器。此前拼 "obj_method"
-                // mangled 字符串 → interpreter 查不到该名字 →
-                // "Undefined function or task"（循环体真正执行后暴露）。
-                if let MirCallee::Method(_obj, method) = callee {
+                // 传入，此处弹出作为 receiver 寄存器。
+                if let WitnessCallee::Method(_obj, method) = callee {
                     let mut arg_regs: Vec<Reg> = Vec::new();
                     for arg in args {
-                        let r = self.lower_expr(arg)?;
+                        let r = self.lower_witness(arg)?;
                         arg_regs.push(r);
                     }
                     self.classify_method_effect(method);
@@ -297,14 +284,16 @@ impl MirExprLowerer {
                     }
                 }
                 let callee_name = match callee {
-                    MirCallee::Name(n) => n.clone(),
-                    MirCallee::Var(n) => n.clone(),
-                    _ => "unknown".to_string(),
+                    WitnessCallee::Name(n) => n.clone(),
+                    WitnessCallee::Var(n) => n.clone(),
+                    WitnessCallee::Builtin(op) => format!("{:?}", op),
+                    WitnessCallee::Evaluated(_) => "unknown".to_string(),
+                    WitnessCallee::Method(obj, m) => format!("{}.{}", obj, m),
                 };
                 self.classify_call_effect(&callee_name);
                 let mut arg_regs: Vec<Reg> = Vec::new();
                 for arg in args {
-                    let r = self.lower_expr(arg)?;
+                    let r = self.lower_witness(arg)?;
                     arg_regs.push(r);
                 }
                 let dst = self.alloc_reg();
@@ -313,15 +302,15 @@ impl MirExprLowerer {
             }
 
             // ── Method calls ──
-            MirExprKind::MethodCall {
+            WitnessKind::MethodCall {
                 receiver,
                 method,
                 args,
             } => {
-                let recv_reg = self.lower_expr(receiver)?;
+                let recv_reg = self.lower_witness(receiver)?;
                 let mut arg_regs: Vec<Reg> = Vec::new();
                 for arg in args {
-                    let r = self.lower_expr(arg)?;
+                    let r = self.lower_witness(arg)?;
                     arg_regs.push(r);
                 }
                 self.classify_method_effect(method);
@@ -331,20 +320,20 @@ impl MirExprLowerer {
             }
 
             // ── Collections ──
-            MirExprKind::List(items) => {
+            WitnessKind::List(items) => {
                 let mut item_regs: Vec<Reg> = Vec::new();
                 for item in items {
-                    let r = self.lower_expr(item)?;
+                    let r = self.lower_witness(item)?;
                     item_regs.push(r);
                 }
                 let dst = self.alloc_reg();
                 self.emit(MirInst::ListLit(dst, item_regs));
                 Ok(dst)
             }
-            MirExprKind::Dict(entries) => {
+            WitnessKind::Dict(entries) => {
                 let mut pair_regs: Vec<(String, Reg)> = Vec::new();
                 for (key, val) in entries {
-                    let r = self.lower_expr(val)?;
+                    let r = self.lower_witness(val)?;
                     pair_regs.push((key.clone(), r));
                 }
                 let dst = self.alloc_reg();
@@ -353,48 +342,41 @@ impl MirExprLowerer {
             }
 
             // ── If/Else ──
-            MirExprKind::If { cond, then, r#else } => {
-                let c = self.lower_expr(cond)?;
-                // v0.75.79: 与 compile 主路径对称 — if 结果经寄存器传递
-                // （Copy dst=src），不再经 env 临时名 `__if_result`（Assign
-                // 写未定义变量静默失败，分支值丢失）。
+            WitnessKind::If { cond, then, r#else } => {
+                let c = self.lower_witness(cond)?;
                 self.emit(MirInst::JumpIfNot(c, 0)); // placeholder
                 let jumpifnot_idx = self.emit.insts.len() - 1;
 
-                // Then branch
-                let then_dst = self.lower_expr(then)?;
+                let then_dst = self.lower_witness(then)?;
                 let dst = self.alloc_reg();
                 self.emit(MirInst::Copy(dst, then_dst));
-                // Jump to end
                 self.emit(MirInst::Jump(0)); // placeholder
                 let jump_end_idx = self.emit.insts.len() - 1;
 
-                // Else branch
                 let else_start = self.emit.insts.len();
                 self.patch_label_at(jumpifnot_idx, else_start);
-                if let Some(else_expr) = r#else {
-                    let else_dst = self.lower_expr(else_expr)?;
+                if let Some(else_w) = r#else {
+                    let else_dst = self.lower_witness(else_w)?;
                     self.emit(MirInst::Copy(dst, else_dst));
                 } else {
                     let nil_reg = self.alloc_reg();
                     self.emit(MirInst::Const(nil_reg, crate::value::Value::Nil));
                     self.emit(MirInst::Copy(dst, nil_reg));
                 }
-                // End
                 let end = self.emit.insts.len();
                 self.patch_label_at(jump_end_idx, end);
                 Ok(dst)
             }
 
             // ── Match ──
-            MirExprKind::Match { scrutinee, arms } => {
-                let val_reg = self.lower_expr(scrutinee)?;
+            WitnessKind::Match { scrutinee, arms } => {
+                let val_reg = self.lower_witness(scrutinee)?;
                 let match_arms: Vec<(String, Option<Reg>, Box<MirFunction>, Reg)> = arms
                     .iter()
                     .map(|arm| {
                         let pat_str = pattern_to_string(&arm.pattern);
-                        let mut body_lowerer = MirExprLowerer::new();
-                        let arm_val_reg = body_lowerer.lower_expr(&arm.body)?;
+                        let mut body_lowerer = WitnessLowerer::new();
+                        let arm_val_reg = body_lowerer.lower_witness(&arm.body)?;
                         body_lowerer.emit(MirInst::Return(Some(arm_val_reg)));
                         Ok((pat_str, None, Box::new(body_lowerer.finish()), arm_val_reg))
                     })
@@ -408,26 +390,21 @@ impl MirExprLowerer {
             }
 
             // ── For loop ──
-            MirExprKind::Loop {
+            WitnessKind::Loop {
                 var,
                 iterable,
                 body,
             } => {
                 use crate::value::Value;
-                let iter_reg = self.lower_expr(iterable)?;
-                // i = 0
+                let iter_reg = self.lower_witness(iterable)?;
                 let i_reg = self.alloc_reg();
                 self.emit(MirInst::Const(i_reg, Value::Int(0)));
-                // len = len(iter)
                 let len_reg = self.alloc_reg();
                 self.emit(MirInst::Call(len_reg, "len".to_string(), vec![iter_reg]));
-                // one = 1
                 let one_reg = self.alloc_reg();
                 self.emit(MirInst::Const(one_reg, Value::Int(1)));
 
-                // loop_label: continue target
                 let loop_label = self.emit.insts.len();
-                // cond = i >= len
                 let cond_reg = self.alloc_reg();
                 self.emit(MirInst::BinaryOp(
                     cond_reg,
@@ -435,23 +412,19 @@ impl MirExprLowerer {
                     crate::common::BinaryOp::GreaterEqual,
                     len_reg,
                 ));
-                // if cond: goto end
                 self.emit(MirInst::JumpIf(cond_reg, 0));
                 let exit_jump_idx = self.emit.insts.len() - 1;
 
-                // x = iter[i]
                 let x_reg = self.alloc_reg();
                 self.emit(MirInst::Index(x_reg, iter_reg, i_reg));
                 self.emit(MirInst::Define(var.clone(), x_reg));
 
-                // body
                 let body_start = self.emit.insts.len();
                 self.emit.loop_stack.push((loop_label, 0));
-                let _ = self.lower_expr(body)?;
+                let _ = self.lower_witness(body)?;
                 self.emit.loop_stack.pop();
                 let body_end = self.emit.insts.len();
 
-                // incr: i = i + 1; goto loop
                 self.emit(MirInst::BinaryOp(
                     i_reg,
                     i_reg,
@@ -460,10 +433,8 @@ impl MirExprLowerer {
                 ));
                 self.emit(MirInst::Jump(loop_label));
 
-                // end_label: break target
                 let end_label = self.emit.insts.len();
                 self.patch_label_at(exit_jump_idx, end_label);
-                // Patch break labels in body
                 for i in body_start..body_end {
                     match &mut self.emit.insts[i] {
                         MirInst::Break(lbl) => *lbl = end_label,
@@ -477,22 +448,21 @@ impl MirExprLowerer {
             }
 
             // ── While loop ──
-            MirExprKind::While { cond, body } => {
+            WitnessKind::While { cond, body } => {
                 let loop_label = self.emit.insts.len();
-                let c = self.lower_expr(cond)?;
+                let c = self.lower_witness(cond)?;
                 self.emit(MirInst::JumpIfNot(c, 0)); // placeholder
                 let exit_jump_idx = self.emit.insts.len() - 1;
 
                 let body_start = self.emit.insts.len();
                 self.emit.loop_stack.push((loop_label, 0));
-                let _ = self.lower_expr(body)?;
+                let _ = self.lower_witness(body)?;
                 self.emit.loop_stack.pop();
                 let body_end = self.emit.insts.len();
 
                 self.emit(MirInst::Jump(loop_label));
                 let end_label = self.emit.insts.len();
                 self.patch_label_at(exit_jump_idx, end_label);
-                // Patch break/continue
                 for i in body_start..body_end {
                     match &mut self.emit.insts[i] {
                         MirInst::Break(lbl) => *lbl = end_label,
@@ -506,10 +476,10 @@ impl MirExprLowerer {
             }
 
             // ── Closure ──
-            MirExprKind::Closure { params, body, .. } => {
+            WitnessKind::Closure { params, body } => {
                 let param_names: Vec<String> = params.iter().map(|p| p.name.clone()).collect();
-                let mut body_lowerer = MirExprLowerer::new();
-                let body_dst = body_lowerer.lower_expr(body)?;
+                let mut body_lowerer = WitnessLowerer::new();
+                let body_dst = body_lowerer.lower_witness(body)?;
                 body_lowerer.emit(MirInst::Return(Some(body_dst)));
                 let body_mir = body_lowerer.finish();
                 let dst = self.alloc_reg();
@@ -522,17 +492,14 @@ impl MirExprLowerer {
             }
 
             // ── FnDef ──
-            MirExprKind::FnDef {
+            WitnessKind::FnDef {
                 name, params, body, ..
             } => {
                 let param_names: Vec<String> = params.iter().map(|p| p.name.clone()).collect();
-                let mut body_lowerer = MirExprLowerer::new();
-                let body_dst = body_lowerer.lower_expr(body)?;
+                let mut body_lowerer = WitnessLowerer::new();
+                let body_dst = body_lowerer.lower_witness(body)?;
                 body_lowerer.emit(MirInst::Return(Some(body_dst)));
                 let body_mir = body_lowerer.finish();
-                // v0.75.79: TaskDef 无 dst 字段 — 不分配死寄存器（顶层结果被
-                // lower_mir_exprs_with_opt 的 `_dst` 丢弃）。修复前 alloc_reg
-                // 使 n_regs 比 compile 主路径多 1（差分等价断言暴露）。
                 self.emit(MirInst::TaskDef {
                     name: name.clone(),
                     params: param_names,
@@ -542,14 +509,14 @@ impl MirExprLowerer {
             }
 
             // ── DynTrait ──
-            MirExprKind::DynTrait {
+            WitnessKind::DynTrait {
                 expr,
                 trait_name,
                 generics,
             } => {
-                let src = self.lower_expr(expr)?;
+                let src = self.lower_witness(expr)?;
                 let dst = self.alloc_reg();
-                let generic_strs: Vec<String> = generics.iter().map(|t| t.name()).collect();
+                let generic_strs: Vec<String> = generics.iter().map(|t| t.to_type().name()).collect();
                 self.emit(MirInst::DynTrait {
                     dst,
                     src,
@@ -560,10 +527,10 @@ impl MirExprLowerer {
             }
 
             // ── Prompt ──
-            MirExprKind::Prompt { parts } => {
+            WitnessKind::Prompt { parts } => {
                 let mut part_regs: Vec<Reg> = Vec::new();
                 for part in parts {
-                    let r = self.lower_expr(part)?;
+                    let r = self.lower_witness(part)?;
                     part_regs.push(r);
                 }
                 let dst = self.alloc_reg();
@@ -572,15 +539,15 @@ impl MirExprLowerer {
             }
 
             // ── Let binding ──
-            MirExprKind::LetBinding {
+            WitnessKind::LetBinding {
                 name,
                 value,
                 init_body,
                 ..
             } => {
-                let v_dst = self.lower_expr(value)?;
+                let v_dst = self.lower_witness(value)?;
                 self.emit(MirInst::Define(name.clone(), v_dst));
-                let b_dst = self.lower_expr(init_body)?;
+                let b_dst = self.lower_witness(init_body)?;
                 let dst = self.alloc_reg();
                 self.emit(MirInst::Assign("__let_result".to_string(), b_dst));
                 self.emit(MirInst::Var(dst, "__let_result".to_string()));
@@ -588,44 +555,41 @@ impl MirExprLowerer {
             }
 
             // ── Assignment ──
-            MirExprKind::Assign { target, value } => {
-                let v = self.lower_expr(value)?;
+            WitnessKind::Assign { target, value } => {
+                let v = self.lower_witness(value)?;
                 self.emit(MirInst::Assign(target.clone(), v));
                 Ok(v)
             }
 
             // ── IndexAssign ──
-            MirExprKind::IndexAssign {
+            WitnessKind::IndexAssign {
                 object,
                 index,
                 value,
             } => {
-                let obj = self.lower_expr(object)?;
-                let idx = self.lower_expr(index)?;
-                let val = self.lower_expr(value)?;
+                let obj = self.lower_witness(object)?;
+                let idx = self.lower_witness(index)?;
+                let val = self.lower_witness(value)?;
                 self.emit(MirInst::IndexAssign(obj, idx, val));
                 let dst = self.alloc_reg();
                 self.emit(MirInst::Const(dst, crate::value::Value::Nil));
                 Ok(dst)
             }
 
-            // ── Expr (discard result) ──
-            // v0.75.20: MirExprKind::Expr 已删（死变体，parser 零构造）；
-            // MirInst::Expr 作为运算原语保留（手工构造可达，运行时语义不变）。
             // ── Sequence ──
-            MirExprKind::Sequence(exprs) => {
+            WitnessKind::Sequence(ws) => {
                 let mut last_dst = 0;
-                for e in exprs {
-                    last_dst = self.lower_expr(e)?;
+                for e in ws {
+                    last_dst = self.lower_witness(e)?;
                 }
                 Ok(last_dst)
             }
 
             // ── Return / Break / Continue ──
-            MirExprKind::Return(val) => {
+            WitnessKind::Return(val) => {
                 match val {
                     Some(v) => {
-                        let r = self.lower_expr(v)?;
+                        let r = self.lower_witness(v)?;
                         self.emit(MirInst::Return(Some(r)));
                     }
                     None => {
@@ -636,7 +600,7 @@ impl MirExprLowerer {
                 self.emit(MirInst::Const(dst, crate::value::Value::Nil));
                 Ok(dst)
             }
-            MirExprKind::Break(_label) => {
+            WitnessKind::Break(_label) => {
                 let (_, brk) = self
                     .emit
                     .loop_stack
@@ -648,7 +612,7 @@ impl MirExprLowerer {
                 self.emit(MirInst::Const(dst, crate::value::Value::Nil));
                 Ok(dst)
             }
-            MirExprKind::Continue(_label) => {
+            WitnessKind::Continue(_label) => {
                 let (cont, _) = self
                     .emit
                     .loop_stack
@@ -662,17 +626,19 @@ impl MirExprLowerer {
             }
 
             // ── Orchestrate ──
-            MirExprKind::Orchestrate {
+            WitnessKind::Orchestrate {
                 input_var,
                 result_var,
                 kind,
             } => {
                 // v0.78: orchestrate 触发 BSP effect（Agent 协调）
                 self.effects.extend("Bsp");
+                // WitnessOrchestrateKind → MirOrchestrateKind（含嵌套 agent 树转换）
+                let mir_kind = crate::mir::orchestrate::MirOrchestrateKind::from_witness_kind(kind);
                 self.emit(MirInst::Orchestrate {
                     input_var: input_var.clone(),
                     result_var: result_var.clone(),
-                    kind: kind.clone(),
+                    kind: Box::new(mir_kind),
                 });
                 let dst = self.alloc_reg();
                 self.emit(MirInst::Const(dst, crate::value::Value::Nil));
@@ -680,16 +646,16 @@ impl MirExprLowerer {
             }
 
             // ── Type definitions ──
-            MirExprKind::TypeAlias { name, target } => {
+            WitnessKind::TypeAlias { name, target } => {
                 self.emit(MirInst::TypeAlias {
                     name: name.clone(),
-                    target: target.name(),
+                    target: target.to_type().name(),
                 });
                 let dst = self.alloc_reg();
                 self.emit(MirInst::Const(dst, crate::value::Value::Nil));
                 Ok(dst)
             }
-            MirExprKind::EnumDef { name, variants } => {
+            WitnessKind::EnumDef { name, variants } => {
                 let evs: Vec<crate::common::EnumVariant> = variants
                     .iter()
                     .map(|v| crate::common::EnumVariant {
@@ -705,12 +671,12 @@ impl MirExprLowerer {
                 self.emit(MirInst::Const(dst, crate::value::Value::Nil));
                 Ok(dst)
             }
-            MirExprKind::StructDef { name, fields } => {
+            WitnessKind::StructDef { name, fields } => {
                 let sfs: Vec<crate::common::StructField> = fields
                     .iter()
                     .map(|(fname, ftype)| crate::common::StructField {
                         name: fname.clone(),
-                        type_hint: ftype.name(),
+                        type_hint: ftype.to_type().name(),
                     })
                     .collect();
                 self.emit(MirInst::StructDef {
@@ -723,39 +689,33 @@ impl MirExprLowerer {
             }
 
             // ── Import / Macro ──
-            MirExprKind::Import(path) => {
+            WitnessKind::Import(path) => {
                 self.emit(MirInst::Import(path.clone()));
                 let dst = self.alloc_reg();
                 self.emit(MirInst::Const(dst, crate::value::Value::Nil));
                 Ok(dst)
             }
-            MirExprKind::MacroDef { name, params } => {
-                // v0.83: MirExpr 路径不携带 body（历史路径），发空体占位。
+            WitnessKind::MacroDef { name, params, body } => {
+                // v0.92: Witness 路径携带 body —— 直接 lower 成 MirFunction。
+                let mut body_lowerer = WitnessLowerer::new();
+                let body_dst = body_lowerer.lower_witness(body)?;
+                body_lowerer.emit(MirInst::Return(Some(body_dst)));
+                let body_mir = body_lowerer.finish();
                 self.emit(MirInst::MacroDef {
                     name: name.clone(),
                     params: params.clone(),
-                    body: Box::new(crate::mir::MirFunction {
-                        params: Vec::new(),
-                        body: Vec::new(),
-                        n_regs: 0,
-                        effects: Default::default(),
-                    }),
+                    body: Box::new(body_mir),
                 });
                 let dst = self.alloc_reg();
                 self.emit(MirInst::Const(dst, crate::value::Value::Nil));
                 Ok(dst)
             }
-            // v0.80: algebraic effects lowering（Stage 2/4 落地）。
-            //
-            // Perform:
-            //   按顺序 lower 每个 arg → Vec<Reg>，
-            //   emit MirInst::Perform(dst, effect_name, arg_regs)。
-            //   与 Call 不同：Perform 不查询宿主全局环境（builtin.dispatch），
-            //   effect handler 必须由 handle 块安装（编译期 + 运行期双重检查）。
-            MirExprKind::Perform { effect, args } => {
+
+            // ── Perform ──
+            WitnessKind::Perform { effect, args } => {
                 let mut arg_regs = Vec::new();
                 for arg in args {
-                    let r = self.lower_expr(arg)?;
+                    let r = self.lower_witness(arg)?;
                     arg_regs.push(r);
                 }
                 let dst = self.alloc_reg();
@@ -766,13 +726,9 @@ impl MirExprLowerer {
                 });
                 Ok(dst)
             }
-            // Handle:
-            //   1. 每个子 block（body + handler）独立 EmitContext（独立寄存器空间）
-            //   2. 内部 emit 完 Const(dst, ...) 表达 body 末尾表达式的值
-            //   3. emit MirInst::Handle { dst, body_mir, handler_mir, k_param, k_dst }
-            //   注：第一版 handler 写死与 body 等价；Stage 2.x 升级到 multi-shot
-            //   continuation 时 handler 与 body 分离。
-            MirExprKind::Handle {
+
+            // ── Handle ──
+            WitnessKind::Handle {
                 effect,
                 body,
                 handler,
@@ -780,25 +736,24 @@ impl MirExprLowerer {
             } => {
                 // body 块独立 EmitContext（独立寄存器空间）
                 let body_outer = std::mem::replace(&mut self.emit, EmitContext::new());
-                let (body_reg, body_w) = self.emit_block_via_expr_w(body)?;
+                let (body_reg, body_w) = self.emit_block_via_witness_w(body)?;
                 let body_inner = std::mem::replace(&mut self.emit, body_outer);
                 let body_mir = {
-                    let mut tmp = MirExprLowerer::new();
+                    let mut tmp = WitnessLowerer::new();
                     tmp.emit = body_inner;
                     tmp.finish()
                 };
 
                 // handler 块独立 EmitContext
                 let handler_outer = std::mem::replace(&mut self.emit, EmitContext::new());
-                let (handler_reg, handler_w) = self.emit_block_via_expr_w(handler)?;
+                let (handler_reg, handler_w) = self.emit_block_via_witness_w(handler)?;
                 let handler_inner = std::mem::replace(&mut self.emit, handler_outer);
                 let handler_mir = {
-                    let mut tmp = MirExprLowerer::new();
+                    let mut tmp = WitnessLowerer::new();
                     tmp.emit = handler_inner;
                     tmp.finish()
                 };
 
-                // 顶层 emit：Handle 指令 + 末尾 Const(nil) 作为返回值
                 let k_dst = self.alloc_reg();
                 self.emit.emit(MirInst::Handle {
                     effect: effect.clone(),
@@ -811,43 +766,34 @@ impl MirExprLowerer {
                 let _ = (body_reg, handler_reg, body_w, handler_w);
                 Ok(k_dst)
             }
-            // v0.88: Quasiquote lowering — MirExpr path's `expr syntax.
-            // QuasiquoteExpr contains MirExpr segments:
-            //   Literal(String(s)) → Quote(s)
-            //   Variable(name) → Unquote(reg)
-            //   Call{Name("splice"), [expr]} → UnquoteSplice(reg)
-            MirExprKind::QuasiquoteExpr(segments) => {
+
+            // ── Quasiquote ──
+            WitnessKind::Quasiquote { segments } => {
                 let dst = self.alloc_reg();
                 let mut resolved: Vec<crate::mir::QuasiquoteSegment> = Vec::new();
                 for seg in segments {
                     match &seg.kind {
-                        MirExprKind::Literal(Literal::String(s, _)) => {
+                        WitnessKind::Literal(Literal::String(s, _)) => {
                             resolved.push(crate::mir::QuasiquoteSegment::Quote(s.clone()));
                         }
-                        MirExprKind::Variable(name) => {
-                            let reg = self.lower_expr(seg)?;
+                        WitnessKind::Variable(_name) => {
+                            let reg = self.lower_witness(seg)?;
                             resolved.push(crate::mir::QuasiquoteSegment::Unquote(reg));
-                            let _ = name;
                         }
-                        MirExprKind::Call {
-                            callee,
-                            args,
-                            ..
-                        } => match callee {
-                            MirCallee::Name(n) if n == "splice" => {
+                        WitnessKind::Call { callee, args } => match callee {
+                            WitnessCallee::Name(n) if n == "splice" => {
                                 if let Some(arg) = args.first() {
-                                    let reg = self.lower_expr(arg)?;
+                                    let reg = self.lower_witness(arg)?;
                                     resolved.push(crate::mir::QuasiquoteSegment::UnquoteSplice(reg));
                                 }
                             }
                             _ => {
-                                let reg = self.lower_expr(seg)?;
+                                let reg = self.lower_witness(seg)?;
                                 resolved.push(crate::mir::QuasiquoteSegment::Unquote(reg));
                             }
                         },
                         _ => {
-                            // Generic expression as unquote
-                            let reg = self.lower_expr(seg)?;
+                            let reg = self.lower_witness(seg)?;
                             resolved.push(crate::mir::QuasiquoteSegment::Unquote(reg));
                         }
                     }
@@ -855,28 +801,123 @@ impl MirExprLowerer {
                 self.emit.emit(MirInst::Quasiquote { dst, segments: resolved });
                 Ok(dst)
             }
-              // 从未产出包裹节点；括号仅作优先级，parse 时不建节点）。
+
+            // ── TEA (v0.83) + WithConfig + 其他 witness-only 变体 ──
+            WitnessKind::ModelDef { name, fields } => {
+                // ModelDef 是类型声明（无 body）——与 StructDef 同构。
+                let sfs: Vec<crate::common::StructField> = fields
+                    .iter()
+                    .map(|(fname, ftype)| crate::common::StructField {
+                        name: fname.clone(),
+                        type_hint: ftype.to_type().name(),
+                    })
+                    .collect();
+                self.emit(MirInst::ModelDef {
+                    name: name.clone(),
+                    fields: sfs,
+                });
+                let dst = self.alloc_reg();
+                self.emit(MirInst::Const(dst, crate::value::Value::Nil));
+                Ok(dst)
+            }
+            WitnessKind::MsgDef { name, variants } => {
+                self.emit(MirInst::MsgDef {
+                    name: name.clone(),
+                    variants: variants.clone(),
+                });
+                let dst = self.alloc_reg();
+                self.emit(MirInst::Const(dst, crate::value::Value::Nil));
+                Ok(dst)
+            }
+            WitnessKind::UpdateDef {
+                name,
+                params,
+                body,
+                ..
+            } => {
+                let param_names: Vec<String> = params.iter().map(|p| p.name.clone()).collect();
+                let mut body_lowerer = WitnessLowerer::new();
+                let body_dst = body_lowerer.lower_witness(body)?;
+                body_lowerer.emit(MirInst::Return(Some(body_dst)));
+                let body_mir = body_lowerer.finish();
+                self.emit(MirInst::UpdateDef {
+                    name: name.clone(),
+                    params: param_names,
+                    body: Box::new(body_mir),
+                });
+                let dst = self.alloc_reg();
+                self.emit(MirInst::Const(dst, crate::value::Value::Nil));
+                Ok(dst)
+            }
+            WitnessKind::AppDef {
+                name,
+                model_name,
+                msg_name,
+                init_w,
+                update_w,
+                view_w,
+            } => {
+                let mut init_l = WitnessLowerer::new();
+                let init_dst = init_l.lower_witness(init_w)?;
+                init_l.emit(MirInst::Return(Some(init_dst)));
+                let init_mir = init_l.finish();
+                let mut update_l = WitnessLowerer::new();
+                let update_dst = update_l.lower_witness(update_w)?;
+                update_l.emit(MirInst::Return(Some(update_dst)));
+                let update_mir = update_l.finish();
+                let mut view_l = WitnessLowerer::new();
+                let view_dst = view_l.lower_witness(view_w)?;
+                view_l.emit(MirInst::Return(Some(view_dst)));
+                let view_mir = view_l.finish();
+                self.emit(MirInst::AppDef {
+                    name: name.clone(),
+                    model_name: model_name.clone(),
+                    msg_name: msg_name.clone(),
+                    init_mir: Box::new(init_mir),
+                    update_mir: Box::new(update_mir),
+                    view_mir: Box::new(view_mir),
+                });
+                let dst = self.alloc_reg();
+                self.emit(MirInst::Const(dst, crate::value::Value::Nil));
+                Ok(dst)
+            }
+            WitnessKind::WithConfig { bindings, body } => {
+                // WithConfig 是元数据包装——emit WithConfig 指令后 lower body。
+                let mut binding_regs: Vec<(String, Reg)> = Vec::new();
+                for (k, v) in bindings {
+                    let r = self.lower_witness(v)?;
+                    binding_regs.push((k.clone(), r));
+                }
+                // body 独立 lower 成 MirFunction
+                let mut body_lowerer = WitnessLowerer::new();
+                let body_dst = body_lowerer.lower_witness(body)?;
+                body_lowerer.emit(MirInst::Return(Some(body_dst)));
+                let body_mir = body_lowerer.finish();
+                self.emit(MirInst::WithConfig {
+                    bindings: binding_regs,
+                    body: Box::new(body_mir),
+                    jit: false,
+                });
+                let dst = self.alloc_reg();
+                self.emit(MirInst::Const(dst, crate::value::Value::Nil));
+                Ok(dst)
+            }
         }
     }
 }
 
-/// Convert MirExpr Pattern to string representation for MatchExpr.
-/// v0.75.40: pub — ParserV3 单遍编译（emit_match_arm）复用同一序列化。
-/// v0.80: 占位 MirWitness —— handle 块嵌套 lowering 时，body/handler 块
-/// 的 witness 由 parser 产生，但 lower 阶段我们只 emit IR（MirInst），
-/// 不重复构建 witness —— 返回一个 Nil 字面量 witness 作 placeholder。
-/// Stage 2.x 升级可走 witness-level emit 重构。
-fn empty_witness_for_expr(expr: &MirExpr) -> MirWitness {
+/// v0.92: 占位 MirWitness —— handle 块嵌套 lowering 时，body/handler 块的
+/// witness 由 parser 产生，但 lower 阶段我们只 emit IR（MirInst），不重复
+/// 构建 witness —— 返回一个 Nil 字面量 witness 作 placeholder。
+fn empty_witness_for_span(span: crate::common::Span) -> MirWitness {
     MirWitness {
-        kind: crate::mir::witness::WitnessKind::Literal(
-            crate::common::Literal::Nil(expr.span),
-        ),
-        span: expr.span,
+        kind: WitnessKind::Literal(crate::common::Literal::Nil(span)),
+        span,
     }
 }
 
-pub fn pattern_to_string(pattern: &crate::mir::expr::Pattern) -> String {
-    use crate::mir::expr::Pattern;
+pub fn pattern_to_string(pattern: &crate::mir::witness::WitnessPattern) -> String {
+    use crate::mir::witness::WitnessPattern as Pattern;
     match pattern {
         Pattern::Wildcard => "_".to_string(),
         Pattern::Variable(name) => name.clone(),
@@ -927,7 +968,7 @@ pub fn pattern_to_string(pattern: &crate::mir::expr::Pattern) -> String {
     }
 }
 
-// v0.78: 单元测试 — MirExprLowerer.classify_call_effect / classify_method_effect 的 effect label 分类
+// v0.78: 单元测试 — WitnessLowerer.classify_call_effect / classify_method_effect 的 effect label 分类
 #[cfg(test)]
 mod tests {
     use super::super::effect::EffectRow;
@@ -975,18 +1016,11 @@ mod tests {
 /// （独立 EmitContext = 独立寄存器空间，与 TaskDef 一致）。
 /// 返回的 MirFunction 是 emit 完所有 MIR 后的快照。
 ///
-/// 注意：当前实现把 witness 转 Sequence MirExpr 后走 lower_mir_exprs。
-/// 第一版简化：handler 的 effect row 累积与 body 的 effect row 累积独立走
-/// MirExprLowerer（每个新建 lowerer 自己的 effects 字段）。Stage 2.x 升级到
-/// row-poly HM 时，这里需要把 effects 字段写入 MirFunction::effects（Stage 2.1
-/// 已就绪——MirFunction.effects 字段已存在）。
+/// v0.92: 直接走 WitnessLowerer（零 MirExpr 桥接）。
 pub(crate) fn lower_block_witness_to_mir(
     witness: &crate::mir::witness::MirWitness,
 ) -> crate::mir::MirFunction {
-    // 把单个 witness 转 MirExpr（from_witness 桥接），再 lower 成 IR。
-    use crate::mir::expr::MirExpr;
-    let expr = MirExpr::from_witness(witness.clone());
-    let mut l = MirExprLowerer::new();
-    let _ = l.lower_expr(&expr);
+    let mut l = WitnessLowerer::new();
+    let _ = l.lower_witness(witness);
     l.finish()
 }

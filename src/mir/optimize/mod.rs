@@ -12,7 +12,7 @@
 //!
 //! # 设计原则：为什么 MirPattern 与 SsaPattern 双层？
 //!
-//! 两者都基于 `MirExprKind`（v0.55 MIR）但操作不同层级：
+//! 两者都操作 MIR 指令层（v0.55 MIR 扁平指令）但粒度不同：
 //!
 //! 1. **`MirPattern`（pattern.rs）** — 匹配 `MirInst`（`Vec<MirInst>` body）
 //!    - 简单局部规则（`RedundantJumpRule`、`ConstFoldingRule`）

@@ -57,8 +57,9 @@ pub fn run_mir(
     func: &Arc<MirFunction>,
     interp: &mut dyn MirHost,
     env: &mut Environment,
+    effects: &mut crate::mir::effect::Effects,
 ) -> Result<Value, String> {
-    Ok(run_mir_with_signal(func, interp, env)?.1)
+    Ok(run_mir_with_signal(func, interp, env, effects)?.1)
 }
 
 /// α.1: 索引操作 List[i] / Dict[key] / String[i]
@@ -325,6 +326,7 @@ pub fn run_main_task(
     func: &Arc<MirFunction>,
     interp: &mut dyn MirHost,
     env: &mut Environment,
+    effects: &mut crate::mir::effect::Effects,
 ) -> Result<(), String> {
     let mut main_body: Option<Arc<MirFunction>> = None;
     for inst in &func.body {
@@ -338,7 +340,7 @@ pub fn run_main_task(
     }
     if let Some(main_func) = main_body {
         let mut main_env = env.clone();
-        let _ = run_mir(&main_func, interp, &mut main_env)?;
+        let _ = run_mir(&main_func, interp, &mut main_env, effects)?;
     }
     Ok(())
 }
@@ -377,8 +379,9 @@ pub fn run_mir_with_signal(
     func: &Arc<MirFunction>,
     interp: &mut dyn MirHost,
     env: &mut Environment,
+    effects: &mut crate::mir::effect::Effects,
 ) -> Result<(MirSignal, Value), String> {
-    run_mir_with_signal_cached(func, interp, env, cache::global_dag_cache())
+    run_mir_with_signal_cached(func, interp, env, cache::global_dag_cache(), effects)
 }
 
 /// v0.75.27: 可注入缓存变体 — 测试/多租户可传独立 `DagCache` 实例隔离
@@ -389,9 +392,10 @@ pub fn run_mir_with_signal_cached(
     interp: &mut dyn MirHost,
     env: &mut Environment,
     dag_cache: &cache::DagCache,
+    effects: &mut crate::mir::effect::Effects,
 ) -> Result<(MirSignal, Value), String> {
     let dag = dag_cache.get_or_build(func);
-    crate::mir::vm::run_dag_with_signal(&dag, func, interp, env)
+    crate::mir::vm::run_dag_with_signal(&dag, func, interp, env, effects)
 }
 
 /// α.10: `run_main_task` 的信号感知变体。
@@ -400,6 +404,7 @@ pub fn run_main_task_with_signal(
     func: &Arc<MirFunction>,
     interp: &mut dyn MirHost,
     env: &mut Environment,
+    effects: &mut crate::mir::effect::Effects,
 ) -> Result<(MirSignal, Value), String> {
     let mut main_body: Option<Arc<MirFunction>> = None;
     for inst in &func.body {
@@ -415,7 +420,7 @@ pub fn run_main_task_with_signal(
         return Ok((MirSignal::None, Value::Nil));
     };
     let mut main_env = env.clone();
-    let value = run_mir(&main_func, interp, &mut main_env)?;
+    let value = run_mir(&main_func, interp, &mut main_env, effects)?;
     Ok((MirSignal::Return(value.clone()), value))
 }
 
@@ -450,7 +455,12 @@ mod tests {
         let mut interp = Interpreter::new();
         let mut env = interp.take_env();
         // v0.75.9: 包裹 Arc（run_mir_dag 签名变更）
-        run_mir_dag(&Arc::new(func), &mut interp, &mut env)
+        run_mir_dag(
+            &Arc::new(func),
+            &mut interp,
+            &mut env,
+            &mut crate::mir::effect::Effects::new(),
+        )
     }
 
     #[test]
@@ -524,9 +534,16 @@ mod tests {
         let run = |memo: &mut DagExecMemo| -> Value {
             let mut interp = Interpreter::new();
             let mut env = interp.take_env();
-            run_dag_with_signal_memo(&dag, &func, memo, &mut interp, &mut env)
-                .expect("memo run should succeed")
-                .1
+            run_dag_with_signal_memo(
+                &dag,
+                &func,
+                memo,
+                &mut interp,
+                &mut env,
+                &mut crate::mir::effect::Effects::new(),
+            )
+            .expect("memo run should succeed")
+            .1
         };
         let v1 = run(&mut memo);
         let v2 = run(&mut memo);
@@ -575,9 +592,16 @@ mod tests {
             let mut interp = Interpreter::new();
             let mut env = interp.take_env();
             env.define("a".to_string(), Value::Int(env_val), false);
-            run_dag_with_signal_memo(&dag, &func, memo, &mut interp, &mut env)
-                .expect("memo run should succeed")
-                .1
+            run_dag_with_signal_memo(
+                &dag,
+                &func,
+                memo,
+                &mut interp,
+                &mut env,
+                &mut crate::mir::effect::Effects::new(),
+            )
+            .expect("memo run should succeed")
+            .1
         };
         assert_eq!(run(1, &mut memo), Value::Int(11));
         assert_eq!(run(1, &mut memo), Value::Int(11), "a 未变 → BinaryOp 跳过");
@@ -612,9 +636,16 @@ mod tests {
             let mut interp = Interpreter::new();
             let mut env = interp.take_env();
             env.define("x".to_string(), Value::Int(7), false);
-            run_dag_with_signal_memo(&dag, &func, memo, &mut interp, &mut env)
-                .expect("memo run should succeed")
-                .1
+            run_dag_with_signal_memo(
+                &dag,
+                &func,
+                memo,
+                &mut interp,
+                &mut env,
+                &mut crate::mir::effect::Effects::new(),
+            )
+            .expect("memo run should succeed")
+            .1
         };
         assert_eq!(run(&mut memo), Value::Int(7));
         assert_eq!(run(&mut memo), Value::Int(7));

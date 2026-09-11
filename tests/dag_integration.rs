@@ -11,7 +11,12 @@ fn run_dag_path(source: &str) -> Result<(), String> {
     let (func, _witnesses) = ParserV3::compile(source)?;
     let mut interp = Interpreter::new();
     let mut env = interp.take_env();
-    mora::mir::vm::run_mir_dag(&std::sync::Arc::new(func), &mut interp, &mut env)?;
+    mora::mir::vm::run_mir_dag(
+        &std::sync::Arc::new(func),
+        &mut interp,
+        &mut env,
+        &mut mora::mir::effect::Effects::new(),
+    )?;
     Ok(())
 }
 
@@ -39,7 +44,12 @@ fn dag_compress_demo_no_crash() {
     let mut env = interp.take_env();
     // Just run the top-level DAG body, then main task via linear
     // v0.75.9: 包裹 Arc（run_mir_dag 签名变更）
-    match mora::mir::vm::run_mir_dag(&std::sync::Arc::new(func), &mut interp, &mut env) {
+    match mora::mir::vm::run_mir_dag(
+        &std::sync::Arc::new(func),
+        &mut interp,
+        &mut env,
+        &mut mora::mir::effect::Effects::new(),
+    ) {
         Ok(v) => eprintln!("DAG result: {:?}", v),
         Err(e) => eprintln!("DAG error (expected during compress mock): {}", e),
     }
@@ -72,14 +82,30 @@ fn memo_incremental_reruns_affected_dependencies_only() {
     let mut env = interp.take_env();
     env.define("a".to_string(), Value::Float(1.0), false);
 
-    run_dag_with_signal_memo(&dag, &func, &mut memo, &mut interp, &mut env).expect("first run");
+    run_dag_with_signal_memo(
+        &dag,
+        &func,
+        &mut memo,
+        &mut interp,
+        &mut env,
+        &mut mora::mir::effect::Effects::new(),
+    )
+    .expect("first run");
     let first_executed = memo.executed_nodes;
     let first_skipped = memo.skipped_nodes;
 
     // 只改 b 链的依赖 a；c/d 链不受影响
     env.assign("a", Value::Float(10.0));
 
-    run_dag_with_signal_memo(&dag, &func, &mut memo, &mut interp, &mut env).expect("second run");
+    run_dag_with_signal_memo(
+        &dag,
+        &func,
+        &mut memo,
+        &mut interp,
+        &mut env,
+        &mut mora::mir::effect::Effects::new(),
+    )
+    .expect("second run");
     let delta_executed = memo.executed_nodes - first_executed;
     let delta_skipped = memo.skipped_nodes - first_skipped;
 

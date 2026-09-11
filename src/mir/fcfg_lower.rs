@@ -390,11 +390,11 @@ fn lower_node(ctx: &mut EmitContext, node: &Fcfg) {
             });
         }
         Node::TraitDef { name, methods, .. } => {
-            let meths: Vec<super::expr::MirTraitMethod> = methods
+            let meths: Vec<super::orchestrate::MirTraitMethod> = methods
                 .iter()
-                .map(|m| super::expr::MirTraitMethod {
+                .map(|m| super::orchestrate::MirTraitMethod {
                     name: m.name.clone(),
-                    params: vec![], // FCFG Param → MirExpr Param 需要额外转换
+                    params: vec![], // FCFG Param → MirTraitMethod Param 需要额外转换
                     return_type: m.return_ann.as_ref().map(|r| r.0.clone()),
                     body: None,
                 })
@@ -407,9 +407,9 @@ fn lower_node(ctx: &mut EmitContext, node: &Fcfg) {
             });
         }
         Node::ImplDef { trait_name, for_type, methods, .. } => {
-            let fndefs: Vec<super::expr::MirFnDef> = methods
+            let fndefs: Vec<super::orchestrate::MirFnDef> = methods
                 .iter()
-                .map(|(n, b)| super::expr::MirFnDef {
+                .map(|(n, b)| super::orchestrate::MirFnDef {
                     name: n.clone(),
                     params: vec![],
                     return_type: None,
@@ -491,7 +491,7 @@ fn lower_node(ctx: &mut EmitContext, node: &Fcfg) {
             ctx.emit(MirInst::Orchestrate {
                 input_var: input_var.clone(),
                 result_var: result_var.clone(),
-                kind: Box::new(super::expr::MirOrchestrateKind::Sequential { agents: vec![] }),
+                kind: Box::new(super::orchestrate::MirOrchestrateKind::Sequential { agents: vec![] }),
             });
         }
 

@@ -24,8 +24,8 @@ fn execute(func: MirFunction) -> Result<Value, String> {
     let mut interp = Interpreter::new();
     let mut env = interp.take_env();
     let func_arc = Arc::new(func);
-    let last = run_mir(&func_arc, &mut interp, &mut env)?;
-    run_main_task(&func_arc, &mut interp, &mut env)?;
+    let last = run_mir(&func_arc, &mut interp, &mut env, &mut mora::mir::effect::Effects::new())?;
+    run_main_task(&func_arc, &mut interp, &mut env, &mut mora::mir::effect::Effects::new())?;
     Ok(last)
 }
 

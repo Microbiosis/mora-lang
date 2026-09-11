@@ -1,11 +1,13 @@
 //! v0.52 ADR-001: CoreRuntime — 语言执行必需的薄核心
 //!
 //! 从 Interpreter god object 抽出的核心执行字段（globals/environment/tool_registry/
-//! current_ai_config/config_stack/current_merge_strategies/dynamic_sends），
+//! current_ai_config/config_stack/current_merge_strategies），
 //! 是解释器运行所必需的最小状态容器。
 //!
 //! v0.70: 移除了 `worker_channels` / `worker_receivers` 死代码分支。
-//! 消息传递通过 `dynamic_sends`（BSP Send API，v0.69 接通）完成。
+//! v0.93: send/aggregate 效应不再驻留宿主 —— 改为显式 `&mut Effects`
+//! 参数沿执行链传递（见 [`crate::mir::effect::Effects`]）。CoreRuntime 因此
+//! 不再持有任何效应缓冲。
 
 use parking_lot::Mutex;
 use std::collections::HashMap;
@@ -33,15 +35,6 @@ pub struct CoreRuntime {
     /// 设值时 `h_transaction`/`h_worker` 使用 `merge_from_with_strategies`；
     /// 为 None 时回退到硬编码 LWW。
     pub(crate) current_merge_strategies: Option<HashMap<String, MergeStrategy>>,
-    /// v0.69: Dynamic sends buffer. `h_send` pushes here; `h_orchestrate`
-    /// flushes into the BSP engine's pending_sends at the start of each
-    /// super-step. Lets agents route messages at runtime without direct
-    /// access to the engine.
-    pub(crate) dynamic_sends: Vec<crate::checkpoint::SendTask>,
-    /// v0.75.83: BSP 聚合器贡献缓冲。`h_aggregate` pushes here; pregel
-    /// 引擎超步末收集并经 aggregator_contribute 归约（与 dynamic_sends
-    /// 同构 —— agent 无法直接访问引擎）。
-    pub(crate) aggregator_contributions: Vec<crate::mir::expr::AggregatorContribution>,
     /// v0.80: algebraic effects handler 注册表（Stage 2/4 落地）。
     /// MirHost trait 的 `perform_effect / install/take/restore_effect_handler`
     /// 全部作用于本字段。嵌套 handle 块走 take+restore 栈模式。
@@ -62,8 +55,6 @@ impl Default for CoreRuntime {
             current_ai_config: None,
             config_stack: Vec::new(),
             current_merge_strategies: None,
-            dynamic_sends: Vec::new(),
-            aggregator_contributions: Vec::new(),
             effect_handlers: crate::runtime::effect::EffectRegistry::default(),
             gensym_counter: Arc::new(Mutex::new(0)),
         }
@@ -84,8 +75,6 @@ impl Clone for CoreRuntime {
             current_ai_config: self.current_ai_config.clone(),
             config_stack: self.config_stack.clone(),
             current_merge_strategies: self.current_merge_strategies.clone(),
-            dynamic_sends: self.dynamic_sends.clone(),
-            aggregator_contributions: self.aggregator_contributions.clone(),
             effect_handlers: crate::runtime::effect::EffectRegistry::default(),
             gensym_counter: self.gensym_counter.clone(),
         }
@@ -120,12 +109,6 @@ mod tests {
     fn core_config_stack_default_empty() {
         let core = CoreRuntime::default();
         assert!(core.config_stack.is_empty());
-    }
-
-    #[test]
-    fn core_dynamic_sends_default_empty() {
-        let core = CoreRuntime::default();
-        assert!(core.dynamic_sends.is_empty());
     }
 
     #[test]

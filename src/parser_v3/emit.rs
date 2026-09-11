@@ -81,7 +81,7 @@ impl ParserV3 {
     }
 
     /// 表达式入口（witness 嵌套版）— 镜像 parse_assignment（含赋值检测）。
-    fn emit_expr_w(&mut self) -> Option<(Reg, MirWitness)> {
+    pub(super) fn emit_expr_w(&mut self) -> Option<(Reg, MirWitness)> {
         // v0.80: algebraic effects 表达式位置 dispatch（Stage 2.0）。
         // 表达式位置出现的 `handle` / `perform` 不是变量名 —— 走专门 emission。
         if let Some(TokenType::Identifier(s)) = self.peek().map(|t| &t.token_type).cloned() {
@@ -113,8 +113,7 @@ impl ParserV3 {
         }
         let (reg, w) = self.emit_or_w()?;
         // v0.85: `as dyn Trait` coercion（§3.5 spec 承诺）— emit 路径中
-        // 显式将 expression 包装为 Value::TraitObject，与 legacy parse 路径
-        // MirExprKind::DynTrait 对齐。
+        // 显式将 expression 包装为 Value::TraitObject。
         self.emit_dyn_coercion(reg, w)
     }
 
@@ -208,12 +207,41 @@ impl ParserV3 {
             let dst = self.emit.alloc_reg();
             self.emit.emit(MirInst::Pipe(dst, left, rhs));
             let span = self.span_of_current();
-            left_w = MirWitness {
-                kind: WitnessKind::Call {
-                    callee: crate::mir::witness::WitnessCallee::Name("|>".to_string()),
-                    args: vec![left_w, rhs_w],
+            // v0.92: `left |> f` 脱糖为 `f(left)`（与 infer.rs 约定一致：
+            // `|>` 脱糖为 Call(right(left))，HM 走 infer_call 而非 operator）。
+            //   - RHS 是裸标识符（`5 |> double`）→ Call{Name(double), [left]}
+            //   - RHS 是调用（`10 |> add(5)`）→ Call{add, [left, 5]}
+            //   - 其它 → 回退为 `|>` 命名 Call（保持旧行为）
+            left_w = match rhs_w.kind {
+                WitnessKind::Variable(name) => MirWitness {
+                    kind: WitnessKind::Call {
+                        callee: crate::mir::witness::WitnessCallee::Name(name),
+                        args: vec![left_w],
+                    },
+                    span,
                 },
-                span,
+                WitnessKind::Call { callee, args } => {
+                    let mut new_args = Vec::with_capacity(args.len() + 1);
+                    new_args.push(left_w);
+                    new_args.extend(args);
+                    MirWitness {
+                        kind: WitnessKind::Call { callee, args: new_args },
+                        span,
+                    }
+                }
+                other => MirWitness {
+                    kind: WitnessKind::Call {
+                        callee: crate::mir::witness::WitnessCallee::Name("|>".to_string()),
+                        args: vec![
+                            left_w,
+                            MirWitness {
+                                kind: other,
+                                span,
+                            },
+                        ],
+                    },
+                    span,
+                },
             };
             left = dst;
         }
@@ -504,14 +532,28 @@ impl ParserV3 {
             }
             TokenType::PromptString(ref s) => {
                 self.advance();
-                // p"..." 拆分为 parts 再 emit Prompt（parts 是纯树，非 token 流）
+                // p"..." 拆分为 parts 再 emit Prompt（parts 是纯树，非 token 流）。
+                // v0.92: parse_prompt_parts 直接返回 MirWitness。
                 let parts = parse_prompt_parts(s, span);
                 let mut part_regs = Vec::new();
                 let mut part_wits = Vec::new();
-                for part in &parts {
-                    let (r, w) = self.emit_expr_witness_w(part)?;
+                for part in parts {
+                    let r = match &part.kind {
+                        WitnessKind::Literal(Literal::String(text, _)) => {
+                            let dst = self.emit.alloc_reg();
+                            self.emit
+                                .emit(MirInst::Const(dst, crate::value::Value::String(text.clone())));
+                            dst
+                        }
+                        WitnessKind::Variable(name) => {
+                            let dst = self.emit.alloc_reg();
+                            self.emit.emit(MirInst::Var(dst, name.clone()));
+                            dst
+                        }
+                        _ => self.emit.alloc_reg(),
+                    };
                     part_regs.push(r);
-                    part_wits.push(w);
+                    part_wits.push(part);
                 }
                 let dst = self.emit.alloc_reg();
                 self.emit.emit(MirInst::Prompt(dst, part_regs));
@@ -862,26 +904,6 @@ impl ParserV3 {
         Some((dst, w))
     }
 
-    /// 辅助：把已构造的 MirExpr（prompt parts：Literal/String 或 Variable）
-    /// emit 成指令 + 返回嵌套 witness。
-    fn emit_expr_witness_w(&mut self, expr: &MirExpr) -> Option<(Reg, MirWitness)> {
-        let wit = MirWitness::from_expr(expr);
-        match &expr.kind {
-            MirExprKind::Literal(Literal::String(s, _)) => {
-                let dst = self.emit.alloc_reg();
-                self.emit
-                    .emit(MirInst::Const(dst, crate::value::Value::String(s.clone())));
-                Some((dst, wit))
-            }
-            MirExprKind::Variable(name) => {
-                let dst = self.emit.alloc_reg();
-                self.emit.emit(MirInst::Var(dst, name.clone()));
-                Some((dst, wit))
-            }
-            _ => None,
-        }
-    }
-
     fn emit_list_w(&mut self) -> Option<(Reg, MirWitness)> {
         let span = self.span_of_current();
         self.consume(TokenType::LBracket, "Expected '['")?;
@@ -953,485 +975,56 @@ impl ParserV3 {
 
     // ── 语句 emit ──
 
-    fn emit_let_w(&mut self) -> Option<MirWitness> {
-        let span = self.span_of_current();
-        self.advance(); // 'let'
-        let name = self.consume_identifier("Expected variable name after 'let'")?;
-        let type_hint = if self.match_token_exact(TokenType::Colon) {
-            self.parse_type_annotation()
-        } else {
-            None
-        };
-        self.consume(TokenType::Assign, "Expected '=' in let binding")?;
-        let (v, v_w) = self.emit_expr_w()?;
-        // v0.85: `let x: dyn Trait = v` — 自动 emit MirInst::DynTrait
-        // coercion，将 plain value 包装为 Value::TraitObject（§3.5 spec 承诺）。
-        let (final_v, final_v_w) = if let Some(crate::typeck::Type::TraitObject {
-            trait_name,
-            ..
-        }) = type_hint.clone()
-        {
-            let dst = self.emit.alloc_reg();
-            self.emit.emit(MirInst::DynTrait {
-                dst,
-                src: v,
-                trait_generics: Vec::new(),
-                trait_name: trait_name.clone(),
-            });
-            (dst, MirWitness {
-                kind: WitnessKind::DynTrait {
-                    expr: Box::new(v_w),
-                    trait_name,
-                    generics: Vec::new(),
-                },
-                span,
-            })
-        } else {
-            (v, v_w)
-        };
-        self.emit.emit(MirInst::Define(name.clone(), final_v));
-        // init_body = Nil（与 lower LetBinding 一致：Const(Nil) → Assign → Var）
-        let b_dst = self.emit.alloc_reg();
-        self.emit
-            .emit(MirInst::Const(b_dst, crate::value::Value::Nil));
-        self.emit
-            .emit(MirInst::Assign("__let_result".to_string(), b_dst));
-        let dst = self.emit.alloc_reg();
-        self.emit
-            .emit(MirInst::Var(dst, "__let_result".to_string()));
-        let nil_w = MirWitness {
-            kind: WitnessKind::Literal(Literal::Nil(span)),
-            span,
-        };
-        Some(MirWitness {
-            kind: WitnessKind::LetBinding {
-                name,
-                type_hint: type_hint.map(crate::mir::hint::TypeHint::from_type),
-                value: Box::new(final_v_w),
-                init_body: Box::new(nil_w),
-            },
-            span,
-        })
-    }
-
-    fn emit_fn_def_w(&mut self) -> Option<MirWitness> {
-        let span = self.span_of_current();
-        self.advance(); // 'task'
-        let name = self.consume_identifier("Expected task name")?;
-        self.consume(TokenType::LParen, "Expected '(' after task name")?;
-        let mut params = Vec::new();
-        while !self.check(&TokenType::RParen) && !self.is_at_end() {
-            if let Some(p) = self.consume_identifier("Expected parameter name") {
-                params.push(p);
-            }
-            if !self.match_token(&[TokenType::Comma]) {
-                break;
-            }
-        }
-        self.consume(TokenType::RParen, "Expected ')' after parameters")?;
-        // 子上下文：函数体是独立寄存器空间（镜像 lower FnDef 分支）
-        let parent = std::mem::replace(&mut self.emit, crate::mir::lower::EmitContext::new());
-        let (body_reg, body_w) = if self.match_token_exact(TokenType::Newline) {
-            let mut stmt_wits = Vec::new();
-            let mut last: Option<Reg> = None;
-            while self.match_token(&[TokenType::Newline]) {}
-            while !self.check(&TokenType::End) && !self.is_at_end() {
-                let (r, w) = self.emit_statement_expr_w()?;
-                last = Some(r);
-                stmt_wits.push(w);
-                while self.match_token(&[TokenType::Newline]) {}
-            }
-            self.consume(TokenType::End, "Expected 'end' after task body")?;
-            (last, Self::block_witness(stmt_wits, span))
-        } else if self.check(&TokenType::End) {
-            // Empty body: `task main() end`
-            let nil_reg = self.emit.alloc_reg();
-            self.emit
-                .emit(MirInst::Const(nil_reg, crate::value::Value::Nil));
-            let nil_w = MirWitness {
-                kind: WitnessKind::Literal(Literal::Nil(span)),
-                span,
-            };
-            (Some(nil_reg), nil_w)
-        } else {
-            let (r, w) = self.emit_expr_w()?;
-            (Some(r), w)
-        };
-        self.emit.emit(MirInst::Return(body_reg));
-        let body_mir = std::mem::replace(&mut self.emit, parent).finish();
-        self.emit.emit(MirInst::TaskDef {
-            name: name.clone(),
-            params: params.clone(),
-            body: Box::new(body_mir),
-        });
-        let w_params = params
-            .iter()
-            .map(|p| WitnessParam {
-                name: p.clone(),
-                type_hint: None,
-                default: None,
-            })
-            .collect();
-        Some(MirWitness {
-            kind: WitnessKind::FnDef {
-                name,
-                params: w_params,
-                return_type: None,
-                body: Box::new(body_w),
-            },
-            span,
-        })
-    }
-
-    fn emit_return_break_continue_w(&mut self) -> Option<MirWitness> {
-        let token = self.peek()?.token_type.clone();
-        let span = self.span_of_current();
-        match token {
-            TokenType::Return => {
-                self.advance();
-                let value = if self.check(&TokenType::Newline)
-                    || self.check(&TokenType::RBrace)
-                    || self.is_at_end()
-                {
-                    None
-                } else {
-                    self.emit_expr_w().map(|(_, w)| Box::new(w))
-                };
-                self.emit.emit(MirInst::Return(value.as_ref().map(|_| 0)));
-                Some(MirWitness {
-                    kind: WitnessKind::Return(value),
-                    span,
-                })
-            }
-            TokenType::Break => {
-                self.advance();
-                let label = if matches!(self.peek()?.token_type, TokenType::Identifier(_)) {
-                    self.consume_identifier("Expected label after 'break'")?
-                } else {
-                    String::new()
-                };
-                let (_, brk) = self
-                    .emit
-                    .loop_stack
-                    .last()
-                    .copied()
-                    .ok_or("Break outside loop")
-                    .ok()?;
-                self.emit.emit(MirInst::Break(brk));
-                Some(MirWitness {
-                    kind: WitnessKind::Break(label),
-                    span,
-                })
-            }
-            TokenType::Continue => {
-                self.advance();
-                let label = if matches!(self.peek()?.token_type, TokenType::Identifier(_)) {
-                    self.consume_identifier("Expected label after 'continue'")?
-                } else {
-                    String::new()
-                };
-                let (cont, _) = self
-                    .emit
-                    .loop_stack
-                    .last()
-                    .copied()
-                    .ok_or("Continue outside loop")
-                    .ok()?;
-                self.emit.emit(MirInst::Continue(cont));
-                Some(MirWitness {
-                    kind: WitnessKind::Continue(label),
-                    span,
-                })
-            }
-            _ => None,
-        }
-    }
-
-    fn emit_type_alias_w(&mut self) -> Option<MirWitness> {
-        let span = self.span_of_current();
-        self.advance(); // 'type'
-        let name = self.consume_identifier("Expected type name")?;
-        self.consume(TokenType::Assign, "Expected '=' in type alias")?;
-        let target = self.parse_type_annotation()?;
-        self.emit.emit(MirInst::TypeAlias {
-            name: name.clone(),
-            target: target.name(),
-        });
-        let dst = self.emit.alloc_reg();
-        self.emit
-            .emit(MirInst::Const(dst, crate::value::Value::Nil));
-        Some(MirWitness {
-            kind: WitnessKind::TypeAlias {
-                name,
-                target: crate::mir::hint::TypeHint::from_type(target),
-            },
-            span,
-        })
-    }
-
-    fn emit_enum_def_w(&mut self) -> Option<MirWitness> {
-        let span = self.span_of_current();
-        self.advance(); // 'enum'
-        let name = self.consume_identifier("Expected enum name")?;
-        let mut variants = Vec::new();
-        while !self.check(&TokenType::End) && !self.is_at_end() {
-            while self.match_token(&[TokenType::Newline]) {}
-            if self.check(&TokenType::End) {
-                break;
-            }
-            if let Some(v) = self.consume_identifier("Expected variant name") {
-                variants.push(v);
-            }
-        }
-        self.consume(TokenType::End, "Expected 'end' after enum")?;
-        let evs: Vec<crate::common::EnumVariant> = variants
-            .iter()
-            .map(|v| crate::common::EnumVariant {
-                name: v.clone(),
-                data: None,
-            })
-            .collect();
-        self.emit.emit(MirInst::EnumDef {
-            name: name.clone(),
-            variants: evs,
-        });
-        let dst = self.emit.alloc_reg();
-        self.emit
-            .emit(MirInst::Const(dst, crate::value::Value::Nil));
-        Some(MirWitness {
-            kind: WitnessKind::EnumDef { name, variants },
-            span,
-        })
-    }
-
-    fn emit_struct_def_w(&mut self) -> Option<MirWitness> {
-        let span = self.span_of_current();
-        self.advance(); // 'struct'
-        let name = self.consume_identifier("Expected struct name")?;
-        let mut fields = Vec::new();
-        while !self.check(&TokenType::End) && !self.is_at_end() {
-            while self.match_token(&[TokenType::Newline]) {}
-            if self.check(&TokenType::End) {
-                break;
-            }
-            if let Some(fname) = self.consume_identifier("Expected field name") {
-                self.consume(TokenType::Colon, "Expected ':' after field name")?;
-                if let Some(ftype) = self.parse_type_annotation() {
-                    fields.push((fname, ftype));
-                }
-            } else {
-                // v0.90 死循环修复：非标识符 token 前进保证进度
-                self.advance();
-            }
-        }
-        self.consume(TokenType::End, "Expected 'end' after struct")?;
-        let sfs: Vec<crate::common::StructField> = fields
-            .iter()
-            .map(|(fname, ftype)| crate::common::StructField {
-                name: fname.clone(),
-                type_hint: ftype.name(),
-            })
-            .collect();
-        self.emit.emit(MirInst::StructDef {
-            name: name.clone(),
-            fields: sfs,
-        });
-        let dst = self.emit.alloc_reg();
-        self.emit
-            .emit(MirInst::Const(dst, crate::value::Value::Nil));
-        Some(MirWitness {
-            kind: WitnessKind::StructDef {
-                name,
-                fields: fields
-                    .into_iter()
-                    .map(|(n, t)| (n, crate::mir::hint::TypeHint::from_type(t)))
-                    .collect(),
-            },
-            span,
-        })
-    }
-
-    /// v0.88: TEA app 定义 — `app Counter ... end` 完整解析。
-    ///
-    /// syntax:
-    /// ```mora
-    /// app Counter
-    ///   model: Counter
-    ///   msg: CounterMsg
-    ///   init: <expr>
-    ///   update: fn(model, msg) => ...
-    ///   view: fn(model) => ...
-    /// end
-    /// ```
-    ///
-    /// 镜像 h_app_def 语义：model/msg 为 Identifier 绑定到当前 env；
-    /// init/update/view 均作为闭包编译（子 EmitContext），emit MirInst::AppDef。
-    fn emit_app_def_w(&mut self) -> Option<MirWitness> {
-        let span = self.span_of_current();
-        self.advance(); // 'app'
-        let name = self.consume_identifier("Expected app name")?;
-
-        // 子上下文：app 块内部是独立寄存器空间
-        let parent = std::mem::replace(
-            &mut self.emit,
-            crate::mir::lower::EmitContext::new(),
-        );
-
-        let mut model_name = String::new();
-        let mut msg_name = String::new();
-        let mut init_witness = None;
-        let mut update_mir = None;
-        let mut view_mir = None;
-
-        while self.match_token(&[TokenType::Newline]) {}
-        while !self.check(&TokenType::End) && !self.is_at_end() {
-            if let Some(field) = self.consume_identifier("Expected field name") {
-                self.consume(TokenType::Colon, "Expected ':' after field name")?;
-                match field.as_str() {
-                    "model" => {
-                        model_name = self
-                            .consume_identifier("Expected model name")?
-                            .clone();
-                    }
-                    "msg" => {
-                        msg_name = self
-                            .consume_identifier("Expected msg name")?
-                            .clone();
-                    }
-                    "init" => {
-                        init_witness = Some(Box::new(self.emit_expr_w().unwrap_or((0, {
-                            let s = self.span_of_current();
-                            MirWitness {
-                                kind: WitnessKind::Literal(Literal::Nil(s)),
-                                span: s,
-                            }
-                        })).1));
-                    }
-                    "update" => {
-                        update_mir = self.emit_closure_mir("update");
-                    }
-                    "view" => {
-                        view_mir = self.emit_closure_mir("view");
-                    }
-                    _ => {
-                        // skip unknown fields
-                    }
-                }
-            } else {
-                // v0.90 死循环修复：字段值解析失败残留的非标识符 token
-                //（如未支持的元组表达式）—— 前进一 token 保证进度。
-                // 此前此处不前进，app 块内任何解析失败都会死循环。
-                self.advance();
-            }
-            while self.match_token(&[TokenType::Newline]) {}
-        }
-        self.consume(TokenType::End, "Expected 'end' after app block")?;
-
-        // 将 init 表达式编译为 MirFunction（必须带 Return）
-        let init_mir = init_witness
-            .as_ref()
-            .map(|b| {
-                let mut mir = crate::mir::lower::lower_block_witness_to_mir(b);
-                if mir.body.is_empty() || !matches!(mir.body.last(), Some(MirInst::Return(_))) {
-                    let result_reg = mir.n_regs.saturating_sub(1);
-                    mir.body.push(MirInst::Return(Some(result_reg)));
-                }
-                mir
-            })
-            .unwrap_or_default();
-
-        // 恢复父上下文（app 块内部指令丢弃，仅保留 init/update/view 的 MirFunction）
-        let _ = std::mem::replace(&mut self.emit, parent).finish();
-
-        self.emit.emit(MirInst::AppDef {
-            name: name.clone(),
-            model_name: model_name.clone(),
-            msg_name: msg_name.clone(),
-            init_mir: Box::new(init_mir),
-            update_mir: Box::new(update_mir.unwrap_or_default()),
-            view_mir: Box::new(view_mir.unwrap_or_default()),
-        });
-
-        Some(MirWitness {
-            kind: WitnessKind::AppDef {
-                name: name.clone(),
-                model_name,
-                msg_name,
-                init_w: init_witness.unwrap_or_else(|| {
-                    Box::new(MirWitness {
-                        kind: WitnessKind::Literal(Literal::Nil(span)),
-                        span,
-                    })
-                }),
-                update_w: Box::new(MirWitness {
-                    kind: WitnessKind::Closure {
-                        params: Vec::new(),
-                        body: Box::new(MirWitness {
-                            kind: WitnessKind::Literal(Literal::Nil(span)),
-                            span,
-                        }),
-                    },
-                    span,
-                }),
-                view_w: Box::new(MirWitness {
-                    kind: WitnessKind::Closure {
-                        params: Vec::new(),
-                        body: Box::new(MirWitness {
-                            kind: WitnessKind::Literal(Literal::Nil(span)),
-                            span,
-                        }),
-                    },
-                    span,
-                }),
-            },
-            span,
-        })
-    }
-
-    /// 解析闭包表达式并直接返回其 body 的 MirFunction（用于 app 的 update/view 字段）。
-    /// 支持两种语法：
-    ///   - fn(params) => body
-    ///   - fn(params) block end
-    fn emit_closure_mir(&mut self, _label: &str) -> Option<MirFunction> {
-        // 消耗可选的 fn 关键字
-        let _ = self.match_token_exact(TokenType::Fn);
-        
-        // 子上下文：闭包体是独立寄存器空间
-        let parent = std::mem::replace(&mut self.emit, crate::mir::lower::EmitContext::new());
-
-        // 解析参数列表（可选）
-        let _params: Vec<String> = if self.match_token_exact(TokenType::LParen) {
-            let mut params = Vec::new();
-            while !self.check(&TokenType::RParen) && !self.is_at_end() {
-                if let Some(p) = self.consume_identifier("Expected parameter") {
-                    params.push(p);
-                }
-                if !self.match_token(&[TokenType::Comma]) {
-                    break;
-                }
-            }
-            self.consume(TokenType::RParen, "Expected ')' after params")?;
-            params
-        } else {
-            Vec::new()
-        };
-
-        // 解析闭包体
-        let (body_reg, _body_w) = if self.match_token_exact(TokenType::FatArrow) {
-            self.emit_expr_w()?
-        } else {
-            self.emit_block_w()?
-        };
-
-        self.emit.emit(MirInst::Return(Some(body_reg)));
-        let body_mir = std::mem::replace(&mut self.emit, parent).finish();
-        Some(body_mir)
-    }
-
     fn emit_import_w(&mut self) -> Option<MirWitness> {
         let span = self.span_of_current();
         self.advance(); // 'import'
-        let path = self.consume_identifier("Expected import path")?;
+        // v0.92: import 路径支持三种形式：
+        //   1. `import "path/to/file.mora"` — 引号字符串（含 `/` 和 `.`）
+        //   2. `import path/to/file.mora`   — 裸多组件路径（`/` `.` 分隔）
+        //   3. `import mod_a`               — 单标识符（向后兼容）
+        let path = match self.peek().cloned() {
+            Some(tok) => match tok.token_type {
+                // 形式 1：引号字符串
+                TokenType::String(ref s) => {
+                    let p = s.clone();
+                    self.advance();
+                    p
+                }
+                _ => {
+                    // 形式 2/3：拼接标识符 + `/` + `.` 组成路径，直到行尾/空白。
+                    // 例：`tests/fixtures/mod_a.mora`
+                    let mut p = String::new();
+                    loop {
+                        match self.peek().cloned() {
+                            Some(t)
+                                if matches!(
+                                    t.token_type,
+                                    TokenType::Identifier(_) | TokenType::Slash
+                                        | TokenType::Dot | TokenType::Newline
+                                ) =>
+                            {
+                                match &t.token_type {
+                                    TokenType::Slash => p.push('/'),
+                                    TokenType::Dot => p.push('.'),
+                                    TokenType::Newline => {}
+                                    TokenType::Identifier(name) => p.push_str(name),
+                                    _ => unreachable!(),
+                                }
+                                self.advance();
+                            }
+                            _ => break,
+                        }
+                    }
+                    if p.is_empty() {
+                        // 回退：单标识符（错误信息保持原样）
+                        self.consume_identifier("Expected import path")?
+                    } else {
+                        p
+                    }
+                }
+            },
+            None => self.consume_identifier("Expected import path")?,
+        };
         self.emit.emit(MirInst::Import(path.clone()));
         let dst = self.emit.alloc_reg();
         self.emit
@@ -1617,9 +1210,27 @@ impl ParserV3 {
         // 分支值写各自 reg，尾端 Copy 到公共 dst，跳转使仅选中分支可达。
         self.emit.emit(MirInst::JumpIfNot(cond, 0));
         let jumpifnot_idx = self.emit.insts.len() - 1;
-        let (then_reg, then_w) = self.emit_block_w()?;
         let dst = self.emit.alloc_reg();
-        self.emit.emit(MirInst::Copy(dst, then_reg));
+
+        // v0.92: 三种分支语法统一收敛：
+        //   1. `then expr`        — then 关键字分支
+        //   2. `{ stmts }`        — 现有花括号块
+        //   3. `\n ... end`       — 顶层无括号块（向后兼容）
+        let has_then_kw = self
+            .peek()
+            .map(|t| matches!(&t.token_type, TokenType::Then))
+            .unwrap_or(false);
+
+        let (_then_reg, then_w) = if has_then_kw {
+            self.advance(); // consume 'then'
+            let (r, w) = self.emit_expr_w()?;
+            self.emit.emit(MirInst::Copy(dst, r));
+            (r, w)
+        } else {
+            let (r, w) = self.emit_block_w()?;
+            self.emit.emit(MirInst::Copy(dst, r));
+            (r, w)
+        };
         self.emit.emit(MirInst::Jump(0));
         let jump_end_idx = self.emit.insts.len() - 1;
         let else_start = self.emit.insts.len();
@@ -1655,7 +1266,7 @@ impl ParserV3 {
 
     /// emit 一个块（{} 或换行到 end），返回 (最后结果寄存器, 块 witness)。
     /// 块 witness：单条语句取该语句的 witness；多条语句嵌套为 Sequence。
-    fn emit_block_w(&mut self) -> Option<(Reg, MirWitness)> {
+    pub(super) fn emit_block_w(&mut self) -> Option<(Reg, MirWitness)> {
         let span = self.span_of_current();
         let mut stmt_wits = Vec::new();
         let mut last = 0;
@@ -1699,7 +1310,7 @@ impl ParserV3 {
     }
 
     /// 块/函数体的语句列表 → 单条则直出，多条嵌套为 Sequence。
-    fn block_witness(stmt_wits: Vec<MirWitness>, span: Span) -> MirWitness {
+    pub(super) fn block_witness(stmt_wits: Vec<MirWitness>, span: Span) -> MirWitness {
         if stmt_wits.len() == 1 {
             stmt_wits.into_iter().next().expect("len==1 verified above")
         } else if stmt_wits.is_empty() {
@@ -1723,7 +1334,7 @@ impl ParserV3 {
     /// v0.75.81: 事务家族（transaction/commit/rollback）+ eval 断言接入
     /// 语句分发（lexer 无对应关键字，经 peek_is_identifier 识别，try/while
     /// 先例）。
-    fn emit_statement_expr_w(&mut self) -> Option<(Reg, MirWitness)> {
+    pub(super) fn emit_statement_expr_w(&mut self) -> Option<(Reg, MirWitness)> {
         if self.check(&TokenType::Let) {
             return self.emit_let_w().map(|w| (0, w));
         }
@@ -2059,7 +1670,7 @@ impl ParserV3 {
         let body_mir = std::mem::replace(&mut self.emit, parent).finish();
         let pat_str = crate::mir::lower::pattern_to_string(&pattern);
         let witness = crate::mir::witness::WitnessArm {
-            pattern: crate::mir::witness::WitnessPattern::from_pattern(&pattern),
+            pattern,
             guard: guard_reg.as_ref().map(|(_, w)| w.clone()),
             body: body_w,
         };
@@ -2072,42 +1683,33 @@ impl ParserV3 {
         })
     }
 
-    fn emit_pattern(&mut self) -> Option<crate::mir::expr::Pattern> {
+    /// v0.92: parse_pattern 返回 WitnessPattern（witness-native）。
+    fn emit_pattern(&mut self) -> Option<crate::mir::witness::WitnessPattern> {
         // 复用完整 pattern 解析器（通配/字面量/变量/元组/列表/dict/类型标注）
         self.parse_pattern()
     }
 
     fn emit_orchestrate_w(&mut self) -> Option<MirWitness> {
-        // 复用旧解析器构造 kind（含预 lower 的 task_body）— orchestrate 是
-        // 数据构造指令，运行时引擎执行，不参与递归 emit（与 lower 的
-        // MirExprKind::Orchestrate 分支一致：emit inst + Const(Nil)）。
-        let span = self.span_of_current();
-        let expr = self.parse_orchestrate_statement()?;
-        if let MirExprKind::Orchestrate {
+        // v0.92: parse_orchestrate_statement 直接返回 MirWitness（Orchestrate 变体）
+        // —— orchestrate 是数据构造指令，运行时引擎执行，不参与递归 emit。
+        let witness = self.parse_orchestrate_statement()?;
+        if let WitnessKind::Orchestrate {
             input_var,
             result_var,
             kind,
-        } = expr.kind
+        } = &witness.kind
         {
+            // WitnessOrchestrateKind → MirOrchestrateKind（含 agent/edge/expert 转换）
+            let mir_kind = crate::mir::orchestrate::MirOrchestrateKind::from_witness_kind(kind);
             self.emit.emit(MirInst::Orchestrate {
                 input_var: input_var.clone(),
                 result_var: result_var.clone(),
-                kind: kind.clone(),
+                kind: Box::new(mir_kind),
             });
             let dst = self.emit.alloc_reg();
             self.emit
                 .emit(MirInst::Const(dst, crate::value::Value::Nil));
-            // witness：从构造的 MirExpr 转换（含嵌套 agent 树）
-            Some(MirWitness {
-                kind: WitnessKind::Orchestrate {
-                    input_var,
-                    result_var,
-                    kind: Box::new(crate::mir::witness::WitnessOrchestrateKind::from_kind(
-                        &kind,
-                    )),
-                },
-                span,
-            })
+            Some(witness)
         } else {
             None
         }

@@ -169,16 +169,16 @@ impl CostModel for TokenEstimate {
             // 编排
             MirInst::Orchestrate { kind, .. } => {
                 let n_agents = match kind.as_ref() {
-                    crate::mir::expr::MirOrchestrateKind::Sequential { agents } => agents.len(),
-                    crate::mir::expr::MirOrchestrateKind::Loop { agents, .. } => agents.len(),
-                    crate::mir::expr::MirOrchestrateKind::Graph { agents, .. } => agents.len(),
-                    crate::mir::expr::MirOrchestrateKind::Pregel { agents, .. } => agents.len(),
+                    crate::mir::orchestrate::MirOrchestrateKind::Sequential { agents } => agents.len(),
+                    crate::mir::orchestrate::MirOrchestrateKind::Loop { agents, .. } => agents.len(),
+                    crate::mir::orchestrate::MirOrchestrateKind::Graph { agents, .. } => agents.len(),
+                    crate::mir::orchestrate::MirOrchestrateKind::Pregel { agents, .. } => agents.len(),
                     // v0.75.84: MoA 展开为 layers×(proposers+1) 个 agent
-                    crate::mir::expr::MirOrchestrateKind::Moa {
+                    crate::mir::orchestrate::MirOrchestrateKind::Moa {
                         layers, proposers, ..
                     } => layers * (proposers.len() + 1),
                     // v0.75.85: MoE 顺序执行，成本 = 专家数（稀疏 ≤ top_k）
-                    crate::mir::expr::MirOrchestrateKind::Moe { experts, .. } => experts.len(),
+                    crate::mir::orchestrate::MirOrchestrateKind::Moe { experts, .. } => experts.len(),
                 };
                 50 + n_agents as u32 * 30
             }
@@ -291,16 +291,18 @@ mod tests {
     #[test]
     fn test_inst_cost_orchestrate_scales_with_agents() {
         let cost = TokenEstimate;
-        use crate::mir::expr::{MirAgentDef, MirOrchestrateKind};
+        use crate::mir::orchestrate::{MirAgentDef, MirOrchestrateKind};
 
         let make_agents = |n: usize| -> Vec<MirAgentDef> {
             (0..n)
                 .map(|i| MirAgentDef {
                     name: format!("a{}", i),
-                    task_expr: crate::mir::expr::MirExpr::lit(
-                        crate::common::Literal::Nil(crate::common::Span::new(1, 1)),
-                        crate::common::Span::new(1, 1),
-                    ),
+                    task_expr: crate::mir::witness::MirWitness {
+                        kind: crate::mir::witness::WitnessKind::Literal(
+                            crate::common::Literal::Nil(crate::common::Span::new(1, 1)),
+                        ),
+                        span: crate::common::Span::new(1, 1),
+                    },
                     verify_expr: None,
                     with_config: None,
                     task_body: crate::mir::MirFunction {

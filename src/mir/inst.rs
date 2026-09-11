@@ -413,6 +413,7 @@ pub fn dispatch(
     interp: &mut dyn MirHost,
     env: &mut Environment,
     task_registry: &HashMap<&str, (&[String], &MirFunction)>,
+    effects: &mut crate::mir::effect::Effects,
 ) -> Result<Flow, String> {
     match inst {
         // ── Pure value ──
@@ -433,7 +434,7 @@ pub fn dispatch(
             Ok(Flow::Continue)
         }
         MirInst::Call(dst, name, args) => {
-            h_call(regs, *dst, name, args, task_registry, interp, env)?;
+            h_call(regs, *dst, name, args, task_registry, interp, env, effects)?;
             Ok(Flow::Continue)
         }
         MirInst::ListLit(dst, items) => {
@@ -449,11 +450,11 @@ pub fn dispatch(
             Ok(Flow::Continue)
         }
         MirInst::MethodCall(dst, recv, method, args) => {
-            h_method_call(regs, *dst, *recv, method, args, interp)?;
+            h_method_call(regs, *dst, *recv, method, args, interp, effects)?;
             Ok(Flow::Continue)
         }
         MirInst::Pipe(dst, lhs, rhs) => {
-            h_pipe(regs, *dst, *lhs, *rhs, interp)?;
+            h_pipe(regs, *dst, *lhs, *rhs, interp, effects)?;
             Ok(Flow::Continue)
         }
         MirInst::Prompt(dst, parts) => {
@@ -474,7 +475,7 @@ pub fn dispatch(
             Ok(Flow::Continue)
         }
         MirInst::MatchExpr { val, arms } => {
-            h_match_expr(interp, env, regs, *val, arms)?;
+            h_match_expr(interp, env, regs, *val, arms, effects)?;
             Ok(Flow::Continue)
         }
 
@@ -538,7 +539,7 @@ pub fn dispatch(
             Ok(Flow::Continue)
         }
         MirInst::Import(path) => {
-            h_import(interp, env, path)?;
+            h_import(interp, env, path, effects)?;
             Ok(Flow::Continue)
         }
         MirInst::WithConfig {
@@ -546,11 +547,11 @@ pub fn dispatch(
             body,
             jit,
         } => {
-            h_with_config(interp, env, regs, bindings, body, *jit)?;
+            h_with_config(interp, env, regs, bindings, body, *jit, effects)?;
             Ok(Flow::Continue)
         }
         MirInst::Perform { dst, effect, args } => {
-            h_perform(regs, *dst, effect, args, interp)?;
+            h_perform(regs, *dst, effect, args, interp, effects)?;
             Ok(Flow::Continue)
         }
         MirInst::Handle {
@@ -560,7 +561,7 @@ pub fn dispatch(
             k_param,
             k_dst,
         } => {
-            h_handle(interp, env, regs, effect, body, handler, k_param.as_str(), *k_dst)?;
+            h_handle(interp, env, regs, effect, body, handler, k_param.as_str(), *k_dst, effects)?;
             Ok(Flow::Continue)
         }
         MirInst::MacroDef { name, params, body } => {
@@ -568,56 +569,56 @@ pub fn dispatch(
             Ok(Flow::Continue)
         }
         MirInst::Transaction { body, compensation } => {
-            h_transaction(interp, env, body, compensation)
+            h_transaction(interp, env, body, compensation, effects)
         }
         MirInst::Send { value, target } => {
-            h_send(interp, regs, *value, target)?;
+            effects.push(h_send(interp, regs, *value, target));
             Ok(Flow::Continue)
         }
         MirInst::Aggregate { name, value } => {
-            h_aggregate(interp, regs, *value, name)?;
+            effects.push(h_aggregate(regs, *value, name));
             Ok(Flow::Continue)
         }
         MirInst::Rollback => Err("Transaction rolled back".to_string()),
         MirInst::Commit => Ok(Flow::Continue),
         MirInst::Worker { name: _, body } => {
-            h_worker(interp, env, body)?;
+            h_worker(interp, env, body, effects)?;
             Ok(Flow::Continue)
         }
         MirInst::Observe { config: _, body } => {
-            h_observe(interp, env, body)?;
+            h_observe(interp, env, body, effects)?;
             Ok(Flow::Continue)
         }
         MirInst::Span { name: _, body } => {
-            h_span(interp, env, body)?;
+            h_span(interp, env, body, effects)?;
             Ok(Flow::Continue)
         }
         MirInst::Save { path, value } => {
-            h_save(interp, env, regs, *path, *value)?;
+            h_save(interp, env, regs, *path, *value, effects)?;
             Ok(Flow::Continue)
         }
         MirInst::Load { path, var } => {
-            h_load(interp, env, regs, *path, var)?;
+            h_load(interp, env, regs, *path, var, effects)?;
             Ok(Flow::Continue)
         }
         MirInst::ReadFile { path, var } => {
-            h_read_file(interp, env, regs, *path, var)?;
+            h_read_file(interp, env, regs, *path, var, effects)?;
             Ok(Flow::Continue)
         }
         MirInst::WriteFile { path, content } => {
-            h_write_file(interp, env, regs, *path, *content)?;
+            h_write_file(interp, env, regs, *path, *content, effects)?;
             Ok(Flow::Continue)
         }
         MirInst::AppendFile { path, content } => {
-            h_append_file(interp, env, regs, *path, *content)?;
+            h_append_file(interp, env, regs, *path, *content, effects)?;
             Ok(Flow::Continue)
         }
         MirInst::ReadBytesFile { path, var } => {
-            h_read_bytes_file(interp, env, regs, *path, var)?;
+            h_read_bytes_file(interp, env, regs, *path, var, effects)?;
             Ok(Flow::Continue)
         }
         MirInst::WriteBytesFile { path, content } => {
-            h_write_bytes_file(interp, env, regs, *path, *content)?;
+            h_write_bytes_file(interp, env, regs, *path, *content, effects)?;
             Ok(Flow::Continue)
         }
         MirInst::TraitDef {
@@ -654,7 +655,7 @@ pub fn dispatch(
             result_var,
             kind,
         } => {
-            h_orchestrate(interp, env, input_var, result_var, kind)?;
+            h_orchestrate(interp, env, input_var, result_var, kind, effects)?;
             Ok(Flow::Continue)
         }
         MirInst::Eval {
@@ -691,11 +692,11 @@ pub fn dispatch(
             Ok(Flow::Continue)
         }
         MirInst::PromptSection { name: _, body } => {
-            h_prompt_section(interp, env, body)?;
+            h_prompt_section(interp, env, body, effects)?;
             Ok(Flow::Continue)
         }
         MirInst::DocumentSection { name: _, body } => {
-            h_document_section(interp, env, body)?;
+            h_document_section(interp, env, body, effects)?;
             Ok(Flow::Continue)
         }
 

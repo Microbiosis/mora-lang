@@ -14,8 +14,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::common::Span;
-use crate::mir::expr::BuiltinOp;
-use crate::mir::witness::{MirWitness, WitnessArm, WitnessCallee, WitnessKind, WitnessParam};
+use crate::mir::witness::{BuiltinOp, MirWitness, WitnessArm, WitnessCallee, WitnessKind, WitnessParam};
 use crate::typeck::Type;
 
 mod builtin; // v0.75.70: builtin 类型推断（自 mod.rs 拆出）

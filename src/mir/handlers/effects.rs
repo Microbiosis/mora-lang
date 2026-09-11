@@ -179,8 +179,8 @@ pub fn h_app_def(args: AppDefArgs) {
         update_closure.clone(),
         view_closure.clone(),
     );
-    // v0.84 Phase 4: 自动执行 init closure 获取初始 model
-    let _ = app.initialize(interp);
+    // v0.84 Phase 4: 自动执行 init closure 获取初始 model（v0.94: 纯转换返回新 app）
+    let app = app.initialized(interp);
     // 注册到 env：app + 三个独立闭包（供 builtin tea.* 通过 name 调用）
     env.define(
         name.to_string(),
@@ -206,8 +206,13 @@ pub fn h_app_def(args: AppDefArgs) {
     let _ = (model_name, msg_name);
 }
 
-pub fn h_import(interp: &mut dyn MirHost, env: &mut Environment, path: &str) -> Result<(), String> {
-    interp.mir_import(path, env)?;
+pub fn h_import(
+    interp: &mut dyn MirHost,
+    env: &mut Environment,
+    path: &str,
+    effects: &mut crate::mir::effect::Effects,
+) -> Result<(), String> {
+    interp.mir_import(path, env, effects)?;
     Ok(())
 }
 
@@ -218,6 +223,7 @@ pub fn h_with_config(
     bindings: &[(String, Reg)],
     body: &MirFunction,
     jit: bool,
+    effects: &mut crate::mir::effect::Effects,
 ) -> Result<(), String> {
     let binding_vals: Vec<(String, Value)> = bindings
         .iter()
@@ -237,12 +243,12 @@ pub fn h_with_config(
                     e
                 );
                 // v0.75.9: 包裹 Arc 走全局 DAG 缓存
-                run_mir(&std::sync::Arc::new((*body).clone()), interp, &mut child_env)?
+                run_mir(&std::sync::Arc::new((*body).clone()), interp, &mut child_env, effects)?
             }
         }
     } else {
         // v0.75.9: 包裹 Arc 走全局 DAG 缓存
-        run_mir(&std::sync::Arc::new((*body).clone()), interp, &mut child_env)?
+        run_mir(&std::sync::Arc::new((*body).clone()), interp, &mut child_env, effects)?
     };
     interp.mir_restore_config();
     Ok(())
@@ -267,6 +273,7 @@ pub fn h_perform(
     effect: &str,
     args: &[Reg],
     interp: &mut dyn crate::mir::host::MirHost,
+    effects: &mut crate::mir::effect::Effects,
 ) -> Result<(), String> {
     let arg_vals: Vec<Value> = args.iter().map(|r| regs[*r].clone()).collect();
     // v0.83: 录制 Cmd 事件（perform 是 Cmd::Perform 的运行时派发）
@@ -274,7 +281,7 @@ pub fn h_perform(
         // 用 Event::Msg 暂存 perform 事件（channel = effect label）
         rec.record_msg(effect.to_string(), Value::List(arg_vals.clone()), 0);
     }
-    match interp.perform_effect(effect, arg_vals) {
+    match interp.perform_effect(effect, arg_vals, effects) {
         Some(reply) => {
             regs[dst] = reply;
             Ok(())
@@ -296,6 +303,7 @@ pub fn h_handle(
     handler: &crate::mir::MirFunction,
     k_param: &str,
     k_dst: Reg,
+    effects: &mut crate::mir::effect::Effects,
 ) -> Result<(), String> {
     // 1. 保存当前 handler（嵌套 handle 栈）
     let prev_handler = interp.take_effect_handler(effect);
@@ -312,10 +320,14 @@ pub fn h_handle(
         }),
     );
 
-    // 3. 执行 body（独立 env 克隆）
-    let mut body_env = env.clone();
+    // 3. 执行 body —— handle body 与 `if` 一样**不创建新作用域**
+    //    （spec §6.2：只有 task/fn/with/for 建新作用域）。直接在同一个 `env`
+    //    上执行：env 作为线性值穿线，无共享 cell、无克隆回写。body 内对既有
+    //    绑定的 `assign` 因此自然回流外层 —— 这正是「用数据流代替状态机」。
+    //    （此前用 `env.clone()` 起独立子环境再丢弃，只靠每绑定 Arc<Mutex>
+    //    的写穿才让外层赋值可见，是隐式的共享可变状态。）
     let body_arc = std::sync::Arc::new(body.clone());
-    let result = crate::mir::vm::run_mir(&body_arc, interp, &mut body_env);
+    let result = crate::mir::vm::run_mir(&body_arc, interp, env, effects);
 
     // 4. 恢复 handler（无论 body 成功/失败）
     interp.restore_effect_handler(effect.to_string(), prev_handler);

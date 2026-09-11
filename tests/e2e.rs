@@ -276,17 +276,21 @@ fn e2e_tea_runtime_compiles() {
     // 验证 TeaApp/TeaCmd/TeaMsg 类型在 VM 中可构造和操作
     // （Runtime 通过 builtin tea.* 暴露，E2E 暂用 unit tests 覆盖）
     use mora::tea::{Cmd, Msg, TeaApp};
+    // v0.94: TeaApp 是纯值 —— with_model/dispatch 返回新 app，run_loop 返回新 app。
     let app = TeaApp::new(
         mora::value::Value::Nil,
         mora::value::Value::Nil,
         mora::value::Value::Nil,
-    );
-    app.set_model(mora::value::Value::Int(42));
+    )
+    .with_model(mora::value::Value::Int(42))
+    .dispatch(Msg::new("Test", mora::value::Value::Nil));
     assert_eq!(app.model(), mora::value::Value::Int(42));
-    app.dispatch(Msg::new("Test", mora::value::Value::Nil));
-    // v0.83: run_loop 现在需要 MirHost context —— 用 Interpreter::new() 注入
+    // v0.83: run_loop 需要 MirHost context —— 用 Interpreter::new() 注入
     let mut interp = mora::interpreter::Interpreter::new();
-    assert_eq!(app.run_loop(10, &mut interp), mora::value::Value::Int(42));
+    assert_eq!(
+        app.run_loop(10, &mut interp).model(),
+        mora::value::Value::Int(42)
+    );
     let cmd = Cmd::None;
     let _ = cmd.to_value();
 }

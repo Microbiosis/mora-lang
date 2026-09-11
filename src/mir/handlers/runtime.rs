@@ -27,10 +27,11 @@ pub(super) fn run_isolated(
     interp: &mut dyn MirHost,
     env: &mut Environment,
     body: &MirFunction,
+    effects: &mut crate::mir::effect::Effects,
 ) -> Result<(crate::value::Value, Vec<crate::value::Conflict>), String> {
     let mut child_env = env.clone();
     // v0.75.9: 包裹 Arc 走全局 DAG 缓存
-    let result = run_mir(&std::sync::Arc::new((*body).clone()), interp, &mut child_env)?;
+    let result = run_mir(&std::sync::Arc::new((*body).clone()), interp, &mut child_env, effects)?;
     let strategies = interp.current_merge_strategies();
     let conflicts = match strategies.as_ref() {
         Some(s) => env.merge_from_with_strategies(
@@ -52,9 +53,10 @@ pub(super) fn run_mir_fn(
     interp: &mut dyn MirHost,
     env: &mut Environment,
     func: &MirFunction,
+    effects: &mut crate::mir::effect::Effects,
 ) -> Result<Value, String> {
     let mut inner_env = env.clone();
-    crate::mir::vm::run_mir(&std::sync::Arc::new(func.clone()), interp, &mut inner_env)
+    crate::mir::vm::run_mir(&std::sync::Arc::new(func.clone()), interp, &mut inner_env, effects)
 }
 
 /// Value → f64（router 分数解析；Int/Float 均接受）。
@@ -75,13 +77,14 @@ pub fn h_transaction(
     env: &mut Environment,
     body: &MirFunction,
     compensation: &MirFunction,
+    effects: &mut crate::mir::effect::Effects,
 ) -> Result<super::Flow, String> {
-    match run_isolated(interp, env, body) {
+    match run_isolated(interp, env, body, effects) {
         Ok(_) => Ok(super::Flow::Continue),
         Err(_) => {
             let mut comp_env = env.clone();
             // v0.75.9: 包裹 Arc 走全局 DAG 缓存
-            if let Err(e) = run_mir(&std::sync::Arc::new((*compensation).clone()), interp, &mut comp_env) {
+            if let Err(e) = run_mir(&std::sync::Arc::new((*compensation).clone()), interp, &mut comp_env, effects) {
                 eprintln!("[warn] transaction compensation failed: {}", e);
             }
             Err("Transaction rolled back".to_string())
@@ -93,8 +96,9 @@ pub fn h_worker(
     interp: &mut dyn MirHost,
     env: &mut Environment,
     body: &MirFunction,
+    effects: &mut crate::mir::effect::Effects,
 ) -> Result<(), String> {
-    let _ = run_isolated(interp, env, body)?;
+    let _ = run_isolated(interp, env, body, effects)?;
     Ok(())
 }
 
@@ -102,11 +106,12 @@ pub fn h_observe(
     interp: &mut dyn MirHost,
     env: &mut Environment,
     body: &MirFunction,
+    effects: &mut crate::mir::effect::Effects,
 ) -> Result<(), String> {
     // v0.68: Bug fix — was discarding child_env mutations. Now merges
     // via run_isolated so observability side-effects (trace vars, span
     // markers) are actually visible.
-    let _ = run_isolated(interp, env, body)?;
+    let _ = run_isolated(interp, env, body, effects)?;
     Ok(())
 }
 
@@ -114,9 +119,10 @@ pub fn h_span(
     interp: &mut dyn MirHost,
     env: &mut Environment,
     body: &MirFunction,
+    effects: &mut crate::mir::effect::Effects,
 ) -> Result<(), String> {
     // v0.68: Bug fix — same as h_observe.
-    let _ = run_isolated(interp, env, body)?;
+    let _ = run_isolated(interp, env, body, effects)?;
     Ok(())
 }
 
@@ -124,10 +130,11 @@ pub fn h_prompt_section(
     interp: &mut dyn MirHost,
     env: &mut Environment,
     body: &MirFunction,
+    effects: &mut crate::mir::effect::Effects,
 ) -> Result<(), String> {
     let mut child_env = env.clone();
     // v0.75.9: 包裹 Arc 走全局 DAG 缓存
-    let _ = run_mir(&std::sync::Arc::new((*body).clone()), interp, &mut child_env);
+    let _ = run_mir(&std::sync::Arc::new((*body).clone()), interp, &mut child_env, effects);
     Ok(())
 }
 
@@ -135,10 +142,11 @@ pub fn h_document_section(
     interp: &mut dyn MirHost,
     env: &mut Environment,
     body: &MirFunction,
+    effects: &mut crate::mir::effect::Effects,
 ) -> Result<(), String> {
     let mut child_env = env.clone();
     // v0.75.9: 包裹 Arc 走全局 DAG 缓存
-    let _ = run_mir(&std::sync::Arc::new((*body).clone()), interp, &mut child_env);
+    let _ = run_mir(&std::sync::Arc::new((*body).clone()), interp, &mut child_env, effects);
     Ok(())
 }
 
@@ -152,6 +160,7 @@ pub fn h_save(
     regs: &[Value],
     path: Reg,
     value: Reg,
+    effects: &mut crate::mir::effect::Effects,
 ) -> Result<(), String> {
     let path_str = value_to_string(&regs[path]);
     let value_str = value_to_string(&regs[value]);
@@ -159,6 +168,7 @@ pub fn h_save(
         "file.write_text",
         vec![Value::String(path_str), Value::String(value_str)],
         env,
+        effects,
     )?;
     Ok(())
 }
@@ -169,9 +179,10 @@ pub fn h_load(
     regs: &[Value],
     path: Reg,
     var: &str,
+    effects: &mut crate::mir::effect::Effects,
 ) -> Result<(), String> {
     let path_str = value_to_string(&regs[path]);
-    let content = interp.mir_call_function("file.read_text", vec![Value::String(path_str)], env)?;
+    let content = interp.mir_call_function("file.read_text", vec![Value::String(path_str)], env, effects)?;
     env.define(var.to_string(), content, false);
     Ok(())
 }
@@ -182,9 +193,10 @@ pub fn h_read_file(
     regs: &[Value],
     path: Reg,
     var: &str,
+    effects: &mut crate::mir::effect::Effects,
 ) -> Result<(), String> {
     let path_str = value_to_string(&regs[path]);
-    let content = interp.mir_call_function("file.read_text", vec![Value::String(path_str)], env)?;
+    let content = interp.mir_call_function("file.read_text", vec![Value::String(path_str)], env, effects)?;
     env.define(var.to_string(), content, false);
     Ok(())
 }
@@ -195,6 +207,7 @@ pub fn h_write_file(
     regs: &[Value],
     path: Reg,
     content: Reg,
+    effects: &mut crate::mir::effect::Effects,
 ) -> Result<(), String> {
     let path_str = value_to_string(&regs[path]);
     let content_str = value_to_string(&regs[content]);
@@ -202,6 +215,7 @@ pub fn h_write_file(
         "file.write_text",
         vec![Value::String(path_str), Value::String(content_str)],
         env,
+        effects,
     )?;
     Ok(())
 }
@@ -212,6 +226,7 @@ pub fn h_append_file(
     regs: &[Value],
     path: Reg,
     content: Reg,
+    effects: &mut crate::mir::effect::Effects,
 ) -> Result<(), String> {
     let path_str = value_to_string(&regs[path]);
     let content_str = value_to_string(&regs[content]);
@@ -219,6 +234,7 @@ pub fn h_append_file(
         "file.append_text",
         vec![Value::String(path_str), Value::String(content_str)],
         env,
+        effects,
     )?;
     Ok(())
 }
@@ -229,9 +245,10 @@ pub fn h_read_bytes_file(
     regs: &[Value],
     path: Reg,
     var: &str,
+    effects: &mut crate::mir::effect::Effects,
 ) -> Result<(), String> {
     let path_str = value_to_string(&regs[path]);
-    let bytes = interp.mir_call_function("file.read_bytes", vec![Value::String(path_str)], env)?;
+    let bytes = interp.mir_call_function("file.read_bytes", vec![Value::String(path_str)], env, effects)?;
     env.define(var.to_string(), bytes, false);
     Ok(())
 }
@@ -242,6 +259,7 @@ pub fn h_write_bytes_file(
     regs: &[Value],
     path: Reg,
     content: Reg,
+    effects: &mut crate::mir::effect::Effects,
 ) -> Result<(), String> {
     let path_str = value_to_string(&regs[path]);
     let content_val = regs[content].clone();
@@ -249,6 +267,7 @@ pub fn h_write_bytes_file(
         "file.write_bytes",
         vec![Value::String(path_str), content_val],
         env,
+        effects,
     )?;
     Ok(())
 }
@@ -257,48 +276,39 @@ pub fn h_write_bytes_file(
 // Orchestrate / Eval
 // ============================================================
 
+/// v0.93: **纯生产者** —— 返回 `Effect` 值而非改写宿主状态。
+/// 调用方（dispatch）把返回值 push 进显式 `Effects` 累加器。
 pub fn h_send(
     interp: &mut dyn MirHost,
     regs: &[Value],
     value: Reg,
     target: &str,
-) -> Result<(), String> {
+) -> crate::mir::effect::Effect {
     let val = regs[value].clone();
-    // v0.69: Push to dynamic_sends buffer. h_orchestrate flushes this into
-    // the BSP engine's pending_sends before each super-step, so the message
-    // reaches its target_node in the next super-step.
-    // v0.70: Removed crossbeam worker_channels fallback (was dead code).
-    interp.dynamic_sends().push(crate::checkpoint::SendTask {
-        target_node: target.to_string(),
-        input: val.clone(),
-    });
-    // v0.83: 录制 Msg 事件 — 发送 BSP 消息本身也是 TEA-style 应用层事件
+    // v0.83: 录制 Msg 事件 — 发送 BSP 消息本身也是 TEA-style 应用层事件。
+    // （recorder 是 TEA 录制通道，与 BSP 效应累加器正交。）
     if let Some(rec) = interp.recorder_mut() {
         // prior_state_hash 用 sys time 简化（完整实现见 src/tea/replay.rs）
-        rec.record_msg(target.to_string(), val, 0);
+        rec.record_msg(target.to_string(), val.clone(), 0);
     }
-    Ok(())
+    // v0.70: Removed crossbeam worker_channels fallback (was dead code).
+    crate::mir::effect::Effect::Send(crate::checkpoint::SendTask {
+        target_node: target.to_string(),
+        input: val,
+    })
 }
 
 /// v0.71: Contribute a value to a per-super-step aggregator.
 /// Currently a no-op when no Pregel run is active (aggregators are BSP-only).
-pub fn h_aggregate(
-    interp: &mut dyn MirHost,
-    regs: &[Value],
-    value: Reg,
-    name: &str,
-) -> Result<(), String> {
-    // v0.75.83: 向 per-super-step 聚合器贡献值。agent 无法直接访问引擎，
-    // 经 MirHost 缓冲提交（与 h_send → dynamic_sends 同构）；Pregel 引擎
-    // 超步末 mem::take 收集并经 aggregator_contribute 归约，结果以
-    // aggregator_<name> channel 暴露给下一超步。
-    interp
-        .aggregator_contributions()
-        .push(crate::mir::orchestrate::AggregatorContribution {
-            name: name.to_string(),
-            value: regs[value].clone(),
-        });
-    Ok(())
+/// v0.93: **纯生产者** —— 返回 `Effect` 值而非改写宿主状态。
+/// 与 h_send 同构：此前 push 到宿主可变缓冲，导致并行 worker 克隆宿主的
+/// 贡献被静默丢弃（正确性缺陷）；现改为返回值，由 dispatch 折叠进显式
+/// `Effects`，worker 边界统一 merge。
+pub fn h_aggregate(regs: &[Value], value: Reg, name: &str) -> crate::mir::effect::Effect {
+    crate::mir::effect::Effect::Contribute(crate::mir::orchestrate::AggregatorContribution {
+        name: name.to_string(),
+        value: regs[value].clone(),
+    })
 }
 
 pub fn h_eval(
@@ -343,6 +353,7 @@ pub fn h_orchestrate(
     input_var: &str,
     result_var: &str,
     kind: &crate::mir::orchestrate::MirOrchestrateKind,
+    effects: &mut crate::mir::effect::Effects,
 ) -> Result<(), String> {
     match kind {
         crate::mir::orchestrate::MirOrchestrateKind::Pregel {
@@ -363,7 +374,7 @@ pub fn h_orchestrate(
                 aggregators: Vec::new(),
                 master_compute: None,
             };
-            run_pregel_config(interp, env, config, input_var, result_var)
+            run_pregel_config(interp, env, config, input_var, result_var, effects)
         }
         // v0.75.84: MoA（Mixture-of-Agents，arXiv:2406.04692）— 展开为
         // pregel 图：每层 L = [N 个 proposer 并行 ai.chat] → [聚合 agent
@@ -375,12 +386,12 @@ pub fn h_orchestrate(
             layers,
             proposers,
             aggregator,
-            prompt,
+            prompt: _,
             prompt_fn,
             ..
         } => {
-            let config = build_moa_config(*layers, proposers, aggregator, prompt, prompt_fn, input_var)?;
-            run_pregel_config(interp, env, config, input_var, result_var)
+            let config = build_moa_config(*layers, proposers, aggregator, prompt_fn, input_var)?;
+            run_pregel_config(interp, env, config, input_var, result_var, effects)
         }
         // v0.75.85: MoE（Mixture-of-Experts，Shazeer 2017 稀疏门控）— 单轮
         // 线性流程：router 打分 → top-k 稀疏激活 → 专家执行 → 加权组合。
@@ -402,6 +413,7 @@ pub fn h_orchestrate(
             prompt_fn,
             input_var,
             result_var,
+            effects,
         ),
         crate::mir::orchestrate::MirOrchestrateKind::Sequential { agents } => {
             // v0.75.34: Sequential orchestrate 执行 — 按声明顺序逐个执行
@@ -426,6 +438,7 @@ pub fn h_orchestrate(
                     &std::sync::Arc::new(agent.task_body.clone()),
                     interp,
                     &mut agent_env,
+                    effects,
                 )?;
                 // agent 期间 define 的变量合并回父 env（与 pregel 引擎
                 // reconcile_outcome 的写回语义一致）。
@@ -439,7 +452,79 @@ pub fn h_orchestrate(
             env.define(result_var.to_string(), result, false);
             Ok(())
         }
-        other => Err(format!("orchestrate({:?}) not yet supported", other)),
+        // v0.92: Graph orchestrate — 图执行。Graph 语义即 pregel 图（agents
+        // 为顶点、edges 为静态边），直接映射到 pregel 配置复用 BSP 引擎：
+        // 每超步按边传播消息、顶点 task_body 执行、vote_to_halt 收敛。
+        // 与 Pregel 变体的唯一区别：无 state_schema/checkpoint/interrupt。
+        crate::mir::orchestrate::MirOrchestrateKind::Graph { agents, edges } => {
+            let config = crate::mir::orchestrate::MirPregelConfig {
+                agents: agents.clone(),
+                edges: edges.clone(),
+                state_schema: Vec::new(),
+                checkpoint: None,
+                interrupt_points: Vec::new(),
+                adjacency: HashMap::new(),
+                aggregators: Vec::new(),
+                master_compute: None,
+            };
+            run_pregel_config(interp, env, config, input_var, result_var, effects)
+        }
+        // v0.92: Loop orchestrate — 迭代执行：agents 按序执行，每轮输出作为
+        // 下一轮输入；`exit_when` 条件为真或达到 `rounds` 上限时停止。
+        // rounds 缺省为 1000（与解析器 MirrorOrchestrateKind::Loop 一致）。
+        crate::mir::orchestrate::MirOrchestrateKind::Loop {
+            agents,
+            rounds,
+            exit_when,
+        } => {
+            let max_rounds = rounds.unwrap_or(1000);
+            let mut input_val = env.get(input_var).unwrap_or(Value::Nil);
+            let mut result = Value::Nil;
+            for _round in 0..max_rounds {
+                for agent in agents {
+                    if agent.task_body.body.is_empty() && agent.task_body.n_regs == 0 {
+                        return Err(format!(
+                            "orchestrate loop: agent '{}' has empty task_body (lowering missing)",
+                            agent.name
+                        ));
+                    }
+                    let mut agent_env = env.clone();
+                    agent_env.define("input".to_string(), input_val.clone(), false);
+                    agent_env.clock.tick(&agent.name);
+                    result = crate::mir::vm::run_mir(
+                        &std::sync::Arc::new(agent.task_body.clone()),
+                        interp,
+                        &mut agent_env,
+                        effects,
+                    )?;
+                    for (name, val) in agent_env.iter() {
+                        if env.get(&name).is_none() {
+                            env.define(name, val, false);
+                        }
+                    }
+                    input_val = result.clone();
+                }
+                // 退出条件：exit_when 求值为真时提前结束。
+                if let Some(cond_w) = exit_when {
+                    let mut cond_env = env.clone();
+                    cond_env.define("input".to_string(), input_val.clone(), false);
+                    cond_env.define(result_var.to_string(), result.clone(), false);
+                    let cond_body =
+                        crate::mir::lower::lower_block_witness_to_mir(cond_w);
+                    let cond_val = crate::mir::vm::run_mir(
+                        &std::sync::Arc::new(cond_body),
+                        interp,
+                        &mut cond_env,
+                        effects,
+                    )?;
+                    if crate::flow::is_truthy(&cond_val) {
+                        break;
+                    }
+                }
+            }
+            env.define(result_var.to_string(), result, false);
+            Ok(())
+        }
     }
 }
 
@@ -462,6 +547,7 @@ fn run_moe(
     prompt_fn: &MirFunction,
     input_var: &str,
     result_var: &str,
+    effects: &mut crate::mir::effect::Effects,
 ) -> Result<(), String> {
     if experts.is_empty() {
         return Err("moe: experts must not be empty".to_string());
@@ -473,8 +559,8 @@ fn run_moe(
     let input_val = env.get(input_var).unwrap_or(Value::Nil);
 
     // 1. router 执行（语言面 fn）→ 分数 dict
-    let router_val = run_mir_fn(interp, env, router_fn)?;
-    let scores = match interp.call_value(&router_val, vec![input_val.clone()])? {
+    let router_val = run_mir_fn(interp, env, router_fn, effects)?;
+    let scores = match interp.call_value(&router_val, vec![input_val.clone()], effects)? {
         Value::Dict(d) => d,
         other => {
             return Err(format!(
@@ -509,7 +595,7 @@ fn run_moe(
             .iter()
             .find(|e| &e.name == name)
             .ok_or_else(|| format!("moe: router referenced unknown expert '{}'", name))?;
-        let out = run_moe_expert(interp, env, expert, &input_val, prompt_fn)?;
+        let out = run_moe_expert(interp, env, expert, &input_val, prompt_fn, effects)?;
         score_sum += *score;
         outputs.push((name.clone(), *score, out));
     }
@@ -527,14 +613,15 @@ fn run_moe_expert(
     expert: &crate::mir::orchestrate::MirMoeExpert,
     input_val: &Value,
     prompt_fn: &MirFunction,
+    effects: &mut crate::mir::effect::Effects,
 ) -> Result<Value, String> {
-    let def_val = run_mir_fn(interp, env, &expert.def_fn)?;
+    let def_val = run_mir_fn(interp, env, &expert.def_fn, effects)?;
     match def_val {
         // 函数专家：Closure/Task/Compose/Partial → call_value
         Value::Closure { .. }
         | Value::Task { .. }
         | Value::Compose(_)
-        | Value::Partial(_, _) => interp.call_value(&def_val, vec![input_val.clone()]),
+        | Value::Partial(_, _) => interp.call_value(&def_val, vec![input_val.clone()], effects),
         // 模型专家：{model: "..."} → ai.chat(prompt, {model})
         Value::Dict(d) => {
             let model = match d.get("model") {
@@ -547,7 +634,7 @@ fn run_moe_expert(
                 }
             };
             // prompt 函数 → 值（含 {input} 插值，经 env 的 input 变量）
-            let prompt_val = run_mir_fn(interp, env, prompt_fn)?;
+            let prompt_val = run_mir_fn(interp, env, prompt_fn, effects)?;
             let prompt_str = match prompt_val {
                 Value::String(s) => s,
                 other => other.to_string(),
@@ -585,7 +672,7 @@ fn run_moe_expert(
                 ..Default::default()
             };
             let mut expert_env = env.clone();
-            crate::mir::vm::run_mir(&std::sync::Arc::new(body_fn), interp, &mut expert_env)
+            crate::mir::vm::run_mir(&std::sync::Arc::new(body_fn), interp, &mut expert_env, effects)
         }
         other => Err(format!(
             "moe: expert '{}' must be a function or {{model: \"...\"}} dict, got {:?}",
@@ -622,13 +709,14 @@ fn combine_moe_outputs(outputs: &[(String, f64, Value)], score_sum: f64) -> Valu
 
 /// v0.75.84: pregel 图执行公共路径（Pregel / MoA 共用）。
 /// 从 h_orchestrate Pregel 分支提取：checkpoint 恢复、input 通道初始化、
-/// 冲突回调、dynamic_sends flush、run、result 绑定。
+/// 冲突回调、effects flush、run、result 绑定。
 fn run_pregel_config(
     interp: &mut dyn MirHost,
     env: &mut Environment,
     config: crate::mir::orchestrate::MirPregelConfig,
     input_var: &str,
     result_var: &str,
+    effects: &mut crate::mir::effect::Effects,
 ) -> Result<(), String> {
     use crate::pregel::MirPregelEngine;
     let mut engine = MirPregelEngine::new(config);
@@ -672,9 +760,15 @@ fn run_pregel_config(
         true // always continue
     }));
 
-    // v0.69: Flush dynamic_sends into engine before run
-    let pending = std::mem::take(interp.dynamic_sends());
-    engine.flush_pending_sends(pending);
+    // v0.93: 调用方在 orchestrate 语句之前累积的 send 先注入引擎
+    // （跨超步投递）。aggregator 贡献是 per-super-step 作用域 —— 引擎 run()
+    // 每个超步开始都会把 acc 重置为 config 初值，故启动前的贡献无归属超步，
+    // 按既有语义不投递（aggregate 只在 agent 体内执行，天然属于某个超步）。
+    let pending = std::mem::take(effects);
+    engine.flush_pending_sends(pending.sends);
+    // 引擎内部（agent 体 + 条件求值 + combiner + master_compute）各自持有
+    // 私有 Effects 并就地折叠进引擎状态（apply_effects）；orchestrate 语句
+    // 本身不再向调用方传播 BSP 内部效应（send/aggregate 是引擎内部原语）。
     let result = engine.run(interp)?;
 
     // v0.62: Expose conflicts as a structured list
@@ -705,7 +799,6 @@ fn build_moa_config(
     layers: usize,
     proposers: &[String],
     aggregator: &str,
-    prompt: &crate::mir::expr::MirExpr,
     prompt_fn: &MirFunction,
     input_var: &str,
 ) -> Result<crate::mir::orchestrate::MirPregelConfig, String> {
@@ -715,6 +808,15 @@ fn build_moa_config(
     if layers == 0 {
         return Err("moa: layers must be >= 1".to_string());
     }
+
+    // v0.92: task_expr 字段类型为 MirWitness；此处不依赖具体
+    // 表达式内容（实际执行走 task_body），传 Nil 占位。
+    let placeholder_expr = crate::mir::witness::MirWitness {
+        kind: crate::mir::witness::WitnessKind::Literal(crate::common::Literal::Nil(
+            crate::common::Span::new(0, 0),
+        )),
+        span: crate::common::Span::new(0, 0),
+    };
 
     let mut agents = Vec::new();
     let mut edges = Vec::new();
@@ -726,7 +828,7 @@ fn build_moa_config(
             let body = build_proposer_body(l, i, model, prompt_fn, input_var);
             agents.push(crate::mir::orchestrate::MirAgentDef {
                 name: pname.clone(),
-                task_expr: prompt.clone(),
+                task_expr: placeholder_expr.clone(),
                 verify_expr: None,
                 with_config: None,
                 task_body: body,
@@ -757,7 +859,7 @@ fn build_moa_config(
         let body = build_aggregator_body(l, aggregator, proposers.len());
         agents.push(crate::mir::orchestrate::MirAgentDef {
             name: aname.clone(),
-            task_expr: prompt.clone(),
+            task_expr: placeholder_expr.clone(),
             verify_expr: None,
             with_config: None,
             task_body: body,

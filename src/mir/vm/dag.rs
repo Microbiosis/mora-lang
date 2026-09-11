@@ -125,6 +125,7 @@ pub fn run_dag_with_signal_memo(
     memo: &mut DagExecMemo,
     interp: &mut dyn MirHost,
     env: &mut Environment,
+    effects: &mut crate::mir::effect::Effects,
 ) -> Result<(MirSignal, Value), String> {
     use MirSignal;
     let task_registry = build_task_registry(&func.body);
@@ -224,7 +225,7 @@ pub fn run_dag_with_signal_memo(
                         continue;
                     }
 
-                    let flow = handlers::dispatch(inst, &mut regs, interp, env, &task_registry)?;
+                    let flow = handlers::dispatch(inst, &mut regs, interp, env, &task_registry, effects)?;
                     if pure {
                         if let Some(d) = inst.dst() {
                             memo.record(node_id, inputs, regs[d].clone());
@@ -321,11 +322,12 @@ pub fn run_mir_dag(
     func: &Arc<MirFunction>,
     interp: &mut dyn MirHost,
     env: &mut Environment,
+    effects: &mut crate::mir::effect::Effects,
 ) -> Result<Value, String> {
     let dag = crate::mir::dag::dag_analyze(func);
-    let val = run_dag(&dag, func, interp, env)?;
+    let val = run_dag(&dag, func, interp, env, effects)?;
     if func.body.iter().any(|i| matches!(i, MirInst::TaskDef { name, params, .. } if name == "main" && params.is_empty())) {
-        run_main_task(func, interp, env)?;
+        run_main_task(func, interp, env, effects)?;
     }
     Ok(val)
 }
@@ -335,8 +337,9 @@ pub fn run_dag(
     func: &MirFunction,
     interp: &mut dyn MirHost,
     env: &mut Environment,
+    effects: &mut crate::mir::effect::Effects,
 ) -> Result<Value, String> {
-    Ok(run_dag_with_signal(dag, func, interp, env)?.1)
+    Ok(run_dag_with_signal(dag, func, interp, env, effects)?.1)
 }
 
 /// v0.75: `run_dag` 的信号感知变体。
@@ -352,8 +355,9 @@ pub fn run_dag_with_signal(
     func: &MirFunction,
     interp: &mut dyn MirHost,
     env: &mut Environment,
+    effects: &mut crate::mir::effect::Effects,
 ) -> Result<(MirSignal, Value), String> {
-    run_dag_with_signal_memo(dag, func, &mut DagExecMemo::new(), interp, env)
+    run_dag_with_signal_memo(dag, func, &mut DagExecMemo::new(), interp, env, effects)
 }
 
 fn node_ready(node: &MirDagNode, reg_ready: &[bool]) -> bool {

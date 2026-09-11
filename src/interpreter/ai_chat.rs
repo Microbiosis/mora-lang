@@ -724,7 +724,8 @@ impl Interpreter {
                     } else {
                         Value::String(tc.arguments.clone())
                     };
-                    match self.call_value(handler_val, vec![args_dict]) {
+                    let mut tool_effects = crate::mir::effect::Effects::new();
+                    match self.call_value(handler_val, vec![args_dict], &mut tool_effects) {
                         Ok(val) => val.to_string(),
                         Err(e) => format!("Error: {}", e),
                     }
@@ -858,7 +859,8 @@ suggestion: <improvement suggestion or "none">"#,
             );
             if let Some(first_tool) = agent_tools.first() {
                 let args_dict = Value::Dict(HashMap::new());
-                let tool_result = match self.call_value(&first_tool.handler, vec![args_dict]) {
+                let mut tool_effects = crate::mir::effect::Effects::new();
+                let tool_result = match self.call_value(&first_tool.handler, vec![args_dict], &mut tool_effects) {
                     Ok(val) => val.to_string(),
                     Err(e) => format!("Tool error: {}", e),
                 };

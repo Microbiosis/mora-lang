@@ -1,8 +1,8 @@
-//! v0.20: 从 interpreter.rs 抽离的自由函数。
+//! v0.20: 自由函数（自 interpreter.rs 抽出）。
 //!
-//! **Move-only refactor** — code copied verbatim from src/interpreter.rs
-//! No signature changes, no field changes, no visibility changes.
-//! Re-exported in interpreter.rs via `use crate::flow::*;`
+//! **Move-only refactor** — 代码自 src/interpreter.rs **迁移**（非复制）：
+//! interpreter.rs 不再持有这些函数的副本，而是通过 `use crate::flow::*`
+//! 重新导出。此处是唯一定义点。
 
 use crate::common::{BinaryOp, Literal};
 use crate::error::MoraError;

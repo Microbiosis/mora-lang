@@ -20,6 +20,7 @@ pub fn h_match_expr(
     regs: &mut [Value],
     val: Reg,
     arms: &[(String, Option<Reg>, Box<MirFunction>, Reg)],
+    effects: &mut crate::mir::effect::Effects,
 ) -> Result<(), String> {
     let val_val = regs[val].clone();
     let mut matched = false;
@@ -30,7 +31,7 @@ pub fn h_match_expr(
         if let Some(guard) = cond_reg && !is_truthy(&regs[*guard]) {
             continue;
         }
-        let result = run_mir(&std::sync::Arc::new((**arm_func).clone()), interp, env)?;
+        let result = run_mir(&std::sync::Arc::new((**arm_func).clone()), interp, env, effects)?;
         regs[*output_reg] = result;
         matched = true;
         break;

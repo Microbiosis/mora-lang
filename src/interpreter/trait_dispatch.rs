@@ -60,6 +60,7 @@ impl Interpreter {
         method: &str,
         args: Vec<Value>,
         call_site: Span,
+        effects: &mut crate::mir::effect::Effects,
     ) -> Result<Value, String> {
         let (for_type, for_generics, trait_name, trait_generics) = match receiver {
             Value::TraitObject {
@@ -106,7 +107,7 @@ impl Interpreter {
                     Vec::new()
                 };
                 all_args.extend(args);
-                return self.call_value(&task, all_args);
+                return self.call_value(&task, all_args, effects);
             }
             drop(env);
 
@@ -121,7 +122,7 @@ impl Interpreter {
                     Vec::new()
                 };
                 all_args.extend(args);
-                return self.call_value(&task, all_args);
+                return self.call_value(&task, all_args, effects);
             }
             drop(env);
         }

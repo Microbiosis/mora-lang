@@ -402,12 +402,22 @@ fn run_file(path: &str, opt_level: Option<mora::mir::ssa::OptLevel>) {
     let mut env = interpreter.take_env();
     // v0.75.9: 包裹 Arc 走全局 DAG 缓存（run_mir + run_main_task 共享同一项）
     let func_arc = std::sync::Arc::new(func);
-    if let Err(e) = mora::mir::vm::run_mir(&func_arc, &mut interpreter, &mut env) {
+    if let Err(e) = mora::mir::vm::run_mir(
+        &func_arc,
+        &mut interpreter,
+        &mut env,
+        &mut mora::mir::effect::Effects::new(),
+    ) {
         eprintln!("Runtime error (MIR): {}", e);
         process::exit(1);
     }
     // 执行完顶层语句后查找并调用 main task
-    if let Err(e) = mora::mir::vm::run_main_task(&func_arc, &mut interpreter, &mut env) {
+    if let Err(e) = mora::mir::vm::run_main_task(
+        &func_arc,
+        &mut interpreter,
+        &mut env,
+        &mut mora::mir::effect::Effects::new(),
+    ) {
         eprintln!("Runtime error (MIR main): {}", e);
         process::exit(1);
     }

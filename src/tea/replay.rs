@@ -37,6 +37,8 @@ pub fn replay_tea_app(app: &TeaApp, recorder: &Recorder) -> ReplayResult {
         mutation_count: 0,
         warnings: Vec::new(),
     };
+    // v0.94: app 是纯值 —— 本地持有推进后的版本（dispatch 返回新 app）。
+    let mut app = app.clone();
 
     for ev in recorder.events() {
         match ev {
@@ -57,9 +59,9 @@ pub fn replay_tea_app(app: &TeaApp, recorder: &Recorder) -> ReplayResult {
             }
             Event::Msg { channel, payload, .. } => {
                 result.msg_count += 1;
-                // 尝试把 Msg dispatch 到 TeaApp
+                // 尝试把 Msg dispatch 到 TeaApp（纯推进，结果留待后续 fold）
                 match Msg::from_value(payload) {
-                    Ok(msg) => app.dispatch(msg),
+                    Ok(msg) => app = app.dispatch(msg),
                     Err(e) => result.warnings.push(format!(
                         "replay: failed to parse Msg payload on channel '{}': {}",
                         channel, e
@@ -96,7 +98,7 @@ mod tests {
         let app = TeaApp::new(Value::Nil, Value::Nil, Value::Nil);
         let mut model = std::collections::HashMap::new();
         model.insert("count".to_string(), Value::Int(0));
-        app.set_model(Value::Dict(model));
+        let app = app.with_model(Value::Dict(model));
 
         let path = tmp_path("state_mut");
         let mut r = Recorder::new_record(path.clone()).unwrap();
@@ -141,7 +143,7 @@ mod tests {
     #[test]
     fn replay_handles_empty_recorder() {
         let app = TeaApp::new(Value::Nil, Value::Nil, Value::Nil);
-        app.set_model(Value::Int(42));
+        let app = app.with_model(Value::Int(42));
         let r = Recorder::new_off();
         let result = replay_tea_app(&app, &r);
         assert_eq!(result.mutation_count, 0);

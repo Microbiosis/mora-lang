@@ -14,9 +14,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::checkpoint::{Checkpoint, CheckpointSaver, SendTask};
+use crate::checkpoint::{Checkpoint, CheckpointSaver};
 use crate::common::trait_info::TraitInfo;
-use crate::mir::expr::AggregatorContribution;
 use crate::value::{Environment, MergeStrategy, Value};
 
 /// MIR 解释器执行所需的宿主能力。
@@ -26,11 +25,14 @@ pub trait MirHost {
     /// 函数调用桥（`h_call` task 分支之外的用户函数/builtin 调用）。
     /// `env` 为当前执行环境（call_function 兜底查找用户函数的单一来源——
     /// v0.75.76：不查询宿主全局环境，杜绝 take_env 空壳造成的双环境分歧）。
+    /// v0.93: `effects` 是显式效应累加器 —— 嵌套调用（闭包/task/macro）产生的
+    /// send/aggregate 经它向上传播，不再依赖宿主侧信道。
     fn mir_call_function(
         &mut self,
         name: &str,
         args: Vec<Value>,
         env: &Environment,
+        effects: &mut crate::mir::effect::Effects,
     ) -> Result<Value, String>;
     /// 方法调用桥（`h_method_call`）。
     fn mir_call_method(
@@ -38,11 +40,22 @@ pub trait MirHost {
         object: Value,
         method: &str,
         args: Vec<Value>,
+        effects: &mut crate::mir::effect::Effects,
     ) -> Result<Value, String>;
     /// 可调用值调用桥（`h_pipe` 的 `|>` 右操作数）。
-    fn call_value(&mut self, value: &Value, args: Vec<Value>) -> Result<Value, String>;
-    /// 模块导入桥（`h_import`）。
-    fn mir_import(&mut self, path: &str, env: &mut Environment) -> Result<(), String>;
+    fn call_value(
+        &mut self,
+        value: &Value,
+        args: Vec<Value>,
+        effects: &mut crate::mir::effect::Effects,
+    ) -> Result<Value, String>;
+    /// 模块导入桥（`h_import`）。导入执行的模块代码可产生效应。
+    fn mir_import(
+        &mut self,
+        path: &str,
+        env: &mut Environment,
+        effects: &mut crate::mir::effect::Effects,
+    ) -> Result<(), String>;
     /// with 块 config 设置（`h_with_config`）。
     fn mir_with_config(&mut self, bindings: &[(String, Value)]) -> Result<(), String>;
     /// with 块 config 恢复（`h_with_config` 末尾）。
@@ -51,12 +64,6 @@ pub trait MirHost {
     fn current_merge_strategies(&self) -> Option<HashMap<String, MergeStrategy>>;
     /// 当前执行环境（`h_closure` 捕获 / `h_receive` 读消息）。
     fn environment(&self) -> Arc<parking_lot::Mutex<Environment>>;
-    /// BSP send 缓冲（`h_send` push / `h_orchestrate` flush）。
-    fn dynamic_sends(&mut self) -> &mut Vec<SendTask>;
-    /// v0.75.83: BSP 聚合器贡献缓冲（`h_aggregate` push / pregel 超步末
-    /// 收集归约）。与 dynamic_sends 同构 —— agent 无法直接访问引擎，
-    /// 经宿主缓冲提交贡献。
-    fn aggregator_contributions(&mut self) -> &mut Vec<AggregatorContribution>;
     /// checkpoint saver（`h_orchestrate` 注入 Pregel 引擎）。
     fn checkpoint_saver(&self) -> Option<Arc<dyn CheckpointSaver>>;
     /// 从 saver 恢复 checkpoint（`h_orchestrate`）。
@@ -84,7 +91,12 @@ pub trait MirHost {
     // 实现位于 interpreter/mod.rs::Interpreter — 通过 CoreRuntime::effect_handlers
     // HashMap<String, Box<dyn EffectHandler>> 存储。
     // EffectHandler trait 在 src/runtime/effect.rs。
-    fn perform_effect(&mut self, effect: &str, args: Vec<Value>) -> Option<Value>;
+    fn perform_effect(
+        &mut self,
+        effect: &str,
+        args: Vec<Value>,
+        effects: &mut crate::mir::effect::Effects,
+    ) -> Option<Value>;
     fn install_effect_handler(
         &mut self,
         effect: String,

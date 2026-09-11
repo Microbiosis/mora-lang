@@ -1,16 +1,14 @@
 //! v0.75.38: MirWitness — 轻量树骨架（typeck/LSP 消费面）。
 //!
-//! 去 AST 化终局的中间层：ParserV3 最终直接 emit MirInst（阶段 3），
+//! 去 AST 化终局的中间层：ParserV3 直接 emit MirInst（阶段 3），
 //! 但 typeck（HM 推断）与 LSP（folding/semantic/definition/rename）
-//! 需要语法树骨架。`MirWitness` 是镜像 `MirExprKind` 的纯树结构
-//! （kind + span），**无执行语义**——执行永远走 MirInst。
+//! 需要语法树骨架。`MirWitness` 是 canonical 纯树结构（kind + span），
+//! **无执行语义**——执行永远走 MirInst。
 //!
-//! 设计决策（阶段 2 用户确认）：
-//! - **独立 WitnessKind 枚举**（镜像 MirExprKind 全部 30 变体），与
-//!   MirExprKind 并存；阶段 3/4 消除 MirExpr 时 WitnessKind 胜出。
-//! - **captured_env 已随 MirExprKind 删除**（零消费死字段）。
-//! - 转换函数 `from_expr`：MirExpr → MirWitness 递归映射（30 变体
-//!   逐一对应），往返一致性由单元测试锁定。
+//! v0.92: 原 `MirExpr` 平行世界已完全删除。MirWitness 曾是镜像
+//! `MirExprKind` 的产物，如今是唯一的 parse-tree 类型；`from_expr` 等
+//! 前向转换函数已随 MirExpr 一并移除。
+//! - **独立 WitnessKind 枚举**（30 变体，captured_env 已删零消费死字段）。
 //!
 //! 复合类型同步镜像：WitnessCallee（MirCallee）、WitnessArm（MatchArm）、
 //! WitnessParam（Param）、WitnessPattern（Pattern）、WitnessOrchestrateKind
@@ -18,10 +16,7 @@
 
 use crate::common::{BinaryOp, Literal, Span};
 use crate::mir::MirFunction;
-use crate::mir::expr::{
-    MatchArm, MirAgentDef, MirCallee, MirEdgeDef, MirExpr, MirExprKind, MirOrchestrateKind, Param,
-    Pattern,
-};
+use crate::mir::orchestrate::{MirAgentDef, MirEdgeDef, MirOrchestrateKind};
 
 /// 轻量树骨架节点 — kind + span，无执行语义。
 #[derive(Debug, Clone, PartialEq)]
@@ -30,206 +25,7 @@ pub struct MirWitness {
     pub span: Span,
 }
 
-impl MirWitness {
-    /// 递归转换：MirExpr → MirWitness（30 变体逐一映射）。
-    /// 阶段 3 parser 直接产出 witness 前，消费面经此桥接。
-    pub fn from_expr(expr: &MirExpr) -> MirWitness {
-        MirWitness {
-            kind: WitnessKind::from_kind(&expr.kind),
-            span: expr.span,
-        }
-    }
-
-    /// 顶层序列转换辅助。
-    pub fn from_exprs(exprs: &[MirExpr]) -> Vec<MirWitness> {
-        exprs.iter().map(MirWitness::from_expr).collect()
-    }
-}
-
-impl WitnessKind {
-    fn from_kind(kind: &MirExprKind) -> WitnessKind {
-        match kind {
-            MirExprKind::Literal(lit) => WitnessKind::Literal(lit.clone()),
-            MirExprKind::Variable(name) => WitnessKind::Variable(name.clone()),
-            MirExprKind::Binary { left, op, right } => WitnessKind::Binary {
-                left: Box::new(MirWitness::from_expr(left)),
-                op: op.clone(),
-                right: Box::new(MirWitness::from_expr(right)),
-            },
-            MirExprKind::Call { callee, args } => WitnessKind::Call {
-                callee: WitnessCallee::from_callee(callee),
-                args: args.iter().map(MirWitness::from_expr).collect(),
-            },
-            MirExprKind::MethodCall {
-                receiver,
-                method,
-                args,
-            } => WitnessKind::MethodCall {
-                receiver: Box::new(MirWitness::from_expr(receiver)),
-                method: method.clone(),
-                args: args.iter().map(MirWitness::from_expr).collect(),
-            },
-            MirExprKind::Closure { params, body } => WitnessKind::Closure {
-                params: params.iter().map(WitnessParam::from_param).collect(),
-                body: Box::new(MirWitness::from_expr(body)),
-            },
-            MirExprKind::FnDef {
-                name,
-                params,
-                return_type,
-                body,
-            } => WitnessKind::FnDef {
-                name: name.clone(),
-                params: params.iter().map(WitnessParam::from_param).collect(),
-                return_type: return_type
-                    .clone()
-                    .map(crate::mir::hint::TypeHint::from_type),
-                body: Box::new(MirWitness::from_expr(body)),
-            },
-            MirExprKind::Match { scrutinee, arms } => WitnessKind::Match {
-                scrutinee: Box::new(MirWitness::from_expr(scrutinee)),
-                arms: arms.iter().map(WitnessArm::from_arm).collect(),
-            },
-            MirExprKind::If { cond, then, r#else } => WitnessKind::If {
-                cond: Box::new(MirWitness::from_expr(cond)),
-                then: Box::new(MirWitness::from_expr(then)),
-                r#else: r#else.as_ref().map(|e| Box::new(MirWitness::from_expr(e))),
-            },
-            MirExprKind::Loop {
-                var,
-                iterable,
-                body,
-            } => WitnessKind::Loop {
-                var: var.clone(),
-                iterable: Box::new(MirWitness::from_expr(iterable)),
-                body: Box::new(MirWitness::from_expr(body)),
-            },
-            MirExprKind::While { cond, body } => WitnessKind::While {
-                cond: Box::new(MirWitness::from_expr(cond)),
-                body: Box::new(MirWitness::from_expr(body)),
-            },
-            MirExprKind::Or { left, right } => WitnessKind::Or {
-                left: Box::new(MirWitness::from_expr(left)),
-                right: Box::new(MirWitness::from_expr(right)),
-            },
-            MirExprKind::And { left, right } => WitnessKind::And {
-                left: Box::new(MirWitness::from_expr(left)),
-                right: Box::new(MirWitness::from_expr(right)),
-            },
-            MirExprKind::List(items) => {
-                WitnessKind::List(items.iter().map(MirWitness::from_expr).collect())
-            }
-            MirExprKind::Dict(entries) => WitnessKind::Dict(
-                entries
-                    .iter()
-                    .map(|(k, v)| (k.clone(), MirWitness::from_expr(v)))
-                    .collect(),
-            ),
-            MirExprKind::DynTrait {
-                expr,
-                trait_name,
-                generics,
-            } => WitnessKind::DynTrait {
-                expr: Box::new(MirWitness::from_expr(expr)),
-                trait_name: trait_name.clone(),
-                generics: generics
-                    .iter()
-                    .cloned()
-                    .map(crate::mir::hint::TypeHint::from_type)
-                    .collect(),
-            },
-            MirExprKind::Prompt { parts } => WitnessKind::Prompt {
-                parts: parts.iter().map(MirWitness::from_expr).collect(),
-            },
-            MirExprKind::LetBinding {
-                name,
-                type_hint,
-                value,
-                init_body,
-            } => WitnessKind::LetBinding {
-                name: name.clone(),
-                type_hint: type_hint.clone().map(crate::mir::hint::TypeHint::from_type),
-                value: Box::new(MirWitness::from_expr(value)),
-                init_body: Box::new(MirWitness::from_expr(init_body)),
-            },
-            MirExprKind::Assign { target, value } => WitnessKind::Assign {
-                target: target.clone(),
-                value: Box::new(MirWitness::from_expr(value)),
-            },
-            MirExprKind::IndexAssign {
-                object,
-                index,
-                value,
-            } => WitnessKind::IndexAssign {
-                object: Box::new(MirWitness::from_expr(object)),
-                index: Box::new(MirWitness::from_expr(index)),
-                value: Box::new(MirWitness::from_expr(value)),
-            },
-            MirExprKind::Return(v) => {
-                WitnessKind::Return(v.as_ref().map(|e| Box::new(MirWitness::from_expr(e))))
-            }
-            MirExprKind::Break(label) => WitnessKind::Break(label.clone()),
-            MirExprKind::Continue(label) => WitnessKind::Continue(label.clone()),
-            MirExprKind::Orchestrate {
-                input_var,
-                result_var,
-                kind,
-            } => WitnessKind::Orchestrate {
-                input_var: input_var.clone(),
-                result_var: result_var.clone(),
-                kind: Box::new(WitnessOrchestrateKind::from_kind(kind)),
-            },
-            MirExprKind::TypeAlias { name, target } => WitnessKind::TypeAlias {
-                name: name.clone(),
-                target: crate::mir::hint::TypeHint::from_type(target.clone()),
-            },
-            MirExprKind::EnumDef { name, variants } => WitnessKind::EnumDef {
-                name: name.clone(),
-                variants: variants.clone(),
-            },
-            MirExprKind::StructDef { name, fields } => WitnessKind::StructDef {
-                name: name.clone(),
-                fields: fields
-                    .iter()
-                    .map(|(n, t)| (n.clone(), crate::mir::hint::TypeHint::from_type(t.clone())))
-                    .collect(),
-            },
-            MirExprKind::Import(path) => WitnessKind::Import(path.clone()),
-            MirExprKind::MacroDef { name, params } => WitnessKind::MacroDef {
-                name: name.clone(),
-                params: params.clone(),
-                body: Box::new(MirWitness {
-                    kind: WitnessKind::Sequence(Vec::new()),
-                    span: Default::default(),
-                }),
-            },
-            // v0.80: algebraic effects witness 转换
-            MirExprKind::Perform { effect, args } => WitnessKind::Perform {
-                effect: effect.clone(),
-                args: args.iter().map(MirWitness::from_expr).collect(),
-            },
-            MirExprKind::Handle {
-                effect,
-                body,
-                handler,
-                k_param,
-            } => WitnessKind::Handle {
-                effect: effect.clone(),
-                body: Box::new(MirWitness::from_expr(body)),
-                handler: Box::new(MirWitness::from_expr(handler)),
-                k_param: k_param.clone(),
-            },
-            MirExprKind::Sequence(exprs) => {
-                WitnessKind::Sequence(exprs.iter().map(MirWitness::from_expr).collect())
-            }
-            MirExprKind::QuasiquoteExpr(segments) => WitnessKind::Quasiquote {
-                segments: segments.iter().map(MirWitness::from_expr).collect(),
-            },
-        }
-    }
-}
-
-/// Witness 树节点种类 — 镜像 MirExprKind 全部 30 变体（captured_env 已删）。
+/// Witness 树节点种类 — 30 变体（captured_env 已删）。
 #[derive(Debug, Clone, PartialEq)]
 pub enum WitnessKind {
     Literal(Literal),
@@ -397,19 +193,17 @@ pub enum WitnessCallee {
     Var(String),
     Method(String, String),
     Evaluated(Box<MirWitness>),
-    Builtin(crate::mir::expr::BuiltinOp),
+    Builtin(BuiltinOp),
 }
 
-impl WitnessCallee {
-    fn from_callee(callee: &MirCallee) -> WitnessCallee {
-        match callee {
-            MirCallee::Name(n) => WitnessCallee::Name(n.clone()),
-            MirCallee::Var(n) => WitnessCallee::Var(n.clone()),
-            MirCallee::Method(obj, m) => WitnessCallee::Method(obj.clone(), m.clone()),
-            MirCallee::Evaluated(e) => WitnessCallee::Evaluated(Box::new(MirWitness::from_expr(e))),
-            MirCallee::Builtin(op) => WitnessCallee::Builtin(op.clone()),
-        }
-    }
+/// v0.92: builtin 操作码（原在 `mir/expr/mod.rs`）。
+/// WitnessCallee::Builtin 与 typeck HM 推断消费；与表达式树无关，故迁至 witness 层。
+#[derive(Debug, Clone, PartialEq)]
+pub enum BuiltinOp {
+    Print,
+    Assert,
+    Not,
+    Length,
 }
 
 /// Match arm — 镜像 MatchArm。
@@ -420,17 +214,7 @@ pub struct WitnessArm {
     pub body: MirWitness,
 }
 
-impl WitnessArm {
-    fn from_arm(arm: &MatchArm) -> WitnessArm {
-        WitnessArm {
-            pattern: WitnessPattern::from_pattern(&arm.pattern),
-            guard: arm.guard.as_ref().map(MirWitness::from_expr),
-            body: MirWitness::from_expr(&arm.body),
-        }
-    }
-}
-
-/// 模式匹配 — 镜像 Pattern。
+/// Pattern 变体 — 镜像 Pattern。
 #[derive(Debug, Clone, PartialEq)]
 pub enum WitnessPattern {
     Wildcard,
@@ -456,59 +240,12 @@ pub enum WitnessPattern {
     },
 }
 
-impl WitnessPattern {
-    pub fn from_pattern(p: &Pattern) -> WitnessPattern {
-        match p {
-            Pattern::Wildcard => WitnessPattern::Wildcard,
-            Pattern::Variable(n) => WitnessPattern::Variable(n.clone()),
-            Pattern::Literal(lit) => WitnessPattern::Literal(lit.clone()),
-            Pattern::Tuple(items) => {
-                WitnessPattern::Tuple(items.iter().map(WitnessPattern::from_pattern).collect())
-            }
-            Pattern::List { head, tail } => WitnessPattern::List {
-                head: Box::new(WitnessPattern::from_pattern(head)),
-                tail: Box::new(WitnessPattern::from_pattern(tail)),
-            },
-            Pattern::ListVec { elements, rest } => WitnessPattern::ListVec {
-                elements: elements.iter().map(WitnessPattern::from_pattern).collect(),
-                rest: rest
-                    .as_ref()
-                    .map(|r| Box::new(WitnessPattern::from_pattern(r))),
-            },
-            Pattern::Dict { required, rest } => WitnessPattern::Dict {
-                required: required
-                    .iter()
-                    .map(|(k, v)| (k.clone(), WitnessPattern::from_pattern(v)))
-                    .collect(),
-                rest: *rest,
-            },
-            Pattern::TypeAscription { name, pattern } => WitnessPattern::TypeAscription {
-                name: name.clone(),
-                pattern: Box::new(WitnessPattern::from_pattern(pattern)),
-            },
-        }
-    }
-}
-
 /// 参数 — 镜像 Param。
 #[derive(Debug, Clone, PartialEq)]
 pub struct WitnessParam {
     pub name: String,
     pub type_hint: Option<crate::mir::hint::TypeHint>,
     pub default: Option<MirWitness>,
-}
-
-impl WitnessParam {
-    fn from_param(p: &Param) -> WitnessParam {
-        WitnessParam {
-            name: p.name.clone(),
-            type_hint: p
-                .type_hint
-                .clone()
-                .map(crate::mir::hint::TypeHint::from_type),
-            default: p.default.as_ref().map(MirWitness::from_expr),
-        }
-    }
 }
 
 /// Orchestrate 种类 — 镜像 MirOrchestrateKind。
@@ -529,9 +266,9 @@ pub enum WitnessOrchestrateKind {
     Pregel {
         agents: Vec<WitnessAgentDef>,
         edges: Vec<WitnessEdgeDef>,
-        state_schema: Vec<crate::mir::expr::MirStateChannel>,
-        checkpoint: Option<crate::mir::expr::MirCheckpointConfig>,
-        interrupt_points: Vec<crate::mir::expr::MirInterruptPoint>,
+        state_schema: Vec<crate::mir::orchestrate::MirStateChannel>,
+        checkpoint: Option<crate::mir::orchestrate::MirCheckpointConfig>,
+        interrupt_points: Vec<crate::mir::orchestrate::MirInterruptPoint>,
         adjacency: std::collections::HashMap<String, Vec<String>>,
     },
     /// v0.75.84: MoA（Mixture-of-Agents）— 分层多模型协作声明。
@@ -563,10 +300,9 @@ impl WitnessOrchestrateKind {
             } => WitnessOrchestrateKind::Loop {
                 agents: agents.iter().map(WitnessAgentDef::from_agent).collect(),
                 rounds: *rounds,
-                exit_when: exit_when.as_ref().map(MirWitness::from_expr),
+                exit_when: exit_when.clone(),
             },
-            MirOrchestrateKind::Graph { agents, edges } => WitnessOrchestrateKind::Graph {
-                agents: agents.iter().map(WitnessAgentDef::from_agent).collect(),
+            MirOrchestrateKind::Graph { agents, edges } => WitnessOrchestrateKind::Graph {                agents: agents.iter().map(WitnessAgentDef::from_agent).collect(),
                 edges: edges.iter().map(WitnessEdgeDef::from_edge).collect(),
             },
             MirOrchestrateKind::Pregel {
@@ -596,7 +332,7 @@ impl WitnessOrchestrateKind {
                 layers: *layers,
                 proposers: proposers.clone(),
                 aggregator: aggregator.clone(),
-                prompt: Box::new(MirWitness::from_expr(prompt)),
+                prompt: Box::new(prompt.clone()),
             },
             // v0.75.85: MoE — 稀疏门控（router 打分 → top-k → 加权）。
             MirOrchestrateKind::Moe {
@@ -608,13 +344,10 @@ impl WitnessOrchestrateKind {
                 prompt_fn: _,
                 ..
             } => WitnessOrchestrateKind::Moe {
-                experts: experts
-                    .iter()
-                    .map(|e| MirWitness::from_expr(&e.def))
-                    .collect(),
-                router: Box::new(MirWitness::from_expr(router)),
+                experts: experts.iter().map(|e| e.def.clone()).collect(),
+                router: Box::new(router.clone()),
                 top_k: *top_k,
-                prompt: Box::new(MirWitness::from_expr(prompt)),
+                prompt: Box::new(prompt.clone()),
             },
         }
     }
@@ -635,13 +368,9 @@ impl WitnessAgentDef {
     fn from_agent(agent: &MirAgentDef) -> WitnessAgentDef {
         WitnessAgentDef {
             name: agent.name.clone(),
-            task_expr: MirWitness::from_expr(&agent.task_expr),
-            verify_expr: agent.verify_expr.as_ref().map(MirWitness::from_expr),
-            with_config: agent.with_config.as_ref().map(|m| {
-                m.iter()
-                    .map(|(k, v)| (k.clone(), MirWitness::from_expr(v)))
-                    .collect()
-            }),
+            task_expr: agent.task_expr.clone(),
+            verify_expr: agent.verify_expr.clone(),
+            with_config: agent.with_config.clone(),
             task_body: agent.task_body.clone(),
             combiner_body: agent.combiner_body.clone(),
         }
@@ -662,7 +391,7 @@ impl WitnessEdgeDef {
         WitnessEdgeDef {
             from: edge.from.clone(),
             to: edge.to.clone(),
-            condition_expr: edge.condition_expr.as_ref().map(MirWitness::from_expr),
+            condition_expr: edge.condition_expr.clone(),
             condition_body: edge.condition_body.clone(),
         }
     }
@@ -673,26 +402,34 @@ mod tests {
     use super::*;
     use crate::common::{BinaryOp, Literal};
 
-    fn lit(n: i64) -> MirExpr {
-        MirExpr::lit(Literal::Int(n, Span::default()), Span::default())
+    // v0.92: MirExpr → MirWitness 正向转换已删除（parser 直接产出 witness）。
+    // 以下测试改为 witness-native 构造，验证 witness 树自身的结构不变量。
+
+    fn lit(n: i64) -> MirWitness {
+        MirWitness {
+            kind: WitnessKind::Literal(Literal::Int(n, Span::default())),
+            span: Span::default(),
+        }
     }
 
-    fn var(name: &str) -> MirExpr {
-        MirExpr::var(name.to_string(), Span::default())
+    fn var(name: &str) -> MirWitness {
+        MirWitness {
+            kind: WitnessKind::Variable(name.to_string()),
+            span: Span::default(),
+        }
     }
 
-    /// 往返一致性：from_expr 后变体一一对应、span 保留。
+    /// witness 树 span 保留 + Binary 结构不变量。
     #[test]
-    fn from_expr_preserves_kind_and_span() {
-        let expr = MirExpr {
-            kind: MirExprKind::Binary {
+    fn witness_preserves_kind_and_span() {
+        let w = MirWitness {
+            kind: WitnessKind::Binary {
                 left: Box::new(lit(1)),
                 op: BinaryOp::Add,
                 right: Box::new(var("x")),
             },
             span: Span { line: 3, column: 7 },
         };
-        let w = MirWitness::from_expr(&expr);
         assert_eq!(w.span.line, 3);
         assert_eq!(w.span.column, 7);
         match &w.kind {
@@ -710,28 +447,52 @@ mod tests {
         }
     }
 
-    /// 全变体覆盖：构造一个覆盖主要类别的程序，from_expr 不 panic 且结构保留。
+    /// 全变体族覆盖：witness 树构造不 panic 且变体类别正确。
     #[test]
-    fn from_expr_covers_all_variant_families() {
-        let exprs = vec![
-            MirExpr::lit(
-                Literal::String("s".into(), Span::default()),
-                Span::default(),
-            ),
+    fn witness_covers_all_variant_families() {
+        let witnesses = [
+            MirWitness {
+                kind: WitnessKind::Literal(Literal::String("s".into(), Span::default())),
+                span: Span::default(),
+            },
             var("a"),
-            MirExpr::binop(BinaryOp::Add, lit(1), lit(2), Span::default()),
-            MirExpr::call(MirCallee::Name("f".into()), vec![lit(1)], Span::default()),
-            MirExpr::if_else(var("c"), lit(1), Some(lit(2)), Span::default()),
-            MirExpr::list(vec![lit(1), lit(2)], Span::default()),
-            MirExpr::dict(vec![("k".into(), lit(1))], Span::default()),
-            MirExpr {
-                kind: MirExprKind::Sequence(vec![lit(1), lit(2)]),
+            MirWitness {
+                kind: WitnessKind::Binary {
+                    left: Box::new(lit(1)),
+                    op: BinaryOp::Add,
+                    right: Box::new(lit(2)),
+                },
+                span: Span::default(),
+            },
+            MirWitness {
+                kind: WitnessKind::Call {
+                    callee: WitnessCallee::Name("f".into()),
+                    args: vec![lit(1)],
+                },
+                span: Span::default(),
+            },
+            MirWitness {
+                kind: WitnessKind::If {
+                    cond: Box::new(var("c")),
+                    then: Box::new(lit(1)),
+                    r#else: Some(Box::new(lit(2))),
+                },
+                span: Span::default(),
+            },
+            MirWitness {
+                kind: WitnessKind::List(vec![lit(1), lit(2)]),
+                span: Span::default(),
+            },
+            MirWitness {
+                kind: WitnessKind::Dict(vec![("k".into(), lit(1))]),
+                span: Span::default(),
+            },
+            MirWitness {
+                kind: WitnessKind::Sequence(vec![lit(1), lit(2)]),
                 span: Span::default(),
             },
         ];
-        let witnesses = MirWitness::from_exprs(&exprs);
         assert_eq!(witnesses.len(), 8);
-        // 逐类确认
         assert!(matches!(witnesses[0].kind, WitnessKind::Literal(_)));
         assert!(matches!(witnesses[1].kind, WitnessKind::Variable(_)));
         assert!(matches!(witnesses[2].kind, WitnessKind::Binary { .. }));
@@ -745,8 +506,13 @@ mod tests {
     /// Closure 不再含 captured_env。
     #[test]
     fn closure_has_no_captured_env() {
-        let expr = MirExpr::closure(vec![], lit(1), Span::default());
-        let w = MirWitness::from_expr(&expr);
+        let w = MirWitness {
+            kind: WitnessKind::Closure {
+                params: vec![],
+                body: Box::new(lit(1)),
+            },
+            span: Span::default(),
+        };
         assert!(matches!(w.kind, WitnessKind::Closure { .. }));
     }
 }

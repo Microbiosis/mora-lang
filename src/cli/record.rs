@@ -36,10 +36,20 @@ pub fn run_record(path: &str, name: &str, opt_level: Option<crate::mir::ssa::Opt
 
     // v0.75.9: 包裹 Arc 走全局 DAG 缓存
     let func_arc = std::sync::Arc::new(func);
-    match crate::mir::vm::run_mir(&func_arc, &mut interpreter, &mut env) {
+    match crate::mir::vm::run_mir(
+        &func_arc,
+        &mut interpreter,
+        &mut env,
+        &mut crate::mir::effect::Effects::new(),
+    ) {
         Ok(_) => {
             // 执行 main task
-            if let Err(e) = crate::mir::vm::run_main_task(&func_arc, &mut interpreter, &mut env) {
+            if let Err(e) = crate::mir::vm::run_main_task(
+                &func_arc,
+                &mut interpreter,
+                &mut env,
+                &mut crate::mir::effect::Effects::new(),
+            ) {
                 if let Err(e) = interpreter.infra_mut().recorder().save() {
                     eprintln!("[warn] partial recording save failed: {}", e);
                 }
@@ -97,11 +107,21 @@ pub fn run_replay(path: &str, name: &str, opt_level: Option<crate::mir::ssa::Opt
 
     // v0.75.9: 包裹 Arc 走全局 DAG 缓存
     let func_arc = std::sync::Arc::new(func);
-    if let Err(e) = crate::mir::vm::run_mir(&func_arc, &mut interpreter, &mut env) {
+    if let Err(e) = crate::mir::vm::run_mir(
+        &func_arc,
+        &mut interpreter,
+        &mut env,
+        &mut crate::mir::effect::Effects::new(),
+    ) {
         eprintln!("Runtime error during replay: {}", e);
         process::exit(1);
     }
-    if let Err(e) = crate::mir::vm::run_main_task(&func_arc, &mut interpreter, &mut env) {
+    if let Err(e) = crate::mir::vm::run_main_task(
+        &func_arc,
+        &mut interpreter,
+        &mut env,
+        &mut crate::mir::effect::Effects::new(),
+    ) {
         eprintln!("Runtime error during replay main: {}", e);
         process::exit(1);
     }
@@ -291,11 +311,21 @@ pub fn run_snapshot(
     let mut env = interpreter.take_env();
     // v0.75.9: 包裹 Arc 走全局 DAG 缓存
     let func_arc = std::sync::Arc::new(func);
-    if let Err(e) = crate::mir::vm::run_mir(&func_arc, &mut interpreter, &mut env) {
+    if let Err(e) = crate::mir::vm::run_mir(
+        &func_arc,
+        &mut interpreter,
+        &mut env,
+        &mut crate::mir::effect::Effects::new(),
+    ) {
         eprintln!("snapshot: runtime error: {}", e);
         process::exit(1);
     }
-    if let Err(e) = crate::mir::vm::run_main_task(&func_arc, &mut interpreter, &mut env) {
+    if let Err(e) = crate::mir::vm::run_main_task(
+        &func_arc,
+        &mut interpreter,
+        &mut env,
+        &mut crate::mir::effect::Effects::new(),
+    ) {
         eprintln!("snapshot: runtime error: {}", e);
         process::exit(1);
     }

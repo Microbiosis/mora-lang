@@ -2,6 +2,66 @@
 
 All notable changes to Mora will be documented in this file.
 
+## [v0.94.00] — 2026-09-11 — refactor: 数据流化 — Environment HAMT + TEA 纯值 + Pregel 双轨收编
+
+**原则**：用数据流代替状态机；纯函数让并发从防御性编程变成自然属性。本版本
+消灭三处状态机/双轨：运行时环境、TEA 驱动、Pregel 平行引擎树。
+
+### (1) Environment — 持久化 HAMT 绑定取代共享锁状态机
+
+**根因（审计发现）**：v0.78 曾为 Environment 预留 `persistent_mirror` 字段 +
+`persistent_env` feature，但落地的 `PersistentMap` 只能存 `u64`，结构上无法
+承载 `Value`，因此从未接线 —— 字段只在 `new()` 里写 `None`，feature 默认关且
+为空。这是 §0 意义上的「造好钩子却没接线」的半实现。
+
+**改动**：
+- `src/value/persistent.rs` 重写为**泛型** `PersistentMap<V>` 的 Arc 路径复制
+  HAMT（`assoc`/`remove`/`get`/`iter`，旧版本保持有效，`clone` 仅增加引用计数）。
+- `Environment.values` 从 `HashMap<String, Arc<Mutex<Value>>>` 改为
+  `PersistentMap<Value>`；`parent` 从 `Option<Arc<Mutex<Environment>>>` 改为
+  不可变 `Option<Arc<Environment>>`。绑定不再有内部可变性。
+- 删除死代码 API：`exports` 字段、`persistent_mirror` 字段、`borrow_variable` /
+  `borrow_variable_mut` / `move_variable` / `get_binding` / `with_parent_of_rc`
+  与 `Binding` enum（全仓库零外部调用者）。
+- 新增纯函数式原语 `Environment::assoc`（返回新环境）与 `Environment::snapshot`
+  （O(1) 结构共享快照）。
+- `assign` 写父作用域改为 `Arc::make_mut` 写时复制 —— 共享的父版本不被就地改写。
+- `h_handle` 的 body 改为在**同一** env 上执行（spec §6.2：handle body 不建新
+  作用域），去掉「克隆子环境 + 靠 Arc<Mutex> 写穿回流」的隐式共享状态。
+- 删除 Cargo.toml 的 `persistent_env` feature（HAMT 现始终启用）。
+
+**并发语义提升**：`Environment` 现为 `Send + Sync` 纯数据 —— 并行 worker 的
+`env.clone()` 从「共享可变 cell」变为「真正隔离的 O(1) 快照」，并发读无需锁。
+
+**不兼容变更**：`Environment` 不再有 `Arc<Mutex>` 内部可变性与被写穿的克隆语义；
+依赖「克隆后原地写可见于原环境」的调用方须改用显式 `merge_from` / `assoc`。
+
+### (2) TEA — 纯值 fold 驱动取代 Arc<Mutex<TeaState>> 状态机
+
+- `src/tea/mod.rs`：`TeaApp` 去掉 `Arc<Mutex<TeaState>>`，改为纯数据值
+  （`model` + `msg_queue`/`cmd_queue` + 三个闭包），派生 `Clone + Debug + PartialEq`。
+- 新增纯转换：`with_model` / `dispatch` / `dispatch_many` / `with_cmd`（均返回新 app）。
+- 核心 `fold`：`model' = fold(msgs, model, update)`；`run_loop` 纯驱动，折叠消息 +
+  解释 Cmd，返回新 app；`initialized` 取代 `initialize`。
+- `Value::TeaApp` 相等性从 `Arc::ptr_eq` 改为结构相等（不再有内部 Mutex 需跳过）。
+- `tea.dispatch`/`tea.run`/`tea.update` builtin 改为返回新 app（此前返回 Nil 靠原地
+  修改）；`h_app_def`/`replay` 同步；`tea_counter.mora` fixture 改为显式穿线 app 值。
+
+### (3) Pregel — 收编双轨，删除未接线的平行引擎树
+
+- 删除 `src/pregel/engine/`（`MirPregelEngine` 平行实现，`#[allow(dead_code)]`，
+  与 `mod.rs` 生产引擎完全重复）与 `src/pregel/engine_tests.rs`（26 个与
+  `mod.rs` 内联 `tests` 同名的重复测试）。
+- 唯一被生产路径使用的 `parse_custom_merge_expr` 迁入 `src/pregel/reducers.rs`。
+- 引擎实现与测试回归单一信息源（`mod.rs`），消除「两份状态机语义漂移」风险。
+
+### 验证
+
+新增 10 个 HAMT 单测 + 6 个 Environment 数据流单测 + 2 个 TEA 纯性/Send+Sync 单测。
+**869 lib**（−26 为删除的重复测试）+ 23 e2e + 17 executor_switch + 19 differential +
+33 tier2 + 31 tier1 + 10 orchestrate_v3 + 14+11 parser_v3 + 58 pregel 全绿；
+clippy `--all-targets --all-features -D warnings` 全绿。
+
 ## [v0.90.04] — 2026-08-23 — fix: Break/Continue label 修补 — 真正确性漏洞修复
 
 **审计发现**：fcfg_lower 的 While/For break/continue label 始终为 0（Break/Continue emit 时 label=0，post-patch 不覆盖，Node::Break 未携带 label）。

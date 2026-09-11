@@ -6,8 +6,9 @@ app Counter
   view: fn(m) => m
 end
 
+-- v0.94: TeaApp 是纯值 —— tea.dispatch/tea.run 返回新 app，须显式穿线。
 let app_inst = tea.init({count: 0, step: 1})
-tea.dispatch(app_inst, {tag: "Increment"})
-tea.dispatch(app_inst, {tag: "Increment"})
-tea.run(app_inst, 5)
+let app_inst = tea.dispatch(app_inst, {tag: "Increment"})
+let app_inst = tea.dispatch(app_inst, {tag: "Increment"})
+let app_inst = tea.run(app_inst, 5)
 tea.model(app_inst)

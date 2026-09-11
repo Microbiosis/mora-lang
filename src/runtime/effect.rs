@@ -42,6 +42,7 @@ pub trait EffectHandler: Send + Sync {
         &mut self,
         host: &mut dyn crate::mir::host::MirHost,
         args: Vec<Value>,
+        effects: &mut crate::mir::effect::Effects,
     ) -> Result<Value, String>;
 }
 
@@ -66,6 +67,7 @@ impl EffectHandler for HandlerClosure {
         &mut self,
         host: &mut dyn crate::mir::host::MirHost,
         args: Vec<Value>,
+        effects: &mut crate::mir::effect::Effects,
     ) -> Result<Value, String> {
         // v0.80 Stage 2.0: 真正的 handler 执行。
         //
@@ -82,7 +84,7 @@ impl EffectHandler for HandlerClosure {
         }
 
         // 2. 跑 handler_mir（host 通过 &mut dyn MirHost 传入）
-        let result = crate::mir::vm::run_mir(&self.handler_mir, host, &mut handler_env);
+        let result = crate::mir::vm::run_mir(&self.handler_mir, host, &mut handler_env, effects);
 
         // 3. 把可能变更的 handler_env 写回（让 handler 写作用域变量生效）
         *self.env.lock() = handler_env;
@@ -146,6 +148,7 @@ mod tests {
                 &mut self,
                 _host: &mut dyn crate::mir::host::MirHost,
                 _args: Vec<Value>,
+                _effects: &mut crate::mir::effect::Effects,
             ) -> Result<Value, String> {
                 Ok(Value::Int(42))
             }

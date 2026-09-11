@@ -34,7 +34,8 @@ pub mod cmir_to_lmir;
 pub mod core;
 // v0.78: EffectRow — algebraic effect 的类型表示（Stage 1/4 落地）
 pub mod effect;
-pub mod expr;
+// v0.92: expr 模块已删除 —— MirExpr 平行 AST 世界完全消除（P0.3）。
+// 全部调用方迁移到 `mir::witness::MirWitness` / `mir::orchestrate::*`。
 // v0.91: orchestrate runtime types — 从 expr 层迁出，独立模块。
 pub mod orchestrate;
 // v0.89: EHIR → Core 桥接
@@ -70,9 +71,9 @@ mod inst; // v0.75.56: MirInst metadata + dispatch（经 handlers::inst re-expor
 pub use inst::*; // 保持 crate::mir::dst() 等旧路径
 pub mod vm;
 
-pub use expr::MirExpr;
 pub use vm::run_mir;
-// lower_program removed in Phase A (v0.55) — use lower_mir_exprs instead
+// lower_program removed in Phase A (v0.55) — use lower_mir_witnesses instead
+// v0.92: `pub use expr::MirExpr` 已删除 —— expr 模块整体移除（P0.3）。
 
 // ── 9 层 IR 架构 re-exports ──
 pub use fcfg::{Block as FcfgBlock, Ehir, Fcfg, Node, TypeInfo};
@@ -340,16 +341,17 @@ pub enum MirInst {
     },
 
     /// α.4: send — 发送值到 worker channel（target 是 channel 名称）。
-    /// v0.75.31: Send 保留（写独立 dynamic_sends 缓冲，不污染变量环境；
-    /// pregel 引擎的 pending_sends/combiner/ADVANCE 投递机制是活的）。
+    /// v0.93: 经 h_send 提交 `Effect::Send`（effect-as-data），执行器在
+    /// worker 边界取走并按确定顺序 merge（不污染变量环境）；pregel 引擎的
+    /// pending_sends/combiner/ADVANCE 投递机制是活的。
     Send {
         value: Reg,
         target: String,
     },
 
     /// v0.75.83: aggregate — 向 per-super-step 聚合器贡献值。
-    /// 经 h_aggregate push 到 MirHost 缓冲，Pregel 引擎超步末收集归约
-    /// （与 Send/dynamic_sends 同构；引擎侧 aggregator_contribute 归约）。
+    /// v0.93: 经 h_aggregate 提交 `Effect::Contribute`（与 Send 同一
+    /// Effects 数据通道），引擎侧 aggregator_contribute 归约。
     Aggregate {
         name: String,
         value: Reg,
@@ -436,10 +438,11 @@ pub enum MirInst {
 
     // ── 类型系统（α.7: TraitDef/ImplDef）──
     /// v0.55: trait def — 完全 MIR-native，methods 是 MirTraitMethod 而非 ast_v2::TraitMethod。
+    /// v0.92: types re-exported from `crate::mir::orchestrate::*` (消除 expr/ 跨层引用)。
     TraitDef {
         name: String,
         parents: Vec<String>,
-        methods: Vec<crate::mir::expr::MirTraitMethod>,
+        methods: Vec<crate::mir::orchestrate::MirTraitMethod>,
         /// prelowered method bodies (parallel to methods)，让默认实现走 run_mir。
         method_bodies: Vec<MirFunction>,
     },
@@ -450,7 +453,7 @@ pub enum MirInst {
         trait_generics: Vec<String>,
         for_type: String,
         for_generics: Vec<String>,
-        methods: Vec<crate::mir::expr::MirFnDef>,
+        methods: Vec<crate::mir::orchestrate::MirFnDef>,
         /// prelowered method bodies (parallel to methods)。
         method_bodies: Vec<MirFunction>,
     },
@@ -460,7 +463,7 @@ pub enum MirInst {
     Orchestrate {
         input_var: String,
         result_var: String,
-        kind: Box<crate::mir::expr::MirOrchestrateKind>,
+        kind: Box<crate::mir::orchestrate::MirOrchestrateKind>,
     },
 
     /// α.8: eval — 断言测试。
@@ -478,10 +481,10 @@ pub enum MirInst {
         description: Option<String>,
         version: Option<String>,
         requires: Vec<String>,
-        tasks: Vec<crate::mir::expr::MirSkillTask>,
+        tasks: Vec<crate::mir::orchestrate::MirSkillTask>,
         /// prelowered task bodies (parallel to tasks)。
         task_bodies: Vec<MirFunction>,
-        verify: Option<crate::mir::expr::MirSkillVerify>,
+        verify: Option<crate::mir::orchestrate::MirSkillVerify>,
         /// α.11: prelowered verify body。
         verify_body: Option<MirFunction>,
     },

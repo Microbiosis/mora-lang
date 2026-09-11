@@ -1,241 +1,222 @@
-//! Parser V3 语法覆盖率测试
+//! Parser V3 语法覆盖率测试（v0.92: witness 路径）
 //!
-//! 直接验证 Parser V3 对以下语法的解析能力（不经过 AST v2）：
+//! 直接验证 Parser V3 对以下语法的解析能力（不经过 AST v2 / MirExpr）：
 //! - `expr as dyn Trait<args>`  (DynTrait)
 //! - `p"Hello {expr}"`         (Prompt 模板字符串)
-//! - `obj.method(args)`         (MethodCall，V3 编码为 Call("obj_method", [obj, ...]))
-//! - `expr[idx]`                (Index，V3 编码为 Call("expr_index", [expr, idx]))
+//! - `obj.method(args)`         (MethodCall)
+//! - `expr[idx]`                (Index)
+//! - `let x: A | B`             (Union 类型注解)
 
-fn parse_v3(source: &str) -> Vec<mora::mir::expr::MirExpr> {
-    let mut lexer = mora::lexer::Lexer::new(source);
-    let tokens = lexer.scan_tokens();
-    let parser = mora::parser_v3::ParserV3::new(tokens, source);
-    parser.parse().expect("Parser V3 should succeed")
+use mora::mir::witness::{MirWitness, WitnessKind};
+
+/// v0.92: 走 canonical `compile()` 路径（MirWitness）。
+fn compile_witnesses(source: &str) -> Vec<MirWitness> {
+    let (_func, witnesses) = mora::parser_v3::ParserV3::compile(source)
+        .unwrap_or_else(|e| panic!("ParserV3::compile failed: {}", e));
+    witnesses
 }
 
-fn find_kind<'a>(
-    exprs: &'a [mora::mir::expr::MirExpr],
-    kind: &mora::mir::expr::MirExprKind,
-) -> Option<&'a mora::mir::expr::MirExpr> {
-    exprs
-        .iter()
-        .find(|e| std::mem::discriminant(&e.kind) == std::mem::discriminant(kind))
+/// 深度优先查找第一个匹配谓词的 witness。
+fn find_witness<F>(ws: &[MirWitness], pred: &F) -> Option<MirWitness>
+where
+    F: Fn(&WitnessKind) -> bool,
+{
+    fn walk<F: Fn(&WitnessKind) -> bool>(w: &MirWitness, pred: &F) -> Option<MirWitness> {
+        if pred(&w.kind) {
+            return Some(w.clone());
+        }
+        match &w.kind {
+            WitnessKind::Binary { left, right, .. }
+            | WitnessKind::And { left, right }
+            | WitnessKind::Or { left, right } => {
+                walk(left, pred).or_else(|| walk(right, pred))
+            }
+            WitnessKind::Call { args, .. } => args.iter().find_map(|a| walk(a, pred)),
+            WitnessKind::MethodCall { receiver, args, .. } => {
+                walk(receiver, pred).or_else(|| args.iter().find_map(|a| walk(a, pred)))
+            }
+            WitnessKind::Closure { body, .. } | WitnessKind::FnDef { body, .. } => walk(body, pred),
+            WitnessKind::If { cond, then, r#else } => walk(cond, pred)
+                .or_else(|| walk(then, pred))
+                .or_else(|| r#else.as_ref().and_then(|e| walk(e, pred))),
+            WitnessKind::Match { scrutinee, arms } => walk(scrutinee, pred).or_else(|| {
+                arms.iter()
+                    .find_map(|a| walk(&a.body, pred))
+            }),
+            WitnessKind::Loop { iterable, body, .. } => {
+                walk(iterable, pred).or_else(|| walk(body, pred))
+            }
+            WitnessKind::While { cond, body } => walk(cond, pred).or_else(|| walk(body, pred)),
+            WitnessKind::List(items) => items.iter().find_map(|i| walk(i, pred)),
+            WitnessKind::Dict(entries) => entries.iter().find_map(|(_, v)| walk(v, pred)),
+            WitnessKind::DynTrait { expr, .. } => walk(expr, pred),
+            WitnessKind::Prompt { parts } => parts.iter().find_map(|p| walk(p, pred)),
+            WitnessKind::LetBinding { value, init_body, .. } => {
+                walk(value, pred).or_else(|| walk(init_body, pred))
+            }
+            WitnessKind::Assign { value, .. } => walk(value, pred),
+            WitnessKind::IndexAssign { object, index, value } => walk(object, pred)
+                .or_else(|| walk(index, pred))
+                .or_else(|| walk(value, pred)),
+            WitnessKind::Return(Some(v)) => walk(v, pred),
+            WitnessKind::Sequence(items) => items.iter().find_map(|i| walk(i, pred)),
+            WitnessKind::Perform { args, .. } => args.iter().find_map(|a| walk(a, pred)),
+            WitnessKind::Handle { body, handler, .. } => {
+                walk(body, pred).or_else(|| walk(handler, pred))
+            }
+            WitnessKind::MacroDef { body, .. } => walk(body, pred),
+            WitnessKind::WithConfig { bindings, body } => bindings
+                .iter()
+                .find_map(|(_, v)| walk(v, pred))
+                .or_else(|| walk(body, pred)),
+            WitnessKind::Quasiquote { segments } => segments.iter().find_map(|s| walk(s, pred)),
+            _ => None,
+        }
+    }
+    ws.iter().find_map(|w| walk(w, pred))
 }
 
 // ─── DynTrait ────────────────────────────────────────────────────────
 
 #[test]
 fn dyntrait_expr_as_dyn_trait_parses() {
-    let exprs = parse_v3("x as dyn Any");
-    let kind = find_kind(
-        &exprs,
-        &mora::mir::expr::MirExprKind::DynTrait {
-            expr: Box::new(mora::mir::expr::MirExpr::var(
-                "x",
-                mora::common::Span::new(1, 1),
-            )),
-            trait_name: "".into(),
-            generics: Vec::new(),
-        },
-    );
-    assert!(kind.is_some(), "expected DynTrait node");
+    let ws = compile_witnesses("x as dyn Any");
+    let found = find_witness(&ws, &|k| matches!(k, WitnessKind::DynTrait { .. }));
+    assert!(found.is_some(), "expected DynTrait node");
 }
 
 #[test]
 fn dyntrait_expr_as_dyn_trait_with_generics_parses() {
-    let exprs = parse_v3("x as dyn Any");
-    let kind = find_kind(
-        &exprs,
-        &mora::mir::expr::MirExprKind::DynTrait {
-            expr: Box::new(mora::mir::expr::MirExpr::var(
-                "x",
-                mora::common::Span::new(1, 1),
-            )),
-            trait_name: "".into(),
-            generics: Vec::new(),
-        },
-    );
-    assert!(kind.is_some(), "expected DynTrait node");
+    let ws = compile_witnesses("x as dyn Any");
+    let found = find_witness(&ws, &|k| {
+        matches!(k, WitnessKind::DynTrait { trait_name, .. } if trait_name == "Any")
+    });
+    assert!(found.is_some(), "expected DynTrait node with trait_name Any");
 }
 
 #[test]
 fn dyntrait_nested_in_let_binding() {
-    let exprs = parse_v3("let obj = 42 as dyn Any");
-    assert!(!exprs.is_empty());
+    let ws = compile_witnesses("let obj = 42 as dyn Any");
+    assert!(!ws.is_empty());
 }
 
 // ─── Prompt 模板字符串 ───────────────────────────────────────────────
 
 #[test]
 fn prompt_literal_without_interpolation_parses() {
-    let exprs = parse_v3("p\"hello world\"");
-    assert!(
-        find_kind(
-            &exprs,
-            &mora::mir::expr::MirExprKind::Prompt { parts: Vec::new() }
-        )
-        .is_some(),
-        "expected Prompt node"
-    );
+    let ws = compile_witnesses("p\"hello world\"");
+    let found = find_witness(&ws, &|k| matches!(k, WitnessKind::Prompt { .. }));
+    assert!(found.is_some(), "expected Prompt node");
 }
 
 #[test]
 fn prompt_with_single_interpolation_parses() {
-    let exprs = parse_v3("p\"hello {name}\"");
-    let kind = find_kind(
-        &exprs,
-        &mora::mir::expr::MirExprKind::Prompt { parts: Vec::new() },
+    let ws = compile_witnesses("p\"hello {name}\"");
+    let found = find_witness(&ws, &|k| matches!(k, WitnessKind::Prompt { parts } if parts.len() == 2));
+    assert!(
+        found.is_some(),
+        "expected Prompt node with 2 parts (literal + interpolation)"
     );
-    assert!(kind.is_some(), "expected Prompt node with interpolation");
 }
 
 #[test]
 fn prompt_with_multiple_interpolation_parses() {
-    let exprs = parse_v3("p\"{a} + {b}\"");
-    let kind = find_kind(
-        &exprs,
-        &mora::mir::expr::MirExprKind::Prompt { parts: Vec::new() },
-    );
+    let ws = compile_witnesses("p\"{a} + {b}\"");
+    let found = find_witness(&ws, &|k| matches!(k, WitnessKind::Prompt { parts } if parts.len() >= 3));
     assert!(
-        kind.is_some(),
+        found.is_some(),
         "expected Prompt node with multiple interpolations"
     );
 }
 
 // ─── MethodCall ──────────────────────────────────────────────────────
-// V3 encodes method calls as Call with mangled name: obj.method() → Call("obj_method", [obj])
 
 #[test]
 fn method_call_parses() {
-    let exprs = parse_v3("obj.method()");
-    let kind = find_kind(
-        &exprs,
-        &mora::mir::expr::MirExprKind::Call {
-            callee: mora::mir::expr::MirCallee::Name("obj_method".into()),
-            args: vec![mora::mir::expr::MirExpr::var(
-                "obj",
-                mora::common::Span::new(1, 1),
-            )],
-        },
-    );
-    assert!(
-        kind.is_some(),
-        "expected method call encoded as Call('obj_method', [obj])"
-    );
+    let ws = compile_witnesses("obj.method()");
+    let found = find_witness(&ws, &|k| {
+        matches!(k, WitnessKind::MethodCall { method, .. } if method == "method")
+    });
+    assert!(found.is_some(), "expected MethodCall node");
 }
 
 #[test]
 fn method_call_with_args_parses() {
-    let exprs = parse_v3("obj.method(1, 2)");
-    let kind = find_kind(
-        &exprs,
-        &mora::mir::expr::MirExprKind::Call {
-            callee: mora::mir::expr::MirCallee::Name("obj_method".into()),
-            args: vec![
-                mora::mir::expr::MirExpr::var("obj", mora::common::Span::new(1, 1)),
-                mora::mir::expr::MirExpr::lit(
-                    mora::common::Literal::Int(1, mora::common::Span::new(1, 1)),
-                    mora::common::Span::new(1, 1),
-                ),
-                mora::mir::expr::MirExpr::lit(
-                    mora::common::Literal::Int(2, mora::common::Span::new(1, 1)),
-                    mora::common::Span::new(1, 1),
-                ),
-            ],
-        },
-    );
-    assert!(
-        kind.is_some(),
-        "expected method call encoded as Call with args"
-    );
+    let ws = compile_witnesses("obj.method(1, 2)");
+    let found = find_witness(&ws, &|k| {
+        matches!(k, WitnessKind::MethodCall { method, args, .. } if method == "method" && args.len() == 2)
+    });
+    assert!(found.is_some(), "expected MethodCall with 2 args");
 }
 
 // ─── Index ───────────────────────────────────────────────────────────
 
 #[test]
 fn index_expr_parses() {
-    let exprs = parse_v3("arr[0]");
-    let kind = find_kind(
-        &exprs,
-        &mora::mir::expr::MirExprKind::Call {
-            callee: mora::mir::expr::MirCallee::Name("".into()),
-            args: Vec::new(),
-        },
-    );
-    assert!(kind.is_some(), "expected Index to parse as Call");
+    let ws = compile_witnesses("arr[0]");
+    // v0.92 witness 路径将 Index 编码为 Call("[]", [arr, 0])。
+    let found = find_witness(&ws, &|k| {
+        matches!(k, WitnessKind::Call { callee, .. }
+            if matches!(callee, mora::mir::witness::WitnessCallee::Name(n) if n == "[]"))
+    });
+    assert!(found.is_some(), "expected Index to parse as Call(\"[]\")");
 }
 
 // ─── Combined scenarios ──────────────────────────────────────────────
 
 #[test]
 fn method_call_chained_parses() {
-    let exprs = parse_v3("obj.foo().bar()");
-    assert!(!exprs.is_empty(), "chained method calls should parse");
+    let ws = compile_witnesses("obj.foo().bar()");
+    assert!(!ws.is_empty(), "chained method calls should parse");
 }
 
 #[test]
 fn dyntrait_then_method_call_parses() {
-    let exprs = parse_v3("(x as dyn Any).method()");
+    let ws = compile_witnesses("(x as dyn Any).method()");
     assert!(
-        !exprs.is_empty(),
+        !ws.is_empty(),
         "dyn trait cast then method call should parse"
     );
 }
 
 // ─── Union type annotation (v0.85) ───────────────────────────────────
 // §3.4: `let x: string | number = ...` — parser accepts pipe-separated union types.
-// The legacy parse() path returns MirExpr::LetBinding with type_hint = Type::Union(...).
 
 #[test]
 fn union_type_two_members_parses() {
-    use mora::mir::expr::MirExprKind;
     use mora::typeck::Type;
-    let exprs = parse_v3("let x: string | number = 42");
-    assert!(
-        !exprs.is_empty(),
-        "union type annotation should parse"
-    );
-    if let Some(MirExprKind::LetBinding { type_hint, .. }) = exprs.first().map(|e| &e.kind) {
-        assert!(
-            matches!(type_hint, Some(Type::Union(m)) if m.len() == 2),
-            "expected Type::Union with 2 members, got {:?}",
-            type_hint
-        );
-    } else {
-        panic!("expected LetBinding, got {:?}", exprs.first().map(|e| &e.kind));
-    }
+    let ws = compile_witnesses("let x: string | number = 42");
+    assert!(!ws.is_empty(), "union type annotation should parse");
+    let found = find_witness(&ws, &|k| {
+        matches!(k, WitnessKind::LetBinding { type_hint: Some(h), .. }
+            if matches!(h.to_type(), Type::Union(m) if m.len() == 2))
+    });
+    assert!(found.is_some(), "expected LetBinding with 2-member union type hint");
 }
 
 #[test]
 fn union_type_three_members_parses() {
-    use mora::mir::expr::MirExprKind;
     use mora::typeck::Type;
-    let exprs = parse_v3("let x: string | number | bool = true");
-    assert!(
-        !exprs.is_empty(),
-        "union type annotation with 3 members should parse"
-    );
-    if let Some(MirExprKind::LetBinding { type_hint, .. }) = exprs.first().map(|e| &e.kind) {
-        assert!(
-            matches!(type_hint, Some(Type::Union(m)) if m.len() == 3),
-            "expected Type::Union with 3 members, got {:?}",
-            type_hint
-        );
-    } else {
-        panic!("expected LetBinding, got {:?}", exprs.first().map(|e| &e.kind));
-    }
+    let ws = compile_witnesses("let x: string | number | bool = true");
+    assert!(!ws.is_empty(), "union type annotation with 3 members should parse");
+    let found = find_witness(&ws, &|k| {
+        matches!(k, WitnessKind::LetBinding { type_hint: Some(h), .. }
+            if matches!(h.to_type(), Type::Union(m) if m.len() == 3))
+    });
+    assert!(found.is_some(), "expected LetBinding with 3-member union type hint");
 }
 
 #[test]
 fn union_type_single_member_parses_as_plain_type() {
-    use mora::mir::expr::MirExprKind;
     use mora::typeck::Type;
     // A "union" with one member is just a plain type (no Union wrapper).
-    let exprs = parse_v3("let x: int = 42");
-    if let Some(MirExprKind::LetBinding { type_hint, .. }) = exprs.first().map(|e| &e.kind) {
-        assert!(
-            matches!(type_hint, Some(Type::Int)),
-            "single-member union should be a plain Type::Int, not Type::Union",
-        );
-    }
+    let ws = compile_witnesses("let x: int = 42");
+    let found = find_witness(&ws, &|k| {
+        matches!(k, WitnessKind::LetBinding { type_hint: Some(h), .. }
+            if matches!(h.to_type(), Type::Int))
+    });
+    assert!(
+        found.is_some(),
+        "single-member union should be a plain Type::Int, not Type::Union"
+    );
 }

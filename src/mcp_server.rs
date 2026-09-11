@@ -383,7 +383,11 @@ async fn handle_tools_call(
     let interp = interp.clone();
     let result = tokio::task::spawn_blocking(move || {
         let mut interp = interp.blocking_write();
-        interp.call_value(&handler, vec![args_value])
+        interp.call_value(
+            &handler,
+            vec![args_value],
+            &mut crate::mir::effect::Effects::new(),
+        )
     })
     .await;
 

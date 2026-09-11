@@ -41,6 +41,7 @@ pub fn h_binary_op(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)] // effect-as-data 线穿：regs+5 语义参数+effects
 pub fn h_call(
     regs: &mut [Value],
     dst: Reg,
@@ -49,6 +50,7 @@ pub fn h_call(
     task_registry: &HashMap<&str, (&[String], &MirFunction)>,
     interp: &mut dyn MirHost,
     env: &mut Environment,
+    effects: &mut crate::mir::effect::Effects,
 ) -> Result<(), String> {
     let arg_vals: Vec<Value> = args.iter().map(|r| regs[*r].clone()).collect();
     let result = if let Some((params, body)) = task_registry.get(name) {
@@ -58,7 +60,7 @@ pub fn h_call(
             child_env.define(param.clone(), val, false);
         }
         // v0.75.9: 包裹 Arc 走全局 DAG 缓存（task body 借自指令表）
-        run_mir(&Arc::new((*body).clone()), interp, &mut child_env)?
+        run_mir(&Arc::new((*body).clone()), interp, &mut child_env, effects)?
     } else if let Some(callable) = env.get(name) {
         // v0.75.76: 用户自定义 callable（Closure/Task/Compose/Partial）在
         // 执行 env 中直调（与 h_define 同一容器，无回落）；其余名（builtin、
@@ -67,11 +69,11 @@ pub fn h_call(
             Value::Task { .. }
             | Value::Closure { .. }
             | Value::Compose(_)
-            | Value::Partial(_, _) => interp.call_value(&callable, arg_vals)?,
-            _ => interp.mir_call_function(name, arg_vals, env)?,
+            | Value::Partial(_, _) => interp.call_value(&callable, arg_vals, effects)?,
+            _ => interp.mir_call_function(name, arg_vals, env, effects)?,
         }
     } else {
-        interp.mir_call_function(name, arg_vals, env)?
+        interp.mir_call_function(name, arg_vals, env, effects)?
     };
     regs[dst] = result;
     Ok(())
@@ -113,10 +115,11 @@ pub fn h_method_call(
     method: &str,
     args: &[Reg],
     interp: &mut dyn MirHost,
+    effects: &mut crate::mir::effect::Effects,
 ) -> Result<(), String> {
     let recv_val = regs[receiver].clone();
     let arg_vals: Vec<Value> = args.iter().map(|r| regs[*r].clone()).collect();
-    regs[dst] = interp.mir_call_method(recv_val, method, arg_vals)?;
+    regs[dst] = interp.mir_call_method(recv_val, method, arg_vals, effects)?;
     Ok(())
 }
 
@@ -126,10 +129,11 @@ pub fn h_pipe(
     lhs: Reg,
     rhs: Reg,
     interp: &mut dyn MirHost,
+    effects: &mut crate::mir::effect::Effects,
 ) -> Result<(), String> {
     let lhs_val = regs[lhs].clone();
     let rhs_val = regs[rhs].clone();
-    regs[dst] = interp.call_value(&rhs_val, vec![lhs_val])?;
+    regs[dst] = interp.call_value(&rhs_val, vec![lhs_val], effects)?;
     Ok(())
 }
 

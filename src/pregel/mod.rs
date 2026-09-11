@@ -30,12 +30,13 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::checkpoint::{Checkpoint, CheckpointSaver, SendTask};
-use crate::mir::expr::MirExpr;
-use crate::mir::expr::{MirInterruptPoint, MirInterruptWhen, MirPregelConfig, MirReducerKind};
+use crate::mir::orchestrate::{MirInterruptPoint, MirInterruptWhen, MirPregelConfig, MirReducerKind};
 use crate::mir::host::MirHost;
 use crate::value::{Conflict, MergeStrategy, Value};
 
 pub mod worker_pool;
+pub mod state;
+pub mod reducers;
 
 /// Interrupt 回调签名
 pub type MirInterruptCallback = Arc<dyn Fn(&str, MirInterruptWhen) -> bool>;
@@ -100,7 +101,7 @@ pub struct MirPregelEngine {
     /// of each step, reduced at the end, exposed as channels.
     pub aggregator_acc: HashMap<String, Value>,
     /// v0.71: Final reducer applied to aggregator_acc each super-step.
-    pub aggregator_reducer: HashMap<String, crate::mir::expr::AggregatorKind>,
+    pub aggregator_reducer: HashMap<String, crate::mir::orchestrate::AggregatorKind>,
     /// v0.72: Per-agent combiner body for pre-delivery message folding.
     pub combiner_bodies: HashMap<String, std::sync::Arc<crate::mir::MirFunction>>,
     /// v0.72: Master coordinator hook — runs once per super-step after
@@ -132,14 +133,15 @@ pub struct MirPregelEngine {
     /// v0.75.10: 寄存器级增量（memo）在其之上细化 — input 未变整体跳过，
     /// input 变了但部分纯节点输入未变则节点级跳过。v1 语义不变。
     agent_input_cache: HashMap<String, String>,
-    /// v0.75.8: 每 agent 上次成功执行的 (signal, result, sends) — 跳过执行时
+    /// v0.75.8: 每 agent 上次成功执行的 (signal, result, effects) — 跳过执行时
     /// 复用。input 相同 → 确定性执行，语义等价。
+    /// v0.93: 第三元从 `Vec<SendTask>` 改为 `Effects`（sends + contributions）。
     agent_outcome_cache: HashMap<
         String,
         (
             crate::mir::vm::MirSignal,
             crate::value::Value,
-            Vec<crate::checkpoint::SendTask>,
+            crate::mir::effect::Effects,
         ),
     >,
     /// v0.75.10: 每 agent 的寄存器级增量 memo（跨超步保持）— 纯节点按输入
@@ -180,12 +182,16 @@ pub struct EngineStats {
 
 /// v0.73: Per-agent outcome collected from a worker (parallel EXEC) or
 /// inline (sequential EXEC). Everything needed by RECONCILE.
+///
+/// v0.93: 唯一定义 —— 经 `state::AgentExecOutcome` 再导出（此前 state.rs
+/// 另有一份重复定义，engine/ 用 state 版、mod.rs 用自己的，属拼接债）。
 pub struct AgentExecOutcome {
     pub node_name: String,
     pub signal: crate::mir::vm::MirSignal,
     pub result: crate::value::Value,
     pub env: crate::value::Environment,
-    pub sends: Vec<crate::checkpoint::SendTask>,
+    /// v0.93: 本 agent 执行累积的全部效应（sends + aggregator contributions）。
+    pub effects: crate::mir::effect::Effects,
     /// v0.75.7: 本次 agent 执行耗时（ms），用于 per_agent_ms 统计。
     pub duration_ms: u128,
     /// v0.75.8: 本次执行的 input（build_node_input 结果），用于增量缓存。
@@ -240,24 +246,6 @@ fn concat_reduce(current: Option<Value>, incoming: Value) -> Result<Value, Strin
     Ok(Value::String(cur + &inc))
 }
 
-/// v0.67: Try to parse a Custom reducer's String payload as a MirExpr
-/// heuristic: integer → IntLit, anything else → Variable reference.
-fn parse_custom_merge_expr(s: &str) -> crate::mir::expr::MirExpr {
-    use crate::common::{Literal, Span};
-    let span = Span::default();
-    if let Ok(n) = s.parse::<i64>() {
-        MirExpr {
-            kind: crate::mir::expr::MirExprKind::Literal(Literal::Int(n, span)),
-            span,
-        }
-    } else {
-        MirExpr {
-            kind: crate::mir::expr::MirExprKind::Variable(s.to_string()),
-            span,
-        }
-    }
-}
-
 impl MirPregelEngine {
     /// 构造 MIR-native Pregel 引擎
     pub fn new(config: MirPregelConfig) -> Self {
@@ -277,7 +265,7 @@ impl MirPregelEngine {
             .iter()
             .map(|a| (a.name.clone(), a.initial.clone()))
             .collect();
-        let aggregator_reducer: HashMap<String, crate::mir::expr::AggregatorKind> = config
+        let aggregator_reducer: HashMap<String, crate::mir::orchestrate::AggregatorKind> = config
             .aggregators
             .iter()
             .map(|a| (a.name.clone(), a.reducer.clone()))
@@ -474,7 +462,7 @@ impl MirPregelEngine {
             (
                 outcome.signal.clone(),
                 outcome.result.clone(),
-                outcome.sends.clone(),
+                outcome.effects.clone(),
             ),
         );
 
@@ -519,6 +507,8 @@ impl MirPregelEngine {
         ));
 
         // Static edges → next hop (with condition evaluation).
+        // v0.93: 条件体效应先累积，循环结束后统一折叠（避免与 edges 借用冲突）。
+        let mut edge_effects = crate::mir::effect::Effects::new();
         for edge in &self.config.edges {
             if edge.from == node_name && edge.to != "@exit" {
                 if let Some(cond_body) = &edge.condition_body {
@@ -528,6 +518,7 @@ impl MirPregelEngine {
                         &std::sync::Arc::new(cond_body.clone()),
                         host,
                         &mut cond_env,
+                        &mut edge_effects,
                     )
                     .unwrap_or(Value::Bool(false));
                     if !crate::flow::is_truthy(&cond_val) {
@@ -537,9 +528,23 @@ impl MirPregelEngine {
                 next_active.insert(edge.to.clone());
             }
         }
+        self.apply_effects(edge_effects)?;
 
-        // Worker's dynamic sends → engine pending_sends (step-N+1 delivery).
-        self.flush_pending_sends(outcome.sends);
+        // v0.93: Worker's effects (sends + aggregator contributions) → engine.
+        // 一条数据通道（Effects），不再区分 sends / contributions 两个缓冲。
+        // 这是「用数据流代替状态机」的核心：effect 是 worker 产出的值，
+        // RECONCILE 按确定顺序把它 merge 进引擎状态。
+        self.apply_effects(outcome.effects)?;
+        Ok(())
+    }
+
+    /// v0.93: 把一次执行的效应值折叠进引擎状态 —— send 进 pending_sends，
+    /// contribution 立即经 aggregator_contribute 归约。
+    fn apply_effects(&mut self, effects: crate::mir::effect::Effects) -> Result<(), String> {
+        self.flush_pending_sends(effects.sends);
+        for contrib in effects.contributions {
+            self.aggregator_contribute(&contrib.name, contrib.value)?;
+        }
         Ok(())
     }
 
@@ -564,19 +569,19 @@ impl MirPregelEngine {
             .aggregator_acc
             .entry(name.to_string())
             .or_insert_with(|| match reducer {
-                crate::mir::expr::AggregatorKind::Add => Value::Int(0),
-                crate::mir::expr::AggregatorKind::Max => value.clone(),
-                crate::mir::expr::AggregatorKind::Min => value.clone(),
-                crate::mir::expr::AggregatorKind::Last => value.clone(),
-                crate::mir::expr::AggregatorKind::Concat => Value::String(String::new()),
+                crate::mir::orchestrate::AggregatorKind::Add => Value::Int(0),
+                crate::mir::orchestrate::AggregatorKind::Max => value.clone(),
+                crate::mir::orchestrate::AggregatorKind::Min => value.clone(),
+                crate::mir::orchestrate::AggregatorKind::Last => value.clone(),
+                crate::mir::orchestrate::AggregatorKind::Concat => Value::String(String::new()),
             });
         *acc = match reducer {
-            crate::mir::expr::AggregatorKind::Add => crate::flow::eval_binary(
+            crate::mir::orchestrate::AggregatorKind::Add => crate::flow::eval_binary(
                 std::mem::replace(acc, Value::Int(0)),
                 &crate::common::BinaryOp::Add,
                 value,
             )?,
-            crate::mir::expr::AggregatorKind::Max => {
+            crate::mir::orchestrate::AggregatorKind::Max => {
                 let cur = acc.clone();
                 match crate::flow::eval_binary(
                     value.clone(),
@@ -587,15 +592,15 @@ impl MirPregelEngine {
                     _ => acc.clone(),               // else keep current (incl. equal)
                 }
             }
-            crate::mir::expr::AggregatorKind::Min => {
+            crate::mir::orchestrate::AggregatorKind::Min => {
                 let cur = acc.clone();
                 match crate::flow::eval_binary(value.clone(), &crate::common::BinaryOp::Less, cur) {
                     Ok(Value::Bool(true)) => value, // incoming < current → keep incoming
                     _ => acc.clone(),               // else keep current (incl. equal)
                 }
             }
-            crate::mir::expr::AggregatorKind::Last => value,
-            crate::mir::expr::AggregatorKind::Concat => {
+            crate::mir::orchestrate::AggregatorKind::Last => value,
+            crate::mir::orchestrate::AggregatorKind::Concat => {
                 let prev = std::mem::replace(acc, Value::String(String::new()));
                 let new = match prev {
                     Value::String(s) => format!("{}{}", s, value),
@@ -677,6 +682,8 @@ impl MirPregelEngine {
             // v0.57 bugfix: 下一跳必须从 active_nodes（含 @start）计算，
             // 而不只是从 to_execute。这样 @start -> a 这类入口边才能触发 agent 执行。
             let mut next_active: HashSet<String> = HashSet::new();
+            // v0.93: PLAN 条件体效应累积（循环后统一折叠，避免与 edges 借用冲突）。
+            let mut plan_effects = crate::mir::effect::Effects::new();
             for active_node in &active_nodes {
                 for edge in &self.config.edges {
                     if edge.from == *active_node && edge.to != "@exit" {
@@ -688,6 +695,7 @@ impl MirPregelEngine {
                                 &std::sync::Arc::new(cond_body.clone()),
                                 interpreter,
                                 &mut cond_env,
+                                &mut plan_effects,
                             )
                             .unwrap_or(Value::Bool(false));
                             if !crate::flow::is_truthy(&cond_val) {
@@ -698,6 +706,7 @@ impl MirPregelEngine {
                     }
                 }
             }
+            self.apply_effects(plan_effects)?;
 
             // v0.75.57: EXEC 段提取至 execute_step（BSP 超步执行 + fault tolerance）
             let writes = self.execute_step(interpreter, &to_execute, &mut next_active)?;
@@ -707,13 +716,9 @@ impl MirPregelEngine {
                 self.apply_write(channel, value, interpreter)?;
             }
 
-            // v0.75.83: 收集 agent 经 aggregate 语句提交的贡献（MirHost 缓冲，
-            // 与 dynamic_sends 同构）→ aggregator_contribute 归约。
-            // 此前 h_aggregate 为空操作，语言层 → 引擎的贡献通道断头。
-            let contributions = std::mem::take(interpreter.aggregator_contributions());
-            for contrib in contributions {
-                self.aggregator_contribute(&contrib.name, contrib.value)?;
-            }
+            // v0.93: aggregator 贡献已随各 agent 的 Effects 在 RECONCILE 时
+            // 折叠进 aggregator_acc（见 apply_effects），此处无需再收集 ——
+            // 消除了此前「执行期缓冲 + 超步末统一 take」的两段式状态机。
 
             // v0.71: Publish aggregator results as channels for next step.
             for (name, value) in &self.aggregator_acc {
@@ -734,7 +739,9 @@ impl MirPregelEngine {
             if let Some(master) = self.master_compute.clone() {
                 let mut master_env = self.exec_env(interpreter).lock().clone();
                 // v0.75.9: master_compute 已是 Arc，直接走全局 DAG 缓存
-                crate::mir::vm::run_mir(&master, interpreter, &mut master_env)?;
+                let mut master_effects = crate::mir::effect::Effects::new();
+                crate::mir::vm::run_mir(&master, interpreter, &mut master_env, &mut master_effects)?;
+                self.apply_effects(master_effects)?;
             }
 
             // interrupt after
@@ -756,6 +763,9 @@ impl MirPregelEngine {
             // before delivery. Default behavior (no combiner) = last-write-wins.
             let mut by_target: std::collections::HashMap<String, Vec<crate::value::Value>> =
                 std::collections::HashMap::new();
+            // v0.93: combiner 体执行产生的效应（send/aggregate）累积于此，
+            // 在 ADVANCE 之后统一折叠 —— effect-as-data，无宿主侧信道。
+            let mut advance_effects = crate::mir::effect::Effects::new();
             for send in self.pending_sends.drain(..) {
                 by_target
                     .entry(send.target_node)
@@ -782,7 +792,7 @@ impl MirPregelEngine {
                         env.define("current".into(), acc.clone(), false);
                         env.define("incoming".into(), incoming.clone(), false);
                         // v0.75.9: combiner_bodies 已是 Arc，直接走全局 DAG 缓存
-                        match crate::mir::vm::run_mir(&combiner, interpreter, &mut env) {
+                        match crate::mir::vm::run_mir(&combiner, interpreter, &mut env, &mut advance_effects) {
                             Ok(v) => acc = v,
                             Err(_) => acc = incoming.clone(), // fallback: LWW
                         }
@@ -798,6 +808,7 @@ impl MirPregelEngine {
                     .or_insert(0) += 1;
                 next_active.insert(target);
             }
+            self.apply_effects(std::mem::take(&mut advance_effects))?;
             active_nodes = next_active.into_iter().collect();
             // v0.73: Sort active_nodes by agent definition order for
             // deterministic super-step scheduling (HashSet iteration order
@@ -900,7 +911,7 @@ impl MirPregelEngine {
                         // input 未变整体跳过；input 变了但部分纯节点输入
                         // 未变则节点级跳过（run_dag_with_signal_memo）。
                         if self.agent_input_cache.get(node_name) == Some(&input_str)
-                            && let Some((signal, result, _sends)) =
+                            && let Some((signal, result, cached_effects)) =
                                 self.agent_outcome_cache.get(node_name).cloned()
                         {
                             let outcome = AgentExecOutcome {
@@ -908,9 +919,9 @@ impl MirPregelEngine {
                                 signal,
                                 result,
                                 env,
-                                // 顺序路径 sends 经 interpreter.dynamic_sends
-                                // 在循环外收集；跳过则无新 send。
-                                sends: Vec::new(),
+                                // 跳过路径复用缓存的 effect（含 sends + contributions），
+                                // 保证跳过与重跑语义一致。
+                                effects: cached_effects,
                                 duration_ms: 0,
                                 input_str,
                                 // 跳过路径：无实际执行（v0.75.10）。
@@ -948,12 +959,16 @@ impl MirPregelEngine {
                         let started = std::time::Instant::now();
                         // v0.75.10: 寄存器级增量执行 — 纯节点输入与上次
                         // 相等则跳过；副作用/env 读取节点永远重跑。
+                        // v0.93: 本 agent 的效应写入私有 Effects（数据），
+                        // 随 outcome 经 reconcile 折叠进引擎 —— effect-as-data。
+                        let mut agent_effects = crate::mir::effect::Effects::new();
                         let (signal, result) = crate::mir::vm::run_dag_with_signal_memo(
                             dag.as_ref(),
                             task_body.as_ref(),
                             &mut memo,
                             interpreter,
                             &mut env,
+                            &mut agent_effects,
                         )
                         .map_err(|e| format!("Pregel node '{}': {}", node_name, e))?;
                         let duration_ms = started.elapsed().as_millis();
@@ -965,7 +980,7 @@ impl MirPregelEngine {
                             signal,
                             result,
                             env,
-                            sends: Vec::new(),
+                            effects: agent_effects,
                             duration_ms,
                             input_str,
                             nodes_executed,
@@ -1006,7 +1021,7 @@ impl MirPregelEngine {
                         // v0.75.8: 增量 v1 — input 未变则跳过，直接 reconcile
                         // 缓存 outcome（与顺序路径同语义）。
                         if self.agent_input_cache.get(node_name) == Some(&input_str)
-                            && let Some((signal, result, sends)) =
+                            && let Some((signal, result, cached_effects)) =
                                 self.agent_outcome_cache.get(node_name).cloned()
                         {
                             let outcome = AgentExecOutcome {
@@ -1014,7 +1029,8 @@ impl MirPregelEngine {
                                 signal,
                                 result,
                                 env,
-                                sends,
+                                // 跳过路径复用缓存的效应（重放「若执行会产出什么」）。
+                                effects: cached_effects,
                                 duration_ms: 0,
                                 input_str,
                                 // 跳过路径：无实际执行；并行 worker 内联执行
@@ -1073,21 +1089,26 @@ impl MirPregelEngine {
                                     // v0.75.6: 用缓存 dag 执行（避免每超步重建）
                                     // v0.75.7: 计时 per-agent 耗时
                                     let job_started = std::time::Instant::now();
+                                    // v0.93: worker 产出写入私有 Effects（数据）回传 ——
+                                    // 此前 worker 只 drain dynamic_sends，aggregator
+                                    // 贡献被静默丢弃（并行路径正确性缺陷），现在
+                                    // send + contribution 同属一个 Effects 值。
+                                    let mut worker_effects = crate::mir::effect::Effects::new();
                                     let (signal, result) = crate::mir::vm::run_dag_with_signal(
                                         dag.as_ref(),
                                         &task,
                                         interp_clone.as_mut(),
                                         &mut env,
+                                        &mut worker_effects,
                                     )
                                     .map_err(|e| format!("Pregel node '{}': {}", name, e))?;
                                     let duration_ms = job_started.elapsed().as_millis();
-                                    let sends = std::mem::take(interp_clone.dynamic_sends());
                                     Ok(Box::new(AgentExecOutcome {
                                         node_name: name,
                                         signal,
                                         result,
                                         env,
-                                        sends,
+                                        effects: worker_effects,
                                         duration_ms,
                                         input_str,
                                         // v0.75.10: worker 内联执行（无 memo），
@@ -1135,9 +1156,6 @@ impl MirPregelEngine {
                     }
                 }
 
-                // v0.73: Flush intra-run sends so a step-N send reaches step-N+1.
-                let sends = std::mem::take(interpreter.dynamic_sends());
-                self.flush_pending_sends(sends);
                 Ok(())
             })();
             // end retryable exec closure
@@ -1212,19 +1230,25 @@ impl MirPregelEngine {
             None => match reducer {
                 MirReducerKind::Merge(merge_expr) => {
                     // v0.62: Execute the merge body with `current` and `incoming`.
-                    let merge_fn =
-                        crate::mir::lower::lower_mir_exprs(std::slice::from_ref(&merge_expr))
-                            .map_err(|e| format!("Pregel merge body lowering failed: {}", e))?;
+                    // v0.92: merge_expr 现为 MirWitness——直接 lower。
+                    let merge_fn = crate::mir::lower::lower_mir_witnesses(std::slice::from_ref(
+                        &merge_expr,
+                    ))
+                    .map_err(|e| format!("Pregel merge body lowering failed: {}", e))?;
                     let mut merge_env = self.exec_env(interpreter).lock().clone();
                     merge_env.define("current".into(), current.unwrap_or(Value::Nil), false);
                     merge_env.define("incoming".into(), value, false);
                     // v0.75.9: 包裹 Arc 走全局 DAG 缓存
-                    crate::mir::vm::run_mir(
+                    let mut merge_effects = crate::mir::effect::Effects::new();
+                    let v = crate::mir::vm::run_mir(
                         &std::sync::Arc::new(merge_fn),
                         interpreter,
                         &mut merge_env,
+                        &mut merge_effects,
                     )
-                    .map_err(|e| format!("Pregel merge body execution failed: {}", e))?
+                    .map_err(|e| format!("Pregel merge body execution failed: {}", e))?;
+                    self.apply_effects(merge_effects)?;
+                    v
                 }
                 // v0.67: Sum — accumulate numeric writes (first write initializes).
                 MirReducerKind::Sum => accumulator_reduce(current, value, "+")?,
@@ -1234,19 +1258,28 @@ impl MirPregelEngine {
                 MirReducerKind::Concat => concat_reduce(current, value)?,
                 // v0.67: Custom — execute user body via Custom merge expression.
                 MirReducerKind::Custom(merge_expr) => {
-                    let expr = parse_custom_merge_expr(merge_expr.as_str());
-                    let merge_fn = crate::mir::lower::lower_mir_exprs(&[expr])
-                        .map_err(|e| format!("Pregel custom body lowering failed: {}", e))?;
+                    // v0.94: 用 reducers.rs 的唯一实现（返回 MirWitness）。
+                    let merge_witness = crate::pregel::reducers::parse_custom_merge_expr(
+                        merge_expr.as_str(),
+                    );
+                    let merge_fn = crate::mir::lower::lower_mir_witnesses(std::slice::from_ref(
+                        &merge_witness,
+                    ))
+                    .map_err(|e| format!("Pregel custom body lowering failed: {}", e))?;
                     let mut merge_env = self.exec_env(interpreter).lock().clone();
                     merge_env.define("current".into(), current.unwrap_or(Value::Nil), false);
                     merge_env.define("incoming".into(), value, false);
                     // v0.75.9: 包裹 Arc 走全局 DAG 缓存
-                    crate::mir::vm::run_mir(
+                    let mut merge_effects = crate::mir::effect::Effects::new();
+                    let v = crate::mir::vm::run_mir(
                         &std::sync::Arc::new(merge_fn),
                         interpreter,
                         &mut merge_env,
+                        &mut merge_effects,
                     )
-                    .map_err(|e| format!("Pregel custom body execution failed: {}", e))?
+                    .map_err(|e| format!("Pregel custom body execution failed: {}", e))?;
+                    self.apply_effects(merge_effects)?;
+                    v
                 }
                 // Static reducers already handled by to_merge_strategy() above
                 _ => value,
@@ -1292,7 +1325,7 @@ impl MirPregelEngine {
             .checkpoint
             .as_ref()
             .and_then(|c| c.thread_id.as_ref())
-            .map(|_| "pregel") // MirExpr evaluation deferred; use config presence as signal
+            .map(|_| "pregel") // thread_id witness evaluation deferred; config presence is the signal
             .unwrap_or("default");
         Checkpoint::new(
             thread_id.to_string(),
@@ -1369,7 +1402,16 @@ mod tests {
     use super::*;
     use crate::mir::MirFunction;
     use crate::mir::MirInst;
-    use crate::mir::expr::{MirAgentDef, MirEdgeDef, MirExpr, MirStateChannel};
+    use crate::mir::orchestrate::{MirAgentDef, MirEdgeDef, MirStateChannel};
+
+    /// v0.92: task_expr 字段现为 MirWitness——Nil 占位（实际执行走 task_body）。
+    fn nil_witness() -> crate::mir::witness::MirWitness {
+        let span = crate::common::Span::new(1, 1);
+        crate::mir::witness::MirWitness {
+            kind: crate::mir::witness::WitnessKind::Literal(crate::common::Literal::Nil(span)),
+            span,
+        }
+    }
 
     fn empty_mir_function() -> MirFunction {
         MirFunction {
@@ -1383,10 +1425,7 @@ mod tests {
     fn make_agent(name: &str) -> MirAgentDef {
         MirAgentDef {
             name: name.to_string(),
-            task_expr: MirExpr::lit(
-                crate::common::Literal::Nil(crate::common::Span::new(1, 1)),
-                crate::common::Span::new(1, 1),
-            ),
+            task_expr: nil_witness(),
             verify_expr: None,
             with_config: None,
             task_body: empty_mir_function(),
@@ -1598,10 +1637,7 @@ mod tests {
     fn make_const_agent(name: &str, value: i64) -> MirAgentDef {
         MirAgentDef {
             name: name.to_string(),
-            task_expr: MirExpr::lit(
-                crate::common::Literal::Nil(crate::common::Span::new(1, 1)),
-                crate::common::Span::new(1, 1),
-            ),
+            task_expr: nil_witness(),
             verify_expr: None,
             with_config: None,
             task_body: MirFunction {
@@ -1613,6 +1649,31 @@ mod tests {
                 n_regs: 1,
             
             ..Default::default()},
+            combiner_body: None,
+        }
+    }
+
+    /// v0.93: agent 体内含 `aggregate agg_name, value` —— 贡献一个聚合器值。
+    /// 用于验证 effect-as-data 通道（send + contribution 同一数据路径）。
+    fn make_aggregating_agent(name: &str, value: i64, agg_name: &str) -> MirAgentDef {
+        MirAgentDef {
+            name: name.to_string(),
+            task_expr: nil_witness(),
+            verify_expr: None,
+            with_config: None,
+            task_body: MirFunction {
+                params: Vec::new(),
+                body: vec![
+                    MirInst::Const(0, Value::Int(value)),
+                    MirInst::Aggregate {
+                        name: agg_name.to_string(),
+                        value: 0,
+                    },
+                    MirInst::Return(Some(0)),
+                ],
+                n_regs: 1,
+                ..Default::default()
+            },
             combiner_body: None,
         }
     }
@@ -1659,6 +1720,73 @@ mod tests {
         // Both agents ran exactly once (parallel mode keeps vertex_state).
         assert_eq!(par_engine.vertex_state.get("a"), Some(&VertexState::Active));
         assert_eq!(par_engine.vertex_state.get("b"), Some(&VertexState::Active));
+    }
+
+    /// v0.93 regression: `aggregate` 贡献在**并行**路径不再被静默丢弃。
+    ///
+    /// 缺陷背景：并行 worker 持有克隆宿主，此前 worker 只 drain
+    /// `dynamic_sends`，从不取 aggregator 贡献 → 并行模式下 aggregate
+    /// 全部丢失（聚合器停在初值）。effect-as-data 重构后，send 与
+    /// contribution 同属一个 `Effects` 值，worker 经显式 `&mut Effects`
+    /// 参数产出并随 outcome 回传，主线程按确定顺序 merge。
+    ///
+    /// 断言：并行（4 worker）与串行（1 worker）得到完全相同的聚合结果。
+    #[test]
+    fn parallel_aggregate_contributions_not_dropped() {
+        let mk_config = || MirPregelConfig {
+            agents: vec![
+                make_aggregating_agent("a", 10, "sum"),
+                make_aggregating_agent("b", 32, "sum"),
+            ],
+            edges: vec![
+                MirEdgeDef {
+                    from: "@start".into(),
+                    to: "a".into(),
+                    condition_expr: None,
+                    condition_body: None,
+                },
+                MirEdgeDef {
+                    from: "@start".into(),
+                    to: "b".into(),
+                    condition_expr: None,
+                    condition_body: None,
+                },
+            ],
+            state_schema: vec![],
+            checkpoint: None,
+            interrupt_points: vec![],
+            adjacency: HashMap::new(),
+            aggregators: vec![crate::mir::orchestrate::MirAggregatorDef {
+                name: "sum".into(),
+                ty: "Int".into(),
+                initial: Value::Int(0),
+                reducer: crate::mir::orchestrate::AggregatorKind::Add,
+            }],
+            master_compute: None,
+        };
+
+        // Sequential（1 worker）
+        let mut seq_engine = MirPregelEngine::new(mk_config());
+        let mut seq_interp = crate::interpreter::Interpreter::new();
+        seq_engine.run(&mut seq_interp).unwrap();
+        let seq_sum = seq_engine.aggregator_acc.get("sum").cloned();
+
+        // Parallel（4 workers）
+        let mut par_engine = MirPregelEngine::new(mk_config()).with_parallelism(4);
+        let mut par_interp = crate::interpreter::Interpreter::new();
+        par_engine.run(&mut par_interp).unwrap();
+        let par_sum = par_engine.aggregator_acc.get("sum").cloned();
+
+        assert_eq!(
+            seq_sum,
+            Some(Value::Int(42)),
+            "串行路径应有 10 + 32 = 42 的聚合贡献"
+        );
+        assert_eq!(
+            par_sum,
+            Some(Value::Int(42)),
+            "并行路径的聚合贡献此前被静默丢弃（会得 0）；修复后必须与串行一致"
+        );
     }
 
     /// Parallel mode keeps vertex_state consistent (both agents run once).
@@ -1715,10 +1843,7 @@ mod tests {
         let config = MirPregelConfig {
             agents: vec![MirAgentDef {
                 name: "a".into(),
-                task_expr: MirExpr::lit(
-                    crate::common::Literal::Nil(crate::common::Span::new(1, 1)),
-                    crate::common::Span::new(1, 1),
-                ),
+                task_expr: nil_witness(),
                 verify_expr: None,
                 with_config: None,
                 task_body: failing_body,
@@ -1864,10 +1989,7 @@ mod tests {
         let config = MirPregelConfig {
             agents: vec![MirAgentDef {
                 name: "a".into(),
-                task_expr: MirExpr::lit(
-                    crate::common::Literal::Nil(crate::common::Span::new(1, 1)),
-                    crate::common::Span::new(1, 1),
-                ),
+                task_expr: nil_witness(),
                 verify_expr: None,
                 with_config: None,
                 task_body: halt_body,
@@ -1909,17 +2031,17 @@ mod tests {
             interrupt_points: vec![],
             adjacency: HashMap::new(),
             aggregators: vec![
-                crate::mir::expr::MirAggregatorDef {
+                crate::mir::orchestrate::MirAggregatorDef {
                     name: "hi".into(),
                     ty: "Int".into(),
                     initial: Value::Int(0),
-                    reducer: crate::mir::expr::AggregatorKind::Max,
+                    reducer: crate::mir::orchestrate::AggregatorKind::Max,
                 },
-                crate::mir::expr::MirAggregatorDef {
+                crate::mir::orchestrate::MirAggregatorDef {
                     name: "lo".into(),
                     ty: "Int".into(),
                     initial: Value::Int(i64::MAX),
-                    reducer: crate::mir::expr::AggregatorKind::Min,
+                    reducer: crate::mir::orchestrate::AggregatorKind::Min,
                 },
             ],
             master_compute: None,
@@ -1980,11 +2102,11 @@ mod tests {
             checkpoint: None,
             interrupt_points: vec![],
             adjacency: HashMap::new(),
-            aggregators: vec![crate::mir::expr::MirAggregatorDef {
+            aggregators: vec![crate::mir::orchestrate::MirAggregatorDef {
                 name: "sum".into(),
                 ty: "Int".into(),
                 initial: Value::Int(0),
-                reducer: crate::mir::expr::AggregatorKind::Add,
+                reducer: crate::mir::orchestrate::AggregatorKind::Add,
             }],
             master_compute: None,
         };
@@ -2081,10 +2203,7 @@ mod tests {
         };
         let agent_a = MirAgentDef {
             name: "a".into(),
-            task_expr: MirExpr::lit(
-                crate::common::Literal::Nil(crate::common::Span::new(1, 1)),
-                crate::common::Span::new(1, 1),
-            ),
+            task_expr: nil_witness(),
             verify_expr: None,
             with_config: None,
             task_body: send_body,
@@ -2151,10 +2270,7 @@ mod tests {
         };
         let agent_a = MirAgentDef {
             name: "a".into(),
-            task_expr: MirExpr::lit(
-                crate::common::Literal::Nil(crate::common::Span::new(1, 1)),
-                crate::common::Span::new(1, 1),
-            ),
+            task_expr: nil_witness(),
             verify_expr: None,
             with_config: None,
             task_body: send_body,
@@ -2314,14 +2430,14 @@ mod tests {
         };
         let mut engine = MirPregelEngine::new(config);
         // 预填充：input = "{}"（无 channel 时 build_node_input 返回），
-        // outcome = (Return(42), Int(42), 无 sends)
+        // outcome = (Return(42), Int(42), 无 effects)
         engine.agent_input_cache.insert("a".into(), "{}".into());
         engine.agent_outcome_cache.insert(
             "a".into(),
             (
                 crate::mir::vm::MirSignal::Return(Value::Int(42)),
                 Value::Int(42),
-                Vec::new(),
+                crate::mir::effect::Effects::new(),
             ),
         );
         let mut interp = crate::interpreter::Interpreter::new();
@@ -2380,10 +2496,7 @@ mod tests {
     fn make_custom_agent(name: &str, body: MirFunction) -> MirAgentDef {
         MirAgentDef {
             name: name.to_string(),
-            task_expr: MirExpr::lit(
-                crate::common::Literal::Nil(crate::common::Span::new(1, 1)),
-                crate::common::Span::new(1, 1),
-            ),
+            task_expr: nil_witness(),
             verify_expr: None,
             with_config: None,
             task_body: body,

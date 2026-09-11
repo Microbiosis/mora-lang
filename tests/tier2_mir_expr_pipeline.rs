@@ -21,8 +21,8 @@ fn run_v3_pipeline(source: &str) -> Result<(), String> {
     let mut interp = Interpreter::new();
     let mut env = interp.take_env();
     let func_arc = std::sync::Arc::new(func);
-    run_mir(&func_arc, &mut interp, &mut env)?;
-    run_main_task(&func_arc, &mut interp, &mut env)
+    run_mir(&func_arc, &mut interp, &mut env, &mut mora::mir::effect::Effects::new())?;
+    run_main_task(&func_arc, &mut interp, &mut env, &mut mora::mir::effect::Effects::new())
 }
 
 // ===================================================================
@@ -213,12 +213,12 @@ fn v3_typecheck_clean_program() {
 
 #[test]
 fn v3_pipeline_string_concat_runs() {
-    run_v3_pipeline(r#"let a = "hello"\nlet b = " "\nlet c = "world"\nprint(a + b + c)"#).expect("string concat should run");
+    run_v3_pipeline("let a = \"hello\"\nlet b = \" \"\nlet c = \"world\"\nprint(a + b + c)").expect("string concat should run");
 }
 
 #[test]
 fn v3_pipeline_dict_access_runs() {
-    run_v3_pipeline(r#"let d = {"key": 42}\nprint(d["key"])"#).expect("dict access should run");
+    run_v3_pipeline("let d = {\"key\": 42}\nprint(d[\"key\"])").expect("dict access should run");
 }
 
 #[test]

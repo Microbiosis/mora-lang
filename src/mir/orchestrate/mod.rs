@@ -5,11 +5,10 @@
 //! 与 Kernel 层（handlers）之间的跨层耦合。
 //!
 //! 依赖：
-//!   - `MirExpr` / `MirExprKind` — 从 `crate::mir::expr` re-export（witness/LSP 序列化用）
+//!   - `MirWitness` — 从 `crate::mir::witness` 引用（v0.92: 字段类型已迁移）
 //!   - `MirFunction` — 从 `crate::mir` 直接引用
 
 use crate::mir::MirFunction;
-use crate::mir::expr::MirExpr;
 use std::collections::HashMap;
 
 use crate::value::{MergeStrategy, Value};
@@ -28,7 +27,7 @@ pub enum MirOrchestrateKind {
     Loop {
         agents: Vec<MirAgentDef>,
         rounds: Option<u64>,
-        exit_when: Option<MirExpr>,
+        exit_when: Option<crate::mir::witness::MirWitness>,
     },
     Graph {
         agents: Vec<MirAgentDef>,
@@ -58,7 +57,8 @@ pub enum MirOrchestrateKind {
         /// 由引擎按 Aggregate-and-Synthesize 模板生成）。
         /// v0.91: `prompt_fn` 是预 lowering 后的 MirFunction（parser 阶段完成），
         /// `prompt` 保留给 witness/LSP 序列化。handlers 执行走 prompt_fn。
-        prompt: MirExpr,
+        /// v0.92: prompt 从 MirExpr 迁移到 MirWitness。
+        prompt: crate::mir::witness::MirWitness,
         /// v0.91: 预 lowering 的 prompt 函数（handlers 执行用，消除 MirExpr 跨层依赖）。
         prompt_fn: MirFunction,
     },
@@ -73,17 +73,139 @@ pub enum MirOrchestrateKind {
         /// 路由器（门控）：语言面 fn(x) → Dict(专家名 → 分数)。
         /// v0.91: `router_fn` 是预 lowering 后的 MirFunction（parser 阶段完成），
         /// `router` 保留给 witness/LSP 序列化。handlers 执行走 router_fn。
-        router: MirExpr,
+        /// v0.92: router 从 MirExpr 迁移到 MirWitness。
+        router: crate::mir::witness::MirWitness,
         /// 稀疏度：只激活分数最高 top_k 个专家（标准配置 2，k=1 可行）。
         top_k: usize,
         /// 模型专家的 prompt（含 {input} 插值）。
         /// v0.91: `prompt_fn` 是预 lowering 后的 MirFunction，`prompt` 保留给 witness。
-        prompt: MirExpr,
+        /// v0.92: prompt 从 MirExpr 迁移到 MirWitness。
+        prompt: crate::mir::witness::MirWitness,
         /// v0.91: 预 lowering 的 router 函数（handlers 执行用，消除 MirExpr 跨层依赖）。
         router_fn: MirFunction,
         /// v0.91: 预 lowering 的 prompt 函数（handlers 执行用）。
         prompt_fn: MirFunction,
     },
+}
+
+impl MirOrchestrateKind {
+    /// v0.92: WitnessOrchestrateKind → MirOrchestrateKind。
+    /// v0.92: 字段类型已迁移到 MirWitness —— 直接 clone，无需 MirExpr 桥接。
+    pub fn from_witness_kind(
+        w: &crate::mir::witness::WitnessOrchestrateKind,
+    ) -> MirOrchestrateKind {
+        use crate::mir::witness::WitnessOrchestrateKind as W;
+        match w {
+            W::Sequential { agents } => MirOrchestrateKind::Sequential {
+                agents: agents.iter().map(mir_agent_from_witness).collect(),
+            },
+            W::Loop {
+                agents,
+                rounds,
+                exit_when,
+            } => MirOrchestrateKind::Loop {
+                agents: agents.iter().map(mir_agent_from_witness).collect(),
+                rounds: *rounds,
+                exit_when: exit_when.clone(),
+            },
+            W::Graph { agents, edges } => MirOrchestrateKind::Graph {
+                agents: agents.iter().map(mir_agent_from_witness).collect(),
+                edges: edges.iter().map(mir_edge_from_witness).collect(),
+            },
+            W::Pregel {
+                agents,
+                edges,
+                state_schema,
+                checkpoint,
+                interrupt_points,
+                adjacency,
+            } => MirOrchestrateKind::Pregel {
+                agents: agents.iter().map(mir_agent_from_witness).collect(),
+                edges: edges.iter().map(mir_edge_from_witness).collect(),
+                state_schema: state_schema.clone(),
+                checkpoint: checkpoint.clone(),
+                interrupt_points: interrupt_points.clone(),
+                adjacency: adjacency.clone(),
+            },
+            W::Moa {
+                layers,
+                proposers,
+                aggregator,
+                prompt,
+            } => {
+                let prompt_fn = crate::mir::lower::lower_mir_witnesses(
+                    std::slice::from_ref(prompt.as_ref()),
+                )
+                .unwrap_or_default();
+                MirOrchestrateKind::Moa {
+                    layers: *layers,
+                    proposers: proposers.clone(),
+                    aggregator: aggregator.clone(),
+                    prompt: prompt.as_ref().clone(),
+                    prompt_fn,
+                }
+            }
+            W::Moe {
+                experts,
+                router,
+                top_k,
+                prompt,
+            } => {
+                let router_fn = crate::mir::lower::lower_mir_witnesses(
+                    std::slice::from_ref(router.as_ref()),
+                )
+                .unwrap_or_default();
+                let prompt_fn = crate::mir::lower::lower_mir_witnesses(
+                    std::slice::from_ref(prompt.as_ref()),
+                )
+                .unwrap_or_default();
+                MirOrchestrateKind::Moe {
+                    experts: experts.iter().map(mir_moe_expert_from_witness).collect(),
+                    router: router.as_ref().clone(),
+                    top_k: *top_k,
+                    prompt: prompt.as_ref().clone(),
+                    router_fn,
+                    prompt_fn,
+                }
+            }
+        }
+    }
+}
+
+/// v0.92: WitnessAgentDef → MirAgentDef（task_expr 直接 clone，
+/// task_body 由 lower_mir_witnesses 产出）。
+fn mir_agent_from_witness(a: &crate::mir::witness::WitnessAgentDef) -> MirAgentDef {
+    let task_body = crate::mir::lower::lower_mir_witnesses(std::slice::from_ref(&a.task_expr))
+        .unwrap_or_default();
+    MirAgentDef {
+        name: a.name.clone(),
+        task_expr: a.task_expr.clone(),
+        verify_expr: None,
+        with_config: None,
+        task_body,
+        combiner_body: None,
+    }
+}
+
+/// v0.92: WitnessEdgeDef → MirEdgeDef。
+fn mir_edge_from_witness(e: &crate::mir::witness::WitnessEdgeDef) -> MirEdgeDef {
+    MirEdgeDef {
+        from: e.from.clone(),
+        to: e.to.clone(),
+        condition_expr: None,
+        condition_body: None,
+    }
+}
+
+/// v0.92: MirWitness(MoE expert) → MirMoeExpert。
+fn mir_moe_expert_from_witness(w: &crate::mir::witness::MirWitness) -> MirMoeExpert {
+    let def = w.clone();
+    let def_fn = crate::mir::lower::lower_mir_witnesses(std::slice::from_ref(w)).unwrap_or_default();
+    MirMoeExpert {
+        name: String::new(),
+        def,
+        def_fn,
+    }
 }
 
 // ===================================================================
@@ -93,22 +215,23 @@ pub enum MirOrchestrateKind {
 /// v0.75.85: MoE 专家定义 — 名 + 定义表达式。
 /// def 执行后为 Value::Closure（函数专家，数值输出）或 Value::Dict
 /// （{model: "..."}，模型专家，String 输出）。
-/// v0.91: `def_fn` 是预 lowering 后的 MirFunction（parser 阶段完成），
-/// `def` 保留给 witness/LSP 序列化。handlers 执行走 def_fn。
+/// v0.91: `def_fn` 是预 lowering 后的 MirFunction（parser 阶段完成）。
+/// v0.92: `def` 类型从 MirExpr 迁移到 MirWitness（canonical 类型）。
 #[derive(Debug, Clone, PartialEq)]
 pub struct MirMoeExpert {
     pub name: String,
-    pub def: MirExpr,
+    pub def: crate::mir::witness::MirWitness,
     pub def_fn: MirFunction,
 }
 
 ///  Agent definition in orchestrate
+/// v0.92: task_expr/verify_expr/with_config 从 MirExpr 迁移到 MirWitness。
 #[derive(Debug, Clone, PartialEq)]
 pub struct MirAgentDef {
     pub name: String,
-    pub task_expr: MirExpr,
-    pub verify_expr: Option<MirExpr>,
-    pub with_config: Option<HashMap<String, MirExpr>>,
+    pub task_expr: crate::mir::witness::MirWitness,
+    pub verify_expr: Option<crate::mir::witness::MirWitness>,
+    pub with_config: Option<HashMap<String, crate::mir::witness::MirWitness>>,
 
     /// Pre-lowered task body (populated during lowering, starts empty)
     pub task_body: MirFunction,
@@ -119,11 +242,12 @@ pub struct MirAgentDef {
 }
 
 ///  Edge definition in orchestrate graph
+/// v0.92: condition_expr 从 MirExpr 迁移到 MirWitness。
 #[derive(Debug, Clone, PartialEq)]
 pub struct MirEdgeDef {
     pub from: String,
     pub to: String,
-    pub condition_expr: Option<MirExpr>,
+    pub condition_expr: Option<crate::mir::witness::MirWitness>,
     pub condition_body: Option<MirFunction>,
 }
 
@@ -132,10 +256,11 @@ pub struct MirEdgeDef {
 // ===================================================================
 
 ///  Checkpoint configuration (placeholder for v0.50)
+/// v0.92: thread_id 从 Box<MirExpr> 迁移到 Box<MirWitness>。
 #[derive(Debug, Clone, PartialEq)]
 pub struct MirCheckpointConfig {
     pub saver: String,
-    pub thread_id: Option<Box<MirExpr>>,
+    pub thread_id: Option<Box<crate::mir::witness::MirWitness>>,
     pub interval: Option<u64>,
     pub max_checkpoints: Option<usize>,
 }
@@ -148,16 +273,18 @@ pub struct MirInterruptPoint {
 }
 
 ///  Interrupt when condition (placeholder for v0.50)
+/// v0.92: Condition 从 MirExpr 迁移到 MirWitness。
 #[derive(Debug, Clone, PartialEq)]
 pub enum MirInterruptWhen {
     Before,
     After,
     Timeout(u64),
-    Condition(MirExpr),
+    Condition(crate::mir::witness::MirWitness),
     Manual,
 }
 
 ///  Reducer kind for dynamic edges (placeholder for v0.50)
+/// v0.92: Merge 从 MirExpr 迁移到 MirWitness。
 #[derive(Debug, Clone, PartialEq)]
 pub enum MirReducerKind {
     Last,
@@ -166,7 +293,7 @@ pub enum MirReducerKind {
     /// v0.75.5: G-Set（grow-only set）— 通道上并集累积（List/Dict 语义），
     /// 对应 `MergeStrategy::GrowOnlySet`。
     GrowOnly,
-    Merge(MirExpr),
+    Merge(crate::mir::witness::MirWitness),
     Sum,
     Product,
     Concat,
@@ -245,11 +372,69 @@ pub enum AggregatorKind {
     Concat,
 }
 
-/// v0.75.83: 聚合器贡献 — agent 经 `aggregate name, value` 语句提交，
-/// h_aggregate push 到 MirHost 缓冲，Pregel 引擎超步末收集并经
-/// aggregator_contribute 归约（与 SendTask/dynamic_sends 同构）。
+/// v0.75.83: 聚合器贡献 — agent 经 `aggregate name, value` 语句提交。
+/// v0.93: h_aggregate 提交 `Effect::Contribute`（effect-as-data，与
+/// SendTask 同一 Effects 数据通道），引擎侧 aggregator_contribute 归约。
 #[derive(Debug, Clone, PartialEq)]
 pub struct AggregatorContribution {
     pub name: String,
     pub value: Value,
+}
+
+// ===================================================================
+// v0.92: Trait/Impl/Skill 元数据类型 — 与 expr/ 平行但属于 Kernel 层
+// 运行时元数据（trait impl 注册、skill task 编排）。完整迁移留待
+// P0.5（expr/ 删除）阶段统一处理；此处先 re-export 自 expr/ 让消费方
+// 可以从 orchestrate::* 直接取，避免跨层细节。
+// ===================================================================
+
+/// v0.92: Alias for MirAgentDef (used by parser_v3 and orchestrate code)。
+pub type MirOrchestrateAgent = MirAgentDef;
+
+/// v0.92: Alias for MirEdgeDef (used by parser_v3 and orchestrate code)。
+pub type MirOrchestrateEdge = MirEdgeDef;
+
+/// v0.92: 参数定义（原在 `mir/expr/mod.rs`）——default 从 MirExpr 迁移到 MirWitness。
+#[derive(Debug, Clone, PartialEq)]
+pub struct Param {
+    pub name: String,
+    pub type_hint: Option<crate::typeck::Type>,
+    pub default: Option<crate::mir::witness::MirWitness>,
+}
+
+/// v0.92: Trait method definition（原在 `mir/expr/mod.rs`）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct MirTraitMethod {
+    pub name: String,
+    pub params: Vec<Param>,
+    pub return_type: Option<String>,
+    pub body: Option<MirFunction>,
+}
+
+/// v0.92: Function definition in impl block（原在 `mir/expr/mod.rs`）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct MirFnDef {
+    pub name: String,
+    pub params: Vec<Param>,
+    pub return_type: Option<String>,
+    pub body: Option<MirFunction>,
+}
+
+/// v0.92: Skill task definition（原在 `mir/expr/mod.rs`）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct MirSkillTask {
+    pub name: String,
+    pub description: Option<String>,
+    pub params: Vec<Param>,
+    pub body: Option<MirFunction>,
+}
+
+/// v0.92: Skill verification definition（原在 `mir/expr/mod.rs`）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct MirSkillVerify {
+    pub name: String,
+    pub given: Vec<String>,
+    pub expects: Vec<String>,
+    pub params: Vec<Param>,
+    pub body: Option<MirFunction>,
 }

@@ -21,7 +21,7 @@ pub fn h_trait_def(
     env: &mut Environment,
     name: &str,
     parents: &[String],
-    methods: &[crate::mir::expr::MirTraitMethod],
+    methods: &[crate::mir::orchestrate::MirTraitMethod],
     method_bodies: &[MirFunction],
 ) -> Result<(), String> {
     let sigs: Vec<TraitMethodSig> = methods
@@ -74,7 +74,7 @@ pub fn h_impl_def(
     trait_generics: &[String],
     for_type: &str,
     for_generics: &[String],
-    methods: &[crate::mir::expr::MirFnDef],
+    methods: &[crate::mir::orchestrate::MirFnDef],
     method_bodies: &[MirFunction],
 ) -> Result<(), String> {
     Arc::make_mut(interp.impl_table())
@@ -111,9 +111,9 @@ pub fn h_skill_def(
     description: &Option<String>,
     version: &Option<String>,
     requires: &[String],
-    tasks: &[crate::mir::expr::MirSkillTask],
+    tasks: &[crate::mir::orchestrate::MirSkillTask],
     task_bodies: &[MirFunction],
-    verify: &Option<crate::mir::expr::MirSkillVerify>,
+    verify: &Option<crate::mir::orchestrate::MirSkillVerify>,
     verify_body: &Option<MirFunction>,
 ) {
     let mut meta = HashMap::new();

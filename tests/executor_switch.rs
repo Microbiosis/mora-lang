@@ -16,9 +16,9 @@ fn run_production(source: &str) -> Value {
     let mut interp = Interpreter::new();
     let mut env = interp.take_env();
     let func_arc = Arc::new(func);
-    let last = run_mir(&func_arc, &mut interp, &mut env)
+    let last = run_mir(&func_arc, &mut interp, &mut env, &mut mora::mir::effect::Effects::new())
         .unwrap_or_else(|e| panic!("run_mir failed: {}", e));
-    run_main_task(&func_arc, &mut interp, &mut env)
+    run_main_task(&func_arc, &mut interp, &mut env, &mut mora::mir::effect::Effects::new())
         .unwrap_or_else(|e| panic!("run_main_task failed: {}", e));
     last
 }
@@ -138,8 +138,8 @@ fn switch_while_break() {
     let mut interp = Interpreter::new();
     let mut env = interp.take_env();
     let arc = Arc::new(func);
-    let _ = run_mir(&arc, &mut interp, &mut env).unwrap();
-    let _ = run_main_task(&arc, &mut interp, &mut env);
+    let _ = run_mir(&arc, &mut interp, &mut env, &mut mora::mir::effect::Effects::new()).unwrap();
+    let _ = run_main_task(&arc, &mut interp, &mut env, &mut mora::mir::effect::Effects::new());
     // 通过 env state 验证：break 触发则 total=10，未触发则=55
     let total = env.get("total").unwrap_or(mora::value::Value::Nil);
     assert!(matches!(total, mora::value::Value::Int(10)), "while break: total should be 10 (break at i=5), got {:?}", total);
@@ -159,8 +159,8 @@ fn switch_while_continue() {
     let mut interp = Interpreter::new();
     let mut env = interp.take_env();
     let arc = Arc::new(func);
-    let _ = run_mir(&arc, &mut interp, &mut env).expect("while_continue run_mir failed");
-    let _ = run_main_task(&arc, &mut interp, &mut env);
+    let _ = run_mir(&arc, &mut interp, &mut env, &mut mora::mir::effect::Effects::new()).expect("while_continue run_mir failed");
+    let _ = run_main_task(&arc, &mut interp, &mut env, &mut mora::mir::effect::Effects::new());
     // 不挂死即通过——label 修补已由 while_break 测试覆盖
 }
 
@@ -177,7 +177,7 @@ fn switch_for_break() {
     let mut interp = Interpreter::new();
     let mut env = interp.take_env();
     let arc = Arc::new(func);
-    let _ = run_mir(&arc, &mut interp, &mut env).expect("for sum run_mir failed");
-    let _ = run_main_task(&arc, &mut interp, &mut env);
+    let _ = run_mir(&arc, &mut interp, &mut env, &mut mora::mir::effect::Effects::new()).expect("for sum run_mir failed");
+    let _ = run_main_task(&arc, &mut interp, &mut env, &mut mora::mir::effect::Effects::new());
     // 不挂死即通过——for 循环值传递问题留后续修复
 }

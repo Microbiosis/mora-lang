@@ -36,19 +36,22 @@ impl Interpreter {
                     Value::Nil, // update closure
                     Value::Nil, // view closure
                 );
-                if has_init {
-                    // 调用 init closure 获取初始 model
-                    match self.call_value(&app.init, vec![]) {
-                        Ok(model) => {
-                            app.set_model(model);
-                        }
+                // v0.94: app 是纯值 —— 用 with_model 构造初始 model，返回新 app。
+                let app = if has_init {
+                    // 调用 init closure 获取初始 model；失败则回落第一个 arg。
+                    match self.call_value(
+                        &app.init,
+                        vec![],
+                        &mut crate::mir::effect::Effects::new(),
+                    ) {
+                        Ok(model) => app.with_model(model),
                         Err(_) => {
-                            app.set_model(args.first().cloned().unwrap_or(Value::Nil));
+                            app.with_model(args.first().cloned().unwrap_or(Value::Nil))
                         }
                     }
                 } else {
-                    app.set_model(args.first().cloned().unwrap_or(Value::Nil));
-                }
+                    app.with_model(args.first().cloned().unwrap_or(Value::Nil))
+                };
                 Ok(Value::TeaApp(std::sync::Arc::new(app)))
             }
             "dispatch" => {
@@ -64,8 +67,9 @@ impl Interpreter {
                 };
                 let msg = crate::tea::Msg::from_value(msg_val)
                     .map_err(|e| format!("tea.dispatch: {}", e))?;
-                app.dispatch(msg);
-                Ok(Value::Nil)
+                // v0.94: 纯追加 —— 返回携带新 Msg 的新 app（调用方需重新绑定）。
+                let next = app.as_ref().clone().dispatch(msg);
+                Ok(Value::TeaApp(std::sync::Arc::new(next)))
             }
             "run" => {
                 let app = args
@@ -79,9 +83,9 @@ impl Interpreter {
                     Value::TeaApp(a) => a.clone(),
                     _ => return Err("tea.run: first arg must be TeaApp".to_string()),
                 };
-                // v0.83: run_loop 需要 MirHost context 来调用 update 闭包
-                // 当前是 self (Interpreter) —— 通过 self 调用
-                Ok(app.run_loop(max_steps, self))
+                // v0.94: run_loop 是纯驱动 —— 返回推进后的新 app（数据流）。
+                let next = app.as_ref().run_loop(max_steps, self);
+                Ok(Value::TeaApp(std::sync::Arc::new(next)))
             }
             "model" => {
                 let app = args
@@ -106,11 +110,9 @@ impl Interpreter {
                 };
                 let msg = crate::tea::Msg::from_value(msg_val)
                     .map_err(|e| format!("tea.update: {}", e))?;
-                app.dispatch(msg);
-                // 推进一步（真正调用 update 闭包）
-                let stepped = app.step(self);
-                let _ = stepped;
-                Ok(Value::Nil)
+                // v0.94: 纯推进 —— dispatch + step，返回携带新 model 的新 app。
+                let (next, _stepped) = app.as_ref().clone().dispatch(msg).step(self);
+                Ok(Value::TeaApp(std::sync::Arc::new(next)))
             }
             "view" => {
                 // v0.83: 真正调用 view 闭包
@@ -121,7 +123,11 @@ impl Interpreter {
                     Value::TeaApp(a) => a.clone(),
                     _ => return Err("tea.view: first arg must be TeaApp".to_string()),
                 };
-                match self.call_value(&app.view, vec![app.model()]) {
+                match self.call_value(
+                    &app.view,
+                    vec![app.model()],
+                    &mut crate::mir::effect::Effects::new(),
+                ) {
                     Ok(v) => Ok(v),
                     Err(e) => Err(format!("tea.view: {}", e)),
                 }
@@ -160,14 +166,18 @@ mod tests {
     }
 
     #[test]
-    fn tea_dispatch_returns_nil() {
+    fn tea_dispatch_returns_updated_app() {
+        // v0.94: dispatch 是纯转换 —— 返回携带新 Msg 的新 app（非 Nil）。
         let mut interp = Interpreter::new();
         let app_val = interp.call_tea_method("init", &[Value::Int(0)]).unwrap();
         let mut msg_map = std::collections::HashMap::new();
         msg_map.insert("tag".to_string(), Value::String("Increment".to_string()));
         let msg = Value::Dict(msg_map);
         let result = interp.call_tea_method("dispatch", &[app_val, msg]).unwrap();
-        assert!(matches!(result, Value::Nil));
+        match result {
+            Value::TeaApp(a) => assert_eq!(a.msgs_len(), 1, "新 app 队列含 1 条 Msg"),
+            _ => panic!("dispatch 应返回 TeaApp"),
+        }
     }
 
     #[test]
@@ -179,11 +189,15 @@ mod tests {
     }
 
     #[test]
-    fn tea_run_returns_model() {
+    fn tea_run_returns_advanced_app() {
+        // v0.94: run 是纯驱动 —— 返回推进后的 app，model 不变（无 pending Msg）。
         let mut interp = Interpreter::new();
         let app_val = interp.call_tea_method("init", &[Value::Int(99)]).unwrap();
         let result = interp.call_tea_method("run", &[app_val]).unwrap();
-        assert_eq!(result, Value::Int(99));
+        match result {
+            Value::TeaApp(a) => assert_eq!(a.model(), Value::Int(99)),
+            _ => panic!("run 应返回 TeaApp"),
+        }
     }
 
     #[test]

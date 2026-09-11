@@ -10,9 +10,8 @@
 //! - 结构化控制流（If/While/For/Match），非 Jump/Label
 //!
 //! 与现有 IR 的关系：
-//! - MirExprKind (26 变体) → Node<M> 的子集映射（树形 → 结构化 CFG）
+//! - WitnessKind (30 变体) → Node<M> 的子集映射（树形 → 结构化 CFG；typeck 消费面）
 //! - MirInst (50 变体) → Node<M> 不直接映射（MirInst 是线性的，Node 是结构化的）
-//! - WitnessKind (30 变体) → Node<M> 的子集映射（typeck 消费面）
 
 use crate::common::{BinaryOp, Literal, Span};
 use crate::mir::effect::EffectRow;

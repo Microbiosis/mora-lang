@@ -100,6 +100,75 @@ impl fmt::Display for EffectRow {
     }
 }
 
+// ─── v0.93: 运行时效应值（effect-as-data）────────────────────────────
+//
+// `EffectRow` 是效果的**类型**表示（编译期）；`Effect`/`Effects` 是效果的
+// **运行时数据**表示。BSP 引擎的 send / aggregate 语句过去直接 push 到宿主
+// 上的 `&mut Vec`（可变状态机式侧信道），导致：
+//   1. 并行 worker 各自持有克隆宿主，worker 产出的 effect 与主线程的缓冲
+//      互相不可见 —— worker 的 aggregator 贡献被静默丢弃（正确性缺陷）；
+//   2. 合并顺序依赖「谁先改缓冲」，而非数据的确定性 fold。
+//
+// 改为「效果即数据」：执行产出一个 `Effects` 值（纯数据），worker 边界按
+// 确定顺序 `merge` 折叠。`merge` 满足结合律（Vec 拼接），因此并发执行的结果
+// 与串行执行逐字节一致 —— 并发成为数据的自然属性，而非需要加锁防御的状态。
+
+use crate::checkpoint::SendTask;
+use crate::mir::orchestrate::AggregatorContribution;
+
+/// 一次执行产生的单个效应。与 `EffectRow` 的具名标签一一对应：
+/// `Send` ↔ BSP 消息，`Contribute` ↔ per-super-step 聚合器贡献。
+#[derive(Debug, Clone, PartialEq)]
+pub enum Effect {
+    /// `send value to target` — 投递到目标顶点的下一条 BSP 消息。
+    Send(SendTask),
+    /// `aggregate name, value` — 向具名聚合器提交一次贡献。
+    Contribute(AggregatorContribution),
+}
+
+/// 一次执行累积的效应集合。**纯数据**：可克隆、可比较、可结合律合并。
+///
+/// 执行器在 worker 边界产出 `Effects`，主线程按拓扑/索引顺序 `merge` 折叠。
+/// 合并顺序固定 → 结果确定，无需共享可变缓冲，也无跨 worker 可见性问题。
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Effects {
+    pub sends: Vec<SendTask>,
+    pub contributions: Vec<AggregatorContribution>,
+}
+
+impl Effects {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.sends.is_empty() && self.contributions.is_empty()
+    }
+
+    /// 追加单个效应（就地累加器语义，等价于 `Vec::push` 的折叠）。
+    pub fn push(&mut self, effect: Effect) {
+        match effect {
+            Effect::Send(task) => self.sends.push(task),
+            Effect::Contribute(contrib) => self.contributions.push(contrib),
+        }
+    }
+
+    /// 结合律合并：`a.merge(b)` 保留 `a` 的元素在前。
+    /// 结合律保证 worker 结果的 fold 顺序不影响最终集合内容
+    /// （对同目标的多条 send，combiner 按 fold 顺序折叠，因此顺序固定即可确定）。
+    pub fn merge(mut self, other: Effects) -> Effects {
+        self.sends.extend(other.sends);
+        self.contributions.extend(other.contributions);
+        self
+    }
+
+    /// 就地合并（`merge` 的引用变体，避免 move）。
+    pub fn absorb(&mut self, other: Effects) {
+        self.sends.extend(other.sends);
+        self.contributions.extend(other.contributions);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -169,5 +238,87 @@ mod tests {
         r.extend("Fs");
         r.extend("Mem");
         assert_eq!(r.labels(), vec!["Ai", "Fs", "Mem"]);
+    }
+
+    // ─── v0.93: Effects（effect-as-data）────────────────────────────
+
+    fn send(target: &str, n: i64) -> Effect {
+        Effect::Send(SendTask {
+            target_node: target.to_string(),
+            input: crate::value::Value::Int(n),
+        })
+    }
+
+    fn contribute(name: &str, n: i64) -> Effect {
+        Effect::Contribute(AggregatorContribution {
+            name: name.to_string(),
+            value: crate::value::Value::Int(n),
+        })
+    }
+
+    #[test]
+    fn effects_push_routes_by_variant() {
+        let mut e = Effects::new();
+        e.push(send("a", 1));
+        e.push(contribute("sum", 2));
+        assert_eq!(e.sends.len(), 1);
+        assert_eq!(e.contributions.len(), 1);
+        assert!(!e.is_empty());
+        assert!(Effects::new().is_empty());
+    }
+
+    /// merge 满足结合律：三种分组方式结果完全一致（含顺序）。
+    /// 这是并发结果的确定性保证 —— worker 产出 Effects，主线程按固定
+    /// 顺序 fold，分组（= worker 边界）不影响结果。
+    #[test]
+    fn effects_merge_is_associative() {
+        let mut a = Effects::new();
+        a.push(send("x", 1));
+        a.push(contribute("sum", 1));
+        let mut b = Effects::new();
+        b.push(send("y", 2));
+        let mut c = Effects::new();
+        c.push(contribute("min", 3));
+        c.push(send("x", 4));
+
+        let left = a.clone().merge(b.clone()).merge(c.clone());
+        let right = a.clone().merge(b.clone().merge(c.clone()));
+        assert_eq!(left, right, "merge 必须满足结合律");
+        // 顺序固定：a 的元素在前，c 的在后。
+        assert_eq!(
+            left.sends
+                .iter()
+                .map(|s| s.target_node.clone())
+                .collect::<Vec<_>>(),
+            vec!["x".to_string(), "y".to_string(), "x".to_string()]
+        );
+        assert_eq!(
+            left.contributions
+                .iter()
+                .map(|c| c.name.clone())
+                .collect::<Vec<_>>(),
+            vec!["sum".to_string(), "min".to_string()]
+        );
+    }
+
+    /// absorb 与 merge 等价（引用变体）。
+    #[test]
+    fn effects_absorb_matches_merge() {
+        let mut a = Effects::new();
+        a.push(send("x", 1));
+        let mut b = Effects::new();
+        b.push(contribute("sum", 2));
+
+        let merged = a.clone().merge(b.clone());
+        a.absorb(b);
+        assert_eq!(a, merged);
+    }
+
+    #[test]
+    fn effects_merge_with_empty_is_identity() {
+        let mut a = Effects::new();
+        a.push(send("x", 1));
+        assert_eq!(a.clone().merge(Effects::new()), a);
+        assert_eq!(Effects::new().merge(a.clone()), a);
     }
 }

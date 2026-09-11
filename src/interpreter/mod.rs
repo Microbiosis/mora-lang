@@ -1,9 +1,28 @@
 //! v0.25: Interpreter 聚合模块 — ai_chat/builtins/dispatch/trait_dispatch 子模块 + Interpreter 主体（MirHost 实现）。
 
+/// v0.75.49: `testcase!(cond, label)` — SQLite `testcase()` 同款断言宏
+/// （D1 借石：VDBE 用它在分支守卫处插桩，标注「此分支有专门测试用例」）。
+///
+/// 语义：开发版（debug_assertions）断言 `cond` 为真并携带分支名 —— 守卫
+/// 若被意外绕过（分支语义漂移）立即暴露；release 版零开销（空转）。
+/// 用法：插在 builtin 类型守卫分支的命中处，把「分支可达性」从裸 match
+/// 显式化为可 grep、可审计的标注。
+///
+/// v0.92: 定义上提到 `interpreter` 模块根，供 dispatch.rs 与 builtin_impls.rs
+/// 经 `macro_rules!` 文本作用域共用（无需 `use`）。
+macro_rules! testcase {
+    ($cond:expr, $label:expr) => {
+        debug_assert!($cond, "testcase: {} — 分支守卫被意外绕过", $label)
+    };
+}
+
 mod ai_chat;
 mod ai_helpers;
 pub mod builtins;
+mod builtin_impls; // v0.92 P1.2: call_builtin_* 实现（自 dispatch.rs 迁出）
 mod dispatch;
+mod method_dispatch; // v0.92 P1.2: Value method dispatch (call_method*) split from dispatch.rs
+mod numeric_helpers; // v0.92 P1.2: split from dispatch.rs
 mod trait_dispatch;
 // v0.75.x: MirPregelEngine + WorkerPool 已迁至 src/pregel/（解耦 mir ↔ interpreter 循环）
 
@@ -92,8 +111,9 @@ fn retry_sleep_ms(attempt: u32, base_ms: u64) -> u64 {
 /// v0.75.x: LruCache 已下沉到 runtime/types.rs，经下方 re-export 引用。
 pub struct Interpreter {
     /// v0.52 ADR-001: CoreRuntime — 核心执行字段（globals/environment/tool_registry/
-    /// current_ai_config/config_stack/current_merge_strategies/dynamic_sends）。
+    /// current_ai_config/config_stack/current_merge_strategies/effects）。
     /// v0.70 移除了 worker_channels/worker_receivers 死代码分支。
+    /// v0.93 effects 为 effect-as-data 累加器（取代 dynamic_sends/aggregator_contributions）。
     pub(crate) core: crate::runtime::core::CoreRuntime,
     /// v0.52 ADR-001: RegistryRuntime facade — BC8 (trait_registry + impl_table + mock_registry +
     /// ccr_store + memory_store)
@@ -151,8 +171,9 @@ impl crate::mir::host::MirHost for Interpreter {
         name: &str,
         args: Vec<Value>,
         env: &Environment,
+        effects: &mut crate::mir::effect::Effects,
     ) -> Result<Value, String> {
-        Interpreter::mir_call_function(self, name, args, env)
+        Interpreter::mir_call_function(self, name, args, env, effects)
     }
 
     fn mir_call_method(
@@ -160,16 +181,27 @@ impl crate::mir::host::MirHost for Interpreter {
         object: Value,
         method: &str,
         args: Vec<Value>,
+        effects: &mut crate::mir::effect::Effects,
     ) -> Result<Value, String> {
-        Interpreter::mir_call_method(self, object, method, args)
+        Interpreter::mir_call_method(self, object, method, args, effects)
     }
 
-    fn call_value(&mut self, value: &Value, args: Vec<Value>) -> Result<Value, String> {
-        self.call_value(value, args)
+    fn call_value(
+        &mut self,
+        value: &Value,
+        args: Vec<Value>,
+        effects: &mut crate::mir::effect::Effects,
+    ) -> Result<Value, String> {
+        self.call_value(value, args, effects)
     }
 
-    fn mir_import(&mut self, path: &str, env: &mut Environment) -> Result<(), String> {
-        Interpreter::mir_import(self, path, env)
+    fn mir_import(
+        &mut self,
+        path: &str,
+        env: &mut Environment,
+        effects: &mut crate::mir::effect::Effects,
+    ) -> Result<(), String> {
+        Interpreter::mir_import(self, path, env, effects)
     }
 
     fn mir_with_config(&mut self, bindings: &[(String, Value)]) -> Result<(), String> {
@@ -184,7 +216,12 @@ impl crate::mir::host::MirHost for Interpreter {
     //
     // 这些方法桥接到 CoreRuntime::effect_handlers（EffectRegistry）。
     // 完整语义见 src/runtime/effect.rs 与 src/mir/handlers.rs::h_perform/h_handle。
-fn perform_effect(&mut self, effect: &str, args: Vec<Value>) -> Option<Value> {
+fn perform_effect(
+    &mut self,
+    effect: &str,
+    args: Vec<Value>,
+    effects: &mut crate::mir::effect::Effects,
+) -> Option<Value> {
     // v0.80 Stage 2.0: 真正的 handler 执行 — HandlerClosure::perform 调 run_mir。
     //
     // architectural reason: handler 实际是 MirFunction（handler_mir），必须有
@@ -196,8 +233,9 @@ fn perform_effect(&mut self, effect: &str, args: Vec<Value>) -> Option<Value> {
         core.take(effect)?
     };
 
-    // host 通过 &mut self 传（self 实现 MirHost）。
-    let result = handler.perform_box(self, args);
+    // host 通过 &mut self 传（self 实现 MirHost）；effects 显式累加器
+    // 穿透 handler 执行（handler 体内 perform/send 属于外层 effect 流）。
+    let result = handler.perform_box(self, args, effects);
     eprintln!("DEBUG perform_effect: result={:?}", result);
     result.ok()
 }
@@ -243,13 +281,6 @@ fn perform_effect(&mut self, effect: &str, args: Vec<Value>) -> Option<Value> {
         self.core.environment.clone()
     }
 
-    fn dynamic_sends(&mut self) -> &mut Vec<crate::checkpoint::SendTask> {
-        &mut self.core.dynamic_sends
-    }
-
-    fn aggregator_contributions(&mut self) -> &mut Vec<crate::mir::expr::AggregatorContribution> {
-        &mut self.core.aggregator_contributions
-    }
 
     fn checkpoint_saver(&self) -> Option<Arc<dyn crate::checkpoint::CheckpointSaver>> {
         self.persist.checkpoint_saver()
@@ -398,7 +429,9 @@ impl Interpreter {
     }
 
     pub fn new_with_globals(globals: Arc<Mutex<Environment>>) -> Self {
-        let env = Arc::new(Mutex::new(Environment::with_parent_of(globals.clone())));
+        let env = Arc::new(Mutex::new(Environment::with_parent_of(Arc::new(
+            globals.lock().clone(),
+        ))));
         Self {
             core: crate::runtime::core::CoreRuntime {
                 globals: globals.clone(),
@@ -514,8 +547,9 @@ impl Interpreter {
         name: &str,
         args: Vec<Value>,
         env: &Environment,
+        effects: &mut crate::mir::effect::Effects,
     ) -> Result<Value, String> {
-        self.call_function(name, args, env, crate::common::Span::default())
+        self.call_function(name, args, env, crate::common::Span::default(), effects)
     }
 
     /// α.1: MIR 解释器的方法调用桥。复用 dispatch.rs 的 call_method。
@@ -524,8 +558,9 @@ impl Interpreter {
         object: Value,
         method: &str,
         args: Vec<Value>,
+        effects: &mut crate::mir::effect::Effects,
     ) -> Result<Value, String> {
-        self.call_method(object, method, args, crate::common::Span::default())
+        self.call_method(object, method, args, crate::common::Span::default(), effects)
     }
 
     /// α.3: MIR 解释器的 import 桥。
@@ -535,6 +570,7 @@ impl Interpreter {
         &mut self,
         path: &str,
         env: &mut crate::value::Environment,
+        effects: &mut crate::mir::effect::Effects,
     ) -> Result<(), String> {
         match std::fs::read_to_string(path) {
             Ok(source) => {
@@ -548,6 +584,7 @@ impl Interpreter {
                     &std::sync::Arc::new(imported_func),
                     self,
                     &mut child_env,
+                    effects,
                 )?;
                 // child_env 中的定义合并回父 env
                 for (name, val) in child_env.iter() {
@@ -714,7 +751,12 @@ impl Interpreter {
             };
 
             // v0.75.9: 包裹 Arc 走全局 DAG 缓存（REPL 每行新建 func，天然独立缓存项）
-            match run_mir(&std::sync::Arc::new(run_func), interp, &mut env) {
+            match run_mir(
+                &std::sync::Arc::new(run_func),
+                interp,
+                &mut env,
+                &mut crate::mir::effect::Effects::new(),
+            ) {
                 Ok(value) => {
                     if !matches!(value, Value::Nil) {
                         println!("= {}", value);

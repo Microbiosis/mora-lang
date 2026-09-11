@@ -905,7 +905,6 @@ impl HMInference {
 mod tests {
     use super::*;
     use crate::common::Span;
-    use crate::mir::MirExpr;
     use crate::mir::witness::WitnessPattern;
 
     // v0.76.02: infer_pattern 5 变体测试
@@ -1050,33 +1049,28 @@ mod tests {
 
     // v0.83: Dict literal field-by-field 验证
 
-    fn make_dict_w(entries: Vec<(String, MirExpr)>) -> MirWitness {
+    // v0.92: 测试助手改为 witness-native（MirExpr 路径已删除）。
+    fn make_int_lit(n: i64) -> MirWitness {
         MirWitness {
-            kind: WitnessKind::Dict(
-                entries
-                    .into_iter()
-                    .map(|(n, e)| (n, MirWitness::from_expr(&e)))
-                    .collect(),
-            ),
+            kind: WitnessKind::Literal(crate::common::Literal::Int(n, Span::default())),
             span: Span::default(),
         }
     }
 
-    fn make_int_lit(n: i64) -> MirExpr {
-        MirExpr::lit(crate::common::Literal::Int(n, Span::default()), Span::default())
-    }
-
-    fn make_str_lit(s: &str) -> MirExpr {
-        MirExpr::lit(
-            crate::common::Literal::String(s.to_string(), Span::default()),
-            Span::default(),
-        )
+    fn make_str_lit(s: &str) -> MirWitness {
+        MirWitness {
+            kind: WitnessKind::Literal(crate::common::Literal::String(
+                s.to_string(),
+                Span::default(),
+            )),
+            span: Span::default(),
+        }
     }
 
     fn make_typed_let(
         type_hint_name: &str,
         type_hint_fields: Vec<(String, Type)>,
-        dict_entries: Vec<(String, MirExpr)>,
+        dict_entries: Vec<(String, MirWitness)>,
     ) -> (String, TypeHint, MirWitness) {
         let ty = Type::TeaModel {
             name: type_hint_name.to_string(),
@@ -1086,7 +1080,14 @@ mod tests {
                 .collect(),
         };
         let hint = TypeHint::from_type(ty);
-        (type_hint_name.to_string(), hint, make_dict_w(dict_entries))
+        (
+            type_hint_name.to_string(),
+            hint,
+            MirWitness {
+                kind: WitnessKind::Dict(dict_entries),
+                span: Span::default(),
+            },
+        )
     }
 
     #[test]
@@ -1158,10 +1159,10 @@ mod tests {
             ],
         };
         let hint = TypeHint::from_type(ty);
-        let value = make_dict_w(vec![(
-            "tag".to_string(),
-            make_str_lit("Increment"),
-        )]);
+        let value = MirWitness {
+            kind: WitnessKind::Dict(vec![("tag".to_string(), make_str_lit("Increment"))]),
+            span: Span::default(),
+        };
         let mut hm = HMInference::new();
         let result = hm.infer_let_typed("x", &hint, &value, Span::default());
         assert!(result.is_ok(), "已知 variant 应该通过: {:?}", result);
@@ -1178,10 +1179,10 @@ mod tests {
             ],
         };
         let hint = TypeHint::from_type(ty);
-        let value = make_dict_w(vec![(
-            "tag".to_string(),
-            make_str_lit("NonExist"),
-        )]);
+        let value = MirWitness {
+            kind: WitnessKind::Dict(vec![("tag".to_string(), make_str_lit("NonExist"))]),
+            span: Span::default(),
+        };
         let mut hm = HMInference::new();
         let result = hm.infer_let_typed("x", &hint, &value, Span::default());
         assert!(result.is_err(), "未知 variant 应该失败");
@@ -1195,10 +1196,10 @@ mod tests {
             variants: vec![("Increment".to_string(), None)],
         };
         let hint = TypeHint::from_type(ty);
-        let value = make_dict_w(vec![(
-            "payload".to_string(),
-            make_int_lit(0),
-        )]);
+        let value = MirWitness {
+            kind: WitnessKind::Dict(vec![("payload".to_string(), make_int_lit(0))]),
+            span: Span::default(),
+        };
         let mut hm = HMInference::new();
         let result = hm.infer_let_typed("x", &hint, &value, Span::default());
         assert!(result.is_err(), "缺 tag 字段应该失败");

@@ -1,17 +1,19 @@
-//! v0.54: Parser V3 - Pure MIR expression parser (Phase γ Complete)
+//! v0.92: Parser V3 - Witness-native MIR parser（MirExpr 中间层已删除）
 //!
-//! **Zero AST v2 dependencies** - Direct tokens → MirExpr conversion
+//! **Zero AST v2 dependencies** - Direct tokens → MirWitness conversion
 //! This is the final parser implementation that completely replaces Parser v2.
 
 use crate::common::{BinaryOp, Literal, Span};
 use crate::lexer::{Lexer, Token, TokenType};
-use crate::mir::expr::*;
+use crate::mir::orchestrate::{MirOrchestrateAgent, MirOrchestrateEdge, MirOrchestrateKind, Param};
 use crate::mir::witness::{MirWitness, WitnessKind, WitnessParam};
 use crate::mir::{MirFunction, MirInst, Reg};
 use std::collections::HashMap;
 
 mod emit;
-mod parse;
+mod emit_definitions; // v0.92 P1.3: definition emit methods split from emit.rs
+mod syntax; // v0.92 P1.4: pattern/orchestrate/type-annotation parsers (from parse.rs)
+mod tokens; // v0.92 P1.4: token-stream navigation primitives (from parse.rs)
 
 ///  ParserV3 - Clean-room MIR parser with no AST legacy baggage
 pub struct ParserV3 {
@@ -19,10 +21,10 @@ pub struct ParserV3 {
     current: usize,
     /// v0.75.40: 单遍编译 emit 上下文（阶段 3 完整融合）。
     /// parse 函数在构造语法树的同时 emit MirInst 到此处；compile() 取走
-    /// 指令序列。旧路径 parse() 忽略此字段（仅构造 MirExpr）。
+    /// 指令序列。
     emit: crate::mir::lower::EmitContext,
     /// v0.75.40: 单遍编译并行产出的 witness 树（typeck/LSP 消费面）。
-    /// compile() 返回此列表；旧路径 parse() 不填充。
+    /// compile() 返回此列表。
     witnesses: Vec<MirWitness>,
     /// v0.86: 原始源码文本（`quote(expr)` 源码提取用）。
     source: String,
@@ -54,11 +56,20 @@ impl ParserV3 {
         String,
     > {
         use crate::lexer::Lexer;
+        // 空输入或仅含注释的输入 → 显式 Err（与 proptest 期望对齐：
+        // 成功编译必须产生非空 body，否则 prop_assert 失败）。
+        let trimmed = source.trim();
+        if trimmed.is_empty() || trimmed.chars().all(|c| c == '-' || c.is_whitespace()) {
+            return Err("empty program: source contains no executable statements".to_string());
+        }
         let tokens = Lexer::new(source).scan_tokens();
         let mut parser = ParserV3::new(tokens, source);
         parser.emit_program()?;
         let func = parser.emit.finish();
         let witnesses = parser.witnesses;
+        if func.body.is_empty() {
+            return Err("empty program: parser produced no executable instructions".to_string());
+        }
         Ok((func, witnesses))
     }
 
@@ -145,18 +156,14 @@ fn token_to_identifier_name(tt: &TokenType) -> Option<&'static str> {
     }
 }
 
-// Helper function to convert MirExpr to string (for method name generation)
-fn match_to_string(expr: &MirExpr) -> String {
-    match &expr.kind {
-        MirExprKind::Variable(n) => n.clone(),
-        MirExprKind::Literal(lit) => format!("{:?}", lit),
-        _ => "expr".to_string(),
-    }
-}
-
-/// Parse prompt string content into MirExpr parts (standalone, no &self borrow).
+/// Parse prompt string content into MirWitness parts (standalone, no &self borrow).
 /// `p"hello {name}"` → [Literal("hello "), Variable("name")]
-fn parse_prompt_parts(content: &str, span: Span) -> Vec<MirExpr> {
+///
+/// v0.92: 返回 MirWitness（canonical 类型）而非 MirExpr。
+/// 内嵌表达式经子 ParserV3 的 `emit_expr_w()` 解析（witness-native）。
+fn parse_prompt_parts(content: &str, span: Span) -> Vec<crate::mir::witness::MirWitness> {
+    use crate::mir::witness::{MirWitness, WitnessKind};
+
     let mut parts = Vec::new();
     let mut current_text = String::new();
     let mut chars = content.chars().peekable();
@@ -165,10 +172,10 @@ fn parse_prompt_parts(content: &str, span: Span) -> Vec<MirExpr> {
         if c == '{' {
             // Flush accumulated text as a literal part
             if !current_text.is_empty() {
-                parts.push(MirExpr::lit(
-                    Literal::String(current_text.clone(), span),
+                parts.push(MirWitness {
+                    kind: WitnessKind::Literal(Literal::String(current_text.clone(), span)),
                     span,
-                ));
+                });
                 current_text.clear();
             }
             // Collect expression text until matching '}'
@@ -189,13 +196,13 @@ fn parse_prompt_parts(content: &str, span: Span) -> Vec<MirExpr> {
                     expr_text.push(ec);
                 }
             }
-            // Parse the expression text via sub-lexer+parser
+            // Parse the expression text via sub-lexer + witness parser
             if !expr_text.is_empty() {
                 let mut lexer = Lexer::new(&expr_text);
                 let tokens = lexer.scan_tokens();
                 let mut parser = ParserV3::new(tokens, &expr_text);
-                if let Some(expr) = parser.parse_assignment() {
-                    parts.push(expr);
+                if let Some((_reg, w)) = parser.emit_expr_w() {
+                    parts.push(w);
                 }
             }
         } else {
@@ -205,24 +212,11 @@ fn parse_prompt_parts(content: &str, span: Span) -> Vec<MirExpr> {
 
     // Flush remaining text
     if !current_text.is_empty() || parts.is_empty() {
-        parts.push(MirExpr::lit(Literal::String(current_text, span), span));
+        parts.push(MirWitness {
+            kind: WitnessKind::Literal(Literal::String(current_text, span)),
+            span,
+        });
     }
 
     parts
-}
-
-// Add grouping helper - build grouped expression as identity
-fn mir_group(inner: MirExpr) -> MirExpr {
-    inner // Currently just return as-is
-}
-
-/// v0.85: 使用 ParserV3 解析代码，返回 MirExpr 列表（纯 MIR，零 AST 依赖）
-///
-/// 该函数原属 `crate::interpreter`（违反层间隔离：解析逻辑不应在解释器层）。
-/// v0.85 迁移至 `crate::parser_v3`。`crate::interpreter::parse_code_v3`
-/// 通过 re-export 保持向后兼容。
-pub fn parse_code_v3(source: &str) -> Result<Vec<crate::mir::expr::MirExpr>, String> {
-    let tokens = Lexer::new(source).scan_tokens();
-    let parser = ParserV3::new(tokens, source);
-    parser.parse().map_err(|e| format!("{:?}", e))
 }

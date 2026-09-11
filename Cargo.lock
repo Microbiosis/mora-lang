@@ -971,7 +971,7 @@ dependencies = [
 
 [[package]]
 name = "mora"
-version = "0.90.4"
+version = "0.94.0"
 dependencies = [
  "anyhow",
  "crossbeam-channel",

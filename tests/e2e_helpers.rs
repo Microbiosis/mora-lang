@@ -69,11 +69,11 @@ pub fn run_e2e(name: &str) -> E2eResult {
     let mut env = interp.take_env();
     let func_arc = Arc::new(func);
 
-    let last_expr = match run_mir(&func_arc, &mut interp, &mut env) {
+    let last_expr = match run_mir(&func_arc, &mut interp, &mut env, &mut mora::mir::effect::Effects::new()) {
         Ok(v) => v,
         Err(e) => return E2eResult::CompileError(format!("run_mir: {}", e)),
     };
-    if let Err(e) = run_main_task(&func_arc, &mut interp, &mut env) {
+    if let Err(e) = run_main_task(&func_arc, &mut interp, &mut env, &mut mora::mir::effect::Effects::new()) {
         return E2eResult::CompileError(format!("run_main_task: {}", e));
     }
 

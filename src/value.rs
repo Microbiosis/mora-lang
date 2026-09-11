@@ -1,16 +1,15 @@
-//! v0.20: 从 interpreter.rs 抽离的运行时值/环境/控制流核心类型。
+//! v0.20: 运行时值/环境/控制流核心类型（自 interpreter.rs 抽出）。
 //!
-//! **Move-only refactor** — code copied verbatim from src/interpreter.rs
-//! No signature changes, no field changes, no visibility changes.
-//! Re-exported in interpreter.rs via `pub use crate::value::*;`
+//! **Move-only refactor** — 代码自 src/interpreter.rs **迁移**（非复制）：
+//! interpreter.rs 不再持有这些定义的副本，而是通过 `pub use crate::value::*`
+//! 重新导出。此处是唯一定义点。
 
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::io::BufReader;
 use std::sync::Arc;
 
-// v0.78: HAMT persistent map（feature = "persistent_env" 时挂入 Environment）
-#[cfg(feature = "persistent_env")]
+// v0.94: HAMT persistent map —— Environment 的绑定存储（始终启用，非 opt-in）。
 pub mod persistent;
 
 // v0.83: Clojure-style transducers — 流式管道的底层原语
@@ -380,8 +379,8 @@ pub enum Value {
     Code(String),
     // v0.83: TEA (The Elm Architecture) — Model/Msg/Update/Cmd 完整架构。
     //
-    // TeaApp = 完整 TEA runtime：Model 状态 + init/update/view 闭包 + msg_queue + cmd_queue。
-    // Arc<Mutex<TeaApp>> 允许多消费者读 model（view 层），单 owner 修改队列。
+    // TeaApp = 不可变 TEA runtime 值：Model + init/update/view 闭包 + msg_queue + cmd_queue。
+    // v0.94: TeaApp 本身是纯数据（无内部 Mutex）；Arc 仅用于廉价共享同一快照。
     TeaApp(std::sync::Arc<crate::tea::TeaApp>),
     // v0.83: TEA Cmd — 描述 update 函数想触发的副作用。
     // 值化后可在 builtin / record / replay 间无缝传递。
@@ -419,8 +418,8 @@ impl PartialEq for Value {
                 },
             ) => a == b && ra == rb && ta == tb && ba == bb,
             (Value::Document { metadata: a, .. }, Value::Document { metadata: b, .. }) => a == b,
-            // v0.83: TEA 变体按 Arc 内容比较（TeaApp 内部 Mutex 跳过）
-            (Value::TeaApp(a), Value::TeaApp(b)) => std::ptr::eq(a.as_ref(), b.as_ref()),
+            // v0.94: TEA 变体是纯数据 —— 结构相等（此前因内部 Mutex 只能按指针比较）。
+            (Value::TeaApp(a), Value::TeaApp(b)) => a == b,
             (Value::TeaCmd(a), Value::TeaCmd(b)) => a == b,
             (Value::TeaMsg(a), Value::TeaMsg(b)) => a == b,
             // v0.86: Curry — 按函数/arity/已绑定参数逐一比较。
@@ -714,23 +713,24 @@ pub struct Conflict {
 }
 
 // ─── Environment ─────────────────────────────────────────
+/// 词法环境 —— **不可变绑定存储**（v0.94 数据流化）。
+///
+/// 与过去的 `HashMap<String, Arc<Mutex<Value>>>` + `Arc<Mutex<Environment>>` 父链
+/// 不同，这里的绑定表是持久化 HAMT（[`persistent::PersistentMap`]）：
+/// - 绑定值是纯 `Value`，无每绑定 `Mutex` —— 捕获的闭包无法再被外部改写。
+/// - `parent` 是 `Arc<Environment>`（不可变），父链共享无需加锁。
+/// - `assoc` 返回新版本（结构共享），因此 [`Environment::snapshot`] 是 O(1) 克隆。
+///
+/// `define`/`assign` 仍是 `&mut self` 以兼容解释器按 `&mut Environment` 穿线的
+/// 调用面，但其内部以持久 map 产生新版本，不再有内部可变性。
 #[derive(Debug, Clone)]
 pub struct Environment {
-    pub values: HashMap<String, Arc<Mutex<Value>>>,
-    pub exports: HashMap<String, Arc<Mutex<Value>>>,
-    pub parent: Option<Arc<Mutex<Environment>>>,
+    pub values: persistent::PersistentMap<Value>,
+    pub parent: Option<Arc<Environment>>,
     /// v0.61: Per-binding version clocks (which agent modified each key).
     pub versions: HashMap<String, VectorClock>,
     /// v0.61: This environment's own vector clock.
     pub clock: VectorClock,
-    /// v0.78: 可选 HAMT 镜像 — `feature = "persistent_env"` 时填充。
-    /// 闭包捕获、agent state undo/redo 时使用纯不可变版本。
-    /// 默认 None（零开销，opt-in）。
-    #[cfg(feature = "persistent_env")]
-    pub persistent_mirror: Option<persistent::PersistentMap>,
-    /// v0.78: 没有 persistent_env feature 时的占位（保持 struct 布局不变）。
-    #[cfg(not(feature = "persistent_env"))]
-    pub persistent_mirror: Option<()>,
 }
 
 impl Default for Environment {
@@ -742,63 +742,62 @@ impl Default for Environment {
 impl Environment {
     pub fn new() -> Self {
         Self {
-            values: HashMap::new(),
-            exports: HashMap::new(),
+            values: persistent::PersistentMap::new(),
             parent: None,
             versions: HashMap::new(),
             clock: VectorClock::default(),
-            persistent_mirror: None,
         }
     }
 
-    pub fn with_parent_of(parent: Arc<Mutex<Environment>>) -> Self {
+    pub fn with_parent_of(parent: Arc<Environment>) -> Self {
         Self {
-            values: HashMap::new(),
-            exports: HashMap::new(),
+            values: persistent::PersistentMap::new(),
             parent: Some(parent),
             versions: HashMap::new(),
             clock: VectorClock::default(),
-            persistent_mirror: None,
         }
     }
 
-    /// v0.40: accept Rc<RefCell<>> for the new env model. Converts
-    /// to Arc<Mutex<>> internally for now (C1 shim, removed in C4).
-    pub fn with_parent_of_rc(parent: std::rc::Rc<std::cell::RefCell<Environment>>) -> Self {
-        Self::with_parent_of(Arc::new(Mutex::new(parent.borrow().clone())))
+    /// O(1) 快照：持久 map 结构共享，父链 Arc 递增。并发捕获的底层原语。
+    pub fn snapshot(&self) -> Environment {
+        self.clone()
     }
 
-    pub fn define(&mut self, name: String, value: Value, exported: bool) {
-        let arc = Arc::new(Mutex::new(value.clone()));
-        self.values.insert(name.clone(), arc.clone());
+    /// 纯函数式定义：返回带新绑定的新环境，`self` 保持不变。
+    /// 这是「用数据流代替状态机」的环境原语 —— 调用方持有新版本即可。
+    pub fn assoc(&self, name: &str, value: Value) -> Environment {
+        let mut next = self.clone();
+        next.values = next.values.assoc(name, value);
+        next.versions.insert(name.to_string(), self.clock.clone());
+        next
+    }
+
+    pub fn define(&mut self, name: String, value: Value, _exported: bool) {
+        self.values = self.values.assoc(&name, value);
         // v0.61: record the current clock for this binding
-        self.versions.insert(name.clone(), self.clock.clone());
-        if exported {
-            self.exports.insert(name, arc);
-        }
+        self.versions.insert(name, self.clock.clone());
     }
 
     pub fn get(&self, name: &str) -> Option<Value> {
-        if let Some(arc) = self.values.get(name) {
-            Some(arc.lock().clone())
+        if let Some(v) = self.values.get(name) {
+            Some(v.clone())
         } else if let Some(parent) = &self.parent {
-            parent.lock().get(name)
+            parent.get(name)
         } else {
             None
         }
     }
 
     pub fn assign(&mut self, name: &str, value: Value) -> bool {
-        if let Some(arc) = self.values.get(name) {
-            *arc.lock() = value;
+        if self.values.contains_key(name) {
+            self.values = self.values.assoc(name, value);
             // v0.61: update the version clock for this binding
             self.versions.insert(name.to_string(), self.clock.clone());
             true
-        } else if let Some(parent) = &self.parent {
-            let result = parent.lock().assign(name, value);
-            // v0.64: Bug fix — also update local clock for parent-scope writes.
-            // Without this, concurrent modifications through the parent chain
-            // would carry stale clocks and fail conflict detection.
+        } else if let Some(parent) = &mut self.parent {
+            // 父链是 Arc<Environment>：写入触发写时复制，共享的父版本不被就地改写。
+            let result = Arc::make_mut(parent).assign(name, value);
+            // v0.64: also update local clock for parent-scope writes.
             if result {
                 self.versions.insert(name.to_string(), self.clock.clone());
             }
@@ -808,58 +807,12 @@ impl Environment {
         }
     }
 
-    // v0.21: 所有权语义支持
-
-    /// 获取绑定状态
-    pub fn get_binding(&self, name: &str) -> Option<Binding> {
-        if let Some(arc) = self.values.get(name) {
-            Some(Binding::Value(arc.lock().clone()))
-        } else if let Some(parent) = &self.parent {
-            parent.lock().get_binding(name)
-        } else {
-            None
-        }
-    }
-
-    /// 移动变量（所有权转移）
-    pub fn move_variable(&mut self, name: &str) -> Result<Value, String> {
-        if let Some(arc) = self.values.remove(name) {
-            Ok(arc.lock().clone())
-        } else if let Some(parent) = &self.parent {
-            parent.lock().move_variable(name)
-        } else {
-            Err(format!("undefined variable: {}", name))
-        }
-    }
-
-    /// 借用变量（不可变）— 返回共享 Arc，修改会反映到原变量
-    pub fn borrow_variable(&self, name: &str) -> Result<Arc<Mutex<Value>>, String> {
-        if let Some(arc) = self.values.get(name) {
-            Ok(Arc::clone(arc))
-        } else if let Some(parent) = &self.parent {
-            parent.lock().borrow_variable(name)
-        } else {
-            Err(format!("undefined variable: {}", name))
-        }
-    }
-
-    /// 可变借用变量 — 返回共享 Arc，修改会反映到原变量
-    pub fn borrow_variable_mut(&mut self, name: &str) -> Result<Arc<Mutex<Value>>, String> {
-        if let Some(arc) = self.values.get(name) {
-            Ok(Arc::clone(arc))
-        } else if let Some(parent) = &self.parent {
-            parent.lock().borrow_variable_mut(name)
-        } else {
-            Err(format!("undefined variable: {}", name))
-        }
-    }
-
     /// 迭代环境中的所有绑定（仅当前层，不含 parent），供 import/子 env 合并用。
-    /// 返回 (name, Value) 的克隆，避免借用临时 MutexGuard。
     pub fn iter(&self) -> Vec<(String, Value)> {
         self.values
             .iter()
-            .map(|(k, v)| (k.clone(), v.lock().clone()))
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.clone()))
             .collect()
     }
 
@@ -872,11 +825,10 @@ impl Environment {
     /// v0.61: Also merges per-binding version clocks and the environment-level clock.
     pub fn merge_from(&mut self, child: &Environment, strategy: &MergeStrategy) {
         for (name, child_val) in values_iter(child) {
-            match self.values.get(&name) {
-                Some(parent_arc) => {
-                    let parent_val = parent_arc.lock().clone();
+            match self.values.get(&name).cloned() {
+                Some(parent_val) => {
                     let merged = Value::merge(parent_val, child_val, strategy);
-                    *parent_arc.lock() = merged;
+                    self.values = self.values.assoc(&name, merged);
                     // Merge version clock for this binding
                     if let Some(child_v) = child.versions.get(&name) {
                         self.versions
@@ -914,8 +866,8 @@ impl Environment {
         let mut conflicts = Vec::new();
         for (name, child_val) in values_iter(child) {
             let strategy = strategies.get(&name).unwrap_or(default);
-            match self.values.get(&name) {
-                Some(parent_arc) => {
+            match self.values.get(&name).cloned() {
+                Some(parent_val) => {
                     let parent_clock = self.versions.get(&name).cloned().unwrap_or_default();
                     let child_clock = child.versions.get(&name).cloned().unwrap_or_default();
 
@@ -926,16 +878,15 @@ impl Environment {
                     {
                         conflicts.push(Conflict {
                             key: name.clone(),
-                            parent_value: parent_arc.lock().clone(),
+                            parent_value: parent_val.clone(),
                             child_value: child_val.clone(),
                             parent_clock: parent_clock.clone(),
                             child_clock: child_clock.clone(),
                         });
                     }
 
-                    let parent_val = parent_arc.lock().clone();
                     let merged = Value::merge(parent_val, child_val, strategy);
-                    *parent_arc.lock() = merged;
+                    self.values = self.values.assoc(&name, merged);
                     // Merge clocks: take max per agent
                     let mut merged_clock = parent_clock;
                     merged_clock.merge(&child_clock);
@@ -959,7 +910,8 @@ impl Environment {
 fn values_iter(env: &Environment) -> Vec<(String, Value)> {
     env.values
         .iter()
-        .map(|(k, v)| (k.clone(), v.lock().clone()))
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.clone()))
         .collect()
 }
 
@@ -1220,6 +1172,84 @@ mod tests {
         parent.merge_from(&child, &MergeStrategy::LastWriteWins);
         assert_eq!(parent.get("a"), Some(Value::Int(1)));
         assert_eq!(parent.get("b"), Some(Value::Int(2)));
+    }
+
+    #[test]
+    fn env_clone_is_isolated_not_aliased() {
+        // 旧实现用 HashMap<String, Arc<Mutex<Value>>>：clone 共享绑定 cell，
+        // 一处写会穿透另一处。持久化绑定后 clone 是独立版本。
+        let mut base = Environment::new();
+        base.define("x".into(), Value::Int(1), false);
+        let mut copy = base.clone();
+        copy.define("x".into(), Value::Int(2), false);
+        assert_eq!(copy.get("x"), Some(Value::Int(2)));
+        assert_eq!(base.get("x"), Some(Value::Int(1)), "clone 不得被别名写穿");
+    }
+
+    #[test]
+    fn env_snapshot_isolated_from_further_writes() {
+        let mut base = Environment::new();
+        base.define("x".into(), Value::Int(1), false);
+        let snap = base.snapshot();
+        base.define("x".into(), Value::Int(9), false);
+        base.define("y".into(), Value::Int(7), false);
+        assert_eq!(snap.get("x"), Some(Value::Int(1)), "快照冻结在捕获时刻");
+        assert_eq!(snap.get("y"), None, "后续定义不进入旧快照");
+        assert_eq!(base.get("x"), Some(Value::Int(9)));
+    }
+
+    #[test]
+    fn env_assoc_is_pure() {
+        let base = Environment::new();
+        let with_a = base.assoc("a", Value::Int(1));
+        let with_b = with_a.assoc("b", Value::Int(2));
+        assert_eq!(base.get("a"), None, "assoc 不改变原环境");
+        assert_eq!(with_a.get("a"), Some(Value::Int(1)));
+        assert_eq!(with_a.get("b"), None);
+        assert_eq!(with_b.get("a"), Some(Value::Int(1)), "结构共享保留旧键");
+        assert_eq!(with_b.get("b"), Some(Value::Int(2)));
+    }
+
+    #[test]
+    fn env_parent_scope_assign_copies_on_write() {
+        let mut p = Environment::new();
+        p.define("a".into(), Value::Int(1), false);
+        let parent = Arc::new(p);
+        let mut child = Environment::with_parent_of(Arc::clone(&parent));
+        assert!(child.assign("a", Value::Int(99)), "写入父作用域已有绑定");
+        assert_eq!(child.get("a"), Some(Value::Int(99)));
+        assert_eq!(
+            parent.get("a"),
+            Some(Value::Int(1)),
+            "父链是不可变的：写时复制，共享的父版本不被就地改写"
+        );
+    }
+
+    #[test]
+    fn environment_is_send_sync() {
+        // 纯函数式数据（无内部可变性）天然满足 Send + Sync —— 并发不再依赖锁。
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<Environment>();
+    }
+
+    #[test]
+    fn env_shared_across_threads_without_locks() {
+        let mut base = Environment::new();
+        base.define("answer".into(), Value::Int(42), false);
+        let shared = Arc::new(base);
+        let handles: Vec<_> = (0..4)
+            .map(|i| {
+                let env = Arc::clone(&shared);
+                std::thread::spawn(move || {
+                    // 纯读：无锁、无 &mut，仅结构共享。
+                    (i, env.get("answer").expect("binding present"))
+                })
+            })
+            .collect();
+        for h in handles {
+            let (_, v) = h.join().expect("thread join");
+            assert_eq!(v, Value::Int(42));
+        }
     }
 
     #[test]

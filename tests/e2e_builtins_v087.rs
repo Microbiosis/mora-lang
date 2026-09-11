@@ -24,8 +24,8 @@ fn run_mora(source: &str) -> Result<Value, String> {
     let mut interp = Interpreter::new();
     let mut env = interp.take_env();
     let func_arc = Arc::new(func);
-    run_mir(&func_arc, &mut interp, &mut env).map_err(|e| format!("run_mir error: {}", e))?;
-    run_main_task(&func_arc, &mut interp, &mut env)
+    run_mir(&func_arc, &mut interp, &mut env, &mut mora::mir::effect::Effects::new()).map_err(|e| format!("run_mir error: {}", e))?;
+    run_main_task(&func_arc, &mut interp, &mut env, &mut mora::mir::effect::Effects::new())
         .map_err(|e| format!("run_main_task error: {}", e))?;
     env.get("__result")
         .ok_or_else(|| "result variable '__result' not found".to_string())

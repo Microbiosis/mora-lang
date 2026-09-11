@@ -260,7 +260,11 @@ fn invoke_handler(
     // 调闭包: handler(req_dict)
     let mut interp = interpreter.blocking_write();
     interp
-        .call_value(&handler, vec![req_value])
+        .call_value(
+            &handler,
+            vec![req_value],
+            &mut crate::mir::effect::Effects::new(),
+        )
         .map_err(MoraError::Other) // v0.75.99: String → MoraError::Other
 }
 

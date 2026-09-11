@@ -1,0 +1,12 @@
+[profile.test]
+opt-level = 0
+debug = true
+link-args = ["/STACK:4194304"]
+
+[profile.test.package."*"]
+opt-level = 0
+link-args = ["/STACK:4194304"]
+
+[profile.test.build-override]
+opt-level = 0
+link-args = ["/STACK:4194304"]

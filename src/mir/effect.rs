@@ -76,6 +76,23 @@ impl EffectRow {
         out
     }
 
+    /// v0.96: 移除一个具名 effect 标签（handle 吸收语义的纯函数原语）。
+    ///
+    /// `handle X { body }` 的残差行 = body 行去掉所有 X 出现点。Var 是
+    /// 多态占位符，保持不变（未知行交由约束推迟消解）。
+    pub fn remove(&self, label: &str) -> EffectRow {
+        match self {
+            EffectRow::Empty | EffectRow::Var(_) => self.clone(),
+            EffectRow::Cons(h, t) => {
+                if h == label {
+                    t.remove(label)
+                } else {
+                    EffectRow::Cons(h.clone(), Box::new(t.remove(label)))
+                }
+            }
+        }
+    }
+
     fn collect_labels<'a>(row: &'a EffectRow, out: &mut Vec<&'a str>) {
         match row {
             EffectRow::Empty | EffectRow::Var(_) => {}
@@ -172,6 +189,28 @@ impl Effects {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remove_absorbs_all_occurrences() {
+        let row = EffectRow::Cons(
+            "Ai".into(),
+            Box::new(EffectRow::Cons(
+                "Log".into(),
+                Box::new(EffectRow::Cons("Ai".into(), Box::new(EffectRow::Empty))),
+            )),
+        );
+        let residual = row.remove("Ai");
+        assert_eq!(residual.labels(), vec!["Log"]);
+    }
+
+    #[test]
+    fn remove_keeps_var_and_other_labels() {
+        let var_row = EffectRow::Var("rho".into());
+        assert!(matches!(var_row.remove("Ai"), EffectRow::Var(_)));
+        let row = EffectRow::Cons("Log".into(), Box::new(EffectRow::Empty));
+        assert_eq!(row.remove("Ai").labels(), vec!["Log"]);
+        assert_eq!(EffectRow::Empty.remove("Ai"), EffectRow::Empty);
+    }
 
     #[test]
     fn extend_into_empty() {

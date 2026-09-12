@@ -196,6 +196,113 @@ pub enum WitnessCallee {
     Builtin(BuiltinOp),
 }
 
+impl MirWitness {
+    /// v0.96: 按求值顺序枚举全部子 witness（无子节点返回空）。
+    ///
+    /// 供效果定位游走等树遍历使用；注意**不**对遍历语义做特殊处理 ——
+    /// Handle 的 body/handler、Closure/FnDef 的 body 一视同仁地返回，
+    /// 调用方（如 typeck 效果定位）自行决定跳过哪些子树。
+    pub fn child_witnesses(&self) -> Vec<&MirWitness> {
+        match &self.kind {
+            WitnessKind::Literal(_)
+            | WitnessKind::Variable(_)
+            | WitnessKind::Break(_)
+            | WitnessKind::Continue(_)
+            | WitnessKind::Import(_)
+            | WitnessKind::Return(None)
+            | WitnessKind::TypeAlias { .. }
+            | WitnessKind::EnumDef { .. }
+            | WitnessKind::StructDef { .. }
+            | WitnessKind::ModelDef { .. }
+            | WitnessKind::MsgDef { .. } => Vec::new(),
+            WitnessKind::Binary { left, right, .. } => vec![left.as_ref(), right.as_ref()],
+            WitnessKind::Call { callee, args } => {
+                let mut out: Vec<&MirWitness> = Vec::new();
+                if let WitnessCallee::Evaluated(e) = callee {
+                    out.push(e.as_ref());
+                }
+                out.extend(args);
+                out
+            }
+            WitnessKind::MethodCall {
+                receiver, args, ..
+            } => {
+                let mut out = vec![receiver.as_ref()];
+                out.extend(args);
+                out
+            }
+            WitnessKind::Closure { body, .. } | WitnessKind::FnDef { body, .. } => {
+                vec![body.as_ref()]
+            }
+            WitnessKind::Match { scrutinee, arms } => {
+                let mut out = vec![scrutinee.as_ref()];
+                for arm in arms {
+                    if let Some(g) = &arm.guard {
+                        out.push(g);
+                    }
+                    out.push(&arm.body);
+                }
+                out
+            }
+            WitnessKind::If {
+                cond,
+                then,
+                r#else,
+            } => {
+                let mut out = vec![cond.as_ref(), then.as_ref()];
+                if let Some(e) = r#else {
+                    out.push(e.as_ref());
+                }
+                out
+            }
+            WitnessKind::Loop {
+                iterable, body, ..
+            }
+            | WitnessKind::While {
+                cond: iterable,
+                body,
+            } => vec![iterable.as_ref(), body.as_ref()],
+            WitnessKind::Or { left, right } | WitnessKind::And { left, right } => {
+                vec![left.as_ref(), right.as_ref()]
+            }
+            WitnessKind::List(items) => items.iter().collect(),
+            WitnessKind::Dict(entries) => entries.iter().map(|(_, v)| v).collect(),
+            WitnessKind::DynTrait { expr, .. } => vec![expr.as_ref()],
+            WitnessKind::Prompt { parts } => parts.iter().collect(),
+            WitnessKind::LetBinding {
+                value, init_body, ..
+            } => vec![value.as_ref(), init_body.as_ref()],
+            WitnessKind::Assign { value, .. } => vec![value.as_ref()],
+            WitnessKind::IndexAssign {
+                object,
+                index,
+                value,
+            } => vec![object.as_ref(), index.as_ref(), value.as_ref()],
+            WitnessKind::Return(Some(v)) => vec![v.as_ref()],
+            WitnessKind::Orchestrate { kind, .. } => kind.child_witnesses(),
+            WitnessKind::Perform { args, .. } => args.iter().collect(),
+            WitnessKind::Handle { body, handler, .. } => {
+                vec![body.as_ref(), handler.as_ref()]
+            }
+            WitnessKind::MacroDef { body, .. } => vec![body.as_ref()],
+            WitnessKind::Sequence(items) => items.iter().collect(),
+            WitnessKind::UpdateDef { body, .. } => vec![body.as_ref()],
+            WitnessKind::AppDef {
+                init_w,
+                update_w,
+                view_w,
+                ..
+            } => vec![init_w.as_ref(), update_w.as_ref(), view_w.as_ref()],
+            WitnessKind::WithConfig { bindings, body } => {
+                let mut out: Vec<&MirWitness> = bindings.iter().map(|(_, v)| v).collect();
+                out.push(body.as_ref());
+                out
+            }
+            WitnessKind::Quasiquote { segments } => segments.iter().collect(),
+        }
+    }
+}
+
 /// v0.92: builtin 操作码（原在 `mir/expr/mod.rs`）。
 /// WitnessCallee::Builtin 与 typeck HM 推断消费；与表达式树无关，故迁至 witness 层。
 #[derive(Debug, Clone, PartialEq)]
@@ -288,6 +395,69 @@ pub enum WitnessOrchestrateKind {
 }
 
 impl WitnessOrchestrateKind {
+    /// v0.96: 按序枚举 orchestrate 声明内的全部子 witness。
+    pub fn child_witnesses(&self) -> Vec<&MirWitness> {
+        fn push_agent<'a>(a: &'a WitnessAgentDef, out: &mut Vec<&'a MirWitness>) {
+            out.push(&a.task_expr);
+            if let Some(v) = &a.verify_expr {
+                out.push(v);
+            }
+            if let Some(cfg) = &a.with_config {
+                out.extend(cfg.values());
+            }
+        }
+        fn push_agents_edges<'a>(
+            agents: &'a [WitnessAgentDef],
+            edges: &'a [WitnessEdgeDef],
+            out: &mut Vec<&'a MirWitness>,
+        ) {
+            for a in agents {
+                push_agent(a, out);
+            }
+            for e in edges {
+                if let Some(c) = &e.condition_expr {
+                    out.push(c);
+                }
+            }
+        }
+        let mut out: Vec<&MirWitness> = Vec::new();
+        match self {
+            WitnessOrchestrateKind::Sequential { agents } => {
+                for a in agents {
+                    push_agent(a, &mut out);
+                }
+            }
+            WitnessOrchestrateKind::Loop {
+                agents, exit_when, ..
+            } => {
+                for a in agents {
+                    push_agent(a, &mut out);
+                }
+                if let Some(e) = exit_when {
+                    out.push(e);
+                }
+            }
+            WitnessOrchestrateKind::Graph { agents, edges } => {
+                push_agents_edges(agents, edges, &mut out);
+            }
+            WitnessOrchestrateKind::Pregel { agents, edges, .. } => {
+                push_agents_edges(agents, edges, &mut out);
+            }
+            WitnessOrchestrateKind::Moa { prompt, .. } => out.push(prompt),
+            WitnessOrchestrateKind::Moe {
+                experts,
+                router,
+                prompt,
+                ..
+            } => {
+                out.extend(experts);
+                out.push(router);
+                out.push(prompt);
+            }
+        }
+        out
+    }
+
     pub fn from_kind(kind: &MirOrchestrateKind) -> WitnessOrchestrateKind {
         match kind {
             MirOrchestrateKind::Sequential { agents } => WitnessOrchestrateKind::Sequential {

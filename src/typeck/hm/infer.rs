@@ -32,7 +32,18 @@ impl HMInference {
         let _span = span; // 保留 span 以便未来错误检查
         let gen_ty = generalize::generalize(&value_ty, &self.env.free_variables());
         self.env.add(name.to_string(), gen_ty.clone());
-        let _ = _span;
+        // v0.96: let 绑定闭包/函数 —— 把定义行登记进 fn_effect_rows。
+        // 零参闭包的类型是裸 TypeVar（无 Arrow 层可携带行），必须按
+        // 定义 span 从 closure_rows 取回，否则跨函数效果传播漏检。
+        if matches!(
+            value.kind,
+            WitnessKind::Closure { .. } | WitnessKind::FnDef { .. }
+        ) && let Some(row) = self.closure_rows.get(&value.span)
+        {
+            self.fn_effect_rows
+                .insert(name.to_string(), row.clone());
+        }
+        let _ = span;
         Ok((gen_ty, value_row))
     }
 
@@ -78,6 +89,15 @@ impl HMInference {
         }
         let gen_hint = generalize::generalize(ty_inner, &self.env.free_variables());
         self.env.add(name.to_string(), gen_hint.clone());
+        // v0.96: 同 infer_let —— 类型标注的 let 绑定闭包也登记效果行。
+        if matches!(
+            value.kind,
+            WitnessKind::Closure { .. } | WitnessKind::FnDef { .. }
+        ) && let Some(row) = self.closure_rows.get(&value.span)
+        {
+            self.fn_effect_rows
+                .insert(name.to_string(), row.clone());
+        }
         let _ = span;
         Ok((gen_hint, value_row))
     }
@@ -350,27 +370,70 @@ impl HMInference {
                 // 兜底 Unknown 有副作用：约束 Unknown = Arrow(...) 在 unification 中
                 // fail-fast 报错（line 0）。改为 fresh TypeVar：让 Arrow 分解约束
                 // 自然传播 ret 类型。
+                // v0.96: 效果行直接从 Arrow 类型/登记表提取（数据流，不靠
+                // 约束消解）—— 顶层边界断言用的是**消解前**的残差行。
+                // Arrow 行为空时回落 fn_effect_rows（零参闭包的类型是裸
+                // TypeVar，行只在其定义 span 的登记表中）。
                 let ty_opt = self.env.get(name).cloned();
-                let ty = if let Some(t) = ty_opt {
-                    Some(self.instantiate_if_forall(&t))
+                let (ty, callee_row) = if let Some(t) = ty_opt {
+                    let inst = self.instantiate_if_forall(&t);
+                    let row = match Self::arrow_row_of(&inst) {
+                        crate::mir::effect::EffectRow::Empty => self
+                            .fn_effect_rows
+                            .get(name)
+                            .cloned()
+                            .unwrap_or(crate::mir::effect::EffectRow::Empty),
+                        r => r,
+                    };
+                    (Some(inst), row)
+                } else if let Some(t) = self.builtin_callee_ty(name) {
+                    let inst = self.instantiate_if_forall(&t);
+                    let row = Self::arrow_row_of(&inst);
+                    (Some(inst), row)
                 } else {
-                    self.builtin_callee_ty(name)
+                    let row = self
+                        .fn_effect_rows
+                        .get(name)
+                        .cloned()
+                        .unwrap_or(crate::mir::effect::EffectRow::Empty);
+                    (None, row)
                 };
                 let ty = ty.unwrap_or_else(|| self.fresh_type_var());
-                (ty, crate::mir::effect::EffectRow::Empty)
+                (ty, callee_row)
             }
             // v0.75.97: Var 命中 ForAll 时实例化
             WitnessCallee::Var(var_name) => {
                 let ty_opt = self.env.get(var_name).cloned();
-                match ty_opt {
-                    Some(ty) => (self.instantiate_if_forall(&ty), crate::mir::effect::EffectRow::Empty),
-                    None => (self.fresh_type_var(), crate::mir::effect::EffectRow::Empty),
-                }
+                let (ty, callee_row) = match ty_opt {
+                    Some(t) => {
+                        let inst = self.instantiate_if_forall(&t);
+                        // v0.96: Arrow 行为空时回落登记表（零参闭包）
+                        let row = match Self::arrow_row_of(&inst) {
+                            crate::mir::effect::EffectRow::Empty => self
+                                .fn_effect_rows
+                                .get(var_name)
+                                .cloned()
+                                .unwrap_or(crate::mir::effect::EffectRow::Empty),
+                            r => r,
+                        };
+                        (inst, row)
+                    }
+                    None => {
+                        let row = self
+                            .fn_effect_rows
+                            .get(var_name)
+                            .cloned()
+                            .unwrap_or(crate::mir::effect::EffectRow::Empty);
+                        (self.fresh_type_var(), row)
+                    }
+                };
+                (ty, callee_row)
             }
             WitnessCallee::Evaluated(expr) => self.infer_expr(expr)?,
             WitnessCallee::Builtin(op) => {
                 let ty = self.builtin_type(op)?;
-                (ty, crate::mir::effect::EffectRow::Empty)
+                let row = Self::arrow_row_of(&ty);
+                (ty, row)
             }
             // v0.75.16: Method 调用（parser 现产出 WitnessCallee::Method）— 走
             // method_signature 推断（receiver 类型 + 参数约束 + 返回类型）。
@@ -430,6 +493,18 @@ impl HMInference {
             acc_row = self.merge_rows(acc_row, fresh_eff);
         }
         Ok((callee_ty, acc_row))
+    }
+
+    /// v0.96: 提取 curried Arrow 外层携带的效果行（非 Arrow → 纯）。
+    ///
+    /// wrap_curried_arrow 在每层 Arrow 都填同一个 body 行，取最外层即可。
+    /// 直接数据提取（而非约束消解）是关键：顶层边界断言消费的是**消解前**
+    /// 的残差行，行若以未消解 Var 形式上浮就会被宽松跳过（漏检）。
+    fn arrow_row_of(ty: &Type) -> crate::mir::effect::EffectRow {
+        match ty {
+            Type::Arrow(_, _, row) => row.clone(),
+            _ => crate::mir::effect::EffectRow::Empty,
+        }
     }
 
     pub(super) fn infer_method_call(
@@ -518,12 +593,13 @@ impl HMInference {
         ))
     }
 
-    pub(super) fn infer_closure(
+    /// v0.96: 闭包/函数推断公共核心 —— 参数类型 + body 类型/效果行。
+    fn infer_closure_core(
         &mut self,
         params: &[WitnessParam],
         body: &MirWitness,
-        span: Span,
-    ) -> Result<(Type, crate::mir::effect::EffectRow), Vec<TypeError>> {
+        _span: Span,
+    ) -> Result<(Vec<Type>, Type, crate::mir::effect::EffectRow), Vec<TypeError>> {
         // v0.84: 检查重复参数名——闭包/函数参数不允许同名。
         let mut seen_names: HashSet<String> = HashSet::new();
         for p in params {
@@ -531,7 +607,7 @@ impl HMInference {
                 return Err(vec![TypeError::UnificationFailure {
                     expected: "distinct parameter names".to_string(),
                     got: format!("duplicate parameter `{}`", p.name),
-                    span: Some(span),
+                    span: Some(_span),
                 }]);
             }
         }
@@ -550,7 +626,11 @@ impl HMInference {
         }
         let (body_ty, body_row) = self.infer_expr(body)?;
         self.env = saved_env;
-        // v0.80: 构建 curried arrow — 从最后一个参数向前包裹。
+        Ok((param_types, body_ty, body_row))
+    }
+
+    /// curried Arrow 包装 —— 从最后一个参数向前包裹，每层携带 body 效果行。
+    fn wrap_curried_arrow(param_types: &[Type], body_ty: Type, body_row: &crate::mir::effect::EffectRow) -> Type {
         let mut ty = body_ty;
         for param_ty in param_types.iter().rev() {
             ty = Type::Arrow(
@@ -559,25 +639,45 @@ impl HMInference {
                 body_row.clone(),
             );
         }
-        // v0.75.86: 不报错路径，保留 _span 备未来错误检查扩展点
-        let _span = span;
-        let _ = _span;
+        ty
+    }
+
+    pub(super) fn infer_closure(
+        &mut self,
+        params: &[WitnessParam],
+        body: &MirWitness,
+        span: Span,
+    ) -> Result<(Type, crate::mir::effect::EffectRow), Vec<TypeError>> {
+        let (param_types, body_ty, body_row) = self.infer_closure_core(params, body, span)?;
+        let ty = Self::wrap_curried_arrow(&param_types, body_ty, &body_row);
+        // v0.96: 按 span 登记定义行 —— 零参闭包类型是裸 TypeVar，
+        // let 绑定侧只能经此表取回行（fn_effect_rows 转登记）。
+        self.closure_rows.insert(span, body_row);
         // 闭包定义是 pure 的 — body 的 effects 被捕获到 Arrow 类型里。
         Ok((ty, crate::mir::effect::EffectRow::Empty))
     }
 
     pub(super) fn infer_fn_def(
         &mut self,
+        name: Option<&str>,
         params: &[WitnessParam],
         body: &MirWitness,
         span: Span,
     ) -> Result<(Type, crate::mir::effect::EffectRow), Vec<TypeError>> {
-        // fn name(params) = body  is treated like an immediately-bound
-        // closure; the name registration is the caller's responsibility.
-        // v0.75.86: 不报错路径，保留 _span 备未来错误检查扩展点
-        let _span = span;
-        let _ = _span;
-        self.infer_closure(params, body, span)
+        // fn/task 定义：与闭包同构（immediately-bound closure；名字注册是
+        // 调用方的责任 —— 定义名不进 env）。
+        // v0.96: body 效果行登记进 `fn_effect_rows`，调用点（infer_call）
+        // 据此把被调效果传播进调用方残差行 —— 跨函数效果得以静态可见。
+        // （定义本身是纯的：perform 发生在调用时、由调用点上下文负责。）
+        let (param_types, body_ty, body_row) = self.infer_closure_core(params, body, span)?;
+        let ty = Self::wrap_curried_arrow(&param_types, body_ty, &body_row);
+        if let Some(n) = name {
+            self.fn_effect_rows.insert(n.to_string(), body_row.clone());
+        }
+        // v0.96: 同 infer_closure —— 支持 `let g = task f()` 别名绑定的
+        // 行转登记（key 是 FnDef witness 的 span）。
+        self.closure_rows.insert(span, body_row);
+        Ok((ty, crate::mir::effect::EffectRow::Empty))
     }
 
     pub(super) fn infer_match(

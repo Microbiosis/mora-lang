@@ -2,6 +2,57 @@
 
 All notable changes to Mora will be documented in this file.
 
+## [v0.96.0] — 2026-09-12 — feat: EffectRow 编译期强制 — unhandled effect 闭环
+
+**原则**：纯函数让并发从防御性编程变成自然属性 —— 「纯」从此是编译期属性。
+v0.80 建成的效果行机制（Perform 产生标签、Handle 约束吸收、跨调用统一）
+只差最后一环：**没有任何边界断言残差行**，行一路向上流后悄然消失，运行时
+"unhandled effect" 兜底注释自称「应被 typeck 捕获」却从未被捕获。本版本
+闭环这条管线，且不落入「词法检查错误拒绝合法程序」的陷阱。
+
+### (1) 顶层边界断言（infer_program）
+
+- 每个顶层 witness 推断后，残差效果行不允许含具名标签 —— 否则报
+  `EffectRowMismatch`，**定位游走**找到发起点：直接 perform 报其 span；
+  跨函数调用报调用点 span 并注明来源函数（`(perform inside "doIt")`）。
+- 残差行仅含行变量（多态未知行，来自未注册 callee 的调用）时宽松放行。
+
+### (2) handle 吸收语义改为直接行差（修复既有误拒）
+
+- `handle X { body }` 残差 = body 行 `remove(X)`（纯数据删除，吸收全部
+  出现点）。此前是严格等式约束 `RowEq(body_row, Cons(X, residual))`，
+  body 不 perform X 时（定义了未触发的 handler —— 合法程序）走
+  unify_row 的 Empty-vs-Cons 分支误报 "pure vs {X}"。未知行（Var）保留
+  约束推迟消解。
+
+### (3) 跨函数效果传播（定义时 perform、调用处 handle 的合法程序不被拒绝）
+
+- `task`/`fn` 定义（WitnessKind::FnDef）：body 效果行登记进
+  `fn_effect_rows`（定义本身是纯的 —— perform 发生在调用时）。
+- `let f = fn/task ...`：经 `closure_rows`（按定义 span）转登记 ——
+  零参闭包的类型是裸 TypeVar，无 Arrow 层可携带行，此路径否则漏检。
+- `infer_call`：从被调类型的 Arrow 层直接提取效果行（数据提取而非约束
+  消解 —— 边界断言消费消解前的残差行），Arrow 行为空时回落登记表。
+
+### (4) 语义保证（新增 8 个边界测试钉住）
+
+- 顶层未处理 perform → 报错（含标签名 + handle 补救提示 + 精准定位）；
+- perform 在匹配 handle 内 → 通过；在不匹配 handle 内 → 报错；
+- 纯 body handle（未触发的 handler）→ **通过**（修复既有误拒）；
+- task/let 闭包定义时 perform：调用点在 handle 内 → 通过；在外 → 报错；
+- 嵌套 handle 各吸收各的效果；
+- 定义体内 perform 不被外层环境误判（定位游走不下潜函数体 —— 词法陷阱
+  的显式防御）。
+
+**行为变更**：此前静默通过的无 handle perform 程序现在在 typeck 报错
+（`--check`/LSP 可见；运行路径仅打印不阻断）。运行时 "unhandled effect"
+兜底自此后只防御动态生成代码（如 eval）。mora-spec §7.7 补录编译期
+强制语义。
+
+**测试**：lib 887（+10：8 边界 + 2 EffectRow::remove；handle_captures_effect
+断言 Var → Empty 同步新语义）、全集成套件 0 失败（全代码库零误拒）、
+clippy -D warnings 清零。
+
 ## [v0.95.0] — 2026-09-12 — refactor: 环境所有权数据流化 — 拆除 Arc<Mutex<Environment>> 冗余锁
 
 **原则**：用数据流代替状态机。v0.94 把 `Environment` 改成无内部可变性的持久化

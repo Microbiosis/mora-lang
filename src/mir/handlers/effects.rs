@@ -292,7 +292,7 @@ pub fn h_perform(
             Ok(())
         }
         None => Err(format!(
-            "unhandled effect: {} (no handle block in scope; this is a compile-time error that should have been caught by typeck)",
+            "unhandled effect: {} (no matching handle block in scope; typeck reports this as an EffectRowMismatch at compile time — this runtime fallback only guards dynamically generated code)",
             effect
         )),
     }

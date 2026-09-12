@@ -70,6 +70,18 @@ pub struct HMInference {
     /// Used by `export_type_table` to produce a TypeTable without
     /// modifying infer/unify/bidirectional logic.
     pub shadow_types: HashMap<Span, (Type, crate::mir::effect::EffectRow)>,
+    /// v0.96: 顶层 fn/task 定义的效果行登记（name → body 残差行）。
+    ///
+    /// `task name() ...` 定义在 witness 层是 [`WitnessKind::FnDef`]，但
+    /// 定义名不进 [`Self::env`]（无 Arrow 类型）—— 调用点只能靠本表把
+    /// 被调函数的效果行传播进调用方残差行，供顶层边界断言
+    /// （`infer_program`）判定 unhandled effect。行内含 Var 时为
+    /// 多态保守行（`contains` 恒真），不参与具体标签判定。
+    pub fn_effect_rows: HashMap<String, crate::mir::effect::EffectRow>,
+    /// v0.96: 闭包/fn 定义节点（按定义 span）的效果行。零参闭包的类型是
+    /// 裸 TypeVar，无 Arrow 层可携带行 —— let 绑定时经本表转登记进
+    /// `fn_effect_rows`（key 是定义 witness 的 span，文件内唯一）。
+    pub closure_rows: HashMap<Span, crate::mir::effect::EffectRow>,
 }
 
 // v0.75.94: 重新导出 WitnessNodeId（抽离到 diag 子模块）以保留外部 API
@@ -245,16 +257,109 @@ impl HMInference {
     /// Drive inference across an entire MirWitness program. Returns the
     /// list of collected diagnostics. The internal Substitution is consumed
     /// to resolve type variables in the shadow type table.
+    ///
+    /// v0.96: 顶层**边界断言** —— 每个顶层 witness 的残差效果行不允许含
+    /// 具名标签。这是 algebraic effects 的编译期强制闭环：Perform 产生
+    /// 标签、Handle 用行差吸收、跨函数调用经 `fn_effect_rows` 传播，
+    /// 最终没有任何 handle 兜住的效果在程序边界在此报错（运行时
+    /// "unhandled effect" 兜底自此只防御动态生成代码）。
+    /// 残差行仅含 Var（多态未知行）时宽松放行 —— 不做错误拒绝。
     pub fn infer_program(&mut self, exprs: &[MirWitness]) -> Vec<TypeError> {
         let mut errors: Vec<TypeError> = Vec::new();
         for expr in exprs {
-            if let Err(mut errs) = self.infer_expr(expr) {
-                errors.append(&mut errs);
+            match self.infer_expr(expr) {
+                Err(mut errs) => errors.append(&mut errs),
+                Ok((_, row)) => {
+                    if let Some(label) = row.labels().first().map(|s| s.to_string()) {
+                        errors.push(self.localize_unhandled_effect(expr, &label));
+                    }
+                }
             }
         }
         let (_subst, mut solve_errors) = self.solve_constraints();
         errors.append(&mut solve_errors);
         errors
+    }
+
+    /// v0.96: 把顶层残差行中的未处理效果定位到发起 witness（精准 span）。
+    fn localize_unhandled_effect(&self, w: &MirWitness, label: &str) -> TypeError {
+        let mut ambient = std::collections::HashSet::new();
+        if let Some((span, via)) = self.find_unhandled(w, label, &mut ambient) {
+            TypeError::EffectRowMismatch {
+                expected: "no unhandled effects — wrap in a matching `handle` block".to_string(),
+                got: match via {
+                    Some(callee) => format!("{{ {label} }} (perform inside `{callee}`)"),
+                    None => format!("{{ {label} }}"),
+                },
+                span: Some(span),
+            }
+        } else {
+            TypeError::EffectRowMismatch {
+                expected: "no unhandled effects".to_string(),
+                got: format!("{{ {label} }}"),
+                span: Some(w.span),
+            }
+        }
+    }
+
+    /// v0.96: 在 witness 树内找第一个发起未处理 `label` 效果的位置。
+    ///
+    /// - Handle 扩展环境已处理集（body 内的 perform 被它吸收）；
+    /// - Closure/FnDef/UpdateDef 体是独立效果上下文（行已捕获进 Arrow /
+    ///   `fn_effect_rows`）—— 不下潜，否则会用外层环境误判定义体内的
+    ///   perform（这正是「词法检查错误拒绝合法程序」的陷阱）；
+    /// - Call 到已登记效果行的 callee：行含未处理标签 → 报在调用点。
+    fn find_unhandled(
+        &self,
+        w: &MirWitness,
+        label: &str,
+        ambient: &mut std::collections::HashSet<String>,
+    ) -> Option<(Span, Option<String>)> {
+        match &w.kind {
+            WitnessKind::Perform { effect, args } => {
+                if effect == label && !ambient.contains(effect) {
+                    return Some((w.span, None));
+                }
+                for a in args {
+                    if let Some(f) = self.find_unhandled(a, label, ambient) {
+                        return Some(f);
+                    }
+                }
+                None
+            }
+            WitnessKind::Handle { effect, body, handler, .. } => {
+                ambient.insert(effect.clone());
+                let found = self
+                    .find_unhandled(body, label, ambient)
+                    .or_else(|| self.find_unhandled(handler, label, ambient));
+                ambient.remove(effect);
+                found
+            }
+            WitnessKind::Call { callee, args } => {
+                for a in args {
+                    if let Some(f) = self.find_unhandled(a, label, ambient) {
+                        return Some(f);
+                    }
+                }
+                if let WitnessCallee::Var(name) | WitnessCallee::Name(name) = callee
+                    && let Some(row) = self.fn_effect_rows.get(name)
+                    && row.labels().contains(&label)
+                    && !ambient.contains(label)
+                {
+                    return Some((w.span, Some(name.clone())));
+                }
+                None
+            }
+            WitnessKind::Closure { .. } | WitnessKind::FnDef { .. } | WitnessKind::UpdateDef { .. } => None,
+            _ => {
+                for c in w.child_witnesses() {
+                    if let Some(f) = self.find_unhandled(c, label, ambient) {
+                        return Some(f);
+                    }
+                }
+                None
+            }
+        }
     }
 
     /// v0.80: 推断表达式类型 + effect row。
@@ -283,8 +388,8 @@ impl HMInference {
             WitnessKind::Closure { params, body, .. } => {
                 self.infer_closure(params, body.as_ref(), expr.span)
             }
-            WitnessKind::FnDef { params, body, .. } => {
-                self.infer_fn_def(params, body.as_ref(), expr.span)
+            WitnessKind::FnDef { name, params, body, .. } => {
+                self.infer_fn_def(Some(name.as_str()), params, body.as_ref(), expr.span)
             }
             WitnessKind::Match { scrutinee, arms } => {
                 self.infer_match(scrutinee.as_ref(), arms, expr.span)
@@ -513,6 +618,13 @@ impl HMInference {
     /// handler 体内的 `__arg0`, `__arg1`, ... 是 perform 传参的运行时约定
     /// （见 `src/runtime/effect.rs`）。类型检查时在 handler 作用域内注册
     /// 这些变量为 fresh type var，让 handler body 的引用通过 typeck。
+    ///
+    /// v0.96: 吸收语义改为**直接行差**（[`EffectRow::remove`]）—— 残差 =
+    /// body 行去掉全部被捕获标签。此前用严格等式约束
+    /// `RowEq(body_row, Cons(effect, residual))`，当 body 不 perform 被
+    /// 捕获效果时（`handle X { 纯 body }`，定义了未触发的 handler ——
+    /// 合法程序），Empty-vs-Cons 的 unify_row 分支误报 "pure vs {X}"。
+    /// 未知行（Var，来自未注册 callee 的调用）保留约束推迟消解。
     fn infer_handle(
         &mut self,
         effect: &str,
@@ -521,12 +633,20 @@ impl HMInference {
         _span: Span,
     ) -> Result<(Type, crate::mir::effect::EffectRow), Vec<TypeError>> {
         let (body_ty, body_row) = self.infer_expr(body)?;
-        let residual = self.fresh_row_var();
-        let expected_row = crate::mir::effect::EffectRow::Cons(
-            effect.to_string(),
-            Box::new(residual.clone()),
-        );
-        self.constraints.push(Constraint::RowEq(body_row, expected_row));
+        let residual_row = match &body_row {
+            crate::mir::effect::EffectRow::Var(_) => {
+                let residual = self.fresh_row_var();
+                self.constraints.push(Constraint::RowEq(
+                    body_row.clone(),
+                    crate::mir::effect::EffectRow::Cons(
+                        effect.to_string(),
+                        Box::new(residual.clone()),
+                    ),
+                ));
+                residual
+            }
+            _ => body_row.remove(effect),
+        };
         // v0.80: 注册 handler 参数（__arg0, __arg1, ...）到 env
         // handler 是 `{ expr }` 形式，其 body 引用 __arg0 等
         let saved_env = self.env.clone();
@@ -536,7 +656,7 @@ impl HMInference {
         self.env.add("__arg0".to_string(), Type::Any);
         let (_handler_ty, handler_row) = self.infer_expr(handler)?;
         self.env = saved_env;
-        Ok((body_ty, self.merge_rows(residual, handler_row)))
+        Ok((body_ty, self.merge_rows(residual_row, handler_row)))
     }
 }
 
@@ -572,6 +692,167 @@ mod tests {
     use crate::mir::witness::{
         MirWitness, WitnessArm, WitnessCallee, WitnessKind, WitnessParam, WitnessPattern,
     };
+
+    // ─── v0.96: 效果边界断言（编译期 unhandled effect 强制）───
+
+    fn wit_perform(effect: &str) -> MirWitness {
+        MirWitness {
+            kind: WitnessKind::Perform {
+                effect: effect.to_string(),
+                args: vec![],
+            },
+            span: Span::new(7, 3),
+        }
+    }
+
+    fn wit_handler() -> MirWitness {
+        MirWitness {
+            kind: WitnessKind::Literal(Literal::String("handled".to_string(), Span::default())),
+            span: Span::default(),
+        }
+    }
+
+    fn wit_handle(effect: &str, body: MirWitness) -> MirWitness {
+        MirWitness {
+            kind: WitnessKind::Handle {
+                effect: effect.to_string(),
+                body: Box::new(body),
+                handler: Box::new(wit_handler()),
+                k_param: "k".to_string(),
+            },
+            span: Span::default(),
+        }
+    }
+
+    fn wit_fn_def(name: &str, body: MirWitness) -> MirWitness {
+        MirWitness {
+            kind: WitnessKind::FnDef {
+                name: name.to_string(),
+                params: vec![],
+                return_type: None,
+                body: Box::new(body),
+            },
+            span: Span::default(),
+        }
+    }
+
+    fn wit_call_var(name: &str) -> MirWitness {
+        MirWitness {
+            kind: WitnessKind::Call {
+                callee: WitnessCallee::Var(name.to_string()),
+                args: vec![],
+            },
+            span: Span::new(9, 1),
+        }
+    }
+
+    #[test]
+    fn program_boundary_rejects_unhandled_perform() {
+        let mut hm = HMInference::new();
+        let errors = hm.infer_program(&[wit_perform("Ai")]);
+        assert_eq!(errors.len(), 1, "顶层未处理 perform 必须报错");
+        let msg = errors[0].to_string();
+        assert!(msg.contains("Ai"), "错误应指名效果标签: {}", msg);
+        assert!(msg.contains("handle"), "错误应提示 handle 补救: {}", msg);
+        // 定位到 perform 发起点（span 7:3）
+        assert!(msg.contains("line 7"), "错误应定位 perform: {}", msg);
+    }
+
+    #[test]
+    fn program_boundary_accepts_handled_perform() {
+        let mut hm = HMInference::new();
+        let errors = hm.infer_program(&[wit_handle("Ai", wit_perform("Ai"))]);
+        assert!(errors.is_empty(), "handle 兜住的 perform 不应报错: {:?}", errors);
+    }
+
+    #[test]
+    fn program_boundary_rejects_mismatched_handle() {
+        let mut hm = HMInference::new();
+        // handle Fs 兜不住 perform Ai
+        let errors = hm.infer_program(&[wit_handle("Fs", wit_perform("Ai"))]);
+        assert_eq!(errors.len(), 1, "不匹配的 handle 必须报错");
+        assert!(errors[0].to_string().contains("Ai"));
+    }
+
+    #[test]
+    fn handle_with_pure_body_is_accepted() {
+        let mut hm = HMInference::new();
+        // v0.96 修复的误拒：定义了未触发的 handler（纯 body）是合法程序。
+        // 此前 RowEq(Empty, Cons(Ai, residual)) 走 unify_row 的
+        // Empty-vs-Cons 分支误报 "pure vs { Ai }"。
+        let errors = hm.infer_program(&[wit_handle("Ai", lit_int(42))]);
+        assert!(
+            errors.is_empty(),
+            "纯 body 的 handle 不应报错: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn task_effect_propagates_to_call_outside_handle() {
+        // task doIt() = perform "Ai" …（witness 层是 FnDef）
+        let def = wit_fn_def("doIt", wit_perform("Ai"));
+        let call = wit_call_var("doIt");
+        let mut hm = HMInference::new();
+        let errors = hm.infer_program(&[def, call]);
+        assert_eq!(errors.len(), 1, "跨函数 perform 无 handle 必须报错");
+        let msg = errors[0].to_string();
+        assert!(msg.contains("Ai"), "错误应指名标签: {}", msg);
+        assert!(msg.contains("doIt"), "错误应指出效果来自哪个调用: {}", msg);
+    }
+
+    #[test]
+    fn task_effect_absorbed_by_matching_handle_at_call_site() {
+        // 定义时 perform 合法 —— 调用点在 handle 内即可（非词法检查）。
+        let def = wit_fn_def("doIt", wit_perform("Ai"));
+        let call_under_handle = wit_handle("Ai", wit_call_var("doIt"));
+        let mut hm = HMInference::new();
+        let errors = hm.infer_program(&[def, call_under_handle]);
+        assert!(
+            errors.is_empty(),
+            "调用点被 handle 兜住不应报错: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn let_bound_closure_effect_propagates() {
+        // let f = fn() = perform "Ai" …；f() —— env 里 Arrow 携带行
+        let closure = MirWitness {
+            kind: WitnessKind::Closure {
+                params: vec![],
+                body: Box::new(wit_perform("Ai")),
+            },
+            span: Span::default(),
+        };
+        let binding = MirWitness {
+            kind: WitnessKind::LetBinding {
+                name: "f".to_string(),
+                type_hint: None,
+                value: Box::new(closure),
+                init_body: Box::new(MirWitness {
+                    kind: WitnessKind::Literal(Literal::Nil(Span::default())),
+                    span: Span::default(),
+                }),
+            },
+            span: Span::default(),
+        };
+        let call = wit_call_var("f");
+        let mut hm = HMInference::new();
+        let errors = hm.infer_program(&[binding, call]);
+        assert_eq!(errors.len(), 1, "let 绑定闭包的效果调用必须报错");
+        assert!(errors[0].to_string().contains("Ai"));
+    }
+
+    #[test]
+    fn nested_handles_absorb_own_effects() {
+        // 内层 handle Fs 吸收 perform Fs；外层 handle Ai 吸收（残差已纯）。
+        let inner = wit_handle("Fs", wit_perform("Fs"));
+        let outer = wit_handle("Ai", inner);
+        let mut hm = HMInference::new();
+        let errors = hm.infer_program(&[outer]);
+        assert!(errors.is_empty(), "嵌套 handle 各吸收各的: {:?}", errors);
+    }
 
     pub(super) fn lit_int(n: i64) -> MirWitness {
         MirWitness {
@@ -743,9 +1024,9 @@ mod tests {
         let (ty, row) = hm.infer_expr(&expr).unwrap();
         // handle returns body type (fresh var from perform)
         assert!(matches!(ty, Type::TypeVar(_)));
-        // effect row should NOT contain "Ai" (captured by handler)
-        // The residual row is a fresh var (row-polymorphic)
-        assert!(matches!(row, crate::mir::effect::EffectRow::Var(_)));
+        // v0.96: 吸收语义改为直接行差 —— effect 被捕获后残差**精确为纯**，
+        // 不再是宽松的 fresh row var（后者会向上泄漏未消解的未知行）。
+        assert!(matches!(row, crate::mir::effect::EffectRow::Empty));
     }
 
     #[test]

@@ -47,10 +47,28 @@ All notable changes to Mora will be documented in this file.
 - `trait_dispatch`（3 处）/ `dispatch`（1 处）/ `builtin_impls`（1 处）/
   `take_env`（1 处）全部拆锁：`get` 即只读快照查询，`drop(env)` 借用管理
   舞步消失。
+- `gensym_counter: Arc<Mutex<usize>>` → 纯 `usize`：唯一消费点（gensym
+  builtin）在 `&mut self` 上递增，无跨线程共享；Clone 按值复制，Pregel
+  worker 分歧语义与旧 Arc clone 一致。
 - 删除死公开 API `Interpreter::new_with_globals`（全仓库零调用者）。
 - `method_dispatch.rs` / `builtin_impls.rs` 显式声明自身所需的
   `parking_lot::Mutex` 导入——此前依赖 `use super::*` 意外传播父模块私有
   导入的隐式耦合被一并消除。
+
+### (6) 锁分类决策（运行时层审计定案）
+
+单属主状态（environment / gensym_counter）已全部持纯值。剩余锁逐一分类
+登记（见 `src/runtime/core.rs` 头部「锁分类决策」），均为承载机制而非冗余
+防御，**有意保留**：
+
+- **有意跨克隆/跨线程共享的注册表与缓存**：orch plans/refine/skill、infra
+  string_interner/ai_cache（worker 线程共享 AI 响应缓存，拆锁会增加真实
+  API 调用）、ccr、mock、sandbox/toolplane、trace_collector（跨 worker 用量
+  聚合）、capability——mutator 为 `&self` + 锁，这是设计。
+- **真跨线程协调**：pregel worker_pool 任务队列/共享接收端、scheduler
+  定时器状态。
+- **语言级显式可变性**：`Value::Atom` / `Value::Router` / `StreamReader`
+  是 Mora 语言自身能力面，不属于运行时状态机问题。
 
 **不兼容变更**：`MirHost::environment()`、`Interpreter::new_with_globals`、
 `MirPregelEngine::with_base_env`、`HandlerClosure::env` 签名变更；依赖回落

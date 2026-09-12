@@ -573,7 +573,7 @@ impl Interpreter {
     /// Lisp 宏系统的核心原语：保证宏展开时引入的新变量名不与用户代码冲突。
     /// Mora 无 AST 架构下，gensym 返回一个 `Value::String`，形式为 `"g{n}"`，
     /// 保证同一 Interpreter 实例内唯一（gensym_counter 在 CoreRuntime 上，
-    /// Arc<Mutex<>> 保护，Pregel worker 各自独立）。
+    /// v0.95 起是纯 `usize`，`&mut self` 递增；Pregel worker 各自独立）。
     ///
     /// 用法：
     ///   let fresh = gensym()   → "g0"
@@ -583,9 +583,8 @@ impl Interpreter {
         if !args.is_empty() {
             return Err("gensym() expects no arguments".to_string());
         }
-        let mut counter = self.core.gensym_counter.lock();
-        let n = *counter;
-        *counter += 1;
+        let n = self.core.gensym_counter;
+        self.core.gensym_counter += 1;
         Ok(Value::String(format!("g{n}")))
     }
 

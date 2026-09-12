@@ -12,9 +12,27 @@
 //! 纯值（HAMT + 不可变父链），`Arc<Mutex<Environment>>` 包装成为纯值外面
 //! 的冗余锁。本结构改持纯 `Environment`：执行 env 由 `take_env` 一次性
 //! 取出后按数据流穿线（v0.75.76 约定），不再存在"锁保护的宿主槽"。
-//! 同时删除死状态 `globals`（v0.75.76 起无任何读取，仅构造器写入）。
+//! 同时删除死状态 `globals`（v0.75.76 起无任何读取，仅构造器写入），
+//! `gensym_counter` 改为纯 `usize`。
+//!
+//! # 锁分类决策（v0.95 审计定案）
+//!
+//! 「纯函数让并发从防御性编程变成自然属性」—— 解释器运行时层的锁只允许
+//! 三类存在理由，全部登记如下：
+//!
+//! 1. **单属主状态**：持纯值，`&mut self` 变更（本文件的 environment /
+//!    gensym_counter 即此类）。禁止 `Arc<Mutex>` 包装。
+//! 2. **有意跨克隆/跨线程共享的注册表与缓存**：锁是共享机制本身，不是
+//!    冗余防御。包括 orch plans/refine/skill、infra string_interner/ai_cache
+//!    （worker 线程共享 AI 响应缓存，拆锁会增加真实 API 调用）、ccr、mock、
+//!    sandbox/toolplane、trace_collector（跨 worker 用量聚合）、capability。
+//!    它们的 mutator 是 `&self` + 锁 —— 这是设计，不是待修。
+//! 3. **真跨线程协调**：pregel worker_pool 的任务队列/共享接收端、
+//!    scheduler 的定时器状态。锁即协调原语。
+//!
+//! 语言级显式可变性（`Value::Atom`、`Value::Router`、`StreamReader`）是
+//! Mora 语言自身的能力面，不属于运行时状态机问题。
 
-use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -43,9 +61,10 @@ pub struct CoreRuntime {
     /// 全部作用于本字段。嵌套 handle 块走 take+restore 栈模式。
     pub(crate) effect_handlers: crate::runtime::effect::EffectRegistry,
     /// v0.87: gensym 计数器。每次 gensym() 调用递增，保证符号名唯一。
-    /// Pregel worker 各自持有独立计数器（Arc clone），宏展开在单 worker 内
-    /// 完成，跨 worker 符号名冲突可接受（gensym 语义仅在宏上下文有意义）。
-    pub(crate) gensym_counter: Arc<Mutex<usize>>,
+    /// v0.95: 纯 `usize` —— 唯一消费点（gensym builtin）在 `&mut self` 上
+    /// 递增，无跨线程共享；Clone 按值复制（Pregel worker 各自独立计数，
+    /// 与旧 Arc<Mutex> clone 的分歧语义一致），无需锁。
+    pub(crate) gensym_counter: usize,
 }
 
 impl Default for CoreRuntime {
@@ -57,7 +76,7 @@ impl Default for CoreRuntime {
             config_stack: Vec::new(),
             current_merge_strategies: None,
             effect_handlers: crate::runtime::effect::EffectRegistry::default(),
-            gensym_counter: Arc::new(Mutex::new(0)),
+            gensym_counter: 0,
         }
     }
 }
@@ -78,7 +97,7 @@ impl Clone for CoreRuntime {
             config_stack: self.config_stack.clone(),
             current_merge_strategies: self.current_merge_strategies.clone(),
             effect_handlers: crate::runtime::effect::EffectRegistry::default(),
-            gensym_counter: self.gensym_counter.clone(),
+            gensym_counter: self.gensym_counter,
         }
     }
 }
@@ -112,9 +131,12 @@ mod tests {
         core
             .environment
             .define("test".to_string(), Value::Int(42), false);
+        core.gensym_counter = 5;
         let cloned = core.clone();
         // 克隆保留绑定
         assert!(matches!(cloned.environment.get("test"), Some(Value::Int(42))));
+        // gensym 计数器按值复制（v0.95: 纯 usize，无锁）
+        assert_eq!(cloned.gensym_counter, 5);
         // 纯值语义：克隆侧写不穿透原侧（无共享可变 cell）
         let mut cloned = cloned;
         cloned

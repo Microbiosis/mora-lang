@@ -49,12 +49,16 @@ pub fn check_program_witnesses_bidirectional(
     let mut hm = HMInference::new();
 
     // v0.75.18: 预扫描 import 目标文件的顶层符号并合并进 env
+    // v0.98: effect 签名随 import 双通道注册
     let mut visited: HashSet<std::path::PathBuf> = HashSet::new();
     let mut import_errors: Vec<TypeError> = Vec::new();
-    for (name, ty) in
-        super::imports::collect_imported_symbols(witnesses, &mut visited, &mut import_errors)
-    {
+    let imported =
+        super::imports::collect_imported_symbols(witnesses, &mut visited, &mut import_errors);
+    for (name, ty) in imported.env_bindings {
         hm.env.add(name, ty);
+    }
+    for (label, sig) in imported.effect_signatures {
+        hm.effect_signatures.insert(label, sig);
     }
 
     // 双向预扫 —— 关键节点的精准 expected/actual
@@ -103,12 +107,16 @@ fn check_program_witnesses_inner(
     let mut errors: Vec<TypeError> = Vec::new();
 
     // v0.75.18: 预扫描 import 目标文件的顶层符号并合并进 env
+    // v0.98: effect 签名随 import 双通道注册
     let mut visited: HashSet<std::path::PathBuf> = HashSet::new();
     let mut import_errors: Vec<TypeError> = Vec::new();
-    for (name, ty) in
-        super::imports::collect_imported_symbols(witnesses, &mut visited, &mut import_errors)
-    {
+    let imported =
+        super::imports::collect_imported_symbols(witnesses, &mut visited, &mut import_errors);
+    for (name, ty) in imported.env_bindings {
         hm.env.add(name, ty);
+    }
+    for (label, sig) in imported.effect_signatures {
+        hm.effect_signatures.insert(label, sig);
     }
     errors.extend(import_errors);
 

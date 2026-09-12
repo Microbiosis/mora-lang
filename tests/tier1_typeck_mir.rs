@@ -171,6 +171,52 @@ fn import_missing_file_reports_error() {
     assert!(!errs.is_empty(), "缺失 import 文件应报 import error");
 }
 
+/// v0.98: effect 签名随 import 传播 —— 主文件的 perform 位点受导入签名
+/// 契约约束（arity 校验只有在签名跨文件可达时才可能发生）。
+#[test]
+fn imported_effect_signature_enforces_arity() {
+    let errs = typecheck(
+        "import \"tests/fixtures/effect_sig_module.mora\"\nperform Ask(\"a\", \"b\")",
+    );
+    assert!(
+        errs.iter()
+            .any(|e| e.message.contains("Expected 1 arguments")),
+        "导入签名的 arity 契约应报错: {:?}",
+        errs
+    );
+}
+
+#[test]
+fn imported_effect_signature_enforces_arg_type() {
+    let errs = typecheck("import \"tests/fixtures/effect_sig_module.mora\"\nperform Ask(42)");
+    assert!(
+        errs.iter()
+            .any(|e| e.message.contains("perform `Ask` arg 0")),
+        "导入签名的实参类型契约应报错: {:?}",
+        errs
+    );
+}
+
+#[test]
+fn imported_effect_signature_result_typed() {
+    // 正确实参 + 结果按签名静态化为 string —— handle body 内 `let v: number`
+    // 标注与签名结果冲突报错。无签名时结果是自由 fresh var，此程序静默通过。
+    let errs = typecheck(
+        "import \"tests/fixtures/effect_sig_module.mora\"\nlet r = handle Ask {\n  let v: number = perform Ask(\"hi\")\n} {\n  \"resp\"\n}",
+    );
+    assert_eq!(
+        errs.len(),
+        1,
+        "导入签名使 perform 结果静态化: {:?}",
+        errs
+    );
+    assert!(
+        errs[0].message.contains("Int"),
+        "冲突应指向标注类型: {:?}",
+        errs
+    );
+}
+
 #[test]
 fn freed_reserved_words_usable_as_identifiers() {
     assert!(

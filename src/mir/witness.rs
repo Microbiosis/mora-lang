@@ -184,6 +184,14 @@ pub enum WitnessKind {
     Quasiquote {
         segments: Vec<MirWitness>,
     },
+    // v0.98: 显式 effect 签名声明（纯类型层 —— 不产 MirInst）。
+    //   `effect Name(Hint, ...) : Hint`   参数契约 + 结果契约
+    //   `effect Name(Hint, ...)`          仅参数契约（结果 = Any）
+    EffectSig {
+        name: String,
+        params: Vec<crate::mir::hint::TypeHint>,
+        result: Option<crate::mir::hint::TypeHint>,
+    },
 }
 
 /// 调用目标 — 镜像 MirCallee。
@@ -214,7 +222,8 @@ impl MirWitness {
             | WitnessKind::EnumDef { .. }
             | WitnessKind::StructDef { .. }
             | WitnessKind::ModelDef { .. }
-            | WitnessKind::MsgDef { .. } => Vec::new(),
+            | WitnessKind::MsgDef { .. }
+            | WitnessKind::EffectSig { .. } => Vec::new(),
             WitnessKind::Binary { left, right, .. } => vec![left.as_ref(), right.as_ref()],
             WitnessKind::Call { callee, args } => {
                 let mut out: Vec<&MirWitness> = Vec::new();

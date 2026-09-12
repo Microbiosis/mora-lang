@@ -60,6 +60,21 @@ pub struct PerformSite {
     pub arg_tys: Vec<Type>,
 }
 
+/// v0.98: 显式 effect 签名 —— 一个 effect 标签的静态契约。
+///
+/// 语法 `effect Name(Hint, ...): Hint`（结果缺省 = Any）。
+/// 语义：
+/// - perform 位点校验：实参数/类型必须符合声明（在位点处报错）；
+/// - perform 结果类型取自签名（不再 fresh var）—— fn/task 体内的高阶
+///   位点由此静态化（不再需要调用点的 handle 才能精确）；
+/// - handler `__arg0..N` 按签名参数类型注册（优先于 v0.97 的位点推导）；
+/// - handler 返回类型必须兼容签名结果（resume 契约的声明化）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct EffectSignature {
+    pub params: Vec<Type>,
+    pub result: Type,
+}
+
 #[derive(Default)]
 pub struct HMInference {
     pub env: TypeEnv,
@@ -88,6 +103,11 @@ pub struct HMInference {
     /// v0.97: 闭包/fn 体推断深度 —— 深度 > 0 时不记录 perform 位点
     /// （调用点上下文未知，高阶位点的结果连接留给 effect signature）。
     pub closure_depth: usize,
+    /// v0.98: 显式 effect 签名表（label → 契约）。由 `EffectSig` witness
+    /// 预扫描注册（infer_program 入口，文件全局 —— 先于顺序推断）与
+    /// import 通道注入。有签名时 perform 位点/结果与 handler 参数/返回
+    /// 全部按契约静态化。
+    pub effect_signatures: HashMap<String, EffectSignature>,
     /// v0.89: Shadow type table — captures infer_expr results per witness
     /// node before substitution. Keyed by Span (unique within a file).
     /// Used by `export_type_table` to produce a TypeTable without
@@ -288,12 +308,16 @@ impl HMInference {
     /// "unhandled effect" 兜底自此只防御动态生成代码）。
     /// 残差行仅含 Var（多态未知行）时宽松放行 —— 不做错误拒绝。
     pub fn infer_program(&mut self, exprs: &[MirWitness]) -> Vec<TypeError> {
+        let mut errors: Vec<TypeError> = Vec::new();
+        // v0.98: effect 签名预扫描 —— EffectSig 是文件全局声明（效果标签
+        // 的契约），先于顺序推断全量注册，perform/handle 在任意位置可查。
+        // 重复声明且签名不一致 → 报错（重复声明且一致 → 幂等放行）。
+        self.precompute_effect_signatures(exprs, &mut errors);
         // v0.97: 不动点预计算 —— fn/task 定义的 witness 树行走器在**顺序
         // 推断开始前**把全部定义（含嵌套、含前向引用）的效果行算到不动点，
         // mutual recursion / 后文定义的调用得以传播效果。行单调增长
         // （标签只增不减），有限标签集保证终止。
         self.precompute_fn_effect_rows(exprs);
-        let mut errors: Vec<TypeError> = Vec::new();
         for expr in exprs {
             match self.infer_expr(expr) {
                 Err(mut errs) => errors.append(&mut errs),
@@ -307,6 +331,56 @@ impl HMInference {
         let (_subst, mut solve_errors) = self.solve_constraints();
         errors.append(&mut solve_errors);
         errors
+    }
+
+    /// v0.98: effect 签名预扫描 —— 收集全部 EffectSig witness（含嵌套）
+    /// 并注册进 `effect_signatures`。重复声明且签名不一致 → 报错指向
+    /// 第二处声明；一致 → 幂等放行（模块合并场景）。
+    fn precompute_effect_signatures(
+        &mut self,
+        exprs: &[MirWitness],
+        errors: &mut Vec<TypeError>,
+    ) {
+        fn collect<'a>(w: &'a MirWitness, out: &mut Vec<&'a MirWitness>) {
+            if let WitnessKind::EffectSig { .. } = &w.kind {
+                out.push(w);
+            }
+            for c in w.child_witnesses() {
+                collect(c, out);
+            }
+        }
+        let mut sigs: Vec<&MirWitness> = Vec::new();
+        for e in exprs {
+            collect(e, &mut sigs);
+        }
+        for w in sigs {
+            if let WitnessKind::EffectSig {
+                name,
+                params,
+                result,
+            } = &w.kind
+            {
+                let sig = EffectSignature {
+                    params: params.iter().map(|h| h.to_type().clone()).collect(),
+                    result: result
+                        .as_ref()
+                        .map(|h| h.to_type().clone())
+                        .unwrap_or(Type::Any),
+                };
+                match self.effect_signatures.get(name) {
+                    Some(prev) if prev != &sig => {
+                        errors.push(TypeError::UnificationFailure {
+                            expected: format!("effect `{}` signature {:?}", name, prev),
+                            got: format!("{:?}", sig),
+                            span: Some(w.span),
+                        });
+                    }
+                    _ => {
+                        self.effect_signatures.insert(name.clone(), sig);
+                    }
+                }
+            }
+        }
     }
 
     /// v0.97: fn/task 定义效果行的不动点预计算。
@@ -732,6 +806,11 @@ impl HMInference {
                 }
                 Ok((Type::String, row))
             }
+            // v0.98: effect 签名声明 —— 纯类型层，无类型/效果贡献。
+            //（签名本身已在 infer_program 预扫描注册进 effect_signatures。）
+            WitnessKind::EffectSig { .. } => {
+                Ok((Type::Nil, crate::mir::effect::EffectRow::Empty))
+            }
         };
         // Shadow capture: store pre-substitution (Type, EffectRow) per witness node.
         // Keyed by Span (unique within a file). Used by export_type_table.
@@ -774,11 +853,16 @@ impl HMInference {
     }
 
     /// v0.80: Perform 推断 — 产生 effect，返回 fresh type var。
+    ///
+    /// v0.98: 签名生效 —— effect 已声明签名时：
+    /// - 实参数/类型必须符合契约（ArityMismatch / 逐参 compatible_with）；
+    /// - 结果类型取自签名（不再 fresh var）—— fn/task 体内的高阶位点
+    ///   由此静态化，无需调用点的 handle 在场。
     fn infer_perform(
         &mut self,
         effect: &str,
         args: &[MirWitness],
-        _span: Span,
+        span: Span,
     ) -> Result<(Type, crate::mir::effect::EffectRow), Vec<TypeError>> {
         let mut arg_rows = crate::mir::effect::EffectRow::Empty;
         let mut arg_tys = Vec::with_capacity(args.len());
@@ -787,9 +871,34 @@ impl HMInference {
             arg_tys.push(t.clone());
             arg_rows = self.merge_rows(arg_rows, row);
         }
-        let result_ty = self.fresh_type_var();
+        let sig = self.effect_signatures.get(effect).cloned();
+        if let Some(sig) = &sig {
+            if sig.params.len() != args.len() {
+                return Err(vec![TypeError::ArityMismatch {
+                    expected: sig.params.len(),
+                    actual: args.len(),
+                    span,
+                }]);
+            }
+            for (i, (a_ty, p_ty)) in arg_tys.iter().zip(sig.params.iter()).enumerate() {
+                if !a_ty.compatible_with(p_ty) {
+                    return Err(vec![TypeError::UnificationFailure {
+                        expected: format!(
+                            "perform `{}` arg {} : {:?}",
+                            effect, i, p_ty
+                        ),
+                        got: format!("{:?}", a_ty),
+                        span: Some(span),
+                    }]);
+                }
+            }
+        }
+        let result_ty = match sig {
+            Some(s) => s.result,
+            None => self.fresh_type_var(),
+        };
         // v0.97: 位点记录到 handle 帧顶（栈顶 = 运行时将接管它的 handler）。
-        // 闭包/fn 体内不记录 —— 调用点上下文未知，高阶连接留给签名系统。
+        // 闭包/fn 体内不记录 —— 调用点上下文未知，高阶连接由签名覆盖。
         if self.closure_depth == 0
             && let Some(frame) = self.handle_stack.last_mut()
             && frame.effect == effect
@@ -861,44 +970,68 @@ impl HMInference {
             }
             _ => body_row.remove(effect),
         };
-        // __arg0..__argN 按位点实参类型注册（异质退化 Any）
+        // __arg0..__argN 注册：v0.98 签名优先（声明的参数契约，覆盖位点
+        // 推导 —— 位点已对签名校验）；无签名回退 v0.97 位点推导。
+        let sig = self.effect_signatures.get(effect).cloned();
         let saved_env = self.env.clone();
-        let max_arity = sites
-            .iter()
-            .map(|s| s.arg_tys.len())
-            .max()
-            .unwrap_or(1)
-            .max(1);
+        let max_arity = match &sig {
+            Some(s) => s.params.len().max(1),
+            None => sites
+                .iter()
+                .map(|s| s.arg_tys.len())
+                .max()
+                .unwrap_or(1)
+                .max(1),
+        };
         for i in 0..max_arity {
-            let mut arg_ty: Option<Type> = None;
-            let mut heterogeneous = false;
-            for s in &sites {
-                if let Some(t) = s.arg_tys.get(i) {
-                    match &arg_ty {
-                        None => arg_ty = Some(t.clone()),
-                        Some(prev) => {
-                            if !prev.compatible_with(t) && !t.compatible_with(prev) {
-                                heterogeneous = true;
+            let registered = if let Some(s) = &sig {
+                s.params.get(i).cloned().unwrap_or(Type::Any)
+            } else {
+                let mut arg_ty: Option<Type> = None;
+                let mut heterogeneous = false;
+                for s in &sites {
+                    if let Some(t) = s.arg_tys.get(i) {
+                        match &arg_ty {
+                            None => arg_ty = Some(t.clone()),
+                            Some(prev) => {
+                                if !prev.compatible_with(t) && !t.compatible_with(prev) {
+                                    heterogeneous = true;
+                                }
                             }
                         }
                     }
                 }
-            }
-            let registered = if heterogeneous {
-                Type::Any
-            } else {
-                arg_ty.unwrap_or(Type::Any)
+                if heterogeneous {
+                    Type::Any
+                } else {
+                    arg_ty.unwrap_or(Type::Any)
+                }
             };
             self.env.add(format!("__arg{}", i), registered);
         }
         let (_handler_ty, handler_row) = self.infer_expr(handler)?;
         self.env = saved_env;
-        // perform 结果 ≡ handler 返回值（resume 契约的静态化）
-        for s in &sites {
-            self.constraints.push(Constraint::Eq(
-                Box::new(s.result_ty.clone()),
-                Box::new(_handler_ty.clone()),
-            ));
+        // perform 结果 ≡ handler 返回值（resume 契约的静态化）。
+        // v0.98: 有签名时 handler 返回必须兼容声明结果（直接检查，报错
+        // 落在 handle span）；无签名走 v0.97 位点 Eq 统一。
+        match &sig {
+            Some(s) => {
+                if !_handler_ty.compatible_with(&s.result) {
+                    return Err(vec![TypeError::UnificationFailure {
+                        expected: format!("handler for `{}` returns {:?}", effect, s.result),
+                        got: format!("{:?}", _handler_ty),
+                        span: Some(_span),
+                    }]);
+                }
+            }
+            None => {
+                for s in &sites {
+                    self.constraints.push(Constraint::Eq(
+                        Box::new(s.result_ty.clone()),
+                        Box::new(_handler_ty.clone()),
+                    ));
+                }
+            }
         }
         Ok((body_ty, self.merge_rows(residual_row, handler_row)))
     }
@@ -1333,6 +1466,105 @@ mod tests {
             "异质位点退化为 Any 不应误拒: {:?}",
             errors
         );
+    }
+
+    // ─── v0.98: 显式 effect 签名声明（全管线：parse → witness → typeck）───
+
+    fn typecheck_src(src: &str) -> Vec<TypeError> {
+        let (_, witnesses) = crate::parser_v3::ParserV3::compile(src).expect("parse");
+        HMInference::new().infer_program(&witnesses)
+    }
+
+    #[test]
+    fn effect_signature_validates_perform_arity() {
+        let errs = typecheck_src("effect Ask(string): string\nperform Ask(\"hi\", \"extra\")");
+        assert_eq!(errs.len(), 1, "签名 arity 校验: {:?}", errs);
+        assert!(
+            errs[0].to_string().contains("Expected 1 arguments"),
+            "ArityMismatch 应指向签名声明的参数数: {:?}",
+            errs
+        );
+    }
+
+    #[test]
+    fn effect_signature_validates_perform_arg_type() {
+        let errs = typecheck_src("effect Ask(string): string\nperform Ask(42)");
+        assert_eq!(errs.len(), 1, "签名实参类型校验: {:?}", errs);
+        assert!(
+            errs[0].to_string().contains("Ask"),
+            "错误应指名效果与参数: {:?}",
+            errs
+        );
+    }
+
+    #[test]
+    fn effect_signature_static_result_in_task_body() {
+        // 高阶位点的结果静态化：perform 在 task 体内、无 handle 在场，
+        // 结果类型取自签名 → let 标注 Int 与签名 String 冲突报错。
+        // （无签名时结果是自由 fresh var，此程序静默通过 = 漏检。）
+        let errs = typecheck_src(
+            "effect Ask(string): string\ntask doIt()\n  let v: number = perform Ask(\"hi\")\nend",
+        );
+        assert_eq!(errs.len(), 1, "签名结果静态连接: {:?}", errs);
+    }
+
+    #[test]
+    fn effect_signature_static_result_positive() {
+        let errs = typecheck_src(
+            "effect Ask(string): string\ntask doIt()\n  let v: string = perform Ask(\"hi\")\nend",
+        );
+        assert!(errs.is_empty(), "结果类型匹配签名应通过: {:?}", errs);
+    }
+
+    #[test]
+    fn effect_signature_handler_params_pass() {
+        let errs = typecheck_src(
+            "effect Ask(number): number\nlet r = handle Ask {\n  perform Ask(42)\n} {\n  let n: number = __arg0\n  n\n}",
+        );
+        assert!(errs.is_empty(), "__arg0 按签名参数类型化应通过: {:?}", errs);
+    }
+
+    #[test]
+    fn effect_signature_handler_params_mismatch() {
+        let errs = typecheck_src(
+            "effect Ask(string): string\nlet r = handle Ask {\n  perform Ask(\"q\")\n} {\n  let n: number = __arg0\n  n\n}",
+        );
+        assert_eq!(errs.len(), 1, "__arg0 与签名参数类型不符应报错: {:?}", errs);
+    }
+
+    #[test]
+    fn effect_signature_handler_return_mismatch() {
+        // handler 返回 String、签名结果 number → 返回值必须兼容声明契约。
+        let errs = typecheck_src(
+            "effect Ask(string): number\nlet r = handle Ask {\n  perform Ask(\"q\")\n} {\n  \"text\"\n}",
+        );
+        assert_eq!(errs.len(), 1, "handler 返回失配签名结果应报错: {:?}", errs);
+        assert!(
+            errs[0].to_string().contains("handler"),
+            "错误应指明是 handler 返回失配: {:?}",
+            errs
+        );
+    }
+
+    #[test]
+    fn effect_signature_no_result_is_any() {
+        // 缺省返回标注 = Any（仅载荷契约）：handler 返回任意值均合法。
+        let errs = typecheck_src(
+            "effect Log(string)\nlet r = handle Log {\n  perform Log(\"x\")\n} {\n  \"ok\"\n}",
+        );
+        assert!(errs.is_empty(), "无结果签名的 handler 返回不应受限: {:?}", errs);
+    }
+
+    #[test]
+    fn duplicate_effect_signature_conflicts() {
+        let errs = typecheck_src("effect Ask(string): string\neffect Ask(number): number");
+        assert_eq!(errs.len(), 1, "签名不一致的重复声明应报错: {:?}", errs);
+    }
+
+    #[test]
+    fn duplicate_effect_signature_identical_is_idempotent() {
+        let errs = typecheck_src("effect Ask(string): string\neffect Ask(string): string");
+        assert!(errs.is_empty(), "一致的重复声明应幂等放行: {:?}", errs);
     }
 
     pub(super) fn lit_int(n: i64) -> MirWitness {

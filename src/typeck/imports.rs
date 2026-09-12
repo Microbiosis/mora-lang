@@ -20,6 +20,20 @@ use crate::mir::witness::{MirWitness, WitnessKind};
 use crate::typeck::Type;
 use crate::typeck::TypeError;
 
+/// v0.98: import 收集结果 —— env 绑定与 effect 签名双通道。
+#[derive(Debug, Default)]
+pub struct ImportedModuleSymbols {
+    pub env_bindings: Vec<(String, Type)>,
+    pub effect_signatures: Vec<(String, crate::typeck::hm::EffectSignature)>,
+}
+
+impl ImportedModuleSymbols {
+    fn extend(&mut self, other: ImportedModuleSymbols) {
+        self.env_bindings.extend(other.env_bindings);
+        self.effect_signatures.extend(other.effect_signatures);
+    }
+}
+
 /// 从一个模块的 witness 列表提取其顶层符号类型。
 ///
 /// - `let` 绑定：用该模块自身的 HM 推断结果（含 generalize）登记；
@@ -32,7 +46,10 @@ use crate::typeck::TypeError;
 ///
 /// v0.75.40: 消费 MirWitness（parse 层直接产出；exprs 版由 check_program_mir
 /// 桥接 from_exprs 后进入本函数，单一实现）。
-fn extract_module_symbols(witnesses: &[MirWitness], pre: &[(String, Type)]) -> Vec<(String, Type)> {
+fn extract_module_symbols(
+    witnesses: &[MirWitness],
+    pre: &[(String, Type)],
+) -> ImportedModuleSymbols {
     let mut syms: Vec<(String, Type)> = Vec::new();
 
     // 1) let 绑定精确类型（模块自身的推断 + generalization）
@@ -60,7 +77,27 @@ fn extract_module_symbols(witnesses: &[MirWitness], pre: &[(String, Type)]) -> V
         }
     }
 
-    syms
+    // 3) v0.98: effect 签名导出（模块声明的效果契约随 import 传播）
+    let mut effect_signatures: Vec<(String, crate::typeck::hm::EffectSignature)> = Vec::new();
+    for w in witnesses {
+        if let WitnessKind::EffectSig { name, params, result } = &w.kind {
+            effect_signatures.push((
+                name.clone(),
+                crate::typeck::hm::EffectSignature {
+                    params: params.iter().map(|h| h.to_type().clone()).collect(),
+                    result: result
+                        .as_ref()
+                        .map(|h| h.to_type().clone())
+                        .unwrap_or(crate::typeck::Type::Any),
+                },
+            ));
+        }
+    }
+
+    ImportedModuleSymbols {
+        env_bindings: syms,
+        effect_signatures,
+    }
 }
 
 /// 合并前的安全化：闭包身份 TypeVar / 未解析 TypeVar 不能直接进目标 env
@@ -91,8 +128,8 @@ pub fn collect_imported_symbols(
     witnesses: &[MirWitness],
     visited: &mut HashSet<PathBuf>,
     errors: &mut Vec<TypeError>,
-) -> Vec<(String, Type)> {
-    let mut out: Vec<(String, Type)> = Vec::new();
+) -> ImportedModuleSymbols {
+    let mut out = ImportedModuleSymbols::default();
     for w in witnesses {
         if let WitnessKind::Import(path) = &w.kind {
             let path = path.clone();
@@ -109,7 +146,8 @@ pub fn collect_imported_symbols(
                             // 再提取本模块符号（传递 import 支持）
                             let nested =
                                 collect_imported_symbols(&module_witnesses, visited, errors);
-                            out.extend(extract_module_symbols(&module_witnesses, &nested));
+                            let own = extract_module_symbols(&module_witnesses, &nested.env_bindings);
+                            out.extend(own);
                             out.extend(nested);
                         }
                         Err(parse_err) => errors.push(TypeError::new(

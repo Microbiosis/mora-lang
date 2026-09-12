@@ -359,6 +359,7 @@ impl<'a> BidirectionalChecker<'a> {
             | WitnessKind::EnumDef { .. }
             | WitnessKind::StructDef { .. }
             | WitnessKind::MacroDef { .. }
+            | WitnessKind::EffectSig { .. }
             | WitnessKind::Sequence(_) => {}
             // v0.80: algebraic effects — Perform/Handle 递归子节点
             WitnessKind::Perform { args, .. } => {

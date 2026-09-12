@@ -62,6 +62,22 @@ impl ParserV3 {
             // 不引入新 TokenType（不抢旧 identifier），与 transaction/eval 同模式。
             TokenType::Identifier(ref s) if s == "handle" => self.emit_handle_w(),
             TokenType::Identifier(ref s) if s == "perform" => self.emit_perform_w(),
+            // v0.98: 显式 effect 签名 —— `effect Name(Hint...): Hint`。
+            // 前瞻守卫：仅 `effect Identifier(` 模式拦截（不抢以 `effect`
+            // 命名的变量的赋值/调用语句）。
+            TokenType::Identifier(ref s)
+                if s == "effect"
+                    && matches!(
+                        self.tokens.get(self.current + 1).map(|t| &t.token_type),
+                        Some(TokenType::Identifier(_))
+                    )
+                    && matches!(
+                        self.tokens.get(self.current + 2).map(|t| &t.token_type),
+                        Some(TokenType::LParen)
+                    ) =>
+            {
+                self.emit_effect_sig_w()
+            }
             TokenType::Return | TokenType::Break | TokenType::Continue => {
                 self.emit_return_break_continue_w()
             }
@@ -1352,6 +1368,20 @@ impl ParserV3 {
             TokenType::Identifier(n) if n == "aggregate" => self.emit_aggregate_w(),
             TokenType::Identifier(n) if n == "handle" => self.emit_handle_w().map(|w| (0, w)),
             TokenType::Identifier(n) if n == "perform" => self.emit_perform_w().map(|w| (0, w)),
+            // v0.98: effect 签名声明（前瞻守卫同上）
+            TokenType::Identifier(n)
+                if n == "effect"
+                    && matches!(
+                        self.tokens.get(self.current + 1).map(|t| &t.token_type),
+                        Some(TokenType::Identifier(_))
+                    )
+                    && matches!(
+                        self.tokens.get(self.current + 2).map(|t| &t.token_type),
+                        Some(TokenType::LParen)
+                    ) =>
+            {
+                self.emit_effect_sig_w().map(|w| (0, w))
+            }
             // v0.85: `with` 配置块（可嵌套在 task body 内）
             TokenType::With => self.emit_with_w().map(|w| (0, w)),
             TokenType::App => self.emit_app_def_w().map(|w| (0, w)),

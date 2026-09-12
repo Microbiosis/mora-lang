@@ -9,6 +9,49 @@
 use super::*;
 
 impl ParserV3 {
+    /// v0.98: 显式 effect 签名声明 —— `effect Name(Hint, ...): Hint`。
+    ///
+    /// 纯类型层契约：不产任何 MirInst（效果签名只被 typeck 消费 ——
+    /// perform 位点校验、handler `__arg0..N` 类型化、结果类型静态化）。
+    /// 返回标注用 `:` 风格（与 task 返回标注一致）；缺省 = Any
+    /// （仅声明载荷契约，结果多态）。
+    pub(super) fn emit_effect_sig_w(&mut self) -> Option<MirWitness> {
+        let span = self.span_of_current();
+        self.advance(); // 'effect'
+        let name = self.consume_identifier("Expected effect name after 'effect'")?;
+        self.consume(TokenType::LParen, "Expected '(' after effect name")?;
+        let mut params: Vec<crate::mir::hint::TypeHint> = Vec::new();
+        while !self.check(&TokenType::RParen) && !self.is_at_end() {
+            let ty = self.parse_type_annotation()?;
+            params.push(crate::mir::hint::TypeHint::from_type(ty));
+            if !self.match_token(&[TokenType::Comma]) {
+                break;
+            }
+        }
+        self.consume(TokenType::RParen, "Expected ')' after effect params")?;
+        let result = if self.match_token_exact(TokenType::Colon) {
+            Some(crate::mir::hint::TypeHint::from_type(
+                self.parse_type_annotation()?,
+            ))
+        } else {
+            None
+        };
+        // 与 TypeAlias 同先例：定义语句落一条 Nil 常量 —— 保持"声明即指令"
+        // 的不变量（空模块守卫 `func.body.is_empty()` 依赖它；纯签名模块
+        // 否则会被 "no executable instructions" 拒绝）。
+        let dst = self.emit.alloc_reg();
+        self.emit
+            .emit(MirInst::Const(dst, crate::value::Value::Nil));
+        Some(MirWitness {
+            kind: WitnessKind::EffectSig {
+                name,
+                params,
+                result,
+            },
+            span,
+        })
+    }
+
     pub(super) fn emit_let_w(&mut self) -> Option<MirWitness> {
         let span = self.span_of_current();
         self.advance(); // 'let'

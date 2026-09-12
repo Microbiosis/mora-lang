@@ -396,6 +396,17 @@ fn build_node(b: &mut FcfgBuilder, w: &MirWitness) -> Node<()> {
             span,
             meta: (),
         },
+        // v0.98: effect 签名声明 —— 纯类型层，CFG 中落 Nil 字面量节点
+        //（无运行时语义；签名由 typeck 预扫描消费）。
+        WitnessKind::EffectSig { .. } => {
+            let reg = b.alloc();
+            Node::Literal {
+                reg,
+                value: crate::common::Literal::Nil(span),
+                span,
+                meta: (),
+            }
+        }
         WitnessKind::EnumDef { name, variants } => Node::EnumDef {
             name: name.clone(),
             variants: variants.iter().map(|v| Variant { name: v.clone(), payload: None }).collect(),

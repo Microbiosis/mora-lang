@@ -2,6 +2,51 @@
 
 All notable changes to Mora will be documented in this file.
 
+## [v0.98.0] — 2026-09-12 — feat: 显式 effect signature 声明语法
+
+v0.97 登记的最后一个语言级扩展点闭环：效果契约从「推断出来的」升级为
+「可以声明的」。
+
+### 语法
+
+```mora
+effect Ask(string): string   -- 载荷契约 + 结果契约（: 风格，同 task 返回标注）
+effect Log(string)           -- 仅载荷契约（结果 = any）
+```
+
+语句级声明（`handle`/`perform` 同款标识符分发，不引入新 TokenType）；
+前瞻守卫 `effect Identifier(` 才拦截 —— 以 `effect` 命名的变量的赋值/
+调用语句不受影响。签名是纯类型层契约：不产生运行时指令（仅按 TypeAlias
+先例落一条 Nil 常量以维持「声明即指令」不变量，否则空模块守卫会拒绝
+纯签名模块）。
+
+### 语义
+
+- **perform 位点校验**：实参数（ArityMismatch）与逐参类型（compatible_with）
+  必须符合签名，违反在位点报错；
+- **结果静态化**：perform 的值取签名结果类型（不再 fresh var）——
+  fn/task 体内的高阶位点由此精确，无需调用点的 handle 在场；
+- **handler 契约化**：`__arg0..N` 按签名参数类型注册（优先于 v0.97 的
+  位点推导）；handler 返回值必须兼容签名结果（违反报在 handle 处）；
+- **导入传播**：imports 收集升级为 env 绑定 + effect 签名双通道
+  （`ImportedModuleSymbols`），签名随 `import` 跨文件生效；
+- **重复声明**：一致幂等放行，不一致报错指向第二处声明；
+- 签名不改变效果行（handled-ness 仍由 handle 动态作用域决定）。
+
+### 实现
+
+- witness：`WitnessKind::EffectSig`（终态变体；child_witnesses /
+  recurse_witness / LSP walk / lower / fcfg 五处穷举匹配同步登记，
+  lower 与 fcfg 落 Nil 常量）；
+- typeck：`EffectSignature` + `effect_signatures` 表 + `infer_program`
+  预扫描（文件全局，先于顺序推断）；`infer_perform` 位点校验与结果
+  静态化；`infer_handle` 签名优先（无签名回退 v0.97 位点推导路径）。
+
+**测试**：新增 10 个 hm 签名测试（arity / 实参类型 / 高阶结果静态化
+正反例 / handler 参数正反例 / 返回失配 / 无结果 Any / 重复声明冲突与
+幂等）+ 3 个 tier1 导入传播测试（新 fixture `effect_sig_module.mora`）；
+lib 899（+10）+ 全集成 0 失败 + clippy -D warnings 清零。mora-spec §7.7 补录。
+
 ## [v0.97.0] — 2026-09-12 — feat: 效果传播不动点 + perform↔handler 静态连接
 
 关闭 v0.96 记录的两个已知边界。

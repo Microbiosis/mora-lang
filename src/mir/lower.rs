@@ -655,6 +655,13 @@ impl WitnessLowerer {
                 self.emit(MirInst::Const(dst, crate::value::Value::Nil));
                 Ok(dst)
             }
+            // v0.98: effect 签名声明 —— 纯类型层，无运行时语义，落 Nil 常量
+            //（签名由 typeck 预扫描消费，与 MirInst 无关）。
+            WitnessKind::EffectSig { .. } => {
+                let dst = self.alloc_reg();
+                self.emit(MirInst::Const(dst, crate::value::Value::Nil));
+                Ok(dst)
+            }
             WitnessKind::EnumDef { name, variants } => {
                 let evs: Vec<crate::common::EnumVariant> = variants
                     .iter()

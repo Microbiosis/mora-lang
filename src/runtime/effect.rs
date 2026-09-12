@@ -19,8 +19,6 @@
 
 use std::sync::Arc;
 
-use parking_lot::Mutex;
-
 use crate::mir::MirFunction;
 use crate::value::{Environment, Value};
 
@@ -28,7 +26,9 @@ use crate::value::{Environment, Value};
 ///
 /// `perform` 在 body 内遇到 `Perform { effect, args }` 指令时被调用。
 /// - `args`: Perform 传递的参数（已从 regs 取值）
-/// - `body_env`: 当前 body 的 env（在多线程场景下，需要 Arc<Mutex<Environment>>）
+/// - handler 内部 env：v0.95 起是 [`HandlerClosure`] 持有的纯
+///   [`Environment`]（v0.94 起无内部可变性）—— handler 自有的线性环境，
+///   经 `&mut self` 直接穿线，不再需要 `Arc<Mutex<>>` 共享壳。
 /// - `k_dst`: 结果写入的寄存器（handler 末尾的 resume 续名）
 ///
 /// 返回 `Ok(reply)` 表示 effect 已处理；`Err(msg)` 表示 handler 内部错误。
@@ -52,13 +52,15 @@ pub trait EffectHandler: Send + Sync {
 /// - `effect`: 注册时绑定的 effect 标签（冗余存储以便调试）
 /// - `handler_mir`: handler 实现（MirFunction）
 /// - `body_arc`: handler 调用的目标 body（thread-safe reference）
-/// - `env`: handler 调用时的 body env（spawn 时克隆）
+/// - `env`: handler 自有的执行环境（v0.95 纯值；安装时从 body env 做 O(1)
+///   结构共享快照，跨多次 perform 保持 handler 侧写可见 —— 与旧
+///   `Arc<Mutex<>>` 回写语义一致，但所有权清晰、无锁）
 /// - `k_param`: handler 内 resume 续名的参数名（todo: 后续 stage 用）
 pub struct HandlerClosure {
     pub effect: String,
     pub handler_mir: Arc<MirFunction>,
     pub body_arc: Arc<MirFunction>,
-    pub env: Arc<Mutex<Environment>>,
+    pub env: Environment,
     pub k_param: String,
 }
 
@@ -78,18 +80,16 @@ impl EffectHandler for HandlerClosure {
         // 第一版（single-shot）：handler 一次性消耗，不还原。注意此 take 拿到
         // 的 handler 已从 EffectRegistry 移除 —— 嵌套 handle 用相同 effect
         // 会重新 push（参考 h_handle 的 take+restore 模式）。
-        let mut handler_env = (*self.env.lock()).clone();
+        //
+        // v0.95: env 是 self 持有的纯值 —— 直接线性穿线（注入 → 执行），
+        // 旧的「锁出克隆 → 执行 → 锁回写」三步舞消失。字段借用不相交，
+        // `&self.handler_mir` 与 `&mut self.env` 可并存。
         for (i, arg) in args.iter().enumerate() {
-            handler_env.define(format!("__arg{}", i), arg.clone(), false);
+            self.env.define(format!("__arg{}", i), arg.clone(), false);
         }
 
         // 2. 跑 handler_mir（host 通过 &mut dyn MirHost 传入）
-        let result = crate::mir::vm::run_mir(&self.handler_mir, host, &mut handler_env, effects);
-
-        // 3. 把可能变更的 handler_env 写回（让 handler 写作用域变量生效）
-        *self.env.lock() = handler_env;
-
-        result
+        crate::mir::vm::run_mir(&self.handler_mir, host, &mut self.env, effects)
     }
 }
 
@@ -170,5 +170,46 @@ mod tests {
         let mut reg = EffectRegistry::default();
         assert!(reg.take("NonExistent").is_none());
         assert!(reg.top_mut("NonExistent").is_none());
+    }
+
+    /// v0.95: HandlerClosure 的 env 是自有纯值 —— perform_box 注入的
+    /// `__arg*` 与跨多次 perform 的状态保留在 handler 内（旧 Arc<Mutex<>>
+    /// 回写语义的等价物），且克隆互不穿透。
+    #[test]
+    fn handler_closure_env_persists_across_performs() {
+        let empty_body = MirFunction {
+            params: Vec::new(),
+            body: Vec::new(),
+            n_regs: 0,
+            ..Default::default()
+        };
+        let mut closure = HandlerClosure {
+            effect: "E".into(),
+            handler_mir: Arc::new(empty_body.clone()),
+            body_arc: Arc::new(empty_body.clone()),
+            env: Environment::new(),
+            k_param: "k".into(),
+        };
+
+        let mut interp = crate::interpreter::Interpreter::new();
+        let host: &mut dyn crate::mir::host::MirHost = &mut interp;
+
+        // 第一次 perform：注入 __arg0
+        let effects = &mut crate::mir::effect::Effects::new();
+        closure
+            .perform_box(host, vec![Value::Int(42)], effects)
+            .expect("first perform should run empty body");
+        assert_eq!(closure.env.get("__arg0"), Some(Value::Int(42)));
+
+        // 第二次 perform：env 仍在（跨 perform 持久），新 arg 覆盖同名
+        closure
+            .perform_box(host, vec![Value::Int(43)], effects)
+            .expect("second perform should run empty body");
+        assert_eq!(closure.env.get("__arg0"), Some(Value::Int(43)));
+
+        // 纯值克隆语义：assoc 产生新版本，不穿透原侧（无共享可变 cell）
+        let snapshot = closure.env.assoc("external", Value::String("x".into()));
+        assert_eq!(snapshot.get("external"), Some(Value::String("x".into())));
+        assert!(closure.env.get("external").is_none());
     }
 }

@@ -95,12 +95,11 @@ impl Interpreter {
                 .map(|m| m.has_self)
                 .unwrap_or(true);
 
-            // 1. 先找具体类型的 impl
+            // 1. 先找具体类型的 impl（v0.95: environment 是纯值，get 即只读
+            // 快照查询 —— 无锁、无 drop 舞步）
             let impl_name =
                 impl_method_key(tname_str, &trait_generics, &for_type, &for_generics, method);
-            let env = self.core.environment.lock();
-            if let Some(task) = env.get(&impl_name) {
-                drop(env);
+            if let Some(task) = self.core.environment.get(&impl_name) {
                 let mut all_args = if has_self {
                     vec![receiver.clone()]
                 } else {
@@ -109,13 +108,10 @@ impl Interpreter {
                 all_args.extend(args);
                 return self.call_value(&task, all_args, effects);
             }
-            drop(env);
 
             // 2. fallback 到 trait 默认实现
             let default_name = default_impl_method_key(tname_str, &trait_generics, method);
-            let env = self.core.environment.lock();
-            if let Some(task) = env.get(&default_name) {
-                drop(env);
+            if let Some(task) = self.core.environment.get(&default_name) {
                 let mut all_args = if has_self {
                     vec![receiver.clone()]
                 } else {
@@ -124,7 +120,6 @@ impl Interpreter {
                 all_args.extend(args);
                 return self.call_value(&task, all_args, effects);
             }
-            drop(env);
         }
 
         Err(format!(
@@ -146,14 +141,12 @@ impl Interpreter {
         call_site: Span,
     ) -> Result<Value, String> {
         let method_names = collect_required_methods(&self.registry.trait_registry, trait_name);
-        let env = self.core.environment.lock();
         for m in method_names {
             let impl_name = impl_method_key(trait_name, trait_generics, for_type, for_generics, m);
             let default_name = default_impl_method_key(trait_name, trait_generics, m);
-            let has_specific = env.get(&impl_name).is_some();
-            let has_default = env.get(&default_name).is_some();
+            let has_specific = self.core.environment.get(&impl_name).is_some();
+            let has_default = self.core.environment.get(&default_name).is_some();
             if !has_specific && !has_default {
-                drop(env);
                 return Err(format!(
                     "trait {}<{}> method '{}' has no impl for type {}<{}> and no default (line {})",
                     trait_name,
@@ -165,7 +158,6 @@ impl Interpreter {
                 ));
             }
         }
-        drop(env);
 
         Ok(Value::TraitObject {
             for_generics: for_generics.to_vec(),

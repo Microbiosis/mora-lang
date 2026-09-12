@@ -308,14 +308,14 @@ pub fn h_handle(
     // 1. 保存当前 handler（嵌套 handle 栈）
     let prev_handler = interp.take_effect_handler(effect);
 
-    // 2. 安装新 handler
+    // 2. 安装新 handler（v0.95: env 是 O(1) 结构共享纯值快照，无锁包装）
     interp.install_effect_handler(
         effect.to_string(),
         Box::new(crate::runtime::effect::HandlerClosure {
             effect: effect.to_string(),
             handler_mir: std::sync::Arc::new(handler.clone()),
             body_arc: std::sync::Arc::new(body.clone()),
-            env: std::sync::Arc::new(parking_lot::Mutex::new(env.clone())),
+            env: env.clone(),
             k_param: k_param.to_string(),
         }),
     );

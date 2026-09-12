@@ -157,8 +157,11 @@ impl Interpreter {
                         args.len()
                     ));
                 }
-                let mut child_env =
-                    Environment::with_parent_of(std::sync::Arc::new(self.core.environment.lock().clone()));
+                // v0.95: 环境纯值 —— 父环境是 O(1) 克隆快照（结构共享），
+                // 子任务对其赋值走 COW，不污染父环境。
+                let mut child_env = Environment::with_parent_of(std::sync::Arc::new(
+                    self.core.environment.clone(),
+                ));
                 for (i, param) in params.iter().enumerate() {
                     let val = args.get(i).cloned().unwrap_or(Value::Nil);
                     child_env.define(param.clone(), val, false);

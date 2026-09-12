@@ -158,10 +158,11 @@ pub struct MirPregelEngine {
     agent_memos: HashMap<String, crate::mir::vm::DagExecMemo>,
     /// v0.75.84: 执行环境（单一来源，v0.75.76+ 约定）。
     /// agent 执行 / 边条件 / master_compute 的 env 来源：优先 base_env
-    /// （orchestrate 传入的执行 env，含 builtin ai 等）；未注入时回落
-    /// interpreter.environment()（pregel 单测直接构造 Interpreter 未
-    /// take_env 的路径，宿主全局槽仍完整）。
-    base_env: Option<Arc<parking_lot::Mutex<crate::value::Environment>>>,
+    /// （orchestrate 传入的执行 env，含 builtin ai 等）；未注入时在
+    /// `run()` 入口回落为 interpreter.environment() 快照。
+    /// v0.95: 纯值 —— 引擎自有所有权，run 入口解析一次后按数据流穿线，
+    /// 不再经 `Arc<Mutex<>>` 访问宿主槽（宿主槽在 CLI take_env 后本就是空壳）。
+    base_env: Option<crate::value::Environment>,
 }
 
 /// v0.74: Engine runtime metrics.
@@ -317,22 +318,24 @@ impl MirPregelEngine {
     }
 
     /// v0.75.84: 注入执行环境（orchestrate 传入，含 builtin ai 等）。
-    pub(crate) fn with_base_env(
-        mut self,
-        env: Arc<parking_lot::Mutex<crate::value::Environment>>,
-    ) -> Self {
+    /// v0.95: 接收纯值（O(1) 结构共享快照），引擎自此拥有独立版本。
+    pub(crate) fn with_base_env(mut self, env: crate::value::Environment) -> Self {
         self.base_env = Some(env);
         self
     }
 
-    /// 执行环境来源：base_env（优先）或 interpreter.environment()（回落）。
-    fn exec_env(
-        &self,
-        interpreter: &dyn MirHost,
-    ) -> Arc<parking_lot::Mutex<crate::value::Environment>> {
+    /// 执行环境（只读）：run() 入口已解析（base_env 优先，回落 host 快照）。
+    fn exec_env(&self) -> &crate::value::Environment {
         self.base_env
-            .clone()
-            .unwrap_or_else(|| interpreter.environment())
+            .as_ref()
+            .expect("Pregel: exec env not resolved — run() resolves base_env before EXEC")
+    }
+
+    /// 执行环境（可变）：RECONCILE 把 agent env 合并回引擎自有的 env 值。
+    fn exec_env_mut(&mut self) -> &mut crate::value::Environment {
+        self.base_env
+            .as_mut()
+            .expect("Pregel: exec env not resolved — run() resolves base_env before EXEC")
     }
 
     pub fn with_max_steps(mut self, max: usize) -> Self {
@@ -478,8 +481,9 @@ impl MirPregelEngine {
         // v0.75.84: 合并目标为执行 env（base_env 优先）— 与 agent 执行用
         // 同一容器（单一来源）；此前 host.environment() 在 CLI take_env 后
         // 是空壳，合并静默落空（MoA 层间 value 丢失）。
+        // v0.95: 合并直接写引擎自有的纯值 env（所有权穿线，无锁）。
         let strategies = self.build_per_key_strategies();
-        let conflicts = self.exec_env(host).lock().merge_from_with_strategies(
+        let conflicts = self.exec_env_mut().merge_from_with_strategies(
             &outcome.env,
             &strategies,
             &MergeStrategy::LastWriteWins,
@@ -512,7 +516,8 @@ impl MirPregelEngine {
         for edge in &self.config.edges {
             if edge.from == node_name && edge.to != "@exit" {
                 if let Some(cond_body) = &edge.condition_body {
-                    let mut cond_env = host.environment().lock().clone();
+                    // v0.95: 读引擎自有的纯值 env 快照（与 run() PLAN 段一致）
+                    let mut cond_env = self.exec_env().clone();
                     // v0.75.9: 包裹 Arc 走全局 DAG 缓存
                     let cond_val = crate::mir::vm::run_mir(
                         &std::sync::Arc::new(cond_body.clone()),
@@ -630,6 +635,13 @@ impl MirPregelEngine {
     pub fn run(&mut self, interpreter: &mut dyn MirHost) -> Result<Value, String> {
         use std::collections::HashSet;
 
+        // v0.95: 执行环境在 run 入口解析为引擎自有的纯值（base_env 优先，
+        // 回落 host 快照）。此后全部消费点读 `exec_env()` 快照 / 写
+        // `exec_env_mut()`（仅 RECONCILE 合并），不再按次穿透宿主槽。
+        if self.base_env.is_none() {
+            self.base_env = Some(interpreter.environment());
+        }
+
         // v0.63: current_step is initialized in new() and may be set by restore_checkpoint.
         // Do NOT reset to 0 here — that would negate checkpoint restore.
         let mut active_nodes: Vec<String> = vec!["@start".to_string()];
@@ -689,7 +701,7 @@ impl MirPregelEngine {
                     if edge.from == *active_node && edge.to != "@exit" {
                         // v0.71: Evaluate edge condition if present.
                         if let Some(cond_body) = &edge.condition_body {
-                            let mut cond_env = self.exec_env(interpreter).lock().clone();
+                            let mut cond_env = self.exec_env().clone();
                             // v0.75.9: 包裹 Arc 走全局 DAG 缓存
                             let cond_val = crate::mir::vm::run_mir(
                                 &std::sync::Arc::new(cond_body.clone()),
@@ -737,7 +749,7 @@ impl MirPregelEngine {
             // 静默继续（吞错误；协调钩子失败可能让引擎跑出错误语义而不自知）。
             // 与「吞异常审计」约束一致：协调钩子是全局控制点，失败必须冒泡。
             if let Some(master) = self.master_compute.clone() {
-                let mut master_env = self.exec_env(interpreter).lock().clone();
+                let mut master_env = self.exec_env().clone();
                 // v0.75.9: master_compute 已是 Arc，直接走全局 DAG 缓存
                 let mut master_effects = crate::mir::effect::Effects::new();
                 crate::mir::vm::run_mir(&master, interpreter, &mut master_env, &mut master_effects)?;
@@ -788,7 +800,7 @@ impl MirPregelEngine {
                 {
                     let mut acc = messages[0].clone();
                     for incoming in &messages[1..] {
-                        let mut env = self.exec_env(interpreter).lock().clone();
+                        let mut env = self.exec_env().clone();
                         env.define("current".into(), acc.clone(), false);
                         env.define("incoming".into(), incoming.clone(), false);
                         // v0.75.9: combiner_bodies 已是 Arc，直接走全局 DAG 缓存
@@ -894,7 +906,7 @@ impl MirPregelEngine {
 
                         let input_val = self.build_node_input(node_name);
                         let input_str = input_val.to_string();
-                        let mut env = self.exec_env(interpreter).lock().clone();
+                        let mut env = self.exec_env().clone();
                         // v0.73: define input on the private clone (agent only
                         // sees its own input; no cross-agent contamination).
                         env.define("input".to_string(), Value::String(input_str.clone()), false);
@@ -1012,7 +1024,7 @@ impl MirPregelEngine {
                         }
                         let input_val = self.build_node_input(node_name);
                         let input_str = input_val.to_string();
-                        let mut env = self.exec_env(interpreter).lock().clone();
+                        let mut env = self.exec_env().clone();
                         env.define("input".to_string(), Value::String(input_str.clone()), false);
                         // v0.75.10: 加法注入（input_<channel>），旧 agent 无感
                         Self::inject_channel_inputs(&mut env, node_name, self);
@@ -1235,7 +1247,7 @@ impl MirPregelEngine {
                         &merge_expr,
                     ))
                     .map_err(|e| format!("Pregel merge body lowering failed: {}", e))?;
-                    let mut merge_env = self.exec_env(interpreter).lock().clone();
+                    let mut merge_env = self.exec_env().clone();
                     merge_env.define("current".into(), current.unwrap_or(Value::Nil), false);
                     merge_env.define("incoming".into(), value, false);
                     // v0.75.9: 包裹 Arc 走全局 DAG 缓存
@@ -1266,7 +1278,7 @@ impl MirPregelEngine {
                         &merge_witness,
                     ))
                     .map_err(|e| format!("Pregel custom body lowering failed: {}", e))?;
-                    let mut merge_env = self.exec_env(interpreter).lock().clone();
+                    let mut merge_env = self.exec_env().clone();
                     merge_env.define("current".into(), current.unwrap_or(Value::Nil), false);
                     merge_env.define("incoming".into(), value, false);
                     // v0.75.9: 包裹 Arc 走全局 DAG 缓存

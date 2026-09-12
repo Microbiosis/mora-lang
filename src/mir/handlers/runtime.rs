@@ -725,11 +725,12 @@ fn run_pregel_config(
     // 单一来源；不注入时回落 interpreter.environment()（单测路径）。
     // `__moa_input` 携带 input_var 原始值（agent env 的 `input` 是 pregel
     // delta JSON，MoA 首层 proposer 的 `{input}` 插值需要真值）。
+    // v0.95: 注入纯值快照，引擎自有所有权。
     let mut base_env = env.clone();
     if let Some(v) = env.get(input_var) {
         base_env.define("__moa_input".to_string(), v, false);
     }
-    engine = engine.with_base_env(std::sync::Arc::new(parking_lot::Mutex::new(base_env)));
+    engine = engine.with_base_env(base_env);
 
     // v0.66: Wire PersistRuntime's checkpoint saver into the engine
     // so the auto-save block in BSP ADVANCE actually persists.

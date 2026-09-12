@@ -4,6 +4,8 @@
 //! 分派 + `call_value` 的 Value→调用），本模块承载 30 个 `call_builtin_*`
 //! 具体实现 + 兜底查找。`testcase!` 宏定义在 `interpreter` 模块根。
 
+use parking_lot::Mutex;
+
 use super::*;
 use crate::value::Value;
 
@@ -329,8 +331,8 @@ impl Interpreter {
         for arg in args {
             let (name, role, text, budget_bytes) = match arg {
                 Value::String(section_name) => {
-                    // 从环境查 section
-                    let looked_up = self.core.environment.lock().get(&section_name);
+                    // 从环境查 section（v0.95: 纯值只读查询，无锁）
+                    let looked_up = self.core.environment.get(&section_name);
                     match looked_up {
                         Some(Value::PromptSection {
                             name,

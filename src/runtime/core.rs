@@ -1,6 +1,6 @@
 //! v0.52 ADR-001: CoreRuntime — 语言执行必需的薄核心
 //!
-//! 从 Interpreter god object 抽出的核心执行字段（globals/environment/tool_registry/
+//! 从 Interpreter god object 抽出的核心执行字段（environment/tool_registry/
 //! current_ai_config/config_stack/current_merge_strategies），
 //! 是解释器运行所必需的最小状态容器。
 //!
@@ -8,6 +8,11 @@
 //! v0.93: send/aggregate 效应不再驻留宿主 —— 改为显式 `&mut Effects`
 //! 参数沿执行链传递（见 [`crate::mir::effect::Effects`]）。CoreRuntime 因此
 //! 不再持有任何效应缓冲。
+//! v0.95: 数据流化 —— v0.94 起 [`Environment`] 已是无内部可变性的持久化
+//! 纯值（HAMT + 不可变父链），`Arc<Mutex<Environment>>` 包装成为纯值外面
+//! 的冗余锁。本结构改持纯 `Environment`：执行 env 由 `take_env` 一次性
+//! 取出后按数据流穿线（v0.75.76 约定），不再存在"锁保护的宿主槽"。
+//! 同时删除死状态 `globals`（v0.75.76 起无任何读取，仅构造器写入）。
 
 use parking_lot::Mutex;
 use std::collections::HashMap;
@@ -21,10 +26,8 @@ use crate::value::{Environment, MergeStrategy};
 // v0.80: CoreRuntime 不再 derive Clone —— EffectHandler 是 move-only trait object，
 // 整个 EffectRegistry 不可 Clone。手动 impl Clone（克隆时 effect_handlers 取空）。
 pub struct CoreRuntime {
-    /// 全局变量环境
-    pub(crate) globals: Arc<Mutex<Environment>>,
-    /// 当前执行环境（可嵌套）
-    pub(crate) environment: Arc<Mutex<Environment>>,
+    /// 当前执行环境（v0.75.76 起仅在 run 前由 `take_env` 取出，此后按值穿线）
+    pub(crate) environment: Environment,
     /// 工具注册表（MCP / builtin tool 的运行时注册）
     pub(crate) tool_registry: Arc<HashMap<String, ToolDef>>,
     /// 当前 with 块 set 的 AiConfig 值
@@ -47,10 +50,8 @@ pub struct CoreRuntime {
 
 impl Default for CoreRuntime {
     fn default() -> Self {
-        let env = Arc::new(Mutex::new(Environment::default()));
         Self {
-            globals: env.clone(),
-            environment: env,
+            environment: Environment::default(),
             tool_registry: Arc::new(HashMap::new()),
             current_ai_config: None,
             config_stack: Vec::new(),
@@ -66,10 +67,11 @@ impl Default for CoreRuntime {
 // 语义：Pregel worker 复制 → 子线程没有已注册的 handler（body 直接 perform 会
 // 报 unhandled effect）。这是 conservative 默认；后续 Stage 2.x 可支持 handler
 // 共享（Arc<dyn EffectHandler> 引用计数）。
+// v0.95: environment 克隆是 O(1) 结构共享（持久化 HAMT），共享绑定不再
+// 需要共享可变 cell —— 克隆后的 env 相互独立，写不穿透。
 impl Clone for CoreRuntime {
     fn clone(&self) -> Self {
         Self {
-            globals: self.globals.clone(),
             environment: self.environment.clone(),
             tool_registry: self.tool_registry.clone(),
             current_ai_config: self.current_ai_config.clone(),
@@ -85,13 +87,6 @@ impl Clone for CoreRuntime {
 mod tests {
     use super::*;
     use crate::value::Value;
-
-    #[test]
-    fn core_default_globals_and_env_share() {
-        let core = CoreRuntime::default();
-        // globals 和 environment 初始指向同一个 Arc
-        assert!(Arc::ptr_eq(&core.globals, &core.environment));
-    }
 
     #[test]
     fn core_tool_registry_empty() {
@@ -112,14 +107,19 @@ mod tests {
     }
 
     #[test]
-    fn core_clone_preserves_globals_identity() {
-        let core = CoreRuntime::default();
-        {
-            let mut env = core.environment.lock();
-            env.define("test".to_string(), Value::Int(42), false);
-        }
+    fn core_clone_preserves_environment_bindings() {
+        let mut core = CoreRuntime::default();
+        core
+            .environment
+            .define("test".to_string(), Value::Int(42), false);
         let cloned = core.clone();
-        let val = cloned.environment.lock().get("test").clone();
-        assert!(matches!(val, Some(Value::Int(42))));
+        // 克隆保留绑定
+        assert!(matches!(cloned.environment.get("test"), Some(Value::Int(42))));
+        // 纯值语义：克隆侧写不穿透原侧（无共享可变 cell）
+        let mut cloned = cloned;
+        cloned
+            .environment
+            .define("test".to_string(), Value::Int(43), false);
+        assert!(matches!(core.environment.get("test"), Some(Value::Int(42))));
     }
 }

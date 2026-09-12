@@ -5,6 +5,8 @@
 //! string/stream/agent/router/mcp/document）；dispatch.rs 保留
 //! `call_function`（builtin 入口）+ `call_builtin_*` + `call_value`。
 
+use parking_lot::Mutex;
+
 use super::*;
 use crate::common::Span;
 use crate::value::{BuiltinKind, Value};

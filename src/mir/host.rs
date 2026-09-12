@@ -62,8 +62,13 @@ pub trait MirHost {
     fn mir_restore_config(&mut self);
     /// 当前 CRDT 合并策略（`h_worker`/`h_transaction` 用）。
     fn current_merge_strategies(&self) -> Option<HashMap<String, MergeStrategy>>;
-    /// 当前执行环境（`h_closure` 捕获 / `h_receive` 读消息）。
-    fn environment(&self) -> Arc<parking_lot::Mutex<Environment>>;
+    /// 当前执行环境的纯值快照。
+    /// v0.95: 返回 [`Environment`] 值（O(1) 结构共享克隆）—— v0.94 起
+    /// Environment 无内部可变性，不再经 `Arc<Mutex<>>` 共享。
+    /// 现有消费者：Pregel 引擎未注入 base_env 时的执行环境回落。
+    /// （`h_closure` 捕获 / `h_receive` 自 v0.75.76 起走显式穿线的 env 参数，
+    /// 不再读宿主槽。）
+    fn environment(&self) -> Environment;
     /// checkpoint saver（`h_orchestrate` 注入 Pregel 引擎）。
     fn checkpoint_saver(&self) -> Option<Arc<dyn CheckpointSaver>>;
     /// 从 saver 恢复 checkpoint（`h_orchestrate`）。

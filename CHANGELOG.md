@@ -2,6 +2,66 @@
 
 All notable changes to Mora will be documented in this file.
 
+## [v0.95.0] — 2026-09-12 — refactor: 环境所有权数据流化 — 拆除 Arc<Mutex<Environment>> 冗余锁
+
+**原则**：用数据流代替状态机。v0.94 把 `Environment` 改成无内部可变性的持久化
+纯值后，运行时里残留的 `Arc<Mutex<Environment>>` 包装已退化为「纯值外面的冗余
+防御层」——锁不再保护任何真实共享，只掩盖所有权归属。本版本把执行环境的
+所有权显式化：**env 是穿线的值，不是锁里的槽**。
+
+### (1) CoreRuntime — 环境改持纯值，删除死状态 globals
+
+- `environment: Arc<Mutex<Environment>>` → `environment: Environment`（纯值，
+  克隆即 O(1) 结构共享的独立版本）。
+- 删除死状态 `globals` 字段：v0.75.76 起「宿主全局环境查询」废除，该字段仅
+  在构造器被写入、全仓库无任何读取（grep 证据：仅 Clone impl 与 ptr_eq 测试
+  引用）。`CoreRuntime` Clone 语义不变（effect_handlers 仍取空）。
+
+### (2) MirHost::environment() — 返回纯值快照
+
+- trait 签名 `-> Arc<Mutex<Environment>>` 改为 `-> Environment`（O(1) 克隆）。
+  文档修正：`h_closure` 捕获 / `h_receive` 自 v0.75.76 起走显式穿线 env，
+  不再读宿主槽；现存消费者仅 Pregel 引擎的执行环境回落。
+
+### (3) Pregel 引擎 — 执行环境一次性解析，引擎自有所有权
+
+- `base_env: Option<Arc<Mutex<Environment>>>` → `Option<Environment>` 纯值；
+  `with_base_env` 接收纯值快照。
+- `run()` 入口一次性解析执行环境（base_env 优先，回落 host 快照），此后
+  全部 8 个消费点（agent 执行 / 边条件 / master_compute / combiner /
+  merge / custom reducer）读 `exec_env()` 快照，RECONCILE 的 env 合并写
+  `exec_env_mut()`（引擎自有值），不再逐次穿透宿主槽。
+- 语义说明：回落路径（单测直接构造 Interpreter）下 env 合并不再回流宿主槽
+  —— 引擎自有快照与宿主槽此后独立；`run()` 的返回值（result 通道）不受
+  影响，5 个既有 run() 回落测试全部保持通过。
+
+### (4) HandlerClosure — handler 环境纯值化
+
+- `env: Arc<Mutex<Environment>>` → `env: Environment`；`perform_box` 从
+  「锁出克隆 → 执行 → 锁回写」三步舞改为直接在自有 env 上线性穿线
+  （注入 `__arg*` → run_mir）。跨多次 perform 的 handler 侧写可见性语义
+  不变（新增测试 `handler_closure_env_persists_across_performs` 钉住）。
+
+### (5) 解释器锁点清零 + 死 API 删除
+
+- `trait_dispatch`（3 处）/ `dispatch`（1 处）/ `builtin_impls`（1 处）/
+  `take_env`（1 处）全部拆锁：`get` 即只读快照查询，`drop(env)` 借用管理
+  舞步消失。
+- 删除死公开 API `Interpreter::new_with_globals`（全仓库零调用者）。
+- `method_dispatch.rs` / `builtin_impls.rs` 显式声明自身所需的
+  `parking_lot::Mutex` 导入——此前依赖 `use super::*` 意外传播父模块私有
+  导入的隐式耦合被一并消除。
+
+**不兼容变更**：`MirHost::environment()`、`Interpreter::new_with_globals`、
+`MirPregelEngine::with_base_env`、`HandlerClosure::env` 签名变更；依赖回落
+路径下「pregel 合并回流宿主槽」的调用方须显式读取引擎结果。
+
+**测试**：lib 869（--all-features 877；替换 1 个断言死状态 Arc 身份的测试为
+纯值隔离语义测试，新增 handler env 持久性测试）、e2e 23、compile_differential 9、
+nine_layer_differential 19、executor_switch 17、jit 17、orchestrate_v3 10、
+tier0 9、tier1 31、tier2 33、parser_v3 14+11、proptest 8、其余集成全绿；
+clippy --all-targets --all-features -D warnings 清零。
+
 ## [v0.94.00] — 2026-09-11 — refactor: 数据流化 — Environment HAMT + TEA 纯值 + Pregel 双轨收编
 
 **原则**：用数据流代替状态机；纯函数让并发从防御性编程变成自然属性。本版本

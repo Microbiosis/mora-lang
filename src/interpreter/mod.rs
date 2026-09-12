@@ -26,7 +26,6 @@ mod numeric_helpers; // v0.92 P1.2: split from dispatch.rs
 mod trait_dispatch;
 // v0.75.x: MirPregelEngine + WorkerPool 已迁至 src/pregel/（解耦 mir ↔ interpreter 循环）
 
-use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::env;
 
@@ -277,7 +276,9 @@ fn perform_effect(
         self.current_merge_strategies()
     }
 
-    fn environment(&self) -> Arc<parking_lot::Mutex<Environment>> {
+    /// v0.95: 返回当前执行环境的纯值快照（O(1) 结构共享 —— v0.94 起
+    /// Environment 无内部可变性，克隆即独立版本，无需锁）。
+    fn environment(&self) -> Environment {
         self.core.environment.clone()
     }
 
@@ -337,14 +338,15 @@ impl Default for Interpreter {
 
 impl Interpreter {
     pub fn new() -> Self {
-        let globals = Arc::new(Mutex::new(Environment::new()));
-        use crate::value::BuiltinKind as Bk;
+        // v0.95: globals 是普通 Environment 纯值 —— builtin 定义直接在值上
+        // 完成，无锁。environment 与 globals 是同一值（结构共享的独立版本）。
+        let mut globals = Environment::new();
         {
-            let mut g = globals.lock();
+            use crate::value::BuiltinKind as Bk;
             // v0.37 (P1-3.6): use typed BuiltinKind instead of String.
-            g.define("print".to_string(), Value::Builtin(Bk::Print), false);
-            g.define("range".to_string(), Value::Builtin(Bk::Range), false);
-            g.define("len".to_string(), Value::Builtin(Bk::Len), false);
+            globals.define("print".to_string(), Value::Builtin(Bk::Print), false);
+            globals.define("range".to_string(), Value::Builtin(Bk::Range), false);
+            globals.define("len".to_string(), Value::Builtin(Bk::Len), false);
             for (name, kind) in &[
                 ("ai", Bk::AiChat),
                 ("web", Bk::Web),
@@ -354,47 +356,46 @@ impl Interpreter {
                 ("agent", Bk::Agent),
                 ("document", Bk::Document),
             ] {
-                g.define(name.to_string(), Value::Builtin(*kind), false);
+                globals.define(name.to_string(), Value::Builtin(*kind), false);
             }
             // v0.26: prompt-section builtins
-            g.define(
+            globals.define(
                 "compose_prompt".to_string(),
                 Value::Builtin(Bk::ComposePrompt),
                 false,
             );
-            g.define("tail".to_string(), Value::Builtin(Bk::Tail), false);
+            globals.define("tail".to_string(), Value::Builtin(Bk::Tail), false);
             // v0.29: compress / crush_json
-            g.define("compress".to_string(), Value::Builtin(Bk::Compress), false);
-            g.define(
+            globals.define("compress".to_string(), Value::Builtin(Bk::Compress), false);
+            globals.define(
                 "crush_json".to_string(),
                 Value::Builtin(Bk::CrushJson),
                 false,
             );
             // v0.34: bus / sandbox / schedule / ccr / mock
-            g.define("bus".to_string(), Value::Builtin(Bk::Bus), false);
-            g.define("sandbox".to_string(), Value::Builtin(Bk::Sandbox), false);
-            g.define("schedule".to_string(), Value::Builtin(Bk::Schedule), false);
-            g.define("ccr".to_string(), Value::Builtin(Bk::Ccr), false);
-            g.define("mock".to_string(), Value::Builtin(Bk::Mock), false);
+            globals.define("bus".to_string(), Value::Builtin(Bk::Bus), false);
+            globals.define("sandbox".to_string(), Value::Builtin(Bk::Sandbox), false);
+            globals.define("schedule".to_string(), Value::Builtin(Bk::Schedule), false);
+            globals.define("ccr".to_string(), Value::Builtin(Bk::Ccr), false);
+            globals.define("mock".to_string(), Value::Builtin(Bk::Mock), false);
             // v0.43.0: exec.* — parallel subprocess execution (pi-mono v1 inspired)
-            g.define("exec".to_string(), Value::Builtin(Bk::Exec), false);
+            globals.define("exec".to_string(), Value::Builtin(Bk::Exec), false);
             // v0.45.0: tool.plane.* — ToolPlane Core/Extension adapter
-            g.define("tool".to_string(), Value::Builtin(Bk::Toolplane), false);
+            globals.define("tool".to_string(), Value::Builtin(Bk::Toolplane), false);
             // v0.46.0: skill.* — MoraSkillSpec + dual registry
-            g.define("skill".to_string(), Value::Builtin(Bk::Skill), false);
+            globals.define("skill".to_string(), Value::Builtin(Bk::Skill), false);
             // v0.48.0: plan.* — real-time checklist (pi-agent)
-            g.define("plan".to_string(), Value::Builtin(Bk::Plan), false);
+            globals.define("plan".to_string(), Value::Builtin(Bk::Plan), false);
             // v0.48.0: mora.* — meta (refine)
-            g.define("mora".to_string(), Value::Builtin(Bk::Mora), false);
+            globals.define("mora".to_string(), Value::Builtin(Bk::Mora), false);
             // v0.91: math/stats/linalg/random 四件套（数学 builtin）
-            g.define("math".to_string(), Value::Builtin(Bk::Math), false);
-            g.define("stats".to_string(), Value::Builtin(Bk::Stats), false);
-            g.define("linalg".to_string(), Value::Builtin(Bk::Linalg), false);
-            g.define("random".to_string(), Value::Builtin(Bk::Random), false);
+            globals.define("math".to_string(), Value::Builtin(Bk::Math), false);
+            globals.define("stats".to_string(), Value::Builtin(Bk::Stats), false);
+            globals.define("linalg".to_string(), Value::Builtin(Bk::Linalg), false);
+            globals.define("random".to_string(), Value::Builtin(Bk::Random), false);
         }
         Self {
             core: crate::runtime::core::CoreRuntime {
-                globals: globals.clone(),
                 environment: globals,
                 tool_registry: Arc::new(HashMap::new()),
                 ..Default::default()
@@ -412,30 +413,9 @@ impl Interpreter {
     /// v0.04: 构造一个空 Interpreter (用于 std::mem::replace 占位)
     /// 空 Interpreter 不能跑 execute, 仅作为占位符存在
     pub fn new_empty() -> Self {
-        let env = Arc::new(Mutex::new(Environment::new()));
         Self {
             core: crate::runtime::core::CoreRuntime {
-                globals: env.clone(),
-                environment: env,
-                ..Default::default()
-            },
-            infra: crate::runtime::infra::InfraRuntime::default(),
-            ai: crate::runtime::ai::AiRuntime::default(),
-            orch: crate::runtime::orch::OrchRuntime::default(),
-            persist: crate::runtime::persist::PersistRuntime::default(),
-            sandbox: crate::runtime::sandbox::SandboxRuntime::default(),
-            registry: crate::runtime::registry::RegistryRuntime::default(),
-        }
-    }
-
-    pub fn new_with_globals(globals: Arc<Mutex<Environment>>) -> Self {
-        let env = Arc::new(Mutex::new(Environment::with_parent_of(Arc::new(
-            globals.lock().clone(),
-        ))));
-        Self {
-            core: crate::runtime::core::CoreRuntime {
-                globals: globals.clone(),
-                environment: env,
+                environment: Environment::new(),
                 ..Default::default()
             },
             infra: crate::runtime::infra::InfraRuntime::default(),
@@ -658,8 +638,10 @@ impl Interpreter {
     }
 
     /// 获取可变的当前执行环境（MIR 解释器入口用）
+    /// v0.95: environment 是纯值 —— take 即值的所有权移出（槽位回到空 env），
+    /// 与旧锁内 mem::take 语义一致，但无锁。
     pub fn take_env(&mut self) -> Environment {
-        std::mem::take(&mut *self.core.environment.lock())
+        std::mem::take(&mut self.core.environment)
     }
 
     pub fn set_trace_enabled(&mut self, enabled: bool) {

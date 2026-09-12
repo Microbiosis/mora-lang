@@ -44,6 +44,22 @@ pub struct ClosureSig {
     pub arity: usize,
 }
 
+/// v0.97: handle 推断帧 —— 一层 handle body 推断期间收集的 perform 位点。
+#[derive(Debug)]
+pub struct HandleFrame {
+    pub effect: String,
+    pub sites: Vec<PerformSite>,
+}
+
+/// v0.97: 一个 perform 位点的静态类型连接材料。
+#[derive(Debug, Clone)]
+pub struct PerformSite {
+    /// perform 的结果类型（fresh var —— 与 handler 返回类型 Eq 统一）
+    pub result_ty: Type,
+    /// 各实参的推断类型（派生 handler 的 __arg0..N）
+    pub arg_tys: Vec<Type>,
+}
+
 #[derive(Default)]
 pub struct HMInference {
     pub env: TypeEnv,
@@ -65,6 +81,13 @@ pub struct HMInference {
     // `crate::typeck::hm::diag::DiagFilter`（双向定型专用基础设施）。
     // HM 公共 API 回归到 v0.75.86 之前的纯粹 HM 状态。
 
+    /// v0.97: handle 推断帧 —— body 推断期间收集本层 effect 的 perform
+    /// 位点（infer_perform 记录到帧顶）。栈语义与运行时 take 栈一致：
+    /// 内层同标签 handle 的 body 位点归内层帧，其 handler 体位点归外层帧。
+    pub handle_stack: Vec<HandleFrame>,
+    /// v0.97: 闭包/fn 体推断深度 —— 深度 > 0 时不记录 perform 位点
+    /// （调用点上下文未知，高阶位点的结果连接留给 effect signature）。
+    pub closure_depth: usize,
     /// v0.89: Shadow type table — captures infer_expr results per witness
     /// node before substitution. Keyed by Span (unique within a file).
     /// Used by `export_type_table` to produce a TypeTable without
@@ -265,6 +288,11 @@ impl HMInference {
     /// "unhandled effect" 兜底自此只防御动态生成代码）。
     /// 残差行仅含 Var（多态未知行）时宽松放行 —— 不做错误拒绝。
     pub fn infer_program(&mut self, exprs: &[MirWitness]) -> Vec<TypeError> {
+        // v0.97: 不动点预计算 —— fn/task 定义的 witness 树行走器在**顺序
+        // 推断开始前**把全部定义（含嵌套、含前向引用）的效果行算到不动点，
+        // mutual recursion / 后文定义的调用得以传播效果。行单调增长
+        // （标签只增不减），有限标签集保证终止。
+        self.precompute_fn_effect_rows(exprs);
         let mut errors: Vec<TypeError> = Vec::new();
         for expr in exprs {
             match self.infer_expr(expr) {
@@ -281,9 +309,161 @@ impl HMInference {
         errors
     }
 
+    /// v0.97: fn/task 定义效果行的不动点预计算。
+    ///
+    /// 顺序推断的限制：`task a() { b() }` 在 `task b()` 之前定义时，推断
+    /// 到 a 的 body 时 `fn_effect_rows` 还没有 b 的行 —— mutual recursion
+    /// 与前向引用的效果静默漏检。本方法用**树行走器**（不跑完整 HM，纯
+    /// 数据操作）把全部定义的效果行迭代到不动点后并入登记表：
+    /// - 行单调增长（标签只增不减），标签集来自树内有限的 Perform 节点，
+    ///   迭代必然终止（另设 64 轮防御上限）；
+    /// - 定义节点本身是纯的（行在调用时发生），但全部定义（含嵌套）都被
+    ///   收集并各自计算行 —— 前向引用由此可见。
+    pub fn precompute_fn_effect_rows(&mut self, exprs: &[MirWitness]) {
+        fn collect_fn_defs<'a>(w: &'a MirWitness, out: &mut Vec<&'a MirWitness>) {
+            if let WitnessKind::FnDef { .. } = &w.kind {
+                out.push(w);
+            }
+            for c in w.child_witnesses() {
+                collect_fn_defs(c, out);
+            }
+        }
+        let mut defs: Vec<&MirWitness> = Vec::new();
+        for e in exprs {
+            collect_fn_defs(e, &mut defs);
+        }
+        if defs.is_empty() {
+            return;
+        }
+        let mut table: HashMap<String, crate::mir::effect::EffectRow> =
+            self.fn_effect_rows.clone();
+        for round in 0..64u32 {
+            let mut changed = false;
+            for def in &defs {
+                if let WitnessKind::FnDef { name, body, .. } = &def.kind {
+                    let mut ambient = std::collections::HashSet::new();
+                    let row = Self::tree_effect_row(body, &mut ambient, &table);
+                    let merged = match table.get(name) {
+                        Some(prev) => Self::union_effect_rows(prev, &row),
+                        None => row,
+                    };
+                    if table.get(name) != Some(&merged) {
+                        table.insert(name.clone(), merged);
+                        changed = true;
+                    }
+                }
+            }
+            if !changed {
+                break;
+            }
+            let _ = round;
+        }
+        for (name, row) in table {
+            self.fn_effect_rows.insert(name, row);
+        }
+    }
+
+    /// v0.97: witness 树的效果行直接计算（与 HM 推断同行代数的数据形态）。
+    ///
+    /// - Perform：环境已处理 → 无贡献；否则产生标签（实参行并入）。
+    /// - Handle：body 行去掉被捕获标签（吸收）∪ handler 行。
+    /// - Call：被调效果行（登记表 / 立即调用闭包内联 body 行）∪ 实参行。
+    /// - Closure/FnDef/UpdateDef 定义节点：纯（行被捕获，不并入外层）。
+    /// - LetBinding 绑定闭包/函数：绑定处纯；其他值行上浮。
+    fn tree_effect_row(
+        w: &MirWitness,
+        ambient: &mut std::collections::HashSet<String>,
+        table: &HashMap<String, crate::mir::effect::EffectRow>,
+    ) -> crate::mir::effect::EffectRow {
+        use crate::mir::effect::EffectRow;
+        let union3 = |a: EffectRow, b: EffectRow| Self::union_effect_rows(&a, &b);
+        match &w.kind {
+            WitnessKind::Perform { effect, args } => {
+                let mut row = if ambient.contains(effect) {
+                    EffectRow::Empty
+                } else {
+                    EffectRow::Cons(effect.clone(), Box::new(EffectRow::Empty))
+                };
+                for a in args {
+                    row = union3(row, Self::tree_effect_row(a, ambient, table));
+                }
+                row
+            }
+            WitnessKind::Handle {
+                effect,
+                body,
+                handler,
+                ..
+            } => {
+                ambient.insert(effect.clone());
+                let b = Self::tree_effect_row(body, ambient, table).remove(effect);
+                ambient.remove(effect);
+                let h = Self::tree_effect_row(handler, ambient, table);
+                union3(b, h)
+            }
+            WitnessKind::Call { callee, args } => {
+                let mut row = match callee {
+                    WitnessCallee::Var(n) | WitnessCallee::Name(n) => {
+                        table.get(n).cloned().unwrap_or(EffectRow::Empty)
+                    }
+                    WitnessCallee::Evaluated(e) => match &e.kind {
+                        // 立即调用的闭包：body 效果在调用点发生
+                        WitnessKind::Closure { body, .. } => {
+                            Self::tree_effect_row(body, ambient, table)
+                        }
+                        _ => Self::tree_effect_row(e, ambient, table),
+                    },
+                    WitnessCallee::Builtin(_) | WitnessCallee::Method(_, _) => EffectRow::Empty,
+                };
+                for a in args {
+                    row = union3(row, Self::tree_effect_row(a, ambient, table));
+                }
+                row
+            }
+            WitnessKind::Closure { .. } | WitnessKind::FnDef { .. } | WitnessKind::UpdateDef { .. } => {
+                EffectRow::Empty
+            }
+            WitnessKind::LetBinding { value, init_body, .. } => {
+                let v = match &value.kind {
+                    WitnessKind::Closure { .. } | WitnessKind::FnDef { .. } => EffectRow::Empty,
+                    _ => Self::tree_effect_row(value, ambient, table),
+                };
+                union3(v, Self::tree_effect_row(init_body, ambient, table))
+            }
+            _ => {
+                let mut row = EffectRow::Empty;
+                for c in w.child_witnesses() {
+                    row = union3(row, Self::tree_effect_row(c, ambient, table));
+                }
+                row
+            }
+        }
+    }
+
+    /// v0.97: 效果行并集 —— 具名标签的集合并（保序去重）；Var（多态未知
+    /// 行）不贡献具体标签，仅在全空时保留未知性。
+    fn union_effect_rows(a: &crate::mir::effect::EffectRow, b: &crate::mir::effect::EffectRow) -> crate::mir::effect::EffectRow {
+        let mut labels: Vec<String> = a.labels().into_iter().map(String::from).collect();
+        for l in b.labels() {
+            if !labels.iter().any(|x| x == l) {
+                labels.push(l.to_string());
+            }
+        }
+        let mut row = crate::mir::effect::EffectRow::Empty;
+        for l in labels {
+            row.extend(&l);
+        }
+        if matches!(row, crate::mir::effect::EffectRow::Empty)
+            && (matches!(a, crate::mir::effect::EffectRow::Var(_))
+                || matches!(b, crate::mir::effect::EffectRow::Var(_)))
+        {
+            row = crate::mir::effect::EffectRow::Var("rho".to_string());
+        }
+        row
+    }
+
     /// v0.96: 把顶层残差行中的未处理效果定位到发起 witness（精准 span）。
-    fn localize_unhandled_effect(&self, w: &MirWitness, label: &str) -> TypeError {
-        let mut ambient = std::collections::HashSet::new();
+    fn localize_unhandled_effect(&self, w: &MirWitness, label: &str) -> TypeError {        let mut ambient = std::collections::HashSet::new();
         if let Some((span, via)) = self.find_unhandled(w, label, &mut ambient) {
             TypeError::EffectRowMismatch {
                 expected: "no unhandled effects — wrap in a matching `handle` block".to_string(),
@@ -601,11 +781,24 @@ impl HMInference {
         _span: Span,
     ) -> Result<(Type, crate::mir::effect::EffectRow), Vec<TypeError>> {
         let mut arg_rows = crate::mir::effect::EffectRow::Empty;
+        let mut arg_tys = Vec::with_capacity(args.len());
         for arg in args {
-            let (_, row) = self.infer_expr(arg)?;
+            let (t, row) = self.infer_expr(arg)?;
+            arg_tys.push(t.clone());
             arg_rows = self.merge_rows(arg_rows, row);
         }
         let result_ty = self.fresh_type_var();
+        // v0.97: 位点记录到 handle 帧顶（栈顶 = 运行时将接管它的 handler）。
+        // 闭包/fn 体内不记录 —— 调用点上下文未知，高阶连接留给签名系统。
+        if self.closure_depth == 0
+            && let Some(frame) = self.handle_stack.last_mut()
+            && frame.effect == effect
+        {
+            frame.sites.push(PerformSite {
+                result_ty: result_ty.clone(),
+                arg_tys,
+            });
+        }
         let perform_row = crate::mir::effect::EffectRow::Cons(
             effect.to_string(),
             Box::new(crate::mir::effect::EffectRow::Empty),
@@ -617,7 +810,7 @@ impl HMInference {
     ///
     /// handler 体内的 `__arg0`, `__arg1`, ... 是 perform 传参的运行时约定
     /// （见 `src/runtime/effect.rs`）。类型检查时在 handler 作用域内注册
-    /// 这些变量为 fresh type var，让 handler body 的引用通过 typeck。
+    /// 这些变量，让 handler body 的引用通过 typeck。
     ///
     /// v0.96: 吸收语义改为**直接行差**（[`EffectRow::remove`]）—— 残差 =
     /// body 行去掉全部被捕获标签。此前用严格等式约束
@@ -625,6 +818,18 @@ impl HMInference {
     /// 捕获效果时（`handle X { 纯 body }`，定义了未触发的 handler ——
     /// 合法程序），Empty-vs-Cons 的 unify_row 分支误报 "pure vs {X}"。
     /// 未知行（Var，来自未注册 callee 的调用）保留约束推迟消解。
+    ///
+    /// v0.97: perform↔handler 静态连接 ——
+    /// - `__arg0..__argN`（N = 位点最大实参数）按位点实参的推断类型注册，
+    ///   不再一律 Any；位点异质时退化为 Any（不误拒，精度优雅降级）；
+    /// - 每个 perform 位点的结果类型（fresh var）与 handler 返回类型
+    ///   Eq 统一 —— runtime 契约「handler 返回值 = resume 值」由此静态化。
+    ///
+    /// 位点经 **handle 帧栈**原位收集（infer_perform 记录到帧顶）：推断
+    /// Perform 时栈顶恰好是运行时将接管它的 handler —— 内层同标签 handle
+    /// 的 body 归内层、内层 handler 体归外层，归属天然正确且零 span 依赖。
+    /// 闭包/fn 体内不下记录（调用点上下文未知 —— 高阶位点的连接留给
+    /// 后续 effect signature 声明）。
     fn infer_handle(
         &mut self,
         effect: &str,
@@ -632,7 +837,16 @@ impl HMInference {
         handler: &MirWitness,
         _span: Span,
     ) -> Result<(Type, crate::mir::effect::EffectRow), Vec<TypeError>> {
+        self.handle_stack.push(HandleFrame {
+            effect: effect.to_string(),
+            sites: Vec::new(),
+        });
         let (body_ty, body_row) = self.infer_expr(body)?;
+        let frame = self
+            .handle_stack
+            .pop()
+            .expect("handle frame pushed above");
+        let sites = frame.sites;
         let residual_row = match &body_row {
             crate::mir::effect::EffectRow::Var(_) => {
                 let residual = self.fresh_row_var();
@@ -647,15 +861,45 @@ impl HMInference {
             }
             _ => body_row.remove(effect),
         };
-        // v0.80: 注册 handler 参数（__arg0, __arg1, ...）到 env
-        // handler 是 `{ expr }` 形式，其 body 引用 __arg0 等
+        // __arg0..__argN 按位点实参类型注册（异质退化 Any）
         let saved_env = self.env.clone();
-        // 注册 __arg0 为 Any（perform 参数类型在运行时确定，typeck 阶段
-        // 无法静态连接 perform 的 arg 类型到 handler 的 __arg0 —— 需要
-        // effect signature 声明才能精确化，当前用 Any 兜底）。
-        self.env.add("__arg0".to_string(), Type::Any);
+        let max_arity = sites
+            .iter()
+            .map(|s| s.arg_tys.len())
+            .max()
+            .unwrap_or(1)
+            .max(1);
+        for i in 0..max_arity {
+            let mut arg_ty: Option<Type> = None;
+            let mut heterogeneous = false;
+            for s in &sites {
+                if let Some(t) = s.arg_tys.get(i) {
+                    match &arg_ty {
+                        None => arg_ty = Some(t.clone()),
+                        Some(prev) => {
+                            if !prev.compatible_with(t) && !t.compatible_with(prev) {
+                                heterogeneous = true;
+                            }
+                        }
+                    }
+                }
+            }
+            let registered = if heterogeneous {
+                Type::Any
+            } else {
+                arg_ty.unwrap_or(Type::Any)
+            };
+            self.env.add(format!("__arg{}", i), registered);
+        }
         let (_handler_ty, handler_row) = self.infer_expr(handler)?;
         self.env = saved_env;
+        // perform 结果 ≡ handler 返回值（resume 契约的静态化）
+        for s in &sites {
+            self.constraints.push(Constraint::Eq(
+                Box::new(s.result_ty.clone()),
+                Box::new(_handler_ty.clone()),
+            ));
+        }
         Ok((body_ty, self.merge_rows(residual_row, handler_row)))
     }
 }
@@ -852,6 +1096,243 @@ mod tests {
         let mut hm = HMInference::new();
         let errors = hm.infer_program(&[outer]);
         assert!(errors.is_empty(), "嵌套 handle 各吸收各的: {:?}", errors);
+    }
+
+    // ─── v0.97: mutual recursion / 前向引用的效果传播 ───
+
+    use crate::common::BinaryOp;
+
+    fn wit_call(name: &str, span: Span) -> MirWitness {
+        MirWitness {
+            kind: WitnessKind::Call {
+                callee: WitnessCallee::Var(name.to_string()),
+                args: vec![],
+            },
+            span,
+        }
+    }
+
+    fn wit_fn_named(name: &str, body: MirWitness) -> MirWitness {
+        wit_fn_def(name, body)
+    }
+
+    #[test]
+    fn mutual_recursion_effect_propagates() {
+        // a 调 b、b perform X：不动点后 a 的行含 X —— a() 无 handle 报错。
+        let def_a = wit_fn_named(
+            "a",
+            wit_call("b", Span::new(2, 1)),
+        );
+        let def_b = wit_fn_named("b", wit_perform("X"));
+        let call = wit_call("a", Span::new(4, 1));
+        let mut hm = HMInference::new();
+        let errors = hm.infer_program(&[def_a, def_b, call]);
+        assert_eq!(errors.len(), 1, "mutual recursion 的效果必须传播: {:?}", errors);
+        let msg = errors[0].to_string();
+        assert!(msg.contains("X"), "错误应指名标签: {}", msg);
+    }
+
+    #[test]
+    fn forward_task_reference_inside_handle_clean() {
+        // 前向引用：main 定义时 helper 尚未出现，调用点在 handle 内 → 合法。
+        let def_main = wit_fn_named(
+            "main",
+            wit_handle("X", wit_call("helper", Span::new(2, 3))),
+        );
+        let def_helper = wit_fn_named("helper", wit_perform("X"));
+        let mut hm = HMInference::new();
+        let errors = hm.infer_program(&[def_main, def_helper]);
+        assert!(
+            errors.is_empty(),
+            "前向引用 + handle 兜住不应报错: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn self_recursive_effect_propagates() {
+        // a 递归调用自己且某分支 perform X → 不动点后 a 的行含 X。
+        let def_a = wit_fn_named(
+            "a",
+            MirWitness {
+                kind: WitnessKind::If {
+                    cond: Box::new(MirWitness {
+                        kind: WitnessKind::Literal(Literal::Bool(true, Span::default())),
+                        span: Span::default(),
+                    }),
+                    then: Box::new(wit_call("a", Span::default())),
+                    r#else: Some(Box::new(wit_perform("X"))),
+                },
+                span: Span::default(),
+            },
+        );
+        let call = wit_call("a", Span::new(3, 1));
+        let mut hm = HMInference::new();
+        let errors = hm.infer_program(&[def_a, call]);
+        assert_eq!(errors.len(), 1, "自递归效果必须传播: {:?}", errors);
+        assert!(errors[0].to_string().contains("X"));
+    }
+
+    // ─── v0.97: perform ↔ handler 静态连接 ───
+
+    fn wit_str(s: &str) -> MirWitness {
+        MirWitness {
+            kind: WitnessKind::Literal(Literal::String(s.to_string(), Span::default())),
+            span: Span::default(),
+        }
+    }
+
+    fn wit_var(name: &str) -> MirWitness {
+        MirWitness {
+            kind: WitnessKind::Variable(name.to_string()),
+            span: Span::default(),
+        }
+    }
+
+    fn wit_add(left: MirWitness, right: MirWitness) -> MirWitness {
+        MirWitness {
+            kind: WitnessKind::Binary {
+                left: Box::new(left),
+                op: BinaryOp::Add,
+                right: Box::new(right),
+            },
+            span: Span::default(),
+        }
+    }
+
+    fn wit_perform_args(effect: &str, args: Vec<MirWitness>) -> MirWitness {
+        MirWitness {
+            kind: WitnessKind::Perform {
+                effect: effect.to_string(),
+                args,
+            },
+            span: Span::default(),
+        }
+    }
+
+    fn wit_let_typed(name: &str, hint: Type, value: MirWitness) -> MirWitness {
+        MirWitness {
+            kind: WitnessKind::LetBinding {
+                name: name.to_string(),
+                type_hint: Some(crate::mir::hint::TypeHint::from_type(hint)),
+                value: Box::new(value),
+                init_body: Box::new(MirWitness {
+                    kind: WitnessKind::Literal(Literal::Nil(Span::default())),
+                    span: Span::default(),
+                }),
+            },
+            span: Span::default(),
+        }
+    }
+
+    #[test]
+    fn perform_result_unifies_with_handler_return() {
+        // handler 返回 String；perform 结果标注为 Int 使用 → 连接后
+        // Eq(Int, fresh) + Eq(fresh, String) 消解冲突报错。无连接时
+        // perform 是自由 fresh var，Int 标注静默通过（漏检）。
+        let body = wit_let_typed(
+            "v",
+            Type::Int,
+            wit_perform_args("X", vec![wit_str("s")]),
+        );
+        let program = [wit_handle("X", body)];
+        let mut hm = HMInference::new();
+        let errors = hm.infer_program(&program);
+        assert_eq!(
+            errors.len(),
+            1,
+            "perform 结果应与 handler 返回类型统一: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn handler_arg_typed_from_perform_site() {
+        // 位点传 Int → __arg0 静态为 Int → handler 内 Int + Int 合法。
+        let body = wit_perform_args("X", vec![lit_int(41)]);
+        let handler = wit_add(wit_var("__arg0"), lit_int(1));
+        let mut hm = HMInference::new();
+        let errors = hm.infer_program(&[MirWitness {
+            kind: WitnessKind::Handle {
+                effect: "X".to_string(),
+                body: Box::new(body),
+                handler: Box::new(handler),
+                k_param: "k".to_string(),
+            },
+            span: Span::default(),
+        }]);
+        assert!(errors.is_empty(), "类型化 __arg0 应通过: {:?}", errors);
+    }
+
+    #[test]
+    fn handler_arg_mismatch_reports() {
+        // 位点传 String、handler 内将 __arg0 标注为 Int 使用 → 报错
+        //（连接生效：__arg0 静态为 String 而非 Any）。
+        let body = wit_perform_args("X", vec![wit_str("s")]);
+        let handler = wit_let_typed("v", Type::Int, wit_var("__arg0"));
+        let mut hm = HMInference::new();
+        let errors = hm.infer_program(&[MirWitness {
+            kind: WitnessKind::Handle {
+                effect: "X".to_string(),
+                body: Box::new(body),
+                handler: Box::new(handler),
+                k_param: "k".to_string(),
+            },
+            span: Span::default(),
+        }]);
+        assert_eq!(errors.len(), 1, "__arg0 类型不匹配必须报错: {:?}", errors);
+    }
+
+    #[test]
+    fn multi_arg_perform_registers_all_handler_params() {
+        // 两参 perform → __arg0/__arg1 都注册（此前只注册 __arg0，
+        // handler 引用 __arg1 误报 UnboundVariable）。
+        let body = wit_perform_args("X", vec![lit_int(1), lit_int(2)]);
+        let handler = wit_add(wit_var("__arg0"), wit_var("__arg1"));
+        let mut hm = HMInference::new();
+        let errors = hm.infer_program(&[MirWitness {
+            kind: WitnessKind::Handle {
+                effect: "X".to_string(),
+                body: Box::new(body),
+                handler: Box::new(handler),
+                k_param: "k".to_string(),
+            },
+            span: Span::default(),
+        }]);
+        assert!(
+            errors.is_empty(),
+            "__arg1 必须被注册（运行时按 __arg0..N 注入）: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn heterogeneous_sites_degrade_to_any() {
+        // 两个位点 __arg0 分别 String / Int → 异质退化为 Any，
+        // handler 内不做错误拒绝（精度优雅降级，不误拒）。
+        let body = MirWitness {
+            kind: WitnessKind::Sequence(vec![
+                wit_perform_args("X", vec![wit_str("a")]),
+                wit_perform_args("X", vec![lit_int(1)]),
+            ]),
+            span: Span::default(),
+        };
+        let handler = wit_add(wit_var("__arg0"), lit_int(1));
+        let mut hm = HMInference::new();
+        let errors = hm.infer_program(&[MirWitness {
+            kind: WitnessKind::Handle {
+                effect: "X".to_string(),
+                body: Box::new(body),
+                handler: Box::new(handler),
+                k_param: "k".to_string(),
+            },
+            span: Span::default(),
+        }]);
+        assert!(
+            errors.is_empty(),
+            "异质位点退化为 Any 不应误拒: {:?}",
+            errors
+        );
     }
 
     pub(super) fn lit_int(n: i64) -> MirWitness {

@@ -624,7 +624,11 @@ impl HMInference {
         for (p, ty) in params.iter().zip(param_types.iter()) {
             self.env.add(p.name.clone(), ty.clone());
         }
+        // v0.97: 闭包体推断深度 —— 深度 > 0 时 infer_perform 不记录位点
+        //（闭包体内的 perform 在调用点发生，上下文未知）。
+        self.closure_depth += 1;
         let (body_ty, body_row) = self.infer_expr(body)?;
+        self.closure_depth -= 1;
         self.env = saved_env;
         Ok((param_types, body_ty, body_row))
     }
@@ -672,7 +676,13 @@ impl HMInference {
         let (param_types, body_ty, body_row) = self.infer_closure_core(params, body, span)?;
         let ty = Self::wrap_curried_arrow(&param_types, body_ty, &body_row);
         if let Some(n) = name {
-            self.fn_effect_rows.insert(n.to_string(), body_row.clone());
+            // v0.97: 合并而非覆盖 —— precompute_fn_effect_rows 的不动点
+            // 预计算可能已登记前向引用带来的行；HM 推断行与之取并集。
+            let merged = match self.fn_effect_rows.get(n) {
+                Some(prev) => Self::union_effect_rows(prev, &body_row),
+                None => body_row.clone(),
+            };
+            self.fn_effect_rows.insert(n.to_string(), merged);
         }
         // v0.96: 同 infer_closure —— 支持 `let g = task f()` 别名绑定的
         // 行转登记（key 是 FnDef witness 的 span）。

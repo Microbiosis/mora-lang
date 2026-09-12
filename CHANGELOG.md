@@ -2,6 +2,38 @@
 
 All notable changes to Mora will be documented in this file.
 
+## [v0.97.0] — 2026-09-12 — feat: 效果传播不动点 + perform↔handler 静态连接
+
+关闭 v0.96 记录的两个已知边界。
+
+### (1) mutual recursion / 前向引用的效果传播
+
+- `infer_program` 前置 `precompute_fn_effect_rows` 不动点预计算：树行走器
+  （`tree_effect_row`，与 HM 推断同行代数的纯数据形态）把全部 fn/task
+  定义（含嵌套）的效果行迭代到稳定后并入登记表 —— 先定义的函数调用
+  后定义的函数、相互递归的定义组，效果均静态可见；
+- 行单调增长（标签只增不减），有限标签集保证终止（另设 64 轮防御上限）；
+- FnDef 推断时的登记改为与预计算行**取并集**（不覆盖）。
+
+### (2) perform ↔ handler 静态连接
+
+- **handle 帧栈**：infer_perform 把位点（结果 fresh var + 实参类型）记录
+  到栈顶帧 —— 推断 Perform 时栈顶恰好是运行时将接管它的 handler，内层
+  同标签 handle 的 body 位点归内层、其 handler 体位点归外层，归属天然
+  正确且零 span 依赖（v0.96 曾试过 shadow 表查位点，被 span 键碰撞否定）；
+- `__arg0..__argN`（N = 位点最大实参数）按位点实参的推断类型注册，
+  不再一律 Any —— 修复既有误拒：多参 perform 的 handler 引用 `__arg1`
+  此前报 UnboundVariable（运行时按 `__arg0..N` 全量注入）；
+- 位点实参异质时 `__argi` 退化为 Any（不误拒，精度优雅降级）；
+- 每个 perform 位点的结果类型与 handler 返回类型 Eq 统一 —— runtime
+  契约「handler 返回值 = resume 值」静态化；
+- 闭包/fn 体内不记录位点（调用点上下文未知）—— 高阶位点的精确连接
+  留给后续 effect signature 声明（spec §7.7 已注明扩展点）。
+
+**测试**：新增 7 个（mutual recursion / 前向引用 handle 内 / 自递归 /
+结果统一报错 / 类型化 __arg0 / __arg0 失配报错 / 多参注册 / 异质退化）；
+lib 896 + 全集成 0 失败（零误拒）+ clippy -D warnings 清零。
+
 ## [v0.96.0] — 2026-09-12 — feat: EffectRow 编译期强制 — unhandled effect 闭环
 
 **原则**：纯函数让并发从防御性编程变成自然属性 —— 「纯」从此是编译期属性。

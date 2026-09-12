@@ -492,6 +492,7 @@ impl Interpreter {
     /// Subsequent `h_transaction` / `h_worker` invocations will use
     /// `merge_from_with_strategies` with this map. Pass `None` to revert to
     /// the hardcoded LWW fallback.
+    /// v0.95 审计定案：显式全局配置，持久生效直至再次设置（非临时槽）。
     pub fn set_merge_strategies(
         &mut self,
         strategies: Option<HashMap<String, crate::value::MergeStrategy>>,
@@ -499,7 +500,8 @@ impl Interpreter {
         self.core.current_merge_strategies = strategies;
     }
 
-    /// v0.67: Get a clone of the current merge strategies (used by handlers).
+    /// v0.67: Get a clone of the current merge strategies (deposit 侧累积与
+    /// 隔离边界读取共用)。
     pub fn current_merge_strategies(&self) -> Option<HashMap<String, crate::value::MergeStrategy>> {
         self.core.current_merge_strategies.clone()
     }

@@ -32,6 +32,7 @@ pub(super) fn run_isolated(
     let mut child_env = env.clone();
     // v0.75.9: 包裹 Arc 走全局 DAG 缓存
     let result = run_mir(&std::sync::Arc::new((*body).clone()), interp, &mut child_env, effects)?;
+    // v0.95 审计定案：策略是显式全局配置（merge_with 持久设置），非临时槽。
     let strategies = interp.current_merge_strategies();
     let conflicts = match strategies.as_ref() {
         Some(s) => env.merge_from_with_strategies(

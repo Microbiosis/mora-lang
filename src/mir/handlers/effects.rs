@@ -232,25 +232,30 @@ pub fn h_with_config(
     interp.mir_with_config(&binding_vals)?;
     let mut child_env = env.clone();
 
-    let _result = if jit {
+    // v0.95: 先捕获 body 结果再恢复 config —— 保存/恢复对必须在**所有**
+    // 路径上平衡（与 h_handle 的 take/restore 同模式）。此前 body 返回
+    // Err 时 `?` 提前冒泡，mir_restore_config 被跳过，失败 with 块的
+    // config 泄漏进 config_stack 并驻留到后续无关代码。
+    let body_result = if jit {
         // v0.75.43: copy-and-patch JIT（零 LLVM）— 直接编译 MirFunction，
         // 未覆盖指令回落解释器（run_jit Err → run_mir）。
         match crate::mir::jit::run_jit(body, interp, &mut child_env) {
-            Ok(v) => v,
+            Ok(v) => Ok(v),
             Err(e) => {
                 eprintln!(
                     "JIT compilation failed ({}), falling back to MIR interpreter",
                     e
                 );
                 // v0.75.9: 包裹 Arc 走全局 DAG 缓存
-                run_mir(&std::sync::Arc::new((*body).clone()), interp, &mut child_env, effects)?
+                run_mir(&std::sync::Arc::new((*body).clone()), interp, &mut child_env, effects)
             }
         }
     } else {
         // v0.75.9: 包裹 Arc 走全局 DAG 缓存
-        run_mir(&std::sync::Arc::new((*body).clone()), interp, &mut child_env, effects)?
+        run_mir(&std::sync::Arc::new((*body).clone()), interp, &mut child_env, effects)
     };
     interp.mir_restore_config();
+    let _result = body_result?;
     Ok(())
 }
 
@@ -357,4 +362,54 @@ pub fn h_macro_def(
         },
         false,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    /// v0.95: with 块的 config 保存/恢复对必须在**所有**路径上平衡 ——
+    /// body 出错时 restore 不得被 `?` 跳过。此前失败 with 块的 config
+    /// 泄漏进 config_stack 并驻留到后续无关代码（状态机卫生缺陷）。
+    #[test]
+    fn with_config_restored_when_body_errors() {
+        let mut interp = crate::interpreter::Interpreter::new();
+        assert!(interp.core.current_ai_config.is_none());
+
+        // with 块内 body 运行期错误：[1][5] 列表越界
+        let src = "with model = \"m1\"\n  let boom = [1][5]\nend";
+        let (func, _witnesses) =
+            crate::parser_v3::ParserV3::compile(src).expect("compile with block");
+        let mut env = crate::value::Environment::new();
+        let result = crate::mir::vm::run_mir(
+            &std::sync::Arc::new(func),
+            &mut interp,
+            &mut env,
+            &mut crate::mir::effect::Effects::new(),
+        );
+        assert!(result.is_err(), "越界索引应报运行时错误");
+        assert!(
+            interp.core.current_ai_config.is_none(),
+            "with 块出错后 config 必须恢复，不得驻留泄漏"
+        );
+    }
+
+    /// 对照：body 成功路径 config 同样恢复（保存/恢复对平衡）。
+    #[test]
+    fn with_config_restored_when_body_succeeds() {
+        let mut interp = crate::interpreter::Interpreter::new();
+        let src = "with model = \"m1\"\n  let x = 1\nend";
+        let (func, _witnesses) =
+            crate::parser_v3::ParserV3::compile(src).expect("compile with block");
+        let mut env = crate::value::Environment::new();
+        crate::mir::vm::run_mir(
+            &std::sync::Arc::new(func),
+            &mut interp,
+            &mut env,
+            &mut crate::mir::effect::Effects::new(),
+        )
+        .expect("with block should succeed");
+        assert!(
+            interp.core.current_ai_config.is_none(),
+            "with 块结束后 config 应恢复到块前状态"
+        );
+    }
 }

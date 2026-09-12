@@ -60,7 +60,10 @@ pub trait MirHost {
     fn mir_with_config(&mut self, bindings: &[(String, Value)]) -> Result<(), String>;
     /// with 块 config 恢复（`h_with_config` 末尾）。
     fn mir_restore_config(&mut self);
-    /// 当前 CRDT 合并策略（`h_worker`/`h_transaction` 用）。
+    /// 当前 CRDT 合并策略（`h_worker`/`h_transaction`/`h_observe`/`h_span` 用）。
+    /// v0.95 审计定案：这是**显式全局配置**（`merge_with` builtin 设置，
+    /// 持久生效直至再次设置），不是 set-then-use 临时槽 —— GrowOnlySet
+    /// 跨多个 worker 累积合并依赖其持久性（tests/tier0_replacement.rs 钉住）。
     fn current_merge_strategies(&self) -> Option<HashMap<String, MergeStrategy>>;
     /// 当前执行环境的纯值快照。
     /// v0.95: 返回 [`Environment`] 值（O(1) 结构共享克隆）—— v0.94 起

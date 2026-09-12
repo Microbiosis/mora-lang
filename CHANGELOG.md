@@ -70,6 +70,22 @@ All notable changes to Mora will be documented in this file.
 - **语言级显式可变性**：`Value::Atom` / `Value::Router` / `StreamReader`
   是 Mora 语言自身能力面，不属于运行时状态机问题。
 
+### (7) set-then-use 宿主槽审计 + with 块 config 栈泄漏修复
+
+**审计定案**（三条状态机轴逐一核验）：
+- `current_merge_strategies`：**显式全局配置**——`merge_with` builtin 持久
+  设置，GrowOnlySet 跨多个 worker 累积合并依赖其持久性
+  （tests/tier0_replacement.rs 钉住）。非临时槽，语义保持不变。
+- `current_ai_config` + `config_stack`：with 块的配对保存/恢复（动态作用域）。
+  **发现并修复泄漏**：`h_with_config` 在 body 返回 Err 时 `?` 提前冒泡，
+  `mir_restore_config` 被跳过——失败 with 块的 config 驻留宿主，泄漏进
+  后续无关代码。修复为「先捕获结果 → 无条件恢复 → 再传播错误」（与
+  `h_handle` 的 take/restore 平衡模式一致）。新增成功/失败两条平衡回归
+  测试（`with_config_restored_when_body_errors` /
+  `with_config_restored_when_body_succeeds`）。
+- `EffectRegistry` take/install/restore：配对平衡（h_handle 已保证），
+  合法的代数效果动态作用域机制。
+
 **不兼容变更**：`MirHost::environment()`、`Interpreter::new_with_globals`、
 `MirPregelEngine::with_base_env`、`HandlerClosure::env` 签名变更；依赖回落
 路径下「pregel 合并回流宿主槽」的调用方须显式读取引擎结果。

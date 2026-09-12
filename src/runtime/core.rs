@@ -55,6 +55,8 @@ pub struct CoreRuntime {
     /// v0.67: 当前 transaction/worker 的 CRDT 合并策略。
     /// 设值时 `h_transaction`/`h_worker` 使用 `merge_from_with_strategies`；
     /// 为 None 时回退到硬编码 LWW。
+    /// v0.95 审计定案：显式全局配置（`merge_with` builtin 持久设置），
+    /// 非 set-then-use 临时槽 —— GrowOnlySet 跨 worker 累积依赖其持久性。
     pub(crate) current_merge_strategies: Option<HashMap<String, MergeStrategy>>,
     /// v0.80: algebraic effects handler 注册表（Stage 2/4 落地）。
     /// MirHost trait 的 `perform_effect / install/take/restore_effect_handler`

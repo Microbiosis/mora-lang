@@ -1,12 +1,13 @@
-[profile.test]
-opt-level = 0
-debug = true
-link-args = ["/STACK:4194304"]
-
-[profile.test.package."*"]
-opt-level = 0
-link-args = ["/STACK:4194304"]
-
-[profile.test.build-override]
-opt-level = 0
-link-args = ["/STACK:4194304"]
+# 测试环境栈大小（延续 3fb5a50 的原始意图：为测试设 4MB 栈）
+#
+# 为什么不用 [profile.test] link-args：
+#   - `link-args` 不是合法的 cargo profile 键，cargo 静默忽略并告警
+#     「unused config key」，原来的 /STACK:4194304 从未生效；
+#   - 即使生效，链接器 /STACK 只作用于主线程，而 libtest 默认把每个测试
+#     派生到独立工作线程（test-threads > 1），主线程栈大小覆盖不到它们。
+#
+# RUST_MIN_STACK 是 libtest 测试线程栈大小的控制机制（std 对派生线程的
+# 默认栈也读取它）。cargo 的 [env] 段（stable 1.56+）将其注入 cargo 派生
+# 的进程环境；外部已显式设置同名变量时以外部值为准（默认不强制覆盖）。
+[env]
+RUST_MIN_STACK = "4194304"

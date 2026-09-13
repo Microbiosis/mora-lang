@@ -2,6 +2,32 @@
 
 All notable changes to Mora will be documented in this file.
 
+## [v0.101.1] — 2026-09-13 — build: 测试栈配置修复 — link-args 死键清除，RUST_MIN_STACK 真正生效
+
+3fb5a50 试图为测试 profile 配置 4MB 栈，但 `link-args` 不是合法的 cargo
+profile 键：cargo 静默忽略并在每次命令时告警「unused config key」，
+`/STACK:4194304` 从未生效。且即便生效也覆盖不到测试：链接器 `/STACK`
+只作用于主线程，而 libtest 默认把每个测试派生到独立工作线程
+（test-threads > 1）——测试实际运行在工作线程上，其栈大小不受主线程
+链接参数控制。
+
+### 变更
+
+- **删除 `[profile.test]` 全部死键**：`link-args` ×3（从未生效）+
+  `opt-level = 0` / `debug = true`（与 test profile 继承 dev 的默认值
+  完全相同，纯冗余）；
+- **新增 `[env] RUST_MIN_STACK = "4194304"`**：RUST_MIN_STACK 是 libtest
+  测试线程栈大小的控制机制（std 对派生线程的默认栈同样读取它），cargo
+  `[env]` 段（stable 1.56+）将其注入 cargo 派生的测试进程环境；外部已
+  显式设置同名变量时以外部值为准（默认不强制覆盖）；
+- **跨平台收益**：原 `/STACK` 写法是 MSVC 专属；RUST_MIN_STACK 在所有
+  平台生效。
+
+### 测试
+
+- `cargo test --lib`：906 passed / 0 failed / 13 ignored，cargo 配置告警消失；
+- `cargo clippy --all-targets --all-features -- -D warnings`：输出完全干净。
+
 ## [v0.101.0] — 2026-09-13 — feat: 容器名计数器数据流化 — 分类外 ambient 全局态清零
 
 v0.100 宣称内核归零后，对全仓 `static`/原子量做了一次穷举审计：其余

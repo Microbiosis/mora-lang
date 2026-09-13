@@ -2,6 +2,76 @@
 
 All notable changes to Mora will be documented in this file.
 
+## [v0.100.0] — 2026-09-13 — feat: DAG 缓存数据流化 — 内核全局状态机归零
+
+「用数据流代替状态机」的下一站：v0.99 收掉 random 全局状态机后，内核
+（执行管线自身）仅剩的两处隐藏可变状态一并清除 —— (1) `mir/cache.rs`
+的进程级 `static DAG_CACHE`（OnceLock + Mutex<HashMap> 防御式加锁，
+缓存的却是对同一 `Arc<MirFunction>` 确定的**纯函数**）；(2)
+`run_pregel_config` 经 `with_conflict_callback` 回调把冲突克隆进
+`Arc<Mutex<Vec<Conflict>>>` 捕获格的冗余侧信道（引擎 `self.conflicts`
+本就收集着同一份数据）。二者数据流化后，执行内核再无进程级全局可变
+状态 —— 残留锁全部位于豁免类：IO 边界（http/mcp/checkpoint/audit/
+event/sandbox 命名）、语言级显式可变原语（`Value::Atom` 等）。
+
+### 语义
+
+- **DAG 缓存单属主化**：`DagCache` 迁为 `Interpreter` 字段（纯
+  `HashMap`，无 Mutex），经新增 `MirHost::dag_cache` 访问器供
+  `run_mir_with_signal` 取用 —— 同一宿主实例跨调用命中；Clone 按值
+  复制（memo 透明：命中与否只影响耗时，不影响结果）—— Pregel worker
+  经 `clone_box` 克隆继承 master 预热条目后独立演化，并发从「共享一把
+  进程级锁」变成「值拷贝即隔离」（v0.95/0.99 同款模式）；
+- **不进 CoreRuntime**：缓存是执行管线的性能附件，不是语言核心态
+  （`random_state`/`gensym_counter` 类）—— 放 Interpreter 避免内核层
+  反向依赖 mir 执行层（跨层污染防线）；
+- **并行路径语义不变**：master 在 PREPARE 阶段经宿主自有缓存预构建
+  DAG，worker 拿到的仍是预构建 `Arc<MirDag>`；agent 体内嵌套闭包调用
+  命中 worker 自己的缓存副本；
+- **冲突捕获格删除**：`run_pregel_config` 在 `engine.run()` 后直接读
+  `engine.conflicts`（effect-as-data：冲突本就是引擎状态的一部分），
+  `Arc<Mutex<Vec<Conflict>>>` + 回调克隆侧信道整体移除；
+
+### Breaking
+
+- 删除 `mir::cache::DAG_CACHE` static 与 `global_dag_cache()`（无兼容
+  层，§6）；迁移点：`run_mir_with_signal`（改走 `MirHost::dag_cache`）、
+  pregel 顺序/并行两处 DAG 构建点、`tests/dag_integration.rs`（改独立
+  `DagCache` 实例）；
+- 删除 `MirConflictCallback` 类型别名、`PregelEngine::with_conflict_callback`
+  builder、`conflict_callback` 字段及 merge 处的回调 abort 分支 —— 唯一
+  用户即被删除的捕获格，callback 从未有非恒真返回值的使用；冲突仍经
+  pub 字段 `engine.conflicts` 暴露；
+- `DagCache::get_or_build` 签名 `&self` → `&mut self`（去 Mutex 后需要
+  插入权）；`run_mir_with_signal_cached` 注入参数同步改为 `&mut DagCache`；
+
+### 实现
+
+- `src/mir/cache.rs`：`DagCache` 去 Mutex 化（`#[derive(Clone)]` 纯
+  HashMap + `&mut self`），删 `DAG_CACHE` static / `global_dag_cache()`；
+  新增 `clone_inherits_and_diverges` 测试钉住「克隆继承预热条目 +
+  独立演化」语义；
+- `src/mir/host.rs`：`MirHost` 新增 `dag_cache` 访问器（同层引用
+  `mir::cache::DagCache`，无跨层依赖）；
+- `src/interpreter/mod.rs`：`Interpreter` 新增 `dag_cache` 字段（new/
+  Default 初始化、手动 Clone 按值复制、MirHost 实现）；
+- `src/mir/vm.rs`：`run_mir_with_signal` 直接经宿主缓存构建（不再委托
+  全局单例）；`run_mir_with_signal_cached` 保留为显式注入变体；
+- `src/pregel/mod.rs`：两处 `global_dag_cache()` 消费点切
+  `interpreter.dag_cache()`；`global_dag_cache_is_idempotent` 重写为
+  `host_dag_cache_is_idempotent`，新增 `host_dag_cache_survives_pregel_run`
+  （钉住 run 后宿主缓存已预热 + 同宿主跨调用命中）；
+- `src/mir/handlers/runtime.rs`：`run_pregel_config` 冲突暴露改为直读
+  引擎数据；
+- `docs/architecture-diagram.md`：`mir/cache.rs` 现状描述更新。
+
+### 测试
+
+- lib 911（+2：`clone_inherits_and_diverges`、`host_dag_cache_survives_pregel_run`；
+  `global_dag_cache_is_idempotent` 重写为 `host_dag_cache_is_idempotent`）
+  + 全部集成套件 0 失败 + clippy `--all-targets --all-features -D warnings`
+  清零。
+
 ## [v0.99.0] — 2026-09-13 — feat: random 全局状态机数据流化 — ambient effect 闭环
 
 「用数据流代替状态机」的下一站：v0.95 锁分类定案中唯一不在任何豁免类

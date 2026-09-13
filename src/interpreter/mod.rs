@@ -131,6 +131,14 @@ pub struct Interpreter {
     pub(crate) persist: crate::runtime::persist::PersistRuntime,
     /// v0.52 ADR-001: OrchRuntime facade — BC4 (plans + refine_registry + skill_registry)
     pub(crate) orch: crate::runtime::orch::OrchRuntime,
+    /// v1.00: 内核 DAG 缓存（宿主单属主纯值）。
+    /// `run_mir_with_signal` 经 `MirHost::dag_cache` 取用 —— 取代 v0.75.27 的
+    /// 进程级 `static DAG_CACHE`（OnceLock + Mutex）全局状态机。缓存的构建
+    /// 路径是对同一 `Arc<MirFunction>` 确定的纯函数，单属主 `&mut self`
+    /// 线性访问无锁；Clone 按值复制（memo 透明）—— Pregel worker 克隆继承
+    /// master 预热条目后独立演化。不属 CoreRuntime：它是执行管线的性能
+    /// 附件，不是语言核心态（random_state/gensym_counter 类）。
+    pub(crate) dag_cache: crate::mir::cache::DagCache,
 }
 
 // v0.75.x: 共享数据类型（AiConfigValue/LruCache/RouteConfig/TokenBudget/TokenUsage/
@@ -146,6 +154,8 @@ pub use crate::common::trait_info::{
 
 // v0.04: 显式实现 Clone 而非 derive
 // v0.52 ADR-001: Interpreter 已薄化为 7 个 facade holder，Clone 简化
+// v1.00: dag_cache 按值复制（memo 透明）—— Pregel worker 继承 master
+// 预热条目后独立演化，并发从「共享一把进程级锁」变成「值拷贝即隔离」。
 impl Clone for Interpreter {
     fn clone(&self) -> Self {
         Self {
@@ -156,6 +166,7 @@ impl Clone for Interpreter {
             sandbox: self.sandbox.clone(),
             persist: self.persist.clone(),
             orch: self.orch.clone(),
+            dag_cache: self.dag_cache.clone(),
         }
     }
 }
@@ -311,6 +322,10 @@ fn perform_effect(
         &mut self.registry.impl_table
     }
 
+    fn dag_cache(&mut self) -> &mut crate::mir::cache::DagCache {
+        &mut self.dag_cache
+    }
+
     fn clone_box(&self) -> Box<dyn crate::mir::host::MirHost + Send> {
         Box::new(self.clone())
     }
@@ -416,6 +431,7 @@ impl Interpreter {
             persist: crate::runtime::persist::PersistRuntime::default(),
             sandbox: crate::runtime::sandbox::SandboxRuntime::default(),
             registry: crate::runtime::registry::RegistryRuntime::default(),
+            dag_cache: crate::mir::cache::DagCache::new(),
         }
     }
 
@@ -433,6 +449,7 @@ impl Interpreter {
             persist: crate::runtime::persist::PersistRuntime::default(),
             sandbox: crate::runtime::sandbox::SandboxRuntime::default(),
             registry: crate::runtime::registry::RegistryRuntime::default(),
+            dag_cache: crate::mir::cache::DagCache::new(),
         }
     }
 

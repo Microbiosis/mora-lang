@@ -51,8 +51,8 @@ pub fn build_task_registry(body: &[MirInst]) -> HashMap<&str, (&[String], &MirFu
 /// 与 `run_dag` 共享同一套 handler 函数。等价于:
 ///   dag_analyze(func) → add_sequential_edges() → run_dag()
 ///
-/// v0.75.9: 接收 `&Arc<MirFunction>` — 优化后 DAG 走全局缓存
-/// （`cache::DAG_CACHE`，key = Arc 指针），同 Arc 跨调用复用。
+/// v0.75.9: 接收 `&Arc<MirFunction>` — 优化后 DAG 走宿主内核缓存
+/// （`MirHost::dag_cache`，key = Arc 指针），同 Arc 跨调用复用。
 pub fn run_mir(
     func: &Arc<MirFunction>,
     interp: &mut dyn MirHost,
@@ -370,28 +370,32 @@ pub enum MirSignal {
 /// （vote_to_halt）信号，导致 Pregel 引擎的 vertex_state 永远无法置为
 /// Halted。现在通过 `run_dag_with_signal` 真正传播 Return/Halt。
 ///
-/// v0.75.9: 接收 `&Arc<MirFunction>`，优化后 DAG 走全局缓存
-/// （`cache::global_dag_cache().get_or_build`），同一 Arc 跨调用复用，
+/// v0.75.9: 接收 `&Arc<MirFunction>`，优化后 DAG 走宿主内核缓存
+/// （`MirHost::dag_cache`，key = Arc 指针），同一 Arc 跨调用复用，
 /// 不再每次 `dag_analyze + dag_optimize + prune_sequence_edges` 全量重建。
 ///
-/// v0.75.27: 委托给 `run_mir_with_signal_cached`（全局缓存为默认注入）。
+/// v1.00: 缓存从进程级 `static DAG_CACHE` 全局状态机迁为宿主单属主纯值
+/// —— 同一解释器实例跨调用命中；Pregel worker 克隆继承 master 预热
+/// 条目后独立演化。
 pub fn run_mir_with_signal(
     func: &Arc<MirFunction>,
     interp: &mut dyn MirHost,
     env: &mut Environment,
     effects: &mut crate::mir::effect::Effects,
 ) -> Result<(MirSignal, Value), String> {
-    run_mir_with_signal_cached(func, interp, env, cache::global_dag_cache(), effects)
+    let dag = interp.dag_cache().get_or_build(func);
+    crate::mir::vm::run_dag_with_signal(&dag, func, interp, env, effects)
 }
 
 /// v0.75.27: 可注入缓存变体 — 测试/多租户可传独立 `DagCache` 实例隔离
-/// 缓存状态（全局 OnceLock 解耦的注入点）。行为与 `run_mir_with_signal`
-/// 完全一致，仅缓存来源不同。
+/// 缓存状态。行为与 `run_mir_with_signal` 完全一致，仅缓存来源不同
+/// （显式参数 vs 宿主自有）。缓存为宿主单属主纯值后无锁，签名收
+/// `&mut DagCache`（get_or_build 需要插入条目）。
 pub fn run_mir_with_signal_cached(
     func: &Arc<MirFunction>,
     interp: &mut dyn MirHost,
     env: &mut Environment,
-    dag_cache: &cache::DagCache,
+    dag_cache: &mut cache::DagCache,
     effects: &mut crate::mir::effect::Effects,
 ) -> Result<(MirSignal, Value), String> {
     let dag = dag_cache.get_or_build(func);

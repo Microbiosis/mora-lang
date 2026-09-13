@@ -67,7 +67,7 @@ fn memo_incremental_reruns_affected_dependencies_only() {
     // 本例：b 链依赖外部 a；c/d 链独立。改 env 的 a 后第二次 run 应只重算
     // b 链、跳过 d 链的纯节点。
     use mora::mir::MirFunction;
-    use mora::mir::cache::global_dag_cache;
+    use mora::mir::cache::DagCache;
     use mora::mir::vm::{DagExecMemo, run_dag_with_signal_memo};
     use mora::value::Value;
     use std::sync::Arc;
@@ -75,7 +75,9 @@ fn memo_incremental_reruns_affected_dependencies_only() {
     let src = "print(a)\nlet b = a + 1\nprint(b)\nlet c = 5\nlet d = c + 1\nprint(d)";
     let (func_raw, _witnesses) = ParserV3::compile(src).expect("compile");
     let func: Arc<MirFunction> = Arc::new(func_raw);
-    let dag = global_dag_cache().get_or_build(&func);
+    // v1.00: 全局缓存已数据流化 —— 本测试关注 memo 行为，用独立缓存实例。
+    let mut cache = DagCache::new();
+    let dag = cache.get_or_build(&func);
     let mut memo = DagExecMemo::new();
 
     let mut interp = Interpreter::new();

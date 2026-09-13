@@ -41,10 +41,6 @@ pub mod reducers;
 /// Interrupt 回调签名
 pub type MirInterruptCallback = Arc<dyn Fn(&str, MirInterruptWhen) -> bool>;
 
-/// v0.62: Conflict callback — invoked for each detected write-write conflict.
-/// Return `true` to continue the BSP run, `false` to abort.
-pub type MirConflictCallback = Arc<dyn Fn(&Conflict) -> bool>;
-
 /// v0.75.8: 并行 EXEC 的 PREPARE 产物 — (node, task_body, 缓存 dag, 私有 env,
 /// 本次 input)。v0.75.6 起携带缓存 dag，v0.75.8 增加 input_str 供增量缓存。
 type PreparedJob = (
@@ -88,8 +84,6 @@ pub struct MirPregelEngine {
     max_steps: usize,
     interrupt_before: Option<MirInterruptCallback>,
     interrupt_after: Option<MirInterruptCallback>,
-    /// v0.62: Invoked for each write-write conflict detected during merge.
-    conflict_callback: Option<MirConflictCallback>,
     /// v0.63: Current super-step (for checkpoint/restore).
     pub current_step: usize,
     /// v0.64: Optional checkpoint persistence backend.
@@ -296,7 +290,6 @@ impl MirPregelEngine {
             max_steps: 1000,
             interrupt_before: None,
             interrupt_after: None,
-            conflict_callback: None,
             current_step: 0,
             vertex_state: HashMap::new(),
             aggregator_acc: HashMap::new(),
@@ -350,13 +343,6 @@ impl MirPregelEngine {
 
     pub fn with_interrupt_after_callback(mut self, cb: MirInterruptCallback) -> Self {
         self.interrupt_after = Some(cb);
-        self
-    }
-
-    /// v0.62: Set a callback invoked for each detected write-write conflict.
-    /// Return `true` to continue, `false` to abort the BSP run.
-    pub fn with_conflict_callback(mut self, cb: MirConflictCallback) -> Self {
-        self.conflict_callback = Some(cb);
         self
     }
 
@@ -488,19 +474,9 @@ impl MirPregelEngine {
             &strategies,
             &MergeStrategy::LastWriteWins,
         );
-        if !conflicts.is_empty() {
-            if let Some(cb) = &self.conflict_callback {
-                for conflict in &conflicts {
-                    if !cb(conflict) {
-                        return Err(format!(
-                            "Pregel: conflict callback aborted at key '{}' (node '{}')",
-                            conflict.key, node_name
-                        ));
-                    }
-                }
-            }
-            self.conflicts.extend(conflicts);
-        }
+        // v1.00: 冲突直接以数据入引擎状态（run_pregel_config 在 run 后
+        // 读取暴露）—— 原 conflict_callback abort 侧信道已删除。
+        self.conflicts.extend(conflicts);
 
         // result → result channel
         let result_str = outcome.result.to_string();
@@ -955,7 +931,7 @@ impl MirPregelEngine {
                             ));
                         }
                         // v0.75.6: 克隆 task_body 解除对 self.config 的借用
-                        // v0.75.10: 稳定 Arc（engine 生命周期保持）— 全局
+                        // v0.75.10: 稳定 Arc（engine 生命周期保持）— 宿主
                         // DAG 缓存（key = Arc 指针）跨超步真正命中（修复
                         // v0.75.9 每超步新建 Arc 的缓存失效）；同 Arc 锚定
                         // 寄存器级增量 memo 记录。
@@ -964,10 +940,11 @@ impl MirPregelEngine {
 
                         self.stats.agents_run += 1;
 
-                        // v0.75.9: 全局 DAG 缓存（mir::cache）— 取代引擎
-                        // 本地 agent_dag_cache，Closure/Task/REPL 共用
+                        // v1.00: 宿主单属主 DAG 缓存（MirHost::dag_cache）
+                        // — 取代 v0.75.9 的进程级全局缓存；Closure/Task/
+                        // REPL 各自经宿主实例命中，跨超步复用同引擎宿主。
                         // v0.75.7: 计时 per-agent 耗时（FPGA 调度可观测性）
-                        let dag = crate::mir::cache::global_dag_cache().get_or_build(&task_body);
+                        let dag = interpreter.dag_cache().get_or_build(&task_body);
                         let started = std::time::Instant::now();
                         // v0.75.10: 寄存器级增量执行 — 纯节点输入与上次
                         // 相等则跳过；副作用/env 读取节点永远重跑。
@@ -1060,10 +1037,12 @@ impl MirPregelEngine {
 
                         self.stats.agents_run += 1;
                         // v0.75.6: 克隆 task_body 解除借用
-                        // v0.75.10: 稳定 Arc（engine 生命周期保持）— 全局
+                        // v0.75.10: 稳定 Arc（engine 生命周期保持）— 宿主
                         // DAG 缓存跨超步命中（修复 v0.75.9 缓存失效）。
+                        // v1.00: master 侧预热宿主自有缓存；worker 克隆
+                        // （clone_box 按值复制缓存）继承条目后独立演化。
                         let task_body = self.stable_task_arc(node_name);
-                        let dag = crate::mir::cache::global_dag_cache().get_or_build(&task_body);
+                        let dag = interpreter.dag_cache().get_or_build(&task_body);
                         prepared.push((node_name.clone(), task_body, dag, env, input_str));
                     }
 
@@ -2246,20 +2225,54 @@ mod tests {
         );
     }
 
-    // ─── v0.75.9: 全局 DAG 缓存（取代引擎本地 agent_dag_cache）──────────
+    // ─── v1.00: 宿主单属主 DAG 缓存（取代 v0.75.9 进程级全局缓存）──────
 
     #[test]
-    fn global_dag_cache_is_idempotent() {
+    fn host_dag_cache_is_idempotent() {
         // 同一 task_body 的 Arc 两次缓存调用返回同一个 Arc（缓存命中）。
-        // 全局缓存 = mir::cache::DAG_CACHE，pregel/Closure/REPL 共用。
+        // 缓存 = 宿主自有 MirHost::dag_cache —— pregel/Closure/REPL 各自
+        // 经宿主实例命中，同宿主跨超步复用。
         let agent = make_const_agent("a", 7);
         let body = std::sync::Arc::new(agent.task_body);
-        let cache = crate::mir::cache::DagCache::new();
+        let mut cache = crate::mir::cache::DagCache::new();
         let d1 = cache.get_or_build(&body);
         let d2 = cache.get_or_build(&body);
         assert!(std::sync::Arc::ptr_eq(&d1, &d2), "重复调用应命中缓存");
         assert_eq!(d1.nodes.len(), d2.nodes.len());
         assert_eq!(d1.edges.len(), d2.edges.len());
+    }
+
+    #[test]
+    fn host_dag_cache_survives_pregel_run() {
+        // v1.00: 引擎 run 复用传入宿主的自有缓存 —— 顺序路径经
+        // MirHost::dag_cache 命中宿主实例（同 Arc 指针必然同 DAG），
+        // 不再有进程级全局状态参与。
+        let agent = make_const_agent("a", 7);
+        let body = std::sync::Arc::new(agent.task_body.clone());
+        let config = MirPregelConfig {
+            agents: vec![agent],
+            edges: vec![MirEdgeDef {
+                from: "@start".to_string(),
+                to: "a".to_string(),
+                condition_expr: None,
+                condition_body: None,
+            }],
+            state_schema: vec![],
+            checkpoint: None,
+            interrupt_points: vec![],
+            adjacency: HashMap::new(),
+            aggregators: Vec::new(),
+            master_compute: None,
+        };
+        let mut engine = MirPregelEngine::new(config);
+        let mut interp = crate::interpreter::Interpreter::new();
+        engine.run(&mut interp).unwrap();
+        let cached_len = interp.dag_cache().len();
+        assert!(cached_len >= 1, "run 后宿主缓存应已预热: {cached_len}");
+
+        let d1 = interp.dag_cache().get_or_build(&body);
+        let d2 = interp.dag_cache().get_or_build(&body);
+        assert!(std::sync::Arc::ptr_eq(&d1, &d2), "同宿主应命中缓存");
     }
 
     #[test]

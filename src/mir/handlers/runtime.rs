@@ -753,15 +753,6 @@ fn run_pregel_config(
         engine.init_channels(initial);
     }
 
-    // v0.62: Collect conflicts via callback for exposure in result
-    let captured: std::sync::Arc<parking_lot::Mutex<Vec<crate::value::Conflict>>> =
-        std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
-    let cb_captured = captured.clone();
-    engine = engine.with_conflict_callback(std::sync::Arc::new(move |c| {
-        cb_captured.lock().push(c.clone());
-        true // always continue
-    }));
-
     // v0.93: 调用方在 orchestrate 语句之前累积的 send 先注入引擎
     // （跨超步投递）。aggregator 贡献是 per-super-step 作用域 —— 引擎 run()
     // 每个超步开始都会把 acc 重置为 config 初值，故启动前的贡献无归属超步，
@@ -773,9 +764,13 @@ fn run_pregel_config(
     // 本身不再向调用方传播 BSP 内部效应（send/aggregate 是引擎内部原语）。
     let result = engine.run(interp)?;
 
-    // v0.62: Expose conflicts as a structured list
-    let conflict_list: Vec<Value> = captured
-        .lock()
+    // v0.62: Expose conflicts as a structured list.
+    // v1.00: 直接读引擎自有 `conflicts` 数据（run 过程中已收集完毕）——
+    // 取代此前经 `with_conflict_callback` 回调把冲突克隆进
+    // `Arc<Mutex<Vec<Conflict>>>` 捕获格的冗余侧信道（effect-as-data：
+    // 冲突本来就是引擎状态的一部分，无需第二个可变容器）。
+    let conflict_list: Vec<Value> = engine
+        .conflicts
         .iter()
         .map(|c| {
             let mut d: HashMap<String, Value> = HashMap::new();

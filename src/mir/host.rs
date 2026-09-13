@@ -83,6 +83,12 @@ pub trait MirHost {
     fn trait_registry(&mut self) -> &mut Arc<HashMap<String, TraitInfo>>;
     /// impl 表（`h_impl_def` 用 `Arc::make_mut` 写入）。
     fn impl_table(&mut self) -> &mut Arc<HashMap<String, Vec<String>>>;
+    /// 内核 DAG 缓存（宿主单属主纯值，v1.00）。
+    /// `run_mir_with_signal` 从宿主取缓存构建优化 DAG —— 取代 v0.75.27 的
+    /// 进程级 `static DAG_CACHE` 状态机（OnceLock + Mutex 防御式加锁）。
+    /// 缓存是对同一 `Arc<MirFunction>` 确定的纯函数的 memo，单属主
+    /// `&mut self` 线性访问无锁；宿主克隆按值复制缓存（memo 透明）。
+    fn dag_cache(&mut self) -> &mut crate::mir::cache::DagCache;
     /// 克隆宿主（Pregel 并行 worker 需要每 worker 一份独立宿主状态）。
     /// object-safe：返回 `Box<dyn MirHost + Send>`，让 `dyn MirHost` 也能被
     /// 复制进 worker 线程（`Interpreter` 实现 = `self.clone()`）。

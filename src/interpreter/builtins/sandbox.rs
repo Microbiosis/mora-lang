@@ -282,7 +282,10 @@ impl Interpreter {
                     .map_err(|e| format!("sandbox.containerize: {}", e))?;
 
                 // **REAL spawn** — 真的调用 docker run
-                let handle = crate::sandbox::spawn_container(&spec)
+                // v0.101: 容器名由本实例的计数器生成（数据流），
+                // spawn 是 (spec, name) → handle 的纯转换。
+                let name = self.sandbox.next_container_name();
+                let handle = crate::sandbox::spawn_container(&spec, &name)
                     .map_err(|e| format!("sandbox.containerize: {}", e))?;
 
                 // 用 container_id 的 hash 做成 Number 返回 (handle 存到 Interpreter)

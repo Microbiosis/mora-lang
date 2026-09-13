@@ -2,6 +2,41 @@
 
 All notable changes to Mora will be documented in this file.
 
+## [v0.101.0] — 2026-09-13 — feat: 容器名计数器数据流化 — 分类外 ambient 全局态清零
+
+v0.100 宣称内核归零后，对全仓 `static`/原子量做了一次穷举审计：其余
+原子量均为实例字段（ccr/schedule 计数器）或并发协调原语（exec permits/
+next_idx），仅剩 `sandbox/container.rs` 的进程级
+`static CONTAINER_COUNTER: AtomicU64` 不在 v0.95 锁分类三类豁免之内 ——
+它是自由函数 `generate_container_name()` 隐式读取的 ambient 可变状态，
+与 v0.99 消灭的 `static Mutex<Xoshiro256>` random 全局状态机同形。
+
+### 语义
+
+- **计数器归实例所有**：`SandboxRuntime` 新增
+  `container_name_counter: Arc<AtomicU64>` 字段与 `next_container_name(&self)`
+  方法 —— 计数器是有意跨克隆共享的实例状态（锁分类第 2 类）：Interpreter
+  clone 出的 worker 与母体共用同一计数序列，同进程内容器名唯一性与旧
+  全局计数器**等价**；独立 SandboxRuntime 实例各自持独立计数（值语义隔离）；
+- **`generate_container_name` 纯化**：改为 `(nanos, counter)` 显式入参的
+  纯格式化函数 —— 同输入恒同名，无任何隐藏全局读取；
+- **`spawn_container` 数据流化**：容器名改为显式入参，函数签名变为
+  `(spec, name) → handle` 纯转换，不再在 IO 路径中段隐式依赖全局状态；
+- **内建接入**：`sandbox.containerize` 经 `self.sandbox.next_container_name()`
+  生成名字后显式传入 spawn —— 名字生成（实例状态）与容器创建（IO 纯转换）
+  职责分离；
+- 名字格式不变（`mora-{nanos:x}-{counter:x}`），无对外破坏性变更。
+
+### 测试
+
+- `generate_container_name_is_pure_and_collision_free`（纯函数语义 +
+  counter 承载唯一性）取代原时序依赖的 `generate_container_name_is_unique`；
+- 新增 `container_name_counter_shared_across_clone`（克隆共享计数序列）、
+  `container_name_counter_independent_across_instances`（独立实例值隔离）、
+  `container_name_unique_under_concurrency`（8 线程共享实例 80 名唯一）；
+- `stress_container_name_unique`（100 线程 × 10 名 = 1000 全唯一）改经
+  共享 `SandboxRuntime` 验证同一保证。
+
 ## [v0.100.0] — 2026-09-13 — feat: DAG 缓存数据流化 — 内核全局状态机归零
 
 「用数据流代替状态机」的下一站：v0.99 收掉 random 全局状态机后，内核

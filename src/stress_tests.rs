@@ -314,20 +314,23 @@ mod tests {
     }
 
     /// v0.49.0 (B2+B3): container name collision under concurrency.
-    /// 100 concurrent generate_container_name() must yield unique names.
+    /// v0.101 数据流化：100 个线程共享同一个 SandboxRuntime 实例（跨克隆
+    /// 共享计数器，锁分类第 2 类），仍必须产出全唯一名字。
     #[test]
     fn stress_container_name_unique() {
-        use crate::sandbox::container::generate_container_name;
+        use crate::runtime::sandbox::SandboxRuntime;
         use std::collections::HashSet;
 
+        let sb = Arc::new(SandboxRuntime::default());
         let mut handles = vec![];
         let _barrier = Arc::new(std::sync::Barrier::new(100));
         for _ in 0..100 {
             let barrier = _barrier.clone();
+            let sb = sb.clone();
             handles.push(std::thread::spawn(move || {
                 barrier.wait();
                 (0..10)
-                    .map(|_| generate_container_name())
+                    .map(|_| sb.next_container_name())
                     .collect::<Vec<_>>()
             }));
         }

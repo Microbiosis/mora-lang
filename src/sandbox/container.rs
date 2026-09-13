@@ -345,25 +345,20 @@ impl ContainerHandle {
     }
 }
 
-/// v0.49.0 (B3): global AtomicU64 counter for guaranteed unique container names.
-/// `mora-{counter:012}` (12-digit zero-padded, max ~10^12 spawns before wrap).
-/// `fetch_add(1, Relaxed)` 在多线程下保证唯一, 即使 nanos 重复也没事.
-static CONTAINER_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
+/// v0.101 数据流化：纯名字格式化函数 —— `(nanos, counter)` 显式入参，
+/// 无任何进程级全局状态。计数器归 [`crate::runtime::sandbox::SandboxRuntime`]
+/// 实例所有（有意跨克隆共享，锁分类第 2 类），本函数只做数据 → 名字映射。
+///
 /// v0.44.0: `docker run` 生成 container_name = "mora-<nanos>-<counter>"
 /// v0.49.0 (B3): 加 counter 后缀, 保证高并发下唯一 (nanos 可能相同, counter 不会)
-pub fn generate_container_name() -> String {
-    use std::sync::atomic::Ordering;
-    let nanos: u64 = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0);
-    let counter = CONTAINER_COUNTER.fetch_add(1, Ordering::Relaxed);
+pub fn generate_container_name(nanos: u64, counter: u64) -> String {
     format!("mora-{:x}-{:x}", nanos, counter)
 }
 
 /// v0.44.0: 真实 spawn docker container
-pub fn spawn_container(spec: &ContainerSpec) -> Result<ContainerHandle, String> {
+/// v0.101: 容器名由调用方显式传入（数据流）—— 本函数是 (spec, name) → handle
+/// 的纯转换，不再隐式读取进程级全局计数器。
+pub fn spawn_container(spec: &ContainerSpec, name: &str) -> Result<ContainerHandle, String> {
     spec.validate()?;
 
     if !spec.backend.is_implemented_v044() {
@@ -390,8 +385,7 @@ pub fn spawn_container(spec: &ContainerSpec) -> Result<ContainerHandle, String> 
         ));
     }
 
-    let name = generate_container_name();
-    let args = spec.to_docker_run_args(&name);
+    let args = spec.to_docker_run_args(name);
 
     let output = Command::new("docker")
         .args(&args)
@@ -412,7 +406,11 @@ pub fn spawn_container(spec: &ContainerSpec) -> Result<ContainerHandle, String> 
         return Err("docker run returned empty container ID".to_string());
     }
 
-    Ok(ContainerHandle::new(container_id, name, spec.clone()))
+    Ok(ContainerHandle::new(
+        container_id,
+        name.to_string(),
+        spec.clone(),
+    ))
 }
 
 /// v0.49.0 (B2): timeout helper, kill process group on docker exec timeout.
@@ -537,21 +535,26 @@ mod tests {
         assert!(args.contains(&"infinity".to_string()));
     }
 
+    /// v0.101: 纯函数语义 —— 同一 (nanos, counter) 输入恒产生同名；
+    /// 不同 counter 输入必然异名（同名冲突只可能来自 nanos+counter 全同）。
     #[test]
-    fn generate_container_name_is_unique() {
-        let n1 = generate_container_name();
-        std::thread::sleep(std::time::Duration::from_millis(2));
-        let n2 = generate_container_name();
+    fn generate_container_name_is_pure_and_collision_free() {
+        let n1 = generate_container_name(1_700_000_000_000, 0);
+        let n2 = generate_container_name(1_700_000_000_000, 1);
+        let n1_again = generate_container_name(1_700_000_000_000, 0);
+        assert_eq!(n1, n1_again, "pure function: same input, same name");
         assert_ne!(n1, n2);
         assert!(n1.starts_with("mora-"));
         assert!(n2.starts_with("mora-"));
+        // counter 是唯一性的承载者：同 nanos 不同 counter 必然可分辨
+        assert_ne!(n1, generate_container_name(1_700_000_000_000, 2));
     }
 
     #[test]
     fn unimplemented_backends_return_error() {
         let mut spec = ContainerSpec::new(ContainerBackend::Gondolin);
         spec.image = "alpine:latest".to_string();
-        let err = spawn_container(&spec).unwrap_err();
+        let err = spawn_container(&spec, "mora-test").unwrap_err();
         assert!(err.contains("not yet implemented"));
     }
 
@@ -561,7 +564,14 @@ mod tests {
     #[ignore]
     fn real_docker_spawn_and_destroy() {
         let spec = ContainerSpec::new(ContainerBackend::Docker);
-        let handle = spawn_container(&spec).expect("spawn must succeed");
+        let name = generate_container_name(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos() as u64)
+                .unwrap_or(0),
+            0,
+        );
+        let handle = spawn_container(&spec, &name).expect("spawn must succeed");
         assert!(!handle.container_id.is_empty());
         assert!(
             handle.container_id.len() >= 12,

@@ -27,6 +27,10 @@
 //!    （worker 线程共享 AI 响应缓存，拆锁会增加真实 API 调用）、ccr、mock、
 //!    sandbox/toolplane、trace_collector（跨 worker 用量聚合）、capability。
 //!    它们的 mutator 是 `&self` + 锁 —— 这是设计，不是待修。
+//!    v0.101: sandbox 的容器名计数器同属此类 —— v0.49 的进程级
+//!    `static CONTAINER_COUNTER: AtomicU64` 收编为
+//!    `SandboxRuntime.container_name_counter: Arc<AtomicU64>`（实例所有、
+//!    跨克隆共享），`spawn_container` 改为名字显式入参的纯转换。
 //! 3. **真跨线程协调**：pregel worker_pool 的任务队列/共享接收端、
 //!    scheduler 的定时器状态。锁即协调原语。
 //!

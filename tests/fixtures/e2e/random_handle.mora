@@ -1,0 +1,23 @@
+-- v0.99: random ambient effect 化 —— 确定性 + 用户 handler 覆写
+-- ambient 状态是运行时单属主纯值：seed 后序列确定性复现
+task main()
+  random.seed(42)
+  let a = random.random()
+  let b = random.random()
+
+  -- handle 覆写：perform 路由到用户 handler，ambient 状态不被消耗
+  let x = 0.0
+  handle random_random {
+    x = random.random()
+  } {
+    0.5
+  }
+
+  -- 覆写结束后 ambient 状态仍在场（multi-shot + restore 语义）
+  let c = random.random()
+
+  print(a)
+  print(b)
+  print(x)
+  print(c)
+end

@@ -29,6 +29,10 @@ impl Interpreter {
         match object {
             Value::List(list) => self.call_method_list(list, method, args, effects),
             Value::Dict(map) => self.call_method_dict(map, method, args, effects),
+            // v0.99: random.* 方法调用 = ambient effect perform（原进程级
+            // 全局 Mutex 状态机数据流化；状态在 CoreRuntime.random_state，
+            // 类型层效果行 + 签名见 typeck 的 ambient 预置）。
+            Value::Builtin(BuiltinKind::Random) => self.call_random_ambient(method, args, effects),
             Value::Builtin(kind) => self.call_method_builtin(kind, method, args),
             Value::Conversation { .. } => self.call_method_conversation(object, method, args),
             Value::String(s) => self.call_method_string(s, method, args),
@@ -45,6 +49,31 @@ impl Interpreter {
             Value::Float(n) => super::numeric_helpers::call_method_numeric(&Value::Float(n), method, &args, false),
             Value::BigInt(n) => super::numeric_helpers::call_method_bigint(&Value::BigInt(n), method, &args),
             _ => Err("Can only call methods on lists, dicts, strings, conversations, streams, agents, routers, mcp_servers, documents, or builtin objects".to_string()),
+        }
+    }
+
+    /// v0.99: `random.*` 方法调用 → ambient effect perform。
+    ///
+    /// 方法名映射为 ambient 标签（`crate::mir::effect::ambient`，与 typeck
+    /// 的效果行标签/签名预置同源），运行时查找顺序：用户 handle 注册表 →
+    /// `CoreRuntime.random_state` 兜底。旧 `call_random_method`（进程级
+    /// 全局 Mutex 状态）已删除 —— 状态单属主化后本方法只是标签翻译层。
+    fn call_random_ambient(
+        &mut self,
+        method: &str,
+        args: Vec<Value>,
+        effects: &mut crate::mir::effect::Effects,
+    ) -> Result<Value, String> {
+        let label = match crate::mir::effect::ambient::random_label_for_method(method) {
+            Some(l) => l,
+            None => return Err(format!("random.{}: unknown method", method)),
+        };
+        match crate::mir::host::MirHost::perform_effect(self, label, args, effects) {
+            Some(v) => Ok(v),
+            None => Err(format!(
+                "unhandled effect: {} (ambient random state missing — runtime invariant violated)",
+                label
+            )),
         }
     }
 
@@ -579,9 +608,8 @@ impl Interpreter {
             (BuiltinKind::Linalg, _) => {
                 crate::interpreter::builtins::linalg::call_linalg_method(method, &args)
             }
-            (BuiltinKind::Random, _) => {
-                crate::interpreter::builtins::random::call_random_method(method, &args)
-            }
+            // v0.99: BuiltinKind::Random 不再走本表 —— call_method 在进入
+            // 前已拦截并转 ambient effect perform（call_random_ambient）。
             _ => Err(format!("Unknown method: {:?}.{}", kind, method)),
         }
     }

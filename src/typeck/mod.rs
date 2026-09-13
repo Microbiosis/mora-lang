@@ -85,6 +85,10 @@ pub enum Type {
     AiError,
     /// v0.06: AI 模块类型（`ai` 内建变量的接收者类型）
     AiModule,
+    /// v0.99: random 模块类型（`random` 内建变量的接收者类型）。
+    /// 模块方法调用 = ambient effect perform —— 每操作一个标签
+    /// （`crate::mir::effect::ambient`）+ 预置签名，效果行随调用传播。
+    RandomModule,
     /// v0.06.2: 类型化错误处理 Result<T, E>
     Result_(Box<Type>, Box<Type>),
     /// v0.83: 元组类型 — `(Model, Cmd)` 等。strong tuple typeck 支持 update 返回。
@@ -196,6 +200,7 @@ impl Type {
             Type::AiResult => "ai_result".to_string(),
             Type::AiError => "ai_error".to_string(),
             Type::AiModule => "ai".to_string(),
+            Type::RandomModule => "random".to_string(),
             Type::Result_(ok, err) => format!("result<{}, {}>", ok.name(), err.name()),
             // v0.83: Tuple 类型
             Type::Tuple(types) => {

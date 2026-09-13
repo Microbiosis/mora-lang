@@ -263,9 +263,13 @@ impl HMInference {
             None => match name {
                 "ai" => Ok(Type::AiModule),
                 "agent" => Ok(Type::Agent),
-                // v0.91: 数学 builtin 模块对象（math/stats/linalg/random）
+                // v0.91: 数学 builtin 模块对象（math/stats/linalg）
                 // — 视为 Any 类型，方法分派走 dispatch.rs::call_method_builtin
-                "math" | "stats" | "linalg" | "random" => Ok(Type::Any),
+                "math" | "stats" | "linalg" => Ok(Type::Any),
+                // v0.99: random 模块 — 方法调用 = ambient effect perform。
+                // 精确分型（每操作标签 + 预置签名 + 效果行）在
+                // infer_method_call 的 RandomModule 分支。
+                "random" => Ok(Type::RandomModule),
                 n if crate::flow::is_builtin_object(n) => Ok(Type::Unknown),
                 _ => Err(vec![TypeError::UnboundVariable {
                     name: name.to_string(),
@@ -485,12 +489,27 @@ impl HMInference {
                 Box::new(fresh_ret.clone()),
                 fresh_eff.clone(),
             );
+            // v0.99: 被调体行以**值**并入调用行（被调箭头的行是具体行时
+            // 直接并）；行仍是 Var（未知被调）才保持 RowEq 推迟。旧行为
+            // 无条件 `RowEq(fresh_eff, acc_row)` —— solve 时 fresh_eff 已被
+            // 上面的 Eq 绑定到被调体的行，等式于是把「被调体行」与「实参行」
+            // 强行画等号，纯被调 + 内联 effectful 实参被误拒
+            // （`print(random.rand_int(1, 10))` 报 expected pure）。
+            let known_callee_row = match &callee_ty {
+                Type::Arrow(_, _, row) if !matches!(row, crate::mir::effect::EffectRow::Var(_)) => {
+                    Some(row.clone())
+                }
+                _ => None,
+            };
             self.constraints.push(Constraint::Eq(
                 Box::new(callee_ty.clone()),
                 Box::new(expected),
             ));
             callee_ty = fresh_ret;
-            acc_row = self.merge_rows(acc_row, fresh_eff);
+            acc_row = match known_callee_row {
+                Some(row) => self.merge_rows(acc_row, row),
+                None => self.merge_rows(acc_row, fresh_eff),
+            };
         }
         Ok((callee_ty, acc_row))
     }
@@ -521,6 +540,12 @@ impl HMInference {
             let (t, r) = self.infer_expr(a)?;
             arg_types.push(t);
             acc_row = self.merge_rows(acc_row, r);
+        }
+
+        // v0.99: random 模块 —— ambient effect 分型（每操作一个标签 +
+        // 预置签名：arity/逐参类型约束、结果静态化、效果行并入标签）。
+        if matches!(recv_ty, Type::RandomModule) {
+            return self.infer_random_method(method, arg_types, acc_row, span);
         }
 
         // v0.55: enforce arity from the dispatch table. The signature
@@ -555,6 +580,68 @@ impl HMInference {
         let _span = span;
         let _ = _span;
         Ok((return_ty, acc_row))
+    }
+
+    /// v0.99: `random.<method>(...)` 的 ambient effect 分型。
+    ///
+    /// 每个操作一个 ambient 标签（`crate::mir::effect::ambient`），签名由
+    /// `infer_program` 入口 `seed_ambient_effect_signatures` 预置进
+    /// `effect_signatures` —— 实参数量与逐参类型按签名约束，结果类型
+    /// 静态化（此前 `random.*` 一律 `Any`，副作用对类型系统不可见），
+    /// 效果行并入标签随调用传播（v0.96/0.97 机制接手：handle 吸收、
+    /// 跨函数传播、根边界断言放行 ambient）。
+    fn infer_random_method(
+        &mut self,
+        method: &str,
+        arg_types: Vec<Type>,
+        mut row: crate::mir::effect::EffectRow,
+        span: Span,
+    ) -> Result<(Type, crate::mir::effect::EffectRow), Vec<TypeError>> {
+        let label = match crate::mir::effect::ambient::random_label_for_method(method) {
+            Some(l) => l,
+            None => {
+                return Err(vec![TypeError::UnificationFailure {
+                    expected: "known random method: random/rand_int/rand_float/rand_choice/seed/shuffle"
+                        .to_string(),
+                    got: format!("random.{}", method),
+                    span: Some(span),
+                }])
+            }
+        };
+        let result_ty = match self.effect_signatures.get(label) {
+            Some(sig) => {
+                if sig.params.len() != arg_types.len() {
+                    return Err(vec![TypeError::ArityMismatch {
+                        expected: sig.params.len(),
+                        actual: arg_types.len(),
+                        span,
+                    }]);
+                }
+                // 与 infer_perform 同机制：compatible_with 校验（携带 span，
+                // 错误定位到调用点）而非延迟 Eq 约束 —— Int<:Float 数字塔、
+                // Any/TypeVar 宽容均由 compatible_with 统一处理。
+                for (i, (a_ty, p_ty)) in arg_types.iter().zip(sig.params.iter()).enumerate() {
+                    if !a_ty.compatible_with(p_ty) {
+                        return Err(vec![TypeError::UnificationFailure {
+                            expected: format!("random.{} arg {} : {}", method, i, p_ty.name()),
+                            got: a_ty.name(),
+                            span: Some(span),
+                        }]);
+                    }
+                }
+                sig.result.clone()
+            }
+            // 签名缺失理论上不可达（ambient 预置先于推断）；保守 Any。
+            None => Type::Any,
+        };
+        row = self.merge_rows(
+            row,
+            crate::mir::effect::EffectRow::Cons(
+                label.to_string(),
+                Box::new(crate::mir::effect::EffectRow::Empty),
+            ),
+        );
+        Ok((result_ty, row))
     }
 
     // v0.75.20: infer_pipe 已删——WitnessKind::Pipe 死变体移除，`|>` 在

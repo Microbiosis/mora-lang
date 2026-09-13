@@ -233,6 +233,7 @@ fn e2e_all_fixtures_run() {
         "stats_basic.mora",
         "linalg_basic.mora",
         "random_basic.mora",
+        "random_handle.mora",
         "bigint_basic.mora",
     ] {
         assert_ok(name);

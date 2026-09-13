@@ -309,6 +309,10 @@ impl HMInference {
     /// 残差行仅含 Var（多态未知行）时宽松放行 —— 不做错误拒绝。
     pub fn infer_program(&mut self, exprs: &[MirWitness]) -> Vec<TypeError> {
         let mut errors: Vec<TypeError> = Vec::new();
+        // v0.99: ambient effect 签名预置 —— 先于文件级 EffectSig 预扫描。
+        // 用户对同一标签的重复声明走既有重复规则（一致幂等放行，不一致
+        // 报错指向声明处）。
+        self.seed_ambient_effect_signatures();
         // v0.98: effect 签名预扫描 —— EffectSig 是文件全局声明（效果标签
         // 的契约），先于顺序推断全量注册，perform/handle 在任意位置可查。
         // 重复声明且签名不一致 → 报错（重复声明且一致 → 幂等放行）。
@@ -322,7 +326,16 @@ impl HMInference {
             match self.infer_expr(expr) {
                 Err(mut errs) => errors.append(&mut errs),
                 Ok((_, row)) => {
-                    if let Some(label) = row.labels().first().map(|s| s.to_string()) {
+                    // v0.99: ambient 标签由运行时根状态兜底（查找顺序：
+                    // 用户 handle 注册表 → CoreRuntime.random_state）——
+                    // 根边界放行纯 ambient 残差。定位第一个**非 ambient**
+                    // 标签精准报错；只跳过 ambient，不吞其他 unhandled。
+                    if let Some(label) = row
+                        .labels()
+                        .into_iter()
+                        .find(|l| !crate::mir::effect::ambient::is_ambient_label(l))
+                        .map(|s| s.to_string())
+                    {
                         errors.push(self.localize_unhandled_effect(expr, &label));
                     }
                 }
@@ -331,6 +344,52 @@ impl HMInference {
         let (_subst, mut solve_errors) = self.solve_constraints();
         errors.append(&mut solve_errors);
         errors
+    }
+
+    /// v0.99: ambient effect 签名预置 —— random 模块的每操作契约
+    /// （标签 ↔ `random.<method>` 映射与运行时分发同源）。
+    ///
+    /// 这些签名在文件级 `effect` 声明预扫描**之前**入表：用户 `handle
+    /// random_* { ... }` / `perform random_*(...)` 直接获得契约校验；
+    /// 用户重声明同标签走 `precompute_effect_signatures` 的重复规则
+    /// （一致幂等、不一致报错 —— expected 侧显示的就是 ambient 契约）。
+    fn seed_ambient_effect_signatures(&mut self) {
+        use crate::mir::effect::ambient;
+        // 参数按语言现实声明：**无后缀数字字面量在词法层一律是 Float**
+        // （lexer.rs number_from 无后缀分支 → TokenType::Float），因此
+        // `random.seed(42)` 的实参类型是 Float 而非 Int；真正的 Int 值
+        // （如 len(x)）经 Int<:Float 数字塔 widening 由 compatible_with
+        // 放行。rand_int 语义上是整数区间，但实参按语言现实收 Float。
+        let entries: [(&str, Vec<Type>, Type); ambient::RANDOM_LABELS.len()] = [
+            ("random_random", vec![], Type::Float),
+            (
+                "random_rand_int",
+                vec![Type::Float, Type::Float],
+                Type::Float,
+            ),
+            (
+                "random_rand_float",
+                vec![Type::Float, Type::Float],
+                Type::Float,
+            ),
+            (
+                "random_rand_choice",
+                vec![Type::List(Box::new(Type::Any))],
+                Type::Any,
+            ),
+            ("random_seed", vec![Type::Float], Type::Nil),
+            (
+                "random_shuffle",
+                vec![Type::List(Box::new(Type::Any))],
+                Type::List(Box::new(Type::Any)),
+            ),
+        ];
+        for (label, params, result) in entries {
+            debug_assert!(ambient::is_ambient_label(label));
+            self.effect_signatures
+                .entry(label.to_string())
+                .or_insert(EffectSignature { params, result });
+        }
     }
 
     /// v0.98: effect 签名预扫描 —— 收集全部 EffectSig witness（含嵌套）
@@ -503,6 +562,31 @@ impl HMInference {
                     _ => Self::tree_effect_row(value, ambient, table),
                 };
                 union3(v, Self::tree_effect_row(init_body, ambient, table))
+            }
+            WitnessKind::MethodCall {
+                receiver,
+                method,
+                args,
+            } => {
+                // v0.99: random 模块方法调用 = ambient perform（与 HM 推断
+                // 同一行代数 —— 否则 mutual recursion / 前向引用经本行走器
+                // 传播时漏掉 random 标签）。纯数据行走器无类型信息，按接收
+                // 者变量名 `random`（语言级绑定名）分类；别名接收者
+                // （`let m = random; m.foo()`）保守按纯处理 —— 欠近似只可
+                // 能漏报，不会误拒；主推断路径的 RandomModule 分支仍覆盖。
+                let mut row = match &receiver.kind {
+                    WitnessKind::Variable(n) if n == "random" => {
+                        match crate::mir::effect::ambient::random_label_for_method(method) {
+                            Some(l) => EffectRow::Cons(l.to_string(), Box::new(EffectRow::Empty)),
+                            None => EffectRow::Empty,
+                        }
+                    }
+                    _ => Self::tree_effect_row(receiver, ambient, table),
+                };
+                for a in args {
+                    row = union3(row, Self::tree_effect_row(a, ambient, table));
+                }
+                row
             }
             _ => {
                 let mut row = EffectRow::Empty;

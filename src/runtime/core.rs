@@ -21,7 +21,7 @@
 //! 三类存在理由，全部登记如下：
 //!
 //! 1. **单属主状态**：持纯值，`&mut self` 变更（本文件的 environment /
-//!    gensym_counter 即此类）。禁止 `Arc<Mutex>` 包装。
+//!    gensym_counter / random_state 即此类）。禁止 `Arc<Mutex>` 包装。
 //! 2. **有意跨克隆/跨线程共享的注册表与缓存**：锁是共享机制本身，不是
 //!    冗余防御。包括 orch plans/refine/skill、infra string_interner/ai_cache
 //!    （worker 线程共享 AI 响应缓存，拆锁会增加真实 API 调用）、ccr、mock、
@@ -67,6 +67,12 @@ pub struct CoreRuntime {
     /// 递增，无跨线程共享；Clone 按值复制（Pregel worker 各自独立计数，
     /// 与旧 Arc<Mutex> clone 的分歧语义一致），无需锁。
     pub(crate) gensym_counter: usize,
+    /// v0.99: ambient random 状态（纯值）。`random.*` 方法调用的 ambient
+    /// effect 由本状态兜底应答 —— 取代 v0.91 的进程级
+    /// `static Mutex<Xoshiro256>` 全局状态机。单属主 `&mut self` 线性穿线
+    /// （锁分类第 1 类），无锁；Clone 按值复制 —— worker 各自独立推进
+    /// 序列，并发从「共享一把锁」变成「值拷贝即隔离」。
+    pub(crate) random_state: crate::runtime::random::Xoshiro256,
 }
 
 impl Default for CoreRuntime {
@@ -79,17 +85,20 @@ impl Default for CoreRuntime {
             current_merge_strategies: None,
             effect_handlers: crate::runtime::effect::EffectRegistry::default(),
             gensym_counter: 0,
+            random_state: crate::runtime::random::Xoshiro256::from_time(),
         }
     }
 }
 
 // v0.80: 手动 Clone impl —— 不能 derive Clone（EffectHandler: !Clone）。
 // effect_handlers 克隆时取空（move semantics —— handler 留在原实例）。
-// 语义：Pregel worker 复制 → 子线程没有已注册的 handler（body 直接 perform 会
-// 报 unhandled effect）。这是 conservative 默认；后续 Stage 2.x 可支持 handler
-// 共享（Arc<dyn EffectHandler> 引用计数）。
+// 语义：Pregel worker 复制 → 子线程没有用户注册的 handler（body 直接 perform
+// 用户 effect 会报 unhandled effect）。用户 handler 是动态作用域，不随克隆
+// 传播；ambient handler 是运行时基础设施，克隆后依然在场（见 random_state）。
 // v0.95: environment 克隆是 O(1) 结构共享（持久化 HAMT），共享绑定不再
 // 需要共享可变 cell —— 克隆后的 env 相互独立，写不穿透。
+// v0.99: random_state 按值复制 —— 每个 worker 独立推进自己的随机序列
+// （互不干扰、无锁），不再是旧全局 Mutex 下的交错共享序列。
 impl Clone for CoreRuntime {
     fn clone(&self) -> Self {
         Self {
@@ -100,6 +109,7 @@ impl Clone for CoreRuntime {
             current_merge_strategies: self.current_merge_strategies.clone(),
             effect_handlers: crate::runtime::effect::EffectRegistry::default(),
             gensym_counter: self.gensym_counter,
+            random_state: self.random_state,
         }
     }
 }

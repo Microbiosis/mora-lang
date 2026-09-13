@@ -163,10 +163,8 @@ pub fn builtin_signatures() -> Vec<(String, Signature)> {
             "linalg".to_string(),
             Signature::new(vec![], Type::Any),
         ),
-        (
-            "random".to_string(),
-            Signature::new(vec![], Type::Any),
-        ),
+        // v0.99: "random" 不在此表 —— 模块对象不可直接调用（`random(...)`
+        // 应报非函数），方法调用经 infer_var → Type::RandomModule 分型。
     ]
 }
 

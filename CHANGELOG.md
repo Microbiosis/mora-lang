@@ -2,6 +2,74 @@
 
 All notable changes to Mora will be documented in this file.
 
+## [v0.99.0] — 2026-09-13 — feat: random 全局状态机数据流化 — ambient effect 闭环
+
+「用数据流代替状态机」的下一站：v0.95 锁分类定案中唯一不在任何豁免类
+（单属主 / 有意共享注册表 / 协调原语 / 语言能力面）的残留状态机 ——
+`random.*` 的进程级 `static Mutex<Xoshiro256>` + `AtomicBool` 惰性时间
+种子 —— 数据流化为 **ambient algebraic effect**。效果系统（v0.78→v0.98）
+自此接管最后一个对类型系统不可见的隐式副作用。
+
+### 语义
+
+- **状态纯值化**：RNG 状态是 `CoreRuntime` 的单属主纯值
+  `random_state: Xoshiro256`（与 `gensym_counter` 同一 v0.95 模式）——
+  无锁、无 static、无初始化标志；构造时按时间种子（实例级唯一）；
+  Clone 按值复制 —— Pregel worker 各自独立推进序列，并发从「共享一把
+  进程级锁」变成「值拷贝即隔离」；
+- **ambient 标签**：`random.<method>(...)` 调用对应 `random_` + 方法名
+  的 ambient 标签（`random_random` / `random_rand_int` / `random_rand_float`
+  / `random_rand_choice` / `random_seed` / `random_shuffle`），运行时查找
+  顺序 = 用户 `handle` 注册表 → ambient 根状态兜底；
+- **类型层可见**：`random` 解析为 `Type::RandomModule`（跟随 `AiModule`
+  先例），方法调用按预置签名分型 —— 实参 compatible_with 校验（携带
+  span）、结果静态化（此前 `random.*` 一律 `Any`）、ambient 标签并入
+  效果行（v0.96/0.97 的跨函数传播 / mutual recursion / handle 吸收
+  一视同仁）；参数按语言现实声明（无后缀字面量在词法层是 Float）；
+- **根边界豁免**：程序根残差行允许含 ambient 标签（根状态即其
+  handler），非 ambient 的 unhandled 效果照常拒绝；
+- **可覆写**：`handle random_random { ... } { ... }` 按动态作用域截获，
+  handler 按签名获得 `__arg0..N` 契约与结果校验 —— 测试可以确定性地
+  固定随机值，无需触碰真实状态；
+- **multi-shot perform**：`perform_effect` 执行后回装 handler（take 弹
+  栈顶、install 推回原深度）—— 同一 handle 块内可多次 perform 同一
+  效果（旧 single-shot 语义下第二次会误报 unhandled）；嵌套 handle 的
+  递归 perform 仍命中外层 handler（标准动态作用域）；
+- **行代数修正**：`infer_call` 的 curried-arrow 消解中，被调体行以
+  **值**并入调用行（具体行直接并、Var 行保持 RowEq 推迟）—— 旧行为
+  无条件 `RowEq(fresh_eff, acc_row)` 把被调体行与实参行强行画等号，
+  纯被调 + 内联 effectful 实参被误拒（`print(random.rand_int(1, 10))`
+  报 expected pure）。
+
+### 实现
+
+- `src/mir/effect.rs`：`ambient` 模块 —— 标签单一事实源（typeck 与
+  runtime 共用，无跨层反向依赖）；
+- `src/runtime/random.rs`（新）：`Xoshiro256` 纯值 + `dispatch_op` 操作
+  分发；原 `src/interpreter/builtins/random.rs`（全局状态机）删除；
+- `src/runtime/core.rs`：`random_state` 字段（锁分类第 1 类：单属主
+  纯值），Default / Clone / 两处字面量构造同步；
+- `src/interpreter/mod.rs`：`perform_effect` multi-shot 回装 + ambient
+  兜底分支；顺带清除两处遗留 DEBUG `eprintln!`；
+- `src/interpreter/method_dispatch.rs`：`BuiltinKind::Random` 在
+  `call_method` 拦截转 `perform_effect`（`call_random_ambient`）；
+- `src/typeck/`：`Type::RandomModule` 变体 + `infer_var` 模块解析 +
+  `infer_method_call` RandomModule 分支（`infer_random_method`）+
+  `seed_ambient_effect_signatures`（先于文件级 EffectSig 预扫描）+
+  根边界 ambient 豁免（定位第一个非 ambient 标签）+
+  `tree_effect_row` MethodCall arm（不动点传播覆盖 random 调用）。
+
+### 测试
+
+- `tests/ambient_random.rs`（新，8 项）：确定性复现 / 六方法面 /
+  行传播 + 根边界豁免 / arity 校验 / 未知方法拒绝 / handle 覆写 /
+  非 ambient unhandled 回归防线 / 跨线程实例隔离（v0.91 全局 Mutex
+  语义下该断言在交错下不成立，v0.99 成为稳定性质）；
+- `runtime::random` 单元测试 6 项（实例独立 / 标签全covers / 纯值
+  确定性 —— 不再共享任何全局状态）；
+- e2e fixture：`random_handle.mora`（覆写 + 覆写后 ambient 仍在场）；
+- lib 909 + 全集成 0 失败 + clippy --all-targets --all-features 清零。
+
 ## [v0.98.0] — 2026-09-12 — feat: 显式 effect signature 声明语法
 
 v0.97 登记的最后一个语言级扩展点闭环：效果契约从「推断出来的」升级为

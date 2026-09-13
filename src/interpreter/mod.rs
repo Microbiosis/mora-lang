@@ -225,18 +225,27 @@ fn perform_effect(
     //
     // architectural reason: handler 实际是 MirFunction（handler_mir），必须有
     // MirHost 才能调 run_mir。EffectHandler::perform 签名带 &mut dyn MirHost。
-    // 第一版（single-shot）：handler 一次性消耗（不还原到栈）。
-    eprintln!("DEBUG perform_effect: effect={} args={:?}", effect, args);
-    let mut handler = {
-        let core = &mut self.core.effect_handlers;
-        core.take(effect)?
-    };
+    //
+    // v0.99: multi-shot —— handler 执行后回装原深度（take 弹栈顶、install
+    // 推回），同一 handle 块内可多次 perform 同一效果。旧 single-shot 语义
+    // 下第二次 perform 会因 handler 已被取走而误报 unhandled。handler 内部
+    // 状态（HandlerClosure 自有 env）跨多次 perform 保持 —— 与 v0.95 线性
+    // 穿线语义一致。嵌套 handle 不受影响：递归 perform 同名效果时 handler
+    // 已被 take 出栈，命中的是外层 handler（标准动态作用域）。
+    if let Some(mut handler) = self.core.effect_handlers.take(effect) {
+        let result = handler.perform_box(self, args, effects);
+        self.core.effect_handlers.install(effect.to_string(), handler);
+        return result.ok();
+    }
 
-    // host 通过 &mut self 传（self 实现 MirHost）；effects 显式累加器
-    // 穿透 handler 执行（handler 体内 perform/send 属于外层 effect 流）。
-    let result = handler.perform_box(self, args, effects);
-    eprintln!("DEBUG perform_effect: result={:?}", result);
-    result.ok()
+    // v0.99: ambient 兜底 —— ambient 标签（如 random_*）由运行时内置的
+    // 单属主纯值状态应答（无锁；用户 handle 注册表优先，动态作用域可覆写）。
+    // 查找顺序：注册表 → ambient。都不命中 = 真正 unhandled。
+    if crate::mir::effect::ambient::is_ambient_label(effect) {
+        return self.core.random_state.dispatch_op(effect, &args).ok();
+    }
+
+    None
 }
 
     fn install_effect_handler(

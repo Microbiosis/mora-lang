@@ -22,6 +22,9 @@ pub mod effect;
 pub mod infra;
 pub mod orch;
 pub mod persist;
+// v0.99: ambient random —— PRNG 纯值 + ambient effect 操作分发
+// （原 src/interpreter/builtins/random.rs 的进程级全局状态机数据流化）
+pub mod random;
 pub mod registry;
 pub mod sandbox;
 pub mod types;

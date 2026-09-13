@@ -117,6 +117,50 @@ impl fmt::Display for EffectRow {
     }
 }
 
+// ─── v0.99: ambient effect 标签（单一事实源）────────────────────────
+//
+// ambient effect = 运行时**根 handler 兜底**、类型层**行传播**的效果。
+// 典型对象是隐式全局状态机（v0.99 前的 `random`：进程级
+// `static Mutex<Xoshiro256>`）—— 副作用真实存在，但用户从未声明。
+// 数据流化之后：状态线性持有在根 handler 对象内（每运行时一份、无锁、
+// worker 克隆天然独立），类型层把 `random.*` 方法调用记入效果行，
+// 程序根边界的残差行断言放行 ambient 标签（根 handler 即其处理者）。
+//
+// 本模块是 typeck（签名预置 / 行分类 / 边界豁免）与 runtime（根 handler
+// 安装 / 方法分派）共用的标签事实源 —— 标签即 `EffectRow::Cons` 的 head
+// 字符串，放 mir 层避免 typeck→runtime 反向依赖。
+pub mod ambient {
+    /// `random` 模块各方法对应的 ambient effect 标签。
+    /// 命名规则：`random_` + 方法名（系统化、可 grep、无特例）。
+    pub const RANDOM_LABELS: [&str; 6] = [
+        "random_random",
+        "random_rand_int",
+        "random_rand_float",
+        "random_rand_choice",
+        "random_seed",
+        "random_shuffle",
+    ];
+
+    /// `random.<method>(...)` 调用对应的 ambient effect 标签。
+    /// 未知方法返回 None（调用方报 unknown method）。
+    pub fn random_label_for_method(method: &str) -> Option<&'static str> {
+        match method {
+            "random" => Some("random_random"),
+            "rand_int" => Some("random_rand_int"),
+            "rand_float" => Some("random_rand_float"),
+            "rand_choice" => Some("random_rand_choice"),
+            "seed" => Some("random_seed"),
+            "shuffle" => Some("random_shuffle"),
+            _ => None,
+        }
+    }
+
+    /// 标签是否属于 ambient 集合（运行时根 handler 已兜底）。
+    pub fn is_ambient_label(label: &str) -> bool {
+        RANDOM_LABELS.contains(&label)
+    }
+}
+
 // ─── v0.93: 运行时效应值（effect-as-data）────────────────────────────
 //
 // `EffectRow` 是效果的**类型**表示（编译期）；`Effect`/`Effects` 是效果的

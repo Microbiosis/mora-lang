@@ -42,6 +42,9 @@ pub enum TokenType {
     With,
     // v0.88: TEA app 块关键字 — app Counter ... end
     App,
+    // v0.102: 声明式范式（逻辑式/关系式）关键字
+    Rel,
+    Solve,
     // 注意: HTTP 方法 (GET/POST/PUT/DELETE/PATCH) 不作关键字
     // —— 保持 Identifier,显式 API Router.route() 按字符串匹配
     Identifier(String),
@@ -769,6 +772,9 @@ impl Lexer {
             "with" => TokenType::With,
             // v0.88: TEA app 块关键字
             "app" => TokenType::App,
+            // v0.102: 声明式范式关键字
+            "rel" => TokenType::Rel,
+            "solve" => TokenType::Solve,
             _ => TokenType::Identifier(value),
         };
         Token {

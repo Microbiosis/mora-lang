@@ -888,6 +888,32 @@ impl WitnessLowerer {
                 self.emit(MirInst::Const(dst, crate::value::Value::Nil));
                 Ok(dst)
             }
+            WitnessKind::RelDef { name, clauses, .. } => {
+                // 编译期子句模板数据随 witness 携带（单一事实源），直接落入指令
+                self.emit(MirInst::RelDef {
+                    name: name.clone(),
+                    clauses: clauses.clone(),
+                });
+                let dst = self.alloc_reg();
+                self.emit(MirInst::Const(dst, crate::value::Value::Nil));
+                Ok(dst)
+            }
+            WitnessKind::Solve { limit, query_vars, anon_vars, goal } => {
+                // goal 构建体独立 lower 成 MirFunction（与 AppDef 的三个子体同规则）
+                let mut goal_l = WitnessLowerer::new();
+                let goal_dst = goal_l.lower_witness(goal)?;
+                goal_l.emit(MirInst::Return(Some(goal_dst)));
+                let goal_mir = goal_l.finish();
+                let dst = self.alloc_reg();
+                self.emit(MirInst::Solve {
+                    dst,
+                    limit: *limit,
+                    query_vars: query_vars.clone(),
+                    anon_vars: anon_vars.clone(),
+                    goal: Box::new(goal_mir),
+                });
+                Ok(dst)
+            }
             WitnessKind::WithConfig { bindings, body } => {
                 // WithConfig 是元数据包装——emit WithConfig 指令后 lower body。
                 let mut binding_regs: Vec<(String, Reg)> = Vec::new();

@@ -54,6 +54,20 @@ impl HMInference {
                 let arg = self.fresh_type_var();
                 Some(curried_arrow(vec![arg], Type::Bool))
             }
+            // v0.102: 声明式范式 — 目标内建
+            "unify" => {
+                let a = self.fresh_type_var();
+                let b = self.fresh_type_var();
+                Some(curried_arrow(vec![a, b], Type::Goal))
+            }
+            "cons" => {
+                let h = self.fresh_type_var();
+                let t = self.fresh_type_var();
+                Some(curried_arrow(
+                    vec![h.clone(), t.clone()],
+                    Type::Cons(Box::new(h), Box::new(t)),
+                ))
+            }
             "range" => {
                 let a = self.fresh_type_var();
                 let b = self.fresh_type_var();

@@ -91,6 +91,9 @@ impl CostModel for TokenEstimate {
             MirInst::MsgDef { .. } => 0,
             MirInst::UpdateDef { .. } => 0,
             MirInst::AppDef { .. } => 0,
+            // v0.102: 声明式范式 — RelDef 声明型 0 成本；Solve 按搜索框架开销估算
+            MirInst::RelDef { .. } => 0,
+            MirInst::Solve { .. } => 40,
             MirInst::Call(_, name, args) => {
                 let name_cost = (name.chars().count() / 4 + 1) as u32;
                 name_cost + args.len() as u32 + 50 // 50 = 调用框架开销

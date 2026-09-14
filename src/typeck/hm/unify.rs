@@ -247,8 +247,23 @@ fn unify(
 
     match (&t1, &t2) {
         // Variable cases
+        //
+        // v0.102 修复：合一是等价关系的闭合，两条标准规则此前缺失——
+        //   1. **自反**：`unify(α, α) = Ok`（此前落入 occurs check，因为
+        //      `contains_typevar(TypeVar(α), α)` 对自身为真 → 误报
+        //      OccursCheck；触发条件是同一未解析 TypeVar 出现在两侧，
+        //      如 `fn(n) n * n end` 的两条 Eq(α, result) 约束消解后
+        //      两侧同为 β）。
+        //   2. **传递 occurs check**：绑定前沿替换链全解析，防止
+        //      `α → β, β → α` 形成无限类型（`contains_typevar` 只看
+        //      一层，链式发生时漏检）。
         (crate::typeck::Type::TypeVar(v1), _) => {
-            if contains_typevar(&t2, *v1) {
+            if let crate::typeck::Type::TypeVar(v2) = &t2
+                && v1 == v2
+            {
+                return Ok(subst.clone());
+            }
+            if occurs_in_subst(subst, *v1, &t2) {
                 Err(TypeError::OccursCheck {
                     var: *v1,
                     with_ty: format!("{:?}", t2),
@@ -259,7 +274,7 @@ fn unify(
             }
         }
         (_, crate::typeck::Type::TypeVar(v2)) => {
-            if contains_typevar(&t1, *v2) {
+            if occurs_in_subst(subst, *v2, &t1) {
                 Err(TypeError::OccursCheck {
                     var: *v2,
                     with_ty: format!("{:?}", t1),
@@ -297,6 +312,27 @@ fn unify(
         // 泛型值不会以 ForAll 形态进入约束；若进入，与内层合一）。
         (crate::typeck::Type::ForAll(_, inner), other)
         | (other, crate::typeck::Type::ForAll(_, inner)) => unify(inner, other, subst),
+
+        // v0.102: 声明式范式类型合一
+        (crate::typeck::Type::Goal, crate::typeck::Type::Goal) => Ok(subst.clone()),
+        (crate::typeck::Type::Cons(h1, t1), crate::typeck::Type::Cons(h2, t2)) => {
+            let s1 = unify(h1, h2, subst)?;
+            unify(t1, t2, &s1)
+        }
+        (crate::typeck::Type::Relation(p1), crate::typeck::Type::Relation(p2)) => {
+            if p1.len() != p2.len() {
+                return Err(TypeError::UnificationFailure {
+                    expected: format_type(&t1),
+                    got: format_type(&t2),
+                    span: None,
+                });
+            }
+            let mut acc = subst.clone();
+            for (a, b) in p1.iter().zip(p2.iter()) {
+                acc = unify(a, b, &acc)?;
+            }
+            Ok(acc)
+        }
 
         // Compound types
         (crate::typeck::Type::List(elem1), crate::typeck::Type::List(elem2)) => {
@@ -362,22 +398,78 @@ fn unify(
 }
 
 ///  Check if a type contains a specific type variable
+///
+/// v0.102: 补全嵌套载体 —— 此前只递归 List/Dict/Result_/Union/ForAll/Arrow，
+/// Tuple/Cons/Relation/Trait·Concrete·TraitObject 的泛型参数被整体遗漏
+/// （occurs check 对这些位置的变量失效）。
 fn contains_typevar(ty: &crate::typeck::Type, var: char) -> bool {
     match ty {
         crate::typeck::Type::TypeVar(v) => *v == var,
-        crate::typeck::Type::List(elem) => contains_typevar(elem, var),
+        crate::typeck::Type::List(elem) | crate::typeck::Type::ForAll(_, elem) => {
+            contains_typevar(elem, var)
+        }
         crate::typeck::Type::Dict(k, v) => contains_typevar(k, var) || contains_typevar(v, var),
         crate::typeck::Type::Result_(ok, err) => {
             contains_typevar(ok, var) || contains_typevar(err, var)
         }
         crate::typeck::Type::Union(members) => members.iter().any(|m| contains_typevar(m, var)),
-        // v0.75.17: ForAll 内层递归（量化变量与活跃 TypeVar 命名空间隔离，
-        // 递归可查内层嵌套的自由变量）。
-        crate::typeck::Type::ForAll(_, inner) => contains_typevar(inner, var),
         // v0.80: Arrow — 递归检查 input/output（effect row 的 Var 是 String
         // 命名空间，与 TypeVar(char) 不同，不参与 occurs check）。
         crate::typeck::Type::Arrow(input, output, _) => {
             contains_typevar(input, var) || contains_typevar(output, var)
+        }
+        // v0.83/v0.102: Tuple / Cons / Relation 元素
+        crate::typeck::Type::Tuple(elems) => elems.iter().any(|e| contains_typevar(e, var)),
+        crate::typeck::Type::Cons(h, t) => contains_typevar(h, var) || contains_typevar(t, var),
+        crate::typeck::Type::Relation(params) => {
+            params.iter().any(|p| contains_typevar(p, var))
+        }
+        // 泛型载体（Trait / Concrete / TraitObject 的泛型实参）
+        crate::typeck::Type::Trait { generics, .. }
+        | crate::typeck::Type::Concrete { generics, .. }
+        | crate::typeck::Type::TraitObject { generics, .. } => {
+            generics.iter().any(|g| contains_typevar(g, var))
+        }
+        _ => false,
+    }
+}
+
+/// v0.102: 沿替换链全解析后的 occurs check。
+///
+/// [`Substitution::apply`] 只解析一层（`α→β`, `β→τ` 时 `apply(α) = β`），
+/// 因此裸 [`contains_typevar`] 会漏掉链式出现（`α→β, β→α` 形成无限类型）。
+/// 本函数在解析结果上结构化递归，遇未彻底解析的 TypeVar 继续下潜其绑定。
+fn occurs_in_subst(s: &Substitution, var: char, ty: &crate::typeck::Type) -> bool {
+    match s.apply(ty) {
+        crate::typeck::Type::TypeVar(c) => {
+            if c == var {
+                true
+            } else {
+                s.mapping
+                    .get(&c)
+                    .is_some_and(|next| occurs_in_subst(s, var, next))
+            }
+        }
+        other => contains_typevar_resolved(s, var, &other),
+    }
+}
+
+/// [`occurs_in_subst`] 的结构化下潜部分（对复合类型的子位置逐一检查）。
+fn contains_typevar_resolved(s: &Substitution, var: char, ty: &crate::typeck::Type) -> bool {
+    use crate::typeck::Type;
+    match ty {
+        Type::List(elem) | Type::ForAll(_, elem) => occurs_in_subst(s, var, elem),
+        Type::Dict(k, v) => occurs_in_subst(s, var, k) || occurs_in_subst(s, var, v),
+        Type::Result_(ok, err) => occurs_in_subst(s, var, ok) || occurs_in_subst(s, var, err),
+        Type::Union(members) => members.iter().any(|m| occurs_in_subst(s, var, m)),
+        Type::Arrow(i, o, _) => occurs_in_subst(s, var, i) || occurs_in_subst(s, var, o),
+        Type::Tuple(elems) => elems.iter().any(|e| occurs_in_subst(s, var, e)),
+        Type::Cons(h, t) => occurs_in_subst(s, var, h) || occurs_in_subst(s, var, t),
+        Type::Relation(params) => params.iter().any(|p| occurs_in_subst(s, var, p)),
+        Type::Trait { generics, .. }
+        | Type::Concrete { generics, .. }
+        | Type::TraitObject { generics, .. } => {
+            generics.iter().any(|g| occurs_in_subst(s, var, g))
         }
         _ => false,
     }
@@ -424,6 +516,62 @@ mod tests {
         let result = unify(&t1, &t2, &subst);
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), TypeError::OccursCheck { .. }));
+    }
+
+    // ─── v0.102: 合一的自反性与传递 occurs check ───
+
+    #[test]
+    fn unify_same_typevar_is_reflexive() {
+        // 此前 unify(α, α) 误报 OccursCheck（contains_typevar 对自身为真）。
+        // 触发链：`fn(n) n * n end` 的两条 Eq(α, result) 约束消解后两侧同为 β。
+        let subst = Substitution::new();
+        let result = unify(&Type::TypeVar('a'), &Type::TypeVar('a'), &subst);
+        assert!(result.is_ok(), "unify(α, α) 必须成功（自反性）");
+        assert!(result.unwrap().mapping.is_empty(), "自反情形不产生绑定");
+    }
+
+    #[test]
+    fn unify_same_typevar_after_resolution_is_reflexive() {
+        // α→β 后 unify(α, β) 两侧都解析为 β —— 同样必须成功
+        let subst = Substitution::new().extend('a', Type::TypeVar('b')).expect("bind");
+        let result = unify(&Type::TypeVar('a'), &Type::TypeVar('b'), &subst);
+        assert!(result.is_ok(), "解析后同变量的合一必须成功");
+    }
+
+    #[test]
+    fn occurs_check_follows_substitution_chain() {
+        // α→β 已绑定；再 β = [α] 必须失败（传递 occur：α 经链出现在右侧）
+        let subst = Substitution::new().extend('a', Type::TypeVar('b')).expect("bind");
+        let rhs = Type::List(Box::new(Type::TypeVar('a')));
+        let result = unify(&Type::TypeVar('b'), &rhs, &subst);
+        assert!(
+            matches!(result, Err(TypeError::OccursCheck { .. })),
+            "链式自引用必须被 occur check 拦截，得到 {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn occurs_check_covers_tuple_and_cons_and_relation() {
+        let subst = Substitution::new();
+        // Tuple 元素
+        let tup = Type::Tuple(vec![Box::new(Type::TypeVar('a'))]);
+        assert!(matches!(
+            unify(&Type::TypeVar('a'), &tup, &subst),
+            Err(TypeError::OccursCheck { .. })
+        ));
+        // Cons 头
+        let cons = Type::Cons(Box::new(Type::TypeVar('a')), Box::new(Type::Nil));
+        assert!(matches!(
+            unify(&Type::TypeVar('a'), &cons, &subst),
+            Err(TypeError::OccursCheck { .. })
+        ));
+        // Relation 参数
+        let rel = Type::Relation(vec![Type::TypeVar('a')]);
+        assert!(matches!(
+            unify(&Type::TypeVar('a'), &rel, &subst),
+            Err(TypeError::OccursCheck { .. })
+        ));
     }
 
     // ─── v0.75.86: Type::subtype_of（非对称 subtype 关系）──

@@ -2,6 +2,122 @@
 
 All notable changes to Mora will be documented in this file.
 
+## [v0.102] — 2026-09-14 — feat: 声明式范式（逻辑式/关系式）完整融入 — 关系/合一/交错搜索
+
+Mora 的第五个一等范式。此前「声明式」在语言里只有 `match` 一处真语义
+（`with` 是配置围栏，`observe`/`span`/`p"..."` 分别是死 IR 与字符串
+拼接语法糖），并无关系/事实/规则/查询基础设施。本版本以逻辑式/关系式
+家族为核心，从底层原语到语法面端到端落地。
+
+### 设计（§0.2 四问）
+
+1. **底层原语**：关系（`Clause` 集合，一等值 `Value::Relation`）+
+   逻辑变量与替换（`Subst`，HAMT 持久映射）+ 目标代数（`Goal`，一等值
+   `Value::Goal`，可组合可高阶）+ 交错搜索（FIFO 任务队列状态机）。
+2. **类型基础**：`Type::Relation(Vec<Type>)`（位置签名）、`Type::Goal`、
+   `Type::Cons`；投影类型 = 查询自由变量经与关系签名合一所得
+   `list<τ>` / `list<Tuple<τ…>>`（复用 TypeVar unify + `Type::Tuple`）。
+3. **最小侵入点**：新增 `src/rel/` Foundation 层（仅依赖 `crate::value`，
+   宿主回调经 `RelHost` trait 注入）；`MirInst::RelDef/Solve`；
+   `WitnessKind::RelDef/Solve`；`Value` 三个变体。
+4. **完整语义配套**：合一含 occur check；交错调度保证公平（无限左分支
+   不饿死右侧备选）；reify 把残留未绑定变量转 `_.N` 符号（逻辑变量不
+   逃逸）；效果行经 `rel_effect_rows` 不动点预计算穿 solve 位点传播；
+   同名 `rel` 定义累积子句（Prolog consult 语义）。
+
+### 语法
+
+```mora
+rel edge("a", "b")                        -- 事实（头部是项，无体）
+rel path(x, y) edge(x, y) end             -- 规则（体是目标合取，`,` 连接）
+rel path(x, z) edge(x, y), path(y, z) end -- 递归传递闭包
+
+solve { path("a", ?to) }                  -- 查询（?to 投影变量）
+solve 3 { path(?from, ?to) }              -- run 3（前 3 个解）
+```
+
+- `rel` 头/体的裸标识符 = 子句局部逻辑变量（体独有变量同样是 fresh），
+  `_` = 匿名变量；符号常量写字符串字面量。
+- `solve` 的 `?name` = 投影变量（解中返回其绑定）；解按查询变量数投影
+  （0 个 → `nil`，1 个 → 标量，n 个 → 元组列表）。
+- 目标原语：`unify(a,b)` / `both(…)`（`conde` 同义）/ `either(…)` /
+  `project(f, args…, result)` / `fail` / `succeed`；关系值可调用
+  （`edge(?x, ?y)` 构造目标），目标是一等值可高阶组合。
+
+### 变更
+
+- **新增 `src/rel/`**：`goal.rs` / `subst.rs` / `unify.rs` / `search.rs` /
+  `reify.rs`（39 个单元测试，含交错公平性、occur check、子句 rename 隔离）；
+- **`Value`**：`Relation` / `Goal(Box<Goal>)` / `LogicVar(u64)` 三变体 +
+  Display + 三处 JSON 序列化 + `type_name`；
+- **`MirInst`**：`RelDef`（声明型，SSA passthrough）/ `Solve`（effectful）；
+- **typeck**：`Type::Relation/Goal/Cons` 五处 match + `hm::unify` 三臂 +
+  `precompute_rel_sigs` 不动点（头项结构 → 位置签名格，多模式子句并入
+  union）+ `rel_effect_rows` + 调用点实参校验与效果行并入；
+- **lexer/parser**：`rel` / `solve` 关键字；`emit_rel_def_w` /
+  `emit_solve_w`（`src/parser_v3/rel.rs`）；
+- **runtime**：`h_rel_def`（同名累积）/ `h_solve`（查询变量注入 + 交错
+  搜索 + reify 投影 + Project 效应收集）；`unify`/`both`/`either`/
+  `project`/`fail`/`succeed` builtin。
+
+### 明确不做（范围边界）
+
+- **不升级 VM multi-shot 续延**：回溯内嵌引擎数据流（HAMT O(1) 快照），
+  效应系统保持 single-shot 现状 —— 耦合 VM 续延升级才是补丁化耦合；
+- **不含 tabling/Datalog 不动点**（递归终止性与 Prolog 同型，由关系作者
+  负责；`solve N` 界形式可安全采样潜在无限解流）。
+
+### 不兼容变更
+
+新增 `rel` / `solve` 两个保留字（词法层 breaking）：以其作为标识符的
+既有代码需改名。按 §6 版本化管理，无兼容层。
+
+### 测试
+
+- `cargo test --lib`：949 passed / 0 failed / 13 ignored（+39 rel 引擎单测
+  +4 合一自反/传递 occurs check 回归）；
+- e2e：33 passed（+7 rel fixture +2 缺陷修复回归 +1 寄存器契约断言）；
+- parser_v3_coverage：19 passed（+5 个 rel/solve witness 结构断言）；
+- tier1_typeck_mir 34 / tier2_mir_expr_pipeline 33 / compile_differential 9 /
+  nine_layer_differential 19 / executor_switch 17 / proptest_compile_lower 2 /
+  orchestrate_v3_pipeline 10 及其余 14 套全绿；
+- `cargo clippy --all-targets --all-features -- -D warnings`：输出完全干净。
+
+### 既有缺陷修复（从底层修正，非 workaround）
+
+实现过程中撞到三个 clean main HEAD 上同样复现的既有缺陷，均按 §0「从底层
+架构构建地基」直接修正，未采用绕过写法：
+
+1. **`return <expr>` 丢失结果寄存器**（`parser_v3/emit_definitions.rs`）。
+   `emit_return_break_continue_w` 硬编码 `MirInst::Return(0)`，丢弃
+   `emit_expr_w` 的结果寄存器。单表达式体（`task f(n) return n*n`，n 恰在
+   reg 0）掩盖了它；含多条指令的表达式（`return n + 100i`）会返回**第一个
+   操作数**而非结果（5 而非 105）。此缺陷同时是 tier1_typeck_mir 此前
+   6 项失败的根因 —— 修复后该套件 34/34 全绿。改为与 break/continue 同
+   模式：取真实结果寄存器。
+
+2. **合一缺少自反性**（`typeck/hm/unify.rs`）。`unify(α, α)` 落入 occurs
+   check（`contains_typevar(TypeVar(α), α)` 对自身为真）→ 误报
+   OccursCheck。触发链：`let f = fn(n) n * n end` 中两条 `Eq(α, result)`
+   约束消解后两侧同为同一 TypeVar。补标准合一的自反规则，并把 occur check
+   升级为**沿替换链全解析**（`occurs_in_subst`），同时补全
+   `contains_typevar` 对 Tuple/Cons/Relation/Trait 泛型的递归（此前这些
+   位置的变量 occurs check 完全失效）。
+
+3. **`task` 定义未真正声明绑定**（`mir/handlers/effects.rs` + `mir/inst.rs`）。
+   `MirInst::TaskDef` 是 dispatch 的 no-op，task 只存在于
+   `build_task_registry`（从**当前执行函数体**静态收集）—— 嵌套函数
+   （闭包/fn 体）执行时看不到外层声明，`let f = fn(x) outer_task(x) end`
+   报 "Undefined function or task"。新增 `h_task_def` 在定义处注册一等
+   `Value::Task` 到环境（与既有 `h_macro_def` 同先例），使嵌套代码可沿
+   env 父链词法解析；`task_registry` 保留为顶层静态索引（提供前向引用），
+   `h_call` 先查 registry 再查 env，两者互补。
+
+### 遗留（非本次引入，未处理）
+
+`Value::ToolDef` 零 parser emit 点（与 `observe`/`span` 同类死 IR），
+不在本次范式范围内。
+
 ## [v0.101.1] — 2026-09-13 — build: 测试栈配置修复 — link-args 死键清除，RUST_MIN_STACK 真正生效
 
 3fb5a50 试图为测试 profile 配置 4MB 栈，但 `link-args` 不是合法的 cargo

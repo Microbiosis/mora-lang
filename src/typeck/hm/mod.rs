@@ -121,6 +121,13 @@ pub struct HMInference {
     /// （`infer_program`）判定 unhandled effect。行内含 Var 时为
     /// 多态保守行（`contains` 恒真），不参与具体标签判定。
     pub fn_effect_rows: HashMap<String, crate::mir::effect::EffectRow>,
+    /// v0.102: 关系签名表（name → 位置参数类型）。`precompute_rel_sigs`
+    /// 不动点预计算（头字面量 + 体关系调用传播）；关系调用点按签名
+    /// 校验实参并返回 Goal。
+    pub rel_sigs: HashMap<String, Vec<Type>>,
+    /// v0.102: 关系效果行登记（name → 子句体残差行）。solve 位点的效果
+    /// 经关系调用传播（与 fn_effect_rows 同机制）。
+    pub rel_effect_rows: HashMap<String, crate::mir::effect::EffectRow>,
     /// v0.96: 闭包/fn 定义节点（按定义 span）的效果行。零参闭包的类型是
     /// 裸 TypeVar，无 Arrow 层可携带行 —— let 绑定时经本表转登记进
     /// `fn_effect_rows`（key 是定义 witness 的 span，文件内唯一）。
@@ -321,7 +328,11 @@ impl HMInference {
         // 推断开始前**把全部定义（含嵌套、含前向引用）的效果行算到不动点，
         // mutual recursion / 后文定义的调用得以传播效果。行单调增长
         // （标签只增不减），有限标签集保证终止。
+        // v0.102: 关系签名/效果行不动点预计算与 fn 行预计算交错两轮 ——
+        // 含 solve 的 fn 体需要 rel 行进表；调用 fn 的 rel 子句体需要 fn 行。
+        self.precompute_rel_sigs(exprs);
         self.precompute_fn_effect_rows(exprs);
+        self.precompute_rel_sigs(exprs);
         for expr in exprs {
             match self.infer_expr(expr) {
                 Err(mut errs) => errors.append(&mut errs),
@@ -470,6 +481,11 @@ impl HMInference {
         }
         let mut table: HashMap<String, crate::mir::effect::EffectRow> =
             self.fn_effect_rows.clone();
+        // v0.102: 关系行并入同一查找表（solve 目标树里的关系调用与
+        // fn 调用同表解析；名字空间不重叠 —— 同名绑定 env 里只有一个）
+        for (n, r) in self.rel_effect_rows.clone() {
+            table.insert(n, r);
+        }
         for round in 0..64u32 {
             let mut changed = false;
             for def in &defs {
@@ -534,10 +550,23 @@ impl HMInference {
                 let h = Self::tree_effect_row(handler, ambient, table);
                 union3(b, h)
             }
+            // v0.102: 关系定义节点纯（行经 rel_effect_rows 登记表在
+            // solve 调用点生效 —— 与 FnDef/Closure 同规则）
+            WitnessKind::RelDef { .. } => EffectRow::Empty,
             WitnessKind::Call { callee, args } => {
                 let mut row = match callee {
                     WitnessCallee::Var(n) | WitnessCallee::Name(n) => {
-                        table.get(n).cloned().unwrap_or(EffectRow::Empty)
+                        // v0.102: project(fn, ...) 的行 = 被投函数的登记行
+                        if n == "project" {
+                            match args.first().map(|a| &a.kind) {
+                                Some(WitnessKind::Variable(f)) | Some(WitnessKind::FnDef { name: f, .. }) => {
+                                    table.get(f).cloned().unwrap_or(EffectRow::Empty)
+                                }
+                                _ => EffectRow::Empty,
+                            }
+                        } else {
+                            table.get(n).cloned().unwrap_or(EffectRow::Empty)
+                        }
                     }
                     WitnessCallee::Evaluated(e) => match &e.kind {
                         // 立即调用的闭包：body 效果在调用点发生
@@ -680,7 +709,8 @@ impl HMInference {
                     }
                 }
                 if let WitnessCallee::Var(name) | WitnessCallee::Name(name) = callee
-                    && let Some(row) = self.fn_effect_rows.get(name)
+                    && let Some(row) =
+                        self.fn_effect_rows.get(name).or_else(|| self.rel_effect_rows.get(name))
                     && row.labels().contains(&label)
                     && !ambient.contains(label)
                 {
@@ -718,6 +748,41 @@ impl HMInference {
                 self.infer_binop(op, left.as_ref(), right.as_ref(), expr.span)
             }
             WitnessKind::Call { callee, args } => self.infer_call(callee, args, expr.span),
+            // ── v0.102: 声明式范式（逻辑式/关系式）──
+            WitnessKind::RelDef { name, clauses, clause_wits, .. } => {
+                self.infer_rel_def(name, clauses, clause_wits, expr.span)
+            }
+            WitnessKind::Solve { limit: _, query_vars, anon_vars, goal } => {
+                // 查询变量注册新作用域（?x → fresh TypeVar），目标构建体
+                // 推断后其类型必须收敛为 Goal；投影类型 = 查询变量类型
+                // 按序组成（0 个 → nil，1 个 → 值，n ≥ 2 → 元组）。
+                let saved = self.env.clone();
+                let mut var_tys: Vec<Type> = Vec::new();
+                for q in query_vars {
+                    let tv = self.fresh_type_var();
+                    self.env.add(q.clone(), tv.clone());
+                    var_tys.push(tv);
+                }
+                // 匿名变量入作用域但不投影
+                for a in anon_vars {
+                    let tv = self.fresh_type_var();
+                    self.env.add(a.clone(), tv);
+                }
+                let outcome = self.infer_expr(goal).map(|(gty, row)| {
+                    self.constraints.push(Constraint::Eq(
+                        Box::new(gty),
+                        Box::new(Type::Goal),
+                    ));
+                    let elem = match var_tys.len() {
+                        0 => Type::Nil,
+                        1 => var_tys[0].clone(),
+                        _ => Type::Tuple(var_tys.iter().map(|t| Box::new(t.clone())).collect()),
+                    };
+                    (Type::List(Box::new(elem)), row)
+                });
+                self.env = saved;
+                outcome
+            }
             WitnessKind::MethodCall {
                 receiver,
                 method,
@@ -1143,6 +1208,307 @@ fn infer_lit(lit: &crate::common::Literal) -> Type {
         Literal::Char(_, _) => Type::Char,
         Literal::Bool(_, _) => Type::Bool,
         Literal::Nil(_) => Type::Nil,
+    }
+}
+
+// ══════════ v0.102: 声明式范式（逻辑式/关系式）typeck ══════════
+
+impl HMInference {
+    /// v0.102: 关系签名/效果行不动点预计算。
+    ///
+    /// 纯数据行走器（不污染主推断状态）：从子句**头字面量**精化位置签名
+    /// 格，从子句**体的关系调用**传播签名约束（`rel path(x,y) edge(x,y) end`
+    /// 的 x/y 经 edge 的签名获得 string），project 并入被投函数行。
+    /// 签名格单调（Unknown/TypeVar → 具体类型），轮数有界 8，保证收敛。
+    pub fn precompute_rel_sigs(&mut self, exprs: &[MirWitness]) {
+        fn collect_rel_defs<'a>(w: &'a MirWitness, out: &mut Vec<&'a MirWitness>) {
+            if let WitnessKind::RelDef { .. } = &w.kind {
+                out.push(w);
+            }
+            for c in w.child_witnesses() {
+                collect_rel_defs(c, out);
+            }
+        }
+        let mut defs: Vec<&MirWitness> = Vec::new();
+        for e in exprs {
+            collect_rel_defs(e, &mut defs);
+        }
+        if defs.is_empty() {
+            return;
+        }
+        let mut sigs: HashMap<String, Vec<Type>> = self.rel_sigs.clone();
+        let mut rows: HashMap<String, crate::mir::effect::EffectRow> =
+            self.rel_effect_rows.clone();
+        for _round in 0..8u32 {
+            let mut changed = false;
+            for def in &defs {
+                if let WitnessKind::RelDef { name, clauses, .. } = &def.kind {
+                    let (sig, row) =
+                        Self::rel_clause_sigs(name, clauses, &sigs, &rows, &self.fn_effect_rows);
+                    match sigs.get(name) {
+                        Some(prev) if prev == &sig => {}
+                        _ => changed = true,
+                    }
+                    let merged_row = match rows.get(name) {
+                        Some(prev) => Self::union_effect_rows(prev, &row),
+                        None => row.clone(),
+                    };
+                    if rows.get(name) != Some(&merged_row) {
+                        changed = true;
+                    }
+                    sigs.insert(name.clone(), sig);
+                    rows.insert(name.clone(), merged_row);
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        self.rel_sigs = sigs;
+        self.rel_effect_rows = rows;
+    }
+
+    /// 精化格（单调向上）。
+    ///
+    /// - `Unknown`/`TypeVar` 让位于具体类型（首次确定位置签名）；
+    /// - 两个不同的具体类型 → 合并为 `Union`（Prolog 多模式子句的合法
+    ///   情形：`appendo(nil, ys, ys)` 与 `appendo(cons(h,t), ...)` 是同一
+    ///   关系在不同模式下的两条子句，位置签名是 Nil ∪ Cons）；
+    /// - 已是 Union 则追加新成员（去重）。
+    ///
+    /// 调用点实参与 union 合一任一成员即通过（`hm::unify` 的 Union 分支）。
+    fn refine_cell(cell: &mut Type, new: &Type) {
+        if &*cell == new {
+            return;
+        }
+        let cell_is_open = matches!(cell, Type::Unknown | Type::TypeVar(_));
+        let new_is_open = matches!(new, Type::Unknown | Type::TypeVar(_));
+        if cell_is_open && !new_is_open {
+            *cell = new.clone();
+            return;
+        }
+        if cell_is_open || new_is_open {
+            // 都还是未定 → 保持（等后续轮次精化）
+            return;
+        }
+        // 两个具体类型：并入 union（展平 + 去重）
+        let mut members: Vec<Type> = match &*cell {
+            Type::Union(existing) => existing.clone(),
+            other => vec![other.clone()],
+        };
+        let to_add: Vec<Type> = match new {
+            Type::Union(extra) => extra.clone(),
+            other => vec![other.clone()],
+        };
+        let mut changed = false;
+        for t in to_add {
+            if !members.contains(&t) {
+                members.push(t);
+                changed = true;
+            }
+        }
+        if changed {
+            *cell = Type::Union(members);
+        }
+    }
+
+    /// 子句项模板 → 静态类型。模板内的逻辑变量位置（`Param`）用 `Any`
+    /// 占位：`Any` 是 top type（与任意类型合一成功）且可判等，因此签名格
+    /// 在不动点迭代中稳定（`TypeVar` 每轮 fresh，会破坏 union 去重）。
+    fn term_static_ty(t: &crate::rel::Term) -> Type {
+        use crate::rel::Term;
+        match t {
+            Term::Param(_) => Type::Any,
+            Term::Val(v) => Self::ground_value_ty(v).unwrap_or(Type::Any),
+            Term::Cons(a, b) => {
+                Type::Cons(Box::new(Self::term_static_ty(a)), Box::new(Self::term_static_ty(b)))
+            }
+            Term::List(xs) => {
+                let elem = xs.first().map(Self::term_static_ty).unwrap_or(Type::Any);
+                Type::List(Box::new(elem))
+            }
+            Term::Dict(entries) => Type::Dict(
+                Box::new(Type::String),
+                Box::new(
+                    entries
+                        .first()
+                        .map(|(_, v)| Self::term_static_ty(v))
+                        .unwrap_or(Type::Any),
+                ),
+            ),
+        }
+    }
+
+    /// ground 字面量值 → 静态类型。
+    fn ground_value_ty(v: &crate::value::Value) -> Option<Type> {
+        Some(match v {
+            crate::value::Value::String(_) => Type::String,
+            crate::value::Value::Char(_) => Type::Char,
+            crate::value::Value::Int(_) => Type::Int,
+            crate::value::Value::Float(_) => Type::Float,
+            crate::value::Value::BigInt(_) => Type::BigInt,
+            crate::value::Value::Bool(_) => Type::Bool,
+            crate::value::Value::Nil => Type::Nil,
+            crate::value::Value::List(items) => {
+                let elem = items
+                    .first()
+                    .and_then(Self::ground_value_ty)
+                    .unwrap_or(Type::Unknown);
+                Type::List(Box::new(elem))
+            }
+            crate::value::Value::Cons { car, cdr } => Type::Cons(
+                Box::new(Self::ground_value_ty(car).unwrap_or(Type::Unknown)),
+                Box::new(Self::ground_value_ty(cdr).unwrap_or(Type::Unknown)),
+            ),
+            _ => return None,
+        })
+    }
+
+    /// 单个关系的签名格 + 效果行（全部子句累积）。
+    fn rel_clause_sigs(
+        name: &str,
+        clauses: &[crate::rel::Clause],
+        sigs: &HashMap<String, Vec<Type>>,
+        rows: &HashMap<String, crate::mir::effect::EffectRow>,
+        fn_rows: &HashMap<String, crate::mir::effect::EffectRow>,
+    ) -> (Vec<Type>, crate::mir::effect::EffectRow) {
+        let mut row = crate::mir::effect::EffectRow::Empty;
+        let mut cells: Vec<Type> = match sigs.get(name) {
+            Some(s) => s.clone(),
+            None => vec![Type::Unknown; clauses.first().map(|c| c.head.len()).unwrap_or(0)],
+        };
+        for clause in clauses {
+            // 头项精化（字面量 / cons / 列表模板 → 静态类型）
+            for (i, t) in clause.head.iter().enumerate() {
+                if let Some(cell) = cells.get_mut(i) {
+                    Self::refine_cell(cell, &Self::term_static_ty(t));
+                }
+            }
+            Self::rel_body_walk(&clause.body, name, &mut cells, sigs, rows, fn_rows, &mut row);
+        }
+        (cells, row)
+    }
+
+    /// 子句体目标走（纯数据）：关系调用把 Param(i) 格向签名精化；
+    /// unify(Param, ground) 同向精化；project 并入被投函数行。
+    fn rel_body_walk(
+        g: &crate::rel::Goal,
+        self_name: &str,
+        cells: &mut Vec<Type>,
+        sigs: &HashMap<String, Vec<Type>>,
+        rows: &HashMap<String, crate::mir::effect::EffectRow>,
+        fn_rows: &HashMap<String, crate::mir::effect::EffectRow>,
+        row: &mut crate::mir::effect::EffectRow,
+    ) {
+        use crate::rel::Goal as G;
+        match g {
+            G::Conj(gs) | G::Disj(gs) => {
+                for gi in gs {
+                    Self::rel_body_walk(gi, self_name, cells, sigs, rows, fn_rows, row);
+                }
+            }
+            G::Invoke { name, args, .. } => {
+                if let Some(r) = rows.get(name) {
+                    *row = Self::union_effect_rows(row, r);
+                }
+                let sig = if name == self_name { sigs.get(self_name) } else { sigs.get(name) };
+                if let Some(sig) = sig {
+                    Self::refine_from_terms(args, sig, cells);
+                }
+            }
+            G::Project { func, .. } => {
+                if let crate::rel::ProjectFn::Name(f) = func
+                    && let Some(r) = fn_rows.get(f)
+                {
+                    *row = Self::union_effect_rows(row, r);
+                }
+            }
+            G::Unify(a, b) => {
+                Self::refine_unify_pair(a, b, cells);
+                Self::refine_unify_pair(b, a, cells);
+            }
+            _ => {}
+        }
+    }
+
+    /// unify(Param(i), ground) → 精化位置 i 的格（单向：literal 侧为 ground）。
+    fn refine_unify_pair(a: &crate::rel::Term, b: &crate::rel::Term, cells: &mut [Type]) {
+        // unify(Param(i), <任何具体项>) → 精化位置 i；模板内变量位置为 Any，
+        // 不参与精化（Any 会让 refine_cell 的 open/fixed 判定保持格不变）。
+        if let crate::rel::Term::Param(i) = a {
+            let ty = Self::term_static_ty(b);
+            if !matches!(ty, Type::Any)
+                && let Some(cell) = cells.get_mut(*i)
+            {
+                Self::refine_cell(cell, &ty);
+            }
+        }
+    }
+
+    /// 调用实参（子句体项）与签名的格精化：Param(i) 位置吸收签名类型。
+    fn refine_from_terms(args: &[crate::rel::Term], sig: &[Type], cells: &mut [Type]) {
+        for (i, t) in args.iter().enumerate() {
+            if let Some(st) = sig.get(i)
+                && let crate::rel::Term::Param(p) = t
+                && let Some(cell) = cells.get_mut(*p)
+            {
+                Self::refine_cell(cell, st);
+            }
+        }
+    }
+
+    /// v0.102: 主推断路径的关系定义检查。
+    ///
+    /// 预计算已产出签名/行；本臂做**错误诊断**：子句参数入作用域、头项
+    /// 与签名 Eq 约束、体必须收敛为 Goal。定义本身纯（Nil, Empty）。
+    fn infer_rel_def(
+        &mut self,
+        name: &str,
+        clauses: &[crate::rel::Clause],
+        clause_wits: &[crate::mir::witness::RelClauseWit],
+        _span: Span,
+    ) -> Result<(Type, crate::mir::effect::EffectRow), Vec<TypeError>> {
+        let known_sig = self.rel_sigs.get(name).cloned();
+        let mut row = crate::mir::effect::EffectRow::Empty;
+        for (clause, cw) in clauses.iter().zip(clause_wits.iter()) {
+            let saved = self.env.clone();
+            // 槽位类型表：先按头项结构把签名类型映射到 Param 槽位，
+            // 未映射的槽位（体独有变量 / 匿名变量）取 fresh TypeVar。
+            let mut slot_tys: Vec<Type> =
+                clause.params.iter().map(|_| self.fresh_type_var()).collect();
+            if let Some(sig) = &known_sig {
+                for (j, ht) in clause.head.iter().enumerate() {
+                    if let (crate::rel::Term::Param(i), Some(st)) = (ht, sig.get(j))
+                        && let Some(cell) = slot_tys.get_mut(*i)
+                    {
+                        *cell = st.clone();
+                    }
+                }
+            }
+            for (i, pname) in clause.params.iter().enumerate() {
+                let t = slot_tys.get(i).cloned().unwrap_or(Type::Unknown);
+                self.env.add(pname.clone(), t);
+            }
+            for (i, hw) in cw.head.iter().enumerate() {
+                let (hty, hrow) = self.infer_expr(hw)?;
+                row = self.merge_rows(row, hrow);
+                if let Some(st) = known_sig.as_ref().and_then(|s| s.get(i)) {
+                    self.constraints
+                        .push(Constraint::Eq(Box::new(hty), Box::new(st.clone())));
+                }
+            }
+            let (bty, brow) = self.infer_expr(&cw.body)?;
+            self.constraints
+                .push(Constraint::Eq(Box::new(bty), Box::new(Type::Goal)));
+            row = self.merge_rows(row, brow);
+            self.env = saved;
+        }
+        let merged = match self.rel_effect_rows.get(name) {
+            Some(prev) => self.merge_rows(prev.clone(), row.clone()),
+            None => row.clone(),
+        };
+        self.rel_effect_rows.insert(name.to_string(), merged);
+        Ok((Type::Nil, crate::mir::effect::EffectRow::Empty))
     }
 }
 

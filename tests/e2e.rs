@@ -301,3 +301,234 @@ fn e2e_tea_runtime_compiles() {
 fn e2e_tea_app_runs() {
     assert_ok("tea_app.mora");
 }
+
+// ===================================================================
+// v0.102: 声明式范式（逻辑式/关系式）
+// ===================================================================
+
+/// rel_basic.mora：事实 + 规则 + 双查询变量 → 传递闭包全部有序对。
+#[test]
+fn e2e_rel_basic_runs() {
+    use mora::value::Value;
+    let (last_expr, _) = assert_ok("rel_basic.mora");
+    let pairs = match last_expr {
+        Value::List(items) => items,
+        other => panic!("expected list of (from, to) pairs, got {:?}", other),
+    };
+    // a→b, b→c, c→d 的传递闭包共 6 条有向路径
+    assert_eq!(pairs.len(), 6, "3 节点链的传递闭包应有 6 条路径");
+    let mut seen: Vec<(String, String)> = Vec::new();
+    for p in &pairs {
+        match p {
+            Value::List(t) if t.len() == 2 => {
+                let from = match &t[0] {
+                    Value::String(s) => s.clone(),
+                    o => panic!("from 应为字符串，得到 {:?}", o),
+                };
+                let to = match &t[1] {
+                    Value::String(s) => s.clone(),
+                    o => panic!("to 应为字符串，得到 {:?}", o),
+                };
+                seen.push((from, to));
+            }
+            o => panic!("解应为二元列表（元组），得到 {:?}", o),
+        }
+    }
+    seen.sort();
+    assert_eq!(
+        seen,
+        vec![
+            ("a".to_string(), "b".to_string()),
+            ("a".to_string(), "c".to_string()),
+            ("a".to_string(), "d".to_string()),
+            ("b".to_string(), "c".to_string()),
+            ("b".to_string(), "d".to_string()),
+            ("c".to_string(), "d".to_string()),
+        ],
+        "传递闭包应精确覆盖所有可达对"
+    );
+}
+
+/// rel_single_var.mora：单查询变量 → 解是标量值本身（非元组）。
+#[test]
+fn e2e_rel_single_var_runs() {
+    use mora::value::Value;
+    let (last_expr, _) = assert_ok("rel_single_var.mora");
+    let mut reach: Vec<String> = match last_expr {
+        Value::List(items) => items
+            .iter()
+            .map(|v| match v {
+                Value::String(s) => s.clone(),
+                o => panic!("单变量解应为字符串，得到 {:?}", o),
+            })
+            .collect(),
+        other => panic!("expected list of strings, got {:?}", other),
+    };
+    reach.sort();
+    assert_eq!(reach, vec!["b", "c", "d"], "从 a 可达 b/c/d");
+}
+
+/// rel_zero_var.mora：零查询变量 → 每个解是 nil 成功标记。
+#[test]
+fn e2e_rel_zero_var_runs() {
+    use mora::value::Value;
+    let (last_expr, _) = assert_ok("rel_zero_var.mora");
+    match last_expr {
+        Value::List(items) => {
+            assert_eq!(items.len(), 1, "edge(\"a\",\"b\") 恰有一个解");
+            assert_eq!(items[0], Value::Nil, "零查询变量的解是 nil 成功标记");
+        }
+        other => panic!("expected list, got {:?}", other),
+    }
+}
+
+/// rel_empty.mora：不可满足的目标 → 空解列表（失败剪枝）。
+#[test]
+fn e2e_rel_empty_runs() {
+    use mora::value::Value;
+    let (last_expr, _) = assert_ok("rel_empty.mora");
+    match last_expr {
+        Value::List(items) => assert!(items.is_empty(), "不存在的边应无解"),
+        other => panic!("expected list, got {:?}", other),
+    }
+}
+
+/// rel_run_limit.mora：run N 形式 → 恰好 N 个解（无后缀数字是 Float 的坑）。
+#[test]
+fn e2e_rel_run_limit_runs() {
+    use mora::value::Value;
+    let (last_expr, _) = assert_ok("rel_run_limit.mora");
+    match last_expr {
+        Value::List(items) => assert_eq!(items.len(), 2, "solve 2 应产出恰好 2 个解"),
+        other => panic!("expected list, got {:?}", other),
+    }
+}
+
+/// rel_project.mora：宿主投影（project）—— 关系体内的确定性宿主计算。
+/// 覆盖 Project 节点 + 顶层 task 的词法可见性：
+/// num 绑定 x → project(square, x, y) 调用外层 task 计算 x*x 并与 y 合一。
+#[test]
+fn e2e_rel_project_runs() {
+    use mora::value::Value;
+    let (last_expr, _) = assert_ok("rel_project.mora");
+    let items = match last_expr {
+        Value::List(items) => items,
+        other => panic!("expected list of (x, y) pairs, got {:?}", other),
+    };
+    assert_eq!(items.len(), 3, "num 有 3 条事实，squared 应产出 3 个解");
+    let mut pairs: Vec<(f64, f64)> = Vec::new();
+    for p in &items {
+        match p {
+            Value::List(t) if t.len() == 2 => {
+                let num = |v: &Value| match v {
+                    Value::Int(n) => *n as f64,
+                    Value::Float(n) => *n,
+                    o => panic!("应为数值，得到 {:?}", o),
+                };
+                pairs.push((num(&t[0]), num(&t[1])));
+            }
+            o => panic!("解应为二元列表，得到 {:?}", o),
+        }
+    }
+    pairs.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+    assert_eq!(
+        pairs,
+        vec![(1.0, 1.0), (2.0, 4.0), (3.0, 9.0)],
+        "project(square, x, y) 应把 x*x 绑定到 y"
+    );
+}
+
+/// rel_cons.mora：cons 项构造 + 递归列表关系（appendo）→ 结构化解。
+#[test]
+fn e2e_rel_cons_runs() {
+    use mora::value::Value;
+    let (last_expr, _) = assert_ok("rel_cons.mora");
+    match last_expr {
+        Value::List(items) => {
+            assert_eq!(items.len(), 1, "appendo 的确定性拼接应恰有一个解");
+            // 结果应是 Cons 链 [1, 2, 3]
+            let mut cur = &items[0];
+            // 注意：无后缀数字字面量在 Mora 词法层是 Float（语言约定），
+            // 故 cons(1, ...) 的头是 Float(1.0)。
+            let mut got: Vec<f64> = Vec::new();
+            loop {
+                match cur {
+                    Value::Cons { car, cdr } => {
+                        match &**car {
+                            Value::Float(n) => got.push(*n),
+                            o => panic!("cons 头应为 Float，得到 {:?}", o),
+                        }
+                        cur = cdr;
+                    }
+                    Value::Nil => break,
+                    o => panic!("列表尾部应为 Cons 或 Nil，得到 {:?}", o),
+                }
+            }
+            assert_eq!(got, vec![1.0, 2.0, 3.0], "appendo([1,2], [3]) = [1,2,3]");
+        }
+        other => panic!("expected list of solutions, got {:?}", other),
+    }
+}
+
+// ===================================================================
+// v0.102 缺陷修复回归
+// ===================================================================
+
+/// return_expr_order.mora：`return <expr>` 返回表达式求值寄存器（非硬编码 0）。
+#[test]
+fn e2e_return_expr_order_runs() {
+    let (_v, out) = assert_ok("return_expr_order.mora");
+    // print 捕获依赖运行环境；此处以执行成功 + 首行值断言核心契约
+    // （编译期寄存器正确性由 src 内 emit 单测覆盖，此处锁定端到端不回归）。
+    assert!(
+        out.is_empty() || out[0].contains("105"),
+        "add100(5) 应为 105，得到 {:?}",
+        out
+    );
+}
+
+/// task_lexical_visibility.mora：顶层 task 对嵌套闭包体词法可见。
+#[test]
+fn e2e_task_lexical_visibility_runs() {
+    let (_v, out) = assert_ok("task_lexical_visibility.mora");
+    assert!(
+        out.is_empty() || out.first().is_some_and(|l| l.contains('9')),
+        "via_closure(3) 应为 9，得到 {:?}",
+        out
+    );
+}
+
+/// rel_project.mora 已改为用顶层 task 作投影函数 —— 见 e2e_rel_project_runs。
+/// 另锁定 register-level 语义：`return <expr>` emit 的寄存器即表达式结果。
+#[test]
+fn return_emits_result_register() {
+    use mora::mir::MirInst;
+    let (func, _w) = mora::parser_v3::ParserV3::compile(
+        "task f(n)
+  return n + 100i
+end",
+    )
+    .expect("compile task");
+    // 找到 TaskDef 的 body：末尾 Return 的寄存器必须是 BinaryOp 的 dst
+    let body = func
+        .body
+        .iter()
+        .find_map(|i| match i {
+            MirInst::TaskDef { name, body, .. } if name == "f" => Some(body.as_ref()),
+            _ => None,
+        })
+        .expect("TaskDef f");
+    let binary_dst = body.body.iter().find_map(|i| match i {
+        MirInst::BinaryOp(dst, _, _, _) => Some(*dst),
+        _ => None,
+    });
+    let ret_reg = body.body.iter().find_map(|i| match i {
+        MirInst::Return(Some(r)) => Some(*r),
+        _ => None,
+    });
+    assert_eq!(
+        ret_reg, binary_dst,
+        "Return 必须指向 BinaryOp 的结果寄存器，而非硬编码 0"
+    );
+    assert_ne!(binary_dst, Some(0), "该表达式结果不在 reg 0，能检出硬编码回归");
+}

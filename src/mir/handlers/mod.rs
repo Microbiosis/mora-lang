@@ -41,8 +41,8 @@ pub use self::control::{
 pub use self::definitions::{h_impl_def, h_skill_def, h_trait_def};
 pub use self::effects::{
     h_app_def, AppDefArgs, h_assign, h_define, h_enum_def, h_handle, h_import,
-    h_macro_def, h_model_def, h_msg_def, h_perform, h_struct_def, h_type_alias,
-    h_update_def, h_with_config,
+    h_macro_def, h_model_def, h_msg_def, h_perform, h_rel_def, h_solve, h_struct_def,
+    h_task_def, h_type_alias, h_update_def, h_with_config,
 };
 pub use self::runtime::{
     h_aggregate, h_append_file, h_document_section, h_eval, h_load, h_observe,

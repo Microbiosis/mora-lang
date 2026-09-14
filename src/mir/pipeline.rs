@@ -221,6 +221,8 @@ fn inst_category(inst: &crate::mir::MirInst) -> &'static str {
         MirInst::EnumDef { .. } => "EnumDef",
         MirInst::StructDef { .. } => "StructDef",
         MirInst::ModelDef { .. } => "ModelDef",
+        MirInst::RelDef { .. } => "RelDef",
+        MirInst::Solve { .. } => "Solve",
         MirInst::MsgDef { .. } => "MsgDef",
         MirInst::UpdateDef { .. } => "UpdateDef",
         MirInst::AppDef { .. } => "AppDef",
@@ -275,6 +277,7 @@ fn count_fcfg_children(n: &Fcfg) -> usize {
                 + count_fcfg_nodes(&view.nodes)
         }
         Node::WithConfig { body, .. } => count_fcfg_nodes(&body.nodes),
+        Node::Solve { goal, .. } => count_fcfg_nodes(&goal.nodes),
         Node::ImplDef { methods, .. } => methods.iter().map(|(_, b)| count_fcfg_nodes(&b.nodes)).sum(),
         _ => 0,
     }

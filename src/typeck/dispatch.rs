@@ -49,6 +49,42 @@ pub fn builtin_signatures() -> Vec<(String, Signature)> {
         // v0.75.23: M 原语 merge_with(key, strategy) — 声明 per-key CRDT
         // 合并策略（append/add/dict_union/grow_only_set/lww），作用于其后的
         // worker/transaction/observe 块合并。
+        // v0.102: 声明式范式目标内建（unify/cons 在 infer_call 特判获得
+        // 更精确的类型约束；both/either/fail/succeed 走通用表签名）
+        (
+            "both".to_string(),
+            Signature::new(
+                vec![
+                    ("g1".to_string(), Type::Goal),
+                    ("g2".to_string(), Type::Goal),
+                ],
+                Type::Goal,
+            ),
+        ),
+        (
+            "either".to_string(),
+            Signature::new(
+                vec![
+                    ("g1".to_string(), Type::Goal),
+                    ("g2".to_string(), Type::Goal),
+                ],
+                Type::Goal,
+            ),
+        ),
+        ("fail".to_string(), Signature::new(vec![], Type::Goal)),
+        ("succeed".to_string(), Signature::new(vec![], Type::Goal)),
+        // project(f, arg, result) — f 的效果行在 infer_call 特判并入
+        (
+            "project".to_string(),
+            Signature::new(
+                vec![
+                    ("f".to_string(), Type::Any),
+                    ("arg".to_string(), Type::Any),
+                    ("result".to_string(), Type::Any),
+                ],
+                Type::Goal,
+            ),
+        ),
         (
             "merge_with".to_string(),
             Signature::new(

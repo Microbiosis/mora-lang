@@ -1,0 +1,13 @@
+-- v0.102 回归：顶层 task 必须对嵌套函数体词法可见
+-- 缺陷：TaskDef 是 dispatch no-op，task 只在 build_task_registry（从**当前
+-- 函数体**静态收集）中；嵌套函数执行时看不到外层声明。
+task square(n)
+  return n * n
+end
+
+task main()
+  let via_closure = fn(x) square(x) end
+  print(via_closure(3i))
+  let via_nested = fn(y) square(y + 1i) end
+  print(via_nested(4i))
+end

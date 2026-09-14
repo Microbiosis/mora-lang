@@ -69,7 +69,9 @@ pub fn h_call(
             Value::Task { .. }
             | Value::Closure { .. }
             | Value::Compose(_)
-            | Value::Partial(_, _) => interp.call_value(&callable, arg_vals, effects)?,
+            | Value::Partial(_, _)
+            // v0.102: 关系值可调用 —— 调用构造 Goal::Invoke（目标构建期）
+            | Value::Relation { .. } => interp.call_value(&callable, arg_vals, effects)?,
             _ => interp.mir_call_function(name, arg_vals, env, effects)?,
         }
     } else {

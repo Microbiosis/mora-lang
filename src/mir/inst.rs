@@ -12,7 +12,8 @@ use super::handlers::{
     h_handle, h_impl_def, h_import, h_index, h_index_assign, h_jump, h_jump_if, h_jump_if_not,
     h_list_lit, h_load, h_macro_def, h_match_expr, h_method_call, h_model_def, h_msg_def,
     h_observe, h_orchestrate, h_perform, h_pipe, h_prompt, h_prompt_section, h_read_bytes_file,
-    h_read_file, h_return, h_save, h_send, h_skill_def, h_span, h_struct_def, h_trait_def,
+    h_read_file, h_rel_def, h_return, h_save, h_send, h_skill_def, h_solve, h_span,
+    h_struct_def, h_task_def, h_trait_def,
     h_transaction, h_type_alias, h_update_def, h_var, h_with_config, h_worker,
     h_write_bytes_file, h_write_file,
     h_quasiquote,
@@ -46,6 +47,8 @@ impl MirInst {
             MirInst::Prompt(r, _) => Some(*r),
             MirInst::MatchExpr { arms, .. } => arms.last().map(|a| a.3),
             MirInst::Perform { dst, .. } => Some(*dst),
+            // v0.102: solve 产生解列表（RelDef 是语句，落 `_ => None`）
+            MirInst::Solve { dst, .. } => Some(*dst),
             // Handle 是语句（不产生值），唯一写入 dst 的是 handler 末尾的 resume 续
             // 续名——该续名由 h_handle 自己 emit Const(dst, ...) 而非 Handle 自身。
             MirInst::Handle { .. } => None,
@@ -116,6 +119,10 @@ impl MirInst {
             | MirInst::EnumDef { .. }
             | MirInst::StructDef { .. }
             // v0.83: TEA type definitions — no input regs
+            // v0.102: 声明式范式 — RelDef 声明型；Solve 的 goal 是独立寄存器
+            // 空间的嵌套 MirFunction，limit/query_vars 非寄存器
+            | MirInst::RelDef { .. }
+            | MirInst::Solve { .. }
             | MirInst::ModelDef { .. }
             | MirInst::MsgDef { .. }
             | MirInst::UpdateDef { .. }
@@ -236,6 +243,9 @@ impl MirInst {
                 params: params.clone(),
                 body: body.clone(),
             },
+            // v0.102: 声明式范式 — RelDef 无寄存器；Solve 的嵌套 goal 构建
+            // 体寄存器空间独立，不递归 map（与 AppDef/Closure 同规则）
+            MirInst::RelDef { .. } | MirInst::Solve { .. } => self.clone(),
             // AppDef: nested MirFunctions 不递归 map（独立 reg 空间）
             MirInst::AppDef {
                 name,
@@ -358,6 +368,10 @@ impl MirInst {
             | MirInst::EnumDef { .. }
             | MirInst::StructDef { .. }
             // v0.83: TEA definitions modify env (register Type::Tea*)
+            // v0.102: RelDef 注册 Value::Relation（改 env）；Solve 执行搜索
+            // （读 env 关系 + 运行 Project 宿主函数）
+            | MirInst::RelDef { .. }
+            | MirInst::Solve { .. }
             | MirInst::ModelDef { .. }
             | MirInst::MsgDef { .. }
             | MirInst::UpdateDef { .. }
@@ -538,6 +552,15 @@ pub fn dispatch(
             });
             Ok(Flow::Continue)
         }
+        // v0.102: 声明式范式 dispatch
+        MirInst::RelDef { name, clauses } => {
+            h_rel_def(env, name, clauses);
+            Ok(Flow::Continue)
+        }
+        MirInst::Solve { dst, limit, query_vars, anon_vars, goal } => {
+            h_solve(interp, env, regs, *dst, *limit, query_vars, anon_vars, goal, effects)?;
+            Ok(Flow::Continue)
+        }
         MirInst::Import(path) => {
             h_import(interp, env, path, effects)?;
             Ok(Flow::Continue)
@@ -700,9 +723,15 @@ pub fn dispatch(
             Ok(Flow::Continue)
         }
 
+        // v0.102: task 定义注册一等 Value::Task（词法可见性 —— 嵌套代码
+        // 可沿 env 父链解析到外层 task；此前是 no-op，嵌套调用报未定义）
+        MirInst::TaskDef { name, params, body } => {
+            h_task_def(env, name, params, body);
+            Ok(Flow::Continue)
+        }
+
         // ── Control flow + no-ops ──
-        MirInst::TaskDef { .. }
-        | MirInst::ToolDef { .. }
+        MirInst::ToolDef { .. }
         | MirInst::MatchArm { .. }
         | MirInst::Label(_) => Ok(Flow::Continue),
         MirInst::Jump(lbl) => Ok(h_jump(*lbl)),

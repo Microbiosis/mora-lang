@@ -192,6 +192,35 @@ pub enum WitnessKind {
         params: Vec<crate::mir::hint::TypeHint>,
         result: Option<crate::mir::hint::TypeHint>,
     },
+    // ── v0.102: 声明式范式（逻辑式/关系式）witness ──
+    /// 关系定义。`clauses` 是编译期子句模板数据（lower_witness 直接取用
+    /// 构造 MirInst::RelDef，单一事实源）；`clause_wits` 是与 clauses
+    /// 一一对应的类型推断镜像（头项 + 体目标）。
+    RelDef {
+        name: String,
+        clauses: Vec<crate::rel::Clause>,
+        clause_wits: Vec<RelClauseWit>,
+    },
+    /// solve 查询。goal 是目标构建表达式 witness（运行期构建 `Value::Goal`）；
+    /// query_vars 是 `?` 隐式逻辑变量名（首次出现序）；limit 是 run N 上界。
+    Solve {
+        limit: Option<usize>,
+        /// 投影变量名（`?name`，首次出现序）—— 解中返回其绑定。
+        query_vars: Vec<String>,
+        /// 存在性匿名变量名（`_`，每次出现独立）—— 分配 fresh 逻辑变量
+        /// 供目标引用，但不投影进解。
+        anon_vars: Vec<String>,
+        goal: Box<MirWitness>,
+    },
+}
+
+/// v0.102: 关系子句 witness —— 编译期模板数据 + 类型推断镜像。
+#[derive(Debug, Clone, PartialEq)]
+pub struct RelClauseWit {
+    /// 头项镜像（与 `Clause::head` 一一对应）。
+    pub head: Vec<MirWitness>,
+    /// 体目标镜像。
+    pub body: Box<MirWitness>,
 }
 
 /// 调用目标 — 镜像 MirCallee。
@@ -308,6 +337,17 @@ impl MirWitness {
                 out
             }
             WitnessKind::Quasiquote { segments } => segments.iter().collect(),
+            // v0.102: 声明式范式 — RelDef 的类型镜像子树（头项 + 体目标）；
+            // Solve 的目标构建表达式。
+            WitnessKind::RelDef { clause_wits, .. } => {
+                let mut out: Vec<&MirWitness> = Vec::new();
+                for cw in clause_wits {
+                    out.extend(cw.head.iter());
+                    out.push(cw.body.as_ref());
+                }
+                out
+            }
+            WitnessKind::Solve { goal, .. } => vec![goal.as_ref()],
         }
     }
 }

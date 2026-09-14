@@ -556,6 +556,10 @@ fn split_into_ssa(
             | MirInst::EnumDef { .. }
             | MirInst::StructDef { .. }
             // v0.83: TEA definitions — compile-time only, pass-through
+            // v0.102: 声明式范式 — RelDef 声明型；Solve 与 Perform 同属
+            // effectful 指令，SSA 不线性化（pass-through）
+            | MirInst::RelDef { .. }
+            | MirInst::Solve { .. }
             | MirInst::ModelDef { .. }
             | MirInst::MsgDef { .. }
             | MirInst::UpdateDef { .. }
@@ -618,6 +622,10 @@ fn is_ssa_passthrough(inst: &MirInst) -> bool {
             | MirInst::EnumDef { .. }
             | MirInst::StructDef { .. }
             // v0.83: TEA definitions — compile-time only, pass-through
+            // v0.102: 声明式范式 — RelDef 声明型；Solve 与 Perform 同属
+            // effectful 指令，SSA 不线性化（pass-through）
+            | MirInst::RelDef { .. }
+            | MirInst::Solve { .. }
             | MirInst::ModelDef { .. }
             | MirInst::MsgDef { .. }
             | MirInst::UpdateDef { .. }

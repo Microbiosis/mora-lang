@@ -375,6 +375,10 @@ pub fn type_name(value: &Value) -> &'static str {
         Value::Nil => "nil",
         Value::List(_) => "list",
         Value::Dict(_) => "dict",
+        // v0.102: 声明式范式值
+        Value::Relation { .. } => "relation",
+        Value::Goal(_) => "goal",
+        Value::LogicVar(_) => "logicvar",
         Value::Task { .. } => "task",
         Value::Tool { .. } => "tool",
         Value::Closure { .. } => "closure",

@@ -188,17 +188,26 @@ impl ParserV3 {
         match token {
             TokenType::Return => {
                 self.advance();
+                // v0.102 修复：`return <expr>` 必须返回**表达式的求值寄存器**。
+                // 此前硬编码 `map(|_| 0)` —— 丢弃 emit_expr_w 的结果寄存器，
+                // 一律返回 reg 0。单表达式体（`task f(n) return n*n`）中函数
+                // 首参恰好落在 reg 0 而掩盖了缺陷；一旦表达式含多条指令
+                // （如 `return n + 100i`，n 在 reg 0、结果在 reg 2），就返回
+                // 了错误的值（实为第一个操作数）。与 `break`/`continue` 的
+                // 寄存器获取方式对齐：取真实结果寄存器。
                 let value = if self.check(&TokenType::Newline)
                     || self.check(&TokenType::RBrace)
                     || self.is_at_end()
                 {
                     None
                 } else {
-                    self.emit_expr_w().map(|(_, w)| Box::new(w))
+                    self.emit_expr_w()
+                        .map(|(reg, w)| (reg, Box::new(w)))
                 };
-                self.emit.emit(MirInst::Return(value.as_ref().map(|_| 0)));
+                self.emit
+                    .emit(MirInst::Return(value.as_ref().map(|(reg, _)| *reg)));
                 Some(MirWitness {
-                    kind: WitnessKind::Return(value),
+                    kind: WitnessKind::Return(value.map(|(_, w)| w)),
                     span,
                 })
             }

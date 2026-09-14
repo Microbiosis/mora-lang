@@ -313,6 +313,12 @@ pub fn value_to_json(value: &Value) -> String {
             ),
         },
         Value::TeaMsg(msg) => value_to_json(&msg.to_value()),
+        // v0.102: 声明式范式值 — 无 JSON 形态，序列化为描述串
+        Value::Relation { name, clauses } => {
+            format!("\"<relation {}/{}>\"", name, clauses.len())
+        }
+        Value::Goal(_) => "\"<goal>\"".to_string(),
+        Value::LogicVar(id) => format!("\"_.{}\"", id),
     }
 }
 

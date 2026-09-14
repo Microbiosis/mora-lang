@@ -267,6 +267,21 @@ fn annotate_node(node: &Fcfg, table: &TypeTable) -> Node<TypeInfo> {
             span: *span,
             meta: info,
         },
+        // v0.102: 声明式范式 — RelDef 无子块；Solve 的 goal 块递归标注
+        Node::RelDef { name, clauses, span, .. } => Node::RelDef {
+            name: name.clone(),
+            clauses: clauses.clone(),
+            span: *span,
+            meta: info,
+        },
+        Node::Solve { limit, query_vars, anon_vars, goal, span, .. } => Node::Solve {
+            limit: *limit,
+            query_vars: query_vars.clone(),
+            anon_vars: anon_vars.clone(),
+            goal: annotate_block(goal, table),
+            span: *span,
+            meta: info,
+        },
         Node::UpdateDef { name, params, body, span, .. } => Node::UpdateDef {
             name: name.clone(),
             params: params.clone(),

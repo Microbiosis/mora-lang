@@ -483,6 +483,24 @@ fn lower_node(ctx: &mut EmitContext, node: &Fcfg) {
                 view_mir: Box::new(view_mir),
             });
         }
+        // ── v0.102: 声明式范式 ──
+        Node::RelDef { name, clauses, .. } => {
+            ctx.emit(MirInst::RelDef {
+                name: name.clone(),
+                clauses: clauses.clone(),
+            });
+        }
+        Node::Solve { limit, query_vars, anon_vars, goal, .. } => {
+            let goal_mir = lower_block_to_function(ctx, goal);
+            let dst = ctx.alloc_reg();
+            ctx.emit(MirInst::Solve {
+                dst,
+                limit: *limit,
+                query_vars: query_vars.clone(),
+                anon_vars: anon_vars.clone(),
+                goal: Box::new(goal_mir),
+            });
+        }
 
         // ── 编排 ──
         Node::Orchestrate { input_var, result_var, .. } => {

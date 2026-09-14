@@ -1,0 +1,13 @@
+-- v0.102 声明式范式：宿主投影（project）—— 关系体内的确定性宿主计算
+-- 投影函数是顶层 task（修复后嵌套代码可词法解析到外层 task）
+task square(n)
+  return n * n
+end
+
+rel num(1i)
+rel num(2i)
+rel num(3i)
+
+rel squared(x, y) num(x), project(square, x, y) end
+
+solve { squared(?x, ?y) }

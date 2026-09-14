@@ -335,6 +335,16 @@ fn lower_node(ctx: &mut CoreContext, node: &Ehir) {
             // TEA 定义在 EHIR 阶段已注册到 env，Core 层无操作
         }
 
+        // ── v0.102: 声明式范式 ──
+        Node::RelDef { .. } => {
+            // 关系定义在 emit 阶段注册到 env，Core 层无操作（同 TEA 定义）
+        }
+        Node::Solve { goal, .. } => {
+            // 目标构建体降维处理；solve 的搜索语义在 MIR 执行层
+            //（同 WithConfig 的 body 透传模式）
+            lower_block(ctx, goal);
+        }
+
         // ── 编排 → CMIR 层处理，Core 层透传 ──
         Node::Orchestrate { .. } => {
             // 编排在 CMIR 层降维，Core 层不处理

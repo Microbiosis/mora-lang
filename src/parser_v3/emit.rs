@@ -46,6 +46,9 @@ impl ParserV3 {
             TokenType::Identifier(ref s) if s == "while" => self.emit_while_w().map(|(_, w)| w),
             // v0.88: TEA app 块
             TokenType::App => self.emit_app_def_w(),
+            // v0.102: 声明式范式（逻辑式/关系式）
+            TokenType::Rel => self.emit_rel_def_w(),
+            TokenType::Solve => self.emit_solve_w().map(|(_, w)| w),
             // v0.75.81: 事务家族 + eval 断言（顶层同嵌套分发）
             TokenType::Identifier(ref s)
                 if s == "transaction"
@@ -501,6 +504,8 @@ impl ParserV3 {
         let span = crate::common::Span::new(token.line, token.column);
 
         let (reg, wit) = match token.token_type {
+            // v0.102: solve 作为表达式（`let r = solve { ... }`）
+            TokenType::Solve => return self.emit_solve_w(),
             TokenType::Int(val) => {
                 self.advance();
                 let dst = self.emit.alloc_reg();
@@ -1385,6 +1390,9 @@ impl ParserV3 {
             // v0.85: `with` 配置块（可嵌套在 task body 内）
             TokenType::With => self.emit_with_w().map(|w| (0, w)),
             TokenType::App => self.emit_app_def_w().map(|w| (0, w)),
+            // v0.102: 声明式范式（嵌套语句上下文）
+            TokenType::Rel => self.emit_rel_def_w().map(|w| (0, w)),
+            TokenType::Solve => self.emit_solve_w(),
             TokenType::Identifier(n) if n == "commit" => {
                 let span = self.span_of_current();
                 self.advance(); // 'commit'

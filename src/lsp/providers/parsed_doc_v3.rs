@@ -41,6 +41,16 @@ fn walk_witness_kind<F: FnMut(&MirWitness)>(kind: &WitnessKind, visit: &mut F) {
         | WitnessKind::MsgDef { .. }
         | WitnessKind::UpdateDef { .. }
         | WitnessKind::AppDef { .. } => {}
+        // v0.102: 声明式范式 — 遍历类型推断镜像（hover/补全可见）
+        WitnessKind::RelDef { clause_wits, .. } => {
+            for cw in clause_wits {
+                for h in &cw.head {
+                    walk_witness(h, visit);
+                }
+                walk_witness(&cw.body, visit);
+            }
+        }
+        WitnessKind::Solve { goal, .. } => walk_witness(goal, visit),
         WitnessKind::Binary { left, right, .. } => {
             walk_witness(left, visit);
             walk_witness(right, visit);

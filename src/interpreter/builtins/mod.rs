@@ -29,6 +29,8 @@ mod skill;
 pub mod stats;
 // v0.83: TEA runtime + transducer builtin
 mod tea;
+// v0.102: 声明式范式（逻辑式/关系式）目标原语
+mod rel;
 mod toolplane;
 mod xform;
 

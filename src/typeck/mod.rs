@@ -173,6 +173,16 @@ pub enum Type {
         update: Box<Type>,
         view: Box<Type>,
     },
+    // ── v0.102: 声明式范式（逻辑式/关系式）类型 ──
+    /// 关系类型 — 位置参数签名（由子句头/体推断，precompute_rel_sigs
+    /// 不动点预计算）。关系调用点实参逐一与签名统一，表达式类型是 Goal。
+    Relation(Vec<Type>),
+    /// 目标类型 — 目标一等值（unify/both/either/关系调用/项目投影的产物，
+    /// solve 的消费对象）。
+    Goal,
+    /// v0.102: cons 单元类型（逻辑式项构造 `cons(h, t)` 的产物，appendo
+    /// 等递归列表关系的载体）。
+    Cons(Box<Type>, Box<Type>),
 } // ← close pub enum Type
 
 impl Type {
@@ -281,6 +291,13 @@ impl Type {
                 format!("msg {} = {}", name, parts.join(" | "))
             }
             Type::TeaApp { name, model, .. } => format!("app<{}: {}>", name, model.name()),
+            // v0.102: 声明式范式
+            Type::Relation(params) => {
+                let parts: Vec<String> = params.iter().map(|t| t.name()).collect();
+                format!("rel({})", parts.join(", "))
+            }
+            Type::Goal => "goal".to_string(),
+            Type::Cons(h, t) => format!("cons<{}, {}>", h.name(), t.name()),
         }
     }
 
@@ -370,6 +387,8 @@ impl Type {
                     Type::Union(vec![])
                 }
             }
+            // v0.102: 声明式范式类型注解
+            "goal" => Type::Goal,
             // v0.12: 未知类型名 fallback → 改用 Type::Trait 占位
             //   这样调用方可以查 trait_registry 判断是否合法
             //   （之前是 Any, 丢失了 hint 信息）
@@ -531,6 +550,17 @@ impl Type {
         // v0.91: BigInt 自反兼容（同类型 BigInt 等于 BigInt）
         if matches!(self, Type::BigInt) && matches!(expected, Type::BigInt) {
             return true;
+        }
+        // v0.102: 声明式范式 — Goal 自反；cons 逐位兼容；关系按位置签名兼容
+        if matches!(self, Type::Goal) && matches!(expected, Type::Goal) {
+            return true;
+        }
+        if let (Type::Cons(h1, t1), Type::Cons(h2, t2)) = (self, expected) {
+            return h1.compatible_with(h2) && t1.compatible_with(t2);
+        }
+        if let (Type::Relation(p1), Type::Relation(p2)) = (self, expected) {
+            return p1.len() == p2.len()
+                && p1.iter().zip(p2.iter()).all(|(a, b)| a.compatible_with(b));
         }
         // v0.08.5: Type::Struct 已删除，统一为 Type::Trait 注册
         self == expected
@@ -729,6 +759,17 @@ if let (Type::Result_(t1, e1), Type::Result_(t2, e2)) = (self, super_ty) {
         if matches!(self, Type::BigInt) && matches!(super_ty, Type::BigInt) {
             return true;
         }
+        // v0.102: 声明式范式 — Goal 自反；cons 逐位 subtype；关系按位置签名
+        if matches!(self, Type::Goal) && matches!(super_ty, Type::Goal) {
+            return true;
+        }
+        if let (Type::Cons(h1, t1), Type::Cons(h2, t2)) = (self, super_ty) {
+            return h1.subtype_of(h2) && t1.subtype_of(t2);
+        }
+        if let (Type::Relation(p1), Type::Relation(p2)) = (self, super_ty) {
+            return p1.len() == p2.len()
+                && p1.iter().zip(p2.iter()).all(|(a, b)| a.subtype_of(b));
+        }
         // 兜底：同构严格相等
         self == super_ty
     }
@@ -802,6 +843,8 @@ pub fn is_known_type(name: &str) -> bool {
             | "partial"
             | "macro"
             | "any"
+            // v0.102: 声明式范式
+            | "goal"
     ) || lower.starts_with("list<")
         || lower.starts_with("dict<")
         || lower.starts_with("result<")

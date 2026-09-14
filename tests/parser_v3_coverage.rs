@@ -70,6 +70,14 @@ where
                 .find_map(|(_, v)| walk(v, pred))
                 .or_else(|| walk(body, pred)),
             WitnessKind::Quasiquote { segments } => segments.iter().find_map(|s| walk(s, pred)),
+            // v0.102: 声明式范式 — 关系定义镜像子树 + solve 目标构建体
+            WitnessKind::RelDef { clause_wits, .. } => clause_wits.iter().find_map(|cw| {
+                cw.head
+                    .iter()
+                    .find_map(|h| walk(h, pred))
+                    .or_else(|| walk(&cw.body, pred))
+            }),
+            WitnessKind::Solve { goal, .. } => walk(goal, pred),
             _ => None,
         }
     }
@@ -219,4 +227,62 @@ fn union_type_single_member_parses_as_plain_type() {
         found.is_some(),
         "single-member union should be a plain Type::Int, not Type::Union"
     );
+}
+
+// ─── v0.102 声明式范式（逻辑式/关系式）────────────────────────────────
+
+#[test]
+fn rel_fact_def_parses() {
+    let ws = compile_witnesses("rel edge(\"a\", \"b\")");
+    let found = find_witness(&ws, &|k| {
+        matches!(k, WitnessKind::RelDef { name, clauses, .. }
+            if name == "edge" && clauses.len() == 1)
+    });
+    assert!(found.is_some(), "expected RelDef witness for the edge fact");
+}
+
+#[test]
+fn rel_rule_def_parses_with_conjunctive_body() {
+    let ws = compile_witnesses(
+        "rel path(x, y) edge(x, y) end
+rel path(x, z) edge(x, y), path(y, z) end",
+    );
+    let found = find_witness(&ws, &|k| {
+        matches!(k, WitnessKind::RelDef { name, clauses, .. }
+            if name == "path" && clauses.len() == 1)
+    });
+    assert!(found.is_some(), "expected RelDef witness for the recursive path rule");
+}
+
+#[test]
+fn solve_query_parses_with_query_vars() {
+    let ws = compile_witnesses("rel e(1i)
+solve { e(?x) }");
+    let found = find_witness(&ws, &|k| {
+        matches!(k, WitnessKind::Solve { query_vars, limit: None, .. }
+            if query_vars == &vec!["x".to_string()])
+    });
+    assert!(found.is_some(), "expected Solve witness with query var x and no limit");
+}
+
+#[test]
+fn solve_run_limit_parses() {
+    // 无后缀数字字面量是 Float —— limit 解析须接受整数值 Float
+    let ws = compile_witnesses("rel e(1i)
+solve 3 { e(?x) }");
+    let found = find_witness(&ws, &|k| {
+        matches!(k, WitnessKind::Solve { limit: Some(3), .. })
+    });
+    assert!(found.is_some(), "expected Solve witness with limit 3");
+}
+
+#[test]
+fn solve_anon_var_is_not_projected() {
+    let ws = compile_witnesses("rel e(1i)
+solve { e(_) }");
+    let found = find_witness(&ws, &|k| {
+        matches!(k, WitnessKind::Solve { query_vars, anon_vars, .. }
+            if query_vars.is_empty() && anon_vars.len() == 1)
+    });
+    assert!(found.is_some(), "anonymous var should be in anon_vars, not query_vars");
 }

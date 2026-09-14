@@ -299,6 +299,23 @@ pub enum Node<M> {
         span: Span,
         meta: M,
     },
+    // ── v0.102: 声明式范式（逻辑式/关系式）──
+    /// 关系定义 —— 编译期子句模板数据随节点携带（lower 直接取用）。
+    RelDef {
+        name: String,
+        clauses: Vec<crate::rel::Clause>,
+        span: Span,
+        meta: M,
+    },
+    /// solve 查询 —— goal 是目标构建体块。
+    Solve {
+        limit: Option<usize>,
+        query_vars: Vec<String>,
+        anon_vars: Vec<String>,
+        goal: Block<M>,
+        span: Span,
+        meta: M,
+    },
 
     // ── 元编程 ──
     Quasiquote {
@@ -531,6 +548,8 @@ impl<M> Node<M> {
             | Node::MsgDef { span, .. }
             | Node::UpdateDef { span, .. }
             | Node::AppDef { span, .. }
+            | Node::RelDef { span, .. }
+            | Node::Solve { span, .. }
             | Node::Quasiquote { span, .. }
             | Node::Orchestrate { span, .. }
             | Node::WithConfig { span, .. }
@@ -579,6 +598,8 @@ impl<M> Node<M> {
             | Node::MsgDef { meta, .. }
             | Node::UpdateDef { meta, .. }
             | Node::AppDef { meta, .. }
+            | Node::RelDef { meta, .. }
+            | Node::Solve { meta, .. }
             | Node::Quasiquote { meta, .. }
             | Node::Orchestrate { meta, .. }
             | Node::WithConfig { meta, .. }

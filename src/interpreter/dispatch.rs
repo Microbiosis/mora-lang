@@ -92,6 +92,13 @@ impl Interpreter {
             "apply" => self.call_builtin_apply(args, effects),
             "curry" => self.call_builtin_curry(args),
             "uncurry" => self.call_builtin_uncurry(args),
+            // v0.102: 声明式范式目标原语
+            "unify" => self.call_builtin_unify(args),
+            "both" | "conde" => self.call_builtin_both(args),
+            "either" => self.call_builtin_either(args),
+            "project" => self.call_builtin_project(args),
+            "fail" => self.call_builtin_fail(args),
+            "succeed" => self.call_builtin_succeed(args),
             "cons" => self.call_builtin_cons(args),
             "car" => self.call_builtin_car(args),
             "cdr" => self.call_builtin_cdr(args),
@@ -168,6 +175,14 @@ impl Interpreter {
                 }
                 crate::mir::vm::run_mir(mir_body, self, &mut child_env, effects)
             }
+            // v0.102: 关系值调用 → Goal::Invoke（自含子句，搜索期无需按名解析）
+            Value::Relation { name, clauses } => Ok(Value::Goal(Box::new(
+                crate::rel::Goal::Invoke {
+                    name: name.clone(),
+                    clauses: Some(clauses.clone()),
+                    args: args.iter().map(|a| crate::rel::Term::Val(a.clone())).collect(),
+                },
+            ))),
             // α.10: Compose/Partial 链路递归 call_value。
             Value::Compose(funcs) => {
                 let mut result = args;

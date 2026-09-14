@@ -324,6 +324,12 @@ fn value_to_json(v: &Value) -> JsonValue {
         Value::BigInt(n) => JsonValue::String_(n.to_string()),
         Value::String(s) => JsonValue::String_(s.clone()),
         Value::Char(c) => JsonValue::String_(c.to_string()),
+        // v0.102: 声明式范式值 — 无 JSON 形态，序列化为描述串
+        Value::Relation { name, clauses } => {
+            JsonValue::String_(format!("<relation {}/{}>", name, clauses.len()))
+        }
+        Value::Goal(_) => JsonValue::String_("<goal>".into()),
+        Value::LogicVar(id) => JsonValue::String_(format!("_.{}", id)),
         Value::List(items) => JsonValue::Array(items.iter().map(value_to_json).collect()),
         Value::Dict(map) => {
             let mut out = std::collections::BTreeMap::new();

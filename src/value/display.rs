@@ -159,6 +159,12 @@ impl std::fmt::Display for Value {
                 }
             },
             Value::TeaMsg(msg) => write!(f, "Msg({:?})", msg.tag),
+            // v0.102: 声明式范式 — 关系/目标/逻辑变量
+            Value::Relation { name, clauses } => {
+                write!(f, "<relation {}/{} clause(s)>", name, clauses.len())
+            }
+            Value::Goal(_) => write!(f, "<goal>"),
+            Value::LogicVar(id) => write!(f, "_.{}", id),
         }
     }
 }

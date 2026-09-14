@@ -1,0 +1,10 @@
+-- v0.102 声明式范式：事实 + 规则 + 双查询变量（传递闭包）
+rel edge("a", "b")
+rel edge("b", "c")
+rel edge("c", "d")
+
+rel path(x, y) edge(x, y) end
+rel path(x, z) edge(x, y), path(y, z) end
+
+-- 传递闭包全部 (from, to) 对
+solve { path(?from, ?to) }

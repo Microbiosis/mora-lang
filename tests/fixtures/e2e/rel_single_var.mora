@@ -1,0 +1,10 @@
+-- v0.102 声明式范式：单查询变量投影（值为标量而非元组）
+rel edge("a", "b")
+rel edge("b", "c")
+rel edge("c", "d")
+
+rel path(x, y) edge(x, y) end
+rel path(x, z) edge(x, y), path(y, z) end
+
+-- 从 "a" 可达的节点（单变量 → 每个解是该字符串本身）
+solve { path("a", ?to) }

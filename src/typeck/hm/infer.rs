@@ -462,6 +462,60 @@ impl HMInference {
             }
         };
 
+        // v0.102: 关系调用特判 —— 按关系签名（precompute_rel_sigs 不动点）
+        // 逐位置校验实参并返回 Goal；关系体的效果行在调用点并入。
+        if let WitnessCallee::Name(n) | WitnessCallee::Var(n) = callee
+            && let Some(sig) = self.rel_sigs.get(n).cloned()
+        {
+                let mut arg_tys: Vec<Type> = Vec::new();
+                for a in args {
+                    let (t, r) = self.infer_expr(a)?;
+                    arg_tys.push(t);
+                    acc_row = self.merge_rows(acc_row, r);
+                }
+                if arg_tys.len() != sig.len() {
+                    return Err(vec![TypeError::ArityMismatch {
+                        expected: sig.len(),
+                        actual: arg_tys.len(),
+                        span,
+                    }]);
+                }
+                for (at, st) in arg_tys.iter().zip(sig.iter()) {
+                    self.constraints
+                        .push(Constraint::Eq(Box::new(at.clone()), Box::new(st.clone())));
+                }
+                let rel_row = self
+                    .rel_effect_rows
+                    .get(n)
+                    .cloned()
+                    .unwrap_or(crate::mir::effect::EffectRow::Empty);
+                return Ok((Type::Goal, self.merge_rows(acc_row, rel_row)));
+        }
+        // v0.102: project(f, args..., result) —— 首个实参是函数名引用（非变量
+        // 使用，不查 env）；并入被投函数 f 的效果行（行必须传播到 solve 位点，
+        // 否则 project 内的 perform 漏检），并推断其余实参与结果项。
+        if let WitnessCallee::Name(n) = callee
+            && n == "project"
+        {
+            let rest = if args.is_empty() { args } else { &args[1..] };
+            for a in rest {
+                let (_, r) = self.infer_expr(a)?;
+                acc_row = self.merge_rows(acc_row, r);
+            }
+            if let Some(first) = args.first() {
+                let fname = match &first.kind {
+                    WitnessKind::Variable(f) | WitnessKind::FnDef { name: f, .. } => Some(f.clone()),
+                    WitnessKind::Literal(crate::common::Literal::String(f, _)) => Some(f.clone()),
+                    _ => None,
+                };
+                if let Some(f) = fname
+                    && let Some(r) = self.fn_effect_rows.get(&f).cloned()
+                {
+                    acc_row = self.merge_rows(acc_row, r);
+                }
+            }
+            return Ok((Type::Goal, acc_row));
+        }
         // v0.75.24: merge_with(key, strategy) 的策略名字面量编译期校验 —
         // 非法策略（静态字符串）在 typeck 阶段拦截，不再留到运行时
         // （运行时变量仍由运行时 MergeStrategy::from_name 兜底）。

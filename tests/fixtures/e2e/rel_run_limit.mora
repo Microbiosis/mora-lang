@@ -1,0 +1,9 @@
+-- v0.102 声明式范式：run N 上界（无后缀数字字面量是 Float，parser 接受整数值）
+rel edge("a", "b")
+rel edge("b", "c")
+rel edge("c", "d")
+
+rel path(x, y) edge(x, y) end
+rel path(x, z) edge(x, y), path(y, z) end
+
+solve 2 { path(?from, ?to) }

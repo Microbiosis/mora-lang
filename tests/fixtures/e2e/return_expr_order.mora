@@ -1,0 +1,15 @@
+-- v0.102 回归：`return <expr>` 必须返回表达式求值寄存器
+-- 缺陷：emit_return_break_continue_w 硬编码 Return(0)，丢弃结果寄存器。
+-- 单表达式体（首参恰在 reg 0）掩盖了它；一旦表达式含多条指令即暴露。
+task add100(n)
+  return n + 100i
+end
+
+task multi(a, b)
+  return a * 10i + b
+end
+
+task main()
+  print(add100(5i))
+  print(multi(4i, 7i))
+end

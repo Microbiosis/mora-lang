@@ -1,0 +1,6 @@
+-- v0.102 声明式范式：cons 项构造 + 递归列表关系（appendo 风格）
+rel appendo(nil, ys, ys)
+rel appendo(cons(h, t), ys, cons(h, zs)) appendo(t, ys, zs) end
+
+-- 把 [1, 2] 与 [3] 拼接，枚举全部结果
+solve { appendo(cons(1, cons(2, nil)), cons(3, nil), ?r) }

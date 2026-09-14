@@ -501,6 +501,25 @@ fn build_node(b: &mut FcfgBuilder, w: &MirWitness) -> Node<()> {
                 meta: (),
             }
         }
+        WitnessKind::RelDef { name, clauses, .. } => {
+            Node::RelDef {
+                name: name.clone(),
+                clauses: clauses.clone(),
+                span,
+                meta: (),
+            }
+        }
+        WitnessKind::Solve { limit, query_vars, anon_vars, goal } => {
+            let goal_block = build_block(b, goal);
+            Node::Solve {
+                limit: *limit,
+                query_vars: query_vars.clone(),
+                anon_vars: anon_vars.clone(),
+                goal: goal_block,
+                span,
+                meta: (),
+            }
+        }
         WitnessKind::WithConfig { bindings, body } => {
             let mut nodes: Vec<Node<()>> = Vec::new();
             let mut pairs = Vec::new();

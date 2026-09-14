@@ -61,3 +61,5 @@ pub mod typeck;
 pub mod value;
 // v0.83: TEA (The Elm Architecture) — Model/Msg/Update/Cmd 完整架构
 pub mod tea;
+// v0.102: 声明式范式（逻辑式/关系式）引擎 — 关系/合一/交错搜索 Foundation 层
+pub mod rel;

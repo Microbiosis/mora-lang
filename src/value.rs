@@ -387,6 +387,19 @@ pub enum Value {
     TeaCmd(crate::tea::Cmd),
     // v0.83: TEA Msg — 触发 update 的输入事件（tagged union：tag + payload）。
     TeaMsg(crate::tea::Msg),
+    // v0.102: 声明式范式（逻辑式/关系式）— 关系值（一等值）。
+    // clauses 为该关系的全部子句（事实+规则）；同名 rel 定义经 h_rel_def 累积。
+    Relation {
+        name: String,
+        clauses: std::sync::Arc<Vec<crate::rel::Clause>>,
+    },
+    // v0.102: 目标值 — 一等值，可组合（both/either）、可高阶传递。
+    // 调用关系值（`edge(?x, ?y)`）即构造目标；solve 消费目标执行搜索。
+    // Box 打断 Value ↔ Goal/Term 的递归环。
+    Goal(Box<crate::rel::Goal>),
+    // v0.102: 逻辑变量 — 搜索期叶子。solve 查询变量由 h_solve 分配 id；
+    // 解在 solve 边界 reify 为 `_.N` 符号，逻辑变量从不逃逸到普通值空间。
+    LogicVar(u64),
 }
 
 // 手动实现 PartialEq（EnvRef 不支持自动派生）
@@ -431,6 +444,9 @@ impl PartialEq for Value {
             (Value::Cons { car: a1, cdr: a2 }, Value::Cons { car: b1, cdr: b2 }) => a1 == b1 && a2 == b2,
             // v0.86: Code — 按 source text 字符串比较。
             (Value::Code(a), Value::Code(b)) => a == b,
+            // v0.102: 逻辑变量 — 按 id 相等（subst 测试/引擎内比较用）。
+            // Relation/Goal 无结构相等语义（落入 `_ => false`）。
+            (Value::LogicVar(a), Value::LogicVar(b)) => a == b,
             _ => false,
         }
     }

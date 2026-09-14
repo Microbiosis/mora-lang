@@ -14,6 +14,7 @@ mod emit;
 mod emit_definitions; // v0.92 P1.3: definition emit methods split from emit.rs
 mod syntax; // v0.92 P1.4: pattern/orchestrate/type-annotation parsers (from parse.rs)
 mod tokens; // v0.92 P1.4: token-stream navigation primitives (from parse.rs)
+mod rel; // v0.102: 声明式范式（rel/solve）语法 emit
 
 ///  ParserV3 - Clean-room MIR parser with no AST legacy baggage
 pub struct ParserV3 {

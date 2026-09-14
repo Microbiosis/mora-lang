@@ -360,7 +360,14 @@ impl<'a> BidirectionalChecker<'a> {
             | WitnessKind::StructDef { .. }
             | WitnessKind::MacroDef { .. }
             | WitnessKind::EffectSig { .. }
+            // v0.102: 声明式范式 — RelDef 镜像子树无独立推断（其检查在
+            // infer_rel_def 内完成，此处不重复递归）
+            | WitnessKind::RelDef { .. }
             | WitnessKind::Sequence(_) => {}
+            // v0.102: solve 的 goal 构建体递归预检
+            WitnessKind::Solve { goal, .. } => {
+                self.pre_check_witness(goal);
+            }
             // v0.80: algebraic effects — Perform/Handle 递归子节点
             WitnessKind::Perform { args, .. } => {
                 for arg in args {

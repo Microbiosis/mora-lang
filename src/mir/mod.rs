@@ -322,6 +322,29 @@ pub enum MirInst {
         view_mir: Box<MirFunction>,
     },
 
+    // ── v0.102: 声明式范式（逻辑式/关系式）──
+    /// 关系定义 — 注册 `Value::Relation { name, clauses }`；同名 rel 定义
+    /// 经 h_rel_def 累积子句（Prolog consult 语义）。
+    /// clauses 是编译期子句模板（头/体可含 `Term::Param` 与构造形态），
+    /// 搜索期由引擎 rename 为 fresh 逻辑变量。
+    RelDef {
+        name: String,
+        clauses: Vec<crate::rel::Clause>,
+    },
+    /// solve 查询 — 运行 goal 构建体（新作用域，查询变量已注入）得到
+    /// `Value::Goal`，引擎交错搜索后把查询变量投影 reify 成列表写 dst。
+    /// limit: None = run*（全部解）；Some(n) = run N（前 n 个解）。
+    /// query_vars: 目标语法中 `?` 隐式逻辑变量名（按首次出现序），
+    /// h_solve 按序分配 `Value::LogicVar(i)` 并注入构建环境。
+    Solve {
+        dst: Reg,
+        limit: Option<usize>,
+        query_vars: Vec<String>,
+        /// v0.102: 存在性匿名变量（`_`）—— 分配 fresh 逻辑变量但不投影。
+        anon_vars: Vec<String>,
+        goal: Box<MirFunction>,
+    },
+
     // ── 宏定义（α.5: 与 AST execute_macro_def 语义一致）──
     /// α.5: macro def — 注册 Value::Macro(name, params, body) 到环境。
     /// body 是宏体的 MIR 编译结果（由 parser_v3 emit_macro_def_w 经子

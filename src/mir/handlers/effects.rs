@@ -259,6 +259,166 @@ pub fn h_with_config(
     Ok(())
 }
 
+// ============================================================
+// v0.102: 声明式范式（逻辑式/关系式）— RelDef / Solve
+// ============================================================
+
+use std::sync::Arc;
+
+use crate::rel::{Clause, ProjectFn, RelHost, Search, Subst, reify};
+
+/// 关系定义：注册 `Value::Relation`。同名定义累积子句（Prolog consult
+/// 语义：先 `rel edge("a","b")` 后 `rel edge("b","c")` 是同一关系的两条
+/// 事实）。非 Relation 的既有绑定被直接覆盖（与 fn 定义同规则）。
+pub fn h_rel_def(env: &mut Environment, name: &str, clauses: &[Clause]) {
+    let fresh: Vec<Clause> = clauses.to_vec();
+    match env.get(name) {
+        Some(Value::Relation { name: rel_name, clauses: existing }) => {
+            let mut all = existing.as_ref().clone();
+            all.extend(fresh);
+            env.assign(
+                name,
+                Value::Relation { name: rel_name.clone(), clauses: Arc::new(all) },
+            );
+        }
+        _ => {
+            env.define(
+                name.to_string(),
+                Value::Relation { name: name.to_string(), clauses: Arc::new(fresh) },
+                false,
+            );
+        }
+    }
+}
+
+/// solve 的搜索期宿主：关系子句从 solve 位点环境解析；Project 实参经
+/// `MirHost::call_value` 做确定性求值。Project 产生的 BSP 效应先收集在
+/// 本地 [`Effects`]，搜索结束后并入 solve 指令的效应通道（效应归属位点
+/// 仍是 solve 这条指令）。
+struct SolveHost<'a> {
+    env: &'a Environment,
+    interp: &'a mut dyn MirHost,
+    collected: crate::mir::effect::Effects,
+}
+
+impl RelHost for SolveHost<'_> {
+    fn relation_clauses(&mut self, name: &str) -> Result<Arc<Vec<Clause>>, String> {
+        match self.env.get(name) {
+            Some(Value::Relation { clauses, .. }) => Ok(clauses.clone()),
+            Some(other) => Err(format!(
+                "{} 不是关系（是 {}），不能作为关系调用",
+                name,
+                crate::flow::type_name(&other)
+            )),
+            None => Err(format!("未定义关系 {}", name)),
+        }
+    }
+
+    fn run_project(&mut self, func: &ProjectFn, args: Vec<Value>) -> Result<Value, String> {
+        let mut local = crate::mir::effect::Effects::default();
+        let out = match func {
+            // 运行期已求值的可调用值（solve 目标体内 project 的构建产物）
+            ProjectFn::Value(v) => self.interp.call_value(v, args, &mut local)?,
+            // 编译期具名引用：查宿主环境（用户任务/闭包）；builtin 值走
+            // 按名分派（call_value 不含 Builtin 分支）；再回落 builtin 表。
+            ProjectFn::Name(n) => match self.env.get(n) {
+                Some(Value::Builtin(_)) => {
+                    self.interp.mir_call_function(n, args, self.env, &mut local)?
+                }
+                Some(v) => {
+                    let v = v.clone();
+                    self.interp.call_value(&v, args, &mut local)?
+                }
+                None => self.interp.mir_call_function(n, args, self.env, &mut local)?,
+            },
+        };
+        self.collected.absorb(local);
+        Ok(out)
+    }
+}
+
+/// 单个解的查询变量投影：
+/// - 0 个查询变量 → `nil`（每个解是一个成功标记）；
+/// - 1 个 → 变量值本身；
+/// - n ≥ 2 → 值列表（元组）。
+///
+/// 未绑定的变量经 reify 命名为 `_.N` 符号。
+fn project_solution(s: &Subst, query_vars: &[String]) -> Value {
+    match query_vars.len() {
+        0 => Value::Nil,
+        1 => reify(&Value::LogicVar(0), s),
+        n => Value::List(
+            (0..n as u64)
+                .map(|i| reify(&Value::LogicVar(i), s))
+                .collect(),
+        ),
+    }
+}
+
+/// solve 查询执行。
+///
+/// 1. 查询变量按序分配 `Value::LogicVar(0..n)`，注入 goal 构建环境
+///    （新作用域层——查询变量不外泄）；
+/// 2. 运行 goal 构建体，产物必须是 `Value::Goal`；
+/// 3. 引擎交错搜索（limit 界定解数量上界），逐解投影 reify；
+/// 4. 解列表写 `regs[dst]`；Project 效应并入 `effects`。
+#[allow(clippy::too_many_arguments)]
+pub fn h_solve(
+    interp: &mut dyn MirHost,
+    env: &mut Environment,
+    regs: &mut [Value],
+    dst: Reg,
+    limit: Option<usize>,
+    query_vars: &[String],
+    anon_vars: &[String],
+    goal: &MirFunction,
+    effects: &mut crate::mir::effect::Effects,
+) -> Result<(), String> {
+    // 1. 查询变量 + 匿名变量注入新作用域层（匿名变量分配在投影变量之后）
+    let mut builder_env = Environment::with_parent_of(Arc::new(env.clone()));
+    for (i, name) in query_vars.iter().enumerate() {
+        builder_env.define(name.clone(), Value::LogicVar(i as u64), false);
+    }
+    let base = query_vars.len() as u64;
+    for (i, name) in anon_vars.iter().enumerate() {
+        builder_env.define(name.clone(), Value::LogicVar(base + i as u64), false);
+    }
+
+    // 2. 运行 goal 构建体
+    let goal_arc = Arc::new(goal.clone());
+    let built = run_mir(&goal_arc, interp, &mut builder_env, effects)?;
+    let built_goal = match built {
+        Value::Goal(g) => *g,
+        other => {
+            return Err(format!(
+                "solve 的目标构建体必须返回 goal 值，得到 {}",
+                crate::flow::type_name(&other)
+            ));
+        }
+    };
+
+    // 3. 交错搜索
+    let mut search = Search::new(built_goal, base + anon_vars.len() as u64);
+    let mut host = SolveHost { env, interp, collected: crate::mir::effect::Effects::default() };
+    let mut solutions: Vec<Value> = Vec::new();
+    loop {
+        if let Some(cap) = limit
+            && solutions.len() >= cap
+        {
+            break;
+        }
+        match search.next_solution(&mut host)? {
+            Some(s) => solutions.push(project_solution(&s, query_vars)),
+            None => break,
+        }
+    }
+    effects.absorb(host.collected);
+
+    // 4. 写解列表
+    regs[dst] = Value::List(solutions);
+    Ok(())
+}
+
 // v0.80: algebraic effects 的完整实现（Stage 2/4 Stage 2.5 落地）。
 //
 // 设计：perform/handle 走单遍解释（single-shot continuation）。
@@ -359,6 +519,38 @@ pub fn h_macro_def(
             name: name.to_string(),
             params: params.to_vec(),
             body: std::sync::Arc::new(body.clone()),
+        },
+        false,
+    );
+}
+
+/// v0.102 修复：task 定义注册一等值到环境。
+///
+/// **缺陷背景**：`MirInst::TaskDef` 此前是 dispatch 的 no-op —— task 只存在于
+/// `build_task_registry`（从**当前执行函数体**静态收集）。顶层函数执行时
+/// registry 含全部顶层 task，但嵌套函数（闭包/fn 体）执行时 registry 由该
+/// 嵌套体重建，看不到外层声明 → `let f = fn(x) outer_task(x) end` 报
+/// "Undefined function or task"。这是**词法可见性缺口**：声明指令没有
+/// 真正声明绑定。
+///
+/// **修法**：与 `MacroDef` 同一先例 —— 定义处 `env.define` 一等 `Value::Task`，
+/// 使任何嵌套代码都能沿 env 父链词法解析到外层 task。
+/// `task_registry` 保留为顶层作用域的静态索引（提供前向引用语义），
+/// `h_call` 先查 registry 再查 env，两者互补覆盖词法可见性。
+///
+/// 定义环境即全局环境（`task` 仅顶层语句可见，parser 不在嵌套上下文产出）。
+pub fn h_task_def(
+    env: &mut Environment,
+    name: &str,
+    params: &[String],
+    body: &crate::mir::MirFunction,
+) {
+    env.define(
+        name.to_string(),
+        Value::Task {
+            name: name.to_string(),
+            params: params.to_vec(),
+            mir_body: std::sync::Arc::new(body.clone()),
         },
         false,
     );

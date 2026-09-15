@@ -390,6 +390,10 @@ impl ParserV3 {
         let mut init_witness = None;
         let mut update_mir = None;
         let mut view_mir = None;
+        // v0.103: update/view 的真实 witness（此前被丢弃 → typeck 只能看到
+        // 伪造的零参 Nil 闭包占位，用户写的 update/view 体完全不参与推断）
+        let mut update_witness = None;
+        let mut view_witness = None;
 
         while self.match_token(&[TokenType::Newline]) {}
         while !self.check(&TokenType::End) && !self.is_at_end() {
@@ -416,10 +420,16 @@ impl ParserV3 {
                         })).1));
                     }
                     "update" => {
-                        update_mir = self.emit_closure_mir("update");
+                        if let Some((m, w)) = self.emit_closure_pair() {
+                            update_mir = Some(m);
+                            update_witness = Some(Box::new(w));
+                        }
                     }
                     "view" => {
-                        view_mir = self.emit_closure_mir("view");
+                        if let Some((m, w)) = self.emit_closure_pair() {
+                            view_mir = Some(m);
+                            view_witness = Some(Box::new(w));
+                        }
                     }
                     _ => {
                         // skip unknown fields
@@ -471,36 +481,48 @@ impl ParserV3 {
                         span,
                     })
                 }),
-                update_w: Box::new(MirWitness {
-                    kind: WitnessKind::Closure {
-                        params: Vec::new(),
-                        body: Box::new(MirWitness {
-                            kind: WitnessKind::Literal(Literal::Nil(span)),
-                            span,
-                        }),
-                    },
-                    span,
+                update_w: update_witness.unwrap_or_else(|| {
+                    // 未提供 update 时的显式空闭包（不是占位遮罩 —— 等价于
+                    // 用户写 `update: fn() => nil`，类型与效果都可推断）
+                    Box::new(MirWitness {
+                        kind: WitnessKind::Closure {
+                            params: Vec::new(),
+                            body: Box::new(MirWitness {
+                                kind: WitnessKind::Literal(Literal::Nil(span)),
+                                span,
+                            }),
+                        },
+                        span,
+                    })
                 }),
-                view_w: Box::new(MirWitness {
-                    kind: WitnessKind::Closure {
-                        params: Vec::new(),
-                        body: Box::new(MirWitness {
-                            kind: WitnessKind::Literal(Literal::Nil(span)),
-                            span,
-                        }),
-                    },
-                    span,
+                view_w: view_witness.unwrap_or_else(|| {
+                    Box::new(MirWitness {
+                        kind: WitnessKind::Closure {
+                            params: Vec::new(),
+                            body: Box::new(MirWitness {
+                                kind: WitnessKind::Literal(Literal::Nil(span)),
+                                span,
+                            }),
+                        },
+                        span,
+                    })
                 }),
             },
             span,
         })
     }
 
-    /// 解析闭包表达式并直接返回其 body 的 MirFunction（用于 app 的 update/view 字段）。
+    /// 解析闭包表达式，同时返回其 body 的 MirFunction 与 witness。
     /// 支持两种语法：
     ///   - fn(params) => body
     ///   - fn(params) block end
-    pub(super) fn emit_closure_mir(&mut self, _label: &str) -> Option<MirFunction> {
+    ///
+    /// v0.103: 返回 `(MirFunction, MirWitness)` —— 此前只返回 MirFunction 且
+    /// 丢弃 witness（`_body_w`），导致 `app` 定义只能把 update/view 的 witness
+    /// 伪造为零参、body 为 Nil 的闭包占位。后果是 typeck 看不到用户写的
+    /// update/view 体：其形参不参与推断、体内错误不被诊断、效果行不传播。
+    pub(super) fn emit_closure_pair(&mut self) -> Option<(MirFunction, MirWitness)> {
+        let span = self.span_of_current();
         // 消耗可选的 fn 关键字
         let _ = self.match_token_exact(TokenType::Fn);
 
@@ -508,7 +530,7 @@ impl ParserV3 {
         let parent = std::mem::replace(&mut self.emit, crate::mir::lower::EmitContext::new());
 
         // 解析参数列表（可选）
-        let _params: Vec<String> = if self.match_token_exact(TokenType::LParen) {
+        let params: Vec<String> = if self.match_token_exact(TokenType::LParen) {
             let mut params = Vec::new();
             while !self.check(&TokenType::RParen) && !self.is_at_end() {
                 if let Some(p) = self.consume_identifier("Expected parameter") {
@@ -525,7 +547,7 @@ impl ParserV3 {
         };
 
         // 解析闭包体
-        let (body_reg, _body_w) = if self.match_token_exact(TokenType::FatArrow) {
+        let (body_reg, body_w) = if self.match_token_exact(TokenType::FatArrow) {
             self.emit_expr_w()?
         } else {
             self.emit_block_w()?
@@ -533,6 +555,20 @@ impl ParserV3 {
 
         self.emit.emit(MirInst::Return(Some(body_reg)));
         let body_mir = std::mem::replace(&mut self.emit, parent).finish();
-        Some(body_mir)
+        let wit = MirWitness {
+            kind: WitnessKind::Closure {
+                params: params
+                    .into_iter()
+                    .map(|name| WitnessParam {
+                        name,
+                        type_hint: None,
+                        default: None,
+                    })
+                    .collect(),
+                body: Box::new(body_w),
+            },
+            span,
+        };
+        Some((body_mir, wit))
     }
 }

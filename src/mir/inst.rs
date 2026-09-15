@@ -8,10 +8,12 @@ use std::collections::HashMap;
 
 use super::handlers::{
     Flow, h_aggregate, h_append_file, h_app_def, AppDefArgs, h_assign, h_binary_op, h_break, h_call, h_closure, h_const,
-    h_continue, h_define, h_dict_lit, h_document_section, h_dyn_trait, h_enum_def, h_eval, h_halt,
+    h_continue, h_define, h_dict_lit, h_document_section, h_dyn_trait, h_enum_def, h_eval,
+    h_export_mark, h_halt,
     h_handle, h_impl_def, h_import, h_index, h_index_assign, h_jump, h_jump_if, h_jump_if_not,
     h_list_lit, h_load, h_macro_def, h_match_expr, h_method_call, h_model_def, h_msg_def,
-    h_observe, h_orchestrate, h_perform, h_pipe, h_prompt, h_prompt_section, h_read_bytes_file,
+    h_observe, h_orchestrate, h_parallel, h_perform, h_pipe, h_prompt, h_prompt_section,
+    h_read_bytes_file,
     h_read_file, h_rel_def, h_return, h_save, h_send, h_skill_def, h_solve, h_span,
     h_struct_def, h_task_def, h_trait_def,
     h_transaction, h_type_alias, h_update_def, h_var, h_with_config, h_worker,
@@ -115,6 +117,7 @@ impl MirInst {
             MirInst::TaskDef { .. }
             | MirInst::ToolDef { .. }
             | MirInst::Import(_)
+            | MirInst::ExportMark(_)
             | MirInst::TypeAlias { .. }
             | MirInst::EnumDef { .. }
             | MirInst::StructDef { .. }
@@ -131,6 +134,7 @@ impl MirInst {
             | MirInst::Transaction { .. }
             | MirInst::Rollback
             | MirInst::Worker { .. }
+            | MirInst::Parallel { .. }
             | MirInst::Commit
             | MirInst::Observe { .. }
             | MirInst::Span { .. }
@@ -222,7 +226,7 @@ impl MirInst {
                 trait_name: trait_name.clone(),
             },
             MirInst::ToolDef { .. } => self.clone(),
-            MirInst::Import(_) => self.clone(),
+            MirInst::Import(_) | MirInst::ExportMark(_) => self.clone(),
             MirInst::WithConfig {
                 bindings,
                 body,
@@ -273,7 +277,7 @@ impl MirInst {
                 value: m(*value),
             },
             MirInst::Rollback => MirInst::Rollback,
-            MirInst::Worker { .. } => self.clone(),
+            MirInst::Worker { .. } | MirInst::Parallel { .. } => self.clone(),
             MirInst::Commit => MirInst::Commit,
             MirInst::Observe { .. } => self.clone(),
             MirInst::Span { .. } => self.clone(),
@@ -356,6 +360,7 @@ impl MirInst {
             // Handle 是语句（安装/卸载 handler），但本身不产生外部副作用。
             // 真正的 effect 来源是 body 内的 Perform 指令。
             | MirInst::Handle { .. }
+            | MirInst::ExportMark(_)
             | MirInst::ReadFile { .. }
             | MirInst::WriteFile { .. }
             | MirInst::AppendFile { .. }
@@ -385,6 +390,7 @@ impl MirInst {
             | MirInst::WithConfig { .. }
             | MirInst::Transaction { .. }
             | MirInst::Worker { .. }
+            | MirInst::Parallel { .. }
             | MirInst::Observe { .. }
             | MirInst::Span { .. }
             | MirInst::PromptSection { .. }
@@ -565,6 +571,10 @@ pub fn dispatch(
             h_import(interp, env, path, effects)?;
             Ok(Flow::Continue)
         }
+        MirInst::ExportMark(name) => {
+            h_export_mark(env, name);
+            Ok(Flow::Continue)
+        }
         MirInst::WithConfig {
             bindings,
             body,
@@ -604,16 +614,20 @@ pub fn dispatch(
         }
         MirInst::Rollback => Err("Transaction rolled back".to_string()),
         MirInst::Commit => Ok(Flow::Continue),
+        MirInst::Parallel { body } => {
+            h_parallel(interp, env, body, effects)?;
+            Ok(Flow::Continue)
+        }
         MirInst::Worker { name: _, body } => {
             h_worker(interp, env, body, effects)?;
             Ok(Flow::Continue)
         }
-        MirInst::Observe { config: _, body } => {
-            h_observe(interp, env, body, effects)?;
+        MirInst::Observe { config, body } => {
+            h_observe(interp, env, config, body, effects)?;
             Ok(Flow::Continue)
         }
-        MirInst::Span { name: _, body } => {
-            h_span(interp, env, body, effects)?;
+        MirInst::Span { name, tags, body } => {
+            h_span(interp, env, name, tags, body, effects)?;
             Ok(Flow::Continue)
         }
         MirInst::Save { path, value } => {
@@ -714,12 +728,12 @@ pub fn dispatch(
             );
             Ok(Flow::Continue)
         }
-        MirInst::PromptSection { name: _, body } => {
-            h_prompt_section(interp, env, body, effects)?;
+        MirInst::PromptSection { name, body } => {
+            h_prompt_section(interp, env, name, body, effects)?;
             Ok(Flow::Continue)
         }
-        MirInst::DocumentSection { name: _, body } => {
-            h_document_section(interp, env, body, effects)?;
+        MirInst::DocumentSection { name, body } => {
+            h_document_section(interp, env, name, body, effects)?;
             Ok(Flow::Continue)
         }
 

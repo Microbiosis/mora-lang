@@ -93,6 +93,15 @@ pub fn h_transaction(
     }
 }
 
+/// `worker <name> do ... end` — 并发 worker 单元。
+///
+/// v0.103: 真正并发执行 —— 在独立宿主克隆（`MirHost::clone_box`）上运行
+/// body，避免与父宿主的数据竞争；产出的 Effect 经 `Effects` 数据通道回传
+/// （与 Pregel 并行 worker 同一机制）。父环境的合并由 `h_parallel` 统一做
+/// （worker 各自作用在克隆 env 上，结果按声明顺序合并，保证确定性）。
+///
+/// 单独出现（不在 parallel 内）时等价于顺序执行 —— 语义与 `parallel` 块的
+/// 边界一致。并行度只在 `parallel` 内生成。
 pub fn h_worker(
     interp: &mut dyn MirHost,
     env: &mut Environment,
@@ -103,51 +112,227 @@ pub fn h_worker(
     Ok(())
 }
 
+/// `parallel ... end` — 并行块（spec §9.1/§9.2）。
+///
+/// 语义：块内连续的 `worker` 声明**并发**执行（每个在独立宿主克隆上），
+/// 其余语句顺序执行。worker 的环境变更按**声明顺序**合并回父环境
+/// （确定性 —— 并发完成顺序不影响最终状态，与 `exec.parallel` 的
+/// 「结果按原始索引排序」同一原则）；Effect 按同样顺序 absorb。
+///
+/// 实现：单次遍历 body 指令，把相邻的 `MirInst::Worker` 收成一批，批内
+/// `thread::scope` 并发，批间与普通指令保持顺序。
+pub fn h_parallel(
+    interp: &mut dyn MirHost,
+    env: &mut Environment,
+    body: &MirFunction,
+    effects: &mut crate::mir::effect::Effects,
+) -> Result<(), String> {
+    use crate::mir::MirInst;
+    let mut idx = 0usize;
+    let insts = &body.body;
+    while idx < insts.len() {
+        // 收集连续 worker 批次
+        if matches!(insts[idx], MirInst::Worker { .. }) {
+            let mut batch: Vec<(&str, &MirFunction)> = Vec::new();
+            while idx < insts.len() {
+                match &insts[idx] {
+                    MirInst::Worker { name, body } => {
+                        batch.push((name.as_str(), body.as_ref()));
+                        idx += 1;
+                    }
+                    _ => break,
+                }
+            }
+            // 批内并发：每 worker 独立宿主克隆 + 克隆 env
+            let base_env = env.clone();
+            let results: Vec<Result<(Environment, crate::mir::effect::Effects), String>> =
+                std::thread::scope(|scope| {
+                    let handles: Vec<_> = batch
+                        .iter()
+                        .map(|(_name, wbody)| {
+                            let mut w_interp = interp.clone_box();
+                            let w_env = base_env.clone();
+                            let wbody_arc = std::sync::Arc::new((*wbody).clone());
+                            scope.spawn(move || {
+                                let mut run_env = w_env;
+                                let mut w_effects = crate::mir::effect::Effects::new();
+                                match crate::mir::vm::run_mir(
+                                    &wbody_arc,
+                                    w_interp.as_mut(),
+                                    &mut run_env,
+                                    &mut w_effects,
+                                ) {
+                                    Ok(_) => Ok((run_env, w_effects)),
+                                    Err(e) => Err(e),
+                                }
+                            })
+                        })
+                        .collect();
+                    handles
+                        .into_iter()
+                        .map(|h| h.join().unwrap_or_else(|_| Err("worker thread panicked".to_string())))
+                        .collect()
+                });
+            // 按声明顺序合并（确定性）
+            for r in results {
+                let (w_env, w_effects) = r?;
+                let strategies = interp.current_merge_strategies();
+                match strategies.as_ref() {
+                    Some(sg) => {
+                        env.merge_from_with_strategies(
+                            &w_env,
+                            sg,
+                            &crate::value::MergeStrategy::LastWriteWins,
+                        );
+                    }
+                    None => env.merge_from(&w_env, &crate::value::MergeStrategy::LastWriteWins),
+                }
+                effects.absorb(w_effects);
+            }
+        } else {
+            // 非 worker 段：把连续的非 Worker 指令收成一段，交给 run_mir
+            // 整段执行 —— 逐指令 dispatch 会丢失控制流语义（Label/Jump 的
+            // Flow::Jump 需由 run_mir 的跳转表处理；逐指令调用会直接吞掉
+            // 跳转，循环体永不前进）。
+            let start = idx;
+            while idx < insts.len() && !matches!(insts[idx], MirInst::Worker { .. }) {
+                idx += 1;
+            }
+            let seg: Vec<MirInst> = insts[start..idx].to_vec();
+            let seg_fn = crate::mir::MirFunction {
+                params: Vec::new(),
+                body: seg,
+                n_regs: body.n_regs,
+                ..Default::default()
+            };
+            if !seg_fn.body.is_empty() {
+                crate::mir::vm::run_mir(
+                    &std::sync::Arc::new(seg_fn),
+                    interp,
+                    env,
+                    effects,
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `observe <kind> "<name>" do ... end` — 可观测性根块。
+///
+/// v0.103: 记录一个真实 span（名 = `<kind>/<name>`）包住 body。此前完全
+/// 空转（只跑 body 丢弃），spec §11.4 承诺的 OpenTelemetry 接入路径名存实亡。
+/// kind 语义：`trace`（分布式追踪根）/ `metric` / `log` —— 作为 span 名前缀
+/// 保留来源，供 `TraceCollector::get_spans_json` 与 otel 区分。
 pub fn h_observe(
     interp: &mut dyn MirHost,
     env: &mut Environment,
+    config: &str,
     body: &MirFunction,
     effects: &mut crate::mir::effect::Effects,
 ) -> Result<(), String> {
-    // v0.68: Bug fix — was discarding child_env mutations. Now merges
-    // via run_isolated so observability side-effects (trace vars, span
-    // markers) are actually visible.
-    let _ = run_isolated(interp, env, body, effects)?;
-    Ok(())
+    let span_name = format!("observe/{}", config);
+    let handle = interp
+        .trace_collector()
+        .map(|t| t.start_span(&span_name, HashMap::new()));
+    let result = run_isolated(interp, env, body, effects);
+    if let Some(h) = handle {
+        h.end(HashMap::new());
+    }
+    result.map(|_| ())
 }
 
+/// `span "<name>" tags {...} do ... end` — 命名追踪 span。
+///
+/// v0.103: 记录真实 span（含 tags 属性）到 TraceCollector；无 trace 能力的
+/// 宿主退化为仅执行 body。此前完全空转。
 pub fn h_span(
     interp: &mut dyn MirHost,
     env: &mut Environment,
+    name: &str,
+    tags: &[(String, String)],
     body: &MirFunction,
     effects: &mut crate::mir::effect::Effects,
 ) -> Result<(), String> {
-    // v0.68: Bug fix — same as h_observe.
-    let _ = run_isolated(interp, env, body, effects)?;
-    Ok(())
+    let attrs: HashMap<String, String> = tags.iter().cloned().collect();
+    let handle = interp
+        .trace_collector()
+        .map(|t| t.start_span(name, attrs.clone()));
+    let result = run_isolated(interp, env, body, effects);
+    if let Some(h) = handle {
+        h.end(attrs);
+    }
+    result.map(|_| ())
 }
 
+/// `prompt "name" do ... end` — 构建 [`Value::PromptSection`] 并绑定到环境。
+///
+/// v0.103 修复：此前实现只 `let _ = run_mir(...)` 跑一遍 body 就丢弃结果 ——
+/// 既吞掉执行错误（无 `?`），也从未构建 PromptSection。后果是
+/// `compose_prompt(name)` 这个**活的、已注册的** builtin 永远取不到 section
+/// （其错误消息还指引用户用 `prompt "x" do ... end`，而该语法当时 parser
+/// 根本不产出 —— 双重缺陷）。
+///
+/// 语义（对齐 `MirInst::PromptSection` 声明）：
+/// - body 求值为 section 的 text（任意值，取用侧按文本化处理）；
+/// - section 名 = 指令的 `name`；
+/// - 绑定 `Value::PromptSection { name, role: None, text, budget_bytes: None }`
+///   到当前环境。role / budget 可由 `compose_prompt` 的 dict 形式覆盖。
 pub fn h_prompt_section(
     interp: &mut dyn MirHost,
     env: &mut Environment,
+    name: &str,
     body: &MirFunction,
     effects: &mut crate::mir::effect::Effects,
 ) -> Result<(), String> {
     let mut child_env = env.clone();
-    // v0.75.9: 包裹 Arc 走全局 DAG 缓存
-    let _ = run_mir(&std::sync::Arc::new((*body).clone()), interp, &mut child_env, effects);
+    let text = run_mir(
+        &std::sync::Arc::new((*body).clone()),
+        interp,
+        &mut child_env,
+        effects,
+    )?;
+    env.define(
+        name.to_string(),
+        Value::PromptSection {
+            name: name.to_string(),
+            role: None,
+            text: Box::new(text),
+            budget_bytes: None,
+        },
+        false,
+    );
     Ok(())
 }
 
+/// `document "name" do ... end` — 构建文档 section 并绑定到环境。
+///
+/// v0.103 修复：此前只 `let _ = run_mir(...)`（吞错且不构建值）。文档
+/// section 是 `document.*` 域下的**命名文本块**，与 prompt section 同构但
+/// 归文档流水线（`compose_prompt` 不消费它）。value 层无独立变体，用带
+/// `tag` 的 Dict 承载，保持值空间封闭。
 pub fn h_document_section(
     interp: &mut dyn MirHost,
     env: &mut Environment,
+    name: &str,
     body: &MirFunction,
     effects: &mut crate::mir::effect::Effects,
 ) -> Result<(), String> {
     let mut child_env = env.clone();
-    // v0.75.9: 包裹 Arc 走全局 DAG 缓存
-    let _ = run_mir(&std::sync::Arc::new((*body).clone()), interp, &mut child_env, effects);
+    let text = run_mir(
+        &std::sync::Arc::new((*body).clone()),
+        interp,
+        &mut child_env,
+        effects,
+    )?;
+    let mut m = HashMap::new();
+    m.insert(
+        "tag".to_string(),
+        Value::String("document_section".to_string()),
+    );
+    m.insert("name".to_string(), Value::String(name.to_string()));
+    m.insert("text".to_string(), text);
+    env.define(name.to_string(), Value::Dict(m), false);
     Ok(())
 }
 

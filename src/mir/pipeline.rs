@@ -194,6 +194,7 @@ fn inst_category(inst: &crate::mir::MirInst) -> &'static str {
         MirInst::TaskDef { .. } => "TaskDef",
         MirInst::ToolDef { .. } => "ToolDef",
         MirInst::Import(_) => "Import",
+        MirInst::ExportMark(_) => "ExportMark",
         MirInst::WithConfig { .. } => "WithConfig",
         MirInst::Handle { .. } => "Handle",
         MirInst::Perform { .. } => "Perform",
@@ -203,6 +204,7 @@ fn inst_category(inst: &crate::mir::MirInst) -> &'static str {
         MirInst::Rollback => "Rollback",
         MirInst::Commit => "Commit",
         MirInst::Worker { .. } => "Worker",
+        MirInst::Parallel { .. } => "Parallel",
         MirInst::Observe { .. } => "Observe",
         MirInst::Span { .. } => "Span",
         MirInst::Save { .. } => "Save",
@@ -278,6 +280,12 @@ fn count_fcfg_children(n: &Fcfg) -> usize {
         }
         Node::WithConfig { body, .. } => count_fcfg_nodes(&body.nodes),
         Node::Solve { goal, .. } => count_fcfg_nodes(&goal.nodes),
+        Node::PromptSection { body, .. } | Node::DocumentSection { body, .. } => {
+            count_fcfg_nodes(&body.nodes)
+        }
+        Node::Observe { body, .. } | Node::Span { body, .. } => count_fcfg_nodes(&body.nodes),
+        Node::Parallel { body, .. } => count_fcfg_nodes(&body.nodes),
+        Node::Export { decl, .. } => count_fcfg_nodes(&decl.nodes),
         Node::ImplDef { methods, .. } => methods.iter().map(|(_, b)| count_fcfg_nodes(&b.nodes)).sum(),
         _ => 0,
     }

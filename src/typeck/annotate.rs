@@ -274,6 +274,42 @@ fn annotate_node(node: &Fcfg, table: &TypeTable) -> Node<TypeInfo> {
             span: *span,
             meta: info,
         },
+        Node::Export { names, decl, span, .. } => Node::Export {
+            names: names.clone(),
+            decl: annotate_block(decl, table),
+            span: *span,
+            meta: info,
+        },
+        Node::Parallel { body, span, .. } => Node::Parallel {
+            body: annotate_block(body, table),
+            span: *span,
+            meta: info,
+        },
+        Node::Observe { config, body, span, .. } => Node::Observe {
+            config: config.clone(),
+            body: annotate_block(body, table),
+            span: *span,
+            meta: info,
+        },
+        Node::Span { name, tags, body, span, .. } => Node::Span {
+            name: name.clone(),
+            tags: tags.clone(),
+            body: annotate_block(body, table),
+            span: *span,
+            meta: info,
+        },
+        Node::PromptSection { name, body, span, .. } => Node::PromptSection {
+            name: name.clone(),
+            body: annotate_block(body, table),
+            span: *span,
+            meta: info,
+        },
+        Node::DocumentSection { name, body, span, .. } => Node::DocumentSection {
+            name: name.clone(),
+            body: annotate_block(body, table),
+            span: *span,
+            meta: info,
+        },
         Node::Solve { limit, query_vars, anon_vars, goal, span, .. } => Node::Solve {
             limit: *limit,
             query_vars: query_vars.clone(),

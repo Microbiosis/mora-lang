@@ -316,6 +316,44 @@ pub enum Node<M> {
         span: Span,
         meta: M,
     },
+    // ── v0.103: 命名 section 声明 ──
+    PromptSection {
+        name: String,
+        body: Block<M>,
+        span: Span,
+        meta: M,
+    },
+    DocumentSection {
+        name: String,
+        body: Block<M>,
+        span: Span,
+        meta: M,
+    },
+    // ── v0.103: 可观测性块 ──
+    Observe {
+        config: String,
+        body: Block<M>,
+        span: Span,
+        meta: M,
+    },
+    Span {
+        name: String,
+        tags: Vec<(String, String)>,
+        body: Block<M>,
+        span: Span,
+        meta: M,
+    },
+    Parallel {
+        body: Block<M>,
+        span: Span,
+        meta: M,
+    },
+    Export {
+        names: Vec<String>,
+        decl: Block<M>,
+        span: Span,
+        meta: M,
+    },
 
     // ── 元编程 ──
     Quasiquote {
@@ -550,6 +588,12 @@ impl<M> Node<M> {
             | Node::AppDef { span, .. }
             | Node::RelDef { span, .. }
             | Node::Solve { span, .. }
+            | Node::PromptSection { span, .. }
+            | Node::DocumentSection { span, .. }
+            | Node::Observe { span, .. }
+            | Node::Span { span, .. }
+            | Node::Parallel { span, .. }
+            | Node::Export { span, .. }
             | Node::Quasiquote { span, .. }
             | Node::Orchestrate { span, .. }
             | Node::WithConfig { span, .. }
@@ -600,6 +644,12 @@ impl<M> Node<M> {
             | Node::AppDef { meta, .. }
             | Node::RelDef { meta, .. }
             | Node::Solve { meta, .. }
+            | Node::PromptSection { meta, .. }
+            | Node::DocumentSection { meta, .. }
+            | Node::Observe { meta, .. }
+            | Node::Span { meta, .. }
+            | Node::Parallel { meta, .. }
+            | Node::Export { meta, .. }
             | Node::Quasiquote { meta, .. }
             | Node::Orchestrate { meta, .. }
             | Node::WithConfig { meta, .. }

@@ -368,6 +368,23 @@ impl<'a> BidirectionalChecker<'a> {
             WitnessKind::Solve { goal, .. } => {
                 self.pre_check_witness(goal);
             }
+            // v0.103: section 声明的 body 递归预检
+            WitnessKind::PromptSection { body, .. }
+            | WitnessKind::DocumentSection { body, .. } => {
+                self.pre_check_witness(body);
+            }
+            // v0.103: 可观测性块的 body
+            WitnessKind::Observe { body, .. } | WitnessKind::Span { body, .. } => {
+                self.pre_check_witness(body);
+            }
+            // v0.103: parallel 块 body
+            WitnessKind::Parallel { body } => {
+                self.pre_check_witness(body);
+            }
+            // v0.103: export 内部声明
+            WitnessKind::Export { decl, .. } => {
+                self.pre_check_witness(decl);
+            }
             // v0.80: algebraic effects — Perform/Handle 递归子节点
             WitnessKind::Perform { args, .. } => {
                 for arg in args {

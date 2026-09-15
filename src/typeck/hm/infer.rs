@@ -256,20 +256,23 @@ impl HMInference {
                 Ok(self.instantiate_type(&ty))
             }
             Some(ty) => Ok(ty.clone()),
-// v0.75.84: 全局内置对象名（ai/web/json/file/memory/agent）——
-            // 非变量绑定，typeck 识别为对应模块类型（ai → AiModule 等）。
-            // 此前 `ai.chat(...)` 报 "Unbound variable 'ai'"（运行时 arm
-            // v0.75.84 补回后 typeck 仍是缺口）。
+            // v0.103: 全局模块对象 —— 从未绑定标识符解析为对象类型（而非
+            // UnboundVariable）。名单唯一事实源是 `crate::value::MODULE_OBJECTS`
+            // （与 Interpreter::new 的 globals 注册、flow::is_builtin_object
+            // 同源）。此前硬编码 6 个名字，导致 globals 已注册的
+            // bus/sandbox/schedule/ccr/mock/exec/tool/skill/plan/mora/
+            // document/tea/xform 共 13 个模块在类型检查阶段被拒。
             None => match name {
+                // 精确分型：AI 相关（方法推断有专门分支）
                 "ai" => Ok(Type::AiModule),
                 "agent" => Ok(Type::Agent),
-                // v0.91: 数学 builtin 模块对象（math/stats/linalg）
-                // — 视为 Any 类型，方法分派走 dispatch.rs::call_method_builtin
-                "math" | "stats" | "linalg" => Ok(Type::Any),
                 // v0.99: random 模块 — 方法调用 = ambient effect perform。
                 // 精确分型（每操作标签 + 预置签名 + 效果行）在
                 // infer_method_call 的 RandomModule 分支。
                 "random" => Ok(Type::RandomModule),
+                // 其余模块对象：方法分派走 dispatch.rs，类型视为不透明客体。
+                // Unknown 允许与任意约束继续推进（v0.75.92 起 Unknown 在
+                // unify 中 fail-fast，故方法调用路径不产生 Unknown 约束）。
                 n if crate::flow::is_builtin_object(n) => Ok(Type::Unknown),
                 _ => Err(vec![TypeError::UnboundVariable {
                     name: name.to_string(),
@@ -609,14 +612,44 @@ impl HMInference {
         // 可选——arity 下限是签名 user 参数数，多传 dict 不报 ArityMismatch。
         if let Some(sig) = crate::typeck::dispatch::method_signature(&recv_ty, method) {
             let user_arity = sig.params.len().saturating_sub(1);
+            // v0.103: 支持**可选尾参** —— 签名中类型含 `Nil` 的尾部参数可省略。
+            // 此前 arity 是「恰好 user_arity」，使 spec 标注为可选（`ctx?`）
+            // 的参数在省略时报 "Expected 2 arguments, got 1"
+            // （`ai.critic(answer)` 因此不可用）。可选性用「类型含 Nil」表达
+            // （Nil 是该参数可缺席的既有编码），最小必需参数数 = 去掉连续
+            // 尾部可选参数后的数量。
+            let min_arity = {
+                let mut min = user_arity;
+                while min > 0 {
+                    let ty = &sig.params[min].1;
+                    let optional = match ty {
+                        Type::Nil => true,
+                        Type::Union(members) => {
+                            members.iter().any(|m| matches!(m, Type::Nil))
+                        }
+                        _ => false,
+                    };
+                    if optional {
+                        min -= 1;
+                    } else {
+                        break;
+                    }
+                }
+                min
+            };
             let extra_configurable = arg_types
                 .iter()
-                .skip(user_arity)
-                .all(|t| matches!(t, Type::Dict(_, _)));
-            if arg_types.len() < user_arity || (arg_types.len() > user_arity && !extra_configurable)
+                .skip(min_arity)
+                .all(|t| matches!(t, Type::Dict(_, _) | Type::Nil))
+                || arg_types
+                    .iter()
+                    .skip(user_arity)
+                    .all(|t| matches!(t, Type::Dict(_, _)));
+            if arg_types.len() < min_arity
+                || (arg_types.len() > user_arity && !extra_configurable)
             {
                 return Err(vec![TypeError::ArityMismatch {
-                    expected: user_arity,
+                    expected: min_arity,
                     actual: arg_types.len(),
                     span,
                 }]);

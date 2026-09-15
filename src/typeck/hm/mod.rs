@@ -752,6 +752,33 @@ impl HMInference {
             WitnessKind::RelDef { name, clauses, clause_wits, .. } => {
                 self.infer_rel_def(name, clauses, clause_wits, expr.span)
             }
+            // v0.103: 命名 section 声明 —— body 求值并把 section 名登记到
+            // env（运行时 h_prompt_section/h_document_section 把同名值绑定
+            // 进环境，typeck 侧必须一致，否则 `compose_prompt("name")` 的
+            // 引用会被判 Unbound variable）。定义点是纯的（值绑定非 effect），
+            // body 的效果行传播。
+            WitnessKind::PromptSection { name, body } => {
+                let (_text_ty, body_row) = self.infer_expr(body)?;
+                self.env.add(name.clone(), Type::PromptSection);
+                Ok((Type::Nil, body_row))
+            }
+            WitnessKind::DocumentSection { name, body } => {
+                let (_text_ty, body_row) = self.infer_expr(body)?;
+                self.env.add(name.clone(), Type::Document);
+                Ok((Type::Nil, body_row))
+            }
+            // v0.103: 可观测性块 —— 包一层 body，效果行传播（span 不改类型）
+            WitnessKind::Observe { config: _, body }
+            | WitnessKind::Span {
+                name: _, tags: _, body,
+            }
+            | WitnessKind::Parallel { body } => {
+                let (_ty, body_row) = self.infer_expr(body)?;
+                Ok((Type::Nil, body_row))
+            }
+            // v0.103: export 内部声明 —— 类型/效果与不加 export 时相同
+            // （export 只影响跨模块可见性，属 import 收集侧的静态判定）。
+            WitnessKind::Export { decl, .. } => self.infer_expr(decl),
             WitnessKind::Solve { limit: _, query_vars, anon_vars, goal } => {
                 // 查询变量注册新作用域（?x → fresh TypeVar），目标构建体
                 // 推断后其类型必须收敛为 Goal；投影类型 = 查询变量类型
@@ -868,21 +895,83 @@ impl HMInference {
                 }
                 Ok((Type::Bool, merged))
             }
-            WitnessKind::Return(_) | WitnessKind::Break(_) | WitnessKind::Continue(_) => {
+            // v0.103 修复：`return <expr>` 的类型 = 被返回表达式的类型。
+            //
+            // 此前一律返回 `Nil` —— 后果是**任何使用显式 `return` 的函数**
+            // 推断出的 Arrow 返回类型都是 Nil。常规调用点因 FnDef 名不入 env
+            // （`infer_call` 对未知名产出 fresh TypeVar）而掩盖了该错误；
+            // 一旦函数类型被**物化**使用（跨模块 import 的精确签名），
+            // 立刻显形（import 后调用导出 task 报 "expected nil, got string"）。
+            // `return` 无值时仍为 Nil。
+            WitnessKind::Return(Some(v)) => self.infer_expr(v),
+            WitnessKind::Return(None) | WitnessKind::Break(_) | WitnessKind::Continue(_) => {
                 Ok((Type::Nil, crate::mir::effect::EffectRow::Empty))
             }
             WitnessKind::IndexAssign { .. } => {
                 Ok((Type::Nil, crate::mir::effect::EffectRow::Empty))
             }
             // v0.55: top-level declarations — no scalar result type.
+            //
+            // v0.103: AppDef 从本组移出（见下方独立分支）—— 它必须在 env 中
+            // 注册 app 名（运行时 h_app_def 会注册 Value::TeaApp，typeck 此前
+            // 不注册 → `app Counter ... end` 后的 `Counter` 被判 Unbound
+            // variable），并推断真实的 update/view 体。
             WitnessKind::TypeAlias { .. }
             | WitnessKind::EnumDef { .. }
             | WitnessKind::StructDef { .. }
             | WitnessKind::Import(_)
             | WitnessKind::MacroDef { .. }
-            | WitnessKind::UpdateDef { .. }
-            | WitnessKind::AppDef { .. } => {
+            | WitnessKind::UpdateDef { .. } => {
                 Ok((Type::Nil, crate::mir::effect::EffectRow::Empty))
+            }
+            // v0.103: App 定义 —— 注册 `app 名` 的 TeaApp 类型到 env（运行时
+            // h_app_def 注册同名 Value::TeaApp，两侧必须一致），并推断
+            // init/update/view 体（v0.103 前 emit 端丢弃 update/view witness，
+            // 此处只能看到伪造占位 —— 修复后用户写的体参与推断与诊断）。
+            WitnessKind::AppDef {
+                name,
+                model_name: _,
+                msg_name: _,
+                init_w,
+                update_w,
+                view_w,
+            } => {
+                // init 在定义点执行（h_app_def 调 app.initialized）→ 其效果
+                // 行传播到外层；update/view 是延迟闭包 → 行登记进
+                // fn_effect_rows（与 FnDef 同规则），不并入定义点行。
+                let (init_ty, init_row) = self.infer_expr(init_w)?;
+                let (update_ty, _update_row) = self.infer_expr(update_w)?;
+                let (view_ty, _view_row) = self.infer_expr(view_w)?;
+                if let WitnessKind::Closure { body, .. } = &update_w.kind {
+                    let mut ambient = std::collections::HashSet::new();
+                    let r = Self::tree_effect_row(
+                        body,
+                        &mut ambient,
+                        &self.fn_effect_rows.clone(),
+                    );
+                    self.fn_effect_rows.insert(format!("{}.update", name), r);
+                }
+                if let WitnessKind::Closure { body, .. } = &view_w.kind {
+                    let mut ambient = std::collections::HashSet::new();
+                    let r = Self::tree_effect_row(
+                        body,
+                        &mut ambient,
+                        &self.fn_effect_rows.clone(),
+                    );
+                    self.fn_effect_rows.insert(format!("{}.view", name), r);
+                }
+                let msg_ty = self.fresh_type_var();
+                self.env.add(
+                    name.clone(),
+                    Type::TeaApp {
+                        name: name.clone(),
+                        model: Box::new(init_ty),
+                        msg: Box::new(msg_ty),
+                        update: Box::new(update_ty),
+                        view: Box::new(view_ty),
+                    },
+                );
+                Ok((Type::Nil, init_row))
             }
             // v0.84: Sequence 推断 — 依次推断子表达式，合并 effect row，
             // 返回最后一个表达式的类型（do-notation 语义）。空 Sequence → Nil。

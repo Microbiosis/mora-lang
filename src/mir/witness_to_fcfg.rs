@@ -501,6 +501,42 @@ fn build_node(b: &mut FcfgBuilder, w: &MirWitness) -> Node<()> {
                 meta: (),
             }
         }
+        WitnessKind::Export { names, decl } => Node::Export {
+            names: names.clone(),
+            decl: build_block(b, decl),
+            span,
+            meta: (),
+        },
+        WitnessKind::Parallel { body } => Node::Parallel {
+            body: build_block(b, body),
+            span,
+            meta: (),
+        },
+        WitnessKind::Observe { config, body } => Node::Observe {
+            config: config.clone(),
+            body: build_block(b, body),
+            span,
+            meta: (),
+        },
+        WitnessKind::Span { name, tags, body } => Node::Span {
+            name: name.clone(),
+            tags: tags.clone(),
+            body: build_block(b, body),
+            span,
+            meta: (),
+        },
+        WitnessKind::PromptSection { name, body } => Node::PromptSection {
+            name: name.clone(),
+            body: build_block(b, body),
+            span,
+            meta: (),
+        },
+        WitnessKind::DocumentSection { name, body } => Node::DocumentSection {
+            name: name.clone(),
+            body: build_block(b, body),
+            span,
+            meta: (),
+        },
         WitnessKind::RelDef { name, clauses, .. } => {
             Node::RelDef {
                 name: name.clone(),

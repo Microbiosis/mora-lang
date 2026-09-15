@@ -212,6 +212,39 @@ pub enum WitnessKind {
         anon_vars: Vec<String>,
         goal: Box<MirWitness>,
     },
+    // ── v0.103: 命名 section 声明（prompt / document）──
+    /// `prompt "name" do ... end` — 构建 Value::PromptSection 绑定到环境。
+    PromptSection {
+        name: String,
+        body: Box<MirWitness>,
+    },
+    /// `document "name" do ... end` — 构建文档 section 绑定到环境。
+    DocumentSection {
+        name: String,
+        body: Box<MirWitness>,
+    },
+    // ── v0.103: 可观测性块（spec §11.4）──
+    /// `observe <kind> "<name>" do ... end` — 可观测性根块。
+    Observe {
+        config: String,
+        body: Box<MirWitness>,
+    },
+    /// `span "<name>" tags {...} do ... end` — 命名追踪 span。
+    Span {
+        name: String,
+        tags: Vec<(String, String)>,
+        body: Box<MirWitness>,
+    },
+    /// v0.103: `parallel ... end` — 并行块（spec §9.1/§9.2）。
+    Parallel {
+        body: Box<MirWitness>,
+    },
+    /// v0.103: `export <声明>` —— 把内层声明导出的名字标记为公开（spec §10.2）。
+    /// `names` 是该声明产生的绑定名（静态可知，供 typeck 侧导入可见性判定）。
+    Export {
+        names: Vec<String>,
+        decl: Box<MirWitness>,
+    },
 }
 
 /// v0.102: 关系子句 witness —— 编译期模板数据 + 类型推断镜像。
@@ -348,6 +381,16 @@ impl MirWitness {
                 out
             }
             WitnessKind::Solve { goal, .. } => vec![goal.as_ref()],
+            // v0.103: section 声明的 body
+            WitnessKind::PromptSection { body, .. }
+            | WitnessKind::DocumentSection { body, .. } => vec![body.as_ref()],
+            // v0.103: 可观测性块的 body
+            WitnessKind::Observe { body, .. } | WitnessKind::Span { body, .. } => {
+                vec![body.as_ref()]
+            }
+            // v0.103: 并行块 body
+            WitnessKind::Parallel { body } => vec![body.as_ref()],
+            WitnessKind::Export { decl, .. } => vec![decl.as_ref()],
         }
     }
 }

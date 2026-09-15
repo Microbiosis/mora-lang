@@ -206,6 +206,15 @@ pub fn h_app_def(args: AppDefArgs) {
     let _ = (model_name, msg_name);
 }
 
+/// v0.103: `export <声明>` —— 把名字写入环境导出集（spec §10.2）。
+///
+/// 与 `Environment::define` 的 `exported=true` 写同一存储；用独立指令是因为
+/// parser 必须先把声明解析完才能得知名字。
+/// 导入侧（`mir_import`）只合并导出集内的绑定。
+pub fn h_export_mark(env: &mut Environment, name: &str) {
+    env.mark_exported(name);
+}
+
 pub fn h_import(
     interp: &mut dyn MirHost,
     env: &mut Environment,

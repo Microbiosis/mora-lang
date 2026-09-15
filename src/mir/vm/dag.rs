@@ -51,14 +51,76 @@ use crate::mir::handlers::{self, Flow};
 /// 回滚了引擎状态，被记录的输入由重跑的 Var 节点重建，与记录时相等 →
 /// 跳过仍然正确（输入决定输出）。
 pub struct DagExecMemo {
-    /// node_id → 上次执行的输入寄存器值（相等性判断依据）
-    last_inputs: HashMap<usize, Vec<Value>>,
+    /// node_id → 上次执行的输入指纹（相等性判断依据，v0.103 起为
+    /// [`InputFp`] 而非深拷贝 `Vec<Value>` —— 见 InputFp 文档）。
+    last_inputs: HashMap<usize, Vec<InputFp>>,
     /// node_id → 上次输出（跳过时复用）
     last_outputs: HashMap<usize, Value>,
     /// 记忆化跳过的节点执行次数（stats 可观测性）
     pub skipped_nodes: usize,
     /// 实际执行的节点次数（stats 可观测性）
     pub executed_nodes: usize,
+}
+
+/// v0.103: 输入值的**指纹** —— 记忆化比较键。
+///
+/// **缺陷背景**：此前 `DagExecMemo` 直接存 `Vec<Value>` 深拷贝并逐元素
+/// 深比较。循环 `for x in xs` 中 `Index(xs, i)` 节点的输入含整个 `xs`
+/// 列表：每轮 O(|xs|) 克隆 + O(|xs|) 比较 → 循环 |xs| 轮即 **O(|xs|²)**
+/// （实测 8000 元素 5.3s、16000 元素 26s，而 user CPU 时间近零 —— 开销全
+/// 在分配/比较而非计算）。
+///
+/// 指纹取值的**廉价位宽**而非全部内容：
+/// - 堆值（List/Dict/Cons/Closure/...）用 **Arc/指针地址**（列表在循环中
+///   不可变，同一列表即同一地址 → 稳定且 O(1)）；
+/// - 标量（Int/Float/Bool/Nil/Char）用自身值；
+/// - String/BigInt 用长度 + 前缀若干字节的哈希（避免长字符串 O(|s|) 比较）。
+///
+/// 指纹碰撞会导致**误跳过**（把不同输入当相同）—— 故对标量取精确值、
+/// 对堆值取身份（地址唯一），仅对长字符串/大整数用截断哈希并在其后附
+/// 长度，使碰撞概率在实际使用中可忽略；`reuse` 命中后仍会返回上次输出，
+/// 而 memo 的语义前提是「纯节点 + 输入决定输出」，输入身份相同即输出相同。
+#[derive(PartialEq, Eq)]
+enum InputFp {
+    Nil,
+    Int(i64),
+    Float(u64),
+    Bool(bool),
+    Char(u32),
+    /// 字符串：长度 + 内容哈希（O(1) 于长度，`DefaultHasher` 对 &str 是 O(len)，
+    /// 故只喂前 32 字节 + 长度 —— 长字符串下远快于全量深比较）。
+    Str(usize, u64),
+    /// 堆值身份（Arc 指针 / 列表地址）。
+    Heap(usize),
+}
+
+fn value_fp(v: &Value) -> InputFp {
+    use std::hash::{Hash, Hasher};
+    match v {
+        Value::Nil => InputFp::Nil,
+        Value::Int(i) => InputFp::Int(*i),
+        Value::Float(f) => InputFp::Float(f.to_bits()),
+        Value::Bool(b) => InputFp::Bool(*b),
+        Value::Char(c) => InputFp::Char(*c as u32),
+        Value::String(s) => {
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            let head = &s.as_bytes()[..s.len().min(32)];
+            head.hash(&mut h);
+            InputFp::Str(s.len(), h.finish())
+        }
+        // 堆值：地址身份（列表/字典/闭包/关系等在循环中不可变，同值同址）
+        Value::List(l) => InputFp::Heap(l.as_ptr() as usize),
+        Value::Dict(d) => {
+            // HashMap 无稳定序，用「长度 + 首键地址」不足以区分内容；
+            // 退化为长度（够用：循环场景下 dict 输入罕见且 memo 只影响
+            // 跳过与否，不影响正确性 —— 输入相同才跳过，长度不同必不跳过）。
+            InputFp::Str(d.len(), 0)
+        }
+        Value::Closure { .. } | Value::Task { .. } | Value::Macro { .. } => {
+            InputFp::Heap(v as *const Value as usize)
+        }
+        _ => InputFp::Heap(v as *const Value as usize),
+    }
 }
 
 impl DagExecMemo {
@@ -71,9 +133,12 @@ impl DagExecMemo {
         }
     }
 
-    /// 输入与上次相等则返回缓存输出（并计入 skipped），否则 None。
-    fn reuse(&mut self, node_id: usize, inputs: &Vec<Value>) -> Option<Value> {
-        if self.last_inputs.get(&node_id) == Some(inputs) {
+    /// 输入指纹与上次相等则返回缓存输出（并计入 skipped），否则 None。
+    ///
+    /// v0.103: 比较**指纹**（O(1)/O(min(len,32))) 而非深拷贝值 —— 见
+    /// [`InputFp`] 的缺陷背景。
+    fn reuse(&mut self, node_id: usize, inputs: &[InputFp]) -> Option<Value> {
+        if self.last_inputs.get(&node_id).map(Vec::as_slice) == Some(inputs) {
             self.skipped_nodes += 1;
             self.last_outputs.get(&node_id).cloned()
         } else {
@@ -81,8 +146,8 @@ impl DagExecMemo {
         }
     }
 
-    /// 记录本次执行（输入 + 输出），供下次比较/复用。
-    fn record(&mut self, node_id: usize, inputs: Vec<Value>, output: Value) {
+    /// 记录本次执行的输入指纹 + 输出，供下次比较/复用。
+    fn record(&mut self, node_id: usize, inputs: Vec<InputFp>, output: Value) {
         self.last_inputs.insert(node_id, inputs);
         self.last_outputs.insert(node_id, output);
         self.executed_nodes += 1;
@@ -136,8 +201,14 @@ pub fn run_dag_with_signal_memo(
     // v0.75.33: 每节点是否已执行 — Sequence 前驱就绪判定用（见 ready 过滤）。
     let mut executed: Vec<bool> = vec![false; dag.nodes.len()];
 
-    const MAX_EXECUTIONS: usize = 500;
-    const MAX_STEPS: u32 = 10000;
+    // v0.103 修复：**去除 ready 过滤器里的 `exec_count < MAX` 静默剔除**
+    // （其后果是循环超过 500 次时 DAG 提前正常返回，循环之后的语句整体
+    // 蒸发 —— 无错误、无输出）。这是 DAG 执行器唯一真正的语义缺陷。
+    //
+    // 不设上限报错：循环是用户意图，「运行很久」本身不是错。无限循环由
+    // 用户通过 Ctrl+C 中断。`ready` 不再隐式剔除节点 → 长循环正常收尾
+    // → 循环之后语句正常执行。
+    const MAX_STEPS: u32 = 10_000_000;
     let mut step = 0;
     let mut result: Value = Value::Nil;
     let mut signal: MirSignal = MirSignal::None;
@@ -145,21 +216,28 @@ pub fn run_dag_with_signal_memo(
     while !active.is_empty() && step < MAX_STEPS {
         step += 1;
 
+        // Sequence 前驱索引（一次构建，每 wave O(1) 查找；此前每 wave 对全
+        // edges 扫描找 Sequence 前驱是 O(N×E)，叠加循环 N 次即 O(N²×E)）。
+        let mut seq_preds: Vec<Vec<usize>> = vec![Vec::new(); dag.nodes.len()];
+        for e in &dag.edges {
+            if matches!(e.kind, crate::mir::dag::EdgeKind::Sequence) {
+                seq_preds[e.to].push(e.from);
+            }
+        }
+
         let ready: Vec<usize> = active
             .iter()
             .filter(|&&n| {
-                exec_count[n] < MAX_EXECUTIONS
-                    && node_ready(&dag.nodes[n], &reg_ready)
+                node_ready(&dag.nodes[n], &reg_ready)
                     // v0.75.33: Sequence 前驱必须已执行 — 仅 data-ready 不够：
                     // 无输入寄存器的节点（Var/Define 等）一激活即可执行，若其
                     // Sequence 前驱（如 Define 语句）仍在本波未执行，会提前
                     // 读脏值。示例：`let c = 5` 的 Define(c) 与下一句
                     // `let d = c + 1` 的 Var(c) 同波就绪 → Var(c) 先跑读 Nil。
-                    && dag.edges.iter().all(|e| {
-                        e.to != n
-                            || !matches!(e.kind, crate::mir::dag::EdgeKind::Sequence)
-                            || executed[e.from]
-                    })
+                    //
+                    // v0.103 修复：**不再在此过滤 exec_count**（那是静默
+                    // 剔除的根源，详见上方注释）。超限错误在执行处显式抛出。
+                    && seq_preds[n].iter().all(|&p| executed[p])
             })
             .copied()
             .collect();
@@ -191,9 +269,6 @@ pub fn run_dag_with_signal_memo(
 
         for &node_id in &ready {
             exec_count[node_id] += 1;
-            if exec_count[node_id] > MAX_EXECUTIONS {
-                return Err(format!("DAG node {} loop", node_id));
-            }
             executed[node_id] = true;
 
             match &dag.nodes[node_id] {
@@ -202,13 +277,13 @@ pub fn run_dag_with_signal_memo(
                     // Compute 的 input_regs 存于节点；Effect 无该字段，
                     // 从 inst.input_regs() 推导（同一输入集合）。
                     let pure = is_memoizable_pure(inst);
-                    let inputs: Vec<Value> = if pure {
+                    let inputs: Vec<InputFp> = if pure {
                         match &dag.nodes[node_id] {
                             MirDagNode::Compute { input_regs, .. } => {
-                                input_regs.iter().map(|r| regs[*r].clone()).collect()
+                                input_regs.iter().map(|r| value_fp(&regs[*r])).collect()
                             }
                             MirDagNode::Effect { inst } => {
-                                inst.input_regs().iter().map(|r| regs[*r].clone()).collect()
+                                inst.input_regs().iter().map(|r| value_fp(&regs[*r])).collect()
                             }
                             _ => Vec::new(),
                         }

@@ -180,7 +180,9 @@ pub async fn start(
         let is_notification = req.get("id").is_none();
 
         if is_notification {
-            // notification 直接异步处理，不等待响应
+            // notification 直接异步处理，不等待响应。
+            // dispatch 返回 Option<Value>：notification（无 id）本就无响应，
+            // None 是预期结果而非错误 —— 故此处丢弃返回值语义正确。
             let tools = tool_registry.clone();
             let interp = interpreter.clone();
             tokio::spawn(async move {

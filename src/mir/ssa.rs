@@ -542,6 +542,7 @@ fn split_into_ssa(
             MirInst::TaskDef { .. }
             | MirInst::ToolDef { .. }
             | MirInst::Import(_)
+            | MirInst::ExportMark(_)
             | MirInst::WithConfig { .. }
             | MirInst::MatchExpr { .. }
             | MirInst::MatchArm { .. }
@@ -572,6 +573,7 @@ fn split_into_ssa(
             | MirInst::MacroDef { .. }
             | MirInst::Commit
             | MirInst::Worker { .. }
+            | MirInst::Parallel { .. }
             | MirInst::Observe { .. }
             | MirInst::Span { .. }
             // α.6: 文件 I/O — SSA 中跳过
@@ -608,6 +610,7 @@ fn is_ssa_passthrough(inst: &MirInst) -> bool {
         MirInst::TaskDef { .. }
             | MirInst::ToolDef { .. }
             | MirInst::Import(_)
+            | MirInst::ExportMark(_)
             | MirInst::WithConfig { .. }
             | MirInst::MatchExpr { .. }
             | MirInst::MatchArm { .. }
@@ -637,6 +640,7 @@ fn is_ssa_passthrough(inst: &MirInst) -> bool {
             | MirInst::MacroDef { .. }
             | MirInst::Commit
             | MirInst::Worker { .. }
+            | MirInst::Parallel { .. }
             | MirInst::Observe { .. }
             | MirInst::Span { .. }
             | MirInst::Save { .. }

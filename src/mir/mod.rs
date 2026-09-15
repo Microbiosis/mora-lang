@@ -205,6 +205,14 @@ pub enum MirInst {
     /// α.2: import 语句。解释器读文件+解析+执行（委托 AST 路径）。
     Import(String),
 
+    /// v0.103: `export <声明>` —— 把名字标记为模块对外公开（spec §10.2）。
+    ///
+    /// 紧跟在被导出的声明之后，把该名字写入环境的导出集
+    /// （`Environment::mark_exported`）。`import` 只合并导出集内的名字，
+    /// 未标记的绑定是模块私有 —— 这是此前完全缺失的可见性机制
+    /// （`Environment::define` 的 `exported` 参数被忽略）。
+    ExportMark(String),
+
     /// α.2: with 块。bindings 设置 AI config，body 执行后恢复。
     /// 解释器保存/恢复 current_ai_config。
     /// v0.75.43: jit=true 时 body 经 copy-and-patch JIT（纯线性 Int 子集）
@@ -387,9 +395,22 @@ pub enum MirInst {
     /// α.4: rollback — 触发事务回滚（返回 "Transaction rolled back" 错误）。
     Rollback,
 
-    /// α.5: worker — 并发 worker。body 顺序执行（与 AST 语义一致）。
+    /// α.5: worker — 并发 worker 单元。
+    ///
+    /// v0.103: 真正并发执行（此前文档写「顺序执行」且 handler 是单线程
+    /// run_isolated —— spec §9.2 承诺「Worker 并发」名存实亡）。每个 worker
+    /// 在独立宿主克隆（`MirHost::clone_box`）上运行，Effect 经 `Effects`
+    /// 数据通道回传父宿主（与 Pregel 并行 worker 同一机制）。
     Worker {
         name: String,
+        body: Box<MirFunction>,
+    },
+
+    /// v0.103: 并行块 —— `parallel ... end`（spec §9.1）。
+    ///
+    /// 块内各 `worker` 声明并发执行，其余语句在块边界顺序执行。声明为零个
+    /// worker 时退化为普通块（顺序执行 body，spec §9.1 的 `let a = ...` 形式）。
+    Parallel {
         body: Box<MirFunction>,
     },
 
@@ -405,9 +426,11 @@ pub enum MirInst {
         body: Box<MirFunction>,
     },
 
-    /// α.5: span — 追踪 span。执行 body，name 记录但不执行实际追踪。
+    /// α.5: span — 追踪 span（v0.103: 接入 TraceCollector 真实记录）。
     Span {
         name: String,
+        /// span 属性（`tags {k: "v", ...}`）。
+        tags: Vec<(String, String)>,
         body: Box<MirFunction>,
     },
 

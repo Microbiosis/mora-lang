@@ -160,8 +160,10 @@ impl CostModel for TokenEstimate {
             MirInst::Worker { body, .. } => {
                 body.body.iter().map(|i| self.inst_cost(i)).sum::<u32>() + 5
             }
+            MirInst::Parallel { .. } => 20,
             // I/O
             MirInst::Import(_) => 100, // 文件导入开销
+            MirInst::ExportMark(_) => 0,
             MirInst::Save { .. }
             | MirInst::Load { .. }
             | MirInst::ReadFile { .. }

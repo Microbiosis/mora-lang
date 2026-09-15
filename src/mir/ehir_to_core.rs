@@ -335,6 +335,24 @@ fn lower_node(ctx: &mut CoreContext, node: &Ehir) {
             // TEA 定义在 EHIR 阶段已注册到 env，Core 层无操作
         }
 
+        // ── v0.103: export → Core 层透传内部声明（导出标记在执行层）──
+        Node::Export { decl, .. } => {
+            lower_block(ctx, decl);
+        }
+        // ── v0.103: parallel → Core 层透传 body（并发在执行层）──
+        Node::Parallel { body, .. } => {
+            lower_block(ctx, body);
+        }
+        // ── v0.103: 可观测性块 → Core 层透传 body（span 记录在执行层）──
+        Node::Observe { body, .. } | Node::Span { body, .. } => {
+            lower_block(ctx, body);
+        }
+        // ── v0.103: 命名 section 声明 → 与 TEA 定义同为编译期注册 ──
+        Node::PromptSection { body, .. } | Node::DocumentSection { body, .. } => {
+            // section 的构建在 MIR 执行层（h_prompt_section 绑定值到 env）；
+            // Core 层降维 body 内的表达式
+            lower_block(ctx, body);
+        }
         // ── v0.102: 声明式范式 ──
         Node::RelDef { .. } => {
             // 关系定义在 emit 阶段注册到 env，Core 层无操作（同 TEA 定义）

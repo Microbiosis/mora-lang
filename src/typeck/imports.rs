@@ -52,21 +52,54 @@ fn extract_module_symbols(
 ) -> ImportedModuleSymbols {
     let mut syms: Vec<(String, Type)> = Vec::new();
 
-    // 1) let 绑定精确类型（模块自身的推断 + generalization）
+    // 1) 逐条顶层声明求**精确类型**。
+    //
+    // v0.103 修复：此前只把 `let` 绑定从模块 HM env 取出，而 `task`(FnDef)
+    // 一律硬编码为裸 `Type::Closure` —— 但调用点需要精确的 Arrow 才能完成
+    // `greet("x")` 的合一，于是「导入的 task 被调用」必然报
+    // "expected closure, got fn (string) -> …"（无任何测试覆盖该路径，
+    // 缺陷长期潜伏）。现在对每条顶层声明单独 `infer_expr` 取其真实类型：
+    // FnDef → curried Arrow，let → 绑定类型，struct/enum → Unknown，
+    // type alias → 目标类型。
     let mut hm = crate::typeck::hm::HMInference::new();
     for (name, ty) in pre {
         hm.env.add(name.clone(), ty.clone());
     }
     let _ = hm.infer_program(witnesses); // 模块内部错误不在此冒泡（与运行时
     // mir_import 的 `let _type_errs` 一致）
+    // let 绑定（已在 env 中，含 generalization）
     for (name, ty) in hm.env.all_bindings() {
         syms.push((name, sanitize(&ty)));
     }
 
-    // 2) 显式声明名称登记（不在 HM env 中）
-    for w in witnesses {
+    // 显式声明名称登记（不在 HM env 中）。
+    // v0.103: `export <声明>` 把声明包在 `WitnessKind::Export` 里 —— 提取
+    // 顶层符号时必须**下潜**到 decl。
+    fn top_decls<'a>(w: &'a MirWitness, out: &mut Vec<&'a MirWitness>) {
         match &w.kind {
-            WitnessKind::FnDef { name, .. } => syms.push((name.clone(), Type::Closure)),
+            WitnessKind::Export { decl, .. } => top_decls(decl, out),
+            WitnessKind::Sequence(items) => {
+                for it in items {
+                    top_decls(it, out);
+                }
+            }
+            _ => out.push(w),
+        }
+    }
+    let mut decls: Vec<&MirWitness> = Vec::new();
+    for w in witnesses {
+        top_decls(w, &mut decls);
+    }
+    for d in &decls {
+        match &d.kind {
+            // FnDef: 用推断出的精确 Arrow（此前硬编码 Closure → 调用必失败）
+            WitnessKind::FnDef { name, .. } => {
+                let ty = hm
+                    .infer_expr(d)
+                    .map(|(t, _)| t)
+                    .unwrap_or(Type::Closure);
+                syms.push((name.clone(), sanitize(&ty)));
+            }
             WitnessKind::StructDef { name, .. } | WitnessKind::EnumDef { name, .. } => {
                 syms.push((name.clone(), Type::Unknown));
             }
@@ -76,6 +109,20 @@ fn extract_module_symbols(
             _ => {}
         }
     }
+
+    // v0.103: 导出集 —— 只有 `export <声明>` 包裹的名字对导入方可见
+    // （spec §10.2）。未导出的绑定是模块私有。
+    let mut export_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for w in witnesses {
+        if let WitnessKind::Export { names, .. } = &w.kind {
+            for n in names {
+                export_names.insert(n.clone());
+            }
+        }
+    }
+    // v0.103: 可见性收紧 —— **默认私有**。不做「无 export 则全导出」的兼容
+    // 回退（§6 禁止兼容分支；本仓库当前零 import 用法，无须过渡）。
+    syms.retain(|(n, _)| export_names.contains(n));
 
     // 3) v0.98: effect 签名导出（模块声明的效果契约随 import 传播）
     let mut effect_signatures: Vec<(String, crate::typeck::hm::EffectSignature)> = Vec::new();

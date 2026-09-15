@@ -345,19 +345,50 @@ fn method_signature_builtin(receiver: &Type, method: &str) -> Option<Signature> 
             ],
             Type::AiResult,
         )),
+        // v0.103: ai.critic(answer, ctx?) —— spec §12.5。ctx 可选（多传/少传
+        // dict 与字符串都容许），返回结构化裁决 dict。
+        (Type::AiModule, "critic") => Some(Signature::new(
+            vec![
+                ("self".to_string(), Type::AiModule),
+                ("answer".to_string(), Type::String),
+                (
+                    "ctx".to_string(),
+                    Type::Union(vec![Type::String, Type::Nil]),
+                ),
+            ],
+            Type::Dict(Box::new(Type::String), Box::new(Type::Any)),
+        )),
         (Type::AiConfig, "model" | "temperature" | "max_tokens" | "system" | "budget") => Some(
             Signature::new(vec![("self".to_string(), Type::AiConfig)], Type::AiConfig),
         ),
+        // v0.103: Router / McpServer 方法签名补齐用户参数 —— 此前只声明
+        // `self`，与运行时 call_method_router / call_method_mcp 的实际实参
+        // 数量不一致：`router.route("GET", "/x", h)`（3 用户参）被 typeck
+        // 误报 "Expected 0 arguments, got 3"。签名是跨层契约，必须与运行时
+        // 的实参消费一致。
         (Type::Router, "route") => Some(Signature::new(
-            vec![("self".to_string(), Type::Router)],
+            vec![
+                ("self".to_string(), Type::Router),
+                ("method".to_string(), Type::String),
+                ("path".to_string(), Type::String),
+                ("handler".to_string(), Type::Any),
+            ],
             Type::Router,
         )),
         (Type::Router, "listen") => Some(Signature::new(
-            vec![("self".to_string(), Type::Router)],
+            vec![
+                ("self".to_string(), Type::Router),
+                ("addr".to_string(), Type::String),
+            ],
             Type::Nil,
         )),
         (Type::McpServer, "tool") => Some(Signature::new(
-            vec![("self".to_string(), Type::McpServer)],
+            vec![
+                ("self".to_string(), Type::McpServer),
+                ("name".to_string(), Type::String),
+                ("schema".to_string(), Type::Any),
+                ("handler".to_string(), Type::Any),
+            ],
             Type::McpServer,
         )),
         (Type::McpServer, "serve") => Some(Signature::new(
@@ -434,8 +465,26 @@ mod tests {
     #[test]
     fn route_method_on_router() {
         let sig = method_signature(&Type::Router, "route").expect("Router.route");
-        assert_eq!(sig.params.len(), 1); // self
+        // v0.103: self + method + path + handler —— 与运行时
+        // call_method_router 的实参消费一致（此前只声明 self，导致
+        // `router.route("GET", "/x", h)` 被误报 arity 错误）。
+        assert_eq!(sig.params.len(), 4);
         assert!(matches!(sig.return_type, Type::Router));
+    }
+
+    #[test]
+    fn mcp_tool_method_arity_matches_runtime() {
+        // McpServer.tool(name, schema, handler) — self + 3 用户参
+        let sig = method_signature(&Type::McpServer, "tool").expect("McpServer.tool");
+        assert_eq!(sig.params.len(), 4);
+        assert!(matches!(sig.return_type, Type::McpServer));
+    }
+
+    #[test]
+    fn router_listen_accepts_addr() {
+        // Router.listen(addr) — self + 1 用户参
+        let sig = method_signature(&Type::Router, "listen").expect("Router.listen");
+        assert_eq!(sig.params.len(), 2);
     }
 
     #[test]

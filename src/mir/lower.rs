@@ -914,6 +914,79 @@ impl WitnessLowerer {
                 });
                 Ok(dst)
             }
+            WitnessKind::PromptSection { name, body } => {
+                let mut body_l = WitnessLowerer::new();
+                let body_dst = body_l.lower_witness(body)?;
+                body_l.emit(MirInst::Return(Some(body_dst)));
+                let body_mir = body_l.finish();
+                self.emit(MirInst::PromptSection {
+                    name: name.clone(),
+                    body: Box::new(body_mir),
+                });
+                let dst = self.alloc_reg();
+                self.emit(MirInst::Const(dst, crate::value::Value::Nil));
+                Ok(dst)
+            }
+            WitnessKind::DocumentSection { name, body } => {
+                let mut body_l = WitnessLowerer::new();
+                let body_dst = body_l.lower_witness(body)?;
+                body_l.emit(MirInst::Return(Some(body_dst)));
+                let body_mir = body_l.finish();
+                self.emit(MirInst::DocumentSection {
+                    name: name.clone(),
+                    body: Box::new(body_mir),
+                });
+                let dst = self.alloc_reg();
+                self.emit(MirInst::Const(dst, crate::value::Value::Nil));
+                Ok(dst)
+            }
+            WitnessKind::Observe { config, body } => {
+                let mut body_l = WitnessLowerer::new();
+                let body_dst = body_l.lower_witness(body)?;
+                body_l.emit(MirInst::Return(Some(body_dst)));
+                let body_mir = body_l.finish();
+                self.emit(MirInst::Observe {
+                    config: config.clone(),
+                    body: Box::new(body_mir),
+                });
+                let dst = self.alloc_reg();
+                self.emit(MirInst::Const(dst, crate::value::Value::Nil));
+                Ok(dst)
+            }
+            WitnessKind::Span { name, tags, body } => {
+                let mut body_l = WitnessLowerer::new();
+                let body_dst = body_l.lower_witness(body)?;
+                body_l.emit(MirInst::Return(Some(body_dst)));
+                let body_mir = body_l.finish();
+                self.emit(MirInst::Span {
+                    name: name.clone(),
+                    tags: tags.clone(),
+                    body: Box::new(body_mir),
+                });
+                let dst = self.alloc_reg();
+                self.emit(MirInst::Const(dst, crate::value::Value::Nil));
+                Ok(dst)
+            }
+            WitnessKind::Parallel { body } => {
+                let mut body_l = WitnessLowerer::new();
+                let body_dst = body_l.lower_witness(body)?;
+                body_l.emit(MirInst::Return(Some(body_dst)));
+                let body_mir = body_l.finish();
+                self.emit(MirInst::Parallel {
+                    body: Box::new(body_mir),
+                });
+                let dst = self.alloc_reg();
+                self.emit(MirInst::Const(dst, crate::value::Value::Nil));
+                Ok(dst)
+            }
+            WitnessKind::Export { names, decl } => {
+                // 先 lower 被导出的声明（产生绑定），再 emit 导出标记指令。
+                let dst = self.lower_witness(decl)?;
+                for n in names {
+                    self.emit(MirInst::ExportMark(n.clone()));
+                }
+                Ok(dst)
+            }
             WitnessKind::WithConfig { bindings, body } => {
                 // WithConfig 是元数据包装——emit WithConfig 指令后 lower body。
                 let mut binding_regs: Vec<(String, Reg)> = Vec::new();

@@ -128,4 +128,15 @@ pub trait MirHost {
     fn recorder_mut(&mut self) -> Option<&mut crate::record::Recorder> {
         None
     }
+
+    /// v0.103: 访问 TraceCollector（`h_span` 记录真实 span 用）。
+    ///
+    /// 默认 `None` —— 无 trace 能力的宿主（测试假实现）下 `span` 块退化为
+    /// 仅执行 body。`Interpreter` 返回其 `AiRuntime.trace`，使
+    /// `observe`/`span` 声明接入 OpenTelemetry 导出路径
+    /// （`TraceCollector::get_spans_json` / `export_otel_json`），
+    /// 而非此前 handler 的「执行 body 并丢弃」空转。
+    fn trace_collector(&self) -> Option<&crate::trace_collector::TraceCollector> {
+        None
+    }
 }

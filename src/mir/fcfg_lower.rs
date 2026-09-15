@@ -483,6 +483,49 @@ fn lower_node(ctx: &mut EmitContext, node: &Fcfg) {
                 view_mir: Box::new(view_mir),
             });
         }
+        Node::Export { names, decl, .. } => {
+            lower_block(ctx, decl);
+            for n in names {
+                ctx.emit(MirInst::ExportMark(n.clone()));
+            }
+        }
+        Node::Parallel { body, .. } => {
+            let body_mir = lower_block_to_function(ctx, body);
+            ctx.emit(MirInst::Parallel {
+                body: Box::new(body_mir),
+            });
+        }
+        // ── v0.103: 可观测性块 ──
+        Node::Observe { config, body, .. } => {
+            let body_mir = lower_block_to_function(ctx, body);
+            ctx.emit(MirInst::Observe {
+                config: config.clone(),
+                body: Box::new(body_mir),
+            });
+        }
+        Node::Span { name, tags, body, .. } => {
+            let body_mir = lower_block_to_function(ctx, body);
+            ctx.emit(MirInst::Span {
+                name: name.clone(),
+                tags: tags.clone(),
+                body: Box::new(body_mir),
+            });
+        }
+        // ── v0.103: 命名 section 声明 ──
+        Node::PromptSection { name, body, .. } => {
+            let body_mir = lower_block_to_function(ctx, body);
+            ctx.emit(MirInst::PromptSection {
+                name: name.clone(),
+                body: Box::new(body_mir),
+            });
+        }
+        Node::DocumentSection { name, body, .. } => {
+            let body_mir = lower_block_to_function(ctx, body);
+            ctx.emit(MirInst::DocumentSection {
+                name: name.clone(),
+                body: Box::new(body_mir),
+            });
+        }
         // ── v0.102: 声明式范式 ──
         Node::RelDef { name, clauses, .. } => {
             ctx.emit(MirInst::RelDef {

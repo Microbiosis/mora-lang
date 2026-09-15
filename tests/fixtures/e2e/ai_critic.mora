@@ -1,0 +1,7 @@
+-- v0.103: ai.critic(answer, ctx?) — spec §12.5 承诺的评估输出（此前零实现）
+-- ctx 是**可选**尾参（signature `ctx?`）：1 参与 2 参调用都必须可用。
+-- 锁定两件事：① ai.critic 存在且返回结构化裁决；② 可选尾参可省略。
+let a = ai.critic("Paris is the capital of France.")
+let b = ai.critic("Paris is the capital of France.", "European geography")
+
+[b, a]

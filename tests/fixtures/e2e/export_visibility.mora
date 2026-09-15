@@ -1,0 +1,7 @@
+-- v0.103 端到端可见性：通过 stdout 断言（helper 不捕获 stdout）。
+import "tests/fixtures/mod_export.mora"
+
+task main()
+  print(greet("x"))
+  print(VERSION)
+end

@@ -159,6 +159,35 @@ fn import_symbol_resolved_in_typecheck() {
     );
 }
 
+/// v0.103: 模块私有绑定不得泄漏 —— 未 `export` 的符号对导入方不可见。
+/// 锁定「`Environment::define` 的 exported 参数被忽略」导致的可见性缺失。
+#[test]
+fn import_private_symbol_not_visible() {
+    let errs = typecheck("import \"tests/fixtures/mod_a.mora\"
+let s = scale");
+    assert!(
+        !errs.is_empty(),
+        "未 export 的模块私有绑定 (scale) 应报 UnboundVariable，实际无错"
+    );
+}
+
+/// v0.103: `return <expr>` 的类型是被返回表达式的类型（此前一律 Nil）。
+/// 后果是任何用显式 return 的函数，其 Arrow 返回类型都错为 Nil ——
+/// 一旦函数类型被物化使用（import 精确签名）即暴露。
+#[test]
+fn return_expr_type_is_returned_type() {
+    // 函数返回 string，调用点赋给 string 注解必须通过。
+    // 若 `return <expr>` 被当作 Nil（v0.103 前的行为），此处会报
+    // "expected string, got nil" —— 这正是本测试锁定的点。
+    let ok_src = "task f()\n  return \"s\"\nend\nlet x: string = f()";
+    let ok_errs = typecheck(ok_src);
+    assert!(
+        ok_errs.is_empty(),
+        "return 字符串的函数返回类型应为 string，实际报错: {:?}",
+        ok_errs
+    );
+}
+
 #[test]
 fn import_symbol_type_checked() {
     let errs = typecheck("import \"tests/fixtures/mod_a.mora\"\nlet s = greeting\ns + 1");

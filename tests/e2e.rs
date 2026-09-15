@@ -302,6 +302,161 @@ fn e2e_tea_app_runs() {
     assert_ok("tea_app.mora");
 }
 
+/// tea_counter.mora：TEA 完整运行时链路 —— 声明式 app 名可引用 +
+/// tea.init 三参构造 + tea.dispatch/run/update 驱动。
+/// 锁定的既有缺陷：typeck 不注册 app 名（Unbound variable）、emit 端伪造
+/// update/view witness、tea.init 硬编码 update/view = Nil（tea.run 崩）。
+#[test]
+fn e2e_tea_counter_runs() {
+    assert_ok("tea_counter.mora");
+}
+
+/// ai_critic.mora：`ai.critic(answer, ctx?)`（spec §12.5 `string, string? -> value`）。
+/// 此前无任何实现（全仓无该 builtin），方法调用落 Unknown method。
+#[test]
+fn e2e_ai_critic_runs() {
+    use mora::value::Value;
+    let (last_expr, _) = assert_ok("ai_critic.mora");
+    // fixture 返回 [b(2参), a(1参)] —— 两者都必须是结构化裁决 dict
+    let items = match last_expr {
+        Value::List(items) => items,
+        other => panic!("期望 [b, a] 列表，得到 {:?}", other),
+    };
+    assert_eq!(items.len(), 2, "1 参与 2 参调用都必须可用（可选尾参）");
+    for (i, v) in items.iter().enumerate() {
+        let d = match v {
+            Value::Dict(d) => d,
+            other => panic!("第 {} 个结果应为 dict，得到 {:?}", i, other),
+        };
+        let verdict = d.get("verdict").and_then(|v| match v {
+            Value::String(s) => Some(s.as_str()),
+            _ => None,
+        });
+        assert!(
+            matches!(verdict, Some("pass") | Some("fail")),
+            "verdict 必须是 pass/fail，得到 {:?}",
+            d.get("verdict")
+        );
+        assert!(d.contains_key("score"), "结果须含 score 字段");
+        assert!(d.contains_key("critique"), "结果须含 critique 字段");
+    }
+}
+
+/// export_visibility.mora：模块可见性（spec §10.2）端到端。
+/// 锁定「未 export 的符号对 import 不可见」+「export 的 let/task 可调用」。
+#[test]
+fn e2e_export_visibility_runs() {
+    // run_e2e 不捕获 stdout（helper 已知架构限制），改走子进程捕获
+    // 并断言 print 的输出。这是 v0.103 export 模块可见性的端到端契约：
+    // 调用 export 的 task 与读取 export 的 let 都必须工作。
+    use std::process::Command;
+    let out = Command::new(env!("CARGO_BIN_EXE_mora"))
+        .arg("tests/fixtures/e2e/export_visibility.mora")
+        .output()
+        .expect("run fixture");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("hi"),
+        "export task greet 应输出 \"hi\"，实际 stdout:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("1.0"),
+        "export let VERSION 应输出 \"1.0\"，实际 stdout:\n{}",
+        stdout
+    );
+}
+
+/// 模块内未 export 的 `hidden` 在 import 侧必须被 typeck 拒。
+/// 直接走 typecheck 入口（无需额外 fixture 文件）：
+/// 写一段 import 后引用隐藏名的代码，typeck 必须报错。
+#[test]
+fn e2e_export_private_symbol_not_visible() {
+    let src = "import \"tests/fixtures/mod_export.mora\"\nlet x = hidden";
+    let witnesses = mora::parser_v3::ParserV3::compile(src)
+        .expect("parse")
+        .1;
+    let errs = mora::typeck::check_mir::check_program_witnesses_bidirectional(&witnesses);
+    assert!(
+        !errs.is_empty(),
+        "未 export 的 hidden 必须在 typeck 阶段被拒，实际无错"
+    );
+}
+
+/// explicit_api.mora：`Type::new()` 关联构造 + Router/McpServer 方法链 +
+/// dict 关键字键。锁定 `::` 不被 parser 消费、构造器无分派、typeck 方法
+/// 签名漏用户参数、dict 键拒绝关键字四处缺陷。
+#[test]
+fn e2e_explicit_api_runs() {
+    use mora::value::Value;
+    let (last_expr, _) = assert_ok("explicit_api.mora");
+    let d = match last_expr {
+        Value::Dict(d) => d,
+        other => panic!("期望 dict 结果，得到 {:?}", other),
+    };
+    assert_eq!(d.get("router"), Some(&Value::String("router".into())));
+    assert_eq!(d.get("server"), Some(&Value::String("mcp_server".into())));
+    assert!(
+        matches!(d.get("schema"), Some(Value::Dict(_))),
+        "schema 应为 dict（含关键字键 type），得到 {:?}",
+        d.get("schema")
+    );
+}
+
+/// prompt_section.mora：`prompt "name" do ... end` 声明 + compose_prompt 拼接。
+/// 锁定：prompt 关键字不被 parser 消费、handler 吞错不构建值、
+/// compose_prompt 读错环境（core.environment vs 执行 env）三处缺陷。
+#[test]
+fn e2e_prompt_section_runs() {
+    use mora::value::Value;
+    let (last_expr, _) = assert_ok("prompt_section.mora");
+    let out = match last_expr {
+        Value::String(s) => s,
+        other => panic!("compose_prompt 应返回字符串，得到 {:?}", other),
+    };
+    assert!(out.contains("system"), "拼接结果应含 system 节: {}", out);
+    assert!(out.contains("You are a helpful assistant."), "应含 system 正文: {}", out);
+    assert!(out.contains("user"), "拼接结果应含 user 节: {}", out);
+    assert!(out.contains("What is Mora?"), "应含 user 正文: {}", out);
+}
+
+/// 全局模块对象在类型检查阶段可用 —— globals 注册表与 typeck 名单同源。
+/// 缺陷：13 个已注册模块（bus/sandbox/schedule/ccr/mock/exec/tool/skill/
+/// plan/mora/document/tea/xform）此前被判 Unbound variable，用户无法调用。
+#[test]
+fn builtin_module_objects_pass_typeck() {
+    use mora::value::MODULE_OBJECTS;
+    for (name, _) in MODULE_OBJECTS {
+        let src = format!("let x = {}
+", name);
+        let (_f, w) = mora::parser_v3::ParserV3::compile(&src)
+            .unwrap_or_else(|e| panic!("{} 编译失败: {}", name, e));
+        let errs = mora::typeck::check_mir::check_program_witnesses_bidirectional(&w);
+        assert!(
+            errs.is_empty(),
+            "模块对象 {} 不应在 typeck 报错: {:?}",
+            name,
+            errs.iter().map(mora::typeck::format_error).collect::<Vec<_>>()
+        );
+    }
+}
+
+/// 模块对象名单与 globals 注册同源（防再次漂移）。
+#[test]
+fn module_objects_are_registered_in_globals() {
+    use mora::mir::host::MirHost;
+    use mora::value::MODULE_OBJECTS;
+    let interp = mora::interpreter::Interpreter::new();
+    let env = MirHost::environment(&interp);
+    for (name, _) in MODULE_OBJECTS {
+        assert!(
+            env.get(name).is_some(),
+            "MODULE_OBJECTS 列出的 {} 必须在 globals 中注册",
+            name
+        );
+    }
+}
+
 // ===================================================================
 // v0.102: 声明式范式（逻辑式/关系式）
 // ===================================================================
@@ -473,6 +628,21 @@ fn e2e_rel_cons_runs() {
 // ===================================================================
 // v0.102 缺陷修复回归
 // ===================================================================
+
+/// loop_beyond_dag_limit.mora：循环 600 次（> 旧的 DAG 上限 500）后，
+/// 循环累加结果仍可访问。锁定「DAG 节点执行上限静默截断循环后续语句」缺陷。
+#[test]
+fn e2e_loop_beyond_dag_limit_runs() {
+    use mora::value::Value;
+    let (last_expr, _) = assert_ok("loop_beyond_dag_limit.mora");
+    // sum(0..599) = 599*600/2 = 179700
+    let got = match last_expr {
+        Value::Int(n) => n as f64,
+        Value::Float(n) => n,
+        other => panic!("期望数值结果，得到 {:?}", other),
+    };
+    assert_eq!(got, 179700.0, "600 次循环的累加和必须完整计算（非被截断）");
+}
 
 /// return_expr_order.mora：`return <expr>` 返回表达式求值寄存器（非硬编码 0）。
 #[test]

@@ -1,3 +1,7 @@
+-- v0.102: TEA 运行时 —— 声明式 app + tea.* 完整构造
+-- 缺陷链：① typeck 不注册 app 名 → Counter 报 Unbound variable
+--         ② emit 端伪造 update/view witness → 用户的体不参与推断
+--         ③ tea.init 硬编码 update/view = Nil → tea.run 报 update not callable
 app Counter
   model: Counter
   msg: CounterMsg
@@ -6,9 +10,12 @@ app Counter
   view: fn(m) => m
 end
 
--- v0.94: TeaApp 是纯值 —— tea.dispatch/tea.run 返回新 app，须显式穿线。
-let app_inst = tea.init({count: 0, step: 1})
-let app_inst = tea.dispatch(app_inst, {tag: "Increment"})
+-- 用声明式 app 实例派发并驱动循环（update/view 来自 app 定义）
+let app_inst = tea.dispatch(Counter, {tag: "Increment"})
 let app_inst = tea.dispatch(app_inst, {tag: "Increment"})
 let app_inst = tea.run(app_inst, 5)
-tea.model(app_inst)
+
+-- tea.init 三参完整构造：init/update/view 全部绑定为闭包
+let built = tea.init(fn() => {count: 0}, fn(m, msg) => m, fn(m) => m)
+let ticked = tea.update(built, {tag: "Tick"})
+tea.model(ticked)

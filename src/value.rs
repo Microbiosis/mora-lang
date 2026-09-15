@@ -98,6 +98,49 @@ pub enum BuiltinKind {
     Random,
 }
 
+/// 全局**模块对象**（`name.method(...)` 形式）的单一事实源。
+///
+/// 三处消费方共享本表，杜绝各自维护名单造成的漂移：
+/// 1. [`Interpreter::new`](crate::interpreter::Interpreter) 把它注册进 globals；
+/// 2. [`crate::flow::is_builtin_object`] 判定「非变量绑定的内建对象名」；
+/// 3. [`crate::typeck::hm`] 的 `infer_var` 把未绑定模块名解析为对象类型
+///    （而非报 `Unbound variable`）。
+///
+/// **缺陷背景（v0.103）**：此前注册与判定各写一份名单 —— globals 注册了
+/// 22 个模块（含 tea/xform），`is_builtin_object` 只列 6 个，`infer_var` 又
+/// 手工列 6 个。结果 `bus`/`sandbox`/`schedule`/`ccr`/`mock`/`exec`/`tool`/
+/// `skill`/`plan`/`mora`/`document`/`tea`/`xform` 共 13 个模块**运行时可用但
+/// 类型检查阶段被拒**（Unbound variable），用户完全无法调用。
+///
+/// 注意：本表只含模块对象。裸函数（print/range/len/compose_prompt/tail/
+/// compress/crush_json）与 `tool`（Toolplane 实例）不在此列 —— 它们不是
+/// `name.method` 形式，注册见 `Interpreter::new`。
+pub const MODULE_OBJECTS: &[(&str, BuiltinKind)] = &[
+    ("ai", BuiltinKind::AiChat),
+    ("web", BuiltinKind::Web),
+    ("json", BuiltinKind::Json),
+    ("file", BuiltinKind::File),
+    ("memory", BuiltinKind::Memory),
+    ("agent", BuiltinKind::Agent),
+    ("document", BuiltinKind::Document),
+    ("bus", BuiltinKind::Bus),
+    ("sandbox", BuiltinKind::Sandbox),
+    ("schedule", BuiltinKind::Schedule),
+    ("ccr", BuiltinKind::Ccr),
+    ("mock", BuiltinKind::Mock),
+    ("exec", BuiltinKind::Exec),
+    ("tool", BuiltinKind::Toolplane),
+    ("skill", BuiltinKind::Skill),
+    ("plan", BuiltinKind::Plan),
+    ("mora", BuiltinKind::Mora),
+    ("math", BuiltinKind::Math),
+    ("stats", BuiltinKind::Stats),
+    ("linalg", BuiltinKind::Linalg),
+    ("random", BuiltinKind::Random),
+    ("tea", BuiltinKind::Tea),
+    ("xform", BuiltinKind::Xform),
+];
+
 impl std::fmt::Display for BuiltinKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let s = match self {
@@ -145,6 +188,12 @@ impl BuiltinKind {
     /// v0.75.52: 静态查找表（P6）— 调用名 → BuiltinKind 的单一来源。
     /// 覆盖裸函数（print/len/range）与 domain 前缀（file.*/ai.chat 等）
     /// 的 kind 登记；未登记返回 None（dispatch 走原生 match fallback）。
+    ///
+    /// v0.103: **模块对象前缀从 [`MODULE_OBJECTS`] 派生**（单一事实源）——
+    /// 此前本表另抄一份名单，与 globals 注册漂移：注册名是 `tool` 而本表
+    /// 只认 `toolplane`，导致 `from_name("tool")` 返回 None。同时
+    /// `BuiltinKind::Toolplane` 的 Display 又写作 `"Toolplane::new"` ——
+    /// 同一内建三种拼写。现统一：模块前缀 == MODULE_OBJECTS 的键。
     pub fn from_name(name: &str) -> Option<BuiltinKind> {
         // 裸函数
         match name {
@@ -156,44 +205,27 @@ impl BuiltinKind {
         }
         // domain 前缀
         let prefix = name.split('.').next().unwrap_or(name);
+        // ai 有子域细分（chat → AiChat / tokens → AiTokens / 其余 → Ai），
+        // 先于 MODULE_OBJECTS 统一映射处理。
+        if prefix == "ai" {
+            return Some(if name.starts_with("ai.chat") {
+                BuiltinKind::AiChat
+            } else if name.starts_with("ai.tokens") {
+                BuiltinKind::AiTokens
+            } else {
+                BuiltinKind::Ai
+            });
+        }
+        // 模块对象：唯一名单（与 globals 注册同源）
+        if let Some((_, kind)) = MODULE_OBJECTS.iter().find(|(n, _)| *n == prefix) {
+            return Some(*kind);
+        }
+        // 非模块 builtin（裸函数形态的域前缀）
         Some(match prefix {
-            "web" => BuiltinKind::Web,
-            "json" => BuiltinKind::Json,
-            "file" => BuiltinKind::File,
-            "memory" => BuiltinKind::Memory,
-            "bus" => BuiltinKind::Bus,
-            "sandbox" => BuiltinKind::Sandbox,
-            "schedule" => BuiltinKind::Schedule,
-            "ccr" => BuiltinKind::Ccr,
-            "mock" => BuiltinKind::Mock,
-            "ai" => {
-                if name.starts_with("ai.chat") {
-                    BuiltinKind::AiChat
-                } else if name.starts_with("ai.tokens") {
-                    BuiltinKind::AiTokens
-                } else {
-                    BuiltinKind::Ai
-                }
-            }
-            "agent" => BuiltinKind::Agent,
-            "document" => BuiltinKind::Document,
             "compress" => BuiltinKind::Compress,
             "crush_json" => BuiltinKind::CrushJson,
             "tail" => BuiltinKind::Tail,
             "compose_prompt" => BuiltinKind::ComposePrompt,
-            "exec" => BuiltinKind::Exec,
-            "toolplane" => BuiltinKind::Toolplane,
-            "skill" => BuiltinKind::Skill,
-            "plan" => BuiltinKind::Plan,
-            "mora" => BuiltinKind::Mora,
-            // v0.83: TEA runtime 与 transducer builtin（无 domain 前缀）
-            "tea" => BuiltinKind::Tea,
-            "xform" => BuiltinKind::Xform,
-            // v0.91: 数学四件套（math/stats/linalg/random）
-            "math" => BuiltinKind::Math,
-            "stats" => BuiltinKind::Stats,
-            "linalg" => BuiltinKind::Linalg,
-            "random" => BuiltinKind::Random,
             _ => return None,
         })
     }
@@ -747,6 +779,16 @@ pub struct Environment {
     pub versions: HashMap<String, VectorClock>,
     /// v0.61: This environment's own vector clock.
     pub clock: VectorClock,
+    /// v0.103: 本层**对外公开**的绑定名（模块导出面）。
+    ///
+    /// 语义（spec §10.2）：`export` 标记的符号对 import 者可见，未标记的
+    /// 是模块私有。本集合是该模块接口的单一存储 —— 两条入口写同一存储：
+    /// 1. [`Environment::define`] 的 `exported` 参数（此前是死参数，被忽略）；
+    /// 2. `MirInst::ExportMark` 指令（`export <decl>` 的运行时落点）。
+    ///
+    /// `import` 只把**导出集内**的名字合并进导入方环境（typeck 侧由
+    /// witness 静态收集同名集合，两侧同源）。
+    pub exports: std::collections::HashSet<String>,
 }
 
 impl Default for Environment {
@@ -762,6 +804,7 @@ impl Environment {
             parent: None,
             versions: HashMap::new(),
             clock: VectorClock::default(),
+            exports: std::collections::HashSet::new(),
         }
     }
 
@@ -771,6 +814,7 @@ impl Environment {
             parent: Some(parent),
             versions: HashMap::new(),
             clock: VectorClock::default(),
+            exports: std::collections::HashSet::new(),
         }
     }
 
@@ -788,10 +832,37 @@ impl Environment {
         next
     }
 
-    pub fn define(&mut self, name: String, value: Value, _exported: bool) {
+    /// 定义绑定。`exported=true` 同时把名字记入本层的**导出集**
+    /// （模块对外接口，见 [`Environment::exports`]）。
+    ///
+    /// v0.103 修复：此前 `exported` 形参被忽略（写作 `_exported`）——
+    /// 模块可见性因此无从表达（spec §10.2 的 `export` 承诺零实现）。
+    pub fn define(&mut self, name: String, value: Value, exported: bool) {
+        if exported {
+            self.exports.insert(name.clone());
+        }
         self.values = self.values.assoc(&name, value);
         // v0.61: record the current clock for this binding
         self.versions.insert(name, self.clock.clone());
+    }
+
+    /// v0.103: 把名字标记为对外公开（`MirInst::ExportMark` 的落点）。
+    /// 与 `define(name, value, true)` 写同一存储，只是允许在绑定之后标记
+    /// （parser 需先解析完整声明才知道名字，故用独立的标记指令）。
+    pub fn mark_exported(&mut self, name: &str) {
+        self.exports.insert(name.to_string());
+    }
+
+    /// 名字是否在本层导出（不看父链 —— 导出面属模块自身）。
+    pub fn is_exported(&self, name: &str) -> bool {
+        self.exports.contains(name)
+    }
+
+    /// 本层导出名（排序后稳定返回，供 import 合并与测试断言）。
+    pub fn exported_names(&self) -> Vec<String> {
+        let mut v: Vec<String> = self.exports.iter().cloned().collect();
+        v.sort();
+        v
     }
 
     pub fn get(&self, name: &str) -> Option<Value> {

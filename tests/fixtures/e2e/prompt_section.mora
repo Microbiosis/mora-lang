@@ -1,0 +1,17 @@
+-- v0.103: prompt section 声明 + compose_prompt 消费
+-- 缺陷链：① prompt 是词法关键字但 parser 从不消费（TokenType::Prompt 零
+--           使用点）→ 语法完全不解析
+--         ② h_prompt_section 只跑 body 丢弃结果（吞错 + 从不构建
+--           Value::PromptSection）
+--         ③ compose_prompt 读 core.environment 而非执行 env（take_env 后
+--           该字段为空）→ 永远查不到 section
+prompt "system" do
+  "You are a helpful assistant."
+end
+
+prompt "user" do
+  "What is Mora?"
+end
+
+-- 拼接两个 section（role 缺省，按 name 分节输出）
+compose_prompt("system", "user")

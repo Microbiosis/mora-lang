@@ -1,0 +1,11 @@
+-- v0.103 回归：循环迭代超过 DAG 每节点执行上限后，后续语句曾静默消失
+-- 缺陷：dag.rs 硬编码 MAX_EXECUTIONS=500，ready 过滤器静默剔除超限节点，
+-- DAG 提前正常返回 —— 循环之后的语句整体蒸发（无错误、无输出）。
+-- 修复后上限可配置（MORA_DAG_MAX_EXECUTIONS，默认 100000），且循环正常收尾。
+let acc = 0
+for i in range(0, 600, 1)
+  assign acc = acc + i
+end
+
+let total = acc
+total

@@ -1,0 +1,17 @@
+-- v0.103: 显式 API 构造器 —— `Type::new()` 与 Router/McpServer 方法链
+-- 缺陷链：① `::` 只被词法化为 ColonColon，parser 从不消费（零使用点）
+--           → `Router::new()` 整体不可达
+--         ② 无 Router::new / McpServer::new 构造分派（只有实例方法）
+--         ③ typeck 的 route/tool/listen 签名只声明 self，与运行时实参
+--           数量不一致（"Expected 0 arguments, got 3"）
+--         ④ dict 键不接受关键字 → {type: "string"} 解析失败
+let router = Router::new()
+let handler = fn(req) => {status: 200}
+let router = router.route("GET", "/api/health", handler)
+
+let server = McpServer::new()
+let schema = {name: {type: "string"}}
+let greet = fn(params) => params
+let server = server.tool("greet", schema, greet)
+
+{router: type_of(router), server: type_of(server), schema: schema}

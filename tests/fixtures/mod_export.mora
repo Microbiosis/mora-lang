@@ -1,0 +1,9 @@
+-- v0.103: 模块文件 —— 仅 export 的符号对 import 可见（spec §10.2）。
+export task greet(name)
+  return "hi"
+end
+
+export let VERSION = "1.0"
+
+-- 未导出 —— 导入方引用会报 UnboundVariable。
+let hidden = 42

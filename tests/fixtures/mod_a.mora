@@ -1,5 +1,11 @@
-let greeting: string = "hi"
-let answer: int = 42i
+-- v0.103: 模块可见性 —— 只有 `export` 的绑定对 import 者可见（spec §10.2）。
+-- 此前 `Environment::define` 的 exported 参数被忽略、无 export 语法，
+-- 模块内全部绑定无条件泄漏给导入方。
+export let greeting: string = "hi"
+export let answer: int = 42i
+
+-- 未导出的绑定是模块私有：导入方引用会报 UnboundVariable
+-- （tests/tier1_typeck_mir.rs::import_private_symbol_not_visible 锁定）。
 let scale = 2.5
 task plus(a, b)
   a + b

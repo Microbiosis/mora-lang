@@ -19,23 +19,23 @@ impl Interpreter {
     ) -> Result<Value, String> {
         match method {
             "init" => {
-                // v0.84 Phase 4c: tea.init(init_closure, model_hint)
-                // - 第一个参数是 init closure 时，调用它拿初始 model
-                // - 第一个参数是普通值时，直接作为初始 model
-                // - 无参数时，model = Nil
-                let (init_val, has_init) = if let Some(first) = args.first() {
-                    match first {
-                        Value::Closure { .. } => (first.clone(), true),
-                        _ => (Value::Nil, false),
-                    }
-                } else {
-                    (Value::Nil, false)
-                };
-                let app = crate::tea::TeaApp::new(
-                    init_val,
-                    Value::Nil, // update closure
-                    Value::Nil, // view closure
-                );
+                // v0.103: tea.init(init, update?, view?) —— 完整构造入口。
+                //
+                // 缺陷背景：此前只接收 init 一个实参，update/view 硬编码为
+                // `Value::Nil`，而 TeaApp 的 update/view 是 `fold`/`step`/`view`
+                // 的运行载体 —— 于是 `tea.dispatch` 产出的 app 一旦 `tea.run`
+                // 就报 "update failed: Value is not callable: nil"。底层
+                // `TeaApp::new(init, update, view)` 本就有三参构造能力，
+                // 是 builtin 面比底层窄。现在透传：
+                // - 第 1 参：init 闭包（或初始 model 值）
+                // - 第 2 参：update 闭包（`fn(model, msg) -> (model, cmd)`）
+                // - 第 3 参：view 闭包（`fn(model) -> any`）
+                // 缺省 update/view 为 Nil（等价于未提供 —— 调用时才报错）。
+                let init_val = args.first().cloned().unwrap_or(Value::Nil);
+                let update_val = args.get(1).cloned().unwrap_or(Value::Nil);
+                let view_val = args.get(2).cloned().unwrap_or(Value::Nil);
+                let has_init = matches!(init_val, Value::Closure { .. });
+                let app = crate::tea::TeaApp::new(init_val.clone(), update_val, view_val);
                 // v0.94: app 是纯值 —— 用 with_model 构造初始 model，返回新 app。
                 let app = if has_init {
                     // 调用 init closure 获取初始 model；失败则回落第一个 arg。
@@ -45,12 +45,10 @@ impl Interpreter {
                         &mut crate::mir::effect::Effects::new(),
                     ) {
                         Ok(model) => app.with_model(model),
-                        Err(_) => {
-                            app.with_model(args.first().cloned().unwrap_or(Value::Nil))
-                        }
+                        Err(_) => app.with_model(init_val),
                     }
                 } else {
-                    app.with_model(args.first().cloned().unwrap_or(Value::Nil))
+                    app.with_model(init_val)
                 };
                 Ok(Value::TeaApp(std::sync::Arc::new(app)))
             }

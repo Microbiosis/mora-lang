@@ -65,6 +65,22 @@ impl Interpreter {
                 );
             }
         }
+        // v0.103: 内建类型构造器 `Router::new()` / `McpServer::new()` ——
+        // spec §18.1/§19 与 CLI 帮助承诺的显式 API 入口。此前 `::` 语法
+        // 不被 parser 消费，故这两条构造路径整体不可达（`Router::new()`
+        // 报 "Undefined function or task"）。
+        match name {
+            "Router::new" => {
+                return Ok(Value::Router {
+                    routes: std::sync::Arc::new(parking_lot::Mutex::new(Vec::new())),
+                });
+            }
+            "McpServer::new" => {
+                return Ok(Value::McpServer { tools: Vec::new() });
+            }
+            _ => {}
+        }
+
         // v0.75.52: P6 — BuiltinKind 静态表登记校验（校验点已移至 `_` 兜底
         // 分支，v0.75.76：顶层断言误拦用户自定义函数）。from_name 是 name→kind
         // 的单一来源；此处仅取 kind 供兜底分支判定。
@@ -87,7 +103,7 @@ impl Interpreter {
             "batch_chat" => self.call_builtin_batch_chat(args),
             "into" => self.call_builtin_into(args, effects),
             "tail" => self.call_builtin_tail(args),
-            "compose_prompt" => self.call_builtin_compose_prompt(args),
+            "compose_prompt" => self.call_builtin_compose_prompt(args, env),
             "eval" => self.call_builtin_eval(args, env, effects),
             "apply" => self.call_builtin_apply(args, effects),
             "curry" => self.call_builtin_curry(args),

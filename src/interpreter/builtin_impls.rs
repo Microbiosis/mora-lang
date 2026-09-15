@@ -323,7 +323,16 @@ impl Interpreter {
         Ok(Value::String(tail_str))
     }
 
-    pub(super) fn call_builtin_compose_prompt(&mut self, args: Vec<Value>) -> Result<Value, String> {
+    /// v0.103 修复：section 从**执行环境**解析（与 `h_prompt_section` 写入的
+    /// 环境同一处）。此前读 `self.core.environment` —— 而 `take_env` 已把
+    /// 宿主的该字段取空交给执行路径，故 `prompt "x" do ... end` 定义的
+    /// section 永远查不到（报 "section 'x' not defined"，错误消息还指引
+    /// 用户写当时 parser 不产出的语法）。与 eval/macroexpand 同一 env 穿线模式。
+    pub(super) fn call_builtin_compose_prompt(
+        &mut self,
+        args: Vec<Value>,
+        env: &Environment,
+    ) -> Result<Value, String> {
         if args.is_empty() {
             return Err("compose_prompt() requires at least 1 section".to_string());
         }
@@ -332,7 +341,7 @@ impl Interpreter {
             let (name, role, text, budget_bytes) = match arg {
                 Value::String(section_name) => {
                     // 从环境查 section（v0.95: 纯值只读查询，无锁）
-                    let looked_up = self.core.environment.get(&section_name);
+                    let looked_up = env.get(&section_name);
                     match looked_up {
                         Some(Value::PromptSection {
                             name,

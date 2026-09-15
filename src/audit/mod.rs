@@ -332,8 +332,13 @@ impl AuditSink for JsonlAuditSink {
 
     fn verify_chain(&self) -> Result<(), AuditError> {
         let state = self.state.lock().expect("audit sink mutex poisoned");
-        // 必须先 flush 才能读到所有写入
-        let _ = state.writer.get_ref().sync_all();
+        // 必须先 flush 才能读到所有写入。sync_all 失败意味着后续读取可能
+        // 基于不完整数据 —— 若静默忽略，会产出错误的「验证通过」结论。
+        state
+            .writer
+            .get_ref()
+            .sync_all()
+            .map_err(|e| AuditError::Io(e.to_string()))?;
         drop(state);
 
         let file = File::open(&self.path).map_err(|e| AuditError::Io(e.to_string()))?;

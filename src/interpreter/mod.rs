@@ -292,6 +292,10 @@ fn perform_effect(
         }
     }
 
+    fn trace_collector(&self) -> Option<&crate::trace_collector::TraceCollector> {
+        Some(&self.ai.trace)
+    }
+
     fn current_merge_strategies(&self) -> Option<HashMap<String, crate::value::MergeStrategy>> {
         self.current_merge_strategies()
     }
@@ -371,17 +375,6 @@ impl Interpreter {
             globals.define("print".to_string(), Value::Builtin(Bk::Print), false);
             globals.define("range".to_string(), Value::Builtin(Bk::Range), false);
             globals.define("len".to_string(), Value::Builtin(Bk::Len), false);
-            for (name, kind) in &[
-                ("ai", Bk::AiChat),
-                ("web", Bk::Web),
-                ("json", Bk::Json),
-                ("file", Bk::File),
-                ("memory", Bk::Memory),
-                ("agent", Bk::Agent),
-                ("document", Bk::Document),
-            ] {
-                globals.define(name.to_string(), Value::Builtin(*kind), false);
-            }
             // v0.26: prompt-section builtins
             globals.define(
                 "compose_prompt".to_string(),
@@ -396,27 +389,14 @@ impl Interpreter {
                 Value::Builtin(Bk::CrushJson),
                 false,
             );
-            // v0.34: bus / sandbox / schedule / ccr / mock
-            globals.define("bus".to_string(), Value::Builtin(Bk::Bus), false);
-            globals.define("sandbox".to_string(), Value::Builtin(Bk::Sandbox), false);
-            globals.define("schedule".to_string(), Value::Builtin(Bk::Schedule), false);
-            globals.define("ccr".to_string(), Value::Builtin(Bk::Ccr), false);
-            globals.define("mock".to_string(), Value::Builtin(Bk::Mock), false);
-            // v0.43.0: exec.* — parallel subprocess execution (pi-mono v1 inspired)
-            globals.define("exec".to_string(), Value::Builtin(Bk::Exec), false);
-            // v0.45.0: tool.plane.* — ToolPlane Core/Extension adapter
-            globals.define("tool".to_string(), Value::Builtin(Bk::Toolplane), false);
-            // v0.46.0: skill.* — MoraSkillSpec + dual registry
-            globals.define("skill".to_string(), Value::Builtin(Bk::Skill), false);
-            // v0.48.0: plan.* — real-time checklist (pi-agent)
-            globals.define("plan".to_string(), Value::Builtin(Bk::Plan), false);
-            // v0.48.0: mora.* — meta (refine)
-            globals.define("mora".to_string(), Value::Builtin(Bk::Mora), false);
-            // v0.91: math/stats/linalg/random 四件套（数学 builtin）
-            globals.define("math".to_string(), Value::Builtin(Bk::Math), false);
-            globals.define("stats".to_string(), Value::Builtin(Bk::Stats), false);
-            globals.define("linalg".to_string(), Value::Builtin(Bk::Linalg), false);
-            globals.define("random".to_string(), Value::Builtin(Bk::Random), false);
+            // v0.103: 模块对象统一从 MODULE_OBJECTS 注册（单一事实源）——
+            // 此前本处逐个 define 22 个模块，与 typeck 的 infer_var 名单、
+            // flow::is_builtin_object 名单三处漂移，导致 13 个模块（bus/
+            // sandbox/schedule/ccr/mock/exec/tool/skill/plan/mora/document/
+            // tea/xform）运行时在册却被类型检查拒绝。
+            for (name, kind) in crate::value::MODULE_OBJECTS {
+                globals.define((*name).to_string(), Value::Builtin(*kind), false);
+            }
         }
         Self {
             core: crate::runtime::core::CoreRuntime {
@@ -594,9 +574,16 @@ impl Interpreter {
                     &mut child_env,
                     effects,
                 )?;
-                // child_env 中的定义合并回父 env
-                for (name, val) in child_env.iter() {
-                    env.define(name, val, false);
+                // v0.103: 只合并**导出集内**的绑定（spec §10.2 可见性语义）。
+                // `export <声明>` 在模块执行时把名字写入 child_env 导出集
+                // （`Environment::exported_names`）；未导出的名字是模块私有，
+                // 不得泄漏进导入方。此前无条件合并全部绑定 —— 可见性机制
+                // 完全缺失（`Environment::define` 的 `exported` 参数被忽略）。
+                let exported = child_env.exported_names();
+                for name in exported {
+                    if let Some(val) = child_env.get(&name) {
+                        env.define(name, val, false);
+                    }
                 }
                 Ok(())
             }

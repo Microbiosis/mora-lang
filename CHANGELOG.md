@@ -2,6 +2,155 @@
 
 All notable changes to Mora will be documented in this file.
 
+## [v0.103] — 2026-09-14 — fix: 全仓缺陷审计 —— 静默吞错 / 模块不可达 / 承诺语法未接线
+
+对本项目现状做系统缺陷审计（死 IR 枚举、静默吞错扫描、spec↔实现落差、
+生产 panic 源），并按「从底层修正、不做补丁」原则逐项修复。发现的缺陷分
+三类：**静默吞错**（错误被丢弃）、**跨层契约漂移**（typeck↔运行时/注册表
+↔名单不一致）、**承诺未接线**（spec/CLI 承诺的语法 parser 不产出）。
+
+### 跨层契约漂移（影响面最大）
+
+- **13 个已注册模块被 typeck 拒绝**：`bus`/`sandbox`/`schedule`/`ccr`/
+  `mock`/`exec`/`tool`/`skill`/`plan`/`mora`/`document`/`tea`/`xform` 在
+  `Interpreter::new` 注册进 globals，却在类型检查阶段报 `Unbound variable`
+  —— 用户完全无法调用。根因：模块名单在三处各自硬编码（globals 注册 22 个、
+  `flow::is_builtin_object` 6 个、`hm::infer_var` 6 个）。新增
+  `value::MODULE_OBJECTS` 单一事实源，三处全部派生。
+- **`app X ... end` 的 app 名不可引用**：运行时 `h_app_def` 注册
+  `Value::TeaApp`，typeck 不注册 → `Counter` 报 Unbound variable。
+- **`tea.init` 硬编码 update/view = Nil**：底层 `TeaApp::new(init, update,
+  view)` 本有三参能力，builtin 面比底层窄 → `tea.run` 报
+  "update failed: Value is not callable: nil"。改为完整透传三参。
+- **`compose_prompt` 读错环境**：读 `self.core.environment` 而非执行 env
+  （`take_env` 已取空该字段）→ 永远查不到 section。与 eval/macroexpand
+  统一为 env 穿线。
+- **typeck 方法签名漏用户参数**：`Router.route` / `McpServer.tool` /
+  `Router.listen` 只声明 `self`，与运行时的实参消费不一致 →
+  `router.route("GET", "/x", h)` 误报 "Expected 0 arguments, got 3"。
+- **可选尾参不可省略**：arity 检查是「恰好 = 签名参数数」，使 spec 标注为
+  可选（`ctx?`）的尾部参数在省略时报 arity 错误（`ai.critic(answer)` 因此
+  不可用）。改为「类型含 `Nil` 的尾部参数可省略」——最小必需参数数由去掉
+  连续尾部可选参数得出。
+- **`BuiltinKind::from_name` 模块名单第四处漂移**：该表另抄一份前缀名单，
+  注册名是 `tool` 而它只认 `toolplane`（`from_name("tool")` → None），
+  `Display` 又写作 `"Toolplane::new"` —— 同一内建三种拼写。改为从
+  `MODULE_OBJECTS` 派生（`ai` 子域细分与其后的裸函数域前缀单独处理）。
+
+### 静默吞错
+
+- **`h_prompt_section` / `h_document_section`**：只 `let _ = run_mir(...)`
+  —— 既吞执行错误（无 `?`）又从不构建声明的值。改为构建
+  `Value::PromptSection` / 文档 section 并绑定、错误传播。
+- **`audit::verify_chain`**：注释声明「必须先 flush」，实现却
+  `let _ = sync_all()` 丢弃错误 → 可能基于不完整数据产出错误的「验证通过」。
+- **`exec.parallel`**：`let _ = h.join()` 吞 worker panic → 结果集静默缺项。
+
+### 承诺未接线的语法（spec/CLI 承诺，parser 零产出）
+
+- **`prompt` / `document` section**（`compose_prompt` 的必需生产者；其错误
+  消息还指引用户使用当时不存在的语法）：`TokenType::Prompt` 是词法关键字但
+  零使用点。新增 `emit_section_w` + witness `PromptSection`/`DocumentSection`
+  贯通八层。
+- **`Type::new()` 关联构造**：`::` 被词法化为 `ColonColon` 但 parser 从不
+  消费 → CLI 帮助与 spec §18.1 承诺的 `Router::new()` / `McpServer::new()`
+  整体不可达。新增关联调用解析 + 两个内建构造器分派。
+- **dict 键不接受关键字**：spec §18.1 的 `{name: {type: "string"}}`（`type`
+  是关键字）解析失败。
+- **`observe` / `span`**（spec §11.4）：MirInst 有 handler 但零 producer，
+  且 handler 是「跑 body 丢弃」空转。新增 `emit_observe_w`/`emit_span_w` +
+  `MirInst::Span.tags` + `MirHost::trace_collector` 桥接，接入
+  `TraceCollector` 真实 span 记录。
+- **`parallel` / `worker`**（spec §9.1/9.2）：完全不解析。新增
+  `MirInst::Parallel` + 真并发 `h_parallel`（`thread::scope` + 独立宿主
+  克隆 + Effect 数据通道回传 + 按声明顺序确定性合并）。
+
+### DAG 执行器：循环静默截断（最严重）
+
+- `dag.rs` 在 ready 过滤器里用 `exec_count[n] < MAX_EXECUTIONS` **静默剔除**
+  节点 —— 循环迭代超过 500 次时 DAG **提前正常返回**，循环之后的语句
+  整体蒸发（无错误、无输出）。实测顶层 `for i in range(0, 500, 1)` 后
+  接 `print` 不打印。
+  **结构性修复**：直接去除 ready 过滤器中的 `exec_count < MAX_EXECUTIONS`
+  节点剔除（这是缺陷的根因）。错误分支（`exec_count > MAX_EXECUTIONS`）
+  此前因过滤已排除该情形而**永不可达**，现在与过滤一起移除。
+  **结论**：循环是用户意图，「跑很久」本身不是错，无限循环由用户 Ctrl+C
+  终止。隐式截断才是缺陷，隐式截断已根治。
+  （**注**：先前尝试过的「保持过滤但调高上限为 100000」属于补丁式 —— 仍
+  是静默截断，只是阈值更高。本次直接去除过滤是根治，与 §0 / §6 一致。）
+
+
+### 承诺未接线（续）
+
+- **`ai.critic`**（spec §12.5 `string, string? -> value`）：此前零实现（全仓
+  无该 builtin，方法调用落 `Unknown method`）。新增 `AiChat::critic` 方法
+  分派 + typeck 签名：经 AI 通道评估 answer，返回结构化
+  `{verdict: pass|fail, critique, score}`。
+- **`export` 模块可见性**（spec §10.2）：完全未实现 ——
+  `Environment::define` 的 `exported` 形参被忽略（写作 `_exported`）、无
+  parser 语法、`import` 无条件合并模块**全部**绑定。本轮完整落地：
+  - `Environment::exports`（导出名集）成为接口的单一存储，`define` 的
+    `exported` 参数与 `mark_exported` 写同一处；
+  - 新增 `MirInst::ExportMark` + `WitnessKind::Export` + parser
+    `export <声明>`（标识符分派，收 let/task/struct/enum/type/macro/rel/
+    prompt/document/app）；
+  - 运行时 `mir_import` 只合并导出集内绑定；typeck `imports.rs` 只登记
+    导出名 → **默认私有**（严格收紧，无「无 export 则全导出」的兼容回退：
+    §6 禁止兼容分支，且本仓库当前零 import 用法，无须过渡）。
+
+### 顺带发现并修复的两个潜伏缺陷（`export` 实现过程中显形）
+
+- **`return <expr>` 的类型恒为 `Nil`**（`hm/mod.rs`）：任何使用显式
+  `return` 的函数，其推断 Arrow 的返回类型都是 Nil。常规调用点因 FnDef 名
+  不入 env（`infer_call` 对未知名产出 fresh TypeVar）而掩盖；函数类型一旦
+  被**物化**使用（跨模块精确签名）立刻显形 —— `import` 后调用导出 task 报
+  `expected nil, got string`。修正为「返回类型 = 被返回表达式的类型」。
+- **`import` 的 task 符号硬编码为裸 `Type::Closure`**（`imports.rs`）：
+  调用点需要精确 Arrow 才能完成合一，故「导入的 task 被调用」必然报
+  `expected closure, got fn (string) -> …`（此前无任何测试覆盖该路径）。
+  改为逐条顶层声明 `infer_expr` 取真实类型（FnDef → curried Arrow）。
+
+### 文档缺陷修复
+
+- **spec 关键字表与实现不符**（§14.1 与附录 A）：原表列出 30+ 个**并非
+  词法关键字**的名字（`export`/`save`/`load`/`read`/`write`/`append`/
+  `read_bytes`/`write_bytes`/`stream`/`tool`/`route`/`observe`/`span`/
+  `tags`/`record`/`trace`/`metrics`/`otel`/`transaction`/`commit`/
+  `rollback`/`compensation`/`worker`/`model`/`msg`/`eval`/`gensym`/`Self`/
+  `where`/`perform`/`handle`/`parallel`），同时漏掉多个真实关键字。已按
+  `lexer.rs::identifier_from` 逐项同步，并说明三类实际机制：**词法关键字**
+  / **标识符 + 前瞻守卫分派**（`transaction`/`worker`/`parallel`/`observe`/
+  `span`/`perform`/`handle`/`effect`/`eval`/`aggregate`）/ **已移除或由
+  builtin 承担**（`route`、`save`/`load`/`read`/`write` 等）。
+- **DAG 执行器 per-wave 开销**：实测每 wave ~130µs（26 节点小图），
+  `active`/`pushed`/`is_ready` 的 per-wave 分配与 `ready.contains` 线性
+  查找可优化。**注**：此前一度判定 O(N²)，经进程内测量（Python
+  subprocess，排除 shell 启动开销）证实**循环本身近即时**（64000 次
+  15ms）—— O(N²) 是 Git Bash 计时假象，该条为性能优化项而非缺陷。
+  本轮已顺带把 memo 的输入比较从深拷贝 `Vec<Value>` 改为 O(1) 指纹。
+
+### 测试
+
+- lib 951（+2 DAG 缓存契约）；e2e 40（+7 缺陷回归）；parser_v3_coverage 19；
+  tier1 34 / tier2 33 / nine_layer 19 / executor_switch 17 / jit 17 /
+  differential 9 / orchestrate 10 / 其余共 24 套件全绿；clippy 全仓清零。
+
+### 已知遗留（本轮未完成，需设计决策或专项优化）
+
+- **parser 不可达的 IR 原语**：11 个 `MirInst` 变体在 src 与 tests 中均无
+  构造点 —— `MatchArm`（legacy，`MatchExpr` 已内联 arms）、`ToolDef` /
+  `SkillDef`（`tool.*` / `skill.*` builtin 承担同名能力）、`Save`/`Load`/
+  `ReadFile`/`WriteFile`/`AppendFile`/`ReadBytesFile`/`WriteBytesFile`
+  （`file.*` builtin 承担，且带 sandbox 路径校验；spec 仅在 §14.1 陈旧
+  关键字表提及）、`Send`。
+  **这不是「死代码」**：本仓库的 IR 层明确支持「手工构造驱动」
+  （`MirInst::Halt` 即由 `tests/tier0_replacement.rs` 直接构造并 pin 住
+  其语义，注释亦载明该模式）。这些变体是 **IR 原语**，只是当前没有语法
+  前端映射到它们。**未删除**原因：判定「补语法前端」还是「随 builtin
+  收敛而移除」属产品方向决策，不应由缺陷审计擅断；删除前需先确认无
+  程序化构造需求（`Halt` 已证明该需求存在）。
+- **`model`·`msg` 独立块**（spec §9.6）：spec 的无名 `model … end` 形式与
+  已实现的 `app Name / model: X` 形式冲突，需先裁清目标语法。
 ## [v0.102] — 2026-09-14 — feat: 声明式范式（逻辑式/关系式）完整融入 — 关系/合一/交错搜索
 
 Mora 的第五个一等范式。此前「声明式」在语言里只有 `match` 一处真语义

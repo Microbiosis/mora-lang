@@ -27,9 +27,13 @@ pub fn is_truthy(value: &Value) -> bool {
     }
 }
 
-/// 检查是否是内置对象名
+/// 检查是否是内置模块对象名（`name.method(...)` 形式）。
+///
+/// v0.103: 改为从 [`crate::value::MODULE_OBJECTS`] 派生 —— 此前此处硬编码
+/// 6 个名字，与 globals 注册表（22 个模块）漂移，导致 13 个已注册模块被
+/// typeck 判为 Unbound variable。
 pub fn is_builtin_object(name: &str) -> bool {
-    matches!(name, "ai" | "web" | "json" | "file" | "memory" | "agent")
+    crate::value::MODULE_OBJECTS.iter().any(|(n, _)| *n == name)
 }
 
 /// hex 编码

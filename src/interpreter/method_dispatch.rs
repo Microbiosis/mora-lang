@@ -514,6 +514,59 @@ impl Interpreter {
                 };
                 Self::do_ai_chat(self, &model, &prompt)
             }
+            (BuiltinKind::AiChat, "critic") => {
+                // v0.103: ai.critic(answer, ctx?) —— spec §12.5 `string, string? -> value`。
+                // 用 AI 对给定 answer 做批判性评估，返回结构化裁决：
+                //   {verdict: "pass"|"fail", critique: <文本>, score: 0..1}
+                // 评估走与 ai.chat 同一模型通道（mock 模式下返回确定性裁决），
+                // 使「评估输出」这条 spec 承诺有真实运行时实现而非 Unknown 方法。
+                let answer = match args.first() {
+                    Some(Value::String(s)) => s.clone(),
+                    Some(other) => other.to_string(),
+                    None => return Err("ai.critic requires an answer argument".to_string()),
+                };
+                let ctx = match args.get(1) {
+                    Some(Value::String(s)) => s.clone(),
+                    _ => String::new(),
+                };
+                let prompt = if ctx.is_empty() {
+                    format!(
+                        "Critically evaluate the following answer. Reply with a single \
+                         word verdict (PASS or FAIL) on the first line, then a \
+                         one-sentence critique.\n\nAnswer:\n{}",
+                        answer
+                    )
+                } else {
+                    format!(
+                        "Critically evaluate the following answer against the given \
+                         context. Reply with a single word verdict (PASS or FAIL) on \
+                         the first line, then a one-sentence critique.\n\nContext:\n{}\n\nAnswer:\n{}",
+                        ctx, answer
+                    )
+                };
+                let model =
+                    std::env::var(AI_MODEL_ENV).unwrap_or_else(|_| AI_MODEL_DEFAULT.to_string());
+                let reply = Self::do_ai_chat(self, &model, &prompt)?;
+                let critique = reply.to_string();
+                // 裁决：只看**首行首个词**是否为 FAIL/PASS。批判正文里出现
+                // 这些词不影响判定；mock 模式回显的指令文本不含裸 verdict 行，
+                // 故缺省按 pass（mock 不是真实评估，不应系统性误报 fail）。
+                let head_word = critique
+                    .lines()
+                    .map(str::trim)
+                    .find(|l| !l.is_empty())
+                    .and_then(|l| l.split_whitespace().next())
+                    .unwrap_or("")
+                    .trim_matches(|c: char| !c.is_ascii_alphabetic())
+                    .to_uppercase();
+                let verdict = if head_word == "FAIL" { "fail" } else { "pass" };
+                let score = if verdict == "pass" { 1.0 } else { 0.0 };
+                let mut out = std::collections::HashMap::new();
+                out.insert("verdict".to_string(), Value::String(verdict.to_string()));
+                out.insert("critique".to_string(), Value::String(critique));
+                out.insert("score".to_string(), Value::Float(score));
+                Ok(Value::Dict(out))
+            }
             (BuiltinKind::AiTokens, _) => self.call_ai_tokens_method(method, &args),
             (BuiltinKind::Agent, "create") => {
                 // agent.create("name", {tools: [...], model: "deep", max_steps: 10, system: "..."})

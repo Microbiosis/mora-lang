@@ -219,9 +219,11 @@ fn exec_parallel(args: &[Value]) -> Result<Value, String> {
         }
     }
 
-    // 等待所有 worker 完成
+    // 等待所有 worker 完成。worker 线程 panic 会让结果集静默缺项（结果按
+    // 原始索引排序后无法分辨缺失与空执行），必须显式暴露。
     for h in handles {
-        let _ = h.join();
+        h.join()
+            .map_err(|_| "exec.parallel: worker thread panicked".to_string())?;
     }
 
     // 按原始索引排序，保证结果顺序 = 输入顺序（消除并发完成顺序导致的竞态）

@@ -1,7 +1,5 @@
 //! Type and metadata definition handlers.
 
-use std::collections::HashMap;
-
 use std::sync::Arc;
 
 use crate::common::trait_info::{TraitInfo, TraitMethodSig, default_impl_method_key, impl_method_key};
@@ -104,60 +102,4 @@ pub fn h_impl_def(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)] // skill def 需携带完整元数据（9 字段，与 emit 端对齐）
-pub fn h_skill_def(
-    env: &mut Environment,
-    name: &str,
-    description: &Option<String>,
-    version: &Option<String>,
-    requires: &[String],
-    tasks: &[crate::mir::orchestrate::MirSkillTask],
-    task_bodies: &[MirFunction],
-    verify: &Option<crate::mir::orchestrate::MirSkillVerify>,
-    verify_body: &Option<MirFunction>,
-) {
-    let mut meta = HashMap::new();
-    meta.insert("name".to_string(), Value::String(name.to_string()));
-    if let Some(d) = description {
-        meta.insert("description".to_string(), Value::String(d.clone()));
-    }
-    if let Some(v) = version {
-        meta.insert("version".to_string(), Value::String(v.clone()));
-    }
-    meta.insert(
-        "requires".to_string(),
-        Value::List(requires.iter().map(|r| Value::String(r.clone())).collect()),
-    );
-    for (task, _body) in tasks.iter().zip(task_bodies.iter()) {
-        if let Some(mfn) = &task.body {
-            meta.insert(
-                task.name.clone(),
-                Value::Task {
-                    name: task.name.clone(),
-                    params: task.params.iter().map(|p| p.name.clone()).collect(),
-                    mir_body: std::sync::Arc::new(mfn.clone()),
-                },
-            );
-        }
-    }
-    if let Some(v) = verify {
-        let vp: Vec<String> = v.params.iter().map(|p| p.name.clone()).collect();
-        let empty = MirFunction {
-            params: vp.clone(),
-            body: Vec::new(),
-            n_regs: 0,
-            ..Default::default()
-        };
-        let verify_mir = v.body.clone().unwrap_or(empty);
-        let _ = verify_body;
-        meta.insert(
-            "verify".to_string(),
-            Value::Task {
-                name: "verify".to_string(),
-                params: vp,
-                mir_body: std::sync::Arc::new(verify_mir),
-            },
-        );
-    }
-    env.define(name.to_string(), Value::Dict(meta), false);
-}
+

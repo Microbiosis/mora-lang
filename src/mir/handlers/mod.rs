@@ -38,7 +38,7 @@ pub use self::control::{
     h_break, h_continue, h_halt, h_jump, h_jump_if, h_jump_if_not, h_match_expr, h_quasiquote,
     h_return,
 };
-pub use self::definitions::{h_impl_def, h_skill_def, h_trait_def};
+pub use self::definitions::{h_impl_def, h_trait_def};
 pub use self::effects::{
     h_app_def, AppDefArgs, h_assign, h_define, h_enum_def, h_handle, h_import,
     h_export_mark, h_macro_def, h_model_def, h_msg_def, h_perform, h_rel_def, h_solve,
@@ -46,10 +46,9 @@ pub use self::effects::{
     h_task_def, h_type_alias, h_update_def, h_with_config,
 };
 pub use self::runtime::{
-    h_aggregate, h_append_file, h_document_section, h_eval, h_load, h_observe,
-    h_orchestrate, h_parallel, h_prompt_section, h_read_bytes_file, h_read_file, h_save,
-    h_send, h_span,
-    h_transaction, h_worker, h_write_bytes_file, h_write_file,
+    h_aggregate, h_document_section, h_eval, h_observe,
+    h_orchestrate, h_parallel, h_prompt_section, h_send, h_span,
+    h_transaction, h_worker,
 };
 pub use self::values::{
     h_binary_op, h_call, h_closure, h_const, h_dict_lit, h_dyn_trait, h_index, h_index_assign,

@@ -135,22 +135,35 @@ All notable changes to Mora will be documented in this file.
   tier1 34 / tier2 33 / nine_layer 19 / executor_switch 17 / jit 17 /
   differential 9 / orchestrate 10 / 其余共 24 套件全绿；clippy 全仓清零。
 
-### 已知遗留（本轮未完成，需设计决策或专项优化）
+### 移除 10 个零 producer 死 IR 原语
 
-- **parser 不可达的 IR 原语**：11 个 `MirInst` 变体在 src 与 tests 中均无
-  构造点 —— `MatchArm`（legacy，`MatchExpr` 已内联 arms）、`ToolDef` /
-  `SkillDef`（`tool.*` / `skill.*` builtin 承担同名能力）、`Save`/`Load`/
-  `ReadFile`/`WriteFile`/`AppendFile`/`ReadBytesFile`/`WriteBytesFile`
-  （`file.*` builtin 承担，且带 sandbox 路径校验；spec 仅在 §14.1 陈旧
-  关键字表提及）、`Send`。
-  **这不是「死代码」**：本仓库的 IR 层明确支持「手工构造驱动」
-  （`MirInst::Halt` 即由 `tests/tier0_replacement.rs` 直接构造并 pin 住
-  其语义，注释亦载明该模式）。这些变体是 **IR 原语**，只是当前没有语法
-  前端映射到它们。**未删除**原因：判定「补语法前端」还是「随 builtin
-  收敛而移除」属产品方向决策，不应由缺陷审计擅断；删除前需先确认无
-  程序化构造需求（`Halt` 已证明该需求存在）。
-- **`model`·`msg` 独立块**（spec §9.6）：spec 的无名 `model … end` 形式与
-  已实现的 `app Name / model: X` 形式冲突，需先裁清目标语法。
+经全仓 producer 审计（parser_v3 / lower / fcfg_lower 三生产路径 + tests），
+确认 10 个 `MirInst` 变体**没有任何构造点**，已删除：
+`MatchArm`（legacy，`MatchExpr` 已内联 arms 字段）、
+`ToolDef` / `SkillDef`（能力由 `tool.*` / `skill.*` builtin 承担；v0.103 的
+export 语义亦取代了 `ToolDef.exported` 参数设计）、
+`Save`/`Load`/`ReadFile`/`WriteFile`/`AppendFile`/`ReadBytesFile`/
+`WriteBytesFile`（能力由带 sandbox 路径校验的 `file.*` builtin 完整承担，
+v0.85+；spec 仅 §14.1 陈旧关键字表提及，无语义章节）。
+
+删除范围：枚举变体定义 + 8 处跨层 match 穷举（inst/ssa/pipeline/cost 等）
++ 8 个孤立 handler（h_save/h_load/h_read_file/h_write_file/h_append_file/
+h_read_bytes_file/h_write_bytes_file/h_skill_def）及其 re-export。
+**零行为变化**（无生产路径能产出这些变体）。与已删除的 `Route`/`Receive`/
+`StreamFor` 同一收敛先例。
+
+**`Send` 与 `Halt` 保留**：二者被测试 fixture 直接构造
+（`src/pregel/mod.rs` 6 处构造 `MirInst::Send` 测 BSP 引擎投递；
+`tests/tier0_replacement.rs` 2 处构造 `MirInst::Halt`）—— 这是本仓库
+「手工构造驱动 IR」的既定模式（`Receive`/`StreamFor` 删除时已确认该
+模式存在），删除会破 8 个测试，且它们的运行时路径是活的。
+
+### 已知遗留（产品方向决策，非缺陷）
+
+- **spec §9.6 `model`·`msg` 独立块**：spec 展示的无名 `model … end` /
+  `msg … end` 形式与已实现的 `app Name / model: X` 形式冲突，需先裁清
+  哪套是目标语法（此为新增语言面，不是缺陷修复）。
+
 ## [v0.102] — 2026-09-14 — feat: 声明式范式（逻辑式/关系式）完整融入 — 关系/合一/交错搜索
 
 Mora 的第五个一等范式。此前「声明式」在语言里只有 `match` 一处真语义

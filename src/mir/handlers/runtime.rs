@@ -11,7 +11,6 @@ use crate::mir::{MirFunction, Reg};
 
 use crate::value::{Environment, Value};
 
-use crate::mir::vm::value_to_string;
 
 // ============================================================
 // Private helpers
@@ -336,127 +335,6 @@ pub fn h_document_section(
     Ok(())
 }
 
-// ============================================================
-// File I/O handlers
-// ============================================================
-
-pub fn h_save(
-    interp: &mut dyn MirHost,
-    env: &Environment,
-    regs: &[Value],
-    path: Reg,
-    value: Reg,
-    effects: &mut crate::mir::effect::Effects,
-) -> Result<(), String> {
-    let path_str = value_to_string(&regs[path]);
-    let value_str = value_to_string(&regs[value]);
-    interp.mir_call_function(
-        "file.write_text",
-        vec![Value::String(path_str), Value::String(value_str)],
-        env,
-        effects,
-    )?;
-    Ok(())
-}
-
-pub fn h_load(
-    interp: &mut dyn MirHost,
-    env: &mut Environment,
-    regs: &[Value],
-    path: Reg,
-    var: &str,
-    effects: &mut crate::mir::effect::Effects,
-) -> Result<(), String> {
-    let path_str = value_to_string(&regs[path]);
-    let content = interp.mir_call_function("file.read_text", vec![Value::String(path_str)], env, effects)?;
-    env.define(var.to_string(), content, false);
-    Ok(())
-}
-
-pub fn h_read_file(
-    interp: &mut dyn MirHost,
-    env: &mut Environment,
-    regs: &[Value],
-    path: Reg,
-    var: &str,
-    effects: &mut crate::mir::effect::Effects,
-) -> Result<(), String> {
-    let path_str = value_to_string(&regs[path]);
-    let content = interp.mir_call_function("file.read_text", vec![Value::String(path_str)], env, effects)?;
-    env.define(var.to_string(), content, false);
-    Ok(())
-}
-
-pub fn h_write_file(
-    interp: &mut dyn MirHost,
-    env: &Environment,
-    regs: &[Value],
-    path: Reg,
-    content: Reg,
-    effects: &mut crate::mir::effect::Effects,
-) -> Result<(), String> {
-    let path_str = value_to_string(&regs[path]);
-    let content_str = value_to_string(&regs[content]);
-    interp.mir_call_function(
-        "file.write_text",
-        vec![Value::String(path_str), Value::String(content_str)],
-        env,
-        effects,
-    )?;
-    Ok(())
-}
-
-pub fn h_append_file(
-    interp: &mut dyn MirHost,
-    env: &Environment,
-    regs: &[Value],
-    path: Reg,
-    content: Reg,
-    effects: &mut crate::mir::effect::Effects,
-) -> Result<(), String> {
-    let path_str = value_to_string(&regs[path]);
-    let content_str = value_to_string(&regs[content]);
-    interp.mir_call_function(
-        "file.append_text",
-        vec![Value::String(path_str), Value::String(content_str)],
-        env,
-        effects,
-    )?;
-    Ok(())
-}
-
-pub fn h_read_bytes_file(
-    interp: &mut dyn MirHost,
-    env: &mut Environment,
-    regs: &[Value],
-    path: Reg,
-    var: &str,
-    effects: &mut crate::mir::effect::Effects,
-) -> Result<(), String> {
-    let path_str = value_to_string(&regs[path]);
-    let bytes = interp.mir_call_function("file.read_bytes", vec![Value::String(path_str)], env, effects)?;
-    env.define(var.to_string(), bytes, false);
-    Ok(())
-}
-
-pub fn h_write_bytes_file(
-    interp: &mut dyn MirHost,
-    env: &Environment,
-    regs: &[Value],
-    path: Reg,
-    content: Reg,
-    effects: &mut crate::mir::effect::Effects,
-) -> Result<(), String> {
-    let path_str = value_to_string(&regs[path]);
-    let content_val = regs[content].clone();
-    interp.mir_call_function(
-        "file.write_bytes",
-        vec![Value::String(path_str), content_val],
-        env,
-        effects,
-    )?;
-    Ok(())
-}
 
 // ============================================================
 // Orchestrate / Eval

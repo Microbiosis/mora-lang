@@ -123,14 +123,6 @@ impl CostModel for TokenEstimate {
             MirInst::Pipe(_, _, _) => 10,
             // 匹配
             MirInst::MatchExpr { val: _, arms } => 5 + arms.len() as u32 * 10,
-            MirInst::MatchArm { cond_reg, body } => {
-                let body_cost = body.body.iter().map(|i| self.inst_cost(i)).sum::<u32>();
-                if cond_reg.is_some() {
-                    body_cost + 5
-                } else {
-                    body_cost
-                }
-            }
             // With/Stream
             MirInst::WithConfig { bindings, body, .. } => {
                 bindings.len() as u32 * 5 + body.body.iter().map(|i| self.inst_cost(i)).sum::<u32>()
@@ -164,13 +156,6 @@ impl CostModel for TokenEstimate {
             // I/O
             MirInst::Import(_) => 100, // 文件导入开销
             MirInst::ExportMark(_) => 0,
-            MirInst::Save { .. }
-            | MirInst::Load { .. }
-            | MirInst::ReadFile { .. }
-            | MirInst::WriteFile { .. }
-            | MirInst::AppendFile { .. }
-            | MirInst::ReadBytesFile { .. }
-            | MirInst::WriteBytesFile { .. } => 50,
             // 编排
             MirInst::Orchestrate { kind, .. } => {
                 let n_agents = match kind.as_ref() {
@@ -191,8 +176,6 @@ impl CostModel for TokenEstimate {
             MirInst::TaskDef { .. } => 0,
             MirInst::TraitDef { .. } => 0,
             MirInst::ImplDef { .. } => 0,
-            MirInst::SkillDef { .. } => 0,
-            MirInst::ToolDef { .. } => 0,
             MirInst::Closure { .. } => 0,
             // 类型宏定义：不计（编译时元数据）
             MirInst::TypeAlias { .. } => 0,

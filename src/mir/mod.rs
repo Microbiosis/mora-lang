@@ -159,13 +159,6 @@ pub enum MirInst {
     Assign(String, Reg),
     Expr(Reg),
 
-    /// 模式匹配分支：cond_reg 非空时表示条件守卫，空时表示默认分支
-    /// 由 Match lowering 生成多个 MatchArm，解释器依次匹配
-    MatchArm {
-        cond_reg: Option<Reg>,
-        body: Box<MirFunction>,
-    },
-
     /// α.2: task 定义。body 是嵌套 MirFunction，解释器递归执行。
     TaskDef {
         name: String,
@@ -189,17 +182,6 @@ pub enum MirInst {
         src: Reg,
         trait_generics: Vec<String>,
         trait_name: String,
-    },
-
-    /// α.2: tool 定义。body 是嵌套 MirFunction；params/return_type 用于 schema。
-    /// 解释器注册为 Value::Tool 到 environment + ToolDef 到 tool_registry。
-    ToolDef {
-        name: String,
-        description: String,
-        params: Vec<String>,
-        return_type: Option<String>,
-        body: Box<MirFunction>,
-        exported: bool,
     },
 
     /// α.2: import 语句。解释器读文件+解析+执行（委托 AST 路径）。
@@ -280,7 +262,33 @@ pub enum MirInst {
     // ai.chat 的 stream:true 参数路径取代；handler 空转：prompt_reg/var 被忽略、
     // body 仅执行一次并丢弃）。流式语义若需 MIR 指令级支持，重新设计而非复活旧形状。
 
-    // ── 类型定义语句（α.3: 与 AST execute 语义一致）──
+    // ── v0.103: 移除 10 个零 producer 死 IR 原语 ──
+    //
+    // 此前遗留：MatchArm/ToolDef/SkillDef + 7 个文件 I/O（Save/Load/ReadFile/
+    // WriteFile/AppendFile/ReadBytesFile/WriteBytesFile）共 10 个变体。
+    // 这些变体在 parser/lower/fcfg_lower 三个生产路径均无构造点：
+    // - v0.55 去 AST 化迁移后未迁移的旧 AST 遗留；
+    // - v0.85+ 的 `file.*` builtin 已完全取代 7 个文件 I/O 的能力（带 sandbox
+    //   路径校验）；
+    // - v0.103 实现的 export 语义取代了 ToolDef.exported 参数设计；
+    // - MatchExpr 已内联 arms 字段，MatchArm 不再是独立构造点。
+    //
+    // **Send / Halt 保留**：Send 在 `src/pregel/mod.rs` 测试 fixture 中直接
+    // 构造（2287, 2543, 2547, 2563, 2659, 2675），删除会破 6 个 BSP 引擎
+    // 单元测试；Halt 在 `tests/tier0_replacement.rs` 中直接构造（241, 258），
+    // 是「手工构造驱动 IR」既定模式的实例 —— 与已删除的 Route/Receive/
+    // StreamFor 同类前提，但存在「被测试 fixture 直接构造」的事实。
+    //
+    // **删除代价**：移除一处枚举变体 + 8 处 match 穷举 + handler 函数
+    // + cost/ssa/pipeline 中的跳过列表条目。零行为变化（无生产路径
+    // 能产出这些变体）。
+
+    // ── 文件 I/O 替代 ──
+    //   file.* builtin 已覆盖 Save/Load/ReadFile/WriteFile/AppendFile/
+    //   ReadBytesFile/WriteBytesFile 的全部功能 —— save "path", value
+    //   等同于 file.write_text；load 等同于 file.read_text 等。
+
+    // ── 类型系统 ──
     /// α.3: 类型别名。定义 `name` → `target` 的字符串映射。
     TypeAlias {
         name: String,
@@ -299,7 +307,7 @@ pub enum MirInst {
         fields: Vec<crate::common::StructField>,
     },
 
-    // ── v0.83: TEA (The Elm Architecture) 语法层 ──
+    // ── v0.103: TEA (The Elm Architecture) 语法层 ──
     /// Model 定义 — 强类型状态容器（类似 StructDef，但语义是「不可变 Model 容器」）。
     /// v0.83 阶段 E 注册到 env 为 Type::TeaModel。
     ModelDef {
@@ -439,48 +447,11 @@ pub enum MirInst {
     // record_tokens`（runtime/ai.rs）承担，AI 调用后真实记录（ai_helpers.rs）。
     // 与 v0.75.26 StreamFor 删除同一先例：语义被运行时路径取代。
 
-    // ── 文件 I/O（α.6: Save/Load/ReadFile/WriteFile/AppendFile/ReadBytesFile/WriteBytesFile）──
-    /// α.6: save — 将 value 序列化为文件。
-    Save {
-        path: Reg,
-        value: Reg,
-    },
-
-    /// α.6: load — 从文件加载 JSON 值并绑定到 var。
-    Load {
-        path: Reg,
-        var: String,
-    },
-
-    /// α.6: read_file — 读取文件为字符串，绑定到 var。
-    ReadFile {
-        path: Reg,
-        var: String,
-    },
-
-    /// α.6: write_file — 将 content 写入文件。
-    WriteFile {
-        path: Reg,
-        content: Reg,
-    },
-
-    /// α.6: append_file — 将 content 追加到文件。
-    AppendFile {
-        path: Reg,
-        content: Reg,
-    },
-
-    /// α.6: read_bytes_file — 读取文件为字节数组，绑定到 var。
-    ReadBytesFile {
-        path: Reg,
-        var: String,
-    },
-
-    /// α.6: write_bytes_file — 将 hex 字节写入文件。
-    WriteBytesFile {
-        path: Reg,
-        content: Reg,
-    },
+    // v0.103: Save/Load/ReadFile/WriteFile/AppendFile/ReadBytesFile/
+    // WriteBytesFile 已删除 —— 零 producer 死 IR（三个生产路径
+    // parser_v3/lower/fcfg_lower 均无构造点），能力由带 sandbox 路径
+    // 校验的 `file.*` builtin 完整承担（v0.85+）。spec 仅 §14.1 陈旧
+    // 关键字表提及，无任何语义章节。
 
     // ── 类型系统（α.7: TraitDef/ImplDef）──
     /// v0.55: trait def — 完全 MIR-native，methods 是 MirTraitMethod 而非 ast_v2::TraitMethod。
@@ -521,19 +492,8 @@ pub enum MirInst {
         replay_path: Option<String>,
     },
 
-    /// v0.55: skill def — 完全 MIR-native。
-    SkillDef {
-        name: String,
-        description: Option<String>,
-        version: Option<String>,
-        requires: Vec<String>,
-        tasks: Vec<crate::mir::orchestrate::MirSkillTask>,
-        /// prelowered task bodies (parallel to tasks)。
-        task_bodies: Vec<MirFunction>,
-        verify: Option<crate::mir::orchestrate::MirSkillVerify>,
-        /// α.11: prelowered verify body。
-        verify_body: Option<MirFunction>,
-    },
+    /// v0.55: skill def 已删除（v0.103）—— 零 producer 死 IR：三个生产路径
+    /// 均无构造点，能力由 `skill.*` builtin 承担。
 
     /// α.8: prompt section — 扫描 body，构建 Value::PromptSection 到环境。
     PromptSection {

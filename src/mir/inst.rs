@@ -7,17 +7,17 @@
 use std::collections::HashMap;
 
 use super::handlers::{
-    Flow, h_aggregate, h_append_file, h_app_def, AppDefArgs, h_assign, h_binary_op, h_break, h_call, h_closure, h_const,
+    Flow, h_aggregate, h_app_def, AppDefArgs, h_assign, h_binary_op, h_break, h_call, h_closure, h_const,
     h_continue, h_define, h_dict_lit, h_document_section, h_dyn_trait, h_enum_def, h_eval,
     h_export_mark, h_halt,
     h_handle, h_impl_def, h_import, h_index, h_index_assign, h_jump, h_jump_if, h_jump_if_not,
-    h_list_lit, h_load, h_macro_def, h_match_expr, h_method_call, h_model_def, h_msg_def,
+    h_list_lit, h_macro_def, h_match_expr, h_method_call, h_model_def, h_msg_def,
     h_observe, h_orchestrate, h_parallel, h_perform, h_pipe, h_prompt, h_prompt_section,
-    h_read_bytes_file,
-    h_read_file, h_rel_def, h_return, h_save, h_send, h_skill_def, h_solve, h_span,
+
+    h_rel_def, h_return, h_send, h_solve, h_span,
     h_struct_def, h_task_def, h_trait_def,
     h_transaction, h_type_alias, h_update_def, h_var, h_with_config, h_worker,
-    h_write_bytes_file, h_write_file,
+
     h_quasiquote,
 };
 
@@ -92,7 +92,6 @@ impl MirInst {
                 }
                 v
             }
-            MirInst::MatchArm { cond_reg, .. } => cond_reg.map(|r| vec![r]).unwrap_or_default(),
             MirInst::Closure { .. } => vec![],
             MirInst::DynTrait { src, .. } => vec![*src],
             MirInst::Define(_, r) => vec![*r],
@@ -105,17 +104,9 @@ impl MirInst {
             MirInst::Halt(None) => vec![],
             MirInst::Send { value, .. } => vec![*value],
             MirInst::Aggregate { value, .. } => vec![*value],
-            MirInst::Save { path, value } => vec![*path, *value],
-            MirInst::Load { path, .. } => vec![*path],
-            MirInst::ReadFile { path, .. } => vec![*path],
-            MirInst::WriteFile { path, content } => vec![*path, *content],
-            MirInst::AppendFile { path, content } => vec![*path, *content],
-            MirInst::ReadBytesFile { path, .. } => vec![*path],
-            MirInst::WriteBytesFile { path, content } => vec![*path, *content],
             MirInst::Eval { given_reg, .. } => vec![*given_reg],
             MirInst::WithConfig { bindings, .. } => bindings.iter().map(|(_, r)| *r).collect(),
             MirInst::TaskDef { .. }
-            | MirInst::ToolDef { .. }
             | MirInst::Import(_)
             | MirInst::ExportMark(_)
             | MirInst::TypeAlias { .. }
@@ -141,7 +132,6 @@ impl MirInst {
             | MirInst::TraitDef { .. }
             | MirInst::ImplDef { .. }
             | MirInst::Orchestrate { .. }
-            | MirInst::SkillDef { .. }
             | MirInst::PromptSection { .. }
             | MirInst::DocumentSection { .. }
             | MirInst::Label(_)
@@ -208,10 +198,6 @@ impl MirInst {
             MirInst::Define(name, r) => MirInst::Define(name.clone(), m(*r)),
             MirInst::Assign(name, r) => MirInst::Assign(name.clone(), m(*r)),
             MirInst::Expr(r) => MirInst::Expr(m(*r)),
-            MirInst::MatchArm { cond_reg, body } => MirInst::MatchArm {
-                cond_reg: cond_reg.map(m),
-                body: body.clone(),
-            },
             MirInst::TaskDef { .. } => self.clone(),
             MirInst::Closure { .. } => self.clone(),
             MirInst::DynTrait {
@@ -225,7 +211,6 @@ impl MirInst {
                 trait_generics: trait_generics.clone(),
                 trait_name: trait_name.clone(),
             },
-            MirInst::ToolDef { .. } => self.clone(),
             MirInst::Import(_) | MirInst::ExportMark(_) => self.clone(),
             MirInst::WithConfig {
                 bindings,
@@ -281,34 +266,6 @@ impl MirInst {
             MirInst::Commit => MirInst::Commit,
             MirInst::Observe { .. } => self.clone(),
             MirInst::Span { .. } => self.clone(),
-            MirInst::Save { path, value } => MirInst::Save {
-                path: m(*path),
-                value: m(*value),
-            },
-            MirInst::Load { path, var } => MirInst::Load {
-                path: m(*path),
-                var: var.clone(),
-            },
-            MirInst::ReadFile { path, var } => MirInst::ReadFile {
-                path: m(*path),
-                var: var.clone(),
-            },
-            MirInst::WriteFile { path, content } => MirInst::WriteFile {
-                path: m(*path),
-                content: m(*content),
-            },
-            MirInst::AppendFile { path, content } => MirInst::AppendFile {
-                path: m(*path),
-                content: m(*content),
-            },
-            MirInst::ReadBytesFile { path, var } => MirInst::ReadBytesFile {
-                path: m(*path),
-                var: var.clone(),
-            },
-            MirInst::WriteBytesFile { path, content } => MirInst::WriteBytesFile {
-                path: m(*path),
-                content: m(*content),
-            },
             MirInst::TraitDef { .. } => self.clone(),
             MirInst::ImplDef { .. } => self.clone(),
             MirInst::Orchestrate { .. } => self.clone(),
@@ -325,7 +282,6 @@ impl MirInst {
                 tolerance: *tolerance,
                 replay_path: replay_path.clone(),
             },
-            MirInst::SkillDef { .. } => self.clone(),
             MirInst::PromptSection { .. } => self.clone(),
             MirInst::DocumentSection { .. } => self.clone(),
             MirInst::Label(l) => MirInst::Label(*l),
@@ -353,19 +309,13 @@ impl MirInst {
             | MirInst::Aggregate { .. }
             | MirInst::Rollback
             | MirInst::Commit
-            | MirInst::Save { .. }
-            | MirInst::Load { .. }
             // Perform 触发 effect — 必然有副作用（即便 handler 解释为纯函数）。
             | MirInst::Perform { .. }
             // Handle 是语句（安装/卸载 handler），但本身不产生外部副作用。
             // 真正的 effect 来源是 body 内的 Perform 指令。
             | MirInst::Handle { .. }
             | MirInst::ExportMark(_)
-            | MirInst::ReadFile { .. }
-            | MirInst::WriteFile { .. }
-            | MirInst::AppendFile { .. }
-            | MirInst::ReadBytesFile { .. }
-            | MirInst::WriteBytesFile { .. }
+            | MirInst::Transaction { .. }
             | MirInst::Orchestrate { .. }
             | MirInst::Eval { .. }
             | MirInst::Import(_)
@@ -385,10 +335,7 @@ impl MirInst {
             | MirInst::TraitDef { .. }
             | MirInst::ImplDef { .. }
             | MirInst::TaskDef { .. }
-            | MirInst::ToolDef { .. }
-            | MirInst::SkillDef { .. }
             | MirInst::WithConfig { .. }
-            | MirInst::Transaction { .. }
             | MirInst::Worker { .. }
             | MirInst::Parallel { .. }
             | MirInst::Observe { .. }
@@ -409,7 +356,6 @@ impl MirInst {
             | MirInst::Pipe(_, _, _)
             | MirInst::Prompt(_, _)
             | MirInst::MatchExpr { .. }
-            | MirInst::MatchArm { .. }
             | MirInst::Closure { .. }
             | MirInst::DynTrait { .. }
             | MirInst::Label(_)
@@ -630,34 +576,6 @@ pub fn dispatch(
             h_span(interp, env, name, tags, body, effects)?;
             Ok(Flow::Continue)
         }
-        MirInst::Save { path, value } => {
-            h_save(interp, env, regs, *path, *value, effects)?;
-            Ok(Flow::Continue)
-        }
-        MirInst::Load { path, var } => {
-            h_load(interp, env, regs, *path, var, effects)?;
-            Ok(Flow::Continue)
-        }
-        MirInst::ReadFile { path, var } => {
-            h_read_file(interp, env, regs, *path, var, effects)?;
-            Ok(Flow::Continue)
-        }
-        MirInst::WriteFile { path, content } => {
-            h_write_file(interp, env, regs, *path, *content, effects)?;
-            Ok(Flow::Continue)
-        }
-        MirInst::AppendFile { path, content } => {
-            h_append_file(interp, env, regs, *path, *content, effects)?;
-            Ok(Flow::Continue)
-        }
-        MirInst::ReadBytesFile { path, var } => {
-            h_read_bytes_file(interp, env, regs, *path, var, effects)?;
-            Ok(Flow::Continue)
-        }
-        MirInst::WriteBytesFile { path, content } => {
-            h_write_bytes_file(interp, env, regs, *path, *content, effects)?;
-            Ok(Flow::Continue)
-        }
         MirInst::TraitDef {
             name,
             parents,
@@ -705,29 +623,6 @@ pub fn dispatch(
             h_eval(regs, env, name, *given_reg, expects, tolerance)?;
             Ok(Flow::Continue)
         }
-        MirInst::SkillDef {
-            name,
-            description,
-            version,
-            requires,
-            tasks,
-            task_bodies,
-            verify,
-            verify_body,
-        } => {
-            h_skill_def(
-                env,
-                name,
-                description,
-                version,
-                requires,
-                tasks,
-                task_bodies,
-                verify,
-                verify_body,
-            );
-            Ok(Flow::Continue)
-        }
         MirInst::PromptSection { name, body } => {
             h_prompt_section(interp, env, name, body, effects)?;
             Ok(Flow::Continue)
@@ -745,9 +640,7 @@ pub fn dispatch(
         }
 
         // ── Control flow + no-ops ──
-        MirInst::ToolDef { .. }
-        | MirInst::MatchArm { .. }
-        | MirInst::Label(_) => Ok(Flow::Continue),
+        MirInst::Label(_) => Ok(Flow::Continue),
         MirInst::Jump(lbl) => Ok(h_jump(*lbl)),
         MirInst::JumpIf(cond, lbl) => Ok(h_jump_if(regs, *cond, *lbl)),
         MirInst::JumpIfNot(cond, lbl) => Ok(h_jump_if_not(regs, *cond, *lbl)),

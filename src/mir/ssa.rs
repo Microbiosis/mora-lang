@@ -540,12 +540,10 @@ fn split_into_ssa(
                 ssa_insts.push(SsaInst::Expr(*reg as SsaReg));
             }
             MirInst::TaskDef { .. }
-            | MirInst::ToolDef { .. }
             | MirInst::Import(_)
             | MirInst::ExportMark(_)
             | MirInst::WithConfig { .. }
             | MirInst::MatchExpr { .. }
-            | MirInst::MatchArm { .. }
             | MirInst::Closure { .. }
             | MirInst::TypeAlias { .. }
             // v0.80: algebraic effects — Perform/Handle 不进入 SSA 线性化（v0.75
@@ -576,21 +574,12 @@ fn split_into_ssa(
             | MirInst::Parallel { .. }
             | MirInst::Observe { .. }
             | MirInst::Span { .. }
-            // α.6: 文件 I/O — SSA 中跳过
-            | MirInst::Save { .. }
-            | MirInst::Load { .. }
-            | MirInst::ReadFile { .. }
-            | MirInst::WriteFile { .. }
-            | MirInst::AppendFile { .. }
-            | MirInst::ReadBytesFile { .. }
-            | MirInst::WriteBytesFile { .. }
             // α.7: 类型系统 — SSA 中跳过
             | MirInst::TraitDef { .. }
             | MirInst::ImplDef { .. }
             // α.8: 高级特性 — SSA 中跳过
             | MirInst::Orchestrate { .. }
             | MirInst::Eval { .. }
-            | MirInst::SkillDef { .. }
             | MirInst::PromptSection { .. }
             | MirInst::DocumentSection { .. } => {}
             // v0.88: Quasiquote — 纯指令，SSA 中跳过
@@ -608,12 +597,10 @@ fn is_ssa_passthrough(inst: &MirInst) -> bool {
     matches!(
         inst,
         MirInst::TaskDef { .. }
-            | MirInst::ToolDef { .. }
             | MirInst::Import(_)
             | MirInst::ExportMark(_)
             | MirInst::WithConfig { .. }
             | MirInst::MatchExpr { .. }
-            | MirInst::MatchArm { .. }
             | MirInst::Closure { .. }
             | MirInst::TypeAlias { .. }
             // v0.80: algebraic effects — Perform/Handle 不进入 SSA 线性化（v0.75
@@ -643,18 +630,10 @@ fn is_ssa_passthrough(inst: &MirInst) -> bool {
             | MirInst::Parallel { .. }
             | MirInst::Observe { .. }
             | MirInst::Span { .. }
-            | MirInst::Save { .. }
-            | MirInst::Load { .. }
-            | MirInst::ReadFile { .. }
-            | MirInst::WriteFile { .. }
-            | MirInst::AppendFile { .. }
-            | MirInst::ReadBytesFile { .. }
-            | MirInst::WriteBytesFile { .. }
             | MirInst::TraitDef { .. }
             | MirInst::ImplDef { .. }
             | MirInst::Orchestrate { .. }
             | MirInst::Eval { .. }
-            | MirInst::SkillDef { .. }
             | MirInst::PromptSection { .. }
             | MirInst::DocumentSection { .. }
             | MirInst::DynTrait { .. }

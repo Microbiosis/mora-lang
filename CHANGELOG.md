@@ -158,11 +158,39 @@ h_read_bytes_file/h_write_bytes_file/h_skill_def）及其 re-export。
 「手工构造驱动 IR」的既定模式（`Receive`/`StreamFor` 删除时已确认该
 模式存在），删除会破 8 个测试，且它们的运行时路径是活的。
 
-### 已知遗留（产品方向决策，非缺陷）
+### TEA 独立声明 `model` / `msg`（承诺未接线）
 
-- **spec §9.6 `model`·`msg` 独立块**：spec 展示的无名 `model … end` /
-  `msg … end` 形式与已实现的 `app Name / model: X` 形式冲突，需先裁清
-  哪套是目标语法（此为新增语言面，不是缺陷修复）。
+spec §9.6 有工作示例、§14.2 EBNF 正式声明 `model_stmt` / `msg_stmt` ——
+但 parser 从未产出：`MirInst::ModelDef`/`MsgDef` + `WitnessKind::ModelDef`/
+`MsgDef` + `h_model_def`/`h_msg_def` + `Type::TeaModel`/`TeaMsg` 全套在
+v0.83 就位，唯独前端缺失（与 `prompt`/`observe`/`span`/`parallel` 同一
+形态的「IR 齐备、parser 零产出」缺陷）。
+
+新增 parser 语法（标识符分派 + 前瞻守卫，与 `export`/`effect` 同模式）：
+
+```mora
+model Counter
+  count: number = 0
+  step: number = 1
+end
+
+msg CounterMsg
+  Increment
+  SetStep(number)
+end
+```
+
+- 字段 `name: Type [= default]`；默认值经**派生键** `Name.defaults`
+  登记为 Dict（与 `h_app_def` 注册 `name.init` 同一既定模式，不扩展
+  IR 形状）。
+- msg 变体 `Name`（无载荷）/ `Name(Type)`（带载荷）。
+- 与 `app Name` 块互补：独立声明定义 Model/Msg 类型，`app` 以其
+  `model:`/`msg:` 标签引用 —— spec §9.6 展示的正是这一组合方式。
+- 前瞻守卫保证 `model`/`msg` 作普通标识符时不被误拦截。
+
+验证：`tests/fixtures/e2e/tea_standalone.mora`（model+msg 独立声明 +
+app 引用 + task main 驱动）+ `e2e_tea_standalone_runs` 精确断言
+（model→dict / msg→list / app→tea_app）。
 
 ## [v0.102] — 2026-09-14 — feat: 声明式范式（逻辑式/关系式）完整融入 — 关系/合一/交错搜索
 

@@ -302,6 +302,39 @@ fn e2e_tea_app_runs() {
     assert_ok("tea_app.mora");
 }
 
+/// tea_standalone.mora：TEA 独立声明 `model Name ... end` / `msg Name ... end`
+/// （spec §9.6 工作示例 + §14.2 EBNF）。锁定「IR/handler/typeck 齐备但
+/// parser 零产出」的缺陷。
+#[test]
+fn e2e_tea_standalone_runs() {
+    // run_e2e 不捕获 stdout 且 last_expr 取自顶层（app 声明为 Nil），
+    // 故走子进程捕获 print 输出做精确断言。
+    use std::process::Command;
+    let out = Command::new(env!("CARGO_BIN_EXE_mora"))
+        .arg("tests/fixtures/e2e/tea_standalone.mora")
+        .output()
+        .expect("run fixture");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("dict"),
+        "model 声明应注册为 dict，实际 stdout:
+{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("list"),
+        "msg 声明应注册为 list，实际 stdout:
+{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("tea_app"),
+        "app 应构造 TeaApp，实际 stdout:
+{}",
+        stdout
+    );
+}
+
 /// tea_counter.mora：TEA 完整运行时链路 —— 声明式 app 名可引用 +
 /// tea.init 三参构造 + tea.dispatch/run/update 驱动。
 /// 锁定的既有缺陷：typeck 不注册 app 名（Unbound variable）、emit 端伪造

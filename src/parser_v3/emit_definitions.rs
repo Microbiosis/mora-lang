@@ -277,6 +277,131 @@ impl ParserV3 {
         })
     }
 
+    /// v0.103: `model Name ... end` —— TEA 状态声明（spec §9.6 / §14.2 EBNF）。
+    ///
+    /// ```mora
+    /// model Counter
+    ///   count: number = 0
+    ///   step: number = 1
+    /// end
+    /// ```
+    ///
+    /// 字段形如 `name: Type` 或 `name: Type = default`。默认值（spec 承诺的
+    /// `= expr`）经**派生键** `Name.defaults` 登记为 `Value::Dict` —— 与
+    /// `h_app_def` 注册 `name.init`/`name.update`/`name.view` 同一既定模式，
+    /// 无需为运行期数据扩展 IR 形状。
+    ///
+    /// **缺陷背景**：`MirInst::ModelDef` / `WitnessKind::ModelDef` /
+    /// `h_model_def` / `Type::TeaModel` 在 v0.83 全部就位，唯独 parser 从未
+    /// 产出 —— 声明形式完全不可用（与 `prompt`/`observe`/`span`/`parallel`
+    /// 同一形态的「IR 齐备、前端缺失」缺陷）。
+    pub(super) fn emit_model_def_w(&mut self) -> Option<MirWitness> {
+        let span = self.span_of_current();
+        self.advance(); // 'model'
+        let name = self.consume_identifier("Expected model name after 'model'")?;
+        while self.match_token(&[TokenType::Newline]) {}
+        let mut fields: Vec<(String, crate::mir::hint::TypeHint)> = Vec::new();
+        let mut defaults: Vec<(String, usize)> = Vec::new(); // (field, default_reg)
+        while !self.check(&TokenType::End) && !self.is_at_end() {
+            // 跳过块内空行（字段之间）
+            while self.match_token(&[TokenType::Newline]) {}
+            if self.check(&TokenType::End) {
+                break;
+            }
+            let fname = self.consume_identifier("Expected field name in model")?;
+            self.consume(TokenType::Colon, "Expected ':' after model field name")?;
+            let ftype = self.parse_type_annotation()?;
+            if self.match_token_exact(TokenType::Assign) {
+                let (dreg, _dw) = self.emit_expr_w()?;
+                defaults.push((fname.clone(), dreg));
+            }
+            fields.push((fname, crate::mir::hint::TypeHint::from_type(ftype)));
+            while self.match_token(&[TokenType::Newline]) {}
+        }
+        self.consume(TokenType::End, "Expected 'end' after model block")?;
+        let sfs: Vec<crate::common::StructField> = fields
+            .iter()
+            .map(|(n, t)| crate::common::StructField {
+                name: n.clone(),
+                type_hint: t.to_type().name(),
+            })
+            .collect();
+        self.emit.emit(MirInst::ModelDef {
+            name: name.clone(),
+            fields: sfs,
+        });
+        // 默认值登记到派生键 `Name.defaults`（无默认值时跳过）。
+        if !defaults.is_empty() {
+            let dst = self.emit.alloc_reg();
+            self.emit.emit(MirInst::DictLit(
+                dst,
+                defaults.iter().map(|(n, r)| (n.clone(), *r)).collect(),
+            ));
+            self.emit
+                .emit(MirInst::Define(format!("{}.defaults", name), dst));
+        }
+        let dst = self.emit.alloc_reg();
+        self.emit
+            .emit(MirInst::Const(dst, crate::value::Value::Nil));
+        Some(MirWitness {
+            kind: WitnessKind::ModelDef { name, fields },
+            span,
+        })
+    }
+
+    /// v0.103: `msg Name ... end` —— TEA 消息声明（spec §9.6 / §14.2 EBNF）。
+    ///
+    /// ```mora
+    /// msg CounterMsg
+    ///   Increment
+    ///   SetStep(number)
+    /// end
+    /// ```
+    ///
+    /// 变体形如 `Name`（无载荷）或 `Name(Type)`（带载荷）。注册为
+    /// `Value::List`（变体名 + payload 类型）到环境；typeck 侧登记
+    /// `Type::TeaMsg`。与 `model` 同属「IR 齐备、parser 缺失」缺陷。
+    pub(super) fn emit_msg_def_w(&mut self) -> Option<MirWitness> {
+        let span = self.span_of_current();
+        self.advance(); // 'msg'
+        let name = self.consume_identifier("Expected msg name after 'msg'")?;
+        while self.match_token(&[TokenType::Newline]) {}
+        let mut variants: Vec<crate::common::MsgVariant> = Vec::new();
+        while !self.check(&TokenType::End) && !self.is_at_end() {
+            while self.match_token(&[TokenType::Newline]) {}
+            if self.check(&TokenType::End) {
+                break;
+            }
+            let vname = self.consume_identifier("Expected msg variant name")?;
+            // 可选载荷 `(Type)`
+            let payload = if self.match_token_exact(TokenType::LParen) {
+                let ty = self.parse_type_annotation()?;
+                self.consume(TokenType::RParen, "Expected ')' after msg payload type")?;
+                Some(ty.name())
+            } else {
+                None
+            };
+            variants.push(crate::common::MsgVariant {
+                name: vname,
+                payload_type: payload,
+            });
+            let _ = self.match_token(&[TokenType::Comma]);
+            while self.match_token(&[TokenType::Newline]) {}
+        }
+        self.consume(TokenType::End, "Expected 'end' after msg block")?;
+        self.emit.emit(MirInst::MsgDef {
+            name: name.clone(),
+            variants: variants.clone(),
+        });
+        let dst = self.emit.alloc_reg();
+        self.emit
+            .emit(MirInst::Const(dst, crate::value::Value::Nil));
+        Some(MirWitness {
+            kind: WitnessKind::MsgDef { name, variants },
+            span,
+        })
+    }
+
     pub(super) fn emit_enum_def_w(&mut self) -> Option<MirWitness> {
         let span = self.span_of_current();
         self.advance(); // 'enum'

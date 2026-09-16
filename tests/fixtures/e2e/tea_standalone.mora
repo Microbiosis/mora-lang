@@ -1,0 +1,33 @@
+-- v0.103: TEA 独立声明 `model Name ... end` / `msg Name ... end`
+-- （spec §9.6 工作示例 + §14.2 EBNF model_stmt/msg_stmt 承诺）。
+-- 缺陷：MirInst::ModelDef/MsgDef + h_model_def/h_msg_def + Type::TeaModel/TeaMsg
+-- 在 v0.83 全部就位，唯独 parser 从未产出 —— 声明形式完全不可用。
+model Counter
+  count: number = 0
+  step: number = 1
+end
+
+msg CounterMsg
+  Increment
+  Decrement
+  SetStep(number)
+end
+
+-- 独立声明的 model/msg 名可被 app 块按标签引用
+app Application
+  model: Counter
+  msg: CounterMsg
+  init: {count: 0, step: 1}
+  update: fn(m, msg) => m
+  view: fn(m) => m
+end
+
+task main()
+  -- 引用独立声明的 model/msg 名（typeck 登记 + 运行期注册）
+  print(type_of(Counter))
+  print(type_of(CounterMsg))
+  -- app 用其驱动的完整链路
+  let a = tea.dispatch(Application, {tag: "Increment"})
+  let a = tea.run(a, 3)
+  print(type_of(a))
+end

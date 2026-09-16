@@ -51,6 +51,18 @@ impl ParserV3 {
             TokenType::Document => self.emit_section_w(false),
             // v0.103: export（标识符分派，spec §10.2）
             TokenType::Identifier(ref s) if s == "export" => self.emit_export_w(),
+            // v0.103: TEA 独立声明 `model Name ... end` / `msg Name ... end`
+            //（spec §9.6 / §14.2 EBNF）。前瞻守卫：仅 `model`/`msg` 后紧跟
+            // 标识符时拦截（不抢以 model/msg 命名的变量/调用语句）。
+            TokenType::Identifier(ref s)
+                if (s == "model" || s == "msg")
+                    && matches!(
+                        self.tokens.get(self.current + 1).map(|t| &t.token_type),
+                        Some(TokenType::Identifier(_))
+                    ) =>
+            {
+                if s == "model" { self.emit_model_def_w() } else { self.emit_msg_def_w() }
+            }
             // v0.103: 可观测性块
             TokenType::Identifier(ref s) if s == "observe" => self.emit_observe_w(),
             TokenType::Identifier(ref s) if s == "span" => self.emit_span_w(),
@@ -1446,6 +1458,17 @@ impl ParserV3 {
             TokenType::Document => self.emit_section_w(false).map(|w| (0, w)),
             // v0.103: export（嵌套上下文）
             TokenType::Identifier(ref s) if s == "export" => self.emit_export_w().map(|w| (0, w)),
+            // v0.103: TEA 独立声明（嵌套上下文）
+            TokenType::Identifier(ref s)
+                if (s == "model" || s == "msg")
+                    && matches!(
+                        self.tokens.get(self.current + 1).map(|t| &t.token_type),
+                        Some(TokenType::Identifier(_))
+                    ) =>
+            {
+                let w = if s == "model" { self.emit_model_def_w() } else { self.emit_msg_def_w() };
+                w.map(|w| (0, w))
+            }
             // v0.103: 可观测性块（嵌套上下文）
             TokenType::Identifier(ref s) if s == "observe" => self.emit_observe_w().map(|w| (0, w)),
             TokenType::Identifier(ref s) if s == "span" => self.emit_span_w().map(|w| (0, w)),

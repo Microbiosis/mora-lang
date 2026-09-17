@@ -28,7 +28,7 @@ impl Interpreter {
                 // `TeaApp::new(init, update, view)` 本就有三参构造能力，
                 // 是 builtin 面比底层窄。现在透传：
                 // - 第 1 参：init 闭包（或初始 model 值）
-                // - 第 2 参：update 闭包（`fn(model, msg) -> (model, cmd)`）
+                // - 第 2 参：update 闭包（`fn(msg, model) -> (model, cmd)`，spec §9.6 / Elm 序）
                 // - 第 3 参：view 闭包（`fn(model) -> any`）
                 // 缺省 update/view 为 Nil（等价于未提供 —— 调用时才报错）。
                 let init_val = args.first().cloned().unwrap_or(Value::Nil);

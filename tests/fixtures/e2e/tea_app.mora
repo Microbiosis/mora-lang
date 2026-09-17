@@ -1,7 +1,9 @@
+-- v0.104: update 实参序对齐 spec §9.6 / Elm —— (msg, model)。
+-- 此前运行时传 (model, msg)，与规范示例的形参序相反。
 app Counter
   model: Counter
   msg: CounterMsg
   init: 0
-  update: fn(m, msg) => m
-  view: fn(m) => m
+  update: fn(msg, model) => model
+  view: fn(model) => model
 end

@@ -71,6 +71,27 @@ impl EmitContext {
         self.insts.push(inst);
     }
 
+    /// v0.103: 追加「块体尾部的隐式 Return」—— 仅当最后一条指令**不是**
+    /// `Return` 时才追加。
+    ///
+    /// **缺陷背景**：此前各处无条件 `emit(MirInst::Return(body_reg))`。当块体
+    /// 以显式 `return ...` 结尾时（`task f(n) return n * n end`），这会追加
+    /// 一条**不可达的尾部 Return** —— 它没有任何入边（不位于任何控制流路径
+    /// 上），但 DAG 的 `entry` 定义为「无入边节点」，于是它被当作入口并在
+    /// 执行器里与真正的 Return 竞争返回值（实测该 task 经宿主投影调用返回
+    /// `n` 而非 `n * n`）。这是**产生死代码**的发射器缺陷，不是执行器问题。
+    ///
+    /// 判据健全性：尾部隐式 Return 只有在「控制流可落到块体末尾」时才必要；
+    /// 若最后一条指令是无条件 `Return`，控制流不可能落下，故可安全跳过。
+    /// 反之（块体以 `if ... end`、循环、赋值等结尾）末指令不是 `Return`，
+    /// 仍会正常追加。
+    pub fn emit_tail_return(&mut self, value: Option<Reg>) {
+        if matches!(self.insts.last(), Some(MirInst::Return(_))) {
+            return;
+        }
+        self.emit(MirInst::Return(value));
+    }
+
     pub fn patch_label_at(&mut self, idx: usize, label: Label) {
         match &mut self.insts[idx] {
             MirInst::JumpIfNot(_, lbl) | MirInst::JumpIf(_, lbl) | MirInst::Jump(lbl) => {
@@ -106,12 +127,49 @@ impl WitnessLowerer {
         }
     }
 
+    /// v0.104: 把 `app` 块的 update/view **闭包 witness** lower 成「体函数」。
+    ///
+    /// `app` 的 update/view 字段值在 witness 层是 [`WitnessKind::Closure`]
+    /// （`fn(m, msg) => …` 或名字引用合成的转发闭包）。运行时
+    /// `h_app_def` 把它们包成 `Value::Closure` 并在调用时按**位置**绑定
+    /// `MirFunction.params` —— 因此这里需要的产物是「闭包的体 + 形参名」，
+    /// 而不是「构造闭包的表达式」。
+    ///
+    /// 缺陷：此前直接 `lower_witness(update_w)`，得到 `Closure{dst,…}` +
+    /// `Return(dst)` —— update 函数每次被调用都返回一个**新建闭包**，
+    /// 模型被替换成 `<closure>`（`tea.model` 返回闭包、TEA 循环失效）。
+    fn lower_app_closure(w: &MirWitness) -> Result<super::MirFunction, String> {
+        let (params, body) = match &w.kind {
+            WitnessKind::Closure { params, body } => (params, body.as_ref()),
+            // 非闭包（如显式 `update: nil` 之类）——按表达式体渲染，
+            // 形参为空，与「未提供 update」的既有兜底一致。
+            _ => {
+                let mut l = WitnessLowerer::new();
+                let dst = l.lower_witness(w)?;
+                l.emit_tail_return(Some(dst));
+                return Ok(l.finish());
+            }
+        };
+        let mut l = WitnessLowerer::new();
+        let dst = l.lower_witness(body)?;
+        l.emit_tail_return(Some(dst));
+        let mut func = l.finish();
+        func.params = params.iter().map(|p| p.name.clone()).collect();
+        Ok(func)
+    }
+
     fn alloc_reg(&mut self) -> Reg {
         self.emit.alloc_reg()
     }
 
     fn emit(&mut self, inst: MirInst) {
         self.emit.emit(inst);
+    }
+
+    /// v0.103: 委托 `EmitContext::emit_tail_return`（条件追加块体尾部
+    /// 隐式 Return —— body 以显式 return 结尾时不产生不可达 Return）。
+    fn emit_tail_return(&mut self, value: Option<Reg>) {
+        self.emit.emit_tail_return(value);
     }
 
     fn patch_label_at(&mut self, idx: usize, label: Label) {
@@ -371,6 +429,14 @@ impl WitnessLowerer {
             // ── Match ──
             WitnessKind::Match { scrutinee, arms } => {
                 let val_reg = self.lower_witness(scrutinee)?;
+                // v0.104: 先分配**外层**结果寄存器，所有 arm 共用它 ——
+                // `h_match_expr` 把选中 arm 的返回值写进 `regs[output_reg]`，
+                // 且 `MirInst::dst()` 对 MatchExpr 取的正是最后一个 arm 的
+                // output_reg。此前这里传的是 arm 自己的局部寄存器
+                // （`body_lowerer` 独立空间，编号自 0 起）→ 编号常超出外层
+                // `n_regs`，`h_match_expr` 越界 panic；另分配的 `dst` 无人写、
+                // 消费者恒读 Nil。与 fcfg_lower 的 `lower_match` 同契约。
+                let dst = self.alloc_reg();
                 let match_arms: Vec<(String, Option<Reg>, Box<MirFunction>, Reg)> = arms
                     .iter()
                     .map(|arm| {
@@ -378,10 +444,9 @@ impl WitnessLowerer {
                         let mut body_lowerer = WitnessLowerer::new();
                         let arm_val_reg = body_lowerer.lower_witness(&arm.body)?;
                         body_lowerer.emit(MirInst::Return(Some(arm_val_reg)));
-                        Ok((pat_str, None, Box::new(body_lowerer.finish()), arm_val_reg))
+                        Ok((pat_str, None, Box::new(body_lowerer.finish()), dst))
                     })
                     .collect::<Result<Vec<_>, String>>()?;
-                let dst = self.alloc_reg();
                 self.emit(MirInst::MatchExpr {
                     val: val_reg,
                     arms: match_arms,
@@ -480,7 +545,9 @@ impl WitnessLowerer {
                 let param_names: Vec<String> = params.iter().map(|p| p.name.clone()).collect();
                 let mut body_lowerer = WitnessLowerer::new();
                 let body_dst = body_lowerer.lower_witness(body)?;
-                body_lowerer.emit(MirInst::Return(Some(body_dst)));
+                // v0.103: 条件追加 —— body 以显式 return 结尾时不再追加不可达
+                // 尾部 Return（见 EmitContext::emit_tail_return）。
+                body_lowerer.emit_tail_return(Some(body_dst));
                 let body_mir = body_lowerer.finish();
                 let dst = self.alloc_reg();
                 self.emit(MirInst::Closure {
@@ -498,7 +565,9 @@ impl WitnessLowerer {
                 let param_names: Vec<String> = params.iter().map(|p| p.name.clone()).collect();
                 let mut body_lowerer = WitnessLowerer::new();
                 let body_dst = body_lowerer.lower_witness(body)?;
-                body_lowerer.emit(MirInst::Return(Some(body_dst)));
+                // v0.103: 条件追加 —— body 以显式 return 结尾时不再追加不可达
+                // 尾部 Return（见 EmitContext::emit_tail_return）。
+                body_lowerer.emit_tail_return(Some(body_dst));
                 let body_mir = body_lowerer.finish();
                 self.emit(MirInst::TaskDef {
                     name: name.clone(),
@@ -845,7 +914,9 @@ impl WitnessLowerer {
                 let param_names: Vec<String> = params.iter().map(|p| p.name.clone()).collect();
                 let mut body_lowerer = WitnessLowerer::new();
                 let body_dst = body_lowerer.lower_witness(body)?;
-                body_lowerer.emit(MirInst::Return(Some(body_dst)));
+                // v0.103: 条件追加 —— body 以显式 return 结尾时不再追加不可达
+                // 尾部 Return（见 EmitContext::emit_tail_return）。
+                body_lowerer.emit_tail_return(Some(body_dst));
                 let body_mir = body_lowerer.finish();
                 self.emit(MirInst::UpdateDef {
                     name: name.clone(),
@@ -868,14 +939,16 @@ impl WitnessLowerer {
                 let init_dst = init_l.lower_witness(init_w)?;
                 init_l.emit(MirInst::Return(Some(init_dst)));
                 let init_mir = init_l.finish();
-                let mut update_l = WitnessLowerer::new();
-                let update_dst = update_l.lower_witness(update_w)?;
-                update_l.emit(MirInst::Return(Some(update_dst)));
-                let update_mir = update_l.finish();
-                let mut view_l = WitnessLowerer::new();
-                let view_dst = view_l.lower_witness(view_w)?;
-                view_l.emit(MirInst::Return(Some(view_dst)));
-                let view_mir = view_l.finish();
+                // v0.104: update/view 的 witness 是 **Closure 节点** —— 其
+                // MIR 必须是闭包**体**（形参由 h_app_def 绑定），而不是
+                // 「构造闭包」的表达式。此前直接 lower_witness(update_w)
+                // 会 emit 一条 MirInst::Closure 再 Return 该寄存器 ——
+                // 得到的 update 函数每次被调用都返回一个**新建的闭包**，
+                // 模型因此变成 `<closure>`（`tea.model` 返回闭包、update
+                // 永不生效）。TeaApp::apply_update 期待的是 `Model -> Msg ->
+                // Model` 的体。
+                let update_mir = Self::lower_app_closure(update_w)?;
+                let view_mir = Self::lower_app_closure(view_w)?;
                 self.emit(MirInst::AppDef {
                     name: name.clone(),
                     model_name: model_name.clone(),
@@ -1078,6 +1151,7 @@ pub fn pattern_to_string(pattern: &crate::mir::witness::WitnessPattern) -> Strin
 #[cfg(test)]
 mod tests {
     use super::super::effect::EffectRow;
+    use super::EmitContext;
 
     #[test]
     fn classify_call_effect_known_builtin() {
@@ -1110,6 +1184,46 @@ mod tests {
         r.extend("Bsp");
         assert_eq!(r.len(), 2);
         assert!(r.contains("Bsp"));
+    }
+
+    /// v0.103: `emit_tail_return` 只在末尾**不是** `Return` 时追加。
+    ///
+    /// 缺陷背景：各块体发射点无条件追加尾部 `Return`，当体以显式
+    /// `return ...` 结尾时会产生一条**无入边**的死 Return 节点 —— DAG 的
+    /// `entry` 定义是「无入边节点」，于是它成为入口并在执行期与真 Return
+    /// 竞争返回值（实测 `task f(n) return n * n end` 经宿主投影调用返回 n）。
+    #[test]
+    fn emit_tail_return_skips_when_already_terminated() {
+        use crate::mir::MirInst;
+
+        // 体已以 Return 结尾 → 不追加（不产生死节点）
+        let mut ctx = EmitContext::new();
+        let r = ctx.alloc_reg();
+        ctx.emit(MirInst::Const(r, crate::value::Value::Int(7)));
+        ctx.emit(MirInst::Return(Some(r)));
+        ctx.emit_tail_return(Some(r));
+        assert_eq!(
+            ctx.insts
+                .iter()
+                .filter(|i| matches!(i, MirInst::Return(_)))
+                .count(),
+            1,
+            "已以 Return 结尾的体不得追加第二条 Return"
+        );
+
+        // 体以赋值等非 Return 结尾 → 追加（控制流可落到末尾）
+        let mut ctx2 = EmitContext::new();
+        let r2 = ctx2.alloc_reg();
+        ctx2.emit(MirInst::Const(r2, crate::value::Value::Int(7)));
+        ctx2.emit_tail_return(Some(r2));
+        assert_eq!(
+            ctx2.insts
+                .iter()
+                .filter(|i| matches!(i, MirInst::Return(_)))
+                .count(),
+            1,
+            "非 Return 结尾的体必须补一条尾部 Return"
+        );
     }
 }
 

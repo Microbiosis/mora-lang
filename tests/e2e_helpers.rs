@@ -53,9 +53,13 @@ pub enum E2eResult {
 /// 当前实现：直接跑原流程，让 stdout 走测试框架；E2E 测试断言
 /// `result.last_expr.to_string()`（module-level 最后表达式）。
 pub fn run_e2e(name: &str) -> E2eResult {
-    let source = read_fixture(name);
+    run_source(&read_fixture(name))
+}
 
-    let (func, witnesses) = match mora::parser_v3::ParserV3::compile(&source) {
+/// v0.103: 与 [`run_e2e`] 同链路，但直接吃源码字符串（不读 fixture）——
+/// 供只需要几行源码的精确断言测试使用，免去为每个语义细节建 fixture。
+pub fn run_source(source: &str) -> E2eResult {
+    let (func, witnesses) = match mora::parser_v3::ParserV3::compile(source) {
         Ok(f) => f,
         Err(e) => return E2eResult::CompileError(e),
     };
@@ -80,6 +84,22 @@ pub fn run_e2e(name: &str) -> E2eResult {
     E2eResult::Ok {
         last_expr,
         stdout_lines: Vec::new(),
+    }
+}
+
+/// v0.103: 断言一段源码跑成功，返回其末表达式的值。
+pub fn assert_source_ok(source: &str) -> Value {
+    match run_source(source) {
+        E2eResult::Ok { last_expr, .. } => last_expr,
+        E2eResult::CompileError(e) => panic!("source: compile error: {}\n---\n{}", e, source),
+        E2eResult::TypeErrors(errs) => {
+            let formatted: Vec<String> = errs.iter().map(format_error).collect();
+            panic!(
+                "source: type errors:\n{}\n---\n{}",
+                formatted.join("\n"),
+                source
+            )
+        }
     }
 }
 

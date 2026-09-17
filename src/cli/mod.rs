@@ -19,15 +19,23 @@ use crate::typeck::format_error;
 /// lower_mir_exprs_with_opt 完全一致（cascades apply_rules 恒跑 + SSA opt
 /// 显式 --opt 优先，未指定走 env 兜底）。调用方各自做 witness typecheck
 /// 并保留原有错误消息。
+///
+/// v0.103: 返回 `Result` —— 此前解析失败直接 `panic!`，于是 CLI 遇到任何
+/// 语法错误都会打印 Rust panic 与回溯（"compile_and_opt failed: Failed to
+/// parse at line N"）而不是可读的编译错误；`mora file.mora` 与
+/// `mora --check file.mora` 两条入口都受影响。调用方统一按 typecheck 错误的
+/// 既有约定报错并以退出码 2 结束。
 pub fn compile_and_opt(
     source: &str,
     opt_level: Option<crate::mir::ssa::OptLevel>,
-) -> (
-    crate::mir::MirFunction,
-    Vec<crate::mir::witness::MirWitness>,
-) {
-    let (mut func, witnesses) =
-        ParserV3::compile(source).unwrap_or_else(|e| panic!("compile_and_opt failed: {e}"));
+) -> Result<
+    (
+        crate::mir::MirFunction,
+        Vec<crate::mir::witness::MirWitness>,
+    ),
+    String,
+> {
+    let (mut func, witnesses) = ParserV3::compile(source)?;
 
     // v0.90.3: 执行器切换 — 9 层管线产出成为生产 MirFunction。
     //
@@ -50,7 +58,7 @@ pub fn compile_and_opt(
             if level.enabled() {
                 crate::mir::opt::optimize(&mut pipeline_func, level);
             }
-            return (pipeline_func, witnesses);
+            return Ok((pipeline_func, witnesses));
         }
         if std::env::var("MORA_9LAYER_DEBUG").is_ok_and(|v| v == "1") {
             eprintln!(
@@ -74,7 +82,7 @@ pub fn compile_and_opt(
     if level.enabled() {
         crate::mir::opt::optimize(&mut func, level);
     }
-    (func, witnesses)
+    Ok((func, witnesses))
 }
 
 fn recordings_dir() -> std::path::PathBuf {

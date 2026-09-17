@@ -2,6 +2,181 @@
 
 All notable changes to Mora will be documented in this file.
 
+## [v0.104] — 2026-09-16 — fix: 缺陷审计第二轮 —— 循环值传递 / 数值塔统一 / 承诺语法接线
+
+对 v0.103 之后的现状续做缺陷审计，修复三类：**DAG 控制流/优化器语义缺陷**
+（循环体静默不执行、死循环）、**类型系统↔运行时契约分叉**（数值塔）、
+**承诺未接线**（spec §9.6 的 `update` 声明、CLI 语法错误 panic）。全部按
+「从底层修正、不做补丁」原则处理，无兼容层。
+
+### DAG 执行器与优化器（缺陷最重的一类）
+
+- **`for` 循环体一次都不执行（9 层管线）**：`fcfg_lower.rs` 的 `Node::For`
+  用 `JumpIfNot` 配合**退出条件** `idx >= len`，语义反转 ——
+  `for x in [1,2,3]` 在 9 层管线下降级为 0 次迭代（`total` 保持 0）。
+  emit.rs 路径用 `JumpIf` 是正确的，两条管线语义分歧。改为 `JumpIf`。
+- **CSE 重命名环携带寄存器 → 死循环**：`CseDagRule` 合并两个等价节点后
+  用 `reg_rename` 全局改写「读旧寄存器」的位点，但**未要求该寄存器单定义**。
+  `for` 的索引有两处定义（init + 增量），当 init 与另一条语句的初始化恰好
+  同值时（`let total = 0i` 与索引 init 都是 `Int(0)`）被合并 → 条件读到
+  init 值、增量写到另一个寄存器 → 条件恒假、死循环。新增
+  `is_multi_defined` 守卫（重命名的 SSA 前置条件）。
+- **CSE 重定向出边跨越基本块**：CSE 把被删节点的**全部出边**重定向到合并
+  目标，而 Sequence 边是「基本块内保序」的位置语义 —— 目标可能在别的控制
+  区域，于是「内层 if 块 → 循环体内块」出现跨块 Sequence 边。Sequence 是
+  DAG 的**激活通道**，`break` 被选中时循环体末端仍被激活 → 回边再次点火
+  → 挂死。改为不重定向 Sequence 出边（线性链由缝合恢复）。
+- **Sequence 缝合跨基本块**：`apply_rewrite` 的缝合把「removed 前驱」直接
+  连到「removed 后继」，未限制同块。新增 `sequence_components`（Sequence
+  连通分量 ≡ 基本块）作为判据，缝合只连同分量。
+- **Data 边充当控制激活通道**：`run_dag` 的 scan 阶段对 Data 边也做
+  激活（`reg_ready` 即推入 active），无视控制流是否到达。递增语句因此被
+  「常量 1」的 Data 边提前激活，与 `break` 分支同波执行。改为 **Data 边只
+  决定就绪、不决定激活**（激活仅由控制边与 Sequence 边决定），并保留
+  「已激活但未就绪」的节点到下一波。
+- **`Break`/`Continue` 目标解析缺 pc 兜底**：v0.75.33 给 `Jump` 补了
+  「Label 优先、裸 pc 兜底」，但 `Break`/`Continue` 漏了同一处。
+  `fcfg_lower`/`emit_loop_w` 都不发 `MirInst::Label`（用指令下标做 label），
+  于是 `label_to_node` 里没有这些键 → Break 节点拿不到出边 → DAG 无从激活
+  退出目标（而 Effect 节点返回的 `Flow::Jump(_)` 在 DAG 里是 no-op）→
+  `break` 被静默忽略、循环永不退出。补齐 pc 兜底。
+- **循环表达式结果寄存器丢失**：`Node::For`/`Node::While` 没有结果寄存器
+  字段，9 层产出比 emit.rs 少一条尾部 `Const(Nil)` → 类别差分失败 → **管线
+  对含循环的模块永久回落 emit.rs**（Phase 2 执行器切换被静默阻塞）。给两个
+  节点加 `dst`，`fcfg_lower`/`ehir_to_core` 按 emit.rs 契约发 Nil 常量，
+  并把步长常量提到循环标签前（与 emit.rs 同序）。
+- **尾部隐式 `Return` 产生死节点**：各块体发射点无条件追加 `Return`，
+  当体以显式 `return ...` 结尾时追加的是一条**无入边**的死 Return —— DAG 的
+  `entry` 定义是「无入边节点」，它因此成为入口并与真 Return 竞争返回值
+  （`task f(n) return n * n end` 经宿主投影调用返回 `n` 而非 `n * n`）。
+  新增 `EmitContext::emit_tail_return`（末指令已是 Return 则跳过），
+  11 处块体发射点统一改用。
+
+### 数值塔：Int ⊂ Float（类型系统↔运行时契约分叉）
+
+- **混合 Int/Float 运算被类型检查放行却在运行期报错**：typeck 的 Numeric
+  约束（v0.90.5）把 Int/Float 提升为 Float、`compatible_with` 亦承认互通
+  （其注释即以 `42 == 3.14` 为例），但运行期 `numeric_op`/`numeric_cmp`/
+  `values_equal` 报 Rust-strict 错误、相等判否 —— **类型检查通过的代码在
+  运行期失败**。同一函数内的 BigInt 分支本就支持混算，进一步证实是漂移。
+  统一为数值塔：`Int op Float → Float`、混合比较按 f64、`4 == 4.0` 为真
+  （与 `4 <= 4.0` 一致）。同步更新 5 个断言旧语义的单测。
+- **比较/相等运算在 typeck 走严格 `Eq`**：`infer_binop` 的 `Equal`/
+  `Greater` 等分支在 `compatible_with` 放行 Int/Float 后紧接着要求
+  `Eq(Int, Float)`，而 `unify` 没有交叉 arm → `4i == 4.0` / `4i < 4.0`
+  被判类型错误。数值对改走 `Numeric` 约束。
+- **`unify` 缺 BigInt 自反 arm**：v0.91 引入 BigInt 变体时漏加，
+  `999n == 999n`、`x: bigint = 999n` 报 "expected bigint, got bigint"。
+- **`Dict` 字段访问无类型规则**：`d.count`（无实参 `.name`）在运行期由
+  method_dispatch 兜底解析为取键值，typeck 签名表只有 get/set/keys/
+  values/len → 落到 `Type::Unknown`，而 Unknown 是 fail-fast 标签 →
+  `d.count + 1i` 被判类型错误。新增 `dict_field_type`（Dict→值类型、
+  TeaModel→字段声明类型）。
+- **方法结果 `Unknown` 泄漏进下游约束**：v0.75.91/92 明确「Unknown 不算
+  已知签名、与任何类型合成都失败」，但方法推断兜底仍产出 Unknown →
+  `task t(model) model.count + 1i end` 报 "expected Int, got TypeVar"。
+  改为交回 fresh TypeVar（与 v0.96 给 infer_call 未知被调者的修正同源）。
+
+### 承诺语法接线（IR 齐备、parser 缺失）
+
+- **`update(msg, model) ... end` 独立声明**（spec §9.6 工作示例）：
+  `WitnessKind::UpdateDef`/`MirInst::UpdateDef`/`Node::UpdateDef`/
+  `h_update_def` 及 SSA/FCFG/typeck/LSP 的全部穷举点自 v0.83 起就位，唯独
+  parser 无产出点。新增 `emit_update_def_w`（注册名由 `UPDATE_NAME` 常量与
+  app 块绑定）+ 前瞻守卫（形参全为裸标识符）+ typeck 注册 `update` 名与
+  真实体推断（子作用域 clone/restore）。
+- **`model`/`msg` 的 `dst` 缺失**：与 `For`/`While` 同一处对齐问题。
+
+### CLI 错误路径
+
+- **语法错误表现为 Rust panic**：`cli::compile_and_opt` 用 `panic!` 包住
+  解析失败，`mora <file>` / `mora --check <file>` / record / replay /
+  snapshot 五条入口都把用户语法错误呈现为编译器内部崩溃（panic + 回溯），
+  与 typecheck 错误路径的 `exit(2)` 不一致。改为返回 `Result`，各调用点
+  统一 `eprintln!` + 退出码 2。
+
+### TEA：spec §9.6 工作示例的完整链路（7 处缺陷串联）
+
+`model Counter … end` / `msg CounterMsg … end` / `update(msg, model) … end` /
+`app CounterApp … update: update … end` 这条规范示例此前**逐字不可跑**：
+
+- **变参 builtin 签名**：`print` 运行期 join 全部实参，签名却只声明 1 个 →
+  `builtin_callee_ty` 生成固定 arity 的 curried arrow → `print("a", b)` 报
+  "expected nil, got fn(string) -> …"。新增 `Signature::variadic`（arity
+  契约的唯一事实源仍是签名表），`infer_call` 对变参 builtin 按末位参数类型
+  逐实参校验后返回声明结果类型。**三个 loop fixture 也因此首次通过类型检查**。
+- **`print` 联合类型缺 BigInt/Int**：v0.91 引入 BigInt 时漏加，
+  `print(999n)` 报 "expected string|float|…, got bigint"（Int 亦不在名单，
+  仅靠 Int<:Float 侥幸通过）。
+- **`update(params) … end` 独立声明**（§9.6）：`emit_update_def_w` +
+  前瞻守卫（形参全为裸标识符）+ typeck 注册名与真实体推断。
+- **`h_update_def` 丢弃 MirFunction**：注册为
+  `Dict{__update_body__: "<MirFunction:2>"}` —— 一个**描述字符串**。
+  改为注册真实可调用的 `Value::Closure`。
+- **AppDef 把 update/view 的 Closure witness 当表达式 lower**：产出「构造
+  闭包」的指令序列 → update 每次调用返回**新闭包**、模型被替换成 `<closure>`
+  （`tea.model` 返回闭包、TEA 循环失效）。新增
+  `lower_app_closure`（lower.rs）/ `split_app_closure`（Node::AppDef 增
+  `update_params`/`view_params`），lower 出「体 + 形参名」。
+- **`h_app_def` 硬编码闭包形参名 `["model","msg"]`**：`call_value` 按**位置**
+  绑定形参名进子环境，用户写的别的名字（`m`）在体内 unbound → 读 Nil。
+  改为取 `MirFunction.params`（位置契约不变）。
+- **app 的 `update: <name>` 名字引用不可解析**：此前被 `emit_closure_pair`
+  当作「无参闭包体」继续解析，把紧随其后的 `view:` 整行吞进体内 →
+  "Expected field name"。新增 `emit_app_field_ref_or_closure`：`fn` → 内联
+  闭包；裸标识符 → 合成转发闭包（先 `Var(形参名)` 取值再 `Call`，并把形参
+  写进 `MirFunction.params`）。
+- **update 实参序与 spec 相反**：运行时传 `(model, msg)`，而 §9.6（首句即
+  「Elm 风格」）示例写 `update(msg, model)` —— 照规范写会拿到「model=消息」，
+  示例体 `model.count` 报 "Dict has no method: count"。统一为 **(msg, model)**。
+- **match 的 output_reg 用 arm 局部寄存器**：arm 有独立寄存器空间，编号常
+  超出外层 `n_regs` → `h_match_expr` 越界 panic（"the len is 2 but the index
+  is 4"）；另分配的 `dst` 无人写、消费者恒读 Nil。`emit.rs::emit_match_w` 与
+  `lower.rs` 的 Match 分支统一为「先分配外层 dst，全部 arm 指向它」
+  （与 `fcfg_lower::lower_match` 同契约）。
+- **双向预扫不登记 `let`/形参**：`BidirectionalChecker::pre_check_program`
+  在 `infer_program` **之前**独立遍历 witness 树，其 `synth`/`check_against`
+  直接调 `hm.infer_expr`（不经过 `infer_let`/`infer_closure_core`），却从不把
+  `LetBinding`/`Closure`/`FnDef` 的绑定写进环境 → 「先 `let`、后出现在块体内」
+  或「形参在 match arm 内被引用」都报
+  `type inference failed: Unbound variable '<name>'`。预扫改为边遍历边登记
+  （Closure/FnDef 推断完整体还原，不泄漏给兄弟节点）。
+
+### 测试
+
+- `e2e_for_loop_runs` 从 `assert_ok` 冒烟升级为**精确值断言**（15）；
+  fixture 增顶层循环使结果成为程序末表达式（`run_e2e` 不捕获 stdout）。
+- `executor_switch` 的 `switch_while_continue` / `switch_for_break` 从
+  「不挂死即通过」升级为精确值断言（12 / 15）。
+- `tea_standalone.mora` 增 `update` 声明覆盖；
+  `e2e_tea_standalone_update_full_cycle` 逐字跑 spec §9.6 示例并断言
+  `count == 3`（+1 +1 -1）。
+- 新增 `e2e_loop_fixtures_exact_values`（loop_basic/break/continue/for_break
+  精确值 + 纳入 `e2e_all_fixtures_run`）、`e2e_variadic_print_accepted`、
+  `e2e_numeric_tower_promotes_mixed_int_float`、
+  `e2e_let_visible_inside_later_blocks`。
+- `loop_basic.mora` 修正 `{` 配 `end` 的语法错误（此前不在任何断言集中，
+  缺陷长期潜伏）；`tea_app.mora` / `tea_counter.mora` 改用 spec 的
+  `(msg, model)` 形参序。
+- 新增单测：`emit_tail_return_skips_when_already_terminated`、
+  `cse_rejects_rename_of_multi_defined_loop_index`、
+  `cse_still_eliminates_single_defined_duplicates`、
+  `dag_optimize_keeps_sequence_edges_intra_block`（非空断言：回退修复即
+  复现跨块 Sequence 边）、`e2e_compile_and_opt_returns_err_on_parse_error`。
+- e2e harness 新增 `run_source` / `assert_source_ok`（免为语义细节建 fixture）。
+
+### 不兼容变更
+
+- `cli::compile_and_opt` 签名由 `(MirFunction, Vec<MirWitness>)` 改为
+  `Result<...>` —— 调用方必须处理解析失败（3 处已迁移）。
+- 数值语义：混合 Int/Float 运算/比较由「运行期报错」改为提升为 Float；
+  `4 == 4.0` 由 false 改为 true。原先依赖该错误的程序（纯属规避类型系统
+  分叉）需移除规避。
+- **TEA update 签名统一为 `(msg, model)`**（spec §9.6 / Elm 序）——
+  旧代码写的 `fn(model, msg)` 需交换形参。
+- 语句首 `update(全部裸标识符)` 现在解析为 TEA 声明（不再是调用）——
+  与 `model`/`msg` 声明同类的保留形态。
+
 ## [v0.103] — 2026-09-14 — fix: 全仓缺陷审计 —— 静默吞错 / 模块不可达 / 承诺语法未接线
 
 对本项目现状做系统缺陷审计（死 IR 枚举、静默吞错扫描、spec↔实现落差、

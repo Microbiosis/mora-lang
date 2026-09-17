@@ -98,8 +98,9 @@ pub fn is_pipe_method(name: &str) -> bool {
 
 /// 二元操作求值
 ///
-/// v0.38 (C5): addition follows the same Rust-strict promotion rules.
-/// v0.76.00: 返回 `Result<Value, MoraError>`（MoraError 统一计划推进）。
+    /// v0.38: addition follows the numeric-tower promotion rules.
+    /// v0.76.00: 返回 `Result<Value, MoraError>`（MoraError 统一计划推进）。
+    /// v0.103: Int ⊂ Float —— 混合运算提升为 Float（此前 Rust-strict 报错）。
 pub fn eval_binary(left: Value, op: &BinaryOp, right: Value) -> Result<Value, MoraError> {
     match op {
         BinaryOp::Add => match (&left, &right) {
@@ -128,10 +129,14 @@ pub fn eval_binary(left: Value, op: &BinaryOp, right: Value) -> Result<Value, Mo
                     |af| Ok(Value::Float(af + *b)),
                 )
             }
-            // Mixed Int/Float -> error
-            (Value::Int(_), Value::Float(_)) | (Value::Float(_), Value::Int(_)) => {
-                Err(MoraError::Other("operator '+' requires both operands to be same numeric type (Int or Float, Rust-strict mode)".to_string()))
-            }
+            // v0.103: numeric tower — Int ⊂ Float，混合运算提升为 Float。
+            // 此前此处报 Rust-strict 错误，与三处既有事实矛盾：类型系统
+            // （`unify.rs` 的 Numeric 约束把 Int/Float 提升为 Float）、
+            // spec §15.1（`number` 按数值比较）以及本函数紧邻的 BigInt 分支
+            // （Int+BigInt / Float+BigInt 均可混算）。结果是**类型检查通过的
+            // 程序在运行期报类型错误** —— 契约分叉，非设计意图。
+            (Value::Int(a), Value::Float(b)) => Ok(Value::Float(*a as f64 + b)),
+            (Value::Float(a), Value::Int(b)) => Ok(Value::Float(a + *b as f64)),
             (Value::String(a), Value::String(b)) => Ok(Value::String(format!("{}{}", a, b))),
             // 字符串 + 任意类型 → 自动转字符串拼接
             (Value::String(a), _) => Ok(Value::String(format!("{}{}", a, right))),
@@ -197,10 +202,10 @@ pub fn eval_binary(left: Value, op: &BinaryOp, right: Value) -> Result<Value, Mo
 
 /// 数值操作辅助
 ///
-/// v0.38 (C5): numeric tower — promotion rules (Rust-strict style):
-/// - `Int + Int = Int`        (pure integer arithmetic)
-/// - `Float + Float = Float`  (pure float arithmetic)
-/// - `Int + Float` / `Float + Int` -> strict type error
+/// v0.38 (C5): numeric tower — promotion rules:
+/// - `Int op Int`     = Int        (纯整数算术)
+/// - `Float op Float` = Float      (纯浮点算术)
+/// - `Int op Float`   = Float      (v0.103: Int ⊂ Float，混合提升为 Float)
 ///
 /// v0.91: 把 BigInt 转为 f64（如果超出 f64 范围返回 ±INFINITY）。
 /// 这是 lossy 转换，仅用于类型提升（Float + BigInt → Float）。
@@ -266,11 +271,10 @@ where
         (BigInt(a), Float(b)) => {
             Ok(Float(op(bigint_to_f64_lossy(&a), b)))
         }
-        // Mixed types -> strict error
-        (Int(_), Float(_)) | (Float(_), Int(_)) => Err(MoraError::Other(
-            "numeric operator does not accept mixed Int and Float operands (Rust-strict mode)"
-                .to_string(),
-        )),
+        // v0.103: numeric tower — Int ⊂ Float，混合提升为 Float（与 typeck
+        // 的 Numeric 约束一致；此前报 Rust-strict 错误，属契约分叉）。
+        (Int(a), Float(b)) => Ok(Float(op(a as f64, b))),
+        (Float(a), Int(b)) => Ok(Float(op(a, b as f64))),
         // v0.17: 广播操作 - list op number
         (Value::List(list), Value::Float(scalar)) => {
             let result: Vec<Value> = list
@@ -318,7 +322,12 @@ where
 
 /// 数值比较辅助
 ///
-/// v0.38: Int/Int compare as i64, Float/Float as f64, mixed -> error.
+/// v0.103: numeric tower — Int ⊂ Float。
+/// - `Int cmp Int`     → 按 i64 比较
+/// - `Float cmp Float` → 按 f64 比较
+/// - `Int cmp Float`   → 提升为 f64 比较（此前报 Rust-strict 错误，
+///   与 typeck 及 spec §15.1「`number` 数值比较」分叉）
+///
 /// v0.76.00: 返回 `Result<Value, MoraError>`（MoraError 统一计划推进）。
 pub fn numeric_cmp<F>(left: Value, right: Value, op: F) -> Result<Value, MoraError>
 where
@@ -328,23 +337,26 @@ where
     match (left, right) {
         (Int(a), Int(b)) => Ok(Bool(op(a as f64, b as f64))),
         (Float(a), Float(b)) => Ok(Bool(op(a, b))),
-        (Int(_), Float(_)) | (Float(_), Int(_)) => Err(MoraError::Other(
-            "numeric comparison does not accept mixed Int and Float operands (Rust-strict mode)"
-                .to_string(),
-        )),
+        (Int(a), Float(b)) => Ok(Bool(op(a as f64, b))),
+        (Float(a), Int(b)) => Ok(Bool(op(a, b as f64))),
         _ => Err(MoraError::Other("Operands must be numbers".to_string())),
     }
 }
 
 /// 值相等比较
+///
+/// v0.103: 数值相等遵循 numeric tower —— `Int ⊂ Float`，故 `4 == 4.0` 为真；
+/// `numeric_cmp` 已把 Int/Float 视为可比较（`4 <= 4.0` 为真），若 `==` 判否
+/// 则 `<=` 与 `==` 自相矛盾。BigInt 亦纳入（v0.91 引入变体时漏加 —— 与
+/// `Value::eq` 的 BigInt arm 保持一致）。
 pub fn values_equal(a: &Value, b: &Value) -> bool {
     match (a, b) {
         (Value::Nil, Value::Nil) => true,
-        // v0.75.44: Int 分支 — v0.38 numeric tower 引入 Int 变体时漏加，
-        // 导致 `4 == 4` 恒 false。Mixed 数字（Int vs Float）仍 false
-        // （跨类型不相等，与 numeric_op strict 语义一致）。
         (Value::Int(a), Value::Int(b)) => a == b,
         (Value::Float(a), Value::Float(b)) => a == b,
+        // v0.103: tower 提升 —— 混合数值按 f64 比较
+        (Value::Int(a), Value::Float(b)) | (Value::Float(b), Value::Int(a)) => *a as f64 == *b,
+        (Value::BigInt(a), Value::BigInt(b)) => a == b,
         (Value::String(a), Value::String(b)) => a == b,
         (Value::Bool(a), Value::Bool(b)) => a == b,
         (Value::List(a), Value::List(b)) => a == b,
@@ -446,22 +458,24 @@ mod tests {
         assert_eq!(v, Value::Float(4.0));
     }
 
-    /// v0.38: Int + Float is a STRICT error (Rust-style).
+    /// v0.103: Int op Float 提升为 Float（取代 v0.38 的 strict error）。
+    /// 旧断言（`is_err`）与 typeck 的 Numeric 提升、spec §15.1、以及本文件
+    /// 的 BigInt 混算分支三处矛盾；此处断言新的 tower 语义。
     #[test]
-    fn numeric_tower_int_plus_float_is_error() {
+    fn numeric_tower_int_plus_float_promotes() {
         let l = Value::Int(2);
         let r = Value::Float(3.0);
-        let v = numeric_op(l, r, |a, b| a + b);
-        assert!(v.is_err(), "expected strict error, got: {:?}", v);
+        let v = numeric_op(l, r, |a, b| a + b).unwrap();
+        assert_eq!(v, Value::Float(5.0), "Int + Float → Float(提升)");
     }
 
-    /// v0.38: Float + Int is symmetric — also error.
+    /// v0.103: Float op Int 对称提升为 Float。
     #[test]
-    fn numeric_tower_float_plus_int_is_error() {
+    fn numeric_tower_float_plus_int_promotes() {
         let l = Value::Float(2.0);
         let r = Value::Int(3);
-        let v = numeric_op(l, r, |a, b| a + b);
-        assert!(v.is_err());
+        let v = numeric_op(l, r, |a, b| a + b).unwrap();
+        assert_eq!(v, Value::Float(5.0), "Float + Int → Float(提升)");
     }
 
     /// v0.38: Float + Float → Float via numeric_op (补充用例：整数 Float)。
@@ -487,11 +501,11 @@ mod tests {
         assert_eq!(v, Value::Float(4.0));
     }
 
-    /// v0.38: eval_binary Add(Int, Float) -> strict error.
+    /// v0.103: eval_binary Add(Int, Float) 提升为 Float（取代 strict error）。
     #[test]
-    fn eval_binary_int_float_add_is_error() {
-        let v = eval_binary(Value::Int(2), &BinaryOp::Add, Value::Float(3.0));
-        assert!(v.is_err());
+    fn eval_binary_int_float_add_promotes() {
+        let v = eval_binary(Value::Int(2), &BinaryOp::Add, Value::Float(3.0)).unwrap();
+        assert_eq!(v, Value::Float(5.0));
     }
 
     /// v0.38: numeric_cmp Int < Int.
@@ -503,15 +517,19 @@ mod tests {
 
     /// v0.75.44: eval_binary Equal(Int, Int) — values_equal 的 Int 分支
     /// （v0.38 引入 Int 变体时漏加，`4 == 4` 曾恒 false）。
+    /// v0.103: 混合数值按 numeric tower 比较 —— `4 == 4.0` 为真（与
+    /// `numeric_cmp` 的 `4 <= 4.0` 一致；此前判否使 `<=` 与 `==` 矛盾）。
     #[test]
     fn eval_binary_int_equal() {
         let v = eval_binary(Value::Int(4), &BinaryOp::Equal, Value::Int(4)).unwrap();
         assert_eq!(v, Value::Bool(true));
         let v2 = eval_binary(Value::Int(4), &BinaryOp::Equal, Value::Int(5)).unwrap();
         assert_eq!(v2, Value::Bool(false));
-        // Mixed 数字不相等（strict 语义）
+        // 混合数值：tower 提升后相等
         let v3 = eval_binary(Value::Int(4), &BinaryOp::Equal, Value::Float(4.0)).unwrap();
-        assert_eq!(v3, Value::Bool(false));
+        assert_eq!(v3, Value::Bool(true), "4 == 4.0（Int ⊂ Float）");
+        let v4 = eval_binary(Value::Int(4), &BinaryOp::Equal, Value::Float(4.5)).unwrap();
+        assert_eq!(v4, Value::Bool(false));
     }
 
     /// v0.38: numeric_cmp Float == Float.
@@ -521,11 +539,13 @@ mod tests {
         assert_eq!(v, Value::Bool(true));
     }
 
-    /// v0.38: numeric_cmp Int vs Float is error.
+    /// v0.103: numeric_cmp Int vs Float 提升比较（取代 v0.38 的 error）。
     #[test]
-    fn numeric_cmp_int_float_is_error() {
-        let v = numeric_cmp(Value::Int(1), Value::Float(1.0), |a, b| a < b);
-        assert!(v.is_err());
+    fn numeric_cmp_int_float_promotes() {
+        let v = numeric_cmp(Value::Int(1), Value::Float(2.0), |a, b| a < b).unwrap();
+        assert_eq!(v, Value::Bool(true));
+        let v2 = numeric_cmp(Value::Float(2.0), Value::Int(1), |a, b| a < b).unwrap();
+        assert_eq!(v2, Value::Bool(false));
     }
 
     /// v0.38: typeck still routes Int literal to Type::Int.

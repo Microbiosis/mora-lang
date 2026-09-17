@@ -69,10 +69,14 @@ fn max_reg_in_node(node: &Fcfg) -> usize {
             }
             m
         }
-        Node::While { cond, body, .. } => {
-            max_reg_in_nodes(&cond.nodes).max(max_reg_in_nodes(&body.nodes))
+        // dst 是 witness_to_fcfg 预分配的循环结果寄存器，必须计入 max ——
+        // 否则本层 bump 分配器会覆盖它（寄存器安全契约见 lower_fcfg 文档）。
+        Node::While { cond, body, dst, .. } => *dst
+            .max(&max_reg_in_nodes(&cond.nodes))
+            .max(&max_reg_in_nodes(&body.nodes)),
+        Node::For { iter, body, dst, .. } => {
+            (*iter).max(*dst).max(max_reg_in_nodes(&body.nodes))
         }
-        Node::For { iter, body, .. } => *iter.max(&max_reg_in_nodes(&body.nodes)),
         Node::Match { dst, scrutinee, arms, .. } => {
             let mut m = *dst.max(scrutinee);
             for arm in arms {
@@ -96,6 +100,17 @@ fn max_reg_in_node(node: &Fcfg) -> usize {
         Node::Sequence { nodes, .. } => max_reg_in_nodes(nodes),
         _ => 0,
     }
+}
+
+/// 发射「循环作为表达式」的结果常量。
+///
+/// emit.rs 的 `emit_loop_w` / `emit_while_w` 在循环指令流末尾各留一个
+/// `Const(dst, Nil)`，使 for/while 出现在值位置（如 `let x = for ... end`）
+/// 时消费者能读到确定的值。9 层管线此前不发这一条 —— 结果是：
+/// ① 类别差分因少了 `Const` 而失败 → 管线对含循环的模块永久回落
+/// emit.rs；② `node_result_reg` 读不到循环结果寄存器。
+fn emit_loop_result(ctx: &mut EmitContext, dst: Reg) {
+    ctx.emit(MirInst::Const(dst, Value::Nil));
 }
 
 /// 降维单个 FCFG 节点。
@@ -193,7 +208,7 @@ fn lower_node(ctx: &mut EmitContext, node: &Fcfg) {
         }
 
         // ── 控制流：While → Label + cond + JumpIfNot + body + Jump + post-patch ──
-        Node::While { cond, body, .. } => {
+        Node::While { cond, body, dst, .. } => {
             let loop_start = ctx.insts.len();
             lower_block(ctx, cond);
             let cond_reg = cond.result.unwrap_or(0);
@@ -215,23 +230,36 @@ fn lower_node(ctx: &mut EmitContext, node: &Fcfg) {
                     _ => {}
                 }
             }
+            // 循环作为表达式的结果 = Nil（与 emit.rs emit_while_w 同契约）。
+            emit_loop_result(ctx, *dst);
         }
 
         // ── 控制流：For → index-based loop + post-patch ──
-        Node::For { var, iter, body, .. } => {
+        Node::For { var, iter, body, dst, .. } => {
             // let __idx = 0
             let idx_reg = ctx.alloc_reg();
             ctx.emit(MirInst::Const(idx_reg, Value::Int(0)));
             // let __len = len(iter)
             let len_reg = ctx.alloc_reg();
             ctx.emit(MirInst::Call(len_reg, "len".to_string(), vec![*iter]));
+            // let __one = 1（与 emit.rs 同序：步长常量在循环标签前发射。
+            // 位置若后移，指令类别序列与 emit.rs 分歧 → 9 层差分失败 →
+            // 管线对 for 循环永久回落，Phase 2 执行器切换被静默阻塞）。
+            let one_reg = ctx.alloc_reg();
+            ctx.emit(MirInst::Const(one_reg, Value::Int(1)));
             // Label: loop_start
             let loop_start = ctx.insts.len();
-            // cond: __idx >= __len
+            // cond: __idx >= __len —— 这是**退出**条件（不是继续条件）。
+            // v0.103 修复：此前此处误用 `JumpIfNot`（与 While 的「cond 为继续
+            // 条件」同形写法），而 For 的 cond 是退出条件 —— 语义反转导致
+            // `idx < len` 时直接跳出，循环体一次都不执行（`for x in [1,2,3]`
+            // 在 9 层管线下降级为 0 次迭代；emit.rs 路径用 `JumpIf` 是正确的，
+            // 这是两条管线的语义分歧）。
+            // 正确：`cond` 为真（idx >= len）→ 跳到 end；否则落入循环体。
             let cond_reg = ctx.alloc_reg();
             ctx.emit(MirInst::BinaryOp(cond_reg, idx_reg, BinaryOp::GreaterEqual, len_reg));
-            ctx.emit(MirInst::JumpIfNot(cond_reg, 0));
-            let jump_not_idx = ctx.insts.len() - 1;
+            ctx.emit(MirInst::JumpIf(cond_reg, 0));
+            let exit_jump_idx = ctx.insts.len() - 1;
             // let var = iter[__idx]
             let val_reg = ctx.alloc_reg();
             ctx.emit(MirInst::Index(val_reg, *iter, idx_reg));
@@ -241,12 +269,15 @@ fn lower_node(ctx: &mut EmitContext, node: &Fcfg) {
             lower_block(ctx, body);
             let body_end = ctx.insts.len();
             // __idx = __idx + 1
-            let one_reg = ctx.alloc_reg();
-            ctx.emit(MirInst::Const(one_reg, Value::Int(1)));
             ctx.emit(MirInst::BinaryOp(idx_reg, idx_reg, BinaryOp::Add, one_reg));
             ctx.emit(MirInst::Jump(loop_start));
             let end = ctx.insts.len();
-            ctx.patch_label_at(jump_not_idx, end);
+            ctx.patch_label_at(exit_jump_idx, end);
+            // 循环作为表达式的结果 = Nil，写入节点自带的 dst（emit.rs
+            // emit_loop_w 的同一契约）。dst 由 witness_to_fcfg 预分配并被
+            // 外层 Sequence 的 node_result_reg 读到 —— 写在值位置的 for/while
+            //（`let x = for ... end`）消费者才能读到正确寄存器，而不是回退 0。
+            emit_loop_result(ctx, *dst);
             // 后修补：body 内 Break→end_label，Continue→loop_start
             for i in body_start..body_end {
                 match &mut ctx.insts[i] {
@@ -470,10 +501,24 @@ fn lower_node(ctx: &mut EmitContext, node: &Fcfg) {
                 body: Box::new(body_mir),
             });
         }
-        Node::AppDef { name, model, msg, init, update, view, .. } => {
+        Node::AppDef {
+            name,
+            model,
+            msg,
+            init,
+            update_params,
+            update,
+            view_params,
+            view,
+            ..
+        } => {
+            // v0.104: update/view 的体块 + 形参名 —— 形参来自 witness_to_fcfg
+            // 拆开的 Closure 节点（运行期 h_app_def 按位置绑定 MirFunction.params）。
             let init_mir = lower_block_to_function(ctx, init);
-            let update_mir = lower_block_to_function(ctx, update);
-            let view_mir = lower_block_to_function(ctx, view);
+            let mut update_mir = lower_body_function_with_return(ctx, update);
+            update_mir.params = update_params.iter().map(|p| p.name.clone()).collect();
+            let mut view_mir = lower_body_function_with_return(ctx, view);
+            view_mir.params = view_params.iter().map(|p| p.name.clone()).collect();
             ctx.emit(MirInst::AppDef {
                 name: name.clone(),
                 model_name: model.clone(),

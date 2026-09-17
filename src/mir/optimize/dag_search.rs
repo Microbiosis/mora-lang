@@ -140,6 +140,41 @@ pub fn dag_search_staged(
 }
 
 
+/// v0.103: Sequence 边连通分量 —— 每个分量恰是一个基本块。
+///
+/// `dag_analyze` 对每个基本块内的**相邻指令对**无条件连 Sequence 边
+/// （`prev_node` 链），因此块内节点由 Sequence 边连成一条链；而跨块的
+/// 控制转移（Jump/Branch 目标）只连 Control 边，不连 Sequence。
+/// 于是「Sequence 连通分量 ≡ 基本块」这一对应关系成立，可在不引入额外
+/// 块信息的前提下判定两个节点是否同块。
+///
+/// 用途见 [`apply_rewrite`] 的 Sequence 缝合 —— 跨块缝合会破坏该等价关系，
+/// 故缝合前用它把配对限制在同块内。
+fn sequence_components(dag: &MirDag) -> Vec<usize> {
+    let n = dag.nodes.len();
+    let mut parent: Vec<usize> = (0..n).collect();
+
+    fn find(parent: &mut [usize], mut x: usize) -> usize {
+        while parent[x] != x {
+            parent[x] = parent[parent[x]];
+            x = parent[x];
+        }
+        x
+    }
+
+    for e in &dag.edges {
+        if !matches!(e.kind, crate::mir::dag::EdgeKind::Sequence) {
+            continue;
+        }
+        let (ra, rb) = (find(&mut parent, e.from), find(&mut parent, e.to));
+        if ra != rb {
+            parent[ra] = rb;
+        }
+    }
+
+    (0..n).map(|i| find(&mut parent, i)).collect()
+}
+
 /// Apply a `DagRewrite` to the DAG in-place.
 fn apply_rewrite(dag: &mut MirDag, rw: DagRewrite) {
     let old_len = dag.nodes.len();
@@ -196,8 +231,23 @@ fn apply_rewrite(dag: &mut MirDag, rw: DagRewrite) {
         })
         .map(|e| e.to)
         .collect();
+    // v0.103: 缝合必须**块内**进行 —— Sequence 边是「基本块内全序」，
+    // DAG 执行器把它当作激活通道（scan 阶段沿 Sequence 边推入消费者）。
+    // 跨块缝合会让「另一个控制区域的节点」被提前激活并对当前区域产生副作用。
+    //
+    // **缺陷背景（`while ... if ... break ... end` 死循环）**：CSE 把循环体
+    // 内块的 `Const(Int(1))` 合并进内层 if 块的同值 `Const`，缝合就把
+    // 「if 块 → 循环体内块」连成 Sequence 边。于是即便 `break` 分支被选中，
+    // 递增语句仍被该边激活执行，循环回边再次点火 → break 被完全架空、挂死。
+    //
+    // 判据：Sequence 边只在基本块内创建，故「Sequence 连通分量 ≡ 基本块」。
+    // 只连接同一分量的前驱/后继，即恢复构造器的不变量（无需额外块信息）。
+    let comps = sequence_components(dag);
     for &a in &seq_preds {
         for &b in &seq_succs {
+            if comps[a] != comps[b] {
+                continue;
+            }
             dag.edges.push(crate::mir::dag::MirDagEdge {
                 from: a,
                 to: b,
@@ -305,6 +355,7 @@ mod tests {
     use crate::mir::dag;
     use crate::mir::optimize::cost::{InstructionCount, TokenEstimate};
     use crate::mir::optimize::dag_rule::{ConstFoldingDagRule, DeadNodeDagRule};
+    use crate::mir::optimize::dag_optimize;
     use crate::mir::{MirFunction, MirInst};
     use crate::value::Value;
 
@@ -322,6 +373,56 @@ mod tests {
         
             ..Default::default()};
         dag::dag_analyze(&func)
+    }
+
+    /// v0.103: `dag_optimize` 后**不得存在跨基本块的 Sequence 边**。
+    ///
+    /// Sequence 边是 DAG 执行器的控制激活通道（scan 沿它推入消费者），
+    /// 语义是「同一基本块内相邻指令的保序」。一旦跨块，另一个控制区域的
+    /// 节点会被提前激活执行。
+    ///
+    /// 缺陷背景（`while ... if ... break ... end` 死循环）：CSE 合并同值
+    /// `Const` 后把该节点的**出边全部**重定向到合并目标 —— 目标可能在别的
+    /// 基本块，于是「内层 if 块的 Const → 循环体内块的增量」出现，`break`
+    /// 被选中时增量仍被激活，回边再次点火 → 挂死。
+    #[test]
+    fn dag_optimize_keeps_sequence_edges_intra_block() {
+        // 形状：外层常量 + 循环（回边）+ 内层分支（break），
+        // 三个基本块，且相邻块首指令与循环体内的常量同值（触发 CSE 合并）。
+        let mut d = make_dag(vec![
+            // 块 A
+            MirInst::Const(0, Value::Int(0)),
+            MirInst::Const(1, Value::Int(1)),
+            MirInst::JumpIfNot(0, 10),
+            // 块 B（循环体入口）
+            MirInst::Const(2, Value::Int(1)),
+            MirInst::Const(3, Value::Int(1)),
+            MirInst::JumpIf(1, 10),
+            // 块 C（循环体后段）
+            MirInst::Const(4, Value::Int(1)),
+            MirInst::BinaryOp(5, 2, BinaryOp::Add, 4),
+            MirInst::Jump(3),
+            // 块 D（退出）
+            MirInst::Const(6, Value::Nil),
+        ]);
+        let before = sequence_components(&d);
+        dag_optimize(&mut d);
+        let cross: Vec<(usize, usize)> = d
+            .edges
+            .iter()
+            .filter(|e| {
+                matches!(e.kind, crate::mir::dag::EdgeKind::Sequence)
+                    && !d.nodes[e.from].is_removed()
+                    && !d.nodes[e.to].is_removed()
+                    && before[e.from] != before[e.to]
+            })
+            .map(|e| (e.from, e.to))
+            .collect();
+        assert!(
+            cross.is_empty(),
+            "CSE 重定向产生了跨基本块的 Sequence 边 {:?} —— 会提前激活别的控制区域的节点",
+            cross
+        );
     }
 
     // ─── Staged search tests ───────────────────────────────────────

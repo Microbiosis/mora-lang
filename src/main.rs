@@ -386,7 +386,14 @@ fn run_file(path: &str, opt_level: Option<mora::mir::ssa::OptLevel>) {
     let source = fs::read_to_string(path).expect("Failed to read file");
 
     // v0.75.40: 单遍编译（compile 直接 emit MirInst + witness）
-    let (func, witnesses) = mora::cli::compile_and_opt(&source, opt_level);
+    // v0.103: 解析失败以可读错误 + 退出码 2 报告（此前 panic）。
+    let (func, witnesses) = match mora::cli::compile_and_opt(&source, opt_level) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("{}: {}", path, e);
+            process::exit(2);
+        }
+    };
 
     // 类型检查 (HM 推断 + 双向) — v0.75.95: 切到 _bidirectional 启用双向叠加层
     let type_errors = mora::typeck::check_mir::check_program_witnesses_bidirectional(&witnesses);
@@ -426,7 +433,14 @@ fn run_file(path: &str, opt_level: Option<mora::mir::ssa::OptLevel>) {
 fn run_check(path: &str) {
     let source = fs::read_to_string(path).expect("Failed to read file");
 
-    let (_, witnesses) = ParserV3::compile(&source).expect("Failed to compile");
+    // v0.103: 解析失败以可读错误 + 退出码 2 报告（此前 `expect` panic）。
+    let (_, witnesses) = match ParserV3::compile(&source) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("{}: {}", path, e);
+            process::exit(2);
+        }
+    };
 
     let type_errors = mora::typeck::check_mir::check_program_witnesses_bidirectional(&witnesses);
     if type_errors.is_empty() {

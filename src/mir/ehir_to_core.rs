@@ -172,7 +172,7 @@ fn lower_node(ctx: &mut CoreContext, node: &Ehir) {
             }
             ctx.flush_block(CoreTerminator::Jump(end_id));
         }
-        Node::While { cond, body, .. } => {
+        Node::While { cond, body, dst, .. } => {
             let cond_id = ctx.next_block_id;
             let body_id = ctx.next_block_id + 1;
             let end_id = ctx.next_block_id + 2;
@@ -195,13 +195,20 @@ fn lower_node(ctx: &mut CoreContext, node: &Ehir) {
             lower_block(ctx, body);
             ctx.emit(CoreInst::Jump(cond_id));
             ctx.flush_block(CoreTerminator::Jump(cond_id));
+
+            // v0.103: 循环作为表达式的结果 = Nil，写节点自带 dst（emit.rs
+            // emit_while_w / fcfg_lower 的同一契约）。
+            ctx.emit(CoreInst::Const(*dst, Value::Nil));
         }
-        Node::For { var, iter, body, .. } => {
+        Node::For { var, iter, body, dst, .. } => {
             // index-based loop
             let idx_reg = ctx.alloc_reg();
             ctx.emit(CoreInst::Const(idx_reg, Value::Int(0)));
             let len_reg = ctx.alloc_reg();
             ctx.emit(CoreInst::Call(len_reg, *iter, vec![*iter]));
+            // 步长常量与 fcfg_lower/emit.rs 同序（循环标签前发射）。
+            let one = ctx.alloc_reg();
+            ctx.emit(CoreInst::Const(one, Value::Int(1)));
 
             let loop_start = ctx.next_block_id;
             let body_id = ctx.next_block_id + 1;
@@ -228,14 +235,16 @@ fn lower_node(ctx: &mut CoreContext, node: &Ehir) {
             ctx.emit(CoreInst::Index(val_reg, *iter, idx_reg));
             ctx.emit(CoreInst::EnvStore(var.clone(), val_reg));
             lower_block(ctx, body);
-            let one = ctx.alloc_reg();
-            ctx.emit(CoreInst::Const(one, Value::Int(1)));
             ctx.emit(CoreInst::BinaryOp(
                 idx_reg, idx_reg,
                 crate::common::BinaryOp::Add, one,
             ));
             ctx.emit(CoreInst::Jump(loop_start));
             ctx.flush_block(CoreTerminator::Jump(loop_start));
+
+            // v0.103: 循环作为表达式的结果 = Nil，写节点自带 dst（emit.rs
+            // emit_loop_w / fcfg_lower 的同一契约）。
+            ctx.emit(CoreInst::Const(*dst, Value::Nil));
         }
         Node::Match { dst, scrutinee, arms, .. } => {
             // 降维为 EnumMatch（dst 作为统一结果寄存器透传）

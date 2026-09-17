@@ -1,6 +1,9 @@
+-- v0.103: 修正 fixture 语法错误 —— 此前 `while i <= 10i {` 配 `end` 收尾
+--（brace 开、end 闭）不可解析，而该文件不在任何断言测试集中，缺陷长期
+-- 潜伏。统一为 end 形式，并让累加结果成为末表达式以便精确断言。
 let total = 0i
 let i = 1i
-while i <= 10i {
+while i <= 10i
   total = total + i
   i = i + 1i
 end

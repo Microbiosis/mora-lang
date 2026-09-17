@@ -1,3 +1,17 @@
+-- v0.103 回归：for 循环值传递 + 循环体内 let 重绑定累加。
+--
+-- 顶层部分把累加结果留在程序末表达式上，使 e2e 能断言精确值 ——
+-- task main 只 print，而 run_e2e 不捕获 stdout（跨线程 print）。
+--
+-- 覆盖两个已验证的缺陷根因：
+--   1. dag_rule::CseDagRule 把「循环索引 init」与另一条语句的同值常量
+--      合并，再把读该索引的位点全局重命名，但增量仍写原寄存器 →
+--      循环条件恒假 → 死循环（`let total = 0i` 与索引 init 同为 Int(0)，
+--      同值才碰撞）。
+--   2. mir/fcfg_lower.rs 的 Node::For 用 JumpIfNot 配「退出条件」
+--      （idx >= len）→ 语义反转 → 循环体零次执行 → 累加保持 0。
+--
+-- 正确结果：1+2+3+4+5 = 15
 task main()
   let total = 0i
   for x in [1i, 2i, 3i, 4i, 5i]
@@ -5,3 +19,9 @@ task main()
   end
   print(total)
 end
+
+let total = 0i
+for x in [1i, 2i, 3i, 4i, 5i]
+  let total = total + x
+end
+total

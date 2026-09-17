@@ -12,7 +12,8 @@ use std::sync::Arc;
 
 /// 生产路径执行：compile_and_opt → run_mir + run_main_task。
 fn run_production(source: &str) -> Value {
-    let (func, _witnesses) = mora::cli::compile_and_opt(source, None);
+    let (func, _witnesses) =
+        mora::cli::compile_and_opt(source, None).expect("compile_and_opt failed");
     let mut interp = Interpreter::new();
     let mut env = interp.take_env();
     let func_arc = Arc::new(func);
@@ -134,7 +135,7 @@ fn switch_while_break() {
     use mora::mir::vm::{run_main_task, run_mir};
     use std::sync::Arc;
     let source = std::fs::read_to_string("tests/fixtures/e2e/loop_break.mora").unwrap();
-    let (func, _) = compile_and_opt(&source, None);
+    let (func, _) = compile_and_opt(&source, None).expect("compile_and_opt failed");
     let mut interp = Interpreter::new();
     let mut env = interp.take_env();
     let arc = Arc::new(func);
@@ -147,37 +148,50 @@ fn switch_while_break() {
 
 #[test]
 fn switch_while_continue() {
-    // v0.90.4: continue label 修补验证 — while_break 已确认 label 修补生效
-    // continue 在管线路径有值传递问题（total 最后表达式返回 Bool），留后续修复
-    // 这里验证不挂死 + continue 触发（不会死循环）
+    // v0.103: continue 值传递已修复（DAG 的 Sequence 缝合不再跨块 +
+    // Data 边不再充当激活通道）—— 断言精确累加值。
+    // 1+2+4+5 = 12（i==3 时 continue，跳过 3）
     use mora::cli::compile_and_opt;
     use mora::interpreter::Interpreter;
     use mora::mir::vm::{run_main_task, run_mir};
     use std::sync::Arc;
     let source = "let total = 0i\nlet i = 0i\nwhile i < 5i\n  i = i + 1i\n  if i == 3i\n    continue\n  end\n  total = total + i\nend\ntotal";
-    let (func, _) = compile_and_opt(source, None);
+    let (func, _) = compile_and_opt(source, None).expect("compile_and_opt failed");
     let mut interp = Interpreter::new();
     let mut env = interp.take_env();
     let arc = Arc::new(func);
-    let _ = run_mir(&arc, &mut interp, &mut env, &mut mora::mir::effect::Effects::new()).expect("while_continue run_mir failed");
+    let last = run_mir(&arc, &mut interp, &mut env, &mut mora::mir::effect::Effects::new())
+        .expect("while_continue run_mir failed");
     let _ = run_main_task(&arc, &mut interp, &mut env, &mut mora::mir::effect::Effects::new());
-    // 不挂死即通过——label 修补已由 while_break 测试覆盖
+    let got = match last {
+        mora::value::Value::Int(n) => n as f64,
+        mora::value::Value::Float(n) => n,
+        other => panic!("期望数值结果，得到 {:?}", other),
+    };
+    assert_eq!(got, 12.0, "continue 跳过 i==3 后累加应为 12");
 }
 
 #[test]
 fn switch_for_break() {
-    // v0.90.4: for label 修补验证 — 管线 for 循环值传递有独立问题
-    // 这里验证 for 循环不挂死
+    // v0.103: for 循环值传递已修复（CSE 不再重命名环携带寄存器；
+    // fcfg_lower 的 For 退出条件用 JumpIf）—— 断言精确累加值。
+    // 1+2+3+4+5 = 15
     use mora::cli::compile_and_opt;
     use mora::interpreter::Interpreter;
     use mora::mir::vm::{run_main_task, run_mir};
     use std::sync::Arc;
     let source = "let total = 0i\nfor i in [1i, 2i, 3i, 4i, 5i]\n  total = total + i\nend\ntotal";
-    let (func, _) = compile_and_opt(source, None);
+    let (func, _) = compile_and_opt(source, None).expect("compile_and_opt failed");
     let mut interp = Interpreter::new();
     let mut env = interp.take_env();
     let arc = Arc::new(func);
-    let _ = run_mir(&arc, &mut interp, &mut env, &mut mora::mir::effect::Effects::new()).expect("for sum run_mir failed");
+    let last = run_mir(&arc, &mut interp, &mut env, &mut mora::mir::effect::Effects::new())
+        .expect("for sum run_mir failed");
     let _ = run_main_task(&arc, &mut interp, &mut env, &mut mora::mir::effect::Effects::new());
-    // 不挂死即通过——for 循环值传递问题留后续修复
+    let got = match last {
+        mora::value::Value::Int(n) => n as f64,
+        mora::value::Value::Float(n) => n,
+        other => panic!("期望数值结果，得到 {:?}", other),
+    };
+    assert_eq!(got, 15.0, "for 循环 1..5 累加应为 15");
 }

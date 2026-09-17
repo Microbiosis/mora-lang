@@ -10,7 +10,14 @@ pub fn run_record(path: &str, name: &str, opt_level: Option<crate::mir::ssa::Opt
         process::exit(1);
     });
 
-    let (func, witnesses) = compile_and_opt(&source, opt_level);
+    // v0.103: 解析失败以可读错误 + 退出码 2 报告（compile_and_opt 返回 Result）。
+    let (func, witnesses) = match compile_and_opt(&source, opt_level) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("record: {}", e);
+            process::exit(2);
+        }
+    };
 
     let type_errors = crate::typeck::check_mir::check_program_witnesses_bidirectional(&witnesses);
     if !type_errors.is_empty() {
@@ -81,7 +88,14 @@ pub fn run_replay(path: &str, name: &str, opt_level: Option<crate::mir::ssa::Opt
         process::exit(1);
     });
 
-    let (func, witnesses) = compile_and_opt(&source, opt_level);
+    // v0.103: 解析失败以可读错误 + 退出码 2 报告（compile_and_opt 返回 Result）。
+    let (func, witnesses) = match compile_and_opt(&source, opt_level) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("replay: {}", e);
+            process::exit(2);
+        }
+    };
 
     let type_errors = crate::typeck::check_mir::check_program_witnesses_bidirectional(&witnesses);
     if !type_errors.is_empty() {
@@ -297,7 +311,14 @@ pub fn run_snapshot(
         eprintln!("snapshot: failed to read {}", file);
         process::exit(1);
     });
-    let (func, witnesses) = compile_and_opt(&source, opt_level);
+    // v0.103: 解析失败以可读错误 + 退出码 2 报告（compile_and_opt 返回 Result）。
+    let (func, witnesses) = match compile_and_opt(&source, opt_level) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("snapshot: {}", e);
+            process::exit(2);
+        }
+    };
     let type_errors = crate::typeck::check_mir::check_program_witnesses_bidirectional(&witnesses);
     if !type_errors.is_empty() {
         for err in &type_errors {

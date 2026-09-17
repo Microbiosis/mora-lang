@@ -360,8 +360,26 @@ pub fn dag_analyze(func: &MirFunction) -> MirDag {
                     }
                 }
             }
+            // v0.103: Break/Continue 目标解析 = Label 优先，裸 pc 兜底 ——
+            // 与上方 Jump/JumpIf 同一契约（v0.75.33 给 Jump 补了 pc 兜底，
+            // 但 Break/Continue 漏了同一处）。
+            //
+            // **缺陷背景**：`fcfg_lower` 与 `emit_loop_w` 都不发 `MirInst::Label`，
+            // 它们把 break/continue 的 label 后修补成**指令下标**（`end` /
+            // `loop_start` 的 `ctx.insts.len()`）。因此 `label_to_node` 里没有
+            // 这些键 → 只查 label_to_node 时 Break 节点拿不到任何出边 →
+            // DAG 执行器无从激活退出目标。而 DAG 执行器对 Effect 节点返回的
+            // `Flow::Jump(_)` 是 no-op（控制转移完全由边决定，见 run_dag 内的
+            // 分支注释）→ `break` 被静默忽略 → 循环永不退出（挂死）。
+            //
+            // 实例：`while t < 2i / if t == 1i / break / end / ... end`
+            // 顶层（非 task）挂死；这正是 DAG 边解析缺失而非运行时跳转问题。
             MirInst::Break(target) | MirInst::Continue(target) => {
-                if let Some(&target_id) = label_to_node.get(target) {
+                let target_id = label_to_node
+                    .get(target)
+                    .or_else(|| pc_to_node.get(target))
+                    .copied();
+                if let Some(target_id) = target_id {
                     edges.push(MirDagEdge {
                         from: *node_id,
                         to: target_id,

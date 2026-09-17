@@ -338,8 +338,25 @@ impl HMInference {
                         span: Some(span),
                     }]);
                 }
-                self.constraints
-                    .push(Constraint::Eq(Box::new(left_ty), Box::new(right_ty)));
+                // v0.103: **数值对走 Numeric 约束，而非严格 Eq**。
+                // `compatible_with` 自 v0.90.5 起明确承认 Int/Float 互相兼容
+                // （其注释即以 `42 == 3.14` 为例），但此处紧接着要求
+                // Eq(Int, Float) —— `unify` 没有 Int/Float 交叉 arm，于是
+                // `4i == 4.0` 被判类型错误：类型系统自相矛盾。Numeric 约束
+                // 会把两操作数绑到提升类型（Float），与 `compatible_with`
+                // 的规则一致。
+                if is_numeric(&left_ty) && is_numeric(&right_ty) {
+                    self.constraints.push(Constraint::Numeric(
+                        super::unify::BinaryConstraint {
+                            left: Box::new(left_ty),
+                            right: Box::new(right_ty),
+                            result: None,
+                        },
+                    ));
+                } else {
+                    self.constraints
+                        .push(Constraint::Eq(Box::new(left_ty), Box::new(right_ty)));
+                }
                 Ok((Type::Bool, merged_row))
             }
             Greater | Less | GreaterEqual | LessEqual => {
@@ -350,8 +367,21 @@ impl HMInference {
                         span: Some(span),
                     }]);
                 }
-                self.constraints
-                    .push(Constraint::Eq(Box::new(left_ty), Box::new(right_ty)));
+                // v0.103: 同 Equal —— 数值比较经 Numeric 约束（Int/Float 提升），
+                // 非数值（如字符串）走 Eq。此前严格 Eq 使 `4i < 4.0` 被拒，
+                // 与 `compatible_with` 的 numeric 规则矛盾。
+                if is_numeric(&left_ty) && is_numeric(&right_ty) {
+                    self.constraints.push(Constraint::Numeric(
+                        super::unify::BinaryConstraint {
+                            left: Box::new(left_ty),
+                            right: Box::new(right_ty),
+                            result: None,
+                        },
+                    ));
+                } else {
+                    self.constraints
+                        .push(Constraint::Eq(Box::new(left_ty), Box::new(right_ty)));
+                }
                 Ok((Type::Bool, merged_row))
             } // v0.55: Or/And are WitnessKind variants (short-circuit),
               // handled directly in infer_expr, not BinaryOp variants.
@@ -535,6 +565,41 @@ impl HMInference {
             }]);
         }
 
+        // v0.103: **变参 builtin** —— 签名表声明 variadic 时（`print`），
+        // 逐实参按声明的参数类型校验，返回声明的结果类型。
+        //
+        // 缺陷：签名表此前无法表达「可重复末参」，`builtin_callee_ty` 于是按
+        // `params.len()` 生成固定 arity 的 curried arrow —— 下面的 curried 循环
+        // 每个实参消耗一层 Arrow，多余实参无处消耗，`print("a", b)` 报
+        // "expected nil, got fn(string) -> …"。运行期 `call_builtin_print`
+        // 本就 join 全部实参，类型系统却在拒绝。
+        //
+        // 判据来自**签名表**（`Signature::variadic`）而非名字硬编码 ——
+        // arity 契约的唯一事实源就是该表。
+        if let WitnessCallee::Name(n) | WitnessCallee::Var(n) = callee
+            && let Some(sig) = crate::typeck::dispatch::lookup_builtin(n)
+            && sig.variadic
+        {
+            let param_ty = sig
+                .params
+                .last()
+                .map(|(_, t)| t.clone())
+                .unwrap_or(Type::Any);
+            for arg in args {
+                let (arg_ty, arg_row) = self.infer_expr(arg)?;
+                acc_row = self.merge_rows(acc_row, arg_row);
+                // 每个实参只需满足末位参数类型（可重复）。
+                if !arg_ty.compatible_with(&param_ty) && !param_ty.compatible_with(&arg_ty) {
+                    return Err(vec![TypeError::UnificationFailure {
+                        expected: param_ty.name().to_string(),
+                        got: arg_ty.name().to_string(),
+                        span: Some(span),
+                    }]);
+                }
+            }
+            return Ok((sig.return_type.clone(), acc_row));
+        }
+
         // v0.80: curried Arrow 消解 — 每个参数消耗一层 Arrow。
         for arg in args {
             let (arg_ty, arg_row) = self.infer_expr(arg)?;
@@ -662,11 +727,58 @@ impl HMInference {
             }
         }
 
+        // v0.103: Dict 字段访问 —— `d.count`（无实参的 `.name`）在运行期由
+        // method_dispatch 的 Dict 兜底分支解析为「取该键的值」，但 typeck 的
+        // 签名表只登记了 get/set/keys/values/len，此形态落到
+        // `method_return_type_fallback` → `Type::Unknown`，而 Unknown 是
+        // fail-fast 标签 → 类型检查失败的代码在运行期本可正常工作。
+        // 规则：无实参的 Dict 字段访问返回**值类型参数** `v`（与运行期
+        // 「非 callable 值直接返回」一致；调用形态另由签名/实参表处理）。
+        // TeaModel 字段同理由 `model.count` 触发，各字段类型不同 —— 返回其
+        // 字段表中该字段的类型。
+        if arg_types.is_empty()
+            && let Some(field_ty) = self.dict_field_type(&recv_ty, method)
+        {
+            return Ok((field_ty, acc_row));
+        }
+
         let return_ty = crate::typeck::dispatch::method_return_type(&recv_ty, method);
+        // v0.103: `Unknown` 是 fail-fast 逃逸标签（v0.75.92：与任何类型合一
+        // 都失败），且 v0.75.91 明确「Unknown 不算已知签名」。方法结果无法
+        // 判定时应交给**待推断变量**，而不是让 Unknown 流进下游约束
+        // —— 否则类型检查期报错、运行期却正常的代码会被误杀。
+        //
+        // 实例：`task t(model) model.count + 1i end` —— `model` 无注解
+        // （TypeVar），字段访问无签名 → 兜底 Unknown → `Unknown + Int` 触发
+        // Eq(Unknown, Int) → 报 "expected Int, got TypeVar"。这与 v0.96 给
+        // infer_call 未知被调者改用 fresh TypeVar 是同一处修正
+        //（见本文件 infer_call 的注释）。
+        let return_ty = if matches!(return_ty, Type::Unknown) {
+            self.fresh_type_var()
+        } else {
+            return_ty
+        };
         // v0.75.86: 不报错路径，保留 _span 备未来错误检查扩展点
         let _span = span;
         let _ = _span;
         Ok((return_ty, acc_row))
+    }
+
+    /// v0.103: `receiver.field`（无实参字段访问）的静态类型。
+    ///
+    /// - `Dict<K, V>` → `V`（运行期返回该键对应的值）
+    /// - `TeaModel { fields }` → 该字段在 `fields` 中的声明类型
+    ///
+    /// 未知字段返回 `None`（交回常规路径，由签名表/fail-fast 处理）。
+    fn dict_field_type(&self, recv_ty: &Type, field: &str) -> Option<Type> {
+        match recv_ty {
+            Type::Dict(_, v) => Some(v.as_ref().clone()),
+            Type::TeaModel { fields, .. } => fields
+                .iter()
+                .find(|(n, _)| n == field)
+                .map(|(_, t)| t.as_ref().clone()),
+            _ => None,
+        }
     }
 
     /// v0.99: `random.<method>(...)` 的 ambient effect 分型。

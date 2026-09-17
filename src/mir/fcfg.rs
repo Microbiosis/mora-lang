@@ -138,6 +138,10 @@ pub enum Node<M> {
     While {
         cond: Block<M>,
         body: Block<M>,
+        /// 循环作为表达式的结果寄存器（Nil）—— 与 emit.rs 的循环 emit
+        /// 契约一致（循环在指令流末尾留一个 Const(Nil) 供值位置消费者
+        /// 读取）。缺此字段时下层只能回退到寄存器 0。
+        dst: Reg,
         span: Span,
         meta: M,
     },
@@ -145,6 +149,8 @@ pub enum Node<M> {
         var: String,
         iter: Reg,
         body: Block<M>,
+        /// 循环作为表达式的结果寄存器（Nil）—— 同 `While::dst`。
+        dst: Reg,
         span: Span,
         meta: M,
     },
@@ -294,7 +300,12 @@ pub enum Node<M> {
         model: String,
         msg: String,
         init: Block<M>,
+        /// v0.104: update/view 的**形参名**（来自 `WitnessKind::Closure`）。
+        /// 运行期 `h_app_def` 按位置绑定 `MirFunction.params` —— 缺此字段时
+        /// 只能硬编码 `["model","msg"]`，用户声明别的形参名就取不到值。
+        update_params: Vec<Param>,
         update: Block<M>,
+        view_params: Vec<Param>,
         view: Block<M>,
         span: Span,
         meta: M,

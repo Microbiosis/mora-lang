@@ -1818,14 +1818,17 @@ mod tests {
     /// Parallel EXEC with a failing agent returns Err (not hang).
     #[test]
     fn parallel_agent_error_propagates() {
-        // Agent "a" task_body errors: Int + Float is a strict-mode type
-        // error in eval_binary → run_mir returns Err.
+        // Agent "a" task_body errors: 越界索引 → run_mir 返回 Err。
+        // v0.103: 此前用 `Int + Float`（v0.38 的 Rust-strict 类型错误）当错误
+        // 载体；numeric tower 统一后该运算合法地提升为 Float(3.5)，故改用
+        // 真正会失败的运行期错误（索引越界），测试意图（并行 agent 错误必须
+        // 向上传播而非挂死）不变。
         let failing_body = MirFunction {
             params: Vec::new(),
             body: vec![
-                MirInst::Const(0, Value::Int(1)),
-                MirInst::Const(1, Value::Float(2.5)),
-                MirInst::BinaryOp(2, 0, crate::common::BinaryOp::Add, 1),
+                MirInst::Const(0, Value::List(vec![Value::Int(1)])),
+                MirInst::Const(1, Value::Int(99)),
+                MirInst::Index(2, 0, 1),
                 MirInst::Return(Some(2)),
             ],
             n_regs: 3,

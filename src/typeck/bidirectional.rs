@@ -171,8 +171,38 @@ impl<'a> BidirectionalChecker<'a> {
                     }
                 }
             }
+            // v0.104: 形参登记进 HM 环境后再递归 body —— 与 LetBinding 同一
+            // 理由：预扫的 `synth`/`check_against` 直接调 `hm.infer_expr`，
+            // 不经过 `infer_closure_core`。缺此前向登记时，形参在块体内被
+            // 引用（`task f(x) match .. { 1i => x + 1i } end`）会在预扫报
+            // `Unbound variable 'x'`。推断后整块还原（不泄漏给兄弟节点）。
+            let saved_env = self.hm.env.clone();
+            for p in params {
+                let ty = p
+                    .type_hint
+                    .as_ref()
+                    .map(|h| h.to_type().clone())
+                    .unwrap_or_else(|| self.hm.fresh_type_var());
+                self.hm.env.add(p.name.clone(), ty);
+            }
             // 递归 body（保守 synth）
             self.pre_check_witness(body);
+            self.hm.env = saved_env;
+            return;
+        }
+        // === Phase A'：FnDef 形参同样登记（与 Closure 同构）===
+        if let WitnessKind::FnDef { params, body, .. } = &w.kind {
+            let saved_env = self.hm.env.clone();
+            for p in params {
+                let ty = p
+                    .type_hint
+                    .as_ref()
+                    .map(|h| h.to_type().clone())
+                    .unwrap_or_else(|| self.hm.fresh_type_var());
+                self.hm.env.add(p.name.clone(), ty);
+            }
+            self.pre_check_witness(body);
+            self.hm.env = saved_env;
             return;
         }
         // === Phase B：Call 实参双向 check against callee.sig.params[i] ===
@@ -296,7 +326,10 @@ impl<'a> BidirectionalChecker<'a> {
         }
         // === Phase C：LetBinding type_hint check against value inferred type ===
         if let WitnessKind::LetBinding {
-            type_hint, value, ..
+            name,
+            type_hint,
+            value,
+            init_body,
         } = &w.kind
         {
             if let Some(hint) = type_hint
@@ -306,8 +339,21 @@ impl<'a> BidirectionalChecker<'a> {
             }
             // 递归 value + init_body
             self.pre_check_witness(value);
-            if let WitnessKind::LetBinding { init_body, .. } = &w.kind {
-                self.pre_check_witness(init_body);
+            self.pre_check_witness(init_body);
+            // v0.104: 把绑定登记进 HM 环境 —— 本预扫在 `infer_program` **之前**
+            // 独立遍历 witness 树，且 Phase A/B/C 的 `check_against`/`synth`
+            // 直接调 `hm.infer_expr`（不经过 `infer_let`）。缺此前向登记时，
+            // 任何「先 `let`、后出现在块内」的引用都会在此报
+            // `type inference failed: Unbound variable '<name>'`：
+            //   let mm = 5i
+            //   if true { print(mm) }   -- mm 在该 if 的 then 分支里被拒
+            // 主推断路径（infer_let → env.add）本身正确，是**预扫**漏了登记。
+            if self.hm.env.get(name).is_none() {
+                let (ty, _row) = self
+                    .hm
+                    .infer_expr(value)
+                    .unwrap_or((crate::typeck::Type::Unknown, Default::default()));
+                self.hm.env.add(name.clone(), ty);
             }
             return;
         }

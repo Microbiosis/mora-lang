@@ -156,7 +156,7 @@ impl ParserV3 {
             let (r, w) = self.emit_expr_w()?;
             (Some(r), w)
         };
-        self.emit.emit(MirInst::Return(body_reg));
+        self.emit.emit_tail_return(body_reg);
         let body_mir = std::mem::replace(&mut self.emit, parent).finish();
         self.emit.emit(MirInst::TaskDef {
             name: name.clone(),
@@ -402,6 +402,100 @@ impl ParserV3 {
         })
     }
 
+    /// v0.103: `update(params) ... end` —— TEA 更新函数独立声明
+    /// （spec §9.6 工作示例）。
+    ///
+    /// ```mora
+    /// update(msg, model)
+    ///   match msg
+    ///     | Increment => {count: model.count + 1}
+    ///   end
+    /// end
+    /// ```
+    ///
+    /// 与 `model`/`msg` 同属「IR 齐备、parser 缺失」缺陷：`WitnessKind::
+    /// UpdateDef`、`MirInst::UpdateDef`、`Node::UpdateDef`、`h_update_def`
+    /// 及 SSA/FCFG/typeck/LSP 的全部穷举点自 v0.83 起就位，唯独没有 parser
+    /// 产出点 —— 声明形式完全不可用。
+    ///
+    /// 注册名固定为 `update`：spec §9.6 形式不带名字，且 `app` 块以
+    /// `update: update` 按名引用同一函数。体沿用 task 的「子寄存器空间 +
+    /// 尾部隐式 return」契约。
+    pub(super) fn emit_update_def_w(&mut self) -> Option<MirWitness> {
+        let span = self.span_of_current();
+        self.advance(); // 'update'
+        self.consume(TokenType::LParen, "Expected '(' after 'update'")?;
+        let mut params = Vec::new();
+        while !self.check(&TokenType::RParen) && !self.is_at_end() {
+            if let Some(p) = self.consume_identifier("Expected parameter name") {
+                params.push(p);
+            }
+            if !self.match_token(&[TokenType::Comma]) {
+                break;
+            }
+        }
+        self.consume(TokenType::RParen, "Expected ')' after update parameters")?;
+        let return_type = if self.match_token_exact(TokenType::Colon) {
+            self.parse_type_annotation()
+                .map(crate::mir::hint::TypeHint::from_type)
+        } else {
+            None
+        };
+
+        // 子上下文：update 体是独立寄存器空间（镜像 emit_fn_def_w）。
+        let parent = std::mem::replace(&mut self.emit, crate::mir::lower::EmitContext::new());
+        let (body_reg, body_w) = if self.match_token_exact(TokenType::Newline) {
+            let mut stmt_wits = Vec::new();
+            let mut last: Option<Reg> = None;
+            while self.match_token(&[TokenType::Newline]) {}
+            while !self.check(&TokenType::End) && !self.is_at_end() {
+                let (r, w) = self.emit_statement_expr_w()?;
+                last = Some(r);
+                stmt_wits.push(w);
+                while self.match_token(&[TokenType::Newline]) {}
+            }
+            self.consume(TokenType::End, "Expected 'end' after update body")?;
+            (last, Self::block_witness(stmt_wits, span))
+        } else if self.check(&TokenType::End) {
+            // 空体：`update(msg, model) end`
+            let nil_reg = self.emit.alloc_reg();
+            self.emit
+                .emit(MirInst::Const(nil_reg, crate::value::Value::Nil));
+            (Some(nil_reg), MirWitness {
+                kind: WitnessKind::Literal(Literal::Nil(span)),
+                span,
+            })
+        } else {
+            let (r, w) = self.emit_expr_w()?;
+            (Some(r), w)
+        };
+        self.emit.emit_tail_return(body_reg);
+        let body_mir = std::mem::replace(&mut self.emit, parent).finish();
+
+        self.emit.emit(MirInst::UpdateDef {
+            name: UPDATE_NAME.to_string(),
+            params: params.clone(),
+            body: Box::new(body_mir),
+        });
+        let w_params = params
+            .iter()
+            .map(|p| WitnessParam {
+                name: p.clone(),
+                type_hint: None,
+                default: None,
+            })
+            .collect();
+        Some(MirWitness {
+            kind: WitnessKind::UpdateDef {
+                name: UPDATE_NAME.to_string(),
+                params: w_params,
+                return_type,
+                body: Box::new(body_w),
+            },
+            span,
+        })
+    }
+
     pub(super) fn emit_enum_def_w(&mut self) -> Option<MirWitness> {
         let span = self.span_of_current();
         self.advance(); // 'enum'
@@ -544,14 +638,20 @@ impl ParserV3 {
                             }
                         })).1));
                     }
+                    // v0.103: 两种形态 ——
+                    //   `update: fn(...) => ... end`  内联闭包体（原路径）
+                    //   `update: <name>`              **名字引用**（spec §9.6）
+                    // 后者此前被 emit_closure_pair 当作「无参数闭包体」解析，
+                    // 把后续字段行吞进体内（`view:` 那行因此报
+                    // "Expected field name"）。名字引用改为合成一层转发闭包。
                     "update" => {
-                        if let Some((m, w)) = self.emit_closure_pair() {
+                        if let Some((m, w)) = self.emit_app_field_ref_or_closure(&["model", "msg"]) {
                             update_mir = Some(m);
                             update_witness = Some(Box::new(w));
                         }
                     }
                     "view" => {
-                        if let Some((m, w)) = self.emit_closure_pair() {
+                        if let Some((m, w)) = self.emit_app_field_ref_or_closure(&["model"]) {
                             view_mir = Some(m);
                             view_witness = Some(Box::new(w));
                         }
@@ -646,6 +746,78 @@ impl ParserV3 {
     /// 丢弃 witness（`_body_w`），导致 `app` 定义只能把 update/view 的 witness
     /// 伪造为零参、body 为 Nil 的闭包占位。后果是 typeck 看不到用户写的
     /// update/view 体：其形参不参与推断、体内错误不被诊断、效果行不传播。
+    ///
+    /// v0.103: `app` 块的 `update:` / `view:` 字段值 —— 支持两种形态：
+    ///
+    /// 1. **内联闭包**：`update: fn(m, msg) => ... end` → 直接走
+    ///    [`Self::emit_closure_pair`]。
+    /// 2. **名字引用**（spec §9.6 工作示例）：`update: update` → 合成一层
+    ///    转发闭包，形参按 TEA 契约固定（`params`），体调用被引用的名字。
+    ///
+    /// 形态判定：`:` 之后是 `fn` 关键字 → 内联；否则若为裸标识符 →
+    /// 名字引用。此前两者都走 `emit_closure_pair`（它把缺 `(` 的值当作零参
+    /// 闭包体继续解析），于是 `update: update` 会把紧随其后的 `view:` 整行
+    /// 吞进 update 体内 → "Expected field name"。
+    pub(super) fn emit_app_field_ref_or_closure(
+        &mut self,
+        params: &[&str],
+    ) -> Option<(MirFunction, MirWitness)> {
+        if self.check(&TokenType::Fn) {
+            return self.emit_closure_pair();
+        }
+        // 名字引用：`update: <ident>`
+        let span = self.span_of_current();
+        let name = self.consume_identifier("Expected `fn` or a referenced name")?;
+
+        let parent = std::mem::replace(&mut self.emit, crate::mir::lower::EmitContext::new());
+        // v0.104: 转发闭包的形参由**闭包调用约定**绑定进子环境（`call_value`
+        // 按位置把实参 define 成 `params[i]` 这些名字），MIR 里没有对应指令。
+        // 因此必须先 `Var(name, 形参名)` 把值从环境读进寄存器，再作为实参
+        // 传给被引用的函数 —— 直接传未定义的寄存器会让实参恒为 Nil。
+        let mut param_regs: Vec<Reg> = Vec::new();
+        for p in params {
+            let r = self.emit.alloc_reg();
+            self.emit.emit(MirInst::Var(r, (*p).to_string()));
+            param_regs.push(r);
+        }
+        let dst = self.emit.alloc_reg();
+        self.emit.emit(MirInst::Call(dst, name.clone(), param_regs.clone()));
+        self.emit.emit_tail_return(Some(dst));
+        let mut body_mir = std::mem::replace(&mut self.emit, parent).finish();
+        // v0.104: 转发闭包的形参名必须落到 MirFunction.params —— 运行期
+        // `h_app_def` 按位置把 model/msg 绑定到这些名字。缺此赋值时被引用
+        // 的 update 体内形参全部 unbound（读 Nil）。
+        body_mir.params = params.iter().map(|p| (*p).to_string()).collect();
+
+        let w = MirWitness {
+            kind: WitnessKind::Closure {
+                params: params
+                    .iter()
+                    .map(|p| WitnessParam {
+                        name: (*p).to_string(),
+                        type_hint: None,
+                        default: None,
+                    })
+                    .collect(),
+                body: Box::new(MirWitness {
+                    kind: WitnessKind::Call {
+                        callee: crate::mir::witness::WitnessCallee::Name(name),
+                        args: params
+                            .iter()
+                            .map(|p| MirWitness {
+                                kind: WitnessKind::Variable((*p).to_string()),
+                                span,
+                            })
+                            .collect(),
+                    },
+                    span,
+                }),
+            },
+            span,
+        };
+        Some((body_mir, w))
+    }
+
     pub(super) fn emit_closure_pair(&mut self) -> Option<(MirFunction, MirWitness)> {
         let span = self.span_of_current();
         // 消耗可选的 fn 关键字
@@ -678,8 +850,14 @@ impl ParserV3 {
             self.emit_block_w()?
         };
 
-        self.emit.emit(MirInst::Return(Some(body_reg)));
-        let body_mir = std::mem::replace(&mut self.emit, parent).finish();
+        self.emit.emit_tail_return(Some(body_reg));
+        let mut body_mir = std::mem::replace(&mut self.emit, parent).finish();
+        // v0.104: 闭包形参名必须落到 MirFunction.params —— 运行期
+        // `Value::Closure` 的 call_value 按**位置**绑定 params 里的名字进
+        // 子环境。此前不赋值 → 体内引用形参全部 unbound（读 Nil）。
+        // `app` 的 update/view 由 h_app_def 包成 Closure 后直接暴露此缺陷
+        // （`update: fn(m, msg) => m` 的 m 读不到模型，tea.model 返回 nil）。
+        body_mir.params = params.clone();
         let wit = MirWitness {
             kind: WitnessKind::Closure {
                 params: params

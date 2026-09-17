@@ -26,6 +26,14 @@ pub struct Signature {
     pub return_type: Type,
     /// v0.10 raw return hint.
     pub raw_return_type: Option<String>,
+    /// v0.103: **变参** —— `params` 描述「至少这么多」，可续传同类型实参。
+    ///
+    /// `print` 是典型：运行期 `call_builtin_print` 把**全部**实参
+    /// `join("\t")` 后输出，而签名只声明 1 个参数 → `builtin_callee_ty`
+    /// 生成固定 arity 的 curried arrow → `print("a", b)` 在类型检查期报
+    /// "expected nil, got fn(string) -> …"（多余实参无法消耗 Arrow 层）。
+    /// 运行期支持、类型系统拒绝 = 契约分叉。
+    pub variadic: bool,
 }
 
 impl Signature {
@@ -37,7 +45,15 @@ impl Signature {
             raw_params,
             return_type,
             raw_return_type: None,
+            variadic: false,
         }
+    }
+
+    /// v0.103: 变参签名 —— 末位参数类型可重复（`print(...)`）。
+    pub fn variadic(params: Vec<(String, Type)>, return_type: Type) -> Self {
+        let mut sig = Self::new(params, return_type);
+        sig.variadic = true;
+        sig
     }
 }
 
@@ -96,6 +112,11 @@ pub fn builtin_signatures() -> Vec<(String, Signature)> {
             ),
         ),
         // v0.13: print(x) accepts any printable primitive and returns nil.
+        // v0.103: 变参 —— 运行期 call_builtin_print 输出**全部**实参
+        //（join("\t")），签名此前只声明 1 个 → `print("a", b)` 被类型检查拒绝。
+        // v0.103: 补 BigInt + Int —— v0.91 引入 BigInt 变体时漏加，且 Int
+        // 也不在名单里（仅靠 Int<:Float 子类型侥幸通过），
+        // `print(999n)` 报 "expected string|float|…, got bigint"。
         (
             "print".to_string(),
             Signature {
@@ -103,7 +124,9 @@ pub fn builtin_signatures() -> Vec<(String, Signature)> {
                     "x".to_string(),
                     Type::Union(vec![
                         Type::String,
+                        Type::Int,
                         Type::Float,
+                        Type::BigInt,
                         Type::Bool,
                         Type::Char,
                         Type::Nil,
@@ -114,6 +137,7 @@ pub fn builtin_signatures() -> Vec<(String, Signature)> {
                 raw_params: vec![None],
                 return_type: Type::Nil,
                 raw_return_type: None,
+                variadic: true,
             },
         ),
         // range(start, end, step) -> list<int>

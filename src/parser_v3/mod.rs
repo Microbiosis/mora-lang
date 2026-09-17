@@ -16,6 +16,12 @@ mod syntax; // v0.92 P1.4: pattern/orchestrate/type-annotation parsers (from par
 mod tokens; // v0.92 P1.4: token-stream navigation primitives (from parse.rs)
 mod rel; // v0.102: 声明式范式（rel/solve）语法 emit
 
+/// v0.103: TEA 独立 `update(params) ... end` 声明的注册名。
+///
+/// spec §9.6 的声明形式不带名字，同节的 `app` 块以 `update: update` 按名
+/// 引用它 —— 两处绑定到同一常量，避免字符串字面量漂移。
+pub(crate) const UPDATE_NAME: &str = "update";
+
 ///  ParserV3 - Clean-room MIR parser with no AST legacy baggage
 pub struct ParserV3 {
     tokens: Vec<Token>,

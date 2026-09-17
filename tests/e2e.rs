@@ -25,6 +25,82 @@ fn e2e_arithmetic_runs() {
     assert_ok("arithmetic.mora");
 }
 
+/// v0.104: 顶层 `let` 绑定在后续**块**（if / match）内必须可见。
+///
+/// 缺陷：双向预扫（`BidirectionalChecker::pre_check_program`）在
+/// `infer_program` **之前**独立遍历 witness 树，其 Phase A/B/C 的
+/// `check_against`/`synth` 直接调 `hm.infer_expr` —— 不经过 `infer_let`。
+/// 预扫从不把 `LetBinding` 登记进 HM 环境，于是任何「先 let、后出现在块体」
+/// 的引用都在预扫阶段报 `type inference failed: Unbound variable '<name>'`
+/// （主推断路径本身正确，是预扫漏了登记）。
+#[test]
+fn e2e_let_visible_inside_later_blocks() {
+    use e2e_helpers::assert_source_ok;
+    use mora::value::Value;
+    // let 在 if 块内可见
+    let v = assert_source_ok("let mm = 5i\nif true { mm + 1i } else { 0i }");
+    assert!(
+        matches!(v, Value::Int(6) | Value::Float(_)),
+        "if 块内应能读到外层 let，得到 {:?}",
+        v
+    );
+    // let 在 match arm 内可见
+    let v = assert_source_ok("let mm = 7i\nmatch 1i { 1i => mm, _ => 0i }");
+    assert!(
+        matches!(v, Value::Int(7) | Value::Float(_)),
+        "match arm 内应能读到外层 let，得到 {:?}",
+        v
+    );
+    // 函数形参在 match arm 内可见
+    let v = assert_source_ok("task f(x)\n  match 1i { 1i => x + 1i, _ => 0i }\nend\nf(41i)");
+    assert!(
+        matches!(v, Value::Int(42) | Value::Float(_)),
+        "match arm 内应能读到函数形参，得到 {:?}",
+        v
+    );
+}
+
+/// v0.103: 数值塔（Int ⊂ Float）—— 混合运算提升为 Float，
+/// 混合比较与相等按提升后数值判定。
+///
+/// 缺陷：typeck 的 Numeric 约束（v0.90.5）与 `compatible_with` 都承认
+/// Int/Float 互通（后者的注释即以 `42 == 3.14` 为例），但运行期
+/// `numeric_op`/`numeric_cmp`/`values_equal` 报 Rust-strict 错误、
+/// 相等判否 —— 类型检查通过的代码在运行期失败。
+#[test]
+fn e2e_numeric_tower_promotes_mixed_int_float() {
+    use e2e_helpers::assert_source_ok;
+    use mora::value::Value;
+    // 混合算术：1i + 2.5 = 3.5（Float）
+    let v = assert_source_ok("1i + 2.5");
+    assert!(
+        matches!(v, Value::Float(f) if (f - 3.5).abs() < 1e-9),
+        "1i + 2.5 应提升为 Float(3.5)，得到 {:?}",
+        v
+    );
+    // 混合比较：4i <= 4.0 → true
+    let v = assert_source_ok("4i <= 4.0");
+    assert!(
+        matches!(v, Value::Bool(true)),
+        "4i <= 4.0 应为 true（Int ⊂ Float），得到 {:?}",
+        v
+    );
+    // 混合相等：4i == 4.0 → true（与 <= 一致；此前判否自相矛盾）
+    let v = assert_source_ok("4i == 4.0");
+    assert!(
+        matches!(v, Value::Bool(true)),
+        "4i == 4.0 应为 true，得到 {:?}",
+        v
+    );
+    // 反向：真不等仍为 false
+    let v = assert_source_ok("4i == 5.0");
+    assert!(
+        matches!(v, Value::Bool(false)),
+        "4i == 5.0 应为 false，得到 {:?}",
+        v
+    );
+}
+
 /// string_concat.mora：字符串拼接 + print。
 #[test]
 fn e2e_string_concat_runs() {
@@ -47,10 +123,24 @@ fn e2e_nested_if_runs() {
     assert_ok("nested_if.mora");
 }
 
-/// for_loop.mora：for-in 累加 + print。
+/// for_loop.mora：for-in 累加 + 循环体内 `let` 重绑定。
+///
+/// v0.103: 从 `assert_ok` 冒烟断言升级为**精确值断言** —— 此前该缺陷
+/// 同时表现为「累加结果为 0」（循环体零次执行）与「死循环」，冒烟断言
+/// 对前者完全无感。fixture 末表达式即累加和，故可断言精确值 15。
 #[test]
 fn e2e_for_loop_runs() {
-    assert_ok("for_loop.mora");
+    use mora::value::Value;
+    let (last_expr, _) = assert_ok("for_loop.mora");
+    let got = match last_expr {
+        Value::Int(n) => n as f64,
+        Value::Float(n) => n,
+        other => panic!("期望数值结果，得到 {:?}", other),
+    };
+    assert_eq!(
+        got, 15.0,
+        "1+2+3+4+5 必须累加为 15（循环体不得零次执行，也不得漏算）"
+    );
 }
 
 /// match_default.mora：match 默认分支 + print。
@@ -170,6 +260,29 @@ fn e2e_parse_error_is_reported() {
     );
 }
 
+/// v0.103: `cli::compile_and_opt` 遇到语法错误必须返回 `Err`，而非 panic。
+///
+/// 缺陷：该函数用 `unwrap_or_else(|e| panic!("compile_and_opt failed: {e}"))`
+/// 包住解析失败，于是 `mora <file>` / `mora --check <file>` / record /
+/// replay / snapshot 五条入口都把一个用户语法错误呈现为编译器内部崩溃
+///（Rust panic + 回溯），与 typecheck 错误路径的 `process::exit(2)` 不一致。
+///
+/// 这里直接断言根因处的契约（返回 Err）——各调用点随即把它转成
+/// `eprintln!` + 退出码 2（见 src/main.rs / src/cli/record.rs）。
+#[test]
+fn e2e_compile_and_opt_returns_err_on_parse_error() {
+    let res = mora::cli::compile_and_opt("let x = (1i +\n", None);
+    assert!(
+        res.is_err(),
+        "语法错误必须以 Err 返回（此前 panic），实际 Ok"
+    );
+    let msg = res.expect_err("asserted is_err above");
+    assert!(
+        !msg.is_empty(),
+        "解析错误消息不得为空（需可读定位）"
+    );
+}
+
 // ===================================================================
 // 6. 字节级 fixture 完整性（防 fixtures 漂移）
 // ===================================================================
@@ -235,6 +348,12 @@ fn e2e_all_fixtures_run() {
         "random_basic.mora",
         "random_handle.mora",
         "bigint_basic.mora",
+        // v0.103: 循环 fixture（此前三个因二参 print 被类型检查拒绝而未纳入，
+        // loop_basic 另有 `{` 配 `end` 的语法错误）
+        "loop_basic.mora",
+        "loop_break.mora",
+        "loop_continue.mora",
+        "loop_for_break.mora",
     ] {
         assert_ok(name);
     }
@@ -327,6 +446,16 @@ fn e2e_tea_standalone_runs() {
 {}",
         stdout
     );
+    // v0.103: 独立 `update(params) ... end` 声明（spec §9.6）——
+    // 运行时 h_update_def 注册为**可调用的 closure**（此前存的是 Dict +
+    // 一个 `"<MirFunction:N>"` 描述字符串，声明出的 update 永不可调用）；
+    // 更早则连 parser 产出点都没有，`type_of(update)` 报 Unbound variable。
+    assert!(
+        stdout.contains("closure"),
+        "update 声明应注册为可调用 closure，实际 stdout:
+{}",
+        stdout
+    );
     assert!(
         stdout.contains("tea_app"),
         "app 应构造 TeaApp，实际 stdout:
@@ -342,6 +471,69 @@ fn e2e_tea_standalone_runs() {
 #[test]
 fn e2e_tea_counter_runs() {
     assert_ok("tea_counter.mora");
+}
+
+/// v0.104: TEA update 全链路 —— spec §9.6 工作示例必须逐字可跑。
+///
+/// 缺陷链（本条锁定的整条）：
+///   ① `update(msg, model) ... end` 独立声明 parser 无产出点（Unbound variable）；
+///   ② `h_update_def` 存 `Dict{__update_body__: "<MirFunction:2>"}` 描述字符串，
+///      声明出的 update 不可调用；
+///   ③ AppDef 把 update/view 的 **Closure witness** 当表达式 lower →
+///      产出「构造闭包」的指令，update 每次调用返回新闭包、模型变 `<closure>`；
+///   ④ `h_app_def` 硬编码闭包形参名 `["model","msg"]`，用户形参名 unbound；
+///   ⑤ 名字引用 `update: update` 的转发闭包缺 `Var` 取参 + 缺 `MirFunction.params`；
+///   ⑥ 运行时 `apply_update` 传 `(model, msg)`，与 spec §9.6 的
+///      `update(msg, model)`（Elm 序）相反 → 示例体 `model.count` 报
+///      "Dict has no method: count"；
+///   ⑦ match 的 output_reg 用 arm 局部寄存器 → 越界 panic。
+///
+/// 断言：2 次 Increment、1 次 Decrement 后模型 count == 3（n = 0 + 2 - 1）。
+#[test]
+fn e2e_tea_standalone_update_full_cycle() {
+    use e2e_helpers::assert_source_ok;
+    use mora::value::Value;
+    let src = "\
+model Counter
+  count: number = 0
+end
+msg CounterMsg
+  Increment
+  Decrement
+end
+update(msg, model)
+  match msg {
+    Increment => {count: model.count + 1i}
+    Decrement => {count: model.count - 1i}
+  }
+end
+app CounterApp
+  model: Counter
+  msg: CounterMsg
+  init: {count: 0}
+  update: update
+  view: fn(m) => m
+end
+let a = tea.dispatch(CounterApp, {tag: \"Increment\"})
+let a = tea.dispatch(a, {tag: \"Increment\"})
+let a = tea.dispatch(a, {tag: \"Decrement\"})
+let b = tea.run(a, 5)
+tea.model(b)
+";
+    let v = assert_source_ok(src);
+    let count = match &v {
+        Value::Dict(m) => m.get("count").cloned(),
+        other => panic!("期望模型 dict，得到 {:?}", other),
+    };
+    let n = match count {
+        Some(Value::Int(i)) => i as f64,
+        Some(Value::Float(f)) => f,
+        other => panic!("期望 count 为数值，得到 {:?}", other),
+    };
+    assert_eq!(
+        n, 3.0,
+        "+1 +1 -1 后 count 应为 3（update(msg, model) 按 spec §9.6 序被真正调用）"
+    );
 }
 
 /// ai_critic.mora：`ai.critic(answer, ctx?)`（spec §12.5 `string, string? -> value`）。
@@ -661,6 +853,55 @@ fn e2e_rel_cons_runs() {
 // ===================================================================
 // v0.102 缺陷修复回归
 // ===================================================================
+
+/// v0.103: 循环 fixture 的**精确值**断言。
+///
+/// 这四个 fixture 此前都不在断言集里（`loop_basic.mora` 甚至因 `{` 配 `end`
+/// 的语法错误而无法解析，`loop_break`/`loop_continue`/`loop_for_break` 用了
+/// 二参 `print`，被当时固定 arity 的 print 签名拒绝）。它们共同锁定
+/// v0.103 修复的循环链：CSE 不重命名环携带寄存器、`for` 退出条件用
+/// JumpIf、`break`/`continue` 目标解析补 pc 兜底、Data 边不充当激活通道、
+/// 尾部隐式 Return 不产生死节点、变参 `print` 被类型系统接受。
+#[test]
+fn e2e_loop_fixtures_exact_values() {
+    use mora::value::Value;
+    let num = |v: Value| match v {
+        Value::Int(n) => n as f64,
+        Value::Float(n) => n,
+        other => panic!("期望数值结果，得到 {:?}", other),
+    };
+    // while 1..10 累加 = 55
+    let (v, _) = assert_ok("loop_basic.mora");
+    assert_eq!(num(v), 55.0, "loop_basic: while 1..=10 累加应为 55");
+    // while + break（i==5 时 break）累加 1..4 = 10，末表达式 = 10 + 1000
+    let (v, _) = assert_ok("loop_break.mora");
+    assert_eq!(num(v), 1010.0, "loop_break: break 于 i=5 得 10，+1000 = 1010");
+    // while + continue（i==3 跳过）累加 1+2+4+5 = 12，+1000
+    let (v, _) = assert_ok("loop_continue.mora");
+    assert_eq!(num(v), 1012.0, "loop_continue: 跳过 3 得 12，+1000 = 1012");
+    // for + break（i==6 时 break）累加 1..5 = 15，+1000
+    let (v, _) = assert_ok("loop_for_break.mora");
+    assert_eq!(num(v), 1015.0, "loop_for_break: break 于 6 得 15，+1000 = 1015");
+}
+
+/// v0.103: 变参 `print` —— 运行期 join 全部实参，类型系统必须接受多实参。
+///
+/// 缺陷：`print` 的签名声明 1 个参数，`builtin_callee_ty` 据此生成固定
+/// arity 的 curried arrow，多余实参无处消耗 → `print("a", b)` 报
+/// "expected nil, got fn(string) -> …"。三个 loop fixture 因此无法通过
+/// 类型检查（它们用二参 print 打印标签 + 值）。
+#[test]
+fn e2e_variadic_print_accepted() {
+    use e2e_helpers::assert_source_ok;
+    use mora::value::Value;
+    // 1/2/3 个实参都应通过类型检查并执行
+    assert!(matches!(assert_source_ok("print(1i)"), Value::Nil));
+    assert!(matches!(assert_source_ok("print(\"a\", 2i)"), Value::Nil));
+    assert!(matches!(
+        assert_source_ok("print(\"a\", 2i, 3.5)"),
+        Value::Nil
+    ));
+}
 
 /// loop_beyond_dag_limit.mora：循环 600 次（> 旧的 DAG 上限 500）后，
 /// 循环累加结果仍可访问。锁定「DAG 节点执行上限静默截断循环后续语句」缺陷。

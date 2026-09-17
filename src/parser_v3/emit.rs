@@ -63,6 +63,22 @@ impl ParserV3 {
             {
                 if s == "model" { self.emit_model_def_w() } else { self.emit_msg_def_w() }
             }
+            // v0.103: TEA 独立 `update(params) ... end`（spec §9.6 工作示例）。
+            //
+            // 守卫：`update` 后紧跟 `(` 且括号内**全为裸标识符**（形参表形态）。
+            // 普通调用 `update(a, b)` 与声明 `update(msg, model)` 在这一位置上
+            // 形似，故再要求「`)` 后是同语句体（换行/`{`/表达式）」不足以区分；
+            // 本守卫以「形参只能是标识符」为界 —— `update(x + 1, y)` 这类
+            // 含表达式的调用不受影响，而恰好「全部实参都是裸标识符」的语句级
+            // 调用会被解析为声明。这与 `model`/`msg` 的守卫同一取舍：为落地
+            // 规范承诺的声明形式，保留一个边界明确的名字。
+            // （接收者调用 `x.update(...)` 不受影响 —— 本分派只在语句首 token
+            // 是 `update` 时触发。）
+            TokenType::Identifier(ref s)
+                if s == "update" && self.looks_like_update_decl() =>
+            {
+                self.emit_update_def_w()
+            }
             // v0.103: 可观测性块
             TokenType::Identifier(ref s) if s == "observe" => self.emit_observe_w(),
             TokenType::Identifier(ref s) if s == "span" => self.emit_span_w(),
@@ -727,7 +743,7 @@ impl ParserV3 {
                 } else {
                     self.emit_block_w()?
                 };
-                self.emit.emit(MirInst::Return(Some(body_reg)));
+                self.emit.emit_tail_return(Some(body_reg));
                 let body_mir = std::mem::replace(&mut self.emit, parent).finish();
                 let dst = self.emit.alloc_reg();
                 let param_names: Vec<String> = params.iter().map(|p| p.name.clone()).collect();
@@ -1268,7 +1284,7 @@ impl ParserV3 {
                 span,
             })
         };
-        self.emit.emit(MirInst::Return(Some(body_reg)));
+        self.emit.emit_tail_return(Some(body_reg));
         let body_mir = std::mem::replace(&mut self.emit, parent).finish();
         self.emit.emit(MirInst::MacroDef {
             name: name.clone(),
@@ -1633,7 +1649,7 @@ impl ParserV3 {
             body_wits.push(w);
             while self.match_token(&[TokenType::Newline]) {}
         }
-        self.emit.emit(MirInst::Return(Some(last)));
+        self.emit.emit_tail_return(Some(last));
         let body_mir = std::mem::replace(&mut self.emit, parent).finish();
 
         // compensation 段（可选）：`compensation` 后语句循环到 `end`
@@ -1649,7 +1665,7 @@ impl ParserV3 {
                 comp_wits.push(w);
                 while self.match_token(&[TokenType::Newline]) {}
             }
-            self.emit.emit(MirInst::Return(Some(comp_last)));
+            self.emit.emit_tail_return(Some(comp_last));
             let cm = std::mem::replace(&mut self.emit, parent2).finish();
             body_wits.extend(comp_wits);
             cm
@@ -1754,7 +1770,22 @@ impl ParserV3 {
             }
         }
         self.consume(TokenType::RBrace, "Expected '}' after match arms")?;
+        // v0.104: match 的结果寄存器必须位于**外层函数**的寄存器空间，且所有
+        // arm 共用它（`h_match_expr` 把选中 arm 的返回值写进 `regs[output_reg]`；
+        // `MirInst::dst()` 对 MatchExpr 取的正是 `arms.last().3`）。
+        //
+        // 缺陷：此前把每个 arm 的**arm 局部**结果寄存器（`arm_val_reg`，来自
+        // arm 自己的 `EmitContext`，编号自 0 起）当作 output_reg。arm 寄存器
+        // 空间与外层无关，编号常超出外层 `n_regs` → `h_match_expr` 越界 panic
+        //（"index out of bounds: the len is 2 but the index is 4"）；即便不越界，
+        // 结果也写进了外层从未读取的寄存器。另有一个 `dst` 被分配并返回，却
+        // 没有任何 arm 写它 —— 消费者读到的恒为 Nil。
+        // 统一为「先分配外层 dst，再让所有 arm 指向它」（与 fcfg_lower 的
+        // `lower_match` 同契约）。
         let dst = self.emit.alloc_reg();
+        for arm in &mut arms {
+            arm.3 = dst;
+        }
         self.emit.emit(MirInst::MatchExpr { val: val_reg, arms });
         let w = MirWitness {
             kind: WitnessKind::Match {
@@ -1921,7 +1952,7 @@ impl ParserV3 {
         }
         self.consume(TokenType::End, "Expected 'end' after section block")?;
         // body 求值 → Return（h_* 取此值作为 section text）
-        self.emit.emit(MirInst::Return(last));
+        self.emit.emit_tail_return(last);
         let body_mir = std::mem::replace(&mut self.emit, parent).finish();
 
         if is_prompt {
@@ -2077,9 +2108,38 @@ impl ParserV3 {
             while self.match_token(&[TokenType::Newline]) {}
         }
         self.consume(TokenType::End, "Expected 'end' after block")?;
-        self.emit.emit(MirInst::Return(last));
+        self.emit.emit_tail_return(last);
         let body_mir = std::mem::replace(&mut self.emit, parent).finish();
         Some((body_mir, Self::block_witness(body_wits, span)))
+    }
+
+    /// v0.103: `update(params)` 是否为 TEA 更新函数声明（而非普通调用）。
+    ///
+    /// 判据（见分派处的守卫注释）：`(` 紧跟当前 token，括号内**全为裸标识符**
+    /// （允许逗号与空参表）。含任意表达式实参 → 不是声明。
+    fn looks_like_update_decl(&self) -> bool {
+        let mut i = self.current + 1; // 指向 '('
+        if !matches!(
+            self.tokens.get(i).map(|t| &t.token_type),
+            Some(TokenType::LParen)
+        ) {
+            return false;
+        }
+        i += 1;
+        loop {
+            match self.tokens.get(i).map(|t| &t.token_type) {
+                // 空参表 `update()`
+                Some(TokenType::RParen) => return true,
+                // 形参：裸标识符
+                Some(TokenType::Identifier(_)) => i += 1,
+                _ => return false,
+            }
+            match self.tokens.get(i).map(|t| &t.token_type) {
+                Some(TokenType::Comma) => i += 1,
+                Some(TokenType::RParen) => return true,
+                _ => return false,
+            }
+        }
     }
 
     /// v0.103: `parallel ... end` / `worker <name> do ... end`（spec §9.1/§9.2）。
@@ -2100,7 +2160,7 @@ impl ParserV3 {
             while self.match_token(&[TokenType::Newline]) {}
         }
         self.consume(TokenType::End, "Expected 'end' after parallel block")?;
-        self.emit.emit(MirInst::Return(last));
+        self.emit.emit_tail_return(last);
         let body_mir = std::mem::replace(&mut self.emit, parent).finish();
         self.emit.emit(MirInst::Parallel {
             body: Box::new(body_mir),
@@ -2134,7 +2194,7 @@ impl ParserV3 {
             while self.match_token(&[TokenType::Newline]) {}
         }
         self.consume(TokenType::End, "Expected 'end' after worker block")?;
-        self.emit.emit(MirInst::Return(last));
+        self.emit.emit_tail_return(last);
         let body_mir = std::mem::replace(&mut self.emit, parent).finish();
         self.emit.emit(MirInst::Worker {
             name: name.clone(),

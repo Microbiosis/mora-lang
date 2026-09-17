@@ -249,9 +249,12 @@ fn build_node(b: &mut FcfgBuilder, w: &MirWitness) -> Node<()> {
             b.push_loop(0, 1);
             let body_block = build_block(b, body);
             b.pop_loop();
+            // v0.103: 循环结果寄存器（收尾 Nil 常量）—— emit.rs emit_loop_w
+            // 同契约；缺此寄存器时 9 层产出与 emit.rs 类别序列分歧。
+            let dst = b.alloc();
             Node::Sequence {
                 nodes: vec![iter_node, Node::For {
-                    var: var.clone(), iter: iter_reg, body: body_block, span, meta: (),
+                    var: var.clone(), iter: iter_reg, body: body_block, dst, span, meta: (),
                 }],
                 span,
                 meta: (),
@@ -264,7 +267,9 @@ fn build_node(b: &mut FcfgBuilder, w: &MirWitness) -> Node<()> {
             b.push_loop(0, 1);
             let body_block = build_block(b, body);
             b.pop_loop();
-            Node::While { cond: cond_block, body: body_block, span, meta: () }
+            // v0.103: 循环结果寄存器（收尾 Nil 常量）—— emit.rs emit_while_w 同契约。
+            let dst = b.alloc();
+            Node::While { cond: cond_block, body: body_block, dst, span, meta: () }
         }
         WitnessKind::List(items) => {
             let mut nodes = Vec::new();
@@ -490,13 +495,28 @@ fn build_node(b: &mut FcfgBuilder, w: &MirWitness) -> Node<()> {
             }
         }
         WitnessKind::AppDef { name, model_name, msg_name, init_w, update_w, view_w } => {
+            // v0.104: update/view 的 witness 是 Closure —— 节点只携带其
+            // **形参**与**体块**（体块才是要 lower 成 update 函数的东西）。
+            // 此前 `build_block(b, update_w)` 把整个 Closure 节点当块体，
+            // lower 后产出「构造闭包」的指令序列 → update 每次调用返回新
+            // 闭包、模型被替换成 `<closure>`（`tea.model` 返回闭包）。
+            let (update_params, update_body) = split_app_closure(update_w);
+            let (view_params, view_body) = split_app_closure(view_w);
             Node::AppDef {
                 name: name.clone(),
                 model: model_name.clone(),
                 msg: msg_name.clone(),
                 init: build_block(b, init_w),
-                update: build_block(b, update_w),
-                view: build_block(b, view_w),
+                update_params: update_params
+                    .iter()
+                    .map(witness_param_to_param)
+                    .collect(),
+                update: build_block(b, update_body),
+                view_params: view_params
+                    .iter()
+                    .map(witness_param_to_param)
+                    .collect(),
+                view: build_block(b, view_body),
                 span,
                 meta: (),
             }
@@ -628,6 +648,18 @@ fn node_result_reg_of(n: &Node<()>) -> Option<Reg> {
         | Node::Quasiquote { dst: reg, .. } => Some(*reg),
         Node::Sequence { nodes, .. } => nodes.last().and_then(node_result_reg_of),
         _ => None,
+    }
+}
+
+/// v0.104: 拆开 `app` 的 update/view 闭包 witness —— 返回 `(形参, 体)`。
+///
+/// 该 witness 正常是 [`WitnessKind::Closure`]（`fn(m, msg) => …` 或名字引用
+/// 合成的转发闭包）。非闭包时按「无参、体即该表达式」处理，与「未提供
+/// update/view」的既有兜底同形。
+fn split_app_closure(w: &MirWitness) -> (&[WitnessParam], &MirWitness) {
+    match &w.kind {
+        WitnessKind::Closure { params, body } => (params.as_slice(), body.as_ref()),
+        _ => (&[], w),
     }
 }
 

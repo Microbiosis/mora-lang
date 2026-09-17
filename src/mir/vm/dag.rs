@@ -377,14 +377,39 @@ pub fn run_dag_with_signal_memo(
                 ) {
                     continue;
                 }
-                let should_push = match &edge.kind {
-                    EdgeKind::Data { reg } => reg_ready[*reg],
-                    _ => is_control_edge(&edge.kind) || matches!(edge.kind, EdgeKind::Sequence),
-                };
+                // v0.103: **Data 边只决定「就绪」，不决定「激活」**。
+                //
+                // 激活（把节点放进下一波的 active）只由控制边与 Sequence 边
+                // 决定 —— 它们编码「控制流是否到达」。Data 边编码「输入值是否
+                // 可用」，只供 `node_ready` 判断，不构成可达性。
+                //
+                // **缺陷背景（`while ... if ... break ... end` 死循环）**：
+                // 此前 `EdgeKind::Data { reg } => reg_ready[*reg]` 会在「寄存器
+                // 曾被写过」时立刻激活消费者 —— 无视控制流是否到达。循环体内
+                // 的递增语句 `t = t + 1` 因此被「常量 1」的 Data 边提前激活，
+                // 与内层 `break` 分支同波执行；递增把循环变量推回去、回边再次
+                // 点火 → `break` 被架空、挂死。
+                //
+                // 结构上 Sequence 边足以保序：`dag_analyze` 给每个基本块内部
+                // 的相邻节点连 Sequence（块内全序），块入口由控制边（Branch/
+                // Jump 的选中目标与 fall-through）激活，`prune_sequence_edges`
+                // 又明确「Sequence 全保留」。因此去掉 Data 激活不会让任何
+                // 可达节点失去激活来源。
+                let should_push = is_control_edge(&edge.kind)
+                    || matches!(edge.kind, EdgeKind::Sequence);
                 if should_push && !pushed[edge.to] {
                     next_active.push(edge.to);
                     pushed[edge.to] = true;
                 }
+            }
+        }
+        // v0.103: 已激活但本波未就绪的节点保留到下波 —— 「控制已到达、输入
+        // 尚未就绪」的节点若被丢弃将永不执行（此前靠 Data 激活的重复推送
+        // 掩盖了这一点）。`pushed[n]` 为假即「在 active 中但未就绪/未执行」。
+        for &n in &active {
+            if !pushed[n] {
+                next_active.push(n);
+                pushed[n] = true;
             }
         }
         active = next_active;

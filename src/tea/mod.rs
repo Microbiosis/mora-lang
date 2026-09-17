@@ -3,7 +3,7 @@
 //! 设计目标：Stage 3 必须实现完整 TEA 循环（§0.6 硬性要求）：
 //!   - Model（状态容器）— `Type::Concrete { name: "Model", ... }`
 //!   - Msg（消息 tagged union）— `Type::Union([TeaMsg, ...])`
-//!   - Update(Model, Msg) -> (Model, Cmd<Model>)
+//!   - Update(Msg, Model) -> (Model, Cmd<Model>)   ← v0.104 对齐 spec §9.6 / Elm
 //!   - Cmd（命令描述副作用）— `Type::Union([Perform, Batch, None])`
 //!   - View(Model) -> render target（占位 Value）
 //!   - Replay：从 Recorder 还原 Msg 流 + StateMutation diffs
@@ -162,7 +162,7 @@ pub struct TeaApp {
     pub cmd_queue: Vec<Cmd>,
     /// init 函数 — `() -> Model`
     pub init: Value,
-    /// update 函数 — `(Model, Msg) -> (Model, Cmd)`
+    /// update 函数 — `(Msg, Model) -> (Model, Cmd)`（v0.104 对齐 spec §9.6 / Elm）
     pub update: Value,
     /// view 函数 — `(Model) -> Value`（占位 render target）
     pub view: Value,
@@ -242,13 +242,20 @@ impl TeaApp {
     }
 
     /// 调用 update 闭包一次并解析 `(Model, Cmd)`。仅 interp 求值有副作用。
+    ///
+    /// v0.104: 实参顺序 **(msg, model)** —— 与 spec §9.6 的工作示例一致
+    /// （`update(msg, model) …`）。本语言把 TEA 明确声明为「Elm 风格」
+    /// （spec §9.6 首句），而 Elm 的签名就是 `update : Msg -> Model -> Model`。
+    /// 此前运行时传 `(model, msg)`，与 spec 示例的形参序相反 —— 照规范写的
+    /// `update(msg, model)` 会拿到「model=消息、msg=模型」，示例体
+    /// `model.count` 因此报 `Dict has no method: count`。
     fn apply_update(
         model: &Value,
         msg: &Msg,
         update: &Value,
         interp: &mut dyn crate::mir::host::MirHost,
     ) -> Result<(Value, Vec<Cmd>), String> {
-        let args = vec![model.clone(), msg.to_value()];
+        let args = vec![msg.to_value(), model.clone()];
         match interp.call_value(update, args, &mut crate::mir::effect::Effects::new())? {
             // update 返回 (Model, Cmd) tuple —— Value::List [model, cmd]
             Value::List(items) => {

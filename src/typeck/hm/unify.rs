@@ -288,6 +288,11 @@ fn unify(
         // Same type constructor
         (crate::typeck::Type::Int, crate::typeck::Type::Int) => Ok(subst.clone()),
         (crate::typeck::Type::Float, crate::typeck::Type::Float) => Ok(subst.clone()),
+        // v0.103: BigInt 自反 —— v0.91 引入 BigInt 变体时漏加本 arm，
+        // 导致同一类型合一失败（`999n == 999n`、`x: bigint = 999n` 均报
+        // "expected bigint, got bigint"）。`compatible_with` 已自 v0.91 起
+        // 承认 BigInt 自反，此处是 unify 侧的同款遗漏。
+        (crate::typeck::Type::BigInt, crate::typeck::Type::BigInt) => Ok(subst.clone()),
         (crate::typeck::Type::String, crate::typeck::Type::String) => Ok(subst.clone()),
         (crate::typeck::Type::Bool, crate::typeck::Type::Bool) => Ok(subst.clone()),
         (crate::typeck::Type::Nil, crate::typeck::Type::Nil) => Ok(subst.clone()),

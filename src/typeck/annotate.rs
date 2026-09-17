@@ -125,16 +125,18 @@ fn annotate_node(node: &Fcfg, table: &TypeTable) -> Node<TypeInfo> {
             span: *span,
             meta: info,
         },
-        Node::While { cond, body, span, .. } => Node::While {
+        Node::While { cond, body, dst, span, .. } => Node::While {
             cond: annotate_block(cond, table),
             body: annotate_block(body, table),
+            dst: *dst,
             span: *span,
             meta: info,
         },
-        Node::For { var, iter, body, span, .. } => Node::For {
+        Node::For { var, iter, body, dst, span, .. } => Node::For {
             var: var.clone(),
             iter: *iter,
             body: annotate_block(body, table),
+            dst: *dst,
             span: *span,
             meta: info,
         },
@@ -325,12 +327,25 @@ fn annotate_node(node: &Fcfg, table: &TypeTable) -> Node<TypeInfo> {
             span: *span,
             meta: info,
         },
-        Node::AppDef { name, model, msg, init, update, view, span, .. } => Node::AppDef {
+        Node::AppDef {
+            name,
+            model,
+            msg,
+            init,
+            update_params,
+            update,
+            view_params,
+            view,
+            span,
+            ..
+        } => Node::AppDef {
             name: name.clone(),
             model: model.clone(),
             msg: msg.clone(),
             init: annotate_block(init, table),
+            update_params: update_params.clone(),
             update: annotate_block(update, table),
+            view_params: view_params.clone(),
             view: annotate_block(view, table),
             span: *span,
             meta: info,

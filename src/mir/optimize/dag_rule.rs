@@ -285,10 +285,36 @@ impl DagRewriteRule for CseDagRule {
                     MirDagNode::Compute { dst, .. } => *dst,
                     _ => unreachable!("nodes_equivalent only matches Compute"),
                 };
+
+                // v0.103: 重命名的**健全性前置条件** —— 见 [`is_multi_defined`]。
+                // 两个寄存器都必须是单定义（SSA），否则全局改名会把「读某个
+                // 程序点的值」错误地改成「读另一个程序点的值」。环携带寄存器
+                // （for/while 的索引：init 与增量写同一寄存器）与跨分支同值
+                // 常量（只有一边执行）都会命中。
+                if is_multi_defined(dag, dst_b) || is_multi_defined(dag, dst_a) {
+                    return None;
+                }
+
+                // v0.103: **不重定向 Sequence 出边** —— Sequence 是「基本块内
+                // 相邻指令的保序边」，位置语义而非数据语义。目标节点
+                // （`prev_id`）可能与被删节点不同块：把它当普通出边重定向会把
+                // 「另一个控制区域的节点」接到当前块的保序链上（DAG 执行器
+                // 沿 Sequence 边激活消费者）→ 该节点被提前激活执行。
+                //
+                // **缺陷背景（`while ... if ... break ... end` 死循环）**：内层
+                // if 块的同值 `Const` 被 CSE 合并后，`Const(pc19) → BinaryOp(pc20)`
+                // 的块内 Sequence 边被重定向成 `Const(pc10) → BinaryOp(pc20)`，
+                // 从 if 块跨越到循环体内块。于是 `break` 分支被选中时递增语句
+                // 仍被激活执行，循环回边再次点火 → break 架空、挂死。
+                //
+                // 线性链由 `apply_rewrite` 的 Sequence 缝合（块内 pred→succ）
+                // 恢复，无需在此重定向。
                 let out_edges: Vec<(NodeId, NodeId, EdgeKind)> = dag
                     .edges
                     .iter()
-                    .filter(|e| e.from == node_id)
+                    .filter(|e| {
+                        e.from == node_id && !matches!(e.kind, EdgeKind::Sequence)
+                    })
                     .map(|e| (prev_id, e.to, e.kind.clone()))
                     .collect();
 
@@ -306,6 +332,47 @@ impl DagRewriteRule for CseDagRule {
     fn cost_gain(&self) -> i32 {
         2
     }
+}
+
+/// v0.103: 寄存器 `reg` 在 DAG 中是否被**多于一个**节点定义（非 SSA）。
+///
+/// **缺陷背景（CSE 重命名的健全性条件）**：CSE 合并两个等价节点后，用
+/// [`DagRewrite::reg_rename`] 把「读 `old_reg`」的**全部**位点全局改写成
+/// 「读 `new_reg`」。这一改写等价于断言：
+///
+/// > 在每一个读 `old_reg` 的程序点，`old_reg` 的值都等于被删节点的输出。
+///
+/// 只有当 `old_reg` **只有一处定义**（SSA）时该断言成立 —— 那时任何读
+/// `old_reg` 都读的是被删节点写的那个值。若 `old_reg` 还有别的定义，则
+/// 不同程序点读到的是不同值，全局改名把语义改错了。`new_reg` 同理：
+/// 多定义会让改名后的读点读到另一个定义的值。
+///
+/// 触发实例（v0.103 `for` 循环值传递缺陷，根因之一）：
+/// ```mora
+/// let t = 0i              -- Const(r0, Int(0))
+/// for x in [1i, 2i, 3i]   -- 索引 init: Const(r7, Int(0))，增量: BinaryOp(r7, r7, Add, r_one)
+///   let total = total + x
+/// end
+/// ```
+/// 索引 `r7` 有两处定义（init + 增量），而 init 与 `t` 的初始化是两个
+/// **同值常量** → CSE 把 `Const(r7, Int(0))` 并进 `Const(r0, Int(0))`，
+/// 再把读 `r7` 的循环条件改写成读 `r0`，但增量仍写 `r7` → 条件恒为
+/// `0 >= len`（false）→ **死循环**（`for_loop.mora` 由「返回 0」退化为
+/// 无限输出）。`let t = 1i` 时两个常量不同值 → 不合并 → 侥幸正确，正是
+/// 「同值才碰撞」的特征。
+fn is_multi_defined(dag: &MirDag, reg: Reg) -> bool {
+    let mut defs = 0usize;
+    for node in &dag.nodes {
+        if let MirDagNode::Compute { dst, .. } = node
+            && *dst == reg
+        {
+            defs += 1;
+            if defs > 1 {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Check if two Compute nodes are structurally equivalent:
@@ -632,6 +699,63 @@ mod tests {
         assert!(
             rule.rewrite(dup_id, &dag).is_none(),
             "different ops should not be eliminated"
+        );
+    }
+
+    /// v0.103 回归：CSE 不得重命名**多定义**（非 SSA）寄存器。
+    ///
+    /// 缺陷形状（`for` 循环值传递，`for_loop.mora` 返回 0 / 死循环的根因）：
+    /// 循环索引寄存器有两处定义 —— init `Const(7, Int(0))` 与增量
+    /// `BinaryOp(7, 7, Add, one)`。当 init 与另一个语句的初始化恰好是
+    /// **同值常量**（`let t = 0i` 的 `Const(0, Int(0))`）时，CSE 判定两者
+    /// 等价 → 删除 init → 把「读 r7」全局改名成「读 r0」。但增量仍写 r7，
+    /// 于是循环条件永远读 r0（不变的 0）→ `0 >= len` 恒假 → 死循环。
+    ///
+    /// 修复：`rewrite` 在产生 `reg_rename` 之前要求 dst_a/dst_b 均为单定义。
+    /// `let t = 1i` 时两常量不同值 → 不合并 → 侥幸正确，正是「同值才碰撞」
+    /// 的特征（测试用 Int(0)/Int(0) 复现碰撞）。
+    #[test]
+    fn cse_rejects_rename_of_multi_defined_loop_index() {
+        let dag = make_dag(vec![
+            MirInst::Const(0, Value::Int(0)), // let t = 0i
+            MirInst::Define("t".to_string(), 0),
+            MirInst::Const(7, Value::Int(0)), // loop idx init（与 t 同值 → CSE 候选）
+            MirInst::Const(9, Value::Int(1)), // increment step
+            MirInst::BinaryOp(10, 7, BinaryOp::GreaterEqual, 9), // cond
+            // 增量：**第二次**定义 r7 → r7 非 SSA
+            MirInst::BinaryOp(7, 7, BinaryOp::Add, 9),
+        ]);
+        let idx_init = dag
+            .nodes
+            .iter()
+            .position(|n| matches!(n, MirDagNode::Compute { dst: 7, .. }))
+            .expect("index init node");
+        let rule = CseDagRule;
+        assert!(
+            rule.rewrite(idx_init, &dag).is_none(),
+            "多定义寄存器（循环索引）不得被 CSE 重命名 — 否则条件读到 init 值、\
+             增量写到另一个寄存器，循环永不终止"
+        );
+    }
+
+    /// 反向断言：单定义（SSA）寄存器的重复计算**仍应**被 CSE 消除 ——
+    /// 上一条的健全性守卫不能把合法优化一并禁掉。
+    #[test]
+    fn cse_still_eliminates_single_defined_duplicates() {
+        let dag = make_dag(vec![
+            MirInst::Const(0, Value::Int(10)),
+            MirInst::Const(1, Value::Int(20)),
+            MirInst::BinaryOp(2, 0, BinaryOp::Add, 1),
+            MirInst::BinaryOp(3, 0, BinaryOp::Add, 1), // r3 单定义 → 可消除
+        ]);
+        let dup_id = dag
+            .nodes
+            .iter()
+            .position(|n| matches!(n, MirDagNode::Compute { dst: 3, .. }))
+            .unwrap();
+        assert!(
+            CseDagRule.rewrite(dup_id, &dag).is_some(),
+            "单定义寄存器的等价节点仍必须被 CSE 消除"
         );
     }
 

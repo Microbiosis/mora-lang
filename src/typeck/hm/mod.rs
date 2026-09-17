@@ -920,8 +920,42 @@ impl HMInference {
             | WitnessKind::EnumDef { .. }
             | WitnessKind::StructDef { .. }
             | WitnessKind::Import(_)
-            | WitnessKind::MacroDef { .. }
-            | WitnessKind::UpdateDef { .. } => {
+            | WitnessKind::MacroDef { .. } => {
+                Ok((Type::Nil, crate::mir::effect::EffectRow::Empty))
+            }
+            // v0.103: TEA 独立 `update(params) ... end` 声明（spec §9.6）——
+            // 注册 `update` 名到 env（运行时 h_update_def 注册同名
+            // `Value::Dict`），并推断真实的体。此前它在上面那组「纯声明」里
+            // 只返回 Nil、不注册任何名 → 同一文件里 `app ... update: update`
+            // 或 `print(type_of(update))` 都报 Unbound variable。
+            WitnessKind::UpdateDef {
+                name, params, body, ..
+            } => {
+                // 先用声明的参数类型构造函数类型；无注解的形参取 fresh
+                // TypeVar（与调用点推断合一）。
+                let param_tys: Vec<Type> = params
+                    .iter()
+                    .map(|p| match &p.type_hint {
+                        Some(h) => h.to_type().clone(),
+                        None => self.fresh_type_var(),
+                    })
+                    .collect();
+                // 体在子作用域推断（形参入 env，退出时整体还原 —— 与
+                // handle 的 __argN 注册同一 clone/restore 契约）。
+                let saved_env = self.env.clone();
+                for (p, pty) in params.iter().zip(param_tys.iter()) {
+                    self.env.add(p.name.clone(), pty.clone());
+                }
+                let (body_ty, body_row) = self.infer_expr(body)?;
+                self.env = saved_env;
+                // 多参按 curried Arrow 逐层包裹 —— 与 infer_call 的消解
+                // 方向一致（每个实参消耗一层）。体残差行挂最内层，供
+                // 调用点传播 unhandled effect。
+                let mut ty = body_ty;
+                for pty in param_tys.into_iter().rev() {
+                    ty = Type::Arrow(Box::new(pty), Box::new(ty), body_row.clone());
+                }
+                self.env.add(name.clone(), ty);
                 Ok((Type::Nil, crate::mir::effect::EffectRow::Empty))
             }
             // v0.103: App 定义 —— 注册 `app 名` 的 TeaApp 类型到 env（运行时

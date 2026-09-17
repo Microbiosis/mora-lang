@@ -105,25 +105,28 @@ pub fn h_msg_def(env: &mut Environment, name: &str, variants: &[crate::common::M
     env.define(name.to_string(), Value::List(variant_names), false);
 }
 
-// v0.83: TEA Update 函数定义 —— 注册到 env 为 Value::Closure (name 关联)
+// v0.83: TEA Update 函数定义 —— 注册到 env 为可调用的 Value::Closure。
 // 完整 type: Model × Msg -> (Model, Cmd) 在阶段 E 加 Type::TeaUpdate
+/// v0.103: 注册**真实可调用**的闭包。
+///
+/// 缺陷：此前注册为 `Dict { __update_params__, __update_body__ }`，而
+/// `__update_body__` 是 `format!("<MirFunction:{}>", …)` —— 一个**描述字符串**
+/// 而非函数体。声明出的 `update` 因此永不可调用，`app ... update: update`
+/// 也无从解析（spec §9.6 的引用形式）。这属于 §0.6 的「丢弃 MirFunction」
+/// 半实现。改为存 `Value::Closure`（与 `h_app_def` 构造 update 闭包同一形态），
+/// env 以 `EnvRef::new(env)` 捕获当前环境。
 pub fn h_update_def(
     env: &mut Environment,
     name: &str,
     params: &[String],
     body: &crate::mir::MirFunction,
 ) {
-    // 注册到 env：name → Dict { params, body_mir }
-    let mut map = std::collections::HashMap::new();
-    map.insert(
-        "__update_params__".to_string(),
-        Value::List(params.iter().map(|s| Value::String(s.clone())).collect()),
-    );
-    map.insert(
-        "__update_body__".to_string(),
-        Value::String(format!("<MirFunction:{}>", body.params.len())),
-    );
-    env.define(name.to_string(), Value::Dict(map), false);
+    let closure = Value::Closure {
+        params: params.to_vec(),
+        env: crate::value::EnvRef(Box::new(env.clone())),
+        mir_body: std::sync::Arc::new(body.clone()),
+    };
+    env.define(name.to_string(), closure, false);
 }
 
 // v0.83: TEA App 定义 —— 构造完整 TeaApp，存为 Value::TeaApp
@@ -162,15 +165,30 @@ pub fn h_app_def(args: AppDefArgs) {
         env: crate::value::EnvRef(Box::new(env.clone())),
         mir_body: std::sync::Arc::new(init_mir.clone()),
     };
-    // update: (Model, Msg) -> (Model, Cmd) —— 2 个参数
+    // update: (Msg, Model) -> (Model, Cmd)（spec §9.6 / Elm 序）。
+    // v0.104: 形参名取自 **MirFunction 自身**（由 witness_to_fcfg / lower 从
+    // 用户写的 `fn(m, msg) => …` 的 Closure witness 提取），不再硬编码
+    // `["model","msg"]`。`call_value` 按**位置**把它们绑定进子环境，硬编码
+    // 会让用户声明的形参名（如 `m`）在体内 unbound → 读到 Nil（模型被
+    // 替换成 nil）。位置（model 在前、msg 在后）仍是 TEA 契约。
+    let update_params = if update_mir.params.is_empty() {
+        vec!["model".to_string(), "msg".to_string()]
+    } else {
+        update_mir.params.clone()
+    };
     let update_closure = Value::Closure {
-        params: vec!["model".to_string(), "msg".to_string()],
+        params: update_params,
         env: crate::value::EnvRef(Box::new(env.clone())),
         mir_body: std::sync::Arc::new(update_mir.clone()),
     };
-    // view: (Model) -> Value —— 1 个参数
+    // view: (Model) -> Value —— 1 个参数（同上，取体自身形参）。
+    let view_params = if view_mir.params.is_empty() {
+        vec!["model".to_string()]
+    } else {
+        view_mir.params.clone()
+    };
     let view_closure = Value::Closure {
-        params: vec!["model".to_string()],
+        params: view_params,
         env: crate::value::EnvRef(Box::new(env.clone())),
         mir_body: std::sync::Arc::new(view_mir.clone()),
     };

@@ -116,6 +116,18 @@ impl Default for MirFunction {
     }
 }
 
+/// match 表达式的单个 arm（`MirInst::MatchExpr` 的元素类型）。
+///
+/// v0.104.3: 守卫由 `Option<Reg>` 改为 `Option<Box<MirFunction>>` —— 守卫
+/// 引用**模式绑定变量**，而绑定只在匹配成功时才进入 env，故守卫必须像
+/// arm body 一样**延迟求值**（`h_match_expr` 在绑定之后调用它）。
+pub type MatchArmInst = (
+    String,
+    Option<Box<MirFunction>>,
+    Box<MirFunction>,
+    Reg,
+);
+
 /// MIR 指令（α.0 + α.1 子集）
 // 允许 large_enum_variant：ImplDef / SkillDef 携带完整函数体（Vec<MirFunction> /
 // Option<MirFunction>），属于 IR 设计，改 Box 需大面积改构造/匹配，收益不高。
@@ -148,10 +160,27 @@ pub enum MirInst {
     /// α.1: p"..." 模板拼接（不触发 AI，只拼接 parts 的字符串形式）
     Prompt(Reg, Vec<Reg>),
     /// α.0: 模式匹配表达式。arms 依次尝试，命中第一个即返回 arm_val。
-    /// arms: (pattern_str, condition_reg_or_None, body_mir_func, output_reg)
+    ///
+    /// v0.104.3: 守卫由 **`Option<Reg>` 改为 `Option<Box<MirFunction>>`**。
+    ///
+    /// **缺陷背景（守卫恒为假、`when` 完全失效）**：守卫表达式此前在外层
+    /// 寄存器空间求值，产物是「求值时读到的寄存器」。但守卫通常引用**模式
+    /// 绑定变量**（`x when x > 0`），而绑定发生在 `h_match_expr` 匹配成功
+    /// **之时**（`self_match_pattern` 把 `val` define 进 env）—— 外层求值
+    /// 时该变量尚不存在，读到 `Nil` → `is_truthy(Nil) == false` → **该 arm
+    /// 恒被跳过**（实测 `match -5 { x when x > 0 => …; x when x < 0 => …; _ }`
+    /// 返回首个 arm 的结果而非 `x < 0` 分支）。fixture `match_guard.mora`
+    /// 之所以"通过"，只因取值 42/0 恰好让首守卫为真 —— 属侥幸。
+    ///
+    /// 修法：守卫与 arm body 同构 —— **延迟到匹配时求值**的 MirFunction，
+    /// 由 `h_match_expr` 在模式绑定之后调用（此时绑定变量已在 env 中），
+    /// 再按真值决定是否采用该 arm。arm 元组第 3 项现为 `(守卫, body)` 两个
+    /// MirFunction。
+    ///
+    /// arms: `(pattern_str, guard_mir_or_None, body_mir_func, output_reg)`
     MatchExpr {
         val: Reg,
-        arms: Vec<(String, Option<Reg>, Box<MirFunction>, Reg)>,
+        arms: Vec<MatchArmInst>,
     },
 
     // ── 语句指令（副作用）──

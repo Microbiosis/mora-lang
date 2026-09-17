@@ -84,13 +84,10 @@ impl MirInst {
             MirInst::Pipe(_, lhs, rhs) => vec![*lhs, *rhs],
             MirInst::Prompt(_, parts) => parts.clone(),
             MirInst::MatchExpr { val, arms } => {
-                let mut v = vec![*val];
-                for arm in arms {
-                    if let Some(g) = arm.1 {
-                        v.push(g);
-                    }
-                }
-                v
+                // v0.104.3: 守卫是 MirFunction（在模式绑定之后由 handler 调用），
+                // 不再是本指令的外层输入寄存器 —— 只有 scrutinee 是输入。
+                let _ = arms;
+                vec![*val]
             }
             MirInst::Closure { .. } => vec![],
             MirInst::DynTrait { src, .. } => vec![*src],
@@ -190,9 +187,11 @@ impl MirInst {
             MirInst::Prompt(r, parts) => MirInst::Prompt(*r, parts.iter().map(|p| m(*p)).collect()),
             MirInst::MatchExpr { val, arms } => MirInst::MatchExpr {
                 val: m(*val),
+                // v0.104.3: 守卫 MirFunction 不在本指令的寄存器平面内
+                // （其在模式绑定后由 handler 独立调用），原样透传。
                 arms: arms
                     .iter()
-                    .map(|(p, g, body, out)| (p.clone(), g.map(&mut m), body.clone(), *out))
+                    .map(|(p, g, body, out)| (p.clone(), g.clone(), body.clone(), *out))
                     .collect(),
             },
             MirInst::Define(name, r) => MirInst::Define(name.clone(), m(*r)),

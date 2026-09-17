@@ -271,10 +271,112 @@ fn e2e_match_default_runs() {
     assert_ok("match_default.mora");
 }
 
-/// v0.87: match_guard.mora — `n when n > 0 => ...` guard conditions。
+/// v0.104.3: `match … with … -> … end` —— spec §14.2 EBNF 与 §7.3/§7.4/§7.5
+/// 教学章节的模式匹配**唯一**拼写（8+ 处示例）。
+///
+/// 缺陷：`emit_match_w` 无条件 `consume(LBrace)`，该形态从未实现 ——
+/// 规范自己整章的模式匹配文档逐字无法运行（"Expected '{' after match
+/// subject"）；CHANGELOG 中**无**该形态被移除的记录（对比 `route` 有明确
+/// 「已移除」声明），故属承诺语法未接线。现两种拼写共用 arm emitter，
+/// 仅体终止符（`end` / `}`）与 arm 分隔（换行 / `,`）不同。
+#[test]
+fn e2e_match_with_arrow_form_matches_spec() {
+    use e2e_helpers::assert_source_ok;
+    use mora::value::Value;
+    let s = |v: Value| match v {
+        Value::String(x) => x,
+        other => panic!("期望字符串，得到 {:?}", other),
+    };
+    // §7.3 模式匹配（字面量 + 通配）
+    let v = assert_source_ok(
+        "let value = 1i\nmatch value with\n  0i -> \"zero\"\n  1i -> \"one\"\n  _ -> \"unknown\"\nend",
+    );
+    assert_eq!(s(v), "one", "with/-> form：字面量 arm");
+    // §7.4 守卫条件 when
+    let v = assert_source_ok(
+        "let n = 5i\nmatch n with\n  x when x > 0i -> \"positive\"\n  x when x < 0i -> \"negative\"\n  _ -> \"zero\"\nend",
+    );
+    assert_eq!(s(v), "positive", "with/-> form：when 守卫");
+    // §7.5 列表 rest 模式
+    let v = assert_source_ok(
+        "match [1i, 2i, 3i] with\n  [h, ...t] -> \"nonempty\"\n  _ -> \"empty\"\nend",
+    );
+    assert_eq!(s(v), "nonempty", "with/-> form：rest 模式");
+    // 两种拼写必须一致（同一程序不同写法）
+    let a = assert_source_ok("match 2i {\n  1i => \"a\"\n  _ => \"b\"\n}");
+    let b = assert_source_ok("match 2i with\n  1i -> \"a\"\n  _ -> \"b\"\nend");
+    assert_eq!(s(a), s(b), "`{{}}/=>` 与 `with/->` 两种拼写结果必须一致");
+}
+
+/// v0.104.3: arm body 只需**彼此一致**，不必与被匹配值同型。
+///
+/// 缺陷：双向预扫用 `check_against(&arm.body, &scrutinee_ty)` —— arm body 是
+/// match 的**结果值**，与 scrutinee 类型无关。于是
+/// `match 1i { 1i => "one", _ => "other" }`（body 全 String、scrutinee Int）
+/// 报 "expected Int, got String"，**任何** body 类型 != scrutinee 类型的
+/// match 都被误拒（规范 §7.3/§7.4/§7.5 示例全是这个形状）。
+/// 现按 joined 检查；arm 之间不兼容时仍由 HM 报错（契约未放松）。
+#[test]
+fn e2e_match_arm_body_need_not_match_scrutinee() {
+    use e2e_helpers::assert_source_ok;
+    use mora::value::Value;
+    // body String / scrutinee Int —— 必须通过
+    let v = assert_source_ok("match 1i {\n  1i => \"one\"\n  _ => \"other\"\n}");
+    assert!(
+        matches!(v, Value::String(ref x) if x == "one"),
+        "arm body 无需与 scrutinee 同型，得到 {:?}",
+        v
+    );
+    // body Int / scrutinee String —— 同样通过
+    let v = assert_source_ok("match \"k\" {\n  \"k\" => 42i\n  _ => 0i\n}");
+    assert!(
+        matches!(v, Value::Int(42) | Value::Float(_)),
+        "反向也应通过，得到 {:?}",
+        v
+    );
+    // 反向契约：arm 之间**不兼容**时仍必须报错
+    let (_, ws) = mora::cli::compile_and_opt(
+        "match 1i {\n  1i => \"str\"\n  _ => 42i\n}\n",
+        None,
+    )
+    .expect("compile");
+    let errs = mora::typeck::check_mir::check_program_witnesses_bidirectional(&ws);
+    assert!(
+        !errs.is_empty(),
+        "异质 arm body（String vs Int）必须被拒，实际无错误"
+    );
+}
+
+/// v0.87 / v0.104.3: match_guard.mora — `n when cond => …` 守卫条件。
+///
+/// v0.104.3: 从 `assert_ok` 冒烟升级为**精确值断言**。
+///
+/// 缺陷：守卫曾被发射进一个随即丢弃的子 EmitContext，其寄存器在外层 `regs`
+/// 中从未被写过 → `h_match_expr` 读到 Nil → **守卫恒假、`when` 完全失效**，
+/// match 落到后续 arm；且 9 层管线在 `witness_to_fcfg` 里把守卫硬编码为
+/// `None`，整个丢弃。原 fixture 的 7 组取值恰好让**首个** arm 的守卫为真，
+/// 故在缺陷下也"通过" —— 属侥幸。fixture 末尾新增的 ①②③ 把「必须落在哪个
+/// arm」做成唯一正确解，守卫失效时结果明确错误，并由本测试断言。
 #[test]
 fn e2e_match_guard_runs() {
-    assert_ok("match_guard.mora");
+    use e2e_helpers::assert_ok;
+    use mora::value::Value;
+    let (last_expr, _) = assert_ok("match_guard.mora");
+    let got: Vec<String> = match last_expr {
+        Value::List(items) => items
+            .iter()
+            .map(|v| match v {
+                Value::String(s) => s.clone(),
+                other => panic!("期望字符串元素，得到 {:?}", other),
+            })
+            .collect(),
+        other => panic!("期望守卫结果列表，得到 {:?}", other),
+    };
+    assert_eq!(
+        got,
+        vec!["negative", "middle", "seven"],
+        "守卫必须真正参与 arm 选择：① 负值→第二 arm ② 双侧假→通配 ③ 第二 arm 成立"
+    );
 }
 
 /// v0.87: match_list_rest.mora — `[a, b, ..rest]` list rest destructuring。

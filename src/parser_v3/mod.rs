@@ -106,7 +106,10 @@ impl ParserV3 {
 /// + witness 侧 WitnessArm。结构体分组避免五元组返回（type_complexity）。
 struct EmittedMatchArm {
     pat_str: String,
-    guard: Option<Reg>,
+    /// v0.104.3: 守卫是**延迟求值**的 MirFunction（在模式绑定之后由
+    /// `h_match_expr` 调用），不再是外层寄存器 —— 守卫引用模式绑定变量，
+    /// 那些绑定只在匹配成功时才存在于 env。
+    guard: Option<Box<MirFunction>>,
     body_mir: Box<MirFunction>,
     val_reg: Reg,
     witness: crate::mir::witness::WitnessArm,

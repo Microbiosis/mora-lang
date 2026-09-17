@@ -1933,19 +1933,48 @@ impl ParserV3 {
         let span = self.span_of_current();
         self.advance(); // 'match'
         let (val_reg, scrutinee_w) = self.emit_expr_w()?;
-        self.consume(TokenType::LBrace, "Expected '{' after match subject")?;
+        // v0.104.3: **两种 arm 体形态** ——
+        //   1. spec §14.2 EBNF（`match_stmt = "match" expr "with"
+        //      { pattern [ "when" expr ] "->" expr } "end"`）与 §7.3/§7.4/§7.5
+        //      的模式匹配教学章节、§2.2/§12 示例共 8+ 处：`with … -> … end`
+        //   2. 既有实现形态：`{ … => … }`（全部 fixtures 用此形态）
+        //
+        // **缺陷**：`with … -> … end` 从未被实现 —— `emit_match_w` 无条件
+        // `consume(TokenType::LBrace)`，于是规范自己**整章**的模式匹配文档
+        // （§7.3 模式匹配 / §7.4 守卫 / §7.5 列表 rest）逐字无法运行，
+        // 报 "Expected '{' after match subject"。而 CHANGELOG 中**没有**
+        // 该形态被移除的记录（对比 `route`：有明确的「已移除」声明与条目），
+        // 因此属「承诺语法未接线」，与 `assign` 同类的真实缺陷。
+        // 两种形态共用 arm emitter，仅体终止符（`end` / `}`）与 arm 分隔
+        // （换行 / `,`）不同。
+        let with_form = self.match_token_exact(TokenType::With);
         let mut arms = Vec::new();
         let mut arm_wits = Vec::new();
-        while !self.check(&TokenType::RBrace) && !self.is_at_end() {
-            if let Some(arm) = self.emit_match_arm_w() {
-                arms.push((arm.pat_str, arm.guard, arm.body_mir, arm.val_reg));
-                arm_wits.push(arm.witness);
-                let _ = self.match_token(&[TokenType::Comma]);
-            } else {
-                self.advance();
+        if with_form {
+            while !self.check(&TokenType::End) && !self.is_at_end() {
+                if let Some(arm) = self.emit_match_arm_w() {
+                    arms.push((arm.pat_str, arm.guard, arm.body_mir, arm.val_reg));
+                    arm_wits.push(arm.witness);
+                } else {
+                    // 解析失败前进一 token 保证进度（不静默死循环）
+                    self.advance();
+                }
+                while self.match_token(&[TokenType::Newline]) {}
             }
+            self.consume(TokenType::End, "Expected 'end' after match arms")?;
+        } else {
+            self.consume(TokenType::LBrace, "Expected '{' or 'with' after match subject")?;
+            while !self.check(&TokenType::RBrace) && !self.is_at_end() {
+                if let Some(arm) = self.emit_match_arm_w() {
+                    arms.push((arm.pat_str, arm.guard, arm.body_mir, arm.val_reg));
+                    arm_wits.push(arm.witness);
+                    let _ = self.match_token(&[TokenType::Comma]);
+                } else {
+                    self.advance();
+                }
+            }
+            self.consume(TokenType::RBrace, "Expected '}' after match arms")?;
         }
-        self.consume(TokenType::RBrace, "Expected '}' after match arms")?;
         // v0.104: match 的结果寄存器必须位于**外层函数**的寄存器空间，且所有
         // arm 共用它（`h_match_expr` 把选中 arm 的返回值写进 `regs[output_reg]`；
         // `MirInst::dst()` 对 MatchExpr 取的正是 `arms.last().3`）。
@@ -1975,22 +2004,45 @@ impl ParserV3 {
 
     fn emit_match_arm_w(&mut self) -> Option<EmittedMatchArm> {
         let pattern = self.emit_pattern()?;
-        // v0.87: Detect optional "when <guard_expr>" before FatArrow
-        let guard_reg = if let TokenType::Identifier(ref name) = self.peek()?.token_type
+        // v0.104.3: arm 箭头有**两种拼写** —— `=>`（既有实现形态、全部
+        // fixtures 使用）与 `->`（spec §14.2 EBNF 与 §7.3/§7.4/§7.5 教学章节
+        // 一律使用）。lexer 早有 `TokenType::Arrow`，只是 match arm 从未接受它。
+        let is_arrow = |t: &TokenType| {
+            matches!(t, TokenType::FatArrow | TokenType::Arrow)
+        };
+        // v0.87: Detect optional "when <guard_expr>" before the arm arrow
+        //
+        // v0.104.3 修复：守卫与 arm body 同构 —— 发射成**延迟求值**的
+        // MirFunction，由 `h_match_expr` 在**模式绑定之后**调用。
+        //
+        // 缺陷：守卫此前在外层寄存器空间求值，而守卫通常引用**模式绑定变量**
+        //（`x when x > 0`）—— 绑定只发生在 `h_match_expr` 匹配成功之时
+        //（`self_match_pattern` 把 val define 进 env）。外层求值时该变量尚不
+        // 存在 → 读到 Nil → `is_truthy(Nil) == false` → **该 arm 恒被跳过**，
+        // `when` 完全失效。实测 `match -5i { x when x > 0i => "positive"
+        // x when x < 0i => "negative" _ => "zero" }` 返回 "positive"；
+        // fixture `match_guard.mora` 之所以"通过"只因取值 42/0 恰好让首守卫
+        // 为真 —— 属侥幸。
+        let guard = if let TokenType::Identifier(ref name) = self.peek()?.token_type
             && name == "when"
         {
             self.advance(); // consume "when"
-            // Parse guard expression in a sub-context (isolated registers)
+            // 独立寄存器空间（与 arm body 同规则）：守卫体自成 MirFunction
             let guard_parent =
                 std::mem::replace(&mut self.emit, crate::mir::lower::EmitContext::new());
             let (guard_val_reg, guard_w) = self.emit_expr_w()?;
             self.emit.emit(MirInst::Return(Some(guard_val_reg)));
-            let _guard_mir =
-                std::mem::replace(&mut self.emit, guard_parent).finish();
-            self.consume(TokenType::FatArrow, "Expected '=>' after guard")?;
-            Some((guard_val_reg, guard_w))
+            let guard_mir = std::mem::replace(&mut self.emit, guard_parent).finish();
+            if !self.peek().map(|t| is_arrow(&t.token_type)).unwrap_or(false) {
+                return None;
+            }
+            self.advance(); // consume '=>' 或 '->'
+            Some((Box::new(guard_mir), guard_w))
         } else {
-            self.consume(TokenType::FatArrow, "Expected '=>' in match arm")?;
+            if !self.peek().map(|t| is_arrow(&t.token_type)).unwrap_or(false) {
+                return None;
+            }
+            self.advance(); // consume '=>' 或 '->'
             None
         };
         // 子上下文：arm body 是独立寄存器空间（镜像 lower Match 分支）
@@ -2001,12 +2053,12 @@ impl ParserV3 {
         let pat_str = crate::mir::lower::pattern_to_string(&pattern);
         let witness = crate::mir::witness::WitnessArm {
             pattern,
-            guard: guard_reg.as_ref().map(|(_, w)| w.clone()),
+            guard: guard.as_ref().map(|(_, w)| w.clone()),
             body: body_w,
         };
         Some(EmittedMatchArm {
             pat_str,
-            guard: guard_reg.map(|(r, _)| r),
+            guard: guard.map(|(m, _)| m),
             body_mir: Box::new(body_mir),
             val_reg: arm_val_reg,
             witness,

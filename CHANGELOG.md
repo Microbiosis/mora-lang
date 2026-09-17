@@ -2,6 +2,86 @@
 
 All notable changes to Mora will be documented in this file.
 
+## [v0.104.3] — 2026-09-17 — fix: match 的 spec 形式与 when 守卫（3 处缺陷）
+
+上一轮 EBNF 实测脚本的失败判据漏了 `Parse error:` 前缀，导致 `match` 相关
+形式被误记为通过。复核后修复 3 处真实缺陷。
+
+### `match … with … -> … end` 从未实现（承诺语法未接线）
+
+spec §14.2 EBNF 的 `match_stmt = "match" expr "with" { pattern [ "when" expr ]
+"->" expr } "end"`，且 §7.3 模式匹配 / §7.4 守卫 / §7.5 列表 rest 三个**教学
+章节**、§2.2/§12 示例共 8+ 处一律使用该形态。但 `emit_match_w` 无条件
+`consume(LBrace)` —— 规范自己整章的模式匹配文档逐字无法运行，报
+"Expected '{' after match subject"。CHANGELOG 中**无**该形态被移除的记录
+（对比 `route` 有明确「已移除」声明与条目），故属承诺语法未接线。
+
+现在两种拼写共用 arm emitter，仅体终止符（`end` / `}`）与 arm 分隔
+（换行 / `,`）不同；arm 箭头同时接受 `->` 与 `=>`（lexer 早有
+`TokenType::Arrow`，只是 match arm 从未接受）。
+
+### `when` 守卫**完全失效**（恒为假）
+
+两处独立缺陷叠加：
+
+1. **守卫在被丢弃的子上下文中求值**：`emit_match_arm_w` 把守卫发射进一个
+   随即丢弃的 `EmitContext`，再把该子上下文的寄存器号当天外层寄存器用。
+   `h_match_expr` 读 `regs[guard]` —— 外层那个位置从未被写过 → 读到 `Nil`
+   → `is_truthy(Nil) == false` → **该 arm 恒被跳过**。
+2. **9 层管线整个丢弃守卫**：`witness_to_fcfg` 把 arm 硬编码为
+   `guard: None`，即使 emit 路径修好守卫语义，管线产出仍无守卫。
+
+根因是**求值时机**：守卫通常引用**模式绑定变量**（`x when x > 0`），而绑定
+只发生在 `h_match_expr` 匹配成功之时（`self_match_pattern` 把 `val` define
+进 env）。在守卫发射期（外层）该变量尚不存在，任何信号都取不到值。
+
+修法：守卫与 arm body 同构 —— `MirInst::MatchExpr` 的 arm 元组第 2 项由
+`Option<Reg>` 改为 `Option<Box<MirFunction>>`（新增 `MatchArmInst` 类型别名），
+`h_match_expr` 在模式绑定**之后**调用守卫体、按真值决定是否采用该 arm。
+`fcfg::MatchArm.guard` 同步由 `Option<Reg>` 改为 `Option<Block<M>>`，
+`fcfg_lower` / `lower.rs` / `witness_to_fcfg` / `annotate` 四处跟随。
+
+**该缺陷此前被 fixture 掩盖**：`match_guard.mora` 的 7 组取值恰好让**首个**
+arm 的守卫为真，故在「守卫恒假」下也"通过" —— 属侥幸。实测判别：
+```mora
+let n = -5i
+match n { x when x > 0i => "positive"
+          x when x < 0i => "negative"
+          _ => "zero" }        -- 修复前返回 "positive"（守卫被跳过）
+```
+fixture 已补 3 组判别用例（负值 → 第二 arm / 双侧假 → 通配 / 第二 arm 成立），
+e2e 断言从 `assert_ok` 升级为精确值 `["negative", "middle", "seven"]`。
+
+### 双向预扫用 scrutinee 误检 arm body
+
+`BidirectionalChecker` 用 `check_against(&arm.body, &scrutinee_ty)` —— arm body
+是 match 的**结果值**，与「被匹配的值是什么类型」无关。于是
+`match 1i { 1i => "one", _ => "other" }`（body 全 String、scrutinee Int）报
+"expected Int, got String"，**任何** body 类型 ≠ scrutinee 类型的 match 都被
+误拒（规范 §7.3/§7.4/§7.5 示例全是这个形状）。改为与 **joined** 比较；arm 之间
+不兼容时仍由 HM 的 `infer_match` 报错（契约未放松，已加反向测试）。
+
+三个建立在旧（错误）契约上的单测同步改写：
+- `phase_d_match_arm_body_subtype_mismatch_reports` → 拆为
+  `phase_d_match_arm_body_checked_against_joined_not_scrutinee`（body String /
+  scrutinee Int **必须通过**）与
+  `phase_d_match_heterogeneous_arms_still_rejected`（异质 arm 仍须报错）；
+- `phase_d_match_marks_diagnosed` → `phase_d_match_homogeneous_arms_pass_without_diagnosis`；
+- `phase_e_match_error_hint_contains_joined_types` → 改为直接验证
+  `join_types` 的 hint 文本构造（原路径已不再报错）。
+
+### 测试
+
+新增 `e2e_match_with_arrow_form_matches_spec`（§7.3 字面量 / §7.4 守卫 /
+§7.5 rest + 两种拼写结果一致）、`e2e_match_arm_body_need_not_match_scrutinee`
+（含反向：异质 arm 必须被拒）；`e2e_match_guard_runs` 升级为精确值断言。
+957 lib + 58 e2e + 全 28 套件 0 失败，clippy -D warnings 清零。
+
+### 构建产物
+
+按官方手段清理：`cargo clean -p mora` + `cargo clean`，`target/` 全清后冷重建
+（1m32s，7.6G）。此前 48G 的堆积产物（含 18320 文件、45.4GiB）已消除。
+
 ## [v0.104.2] — 2026-09-17 — fix: EBNF 关键字逐个实测 —— 管道语义 / if-then 拼写 / 跳转目标重映射
 
 按上一轮遗留项：**逐个实测** spec §14.2 EBNF 的每个语句关键字（不再依赖

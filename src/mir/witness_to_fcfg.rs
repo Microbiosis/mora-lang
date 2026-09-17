@@ -221,7 +221,10 @@ fn build_node(b: &mut FcfgBuilder, w: &MirWitness) -> Node<()> {
                 .iter()
                 .map(|arm| MatchArm {
                     pattern: witness_pattern_to_pattern(&arm.pattern),
-                    guard: None,
+                    // v0.104.3: 守卫必须**随节点携带**（独立块体，延迟求值）。
+                    // 此前硬编码 `guard: None` —— 9 层管线把 `when` 守卫整个
+                    // 丢弃，即使 emit 路径修好守卫语义，管线产出仍无守卫。
+                    guard: arm.guard.as_ref().map(|g| build_block(b, g)),
                     body: build_block(b, &arm.body),
                 })
                 .collect();

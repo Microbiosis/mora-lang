@@ -431,7 +431,13 @@ pub struct Block<M> {
 #[derive(Debug, Clone)]
 pub struct MatchArm<M> {
     pub pattern: Pattern,
-    pub guard: Option<Reg>,
+    /// v0.104.3: 守卫是**块体**（独立寄存器空间、延迟求值），不再是外层寄存器。
+    ///
+    /// 守卫引用**模式绑定变量**（`x when x > 0`），而那些绑定只在
+    /// `h_match_expr` 匹配成功时才进入 env —— 外层求值读不到，守卫恒假。
+    /// 与 `body` 同构：lowering 后成为独立 `MirFunction`，由 handler 在绑定
+    /// 之后调用。
+    pub guard: Option<Block<M>>,
     pub body: Block<M>,
 }
 

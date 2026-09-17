@@ -4,7 +4,7 @@ use crate::flow::is_truthy;
 
 use crate::mir::vm::{run_mir, self_match_pattern, value_to_string};
 
-use crate::mir::{MirFunction, Reg};
+use crate::mir::Reg;
 
 use crate::mir::host::MirHost;
 
@@ -19,24 +19,37 @@ pub fn h_match_expr(
     env: &mut Environment,
     regs: &mut [Value],
     val: Reg,
-    arms: &[(String, Option<Reg>, Box<MirFunction>, Reg)],
+    arms: &[crate::mir::MatchArmInst],
     effects: &mut crate::mir::effect::Effects,
 ) -> Result<(), String> {
     let val_val = regs[val].clone();
     let mut matched = false;
-    for (pat_str, cond_reg, arm_func, output_reg) in arms {
+    for (pat_str, guard_func, arm_func, output_reg) in arms {
         if !self_match_pattern(&val_val, pat_str, None, env) {
             continue;
         }
-        if let Some(guard) = cond_reg && !is_truthy(&regs[*guard]) {
-            continue;
+        // v0.104.3: 守卫在**模式绑定之后**求值 —— `self_match_pattern` 已把
+        // 绑定变量 define 进 `env`，守卫体因此能读到它们；再按真值决定是否
+        // 采用该 arm。此前守卫是「外层寄存器」，而绑定只在匹配时才存在 →
+        // 读到 Nil → 守卫恒假、`when` 完全失效（fixture match_guard.mora
+        // 只因取值恰好让首守卫为真而"通过"）。
+        if let Some(guard) = guard_func {
+            let g = run_mir(
+                &std::sync::Arc::new((**guard).clone()),
+                interp,
+                env,
+                effects,
+            )?;
+            if !is_truthy(&g) {
+                continue;
+            }
         }
         let result = run_mir(&std::sync::Arc::new((**arm_func).clone()), interp, env, effects)?;
         regs[*output_reg] = result;
         matched = true;
         break;
     }
-    if !matched && let Some((_pat, _cond, _func, output_reg)) = arms.first() {
+    if !matched && let Some((_pat, _guard, _func, output_reg)) = arms.first() {
         regs[*output_reg] = Value::Nil;
     }
     Ok(())

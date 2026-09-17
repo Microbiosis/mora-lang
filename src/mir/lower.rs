@@ -437,16 +437,27 @@ impl WitnessLowerer {
                 // `n_regs`，`h_match_expr` 越界 panic；另分配的 `dst` 无人写、
                 // 消费者恒读 Nil。与 fcfg_lower 的 `lower_match` 同契约。
                 let dst = self.alloc_reg();
-                let match_arms: Vec<(String, Option<Reg>, Box<MirFunction>, Reg)> = arms
-                    .iter()
-                    .map(|arm| {
-                        let pat_str = pattern_to_string(&arm.pattern);
-                        let mut body_lowerer = WitnessLowerer::new();
-                        let arm_val_reg = body_lowerer.lower_witness(&arm.body)?;
-                        body_lowerer.emit(MirInst::Return(Some(arm_val_reg)));
-                        Ok((pat_str, None, Box::new(body_lowerer.finish()), dst))
-                    })
-                    .collect::<Result<Vec<_>, String>>()?;
+                let match_arms: Vec<crate::mir::MatchArmInst> =
+                    arms.iter()
+                        .map(|arm| {
+                            let pat_str = pattern_to_string(&arm.pattern);
+                            let mut body_lowerer = WitnessLowerer::new();
+                            let arm_val_reg = body_lowerer.lower_witness(&arm.body)?;
+                            body_lowerer.emit(MirInst::Return(Some(arm_val_reg)));
+                            // v0.104.3: 守卫降维为独立 MirFunction —— 在模式绑定
+                            // 之后由 `h_match_expr` 调用（守卫引用绑定变量）。
+                            let guard = match &arm.guard {
+                                Some(g) => {
+                                    let mut gl = WitnessLowerer::new();
+                                    let gr = gl.lower_witness(g)?;
+                                    gl.emit(MirInst::Return(Some(gr)));
+                                    Some(Box::new(gl.finish()))
+                                }
+                                None => None,
+                            };
+                            Ok((pat_str, guard, Box::new(body_lowerer.finish()), dst))
+                        })
+                        .collect::<Result<Vec<_>, String>>()?;
                 self.emit(MirInst::MatchExpr {
                     val: val_reg,
                     arms: match_arms,

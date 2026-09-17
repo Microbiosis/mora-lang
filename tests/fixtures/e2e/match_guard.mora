@@ -1,4 +1,13 @@
--- v0.87: match guard conditions (when)
+-- v0.87 / v0.104.3: match guard conditions (when)
+--
+-- v0.104.3 断言入口：本 fixture 的**末表达式**是守卫结果列表，
+-- 使 e2e 可用 `run_source` 直接断言精确值（无需子进程捕获 stdout）。
+--
+-- 缺陷背景：守卫曾被发射进随即丢弃的子 EmitContext，其寄存器在外层 regs
+-- 中从未被写过 → `h_match_expr` 读到 Nil → 守卫恒假、`when` 完全失效；
+-- 且 9 层管线在 witness_to_fcfg 里把守卫硬编码为 None，整个丢弃。
+-- 原 fixture 的取值恰好让**首个** arm 的守卫为真，故在缺陷下也"通过"
+-- —— 属侥幸。下方 ①②③ 把「必须落在哪个 arm」做成唯一正确解。
 task main()
   let n = 42
   let result1 = match n {
@@ -55,3 +64,36 @@ task main()
   }
   print(result7)
 end
+
+-- ── v0.104.3 判别用例（守卫必须真正参与 arm 选择）──
+-- 下面的值把「应当落在哪个 arm」做成唯一正确解；守卫失效时结果明确错误。
+
+-- ① 负值 → 首守卫为假，必须落到第二个 arm
+let neg = -5
+let r8 = match neg {
+  x when x > 0 => "positive"
+  x when x < 0 => "negative"
+  _ => "zero"
+}
+
+-- ② 两侧守卫皆假 → 必须落到通配 arm
+let mid = 0
+let r9 = match mid {
+  x when x > 10 => "big"
+  x when x < -10 => "small"
+  _ => "middle"
+}
+
+-- ③ 第二个 arm 的守卫才成立
+let val = 7
+let r10 = match val {
+  n when n > 100 => "huge"
+  n when n == 7 => "seven"
+  _ => "other"
+}
+
+-- v0.104.3 断言入口：`print` 供人工观察，**末尾的列表表达式**是程序末值，
+-- 供 e2e 的 `run_source`/`assert_ok` 直接断言（`run_e2e` 不捕获 stdout，
+-- last_expr 取自顶层末表达式）。
+print([r8, r9, r10])
+[r8, r9, r10]

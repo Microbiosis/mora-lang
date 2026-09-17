@@ -395,7 +395,7 @@ fn annotate_block(block: &Block<()>, table: &TypeTable) -> Block<TypeInfo> {
 fn annotate_arm(arm: &MatchArm<()>, table: &TypeTable) -> MatchArm<TypeInfo> {
     MatchArm {
         pattern: arm.pattern.clone(),
-        guard: arm.guard,
+        guard: arm.guard.as_ref().map(|g| annotate_block(g, table)),
         body: annotate_block(&arm.body, table),
     }
 }

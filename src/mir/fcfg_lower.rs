@@ -654,8 +654,7 @@ fn lower_match(ctx: &mut EmitContext, scrutinee: Reg, dst: Reg, arms: &[MatchArm
     // 镜像 emit_match_w：单条 MatchExpr，arm body 为嵌套 MirFunction
     //（末尾带 Return）。output_reg 统一为 dst — 所有 arm 写同一寄存器，
     // 消费者（let/Define/嵌套表达式）读 dst（与 inst.dst() 约定一致）。
-    let mir_arms: Vec<(String, Option<Reg>, Box<super::MirFunction>, Reg)> = arms
-        .iter()
+    let mir_arms: Vec<super::MatchArmInst> = arms.iter()
         .map(|arm| {
             let pat_str = fcfg_pattern_to_string(&arm.pattern);
             let mut body_fn = lower_block_to_function(ctx, &arm.body);
@@ -664,7 +663,17 @@ fn lower_match(ctx: &mut EmitContext, scrutinee: Reg, dst: Reg, arms: &[MatchArm
                 let result_reg = arm.body.result.unwrap_or(0);
                 body_fn.body.push(MirInst::Return(Some(result_reg)));
             }
-            (pat_str, arm.guard, Box::new(body_fn), dst)
+            // v0.104.3: 守卫降维为独立 MirFunction（在模式绑定之后由
+            // `h_match_expr` 调用）—— 与 body 同规则。
+            let guard_fn = arm.guard.as_ref().map(|g| {
+                let mut gf = lower_block_to_function(ctx, g);
+                if gf.body.is_empty() || !matches!(gf.body.last(), Some(MirInst::Return(_))) {
+                    let r = g.result.unwrap_or(0);
+                    gf.body.push(MirInst::Return(Some(r)));
+                }
+                Box::new(gf)
+            });
+            (pat_str, guard_fn, Box::new(body_fn), dst)
         })
         .collect();
     let _ = ctx.alloc_reg(); // 镜像 emit_match_w：结果寄存器槽位保留

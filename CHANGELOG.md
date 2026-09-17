@@ -2,6 +2,98 @@
 
 All notable changes to Mora will be documented in this file.
 
+## [v0.104.1] — 2026-09-17 — fix: 缺陷审计第三轮 —— 类型检查桩 / assign 语句 / I/O 错误路径
+
+按「生产路径 panic!/unwrap、静默吞错、零 producer IR 变体、spec↔实现落差」
+四条线索做系统性穷举扫描。零 producer 变体与静默吞错两项**未发现新缺陷**
+（结论见下），另两项发现并修复 4 处。
+
+### 类型检查桩：`for`/`while` 的 body 从未被推断（影响面最大）
+
+- `HMInference::infer_expr` 的 `WitnessKind::Loop`/`While` 分支自 v0.55 起是
+  空桩 `Ok((Type::Nil, EffectRow::Empty))` —— **完全不推断** iterable、条件与
+  body。后果有四：
+  1. **循环体内任何未定义变量静默通过**，运行期读成 `nil`：
+     `for i in [1,2,3] print(nosuchvar) end` 不报错；
+  2. 体内的 `perform` 效果行不进残差行 → 根边界 unhandled-effect 断言**漏检**
+     （`perform Ai("x")` 在循环体内逃过静态检查，运行期才报）；
+  3. `while <非布尔>` 与 `if <非布尔>` 契约分叉（后者报错、前者放行）；
+  4. `for x in <非列表>` 到运行期才由 `len()` 报错。
+- 现在：迭代变量按 iterable 元素类型绑定（`list<T>` → `T`；`string` → `char`；
+  TypeVar/Any/dict 宽容取 fresh 变量），`while` 条件要求 Bool（与 `if` 同契约，
+  宽容 TypeVar/Any/Unknown），body 在子作用域推断、效果行并入，循环整体为 Nil。
+- 该桩同时**掩盖**了下面 `assign` 缺陷 —— 循环体内的 `assign` 语句因此"看似可用"。
+
+### `assign` 语句从未被识别（spec §14.2 `assign_stmt`）
+
+- 词法层 `assign` 是普通标识符（`TokenType::Identifier("assign")`），分派表
+  无对应 arm → 整条语句落回**表达式**路径，发出 `Var("assign")` 读一个不存在
+  的变量。顶层与 task 体内一律报 `Unbound variable 'assign'`；witness 树里还
+  多一个假的 `Variable("assign")` 节点。
+- 新增 `emit_assign_w`（`assign` → 标识符 → `=` → 表达式 → `MirInst::Assign`
+  + `WitnessKind::Assign`），并入顶层与嵌套两个分派器，前瞻守卫保留
+  `assign(...)` 同名调用。
+
+### 数值塔在「含未解析变量」与「赋值」位点的分叉
+
+- `infer_binop` 的算术/比较分支对 TypeVar 直接推 `Eq`，把未解析变量**当场钉到**
+  对侧具体类型，之后无法参与数值塔提升。实例（语言自身 fixtures 的形状）：
+  ```mora
+  let total = 0i
+  for i in [1, 2, 3]        -- i 的元素类型是 fresh TypeVar
+    if i == 6i …            -- Eq(α, Int) 把 α 钉成 Int
+    total = total + i       -- 随后列表的 Eq(α, Float) 冲突 → "expected float, got int"
+  end
+  ```
+  现在「恰有一侧是具体数值、另一侧是 TypeVar」以及比较位点的 TypeVar 都走
+  `Numeric`（solve 阶段按已解析结果提升）；两侧都是 TypeVar 时保持 `Eq`
+  （泛型算术 `task add(a,b) a + b end` 仍可用）。
+- `infer_assign` 无条件推 `Eq(existing, value_ty)`，而 `unify` 没有任何
+  Int/Float 交叉 arm（提升专门由 `Numeric` 负责）→ 数值目标改为 `Numeric`，
+  非数值目标仍走严格 `Eq`。这与 `let z = total + i` 的既有一致。
+
+### CLI I/O 错误路径
+
+- `run_file` / `run_check` 用 `fs::read_to_string(path).expect(...)`：路径不存在、
+  无权限或是目录时打印 Rust panic 与回溯、退出码 101。改为可读错误 + 退出码 1
+  （与 typecheck/解析错误的 exit(2) 区分：I/O 早于编译）。
+
+### 扫描结论（未发现缺陷的两项）
+
+- **零 producer IR 变体**：`MirInst` 58 变体、`WitnessKind` 47 变体、`Node` 50
+  变体、`Pattern` 8 变体**全部有构造点**；`MirInst` 的 4 处穷举点
+  （inst.rs / ssa.rs / pipeline.rs / cost.rs）与 `WitnessKind` 的 5 处穷举点
+  （child_witnesses / lower_witness / witness_to_fcfg / infer_expr /
+  tree_effect_row）**均 100% 覆盖**。
+- **静默吞错**：`let _ = <fallible>` 候选 9 处，逐一核对后 7 处为绑定丢弃
+  （`let _ = std::mem::replace(...)`）或不可失败的 `send`/`flush`；2 处
+  （`mcp_server.rs` 的 notification 分支、`schedule/mod.rs` 的 best-effort
+  持久化）是**有注释说明的故意设计**，非缺陷。
+- **panic!/unwrap/expect**：157 处命中里绝大多数是 `lock().expect("… poisoned")`
+  惯用法（AGENTS.md §3 明确要求 `expect` 而非 `unwrap`）与不变式断言
+  （`len==1 verified above`、`dag: queue drained`），非用户可达 panic；
+  仅 CLI I/O 两处属真实缺陷，已修。
+
+### 安全审计
+
+- 补跑完整 Mimosa deep 扫描并**取得密封结论**（此前提交钩子报
+  `scanner_enobufs` 未出结论）：`scan-2026-09-17T05-50-54.094Z-a201487bf476`，
+  seal `sha256:b3f3fb97e7302cc91817d7eed42ceee953213f1305095bf7adc3ca249cbc19e0`，
+  247 文件全解析、0 读取/解析失败，254 包 0 advisory 命中。
+  唯一 finding（high, CWE-22）位于 `examples/lsp_v04_smoke.py:13`，
+  经复核为**误报**：`CODE_PATH` 由 `tempfile.mkdtemp()` + 硬编码文件名拼成，
+  该文件无 `sys.argv`/`input()`，无任何外部输入可达（静态分析器看不到
+  `mkdtemp` 的返回值约束）。覆盖状态 `partial`（调用图对动态派发不完整），
+  故**不宣称项目已完全审计**。
+
+### 测试
+
+- 新增 `e2e_assign_statement_recognized`（顶层/task/for/while 四处 + 未绑定目标
+  必须被拒）、`e2e_loop_bodies_are_typechecked`（for/while 体内未定义变量、
+  while 非布尔条件必须报错）、`e2e_numeric_tower_at_assign_and_unresolved_sites`
+  （Int 累加器吸收 Float 元素 + 泛型加法 + 字符串拼接不受影响）。
+- 955 lib + 52 e2e + 全集成绿，clippy -D warnings 清零。
+
 ## [v0.104] — 2026-09-16 — fix: 缺陷审计第二轮 —— 循环值传递 / 数值塔统一 / 承诺语法接线
 
 对 v0.103 之后的现状续做缺陷审计，修复三类：**DAG 控制流/优化器语义缺陷**

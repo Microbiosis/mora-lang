@@ -383,7 +383,16 @@ fn update_lock(pkg_name: &str, url: &str) {
 }
 
 fn run_file(path: &str, opt_level: Option<mora::mir::ssa::OptLevel>) {
-    let source = fs::read_to_string(path).expect("Failed to read file");
+    // v0.104: I/O 失败以可读错误 + 退出码 1 报告（此前 `expect` panic ——
+    // 路径不存在/无权限/是目录时打印 Rust panic 与回溯，退出码 101，
+    // 与 typecheck 的 exit(2)、解析错误的 exit(2) 都不一致）。
+    let source = match fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("{}: {}", path, e);
+            process::exit(1);
+        }
+    };
 
     // v0.75.40: 单遍编译（compile 直接 emit MirInst + witness）
     // v0.103: 解析失败以可读错误 + 退出码 2 报告（此前 panic）。
@@ -431,7 +440,14 @@ fn run_file(path: &str, opt_level: Option<mora::mir::ssa::OptLevel>) {
 }
 
 fn run_check(path: &str) {
-    let source = fs::read_to_string(path).expect("Failed to read file");
+    // v0.104: I/O 失败以可读错误 + 退出码 1 报告（此前 `expect` panic）。
+    let source = match fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("{}: {}", path, e);
+            process::exit(1);
+        }
+    };
 
     // v0.103: 解析失败以可读错误 + 退出码 2 报告（此前 `expect` panic）。
     let (_, witnesses) = match ParserV3::compile(&source) {

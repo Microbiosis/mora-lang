@@ -60,6 +60,128 @@ fn e2e_let_visible_inside_later_blocks() {
     );
 }
 
+/// v0.104: `assign` 是 spec §14.2 的一等语句（assign_stmt）。
+///
+/// 缺陷：`assign` 从未被识别为**语句前缀**（词法层它是普通标识符，分派表
+/// 无对应 arm），整条语句落回表达式路径 —— 发出 `Var("assign")` 读一个
+/// 不存在的变量，于是 typeck 报 `Unbound variable 'assign'`。仅当该语句位于
+/// **循环体**内时"看似可用"，因为循环体的类型检查当时是 v0.55 的桩
+/// （见本文件另一条测试）。
+#[test]
+fn e2e_assign_statement_recognized() {
+    use e2e_helpers::assert_source_ok;
+    use mora::value::Value;
+    let num = |v: Value| match v {
+        Value::Int(n) => n as f64,
+        Value::Float(n) => n,
+        other => panic!("期望数值结果，得到 {:?}", other),
+    };
+    // 顶层
+    let v = assert_source_ok("let x = 1i\nassign x = 2i\nx");
+    assert_eq!(num(v), 2.0, "顶层 assign 应生效");
+    // task 体内
+    let v = assert_source_ok("task f()\n  let x = 1i\n  assign x = 9i\n  x\nend\nf()");
+    assert_eq!(num(v), 9.0, "task 体内 assign 应生效");
+    // 循环体内
+    let v = assert_source_ok(
+        "let acc = 0\nfor i in [1, 2, 3]\n  assign acc = acc + i\nend\nacc",
+    );
+    assert_eq!(num(v), 6.0, "循环体内 assign 应生效");
+    // while 体内
+    let v = assert_source_ok("let n = 0i\nwhile n < 3i\n  assign n = n + 1i\nend\nn");
+    assert_eq!(num(v), 3.0, "while 体内 assign 应生效");
+    // 未绑定的目标必须被拒（assign 是更新，不是声明）
+    let r = mora::cli::compile_and_opt("assign zzz = 1i\n", None);
+    assert!(r.is_ok(), "语法上应可编译（语义由 typeck 拒）");
+    let ws = r.expect("compile ok").1;
+    let errs = mora::typeck::check_mir::check_program_witnesses_bidirectional(&ws);
+    assert!(!errs.is_empty(), "assign 到未绑定名字必须报错");
+}
+
+/// v0.104: `for`/`while` 的 body **必须被类型检查** —— v0.55 起是空桩。
+///
+/// 缺陷：`infer_expr` 的 `Loop`/`While` 分支直接返回 `(Type::Nil, Empty)`，
+/// **完全不推断 iterable/条件/body**。后果：
+///   - 循环体内任何未定义变量静默通过（运行期得 nil）；
+///   - 体内 `perform` 的效果行不进残差行 → 根边界 unhandled-effect 断言漏检；
+///   - `while <非布尔>` 与 `if <非布尔>` 契约分叉（后者报错）；
+///   - `for x in <非列表>` 到运行期才报错。
+#[test]
+fn e2e_loop_bodies_are_typechecked() {
+    use e2e_helpers::assert_source_ok;
+    let errs_of = |src: &str| -> Vec<String> {
+        let (_, ws) = mora::cli::compile_and_opt(src, None).expect("compile");
+        mora::typeck::check_mir::check_program_witnesses_bidirectional(&ws)
+            .iter()
+            .map(mora::typeck::format_error)
+            .collect()
+    };
+    // 未定义变量在 for 体内必须报错
+    let e = errs_of("task main()\n  for i in [1, 2, 3]\n    print(nosuchvar)\n  end\nend");
+    assert!(
+        e.iter().any(|m| m.contains("nosuchvar")),
+        "for 体内的未定义变量必须报错，实际 {:?}",
+        e
+    );
+    // 未定义变量在 while 体内必须报错
+    let e = errs_of(
+        "task main()\n  let n = 0\n  while n < 1\n    print(nosuchvar)\n  end\nend",
+    );
+    assert!(
+        e.iter().any(|m| m.contains("nosuchvar")),
+        "while 体内的未定义变量必须报错，实际 {:?}",
+        e
+    );
+    // while 条件必须是 bool（与 if 同契约）
+    let e = errs_of("while 1i { print(1i) }");
+    assert!(
+        e.iter().any(|m| m.to_lowercase().contains("bool")),
+        "while 的非布尔条件必须报错，实际 {:?}",
+        e
+    );
+    // 合法循环仍通过
+    let v = assert_source_ok("for x in [1i, 2i]\n  print(x)\nend\n42i");
+    assert!(matches!(v, mora::value::Value::Int(42) | mora::value::Value::Float(_)));
+}
+
+/// v0.104: 数值塔在**赋值**与**含未解析变量**的运算位点同样成立。
+///
+/// 缺陷：`infer_binop` 与 `infer_assign` 对 TypeVar 直接推 `Eq`，把未解析
+/// 变量当场钉到对侧具体类型，之后无法参与数值塔提升。实例（语言自身
+/// fixtures 的形状）：
+///   let total = 0i
+///   for i in [1, 2, 3]        -- i 的类型是 fresh TypeVar
+///     if i == 6i …            -- Eq(α, Int) 把 α 钉成 Int
+///     total = total + i       -- 随后列表的 Eq(α, Float) 冲突
+///   end
+/// 报 "expected float, got int"。现在含 TypeVar 的比较/算术/赋值走
+/// `Numeric`（solve 阶段按已解析结果提升）。
+#[test]
+fn e2e_numeric_tower_at_assign_and_unresolved_sites() {
+    use e2e_helpers::assert_source_ok;
+    use mora::value::Value;
+    let num = |v: Value| match v {
+        Value::Int(n) => n as f64,
+        Value::Float(n) => n,
+        other => panic!("期望数值结果，得到 {:?}", other),
+    };
+    // Int 累加器 + Float 列表 + if 比较 + assign（1+2+3+4+5 = 15）
+    let v = assert_source_ok(
+        "let total = 0i\nfor i in [1, 2, 3, 4, 5]\n  if i == 6i\n    break\n  end\n  assign total = total + i\nend\ntotal",
+    );
+    assert_eq!(num(v), 15.0, "Int 累加器吸收 Float 元素应提升为 Float");
+    // 泛型加法仍可用
+    let v = assert_source_ok("task add(a, b)\n  return a + b\nend\nadd(1i, 2i)");
+    assert_eq!(num(v), 3.0, "泛型加法不应被 Numeric 约束破坏");
+    // 字符串拼接不受影响
+    let v = assert_source_ok("let a = \"x\"\nlet b = \"y\"\na + b");
+    assert!(
+        matches!(v, Value::String(ref s) if s == "xy"),
+        "字符串拼接不受数值约束影响，得到 {:?}",
+        v
+    );
+}
+
 /// v0.103: 数值塔（Int ⊂ Float）—— 混合运算提升为 Float，
 /// 混合比较与相等按提升后数值判定。
 ///

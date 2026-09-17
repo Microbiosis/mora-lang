@@ -867,13 +867,53 @@ impl HMInference {
                 self.env.add(result_var.clone(), Type::Unknown);
                 Ok((Type::Nil, crate::mir::effect::EffectRow::Empty))
             }
-            WitnessKind::Loop { .. } => {
-                // v0.55: Loop lowering produces nil at the MIR level.
-                Ok((Type::Nil, crate::mir::effect::EffectRow::Empty))
+            // v0.104: `for x in xs … end` 的真实推断 —— 之前是 v0.55 的桩
+            // `Ok((Type::Nil, Empty))`，**完全不推断 iterable 与 body**，
+            // 于是循环体内的一切错误被静默吞掉：
+            //   for i in [1,2,3] / print(nosuchvar) end   -- 不报 Unbound，
+            //                                             运行期得 nil
+            //   for i in [1,2,3] / perform Ai("x") end    -- 效果行不进残差，
+            //                                             根边界断言漏检
+            //   for x in 5i …                             -- iterable 非列表
+            //                                             到运行期才 len() 报错
+            // 现在：迭代变量按 iterable 的元素类型绑定（list<T> → T；
+            // string → char；TypeVar/dict 宽容绑定），body 在子作用域推断，
+            // 效果行并入，循环整体为 Nil。
+            WitnessKind::Loop { var, iterable, body } => {
+                let (iter_ty, iter_row) = self.infer_expr(iterable)?;
+                let elem_ty = match &iter_ty {
+                    Type::List(elem) => elem.as_ref().clone(),
+                    Type::String => Type::Char,
+                    // TypeVar（待推断）/ Any / Unknown / dict → 宽容：元素
+                    // 类型取 fresh 变量，让 body 内的用法自然约束它。
+                    _ => self.fresh_type_var(),
+                };
+                let saved_env = self.env.clone();
+                self.env.add(var.clone(), elem_ty);
+                let (_, body_row) = self.infer_expr(body)?;
+                self.env = saved_env;
+                let row = self.merge_rows(iter_row, body_row);
+                Ok((Type::Nil, row))
             }
-            WitnessKind::While { .. } => {
-                // v0.55: While lowering produces nil at the MIR level.
-                Ok((Type::Nil, crate::mir::effect::EffectRow::Empty))
+            // v0.104: `while cond … end` 的真实推断 —— 同上，桩改为：
+            // 条件必须是 Bool（与 `if` 同一契约，此前 `while 1i` 静默放行），
+            // body 在子作用域推断，效果行并入，循环整体为 Nil。
+            WitnessKind::While { cond, body } => {
+                let (cond_ty, cond_row) = self.infer_expr(cond)?;
+                if !matches!(cond_ty, Type::Bool)
+                    && !matches!(cond_ty, Type::TypeVar(_) | Type::Any | Type::Unknown)
+                {
+                    return Err(vec![TypeError::UnificationFailure {
+                        expected: "bool".to_string(),
+                        got: cond_ty.name().to_string(),
+                        span: Some(cond.span),
+                    }]);
+                }
+                let saved_env = self.env.clone();
+                let (_, body_row) = self.infer_expr(body)?;
+                self.env = saved_env;
+                let row = self.merge_rows(cond_row, body_row);
+                Ok((Type::Nil, row))
             }
             WitnessKind::Or { left, right } | WitnessKind::And { left, right } => {
                 let (left_ty, left_row) = self.infer_expr(left)?;

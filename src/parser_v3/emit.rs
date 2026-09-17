@@ -89,12 +89,15 @@ impl ParserV3 {
             TokenType::Rel => self.emit_rel_def_w(),
             TokenType::Solve => self.emit_solve_w().map(|(_, w)| w),
             // v0.75.81: 事务家族 + eval 断言（顶层同嵌套分发）
+            // v0.104: `assign` 并入本组 —— 它是 spec §14.2 的一等语句
+            //（assign_stmt），需在顶层与嵌套上下文都走同一分派。
             TokenType::Identifier(ref s)
                 if s == "transaction"
                     || s == "commit"
                     || s == "rollback"
                     || s == "eval"
-                    || s == "aggregate" =>
+                    || s == "aggregate"
+                    || s == "assign" =>
             {
                 self.emit_statement_expr_w().map(|(_, w)| w)
             }
@@ -1437,6 +1440,19 @@ impl ParserV3 {
     pub(super) fn emit_statement_expr_w(&mut self) -> Option<(Reg, MirWitness)> {
         if self.check(&TokenType::Let) {
             return self.emit_let_w().map(|w| (0, w));
+        }
+        // v0.104: `assign <name> = <expr>`（spec §14.2 assign_stmt）—— 与
+        // `while`/`transaction` 同属标识符分发（不占新 TokenType）。前瞻守卫：
+        // 仅当 `assign` 后紧跟标识符时才拦截，保留 `assign(...)` 这类以
+        // assign 为名的普通调用。
+        if let Some(TokenType::Identifier(s)) = self.peek().map(|t| &t.token_type)
+            && s == "assign"
+            && matches!(
+                self.tokens.get(self.current + 1).map(|t| &t.token_type),
+                Some(TokenType::Identifier(_))
+            )
+        {
+            return self.emit_assign_w().map(|w| (0, w));
         }
         match self.peek()?.token_type.clone() {
             TokenType::Return | TokenType::Break | TokenType::Continue => {

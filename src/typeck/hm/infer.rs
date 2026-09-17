@@ -234,10 +234,44 @@ impl HMInference {
         if let Some(existing) = current {
             // v0.75.97: 命中 ForAll 时先实例化再合一（赋值的 LHS 是单形实例）
             let existing = self.instantiate_if_forall(&existing);
-            self.constraints.push(Constraint::Eq(
-                Box::new(existing),
-                Box::new(value_ty.clone()),
-            ));
+            // v0.104: **数值塔在赋值位点同样成立**（Int ⊂ Float）。
+            //
+            // 缺陷：此前无条件推 `Eq(existing, value_ty)`。`unify` 没有任何
+            // Int/Float 交叉 arm（它只做同构合一；提升专门由 `Numeric` 约束
+            // 负责），于是
+            //   let total = 0i
+            //   for i in [1, 2, 3]        -- 无后缀字面量是 Float
+            //     total = total + i       -- `total + i` 按塔提升为 Float
+            //   end
+            // 报 "expected float, got int"。同一表达式写在 `let` 右侧
+            // （`let z = total + i`）却合法 —— 赋值位点与 let 位点语义分叉。
+            //
+            // 运行期 `h_assign` 原样写入值、绑定表示随值变化，本就允许这种
+            // 加宽；语言自身的 fixtures（loop_break / loop_continue /
+            // loop_for_break / loop_beyond_dag_limit）也都用这个形状。
+            // 因此数值目标走 `Numeric`（把两侧归一到提升类型，`value_ty`
+            // 为 TypeVar 时留到 solve 阶段解析），非数值目标仍走严格 `Eq`。
+            if !existing.compatible_with(&value_ty) && !value_ty.compatible_with(&existing) {
+                return Err(vec![TypeError::UnificationFailure {
+                    expected: existing.name().to_string(),
+                    got: value_ty.name().to_string(),
+                    span: Some(span),
+                }]);
+            }
+            if is_numeric(&existing) {
+                self.constraints.push(Constraint::Numeric(
+                    super::unify::BinaryConstraint {
+                        left: Box::new(existing),
+                        right: Box::new(value_ty.clone()),
+                        result: None,
+                    },
+                ));
+            } else {
+                self.constraints.push(Constraint::Eq(
+                    Box::new(existing),
+                    Box::new(value_ty.clone()),
+                ));
+            }
         } else {
             return Err(vec![TypeError::UnboundVariable {
                 name: target.to_string(),
@@ -299,7 +333,29 @@ impl HMInference {
                 // v0.90.5: Numeric constraint — 允许 Int/Float 混合运算，
                 // 结果类型由 numeric promotion 规则决定（Int+Int→Int, 含 Float→Float）。
                 // TypeVar 视为潜在数值类型，推迟到 solve 阶段判定。
-                if !is_numeric(&left_ty) || !is_numeric(&right_ty) {
+                //
+                // v0.104: **「推迟」必须真的推迟** —— 此前 TypeVar 落到非数值
+                // 分支推 `Eq(left, right)`，把未解析变量**当场钉到**另一侧的
+                // 具体类型上，之后该变量若被别处约束为可提升类型就冲突。
+                //
+                // 实例（语言自身 fixtures 的形状）：
+                //   let total = 0i
+                //   for i in [1, 2, 3]        -- 元素类型是 fresh TypeVar，
+                //     total = total + i       --   Eq(elem, Float) 待解
+                //   end
+                // `total + i` 里 `i` 的类型此刻是未解析 TypeVar：Eq(Int, α)
+                // 把 α 钉成 Int，随后列表的 Eq(α, Float) 冲突 →
+                // "expected float, got int"。而按数值塔 `Int + Float` 应提升
+                // 为 Float。判据：**恰有一侧是具体数值**、另一侧是 TypeVar 时
+                // 走 `Numeric`（solve 阶段按当时解析结果提升）；两侧都是
+                // TypeVar 时保持 `Eq`（泛型算术仍需把两侧合一，Numeric 会因
+                // 无法解析两侧而误报）。
+                let left_num = is_numeric(&left_ty);
+                let right_num = is_numeric(&right_ty);
+                let left_tv = matches!(left_ty, crate::typeck::Type::TypeVar(_));
+                let right_tv = matches!(right_ty, crate::typeck::Type::TypeVar(_));
+                let defer_numeric = (left_num && right_tv) || (right_num && left_tv);
+                if (!left_num || !right_num) && !defer_numeric {
                     // 非数值类型：检查 symmetric compatible_with（如 String+String 拼接）
                     if !left_ty.compatible_with(&right_ty) {
                         return Err(vec![TypeError::UnificationFailure {
@@ -353,6 +409,23 @@ impl HMInference {
                             result: None,
                         },
                     ));
+                } else if matches!(left_ty, crate::typeck::Type::TypeVar(_))
+                    || matches!(right_ty, crate::typeck::Type::TypeVar(_))
+                {
+                    // v0.104: 未解析变量同样推迟 —— 直接把 TypeVar 钉到对侧
+                    // 具体类型会让它无法参与数值塔提升。实例：
+                    //   for i in [1, 2, 3]        -- i 的类型是 fresh TypeVar
+                    //     if i == 6i …            -- Eq(α, Int) 把 α 钉成 Int，
+                    //   end                       --   随后列表的 Eq(α, Float)
+                    // 冲突 → "expected float, got int"。走 Numeric 由 solve
+                    // 阶段按已解析结果提升。
+                    self.constraints.push(Constraint::Numeric(
+                        super::unify::BinaryConstraint {
+                            left: Box::new(left_ty),
+                            right: Box::new(right_ty),
+                            result: None,
+                        },
+                    ));
                 } else {
                     self.constraints
                         .push(Constraint::Eq(Box::new(left_ty), Box::new(right_ty)));
@@ -370,7 +443,19 @@ impl HMInference {
                 // v0.103: 同 Equal —— 数值比较经 Numeric 约束（Int/Float 提升），
                 // 非数值（如字符串）走 Eq。此前严格 Eq 使 `4i < 4.0` 被拒，
                 // 与 `compatible_with` 的 numeric 规则矛盾。
+                // v0.104: 含未解析 TypeVar 时同样推迟（理由见 Equal 分支）。
                 if is_numeric(&left_ty) && is_numeric(&right_ty) {
+                    self.constraints.push(Constraint::Numeric(
+                        super::unify::BinaryConstraint {
+                            left: Box::new(left_ty),
+                            right: Box::new(right_ty),
+                            result: None,
+                        },
+                    ));
+                } else if matches!(left_ty, crate::typeck::Type::TypeVar(_))
+                    || matches!(right_ty, crate::typeck::Type::TypeVar(_))
+                {
+                    // v0.104: 含未解析 TypeVar → 推迟到 solve（同 Equal 分支）。
                     self.constraints.push(Constraint::Numeric(
                         super::unify::BinaryConstraint {
                             left: Box::new(left_ty),

@@ -113,6 +113,39 @@ impl ParserV3 {
         })
     }
 
+    /// v0.104: `assign <name> = <expr>` —— 显式可变更新（spec §2 命令式面、
+    /// §14.2 EBNF `assign_stmt = "assign" IDENTIFIER "=" expr`）。
+    ///
+    /// **缺陷**：`assign` 从未作为**语句前缀**被识别。词法层 `assign` 是普通
+    /// 标识符（`TokenType::Identifier("assign")`），分派表里没有它的 arm，
+    /// 于是整条语句落回表达式路径 —— 发出 `Var("assign")` 读一个不存在的
+    /// 变量，紧接着 `acc = acc + i` 走「裸赋值」分支。后果分三档：
+    ///   ① typeck 报 `Unbound variable 'assign'`（顶层、task 体内均如此）；
+    ///   ② 仅当该语句位于**循环体**内时，循环体的类型检查此前是 v0.55 桩
+    ///      （见 `infer_expr` 的 Loop/While 分支）而被跳过，于是「看似可用」，
+    ///      实际靠运行期 DAG 按名字写环境掩盖；
+    ///   ③ 语义上多读一个不存在的变量，且 witness 树里多一个假的
+    ///      `Variable("assign")` 节点（`child_witnesses` 遍历者都会看到）。
+    ///
+    /// 现在按 spec 形状解析：`assign` → 标识符 → `=` → 表达式，
+    /// 产出 `MirInst::Assign` + `WitnessKind::Assign`（与裸赋值同一 IR 契约，
+    /// 目标必须是已绑定名字，由 `infer_assign` 校验）。
+    pub(super) fn emit_assign_w(&mut self) -> Option<MirWitness> {
+        let span = self.span_of_current();
+        self.advance(); // 'assign'
+        let name = self.consume_identifier("Expected variable name after 'assign'")?;
+        self.consume(TokenType::Assign, "Expected '=' in assign statement")?;
+        let (v, v_w) = self.emit_expr_w()?;
+        self.emit.emit(MirInst::Assign(name.clone(), v));
+        Some(MirWitness {
+            kind: WitnessKind::Assign {
+                target: name,
+                value: Box::new(v_w),
+            },
+            span,
+        })
+    }
+
     pub(super) fn emit_fn_def_w(&mut self) -> Option<MirWitness> {
         let span = self.span_of_current();
         self.advance(); // 'task'

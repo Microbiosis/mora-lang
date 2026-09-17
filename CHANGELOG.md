@@ -77,8 +77,10 @@ All notable changes to Mora will be documented in this file.
 ### 安全审计
 
 - 补跑完整 Mimosa deep 扫描并**取得密封结论**（此前提交钩子报
-  `scanner_enobufs` 未出结论）：`scan-2026-09-17T05-50-54.094Z-a201487bf476`，
-  seal `sha256:b3f3fb97e7302cc91817d7eed42ceee953213f1305095bf7adc3ca249cbc19e0`，
+  `scanner_enobufs` 未出结论）。两次均密封，结论一致：
+  - `scan-2026-09-17T05-50-54.094Z-a201487bf476`（修复前）
+  - `scan-2026-09-17T09-05-20.586Z-17d4b9a33bf5`（**本次提交后**）
+    seal `sha256:4d7c938121c569dd66b2a94dd52957e135c46919127dcb5604950393c3906884`
   247 文件全解析、0 读取/解析失败，254 包 0 advisory 命中。
   唯一 finding（high, CWE-22）位于 `examples/lsp_v04_smoke.py:13`，
   经复核为**误报**：`CODE_PATH` 由 `tempfile.mkdtemp()` + 硬编码文件名拼成，

@@ -335,16 +335,36 @@ fn method_signature_builtin(receiver: &Type, method: &str) -> Option<Signature> 
             vec![("self".to_string(), Type::String)],
             Type::Float,
         )),
-        (Type::String, "upper" | "lower" | "trim" | "replace") => Some(Signature::new(
+        // v0.104.2: String 方法签名补全**实参**。此前 `upper/lower/trim/replace`
+        // 与 `starts_with/ends_with/contains/split` 各自共用一条只声明 `self`
+        // 的签名，而运行期 `call_method_string` 对这些名字都要读实参：
+        //   replace(from, to) / starts_with(p) / ends_with(p) / contains(n) / split(sep)
+        // 于是 `"a,b" |> split(",")` 报 "Expected 0 arguments, got 1"
+        //（spec §7.6 的管道示例正是这个形状）。按运行期真实 arity 拆开。
+        (Type::String, "upper" | "lower" | "trim") => Some(Signature::new(
             vec![("self".to_string(), Type::String)],
             Type::String,
         )),
+        (Type::String, "replace") => Some(Signature::new(
+            vec![
+                ("self".to_string(), Type::String),
+                ("from".to_string(), Type::String),
+                ("to".to_string(), Type::String),
+            ],
+            Type::String,
+        )),
         (Type::String, "starts_with" | "ends_with" | "contains") => Some(Signature::new(
-            vec![("self".to_string(), Type::String)],
+            vec![
+                ("self".to_string(), Type::String),
+                ("needle".to_string(), Type::String),
+            ],
             Type::Bool,
         )),
         (Type::String, "split") => Some(Signature::new(
-            vec![("self".to_string(), Type::String)],
+            vec![
+                ("self".to_string(), Type::String),
+                ("sep".to_string(), Type::String),
+            ],
             Type::List(Box::new(Type::String)),
         )),
         (Type::Conversation, "chat") => Some(Signature::new(

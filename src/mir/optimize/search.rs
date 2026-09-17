@@ -125,10 +125,60 @@ pub fn greedy_search(
         };
 
         // 应用：替换 current[pc] 为 new_insts
+        //
+        // v0.104.2: **跳转目标重映射** —— 重写的长度若与原文不同（`n` 条 →
+        // `m` 条），pc 之后的全部指令整体位移 `m - n`，但指令里的**裸 pc
+        // 跳转目标**仍是旧编号。不修就会跳到错误位置。
+        //
+        // **缺陷背景（`if true { print("p") }` 之后的语句整体消失）**：
+        // `IfSimplifyRule` 把常量条件的 `JumpIfNot(cond, target)` 折叠为
+        // 空（条件为假）或 `Jump(target)`（条件为真）。前者使体长 -1，于是
+        // **所有 pc > 目标位置**的指令前移一位，而结尾的 `Const(Int(7))`
+        // 仍在旧编号上；DAG 按旧的 `Jump(8)` 解析 → 跳到不存在的 pc →
+        // 该节点无出边 → 尾部语句（含 `print` 之后的值）**静默丢失**，
+        // `run_mir` 返回 Nil、退出码 0。
+        //
+        // 规则：被删/新增区间是 `[pc, pc+1)` → `[pc, pc+m)`。
+        //   · target <= pc        : 不受位移影响
+        //   · target == pc + 1    : 原「跳过后继」 → 现在应指向 pc + m
+        //   · target >  pc + 1    : 落在位移区间之后 → target + (m - 1)
+        let old_span_end = pc + 1;
+        let new_span_end = pc + new_insts.len();
+        let delta = new_span_end as isize - old_span_end as isize;
+        let remap = |t: &mut usize| {
+            if *t == old_span_end {
+                *t = new_span_end;
+            } else if *t > old_span_end {
+                let shifted = (*t as isize + delta).max(0) as usize;
+                *t = shifted;
+            }
+        };
+        let mut new_insts = new_insts;
+        for inst in new_insts.iter_mut() {
+            match inst {
+                MirInst::Jump(t)
+                | MirInst::JumpIf(_, t)
+                | MirInst::JumpIfNot(_, t)
+                | MirInst::Break(t)
+                | MirInst::Continue(t) => remap(t),
+                _ => {}
+            }
+        }
         let mut updated: Vec<MirInst> = Vec::with_capacity(current.len() - 1 + new_insts.len());
         updated.extend_from_slice(&current[..pc]);
         updated.extend(new_insts);
         updated.extend_from_slice(&current[pc + 1..]);
+        // 位移区间**之后**的既有指令，其跳转目标同样需要重映射
+        for inst in updated.iter_mut().skip(new_span_end) {
+            match inst {
+                MirInst::Jump(t)
+                | MirInst::JumpIf(_, t)
+                | MirInst::JumpIfNot(_, t)
+                | MirInst::Break(t)
+                | MirInst::Continue(t) => remap(t),
+                _ => {}
+            }
+        }
         current = updated;
         current_cost = cost.body_cost(&current);
         applied_rules.push(rule_name);
@@ -225,12 +275,22 @@ mod tests {
         let rules = builtin_rules();
         let cost = InstructionCount;
         let multi = greedy_search(&body, &rules, &cost, 10);
-        // greedy 每轮应用 best 一个：首轮删一个冗余 Jump（gain=1），
-        // 左移后另一 Jump 的 target 不再等于 pc+1 → 保留。
-        // 期望：3 条指令（Const, Jump, Const）。
+        // v0.104.2: 随着**跳转目标重映射**的引入，两条冗余 Jump 都会被消除。
+        // 首轮删 `Jump(1)@0`（跳到下一条），整体左移一位 → 原 `Jump(3)@2`
+        // 的目标被重映射为新的「下一条」(`pc+1`)，于是次轮它同样满足冗余
+        // 条件而被删除 → 只剩 2 条 Const。
+        // 旧断言（cost==3）建立在「重映射缺失、跳转目标悬垂」的错误行为上：
+        // 当时 `Jump(3)` 在 3 条指令的 body 里指向不存在的 pc 3，恰好因此
+        // 「不等于 pc+1」而侥幸留下 —— 那是缺陷的副作用，不是语义要求。
         assert_eq!(
-            multi.final_cost, 3,
-            "one redundant jump eliminated per pass"
+            multi.final_cost, 2,
+            "both redundant jumps eliminated (target remap keeps them redundant)"
+        );
+        // 检查残留指令确实全是 Const —— 证明两条 Jump 都被删掉
+        assert!(
+            multi.body.iter().all(|i| matches!(i, MirInst::Const(_, _))),
+            "remaining body should be Consts only, got {:?}",
+            multi.body
         );
         // 行为等价对照：无重复形态的等价 body 收敛到同一 cost。
         let control = greedy_search(
@@ -240,5 +300,46 @@ mod tests {
             10,
         );
         assert_eq!(control.final_cost, 1, "single-jump body: 1 Const remains");
+    }
+
+    /// v0.104.2: 重写改变长度时，**跳转目标必须重映射**。
+    ///
+    /// 缺陷：`greedy_search` 应用重写后直接拼接 `[..pc] + new + [pc+1..]`，
+    /// 未调整指令里的裸 pc 跳转目标。重写变短时，`pc` 之后的指令整体前移，
+    /// 旧目标编号即指向错误位置（或越界）—— 实测
+    /// `if true { print("p") }` + 尾随表达式：`IfSimplifyRule` 折叠掉常量
+    /// 分支后长度 -1，结尾的 `Jump` 仍指向旧编号 → 尾随语句**静默丢失**、
+    /// `run_mir` 返回 Nil、退出码 0。
+    #[test]
+    fn test_rewrite_remaps_jump_targets_on_length_change() {
+        // body：常量条件假 → IfSimplifyRule 删除 JumpIfNot（长度 -1），
+        // 末尾 Jump 的旧目标 3 应被重映射为 2。
+        let body = vec![
+            MirInst::Const(0, Value::Bool(false)),
+            MirInst::JumpIfNot(0, 3),
+            MirInst::Const(1, Value::Int(1)),
+            MirInst::Const(2, Value::Int(2)),
+        ];
+        let rules = builtin_rules();
+        let r = greedy_search(&body, &rules, &InstructionCount, 10);
+        // 全部 Jump 目标都必须落在 body 内（不得悬垂/越界）
+        for (pc, inst) in r.body.iter().enumerate() {
+            let t = match inst {
+                MirInst::Jump(t)
+                | MirInst::JumpIf(_, t)
+                | MirInst::JumpIfNot(_, t)
+                | MirInst::Break(t)
+                | MirInst::Continue(t) => Some(*t),
+                _ => None,
+            };
+            if let Some(t) = t {
+                assert!(
+                    t <= r.body.len(),
+                    "pc {pc} 的跳转目标 {t} 越界（body 长度 {}）：{:?}",
+                    r.body.len(),
+                    r.body
+                );
+            }
+        }
     }
 }

@@ -118,10 +118,11 @@ fn annotate_node(node: &Fcfg, table: &TypeTable) -> Node<TypeInfo> {
         },
 
         // ── 控制流 ──
-        Node::If { cond, then, else_, span, .. } => Node::If {
+        Node::If { cond, then, else_, dst, span, .. } => Node::If {
             cond: *cond,
             then: annotate_block(then, table),
             else_: else_.as_ref().map(|e| annotate_block(e, table)),
+            dst: *dst,
             span: *span,
             meta: info,
         },

@@ -2,6 +2,114 @@
 
 All notable changes to Mora will be documented in this file.
 
+## [v0.104.2] — 2026-09-17 — fix: EBNF 关键字逐个实测 —— 管道语义 / if-then 拼写 / 跳转目标重映射
+
+按上一轮遗留项：**逐个实测** spec §14.2 EBNF 的每个语句关键字（不再依赖
+grep 判定 —— `assign` 已证明 grep 会因「关键字 0 命中=缺陷存在」而误判为
+OK）。实测 32 个形式，修复 7 处缺陷。
+
+### `route` —— 判定为**规范过时**，非未接线（附规范自相矛盾修正）
+
+spec §14.2 的 EBNF 列有 `route_stmt = "route" METHOD PATH "->" IDENTIFIER`，
+但**同一节** §14.3「已移除」明确写着：`route` 自 v0.06.7 起由显式 API
+`Router::new()` 承担（CHANGELOG v0.103 的「文档缺陷修复」亦有同一记录）。
+实测 `route POST /api/chat -> h` 确为解析错误 —— **符合「已移除」的设计**，
+不是漏接线。规范自身矛盾已修正：
+- §14.2 EBNF 删除 `route_stmt`（含 `statement` 产生式里的引用）；
+- §11.3「路由声明」改为展示 §18.1 的显式 `Router` API 并说明原因。
+（`docs/` 在 `.gitignore` 中，故此项**仅落盘不随提交**。）
+
+### 管道 `|>` —— 6 处规范示例全部不可用
+
+- **`x |> f(args)` 的 witness 与 MIR 语义分叉**：witness 脱糖为
+  `Call{f, [x, ...args]}`，但 MIR 发 `Pipe(x, rhs)`，而 **rhs 是 `f(args)`
+  已被求值的寄存器** —— 求值本身就是一次「自由函数调用」。对只有方法形态的
+  名字（`map`/`filter`/`upper`/`split`/`route`/`tool`/`serve`/`listen`）
+  必然失败（"Undefined function or task: map"），于是 spec §2.1 / §7.6 /
+  §18.1 / §18.2 的 6 处管道示例**全部不可用**。规范对这六处的形态高度一致：
+  `f(args)` 一律是**接收者的方法**。现按此实现 —— 就地把刚发出的
+  `Call(dst, f, argv)` 改写为 `MethodCall(dst, x, f, argv)`，witness 同步；
+  裸标识符 `x |> f` 仍是值应用（§7.6 `5 |> double`）。
+- **String 方法签名 arity 漂移**：`split`/`replace`/`starts_with`/
+  `ends_with`/`contains` 的 typeck 签名只声明 `self`，而运行期
+  `call_method_string` 都要读实参 → `"a,b" |> split(",")` 报
+  "Expected 0 arguments, got 1"。按运行期真实 arity 拆开五条签名。
+
+### `if` 的两种 EBNF 拼写
+
+- **`then` + 块体 + `end` 不可解析**：`then` 分支无条件走 `emit_expr_w`
+  （只吃一个表达式），换行立即失败 —— spec §14.2 `if_stmt` 的定义形态与
+  §3.2/§7.3/§11.5 共 4 处示例全部不可用，而 `{}` 形式可用。现按
+  「`then` 后紧跟换行/`{` → 块体」判据支持。
+- **块体在 `else` 上不停**：`emit_block_w` 的终止集缺 `else`，把它当语句解析
+  → "Unbound variable 'else'"。已补入终止集。
+- **`then <stmt> end` 不消费尾随 `end`**：留给外层块解析器当语句起始 →
+  解析失败（spec §7.1 L83、§7.3 L412/413）。现由 `then` 分支消费，并改走
+  **语句**分派（`continue`/`break` 是语句，表达式分派解析不了）。
+- **`else if` 链不可解析**：`else` 之后无条件走 `emit_block_w`，而
+  `else if …` 的 `if` 是**表达式** → 两级深度的同一语法一边通一边不通。
+  现 `else if` 递归 `emit_if_w`。
+- **`if` 不能出现在表达式位置**：spec §7.1 的核心示例
+  `let x = if cond then "a" else "b" end` 不可用（`emit_expr_w` 无 `If` arm）。
+  已接线 —— 该接线此前被执行器的合并点缺陷阻塞，本轮修好后才安全开启。
+
+### DAG 执行器：常量折叠后的死块成为入口（**静默返回 Nil**）
+
+- **`if true { print("p") }` 之后的语句整体静默消失、退出码 0**：
+  `greedy_search` 应用重写后直接拼接 `[..pc] + new + [pc+1..]`，**未重映射
+  裸 pc 跳转目标**。`IfSimplifyRule` 折叠常量分支使体长 -1 → 后续指令整体
+  前移而跳转仍指旧编号 → 越界/错位 → 尾随语句丢失。新增目标重映射
+  （`target == old_span_end → new_span_end`；`target > old_span_end →
+  target + delta`），重写区间之后的既有指令同样重映射。
+- **`entry` 取「所有无入边节点」**：常量折叠留下的 else 死块没有入边，于是与
+  函数入口**并列成为入口** → 无条件下执行 → 其 `Copy(dst, Nil)` 覆盖真分支
+  结果、并因 Sequence 抢先于尾部语句 → 尾值变 Nil。改为**从 pc 0 可达**的
+  无入边节点才是合法入口。
+- 单测 `test_rewrite_memo_reuses_equivalent_shapes` 的旧断言（cost==3）建立在
+  「跳转目标悬垂」的错误行为上（那条 `Jump(3)` 在 3 条指令的 body 里恰好因
+  越界而侥幸留下），已按修正后的语义更新为 cost==2 并断言残留全是 `Const`；
+  新增 `test_rewrite_remaps_jump_targets_on_length_change`。
+
+### `for` 的 `continue` 死循环
+
+- **`continue` 跳过循环变量增量**：`emit_loop_w` / `fcfg_lower` 的后修补把
+  `Continue` 目标设为 `loop_label`（条件判定处），**跳过了索引增量** →
+  索引永不前进、条件恒为「未越界」→ **无限循环**（三种 `if` 拼写均复现，
+  且 `{}` 形式在 HEAD 上就已挂死）。目标改为增量指令。
+
+### 空块与 I/O
+
+- **空块返回哨兵寄存器 → 越界 panic**：`emit_transaction_w` 用 `let last = 0`
+  哨兵，而块体在**独立寄存器空间** —— `transaction end`（空体）没分配任何
+  寄存器，引用 reg 0 让 `run_mir` 拿到 `n_regs=0` 的函数 →
+  `node_ready` 的 `reg_ready[0]` 越界 panic（"the len is 0 but the index is 0"，
+  退出码 101）。`commit`/`rollback` 同样返回哨兵 0。改用真实分配的寄存器
+  （`Option<Reg>` + 空时补 Nil 常量），与 `emit_block_mir_and_wit` 一致。
+- **`[1i] + [2i]` 得 `[nil]`**：等长列表逐元素相加只列了 `Float+Float` 与
+  `String+String`，**Int 落到 `_ => Nil`**（不等长时才拼接，于是同一运算的
+  结果取决于长度）。委托 `eval_binary(Add)` 与标量加法同一套规则。
+
+### 测试
+
+- 新增 `e2e_pipe_value_application_and_method_forms`、
+  `e2e_string_method_arities_match_runtime`、
+  `e2e_if_then_block_and_single_stmt_forms`、
+  `e2e_empty_blocks_do_not_panic`、`e2e_continue_advances_for_loop_index`
+  （三种 `if` 拼写各断言跳过 2 → 和为 4，并含「不 continue 时为 6」对照）。
+- 956 lib + 57 e2e + 全 29 套件 0 失败，clippy -D warnings 清零。
+
+### 本轮范围的边界（明确记录）
+
+- **`route` 语句形式按规范设计不实现**（见上）：`Router::new()` 显式 API 是
+  唯一路径。规范自相矛盾处已修正（§14.2 EBNF / §11.3）。
+- EBNF 逐项实测覆盖 32 个语句形式（let / assign / task / if-then-else /
+  for-in / return / import / match-when / with / worker / transaction /
+  compensation / macro / perform / handle / model / msg / update / app /
+  observe / span / parallel / export / eval / aggregate / rel / solve /
+  commit / rollback / route / prompt / document / effect 签名）。
+  其余项（`document` 前瞻守卫、`effect` 签名、`rel`/`solve`、`observe trace`
+  等）实测均通过，未发现缺陷。
+
 ## [v0.104.1] — 2026-09-17 — fix: 缺陷审计第三轮 —— 类型检查桩 / assign 语句 / I/O 错误路径
 
 按「生产路径 panic!/unwrap、静默吞错、零 producer IR 变体、spec↔实现落差」

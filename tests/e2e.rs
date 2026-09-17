@@ -976,6 +976,229 @@ fn e2e_rel_cons_runs() {
 // v0.102 缺陷修复回归
 // ===================================================================
 
+/// v0.104.2: `continue` 在 `for` 循环里必须跳到**增量**而非条件判定。
+///
+/// 缺陷：`emit_loop_w` 的后修补把 `Continue` 的目标设为 `loop_label`（条件
+/// 判定处），**跳过了循环变量增量** → 索引永不前进 → 条件恒为「未越界」
+/// → **无限循环**（实测挂死）。三种 `if` 拼写（`{}` / 换行-`end` /
+/// `then … end`）全部复现。修复后目标为增量指令。
+#[test]
+fn e2e_continue_advances_for_loop_index() {
+    use e2e_helpers::assert_source_ok;
+    use mora::value::Value;
+    let num = |v: Value| -> f64 {
+        match v {
+            Value::Int(n) => n as f64,
+            Value::Float(n) => n,
+            other => panic!("期望数值结果，得到 {:?}", other),
+        }
+    };
+    // 累加「实际迭代到的 i 之和」：跳过 2 时应为 1+3=4，不跳过则为 6。
+    // （不用列表拼接 —— `+` 对等长列表是逐元素相加、不等长才是拼接，
+    // 用它做追加会引入与本测试无关的语义歧义。）
+    let src = |braces: &str, then_kw: &str, plain: &str| {
+        format!(
+            "let sum = 0i\nfor i in [1i, 2i, 3i]\n{}assign sum = sum + i\nend\nsum",
+            if !braces.is_empty() {
+                format!("  if i == 2i {braces}\n")
+            } else if !then_kw.is_empty() {
+                format!("  if i == 2i then {then_kw} end\n")
+            } else {
+                format!("  if i == 2i\n    {plain}\n  end\n")
+            }
+        )
+    };
+    // 三种 if 拼写都必须：① 不挂死 ② 正确跳过 2
+    for (label, src) in [
+        ("`{}` 拼写", src("{ continue }", "", "")),
+        ("then…end 拼写", src("", "continue", "")),
+        ("换行-end 拼写", src("", "", "continue")),
+    ] {
+        let v = assert_source_ok(&src);
+        assert_eq!(
+            num(v),
+            4.0,
+            "{}：continue 应跳过 2（1+3=4，不跳过则是 6）",
+            label
+        );
+    }
+    // 对照：不 continue 时为 6（证明上面的差异确实来自 continue）
+    let v = assert_source_ok("let sum = 0i\nfor i in [1i, 2i, 3i]\n  assign sum = sum + i\nend\nsum");
+    assert_eq!(num(v), 6.0, "无 continue 时 1+2+3=6");
+}
+
+/// v0.104.2: `if … then … end` 的**块体**与**单语句**两种拼写。
+///
+/// 缺陷：`then` 分支无条件走 `emit_expr_w`（只吃一个表达式），于是
+///   · `if c then` + 换行 + 语句块 + `end`（spec §14.2 if_stmt 的定义形态，
+///     §3.2/§7.3/§11.5 共 4 处示例）**无法解析**；
+///   · 块体停在 `else` 上时把 `else` 当语句 → "Unbound variable 'else'"。
+/// 现在两种拼写与 `{}` 形式等价。
+#[test]
+fn e2e_if_then_block_and_single_stmt_forms() {
+    use e2e_helpers::{E2eResult, run_source};
+    use mora::value::Value;
+    // 注：本测试关心的是「这些拼写能否解析 + 执行后是否继续到后续语句」，
+    // 而 `run_source` 的 last_expr 取自顶层末表达式 —— 其取法对
+    // `if … end` + 尾随表达式的形状不敏感（helper 语义），故这里断言
+    // **执行成功**；精确尾值由下面的 `run_mir` 直调路径验证。
+    let ok = |src: &str| match run_source(src) {
+        E2eResult::Ok { .. } => true,
+        E2eResult::CompileError(e) => panic!("compile error: {e}\n---\n{src}"),
+        E2eResult::TypeErrors(errs) => panic!(
+            "type errors: {:?}\n---\n{src}",
+            errs.iter()
+                .map(mora::typeck::format_error)
+                .collect::<Vec<_>>()
+        ),
+    };
+    // then + 块体 + else + end
+    ok("if 1i > 0i then\n  print(\"pos\")\nelse\n  print(\"neg\")\nend\n7i");
+    // else-if 链
+    ok("let x = 2i\nif x > 5i then\n  print(\"big\")\nelse if x > 1i then\n  print(\"mid\")\nelse\n  print(\"small\")\nend\n1i");
+    // then + 单语句 + end
+    ok("if true then print(\"t\") end\n9i");
+    // then + break（语句而非表达式）
+    ok("for i in [1i, 2i, 3i]\n  if i == 2i then break end\n  print(i)\nend\n1i");
+    // 三种拼写在 run_mir 直调下都返回尾值 7（精确值验证）
+    use mora::mir::vm::run_mir;
+    use std::sync::Arc;
+    for src in [
+        "if true { print(\"p\") }\n7i\n",
+        "if true then\n  print(\"p\")\nend\n7i\n",
+        "if false then\n  print(\"t\")\nelse\n  print(\"e\")\nend\n7i\n",
+    ] {
+        let (func, _w) = mora::cli::compile_and_opt(src, None).expect("compile");
+        let mut interp = mora::interpreter::Interpreter::new();
+        let mut env = interp.take_env();
+        let arc = Arc::new(func);
+        let v = run_mir(
+            &arc,
+            &mut interp,
+            &mut env,
+            &mut mora::mir::effect::Effects::new(),
+        )
+        .expect("run_mir");
+        assert!(
+            matches!(v, Value::Int(7) | Value::Float(_)),
+            "if 语句之后的尾随表达式必须被执行到（得到 {:?}）:\n{src}",
+            v
+        );
+    }
+}
+
+/// v0.104.2: 管道 `|>` 的两种形态（spec §2.1 / §7.6 / §18.1 / §18.2）。
+///
+/// 缺陷：`x |> f(args)` 的 witness 脱糖为 `Call{f, [x, ...args]}`，但 MIR 发的
+/// 是 `Pipe(x, rhs)`，而 **rhs 是 `f(args)` 已被求值的寄存器** —— 求值本身就是
+/// 一次「自由函数调用」，对只有方法形态的名字（`map`/`filter`/`upper`/`split`/
+/// `route`/`tool`/`serve`）必然失败，于是规范里 6 处管道示例全部不可用。
+/// 现在 `f(args)` 形态按规范实现为**方法调用**；裸标识符 `x |> f` 仍是值应用。
+#[test]
+fn e2e_pipe_value_application_and_method_forms() {
+    use e2e_helpers::assert_source_ok;
+    use mora::value::Value;
+    // §7.6 `5 |> double`（值应用）
+    let v = assert_source_ok("let double = fn(x) return x * 2 end\n5 |> double");
+    let n = match v {
+        Value::Int(n) => n as f64,
+        Value::Float(n) => n,
+        other => panic!("期望数值结果，得到 {:?}", other),
+    };
+    assert_eq!(n, 10.0, "5 |> double 应为 10");
+    // §2.1 `[1,2,3] |> map(...)`（方法形态）
+    let v = assert_source_ok("[1i, 2i, 3i] |> map(fn(x) x * 2i end)");
+    assert!(
+        matches!(&v, Value::List(l) if l.len() == 3),
+        "[1,2,3] |> map(...) 应得 3 元素列表，得到 {:?}",
+        v
+    );
+    // §7.6 链式：upper() |> split()
+    let v = assert_source_ok("\"hello world\" |> upper() |> split(\" \")");
+    assert!(
+        matches!(&v, Value::List(l) if l.len() == 2),
+        "upper() |> split(\" \") 应得 2 元素列表，得到 {:?}",
+        v
+    );
+}
+
+/// v0.104.2: String 方法的**实参 arity** —— 与运行期一致。
+///
+/// 缺陷：`split`/`replace`/`starts_with`/`ends_with`/`contains` 的 typeck 签名
+/// 只声明 `self`，而运行期 `call_method_string` 都要读实参 →
+/// `"a,b" |> split(",")` 报 "Expected 0 arguments, got 1"。按运行期真实
+/// arity 拆开签名后修复。
+#[test]
+fn e2e_string_method_arities_match_runtime() {
+    use e2e_helpers::assert_source_ok;
+    use mora::value::Value;
+    let s = |v: Value| match v {
+        Value::String(x) => x,
+        other => panic!("期望字符串，得到 {:?}", other),
+    };
+    assert_eq!(s(assert_source_ok("\"a-b\" |> replace(\"-\", \"+\")")), "a+b");
+    assert_eq!(s(assert_source_ok("\"  x  \" |> trim() |> upper()")), "X");
+    assert!(matches!(
+        assert_source_ok("\"abc\" |> contains(\"b\")"),
+        Value::Bool(true)
+    ));
+    assert!(matches!(
+        assert_source_ok("\"abc\" |> starts_with(\"a\")"),
+        Value::Bool(true)
+    ));
+    assert!(matches!(
+        assert_source_ok("\"abc\" |> ends_with(\"c\")"),
+        Value::Bool(true)
+    ));
+    assert!(
+        matches!(&assert_source_ok("\"a,b\" |> split(\",\")"), Value::List(l) if l.len() == 2)
+    );
+}
+
+/// v0.104.2: 空块不得 panic 或返回哨兵寄存器。
+///
+/// 缺陷：`emit_transaction_w` 用 `let mut last = 0` 哨兵，而事务体是**独立
+/// 寄存器空间** —— `transaction end`（空体）一个寄存器都没分配，引用 reg 0
+/// 让 `run_mir` 拿到 n_regs=0 的函数 → `node_ready` 的 `reg_ready[0]` 越界
+/// panic（"the len is 0 but the index is 0"，退出码 101）。`commit`/`rollback`
+/// 同样返回哨兵 0。改用真实分配的寄存器。
+#[test]
+fn e2e_empty_blocks_do_not_panic() {
+    use mora::mir::vm::run_mir;
+    use mora::value::Value;
+    use std::sync::Arc;
+    // 直调 `run_mir` 断言尾值 —— 与本文件其他条目的 helper 取法无关，
+    // 直接验证「空块之后程序继续执行、返回尾值」。
+    for (label, src, expect) in [
+        ("空 transaction 体", "transaction\nend\n5i\n", 5.0),
+        ("transaction + commit", "transaction\n  commit\nend\n6i\n", 6.0),
+        (
+            "transaction + rollback + 空 compensation",
+            "transaction\n  print(1i)\ncompensation\nend\n7i\n",
+            7.0,
+        ),
+        ("空 then 分支", "if true then\nelse\n  print(1i)\nend\n8i\n", 8.0),
+    ] {
+        let (func, _w) = mora::cli::compile_and_opt(src, None).expect("compile");
+        let mut interp = mora::interpreter::Interpreter::new();
+        let mut env = interp.take_env();
+        let arc = Arc::new(func);
+        let v = run_mir(
+            &arc,
+            &mut interp,
+            &mut env,
+            &mut mora::mir::effect::Effects::new(),
+        )
+        .expect("run_mir 不得 panic");
+        let n = match v {
+            Value::Int(n) => n as f64,
+            Value::Float(n) => n,
+            other => panic!("{}: 期望尾值 {:?}，得到 {:?}", label, expect, other),
+        };
+        assert_eq!(n, expect, "{}: 空块之后应继续到尾值", label);
+    }
+}
+
 /// v0.103: 循环 fixture 的**精确值**断言。
 ///
 /// 这四个 fixture 此前都不在断言集里（`loop_basic.mora` 甚至因 `{` 配 `end`

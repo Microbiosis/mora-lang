@@ -143,6 +143,18 @@ impl ParserV3 {
 
     /// 表达式入口（witness 嵌套版）— 镜像 parse_assignment（含赋值检测）。
     pub(super) fn emit_expr_w(&mut self) -> Option<(Reg, MirWitness)> {
+        // v0.104.2: `if` 出现在**表达式位置**（spec §7.1 的核心示例）
+        //     let x = if cond then "a" else "b" end
+        // 以及 §7.3 的 `if i == 3 then continue end` 值形态。
+        // `emit_if_w` 返回 (结果寄存器, witness)，与其它表达式产出同契约。
+        //
+        // 注：此前这条接线被「合并点永不就绪」的执行器缺陷阻塞（`if` 之后的
+        // 语句会静默消失、退出码 0）；该缺陷已随 `dag.rs` 的
+        // 「entry 取 pc 0 可达节点」修复而消除（常量折叠后的 else 死块不再
+        // 与函数入口并列成为入口），故此处可以安全接线。
+        if self.check(&TokenType::If) {
+            return self.emit_if_w();
+        }
         // v0.80: algebraic effects 表达式位置 dispatch（Stage 2.0）。
         // 表达式位置出现的 `handle` / `perform` 不是变量名 —— 走专门 emission。
         if let Some(TokenType::Identifier(s)) = self.peek().map(|t| &t.token_type).cloned() {
@@ -261,50 +273,104 @@ impl ParserV3 {
         Some((left, left_w))
     }
 
+    /// 管道 `|>` —— 两种形态（spec §7.6 / §18.1 / §18.2）：
+    ///
+    /// - `x |> f`        裸标识符 → **值应用** `f(x)`（§7.6 `5 |> double`）。
+    /// - `x |> f(args)`  调用形态 → **方法调用** `x.f(args)`。
+    ///
+    /// **缺陷（v0.104.2 修复）**：`x |> f(args)` 此前 witness 与 MIR 语义分叉 ——
+    /// witness 脱糖为 `Call{f, [x, ...args]}`（看起来是「f 接收 x 作为首参」），
+    /// 但 MIR 发的是 `Pipe(new_dst, x, rhs)`，而 **rhs 是 RHS 表达式已被求值的
+    /// 寄存器** —— 求值 `f(args)` 本身就是一次「自由函数调用」，对
+    /// `map`/`filter`/`upper`/`split`/`route`/`tool`/`serve`/`listen` 这些
+    /// **只有方法形态**的名字必然失败（"Undefined function or task: map"），
+    /// 于是 spec 里 6 处管道示例全部不可用：
+    ///   §2.1  `[1,2,3] |> map(fn(x) x*2 end)`
+    ///   §7.6  `"hello world" |> upper() |> split(" ") |> map(...) |> filter(...)`
+    ///   §18.1 `router |> route("POST", …) |> listen(…)`
+    ///   §18.2 `server |> tool(…) |> serve()`
+    /// 规范对这六处的形态高度一致：`f(args)` 一律是**接收者的方法**。
+    /// 现在按此实现 —— 就地把握手前刚发出的 `Call(dst, f, argv)` 改写为
+    /// `MethodCall(dst, x, f, argv)`，witness 同步为 `MethodCall`。
     fn emit_pipe_w(&mut self) -> Option<(Reg, MirWitness)> {
         let (mut left, mut left_w) = self.emit_comparison_w()?;
         while self.match_token_exact(TokenType::Pipe) {
+            // 记录 RHS 的发射起点，供「就地改写为方法调用」精确定位
+            let mark = self.emit.insts.len();
             let (rhs, rhs_w) = self.emit_comparison_w()?;
-            let dst = self.emit.alloc_reg();
-            self.emit.emit(MirInst::Pipe(dst, left, rhs));
             let span = self.span_of_current();
-            // v0.92: `left |> f` 脱糖为 `f(left)`（与 infer.rs 约定一致：
-            // `|>` 脱糖为 Call(right(left))，HM 走 infer_call 而非 operator）。
-            //   - RHS 是裸标识符（`5 |> double`）→ Call{Name(double), [left]}
-            //   - RHS 是调用（`10 |> add(5)`）→ Call{add, [left, 5]}
-            //   - 其它 → 回退为 `|>` 命名 Call（保持旧行为）
             left_w = match rhs_w.kind {
-                WitnessKind::Variable(name) => MirWitness {
-                    kind: WitnessKind::Call {
-                        callee: crate::mir::witness::WitnessCallee::Name(name),
-                        args: vec![left_w],
-                    },
-                    span,
-                },
-                WitnessKind::Call { callee, args } => {
-                    let mut new_args = Vec::with_capacity(args.len() + 1);
-                    new_args.push(left_w);
-                    new_args.extend(args);
+                // ── `x |> f(args)` → 方法调用 `x.f(args)` ──
+                WitnessKind::Call {
+                    callee: crate::mir::witness::WitnessCallee::Name(method),
+                    args,
+                } => {
+                    // 把本次 RHS 发射区间内、以 rhs 为目标寄存器的 Call 改写为
+                    // MethodCall（接收者 = 管道左侧）。寄存器有唯一生产者，
+                    // 区间又限定为「本次 RHS」，故定位精确。
+                    let mut patched = false;
+                    for inst in self.emit.insts[mark..].iter_mut() {
+                        if let MirInst::Call(d, name, argv) = inst
+                            && *d == rhs
+                            && *name == method
+                        {
+                            let argv = argv.clone();
+                            *inst = MirInst::MethodCall(rhs, left, method.clone(), argv);
+                            patched = true;
+                            break;
+                        }
+                    }
+                    if !patched {
+                        // 形状不符预期（如 `x |> f(1).g(2)` 的 RHS 结果来自
+                        // 尾链的最后一个调用）—— 退回值应用语义，保持旧行为。
+                        let dst = self.emit.alloc_reg();
+                        self.emit.emit(MirInst::Pipe(dst, left, rhs));
+                        left = dst;
+                    } else {
+                        left = rhs;
+                    }
                     MirWitness {
-                        kind: WitnessKind::Call { callee, args: new_args },
+                        kind: WitnessKind::MethodCall {
+                            receiver: Box::new(left_w),
+                            method,
+                            args,
+                        },
                         span,
                     }
                 }
-                other => MirWitness {
-                    kind: WitnessKind::Call {
-                        callee: crate::mir::witness::WitnessCallee::Name("|>".to_string()),
-                        args: vec![
-                            left_w,
-                            MirWitness {
-                                kind: other,
-                                span,
-                            },
-                        ],
-                    },
-                    span,
-                },
+                // ── `x |> f`（裸标识符）→ 值应用 `f(x)` ──
+                WitnessKind::Variable(name) => {
+                    let dst = self.emit.alloc_reg();
+                    self.emit.emit(MirInst::Pipe(dst, left, rhs));
+                    left = dst;
+                    MirWitness {
+                        kind: WitnessKind::Call {
+                            callee: crate::mir::witness::WitnessCallee::Name(name),
+                            args: vec![left_w],
+                        },
+                        span,
+                    }
+                }
+                // ── 其它 → 值应用（把 RHS 的值当可调用对象）──
+                other => {
+                    let dst = self.emit.alloc_reg();
+                    self.emit.emit(MirInst::Pipe(dst, left, rhs));
+                    left = dst;
+                    MirWitness {
+                        kind: WitnessKind::Call {
+                            callee: crate::mir::witness::WitnessCallee::Name("|>".to_string()),
+                            args: vec![
+                                left_w,
+                                MirWitness {
+                                    kind: other,
+                                    span,
+                                },
+                            ],
+                        },
+                        span,
+                    }
+                }
             };
-            left = dst;
         }
         Some((left, left_w))
     }
@@ -1316,9 +1382,20 @@ impl ParserV3 {
         let dst = self.emit.alloc_reg();
 
         // v0.92: 三种分支语法统一收敛：
-        //   1. `then expr`        — then 关键字分支
+        //   1. `then expr`        — then 关键字分支（单表达式）
         //   2. `{ stmts }`        — 现有花括号块
         //   3. `\n ... end`       — 顶层无括号块（向后兼容）
+        // v0.104.2: `then` 之后是**块**时也接受 —— spec §14.2 EBNF
+        //（`if_stmt = "if" expr "then" { statement } … "end"`）与 §3.2/§7.3/
+        // §11.5 的示例一律写作
+        //     if condition then
+        //       …
+        //     end
+        // 即「`then` + 换行 + 语句块 + `end`」。此前 `then` 分支无条件走
+        // `emit_expr_w`（只吃一个表达式），换行立刻让解析失败 →
+        // 规范里 4 处 `if … then` 示例全部不可解析，而花括号形式可用 ——
+        // 同一语句的两种拼写一边通一边不通。
+        // 判据：`then` 后紧跟换行或 `{` → 块体；否则单表达式。
         let has_then_kw = self
             .peek()
             .map(|t| matches!(&t.token_type, TokenType::Then))
@@ -1326,7 +1403,23 @@ impl ParserV3 {
 
         let (_then_reg, then_w) = if has_then_kw {
             self.advance(); // consume 'then'
-            let (r, w) = self.emit_expr_w()?;
+            let then_is_block = matches!(
+                self.peek().map(|t| &t.token_type),
+                Some(TokenType::Newline) | Some(TokenType::LBrace)
+            );
+            let (r, w) = if then_is_block {
+                self.emit_block_w()?
+            } else {
+                // v0.104.2: `then <stmt>` 的单语句形态（spec §7.1 L83
+                // `if cond then "a" else "b" end`、§7.3 L412/413
+                // `if i == 3 then continue end`）。走**语句**分派而非表达式
+                // 分派 —— `continue`/`break`/`return` 是语句，`emit_expr_w`
+                // 会把它们当标识符解析（"Failed to parse"）。
+                // 尾随 `end` **由本分支消费**，否则留给外层块解析器当语句起始。
+                let (r, w) = self.emit_statement_expr_w()?;
+                self.match_token_exact(TokenType::End);
+                (r, w)
+            };
             self.emit.emit(MirInst::Copy(dst, r));
             (r, w)
         } else {
@@ -1344,7 +1437,23 @@ impl ParserV3 {
             .unwrap_or(false)
         {
             self.advance();
-            let (else_reg, w) = self.emit_block_w()?;
+            // v0.104.2: `else if …` —— 链式条件分支（spec §14.2 if_stmt 的
+            // `{ "else" "if" expr "then" … }` 形态，§7.3 亦使用）。
+            //
+            // **缺陷**：`else` 之后无条件走 `emit_block_w`，而它只认
+            // 块起始（`{` / 换行到 `end`）—— 遇到作为**表达式**的 `if`
+            // 会落到"把 if 当语句"的路径并最终解析失败；于是
+            //   `if c1 { a } else if c2 { b }`（值形态）**不可解析**，
+            // 而 `if c1 { a } else { b }` 可解析 —— 同一语法的两级深浅
+            // 一边通一边不通。
+            // 现在：`else if` 递归走 `emit_if_w`（它同样返回结果寄存器，
+            // 与块体路径的 `Copy(dst, r)` 契约一致）。
+            let else_is_if = self.check(&TokenType::If);
+            let (else_reg, w) = if else_is_if {
+                self.emit_if_w()?
+            } else {
+                self.emit_block_w()?
+            };
             self.emit.emit(MirInst::Copy(dst, else_reg));
             Some(Box::new(w))
         } else {
@@ -1372,7 +1481,8 @@ impl ParserV3 {
     pub(super) fn emit_block_w(&mut self) -> Option<(Reg, MirWitness)> {
         let span = self.span_of_current();
         let mut stmt_wits = Vec::new();
-        let mut last = 0;
+        // v0.104.2: `Option<Reg>` —— 空块不得返回哨兵 0（见下方 None 分支）。
+        let mut last: Option<Reg> = None;
         if self.match_token_exact(TokenType::LBrace) {
             // v0.75.78: 与 parse_block_body/else 分支对称 —— 块内语句间允许
             // 换行（`if c {\n  stmt\n}`）。修复前 `{` 后不跳换行，多行
@@ -1381,7 +1491,7 @@ impl ParserV3 {
             while self.match_token(&[TokenType::Newline]) {}
             while !self.check(&TokenType::RBrace) && !self.is_at_end() {
                 let (r, w) = self.emit_statement_expr_w()?;
-                last = r;
+                last = Some(r);
                 stmt_wits.push(w);
                 while self.match_token(&[TokenType::Newline]) {}
             }
@@ -1390,18 +1500,31 @@ impl ParserV3 {
             // 换行到 end（v0.87：或 EOF / 右括号 / 逗号 终止）
             while self.match_token(&[TokenType::Newline]) {}
             let is_block_end = |p: &ParserV3| -> bool {
-                p.peek().map(|t| matches!(
-                    &t.token_type,
-                    TokenType::End
+                match p.peek().map(|t| &t.token_type) {
+                    Some(
+                        TokenType::End
                         | TokenType::RParen
                         | TokenType::RBrace
                         | TokenType::Comma
-                        | TokenType::EOF
-                )).unwrap_or(true) // EOF 也是终止符
+                        | TokenType::EOF,
+                    ) => true,
+                    // v0.104.2: `else` 也是块终止符 ——
+                    //     if c then
+                    //       …
+                    //     else          ← 必须在此停下
+                    //       …
+                    //     end
+                    // 此前 `else` 不在终止集内，块体把它当**语句**解析
+                    // → 「Unbound variable 'else'」。规范 §14.2 的 if_stmt
+                    // 与 §7.3/§11.5 示例都是这个形状。
+                    Some(TokenType::Identifier(s)) => s == "else",
+                    None => true, // EOF 也是终止符
+                    Some(_) => false,
+                }
             };
             while !is_block_end(self) {
                 let (r, w) = self.emit_statement_expr_w()?;
-                last = r;
+                last = Some(r);
                 stmt_wits.push(w);
                 while self.match_token(&[TokenType::Newline]) {}
             }
@@ -1409,6 +1532,18 @@ impl ParserV3 {
             // 不要求显式 end；match_token_exact 在 token 不匹配时静默返回 false。
             self.match_token_exact(TokenType::End);
         }
+        let last = match last {
+            Some(r) => r,
+            // v0.104.2: 空块 → 分配一个真实的 Nil 寄存器，不再返回哨兵 0。
+            // 空块（`if c then else … end`、`transaction end` 之类）在**独立
+            // 寄存器空间**里可能一个寄存器都没分配，返回 0 会让消费者引用
+            // 越界寄存器（`node_ready` 的 `reg_ready[0]` panic）。
+            None => {
+                let r = self.emit.alloc_reg();
+                self.emit.emit(MirInst::Const(r, crate::value::Value::Nil));
+                r
+            }
+        };
         Some((last, Self::block_witness(stmt_wits, span)))
     }
 
@@ -1514,21 +1649,32 @@ impl ParserV3 {
                 let span = self.span_of_current();
                 self.advance(); // 'commit'
                 self.emit.emit(MirInst::Commit);
+                // v0.104.2: 返回**真实分配**的寄存器并写入 Nil —— `Commit`
+                // 是 unit 指令（无 dst），此前直接返回哨兵 `0`。事务体是独立
+                // 寄存器空间，`transaction commit end` 里它一个寄存器都没分配，
+                // 于是 `Some((0, _))` 被当作 body 的末值寄存器 → 返回语句引用
+                // reg 0 → run_mir 拿到 n_regs=0 的函数 → `node_ready` 越界 panic。
+                let dst = self.emit.alloc_reg();
+                self.emit.emit(MirInst::Const(dst, crate::value::Value::Nil));
                 let w = MirWitness {
                     kind: WitnessKind::Sequence(vec![]),
                     span,
                 };
-                Some((0, w))
+                Some((dst, w))
             }
             TokenType::Identifier(n) if n == "rollback" => {
                 let span = self.span_of_current();
                 self.advance(); // 'rollback'
                 self.emit.emit(MirInst::Rollback);
+                // 同 commit：返回真实寄存器（rollback 通过 dispatch 返回 Err
+                // 中断，该寄存器不会被读到，但保持与 commit 同一形状）。
+                let dst = self.emit.alloc_reg();
+                self.emit.emit(MirInst::Const(dst, crate::value::Value::Nil));
                 let w = MirWitness {
                     kind: WitnessKind::Sequence(vec![]),
                     span,
                 };
-                Some((0, w))
+                Some((dst, w))
             }
             _ => self.emit_expr_w(),
         }
@@ -1573,13 +1719,22 @@ impl ParserV3 {
 
         self.emit
             .emit(MirInst::BinaryOp(i_reg, i_reg, BinaryOp::Add, one_reg));
+        // v0.104.2: `continue` 的目标是**增量指令**，不是 `loop_label`。
+        //
+        // **缺陷（`for i in [1,2,3]` + `if i == 2 { continue }` 挂死）**：
+        // `continue` 此前被后修补成 `loop_label` —— 即条件判定处，**跳过了
+        // 循环变量增量**。`i` 因此永不前进，条件恒为「未越界」→ 无限循环。
+        // （`break` 无此问题：它的目标是循环出口。）
+        // 语义上 `continue` = 「跳过本次迭代剩余 body」，而「下一次迭代」
+        // 在本 lowering 里必须先执行增量，故目标应为刚发出的这条 BinaryOp。
+        let increment_idx = self.emit.insts.len() - 1;
         self.emit.emit(MirInst::Jump(loop_label));
         let end_label = self.emit.insts.len();
         self.emit.patch_label_at(exit_jump_idx, end_label);
         for i in body_start..body_end {
             match &mut self.emit.insts[i] {
                 MirInst::Break(lbl) => *lbl = end_label,
-                MirInst::Continue(lbl) => *lbl = loop_label,
+                MirInst::Continue(lbl) => *lbl = increment_idx,
                 _ => {}
             }
         }
@@ -1654,18 +1809,23 @@ impl ParserV3 {
         // 子上下文：事务体是独立寄存器空间（镜像 lower/closure/task 分支）
         let parent = std::mem::replace(&mut self.emit, crate::mir::lower::EmitContext::new());
         let mut body_wits = Vec::new();
-        let mut last = 0;
+        // v0.104.2: `Option<Reg>` 而非哨兵 0 —— 空事务体（`transaction end`）
+        // 在**独立寄存器空间**里一个寄存器都没分配，此时引用 reg 0 会让
+        // `run_mir` 拿到 n_regs=0 的函数 → `node_ready` 用 reg_ready[0] 越界
+        // panic（"the len is 0 but the index is 0"）。与 emit_block_mir_and_wit /
+        // emit_section_w 的既有一致写法。
+        let mut last: Option<Reg> = None;
         while self.match_token(&[TokenType::Newline]) {}
         while !self.check(&TokenType::End)
             && !self.peek_is_identifier("compensation")
             && !self.is_at_end()
         {
             let (r, w) = self.emit_statement_expr_w()?;
-            last = r;
+            last = Some(r);
             body_wits.push(w);
             while self.match_token(&[TokenType::Newline]) {}
         }
-        self.emit.emit_tail_return(Some(last));
+        self.emit.emit_tail_return(last);
         let body_mir = std::mem::replace(&mut self.emit, parent).finish();
 
         // compensation 段（可选）：`compensation` 后语句循环到 `end`
@@ -1673,15 +1833,15 @@ impl ParserV3 {
             self.advance(); // 'compensation'
             let parent2 = std::mem::replace(&mut self.emit, crate::mir::lower::EmitContext::new());
             let mut comp_wits = Vec::new();
-            let mut comp_last = 0;
+            let mut comp_last: Option<Reg> = None;
             while self.match_token(&[TokenType::Newline]) {}
             while !self.check(&TokenType::End) && !self.is_at_end() {
                 let (r, w) = self.emit_statement_expr_w()?;
-                comp_last = r;
+                comp_last = Some(r);
                 comp_wits.push(w);
                 while self.match_token(&[TokenType::Newline]) {}
             }
-            self.emit.emit_tail_return(Some(comp_last));
+            self.emit.emit_tail_return(comp_last);
             let cm = std::mem::replace(&mut self.emit, parent2).finish();
             body_wits.extend(comp_wits);
             cm

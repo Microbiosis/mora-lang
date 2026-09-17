@@ -237,7 +237,17 @@ fn build_node(b: &mut FcfgBuilder, w: &MirWitness) -> Node<()> {
             let cond_reg = node_result_reg(&cond_node);
             let then_block = build_block(b, then);
             let else_block = r#else.as_ref().map(|e| build_block(b, e));
-            let if_node = Node::If { cond: cond_reg, then: then_block, else_: else_block, span, meta: () };
+            // v0.104.2: 结果寄存器（两分支 Copy 到它）—— 与 For/While 同契约，
+            // 使 `let x = if … end` 能拿到 if 的值而非哨兵 0。
+            let dst = b.alloc();
+            let if_node = Node::If {
+                cond: cond_reg,
+                then: then_block,
+                else_: else_block,
+                dst,
+                span,
+                meta: (),
+            };
             // Sequence 保留条件求值顺序 + If 节点（此前 wrap_with_cond
             // 丢弃了 If 自身 — 嵌套体（macro body）的分支全部丢失）
             Node::Sequence { nodes: vec![cond_node, if_node], span, meta: () }
@@ -645,6 +655,10 @@ fn node_result_reg_of(n: &Node<()>) -> Option<Reg> {
         | Node::Index { dst: reg, .. }
         | Node::Perform { dst: reg, .. }
         | Node::Match { dst: reg, .. }
+        // v0.104.2: If 也是**表达式**（spec §7.1 `let x = if c then "a" else "b" end`）——
+        // 结果寄存器由 witness_to_fcfg 预分配、fcfg_lower 两分支各 Copy 一次。
+        // 缺此 arm 时消费者（`let` 绑定）只能拿到哨兵 0。
+        | Node::If { dst: reg, .. }
         | Node::Quasiquote { dst: reg, .. } => Some(*reg),
         Node::Sequence { nodes, .. } => nodes.last().and_then(node_result_reg_of),
         _ => None,

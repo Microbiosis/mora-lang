@@ -144,15 +144,19 @@ pub fn eval_binary(left: Value, op: &BinaryOp, right: Value) -> Result<Value, Mo
             (Value::List(a), Value::List(b)) => {
                 // v0.17: 等长列表逐元素相加，否则拼接
                 if a.len() == b.len() {
+                    // v0.104.2: 逐元素加法委托 `eval_binary(Add)` ——
+                    // 此前只列了 `Float+Float` 与 `String+String`，
+                    // **Int 落到 `_ => Nil`**：`[1i] + [2i]` 得 `[nil]`
+                    //（等长时逐元素、不等长才拼接，于是同一运算的结果取决于
+                    // 长度 —— `[] + [1i]` 得 `[1]` 而 `[1i] + [2i]` 得 `[nil]`）。
+                    // 委托后与标量加法同一套规则（Int+Int / Int+Float /
+                    // Float+Float / BigInt 提升 / 字符串拼接），语义收敛。
                     let result: Vec<Value> = a
                         .iter()
                         .zip(b.iter())
-                        .map(|(x, y)| match (x, y) {
-                            (Value::Float(xn), Value::Float(yn)) => Value::Float(xn + yn),
-                            (Value::String(xs), Value::String(ys)) => {
-                                Value::String(format!("{}{}", xs, ys))
-                            }
-                            _ => Value::Nil,
+                        .map(|(x, y)| {
+                            eval_binary(x.clone(), &BinaryOp::Add, y.clone())
+                                .unwrap_or(Value::Nil) // 不支持加法的元素对（如 dict+dict）→ Nil
                         })
                         .collect();
                     Ok(Value::List(result))

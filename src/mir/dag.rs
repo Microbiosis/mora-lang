@@ -468,8 +468,34 @@ pub fn dag_analyze(func: &MirFunction) -> MirDag {
         has_outgoing.insert(edge.from);
     }
 
+    // v0.104.2: entry = **从 pc 0 可达**的无入边节点，而不是「所有无入边节点」。
+    //
+    // **缺陷背景（`if true { print("p") }` 之后 7i 丢失、run_mir 返回 Nil）**：
+    // 常量条件的 `JumpIfNot` 被 `IfSimplifyRule` 折叠掉后，else 臂（`Const(Nil)`
+    // + `Copy(dst, …)`）成为**不可达死块**，它自然没有入边。此前 entry 取
+    // 「所有无入边节点」→ 死块与函数入口**并列成为入口** → DAG 无条件下执行
+    // 它 → 其 `Copy(dst, Nil)` 覆盖了真分支写好的结果，且 `n6 -> n7` 的
+    // Sequence 让死块抢先于尾部语句 → 尾值被 Nil 取代（**静默返回 Nil**）。
+    //
+    // 判据：函数入口只有 pc 0（`partition_blocks` 恒把 0 放进 starts）。
+    // 从它出发沿边做一次可达性遍历，只有可达且无入边的节点才是合法入口；
+    // 其余无入边节点是优化留下的死块，不参与执行（它们仍留在 nodes 里，
+    // 与 `MirDagNode::Removed` 的既有约定一致）。
+    let true_entry: Option<NodeId> = pc_to_node.get(&0).copied();
+    let mut reachable: HashSet<NodeId> = HashSet::new();
+    if let Some(root) = true_entry {
+        let mut stack = vec![root];
+        reachable.insert(root);
+        while let Some(n) = stack.pop() {
+            for e in edges.iter().filter(|e| e.from == n) {
+                if reachable.insert(e.to) {
+                    stack.push(e.to);
+                }
+            }
+        }
+    }
     let entry: Vec<NodeId> = (0..nodes.len())
-        .filter(|n| !has_incoming.contains(n))
+        .filter(|n| !has_incoming.contains(n) && reachable.contains(n))
         .collect();
     let exit: Vec<NodeId> = (0..nodes.len())
         .filter(|n| !has_outgoing.contains(n))

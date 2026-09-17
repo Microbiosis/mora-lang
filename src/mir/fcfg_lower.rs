@@ -61,8 +61,10 @@ fn max_reg_in_node(node: &Fcfg) -> usize {
         Node::ListLit { dst, items, .. } => items.iter().fold(*dst, |m, r| m.max(*r)),
         Node::DictLit { dst, entries, .. } => entries.iter().fold(*dst, |m, (_, r)| m.max(*r)),
         Node::Index { dst, obj, idx, .. } => *dst.max(obj).max(idx),
-        Node::If { cond, then, else_, .. } => {
-            let mut m = *cond;
+        // dst 是 witness_to_fcfg 预分配的结果寄存器，必须计入 max ——
+        // 否则本层 bump 分配器会覆盖它（寄存器安全契约见 lower_fcfg 文档）。
+        Node::If { cond, then, else_, dst, .. } => {
+            let mut m = (*cond).max(*dst);
             m = m.max(max_reg_in_nodes(&then.nodes));
             if let Some(e) = else_ {
                 m = m.max(max_reg_in_nodes(&e.nodes));
@@ -183,14 +185,15 @@ fn lower_node(ctx: &mut EmitContext, node: &Fcfg) {
         }
 
         // ── 控制流：If → JumpIfNot + Copy 结果合并（镜像 emit 路径）──
-        Node::If { cond, then, else_, .. } => {
+        Node::If { cond, then, else_, dst, .. } => {
             ctx.emit(MirInst::JumpIfNot(*cond, 0));
             let jump_not_idx = ctx.insts.len() - 1;
             lower_block(ctx, then);
             let then_result = then.result.unwrap_or(0);
-            // 结果寄存器：两个分支各 Copy 一次（emit_if 语义）
-            let dst = ctx.alloc_reg();
-            ctx.emit(MirInst::Copy(dst, then_result));
+            // v0.104.2: 用节点自带的结果寄存器（witness_to_fcfg 预分配），
+            // 不再就地 alloc —— 消费者（`let x = if … end`）读的是同一个
+            // dst；就地分配时它无法得知该寄存器号，只能回退哨兵 0。
+            ctx.emit(MirInst::Copy(*dst, then_result));
             if let Some(else_block) = else_ {
                 ctx.emit(MirInst::Jump(0));
                 let jump_idx = ctx.insts.len() - 1;
@@ -198,7 +201,7 @@ fn lower_node(ctx: &mut EmitContext, node: &Fcfg) {
                 ctx.patch_label_at(jump_not_idx, else_start);
                 lower_block(ctx, else_block);
                 let else_result = else_block.result.unwrap_or(0);
-                ctx.emit(MirInst::Copy(dst, else_result));
+                ctx.emit(MirInst::Copy(*dst, else_result));
                 let end = ctx.insts.len();
                 ctx.patch_label_at(jump_idx, end);
             } else {
@@ -269,6 +272,9 @@ fn lower_node(ctx: &mut EmitContext, node: &Fcfg) {
             lower_block(ctx, body);
             let body_end = ctx.insts.len();
             // __idx = __idx + 1
+            // v0.104.2: `continue` 的目标是**这条增量**（见下方后修补）——
+            // 跳到 loop_start（条件判定）会跳过增量 → 索引永不前进 → 死循环。
+            let increment_idx = ctx.insts.len();
             ctx.emit(MirInst::BinaryOp(idx_reg, idx_reg, BinaryOp::Add, one_reg));
             ctx.emit(MirInst::Jump(loop_start));
             let end = ctx.insts.len();
@@ -278,11 +284,11 @@ fn lower_node(ctx: &mut EmitContext, node: &Fcfg) {
             // 外层 Sequence 的 node_result_reg 读到 —— 写在值位置的 for/while
             //（`let x = for ... end`）消费者才能读到正确寄存器，而不是回退 0。
             emit_loop_result(ctx, *dst);
-            // 后修补：body 内 Break→end_label，Continue→loop_start
+            // 后修补：body 内 Break→end_label，Continue→增量
             for i in body_start..body_end {
                 match &mut ctx.insts[i] {
                     MirInst::Break(lbl) => *lbl = end,
-                    MirInst::Continue(lbl) => *lbl = loop_start,
+                    MirInst::Continue(lbl) => *lbl = increment_idx,
                     _ => {}
                 }
             }
@@ -794,6 +800,8 @@ mod tests {
                 }],
                 result: Some(2),
             }),
+            // v0.104.2: if 的结果寄存器由 witness_to_fcfg 预分配（两分支 Copy 到它）
+            dst: 3,
             span: S,
             meta: (),
         }];
@@ -802,10 +810,10 @@ mod tests {
         assert_eq!(insts.len(), 6, "expected 6 instructions: {:?}", insts);
         assert!(matches!(&insts[0], MirInst::JumpIfNot(0, _)));
         assert!(matches!(&insts[1], MirInst::Const(1, Value::Int(1))));
-        assert!(matches!(&insts[2], MirInst::Copy(_, 1)));
+        assert!(matches!(&insts[2], MirInst::Copy(3, 1)));
         assert!(matches!(&insts[3], MirInst::Jump(_)));
         assert!(matches!(&insts[4], MirInst::Const(2, Value::Int(2))));
-        assert!(matches!(&insts[5], MirInst::Copy(_, 2)));
+        assert!(matches!(&insts[5], MirInst::Copy(3, 2)));
         let _ = n_regs;
     }
 

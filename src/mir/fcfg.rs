@@ -132,6 +132,12 @@ pub enum Node<M> {
         cond: Reg,
         then: Block<M>,
         else_: Option<Block<M>>,
+        /// v0.104.2: `if` 作为**表达式**的结果寄存器（两分支各 Copy 一次到
+        /// 它）。与 `While::dst` 同一理由：缺此字段时 `node_result_reg_of`
+        /// 只能返回哨兵 0，`let x = if c then "a" else "b" end` 会把 `x`
+        /// 绑到寄存器 0（恰好是前面某个绑定的值）—— spec §7.1 的
+        /// `let x = if cond then "a" else "b" end` 因此静默取到错值。
+        dst: Reg,
         span: Span,
         meta: M,
     },

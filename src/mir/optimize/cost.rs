@@ -159,16 +159,26 @@ impl CostModel for TokenEstimate {
             // 编排
             MirInst::Orchestrate { kind, .. } => {
                 let n_agents = match kind.as_ref() {
-                    crate::mir::orchestrate::MirOrchestrateKind::Sequential { agents } => agents.len(),
-                    crate::mir::orchestrate::MirOrchestrateKind::Loop { agents, .. } => agents.len(),
-                    crate::mir::orchestrate::MirOrchestrateKind::Graph { agents, .. } => agents.len(),
-                    crate::mir::orchestrate::MirOrchestrateKind::Pregel { agents, .. } => agents.len(),
+                    crate::mir::orchestrate::MirOrchestrateKind::Sequential { agents } => {
+                        agents.len()
+                    }
+                    crate::mir::orchestrate::MirOrchestrateKind::Loop { agents, .. } => {
+                        agents.len()
+                    }
+                    crate::mir::orchestrate::MirOrchestrateKind::Graph { agents, .. } => {
+                        agents.len()
+                    }
+                    crate::mir::orchestrate::MirOrchestrateKind::Pregel { agents, .. } => {
+                        agents.len()
+                    }
                     // v0.75.84: MoA 展开为 layers×(proposers+1) 个 agent
                     crate::mir::orchestrate::MirOrchestrateKind::Moa {
                         layers, proposers, ..
                     } => layers * (proposers.len() + 1),
                     // v0.75.85: MoE 顺序执行，成本 = 专家数（稀疏 ≤ top_k）
-                    crate::mir::orchestrate::MirOrchestrateKind::Moe { experts, .. } => experts.len(),
+                    crate::mir::orchestrate::MirOrchestrateKind::Moe { experts, .. } => {
+                        experts.len()
+                    }
                 };
                 50 + n_agents as u32 * 30
             }
@@ -297,8 +307,9 @@ mod tests {
                         params: Vec::new(),
                         body: Vec::new(),
                         n_regs: 0,
-                    
-            ..Default::default()},
+
+                        ..Default::default()
+                    },
                     combiner_body: None,
                 })
                 .collect()
@@ -372,8 +383,9 @@ mod tests {
                 params: vec![],
                 body: vec![],
                 n_regs: 0,
-            
-            ..Default::default()}),
+
+                ..Default::default()
+            }),
         };
         let populated = MirInst::Observe {
             config: "{}".to_string(),
@@ -384,8 +396,9 @@ mod tests {
                     MirInst::Const(1, Value::Int(99)),
                 ],
                 n_regs: 2,
-            
-            ..Default::default()}),
+
+                ..Default::default()
+            }),
         };
         assert!(
             cost.inst_cost(&populated) > cost.inst_cost(&empty_body),

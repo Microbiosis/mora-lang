@@ -21,8 +21,18 @@ fn run_via_mir(source: &str) -> Result<(), String> {
     let mut interp = Interpreter::new();
     let mut env = interp.take_env();
     let func_arc = std::sync::Arc::new(func);
-    run_mir(&func_arc, &mut interp, &mut env, &mut mora::mir::effect::Effects::new())?;
-    run_main_task(&func_arc, &mut interp, &mut env, &mut mora::mir::effect::Effects::new())
+    run_mir(
+        &func_arc,
+        &mut interp,
+        &mut env,
+        &mut mora::mir::effect::Effects::new(),
+    )?;
+    run_main_task(
+        &func_arc,
+        &mut interp,
+        &mut env,
+        &mut mora::mir::effect::Effects::new(),
+    )
 }
 
 #[test]
@@ -61,8 +71,8 @@ use mora::mir::MirInst;
 
 /// Helper: compile via single-pass path and return the MirFunction body.
 fn compile_body(source: &str) -> Vec<MirInst> {
-    let (func, _witnesses) = mora::parser_v3::ParserV3::compile(source)
-        .expect("compile should succeed");
+    let (func, _witnesses) =
+        mora::parser_v3::ParserV3::compile(source).expect("compile should succeed");
     func.body
 }
 
@@ -74,8 +84,8 @@ fn find_inst(body: &[MirInst], pred: impl Fn(&MirInst) -> bool) -> Option<&MirIn
 #[test]
 fn as_dyn_trait_in_emit_path_works() {
     let src = "42 as dyn Any";
-    let (func, _witnesses) = mora::parser_v3::ParserV3::compile(src)
-        .expect("compile should succeed");
+    let (func, _witnesses) =
+        mora::parser_v3::ParserV3::compile(src).expect("compile should succeed");
     let dyn_inst = find_inst(&func.body, |inst| matches!(inst, MirInst::DynTrait { .. }));
     assert!(
         dyn_inst.is_some(),
@@ -83,7 +93,10 @@ fn as_dyn_trait_in_emit_path_works() {
         func.body
     );
     if let MirInst::DynTrait {
-        trait_name, src: src_reg, dst, ..
+        trait_name,
+        src: src_reg,
+        dst,
+        ..
     } = dyn_inst.unwrap()
     {
         assert_eq!(trait_name, "Any");
@@ -122,7 +135,9 @@ end
         body
     );
     if let MirInst::WithConfig {
-        bindings, body: nested, ..
+        bindings,
+        body: nested,
+        ..
     } = with_inst.unwrap()
     {
         assert!(
@@ -148,7 +163,8 @@ task main()
   end
 end
 "#,
-    ).expect("compile should succeed");
+    )
+    .expect("compile should succeed");
 
     fn find_with_config(body: &[MirInst]) -> bool {
         body.iter().any(|inst| match inst {

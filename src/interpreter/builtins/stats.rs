@@ -172,15 +172,15 @@ fn variance(xs: &[f64], sample: bool) -> f64 {
 fn pearson_correlation(a: &[f64], b: &[f64]) -> f64 {
     let ma = mean(a);
     let mb = mean(b);
-    let cov: f64 = a.iter().zip(b.iter()).map(|(x, y)| (x - ma) * (y - mb)).sum();
+    let cov: f64 = a
+        .iter()
+        .zip(b.iter())
+        .map(|(x, y)| (x - ma) * (y - mb))
+        .sum();
     let va: f64 = a.iter().map(|x| (x - ma).powi(2)).sum();
     let vb: f64 = b.iter().map(|x| (x - mb).powi(2)).sum();
     let denom = (va * vb).sqrt();
-    if denom == 0.0 {
-        0.0
-    } else {
-        cov / denom
-    }
+    if denom == 0.0 { 0.0 } else { cov / denom }
 }
 
 /// 直方图：返回 `[{lo, hi, count}, ...]` list of dict
@@ -264,7 +264,8 @@ mod tests {
 
     #[test]
     fn histogram_returns_bins() {
-        let r = call_stats_method("histogram", &[list(&[1.0, 2.0, 3.0, 4.0]), Value::Int(2)]).unwrap();
+        let r =
+            call_stats_method("histogram", &[list(&[1.0, 2.0, 3.0, 4.0]), Value::Int(2)]).unwrap();
         if let Value::List(bins) = r {
             assert_eq!(bins.len(), 2);
         } else {

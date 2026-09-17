@@ -7,9 +7,9 @@
 //! Phase 2（执行器切换）的前置条件：本文件全绿。
 
 use mora::interpreter::Interpreter;
+use mora::mir::MirFunction;
 use mora::mir::vm::{run_main_task, run_mir};
 use mora::mir::witness_to_fcfg::witness_to_fcfg;
-use mora::mir::MirFunction;
 use mora::parser_v3::ParserV3;
 use mora::value::Value;
 use std::sync::Arc;
@@ -24,16 +24,26 @@ fn execute(func: MirFunction) -> Result<Value, String> {
     let mut interp = Interpreter::new();
     let mut env = interp.take_env();
     let func_arc = Arc::new(func);
-    let last = run_mir(&func_arc, &mut interp, &mut env, &mut mora::mir::effect::Effects::new())?;
-    run_main_task(&func_arc, &mut interp, &mut env, &mut mora::mir::effect::Effects::new())?;
+    let last = run_mir(
+        &func_arc,
+        &mut interp,
+        &mut env,
+        &mut mora::mir::effect::Effects::new(),
+    )?;
+    run_main_task(
+        &func_arc,
+        &mut interp,
+        &mut env,
+        &mut mora::mir::effect::Effects::new(),
+    )?;
     Ok(last)
 }
 
 /// 双级差分审计：类别级 + 执行级。
 fn audit(name: &str) {
     let source = read_fixture(name);
-    let (func, witnesses) = ParserV3::compile(&source)
-        .unwrap_or_else(|e| panic!("{}: compile failed: {}", name, e));
+    let (func, witnesses) =
+        ParserV3::compile(&source).unwrap_or_else(|e| panic!("{}: compile failed: {}", name, e));
 
     // ── 管线产出 ──
     let fcfg = witness_to_fcfg(&witnesses);
@@ -93,10 +103,7 @@ fn audit(name: &str) {
     }
 }
 
-fn category_diffs(
-    pipeline: &[mora::mir::MirInst],
-    original: &[mora::mir::MirInst],
-) -> Vec<String> {
+fn category_diffs(pipeline: &[mora::mir::MirInst], original: &[mora::mir::MirInst]) -> Vec<String> {
     let mut diffs = Vec::new();
     if pipeline.len() != original.len() {
         diffs.push(format!(
@@ -121,58 +128,96 @@ fn category_diffs(
 }
 
 #[test]
-fn diff_arithmetic() { audit("arithmetic"); }
+fn diff_arithmetic() {
+    audit("arithmetic");
+}
 
 #[test]
-fn diff_dict_access() { audit("dict_access"); }
+fn diff_dict_access() {
+    audit("dict_access");
+}
 
 #[test]
-fn diff_eval() { audit("eval"); }
+fn diff_eval() {
+    audit("eval");
+}
 
 #[test]
-fn diff_for_loop() { audit("for_loop"); }
+fn diff_for_loop() {
+    audit("for_loop");
+}
 
 #[test]
-fn diff_function_call() { audit("function_call"); }
+fn diff_function_call() {
+    audit("function_call");
+}
 
 #[test]
-fn diff_handle_effect() { audit("handle_effect"); }
+fn diff_handle_effect() {
+    audit("handle_effect");
+}
 
 #[test]
-fn diff_if_else() { audit("if_else"); }
+fn diff_if_else() {
+    audit("if_else");
+}
 
 #[test]
-fn diff_lisp() { audit("lisp"); }
+fn diff_lisp() {
+    audit("lisp");
+}
 
 #[test]
-fn diff_macro_advanced() { audit("macro_advanced"); }
+fn diff_macro_advanced() {
+    audit("macro_advanced");
+}
 
 #[test]
-fn diff_macro_def() { audit("macro_def"); }
+fn diff_macro_def() {
+    audit("macro_def");
+}
 
 #[test]
-fn diff_match_default() { audit("match_default"); }
+fn diff_match_default() {
+    audit("match_default");
+}
 
 #[test]
-fn diff_match_dict_rename() { audit("match_dict_rename"); }
+fn diff_match_dict_rename() {
+    audit("match_dict_rename");
+}
 
 #[test]
-fn diff_match_guard() { audit("match_guard"); }
+fn diff_match_guard() {
+    audit("match_guard");
+}
 
 #[test]
-fn diff_match_list_rest() { audit("match_list_rest"); }
+fn diff_match_list_rest() {
+    audit("match_list_rest");
+}
 
 #[test]
-fn diff_nested_if() { audit("nested_if"); }
+fn diff_nested_if() {
+    audit("nested_if");
+}
 
 #[test]
-fn diff_quasiquote() { audit("quasiquote"); }
+fn diff_quasiquote() {
+    audit("quasiquote");
+}
 
 #[test]
-fn diff_string_concat() { audit("string_concat"); }
+fn diff_string_concat() {
+    audit("string_concat");
+}
 
 #[test]
-fn diff_tea_app() { audit("tea_app"); }
+fn diff_tea_app() {
+    audit("tea_app");
+}
 
 #[test]
-fn diff_tea_counter() { audit("tea_counter"); }
+fn diff_tea_counter() {
+    audit("tea_counter");
+}

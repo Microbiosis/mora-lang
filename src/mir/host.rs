@@ -116,7 +116,10 @@ pub trait MirHost {
         effect: String,
         handler: Box<dyn crate::runtime::effect::EffectHandler>,
     );
-    fn take_effect_handler(&mut self, effect: &str) -> Option<Box<dyn crate::runtime::effect::EffectHandler>>;
+    fn take_effect_handler(
+        &mut self,
+        effect: &str,
+    ) -> Option<Box<dyn crate::runtime::effect::EffectHandler>>;
     fn restore_effect_handler(
         &mut self,
         effect: String,

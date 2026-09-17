@@ -30,13 +30,15 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::checkpoint::{Checkpoint, CheckpointSaver, SendTask};
-use crate::mir::orchestrate::{MirInterruptPoint, MirInterruptWhen, MirPregelConfig, MirReducerKind};
 use crate::mir::host::MirHost;
+use crate::mir::orchestrate::{
+    MirInterruptPoint, MirInterruptWhen, MirPregelConfig, MirReducerKind,
+};
 use crate::value::{Conflict, MergeStrategy, Value};
 
-pub mod worker_pool;
-pub mod state;
 pub mod reducers;
+pub mod state;
+pub mod worker_pool;
 
 /// Interrupt 回调签名
 pub type MirInterruptCallback = Arc<dyn Fn(&str, MirInterruptWhen) -> bool>;
@@ -728,7 +730,12 @@ impl MirPregelEngine {
                 let mut master_env = self.exec_env().clone();
                 // v0.75.9: master_compute 已是 Arc，直接走全局 DAG 缓存
                 let mut master_effects = crate::mir::effect::Effects::new();
-                crate::mir::vm::run_mir(&master, interpreter, &mut master_env, &mut master_effects)?;
+                crate::mir::vm::run_mir(
+                    &master,
+                    interpreter,
+                    &mut master_env,
+                    &mut master_effects,
+                )?;
                 self.apply_effects(master_effects)?;
             }
 
@@ -780,7 +787,12 @@ impl MirPregelEngine {
                         env.define("current".into(), acc.clone(), false);
                         env.define("incoming".into(), incoming.clone(), false);
                         // v0.75.9: combiner_bodies 已是 Arc，直接走全局 DAG 缓存
-                        match crate::mir::vm::run_mir(&combiner, interpreter, &mut env, &mut advance_effects) {
+                        match crate::mir::vm::run_mir(
+                            &combiner,
+                            interpreter,
+                            &mut env,
+                            &mut advance_effects,
+                        ) {
                             Ok(v) => acc = v,
                             Err(_) => acc = incoming.clone(), // fallback: LWW
                         }
@@ -1222,10 +1234,9 @@ impl MirPregelEngine {
                 MirReducerKind::Merge(merge_expr) => {
                     // v0.62: Execute the merge body with `current` and `incoming`.
                     // v0.92: merge_expr 现为 MirWitness——直接 lower。
-                    let merge_fn = crate::mir::lower::lower_mir_witnesses(std::slice::from_ref(
-                        &merge_expr,
-                    ))
-                    .map_err(|e| format!("Pregel merge body lowering failed: {}", e))?;
+                    let merge_fn =
+                        crate::mir::lower::lower_mir_witnesses(std::slice::from_ref(&merge_expr))
+                            .map_err(|e| format!("Pregel merge body lowering failed: {}", e))?;
                     let mut merge_env = self.exec_env().clone();
                     merge_env.define("current".into(), current.unwrap_or(Value::Nil), false);
                     merge_env.define("incoming".into(), value, false);
@@ -1250,9 +1261,8 @@ impl MirPregelEngine {
                 // v0.67: Custom — execute user body via Custom merge expression.
                 MirReducerKind::Custom(merge_expr) => {
                     // v0.94: 用 reducers.rs 的唯一实现（返回 MirWitness）。
-                    let merge_witness = crate::pregel::reducers::parse_custom_merge_expr(
-                        merge_expr.as_str(),
-                    );
+                    let merge_witness =
+                        crate::pregel::reducers::parse_custom_merge_expr(merge_expr.as_str());
                     let merge_fn = crate::mir::lower::lower_mir_witnesses(std::slice::from_ref(
                         &merge_witness,
                     ))
@@ -1409,8 +1419,9 @@ mod tests {
             params: Vec::new(),
             body: Vec::new(),
             n_regs: 0,
-        
-            ..Default::default()}
+
+            ..Default::default()
+        }
     }
 
     fn make_agent(name: &str) -> MirAgentDef {
@@ -1638,8 +1649,9 @@ mod tests {
                     MirInst::Return(Some(0)),
                 ],
                 n_regs: 1,
-            
-            ..Default::default()},
+
+                ..Default::default()
+            },
             combiner_body: None,
         }
     }
@@ -1832,8 +1844,9 @@ mod tests {
                 MirInst::Return(Some(2)),
             ],
             n_regs: 3,
-        
-            ..Default::default()};
+
+            ..Default::default()
+        };
         let config = MirPregelConfig {
             agents: vec![MirAgentDef {
                 name: "a".into(),
@@ -1910,8 +1923,9 @@ mod tests {
             params: Vec::new(),
             body: vec![MirInst::Const(0, Value::Nil), MirInst::Return(None)],
             n_regs: 1,
-        
-            ..Default::default()};
+
+            ..Default::default()
+        };
         let config = MirPregelConfig {
             agents: vec![make_const_agent("a", 1)],
             edges: vec![MirEdgeDef {
@@ -1942,8 +1956,9 @@ mod tests {
             params: Vec::new(),
             body: vec![MirInst::Call(0, "__no_such_fn__".to_string(), Vec::new())],
             n_regs: 1,
-        
-            ..Default::default()};
+
+            ..Default::default()
+        };
         let config_bad = MirPregelConfig {
             agents: vec![make_const_agent("a", 1)],
             edges: vec![MirEdgeDef {
@@ -1978,8 +1993,9 @@ mod tests {
             params: Vec::new(),
             body: vec![MirInst::Const(0, Value::Int(99)), MirInst::Halt(Some(0))],
             n_regs: 1,
-        
-            ..Default::default()};
+
+            ..Default::default()
+        };
         let config = MirPregelConfig {
             agents: vec![MirAgentDef {
                 name: "a".into(),
@@ -2392,8 +2408,9 @@ mod tests {
                 MirInst::Return(Some(4)),
             ],
             n_regs: 5,
-        
-            ..Default::default()};
+
+            ..Default::default()
+        };
         let config = MirPregelConfig {
             agents: vec![heavy.clone(), make_const_agent("light", 7)],
             edges: vec![
@@ -2584,8 +2601,9 @@ mod tests {
                     MirInst::Return(Some(0)),
                 ],
                 n_regs: 2,
-            
-            ..Default::default()},
+
+                ..Default::default()
+            },
         );
         let config = MirPregelConfig {
             agents: vec![a1, a2, b],
@@ -2696,8 +2714,9 @@ mod tests {
                     MirInst::Return(Some(0)),
                 ],
                 n_regs: 1,
-            
-            ..Default::default()},
+
+                ..Default::default()
+            },
         );
         let config = MirPregelConfig {
             agents: vec![a1, a2, b],

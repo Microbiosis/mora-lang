@@ -29,10 +29,7 @@ pub enum LmirInst {
 
     // ── 内存操作 ──
     /// 分配内存。
-    Alloc {
-        dst: Reg,
-        layout: MemLayout,
-    },
+    Alloc { dst: Reg, layout: MemLayout },
     /// 从内存加载。
     Load {
         dst: Reg,
@@ -48,28 +45,17 @@ pub enum LmirInst {
         size: usize,
     },
     /// 指针算术（Get Element Pointer）。
-    Gep {
-        dst: Reg,
-        base: Reg,
-        offset: Reg,
-    },
+    Gep { dst: Reg, base: Reg, offset: Reg },
 
     // ── GC/引用管理 ──
     /// GC 分配（带追踪）。
-    GcAlloc {
-        dst: Reg,
-        layout: MemLayout,
-    },
+    GcAlloc { dst: Reg, layout: MemLayout },
     /// 注册 GC 根。
     GcRoot(Reg),
     /// GC 写屏障。
     GcBarrier(Reg),
     /// 引用计数操作。
-    RefCount {
-        dst: Reg,
-        src: Reg,
-        delta: i32,
-    },
+    RefCount { dst: Reg, src: Reg, delta: i32 },
 
     // ── FFI 边界 ──
     /// 调用外部函数。
@@ -151,22 +137,38 @@ pub enum UnboxStrategy {
 impl MemLayout {
     /// Int64 布局。
     pub fn int64() -> Self {
-        Self { size: 8, align: 8, fields: vec![] }
+        Self {
+            size: 8,
+            align: 8,
+            fields: vec![],
+        }
     }
 
     /// Float64 布局。
     pub fn float64() -> Self {
-        Self { size: 8, align: 8, fields: vec![] }
+        Self {
+            size: 8,
+            align: 8,
+            fields: vec![],
+        }
     }
 
     /// Bool 布局。
     pub fn bool() -> Self {
-        Self { size: 1, align: 1, fields: vec![] }
+        Self {
+            size: 1,
+            align: 1,
+            fields: vec![],
+        }
     }
 
     /// Pointer 布局。
     pub fn ptr() -> Self {
-        Self { size: 8, align: 8, fields: vec![] }
+        Self {
+            size: 8,
+            align: 8,
+            fields: vec![],
+        }
     }
 }
 
@@ -215,7 +217,9 @@ mod tests {
 
     #[test]
     fn unbox_strategy_debug() {
-        let s = UnboxStrategy::SmallInline { threshold_bytes: 16 };
+        let s = UnboxStrategy::SmallInline {
+            threshold_bytes: 16,
+        };
         assert!(format!("{:?}", s).contains("16"));
     }
 }

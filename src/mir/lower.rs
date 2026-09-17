@@ -222,7 +222,9 @@ impl WitnessLowerer {
         // Sequence expression: lower each statement; last reg is the result.
         let WitnessKind::Sequence(stmts) = &w.kind else {
             // Single expression — wrap as a single-statement sequence.
-            return self.lower_witness(w).map(|r| (r, empty_witness_for_span(w.span)));
+            return self
+                .lower_witness(w)
+                .map(|r| (r, empty_witness_for_span(w.span)));
         };
         let mut last_reg = 0;
         for stmt in stmts {
@@ -437,27 +439,27 @@ impl WitnessLowerer {
                 // `n_regs`，`h_match_expr` 越界 panic；另分配的 `dst` 无人写、
                 // 消费者恒读 Nil。与 fcfg_lower 的 `lower_match` 同契约。
                 let dst = self.alloc_reg();
-                let match_arms: Vec<crate::mir::MatchArmInst> =
-                    arms.iter()
-                        .map(|arm| {
-                            let pat_str = pattern_to_string(&arm.pattern);
-                            let mut body_lowerer = WitnessLowerer::new();
-                            let arm_val_reg = body_lowerer.lower_witness(&arm.body)?;
-                            body_lowerer.emit(MirInst::Return(Some(arm_val_reg)));
-                            // v0.104.3: 守卫降维为独立 MirFunction —— 在模式绑定
-                            // 之后由 `h_match_expr` 调用（守卫引用绑定变量）。
-                            let guard = match &arm.guard {
-                                Some(g) => {
-                                    let mut gl = WitnessLowerer::new();
-                                    let gr = gl.lower_witness(g)?;
-                                    gl.emit(MirInst::Return(Some(gr)));
-                                    Some(Box::new(gl.finish()))
-                                }
-                                None => None,
-                            };
-                            Ok((pat_str, guard, Box::new(body_lowerer.finish()), dst))
-                        })
-                        .collect::<Result<Vec<_>, String>>()?;
+                let match_arms: Vec<crate::mir::MatchArmInst> = arms
+                    .iter()
+                    .map(|arm| {
+                        let pat_str = pattern_to_string(&arm.pattern);
+                        let mut body_lowerer = WitnessLowerer::new();
+                        let arm_val_reg = body_lowerer.lower_witness(&arm.body)?;
+                        body_lowerer.emit(MirInst::Return(Some(arm_val_reg)));
+                        // v0.104.3: 守卫降维为独立 MirFunction —— 在模式绑定
+                        // 之后由 `h_match_expr` 调用（守卫引用绑定变量）。
+                        let guard = match &arm.guard {
+                            Some(g) => {
+                                let mut gl = WitnessLowerer::new();
+                                let gr = gl.lower_witness(g)?;
+                                gl.emit(MirInst::Return(Some(gr)));
+                                Some(Box::new(gl.finish()))
+                            }
+                            None => None,
+                        };
+                        Ok((pat_str, guard, Box::new(body_lowerer.finish()), dst))
+                    })
+                    .collect::<Result<Vec<_>, String>>()?;
                 self.emit(MirInst::MatchExpr {
                     val: val_reg,
                     arms: match_arms,
@@ -596,7 +598,8 @@ impl WitnessLowerer {
             } => {
                 let src = self.lower_witness(expr)?;
                 let dst = self.alloc_reg();
-                let generic_strs: Vec<String> = generics.iter().map(|t| t.to_type().name()).collect();
+                let generic_strs: Vec<String> =
+                    generics.iter().map(|t| t.to_type().name()).collect();
                 self.emit(MirInst::DynTrait {
                     dst,
                     src,
@@ -871,7 +874,8 @@ impl WitnessLowerer {
                             WitnessCallee::Name(n) if n == "splice" => {
                                 if let Some(arg) = args.first() {
                                     let reg = self.lower_witness(arg)?;
-                                    resolved.push(crate::mir::QuasiquoteSegment::UnquoteSplice(reg));
+                                    resolved
+                                        .push(crate::mir::QuasiquoteSegment::UnquoteSplice(reg));
                                 }
                             }
                             _ => {
@@ -885,7 +889,10 @@ impl WitnessLowerer {
                         }
                     }
                 }
-                self.emit.emit(MirInst::Quasiquote { dst, segments: resolved });
+                self.emit.emit(MirInst::Quasiquote {
+                    dst,
+                    segments: resolved,
+                });
                 Ok(dst)
             }
 
@@ -917,10 +924,7 @@ impl WitnessLowerer {
                 Ok(dst)
             }
             WitnessKind::UpdateDef {
-                name,
-                params,
-                body,
-                ..
+                name, params, body, ..
             } => {
                 let param_names: Vec<String> = params.iter().map(|p| p.name.clone()).collect();
                 let mut body_lowerer = WitnessLowerer::new();
@@ -982,7 +986,12 @@ impl WitnessLowerer {
                 self.emit(MirInst::Const(dst, crate::value::Value::Nil));
                 Ok(dst)
             }
-            WitnessKind::Solve { limit, query_vars, anon_vars, goal } => {
+            WitnessKind::Solve {
+                limit,
+                query_vars,
+                anon_vars,
+                goal,
+            } => {
                 // goal 构建体独立 lower 成 MirFunction（与 AppDef 的三个子体同规则）
                 let mut goal_l = WitnessLowerer::new();
                 let goal_dst = goal_l.lower_witness(goal)?;
@@ -1132,8 +1141,7 @@ pub fn pattern_to_string(pattern: &crate::mir::witness::WitnessPattern) -> Strin
             )
         }
         Pattern::ListVec { elements, rest } => {
-            let parts: Vec<String> =
-                elements.iter().map(pattern_to_string).collect();
+            let parts: Vec<String> = elements.iter().map(pattern_to_string).collect();
             if let Some(r) = rest {
                 format!(
                     "list:vector:[{},..{}]",

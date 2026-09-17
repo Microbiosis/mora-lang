@@ -20,10 +20,7 @@ pub enum Cmd {
     /// 批量执行多个命令（顺序执行，前一个失败则中止）
     Batch(Vec<Cmd>),
     /// 执行一个具名 effect（对应 algebraic effect）
-    Perform {
-        effect: String,
-        args: Vec<Value>,
-    },
+    Perform { effect: String, args: Vec<Value> },
     /// 触发另一个 Msg（chain update）
     Dispatch(Box<Value>),
 }
@@ -41,10 +38,7 @@ impl Cmd {
                 let mut map = std::collections::HashMap::new();
                 map.insert("kind".to_string(), Value::String("Perform".to_string()));
                 map.insert("effect".to_string(), Value::String(effect.clone()));
-                map.insert(
-                    "args".to_string(),
-                    Value::List(args.clone()),
-                );
+                map.insert("args".to_string(), Value::List(args.clone()));
                 Value::Dict(map)
             }
             Cmd::Dispatch(msg) => {
@@ -94,7 +88,10 @@ impl Cmd {
                     other => Err(format!("Cmd.from_value: unknown kind '{}'", other)),
                 }
             }
-            other => Err(format!("Cmd.from_value: expected List or Dict, got {:?}", other)),
+            other => Err(format!(
+                "Cmd.from_value: expected List or Dict, got {:?}",
+                other
+            )),
         }
     }
 }
@@ -132,9 +129,7 @@ impl Msg {
                     Some(Value::String(s)) => s.clone(),
                     _ => return Err("Msg.from_value: missing tag".to_string()),
                 };
-                let payload = Box::new(
-                    map.get("payload").cloned().unwrap_or(Value::Nil),
-                );
+                let payload = Box::new(map.get("payload").cloned().unwrap_or(Value::Nil));
                 Ok(Msg { tag, payload })
             }
             other => Err(format!("Msg.from_value: expected Dict, got {:?}", other)),
@@ -298,11 +293,7 @@ impl TeaApp {
     /// 每轮：
     /// 1. `fold` 所有待处理 Msg → 新 model + 产出 Cmd 流（纯数据变换）
     /// 2. 解释 Cmd（`Cmd::Dispatch` 的消息回流到 `msg_queue`，供下一轮折叠）
-    pub fn run_loop(
-        &self,
-        max_steps: usize,
-        interp: &mut dyn crate::mir::host::MirHost,
-    ) -> TeaApp {
+    pub fn run_loop(&self, max_steps: usize, interp: &mut dyn crate::mir::host::MirHost) -> TeaApp {
         let mut app = self.clone();
         for _ in 0..max_steps {
             if app.msg_queue.is_empty() && app.cmd_queue.is_empty() {
@@ -332,11 +323,8 @@ impl TeaApp {
                 }
             }
             Cmd::Perform { effect, args } => {
-                let _ = interp.perform_effect(
-                    &effect,
-                    args,
-                    &mut crate::mir::effect::Effects::new(),
-                );
+                let _ =
+                    interp.perform_effect(&effect, args, &mut crate::mir::effect::Effects::new());
             }
             Cmd::Dispatch(msg_value) => {
                 if let Ok(msg) = Msg::from_value(&msg_value) {

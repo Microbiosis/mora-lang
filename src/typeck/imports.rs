@@ -94,10 +94,7 @@ fn extract_module_symbols(
         match &d.kind {
             // FnDef: 用推断出的精确 Arrow（此前硬编码 Closure → 调用必失败）
             WitnessKind::FnDef { name, .. } => {
-                let ty = hm
-                    .infer_expr(d)
-                    .map(|(t, _)| t)
-                    .unwrap_or(Type::Closure);
+                let ty = hm.infer_expr(d).map(|(t, _)| t).unwrap_or(Type::Closure);
                 syms.push((name.clone(), sanitize(&ty)));
             }
             WitnessKind::StructDef { name, .. } | WitnessKind::EnumDef { name, .. } => {
@@ -127,7 +124,12 @@ fn extract_module_symbols(
     // 3) v0.98: effect 签名导出（模块声明的效果契约随 import 传播）
     let mut effect_signatures: Vec<(String, crate::typeck::hm::EffectSignature)> = Vec::new();
     for w in witnesses {
-        if let WitnessKind::EffectSig { name, params, result } = &w.kind {
+        if let WitnessKind::EffectSig {
+            name,
+            params,
+            result,
+        } = &w.kind
+        {
             effect_signatures.push((
                 name.clone(),
                 crate::typeck::hm::EffectSignature {
@@ -193,7 +195,8 @@ pub fn collect_imported_symbols(
                             // 再提取本模块符号（传递 import 支持）
                             let nested =
                                 collect_imported_symbols(&module_witnesses, visited, errors);
-                            let own = extract_module_symbols(&module_witnesses, &nested.env_bindings);
+                            let own =
+                                extract_module_symbols(&module_witnesses, &nested.env_bindings);
                             out.extend(own);
                             out.extend(nested);
                         }

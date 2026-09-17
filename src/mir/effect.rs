@@ -35,10 +35,9 @@ impl EffectRow {
             EffectRow::Empty => {
                 EffectRow::Cons(effect_name.to_string(), Box::new(EffectRow::Empty))
             }
-            EffectRow::Var(_) => EffectRow::Cons(
-                effect_name.to_string(),
-                Box::new(std::mem::take(self)),
-            ),
+            EffectRow::Var(_) => {
+                EffectRow::Cons(effect_name.to_string(), Box::new(std::mem::take(self)))
+            }
             EffectRow::Cons(h, t) => {
                 let mut new_tail = *t;
                 new_tail.extend(effect_name);
@@ -260,10 +259,7 @@ mod tests {
     fn extend_into_empty() {
         let mut r = EffectRow::default();
         assert!(r.extend("Ai"));
-        assert_eq!(
-            r,
-            EffectRow::Cons("Ai".into(), Box::new(EffectRow::Empty))
-        );
+        assert_eq!(r, EffectRow::Cons("Ai".into(), Box::new(EffectRow::Empty)));
     }
 
     #[test]
@@ -271,10 +267,7 @@ mod tests {
         let mut r = EffectRow::default();
         assert!(r.extend("Ai"));
         assert!(!r.extend("Ai"), "second extend should return false");
-        assert_eq!(
-            r,
-            EffectRow::Cons("Ai".into(), Box::new(EffectRow::Empty))
-        );
+        assert_eq!(r, EffectRow::Cons("Ai".into(), Box::new(EffectRow::Empty)));
     }
 
     #[test]

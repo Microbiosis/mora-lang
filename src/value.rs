@@ -468,12 +468,22 @@ impl PartialEq for Value {
             (Value::TeaCmd(a), Value::TeaCmd(b)) => a == b,
             (Value::TeaMsg(a), Value::TeaMsg(b)) => a == b,
             // v0.86: Curry — 按函数/arity/已绑定参数逐一比较。
-            (Value::Curry { func: a, arity: aa, bound_args: ba },
-             Value::Curry { func: b, arity: ab, bound_args: bb }) => {
-                a == b && aa == ab && ba == bb
-            }
+            (
+                Value::Curry {
+                    func: a,
+                    arity: aa,
+                    bound_args: ba,
+                },
+                Value::Curry {
+                    func: b,
+                    arity: ab,
+                    bound_args: bb,
+                },
+            ) => a == b && aa == ab && ba == bb,
             // v0.86: Cons — 按 car/cdr 结构比较。
-            (Value::Cons { car: a1, cdr: a2 }, Value::Cons { car: b1, cdr: b2 }) => a1 == b1 && a2 == b2,
+            (Value::Cons { car: a1, cdr: a2 }, Value::Cons { car: b1, cdr: b2 }) => {
+                a1 == b1 && a2 == b2
+            }
             // v0.86: Code — 按 source text 字符串比较。
             (Value::Code(a), Value::Code(b)) => a == b,
             // v0.102: 逻辑变量 — 按 id 相等（subst 测试/引擎内比较用）。
@@ -569,24 +579,42 @@ impl Value {
             Value::Dict(_) => &["get", "set", "keys", "values", "len", "json"],
             Value::Int(_) => &[
                 // v0.91: 整数数学方法
-                "abs", "sign", "floor", "ceil", "round", "sqrt",
-                "sin", "cos", "tan", "exp", "log", "log2", "log10",
-                "to_float",
+                "abs", "sign", "floor", "ceil", "round", "sqrt", "sin", "cos", "tan", "exp", "log",
+                "log2", "log10", "to_float",
             ],
             Value::Float(_) => &[
                 // v0.91: 浮点数学方法
-                "abs", "sign", "floor", "ceil", "round", "trunc", "fract",
-                "sqrt", "cbrt",
-                "sin", "cos", "tan", "asin", "acos", "atan",
-                "sinh", "cosh", "tanh",
-                "exp", "log", "log2", "log10", "log1p",
-                "is_nan", "is_inf", "is_finite",
+                "abs",
+                "sign",
+                "floor",
+                "ceil",
+                "round",
+                "trunc",
+                "fract",
+                "sqrt",
+                "cbrt",
+                "sin",
+                "cos",
+                "tan",
+                "asin",
+                "acos",
+                "atan",
+                "sinh",
+                "cosh",
+                "tanh",
+                "exp",
+                "log",
+                "log2",
+                "log10",
+                "log1p",
+                "is_nan",
+                "is_inf",
+                "is_finite",
                 "to_int",
             ],
             Value::BigInt(_) => &[
                 // v0.91: BigInt 数学方法
-                "abs", "sign",
-                "to_int", "to_float",
+                "abs", "sign", "to_int", "to_float",
             ],
             Value::Conversation { .. } => &["chat", "history", "clear", "model", "len"],
             Value::Stream { .. } => &["collect", "is_done"],
@@ -616,12 +644,8 @@ impl Value {
                 (Value::Int(a), Value::Int(b)) => Value::Int(a + b),
                 (Value::Float(a), Value::Float(b)) => Value::Float(a + b),
                 (Value::BigInt(a), Value::BigInt(b)) => Value::BigInt(a + b),
-                (Value::Int(a), Value::BigInt(b)) => {
-                    Value::BigInt(num_bigint::BigInt::from(a) + b)
-                }
-                (Value::BigInt(a), Value::Int(b)) => {
-                    Value::BigInt(a + num_bigint::BigInt::from(b))
-                }
+                (Value::Int(a), Value::BigInt(b)) => Value::BigInt(num_bigint::BigInt::from(a) + b),
+                (Value::BigInt(a), Value::Int(b)) => Value::BigInt(a + num_bigint::BigInt::from(b)),
                 (Value::Float(a), Value::BigInt(b)) => {
                     // Float + BigInt → Float（如果 b 能转 f64，否则保留 BigInt）
                     b.to_string().parse::<f64>().map_or_else(
@@ -629,12 +653,10 @@ impl Value {
                         |bf| Value::Float(a + bf),
                     )
                 }
-                (Value::BigInt(a), Value::Float(b)) => {
-                    a.to_string().parse::<f64>().map_or_else(
-                        |_| Value::BigInt(a + num_bigint::BigInt::from(b as i64)),
-                        |af| Value::Float(af + b),
-                    )
-                }
+                (Value::BigInt(a), Value::Float(b)) => a.to_string().parse::<f64>().map_or_else(
+                    |_| Value::BigInt(a + num_bigint::BigInt::from(b as i64)),
+                    |af| Value::Float(af + b),
+                ),
                 (_, child) => child,
             },
             MergeStrategy::DictUnion => match (parent, child) {

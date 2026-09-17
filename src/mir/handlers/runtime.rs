@@ -11,7 +11,6 @@ use crate::mir::{MirFunction, Reg};
 
 use crate::value::{Environment, Value};
 
-
 // ============================================================
 // Private helpers
 // ============================================================
@@ -30,7 +29,12 @@ pub(super) fn run_isolated(
 ) -> Result<(crate::value::Value, Vec<crate::value::Conflict>), String> {
     let mut child_env = env.clone();
     // v0.75.9: 包裹 Arc 走全局 DAG 缓存
-    let result = run_mir(&std::sync::Arc::new((*body).clone()), interp, &mut child_env, effects)?;
+    let result = run_mir(
+        &std::sync::Arc::new((*body).clone()),
+        interp,
+        &mut child_env,
+        effects,
+    )?;
     // v0.95 审计定案：策略是显式全局配置（merge_with 持久设置），非临时槽。
     let strategies = interp.current_merge_strategies();
     let conflicts = match strategies.as_ref() {
@@ -56,7 +60,12 @@ pub(super) fn run_mir_fn(
     effects: &mut crate::mir::effect::Effects,
 ) -> Result<Value, String> {
     let mut inner_env = env.clone();
-    crate::mir::vm::run_mir(&std::sync::Arc::new(func.clone()), interp, &mut inner_env, effects)
+    crate::mir::vm::run_mir(
+        &std::sync::Arc::new(func.clone()),
+        interp,
+        &mut inner_env,
+        effects,
+    )
 }
 
 /// Value → f64（router 分数解析；Int/Float 均接受）。
@@ -84,7 +93,12 @@ pub fn h_transaction(
         Err(_) => {
             let mut comp_env = env.clone();
             // v0.75.9: 包裹 Arc 走全局 DAG 缓存
-            if let Err(e) = run_mir(&std::sync::Arc::new((*compensation).clone()), interp, &mut comp_env, effects) {
+            if let Err(e) = run_mir(
+                &std::sync::Arc::new((*compensation).clone()),
+                interp,
+                &mut comp_env,
+                effects,
+            ) {
                 eprintln!("[warn] transaction compensation failed: {}", e);
             }
             Err("Transaction rolled back".to_string())
@@ -169,7 +183,10 @@ pub fn h_parallel(
                         .collect();
                     handles
                         .into_iter()
-                        .map(|h| h.join().unwrap_or_else(|_| Err("worker thread panicked".to_string())))
+                        .map(|h| {
+                            h.join()
+                                .unwrap_or_else(|_| Err("worker thread panicked".to_string()))
+                        })
                         .collect()
                 });
             // 按声明顺序合并（确定性）
@@ -205,12 +222,7 @@ pub fn h_parallel(
                 ..Default::default()
             };
             if !seg_fn.body.is_empty() {
-                crate::mir::vm::run_mir(
-                    &std::sync::Arc::new(seg_fn),
-                    interp,
-                    env,
-                    effects,
-                )?;
+                crate::mir::vm::run_mir(&std::sync::Arc::new(seg_fn), interp, env, effects)?;
             }
         }
     }
@@ -334,7 +346,6 @@ pub fn h_document_section(
     env.define(name.to_string(), Value::Dict(m), false);
     Ok(())
 }
-
 
 // ============================================================
 // Orchestrate / Eval
@@ -469,15 +480,7 @@ pub fn h_orchestrate(
             router_fn,
             prompt_fn,
         } => run_moe(
-            interp,
-            env,
-            experts,
-            router_fn,
-            *top_k,
-            prompt_fn,
-            input_var,
-            result_var,
-            effects,
+            interp, env, experts, router_fn, *top_k, prompt_fn, input_var, result_var, effects,
         ),
         crate::mir::orchestrate::MirOrchestrateKind::Sequential { agents } => {
             // v0.75.34: Sequential orchestrate 执行 — 按声明顺序逐个执行
@@ -573,8 +576,7 @@ pub fn h_orchestrate(
                     let mut cond_env = env.clone();
                     cond_env.define("input".to_string(), input_val.clone(), false);
                     cond_env.define(result_var.to_string(), result.clone(), false);
-                    let cond_body =
-                        crate::mir::lower::lower_block_witness_to_mir(cond_w);
+                    let cond_body = crate::mir::lower::lower_block_witness_to_mir(cond_w);
                     let cond_val = crate::mir::vm::run_mir(
                         &std::sync::Arc::new(cond_body),
                         interp,
@@ -682,10 +684,9 @@ fn run_moe_expert(
     let def_val = run_mir_fn(interp, env, &expert.def_fn, effects)?;
     match def_val {
         // 函数专家：Closure/Task/Compose/Partial → call_value
-        Value::Closure { .. }
-        | Value::Task { .. }
-        | Value::Compose(_)
-        | Value::Partial(_, _) => interp.call_value(&def_val, vec![input_val.clone()], effects),
+        Value::Closure { .. } | Value::Task { .. } | Value::Compose(_) | Value::Partial(_, _) => {
+            interp.call_value(&def_val, vec![input_val.clone()], effects)
+        }
         // 模型专家：{model: "..."} → ai.chat(prompt, {model})
         Value::Dict(d) => {
             let model = match d.get("model") {
@@ -736,7 +737,12 @@ fn run_moe_expert(
                 ..Default::default()
             };
             let mut expert_env = env.clone();
-            crate::mir::vm::run_mir(&std::sync::Arc::new(body_fn), interp, &mut expert_env, effects)
+            crate::mir::vm::run_mir(
+                &std::sync::Arc::new(body_fn),
+                interp,
+                &mut expert_env,
+                effects,
+            )
         }
         other => Err(format!(
             "moe: expert '{}' must be a function or {{model: \"...\"}} dict, got {:?}",

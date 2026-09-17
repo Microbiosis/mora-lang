@@ -211,18 +211,9 @@ pub fn builtin_signatures() -> Vec<(String, Signature)> {
         // v0.91: 数学 builtin — math/stats/linalg/random
         // 这些是 domain prefix 模块，typeck 注册为 marker signature（任意参数→Any）
         // 实际方法分派由 dispatch.rs::call_method_builtin 处理
-        (
-            "math".to_string(),
-            Signature::new(vec![], Type::Any),
-        ),
-        (
-            "stats".to_string(),
-            Signature::new(vec![], Type::Any),
-        ),
-        (
-            "linalg".to_string(),
-            Signature::new(vec![], Type::Any),
-        ),
+        ("math".to_string(), Signature::new(vec![], Type::Any)),
+        ("stats".to_string(), Signature::new(vec![], Type::Any)),
+        ("linalg".to_string(), Signature::new(vec![], Type::Any)),
         // v0.99: "random" 不在此表 —— 模块对象不可直接调用（`random(...)`
         // 应报非函数），方法调用经 infer_var → Type::RandomModule 分型。
     ]

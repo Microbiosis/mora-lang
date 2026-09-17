@@ -2,7 +2,9 @@
 
 use std::sync::Arc;
 
-use crate::common::trait_info::{TraitInfo, TraitMethodSig, default_impl_method_key, impl_method_key};
+use crate::common::trait_info::{
+    TraitInfo, TraitMethodSig, default_impl_method_key, impl_method_key,
+};
 
 use crate::mir::host::MirHost;
 
@@ -45,11 +47,7 @@ pub fn h_trait_def(
     );
     for (m, _body) in methods.iter().zip(method_bodies.iter()) {
         if let Some(mfn) = &m.body {
-            let key = default_impl_method_key(
-                name,
-                &Vec::<String>::new(),
-                &m.name,
-            );
+            let key = default_impl_method_key(name, &Vec::<String>::new(), &m.name);
             env.define(
                 key,
                 Value::Task {
@@ -81,13 +79,7 @@ pub fn h_impl_def(
         .push(for_type.to_string());
     for (m, _body) in methods.iter().zip(method_bodies.iter()) {
         if let Some(mfn) = &m.body {
-            let key = impl_method_key(
-                trait_name,
-                trait_generics,
-                for_type,
-                for_generics,
-                &m.name,
-            );
+            let key = impl_method_key(trait_name, trait_generics, for_type, for_generics, &m.name);
             env.define(
                 key,
                 Value::Task {
@@ -101,5 +93,3 @@ pub fn h_impl_def(
     }
     Ok(())
 }
-
-

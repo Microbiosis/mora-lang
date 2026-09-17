@@ -44,7 +44,12 @@ pub fn h_match_expr(
                 continue;
             }
         }
-        let result = run_mir(&std::sync::Arc::new((**arm_func).clone()), interp, env, effects)?;
+        let result = run_mir(
+            &std::sync::Arc::new((**arm_func).clone()),
+            interp,
+            env,
+            effects,
+        )?;
         regs[*output_reg] = result;
         matched = true;
         break;
@@ -125,12 +130,7 @@ pub fn h_quasiquote(
                         let parts: Vec<String> = items.iter().map(value_to_string).collect();
                         buf.push_str(&parts.join(", "));
                     }
-                    _ => {
-                        return Err(format!(
-                            "unquote_splice: expected List, got {:?}",
-                            val
-                        ))
-                    }
+                    _ => return Err(format!("unquote_splice: expected List, got {:?}", val)),
                 }
             }
         }

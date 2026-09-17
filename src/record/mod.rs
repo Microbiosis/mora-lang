@@ -224,7 +224,12 @@ impl Recorder {
     }
 
     /// v0.83: 录制 TEA Msg 事件（便捷构造）。
-    pub fn record_msg(&mut self, channel: String, payload: crate::value::Value, prior_state_hash: u64) {
+    pub fn record_msg(
+        &mut self,
+        channel: String,
+        payload: crate::value::Value,
+        prior_state_hash: u64,
+    ) {
         let id = self.next_event_id();
         let ts_ms = Self::now_ms();
         self.record(Event::Msg {

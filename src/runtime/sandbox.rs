@@ -5,8 +5,8 @@
 //! 注意：ContainerHandle 有 Drop impl（v0.49 C3）触发 `docker rm -f`。
 //! 多次 Clone 会导致 Drop 多次触发 — 这是 pre-existing 行为（Interpreter::clone 也走同路径）。
 
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use crate::sandbox::{ContainerHandle, SandboxPolicy};
 use crate::toolplane::ToolPlaneRegistry;
@@ -136,11 +136,13 @@ mod tests {
         assert_ne!(b_first, b_second, "same instance: counter advances");
         // b 实例的计数器值等于 2（前两次调用来自 a，与 b 无关）
         assert_eq!(
-            b.container_name_counter.load(std::sync::atomic::Ordering::Relaxed),
+            b.container_name_counter
+                .load(std::sync::atomic::Ordering::Relaxed),
             2
         );
         assert_eq!(
-            a.container_name_counter.load(std::sync::atomic::Ordering::Relaxed),
+            a.container_name_counter
+                .load(std::sync::atomic::Ordering::Relaxed),
             2
         );
     }
@@ -160,7 +162,9 @@ mod tests {
                 let barrier = barrier.clone();
                 std::thread::spawn(move || {
                     barrier.wait();
-                    (0..10).map(|_| sb.next_container_name()).collect::<Vec<_>>()
+                    (0..10)
+                        .map(|_| sb.next_container_name())
+                        .collect::<Vec<_>>()
                 })
             })
             .collect();

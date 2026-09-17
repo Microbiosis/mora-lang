@@ -842,10 +842,18 @@ fn msg_event_serialization_roundtrip() {
     let r2 = Recorder::new_replay(path.clone()).unwrap();
     assert_eq!(r2.events().len(), 1);
     match &r2.events()[0] {
-        Event::Msg { channel, payload, prior_state_hash, .. } => {
+        Event::Msg {
+            channel,
+            payload,
+            prior_state_hash,
+            ..
+        } => {
             assert_eq!(channel, "channel_a");
-            assert_eq!(*payload, crate::value::Value::String("payload".to_string()),
-                       "payload roundtrip 完整 Value JSON");
+            assert_eq!(
+                *payload,
+                crate::value::Value::String("payload".to_string()),
+                "payload roundtrip 完整 Value JSON"
+            );
             assert_eq!(*prior_state_hash, 12345);
         }
         other => panic!("expected Msg, got {:?}", other),
@@ -885,7 +893,11 @@ fn recorder_is_off_check() {
     let mut r2 = Recorder::new_record(path.clone()).unwrap();
     assert!(!r2.is_off());
     // 写入一个 event 让 file 存在，然后才能 replay
-    r2.record_state_mutation("x".into(), crate::value::Value::Nil, crate::value::Value::Int(1));
+    r2.record_state_mutation(
+        "x".into(),
+        crate::value::Value::Nil,
+        crate::value::Value::Int(1),
+    );
     r2.save().unwrap();
     let r3 = Recorder::new_replay(path.clone()).unwrap();
     assert!(!r3.is_off());

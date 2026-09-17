@@ -73,11 +73,21 @@ pub fn run_source(source: &str) -> E2eResult {
     let mut env = interp.take_env();
     let func_arc = Arc::new(func);
 
-    let last_expr = match run_mir(&func_arc, &mut interp, &mut env, &mut mora::mir::effect::Effects::new()) {
+    let last_expr = match run_mir(
+        &func_arc,
+        &mut interp,
+        &mut env,
+        &mut mora::mir::effect::Effects::new(),
+    ) {
         Ok(v) => v,
         Err(e) => return E2eResult::CompileError(format!("run_mir: {}", e)),
     };
-    if let Err(e) = run_main_task(&func_arc, &mut interp, &mut env, &mut mora::mir::effect::Effects::new()) {
+    if let Err(e) = run_main_task(
+        &func_arc,
+        &mut interp,
+        &mut env,
+        &mut mora::mir::effect::Effects::new(),
+    ) {
         return E2eResult::CompileError(format!("run_main_task: {}", e));
     }
 
@@ -123,7 +133,10 @@ pub fn assert_compile_error(name: &str) -> String {
     match run_e2e(name) {
         E2eResult::CompileError(e) => e,
         E2eResult::Ok { last_expr, .. } => {
-            panic!("E2E {}: expected compile error, got Ok({:?})", name, last_expr)
+            panic!(
+                "E2E {}: expected compile error, got Ok({:?})",
+                name, last_expr
+            )
         }
         E2eResult::TypeErrors(errs) => {
             let formatted: Vec<String> = errs.iter().map(format_error).collect();

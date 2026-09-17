@@ -28,14 +28,14 @@ pub mod annotate; // v0.89: TypeAnnotator (FCFG + TypeTable → EHIR)
 pub mod bidirectional; // v0.75.86: 双向类型检查骨架入口（Phase A）
 pub mod check_mir;
 pub mod dispatch;
-pub mod export;   // v0.89: shadow type table export (Phase 0 EHIR)
+pub mod export; // v0.89: shadow type table export (Phase 0 EHIR)
 pub mod hm;
 /// v0.75.18: 跨模块 import 符号表（typeck 阶段预扫描合并）
 pub mod imports;
 
 // ── 9 层 IR 架构 re-exports ──
 pub use annotate::annotate;
-pub use export::{export_type_table, verify_type_table, TypeTable};
+pub use export::{TypeTable, export_type_table, verify_type_table};
 
 use std::collections::HashMap;
 
@@ -261,7 +261,12 @@ impl Type {
                 if row_str == "pure" {
                     format!("fn ({}) -> {}", input.name(), output.name())
                 } else {
-                    format!("fn ({}) -> {} ! {{ {} }}", input.name(), output.name(), row_str)
+                    format!(
+                        "fn ({}) -> {} ! {{ {} }}",
+                        input.name(),
+                        output.name(),
+                        row_str
+                    )
                 }
             }
             // v0.13: Union 类型显示为 "T1 | T2 | T3"
@@ -479,9 +484,13 @@ impl Type {
         }
         // v0.83: Tuple 元素逐一兼容
         if let (Type::Tuple(a), Type::Tuple(b)) = (self, expected) {
-            if a.len() != b.len() { return false; }
+            if a.len() != b.len() {
+                return false;
+            }
             for (ta, tb) in a.iter().zip(b.iter()) {
-                if !ta.compatible_with(tb) { return false; }
+                if !ta.compatible_with(tb) {
+                    return false;
+                }
             }
             return true;
         }
@@ -497,7 +506,9 @@ impl Type {
         // Dict literal 必须有 tag 字段（TeaMsg）或匹配字段名（TeaModel）
         // —— 真正的 field-by-field 检查在 infer_let_typed 的 path 里做（用 value.entries）
         // 这里只做「Dict literal 是 compatible_with TeaModel/TeaMsg」的基础检查
-        if let (Type::Dict(_, _), Type::TeaModel { .. }) | (Type::Dict(_, _), Type::TeaMsg { .. }) = (self, expected) {
+        if let (Type::Dict(_, _), Type::TeaModel { .. }) | (Type::Dict(_, _), Type::TeaMsg { .. }) =
+            (self, expected)
+        {
             return true; // 详细检查在 infer_let_typed path
         }
         // v0.08.1: Nil 兼容所有 trait（用于 dyn Trait = nil 占位）
@@ -629,14 +640,18 @@ impl Type {
             return members.iter().any(|m| self.subtype_of(m));
         }
         // Result<T1, E1> subtype Result<T2, E2> 当 T1<:T2 && E1<:E2
-if let (Type::Result_(t1, e1), Type::Result_(t2, e2)) = (self, super_ty) {
+        if let (Type::Result_(t1, e1), Type::Result_(t2, e2)) = (self, super_ty) {
             return t1.subtype_of(t2) && e2.subtype_of(e1);
         }
         // v0.83: Tuple 元素逐一 subtype
         if let (Type::Tuple(a), Type::Tuple(b)) = (self, super_ty) {
-            if a.len() != b.len() { return false; }
+            if a.len() != b.len() {
+                return false;
+            }
             for (ta, tb) in a.iter().zip(b.iter()) {
-                if !ta.subtype_of(tb) { return false; }
+                if !ta.subtype_of(tb) {
+                    return false;
+                }
             }
             return true;
         }
@@ -649,27 +664,55 @@ if let (Type::Result_(t1, e1), Type::Result_(t2, e2)) = (self, super_ty) {
             return k1.subtype_of(k2) && v1.subtype_of(v2);
         }
         // v0.83: Dict literal subtype TeaModel/TeaMsg（强类型 typeck 基础规则）
-        if let (Type::Dict(_, _), Type::TeaModel { .. }) | (Type::Dict(_, _), Type::TeaMsg { .. }) = (self, super_ty) {
+        if let (Type::Dict(_, _), Type::TeaModel { .. }) | (Type::Dict(_, _), Type::TeaMsg { .. }) =
+            (self, super_ty)
+        {
             return true; // 详细检查在 infer_let_typed
         }
         // v0.83: TeaModel subtype TeaModel（同 name + 字段兼容）
-        if let (Type::TeaModel { name: n1, fields: f1 }, Type::TeaModel { name: n2, fields: f2 }) = (self, super_ty) {
-            if n1 != n2 { return false; }
+        if let (
+            Type::TeaModel {
+                name: n1,
+                fields: f1,
+            },
+            Type::TeaModel {
+                name: n2,
+                fields: f2,
+            },
+        ) = (self, super_ty)
+        {
+            if n1 != n2 {
+                return false;
+            }
             // source 可少字段，extra 字段允许；但 target 字段必须 source 也有
             for (target_name, target_ty) in f2 {
                 let source_match = f1.iter().find(|(n, _)| n == target_name);
                 match source_match {
                     None => return false,
                     Some((_, source_ty)) => {
-                        if !source_ty.subtype_of(target_ty) { return false; }
+                        if !source_ty.subtype_of(target_ty) {
+                            return false;
+                        }
                     }
                 }
             }
             return true;
         }
         // v0.83: TeaMsg subtype TeaMsg（同 name + variants 兼容）
-        if let (Type::TeaMsg { name: n1, variants: v1 }, Type::TeaMsg { name: n2, variants: v2 }) = (self, super_ty) {
-            if n1 != n2 { return false; }
+        if let (
+            Type::TeaMsg {
+                name: n1,
+                variants: v1,
+            },
+            Type::TeaMsg {
+                name: n2,
+                variants: v2,
+            },
+        ) = (self, super_ty)
+        {
+            if n1 != n2 {
+                return false;
+            }
             // source 可少 variants；但 target variant 必 source 也有
             for (target_name, target_payload) in v2 {
                 let source_match = v1.iter().find(|(n, _)| n == target_name);
@@ -679,7 +722,9 @@ if let (Type::Result_(t1, e1), Type::Result_(t2, e2)) = (self, super_ty) {
                         // source payload 必须 subtype target payload
                         match (source_payload, target_payload) {
                             (Some(s), Some(t)) => {
-                                if !s.subtype_of(t) { return false; }
+                                if !s.subtype_of(t) {
+                                    return false;
+                                }
                             }
                             (None, None) => {}
                             // source has no payload but target does —— 不兼容
@@ -767,8 +812,7 @@ if let (Type::Result_(t1, e1), Type::Result_(t2, e2)) = (self, super_ty) {
             return h1.subtype_of(h2) && t1.subtype_of(t2);
         }
         if let (Type::Relation(p1), Type::Relation(p2)) = (self, super_ty) {
-            return p1.len() == p2.len()
-                && p1.iter().zip(p2.iter()).all(|(a, b)| a.subtype_of(b));
+            return p1.len() == p2.len() && p1.iter().zip(p2.iter()).all(|(a, b)| a.subtype_of(b));
         }
         // 兜底：同构严格相等
         self == super_ty

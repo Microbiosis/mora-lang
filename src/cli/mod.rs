@@ -50,8 +50,7 @@ pub fn compile_and_opt(
     // MORA_9LAYER=0 可禁用（回落纯原管线）。
     let level = opt_level.unwrap_or_default();
     if std::env::var("MORA_9LAYER").map_or(true, |v| v != "0") {
-        let (result, mut pipeline_func) =
-            crate::mir::pipeline::run_pipeline(&func, &witnesses);
+        let (result, mut pipeline_func) = crate::mir::pipeline::run_pipeline(&func, &witnesses);
         if result.differential_ok {
             // 双侧同序优化 — 管线产出走与原管线完全一致的优化路径
             crate::mir::optimize::apply_rules(&mut pipeline_func);

@@ -105,17 +105,14 @@ pub fn summary_llm_impl(content: &str, _max_bytes: usize) -> Result<String, Stri
     let base_url =
         std::env::var(AI_BASE_URL_ENV).unwrap_or_else(|_| AI_BASE_URL_DEFAULT.to_string());
     let prompt_len = content.len().min(4000);
-    let prompt =
-        format!("Summarize the following text concisely:\n\n{}", &content[..prompt_len]);
+    let prompt = format!(
+        "Summarize the following text concisely:\n\n{}",
+        &content[..prompt_len]
+    );
     if let Ok(summary) = summary_via_llm(&prompt, &api_key, &base_url) {
-        Ok(format!(
-            "{}\n<compressed:method=summary llm>",
-            summary
-        ))
+        Ok(format!("{}\n<compressed:method=summary llm>", summary))
     } else {
-        eprintln!(
-            "compress.summary: LLM call failed (OPENAI_API_KEY set), falling back to mock"
-        );
+        eprintln!("compress.summary: LLM call failed (OPENAI_API_KEY set), falling back to mock");
         Ok(format!(
             "{}\n<compressed:method=summary mock_mode>",
             preview

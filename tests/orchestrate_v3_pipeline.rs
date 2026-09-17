@@ -10,9 +10,7 @@ use mora::mir::vm::run_mir;
 use mora::parser_v3::ParserV3;
 
 fn compile_v3(source: &str) -> mora::mir::MirFunction {
-    ParserV3::compile(source)
-        .expect("compile should succeed")
-        .0
+    ParserV3::compile(source).expect("compile should succeed").0
 }
 
 // ===================================================================
@@ -33,7 +31,11 @@ end
         .iter()
         .filter(|inst| matches!(inst, MirInst::Orchestrate { .. }))
         .collect();
-    assert_eq!(orchestrate_insts.len(), 1, "expected exactly one Orchestrate inst");
+    assert_eq!(
+        orchestrate_insts.len(),
+        1,
+        "expected exactly one Orchestrate inst"
+    );
 }
 
 #[test]
@@ -52,7 +54,11 @@ end
         .iter()
         .filter(|inst| matches!(inst, MirInst::Orchestrate { .. }))
         .collect();
-    assert_eq!(orchestrate_insts.len(), 1, "expected exactly one Orchestrate inst");
+    assert_eq!(
+        orchestrate_insts.len(),
+        1,
+        "expected exactly one Orchestrate inst"
+    );
 }
 
 #[test]
@@ -71,7 +77,11 @@ end
         .iter()
         .filter(|inst| matches!(inst, MirInst::Orchestrate { .. }))
         .collect();
-    assert_eq!(orchestrate_insts.len(), 1, "expected exactly one Orchestrate inst");
+    assert_eq!(
+        orchestrate_insts.len(),
+        1,
+        "expected exactly one Orchestrate inst"
+    );
 }
 
 // ===================================================================
@@ -93,7 +103,11 @@ end
         .iter()
         .filter(|inst| matches!(inst, MirInst::Orchestrate { .. }))
         .collect();
-    assert_eq!(orchestrate_insts.len(), 1, "expected exactly one Orchestrate inst");
+    assert_eq!(
+        orchestrate_insts.len(),
+        1,
+        "expected exactly one Orchestrate inst"
+    );
     if let MirInst::Orchestrate {
         input_var,
         result_var,
@@ -170,7 +184,12 @@ print(result)
     let mut interp = Interpreter::new();
     let mut env = interp.take_env();
     let func_arc = std::sync::Arc::new(func);
-    let result = run_mir(&func_arc, &mut interp, &mut env, &mut mora::mir::effect::Effects::new());
+    let result = run_mir(
+        &func_arc,
+        &mut interp,
+        &mut env,
+        &mut mora::mir::effect::Effects::new(),
+    );
     match result {
         Ok(_) => {}
         Err(e) => panic!("orchestrate sequential should run: {}", e),
@@ -191,7 +210,12 @@ print(result)
     let mut interp = Interpreter::new();
     let mut env = interp.take_env();
     let func_arc = std::sync::Arc::new(func);
-    let result = run_mir(&func_arc, &mut interp, &mut env, &mut mora::mir::effect::Effects::new());
+    let result = run_mir(
+        &func_arc,
+        &mut interp,
+        &mut env,
+        &mut mora::mir::effect::Effects::new(),
+    );
     match result {
         Ok(_) => {}
         Err(e) => panic!("orchestrate with edge should run: {}", e),
@@ -216,7 +240,12 @@ print(result)
     let mut interp = Interpreter::new();
     let mut env = interp.take_env();
     let func_arc = std::sync::Arc::new(func);
-    let result = run_mir(&func_arc, &mut interp, &mut env, &mut mora::mir::effect::Effects::new());
+    let result = run_mir(
+        &func_arc,
+        &mut interp,
+        &mut env,
+        &mut mora::mir::effect::Effects::new(),
+    );
     match result {
         Ok(_) => {}
         Err(e) => panic!("orchestrate pregel should run: {}", e),
@@ -237,7 +266,12 @@ print(result)
     let mut interp = Interpreter::new();
     let mut env = interp.take_env();
     let func_arc = std::sync::Arc::new(func);
-    let result = run_mir(&func_arc, &mut interp, &mut env, &mut mora::mir::effect::Effects::new());
+    let result = run_mir(
+        &func_arc,
+        &mut interp,
+        &mut env,
+        &mut mora::mir::effect::Effects::new(),
+    );
     match result {
         Ok(_) => {}
         Err(e) => panic!("orchestrate graph should run: {}", e),

@@ -71,9 +71,7 @@ fn compile_valid_nested_constructs() {
     assert_compile_valid(
         "let pick = fn(n)\n  if n > 0 {\n    1\n  } else {\n    0\n  }\nend\nprint(pick(3))",
     );
-    assert_compile_valid(
-        "let n = 1\nfor i in [1, 2, 3] {\n  if i > n {\n    print(i)\n  }\n}",
-    );
+    assert_compile_valid("let n = 1\nfor i in [1, 2, 3] {\n  if i > n {\n    print(i)\n  }\n}");
     assert_compile_valid("match 0 {\n  0 => print(\"zero\"),\n  _ => print(\"other\"),\n}");
 }
 

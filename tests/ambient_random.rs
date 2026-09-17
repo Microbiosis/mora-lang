@@ -27,8 +27,13 @@ fn compile_and_run(src: &str) -> Value {
     let mut interp = Interpreter::new();
     let mut env = interp.take_env();
     let mut effects = mora::mir::effect::Effects::default();
-    run_mir(&std::sync::Arc::new(func), &mut interp, &mut env, &mut effects)
-        .unwrap_or_else(|e| panic!("run failed: {}", e))
+    run_mir(
+        &std::sync::Arc::new(func),
+        &mut interp,
+        &mut env,
+        &mut effects,
+    )
+    .unwrap_or_else(|e| panic!("run failed: {}", e))
 }
 
 /// 编译 + typeck，返回 typeck 错误（用于断言拒绝）。
@@ -72,7 +77,11 @@ task main()
 end
 "#,
     );
-    assert!(matches!(v, Value::Nil), "sequence ends with print, got {:?}", v);
+    assert!(
+        matches!(v, Value::Nil),
+        "sequence ends with print, got {:?}",
+        v
+    );
 }
 
 // ── 2. 类型层（效果行 + 签名 + 边界）──
@@ -88,7 +97,11 @@ task main()
 end
 "#;
     let errs = type_errors(src);
-    assert!(errs.is_empty(), "ambient residual should be exempt: {:?}", errs);
+    assert!(
+        errs.is_empty(),
+        "ambient residual should be exempt: {:?}",
+        errs
+    );
 }
 
 #[test]
@@ -173,7 +186,13 @@ fn interpreters_are_isolated_across_threads() {
             "task main()\n  random.seed(123)\n  [random.random(), random.random()]\nend",
         )
         .unwrap();
-        run_mir(&std::sync::Arc::new(func), &mut interp, &mut env, &mut effects).unwrap()
+        run_mir(
+            &std::sync::Arc::new(func),
+            &mut interp,
+            &mut env,
+            &mut effects,
+        )
+        .unwrap()
     });
     let h2 = std::thread::spawn(|| {
         let mut interp = Interpreter::new();
@@ -183,7 +202,13 @@ fn interpreters_are_isolated_across_threads() {
             "task main()\n  random.seed(456)\n  [random.random(), random.random()]\nend",
         )
         .unwrap();
-        run_mir(&std::sync::Arc::new(func), &mut interp, &mut env, &mut effects).unwrap()
+        run_mir(
+            &std::sync::Arc::new(func),
+            &mut interp,
+            &mut env,
+            &mut effects,
+        )
+        .unwrap()
     });
     let (a, _b) = (h1.join().unwrap(), h2.join().unwrap());
     // a 的序列 == 单线程同种子序列（未被其他线程推进）

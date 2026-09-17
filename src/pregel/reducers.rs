@@ -11,7 +11,11 @@ use crate::value::{MergeStrategy, Value};
 
 /// v0.67: Numeric accumulator for Sum/Product. First write initializes
 /// to the op identity (`0` for `+`, `1` for `*`). Subsequent writes fold.
-pub fn accumulator_reduce(current: Option<Value>, incoming: Value, op: &str) -> Result<Value, String> {
+pub fn accumulator_reduce(
+    current: Option<Value>,
+    incoming: Value,
+    op: &str,
+) -> Result<Value, String> {
     let identity = match op {
         "+" => Value::Int(0),
         "*" => Value::Int(1),

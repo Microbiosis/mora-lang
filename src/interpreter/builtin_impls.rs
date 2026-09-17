@@ -373,7 +373,10 @@ impl Interpreter {
                         .cloned()
                         .unwrap_or(Value::String(String::new()));
                     let budget = if let Some(b) = map.get("budget") {
-                        Some(super::numeric_helpers::parse_budget_dispatch(b.clone(), "budget")?)
+                        Some(super::numeric_helpers::parse_budget_dispatch(
+                            b.clone(),
+                            "budget",
+                        )?)
                     } else {
                         None
                     };
@@ -430,7 +433,9 @@ impl Interpreter {
             Some(Value::String(s)) => s.clone(),
             Some(Value::Code(s)) => s.clone(),
             _ => {
-                return Err("eval(source: string|code) expects a string or code argument".to_string());
+                return Err(
+                    "eval(source: string|code) expects a string or code argument".to_string(),
+                );
             }
         };
         let (func, _witnesses) = match crate::parser_v3::ParserV3::compile(&source) {
@@ -565,9 +570,7 @@ impl Interpreter {
         let source = match args.first() {
             Some(Value::String(s)) => s.clone(),
             _ => {
-                return Err(
-                    "quote(source: string) expects a string argument".to_string(),
-                );
+                return Err("quote(source: string) expects a string argument".to_string());
             }
         };
         Ok(Value::Code(source))
@@ -613,7 +616,9 @@ impl Interpreter {
             Some(Value::String(s)) => s.clone(),
             Some(Value::Code(s)) => s.clone(),
             _ => {
-                return Err("read(source: string|code) expects a string or code argument".to_string());
+                return Err(
+                    "read(source: string|code) expects a string or code argument".to_string(),
+                );
             }
         };
         Ok(Value::Code(source))
@@ -646,9 +651,7 @@ impl Interpreter {
         let name = match args.first() {
             Some(Value::String(s)) => s.clone(),
             _ => {
-                return Err(
-                    "macroexpand(name: string, args...) expects a string name".to_string(),
-                );
+                return Err("macroexpand(name: string, args...) expects a string name".to_string());
             }
         };
         let expr_args: Vec<Value> = if args.len() > 1 {
@@ -670,15 +673,13 @@ impl Interpreter {
                 params,
                 body,
             } => {
-                let mut child_env =
-                    Environment::with_parent_of(std::sync::Arc::new(env.clone()));
+                let mut child_env = Environment::with_parent_of(std::sync::Arc::new(env.clone()));
                 for (i, param) in params.iter().enumerate() {
                     let val = expr_args.get(i).cloned().unwrap_or(Value::Nil);
                     child_env.define(param.clone(), val, false);
                 }
-                crate::mir::vm::run_mir(&body, self, &mut child_env, effects).map_err(|e| {
-                    format!("macro '{}' expansion error: {}", mname, e)
-                })
+                crate::mir::vm::run_mir(&body, self, &mut child_env, effects)
+                    .map_err(|e| format!("macro '{}' expansion error: {}", mname, e))
             }
             _ => Err(format!("macroexpand: '{}' is not a macro", name)),
         }
@@ -715,9 +716,8 @@ impl Interpreter {
                         let val = args.get(i).cloned().unwrap_or(Value::Nil);
                         child_env.define(param.clone(), val, false);
                     }
-                    crate::mir::vm::run_mir(&body, self, &mut child_env, effects).map_err(|e| {
-                        format!("macro '{}' execution error: {}", mname, e)
-                    })
+                    crate::mir::vm::run_mir(&body, self, &mut child_env, effects)
+                        .map_err(|e| format!("macro '{}' execution error: {}", mname, e))
                 }
                 _ => Err(format!("'{}' is not callable", name)),
             }

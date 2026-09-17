@@ -80,11 +80,15 @@ pub fn h_model_def(env: &mut Environment, name: &str, fields: &[crate::common::S
     let field_names: Vec<String> = fields.iter().map(|f| f.name.clone()).collect();
     env.define(
         name.to_string(),
-        Value::Dict(HashMap::from([
-            ("__model_fields__".to_string(), Value::List(
-                field_names.iter().map(|s| Value::String(s.clone())).collect(),
-            )),
-        ])),
+        Value::Dict(HashMap::from([(
+            "__model_fields__".to_string(),
+            Value::List(
+                field_names
+                    .iter()
+                    .map(|s| Value::String(s.clone()))
+                    .collect(),
+            ),
+        )])),
         false,
     );
 }
@@ -205,21 +209,9 @@ pub fn h_app_def(args: AppDefArgs) {
         Value::TeaApp(std::sync::Arc::new(app)),
         false,
     );
-    env.define(
-        format!("{}.init", name),
-        init_closure,
-        false,
-    );
-    env.define(
-        format!("{}.update", name),
-        update_closure,
-        false,
-    );
-    env.define(
-        format!("{}.view", name),
-        view_closure,
-        false,
-    );
+    env.define(format!("{}.init", name), init_closure, false);
+    env.define(format!("{}.update", name), update_closure, false);
+    env.define(format!("{}.view", name), view_closure, false);
     // 引用 model_name/msg_name（供 typeck 后续扩展检查 Model/Msg 字段匹配）
     let _ = (model_name, msg_name);
 }
@@ -274,12 +266,22 @@ pub fn h_with_config(
                     e
                 );
                 // v0.75.9: 包裹 Arc 走全局 DAG 缓存
-                run_mir(&std::sync::Arc::new((*body).clone()), interp, &mut child_env, effects)
+                run_mir(
+                    &std::sync::Arc::new((*body).clone()),
+                    interp,
+                    &mut child_env,
+                    effects,
+                )
             }
         }
     } else {
         // v0.75.9: 包裹 Arc 走全局 DAG 缓存
-        run_mir(&std::sync::Arc::new((*body).clone()), interp, &mut child_env, effects)
+        run_mir(
+            &std::sync::Arc::new((*body).clone()),
+            interp,
+            &mut child_env,
+            effects,
+        )
     };
     interp.mir_restore_config();
     let _result = body_result?;
@@ -300,18 +302,27 @@ use crate::rel::{Clause, ProjectFn, RelHost, Search, Subst, reify};
 pub fn h_rel_def(env: &mut Environment, name: &str, clauses: &[Clause]) {
     let fresh: Vec<Clause> = clauses.to_vec();
     match env.get(name) {
-        Some(Value::Relation { name: rel_name, clauses: existing }) => {
+        Some(Value::Relation {
+            name: rel_name,
+            clauses: existing,
+        }) => {
             let mut all = existing.as_ref().clone();
             all.extend(fresh);
             env.assign(
                 name,
-                Value::Relation { name: rel_name.clone(), clauses: Arc::new(all) },
+                Value::Relation {
+                    name: rel_name.clone(),
+                    clauses: Arc::new(all),
+                },
             );
         }
         _ => {
             env.define(
                 name.to_string(),
-                Value::Relation { name: name.to_string(), clauses: Arc::new(fresh) },
+                Value::Relation {
+                    name: name.to_string(),
+                    clauses: Arc::new(fresh),
+                },
                 false,
             );
         }
@@ -349,14 +360,16 @@ impl RelHost for SolveHost<'_> {
             // 编译期具名引用：查宿主环境（用户任务/闭包）；builtin 值走
             // 按名分派（call_value 不含 Builtin 分支）；再回落 builtin 表。
             ProjectFn::Name(n) => match self.env.get(n) {
-                Some(Value::Builtin(_)) => {
-                    self.interp.mir_call_function(n, args, self.env, &mut local)?
-                }
+                Some(Value::Builtin(_)) => self
+                    .interp
+                    .mir_call_function(n, args, self.env, &mut local)?,
                 Some(v) => {
                     let v = v.clone();
                     self.interp.call_value(&v, args, &mut local)?
                 }
-                None => self.interp.mir_call_function(n, args, self.env, &mut local)?,
+                None => self
+                    .interp
+                    .mir_call_function(n, args, self.env, &mut local)?,
             },
         };
         self.collected.absorb(local);
@@ -426,7 +439,11 @@ pub fn h_solve(
 
     // 3. 交错搜索
     let mut search = Search::new(built_goal, base + anon_vars.len() as u64);
-    let mut host = SolveHost { env, interp, collected: crate::mir::effect::Effects::default() };
+    let mut host = SolveHost {
+        env,
+        interp,
+        collected: crate::mir::effect::Effects::default(),
+    };
     let mut solutions: Vec<Value> = Vec::new();
     loop {
         if let Some(cap) = limit

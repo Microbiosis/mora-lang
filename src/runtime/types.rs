@@ -138,5 +138,5 @@ pub struct ToolDef {
 /// `runtime/` 的架构耦合。此处 re-export 保持旧路径兼容（现有代码用
 /// `crate::runtime::types::TraitInfo` 等不变），实际类型定义在 common/ 层。
 pub use crate::common::trait_info::{
-    default_impl_method_key, impl_method_key, TraitInfo, TraitMethodSig,
+    TraitInfo, TraitMethodSig, default_impl_method_key, impl_method_key,
 };

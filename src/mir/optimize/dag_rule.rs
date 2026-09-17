@@ -312,9 +312,7 @@ impl DagRewriteRule for CseDagRule {
                 let out_edges: Vec<(NodeId, NodeId, EdgeKind)> = dag
                     .edges
                     .iter()
-                    .filter(|e| {
-                        e.from == node_id && !matches!(e.kind, EdgeKind::Sequence)
-                    })
+                    .filter(|e| e.from == node_id && !matches!(e.kind, EdgeKind::Sequence))
                     .map(|e| (prev_id, e.to, e.kind.clone()))
                     .collect();
 
@@ -585,8 +583,9 @@ mod tests {
             params: vec![],
             body,
             n_regs: n,
-        
-            ..Default::default()};
+
+            ..Default::default()
+        };
         dag::dag_analyze(&func)
     }
 

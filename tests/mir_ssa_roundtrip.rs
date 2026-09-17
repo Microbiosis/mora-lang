@@ -19,9 +19,9 @@
 //!   优化重排后不稳定（独立于 SSA 管线）
 
 use mora::interpreter::Interpreter;
-use mora::parser_v3::ParserV3;
 use mora::mir::ssa::OptLevel;
 use mora::mir::vm::{run_main_task, run_mir};
+use mora::parser_v3::ParserV3;
 
 /// 应用 SSA 优化（不 panic 即通过 — 管线正确性由等价性测试治理）。
 fn optimize_without_panic(source: &str, level: OptLevel) {
@@ -30,8 +30,18 @@ fn optimize_without_panic(source: &str, level: OptLevel) {
     let mut interp = Interpreter::new();
     let mut env = interp.take_env();
     let func_arc = std::sync::Arc::new(func);
-    let _ = run_mir(&func_arc, &mut interp, &mut env, &mut mora::mir::effect::Effects::new());
-    let _ = run_main_task(&func_arc, &mut interp, &mut env, &mut mora::mir::effect::Effects::new());
+    let _ = run_mir(
+        &func_arc,
+        &mut interp,
+        &mut env,
+        &mut mora::mir::effect::Effects::new(),
+    );
+    let _ = run_main_task(
+        &func_arc,
+        &mut interp,
+        &mut env,
+        &mut mora::mir::effect::Effects::new(),
+    );
 }
 
 /// 对 task 内显式 return 的程序，验证优化前后返回值一致。
@@ -44,8 +54,18 @@ fn assert_task_equiv(source: &str) {
         let mut interp = Interpreter::new();
         let mut env = interp.take_env();
         let func_arc = std::sync::Arc::new(func);
-        let v = run_mir(&func_arc, &mut interp, &mut env, &mut mora::mir::effect::Effects::new())?;
-        run_main_task(&func_arc, &mut interp, &mut env, &mut mora::mir::effect::Effects::new())?;
+        let v = run_mir(
+            &func_arc,
+            &mut interp,
+            &mut env,
+            &mut mora::mir::effect::Effects::new(),
+        )?;
+        run_main_task(
+            &func_arc,
+            &mut interp,
+            &mut env,
+            &mut mora::mir::effect::Effects::new(),
+        )?;
         Ok(v)
     };
     let baseline = run(None);
@@ -105,7 +125,12 @@ fn assert_top_level_equiv(source: &str) {
         }
         let mut interp = Interpreter::new();
         let mut env = interp.take_env();
-        run_mir(&std::sync::Arc::new(func), &mut interp, &mut env, &mut mora::mir::effect::Effects::new())
+        run_mir(
+            &std::sync::Arc::new(func),
+            &mut interp,
+            &mut env,
+            &mut mora::mir::effect::Effects::new(),
+        )
     };
     let baseline = run(None);
     let basic = run(Some(OptLevel::Basic));

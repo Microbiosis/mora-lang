@@ -18,8 +18,8 @@ macro_rules! testcase {
 
 mod ai_chat;
 mod ai_helpers;
-pub mod builtins;
 mod builtin_impls; // v0.92 P1.2: call_builtin_* 实现（自 dispatch.rs 迁出）
+pub mod builtins;
 mod dispatch;
 mod method_dispatch; // v0.92 P1.2: Value method dispatch (call_method*) split from dispatch.rs
 mod numeric_helpers; // v0.92 P1.2: split from dispatch.rs
@@ -145,11 +145,11 @@ pub struct Interpreter {
 // ToolDef）保留在 runtime/types.rs；TraitInfo/TraitMethodSig 及其 key 函数
 // 已下沉到 common/trait_info.rs。此处 re-export 保持既有路径兼容
 // （mir/、stress_tests.rs、interpreter 子模块继续 use crate::interpreter::* 均不受影响）。
+pub use crate::common::trait_info::{
+    TraitInfo, TraitMethodSig, default_impl_method_key, impl_method_key,
+};
 pub use crate::runtime::types::{
     AiConfigValue, LruCache, RouteConfig, TokenBudget, TokenUsage, ToolDef,
-};
-pub use crate::common::trait_info::{
-    default_impl_method_key, impl_method_key, TraitInfo, TraitMethodSig,
 };
 
 // v0.04: 显式实现 Clone 而非 derive
@@ -226,38 +226,40 @@ impl crate::mir::host::MirHost for Interpreter {
     //
     // 这些方法桥接到 CoreRuntime::effect_handlers（EffectRegistry）。
     // 完整语义见 src/runtime/effect.rs 与 src/mir/handlers.rs::h_perform/h_handle。
-fn perform_effect(
-    &mut self,
-    effect: &str,
-    args: Vec<Value>,
-    effects: &mut crate::mir::effect::Effects,
-) -> Option<Value> {
-    // v0.80 Stage 2.0: 真正的 handler 执行 — HandlerClosure::perform 调 run_mir。
-    //
-    // architectural reason: handler 实际是 MirFunction（handler_mir），必须有
-    // MirHost 才能调 run_mir。EffectHandler::perform 签名带 &mut dyn MirHost。
-    //
-    // v0.99: multi-shot —— handler 执行后回装原深度（take 弹栈顶、install
-    // 推回），同一 handle 块内可多次 perform 同一效果。旧 single-shot 语义
-    // 下第二次 perform 会因 handler 已被取走而误报 unhandled。handler 内部
-    // 状态（HandlerClosure 自有 env）跨多次 perform 保持 —— 与 v0.95 线性
-    // 穿线语义一致。嵌套 handle 不受影响：递归 perform 同名效果时 handler
-    // 已被 take 出栈，命中的是外层 handler（标准动态作用域）。
-    if let Some(mut handler) = self.core.effect_handlers.take(effect) {
-        let result = handler.perform_box(self, args, effects);
-        self.core.effect_handlers.install(effect.to_string(), handler);
-        return result.ok();
-    }
+    fn perform_effect(
+        &mut self,
+        effect: &str,
+        args: Vec<Value>,
+        effects: &mut crate::mir::effect::Effects,
+    ) -> Option<Value> {
+        // v0.80 Stage 2.0: 真正的 handler 执行 — HandlerClosure::perform 调 run_mir。
+        //
+        // architectural reason: handler 实际是 MirFunction（handler_mir），必须有
+        // MirHost 才能调 run_mir。EffectHandler::perform 签名带 &mut dyn MirHost。
+        //
+        // v0.99: multi-shot —— handler 执行后回装原深度（take 弹栈顶、install
+        // 推回），同一 handle 块内可多次 perform 同一效果。旧 single-shot 语义
+        // 下第二次 perform 会因 handler 已被取走而误报 unhandled。handler 内部
+        // 状态（HandlerClosure 自有 env）跨多次 perform 保持 —— 与 v0.95 线性
+        // 穿线语义一致。嵌套 handle 不受影响：递归 perform 同名效果时 handler
+        // 已被 take 出栈，命中的是外层 handler（标准动态作用域）。
+        if let Some(mut handler) = self.core.effect_handlers.take(effect) {
+            let result = handler.perform_box(self, args, effects);
+            self.core
+                .effect_handlers
+                .install(effect.to_string(), handler);
+            return result.ok();
+        }
 
-    // v0.99: ambient 兜底 —— ambient 标签（如 random_*）由运行时内置的
-    // 单属主纯值状态应答（无锁；用户 handle 注册表优先，动态作用域可覆写）。
-    // 查找顺序：注册表 → ambient。都不命中 = 真正 unhandled。
-    if crate::mir::effect::ambient::is_ambient_label(effect) {
-        return self.core.random_state.dispatch_op(effect, &args).ok();
-    }
+        // v0.99: ambient 兜底 —— ambient 标签（如 random_*）由运行时内置的
+        // 单属主纯值状态应答（无锁；用户 handle 注册表优先，动态作用域可覆写）。
+        // 查找顺序：注册表 → ambient。都不命中 = 真正 unhandled。
+        if crate::mir::effect::ambient::is_ambient_label(effect) {
+            return self.core.random_state.dispatch_op(effect, &args).ok();
+        }
 
-    None
-}
+        None
+    }
 
     fn install_effect_handler(
         &mut self,
@@ -305,7 +307,6 @@ fn perform_effect(
     fn environment(&self) -> Environment {
         self.core.environment.clone()
     }
-
 
     fn checkpoint_saver(&self) -> Option<Arc<dyn crate::checkpoint::CheckpointSaver>> {
         self.persist.checkpoint_saver()
@@ -548,7 +549,13 @@ impl Interpreter {
         args: Vec<Value>,
         effects: &mut crate::mir::effect::Effects,
     ) -> Result<Value, String> {
-        self.call_method(object, method, args, crate::common::Span::default(), effects)
+        self.call_method(
+            object,
+            method,
+            args,
+            crate::common::Span::default(),
+            effects,
+        )
     }
 
     /// α.3: MIR 解释器的 import 桥。
@@ -617,29 +624,27 @@ impl Interpreter {
                 // 注入预配置响应队列（ai_chat.rs:308 消费）。接受 list<string>
                 // 或单个 string 字面量。`with mock_llm = ["resp1", "resp2"]`
                 // 是规格 §19.4 承诺的唯一 Mora 语法入口。
-                "mock_llm" | "mock_responses" => {
-                    match v {
-                        Value::List(items) => {
-                            let strings: Vec<String> = items
-                                .iter()
-                                .filter_map(|it| match it {
-                                    Value::String(s) => Some(s.clone()),
-                                    _ => {
-                                        eprintln!("mock_llm response must be string, skipping");
-                                        None
-                                    }
-                                })
-                                .collect();
-                            if !strings.is_empty() {
-                                cfg.mock_responses = Some(strings);
-                            }
-                        }
-                        Value::String(s) => cfg.mock_responses = Some(vec![s.clone()]),
-                        _ => {
-                            eprintln!("mock_llm expects list<string> or string, got {:?}", v);
+                "mock_llm" | "mock_responses" => match v {
+                    Value::List(items) => {
+                        let strings: Vec<String> = items
+                            .iter()
+                            .filter_map(|it| match it {
+                                Value::String(s) => Some(s.clone()),
+                                _ => {
+                                    eprintln!("mock_llm response must be string, skipping");
+                                    None
+                                }
+                            })
+                            .collect();
+                        if !strings.is_empty() {
+                            cfg.mock_responses = Some(strings);
                         }
                     }
-                }
+                    Value::String(s) => cfg.mock_responses = Some(vec![s.clone()]),
+                    _ => {
+                        eprintln!("mock_llm expects list<string> or string, got {:?}", v);
+                    }
+                },
                 _ => {}
             }
         }

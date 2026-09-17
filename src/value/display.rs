@@ -119,7 +119,9 @@ impl std::fmt::Display for Value {
                 write!(f, "<macro {}>", name)
             }
             // v0.86: Curry — 显示为可调用值，包含已绑定参数数量。
-            Value::Curry { arity, bound_args, .. } => {
+            Value::Curry {
+                arity, bound_args, ..
+            } => {
                 write!(f, "<curry arity={} bound={}>", arity, bound_args.len())
             }
             // v0.86: Cons — 显示为 Lisp 风格的 (car . cdr)。

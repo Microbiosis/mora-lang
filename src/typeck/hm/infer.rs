@@ -40,8 +40,7 @@ impl HMInference {
             WitnessKind::Closure { .. } | WitnessKind::FnDef { .. }
         ) && let Some(row) = self.closure_rows.get(&value.span)
         {
-            self.fn_effect_rows
-                .insert(name.to_string(), row.clone());
+            self.fn_effect_rows.insert(name.to_string(), row.clone());
         }
         let _ = span;
         Ok((gen_ty, value_row))
@@ -57,14 +56,24 @@ impl HMInference {
         let ty_inner = type_hint.to_type();
         // v0.83: 提前 field-by-field 验证（如果是 let x: TeaModel = {field: val, ...}）
         // 必须在 infer_expr 前做检查（infer_expr 把 field 名丢失到 Dict<String, V>）
-        if let (Type::TeaModel { name: target_name, fields: target_fields }, WitnessKind::Dict(entries)) =
-            (&ty_inner, &value.kind)
+        if let (
+            Type::TeaModel {
+                name: target_name,
+                fields: target_fields,
+            },
+            WitnessKind::Dict(entries),
+        ) = (&ty_inner, &value.kind)
         {
             self.check_dict_against_teamodel(entries, target_name, target_fields, span)?;
         }
         // v0.83: 同样支持 let x: TeaMsg = {tag: "Increment"}
-        if let (Type::TeaMsg { name: target_name, variants: target_variants }, WitnessKind::Dict(entries)) =
-            (&ty_inner, &value.kind)
+        if let (
+            Type::TeaMsg {
+                name: target_name,
+                variants: target_variants,
+            },
+            WitnessKind::Dict(entries),
+        ) = (&ty_inner, &value.kind)
         {
             self.check_dict_against_teamsg(entries, target_name, target_variants, span)?;
         }
@@ -95,8 +104,7 @@ impl HMInference {
             WitnessKind::Closure { .. } | WitnessKind::FnDef { .. }
         ) && let Some(row) = self.closure_rows.get(&value.span)
         {
-            self.fn_effect_rows
-                .insert(name.to_string(), row.clone());
+            self.fn_effect_rows.insert(name.to_string(), row.clone());
         }
         let _ = span;
         Ok((gen_hint, value_row))
@@ -117,7 +125,10 @@ impl HMInference {
             match source_match {
                 None => {
                     return Err(vec![TypeError::UnificationFailure {
-                        expected: format!("field `{}` in model `{}`", target_field_name, target_name),
+                        expected: format!(
+                            "field `{}` in model `{}`",
+                            target_field_name, target_name
+                        ),
                         got: "<missing>".to_string(),
                         span: Some(span),
                     }]);
@@ -156,7 +167,9 @@ impl HMInference {
         let tag_entry = entries.iter().find(|(n, _)| n == "tag");
         let tag_value = match tag_entry {
             Some((_, tag_witness)) => {
-                if let WitnessKind::Literal(crate::common::Literal::String(s, _)) = &tag_witness.kind {
+                if let WitnessKind::Literal(crate::common::Literal::String(s, _)) =
+                    &tag_witness.kind
+                {
                     s.clone()
                 } else {
                     return Err(vec![TypeError::UnificationFailure {
@@ -199,7 +212,9 @@ impl HMInference {
                     None => Err(vec![TypeError::UnificationFailure {
                         expected: format!(
                             "msg `{}` variant `{}` requires `payload` field of type `{}`",
-                            target_name, tag_value, payload_ty.name()
+                            target_name,
+                            tag_value,
+                            payload_ty.name()
                         ),
                         got: "<missing>".to_string(),
                         span: Some(span),
@@ -210,7 +225,9 @@ impl HMInference {
                             return Err(vec![TypeError::UnificationFailure {
                                 expected: format!(
                                     "msg `{}` variant `{}` payload: `{}`",
-                                    target_name, tag_value, payload_ty.name()
+                                    target_name,
+                                    tag_value,
+                                    payload_ty.name()
                                 ),
                                 got: source_payload_ty.name(),
                                 span: Some(span),
@@ -259,13 +276,12 @@ impl HMInference {
                 }]);
             }
             if is_numeric(&existing) {
-                self.constraints.push(Constraint::Numeric(
-                    super::unify::BinaryConstraint {
+                self.constraints
+                    .push(Constraint::Numeric(super::unify::BinaryConstraint {
                         left: Box::new(existing),
                         right: Box::new(value_ty.clone()),
                         result: None,
-                    },
-                ));
+                    }));
             } else {
                 self.constraints.push(Constraint::Eq(
                     Box::new(existing),
@@ -376,13 +392,12 @@ impl HMInference {
                 } else {
                     // 数值类型：用 Numeric 约束（Int/Float promotion 由 solver 处理）
                     // result 字段让 solver 在校验后自动将 result_ty 与 promotion 类型合一
-                    self.constraints.push(Constraint::Numeric(
-                        super::unify::BinaryConstraint {
+                    self.constraints
+                        .push(Constraint::Numeric(super::unify::BinaryConstraint {
                             left: Box::new(left_ty.clone()),
                             right: Box::new(right_ty.clone()),
                             result: Some(Box::new(result_ty.clone())),
-                        },
-                    ));
+                        }));
                 }
                 Ok((result_ty, merged_row))
             }
@@ -402,13 +417,12 @@ impl HMInference {
                 // 会把两操作数绑到提升类型（Float），与 `compatible_with`
                 // 的规则一致。
                 if is_numeric(&left_ty) && is_numeric(&right_ty) {
-                    self.constraints.push(Constraint::Numeric(
-                        super::unify::BinaryConstraint {
+                    self.constraints
+                        .push(Constraint::Numeric(super::unify::BinaryConstraint {
                             left: Box::new(left_ty),
                             right: Box::new(right_ty),
                             result: None,
-                        },
-                    ));
+                        }));
                 } else if matches!(left_ty, crate::typeck::Type::TypeVar(_))
                     || matches!(right_ty, crate::typeck::Type::TypeVar(_))
                 {
@@ -419,13 +433,12 @@ impl HMInference {
                     //   end                       --   随后列表的 Eq(α, Float)
                     // 冲突 → "expected float, got int"。走 Numeric 由 solve
                     // 阶段按已解析结果提升。
-                    self.constraints.push(Constraint::Numeric(
-                        super::unify::BinaryConstraint {
+                    self.constraints
+                        .push(Constraint::Numeric(super::unify::BinaryConstraint {
                             left: Box::new(left_ty),
                             right: Box::new(right_ty),
                             result: None,
-                        },
-                    ));
+                        }));
                 } else {
                     self.constraints
                         .push(Constraint::Eq(Box::new(left_ty), Box::new(right_ty)));
@@ -445,24 +458,22 @@ impl HMInference {
                 // 与 `compatible_with` 的 numeric 规则矛盾。
                 // v0.104: 含未解析 TypeVar 时同样推迟（理由见 Equal 分支）。
                 if is_numeric(&left_ty) && is_numeric(&right_ty) {
-                    self.constraints.push(Constraint::Numeric(
-                        super::unify::BinaryConstraint {
+                    self.constraints
+                        .push(Constraint::Numeric(super::unify::BinaryConstraint {
                             left: Box::new(left_ty),
                             right: Box::new(right_ty),
                             result: None,
-                        },
-                    ));
+                        }));
                 } else if matches!(left_ty, crate::typeck::Type::TypeVar(_))
                     || matches!(right_ty, crate::typeck::Type::TypeVar(_))
                 {
                     // v0.104: 含未解析 TypeVar → 推迟到 solve（同 Equal 分支）。
-                    self.constraints.push(Constraint::Numeric(
-                        super::unify::BinaryConstraint {
+                    self.constraints
+                        .push(Constraint::Numeric(super::unify::BinaryConstraint {
                             left: Box::new(left_ty),
                             right: Box::new(right_ty),
                             result: None,
-                        },
-                    ));
+                        }));
                 } else {
                     self.constraints
                         .push(Constraint::Eq(Box::new(left_ty), Box::new(right_ty)));
@@ -585,29 +596,29 @@ impl HMInference {
         if let WitnessCallee::Name(n) | WitnessCallee::Var(n) = callee
             && let Some(sig) = self.rel_sigs.get(n).cloned()
         {
-                let mut arg_tys: Vec<Type> = Vec::new();
-                for a in args {
-                    let (t, r) = self.infer_expr(a)?;
-                    arg_tys.push(t);
-                    acc_row = self.merge_rows(acc_row, r);
-                }
-                if arg_tys.len() != sig.len() {
-                    return Err(vec![TypeError::ArityMismatch {
-                        expected: sig.len(),
-                        actual: arg_tys.len(),
-                        span,
-                    }]);
-                }
-                for (at, st) in arg_tys.iter().zip(sig.iter()) {
-                    self.constraints
-                        .push(Constraint::Eq(Box::new(at.clone()), Box::new(st.clone())));
-                }
-                let rel_row = self
-                    .rel_effect_rows
-                    .get(n)
-                    .cloned()
-                    .unwrap_or(crate::mir::effect::EffectRow::Empty);
-                return Ok((Type::Goal, self.merge_rows(acc_row, rel_row)));
+            let mut arg_tys: Vec<Type> = Vec::new();
+            for a in args {
+                let (t, r) = self.infer_expr(a)?;
+                arg_tys.push(t);
+                acc_row = self.merge_rows(acc_row, r);
+            }
+            if arg_tys.len() != sig.len() {
+                return Err(vec![TypeError::ArityMismatch {
+                    expected: sig.len(),
+                    actual: arg_tys.len(),
+                    span,
+                }]);
+            }
+            for (at, st) in arg_tys.iter().zip(sig.iter()) {
+                self.constraints
+                    .push(Constraint::Eq(Box::new(at.clone()), Box::new(st.clone())));
+            }
+            let rel_row = self
+                .rel_effect_rows
+                .get(n)
+                .cloned()
+                .unwrap_or(crate::mir::effect::EffectRow::Empty);
+            return Ok((Type::Goal, self.merge_rows(acc_row, rel_row)));
         }
         // v0.102: project(f, args..., result) —— 首个实参是函数名引用（非变量
         // 使用，不查 env）；并入被投函数 f 的效果行（行必须传播到 solve 位点，
@@ -622,7 +633,9 @@ impl HMInference {
             }
             if let Some(first) = args.first() {
                 let fname = match &first.kind {
-                    WitnessKind::Variable(f) | WitnessKind::FnDef { name: f, .. } => Some(f.clone()),
+                    WitnessKind::Variable(f) | WitnessKind::FnDef { name: f, .. } => {
+                        Some(f.clone())
+                    }
                     WitnessKind::Literal(crate::common::Literal::String(f, _)) => Some(f.clone()),
                     _ => None,
                 };
@@ -774,9 +787,7 @@ impl HMInference {
                     let ty = &sig.params[min].1;
                     let optional = match ty {
                         Type::Nil => true,
-                        Type::Union(members) => {
-                            members.iter().any(|m| matches!(m, Type::Nil))
-                        }
+                        Type::Union(members) => members.iter().any(|m| matches!(m, Type::Nil)),
                         _ => false,
                     };
                     if optional {
@@ -795,8 +806,7 @@ impl HMInference {
                     .iter()
                     .skip(user_arity)
                     .all(|t| matches!(t, Type::Dict(_, _)));
-            if arg_types.len() < min_arity
-                || (arg_types.len() > user_arity && !extra_configurable)
+            if arg_types.len() < min_arity || (arg_types.len() > user_arity && !extra_configurable)
             {
                 return Err(vec![TypeError::ArityMismatch {
                     expected: min_arity,
@@ -881,15 +891,22 @@ impl HMInference {
         mut row: crate::mir::effect::EffectRow,
         span: Span,
     ) -> Result<(Type, crate::mir::effect::EffectRow), Vec<TypeError>> {
+        // 注：此处形状对齐 CI 的 rustfmt（1.98，`dtolnay/rust-toolchain@stable`
+        // 浮动到的最新 stable）—— 它把「RHS 过长的 `let x = match`」拆成
+        // `let x =` + 缩进的 `match`，并把臂内的 `{ return Err(…) }` 折成
+        // 单行 `=> return Err(…)`。本机 rustfmt 1.96 对同一构造的折法不同
+        //（不拆 `let`、保留块）。CI 的 `cargo fmt --all -- --check` 用的是
+        // 1.98，故以 1.98 的输出为准。
         let label = match crate::mir::effect::ambient::random_label_for_method(method) {
             Some(l) => l,
             None => {
                 return Err(vec![TypeError::UnificationFailure {
-                    expected: "known random method: random/rand_int/rand_float/rand_choice/seed/shuffle"
-                        .to_string(),
+                    expected:
+                        "known random method: random/rand_int/rand_float/rand_choice/seed/shuffle"
+                            .to_string(),
                     got: format!("random.{}", method),
                     span: Some(span),
-                }])
+                }]);
             }
         };
         let result_ty = match self.effect_signatures.get(label) {
@@ -958,10 +975,7 @@ impl HMInference {
         }
         let _span = span;
         let _ = _span;
-        Ok((
-            last_ty.unwrap_or(Type::Nil),
-            acc_row,
-        ))
+        Ok((last_ty.unwrap_or(Type::Nil), acc_row))
     }
 
     /// v0.96: 闭包/函数推断公共核心 —— 参数类型 + body 类型/效果行。
@@ -1005,14 +1019,14 @@ impl HMInference {
     }
 
     /// curried Arrow 包装 —— 从最后一个参数向前包裹，每层携带 body 效果行。
-    fn wrap_curried_arrow(param_types: &[Type], body_ty: Type, body_row: &crate::mir::effect::EffectRow) -> Type {
+    fn wrap_curried_arrow(
+        param_types: &[Type],
+        body_ty: Type,
+        body_row: &crate::mir::effect::EffectRow,
+    ) -> Type {
         let mut ty = body_ty;
         for param_ty in param_types.iter().rev() {
-            ty = Type::Arrow(
-                Box::new(param_ty.clone()),
-                Box::new(ty),
-                body_row.clone(),
-            );
+            ty = Type::Arrow(Box::new(param_ty.clone()), Box::new(ty), body_row.clone());
         }
         ty
     }
@@ -1272,7 +1286,10 @@ impl HMInference {
                 }
                 Ok(())
             }
-            WitnessPattern::TypeAscription { name: _name, pattern } => {
+            WitnessPattern::TypeAscription {
+                name: _name,
+                pattern,
+            } => {
                 self.add_pattern_bindings(pattern, _scrutinee_ty, _span)?;
                 Ok(())
             }
@@ -1446,10 +1463,7 @@ mod tests {
         let list_ty = Type::List(Box::new(elem_ty.clone()));
         let r = hm.infer_pattern(
             &WitnessPattern::ListVec {
-                elements: vec![
-                    WitnessPattern::Wildcard,
-                    WitnessPattern::Wildcard,
-                ],
+                elements: vec![WitnessPattern::Wildcard, WitnessPattern::Wildcard],
                 rest: Some(Box::new(WitnessPattern::Variable("rest".to_string()))),
             },
             &list_ty,
@@ -1466,10 +1480,7 @@ mod tests {
         let list_ty = Type::List(Box::new(elem_ty.clone()));
         let r = hm.infer_pattern(
             &WitnessPattern::ListVec {
-                elements: vec![
-                    WitnessPattern::Wildcard,
-                    WitnessPattern::Wildcard,
-                ],
+                elements: vec![WitnessPattern::Wildcard, WitnessPattern::Wildcard],
                 rest: None,
             },
             &list_ty,
@@ -1633,10 +1644,7 @@ mod tests {
             variants: vec![
                 ("Increment".to_string(), None),
                 ("Decrement".to_string(), None),
-                (
-                    "SetStep".to_string(),
-                    Some(Box::new(Type::Int)),
-                ),
+                ("SetStep".to_string(), Some(Box::new(Type::Int))),
             ],
         };
         let hint = TypeHint::from_type(ty);
@@ -1750,8 +1758,7 @@ mod tests {
     fn sequence_with_variable_infer_ok() {
         let mut hm = HMInference::new();
         // Register x as Int in env
-        hm.env
-            .add("x".to_string(), crate::typeck::Type::Int);
+        hm.env.add("x".to_string(), crate::typeck::Type::Int);
         let exprs = vec![make_var_w("x")];
         let result = hm.infer_sequence(&exprs, Span::default());
         assert!(result.is_ok(), "variable lookup should succeed");

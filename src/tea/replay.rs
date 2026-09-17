@@ -57,7 +57,9 @@ pub fn replay_tea_app(app: &TeaApp, recorder: &Recorder) -> ReplayResult {
                 result.final_model = model;
                 result.mutation_count += 1;
             }
-            Event::Msg { channel, payload, .. } => {
+            Event::Msg {
+                channel, payload, ..
+            } => {
                 result.msg_count += 1;
                 // 尝试把 Msg dispatch 到 TeaApp（纯推进，结果留待后续 fold）
                 match Msg::from_value(payload) {
@@ -102,11 +104,7 @@ mod tests {
 
         let path = tmp_path("state_mut");
         let mut r = Recorder::new_record(path.clone()).unwrap();
-        r.record_state_mutation(
-            "count".to_string(),
-            Value::Int(0),
-            Value::Int(42),
-        );
+        r.record_state_mutation("count".to_string(), Value::Int(0), Value::Int(42));
         r.save().unwrap();
         let r2 = Recorder::new_replay(path.clone()).unwrap();
         let result = replay_tea_app(&app, &r2);
@@ -128,11 +126,7 @@ mod tests {
         let mut r = Recorder::new_record(path.clone()).unwrap();
         let mut payload = std::collections::HashMap::new();
         payload.insert("tag".to_string(), Value::String("Inc".to_string()));
-        r.record_msg(
-            "user".to_string(),
-            Value::Dict(payload),
-            0,
-        );
+        r.record_msg("user".to_string(), Value::Dict(payload), 0);
         r.save().unwrap();
         let r2 = Recorder::new_replay(path.clone()).unwrap();
         let result = replay_tea_app(&app, &r2);

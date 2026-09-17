@@ -10,7 +10,7 @@ use crate::flow::eval_binary;
 
 use crate::mir::host::MirHost;
 
-use crate::mir::vm::{index_value, index_assign_value, run_mir, value_to_string};
+use crate::mir::vm::{index_assign_value, index_value, run_mir, value_to_string};
 
 use crate::mir::{MirFunction, Reg};
 

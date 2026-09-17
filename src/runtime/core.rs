@@ -144,13 +144,15 @@ mod tests {
     #[test]
     fn core_clone_preserves_environment_bindings() {
         let mut core = CoreRuntime::default();
-        core
-            .environment
+        core.environment
             .define("test".to_string(), Value::Int(42), false);
         core.gensym_counter = 5;
         let cloned = core.clone();
         // 克隆保留绑定
-        assert!(matches!(cloned.environment.get("test"), Some(Value::Int(42))));
+        assert!(matches!(
+            cloned.environment.get("test"),
+            Some(Value::Int(42))
+        ));
         // gensym 计数器按值复制（v0.95: 纯 usize，无锁）
         assert_eq!(cloned.gensym_counter, 5);
         // 纯值语义：克隆侧写不穿透原侧（无共享可变 cell）

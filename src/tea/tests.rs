@@ -178,8 +178,7 @@ fn teaapp_init_closure_is_callable() {
     let app = TeaApp::new(init_closure, Value::Nil, Value::Nil);
     // 直接调 call_value（绕过 builtin 测试 init 路径）
     let mut interp = crate::interpreter::Interpreter::new();
-    let result =
-        interp.call_value(&app.init, vec![], &mut crate::mir::effect::Effects::new());
+    let result = interp.call_value(&app.init, vec![], &mut crate::mir::effect::Effects::new());
     // 空 init closure 返回 Nil
     assert!(result.is_ok());
 }
@@ -187,10 +186,13 @@ fn teaapp_init_closure_is_callable() {
 #[test]
 fn teaapp_cmd_serialization_roundtrip() {
     // v0.83: 验证 Cmd::to_value/from_value 完整 roundtrip
-    let original = Cmd::Batch(vec![Cmd::None, Cmd::Perform {
-        effect: "Ai".to_string(),
-        args: vec![Value::String("test".to_string())],
-    }]);
+    let original = Cmd::Batch(vec![
+        Cmd::None,
+        Cmd::Perform {
+            effect: "Ai".to_string(),
+            args: vec![Value::String("test".to_string())],
+        },
+    ]);
     let value = original.to_value();
     let restored = Cmd::from_value(&value).unwrap();
     assert_eq!(original, restored);

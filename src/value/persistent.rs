@@ -42,9 +42,15 @@ enum Node<V> {
     /// 单条 entry。
     Leaf { hash: u64, key: String, val: V },
     /// bitmap 索引节点：`children.len() == bitmap.count_ones()`，按 bit 升序 packed。
-    Bitmap { bitmap: u32, children: Vec<Arc<Node<V>>> },
+    Bitmap {
+        bitmap: u32,
+        children: Vec<Arc<Node<V>>>,
+    },
     /// 整 hash 碰撞（同一 64-bit hash 的多条 entry）。
-    Collision { hash: u64, entries: Vec<(String, V)> },
+    Collision {
+        hash: u64,
+        entries: Vec<(String, V)>,
+    },
 }
 
 fn collect_entries<V: Clone>(node: &Node<V>, out: &mut Vec<(String, V)>) {
@@ -73,19 +79,28 @@ fn merge_nodes<V: Clone>(
         let mut entries = Vec::new();
         collect_entries(&a, &mut entries);
         collect_entries(&b, &mut entries);
-        return Arc::new(Node::Collision { hash: a_hash, entries });
+        return Arc::new(Node::Collision {
+            hash: a_hash,
+            entries,
+        });
     }
     let bp_a = bitpos(a_hash, shift);
     let bp_b = bitpos(b_hash, shift);
     if bp_a == bp_b {
         let child = merge_nodes(shift + BITS, a, a_hash, b, b_hash);
-        Arc::new(Node::Bitmap { bitmap: bp_a, children: vec![child] })
+        Arc::new(Node::Bitmap {
+            bitmap: bp_a,
+            children: vec![child],
+        })
     } else {
         let bitmap = bp_a | bp_b;
         let ia = bit_index(bitmap, bp_a);
         let ib = bit_index(bitmap, bp_b);
         let (first, second) = if ia < ib { (a, b) } else { (b, a) };
-        Arc::new(Node::Bitmap { bitmap, children: vec![first, second] })
+        Arc::new(Node::Bitmap {
+            bitmap,
+            children: vec![first, second],
+        })
     }
 }
 
@@ -98,13 +113,29 @@ fn assoc_node<V: Clone>(
     val: V,
 ) -> Arc<Node<V>> {
     match node {
-        None => Arc::new(Node::Leaf { hash, key: key.to_string(), val }),
+        None => Arc::new(Node::Leaf {
+            hash,
+            key: key.to_string(),
+            val,
+        }),
         Some(n) => match &**n {
-            Node::Leaf { hash: h, key: k, val: _ } => {
+            Node::Leaf {
+                hash: h,
+                key: k,
+                val: _,
+            } => {
                 if k == key {
-                    Arc::new(Node::Leaf { hash, key: key.to_string(), val })
+                    Arc::new(Node::Leaf {
+                        hash,
+                        key: key.to_string(),
+                        val,
+                    })
                 } else {
-                    let new_leaf = Arc::new(Node::Leaf { hash, key: key.to_string(), val });
+                    let new_leaf = Arc::new(Node::Leaf {
+                        hash,
+                        key: key.to_string(),
+                        val,
+                    });
                     merge_nodes(shift, Arc::clone(n), *h, new_leaf, hash)
                 }
             }
@@ -115,10 +146,17 @@ fn assoc_node<V: Clone>(
                     let child = assoc_node(Some(&children[idx]), shift + BITS, hash, key, val);
                     let mut new_children = children.clone();
                     new_children[idx] = child;
-                    Arc::new(Node::Bitmap { bitmap: *bitmap, children: new_children })
+                    Arc::new(Node::Bitmap {
+                        bitmap: *bitmap,
+                        children: new_children,
+                    })
                 } else {
                     let idx = bit_index(*bitmap, bit);
-                    let leaf = Arc::new(Node::Leaf { hash, key: key.to_string(), val });
+                    let leaf = Arc::new(Node::Leaf {
+                        hash,
+                        key: key.to_string(),
+                        val,
+                    });
                     let mut new_children: Vec<Arc<Node<V>>> =
                         Vec::with_capacity(children.len() + 1);
                     for (i, c) in children.iter().enumerate() {
@@ -130,7 +168,10 @@ fn assoc_node<V: Clone>(
                     if idx >= children.len() {
                         new_children.push(leaf);
                     }
-                    Arc::new(Node::Bitmap { bitmap: *bitmap | bit, children: new_children })
+                    Arc::new(Node::Bitmap {
+                        bitmap: *bitmap | bit,
+                        children: new_children,
+                    })
                 }
             }
             Node::Collision { hash: h, entries } => {
@@ -141,9 +182,16 @@ fn assoc_node<V: Clone>(
                     } else {
                         new_entries.push((key.to_string(), val));
                     }
-                    Arc::new(Node::Collision { hash: *h, entries: new_entries })
+                    Arc::new(Node::Collision {
+                        hash: *h,
+                        entries: new_entries,
+                    })
                 } else {
-                    let new_leaf = Arc::new(Node::Leaf { hash, key: key.to_string(), val });
+                    let new_leaf = Arc::new(Node::Leaf {
+                        hash,
+                        key: key.to_string(),
+                        val,
+                    });
                     merge_nodes(shift, Arc::clone(n), *h, new_leaf, hash)
                 }
             }
@@ -168,9 +216,16 @@ fn remove_node<V: Clone>(
                 0 => None,
                 1 => {
                     let (k, v) = new_entries.pop().expect("len==1 已保证非空");
-                    Some(Arc::new(Node::Leaf { hash, key: k, val: v }))
+                    Some(Arc::new(Node::Leaf {
+                        hash,
+                        key: k,
+                        val: v,
+                    }))
                 }
-                _ => Some(Arc::new(Node::Collision { hash: *h, entries: new_entries })),
+                _ => Some(Arc::new(Node::Collision {
+                    hash: *h,
+                    entries: new_entries,
+                })),
             }
         }
         Node::Collision { .. } => Some(Arc::clone(node)),
@@ -184,7 +239,10 @@ fn remove_node<V: Clone>(
                 Some(new_child) => {
                     let mut new_children = children.clone();
                     new_children[idx] = new_child;
-                    Some(Arc::new(Node::Bitmap { bitmap: *bitmap, children: new_children }))
+                    Some(Arc::new(Node::Bitmap {
+                        bitmap: *bitmap,
+                        children: new_children,
+                    }))
                 }
                 None => {
                     let new_bitmap = bitmap & !bit;
@@ -197,7 +255,10 @@ fn remove_node<V: Clone>(
                             .filter(|(i, _)| *i != idx)
                             .map(|(_, c)| Arc::clone(c))
                             .collect();
-                        Some(Arc::new(Node::Bitmap { bitmap: new_bitmap, children: new_children }))
+                        Some(Arc::new(Node::Bitmap {
+                            bitmap: new_bitmap,
+                            children: new_children,
+                        }))
                     }
                 }
             }
@@ -265,7 +326,10 @@ impl<V> Default for PersistentMap<V> {
 // 手写 Clone：Arc 引用计数递增，不复制树。
 impl<V> Clone for PersistentMap<V> {
     fn clone(&self) -> Self {
-        PersistentMap { root: self.root.clone(), len: self.len }
+        PersistentMap {
+            root: self.root.clone(),
+            len: self.len,
+        }
     }
 }
 
@@ -299,7 +363,10 @@ impl<V: Clone> PersistentMap<V> {
         let hash = hash_of(key);
         let existed = self.contains_key(key);
         let root = assoc_node(self.root.as_ref(), 0, hash, key, val);
-        PersistentMap { root: Some(root), len: if existed { self.len } else { self.len + 1 } }
+        PersistentMap {
+            root: Some(root),
+            len: if existed { self.len } else { self.len + 1 },
+        }
     }
 
     /// 删除，返回新版本。key 不存在时返回与自身等值的浅拷贝。
@@ -308,8 +375,14 @@ impl<V: Clone> PersistentMap<V> {
             return self.clone();
         }
         let hash = hash_of(key);
-        let root = self.root.as_ref().and_then(|r| remove_node(r, 0, hash, key));
-        PersistentMap { root, len: self.len - 1 }
+        let root = self
+            .root
+            .as_ref()
+            .and_then(|r| remove_node(r, 0, hash, key));
+        PersistentMap {
+            root,
+            len: self.len - 1,
+        }
     }
 
     /// 遍历当前版本的所有 (key, value) 引用。
@@ -367,7 +440,10 @@ mod tests {
         }
         assert_eq!(m.len(), 500);
         for i in 0..500u64 {
-            assert_eq!(m.get(&format!("key_{i}")).map(String::as_str), Some(format!("val_{i}")).as_deref());
+            assert_eq!(
+                m.get(&format!("key_{i}")).map(String::as_str),
+                Some(format!("val_{i}")).as_deref()
+            );
         }
         assert_eq!(m.get("missing"), None);
     }

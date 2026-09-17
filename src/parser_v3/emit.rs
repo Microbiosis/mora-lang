@@ -61,7 +61,11 @@ impl ParserV3 {
                         Some(TokenType::Identifier(_))
                     ) =>
             {
-                if s == "model" { self.emit_model_def_w() } else { self.emit_msg_def_w() }
+                if s == "model" {
+                    self.emit_model_def_w()
+                } else {
+                    self.emit_msg_def_w()
+                }
             }
             // v0.103: TEA 独立 `update(params) ... end`（spec §9.6 工作示例）。
             //
@@ -74,9 +78,7 @@ impl ParserV3 {
             // 规范承诺的声明形式，保留一个边界明确的名字。
             // （接收者调用 `x.update(...)` 不受影响 —— 本分派只在语句首 token
             // 是 `update` 时触发。）
-            TokenType::Identifier(ref s)
-                if s == "update" && self.looks_like_update_decl() =>
-            {
+            TokenType::Identifier(ref s) if s == "update" && self.looks_like_update_decl() => {
                 self.emit_update_def_w()
             }
             // v0.103: 可观测性块
@@ -359,13 +361,7 @@ impl ParserV3 {
                     MirWitness {
                         kind: WitnessKind::Call {
                             callee: crate::mir::witness::WitnessCallee::Name("|>".to_string()),
-                            args: vec![
-                                left_w,
-                                MirWitness {
-                                    kind: other,
-                                    span,
-                                },
-                            ],
+                            args: vec![left_w, MirWitness { kind: other, span }],
                         },
                         span,
                     }
@@ -669,8 +665,10 @@ impl ParserV3 {
             TokenType::BigInt(val) => {
                 self.advance();
                 let dst = self.emit.alloc_reg();
-                self.emit
-                    .emit(MirInst::Const(dst, crate::value::Value::BigInt(val.clone())));
+                self.emit.emit(MirInst::Const(
+                    dst,
+                    crate::value::Value::BigInt(val.clone()),
+                ));
                 let w = MirWitness {
                     kind: WitnessKind::Literal(Literal::BigInt(val, span)),
                     span,
@@ -699,8 +697,10 @@ impl ParserV3 {
                     let r = match &part.kind {
                         WitnessKind::Literal(Literal::String(text, _)) => {
                             let dst = self.emit.alloc_reg();
-                            self.emit
-                                .emit(MirInst::Const(dst, crate::value::Value::String(text.clone())));
+                            self.emit.emit(MirInst::Const(
+                                dst,
+                                crate::value::Value::String(text.clone()),
+                            ));
                             dst
                         }
                         WitnessKind::Variable(name) => {
@@ -905,20 +905,14 @@ impl ParserV3 {
         ));
         // emit: Call(dst_reg, "quote", [str_reg])
         let dst = self.emit.alloc_reg();
-        self.emit.emit(MirInst::Call(
-            dst,
-            "quote".to_string(),
-            vec![str_reg],
-        ));
+        self.emit
+            .emit(MirInst::Call(dst, "quote".to_string(), vec![str_reg]));
 
         let w = MirWitness {
             kind: WitnessKind::Call {
                 callee: crate::mir::witness::WitnessCallee::Name("quote".to_string()),
                 args: vec![MirWitness {
-                    kind: WitnessKind::Literal(Literal::String(
-                        quoted_text.to_string(),
-                        span,
-                    )),
+                    kind: WitnessKind::Literal(Literal::String(quoted_text.to_string(), span)),
                     span,
                 }],
             },
@@ -962,10 +956,7 @@ impl ParserV3 {
             };
 
             match &tok.token_type {
-                TokenType::LParen
-                | TokenType::LBracket
-                | TokenType::LBrace
-                | TokenType::Less => {
+                TokenType::LParen | TokenType::LBracket | TokenType::LBrace | TokenType::Less => {
                     depth += 1;
                     self.advance();
                 }
@@ -979,54 +970,46 @@ impl ParserV3 {
                 TokenType::Newline if depth == 0 => {
                     break;
                 }
-                _ if depth == 0 => {
-                    match &tok.token_type {
-                        TokenType::Comma | TokenType::CommaComma => {
-                            let is_splice =
-                                matches!(&tok.token_type, TokenType::CommaComma);
+                _ if depth == 0 => match &tok.token_type {
+                    TokenType::Comma | TokenType::CommaComma => {
+                        let is_splice = matches!(&tok.token_type, TokenType::CommaComma);
 
-                            let end = self.source_byte_at(tok.line, tok.column);
-                            if end > capture_start {
-                                let text = &self.source[capture_start..end];
-                                if !text.is_empty() {
-                                    segments
-                                        .push(crate::mir::QuasiquoteSegment::Quote(
-                                            text.to_string(),
-                                        ));
-                                    witness_segments.push(MirWitness {
-                                        kind: WitnessKind::Literal(Literal::String(
-                                            text.to_string(),
-                                            start_span,
-                                        )),
-                                        span: start_span,
-                                    });
-                                }
+                        let end = self.source_byte_at(tok.line, tok.column);
+                        if end > capture_start {
+                            let text = &self.source[capture_start..end];
+                            if !text.is_empty() {
+                                segments
+                                    .push(crate::mir::QuasiquoteSegment::Quote(text.to_string()));
+                                witness_segments.push(MirWitness {
+                                    kind: WitnessKind::Literal(Literal::String(
+                                        text.to_string(),
+                                        start_span,
+                                    )),
+                                    span: start_span,
+                                });
                             }
+                        }
 
-                            self.advance();
-                            if let Some((reg, w)) = self.emit_expr_w() {
-                                if is_splice {
-                                    segments
-                                        .push(crate::mir::QuasiquoteSegment::UnquoteSplice(reg));
-                                } else {
-                                    segments
-                                        .push(crate::mir::QuasiquoteSegment::Unquote(reg));
-                                }
-                                witness_segments.push(w);
-                                if let Some(next) = self.peek() {
-                                    capture_start =
-                                        self.source_byte_at(next.line, next.column);
-                                }
+                        self.advance();
+                        if let Some((reg, w)) = self.emit_expr_w() {
+                            if is_splice {
+                                segments.push(crate::mir::QuasiquoteSegment::UnquoteSplice(reg));
                             } else {
-                                return None;
+                                segments.push(crate::mir::QuasiquoteSegment::Unquote(reg));
                             }
-                            continue 'scan;
+                            witness_segments.push(w);
+                            if let Some(next) = self.peek() {
+                                capture_start = self.source_byte_at(next.line, next.column);
+                            }
+                        } else {
+                            return None;
                         }
-                        _ => {
-                            self.advance();
-                        }
+                        continue 'scan;
                     }
-                }
+                    _ => {
+                        self.advance();
+                    }
+                },
                 _ => {
                     self.advance();
                 }
@@ -1039,13 +1022,9 @@ impl ParserV3 {
             if end > capture_start {
                 let text = &self.source[capture_start..end];
                 if !text.is_empty() {
-                    segments
-                        .push(crate::mir::QuasiquoteSegment::Quote(text.to_string()));
+                    segments.push(crate::mir::QuasiquoteSegment::Quote(text.to_string()));
                     witness_segments.push(MirWitness {
-                        kind: WitnessKind::Literal(Literal::String(
-                            text.to_string(),
-                            start_span,
-                        )),
+                        kind: WitnessKind::Literal(Literal::String(text.to_string(), start_span)),
                         span: start_span,
                     });
                 }
@@ -1056,7 +1035,9 @@ impl ParserV3 {
         self.emit.emit(MirInst::Quasiquote { dst, segments });
 
         let w = MirWitness {
-            kind: WitnessKind::Quasiquote { segments: witness_segments },
+            kind: WitnessKind::Quasiquote {
+                segments: witness_segments,
+            },
             span: start_span,
         };
         Some((dst, w))
@@ -1168,8 +1149,10 @@ impl ParserV3 {
                             Some(t)
                                 if matches!(
                                     t.token_type,
-                                    TokenType::Identifier(_) | TokenType::Slash
-                                        | TokenType::Dot | TokenType::Newline
+                                    TokenType::Identifier(_)
+                                        | TokenType::Slash
+                                        | TokenType::Dot
+                                        | TokenType::Newline
                                 ) =>
                             {
                                 match &t.token_type {
@@ -1330,10 +1313,7 @@ impl ParserV3 {
         // 父 EmitContext emit MacroDef 指令。宏体语句序列在子上下文中编译为
         // MirFunction，尾部 emit Return(body_reg)。运行期 dispatch.rs 中
         // Value::Macro 分支以 args 绑定 params，run_mir 执行 body。
-        let parent = std::mem::replace(
-            &mut self.emit,
-            crate::mir::lower::EmitContext::new(),
-        );
+        let parent = std::mem::replace(&mut self.emit, crate::mir::lower::EmitContext::new());
         let (body_reg, body_w) = if self.match_token_exact(TokenType::Newline) {
             let mut stmt_wits = Vec::new();
             let mut last = 0;
@@ -1348,10 +1328,13 @@ impl ParserV3 {
             (last, Self::block_witness(stmt_wits, span))
         } else {
             self.consume(TokenType::End, "Expected 'end' after macro body")?;
-            (0, MirWitness {
-                kind: WitnessKind::Sequence(Vec::new()),
-                span,
-            })
+            (
+                0,
+                MirWitness {
+                    kind: WitnessKind::Sequence(Vec::new()),
+                    span,
+                },
+            )
         };
         self.emit.emit_tail_return(Some(body_reg));
         let body_mir = std::mem::replace(&mut self.emit, parent).finish();
@@ -1633,14 +1616,20 @@ impl ParserV3 {
                         Some(TokenType::Identifier(_))
                     ) =>
             {
-                let w = if s == "model" { self.emit_model_def_w() } else { self.emit_msg_def_w() };
+                let w = if s == "model" {
+                    self.emit_model_def_w()
+                } else {
+                    self.emit_msg_def_w()
+                };
                 w.map(|w| (0, w))
             }
             // v0.103: 可观测性块（嵌套上下文）
             TokenType::Identifier(ref s) if s == "observe" => self.emit_observe_w().map(|w| (0, w)),
             TokenType::Identifier(ref s) if s == "span" => self.emit_span_w().map(|w| (0, w)),
             // v0.103: 并行块 / worker（嵌套上下文）
-            TokenType::Identifier(ref s) if s == "parallel" => self.emit_parallel_w().map(|w| (0, w)),
+            TokenType::Identifier(ref s) if s == "parallel" => {
+                self.emit_parallel_w().map(|w| (0, w))
+            }
             TokenType::Identifier(ref s) if s == "worker" => self.emit_worker_w().map(|w| (0, w)),
             // v0.102: 声明式范式（嵌套语句上下文）
             TokenType::Rel => self.emit_rel_def_w().map(|w| (0, w)),
@@ -1655,7 +1644,8 @@ impl ParserV3 {
                 // 于是 `Some((0, _))` 被当作 body 的末值寄存器 → 返回语句引用
                 // reg 0 → run_mir 拿到 n_regs=0 的函数 → `node_ready` 越界 panic。
                 let dst = self.emit.alloc_reg();
-                self.emit.emit(MirInst::Const(dst, crate::value::Value::Nil));
+                self.emit
+                    .emit(MirInst::Const(dst, crate::value::Value::Nil));
                 let w = MirWitness {
                     kind: WitnessKind::Sequence(vec![]),
                     span,
@@ -1669,7 +1659,8 @@ impl ParserV3 {
                 // 同 commit：返回真实寄存器（rollback 通过 dispatch 返回 Err
                 // 中断，该寄存器不会被读到，但保持与 commit 同一形状）。
                 let dst = self.emit.alloc_reg();
-                self.emit.emit(MirInst::Const(dst, crate::value::Value::Nil));
+                self.emit
+                    .emit(MirInst::Const(dst, crate::value::Value::Nil));
                 let w = MirWitness {
                     kind: WitnessKind::Sequence(vec![]),
                     span,
@@ -1963,7 +1954,10 @@ impl ParserV3 {
             }
             self.consume(TokenType::End, "Expected 'end' after match arms")?;
         } else {
-            self.consume(TokenType::LBrace, "Expected '{' or 'with' after match subject")?;
+            self.consume(
+                TokenType::LBrace,
+                "Expected '{' or 'with' after match subject",
+            )?;
             while !self.check(&TokenType::RBrace) && !self.is_at_end() {
                 if let Some(arm) = self.emit_match_arm_w() {
                     arms.push((arm.pat_str, arm.guard, arm.body_mir, arm.val_reg));
@@ -2007,9 +2001,7 @@ impl ParserV3 {
         // v0.104.3: arm 箭头有**两种拼写** —— `=>`（既有实现形态、全部
         // fixtures 使用）与 `->`（spec §14.2 EBNF 与 §7.3/§7.4/§7.5 教学章节
         // 一律使用）。lexer 早有 `TokenType::Arrow`，只是 match arm 从未接受它。
-        let is_arrow = |t: &TokenType| {
-            matches!(t, TokenType::FatArrow | TokenType::Arrow)
-        };
+        let is_arrow = |t: &TokenType| matches!(t, TokenType::FatArrow | TokenType::Arrow);
         // v0.87: Detect optional "when <guard_expr>" before the arm arrow
         //
         // v0.104.3 修复：守卫与 arm body 同构 —— 发射成**延迟求值**的
@@ -2033,13 +2025,21 @@ impl ParserV3 {
             let (guard_val_reg, guard_w) = self.emit_expr_w()?;
             self.emit.emit(MirInst::Return(Some(guard_val_reg)));
             let guard_mir = std::mem::replace(&mut self.emit, guard_parent).finish();
-            if !self.peek().map(|t| is_arrow(&t.token_type)).unwrap_or(false) {
+            if !self
+                .peek()
+                .map(|t| is_arrow(&t.token_type))
+                .unwrap_or(false)
+            {
                 return None;
             }
             self.advance(); // consume '=>' 或 '->'
             Some((Box::new(guard_mir), guard_w))
         } else {
-            if !self.peek().map(|t| is_arrow(&t.token_type)).unwrap_or(false) {
+            if !self
+                .peek()
+                .map(|t| is_arrow(&t.token_type))
+                .unwrap_or(false)
+            {
                 return None;
             }
             self.advance(); // consume '=>' 或 '->'
@@ -2101,17 +2101,12 @@ impl ParserV3 {
     /// 检测当前 token 序列为 `as dyn <TraitName>`，emit MirInst::DynTrait
     /// 指令，将 src_reg 的 plain value 包装为 Value::TraitObject。
     /// 未检测到则原样返回。
-    fn emit_dyn_coercion(
-        &mut self,
-        src_reg: Reg,
-        src_w: MirWitness,
-    ) -> Option<(Reg, MirWitness)> {
+    fn emit_dyn_coercion(&mut self, src_reg: Reg, src_w: MirWitness) -> Option<(Reg, MirWitness)> {
         if self.check(&TokenType::As) {
             self.advance(); // 'as'
             if self.check(&TokenType::Dyn) {
                 self.advance(); // 'dyn'
-                let trait_name =
-                    self.consume_identifier("Expected trait name after 'dyn'")?;
+                let trait_name = self.consume_identifier("Expected trait name after 'dyn'")?;
                 let dst = self.emit.alloc_reg();
                 self.emit.emit(MirInst::DynTrait {
                     dst,
@@ -2120,14 +2115,17 @@ impl ParserV3 {
                     trait_name: trait_name.clone(),
                 });
                 let span = src_w.span;
-                return Some((dst, MirWitness {
-                    kind: WitnessKind::DynTrait {
-                        expr: Box::new(src_w),
-                        trait_name,
-                        generics: Vec::new(),
+                return Some((
+                    dst,
+                    MirWitness {
+                        kind: WitnessKind::DynTrait {
+                            expr: Box::new(src_w),
+                            trait_name,
+                            generics: Vec::new(),
+                        },
+                        span,
                     },
-                    span,
-                }));
+                ));
             }
         }
         Some((src_reg, src_w))
@@ -2526,14 +2524,10 @@ impl ParserV3 {
         let _ = self.emit.alloc_reg(); // 子 body 的返回值不传播
         let body_mir = std::mem::replace(&mut self.emit, parent).finish();
         // 分离 binding 三元素组：MIR 指令侧 (name, reg) + witness 侧 (name, witness)
-        let binding_pairs: Vec<(String, usize)> = bindings
-            .iter()
-            .map(|(n, r, _)| (n.clone(), *r))
-            .collect();
-        let binding_witnesses: Vec<(String, MirWitness)> = bindings
-            .into_iter()
-            .map(|(n, _r, w)| (n, w))
-            .collect();
+        let binding_pairs: Vec<(String, usize)> =
+            bindings.iter().map(|(n, r, _)| (n.clone(), *r)).collect();
+        let binding_witnesses: Vec<(String, MirWitness)> =
+            bindings.into_iter().map(|(n, _r, w)| (n, w)).collect();
         self.emit.emit(MirInst::WithConfig {
             bindings: binding_pairs,
             body: Box::new(body_mir),

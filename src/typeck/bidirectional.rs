@@ -392,7 +392,11 @@ impl<'a> BidirectionalChecker<'a> {
                     params.push((*input).clone());
                     current = (*output).clone();
                 }
-                if params.is_empty() { None } else { Some(params) }
+                if params.is_empty() {
+                    None
+                } else {
+                    Some(params)
+                }
             }
             // Name/Evaluated/Builtin/Method —— 暂未实现查 builtin/method sig
             _ => None,

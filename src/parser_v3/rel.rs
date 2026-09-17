@@ -114,7 +114,10 @@ impl ParserV3 {
                 },
             )
         } else if body_goals.len() == 1 {
-            (body_goals.pop().expect("len 1"), body_wits.pop().expect("len 1"))
+            (
+                body_goals.pop().expect("len 1"),
+                body_wits.pop().expect("len 1"),
+            )
         } else {
             let wit = MirWitness {
                 kind: WitnessKind::Sequence(body_wits),
@@ -227,14 +230,8 @@ impl ParserV3 {
         let name = self.consume_identifier("Expected goal name")?;
 
         match name.as_str() {
-            "fail" => Some((
-                Goal::Fail,
-                Self::goal_const_wit("fail", span),
-            )),
-            "succeed" => Some((
-                Goal::Succeed,
-                Self::goal_const_wit("succeed", span),
-            )),
+            "fail" => Some((Goal::Fail, Self::goal_const_wit("fail", span))),
+            "succeed" => Some((Goal::Succeed, Self::goal_const_wit("succeed", span))),
             "unify" => {
                 self.consume(TokenType::LParen, "Expected '(' after unify")?;
                 let (a, aw) = self.emit_clause_term_w(vars)?;
@@ -519,11 +516,7 @@ impl ParserV3 {
     }
 
     /// 字面量项解析（Int/Float/String/Char/BigInt/Bool/Nil）。
-    fn emit_literal_term_w(
-        &mut self,
-        tok: TokenType,
-        span: Span,
-    ) -> Option<(Term, MirWitness)> {
+    fn emit_literal_term_w(&mut self, tok: TokenType, span: Span) -> Option<(Term, MirWitness)> {
         let (t, lit) = match tok {
             TokenType::Int(n) => (
                 Term::Val(crate::value::Value::Int(n)),
@@ -553,10 +546,7 @@ impl ParserV3 {
                 Term::Val(crate::value::Value::Bool(false)),
                 Literal::Bool(false, span),
             ),
-            TokenType::Nil => (
-                Term::Val(crate::value::Value::Nil),
-                Literal::Nil(span),
-            ),
+            TokenType::Nil => (Term::Val(crate::value::Value::Nil), Literal::Nil(span)),
             _ => return None,
         };
         self.advance();

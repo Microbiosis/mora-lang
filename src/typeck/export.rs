@@ -18,8 +18,8 @@ use std::collections::HashMap;
 use crate::common::Span;
 use crate::mir::effect::EffectRow;
 use crate::mir::witness::MirWitness;
-use crate::typeck::hm::HMInference;
 use crate::typeck::Type;
+use crate::typeck::hm::HMInference;
 
 /// Type table produced by shadow export. Maps each witness node's Span
 /// to its inferred (Type, EffectRow) pair.
@@ -78,10 +78,7 @@ pub fn verify_type_table(table: &TypeTable) -> Vec<String> {
     let mut issues = Vec::new();
     for (span, (ty, _row)) in &table.types {
         if has_free_typevar(ty) {
-            issues.push(format!(
-                "span {:?}: unresolved TypeVar in {:?}",
-                span, ty
-            ));
+            issues.push(format!("span {:?}: unresolved TypeVar in {:?}", span, ty));
         }
     }
     issues
@@ -95,9 +92,7 @@ fn has_free_typevar(ty: &Type) -> bool {
         Type::Dict(k, v) => has_free_typevar(k) || has_free_typevar(v),
         Type::Tuple(items) => items.iter().any(|t| has_free_typevar(t)),
         Type::Union(items) => items.iter().any(has_free_typevar),
-        Type::Arrow(input, output, _row) => {
-            has_free_typevar(input) || has_free_typevar(output)
-        }
+        Type::Arrow(input, output, _row) => has_free_typevar(input) || has_free_typevar(output),
         Type::ForAll(_, inner) => has_free_typevar(inner),
         Type::Result_(ok, err) => has_free_typevar(ok) || has_free_typevar(err),
         // Concrete types — no free variables
@@ -109,7 +104,7 @@ fn has_free_typevar(ty: &Type) -> bool {
 mod tests {
     use super::*;
     use crate::common::Literal;
-    use crate::mir::witness::{WitnessKind, MirWitness};
+    use crate::mir::witness::{MirWitness, WitnessKind};
 
     fn lit_int(n: i64) -> MirWitness {
         MirWitness {
@@ -138,13 +133,17 @@ mod tests {
         let witnesses = vec![lit_int(42)];
         let table = export_type_table(&witnesses);
         let issues = verify_type_table(&table);
-        assert!(issues.is_empty(), "literal-only table should have no unresolved vars: {:?}", issues);
+        assert!(
+            issues.is_empty(),
+            "literal-only table should have no unresolved vars: {:?}",
+            issues
+        );
     }
 
     /// Helper: compile a .mora source string and return (witness_count, table_size, unresolved_count).
     fn compile_and_export(source: &str) -> (usize, usize, usize) {
-        let (_func, witnesses) = crate::parser_v3::ParserV3::compile(source)
-            .expect("compile should succeed");
+        let (_func, witnesses) =
+            crate::parser_v3::ParserV3::compile(source).expect("compile should succeed");
         let witness_count = count_witnesses(&witnesses);
         let table = export_type_table(&witnesses);
         let table_size = table.types.len();
@@ -167,11 +166,16 @@ mod tests {
                 count_witnesses(std::slice::from_ref(left))
                     + count_witnesses(std::slice::from_ref(right))
             }
-            WitnessKind::Call { args, .. } => args.iter().map(|a| count_witnesses(std::slice::from_ref(a))).sum(),
+            WitnessKind::Call { args, .. } => args
+                .iter()
+                .map(|a| count_witnesses(std::slice::from_ref(a)))
+                .sum(),
             WitnessKind::If { cond, then, r#else } => {
                 count_witnesses(std::slice::from_ref(cond))
                     + count_witnesses(std::slice::from_ref(then))
-                    + r#else.as_ref().map_or(0, |e| count_witnesses(std::slice::from_ref(e)))
+                    + r#else
+                        .as_ref()
+                        .map_or(0, |e| count_witnesses(std::slice::from_ref(e)))
             }
             WitnessKind::LetBinding { value, .. } => count_witnesses(std::slice::from_ref(value)),
             WitnessKind::Sequence(exprs) => count_witnesses(exprs),
@@ -195,7 +199,10 @@ mod tests {
         assert!(witness_count > 0, "should have witnesses");
         assert!(table_size > 0, "shadow table should capture types");
         if unresolved > 0 {
-            eprintln!("NOTE: function_call has {} unresolved TypeVars (expected for polymorphic fns)", unresolved);
+            eprintln!(
+                "NOTE: function_call has {} unresolved TypeVars (expected for polymorphic fns)",
+                unresolved
+            );
         }
     }
 

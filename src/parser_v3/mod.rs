@@ -12,9 +12,9 @@ use std::collections::HashMap;
 
 mod emit;
 mod emit_definitions; // v0.92 P1.3: definition emit methods split from emit.rs
+mod rel;
 mod syntax; // v0.92 P1.4: pattern/orchestrate/type-annotation parsers (from parse.rs)
-mod tokens; // v0.92 P1.4: token-stream navigation primitives (from parse.rs)
-mod rel; // v0.102: 声明式范式（rel/solve）语法 emit
+mod tokens; // v0.92 P1.4: token-stream navigation primitives (from parse.rs) // v0.102: 声明式范式（rel/solve）语法 emit
 
 /// v0.103: TEA 独立 `update(params) ... end` 声明的注册名。
 ///

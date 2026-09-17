@@ -82,11 +82,21 @@ fn build_node(b: &mut FcfgBuilder, w: &MirWitness) -> Node<()> {
         // ── 值产生 ──
         WitnessKind::Literal(lit) => {
             let reg = b.alloc();
-            Node::Literal { reg, value: lit.clone(), span, meta: () }
+            Node::Literal {
+                reg,
+                value: lit.clone(),
+                span,
+                meta: (),
+            }
         }
         WitnessKind::Variable(name) => {
             let reg = b.alloc();
-            Node::Variable { reg, name: name.clone(), span, meta: () }
+            Node::Variable {
+                reg,
+                name: name.clone(),
+                span,
+                meta: (),
+            }
         }
         WitnessKind::Binary { left, op, right } => {
             let lhs = build_node(b, left);
@@ -95,9 +105,18 @@ fn build_node(b: &mut FcfgBuilder, w: &MirWitness) -> Node<()> {
             let rhs_reg = node_result_reg(&rhs);
             let dst = b.alloc();
             Node::Sequence {
-                nodes: vec![lhs, rhs, Node::BinaryOp {
-                    dst, lhs: lhs_reg, op: op.clone(), rhs: rhs_reg, span, meta: (),
-                }],
+                nodes: vec![
+                    lhs,
+                    rhs,
+                    Node::BinaryOp {
+                        dst,
+                        lhs: lhs_reg,
+                        op: op.clone(),
+                        rhs: rhs_reg,
+                        span,
+                        meta: (),
+                    },
+                ],
                 span,
                 meta: (),
             }
@@ -109,7 +128,17 @@ fn build_node(b: &mut FcfgBuilder, w: &MirWitness) -> Node<()> {
             let r = node_result_reg(&rhs);
             let dst = b.alloc();
             Node::Sequence {
-                nodes: vec![lhs, rhs, Node::Or { dst, lhs: l, rhs: r, span, meta: () }],
+                nodes: vec![
+                    lhs,
+                    rhs,
+                    Node::Or {
+                        dst,
+                        lhs: l,
+                        rhs: r,
+                        span,
+                        meta: (),
+                    },
+                ],
                 span,
                 meta: (),
             }
@@ -121,7 +150,17 @@ fn build_node(b: &mut FcfgBuilder, w: &MirWitness) -> Node<()> {
             let r = node_result_reg(&rhs);
             let dst = b.alloc();
             Node::Sequence {
-                nodes: vec![lhs, rhs, Node::And { dst, lhs: l, rhs: r, span, meta: () }],
+                nodes: vec![
+                    lhs,
+                    rhs,
+                    Node::And {
+                        dst,
+                        lhs: l,
+                        rhs: r,
+                        span,
+                        meta: (),
+                    },
+                ],
                 span,
                 meta: (),
             }
@@ -132,12 +171,22 @@ fn build_node(b: &mut FcfgBuilder, w: &MirWitness) -> Node<()> {
                 WitnessCallee::Name(n) => (Some(n.clone()), b.alloc()),
                 WitnessCallee::Var(n) => {
                     let r = b.alloc();
-                    nodes.push(Node::Variable { reg: r, name: n.clone(), span, meta: () });
+                    nodes.push(Node::Variable {
+                        reg: r,
+                        name: n.clone(),
+                        span,
+                        meta: (),
+                    });
                     (None, r)
                 }
                 WitnessCallee::Method(obj, m) => {
                     let r = b.alloc();
-                    nodes.push(Node::Variable { reg: r, name: format!("{}.{}", obj, m), span, meta: () });
+                    nodes.push(Node::Variable {
+                        reg: r,
+                        name: format!("{}.{}", obj, m),
+                        span,
+                        meta: (),
+                    });
                     (Some(format!("{}.{}", obj, m)), r)
                 }
                 WitnessCallee::Evaluated(e) => {
@@ -148,7 +197,12 @@ fn build_node(b: &mut FcfgBuilder, w: &MirWitness) -> Node<()> {
                 }
                 WitnessCallee::Builtin(op) => {
                     let r = b.alloc();
-                    nodes.push(Node::Variable { reg: r, name: format!("{:?}", op), span, meta: () });
+                    nodes.push(Node::Variable {
+                        reg: r,
+                        name: format!("{:?}", op),
+                        span,
+                        meta: (),
+                    });
                     (Some(format!("{:?}", op)), r)
                 }
             };
@@ -171,12 +225,25 @@ fn build_node(b: &mut FcfgBuilder, w: &MirWitness) -> Node<()> {
                 });
             } else {
                 nodes.push(Node::Call {
-                    dst, callee: callee_reg, callee_name, args: arg_regs, span, meta: (),
+                    dst,
+                    callee: callee_reg,
+                    callee_name,
+                    args: arg_regs,
+                    span,
+                    meta: (),
                 });
             }
-            Node::Sequence { nodes, span, meta: () }
+            Node::Sequence {
+                nodes,
+                span,
+                meta: (),
+            }
         }
-        WitnessKind::MethodCall { receiver, method, args } => {
+        WitnessKind::MethodCall {
+            receiver,
+            method,
+            args,
+        } => {
             let recv_node = build_node(b, receiver);
             let recv_reg = node_result_reg(&recv_node);
             let mut nodes = vec![recv_node];
@@ -188,9 +255,18 @@ fn build_node(b: &mut FcfgBuilder, w: &MirWitness) -> Node<()> {
             }
             let dst = b.alloc();
             nodes.push(Node::MethodCall {
-                dst, receiver: recv_reg, method: method.clone(), args: arg_regs, span, meta: (),
+                dst,
+                receiver: recv_reg,
+                method: method.clone(),
+                args: arg_regs,
+                span,
+                meta: (),
             });
-            Node::Sequence { nodes, span, meta: () }
+            Node::Sequence {
+                nodes,
+                span,
+                meta: (),
+            }
         }
         WitnessKind::Closure { params, body } => {
             let body_block = build_block(b, body);
@@ -203,7 +279,12 @@ fn build_node(b: &mut FcfgBuilder, w: &MirWitness) -> Node<()> {
                 meta: (),
             }
         }
-        WitnessKind::FnDef { name, params, return_type, body } => {
+        WitnessKind::FnDef {
+            name,
+            params,
+            return_type,
+            body,
+        } => {
             let body_block = build_block(b, body);
             Node::FnDef {
                 name: name.clone(),
@@ -230,7 +311,16 @@ fn build_node(b: &mut FcfgBuilder, w: &MirWitness) -> Node<()> {
                 .collect();
             let dst = b.alloc();
             Node::Sequence {
-                nodes: vec![scrut_node, Node::Match { dst, scrutinee: scrut_reg, arms: core_arms, span, meta: () }],
+                nodes: vec![
+                    scrut_node,
+                    Node::Match {
+                        dst,
+                        scrutinee: scrut_reg,
+                        arms: core_arms,
+                        span,
+                        meta: (),
+                    },
+                ],
                 span,
                 meta: (),
             }
@@ -253,9 +343,17 @@ fn build_node(b: &mut FcfgBuilder, w: &MirWitness) -> Node<()> {
             };
             // Sequence 保留条件求值顺序 + If 节点（此前 wrap_with_cond
             // 丢弃了 If 自身 — 嵌套体（macro body）的分支全部丢失）
-            Node::Sequence { nodes: vec![cond_node, if_node], span, meta: () }
+            Node::Sequence {
+                nodes: vec![cond_node, if_node],
+                span,
+                meta: (),
+            }
         }
-        WitnessKind::Loop { var, iterable, body } => {
+        WitnessKind::Loop {
+            var,
+            iterable,
+            body,
+        } => {
             let iter_node = build_node(b, iterable);
             let iter_reg = node_result_reg(&iter_node);
             // v0.90.4: push loop context — body 内的 break/continue 找当前 loop label
@@ -266,9 +364,17 @@ fn build_node(b: &mut FcfgBuilder, w: &MirWitness) -> Node<()> {
             // 同契约；缺此寄存器时 9 层产出与 emit.rs 类别序列分歧。
             let dst = b.alloc();
             Node::Sequence {
-                nodes: vec![iter_node, Node::For {
-                    var: var.clone(), iter: iter_reg, body: body_block, dst, span, meta: (),
-                }],
+                nodes: vec![
+                    iter_node,
+                    Node::For {
+                        var: var.clone(),
+                        iter: iter_reg,
+                        body: body_block,
+                        dst,
+                        span,
+                        meta: (),
+                    },
+                ],
                 span,
                 meta: (),
             }
@@ -282,7 +388,13 @@ fn build_node(b: &mut FcfgBuilder, w: &MirWitness) -> Node<()> {
             b.pop_loop();
             // v0.103: 循环结果寄存器（收尾 Nil 常量）—— emit.rs emit_while_w 同契约。
             let dst = b.alloc();
-            Node::While { cond: cond_block, body: body_block, dst, span, meta: () }
+            Node::While {
+                cond: cond_block,
+                body: body_block,
+                dst,
+                span,
+                meta: (),
+            }
         }
         WitnessKind::List(items) => {
             let mut nodes = Vec::new();
@@ -293,8 +405,17 @@ fn build_node(b: &mut FcfgBuilder, w: &MirWitness) -> Node<()> {
                 nodes.push(n);
             }
             let dst = b.alloc();
-            nodes.push(Node::ListLit { dst, items: item_regs, span, meta: () });
-            Node::Sequence { nodes, span, meta: () }
+            nodes.push(Node::ListLit {
+                dst,
+                items: item_regs,
+                span,
+                meta: (),
+            });
+            Node::Sequence {
+                nodes,
+                span,
+                meta: (),
+            }
         }
         WitnessKind::Dict(entries) => {
             let mut nodes = Vec::new();
@@ -305,17 +426,35 @@ fn build_node(b: &mut FcfgBuilder, w: &MirWitness) -> Node<()> {
                 nodes.push(n);
             }
             let dst = b.alloc();
-            nodes.push(Node::DictLit { dst, entries: pairs, span, meta: () });
-            Node::Sequence { nodes, span, meta: () }
+            nodes.push(Node::DictLit {
+                dst,
+                entries: pairs,
+                span,
+                meta: (),
+            });
+            Node::Sequence {
+                nodes,
+                span,
+                meta: (),
+            }
         }
-        WitnessKind::DynTrait { expr, trait_name, .. } => {
+        WitnessKind::DynTrait {
+            expr, trait_name, ..
+        } => {
             let inner = build_node(b, expr);
             let src = node_result_reg(&inner);
             let dst = b.alloc();
             Node::Sequence {
-                nodes: vec![inner, Node::DynTrait {
-                    dst, src, trait_name: trait_name.clone(), span, meta: (),
-                }],
+                nodes: vec![
+                    inner,
+                    Node::DynTrait {
+                        dst,
+                        src,
+                        trait_name: trait_name.clone(),
+                        span,
+                        meta: (),
+                    },
+                ],
                 span,
                 meta: (),
             }
@@ -329,22 +468,39 @@ fn build_node(b: &mut FcfgBuilder, w: &MirWitness) -> Node<()> {
                 nodes.push(n);
             }
             let dst = b.alloc();
-            nodes.push(Node::Prompt { dst, parts: part_regs, span, meta: () });
-            Node::Sequence { nodes, span, meta: () }
+            nodes.push(Node::Prompt {
+                dst,
+                parts: part_regs,
+                span,
+                meta: (),
+            });
+            Node::Sequence {
+                nodes,
+                span,
+                meta: (),
+            }
         }
-        WitnessKind::LetBinding { name, type_hint, value, init_body } => {
+        WitnessKind::LetBinding {
+            name,
+            type_hint,
+            value,
+            init_body,
+        } => {
             let val_node = build_node(b, value);
             let val_reg = node_result_reg(&val_node);
             let body_block = build_block(b, init_body);
             Node::Sequence {
-                nodes: vec![val_node, Node::Let {
-                    name: name.clone(),
-                    type_ann: type_hint.as_ref().map(hint_to_annotation),
-                    value: val_reg,
-                    body: body_block,
-                    span,
-                    meta: (),
-                }],
+                nodes: vec![
+                    val_node,
+                    Node::Let {
+                        name: name.clone(),
+                        type_ann: type_hint.as_ref().map(hint_to_annotation),
+                        value: val_reg,
+                        body: body_block,
+                        span,
+                        meta: (),
+                    },
+                ],
                 span,
                 meta: (),
             }
@@ -353,12 +509,24 @@ fn build_node(b: &mut FcfgBuilder, w: &MirWitness) -> Node<()> {
             let val_node = build_node(b, value);
             let val_reg = node_result_reg(&val_node);
             Node::Sequence {
-                nodes: vec![val_node, Node::Assign { name: target.clone(), value: val_reg, span, meta: () }],
+                nodes: vec![
+                    val_node,
+                    Node::Assign {
+                        name: target.clone(),
+                        value: val_reg,
+                        span,
+                        meta: (),
+                    },
+                ],
                 span,
                 meta: (),
             }
         }
-        WitnessKind::IndexAssign { object, index, value } => {
+        WitnessKind::IndexAssign {
+            object,
+            index,
+            value,
+        } => {
             let obj_node = build_node(b, object);
             let obj_reg = node_result_reg(&obj_node);
             let idx_node = build_node(b, index);
@@ -366,27 +534,45 @@ fn build_node(b: &mut FcfgBuilder, w: &MirWitness) -> Node<()> {
             let val_node2 = build_node(b, value);
             let val_reg = node_result_reg(&val_node2);
             Node::Sequence {
-                nodes: vec![obj_node, idx_node, val_node2, Node::IndexAssign {
-                    obj: obj_reg, idx: idx_reg, value: val_reg, span, meta: (),
-                }],
+                nodes: vec![
+                    obj_node,
+                    idx_node,
+                    val_node2,
+                    Node::IndexAssign {
+                        obj: obj_reg,
+                        idx: idx_reg,
+                        value: val_reg,
+                        span,
+                        meta: (),
+                    },
+                ],
                 span,
                 meta: (),
             }
         }
-        WitnessKind::Return(v) => {
-            match v {
-                Some(e) => {
-                    let n = build_node(b, e);
-                    let r = node_result_reg(&n);
-                    Node::Sequence {
-                        nodes: vec![n, Node::Return { value: Some(r), span, meta: () }],
-                        span,
-                        meta: (),
-                    }
+        WitnessKind::Return(v) => match v {
+            Some(e) => {
+                let n = build_node(b, e);
+                let r = node_result_reg(&n);
+                Node::Sequence {
+                    nodes: vec![
+                        n,
+                        Node::Return {
+                            value: Some(r),
+                            span,
+                            meta: (),
+                        },
+                    ],
+                    span,
+                    meta: (),
                 }
-                None => Node::Return { value: None, span, meta: () },
             }
-        }
+            None => Node::Return {
+                value: None,
+                span,
+                meta: (),
+            },
+        },
         // v0.90.4: break/continue label 取自当前循环上下文（While/For push）
         WitnessKind::Break(_) => Node::Break {
             label: b.current_break_label(),
@@ -398,7 +584,11 @@ fn build_node(b: &mut FcfgBuilder, w: &MirWitness) -> Node<()> {
             span,
             meta: (),
         },
-        WitnessKind::Orchestrate { input_var, result_var, kind } => {
+        WitnessKind::Orchestrate {
+            input_var,
+            result_var,
+            kind,
+        } => {
             let mir_kind = build_orchestrate_kind(b, kind);
             Node::Orchestrate {
                 input_var: input_var.clone(),
@@ -427,7 +617,13 @@ fn build_node(b: &mut FcfgBuilder, w: &MirWitness) -> Node<()> {
         }
         WitnessKind::EnumDef { name, variants } => Node::EnumDef {
             name: name.clone(),
-            variants: variants.iter().map(|v| Variant { name: v.clone(), payload: None }).collect(),
+            variants: variants
+                .iter()
+                .map(|v| Variant {
+                    name: v.clone(),
+                    payload: None,
+                })
+                .collect(),
             span,
             meta: (),
         },
@@ -440,7 +636,11 @@ fn build_node(b: &mut FcfgBuilder, w: &MirWitness) -> Node<()> {
             span,
             meta: (),
         },
-        WitnessKind::Import(path) => Node::Import { path: path.clone(), span, meta: () },
+        WitnessKind::Import(path) => Node::Import {
+            path: path.clone(),
+            span,
+            meta: (),
+        },
         WitnessKind::Perform { effect, args } => {
             let mut nodes = Vec::new();
             let mut arg_regs = Vec::new();
@@ -450,10 +650,25 @@ fn build_node(b: &mut FcfgBuilder, w: &MirWitness) -> Node<()> {
                 nodes.push(n);
             }
             let dst = b.alloc();
-            nodes.push(Node::Perform { dst, effect: effect.clone(), args: arg_regs, span, meta: () });
-            Node::Sequence { nodes, span, meta: () }
+            nodes.push(Node::Perform {
+                dst,
+                effect: effect.clone(),
+                args: arg_regs,
+                span,
+                meta: (),
+            });
+            Node::Sequence {
+                nodes,
+                span,
+                meta: (),
+            }
         }
-        WitnessKind::Handle { effect, body, handler, k_param } => {
+        WitnessKind::Handle {
+            effect,
+            body,
+            handler,
+            k_param,
+        } => {
             let body_block = build_block(b, body);
             let handler_block = build_block(b, handler);
             Node::Handle {
@@ -477,11 +692,18 @@ fn build_node(b: &mut FcfgBuilder, w: &MirWitness) -> Node<()> {
         }
         WitnessKind::Sequence(exprs) => {
             let nodes: Vec<Node<()>> = exprs.iter().map(|e| build_node(b, e)).collect();
-            Node::Sequence { nodes, span, meta: () }
+            Node::Sequence {
+                nodes,
+                span,
+                meta: (),
+            }
         }
         WitnessKind::ModelDef { name, fields } => Node::ModelDef {
             name: name.clone(),
-            fields: fields.iter().map(|(n, t)| (n.clone(), hint_to_annotation(t))).collect(),
+            fields: fields
+                .iter()
+                .map(|(n, t)| (n.clone(), hint_to_annotation(t)))
+                .collect(),
             span,
             meta: (),
         },
@@ -497,7 +719,9 @@ fn build_node(b: &mut FcfgBuilder, w: &MirWitness) -> Node<()> {
             span,
             meta: (),
         },
-        WitnessKind::UpdateDef { name, params, body, .. } => {
+        WitnessKind::UpdateDef {
+            name, params, body, ..
+        } => {
             let body_block = build_block(b, body);
             Node::UpdateDef {
                 name: name.clone(),
@@ -507,7 +731,14 @@ fn build_node(b: &mut FcfgBuilder, w: &MirWitness) -> Node<()> {
                 meta: (),
             }
         }
-        WitnessKind::AppDef { name, model_name, msg_name, init_w, update_w, view_w } => {
+        WitnessKind::AppDef {
+            name,
+            model_name,
+            msg_name,
+            init_w,
+            update_w,
+            view_w,
+        } => {
             // v0.104: update/view 的 witness 是 Closure —— 节点只携带其
             // **形参**与**体块**（体块才是要 lower 成 update 函数的东西）。
             // 此前 `build_block(b, update_w)` 把整个 Closure 节点当块体，
@@ -520,15 +751,9 @@ fn build_node(b: &mut FcfgBuilder, w: &MirWitness) -> Node<()> {
                 model: model_name.clone(),
                 msg: msg_name.clone(),
                 init: build_block(b, init_w),
-                update_params: update_params
-                    .iter()
-                    .map(witness_param_to_param)
-                    .collect(),
+                update_params: update_params.iter().map(witness_param_to_param).collect(),
                 update: build_block(b, update_body),
-                view_params: view_params
-                    .iter()
-                    .map(witness_param_to_param)
-                    .collect(),
+                view_params: view_params.iter().map(witness_param_to_param).collect(),
                 view: build_block(b, view_body),
                 span,
                 meta: (),
@@ -570,15 +795,18 @@ fn build_node(b: &mut FcfgBuilder, w: &MirWitness) -> Node<()> {
             span,
             meta: (),
         },
-        WitnessKind::RelDef { name, clauses, .. } => {
-            Node::RelDef {
-                name: name.clone(),
-                clauses: clauses.clone(),
-                span,
-                meta: (),
-            }
-        }
-        WitnessKind::Solve { limit, query_vars, anon_vars, goal } => {
+        WitnessKind::RelDef { name, clauses, .. } => Node::RelDef {
+            name: name.clone(),
+            clauses: clauses.clone(),
+            span,
+            meta: (),
+        },
+        WitnessKind::Solve {
+            limit,
+            query_vars,
+            anon_vars,
+            goal,
+        } => {
             let goal_block = build_block(b, goal);
             Node::Solve {
                 limit: *limit,
@@ -598,8 +826,17 @@ fn build_node(b: &mut FcfgBuilder, w: &MirWitness) -> Node<()> {
                 nodes.push(n);
             }
             let body_block = build_block(b, body);
-            nodes.push(Node::WithConfig { bindings: pairs, body: body_block, span, meta: () });
-            Node::Sequence { nodes, span, meta: () }
+            nodes.push(Node::WithConfig {
+                bindings: pairs,
+                body: body_block,
+                span,
+                meta: (),
+            });
+            Node::Sequence {
+                nodes,
+                span,
+                meta: (),
+            }
         }
         WitnessKind::Quasiquote { segments } => {
             let mut nodes: Vec<Node<()>> = Vec::new();
@@ -622,8 +859,17 @@ fn build_node(b: &mut FcfgBuilder, w: &MirWitness) -> Node<()> {
                 }
             }
             let dst = b.alloc();
-            nodes.push(Node::Quasiquote { dst, segments: segs, span, meta: () });
-            Node::Sequence { nodes, span, meta: () }
+            nodes.push(Node::Quasiquote {
+                dst,
+                segments: segs,
+                span,
+                meta: (),
+            });
+            Node::Sequence {
+                nodes,
+                span,
+                meta: (),
+            }
         }
     }
 }
@@ -632,7 +878,10 @@ fn build_node(b: &mut FcfgBuilder, w: &MirWitness) -> Node<()> {
 fn build_block(b: &mut FcfgBuilder, w: &MirWitness) -> Block<()> {
     let node = build_node(b, w);
     let result = node_result_reg(&node);
-    Block { nodes: vec![node], result: Some(result) }
+    Block {
+        nodes: vec![node],
+        result: Some(result),
+    }
 }
 
 /// 提取节点的结果寄存器（值产生节点）。
@@ -712,7 +961,9 @@ fn witness_pattern_to_pattern(p: &WitnessPattern) -> Pattern {
         },
         WitnessPattern::ListVec { elements, rest } => Pattern::ListVec {
             head: elements.iter().map(witness_pattern_to_pattern).collect(),
-            tail: rest.as_ref().map(|t| Box::new(witness_pattern_to_pattern(t))),
+            tail: rest
+                .as_ref()
+                .map(|t| Box::new(witness_pattern_to_pattern(t))),
         },
         WitnessPattern::Dict { required, .. } => Pattern::Dict(
             required
@@ -732,28 +983,54 @@ fn build_orchestrate_kind(_b: &mut FcfgBuilder, k: &WitnessOrchestrateKind) -> O
     use crate::mir::witness::WitnessOrchestrateKind as W;
     match k {
         W::Sequential { .. } => OrchestrateKind::Sequential,
-        W::Loop { .. } => OrchestrateKind::Loop { body: Block { nodes: vec![], result: None } },
+        W::Loop { .. } => OrchestrateKind::Loop {
+            body: Block {
+                nodes: vec![],
+                result: None,
+            },
+        },
         W::Graph { agents, edges } => OrchestrateKind::Graph {
             vertices: agents.iter().map(|a| a.name.clone()).collect(),
-            edges: edges.iter().map(|e| (e.from.clone(), e.to.clone())).collect(),
+            edges: edges
+                .iter()
+                .map(|e| (e.from.clone(), e.to.clone()))
+                .collect(),
         },
         W::Pregel { agents, edges, .. } => OrchestrateKind::Pregel {
             config: crate::mir::fcfg::PregelConfig {
                 vertices: agents.iter().map(|a| a.name.clone()).collect(),
-                edges: edges.iter().map(|e| (e.from.clone(), e.to.clone())).collect(),
-                compute: Block { nodes: vec![], result: None },
+                edges: edges
+                    .iter()
+                    .map(|e| (e.from.clone(), e.to.clone()))
+                    .collect(),
+                compute: Block {
+                    nodes: vec![],
+                    result: None,
+                },
                 combine: None,
                 max_supersteps: None,
             },
         },
-        W::Moa { proposers, aggregator, .. } => OrchestrateKind::MoA {
+        W::Moa {
+            proposers,
+            aggregator,
+            ..
+        } => OrchestrateKind::MoA {
             layers: vec![crate::mir::fcfg::MoALayer {
                 proposers: vec![],
-                aggregator: crate::mir::fcfg::Block { nodes: vec![], result: None },
+                aggregator: crate::mir::fcfg::Block {
+                    nodes: vec![],
+                    result: None,
+                },
             }],
         }
         .tag_moa(proposers, aggregator),
-        W::Moe { experts, router, top_k, .. } => OrchestrateKind::MoE {
+        W::Moe {
+            experts,
+            router,
+            top_k,
+            ..
+        } => OrchestrateKind::MoE {
             experts: experts.iter().map(|e| format!("{:?}", e.span)).collect(),
             router: format!("{:?}", router.span),
             top_k: *top_k,
@@ -816,7 +1093,9 @@ mod tests {
             Node::Sequence { nodes, .. } => {
                 assert_eq!(nodes.len(), 3); // lhs + rhs + BinaryOp
                 match &nodes[2] {
-                    Node::BinaryOp { dst, lhs, op, rhs, .. } => {
+                    Node::BinaryOp {
+                        dst, lhs, op, rhs, ..
+                    } => {
                         assert_eq!(*lhs, 0);
                         assert_eq!(*rhs, 1);
                         assert_eq!(*dst, 2);

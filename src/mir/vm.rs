@@ -200,9 +200,7 @@ pub fn self_match_pattern(
                 inner.split(',').collect()
             };
             // Find rest marker ..rest_name (pattern_to_string serializes without braces)
-            let rest_pos = parts
-                .iter()
-                .position(|p| p.starts_with(".."));
+            let rest_pos = parts.iter().position(|p| p.starts_with(".."));
             match rest_pos {
                 Some(pos) => {
                     // Elements before rest
@@ -219,12 +217,14 @@ pub fn self_match_pattern(
                         }
                     }
                     // Parse rest variable name from ..rest_name
-                    let rest_name = parts[pos]
-                        .strip_prefix("..")
-                        .unwrap_or(parts[pos]);
+                    let rest_name = parts[pos].strip_prefix("..").unwrap_or(parts[pos]);
                     if !rest_name.is_empty() {
                         // Bind the remaining items as a list to the rest variable
-                        env.define(rest_name.to_string(), Value::List(items[pos..].to_vec()), false);
+                        env.define(
+                            rest_name.to_string(),
+                            Value::List(items[pos..].to_vec()),
+                            false,
+                        );
                     }
                     return true;
                 }

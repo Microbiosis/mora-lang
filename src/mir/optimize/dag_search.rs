@@ -139,7 +139,6 @@ pub fn dag_search_staged(
     }
 }
 
-
 /// v0.103: Sequence 边连通分量 —— 每个分量恰是一个基本块。
 ///
 /// `dag_analyze` 对每个基本块内的**相邻指令对**无条件连 Sequence 边
@@ -354,8 +353,8 @@ mod tests {
     use crate::common::BinaryOp;
     use crate::mir::dag;
     use crate::mir::optimize::cost::{InstructionCount, TokenEstimate};
-    use crate::mir::optimize::dag_rule::{ConstFoldingDagRule, DeadNodeDagRule};
     use crate::mir::optimize::dag_optimize;
+    use crate::mir::optimize::dag_rule::{ConstFoldingDagRule, DeadNodeDagRule};
     use crate::mir::{MirFunction, MirInst};
     use crate::value::Value;
 
@@ -370,8 +369,9 @@ mod tests {
             params: vec![],
             body,
             n_regs: n,
-        
-            ..Default::default()};
+
+            ..Default::default()
+        };
         dag::dag_analyze(&func)
     }
 

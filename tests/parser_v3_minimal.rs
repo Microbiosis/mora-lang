@@ -6,9 +6,7 @@
 use mora::parser_v3::ParserV3;
 
 fn compile_ok(src: &str) -> mora::mir::MirFunction {
-    ParserV3::compile(src)
-        .expect("compile should succeed")
-        .0
+    ParserV3::compile(src).expect("compile should succeed").0
 }
 
 #[test]
@@ -67,7 +65,10 @@ fn mcp_server_compiles() {
     // McpServer::new() 可能需要特定的运行时上下文
     let result = ParserV3::compile("let mcp = McpServer::new()");
     // 如果编译失败，这是可接受的（运行时依赖）
-    assert!(result.is_ok() || result.is_err(), "mcp_server should not panic");
+    assert!(
+        result.is_ok() || result.is_err(),
+        "mcp_server should not panic"
+    );
 }
 
 #[test]

@@ -27,19 +27,30 @@ fn annotate_node(node: &Fcfg, table: &TypeTable) -> Node<TypeInfo> {
 
     match node {
         // ── 值产生 ──
-        Node::Literal { reg, value, span, .. } => Node::Literal {
+        Node::Literal {
+            reg, value, span, ..
+        } => Node::Literal {
             reg: *reg,
             value: value.clone(),
             span: *span,
             meta: info,
         },
-        Node::Variable { reg, name, span, .. } => Node::Variable {
+        Node::Variable {
+            reg, name, span, ..
+        } => Node::Variable {
             reg: *reg,
             name: name.clone(),
             span: *span,
             meta: info,
         },
-        Node::BinaryOp { dst, lhs, op, rhs, span, .. } => Node::BinaryOp {
+        Node::BinaryOp {
+            dst,
+            lhs,
+            op,
+            rhs,
+            span,
+            ..
+        } => Node::BinaryOp {
             dst: *dst,
             lhs: *lhs,
             op: op.clone(),
@@ -47,7 +58,14 @@ fn annotate_node(node: &Fcfg, table: &TypeTable) -> Node<TypeInfo> {
             span: *span,
             meta: info,
         },
-        Node::Call { dst, callee, callee_name, args, span, .. } => Node::Call {
+        Node::Call {
+            dst,
+            callee,
+            callee_name,
+            args,
+            span,
+            ..
+        } => Node::Call {
             dst: *dst,
             callee: *callee,
             callee_name: callee_name.clone(),
@@ -55,7 +73,14 @@ fn annotate_node(node: &Fcfg, table: &TypeTable) -> Node<TypeInfo> {
             span: *span,
             meta: info,
         },
-        Node::MethodCall { dst, receiver, method, args, span, .. } => Node::MethodCall {
+        Node::MethodCall {
+            dst,
+            receiver,
+            method,
+            args,
+            span,
+            ..
+        } => Node::MethodCall {
             dst: *dst,
             receiver: *receiver,
             method: method.clone(),
@@ -63,53 +88,89 @@ fn annotate_node(node: &Fcfg, table: &TypeTable) -> Node<TypeInfo> {
             span: *span,
             meta: info,
         },
-        Node::Or { dst, lhs, rhs, span, .. } => Node::Or {
+        Node::Or {
+            dst,
+            lhs,
+            rhs,
+            span,
+            ..
+        } => Node::Or {
             dst: *dst,
             lhs: *lhs,
             rhs: *rhs,
             span: *span,
             meta: info,
         },
-        Node::And { dst, lhs, rhs, span, .. } => Node::And {
+        Node::And {
+            dst,
+            lhs,
+            rhs,
+            span,
+            ..
+        } => Node::And {
             dst: *dst,
             lhs: *lhs,
             rhs: *rhs,
             span: *span,
             meta: info,
         },
-        Node::DynTrait { dst, src, trait_name, span, .. } => Node::DynTrait {
+        Node::DynTrait {
+            dst,
+            src,
+            trait_name,
+            span,
+            ..
+        } => Node::DynTrait {
             dst: *dst,
             src: *src,
             trait_name: trait_name.clone(),
             span: *span,
             meta: info,
         },
-        Node::Prompt { dst, parts, span, .. } => Node::Prompt {
+        Node::Prompt {
+            dst, parts, span, ..
+        } => Node::Prompt {
             dst: *dst,
             parts: parts.clone(),
             span: *span,
             meta: info,
         },
-        Node::ClosureExpr { dst, params, body, span, .. } => Node::ClosureExpr {
+        Node::ClosureExpr {
+            dst,
+            params,
+            body,
+            span,
+            ..
+        } => Node::ClosureExpr {
             dst: *dst,
             params: params.clone(),
             body: annotate_block(body, table),
             span: *span,
             meta: info,
         },
-        Node::ListLit { dst, items, span, .. } => Node::ListLit {
+        Node::ListLit {
+            dst, items, span, ..
+        } => Node::ListLit {
             dst: *dst,
             items: items.clone(),
             span: *span,
             meta: info,
         },
-        Node::DictLit { dst, entries, span, .. } => Node::DictLit {
+        Node::DictLit {
+            dst, entries, span, ..
+        } => Node::DictLit {
             dst: *dst,
             entries: entries.clone(),
             span: *span,
             meta: info,
         },
-        Node::Index { dst, obj, idx, span, .. } => Node::Index {
+        Node::Index {
+            dst,
+            obj,
+            idx,
+            span,
+            ..
+        } => Node::Index {
             dst: *dst,
             obj: *obj,
             idx: *idx,
@@ -118,7 +179,14 @@ fn annotate_node(node: &Fcfg, table: &TypeTable) -> Node<TypeInfo> {
         },
 
         // ── 控制流 ──
-        Node::If { cond, then, else_, dst, span, .. } => Node::If {
+        Node::If {
+            cond,
+            then,
+            else_,
+            dst,
+            span,
+            ..
+        } => Node::If {
             cond: *cond,
             then: annotate_block(then, table),
             else_: else_.as_ref().map(|e| annotate_block(e, table)),
@@ -126,14 +194,27 @@ fn annotate_node(node: &Fcfg, table: &TypeTable) -> Node<TypeInfo> {
             span: *span,
             meta: info,
         },
-        Node::While { cond, body, dst, span, .. } => Node::While {
+        Node::While {
+            cond,
+            body,
+            dst,
+            span,
+            ..
+        } => Node::While {
             cond: annotate_block(cond, table),
             body: annotate_block(body, table),
             dst: *dst,
             span: *span,
             meta: info,
         },
-        Node::For { var, iter, body, dst, span, .. } => Node::For {
+        Node::For {
+            var,
+            iter,
+            body,
+            dst,
+            span,
+            ..
+        } => Node::For {
             var: var.clone(),
             iter: *iter,
             body: annotate_block(body, table),
@@ -141,7 +222,13 @@ fn annotate_node(node: &Fcfg, table: &TypeTable) -> Node<TypeInfo> {
             span: *span,
             meta: info,
         },
-        Node::Match { dst, scrutinee, arms, span, .. } => Node::Match {
+        Node::Match {
+            dst,
+            scrutinee,
+            arms,
+            span,
+            ..
+        } => Node::Match {
             dst: *dst,
             scrutinee: *scrutinee,
             arms: arms.iter().map(|a| annotate_arm(a, table)).collect(),
@@ -165,7 +252,14 @@ fn annotate_node(node: &Fcfg, table: &TypeTable) -> Node<TypeInfo> {
         },
 
         // ── 绑定 ──
-        Node::Let { name, type_ann, value, body, span, .. } => Node::Let {
+        Node::Let {
+            name,
+            type_ann,
+            value,
+            body,
+            span,
+            ..
+        } => Node::Let {
             name: name.clone(),
             type_ann: type_ann.clone(),
             value: *value,
@@ -173,13 +267,21 @@ fn annotate_node(node: &Fcfg, table: &TypeTable) -> Node<TypeInfo> {
             span: *span,
             meta: info,
         },
-        Node::Assign { name, value, span, .. } => Node::Assign {
+        Node::Assign {
+            name, value, span, ..
+        } => Node::Assign {
             name: name.clone(),
             value: *value,
             span: *span,
             meta: info,
         },
-        Node::IndexAssign { obj, idx, value, span, .. } => Node::IndexAssign {
+        Node::IndexAssign {
+            obj,
+            idx,
+            value,
+            span,
+            ..
+        } => Node::IndexAssign {
             obj: *obj,
             idx: *idx,
             value: *value,
@@ -188,7 +290,14 @@ fn annotate_node(node: &Fcfg, table: &TypeTable) -> Node<TypeInfo> {
         },
 
         // ── 声明 ──
-        Node::FnDef { name, params, return_ann, body, span, .. } => Node::FnDef {
+        Node::FnDef {
+            name,
+            params,
+            return_ann,
+            body,
+            span,
+            ..
+        } => Node::FnDef {
             name: name.clone(),
             params: params.clone(),
             return_ann: return_ann.clone(),
@@ -196,34 +305,57 @@ fn annotate_node(node: &Fcfg, table: &TypeTable) -> Node<TypeInfo> {
             span: *span,
             meta: info,
         },
-        Node::TypeAlias { name, target, span, .. } => Node::TypeAlias {
+        Node::TypeAlias {
+            name, target, span, ..
+        } => Node::TypeAlias {
             name: name.clone(),
             target: target.clone(),
             span: *span,
             meta: info,
         },
-        Node::EnumDef { name, variants, span, .. } => Node::EnumDef {
+        Node::EnumDef {
+            name,
+            variants,
+            span,
+            ..
+        } => Node::EnumDef {
             name: name.clone(),
             variants: variants.clone(),
             span: *span,
             meta: info,
         },
-        Node::StructDef { name, fields, span, .. } => Node::StructDef {
+        Node::StructDef {
+            name, fields, span, ..
+        } => Node::StructDef {
             name: name.clone(),
             fields: fields.clone(),
             span: *span,
             meta: info,
         },
-        Node::TraitDef { name, methods, span, .. } => Node::TraitDef {
+        Node::TraitDef {
+            name,
+            methods,
+            span,
+            ..
+        } => Node::TraitDef {
             name: name.clone(),
             methods: methods.clone(),
             span: *span,
             meta: info,
         },
-        Node::ImplDef { trait_name, for_type, methods, span, .. } => Node::ImplDef {
+        Node::ImplDef {
+            trait_name,
+            for_type,
+            methods,
+            span,
+            ..
+        } => Node::ImplDef {
             trait_name: trait_name.clone(),
             for_type: for_type.clone(),
-            methods: methods.iter().map(|(n, b)| (n.clone(), annotate_block(b, table))).collect(),
+            methods: methods
+                .iter()
+                .map(|(n, b)| (n.clone(), annotate_block(b, table)))
+                .collect(),
             span: *span,
             meta: info,
         },
@@ -232,7 +364,13 @@ fn annotate_node(node: &Fcfg, table: &TypeTable) -> Node<TypeInfo> {
             span: *span,
             meta: info,
         },
-        Node::MacroDef { name, params, body, span, .. } => Node::MacroDef {
+        Node::MacroDef {
+            name,
+            params,
+            body,
+            span,
+            ..
+        } => Node::MacroDef {
             name: name.clone(),
             params: params.clone(),
             body: annotate_block(body, table),
@@ -241,14 +379,27 @@ fn annotate_node(node: &Fcfg, table: &TypeTable) -> Node<TypeInfo> {
         },
 
         // ── 效果 ──
-        Node::Perform { dst, effect, args, span, .. } => Node::Perform {
+        Node::Perform {
+            dst,
+            effect,
+            args,
+            span,
+            ..
+        } => Node::Perform {
             dst: *dst,
             effect: effect.clone(),
             args: args.clone(),
             span: *span,
             meta: info,
         },
-        Node::Handle { effect, body, handler, k_param, span, .. } => Node::Handle {
+        Node::Handle {
+            effect,
+            body,
+            handler,
+            k_param,
+            span,
+            ..
+        } => Node::Handle {
             effect: effect.clone(),
             body: annotate_block(body, table),
             handler: annotate_block(handler, table),
@@ -258,26 +409,40 @@ fn annotate_node(node: &Fcfg, table: &TypeTable) -> Node<TypeInfo> {
         },
 
         // ── TEA ──
-        Node::ModelDef { name, fields, span, .. } => Node::ModelDef {
+        Node::ModelDef {
+            name, fields, span, ..
+        } => Node::ModelDef {
             name: name.clone(),
             fields: fields.clone(),
             span: *span,
             meta: info,
         },
-        Node::MsgDef { name, variants, span, .. } => Node::MsgDef {
+        Node::MsgDef {
+            name,
+            variants,
+            span,
+            ..
+        } => Node::MsgDef {
             name: name.clone(),
             variants: variants.clone(),
             span: *span,
             meta: info,
         },
         // v0.102: 声明式范式 — RelDef 无子块；Solve 的 goal 块递归标注
-        Node::RelDef { name, clauses, span, .. } => Node::RelDef {
+        Node::RelDef {
+            name,
+            clauses,
+            span,
+            ..
+        } => Node::RelDef {
             name: name.clone(),
             clauses: clauses.clone(),
             span: *span,
             meta: info,
         },
-        Node::Export { names, decl, span, .. } => Node::Export {
+        Node::Export {
+            names, decl, span, ..
+        } => Node::Export {
             names: names.clone(),
             decl: annotate_block(decl, table),
             span: *span,
@@ -288,32 +453,51 @@ fn annotate_node(node: &Fcfg, table: &TypeTable) -> Node<TypeInfo> {
             span: *span,
             meta: info,
         },
-        Node::Observe { config, body, span, .. } => Node::Observe {
+        Node::Observe {
+            config, body, span, ..
+        } => Node::Observe {
             config: config.clone(),
             body: annotate_block(body, table),
             span: *span,
             meta: info,
         },
-        Node::Span { name, tags, body, span, .. } => Node::Span {
+        Node::Span {
+            name,
+            tags,
+            body,
+            span,
+            ..
+        } => Node::Span {
             name: name.clone(),
             tags: tags.clone(),
             body: annotate_block(body, table),
             span: *span,
             meta: info,
         },
-        Node::PromptSection { name, body, span, .. } => Node::PromptSection {
+        Node::PromptSection {
+            name, body, span, ..
+        } => Node::PromptSection {
             name: name.clone(),
             body: annotate_block(body, table),
             span: *span,
             meta: info,
         },
-        Node::DocumentSection { name, body, span, .. } => Node::DocumentSection {
+        Node::DocumentSection {
+            name, body, span, ..
+        } => Node::DocumentSection {
             name: name.clone(),
             body: annotate_block(body, table),
             span: *span,
             meta: info,
         },
-        Node::Solve { limit, query_vars, anon_vars, goal, span, .. } => Node::Solve {
+        Node::Solve {
+            limit,
+            query_vars,
+            anon_vars,
+            goal,
+            span,
+            ..
+        } => Node::Solve {
             limit: *limit,
             query_vars: query_vars.clone(),
             anon_vars: anon_vars.clone(),
@@ -321,7 +505,13 @@ fn annotate_node(node: &Fcfg, table: &TypeTable) -> Node<TypeInfo> {
             span: *span,
             meta: info,
         },
-        Node::UpdateDef { name, params, body, span, .. } => Node::UpdateDef {
+        Node::UpdateDef {
+            name,
+            params,
+            body,
+            span,
+            ..
+        } => Node::UpdateDef {
             name: name.clone(),
             params: params.clone(),
             body: annotate_block(body, table),
@@ -353,20 +543,36 @@ fn annotate_node(node: &Fcfg, table: &TypeTable) -> Node<TypeInfo> {
         },
 
         // ── 其它 ──
-        Node::Quasiquote { dst, segments, span, .. } => Node::Quasiquote {
+        Node::Quasiquote {
+            dst,
+            segments,
+            span,
+            ..
+        } => Node::Quasiquote {
             dst: *dst,
             segments: segments.clone(),
             span: *span,
             meta: info,
         },
-        Node::Orchestrate { input_var, result_var, kind, span, .. } => Node::Orchestrate {
+        Node::Orchestrate {
+            input_var,
+            result_var,
+            kind,
+            span,
+            ..
+        } => Node::Orchestrate {
             input_var: input_var.clone(),
             result_var: result_var.clone(),
             kind: annotate_orchestrate_kind(kind, table),
             span: *span,
             meta: info,
         },
-        Node::WithConfig { bindings, body, span, .. } => Node::WithConfig {
+        Node::WithConfig {
+            bindings,
+            body,
+            span,
+            ..
+        } => Node::WithConfig {
             bindings: bindings.clone(),
             body: annotate_block(body, table),
             span: *span,
@@ -427,12 +633,20 @@ fn annotate_orchestrate_kind(
             layers: layers
                 .iter()
                 .map(|l| crate::mir::fcfg::MoALayer {
-                    proposers: l.proposers.iter().map(|p| annotate_block(p, table)).collect(),
+                    proposers: l
+                        .proposers
+                        .iter()
+                        .map(|p| annotate_block(p, table))
+                        .collect(),
                     aggregator: annotate_block(&l.aggregator, table),
                 })
                 .collect(),
         },
-        OrchestrateKind::MoE { experts, router, top_k } => OrchestrateKind::MoE {
+        OrchestrateKind::MoE {
+            experts,
+            router,
+            top_k,
+        } => OrchestrateKind::MoE {
             experts: experts.clone(),
             router: router.clone(),
             top_k: *top_k,
@@ -447,7 +661,10 @@ mod tests {
     use crate::mir::effect::EffectRow;
     use crate::typeck::Type;
 
-    const S: Span = Span { line: 42, column: 0 };
+    const S: Span = Span {
+        line: 42,
+        column: 0,
+    };
 
     #[test]
     fn annotate_literal_with_type() {
@@ -457,7 +674,9 @@ mod tests {
             span: S,
             meta: (),
         }];
-        let mut table = TypeTable { types: std::collections::HashMap::new() };
+        let mut table = TypeTable {
+            types: std::collections::HashMap::new(),
+        };
         table.types.insert(S, (Type::Int, EffectRow::Empty));
 
         let ehir = annotate(&fcfg, &table);
@@ -479,7 +698,9 @@ mod tests {
             span: S,
             meta: (),
         }];
-        let table = TypeTable { types: std::collections::HashMap::new() };
+        let table = TypeTable {
+            types: std::collections::HashMap::new(),
+        };
 
         let ehir = annotate(&fcfg, &table);
         match &ehir[0] {

@@ -14,7 +14,9 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::common::Span;
-use crate::mir::witness::{BuiltinOp, MirWitness, WitnessArm, WitnessCallee, WitnessKind, WitnessParam};
+use crate::mir::witness::{
+    BuiltinOp, MirWitness, WitnessArm, WitnessCallee, WitnessKind, WitnessParam,
+};
 use crate::typeck::Type;
 
 mod builtin; // v0.75.70: builtin 类型推断（自 mod.rs 拆出）
@@ -95,7 +97,6 @@ pub struct HMInference {
     // (`mark_diagnosed` / `is_diagnosed` / `is_diagnosed_at`) —— 抽离到
     // `crate::typeck::hm::diag::DiagFilter`（双向定型专用基础设施）。
     // HM 公共 API 回归到 v0.75.86 之前的纯粹 HM 状态。
-
     /// v0.97: handle 推断帧 —— body 推断期间收集本层 effect 的 perform
     /// 位点（infer_perform 记录到帧顶）。栈语义与运行时 take 栈一致：
     /// 内层同标签 handle 的 body 位点归内层帧，其 handler 体位点归外层帧。
@@ -406,11 +407,7 @@ impl HMInference {
     /// v0.98: effect 签名预扫描 —— 收集全部 EffectSig witness（含嵌套）
     /// 并注册进 `effect_signatures`。重复声明且签名不一致 → 报错指向
     /// 第二处声明；一致 → 幂等放行（模块合并场景）。
-    fn precompute_effect_signatures(
-        &mut self,
-        exprs: &[MirWitness],
-        errors: &mut Vec<TypeError>,
-    ) {
+    fn precompute_effect_signatures(&mut self, exprs: &[MirWitness], errors: &mut Vec<TypeError>) {
         fn collect<'a>(w: &'a MirWitness, out: &mut Vec<&'a MirWitness>) {
             if let WitnessKind::EffectSig { .. } = &w.kind {
                 out.push(w);
@@ -479,8 +476,7 @@ impl HMInference {
         if defs.is_empty() {
             return;
         }
-        let mut table: HashMap<String, crate::mir::effect::EffectRow> =
-            self.fn_effect_rows.clone();
+        let mut table: HashMap<String, crate::mir::effect::EffectRow> = self.fn_effect_rows.clone();
         // v0.102: 关系行并入同一查找表（solve 目标树里的关系调用与
         // fn 调用同表解析；名字空间不重叠 —— 同名绑定 env 里只有一个）
         for (n, r) in self.rel_effect_rows.clone() {
@@ -559,7 +555,8 @@ impl HMInference {
                         // v0.102: project(fn, ...) 的行 = 被投函数的登记行
                         if n == "project" {
                             match args.first().map(|a| &a.kind) {
-                                Some(WitnessKind::Variable(f)) | Some(WitnessKind::FnDef { name: f, .. }) => {
+                                Some(WitnessKind::Variable(f))
+                                | Some(WitnessKind::FnDef { name: f, .. }) => {
                                     table.get(f).cloned().unwrap_or(EffectRow::Empty)
                                 }
                                 _ => EffectRow::Empty,
@@ -582,10 +579,12 @@ impl HMInference {
                 }
                 row
             }
-            WitnessKind::Closure { .. } | WitnessKind::FnDef { .. } | WitnessKind::UpdateDef { .. } => {
-                EffectRow::Empty
-            }
-            WitnessKind::LetBinding { value, init_body, .. } => {
+            WitnessKind::Closure { .. }
+            | WitnessKind::FnDef { .. }
+            | WitnessKind::UpdateDef { .. } => EffectRow::Empty,
+            WitnessKind::LetBinding {
+                value, init_body, ..
+            } => {
                 let v = match &value.kind {
                     WitnessKind::Closure { .. } | WitnessKind::FnDef { .. } => EffectRow::Empty,
                     _ => Self::tree_effect_row(value, ambient, table),
@@ -629,7 +628,10 @@ impl HMInference {
 
     /// v0.97: 效果行并集 —— 具名标签的集合并（保序去重）；Var（多态未知
     /// 行）不贡献具体标签，仅在全空时保留未知性。
-    fn union_effect_rows(a: &crate::mir::effect::EffectRow, b: &crate::mir::effect::EffectRow) -> crate::mir::effect::EffectRow {
+    fn union_effect_rows(
+        a: &crate::mir::effect::EffectRow,
+        b: &crate::mir::effect::EffectRow,
+    ) -> crate::mir::effect::EffectRow {
         let mut labels: Vec<String> = a.labels().into_iter().map(String::from).collect();
         for l in b.labels() {
             if !labels.iter().any(|x| x == l) {
@@ -650,7 +652,8 @@ impl HMInference {
     }
 
     /// v0.96: 把顶层残差行中的未处理效果定位到发起 witness（精准 span）。
-    fn localize_unhandled_effect(&self, w: &MirWitness, label: &str) -> TypeError {        let mut ambient = std::collections::HashSet::new();
+    fn localize_unhandled_effect(&self, w: &MirWitness, label: &str) -> TypeError {
+        let mut ambient = std::collections::HashSet::new();
         if let Some((span, via)) = self.find_unhandled(w, label, &mut ambient) {
             TypeError::EffectRowMismatch {
                 expected: "no unhandled effects — wrap in a matching `handle` block".to_string(),
@@ -694,7 +697,12 @@ impl HMInference {
                 }
                 None
             }
-            WitnessKind::Handle { effect, body, handler, .. } => {
+            WitnessKind::Handle {
+                effect,
+                body,
+                handler,
+                ..
+            } => {
                 ambient.insert(effect.clone());
                 let found = self
                     .find_unhandled(body, label, ambient)
@@ -709,8 +717,10 @@ impl HMInference {
                     }
                 }
                 if let WitnessCallee::Var(name) | WitnessCallee::Name(name) = callee
-                    && let Some(row) =
-                        self.fn_effect_rows.get(name).or_else(|| self.rel_effect_rows.get(name))
+                    && let Some(row) = self
+                        .fn_effect_rows
+                        .get(name)
+                        .or_else(|| self.rel_effect_rows.get(name))
                     && row.labels().contains(&label)
                     && !ambient.contains(label)
                 {
@@ -718,7 +728,9 @@ impl HMInference {
                 }
                 None
             }
-            WitnessKind::Closure { .. } | WitnessKind::FnDef { .. } | WitnessKind::UpdateDef { .. } => None,
+            WitnessKind::Closure { .. }
+            | WitnessKind::FnDef { .. }
+            | WitnessKind::UpdateDef { .. } => None,
             _ => {
                 for c in w.child_witnesses() {
                     if let Some(f) = self.find_unhandled(c, label, ambient) {
@@ -749,9 +761,12 @@ impl HMInference {
             }
             WitnessKind::Call { callee, args } => self.infer_call(callee, args, expr.span),
             // ── v0.102: 声明式范式（逻辑式/关系式）──
-            WitnessKind::RelDef { name, clauses, clause_wits, .. } => {
-                self.infer_rel_def(name, clauses, clause_wits, expr.span)
-            }
+            WitnessKind::RelDef {
+                name,
+                clauses,
+                clause_wits,
+                ..
+            } => self.infer_rel_def(name, clauses, clause_wits, expr.span),
             // v0.103: 命名 section 声明 —— body 求值并把 section 名登记到
             // env（运行时 h_prompt_section/h_document_section 把同名值绑定
             // 进环境，typeck 侧必须一致，否则 `compose_prompt("name")` 的
@@ -770,7 +785,9 @@ impl HMInference {
             // v0.103: 可观测性块 —— 包一层 body，效果行传播（span 不改类型）
             WitnessKind::Observe { config: _, body }
             | WitnessKind::Span {
-                name: _, tags: _, body,
+                name: _,
+                tags: _,
+                body,
             }
             | WitnessKind::Parallel { body } => {
                 let (_ty, body_row) = self.infer_expr(body)?;
@@ -779,7 +796,12 @@ impl HMInference {
             // v0.103: export 内部声明 —— 类型/效果与不加 export 时相同
             // （export 只影响跨模块可见性，属 import 收集侧的静态判定）。
             WitnessKind::Export { decl, .. } => self.infer_expr(decl),
-            WitnessKind::Solve { limit: _, query_vars, anon_vars, goal } => {
+            WitnessKind::Solve {
+                limit: _,
+                query_vars,
+                anon_vars,
+                goal,
+            } => {
                 // 查询变量注册新作用域（?x → fresh TypeVar），目标构建体
                 // 推断后其类型必须收敛为 Goal；投影类型 = 查询变量类型
                 // 按序组成（0 个 → nil，1 个 → 值，n ≥ 2 → 元组）。
@@ -796,10 +818,8 @@ impl HMInference {
                     self.env.add(a.clone(), tv);
                 }
                 let outcome = self.infer_expr(goal).map(|(gty, row)| {
-                    self.constraints.push(Constraint::Eq(
-                        Box::new(gty),
-                        Box::new(Type::Goal),
-                    ));
+                    self.constraints
+                        .push(Constraint::Eq(Box::new(gty), Box::new(Type::Goal)));
                     let elem = match var_tys.len() {
                         0 => Type::Nil,
                         1 => var_tys[0].clone(),
@@ -818,9 +838,9 @@ impl HMInference {
             WitnessKind::Closure { params, body, .. } => {
                 self.infer_closure(params, body.as_ref(), expr.span)
             }
-            WitnessKind::FnDef { name, params, body, .. } => {
-                self.infer_fn_def(Some(name.as_str()), params, body.as_ref(), expr.span)
-            }
+            WitnessKind::FnDef {
+                name, params, body, ..
+            } => self.infer_fn_def(Some(name.as_str()), params, body.as_ref(), expr.span),
             WitnessKind::Match { scrutinee, arms } => {
                 self.infer_match(scrutinee.as_ref(), arms, expr.span)
             }
@@ -879,7 +899,11 @@ impl HMInference {
             // 现在：迭代变量按 iterable 的元素类型绑定（list<T> → T；
             // string → char；TypeVar/dict 宽容绑定），body 在子作用域推断，
             // 效果行并入，循环整体为 Nil。
-            WitnessKind::Loop { var, iterable, body } => {
+            WitnessKind::Loop {
+                var,
+                iterable,
+                body,
+            } => {
                 let (iter_ty, iter_row) = self.infer_expr(iterable)?;
                 let elem_ty = match &iter_ty {
                     Type::List(elem) => elem.as_ref().clone(),
@@ -960,9 +984,7 @@ impl HMInference {
             | WitnessKind::EnumDef { .. }
             | WitnessKind::StructDef { .. }
             | WitnessKind::Import(_)
-            | WitnessKind::MacroDef { .. } => {
-                Ok((Type::Nil, crate::mir::effect::EffectRow::Empty))
-            }
+            | WitnessKind::MacroDef { .. } => Ok((Type::Nil, crate::mir::effect::EffectRow::Empty)),
             // v0.103: TEA 独立 `update(params) ... end` 声明（spec §9.6）——
             // 注册 `update` 名到 env（运行时 h_update_def 注册同名
             // `Value::Dict`），并推断真实的体。此前它在上面那组「纯声明」里
@@ -1018,20 +1040,12 @@ impl HMInference {
                 let (view_ty, _view_row) = self.infer_expr(view_w)?;
                 if let WitnessKind::Closure { body, .. } = &update_w.kind {
                     let mut ambient = std::collections::HashSet::new();
-                    let r = Self::tree_effect_row(
-                        body,
-                        &mut ambient,
-                        &self.fn_effect_rows.clone(),
-                    );
+                    let r = Self::tree_effect_row(body, &mut ambient, &self.fn_effect_rows.clone());
                     self.fn_effect_rows.insert(format!("{}.update", name), r);
                 }
                 if let WitnessKind::Closure { body, .. } = &view_w.kind {
                     let mut ambient = std::collections::HashSet::new();
-                    let r = Self::tree_effect_row(
-                        body,
-                        &mut ambient,
-                        &self.fn_effect_rows.clone(),
-                    );
+                    let r = Self::tree_effect_row(body, &mut ambient, &self.fn_effect_rows.clone());
                     self.fn_effect_rows.insert(format!("{}.view", name), r);
                 }
                 let msg_ty = self.fresh_type_var();
@@ -1097,9 +1111,7 @@ impl HMInference {
                 Ok((Type::Nil, crate::mir::effect::EffectRow::Empty))
             }
             // v0.80: Perform — 产生 effect，返回 fresh type var（由 handler 决定具体类型）。
-            WitnessKind::Perform { effect, args } => {
-                self.infer_perform(effect, args, expr.span)
-            }
+            WitnessKind::Perform { effect, args } => self.infer_perform(effect, args, expr.span),
             // v0.80: Handle — 捕获 effect，body 的 effect row 中移除被捕获的 effect。
             WitnessKind::Handle {
                 effect,
@@ -1120,9 +1132,7 @@ impl HMInference {
             }
             // v0.98: effect 签名声明 —— 纯类型层，无类型/效果贡献。
             //（签名本身已在 infer_program 预扫描注册进 effect_signatures。）
-            WitnessKind::EffectSig { .. } => {
-                Ok((Type::Nil, crate::mir::effect::EffectRow::Empty))
-            }
+            WitnessKind::EffectSig { .. } => Ok((Type::Nil, crate::mir::effect::EffectRow::Empty)),
         };
         // Shadow capture: store pre-substitution (Type, EffectRow) per witness node.
         // Keyed by Span (unique within a file). Used by export_type_table.
@@ -1155,10 +1165,8 @@ impl HMInference {
                 }
             }
             (EffectRow::Var(v), b) => {
-                self.constraints.push(Constraint::RowEq(
-                    EffectRow::Var(v),
-                    b.clone(),
-                ));
+                self.constraints
+                    .push(Constraint::RowEq(EffectRow::Var(v), b.clone()));
                 b
             }
         }
@@ -1195,10 +1203,7 @@ impl HMInference {
             for (i, (a_ty, p_ty)) in arg_tys.iter().zip(sig.params.iter()).enumerate() {
                 if !a_ty.compatible_with(p_ty) {
                     return Err(vec![TypeError::UnificationFailure {
-                        expected: format!(
-                            "perform `{}` arg {} : {:?}",
-                            effect, i, p_ty
-                        ),
+                        expected: format!("perform `{}` arg {} : {:?}", effect, i, p_ty),
                         got: format!("{:?}", a_ty),
                         span: Some(span),
                     }]);
@@ -1263,10 +1268,7 @@ impl HMInference {
             sites: Vec::new(),
         });
         let (body_ty, body_row) = self.infer_expr(body)?;
-        let frame = self
-            .handle_stack
-            .pop()
-            .expect("handle frame pushed above");
+        let frame = self.handle_stack.pop().expect("handle frame pushed above");
         let sites = frame.sites;
         let residual_row = match &body_row {
             crate::mir::effect::EffectRow::Var(_) => {
@@ -1355,9 +1357,7 @@ fn row_contains_concrete(row: &crate::mir::effect::EffectRow, label: &str) -> bo
     match row {
         crate::mir::effect::EffectRow::Empty => false,
         crate::mir::effect::EffectRow::Var(_) => false,
-        crate::mir::effect::EffectRow::Cons(h, t) => {
-            h == label || row_contains_concrete(t, label)
-        }
+        crate::mir::effect::EffectRow::Cons(h, t) => h == label || row_contains_concrete(t, label),
     }
 }
 
@@ -1400,8 +1400,7 @@ impl HMInference {
             return;
         }
         let mut sigs: HashMap<String, Vec<Type>> = self.rel_sigs.clone();
-        let mut rows: HashMap<String, crate::mir::effect::EffectRow> =
-            self.rel_effect_rows.clone();
+        let mut rows: HashMap<String, crate::mir::effect::EffectRow> = self.rel_effect_rows.clone();
         for _round in 0..8u32 {
             let mut changed = false;
             for def in &defs {
@@ -1483,9 +1482,10 @@ impl HMInference {
         match t {
             Term::Param(_) => Type::Any,
             Term::Val(v) => Self::ground_value_ty(v).unwrap_or(Type::Any),
-            Term::Cons(a, b) => {
-                Type::Cons(Box::new(Self::term_static_ty(a)), Box::new(Self::term_static_ty(b)))
-            }
+            Term::Cons(a, b) => Type::Cons(
+                Box::new(Self::term_static_ty(a)),
+                Box::new(Self::term_static_ty(b)),
+            ),
             Term::List(xs) => {
                 let elem = xs.first().map(Self::term_static_ty).unwrap_or(Type::Any);
                 Type::List(Box::new(elem))
@@ -1547,7 +1547,15 @@ impl HMInference {
                     Self::refine_cell(cell, &Self::term_static_ty(t));
                 }
             }
-            Self::rel_body_walk(&clause.body, name, &mut cells, sigs, rows, fn_rows, &mut row);
+            Self::rel_body_walk(
+                &clause.body,
+                name,
+                &mut cells,
+                sigs,
+                rows,
+                fn_rows,
+                &mut row,
+            );
         }
         (cells, row)
     }
@@ -1574,7 +1582,11 @@ impl HMInference {
                 if let Some(r) = rows.get(name) {
                     *row = Self::union_effect_rows(row, r);
                 }
-                let sig = if name == self_name { sigs.get(self_name) } else { sigs.get(name) };
+                let sig = if name == self_name {
+                    sigs.get(self_name)
+                } else {
+                    sigs.get(name)
+                };
                 if let Some(sig) = sig {
                     Self::refine_from_terms(args, sig, cells);
                 }
@@ -1637,8 +1649,11 @@ impl HMInference {
             let saved = self.env.clone();
             // 槽位类型表：先按头项结构把签名类型映射到 Param 槽位，
             // 未映射的槽位（体独有变量 / 匿名变量）取 fresh TypeVar。
-            let mut slot_tys: Vec<Type> =
-                clause.params.iter().map(|_| self.fresh_type_var()).collect();
+            let mut slot_tys: Vec<Type> = clause
+                .params
+                .iter()
+                .map(|_| self.fresh_type_var())
+                .collect();
             if let Some(sig) = &known_sig {
                 for (j, ht) in clause.head.iter().enumerate() {
                     if let (crate::rel::Term::Param(i), Some(st)) = (ht, sig.get(j))
@@ -1752,7 +1767,11 @@ mod tests {
     fn program_boundary_accepts_handled_perform() {
         let mut hm = HMInference::new();
         let errors = hm.infer_program(&[wit_handle("Ai", wit_perform("Ai"))]);
-        assert!(errors.is_empty(), "handle 兜住的 perform 不应报错: {:?}", errors);
+        assert!(
+            errors.is_empty(),
+            "handle 兜住的 perform 不应报错: {:?}",
+            errors
+        );
     }
 
     #[test]
@@ -1865,15 +1884,17 @@ mod tests {
     #[test]
     fn mutual_recursion_effect_propagates() {
         // a 调 b、b perform X：不动点后 a 的行含 X —— a() 无 handle 报错。
-        let def_a = wit_fn_named(
-            "a",
-            wit_call("b", Span::new(2, 1)),
-        );
+        let def_a = wit_fn_named("a", wit_call("b", Span::new(2, 1)));
         let def_b = wit_fn_named("b", wit_perform("X"));
         let call = wit_call("a", Span::new(4, 1));
         let mut hm = HMInference::new();
         let errors = hm.infer_program(&[def_a, def_b, call]);
-        assert_eq!(errors.len(), 1, "mutual recursion 的效果必须传播: {:?}", errors);
+        assert_eq!(
+            errors.len(),
+            1,
+            "mutual recursion 的效果必须传播: {:?}",
+            errors
+        );
         let msg = errors[0].to_string();
         assert!(msg.contains("X"), "错误应指名标签: {}", msg);
     }
@@ -1881,10 +1902,7 @@ mod tests {
     #[test]
     fn forward_task_reference_inside_handle_clean() {
         // 前向引用：main 定义时 helper 尚未出现，调用点在 handle 内 → 合法。
-        let def_main = wit_fn_named(
-            "main",
-            wit_handle("X", wit_call("helper", Span::new(2, 3))),
-        );
+        let def_main = wit_fn_named("main", wit_handle("X", wit_call("helper", Span::new(2, 3))));
         let def_helper = wit_fn_named("helper", wit_perform("X"));
         let mut hm = HMInference::new();
         let errors = hm.infer_program(&[def_main, def_helper]);
@@ -1976,11 +1994,7 @@ mod tests {
         // handler 返回 String；perform 结果标注为 Int 使用 → 连接后
         // Eq(Int, fresh) + Eq(fresh, String) 消解冲突报错。无连接时
         // perform 是自由 fresh var，Int 标注静默通过（漏检）。
-        let body = wit_let_typed(
-            "v",
-            Type::Int,
-            wit_perform_args("X", vec![wit_str("s")]),
-        );
+        let body = wit_let_typed("v", Type::Int, wit_perform_args("X", vec![wit_str("s")]));
         let program = [wit_handle("X", body)];
         let mut hm = HMInference::new();
         let errors = hm.infer_program(&program);
@@ -2165,7 +2179,11 @@ mod tests {
         let errs = typecheck_src(
             "effect Log(string)\nlet r = handle Log {\n  perform Log(\"x\")\n} {\n  \"ok\"\n}",
         );
-        assert!(errs.is_empty(), "无结果签名的 handler 返回不应受限: {:?}", errs);
+        assert!(
+            errs.is_empty(),
+            "无结果签名的 handler 返回不应受限: {:?}",
+            errs
+        );
     }
 
     #[test]
@@ -2241,10 +2259,7 @@ mod tests {
         };
         hm.infer_expr(&expr).unwrap();
         let (_subst, errors) = hm.solve_constraints();
-        assert!(
-            errors.is_empty(),
-            "if(int,int,int) should unify cleanly"
-        );
+        assert!(errors.is_empty(), "if(int,int,int) should unify cleanly");
     }
 
     #[test]

@@ -52,10 +52,7 @@ pub fn cmir_to_lmir(block: &CmirBlock) -> (Vec<LmirInst>, Vec<(String, MemLayout
 }
 
 /// 降维纯计算 CoreInst 为 LmirInst。
-fn lower_pure_inst(
-    inst: &CoreInst,
-    layouts: &mut Vec<(String, MemLayout)>,
-) -> Option<LmirInst> {
+fn lower_pure_inst(inst: &CoreInst, layouts: &mut Vec<(String, MemLayout)>) -> Option<LmirInst> {
     match inst {
         CoreInst::Const(reg, value) => {
             match value {
@@ -80,7 +77,7 @@ fn lower_pure_inst(
                     layouts.push(("String".to_string(), layout));
                     Some(LmirInst::ConstInt(*reg, 0)) // placeholder
                 }
-                Value::Nil => None, // nil 不占内存
+                Value::Nil => None,                     // nil 不占内存
                 _ => Some(LmirInst::ConstInt(*reg, 0)), // 其他值占位
             }
         }

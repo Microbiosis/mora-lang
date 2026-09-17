@@ -6,7 +6,10 @@ fn test_token_stream_inline_closure() {
     let src = "fn(f) f(21)";
     let tokens = Lexer::new(src).scan_tokens();
     for (i, t) in tokens.iter().enumerate() {
-        println!("[{} token={:?} line={} col={}", i, t.token_type, t.line, t.column);
+        println!(
+            "[{} token={:?} line={} col={}",
+            i, t.token_type, t.line, t.column
+        );
     }
 
     match ParserV3::compile(src) {
@@ -38,7 +41,11 @@ fn test_direct_compile_closure() {
             println!("ERR: {}", e);
         }
     }
-    assert!(result.is_ok(), "closure 'fn(f) f(21)' should compile but got error: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "closure 'fn(f) f(21)' should compile but got error: {:?}",
+        result.err()
+    );
 }
 
 #[test]

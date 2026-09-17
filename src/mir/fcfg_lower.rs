@@ -6,9 +6,9 @@
 //!
 //! 使用 EmitContext（与 emit.rs 和 lower.rs 共享）做寄存器分配和指令发射。
 
+use super::MirInst;
 use super::fcfg::{Block, Fcfg, MatchArm, Node, Pattern, QuasiquoteSegment, Reg};
 use super::lower::EmitContext;
-use super::MirInst;
 use crate::common::BinaryOp;
 use crate::value::Value;
 
@@ -46,15 +46,16 @@ fn max_reg_in_node(node: &Fcfg) -> usize {
     match node {
         Node::Literal { reg, .. } | Node::Variable { reg, .. } | Node::Expr { reg, .. } => *reg,
         Node::BinaryOp { dst, lhs, rhs, .. } => *dst.max(lhs).max(rhs),
-        Node::Call { dst, callee, args, .. } => {
-            args.iter().fold(*dst.max(callee), |m, r| m.max(*r))
-        }
-        Node::MethodCall { dst, receiver, args, .. } => {
-            args.iter().fold(*dst.max(receiver), |m, r| m.max(*r))
-        }
-        Node::Or { dst, lhs, rhs, .. } | Node::And { dst, lhs, rhs, .. } => {
-            *dst.max(lhs).max(rhs)
-        }
+        Node::Call {
+            dst, callee, args, ..
+        } => args.iter().fold(*dst.max(callee), |m, r| m.max(*r)),
+        Node::MethodCall {
+            dst,
+            receiver,
+            args,
+            ..
+        } => args.iter().fold(*dst.max(receiver), |m, r| m.max(*r)),
+        Node::Or { dst, lhs, rhs, .. } | Node::And { dst, lhs, rhs, .. } => *dst.max(lhs).max(rhs),
         Node::DynTrait { dst, src, .. } => *dst.max(src),
         Node::Prompt { dst, parts, .. } => parts.iter().fold(*dst, |m, r| m.max(*r)),
         Node::ClosureExpr { dst, body, .. } => *dst.max(&max_reg_in_nodes(&body.nodes)),
@@ -63,7 +64,13 @@ fn max_reg_in_node(node: &Fcfg) -> usize {
         Node::Index { dst, obj, idx, .. } => *dst.max(obj).max(idx),
         // dst 是 witness_to_fcfg 预分配的结果寄存器，必须计入 max ——
         // 否则本层 bump 分配器会覆盖它（寄存器安全契约见 lower_fcfg 文档）。
-        Node::If { cond, then, else_, dst, .. } => {
+        Node::If {
+            cond,
+            then,
+            else_,
+            dst,
+            ..
+        } => {
             let mut m = (*cond).max(*dst);
             m = m.max(max_reg_in_nodes(&then.nodes));
             if let Some(e) = else_ {
@@ -73,13 +80,20 @@ fn max_reg_in_node(node: &Fcfg) -> usize {
         }
         // dst 是 witness_to_fcfg 预分配的循环结果寄存器，必须计入 max ——
         // 否则本层 bump 分配器会覆盖它（寄存器安全契约见 lower_fcfg 文档）。
-        Node::While { cond, body, dst, .. } => *dst
+        Node::While {
+            cond, body, dst, ..
+        } => *dst
             .max(&max_reg_in_nodes(&cond.nodes))
             .max(&max_reg_in_nodes(&body.nodes)),
-        Node::For { iter, body, dst, .. } => {
-            (*iter).max(*dst).max(max_reg_in_nodes(&body.nodes))
-        }
-        Node::Match { dst, scrutinee, arms, .. } => {
+        Node::For {
+            iter, body, dst, ..
+        } => (*iter).max(*dst).max(max_reg_in_nodes(&body.nodes)),
+        Node::Match {
+            dst,
+            scrutinee,
+            arms,
+            ..
+        } => {
             let mut m = *dst.max(scrutinee);
             for arm in arms {
                 m = m.max(max_reg_in_nodes(&arm.body.nodes));
@@ -88,17 +102,17 @@ fn max_reg_in_node(node: &Fcfg) -> usize {
         }
         Node::Let { value, body, .. } => *value.max(&max_reg_in_nodes(&body.nodes)),
         Node::Assign { value, .. } => *value,
-        Node::IndexAssign { obj, idx, value, .. } => *obj.max(idx).max(value),
+        Node::IndexAssign {
+            obj, idx, value, ..
+        } => *obj.max(idx).max(value),
         Node::Perform { dst, args, .. } => args.iter().fold(*dst, |m, r| m.max(*r)),
         Node::Handle { body, handler, .. } => {
             max_reg_in_nodes(&body.nodes).max(max_reg_in_nodes(&handler.nodes))
         }
-        Node::Quasiquote { dst, segments, .. } => {
-            segments.iter().fold(*dst, |m, seg| match seg {
-                QuasiquoteSegment::Unquote(r) | QuasiquoteSegment::UnquoteSplice(r) => m.max(*r),
-                _ => m,
-            })
-        }
+        Node::Quasiquote { dst, segments, .. } => segments.iter().fold(*dst, |m, seg| match seg {
+            QuasiquoteSegment::Unquote(r) | QuasiquoteSegment::UnquoteSplice(r) => m.max(*r),
+            _ => m,
+        }),
         Node::Sequence { nodes, .. } => max_reg_in_nodes(nodes),
         _ => 0,
     }
@@ -125,17 +139,36 @@ fn lower_node(ctx: &mut EmitContext, node: &Fcfg) {
         Node::Variable { reg, name, .. } => {
             ctx.emit(MirInst::Var(*reg, name.clone()));
         }
-        Node::BinaryOp { dst, lhs, op, rhs, .. } => {
+        Node::BinaryOp {
+            dst, lhs, op, rhs, ..
+        } => {
             ctx.emit(MirInst::BinaryOp(*dst, *lhs, op.clone(), *rhs));
         }
-        Node::Call { dst, callee, callee_name, args, .. } => {
+        Node::Call {
+            dst,
+            callee,
+            callee_name,
+            args,
+            ..
+        } => {
             let name = callee_name
                 .clone()
                 .unwrap_or_else(|| format!("_r{}", callee));
             ctx.emit(MirInst::Call(*dst, name, args.clone()));
         }
-        Node::MethodCall { dst, receiver, method, args, .. } => {
-            ctx.emit(MirInst::MethodCall(*dst, *receiver, method.clone(), args.clone()));
+        Node::MethodCall {
+            dst,
+            receiver,
+            method,
+            args,
+            ..
+        } => {
+            ctx.emit(MirInst::MethodCall(
+                *dst,
+                *receiver,
+                method.clone(),
+                args.clone(),
+            ));
         }
         // Or/And → 短路求值（镜像 emit_or_w 的 JumpIf + NotEqual 模式）
         Node::Or { dst, lhs, rhs, .. } => {
@@ -154,7 +187,12 @@ fn lower_node(ctx: &mut EmitContext, node: &Fcfg) {
             let end = ctx.insts.len();
             ctx.patch_label_at(jump_idx, end);
         }
-        Node::DynTrait { dst, src, trait_name, .. } => {
+        Node::DynTrait {
+            dst,
+            src,
+            trait_name,
+            ..
+        } => {
             ctx.emit(MirInst::DynTrait {
                 dst: *dst,
                 src: *src,
@@ -165,7 +203,9 @@ fn lower_node(ctx: &mut EmitContext, node: &Fcfg) {
         Node::Prompt { dst, parts, .. } => {
             ctx.emit(MirInst::Prompt(*dst, parts.clone()));
         }
-        Node::ClosureExpr { dst, params, body, .. } => {
+        Node::ClosureExpr {
+            dst, params, body, ..
+        } => {
             let param_names: Vec<String> = params.iter().map(|p| p.name.clone()).collect();
             let body_mir = lower_body_function_with_return(ctx, body);
             ctx.emit(MirInst::Closure {
@@ -185,7 +225,13 @@ fn lower_node(ctx: &mut EmitContext, node: &Fcfg) {
         }
 
         // ── 控制流：If → JumpIfNot + Copy 结果合并（镜像 emit 路径）──
-        Node::If { cond, then, else_, dst, .. } => {
+        Node::If {
+            cond,
+            then,
+            else_,
+            dst,
+            ..
+        } => {
             ctx.emit(MirInst::JumpIfNot(*cond, 0));
             let jump_not_idx = ctx.insts.len() - 1;
             lower_block(ctx, then);
@@ -211,7 +257,9 @@ fn lower_node(ctx: &mut EmitContext, node: &Fcfg) {
         }
 
         // ── 控制流：While → Label + cond + JumpIfNot + body + Jump + post-patch ──
-        Node::While { cond, body, dst, .. } => {
+        Node::While {
+            cond, body, dst, ..
+        } => {
             let loop_start = ctx.insts.len();
             lower_block(ctx, cond);
             let cond_reg = cond.result.unwrap_or(0);
@@ -238,7 +286,13 @@ fn lower_node(ctx: &mut EmitContext, node: &Fcfg) {
         }
 
         // ── 控制流：For → index-based loop + post-patch ──
-        Node::For { var, iter, body, dst, .. } => {
+        Node::For {
+            var,
+            iter,
+            body,
+            dst,
+            ..
+        } => {
             // let __idx = 0
             let idx_reg = ctx.alloc_reg();
             ctx.emit(MirInst::Const(idx_reg, Value::Int(0)));
@@ -260,7 +314,12 @@ fn lower_node(ctx: &mut EmitContext, node: &Fcfg) {
             // 这是两条管线的语义分歧）。
             // 正确：`cond` 为真（idx >= len）→ 跳到 end；否则落入循环体。
             let cond_reg = ctx.alloc_reg();
-            ctx.emit(MirInst::BinaryOp(cond_reg, idx_reg, BinaryOp::GreaterEqual, len_reg));
+            ctx.emit(MirInst::BinaryOp(
+                cond_reg,
+                idx_reg,
+                BinaryOp::GreaterEqual,
+                len_reg,
+            ));
             ctx.emit(MirInst::JumpIf(cond_reg, 0));
             let exit_jump_idx = ctx.insts.len() - 1;
             // let var = iter[__idx]
@@ -295,7 +354,12 @@ fn lower_node(ctx: &mut EmitContext, node: &Fcfg) {
         }
 
         // ── Match → 单条 MatchExpr（镜像 emit_match_w：嵌套 arm MirFunction）──
-        Node::Match { dst, scrutinee, arms, .. } => {
+        Node::Match {
+            dst,
+            scrutinee,
+            arms,
+            ..
+        } => {
             lower_match(ctx, *scrutinee, *dst, arms);
         }
 
@@ -313,7 +377,9 @@ fn lower_node(ctx: &mut EmitContext, node: &Fcfg) {
         }
 
         // ── 绑定 ──
-        Node::Let { name, value, body, .. } => {
+        Node::Let {
+            name, value, body, ..
+        } => {
             ctx.emit(MirInst::Define(name.clone(), *value));
             // 镜像 emit_let_w：init_body（Nil 字面量块）先求值，
             // 结果经 __let_result 哨兵传出 —— let 表达式的值语义。
@@ -326,12 +392,16 @@ fn lower_node(ctx: &mut EmitContext, node: &Fcfg) {
         Node::Assign { name, value, .. } => {
             ctx.emit(MirInst::Assign(name.clone(), *value));
         }
-        Node::IndexAssign { obj, idx, value, .. } => {
+        Node::IndexAssign {
+            obj, idx, value, ..
+        } => {
             ctx.emit(MirInst::IndexAssign(*obj, *idx, *value));
         }
 
         // ── 声明 ──
-        Node::FnDef { name, params, body, .. } => {
+        Node::FnDef {
+            name, params, body, ..
+        } => {
             let param_names: Vec<String> = params.iter().map(|p| p.name.clone()).collect();
             let body_mir = lower_body_function_with_return(ctx, body);
             ctx.emit(MirInst::TaskDef {
@@ -351,14 +421,22 @@ fn lower_node(ctx: &mut EmitContext, node: &Fcfg) {
         }
 
         // ── 代数效果 ──
-        Node::Perform { dst, effect, args, .. } => {
+        Node::Perform {
+            dst, effect, args, ..
+        } => {
             ctx.emit(MirInst::Perform {
                 dst: *dst,
                 effect: effect.clone(),
                 args: args.clone(),
             });
         }
-        Node::Handle { effect, body, handler, k_param, .. } => {
+        Node::Handle {
+            effect,
+            body,
+            handler,
+            k_param,
+            ..
+        } => {
             let body_mir = lower_block_to_function(ctx, body);
             let handler_mir = lower_block_to_function(ctx, handler);
             let k_dst = ctx.alloc_reg();
@@ -378,7 +456,9 @@ fn lower_node(ctx: &mut EmitContext, node: &Fcfg) {
                 .map(|seg| match seg {
                     QuasiquoteSegment::Quote(s) => super::QuasiquoteSegment::Quote(s.clone()),
                     QuasiquoteSegment::Unquote(r) => super::QuasiquoteSegment::Unquote(*r),
-                    QuasiquoteSegment::UnquoteSplice(r) => super::QuasiquoteSegment::UnquoteSplice(*r),
+                    QuasiquoteSegment::UnquoteSplice(r) => {
+                        super::QuasiquoteSegment::UnquoteSplice(*r)
+                    }
                 })
                 .collect();
             ctx.emit(MirInst::Quasiquote {
@@ -443,7 +523,12 @@ fn lower_node(ctx: &mut EmitContext, node: &Fcfg) {
                 method_bodies: vec![],
             });
         }
-        Node::ImplDef { trait_name, for_type, methods, .. } => {
+        Node::ImplDef {
+            trait_name,
+            for_type,
+            methods,
+            ..
+        } => {
             let fndefs: Vec<super::orchestrate::MirFnDef> = methods
                 .iter()
                 .map(|(n, b)| super::orchestrate::MirFnDef {
@@ -462,7 +547,9 @@ fn lower_node(ctx: &mut EmitContext, node: &Fcfg) {
                 method_bodies: vec![],
             });
         }
-        Node::MacroDef { name, params, body, .. } => {
+        Node::MacroDef {
+            name, params, body, ..
+        } => {
             let body_mir = lower_block_to_function(ctx, body);
             ctx.emit(MirInst::MacroDef {
                 name: name.clone(),
@@ -498,7 +585,9 @@ fn lower_node(ctx: &mut EmitContext, node: &Fcfg) {
                 variants: vars,
             });
         }
-        Node::UpdateDef { name, params, body, .. } => {
+        Node::UpdateDef {
+            name, params, body, ..
+        } => {
             let param_names: Vec<String> = params.iter().map(|p| p.name.clone()).collect();
             let body_mir = lower_block_to_function(ctx, body);
             ctx.emit(MirInst::UpdateDef {
@@ -554,7 +643,9 @@ fn lower_node(ctx: &mut EmitContext, node: &Fcfg) {
                 body: Box::new(body_mir),
             });
         }
-        Node::Span { name, tags, body, .. } => {
+        Node::Span {
+            name, tags, body, ..
+        } => {
             let body_mir = lower_block_to_function(ctx, body);
             ctx.emit(MirInst::Span {
                 name: name.clone(),
@@ -584,7 +675,13 @@ fn lower_node(ctx: &mut EmitContext, node: &Fcfg) {
                 clauses: clauses.clone(),
             });
         }
-        Node::Solve { limit, query_vars, anon_vars, goal, .. } => {
+        Node::Solve {
+            limit,
+            query_vars,
+            anon_vars,
+            goal,
+            ..
+        } => {
             let goal_mir = lower_block_to_function(ctx, goal);
             let dst = ctx.alloc_reg();
             ctx.emit(MirInst::Solve {
@@ -597,13 +694,19 @@ fn lower_node(ctx: &mut EmitContext, node: &Fcfg) {
         }
 
         // ── 编排 ──
-        Node::Orchestrate { input_var, result_var, .. } => {
+        Node::Orchestrate {
+            input_var,
+            result_var,
+            ..
+        } => {
             // FCFG OrchestrateKind → MirOrchestrateKind 转换需要 agent 定义，
             // 桥接层暂用 Sequential 占位。
             ctx.emit(MirInst::Orchestrate {
                 input_var: input_var.clone(),
                 result_var: result_var.clone(),
-                kind: Box::new(super::orchestrate::MirOrchestrateKind::Sequential { agents: vec![] }),
+                kind: Box::new(super::orchestrate::MirOrchestrateKind::Sequential {
+                    agents: vec![],
+                }),
             });
         }
 
@@ -643,7 +746,9 @@ fn lower_block_to_function(ctx: &mut EmitContext, block: &Block<()>) -> super::M
 fn lower_body_function_with_return(ctx: &mut EmitContext, block: &Block<()>) -> super::MirFunction {
     let mut func = lower_block_to_function(ctx, block);
     if func.body.is_empty() || !matches!(func.body.last(), Some(MirInst::Return(_))) {
-        let result_reg = block.result.unwrap_or_else(|| func.n_regs.saturating_sub(1));
+        let result_reg = block
+            .result
+            .unwrap_or_else(|| func.n_regs.saturating_sub(1));
         func.body.push(MirInst::Return(Some(result_reg)));
     }
     func
@@ -654,7 +759,8 @@ fn lower_match(ctx: &mut EmitContext, scrutinee: Reg, dst: Reg, arms: &[MatchArm
     // 镜像 emit_match_w：单条 MatchExpr，arm body 为嵌套 MirFunction
     //（末尾带 Return）。output_reg 统一为 dst — 所有 arm 写同一寄存器，
     // 消费者（let/Define/嵌套表达式）读 dst（与 inst.dst() 约定一致）。
-    let mir_arms: Vec<super::MatchArmInst> = arms.iter()
+    let mir_arms: Vec<super::MatchArmInst> = arms
+        .iter()
         .map(|arm| {
             let pat_str = fcfg_pattern_to_string(&arm.pattern);
             let mut body_fn = lower_block_to_function(ctx, &arm.body);
@@ -677,7 +783,10 @@ fn lower_match(ctx: &mut EmitContext, scrutinee: Reg, dst: Reg, arms: &[MatchArm
         })
         .collect();
     let _ = ctx.alloc_reg(); // 镜像 emit_match_w：结果寄存器槽位保留
-    ctx.emit(MirInst::MatchExpr { val: scrutinee, arms: mir_arms });
+    ctx.emit(MirInst::MatchExpr {
+        val: scrutinee,
+        arms: mir_arms,
+    });
 }
 
 /// fcfg::Pattern → 字符串（镜像 lower.rs::pattern_to_string 的运行时
@@ -707,7 +816,11 @@ fn fcfg_pattern_to_string(pattern: &Pattern) -> String {
         Pattern::ListVec { head, tail } => {
             let parts: Vec<String> = head.iter().map(fcfg_pattern_to_string).collect();
             match tail {
-                Some(t) => format!("list:vector:[{},..{}]", parts.join(","), fcfg_pattern_to_string(t)),
+                Some(t) => format!(
+                    "list:vector:[{},..{}]",
+                    parts.join(","),
+                    fcfg_pattern_to_string(t)
+                ),
                 None => format!("list:vector:[{}]", parts.join(",")),
             }
         }

@@ -29,8 +29,18 @@ fn run_via_mir(source: &str) -> Result<(), String> {
     let mut interp = Interpreter::new();
     let mut env = interp.take_env();
     let func_arc = std::sync::Arc::new(func);
-    run_mir(&func_arc, &mut interp, &mut env, &mut mora::mir::effect::Effects::new())?;
-    run_main_task(&func_arc, &mut interp, &mut env, &mut mora::mir::effect::Effects::new())
+    run_mir(
+        &func_arc,
+        &mut interp,
+        &mut env,
+        &mut mora::mir::effect::Effects::new(),
+    )?;
+    run_main_task(
+        &func_arc,
+        &mut interp,
+        &mut env,
+        &mut mora::mir::effect::Effects::new(),
+    )
 }
 
 // ─── 1. 语法 (syntax) ───────────────────────────────────────────────
@@ -125,14 +135,16 @@ fn runtime_transaction_success_path_via_mir() {
             MirInst::Define("x".to_string(), 0),
         ],
         n_regs: 1,
-    
-            ..Default::default()};
+
+        ..Default::default()
+    };
     let compensation = mora::mir::MirFunction {
         params: Vec::new(),
         body: vec![MirInst::Const(0, mora::value::Value::Int(0))],
         n_regs: 1,
-    
-            ..Default::default()};
+
+        ..Default::default()
+    };
     let func = MirFunction {
         params: Vec::new(),
         body: vec![MirInst::Transaction {
@@ -145,7 +157,13 @@ fn runtime_transaction_success_path_via_mir() {
     let mut interp = Interpreter::new();
     let mut env = interp.take_env();
     let func_arc = std::sync::Arc::new(func);
-    run_mir(&func_arc, &mut interp, &mut env, &mut mora::mir::effect::Effects::new()).expect("transaction success path via MIR");
+    run_mir(
+        &func_arc,
+        &mut interp,
+        &mut env,
+        &mut mora::mir::effect::Effects::new(),
+    )
+    .expect("transaction success path via MIR");
     assert_eq!(
         env.get("x"),
         Some(mora::value::Value::Int(2)),
@@ -164,14 +182,16 @@ fn runtime_transaction_rollback_path_via_mir() {
             MirInst::Rollback,
         ],
         n_regs: 1,
-    
-            ..Default::default()};
+
+        ..Default::default()
+    };
     let compensation = mora::mir::MirFunction {
         params: Vec::new(),
         body: vec![MirInst::Const(0, mora::value::Value::Int(99))],
         n_regs: 1,
-    
-            ..Default::default()};
+
+        ..Default::default()
+    };
     let func = MirFunction {
         params: Vec::new(),
         body: vec![MirInst::Transaction {
@@ -184,7 +204,12 @@ fn runtime_transaction_rollback_path_via_mir() {
     let mut interp = Interpreter::new();
     let mut env = interp.take_env();
     let func_arc = std::sync::Arc::new(func);
-    let result = run_mir(&func_arc, &mut interp, &mut env, &mut mora::mir::effect::Effects::new());
+    let result = run_mir(
+        &func_arc,
+        &mut interp,
+        &mut env,
+        &mut mora::mir::effect::Effects::new(),
+    );
     assert!(result.is_err(), "rollback must surface as Err");
     assert!(
         result.as_ref().err().unwrap().contains("rolled back"),
@@ -243,8 +268,9 @@ fn mk_list_worker(items: Vec<f64>) -> MirFunction {
         params: Vec::new(),
         body,
         n_regs: r,
-    
-            ..Default::default()}
+
+        ..Default::default()
+    }
 }
 
 fn wrap_worker(name: &str, body: MirFunction) -> MirFunction {
@@ -274,9 +300,21 @@ fn merge_with_grow_only_set_merges_worker_outputs() {
     )])));
 
     let w1 = std::sync::Arc::new(wrap_worker("w1", mk_list_worker(vec![1.0, 2.0])));
-    run_mir(&w1, &mut interp, &mut env, &mut mora::mir::effect::Effects::new()).expect("worker1 run");
+    run_mir(
+        &w1,
+        &mut interp,
+        &mut env,
+        &mut mora::mir::effect::Effects::new(),
+    )
+    .expect("worker1 run");
     let w2 = std::sync::Arc::new(wrap_worker("w2", mk_list_worker(vec![2.0, 3.0])));
-    run_mir(&w2, &mut interp, &mut env, &mut mora::mir::effect::Effects::new()).expect("worker2 run");
+    run_mir(
+        &w2,
+        &mut interp,
+        &mut env,
+        &mut mora::mir::effect::Effects::new(),
+    )
+    .expect("worker2 run");
 
     let vals: Vec<f64> = match env.get("x") {
         Some(Value::List(l)) => l
@@ -301,9 +339,21 @@ fn merge_with_lww_default_overwrites() {
     let mut interp = Interpreter::new();
     let mut env = interp.take_env();
     let w1 = std::sync::Arc::new(wrap_worker("w1", mk_list_worker(vec![1.0, 2.0])));
-    run_mir(&w1, &mut interp, &mut env, &mut mora::mir::effect::Effects::new()).expect("worker1 run");
+    run_mir(
+        &w1,
+        &mut interp,
+        &mut env,
+        &mut mora::mir::effect::Effects::new(),
+    )
+    .expect("worker1 run");
     let w2 = std::sync::Arc::new(wrap_worker("w2", mk_list_worker(vec![2.0, 3.0])));
-    run_mir(&w2, &mut interp, &mut env, &mut mora::mir::effect::Effects::new()).expect("worker2 run");
+    run_mir(
+        &w2,
+        &mut interp,
+        &mut env,
+        &mut mora::mir::effect::Effects::new(),
+    )
+    .expect("worker2 run");
     let vals: Vec<f64> = match env.get("x") {
         Some(Value::List(l)) => l
             .iter()

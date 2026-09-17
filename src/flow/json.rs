@@ -213,7 +213,9 @@ fn parse_json_number(s: &str) -> Result<(Value, usize), String> {
             Ok((Value::Float(num), i))
         }
     } else {
-        let num: f64 = num_str.parse().map_err(|_| format!("Invalid number: {}", num_str))?;
+        let num: f64 = num_str
+            .parse()
+            .map_err(|_| format!("Invalid number: {}", num_str))?;
         Ok((Value::Float(num), i))
     }
 }
@@ -292,25 +294,21 @@ pub fn value_to_json(value: &Value) -> String {
         Value::TeaCmd(cmd) => match cmd {
             crate::tea::Cmd::None => "null".to_string(),
             crate::tea::Cmd::Batch(items) => {
-                let parts: Vec<String> = items
-                    .iter()
-                    .map(|c| value_to_json(&c.to_value()))
-                    .collect();
+                let parts: Vec<String> =
+                    items.iter().map(|c| value_to_json(&c.to_value())).collect();
                 format!("[{}]", parts.join(","))
             }
             crate::tea::Cmd::Perform { effect, args } => {
-                let arg_jsons: Vec<String> =
-                    args.iter().map(value_to_json).collect();
+                let arg_jsons: Vec<String> = args.iter().map(value_to_json).collect();
                 format!(
                     "{{\"kind\":\"Perform\",\"effect\":\"{}\",\"args\":[{}}}",
                     effect,
                     arg_jsons.join(",")
                 )
             }
-            crate::tea::Cmd::Dispatch(msg) => format!(
-                "{{\"kind\":\"Dispatch\",\"msg\":{}}}",
-                value_to_json(msg)
-            ),
+            crate::tea::Cmd::Dispatch(msg) => {
+                format!("{{\"kind\":\"Dispatch\",\"msg\":{}}}", value_to_json(msg))
+            }
         },
         Value::TeaMsg(msg) => value_to_json(&msg.to_value()),
         // v0.102: 声明式范式值 — 无 JSON 形态，序列化为描述串
@@ -418,10 +416,7 @@ mod tests {
         let v = json_to_value("999999999999999999999").unwrap();
         match v {
             Value::Float(_) => {} // 期望 Float
-            other => panic!(
-                "expected Float for overflow integer, got {:?}",
-                other
-            ),
+            other => panic!("expected Float for overflow integer, got {:?}", other),
         }
     }
 

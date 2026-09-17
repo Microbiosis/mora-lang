@@ -17,10 +17,7 @@ pub fn call_linalg_method(method: &str, args: &[Value]) -> Result<Value, String>
             let a = expect_f64_vec(args.first(), "linalg.cross")?;
             let b = expect_f64_vec(args.get(1), "linalg.cross")?;
             Ok(Value::List(
-                cross(&a, &b)
-                    .into_iter()
-                    .map(Value::Float)
-                    .collect(),
+                cross(&a, &b).into_iter().map(Value::Float).collect(),
             ))
         }
         "norm" => {
@@ -73,13 +70,13 @@ fn expect_f64_matrix(arg: Option<&Value>, ctx: &str) -> Result<Vec<Vec<f64>>, St
         Value::List(rows) => rows
             .iter()
             .map(|row| match row {
-                    Value::List(xs) => xs
-                        .iter()
-                        .map(|x| as_f64(x).ok_or_else(|| format!("{}: non-numeric", ctx)))
-                        .collect(),
-                    _ => Err(format!("{}: matrix rows must be lists", ctx)),
-                })
-                .collect(),
+                Value::List(xs) => xs
+                    .iter()
+                    .map(|x| as_f64(x).ok_or_else(|| format!("{}: non-numeric", ctx)))
+                    .collect(),
+                _ => Err(format!("{}: matrix rows must be lists", ctx)),
+            })
+            .collect(),
         _ => Err(format!("{}: matrix argument required", ctx)),
     }
 }
@@ -179,16 +176,32 @@ mod tests {
 
     #[test]
     fn dot_basic() {
-        let a = Value::List(vec![Value::Float(1.0), Value::Float(2.0), Value::Float(3.0)]);
-        let b = Value::List(vec![Value::Float(4.0), Value::Float(5.0), Value::Float(6.0)]);
+        let a = Value::List(vec![
+            Value::Float(1.0),
+            Value::Float(2.0),
+            Value::Float(3.0),
+        ]);
+        let b = Value::List(vec![
+            Value::Float(4.0),
+            Value::Float(5.0),
+            Value::Float(6.0),
+        ]);
         let r = call_linalg_method("dot", &[a, b]).unwrap();
         assert!(matches!(r, Value::Float(x) if (x - 32.0).abs() < 1e-9));
     }
 
     #[test]
     fn cross_3d() {
-        let x = Value::List(vec![Value::Float(1.0), Value::Float(0.0), Value::Float(0.0)]);
-        let y = Value::List(vec![Value::Float(0.0), Value::Float(1.0), Value::Float(0.0)]);
+        let x = Value::List(vec![
+            Value::Float(1.0),
+            Value::Float(0.0),
+            Value::Float(0.0),
+        ]);
+        let y = Value::List(vec![
+            Value::Float(0.0),
+            Value::Float(1.0),
+            Value::Float(0.0),
+        ]);
         let r = call_linalg_method("cross", &[x, y]).unwrap();
         if let Value::List(v) = &r
             && let [Value::Float(a), Value::Float(b), Value::Float(c)] = &v[..]
@@ -228,8 +241,16 @@ mod tests {
     #[test]
     fn transpose_basic() {
         let a = Value::List(vec![
-            Value::List(vec![Value::Float(1.0), Value::Float(2.0), Value::Float(3.0)]),
-            Value::List(vec![Value::Float(4.0), Value::Float(5.0), Value::Float(6.0)]),
+            Value::List(vec![
+                Value::Float(1.0),
+                Value::Float(2.0),
+                Value::Float(3.0),
+            ]),
+            Value::List(vec![
+                Value::Float(4.0),
+                Value::Float(5.0),
+                Value::Float(6.0),
+            ]),
         ]);
         let r = call_linalg_method("transpose", &[a]).unwrap();
         if let Value::List(rows) = r {

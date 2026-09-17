@@ -47,8 +47,7 @@ pub(super) fn call_method_numeric(
     let mut full_args = Vec::with_capacity(args.len() + 1);
     full_args.push(recv.clone());
     full_args.extend_from_slice(args);
-    let result =
-        crate::interpreter::builtins::math::call_math_method(method, &full_args)?;
+    let result = crate::interpreter::builtins::math::call_math_method(method, &full_args)?;
     // 对 Int 输入：abs/sign/signum/floor/ceil/round 保留 Int；其他转 Float
     if is_int
         && matches!(
@@ -94,19 +93,19 @@ pub(super) fn call_method_bigint(
         "to_int" => {
             // 仅当 n 适合 i64 时才转；否则返回错误（用户用 to_string 取文本）
             if n.bits() < 64 {
-                let v: i64 = n.try_into().map_err(|_| {
-                    "BigInt.to_int: value exceeds i64 range".to_string()
-                })?;
+                let v: i64 = n
+                    .try_into()
+                    .map_err(|_| "BigInt.to_int: value exceeds i64 range".to_string())?;
                 Ok(Value::Int(v))
             } else {
                 Err("BigInt.to_int: value exceeds i64 range".to_string())
             }
         }
-        "to_float" => {
-            n.to_string().parse::<f64>().map(Value::Float).map_err(|_| {
-                "BigInt.to_float: value cannot be represented as f64".to_string()
-            })
-        }
+        "to_float" => n
+            .to_string()
+            .parse::<f64>()
+            .map(Value::Float)
+            .map_err(|_| "BigInt.to_float: value cannot be represented as f64".to_string()),
         _ => Err(format!("BigInt has no method: {}", method)),
     }
 }

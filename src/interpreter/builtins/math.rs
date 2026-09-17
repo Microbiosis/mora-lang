@@ -39,15 +39,19 @@ pub fn call_math_method(method: &str, args: &[Value]) -> Result<Value, String> {
 
         // ── 取整/舍入（保持类型：Int 输入 → Int，Float 输入 → Float）──
         "abs" => unary_preserve(args, |x| x.abs(), |x| x.abs()),
-        "sign" => unary_preserve(args, |x| x.signum(), |x| {
-            if x > 0.0 {
-                1.0
-            } else if x < 0.0 {
-                -1.0
-            } else {
-                0.0
-            }
-        }),
+        "sign" => unary_preserve(
+            args,
+            |x| x.signum(),
+            |x| {
+                if x > 0.0 {
+                    1.0
+                } else if x < 0.0 {
+                    -1.0
+                } else {
+                    0.0
+                }
+            },
+        ),
         "floor" => unary_preserve(args, |x| x, |x| x.floor()),
         "ceil" => unary_preserve(args, |x| x, |x| x.ceil()),
         "round" => unary_preserve(args, |x| x, |x| x.round()),
@@ -113,9 +117,10 @@ fn expect_number(arg: Option<&Value>, ns: &str) -> Result<f64, String> {
     match arg {
         Some(Value::Int(n)) => Ok(*n as f64),
         Some(Value::Float(n)) => Ok(*n),
-        Some(Value::BigInt(n)) => n.to_string().parse::<f64>().map_err(|_| {
-            format!("{}.*: BigInt out of f64 range", ns)
-        }),
+        Some(Value::BigInt(n)) => n
+            .to_string()
+            .parse::<f64>()
+            .map_err(|_| format!("{}.*: BigInt out of f64 range", ns)),
         _ => Err(format!("{}: numeric argument required", ns)),
     }
 }

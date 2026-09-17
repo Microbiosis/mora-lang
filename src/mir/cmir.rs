@@ -49,10 +49,7 @@ pub enum CmirNode {
         barrier: SyncBarrier,
     },
     /// 收集 Agent 结果。
-    AgentCollect {
-        agent: String,
-        result: Reg,
-    },
+    AgentCollect { agent: String, result: Reg },
 
     // ── 效果处理（并发感知）──
     /// 效果处理器安装 — 并发安全策略由 ConcurrencyMode 决定。
@@ -73,9 +70,7 @@ pub enum CmirNode {
         supersteps: Vec<CmirBlock>,
     },
     /// MoA (Mixture-of-Agents) → 并行 propose + aggregate。
-    MoAPipeline {
-        layers: Vec<MoALayer>,
-    },
+    MoAPipeline { layers: Vec<MoALayer> },
     /// MoE (Mixture-of-Experts) → router + sparse activation。
     MoERouter {
         experts: Vec<String>,
@@ -92,11 +87,7 @@ pub enum CmirNode {
         lanes: usize,
     },
     /// 向量归约：将 src 归约为标量。
-    SimdReduce {
-        dst: Reg,
-        src: Reg,
-        op: ReduceOp,
-    },
+    SimdReduce { dst: Reg, src: Reg, op: ReduceOp },
 }
 
 // ===================================================================

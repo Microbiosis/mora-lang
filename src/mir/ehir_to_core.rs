@@ -15,13 +15,17 @@
 use crate::mir::core::{
     BlockId, CoreBlock, CoreFunction, CoreInst, CoreTerminator, EffectLabel, EnumMatchArm,
 };
-use crate::mir::fcfg::{Ehir, EhirBlock, Node};
 use crate::mir::effect::EffectRow;
+use crate::mir::fcfg::{Ehir, EhirBlock, Node};
 use crate::typeck::Type;
 use crate::value::Value;
 
 /// 将 EHIR 节点列表降维为 CoreFunction。
-pub fn ehir_to_core(nodes: &[Ehir], params: Vec<(String, Type)>, effects: EffectRow) -> CoreFunction {
+pub fn ehir_to_core(
+    nodes: &[Ehir],
+    params: Vec<(String, Type)>,
+    effects: EffectRow,
+) -> CoreFunction {
     let mut ctx = CoreContext::new();
     for node in nodes {
         lower_node(&mut ctx, node);
@@ -89,16 +93,28 @@ fn lower_node(ctx: &mut CoreContext, node: &Ehir) {
         Node::Variable { reg, name, .. } => {
             ctx.emit(CoreInst::EnvLoad(*reg, name.clone()));
         }
-        Node::BinaryOp { dst, lhs, op, rhs, .. } => {
+        Node::BinaryOp {
+            dst, lhs, op, rhs, ..
+        } => {
             ctx.emit(CoreInst::BinaryOp(*dst, *lhs, op.clone(), *rhs));
         }
         // Or/And → Core 层降维为短路求值的控制流（Branch + 常量合并）
         Node::Or { dst, lhs, rhs, .. } => {
             // 简化：非短路直接 BinaryOp（NotEqual 语义与 emit_or_w 一致）
-            ctx.emit(CoreInst::BinaryOp(*dst, *lhs, crate::common::BinaryOp::NotEqual, *rhs));
+            ctx.emit(CoreInst::BinaryOp(
+                *dst,
+                *lhs,
+                crate::common::BinaryOp::NotEqual,
+                *rhs,
+            ));
         }
         Node::And { dst, lhs, rhs, .. } => {
-            ctx.emit(CoreInst::BinaryOp(*dst, *lhs, crate::common::BinaryOp::Equal, *rhs));
+            ctx.emit(CoreInst::BinaryOp(
+                *dst,
+                *lhs,
+                crate::common::BinaryOp::Equal,
+                *rhs,
+            ));
         }
         // DynTrait/Prompt → Core 层降维为透传调用
         Node::DynTrait { dst, src, .. } => {
@@ -109,7 +125,9 @@ fn lower_node(ctx: &mut CoreContext, node: &Ehir) {
             let prompt_callee = ctx.alloc_reg();
             ctx.emit(CoreInst::Call(*dst, prompt_callee, parts.clone()));
         }
-        Node::ClosureExpr { dst, params, body, .. } => {
+        Node::ClosureExpr {
+            dst, params, body, ..
+        } => {
             let param_names: Vec<String> = params.iter().map(|p| p.name.clone()).collect();
             let core_body = lower_block_to_core(ctx, body);
             ctx.emit(CoreInst::ClosureCreate {
@@ -119,7 +137,13 @@ fn lower_node(ctx: &mut CoreContext, node: &Ehir) {
                 body: core_body,
             });
         }
-        Node::Call { dst, callee, callee_name, args, .. } => {
+        Node::Call {
+            dst,
+            callee,
+            callee_name,
+            args,
+            ..
+        } => {
             // 已知函数名 → 直接 Call，否则 → ClosureCall
             if callee_name.is_some() {
                 ctx.emit(CoreInst::Call(*dst, *callee, args.clone()));
@@ -127,7 +151,13 @@ fn lower_node(ctx: &mut CoreContext, node: &Ehir) {
                 ctx.emit(CoreInst::ClosureCall(*dst, *callee, args.clone()));
             }
         }
-        Node::MethodCall { dst, receiver, method, args, .. } => {
+        Node::MethodCall {
+            dst,
+            receiver,
+            method,
+            args,
+            ..
+        } => {
             // 方法调用降维为函数调用：callee = receiver, args = [receiver, ...args]
             let mut full_args = vec![*receiver];
             full_args.extend_from_slice(args);
@@ -145,10 +175,16 @@ fn lower_node(ctx: &mut CoreContext, node: &Ehir) {
         }
 
         // ── 控制流 ──
-        Node::If { cond, then, else_, .. } => {
+        Node::If {
+            cond, then, else_, ..
+        } => {
             // 降维为 Branch + 两个基本块
             let then_id = ctx.next_block_id + 1;
-            let else_id = if else_.is_some() { ctx.next_block_id + 2 } else { ctx.next_block_id + 3 };
+            let else_id = if else_.is_some() {
+                ctx.next_block_id + 2
+            } else {
+                ctx.next_block_id + 3
+            };
             let end_id = ctx.next_block_id + 3;
 
             ctx.emit(CoreInst::Branch {
@@ -172,7 +208,9 @@ fn lower_node(ctx: &mut CoreContext, node: &Ehir) {
             }
             ctx.flush_block(CoreTerminator::Jump(end_id));
         }
-        Node::While { cond, body, dst, .. } => {
+        Node::While {
+            cond, body, dst, ..
+        } => {
             let cond_id = ctx.next_block_id;
             let body_id = ctx.next_block_id + 1;
             let end_id = ctx.next_block_id + 2;
@@ -200,7 +238,13 @@ fn lower_node(ctx: &mut CoreContext, node: &Ehir) {
             // emit_while_w / fcfg_lower 的同一契约）。
             ctx.emit(CoreInst::Const(*dst, Value::Nil));
         }
-        Node::For { var, iter, body, dst, .. } => {
+        Node::For {
+            var,
+            iter,
+            body,
+            dst,
+            ..
+        } => {
             // index-based loop
             let idx_reg = ctx.alloc_reg();
             ctx.emit(CoreInst::Const(idx_reg, Value::Int(0)));
@@ -216,8 +260,10 @@ fn lower_node(ctx: &mut CoreContext, node: &Ehir) {
 
             let cond_reg = ctx.alloc_reg();
             ctx.emit(CoreInst::BinaryOp(
-                cond_reg, idx_reg,
-                crate::common::BinaryOp::GreaterEqual, len_reg,
+                cond_reg,
+                idx_reg,
+                crate::common::BinaryOp::GreaterEqual,
+                len_reg,
             ));
             ctx.emit(CoreInst::Branch {
                 cond: cond_reg,
@@ -236,8 +282,10 @@ fn lower_node(ctx: &mut CoreContext, node: &Ehir) {
             ctx.emit(CoreInst::EnvStore(var.clone(), val_reg));
             lower_block(ctx, body);
             ctx.emit(CoreInst::BinaryOp(
-                idx_reg, idx_reg,
-                crate::common::BinaryOp::Add, one,
+                idx_reg,
+                idx_reg,
+                crate::common::BinaryOp::Add,
+                one,
             ));
             ctx.emit(CoreInst::Jump(loop_start));
             ctx.flush_block(CoreTerminator::Jump(loop_start));
@@ -246,7 +294,12 @@ fn lower_node(ctx: &mut CoreContext, node: &Ehir) {
             // emit_loop_w / fcfg_lower 的同一契约）。
             ctx.emit(CoreInst::Const(*dst, Value::Nil));
         }
-        Node::Match { dst, scrutinee, arms, .. } => {
+        Node::Match {
+            dst,
+            scrutinee,
+            arms,
+            ..
+        } => {
             // 降维为 EnumMatch（dst 作为统一结果寄存器透传）
             let core_arms: Vec<EnumMatchArm> = arms
                 .iter()
@@ -271,19 +324,25 @@ fn lower_node(ctx: &mut CoreContext, node: &Ehir) {
         }
 
         // ── 绑定 ──
-        Node::Let { name, value, body, .. } => {
+        Node::Let {
+            name, value, body, ..
+        } => {
             ctx.emit(CoreInst::EnvStore(name.clone(), *value));
             lower_block(ctx, body);
         }
         Node::Assign { name, value, .. } => {
             ctx.emit(CoreInst::EnvMutate(name.clone(), *value));
         }
-        Node::IndexAssign { obj, idx, value, .. } => {
+        Node::IndexAssign {
+            obj, idx, value, ..
+        } => {
             ctx.emit(CoreInst::IndexAssign(*obj, *idx, *value));
         }
 
         // ── 闭包/函数 ──
-        Node::FnDef { name, params, body, .. } => {
+        Node::FnDef {
+            name, params, body, ..
+        } => {
             let param_names: Vec<String> = params.iter().map(|p| p.name.clone()).collect();
             let captures = vec![]; // 捕获变量由 EHIR 分析确定
             let core_body = lower_block_to_core(ctx, body);
@@ -298,14 +357,21 @@ fn lower_node(ctx: &mut CoreContext, node: &Ehir) {
         }
 
         // ── 效果 ──
-        Node::Perform { dst, effect, args, .. } => {
+        Node::Perform {
+            dst, effect, args, ..
+        } => {
             ctx.emit(CoreInst::EffectPerform {
                 dst: *dst,
                 label: EffectLabel::from_name(effect),
                 args: args.clone(),
             });
         }
-        Node::Handle { effect, body, handler, .. } => {
+        Node::Handle {
+            effect,
+            body,
+            handler,
+            ..
+        } => {
             let handler_reg = ctx.alloc_reg();
             // handler 降维为闭包
             let handler_body = lower_block_to_core(ctx, handler);
@@ -493,7 +559,10 @@ mod tests {
         }];
         let func = ehir_to_core(&nodes, vec![], EffectRow::Empty);
         assert_eq!(func.blocks[0].insts.len(), 1);
-        assert!(matches!(&func.blocks[0].insts[0], CoreInst::BinaryOp(2, 0, _, 1)));
+        assert!(matches!(
+            &func.blocks[0].insts[0],
+            CoreInst::BinaryOp(2, 0, _, 1)
+        ));
     }
 
     #[test]

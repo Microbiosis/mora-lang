@@ -118,21 +118,13 @@ pub enum CoreInst {
         args: Vec<Reg>,
     },
     /// 安装效果处理器。
-    EffectInstall {
-        label: EffectLabel,
-        handler: Reg,
-    },
+    EffectInstall { label: EffectLabel, handler: Reg },
     /// 恢复效果处理器。
-    EffectRestore {
-        label: EffectLabel,
-    },
+    EffectRestore { label: EffectLabel },
 
     // ── Thunk 降维 ──
     /// 创建惰性求值 thunk。
-    ThunkCreate {
-        dst: Reg,
-        body: CoreBlock,
-    },
+    ThunkCreate { dst: Reg, body: CoreBlock },
     /// 强制求值 thunk。
     ThunkForce(Reg, Reg),
 

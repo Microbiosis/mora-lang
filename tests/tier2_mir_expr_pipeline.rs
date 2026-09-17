@@ -10,9 +10,7 @@ use mora::typeck::check_mir::check_program_witnesses;
 use mora::value::Value;
 
 fn compile_v3(source: &str) -> MirFunction {
-    ParserV3::compile(source)
-        .expect("compile should succeed")
-        .0
+    ParserV3::compile(source).expect("compile should succeed").0
 }
 
 fn run_v3_pipeline(source: &str) -> Result<(), String> {
@@ -21,8 +19,18 @@ fn run_v3_pipeline(source: &str) -> Result<(), String> {
     let mut interp = Interpreter::new();
     let mut env = interp.take_env();
     let func_arc = std::sync::Arc::new(func);
-    run_mir(&func_arc, &mut interp, &mut env, &mut mora::mir::effect::Effects::new())?;
-    run_main_task(&func_arc, &mut interp, &mut env, &mut mora::mir::effect::Effects::new())
+    run_mir(
+        &func_arc,
+        &mut interp,
+        &mut env,
+        &mut mora::mir::effect::Effects::new(),
+    )?;
+    run_main_task(
+        &func_arc,
+        &mut interp,
+        &mut env,
+        &mut mora::mir::effect::Effects::new(),
+    )
 }
 
 // ===================================================================
@@ -32,37 +40,61 @@ fn run_v3_pipeline(source: &str) -> Result<(), String> {
 #[test]
 fn v3_parse_literal_expression() {
     let func = compile_v3("42");
-    assert!(func.body.iter().any(|inst| matches!(inst, MirInst::Const(_, _))));
+    assert!(
+        func.body
+            .iter()
+            .any(|inst| matches!(inst, MirInst::Const(_, _)))
+    );
 }
 
 #[test]
 fn v3_parse_string_expression() {
     let func = compile_v3(r#""hello""#);
-    assert!(func.body.iter().any(|inst| matches!(inst, MirInst::Const(_, _))));
+    assert!(
+        func.body
+            .iter()
+            .any(|inst| matches!(inst, MirInst::Const(_, _)))
+    );
 }
 
 #[test]
 fn v3_parse_variable_reference() {
     let func = compile_v3("let x = 1\nx");
-    assert!(func.body.iter().any(|inst| matches!(inst, MirInst::Var(_, _))));
+    assert!(
+        func.body
+            .iter()
+            .any(|inst| matches!(inst, MirInst::Var(_, _)))
+    );
 }
 
 #[test]
 fn v3_parse_binary_expression() {
     let func = compile_v3("1 + 2");
-    assert!(func.body.iter().any(|inst| matches!(inst, MirInst::Const(_, _))));
+    assert!(
+        func.body
+            .iter()
+            .any(|inst| matches!(inst, MirInst::Const(_, _)))
+    );
 }
 
 #[test]
 fn v3_parse_list_literal() {
     let func = compile_v3("[1, 2, 3]");
-    assert!(func.body.iter().any(|inst| matches!(inst, MirInst::ListLit(_, _))));
+    assert!(
+        func.body
+            .iter()
+            .any(|inst| matches!(inst, MirInst::ListLit(_, _)))
+    );
 }
 
 #[test]
 fn v3_parse_dict_literal() {
     let func = compile_v3(r#"{key: "value"}"#);
-    assert!(func.body.iter().any(|inst| matches!(inst, MirInst::DictLit(_, _))));
+    assert!(
+        func.body
+            .iter()
+            .any(|inst| matches!(inst, MirInst::DictLit(_, _)))
+    );
 }
 
 // ===================================================================
@@ -92,25 +124,41 @@ fn v3_lower_binary_produces_binary_op() {
 #[test]
 fn v3_lower_let_binding_produces_define() {
     let func = compile_v3("let x = 42");
-    assert!(func.body.iter().any(|inst| matches!(inst, MirInst::Define(_, _))));
+    assert!(
+        func.body
+            .iter()
+            .any(|inst| matches!(inst, MirInst::Define(_, _)))
+    );
 }
 
 #[test]
 fn v3_lower_variable_reference_produces_var() {
     let func = compile_v3("let x = 42\nx");
-    assert!(func.body.iter().any(|inst| matches!(inst, MirInst::Var(_, _))));
+    assert!(
+        func.body
+            .iter()
+            .any(|inst| matches!(inst, MirInst::Var(_, _)))
+    );
 }
 
 #[test]
 fn v3_lower_list_literal_produces_list_lit() {
     let func = compile_v3("[1, 2]");
-    assert!(func.body.iter().any(|inst| matches!(inst, MirInst::ListLit(_, _))));
+    assert!(
+        func.body
+            .iter()
+            .any(|inst| matches!(inst, MirInst::ListLit(_, _)))
+    );
 }
 
 #[test]
 fn v3_lower_dict_literal_produces_dict_lit() {
     let func = compile_v3(r#"{a: 1}"#);
-    assert!(func.body.iter().any(|inst| matches!(inst, MirInst::DictLit(_, _))));
+    assert!(
+        func.body
+            .iter()
+            .any(|inst| matches!(inst, MirInst::DictLit(_, _)))
+    );
 }
 
 // ===================================================================
@@ -121,7 +169,10 @@ fn v3_lower_dict_literal_produces_dict_lit() {
 fn v3_typecheck_then_lower_succeeds() {
     let (func, witnesses) = ParserV3::compile("let x = 42").expect("compile should succeed");
     let _errors = check_program_witnesses(&witnesses);
-    assert!(!func.body.is_empty(), "lowered function should have instructions");
+    assert!(
+        !func.body.is_empty(),
+        "lowered function should have instructions"
+    );
 }
 
 // ===================================================================
@@ -130,34 +181,42 @@ fn v3_typecheck_then_lower_succeeds() {
 
 #[test]
 fn v3_pipeline_let_then_variable_runs() {
-    run_v3_pipeline("task main()\n  let x = 42\nend").expect("V3 pipeline should execute let + variable");
+    run_v3_pipeline("task main()\n  let x = 42\nend")
+        .expect("V3 pipeline should execute let + variable");
 }
 
 #[test]
 fn v3_pipeline_binary_expression_runs() {
-    run_v3_pipeline("task main()\n  let result = 1 + 2\nend").expect("V3 pipeline should execute binary expression");
+    run_v3_pipeline("task main()\n  let result = 1 + 2\nend")
+        .expect("V3 pipeline should execute binary expression");
 }
 
 #[test]
 fn v3_pipeline_nested_binary_runs() {
-    run_v3_pipeline("task main()\n  let result = (1 + 2) * 3\nend").expect("V3 pipeline should execute nested binary");
+    run_v3_pipeline("task main()\n  let result = (1 + 2) * 3\nend")
+        .expect("V3 pipeline should execute nested binary");
 }
 
 #[test]
 fn v3_pipeline_list_literal_runs() {
-    run_v3_pipeline("task main()\n  let xs = [1, 2, 3]\nend").expect("V3 pipeline should execute list literal");
+    run_v3_pipeline("task main()\n  let xs = [1, 2, 3]\nend")
+        .expect("V3 pipeline should execute list literal");
 }
 
 #[test]
 fn v3_pipeline_dict_literal_runs() {
-    run_v3_pipeline(r#"task main()
+    run_v3_pipeline(
+        r#"task main()
   let d = {"key": "value"}
-end"#).expect("V3 pipeline should execute dict literal");
+end"#,
+    )
+    .expect("V3 pipeline should execute dict literal");
 }
 
 #[test]
 fn v3_pipeline_multiple_statements_runs() {
-    run_v3_pipeline("task main()\n  let a = 1\n  let b = 2\n  let c = a + b\nend").expect("V3 pipeline should execute multiple statements");
+    run_v3_pipeline("task main()\n  let a = 1\n  let b = 2\n  let c = a + b\nend")
+        .expect("V3 pipeline should execute multiple statements");
 }
 
 // ===================================================================
@@ -166,7 +225,10 @@ fn v3_pipeline_multiple_statements_runs() {
 
 #[test]
 fn v3_pipeline_if_else_runs() {
-    run_v3_pipeline("task main()\n  let x = 5\n  if x > 3 { print(\"big\") } else { print(\"small\") }\nend").expect("if-else should run");
+    run_v3_pipeline(
+        "task main()\n  let x = 5\n  if x > 3 { print(\"big\") } else { print(\"small\") }\nend",
+    )
+    .expect("if-else should run");
 }
 
 #[test]
@@ -202,7 +264,8 @@ fn v3_typecheck_unbound_variable() {
 
 #[test]
 fn v3_typecheck_clean_program() {
-    let (_func, witnesses) = ParserV3::compile("let x = 1 + 2\nprint(x)").expect("compile should succeed");
+    let (_func, witnesses) =
+        ParserV3::compile("let x = 1 + 2\nprint(x)").expect("compile should succeed");
     let errs = check_program_witnesses(&witnesses);
     assert!(errs.is_empty(), "clean program should have no errors");
 }
@@ -213,7 +276,8 @@ fn v3_typecheck_clean_program() {
 
 #[test]
 fn v3_pipeline_string_concat_runs() {
-    run_v3_pipeline("let a = \"hello\"\nlet b = \" \"\nlet c = \"world\"\nprint(a + b + c)").expect("string concat should run");
+    run_v3_pipeline("let a = \"hello\"\nlet b = \" \"\nlet c = \"world\"\nprint(a + b + c)")
+        .expect("string concat should run");
 }
 
 #[test]
@@ -223,22 +287,28 @@ fn v3_pipeline_dict_access_runs() {
 
 #[test]
 fn v3_pipeline_nested_if_runs() {
-    run_v3_pipeline("let x = 5\nif x > 3 {\n  if x > 4 {\n    print(\"big\")\n  }\n}").expect("nested if should run");
+    run_v3_pipeline("let x = 5\nif x > 3 {\n  if x > 4 {\n    print(\"big\")\n  }\n}")
+        .expect("nested if should run");
 }
 
 #[test]
 fn v3_pipeline_task_define_and_call_runs() {
-    run_v3_pipeline("task add(a, b)\n  a + b\nend\nprint(add(1, 2))").expect("task define and call should run");
+    run_v3_pipeline("task add(a, b)\n  a + b\nend\nprint(add(1, 2))")
+        .expect("task define and call should run");
 }
 
 #[test]
 fn v3_pipeline_closure_capture_runs() {
-    run_v3_pipeline("let base = 10\nlet offset = fn(x) x + base end\nprint(offset(5))").expect("closure capture should run");
+    run_v3_pipeline("let base = 10\nlet offset = fn(x) x + base end\nprint(offset(5))")
+        .expect("closure capture should run");
 }
 
 #[test]
 fn v3_pipeline_match_with_literal_runs() {
-    run_v3_pipeline("let x = 42\nmatch x {\n  42 => print(\"found\"),\n  _ => print(\"not found\")\n}").expect("match with literal should run");
+    run_v3_pipeline(
+        "let x = 42\nmatch x {\n  42 => print(\"found\"),\n  _ => print(\"not found\")\n}",
+    )
+    .expect("match with literal should run");
 }
 
 #[test]

@@ -94,7 +94,11 @@ pub struct Clause {
 impl Clause {
     /// 事实子句构造器。
     pub fn fact(params: Vec<String>, head: Vec<Term>) -> Clause {
-        Clause { params, head, body: Goal::Succeed }
+        Clause {
+            params,
+            head,
+            body: Goal::Succeed,
+        }
     }
 
     /// 规则子句构造器。

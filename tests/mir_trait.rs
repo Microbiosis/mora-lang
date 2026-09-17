@@ -22,8 +22,18 @@ fn run_via_mir(source: &str) -> Result<(), String> {
     let mut interp = Interpreter::new();
     let mut env = interp.take_env();
     let func_arc = std::sync::Arc::new(func);
-    run_mir(&func_arc, &mut interp, &mut env, &mut mora::mir::effect::Effects::new())?;
-    run_main_task(&func_arc, &mut interp, &mut env, &mut mora::mir::effect::Effects::new())
+    run_mir(
+        &func_arc,
+        &mut interp,
+        &mut env,
+        &mut mora::mir::effect::Effects::new(),
+    )?;
+    run_main_task(
+        &func_arc,
+        &mut interp,
+        &mut env,
+        &mut mora::mir::effect::Effects::new(),
+    )
 }
 
 // ─── 集成验证 ─────────────────────────────────────────────────────────

@@ -47,8 +47,9 @@ fn binop_func(a: f64, op: mora::common::BinaryOp, b: f64) -> MirFunction {
             fbinop(2, 0, op.clone(), 1),
         ],
         n_regs: 3,
-    
-            ..Default::default()}
+
+        ..Default::default()
+    }
 }
 
 fn run_interp(func: &MirFunction) -> Result<Value, String> {
@@ -158,8 +159,9 @@ fn jit_rejects_uncompilable() {
             fbinop(2, 0, mora::common::BinaryOp::Mod, 1),
         ],
         n_regs: 3,
-    
-            ..Default::default()};
+
+        ..Default::default()
+    };
     assert!(run_jit_of(&func_mod).is_err(), "Float Mod 应拒绝");
 
     // Mixed 类型（Int + Float）
@@ -171,8 +173,9 @@ fn jit_rejects_uncompilable() {
             fbinop(2, 0, mora::common::BinaryOp::Add, 1),
         ],
         n_regs: 3,
-    
-            ..Default::default()};
+
+        ..Default::default()
+    };
     assert!(run_jit_of(&func_mixed).is_err(), "Mixed 应拒绝");
 
     // 变量/定义/调用
@@ -206,8 +209,9 @@ fn jit_equiv_manual_int_arith() {
                 fbinop(2, 0, op.clone(), 1),
             ],
             n_regs: 3,
-        
-            ..Default::default()};
+
+            ..Default::default()
+        };
         let jit_val =
             run_jit_of(&func).unwrap_or_else(|e| panic!("JIT failed for {a} {op:?} {b}: {e}"));
         let mir_val = run_interp(&func).expect("interp should run");
@@ -226,8 +230,9 @@ fn jit_int_add_wraps() {
             fbinop(2, 0, mora::common::BinaryOp::Add, 1),
         ],
         n_regs: 3,
-    
-            ..Default::default()};
+
+        ..Default::default()
+    };
     let jit_val = run_jit_of(&func).expect("JIT should compile Add");
     // i64 直接加法 wrap：MAX + 1 = MIN
     assert_eq!(jit_val, Value::Int(i64::MIN), "Add 溢出应 wrap");
@@ -245,8 +250,9 @@ fn jit_equiv_manual_int_mod() {
                 fbinop(2, 0, mora::common::BinaryOp::Mod, 1),
             ],
             n_regs: 3,
-        
-            ..Default::default()};
+
+            ..Default::default()
+        };
         let jit_val = run_jit_of(&func).unwrap_or_else(|e| panic!("JIT failed for {a} % {b}: {e}"));
         let mir_val = run_interp(&func).expect("interp should run");
         assert_eq!(jit_val, mir_val, "JIT != interp for {a} % {b}");
@@ -272,8 +278,9 @@ fn jit_equiv_manual_int_cmp() {
                 fbinop(2, 0, op.clone(), 1),
             ],
             n_regs: 3,
-        
-            ..Default::default()};
+
+            ..Default::default()
+        };
         let jit_val =
             run_jit_of(&func).unwrap_or_else(|e| panic!("JIT failed for {a} {op:?} {b}: {e}"));
         let mir_val = run_interp(&func).expect("interp should run");
@@ -293,8 +300,9 @@ fn jit_equiv_jump_skip() {
             MirInst::Const(2, Value::Int(7)), // 跳转命中此 pc（静态最后）
         ],
         n_regs: 3,
-    
-            ..Default::default()};
+
+        ..Default::default()
+    };
     let jit_val = run_jit_of(&func).expect("JIT should compile Jump");
     let mir_val = run_interp(&func).expect("interp should run");
     assert_eq!(
@@ -317,8 +325,9 @@ fn jit_equiv_jump_if() {
             MirInst::Const(2, Value::Int(2)),
         ],
         n_regs: 3,
-    
-            ..Default::default()};
+
+        ..Default::default()
+    };
     // 注：解释器 dag 优化会裁剪「无数据消费者」的死 Const，导致条件跳转
     // 目标的 interp 路径与原始指令语义分歧 —— 差分对比仅适用于无条件跳转
     // （见 jump_skip）。条件跳转断言 JIT 的线性指令语义 + 跳转目标命中
@@ -344,8 +353,9 @@ fn jit_equiv_jump_if() {
             MirInst::Const(2, Value::Int(2)),
         ],
         n_regs: 3,
-    
-            ..Default::default()};
+
+        ..Default::default()
+    };
     let jit_val = run_jit_of(&func_false).expect("JIT should compile JumpIf");
     assert_eq!(jit_val, Value::Int(2), "JumpIf(false) fall-through 出口值");
 }
@@ -363,8 +373,9 @@ fn jit_equiv_jump_if_not() {
             MirInst::Const(2, Value::Int(2)),
         ],
         n_regs: 3,
-    
-            ..Default::default()};
+
+        ..Default::default()
+    };
     // 同 jump_if：跳转目标命中验证。
     let jit_val = run_jit_of(&func_false).expect("JIT should compile JumpIfNot");
     assert_eq!(jit_val, Value::Int(2), "JumpIfNot(false) 跳转目标命中");
@@ -379,8 +390,9 @@ fn jit_equiv_jump_if_not() {
             MirInst::Const(2, Value::Int(2)),
         ],
         n_regs: 3,
-    
-            ..Default::default()};
+
+        ..Default::default()
+    };
     let jit_val = run_jit_of(&func_true).expect("JIT should compile JumpIfNot");
     assert_eq!(
         jit_val,
@@ -402,8 +414,9 @@ fn jit_equiv_jump_forward_mid() {
             MirInst::Const(2, Value::Int(7)), // 命中（静态最后）
         ],
         n_regs: 3,
-    
-            ..Default::default()};
+
+        ..Default::default()
+    };
     let jit_val = run_jit_of(&func).expect("JIT should compile forward jump");
     let mir_val = run_interp(&func).expect("interp should run");
     assert_eq!(
@@ -423,8 +436,9 @@ fn jit_rejects_non_bool_cond() {
             MirInst::Const(1, Value::Int(2)),
         ],
         n_regs: 2,
-    
-            ..Default::default()};
+
+        ..Default::default()
+    };
     assert!(
         run_jit_of(&func).is_err(),
         "非 Bool cond 应拒绝（回落解释器）"
@@ -448,7 +462,12 @@ fn with_config_env(body: &MirFunction, jit: bool) -> Result<mora::value::Environ
     };
     let mut interp = Interpreter::new();
     let mut env = interp.take_env();
-    run_mir(&std::sync::Arc::new(outer), &mut interp, &mut env, &mut mora::mir::effect::Effects::new())?;
+    run_mir(
+        &std::sync::Arc::new(outer),
+        &mut interp,
+        &mut env,
+        &mut mora::mir::effect::Effects::new(),
+    )?;
     Ok(env)
 }
 
@@ -463,8 +482,9 @@ fn jit_with_config_compilable_body() {
             fbinop(2, 0, mora::common::BinaryOp::Div, 1), // 2.5
         ],
         n_regs: 3,
-    
-            ..Default::default()};
+
+        ..Default::default()
+    };
     let env_jit = with_config_env(&body, true).expect("jit=true 不应 Err");
     let env_mir = with_config_env(&body, false).expect("jit=false 不应 Err");
     // config 设置/恢复无环境副作用 → 两者终态一致
@@ -486,8 +506,9 @@ fn jit_with_config_falls_back() {
             MirInst::Define("jitted".to_string(), 0),
         ],
         n_regs: 1,
-    
-            ..Default::default()};
+
+        ..Default::default()
+    };
     let env_jit = with_config_env(&body, true).expect("jit=true 回落不应 Err");
     let env_mir = with_config_env(&body, false).expect("jit=false 不应 Err");
     // Define 副作用在 child_env（h_with_config 不合并回父）→ 父 env 均无
@@ -515,8 +536,9 @@ fn jit_error_classification() {
             MirInst::Define("x".to_string(), 0),
         ],
         n_regs: 1,
-    
-            ..Default::default()};
+
+        ..Default::default()
+    };
     match run(&reject) {
         Err(mora::mir::jit::JitError::CompileReject(msg)) => {
             assert!(!msg.is_empty(), "CompileReject 应携带原因");
@@ -528,8 +550,9 @@ fn jit_error_classification() {
         params: Vec::new(),
         body: vec![MirInst::Const(0, Value::String("hi".into()))],
         n_regs: 1,
-    
-            ..Default::default()};
+
+        ..Default::default()
+    };
     match run(&reject_str) {
         Err(mora::mir::jit::JitError::CompileReject(_)) => {}
         other => panic!("String Const 应 CompileReject，got {other:?}"),
@@ -539,7 +562,8 @@ fn jit_error_classification() {
         params: Vec::new(),
         body: vec![MirInst::Const(0, Value::Int(42))],
         n_regs: 1,
-    
-            ..Default::default()};
+
+        ..Default::default()
+    };
     assert!(run(&ok).is_ok(), "纯 Const 应成功编译执行");
 }

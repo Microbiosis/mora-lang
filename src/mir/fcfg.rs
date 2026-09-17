@@ -476,7 +476,10 @@ pub enum Pattern {
     Literal(Literal),
     Tuple(Vec<Pattern>),
     List(Vec<Pattern>),
-    ListVec { head: Vec<Pattern>, tail: Option<Box<Pattern>> },
+    ListVec {
+        head: Vec<Pattern>,
+        tail: Option<Box<Pattern>>,
+    },
     Dict(Vec<(String, Pattern)>),
     TypeAscription(Box<Pattern>, TypeAnnotation),
 }
@@ -493,11 +496,24 @@ pub enum QuasiquoteSegment {
 #[derive(Debug, Clone)]
 pub enum OrchestrateKind<M> {
     Sequential,
-    Loop { body: Block<M> },
-    Graph { vertices: Vec<String>, edges: Vec<(String, String)> },
-    Pregel { config: PregelConfig<M> },
-    MoA { layers: Vec<MoALayer<M>> },
-    MoE { experts: Vec<String>, router: String, top_k: usize },
+    Loop {
+        body: Block<M>,
+    },
+    Graph {
+        vertices: Vec<String>,
+        edges: Vec<(String, String)>,
+    },
+    Pregel {
+        config: PregelConfig<M>,
+    },
+    MoA {
+        layers: Vec<MoALayer<M>>,
+    },
+    MoE {
+        experts: Vec<String>,
+        router: String,
+        top_k: usize,
+    },
 }
 
 /// Pregel 配置。

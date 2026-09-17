@@ -88,7 +88,7 @@ pub(super) fn event_to_jsonl(ev: &Event) -> String {
             )
         }
         // v0.83: Msg + StateMutation — payload/old/new 序列化为完整 Value JSON
-// （用 flow::value_to_json 而非 Debug 字符串）。旧 JSONL 文件失效。
+        // （用 flow::value_to_json 而非 Debug 字符串）。旧 JSONL 文件失效。
         Event::Msg {
             id,
             ts_ms,

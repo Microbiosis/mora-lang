@@ -282,9 +282,11 @@ pub fn run_dag_with_signal_memo(
                             MirDagNode::Compute { input_regs, .. } => {
                                 input_regs.iter().map(|r| value_fp(&regs[*r])).collect()
                             }
-                            MirDagNode::Effect { inst } => {
-                                inst.input_regs().iter().map(|r| value_fp(&regs[*r])).collect()
-                            }
+                            MirDagNode::Effect { inst } => inst
+                                .input_regs()
+                                .iter()
+                                .map(|r| value_fp(&regs[*r]))
+                                .collect(),
                             _ => Vec::new(),
                         }
                     } else {
@@ -300,7 +302,8 @@ pub fn run_dag_with_signal_memo(
                         continue;
                     }
 
-                    let flow = handlers::dispatch(inst, &mut regs, interp, env, &task_registry, effects)?;
+                    let flow =
+                        handlers::dispatch(inst, &mut regs, interp, env, &task_registry, effects)?;
                     if pure {
                         if let Some(d) = inst.dst() {
                             memo.record(node_id, inputs, regs[d].clone());
@@ -395,8 +398,8 @@ pub fn run_dag_with_signal_memo(
                 // Jump 的选中目标与 fall-through）激活，`prune_sequence_edges`
                 // 又明确「Sequence 全保留」。因此去掉 Data 激活不会让任何
                 // 可达节点失去激活来源。
-                let should_push = is_control_edge(&edge.kind)
-                    || matches!(edge.kind, EdgeKind::Sequence);
+                let should_push =
+                    is_control_edge(&edge.kind) || matches!(edge.kind, EdgeKind::Sequence);
                 if should_push && !pushed[edge.to] {
                     next_active.push(edge.to);
                     pushed[edge.to] = true;

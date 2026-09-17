@@ -19,7 +19,9 @@ use std::marker::PhantomData;
 ///
 /// `Send + Sync + Debug` bounds 让 transducer 可存于 `Value::Stream`（要求 Send+Sync+Debug）
 /// 并跨线程传递（用于 Pregel BSP worker 池）。
-pub trait Transducer<A: Clone + Send + Sync, B: Clone + Send + Sync>: Send + Sync + std::fmt::Debug {
+pub trait Transducer<A: Clone + Send + Sync, B: Clone + Send + Sync>:
+    Send + Sync + std::fmt::Debug
+{
     /// 处理一个输入元素，返回 `Some(output)` 或 `None`（终止）。
     fn step(&mut self, next: A) -> Option<B>;
     /// 流结束时调用（默认 no-op）。
@@ -52,9 +54,7 @@ impl<A, F: FnMut(&A) -> bool> std::fmt::Debug for Filter<A, F> {
     }
 }
 
-impl<A: Clone + Send + Sync, F: FnMut(&A) -> bool + Send + Sync> Transducer<A, A>
-    for Filter<A, F>
-{
+impl<A: Clone + Send + Sync, F: FnMut(&A) -> bool + Send + Sync> Transducer<A, A> for Filter<A, F> {
     fn step(&mut self, next: A) -> Option<A> {
         if (self.0)(&next) { Some(next) } else { None }
     }
@@ -90,8 +90,8 @@ where
     X1: Transducer<B, C>,
     X2: Transducer<A, B>,
 {
-    pub first: X2,   // 先应用（内层）
-    pub second: X1,  // 后应用（外层）
+    pub first: X2,  // 先应用（内层）
+    pub second: X1, // 后应用（外层）
     pub _phantom: PhantomData<(A, B, C)>,
 }
 
@@ -153,9 +153,7 @@ pub fn map<A: Clone + Send + Sync, B: Clone + Send + Sync, F: FnMut(A) -> B + Se
 }
 
 /// 便捷构造：Filter transducer。
-pub fn filter<A: Clone + Send + Sync, F: FnMut(&A) -> bool + Send + Sync>(
-    f: F,
-) -> Filter<A, F> {
+pub fn filter<A: Clone + Send + Sync, F: FnMut(&A) -> bool + Send + Sync>(f: F) -> Filter<A, F> {
     Filter(f, PhantomData)
 }
 
@@ -205,10 +203,7 @@ mod tests {
     #[test]
     fn comp_map_then_filter() {
         // comp(filter(>5), map(*2)) — 先 map 后 filter
-        let mut c = comp(
-            map(|x: i32| x * 2),
-            filter(|x: &i32| *x > 5),
-        );
+        let mut c = comp(map(|x: i32| x * 2), filter(|x: &i32| *x > 5));
         assert_eq!(c.step(1), None); // 1*2=2, 2>5=false
         assert_eq!(c.step(3), Some(6)); // 3*2=6, 6>5=true
     }
@@ -216,10 +211,7 @@ mod tests {
     #[test]
     fn comp_filter_then_map() {
         // comp(map(*2), filter(>5)) — 先 filter 后 map
-        let mut c = comp(
-            filter(|x: &i32| *x > 5),
-            map(|x: i32| x * 2),
-        );
+        let mut c = comp(filter(|x: &i32| *x > 5), map(|x: i32| x * 2));
         assert_eq!(c.step(3), None); // 3>5=false
         assert_eq!(c.step(6), Some(12)); // 6>5=true, 6*2=12
     }
@@ -239,10 +231,7 @@ mod tests {
     #[test]
     fn comp_three_chain() {
         // comp(comp(map(+1), filter(>2)), map(*10))
-        let inner = comp(
-            map(|x: i32| x + 1),
-            filter(|x: &i32| *x > 2),
-        );
+        let inner = comp(map(|x: i32| x + 1), filter(|x: &i32| *x > 2));
         let mut outer = comp(inner, map(|x: i32| x * 10));
         assert_eq!(outer.step(1), None); // 1+1=2, 2>2=false
         assert_eq!(outer.step(2), Some(30)); // 2+1=3, 3>2=true, 3*10=30

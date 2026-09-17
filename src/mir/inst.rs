@@ -7,18 +7,13 @@
 use std::collections::HashMap;
 
 use super::handlers::{
-    Flow, h_aggregate, h_app_def, AppDefArgs, h_assign, h_binary_op, h_break, h_call, h_closure, h_const,
-    h_continue, h_define, h_dict_lit, h_document_section, h_dyn_trait, h_enum_def, h_eval,
-    h_export_mark, h_halt,
-    h_handle, h_impl_def, h_import, h_index, h_index_assign, h_jump, h_jump_if, h_jump_if_not,
-    h_list_lit, h_macro_def, h_match_expr, h_method_call, h_model_def, h_msg_def,
-    h_observe, h_orchestrate, h_parallel, h_perform, h_pipe, h_prompt, h_prompt_section,
-
-    h_rel_def, h_return, h_send, h_solve, h_span,
-    h_struct_def, h_task_def, h_trait_def,
-    h_transaction, h_type_alias, h_update_def, h_var, h_with_config, h_worker,
-
-    h_quasiquote,
+    AppDefArgs, Flow, h_aggregate, h_app_def, h_assign, h_binary_op, h_break, h_call, h_closure,
+    h_const, h_continue, h_define, h_dict_lit, h_document_section, h_dyn_trait, h_enum_def, h_eval,
+    h_export_mark, h_halt, h_handle, h_impl_def, h_import, h_index, h_index_assign, h_jump,
+    h_jump_if, h_jump_if_not, h_list_lit, h_macro_def, h_match_expr, h_method_call, h_model_def,
+    h_msg_def, h_observe, h_orchestrate, h_parallel, h_perform, h_pipe, h_prompt, h_prompt_section,
+    h_quasiquote, h_rel_def, h_return, h_send, h_solve, h_span, h_struct_def, h_task_def,
+    h_trait_def, h_transaction, h_type_alias, h_update_def, h_var, h_with_config, h_worker,
 };
 
 use crate::mir::host::MirHost;
@@ -161,7 +156,13 @@ impl MirInst {
             },
             // Handle: body 和 handler 是独立 reg 空间（不递归 map）。
             // k_param 是 handler 内的 resume 续名（handler body 内部管理）。
-            MirInst::Handle { effect, body, handler, k_param, k_dst } => MirInst::Handle {
+            MirInst::Handle {
+                effect,
+                body,
+                handler,
+                k_param,
+                k_dst,
+            } => MirInst::Handle {
                 effect: effect.clone(),
                 body: body.clone(),
                 handler: handler.clone(),
@@ -508,8 +509,16 @@ pub fn dispatch(
             h_rel_def(env, name, clauses);
             Ok(Flow::Continue)
         }
-        MirInst::Solve { dst, limit, query_vars, anon_vars, goal } => {
-            h_solve(interp, env, regs, *dst, *limit, query_vars, anon_vars, goal, effects)?;
+        MirInst::Solve {
+            dst,
+            limit,
+            query_vars,
+            anon_vars,
+            goal,
+        } => {
+            h_solve(
+                interp, env, regs, *dst, *limit, query_vars, anon_vars, goal, effects,
+            )?;
             Ok(Flow::Continue)
         }
         MirInst::Import(path) => {
@@ -539,7 +548,17 @@ pub fn dispatch(
             k_param,
             k_dst,
         } => {
-            h_handle(interp, env, regs, effect, body, handler, k_param.as_str(), *k_dst, effects)?;
+            h_handle(
+                interp,
+                env,
+                regs,
+                effect,
+                body,
+                handler,
+                k_param.as_str(),
+                *k_dst,
+                effects,
+            )?;
             Ok(Flow::Continue)
         }
         MirInst::MacroDef { name, params, body } => {

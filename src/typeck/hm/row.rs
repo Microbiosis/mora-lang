@@ -96,13 +96,11 @@ pub fn unify_row(
                 Ok(())
             }
         }
-        (Empty, Cons(h, _)) | (Cons(h, _), Empty) => {
-            Err(TypeError::EffectRowMismatch {
-                expected: "pure".to_string(),
-                got: format!("{{ {} }}", h),
-                span: None,
-            })
-        }
+        (Empty, Cons(h, _)) | (Cons(h, _), Empty) => Err(TypeError::EffectRowMismatch {
+            expected: "pure".to_string(),
+            got: format!("{{ {} }}", h),
+            span: None,
+        }),
         (Cons(h1, t1), Cons(h2, t2)) => {
             if h1 != h2 {
                 Err(TypeError::EffectRowMismatch {
@@ -121,7 +119,11 @@ pub fn unify_row(
 
 /// 把 row var 绑到具体 row（写入 substitution）。
 /// v0.84: occur check 在 unify_row 内部完成，本函数只写入映射。
-pub fn bind_row(subst: &mut super::unify::Substitution, name: String, row: EffectRow) -> Result<(), TypeError> {
+pub fn bind_row(
+    subst: &mut super::unify::Substitution,
+    name: String,
+    row: EffectRow,
+) -> Result<(), TypeError> {
     subst.bind_row(name, row);
     Ok(())
 }
@@ -261,7 +263,10 @@ mod tests {
         let a = EffectRow::Var("x".into());
         let b = EffectRow::Cons(
             "Ai".into(),
-            Box::new(EffectRow::Cons("Fs".into(), Box::new(EffectRow::Var("x".into())))),
+            Box::new(EffectRow::Cons(
+                "Fs".into(),
+                Box::new(EffectRow::Var("x".into())),
+            )),
         );
         assert!(unify_row(&a, &b, &mut s).is_err());
     }

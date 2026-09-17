@@ -7,8 +7,8 @@
 //! LegacyJitBackend 适配层接入。
 
 use crate::mir::core::CoreFunction;
-use crate::mir::fcfg::Reg;
 use crate::mir::effect::EffectRow;
+use crate::mir::fcfg::Reg;
 use crate::mir::lmir::MemLayout;
 use crate::typeck::Type;
 

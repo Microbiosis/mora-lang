@@ -8,10 +8,20 @@ fn run_mora(source: &str) -> Result<Value, String> {
     let (func, _witnesses) =
         ParserV3::compile(source).map_err(|e| format!("compile error: {}", e))?;
     let func_arc = Arc::new(func);
-    mora::mir::vm::run_mir(&func_arc, &mut interp, &mut env, &mut mora::mir::effect::Effects::new())
-        .map_err(|e| format!("run_mir error: {}", e))?;
-    mora::mir::vm::run_main_task(&func_arc, &mut interp, &mut env, &mut mora::mir::effect::Effects::new())
-        .map_err(|e| format!("run_main_task error: {}", e))?;
+    mora::mir::vm::run_mir(
+        &func_arc,
+        &mut interp,
+        &mut env,
+        &mut mora::mir::effect::Effects::new(),
+    )
+    .map_err(|e| format!("run_mir error: {}", e))?;
+    mora::mir::vm::run_main_task(
+        &func_arc,
+        &mut interp,
+        &mut env,
+        &mut mora::mir::effect::Effects::new(),
+    )
+    .map_err(|e| format!("run_main_task error: {}", e))?;
     env.get("__result")
         .ok_or_else(|| "result variable '__result' not found".to_string())
 }

@@ -110,9 +110,12 @@ fn list_get_exposes_element_type_error() {
 
 #[test]
 fn list_map_keeps_int_elements_clean() {
-    assert!(typecheck(
-        "let f = fn(x) x * 2 end\nlet xs = [1, 2, 3]\nlet ys = xs.map(f)\nlet z = ys[0]\nz + 1"
-    ).is_empty());
+    assert!(
+        typecheck(
+            "let f = fn(x) x * 2 end\nlet xs = [1, 2, 3]\nlet ys = xs.map(f)\nlet z = ys[0]\nz + 1"
+        )
+        .is_empty()
+    );
 }
 
 #[test]
@@ -148,13 +151,19 @@ fn generic_type_annotation_dict_string_any_parses() {
 #[test]
 fn generic_annotation_mismatch_reported() {
     let errs = typecheck("let x: List<string> = [1i, 2i]");
-    assert!(!errs.is_empty(), "List<string> 注解与 List<Int> 值应报类型错误");
+    assert!(
+        !errs.is_empty(),
+        "List<string> 注解与 List<Int> 值应报类型错误"
+    );
 }
 
 #[test]
 fn import_symbol_resolved_in_typecheck() {
     assert!(
-        typecheck("import \"tests/fixtures/mod_a.mora\"\nlet s = greeting\nlet n = answer\nprint(s)").is_empty(),
+        typecheck(
+            "import \"tests/fixtures/mod_a.mora\"\nlet s = greeting\nlet n = answer\nprint(s)"
+        )
+        .is_empty(),
         "import 符号应被解析，无 UnboundVariable"
     );
 }
@@ -163,8 +172,10 @@ fn import_symbol_resolved_in_typecheck() {
 /// 锁定「`Environment::define` 的 exported 参数被忽略」导致的可见性缺失。
 #[test]
 fn import_private_symbol_not_visible() {
-    let errs = typecheck("import \"tests/fixtures/mod_a.mora\"
-let s = scale");
+    let errs = typecheck(
+        "import \"tests/fixtures/mod_a.mora\"
+let s = scale",
+    );
     assert!(
         !errs.is_empty(),
         "未 export 的模块私有绑定 (scale) 应报 UnboundVariable，实际无错"
@@ -204,9 +215,8 @@ fn import_missing_file_reports_error() {
 /// 契约约束（arity 校验只有在签名跨文件可达时才可能发生）。
 #[test]
 fn imported_effect_signature_enforces_arity() {
-    let errs = typecheck(
-        "import \"tests/fixtures/effect_sig_module.mora\"\nperform Ask(\"a\", \"b\")",
-    );
+    let errs =
+        typecheck("import \"tests/fixtures/effect_sig_module.mora\"\nperform Ask(\"a\", \"b\")");
     assert!(
         errs.iter()
             .any(|e| e.message.contains("Expected 1 arguments")),
@@ -233,12 +243,7 @@ fn imported_effect_signature_result_typed() {
     let errs = typecheck(
         "import \"tests/fixtures/effect_sig_module.mora\"\nlet r = handle Ask {\n  let v: number = perform Ask(\"hi\")\n} {\n  \"resp\"\n}",
     );
-    assert_eq!(
-        errs.len(),
-        1,
-        "导入签名使 perform 结果静态化: {:?}",
-        errs
-    );
+    assert_eq!(errs.len(), 1, "导入签名使 perform 结果静态化: {:?}", errs);
     assert!(
         errs[0].message.contains("Int"),
         "冲突应指向标注类型: {:?}",

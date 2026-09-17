@@ -96,8 +96,14 @@ mod tests {
         };
         let cmir = core_to_cmir(&func);
         assert_eq!(cmir.nodes.len(), 2);
-        assert!(matches!(&cmir.nodes[0], CmirNode::Pure(CoreInst::Const(_, _))));
-        assert!(matches!(&cmir.nodes[1], CmirNode::Pure(CoreInst::BinaryOp(_, _, _, _))));
+        assert!(matches!(
+            &cmir.nodes[0],
+            CmirNode::Pure(CoreInst::Const(_, _))
+        ));
+        assert!(matches!(
+            &cmir.nodes[1],
+            CmirNode::Pure(CoreInst::BinaryOp(_, _, _, _))
+        ));
     }
 
     #[test]
@@ -118,6 +124,9 @@ mod tests {
             n_regs: 1,
         };
         let cmir = core_to_cmir(&func);
-        assert!(matches!(&cmir.nodes[0], CmirNode::Pure(CoreInst::EffectPerform { .. })));
+        assert!(matches!(
+            &cmir.nodes[0],
+            CmirNode::Pure(CoreInst::EffectPerform { .. })
+        ));
     }
 }

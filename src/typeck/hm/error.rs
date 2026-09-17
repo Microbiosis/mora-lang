@@ -117,7 +117,11 @@ impl std::fmt::Display for TypeError {
                     Ok(())
                 }
             }
-            TypeError::EffectRowMismatch { expected, got, span } => {
+            TypeError::EffectRowMismatch {
+                expected,
+                got,
+                span,
+            } => {
                 write!(f, "Effect row mismatch: expected {}, got {}", expected, got)?;
                 if let Some(s) = span {
                     write!(f, " at line {}, column {}", s.line, s.column)

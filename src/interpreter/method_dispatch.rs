@@ -7,10 +7,10 @@
 
 use parking_lot::Mutex;
 
+use super::dispatch::block_on_async;
 use super::*;
 use crate::common::Span;
 use crate::value::{BuiltinKind, Value};
-use super::dispatch::block_on_async;
 
 impl Interpreter {
     /// v0.17: 直接调用 Value 形式的函数（用于管道闭包）
@@ -350,7 +350,10 @@ impl Interpreter {
             // v0.91: List 统计方法链（list.sum() / .mean() / .min() / .max() / ...）
             // 复用 stats.* builtin 同一底层函数
             "sum" | "mean" | "median" | "stddev" | "var" | "min" | "max" => {
-                crate::interpreter::builtins::stats::call_stats_method(method, &[Value::List(list.clone())])
+                crate::interpreter::builtins::stats::call_stats_method(
+                    method,
+                    &[Value::List(list.clone())],
+                )
             }
             // v0.91: List.sort() — 升序排序（仅数值列表，非数值原样返回）
             "sort" => {
@@ -827,10 +830,13 @@ impl Interpreter {
                     // (other holder exists), fall back to identity.
                     let mut xform_arc = xform;
                     loop {
-                        let xform_mut: Option<&mut dyn crate::value::transducer::Transducer<String, String>> =
-                            xform_arc.as_mut().and_then(|arc| {
-                                std::sync::Arc::get_mut(arc).map(|t| { t as &mut dyn crate::value::transducer::Transducer<String, String> })
-                            });
+                        let xform_mut: Option<
+                            &mut dyn crate::value::transducer::Transducer<String, String>,
+                        > = xform_arc.as_mut().and_then(|arc| {
+                            std::sync::Arc::get_mut(arc).map(|t| {
+                                t as &mut dyn crate::value::transducer::Transducer<String, String>
+                            })
+                        });
                         match Self::read_next_sse_token(&mut guard, xform_mut) {
                             Ok(Some(token)) => result.push_str(&token),
                             Ok(None) => {

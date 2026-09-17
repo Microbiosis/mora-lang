@@ -55,9 +55,9 @@ pub mod lower;
 // v0.90: witness → FCFG 转换器（9 层切换的核心：FCFG 生产者）
 pub mod witness_to_fcfg;
 // v0.90: 9 层管线驱动 + 差分验证
-pub mod pipeline;
 pub mod opt;
 pub mod optimize;
+pub mod pipeline;
 // v0.89: RIR/JIR — 9 层架构第 7-8 层（运行时 + JIT 接口）
 pub mod rir;
 pub mod ssa;
@@ -76,10 +76,10 @@ pub use vm::run_mir;
 // v0.92: `pub use expr::MirExpr` 已删除 —— expr 模块整体移除（P0.3）。
 
 // ── 9 层 IR 架构 re-exports ──
+pub use cmir::{CmirBlock, CmirNode, ConcurrencyMode};
+pub use core::{CoreBlock, CoreFunction, CoreInst, CoreTerminator};
 pub use fcfg::{Block as FcfgBlock, Ehir, Fcfg, Node, TypeInfo};
 pub use fcfg_lower::lower_fcfg;
-pub use core::{CoreBlock, CoreFunction, CoreInst, CoreTerminator};
-pub use cmir::{CmirBlock, CmirNode, ConcurrencyMode};
 pub use lmir::{LmirInst, LmirType, MemLayout};
 pub use rir::{
     CompiledFunction, FunctionVersionTable, JitBackend, JitEntry, JitError, LayoutTable,
@@ -121,12 +121,7 @@ impl Default for MirFunction {
 /// v0.104.3: 守卫由 `Option<Reg>` 改为 `Option<Box<MirFunction>>` —— 守卫
 /// 引用**模式绑定变量**，而绑定只在匹配成功时才进入 env，故守卫必须像
 /// arm body 一样**延迟求值**（`h_match_expr` 在绑定之后调用它）。
-pub type MatchArmInst = (
-    String,
-    Option<Box<MirFunction>>,
-    Box<MirFunction>,
-    Reg,
-);
+pub type MatchArmInst = (String, Option<Box<MirFunction>>, Box<MirFunction>, Reg);
 
 /// MIR 指令（α.0 + α.1 子集）
 // 允许 large_enum_variant：ImplDef / SkillDef 携带完整函数体（Vec<MirFunction> /

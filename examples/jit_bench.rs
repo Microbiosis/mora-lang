@@ -54,7 +54,7 @@ fn main() {
             &mut env,
             &mut mora::mir::effect::Effects::new(),
         )
-            .unwrap();
+        .unwrap();
     }
     let mir_elapsed = start.elapsed();
 

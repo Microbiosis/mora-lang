@@ -9,9 +9,9 @@
 //! - Bool → i1（1 字节，条件分支）
 //! - String → ptr + len（16 字节，间接访问）
 
+use crate::mir::core::CoreFunction;
 use crate::mir::lmir::{LmirInst, MemLayout};
 use crate::mir::rir::{CompiledFunction, FunctionVersionTable, LayoutTable};
-use crate::mir::core::CoreFunction;
 use crate::typeck::Type;
 
 /// 从 LMIR 指令列表提取布局信息，填充 LayoutTable。
@@ -80,11 +80,14 @@ mod tests {
 
     #[test]
     fn populate_custom_layouts() {
-        let custom = vec![("MyStruct".to_string(), MemLayout {
-            size: 16,
-            align: 8,
-            fields: vec![(0, LmirType::Int64), (8, LmirType::Bool)],
-        })];
+        let custom = vec![(
+            "MyStruct".to_string(),
+            MemLayout {
+                size: 16,
+                align: 8,
+                fields: vec![(0, LmirType::Int64), (8, LmirType::Bool)],
+            },
+        )];
         let table = populate_layout_table(&[], &custom);
         let layout = table.get("MyStruct").unwrap();
         assert_eq!(layout.size, 16);

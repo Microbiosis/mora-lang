@@ -16,11 +16,7 @@ impl Interpreter {
     /// - `xform.take(n)` — 构造 take(n) transducer
     /// - `xform.comp(other_xform)` — 组合两个 transducer（self 在前）
     /// - `xform.attach(stream)` — 把 pipeline 安装到 stream 上
-    pub fn call_xform_method(
-        &mut self,
-        method: &str,
-        args: &[Value],
-    ) -> Result<Value, String> {
+    pub fn call_xform_method(&mut self, method: &str, args: &[Value]) -> Result<Value, String> {
         match method {
             "map" => {
                 let fn_val = args.first().ok_or("xform.map: missing fn arg")?;
@@ -63,9 +59,7 @@ mod tests {
     #[test]
     fn xform_take_returns_marker() {
         let mut interp = Interpreter::new();
-        let result = interp
-            .call_xform_method("take", &[Value::Int(5)])
-            .unwrap();
+        let result = interp.call_xform_method("take", &[Value::Int(5)]).unwrap();
         assert!(matches!(result, Value::String(_)));
     }
 

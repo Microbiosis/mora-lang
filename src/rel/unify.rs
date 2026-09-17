@@ -117,7 +117,10 @@ mod tests {
     #[test]
     fn occur_check_rejects_self_reference() {
         // x = cons(x, nil) 必须失败（无限项）
-        let t = Value::Cons { car: Box::new(v(0)), cdr: Box::new(Value::Nil) };
+        let t = Value::Cons {
+            car: Box::new(v(0)),
+            cdr: Box::new(Value::Nil),
+        };
         assert!(unify(&v(0), &t, &Subst::new()).is_none());
     }
 
@@ -147,8 +150,14 @@ mod tests {
 
     #[test]
     fn unify_dicts_by_key() {
-        let a = Value::Dict(HashMap::from([("x".into(), v(0)), ("y".into(), Value::Int(2))]));
-        let b = Value::Dict(HashMap::from([("x".into(), Value::Int(1)), ("y".into(), v(1))]));
+        let a = Value::Dict(HashMap::from([
+            ("x".into(), v(0)),
+            ("y".into(), Value::Int(2)),
+        ]));
+        let b = Value::Dict(HashMap::from([
+            ("x".into(), Value::Int(1)),
+            ("y".into(), v(1)),
+        ]));
         let s = unify(&a, &b, &Subst::new()).expect("unify");
         assert_eq!(s.walk(&v(0)), Value::Int(1));
         assert_eq!(s.walk(&v(1)), Value::Int(2));
@@ -163,8 +172,14 @@ mod tests {
 
     #[test]
     fn unify_cons_structurally() {
-        let a = Value::Cons { car: Box::new(v(0)), cdr: Box::new(v(1)) };
-        let b = Value::Cons { car: Box::new(Value::Int(1)), cdr: Box::new(Value::Nil) };
+        let a = Value::Cons {
+            car: Box::new(v(0)),
+            cdr: Box::new(v(1)),
+        };
+        let b = Value::Cons {
+            car: Box::new(Value::Int(1)),
+            cdr: Box::new(Value::Nil),
+        };
         let s = unify(&a, &b, &Subst::new()).expect("unify");
         assert_eq!(s.walk(&v(0)), Value::Int(1));
         assert_eq!(s.walk(&v(1)), Value::Nil);
@@ -172,7 +187,10 @@ mod tests {
 
     #[test]
     fn unify_cons_vs_nil_fails() {
-        let a = Value::Cons { car: Box::new(Value::Int(1)), cdr: Box::new(Value::Nil) };
+        let a = Value::Cons {
+            car: Box::new(Value::Int(1)),
+            cdr: Box::new(Value::Nil),
+        };
         assert!(unify(&a, &Value::Nil, &Subst::new()).is_none());
     }
 

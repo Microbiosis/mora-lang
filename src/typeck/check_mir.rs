@@ -186,7 +186,11 @@ fn hm_to_external(err: HmError) -> TypeError {
                 Some(value.clone()),
             )
         }
-        EffectRowMismatch { expected, got, span } => {
+        EffectRowMismatch {
+            expected,
+            got,
+            span,
+        } => {
             let (l, c) = span.map(|s| (s.line, s.column)).unwrap_or((0, 0));
             (l, c, Some(expected.clone()), Some(got.clone()))
         }
@@ -203,7 +207,7 @@ fn hm_to_external(err: HmError) -> TypeError {
 mod tests {
     use super::*;
     use crate::common::{Literal, Span};
-    use crate::mir::witness::{MirWitness, WitnessKind, WitnessCallee, WitnessArm, WitnessPattern};
+    use crate::mir::witness::{MirWitness, WitnessArm, WitnessCallee, WitnessKind, WitnessPattern};
 
     fn lit(n: i64) -> MirWitness {
         MirWitness {
@@ -289,7 +293,9 @@ mod tests {
         }];
         let bidir_errs = check_program_witnesses_bidirectional(&program);
         assert!(
-            bidir_errs.iter().any(|e| e.message.contains("type mismatch")),
+            bidir_errs
+                .iter()
+                .any(|e| e.message.contains("type mismatch")),
             "bidirectional should catch If cond type mismatch, got {:?}",
             bidir_errs
         );
@@ -315,11 +321,15 @@ mod tests {
             span: Span::default(),
         };
         let errs = check_program_witnesses(&[not_a_fn, bad_call]);
-        assert!(!errs.is_empty(), "expected type error when calling non-function, got none");
+        assert!(
+            !errs.is_empty(),
+            "expected type error when calling non-function, got none"
+        );
         let e = &errs[0];
         assert!(
             e.expected.is_some() || e.actual.is_some() || !e.message.is_empty(),
-            "error should carry diagnostic info, got {:?}", e
+            "error should carry diagnostic info, got {:?}",
+            e
         );
     }
 
@@ -329,7 +339,9 @@ mod tests {
         let program = vec![MirWitness {
             kind: WitnessKind::LetBinding {
                 name: "x".to_string(),
-                type_hint: Some(crate::mir::hint::TypeHint::from_type(crate::typeck::Type::Int)),
+                type_hint: Some(crate::mir::hint::TypeHint::from_type(
+                    crate::typeck::Type::Int,
+                )),
                 value: Box::new(str_lit_at("hello", 1, 5)),
                 init_body: Box::new(var_at("x", 2, 0)),
             },
@@ -337,10 +349,20 @@ mod tests {
         }];
         let errs = check_program_witnesses(&program);
         assert!(!errs.is_empty(), "expected at least one error, got none");
-        let mismatch = errs.iter().find(|e| e.message.contains("Type mismatch"))
+        let mismatch = errs
+            .iter()
+            .find(|e| e.message.contains("Type mismatch"))
             .expect("expected type mismatch error");
-        assert_eq!(mismatch.line, 1, "line should be 1, got {} (line 0 = bug)", mismatch.line);
-        assert_eq!(mismatch.column, 0, "column should be 0 (let keyword), got {}", mismatch.column);
+        assert_eq!(
+            mismatch.line, 1,
+            "line should be 1, got {} (line 0 = bug)",
+            mismatch.line
+        );
+        assert_eq!(
+            mismatch.column, 0,
+            "column should be 0 (let keyword), got {}",
+            mismatch.column
+        );
     }
 
     // v0.75.86: match arms body type 不一致应报真实行号
@@ -366,7 +388,11 @@ mod tests {
         }];
         let errs = check_program_witnesses(&program);
         if let Some(e) = errs.iter().find(|e| e.message.contains("Type")) {
-            assert!(e.line > 0, "match arm mismatch should report real line, got line {}", e.line);
+            assert!(
+                e.line > 0,
+                "match arm mismatch should report real line, got line {}",
+                e.line
+            );
         }
     }
 
@@ -383,10 +409,18 @@ mod tests {
         }];
         let errs = check_program_witnesses(&program);
         if let Some(e) = errs.iter().find(|e| e.message.contains("Type mismatch")) {
-            assert!(e.line > 0, "if branches mismatch should report real line, got line {}", e.line);
+            assert!(
+                e.line > 0,
+                "if branches mismatch should report real line, got line {}",
+                e.line
+            );
         }
         for e in &errs {
-            assert!(e.line > 0, "if-else error should have real line, got line 0: {:?}", e);
+            assert!(
+                e.line > 0,
+                "if-else error should have real line, got line 0: {:?}",
+                e
+            );
         }
     }
 
@@ -397,7 +431,9 @@ mod tests {
             MirWitness {
                 kind: WitnessKind::LetBinding {
                     name: "x".to_string(),
-                    type_hint: Some(crate::mir::hint::TypeHint::from_type(crate::typeck::Type::Int)),
+                    type_hint: Some(crate::mir::hint::TypeHint::from_type(
+                        crate::typeck::Type::Int,
+                    )),
                     value: Box::new(str_lit_at("str", 1, 12)),
                     init_body: Box::new(var_at("x", 1, 0)),
                 },
@@ -408,7 +444,11 @@ mod tests {
         let errs = check_program_witnesses(&program);
         assert!(errs.len() >= 2, "expected >= 2 errors, got {}", errs.len());
         for e in &errs {
-            assert!(e.line > 0, "any typeck error should have real line, got line 0: {:?}", e);
+            assert!(
+                e.line > 0,
+                "any typeck error should have real line, got line 0: {:?}",
+                e
+            );
         }
     }
 
@@ -425,7 +465,11 @@ mod tests {
         }];
         let errs = check_program_witnesses(&program);
         assert!(!errs.is_empty());
-        assert!(errs[0].line > 0, "binop mismatch should have real line, got {}", errs[0].line);
+        assert!(
+            errs[0].line > 0,
+            "binop mismatch should have real line, got {}",
+            errs[0].line
+        );
     }
 
     // v0.75.86: list elem 类型不一致应报真实行号
@@ -441,6 +485,10 @@ mod tests {
         }];
         let errs = check_program_witnesses(&program);
         assert!(!errs.is_empty());
-        assert!(errs[0].line > 0, "list elem mismatch should have real line, got {}", errs[0].line);
+        assert!(
+            errs[0].line > 0,
+            "list elem mismatch should have real line, got {}",
+            errs[0].line
+        );
     }
 }

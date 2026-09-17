@@ -139,7 +139,6 @@ impl Interpreter {
         }
     }
 
-
     pub(crate) fn call_value(
         &mut self,
         value: &Value,
@@ -182,9 +181,8 @@ impl Interpreter {
                 }
                 // v0.95: 环境纯值 —— 父环境是 O(1) 克隆快照（结构共享），
                 // 子任务对其赋值走 COW，不污染父环境。
-                let mut child_env = Environment::with_parent_of(std::sync::Arc::new(
-                    self.core.environment.clone(),
-                ));
+                let mut child_env =
+                    Environment::with_parent_of(std::sync::Arc::new(self.core.environment.clone()));
                 for (i, param) in params.iter().enumerate() {
                     let val = args.get(i).cloned().unwrap_or(Value::Nil);
                     child_env.define(param.clone(), val, false);
@@ -192,13 +190,16 @@ impl Interpreter {
                 crate::mir::vm::run_mir(mir_body, self, &mut child_env, effects)
             }
             // v0.102: 关系值调用 → Goal::Invoke（自含子句，搜索期无需按名解析）
-            Value::Relation { name, clauses } => Ok(Value::Goal(Box::new(
-                crate::rel::Goal::Invoke {
+            Value::Relation { name, clauses } => {
+                Ok(Value::Goal(Box::new(crate::rel::Goal::Invoke {
                     name: name.clone(),
                     clauses: Some(clauses.clone()),
-                    args: args.iter().map(|a| crate::rel::Term::Val(a.clone())).collect(),
-                },
-            ))),
+                    args: args
+                        .iter()
+                        .map(|a| crate::rel::Term::Val(a.clone()))
+                        .collect(),
+                })))
+            }
             // α.10: Compose/Partial 链路递归 call_value。
             Value::Compose(funcs) => {
                 let mut result = args;
@@ -213,7 +214,11 @@ impl Interpreter {
                 self.call_value(func, all_args, effects)
             }
             // v0.86: Curry — 累积参数直到 arity 时调用内部函数。
-            Value::Curry { func, arity, bound_args } => {
+            Value::Curry {
+                func,
+                arity,
+                bound_args,
+            } => {
                 let mut total_args = bound_args.clone();
                 total_args.extend(args);
                 if total_args.len() < *arity {

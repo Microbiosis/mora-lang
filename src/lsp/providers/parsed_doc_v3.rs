@@ -52,8 +52,9 @@ fn walk_witness_kind<F: FnMut(&MirWitness)>(kind: &WitnessKind, visit: &mut F) {
         }
         WitnessKind::Solve { goal, .. } => walk_witness(goal, visit),
         // v0.103: section 声明 — 遍历 body
-        WitnessKind::PromptSection { body, .. }
-        | WitnessKind::DocumentSection { body, .. } => walk_witness(body, visit),
+        WitnessKind::PromptSection { body, .. } | WitnessKind::DocumentSection { body, .. } => {
+            walk_witness(body, visit)
+        }
         WitnessKind::Observe { body, .. } | WitnessKind::Span { body, .. } => {
             walk_witness(body, visit)
         }

@@ -28,9 +28,7 @@ where
         match &w.kind {
             WitnessKind::Binary { left, right, .. }
             | WitnessKind::And { left, right }
-            | WitnessKind::Or { left, right } => {
-                walk(left, pred).or_else(|| walk(right, pred))
-            }
+            | WitnessKind::Or { left, right } => walk(left, pred).or_else(|| walk(right, pred)),
             WitnessKind::Call { args, .. } => args.iter().find_map(|a| walk(a, pred)),
             WitnessKind::MethodCall { receiver, args, .. } => {
                 walk(receiver, pred).or_else(|| args.iter().find_map(|a| walk(a, pred)))
@@ -39,10 +37,9 @@ where
             WitnessKind::If { cond, then, r#else } => walk(cond, pred)
                 .or_else(|| walk(then, pred))
                 .or_else(|| r#else.as_ref().and_then(|e| walk(e, pred))),
-            WitnessKind::Match { scrutinee, arms } => walk(scrutinee, pred).or_else(|| {
-                arms.iter()
-                    .find_map(|a| walk(&a.body, pred))
-            }),
+            WitnessKind::Match { scrutinee, arms } => {
+                walk(scrutinee, pred).or_else(|| arms.iter().find_map(|a| walk(&a.body, pred)))
+            }
             WitnessKind::Loop { iterable, body, .. } => {
                 walk(iterable, pred).or_else(|| walk(body, pred))
             }
@@ -51,11 +48,15 @@ where
             WitnessKind::Dict(entries) => entries.iter().find_map(|(_, v)| walk(v, pred)),
             WitnessKind::DynTrait { expr, .. } => walk(expr, pred),
             WitnessKind::Prompt { parts } => parts.iter().find_map(|p| walk(p, pred)),
-            WitnessKind::LetBinding { value, init_body, .. } => {
-                walk(value, pred).or_else(|| walk(init_body, pred))
-            }
+            WitnessKind::LetBinding {
+                value, init_body, ..
+            } => walk(value, pred).or_else(|| walk(init_body, pred)),
             WitnessKind::Assign { value, .. } => walk(value, pred),
-            WitnessKind::IndexAssign { object, index, value } => walk(object, pred)
+            WitnessKind::IndexAssign {
+                object,
+                index,
+                value,
+            } => walk(object, pred)
                 .or_else(|| walk(index, pred))
                 .or_else(|| walk(value, pred)),
             WitnessKind::Return(Some(v)) => walk(v, pred),
@@ -96,10 +97,14 @@ fn dyntrait_expr_as_dyn_trait_parses() {
 #[test]
 fn dyntrait_expr_as_dyn_trait_with_generics_parses() {
     let ws = compile_witnesses("x as dyn Any");
-    let found = find_witness(&ws, &|k| {
-        matches!(k, WitnessKind::DynTrait { trait_name, .. } if trait_name == "Any")
-    });
-    assert!(found.is_some(), "expected DynTrait node with trait_name Any");
+    let found = find_witness(
+        &ws,
+        &|k| matches!(k, WitnessKind::DynTrait { trait_name, .. } if trait_name == "Any"),
+    );
+    assert!(
+        found.is_some(),
+        "expected DynTrait node with trait_name Any"
+    );
 }
 
 #[test]
@@ -120,7 +125,10 @@ fn prompt_literal_without_interpolation_parses() {
 #[test]
 fn prompt_with_single_interpolation_parses() {
     let ws = compile_witnesses("p\"hello {name}\"");
-    let found = find_witness(&ws, &|k| matches!(k, WitnessKind::Prompt { parts } if parts.len() == 2));
+    let found = find_witness(
+        &ws,
+        &|k| matches!(k, WitnessKind::Prompt { parts } if parts.len() == 2),
+    );
     assert!(
         found.is_some(),
         "expected Prompt node with 2 parts (literal + interpolation)"
@@ -130,7 +138,10 @@ fn prompt_with_single_interpolation_parses() {
 #[test]
 fn prompt_with_multiple_interpolation_parses() {
     let ws = compile_witnesses("p\"{a} + {b}\"");
-    let found = find_witness(&ws, &|k| matches!(k, WitnessKind::Prompt { parts } if parts.len() >= 3));
+    let found = find_witness(
+        &ws,
+        &|k| matches!(k, WitnessKind::Prompt { parts } if parts.len() >= 3),
+    );
     assert!(
         found.is_some(),
         "expected Prompt node with multiple interpolations"
@@ -142,18 +153,20 @@ fn prompt_with_multiple_interpolation_parses() {
 #[test]
 fn method_call_parses() {
     let ws = compile_witnesses("obj.method()");
-    let found = find_witness(&ws, &|k| {
-        matches!(k, WitnessKind::MethodCall { method, .. } if method == "method")
-    });
+    let found = find_witness(
+        &ws,
+        &|k| matches!(k, WitnessKind::MethodCall { method, .. } if method == "method"),
+    );
     assert!(found.is_some(), "expected MethodCall node");
 }
 
 #[test]
 fn method_call_with_args_parses() {
     let ws = compile_witnesses("obj.method(1, 2)");
-    let found = find_witness(&ws, &|k| {
-        matches!(k, WitnessKind::MethodCall { method, args, .. } if method == "method" && args.len() == 2)
-    });
+    let found = find_witness(
+        &ws,
+        &|k| matches!(k, WitnessKind::MethodCall { method, args, .. } if method == "method" && args.len() == 2),
+    );
     assert!(found.is_some(), "expected MethodCall with 2 args");
 }
 
@@ -199,19 +212,28 @@ fn union_type_two_members_parses() {
         matches!(k, WitnessKind::LetBinding { type_hint: Some(h), .. }
             if matches!(h.to_type(), Type::Union(m) if m.len() == 2))
     });
-    assert!(found.is_some(), "expected LetBinding with 2-member union type hint");
+    assert!(
+        found.is_some(),
+        "expected LetBinding with 2-member union type hint"
+    );
 }
 
 #[test]
 fn union_type_three_members_parses() {
     use mora::typeck::Type;
     let ws = compile_witnesses("let x: string | number | bool = true");
-    assert!(!ws.is_empty(), "union type annotation with 3 members should parse");
+    assert!(
+        !ws.is_empty(),
+        "union type annotation with 3 members should parse"
+    );
     let found = find_witness(&ws, &|k| {
         matches!(k, WitnessKind::LetBinding { type_hint: Some(h), .. }
             if matches!(h.to_type(), Type::Union(m) if m.len() == 3))
     });
-    assert!(found.is_some(), "expected LetBinding with 3-member union type hint");
+    assert!(
+        found.is_some(),
+        "expected LetBinding with 3-member union type hint"
+    );
 }
 
 #[test]
@@ -251,25 +273,35 @@ rel path(x, z) edge(x, y), path(y, z) end",
         matches!(k, WitnessKind::RelDef { name, clauses, .. }
             if name == "path" && clauses.len() == 1)
     });
-    assert!(found.is_some(), "expected RelDef witness for the recursive path rule");
+    assert!(
+        found.is_some(),
+        "expected RelDef witness for the recursive path rule"
+    );
 }
 
 #[test]
 fn solve_query_parses_with_query_vars() {
-    let ws = compile_witnesses("rel e(1i)
-solve { e(?x) }");
+    let ws = compile_witnesses(
+        "rel e(1i)
+solve { e(?x) }",
+    );
     let found = find_witness(&ws, &|k| {
         matches!(k, WitnessKind::Solve { query_vars, limit: None, .. }
             if query_vars == &vec!["x".to_string()])
     });
-    assert!(found.is_some(), "expected Solve witness with query var x and no limit");
+    assert!(
+        found.is_some(),
+        "expected Solve witness with query var x and no limit"
+    );
 }
 
 #[test]
 fn solve_run_limit_parses() {
     // 无后缀数字字面量是 Float —— limit 解析须接受整数值 Float
-    let ws = compile_witnesses("rel e(1i)
-solve 3 { e(?x) }");
+    let ws = compile_witnesses(
+        "rel e(1i)
+solve 3 { e(?x) }",
+    );
     let found = find_witness(&ws, &|k| {
         matches!(k, WitnessKind::Solve { limit: Some(3), .. })
     });
@@ -278,11 +310,16 @@ solve 3 { e(?x) }");
 
 #[test]
 fn solve_anon_var_is_not_projected() {
-    let ws = compile_witnesses("rel e(1i)
-solve { e(_) }");
+    let ws = compile_witnesses(
+        "rel e(1i)
+solve { e(_) }",
+    );
     let found = find_witness(&ws, &|k| {
         matches!(k, WitnessKind::Solve { query_vars, anon_vars, .. }
             if query_vars.is_empty() && anon_vars.len() == 1)
     });
-    assert!(found.is_some(), "anonymous var should be in anon_vars, not query_vars");
+    assert!(
+        found.is_some(),
+        "anonymous var should be in anon_vars, not query_vars"
+    );
 }

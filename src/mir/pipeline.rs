@@ -22,6 +22,7 @@
 //!
 //! 执行器仍消费原 MirFunction（Phase 2 切换，待差分验证全绿后）。
 
+use crate::mir::MirFunction;
 use crate::mir::cmir_to_lmir::cmir_to_lmir;
 use crate::mir::core::CoreFunction;
 use crate::mir::core_to_cmir::core_to_cmir;
@@ -33,9 +34,8 @@ use crate::mir::lmir_to_rir::populate_layout_table;
 use crate::mir::rir::LayoutTable;
 use crate::mir::witness::MirWitness;
 use crate::mir::witness_to_fcfg::witness_to_fcfg;
-use crate::mir::MirFunction;
 use crate::typeck::annotate::annotate;
-use crate::typeck::export::{export_type_table, TypeTable};
+use crate::typeck::export::{TypeTable, export_type_table};
 
 /// 9 层管线运行结果。
 #[derive(Debug)]
@@ -105,8 +105,7 @@ pub fn run_pipeline(func: &MirFunction, witnesses: &[MirWitness]) -> (PipelineRe
     // ── 差分验证：lower_fcfg(fcfg) vs 原 MirFunction（raw vs raw）──
     let pipeline_mir_count = pipeline_body.len();
     let original_mir_count = func.body.len();
-    let (differential_ok, differential_diffs) =
-        differential_check(&pipeline_body, &func.body);
+    let (differential_ok, differential_diffs) = differential_check(&pipeline_body, &func.body);
 
     let result = PipelineResult {
         fcfg_nodes,
@@ -247,8 +246,7 @@ fn count_fcfg_children(n: &Fcfg) -> usize {
     use crate::mir::fcfg::Node;
     match n {
         Node::If { then, else_, .. } => {
-            count_fcfg_nodes(&then.nodes)
-                + else_.as_ref().map_or(0, |e| count_fcfg_nodes(&e.nodes))
+            count_fcfg_nodes(&then.nodes) + else_.as_ref().map_or(0, |e| count_fcfg_nodes(&e.nodes))
         }
         Node::While { cond, body, .. } => {
             count_fcfg_nodes(&cond.nodes) + count_fcfg_nodes(&body.nodes)
@@ -263,7 +261,9 @@ fn count_fcfg_children(n: &Fcfg) -> usize {
         Node::Sequence { nodes, .. } => count_fcfg_nodes(nodes),
         Node::MacroDef { body, .. } => count_fcfg_nodes(&body.nodes),
         Node::UpdateDef { body, .. } => count_fcfg_nodes(&body.nodes),
-        Node::AppDef { init, update, view, .. } => {
+        Node::AppDef {
+            init, update, view, ..
+        } => {
             count_fcfg_nodes(&init.nodes)
                 + count_fcfg_nodes(&update.nodes)
                 + count_fcfg_nodes(&view.nodes)
@@ -276,7 +276,10 @@ fn count_fcfg_children(n: &Fcfg) -> usize {
         Node::Observe { body, .. } | Node::Span { body, .. } => count_fcfg_nodes(&body.nodes),
         Node::Parallel { body, .. } => count_fcfg_nodes(&body.nodes),
         Node::Export { decl, .. } => count_fcfg_nodes(&decl.nodes),
-        Node::ImplDef { methods, .. } => methods.iter().map(|(_, b)| count_fcfg_nodes(&b.nodes)).sum(),
+        Node::ImplDef { methods, .. } => methods
+            .iter()
+            .map(|(_, b)| count_fcfg_nodes(&b.nodes))
+            .sum(),
         _ => 0,
     }
 }
@@ -293,8 +296,14 @@ mod tests {
         let (result, pipeline_func) = run_pipeline(&func, &witnesses);
         assert!(result.fcfg_nodes > 0, "FCFG should be non-empty");
         assert!(result.core_insts > 0, "Core should be non-empty");
-        assert!(result.layouts > 0, "LayoutTable should be populated (top-level Int/Float consts)");
-        assert!(!pipeline_func.body.is_empty(), "pipeline MirFunction should be non-empty");
+        assert!(
+            result.layouts > 0,
+            "LayoutTable should be populated (top-level Int/Float consts)"
+        );
+        assert!(
+            !pipeline_func.body.is_empty(),
+            "pipeline MirFunction should be non-empty"
+        );
     }
 
     #[test]
@@ -303,8 +312,14 @@ mod tests {
         let src = "task main()\n  print(10i + 32i)\nend";
         let (func, witnesses) = crate::parser_v3::ParserV3::compile(src).unwrap();
         let (result, pipeline_func) = run_pipeline(&func, &witnesses);
-        assert!(result.fcfg_nodes > 0, "FCFG should be non-empty (task body)");
-        assert!(result.core_insts > 0, "Core should be non-empty (closure create)");
+        assert!(
+            result.fcfg_nodes > 0,
+            "FCFG should be non-empty (task body)"
+        );
+        assert!(
+            result.core_insts > 0,
+            "Core should be non-empty (closure create)"
+        );
         assert!(!pipeline_func.body.is_empty());
     }
 

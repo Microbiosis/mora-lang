@@ -133,10 +133,9 @@ impl MirOrchestrateKind {
                 aggregator,
                 prompt,
             } => {
-                let prompt_fn = crate::mir::lower::lower_mir_witnesses(
-                    std::slice::from_ref(prompt.as_ref()),
-                )
-                .unwrap_or_default();
+                let prompt_fn =
+                    crate::mir::lower::lower_mir_witnesses(std::slice::from_ref(prompt.as_ref()))
+                        .unwrap_or_default();
                 MirOrchestrateKind::Moa {
                     layers: *layers,
                     proposers: proposers.clone(),
@@ -151,14 +150,12 @@ impl MirOrchestrateKind {
                 top_k,
                 prompt,
             } => {
-                let router_fn = crate::mir::lower::lower_mir_witnesses(
-                    std::slice::from_ref(router.as_ref()),
-                )
-                .unwrap_or_default();
-                let prompt_fn = crate::mir::lower::lower_mir_witnesses(
-                    std::slice::from_ref(prompt.as_ref()),
-                )
-                .unwrap_or_default();
+                let router_fn =
+                    crate::mir::lower::lower_mir_witnesses(std::slice::from_ref(router.as_ref()))
+                        .unwrap_or_default();
+                let prompt_fn =
+                    crate::mir::lower::lower_mir_witnesses(std::slice::from_ref(prompt.as_ref()))
+                        .unwrap_or_default();
                 MirOrchestrateKind::Moe {
                     experts: experts.iter().map(mir_moe_expert_from_witness).collect(),
                     router: router.as_ref().clone(),
@@ -200,7 +197,8 @@ fn mir_edge_from_witness(e: &crate::mir::witness::WitnessEdgeDef) -> MirEdgeDef 
 /// v0.92: MirWitness(MoE expert) → MirMoeExpert。
 fn mir_moe_expert_from_witness(w: &crate::mir::witness::MirWitness) -> MirMoeExpert {
     let def = w.clone();
-    let def_fn = crate::mir::lower::lower_mir_witnesses(std::slice::from_ref(w)).unwrap_or_default();
+    let def_fn =
+        crate::mir::lower::lower_mir_witnesses(std::slice::from_ref(w)).unwrap_or_default();
     MirMoeExpert {
         name: String::new(),
         def,

@@ -146,8 +146,9 @@ mod tests {
                 params: vec!["x".to_string()],
                 body: Vec::new(),
                 n_regs: 0,
-            
-            ..Default::default()}),
+
+                ..Default::default()
+            }),
         };
         r.register("script.handler", MockHandler::Script(closure));
         assert_eq!(r.count(), 1);

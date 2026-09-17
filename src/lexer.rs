@@ -70,7 +70,7 @@ pub enum TokenType {
     Less,
     GreaterEqual,
     LessEqual,
-    Pipe,  // `|>` pipeline operator
+    Pipe, // `|>` pipeline operator
     // v0.85: standalone `|` — used for union type annotations (`string | number`).
     // `|` alone = Or; `|>` = Pipe. Distinct tokens to avoid ambiguity.
     Or,
@@ -104,7 +104,7 @@ pub enum TokenType {
     LBrace,
     RBrace,
     Dot,
-    DotDot, // v0.87: '..' for list rest pattern
+    DotDot,    // v0.87: '..' for list rest pattern
     DotDotDot, // v0.16: '...' for list rest pattern
     Comma,
     Colon,

@@ -65,29 +65,29 @@ impl ParserV3 {
         let (v, v_w) = self.emit_expr_w()?;
         // v0.85: `let x: dyn Trait = v` — 自动 emit MirInst::DynTrait
         // coercion，将 plain value 包装为 Value::TraitObject（§3.5 spec 承诺）。
-        let (final_v, final_v_w) = if let Some(crate::typeck::Type::TraitObject {
-            trait_name,
-            ..
-        }) = type_hint.clone()
-        {
-            let dst = self.emit.alloc_reg();
-            self.emit.emit(MirInst::DynTrait {
-                dst,
-                src: v,
-                trait_generics: Vec::new(),
-                trait_name: trait_name.clone(),
-            });
-            (dst, MirWitness {
-                kind: WitnessKind::DynTrait {
-                    expr: Box::new(v_w),
-                    trait_name,
-                    generics: Vec::new(),
-                },
-                span,
-            })
-        } else {
-            (v, v_w)
-        };
+        let (final_v, final_v_w) =
+            if let Some(crate::typeck::Type::TraitObject { trait_name, .. }) = type_hint.clone() {
+                let dst = self.emit.alloc_reg();
+                self.emit.emit(MirInst::DynTrait {
+                    dst,
+                    src: v,
+                    trait_generics: Vec::new(),
+                    trait_name: trait_name.clone(),
+                });
+                (
+                    dst,
+                    MirWitness {
+                        kind: WitnessKind::DynTrait {
+                            expr: Box::new(v_w),
+                            trait_name,
+                            generics: Vec::new(),
+                        },
+                        span,
+                    },
+                )
+            } else {
+                (v, v_w)
+            };
         self.emit.emit(MirInst::Define(name.clone(), final_v));
         // init_body = Nil（与 lower LetBinding 一致：Const(Nil) → Assign → Var）
         let b_dst = self.emit.alloc_reg();
@@ -234,8 +234,7 @@ impl ParserV3 {
                 {
                     None
                 } else {
-                    self.emit_expr_w()
-                        .map(|(reg, w)| (reg, Box::new(w)))
+                    self.emit_expr_w().map(|(reg, w)| (reg, Box::new(w)))
                 };
                 self.emit
                     .emit(MirInst::Return(value.as_ref().map(|(reg, _)| *reg)));
@@ -494,10 +493,13 @@ impl ParserV3 {
             let nil_reg = self.emit.alloc_reg();
             self.emit
                 .emit(MirInst::Const(nil_reg, crate::value::Value::Nil));
-            (Some(nil_reg), MirWitness {
-                kind: WitnessKind::Literal(Literal::Nil(span)),
-                span,
-            })
+            (
+                Some(nil_reg),
+                MirWitness {
+                    kind: WitnessKind::Literal(Literal::Nil(span)),
+                    span,
+                },
+            )
         } else {
             let (r, w) = self.emit_expr_w()?;
             (Some(r), w)
@@ -632,10 +634,7 @@ impl ParserV3 {
         let name = self.consume_identifier("Expected app name")?;
 
         // 子上下文：app 块内部是独立寄存器空间
-        let parent = std::mem::replace(
-            &mut self.emit,
-            crate::mir::lower::EmitContext::new(),
-        );
+        let parent = std::mem::replace(&mut self.emit, crate::mir::lower::EmitContext::new());
 
         let mut model_name = String::new();
         let mut msg_name = String::new();
@@ -653,23 +652,23 @@ impl ParserV3 {
                 self.consume(TokenType::Colon, "Expected ':' after field name")?;
                 match field.as_str() {
                     "model" => {
-                        model_name = self
-                            .consume_identifier("Expected model name")?
-                            .clone();
+                        model_name = self.consume_identifier("Expected model name")?.clone();
                     }
                     "msg" => {
-                        msg_name = self
-                            .consume_identifier("Expected msg name")?
-                            .clone();
+                        msg_name = self.consume_identifier("Expected msg name")?.clone();
                     }
                     "init" => {
-                        init_witness = Some(Box::new(self.emit_expr_w().unwrap_or((0, {
-                            let s = self.span_of_current();
-                            MirWitness {
-                                kind: WitnessKind::Literal(Literal::Nil(s)),
-                                span: s,
-                            }
-                        })).1));
+                        init_witness = Some(Box::new(
+                            self.emit_expr_w()
+                                .unwrap_or((0, {
+                                    let s = self.span_of_current();
+                                    MirWitness {
+                                        kind: WitnessKind::Literal(Literal::Nil(s)),
+                                        span: s,
+                                    }
+                                }))
+                                .1,
+                        ));
                     }
                     // v0.103: 两种形态 ——
                     //   `update: fn(...) => ... end`  内联闭包体（原路径）
@@ -678,7 +677,8 @@ impl ParserV3 {
                     // 把后续字段行吞进体内（`view:` 那行因此报
                     // "Expected field name"）。名字引用改为合成一层转发闭包。
                     "update" => {
-                        if let Some((m, w)) = self.emit_app_field_ref_or_closure(&["model", "msg"]) {
+                        if let Some((m, w)) = self.emit_app_field_ref_or_closure(&["model", "msg"])
+                        {
                             update_mir = Some(m);
                             update_witness = Some(Box::new(w));
                         }
@@ -814,7 +814,8 @@ impl ParserV3 {
             param_regs.push(r);
         }
         let dst = self.emit.alloc_reg();
-        self.emit.emit(MirInst::Call(dst, name.clone(), param_regs.clone()));
+        self.emit
+            .emit(MirInst::Call(dst, name.clone(), param_regs.clone()));
         self.emit.emit_tail_return(Some(dst));
         let mut body_mir = std::mem::replace(&mut self.emit, parent).finish();
         // v0.104: 转发闭包的形参名必须落到 MirFunction.params —— 运行期

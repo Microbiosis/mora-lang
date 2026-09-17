@@ -98,9 +98,9 @@ pub fn is_pipe_method(name: &str) -> bool {
 
 /// 二元操作求值
 ///
-    /// v0.38: addition follows the numeric-tower promotion rules.
-    /// v0.76.00: 返回 `Result<Value, MoraError>`（MoraError 统一计划推进）。
-    /// v0.103: Int ⊂ Float —— 混合运算提升为 Float（此前 Rust-strict 报错）。
+/// v0.38: addition follows the numeric-tower promotion rules.
+/// v0.76.00: 返回 `Result<Value, MoraError>`（MoraError 统一计划推进）。
+/// v0.103: Int ⊂ Float —— 混合运算提升为 Float（此前 Rust-strict 报错）。
 pub fn eval_binary(left: Value, op: &BinaryOp, right: Value) -> Result<Value, MoraError> {
     match op {
         BinaryOp::Add => match (&left, &right) {
@@ -117,18 +117,22 @@ pub fn eval_binary(left: Value, op: &BinaryOp, right: Value) -> Result<Value, Mo
                 Ok(Value::BigInt(a + num_bigint::BigInt::from(*b)))
             }
             // Float + BigInt — 优先 BigInt（保留精度），仅当能无损转换时回 Float
-            (Value::Float(a), Value::BigInt(b)) => {
-                b.to_string().parse::<f64>().map_or_else(
-                    |_| Ok(Value::BigInt(num_bigint::BigInt::from(*a as i64) + b.clone())),
-                    |bf| Ok(Value::Float(*a + bf)),
-                )
-            }
-            (Value::BigInt(a), Value::Float(b)) => {
-                a.to_string().parse::<f64>().map_or_else(
-                    |_| Ok(Value::BigInt(a.clone() + num_bigint::BigInt::from(*b as i64))),
-                    |af| Ok(Value::Float(af + *b)),
-                )
-            }
+            (Value::Float(a), Value::BigInt(b)) => b.to_string().parse::<f64>().map_or_else(
+                |_| {
+                    Ok(Value::BigInt(
+                        num_bigint::BigInt::from(*a as i64) + b.clone(),
+                    ))
+                },
+                |bf| Ok(Value::Float(*a + bf)),
+            ),
+            (Value::BigInt(a), Value::Float(b)) => a.to_string().parse::<f64>().map_or_else(
+                |_| {
+                    Ok(Value::BigInt(
+                        a.clone() + num_bigint::BigInt::from(*b as i64),
+                    ))
+                },
+                |af| Ok(Value::Float(af + *b)),
+            ),
             // v0.103: numeric tower — Int ⊂ Float，混合运算提升为 Float。
             // 此前此处报 Rust-strict 错误，与三处既有事实矛盾：类型系统
             // （`unify.rs` 的 Numeric 约束把 Int/Float 提升为 Float）、
@@ -155,8 +159,7 @@ pub fn eval_binary(left: Value, op: &BinaryOp, right: Value) -> Result<Value, Mo
                         .iter()
                         .zip(b.iter())
                         .map(|(x, y)| {
-                            eval_binary(x.clone(), &BinaryOp::Add, y.clone())
-                                .unwrap_or(Value::Nil) // 不支持加法的元素对（如 dict+dict）→ Nil
+                            eval_binary(x.clone(), &BinaryOp::Add, y.clone()).unwrap_or(Value::Nil) // 不支持加法的元素对（如 dict+dict）→ Nil
                         })
                         .collect();
                     Ok(Value::List(result))
@@ -189,7 +192,9 @@ pub fn eval_binary(left: Value, op: &BinaryOp, right: Value) -> Result<Value, Mo
                     .collect();
                 Ok(Value::List(result))
             }
-            _ => Err(MoraError::Other("Operands must be two numbers, two strings, or two lists".to_string())),
+            _ => Err(MoraError::Other(
+                "Operands must be two numbers, two strings, or two lists".to_string(),
+            )),
         },
         BinaryOp::Sub => numeric_op(left, right, |a, b| a - b),
         BinaryOp::Mul => numeric_op(left, right, |a, b| a * b),
@@ -244,9 +249,7 @@ where
                 // 整数与浮点结果都用 i64 近似 — 浮点 BigInt 标记表示"原运算含 BigInt"
                 Ok(BigInt(num_bigint::BigInt::from(result as i64)))
             } else {
-                Err(MoraError::Other(
-                    "BigInt op out of f64 range".to_string(),
-                ))
+                Err(MoraError::Other("BigInt op out of f64 range".to_string()))
             }
         }
         (Int(a), BigInt(b)) => {
@@ -269,12 +272,8 @@ where
                 Err(MoraError::Other("BigInt op out of f64 range".to_string()))
             }
         }
-        (Float(a), BigInt(b)) => {
-            Ok(Float(op(a, bigint_to_f64_lossy(&b))))
-        }
-        (BigInt(a), Float(b)) => {
-            Ok(Float(op(bigint_to_f64_lossy(&a), b)))
-        }
+        (Float(a), BigInt(b)) => Ok(Float(op(a, bigint_to_f64_lossy(&b)))),
+        (BigInt(a), Float(b)) => Ok(Float(op(bigint_to_f64_lossy(&a), b))),
         // v0.103: numeric tower — Int ⊂ Float，混合提升为 Float（与 typeck
         // 的 Numeric 约束一致；此前报 Rust-strict 错误，属契约分叉）。
         (Int(a), Float(b)) => Ok(Float(op(a as f64, b))),

@@ -3,8 +3,8 @@
 #![allow(unused_mut)]
 
 mod tests_v0421_audit {
-    use crate::interpreter::Interpreter;
     use crate::audit::{AuditSink, JsonlAuditSink};
+    use crate::interpreter::Interpreter;
     use crate::value::Value;
     use std::sync::Arc;
 

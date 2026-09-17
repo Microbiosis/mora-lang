@@ -12,11 +12,7 @@ use super::*;
 
 impl Interpreter {
     /// v0.83: tea.* builtin dispatch。
-    pub fn call_tea_method(
-        &mut self,
-        method: &str,
-        args: &[Value],
-    ) -> Result<Value, String> {
+    pub fn call_tea_method(&mut self, method: &str, args: &[Value]) -> Result<Value, String> {
         match method {
             "init" => {
                 // v0.103: tea.init(init, update?, view?) —— 完整构造入口。
@@ -53,12 +49,8 @@ impl Interpreter {
                 Ok(Value::TeaApp(std::sync::Arc::new(app)))
             }
             "dispatch" => {
-                let app = args
-                    .first()
-                    .ok_or("tea.dispatch: missing app arg")?;
-                let msg_val = args
-                    .get(1)
-                    .ok_or("tea.dispatch: missing msg arg")?;
+                let app = args.first().ok_or("tea.dispatch: missing app arg")?;
+                let msg_val = args.get(1).ok_or("tea.dispatch: missing msg arg")?;
                 let app = match app {
                     Value::TeaApp(a) => a.clone(),
                     _ => return Err("tea.dispatch: first arg must be TeaApp".to_string()),
@@ -70,9 +62,7 @@ impl Interpreter {
                 Ok(Value::TeaApp(std::sync::Arc::new(next)))
             }
             "run" => {
-                let app = args
-                    .first()
-                    .ok_or("tea.run: missing app arg")?;
+                let app = args.first().ok_or("tea.run: missing app arg")?;
                 let max_steps = match args.get(1) {
                     Some(Value::Int(n)) => *n as usize,
                     _ => 1000,
@@ -86,9 +76,7 @@ impl Interpreter {
                 Ok(Value::TeaApp(std::sync::Arc::new(next)))
             }
             "model" => {
-                let app = args
-                    .first()
-                    .ok_or("tea.model: missing app arg")?;
+                let app = args.first().ok_or("tea.model: missing app arg")?;
                 match app {
                     Value::TeaApp(a) => Ok(a.model()),
                     _ => Err("tea.model: first arg must be TeaApp".to_string()),
@@ -96,12 +84,8 @@ impl Interpreter {
             }
             "update" => {
                 // v0.83: 真正调用 update 闭包 —— self 是 MirHost context
-                let app = args
-                    .first()
-                    .ok_or("tea.update: missing app arg")?;
-                let msg_val = args
-                    .get(1)
-                    .ok_or("tea.update: missing msg arg")?;
+                let app = args.first().ok_or("tea.update: missing app arg")?;
+                let msg_val = args.get(1).ok_or("tea.update: missing msg arg")?;
                 let app = match app {
                     Value::TeaApp(a) => a.clone(),
                     _ => return Err("tea.update: first arg must be TeaApp".to_string()),
@@ -114,9 +98,7 @@ impl Interpreter {
             }
             "view" => {
                 // v0.83: 真正调用 view 闭包
-                let app = args
-                    .first()
-                    .ok_or("tea.view: missing app arg")?;
+                let app = args.first().ok_or("tea.view: missing app arg")?;
                 let app = match app {
                     Value::TeaApp(a) => a.clone(),
                     _ => return Err("tea.view: first arg must be TeaApp".to_string()),
@@ -157,9 +139,7 @@ mod tests {
     #[test]
     fn tea_init_creates_app() {
         let mut interp = Interpreter::new();
-        let result = interp
-            .call_tea_method("init", &[Value::Int(42)])
-            .unwrap();
+        let result = interp.call_tea_method("init", &[Value::Int(42)]).unwrap();
         assert!(matches!(result, Value::TeaApp(_)));
     }
 
@@ -181,7 +161,9 @@ mod tests {
     #[test]
     fn tea_model_returns_initial() {
         let mut interp = Interpreter::new();
-        let app_val = interp.call_tea_method("init", &[Value::String("hello".to_string())]).unwrap();
+        let app_val = interp
+            .call_tea_method("init", &[Value::String("hello".to_string())])
+            .unwrap();
         let model = interp.call_tea_method("model", &[app_val]).unwrap();
         assert_eq!(model, Value::String("hello".to_string()));
     }

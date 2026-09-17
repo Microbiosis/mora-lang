@@ -45,13 +45,11 @@ impl Interpreter {
                 let call_args = args.get(1).cloned().unwrap_or(Value::Nil);
                 match self.registry.mock_registry.get(&name) {
                     Some(crate::mock::MockHandler::Native(f)) => Ok(f(&call_args)),
-                    Some(crate::mock::MockHandler::Script(closure)) => {
-                        self.call_value(
-                            &closure,
-                            vec![call_args],
-                            &mut crate::mir::effect::Effects::new(),
-                        )
-                    }
+                    Some(crate::mock::MockHandler::Script(closure)) => self.call_value(
+                        &closure,
+                        vec![call_args],
+                        &mut crate::mir::effect::Effects::new(),
+                    ),
                     None => Ok(Value::Nil),
                 }
             }

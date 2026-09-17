@@ -79,7 +79,11 @@ impl Search {
                         self.queue.push_back((alt, s.clone()));
                     }
                 }
-                Goal::Invoke { name, clauses, args } => {
+                Goal::Invoke {
+                    name,
+                    clauses,
+                    args,
+                } => {
                     self.invoke(host, &name, clauses, &args, chain, s)?;
                 }
                 Goal::Project { func, args, result } => {
@@ -222,14 +226,24 @@ pub fn rename_goal(g: &Goal, map: &mut HashMap<usize, u64>, next: &mut u64) -> G
         ),
         Goal::Conj(gs) => Goal::Conj(gs.iter().map(|g| rename_goal(g, map, next)).collect()),
         Goal::Disj(gs) => Goal::Disj(gs.iter().map(|g| rename_goal(g, map, next)).collect()),
-        Goal::Invoke { name, clauses, args } => Goal::Invoke {
+        Goal::Invoke {
+            name,
+            clauses,
+            args,
+        } => Goal::Invoke {
             name: name.clone(),
             clauses: clauses.clone(),
-            args: args.iter().map(|t| Term::Val(rename_term(t, map, next))).collect(),
+            args: args
+                .iter()
+                .map(|t| Term::Val(rename_term(t, map, next)))
+                .collect(),
         },
         Goal::Project { func, args, result } => Goal::Project {
             func: func.clone(),
-            args: args.iter().map(|t| Term::Val(rename_term(t, map, next))).collect(),
+            args: args
+                .iter()
+                .map(|t| Term::Val(rename_term(t, map, next)))
+                .collect(),
             result: Term::Val(rename_term(result, map, next)),
         },
     }
@@ -297,8 +311,20 @@ mod tests {
         let host = &mut TestHost::with(
             "edge",
             vec![
-                Clause::fact(vec![], vec![ground(Value::String("a".into())), ground(Value::String("b".into()))]),
-                Clause::fact(vec![], vec![ground(Value::String("a".into())), ground(Value::String("c".into()))]),
+                Clause::fact(
+                    vec![],
+                    vec![
+                        ground(Value::String("a".into())),
+                        ground(Value::String("b".into())),
+                    ],
+                ),
+                Clause::fact(
+                    vec![],
+                    vec![
+                        ground(Value::String("a".into())),
+                        ground(Value::String("c".into())),
+                    ],
+                ),
             ],
         );
         // solve { edge("a", ?x) }
@@ -326,12 +352,18 @@ mod tests {
             "e",
             vec![Clause::fact(
                 vec![],
-                vec![ground(Value::String("a".into())), ground(Value::String("b".into()))],
+                vec![
+                    ground(Value::String("a".into())),
+                    ground(Value::String("b".into())),
+                ],
             )],
         );
         host.rels.insert(
             "f".into(),
-            Arc::new(vec![Clause::fact(vec![], vec![ground(Value::String("b".into()))])]),
+            Arc::new(vec![Clause::fact(
+                vec![],
+                vec![ground(Value::String("b".into()))],
+            )]),
         );
         let goal = Goal::Conj(vec![
             Goal::Invoke {
@@ -368,21 +400,45 @@ mod tests {
         // rel path(x,z) e(x,y), path(y,z) end
         // e: a→b, b→c
         let e = vec![
-            Clause::fact(vec![], vec![ground(Value::String("a".into())), ground(Value::String("b".into()))]),
-            Clause::fact(vec![], vec![ground(Value::String("b".into())), ground(Value::String("c".into()))]),
+            Clause::fact(
+                vec![],
+                vec![
+                    ground(Value::String("a".into())),
+                    ground(Value::String("b".into())),
+                ],
+            ),
+            Clause::fact(
+                vec![],
+                vec![
+                    ground(Value::String("b".into())),
+                    ground(Value::String("c".into())),
+                ],
+            ),
         ];
         let path = vec![
             Clause::rule(
                 vec!["x".into(), "y".into()],
                 vec![p(0), p(1)],
-                Goal::Invoke { name: "e".into(), clauses: None, args: vec![p(0), p(1)] },
+                Goal::Invoke {
+                    name: "e".into(),
+                    clauses: None,
+                    args: vec![p(0), p(1)],
+                },
             ),
             Clause::rule(
                 vec!["x".into(), "z".into()],
                 vec![p(0), p(1)],
                 Goal::Conj(vec![
-                    Goal::Invoke { name: "e".into(), clauses: None, args: vec![p(0), p(2)] },
-                    Goal::Invoke { name: "path".into(), clauses: None, args: vec![p(2), p(1)] },
+                    Goal::Invoke {
+                        name: "e".into(),
+                        clauses: None,
+                        args: vec![p(0), p(2)],
+                    },
+                    Goal::Invoke {
+                        name: "path".into(),
+                        clauses: None,
+                        args: vec![p(2), p(1)],
+                    },
                 ]),
             ),
         ];
@@ -392,7 +448,10 @@ mod tests {
         let goal = Goal::Invoke {
             name: "path".into(),
             clauses: None,
-            args: vec![ground(Value::LogicVar(0)), ground(Value::String("c".into()))],
+            args: vec![
+                ground(Value::LogicVar(0)),
+                ground(Value::String("c".into())),
+            ],
         };
         let mut search = Search::new(goal, 1);
         let sols = collect(&mut search, &mut host, 10);
@@ -454,15 +513,15 @@ mod tests {
         // rel any(x) any(x) end   -- 无限左递归
         // solve 3 { any(?x) } → 公平交错下右侧备选不被饿死，得 3 个解
         let any = vec![
+            Clause::rule(vec!["x".into()], vec![p(0)], Goal::Succeed),
             Clause::rule(
                 vec!["x".into()],
                 vec![p(0)],
-                Goal::Succeed,
-            ),
-            Clause::rule(
-                vec!["x".into()],
-                vec![p(0)],
-                Goal::Invoke { name: "any".into(), clauses: None, args: vec![p(0)] },
+                Goal::Invoke {
+                    name: "any".into(),
+                    clauses: None,
+                    args: vec![p(0)],
+                },
             ),
         ];
         let host = &mut TestHost::with("any", any);
@@ -488,7 +547,10 @@ mod tests {
         let mut search = Search::new(goal, 1);
         let sols = collect(&mut search, host, 10);
         assert_eq!(sols.len(), 1);
-        assert_eq!(sols[0].walk(&Value::LogicVar(0)), Value::String("hello".into()));
+        assert_eq!(
+            sols[0].walk(&Value::LogicVar(0)),
+            Value::String("hello".into())
+        );
     }
 
     #[test]
@@ -552,10 +614,8 @@ mod tests {
 
     #[test]
     fn arity_mismatch_is_error() {
-        let host = &mut TestHost::with(
-            "e",
-            vec![Clause::fact(vec![], vec![ground(Value::Int(1))])],
-        );
+        let host =
+            &mut TestHost::with("e", vec![Clause::fact(vec![], vec![ground(Value::Int(1))])]);
         let goal = Goal::Invoke {
             name: "e".into(),
             clauses: None,
@@ -581,10 +641,7 @@ mod tests {
     fn embedded_clauses_skip_host_lookup() {
         // 自含子句的 Invoke 不查宿主
         let host = &mut TestHost::with("e", vec![]);
-        let clauses = Arc::new(vec![Clause::fact(
-            vec!["x".into()],
-            vec![p(0)],
-        )]);
+        let clauses = Arc::new(vec![Clause::fact(vec!["x".into()], vec![p(0)])]);
         let goal = Goal::Invoke {
             name: "embedded".into(),
             clauses: Some(clauses),
@@ -593,6 +650,9 @@ mod tests {
         let mut search = Search::new(goal, 1);
         let sols = collect(&mut search, host, 10);
         assert_eq!(sols.len(), 1);
-        assert!(matches!(sols[0].walk(&Value::LogicVar(0)), Value::LogicVar(_)));
+        assert!(matches!(
+            sols[0].walk(&Value::LogicVar(0)),
+            Value::LogicVar(_)
+        ));
     }
 }

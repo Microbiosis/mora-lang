@@ -295,9 +295,7 @@ impl MirWitness {
                 out.extend(args);
                 out
             }
-            WitnessKind::MethodCall {
-                receiver, args, ..
-            } => {
+            WitnessKind::MethodCall { receiver, args, .. } => {
                 let mut out = vec![receiver.as_ref()];
                 out.extend(args);
                 out
@@ -315,20 +313,14 @@ impl MirWitness {
                 }
                 out
             }
-            WitnessKind::If {
-                cond,
-                then,
-                r#else,
-            } => {
+            WitnessKind::If { cond, then, r#else } => {
                 let mut out = vec![cond.as_ref(), then.as_ref()];
                 if let Some(e) = r#else {
                     out.push(e.as_ref());
                 }
                 out
             }
-            WitnessKind::Loop {
-                iterable, body, ..
-            }
+            WitnessKind::Loop { iterable, body, .. }
             | WitnessKind::While {
                 cond: iterable,
                 body,
@@ -382,8 +374,9 @@ impl MirWitness {
             }
             WitnessKind::Solve { goal, .. } => vec![goal.as_ref()],
             // v0.103: section 声明的 body
-            WitnessKind::PromptSection { body, .. }
-            | WitnessKind::DocumentSection { body, .. } => vec![body.as_ref()],
+            WitnessKind::PromptSection { body, .. } | WitnessKind::DocumentSection { body, .. } => {
+                vec![body.as_ref()]
+            }
             // v0.103: 可观测性块的 body
             WitnessKind::Observe { body, .. } | WitnessKind::Span { body, .. } => {
                 vec![body.as_ref()]
@@ -564,7 +557,8 @@ impl WitnessOrchestrateKind {
                 rounds: *rounds,
                 exit_when: exit_when.clone(),
             },
-            MirOrchestrateKind::Graph { agents, edges } => WitnessOrchestrateKind::Graph {                agents: agents.iter().map(WitnessAgentDef::from_agent).collect(),
+            MirOrchestrateKind::Graph { agents, edges } => WitnessOrchestrateKind::Graph {
+                agents: agents.iter().map(WitnessAgentDef::from_agent).collect(),
                 edges: edges.iter().map(WitnessEdgeDef::from_edge).collect(),
             },
             MirOrchestrateKind::Pregel {
@@ -583,12 +577,13 @@ impl WitnessOrchestrateKind {
                 adjacency: adjacency.clone(),
             },
             // v0.75.84: MoA — 编译到 pregel 图，witness 记录声明参数。
+            // v0.104.4: 不再显式写 `prompt_fn: _,` —— 其后的 `..` 已覆盖全部
+            // 未列字段，clippy 1.98 的 unneeded_wildcard_pattern 拒绝该冗余。
             MirOrchestrateKind::Moa {
                 layers,
                 proposers,
                 aggregator,
                 prompt,
-                prompt_fn: _,
                 ..
             } => WitnessOrchestrateKind::Moa {
                 layers: *layers,
@@ -602,8 +597,6 @@ impl WitnessOrchestrateKind {
                 router,
                 top_k,
                 prompt,
-                router_fn: _,
-                prompt_fn: _,
                 ..
             } => WitnessOrchestrateKind::Moe {
                 experts: experts.iter().map(|e| e.def.clone()).collect(),

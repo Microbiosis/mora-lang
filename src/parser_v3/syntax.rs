@@ -92,20 +92,20 @@ impl ParserV3 {
                     };
                     if let Some(name) = name_opt {
                         self.advance();
-                        rest = Some(Box::new(
-                            crate::mir::witness::WitnessPattern::Variable(name),
-                        ));
+                        rest = Some(Box::new(crate::mir::witness::WitnessPattern::Variable(
+                            name,
+                        )));
                     } else {
                         rest = Some(Box::new(crate::mir::witness::WitnessPattern::Wildcard));
                     }
                     self.consume(TokenType::RBracket, "Expected ']' after rest pattern")?;
                     break;
                 }
-                if let Some(elem) = self.parse_pattern() {
-                    elements.push(elem);
-                } else {
-                    return None;
-                }
+                // v0.104.4: `?` 取代 `if let … else return None`
+                //（clippy 1.98 的 question_mark；本函数返回 `Option`，
+                // Option 的 `?` 在 `None` 时提前返回 `None`）。
+                let elem = self.parse_pattern()?;
+                elements.push(elem);
                 if !self.match_token_exact(TokenType::Comma) {
                     self.consume(TokenType::RBracket, "Expected ']' after list pattern")?;
                     break;
@@ -123,11 +123,10 @@ impl ParserV3 {
                 }
                 let key = self.consume_identifier("Expected dict key")?;
                 self.consume(TokenType::Colon, "Expected ':' after dict key")?;
-                if let Some(value_pat) = self.parse_pattern() {
-                    required.push((key, value_pat));
-                } else {
-                    return None;
-                }
+                // v0.104.4: `?` 取代 `if let … else return None`
+                //（clippy 1.98 的 question_mark）。
+                let value_pat = self.parse_pattern()?;
+                required.push((key, value_pat));
                 if !self.match_token_exact(TokenType::Comma) {
                     self.consume(TokenType::RBrace, "Expected '}' after dict pattern")?;
                     break;
@@ -443,9 +442,9 @@ impl ParserV3 {
                 };
                 let aggregator = moa_aggregator.unwrap_or_else(|| proposers[0].clone());
                 let prompt_witness = moa_prompt.unwrap_or_else(|| input_var_witness(start_span));
-                let prompt_fn = match crate::mir::lower::lower_mir_witnesses(
-                    std::slice::from_ref(&prompt_witness),
-                ) {
+                let prompt_fn = match crate::mir::lower::lower_mir_witnesses(std::slice::from_ref(
+                    &prompt_witness,
+                )) {
                     Ok(f) => f,
                     Err(_) => return None,
                 };
@@ -459,17 +458,17 @@ impl ParserV3 {
             }
             "moe" => {
                 let router_witness = moe_router.unwrap_or_else(|| input_var_witness(start_span));
-                let router_fn = match crate::mir::lower::lower_mir_witnesses(
-                    std::slice::from_ref(&router_witness),
-                ) {
+                let router_fn = match crate::mir::lower::lower_mir_witnesses(std::slice::from_ref(
+                    &router_witness,
+                )) {
                     Ok(f) => f,
                     Err(_) => return None,
                 };
                 let top_k = moe_top_k.unwrap_or(2);
                 let prompt_witness = moe_prompt.unwrap_or_else(|| input_var_witness(start_span));
-                let prompt_fn = match crate::mir::lower::lower_mir_witnesses(
-                    std::slice::from_ref(&prompt_witness),
-                ) {
+                let prompt_fn = match crate::mir::lower::lower_mir_witnesses(std::slice::from_ref(
+                    &prompt_witness,
+                )) {
                     Ok(f) => f,
                     Err(_) => return None,
                 };
@@ -489,7 +488,9 @@ impl ParserV3 {
             kind: crate::mir::witness::WitnessKind::Orchestrate {
                 input_var,
                 result_var,
-                kind: Box::new(crate::mir::witness::WitnessOrchestrateKind::from_kind(&kind)),
+                kind: Box::new(crate::mir::witness::WitnessOrchestrateKind::from_kind(
+                    &kind,
+                )),
             },
             span: start_span,
         })
@@ -540,15 +541,14 @@ impl ParserV3 {
                 return None;
             }
         };
-        let lowered_body = match crate::mir::lower::lower_mir_witnesses(std::slice::from_ref(
-            &body_witness,
-        )) {
-            Ok(f) => f,
-            Err(_) => {
-                self.current = saved;
-                return None;
-            }
-        };
+        let lowered_body =
+            match crate::mir::lower::lower_mir_witnesses(std::slice::from_ref(&body_witness)) {
+                Ok(f) => f,
+                Err(_) => {
+                    self.current = saved;
+                    return None;
+                }
+            };
         Some(MirOrchestrateAgent {
             name,
             with_config: None,
@@ -649,7 +649,12 @@ impl ParserV3 {
         }
 
         if members.len() == 1 {
-            Some(members.into_iter().next().expect("members.len() == 1 verified"))
+            Some(
+                members
+                    .into_iter()
+                    .next()
+                    .expect("members.len() == 1 verified"),
+            )
         } else {
             Some(Type::Union(members))
         }

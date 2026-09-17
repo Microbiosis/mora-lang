@@ -83,9 +83,7 @@ fn e2e_assign_statement_recognized() {
     let v = assert_source_ok("task f()\n  let x = 1i\n  assign x = 9i\n  x\nend\nf()");
     assert_eq!(num(v), 9.0, "task 体内 assign 应生效");
     // 循环体内
-    let v = assert_source_ok(
-        "let acc = 0\nfor i in [1, 2, 3]\n  assign acc = acc + i\nend\nacc",
-    );
+    let v = assert_source_ok("let acc = 0\nfor i in [1, 2, 3]\n  assign acc = acc + i\nend\nacc");
     assert_eq!(num(v), 6.0, "循环体内 assign 应生效");
     // while 体内
     let v = assert_source_ok("let n = 0i\nwhile n < 3i\n  assign n = n + 1i\nend\nn");
@@ -124,9 +122,7 @@ fn e2e_loop_bodies_are_typechecked() {
         e
     );
     // 未定义变量在 while 体内必须报错
-    let e = errs_of(
-        "task main()\n  let n = 0\n  while n < 1\n    print(nosuchvar)\n  end\nend",
-    );
+    let e = errs_of("task main()\n  let n = 0\n  while n < 1\n    print(nosuchvar)\n  end\nend");
     assert!(
         e.iter().any(|m| m.contains("nosuchvar")),
         "while 体内的未定义变量必须报错，实际 {:?}",
@@ -141,7 +137,10 @@ fn e2e_loop_bodies_are_typechecked() {
     );
     // 合法循环仍通过
     let v = assert_source_ok("for x in [1i, 2i]\n  print(x)\nend\n42i");
-    assert!(matches!(v, mora::value::Value::Int(42) | mora::value::Value::Float(_)));
+    assert!(matches!(
+        v,
+        mora::value::Value::Int(42) | mora::value::Value::Float(_)
+    ));
 }
 
 /// v0.104: 数值塔在**赋值**与**含未解析变量**的运算位点同样成立。
@@ -335,11 +334,8 @@ fn e2e_match_arm_body_need_not_match_scrutinee() {
         v
     );
     // 反向契约：arm 之间**不兼容**时仍必须报错
-    let (_, ws) = mora::cli::compile_and_opt(
-        "match 1i {\n  1i => \"str\"\n  _ => 42i\n}\n",
-        None,
-    )
-    .expect("compile");
+    let (_, ws) = mora::cli::compile_and_opt("match 1i {\n  1i => \"str\"\n  _ => 42i\n}\n", None)
+        .expect("compile");
     let errs = mora::typeck::check_mir::check_program_witnesses_bidirectional(&ws);
     assert!(
         !errs.is_empty(),
@@ -458,10 +454,9 @@ let x: int = "not an int"
 x
 "#;
     let res = (|| -> Result<(), String> {
-        let (_, witnesses) = mora::parser_v3::ParserV3::compile(bogus)
-            .map_err(|e| format!("parse: {}", e))?;
-        let type_errs =
-            mora::typeck::check_mir::check_program_witnesses_bidirectional(&witnesses);
+        let (_, witnesses) =
+            mora::parser_v3::ParserV3::compile(bogus).map_err(|e| format!("parse: {}", e))?;
+        let type_errs = mora::typeck::check_mir::check_program_witnesses_bidirectional(&witnesses);
         if !type_errs.is_empty() {
             return Err(format!("{} type error(s)", type_errs.len()));
         }
@@ -501,10 +496,7 @@ fn e2e_compile_and_opt_returns_err_on_parse_error() {
         "语法错误必须以 Err 返回（此前 panic），实际 Ok"
     );
     let msg = res.expect_err("asserted is_err above");
-    assert!(
-        !msg.is_empty(),
-        "解析错误消息不得为空（需可读定位）"
-    );
+    assert!(!msg.is_empty(), "解析错误消息不得为空（需可读定位）");
 }
 
 // ===================================================================
@@ -822,9 +814,7 @@ fn e2e_export_visibility_runs() {
 #[test]
 fn e2e_export_private_symbol_not_visible() {
     let src = "import \"tests/fixtures/mod_export.mora\"\nlet x = hidden";
-    let witnesses = mora::parser_v3::ParserV3::compile(src)
-        .expect("parse")
-        .1;
+    let witnesses = mora::parser_v3::ParserV3::compile(src).expect("parse").1;
     let errs = mora::typeck::check_mir::check_program_witnesses_bidirectional(&witnesses);
     assert!(
         !errs.is_empty(),
@@ -852,6 +842,59 @@ fn e2e_explicit_api_runs() {
     );
 }
 
+/// v0.104.4: **具体类型的自反合一** —— `unify(τ, τ)` 对任何 τ 成立。
+///
+/// 缺陷：`unify` 只列了 Int/Float/BigInt/String/Bool/Nil/Any 七个具体类型的
+/// 自反 arm，其余所有具体类型（Router、McpServer、Conversation…）落到末尾
+/// `_ => Err` —— 同一类型与自己合一都失败。触发面是「把方法返回值赋回同一
+/// 变量」的链式累加：`mcp = mcp.tool(…)` 报 "expected mcp_server, got
+/// mcp_server"；而 `let y = x.tool(…)`（新绑定走 generalize、不推 `Eq`）
+/// 正常，于是呈现为「赋回自己失败、换个名字就好」的怪象。
+/// 这正是 CI 里 `examples/mcp_server_demo.mora` 的报错。
+#[test]
+fn e2e_concrete_type_self_reassign_unifies() {
+    use e2e_helpers::run_source;
+    use mora::value::Value;
+    // ① McpServer 链式累加（CI 示例的形状）
+    let src = "let mcp = McpServer::new()\nmcp = mcp.tool(\"t\", {}, fn(a) return 1i end)\nmcp";
+    match run_source(src) {
+        e2e_helpers::E2eResult::Ok { last_expr, .. } => assert!(
+            matches!(last_expr, Value::McpServer { .. }),
+            "McpServer 自反赋值后应仍是 mcp_server，得到 {:?}",
+            last_expr
+        ),
+        e2e_helpers::E2eResult::CompileError(e) => {
+            panic!("McpServer 自反赋值不应是编译错误: {e}")
+        }
+        e2e_helpers::E2eResult::TypeErrors(errs) => panic!(
+            "McpServer 自反赋值不应报类型错误: {:?}",
+            errs.iter()
+                .map(mora::typeck::format_error)
+                .collect::<Vec<_>>()
+        ),
+    }
+    // ② Router 同理
+    let src = "let r = Router::new()\nr = r.route(\"GET\", \"/x\", fn(q) return 1i end)\nr";
+    match run_source(src) {
+        e2e_helpers::E2eResult::Ok { last_expr, .. } => assert!(
+            matches!(last_expr, Value::Router { .. }),
+            "Router 自反赋值后应仍是 router，得到 {:?}",
+            last_expr
+        ),
+        _ => panic!("Router 自反赋值必须通过类型检查"),
+    }
+    // ③ 反向：真正不同的具体类型仍必须被拒（契约未放松）
+    let (_f, w) = mora::parser_v3::ParserV3::compile(
+        "let mcp = McpServer::new()\nlet r = Router::new()\nmcp = r\n",
+    )
+    .expect("compile");
+    let errs = mora::typeck::check_mir::check_program_witnesses_bidirectional(&w);
+    assert!(
+        !errs.is_empty(),
+        "McpServer 赋值为 Router 必须被拒，实际无错误"
+    );
+}
+
 /// prompt_section.mora：`prompt "name" do ... end` 声明 + compose_prompt 拼接。
 /// 锁定：prompt 关键字不被 parser 消费、handler 吞错不构建值、
 /// compose_prompt 读错环境（core.environment vs 执行 env）三处缺陷。
@@ -864,7 +907,11 @@ fn e2e_prompt_section_runs() {
         other => panic!("compose_prompt 应返回字符串，得到 {:?}", other),
     };
     assert!(out.contains("system"), "拼接结果应含 system 节: {}", out);
-    assert!(out.contains("You are a helpful assistant."), "应含 system 正文: {}", out);
+    assert!(
+        out.contains("You are a helpful assistant."),
+        "应含 system 正文: {}",
+        out
+    );
     assert!(out.contains("user"), "拼接结果应含 user 节: {}", out);
     assert!(out.contains("What is Mora?"), "应含 user 正文: {}", out);
 }
@@ -876,8 +923,11 @@ fn e2e_prompt_section_runs() {
 fn builtin_module_objects_pass_typeck() {
     use mora::value::MODULE_OBJECTS;
     for (name, _) in MODULE_OBJECTS {
-        let src = format!("let x = {}
-", name);
+        let src = format!(
+            "let x = {}
+",
+            name
+        );
         let (_f, w) = mora::parser_v3::ParserV3::compile(&src)
             .unwrap_or_else(|e| panic!("{} 编译失败: {}", name, e));
         let errs = mora::typeck::check_mir::check_program_witnesses_bidirectional(&w);
@@ -885,7 +935,9 @@ fn builtin_module_objects_pass_typeck() {
             errs.is_empty(),
             "模块对象 {} 不应在 typeck 报错: {:?}",
             name,
-            errs.iter().map(mora::typeck::format_error).collect::<Vec<_>>()
+            errs.iter()
+                .map(mora::typeck::format_error)
+                .collect::<Vec<_>>()
         );
     }
 }
@@ -1125,7 +1177,8 @@ fn e2e_continue_advances_for_loop_index() {
         );
     }
     // 对照：不 continue 时为 6（证明上面的差异确实来自 continue）
-    let v = assert_source_ok("let sum = 0i\nfor i in [1i, 2i, 3i]\n  assign sum = sum + i\nend\nsum");
+    let v =
+        assert_source_ok("let sum = 0i\nfor i in [1i, 2i, 3i]\n  assign sum = sum + i\nend\nsum");
     assert_eq!(num(v), 6.0, "无 continue 时 1+2+3=6");
 }
 
@@ -1157,7 +1210,9 @@ fn e2e_if_then_block_and_single_stmt_forms() {
     // then + 块体 + else + end
     ok("if 1i > 0i then\n  print(\"pos\")\nelse\n  print(\"neg\")\nend\n7i");
     // else-if 链
-    ok("let x = 2i\nif x > 5i then\n  print(\"big\")\nelse if x > 1i then\n  print(\"mid\")\nelse\n  print(\"small\")\nend\n1i");
+    ok(
+        "let x = 2i\nif x > 5i then\n  print(\"big\")\nelse if x > 1i then\n  print(\"mid\")\nelse\n  print(\"small\")\nend\n1i",
+    );
     // then + 单语句 + end
     ok("if true then print(\"t\") end\n9i");
     // then + break（语句而非表达式）
@@ -1238,7 +1293,10 @@ fn e2e_string_method_arities_match_runtime() {
         Value::String(x) => x,
         other => panic!("期望字符串，得到 {:?}", other),
     };
-    assert_eq!(s(assert_source_ok("\"a-b\" |> replace(\"-\", \"+\")")), "a+b");
+    assert_eq!(
+        s(assert_source_ok("\"a-b\" |> replace(\"-\", \"+\")")),
+        "a+b"
+    );
     assert_eq!(s(assert_source_ok("\"  x  \" |> trim() |> upper()")), "X");
     assert!(matches!(
         assert_source_ok("\"abc\" |> contains(\"b\")"),
@@ -1252,9 +1310,7 @@ fn e2e_string_method_arities_match_runtime() {
         assert_source_ok("\"abc\" |> ends_with(\"c\")"),
         Value::Bool(true)
     ));
-    assert!(
-        matches!(&assert_source_ok("\"a,b\" |> split(\",\")"), Value::List(l) if l.len() == 2)
-    );
+    assert!(matches!(&assert_source_ok("\"a,b\" |> split(\",\")"), Value::List(l) if l.len() == 2));
 }
 
 /// v0.104.2: 空块不得 panic 或返回哨兵寄存器。
@@ -1273,13 +1329,21 @@ fn e2e_empty_blocks_do_not_panic() {
     // 直接验证「空块之后程序继续执行、返回尾值」。
     for (label, src, expect) in [
         ("空 transaction 体", "transaction\nend\n5i\n", 5.0),
-        ("transaction + commit", "transaction\n  commit\nend\n6i\n", 6.0),
+        (
+            "transaction + commit",
+            "transaction\n  commit\nend\n6i\n",
+            6.0,
+        ),
         (
             "transaction + rollback + 空 compensation",
             "transaction\n  print(1i)\ncompensation\nend\n7i\n",
             7.0,
         ),
-        ("空 then 分支", "if true then\nelse\n  print(1i)\nend\n8i\n", 8.0),
+        (
+            "空 then 分支",
+            "if true then\nelse\n  print(1i)\nend\n8i\n",
+            8.0,
+        ),
     ] {
         let (func, _w) = mora::cli::compile_and_opt(src, None).expect("compile");
         let mut interp = mora::interpreter::Interpreter::new();
@@ -1322,13 +1386,21 @@ fn e2e_loop_fixtures_exact_values() {
     assert_eq!(num(v), 55.0, "loop_basic: while 1..=10 累加应为 55");
     // while + break（i==5 时 break）累加 1..4 = 10，末表达式 = 10 + 1000
     let (v, _) = assert_ok("loop_break.mora");
-    assert_eq!(num(v), 1010.0, "loop_break: break 于 i=5 得 10，+1000 = 1010");
+    assert_eq!(
+        num(v),
+        1010.0,
+        "loop_break: break 于 i=5 得 10，+1000 = 1010"
+    );
     // while + continue（i==3 跳过）累加 1+2+4+5 = 12，+1000
     let (v, _) = assert_ok("loop_continue.mora");
     assert_eq!(num(v), 1012.0, "loop_continue: 跳过 3 得 12，+1000 = 1012");
     // for + break（i==6 时 break）累加 1..5 = 15，+1000
     let (v, _) = assert_ok("loop_for_break.mora");
-    assert_eq!(num(v), 1015.0, "loop_for_break: break 于 6 得 15，+1000 = 1015");
+    assert_eq!(
+        num(v),
+        1015.0,
+        "loop_for_break: break 于 6 得 15，+1000 = 1015"
+    );
 }
 
 /// v0.103: 变参 `print` —— 运行期 join 全部实参，类型系统必须接受多实参。
@@ -1421,5 +1493,9 @@ end",
         ret_reg, binary_dst,
         "Return 必须指向 BinaryOp 的结果寄存器，而非硬编码 0"
     );
-    assert_ne!(binary_dst, Some(0), "该表达式结果不在 reg 0，能检出硬编码回归");
+    assert_ne!(
+        binary_dst,
+        Some(0),
+        "该表达式结果不在 reg 0，能检出硬编码回归"
+    );
 }

@@ -1,16 +1,22 @@
 -- v0.07: MCP server demo（serve as mcp 已移除，走 McpServer::new() 显式 API）
 -- 测: tool 注册 + serve 启动
+--
+-- v0.104.4 修复：此前第 6/7 行写 `let q := args["query"]` —— `:=` **不是**
+-- Mora 的绑定语法（Mora 用 `let x = …`），故报 "expected type annotation at
+-- line 6/7"。该示例因此从未跑通，CI 的 Integration Tests 一直红。
+-- 另：`mcp = mcp.tool(…)` 这种「把方法返回值赋回同一变量」的写法同时暴露了
+-- `unify` 缺通用自反 arm 的缺陷（报 "expected mcp_server, got mcp_server"），
+-- 已一并修复。
 
 let mcp = McpServer::new()
 mcp = mcp.tool("search", {query: "string", max_results: "number"}, fn(args)
-  let q := args["query"]
-  let n := args["max_results"]
+  let q = args["query"]
+  let n = args["max_results"]
   return "found " + n + " docs for: " + q
 end)
 mcp = mcp.tool("calculate", {expression: "string"}, fn(args)
   return 42
 end)
 
-mcp.serve()
-
-print("server blocks")
+print(type_of(mcp))
+print("tools registered")

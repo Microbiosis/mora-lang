@@ -10,8 +10,8 @@
 
 use std::borrow::Cow;
 
-use crate::value::persistent::PersistentMap;
 use crate::value::Value;
+use crate::value::persistent::PersistentMap;
 
 #[derive(Debug, Clone, Default)]
 pub struct Subst {
@@ -25,7 +25,9 @@ fn key_of(var: u64) -> String {
 
 impl Subst {
     pub fn new() -> Subst {
-        Subst { map: PersistentMap::new() }
+        Subst {
+            map: PersistentMap::new(),
+        }
     }
 
     pub fn is_empty(&self) -> bool {
@@ -34,7 +36,9 @@ impl Subst {
 
     /// 绑定逻辑变量，返回新版本替换。
     pub fn bind(&self, var: u64, val: Value) -> Subst {
-        Subst { map: self.map.assoc(&key_of(var), val) }
+        Subst {
+            map: self.map.assoc(&key_of(var), val),
+        }
     }
 
     /// 查询变量的直接绑定（不沿链解析）。
@@ -77,7 +81,9 @@ impl Subst {
             Value::Dict(entries) => {
                 let mut out = entries.clone();
                 let mut changed = false;
-                for (_k, val) in out.iter_mut() {
+                // v0.104.4: `values_mut()` 取代 `for (_k, val) in iter_mut()`
+                //（clippy 1.98 的 for_kv_map）。
+                for val in out.values_mut() {
                     let resolved = self.walk_star(val);
                     if &resolved != val {
                         changed = true;
@@ -153,7 +159,10 @@ mod tests {
     fn walk_unbound_is_identity() {
         let s = Subst::new();
         assert!(matches!(s.walk(&var(7)), Value::LogicVar(7)));
-        assert!(matches!(s.walk_ref(&Value::Int(3)), Cow::Borrowed(Value::Int(3))));
+        assert!(matches!(
+            s.walk_ref(&Value::Int(3)),
+            Cow::Borrowed(Value::Int(3))
+        ));
     }
 
     #[test]
@@ -161,13 +170,19 @@ mod tests {
         // x=0 → "a"；列表 [x, 2] → ["a", 2]
         let s = Subst::new().bind(0, Value::String("a".into()));
         let term = Value::List(vec![var(0), Value::Int(2)]);
-        assert_eq!(s.walk_star(&term), Value::List(vec![Value::String("a".into()), Value::Int(2)]));
+        assert_eq!(
+            s.walk_star(&term),
+            Value::List(vec![Value::String("a".into()), Value::Int(2)])
+        );
     }
 
     #[test]
     fn walk_star_resolves_cons() {
         let s = Subst::new().bind(0, Value::Int(1));
-        let term = Value::Cons { car: Box::new(var(0)), cdr: Box::new(Value::Nil) };
+        let term = Value::Cons {
+            car: Box::new(var(0)),
+            cdr: Box::new(Value::Nil),
+        };
         let out = s.walk_star(&term);
         assert!(matches!(out, Value::Cons { ref car, .. } if **car == Value::Int(1)));
     }

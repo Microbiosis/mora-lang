@@ -167,15 +167,25 @@ pub fn solve(constraint: &Constraint, subst: &Substitution) -> Result<Substituti
             let right = subst.apply(&bc.right);
             let promoted = match (&left, &right) {
                 (crate::typeck::Type::Int, crate::typeck::Type::Int) => crate::typeck::Type::Int,
-                (crate::typeck::Type::Float, crate::typeck::Type::Float) => crate::typeck::Type::Float,
+                (crate::typeck::Type::Float, crate::typeck::Type::Float) => {
+                    crate::typeck::Type::Float
+                }
                 (crate::typeck::Type::Int, crate::typeck::Type::Float)
-                | (crate::typeck::Type::Float, crate::typeck::Type::Int) => crate::typeck::Type::Float,
+                | (crate::typeck::Type::Float, crate::typeck::Type::Int) => {
+                    crate::typeck::Type::Float
+                }
                 // v0.91: BigInt promotion — 任一含 BigInt 时结果 BigInt
-                (crate::typeck::Type::BigInt, crate::typeck::Type::BigInt) => crate::typeck::Type::BigInt,
+                (crate::typeck::Type::BigInt, crate::typeck::Type::BigInt) => {
+                    crate::typeck::Type::BigInt
+                }
                 (crate::typeck::Type::Int, crate::typeck::Type::BigInt)
-                | (crate::typeck::Type::BigInt, crate::typeck::Type::Int) => crate::typeck::Type::BigInt,
+                | (crate::typeck::Type::BigInt, crate::typeck::Type::Int) => {
+                    crate::typeck::Type::BigInt
+                }
                 (crate::typeck::Type::Float, crate::typeck::Type::BigInt)
-                | (crate::typeck::Type::BigInt, crate::typeck::Type::Float) => crate::typeck::Type::Float,
+                | (crate::typeck::Type::BigInt, crate::typeck::Type::Float) => {
+                    crate::typeck::Type::Float
+                }
                 // TypeVar + numeric → bind TypeVar to numeric type
                 (crate::typeck::Type::TypeVar(v), crate::typeck::Type::Int)
                 | (crate::typeck::Type::Int, crate::typeck::Type::TypeVar(v)) => {
@@ -204,8 +214,7 @@ pub fn solve(constraint: &Constraint, subst: &Substitution) -> Result<Substituti
                 }
                 // TypeVar + 任何类型 — Numeric 约束要求两侧均为已解析数值，
                 // TypeVar 出现在此处说明推断有误（infer_binop guard 应阻止）。
-                (crate::typeck::Type::TypeVar(_), _)
-                | (_, crate::typeck::Type::TypeVar(_)) => {
+                (crate::typeck::Type::TypeVar(_), _) | (_, crate::typeck::Type::TypeVar(_)) => {
                     return Err(crate::typeck::hm::error::TypeError::UnificationFailure {
                         expected: "numeric type (int or float)".to_string(),
                         got: format!("{} and {}", format_type(&left), format_type(&right)),
@@ -393,6 +402,28 @@ fn unify(
             }
         }
 
+        // v0.104.4: **自反性（通用）** —— `unify(τ, τ) = Ok` 对**任何**类型 τ
+        // 成立。这是合一作为等价关系的公理，不该按变体逐个列举。
+        //
+        // 缺陷背景：此前只在文件上方列了 Int/Float/BigInt/String/Bool/Nil/Any
+        // 七个具体类型的自反 arm，其余**所有**具体类型（Router、McpServer、
+        // Conversation、Agent、Stream、Document、HttpRequest、…）落到下面的
+        // Mismatch 分支 —— **同一类型与自己合一都失败**：
+        //   let mcp = McpServer::new()
+        //   mcp = mcp.tool("t", {}, handler)   -- "expected mcp_server,
+        //                                         got mcp_server"
+        // 触发面：任何「把方法返回值赋回同一变量」的链式累加（`x = x.m(…)`），
+        // 或任何需要 `Eq(τ,τ)` 的位点。而 `let y = x.m(…)`（新绑定走
+        // generalize、不推 Eq）正常 —— 呈现为「赋回自己失败、换个名字就好」
+        // 的怪象，正是 CI 里 `examples/mcp_server_demo.mora` 的报错。
+        // 与 v0.103 补 BigInt 自反是同一个坑，当时只补了那一个变体；此处
+        // 按公理修根，不再逐个变体列举（列举法正是漏项的成因）。
+        //
+        // 位置：必须在 **Unknown fail-fast 之后**（`Unknown` 与任何类型合一
+        // 都失败，包括它自己 —— 那是刻意的逃逸标签语义），也必须在
+        // TypeVar/Any/ForAll/结构化递归 arm 之后（那些有更具体的处理）。
+        _ if t1 == t2 => Ok(subst.clone()),
+
         // Mismatch
         _ => Err(TypeError::UnificationFailure {
             expected: format_type(&t1),
@@ -426,9 +457,7 @@ fn contains_typevar(ty: &crate::typeck::Type, var: char) -> bool {
         // v0.83/v0.102: Tuple / Cons / Relation 元素
         crate::typeck::Type::Tuple(elems) => elems.iter().any(|e| contains_typevar(e, var)),
         crate::typeck::Type::Cons(h, t) => contains_typevar(h, var) || contains_typevar(t, var),
-        crate::typeck::Type::Relation(params) => {
-            params.iter().any(|p| contains_typevar(p, var))
-        }
+        crate::typeck::Type::Relation(params) => params.iter().any(|p| contains_typevar(p, var)),
         // 泛型载体（Trait / Concrete / TraitObject 的泛型实参）
         crate::typeck::Type::Trait { generics, .. }
         | crate::typeck::Type::Concrete { generics, .. }
@@ -473,9 +502,7 @@ fn contains_typevar_resolved(s: &Substitution, var: char, ty: &crate::typeck::Ty
         Type::Relation(params) => params.iter().any(|p| occurs_in_subst(s, var, p)),
         Type::Trait { generics, .. }
         | Type::Concrete { generics, .. }
-        | Type::TraitObject { generics, .. } => {
-            generics.iter().any(|g| occurs_in_subst(s, var, g))
-        }
+        | Type::TraitObject { generics, .. } => generics.iter().any(|g| occurs_in_subst(s, var, g)),
         _ => false,
     }
 }
@@ -525,6 +552,51 @@ mod tests {
 
     // ─── v0.102: 合一的自反性与传递 occurs check ───
 
+    /// v0.104.4: **具体类型的自反性必须是通用的**，不能按变体逐个列举。
+    ///
+    /// 缺陷：此前只列了 Int/Float/BigInt/String/Bool/Nil/Any 七个具体类型的
+    /// 自反 arm，其余**所有**具体类型（Router、McpServer、Conversation、
+    /// Agent、Stream、Document、HttpRequest…）落到末尾 `_ => Err` ——
+    /// **同一类型与自己合一都失败**。触发面是任何「把方法返回值赋回同一变量」
+    /// 的链式累加（`x = x.method(…)`），或任何需要 `Eq(τ,τ)` 的位点。
+    /// 实测症状："expected mcp_server, got mcp_server"。
+    #[test]
+    fn unify_concrete_types_are_reflexive() {
+        let subst = Substitution::new();
+        // 覆盖「有专门 arm」与「没有专门 arm」的两组具体类型
+        for (name, ty) in [
+            ("Int", Type::Int),
+            ("String", Type::String),
+            ("BigInt", Type::BigInt),
+            ("Router", Type::Router),
+            ("McpServer", Type::McpServer),
+            ("Conversation", Type::Conversation),
+            ("Agent", Type::Agent),
+            ("Stream", Type::Stream),
+        ] {
+            let r = unify(&ty, &ty, &subst);
+            assert!(
+                r.is_ok(),
+                "unify({name}, {name}) 必须成功（具体类型自反性）"
+            );
+        }
+    }
+
+    /// v0.104.4: 通用自反 arm **不得**吞掉 `Unknown` 的 fail-fast 语义。
+    ///
+    /// `Unknown` 是刻意的逃逸标签（v0.75.92）：与**任何**类型合成都失败，
+    /// **包括它自己**。通用 `_ if t1 == t2` 若放在 Unknown arm 之前，
+    /// `unify(Unknown, Unknown)` 会静默成功，破坏该语义。
+    #[test]
+    fn unify_unknown_with_itself_still_fails() {
+        let subst = Substitution::new();
+        let r = unify(&Type::Unknown, &Type::Unknown, &subst);
+        assert!(
+            r.is_err(),
+            "Unknown 与自身合一必须仍失败（fail-fast 标签语义，不得被通用自反 arm 吞掉）"
+        );
+    }
+
     #[test]
     fn unify_same_typevar_is_reflexive() {
         // 此前 unify(α, α) 误报 OccursCheck（contains_typevar 对自身为真）。
@@ -538,7 +610,9 @@ mod tests {
     #[test]
     fn unify_same_typevar_after_resolution_is_reflexive() {
         // α→β 后 unify(α, β) 两侧都解析为 β —— 同样必须成功
-        let subst = Substitution::new().extend('a', Type::TypeVar('b')).expect("bind");
+        let subst = Substitution::new()
+            .extend('a', Type::TypeVar('b'))
+            .expect("bind");
         let result = unify(&Type::TypeVar('a'), &Type::TypeVar('b'), &subst);
         assert!(result.is_ok(), "解析后同变量的合一必须成功");
     }
@@ -546,7 +620,9 @@ mod tests {
     #[test]
     fn occurs_check_follows_substitution_chain() {
         // α→β 已绑定；再 β = [α] 必须失败（传递 occur：α 经链出现在右侧）
-        let subst = Substitution::new().extend('a', Type::TypeVar('b')).expect("bind");
+        let subst = Substitution::new()
+            .extend('a', Type::TypeVar('b'))
+            .expect("bind");
         let rhs = Type::List(Box::new(Type::TypeVar('a')));
         let result = unify(&Type::TypeVar('b'), &rhs, &subst);
         assert!(

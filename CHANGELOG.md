@@ -2,6 +2,79 @@
 
 All notable changes to Mora will be documented in this file.
 
+## [v0.104.4] — 2026-09-17 — fix: CI 首次转绿 —— 自反合一 / clippy 1.98 lint / 全仓 rustfmt
+
+首次把 CI 的 7 个 job 在本地用**同版本工具链**（1.98.1）全部复现并跑绿。
+此前 CI 从未成功过（历史 11 次运行全 failure，两次跑到 6 小时超时）。
+
+### `unify` 缺通用自反 arm（同一类型与自己合一失败）
+
+`unify` 只列了 Int/Float/BigInt/String/Bool/Nil/Any **七个**具体类型的自反
+arm，其余**所有**具体类型（Router、McpServer、Conversation、Agent、Stream、
+Document、HttpRequest…）落到末尾 `_ => Err(UnificationFailure)` —— 于是
+`unify(τ, τ)` 对它们全部失败。
+
+实测症状（CI 的 integration job 抓到的）：
+```mora
+let mcp = McpServer::new()
+mcp = mcp.tool("t", {}, handler)   -- "expected mcp_server, got mcp_server"
+```
+触发面是任何「把方法返回值赋回同一变量」的链式累加（`x = x.m(…)`），或任何
+需要 `Eq(τ,τ)` 的位点。而 `let y = x.m(…)`（新绑定走 generalize、不推 Eq）
+正常，于是呈现为「赋回自己失败、换个名字就好」的怪象。
+
+这与 v0.103 补 BigInt 自反是同一个坑 —— 当时只补了那**一个**变体，列举法
+本身就漏项成因。此次按公理修根：在 Unknown fail-fast 与各结构化 arm **之后**
+加 `_ if t1 == t2 => Ok(subst.clone())`。位置关键：`Unknown` 是刻意的逃逸
+标签，与**任何**类型合成都失败（**包括它自己**），通用 arm 若排在它之前会
+把该语义吞掉 —— 已加 `unify_unknown_with_itself_still_fails` 锁定。
+
+新增 `unify_concrete_types_are_reflexive`（覆盖有/无专门 arm 的两组类型；
+已验证「移除修复即失败」）与 `e2e_concrete_type_self_reassign_unifies`
+（McpServer/Router 自反赋值通过 + 反向：McpServer 赋 Router 仍须被拒）。
+
+### `examples/mcp_server_demo.mora` 用了非法语法（从未跑通）
+
+第 6/7 行写 `let q := args["query"]` —— `:=` **不是** Mora 的绑定语法
+（Mora 用 `let x = …`），故报 "expected type annotation at line 6/7"。
+该示例因此从未执行成功，CI 的 integration job 长期红。
+另：`mcp.serve()` 会启动 HTTP 服务并阻塞，示例不适合在 CI 里跑，改为打印
+工具注册结果。
+
+### clippy 1.98 新增 lint（5 处）
+
+本机此前是 1.96，看不到这些；默认工具链升到 1.98.1（与 CI 的
+`dtolnay/rust-toolchain@stable` 同版本）后逐一复现并修复：
+
+- `unneeded_wildcard_pattern`×2（`src/mir/witness.rs`）：`field: _,` 与其后的
+  `..` 冗余，删去显式通配。
+- `question_mark`×2（`src/parser_v3/syntax.rs`）：`if let … else return None`
+  改写为 `?`（本函数返回 `Option`）。
+- `for_kv_map`×1（`src/rel/subst.rs`）：`for (_k, val) in iter_mut()` 改为
+  `for val in values_mut()`。
+
+### 全仓 rustfmt（108 文件）
+
+`cargo fmt --check` 此前一直红（CI 从建立起就没绿过），属**存量**格式债务
+（非某次改动引入）。用与 CI 同版本的工具链执行 `cargo fmt --all` 清账，
+`--check` 现为 0 diff 且幂等。
+
+**方法教训**：我一度从 CI 日志里「提取期望输出」手工对齐格式，结果把 CI 的
+`-`（旧内容）误读为期望值，反而引入 2 处 diff。拿到权威工具链后应直接让它
+格式化，不要从日志反推。
+
+### 本地复现的 7 个 CI gate
+
+| job | 命令 | 结果 |
+|---|---|---|
+| check | `cargo check --all-targets` | ✅ |
+| test | `cargo test --lib` / `--all-targets` | ✅ 959 lib，30 套件 0 失败 |
+| fmt | `cargo fmt --all -- --check` | ✅ 0 diff |
+| clippy | `cargo clippy --all-targets --all-features -- -D warnings` | ✅ 0 |
+| integration | release 构建 + 5 个示例脚本 | ✅ 5/5 |
+| lsp | `lsp_smoke` | ✅ ALL E2E CHECKS PASSED |
+| record | `record list` + `snapshot` | ✅ |
+
 ## [v0.104.3] — 2026-09-17 — fix: match 的 spec 形式与 when 守卫（3 处缺陷）
 
 上一轮 EBNF 实测脚本的失败判据漏了 `Parse error:` 前缀，导致 `match` 相关

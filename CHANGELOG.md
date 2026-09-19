@@ -2,6 +2,22 @@
 
 All notable changes to Mora will be documented in this file.
 
+## [v0.104.5] — 2026-09-19 — docs: AGENTS.md 末尾追加 5 个 agent 协作小节
+
+无代码改动。在 `AGENTS.md` 末尾追加 5 节，给后续 agent / IDE 自动化协作铺路：
+
+- **Setup commands** — `cargo build` / `run` / `build --release` / `test --all-targets` / `clippy --all-targets --all-features -- -D warnings` / `fmt --all -- --check` / `check --all-targets`
+- **Project layout** — `src` / `tests` / `examples` / `docs` / `scripts` / `editors/vscode` / `vendor` / `test_data` 八大目录职责
+- **Code style** — Rust edition 2024、MSRV 1.85、`expect("…")` 优于 `unwrap()`
+- **Testing instructions** — 单测 / proptest / `lsp_smoke` / record & snapshot 四条路径
+- **Security** — BSD-3-Clause、禁 commit 密钥、`AGENTS.md` 入版本控制、`CLAUDE.md` 显式排除
+
+### 附带修复：Dockerfile 缺 `COPY build.rs`
+
+v0.51 在 `Cargo.toml` 引入 `build = "build.rs"`，但 `Dockerfile` 沿用 v0.25 时代的 COPY 列表，**遗漏 `build.rs`**。v0.51 ~ v0.104.x 期间无 tag push 触发 Docker job，故该 bug 潜伏；v0.104.5 tag 第一次触发即报 `couldn't read 'build.rs'`。
+
+本次一并补：`COPY Cargo.toml Cargo.lock build.rs ./`；同时把顶部 "Mora v0.25" 注释更新为当前版本号。
+
 ## [v0.104.4] — 2026-09-17 — fix: CI 首次转绿 —— 自反合一 / clippy 1.98 lint / 全仓 rustfmt
 
 首次把 CI 的 7 个 job 在本地用**同版本工具链**（1.98.1）全部复现并跑绿。

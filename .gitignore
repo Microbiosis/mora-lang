@@ -17,6 +17,9 @@ CLAUDE.md
 /cli-anything/
 /openinfer/
 
+# MiniMax Code Mini App 工作区产物 (工具生成，会话级)
+/miniapps/
+
 # AI 助手工作流残留 (跨工具会话)
 .codebuddy/
 .workbuddy/

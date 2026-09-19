@@ -219,3 +219,49 @@
   数据流 / 调用链），或明确标注「命名巧合，非同源」。
 - 若发现前一分析犯了「按名字归类」的错误，修正结论 + 更新本节（本节
   本身允许被更准确的教训修订）。
+---
+
+## Setup commands
+
+- Install deps: `cargo build`
+- Start dev:    `cargo run -- <script.mora>`
+- Build:        `cargo build --release` (produces `mora` and `mora-lsp` binaries)
+- Test:         `cargo test --all-targets`
+- Lint:         `cargo clippy --all-targets --all-features -- -D warnings`
+- Fmt:          `cargo fmt --all -- --check` (CI-enforced)
+- Typecheck:    `cargo check --all-targets`
+
+## Project layout
+
+- `src/` — library + binaries (`mora`, `mora-lsp`)
+- `tests/` — integration tests + property-based tests (proptest)
+- `examples/` — runnable Mora demo scripts (CI also runs these against the release binary)
+- `docs/` — language spec, influences, learning plan, architecture
+- `scripts/` — repo utility scripts (PowerShell helpers)
+- `editors/vscode/` — VSCode extension support
+- `vendor/` — vendored code / sample input
+- `test_data/` — test fixtures
+
+## Code style
+
+- Rust edition 2024, MSRV 1.85 (required by `ureq` 3.4)
+- Default `rustfmt` (no `.rustfmt.toml` checked in)
+- Clippy: `cargo clippy --all-targets --all-features -- -D warnings` (CI-enforced, treat warnings as errors)
+- Run `cargo fmt --all` before committing
+- Prefer `expect("meaningful message")` over `unwrap()` in production paths
+
+## Testing instructions
+
+- Unit + integration tests: `cargo test --all-targets` (CI matrix: Ubuntu / Windows / macOS, stable + nightly)
+- Library tests only: `cargo test --lib`
+- Property-based tests: `proptest = "1.7"` dev-dep (see `tests/proptest_*.rs`)
+- LSP smoke: `cargo run --release --example lsp_smoke -- ./target/release/mora-lsp`
+- Record / snapshot CLI: covered by CI (`mora record list`, `mora snapshot`)
+- Add tests for every new behavior — see existing `tests/*.rs` files for the pattern
+- All tests must pass before opening a PR
+
+## Security
+
+- License: BSD-3-Clause (`LICENSE` in repo root)
+- Never commit secrets — `.env` and tool caches are in `.gitignore`
+- `AGENTS.md` is intentionally tracked; `CLAUDE.md` is excluded per project policy

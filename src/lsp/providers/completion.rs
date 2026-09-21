@@ -33,8 +33,8 @@ pub fn completion_v3(docs: &HashMap<String, DocumentState>, params: &Value) -> V
 
     for kw in [
         "let", "task", "if", "then", "else", "end", "for", "in", "return", "fn", "true", "false",
-        "nil", "match", "with", "import", "export", "parallel", "break", "continue", "route",
-        "observe", "stream", "tool",
+        "nil", "match", "with", "import", "export", "parallel", "break", "continue", "observe",
+        "span",
     ] {
         if seen.insert(kw.to_string()) {
             items.push(make_completion(kw, 14.0, Some("keyword")));

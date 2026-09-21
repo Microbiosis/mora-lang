@@ -689,7 +689,7 @@ impl Interpreter {
     }
 
     /// 入口：直接执行 v2 AST
-    /// v0.04补: REPL 入口（main.rs 和 serve as repl 共用）
+    /// v0.04补: REPL 入口（`mora --repl` 走这里）
     /// 与 main.rs::run_repl 行为一致：循环读 stdin, 逐行 tokenize+parse+lower+run_mir
     /// 接收外部 &mut Interpreter 保留 setup 代码的 state
     pub fn run_repl_with(interp: &mut Interpreter) {

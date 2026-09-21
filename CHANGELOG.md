@@ -2,6 +2,132 @@
 
 All notable changes to Mora will be documented in this file.
 
+## [Unreleased] — docs: 文档全面对齐 v0.104.5 实际 API
+
+README / release body / 源码注释描述的是 v0.04~v0.25 时代的声明式语法，
+与 v0.103 起全面转向的显式 API 脱节。本次把文档改写到实证可达的写法，
+示例全部经 `mora --check` 验证。
+
+### 已从文档移除的过期语法（v0.104.5 已不存在）
+
+| 过期写法 | 实际替代 |
+|----------|----------|
+| `serve as http on port N do ... end` | `Router::new()` + `router.listen(addr)` |
+| `serve as mcp do ... end` | `McpServer::new()` + `server.serve()` |
+| `route fast: ai_model(...)` + `fast(p"...")` | `with model = "...", temperature = 0.7` 块 |
+| `observe otel endpoint "..."` / 裸 `observe trace` | `observe trace do ... end` |
+| `try ... catch e: AiError` | 无对应语法（v0.05.0 已移除） |
+| `record_tokens(input, output)` | `ai.tokens` → `.input` / `.output` / `.total` |
+| `ai.create("model")` + `conv.chat(...)` | 无对应构造入口（Conversation 无构造器） |
+| `ai.embed` / `ai.cosine` / `ai.search` / `ai.stream` | 运行时不可达（`dot`/`norm` 属 `linalg.*`，`search` 属 `memory.*`） |
+| `MORA_NO_TYPECK=1` / `MORA_EMBED_MODEL` | 全 `src/` 零匹配，环境变量不存在 |
+| `tool name(args): T do ... end` | `server.tool(name, schema, handler)` |
+
+### 同步修正
+
+- `README.md` — Highlights / 主示例 / AI surface 表 / 环境变量表 / Server
+  modes / Routing & observability / Pipeline 图 / 测试数（611 → 1265，
+  30 套件）全部重写；删掉 `SO_REUSEADDR` 不实声明（`src/` 零匹配）；
+  Standard library 的 `memory` 行改为真实方法名（`search` / `size` / `keys`，
+  原写的 `list` / `len` 不存在）。
+- `.github/workflows/release.yml` — release body 重写至实际 API。
+- 源码注释 — `src/http_server.rs` 模块头（原写 `serve as http` 块收集
+  routes）、`src/interpreter/mod.rs`（"serve as repl 共用"）、
+  `src/main.rs`（"模型路由走 `route` 块"）。
+- `src/lsp/providers/completion.rs` — 关键字表删掉 `route` / `stream` /
+  `tool`（已非语言关键字），补上与 `observe` 同属 v0.103 上下文的 `span`。
+- `Cargo.toml` — 协议选择注释改为显式构造器入口。
+- 识别出孤儿目录 `test_data/`（`v0.07_validation.mora` /
+  `typeck_errors.mora` / `verify_typeck_errors.sh`）：`src/`、`tests/`、
+  `.github/workflows` 零代码引用，且文件内混有 `route fast:` /
+  `record_tokens` 等已删语法。本轮拟删除，但本地回收机制不可用未能执行，
+  **待手动移除**（删除后可用 `git restore` 恢复）。
+
+### 实证新发现（文档未记录的真实约束）
+
+- **dict 字面量要求值类型同质**：`{a: "x", b: 5}` 在 HM 推断下报
+  `expected String, got Float`。首值固定 dict 的值类型。
+- **`span` 的 `tags {}` 只接受字符串或裸标识符**：`tags {user_id: 1}`
+  解析报 `Expected '}' after tags`（`emit_span_w` 仅消费 String /
+  Identifier token）。
+- **`ai.chat` 的 typeck 签名与运行时不一致**：typeck 声明 `-> AiResult`，
+  运行时返回 `Value::String`，故 `print(ai.chat(...))` /
+  `{reply: ai.chat(...)}` 被拒。属待修缺陷，本次仅在文档中规避。
+- **`ai.tokens.calls` 返回 input 计数**（`builtins/ai_tokens.rs:16` 复用了
+  `input` 字段），文档因此只宣传 `input` / `output` / `total`。
+
+### 28 条问题清单复核结论
+
+对新收到的 28 条清单逐条到 `src/` 取证：**18 条证实、7 条证伪、1 条部分
+证伪**。清单把 v0.25 时代的声明式语法与失实的 API 描述当成 v0.104.5
+的行为，其中 7 条描述的"不可用"实际可用。
+
+**证伪（清单声称不可用，实际可用，已在文档保留/恢复对应能力描述）**
+
+| # | 清单声称 | 实证结果 |
+|---|----------|----------|
+| 01 | `p"hello {name}"` 插值解析报错 | 可用；`{text}` 仅在 `tea` / `agent` 块体等少数上下文才是块开始 |
+| 10 | `if x > 10 then` 无 `then` | `then` 存在 |
+| 12 | `fn(x) return x*2 end` 块体解析失败 | 可用 |
+| 15 | commit / rollback 非真实指令 | `emit.rs:1640` / `emit.rs:1658` 真实派发 |
+| 16a | （`orchestrate` 相关） | 可用，见 `syntax.rs:189-223` |
+| 18b | （`observe` 相关） | 可用 |
+| 20 | `tea` 块 parser 不可解析 | 可解析 |
+
+**部分证伪**
+
+- ISSUE-25：dict 可以容纳 `ai.chat` 返回值（dict 值同质性约束见上文），
+  真正的断层是 `ai_result` 不能直接进 `print` / 字符串上下文。
+
+**证实且已处置的缺陷（仅记录，不在本次修复）**
+
+- `enum` 死循环：`emit_definitions.rs:539-547` 在枚举体循环里遇到 `{` 或
+  payload `(` 时不消费也不退出，`mora --check` 永久挂起。**多行形态同样
+  中招**——只要带 payload 或花括号即死锁，仅多行无 payload 形态可用。
+- `observe` 挂起（v0.104.5 同一族缺陷，实测 CHECK / RUN 均死锁 >10s）：
+  `observe otel endpoint "..."`（`emit_observe_w` 的 name 接受 Identifier，
+  `endpoint` 被吞成 name，后面的字符串无处可去）、裸 `observe trace` 后接
+  `task main()`（`emit_statement_expr_w` 不分发 task 定义）、裸
+  `observe metric` 三种形态全部无限循环。根因是
+  `emit.rs:2322-2340` 的 `emit_block_mir_and_wit`：`do` 被
+  `let _ = self.match_token_exact(TokenType::Do)` 设为可选，而 body 循环
+  `while !self.check(&TokenType::End) && !self.is_at_end()` 在
+  `emit_statement_expr_w` 返回 None 且当前 token 非 Newline/End 时不消费
+  任何 token。`emit_span_w` 共用该函数，有同样风险。仅
+  `observe trace do ... end` 与 `observe otel "svc" do ... end` 两种形态
+  实证可用（exit=0）。
+- 数字类型断层：`parser_v3/syntax.rs:739` 把 `number` 标注解析为
+  `Type::Int`，而 `typeck/mod.rs:314` 的 `from_hint("number")` 给
+  `Type::Float`，两条路径真实矛盾。表现为 `let x: number = 1` 报
+  `expected int, got float`、`42i` 才过、`let x: float = 1` 反而通过
+  （无后缀整数字面量一律是 `Float`）。
+
+### README 两表逐行取证结果
+
+"Language at a glance"（17 行）与 "Borrowed from history"（24 用例）
+共 41 行/用例全部跑过 `mora --check`，**11 + 3 行失实**，已改写为实证
+范本：
+
+- task 行 —— 去掉参数/返回类型标注（`emit_fn_def_w` 只接受裸标识符参数，
+  `return_type` 硬编码 `None`）
+- Traits + impls 行 —— 改 `Dyn dispatch`（`trait`/`impl` 定义 runtime 存在
+  但 parser 不可达：`fcfg_lower.rs:519` 只被差分验证调用）
+- Generics 行 —— 收窄为"仅标注"：`list<T>` / `dict<K,V>` 可用，
+  `task first<T>(x)` 报 `Expected '(' after task name`
+- Enums 行 —— 改多行无 payload 形态（花括号/payload 见上方死循环缺陷）
+- Structs 行 —— 改多行字段形态（单行 `struct { }` 解析失败）
+- References 行 —— 删除（`Amp` token 在 parser_v3 无消费方）
+- 历史表删除 list destructuring / `[1,2,3]*2` 广播 / references 三行
+
+### 其它实证约束（v0.104.5 真实边界）
+
+- **task 名不是一等值**：不可传给 `partial` / `compose`；两个内建返回的
+  高阶函数需先绑变量再调用——`compose(inc, dbl)(5i)` 报
+  `Parse error: Expected ')'`，链式立即调用 `f(args)(args)` 不支持。
+- **用户自定义 `type` 别名不能作类型标注**：`type MyNum = number` 定义
+  本身通过，但 `let x: MyNum = 1` 报错。
+- **`set<T>` 泛型标注不支持**：报 `unsupported generic type annotation 'set'`。
+
 ## [v0.104.5] — 2026-09-19 — docs: AGENTS.md 末尾追加 5 个 agent 协作小节
 
 无代码改动。在 `AGENTS.md` 末尾追加 5 节，给后续 agent / IDE 自动化协作铺路：

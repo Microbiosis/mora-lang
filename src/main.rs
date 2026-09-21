@@ -351,7 +351,8 @@ fn print_banner() {
     let has_openai_key = env::var(AI_API_KEY_ENV)
         .map(|k| !k.is_empty())
         .unwrap_or(false);
-    // v0.06.5: MORA_AI_MODEL 不再作为全局默认；模型路由走 `route` 块 + `with` 块
+    // v0.06.5: MORA_AI_MODEL 只是 ai.chat 的兜底默认；模型选择主要走
+    // `with` 块的 model 绑定与 ai.chat 第二参 {model: "..."}
     let base_url = env::var(AI_BASE_URL_ENV).unwrap_or_else(|_| AI_BASE_URL_DEFAULT.to_string());
 
     println!("Mora v{}", mora::VERSION);

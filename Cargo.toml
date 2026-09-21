@@ -24,7 +24,8 @@ name = "mora-lsp"
 path = "src/bin/lsp.rs"
 
 # v0.04: 删除 mora-mcp 和 mora-serve 二进制
-# 单二进制 mora 根据脚本内 `serve as mcp/http` 块自动选择协议
+# 单二进制 mora：脚本内用 `Router::new()` 起 HTTP、`McpServer::new()` 起 MCP，
+# 协议由脚本调用的入口（listen / serve）决定
 
 [dependencies]
 # v0.36: crossbeam-channel for Send/Sync Interpreter (replaces std::sync::mpsc

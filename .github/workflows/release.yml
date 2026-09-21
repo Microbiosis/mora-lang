@@ -160,31 +160,26 @@ jobs:
 
             ## 核心特性
 
-            - **AI 调用是语法原语**: `p"..."` / `with` / `stream` / `tool` / `catch e: AiError`
-            - **HTTP / MCP server 是语法块**: `serve as http` / `serve as mcp`
-            - **可观测是语法块**: `observe trace` / `span` 块 + OTEL
-            - **单二进制多协议**: `mora` 根据脚本顶层 `serve` 块自动选择协议
-            - **Route 是语言概念**: `route fast: "gpt-4o-mini"` + `fast(p"...")`
-            - **强类型系统**: 类型推断、泛型、trait、enum、struct
+            - **AI 调用是显式 API**: `ai.chat(p"...")` / `ai.critic(answer)` / `ai.tokens`
+            - **HTTP / MCP server 是显式构造器**: `Router::new()` + `router.listen(addr)` / `McpServer::new()` + `server.serve()`
+            - **可观测是语法块**: `observe trace do ... end` / `span "name" tags {k: "v"} do ... end`
+            - **单二进制多协议**: 同一个 `mora` 二进制内建 HTTP 与 MCP 两种服务入口，由脚本选择
+            - **模型配置是语法块**: `with model = "gpt-4o-mini", temperature = 0.7`
+            - **强类型系统**: HM 类型推断、泛型、trait、enum、struct
 
             ## 快速开始
 
             ```bash
             # 写一个 Mora 脚本
             cat > hello.mora << 'EOF'
-            observe trace
-            route fast: "gpt-4o-mini"
-
-            serve as http on port 3000 do
-              GET "/chat" -> fn(req)
-                return fast(p"hello: {req.query.name}")
-              end
-            end
+            let router = Router::new()
+            let router = router.route("GET", "/chat", fn(req) => {status: "ok"})
+            router.listen("127.0.0.1:3000")
             EOF
 
             # 运行
             mora hello.mora
-            # 另一终端: curl http://localhost:3000/chat?name=World
+            # 另一终端: curl http://localhost:3000/chat
             ```
 
             ## 文档

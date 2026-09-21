@@ -5,8 +5,8 @@
 //! 不是 Rust 代码里写死的 8 个。
 //!
 //! 协议:
-//! - 顶层 `serve as http on port N do ... end` 块收集 routes
-//! - 每个 `GET "/path" -> fn(req) ... end` 注册到路由表
+//! - routes 由 Router 显式 API 收集（`Router::new()` + `router.route(...)`）
+//! - 每个 `router.route("GET", "/path", handler)` 注册到路由表
 //! - 收到 HTTP request 时: 解析 method/path/body,找路由,调闭包
 //! - 闭包返回值是 dict,自动 json.stringify 成 response body
 

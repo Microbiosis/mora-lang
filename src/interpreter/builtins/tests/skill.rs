@@ -7,7 +7,31 @@ mod tests_v046_skill {
     use crate::value::Value;
 
     /// v0.46.0: skill.* builtin (CLI-Anything SKILL.md pattern)
-    fn write_temp_skill_file(name: &str, content: &str) -> std::path::PathBuf {
+    ///
+    /// v0.104.6 D411：改为返回 **RAII 守卫**，`Drop` 时回收整个目录。
+    ///
+    /// 修前本 helper **完全没有清理** —— 每次调用泄漏一个
+    /// `mora_skill_test_<pid>_<nanos>/`（**含文件**）。因命名唯一，
+    /// 每跑一次测试套件就多一个 ⇒ **无上限增长**。
+    ///
+    /// 这是 D34 / D294 修掉的 `mora_audit*` 泄漏的**同一族第三个实例**
+    /// （那两个都选 `Drop` 而非测试末尾显式删，因为 `Drop` 在 unwind
+    /// 时同样执行 ⇒ **panic 路径也不漏**）。
+    ///
+    /// 实测：本会话内 `%TEMP%` 里新增了 `mora_skill_test_13828_…`；
+    /// 修后同一测试连跑多次，`%TEMP%` 计数**不再增长**（见 CHANGELOG D411）。
+    struct TempSkillFile {
+        dir: std::path::PathBuf,
+        path: std::path::PathBuf,
+    }
+
+    impl Drop for TempSkillFile {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    fn write_temp_skill_file(name: &str, content: &str) -> TempSkillFile {
         let dir = std::env::temp_dir().join(format!(
             "mora_skill_test_{}_{}",
             std::process::id(),
@@ -19,7 +43,7 @@ mod tests_v046_skill {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join(format!("{}.md", name));
         std::fs::write(&path, content).unwrap();
-        path
+        TempSkillFile { dir, path }
     }
 
     use std::time::UNIX_EPOCH;
@@ -146,7 +170,8 @@ description: Loaded from file
 
 This skill was loaded from a real file on disk.
 "#;
-        let path = write_temp_skill_file("file-loaded", content);
+        let tmp = write_temp_skill_file("file-loaded", content);
+        let path = tmp.path.clone();
 
         let result = interp
             .call_skill_method("load", &[Value::String(path.to_string_lossy().to_string())])

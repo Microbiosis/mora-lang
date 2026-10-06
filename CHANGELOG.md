@@ -19520,6 +19520,92 @@ CRLF 造出来的** —— 仓库里 `src/` 下含 CR 的文件数是 **0**（`g
 ## 待裁决（新增）
 
 无。本轮 2 处修复（LruCache 契约 + 一道行尾脆弱判据），无产品语义分歧。
+#### D411：清理核查时发现的**第三处临时目录泄漏** —— `mora_skill_test_*` 完全无回收（修复轮）
+
+本轮起点是一次环境清理核查（用户要求「该清除的清除」）。
+清掉仓库内 5 个残骸后，核查 `%TEMP%` 下 9 238 个 `mora_*` 目录，
+**查出了泄漏源，并且发现旧的泄漏其实早已修好、只是残留在那儿**。
+
+## 先说好消息：`mora_audit` 的 8 655 个空目录是**历史残留，不是仍在泄漏**
+
+按创建时间分组：
+
+| 前缀 | 数量 | 说明 |
+|---|---|---|
+| `mora_audit` | 8 655 | 最新的一个创建于 **2026-10-04 09:12**；今日测试运行**一个都没新增** |
+| `mora_record` | 551 | 同上，早于 RAII 修复 |
+| `mora_schema_test` | 4 | **固定名**、复用，**有界** |
+| `mora_skill_test` | 1 → 本轮修 | 唯一**无上限**的 |
+
+⇒ D34 与 D294 已经用 RAII `Drop` 守卫把 `mora_audit*` 的泄漏修好了
+（`src/audit/mod.rs:610` 与 `interpreter/builtins/tests/audit.rs:15` 的注释都记着）。
+9 238 个目录里 **99.96% 的字节占用是 0**（全是空目录，实测 0.01 MB）
+⇒ 无害，但它们是修复前的沉积。
+
+## 但查出了**同一族的第三个实例**，且这次是**真·无上限**
+
+```rust
+fn write_temp_skill_file(name: &str, content: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!(
+        "mora_skill_test_{}_{}", pid, 纳秒));      // ← 命名**唯一**
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(&path, content).unwrap();
+    path                                              // ← **完全没有清理**
+}
+```
+
+比 D34 / D294 修掉的那两处**更糟**：
+
+| | D34 / D294 的 `mora_audit*` | 本条 |
+|---|---|---|
+| 回收 | 「删文件、留空目录」 | **文件和目录都留** |
+| 命名 | `pid_纳秒`（唯一） | `pid_纳秒`（唯一） |
+| 增长 | 有界（目录被复用） | **每次调用 +1，无上限** |
+
+只有 **1 个调用点**（`skill_load_real_skill_md_file`），修起来很干净。
+
+## 修法：套用项目既有的 RAII 守卫
+
+```rust
+struct TempSkillFile { dir: PathBuf, path: PathBuf }
+impl Drop for TempSkillFile {
+    fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.dir); }
+}
+```
+
+选 `Drop` 而非测试末尾显式删，理由与 D34/D294 一致：
+**`Drop` 在 unwind（panic）时同样执行 ⇒ 异常路径也不漏**。
+
+## 验证：跑前/跑后计数对比（不是「跑完看着没问题」）
+
+```text
+BEFORE = 1
+cargo test --lib skill     → 21 passed
+AFTER  = 1                 ← 计数**未增长**
+```
+
+## 只报告不修的一处
+
+`src/record/tests.rs:738` 的 `schema_test_path` 用**固定名**
+（`mora_schema_test_{name}`，4 个调用点），开头 `remove_dir_all` 复用目录、
+结尾不删 ⇒ **有界**（永远 4 个），不会无上限增长。
+
+⇒ 与本条性质不同（一个是**无界泄漏**，一个是**固定残留**），
+按比例原则只记录，不在本轮一并改。
+
+## 顺带清掉的
+
+| 项 | 说明 |
+|---|---|
+| `.txt` / `true` | CLI 输出重定向残骸（446 B / 9 B） |
+| `examples/_diag_*.moved` ×3 | 故意写坏语法的诊断探针（9/21） |
+| `audit/d387-d409` 分支 | 已并入 main（领先 0 提交） |
+| `feat/declarative-paradigm-rel` 分支 | 已并入 main（领先 0 提交） |
+
+## 门禁
+
+`cargo test --no-fail-fast` / `clippy --all-targets --all-features -D warnings` /
+`fmt --all -- --check` / `cargo doc --no-deps` 全 0（数值见 CHANGELOG 同轮次记录）。
 #### D385：`xform` 的**实际形态** + transducer 底层**接上了**（否定轮，修正 D346 的印象）
 
 D346 判定 `xform` 是「静默无效」，但当时**没查底层**。本轮查清两件事。

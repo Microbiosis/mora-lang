@@ -301,14 +301,26 @@ impl<'a> BidirectionalChecker<'a> {
             // Pass 2：每 arm body 用 scrutinee subtype check
             // 收集 arm_pairs 供 join_types；同时用 hint 把 joined 类型
             // 写入失败的 TypeError——Phase E 错误诊断改进
+            // v0.104.6 D165：arm 体在 `synth` / `check_against` 之前必须
+            // **注册该 arm 的模式绑定**，否则体里引用绑定变量会被判成
+            // `Unbound variable`（见 `add_pattern_bindings` 上方的说明）。
+            // 顺序与 HM 侧 `infer_match` 同构：save → add → infer → restore。
             let mut arm_pairs: Vec<(Span, Type)> = Vec::new();
             for arm in arms {
-                if let Ok(t) = self.synth(&arm.body) {
+                let saved_env = self.hm.env.clone();
+                let bound = self
+                    .hm
+                    .add_pattern_bindings(&arm.pattern, &scrutinee_ty, arm.body.span)
+                    .is_ok();
+                if bound && let Ok(t) = self.synth(&arm.body) {
                     arm_pairs.push((arm.body.span, t));
                 }
-                if let Some(g) = &arm.guard {
+                if bound && let Some(g) = &arm.guard {
+                    // 守卫同样可能引用绑定变量（`x when x > 0`），故也在
+                    // 绑定就位的前提下递归。
                     self.pre_check_witness(g);
                 }
+                self.hm.env = saved_env;
             }
             // 第一轮后：所有 arm 类型已知——计算 joined type
             let joined = join_types(&arm_pairs, w.span);
@@ -329,10 +341,17 @@ impl<'a> BidirectionalChecker<'a> {
             let _ = &scrutinee_ty;
             let _ = &hint;
             for arm in arms {
-                if let Err(mut e) = self.check_against(&arm.body, &joined, None) {
+                // v0.104.6 D165：同上文 —— 这里也要先注册绑定。
+                let saved_env = self.hm.env.clone();
+                let bound = self
+                    .hm
+                    .add_pattern_bindings(&arm.pattern, &scrutinee_ty, arm.body.span)
+                    .is_ok();
+                if bound && let Err(mut e) = self.check_against(&arm.body, &joined, None) {
                     e.hint = hint.clone();
                     self.errors.push(e);
                 }
+                self.hm.env = saved_env;
             }
             return;
         }
@@ -345,10 +364,45 @@ impl<'a> BidirectionalChecker<'a> {
         } = &w.kind
         {
             if let Some(hint) = type_hint
+                // v0.104.6 D82：`dyn Trait` 标注**不容许值侧**，与
+                // `Type::Any` 同等对待 —— 语义是「把值强制转换成 TraitObject」
+                // （emit 侧的 `MirInst::DynTrait`），不是「值本来就得是
+                // TraitObject」。
+                //
+                // ⚠ 这是同一个检查的**第二个查找点**：HM 侧 `infer_let_typed`
+                // 也要放行。**顶层 `let` 两条路都跑**（只改 HM 侧时顶层仍报
+                // `expected TraitObject, got Float`），而 `task main()` 体内
+                // 的 `let` 只跑本条 —— 这个「顶层失败、体内通过」的不对称
+                // 正是定位到漏改点的线索。
+                //
+                // 教训同 D69：同一检查在 N 处查找时，只接一处等于只修一半。
+                && !matches!(hint.to_type(), Type::TraitObject { .. })
                 && let Err(e) = self.check_against(value, hint.to_type(), None)
             {
                 self.errors.push(e);
             }
+            // v0.104.6 D55（**第二次回退**，D54 已修但本约束仍不可用）：
+            // 机制已完全查清 —— `check_against` 是**纯比较**、从不产生约束，
+            // 而 `TypeVar::subtype_of` 对任何类型都返回 `true`
+            // （`typeck/mod.rs` v0.84 注释：该严格判断**委托给 solver**），
+            // 故「值 = 注解」这条边不存在，`let y: Int = xs[0]` 被静默接受。
+            //
+            // 补 `Eq(synth, expected)` 对**非数值**情形确实正确（`xs` 是字符串
+            // 列表时正确报错），但会误伤**数值塔**：`let d = {count: 5}` /
+            // `let n: Int = d.count` 原本合法（本语言数值字面量全是 `Float`，
+            // `Int` 与 `Float` 互相「兼容」，见 `subtype_of` 与 v0.90.5），
+            // 加上约束后变成 `expected float, got int` 硬错误。
+            //
+            // **要两者兼得，需要一种尊重数值塔的「子类型」约束**
+            // （synth 解析为 Float、注解为 Int 时应当**放行**并把 TypeVar 绑到
+            // Float）。现有 `Constraint` 只有 `Eq` / `Numeric` / `RowEq`：
+            // `Eq` 对 Int/Float 冲突即报错（太严），`Numeric` 虽接受混合但会
+            // 把 TypeVar 绑到 `Int`，与字典字面量的 `Eq(TypeVar, Float)`
+            // 仍然相撞。**新增约束种类超出本轮范围**（牵动 solver 与所有
+            // 已注册约束的使用点），故再次回退。
+            //
+            // D54（`dict_field_type` 遮蔽真方法）**已修且不回退** —— 那是
+            // 独立的、可单独成立的缺陷修复。
             // 递归 value + init_body
             self.pre_check_witness(value);
             self.pre_check_witness(init_body);
@@ -515,7 +569,29 @@ impl<'a> BidirectionalChecker<'a> {
             WitnessKind::Assign { target: _, value } => {
                 self.pre_check_witness(value);
             }
-            WitnessKind::Loop { body, .. } | WitnessKind::While { body, .. } => {
+            // v0.104.6 D11：循环变量必须在递归 body **之前**登记进 HM 环境。
+            //
+            // 此前本分支直接 `pre_check_witness(body)`，不登记 `var`。而
+            // Closure/FnDef 都会先登记形参（见上方 Phase A / Phase A'），
+            // 循环变量漏登记的后果是：`if <loopvar> == n` 作为**循环体第一条
+            // 语句**时报
+            //   `type inference failed: Unbound variable 'y'`
+            // 而在它前面加任何一条别的语句就正常 —— 因为 block 内的定义点
+            // 是顺序登记的，循环变量却从未被登记过。
+            //
+            // 类型取 fresh type var（与无标注的 Closure/FnDef 形参同一处理）：
+            // 不预设元素类型，避免对 `list<T>` 的元素类型做错误约束。
+            // 推断后整块还原，不泄漏给兄弟节点。
+            WitnessKind::Loop {
+                var, body, ..
+            } => {
+                let saved_env = self.hm.env.clone();
+                let ty = self.hm.fresh_type_var();
+                self.hm.env.add(var.clone(), ty);
+                self.pre_check_witness(body);
+                self.hm.env = saved_env;
+            }
+            WitnessKind::While { body, .. } => {
                 self.pre_check_witness(body);
             }
             WitnessKind::Or { left, right } | WitnessKind::And { left, right } => {

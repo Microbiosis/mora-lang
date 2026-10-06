@@ -1,0 +1,35 @@
+-- e2e：v0.104.6 四个 builtin 缺陷在**真实 CLI 路径**上的验证
+--
+-- 本文件由 `tests/builtin_gaps.rs::cli_path_runs_all_four_fixes` 驱动，
+-- 逐条断言退出码为 0 且 stdout 逐行匹配。
+--
+-- 为什么必须有这条：同文件里的库内测试走 `run_mir`，**绕过 typeck**；
+-- 而 `mora run` 会在 main.rs:409 跑 `check_program_witnesses_bidirectional`，
+-- 出错就 `process::exit(2)`。所以「typeck 放行 → 运行期报 Undefined」
+-- 这一族缺陷（str/int/float/bool 全家）只有在真实 CLI 上才暴露完整。
+--
+-- Run: cargo run -- tests/fixtures/e2e/builtin_gaps.mora
+
+-- ── D1：range(0, len(xs)) 曾经静默求和得 0.0（应为 15.0）─────────
+let xs = [1, 2, 3, 4, 5]
+let total = 0
+for i in range(0, len(xs))
+  assign total = total + xs[i]
+end
+print("sum=" + str(total))
+print("bound=" + str(len(xs)))
+
+-- ── D2：字符串长度曾数 UTF-8 字节（"中文字abc" → 12）────────────
+let s = "中文字abc"
+print("chars=" + str(len(s)))
+print("method=" + str(s.len()))
+
+-- ── D3：字符串索引曾在源码层完全不可用 ───────────────────────────
+print("first=" + str(s[0]))
+print("last=" + str(s[len(s) - 1]))
+
+-- ── D4：int/float/bool 曾在 typeck 有签名、运行期报 Undefined ─────
+print("int=" + str(int("42")))
+print("float=" + str(float("1.5")))
+print("bool=" + str(bool(0)))
+print("bool2=" + str(bool("x")))

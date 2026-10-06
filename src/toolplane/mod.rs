@@ -8,9 +8,26 @@
 //!
 //! v0.45.0 设计:
 //! - Multi-plane registry (vs v0.34 single HashMap tool_registry)
-//! - Core/Extension 分桶, 调度通过 `tool.plane.dispatch(plane, name, args)`
+//! - Core/Extension 分桶
 //! - 保留 `tool_registry` field (向后兼容), 新加 `tool_planes` field
-//! - builtin `tool.plane.*` 操作 plane
+//!
+//! ⚠ v0.104.6 D403 更正：下面两行原本写着
+//! 「调度通过 `tool.plane.dispatch(plane, name, args)`」与
+//! 「builtin `tool.plane.*` 操作 plane」—— **三处都不成立**：
+//! - 模块的**注册名是 `tool`**（`crate::value::MODULE_OBJECTS` 是唯一事实源，
+//!   D74 已因此踩过坑：按枚举变体名 `toolplane` 建表会**永远匹配不到**）。
+//!   源语言里 `toolplane` 是**未绑定变量**。
+//! - **没有** `tool.plane` 这个名字：是 `tool.list()`，不是 `tool.plane.list()`。
+//! - **没有** `dispatch` 方法。实际 8 个方法是
+//!   `create` / `register` / `unregister` / `list` / `list_tools` /
+//!   `info` / `find` / `remove`（`builtins/toolplane.rs::call_toolplane_method`，
+//!   `typeck/dispatch.rs::TOOL_METHODS` 与之一一对应）。
+//!
+//! ⚠ **三兄弟的错误风格不一致**（当前语义，只记录不改）：
+//! 对**不存在的 plane**，`info` / `find` 返回 `Nil`（当「没结果」），
+//! 而 `list_tools` 抛 `Err`（当「出错」）⇒ 脚本里前者静默、后者直接终止。
+//! 各自与 typeck 声明一致（`info`/`find` 是 `Union[..., Nil]`，
+//! `list_tools` 是裸 `List[String]`）⇒ **改它属产品语义决定**。
 //!
 //! 与 master doc §6.5 区别: master 提议 `ToolPlane 替代 tool_registry`,
 //! v0.45.0 保守共存 (additive), 留 v0.46+ 再做完全替代。

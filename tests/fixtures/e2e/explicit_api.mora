@@ -14,4 +14,20 @@ let schema = {name: {type: "string"}}
 let greet = fn(params) => params
 let server = server.tool("greet", schema, greet)
 
-{router: type_of(router), server: type_of(server), schema: schema}
+-- v0.104.6 D79：`schema` 加 `any` 标注。
+--
+-- D79 给 `type_of` 补上了 `Type::String` 的精确返回类型（此前是未解算的
+-- TypeVar，兼容任何东西）。于是本行这个**异质** dict 字面量第一次被真正检查：
+-- `infer_dict` 取首个值的类型（`String`，来自 `type_of(router)`）并要求其余
+-- 值与之 `compatible_with`，而 `schema` 是 `Dict(String, Dict(String, String))`
+-- → "expected String, got Dict(...)"。
+--
+-- 运行期 `HashMap<String, Value>` 本就允许异质，这个 fixture 也是**有意**这么写
+-- 的（`tests/e2e.rs::e2e_explicit_api_runs` 明确断言 `schema` 是 Dict）。
+-- 所以真正的问题是「mora 的 dict 字面量该不该同质」这个**类型系统设计决定**，
+-- 而不是这条 fixture 写错了。改 `infer_dict` 让它接受异质是宽面改动
+-- （影响所有 dict 推断），已列入待用户决定清单；此处只把放进**这个异质 dict**
+-- 的那一份标成 `any` —— `tool()` 调用处仍用未标注的 `schema`，保持那里的精度。
+let schema_in_dict: any = schema
+
+{router: type_of(router), server: type_of(server), schema: schema_in_dict}

@@ -32,6 +32,53 @@ fn recorder_off_is_noop() {
     assert_eq!(r.events().len(), 0); // off 模式不录制
 }
 
+/// v0.104.6 D174: `RecordMemory` —— 录事件但**不落盘**。
+///
+/// `mora snapshot` 只需要 `events()` 拿去与基线比对，不需要一份 JSONL 录像。
+/// 与 `new_record` 的区别就是「没有目标文件」，故：
+/// - `is_record()` 必须为真（否则所有 `record_*` 的门控会挡掉事件）；
+/// - `save()` 必须是 no-op（不能凭空造文件/目录）。
+#[test]
+fn record_memory_records_but_never_writes() {
+    let mut r = Recorder::new_record_memory();
+    // 门控：off 会挡住一切事件 —— RecordMemory 绝不能落进 off 那档。
+    assert!(r.mode().is_record(), "RecordMemory 必须算 record 模式");
+    assert!(!r.mode().is_off(), "RecordMemory 不是 off");
+    assert!(!r.mode().is_replay(), "RecordMemory 不是 replay");
+
+    r.record_ai_chat(
+        "gpt-4o".to_string(),
+        "hello".to_string(),
+        "world".to_string(),
+        5,
+        7,
+        123,
+        None,
+        "test_sig".to_string(),
+    );
+    assert_eq!(r.events().len(), 1, "RecordMemory 必须真的累积事件");
+
+    // save() 是 no-op：不报错、不消费事件、也不往磁盘写任何东西。
+    //
+    // 判据用**独占目录**而不是 `%TEMP%` 的文件计数 —— 后者是脆判据：
+    // 单独跑本测试时通过，全量套件里红，因为**并行测试**同时在
+    // `%TEMP%` 建文件，计数会漂。（D171 教训的又一次自踩。）
+    let dir = env::temp_dir().join(format!(
+        "mora_recmem_{}_{}",
+        std::process::id(),
+        Recorder::now_ms()
+    ));
+    fs::create_dir_all(&dir).expect("建独占目录");
+    let count = || fs::read_dir(&dir).map(|d| d.count()).unwrap_or(0);
+    assert_eq!(count(), 0, "独占目录初始应为空");
+
+    r.save().expect("RecordMemory 的 save 不该是错误");
+    assert_eq!(count(), 0, "RecordMemory 的 save() 绝不能往磁盘写东西");
+    assert_eq!(r.events().len(), 1, "save() 不该消费/清空事件");
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn record_roundtrip() {
     let path = tmp_path("roundtrip");
@@ -668,17 +715,22 @@ fn build_timeline_basic() {
 
 #[test]
 fn new_record_creates_parent_dir() {
-    let mut p = env::temp_dir();
-    p.push(format!("mora_record_test_subdir_{}", std::process::id()));
+    // v0.104.6 D34：原先只删 `nested`，**父目录** `mora_record_test_subdir_<pid>`
+    // 留着 —— 每次跑测试漏一个。实测该前缀在 `%TEMP%` 下累积到 578 个。
+    // 现在把整个基目录删掉（两次：前置清残留 + 后置清本次产物）。
+    let mut base = env::temp_dir();
+    base.push(format!("mora_record_test_subdir_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&base);
+
+    let mut p = base.clone();
     p.push("nested");
     p.push("test.jsonl");
-    let _ = fs::remove_dir_all(p.parent().unwrap());
 
     let r = Recorder::new_record(p.clone());
     assert!(r.is_ok());
     assert!(p.parent().unwrap().exists());
 
-    let _ = fs::remove_dir_all(p.parent().unwrap());
+    let _ = fs::remove_dir_all(&base);
 }
 
 // v0.76.05: Schema 校验测试——arg_signature 不匹配时返 None
@@ -928,4 +980,136 @@ fn timeline_includes_msg_and_state_mutation() {
     assert_eq!(rows[0].detail, "ch");
     assert_eq!(rows[1].kind, "state_mutation");
     assert_eq!(rows[1].detail, "v");
+}
+
+/// D89 第二处：`event_to_jsonl` 的 `WebFetch` 里 **`method` 漏了 `esc()`**
+/// （同函数其余字符串字段都转义）。含 `"` 的 method 会写出畸形 JSONL，
+/// 解码器引号配对错位 → 该行被 `load_jsonl` 静默丢弃。
+///
+/// **当前不可达**：两个生产调用点都硬编码 `"GET"`；但 `record_web_fetch`
+/// 是 `pub fn`，属潜在缺陷。此测试直接用公开 API 构造来覆盖它。
+#[test]
+fn d89_web_fetch_method_is_escaped() {
+    let path = tmp_path("d89_method_esc");
+    let mut r = Recorder::new_record(path.clone()).unwrap();
+    let nasty = r#"GE"T,X\Y"#;
+    r.record_web_fetch(
+        "https://example.com/a?b=1&c=\"2\"".to_string(),
+        nasty.to_string(),
+        200,
+        10,
+        5,
+        None,
+        "sig".to_string(),
+    );
+    r.save().unwrap();
+
+    let raw = fs::read_to_string(&path).expect("read jsonl");
+    assert_eq!(
+        raw.lines().count(),
+        1,
+        "写入必须恰好一行（未转义的引号会撑破 JSON 结构）：\n{raw}"
+    );
+    let r2 = Recorder::new_replay(path.clone()).unwrap();
+    assert_eq!(r2.events().len(), 1, "该行不该被静默丢弃");
+    match &r2.events()[0] {
+        Event::WebFetch { method, url, .. } => {
+            assert_eq!(method, nasty, "method 必须原样往返");
+            assert_eq!(url, "https://example.com/a?b=1&c=\"2\"");
+        }
+        other => panic!("expected WebFetch, got {other:?}"),
+    }
+    let _ = fs::remove_file(&path);
+}
+
+/// v0.104.6 D89：`Msg.payload` / `StateMutation.old|new` 是**原样插入的完整
+/// Value JSON**，而解码器是「按 `,` 切分（字符串外）」的简易解析器。
+///
+/// **Dict 有 ≥2 个键时，`{` 内部的 `,` 也在字符串外** —— 解析器从 payload 中间
+/// 切一刀，`fields["payload"]` 只拿到被截断的 `{"a":1`，`json_to_value` 解析失败后
+/// `.unwrap_or(Value::Nil)` **静默变成 Nil**，事件其余部分照常加载。
+///
+/// 症状：**录制 → 重放的数据静默丢失，无任何报错**。既有往返测试
+/// （`msg_event_serialization_roundtrip` / state_mutation 那条）用的全是
+/// `Value::String` / `Value::Int` **标量**，所以这条路从来没被踩到。
+#[test]
+fn d89_msg_payload_dict_with_multiple_keys_survives_roundtrip() {
+    let mut d = std::collections::HashMap::new();
+    d.insert("a".to_string(), crate::value::Value::Int(1));
+    d.insert(
+        "b".to_string(),
+        crate::value::Value::String("two".to_string()),
+    );
+    let payload = crate::value::Value::Dict(d);
+
+    let path = tmp_path("d89_msg_dict");
+    let mut r = Recorder::new_record(path.clone()).unwrap();
+    r.record_msg("ch".to_string(), payload.clone(), 7);
+    r.save().unwrap();
+
+    let r2 = Recorder::new_replay(path.clone()).unwrap();
+    assert_eq!(r2.events().len(), 1, "事件本身不该丢");
+    match &r2.events()[0] {
+        Event::Msg {
+            channel,
+            payload: got,
+            ..
+        } => {
+            assert_eq!(channel, "ch");
+            assert_eq!(*got, payload, "多键 Dict payload 必须原样往返");
+        }
+        other => panic!("expected Msg, got {other:?}"),
+    }
+    let _ = fs::remove_file(&path);
+}
+
+/// 同根因的第二条路径：`StateMutation` 的 `old` / `new`。
+#[test]
+fn d89_state_mutation_dict_survives_roundtrip() {
+    let mut d = std::collections::HashMap::new();
+    d.insert("k1".to_string(), crate::value::Value::Int(1));
+    d.insert("k2".to_string(), crate::value::Value::Int(2));
+    let new = crate::value::Value::Dict(d);
+
+    let path = tmp_path("d89_sm_dict");
+    let mut r = Recorder::new_record(path.clone()).unwrap();
+    r.record_state_mutation("v".to_string(), crate::value::Value::Nil, new.clone());
+    r.save().unwrap();
+
+    let r2 = Recorder::new_replay(path.clone()).unwrap();
+    assert_eq!(r2.events().len(), 1);
+    match &r2.events()[0] {
+        Event::StateMutation { var, new: got, .. } => {
+            assert_eq!(var, "v");
+            assert_eq!(*got, new, "多键 Dict new 值必须原样往返");
+        }
+        other => panic!("expected StateMutation, got {other:?}"),
+    }
+    let _ = fs::remove_file(&path);
+}
+
+/// 同一根因的第三种形态：**List 元素里含 Dict**。`[1,2]` 本身在字符串外也带逗号，
+/// 同样会被切断。
+#[test]
+fn d89_msg_payload_list_of_dicts_survives_roundtrip() {
+    let mut d = std::collections::HashMap::new();
+    d.insert("a".to_string(), crate::value::Value::Int(1));
+    d.insert("b".to_string(), crate::value::Value::Int(2));
+    let payload = crate::value::Value::List(
+        vec![crate::value::Value::Dict(d), crate::value::Value::Int(9)].into(),
+    );
+
+    let path = tmp_path("d89_msg_list");
+    let mut r = Recorder::new_record(path.clone()).unwrap();
+    r.record_msg("ch".to_string(), payload.clone(), 1);
+    r.save().unwrap();
+
+    let r2 = Recorder::new_replay(path.clone()).unwrap();
+    match &r2.events()[0] {
+        Event::Msg { payload: got, .. } => {
+            assert_eq!(*got, payload, "含 Dict 的 List payload 必须原样往返");
+        }
+        other => panic!("expected Msg, got {other:?}"),
+    }
+    let _ = fs::remove_file(&path);
 }

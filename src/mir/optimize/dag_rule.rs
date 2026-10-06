@@ -7,6 +7,8 @@
 //! which edges to redirect.
 
 use crate::mir::dag::{EdgeKind, MirDag, MirDagEdge, MirDagNode, NodeId};
+// v0.104.6 D31：规则的邻接查询一律经它，避免退回 O(E) 全图扫描。
+use crate::mir::optimize::dag_search::DagIndex;
 use crate::mir::{MirInst, Reg};
 use crate::value::Value;
 
@@ -44,10 +46,14 @@ pub trait DagRewriteRule {
     fn name(&self) -> &'static str;
 
     /// Does this rule apply to the given node?
-    fn matches(&self, node_id: NodeId, node: &MirDagNode, dag: &MirDag) -> bool;
+    ///
+    /// v0.104.6 D31：新增 `idx` 邻接索引参数。**必须用它做邻接查询**
+    /// （`idx.out(n)` / `idx.inc(n)`），不要退回 `dag.edges.iter()` 全图扫
+    /// —— 那是本缺陷的根因，实测让 375 条语句的编译从 22.9 s 变成二次方。
+    fn matches(&self, node_id: NodeId, node: &MirDagNode, dag: &MirDag, idx: &DagIndex) -> bool;
 
     /// Produce a rewrite for the given node, or None if not applicable.
-    fn rewrite(&self, node_id: NodeId, dag: &MirDag) -> Option<DagRewrite>;
+    fn rewrite(&self, node_id: NodeId, dag: &MirDag, idx: &DagIndex) -> Option<DagRewrite>;
 
     fn cost_gain(&self) -> i32 {
         1
@@ -68,8 +74,14 @@ fn const_value(node: &MirDagNode) -> Option<&Value> {
 }
 
 /// Find incoming Data edges to `node_id` for a specific register.
-fn find_data_source(dag: &MirDag, node_id: NodeId, reg: Reg) -> Option<NodeId> {
-    dag.edges.iter().find_map(|e| {
+///
+/// v0.104.6 D31：走 `idx.inc(node_id)` 的入边桶，O(入度) 而非 O(E)。
+/// 索引与图恒等（见 `DagIndex` 文档），故结果与旧的全表 `find_map`
+/// **逐字相同** —— 包括「同一 (node, reg) 有多条 Data 边时取第一条」
+/// 这一顺序语义：桶内按边在 `dag.edges` 中的下标升序，与全表扫描同序。
+fn find_data_source(dag: &MirDag, idx: &DagIndex, node_id: NodeId, reg: Reg) -> Option<NodeId> {
+    idx.inc(node_id).iter().find_map(|&ei| {
+        let e = &dag.edges[ei as usize];
         if e.to == node_id
             && let EdgeKind::Data { reg: r } = e.kind
             && r == reg
@@ -82,9 +94,16 @@ fn find_data_source(dag: &MirDag, node_id: NodeId, reg: Reg) -> Option<NodeId> {
 }
 
 /// Find all outgoing Data edges from `node_id`.
-fn outgoing_data_edges(dag: &MirDag, node_id: NodeId) -> Vec<&MirDagEdge> {
-    dag.edges
+///
+/// v0.104.6 D31：走 `idx.out(node_id)` 出边桶，O(出度) 而非 O(E)。
+fn outgoing_data_edges<'a>(
+    dag: &'a MirDag,
+    idx: &DagIndex,
+    node_id: NodeId,
+) -> Vec<&'a MirDagEdge> {
+    idx.out(node_id)
         .iter()
+        .map(|&ei| &dag.edges[ei as usize])
         .filter(|e| e.from == node_id && matches!(e.kind, EdgeKind::Data { .. }))
         .collect()
 }
@@ -100,7 +119,7 @@ impl DagRewriteRule for ConstFoldingDagRule {
         "dag_const_folding"
     }
 
-    fn matches(&self, _node_id: NodeId, node: &MirDagNode, _dag: &MirDag) -> bool {
+    fn matches(&self, _node_id: NodeId, node: &MirDagNode, _dag: &MirDag, _idx: &DagIndex) -> bool {
         matches!(
             node,
             MirDagNode::Compute {
@@ -110,7 +129,7 @@ impl DagRewriteRule for ConstFoldingDagRule {
         )
     }
 
-    fn rewrite(&self, node_id: NodeId, dag: &MirDag) -> Option<DagRewrite> {
+    fn rewrite(&self, node_id: NodeId, dag: &MirDag, idx: &DagIndex) -> Option<DagRewrite> {
         let node = dag.nodes.get(node_id)?;
         let (dst, lhs_reg, op, rhs_reg) = match node {
             MirDagNode::Compute {
@@ -121,8 +140,8 @@ impl DagRewriteRule for ConstFoldingDagRule {
         };
 
         // Find Const source nodes via Data edges
-        let lhs_src = find_data_source(dag, node_id, *lhs_reg)?;
-        let rhs_src = find_data_source(dag, node_id, *rhs_reg)?;
+        let lhs_src = find_data_source(dag, idx, node_id, *lhs_reg)?;
+        let rhs_src = find_data_source(dag, idx, node_id, *rhs_reg)?;
 
         let lhs_v = const_value(&dag.nodes[lhs_src])?.clone();
         let rhs_v = const_value(&dag.nodes[rhs_src])?.clone();
@@ -145,10 +164,10 @@ impl DagRewriteRule for ConstFoldingDagRule {
             .collect();
 
         let mut removed = vec![node_id];
-        if outgoing_data_edges(dag, lhs_src).len() <= 1 {
+        if outgoing_data_edges(dag, idx, lhs_src).len() <= 1 {
             removed.push(lhs_src);
         }
-        if outgoing_data_edges(dag, rhs_src).len() <= 1 {
+        if outgoing_data_edges(dag, idx, rhs_src).len() <= 1 {
             removed.push(rhs_src);
         }
 
@@ -177,16 +196,27 @@ impl DagRewriteRule for DeadNodeDagRule {
         "dag_dead_node"
     }
 
-    fn matches(&self, _node_id: NodeId, node: &MirDagNode, _dag: &MirDag) -> bool {
+    fn matches(&self, _node_id: NodeId, node: &MirDagNode, _dag: &MirDag, _idx: &DagIndex) -> bool {
         matches!(node, MirDagNode::Compute { .. })
     }
 
-    fn rewrite(&self, node_id: NodeId, dag: &MirDag) -> Option<DagRewrite> {
+    fn rewrite(&self, node_id: NodeId, dag: &MirDag, idx: &DagIndex) -> Option<DagRewrite> {
         // Don't remove exit nodes (they carry the function's result)
         if dag.exit.contains(&node_id) {
             return None;
         }
-        let has_outgoing = dag.edges.iter().any(|e| e.from == node_id);
+        // v0.104.6（**已知限制，未修**）：透明穿通保留了 removed 节点的边
+        // （`dag.reachable` 的有效性依赖它们），故「有出边」这一判据会放过
+        // 「消费方**全是 Removed**」的节点 —— 它们其实已死，却删不掉，死节点
+        // 会逐轮堆积（每轮参与 `node_ready` 判定、在 `seq_preds` 里占位）。
+        //
+        // 试过把判据改成「有**存活**出边」，实测破坏 `jit_equiv_folded_constants`
+        // 与 `if_as_value_not_starved_by_dead_branch` 两项 —— 沿穿通链继续
+        // 承担激活传递的节点也被判死并摘掉，链条断裂。两者相较，此处**正确性
+        // 优先**：保留旧判据，接受死节点堆积这一有界开销。
+        // v0.104.6 D31：走 `idx.has_outgoing(node_id)`（出边桶是否为空），
+        // O(1) 而非扫全部 E 条边。
+        let has_outgoing = idx.has_outgoing(node_id);
         if has_outgoing {
             return None;
         }
@@ -195,7 +225,7 @@ impl DagRewriteRule for DeadNodeDagRule {
         // dag_search 删节点只清边、不修补引用者的 target 指针，删除后
         // target 悬垂 → 执行器跳进 Removed 死路。循环退出目标（for 循环后
         // 的 Const 占位）是典型：被 JumpIf true_target 引用、无出边。
-        if is_control_target(node_id, dag) {
+        if is_control_target(node_id, dag, idx) {
             return None;
         }
         // v0.75.33: 活跃 use 保护 — 节点的 dst reg 若被其他存活节点作为
@@ -243,12 +273,12 @@ impl DagRewriteRule for CseDagRule {
         "dag_cse"
     }
 
-    fn matches(&self, _node_id: NodeId, node: &MirDagNode, _dag: &MirDag) -> bool {
+    fn matches(&self, _node_id: NodeId, node: &MirDagNode, _dag: &MirDag, _idx: &DagIndex) -> bool {
         // Any pure Compute node is a candidate
         matches!(node, MirDagNode::Compute { .. })
     }
 
-    fn rewrite(&self, node_id: NodeId, dag: &MirDag) -> Option<DagRewrite> {
+    fn rewrite(&self, node_id: NodeId, dag: &MirDag, idx: &DagIndex) -> Option<DagRewrite> {
         let (dst_b, _) = match &dag.nodes[node_id] {
             MirDagNode::Compute { dst, .. } => (*dst, ()),
             _ => return None,
@@ -262,7 +292,7 @@ impl DagRewriteRule for CseDagRule {
         // v0.75.33: 控制流入口保护 — 被 Branch/Jump target 引用的节点不参与
         // CSE 合并（合并=删除 + 重定向出边，但不修补入边指针 → target 悬垂）。
         // 循环退出目标（for 后的 Const 占位）是典型受害者。
-        if is_control_target(node_id, dag) {
+        if is_control_target(node_id, dag, idx) {
             return None;
         }
 
@@ -275,7 +305,7 @@ impl DagRewriteRule for CseDagRule {
                 continue;
             }
 
-            if nodes_equivalent(&dag.nodes[prev_id], node, prev_id, node_id, dag) {
+            if nodes_equivalent(&dag.nodes[prev_id], node, prev_id, node_id, dag, idx) {
                 // Found equivalent — redirect outgoing edges from node_id to prev_id
                 // v0.75.33: 合并不同 dst 的节点必须重命名 — dag_interp 按
                 // input_regs（寄存器号）取数，不按 Data 边；只重定向边会让
@@ -292,6 +322,61 @@ impl DagRewriteRule for CseDagRule {
                 // （for/while 的索引：init 与增量写同一寄存器）与跨分支同值
                 // 常量（只有一边执行）都会命中。
                 if is_multi_defined(dag, dst_b) || is_multi_defined(dag, dst_a) {
+                    return None;
+                }
+
+                // v0.104.6 D9：胜者必须在败者执行时**一定已执行**（支配关系）。
+                // 否则 `reg_rename` 会把败者的消费者改写成一个「只在该胜者所在
+                // 控制区域被选中时才写该寄存器」的 producer → 消费者永久
+                // not-ready → 前沿饿死 → 程序静默结束。
+                //
+                // **触发实例（D9：`while` + `continue` 返回 0，应 4）**：
+                // ```mora
+                // let n = 0i
+                // let k = 0i
+                // while k < 5i
+                //   if k == 2i then
+                //     assign k = k + 1i
+                //     continue
+                //   end
+                //   assign n = n + 1i     -- 需要 if 块里的 Const(1)
+                //   assign k = k + 1i
+                // end
+                // ```
+                // if 块内的 `Const(1)`（`k = k + 1`）与 if 之后的
+                // `n = n + 1` 所用的 `Const(1)` 同值 → 被 CSE 合并。两者
+                // 寄存器都是单定义，`is_control_target` / `is_multi_defined`
+                // 三道守卫全部放行。但两块**互斥**：k != 2 时 if 块不执行，
+                // 其 `Const(1)` 永不写寄存器 → `n = n + 1` 永久 not-ready
+                // → 循环体尾部永不执行 → 循环无法推进 → 静默结束。
+                //
+                // 判据取「同一基本块」：Sequence 边只在基本块内创建，故沿
+                // Sequence 边可达 ≡ 同块；同块节点同生共死，合并必然安全。
+                // 这是**充分**条件（支配但不同块的节点仍会被保守地放弃合并），
+                // 代价只是少做一些本可做的优化。
+                if !seq_reachable(dag, idx, prev_id, node_id) {
+                    return None;
+                }
+
+                // v0.104.6：**胜者必须与败者一样可达**。
+                //
+                // 上面那道「同基本块」判据挡不住「死块里的等价节点」这一类：
+                // Sequence 边会从死块跨进活块（实例：`let x = if 1 == 1 then 5 end`
+                // 里，常量折叠删掉 `JumpIfNot` 后 else 臂成为死块，其
+                // `Const(10, Nil)` → `Copy(4,10)` → `Define(x,4)` 仍与
+                // 后续活代码同处一条 Sequence 链），于是「同块」成立、合并放行。
+                //
+                // 但**死块里的节点从不写它的寄存器**：把败者消费者改写成读胜者
+                // 的寄存器后，那个寄存器永远 not-ready → 消费者永不执行 →
+                // 其后整条尾部（`print`）静默消失。
+                // 实测：`Assign("__let_result", 5)` 被改名成读 reg 10（死 else
+                // 臂的 `Const(10, Nil)`）→ 程序无任何输出、退出码 0。
+                //
+                // 判据：败者可达时，胜者也必须可达（死块里的节点只配与死块
+                // 合并，而那没有收益）。
+                if dag.reachable.get(node_id).copied().unwrap_or(false)
+                    && !dag.reachable.get(prev_id).copied().unwrap_or(false)
+                {
                     return None;
                 }
 
@@ -373,13 +458,47 @@ fn is_multi_defined(dag: &MirDag, reg: Reg) -> bool {
     false
 }
 
+/// v0.104.6 D9：节点 `to` 是否可从 `from` 沿**仅 Sequence 边**到达。
+///
+/// 用途：CSE 合并的支配性判据。Sequence 边是「基本块内相邻指令的保序边」，
+/// 只在块内创建（见 `dag_analyze` 的 Sequence 构造与 `prune_sequence_edges`
+/// 的「全保留」约定），故「沿 Sequence 边可达」≡「同一基本块」≡ 同生共死。
+/// 跨块（互斥控制区域）的两个节点不可合并 —— 见 `CseDagRule::rewrite` 中
+/// D9 的触发实例。
+/// v0.104.6 D31：走 `idx.out(n)` 出边桶，O(Σ度) 而非 O(V·E)。
+/// 桶内按边下标升序，与旧的全表扫描同序，故可达性判定逐字等价。
+fn seq_reachable(dag: &MirDag, idx: &DagIndex, from: NodeId, to: NodeId) -> bool {
+    if from == to {
+        return true;
+    }
+    let mut seen: std::collections::HashSet<NodeId> = std::collections::HashSet::new();
+    let mut stack = vec![from];
+    seen.insert(from);
+    while let Some(n) = stack.pop() {
+        for &ei in idx.out(n) {
+            let e = &dag.edges[ei as usize];
+            if !matches!(e.kind, EdgeKind::Sequence) {
+                continue;
+            }
+            if e.to == to {
+                return true;
+            }
+            if seen.insert(e.to) {
+                stack.push(e.to);
+            }
+        }
+    }
+    false
+}
+
 /// Check if two Compute nodes are structurally equivalent:
 /// same instruction type + same data sources.
 /// v0.75.33: 控制流入口判定 — 该节点是否被任意控制边（Control/
 /// ControlIfTrue/ControlIfFalse）作为 target 引用。被引用的节点是控制流
 /// 入口：删除会导致引用者的 target 指针悬垂（dag_search 删节点不清指针）。
-fn is_control_target(node_id: NodeId, dag: &MirDag) -> bool {
-    dag.edges.iter().any(|e| {
+fn is_control_target(node_id: NodeId, dag: &MirDag, idx: &DagIndex) -> bool {
+    idx.inc(node_id).iter().any(|&ei| {
+        let e = &dag.edges[ei as usize];
         e.to == node_id
             && matches!(
                 e.kind,
@@ -396,6 +515,7 @@ fn nodes_equivalent(
     a_id: NodeId,
     b_id: NodeId,
     dag: &MirDag,
+    idx: &DagIndex,
 ) -> bool {
     let (inst_a, _dst_a, inputs_a) = match a {
         MirDagNode::Compute {
@@ -425,8 +545,8 @@ fn nodes_equivalent(
 
     // Same data sources for each input register?
     for (&reg_a, &reg_b) in inputs_a.iter().zip(inputs_b.iter()) {
-        let src_a = find_data_source(dag, a_id, reg_a);
-        let src_b = find_data_source(dag, b_id, reg_b);
+        let src_a = find_data_source(dag, idx, a_id, reg_a);
+        let src_b = find_data_source(dag, idx, b_id, reg_b);
         if src_a != src_b {
             return false;
         }
@@ -466,7 +586,7 @@ impl DagRewriteRule for AlgebraicSimplifyDagRule {
         "dag_algebraic"
     }
 
-    fn matches(&self, _node_id: NodeId, node: &MirDagNode, _dag: &MirDag) -> bool {
+    fn matches(&self, _node_id: NodeId, node: &MirDagNode, _dag: &MirDag, _idx: &DagIndex) -> bool {
         matches!(
             node,
             MirDagNode::Compute {
@@ -476,7 +596,7 @@ impl DagRewriteRule for AlgebraicSimplifyDagRule {
         )
     }
 
-    fn rewrite(&self, node_id: NodeId, dag: &MirDag) -> Option<DagRewrite> {
+    fn rewrite(&self, node_id: NodeId, dag: &MirDag, idx: &DagIndex) -> Option<DagRewrite> {
         let node = dag.nodes.get(node_id)?;
         let (dst, lhs_reg, op, rhs_reg) = match node {
             MirDagNode::Compute {
@@ -486,8 +606,8 @@ impl DagRewriteRule for AlgebraicSimplifyDagRule {
             _ => return None,
         };
 
-        let lhs_src = find_data_source(dag, node_id, *lhs_reg);
-        let rhs_src = find_data_source(dag, node_id, *rhs_reg);
+        let lhs_src = find_data_source(dag, idx, node_id, *lhs_reg);
+        let rhs_src = find_data_source(dag, idx, node_id, *rhs_reg);
 
         let lhs_val = lhs_src.and_then(|id| const_value(&dag.nodes[id]));
         let rhs_val = rhs_src.and_then(|id| const_value(&dag.nodes[id]));
@@ -541,6 +661,36 @@ impl DagRewriteRule for AlgebraicSimplifyDagRule {
                 reg_rename: None,
             }),
             ReplaceWith::ReplaceWithSource(reg, Some(src_id)) => {
+                // v0.104.6 D302：**本分支已停用**（原本就在产出错误代码）。
+                //
+                // 它是 `MirInst::Copy` 时代的遗留物 —— 而 `Copy` 在 v0.55 已删除
+                // （见 `optimize/rule.rs` 的 `DeadAssignRule` 注释）。该分支
+                // `added: vec![]`：**不添加任何节点**，只把原节点标 `Removed`
+                // 并把出边改指到源节点。于是没有任何指令写 `dst`，而消费者
+                // （`reg_rename: None` ⇒ 读寄存器没变）仍在读 `dst`。
+                //
+                // 后果（实测，默认档 `OptLevel::None`）：
+                // ```mora
+                // print("A")
+                // let a = 100i + 0i
+                // print(a)
+                // print("B")
+                // ```
+                // 只输出 `A`；`a` 与 `B` 两条语句**静默不执行**，
+                // 退出码 **0**、零诊断 —— 即 D35「静默饿死」那一族。
+                //
+                // 修法不是把边的 `reg` 改成 `dst`（**已试，无效**：执行器要的是
+                // 一个 `dst` 匹配的**节点**，不是一条声称携带 dst 的边），
+                // 而是让它**别产出错误代码**。要恢复这条优化需要重新引入
+                // 「把源的值搬进 dst」的机制（恢复 `Copy` 或加等价节点）——
+                // 那是**架构决定**，未擅自实施，已上报。
+                //
+                // 停用的代价：恒等运算不再被化简（`x+0` 保留 `BinaryOp`）。
+                // 语义上完全等价（执行器照常算出 `x`），只少了这一处优化；
+                // 两个字面量的情形仍由 MIR 层 `ConstFoldingRule` 折叠。
+                let _ = (reg, src_id);
+                return None;
+                #[allow(unreachable_code)]
                 let out_edges: Vec<(NodeId, NodeId, EdgeKind)> = dag
                     .edges
                     .iter()
@@ -597,6 +747,8 @@ mod tests {
             MirInst::Const(1, Value::Int(32)),
             MirInst::BinaryOp(2, 0, BinaryOp::Add, 1),
         ]);
+        // v0.104.6 D31：规则回调的邻接查询走索引（见 `DagIndex` 文档）
+        let idx = DagIndex::build(&dag);
         // Find the BinaryOp node
         let binop_id = dag
             .nodes
@@ -613,7 +765,9 @@ mod tests {
             .unwrap();
 
         let rule = ConstFoldingDagRule;
-        let rw = rule.rewrite(binop_id, &dag).expect("should fold constants");
+        let rw = rule
+            .rewrite(binop_id, &dag, &idx)
+            .expect("should fold constants");
         assert_eq!(rw.added.len(), 1, "should add one Const node");
         assert!(rw.removed.contains(&binop_id), "should remove BinaryOp");
         // The new node should be a Const with value 42
@@ -636,6 +790,8 @@ mod tests {
             MirInst::Const(1, Value::Int(10)),
             MirInst::BinaryOp(2, 0, BinaryOp::Add, 1),
         ]);
+        // v0.104.6 D31：规则回调的邻接查询走索引（见 `DagIndex` 文档）
+        let idx = DagIndex::build(&dag);
         let binop_id = dag
             .nodes
             .iter()
@@ -651,7 +807,7 @@ mod tests {
             .unwrap();
         let rule = ConstFoldingDagRule;
         assert!(
-            rule.rewrite(binop_id, &dag).is_none(),
+            rule.rewrite(binop_id, &dag, &idx).is_none(),
             "should not fold non-const lhs"
         );
     }
@@ -665,6 +821,8 @@ mod tests {
             MirInst::BinaryOp(2, 0, BinaryOp::Add, 1),
             MirInst::BinaryOp(3, 0, BinaryOp::Add, 1),
         ]);
+        // v0.104.6 D31：规则回调的邻接查询走索引（见 `DagIndex` 文档）
+        let idx = DagIndex::build(&dag);
         // BinaryOp at r3 (node with dst=3) should be eliminated
         let dup_id = dag
             .nodes
@@ -673,7 +831,7 @@ mod tests {
             .unwrap();
         let rule = CseDagRule;
         let rw = rule
-            .rewrite(dup_id, &dag)
+            .rewrite(dup_id, &dag, &idx)
             .expect("should eliminate duplicate");
         assert!(
             rw.removed.contains(&dup_id),
@@ -689,6 +847,8 @@ mod tests {
             MirInst::BinaryOp(2, 0, BinaryOp::Add, 1),
             MirInst::BinaryOp(3, 0, BinaryOp::Mul, 1), // different op
         ]);
+        // v0.104.6 D31：规则回调的邻接查询走索引（见 `DagIndex` 文档）
+        let idx = DagIndex::build(&dag);
         let dup_id = dag
             .nodes
             .iter()
@@ -696,7 +856,7 @@ mod tests {
             .unwrap();
         let rule = CseDagRule;
         assert!(
-            rule.rewrite(dup_id, &dag).is_none(),
+            rule.rewrite(dup_id, &dag, &idx).is_none(),
             "different ops should not be eliminated"
         );
     }
@@ -724,6 +884,8 @@ mod tests {
             // 增量：**第二次**定义 r7 → r7 非 SSA
             MirInst::BinaryOp(7, 7, BinaryOp::Add, 9),
         ]);
+        // v0.104.6 D31：规则回调的邻接查询走索引（见 `DagIndex` 文档）
+        let idx = DagIndex::build(&dag);
         let idx_init = dag
             .nodes
             .iter()
@@ -731,7 +893,7 @@ mod tests {
             .expect("index init node");
         let rule = CseDagRule;
         assert!(
-            rule.rewrite(idx_init, &dag).is_none(),
+            rule.rewrite(idx_init, &dag, &idx).is_none(),
             "多定义寄存器（循环索引）不得被 CSE 重命名 — 否则条件读到 init 值、\
              增量写到另一个寄存器，循环永不终止"
         );
@@ -747,50 +909,73 @@ mod tests {
             MirInst::BinaryOp(2, 0, BinaryOp::Add, 1),
             MirInst::BinaryOp(3, 0, BinaryOp::Add, 1), // r3 单定义 → 可消除
         ]);
+        // v0.104.6 D31：规则回调的邻接查询走索引（见 `DagIndex` 文档）
+        let idx = DagIndex::build(&dag);
         let dup_id = dag
             .nodes
             .iter()
             .position(|n| matches!(n, MirDagNode::Compute { dst: 3, .. }))
             .unwrap();
         assert!(
-            CseDagRule.rewrite(dup_id, &dag).is_some(),
+            CseDagRule.rewrite(dup_id, &dag, &idx).is_some(),
             "单定义寄存器的等价节点仍必须被 CSE 消除"
         );
     }
 
     #[test]
-    fn algebraic_x_plus_zero() {
-        // r0=Var("x"), r1=0, r2=r0+r1  →  should simplify to just r0
+    fn algebraic_x_plus_zero_is_refused_not_applied() {
+        // v0.104.6 D302：本条**原先断言规则会触发**（`x+0 → x`），现已反转为
+        // 「必须**拒绝**改写」。
+        //
+        // 原因：`ReplaceWithSource` 分支是 `MirInst::Copy` 的遗留物（`Copy`
+        // 在 v0.55 已删）。它 `added: vec![]` —— 不添加任何节点，只把原节点
+        // 标 `Removed` 并把出边改指到源节点。于是没有任何指令写 `dst`，
+        // 消费者（`reg_rename: None` ⇒ 读寄存器没变）永远等不到 `dst`。
+        //
+        // 端到端后果（默认档 `OptLevel::None`）：
+        //     print("A") / let a = 100i + 0i / print(a) / print("B")
+        // 只输出 `A` —— 后两条语句静默不执行，退出码 0、零诊断。
+        // 端到端判据：`tests/identity_op_silently_drops_statements.rs`。
         let dag = make_dag(vec![
             MirInst::Var(0, "x".to_string()),
             MirInst::Const(1, Value::Int(0)),
             MirInst::BinaryOp(2, 0, BinaryOp::Add, 1),
         ]);
+        let idx = DagIndex::build(&dag);
         let binop_id = dag
             .nodes
             .iter()
             .position(|n| matches!(n, MirDagNode::Compute { dst: 2, .. }))
             .unwrap();
         let rule = AlgebraicSimplifyDagRule;
-        let rw = rule.rewrite(binop_id, &dag).expect("x+0 should simplify");
-        assert!(rw.removed.contains(&binop_id), "should remove the add");
+        assert!(
+            rule.rewrite(binop_id, &dag, &idx).is_none(),
+            "`x + 0` 的改写会打断 dst 的数据依赖（D302）—— 该分支必须保持停用，\
+             直到重新引入「把源的值搬进 dst」的机制"
+        );
     }
 
     #[test]
-    fn algebraic_x_times_one() {
+    fn algebraic_x_times_one_is_refused_not_applied() {
+        // 同上：`x * 1` 与 `x + 0` 走的是同一条 `ReplaceWithSource` 分支。
+        // 对照 `algebraic_x_times_zero`：`x * 0` 走 `ReplaceWithConst`
+        // （会真的加一个写 dst 的 `Const` 节点）—— 那一支是安全的，仍在生效。
         let dag = make_dag(vec![
             MirInst::Var(0, "x".to_string()),
             MirInst::Const(1, Value::Int(1)),
             MirInst::BinaryOp(2, 0, BinaryOp::Mul, 1),
         ]);
+        let idx = DagIndex::build(&dag);
         let binop_id = dag
             .nodes
             .iter()
             .position(|n| matches!(n, MirDagNode::Compute { dst: 2, .. }))
             .unwrap();
         let rule = AlgebraicSimplifyDagRule;
-        let rw = rule.rewrite(binop_id, &dag).expect("x*1 should simplify");
-        assert!(rw.removed.contains(&binop_id));
+        assert!(
+            rule.rewrite(binop_id, &dag, &idx).is_none(),
+            "`x * 1` 的改写会打断 dst 的数据依赖（D302）—— 该分支必须保持停用"
+        );
     }
 
     #[test]
@@ -800,6 +985,8 @@ mod tests {
             MirInst::Const(1, Value::Int(0)),
             MirInst::BinaryOp(2, 0, BinaryOp::Mul, 1),
         ]);
+        // v0.104.6 D31：规则回调的邻接查询走索引（见 `DagIndex` 文档）
+        let idx = DagIndex::build(&dag);
         let binop_id = dag
             .nodes
             .iter()
@@ -807,7 +994,7 @@ mod tests {
             .unwrap();
         let rule = AlgebraicSimplifyDagRule;
         let rw = rule
-            .rewrite(binop_id, &dag)
+            .rewrite(binop_id, &dag, &idx)
             .expect("x*0 should simplify to 0");
         assert_eq!(rw.added.len(), 1);
         match &rw.added[0] {

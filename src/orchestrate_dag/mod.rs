@@ -9,7 +9,15 @@
 //! - `OrchestrateDag` struct: nodes + edges
 //! - `topological_order()` — Kahn's algorithm (BFS)
 //! - `validate()` — detect cycles, missing nodes
-//! - builtin `orchestrate.dag(nodes, edges, max_steps?)` → List[String] order
+//!
+//! v0.104.6 D280：下面这行原本写着
+//! `builtin orchestrate.dag(nodes, edges, max_steps?)`，**两处都不对**：
+//! - 实际 builtin 名是 **`ai.dag`**（不是 `orchestrate.dag`）；
+//! - **没有** `max_steps` 参数 —— 实参就是 `(nodes, edges)` 两个，
+//!   少于此数直接报 `ai.dag: requires 2 args (nodes, edges)`。
+//!
+//! 另注：那个 builtin 目前**源码不可达**（D59
+//! `tests/ai_namespace_reachability.rs`）—— 此处仅订正签名，不宣称它可用。
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
@@ -50,7 +58,27 @@ impl OrchestrateDag {
     }
 
     /// Kahn's algorithm: BFS topological sort
-    /// Returns: Vec<String> in execution order
+    /// Returns: Vec`<String>` in execution order
+    ///
+    /// v0.104.6 D280：**并列节点的顺序必须确定**。
+    ///
+    /// 修前 `in_degree` / `edges_by_from` 都是 `HashMap`，而 Rust 的
+    /// `HashMap` 用**逐进程随机种子**（`RandomState`）⇒ 同一张图、不同进程
+    /// 返回的顺序**不同**。实测 8 个无边（全部独立）的节点，声明序
+    /// `a..h` 而返回 `["d","b","f","a","c","e","g","h"]`。
+    ///
+    /// 拓扑序本身对并列节点无所谓，但这个顺序是**暴露给用户**的 ——
+    /// builtin `ai.dag(nodes, edges)` 直接把它作为 `List[String]` 返回。
+    /// 仓库内已有同一条原则：`pregel/mod.rs` 明确按 agent 定义顺序排序
+    /// `active_nodes`，注释写着「HashSet 迭代顺序不确定 → 会让结果依赖顺序」。
+    ///
+    /// 本实现改为：**起点按 `nodes` 声明顺序**入队、**同层后继按声明顺序**
+    /// 入队 ⇒ 全部并列都按源码书写顺序打破平局。
+    ///
+    /// ⚠ 目前**零用户可见变更**：builtin `ai.dag` 在源码里**不可达**
+    /// （`call_ai_method` 只挂在 `(BuiltinKind::Ai, _)` 上，而 parser 把裸名
+    /// `ai.x` 解析成 `BuiltinKind::AiChat` —— 见 D59
+    /// `tests/ai_namespace_reachability.rs`）。本条是给「将来接线」拆雷。
     pub fn topological_order(&self) -> Result<Vec<String>, String> {
         self.validate()?;
 
@@ -66,11 +94,20 @@ impl OrchestrateDag {
                 .expect("topological_order: edge target not in nodes (validate passed)") += 1;
         }
 
-        // 起点: in_degree == 0
+        // v0.104.6 D280：声明位置索引 —— 用来把 HashMap 的并列变成源码序。
+        let pos: HashMap<&str, usize> = self
+            .nodes
+            .iter()
+            .enumerate()
+            .map(|(i, n)| (n.as_str(), i))
+            .collect();
+
+        // 起点: in_degree == 0。**按 nodes 声明顺序**入队（修前是遍历
+        // HashMap ⇒ 顺序不确定）。
         let mut queue: VecDeque<&str> = VecDeque::new();
-        for (n, &deg) in &in_degree {
-            if deg == 0 {
-                queue.push_back(n);
+        for n in &self.nodes {
+            if in_degree.get(n.as_str()).copied().unwrap_or(0) == 0 {
+                queue.push_back(n.as_str());
             }
         }
 
@@ -82,6 +119,11 @@ impl OrchestrateDag {
                 .entry(from.as_str())
                 .or_default()
                 .push(to.as_str());
+        }
+        // v0.104.6 D280：同一 from 的多个后继也按声明顺序入队，
+        // 否则「a 同时指向 b/c/d」时的并列顺序同样不确定。
+        for tos in edges_by_from.values_mut() {
+            tos.sort_by_key(|t| pos.get(t).copied().unwrap_or(usize::MAX));
         }
 
         while let Some(n) = queue.pop_front() {
@@ -110,7 +152,23 @@ impl OrchestrateDag {
     }
 
     /// 拓扑排序并检测环 (Kahn's standard detection)
+    ///
+    /// v0.104.6 D400：**只回答「环」**。
+    ///
+    /// 此前是 `self.topological_order().is_err()`，而 `topological_order()`
+    /// 第一步就 `self.validate()?` ⇒ `validate()` 的三类错误
+    /// （`duplicate node` / `edge from unknown node` / `edge to unknown node`）
+    /// **全都不是环**，却会让本方法回答「**有环**」。
+    /// 实测：`nodes=["a"]`、`edges=[("a","ghost")]`（只是打错节点名）
+    /// 报 `has_cycle() == true`。
+    ///
+    /// 修法：畸形图**无从谈环** ⇒ 返回 `false`，
+    /// 由调用方用 `validate()` / `topological_order()` 去处理那三类错误。
+    /// `validate` 过了之后，`topological_order` 唯一的错误就只剩环。
     pub fn has_cycle(&self) -> bool {
+        if self.validate().is_err() {
+            return false;
+        }
         self.topological_order().is_err()
     }
 

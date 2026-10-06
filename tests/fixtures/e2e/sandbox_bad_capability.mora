@@ -1,0 +1,16 @@
+-- e2e：sandbox capability **非法名**的错误路径（v0.104.6 D388）
+--
+-- 与 `sandbox_capability.mora` 的 ④ 配对：那里的 `web.fetch` 是
+-- **合法** capability 名，只是不在令牌里 ⇒ 返回 `false`。
+-- 这里钉另一半：**非法名**（`net.http` 不在 13 个 variant 里）
+-- 是在 builtin 层 `Capability::parse` 就失败的，
+-- 抛 Err **并终止脚本**（exit 1），不是 `false`。
+--
+-- 判据断言：非零退出 + 错误消息**点名**那个非法名。
+--
+-- Run: cargo run -- tests/fixtures/e2e/sandbox_bad_capability.mora
+
+let d = sandbox.key("file.read")
+print("issued=" + str(d))
+print("about_to_fail=" + str(sandbox.check_call(d, "net.http")))
+print("unreachable")

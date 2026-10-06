@@ -15,9 +15,9 @@
 //! EventClient 代码片段, 见 RESEARCH_PRIMITIVES_MASTER_v2.md §1.10)
 //!
 //! 索引结构 (双层):
-//! - `exact`: 字面量键 (e.g. "ai.chat.completed") → Vec<Handler>
-//! - `prefix`: 仅末尾 ".*" 模式 (e.g. "ai.chat.*") → Vec<Handler>, key 即 prefix
-//! - `interior`: 中间含通配符的模式 (e.g. "ai.*.completed") → Vec<Handler>
+//! - `exact`: 字面量键 (e.g. "ai.chat.completed") → Vec`<Handler>`
+//! - `prefix`: 仅末尾 ".*" 模式 (e.g. "ai.chat.*") → Vec`<Handler>`, key 即 prefix
+//! - `interior`: 中间含通配符的模式 (e.g. "ai.*.completed") → Vec`<Handler>`
 //!   interior 用量极少, emit 时 fallback linear scan 即可; v0.41 不优化
 //!
 //! emit 路径:
@@ -144,6 +144,16 @@ impl EventBus {
                 }
                 for i in 0..parts.len() {
                     let prefix_key = parts[..=i].join(".");
+                    // v0.104.6 D390：**跳过空 key**，否则与上面 catch-all 那次
+                    // 命中**同一个** `prefix[""]` 桶 ⇒ 重复投递。
+                    //
+                    // 触发条件只有空事件名：`"".split('.')` 产出 `[""]`，
+                    // 于是 `parts[..=0].join(".") == ""`。
+                    // 任何非空事件名都产不出空 key（`"a."` → `"a."`、
+                    // `"a..b"` → `"a."` / `"a..b"`），故本分支只影响空事件名。
+                    if prefix_key.is_empty() {
+                        continue;
+                    }
                     if let Some(handlers) = prefix.get(&prefix_key) {
                         out.extend(handlers.iter().cloned());
                     }
@@ -258,6 +268,20 @@ fn classify_pattern(pattern: &str) -> PatternBucket {
 /// - pattern 全 `*` 匹配所有
 ///
 /// Example: "outer.*" 匹配 "outer.gui" "outer.foo" "outer.gui.item.removed"
+///
+/// ## v0.104.6 D281：`X.*` **也匹配裸 `X`**（两条实现一致，此前无测试覆盖）
+///
+/// `pa_segments.len() <= ev_segments.len() + 1` 里的那个 `+1` 余量使
+/// `matches("outer", "outer.*")` 返回 **true**。这不是「只匹配 `outer.` 之下」。
+///
+/// 与**索引路径一致**（不是两套实现打架）：`classify_pattern("outer.*")` 把它
+/// 存成 `prefix["outer"]`，而 `emit("outer")` 在 `for i in 0..parts.len()`
+/// 里正好查到 `prefix["outer"]` ⇒ 同样触发。
+///
+/// **本轮不改这个语义**（改它属产品策略决定），只把既有行为**写明并钉住**：
+/// 判据见 `tests/event_pattern_matching_semantics.rs`。
+/// 影响面已核：`sandbox.check_builtin` 是**查询型** builtin（参数由用户传、
+/// 执行路径上无调用者），事件总线的消费者都是内部代码 ⇒ 目前**无可观察后果**。
 ///
 /// v0.41: 此函数仅在 interior 桶的 fallback 扫描中使用; exact/prefix 桶走 O(1)/O(seg) 索引
 pub fn matches(event: &str, pattern: &str) -> bool {

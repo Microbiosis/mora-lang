@@ -15,6 +15,11 @@ pub mod persistent;
 // v0.83: Clojure-style transducers — 流式管道的底层原语
 pub mod transducer;
 
+// v0.104.6: 不可变分块列表（`Rc` 结构共享）—— `Value::List` 的目标表示。
+// 尚未接管 `Value::List`（那是 165 处构造 + 163 处模式匹配的机械迁移，
+// 独立一步做）。本阶段先让类型本身测到全绿并量测收益。
+pub mod list;
+
 // v1 Stmt 已移除 — Value::Task/Closure 不再持有 body
 
 // ─── StreamReader ─────────────────────────────────────────
@@ -233,10 +238,10 @@ impl BuiltinKind {
 
 /// v0.40: Immutable Environment snapshot for closure captures.
 ///
-/// Wraps a Box<Environment>. Unlike the legacy Arc<Mutex<Environment>>,
+/// Wraps a Box``<Environment>``. Unlike the legacy Arc<Mutex``<Environment>``>,
 /// an EnvRef is owned — the captured env is frozen at capture time
 /// and cannot be mutated by any other thread or closure. This also
-/// makes EnvRef Send (Box<Environment> is Send because Environment
+/// makes EnvRef Send (Box`<Environment>` is Send because Environment
 /// contains only Send-safe fields).
 #[derive(Debug, Clone)]
 pub struct EnvRef(pub Box<Environment>);
@@ -262,7 +267,7 @@ pub enum Value {
     BigInt(num_bigint::BigInt),
     Bool(bool),
     Nil,
-    List(Vec<Value>),
+    List(list::List),
     Dict(HashMap<String, Value>),
     Task {
         name: String,
@@ -282,8 +287,8 @@ pub enum Value {
     },
     Closure {
         params: Vec<String>,
-        /// v0.40: env is now EnvRef (Local Rc<RefCell> or Owned Box<Environment>)
-        /// instead of Arc<Mutex<Environment>>. Callers convert via
+        /// v0.40: env is now EnvRef (Local Rc`<RefCell>` or Owned Box`<Environment>`)
+        /// instead of Arc<Mutex`<Environment>`>. Callers convert via
         /// EnvRef::new(env) for closure captures.
         env: EnvRef,
         /// α.10/α.11: MIR-built 闭包体。所有 closure 必须有 body；
@@ -340,7 +345,18 @@ pub enum Value {
     },
     // v0.06.6: McpServer 值类型
     McpServer {
-        tools: Vec<(String, Value)>, // (tool_name, handler)
+        // v0.104.6：加入 schema 一维 —— `(tool_name, input_schema_json, handler)`。
+        //
+        // 此前是 `Vec<(String, Value)>`（name + handler），**结构上就存不下
+        // schema**，于是 `McpServer.tool(name, schema, handler)` 读 `args[0]`
+        // 与 `args[2]`、**把 `args[1]` 整个丢掉**；`serve` 再把
+        // `McpTool.parameters` 硬编码成 `"{}"`。后果：MCP 协议里发给客户端的
+        // `tools/list` 每项 `inputSchema` 都是空对象（`mcp_server.rs:346`），
+        // 客户端因而认为该工具**无参数**，对需要入参的 handler 以空参调用。
+        //
+        // typeck 一直声明的是 `tool(name, schema, handler)` 三个形参
+        // （`typeck/dispatch.rs:488`）—— 契约是对的，是运行期没兑现。
+        tools: Vec<(String, String, Value)>, // (tool_name, input_schema_json, handler)
     },
     // v0.08.5: trait 对象 — 携带 data + for_type + trait_name（一等值类型）
     // v0.09: 加 for_generics + trait_generics 两个字段
@@ -575,6 +591,13 @@ impl Value {
                 "stddev",
                 "var",
                 "sort",
+                // v0.104.6：此前漏报。`call_method_list` 有 `crush_json` 分支
+                // （实测报 "List.crush_json: requires max as number"，即分支
+                // 确实存在），但本表没列，于是 `methods_of([1,2,3])` 少报一个。
+                // 这张表是 `methods_of` builtin 的唯一数据源（value.rs:544
+                // `Value::methods`），漏报会让用户按 `methods_of` 的结果
+                // 推断能力时得到偏小的集合。
+                "crush_json",
             ],
             Value::Dict(_) => &["get", "set", "keys", "values", "len", "json"],
             Value::Int(_) => &[
@@ -621,6 +644,64 @@ impl Value {
             Value::Router { .. } => &["route", "listen"],
             Value::McpServer { .. } => &["tool", "serve"],
             Value::Agent { .. } => &["run", "name", "max_steps"],
+            // v0.104.6 D169：此前**整个类型**漏报。
+            //
+            // `method_dispatch.rs:46` 有 `Value::Document → call_method_document`
+            // 分派，该函数实现了 6 个方法（markdown / text / pages / metadata /
+            // blocks / origin），实测**全部可用**：
+            //
+            // ```text
+            // let d = document.parse("sample.md")
+            // print(d.text())          → 全文
+            // print(len(d.pages()))     → 1
+            // print(len(d.blocks()))    → 6
+            // print(methods_of(d))      → []   ← 漏报
+            // ```
+            //
+            // 而 `call_method` 的 `_` 臂错误消息**自己就列了 documents**，
+            // 说明只有这张 `methods()` 表漏了。同 D109 修 `crush_json` 那一类，
+            // 但那次漏 1 个方法、这次漏**整个类型**的 6 个 ——
+            // 而这张表是 `methods_of` 的**唯一**数据源，漏报会让用户
+            // （本语言是 AI-native 的，agent 常靠 `methods_of` 推断能力）
+            // 得到一个**偏小且为空**的集合。
+            Value::Document { .. } => {
+                &["markdown", "text", "pages", "metadata", "blocks", "origin"]
+            }
+            // v0.104.6 D171：模块对象（`Value::Builtin`）的方法名 —— 由
+            // `typeck::dispatch::module_method_names` 提供，而后者读的是
+            // **与签名查找同一张方法组表**（`MATH_METHODS` 等 20 张，
+            // v0.104.6 D293 起名字与签名同处一项），故二者不可能漂移。
+            //
+            // 修复前 `methods_of(math)` / `methods_of(json)` / …（23 个模块）
+            // **全是 `[]`**，而 `math.floor` / `json.parse` / `file.read_text`
+            // 都可用（D170 普查）。本语言是 AI-native 的，agent 靠 `methods_of`
+            // 推断能力 —— 空集等于告诉 agent「这个值什么都不能做」。
+            //
+            // v0.104.6 D175 修正：此前这里写着 `ai` / `agent` / `random`
+            // **「故意」不在表内**（理由：它们有各自的精确 `Type` 变体与专用
+            // 分派路径）—— 那是**解释现状**，不是**排除它们是对的**：
+            // `ai.chat` / `ai.tokens` / `ai.critic` / `agent.create` /
+            // `agent.critic` / `random.rand_int` … 经运行期实测**全部可达**，
+            // 而自省报空集等于告诉 agent「这个模块什么都不能做」。
+            // 三者已补进 `module_method_names`（各自的收窄理由见那张表旁的注释）。
+            Value::Builtin(kind) => {
+                // `MODULE_OBJECTS` 是「注册名 ↔ BuiltinKind」的单一事实源，
+                // 反向查回注册名（`Toolplane` 的注册名是 `tool`，D74 已记过
+                // 「按枚举变体名建表会整段匹配不到」这个坑）。
+                let name = MODULE_OBJECTS
+                    .iter()
+                    .find(|(_, k)| std::mem::discriminant(k) == std::mem::discriminant(kind))
+                    .map(|(n, _)| *n);
+                return match name {
+                    Some(n) => crate::typeck::dispatch::module_method_names(n)
+                        .into_iter()
+                        .map(str::to_string)
+                        .collect(),
+                    // 裸函数（print/len/range）与未登记的 BuiltinKind：
+                    // 无可枚举的签名表 → 空集是**诚实**的
+                    None => Vec::new(),
+                };
+            }
             _ => &[],
         };
         names.iter().map(|s| s.to_string()).collect()
@@ -633,9 +714,11 @@ impl Value {
         match strategy {
             MergeStrategy::LastWriteWins => child,
             MergeStrategy::Append => match (parent, child) {
-                (Value::List(mut a), Value::List(b)) => {
-                    a.extend(b);
-                    Value::List(a)
+                // v0.104.6：List 不可变，拼接走「取回 Vec → extend → 装回」
+                (Value::List(a), Value::List(b)) => {
+                    let mut merged = a.to_vec();
+                    merged.extend(b.iter().cloned());
+                    Value::List(merged.into())
                 }
                 (Value::String(a), Value::String(b)) => Value::String(a + &b),
                 (_, child) => child, // fallback: LWW
@@ -669,13 +752,15 @@ impl Value {
                 (_, child) => child,
             },
             MergeStrategy::GrowOnlySet => match (parent, child) {
-                (Value::List(mut a), Value::List(b)) => {
-                    for item in b {
-                        if !a.contains(&item) {
-                            a.push(item);
+                // v0.104.6：同上，List 不可变
+                (Value::List(a), Value::List(b)) => {
+                    let mut acc = a.to_vec();
+                    for item in b.iter() {
+                        if !acc.contains(item) {
+                            acc.push(item.clone());
                         }
                     }
-                    Value::List(a)
+                    Value::List(acc.into())
                 }
                 (Value::Dict(mut a), Value::Dict(b)) => {
                     for (k, v) in b {
@@ -715,7 +800,7 @@ impl VectorClock {
 
     /// True if `a` happened-before `b` (strict partial order).
     ///
-    /// Condition: ∀k: a[k] ≤ b[k] AND ∃k: a[k] < b[k].
+    /// Condition: ∀k: a\[k\] ≤ b\[k\] AND ∃k: a\[k\] < b\[k\].
     pub fn happened_before(a: &VectorClock, b: &VectorClock) -> bool {
         let mut has_strict = false;
         for k in a.entries.keys().chain(b.entries.keys()) {
@@ -753,7 +838,29 @@ impl VectorClock {
             .collect()
     }
 
-    /// v0.63: Deserialize from a Dict (checkpoint restore).
+    /// v0.63: 从 Dict 构造（`to_dict` 的逆运算）。
+    ///
+    /// v0.104.6 D286：文档原写「Deserialize from a Dict (**checkpoint
+    /// restore**)」—— 但 `pregel/mod.rs` 的模块文档明确写着
+    /// `Environment::versions`（per-binding `VectorClock`）**NOT checkpointed**
+    /// （「derived from agent execution, not persisted」）。
+    /// ⇒ **checkpoint 恢复路径在架构上并不存在**，本函数当前**零生产调用者**
+    /// （全仓只有本模块的单测在用）。
+    ///
+    /// ⚠ 两处**潜在**问题，均未修（无生产影响，改 `pub` 签名属产品决定）：
+    ///
+    /// 1. 本函数**无任何负数守卫** —— `Value::Int(-1) as u64` **回绕**成
+    ///    `u64::MAX`、`Value::Float(-1.0) as u64` **饱和成 0**。对
+    ///    `VectorClock` 而言这两种值都有害：0 表示「早于一切」、
+    ///    `u64::MAX` 表示「晚于一切」，任一种都会污染
+    ///    `happened_before` / `concurrent` 的因果判定
+    ///    （`merge` / `happened_before` 本身已由 D267 审过、判为正确）。
+    /// 2. 值不是数字时被 `filter_map` **静默丢弃**（`_ => None`），
+    ///    同样无诊断。
+    ///
+    /// 若将来真要接线（例如把 `versions` 纳入 checkpoint），
+    /// 改走 `flow::value_as_usize`（D246 立的收口）并把签名改成
+    /// `Result<Self, String>`，**先**处理上面两条。
     pub fn from_dict(d: &HashMap<String, Value>) -> Self {
         let entries: HashMap<String, u64> = d
             .iter()
@@ -1145,11 +1252,11 @@ mod tests {
     fn merge_append_lists() {
         assert_eq!(
             Value::merge(
-                Value::List(vec![Value::Int(1)]),
-                Value::List(vec![Value::Int(2)]),
+                Value::List(vec![Value::Int(1)].into()),
+                Value::List(vec![Value::Int(2)].into()),
                 &MergeStrategy::Append
             ),
-            Value::List(vec![Value::Int(1), Value::Int(2)])
+            Value::List(vec![Value::Int(1), Value::Int(2)].into())
         );
     }
 
@@ -1208,11 +1315,11 @@ mod tests {
         // 并集：parent ∪ child，只加新元素
         assert_eq!(
             Value::merge(
-                Value::List(vec![Value::Int(1), Value::Int(2)]),
-                Value::List(vec![Value::Int(2), Value::Int(3)]),
+                Value::List(vec![Value::Int(1), Value::Int(2)].into()),
+                Value::List(vec![Value::Int(2), Value::Int(3)].into()),
                 &MergeStrategy::GrowOnlySet
             ),
-            Value::List(vec![Value::Int(1), Value::Int(2), Value::Int(3)])
+            Value::List(vec![Value::Int(1), Value::Int(2), Value::Int(3)].into())
         );
     }
 
@@ -1251,13 +1358,13 @@ mod tests {
         let mut parent = Environment::new();
         parent.define(
             "tags".into(),
-            Value::List(vec![Value::String("a".into())]),
+            Value::List(vec![Value::String("a".into())].into()),
             false,
         );
         let mut child = Environment::new();
         child.define(
             "tags".into(),
-            Value::List(vec![Value::String("a".into()), Value::String("b".into())]),
+            Value::List(vec![Value::String("a".into()), Value::String("b".into())].into()),
             false,
         );
         let mut strategies = HashMap::new();
@@ -1265,10 +1372,9 @@ mod tests {
         parent.merge_from_with_strategies(&child, &strategies, &MergeStrategy::LastWriteWins);
         assert_eq!(
             parent.get("tags"),
-            Some(Value::List(vec![
-                Value::String("a".into()),
-                Value::String("b".into())
-            ]))
+            Some(Value::List(
+                vec![Value::String("a".into()), Value::String("b".into())].into()
+            ))
         );
     }
 
@@ -1375,14 +1481,14 @@ mod tests {
     fn env_merge_with_per_key_strategies() {
         let mut parent = Environment::new();
         parent.define("counter".into(), Value::Int(100), false);
-        parent.define("log".into(), Value::List(vec![]), false);
+        parent.define("log".into(), Value::List(vec![].into()), false);
         parent.define("name".into(), Value::String("alice".into()), false);
 
         let mut child = Environment::new();
         child.define("counter".into(), Value::Int(5), false);
         child.define(
             "log".into(),
-            Value::List(vec![Value::String("msg1".into())]),
+            Value::List(vec![Value::String("msg1".into())].into()),
             false,
         );
         child.define("name".into(), Value::String("bob".into()), false);
@@ -1400,7 +1506,7 @@ mod tests {
         // log: [] ++ ["msg1"] = ["msg1"] (Append strategy)
         assert_eq!(
             parent.get("log"),
-            Some(Value::List(vec![Value::String("msg1".into())]))
+            Some(Value::List(vec![Value::String("msg1".into())].into()))
         );
         // name: LWW → child wins (not in strategies map)
         assert_eq!(parent.get("name"), Some(Value::String("bob".into())));

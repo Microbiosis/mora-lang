@@ -190,8 +190,28 @@ impl ParserV3 {
         let goal_wit = if body_wits.len() == 1 {
             body_wits.pop().expect("len 1")
         } else {
+            // v0.104.6 D216：多个 goal 必须**合取**，不能只取最后一个。
+            //
+            // 修前这里是 `WitnessKind::Sequence(body_wits)` —— 一个**顺序块**，
+            // 而块的产出值只是**最后一个**子表达式的值。于是运行期
+            // `h_solve` 拿到的 `Value::Goal` 里**只有最后一个 goal**，
+            // 前面 goal 建立的绑定被静默丢弃，并以 reify 的 `_.N` 呈现：
+            //
+            // ```text
+            // rel p("a","b") / rel q("b","c")
+            // solve { p(?X, ?Y), q(?Y, ?Z) }  →  [[_.0, b, c]]   （期望 [[a, b, c]]）
+            // ```
+            //
+            // 零诊断、exit 0，且结果**看起来合理**（b、c 都在）。
+            //
+            // 改为对各子 goal 调 `both(...)` —— 它就是运行期的
+            // `Goal::Conj` 构造器（`interpreter/builtins/rel.rs::call_builtin_both`），
+            // 复用既有 builtin，无需新 MIR 指令。
             MirWitness {
-                kind: WitnessKind::Sequence(body_wits),
+                kind: WitnessKind::Call {
+                    callee: crate::mir::witness::WitnessCallee::Name("both".to_string()),
+                    args: body_wits,
+                },
                 span,
             }
         };

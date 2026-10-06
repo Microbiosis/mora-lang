@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc bfaba0406cdd7e89ea803f57659e785233bb46be175fe27f6bb781c60e7c1bbd # shrinks to stmts = [For(1.0, [If(Lt(0, 2), [Assign(0, Var(0))], [Assign(0, Var(0))])])]

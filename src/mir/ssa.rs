@@ -36,6 +36,24 @@ pub struct MirSsaFunction {
     /// 还原到 body 头部。此前这些指令被丢弃 → `--opt` 下 task main 消失
     /// （MORA_OPT=1 默认关掩盖了该 bug，CLI 显式化后暴露）。
     pub passthrough: Vec<MirInst>,
+    /// v0.104.6 D304：**进入 SSA 之前**的 `MirFunction::n_regs`。
+    ///
+    /// `passthrough` 里的指令是**原样回插**的 —— 它们的寄存器号仍是
+    /// **重命名前**的编号，而 body 其余部分已被 `map_ssa` 压进
+    /// `0..next_plain_reg`。若只按 `next_plain_reg` 设 `n_regs`，
+    /// 透传指令引用的寄存器就会**越界**：
+    ///
+    /// ```text
+    /// Runtime error (MIR): internal: instruction at DAG node 5
+    /// references register 5 (read/write) but the function only has
+    /// 1 register(s) — a unit-statement emitter returned an unallocated
+    /// sentinel register
+    /// ```
+    ///
+    /// 取 `max(next_plain_reg, orig_n_regs)`：透传指令引用的每一个寄存器
+    /// 都 < 原始 `n_regs`（它们就是原始编号），故这是**可靠上界**，
+    /// 且多分配几个寄存器是无害的（只多几个 `Value` 槽）。
+    pub orig_n_regs: usize,
 }
 
 // v0.75.82: RegType 已删除 — 死类型推断（零消费者）。infer_types 全仓
@@ -169,6 +187,7 @@ pub fn construct(func: &MirFunction) -> MirSsaFunction {
             }],
             entry: 0,
             passthrough: Vec::new(),
+            orig_n_regs: func.n_regs,
         };
     }
 
@@ -281,6 +300,7 @@ pub fn construct(func: &MirFunction) -> MirSsaFunction {
         blocks,
         entry: 0,
         passthrough,
+        orig_n_regs: func.n_regs,
     }
 }
 
@@ -593,6 +613,113 @@ fn split_into_ssa(
 
 /// v0.75.30: 声明型指令 — SSA 构造跳过（不优化声明），deconstruct 还原。
 /// 与 `split_into_ssa` 的跳过列表同源（单点谓词，防两处漂移）。
+///
+/// v0.104.6 D310：这些指令的寄存器**不参与 SSA 重编号**，而同一函数里其余
+/// 指令会重编号 ⇒ 两者一旦同处一个函数就出现两套寄存器空间
+/// （`Closure` 写 r8 而 `map` 读 r2）。故 `crate::mir::opt::optimize`
+/// 在见到它们时**整体跳过 SSA**。
+pub fn has_passthrough_inst(func: &MirFunction) -> bool {
+    func.body.iter().any(is_ssa_passthrough)
+}
+
+/// v0.104.6 D313：body 里存在**跳到 body 之外**的控制转移 —— SSA/DAG 路径会
+/// 把这种块结构拆散。
+///
+/// ## 缺陷背景（实测，逐条转储 construct 前后）
+///
+/// 源程序 `if 1 > 0 / print(7) / else / print(8) / end`（`if` 是最后一句）
+/// 经 `apply_rules`（**两档都跑**，见 `cli/mod.rs:56`）之后变成：
+///
+/// ```text
+///  2  Const(2, Bool(true))    ← ConstFoldingRule 折叠 1 > 0
+///  3  Const(4, Float(7.0))
+///  4  Call(5, "print", [4])
+///  5  Copy(9, 5)
+///  6  Jump(10)                ← IfSimplifyRule 删掉了 JumpIfNot，
+///                                只剩这条「跳到 end」的 Jump；而 end = 10
+///                                **已越过 body 末尾（body 只有 0..9）**
+///  7  Const(7, Float(8.0))     ← else 分支紧跟其后
+///  8  Call(8, "print", [7])
+///  9  Copy(9, 8)
+/// ```
+///
+/// `IfSimplifyRule`（`rule.rs:119`，`Some(true) if is_not => Vec::new()`）
+/// 这个局部改写**本身是对的** —— `JumpIfNot(true, t)` 永不跳，删掉即落下去。
+/// 出问题的是**它留下的结构被下游误读**：
+///
+/// 1. `construct` 的分块规则是 `if lbl < body_len && lbl > 0`；`10 < 10`
+///    为假 ⇒ **不在那里起块** ⇒ CFG 断成互不相连的两块
+///    （实测 `block 0 succs=[]`、`block 1 preds=[]`）。
+/// 2. `deconstruct` 把该 terminal 跳转经 `terminator_to_plain` 映成
+///    `Return(None)`，而 `Return(None)` 是**被丢弃**的（`deconstruct.rs:340`
+///    的 `Label(usize::MAX)` 跳过）⇒ **那条 Jump 彻底消失**。
+/// 3. 第四遍只是把各块**线性拼接** ⇒ then 与 else 之间再无任何控制转移
+///    ⇒ DAG 把两段都当独立链执行 ⇒ **两个分支都跑**。
+///
+/// 结果：`--opt=1/2` 下打印 `7.0` **和** `8.0`；opt=off 只打印 `7.0`。
+/// 副作用会**重复发生**（重复写文件、重复扣款、重复发送）—— 程序看起来
+/// 在正常工作，这比静默中止更危险。
+///
+/// ## 为什么守卫落在**输入 MIR** 上而不是 `BasicBlock.preds`
+///
+/// 最直接的修法是让 `deconstruct` 丢掉不可达块，但**判据不能用 `preds`**：
+/// 它正是 D261 记档的「三处缺口」之一（实测 `block 1 preds=[]`，
+/// 而实际存在一条来自 block 0 的边）—— **拿一个已知不可靠的字段去决定
+/// 删除代码**，正是 D276「优化器回滚」教训指向的方向。
+///
+/// 越界跳转目标则是**直接可测的事实**，在 `construct` 之前就能判，
+/// 不依赖任何下游数据结构。
+///
+/// ## 代价
+///
+/// 实测 56 个真实 `.mora`：**零命中**（`apply_rules` 之后没有程序留下
+/// 越界跳转；探针置于 `optimize()` 里所有 early return 之前，避免
+/// 「守卫命中的样本恰好绕过统计点」这种选择偏差）⇒ 对现有程序**零代价**，
+/// 纯粹兜住这个合成形状。
+pub fn has_out_of_range_jump(func: &MirFunction) -> bool {
+    let n = func.body.len();
+    func.body.iter().any(|i| {
+        let target = match i {
+            MirInst::Jump(t)
+            | MirInst::JumpIf(_, t)
+            | MirInst::JumpIfNot(_, t)
+            | MirInst::Break(t)
+            | MirInst::Continue(t) => *t,
+            _ => return false,
+        };
+        // `usize::MAX` 是 `deconstruct` 的丢弃哨兵（`Label(usize::MAX)`），
+        // 不算越界。
+        target != usize::MAX && target >= n
+    })
+}
+
+/// v0.104.6 D311：**带寄存器**的透传指令 —— 才是「两套寄存器空间」的真正来源。
+///
+/// `is_ssa_passthrough` 里的 18 类并非都会造成编号冲突：
+/// **声明型**（`TaskDef` / `Import` / `ExportMark` / `TypeAlias` / `EnumDef` /
+/// `StructDef` / TEA 定义 / `RelDef`）不携带任何寄存器，它们在 body 里原样
+/// 保留不影响 SSA 重编号后的空间。
+///
+/// 而几乎每个 Mora 程序都有一条 `task main()` ⇒ 用宽判据会让
+/// **56 个真实程序里 48 个（85.7%）整体跳过 SSA**（D312 实测重新确认）——
+/// 等于把 `--opt` 废掉。收窄后降到 **15/56（26.8%）**。
+/// 故守卫只认下面这几类真正跨寄存器平面的指令。
+pub fn has_register_carrying_passthrough(func: &MirFunction) -> bool {
+    func.body.iter().any(|i| {
+        matches!(
+            i,
+            MirInst::Closure { .. }
+                | MirInst::MatchExpr { .. }
+                | MirInst::WithConfig { .. }
+                | MirInst::Perform { .. }
+                | MirInst::Handle { .. }
+                | MirInst::Solve { .. }
+                | MirInst::DynTrait { .. }
+                | MirInst::Quasiquote { .. }
+        )
+    })
+}
+
 fn is_ssa_passthrough(inst: &MirInst) -> bool {
     matches!(
         inst,

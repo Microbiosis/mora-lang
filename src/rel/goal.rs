@@ -10,7 +10,7 @@
 //!   `unify`/`both`/`either`/`fail`/`succeed` 内建与关系调用在运行期构造。
 //! - [`Clause`]：关系子句（事实 = body 为 `Succeed` 的子句）。
 //!
-//! 搜索语义见 [`super::search`]；合一语义见 [`super::unify`]。
+//! 搜索语义见 [`super::search`]；合一语义见 `super::unify`。
 
 use std::sync::Arc;
 

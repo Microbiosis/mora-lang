@@ -130,7 +130,15 @@ pub fn h_quasiquote(
                         let parts: Vec<String> = items.iter().map(value_to_string).collect();
                         buf.push_str(&parts.join(", "));
                     }
-                    _ => return Err(format!("unquote_splice: expected List, got {:?}", val)),
+                    // v0.104.6：`{:?}` → 类型名。`Value::Dict` 的 `Debug`
+                    // 按 HashMap 迭代序打印（每进程随机），会让同一条错误信息
+                    // 跨进程键序不同。错误本来讲的就是「类型不对」。
+                    _ => {
+                        return Err(format!(
+                            "unquote_splice: expected List, got {}",
+                            crate::flow::type_name(val)
+                        ));
+                    }
                 }
             }
         }

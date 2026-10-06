@@ -7,6 +7,35 @@
 
 use super::*;
 
+/// v0.104.6 D266：占位标记里的实参表示。
+///
+/// 此前四个构造方法都用 `{:?}` 打印 `Value`，实测两个问题（D266）：
+///
+/// 1. **跨进程不可复现** —— `Value::Dict` 的 `Debug` 走 HashMap 迭代序，
+///    而 `HashMap` 用 `RandomState`（每进程随机种子）。实测同一段程序
+///    `xform.map({a:1.0, b:2.0, c:3.0, d:4.0})` 连跑 5 次得到 **5 个不同
+///    输出**。
+/// 2. **泄露整个全局环境** —— 传 `Closure` 时，`Debug` 会把它的 `env`
+///    （PersistentMap / Bitmap / 全部 30 个 builtin 的哈希）整份转储进返回值，
+///    单条输出达数千字节。
+///
+/// ⇒ 改为：**简单标量显示值，复杂类型显示类型名** —— 与 D233
+/// （`json.stringify` 对 Closure / Agent 输出占位串）同一取舍，且**稳定**。
+///
+/// ⚠ 只用 `Display` 不够：`Value::Dict` 的 `Display` 是 `{k: v}` 形式，
+/// 键序同样随 HashMap 变（只是没那么显眼）。
+fn describe(v: &Value) -> String {
+    match v {
+        Value::String(s) => s.clone(),
+        Value::Char(c) => c.to_string(),
+        Value::Int(n) => n.to_string(),
+        Value::Float(n) => n.to_string(),
+        Value::Bool(b) => b.to_string(),
+        Value::Nil => "nil".to_string(),
+        other => crate::flow::type_name(other).to_string(),
+    }
+}
+
 impl Interpreter {
     /// v0.83: xform.* builtin dispatch。
     ///
@@ -20,19 +49,22 @@ impl Interpreter {
         match method {
             "map" => {
                 let fn_val = args.first().ok_or("xform.map: missing fn arg")?;
-                Ok(Value::String(format!("<xform.map({:?})>", fn_val)))
+                Ok(Value::String(format!("<xform.map({})>", describe(fn_val))))
             }
             "filter" => {
                 let pred_val = args.first().ok_or("xform.filter: missing pred arg")?;
-                Ok(Value::String(format!("<xform.filter({:?})>", pred_val)))
+                Ok(Value::String(format!(
+                    "<xform.filter({})>",
+                    describe(pred_val)
+                )))
             }
             "take" => {
                 let n = args.first().ok_or("xform.take: missing n arg")?;
-                Ok(Value::String(format!("<xform.take({:?})>", n)))
+                Ok(Value::String(format!("<xform.take({})>", describe(n))))
             }
             "comp" => {
                 let other = args.first().ok_or("xform.comp: missing other_xform arg")?;
-                Ok(Value::String(format!("<xform.comp({:?})>", other)))
+                Ok(Value::String(format!("<xform.comp({})>", describe(other))))
             }
             "attach" => {
                 let stream = args.first().ok_or("xform.attach: missing stream arg")?;

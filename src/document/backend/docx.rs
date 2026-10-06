@@ -151,26 +151,35 @@ impl DocumentBackend for DocxBackend {
             block_dict.insert("kind".into(), Value::String("text".into()));
             block_dict.insert(
                 "bbox".into(),
-                Value::List(vec![
-                    Value::Float(0.0),
-                    Value::Float(0.0),
-                    Value::Float(0.0),
-                    Value::Float(0.0),
-                ]),
+                Value::List(
+                    vec![
+                        Value::Float(0.0),
+                        Value::Float(0.0),
+                        Value::Float(0.0),
+                        Value::Float(0.0),
+                    ]
+                    .into(),
+                ),
             );
             let mut span_dict: HashMap<String, Value> = HashMap::new();
             span_dict.insert("text".into(), Value::String(p.clone()));
             span_dict.insert(
                 "bbox".into(),
-                Value::List(vec![
-                    Value::Float(0.0),
-                    Value::Float(0.0),
-                    Value::Float(0.0),
-                    Value::Float(0.0),
-                ]),
+                Value::List(
+                    vec![
+                        Value::Float(0.0),
+                        Value::Float(0.0),
+                        Value::Float(0.0),
+                        Value::Float(0.0),
+                    ]
+                    .into(),
+                ),
             );
             span_dict.insert("score".into(), Value::Nil);
-            block_dict.insert("spans".into(), Value::List(vec![Value::Dict(span_dict)]));
+            block_dict.insert(
+                "spans".into(),
+                Value::List(vec![Value::Dict(span_dict)].into()),
+            );
             blocks.push(Value::Dict(block_dict));
         }
 
@@ -178,8 +187,8 @@ impl DocumentBackend for DocxBackend {
         page_dict.insert("page_no".into(), Value::Float(1.0));
         page_dict.insert("width".into(), Value::Float(0.0));
         page_dict.insert("height".into(), Value::Float(0.0));
-        page_dict.insert("blocks".into(), Value::List(blocks));
-        Ok(Value::List(vec![Value::Dict(page_dict)]))
+        page_dict.insert("blocks".into(), Value::List(blocks.into()));
+        Ok(Value::List(vec![Value::Dict(page_dict)].into()))
     }
 
     /// Paragraph text joined with `\n\n` (blank line between paragraphs).
@@ -223,7 +232,7 @@ impl DocumentBackend for DocxBackend {
                 }
             }
         }
-        Ok(Value::List(blocks))
+        Ok(Value::List(blocks.into()))
     }
 }
 

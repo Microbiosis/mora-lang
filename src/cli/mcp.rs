@@ -17,7 +17,33 @@ pub fn run_mcp_tool_list() {
     all_tools.sort();
     all_tools.dedup_by(|a, b| a.0 == b.0);
 
-    println!("MCP Tools ({}):\n", all_tools.len());
+    // v0.104.6 D186：**如实标注这是什么**。
+    //
+    // 修前标题写「MCP Tools (13):」—— 一个**计数**，读起来像是在报告某个
+    // 系统的状态。但它读的是 `builtin_toolsets()` 这张**静态名字目录**，
+    // 与真正对外暴露的工具**毫无关系**：后者由每个脚本自己用
+    // `server.tool(name, schema, handler)` 注册。
+    //
+    // 判别性实测（同一台机器、同一个二进制）：
+    //
+    // ```text
+    // $ mora mcp tool-list            →  MCP Tools (13)   ← 静态目录
+    // $ # 一个只注册了 greet 的脚本：
+    //   stderr: [mcp] Registered 1 tool(s) (1 enabled)
+    //   tools/list 应答: {"tools":[{"name":"greet"}]}   ← 真实注册表
+    // ```
+    //
+    // 同一件事，两个**都被当作权威**的计数，且互不引用。用户照着 13 个名字
+    // 给 MCP 客户端接线，其中 `ai.create` / `ai.stream` 必然调不通
+    // （本轮已从目录里删掉，全仓无实现）。
+    println!("Builtin MCP tool names by toolset ({}):\n", all_tools.len());
+    println!(
+        "  ^ 这是**内置名字目录**，不是某个运行中服务器的工具清单。\n\
+           真正对外暴露哪些工具，取决于脚本用 server.tool(name, schema, handler)\n\
+           注册了什么；问那个 MCP 服务器要 tools/list，或看它启动时打印的\n\
+           \"[mcp] Registered N tool(s)\"。"
+    );
+    println!();
     println!("{:<30} {:<15}", "TOOL", "TOOLSET");
     println!("{}", "-".repeat(45));
     for (tool, toolset) in &all_tools {
@@ -46,9 +72,16 @@ pub fn run_mcp_tool_search(query: &str) {
     results.dedup_by(|a, b| a.0 == b.0);
 
     if results.is_empty() {
-        println!("No tools found matching '{}'", query);
+        println!("No builtin tool names matching '{}'", query);
     } else {
-        println!("Search results for '{}' ({}):\n", query, results.len());
+        // v0.104.6 D186：与 `tool-list` 一致的口径 —— 这是**内置名字目录**的
+        // 搜索结果，不是某个运行中服务器的工具清单。
+        println!(
+            "Builtin tool names matching '{}' ({}):\n  ^ 名字目录，非实时注册表；\
+             实际对外暴露哪些工具取决于脚本注册了什么。\n",
+            query,
+            results.len()
+        );
         println!("{:<30} {:<15}", "TOOL", "TOOLSET");
         println!("{}", "-".repeat(45));
         for (tool, toolset) in &results {

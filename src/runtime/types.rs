@@ -107,6 +107,14 @@ pub struct TokenBudget {
 pub struct TokenUsage {
     pub input: usize,
     pub output: usize,
+    /// v0.104.6 D76：**AI 调用次数**。
+    ///
+    /// 此前**根本没有这个字段** —— 而 `ai.tokens().calls()`
+    /// （`interpreter/builtins/ai_tokens.rs`）却返回
+    /// `token_usage.input`，即**把「输入 token 数」当作「调用次数」报出去**。
+    /// 二者在真实调用下必然不同（一次调用可能有几百个 input token），
+    /// 于是这个方法静默给出错误数字。属复制粘贴 bug。
+    pub calls: usize,
 }
 
 /// 模型路由配置

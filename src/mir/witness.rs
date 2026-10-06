@@ -471,12 +471,30 @@ pub enum WitnessOrchestrateKind {
         prompt: Box<MirWitness>,
     },
     /// v0.75.85: MoE（Mixture-of-Experts）— 稀疏门控声明。
+    ///
+    /// v0.104.6 D270：`experts` 原为 `Vec<MirWitness>` —— **只装定义 witness，
+    /// 没有地方放专家名**。于是 `from_kind` 的 `map(|e| e.def.clone())` 把名字
+    /// 丢掉，反向转换再硬编码 `name: String::new()` 补空串，最终
+    /// `run_moe` 用 router 的键去 `find` 一张全叫 `""` 的表，**永远找不到**：
+    /// `orchestrate moe` 100% 不可用。详见 `WitnessMoeExpert`。
     Moe {
-        experts: Vec<MirWitness>,
+        experts: Vec<WitnessMoeExpert>,
         router: Box<MirWitness>,
         top_k: usize,
         prompt: Box<MirWitness>,
     },
+}
+
+/// v0.104.6 D270：MoE 专家（witness 层）— 镜像 `MirMoeExpert` 的**名字 + 定义**。
+///
+/// 与 `WitnessAgentDef` 同构：agent 侧一直带着 `name: String`，唯独 MoE
+/// 这里退化成了裸 `MirWitness`，名字在 v0.92 的 witness 迁移里漏掉了。
+#[derive(Debug, Clone, PartialEq)]
+pub struct WitnessMoeExpert {
+    /// 专家名（router 返回的 Dict 键必须与之匹配）。
+    pub name: String,
+    /// 专家定义：函数闭包或 `{model: "..."}` 字面量。
+    pub def: MirWitness,
 }
 
 impl WitnessOrchestrateKind {
@@ -535,7 +553,10 @@ impl WitnessOrchestrateKind {
                 prompt,
                 ..
             } => {
-                out.extend(experts);
+                // v0.104.6 D270：只 walk 专家的**定义** witness（名字不是
+                // 可 walk 的表达式节点）。`out` 是 `Vec<&MirWitness>`，
+                // 所以取 `&e.def` 而非克隆。
+                out.extend(experts.iter().map(|e| &e.def));
                 out.push(router);
                 out.push(prompt);
             }
@@ -599,7 +620,14 @@ impl WitnessOrchestrateKind {
                 prompt,
                 ..
             } => WitnessOrchestrateKind::Moe {
-                experts: experts.iter().map(|e| e.def.clone()).collect(),
+                // v0.104.6 D270：连 `name` 一起搬（修前只搬 `e.def`，名字在此丢失）。
+                experts: experts
+                    .iter()
+                    .map(|e| WitnessMoeExpert {
+                        name: e.name.clone(),
+                        def: e.def.clone(),
+                    })
+                    .collect(),
                 router: Box::new(router.clone()),
                 top_k: *top_k,
                 prompt: Box::new(prompt.clone()),

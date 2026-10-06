@@ -68,7 +68,7 @@ impl NetworkMode {
     }
 }
 
-/// v0.44.0: 挂载配置 (host_path:container_path[:mode])
+/// v0.44.0: 挂载配置 (host_path:container_path\[:mode\])
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MountSpec {
     pub host_path: String,
@@ -79,16 +79,40 @@ pub struct MountSpec {
 
 impl MountSpec {
     pub fn parse(s: &str) -> Result<Self, String> {
-        // splitn(3, ':') 允许 path 含 ':' (最后一个 ':mode' 可选)
-        let parts: Vec<&str> = s.splitn(3, ':').collect();
+        // ⚠ `splitn(3, ':')` 按冒号数切成**至多 3 段** ⇒ 第 2 个冒号之后的
+        // 内容**整段落进 `mode`**，`container` 段**永远拿不到**冒号后的部分。
+        // 修前那句「允许 path 含 `:`」**不成立**：三段里没有任何一段能真正
+        // 容纳冒号（`mode` 能，但会被 `validate` 拒掉）。
+        //
+        // v0.104.6 D389：唯一真实存在的「path 内冒号」是 **Windows 盘符** ——
+        // 字符就是 `:`。盘符若与分隔符混为一谈，`"C:\data:/data:ro"` 会被切成
+        // `["C", "\data", "/data:ro"]` ⇒ `host_path` 变成 `"C"`、
+        // `mode` 变成 `"/data:ro"`，于是 `validate()` 报出
+        // 「mount.mode must be 'ro' or 'rw', **got: /data:ro**」——
+        // **归因到了错误的字段，还报出用户从未写过的值**，
+        // 而 Windows 上任何**绝对** host path 都因此不可用。
+        //
+        // 修法：**先剥掉盘符前缀再 split**。判定条件刻意收紧为
+        // 「字母 + `:` + 路径分隔符(`\` 或 `/`)」，这样：
+        // - `"C:\data:/data:ro"` / `"C:/data:/data:ro"` ⇒ 识别为盘符 ✔
+        // - `"a:b:c"`（1 字母 host，**既有单测**的形态）⇒ `a:` 后是 `b`
+        //   不是路径分隔符 ⇒ **不**当盘符，行为与修前完全一致 ✔
+        // - POSIX 路径首字符非字母 ⇒ 完全不受影响 ✔
+        let (drive, rest) = match s.as_bytes() {
+            [b, b':', c, ..] if b.is_ascii_alphabetic() && (*c == b'\\' || *c == b'/') => {
+                (&s[..2], &s[2..])
+            }
+            _ => ("", s),
+        };
+        let parts: Vec<&str> = rest.splitn(3, ':').collect();
         match parts.len() {
             2 => Ok(Self {
-                host_path: parts[0].to_string(),
+                host_path: format!("{}{}", drive, parts[0]),
                 container_path: parts[1].to_string(),
                 mode: "rw".to_string(),
             }),
             3 => Ok(Self {
-                host_path: parts[0].to_string(),
+                host_path: format!("{}{}", drive, parts[0]),
                 container_path: parts[1].to_string(),
                 mode: parts[2].to_string(),
             }),
@@ -349,7 +373,7 @@ impl ContainerHandle {
 /// 无任何进程级全局状态。计数器归 [`crate::runtime::sandbox::SandboxRuntime`]
 /// 实例所有（有意跨克隆共享，锁分类第 2 类），本函数只做数据 → 名字映射。
 ///
-/// v0.44.0: `docker run` 生成 container_name = "mora-<nanos>-<counter>"
+/// v0.44.0: `docker run` 生成 container_name = "mora-`<nanos>`-`<counter>`"
 /// v0.49.0 (B3): 加 counter 后缀, 保证高并发下唯一 (nanos 可能相同, counter 不会)
 pub fn generate_container_name(nanos: u64, counter: u64) -> String {
     format!("mora-{:x}-{:x}", nanos, counter)
@@ -417,6 +441,9 @@ pub fn spawn_container(spec: &ContainerSpec, name: &str) -> Result<ContainerHand
 /// Unix: killpg(SIGKILL); Windows: taskkill /F /T.
 fn timeout_kill_process_group(pid: u32) {
     #[cfg(unix)]
+    // SAFETY: `libc::killpg` 是直接的进程组信号系统调用 —— 不解引用任何裸
+    // 指针、不触碰 Rust 内存，所以没有别名或生命周期问题。`pid` 来自
+    // `Child::id()`（`u32`），而真实 pid 远小于 `i32::MAX`，`as i32` 不会回绕。
     unsafe {
         libc::killpg(pid as i32, libc::SIGKILL);
     }

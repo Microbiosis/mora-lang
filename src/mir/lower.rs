@@ -54,6 +54,35 @@ pub struct EmitContext {
     pub insts: Vec<MirInst>,
     /// 循环上下文栈: (continue_label, break_label)
     pub loop_stack: Vec<(Label, Label)>,
+    /// v0.104.6 D42：本寄存器空间是**程序顶层**（而非任何函数体）。
+    ///
+    /// 只有 `ParserV3::new` 会置 `true`；所有嵌套体（task / closure /
+    /// macro / worker / transaction / observe / update / match arm …）都是
+    /// `EmitContext::new()`，即 `false`。内联块（`if` / `for` / `while` /
+    /// `with` 的体）**不**换上下文，故继承外层的值 ——
+    /// task 里的 `for` 体仍在函数体里，顶层的 `for` 体仍在程序顶层。
+    ///
+    /// 用途：`return` 在程序顶层没有可返回的函数，此前会静默终止整个程序
+    /// （见 `emit_definitions.rs::emit_return_break_continue_w` 的守卫）。
+    /// 与 `loop_stack` 同款：`break`/`continue` 靠它判「循环外」。
+    pub is_program_top: bool,
+    /// v0.104.6 缺陷修复：每层循环**自己**的 `break` 指令索引栈。
+    ///
+    /// **为什么需要**：循环出口标签在 body 全部 emit 之后才知道，历史上靠
+    /// 「body 结束后扫 `body_start..body_end` 全区间重写标签」回填。但该区间
+    /// 在**嵌套循环**时包含内层循环的全部指令 —— 外层回填会把内层已正确解析
+    /// 的标签覆盖成外层的：
+    ///   - 内层 `break`  → 被改成外层出口 → 内层 break 跳出了外层循环；
+    ///   - 内层 `continue` → 被改成外层 continue 目标 → 控制流失控，
+    ///     整个程序静默结束（无输出、退出码 0）。
+    ///
+    /// 改为 emit 时按作用域登记索引（`emit_break` / `emit_continue`），循环
+    /// 退出时只回填**自己那一层**登记过的索引（`pop_loop_scope`）。嵌套关系
+    /// 由栈天然隔离：内层索引在 `pop_loop_scope` 时已被取走并回填，外层再也
+    /// 看不到它们。
+    pub break_slots: Vec<Vec<usize>>,
+    /// v0.104.6：同上，`continue` 指令索引栈。
+    pub continue_slots: Vec<Vec<usize>>,
 }
 
 impl EmitContext {
@@ -69,6 +98,62 @@ impl EmitContext {
 
     pub fn emit(&mut self, inst: MirInst) {
         self.insts.push(inst);
+    }
+
+    /// v0.104.6：进入一层循环作用域。**必须**与 `loop_stack.push` 成对使用
+    /// （由 [`EmitContext::push_loop_scope`] 一并完成，不要单独动 loop_stack）。
+    pub fn push_loop_scope(&mut self, continue_label: Label, break_label: Label) {
+        self.loop_stack.push((continue_label, break_label));
+        self.break_slots.push(Vec::new());
+        self.continue_slots.push(Vec::new());
+    }
+
+    /// v0.104.6：退出一层循环作用域，取回**本层**的 break/continue 指令索引。
+    /// 返回的索引已在本层回填完毕，不再对上层可见。
+    pub fn pop_loop_scope(&mut self) -> (Vec<usize>, Vec<usize>) {
+        self.loop_stack.pop();
+        (
+            self.break_slots.pop().unwrap_or_default(),
+            self.continue_slots.pop().unwrap_or_default(),
+        )
+    }
+
+    /// v0.104.6：emit 一条 `break` 并登记到当前最内层循环。
+    pub fn emit_break(&mut self, lbl: Label) {
+        let idx = self.insts.len();
+        self.insts.push(MirInst::Break(lbl));
+        if let Some(slot) = self.break_slots.last_mut() {
+            slot.push(idx);
+        }
+    }
+
+    /// v0.104.6：emit 一条 `continue` 并登记到当前最内层循环。
+    pub fn emit_continue(&mut self, lbl: Label) {
+        let idx = self.insts.len();
+        self.insts.push(MirInst::Continue(lbl));
+        if let Some(slot) = self.continue_slots.last_mut() {
+            slot.push(idx);
+        }
+    }
+
+    /// v0.104.6：把本层 break 全部指向循环出口。
+    pub fn patch_breaks_to(&mut self, indices: &[usize], exit_label: Label) {
+        for &i in indices {
+            if let MirInst::Break(l) = &mut self.insts[i] {
+                *l = exit_label;
+            }
+        }
+    }
+
+    /// v0.104.6：把本层 continue 全部指向继续目标。
+    /// `for` 循环传**增量指令**（跳过 body 但不跳过变量推进），
+    /// `while` 循环传 `loop_label`（无增量）。
+    pub fn patch_continues_to(&mut self, indices: &[usize], target: Label) {
+        for &i in indices {
+            if let MirInst::Continue(l) = &mut self.insts[i] {
+                *l = target;
+            }
+        }
     }
 
     /// v0.103: 追加「块体尾部的隐式 Return」—— 仅当最后一条指令**不是**
@@ -356,6 +441,42 @@ impl WitnessLowerer {
                     let r = self.lower_witness(arg)?;
                     arg_regs.push(r);
                 }
+                // v0.104.6 D14：把 witness 的索引编码解码回 `MirInst::Index`。
+                //
+                // witness 侧**有意**把读索引 `obj[i]` 编码成
+                // `Call { callee: Name("[]"), args: [obj, i] }`（见
+                // `parser_v3/emit.rs` 的索引发射分支，以及
+                // `tests/parser_v3_coverage.rs::index_expr_parses`
+                // 「expected Index to parse as Call("[]")」）。
+                // 直接 emit 路径同时发出真正的 `MirInst::Index`，
+                // 但**经 witness 重新 lower 时**（`lower_block_witness_to_mir`
+                // —— handle body / handler 正是走这条）此前没有解码，
+                // 于是产出 `MirInst::Call(dst, "[]", [obj, idx])`，
+                // 运行期解释成「调用一个名叫 `[]` 的函数」：
+                //
+                // ```text
+                // handle random_random { x = t[1] } { 0.5 }
+                // → Undefined function or task: []
+                // ```
+                //
+                // 顶层同一表达式不受影响（走直接 emit 的 `Index`），
+                // 于是这个缺陷只在**嵌套 lower 的块**里显形：handle body，
+                // 以及任何 `import` / `eval()` 编译的模块（它们不过 9 层管线，
+                // 直接用 `ParserV3::compile` 的 witness 路径）。实测同一段代码
+                // 内联得 `index 99 out of bounds (len 2)`、import 进来得
+                // `Undefined function or task: []`。
+                if callee_name == "[]" {
+                    // 少于两个实参（`x[]`）不该走到这里，但真到了要给明确错误，
+                    // 而不是构造一条坏指令。
+                    let (Some(obj_reg), Some(idx_reg)) =
+                        (arg_regs.first().copied(), arg_regs.get(1).copied())
+                    else {
+                        return Err("index expression requires an object and an index".to_string());
+                    };
+                    let dst = self.alloc_reg();
+                    self.emit(MirInst::Index(dst, obj_reg, idx_reg));
+                    return Ok(dst);
+                }
                 let dst = self.alloc_reg();
                 self.emit(MirInst::Call(dst, callee_name, arg_regs));
                 Ok(dst)
@@ -473,7 +594,6 @@ impl WitnessLowerer {
                 iterable,
                 body,
             } => {
-                use crate::value::Value;
                 let iter_reg = self.lower_witness(iterable)?;
                 let i_reg = self.alloc_reg();
                 self.emit(MirInst::Const(i_reg, Value::Int(0)));
@@ -497,11 +617,12 @@ impl WitnessLowerer {
                 self.emit(MirInst::Index(x_reg, iter_reg, i_reg));
                 self.emit(MirInst::Define(var.clone(), x_reg));
 
-                let body_start = self.emit.insts.len();
-                self.emit.loop_stack.push((loop_label, 0));
+                self.emit.push_loop_scope(loop_label, 0);
                 let _ = self.lower_witness(body)?;
-                self.emit.loop_stack.pop();
-                let body_end = self.emit.insts.len();
+                // v0.104.6：只回填本层登记的 break/continue 索引（不再是
+                // `body_start..body_end` 全区间扫描）—— 嵌套循环下全区间会把
+                // 内层已解析的标签覆盖掉，见 EmitContext::break_slots 文档。
+                let (my_breaks, my_continues) = self.emit.pop_loop_scope();
 
                 self.emit(MirInst::BinaryOp(
                     i_reg,
@@ -513,13 +634,8 @@ impl WitnessLowerer {
 
                 let end_label = self.emit.insts.len();
                 self.patch_label_at(exit_jump_idx, end_label);
-                for i in body_start..body_end {
-                    match &mut self.emit.insts[i] {
-                        MirInst::Break(lbl) => *lbl = end_label,
-                        MirInst::Continue(lbl) => *lbl = loop_label,
-                        _ => {}
-                    }
-                }
+                self.emit.patch_breaks_to(&my_breaks, end_label);
+                self.emit.patch_continues_to(&my_continues, loop_label);
                 let dst = self.alloc_reg();
                 self.emit(MirInst::Const(dst, Value::Nil));
                 Ok(dst)
@@ -532,22 +648,16 @@ impl WitnessLowerer {
                 self.emit(MirInst::JumpIfNot(c, 0)); // placeholder
                 let exit_jump_idx = self.emit.insts.len() - 1;
 
-                let body_start = self.emit.insts.len();
-                self.emit.loop_stack.push((loop_label, 0));
+                self.emit.push_loop_scope(loop_label, 0);
                 let _ = self.lower_witness(body)?;
-                self.emit.loop_stack.pop();
-                let body_end = self.emit.insts.len();
+                // v0.104.6：同 for 循环 —— 按作用域登记回填，不做全区间扫描。
+                let (my_breaks, my_continues) = self.emit.pop_loop_scope();
 
                 self.emit(MirInst::Jump(loop_label));
                 let end_label = self.emit.insts.len();
                 self.patch_label_at(exit_jump_idx, end_label);
-                for i in body_start..body_end {
-                    match &mut self.emit.insts[i] {
-                        MirInst::Break(lbl) => *lbl = end_label,
-                        MirInst::Continue(lbl) => *lbl = loop_label,
-                        _ => {}
-                    }
-                }
+                self.emit.patch_breaks_to(&my_breaks, end_label);
+                self.emit.patch_continues_to(&my_continues, loop_label);
                 let dst = self.alloc_reg();
                 self.emit(MirInst::Const(dst, crate::value::Value::Nil));
                 Ok(dst)
@@ -690,7 +800,7 @@ impl WitnessLowerer {
                     .last()
                     .copied()
                     .ok_or("Break outside loop")?;
-                self.emit(MirInst::Break(brk));
+                self.emit.emit_break(brk);
                 let dst = self.alloc_reg();
                 self.emit(MirInst::Const(dst, crate::value::Value::Nil));
                 Ok(dst)
@@ -702,7 +812,7 @@ impl WitnessLowerer {
                     .last()
                     .copied()
                     .ok_or("Continue outside loop")?;
-                self.emit(MirInst::Continue(cont));
+                self.emit.emit_continue(cont);
                 let dst = self.alloc_reg();
                 self.emit(MirInst::Const(dst, crate::value::Value::Nil));
                 Ok(dst)
@@ -852,7 +962,24 @@ impl WitnessLowerer {
                     k_param: k_param.clone(),
                     k_dst,
                 });
-                self.emit.emit(MirInst::Const(k_dst, Value::Nil));
+                // v0.104.6 D36：此处原有 `self.emit.emit(MirInst::Const(k_dst,
+                // Value::Nil));` 兜底，**已删除**。
+                //
+                // 它**本就多余**：`run_dag_with_signal_memo` 的 `regs` 初始化就是
+                // `vec![Value::Nil; dag.n_regs]`，`h_handle` 不写 `k_dst` 时它
+                // 本来就是 Nil。而一旦 `h_handle` **正常写入**结果，这条 Const
+                // 就会在 Sequence 链上**排在 Handle 之后把真值覆盖回 Nil**。
+                //
+                // 顶层看不出来（parser 的 `emit_handle_w` 走的是另一条路、
+                // 不经本函数），只有**嵌套 handle** 会中招：内层 handle 经
+                // `lower_block_witness_to_mir` 落到**外层 body_mir** 的 context，
+                // 于是 body 的指令序是 `[内层Handle(写 regs[X]), Const(X, Nil)]`
+                // → 外层拿到的 body 结果是 Nil。
+                //
+                // 实测（`MORA_9LAYER=0` + `let r = handle a { handle b { 6 }
+                // { 8 } } { 7 }`）：修前 `r` 为 Nil、`r + 1` 报 "Operands must
+                // be two numbers"。对照 9 层管线的 body 只有 1 条指令（无此
+                // 兜底），运行正确 —— 两条路径的差异正来自这一行。
                 let _ = (body_reg, handler_reg, body_w, handler_w);
                 Ok(k_dst)
             }

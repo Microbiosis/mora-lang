@@ -17,14 +17,51 @@ use mora::typeck::format_error;
 /// v0.75.53: 单遍编译 + 优化已随 record/mcp 迁至 `mora::cli::compile_and_opt`。
 /// 本文件仅保留编译入口 run_file/run_check/run_repl 与 CLI dispatch。
 fn main() {
+    // v0.104.6 D25：把整个命令分派放到**显式大栈线程**上跑。
+    //
+    // Windows 主线程栈由 PE 头决定，默认仅 **1 MB**（Linux 8 MB）。而
+    // `ParserV3` 是标准递归下降实现 —— 一层表达式嵌套要穿过
+    // `emit_or_w → and → equality → pipe → comparison → term → factor →
+    // unary → call → primary` 十个栈帧，每帧还带着 `MirWitness` 与若干
+    // 局部量。实测在主线程默认栈上，**20~32 层**普通嵌套就爆栈：
+    //
+    // ```text
+    // print((((((1))))))          # 21 层 → thread 'main' has overflowed its stack
+    // let s = "abc"  print(s[0][0]… )  # 29 层 → 同上
+    // ```
+    //
+    // 而且 `mora --check` **同样崩**（它调的是同一个 `ParserV3::compile`）——
+    // 即「检查通过、运行崩溃」并不成立，20 多层嵌套这种完全正常的代码
+    // 直接让编译器硬崩（abort，非可读错误），连退出码都没有。
+    //
+    // 这里只做「把可用栈从 1 MB 抬到 64 MB」这一件事：把 20 层的崩溃
+    // 变成几百层，把绝大多数真实代码彻底移出这个雷区。**真正的兜底是
+    // parser 侧���嵌套深度上限**（`parser_v3::MAX_NESTING_DEPTH`）——
+    // 超出时给可读诊断而非爆栈。两者配合：栈决定实际上限，深度上限
+    // 保证越界时报错而不是崩。
+    const STACK_SIZE: usize = 64 * 1024 * 1024;
+    let code = std::thread::scope(|s| {
+        std::thread::Builder::new()
+            .stack_size(STACK_SIZE)
+            .name("mora-main".to_string())
+            .spawn_scoped(s, dispatch)
+            .map(|h| h.join().unwrap_or(101))
+            .unwrap_or(101)
+    });
+    if code != 0 {
+        process::exit(code);
+    }
+}
+
+fn dispatch() -> i32 {
     let args: Vec<String> = env::args().collect();
 
     // --version / --help 不显示 banner
     if args.len() >= 2 {
         match args[1].as_str() {
             "--version" | "-v" => {
-                println!("Mora v{}", mora::VERSION);
-                return;
+                eprintln!("Mora v{}", mora::VERSION);
+                return 0;
             }
             "--help" | "-h" => {
                 println!(
@@ -39,6 +76,11 @@ fn main() {
                 );
                 println!("  mora --repl                Interactive REPL");
                 println!("  mora --check <file>        Type check only");
+                // v0.104.6 D185：补上三个**能跑却在用法里没有**的顶层子命令。
+                // 此前它们只在标题行里被顺带提到（`snapshot`），`run` / `install`
+                // 连标题行都没有 —— 而分派是真的（`main.rs` 的 match 臂）。
+                println!("  mora run <file.mora>       Run a script (explicit form)");
+                println!("  mora install <url>         Install a package from a URL");
                 println!();
                 println!("Recording:");
                 println!(
@@ -49,6 +91,25 @@ fn main() {
                 println!("  mora record list           List all recordings");
                 println!("  mora record stats <name>   Show recording statistics");
                 println!("  mora record timeline <name> Show call timeline");
+                // v0.104.6 D185：补上三个缺失的 `record` 子命令。其中
+                // **`audit` 是密钥扫描器** —— 用户问「我这份录像里有没有泄漏
+                // API key」时唯一能回答问题的命令，此前在 `--help` 的
+                // 标题行与用法列表里**都没有**出现过。
+                println!(
+                    "  mora record export <name>  Export recording (--format jsonl|md, --output <file>)"
+                );
+                println!(
+                    "  mora record audit <name>   Scan recording for secrets (--policy <file>)"
+                );
+                println!(
+                    "  mora record report <name>  Generate an evidence report (--note, --verify, --output)"
+                );
+                println!();
+                println!("Regression:");
+                // v0.104.6 D185：`snapshot` 此前只在标题行出现，没有用法条目。
+                println!(
+                    "  mora snapshot <file> <name> [--update]   Record-and-compare regression test"
+                );
                 println!();
                 println!("MCP:");
                 println!("  mora mcp tool-list         List available MCP tools");
@@ -57,7 +118,7 @@ fn main() {
                 println!();
                 println!("  mora --version             Show version");
                 println!("  mora --help                Show this help");
-                return;
+                return 0;
             }
             _ => {}
         }
@@ -68,7 +129,7 @@ fn main() {
 
     if args.len() < 2 {
         run_repl();
-        return;
+        return 0;
     }
 
     // v0.75.30: 显式编译选项 `--opt=N`（0=关/1=Basic/>=2=Aggressive）—
@@ -113,7 +174,9 @@ fn main() {
         "record" => {
             if args.len() < 3 {
                 eprintln!(
-                    "Usage: mora record <file.mora> <name> | mora record list|stats|timeline ..."
+                    "Usage: mora record <file.mora> <name>\n       \
+                     mora record list | stats <name> | timeline <name> | \
+                     export <name> | audit <name> [--policy <file>] | report <name>"
                 );
                 process::exit(1);
             }
@@ -273,6 +336,7 @@ fn main() {
         }
         _ => run_file(&args[1], opt_level),
     }
+    0
 }
 
 fn install_package(url: &str) {
@@ -355,19 +419,39 @@ fn print_banner() {
     // `with` 块的 model 绑定与 ai.chat 第二参 {model: "..."}
     let base_url = env::var(AI_BASE_URL_ENV).unwrap_or_else(|_| AI_BASE_URL_DEFAULT.to_string());
 
-    println!("Mora v{}", mora::VERSION);
+    // v0.104.6 D100：横幅走 **stderr**，不是 stdout。
+    //
+    // `mora run` 可以启动 **stdio JSON-RPC 服务器**（`McpServer.serve()`，
+    // 也用于 LSP 形态）。这类服务器的 **stdout 就是协议通道**，
+    // 而本横幅在此之前就被 `println!` 写进 stdout 且排在所有协议帧之前 ——
+    // 合规客户端无法把它当帧解析。实测（`mora-lsp` 无此问题，
+    // 其 stdout 直接以 `Content-Length` 开头）：
+    //
+    // ```text
+    // Mora v0.104.5
+    //   AI: mock mode (…)
+    //   …共 9 行…
+    //
+    // Content-Length: 162
+    //
+    // {"id":1,"jsonrpc":"2.0",…}
+    // ```
+    //
+    // 对普通 `mora run` 而言，横幅同样是**元数据而非程序输出**，
+    // 走 stderr 才是 CLI 惯例，且不再污染 `mora run … > out.txt` 的结果。
+    eprintln!("Mora v{}", mora::VERSION);
     if has_openai_key {
-        println!("  AI: real API (endpoint: {})", base_url);
+        eprintln!("  AI: real API (endpoint: {})", base_url);
     } else {
-        println!("  AI: mock mode (set OPENAI_API_KEY for real calls)");
+        eprintln!("  AI: mock mode (set OPENAI_API_KEY for real calls)");
     }
-    println!("  AI 原语: p\"...\" / with / stream / tool / ai.chat / AiConfig / Result<?>");
-    println!("  显式 API: Router::new() / McpServer::new() + route + observe / span");
-    println!("  Trait 系统: trait / impl / dyn / ::new() / 继承 / 默认实现");
-    println!("  Built-in: web.fetch / json.* / file.* / typeck (必走) / mora-lsp");
-    println!("  v0.15 CLI: record / replay / diff / list / stats / timeline");
-    println!("  ⚠  不兼容 v0.03 builtin");
-    println!();
+    eprintln!("  AI 原语: p\"...\" / with / stream / tool / ai.chat / AiConfig / Result<?>");
+    eprintln!("  显式 API: Router::new() / McpServer::new() + route + observe / span");
+    eprintln!("  Trait 系统: trait / impl / dyn / ::new() / 继承 / 默认实现");
+    eprintln!("  Built-in: web.fetch / json.* / file.* / typeck (必走) / mora-lsp");
+    eprintln!("  v0.15 CLI: record / replay / diff / list / stats / timeline");
+    eprintln!("  ⚠  不兼容 v0.03 builtin");
+    eprintln!();
 }
 
 fn update_lock(pkg_name: &str, url: &str) {
@@ -387,7 +471,8 @@ fn run_file(path: &str, opt_level: Option<mora::mir::ssa::OptLevel>) {
     // v0.104: I/O 失败以可读错误 + 退出码 1 报告（此前 `expect` panic ——
     // 路径不存在/无权限/是目录时打印 Rust panic 与回溯，退出码 101，
     // 与 typecheck 的 exit(2)、解析错误的 exit(2) 都不一致）。
-    let source = match fs::read_to_string(path) {
+    mora::cli::reject_option_as_path(path);
+    let source = match mora::cli::read_source(Path::new(path)) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("{}: {}", path, e);
@@ -441,8 +526,9 @@ fn run_file(path: &str, opt_level: Option<mora::mir::ssa::OptLevel>) {
 }
 
 fn run_check(path: &str) {
+    mora::cli::reject_option_as_path(path);
     // v0.104: I/O 失败以可读错误 + 退出码 1 报告（此前 `expect` panic）。
-    let source = match fs::read_to_string(path) {
+    let source = match mora::cli::read_source(Path::new(path)) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("{}: {}", path, e);

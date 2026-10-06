@@ -55,35 +55,110 @@ impl Interpreter {
         Ok(Value::Nil)
     }
 
+    /// `range(start, end, step)` → `[start, start+step, …]`，**左闭右开**。
+    ///
+    /// v0.104.6 修复：**实参不再只认 `Value::Float`**。
+    ///
+    /// 此前三个实参各自 `.and_then(|v| match v { Value::Float(n) => …, _ => None })`
+    /// 然后 `.unwrap_or(默认值)`。于是任何一个**非 Float** 的实参都被当成
+    /// 「没传」，静默取默认值 —— 而本语言里字面量是 `Float`、`len()` 与
+    /// `xs.len()` 返的却是 `Int`，所以最自然的那句标准写法：
+    ///
+    /// ```text
+    /// for i in range(0, len(xs))   # xs = [1,2,3,4,5]
+    ///   assign s = s + xs[i]
+    /// end
+    /// ```
+    /// 得到 **`s = 0.0`**（应为 15.0）：`end` 退回 `start`，range 恒空，
+    /// 循环体一次都不执行。**无任何报错、退出码 0。**
+    /// （`range(0, len(vs))` 同理得 0 个元素；把字面量换成 `0, 5` 立刻正确。）
+    ///
+    /// 修法是消除「静默降级」这一恶劣失败模式本身，而不只补 `Int` 一个洞：
+    /// 实参**存在但类型不对**一律报错。只有实参**真的缺席**才用默认值。
     pub(super) fn call_builtin_range(&mut self, args: Vec<Value>) -> Result<Value, String> {
-        let start = args
-            .first()
-            .and_then(|v| match v {
-                Value::Float(n) => Some(*n as i64),
-                _ => None,
-            })
-            .unwrap_or(0);
-        let end = args
-            .get(1)
-            .and_then(|v| match v {
-                Value::Float(n) => Some(*n as i64),
-                _ => None,
-            })
-            .unwrap_or(start);
-        let step = args
-            .get(2)
-            .and_then(|v| match v {
-                Value::Float(n) => Some(*n as i64),
-                _ => None,
-            })
-            .unwrap_or(1);
-        let mut items = Vec::new();
-        let mut i = start;
-        while i < end {
-            items.push(Value::Float(i as f64));
-            i += step;
+        fn as_i64(v: &Value, which: &str) -> Result<Option<i64>, String> {
+            match v {
+                Value::Float(n) => {
+                    if !n.is_finite() {
+                        return Err(format!("range() {which} must be finite, got {n}"));
+                    }
+                    Ok(Some(*n as i64))
+                }
+                Value::Int(n) => Ok(Some(*n)),
+                Value::BigInt(n) => n
+                    .to_i64()
+                    .map(Some)
+                    .ok_or_else(|| format!("range() {which} out of i64 range: {n}")),
+                other => Err(format!(
+                    "range() {which} must be a number, got {}",
+                    crate::flow::type_name(other)
+                )),
+            }
         }
-        Ok(Value::List(items))
+        use num_traits::ToPrimitive;
+
+        // v0.104.6 D327：单参 `range(n)` 必须等价于 `range(0, n)`。
+        //
+        // 修前：`start = args.first()`、`end = args.get(1)`，而 `end` 缺参时
+        // 取 `start` ⇒ 单参时 **start == end** ⇒ `while i < end` 恒假 ⇒
+        // **静默返回空列表**。实测后果：
+        //
+        // ```text
+        // let t = 0
+        // for i in range(5)
+        //   t = t + i
+        // end
+        // print(t)                     →  0.0      （期望 10）
+        // for i in range(3) { print(i) } →  一次都不打印
+        // len(range(5))                 →  0
+        // ```
+        //
+        // **退出码 0、零诊断**，且与 D312 / D313 / D315 同族：静默失败。
+        //
+        // 查证（吸取 D320 教训：肯定断言也需要自己的验证）：
+        // - `docs/mora-spec.md` 里 **`range` 零命中** —— 规范从未定义它；
+        // - 既有判据**全部**用多参形态（`range(0,4)` / `range(0,n,1)` /
+        //   `range(3,0,-1)` / `range(0,5,0)`），**无一条覆盖单参**；
+        // - `builtin_return_types.rs:153` 明写「range 声明 **3 参**却常被
+        //   2 参调用」⇒ 签名是 3 参，1 参落在签名之外。
+        //
+        // ⇒ 单参是**未文档化、未钉住的漏掉方向**，与 D325 的 `reshape` 截断
+        // 同形。Python / JS / Rust 的 `range(n)` 均为 `[0, n)`。
+        //
+        // 负步长分支（D- 轮已修）不在此列，本次只动单参。
+        let (start, end) = match args.len() {
+            0 => (0, 0),
+            // 单参 = 上界：`range(n)` ≡ `range(0, n)`。
+            1 => (0, as_i64(&args[0], "end")?.unwrap_or(0)),
+            _ => (
+                as_i64(&args[0], "start")?.unwrap_or(0),
+                as_i64(&args[1], "end")?.unwrap_or(0),
+            ),
+        };
+        let step = match args.get(2) {
+            Some(v) => as_i64(v, "step")?.unwrap_or(1),
+            None => 1,
+        };
+        if step == 0 {
+            return Err("range() step must not be 0 (would never terminate)".to_string());
+        }
+        let mut items = Vec::new();
+        if step > 0 {
+            let mut i = start;
+            while i < end {
+                items.push(Value::Float(i as f64));
+                i += step;
+            }
+        } else {
+            // 负步长：`range(3, 0, -1)` 递减。旧实现 `i < end` 对负步长恒假，
+            // 于是负步长一律静默返回空列表（同样是「静默降级」的一种）。
+            let mut i = start;
+            while i > end {
+                items.push(Value::Float(i as f64));
+                i += step;
+            }
+        }
+        Ok(Value::List(items.into()))
     }
 
     pub(super) fn call_builtin_len(&mut self, args: Vec<Value>) -> Result<Value, String> {
@@ -93,8 +168,18 @@ impl Interpreter {
                 list.len()
             }
             Some(Value::String(s)) => {
+                // v0.104.6 修复：数**字符**，不是 UTF-8 字节。
+                //
+                // 旧实现是 `s.len()`（Rust 的字节长度），于是 `len("中文字")`
+                // 得 **9**。这与本文件之外的字符串索引空间直接矛盾 ——
+                // `index_value` 的字符串分支用 `s.chars().nth(i)`，是字符语义，
+                // 合法下标只有 0..2。于是 `len(s)` 报告 9、`s[8]` 却越界，
+                // `for i in range(0, len(s))` 会在 i=3 处炸。
+                //
+                // 字符串长度在所有主流语言里都是字符数（含 CJK 的语言无一例外），
+                // 且 `s[0]` 已经按字符取，len 必须与它同口径。
                 testcase!(true, "len: string");
-                s.len()
+                s.chars().count()
             }
             Some(Value::Dict(map)) => {
                 testcase!(true, "len: dict");
@@ -103,6 +188,147 @@ impl Interpreter {
             _ => return Err("len() expects a list, string, or dict".to_string()),
         };
         Ok(Value::Int(len as i64))
+    }
+
+    /// v0.104.6：`str(x)` —— 值 → 显示字符串。
+    ///
+    /// **补的是一个先存后废的缺口**：`src/typeck/hm/builtin.rs` 早已把
+    /// `"str" => α → String` 登记进 HM 内建签名表，于是**任何**用到
+    /// `str(x)` 的程序都能过类型检查；运行期却没有对应实现 ——
+    /// `dispatch.rs` 的 `match name` 里没有 `"str"` 分支，落到兜底的环境查找，
+    /// 报 `Undefined function or task: str`。
+    ///
+    /// 之所以一直没人发现：`tests/tier0_replacement.rs::
+    /// semantics_control_flow_runs_via_mir` 是**全仓库唯一**用到 `str()` 的地方，
+    /// 而它那句 `print("sum=" + str(total))` 位于一个 `if total > 0 { ... }`
+    /// 的汇合点之后 —— 执行器缺陷 E1（汇合点被未被选中的分支臂饿死）让这整段
+    /// 尾部**从未执行过**，测试因此「通过」。E1 修好后这条语句第一次真正跑到，
+    /// 缺口才暴露。
+    ///
+    /// 独立于控制流即可复现：`print(str(45))` 无任何分支，直接报同样的错。
+    ///
+    /// 语义与 `print` 对单个值的取字一致（`call_builtin_print` 同用
+    /// `Value::to_string`），因此 `"x" + str(n)` 的拼接结果与 `print(x, n)` 一致。
+    pub(super) fn call_builtin_str(&mut self, args: Vec<Value>) -> Result<Value, String> {
+        let v = args.first().cloned().unwrap_or(Value::Nil);
+        testcase!(true, "str: any");
+        Ok(Value::String(v.to_string()))
+    }
+
+    /// v0.104.6：`int(x)` —— 值 → 整数。
+    ///
+    /// 与 `str()` **完全同源**的缺口：`src/typeck/hm/builtin.rs:48` 早已登记
+    /// `"int" => String → Int`，`src/typeck/dispatch.rs:177` 也登记了同名签名，
+    /// 于是 `int("42")` 能过类型检查；运行期 `dispatch.rs` 的 `match name` 里
+    /// 没有 `"int"` 分支，落到兜底环境查找，报 `Undefined function or task: int`。
+    ///
+    /// 与 `str()` 一样，它之所以一直藏着：全仓库没有任何测试调用过它。
+    /// 本文件 `tests/builtin_gaps.rs` 是全仓库第一个用到 `int/float/bool` 的地方。
+    ///
+    /// 语义：字符串按十进制解析（允许前后空白与 `+`/`-`）；数值按**截断**
+    /// （`int(4.7) = 4`，向零取整，与 Rust `as i64` 一致）；`Bool` 取 1/0；
+    /// 其余（List/Dict/Nil/…）报明确错误而非静默给 0。
+    pub(super) fn call_builtin_int(&mut self, args: Vec<Value>) -> Result<Value, String> {
+        use num_traits::ToPrimitive;
+        let v = args.first().cloned().unwrap_or(Value::Nil);
+        let out = match v {
+            Value::String(s) => {
+                let t = s.trim();
+                if let Ok(n) = t.parse::<i64>() {
+                    n
+                } else {
+                    // 允许 "42.0" / "4.7"：先按 f64 解析再截断
+                    t.parse::<f64>()
+                        .map(|f| f as i64)
+                        .map_err(|_| format!("int() cannot parse string: {s:?}"))?
+                }
+            }
+            Value::Float(f) => {
+                if !f.is_finite() {
+                    return Err(format!("int() cannot convert non-finite float: {f}"));
+                }
+                f as i64
+            }
+            Value::Int(n) => n,
+            Value::BigInt(n) => n
+                .to_i64()
+                .ok_or_else(|| format!("int() cannot convert bigint out of i64 range: {n}"))?,
+            Value::Bool(b) => {
+                if b {
+                    1
+                } else {
+                    0
+                }
+            }
+            other => {
+                return Err(format!(
+                    "int() does not accept {}",
+                    crate::flow::type_name(&other)
+                ));
+            }
+        };
+        testcase!(true, "int: coercion");
+        Ok(Value::Int(out))
+    }
+
+    /// v0.104.6：`float(x)` —— 值 → 浮点。与 `int()` 同源的缺口。
+    pub(super) fn call_builtin_float(&mut self, args: Vec<Value>) -> Result<Value, String> {
+        use num_traits::ToPrimitive;
+        let v = args.first().cloned().unwrap_or(Value::Nil);
+        let out = match v {
+            Value::String(s) => s
+                .trim()
+                .parse::<f64>()
+                .map_err(|_| format!("float() cannot parse string: {s:?}"))?,
+            Value::Float(f) => f,
+            Value::Int(n) => n as f64,
+            Value::BigInt(n) => n
+                .to_f64()
+                .ok_or_else(|| format!("float() cannot convert bigint out of range: {n}"))?,
+            Value::Bool(b) => {
+                if b {
+                    1.0
+                } else {
+                    0.0
+                }
+            }
+            other => {
+                return Err(format!(
+                    "float() does not accept {}",
+                    crate::flow::type_name(&other)
+                ));
+            }
+        };
+        testcase!(true, "float: coercion");
+        Ok(Value::Float(out))
+    }
+
+    /// v0.104.6：`bool(x)` —— 值 → 布尔。与 `int()` 同源的缺口。
+    ///
+    /// **直接委托 `flow::is_truthy`，不自建真值表。**
+    ///
+    /// v0.104.6 初版在这里手搓了一张表（`0.0` / `""` / `[]` / `{}` / `nil`
+    /// 为假，其余按类型逐个判，未知类型报错）。实测与语言的真值判断在 **4 处**
+    /// 分叉：
+    ///
+    /// ```text
+    /// 0n (BigInt)      if 判真 = true    bool() = false   ← 判反了
+    /// fn(x) x end      if 判真 = true    bool() 报错
+    /// Router::new()    if 判真 = true    bool() 报错
+    /// McpServer::new() if 判真 = true    bool() 报错
+    /// ```
+    ///
+    /// 根因：`is_truthy` 的兜底臂是 `_ => true`（未知类型一律为真），而我
+    /// 那张表对未知类型**报错**、又给 BigInt 单独判了一套。
+    ///
+    /// 而 `is_truthy` 自己的文档恰好写着「MIR 条件分支的**单一真值源**
+    /// （v0.75.83 收敛）」，并警告「两处语义分叉是隐蔽 bug 温床」—— 我做的
+    /// 正是它警告的那件事。委托即可，分叉从根上消失。
+    /// 由 `tests/builtin_gaps.rs::bool_agrees_with_language_truthiness` 逐值钉住。
+    pub(super) fn call_builtin_bool(&mut self, args: Vec<Value>) -> Result<Value, String> {
+        let v = args.first().cloned().unwrap_or(Value::Nil);
+        testcase!(true, "bool: coercion");
+        Ok(Value::Bool(crate::flow::is_truthy(&v)))
     }
 
     pub(super) fn call_builtin_compose(&mut self, args: Vec<Value>) -> Result<Value, String> {
@@ -210,16 +436,34 @@ impl Interpreter {
         if args.len() < 2 {
             return Err("crush_json() requires 2 arguments: input and max".to_string());
         }
+        // v0.104.6 D262：此前只匹配 `Value::Float`。而本仓数字有两个来源 ——
+        // 字面量给 `Float`（D98）、`len()` 等运算给 `Int`（D129）⇒
+        // `crush_json(xs, len(xs))` 落在 `other` 分支，报
+        //   "crush_json: max must be a number, got int"
+        // —— **「int 明明是数字」**（与 D249 的 `with temperature` 同型）。
+        //
+        // 走 D246 立的收口 `flow::value_as_usize`，但**保留两种错误的区分**
+        // （D259 教训：收口不该顺手抹掉诊断信息）。
         let max_items = match &args[1] {
-            Value::Float(n) => {
-                if *n < 0.0 {
-                    return Err("crush_json: max must be non-negative".to_string());
+            Value::Int(n) if (*n as f64) < 0.0 => {
+                return Err("crush_json: max must be non-negative".to_string());
+            }
+            Value::Float(n) if *n < 0.0 => {
+                return Err("crush_json: max must be non-negative".to_string());
+            }
+            v => match crate::flow::value_as_usize(v) {
+                Some(n) => n,
+                None => {
+                    // v0.104.6：`{:?}` → 类型名。`Value::Dict` 的 `Debug` 按
+                    // HashMap 迭代序打印（每进程随机），同一条错误信息跨进程会
+                    // 键序不同。本会话早前已修 Display / JSON / keys / values 的
+                    // 同类问题，`{:?}` 这条路这里漏了。
+                    return Err(format!(
+                        "crush_json: max must be a number, got {}",
+                        crate::flow::type_name(v)
+                    ));
                 }
-                *n as usize
-            }
-            other => {
-                return Err(format!("crush_json: max must be a number, got {:?}", other));
-            }
+            },
         };
         let options_val = args
             .get(2)
@@ -232,8 +476,8 @@ impl Interpreter {
                 return Err("crush_json: expected List as first argument".to_string());
             }
         };
-        let result = crate::compress::crush_json(&items, max_items, &opts);
-        let json = crate::compress::value_to_json_simple(&Value::List(result.items.clone()));
+        let result = crate::compress::crush_json(&items.to_vec(), max_items, &opts);
+        let json = crate::compress::value_to_json_simple(&Value::List(result.items.clone().into()));
         Ok(Value::String(format!(
             "{}\n<compressed:method=smart_crusher strategy={} items={} total={} savings={:.2}>",
             json, result.strategy_used, result.items_kept, result.items_total, result.savings_ratio
@@ -257,7 +501,7 @@ impl Interpreter {
                     let result = Self::do_ai_chat(self, &model, &prompt)?;
                     results.push(result);
                 }
-                Ok(Value::List(results))
+                Ok(Value::List(results.into()))
             }
             _ => Err("batch_chat() argument must be a list".to_string()),
         }
@@ -283,7 +527,7 @@ impl Interpreter {
                         other => result.push(other),
                     }
                 }
-                Ok(Value::List(result))
+                Ok(Value::List(result.into()))
             }
             _ => Err("into() first argument must be a list".to_string()),
         }
@@ -302,15 +546,20 @@ impl Interpreter {
                 ));
             }
         };
-        let max: usize = match &args[1] {
-            Value::Float(n) => {
-                if *n < 0.0 {
-                    return Err("tail() max must be non-negative".to_string());
-                }
-                *n as usize
-            }
-            _ => return Err("tail() second argument 'max' must be a number".to_string()),
-        };
+        // v0.104.6 D153：此前只匹配 `Float`，`Int` 实参报「second argument 'max'
+        // must be a number」—— 而 `Int` 在本语言里**就是**数字类型，这条消息误导。
+        // **更正**：本方法在 D148 的饱和转换普查表里被记为「本就正确 · 作样板」，
+        // 那行判断是错的 —— 它只审了**负数**那一侧，没审**类型**这一侧。
+        let max = crate::interpreter::builtins::required_num_arg(
+            &args,
+            1,
+            "tail()",
+            "second argument 'max'",
+        )?;
+        if max < 0.0 {
+            return Err("tail() max must be non-negative".to_string());
+        }
+        let max = max as usize;
         let content = std::fs::read_to_string(&path)
             .map_err(|e| format!("tail() cannot read '{}': {}", path, e))?;
         let lines: Vec<&str> = content.lines().collect();
@@ -466,7 +715,7 @@ impl Interpreter {
         let arg_list = &args[1];
         // 提取待展开的参数列表
         let expanded: Vec<Value> = match arg_list {
-            Value::List(items) => items.clone(),
+            Value::List(items) => items.to_vec(),
             // 单个元素也算作一个参数的"列表"
             other => vec![other.clone()],
         };
@@ -486,7 +735,20 @@ impl Interpreter {
             return Err("curry(fn, arity) expects fn and arity".to_string());
         }
         let fn_val = args[0].clone();
+        // v0.104.6 D148：负数 arity 必须报错。
+        //
+        // ⚠ 下方 `arity == 0` 的既有检查**只挡住了 Float 一侧**：
+        //   `Value::Float(-1.0) as usize` → 饱和成 0     → 被 `arity == 0` 挡住 ✓
+        //   `Value::Int(-1)   as usize` → **截断**成 usize::MAX → 绕过检查
+        // 于是 `curry(f, -1)` 得到一个**永远凑不齐参数**的 Curry（调用多少次
+        // 都不返回值），exit 0、零诊断 —— 静默挂死。
         let arity = match &args[1] {
+            Value::Int(n) if *n < 0 => {
+                return Err(format!("curry: arity 不能为负数（得到 {n}）"));
+            }
+            Value::Float(n) if *n < 0.0 => {
+                return Err(format!("curry: arity 不能为负数（得到 {n}）"));
+            }
             Value::Int(n) => *n as usize,
             Value::Float(n) => *n as usize,
             _ => return Err("curry: arity must be an integer".to_string()),
@@ -551,7 +813,7 @@ impl Interpreter {
         }
         match &args[0] {
             Value::Cons { cdr, .. } => Ok((**cdr).clone()),
-            Value::List(items) => Ok(Value::List(items[1..].to_vec())),
+            Value::List(items) => Ok(Value::List(items.slice(1, items.len()))),
             Value::Nil => Err("cdr: cannot take cdr of Nil".to_string()),
             _ => Err(format!("cdr: expected cons cell or list, got {}", args[0])),
         }
@@ -656,7 +918,7 @@ impl Interpreter {
         };
         let expr_args: Vec<Value> = if args.len() > 1 {
             match &args[1] {
-                Value::List(items) => items.clone(),
+                Value::List(items) => items.to_vec(),
                 other => vec![other.clone()],
             }
         } else {
@@ -673,6 +935,17 @@ impl Interpreter {
                 params,
                 body,
             } => {
+                // v0.104.6 D50：arity 校验。此前缺参静默填 Nil（症状是宏体里
+                // 冒出「Operands must be two numbers...」这类**误导性**错误），
+                // 多余实参**静默丢弃**。与 D47 的 task / D48 的 reduce 同型。
+                if expr_args.len() != params.len() {
+                    return Err(format!(
+                        "macroexpand: macro '{}' expects {} args, got {}",
+                        mname,
+                        params.len(),
+                        expr_args.len()
+                    ));
+                }
                 let mut child_env = Environment::with_parent_of(std::sync::Arc::new(env.clone()));
                 for (i, param) in params.iter().enumerate() {
                     let val = expr_args.get(i).cloned().unwrap_or(Value::Nil);
@@ -708,6 +981,16 @@ impl Interpreter {
                     params,
                     body,
                 } => {
+                    // v0.104.6 D47：宏体与 task/closure 同构，此前同样
+                    // **静默**按 params 逐个绑定、缺参填 Nil、多参丢弃。
+                    if args.len() != params.len() {
+                        return Err(format!(
+                            "macro '{}' expects {} args, got {}",
+                            mname,
+                            params.len(),
+                            args.len()
+                        ));
+                    }
                     // v0.86: 宏体执行的 parent 环境改为当前调用栈 env（而非全局环境），
                     // 这样宏可以引用同级定义的其他宏和变量（如 square 调 mul）。
                     let mut child_env =
@@ -718,6 +1001,20 @@ impl Interpreter {
                     }
                     crate::mir::vm::run_mir(&body, self, &mut child_env, effects)
                         .map_err(|e| format!("macro '{}' execution error: {}", mname, e))
+                }
+                // v0.104.6：模块前缀被当自由函数调（`math(2.5)`）时给一条
+                // 能指路的错误。走到这里说明按名字取到的**不是**可调用值；
+                // 若它恰好是 `MODULE_OBJECTS` 里的模块对象，那就是「用错了
+                // 调用形式」，而不是「这个模块不能当函数用」——
+                // 说清区别能省掉一次「为什么 math.floor 行、math 不行」的困惑。
+                _ if crate::value::MODULE_OBJECTS
+                    .iter()
+                    .any(|(m, _)| *m == name.split('.').next().unwrap_or(name)) =>
+                {
+                    Err(format!(
+                        "'{name}' is a module, not a function — call a method on it \
+                         (e.g. {name}.<method>(...)), not {name}(...)"
+                    ))
                 }
                 _ => Err(format!("'{}' is not callable", name)),
             }

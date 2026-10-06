@@ -67,12 +67,39 @@ impl Subst {
         let walked = self.walk(v);
         match &walked {
             Value::List(items) => {
+                // v0.104.6 D396：`changed` 此前是**浅层**判据
+                // （`items.iter().any(|it| matches!(it, Value::LogicVar(_)))`），
+                // 而本函数是**递归**的 —— 于是「直接子项是**容器**、
+                // 变量藏在容器里面」时，容器已被解析但 `changed` 仍为 false
+                // ⇒ 返回**原始** `walked`，把解析结果整份丢弃。
+                //
+                // 实测（`s.bind(0, Int(42))`）：
+                // ```text
+                // walk_star([LogicVar(0)])        → List([Int(42)])            ✅
+                // walk_star([[LogicVar(0)]])      → List([List([LogicVar(0)])]) ❌ 原样未解析
+                // walk_star(Dict{k: LogicVar(0)}) → Dict({"k": Int(42)})      ✅（本来就用深比较）
+                // walk_star(Cons{car: LogicVar})  → Cons { car: Int(42) }     ✅（无 changed 判据）
+                // ```
+                // 后果走的是**用户可见**路径：`reify` → `project_solution` →
+                // `solve` 的返回值，残留变量会被改名成 `String("_.0")` ——
+                // 用户拿到的是**字符串占位符**而不是真值。
+                //
+                // 修法：与 Dict 分支对齐，改用**深比较**算 `changed`
+                // （保留「无变化就不重建」的优化）。
                 let mut out = Vec::with_capacity(items.len());
-                let changed = items.iter().any(|it| matches!(it, Value::LogicVar(_)));
+                let mut changed = false;
                 for it in items {
-                    out.push(self.walk_star(it));
+                    let resolved = self.walk_star(it);
+                    if &resolved != it {
+                        changed = true;
+                    }
+                    out.push(resolved);
                 }
-                if changed { Value::List(out) } else { walked }
+                if changed {
+                    Value::List(out.into())
+                } else {
+                    walked
+                }
             }
             Value::Cons { car, cdr } => Value::Cons {
                 car: Box::new(self.walk_star(car)),
@@ -169,10 +196,10 @@ mod tests {
     fn walk_star_resolves_nested() {
         // x=0 → "a"；列表 [x, 2] → ["a", 2]
         let s = Subst::new().bind(0, Value::String("a".into()));
-        let term = Value::List(vec![var(0), Value::Int(2)]);
+        let term = Value::List(vec![var(0), Value::Int(2)].into());
         assert_eq!(
             s.walk_star(&term),
-            Value::List(vec![Value::String("a".into()), Value::Int(2)])
+            Value::List(vec![Value::String("a".into()), Value::Int(2)].into())
         );
     }
 
@@ -191,8 +218,8 @@ mod tests {
     fn occurs_direct_and_nested() {
         let s = Subst::new();
         assert!(s.occurs(0, &var(0)));
-        assert!(s.occurs(0, &Value::List(vec![Value::Int(1), var(0)])));
-        assert!(!s.occurs(0, &Value::List(vec![Value::Int(1)])));
+        assert!(s.occurs(0, &Value::List(vec![Value::Int(1), var(0)].into())));
+        assert!(!s.occurs(0, &Value::List(vec![Value::Int(1)].into())));
     }
 
     #[test]

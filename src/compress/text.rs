@@ -19,7 +19,7 @@
 
 use std::time::Duration;
 
-use crate::compress::{CompressOptions, SubCompressor};
+use crate::compress::{CompressOptions, SubCompressor, finish_within_budget};
 use crate::config::{AI_API_KEY_ENV, AI_BASE_URL_DEFAULT, AI_BASE_URL_ENV};
 use crate::flow::json_to_value;
 use crate::value::Value;
@@ -30,29 +30,27 @@ use crate::value::Value;
 /// 这样 `&s[..idx]` 和 `&s[idx..]` 都是合法的字符串切片, 不会 panic。
 ///
 /// v0.29 final review BLOCKER fix — 由 `examples/compact_demo.mora` 的中文文本触发。
-fn floor_char_boundary(s: &str, mut idx: usize) -> usize {
-    while idx > 0 && !s.is_char_boundary(idx) {
-        idx -= 1;
-    }
-    idx
+///
+/// v0.104.6 D227：改为转发到 `compress::floor_char_boundary`（已提为共享），
+/// 本文件保留这个名字是因为 4 处调用点 + 单测都按它写。
+fn floor_char_boundary(s: &str, idx: usize) -> usize {
+    crate::compress::floor_char_boundary(s, idx)
 }
 
 /// v0.29: head_tail 实现 — 保留首 `head_pct` + 尾 `tail_pct` 字节, 中间 marker。
 ///
 /// 输入契约:
 /// - `head_pct` 与 `tail_pct` 期望 ∈ `[0.0, 1.0]`, 且通常 `head_pct + tail_pct < 1.0`。
-///   若 `head_pct + tail_pct >= 1.0`, elided 大小会 ≤ 0, marker 仍会出现但内容会重叠。
-/// - `max_bytes` 仅用于判断"是否需要压缩"——若 `content.len() <= max_bytes`,
-///   原样返回, 不产生 marker。
+///   **v0.104.6 D227**: 此前二者**完全无校验** —— 和 > 1 时 head 段与 tail 段
+///   **重叠**, 同一段内容被输出两次, 结果比原文更长 (实测 6500 → 7850)。
+///   现在钳制到 `[0.0, 1.0]` 并要求 `head_pct + tail_pct <= 1.0`。
+/// - `max_bytes` 现在是**硬上限**: head/tail 两段的字节预算由它反推
+///   (修前只当「要不要压缩」的开关, 结果 max_bytes=10 与 max_bytes=2000
+///   输出**完全一样**的 2003 字节)。
 ///
 /// 字节切片安全:
-/// - `head_n = (total * head_pct) as usize`, 由于 `head_pct <= 1.0`, `head_n ≤ total` 成立 (单调),
-///   所以 `content[..head_n]` 不会越界。
-/// - `tail_n = (total * tail_pct) as usize`, 同理 `tail_n ≤ total`,
-///   `total.saturating_sub(tail_n) ≤ total`, 切片安全。
-/// - 字节截断可能落在 UTF-8 字符中段, 触发 `slice` panic。
-///   修复: 用 `floor_char_boundary` 把切片落到最近的字符边界, 避免 panic
-///   (v0.29 final review BLOCKER fix — `examples/compact_demo.mora` 含中文文本)。
+/// - 预算反推保证 `head_n + tail_n <= total`, 两个区间不重叠, 切片不越界。
+/// - 字节截断可能落在 UTF-8 字符中段 → 用 `floor_char_boundary` 对齐。
 pub fn head_tail_impl(content: &str, head_pct: f32, tail_pct: f32, max_bytes: usize) -> String {
     let total = content.len();
 
@@ -61,27 +59,64 @@ pub fn head_tail_impl(content: &str, head_pct: f32, tail_pct: f32, max_bytes: us
         return content.to_string();
     }
 
-    // 截断长度计算 + clamp 防御 (head_pct/tail_pct 异常值时仍安全)
-    let head_n = (((total as f32) * head_pct) as usize).min(total);
-    let tail_n = (((total as f32) * tail_pct) as usize).min(total);
+    // v0.104.6 D227：pct 钳制。越界值（负数 / > 1 / 和 > 1）此前全部直接
+    // 参与切片，导致重叠或空输出。现按「和 ≤ 1」等比缩放。
+    let head_pct = head_pct.clamp(0.0, 1.0);
+    let tail_pct = tail_pct.clamp(0.0, 1.0);
+    let sum = head_pct + tail_pct;
+    let (head_pct, tail_pct) = if sum > 1.0 {
+        (head_pct / sum, tail_pct / sum)
+    } else {
+        (head_pct, tail_pct)
+    };
+
+    // v0.104.6 D227：预算从 max_bytes 反推。
+    //
+    // 预留量按**真实** marker 的保守长度算（marker 里嵌了 elided 字节数，
+    // 位数不定，故按 usize 上界估），而不是拍一个常数。拍常数会让小预算
+    // 场景（max_bytes=10）输出退化成 2 字节这种无意义的残片。
+    // 收尾时由 `finish_within_budget` 兜底（它才是契约的保证者）。
+    const MARKER_RESERVE: usize = 64;
+    let budget_body = max_bytes.saturating_sub(MARKER_RESERVE);
+    let take = ((total as f64) * (head_pct + tail_pct) as f64).min(budget_body as f64) as usize;
+
+    // 按 head:tail 的比例把 take 拆成两段（比例已保证和 ≤ 1，两段不重叠）
+    let head_n = if sum > 0.0 {
+        ((take as f64) * (head_pct as f64 / sum as f64)) as usize
+    } else {
+        0
+    };
+    let tail_n = take.saturating_sub(head_n);
 
     // UTF-8 边界对齐: 避免字节切片落在多字节字符中段触发 panic
-    // (v0.29 final review BLOCKER — 触发源: examples/compact_demo.mora 中文文本)
-    let head_n = floor_char_boundary(content, head_n);
+    let head_n = floor_char_boundary(content, head_n.min(total));
+    let tail_n = floor_char_boundary(content, tail_n.min(total.saturating_sub(head_n)));
     let tail_start = floor_char_boundary(content, total.saturating_sub(tail_n));
 
     let head = &content[..head_n];
     let tail = &content[tail_start..];
     let elided = total.saturating_sub(head_n + tail_n);
 
-    format!(
-        "{}\n\n... [{} bytes elided (head_tail {:.0}% + {:.0}%)] ...\n\n{}",
-        head,
-        elided,
-        head_pct * 100.0,
-        tail_pct * 100.0,
-        tail
-    )
+    // v0.104.6 D227：marker 报**实际**保留比例，不是请求的 pct。
+    //
+    // 修前报的是 `head_pct` / `tail_pct` 原值。预算饱和时（max_bytes 远小于
+    // total × pct）二者分叉：实测 pct=0.5+0.5、max_bytes=1000、total=6500 时，
+    // marker 写「head_tail 50% + 50%」，实况只留了 975/6500 ≈ 15%。
+    // marker 是压缩结果的**唯一**自述，报请求值等于让输出对自身撒谎。
+    let (real_head_pct, real_tail_pct) = if total == 0 {
+        (0.0, 0.0)
+    } else {
+        (
+            head_n as f64 * 100.0 / total as f64,
+            tail_n as f64 * 100.0 / total as f64,
+        )
+    };
+    let marker = format!(
+        "\n\n... [{} bytes elided (head_tail {:.0}% + {:.0}%)] ...\n\n",
+        elided, real_head_pct, real_tail_pct
+    );
+    let body = format!("{head}\n\n{tail}");
+    finish_within_budget(content, body, &marker, max_bytes)
 }
 
 /// v0.29: summary 通过 LLM 调用。
@@ -90,34 +125,47 @@ pub fn head_tail_impl(content: &str, head_pct: f32, tail_pct: f32, max_bytes: us
 /// - `OPENAI_API_KEY` 为空 → mock 截前 200 字符 + `mock_mode` marker。
 /// - `OPENAI_API_KEY` 已设置 → 调 Chat Completions API (复用 ureq，保持零 serde 依赖);
 ///   调用失败时 eprintln 错误并 fallback 到 mock。
-pub fn summary_llm_impl(content: &str, _max_bytes: usize) -> Result<String, String> {
+pub fn summary_llm_impl(content: &str, max_bytes: usize) -> Result<String, String> {
     let api_key = std::env::var(AI_API_KEY_ENV).unwrap_or_default();
-    let preview: String = content.chars().take(200).collect();
 
     if api_key.is_empty() {
-        return Ok(format!(
-            "{}\n<compressed:method=summary mock_mode>",
-            preview
-        ));
+        // v0.104.6 D227：mock 模式此前固定取前 **200 字符**并无视 max_bytes
+        // （max_bytes=16 时输出 240+ 字节）。现在预览长度由 max_bytes 定，
+        // 并经 `finish_within_budget` 收口。
+        return Ok(mock_summary(content, max_bytes));
     }
 
     // 有 API key: 尝试真实 LLM 调用
     let base_url =
         std::env::var(AI_BASE_URL_ENV).unwrap_or_else(|_| AI_BASE_URL_DEFAULT.to_string());
-    let prompt_len = content.len().min(4000);
+    let prompt_len = floor_char_boundary(content, content.len().min(4000));
     let prompt = format!(
         "Summarize the following text concisely:\n\n{}",
         &content[..prompt_len]
     );
     if let Ok(summary) = summary_via_llm(&prompt, &api_key, &base_url) {
-        Ok(format!("{}\n<compressed:method=summary llm>", summary))
+        // v0.104.6 D227：真实 LLM 的摘要长度同样不受控，经收口保证上限。
+        Ok(crate::compress::finish_within_budget(
+            content,
+            summary,
+            "\n<compressed:method=summary llm>",
+            max_bytes,
+        ))
     } else {
         eprintln!("compress.summary: LLM call failed (OPENAI_API_KEY set), falling back to mock");
-        Ok(format!(
-            "{}\n<compressed:method=summary mock_mode>",
-            preview
-        ))
+        Ok(mock_summary(content, max_bytes))
     }
+}
+
+/// v0.104.6 D227：mock 摘要 —— 预览长度由 `max_bytes` 决定。
+///
+/// 修前固定 `content.chars().take(200)`，与 `max_bytes` 无关：
+/// 短内容 + 小上限时输出必然超限。
+fn mock_summary(content: &str, max_bytes: usize) -> String {
+    const MARKER: &str = "\n<compressed:method=summary mock_mode>";
+    let room = max_bytes.saturating_sub(MARKER.len());
+    let take = floor_char_boundary(content, room.min(content.len()));
+    crate::compress::finish_within_budget(content, content[..take].to_string(), MARKER, max_bytes)
 }
 
 /// v0.29: 通过 Chat Completions API 执行摘要。
@@ -126,10 +174,8 @@ pub fn summary_llm_impl(content: &str, _max_bytes: usize) -> Result<String, Stri
 /// - 用 `json_to_value` 解析响应，提取 `choices[0].message.content`
 /// - 30s 读超时（LLM 推理可能慢）
 fn summary_via_llm(prompt: &str, api_key: &str, base_url: &str) -> Result<String, String> {
-    let escaped_prompt = prompt
-        .replace('\\', "\\\\")
-        .replace('"', "\\\"")
-        .replace('\n', "\\n");
+    // v0.104.6 D209：改用共享的 RFC 8259 转义器
+    let escaped_prompt = crate::flow::escape_json_string(prompt);
     let body = format!(
         r#"{{"model":"gpt-4o-mini","messages":[{{"role":"user","content":"{}"}}]}}"#,
         escaped_prompt
@@ -202,11 +248,28 @@ impl SubCompressor for TextSubCompressor {
                 max_bytes,
             )),
             "summary" => summary_llm_impl(content, max_bytes),
-            "lossless" => Ok(format!(
-                "{}\n<compressed:method=lossless original_size={}>",
-                content,
-                content.len()
-            )),
+            // v0.104.6 D227：lossless 此前**无条件**返回 content + marker，
+            // 完全不看 max_bytes —— 原样输出必然超限（实测 6500 → 6560，
+            // 而 max_bytes 可以是 16）。lossless 的语义本就是「不丢内容」，
+            // 所以正确行为是：装得下就原样返回，装不下就**如实报错**，
+            // 而不是静默返回一个超限结果。
+            "lossless" => {
+                let marker = format!(
+                    "\n<compressed:method=lossless original_size={}>",
+                    content.len()
+                );
+                if content.len() + marker.len() <= max_bytes {
+                    Ok(format!("{content}{marker}"))
+                } else {
+                    Err(format!(
+                        "compress.lossless: content is {} bytes but max_bytes is {} \
+                         — lossless keeps all content, so it cannot fit; \
+                         use head_tail or raise max_bytes",
+                        content.len(),
+                        max_bytes
+                    ))
+                }
+            }
             // 默认 / 未知 strategy: head_tail with 0.3 / 0.3 (与 spec §6.5 一致)
             _ => Ok(head_tail_impl(content, 0.3, 0.3, max_bytes)),
         }
@@ -298,12 +361,25 @@ mod tests {
     /// 无 fix 时, head_pct=0.3 的 head_n 落在一个中文字符中间字节, 触发 slice panic。
     #[test]
     fn test_text_head_tail_utf8_boundary() {
-        // 中文 + ASCII 混合; 故意长到 max_bytes 8 强制触发 elision
+        // 中文 + ASCII 混合; 故意长到 max_bytes 64 强制触发 elision
+        //
+        // v0.104.6 D227：预算从 8 提到 64。原先 `max_bytes: 8` 让本判据的
+        // `contains("elided")` 与 D227 的字节上限契约正面冲突 —— 8 字节
+        // 装不下 `... [N bytes elided (head_tail H% + T%)] ...` marker，
+        // 收口函数把输出截到 0 字节。64 字节既能触发省略（原文 ~300 字节），
+        // 又装得下 marker，两条判据同时成立。
         let s = "中文测试 abc 中文测试 中文测试 中文测试 中文测试 中文测试 中文测试 中文测试 中文测试 中文测试";
-        let result = head_tail_impl(s, 0.3, 0.3, 8);
+        let result = head_tail_impl(s, 0.3, 0.3, 64);
         assert!(
             result.contains("elided"),
             "must contain elided marker: {result}"
+        );
+        // D227: 输出必须仍是合法 UTF-8（截断点落在字符边界上），
+        // 且不超过 max_bytes
+        assert!(
+            result.len() <= 64,
+            "D227: 输出不得超过 max_bytes; 实得 {} 字节: {result}",
+            result.len()
         );
         // No panic is the main assertion — UTF-8 boundary safety
     }

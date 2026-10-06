@@ -128,14 +128,14 @@ mod tests {
     fn occur_check_rejects_nested_through_binding() {
         // x → y（已绑定），再 y = [x] 应失败
         let s = Subst::new().bind(1, v(0));
-        let t = Value::List(vec![v(1)]);
+        let t = Value::List(vec![v(1)].into());
         assert!(unify(&v(0), &t, &s).is_none());
     }
 
     #[test]
     fn unify_lists_elementwise() {
-        let a = Value::List(vec![v(0), Value::Int(2)]);
-        let b = Value::List(vec![Value::Int(1), v(1)]);
+        let a = Value::List(vec![v(0), Value::Int(2)].into());
+        let b = Value::List(vec![Value::Int(1), v(1)].into());
         let s = unify(&a, &b, &Subst::new()).expect("unify");
         assert_eq!(s.walk(&v(0)), Value::Int(1));
         assert_eq!(s.walk(&v(1)), Value::Int(2));
@@ -143,8 +143,8 @@ mod tests {
 
     #[test]
     fn unify_list_length_mismatch_fails() {
-        let a = Value::List(vec![Value::Int(1)]);
-        let b = Value::List(vec![Value::Int(1), Value::Int(2)]);
+        let a = Value::List(vec![Value::Int(1)].into());
+        let b = Value::List(vec![Value::Int(1), Value::Int(2)].into());
         assert!(unify(&a, &b, &Subst::new()).is_none());
     }
 

@@ -5,6 +5,42 @@
 use super::*;
 use crate::value::Value;
 
+/// v0.104.6 D283：用户传入数值的**唯一**转换入口（本文件内）。
+///
+/// 修前本文件有 4 处直接 `as u64` / `as u32` 吃用户传进来的 `Value`：
+///
+/// ```text
+/// Value::Float(n) => *n as u64,   // Float(-1.0) as u64 —— **饱和成 0**
+/// Value::Int(i)   => *i as u64,   // Int(-1)   as u64 —— **回绕成 u64::MAX**
+/// ```
+///
+/// 后果是**一个负数被静默换成一个「看起来合法」的 id**。实测
+/// `sandbox.revoke(-1)` 报的是 `capability token 0 not found (revoked?)`
+/// —— `-1` 饱和成了 0，于是去查 token 0，错误信息把排查方向引到 token 0，
+/// 而真正的问题（传了负数）被完全掩盖。
+///
+/// 同样的形状也让 `containerize` 的 `cpu_cores` / `memory_mb` 把负数变成
+/// `Some(0)`（0 核 / 0 内存），比 `None`（不限）**更危险**。
+///
+/// 改走 [`crate::flow::value_as_usize`]（D246 立的收口）：负数 / `NaN` /
+/// `±inf` 一律返回 `None`，由调用方**报错**——正是该收口文档里写的
+/// 「不替它猜」。
+fn arg_nonneg_u64(v: &Value, what: &str) -> Result<u64, String> {
+    crate::flow::value_as_usize(v)
+        .map(|n| n as u64)
+        .ok_or_else(|| format!("{what} must be a non-negative integer, got {v:?}"))
+}
+
+/// 同 [`arg_nonneg_u64`]，但额外要求落在 `u32` 范围内（`cpu_cores` 用）。
+///
+/// `value_as_usize` 在 64 位上给到 `u64`，直接 `as u32` 会**静默截断**
+/// （例如 `4294967297` → 1），所以这里显式校验上界。
+fn arg_nonneg_u32(v: &Value, what: &str) -> Result<u32, String> {
+    let n = crate::flow::value_as_usize(v)
+        .ok_or_else(|| format!("{what} must be a non-negative integer, got {v:?}"))?;
+    u32::try_from(n).map_err(|_| format!("{what} must be <= 4294967295, got {n}"))
+}
+
 impl Interpreter {
     pub fn call_sandbox_method(&self, method: &str, args: &[Value]) -> Result<Value, String> {
         match method {
@@ -91,13 +127,7 @@ impl Interpreter {
                         args.len()
                     ));
                 }
-                let token_id = match &args[0] {
-                    Value::Float(n) => *n as u64,
-                    Value::Int(i) => *i as u64,
-                    _ => {
-                        return Err("sandbox.check_call: token_id must be a number".to_string());
-                    }
-                };
+                let token_id = arg_nonneg_u64(&args[0], "sandbox.check_call: token_id")?;
                 let cap_str = match &args[1] {
                     Value::String(s) => s.clone(),
                     _ => {
@@ -123,13 +153,7 @@ impl Interpreter {
                         args.len()
                     ));
                 }
-                let token_id = match &args[0] {
-                    Value::Float(n) => *n as u64,
-                    Value::Int(i) => *i as u64,
-                    _ => {
-                        return Err("sandbox.revoke: token_id must be a number".to_string());
-                    }
-                };
+                let token_id = arg_nonneg_u64(&args[0], "sandbox.revoke: token_id")?;
                 self.sandbox
                     .sandbox
                     .capabilities
@@ -220,62 +244,74 @@ impl Interpreter {
                 let mut spec = crate::sandbox::ContainerSpec::new(backend);
 
                 // mounts (可选, arg 1)
-                if let Some(Value::List(mounts)) = args.get(1) {
-                    for (i, m) in mounts.iter().enumerate() {
-                        let m_str = match m {
-                            Value::String(s) => s.clone(),
-                            _ => {
-                                return Err(format!(
-                                    "sandbox.containerize: mounts[{}] must be a string",
-                                    i
-                                ));
-                            }
-                        };
-                        let mount = crate::sandbox::MountSpec::parse(&m_str)
-                            .map_err(|e| format!("sandbox.containerize: {}", e))?;
-                        spec.mounts.push(mount);
+                // v0.104.6 D152：此前 `if let Some(Value::List(..))` 无 else 分支 ——
+                // 传错类型即**静默当成没传**（mounts 悄悄消失）。同函数的
+                // `cpu_cores` / `memory_mb` 一直都有 else 报错（见下），此处是对齐它们。
+                match args.get(1) {
+                    None | Some(Value::Nil) => {}
+                    Some(Value::List(mounts)) => {
+                        for (i, m) in mounts.iter().enumerate() {
+                            let m_str = match m {
+                                Value::String(s) => s.clone(),
+                                _ => {
+                                    return Err(format!(
+                                        "sandbox.containerize: mounts[{}] must be a string",
+                                        i
+                                    ));
+                                }
+                            };
+                            let mount = crate::sandbox::MountSpec::parse(&m_str)
+                                .map_err(|e| format!("sandbox.containerize: {}", e))?;
+                            spec.mounts.push(mount);
+                        }
+                    }
+                    Some(_) => {
+                        return Err(
+                            "sandbox.containerize: mounts must be a list of strings".to_string()
+                        );
                     }
                 }
 
                 // network (可选, arg 2)
-                if let Some(Value::String(net_str)) = args.get(2) {
+                // v0.104.6 D152：同 mounts —— 传错类型曾**静默保持默认网络模式**。
+                if let Some(net_str) = optional_str_arg(args, 2, "sandbox.containerize", "network")?
+                {
                     spec.network =
-                        crate::sandbox::NetworkMode::parse(net_str).ok_or_else(|| {
+                        crate::sandbox::NetworkMode::parse(&net_str).ok_or_else(|| {
                             format!("sandbox.containerize: unknown network '{}'", net_str)
                         })?;
                 }
 
                 // cpu_cores (可选, arg 3)
+                // v0.104.6 D283：修前 `*v as u32` 使负数饱和成 `Some(0)`
+                // （0 核），比 `None`（不限）更危险；超 `u32` 上界也会静默截断。
                 if let Some(n) = args.get(3) {
                     match n {
-                        Value::Float(v) => spec.limits.cpu_cores = Some(*v as u32),
-                        Value::Int(i) => spec.limits.cpu_cores = Some(*i as u32),
                         Value::Nil => {}
-                        _ => {
-                            return Err(
-                                "sandbox.containerize: cpu_cores must be a number".to_string()
-                            );
+                        other => {
+                            spec.limits.cpu_cores =
+                                Some(arg_nonneg_u32(other, "sandbox.containerize: cpu_cores")?);
                         }
                     }
                 }
 
-                // memory_mb (可选, arg 4)
+                // memory_mb (可选, arg 4) —— 同上，负数曾饱和成 `Some(0)`（0 内存）。
                 if let Some(n) = args.get(4) {
                     match n {
-                        Value::Float(v) => spec.limits.memory_mb = Some(*v as u64),
-                        Value::Int(i) => spec.limits.memory_mb = Some(*i as u64),
                         Value::Nil => {}
-                        _ => {
-                            return Err(
-                                "sandbox.containerize: memory_mb must be a number".to_string()
-                            );
+                        other => {
+                            spec.limits.memory_mb =
+                                Some(arg_nonneg_u64(other, "sandbox.containerize: memory_mb")?);
                         }
                     }
                 }
 
                 // image (可选, arg 5; default alpine:latest)
-                if let Some(Value::String(img)) = args.get(5) {
-                    spec.image = img.clone();
+                // v0.104.6 D152：同 mounts —— 传错类型曾**静默保持默认镜像**。
+                // 本轮实测：传 `12345` 时错误最终以「docker daemon unreachable」暴露，
+                // 真正的问题（image 类型不对）被完全掩盖，且 exit 1 的归因是错的。
+                if let Some(img) = optional_str_arg(args, 5, "sandbox.containerize", "image")? {
+                    spec.image = img;
                 }
 
                 spec.validate()

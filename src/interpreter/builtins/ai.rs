@@ -21,12 +21,21 @@ impl Interpreter {
                 if attempts_n == 0 {
                     return Err("ai.retry: attempts must be > 0".to_string());
                 }
+                // v0.104.6 D246：两侧都无守卫 —— `Int(-1) as u64` **回绕**成
+                // `u64::MAX` = 1.8e19 毫秒 ≈ 5.8 亿年，于是任何带重试的调用
+                // **永远等不到退避结束**（静默挂死，且不报错）。`Float(-1.0)`
+                // 则饱和成 0，退避完全失效。
                 let backoff_ms: u64 = if let Some(v) = args.get(1) {
                     match v {
-                        Value::Float(n) => *n as u64,
-                        Value::Int(i) => *i as u64,
                         Value::String(s) => s.parse().unwrap_or(1000),
-                        _ => 1000,
+                        other => match crate::flow::value_as_usize(other) {
+                            Some(n) => n as u64,
+                            None => {
+                                return Err(format!(
+                                    "ai.retry: backoff_ms must be a non-negative integer (got {other})"
+                                ));
+                            }
+                        },
                     }
                 } else {
                     1000
@@ -54,7 +63,7 @@ impl Interpreter {
                     };
                     schedule.push(Value::Float(delay as f64));
                 }
-                d.insert("schedule".to_string(), Value::List(schedule));
+                d.insert("schedule".to_string(), Value::List(schedule.into()));
                 Ok(Value::Dict(d))
             }
             // v0.45.0: ai.role(name) — set/get current AI role (OpenFugu per-turn)
@@ -212,7 +221,7 @@ impl Interpreter {
                         Value::Dict(m)
                     })
                     .collect();
-                d.insert("items".to_string(), Value::List(items));
+                d.insert("items".to_string(), Value::List(items.into()));
                 Ok(Value::Dict(d))
             }
             _ => Err(format!("ai.{}: unknown method", method)),

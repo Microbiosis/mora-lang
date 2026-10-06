@@ -1,0 +1,13 @@
+-- e2e：**真正非法**的 mount mode 仍被 `mode` 字段拦下（v0.104.6 D389）
+--
+-- 与 `sandbox_container_mount_win.mora` 配对，构成**真反向对照**：
+-- 那条证明「Windows 盘符不再误报 mode」，本条证明
+-- 「mode 校验本身没被改坏」——否则上条只是「反正报错了」，
+-- 判据会失去判别力。
+--
+-- 判据断言错误消息里回显的是用户**真写过**的值 `xx`，
+-- 而不是像修前那样回显被盘符冒号污染出来的 `/data:ro`。
+--
+-- Run: cargo run -- tests/fixtures/e2e/sandbox_container_mount_bad_mode.mora
+
+print(sandbox.containerize("gondolin", ["/data:/data:xx"]))

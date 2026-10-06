@@ -29,7 +29,10 @@ mod tests_v048_plan {
         let name = interp
             .call_plan_method(
                 "create",
-                &[Value::String("myplan".to_string()), Value::List(steps)],
+                &[
+                    Value::String("myplan".to_string()),
+                    Value::List(steps.into()),
+                ],
             )
             .expect("create 调用应成功");
         assert_eq!(name, Value::String("myplan".to_string()));
@@ -64,18 +67,21 @@ mod tests_v048_plan {
         interp
             .call_plan_method(
                 "create",
-                &[Value::String("p".to_string()), Value::List(steps)],
+                &[Value::String("p".to_string()), Value::List(steps.into())],
             )
             .unwrap();
         // update a -> done
-        let updates = vec![Value::List(vec![
-            Value::String("a".to_string()),
-            Value::String("done".to_string()),
-        ])];
+        let updates = vec![Value::List(
+            vec![
+                Value::String("a".to_string()),
+                Value::String("done".to_string()),
+            ]
+            .into(),
+        )];
         let result = interp
             .call_plan_method(
                 "update",
-                &[Value::String("p".to_string()), Value::List(updates)],
+                &[Value::String("p".to_string()), Value::List(updates.into())],
             )
             .expect("update 调用应成功");
         assert_eq!(result, Value::Bool(true));
@@ -107,18 +113,21 @@ mod tests_v048_plan {
         interp
             .call_plan_method(
                 "create",
-                &[Value::String("p".to_string()), Value::List(steps)],
+                &[Value::String("p".to_string()), Value::List(steps.into())],
             )
             .unwrap();
         // emoji ✅
-        let updates = vec![Value::List(vec![
-            Value::String("a".to_string()),
-            Value::String("✅".to_string()),
-        ])];
+        let updates = vec![Value::List(
+            vec![
+                Value::String("a".to_string()),
+                Value::String("✅".to_string()),
+            ]
+            .into(),
+        )];
         let result = interp
             .call_plan_method(
                 "update",
-                &[Value::String("p".to_string()), Value::List(updates)],
+                &[Value::String("p".to_string()), Value::List(updates.into())],
             )
             .expect("update with emoji");
         assert_eq!(result, Value::Bool(true));
@@ -132,23 +141,29 @@ mod tests_v048_plan {
                 "create",
                 &[
                     Value::String("p".to_string()),
-                    Value::List(vec![Value::Dict({
-                        let mut d = std::collections::HashMap::new();
-                        d.insert("id".to_string(), Value::String("a".to_string()));
-                        d.insert("text".to_string(), Value::String("A".to_string()));
-                        d
-                    })]),
+                    Value::List(
+                        vec![Value::Dict({
+                            let mut d = std::collections::HashMap::new();
+                            d.insert("id".to_string(), Value::String("a".to_string()));
+                            d.insert("text".to_string(), Value::String("A".to_string()));
+                            d
+                        })]
+                        .into(),
+                    ),
                 ],
             )
             .unwrap();
-        let updates = vec![Value::List(vec![
-            Value::String("ghost".to_string()),
-            Value::String("done".to_string()),
-        ])];
+        let updates = vec![Value::List(
+            vec![
+                Value::String("ghost".to_string()),
+                Value::String("done".to_string()),
+            ]
+            .into(),
+        )];
         let err = interp
             .call_plan_method(
                 "update",
-                &[Value::String("p".to_string()), Value::List(updates)],
+                &[Value::String("p".to_string()), Value::List(updates.into())],
             )
             .expect_err("unknown step should fail");
         assert!(err.contains("not found"), "got: {}", err);
@@ -160,7 +175,7 @@ mod tests_v048_plan {
         interp
             .call_plan_method(
                 "create",
-                &[Value::String("p".to_string()), Value::List(vec![])],
+                &[Value::String("p".to_string()), Value::List(vec![].into())],
             )
             .unwrap();
         let added = interp
@@ -198,7 +213,7 @@ mod tests_v048_plan {
         interp
             .call_plan_method(
                 "create",
-                &[Value::String("p".to_string()), Value::List(steps)],
+                &[Value::String("p".to_string()), Value::List(steps.into())],
             )
             .unwrap();
         let list = interp
@@ -243,7 +258,7 @@ mod tests_v048_plan {
         interp
             .call_plan_method(
                 "create",
-                &[Value::String("p".to_string()), Value::List(steps)],
+                &[Value::String("p".to_string()), Value::List(steps.into())],
             )
             .unwrap();
         let info = interp

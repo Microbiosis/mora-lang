@@ -10,6 +10,7 @@ use parking_lot::Mutex;
 use super::dispatch::block_on_async;
 use super::*;
 use crate::common::Span;
+use crate::value::list::List;
 use crate::value::{BuiltinKind, Value};
 
 impl Interpreter {
@@ -70,16 +71,27 @@ impl Interpreter {
         };
         match crate::mir::host::MirHost::perform_effect(self, label, args, effects) {
             Some(v) => Ok(v),
-            None => Err(format!(
-                "unhandled effect: {} (ambient random state missing — runtime invariant violated)",
-                label
-            )),
+            None => {
+                // v0.104.6：ambient 兜底若**跑到了但实参校验失败**，
+                // `perform_effect` 会把真实原因暂存到 `last_ambient_error`
+                // （它的 trait 签名只返 `Option<Value>`，没有错误通道）。
+                // 这里取走并还原 —— 过去无论什么原因都报
+                // "ambient random state missing — runtime invariant violated"，
+                // 把「自己实参写错」说成「运行期不变量被破坏」，诊断方向完全错。
+                match self.core.last_ambient_error.take() {
+                    Some(reason) => Err(format!("random.{}: {}", method, reason)),
+                    None => Err(format!(
+                        "unhandled effect: {label} (ambient random state missing — runtime invariant violated)"
+                    )),
+                }
+            }
         }
     }
 
+    /// v0.104.6：`List` 已接管 `Value::List`，形参随之改为 `list::List`（按值）。
     fn call_method_list(
         &mut self,
-        list: Vec<Value>,
+        list: List,
         method: &str,
         args: Vec<Value>,
         effects: &mut crate::mir::effect::Effects,
@@ -87,23 +99,19 @@ impl Interpreter {
         match method {
             // v0.30: List.crush_json(max) -> string SmartCrusher
             "crush_json" => {
-                let max = args
-                    .first()
-                    .and_then(|v| match v {
-                        Value::Float(n) => {
-                            if *n < 0.0 {
-                                None
-                            } else {
-                                Some(*n as usize)
-                            }
-                        }
-                        _ => None,
-                    })
-                    .ok_or_else(|| "List.crush_json: requires max as number".to_string())?;
+                // v0.104.6 D153：只匹配 `Float` → `Int` 实参报「requires max as number」
+                // （实参明明传了）。**更正**：本方法在 D148 的饱和转换普查表里被
+                // 记为「本就正确 · 作样板」，那行判断是错的 —— 它没审**类型**这一侧。
+                let max = super::builtins::required_num_arg(&args, 0, "List.crush_json", "max")?;
+                if max < 0.0 {
+                    return Err("List.crush_json: max must be non-negative".to_string());
+                }
+                let max = max as usize;
                 let opts = crate::compress::CompressOptions::default();
-                let result = crate::compress::crush_json(&list, max, &opts);
-                let json =
-                    crate::compress::value_to_json_simple(&Value::List(result.items.clone()));
+                let result = crate::compress::crush_json(&list.to_vec(), max, &opts);
+                let json = crate::compress::value_to_json_simple(&Value::List(
+                    result.items.clone().into(),
+                ));
                 Ok(Value::String(format!(
                     "{}\n<compressed:method=smart_crusher strategy={} items={} total={} savings={:.2}>",
                     json,
@@ -115,23 +123,50 @@ impl Interpreter {
             }
             "push" => {
                 let item = args.first().cloned().unwrap_or(Value::Nil);
-                let mut new_list = list.clone();
-                new_list.push(item);
+                // v0.104.6：List 不可变，push 返回新列表
+                let new_list = list.push(item);
                 Ok(Value::List(new_list))
             }
             "get" => {
-                let index = args
-                    .first()
-                    .and_then(|v| match v {
-                        Value::Float(n) => Some(*n as usize),
-                        _ => None,
-                    })
-                    .unwrap_or(0);
-                Ok(list.get(index).cloned().unwrap_or(Value::Nil))
+                // v0.104.6 D153：此前是
+                //   `.and_then(|v| match v { Value::Float(n) => Some(*n as usize), _ => None }).unwrap_or(0)`
+                // —— 只匹配 `Float`，于是**合法的 `Int` 索引**（`len()` 的产物）落到
+                // `_ => None` → `unwrap_or(0)` → **静默变成第 0 个元素**：
+                //   xs = [10,20,30]
+                //   xs.get(2)        → 30.0  ✅
+                //   xs.get(len([9,9])) → 10.0 ❌（应为 30.0）
+                //   xs.get(len([9,9,9])) → 10.0 ❌（索引 3 越界，本应报错）
+                // exit 0、零诊断。**比 D152 的 `plan.list` 更糟**：那里用户拿到的是
+                // 「另一个操作」的结果，这里连报错都被吞掉 —— 一个**本该越界**的下标
+                // 静默返回了首元素。
+                //
+                // 该实参被 typeck 强制为 1 个（`xs.get()` 直接类型错），故用必选助手：
+                // 缺参时报「requires index」是诚实的，而旧的 `unwrap_or(0)` 会静默
+                // 返回首元素。
+                let index = super::builtins::required_num_arg(&args, 0, "List.get", "index")?;
+                let index = if index < 0.0 {
+                    return Err("List.get: index must be non-negative".to_string());
+                } else {
+                    index as usize
+                };
+                // v0.104.6 修复：此前是 `list.get(index).cloned().unwrap_or(Value::Nil)`
+                // —— **越界静默返回 nil**，而等价的 `xs[index]`（走 `index_value`）
+                // 会报错。同语义两种写法两种结果：
+                //   xs[5]     → ERR: index 5 out of bounds (len 2)
+                //   xs.get(5) → nil
+                // 越界的 list 下标本身就是错误，吞成 nil 会让「下标算错」这类缺陷
+                // 在循环里悄无声息（`total += xs.get(i)` 恒加 0）。
+                // 错误文本与 `index_value` 保持一致，使两种写法完全等价。
+                //
+                // 注：**dict 的 `.get` 仍返回 Nil**（键不存在时），因为
+                // `d[k]` 同样返回 Nil（`index_value` 对 Dict 是 `unwrap_or(Nil)`），
+                // 两者本就一致；list 则是「越界即错」的一侧。
+                list.get(index)
+                    .cloned()
+                    .ok_or_else(|| format!("index {} out of bounds (len {})", index, list.len()))
             }
             "pop" => {
-                let mut new_list = list.clone();
-                let item = new_list.pop().unwrap_or(Value::Nil);
+                let item = list.pop_last().unwrap_or(Value::Nil);
                 Ok(item)
             }
             "len" => Ok(Value::Int(list.len() as i64)),
@@ -142,7 +177,7 @@ impl Interpreter {
                     let mapped = self.call_value(&mapper, vec![item], effects)?;
                     result.push(mapped);
                 }
-                Ok(Value::List(result))
+                Ok(Value::List(result.into()))
             }
             "filter" => {
                 let predicate = args
@@ -156,14 +191,30 @@ impl Interpreter {
                         result.push(item);
                     }
                 }
-                Ok(Value::List(result))
+                Ok(Value::List(result.into()))
             }
             "reduce" => {
                 let reducer = args
                     .first()
                     .cloned()
                     .ok_or("reduce() requires a function")?;
-                let mut acc = args.get(1).cloned().unwrap_or(Value::Nil);
+                // v0.104.6 D48：初值**必填**（spec §1053 `.reduce(fn, init)`，
+                // 签名 `closure, any -> any`）。此前缺初值时静默从 `Nil` 起算：
+                //
+                //   [1,2,3].reduce(fn(a,b) a+b end)
+                //     → Runtime error: Operands must be two numbers, …   ← 误导
+                //       （真实原因是少传了初值，用户会去查 `+` 的类型规则）
+                //
+                //   ["a","b","c"].reduce(fn(a,b) a+b end)
+                //     → "nilabc"   ← **静默的错误结果，exit 0**，`Nil` 被当
+                //       字符串拼进去了，垃圾值直接进了返回值
+                //
+                // 不采用「缺初值就用首元素」——spec 明确 init 是必填参数，
+                // 那是语言设计决定，不该由实现悄悄替用户选。
+                let mut acc = args
+                    .get(1)
+                    .cloned()
+                    .ok_or("reduce() requires an initial value as the second argument")?;
                 for item in list {
                     acc = self.call_value(&reducer, vec![acc, item], effects)?;
                 }
@@ -171,66 +222,60 @@ impl Interpreter {
             }
             // v0.18: take(n) - 取前 n 个元素
             "take" => {
-                let n = args
-                    .first()
-                    .and_then(|v| match v {
-                        Value::Float(n) => Some(*n as usize),
-                        _ => None,
-                    })
-                    .ok_or("take() requires a count argument")?;
-                let result: Vec<Value> = list.into_iter().take(n).collect();
-                Ok(Value::List(result))
+                // v0.104.6 D153：此前只匹配 `Float`，`Int` 实参报「requires a count
+                // argument」—— 实参传了，只是个合法的 `Int`。归因错误。
+                let n = super::builtins::required_num_arg(&args, 0, "take", "count")?;
+                // v0.104.6 D146：此前 `*n as usize` —— float→int `as` 是**饱和转换**，
+                // `-1.0 as usize == 0`，于是 `xs.take(-1)` 得**空列表**（用户以为
+                // 「取最后 1 个」），`xs.drop(-1)` 则原样返回全部。两者都 exit 0、
+                // 零诊断。同族的 `crush_json(max)` / `tail(max)` 已有非负校验，
+                // 此处漏了。
+                if n < 0.0 {
+                    return Err(format!("take(): count 不能为负数（得到 {n}）"));
+                }
+                let result: Vec<Value> = list.into_iter().take(n as usize).collect();
+                Ok(Value::List(result.into()))
             }
             // v0.18: drop(n) - 跳过前 n 个元素
             "drop" => {
-                let n = args
-                    .first()
-                    .and_then(|v| match v {
-                        Value::Float(n) => Some(*n as usize),
-                        _ => None,
-                    })
-                    .ok_or("drop() requires a count argument")?;
-                let result: Vec<Value> = list.into_iter().skip(n).collect();
-                Ok(Value::List(result))
+                // v0.104.6 D153：同 `take` —— 修「Int 被报成没传」的归因错误。
+                let n = super::builtins::required_num_arg(&args, 0, "drop", "count")?;
+                if n < 0.0 {
+                    return Err(format!("drop(): count 不能为负数（得到 {n}）"));
+                }
+                let result: Vec<Value> = list.into_iter().skip(n as usize).collect();
+                Ok(Value::List(result.into()))
             }
             // v0.17: window(size) - 滑动窗口
             "window" => {
-                let size = args
-                    .first()
-                    .and_then(|v| match v {
-                        Value::Float(n) => Some(*n as usize),
-                        _ => None,
-                    })
-                    .ok_or("window() requires a size argument")?;
-                if size == 0 {
+                // v0.104.6 D153：同 `take` —— 修「Int 被报成没传」的归因错误。
+                let size = super::builtins::required_num_arg(&args, 0, "window", "size")?;
+                if size <= 0.0 {
                     return Err("window() size must be > 0".to_string());
                 }
+                let size = size as usize;
                 let mut windows = Vec::new();
                 for i in 0..list.len() {
                     if i + size <= list.len() {
-                        let window: Vec<Value> = list[i..i + size].to_vec();
-                        windows.push(Value::List(window));
+                        let window: Vec<Value> = list.slice(i, i + size).to_vec();
+                        windows.push(Value::List(window.into()));
                     }
                 }
-                Ok(Value::List(windows))
+                Ok(Value::List(windows.into()))
             }
             // v0.17: batch(size) - 翻转窗口（批次处理）
             "batch" => {
-                let size = args
-                    .first()
-                    .and_then(|v| match v {
-                        Value::Float(n) => Some(*n as usize),
-                        _ => None,
-                    })
-                    .ok_or("batch() requires a size argument")?;
-                if size == 0 {
+                // v0.104.6 D153：同 `window` —— 修「Int 被报成没传」的归因错误。
+                let size = super::builtins::required_num_arg(&args, 0, "batch", "size")?;
+                if size <= 0.0 {
                     return Err("batch() size must be > 0".to_string());
                 }
+                let size = size as usize;
                 let mut batches = Vec::new();
-                for chunk in list.chunks(size) {
-                    batches.push(Value::List(chunk.to_vec()));
+                for chunk in list.windows(size) {
+                    batches.push(Value::List(chunk.into()));
                 }
-                Ok(Value::List(batches))
+                Ok(Value::List(batches.into()))
             }
             // v0.17: shape() - 返回维度
             "shape" => {
@@ -272,19 +317,21 @@ impl Interpreter {
                 }
                 let mut result = Vec::new();
                 flatten_list(&Value::List(list.clone()), &mut result);
-                Ok(Value::List(result))
+                Ok(Value::List(result.into()))
             }
             // v0.17: transpose() - 转置二维列表
             "transpose" => {
                 if list.is_empty() {
-                    return Ok(Value::List(vec![]));
+                    return Ok(Value::List(vec![].into()));
                 }
                 // 检查是否是二维列表
-                let rows: Vec<&Vec<Value>> = list
+                // v0.104.6：`List` 不可变、拿不出连续切片，故这里把每个子列表
+                // 降级成 `Vec<Value>`（transpose 本就产出新列表，拷贝可接受）。
+                let rows: Vec<Vec<Value>> = list
                     .iter()
                     .filter_map(|v| {
                         if let Value::List(items) = v {
-                            Some(items)
+                            Some(items.to_vec())
                         } else {
                             None
                         }
@@ -293,33 +340,47 @@ impl Interpreter {
                 if rows.len() != list.len() {
                     return Err("transpose() requires a 2D list".to_string());
                 }
-                let ncols = rows.iter().map(|r| r.len()).max().unwrap_or(0);
+                // v0.104.6 D49：此前只校验「每项都是列表」，**不校验各行等长**，
+                // 短行用 `row.get(col).unwrap_or(Nil)` 静默补 nil：
+                //
+                //   [[1,2],[3]].transpose()     → [[1.0, 3.0], [2.0, nil]]
+                //   [[1],[2,3]].transpose()     → [[1.0, 2.0], [nil, 3.0]]
+                //   [[1,2,3],[4]].transpose()   → [[1.0, 4.0], [2.0, nil], [3.0, nil]]
+                //
+                // 全部 **exit 0、零提示**，返回一个用 null 补齐的伪矩阵 ——
+                // 下游任何按长度/形状算的代码都会拿到垃圾而不自知。
+                // 「二维列表」按惯例即各行等长，spec §1060 `.transpose() -> list`
+                // 也未承诺补齐语义，故按不规则即报错处理。
+                let ncols = rows.first().map(|r| r.len()).unwrap_or(0);
+                if rows.iter().any(|r| r.len() != ncols) {
+                    return Err(format!(
+                        "transpose() requires a rectangular 2D list (row widths differ: {:?})",
+                        rows.iter().map(|r| r.len()).collect::<Vec<_>>()
+                    ));
+                }
                 let mut result = Vec::new();
                 for col in 0..ncols {
                     let mut new_row = Vec::new();
                     for row in &rows {
-                        new_row.push(row.get(col).cloned().unwrap_or(Value::Nil));
+                        new_row.push(
+                            row.get(col)
+                                .cloned()
+                                .ok_or("transpose(): internal row width mismatch")?,
+                        );
                     }
-                    result.push(Value::List(new_row));
+                    result.push(Value::List(new_row.into()));
                 }
-                Ok(Value::List(result))
+                Ok(Value::List(result.into()))
             }
             // v0.17: reshape(rows, cols) - 重塑列表
             "reshape" => {
-                let rows = args
-                    .first()
-                    .and_then(|v| match v {
-                        Value::Float(n) => Some(*n as usize),
-                        _ => None,
-                    })
-                    .ok_or("reshape() requires rows argument")?;
-                let cols = args
-                    .get(1)
-                    .and_then(|v| match v {
-                        Value::Float(n) => Some(*n as usize),
-                        _ => None,
-                    })
-                    .ok_or("reshape() requires cols argument")?;
+                // v0.104.6 D153：同 `take` —— 两个实参都修「Int 被报成没传」的归因错误。
+                let rows = super::builtins::required_num_arg(&args, 0, "reshape", "rows")?;
+                let cols = super::builtins::required_num_arg(&args, 1, "reshape", "cols")?;
+                if rows < 0.0 || cols < 0.0 {
+                    return Err("reshape(): rows and cols must be non-negative".to_string());
+                }
+                let (rows, cols) = (rows as usize, cols as usize);
                 let total = rows * cols;
                 // 展平后重塑
                 fn flatten_list(val: &Value, out: &mut Vec<Value>) {
@@ -334,6 +395,34 @@ impl Interpreter {
                 }
                 let mut flat = Vec::new();
                 flatten_list(&Value::List(list.clone()), &mut flat);
+                // v0.104.6 D325：目标**小于**源 ⇒ 静默丢数据，改为报错。
+                //
+                // 实测（修前）：`[1,2,3,4,5,6].reshape(1,1)` → `[[1.0]]`，
+                // **5 个元素凭空消失，退出码 0、零诊断**。任何在 reshape 结果上
+                // 做聚合（`sum` / 循环累加）的代码都会拿到**错误的数**。
+                //
+                // 为什么这不是「设计」：
+                // - `docs/learning-plan.md:166` 写的是「元素按 ravel 顺序复制，
+                //   **不足则循环重复**」—— 方向是「补」，从未说「多就丢」；
+                // - `docs/mora-spec.md:1068` 只说「重塑列表」；
+                // - `tests/list_methods.rs` 的 6 条 reshape 判据全是「恰好」
+                //   或「填充」，**无一条覆盖截断**；
+                // - numpy / Julia 的 `reshape` 在 size 不匹配时**报错**。
+                //
+                // 与本文件既有的立场一致（v0.104.6 修 `list.get` 越界静默返回
+                // nil 时）：**静默改变数据形状必须是显式错误**。
+                // 下方 `while` 只增长不收缩、`flat[r*cols..(r+1)*cols]` 只读前缀，
+                // 正是丢数据的直接原因。
+                if total < flat.len() {
+                    return Err(format!(
+                        "reshape(): target shape {}x{} holds {} elements but the input has {} — \
+                         reshape() pads but never drops; use take() if you want fewer",
+                        rows,
+                        cols,
+                        total,
+                        flat.len()
+                    ));
+                }
                 // 循环填充
                 while flat.len() < total {
                     let extend_len = (total - flat.len()).min(flat.len());
@@ -343,9 +432,9 @@ impl Interpreter {
                 let mut result = Vec::new();
                 for r in 0..rows {
                     let row: Vec<Value> = flat[r * cols..(r + 1) * cols].to_vec();
-                    result.push(Value::List(row));
+                    result.push(Value::List(row.into()));
                 }
-                Ok(Value::List(result))
+                Ok(Value::List(result.into()))
             }
             // v0.91: List 统计方法链（list.sum() / .mean() / .min() / .max() / ...）
             // 复用 stats.* builtin 同一底层函数
@@ -370,10 +459,19 @@ impl Interpreter {
                 if indexed.len() != list.len() {
                     return Err("List.sort: contains non-numeric elements".to_string());
                 }
-                indexed.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+                // v0.104.6 D242：用 `total_cmp`（IEEE 754 全序）而非
+                // `partial_cmp(...).unwrap_or(Equal)`。
+                //
+                // 后者遇 NaN 时 `partial_cmp` 返回 `None` → `Equal` ⇒
+                // NaN 与一切相等，违反传递性 ⇒ `sort_by` **静默**产出
+                // 依赖输入顺序的结果。实测同一组 `[1, NaN, 3, 2]`：
+                //   输入 a3b21 顺序 → `[1.0, nan, 2.0, 3.0]`
+                //   输入 b31a2 顺序 → `[nan, 1.0, 2.0, 3.0]`
+                // NaN 混在中间时「1.0 < NaN < 2.0」是假的排序。
+                indexed.sort_by(|a, b| a.1.total_cmp(&b.1));
                 // 用 indexed[i].0 取原始 value 重建
                 let sorted: Vec<Value> = indexed.iter().map(|(i, _)| list[*i].clone()).collect();
-                Ok(Value::List(sorted))
+                Ok(Value::List(sorted.into()))
             }
             _ => Err(format!("List has no method: {}", method)),
         }
@@ -397,13 +495,36 @@ impl Interpreter {
                 new_map.insert(key, value);
                 Ok(Value::Dict(new_map))
             }
+            // v0.104.6 可复现性修复（**语义级**，非仅显示）：`keys` / `values`
+            // 按 key 排序返回。
+            //
+            // **缺陷**：`Value::Dict` 是 `HashMap`，`RandomState` 每进程随机 →
+            // 这两个方法的返回序**每次运行都不同**。这不是「输出不好看」，而是
+            // **同一个程序每次跑出不同答案**：
+            //   let d = {zeta: 26, alpha: 1, mid: 13}
+            //   d.values()[0]   // 连跑 5 次得 13.0 / 1.0 / 26.0 / 1.0 / 13.0
+            // 用户按 `keys()[0]` 取「第一个键」、或 `for k in d.keys()` 顺序处理，
+            // 都会拿到随机结果 —— 且**不报错**。
+            //
+            // 与 `flow::json::value_to_json`、`Value` 的 Display 以及
+            // http/mcp 服务器的 `BTreeMap` 做法统一为「按 key 排序」。
+            // 回归：`tests/dict_determinism.rs`。
             "keys" => {
-                let keys: Vec<Value> = map.keys().map(|k| Value::String(k.clone())).collect();
-                Ok(Value::List(keys))
+                let mut keys: Vec<&String> = map.keys().collect();
+                keys.sort();
+                Ok(Value::List(
+                    keys.into_iter().map(|k| Value::String(k.clone())).collect(),
+                ))
             }
             "values" => {
-                let values: Vec<Value> = map.values().cloned().collect();
-                Ok(Value::List(values))
+                // **必须与 `keys` 同序** —— 否则 `d.values()[i]` 与
+                // `d.keys()[i]` 不再指向同一个键。直接迭代 HashMap 的
+                // `values()` 与 `keys()` 顺序本就无关，这里显式按 key 走。
+                let mut entries: Vec<(&String, &Value)> = map.iter().collect();
+                entries.sort_by(|a, b| a.0.cmp(b.0));
+                Ok(Value::List(
+                    entries.into_iter().map(|(_, v)| v.clone()).collect(),
+                ))
             }
             "len" => Ok(Value::Int(map.len() as i64)),
             // v0.07.1: req.json() — 从 body 字段解析 JSON，返回 Result<Dict, ParseError>
@@ -472,8 +593,20 @@ impl Interpreter {
                 self.real_web_fetch(&url)
             }
             (BuiltinKind::Json, "parse") => {
-                // v10: 真实 JSON 解析
-                let text = args.first().map(|v| v.to_string()).unwrap_or_default();
+                // v0.104.6 D155：此前是 `args.first().map(|v| v.to_string())` ——
+                // 把**任何** Value 静默字符串化后再当 JSON 文本解析。数字与布尔量的
+                // 字符串形式**本身就是合法 JSON**，于是：
+                //   json.parse(5)    → 5.0        （用户以为在解析一段文本）
+                //   json.parse(true) → true
+                // **exit 0、零诊断**。
+                //
+                // typeck 侧无法拦：`dispatch.rs` 给 `json.parse` 的签名是
+                // `params_variadic(1, Type::Any)`，而 `params()` 把模块方法的所有
+                // 形参一律声明为 `Type::Any`（保守约定，见该函数上方注释），
+                // `Any` 与任何类型都能合一。故只能在运行期收紧。
+                //
+                // 与同族一致：`document.parse` 的 path 同样要求字符串（D153 已修）。
+                let text = super::builtins::required_str_arg(&args, 0, "json.parse", "text")?;
                 json_to_value(&text).map_err(|e| format!("json.parse: {}", e))
             }
             (BuiltinKind::Json, "stringify") => {
@@ -593,9 +726,20 @@ impl Interpreter {
                     Some(Value::String(s)) => s.clone(),
                     _ => "default".to_string(),
                 };
+                // v0.104.6 D246：此前是 `Some(Value::Float(n)) => *n as usize`，
+                // **只认 `Float`** —— 写 `max_steps: 20`（整数，来自 `json.parse`
+                // 或用户 dict）会静默落到 `_ => 10`。且负数（`Float(-1.0)`）会
+                // 饱和成 0 步，而 `Int(-1)` 直接通过（Float 分支不匹配）。
                 let max_steps = match config.get("max_steps") {
-                    Some(Value::Float(n)) => *n as usize,
-                    _ => 10,
+                    Some(v) => match crate::flow::value_as_usize(v) {
+                        Some(n) => n,
+                        None => {
+                            return Err(format!(
+                                "agent.create: max_steps must be a non-negative integer (got {v})"
+                            ));
+                        }
+                    },
+                    None => 10,
                 };
                 let system = match config.get("system") {
                     Some(Value::String(s)) => s.clone(),
@@ -628,13 +772,9 @@ impl Interpreter {
             }
             // v0.27: 顶层模块入口 — `document.parse(path)` 返回 Value::Document
             (BuiltinKind::Document, "parse") => {
-                let path = args
-                    .first()
-                    .and_then(|v| match v {
-                        Value::String(s) => Some(s.clone()),
-                        _ => None,
-                    })
-                    .ok_or_else(|| "document.parse: requires a path string".to_string())?;
+                // v0.104.6 D153：此前只匹配 `String`，非字符串实参报
+                // 「requires a path string」—— 归因错误（实参传了，只是类型不对）。
+                let path = super::builtins::required_str_arg(&args, 0, "document.parse", "path")?;
                 crate::document::parse_document(&path)
             }
             (BuiltinKind::Document, _) => Err(format!("document.{}: unknown method", method)),
@@ -710,7 +850,7 @@ impl Interpreter {
                         Value::Dict(m)
                     })
                     .collect();
-                Ok(Value::List(hist))
+                Ok(Value::List(hist.into()))
             }
             "clear" => {
                 messages.clear();
@@ -721,13 +861,14 @@ impl Interpreter {
             // v0.29: Conversation.compact() 已重命名为 compress(strategy?) — 见下方 "compress" arm
             // v0.29: Conversation.compress(strategy?) -> string
             "compress" => {
-                let strategy = args
-                    .first()
-                    .and_then(|v| match v {
-                        Value::String(s) => Some(s.clone()),
-                        _ => None,
-                    })
-                    .unwrap_or_else(|| "summary".to_string());
+                // v0.104.6 D153：此前只匹配 `String`，传错类型**静默退回 "summary"**。
+                let strategy = super::builtins::optional_str_arg(
+                    &args,
+                    0,
+                    "Conversation.compress",
+                    "strategy",
+                )?
+                .unwrap_or_else(|| "summary".to_string());
                 let opts = crate::compress::CompressOptions {
                     strategy: strategy.clone(),
                     ..Default::default()
@@ -754,7 +895,11 @@ impl Interpreter {
         args: Vec<Value>,
     ) -> Result<Value, String> {
         match method {
-            "len" => Ok(Value::Float(s.len() as f64)),
+            // v0.104.6：数**字符**而非 UTF-8 字节，与 `index_value` 的
+            // `s.chars().nth(i)` 索引空间对齐，也与自由函数 `len()` 同口径。
+            // 另：返回值类型由 `Float` 改为 `Int`，与 list/dict 的 `.len()`
+            // 及自由函数 `len()` 一致 —— 原先五种 `len` 实现里独此一处返 Float。
+            "len" => Ok(Value::Int(s.chars().count() as i64)),
             "upper" => Ok(Value::String(s.to_uppercase())),
             "lower" => Ok(Value::String(s.to_lowercase())),
             "trim" => Ok(Value::String(s.trim().to_string())),
@@ -776,7 +921,7 @@ impl Interpreter {
                     .split(&sep)
                     .map(|p| Value::String(p.to_string()))
                     .collect();
-                Ok(Value::List(parts))
+                Ok(Value::List(parts.into()))
             }
             "replace" => {
                 let from = args.first().map(|v| v.to_string()).unwrap_or_default();
@@ -963,7 +1108,7 @@ impl Interpreter {
     }
     fn call_method_mcp(
         &mut self,
-        mut tools: Vec<(String, Value)>,
+        mut tools: Vec<(String, String, Value)>,
         method: &str,
         args: Vec<Value>,
     ) -> Result<Value, String> {
@@ -974,7 +1119,27 @@ impl Interpreter {
                     .get(2)
                     .cloned()
                     .ok_or("McpServer.tool() requires 3 args (name, schema, handler)")?;
-                tools.push((name, handler));
+                // v0.104.6：`args[1]` 的 schema 此前被**整个丢弃**，且 `serve`
+                // 把 `McpTool.parameters` 硬编码成 `"{}"`，于是 MCP 协议发给
+                // 客户端的 `tools/list` 每项 `inputSchema` 都是空对象，客户端
+                // 误以为工具无参数。typeck 一直声明的是三形参
+                // `tool(name, schema, handler)` —— 契约是对的，运行期没兑现。
+                //
+                // schema 归一化成 JSON Schema 字符串（`McpTool.parameters` 的
+                // 类型）。非 dict 值按 MCP 惯例退化成 `{"type":"object"}`，
+                // 而不是静默变成 `{}` —— 后者会让客户端以为工具无参数。
+                let schema_json = match args.get(1) {
+                    Some(Value::String(s)) => s.clone(),
+                    Some(Value::Dict(_)) => crate::flow::value_to_json(&args[1]),
+                    Some(Value::Nil) | None => "{}".to_string(),
+                    Some(other) => {
+                        return Err(format!(
+                            "McpServer.tool() schema must be a dict or JSON string, got {}",
+                            crate::flow::type_name(other)
+                        ));
+                    }
+                };
+                tools.push((name, schema_json, handler));
                 Ok(Value::McpServer {
                     tools: tools.clone(),
                 })
@@ -991,11 +1156,12 @@ impl Interpreter {
                     > = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
                     {
                         let mut tr = tool_registry.write().await;
-                        for (name, handler) in tools_clone {
+                        for (name, schema, handler) in tools_clone {
                             let mcp_tool = crate::mcp_server::McpTool {
                                 name: name.clone(),
                                 description: String::new(),
-                                parameters: "{}".to_string(),
+                                // v0.104.6：不再硬编码 "{}"，用注册时给的 schema。
+                                parameters: schema,
                                 handler,
                                 toolset: "custom".to_string(),
                             };

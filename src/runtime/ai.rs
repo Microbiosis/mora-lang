@@ -43,9 +43,13 @@ impl Default for AiRuntime {
 
 impl AiRuntime {
     /// 记录 token 消耗到 usage
+    ///
+    /// v0.104.6 D76：同时累加 `calls` —— `ai.tokens().calls()` 读的就是它
+    /// （此前该方法误读 `input`，见 `TokenUsage::calls` 的说明）。
     pub fn record_tokens(&mut self, input: usize, output: usize) {
         self.token_usage.input += input;
         self.token_usage.output += output;
+        self.token_usage.calls += 1;
     }
 
     /// 启用/禁用 trace
@@ -84,6 +88,29 @@ mod tests {
         ai.record_tokens(200, 80);
         assert_eq!(ai.token_usage.input, 300);
         assert_eq!(ai.token_usage.output, 130);
+    }
+
+    /// v0.104.6 D76：`calls` 必须记**调用次数**（= 2），而不是
+    /// 「输入 token 总数」（= 300）。修前 `ai.tokens().calls()` 返回 300 ——
+    /// 一个比真值大两个数量级的数字。mock 模式下 `account_tokens` 不被调用，
+    /// 故本测试是**唯一**能在本机观测该修复的地方（见 CHANGELOG）。
+    #[test]
+    fn record_tokens_counts_calls_not_input_tokens() {
+        let mut ai = AiRuntime::default();
+        ai.record_tokens(100, 50);
+        ai.record_tokens(200, 80);
+        assert_eq!(ai.token_usage.calls, 2, "两次 record_tokens = 2 次调用");
+        assert_eq!(ai.token_usage.input, 300, "对照：input 仍是 300");
+        assert_ne!(
+            ai.token_usage.calls, ai.token_usage.input,
+            "calls 与 input 必须能区分开 —— 否则 D76 的 bug 会回来"
+        );
+    }
+
+    #[test]
+    fn default_token_usage_calls_zero() {
+        let ai = AiRuntime::default();
+        assert_eq!(ai.token_usage.calls, 0);
     }
 
     #[test]

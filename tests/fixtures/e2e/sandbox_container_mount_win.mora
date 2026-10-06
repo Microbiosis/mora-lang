@@ -1,0 +1,15 @@
+-- e2e：Windows 盘符挂载能过 `validate()`（v0.104.6 D389）
+--
+-- 修前实测（真实 CLI）：
+--   sandbox.containerize("gondolin", ["C:\data:/data:ro"])
+--   → mount.mode must be 'ro' or 'rw', got: /data:ro     ← 误归因 + 功能全废
+-- 修后：解析与校验都通过，推进到 backend 门禁才停。
+--
+-- ⚠ 为什么用 `gondolin`（未实现 backend）：`spawn_container` 的顺序是
+-- `validate()` → backend 门禁 → `docker version` 探测 ⇒ 在**触达 docker
+-- 之前**停下。本机 docker daemon 未运行，判据不能依赖它，
+-- 更不能真去 spawn 容器。
+--
+-- Run: cargo run -- tests/fixtures/e2e/sandbox_container_mount_win.mora
+
+print(sandbox.containerize("gondolin", ["C:\data:/data:ro"]))

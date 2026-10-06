@@ -1,0 +1,11 @@
+-- v0.104.6 D14：import 进来的模块里 handle + 索引。
+--
+-- 修复前：h2 报 `Undefined function or task: []`（witness 索引编码未解码）；
+--         h1 同样报那条假错误，而非真实的 `index 99 out of bounds`。
+--
+-- 修复后：h2 打印 20.0；h1 由 tests/e2e.rs 断言真实越界错误。
+import "tests/fixtures/e2e/import_handle_index.mora"
+
+task main()
+  print(h2())
+end

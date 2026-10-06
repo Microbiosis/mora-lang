@@ -6,7 +6,7 @@
 //! 并发靠一把进程级互斥锁防御。
 //!
 //! v0.99 数据流化（用数据流代替状态机）：
-//! - **状态是纯值**：[`Xoshiro256`] 由 [`crate::runtime::core::CoreRuntime`]
+//! - **状态是纯值**：`Xoshiro256` 由 [`crate::runtime::core::CoreRuntime`]
 //!   单属主持有（与 `gensym_counter` 同一 v0.95 模式），`&mut self` 线性
 //!   穿线 —— 无锁、无 static、无初始化标志。Clone 按值复制：Pregel worker
 //!   各自独立推进序列，并发从「共享一把锁」变成「值拷贝即隔离」。
@@ -100,6 +100,18 @@ impl Xoshiro256 {
                         _ => None,
                     })
                     .ok_or_else(|| "random.rand_int requires (min, max)".to_string())?;
+                // v0.104.6 D144：`min > max`（区间**写反**）此前被
+                // `next_i64_in` 的 `max <= min → return min` 一并吞掉 ——
+                // 实测 `random.rand_int(5, 1)` 得 `5.0`、exit 0、零诊断，
+                // 用户以为在 `[5, 1]` 里取随机值，实际拿到的是一个确定值。
+                //
+                // `max == min` 是**单点区间**，返回 min 合理，保持不变
+                // （`rand_choice` / `shuffle` 两个内部调用点也依赖该行为）。
+                if min > max {
+                    return Err(format!(
+                        "random.rand_int: min({min}) > max({max}) —— 区间写反"
+                    ));
+                }
                 Ok(Value::Float(self.next_i64_in(min, max) as f64))
             }
             "random_rand_float" => {
@@ -111,6 +123,14 @@ impl Xoshiro256 {
                     .get(1)
                     .and_then(as_f64)
                     .ok_or_else(|| "random.rand_float requires (min, max)".to_string())?;
+                // v0.104.6 D144：同 `rand_int` —— 区间写反此前**静默**产出
+                // `[max, min)` 内的随机值（`min + (max-min)*rand` 在 max<min 时
+                // 仍落在两数之间），用户看不出方向反了。
+                if min > max {
+                    return Err(format!(
+                        "random.rand_float: min({min}) > max({max}) —— 区间写反"
+                    ));
+                }
                 Ok(Value::Float(min + (max - min) * self.next_f64()))
             }
             "random_rand_choice" => {
@@ -138,17 +158,19 @@ impl Xoshiro256 {
             }
             "random_shuffle" => {
                 let items = match args.first() {
-                    Some(Value::List(xs)) => xs.clone(),
+                    Some(Value::List(xs)) => xs,
                     _ => return Err("random.shuffle requires a list".to_string()),
                 };
                 // Fisher-Yates
-                let n = items.len();
-                let mut result = items;
+                // v0.104.6：`List` 不可变，没有 `swap`。取回一份可改的 Vec 做
+                // 就地交换，再整体装回 —— 值语义下 shuffle 本就产生新列表。
+                let mut result = items.to_vec();
+                let n = result.len();
                 for i in (1..n).rev() {
                     let j = self.next_i64_in(0, (i + 1) as i64) as usize;
                     result.swap(i, j);
                 }
-                Ok(Value::List(result))
+                Ok(Value::List(result.into()))
             }
             other => Err(format!("random: unknown ambient effect label `{}`", other)),
         }
@@ -226,13 +248,16 @@ mod tests {
     #[test]
     fn shuffle_preserves_elements() {
         let mut rng = Xoshiro256::from_seed(7);
-        let input = Value::List(vec![
-            Value::Int(1),
-            Value::Int(2),
-            Value::Int(3),
-            Value::Int(4),
-            Value::Int(5),
-        ]);
+        let input = Value::List(
+            vec![
+                Value::Int(1),
+                Value::Int(2),
+                Value::Int(3),
+                Value::Int(4),
+                Value::Int(5),
+            ]
+            .into(),
+        );
         let r = rng.dispatch_op("random_shuffle", &[input]).unwrap();
         if let Value::List(out) = r {
             assert_eq!(out.len(), 5);

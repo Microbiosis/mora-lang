@@ -39,9 +39,33 @@ impl Interpreter {
                             return Err(format!("plan.create: steps[{}].text must be a string", i));
                         }
                     };
+                    // v0.104.6 D343：此前是
+                    //   `StepStatus::parse(s).unwrap_or(StepStatus::Pending)`
+                    // ⇒ **非法 status 静默变成 pending**，exit 0、零诊断。实测：
+                    //   plan.create("p1", [{id:"s1",text:"t1",status:"done"},
+                    //                          {id:"s2",text:"t2",status:"BOGUS"}])
+                    //   → s1 = done ✅，s2 = **pending ⬜**（拼写错误被吞掉）
+                    //
+                    // **同一模块内两种策略并存**：`plan.update`（下面第 87 行）对
+                    // 同样的非法值用 `.ok_or_else(...)` **明确报错**。
+                    // `StepStatus::parse` 返回 `Option` 就是在说「可能不合法」，
+                    // 调用方把这个信息丢掉是**漏写**，不是设计。
+                    //
+                    // 危害：`create` 出来的计划里，某一步**看起来是待办**，
+                    // 于是依赖 `done` 的下游逻辑（完成度统计 / 收尾检查）漏掉它，
+                    // 而用户完全不知道自己拼错了状态名。
                     let status = match d.get("status") {
-                        Some(Value::String(s)) => crate::plan::StepStatus::parse(s)
-                            .unwrap_or(crate::plan::StepStatus::Pending),
+                        Some(Value::String(s)) => {
+                            crate::plan::StepStatus::parse(s).ok_or_else(|| {
+                                format!(
+                                    "plan.create: steps[{}].status invalid '{}' \
+                                     (expected one of: pending/todo/⬜, \
+                                     in_progress/in-progress/doing/🔄, \
+                                     done/completed/finish/✅)",
+                                    i, s
+                                )
+                            })?
+                        }
                         _ => crate::plan::StepStatus::Pending,
                     };
                     plan.add_step(crate::plan::PlanStep::new(id, text).with_status(status))
@@ -130,9 +154,18 @@ impl Interpreter {
                 Ok(Value::Bool(removed.is_some()))
             }
             "list" => {
-                if let Some(Value::String(name)) = args.first() {
+                // v0.104.6 D152：此前写成
+                //   `if let Some(Value::String(name)) = args.first() { 查该计划 } else { 列所有计划名 }`
+                // 而这里的 `else` **不是默认值、是另一个操作** —— 于是传错类型的 name
+                // （`plan.list(5)` / `plan.list(["alpha"])`）会静默返回**所有计划名**，
+                // exit 0、零诊断。用户要某计划的步骤，拿到的是另一件事，
+                // 下游 `filter` / 下标随之给出错误结果却无任何报错。
+                //
+                // 同文件的 `create` / `update` 对每个字段都有精确类型报错
+                // （`steps[{}].id must be a string` 等）—— 即「同族里有人做对了」。
+                if let Some(name) = optional_str_arg(args, 0, "plan.list", "plan name")? {
                     let plan = plans
-                        .get(name)
+                        .get(&name)
                         .ok_or_else(|| format!("plan.list: plan '{}' not found", name))?;
                     let items: Vec<Value> = plan
                         .steps()
@@ -152,7 +185,7 @@ impl Interpreter {
                             Value::Dict(d)
                         })
                         .collect();
-                    Ok(Value::List(items))
+                    Ok(Value::List(items.into()))
                 } else {
                     let mut names: Vec<String> = plans.keys().cloned().collect();
                     names.sort();

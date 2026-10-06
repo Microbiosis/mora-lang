@@ -75,10 +75,39 @@ pub fn greedy_search(
         let mut rewrite_memo: HashMap<(usize, String), Vec<MirInst>> = HashMap::new();
 
         // 扫描所有 (pc, rule) 对
+        //
+        // v0.104.6 D32：`last_return_pc` **每轮算一次**。body 在一整轮扫描内
+        // 不变（只在轮末整体替换），故这与「每条指令算一次」逐字等价 ——
+        // 但避免了通配 pattern 规则对每条指令都 O(n) 重扫 body。
+        let __last_return_pc = current
+            .iter()
+            .rposition(|i| matches!(i, MirInst::Return(_)));
         for (pc, inst) in current.iter().enumerate() {
+            // v0.104.6 D32：`format!("{:?}", inst)` 从内层规则循环**外提**
+            // （且惰性 —— 只在确有规则命中时才格式化）。
+            //
+            // `MirInst` 因含递归的 `Value` 字段未实现 `Hash`/`Eq`，memo 的键
+            // 只能用 Debug 字符串。旧写法把这次格式化放在内层，于是
+            // **每条指令 × 每条规则**各格式化一次，而 `Debug` 对 `MirInst`
+            // 是深层递归的、每次还要分配一个 String。控制流密集的程序
+            // （嵌套 if：body 上千条指令）在外层循环（最多 50 轮）里反复重扫，
+            // 量级是「指令数 × 规则数 × 轮数」次格式化。
+            //
+            // **纯循环不变量外提**：`inst` 在内层循环里不变，键的内容完全
+            // 相同，memo 命中行为逐字不变，只把格式化次数从
+            // 「指令 × 规则」降到「指令」（且无规则命中的指令一次都不做）。
+            let mut inst_debug: Option<String> = None;
             for (rule_idx, rule) in rules.iter().enumerate() {
+                if !rule.precheck(pc, __last_return_pc) {
+                    continue;
+                }
                 if let Some(bindings) = rule.pattern().matches(inst) {
-                    let memo_key = (rule_idx, format!("{:?}", inst));
+                    let memo_key = (
+                        rule_idx,
+                        inst_debug
+                            .get_or_insert_with(|| format!("{inst:?}"))
+                            .clone(),
+                    );
                     let new_insts = match rewrite_memo.get(&memo_key) {
                         Some(cached) => cached.clone(),
                         None => {

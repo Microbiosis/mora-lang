@@ -1,0 +1,40 @@
+-- e2e：sandbox capability 令牌的**逐令牌撤销**语义（v0.104.6 D388）
+--
+-- 本文件由 `tests/sandbox_capability_generation.rs` 驱动，
+-- 逐条断言 stdout 逐行匹配。
+--
+-- 为什么必须走真实 CLI：库内测试用 `run_mir`，**绕过 typeck**；
+-- 而 `mora run` 会在 main.rs 跑 `check_program_witnesses_bidirectional`，
+-- 出错就 `process::exit(2)`。`sandbox.key` 是否登记在 typeck 的
+-- `SANDBOX_METHODS` 表里，只有真实 CLI 才暴露得出来。
+
+-- ── ① 单令牌：撤销后失效 ──────────────────────────────────────────
+let t = sandbox.key("file.read")
+print("key_ok=" + str(t))
+print("before=" + str(sandbox.check_call(t, "file.read")))
+sandbox.revoke(t)
+print("after=" + str(sandbox.check_call(t, "file.read")))
+
+-- ── ② 双令牌：撤销 a **不得**波及 b ───────────────────────────────
+-- 这是本文件的核心。`revoke` 会 bump 全局 `current_generation`，
+-- 若 `check` 真按注释所说校验 `token.generation`，
+-- 那么同代签发的 b 会被连坐成 false。
+-- 实际语义是 per-token 撤销（`revoked` 集合）⇒ b 仍是 true。
+let a = sandbox.key("file.read")
+let b = sandbox.key("file.write")
+print("a_before=" + str(sandbox.check_call(a, "file.read")))
+print("b_before=" + str(sandbox.check_call(b, "file.write")))
+sandbox.revoke(a)
+print("a_after=" + str(sandbox.check_call(a, "file.read")))
+print("b_after=" + str(sandbox.check_call(b, "file.write")))
+
+-- ── ③ 撤销后再签发的新令牌不受影响 ────────────────────────────────
+let c = sandbox.key("file.read")
+print("c_after_revokes=" + str(sandbox.check_call(c, "file.read")))
+
+-- ── ④ 越权：令牌**不含**该 capability ⇒ false（合法名，返回值表达）──
+-- ⚠ 合法名 + 未授权 = `false`；**非法名** = 抛错并终止脚本，
+-- 后者由 `sandbox_bad_capability.mora` 单独钉。
+let d = sandbox.key("file.read")
+print("d_web=" + str(sandbox.check_call(d, "web.fetch")))
+print("count=" + str(sandbox.token_count()))

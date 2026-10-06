@@ -17,6 +17,17 @@ use num_traits::Signed;
 //
 // 设计：复用 math.* builtin 同一底层函数，避免双实现。
 // `math.abs(x)` / `x.abs()` 走 `call_math_method("abs", &[x])`，结果一致。
+//
+// v0.104.6：上面那句「结果一致」此前是**未经实测的断言**。现已逐条验证
+// （`tests/builtin_gaps.rs::numeric_method_and_math_module_agree`）：
+// 8 个方法 × 正负输入，两种写法逐值相同，包括 `floor/ceil/round/trunc`
+// 在负数上的分歧点（如 `(-2.5).floor() = -3.0` 而 `math.floor(-2.5) = -3.0`，
+// 两边同样取 floor 而非截断）以及 `sqrt(-2.5)` 两边都返 `NaN` 而非报错。
+//
+// 顺带记一个**容易误判成缺陷**的坑：`-2.5.abs()` 解析为 `-(2.5.abs())`
+// = `-2.5`，而 `math.abs(-2.5)` = `2.5`。这是标准数学优先级（类比 `-x^2`
+// 是 `-(x^2)`），不是两种写法不一致 —— 要对负数取方法得写 `(-2.5).abs()`。
+// 判别方法：`0 - 2.5.abs()` 同样得 `-2.5`，说明是「方法调用先算、再取负」。
 pub(super) fn call_method_numeric(
     recv: &Value,
     method: &str,
@@ -120,15 +131,24 @@ pub(super) fn text_to_string(v: &Value) -> String {
     }
 }
 
-/// 解析 budget 值 (dispatch 层副本,与 execute.rs 同语义)
+/// 解析 budget 值。
+///
+/// v0.104.6 D263：此前只匹配 `Value::Float`。而 dict 值有两个来源 ——
+/// 字面量给 `Float`（D98）、`json.parse` / `len()` 给 `Int`（D129）——
+/// 于是 `json.parse` 读进来的 `{"budget": 1000}` 落到 `other` 分支被拒。
+/// 与 D262 的 `crush_json` **同型**。
+///
+/// 同时把 `{:?}` 换成类型名（D262 同款问题：`Value::Dict` 的 `Debug` 按
+/// HashMap 迭代序打印，跨进程键序不同）。
+///
+/// ⚠ 原注释写「与 execute.rs 同语义」—— 那份副本**已不存在**（全仓仅此
+/// 一处），注释本身已过时。
 pub(super) fn parse_budget_dispatch(v: Value, ctx: &str) -> Result<usize, String> {
     match v {
-        Value::Float(n) => {
-            if n < 0.0 {
-                return Err(format!("{}: budget must be non-negative", ctx));
-            }
-            Ok(n as usize)
-        }
+        Value::Int(n) if n < 0 => Err(format!("{}: budget must be non-negative", ctx)),
+        Value::Float(n) if n < 0.0 => Err(format!("{}: budget must be non-negative", ctx)),
+        Value::Int(n) => Ok(n as usize),
+        Value::Float(n) => Ok(n as usize),
         Value::String(s) => {
             let s = s.trim();
             if s.is_empty() {
@@ -159,8 +179,9 @@ pub(super) fn parse_budget_dispatch(v: Value, ctx: &str) -> Result<usize, String
             Ok((num * mult as f64) as usize)
         }
         other => Err(format!(
-            "{}: budget must be string or number, got {:?}",
-            ctx, other
+            "{}: budget must be string or number, got {}",
+            ctx,
+            crate::flow::type_name(&other)
         )),
     }
 }

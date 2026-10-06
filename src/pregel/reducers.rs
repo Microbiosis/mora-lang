@@ -83,18 +83,16 @@ pub fn parse_custom_merge_expr(s: &str) -> crate::mir::witness::MirWitness {
 
 // ─── Node input serialization ────────────────────────────────────────
 
-/// v0.57: Serialize a `Value` to a JSON string fragment (for `build_node_input`).
-pub fn value_to_json_string(v: &Value) -> String {
-    match v {
-        Value::String(s) => format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\"")),
-        Value::Int(n) => format!("{}", n),
-        Value::Float(n) => format!("{}", n),
-        Value::Bool(b) => format!("{}", b),
-        Value::Nil => "null".to_string(),
-        Value::List(items) => {
-            let parts: Vec<String> = items.iter().map(value_to_json_string).collect();
-            format!("[{}]", parts.join(","))
-        }
-        _ => format!("\"{}\"", v),
-    }
-}
+// v0.104.6 D235：此处原有的 `pub fn value_to_json_string` 已**删除**。
+//
+// 它是 `pregel/mod.rs` 里同名函数的**重复实现**（D209 已记录「改一处须
+// 同步另一处」的维护陷阱），且有两个 D235 缺陷：
+//   ① 没有 `Dict` 分支 ⇒ dict 落到 `_ => format!("\"{}\"", v)`，
+//      经 `Value::Display` 得 `{k: v}` —— **key 无引号，不是 JSON**；
+//   ② `Float(42.0)` 输出 `42` ⇒ 往返变 `Int`（D84/D99 要求 Float
+//      必带小数点，类型降级不可逆）。
+//
+// `build_node_input` 现直接构造 `Value::Dict` 交给 `flow::value_to_json`
+// —— 仓内**唯一**的序列化实现。本函数失去全部调用者；
+// 保留一个已被证明错误、又无人调用的 `pub` 重复实现，只会诱使后来者
+// 直接用它。

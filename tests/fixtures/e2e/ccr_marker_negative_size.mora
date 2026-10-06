@@ -1,0 +1,30 @@
+-- e2e：`ccr.marker` 的 **size 负数饱和成 0**（D339 明确记录的「不修、只钉现状」决定）
+-- （v0.104.6 D404 补齐覆盖矩阵）
+--
+-- ⚠ 本轮我**一度**把它改成「负数报错」，随后**回退** ——
+--   `tests/tea_max_steps_guard.rs` 里 D339 的判据专门钉着旧行为，
+--   其 doc 写明「改它属**产品契约决定**」。
+--   ⇒ 钉住有意决策的判据**本身就是**「该决定有意」的证据。
+--
+-- 本文件把覆盖从「1 条（两种类型都变 0）」补到完整矩阵：
+--   正数 / 显式 0 / 缺省 / nil / 小数截断 / Float 负数 / Int 负数。
+--
+-- 当前**不终止**（exit 0），所以最后一行 `unreachable` 会被打印 ——
+--   这正是「钉住无错误路径」的判据。
+--
+-- Run: cargo run -- tests/fixtures/e2e/ccr_marker_negative_size.mora
+
+let h = ccr.put("hello")
+
+print("pos=" + str(ccr.marker(h, 8)))
+print("zero=" + str(ccr.marker(h, 0)))
+print("absent=" + str(ccr.marker(h)))
+print("nil=" + str(ccr.marker(h, nil)))
+-- 既有约定：小数向零截断（value_as_usize 的文档化行为）
+print("frac=" + str(ccr.marker(h, 2.9)))
+-- 负数：Float 负数饱和成 0（D339 决定）
+-- ⚠ `Int` 负数**脚本不可达**（字面量是 Float，`len()` 只会给非负 Int），
+--   那一路在 `tests/ccr_marker_size_guard.rs` 的库级判据里覆盖。
+print("neg=" + str(ccr.marker(h, -1)))
+
+print("unreachable")

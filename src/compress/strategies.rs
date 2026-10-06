@@ -36,14 +36,12 @@ impl Strategy for TopNStrategy {
             .enumerate()
             .map(|(i, it)| {
                 let s = if let Value::Dict(d) = it {
+                    // v0.104.6 D231：数值提取统一走 `super::json::value_as_f64`。
+                    // 修前只认 `Float` ⇒ `json.parse` 读入的整数 score
+                    // **全部退化成 `0.0`**，`scored` 变成全等分，
+                    // 排序退化为「稳定保序」—— 即 TopN **根本没在按分数排**。
                     d.get(&score_field)
-                        .and_then(|v| {
-                            if let Value::Float(n) = v {
-                                Some(*n)
-                            } else {
-                                None
-                            }
-                        })
+                        .and_then(super::json::value_as_f64)
                         .unwrap_or(0.0)
                 } else {
                     0.0
@@ -51,7 +49,10 @@ impl Strategy for TopNStrategy {
                 (i, s)
             })
             .collect();
-        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        // v0.104.6 D242：`total_cmp`（IEEE 754 全序）而非
+        // `partial_cmp(...).unwrap_or(Equal)` —— 后者遇 NaN score 时
+        // 违反传递性，「取分数最高的 N 个」会依赖输入顺序（D241 同款）。
+        scored.sort_by(|a, b| b.1.total_cmp(&a.1));
         let mut keep: Vec<usize> = scored.iter().take(target).map(|(i, _)| *i).collect();
         apply_all(&mut keep, items, fields, constraints);
         finalize(keep, target)

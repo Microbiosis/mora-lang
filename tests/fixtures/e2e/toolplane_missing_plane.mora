@@ -1,0 +1,25 @@
+-- e2e：`toolplane.*`（注册名是 **`tool`**）对**不存在的 plane** 的三种错误风格
+-- （v0.104.6 D403）
+--
+-- ⚠ 注意本文件**故意**让脚本以非零退出：`list_tools` 对缺失 plane 抛 Err，
+--  Mora 无 try/catch ⇒ 脚本终止。所以**排在最后**。
+--
+-- 现状（D403 记录的产品语义分歧，本轮**不改**，只钉住）：
+--   info  / 缺失 plane → nil      （当「没结果」，静默）
+--   find  / 缺失 plane → nil      （当「没结果」，静默）
+--   list_tools / 缺失 plane → Err （当「出错」，脚本终止）
+--
+-- 各自与 typeck 声明一致（info/find 是 Union[..., Nil]，list_tools 是裸 List）。
+--
+-- Run: cargo run -- tests/fixtures/e2e/toolplane_missing_plane.mora
+
+-- 注册名是 `tool`（不是 `toolplane`，后者是未绑定变量）
+print("list=" + str(tool.list()))
+print("created=" + str(tool.create("mine", "extension")))
+print("info_ok=" + str(tool.info("mine")))
+print("info_missing=" + str(tool.info("nope")))
+print("find_missing=" + str(tool.find("nope", "x")))
+
+-- 最后一条：抛 Err ⇒ 脚本在此终止
+print("list_tools_missing=" + str(tool.list_tools("nope")))
+print("unreachable")

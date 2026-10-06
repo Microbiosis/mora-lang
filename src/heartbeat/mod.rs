@@ -6,10 +6,27 @@
 //! - mimiclaw 把 md 文件作为可执行 agent 行为源
 //!
 //! v0.47.0 Mora adaptation:
-//! - `HeartbeatChecklist` 解析 markdown 清单 (- [ ] / - [x])
+//! - `HeartbeatChecklist` 解析 markdown 清单 (\- \[ \] / - \[x\])
 //! - `HeartbeatReport` 返回 done/pending counts + items list
-//! - builtin `heartbeat.check(path?)` -> Dict (报告) 或触发真实 action
 //! - 真实**读取文件** (REAL file I/O, not metadata)
+//!
+//! ⚠ v0.104.6 D402 更正：下面这行原本写着
+//! `builtin heartbeat.check(path?) -> Dict (报告) 或触发真实 action`，
+//! **两处都不成立**：
+//! - **没有** `heartbeat` 这个 builtin 模块。实测 `heartbeat.check("...")`
+//!   → `Type error: Unbound variable 'heartbeat'`。
+//!   实际名字是 **`ai.heartbeat(path?)`**（`builtins/ai.rs` 的 `call_ai_method`）。
+//! - 那个 `ai.heartbeat` 目前**源码不可达**（D59
+//!   `tests/ai_namespace_reachability.rs`）—— `ai` 裸名 → `BuiltinKind::AiChat`，
+//!   而 `call_ai_method` 挂在 `(BuiltinKind::Ai, _)` 上。
+//!   `builtins/tests/heartbeat.rs` 里的测试**直接调 `call_ai_method`**，
+//!   绕过了名字解析 ⇒ 测的是一个源码到不了的实现。
+//!
+//! ⚠ **给「将来接线」的人拆雷**：`load_heartbeat` / `ai.heartbeat` 接收
+//! **调用方给的任意路径**且**不走 `sandbox.check_path`** —— 而所有
+//! `file.*` 带路径入口都走了（D334 / D389 逐一补齐）。
+//! ⇒ 一旦接线，就等于开了一个**绕过沙箱的文件读**口子。
+//! 接线时**必须**补 `check_path`。
 
 use std::path::{Path, PathBuf};
 

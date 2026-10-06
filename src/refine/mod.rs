@@ -98,7 +98,7 @@ impl RefineSession {
     /// 执行一次 refine 迭代 (REAL file I/O)
     /// 1. 读原 script
     /// 2. 创建 refine_dir (REAL create_dir_all)
-    /// 3. 写 .refine/<stem>.refined.<n>.mora (REAL write)
+    /// 3. 写 .refine/`<stem>`.refined.`<n>`.mora (REAL write)
     /// 4. 计算 diff (line counts: original vs refined)
     /// 5. 追加 step 到 session
     ///
@@ -113,7 +113,7 @@ impl RefineSession {
     }
 
     /// v0.75.8: 多候选生成 — 对同一 instruction 生成 N 个独立候选副本
-    /// （<stem>.refined.<n>.<a|b|c...>），每个带各自的指令头，均记录为
+    /// （`<stem>`.refined.`<n>`.<a|b|c...>），每个带各自的指令头，均记录为
     /// 同一次迭代的候选（iteration 相同）。返回各候选的 RefineStep。
     ///
     /// `count` 校验：1..=26（候选后缀 a..z）。`refine()` 等价于
@@ -158,12 +158,19 @@ impl RefineSession {
             let refined_path = self.refine_dir.join(&refined_filename);
 
             // 真实写副本 (含 instruction 注释行)
+            //
+            // v0.104.6 D398：此前写的是 `# --- INSTRUCTION ...`，
+            // 而 **Mora 的行注释是 `--`，`#` 不是合法记号** ⇒
+            // 产出的 `.refined.<n>.mora` **根本无法运行**（实测
+            // `Unexpected character '#' at line 1, column 1`，exit 2）。
+            // 本模块 doc 第 12 行本来就写的是「`-- INSTRUCTION: <text>`」——
+            // **代码与自己的 doc 矛盾**，且 `#` 版不是任何取舍，是笔误。
             let instruction_header = if count == 1 {
-                format!("# --- INSTRUCTION (refine iter {}): {}", n, instruction)
+                format!("-- --- INSTRUCTION (refine iter {}): {}", n, instruction)
             } else {
                 let suffix = (b'a' + i as u8) as char;
                 format!(
-                    "# --- INSTRUCTION (refine iter {} candidate {}): {}",
+                    "-- --- INSTRUCTION (refine iter {} candidate {}): {}",
                     n, suffix, instruction
                 )
             };
@@ -268,8 +275,15 @@ mod tests {
         assert!(step.refined_path.exists());
 
         // 验证副本内容包含 instruction 注释行
+        //
+        // v0.104.6 D398：断言同步改为 `--`（Mora 的行注释记号）。
+        // 首版把 `# ---` 钉住了 —— **测试把 bug 形态固化**了，
+        // 于是「产出的副本能否运行」这件事从未被验证。
         let content = std::fs::read_to_string(&step.refined_path).unwrap();
-        assert!(content.contains("# --- INSTRUCTION (refine iter 1): add greeting"));
+        assert!(
+            content.contains("-- --- INSTRUCTION (refine iter 1): add greeting"),
+            "instruction 注释行应用 Mora 的行注释记号 `--`"
+        );
         assert!(content.contains("task main()"));
         assert!(content.contains("print(\"hi\")"));
 

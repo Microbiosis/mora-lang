@@ -18,6 +18,46 @@ use crate::compress::CompressOptions;
 use crate::flow::{json_to_value, value_to_json};
 use crate::value::Value;
 
+// ──────────────────── 数值提取（唯一收口点） ────────────────────
+
+/// v0.104.6 D231：`Value` → `f64` 的**唯一**提取点，`Int` 与 `Float` 都接受。
+///
+/// 修前全仓有 **5 处**各自手写 `if let Value::Float(n) = v`（`detect.rs` ×3、
+/// `strategies.rs` ×1、`constraints.rs` ×1），**全部**只认 `Float`。而本仓
+/// 数字有两个来源：dict 字面量给 `Float`（D98），`json.parse` 给 `Int`（D129）。
+///
+/// 后果实测（`json.parse` 读入的整数列，`crush_json` 观察）：
+///
+/// | 语料 | `is_numeric` | `array_type` | 选出策略 |
+/// |---|---|---|---|
+/// | `[{"id":1},…,{"id":12}]` | **false** | `Uniform` | `lossless`（几乎不压缩） |
+/// | `[{"id":1.0},…]`（对照） | true | `TopScores` | `topn` |
+/// | 混排 `[{"n":1},{"n":2.5},…]` | **false** | `Uniform` | `lossless` |
+/// | `v` 列含 1000 outlier（Int） | **false** | — | **outlier 保护静默失效** |
+///
+/// 即：`json.parse` 读进来的整数列**完全不被识别为数值** —— 字段角色推断
+/// （Id 角色检测不到）、`numeric_range`（`None`）、outlier 保护、策略选择
+/// 全部失准，且**零诊断**。
+///
+/// 「同一事实两套算法 ⇒ 合并」：三处各自的 `if let Value::Float` 收敛到此处，
+/// 新增数值提取**必须**走它，否则同样违约。
+///
+/// v0.104.6 D246：实现已**上移**到 `flow::value_as_f64`。D231 立此规矩时它
+/// 住在 `compress` 里，**`interpreter` 够不着** —— 于是
+/// `ai_helpers::extract_usage` 直接手写 `if let Value::Float(n)`，把真实
+/// API 响应的**整数** token 数全记成 0，导致整套 token 预算机制失效且零症状。
+///
+/// ⇒ 收口的**位置**和收口本身一样重要：放在只有一部分调用方能到达的地方，
+/// 等于没有收口。此函数保留为转发层，路径不变。
+pub fn value_as_f64(v: &Value) -> Option<f64> {
+    crate::flow::value_as_f64(v)
+}
+
+/// 同 [`value_as_f64`]，但把 `Value` 切片批量转成 `f64`（丢弃非数值项）。
+pub fn values_as_f64<'a>(values: impl Iterator<Item = &'a Value>) -> Vec<f64> {
+    values.filter_map(value_as_f64).collect()
+}
+
 // ──────────────────── 字段角色 ────────────────────
 
 /// 字段语义角色（按值分布推断，与字段名无关）
@@ -443,9 +483,22 @@ pub fn compact_value_recursive(value: &Value, min_items: usize) -> (Value, usize
                         }
                     }
                     Value::Dict(d) => {
-                        // 收集 keys 按反序, 保证原序处理
+                        // 收集 keys 按反序, 保证正序处理。
+                        //
+                        // v0.104.6 可复现性修复：**先按 key 排序再反转**。
+                        // `Value::Dict` 是 `HashMap`，其迭代序每进程随机 ——
+                        // 而这里是**决定压缩决策的顺序**（哪个子节点先被处理、
+                        // 哪些字节先被丢弃、`total` 怎么累加），不是展示顺序。
+                        // 原来的 `entries.reverse()` 只对 `List` 有意义
+                        // （List 有确定的原序），对 Dict 而言「原序」并不存在，
+                        // 于是 `crush_json` 压字典树的结果**每次运行都不同**。
+                        //
+                        // 必须与下方 `Op::Exit` 分支的 key 顺序**一致** ——
+                        // 那里靠 `keys.pop()` 与 LIFO 的 results 栈配对，
+                        // 顺序不一致会把子节点结果配到错误的 key 上。
                         let mut entries: Vec<(String, Value)> =
                             d.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+                        entries.sort_by(|a, b| a.0.cmp(&b.0));
                         entries.reverse();
                         for (_, val) in entries {
                             stack.push((val, Op::Enter));
@@ -470,15 +523,15 @@ pub fn compact_value_recursive(value: &Value, min_items: usize) -> (Value, usize
                         }
                         new_items.reverse();
                         if items.len() >= min_items {
-                            let fields = extract_field_stats(items);
-                            if let Some(crushed) = try_lossless_compact(items, &fields)
+                            let fields = extract_field_stats(&items.to_vec());
+                            if let Some(crushed) = try_lossless_compact(&items.to_vec(), &fields)
                                 && let Some(first) = crushed.items.into_iter().next()
                             {
                                 results.push((first, total + 1));
                                 continue;
                             }
                         }
-                        results.push((Value::List(new_items), total));
+                        results.push((Value::List(new_items.into()), total));
                     }
                     Value::Dict(d) => {
                         let n_kids = d.len();
@@ -486,6 +539,9 @@ pub fn compact_value_recursive(value: &Value, min_items: usize) -> (Value, usize
                             std::collections::HashMap::with_capacity(n_kids);
                         let mut total = 0;
                         let mut keys: Vec<String> = d.keys().cloned().collect();
+                        // v0.104.6：与上方 `Op::Enter` 分支**同序**（按 key 排序）。
+                        // 两处必须一致，否则 LIFO 的 results 栈会与 key 错配。
+                        keys.sort();
                         for _ in 0..n_kids {
                             if let Some((nv, n)) = results.pop() {
                                 // 配对: 倒序弹出 key
@@ -530,7 +586,7 @@ pub fn crush_json_string(
             ));
         }
     };
-    Ok(crush_json(&items, target, options))
+    Ok(crush_json(&items.to_vec(), target, options))
 }
 
 /// JSON 视角类型名（错误消息用）。复用 flow::type_name（String→string /
@@ -562,6 +618,11 @@ impl crate::compress::SubCompressor for JsonSubCompressor {
         }
     }
 
+    /// 压缩: SmartCrusher 选若干项，序列化后经收口函数保证字节上限。
+    ///
+    /// v0.104.6 D227：预算此前是 `max_bytes / 200` —— **每项 200 字节**同样
+    /// 是无根据的假设。实测每项 ~68 字节时，max_bytes=16 算出 target=1，
+    /// 输出 148 字节（超限 8.25 倍）。现在改为「按真实序列化长度收敛」。
     fn compress(
         &self,
         content: &str,
@@ -578,13 +639,32 @@ impl crate::compress::SubCompressor for JsonSubCompressor {
                 ));
             }
         };
-        // 由 max_bytes 推 target: 假设每项 200 bytes (与 v0.29 一致)
-        let target = (max_bytes / 200).max(1);
-        let result = crush_json(&items, target, options);
-        let json = value_to_json(&Value::List(result.items.clone()));
-        Ok(format!(
-            "{}\n<compressed:method=smart_crusher strategy={} items={} total={} savings={:.2}>",
-            json, result.strategy_used, result.items_kept, result.items_total, result.savings_ratio
+        // v0.104.6 D227：不再用「每项 200 字节」的猜测，而是**逐次收缩**
+        // target 直到序列化结果装得下。先用估算值起步，收口函数兜底。
+        // 预留量按 marker 的**保守**长度算（计数位数不定），不是拍常数。
+        const MARKER_RESERVE: usize = 96;
+        let mut target = ((max_bytes / 200).max(1)).min(items.len().max(1));
+        let mut result = crush_json(&items.to_vec(), target, options);
+        // 收缩循环：每次把 target 减半（至少 1），最多 12 轮。
+        // 轮数上限保证不会死循环；兜底由 finish_within_budget 负责。
+        for _ in 0..12 {
+            let json = value_to_json(&Value::List(result.items.clone().into()));
+            if json.len() + MARKER_RESERVE <= max_bytes {
+                break;
+            }
+            if target <= 1 {
+                break;
+            }
+            target = (target / 2).max(1);
+            result = crush_json(&items.to_vec(), target, options);
+        }
+        let json = value_to_json(&Value::List(result.items.clone().into()));
+        let marker = format!(
+            "\n<compressed:method=smart_crusher strategy={} items={} total={} savings={:.2}>",
+            result.strategy_used, result.items_kept, result.items_total, result.savings_ratio
+        );
+        Ok(crate::compress::finish_within_budget(
+            content, json, &marker, max_bytes,
         ))
     }
 
@@ -601,6 +681,47 @@ mod tests {
 
     fn make_items<F: Fn(usize) -> HashMap<String, Value>>(n: usize, f: F) -> Vec<Value> {
         (0..n).map(|i| Value::Dict(f(i))).collect()
+    }
+
+    // ── v0.104.6 D231：数值提取的 Int 侧 ──
+
+    /// v0.104.6 D231：`is_sequential_numeric` 必须识别**整数**序列。
+    ///
+    /// 首轮牙齿验证里这一处的回退**没让任何判据变红**（NO TEETH）——
+    /// 集成判据 `d231_sequential_int_column_gets_id_role` 走的是
+    /// `extract_field_stats` 整条链，而 `detect_id` 的 `or_else` 链里
+    /// `detect_score` **排在它前面**：`seq: 1..8` 落在 `[0,100]` 被判为
+    /// `Score`，`is_sequential_numeric` 压根不会被调用 ⇒ 判据测不到它。
+    ///
+    /// 改用直接调用 `is_sequential_numeric`（私有函数，只能在模块内测），
+    /// 语料避开 `[0,100]`。
+    #[test]
+    fn d231_is_sequential_numeric_accepts_int_sequence() {
+        let ints: Vec<Value> = (1000..1008).map(Value::Int).collect();
+        let int_refs: Vec<&Value> = ints.iter().collect();
+        assert!(
+            super::super::detect::detect_field_role("seq", &int_refs).role == FieldRole::Id,
+            "D231: 顺序整数列应拿到 Id 角色（value_as_f64 的 Int 侧）"
+        );
+
+        let floats: Vec<Value> = (1000..1008).map(|i| Value::Float(i as f64)).collect();
+        let float_refs: Vec<&Value> = floats.iter().collect();
+        assert_eq!(
+            super::super::detect::detect_field_role("seq", &int_refs).role,
+            super::super::detect::detect_field_role("seq", &float_refs).role,
+            "D231: 顺序整数列与顺序浮点列应得到相同角色"
+        );
+    }
+
+    /// v0.104.6 D231：`value_as_f64` 的边界。
+    #[test]
+    fn d231_value_as_f64_boundaries() {
+        assert_eq!(value_as_f64(&Value::Int(7)), Some(7.0));
+        assert_eq!(value_as_f64(&Value::Float(7.5)), Some(7.5));
+        assert_eq!(value_as_f64(&Value::Int(-3)), Some(-3.0));
+        assert_eq!(value_as_f64(&Value::String("7".into())), None);
+        assert_eq!(value_as_f64(&Value::Bool(true)), None);
+        assert_eq!(value_as_f64(&Value::Nil), None);
     }
 
     // ── 字段角色测试 ──
@@ -882,7 +1003,7 @@ mod tests {
                 }
                 let mut outer = std::collections::HashMap::new();
                 outer.insert("name".into(), Value::String(format!("g{}", i)));
-                outer.insert("items".into(), Value::List(inner));
+                outer.insert("items".into(), Value::List(inner.into()));
                 Value::Dict(outer)
             })
             .collect();
@@ -904,20 +1025,23 @@ mod tests {
     #[test]
     fn compact_value_recursive_simple() {
         // 直接测试 walker
-        let v = Value::List(vec![
-            Value::Dict({
-                let mut d = std::collections::HashMap::new();
-                d.insert("id".into(), Value::Float(1.0));
-                d.insert("name".into(), Value::String("a".into()));
-                d
-            }),
-            Value::Dict({
-                let mut d = std::collections::HashMap::new();
-                d.insert("id".into(), Value::Float(2.0));
-                d.insert("name".into(), Value::String("b".into()));
-                d
-            }),
-        ]);
+        let v = Value::List(
+            vec![
+                Value::Dict({
+                    let mut d = std::collections::HashMap::new();
+                    d.insert("id".into(), Value::Float(1.0));
+                    d.insert("name".into(), Value::String("a".into()));
+                    d
+                }),
+                Value::Dict({
+                    let mut d = std::collections::HashMap::new();
+                    d.insert("id".into(), Value::Float(2.0));
+                    d.insert("name".into(), Value::String("b".into()));
+                    d
+                }),
+            ]
+            .into(),
+        );
         let (new_v, n) = compact_value_recursive(&v, 5);
         // 单层 compact: 因 min_items=5 但 v.len()=2, 不 compact
         assert_eq!(n, 0);

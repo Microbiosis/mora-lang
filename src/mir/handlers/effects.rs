@@ -22,10 +22,15 @@ pub fn h_define(
     src: Reg,
 ) {
     // v0.83: 录制 StateMutation（前值为 Nil（新变量），后值为 regs[src]）
+    //
+    // v0.104.6 性能修复：同 h_assign —— 未录制时那次 `new_val.clone()`
+    // 无人消费，直接把所有权交给 `define`。
     let new_val = regs[src].clone();
-    env.define(name.to_string(), new_val.clone(), false);
     if let Some(rec) = interp.recorder_mut() {
+        env.define(name.to_string(), new_val.clone(), false);
         rec.record_state_mutation(name.to_string(), Value::Nil, new_val);
+    } else {
+        env.define(name.to_string(), new_val, false);
     }
 }
 
@@ -37,11 +42,20 @@ pub fn h_assign(
     src: Reg,
 ) {
     // v0.83: 录制 StateMutation（前值 = env 当前值，后值 = regs[src]）
-    let old_val = env.get(name).unwrap_or(Value::Nil);
+    //
+    // v0.104.6 性能修复：原实现**无条件**执行 `env.get(name)` 取旧值 + 两次
+    // `Value::clone()`，而 `old_val` 与为保留 `new_val` 而做的那次克隆
+    // **只被录制器消费**。未录制时（正常执行路径）三者全是纯浪费：assign 是
+    // 循环体最热指令，每迭代都要付。改为先取录制器，再决定是否采集诊断值。
+    //
+    // 录制分支保持原顺序（先读旧值、再写入）—— 旧值必须反映赋值前状态。
     let new_val = regs[src].clone();
-    env.assign(name, new_val.clone());
     if let Some(rec) = interp.recorder_mut() {
+        let old_val = env.get(name).unwrap_or(Value::Nil);
+        env.assign(name, new_val.clone());
         rec.record_state_mutation(name.to_string(), old_val, new_val);
+    } else {
+        env.assign(name, new_val);
     }
 }
 
@@ -106,7 +120,7 @@ pub fn h_msg_def(env: &mut Environment, name: &str, variants: &[crate::common::M
             Value::Dict(map)
         })
         .collect();
-    env.define(name.to_string(), Value::List(variant_names), false);
+    env.define(name.to_string(), Value::List(variant_names.into()), false);
 }
 
 // v0.83: TEA Update 函数定义 —— 注册到 env 为可调用的 Value::Closure。
@@ -459,7 +473,7 @@ pub fn h_solve(
     effects.absorb(host.collected);
 
     // 4. 写解列表
-    regs[dst] = Value::List(solutions);
+    regs[dst] = Value::List(solutions.into());
     Ok(())
 }
 
@@ -488,7 +502,7 @@ pub fn h_perform(
     // v0.83: 录制 Cmd 事件（perform 是 Cmd::Perform 的运行时派发）
     if let Some(rec) = interp.recorder_mut() {
         // 用 Event::Msg 暂存 perform 事件（channel = effect label）
-        rec.record_msg(effect.to_string(), Value::List(arg_vals.clone()), 0);
+        rec.record_msg(effect.to_string(), Value::List(arg_vals.clone().into()), 0);
     }
     match interp.perform_effect(effect, arg_vals, effects) {
         Some(reply) => {

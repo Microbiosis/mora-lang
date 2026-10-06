@@ -21,6 +21,25 @@ pub trait RewriteRule {
     /// 匹配模式
     fn pattern(&self) -> &MirPattern;
 
+    /// v0.104.6 D32：**廉价前置筛选** —— 在 `pattern().matches()` 之前调用。
+    ///
+    /// 返回 `false` 表示这条规则在当前 `pc` 上**确定不可能**产出改写，
+    /// 搜索器会直接跳过（不跑 pattern 匹配、不调 `rewrite_with_context`）。
+    /// 默认恒 `true`，故对既有规则**零影响**。
+    ///
+    /// 存在的理由：一条 pattern 为**通配符**的规则会对 body 里**每条**指令
+    /// 都进入 `rewrite_with_context`，而若后者内部要 O(n) 扫 body
+    /// （`DeadAfterReturnRule` 正是如此：每次都从后往前找最后一个
+    /// `Return`），则单轮代价是 O(n²) —— 实测 400 层嵌套 if（body 3200 条）
+    /// 的 `apply_rules` 独占 **6.8 s**，全部耗在这里，且 50 轮迭代上限只
+    /// 折叠了 50 个 if（共 400 个）。
+    ///
+    /// `last_return_pc` 由搜索器**每轮算一次**传入 —— body 在一整轮扫描内
+    /// 不变（只在轮末整体替换），故每轮一次与每条指令一次**完全等价**。
+    fn precheck(&self, _pc: usize, _last_return_pc: Option<usize>) -> bool {
+        true
+    }
+
     /// 重写：给定匹配的指令和绑定，返回新的指令序列
     /// - 空 Vec 表示「删除该指令」
     /// - `vec![inst]` 表示「替换为单条指令」
@@ -138,6 +157,21 @@ impl RewriteRule for DeadAfterReturnRule {
     fn pattern(&self) -> &MirPattern {
         // 通配模式 — 匹配任何指令
         &WILDCARD_PATTERN
+    }
+
+    /// v0.104.6 D32：把「pc 是否在最后一个 Return 之后」这个 O(n) 判断
+    /// **每轮前置一次**，避免对每条指令都进 `rewrite_with_context` 再
+    /// 从后往前扫全 body（单轮 O(n²)，实测 400 层嵌套 if 占 6.8 s）。
+    ///
+    /// 判据与 `rewrite_with_context` 里的原判断**逐字相同**
+    /// （`Some(ret_idx)` 时 `pc > ret_idx` 才删），只是提前到不扫 body 的位置。
+    fn precheck(&self, pc: usize, last_return_pc: Option<usize>) -> bool {
+        match last_return_pc {
+            Some(ret_idx) => pc > ret_idx,
+            // 找不到 Return 时原实现保留指令（gain 为 0，等价于不改进），
+            // 这里同样返回 false 让搜索器跳过 —— 语义一致。
+            None => false,
+        }
     }
 
     fn rewrite_with_context(

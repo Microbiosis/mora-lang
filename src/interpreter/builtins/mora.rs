@@ -18,11 +18,13 @@ impl Interpreter {
                 let instruction = args[1].to_string();
                 // v0.75.8: 可选第 3 参 count — 生成 N 个候选副本（多方案生成）。
                 // 2 参（count=1）返回单个 Dict（行为不变）；3 参返回 List[Dict]。
-                let count = if let Some(Value::Float(n)) = args.get(2) {
-                    *n as usize
-                } else {
-                    1
-                };
+                // v0.104.6 D150：此前只匹配 `Value::Float`，于是**合法的 `Int`**
+                // 被静默丢弃、count 退回 1 —— 而 count 决定**返回类型**
+                // （见下方 `if count == 1`）：传 Int 会让 `List[Dict]` 静默变成
+                // 单个 `Dict`，调用方的 `for` / 下标随之失效。
+                let count = optional_num_arg(args, 2, "mora.refine", "count")?
+                    .map(|n| n as usize)
+                    .unwrap_or(1);
                 // v0.49.0 (A2): drop lock before file I/O.
                 // get_or_create 只创建空 session (无 I/O); refine 是 I/O 在锁外
                 let steps = {
@@ -57,11 +59,11 @@ impl Interpreter {
                     return Err("mora.refine_info: requires script_path".to_string());
                 }
                 let script = std::path::PathBuf::from(args[0].to_string());
-                let iter = if let Some(Value::Float(n)) = args.get(1) {
-                    Some(*n as usize)
-                } else {
-                    None
-                };
+                // v0.104.6 D150：此前只匹配 `Value::Float`，于是**合法的 `Int`**
+                // 被静默丢弃、`iter` 变 `None` → 走 `latest_step()` 分支 ——
+                // 即「查第 1 轮」静默返回**最新一轮**（exit 0、零诊断）。
+                let iter =
+                    optional_num_arg(args, 1, "mora.refine_info", "iteration")?.map(|n| n as usize);
                 let registry = self
                     .orch
                     .refine_registry

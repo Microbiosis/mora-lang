@@ -54,19 +54,19 @@ mod tests {
     #[test]
     fn reify_unbound_vars_named_by_first_occurrence() {
         // [x, y, x] 均未绑定 → ["_.0", "_.1", "_.0"]
-        let term = Value::List(vec![
-            Value::LogicVar(9),
-            Value::LogicVar(4),
-            Value::LogicVar(9),
-        ]);
+        let term =
+            Value::List(vec![Value::LogicVar(9), Value::LogicVar(4), Value::LogicVar(9)].into());
         let out = reify(&term, &Subst::new());
         assert_eq!(
             out,
-            Value::List(vec![
-                Value::String("_.0".into()),
-                Value::String("_.1".into()),
-                Value::String("_.0".into()),
-            ])
+            Value::List(
+                vec![
+                    Value::String("_.0".into()),
+                    Value::String("_.1".into()),
+                    Value::String("_.0".into()),
+                ]
+                .into()
+            )
         );
     }
 

@@ -10,7 +10,7 @@
 //! 把 handler MirFunction + body Arc + body env + k_param 装箱。
 //! perform 时 clone 当前 env，运行 handler 拿到结果，写到 body 的 k_dst。
 //!
-//! **EffectRegistry**: 全局 handler 栈（HashMap<String, Box<dyn EffectHandler>>）。
+//! **EffectRegistry**: 全局 handler 栈（`HashMap<String, Box<dyn EffectHandler>>`）。
 //! interpreter::CoreRuntime::effect_handlers 持有，由 MirHost trait 暴露。
 //!
 //! 第一版是 single-shot（handler 末尾表达式的值自动 resume 一次），
@@ -101,7 +101,7 @@ impl EffectHandler for HandlerClosure {
 /// 3. body 执行
 /// 4. `restore_effect_handler(effect, prev)` 恢复
 ///
-/// v0.80 第一版：HashMap<effect, Vec<handler>> 栈结构。
+/// v0.80 第一版：HashMap<effect, Vec`<handler>`> 栈结构。
 /// Stage 2.x 升级到更高效的 Arena 索引。
 ///
 /// 注意：`EffectHandler` trait 不需要 Clone（handler 是 move-only）。

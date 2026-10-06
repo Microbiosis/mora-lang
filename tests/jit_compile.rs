@@ -187,19 +187,14 @@ fn jit_rejects_uncompilable() {
 
 /// 手工构造的 Int 算术（复刻解释器分裂语义：Add=i64 直接、Sub/Mul/Div=
 /// f64 round-trip）：JIT == 解释器。
+/// Int 加/减/乘：JIT 与解释器逐值一致（这三者本就精确，`numeric_op` 的
+/// `.round()` 对 i64 范围内的整数值是恒等）。
 #[test]
 fn jit_equiv_manual_int_arith() {
     for (a, op, b) in [
         (4i64, mora::common::BinaryOp::Add, 5i64),
         (10, mora::common::BinaryOp::Sub, 3),
         (4, mora::common::BinaryOp::Mul, 5),
-        (20, mora::common::BinaryOp::Div, 4),
-        (7, mora::common::BinaryOp::Div, 2), // round-trip：3.5 → round → 4
-        (1, mora::common::BinaryOp::Div, 0), // 除零：inf → 饱和 i64::MAX
-        (-1, mora::common::BinaryOp::Div, 0), // -inf → 饱和 i64::MIN
-                                             // 注：`i64::MAX + 1` 不进等价测试 —— 解释器 Add(Int) 用直接 i64
-                                             // 加法，debug 构建溢出 panic（既有行为）；JIT 用 x86 add wrap 与
-                                             // release 解释器一致。此处验证 wrap 与 release 语义（不 panic）。
     ] {
         let func = MirFunction {
             params: Vec::new(),
@@ -216,6 +211,56 @@ fn jit_equiv_manual_int_arith() {
             run_jit_of(&func).unwrap_or_else(|e| panic!("JIT failed for {a} {op:?} {b}: {e}"));
         let mir_val = run_interp(&func).expect("interp should run");
         assert_eq!(jit_val, mir_val, "JIT != interp for {a} {op:?} {b}");
+    }
+}
+
+/// v0.104.6 D19：Int 的 Div / Mod **JIT 必须编译期拒绝**（回落解释器）。
+///
+/// 此前 JIT 用 `BinopIntArith` 模板（f64 round-trip）处理整数除模，与当时的
+/// 解释器**同样错误**，所以差分测试是绿的：
+///
+/// ```text
+/// 7 / 2   JIT Int(4)  interp Int(4)   ← 一起错
+/// 1 / 0   JIT Int(i64::MAX)  interp 同  ← 一起错
+/// ```
+///
+/// 解释器修好（截断向零 + 除零报错）后两者分叉，才暴露出来。现在 JIT 按
+/// `template_for_binary` 的既定契约返回 `None`（模板集未覆盖 → 编译期拒绝），
+/// 由 `run_jit` 的 Err 分支回落解释器。
+///
+/// 之所以**拒绝**而不是给 JIT 补 `idiv` 模板：正确的整数除需要
+/// `cqo` + `idiv` + 除零陷阱判定，超出当前 copy-and-patch 模板集的能力范围；
+/// 而回落路径是本模块文档明写的语义正确性保证。
+#[test]
+fn jit_rejects_int_div_and_mod_falling_back_to_interpreter() {
+    for (a, op, b, want) in [
+        (7i64, mora::common::BinaryOp::Div, 2i64, Value::Int(3)),
+        (1, mora::common::BinaryOp::Div, 0, Value::Nil), // 解释器报错 → 回落路径不适用
+        (5, mora::common::BinaryOp::Mod, 2, Value::Int(1)),
+    ] {
+        let func = MirFunction {
+            params: Vec::new(),
+            body: vec![
+                MirInst::Const(0, Value::Int(a)),
+                MirInst::Const(1, Value::Int(b)),
+                fbinop(2, 0, op.clone(), 1),
+            ],
+            n_regs: 3,
+            ..Default::default()
+        };
+        assert!(
+            run_jit_of(&func).is_err(),
+            "JIT 不应编译 Int {op:?}（{a} {b}）—— 整数除模需要 idiv 模板，\
+             当前模板集不覆盖，必须回落解释器"
+        );
+        // 解释器给出正确值（除零那条会报错，这里只断言非除零的两条）
+        if b != 0 {
+            assert_eq!(
+                run_interp(&func).expect("interp should run"),
+                want,
+                "解释器对 {a} {op:?} {b} 应得 {want}"
+            );
+        }
     }
 }
 
@@ -238,10 +283,18 @@ fn jit_int_add_wraps() {
     assert_eq!(jit_val, Value::Int(i64::MIN), "Add 溢出应 wrap");
 }
 
-/// 手工构造的 Int Mod（Rust 浮点余数截断语义）：JIT == 解释器。
+/// Int Mod：JIT **编译期拒绝**（v0.104.6 D19，见
+/// `jit_rejects_int_div_and_mod_falling_back_to_interpreter` 的说明）。
+/// 解释器侧仍须给出正确值（含负数，符号随被除数）。
 #[test]
-fn jit_equiv_manual_int_mod() {
-    for (a, b) in [(17i64, 5i64), (-17, 5), (17, -5), (-17, -5), (0, 5), (7, 3)] {
+fn jit_rejects_int_mod_and_interpreter_is_correct() {
+    for (a, b, want) in [
+        (17i64, 5i64, Value::Int(2)),
+        (-17, 5, Value::Int(-2)),
+        (17, -5, Value::Int(2)),
+        (-17, -5, Value::Int(-2)),
+        (7, 3, Value::Int(1)),
+    ] {
         let func = MirFunction {
             params: Vec::new(),
             body: vec![
@@ -253,9 +306,15 @@ fn jit_equiv_manual_int_mod() {
 
             ..Default::default()
         };
-        let jit_val = run_jit_of(&func).unwrap_or_else(|e| panic!("JIT failed for {a} % {b}: {e}"));
-        let mir_val = run_interp(&func).expect("interp should run");
-        assert_eq!(jit_val, mir_val, "JIT != interp for {a} % {b}");
+        assert!(
+            run_jit_of(&func).is_err(),
+            "JIT 不应编译 Int Mod（{a} % {b}）"
+        );
+        assert_eq!(
+            run_interp(&func).expect("interp should run"),
+            want,
+            "解释器对 {a} % {b} 应得 {want}"
+        );
     }
 }
 

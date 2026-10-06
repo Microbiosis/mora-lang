@@ -304,7 +304,7 @@ pub fn deconstruct(ssa: &MirSsaFunction) -> MirFunction {
             Terminator::Break(t) => MirInst::Break(*t),
             Terminator::Continue(t) if *t >= num_blocks => MirInst::Return(None),
             Terminator::Continue(t) => MirInst::Continue(*t),
-            Terminator::Unreachable => MirInst::Return(None),
+            Terminator::Unreachable => MirInst::Label(usize::MAX), // skipped below
         }
     }
 
@@ -414,7 +414,12 @@ pub fn deconstruct(ssa: &MirSsaFunction) -> MirFunction {
         // v0.75.30: 还原声明型指令（TaskDef 等）到 body 头部 — 此前被 SSA
         // 丢弃导致 `--opt` 下 task main 消失。
         body: ssa.passthrough.iter().cloned().chain(body).collect(),
-        n_regs: next_plain_reg,
+        // v0.104.6 D304：`max` 上界不可省 ——
+        // `passthrough` 原样回插，其寄存器号仍是**重命名前**的编号；
+        // 只按 `next_plain_reg` 设值会让它们越界，执行器直接报
+        // 「references register N but the function only has M register(s)」
+        // —— 这正是 56 个真实程序里 16 个在 `--opt=1` 下失败的根因。
+        n_regs: next_plain_reg.max(ssa.orig_n_regs),
         ..Default::default()
     }
 }

@@ -1,0 +1,29 @@
+-- v0.104.6 D14 固件：被 import 的模块。
+--
+-- `import` 走裸 `ParserV3::compile` 的 witness 路径（不过 9 层管线），
+-- 而 witness 把读索引编码成 `Call("[]")`，此前 lower 未解码 →
+-- `Undefined function or task: []`。
+--
+-- import_h1：越界索引 → 应报真实的越界错误
+export task h1()
+  let x = 0.0
+  let t = [1, 2]
+  handle random_random {
+    x = t[99]
+  } {
+    0.5
+  }
+  x
+end
+
+-- import_h2：合法索引 → 应得 20.0
+export task h2()
+  let x = 0.0
+  let t = [10, 20, 30]
+  handle random_random {
+    x = t[1]
+  } {
+    0.5
+  }
+  x
+end

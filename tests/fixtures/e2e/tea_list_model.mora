@@ -1,0 +1,38 @@
+-- e2e：TEA 的 **列表 model** 不得被 update 静默截断（v0.104.6 D394）
+--
+-- 修前实测（真实 CLI）：
+--   tea.init([1, 2], …)     → model = [1.0, 2.0]   ✅
+--   tea.update(该 app, msg) → model = **1.0**      ❌ 类型从 list 变 float
+--   tea.init([9, 8, 7], …)  → update 后 = **9.0**
+--
+-- 根因：`TeaApp::apply_update` **只判类型不判形状** —— 任何 `Value::List`
+-- 返回值都被当成 `(Model, Cmd)` 二元组，model 取 `items.first()`。
+-- 而 `tea.init` 第 1 参**明确允许**「init 闭包（**或初始 model 值**）」，
+-- 列表 model 完全合法。
+--
+-- Run: cargo run -- tests/fixtures/e2e/tea_list_model.mora
+
+-- ── ① 2 元素列表 model ────────────────────────────────────────
+let t1 = tea.init([1, 2], fn(msg, model) => model end, fn(model) => model end)
+print("list_before=" + str(tea.model(t1)))
+let t2 = tea.update(t1, {tag: "X"})
+print("list_after=" + str(tea.model(t2)))
+
+-- ── ② 3 元素列表 model ────────────────────────────────────────
+let t3 = tea.init([9, 8, 7], fn(msg, model) => model end, fn(model) => model end)
+print("long_before=" + str(tea.model(t3)))
+let t4 = tea.update(t3, {tag: "X"})
+print("long_after=" + str(tea.model(t4)))
+
+-- ── ③ 反向对照：真元组 `[model, nil]` 仍按元组解读 ──────────────
+-- `nil` 是合法的 `Cmd::None` ⇒ 长度 2 且第二项可解析 ⇒ 必须走元组分支，
+-- model 原样保留。**这条若也红，说明修法把元组支持一起弄坏了。**
+let d1 = tea.init({count: 0}, fn(msg, model) => [model, nil] end, fn(model) => model end)
+print("tuple_before=" + str(tea.model(d1)))
+let d2 = tea.update(d1, {tag: "X"})
+print("tuple_after=" + str(tea.model(d2)))
+
+-- ── ④ 反向对照：dict model 裸返回不受影响 ──────────────────────
+let e1 = tea.init({count: 0}, fn(msg, model) => model end, fn(model) => model end)
+let e2 = tea.update(e1, {tag: "X"})
+print("dict_after=" + str(tea.model(e2)))

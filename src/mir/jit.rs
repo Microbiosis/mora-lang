@@ -135,6 +135,10 @@ impl ExecMem {
             const MEM_COMMIT: u32 = 0x1000;
             const MEM_RESERVE: u32 = 0x2000;
             const PAGE_READWRITE: u32 = 0x04;
+            // SAFETY: `lp_address` 传 NULL 让系统挑地址；`len` 已由 `max(1)`
+            // 去零，故不为 0；`MEM_COMMIT|MEM_RESERVE` + `PAGE_READWRITE` 恰好
+            // 申请本阶段要的「可写、不可执行」权限（W^X 的前半段）。返回 NULL
+            // 时下方的 `is_null()` 判空并返回 `None`，不产生野指针。
             let p = unsafe {
                 VirtualAlloc(
                     std::ptr::null_mut(),
@@ -168,6 +172,10 @@ impl ExecMem {
             const PROT_WRITE: i32 = 2;
             const MAP_PRIVATE: i32 = 2;
             const MAP_ANONYMOUS: i32 = 0x20;
+            // SAFETY: `length = len`（已 `max(1)`，非 0）；`MAP_PRIVATE|
+            // MAP_ANONYMOUS` 下 `fd`/`offset` 被内核忽略（传 -1/0）。返回
+            // `MAP_FAILED` 时下方的 `p as usize == usize::MAX` 判失败并返回
+            // `None`，不把错误指针当内存用。
             let p = unsafe {
                 mmap(
                     std::ptr::null_mut(),
@@ -205,6 +213,10 @@ impl ExecMem {
             }
             const PAGE_EXECUTE_READ: u32 = 0x20;
             let mut old: u32 = 0;
+            // SAFETY: `self.ptr` / `self.len` 是 `alloc_rw` 那次分配的**原样
+            // 回传**（ExecMem 不允许别处改这两个字段），故范围必然落在该分配
+            // 内；`lpfl_old_protect` 指向合法的 `&mut u32`。返回值非 0 才继续，
+            // 失败路径已 `return Err`。
             let rc = unsafe {
                 VirtualProtect(
                     self.ptr as *mut std::os::raw::c_void,
@@ -225,6 +237,9 @@ impl ExecMem {
             }
             const PROT_READ: i32 = 1;
             const PROT_EXEC: i32 = 4;
+            // SAFETY: `self.ptr` / `self.len` 来自 `alloc_rw` 的同一次 mmap，
+            // 原样回传；`PROT_READ|PROT_EXEC` 正是 W^X 的后半段（写入完成后才
+            // 提权）。`rc != 0` 的失败路径已先行返回 `Err`。
             let rc = unsafe { mprotect(self.ptr, self.len, PROT_READ | PROT_EXEC) };
             if rc != 0 {
                 return Err("mprotect failed (W^X)".to_string());
@@ -238,6 +253,11 @@ impl ExecMem {
     }
 
     fn as_fn_ptr(&self) -> unsafe extern "C" fn(*mut JitState) -> u32 {
+        // SAFETY: 目标内存此刻**已完成 W^X 的 RW→RX 切换**（调用方必须先
+        // `make_exec()` 成功，见 `try_compile` 的顺序），且其中已由
+        // `copy_nonoverlapping` 写入完整的函数字节，长度 ≥ 1（`alloc_rw` 的
+        // `max(1)`）。transmute 用的目标签名与生成代码的出口约定一致
+        // （`JitState* -> u32`），与 `run_jit` 的调用点同签名。
         unsafe { std::mem::transmute(self.ptr) }
     }
 }
@@ -254,6 +274,9 @@ impl Drop for ExecMem {
                 ) -> i32;
             }
             const MEM_RELEASE: u32 = 0x8000;
+            // SAFETY: `self.ptr` 是本 `ExecMem` 独占的那次分配，而 Drop 拿到
+            // `&mut self`，保证全局只有一个执行者。`MEM_RELEASE` 要求
+            // `dwSize = 0`，与实参一致（该类型忽略 size，只认基址）。
             unsafe {
                 VirtualFree(self.ptr as *mut std::os::raw::c_void, 0, MEM_RELEASE);
             }
@@ -263,6 +286,8 @@ impl Drop for ExecMem {
             unsafe extern "C" {
                 fn munmap(addr: *mut u8, length: usize) -> i32;
             }
+            // SAFETY: `self.ptr` / `self.len` 是 `alloc_rw` 那次 mmap 的原样
+            // 回传，范围精确匹配；Drop 持有 `&mut self`，无并发释放者。
             unsafe {
                 munmap(self.ptr, self.len);
             }
@@ -581,31 +606,6 @@ fn emit_binop_int(code: &mut Code, dst: Reg, a: Reg, op: crate::common::BinaryOp
     code.store_payload_r11(dst);
 }
 
-/// Int Mod（精确复刻解释器 `(af % bf).round() as i64`，Rust 浮点 % =
-/// 截断余数 `a - trunc(a/b)*b`）。SSE2：div → roundsd mode 3（trunc）→
-/// mul → 重载 a 相减 → roundsd mode 0 → cvtsd2si。
-fn emit_binop_int_mod(code: &mut Code, dst: Reg, a: Reg, b: Reg) {
-    code.load_regs();
-    code.cmp_tag(a, TAG_INT);
-    code.jne_bail();
-    code.cmp_tag(b, TAG_INT);
-    code.jne_bail();
-    code.load_int_xmm0(a); // xmm0 = a
-    code.load_int_xmm1(b); // xmm1 = b
-    code.extend(&[0xF2, 0x0F, 0x5E, 0xC1]); // divsd xmm0, xmm1 → a/b
-    code.extend(&[0x66, 0x0F, 0x3A, 0x0B, 0xC0, 0x03]); // roundsd xmm0, xmm0, 3 → trunc(a/b)
-    code.extend(&[0xF2, 0x0F, 0x59, 0xC1]); // mulsd xmm0, xmm1 → trunc(a/b)*b
-    code.load_int_xmm1(a); // xmm1 = a（重读，覆盖 b）
-    code.extend(&[0xF2, 0x0F, 0x5C, 0xC8]); // subsd xmm1, xmm0 → a - trunc(a/b)*b
-    code.extend(&[0x66, 0x0F, 0x3A, 0x0B, 0xC9, 0x00]); // roundsd xmm1, xmm1, 0
-    code.extend(&[0xF2, 0x4C, 0x0F, 0x2D, 0xD9]); // cvtsd2si r11, xmm1
-    code.extend(&[0x66, 0x0F, 0x28, 0xC1]); // movaps xmm0, xmm1（饱和判别读 xmm0）
-    code.int_saturate();
-    code.store_tag(dst, TAG_INT);
-    code.store_payload_r11(dst);
-}
-
-/// Int 比较（精确复刻解释器 numeric_cmp Int 分支 `a as f64 op b as f64`）。
 /// 无 NaN 修正（Int→f64 恒有序）。
 fn emit_binop_int_cmp(code: &mut Code, dst: Reg, a: Reg, op: crate::common::BinaryOp, b: Reg) {
     code.load_regs();
@@ -705,9 +705,11 @@ enum TemplateSpec {
     BinopFloatArith, // addsd/subsd/mulsd/divsd → Float
     BinopFloatCmp,   // comisd+setcc → Bool
     BinopIntAdd,     // i64 直接加 → Int
-    BinopIntArith,   // f64 round-trip（Sub/Mul/Div）→ Int
-    BinopIntMod,     // trunc 余数序列 → Int
-    BinopIntCmp,     // as f64 比较 → Bool
+    BinopIntArith,   // f64 round-trip（Sub/Mul）→ Int
+    // v0.104.6 D19：原 `BinopIntMod`（trunc 余数序列）已随 Int Div/Mod 一并
+    // 从 `template_for_binary` 移除 —— 二者都需要除零陷阱判定，超出本模板集
+    // 能力范围，现按契约回落解释器。保留变体会是永不构造的死 IR。
+    BinopIntCmp, // as f64 比较 → Bool
     Jump,
     JumpIf, // cond 须 Bool
 }
@@ -715,10 +717,9 @@ enum TemplateSpec {
 impl TemplateSpec {
     fn result_type(self) -> Option<Ty> {
         match self {
-            TemplateSpec::ConstInt
-            | TemplateSpec::BinopIntAdd
-            | TemplateSpec::BinopIntArith
-            | TemplateSpec::BinopIntMod => Some(Ty::Int),
+            TemplateSpec::ConstInt | TemplateSpec::BinopIntAdd | TemplateSpec::BinopIntArith => {
+                Some(Ty::Int)
+            }
             TemplateSpec::ConstFloat | TemplateSpec::BinopFloatArith => Some(Ty::Float),
             TemplateSpec::ConstBool | TemplateSpec::BinopFloatCmp | TemplateSpec::BinopIntCmp => {
                 Some(Ty::Bool)
@@ -752,10 +753,28 @@ fn template_for_binary(
     } else if is_int {
         match op {
             crate::common::BinaryOp::Add => Some(TemplateSpec::BinopIntAdd),
-            crate::common::BinaryOp::Sub
-            | crate::common::BinaryOp::Mul
-            | crate::common::BinaryOp::Div => Some(TemplateSpec::BinopIntArith),
-            crate::common::BinaryOp::Mod => Some(TemplateSpec::BinopIntMod),
+            crate::common::BinaryOp::Sub | crate::common::BinaryOp::Mul => {
+                Some(TemplateSpec::BinopIntArith)
+            }
+            // v0.104.6 D19：Int 的 Div / Mod **不再**走 `BinopIntArith`
+            // （f64 round-trip 发射）。
+            //
+            // 解释器侧原本也是「浮点除法 + `.round() as i64`」，于是
+            // `7/2` 得 4、`1/0` 得 i64::MAX、`5%0` 得 0 —— 三处都错。解释器
+            // 已改为整数专用分派（截断向零 + 除零报错），若 JIT 仍走
+            // round-trip，两条路径就会**分叉**（解释器对、JIT 错），而 JIT 只
+            // 在 `with` 块里被调用（D19 修完仍会静默给出错值）。
+            //
+            // 正确的整数除/模需要 x86 的 `idiv`/`cqo` 序列 + 除零陷阱判定，
+            // 超出当前 copy-and-patch 模板集的能力范围。按本模块既定的
+            // 「模板集未覆盖 → 编译期拒绝 → 回落解释器」契约，这里返回
+            // `None`：**语义正确性由解释器兜底**（`run_jit` 的 Err 分支）。
+            //
+            // 此前 `jit_compile.rs::jit_equiv_manual_int_arith` 把
+            // `7 Div 2 → 4` / `1 Div 0 → i64::MAX` 当作**既定语义**写进断言
+            // 与注释，于是这条差分测试是在两边都错的时候通过的 —— 给整条整数
+            // 除法路径提供了假信心。该测试已改为断言「JIT 拒绝、回落解释器」。
+            crate::common::BinaryOp::Div | crate::common::BinaryOp::Mod => None,
             crate::common::BinaryOp::Equal
             | crate::common::BinaryOp::NotEqual
             | crate::common::BinaryOp::Greater
@@ -923,10 +942,6 @@ fn try_compile(func: &MirFunction) -> Result<(ExecMem, Reg), JitError> {
                         emit_binop_int(&mut code, *dst, *a, op.clone(), *b);
                         types[*dst] = Some(Ty::Int);
                     }
-                    TemplateSpec::BinopIntMod => {
-                        emit_binop_int_mod(&mut code, *dst, *a, *b);
-                        types[*dst] = Some(Ty::Int);
-                    }
                     TemplateSpec::BinopIntCmp => {
                         emit_binop_int_cmp(&mut code, *dst, *a, op.clone(), *b);
                         types[*dst] = Some(Ty::Bool);
@@ -1000,6 +1015,12 @@ fn try_compile(func: &MirFunction) -> Result<(ExecMem, Reg), JitError> {
     // W^X：先 RW 写入，再切 RX（见 ExecMem::make_exec）。
     let mut mem = ExecMem::alloc_rw(bytes.len())
         .ok_or_else(|| JitError::InternalInvariant("executable memory allocation failed".into()))?;
+    // SAFETY: 两段内存**长度同源** —— 上面刚用 `bytes.len()` 调
+    // `ExecMem::alloc_rw`，而 `alloc_rw` 只会 `max(1)` 放大，绝不缩小，故目标
+    // 可写区至少 `bytes.len()` 字节；源 `bytes` 是长度恰为 `bytes.len()` 的
+    // 有效切片。两段不重叠：一个是刚分配的可执行内存，一个是 Rust 堆上的
+    // `Vec` 的缓冲。此时内存仍是 **RW**（`make_exec()` 在下一行才提权），
+    // 符合 W^X；且 `&mut mem` 保证没有别人同时写。
     unsafe {
         std::ptr::copy_nonoverlapping(bytes.as_ptr(), mem.ptr, bytes.len());
     }

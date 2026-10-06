@@ -18,16 +18,16 @@ impl Interpreter {
         let parts: Vec<String> = messages.iter().map(|msg| {
             match msg {
                 ChatMessage::User { content } => {
-                    let esc = content.replace('\\', "\\\\").replace('"', "\\\"")
-                        .replace('\n', "\\n").replace('\r', "\\r").replace('\t', "\\t");
+                    // v0.104.6 D209：改用共享的 RFC 8259 转义器
+                    let esc = crate::flow::escape_json_string(content);
                     format!(r#"{{"role":"user","content":"{}"}}"#, esc)
                 }
                 ChatMessage::Assistant { content, tool_calls } => {
                     let mut parts = vec![r#""role":"assistant""#.to_string()];
                     match content {
                         Some(c) => {
-                            let esc = c.replace('\\', "\\\\").replace('"', "\\\"")
-                                .replace('\n', "\\n").replace('\r', "\\r").replace('\t', "\\t");
+                            // v0.104.6 D209：改用共享的 RFC 8259 转义器
+                            let esc = crate::flow::escape_json_string(c);
                             parts.push(format!(r#""content":"{}""#, esc));
                         }
                         None => parts.push(r#""content":null"#.to_string()),
@@ -36,9 +36,9 @@ impl Interpreter {
                         let tc_json: Vec<String> = tool_calls.iter().map(|tc| {
                             format!(
                                 r#"{{"id":"{}","type":"function","function":{{"name":"{}","arguments":"{}"}}}}"#,
-                                tc.id.replace('\\', "\\\\").replace('"', "\\\""),
-                                tc.name.replace('\\', "\\\\").replace('"', "\\\""),
-                                tc.arguments.replace('\\', "\\\\").replace('"', "\\\"")
+                                crate::flow::escape_json_string(&tc.id),
+                                crate::flow::escape_json_string(&tc.name),
+                                crate::flow::escape_json_string(&tc.arguments)
                             )
                         }).collect();
                         parts.push(format!(r#""tool_calls":[{}]"#, tc_json.join(",")));
@@ -46,9 +46,9 @@ impl Interpreter {
                     format!("{{{}}}", parts.join(","))
                 }
                 ChatMessage::Tool { tool_call_id, content } => {
-                    let esc_id = tool_call_id.replace('\\', "\\\\").replace('"', "\\\"");
-                    let esc_content = content.replace('\\', "\\\\").replace('"', "\\\"")
-                        .replace('\n', "\\n").replace('\r', "\\r").replace('\t', "\\t");
+                    // v0.104.6 D209：改用共享的 RFC 8259 转义器
+                    let esc_id = crate::flow::escape_json_string(tool_call_id);
+                    let esc_content = crate::flow::escape_json_string(content);
                     format!(r#"{{"role":"tool","tool_call_id":"{}","content":"{}"}}"#, esc_id, esc_content)
                 }
             }
@@ -104,18 +104,36 @@ impl Interpreter {
     }
 
     /// 从 API 响应中提取 usage（prompt_tokens, completion_tokens）
+    ///
+    /// v0.104.6 D246：此前是 `Some(Value::Float(n)) => *n as usize`，**只认
+    /// `Float`**。而真实 API 的 usage 是**整数** JSON 数字，`json_to_value`
+    /// 产出 `Int`（D129）⇒ 落到 `_ => 0`。
+    ///
+    /// 实测后果 —— `track_tokens` 是 token 预算检查的**唯一执行者**
+    /// （per_call 上限、总量预算、告警阈值、`ai.tokens().calls()` 全靠它），
+    /// 而 `ai_chat.rs:676` / `832` 两条 chat 响应路径都走这里：
+    ///
+    /// ```text
+    /// {"usage":{"prompt_tokens":1500,"completion_tokens":250}}  → (0, 0)      ← 真实形态
+    /// {"usage":{"prompt_tokens":1500.0,"completion_tokens":250.0}} → (1500, 250)  ← 现实不会发生
+    /// ```
+    ///
+    /// 即**用户设了 token 预算，但它永远不触发、`ai.tokens()` 恒显示 0、
+    /// 告警永不打印，且全程零诊断**。这是 D231 立的规矩（「新增数值提取必须
+    /// 走 `value_as_f64`」）被违反的直接后果 —— 那个收口当时住在 `compress`
+    /// 里，`interpreter` 够不着。现两处共用 `flow::value_as_usize`。
     pub(super) fn extract_usage(json_text: &str) -> (usize, usize) {
         if let Ok(Value::Dict(map)) = json_to_value(json_text)
             && let Some(Value::Dict(usage)) = map.get("usage")
         {
-            let input = match usage.get("prompt_tokens") {
-                Some(Value::Float(n)) => *n as usize,
-                _ => 0,
-            };
-            let output = match usage.get("completion_tokens") {
-                Some(Value::Float(n)) => *n as usize,
-                _ => 0,
-            };
+            let input = usage
+                .get("prompt_tokens")
+                .and_then(crate::flow::value_as_usize)
+                .unwrap_or(0);
+            let output = usage
+                .get("completion_tokens")
+                .and_then(crate::flow::value_as_usize)
+                .unwrap_or(0);
             return (input, output);
         }
         (0, 0)
@@ -138,6 +156,10 @@ impl Interpreter {
 
         self.ai.token_usage.input += input;
         self.ai.token_usage.output += output;
+        // v0.104.6 D76：此处是运行期**唯一**填充 token_usage 的入口
+        // （`AiRuntime::record_tokens` 只被单测调用），调用次数必须在这里累加 ——
+        // `ai.tokens().calls()` 读的就是它。
+        self.ai.token_usage.calls += 1;
         self.ai.trace.record_tokens(input as u64, output as u64);
         let total_used = self.ai.token_usage.input + self.ai.token_usage.output;
         if let Some(ref budget) = self.ai.token_budget {
@@ -347,4 +369,72 @@ impl Interpreter {
     }
 
     // Mock 工具调用（无 API Key 时，调用第一个注册的工具）
+}
+
+#[cfg(test)]
+mod d246_tests {
+    use super::*;
+
+    /// v0.104.6 D246：`extract_usage` 必须同时接受 `Int` 与 `Float`。
+    ///
+    /// 它是 `pub(super)`，集成测试够不着，故判据只能落在模块内。
+    /// 上游后果：`track_tokens`（token 预算的唯一执行者）经由
+    /// `ai_chat.rs` 两条响应路径喂数，`Int` 不被接受 ⇒ 整套预算机制失效。
+    #[test]
+    fn d246_extract_usage_accepts_int_token_counts() {
+        // 真实 API 形态：token 数是**整数** JSON 数字 ⇒ 产出 Value::Int。
+        let (i, o) = Interpreter::extract_usage(
+            r#"{"usage":{"prompt_tokens":1500,"completion_tokens":250}}"#,
+        );
+        assert_eq!(
+            (i, o),
+            (1500, 250),
+            "整数 token 必须被提取，不能落到 _ => 0"
+        );
+
+        // 浮点形态（现实中不会出现）仍须可用 —— 防过度收紧。
+        let (i2, o2) = Interpreter::extract_usage(
+            r#"{"usage":{"prompt_tokens":1500.0,"completion_tokens":250.0}}"#,
+        );
+        assert_eq!((i2, o2), (1500, 250));
+
+        // 只有一半是整数时，另一半也必须各自独立生效。
+        let (i3, o3) =
+            Interpreter::extract_usage(r#"{"usage":{"prompt_tokens":42,"completion_tokens":7.0}}"#);
+        assert_eq!((i3, o3), (42, 7));
+    }
+
+    #[test]
+    fn d246_extract_usage_degenerate_inputs_yield_zero_not_wrap() {
+        // 缺 usage / 空 choices：0，符合原行为。
+        assert_eq!(Interpreter::extract_usage(r#"{"choices":[]}"#), (0, 0));
+        // 畸形响应（负 token）必须记 0，**不能**回绕成 usize::MAX。
+        assert_eq!(
+            Interpreter::extract_usage(r#"{"usage":{"prompt_tokens":-5,"completion_tokens":-7}}"#),
+            (0, 0)
+        );
+        // 非数值类型：0。
+        assert_eq!(
+            Interpreter::extract_usage(
+                r#"{"usage":{"prompt_tokens":"many","completion_tokens":null}}"#
+            ),
+            (0, 0)
+        );
+        // 非法 JSON：0，不 panic。
+        assert_eq!(Interpreter::extract_usage("not json"), (0, 0));
+    }
+
+    /// 对照组：钉住「整数 JSON → `Value::Int`」这条前提本身。
+    #[test]
+    fn d246_control_group_json_int_is_int_value() {
+        let v = json_to_value(r#"{"prompt_tokens":1500}"#).expect("parse");
+        let Value::Dict(m) = &v else {
+            panic!("expected dict")
+        };
+        assert!(
+            matches!(m.get("prompt_tokens"), Some(Value::Int(1500))),
+            "整数 JSON 应产出 Int，实得 {:?}",
+            m.get("prompt_tokens")
+        );
+    }
 }

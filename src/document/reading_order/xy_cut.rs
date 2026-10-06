@@ -118,20 +118,59 @@ fn compute_density_ratios(entries: &[(usize, BBox)]) -> (f64, f64) {
     (sum_w / x_span, sum_h / y_span)
 }
 
+/// v0.104.6 D243：该轴的投影原点 —— 所有块在该轴**两端**坐标上的最小值，下限 0。
+///
+/// 存在的唯一理由：直方图下标是 `坐标 as usize`，`split_projection` 返回的段
+/// 边界也是**下标**；而 `recursive_xy_cut` 的段成员判定却把该下标直接当
+/// **原始 f64 中心坐标**来比。两者必须同属一个坐标系，否则比较毫无意义。
+///
+/// Rust 的 `as usize` 对负数是**饱和**转换（`-5.0 as usize == 0`，实测）。
+/// 于是负坐标（带 offset 的坐标系、居中为原点的坐标系都很常见）会被
+/// 整块塌进 0 号下标，而 `center_y()` 仍是负数 —— 两者永不相等。
+///
+/// 实测后果（`XyCutPlusPlus`，4 块单列，相对几何完全相同，只改坐标系原点）：
+///   y0=0     -> [title, p1, p2, footer]   正确
+///   y0=-100  -> [p2, footer]              **4 块输入只输出 2 块，静默丢数据**
+///   y0=-300  -> [title, p1, p2, footer]   碰巧对（见下）
+///
+/// `y0=-300` 之所以「碰巧对」：此时全部 `as usize` 都塌成 0，直方图全零
+/// ⇒ 检不出 gap ⇒ 走「两轴都无法切分」的旁路，而那条旁路**不按段过滤**。
+/// 也就是说它是**巧合正确**，不是真的正确 —— 只测这一个点会得到否定结论。
+///
+/// 归一化后投影下标与 `y0=0` 逐位相同 ⇒ 平移不变性成立。
+/// `fold` 从 `0.0` 起步 ⇒ 原点恒 ≤ 0 ⇒ 平移后坐标恒非负，`as usize` 不再饱和。
+/// `is_finite` 过滤 NaN/±inf，避免它们污染原点。
+fn axis_origin(entries: &[(usize, BBox)], axis: usize) -> f64 {
+    entries
+        .iter()
+        .map(|(_, b)| {
+            let (lo, hi) = if axis == 0 {
+                (b.x, b.right())
+            } else {
+                (b.y, b.bottom())
+            };
+            lo.min(hi)
+        })
+        .filter(|v| v.is_finite())
+        .fold(0.0_f64, f64::min)
+}
+
 /// v0.41.1: 投影到轴 (0=x, 1=y)，输出 1D 直方图 (per-pixel count)
 fn project_to_axis(entries: &[(usize, BBox)], axis: usize) -> Vec<u32> {
     if entries.is_empty() {
         return vec![];
     }
+    // v0.104.6 D243：先按 `axis_origin` 平移到非负空间，再取下标。
+    let origin = axis_origin(entries, axis);
     let max_coord = entries
         .iter()
-        .map(|(_, b)| if axis == 0 { b.right() } else { b.bottom() })
+        .map(|(_, b)| (if axis == 0 { b.right() } else { b.bottom() }) - origin)
         .fold(0.0_f64, f64::max)
         .ceil() as usize;
     let mut hist = vec![0u32; max_coord + 1];
     for (_, b) in entries {
-        let start = if axis == 0 { b.x } else { b.y } as usize;
-        let end = (if axis == 0 { b.right() } else { b.bottom() }) as usize;
+        let start = (if axis == 0 { b.x } else { b.y } - origin) as usize;
+        let end = ((if axis == 0 { b.right() } else { b.bottom() }) - origin) as usize;
         for i in start..end.min(hist.len()) {
             hist[i] += 1;
         }
@@ -223,16 +262,20 @@ fn recursive_xy_cut(
         }
 
         // 沿 secondary 切分, 每个子段按 primary 排序
+        //
+        // v0.104.6 D243：`c` 必须减掉与 `project_to_axis` 相同的 `axis_origin`，
+        // 否则段边界（下标）与 `center`（原始坐标）不在同一坐标系。
+        let sec_origin = axis_origin(entries, secondary_axis);
         for (s_start, s_end) in &secondary_segs {
             let mut sub: Vec<_> = entries
                 .iter()
                 .copied()
                 .filter(|(_, b)| {
-                    let c = if secondary_axis == 0 {
+                    let c = (if secondary_axis == 0 {
                         b.center_x()
                     } else {
                         b.center_y()
-                    };
+                    }) - sec_origin;
                     let start = *s_start as f64;
                     let end = *s_end as f64;
                     c >= start && c < end
@@ -257,16 +300,19 @@ fn recursive_xy_cut(
     }
 
     // 沿 primary 切分, 每个子段递归
+    //
+    // v0.104.6 D243：同 secondary 分支 —— `c` 减同轴 `axis_origin`。
+    let pri_origin = axis_origin(entries, primary_axis);
     for (s_start, s_end) in &primary_segs {
         let sub: Vec<_> = entries
             .iter()
             .copied()
             .filter(|(_, b)| {
-                let c = if primary_axis == 0 {
+                let c = (if primary_axis == 0 {
                     b.center_x()
                 } else {
                     b.center_y()
-                };
+                }) - pri_origin;
                 let start = *s_start as f64;
                 let end = *s_end as f64;
                 c >= start && c < end

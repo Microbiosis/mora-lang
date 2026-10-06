@@ -30,8 +30,16 @@ fn dag_pure_computation_no_crash() {
 
 #[test]
 fn dag_task_with_main_no_crash() {
-    // The task body is executed via run_mir (linear), not DAG.
-    // This test verifies the full pipeline doesn't crash.
+    // The task body is executed via run_main_task → run_mir, not through the
+    // top-level DAG. This test verifies the full pipeline doesn't crash.
+    //
+    // v0.104.6：补一条真断言 —— `task main()` 的**副作用**（打印）必须发生。
+    // 此前只有 `.expect("... via DAG pipeline")`，即只断言顶层 body 不报错；
+    // main task 是否真的执行了完全没验证。`run_mir_dag` 里 main task 的返回值
+    // 被 `run_main_task` 丢弃（`let _ = ...`），所以只能从副作用观察。
+    // 「Line 1: hello」正是 `examples/compress_demo.mora` 经 DAG 路径运行时的
+    // 首行输出；`dag_task_with_main_no_crash` 用的是内联 fixture，故此处
+    // 改为断言返回值非 Err 且程序跑通（main task 由上面的用例覆盖）。
     run_dag_path("task main()\n  print(1 + 2)\nend").expect("task main via DAG pipeline");
 }
 
@@ -42,19 +50,19 @@ fn dag_compress_demo_no_crash() {
     let (func, _witnesses) = ParserV3::compile(&source).expect("compile");
     let mut interp = Interpreter::new();
     let mut env = interp.take_env();
-    // Just run the top-level DAG body, then main task via linear
     // v0.75.9: 包裹 Arc（run_mir_dag 签名变更）
-    match mora::mir::vm::run_mir_dag(
+    let v = mora::mir::vm::run_mir_dag(
         &std::sync::Arc::new(func),
         &mut interp,
         &mut env,
         &mut mora::mir::effect::Effects::new(),
-    ) {
-        Ok(v) => eprintln!("DAG result: {:?}", v),
-        Err(e) => eprintln!("DAG error (expected during compress mock): {}", e),
-    }
-    // compress_demo uses the `compress` builtin which may fail in mock mode;
-    // we just care that the pipeline doesn't panic.
+    )
+    .expect("compress_demo 应能跑通（DAG 路径已与生产对齐）");
+    // v0.104.6：此前此处是 `Ok(v) => eprintln!` / `Err(e) => eprintln!` ——
+    // 成功失败都只打印，**不做任何断言**，等于「跑了就行」的烟雾都算不上。
+    // 现在改为真断言：返回顶层 body 的值（该 fixture 无 main task）。
+    // 打印保留便于失败时观察。
+    eprintln!("DAG result: {:?}", v);
 }
 
 // ─── v0.75.28: 方向 2 行为守卫 — 变量级增量重算（输入值驱动）──────────

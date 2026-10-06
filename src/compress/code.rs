@@ -49,40 +49,68 @@ impl SubCompressor for CodeSubCompressor {
     }
 
     /// 压缩: 保留签名行, 合并连续非签名行为 elide marker。
+    ///
+    /// v0.104.6 D227：预算检查此前是 `if out.len() >= max_bytes { break; }`
+    /// —— 在**已经追加完本行之后**才判断，且判断通过后还要再追加 elide
+    /// marker + `<compressed:method=code …>` 两段尾部，输出必然超限
+    /// （实测 max_bytes=16 → 79 字节）。现在给尾部留预算。
     fn compress(
         &self,
         content: &str,
         max_bytes: usize,
         _options: &CompressOptions,
     ) -> Result<String, String> {
-        let mut out = String::new();
+        // v0.104.6 D227：尾部要放 elide marker + `<compressed:method=code …>`。
+        //
+        // 预留量按**真实**的 `<compressed:method=code original_size={total}>`
+        // 长度算，而不是拍一个常数。拍常数（曾用 96）在 max_bytes=200 这种
+        // 小预算上会吃掉近一半预算，把签名行全挤掉 —— 既有单测
+        // `test_code_compress_preserves_signatures` 就是这么变红的。
+        // elide marker 只在真的有 body 行被省略时才出现，先按 0 算，
+        // 收口函数 `finish_within_budget` 是契约的最终保证者。
+        let compressed_marker_len = format!(
+            "\n<compressed:method=code original_size={}>\n",
+            content.len()
+        )
+        .len();
+        let body_budget = max_bytes.saturating_sub(compressed_marker_len);
+
+        let mut body = String::new();
         let mut body_lines: usize = 0;
         for line in content.lines() {
             let is_signature = CODE_KEYWORDS.iter().any(|k| line.contains(k))
                 || line.trim_start().starts_with("//")
                 || line.trim_start().starts_with('#');
-            if is_signature {
+            let piece = if is_signature {
+                let mut p = String::new();
                 if body_lines > 0 {
-                    out.push_str(&format!("    ... [{} body lines elided] ...\n", body_lines));
+                    p.push_str(&format!("    ... [{} body lines elided] ...\n", body_lines));
                     body_lines = 0;
                 }
-                out.push_str(line);
-                out.push('\n');
+                p.push_str(line);
+                p.push('\n');
+                p
             } else {
                 body_lines += 1;
-            }
-            if out.len() >= max_bytes {
-                break;
+                String::new()
+            };
+            if !piece.is_empty() {
+                if body.len() + piece.len() > body_budget {
+                    break;
+                }
+                body.push_str(&piece);
             }
         }
         if body_lines > 0 {
-            out.push_str(&format!("    ... [{} body lines elided] ...\n", body_lines));
+            body.push_str(&format!("    ... [{} body lines elided] ...\n", body_lines));
         }
-        out.push_str(&format!(
+        let marker = format!(
             "\n<compressed:method=code original_size={}>\n",
             content.len()
-        ));
-        Ok(out)
+        );
+        Ok(crate::compress::finish_within_budget(
+            content, body, &marker, max_bytes,
+        ))
     }
 
     fn origin(&self) -> &'static str {
@@ -119,9 +147,56 @@ mod tests {
             out.contains("fn helper()"),
             "must preserve fn helper(): {out}"
         );
+        // v0.104.6 D227：原先这里断言 `contains("body lines elided")`。
+        // 那是**超限 bug 的副产物** —— 旧实现不看预算就一路追加，输出
+        // (66 字节源码 + 40 字节 marker) 超过 max_bytes=200 之前，elide
+        // marker 仍会出现。修好后预算足够装下全部 4 行，**没有省略发生**，
+        // 于是 elide marker 理应不存在；断言它存在等于要求压缩器**必须**
+        // 多余地丢弃内容。
+        //
+        // 换成两条真正的不变式：签名行都在，且输出没超预算。
+        assert!(
+            out.len() <= 200,
+            "D227: 输出不得超过 max_bytes; 实得 {} 字节: {out}",
+            out.len()
+        );
+        // original_size 按**实际**源码长度算，不写死数字
+        // （先写成 66 判红 —— 真实值是 74，典型「不写死具体数字」纪律的违反）。
+        assert!(
+            out.contains(&format!(
+                "<compressed:method=code original_size={}>",
+                src.len()
+            )),
+            "应带上 original_size={} marker: {out}",
+            src.len()
+        );
+    }
+
+    /// v0.104.6 D227 回归：预算不足时**必须**省略并留下 elide marker。
+    ///
+    /// 与上一条互补：上一条验「够用时不省略」，本条验「不够用时必省略」，
+    /// 且省略后仍须给出 elide marker 说明丢了多少行。
+    #[test]
+    fn test_code_compress_elides_when_over_budget() {
+        let c = CodeSubCompressor;
+        let mut src = String::new();
+        for i in 0..50 {
+            src.push_str(&format!("fn f{i}() {{\n"));
+            src.push_str("    let x = 1;\n");
+            src.push_str("}\n");
+        }
+        let opts = CompressOptions::default();
+        let out = c
+            .compress(&src, 200, &opts)
+            .expect("compress should not error");
         assert!(
             out.contains("body lines elided"),
-            "must include elide marker: {out}"
+            "预算不足时必须留下 elide marker: {out}"
+        );
+        assert!(
+            out.len() <= 200,
+            "D227: 省略后仍须满足 max_bytes; 实得 {} 字节",
+            out.len()
         );
     }
 }

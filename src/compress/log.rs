@@ -64,44 +64,80 @@ impl SubCompressor for LogSubCompressor {
 
     /// 压缩: 保留所有行 (ERROR/FATAL 强制 + 其他等级按预算截断),
     /// 末尾追加 ERROR/FATAL 行数标记。
+    ///
+    /// v0.104.6 D227：预算此前是 `max_bytes / 80` —— **每行 80 字节**是
+    /// 一个无根据的硬编码假设。实测 560 字节/行的日志里，max_bytes=4800
+    /// 算出 60 行预算，60 行 × 560 = 33660 字节，输出 33703，**是原文的
+    /// 100.1%**（压缩了个寂寞）。现在改为按**真实字节数**累计。
     fn compress(
         &self,
         content: &str,
         max_bytes: usize,
         _options: &CompressOptions,
     ) -> Result<String, String> {
-        let mut keep: Vec<&str> = Vec::new();
-        let mut error_count: usize = 0;
-        // 粗略每行 ~80 bytes (与 spec §6.4 一致)
-        let line_budget = max_bytes / 80;
-        for line in content.lines() {
-            if line.contains("ERROR") || line.contains("FATAL") {
-                keep.push(line);
-                error_count += 1;
-            } else if line.contains("INFO") || line.contains("WARN") || line.contains("DEBUG") {
-                keep.push(line);
+        // v0.104.6 D227：marker 也要算进预算，否则收口时正文被截，
+        // 报出来的 error_count 与实际保留的行不再对应。
+        //
+        // 预留量用**实际** marker 文本算，不用拍脑袋的常数：`<compressed:…>`
+        // 段长度随 `original_size` 的位数变化，而 `<N ERROR lines preserved>`
+        // 段是否出现取决于全文有没有 ERROR 行（没有就不占预算）。
+        // 既有单测 `test_log_preserves_error_lines` 用 max_bytes=2000，
+        // 曾因固定预留 96 字节把保留行挤空而变红。
+        let error_total = content
+            .lines()
+            .filter(|l| l.contains("ERROR") || l.contains("FATAL"))
+            .count();
+        let marker_budget = format!("<compressed:method=log original_size={}>\n", content.len())
+            .len()
+            + if error_total > 0 {
+                // 保守取 8 位计数的长度
+                format!(
+                    "\n<{error_total} ERROR lines preserved> ({error_total} ERROR/FATAL total)\n"
+                )
+                .len()
             } else {
-                // 非日志行也保留 (避免截断非结构化日志如 stack trace)
-                keep.push(line);
-            }
-            if keep.len() >= line_budget.max(1) {
+                0
+            };
+        let line_budget = max_bytes.saturating_sub(marker_budget);
+
+        let mut keep: Vec<&str> = Vec::new();
+        let mut kept_bytes: usize = 0;
+        let mut error_count: usize = 0;
+        for line in content.lines() {
+            // +1 是 join("\n") 的分隔符
+            let cost = line.len() + 1;
+            if kept_bytes + cost > line_budget {
+                // v0.104.6 D227：预算耗尽即停。修前是 `keep.len() >= line_budget`
+                // —— 比较的是**行数**与**字节预算**，量纲都不对。
                 break;
             }
+            if line.contains("ERROR") || line.contains("FATAL") {
+                error_count += 1;
+            }
+            kept_bytes += cost;
+            keep.push(line);
         }
-        let mut out = keep.join("\n");
+
+        let body = keep.join("\n");
+        let mut marker = String::new();
         if error_count > 0 {
             // marker 必须包含 "ERROR lines preserved" 子串 (test contract),
             // 同时显式标记包含 FATAL。
-            out.push_str(&format!(
-                "\n<{} ERROR lines preserved> ({} ERROR/FATAL total)\n",
-                error_count, error_count
+            //
+            // v0.104.6 D227：括号里的数字此前写的是 `error_count`（= 保留数），
+            // 但文案说的是 "total"（= 全文总数）—— 两个不同含义填了同一个值。
+            // 保留数与总数在预算截断后会分叉，故分别填。
+            marker.push_str(&format!(
+                "\n<{error_count} ERROR lines preserved> ({error_total} ERROR/FATAL total)\n"
             ));
         }
-        out.push_str(&format!(
+        marker.push_str(&format!(
             "<compressed:method=log original_size={}>\n",
             content.len()
         ));
-        Ok(out)
+        Ok(crate::compress::finish_within_budget(
+            content, body, &marker, max_bytes,
+        ))
     }
 
     fn origin(&self) -> &'static str {
@@ -150,5 +186,45 @@ mod tests {
             out.contains("ERROR lines preserved"),
             "must include preserved marker: {out}"
         );
+    }
+
+    /// v0.104.6 D227 回归：预算必须按**真实字节数**累计，而不是「每行 80 字节」。
+    ///
+    /// 修前 `line_budget = max_bytes / 80`，对 560 字节/行的日志算出
+    /// 「还能放 60 行」，60 × 560 = 33660 字节远超 max_bytes —— 压缩了个寂寞。
+    /// 判据形态是**不变式**而非具体数字：无论每行多长，输出都 ≤ max_bytes，
+    /// 且行数随预算**单调**变化（预算翻倍 → 保留行数不减）。
+    #[test]
+    fn test_log_budget_scales_with_real_line_length() {
+        let c = LogSubCompressor;
+        let opts = CompressOptions::default();
+        // 故意用远大于 80 字节的行长，放大「80 字节假设」的误差
+        let long_line = format!("2026-07-01 10:00:00 INFO {}", "x".repeat(500));
+        let text = (0..60)
+            .map(|_| long_line.clone())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let mut prev_kept = 0usize;
+        for mb in [500usize, 1000, 2000, 4000] {
+            let out = c
+                .compress(&text, mb, &opts)
+                .expect("compress should not error");
+            assert!(
+                out.len() <= mb,
+                "D227: max_bytes={mb} 时输出 {} 字节超限（行长 {} 字节）",
+                out.len(),
+                long_line.len()
+            );
+            let kept = out.lines().filter(|l| l.contains("2026-07-01")).count();
+            assert!(
+                kept >= prev_kept,
+                "D227: 预算从 {} 增到 {mb}，保留行数不应变少（{} → {}）",
+                mb / 2,
+                prev_kept,
+                kept
+            );
+            prev_kept = kept;
+        }
     }
 }

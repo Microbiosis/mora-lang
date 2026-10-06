@@ -17,17 +17,26 @@ mod tests_v047_dag {
             Value::String("c".to_string()),
         ];
         let edges = vec![
-            Value::List(vec![
-                Value::String("a".to_string()),
-                Value::String("b".to_string()),
-            ]),
-            Value::List(vec![
-                Value::String("b".to_string()),
-                Value::String("c".to_string()),
-            ]),
+            Value::List(
+                vec![
+                    Value::String("a".to_string()),
+                    Value::String("b".to_string()),
+                ]
+                .into(),
+            ),
+            Value::List(
+                vec![
+                    Value::String("b".to_string()),
+                    Value::String("c".to_string()),
+                ]
+                .into(),
+            ),
         ];
         let result = interp
-            .call_ai_method("dag", &[Value::List(nodes), Value::List(edges)])
+            .call_ai_method(
+                "dag",
+                &[Value::List(nodes.into()), Value::List(edges.into())],
+            )
             .expect("dag 调用应成功");
         match result {
             Value::List(items) => {
@@ -52,17 +61,26 @@ mod tests_v047_dag {
             Value::String("b".to_string()),
         ];
         let edges = vec![
-            Value::List(vec![
-                Value::String("a".to_string()),
-                Value::String("b".to_string()),
-            ]),
-            Value::List(vec![
-                Value::String("b".to_string()),
-                Value::String("a".to_string()),
-            ]),
+            Value::List(
+                vec![
+                    Value::String("a".to_string()),
+                    Value::String("b".to_string()),
+                ]
+                .into(),
+            ),
+            Value::List(
+                vec![
+                    Value::String("b".to_string()),
+                    Value::String("a".to_string()),
+                ]
+                .into(),
+            ),
         ];
         let err = interp
-            .call_ai_method("dag", &[Value::List(nodes), Value::List(edges)])
+            .call_ai_method(
+                "dag",
+                &[Value::List(nodes.into()), Value::List(edges.into())],
+            )
             .expect_err("cycle should fail");
         assert!(err.contains("ai.dag"), "got: {}", err);
         assert!(err.contains("cycle"), "got: {}", err);
@@ -78,25 +96,40 @@ mod tests_v047_dag {
             Value::String("d".to_string()),
         ];
         let edges = vec![
-            Value::List(vec![
-                Value::String("a".to_string()),
-                Value::String("b".to_string()),
-            ]),
-            Value::List(vec![
-                Value::String("a".to_string()),
-                Value::String("c".to_string()),
-            ]),
-            Value::List(vec![
-                Value::String("b".to_string()),
-                Value::String("d".to_string()),
-            ]),
-            Value::List(vec![
-                Value::String("c".to_string()),
-                Value::String("d".to_string()),
-            ]),
+            Value::List(
+                vec![
+                    Value::String("a".to_string()),
+                    Value::String("b".to_string()),
+                ]
+                .into(),
+            ),
+            Value::List(
+                vec![
+                    Value::String("a".to_string()),
+                    Value::String("c".to_string()),
+                ]
+                .into(),
+            ),
+            Value::List(
+                vec![
+                    Value::String("b".to_string()),
+                    Value::String("d".to_string()),
+                ]
+                .into(),
+            ),
+            Value::List(
+                vec![
+                    Value::String("c".to_string()),
+                    Value::String("d".to_string()),
+                ]
+                .into(),
+            ),
         ];
         let result = interp
-            .call_ai_method("dag", &[Value::List(nodes), Value::List(edges)])
+            .call_ai_method(
+                "dag",
+                &[Value::List(nodes.into()), Value::List(edges.into())],
+            )
             .expect("dag 调用应成功");
         match result {
             Value::List(items) => {
@@ -122,7 +155,10 @@ mod tests_v047_dag {
             Value::String("b".to_string()),
         ];
         let result = interp
-            .call_ai_method("dag", &[Value::List(nodes), Value::List(vec![])])
+            .call_ai_method(
+                "dag",
+                &[Value::List(nodes.into()), Value::List(vec![].into())],
+            )
             .expect("dag 调用应成功");
         match result {
             Value::List(items) => assert_eq!(items.len(), 2),

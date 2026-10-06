@@ -4,7 +4,27 @@
 //! - interp 部分：`run_mir` / `run_mir_with_signal` / `MirSignal` /
 //!   `build_task_registry` / `run_main_task` / 索引与模式匹配辅助。
 //! - dag_interp 部分：`run_dag_with_signal*` — BSP 超步模型，生产主路径。
-//!   `run_mir ≡ run_dag`（dag.add_sequential_edges 后退化线性）。
+//!
+//! v0.104.6 核实：原注释在此写的是
+//!   「`run_mir ≡ run_dag`（dag.add_sequential_edges 后退化线性）」。
+//!   **该表述不成立** —— `run_mir` 的构建链是
+//!   `dag_analyze → dag_optimize → prune_sequence_edges`，**根本不含**
+//!   `add_sequential_edges`；而把图线性化后再交给同一个 BSP 执行器，
+//!   控制流语义会变（实测 9 例中 3 例与生产路径发散：`if-else` /
+//!   `for+break` / `while+continue`）。
+//!
+//!   v0.104.6 复核更正：本段原写「`while+continue` 一例线性化反而算对、
+//!   生产路径错，即执行器缺陷 E1」—— **两处都错**。以 `continue` 的
+//!   if/else 等价改写做三路对照实测（`tests/continue_semantics.rs`）：
+//!   生产路径的 5.0 才是对的，线性化的 6.0 是错值（它把 `continue` 当
+//!   跳过的部分照跑，多执行了一轮）。且 E1 早已修复而该发散依旧，归因不成立。
+//!   详见 `tests/run_mir_equiv_run_dag.rs`（6 条真等价 + 3 条已记录分歧）
+//!   与 `tests/continue_semantics.rs`。
+//!
+//! 准确的现状：`run_mir` 已**完全委派**给 `run_dag_with_signal`（经 DAG 缓存），
+//! 两者共用同一套 handler —— 即「线性」的执行实现在 v0.59 就已归并进非线性
+//! 执行器；残留的只是 `add_sequential_edges` 这个**无人调用**、且**不保语义**
+//! 的工具方法。
 //!
 //! 模块引用：外部统一 `crate::mir::vm::`（旧 `mir::interp::` /
 //! `mir::dag_interp::` 已合并，见 CHANGELOG v0.75.47）。
@@ -47,9 +67,24 @@ pub fn build_task_registry(body: &[MirInst]) -> HashMap<&str, (&[String], &MirFu
 
 /// MIR 解释器执行一个 MirFunction，返回最后的表达式值或 Return 值。
 ///
-/// v0.59: 现在通过 DAG 分析 + 强制 Sequence 边退化为线性执行，
-/// 与 `run_dag` 共享同一套 handler 函数。等价于:
-///   dag_analyze(func) → add_sequential_edges() → run_dag()
+/// v0.59: 现在通过 DAG 分析执行，与 `run_dag` 共享同一套 handler 函数。
+/// 构建链为 `dag_analyze → dag_optimize → prune_sequence_edges`（经
+/// `MirHost::dag_cache` 缓存）。
+///
+/// v0.104.6 更正：本函数原注释称
+/// 「v0.59: 现在通过 DAG 分析 + 强制 Sequence 边退化为线性执行 …
+/// 等价于 `dag_analyze(func) → add_sequential_edges() → run_dag()`」——
+/// **该表述不成立**：`add_sequential_edges` 从未出现在本函数的构建链里。
+/// 且实测表明，线性化后的图交给同一个 BSP 执行器会**改变控制流语义**
+/// （`if-else` / `for+break` / `while+continue` 三例发散）。
+///
+/// v0.104.6 复核更正：此段原写「`while+continue` 一例线性化反而正确、
+/// 生产路径错误 —— 即缺陷 E1」。**两处都错**：生产路径的 5.0 才是对的
+/// （`continue` 的 if/else 等价写法同样得 5.0，删掉 `continue` 才得 6.0，
+/// 见 `tests/continue_semantics.rs`）；线性化路径的 6.0 才是错值，原因是
+/// 它**忽略了 `break` / `continue`** —— 这与 `for+break` 那例的错法同源。
+/// E1 早已修复而发散依旧，故原归因不成立。
+/// 证据与复现见 `tests/run_mir_equiv_run_dag.rs`。
 ///
 /// v0.75.9: 接收 `&Arc<MirFunction>` — 优化后 DAG 走宿主内核缓存
 /// （`MirHost::dag_cache`，key = Arc 指针），同 Arc 跨调用复用。
@@ -63,33 +98,124 @@ pub fn run_mir(
 }
 
 /// α.1: 索引操作 List[i] / Dict[key] / String[i]
+///
+/// v0.104.6 修复：字符串索引**在源码层完全不可用**。
+///
+/// 本语言所有数值字面量都是 `Value::Float`（`str(3)` 得 `"3.0"` 可证），
+/// 所以 `s[0]` 传进来的实参是 `Float(0.0)`；而下面的字符串分支只匹配
+/// `Value::Int`，于是**任何** `s[i]` 都掉进末尾的 `_ =>` 兜底：
+///
+/// ```text
+/// let s = "abc"
+/// s[0]              # ERR: cannot index String("abc") with Float(0.0)
+/// s[len(s) - 1]     # ERR: cannot index … with Float(2.0)
+/// ```
+///
+/// 即「取一个字符」这个最基本的操作在源语言里根本写不出来。`Value::Int` 只能
+/// 从 `len()` 一类产出 `Int` 的原语拿到，而 `len(s) - 1` 经算术后又会退回
+/// `Float`（见 `flow.rs` 的 Int/Float 混合算术），所以旧签名够不着。
+///
+/// List 分支本来就同时收 Int 与 Float，字符串分支与之对齐即可。
+/// 索引归一化：把数值下标转成 `usize`，并拒绝**负数**与 NaN。
+///
+/// v0.104.6 D28：负下标**静默返回首元素**。
+///
+/// 根因是 Rust 的浮点→整数 `as` 转换是**饱和**转换（Rust 1.45 起）：
+/// `-1.0 as usize == 0`、`-5.0 as usize == 0`、`-0.0 as usize == 0`，
+/// 既不 panic 也不报错。而 `Value::Float` 正是**裸数字字面量的运行期类型**
+/// （`lexer.rs:702` 一律发射 `TokenType::Float`），所以 `xs[-1]` 走的就是
+/// 这条分支：
+///
+/// ```text
+/// let xs = [1, 2, 3]
+/// xs[-1]     # 1.0 —— 静默给首元素
+/// xs[-5]     # 1.0 —— 越界 5 位，仍给首元素
+/// "abc"[-1]  # a
+/// ```
+///
+/// 即「取倒数第 N 个」这个意图会**无声地退化成取第一个**，不报错。
+///
+/// 与正向越界既有的约定对齐：下标不落在 `[0, len)` 内一律报错，只是把
+/// 此前被饱和转换吞掉的「负」与「非数」两种情形也纳入检查。
+///
+/// `what` 是错误信息里的下标措辞（`"index"` / `"string index"`）—— 字符串
+/// 越界历来报 `string index N out of bounds`，别被顺手改成通用的
+/// `index N`（`tests/builtin_gaps.rs` 的 D2/D3 用例锁着这条措辞，
+/// 它对用户判断「是哪个空间越界了」有信息量）。
+fn checked_index(n: f64, len: usize, what: &str) -> Result<usize, String> {
+    if n.is_nan() {
+        return Err(format!("{}: NaN is not a valid index", what));
+    }
+    if n < 0.0 {
+        return Err(format!("negative {}: {}", what, n));
+    }
+    // 上界用原始 f64 比较，`as usize` 的饱和值不进消息 —— 否则
+    // `xs[1e30]` 会报成 index 18446744073709551615，与源码对不上。
+    if n >= len as f64 {
+        return Err(format!("{} {} out of bounds (len {})", what, n, len));
+    }
+    // ⚠ 浮点下标**向零截断是既定设计**（v0.104.6 D3 的决定），由
+    // `tests/depth_and_diagnostics.rs::d28_positive_index_unaffected` 钉住：
+    //     // 浮点下标按既有约定向零截断（D3 的设计决定）
+    //     assert_eq!(run("…\nxs[1.9]").unwrap(), "Float(2.0)");
+    //     assert_eq!(run("…\ns[1.9]").unwrap(), "Char('b')");
+    //
+    // D320 曾试图改成「小数下标报错」，被该判据打回后**已回退**。
+    // D320 的教训：D28（负下标）与 `method_dispatch`（越界吞成 nil）讲的是
+    // **越界/负数**两条，不覆盖小数；**不能拿「下标算错必须暴露」这条原则
+    // 去推「小数也该报错」** —— 原则的适用边界要看既有判据钉了什么。
+    Ok(n as usize)
+}
+
 pub fn index_value(obj: &Value, idx: &Value) -> Result<Value, String> {
     match (obj, idx) {
         (Value::List(list), Value::Int(i)) => {
-            let i = *i as usize;
+            let i = checked_index(*i as f64, list.len(), "index")?;
             list.get(i)
                 .cloned()
                 .ok_or_else(|| format!("index {} out of bounds (len {})", i, list.len()))
         }
         (Value::List(list), Value::Float(n)) => {
-            let i = *n as usize;
+            let i = checked_index(*n, list.len(), "index")?;
             list.get(i)
                 .cloned()
                 .ok_or_else(|| format!("index {} out of bounds (len {})", i, list.len()))
         }
         (Value::Dict(map), Value::String(key)) => Ok(map.get(key).cloned().unwrap_or(Value::Nil)),
+        // 字符语义（非字节）：与 `len()` 的 `chars().count()` 同一口径。
         (Value::String(s), Value::Int(i)) => {
-            let i = *i as usize;
-            s.chars().nth(i).map(Value::Char).ok_or_else(|| {
-                format!(
-                    "string index {} out of bounds (len {})",
-                    i,
-                    s.chars().count()
-                )
-            })
+            let i = checked_index(*i as f64, s.chars().count(), "string index")?;
+            char_at(s, i)
         }
-        _ => Err(format!("cannot index {:?} with {:?}", obj, idx)),
+        (Value::String(s), Value::Float(n)) => {
+            let i = checked_index(*n, s.chars().count(), "string index")?;
+            char_at(s, i)
+        }
+        // v0.104.6：`{:?}` → 类型名 + Display。
+        //
+        // `Value::Dict` 是 `HashMap`，`Debug` 按迭代序打印，而 `RandomState`
+        // 每进程随机 —— 于是**同一条错误信息在不同进程里键序不同**（本会话早前
+        // 修过 Display / JSON / keys / values 的同类问题，`{:?}` 这条路漏了）。
+        // 改用 `flow::type_name`（错误本来讲的就是「类型不对」）+ 已排序的
+        // `Display`，顺带比整块 dump 更好读。
+        _ => Err(format!(
+            "cannot index {} with {}",
+            crate::flow::type_name(obj),
+            crate::flow::type_name(idx)
+        )),
     }
+}
+
+/// 取字符串第 `i` 个**字符**（非字节）。越界报「字符数」而非「字节数」，
+/// 否则与 `len(s)` 对不上 —— 那是 v0.104.6 之前 `len` 数字节时留下的错位。
+fn char_at(s: &str, i: usize) -> Result<Value, String> {
+    s.chars().nth(i).map(Value::Char).ok_or_else(|| {
+        format!(
+            "string index {} out of bounds (len {})",
+            i,
+            s.chars().count()
+        )
+    })
 }
 
 /// α.1: Value 转字符串（p"..." 拼接用，与 AST 解释器 evaluate_prompt 语义一致）
@@ -110,24 +236,28 @@ pub fn value_to_string(v: &Value) -> String {
 // 收敛为单一实现：crate::flow::is_truthy（MIR 条件分支唯一真值源），
 // handlers 的 h_jump_if/h_jump_if_not 与 DAG Branch 共用。
 
-/// α.2: 索引赋值 obj[idx] = val（就地修改）
+/// α.2: 索引赋值 obj\[idx\] = val（就地修改）
+///
+/// v0.104.6：`List` 是**不可变**的，原地 `list[i] = v` 不再成立 ——
+/// 值语义下「改」必须表达成「产出新列表并写回」。`List::set` 返回新列表，
+/// 这里把新列表赋回 `*obj`（`*obj` 已是 `&mut Value`）。
 pub fn index_assign_value(obj: &mut Value, idx: &Value, val: &Value) -> Result<(), String> {
     match (obj, idx) {
         (Value::List(list), Value::Int(i)) => {
-            let i = *i as usize;
+            let i = checked_index(*i as f64, list.len(), "index")?;
             if i >= list.len() {
                 Err(format!("index {} out of bounds (len {})", i, list.len()))
             } else {
-                list[i] = val.clone();
+                *list = list.set(i, val.clone());
                 Ok(())
             }
         }
         (Value::List(list), Value::Float(n)) => {
-            let i = *n as usize;
+            let i = checked_index(*n, list.len(), "index")?;
             if i >= list.len() {
                 Err(format!("index {} out of bounds (len {})", i, list.len()))
             } else {
-                list[i] = val.clone();
+                *list = list.set(i, val.clone());
                 Ok(())
             }
         }
@@ -181,6 +311,27 @@ pub fn self_match_pattern(
     {
         return (f - n).abs() < FLOAT_PATTERN_EPSILON;
     }
+    // v0.104.6 D317：bigint 模式: bigint:123
+    //
+    // `pattern_to_string`（`lower.rs:1255`）**会**把 `Literal::BigInt` 序列化成
+    // `bigint:{n}`，但本函数此前**没有任何 `bigint:` 分支** ⇒ 该模式穿过全部
+    // 分支后落到末尾的 `false`。
+    //
+    // 后果（实测）：`match 123n { 123n => "big", _ => "other" }` 恒得 `other`
+    // —— **同类型、同值也不匹配**。这是序列化器与匹配器之间的**不对称**
+    // （一端能产出、另一端认不出），不涉及任何语义取舍，故直接修。
+    //
+    // ⚠ **只修这一条，不碰 int↔float 互认**：`float:` 模式不认 `Value::Int`
+    // （`match len("xy") { 2 => "two", _ => "other" }` 恒得 `other`，而
+    // `len("xy") == 2` 为 `true`）是**另一件事** —— 那是「match 要不要跟
+    // `eval_binary` 的 `==` 一样做数值提升」的**语言语义决定**，
+    // 两种答案都自洽，故只报告不实施。见 CHANGELOG D317。
+    if let Some(suffix) = pat_str.strip_prefix("bigint:")
+        && let Value::BigInt(b) = val
+        && let Ok(n) = suffix.parse::<num_bigint::BigInt>()
+    {
+        return b == &n;
+    }
     // str 模式: str:hello
     if let Some(suffix) = pat_str.strip_prefix("str:")
         && let Value::String(s) = val
@@ -222,7 +373,7 @@ pub fn self_match_pattern(
                         // Bind the remaining items as a list to the rest variable
                         env.define(
                             rest_name.to_string(),
-                            Value::List(items[pos..].to_vec()),
+                            Value::List(items.slice(pos, items.len())),
                             false,
                         );
                     }
@@ -490,6 +641,14 @@ mod tests {
 
     #[test]
     fn dag_exec_chain() {
+        // 注：`run_mir_dag` 直调 `dag_analyze`、**不跑 `dag_optimize`**
+        // （见 `vm/dag.rs::run_mir_dag` 的 v0.104.6 说明：曾尝试对齐生产链，
+        // 但本用例随即变红 —— 折叠追加的节点未被激活，且「手写 MIR」与
+        // 「编译器产出 MIR」的差异尚未查清，故已回退）。
+        //
+        // 一旦 `run_mir_dag` 将来对齐优化链，本用例需要重新评估：届时
+        // `BinaryOp(4, 2, Add, 3)` 会被常量折叠成追加在尾部的新节点，
+        // 取值可能落到前一个节点（得 3，应 6）。
         assert_eq!(
             run(vec![
                 MirInst::Const(0, Value::Int(1)),
@@ -512,7 +671,7 @@ mod tests {
                 MirInst::ListLit(2, vec![0, 1])
             ])
             .unwrap(),
-            Value::List(vec![Value::Int(1), Value::Int(2)])
+            Value::List(vec![Value::Int(1), Value::Int(2)].into())
         );
     }
 

@@ -155,8 +155,10 @@ mod tests_v042_capability {
                 .is_some()
         );
 
-        // v0.49.0: revoked token 在 check_call 时返回 false (TokenNotFound,
-        // 因为 token.generation != current_generation)
+        // v0.104.6 D388 更正：revoked token 在 check_call 时返回 false
+        // (TokenNotFound)。真因是 store 的 `revoked` 集合（v0.49.0-fix P0-1），
+        // **不是**「token.generation != current_generation」——
+        // `check` 并不比较代数。
         let after = interp
             .call_sandbox_method(
                 "check_call",

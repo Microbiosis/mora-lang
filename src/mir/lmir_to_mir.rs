@@ -74,6 +74,16 @@ fn lower_lmir_inst(inst: &LmirInst) -> Option<MirInst> {
         LmirInst::ConstString(reg, _ptr, len) => {
             // LMIR 层字符串用 pointer+length 表示；逆降维时重建 Rust String。
             // 注意：这是 unsafe 的，仅用于骨架验证；生产路径应走 proper FFI。
+            // SAFETY: ⚠ **本文件当前未在 `mir/mod.rs` 里声明** ⇒ 不参与编译、
+            // 这段代码不会执行（`cargo test --lib lmir_to_mir` 为 0 tests）。
+            //
+            // 一旦有人补上 `mod lmir_to_mir;`，下面两个前提**必须**由上游保证，
+            // 而当前都没有任何检查：
+            //  ① `_ptr` 非空，且指向至少 `len` 字节的已初始化内存；
+            //  ② 这 `len` 字节是**合法 UTF-8** —— `from_utf8_unchecked` 不做
+            //     校验，非法字节会构造出一个无效 `str`，此后任何字符串操作
+            //     （切片 / 索引 / 长度）都是 UB。
+            // 接线前应改用 `std::str::from_utf8(slice)` 做校验。
             let s = unsafe {
                 let slice = std::slice::from_raw_parts(*_ptr, *len);
                 std::str::from_utf8_unchecked(slice)

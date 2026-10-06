@@ -10,8 +10,8 @@
 //! - 结构化控制流（If/While/For/Match），非 Jump/Label
 //!
 //! 与现有 IR 的关系：
-//! - WitnessKind (30 变体) → Node<M> 的子集映射（树形 → 结构化 CFG；typeck 消费面）
-//! - MirInst (50 变体) → Node<M> 不直接映射（MirInst 是线性的，Node 是结构化的）
+//! - WitnessKind (30 变体) → Node`<M>` 的子集映射（树形 → 结构化 CFG；typeck 消费面）
+//! - MirInst (50 变体) → Node`<M>` 不直接映射（MirInst 是线性的，Node 是结构化的）
 
 use crate::common::{BinaryOp, Literal, Span};
 use crate::mir::effect::EffectRow;
@@ -273,6 +273,23 @@ pub enum Node<M> {
         meta: M,
     },
     Handle {
+        /// v0.104.6 D35：handle 整体的结果寄存器（`h_handle` 写入 body 末尾
+        /// 表达式的值）。**本字段此前不存在**，而 `Perform` / `If` / `Match`
+        /// 等所有「表达式节点」都有 —— 缺它导致：
+        ///
+        /// * `node_result_reg_of` 匹配不到 `Handle` → 落 `_ => None` →
+        ///   兜底返回**哨兵 0**，于是 `let r = handle …` 的 `Let` 节点引用
+        ///   寄存器 0；
+        /// * `fcfg_lower` 只能**新分配** `k_dst = ctx.alloc_reg()`，而
+        ///   `lower_fcfg(nodes: &[Fcfg])` 收的是不可变切片，**写不回去**通知
+        ///   那个 `Let`。
+        ///
+        /// 结果两端脱节：`Define("r", 0)` 引用一个无任何生产者写过的寄存器 →
+        /// DAG 执行器 `node_ready` 恒 false → `Define` 永不激活 → 它所在的
+        /// Sequence 链断裂 → **其后所有 Effect 节点（含 `print`）静默消失**，
+        /// 无报错、退出码 0。判决实验：`MORA_9LAYER=0`（走 `emit.rs` 单遍
+        /// 直出、不经本 IR）现象消失。
+        dst: Reg,
         effect: String,
         body: Block<M>,
         handler: Block<M>,
@@ -325,7 +342,17 @@ pub enum Node<M> {
         meta: M,
     },
     /// solve 查询 —— goal 是目标构建体块。
+    ///
+    /// v0.104.6 D120：`dst` 是**解列表**的结果寄存器。缺此字段时
+    /// `node_result_reg_of` 落到 `_ => None` → `unwrap_or(0)` 哨兵 →
+    /// `let r = solve { … }` 的就绪门槛恒 false → 其后整条 Sequence 链
+    /// **静默饿死**（无报错、退出码 0）。与 D35(`Handle`)/D58(`WithConfig`)
+    /// 同一失败模式，那两个已修，此处漏了。
+    ///
+    /// 由 `witness_to_fcfg` 用**该层**的 `b.alloc()` 预分配 —— `fcfg_lower`
+    /// 必须复用它，不得另 alloc，否则两条寄存器序列对不上。
     Solve {
+        dst: Reg,
         limit: Option<usize>,
         query_vars: Vec<String>,
         anon_vars: Vec<String>,
@@ -393,6 +420,18 @@ pub enum Node<M> {
     WithConfig {
         bindings: Vec<(String, Reg)>,
         body: Block<M>,
+        /// v0.104.6 D58：块自身的**结果寄存器**。
+        ///
+        /// `with` 块的语义是「配一段上下文，跑块体，值不向外传播」
+        /// （emit 路径 `emit_with_w` 的注释即写着「子 body 的返回值不传播」，
+        /// 随后补一条 `Const(dst, Nil)`）。此前本节点**没有**结果寄存器，
+        /// 于是 `witness_to_fcfg::node_result_reg_of` 落 `_ => None`
+        /// → `unwrap_or(0)` → 块结果被指向**寄存器 0**，而 reg 0 恰恰是
+        /// 第一个配置绑定值 —— `with model = "gpt-4o" / 2 / end` 的块结果
+        /// 因此变成 `String("gpt-4o")`（裸路径是 `Nil`）。
+        ///
+        /// 与 D35 给 `Node::Handle` 补 `dst` 是同一类修复、同一种失败形态。
+        dst: Reg,
         span: Span,
         meta: M,
     },

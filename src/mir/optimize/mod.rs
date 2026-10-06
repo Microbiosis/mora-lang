@@ -77,7 +77,31 @@ use crate::mir::optimize::search::greedy_search;
 pub fn apply_rules(func: &mut MirFunction) {
     let rules = builtin_rules();
     let cost = TokenEstimate;
-    let result = greedy_search(&func.body, &rules, &cost, 50);
+    // v0.104.6 D33：`max_iter` 由 50 提到 2000。
+    //
+    // `greedy_search` **收敛即停**（`best` 为 `None` 就 break），所以这个
+    // 常数只是**上限**，不是固定成本 —— 提高它对已收敛的程序零影响（实测
+    // 375/1000 个 `let`、普通 `let`+`for` 程序，提上限前后耗时不变）。
+    //
+    // 它只约束「优化机会数 > 50」的程序，而那正是**优化不完整**的程序：
+    // 每轮只应用一条重写，所以 n 个独立机会要 n 轮，50 轮上限会把其余
+    // 全部丢掉。实测 500 层嵌套 `if true`（`max_iter=50` 时）：
+    //
+    // ```text
+    // iterations=50  applied=50   body 4000 → 3950   ← 只折叠 50 个，
+    //                                                    450 个常量条件没优化
+    // ```
+    //
+    // 提到 2000 后（同一程序）：
+    //
+    // ```text
+    // iterations=501 applied=500  body 4000 → 3500   ← 全部折叠，每层省 1 条
+    // ```
+    //
+    // 代价是这类程序的**编译**时间：if500 实测 2.1 s → 7.8 s（3.7×，
+    // 因为轮数 O(机会数) × 每轮 O(body) = O(n²)）。编译是一次性成本，
+    // 而被折叠掉的分支判断影响**每次运行**，取舍以此。
+    let result = greedy_search(&func.body, &rules, &cost, 2000);
     func.body = result.body;
     func.n_regs = func.n_regs.max(
         func.body

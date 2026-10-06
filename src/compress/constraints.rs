@@ -50,20 +50,43 @@ impl Constraint for KeepOutliersConstraint {
         // 只对 role=Anomaly 字段跑 outlier 检测
         // (Score 字段的高值是 feature 不是 outlier, 由 TopNStrategy 保留)
         for field in fields.iter().filter(|f| f.role == FieldRole::Anomaly) {
-            let values: Vec<&Value> = items
+            // v0.104.6 D369：**必须记 items 下标，不能只收 `values`**。
+            //
+            // 修前只 `filter_map` 收 `values`，`outliers_by_zscore` 返回的
+            // 是**values 的下标**，而下面 `keep.push(i)` 把它当 **items 下标**
+            // 用 ⇒ 只要有任何一条记录**缺这个键**（JSON 里极常见），
+            // 之后所有下标**全部错位**。
+            //
+            // 实测（20 条记录，前 3 条缺 `v`，outlier 在 items[15]）：
+            //
+            // ```text
+            // items n=20, values n=17, outlier 在 values 里是 [12]
+            // constraint 保留 items[12]（值 22.0）—— 错
+            // 真正的 outlier items[15]（值 9999.0）—— 被丢掉
+            // ```
+            //
+            // 修法：收 `(items 下标, &Value)`，并把 items 下标传下去。
+            let indexed: Vec<(usize, &Value)> = items
                 .iter()
-                .filter_map(|it| {
+                .enumerate()
+                .filter_map(|(i, it)| {
                     if let Value::Dict(d) = it {
-                        d.get(&field.name)
+                        d.get(&field.name).map(|v| (i, v))
                     } else {
                         None
                     }
                 })
                 .collect();
+            let values: Vec<&Value> = indexed.iter().map(|(_, v)| *v).collect();
+            let value_to_item: Vec<usize> = indexed.iter().map(|(i, _)| *i).collect();
             let outliers = outliers_by_zscore(&values, 2.0);
-            for i in outliers {
-                if !keep.contains(&i) {
-                    keep.push(i);
+            for pos in outliers {
+                // `pos` 是 values 下标 ⇒ 映回 items 下标。
+                let Some(&item_idx) = value_to_item.get(pos) else {
+                    continue;
+                };
+                if !keep.contains(&item_idx) {
+                    keep.push(item_idx);
                 }
             }
         }
@@ -71,16 +94,13 @@ impl Constraint for KeepOutliersConstraint {
 }
 
 pub fn outliers_by_zscore(values: &[&Value], z: f64) -> Vec<usize> {
+    // v0.104.6 D231：数值提取统一走 `super::json::value_as_f64`。
+    // 修前只认 `Float` ⇒ `json.parse` 读入的整数列**永远不产生任何 outlier**，
+    // `preserve_outliers` 保护对整数列**静默失效**。
     let nums: Vec<(usize, f64)> = values
         .iter()
         .enumerate()
-        .filter_map(|(i, v)| {
-            if let Value::Float(n) = v {
-                Some((i, *n))
-            } else {
-                None
-            }
-        })
+        .filter_map(|(i, v)| super::json::value_as_f64(v).map(|n| (i, n)))
         .collect();
     if nums.len() < 5 {
         return vec![];

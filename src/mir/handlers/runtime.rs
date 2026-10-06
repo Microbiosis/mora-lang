@@ -1,6 +1,5 @@
 //! Runtime instructions — orchestrate, file I/O, and private execution helpers.
 
-use std::cmp::Ordering;
 use std::collections::HashMap;
 
 use crate::mir::host::MirHost;
@@ -647,7 +646,10 @@ fn run_moe(
         })?;
         scored.push((name.clone(), s));
     }
-    scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
+    // v0.104.6 D242：`total_cmp`（IEEE 754 全序）而非
+    // `partial_cmp(...).unwrap_or(Equal)` —— 后者遇 NaN score 时违反
+    // 传递性，「取 top_k」会依赖输入顺序（D241 同款）。
+    scored.sort_by(|a, b| b.1.total_cmp(&a.1));
     scored.truncate(top_k);
     if scored.is_empty() {
         return Err("moe: router returned no scores".to_string());
@@ -851,7 +853,7 @@ fn run_pregel_config(
         .collect();
     env.define(
         format!("{}_conflicts", result_var),
-        Value::List(conflict_list),
+        Value::List(conflict_list.into()),
         false,
     );
     env.define(result_var.to_string(), result, false);

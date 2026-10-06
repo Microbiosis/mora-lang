@@ -88,30 +88,42 @@ impl DocumentBackend for PdfBackend {
             block_dict.insert("kind".into(), Value::String("text".into()));
             block_dict.insert(
                 "bbox".into(),
-                Value::List(vec![
-                    Value::Float(0.0),
-                    Value::Float(0.0),
-                    Value::Float(595.0),
-                    Value::Float(842.0),
-                ]),
+                Value::List(
+                    vec![
+                        Value::Float(0.0),
+                        Value::Float(0.0),
+                        Value::Float(595.0),
+                        Value::Float(842.0),
+                    ]
+                    .into(),
+                ),
             );
             let mut span_dict: HashMap<String, Value> = HashMap::new();
             span_dict.insert("text".into(), Value::String(text.clone()));
             span_dict.insert(
                 "bbox".into(),
-                Value::List(vec![
-                    Value::Float(0.0),
-                    Value::Float(0.0),
-                    Value::Float(595.0),
-                    Value::Float(842.0),
-                ]),
+                Value::List(
+                    vec![
+                        Value::Float(0.0),
+                        Value::Float(0.0),
+                        Value::Float(595.0),
+                        Value::Float(842.0),
+                    ]
+                    .into(),
+                ),
             );
             span_dict.insert("score".into(), Value::Nil);
-            block_dict.insert("spans".into(), Value::List(vec![Value::Dict(span_dict)]));
-            page_dict.insert("blocks".into(), Value::List(vec![Value::Dict(block_dict)]));
+            block_dict.insert(
+                "spans".into(),
+                Value::List(vec![Value::Dict(span_dict)].into()),
+            );
+            page_dict.insert(
+                "blocks".into(),
+                Value::List(vec![Value::Dict(block_dict)].into()),
+            );
             out.push(Value::Dict(page_dict));
         }
-        Ok(Value::List(out))
+        Ok(Value::List(out.into()))
     }
 
     /// MVP: returns the cached page text. With pdf-extract 0.12 collapsing
@@ -148,20 +160,26 @@ impl DocumentBackend for PdfBackend {
             block_dict.insert("kind".into(), Value::String("text".into()));
             block_dict.insert(
                 "bbox".into(),
-                Value::List(vec![
-                    Value::Float(0.0),
-                    Value::Float(0.0),
-                    Value::Float(595.0),
-                    Value::Float(842.0),
-                ]),
+                Value::List(
+                    vec![
+                        Value::Float(0.0),
+                        Value::Float(0.0),
+                        Value::Float(595.0),
+                        Value::Float(842.0),
+                    ]
+                    .into(),
+                ),
             );
             let mut span_dict: HashMap<String, Value> = HashMap::new();
             span_dict.insert("text".into(), Value::String(text.clone()));
             span_dict.insert("score".into(), Value::Nil);
-            block_dict.insert("spans".into(), Value::List(vec![Value::Dict(span_dict)]));
+            block_dict.insert(
+                "spans".into(),
+                Value::List(vec![Value::Dict(span_dict)].into()),
+            );
             out.push(Value::Dict(block_dict));
         }
-        Ok(Value::List(out))
+        Ok(Value::List(out.into()))
     }
 }
 

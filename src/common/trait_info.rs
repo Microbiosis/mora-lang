@@ -35,7 +35,7 @@ pub struct TraitMethodSig {
 }
 
 /// v0.09: 注册 impl method 时用的 key（含泛型签名）
-/// 格式: __impl_<Trait>_<TraitGen>_<ForType>_<ForGen>_<method>
+/// 格式: __impl_`<Trait>`_`<TraitGen>`_`<ForType>`_`<ForGen>`_`<method>`
 pub fn impl_method_key(
     trait_name: &str,
     trait_generics: &[String],
@@ -52,7 +52,7 @@ pub fn impl_method_key(
 }
 
 /// v0.09: 默认实现的 key（self 类型 = trait 名）
-/// 格式: __impl_<Trait>_<TraitGen>_<method>
+/// 格式: __impl_`<Trait>`_`<TraitGen>`_`<method>`
 pub fn default_impl_method_key(
     trait_name: &str,
     trait_generics: &[String],

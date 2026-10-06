@@ -1,6 +1,6 @@
 //! v0.89: EHIR → Core 降维 — 9 层架构桥接第 1 段。
 //!
-//! 将 Node<TypeInfo>（带类型的结构化 CFG）降维为 CoreInst（SSA 基元）。
+//! 将 Node`<TypeInfo>`（带类型的结构化 CFG）降维为 CoreInst（SSA 基元）。
 //!
 //! 降维内容：
 //! - FnDef → ClosureCreate + EnvStore（函数即闭包）

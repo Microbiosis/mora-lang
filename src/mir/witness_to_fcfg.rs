@@ -671,7 +671,12 @@ fn build_node(b: &mut FcfgBuilder, w: &MirWitness) -> Node<()> {
         } => {
             let body_block = build_block(b, body);
             let handler_block = build_block(b, handler);
+            // v0.104.6 D35：结果寄存器必须**在这里**预分配并放进 Node ——
+            // `fcfg_lower` 收的是 `&[Fcfg]` 不可变切片，无法事后回填。
+            // 与 `WitnessKind::Perform` 的 `b.alloc()` 完全同构。
+            let dst = b.alloc();
             Node::Handle {
+                dst,
                 effect: effect.clone(),
                 body: body_block,
                 handler: handler_block,
@@ -808,7 +813,12 @@ fn build_node(b: &mut FcfgBuilder, w: &MirWitness) -> Node<()> {
             goal,
         } => {
             let goal_block = build_block(b, goal);
+            // v0.104.6 D120：预分配解列表的结果寄存器（与 D58 的 WithConfig::dst
+            // 同理）。缺它 → node_result_reg_of 落 `_ => None` → 哨兵 0 →
+            // `let r = solve { … }` 就绪门槛恒 false → 后续语句静默饿死。
+            let dst = b.alloc();
             Node::Solve {
+                dst,
                 limit: *limit,
                 query_vars: query_vars.clone(),
                 anon_vars: anon_vars.clone(),
@@ -826,9 +836,13 @@ fn build_node(b: &mut FcfgBuilder, w: &MirWitness) -> Node<()> {
                 nodes.push(n);
             }
             let body_block = build_block(b, body);
+            // v0.104.6 D58：预分配块自身的 dst —— `with` 块的值是 Nil
+            // （子 body 的返回值不传播），见 `Node::WithConfig::dst` 的说明。
+            let dst = b.alloc();
             nodes.push(Node::WithConfig {
                 bindings: pairs,
                 body: body_block,
+                dst,
                 span,
                 meta: (),
             });
@@ -841,6 +855,16 @@ fn build_node(b: &mut FcfgBuilder, w: &MirWitness) -> Node<()> {
         WitnessKind::Quasiquote { segments } => {
             let mut nodes: Vec<Node<()>> = Vec::new();
             let mut segs: Vec<QuasiquoteSegment> = Vec::new();
+            // v0.104.6 D278：标记段把**紧随其后**的那一段变成 splice。
+            //
+            // 修前这里是「跳过标记」而已 —— 被标记的段随后仍按 `Unquote`
+            // 处理（取寄存器值经 Display 拼进源码），于是 `` `,,xs `` 得到
+            // `List([1.0, 2.0, 3.0])` 而不是 `1, 2, 3`。
+            // 标记由 `parser_v3::emit::emit_quasiquote_w` 产出（此前从未产出）。
+            //
+            // 下游两处**早已**正确处理 `UnquoteSplice`
+            // （`fcfg_lower` 与 `ehir_to_core`），所以这里补上即可点亮整条链。
+            let mut pending_splice = false;
             for seg in segments {
                 match &seg.kind {
                     // Quote 段：Literal(String)
@@ -849,11 +873,17 @@ fn build_node(b: &mut FcfgBuilder, w: &MirWitness) -> Node<()> {
                     }
                     // UnquoteSplice 标记：Literal(Boolean("splice"))
                     WitnessKind::Literal(Literal::Bool(true, _)) => {
-                        // 已在前面处理 — 跳过标记
+                        pending_splice = true;
                     }
                     _ => {
                         let n = build_node(b, seg);
-                        segs.push(QuasiquoteSegment::Unquote(node_result_reg(&n)));
+                        let r = node_result_reg(&n);
+                        segs.push(if pending_splice {
+                            QuasiquoteSegment::UnquoteSplice(r)
+                        } else {
+                            QuasiquoteSegment::Unquote(r)
+                        });
+                        pending_splice = false;
                         nodes.push(n);
                     }
                 }
@@ -911,7 +941,21 @@ fn node_result_reg_of(n: &Node<()>) -> Option<Reg> {
         // 结果寄存器由 witness_to_fcfg 预分配、fcfg_lower 两分支各 Copy 一次。
         // 缺此 arm 时消费者（`let` 绑定）只能拿到哨兵 0。
         | Node::If { dst: reg, .. }
+        // v0.104.6 D35：Handle 也是**表达式**（`let r = handle …`），结果
+        // 寄存器由 witness_to_fcfg 预分配、fcfg_lower 用它作 `k_dst`。
+        // 缺此 arm 时 `let` 绑定只能拿到哨兵 0 → 就绪门槛恒 false →
+        // 其后整条 Sequence 链静默饿死（无报错、退出码 0）。
+        | Node::Handle { dst: reg, .. }
+        // v0.104.6 D58：`with` 块也是**值产生节点**（值恒为 Nil）。
+        // 缺此 arm 时结果落 `unwrap_or(0)` → 指向**第一个配置绑定值**的寄存器
+        // → `with model = "gpt-4o" / 2 / end` 的块结果变成 `String("gpt-4o")`，
+        // 而裸路径是 `Nil`。与上面 D35 的 `Handle` arm 同一类。
+        | Node::WithConfig { dst: reg, .. }
         | Node::Quasiquote { dst: reg, .. } => Some(*reg),
+        // v0.104.6 D120：solve 产生**解列表**，是值产生节点。缺此 arm 时
+        // `let r = solve { … }` 的绑定拿到哨兵 0，就绪门槛恒 false。
+        // 单独成 arm（不并进上面的 or-pattern）以便反向验证整体摘除。
+        Node::Solve { dst, .. } => Some(*dst),
         Node::Sequence { nodes, .. } => nodes.last().and_then(node_result_reg_of),
         _ => None,
     }
@@ -1031,7 +1075,11 @@ fn build_orchestrate_kind(_b: &mut FcfgBuilder, k: &WitnessOrchestrateKind) -> O
             top_k,
             ..
         } => OrchestrateKind::MoE {
-            experts: experts.iter().map(|e| format!("{:?}", e.span)).collect(),
+            // v0.104.6 D270：专家项现为 `WitnessMoeExpert`，span 在其 `def` 上。
+            experts: experts
+                .iter()
+                .map(|e| format!("{:?}", e.def.span))
+                .collect(),
             router: format!("{:?}", router.span),
             top_k: *top_k,
         },

@@ -368,7 +368,9 @@ fn value_to_json(v: &Value) -> JsonValue {
 }
 
 fn json_error(msg: &str) -> String {
-    let escaped = msg.replace('\\', "\\\\").replace('"', "\\\"");
+    // v0.104.6 D209：改用共享的 RFC 8259 转义器
+    let escaped = crate::flow::escape_json_string(msg);
+
     format!("{{\"error\":\"{}\"}}", escaped)
 }
 
@@ -423,14 +425,35 @@ async fn parse_request(stream: &mut TcpStream) -> io::Result<HttpRequest> {
     })
 }
 
-async fn send_response(stream: &mut TcpStream, status: u16, body: &str) -> io::Result<()> {
-    let status_text = match status {
+/// HTTP 状态码 → reason phrase。
+///
+/// v0.104.6 D214：此前这段 `match` 是 `send_response` 内联的，且兜底是
+/// `_ => "OK"` —— 而 **504 根本不在 match 里**。于是 handler 超时时返回：
+///
+/// ```text
+/// HTTP/1.1 504 OK          ← 状态码说「超时」，reason phrase 说「成功」
+/// ```
+///
+/// 两个字段**互相矛盾**。reason phrase 虽是 RFC 9110 的遗留字段、多数客户端
+/// 忽略，但 `curl -v` / 代理 / 日志 / 任何读它的人都直接看到这句话，
+/// 且**任何将来新增的状态码都会静默被标成 "OK"** —— 与 D193 / D201 / D213
+/// 同族的「声明一样、做成另一个样」。
+///
+/// 改为：抽成独立纯函数（可被测试直接钉住）、**补齐 504**、
+/// 兜底改成 `"Unknown"` —— 宁可说「不知道」，也不说「OK」。
+pub fn status_text(status: u16) -> &'static str {
+    match status {
         200 => "OK",
         400 => "Bad Request",
         404 => "Not Found",
         500 => "Internal Server Error",
-        _ => "OK",
-    };
+        504 => "Gateway Timeout",
+        _ => "Unknown",
+    }
+}
+
+async fn send_response(stream: &mut TcpStream, status: u16, body: &str) -> io::Result<()> {
+    let status_text = status_text(status);
     // S5 fix: CORS 通配符改为可配置。默认 *（本地开发兼容），生产环境应通过
     // MORA_CORS_ORIGIN 环境变量收紧（如 "https://example.com"）。
     // 注意：S6 已将默认绑定改为 127.0.0.1，* 的实际风险已大幅降低（仅本机可达）。

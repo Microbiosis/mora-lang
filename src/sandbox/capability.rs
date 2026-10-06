@@ -195,11 +195,18 @@ impl std::error::Error for SandboxError {}
 
 /// v0.42.0: Capability Store — token_id → CapabilityToken 映射
 ///
-/// 设计: 单线程同步, 用 Arc<Mutex> 共享 (与 EventBus 一致).
+/// 设计: 单线程同步, 用 Arc`<Mutex>` 共享 (与 EventBus 一致).
 /// `next_id` 单调递增.
-/// v0.49.0 (A1+B1): revoke bumps `current_generation` (not token's); `check` requires
-/// `token.generation == current_generation` (else TokenNotFound). Previously `check`
-/// ignored generation entirely — revoke was a no-op for security checks.
+/// v0.49.0-fix (P0-1): revoke 走**逐令牌**的 `revoked` 集合，`check` 查它。
+///
+/// v0.104.6 D388 更正：本段此前声称「`check` requires
+/// `token.generation == current_generation`（else TokenNotFound）」——
+/// **与代码不符**。`check` 从不比较代数，它只查 `revoked`。
+///
+/// 为什么**不**把代数校验加回去：代数是**全局**的，`revoke` bump 一次
+/// 就会让同代签发的**所有**令牌失配 ⇒ per-token 撤销退化成全局撤销。
+/// P0-1 引入 `revoked` 集合正是为了修掉这一点。实测（`b_after=true`）：
+/// 撤销 a 之后同代的 b 仍然可用。见 `tests/sandbox_capability_generation.rs`。
 #[derive(Debug, Clone)]
 pub struct CapabilityStore {
     tokens: std::sync::Arc<RwLock<CapabilityStoreInner>>,
@@ -218,7 +225,11 @@ struct CapabilityStoreInner {
     by_id: BTreeMap<u64, CapabilityToken>,
     next_id: u64,
     /// v0.49.0: current global generation; bumped by `revoke()`.
-    /// Tokens with `generation != current_generation` are treated as not-found.
+    ///
+    /// v0.104.6 D388 更正：此处曾写「Tokens with `generation != current_generation`
+    /// are treated as not-found」—— **不成立**。`check` 不读本字段，
+    /// 它只是 `issue` 打代数时的来源 + `revoke` 递增的计数，
+    /// 撤销判定完全走同级的 `revoked` 集合。
     current_generation: u32,
     /// v0.49.0-fix: explicitly revoked token IDs (P0-1: per-token revoke, not global)
     revoked: BTreeSet<u64>,
@@ -264,8 +275,11 @@ impl CapabilityStore {
         inner.by_id.get(&token_id).cloned()
     }
 
-    /// v0.49.0 (A5 + A1): 检查 capability (返回 Ok(()) 或 Err(SandboxError))
-    /// 单锁内 get + check; 同时校验 generation (A1) — revoked token 返回 TokenNotFound.
+    /// v0.49.0 (A5): 检查 capability (返回 Ok(()) 或 Err(SandboxError))
+    /// 单锁内 get + check; revoked token 返回 TokenNotFound。
+    ///
+    /// v0.104.6 D388 更正：原文写「同时校验 generation (A1)」—— 本函数
+    /// **不**校验代数（见 D388 判据 `d388_generation_is_write_only`）。
     pub fn check(&self, token_id: u64, capability: Capability) -> Result<(), SandboxError> {
         let inner = self.tokens.read();
         let token = inner
@@ -289,9 +303,13 @@ impl CapabilityStore {
         }
     }
 
-    /// v0.49.0 (B1): 撤销 token — bump GLOBAL `current_generation`.
-    /// 旧持有者的 token 仍携带旧 generation, `check` 会视为 TokenNotFound.
-    /// 这样 revoke 在并发场景下立即生效 (无需遍历所有 token).
+    /// v0.49.0 (B1) + v0.49.0-fix (P0-1): 撤销 token。
+    ///
+    /// 实际机制是 `revoked.insert(token_id)`（**逐令牌**）+ bump 全局代数。
+    ///
+    /// v0.104.6 D388 更正：原文写「旧持有者的 token 仍携带旧 generation,
+    /// `check` 会视为 TokenNotFound」—— `check` 并不看代数。它靠单锁内
+    /// 写 `revoked` 在并发下立即生效，无需遍历所有令牌（这一条成立）。
     pub fn revoke(&self, _token_id: u64) -> Result<(), SandboxError> {
         // 检查 token 存在 (保持 API 兼容, 返回 TokenNotFound if not)
         let mut inner = self.tokens.write();

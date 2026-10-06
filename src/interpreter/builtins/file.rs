@@ -15,6 +15,19 @@ impl Interpreter {
             }
         };
         // v0.36: enforce sandbox on every path-bearing file op.
+        //
+        // ⚠ v0.104.6 D334：这句话此前是**假的** —— 四个带路径的入口
+        // （`rename` / `copy` / `touch` / `chdir`）**漏调**本守卫。
+        // `chdir` 最严重：它不自己读写沙箱外，而是**移动相对路径的解析基准**，
+        // 使**其后所有** `file.*` 操作的 `check_path` 判定同时失效
+        // （实测：一次 chdir 到用户可写目录后，`write_text` / `read_text` /
+        // `list` 全部在沙箱外成功，详见 `chdir` 分支的注释）。
+        //
+        // 修法：四个入口各补本守卫。**`rename` / `copy` 要查两个路径**
+        // （`from` 读、`to` 写），少查一个就能把数据搬出沙箱。
+        //
+        // ⇒ 新增带路径的入口时，`check_path` 不是「惯例」而是**义务**；
+        // `tests/file_sandbox_coverage.rs` 逐一核对全部入口都调了它。
         let check_path = |path: &str| -> Result<(), String> {
             self.sandbox
                 .sandbox
@@ -150,6 +163,17 @@ impl Interpreter {
             "rename" => {
                 let from = expect_str(0, "from")?;
                 let to = expect_str(1, "to")?;
+                // v0.104.6 D334：本入口此前**没有** `check_path` ——
+                // 上面那句「enforce sandbox on every path-bearing file op」
+                // 的注释是假的。实测 `file.rename("C:/a.txt", "C:/b.txt")`
+                // 得到的是 OS 错误「系统找不到指定的文件」，
+                // 而**不是**其它入口的 `sandbox denied ... escapes fs_root`。
+                //
+                // `rename` 会在 fs_root 之外**移动**文件，是写操作 ⇒ 必须守卫。
+                // **两个**路径都要查：`from` 是读源、`to` 是写目标，
+                // 少查任一个都能被用来把数据搬出沙箱。
+                check_path(&from)?;
+                check_path(&to)?;
                 std::fs::rename(&from, &to).map_err(|e| {
                     format!("file.rename: cannot rename '{}' -> '{}': {}", from, to, e)
                 })?;
@@ -158,12 +182,21 @@ impl Interpreter {
             "copy" => {
                 let from = expect_str(0, "from")?;
                 let to = expect_str(1, "to")?;
+                // v0.104.6 D334：同 `rename`，此前**没有** `check_path`。
+                // `copy` 是读源 + 写目标，两个路径都必须过守卫。
+                check_path(&from)?;
+                check_path(&to)?;
                 std::fs::copy(&from, &to)
                     .map_err(|e| format!("file.copy: cannot copy '{}' -> '{}': {}", from, to, e))?;
                 Ok(Value::Nil)
             }
             "touch" => {
                 let path = expect_str(0, "path")?;
+                // v0.104.6 D334：本入口此前**没有** `check_path`。`touch` 会
+                // **创建**文件（`std::fs::write(&path, "")`），是写操作。
+                // 实测 `file.touch("C:/x.txt")` 得到的是 OS 错误
+                // 「拒绝访问」(os error 5) 而**不是** `sandbox denied`。
+                check_path(&path)?;
                 let p = std::path::Path::new(&path);
                 if !p.exists() {
                     if let Some(parent) = p.parent()
@@ -186,6 +219,28 @@ impl Interpreter {
             }
             "chdir" => {
                 let path = expect_str(0, "path")?;
+                // v0.104.6 D334：本入口此前**没有** `check_path`，且它是
+                // **四个漏网入口里最严重的一个** ——
+                //
+                // 原因不是「chdir 自己能读写沙箱外」，而是它**移动了判定的基准**：
+                // `check_path` 拿相对路径与 `fs_root` 比对，而相对路径是相对
+                // **当前工作目录**解析的。所以一次 `chdir` 到沙箱外，
+                // 就让**其后所有** `file.*` 操作的相对路径都从沙箱外解析。
+                //
+                // 实测（未修前）：
+                // ```mora
+                // file.chdir("C:/Users/<u>/AppData/Local/Temp")  → nil   ← 无 sandbox 拒绝
+                // file.cwd()                                        → C:\Users\<u>\AppData\Local\Temp
+                // file.write_text("d334_escape2.txt", "escaped")    → nil  ← **写成功**
+                // file.read_text("d334_escape2.txt")                → "escaped"
+                // file.list(".")                                     → 10000 项
+                // ```
+                // ⇒ sandbox 被**完整绕过**（该次实测在 %TEMP% 留下真实文件，
+                // 已清理）。带 `check_path` 的 `write_text` / `read_text` / `list`
+                // **全部**因此失效 —— 它们各自都有守卫，但守卫算出的路径已经错了。
+                //
+                // ⇒ 本条不是「补一个漏掉的守卫」，而是**堵住让所有守卫同时失效的入口**。
+                check_path(&path)?;
                 std::env::set_current_dir(&path)
                     .map_err(|e| format!("file.chdir: cannot chdir to '{}': {}", path, e))?;
                 Ok(Value::Nil)

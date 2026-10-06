@@ -212,22 +212,84 @@ impl<'a> Parser<'a> {
                                 .map_err(|e| e.to_string())?;
                             self.pos += 4;
                             let code = u32::from_str_radix(hex, 16).map_err(|e| e.to_string())?;
-                            if let Some(ch) = char::from_u32(code) {
+                            // v0.104.6 D204：代理对。`😀` 在 JSON 里合法地写成
+                            // `\uD83D\uDE00`（两个 UTF-16 码元）。此前
+                            // `char::from_u32(0xD83D)` 返回 `None` → 整条消息
+                            // 解析失败 → 服务端 `continue` 丢弃它。
+                            if (0xD800..0xDC00).contains(&code) {
+                                let lo = self.parse_low_surrogate(code)?;
+                                match char::from_u32(lo) {
+                                    Some(c) => out.push(c),
+                                    None => {
+                                        return Err(format!("invalid unicode: {lo:#x}"));
+                                    }
+                                }
+                            } else if (0xDC00..0xE000).contains(&code) {
+                                return Err(format!("unpaired low surrogate: {code:#x}"));
+                            } else if let Some(ch) = char::from_u32(code) {
                                 out.push(ch);
                             } else {
-                                return Err(format!("invalid unicode: {}", code));
+                                return Err(format!("invalid unicode: {code}"));
                             }
                         }
                         other => return Err(format!("unknown escape: \\{}", other as char)),
                     }
                 }
+                // v0.104.6 D204：原始字节必须按 **UTF-8** 解码。
+                //
+                // 修前是 `out.push(c as char)` —— `c: u8`，而 Rust 的
+                // `u8 as char` 是 **Latin-1 解释**（把字节当成同数值的码点），
+                // 不是 UTF-8 解码。于是「你好世界」的 `E6 96 87 …`
+                // 变成三个码点 `U+00E6 U+0096 U+0087`，写出去时每个又编成
+                // 2 字节 → **双重编码乱码**：
+                //
+                // ```text
+                // 服务端收到: let s = "你好世界"
+                // 服务端回给客户端: let s = "Ã¤Â½ Ã¥Â¥Â½Ã¤Â¸Â§Â"
+                // ```
+                //
+                // 客户端把这份 `newText` 应用并存盘 → **用户的源码被改了**。
+                // 而且 `0xA0` 那类字节会变成 `U+00A0`（不换行空格），
+                // 连字符串**内容**都变了。
+                //
+                // 改为收集一段连续原始字节、按 UTF-8 解码；非法 UTF-8 **报错**
+                // （而不是静默产出错的字符串）。
                 _ => {
-                    out.push(c as char);
-                    self.pos += 1;
+                    let start = self.pos;
+                    while self.pos < self.bytes.len()
+                        && self.bytes[self.pos] != b'"'
+                        && self.bytes[self.pos] != b'\\'
+                    {
+                        self.pos += 1;
+                    }
+                    let chunk = std::str::from_utf8(&self.bytes[start..self.pos])
+                        .map_err(|e| format!("invalid UTF-8 in string at byte {start}: {e}"))?;
+                    out.push_str(chunk);
                 }
             }
         }
         Err("unterminated string".to_string())
+    }
+
+    /// v0.104.6 D204：读到 `\uXXXX` 的**低代理**（`0xDC00..0xE000`），
+    /// 与已读到的 `hi` 合成一个码点。
+    fn parse_low_surrogate(&mut self, hi: u32) -> Result<u32, String> {
+        if self.pos + 6 > self.bytes.len() || self.bytes[self.pos] != b'\\' {
+            return Err("lone high surrogate".to_string());
+        }
+        let hex = std::str::from_utf8(&self.bytes[self.pos + 2..self.pos + 6])
+            .map_err(|e| e.to_string())?;
+        if self.bytes[self.pos + 1] != b'u' {
+            return Err("lone high surrogate".to_string());
+        }
+        let lo = u32::from_str_radix(hex, 16).map_err(|e| e.to_string())?;
+        self.pos += 6;
+        if !(0xDC00..0xE000).contains(&lo) {
+            return Err(format!(
+                "high surrogate {hi:#x} not followed by low surrogate"
+            ));
+        }
+        Ok(0x10000 + ((hi - 0xD800) << 10) + (lo - 0xDC00))
     }
 
     fn parse_number(&mut self) -> Result<Value, String> {

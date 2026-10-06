@@ -11,14 +11,14 @@ use mora::interpreter::Interpreter;
 use mora::mir::vm::{run_main_task, run_mir};
 use mora::mir::{MirFunction, MirInst};
 use mora::parser_v3::ParserV3;
-use mora::typeck::check_mir::check_program_witnesses;
+use mora::typeck::check_mir::check_program_witnesses_bidirectional;
 use mora::value::Value;
 
 /// 公共执行入口：compile → typeck → run_mir → run_main_task
 /// 这是 `src/main.rs::run_file()` 的纯库版本，可被测试独立调用。
 fn run_via_mir(source: &str) -> Result<(), String> {
     let (func, witnesses) = ParserV3::compile(source)?;
-    let type_errs = check_program_witnesses(&witnesses);
+    let type_errs = check_program_witnesses_bidirectional(&witnesses);
     if !type_errs.is_empty() {
         return Err(format!(
             "typeck: {} error(s); first = {}",

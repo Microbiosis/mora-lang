@@ -3,7 +3,7 @@
 //! 设计目标：Stage 3 必须实现完整 TEA 循环（§0.6 硬性要求）：
 //!   - Model（状态容器）— `Type::Concrete { name: "Model", ... }`
 //!   - Msg（消息 tagged union）— `Type::Union([TeaMsg, ...])`
-//!   - Update(Msg, Model) -> (Model, Cmd<Model>)   ← v0.104 对齐 spec §9.6 / Elm
+//!   - Update(Msg, Model) -> (Model, Cmd`<Model>`)   ← v0.104 对齐 spec §9.6 / Elm
 //!   - Cmd（命令描述副作用）— `Type::Union([Perform, Batch, None])`
 //!   - View(Model) -> render target（占位 Value）
 //!   - Replay：从 Recorder 还原 Msg 流 + StateMutation diffs
@@ -32,13 +32,13 @@ impl Cmd {
             Cmd::None => Value::Nil,
             Cmd::Batch(cmds) => {
                 let items: Vec<Value> = cmds.iter().map(|c| c.to_value()).collect();
-                Value::List(items)
+                Value::List(items.into())
             }
             Cmd::Perform { effect, args } => {
                 let mut map = std::collections::HashMap::new();
                 map.insert("kind".to_string(), Value::String("Perform".to_string()));
                 map.insert("effect".to_string(), Value::String(effect.clone()));
-                map.insert("args".to_string(), Value::List(args.clone()));
+                map.insert("args".to_string(), Value::List(args.clone().into()));
                 Value::Dict(map)
             }
             Cmd::Dispatch(msg) => {
@@ -73,7 +73,7 @@ impl Cmd {
                             _ => return Err("Cmd.from_value: missing effect".to_string()),
                         };
                         let args = match map.get("args") {
-                            Some(Value::List(items)) => items.clone(),
+                            Some(Value::List(items)) => items.to_vec(),
                             _ => Vec::new(),
                         };
                         Ok(Cmd::Perform { effect, args })
@@ -142,7 +142,7 @@ impl Msg {
 /// v0.94 数据流化：去掉 `Arc<Mutex<TeaState>>`。TeaApp 现在是纯数据 ——
 /// `model` + 待处理 `msg_queue`/`cmd_queue` + 三个闭包。所有转换返回新 app：
 /// - [`TeaApp::dispatch`]：纯，追加一条 Msg。
-/// - [`TeaApp::fold`]：TEA 核心折叠 `model' = fold(msgs, model, update)`。
+/// - `TeaApp::fold`：TEA 核心折叠 `model' = fold(msgs, model, update)`。
 /// - [`TeaApp::run_loop`]：纯驱动，折叠全部消息 + 解释 Cmd，返回新 app。
 ///
 /// 因为 app 是值，`Value::TeaApp(Arc<TeaApp>)` 可被多个消费者并发共享同一
@@ -252,16 +252,35 @@ impl TeaApp {
     ) -> Result<(Value, Vec<Cmd>), String> {
         let args = vec![msg.to_value(), model.clone()];
         match interp.call_value(update, args, &mut crate::mir::effect::Effects::new())? {
-            // update 返回 (Model, Cmd) tuple —— Value::List [model, cmd]
-            Value::List(items) => {
-                let next = items.first().cloned().unwrap_or(Value::Nil);
-                let cmds = items
-                    .get(1)
-                    .and_then(|v| Cmd::from_value(v).ok())
-                    .into_iter()
-                    .collect();
-                Ok((next, cmds))
-            }
+            // update 返回 `(Model, Cmd)` tuple —— Value::List [model, cmd]
+            //
+            // v0.104.6 D394：此处此前**只判类型不判形状** —— 任何 `Value::List`
+            // 都被当成二元组，且 model 取 `items.first()`。
+            // 而 `tea.init` 的第 1 参**明确允许**「init 闭包（**或初始 model 值**）」
+            // （`builtins/tea.rs:26`）⇒ **列表形态的 model 完全合法**，
+            // 于是一次 update 后它被静默截断成首元素。实测（真实 CLI）：
+            //
+            // ```text
+            // tea.init([1, 2], …)      → model = [1.0, 2.0]   ✅
+            // tea.update(该 app, msg)   → model = **1.0**      ❌ 类型从 list 变 float
+            // tea.init([9, 8, 7], …)    → update 后 = **9.0**
+            // ```
+            //
+            // 零报错、零警告 —— 是最危险的一类（静默错值）。
+            //
+            // 修法：**只有确实是二元组**（长度恰为 2 **且**第二项能解析成
+            // `Cmd`）才按元组解读，否则整段返回值就是裸 model。
+            // `Cmd::from_value` 对 `Float` / `String` / 无 `kind` 的 Dict 都会失败，
+            // 因此普通的 2 元素列表 model 不会被误判。
+            //
+            // ⚠ **残留歧义**（本语言全部值都是 `Value`，无静态 Cmd 类型可依）：
+            // 若 model 恰是「2 元素列表且第 2 项是 Cmd 形态（如 `nil` 或
+            // 带 `kind` 的 dict）」，仍会被判成二元组。
+            // 彻底消歧需要给 TEA 引入独立的 Cmd 值类型（属设计决定，不在本轮）。
+            Value::List(items) => match (items.len(), items.get(1).map(Cmd::from_value)) {
+                (2, Some(Ok(cmd))) => Ok((items[0].clone(), vec![cmd])),
+                _ => Ok((Value::List(items), Vec::new())),
+            },
             // update 返回裸 model（无 Cmd）—— 也支持
             other => Ok((other, Vec::new())),
         }

@@ -9,13 +9,30 @@
 //!   channel (16 char) / chat_id (96 char) / delete_after_run
 //!
 //! v0.33 简化版: 只实现核心 4 字段 (id / kind / interval_s / at_epoch / message),
-//! 持久化到 `<cwd>`/`.mora_schedule.json (MimiClaw 用 SPIFFS; Mora 用 std::fs).
+//! 序列化到 JSON 文件 (MimiClaw 用 SPIFFS; Mora 用 std::fs).
 //!
-//! 提供 builtin:
+//! ⚠ v0.104.6 D395 更正：原文写「持久化到 `<cwd>`/`.mora_schedule.json`」——
+//! **两处都不成立**（实测 + 全仓 grep）：
+//! 1. **生产上从不落盘**：`set_persist_path` 全仓**唯一调用点是本文件的单测**
+//!    ⇒ 生产 `persist_path` 恒 `None` ⇒ `save()` 直接跳过整段写盘。
+//!    实测跑完含 `schedule.add` 的脚本后，工作目录下**不存在**
+//!    `.mora_schedule.json`。
+//! 2. **没有读回路径**：全仓不存在 scheduler 的 `load` / `from_json`。
+//!    即使落了盘也无人读。
+//!
+//! ⇒ 「持久化」目前是**名义上的**：有完整的写入侧实现，但两端都没接上。
+//! 判据见 `tests/schedule_persistence_gap.rs`（钉住「唯一调用点在单测」
+//! 与「无 loader」两个事实，接上时立刻变红）。
+//!
+//! 提供 builtin（`schedule.*`，**全部脚本可达**）:
 //!   schedule.add(name, kind, message, [interval_s | at_epoch]) -> id
 //!   schedule.list() -> [{id, name, kind, message, ...}]
 //!   schedule.remove(id) -> bool
-//!   schedule.tick(now) -> [triggered messages]  (内部: 由 event loop 调用)
+//!   schedule.count() -> Float
+//!   schedule.tick() -> [triggered messages]
+//!
+//! ⚠ `tick` 的 `now` 由 builtin 传入 `Scheduler::now()`（**无参**），
+//!   并非原文所写的「由 event loop 调用」。
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
@@ -60,7 +77,7 @@ pub struct Scheduler {
     /// v0.75.2: 到期时间索引（next_fire_epoch → job ids）。所有到期桶
     /// 恒在未来（add 已校验 At 需 at_epoch > now、Every 需 interval > 0）。
     buckets: Arc<Mutex<BTreeMap<u64, Vec<String>>>>,
-    /// v0.36 (P1-1.8): AtomicU64 — was Mutex<u32> which overflowed at 4B adds.
+    /// v0.36 (P1-1.8): AtomicU64 — was Mutex`<u32>` which overflowed at 4B adds.
     next_id: Arc<std::sync::atomic::AtomicU64>,
     /// Persistence file path (None = in-memory only)
     persist_path: Arc<Mutex<Option<PathBuf>>>,

@@ -12,11 +12,27 @@
 //!    (a) dag placeholder 0 → usize::MAX（dag_rule.rs / dag_search.rs）
 //!    (c) deconstruct 丢弃 Return(None)（ssa.rs）
 //!
-//! 已知问题（未修复，记录于此）：
-//! - SSA construct 后寄存器引用丢失（顶层 `let x = 1+2; return x`
-//!   优化后返回值变 Nil）→ 管线不接入
-//! - 顶层隐式返回语义在 dag_interp 中依赖「最后产生 dst 的节点」，
-//!   优化重排后不稳定（独立于 SSA 管线）
+//! 曾经记录的两条「已知问题（未修复）」—— **v0.104.6 D115 实测均已不复现，更正如下**：
+//!
+//! - ~~「SSA construct 后寄存器引用丢失（顶层 `let x = 1+2; return x` 优化后返回值
+//!   变 Nil）」~~ —— 该复现式**如今连编译都过不了**（顶层 `return` 直接报错，
+//!   报 `return is only valid inside a task / closure body`），必须放进 task 才复现；
+//!   而放进 task 后实测（无优化 / Basic / Aggressive 三档）返回
+//!   `Return(Float(3.0))` —— **正确**。
+//! - ~~「顶层隐式返回语义在 dag_interp 中依赖『最后产生 dst 的节点』，优化重排后
+//!   不稳定」~~ —— 实测三种形态（`let a=1+2/let b=3+4/b`、`let a=1+2/let b=a*3/b`、
+//!   `let s="x"/let t=s+"y"/t`）× 三档优化，末值恒为 `7.0` / `9.0` / `xy`，**稳定**。
+//!
+//! 本文件当时**没有** `#[ignore]` 测试，10 条测试全部在跑 —— 说明这两条是在别的
+//! 改动里被顺带修好的，注释没跟上。**「已知问题」注释与实际行为脱节时，后人���据此
+//! 绕开本来可用的机制** —— 这与 D87（过期「实测结论」注释）是同一类危害。
+//!
+//! ⚠ 测量时的两个自身失误，记录在此免得重蹈：
+//! 1. 第一版量的是顶层 `last_expr`（`run_mir`），而 task 的返回值要经
+//!    `run_main_task_with_signal` 才看得到 —— **量错了对象**，一度得到
+//!    三档全是 `nil` 的误导结论；
+//! 2. 第一版把 `return` 写在顶层当复现式，被 parser 正确拒绝。
+//!    **与 D102 同源：写判据/复现式之前先确认它在当前实现下成立。**
 
 use mora::interpreter::Interpreter;
 use mora::mir::ssa::OptLevel;

@@ -234,10 +234,25 @@ impl JsonlAuditSink {
             .map_err(|e| AuditError::Io(e.to_string()))?;
 
         // 读取末尾行, 提取 last_hash (如果文件非空)
-        let (last_hash, events_count) = read_tail_hash(path).unwrap_or_else(|_| {
-            // 文件不存在或为空 → genesis
-            (Self::GENESIS_HASH.to_string(), 0)
-        });
+        //
+        // v0.104.6 D399：此前是 `read_tail_hash(path).unwrap_or_else(|_| (GENESIS, 0))`，
+        // **吞掉所有错误**。而 `read_tail_hash` 自己在「文件为空」时已经返回
+        // `Ok((GENESIS, 0))` ⇒ 那个 fallback **只会在真实错误时触发**
+        // （尾部行损坏 / I/O 失败），等于把「日志尾部损坏」静默当成「空文件」。
+        //
+        // 实测（写 3 条 → 截掉尾部 30 字节，模拟崩溃写半行）：
+        //
+        // ```text
+        // new()      → Ok（未报错）        ← ParseError 被吞
+        // event_count→ 0                  ← 文件里有 2 条完整事件，静默算错
+        // ```
+        //
+        // 之后写入的新事件还会以 genesis 为 `prev` 追加，
+        // **恢复动作本身进一步污染了链**。
+        //
+        // 对一套**防篡改**系统，静默归零计数比直接报错糟得多。
+        // 「文件不存在」不可能发生：上面 `OpenOptions::create(true)` 刚建过。
+        let (last_hash, events_count) = read_tail_hash(path)?;
 
         let writer = std::io::BufWriter::new(file);
 
@@ -344,19 +359,26 @@ impl AuditSink for JsonlAuditSink {
         let file = File::open(&self.path).map_err(|e| AuditError::Io(e.to_string()))?;
         let reader = BufReader::new(file);
         let mut prev = Self::GENESIS_HASH.to_string();
+        // v0.104.6 D399：**行号 1 基**。
+        // 此前用 `enumerate()` 的 0 基下标，而同一模块的 `read_tail_hash`
+        // 用的是 1 基计数器 ⇒ 同一个 `ParseError` 在两处给出**不同基准**的行号，
+        // 运维对着同���个文件会拿到互相矛盾的指引。
+        // 且既有单测的断言消息写的是「tamper at line 1 should fail at line 1」
+        // —— 证明**本意就是 1 基**，实现与意图不符。
         for (i, line) in reader.lines().enumerate() {
+            let lineno = i + 1;
             let line = line.map_err(|e| AuditError::Io(e.to_string()))?;
             if line.is_empty() {
                 continue;
             }
             let (stored_prev, stored_hash) =
                 parse_prev_hash(&line).ok_or_else(|| AuditError::ParseError {
-                    line: i,
+                    line: lineno,
                     msg: "missing prev/hash fields".to_string(),
                 })?;
             if stored_prev != prev {
                 return Err(AuditError::ChainBroken {
-                    line: i,
+                    line: lineno,
                     expected_prev: prev,
                     actual_prev: stored_prev,
                 });
@@ -364,14 +386,14 @@ impl AuditSink for JsonlAuditSink {
             // 重新计算 hash
             let mut computed_event =
                 parse_event_for_seal(&line).ok_or_else(|| AuditError::ParseError {
-                    line: i,
+                    line: lineno,
                     msg: "missing required fields".to_string(),
                 })?;
             computed_event.prev_hash = stored_prev.clone();
             computed_event.seal();
             if computed_event.hash != stored_hash {
                 return Err(AuditError::HashMismatch {
-                    line: i,
+                    line: lineno,
                     stored: stored_hash,
                     computed: computed_event.hash,
                 });
@@ -422,7 +444,33 @@ fn parse_prev_hash(line: &str) -> Option<(String, String)> {
     Some((prev, hash))
 }
 
-/// 提取字符串字段, 正确处理 JSON 转义 (反转义 \", \\, \n, \r, \t)
+/// 提取字符串字段, 正确处理 JSON 转义
+///
+/// v0.104.6 D207：两处修。
+///
+/// **① 原始字节按 UTF-8 解码。** 修前是 `out.push(bytes[i] as char)`，
+/// 而 `bytes[i]: u8` —— Rust 的 `u8 as char` 是 **Latin-1 解释**（把字节
+/// 当成同数值的码点），不是 UTF-8 解码。
+///
+/// 写端 `json_string` 逐 `chars()` 输出、非 ASCII **原样写**，而本函数是
+/// 唯一读回它的地方。于是中文 `actor` 被拆成 3 倍长的码点序列，
+/// `verify_chain` 用它重建 `AuditEvent` 并 `seal()` 重算 SHA-256 ——
+/// 算出来必然对不上存储值：
+///
+/// ```text
+/// AuditError::HashMismatch { line: 0, stored: "93c3ee…", computed: "b6c55a…" }
+/// ```
+///
+/// 即**未篡改**的日志被判为已篡改。对一套防篡改系统来说，这比不校验更糟：
+/// 真篡改者能藏在噪声里，而运维会学会忽略这条告警。
+///
+/// **② 转义表补齐。** 修前只认 `\"` `\\` `\n` `\r` `\t`，其余一律
+/// 「原样带出反斜杠」—— 而写端 `json_string` 会产出 `\b` `\f` `\/`
+/// 与 `\u00xx`（控制字符），**往返不等价**。现补齐 JSON 标准的全套，
+/// 含 `\uXXXX` 与**代理对**（`😀` = `\uD83D\uDE00`）。
+///
+/// 未知转义（如 `\'`）按 JSON 规范保持原样带出，且**只前进 1 字节** ——
+/// 这样后续字节仍走 UTF-8 解码路径，不会再被按 Latin-1 拆开。
 fn extract_field_skip_escaped(line: &str, field: &str) -> Option<String> {
     let needle = format!("\"{}\":\"", field);
     let start = line.find(&needle)? + needle.len();
@@ -431,31 +479,66 @@ fn extract_field_skip_escaped(line: &str, field: &str) -> Option<String> {
     let mut out = String::new();
     let mut i = 0;
     while i < bytes.len() {
-        if bytes[i] == b'\\' && i + 1 < bytes.len() {
-            // 反转义: \" → ", \\ → \, \n → newline, \r → cr, \t → tab
-            match bytes[i + 1] {
-                b'"' => out.push('"'),
-                b'\\' => out.push('\\'),
-                b'n' => out.push('\n'),
-                b'r' => out.push('\r'),
-                b't' => out.push('\t'),
-                _ => {
-                    out.push('\\');
-                    out.push(bytes[i + 1] as char);
-                }
-            }
-            i += 2;
-            continue;
-        }
         if bytes[i] == b'"' {
             return Some(out);
         }
-        out.push(bytes[i] as char);
-        i += 1;
+        if bytes[i] == b'\\' && i + 1 < bytes.len() {
+            // 反转义。写端（`json_string`）产出的集合与 JSON 标准一致。
+            let decoded: Option<String> = match bytes[i + 1] {
+                b'"' => Some("\"".to_string()),
+                b'\\' => Some("\\".to_string()),
+                b'/' => Some("/".to_string()),
+                b'n' => Some("\n".to_string()),
+                b'r' => Some("\r".to_string()),
+                b't' => Some("\t".to_string()),
+                b'b' => Some("\u{0008}".to_string()),
+                b'f' => Some("\u{000C}".to_string()),
+                b'u' => {
+                    let hex4 = std::str::from_utf8(bytes.get(i + 2..i + 6)?).ok()?;
+                    let code = u32::from_str_radix(hex4, 16).ok()?;
+                    i += 4; // 指向第 4 个 hex 位
+                    if (0xD800..0xDC00).contains(&code) {
+                        // 代理对：后面必须紧跟 `\uDC00`–`\uDFFF`
+                        let hex2 = std::str::from_utf8(bytes.get(i + 3..i + 7)?).ok()?;
+                        let lo = u32::from_str_radix(hex2, 16).ok()?;
+                        if !(0xDC00..0xE000).contains(&lo) {
+                            return None;
+                        }
+                        i += 6;
+                        let combined = 0x10000 + ((code - 0xD800) << 10) + (lo - 0xDC00);
+                        char::from_u32(combined).map(|c| c.to_string())
+                    } else if (0xDC00..0xE000).contains(&code) {
+                        None
+                    } else {
+                        char::from_u32(code).map(|c| c.to_string())
+                    }
+                }
+                // 未知转义：按 JSON 规范原样带出，且**只前进 1 字节** ——
+                // 后面的字节仍会走下面的 UTF-8 解码路径。
+                _ => None,
+            };
+            match decoded {
+                Some(s) => {
+                    out.push_str(&s);
+                    i += 2;
+                }
+                None => {
+                    out.push('\\');
+                    i += 1;
+                }
+            }
+            continue;
+        }
+        // 收集一段连续原始字节（到 `"` / `\` / 结尾），按 **UTF-8** 解码。
+        let run_start = i;
+        while i < bytes.len() && bytes[i] != b'"' && bytes[i] != b'\\' {
+            i += 1;
+        }
+        // 非法 UTF-8 → 解析失败（而不是静默产出错的字符串）
+        out.push_str(std::str::from_utf8(bytes.get(run_start..i)?).ok()?);
     }
     None
 }
-
 fn extract_field(line: &str, field: &str) -> Option<String> {
     extract_field_skip_escaped(line, field)
 }
@@ -521,8 +604,55 @@ impl AuditSink for NullSink {
 mod tests {
     use super::*;
     use std::collections::HashSet;
+    use std::ops::Deref;
+    use std::path::{Path, PathBuf};
 
-    fn temp_log_path(name: &str) -> std::path::PathBuf {
+    /// v0.104.6 D294：审计日志的临时**目录**用 RAII 守卫回收。
+    ///
+    /// D34 已经修过**同一个缺陷的另一个副本**
+    /// （`interpreter/builtins/tests/audit.rs` 的 `mora_audit_builtin_*`），
+    /// 但本模块自带一份**逐字相同**的 `temp_log_path()` 被漏掉了：它同样
+    /// 「删文件、留空目录」，测试 panic 时连文件都不删。
+    ///
+    /// 实测后果（本轮实测，非估算）：一次 `cargo test` 净新增 **6 个**空目录
+    /// （本模块 6 个用它的测试），而 `%TEMP%` 里的 `mora_audit_*` 已累积到
+    /// **8 000+** 个（最早 2026-08-15）。D34 的注释里记的
+    /// 「`mora_audit_builtin_*` 累积到 2 954 个」正是同一现象的另一条分支。
+    ///
+    /// 改法与 D34 一致：`Drop` 时 `remove_dir_all` 整个目录。`Drop` 在
+    /// unwind（panic）时同样执行，故**异常路径也不漏**。
+    /// `Deref<Target = Path>` + `AsRef<Path>` 让既有 `&path` 用法
+    /// （`JsonlAuditSink::new_fresh(&path)` / `fs::read_to_string(&path)` /
+    /// `fs::write(&path, …)` / `remove_file(&path)`）一字不改。
+    ///
+    /// ⚠ 声明顺序很重要：`path` 必须在各 `sink` **之前**绑定，
+    /// Rust 的逆序 drop 才会让 sink 先关句柄、`TempLog` 再删目录
+    /// （Windows 上文件被占用时 `remove_dir_all` 会失败）。
+    struct TempLog {
+        dir: PathBuf,
+        file: PathBuf,
+    }
+
+    impl Deref for TempLog {
+        type Target = Path;
+        fn deref(&self) -> &Path {
+            &self.file
+        }
+    }
+
+    impl AsRef<Path> for TempLog {
+        fn as_ref(&self) -> &Path {
+            &self.file
+        }
+    }
+
+    impl Drop for TempLog {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    fn temp_log(name: &str) -> TempLog {
         let dir = std::env::temp_dir().join(format!(
             "mora_audit_{}_{}",
             std::process::id(),
@@ -532,12 +662,13 @@ mod tests {
                 .as_nanos()
         ));
         std::fs::create_dir_all(&dir).unwrap();
-        dir.join(name)
+        let file = dir.join(name);
+        TempLog { dir, file }
     }
 
     #[test]
     fn write_appends_jsonl_line() {
-        let path = temp_log_path("write_basic.jsonl");
+        let path = temp_log("write_basic.jsonl");
         let sink = JsonlAuditSink::new_fresh(&path).unwrap();
 
         let event = AuditEvent::new("user", "test.action", None, None, None);
@@ -557,7 +688,7 @@ mod tests {
 
     #[test]
     fn each_event_has_chained_hash() {
-        let path = temp_log_path("chained.jsonl");
+        let path = temp_log("chained.jsonl");
         let sink = JsonlAuditSink::new_fresh(&path).unwrap();
 
         let mut prev_hashes = Vec::new();
@@ -577,7 +708,7 @@ mod tests {
 
     #[test]
     fn verify_chain_passes_for_valid_log() {
-        let path = temp_log_path("valid.jsonl");
+        let path = temp_log("valid.jsonl");
         let sink = JsonlAuditSink::new_fresh(&path).unwrap();
 
         for i in 0..10 {
@@ -597,7 +728,7 @@ mod tests {
 
     #[test]
     fn verify_chain_fails_on_tampered_event() {
-        let path = temp_log_path("tampered.jsonl");
+        let path = temp_log("tampered.jsonl");
         let sink = JsonlAuditSink::new_fresh(&path).unwrap();
 
         for i in 0..3 {
@@ -616,7 +747,9 @@ mod tests {
         let err = sink.verify_chain().unwrap_err();
         match err {
             AuditError::HashMismatch { line, .. } => {
-                assert_eq!(line, 1, "tamper at line 1 should fail at line 1")
+                // v0.104.6 D399：`lines[1]` 是**第二个**物理行（0 基下标），
+                // 而错误消息是 **1 基** ⇒ 断言 2。修前实现用 0 基、断言 1。
+                assert_eq!(line, 2, "第 2 个物理行被篡改 ⇒ 应报 line 2（1 基）")
             }
             other => panic!("expected HashMismatch, got {:?}", other),
         }
@@ -625,7 +758,7 @@ mod tests {
 
     #[test]
     fn empty_log_verifies_as_genesis() {
-        let path = temp_log_path("empty.jsonl");
+        let path = temp_log("empty.jsonl");
         let _sink = JsonlAuditSink::new_fresh(&path).unwrap();
         // 没有写入任何 event
         let sink2 = JsonlAuditSink::new(&path).unwrap(); // 重新打开
@@ -636,7 +769,7 @@ mod tests {
 
     #[test]
     fn reopen_preserves_last_hash_for_chaining() {
-        let path = temp_log_path("reopen.jsonl");
+        let path = temp_log("reopen.jsonl");
         {
             let sink = JsonlAuditSink::new_fresh(&path).unwrap();
             sink.write(AuditEvent::new("a", "op.1", None, None, None))

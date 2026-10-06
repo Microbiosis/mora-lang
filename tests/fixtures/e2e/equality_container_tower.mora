@@ -1,0 +1,34 @@
+-- e2e：容器比较与标量比较**必须给出一致答案**（v0.104.6 D391）
+--
+-- 修前实测（真实 CLI）：
+--   j[0]         == 1.0         → true    ← 标量走数值塔
+--   j            == [1.0, 2.0]  → false   ← 容器丢掉数值塔
+--   d.get("a")   == 1.0         → true
+--   d            == {"a": 1.0}  → false
+--
+-- ⚠ 为什么必须用 `json.parse` 造值：
+--   - Mora 的**裸数字字面量是 `Float`**，所以 `[1]` 与 `[1.0]` 元素类型完全相同，
+--     根本没有混比可测；
+--   - typeck 的**列表同质性**规则又直接拒掉 `[1, len("ab")]` 这类混比字面量
+--     （实测 exit 2：`expected: float, got: int`）。
+--   ⇒ 唯一能进入被测路径的办法是运行时解析：`json.parse("[1,2]")` 给 `Int` 元素（D129）。
+--   首版探针正是栽在这里 —— 它「测出」`list_int_float=true`，
+--   看起来没问题，实则**根本没进入被测条件**。
+--
+-- Run: cargo run -- tests/fixtures/e2e/equality_container_tower.mora
+
+let j = json.parse("[1,2]")
+let d = json.parse("{\"a\":1}")
+
+-- 标量侧：数值塔成立（对照）
+print("list_val_scalar=" + str(j[0] == 1.0))
+print("dict_val_scalar=" + str(d.get("a") == 1.0))
+
+-- 容器侧：修前为 false
+print("list_eq=" + str(j == [1.0, 2.0]))
+print("dict_eq=" + str(d == {"a": 1.0}))
+
+-- 反向对照：不等的情形必须**仍然**不等
+print("control_list_neq=" + str(j == [1.0, 2.5]))
+print("control_dict_neq=" + str(d == {"a": 1.5}))
+print("control_len_neq=" + str(j == [1.0]))

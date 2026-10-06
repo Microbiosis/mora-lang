@@ -106,7 +106,7 @@ pub struct CmirBlock {
 pub enum ConcurrencyMode {
     /// 无并发，env 直接共享（纯函数效果处理）。
     Sequential,
-    /// Mutex<Arc<Env>> 保护（当前 Handle 实现）。
+    /// Mutex<Arc`<Env>`> 保护（当前 Handle 实现）。
     Protected,
     /// Clone env，隔离执行（Transaction/Worker）。
     Isolated,

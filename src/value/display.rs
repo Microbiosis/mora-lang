@@ -48,8 +48,23 @@ impl std::fmt::Display for Value {
                 write!(f, "]")
             }
             Value::Dict(map) => {
+                // v0.104.6 可复现性修复：按 key 排序（`Value::Dict` 是
+                // `HashMap`，迭代序每进程随机）。与 `flow::json::value_to_json`
+                // 及 http/mcp 服务器的 `BTreeMap` 做法对齐。
+                //
+                // ⚠ v0.104.6 D291：这句话**只对 dict 的键序成立**，不要
+                // 推及整条序列化路径 —— 两个手写序列化器对**值**并不等价：
+                //   `BigInt`：`flow::value_to_json` 写**裸数字**（实跑确认），
+                //            `http_server::value_to_json` 写**带引号字符串**；
+                //   读方向：`flow::json::json_to_value` 区分 Int/Float/BigInt，
+                //            `http_server::json_lsp_to_value` 把
+                //            `JsonValue::Number(n)` 一律变成 `Value::Float`。
+                // （D291 已记录；运行时影响当时**未证实** —— 那两个映射函数
+                //  是私有的，且 http 服务没有可回显 `Value` 的端点。）
                 write!(f, "{{")?;
-                for (i, (k, v)) in map.iter().enumerate() {
+                let mut entries: Vec<(&String, &Value)> = map.iter().collect();
+                entries.sort_by(|a, b| a.0.cmp(b.0));
+                for (i, (k, v)) in entries.into_iter().enumerate() {
                     if i > 0 {
                         write!(f, ", ")?;
                     }
@@ -112,6 +127,11 @@ impl std::fmt::Display for Value {
             }
             Value::Atom(arc) => {
                 // v0.35: Display must be infallible; parking_lot::Mutex does not poison.
+                //
+                // v0.104.6 D393：此处持锁**不是**环安全的关键 —— 牙齿验证把它
+                // 改成 `arc.lock().clone()`（解锁后格式化）后，自引用 atom 判据
+                // **照样全绿**。真正的环断开器是 parking_lot 自己的
+                // `Mutex: Debug`：`try_lock()` 失败时打印 `<locked>` 而不下钻。
                 let v = arc.lock();
                 write!(f, "<atom {:?}>", v)
             }
@@ -173,7 +193,29 @@ impl std::fmt::Display for Value {
 
 /// v0.36 (P2-3.14): depth-limited Display helper. Walks a Value recursively
 /// but stops at MAX_DEPTH (default 16) to prevent stack overflow on
-/// recursive/cyclic structures (e.g. Atom containing self).
+/// **deeply nested** `List` / `Dict`。
+///
+/// ⚠ v0.104.6 D393 更正：原文写「prevent stack overflow on
+/// recursive/cyclic structures (**e.g. Atom containing self**)」——
+/// **该括号内的说法不成立**。
+///
+/// `Atom` 分支走 `{:?}`，**完全不经过本函数的深度检查**（递归由派生
+/// `Debug` 完成，`MAX_DEPTH` 对它无效）。自引用 atom 之所以**不会**
+/// 无限递归，真正起作用的是 **parking_lot 自己的 `Mutex: Debug`**：
+/// 它在 `try_lock()` 失败时打印 `<locked>` 而**不再下钻**
+/// ⇒ 意外形成环断开器。
+///
+/// ⚠ 环断开器**不是**本文件 atom 臂的 `arc.lock()`。牙齿验证把该处改成
+/// `arc.lock().clone()`（**解锁后**再格式化）后，自引用 atom 判据**照样全绿**
+/// —— 因为 parking_lot 的 Debug **自己**取锁，重入时它自己取不到。
+/// （可佐证：非环的 `atom(0)` 会显示 `Float(0.0)`，说明锁可取时它会渲染数据；
+///   只有重入取不到才退化成 `<locked>`。）
+///
+/// ⇒ 因此：**深度限制覆盖 List/Dict，环安全覆盖 Atom**，二者机制不同，
+/// 且环安全依赖的是**第三方 crate 的 Debug 实现细节**。
+/// 判据 `tests/display_atom_and_depth.rs` 钉住「自引用 atom 必须终止」；
+/// 若 parking_lot 换掉 Debug 实现，或有人把 atom 臂改成 `Display` 语义，
+/// 该判据会立刻红。
 const DISPLAY_MAX_DEPTH: usize = 16;
 
 fn fmt_inner(f: &mut std::fmt::Formatter<'_>, v: &Value, depth: usize) -> std::fmt::Result {
@@ -197,7 +239,10 @@ fn fmt_inner(f: &mut std::fmt::Formatter<'_>, v: &Value, depth: usize) -> std::f
         }
         Value::Dict(map) => {
             write!(f, "{{")?;
-            for (i, (k, child)) in map.iter().enumerate() {
+            // v0.104.6 可复现性修复：同上方浅层分支，按 key 排序。
+            let mut entries: Vec<(&String, &Value)> = map.iter().collect();
+            entries.sort_by(|a, b| a.0.cmp(b.0));
+            for (i, (k, child)) in entries.into_iter().enumerate() {
                 if i > 0 {
                     write!(f, ", ")?;
                 }

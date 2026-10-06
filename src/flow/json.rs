@@ -40,31 +40,128 @@ fn parse_json_string(s: &str) -> Result<(Value, usize), String> {
     if s.as_bytes()[0] != b'"' {
         return Err("Expected '\"'".to_string());
     }
+    let b = s.as_bytes();
     let mut i = 1;
     let mut result = String::new();
     while i < s.len() {
-        match s.as_bytes()[i] {
+        match b[i] {
             b'"' => return Ok((Value::String(result), i + 1)),
             b'\\' => {
-                i += 1;
-                if i >= s.len() {
+                if i + 1 >= s.len() {
                     return Err("Unterminated string escape".to_string());
                 }
-                match s.as_bytes()[i] {
-                    b'"' => result.push('"'),
-                    b'\\' => result.push('\\'),
-                    b'n' => result.push('\n'),
-                    b't' => result.push('\t'),
-                    b'r' => result.push('\r'),
-                    b'0' => result.push('\0'),
-                    _ => return Err(format!("Invalid escape: \\{}", s.as_bytes()[i] as char)),
-                }
+                result.push_str(&decode_escape(s, &mut i)?);
             }
-            c => result.push(c as char),
+            // v0.104.6 D205：原始字节必须按 **UTF-8** 解码。
+            //
+            // 修前是 `c => result.push(c as char)` —— `c: u8`，而 Rust 的
+            // `u8 as char` 是 **Latin-1 解释**（把字节当成同数值的码点）。
+            // 于是每个 UTF-8 字节变成一个码点，实测：
+            //
+            // ```text
+            // json.parse("{\"greeting\": \"你好世界\"}")
+            //   → print(v["greeting"])  打印 ä½ å¥½ä¸çå¥½
+            //   → print(len(...))      得到 12（正确的值是 4）
+            // ```
+            //
+            // **长度都被改了**（4 个汉字 = 12 字节 → 12 个码点）：任何按长度
+            // 索引、切片、比较、哈希的下游全错。这属于 D198 的
+            // 「静默给错数」，比乱码本身更危险 —— 乱码还看得见，错误的长度看不见。
+            //
+            // 非法 UTF-8 **报错**而不是静默产出错的字符串。
+            _ => {
+                let start = i;
+                while i < s.len() && b[i] != b'"' && b[i] != b'\\' {
+                    i += 1;
+                }
+                let chunk = std::str::from_utf8(&b[start..i])
+                    .map_err(|e| format!("Invalid UTF-8 in JSON string: {}", e))?;
+                result.push_str(chunk);
+                // `i` 已停在 `"` / `\` 上，不能再 `+= 1`
+                continue;
+            }
         }
         i += 1;
     }
     Err("Unterminated string".to_string())
+}
+
+/// v0.104.6 D206：处理一个 `\X` 转义，返回解出的文本。
+///
+/// `i` 进来时指向**反斜杠**，出去时指向**最后一个被消费的字节**
+/// （与 `parse_json_string` 循环末尾的 `i += 1` 配套）。
+///
+/// 修前这张表只有 `\"` `\\` `\n` `\t` `\r` `\0`，其余一律
+/// `Invalid escape` —— 而 **`\uXXXX` 是 JSON 标准的一部分**。
+/// 实测：
+///
+/// ```text
+/// json.parse("{\"g\": \"\u4f60\u597d\"}")
+///   → Runtime error (MIR): json.parse: Invalid escape: \u
+/// ```
+///
+/// 而 **Python 的 `json.dumps()` 默认 `ensure_ascii=True`**，产出的就是
+/// `\uXXXX` —— 即**最常见的 JSON 生成方式**产出的含非 ASCII 文件，
+/// 本语言**根本读不了**。同时补齐 JSON 标准的 `\b` / `\f` / `\/`，
+/// 以及代理对（`😀` 在 ASCII 转义下是 `\uD83D\uDE00` 两个 UTF-16 码元）。
+fn decode_escape(s: &str, i: &mut usize) -> Result<String, String> {
+    let b = s.as_bytes();
+    let esc = b[*i + 1];
+    *i += 1; // 指向转义字符本身
+    Ok(match esc {
+        b'"' => "\"".to_string(),
+        b'\\' => "\\".to_string(),
+        b'/' => "/".to_string(),
+        b'n' => "\n".to_string(),
+        b't' => "\t".to_string(),
+        b'r' => "\r".to_string(),
+        b'b' => "\u{0008}".to_string(),
+        b'f' => "\u{000C}".to_string(),
+        b'0' => "\0".to_string(),
+        b'u' => {
+            let hex4 = s
+                .get(*i + 1..*i + 5)
+                .ok_or_else(|| "Truncated \\u escape".to_string())?;
+            let code = u32::from_str_radix(hex4, 16)
+                .map_err(|_| format!("Invalid \\u escape: \\u{}", hex4))?;
+            *i += 4; // 指向第 4 个 hex 位
+            if (0xD800..0xDC00).contains(&code) {
+                // 高代理：后面必须紧跟 `\uDC00`–`\uDFFF`
+                if *i + 6 >= s.len() || b[*i + 1] != b'\\' || b[*i + 2] != b'u' {
+                    return Err(format!(
+                        "Invalid escape: unpaired surrogate \\u{:04X}",
+                        code
+                    ));
+                }
+                let hex2 = &s[*i + 3..*i + 7];
+                let lo = u32::from_str_radix(hex2, 16)
+                    .map_err(|_| format!("Invalid \\u escape: \\u{}", hex2))?;
+                if !(0xDC00..0xE000).contains(&lo) {
+                    return Err(format!(
+                        "Invalid escape: \\u{:04X} is not followed by a low surrogate",
+                        code
+                    ));
+                }
+                *i += 6;
+                let combined = 0x10000 + ((code - 0xD800) << 10) + (lo - 0xDC00);
+                match char::from_u32(combined) {
+                    Some(c) => c.to_string(),
+                    None => return Err("Invalid escape: bad surrogate pair".to_string()),
+                }
+            } else if (0xDC00..0xE000).contains(&code) {
+                return Err(format!(
+                    "Invalid escape: unpaired low surrogate \\u{:04X}",
+                    code
+                ));
+            } else {
+                match char::from_u32(code) {
+                    Some(c) => c.to_string(),
+                    None => return Err(format!("Invalid escape: \\u{:04X}", code)),
+                }
+            }
+        }
+        other => return Err(format!("Invalid escape: \\{}", other as char)),
+    })
 }
 
 /// v0.35 (P0-D1): byte-index whitespace skipper. The old code used
@@ -108,7 +205,7 @@ fn parse_json_list(s: &str) -> Result<(Value, usize), String> {
         items.push(val);
         i += consumed;
     }
-    Ok((Value::List(items), i))
+    Ok((Value::List(items.into()), i))
 }
 
 fn parse_json_dict(s: &str) -> Result<(Value, usize), String> {
@@ -203,14 +300,29 @@ fn parse_json_number(s: &str) -> Result<(Value, usize), String> {
     // value_to_json: Int(42) → "42"; Float(42.0) → "42.0"
     // parse_json_number: "42" → Int(42); "42.0" → Float(42.0)
     if !has_decimal && !has_exponent {
-        // 整数路径：先尝试 i64，溢出时回退 Float
+        // 整数路径：i64 → BigInt
+        //
+        // v0.104.6 D197：修前是「先试 i64，**溢出时回退 Float**」——
+        // 静默丢精度，且丢得**无声无息**：
+        //
+        // ```text
+        // 18446744073709551615  (u64::MAX) →  18446744073709551616.0   ← 差 1
+        // -9223372036854775809             →  -9223372036854775808.0  ← 差 1
+        // 12345678901234567890              →  12345678901234567168.0  ← 差 5 位有效数字
+        // ```
+        //
+        // 本语言**已有**真任意精度的 `Value::BigInt`（num-bigint 后端，
+        // 字面量语法 `<digits>n`），算术 promotion 也已就位。回落 Float
+        // 既无必要、又危险：对处理 ID / 金额 / 序号的 agent 来说，
+        // 「拿到一个不同的数字」比「拿到一个 Float」糟得多。
         if let Ok(n) = num_str.parse::<i64>() {
             Ok((Value::Int(n), i))
         } else {
-            let num: f64 = num_str
+            // 超出 i64 → BigInt（任意精度，**不丢一位**）
+            let b: num_bigint::BigInt = num_str
                 .parse()
                 .map_err(|_| format!("Invalid number: {}", num_str))?;
-            Ok((Value::Float(num), i))
+            Ok((Value::BigInt(b), i))
         }
     } else {
         let num: f64 = num_str
@@ -220,11 +332,52 @@ fn parse_json_number(s: &str) -> Result<(Value, usize), String> {
     }
 }
 
+/// JSON 字符串转义（RFC 8259）—— 返回**不含**外层引号的转义结果。
+///
+/// v0.104.6 D209：新增。仓库里原本有**六处**手写转义链，每处转义的字符集
+/// 都不同，且**没有一处**处理除 `\n` `\r` `\t` 外的控制字符，于是产出
+/// **非法 JSON**（真实 `mora` + Python `json.loads` 实测）：
+///
+/// ```text
+/// json.stringify("a\nb")  →  22 61 0A 62 22    （裸换行在字符串里）
+///   Python: JSONDecodeError: Invalid control character
+/// json.stringify('"')     →  22 22 22          （Char 一点都没转义）
+///   Python: JSONDecodeError: Extra data
+/// json.stringify({"k\ny": "v"})  →  7B 22 6B 0A 79 22 ...  （裸换行在 key 里）
+///   Python: JSONDecodeError: Invalid control character
+/// ```
+///
+/// ⚠ **Mora 自己的 `json.parse` 接受这些输出** —— `parse_json_string` 按字节
+/// 收集到 `"` 为止，裸换行就原样进了结果。所以**语言内部往返是通的**，
+/// 这正是它一直没被发现的原因：**自洽但不合规**。只有**外部**解析器
+/// （Python / JS / Go / 任何真实 API）才会拒绝，而那正是 `json.stringify`
+/// 的用途 —— 把结构化数据交给外部。
+///
+/// 规则（RFC 8259 §7）：`"` 与 `\` 必须转义；`< 0x20` 的控制字符**必须**
+/// 转义（`\b` `\f` `\n` `\r` `\t` 用短形式，其余用 `\u00xx`）；
+/// `/` 与非 ASCII **不必**转义，保持原样可读。
+pub fn escape_json_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\u{0008}' => out.push_str("\\b"),
+            '\u{000C}' => out.push_str("\\f"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
+}
 /// Value 转 JSON 字符串
 pub fn value_to_json(value: &Value) -> String {
     match value {
-        Value::String(s) => format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\"")),
-        Value::Char(c) => format!("\"{}\"", c),
+        Value::String(s) => format!("\"{}\"", escape_json_string(s)),
+        Value::Char(c) => format!("\"{}\"", escape_json_string(&c.to_string())),
         // v0.38: Int formatted without decimal; Float always shows decimal.
         // v0.84: Float 必须始终输出小数点，即使 fract() == 0.0（如 42.0 → "42.0"），
         // 以保持与 parse_json_number 的类型对称性。parse_json_number 对不含小数点的
@@ -232,9 +385,24 @@ pub fn value_to_json(value: &Value) -> String {
         // 变成 Int(42)，类型降级不可逆。
         Value::Int(i) => i.to_string(),
         Value::Float(f) => {
-            // 如果 fract() == 0.0，format!("{}", f) 会输出 "42" 无小数点，
-            // 与 Int 不可区分。用 "{:.1}" 强制至少一位小数："42.0"。
-            if f.fract() == 0.0 {
+            // v0.104.6 D99：**非有限浮点不是 JSON**。
+            //
+            // 此前只判 `f.fract() == 0.0` 决定是否补小数点，而
+            // `inf.fract()` 与 `NaN.fract()` **都是 NaN**，`NaN == 0.0` 恒假
+            // → 落进 `format!("{}", f)`，Rust 输出裸的 `inf` / `NaN` ——
+            // 那不是 JSON 字面量：语言自己的 `json.parse` 读不回来
+            // （实测 `Unexpected character in JSON: inf`），PowerShell 等
+            // 真实解析器同样拒绝（`Invalid JSON primitive: inf.`）。
+            //
+            // `1.0 / 0.0` 是最普通的算术，故非边缘情形。
+            // 非有限 → `null`：JSON 表示不了它们的通行做法，也与
+            // `http_server::value_to_json`（经 `JsonValue` 映射，已输出 `null`）
+            // 行为一致 —— 此前两处**不一致**。
+            if !f.is_finite() {
+                "null".to_string()
+            } else if f.fract() == 0.0 {
+                // 如果 fract() == 0.0，format!("{}", f) 会输出 "42" 无小数点，
+                // 与 Int 不可区分。用 "{:.1}" 强制至少一位小数："42.0"。
                 format!("{:.1}", f)
             } else {
                 format!("{}", f)
@@ -249,15 +417,19 @@ pub fn value_to_json(value: &Value) -> String {
             format!("[{}]", parts.join(","))
         }
         Value::Dict(map) => {
-            let parts: Vec<String> = map
-                .iter()
-                .map(|(k, v)| {
-                    format!(
-                        "\"{}\":{}",
-                        k.replace('\\', "\\\\").replace('"', "\\\""),
-                        value_to_json(v)
-                    )
-                })
+            // v0.104.6 可复现性修复：按 key 排序输出。
+            //
+            // `Value::Dict` 底层是 `HashMap`，其 `RandomState` 每进程随机 →
+            // `map.iter()` 的顺序**每次运行都不同**。JSON 对象的键序在语义上无关
+            // （RFC 8259 明确对象是无序的），故这是纯粹的可复现性问题，但后果是
+            // 实打实的：`json.*` builtin 的输出不可复现 → 无法写断言 / diff /
+            // 哈希签名 / 缓存。仓库内已有正确先例：`http_server.rs::value_to_json`
+            // 与 `mcp_server.rs::mora_to_json` 都先收进 `BTreeMap` 再输出。
+            let mut entries: Vec<(&String, &Value)> = map.iter().collect();
+            entries.sort_by(|a, b| a.0.cmp(b.0));
+            let parts: Vec<String> = entries
+                .into_iter()
+                .map(|(k, v)| format!("\"{}\":{}", escape_json_string(k), value_to_json(v)))
                 .collect();
             format!("{{{}}}", parts.join(","))
         }
@@ -411,13 +583,28 @@ mod tests {
     }
 
     #[test]
-    fn large_integer_overflow_falls_back_to_float() {
-        // 超出 i64 范围的大整数 → Float（避免 panic）
+    fn large_integer_overflow_becomes_bigint_not_float() {
+        // v0.104.6 D197：此测试原先叫 `large_integer_overflow_falls_back_to_float`，
+        // 断言「超 i64 → **Float**」—— 也就是把**有缺陷的行为**钉成了期望。
+        // 那不是「防 panic」的合理设计，是**静默的数值损坏**：
+        //
+        // ```text
+        // 18446744073709551615  →  18446744073709551616.0   ← 差 1，且无任何提示
+        // ```
+        //
+        // 本语言已有真任意精度的 `BigInt`（num-bigint），故改为产出 BigInt。
+        // 期望随之翻转。
         let v = json_to_value("999999999999999999999").unwrap();
-        match v {
-            Value::Float(_) => {} // 期望 Float
-            other => panic!("expected Float for overflow integer, got {:?}", other),
+        match &v {
+            Value::BigInt(b) => assert_eq!(
+                b.to_string(),
+                "999999999999999999999",
+                "BigInt 必须**逐位**保留，不得丢精度"
+            ),
+            other => panic!("expected BigInt for overflow integer, got {:?}", other),
         }
+        // 顺带钉住「不 panic」这条旧意图（它本身是对的，只是载体从 Float 换成 BigInt）。
+        assert_ne!(json_to_value("999999999999999999999"), Err(String::new()));
     }
 
     // ── 嵌套结构中 Int/Float 类型保留 ──

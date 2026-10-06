@@ -4,6 +4,18 @@
 //!
 //! 与 parser_v2_integration.rs 那种依赖 cwd 的 read_to_string 不同，
 //! 本模块所有路径用 env!("CARGO_MANIFEST_DIR") 解析，CI 无依赖。
+//!
+//! v0.104.6 D295：`#![allow(dead_code)]` —— 本模块被**两个**测试二进制
+//! 各自 `mod e2e_helpers;` 引入（`e2e.rs` 与 `nested_loop_jumps.rs`），
+//! 而**每个二进制单独编译**。只用 `assert_source_ok` 的那个自然看不到
+//! `fixture_path` / `read_fixture` / `run_e2e` / `assert_ok` /
+//! `assert_compile_error`，于是 `dead_code` 必然报 —— 它报的是「本二进制
+//! 没用」，不是「仓库里没人用」（`e2e.rs` 五个全在用）。
+//!
+//! `e2e.rs` 里曾有一个 `_unused_assert_compile_error()` 占位函数专门用来
+//! 骗过这条 lint，本轮随本注解一并删除。
+
+#![allow(dead_code)]
 
 use mora::interpreter::Interpreter;
 use mora::mir::vm::{run_main_task, run_mir};

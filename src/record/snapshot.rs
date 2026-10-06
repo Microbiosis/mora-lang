@@ -3,6 +3,36 @@
 use super::serialization::{esc, event_to_jsonl};
 use super::*;
 
+/// 按**字符**数截断显示串（超长时补 `…`）。
+///
+/// v0.104.6 D179：本仓库有**三处**同一类 bug —— 用 `str::len()`（**字节**）
+/// 判断长度、却用 `[..n]`（**字节**偏移）去切。对纯 ASCII 无害，对
+/// **中文/重音字母**就会切在字符中间 → Rust panic。
+///
+/// 实测（`mora record report`，prompt 为 25 个汉字 = 75 字节）：
+///
+/// ```text
+/// thread 'mora-main' panicked at src/record/snapshot.rs:81:
+///   byte index 49 is not a char boundary; it is inside '要' (bytes 48..51 …)
+/// ```
+///
+/// 三处站点（全部改为走本函数）：
+/// - `record/snapshot.rs` 的 report Timeline 表（`len()>50` / `[..49]`）
+/// - `record/analysis.rs` 的 export Markdown 表（`len()>40` / `[..39]`）
+/// - `cli/mod.rs::truncate`（timeline 表格用，`len()<=max` / `[..max-1]`）
+///
+/// 语义变化：现在按**字符**数截断，中文内容能完整显示 50/40 个字
+/// （原先按字节只能显示 16/13 个字就 panic 或被切碎）。
+pub fn truncate_display(s: &str, max_chars: usize) -> String {
+    if s.chars().count() <= max_chars {
+        return s.to_string();
+    }
+    // 留 1 个位置给 `…`（`max_chars == 0` 时不留，避免 `max - 1` 下溢）。
+    let keep = max_chars.saturating_sub(1);
+    let head: String = s.chars().take(keep).collect();
+    format!("{}…", head)
+}
+
 pub fn generate_report(
     events: &[Event],
     name: &str,
@@ -77,11 +107,10 @@ pub fn generate_report(
     md.push_str("| # | Kind | Detail | Tokens | Lat(ms) | Status |\n");
     md.push_str("|---|------|--------|--------|---------|--------|\n");
     for row in &build_timeline(events) {
-        let detail = if row.detail.len() > 50 {
-            format!("{}…", &row.detail[..49])
-        } else {
-            row.detail.clone()
-        };
+        // v0.104.6 D179：原为 `row.detail.len() > 50` + `&row.detail[..49]`
+        // （字节数判断、字节数切片）→ 中文内容必 panic。改走
+        // `truncate_display`（按字符）。
+        let detail = truncate_display(&row.detail, 50);
         md.push_str(&format!(
             "| {} | {} | {} | {} | {} | {} |\n",
             row.seq, row.kind, detail, row.tokens, row.latency_ms, row.status

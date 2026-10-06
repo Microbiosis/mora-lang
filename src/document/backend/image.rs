@@ -209,8 +209,8 @@ impl DocumentBackend for ImageBackend {
         pd.insert("page_no".into(), Value::Float(1.0));
         pd.insert("width".into(), Value::Float(self.width as f64));
         pd.insert("height".into(), Value::Float(self.height as f64));
-        pd.insert("blocks".into(), Value::List(vec![]));
-        Ok(Value::List(vec![Value::Dict(pd)]))
+        pd.insert("blocks".into(), Value::List(vec![].into()));
+        Ok(Value::List(vec![Value::Dict(pd)].into()))
     }
     fn markdown(&self) -> Result<String, String> {
         Ok(self.lines.join("\n"))
@@ -230,7 +230,7 @@ impl DocumentBackend for ImageBackend {
         Ok(Value::Dict(m))
     }
     fn blocks(&self) -> Result<Value, String> {
-        Ok(Value::List(vec![]))
+        Ok(Value::List(vec![].into()))
     }
 }
 

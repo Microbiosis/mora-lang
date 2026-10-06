@@ -136,7 +136,18 @@ impl Server {
                 }
             }
             "textDocument/didChange" => {
-                if let Some((uri, version, text)) = parse_change_params(&params) {
+                if let Some((uri, version, changes)) = parse_change_params(&params) {
+                    // v0.104.6 D194：变更要**基于当前文档**应用 —— 增量变更
+                    // 必须拿到现有文本才能按 `range` 拼接（修前取最后一条的
+                    // `text` 当整份文档，增量编辑会丢掉整个文件）。
+                    let base = {
+                        let docs = self
+                            .docs
+                            .lock()
+                            .map_err(|_| io::Error::other("docs mutex poisoned"))?;
+                        docs.get(&uri).map(|d| d.text.clone()).unwrap_or_default()
+                    };
+                    let text = apply_content_changes(&base, &changes);
                     let diags = self.check_diagnostics(&text);
                     let mut docs = self
                         .docs
@@ -243,10 +254,30 @@ impl Server {
 
         // completionProvider
         let mut cp = std::collections::BTreeMap::new();
-        cp.insert(
-            "triggerCharacters".to_string(),
-            Value::Array(vec![Value::String_(":".to_string())]),
-        );
+        // v0.104.6 D195：撤掉 `":"` 这个 triggerCharacter。
+        //
+        // 此前 capabilities 声明 `triggerCharacters: [":"]` —— 告诉编辑器
+        // 「用户一打冒号就向我请求补全」。而实测**在那个位置返回空**：
+        //
+        // ```text
+        // 普通位置 print(x) 的 →  →  35 条
+        // 紧跟 `let x: `            →   0 条
+        // with 块内缩进行            →   0 条
+        // ```
+        //
+        // 即**宣称会在某个位置提供补全，却在那里什么都不给** ——
+        // 与 D175 的 `methods_of` 空集、D186 的 MCP 名字目录同族。
+        // 用户每打一个冒号（类型标注 / dict 字面量 / `with` 块）都会
+        // 闪一个空列表。
+        //
+        // **撤声明而不是补实现**：真正兑现这个触发需要一份「类型名清单」，
+        // 而那必然是**第三份**要维护的名字表（已有 `Type` 枚举与
+        // `typeck` 的类型名映射），正是 D175/D189 记过的那种漂移陷阱。
+        // 等真要做补全时连同内容一起加，并把这行注释改回去。
+        //
+        // 判据 `tests/lsp_completion_trigger_honesty.rs` 是**自适应**的：
+        // 它允许将来重新声明 `":"` —— 条件是那时在冒号后**确实**返回条目。
+        cp.insert("triggerCharacters".to_string(), Value::Array(Vec::new()));
         capabilities.insert("completionProvider".to_string(), Value::Object(cp));
 
         capabilities.insert("definitionProvider".to_string(), Value::Bool(true));
@@ -261,10 +292,10 @@ impl Server {
         capabilities.insert("foldingRangeProvider".to_string(), Value::Bool(true));
 
         // semanticTokensProvider
+        // v0.104.6 D201：legend 与 semantic.rs 里的索引**同源** ——
+        // 此前两边各写各的，服务器发出的索引全部越界。
         let mut token_types = Vec::new();
-        for t in [
-            "keyword", "function", "variable", "string", "float", "comment", "type", "operator",
-        ] {
+        for t in super::providers::semantic::TOKEN_TYPES {
             token_types.push(Value::String_(t.to_string()));
         }
         let mut token_mods = Vec::new();
@@ -370,11 +401,49 @@ impl Server {
     // ============================================================
     // Diagnostics（typeck → LSP Diagnostic）
     // ============================================================
+    /// v0.104.6 D101：把 parser 的错误消息转成一条 LSP `Diagnostic`。
+    ///
+    /// 行号优先取消息里的 `at line N`（parser 的位置格式，1-based → 0-based），
+    /// 退化到 `line N` / `第 N 行`，都没有则落在第 0 行。列号一律 0 ——
+    /// parser 的错误消息不带列号，与其编一个不如留 0（编辑器会指向行首）。
+    fn parse_error_diagnostic(msg: &str) -> Diagnostic {
+        let line_1 = ["at line ", "line ", "第 "]
+            .iter()
+            .find_map(|marker| {
+                let i = msg.find(marker)? + marker.len();
+                let rest = &msg[i..];
+                let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+                if digits.is_empty() {
+                    None
+                } else {
+                    digits.parse::<usize>().ok()
+                }
+            })
+            .unwrap_or(1);
+        Diagnostic {
+            line: line_1.saturating_sub(1),
+            column: 0,
+            end_line: line_1.saturating_sub(1),
+            end_column: 1,
+            severity: 1, // Error
+            message: msg.to_string(),
+            source: "mora-parser".to_string(),
+        }
+    }
+
     fn check_diagnostics(&self, text: &str) -> Vec<Diagnostic> {
         // v0.75.40: 单遍编译（compile 直接产出 witness），typeck 直接消费
         let (_, witnesses) = match crate::parser_v3::ParserV3::compile(text) {
             Ok(pair) => pair,
-            Err(_) => return Vec::new(),
+            // v0.104.6 D101：此前 `Err(_) => return Vec::new()` —— **语法错误
+            // 产生零诊断**。实测 `let = = =` 在 `mora run` 下报
+            // 「Parse error: Expected variable name after 'let' at line 1」，
+            // 而 LSP 推送 `diagnostics: []`，即**告诉用户「代码没问题」**。
+            // 语法错误是语言服务器最基本的能力，这一吞让整条诊断链在此处失效。
+            //
+            // 改为把 parse 错误本身作为一条 Error 诊断推出。行号从消息里的
+            // `at line N` 提取（1-based → 0-based）；提取不到时落在第 0 行。
+            Err(e) => return vec![Self::parse_error_diagnostic(&e)],
         };
         let errs = crate::typeck::check_mir::check_program_witnesses_bidirectional(&witnesses);
         errs.into_iter()
@@ -515,15 +584,70 @@ pub fn parse_doc_params(params: &Value) -> Option<DocumentState> {
     })
 }
 
-pub fn parse_change_params(params: &Value) -> Option<(String, i64, String)> {
+/// 从 `contentChanges` 的某一条里取出 `(line, character)`。
+fn pos_of(v: Option<&Value>) -> (usize, usize) {
+    let p = match v {
+        Some(p) => p,
+        None => return (0, 0),
+    };
+    // v0.104.6 D245：转发到 `providers::parsed_doc_v3::pos_of` —— 那才是
+    // 全部入站位置的**唯一收口**。此前本函数自带 `.max(0)`（D194）而
+    // `definition` / `hover` / `formatting` 三处各写一遍且**都没有**守卫，
+    // 同一个仓库里两套行为。现四处共用一处。
+    super::providers::parsed_doc_v3::pos_of(p.get("line"), p.get("character"))
+}
+
+/// v0.104.6 D194：按 LSP 规范应用 `contentChanges`。
+///
+/// 服务器在 capabilities 里声明 `textDocumentSync.change: 1`（**Incremental**），
+/// 于是**带 `range` 的变更必须按范围拼接**。
+///
+/// 修前 `parse_change_params` 只取**最后一条**的 `text` 当作整份文档
+/// （注释还写着「Full sync: 只取最后一条」）—— 全量同步下碰巧正确，
+/// 但增量同步下**每个字符都会把整个文件替换掉**。实测（真实 `mora-lsp.exe`）：
+///
+/// ```text
+/// didOpen  "let a = 1\nprint(a)\n"
+/// didChange range=(0,8)-(0,9) text="2"      ← 只把 '1' 改成 '2'
+///   → 文档实际变成 "2"
+///   → documentSymbol 返回 []（编辑前返回 [a]）
+///   → hover 在 (0,4) 报 "variable 2"
+/// ```
+///
+/// 而全量变更（无 `range`）一切正常 —— 于是「只在真实编辑里出现」。
+/// 影响：任何按声明使用增量同步的编辑器，**敲第一个键就丢掉整个文件**，
+/// 之后 hover / 符号 / 诊断 / 补全全部空转。
+pub fn apply_content_changes(base: &str, changes: &[Value]) -> String {
+    use crate::lsp::providers::parsed_doc_v3::position_to_offset;
+    let mut text = base.to_string();
+    for ch in changes {
+        let new_text = ch.get("text").and_then(|t| t.as_str()).unwrap_or("");
+        match ch.get("range") {
+            // 增量：按范围拼接
+            Some(r) => {
+                let (sl, sc) = pos_of(r.get("start"));
+                let (el, ec) = pos_of(r.get("end"));
+                let s = position_to_offset(&text, sl, sc);
+                let e = position_to_offset(&text, el, ec).max(s);
+                text.replace_range(s..e, new_text);
+            }
+            // 全量：整份替换（规范允许同一次请求里混合）
+            None => text = new_text.to_string(),
+        }
+    }
+    text
+}
+
+/// v0.104.6 D194：返回 `(uri, version, contentChanges 原样)`。
+///
+/// 变更**怎么应用**交给 `apply_content_changes` —— 它要按 `range` 拼接，
+/// 而拼接必须基于当前文档，不能在这里就把文本定死。
+pub fn parse_change_params(params: &Value) -> Option<(String, i64, Vec<Value>)> {
     let td = params.get("textDocument")?;
     let uri = td.get("uri")?.as_str()?.to_string();
     let version = td.get("version").and_then(|v| v.as_i64()).unwrap_or(0);
-    let changes = params.get("contentChanges")?.as_array()?;
-    // Full sync: 只取最后一条（按 LSP 规范 full sync 只发一条）
-    let last = changes.last()?;
-    let text = last.get("text")?.as_str()?.to_string();
-    Some((uri, version, text))
+    let changes = params.get("contentChanges")?.as_array()?.clone();
+    Some((uri, version, changes))
 }
 
 #[cfg(test)]

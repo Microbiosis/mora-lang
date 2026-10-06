@@ -63,9 +63,34 @@ impl Interpreter {
             }
             "run" => {
                 let app = args.first().ok_or("tea.run: missing app arg")?;
-                let max_steps = match args.get(1) {
-                    Some(Value::Int(n)) => *n as usize,
-                    _ => 1000,
+                // v0.104.6 D150：此前**只认 `Value::Int`**，而 Mora 的数字**字面量**
+                // 是 `Float`（D98）—— 反向的同一个缺陷：`tea.run(a, 5)` 这种最自然的
+                // 写法上限被**静默忽略**。实测（探针 `H10`：update 每轮 produce 一个
+                // `Cmd::Dispatch` 使队列永不空，故轮数 = count）：
+                //   修复前 `tea.run(a, 3)` → count 1000（跑了默认上限），
+                //          `tea.run(a, 10)` → count 1000；
+                //   修复后 3 / 10 —— 且 `len(...)` 的 `Int` 与字面量两条路都生效。
+                // v0.104.6 D339：`n as usize` 是**无守卫**的数字转换，与 D285
+                // 在 `exec.parallel` 上修掉的是**同一个根因**（`optional_num_arg`
+                // 之后又补了一次裸 `as`）。
+                //
+                // 实测两种实参类型给出**天差地别**的结果：
+                //   `-1.0f64 as usize`  → **饱和成 0** ⇒ `for _ in 0..0` ⇒ **静默不跑**
+                //   `-1i64  as usize`  → **回绕成 1.8e19** ⇒ 「update 每轮产 Cmd」时**挂死**
+                // 同一句源码、两种数值类型，exit 0、零诊断。
+                //
+                // 现改走 D246 的收口 `value_as_usize`（负数 / NaN / ±inf 一律 `None`）
+                // —— 与 `exec.parallel` 的 `max_concurrent` / `timeout_ms` 完全一致。
+                let max_steps = match optional_num_arg(args, 1, "tea.run", "max_steps")? {
+                    None => 1000, // 缺参或显式 nil ⇒ 默认上限
+                    Some(n) => {
+                        if !n.is_finite() || n < 0.0 {
+                            return Err(
+                                "tea.run: max_steps must be a non-negative number".to_string()
+                            );
+                        }
+                        n as usize
+                    }
                 };
                 let app = match app {
                     Value::TeaApp(a) => a.clone(),

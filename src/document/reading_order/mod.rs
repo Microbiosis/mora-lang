@@ -55,10 +55,21 @@ impl BBox {
         };
         let get = |k: &str| {
             bbox_dict.get(k).and_then(|x| {
-                if let Value::Float(n) = x {
-                    Some(*n)
-                } else {
-                    None
+                // v0.104.6 D230：`Int` 与 `Float` 都接受。
+                //
+                // 此前只匹配 `Value::Float` ⇒ **`json.parse` 产出的 bbox 整个被丢弃**
+                // （D129：`json.parse` 产出 `Int`，dict 字面量给 `Float`）。
+                // 后果实测：三块同列、输入顺序与几何顺序相反时，
+                // 全部 `Float` 得到 `A_top, C, B_bottom`；
+                // 中间块换成 `Int` 后得到 `B_bottom, C, A_top` ——
+                // **阅读顺序完全颠倒，零诊断**。
+                //
+                // 与 D149（compress options）、D148（reading_order_idx）
+                // 同一套修法：`Int` 侧也要管。
+                match x {
+                    Value::Int(n) => Some(*n as f64),
+                    Value::Float(n) => Some(*n),
+                    _ => None,
                 }
             })
         };
@@ -142,26 +153,35 @@ pub fn assign_reading_order(
             // indices already 0..n
         }
         Strategy::TopToBottom => {
+            // v0.104.6 D241：改为**单一全序 key** `(y, x)`，与 `XyCut` 同款。
+            //
+            // 修前是**混合比较器**：垂直**不重叠**时比 y（谁在上），
+            // **重叠**时比 x（谁靠左）。这不是全序 —— 可构造
+            // `cmp(A,B)` 与 `cmp(B,C)` 用 x 决定、而 `cmp(A,C)` 用 y 决定
+            // 的三元组，链式推论与直接比较**互相矛盾**。
+            //
+            // Rust 的 `sort_by` 在比较器非全序时**静默**产生错误结果
+            // （官方文档明说 "may panic or return nonsense"，
+            //  实践上表现为结果**依赖输入排列**），不 panic、零诊断。
+            //
+            // 实测（穷举全部输入排列）：
+            //   3 个块 → 6 种排列 → **6 种不同结果**（每个恰好 1 次）
+            //   4 个块 → 24 种排列 → **24 种不同结果**
+            // 即：**排序完全没有发生**，输出恒等于输入顺序 ——
+            // `TopToBottom` 实际退化成了 `InputOrder`。
+            //
+            // 「按 y 分行、行内按 x」正是该策略文档所述的语义，
+            // 而 `(y, x)` 正是它的全序实现。
             indices.sort_by(|&a, &b| {
                 let ba = bboxes[a];
                 let bb = bboxes[b];
                 match (ba, bb) {
-                    (Some(ba), Some(bb)) => {
-                        // a 在 b 之前如果 a 的 vertical range 在 b 之前 (无 overlap)
-                        let a_bot = ba.bottom();
-                        let b_top = bb.y;
-                        let a_top = ba.y;
-                        let b_bot = bb.bottom();
-                        if a_bot <= b_top {
-                            std::cmp::Ordering::Less
-                        } else if b_bot <= a_top {
-                            std::cmp::Ordering::Greater
-                        } else {
-                            // 重叠 (同 row), 按 x
-                            ba.x.partial_cmp(&bb.x).unwrap_or(std::cmp::Ordering::Equal)
-                        }
-                    }
-                    _ => std::cmp::Ordering::Equal, // 缺 bbox 保持原序
+                    (Some(ba), Some(bb)) => ba
+                        .y
+                        .partial_cmp(&bb.y)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                        .then_with(|| ba.x.partial_cmp(&bb.x).unwrap_or(std::cmp::Ordering::Equal)),
+                    _ => std::cmp::Ordering::Equal,
                 }
             });
         }
@@ -288,11 +308,25 @@ mod tests {
 
     fn reading_order_idx(b: &Value) -> Option<usize> {
         if let Value::Dict(d) = b {
-            if let Some(Value::Float(n)) = d.get("reading_order_idx") {
-                Some(*n as usize)
-            } else {
-                None
+            // v0.104.6 D230：`Int` 与 `Float` 都接受。
+            //
+            // `assign_reading_order` 自己写入的是 `Value::Float`，故这条读取
+            // 此前**自洽**；但从 `json.parse` 读回的录制 / 外部数据里
+            // `reading_order_idx` 是 `Int`，会被当成「无 idx」。
+            // 与 D148 同源的 `Int`/`Float` 双侧问题，一并收口。
+            let n = match d.get("reading_order_idx") {
+                Some(Value::Int(i)) => *i as f64,
+                Some(Value::Float(f)) => *f,
+                _ => return None,
+            };
+            // v0.104.6 D148：`reading_order_idx` 是排序下标，语义上非负。
+            // 此前 `-1.0 as usize == 0`（饱和），负值会被静默当成「第 0 个」，
+            // 把块顺序排错且无任何诊断。此处返回 `None`（= 无 idx，走无序分支），
+            // 交由调用方按缺失处理，而不是伪造一个下标。
+            if n < 0.0 {
+                return None;
             }
+            Some(n as usize)
         } else {
             None
         }
@@ -544,6 +578,31 @@ mod tests {
     fn empty_input() {
         let out = assign_reading_order(vec![], Strategy::TopToBottom);
         assert!(out.is_empty());
+    }
+
+    /// v0.104.6 D230：`reading_order_idx` 的读取必须同时接受 `Int` 与 `Float`。
+    ///
+    /// 放在模块内是因为 `reading_order_idx` 是 `#[cfg(test)]` 的私有辅助函数，
+    /// 集成测试访问不到 —— 而这一处的回退**确实**没有牙齿（首轮牙齿验证里
+    /// T2 报 NO TEETH），所以必须有判据，否则这处修复无保护。
+    #[test]
+    fn d230_reading_order_idx_accepts_int_and_float() {
+        let mut d = std::collections::HashMap::new();
+        d.insert("reading_order_idx".to_string(), Value::Float(3.0));
+        assert_eq!(reading_order_idx(&Value::Dict(d.clone())), Some(3));
+
+        d.insert("reading_order_idx".to_string(), Value::Int(3));
+        assert_eq!(
+            reading_order_idx(&Value::Dict(d.clone())),
+            Some(3),
+            "D230: Int 侧必须同样被接受（json.parse 产出的就是 Int）"
+        );
+
+        // D148 保留：负值仍须被拒绝（饱和转换会把 -1 变成 0）
+        d.insert("reading_order_idx".to_string(), Value::Int(-1));
+        assert_eq!(reading_order_idx(&Value::Dict(d.clone())), None);
+        d.insert("reading_order_idx".to_string(), Value::Float(-1.0));
+        assert_eq!(reading_order_idx(&Value::Dict(d)), None);
     }
 
     #[test]
@@ -844,5 +903,71 @@ mod tests {
         let mut indices: Vec<usize> = out.iter().map(|b| reading_order_idx(b).unwrap()).collect();
         indices.sort();
         assert_eq!(indices, vec![0, 1, 2, 3]);
+    }
+
+    /// v0.104.6 D243：XY-Cut++ 必须**平移不变**，且不得因负坐标丢块。
+    ///
+    /// 本模块原有的 16 条 `xy_cut_pp_*` 测试**全部使用正坐标**（`x: 0.0,
+    /// y: 0.0` 起），所以它们对本缺陷**完全无感**。补这一条是为了让
+    /// `cargo test --lib` 单独运行时也守得住 —— 集成判据在
+    /// `tests/xy_cut_translation_invariance.rs`。
+    ///
+    /// 缺陷回顾：`project_to_axis` 的直方图下标与 `recursive_xy_cut` 的段
+    /// 成员判定不在同一坐标系（前者 `坐标 as usize`，后者拿段边界下标去比
+    /// 原始 `center_y()`），而 `as usize` 对负数是饱和转换 ⇒ 负坐标块被
+    /// 静默丢弃。实测 `y0 = -100` 时 4 块输入只输出 2 块。
+    #[test]
+    fn d243_xy_cut_pp_survives_negative_coords() {
+        let make = |y0: f64| {
+            vec![
+                make_block(
+                    "title",
+                    Some(BBox {
+                        x: 0.0,
+                        y: y0,
+                        w: 200.0,
+                        h: 30.0,
+                    }),
+                ),
+                make_block(
+                    "p1",
+                    Some(BBox {
+                        x: 0.0,
+                        y: y0 + 40.0,
+                        w: 200.0,
+                        h: 100.0,
+                    }),
+                ),
+                make_block(
+                    "p2",
+                    Some(BBox {
+                        x: 0.0,
+                        y: y0 + 150.0,
+                        w: 200.0,
+                        h: 100.0,
+                    }),
+                ),
+                make_block(
+                    "footer",
+                    Some(BBox {
+                        x: 0.0,
+                        y: y0 + 260.0,
+                        w: 200.0,
+                        h: 20.0,
+                    }),
+                ),
+            ]
+        };
+        let baseline = extract_texts(&assign_reading_order(make(0.0), Strategy::XyCutPlusPlus));
+        assert_eq!(baseline, vec!["title", "p1", "p2", "footer"]);
+
+        // 平移量要**多取几个**：只取 -300 会落进「巧合正确」的旁路
+        // （所有下标塌成 0 ⇒ 无 gap ⇒ 走不按段过滤的排序分支）。
+        for y0 in [-100.0, -300.0, -1000.0, 1000.0] {
+            let out = assign_reading_order(make(y0), Strategy::XyCutPlusPlus);
+            let texts = extract_texts(&out);
+            assert_eq!(texts, baseline, "平移 y0={y0} 改变了阅读顺序：{texts:?}");
+            assert_eq!(out.len(), 4, "平移 y0={y0} 静默丢块：{texts:?}");
+        }
     }
 }

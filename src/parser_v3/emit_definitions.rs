@@ -55,9 +55,53 @@ impl ParserV3 {
     pub(super) fn emit_let_w(&mut self) -> Option<MirWitness> {
         let span = self.span_of_current();
         self.advance(); // 'let'
-        let name = self.consume_identifier("Expected variable name after 'let'")?;
+        // v0.104.6 D353：此前走 `consume_identifier`，而它的兜底分支
+        // （`tokens.rs`）会调 `token_to_identifier_name()` 把**关键字 token
+        // 映射回标识符名**（`if` / `let` / `fn` / `end` / … 共 20+ 个）。
+        //
+        // 那个映射的**本意**是别的位置（见 `parser_v3/mod.rs:296` 的注释）：
+        // 关键字可以出现在「方法名」或「`.` / `::` 之后的引用」位置。
+        // 但 `let` 的**声明位**借用了同一条路径 ⇒ 宽容**泄漏**到声明位，
+        // 产出**僵尸绑定**（zombie binding）：
+        //
+        // ```text
+        // let if = 5        → exit 0，**接受**（声明了一个变量）
+        // print(if)         → Failed to parse at line 2
+        // let zz = 5
+        // print(zz)         → 5.0                            ← 正常对照
+        // ```
+        //
+        // 声明**成功**、引用**永远失败** ⇒ 变量不可用，且诊断**指错了行**
+        // （问题在 line 1，错误报在 line 2）。这比直接报错更糟：
+        // 用户会去查 line 2，而那里完全没问题。
+        //
+        // 修法：声明位**只认** `TokenType::Identifier`（真正的标识符），
+        // 关键字一律报错。**零依赖** —— 实测 `tests/fixtures/**` 与
+        // `examples/**` 下 **56 个** `.mora` 文件里，
+        // **没有任何一个**用关键字作 `let` 变量名。
+        let name = self.consume_plain_identifier("Expected variable name after 'let'")?;
         let type_hint = if self.match_token_exact(TokenType::Colon) {
-            self.parse_type_annotation()
+            // v0.104.6 D111：此前是裸调用 `self.parse_type_annotation()`，
+            // 它返回 `None` 时（**不受支持的泛型标注**，
+            // 见 `syntax.rs` 的 `unsupported generic type annotation` 分支）
+            // 被当成「这一行没有标注」—— **标注被静默丢弃**，程序照常跑、
+            // exit 0，且 `let` 绑定的类型就是右值的推断类型。
+            //
+            // 实测：`let r: result<number, string> = 1` → exit 0、零报错、`r = 1.0`；
+            // 而 `let r: string = 1` 会被 typeck 正确拒绝。
+            // 同一类缺陷 D46 已在 `emit_struct_def_w` / `emit_enum_def_w` 修过，
+            // **此处未同步**。改为报错。
+            match self.parse_type_annotation() {
+                Some(t) => Some(t),
+                None => {
+                    eprintln!(
+                        "Parse error: unparsable type annotation for let binding \
+                         `{name}` (line {})",
+                        self.current_line()
+                    );
+                    return None;
+                }
+            }
         } else {
             None
         };
@@ -162,34 +206,44 @@ impl ParserV3 {
         }
         self.consume(TokenType::RParen, "Expected ')' after parameters")?;
         // 子上下文：函数体是独立寄存器空间（镜像 lower FnDef 分支）
+        //
+        // v0.104.6 D44：体发射失败时**还原父上下文**（见 emit_match_arm_w 处的
+        // 完整说明）。体包进闭包，使 `?` 只退出闭包而不是整个函数。
         let parent = std::mem::replace(&mut self.emit, crate::mir::lower::EmitContext::new());
-        let (body_reg, body_w) = if self.match_token_exact(TokenType::Newline) {
-            let mut stmt_wits = Vec::new();
-            let mut last: Option<Reg> = None;
-            while self.match_token(&[TokenType::Newline]) {}
-            while !self.check(&TokenType::End) && !self.is_at_end() {
-                let (r, w) = self.emit_statement_expr_w()?;
-                last = Some(r);
-                stmt_wits.push(w);
+        let body_res = (|| -> Option<(Option<Reg>, MirWitness)> {
+            let (body_reg, body_w) = if self.match_token_exact(TokenType::Newline) {
+                let mut stmt_wits = Vec::new();
+                let mut last: Option<Reg> = None;
                 while self.match_token(&[TokenType::Newline]) {}
-            }
-            self.consume(TokenType::End, "Expected 'end' after task body")?;
-            (last, Self::block_witness(stmt_wits, span))
-        } else if self.check(&TokenType::End) {
-            // Empty body: `task main() end`
-            let nil_reg = self.emit.alloc_reg();
-            self.emit
-                .emit(MirInst::Const(nil_reg, crate::value::Value::Nil));
-            let nil_w = MirWitness {
-                kind: WitnessKind::Literal(Literal::Nil(span)),
-                span,
+                while !self.check(&TokenType::End) && !self.is_at_end() {
+                    let (r, w) = self.emit_statement_expr_w()?;
+                    last = Some(r);
+                    stmt_wits.push(w);
+                    while self.match_token(&[TokenType::Newline]) {}
+                }
+                self.consume(TokenType::End, "Expected 'end' after task body")?;
+                (last, Self::block_witness(stmt_wits, span))
+            } else if self.check(&TokenType::End) {
+                // Empty body: `task main() end`
+                let nil_reg = self.emit.alloc_reg();
+                self.emit
+                    .emit(MirInst::Const(nil_reg, crate::value::Value::Nil));
+                let nil_w = MirWitness {
+                    kind: WitnessKind::Literal(Literal::Nil(span)),
+                    span,
+                };
+                (Some(nil_reg), nil_w)
+            } else {
+                let (r, w) = self.emit_expr_w()?;
+                (Some(r), w)
             };
-            (Some(nil_reg), nil_w)
-        } else {
-            let (r, w) = self.emit_expr_w()?;
-            (Some(r), w)
+            self.emit.emit_tail_return(body_reg);
+            Some((body_reg, body_w))
+        })();
+        let Some((_body_reg, body_w)) = body_res else {
+            self.emit = parent;
+            return None;
         };
-        self.emit.emit_tail_return(body_reg);
         let body_mir = std::mem::replace(&mut self.emit, parent).finish();
         self.emit.emit(MirInst::TaskDef {
             name: name.clone(),
@@ -220,6 +274,34 @@ impl ParserV3 {
         let span = self.span_of_current();
         match token {
             TokenType::Return => {
+                // v0.104.6 D42：`return` 只在函数体里有意义。判据用
+                // `is_program_top`（程序顶层是唯一不属于任何函数体的寄存器
+                // 空间），与下方 `break`/`continue` 的 `loop_stack` 守卫同款。
+                //
+                // 修前的实测（真实 CLI `mora run`，**全部 exit 0、零提示**）：
+                //
+                // ```mora
+                // print(111)   → 111.0
+                // return 1
+                // print(999)   → 从不执行
+                // ```
+                //
+                // `if` / `for` / `with` 的体同样内联在程序顶层，故
+                // `if c == 1 then return 7 end` + `print(888)` 也会把 888 吞掉。
+                // 用户写「提前返回」却看到程序「成功结束」，与 D35
+                // （`let r = handle …` 让其后所有语句静默消失）同族。
+                //
+                // 为什么**不**保留「顶层 return = 结束程序」：那与
+                // 「正常跑完」在退出码和输出上完全不可区分。
+                if self.emit.is_program_top {
+                    eprintln!(
+                        "Parse error: `return` is only valid inside a `task` / closure \
+                         body (line {}) — at the top level it silently terminated the \
+                         whole program, discarding every following statement",
+                        self.current_line()
+                    );
+                    return None;
+                }
                 self.advance();
                 // v0.102 修复：`return <expr>` 必须返回**表达式的求值寄存器**。
                 // 此前硬编码 `map(|_| 0)` —— 丢弃 emit_expr_w 的结果寄存器，
@@ -257,7 +339,7 @@ impl ParserV3 {
                     .copied()
                     .ok_or("Break outside loop")
                     .ok()?;
-                self.emit.emit(MirInst::Break(brk));
+                self.emit.emit_break(brk);
                 Some(MirWitness {
                     kind: WitnessKind::Break(label),
                     span,
@@ -277,7 +359,7 @@ impl ParserV3 {
                     .copied()
                     .ok_or("Continue outside loop")
                     .ok()?;
-                self.emit.emit(MirInst::Continue(cont));
+                self.emit.emit_continue(cont);
                 Some(MirWitness {
                     kind: WitnessKind::Continue(label),
                     span,
@@ -468,43 +550,63 @@ impl ParserV3 {
         }
         self.consume(TokenType::RParen, "Expected ')' after update parameters")?;
         let return_type = if self.match_token_exact(TokenType::Colon) {
-            self.parse_type_annotation()
-                .map(crate::mir::hint::TypeHint::from_type)
+            // v0.104.6 D111：同 `emit_let_w` —— 此前是 `.map(...)`，
+            // `parse_type_annotation()` 返回 `None` 时**静默丢弃**返回类型标注。
+            match self.parse_type_annotation() {
+                Some(t) => Some(crate::mir::hint::TypeHint::from_type(t)),
+                None => {
+                    eprintln!(
+                        "Parse error: unparsable return type annotation for update \
+                         (line {})",
+                        self.current_line()
+                    );
+                    return None;
+                }
+            }
         } else {
             None
         };
 
         // 子上下文：update 体是独立寄存器空间（镜像 emit_fn_def_w）。
+        //
+        // v0.104.6 D44：失败时还原父上下文（见 emit_match_arm_w 处的说明）
         let parent = std::mem::replace(&mut self.emit, crate::mir::lower::EmitContext::new());
-        let (body_reg, body_w) = if self.match_token_exact(TokenType::Newline) {
-            let mut stmt_wits = Vec::new();
-            let mut last: Option<Reg> = None;
-            while self.match_token(&[TokenType::Newline]) {}
-            while !self.check(&TokenType::End) && !self.is_at_end() {
-                let (r, w) = self.emit_statement_expr_w()?;
-                last = Some(r);
-                stmt_wits.push(w);
+        let body_res = (|| -> Option<(Option<Reg>, MirWitness)> {
+            let (body_reg, body_w) = if self.match_token_exact(TokenType::Newline) {
+                let mut stmt_wits = Vec::new();
+                let mut last: Option<Reg> = None;
                 while self.match_token(&[TokenType::Newline]) {}
-            }
-            self.consume(TokenType::End, "Expected 'end' after update body")?;
-            (last, Self::block_witness(stmt_wits, span))
-        } else if self.check(&TokenType::End) {
-            // 空体：`update(msg, model) end`
-            let nil_reg = self.emit.alloc_reg();
-            self.emit
-                .emit(MirInst::Const(nil_reg, crate::value::Value::Nil));
-            (
-                Some(nil_reg),
-                MirWitness {
-                    kind: WitnessKind::Literal(Literal::Nil(span)),
-                    span,
-                },
-            )
-        } else {
-            let (r, w) = self.emit_expr_w()?;
-            (Some(r), w)
+                while !self.check(&TokenType::End) && !self.is_at_end() {
+                    let (r, w) = self.emit_statement_expr_w()?;
+                    last = Some(r);
+                    stmt_wits.push(w);
+                    while self.match_token(&[TokenType::Newline]) {}
+                }
+                self.consume(TokenType::End, "Expected 'end' after update body")?;
+                (last, Self::block_witness(stmt_wits, span))
+            } else if self.check(&TokenType::End) {
+                // 空体：`update(msg, model) end`
+                let nil_reg = self.emit.alloc_reg();
+                self.emit
+                    .emit(MirInst::Const(nil_reg, crate::value::Value::Nil));
+                (
+                    Some(nil_reg),
+                    MirWitness {
+                        kind: WitnessKind::Literal(Literal::Nil(span)),
+                        span,
+                    },
+                )
+            } else {
+                let (r, w) = self.emit_expr_w()?;
+                (Some(r), w)
+            };
+            self.emit.emit_tail_return(body_reg);
+            Some((body_reg, body_w))
+        })();
+        let Some((_body_reg, body_w)) = body_res else {
+            self.emit = parent;
+            return None;
         };
-        self.emit.emit_tail_return(body_reg);
         let body_mir = std::mem::replace(&mut self.emit, parent).finish();
 
         self.emit.emit(MirInst::UpdateDef {
@@ -541,8 +643,28 @@ impl ParserV3 {
             if self.check(&TokenType::End) {
                 break;
             }
-            if let Some(v) = self.consume_identifier("Expected variant name") {
-                variants.push(v);
+            // v0.104.6 D46：保证进度（见 struct 块同处说明）
+            let before = self.current;
+            match self.consume_identifier("Expected variant name") {
+                Some(v) => variants.push(v),
+                // v0.104.6 D46：**此前根本没有 else 分支** —— 变体名解析失败时
+                // 既不 push 也不 advance，循环条件恒真 → **死循环**，且
+                // `consume_identifier` 每次都重打 "Expected variant name" 刷屏。
+                // 实测 `enum E / A / @@@ / B / end` 挂死 >8s。
+                None => {
+                    eprintln!(
+                        "Parse error: unparsable enum variant (line {})",
+                        self.current_line()
+                    );
+                    return None;
+                }
+            }
+            if self.current == before {
+                eprintln!(
+                    "Parse error: parser made no progress in enum block (line {})",
+                    self.current_line()
+                );
+                return None;
             }
         }
         self.consume(TokenType::End, "Expected 'end' after enum")?;
@@ -576,14 +698,43 @@ impl ParserV3 {
             if self.check(&TokenType::End) {
                 break;
             }
-            if let Some(fname) = self.consume_identifier("Expected field name") {
-                self.consume(TokenType::Colon, "Expected ':' after field name")?;
-                if let Some(ftype) = self.parse_type_annotation() {
-                    fields.push((fname, ftype));
+            // v0.104.6 D46：保证进度（见 enum 块同处说明）
+            let before = self.current;
+            match self.consume_identifier("Expected field name") {
+                Some(fname) => {
+                    self.consume(TokenType::Colon, "Expected ':' after field name")?;
+                    // 类型标注解析失败时此前是**静默丢字段**（`if let Some(..)`
+                    // 落空即什么都不做），用户以为 `x: T` 声明成功了。
+                    // 改为报错。
+                    match self.parse_type_annotation() {
+                        Some(ftype) => fields.push((fname, ftype)),
+                        None => {
+                            eprintln!(
+                                "Parse error: unparsable type annotation for field \
+                                 `{fname}` (line {})",
+                                self.current_line()
+                            );
+                            return None;
+                        }
+                    }
                 }
-            } else {
-                // v0.90 死循环修复：非标识符 token 前进保证进度
-                self.advance();
+                // v0.104.6 D46：此前是 `self.advance()` —— 静默跳过整行，
+                // 程序继续跑并 exit 0（实测 `struct S / @@@ / x: Int / end`
+                // 正常执行、退出码 0）。且错误被重复打印 3~4 遍（循环每次重试）。
+                None => {
+                    eprintln!(
+                        "Parse error: unparsable field name in struct block (line {})",
+                        self.current_line()
+                    );
+                    return None;
+                }
+            }
+            if self.current == before {
+                eprintln!(
+                    "Parse error: parser made no progress in struct block (line {})",
+                    self.current_line()
+                );
+                return None;
             }
         }
         self.consume(TokenType::End, "Expected 'end' after struct")?;
@@ -646,62 +797,84 @@ impl ParserV3 {
         let mut update_witness = None;
         let mut view_witness = None;
 
-        while self.match_token(&[TokenType::Newline]) {}
-        while !self.check(&TokenType::End) && !self.is_at_end() {
-            if let Some(field) = self.consume_identifier("Expected field name") {
-                self.consume(TokenType::Colon, "Expected ':' after field name")?;
-                match field.as_str() {
-                    "model" => {
-                        model_name = self.consume_identifier("Expected model name")?.clone();
-                    }
-                    "msg" => {
-                        msg_name = self.consume_identifier("Expected msg name")?.clone();
-                    }
-                    "init" => {
-                        init_witness = Some(Box::new(
-                            self.emit_expr_w()
-                                .unwrap_or((0, {
-                                    let s = self.span_of_current();
-                                    MirWitness {
-                                        kind: WitnessKind::Literal(Literal::Nil(s)),
-                                        span: s,
-                                    }
-                                }))
-                                .1,
-                        ));
-                    }
-                    // v0.103: 两种形态 ——
-                    //   `update: fn(...) => ... end`  内联闭包体（原路径）
-                    //   `update: <name>`              **名字引用**（spec §9.6）
-                    // 后者此前被 emit_closure_pair 当作「无参数闭包体」解析，
-                    // 把后续字段行吞进体内（`view:` 那行因此报
-                    // "Expected field name"）。名字引用改为合成一层转发闭包。
-                    "update" => {
-                        if let Some((m, w)) = self.emit_app_field_ref_or_closure(&["model", "msg"])
-                        {
-                            update_mir = Some(m);
-                            update_witness = Some(Box::new(w));
-                        }
-                    }
-                    "view" => {
-                        if let Some((m, w)) = self.emit_app_field_ref_or_closure(&["model"]) {
-                            view_mir = Some(m);
-                            view_witness = Some(Box::new(w));
-                        }
-                    }
-                    _ => {
-                        // skip unknown fields
-                    }
-                }
-            } else {
-                // v0.90 死循环修复：字段值解析失败残留的非标识符 token
-                //（如未支持的元组表达式）—— 前进一 token 保证进度。
-                // 此前此处不前进，app 块内任何解析失败都会死循环。
-                self.advance();
-            }
+        // v0.104.6 D44：失败时还原父上下文（见 emit_match_arm_w 处的说明）
+        let app_ok = (|| -> Option<()> {
             while self.match_token(&[TokenType::Newline]) {}
+            while !self.check(&TokenType::End) && !self.is_at_end() {
+                // v0.104.6 D46：保证进度（见 enum 块同处说明）
+                let before = self.current;
+                if let Some(field) = self.consume_identifier("Expected field name") {
+                    self.consume(TokenType::Colon, "Expected ':' after field name")?;
+                    match field.as_str() {
+                        "model" => {
+                            model_name = self.consume_identifier("Expected model name")?.clone();
+                        }
+                        "msg" => {
+                            msg_name = self.consume_identifier("Expected msg name")?.clone();
+                        }
+                        "init" => {
+                            init_witness = Some(Box::new(
+                                self.emit_expr_w()
+                                    .unwrap_or((0, {
+                                        let s = self.span_of_current();
+                                        MirWitness {
+                                            kind: WitnessKind::Literal(Literal::Nil(s)),
+                                            span: s,
+                                        }
+                                    }))
+                                    .1,
+                            ));
+                        }
+                        // v0.103: 两种形态 ——
+                        //   `update: fn(...) => ... end`  内联闭包体（原路径）
+                        //   `update: <name>`              **名字引用**（spec §9.6）
+                        // 后者此前被 emit_closure_pair 当作「无参数闭包体」解析，
+                        // 把后续字段行吞进体内（`view:` 那行因此报
+                        // "Expected field name"）。名字引用改为合成一层转发闭包。
+                        "update" => {
+                            if let Some((m, w)) =
+                                self.emit_app_field_ref_or_closure(&["model", "msg"])
+                            {
+                                update_mir = Some(m);
+                                update_witness = Some(Box::new(w));
+                            }
+                        }
+                        "view" => {
+                            if let Some((m, w)) = self.emit_app_field_ref_or_closure(&["model"]) {
+                                view_mir = Some(m);
+                                view_witness = Some(Box::new(w));
+                            }
+                        }
+                        _ => {
+                            // skip unknown fields
+                        }
+                    }
+                } else {
+                    // v0.104.6 D46：此前是 `self.advance()` —— 静默跳过整行，
+                    // 程序继续跑并 exit 0（实测 `app a / model: M / @@@ /
+                    // msg: N / end` 正常执行、退出码 0），错误还重复打印 3 遍。
+                    eprintln!(
+                        "Parse error: unparsable field in app block (line {})",
+                        self.current_line()
+                    );
+                    return None;
+                }
+                while self.match_token(&[TokenType::Newline]) {}
+                if self.current == before {
+                    eprintln!(
+                        "Parse error: parser made no progress in app block (line {})",
+                        self.current_line()
+                    );
+                    return None;
+                }
+            }
+            self.consume(TokenType::End, "Expected 'end' after app block")?;
+            Some(())
+        })();
+        if app_ok.is_none() {
+            self.emit = parent;
+            return None;
         }
-        self.consume(TokenType::End, "Expected 'end' after app block")?;
 
         // 将 init 表达式编译为 MirFunction（必须带 Return）
         let init_mir = init_witness
@@ -861,30 +1034,44 @@ impl ParserV3 {
         let parent = std::mem::replace(&mut self.emit, crate::mir::lower::EmitContext::new());
 
         // 解析参数列表（可选）
-        let params: Vec<String> = if self.match_token_exact(TokenType::LParen) {
-            let mut params = Vec::new();
-            while !self.check(&TokenType::RParen) && !self.is_at_end() {
-                if let Some(p) = self.consume_identifier("Expected parameter") {
-                    params.push(p);
+        // v0.104.6 D44：失败时还原父上下文（见 emit_match_arm_w 处的说明）
+        let params_res = (|| -> Option<Vec<String>> {
+            let params: Vec<String> = if self.match_token_exact(TokenType::LParen) {
+                let mut params = Vec::new();
+                while !self.check(&TokenType::RParen) && !self.is_at_end() {
+                    if let Some(p) = self.consume_identifier("Expected parameter") {
+                        params.push(p);
+                    }
+                    if !self.match_token(&[TokenType::Comma]) {
+                        break;
+                    }
                 }
-                if !self.match_token(&[TokenType::Comma]) {
-                    break;
-                }
-            }
-            self.consume(TokenType::RParen, "Expected ')' after params")?;
-            params
-        } else {
-            Vec::new()
+                self.consume(TokenType::RParen, "Expected ')' after params")?;
+                params
+            } else {
+                Vec::new()
+            };
+            Some(params)
+        })();
+        let Some(params) = params_res else {
+            self.emit = parent;
+            return None;
         };
 
         // 解析闭包体
-        let (body_reg, body_w) = if self.match_token_exact(TokenType::FatArrow) {
-            self.emit_expr_w()?
-        } else {
-            self.emit_block_w()?
+        let body_res = (|| -> Option<(Reg, MirWitness)> {
+            let (body_reg, body_w) = if self.match_token_exact(TokenType::FatArrow) {
+                self.emit_expr_w()?
+            } else {
+                self.emit_block_w()?
+            };
+            self.emit.emit_tail_return(Some(body_reg));
+            Some((body_reg, body_w))
+        })();
+        let Some((_body_reg, body_w)) = body_res else {
+            self.emit = parent;
+            return None;
         };
-
-        self.emit.emit_tail_return(Some(body_reg));
         let mut body_mir = std::mem::replace(&mut self.emit, parent).finish();
         // v0.104: 闭包形参名必须落到 MirFunction.params —— 运行期
         // `Value::Closure` 的 call_value 按**位置**绑定 params 里的名字进

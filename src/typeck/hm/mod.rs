@@ -8,7 +8,7 @@
 //! a side table keyed by a fresh `Type::TypeVar`, and covers every
 //! `WitnessKind` variant.
 //!
-//! Public entry point: [`check_program_mir`] (re-exported from
+//! Public entry point: `check_program_mir` (re-exported from
 //! `crate::typeck`).
 
 use std::collections::{HashMap, HashSet};
@@ -87,6 +87,17 @@ pub struct HMInference {
     /// stored inside the closure's `Type::TypeVar(_)` so callers can
     /// recover the signature by extracting the variable identifier.
     pub closure_sigs: HashMap<char, ClosureSig>,
+    /// v0.104.6 D167：顶层 `task` / `fn` **定义名 → 形参个数**。
+    ///
+    /// 闭包的 arity 由 `Arrow` 链的输出嵌套深度给出（D161），但**定义名不进
+    /// env**（`infer_fn_def` 注释），调用点解析成 `TypeVar` → arity 0 → 检查
+    /// 被跳过，于是 `task add(a, b) … end; add(1)` 在 `--check` 下 exit 0
+    /// 而运行期报 `task expects 2 args, got 1`。
+    ///
+    /// 与 `precompute_fn_effect_rows` 不同，这里**不需要不动点**：arity 就是
+    /// `params.len()`，**不必推断体就能拿到** —— 所以既没有 mutual recursion
+    /// 也没有前向引用的先后依赖，一遍树行走即可。名字 → 元数是无歧义映射。
+    pub fn_arities: HashMap<String, usize>,
     /// Stack of in-scope closure names introduced by FnDef so that a
     /// recursive function can refer to itself.
     pub fn_scope: Vec<String>,
@@ -332,6 +343,10 @@ impl HMInference {
         // v0.102: 关系签名/效果行不动点预计算与 fn 行预计算交错两轮 ——
         // 含 solve 的 fn 体需要 rel 行进表；调用 fn 的 rel 子句体需要 fn 行。
         self.precompute_rel_sigs(exprs);
+        // v0.104.6 D167：形参个数预登记 —— 必须在顺序推断**之前**，
+        // 否则 `task a() … task b() … end` 里对后定义者的调用会漏检。
+        // 放在 `precompute_fn_effect_rows` 之后：两者都只做树行走，顺序无关。
+        self.precompute_fn_arities(exprs);
         self.precompute_fn_effect_rows(exprs);
         self.precompute_rel_sigs(exprs);
         for expr in exprs {
@@ -446,6 +461,34 @@ impl HMInference {
                         self.effect_signatures.insert(name.clone(), sig);
                     }
                 }
+            }
+        }
+    }
+
+    /// v0.104.6 D167：预登记顶层 `task` / `fn` 定义的**形参个数**。
+    ///
+    /// 纯树行走（不跑 HM），故对 mutual recursion 与前向引用都免疫 ——
+    /// arity 是 `params.len()`，与体无关。名字重复时取**首次出现**的（与
+    /// `precompute_fn_effect_rows` 的「合并而非覆盖」不同：重载在 Mora 里
+    /// 不存在，后者先到先得更贴近「先定义先生效」）。
+    pub fn precompute_fn_arities(&mut self, exprs: &[MirWitness]) {
+        fn collect<'a>(w: &'a MirWitness, out: &mut Vec<&'a MirWitness>) {
+            if let WitnessKind::FnDef { .. } = &w.kind {
+                out.push(w);
+            }
+            for c in w.child_witnesses() {
+                collect(c, out);
+            }
+        }
+        let mut defs: Vec<&MirWitness> = Vec::new();
+        for e in exprs {
+            collect(e, &mut defs);
+        }
+        for def in defs {
+            if let WitnessKind::FnDef { name, params, .. } = &def.kind
+                && !self.fn_arities.contains_key(name)
+            {
+                self.fn_arities.insert(name.clone(), params.len());
             }
         }
     }

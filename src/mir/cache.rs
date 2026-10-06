@@ -233,7 +233,12 @@ mod tests {
     /// 缓存 DAG 与直建 DAG 等价执行（tier0 管线守卫）。
     #[test]
     fn cached_dag_runs_same_result() {
-        let source = "let acc = 0\nfor i in [1, 2, 3]\n  acc = acc + i\nend\nreturn acc\n";
+        // v0.104.6 D42：原先这里写的是顶层 `return acc`，而 D42 判定
+        // 「程序顶层的 return」为缺陷（它会静默终止整个程序、吞掉后续
+        // 语句且退出码 0），已改为编译期拒绝。本测试的意图是
+        // 「**缓存路径与直建路径结果一致**」，与顶层 `return` 无关 ——
+        // 故把累加与 `return` 一起放进 task，形状与原用例等价。
+        let source = "task go()\n  let acc = 0\n  for i in [1, 2, 3]\n    acc = acc + i\n  end\n  return acc\nend\ngo()\n";
         let (func_raw, _witnesses) = ParserV3::compile(source).expect("compile");
         let func: Arc<MirFunction> = Arc::new(func_raw);
 

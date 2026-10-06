@@ -27,9 +27,24 @@ pub fn lower_fcfg(nodes: &[Fcfg]) -> (Vec<MirInst>, usize) {
     for node in nodes {
         lower_node(&mut ctx, node);
     }
-    // n_regs = max(预分配寄存器, ctx 分配的寄存器) + 1 (0-indexed)
+    // n_regs = max(预分配寄存器, ctx 分配的寄存器, **实际发射指令引用的寄存器**) + 1
+    //
+    // v0.104.6 D314：第三项是安全网。`max_reg_in_node` 虽然已改成**穷尽
+    // match**（新增变体从此编译不过），但它对「哪些变体带顶层寄存器」的
+    // 判定是**人工的** —— 判错一个就是运行期越界。这里直接从已发射的
+    // `MirInst` 反推一个下界：只会让 `n_regs` 变大（多几个 `Value` 槽，
+    // 无害），不可能变小。
     let max_pre_alloc = max_reg_in_nodes(nodes);
-    let n_regs = max_pre_alloc.max(ctx.next_reg.saturating_sub(1)) + 1;
+    let max_emitted = ctx
+        .insts
+        .iter()
+        .flat_map(|i| i.input_regs())
+        .chain(ctx.insts.iter().filter_map(MirInst::written_reg))
+        .max();
+    let n_regs = max_pre_alloc
+        .max(ctx.next_reg.saturating_sub(1))
+        .max(max_emitted.unwrap_or(0))
+        + 1;
     (ctx.insts, n_regs)
 }
 
@@ -106,15 +121,78 @@ fn max_reg_in_node(node: &Fcfg) -> usize {
             obj, idx, value, ..
         } => *obj.max(idx).max(value),
         Node::Perform { dst, args, .. } => args.iter().fold(*dst, |m, r| m.max(*r)),
-        Node::Handle { body, handler, .. } => {
-            max_reg_in_nodes(&body.nodes).max(max_reg_in_nodes(&handler.nodes))
-        }
+        // v0.104.6 D35：`dst` 必须计入（handle 自身写它），否则
+        // `n_regs` 可能小于它、消费者按它取寄存器就越界。
+        Node::Handle {
+            dst, body, handler, ..
+        } => max_reg_in_nodes(&body.nodes)
+            .max(max_reg_in_nodes(&handler.nodes))
+            .max(*dst),
         Node::Quasiquote { dst, segments, .. } => segments.iter().fold(*dst, |m, seg| match seg {
             QuasiquoteSegment::Unquote(r) | QuasiquoteSegment::UnquoteSplice(r) => m.max(*r),
             _ => m,
         }),
         Node::Sequence { nodes, .. } => max_reg_in_nodes(nodes),
-        _ => 0,
+        // ── v0.104.6 D314：以下 25 个变体此前全部落进 `_ => 0` ──
+        //
+        // 后果（实测）：`rel_empty.mora`（`rel edge(...)` + `solve { ... }`）
+        // 的 FCFG 只含 `RelDef` 与 `Solve` 两个节点 ⇒ `max_reg_in_nodes` 返回 0
+        // ⇒ `ctx.next_reg` 从 1 起步、`n_regs` 结算为 **1**；而发射出的
+        // `MirInst::Solve { dst: 4, .. }` 引用寄存器 4 ⇒ 9 层管线路径上
+        // **运行期越界**：
+        //     Runtime error (MIR): internal: instruction at DAG node 1
+        //     references register 4 (read/write) but the function only has
+        //     1 register(s)
+        //
+        // 该错误在生产路径上被**差分回落**挡住了（11/56 触发回落，其中 7 个
+        // 若强制走管线必崩），所以此前不可见。
+        //
+        // **为什么改成穷尽 match**：`_ => 0` 等于宣告「没枚举到的节点不带
+        // 寄存器」—— 任何新增变体都静默继承这个假设。去掉 `_` 之后，
+        // rustc 会在**编译期**强制每个新变体显式表态，整族缺陷不再复发
+        // （与 `MirInst::input_regs` / `written_reg` 已有的穷尽式写法同规）。
+        //
+        // 本组里**真正带顶层寄存器**的只有 3 个：
+        //   - `Return{value}`     → 发射 `MirInst::Return(*value)`
+        //   - `Solve{dst, ..}`    → `goal` 是**独立寄存器空间**的嵌套
+        //     MirFunction，`limit`/`query_vars`/`anon_vars` 不是寄存器
+        //   - `WithConfig{dst, bindings, body}`
+        // 其余 22 个是纯声明型或只含嵌套 MirFunction（嵌套体有自己的寄存器
+        // 平面，不递归计算 —— 与 `MirInst::input_regs` 对它们的处理一致）。
+        // `Return(None)` = 隐式返回，不引用寄存器；取 0 是安全的下界。
+        Node::Return { value, .. } => value.unwrap_or(0),
+        Node::Solve { dst, .. } => *dst,
+        Node::WithConfig {
+            bindings,
+            body,
+            dst,
+            ..
+        } => bindings
+            .iter()
+            .fold(*dst, |m, (_, r)| m.max(*r))
+            .max(max_reg_in_nodes(&body.nodes)),
+        // 纯声明型 / 控制转移 / 嵌套体独立寄存器空间 —— 无顶层寄存器。
+        Node::Break { .. } | Node::Continue { .. } => 0,
+        Node::FnDef { body, .. }
+        | Node::MacroDef { body, .. }
+        | Node::UpdateDef { body, .. }
+        | Node::PromptSection { body, .. }
+        | Node::DocumentSection { body, .. }
+        | Node::Observe { body, .. }
+        | Node::Span { body, .. }
+        | Node::Parallel { body, .. } => max_reg_in_nodes(&body.nodes),
+        Node::TypeAlias { .. }
+        | Node::EnumDef { .. }
+        | Node::StructDef { .. }
+        | Node::TraitDef { .. }
+        | Node::ImplDef { .. }
+        | Node::Import { .. }
+        | Node::ModelDef { .. }
+        | Node::MsgDef { .. }
+        | Node::AppDef { .. }
+        | Node::RelDef { .. }
+        | Node::Export { .. }
+        | Node::Orchestrate { .. } => 0,
     }
 }
 
@@ -251,8 +329,35 @@ fn lower_node(ctx: &mut EmitContext, node: &Fcfg) {
                 let end = ctx.insts.len();
                 ctx.patch_label_at(jump_idx, end);
             } else {
+                // v0.104.6 D10：**无 else 的 `if` 必须物化隐式 else 块**，
+                // 与 emit.rs `emit_if_w` 的 else-less 分支逐指令对齐
+                // （`Jump / Const(Nil) / Copy(dst, nil)`）。
+                //
+                // 此前本分支只 `patch_label_at(jump_not_idx, end)` 就收工。
+                // 两者运行结果其实**等价**（dst 由寄存器初值 Nil 兜底），但
+                // 9 层差分按指令类别逐条比对 → 只要程序里有任意一个裸 `if`，
+                // 差分必失败 → 管线静默回落 emit.rs，执行器切换被静默阻塞。
+                //
+                // 本改动此前实测引发 6 项回归（`e2e_if_then_block_and_single_
+                // stmt_forms` / `e2e_match_guard_runs` /
+                // `e2e_empty_blocks_do_not_panic` / `top_level_const_fold_equiv`
+                // / `top_level_variable_equiv` / `top_level_reassignment_equiv`）。
+                // 那些回归的根因在 DAG 侧（`Label` 孤立节点、可达集塌缩、死块
+                // 留在 Sequence 链上），已在 `dag.rs` / `dag_search.rs` /
+                // `vm/dag.rs` 修复 —— 此处重试。
+                //
+                // 寄存器安全：`ctx.next_reg` 起点是 `max_reg_in_nodes + 1`
+                // （见 `lower_fcfg`），此处 alloc 必然高于全部预分配寄存器，
+                // 且 `n_regs` 在 `lower_fcfg` 末尾按 `ctx.next_reg` 结算。
+                ctx.emit(MirInst::Jump(0));
+                let jump_idx = ctx.insts.len() - 1;
+                let else_start = ctx.insts.len();
+                ctx.patch_label_at(jump_not_idx, else_start);
+                let nil_reg = ctx.alloc_reg();
+                ctx.emit(MirInst::Const(nil_reg, Value::Nil));
+                ctx.emit(MirInst::Copy(*dst, nil_reg));
                 let end = ctx.insts.len();
-                ctx.patch_label_at(jump_not_idx, end);
+                ctx.patch_label_at(jump_idx, end);
             }
         }
 
@@ -267,20 +372,20 @@ fn lower_node(ctx: &mut EmitContext, node: &Fcfg) {
             let jump_not_idx = ctx.insts.len() - 1;
             // v0.90.4: break/continue label 由 witness_to_fcfg 携带（Node::Break.label），
             // fcfg_lower 不维护独立 loop_stack —— 后修补直接用节点自带的 label。
-            let body_start = ctx.insts.len();
+            //
+            // v0.104.6 D1/D3：与 `EmitContext` 共用作用域登记，**不再**用
+            // `body_start..body_end` 全区间扫描 —— 嵌套循环下该区间含内层
+            // 指令，外层回填会摧毁内层已正确指向内层出口/增量的标签
+            // （内层 break 跳出外层 / 内层 continue 失控导致程序静默结束）。
+            ctx.push_loop_scope(loop_start, 0);
             lower_block(ctx, body);
-            let body_end = ctx.insts.len();
+            let (my_breaks, my_continues) = ctx.pop_loop_scope();
             ctx.emit(MirInst::Jump(loop_start));
             let end = ctx.insts.len();
             ctx.patch_label_at(jump_not_idx, end);
             // 后修补：body 内 Break→end_label（label已正确），Continue→loop_start
-            for i in body_start..body_end {
-                match &mut ctx.insts[i] {
-                    MirInst::Break(lbl) => *lbl = end,
-                    MirInst::Continue(lbl) => *lbl = loop_start,
-                    _ => {}
-                }
-            }
+            ctx.patch_breaks_to(&my_breaks, end);
+            ctx.patch_continues_to(&my_continues, loop_start);
             // 循环作为表达式的结果 = Nil（与 emit.rs emit_while_w 同契约）。
             emit_loop_result(ctx, *dst);
         }
@@ -327,9 +432,12 @@ fn lower_node(ctx: &mut EmitContext, node: &Fcfg) {
             ctx.emit(MirInst::Index(val_reg, *iter, idx_reg));
             ctx.emit(MirInst::Define(var.clone(), val_reg));
             // v0.90.4: break/continue label 由 Node 携带，无独立 loop_stack
-            let body_start = ctx.insts.len();
+            //
+            // v0.104.6 D1/D3：同 While 分支 —— 改用作用域登记，杜绝嵌套循环下
+            // 外层回填覆盖内层标签。
+            ctx.push_loop_scope(loop_start, 0);
             lower_block(ctx, body);
-            let body_end = ctx.insts.len();
+            let (my_breaks, my_continues) = ctx.pop_loop_scope();
             // __idx = __idx + 1
             // v0.104.2: `continue` 的目标是**这条增量**（见下方后修补）——
             // 跳到 loop_start（条件判定）会跳过增量 → 索引永不前进 → 死循环。
@@ -344,13 +452,8 @@ fn lower_node(ctx: &mut EmitContext, node: &Fcfg) {
             //（`let x = for ... end`）消费者才能读到正确寄存器，而不是回退 0。
             emit_loop_result(ctx, *dst);
             // 后修补：body 内 Break→end_label，Continue→增量
-            for i in body_start..body_end {
-                match &mut ctx.insts[i] {
-                    MirInst::Break(lbl) => *lbl = end,
-                    MirInst::Continue(lbl) => *lbl = increment_idx,
-                    _ => {}
-                }
-            }
+            ctx.patch_breaks_to(&my_breaks, end);
+            ctx.patch_continues_to(&my_continues, increment_idx);
         }
 
         // ── Match → 单条 MatchExpr（镜像 emit_match_w：嵌套 arm MirFunction）──
@@ -370,10 +473,14 @@ fn lower_node(ctx: &mut EmitContext, node: &Fcfg) {
         Node::Break { label, .. } => {
             // v0.90.4: label 由 witness_to_fcfg 携带（While/For push_loop 后填）。
             // fcfg_lower 无独立 loop_stack——单一信息源：节点本身。
-            ctx.emit(MirInst::Break(*label));
+            //
+            // v0.104.6 D1/D3：标签最终由**所属循环**的后修补写入（作用域登记），
+            // 此处的 `label` 只是占位；用 emit_break 登记到当前最内层循环，
+            // 外层循环的后修补便不会覆盖它。
+            ctx.emit_break(*label);
         }
         Node::Continue { label, .. } => {
-            ctx.emit(MirInst::Continue(*label));
+            ctx.emit_continue(*label);
         }
 
         // ── 绑定 ──
@@ -435,11 +542,17 @@ fn lower_node(ctx: &mut EmitContext, node: &Fcfg) {
             body,
             handler,
             k_param,
+            dst,
             ..
         } => {
             let body_mir = lower_block_to_function(ctx, body);
             let handler_mir = lower_block_to_function(ctx, handler);
-            let k_dst = ctx.alloc_reg();
+            // v0.104.6 D35：用 Node 预分配的 `dst`（`witness_to_fcfg` 填），
+            // **不再新分配** —— 引用它的 `Let` 节点拿的是同一个 `dst`，
+            // 两端必须一致。旧实现新 `alloc_reg()` 造出另一个编号，且
+            // `lower_fcfg(&[Fcfg])` 不可变、写不回去通知 `Let`，
+            // 于是 `Let` 引用一个无人生产的寄存器 → 整条后续 Sequence 链饿死。
+            let k_dst = *dst;
             ctx.emit(MirInst::Handle {
                 effect: effect.clone(),
                 body: Box::new(body_mir),
@@ -630,6 +743,18 @@ fn lower_node(ctx: &mut EmitContext, node: &Fcfg) {
             }
         }
         Node::Parallel { body, .. } => {
+            // ⚠ v0.104.6 D95：本轮**试过**把这 5 个分支改成
+            // `lower_body_function_with_return`（让嵌套体补上尾部 `Return`，
+            // 与 emit 路径的 `emit_tail_return` 对齐）。实测：嵌套体确实变成
+            // `["Const","Call","Return"]` 与原路径一致，**但差分仍失败** ——
+            // 剩余差异在**顶层**：emit 路径每个块后补 `Const(dst, Nil)`，
+            // 管线不补。
+            //
+            // 补齐它需要给 `Node::{Parallel,Observe,Span,PromptSection,
+            // DocumentSection}` **加 `dst` 字段**、在 `witness_to_fcfg` 预分配
+            // （照 `Node::WithConfig` 的 D58 做法）、并在 `node_result_reg`
+            // 补 arm —— 那是**核心 `Node<M>` AST 的结构性改动**，超出缺陷修复范围。
+            // 故本轮回退该改动，不留「无效果的未验证降级改动」。
             let body_mir = lower_block_to_function(ctx, body);
             ctx.emit(MirInst::Parallel {
                 body: Box::new(body_mir),
@@ -680,12 +805,15 @@ fn lower_node(ctx: &mut EmitContext, node: &Fcfg) {
             query_vars,
             anon_vars,
             goal,
+            dst,
             ..
         } => {
             let goal_mir = lower_block_to_function(ctx, goal);
-            let dst = ctx.alloc_reg();
+            // v0.104.6 D120：复用 witness_to_fcfg 预分配的 dst，**不得**在此
+            // 另 alloc —— `node_result_reg_of` 报的是同一个寄存器，两处
+            // 各自分配会让就绪门槛等一个永不被写的寄存器（D35/D58 同源）。
             ctx.emit(MirInst::Solve {
-                dst,
+                dst: *dst,
                 limit: *limit,
                 query_vars: query_vars.clone(),
                 anon_vars: anon_vars.clone(),
@@ -711,13 +839,22 @@ fn lower_node(ctx: &mut EmitContext, node: &Fcfg) {
         }
 
         // ── 配置块 ──
-        Node::WithConfig { bindings, body, .. } => {
+        Node::WithConfig {
+            bindings,
+            body,
+            dst,
+            ..
+        } => {
             let body_mir = lower_block_to_function(ctx, body);
             ctx.emit(MirInst::WithConfig {
                 bindings: bindings.clone(),
                 body: Box::new(body_mir),
                 jit: false,
             });
+            // v0.104.6 D58：`with` 块的值恒为 Nil（子 body 的返回值不传播）
+            // —— 与 emit 路径 `emit_with_w` 补的那条 `Const(dst, Nil)` 同形。
+            // 缺了它，`Block::result` 指向的 dst 从未被写。
+            ctx.emit(MirInst::Const(*dst, crate::value::Value::Nil));
         }
     }
 }

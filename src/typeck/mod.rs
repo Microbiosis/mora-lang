@@ -78,8 +78,23 @@ pub enum Type {
     Stream,
     Builtin,
     /// v0.06: AI 配置类型（ai.chat 的接收者 / AiConfig::new() 构造）
+    ///
+    /// ⚠ v0.104.6：`Value::AiConfig` **全仓从未被构造**，本类型是只存在于
+    /// typeck 的幽灵类型。详见 `dispatch.rs::method_signature_builtin` 里
+    /// `(Type::AiConfig, …)` 处的完整标注。
     AiConfig,
     /// v0.06: AI 调用结果类型（ai.chat 的成功返回）
+    ///
+    /// ⚠ v0.104.6：`ai.chat` 的返回类型**已改为 `Type::String`**，本类型自
+    /// 此**无人引用**。原因：`Value` 里没有任何 `AiResult` 变体，而
+    /// `do_ai_chat` 的每一条路径都返回 `Value::String` —— 声明成它等于宣布
+    /// 「`ai.chat` 的返回值任何东西都消费不了」，实测使 `ai.chat` 在源语言里
+    /// 完全不可用（连 `let r = ai.chat("hi")` 再 `print(r)` 都过不了检查）。
+    ///
+    /// 保留变体本身（它仍可由字符串 `"ai_result"` 解析，见下方名字映射），
+    /// 以免把一个语言设计决定（未来 `ai.chat` 是否该返结构化结果）偷偷
+    /// 变成一次机械清理。**要真让 `ai.chat` 返结构化结果，得先给 `Value`
+    /// 加对应变体。**
     AiResult,
     /// v0.06: AI 调用错误类型（ai.chat 的失败返回，v0.06.2 起被 Result<T,E> 包裹）
     AiError,
@@ -126,7 +141,7 @@ pub enum Type {
     /// v0.08.5: Trait object carrier (for_type + trait_name + generics + data)
     /// v0.75.86: 扩展 trait_name + generics 字段——subtype_of 升级为
     /// trait_name + generics 同构判断（之前 unit variant 返 false 是 stub）。
-    /// 对应运行时 [`Value::TraitObject`] 包含 dyn dispatch 信息。
+    /// 对应运行时 `Value::TraitObject` 包含 dyn dispatch 信息。
     TraitObject {
         trait_name: String,
         generics: Vec<Type>,
@@ -141,7 +156,7 @@ pub enum Type {
     Macro,
     /// v0.26: Prompt section (named system-prompt segment)
     PromptSection,
-    /// v0.27: Document unified IR (Arc<dyn DocumentBackend>)
+    /// v0.27: Document unified IR (`Arc<dyn DocumentBackend>`)
     Document,
     /// v0.55: HM type variable (char key, fresh in inference, unified during solve)
     TypeVar(char),
@@ -311,7 +326,13 @@ impl Type {
         match hint {
             "string" => Type::String,
             "char" => Type::Char,
-            "float" | "number" => Type::Float, // v0.x: "number" kept for backwards compatibility
+            // v0.104.6 D62: `number` 与 `parser_v3/syntax.rs` 的标注映射
+            // 对齐为数值塔 `Int | Float`（此前这里是 `Type::Float`、那边
+            // 是 `Type::Int`，两处互相矛盾且与 spec §13.1 :110 相悖）。
+            // ⚠ 本函数目前**全仓零调用点**（只有自递归），实际生效的映射
+            // 是 parser 那条；此处同步只为消除同一概念的两份真相。
+            "float" => Type::Float,
+            "number" => Type::Union(vec![Type::Int, Type::Float]),
             "bigint" => Type::BigInt,
             "bool" => Type::Bool,
             "nil" => Type::Nil,
@@ -573,6 +594,57 @@ impl Type {
             return p1.len() == p2.len()
                 && p1.iter().zip(p2.iter()).all(|(a, b)| a.compatible_with(b));
         }
+        // v0.104.6 D77：`Type::TeaApp` 的 `name` 是**显示标签**（`name()` 渲染成
+        // `app<{name}: {model}>`），**不是名义类型的一部分** —— 源语言里没有任何
+        // 语法能写出一个指定名字的 TEA app（`tea` 模块没有类型标注语法）。
+        //
+        // 但下面的兜底 `self == expected` 是**结构相等**，会把 `name` 一起比掉，
+        // 于是两条签名各自构造的 TeaApp（`name` 一个 `"tea"` 一个 `""`）被判为
+        // 不兼容：
+        //     print(tea.init())
+        //     → expected … | app<: any> | … , got app<tea: any>
+        // 运行期 `value/display.rs:155` 明明有
+        // `Value::TeaApp(_) => write!(f, "<tea_app>")` —— 打不出来纯粹是这个
+        // 字段比较带来的。故按四个**类型**字段逐一比较、忽略 `name`，
+        // 与 `Cons` / `Relation` 的结构化处理同款。
+        //
+        // ⚠ 承重的是**这一处**（`compatible_with`）：反向验证把它退回结构相等后，
+        // `tests/print_display_arms.rs` 的 2 条测试立即失败。`subtype_of` 里的
+        // 同名 arm **未被该测试触及**（退回后测试仍绿），它是为「同一概念两处
+        // 保持一致」而一并改的 —— 属推理，不是测试证据。
+        if let (
+            Type::TeaApp {
+                model: m1,
+                msg: g1,
+                update: u1,
+                view: v1,
+                ..
+            },
+            Type::TeaApp {
+                model: m2,
+                msg: g2,
+                update: u2,
+                view: v2,
+                ..
+            },
+        ) = (self, expected)
+        {
+            return m1.compatible_with(m2)
+                && g1.compatible_with(g2)
+                && u1.compatible_with(u2)
+                && v1.compatible_with(v2);
+        }
+        // v0.104.6 D82：`Type::TraitObject` 同理 —— `trait_name` 在 `print`
+        // 的 Union 成员里只能是**通配**（用户写 `let x: dyn Foo = 1`，
+        // trait 名由用户任意指定，签名表无从枚举）。按结构相等比较的话，
+        // 成员渲染成 `dyn` 而实际是 `dyn Foo`，`print(x)` 会被误拒 ——
+        // 这正是 D77 修 `TeaApp` 时**漏掉的同型问题**。
+        // 代价：不同 trait 名的 `TraitObject` 互相兼容（放弃名义性）。
+        // 鉴于 `impl` 前端尚不存在、用户代码无法构造任何 impl，
+        // 该代价目前**无实际影响**；待 impl 前端落地时须重新审视。
+        if let (Type::TraitObject { .. }, Type::TraitObject { .. }) = (self, expected) {
+            return true;
+        }
         // v0.08.5: Type::Struct 已删除，统一为 Type::Trait 注册
         self == expected
     }
@@ -814,6 +886,39 @@ impl Type {
         if let (Type::Relation(p1), Type::Relation(p2)) = (self, super_ty) {
             return p1.len() == p2.len() && p1.iter().zip(p2.iter()).all(|(a, b)| a.subtype_of(b));
         }
+        // v0.104.6 D77：同 `compatible_with` 里的处理 —— `Type::TeaApp` 的
+        // `name` 是显示标签而非名义类型的一部分，逐字段比较时忽略它。
+        // `print` 的形参检查走 `check_against` → 本函数，其 Union 分支调用的
+        // 也是 `subtype_of`，故这一处**必须**与 `compatible_with` 同步改，
+        // 否则 `print(tea.init())` 仍会被拒。
+        if let (
+            Type::TeaApp {
+                model: m1,
+                msg: g1,
+                update: u1,
+                view: v1,
+                ..
+            },
+            Type::TeaApp {
+                model: m2,
+                msg: g2,
+                update: u2,
+                view: v2,
+                ..
+            },
+        ) = (self, super_ty)
+        {
+            // ⚠ 诚实标注：**本 arm 未被 `tests/print_display_arms.rs` 触及** ——
+            // 反向验证表明，把上面 `compatible_with` 的同名 arm 退回结构相等后
+            // 那 2 条测试仍失败（即 `print` 这条路径**只**走 `compatible_with`）。
+            // 此处仍按同一推理修改，是为「同一概念两处保持一致」：否则下一次
+            // 有代码走 `subtype_of` 判 TeaApp 兼容性时会重新踩坑。
+            // **理由是推理，不是测试证据** —— 别把它当成「测过了」。
+            return m1.subtype_of(m2)
+                && g1.subtype_of(g2)
+                && u1.subtype_of(u2)
+                && v1.subtype_of(v2);
+        }
         // 兜底：同构严格相等
         self == super_ty
     }
@@ -994,7 +1099,16 @@ impl TypeError {
 
 /// 格式化错误信息（含修复建议）
 pub fn format_error(err: &TypeError) -> String {
-    let mut s = if err.column > 0 {
+    // v0.104.6 D126：`line == 0` 表示这条诊断**没有可用的位置**（`Span::default()`），
+    // 典型来源是约束求解阶段 —— `Constraint` 不携带 span，于是
+    // `unify` 失败时只能报 `span: None`，一路渲染成「line 0」。
+    // 「第 0 行」是误导性的（源码没有第 0 行），**宁可诚实说位置未知**。
+    //
+    // 根治方案（让 `Constraint` 携带 span、从构造点一路带到 unify）触及
+    // 泛化/量化逻辑，风险高于本轮的其它改动，已记入 CHANGELOG D126 待办。
+    let mut s = if err.line == 0 {
+        "Type error (位置未跟踪)".to_string()
+    } else if err.column > 0 {
         format!("Type error at line {}:{}", err.line, err.column)
     } else {
         format!("Type error at line {}", err.line)

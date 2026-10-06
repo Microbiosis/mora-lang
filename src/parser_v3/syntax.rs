@@ -234,6 +234,10 @@ impl ParserV3 {
         let mut moe_router: Option<crate::mir::witness::MirWitness> = None;
         let mut moe_top_k: Option<usize> = None;
         let mut moe_prompt: Option<crate::mir::witness::MirWitness> = None;
+        // v0.104.6 D269：`max_rounds` 的实值。此前该分支**只吞掉整行**
+        // （见下方 `max_rounds` 处理），值从未被读取，`Loop.rounds` 又在
+        // kind 构造处硬编码为 `Some(1000)` ⇒ 用户写的轮数被静默丢弃。
+        let mut loop_rounds: Option<u64> = None;
 
         loop {
             while self.match_token(&[TokenType::Newline]) {}
@@ -359,12 +363,29 @@ impl ParserV3 {
                 }
             }
 
+            // v0.104.6 D269：真正读出 `max_rounds` 的值。
+            //
+            // 修前这里是「识别关键字 → 吃掉冒号 → 把行尾 token 全部 advance
+            // 掉」，值从不落地；而 `Loop.rounds` 又在 kind 构造处写死
+            // `Some(1000)`。两处叠加的结果是：`max_rounds: 5` 被**完全接受**
+            // 却**完全无效**，循环照跑 1000 轮，exit 0、零诊断。
+            //
+            // lexer 早为它准备了专属 token（`TokenType::MaxRounds`）、
+            // handler 侧也有 `rounds.unwrap_or(1000)` 的消费点 ——
+            // **意图明确是「支持」**，只是中间这一段没接上。
+            //
+            // 解析风格与同函数内 `top_k`（见上）保持一致：非数字字面量一律
+            // `return None` 走解析错误，而不是像修前那样照单全收后丢弃 ——
+            // 「写错值」必须比「值被忽略」更容易被发现。
             if self.peek_is_identifier("max_rounds") || self.check(&TokenType::MaxRounds) {
                 self.advance();
                 self.consume(TokenType::Colon, "Expected ':' after 'max_rounds'")?;
-                while !self.check(&TokenType::Newline) && !self.is_at_end() {
-                    self.advance();
-                }
+                let tok = self.advance()?;
+                loop_rounds = Some(match tok.token_type {
+                    TokenType::Float(f) => f.max(1.0) as u64,
+                    TokenType::Int(i) => i.max(1) as u64,
+                    _ => return None,
+                });
                 continue;
             }
 
@@ -396,10 +417,16 @@ impl ParserV3 {
         let kind = match kind_str.as_str() {
             "sequential" => MirOrchestrateKind::Sequential { agents },
             "loop" => {
-                let agent = agents
-                    .into_iter()
-                    .next()
-                    .unwrap_or_else(|| MirOrchestrateAgent {
+                // v0.104.6 D269：保留**全部** agent。
+                //
+                // 修前是 `agents.into_iter().next()` —— 只取第一个，其余
+                // `agent` 行被**静默丢弃**。而 `MirOrchestrateKind::Loop.agents`
+                // 本身是 `Vec`，handler 侧（`runtime.rs` 的 Loop 分支）也是
+                // `for agent in agents` 逐个执行：`sequential`/`graph`/`pregel`
+                // 三个兄弟 kind 都原样保留整个 vec。**只有 loop 截断**，
+                // 截断只发生在解析器这一处，是孤立的漏写而非设计。
+                if agents.is_empty() {
+                    agents.push(MirOrchestrateAgent {
                         name: "default".to_string(),
                         with_config: None,
                         // v0.92: task_expr 现为 MirWitness。
@@ -418,9 +445,13 @@ impl ParserV3 {
                         },
                         combiner_body: None,
                     });
+                }
                 MirOrchestrateKind::Loop {
-                    agents: vec![agent],
-                    rounds: Some(1000),
+                    agents,
+                    // 缺省仍是 1000 —— 与 handler 侧 `rounds.unwrap_or(1000)`
+                    // 一致（`runtime.rs` 的注释也这么写）。写了 `max_rounds`
+                    // 就用用户给的值；不写则行为与修前完全相同。
+                    rounds: loop_rounds.or(Some(1000)),
                     exit_when,
                 }
             }
@@ -615,11 +646,30 @@ impl ParserV3 {
             }
         }
 
+        // v0.104.6 D271：把边条件**预 lowering** 成 `condition_body`。
+        //
+        // 修前 `condition_body` 恒为 `None`，而引擎（`pregel/mod.rs` 的两处
+        // 条件求值）**只读 `condition_body`**、从不读 `condition_expr`
+        // —— 后者全仓唯一的读者是 LSP 的 witness walk。于是
+        // `edge a -> b on: <cond>` 解析成功、条件被完整保存、却**从不生效**：
+        // 边永远无条件激活，exit 0、零诊断。
+        //
+        // 在此预 lowering，与同函数内 agent 的 `task_body`、moe expert 的
+        // `def_fn` 同一风格：lowering 失败一律 `return None` 走解析错误，
+        // 而不是让一个「写了但永远不执行」的条件蒙混过关。
+        let condition_body = match &condition {
+            Some(w) => match crate::mir::lower::lower_mir_witnesses(std::slice::from_ref(w)) {
+                Ok(f) => Some(f),
+                Err(_) => return None,
+            },
+            None => None,
+        };
+
         Some(MirOrchestrateEdge {
             from,
             to,
             condition_expr: condition,
-            condition_body: None,
+            condition_body,
         })
     }
 
@@ -692,6 +742,16 @@ impl ParserV3 {
                     generics,
                 })
             }
+            // v0.104.6 D64：`nil` 是**关键字 token**（lexer.rs:13 `TokenType::Nil`），
+            // 走不到下面的 `Identifier` 分支 —— 白名单里的 `"nil" => Type::Nil`
+            // 因此是一条**不可达的死 arm**，`let v: nil = nil` 直接报
+            // "expected type annotation"。spec §3.1 :115 把 `nil` 列为正式类型，
+            // 且 typeck 三处（`subtype_of` mod.rs:762、`compatible_with` mod.rs:532、
+            // `unify` unify.rs:307）都已成对支持 `Nil`，补上这一条即可跑通。
+            TokenType::Nil => {
+                self.advance();
+                Some(Type::Nil)
+            }
             TokenType::Identifier(name) => {
                 let lower = name.to_lowercase();
                 if matches!(
@@ -736,8 +796,58 @@ impl ParserV3 {
                     };
                 }
                 let ty = match lower.as_str() {
-                    "int" | "number" => Type::Int,
+                    "int" => Type::Int,
+                    // v0.104.6 D62: `number` 是**数值塔**，不是 `Int` 的别名。
+                    //
+                    // 依据（spec §13.1 类型表 + 形式规则）：
+                    //   · :110 把 `42` 与 `3.14` **同列**为 `number`
+                    //   · :1154-1156 `Γ ⊢ e₁ : number Γ ⊢ e₂ : number ⊢
+                    //     e₁ + e₂ : number`
+                    //   · :928 `len(x) -> number`，而 `len` 运行期返 `Int`
+                    // 三条合起来要求 `number` 同时容纳 Int 与 Float。
+                    //
+                    // 此前映射到 `Type::Int`，方向正好相反：只收 Int、拒掉
+                    // Float，而 **Float 才是本语言的无后缀数值字面量类型**
+                    // （`1` / `1.5` / `-1` / `1 + 2` 全是 Float，实测见
+                    // tests/number_tower.rs）。于是「通用数值标注」恰好在最
+                    // 常见的用法上失败，且与 :1156 自相矛盾。
+                    //
+                    // 选 `Union[Int, Float]` 而非新造 `Type::Number` 变体：
+                    // subtype_of / compatible_with / unify 三处**早已**在
+                    // Union 两侧实现了成员语义（`mod.rs:642-656`、
+                    // `mod.rs:473-487`、`unify.rs:376-392`），`let` 标注的
+                    // 三道关卡（infer_let_typed 的 compatible_with 即时报错
+                    // + 压入的 Constraint::Eq + bidirectional 的 subtype_of）
+                    // 因此全部自动放行，**且完全不触碰 promotion 塔本身**。
+                    // BigInt 故意排除：v0.91 明确「BigInt 不参与 Int <: Float
+                    // 提升（避免隐式精度损失）」，spec :110 也未列入 `number`。
+                    "number" => Type::Union(vec![Type::Int, Type::Float]),
                     "float" => Type::Float,
+                    // v0.104.6 D63：`bigint` 是 spec §3.1 :113 正式列出的类型
+                    // （`999n`），`Type::BigInt` 存在、字面量产出它、`from_hint`
+                    // 也认它 —— 但白名单漏了，导致 BigInt 值**永远无法被标注**
+                    // （实测 `let x: bigint = 999n` 报 unsupported type annotation）。
+                    // typeck 侧无需改动：`subtype_of` mod.rs:824-825、
+                    // `compatible_with`、`unify` unify.rs:304 三处都已自反。
+                    // 不放进 `number`：v0.91 明确 BigInt 不参与 `Int <: Float`。
+                    "bigint" => Type::BigInt,
+                    // v0.104.6 D72：`document` 此前是**幽灵标注** ——
+                    // `Type::Document` 存在、`document.parse(path)` 运行期
+                    // 产出 `Value::Document`，但白名单没有它，
+                    // `let d: document = document.parse("a.md")` 报
+                    // "unsupported type annotation 'document'"。
+                    // 与 D63（bigint）同型：值能造出来、标编写不出。
+                    // ⚠ 与 `document` **模块**同名但不是一回事 ——
+                    // 模块侧的方法签名见 `module_method_signature`；
+                    // `Type::Document` 是 `Value::Document` 对应的值类型。
+                    "document" => Type::Document,
+                    // v0.104.6 D85：`agent` 同属**幽灵标注** ——
+                    // `Type::Agent` 存在、`agent.create(name, cfg)` 运行期产出
+                    // `Value::Agent`（D85 刚给它补上签名），但白名单没有它，
+                    // `let v: agent = agent.create("a", {})` 报
+                    // "unsupported type annotation 'agent'"。与 D63（bigint）、
+                    // D64（nil）、D72（document）同型。
+                    "agent" => Type::Agent,
                     "string" => Type::String,
                     "char" => Type::Char,
                     "bool" => Type::Bool,

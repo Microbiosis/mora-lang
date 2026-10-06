@@ -33,6 +33,7 @@ mod tests;
 pub use analysis::*;
 pub use audit::*;
 pub use diff::*;
+pub use serialization::SkippedLine;
 pub use serialization::hash_prompt;
 use serialization::{event_to_jsonl, event_to_replay_entry, load_jsonl};
 pub use snapshot::*;
@@ -43,6 +44,13 @@ pub enum Mode {
     Off,
     /// 录制所有事件到 `path` (JSONL)
     Record(PathBuf),
+    /// v0.104.6: 只在内存里录制,事件**不落盘**。
+    ///
+    /// 供 `mora snapshot` 使用 —— 它只需要 `events()` 拿去和基线比对,
+    /// 不需要一份 JSONL 录像。v0.104.5 及以前该命令根本不装录制器
+    /// (`Interpreter::new()` 的默认 `new_off()`),于是 `current_events`
+    /// 恒空,比对 0 vs 0 恒 Match → **对完全不同的输入也报 "passed"**。
+    RecordMemory,
     /// 从 `path` 重放,匹配 (kind, key) 返回录制响应
     Replay(PathBuf),
 }
@@ -52,7 +60,7 @@ impl Mode {
         matches!(self, Mode::Off)
     }
     pub fn is_record(&self) -> bool {
-        matches!(self, Mode::Record(_))
+        matches!(self, Mode::Record(_) | Mode::RecordMemory)
     }
     pub fn is_replay(&self) -> bool {
         matches!(self, Mode::Replay(_))
@@ -145,6 +153,23 @@ pub struct Recorder {
     index: HashMap<(String, String), RecordedResponse>,
     /// v0.76.06: 签名漂移 warning 收集（replay 时签名不匹配 push 警告）
     pub warnings: Vec<String>,
+    /// v0.104.6 D178：加载录像时**没能解析出来**的行（截断/畸形/非 JSON）。
+    ///
+    /// 以前这些行被静默丢弃，于是 `replay` / `diff` / `stats` / `export` /
+    /// **`audit`** 全都在**不完整数据**上照常报成功 —— 密钥扫描器尤其危险：
+    /// 缺了的那行若含密钥，`audit` 仍会说「No secrets found」。
+    /// 容忍畸形行（前向兼容）不变，但不再**沉默**。
+    pub skipped_lines: Vec<SkippedLine>,
+    /// v0.104.6 D182：重放时**实际从录像取到了响应**的次数。
+    ///
+    /// 此前 `mora replay` 报的是「加载了多少条事件」——
+    /// 一次都没命中时照样打 `✓ replayed 3 events`（D174 同族的假绿）。
+    /// 而其中 `state_mutation` 之类**根本不可重放**，那个数字天生虚高。
+    pub replay_hits: u64,
+    /// v0.104.6 D182：重放时**查了但没取到**的次数（prompt/model 对不上、
+    /// url 不一致、签名漂移）。与 [`Self::replay_hits`] 一起才能回答
+    /// 「这次重放到底复现了没有」。
+    pub replay_misses: u64,
 }
 
 impl Recorder {
@@ -155,6 +180,9 @@ impl Recorder {
             next_id: 1,
             index: HashMap::new(),
             warnings: Vec::new(),
+            skipped_lines: Vec::new(),
+            replay_hits: 0,
+            replay_misses: 0,
         }
     }
 
@@ -174,11 +202,31 @@ impl Recorder {
             next_id: 1,
             index: HashMap::new(),
             warnings: Vec::new(),
+            skipped_lines: Vec::new(),
+            replay_hits: 0,
+            replay_misses: 0,
         })
     }
 
+    /// v0.104.6: 内存录制 —— 累积事件但不落盘。
+    ///
+    /// 与 `new_record` 的唯一区别是没有目标文件,故 `save()` 是 no-op。
+    /// 事件只从 `events()` 读,供 `mora snapshot` 与基线比对。
+    pub fn new_record_memory() -> Self {
+        Self {
+            mode: Mode::RecordMemory,
+            events: Vec::new(),
+            next_id: 1,
+            index: HashMap::new(),
+            warnings: Vec::new(),
+            skipped_lines: Vec::new(),
+            replay_hits: 0,
+            replay_misses: 0,
+        }
+    }
+
     pub fn new_replay(path: PathBuf) -> Result<Self, String> {
-        let events = load_jsonl(&path)?;
+        let (events, skipped) = load_jsonl(&path)?;
         let mut index = HashMap::new();
         for ev in &events {
             if let Some((kind, key, resp)) = event_to_replay_entry(ev) {
@@ -191,6 +239,9 @@ impl Recorder {
             next_id: 0,
             index,
             warnings: Vec::new(),
+            skipped_lines: skipped,
+            replay_hits: 0,
+            replay_misses: 0,
         })
     }
 
@@ -274,7 +325,12 @@ impl Recorder {
             return None;
         }
         let key = format!("{}|{}", model, hash_prompt(prompt));
-        let rec = self.index.get(&("ai.chat".to_string(), key))?;
+        // v0.104.6 D182：记录命中/未命中 —— 让「重放有没有真的发生」可见。
+        // 详见 `replay_hits` 字段说明。
+        let Some(rec) = self.index.get(&("ai.chat".to_string(), key)) else {
+            self.replay_misses += 1;
+            return None;
+        };
         // v0.76.05: 签名校验——录制与当前签名不一致 = 不匹配
         if rec.arg_signature != current_arg_signature {
             // v0.76.06: 签名漂移 warning
@@ -282,8 +338,10 @@ impl Recorder {
                 "ai.chat({}) 签名漂移: 录制 '{}' vs 当前 '{}'",
                 model, rec.arg_signature, current_arg_signature
             ));
+            self.replay_misses += 1;
             return None;
         }
+        self.replay_hits += 1;
         Some(rec.clone())
     }
 
@@ -298,9 +356,10 @@ impl Recorder {
         if !self.mode.is_replay() {
             return None;
         }
-        let rec = self
-            .index
-            .get(&("web.fetch".to_string(), url.to_string()))?;
+        let Some(rec) = self.index.get(&("web.fetch".to_string(), url.to_string())) else {
+            self.replay_misses += 1;
+            return None;
+        };
         // v0.76.05: 签名校验
         if rec.arg_signature != current_arg_signature {
             // v0.76.06: 签名漂移 warning
@@ -308,8 +367,10 @@ impl Recorder {
                 "web.fetch({}) 签名漂移: 录制 '{}' vs 当前 '{}'",
                 url, rec.arg_signature, current_arg_signature
             ));
+            self.replay_misses += 1;
             return None;
         }
+        self.replay_hits += 1;
         Some(rec.clone())
     }
 
@@ -318,6 +379,9 @@ impl Recorder {
     pub fn save(&self) -> Result<(), String> {
         let path = match &self.mode {
             Mode::Record(p) => p,
+            // v0.104.6: 内存录制无落盘目标 —— save 是 no-op (不是错误:
+            // 事件仍可从 events() 读, snapshot 正是这样用的)。
+            Mode::RecordMemory => return Ok(()),
             _ => return Ok(()),
         };
         let mut out = String::new();

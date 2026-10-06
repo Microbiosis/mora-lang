@@ -14,6 +14,105 @@ use crate::value::Value;
 use std::collections::HashMap;
 
 // ============================================================
+// 往返可逆性检查（v0.104.6 D233）
+// ============================================================
+
+/// 判定一个 `Value` 经 `value_to_json` → `json_to_value` 后是否**逐类型恒等**。
+///
+/// v0.104.6 D233：`Checkpoint` 的文档说「Captures the **complete** state」，
+/// 而 `to_json` 把不可 JSON 化的变体交给 `value_to_json` 处理 ——
+/// 后者对它们输出**占位字符串**（`"<agent X>"` / `"<conversation X>"` / …）。
+/// 往返后：
+///
+/// | 存入 | 读回 |
+/// |---|---|
+/// | `Char('中')` | `String("中")` |
+/// | `Code("fn main() {}")` | `String("fn main() {}")` |
+/// | `Agent { .. }` | `String("<agent worker>")` |
+/// | `Conversation { .. }` | `String("<conversation gpt>")` |
+/// | `HttpRequest { .. }` | `String("<http_request GET /x>")` |
+///
+/// 即：**类型降级 + 信息全丢**，而 `to_json` 返回 `Ok`、零诊断。
+/// `restore_checkpoint` 再把这个字符串写回 `channels`，Pregel 引擎
+/// 拿着**损坏的状态**继续跑。
+///
+/// 这个函数让 `to_json` 能在**序列化前**发现不可逆的值并报错，
+/// 把「静默损坏」变成「明确失败」——`pregel::run` 的
+/// `saver.save(&thread_id, &cp)?` 会把错误向上传播。
+///
+/// ⚠ 对 `json.stringify` builtin 而言，占位串是**合理取舍**（用户的
+/// 函数/Agent 本来就无法 JSON 化）；对 checkpoint 而言是**缺陷**
+/// （目标是恢复状态，不是展示）。两处语义不同，故检查放在 checkpoint 层。
+pub fn is_roundtrip_faithful(v: &Value) -> bool {
+    match v {
+        // JSON 原生可表示且逐类型恒等（D99/D223 已把 Float/String 转义做穷举）
+        Value::Nil
+        | Value::Bool(_)
+        | Value::Int(_)
+        | Value::Float(_)
+        | Value::BigInt(_)
+        | Value::String(_)
+        | Value::List(_)
+        | Value::Dict(_) => true,
+        // 其余：要么被降级成 String（Char / Code），要么被换成占位串
+        // （Agent / Conversation / HttpRequest / Router / McpServer / …），
+        // 要么直接变 `null`（Compose / Curry / Cons / Macro / …）。
+        // 一律判为**不可逆**。
+        _ => false,
+    }
+}
+
+/// 递归检查 `channel_values` 与 `pending_sends[].input` 里的所有值。
+fn find_unfaithful(v: &Value, path: &str) -> Option<String> {
+    if !is_roundtrip_faithful(v) {
+        return Some(format!("{path}: {}", value_kind_name(v)));
+    }
+    match v {
+        Value::List(items) => {
+            for (i, item) in items.iter().enumerate() {
+                if let Some(p) = find_unfaithful(item, &format!("{path}[{i}]")) {
+                    return Some(p);
+                }
+            }
+            None
+        }
+        Value::Dict(map) => {
+            // 排序保证报错信息稳定（HashMap 迭代序每进程不同）
+            let mut keys: Vec<&String> = map.keys().collect();
+            keys.sort();
+            for k in keys {
+                if let Some(p) = find_unfaithful(&map[k], &format!("{path}.{k}")) {
+                    return Some(p);
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+/// 给人看的类型名（`Value` 无 `Display` 契约，全量 match 太重）。
+fn value_kind_name(v: &Value) -> &'static str {
+    match v {
+        Value::Char(_) => "char",
+        Value::Code(_) => "code",
+        Value::Task { .. } => "task",
+        Value::Tool { .. } => "tool",
+        Value::Closure { .. } => "closure",
+        Value::Conversation { .. } => "conversation",
+        Value::Stream { .. } => "stream",
+        Value::Agent { .. } => "agent",
+        Value::AiConfig { .. } => "ai_config",
+        Value::Router { .. } => "router",
+        Value::HttpRequest { .. } => "http_request",
+        Value::McpServer { .. } => "mcp_server",
+        Value::TraitObject { .. } => "trait_object",
+        Value::Document { .. } => "document",
+        _ => "non-JSON value",
+    }
+}
+
+// ============================================================
 // SendTask
 // ============================================================
 
@@ -60,6 +159,53 @@ pub struct Checkpoint {
     pub timestamp_ms: u128,
 }
 
+/// v0.104.6 D244：所有「外部数字 → 非负整数」转换的**唯一收口**。
+///
+/// 此前 D148 只给 `v` / `step` 加了负数守卫，而**同一个函数**里的
+/// `channel_versions` / `versions_seen` / `timestamp_ms` 三处同样是从
+/// `Value`（外部 JSON，或 `SqliteSaver::load` 读出的 `data_json`）转换，
+/// 却没有守卫 —— **守卫漏了 5 处中的 3 处**，且无任何统一入口可查。
+///
+/// 缺陷后果实测（`Checkpoint::from_json`，喂 `-1`）：
+///
+/// | 字段 | 修前 | 修后 |
+/// |---|---|---|
+/// | `v` | 报错 | 报错（D148 已有） |
+/// | `step` | 报错 | 报错（D148 已有） |
+/// | `channel_versions` | **18446744073709551615** | 报错 |
+/// | `versions_seen` | **18446744073709551615** | 报错 |
+/// | `timestamp_ms` | **340282366920938463463374607431768211455** | 报错 |
+///
+/// 两种失败模式都**零诊断**，且方向相反：
+/// 整数 `as` 是**回绕**（`-1i64 as u64 == u64::MAX`），
+/// 浮点 `as` 是**饱和**（`-1.0f64 as u64 == 0`）。
+///
+/// `channel_versions` / `versions_seen` 变 `u64::MAX` 尤其隐蔽：版本号的
+/// 语义是「已观测到的最大版本」，`u64::MAX` 等于宣告「这个 channel 的一切
+/// 都已见过」⇒ **增量计算永久停滞**。`timestamp_ms` 变 `u128::MAX` 则让
+/// D234 的三级排序键 `(step, timestamp_ms, id)` 永远把它排到 `load` 的
+/// 第一位 / `list` 的最后一位。
+///
+/// `TryFrom` 一并把**大值回绕**（如 `2^32+1 as u32 == 1`）也变成报错 ——
+/// 那是同一类「静默得到看似合法的错值」。
+fn nonneg_num<T>(field: &str, v: Option<&Value>) -> Result<T, String>
+where
+    T: TryFrom<u64>,
+{
+    let raw = match v {
+        Some(Value::Int(i)) if *i < 0 => {
+            return Err(format!("Checkpoint {field} 不能为负数（得到 {i}）"));
+        }
+        Some(Value::Int(i)) => *i as u64,
+        Some(Value::Float(n)) if *n < 0.0 => {
+            return Err(format!("Checkpoint {field} 不能为负数（得到 {n}）"));
+        }
+        Some(Value::Float(n)) => *n as u64,
+        _ => return Err(format!("Checkpoint {field} must be a number")),
+    };
+    T::try_from(raw).map_err(|_| format!("Checkpoint {field} 超出可表示范围（得到 {raw}）"))
+}
+
 impl Checkpoint {
     /// Generate a new random checkpoint ID.
     pub fn new_id() -> String {
@@ -91,7 +237,37 @@ impl Checkpoint {
     }
 
     /// Serialize to JSON string (hand-written, no serde).
+    ///
+    /// v0.104.6 D233：序列化**前**先验证所有值可无损往返；不可逆的
+    /// 值（`Char` / `Code` / `Agent` / `Conversation` / `HttpRequest` …）
+    /// **报错**而不是交给 `value_to_json` 静默写成占位字符串。
+    /// 理由见 [`is_roundtrip_faithful`] 的文档：checkpoint 的目的是
+    /// **恢复状态**，写一个恢复不出来的检查点比停下更糟。
     pub fn to_json(&self) -> Result<String, String> {
+        // 排序保证报错信息稳定（HashMap 迭代序每进程不同）
+        let mut ch_keys: Vec<&String> = self.channel_values.keys().collect();
+        ch_keys.sort();
+        for k in &ch_keys {
+            if let Some(p) =
+                find_unfaithful(&self.channel_values[*k], &format!("channel_values.{k}"))
+            {
+                return Err(format!(
+                    "Checkpoint 不能序列化不可逆的值（{p}）—— \
+                     恢复后状态会与保存时不同。请改用 JSON 可表示的类型 \
+                     （nil / bool / int / float / bigint / string / list / dict）。"
+                ));
+            }
+        }
+        for (i, send) in self.pending_sends.iter().enumerate() {
+            if let Some(p) = find_unfaithful(&send.input, &format!("pending_sends[{i}].input")) {
+                return Err(format!(
+                    "Checkpoint 不能序列化不可逆的值（{p}）—— \
+                     恢复后状态会与保存时不同。请改用 JSON 可表示的类型 \
+                     （nil / bool / int / float / bigint / string / list / dict）。"
+                ));
+            }
+        }
+
         let mut map = HashMap::new();
 
         map.insert("id".to_string(), Value::String(self.id.clone()));
@@ -139,7 +315,10 @@ impl Checkpoint {
                 Value::Dict(send_map)
             })
             .collect();
-        map.insert("pending_sends".to_string(), Value::List(pending_sends));
+        map.insert(
+            "pending_sends".to_string(),
+            Value::List(pending_sends.into()),
+        );
 
         // u128 does not fit safely in f64 (JSON number), so store as string.
         map.insert(
@@ -163,42 +342,32 @@ impl Checkpoint {
             _ => return Err("Checkpoint id must be a string".to_string()),
         };
 
-        let v = match map.get("v") {
-            Some(Value::Int(i)) => *i as u32,
-            Some(Value::Float(n)) => *n as u32,
-            _ => return Err("Checkpoint v must be a number".to_string()),
-        };
+        // v0.104.6 D148 定位、D244 收敛：`v` / `step` 的负数守卫与
+        // `channel_versions` / `versions_seen` / `timestamp_ms` 是**同一件事**
+        // （外部数字 → 非负整数），此前被写成 5 段独立内联逻辑，于是守卫
+        // 只覆盖了 2/5 处（详见 `nonneg_num` 的文档）。
+        let v: u32 = nonneg_num("v", map.get("v"))?;
 
         let thread_id = match map.get("thread_id") {
             Some(Value::String(s)) => s.clone(),
             _ => return Err("Checkpoint thread_id must be a string".to_string()),
         };
 
-        let step = match map.get("step") {
-            Some(Value::Int(i)) => *i as usize,
-            Some(Value::Float(n)) => *n as usize,
-            _ => return Err("Checkpoint step must be a number".to_string()),
-        };
+        let step: usize = nonneg_num("step", map.get("step"))?;
 
         let channel_values = match map.get("channel_values") {
             Some(Value::Dict(m)) => m.clone(),
             _ => return Err("Checkpoint channel_values must be a dict".to_string()),
         };
 
+        // v0.104.6 D244：版本号同样是「非负整数」语义，走同一收口。
+        // 修前 `Value::Int(-1) as u64` **回绕**成 `u64::MAX`，
+        // 等于宣告「这个 channel 的一切都已见过」⇒ 增量计算永久停滞。
         let channel_versions = match map.get("channel_versions") {
             Some(Value::Dict(m)) => m
                 .iter()
                 .map(|(k, v)| {
-                    let num = match v {
-                        Value::Int(i) => *i as u64,
-                        Value::Float(n) => *n as u64,
-                        _ => {
-                            return Err(format!(
-                                "channel_versions value must be a number: {:?}",
-                                v
-                            ));
-                        }
-                    };
+                    let num = nonneg_num::<u64>(&format!("channel_versions[{k}]"), Some(v))?;
                     Ok((k.clone(), num))
                 })
                 .collect::<Result<HashMap<String, u64>, String>>()?,
@@ -213,16 +382,10 @@ impl Checkpoint {
                         Value::Dict(inner_map) => inner_map
                             .iter()
                             .map(|(k, v)| {
-                                let num = match v {
-                                    Value::Int(i) => *i as u64,
-                                    Value::Float(n) => *n as u64,
-                                    _ => {
-                                        return Err(format!(
-                                            "versions_seen value must be a number: {:?}",
-                                            v
-                                        ));
-                                    }
-                                };
+                                let num = nonneg_num::<u64>(
+                                    &format!("versions_seen[{node}][{k}]"),
+                                    Some(v),
+                                )?;
                                 Ok((k.clone(), num))
                             })
                             .collect::<Result<HashMap<String, u64>, String>>()?,
@@ -256,13 +419,14 @@ impl Checkpoint {
             _ => return Err("Checkpoint pending_sends must be a list".to_string()),
         };
 
-        let timestamp_ms = match map.get("timestamp_ms") {
+        // v0.104.6 D244：同族第三处。修前 `Value::Int(-1) as u128` 回绕成
+        // `u128::MAX`，而 `timestamp_ms` 是 D234 三级排序键
+        // `(step, timestamp_ms, id)` 的第二项 ⇒ 永远被 `load` 排到第一位。
+        let timestamp_ms: u128 = match map.get("timestamp_ms") {
             Some(Value::String(s)) => s
                 .parse::<u128>()
                 .map_err(|e| format!("Invalid timestamp_ms: {}", e))?,
-            Some(Value::Int(i)) => *i as u128,
-            Some(Value::Float(n)) => *n as u128,
-            _ => return Err("Checkpoint timestamp_ms must be a string or number".to_string()),
+            other => nonneg_num("timestamp_ms", other)?,
         };
 
         Ok(Checkpoint {
@@ -391,10 +555,13 @@ mod tests {
         let mut channel_values = HashMap::new();
         channel_values.insert(
             "messages".to_string(),
-            Value::List(vec![
-                Value::String("hello".to_string()),
-                Value::String("world".to_string()),
-            ]),
+            Value::List(
+                vec![
+                    Value::String("hello".to_string()),
+                    Value::String("world".to_string()),
+                ]
+                .into(),
+            ),
         );
         let mut channel_versions = HashMap::new();
         channel_versions.insert("messages".to_string(), 3);
@@ -607,5 +774,85 @@ mod tests {
         let bad = r#"[1,2,3]"#;
         let result = Checkpoint::from_json(bad);
         assert!(result.is_err());
+    }
+
+    /// v0.104.6 D244：负数守卫必须覆盖 `from_json` 里的**全部五个**数字字段。
+    ///
+    /// D148 只给 `v` / `step` 加了守卫，而同一函数里的 `channel_versions` /
+    /// `versions_seen` / `timestamp_ms` 同样从外部 `Value` 转换却没有 ——
+    /// 覆盖 5 处中的 2 处。实测修前喂 `-1` 会得到 `u64::MAX` / `u128::MAX`，
+    /// 且整数 `as` **回绕**、浮点 `as` **饱和**，两个方向都零诊断。
+    ///
+    /// 放在模块内是因为它只需覆盖 `from_json` 本身（`SqliteSaver::load` 的
+    /// 调用方也走这里）；字段名点名的完整判据在
+    /// `tests/checkpoint_negative_number_guard.rs`。
+    #[test]
+    fn d244_from_json_rejects_negative_in_every_numeric_field() {
+        let base = |v: &str, step: &str, cv: &str, vs: &str, ts: &str| -> String {
+            format!(
+                r#"{{"id":"cp1","v":{v},"thread_id":"t1","step":{step},
+                    "channel_values":{{}},
+                    "channel_versions":{cv},
+                    "versions_seen":{vs},
+                    "pending_sends":[],
+                    "timestamp_ms":{ts}}}"#
+            )
+        };
+        let ok_cv = r#"{"messages":2}"#;
+        let ok_vs = r#"{"node_a":{"messages":1}}"#;
+
+        // 基线：全部合法。
+        assert!(
+            Checkpoint::from_json(&base("1", "3", ok_cv, ok_vs, "1700000000000")).is_ok(),
+            "基线 checkpoint 应当可解析"
+        );
+
+        // 五个字段 × 两种负数表示（整数回绕 / 浮点饱和）—— 全部必须报错。
+        for (field, neg_i, neg_f) in [
+            (
+                "v",
+                base("-1", "3", ok_cv, ok_vs, "1700000000000"),
+                base("-1.0", "3", ok_cv, ok_vs, "1700000000000"),
+            ),
+            (
+                "step",
+                base("1", "-1", ok_cv, ok_vs, "1700000000000"),
+                base("1", "-1.0", ok_cv, ok_vs, "1700000000000"),
+            ),
+            (
+                "channel_versions",
+                base("1", "3", r#"{"messages":-1}"#, ok_vs, "1700000000000"),
+                base("1", "3", r#"{"messages":-1.0}"#, ok_vs, "1700000000000"),
+            ),
+            (
+                "versions_seen",
+                base(
+                    "1",
+                    "3",
+                    ok_cv,
+                    r#"{"node_a":{"messages":-1}}"#,
+                    "1700000000000",
+                ),
+                base(
+                    "1",
+                    "3",
+                    ok_cv,
+                    r#"{"node_a":{"messages":-1.0}}"#,
+                    "1700000000000",
+                ),
+            ),
+            (
+                "timestamp_ms",
+                base("1", "3", ok_cv, ok_vs, "-1"),
+                base("1", "3", ok_cv, ok_vs, "-1.0"),
+            ),
+        ] {
+            for (label, json) in [("int", neg_i), ("float", neg_f)] {
+                assert!(
+                    Checkpoint::from_json(&json).is_err(),
+                    "{field} 的负数（{label}）竟然被接受：{json}"
+                );
+            }
+        }
     }
 }

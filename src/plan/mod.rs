@@ -102,13 +102,33 @@ impl Plan {
     /// 增量更新 steps (id match, status patch)
     /// Input: `&[PlanStepUpdate { id, status }]`
     /// 找不到的 id 返回 error
+    ///
+    /// v0.104.6 D401：**原子** —— 先全量校验 id，再统一应用。
+    ///
+    /// 修前是逐条「查 id → 写 status」，遇到未知 id 就 `?` 返回，
+    /// 于是**错误路径上留下了部分生效的副作用**。实测：
+    ///
+    /// ```text
+    /// update([("a",Done), ("b",Done), ("ghost",Done)])
+    ///   → Err: step id 'ghost' not found
+    ///   → 但 a、b **已变成 Done**（done=2 / pending=1）
+    /// ```
+    ///
+    /// 错误消息只说「ghost 不存在」，会让调用方以为**什么都没发生** ——
+    /// 而 plan 是**持久留在解释器注册表里**的（脚本报错终止，plan 状态仍在）。
+    ///
+    /// ⇒ 改成两轮：先确认全部 id 存在（否则一个字节都不写），再统一应用。
     pub fn update(&mut self, updates: &[(String, StepStatus)]) -> Result<(), String> {
+        // 第 1 轮：全量校验，一个都找不到之外的情况都不写
+        for (id, _) in updates {
+            if !self.by_id.contains_key(id) {
+                return Err(format!("step id '{}' not found", id));
+            }
+        }
+        // 第 2 轮：全部 id 已确认存在，直接写
         for (id, new_status) in updates {
-            let idx = self
-                .by_id
-                .get(id)
-                .ok_or_else(|| format!("step id '{}' not found", id))?;
-            self.steps[*idx].status = *new_status;
+            let idx = *self.by_id.get(id).expect("第 1 轮已校验全部 id 存在");
+            self.steps[idx].status = *new_status;
         }
         Ok(())
     }

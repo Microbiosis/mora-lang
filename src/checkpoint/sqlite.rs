@@ -86,10 +86,23 @@ impl CheckpointSaver for SqliteSaver {
             .optional()
             .map_err(|e| e.to_string())?
         } else {
+            // v0.104.6 D234：`ORDER BY` 必须给**全序**的三级键。
+            //
+            // 修前只有 `ORDER BY step DESC` —— step 相同时 SQLite 不保证
+            // 返回哪一行（实测取的是先插入的 `a`），而 `MemorySaver` 的
+            // `max_by_key(step)` 取的是**后**插入的 `b` ⇒ 同一份数据
+            // 经两个 saver 恢复出**不同状态**。
+            //
+            // 同 step 并不罕见：`pregel` 的 fault-retry 会重跑同一步，
+            // 两条路径都往同一步写检查点。
+            //
+            // 三级键 `(step DESC, timestamp_ms DESC, id DESC)` 与
+            // `MemorySaver::load` 的 `max_by` 逐项对应，且 `id` 保证
+            // 完全并列时也有确定结果。
             conn.query_row(
                 "SELECT data_json FROM checkpoints
                  WHERE thread_id = ?1
-                 ORDER BY step DESC
+                 ORDER BY step DESC, timestamp_ms DESC, id DESC
                  LIMIT 1",
                 rusqlite::params![thread_id],
                 |row| row.get(0),
@@ -111,9 +124,10 @@ impl CheckpointSaver for SqliteSaver {
         let conn = self.conn.lock();
         let mut stmt = conn
             .prepare(
+                // v0.104.6 D234：与 `MemorySaver::list` 逐项对应的全序三级键
                 "SELECT id FROM checkpoints
                  WHERE thread_id = ?1
-                 ORDER BY step ASC",
+                 ORDER BY step ASC, timestamp_ms ASC, id ASC",
             )
             .map_err(|e| MoraError::Other(e.to_string()))?;
         let ids: Vec<String> = stmt
@@ -232,10 +246,18 @@ mod tests {
         let mut values = HashMap::new();
         values.insert(
             "messages".to_string(),
-            crate::value::Value::List(vec![
-                crate::value::Value::String("hello".to_string()),
-                crate::value::Value::String("world".to_string()),
-            ]),
+            // v0.104.6：`Value::List` 已改用分块存储的 `list::List`
+            // （`Value::List(list::List)`），不再是 `Vec<Value>`。此处是
+            // 本会话早期 List 改造遗留的编译错误 —— `cargo test`（默认
+            // features）碰不到本 target，`cargo clippy --all-targets
+            // --all-features` 才暴露。
+            crate::value::Value::List(
+                vec![
+                    crate::value::Value::String("hello".to_string()),
+                    crate::value::Value::String("world".to_string()),
+                ]
+                .into(),
+            ),
         );
         values.insert(
             "score".to_string(),

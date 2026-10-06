@@ -623,6 +623,10 @@ impl MirPregelEngine {
         // v0.63: current_step is initialized in new() and may be set by restore_checkpoint.
         // Do NOT reset to 0 here — that would negate checkpoint restore.
         let mut active_nodes: Vec<String> = vec!["@start".to_string()];
+        // v0.104.6 D97：累计**被调度**的 agent 数。刻意区别于 `stats.agents_run`
+        // —— 后者**不计**增量缓存的跳过路径，而「被调度但因 input 未变而跳过」
+        // 是一条**合法**的生产路径（见 `incremental_skip_when_input_unchanged`）。
+        let mut scheduled: usize = 0;
 
         while !active_nodes.is_empty() && self.current_step < self.max_steps {
             // v0.71: Reset aggregators at start of each step.
@@ -662,6 +666,7 @@ impl MirPregelEngine {
 
             // ─ 2. EXEC ──────
             // 记录激活节点的 snapshots
+            scheduled += to_execute.len();
             for node_name in &to_execute {
                 let snapshot = self.versions_seen.entry(node_name.clone()).or_default();
                 for (channel, version) in &self.channel_versions {
@@ -844,6 +849,81 @@ impl MirPregelEngine {
                     }
                 }
             }
+        }
+
+        // v0.104.6 D97：静默空转守卫。
+        //
+        // 实测：只写 `edge a -> b` 而**不写** `edge @start -> a` 时，
+        // `active_nodes` 初始为 `vec!["@start"]`、下一跳沿 edges 从它算，
+        // 于是 `to_execute` 恒空 —— **没有任何 agent 跑过**，
+        // 末尾 `channels.get("result")` 返 `Nil`，全程 **exit 0、零诊断**。
+        //
+        // 守卫条件**不是**「有没有 `@start` 边」—— 那会误伤：
+        //   ① checkpoint 恢复的引擎（`current_step != 0`）；
+        //   ② 28 个 pregel 单测里有 8 个根本没有 `@start`。
+        // 正确条件是「**本图存在从 `@start` 可达的 agent，却一个都没跑**」——
+        // 即图本身是配好的、只是没有任何东西被激活。
+        // 守卫条件刻意**不**含可达性分析：「配置里声明了 agent，却一次都没被
+        // 调度」本身就是错配 —— 无论原因是漏写入口边、边指向未知节点，
+        // 还是所有 agent 都被 Halt。
+        //
+        // 用 `scheduled` 而非 `stats.agents_run` 是关键：后者**不计**增量缓存
+        // 的跳过路径，而「被调度但 input 未变而跳过」是**合法**的生产路径
+        // （`incremental_skip_when_input_unchanged` 测的就是它）。
+        if scheduled == 0 && !self.config.agents.is_empty() {
+            let names: Vec<&str> = self.config.agents.iter().map(|a| a.name.as_str()).collect();
+            return Err(format!(
+                "pregel: graph declares agents but none was ever scheduled \
+                 (agents: {}). No agent is activated — check that an entry edge \
+                 such as `edge @start -> <agent>` exists.",
+                names.join(", ")
+            ));
+        }
+
+        // v0.104.6 D268：超步预算耗尽守卫。
+        //
+        // 实测（真实 CLI，`agent a` / `agent b` + `edge a -> b` + `edge b -> a`）：
+        // 跑满 `max_steps`（=1000）后**静默**返回 `result` 通道的当前值、
+        // **exit 0、零诊断**，耗时 196ms。用户无从分辨「图收敛了」与
+        // 「预算烧完了」。而返回的那个值还是**中途**的值（链式图实测：
+        // `max_steps=2` 时 `result` 是 `"A"`，链尾 `d` 从未执行）。
+        //
+        // 与 D97 的关系：两者守的是**同一个 while 循环的两个出口**
+        // （`while !active_nodes.is_empty() && self.current_step < self.max_steps`），
+        // 而 D97 只守了「一个 agent 都没被调度」这半个条件。本守卫补另一半。
+        // 顺序刻意在 D97 之后：`max_steps == 0` 时两者都成立，而
+        // 「没有任何 agent 被激活」是更具体的诊断，应优先报出。
+        //
+        // 条件刻意**不含**可达性/收敛性分析 —— 循环因预算退出时
+        // `active_nodes` 非空就意味着**还有没跑的顶点**，无论成因是
+        // 图里有环、超步数确实超出，还是 checkpoint 恢复后接着跑。
+        //
+        // 关键前提：`max_steps` **无法从语言层设置** —— `with_max_steps`
+        // 在 `src/` 内无任何调用点，硬编码于 `new()`；`orchestrate.dag` 的
+        // `max_steps` 是另一个模块，与本引擎无关。因此 Mora 程序撞上上限
+        // **只可能**是图不收敛，而非「用户主动用完预算」——
+        // 本守卫不限制任何合法用法。
+        //
+        // （同一区域的另一条线索：`orchestrate pregel` 目前**也无法**产生
+        // 消息 —— 全仓 `MirInst::Send` 仅在 `pregel/mod.rs` 自己的
+        // `#[cfg(test)]` 里被构造，真实 CLI 实测 `send("b", 1)` 报
+        // `Undefined function or task: send`、exit 1。所以带环的图只能
+        // 靠静态 `edge` 表达，这正是本守卫唯一可达的触发形态。）
+        if self.current_step >= self.max_steps && !active_nodes.is_empty() {
+            let mut pending: Vec<&str> = active_nodes.iter().map(|s| s.as_str()).collect();
+            pending.sort_unstable();
+            return Err(format!(
+                "pregel: super-step budget exhausted after {} steps (max_steps={}) \
+                 with {} vertex/vertices still pending: {}. The graph did not \
+                 converge — check for a cycle in the `edge` declarations \
+                 (e.g. `edge a -> b` together with `edge b -> a`). Returning \
+                 the in-flight `result` here would silently report a \
+                 mid-computation value as the answer.",
+                self.current_step,
+                self.max_steps,
+                pending.len(),
+                pending.join(", "),
+            ));
         }
 
         // 返回 result 通道
@@ -1177,22 +1257,34 @@ impl MirPregelEngine {
     }
 
     /// 构建节点输入 — 序列化 channels
+    ///
+    /// v0.104.6 D235：改为**直接构造 `Value::Dict` 再交给
+    /// `flow::value_to_json`**，不再手工拼 `"ch":frag` 字符串。
+    ///
+    /// 修前有三处叠加缺陷（实测，见 CHANGELOG D235）：
+    /// ① `value_to_json_string` **没有 `Dict` 分支** ⇒ dict 落到
+    ///    `_ => format!("\"{}\"", v)`，经 `Value::Display` 得到
+    ///    `{k: v, n: 3}` —— **key 无引号，不是 JSON**。整个对象变成
+    ///    `{"ch":{k: v}}`，而这段字符串会**喂给 agent**。
+    /// ② `channel` 名未经转义：`format!("\"{}\":", channel)` ⇒
+    ///    含 `"` 或 `\` 的 channel 名直接破坏 JSON。
+    /// ③ `Float(42.0)` 输出 `42` ⇒ 读回变 `Int`（D84/D99 明确要求
+    ///    Float 必带小数点，类型降级不可逆）。
+    ///
+    /// 构造 `Dict` 后交给共享的 `flow::value_to_json` ⇒ 三处一并解决，
+    /// 且**只有一份**序列化实现（见 `value_to_json_string` 的 D235 注释）。
     fn build_node_input(&self, node_name: &str) -> String {
         let snapshot = self.versions_seen.get(node_name);
-        let mut parts: Vec<String> = Vec::new();
+        let mut map: std::collections::HashMap<String, Value> = std::collections::HashMap::new();
         for (channel, version) in &self.channel_versions {
             let seen_version = snapshot.and_then(|s| s.get(channel)).copied().unwrap_or(0);
             if *version > seen_version
                 && let Some(v) = self.channels.get(channel)
             {
-                parts.push(format!("\"{}\":{}", channel, value_to_json_string(v)));
+                map.insert(channel.clone(), v.clone());
             }
         }
-        if parts.is_empty() {
-            "{}".to_string()
-        } else {
-            format!("{{{}}}", parts.join(","))
-        }
+        crate::flow::value_to_json(&Value::Dict(map))
     }
 
     /// 应用写入 — 通过 Value::merge() 统一 CRDT 路径
@@ -1213,13 +1305,13 @@ impl MirPregelEngine {
         // Pregel Append: accumulate individual writes into a list.
         // Different from MergeStrategy::Append which extends two lists.
         if reducer == MirReducerKind::Append {
-            let mut list = match current {
+            // v0.104.6：List 不可变，push 返回新列表
+            let list = match current {
                 Some(Value::List(l)) => l,
-                Some(v) => vec![v],
-                None => Vec::new(),
+                Some(v) => crate::value::list::List::from_vec(vec![v]),
+                None => crate::value::list::List::new(),
             };
-            list.push(value);
-            let new_value = Value::List(list);
+            let new_value = Value::List(list.push(value));
             self.channels.insert(channel.clone(), new_value);
             *self.channel_versions.entry(channel).or_insert(0) += 1;
             return Ok(());
@@ -1382,21 +1474,17 @@ impl MirPregelEngine {
     }
 }
 
-/// v0.57: 将 Value 序列化为 JSON 字符串片段（用于 build_node_input）
-fn value_to_json_string(v: &Value) -> String {
-    match v {
-        Value::String(s) => format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\"")),
-        Value::Int(n) => format!("{}", n),
-        Value::Float(n) => format!("{}", n),
-        Value::Bool(b) => format!("{}", b),
-        Value::Nil => "null".to_string(),
-        Value::List(items) => {
-            let parts: Vec<String> = items.iter().map(value_to_json_string).collect();
-            format!("[{}]", parts.join(","))
-        }
-        _ => format!("\"{}\"", v),
-    }
-}
+// v0.104.6 D235：此处原有的 `value_to_json_string`（与 `pregel::reducers`
+// 的同名函数各一份的重复实现）已**删除**。
+//
+// 它有两个 D235 缺陷 —— 没有 `Dict` 分支（dict 落到 `Display` 得
+// `{k: v}`，key 无引号、**不是 JSON**）、`Float(42.0)` 输出 `42`
+// （往返变 `Int`，类型降级不可逆）。
+//
+// `build_node_input` 现直接构造 `Value::Dict` 交给
+// `flow::value_to_json`（唯一的序列化实现），两个函数都失去调用者。
+// 保留一个已被证明错误、又无人调用的重复实现，只会成为下一个
+// 「改一处须同步另一处」的陷阱。
 
 #[cfg(test)]
 mod tests {
@@ -1459,6 +1547,131 @@ mod tests {
         let engine = MirPregelEngine::new(config);
         assert_eq!(engine.config().agents.len(), 1);
         assert_eq!(engine.config().edges.len(), 1);
+    }
+
+    // ── v0.104.6 D235：build_node_input 必须产出合法 JSON ──
+
+    /// 造一个最小 engine（单 agent、单 state channel `x`）。
+    fn engine_for_input_test() -> MirPregelEngine {
+        let config = MirPregelConfig {
+            agents: vec![make_agent("a")],
+            edges: vec![MirEdgeDef {
+                from: "@start".to_string(),
+                to: "a".to_string(),
+                condition_expr: None,
+                condition_body: None,
+            }],
+            state_schema: vec![MirStateChannel {
+                name: "x".to_string(),
+                ty: "Any".to_string(),
+                reducer: MirReducerKind::Last,
+            }],
+            checkpoint: None,
+            interrupt_points: vec![],
+            adjacency: HashMap::new(),
+            aggregators: Vec::new(),
+            master_compute: None,
+        };
+        MirPregelEngine::new(config)
+    }
+
+    /// D235 主判据：`build_node_input` 的产出必须是**合法 JSON**。
+    ///
+    /// 修前它手工拼 `"ch": <fragment>`，而 fragment 来自局部的
+    /// `value_to_json_string`（**没有 `Dict` 分支**）⇒
+    /// `Dict{k:"v", n:3}` 变成 **`{k: v, n: 3}`**（key 无引号），
+    /// 整个对象成为 `{"x":{k: v, n: 3}}` —— 而这段字符串是**喂给 agent 的
+    /// 请求体**（`run` 路径 `mod.rs:929` / `:1048`）。
+    ///
+    /// 判据钉在**真实消费路径**上（私有方法只能在本模块内测）。
+    /// ⚠ 不能只断言「`json_to_value` 不报错」—— 修前它对 `{k: v, n: 3}`
+    /// **返回 `Ok`**（整段当字符串读回），那个检查**掩盖了缺陷**。
+    /// 必须断言读回是 `Dict`。
+    #[test]
+    fn d235_build_node_input_is_valid_json_for_dict_channel() {
+        let mut engine = engine_for_input_test();
+        let mut d = HashMap::new();
+        d.insert("k".to_string(), Value::String("v".into()));
+        d.insert("n".to_string(), Value::Int(3));
+        engine.channels.insert("x".to_string(), Value::Dict(d));
+        engine.channel_versions.insert("x".to_string(), 1u64);
+
+        let out = engine.build_node_input("a");
+        let parsed = crate::flow::json_to_value(&out)
+            .unwrap_or_else(|e| panic!("D235: build_node_input 产出**非法 JSON**: {out} ({e})"));
+        // ⚠ 只断言外层是 Dict **不够**：修前产出 `{"x":{k: v, n: 3}}`，
+        // 外层 key 合法 ⇒ `json_to_value` **成功**返回 Dict（内层是字符串
+        // `"{k: v, n: 3}"`）。必须查**内层**（channel "x" 的值）是否仍是 Dict。
+        let x_is_dict = match &parsed {
+            Value::Dict(m) => matches!(m.get("x"), Some(Value::Dict(_))),
+            _ => false,
+        };
+        assert!(
+            x_is_dict,
+            "D235: channel \"x\" 的值读回应仍是 Dict。\n\
+             out    = {out}\n\
+             parsed = {parsed:?}\n\
+             修前的局部序列化器**没有 Dict 分支**，`Value::Dict{{k,n}}` 落到 \
+             `format!(\"{{}}\", v)` ⇒ 经 Display 得 `{{k: v, n: 3}}`（key 无引号）。\
+             外层 `\"x\"` 仍合法 ⇒ json_to_value **成功**返回 Dict（内层是字符串），\
+             所以「外层是 Dict / 能解析」两个检查都**掩盖**了这个缺陷。"
+        );
+    }
+
+    /// D235：`Float(42.0)` 必须带小数点（否则读回变 `Int`，类型降级不可逆）。
+    #[test]
+    fn d235_build_node_input_keeps_float_decimal_point() {
+        let mut engine = engine_for_input_test();
+        engine.channels.insert("x".to_string(), Value::Float(42.0));
+        engine.channel_versions.insert("x".to_string(), 1u64);
+
+        let out = engine.build_node_input("a");
+        assert!(
+            out.contains("42.0"),
+            "D235: Float(42.0) 应序列化成 42.0；实得 {out} —— \
+             缺小数点则读回变 Int，类型降级不可逆（D84/D99）"
+        );
+        let parsed = crate::flow::json_to_value(&out).expect("valid json");
+        let x_is_float =
+            matches!(&parsed, Value::Dict(m) if matches!(m.get("x"), Some(Value::Float(_))));
+        assert!(x_is_float, "D235: x 读回应为 Float；实得 {parsed:?}");
+    }
+
+    /// D235：`channel` 名含引号 / 反斜杠时输出仍须合法 JSON。
+    ///
+    /// 修前是 `format!("\"{}\":", channel)` —— **未经转义**，
+    /// 含 `"` 的 channel 名直接产出非法 JSON。
+    #[test]
+    fn d235_build_node_input_escapes_channel_names() {
+        let mut engine = engine_for_input_test();
+        let evil = "ch\"with\\quotes";
+        engine.channels.insert(evil.to_string(), Value::Int(1));
+        engine.channel_versions.insert(evil.to_string(), 1u64);
+
+        let out = engine.build_node_input("a");
+        let parsed = crate::flow::json_to_value(&out).unwrap_or_else(|e| {
+            panic!("D235: channel 名含引号/反斜杠时产出非法 JSON: {out} ({e})")
+        });
+        match parsed {
+            Value::Dict(m) => assert_eq!(
+                m.get(evil),
+                Some(&Value::Int(1)),
+                "D235: 特殊 channel 名应被正确转义并读回原名"
+            ),
+            other => panic!("应读回为 Dict; got {other:?}"),
+        }
+    }
+
+    /// D235：空 channel 集应产出 `{}`（合法 JSON），不是别的。
+    #[test]
+    fn d235_build_node_input_empty_is_valid_json() {
+        let engine = engine_for_input_test();
+        let out = engine.build_node_input("a");
+        assert_eq!(out, "{}", "无可见 channel 时应产出 {{}}");
+        assert!(
+            crate::flow::json_to_value(&out).is_ok(),
+            "{{}} 必须是合法 JSON"
+        );
     }
 
     #[test]
@@ -1838,7 +2051,7 @@ mod tests {
         let failing_body = MirFunction {
             params: Vec::new(),
             body: vec![
-                MirInst::Const(0, Value::List(vec![Value::Int(1)])),
+                MirInst::Const(0, Value::List(vec![Value::Int(1)].into())),
                 MirInst::Const(1, Value::Int(99)),
                 MirInst::Index(2, 0, 1),
                 MirInst::Return(Some(2)),

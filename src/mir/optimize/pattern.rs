@@ -133,7 +133,7 @@ impl MatchBindings {
             })
     }
 
-    /// 按名称查询 Option<Reg> 绑定
+    /// 按名称查询 Option`<Reg>` 绑定
     pub fn get_reg_opt(&self, key: &str) -> Option<Option<Reg>> {
         self.bindings
             .iter()
@@ -164,7 +164,7 @@ pub enum RegMatcher {
     Bind(String),
 }
 
-/// Option<Reg> matcher — 匹配 Some/None
+/// Option`<Reg>` matcher — 匹配 Some/None
 #[derive(Debug, Clone, PartialEq)]
 pub enum RegOptMatcher {
     /// 匹配 Some(any reg)

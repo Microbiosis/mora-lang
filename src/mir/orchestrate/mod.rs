@@ -184,24 +184,34 @@ fn mir_agent_from_witness(a: &crate::mir::witness::WitnessAgentDef) -> MirAgentD
     }
 }
 
-/// v0.92: WitnessEdgeDef → MirEdgeDef。
+/// v0.92 + v0.104.6 D271：WitnessEdgeDef → MirEdgeDef。
+///
+/// D271 修前这里把 `condition_expr` **硬编码成 `None`** —— 与 D270 的 MoE
+/// 专家名同型：witness 侧明明有字段，反向转换却丢掉了。`on:` 条件因此
+/// 在往返中蒸发。
+///
+/// `condition_body` 一并带过：引擎（`pregel/mod.rs`）只读它，由解析阶段
+/// 预 lowering 得到（见 `syntax.rs::try_parse_edge_def`）。
 fn mir_edge_from_witness(e: &crate::mir::witness::WitnessEdgeDef) -> MirEdgeDef {
     MirEdgeDef {
         from: e.from.clone(),
         to: e.to.clone(),
-        condition_expr: None,
-        condition_body: None,
+        condition_expr: e.condition_expr.clone(),
+        condition_body: e.condition_body.clone(),
     }
 }
 
-/// v0.92: MirWitness(MoE expert) → MirMoeExpert。
-fn mir_moe_expert_from_witness(w: &crate::mir::witness::MirWitness) -> MirMoeExpert {
-    let def = w.clone();
+/// v0.92 + v0.104.6 D270：WitnessMoeExpert → MirMoeExpert。
+///
+/// D270 修前这里收的是裸 `MirWitness`，只能把 `name` 硬编码成空串 ——
+/// 而 `run_moe` 正是拿 router 的键去 `find` `e.name`，于是必然落空，
+/// `orchestrate moe` 100% 报「router referenced unknown expert」。
+fn mir_moe_expert_from_witness(w: &crate::mir::witness::WitnessMoeExpert) -> MirMoeExpert {
     let def_fn =
-        crate::mir::lower::lower_mir_witnesses(std::slice::from_ref(w)).unwrap_or_default();
+        crate::mir::lower::lower_mir_witnesses(std::slice::from_ref(&w.def)).unwrap_or_default();
     MirMoeExpert {
-        name: String::new(),
-        def,
+        name: w.name.clone(),
+        def: w.def.clone(),
         def_fn,
     }
 }
@@ -254,7 +264,7 @@ pub struct MirEdgeDef {
 // ===================================================================
 
 ///  Checkpoint configuration (placeholder for v0.50)
-/// v0.92: thread_id 从 Box<MirExpr> 迁移到 Box<MirWitness>。
+/// v0.92: thread_id 从 Box`<MirExpr>` 迁移到 Box`<MirWitness>`。
 #[derive(Debug, Clone, PartialEq)]
 pub struct MirCheckpointConfig {
     pub saver: String,

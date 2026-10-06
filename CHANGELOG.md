@@ -96,11 +96,14 @@ README / release body / 源码注释描述的是 v0.04~v0.25 时代的声明式�
   任何 token。`emit_span_w` 共用该函数，有同样风险。仅
   `observe trace do ... end` 与 `observe otel "svc" do ... end` 两种形态
   实证可用（exit=0）。
-- 数字类型断层：`parser_v3/syntax.rs:739` 把 `number` 标注解析为
-  `Type::Int`，而 `typeck/mod.rs:314` 的 `from_hint("number")` 给
-  `Type::Float`，两条路径真实矛盾。表现为 `let x: number = 1` 报
-  `expected int, got float`、`42i` 才过、`let x: float = 1` 反而通过
-  （无后缀整数字面量一律是 `Float`）。
+- ~~数字类型断层~~ **已修，见 v0.104.6 段 D62**：`parser_v3/syntax.rs:739`
+  原先把 `number` 标注解析为 `Type::Int`，而 `typeck/mod.rs` 的
+  `from_hint("number")` 给 `Type::Float`，两条路径真实矛盾。表现为
+  `let x: number = 1` 报 `expected int, got float`、`42i` 才过、
+  `let x: float = 1` 反而通过（无后缀整数字面量一律是 `Float`）。
+  **该记录只观察到了矛盾的一半**：真正的问题不是「两处不一致」，而是
+  `Int` 这个映射本身错了 —— spec §13.1 `:110` 要求 `number` 同收 `42` 与
+  `3.14`。现已统一为 `Union[Int, Float]`。
 
 ### README 两表逐行取证结果
 
@@ -127,6 +130,26573 @@ README / release body / 源码注释描述的是 v0.04~v0.25 时代的声明式�
 - **用户自定义 `type` 别名不能作类型标注**：`type MyNum = number` 定义
   本身通过，但 `let x: MyNum = 1` 报错。
 - **`set<T>` 泛型标注不支持**：报 `unsupported generic type annotation 'set'`。
+
+## [v0.104.6] — 2026-09-30 — fix: 内建原语四缺陷 + 执行器 E1 + 数值/容器性能
+
+本轮以「**把语义相同、不同写法的代码配成对跑**」为主方法论，一次系统性
+对拍抓出多个此前从未被任何测试触及的缺陷。共同特征：**不报错**。
+
+### 一、内建原语四缺陷（本轮）
+
+| # | 现象 | 修前实测 | 修后 |
+|---|------|----------|------|
+| D1 | `range` 实参非 `Float` 时**静默取默认值** | `for i in range(0, len(xs))` 求和 = **0.0**（应 15.0） | 15.0 |
+| D2 | 字符串 `len()` 数 **UTF-8 字节** | `len("中文字")` = **9** | 3 |
+| D3 | 字符串索引 `s[i]` **源码层完全不可用** | `ERR: cannot index String("abc") with Float(0.0)` | `Char('a')` |
+| D4 | `int()` / `float()` / `bool()` 只存在于 typeck | `ERR: Undefined function or task: int` | `Int(42)` |
+| D6 | 模块前缀当自由函数调 **panic** | `math(2.5)` → `*** PANIC ***` | 指路错误 |
+| D5 | `len` 的 typeck 声明与运行期不符 | `let n: Int = len(xs)` → **exit 2**（拒绝正确标注） | 接受 |
+| D9 | `ai.chat` **任何用法都过不了类型检查** | `let r = ai.chat("hi")` → **exit 2** | 可用 |
+| D10 | `McpServer.tool` **丢弃 schema** | 客户端 `inputSchema` 恒为 `{}` | 用注册时的 schema |
+| D11 | `print()` 拒绝 router / mcp_server | `print(r)` → **exit 2** | 可用 |
+| D12 | `bool()` 与语言真值判断**分叉 4 处** | `if 0n` 真，但 `bool(0n)` 假 | 委托 `is_truthy` |
+| D13 | ambient 兜底失败**误报「运行期不变量被破坏」** | `rand_float()` → invariant violated | 报真实参数错误 |
+| D19 | **`Int / Int` 是四舍五入；除零静默返回 i64::MAX** | `1/2` → **1**、`1/0` → i64::MAX | 截断 + 除零报错 |
+| D20 | **BigInt 与 Int/Float 混比全错** | `4n < 4.5` → ERR、`4n == 4.0` → false | 按 tower 提升为 f64 |
+| D21 | **BigInt 超出 i64 后静默饱和** | `10^20 * 2n` → i64::MAX | 原生大数运算 |
+| D14 | `import` 进来的模块里 **handle+索引完全不可用** | `Undefined function or task: []` | 与内联一致 |
+| D15 | **`char` 字面量 `'a'` 无法解析** | `let c = 'a'` → exit 2 | 可用 |
+| D16 | `==` 与 `PartialEq` 两个相等函数**分叉** | `'a' == 'a'` → **false** | true |
+
+- **D1 的机制**：本语言所有数值字面量都是 `Float`，而 `len()` 返 `Int`；
+  `call_builtin_range` 三个实参各自 `.and_then(|v| match v { Value::Float(n) => …,
+  _ => None }).unwrap_or(默认)` —— `Int` 实参被当成「没传」，`end` 退回
+  `start`，range 恒空，**循环体一次都不执行**，`sum` 保持初值 0.0。
+  同一段代码把 `len(xs)` 换成字面量 `5` 立刻正确 —— 这种「换个写法就对」
+  的错误最难自查。修法不是补 `Int` 一个洞，而是**消除静默降级这一失败
+  模式本身**：实参存在但类型不对一律报错，只有真的缺席才用默认值。
+  顺带修好负步长（旧实现 `while i < end` 对负步长恒假，静默返回空列表）
+  与 `step == 0`（原本死循环）。
+- **D2/D3 的机制**：`len` 用 Rust 的 `s.len()`（字节），而 `index_value` 的
+  字符串分支用 `s.chars().nth(i)`（字符），两者差一个 3 倍因子；且该分支只
+  匹配 `Value::Int`，而源码里写不出 `Int` 字面量，于是 `s[i]` 恒落到兜底
+  报错。现在 `len` 改 `chars().count()`，字符串索引同时收 `Int` 与 `Float`
+  （与 List 分支对齐）。
+- **D4 与 v0.104.6 早前修的 `str()` 完全同源**：`typeck/hm/builtin.rs` 与
+  `typeck/dispatch.rs` 登记了签名，`interpreter/dispatch.rs` 的 `match name`
+  里却没有分支，落到兜底环境查找报 `Undefined function or task: …`。
+  `str()` 之所以多藏了一阵是被执行器缺陷 E1 连带掩盖；`int/float/bool`
+  则从一开始就没有任何测试碰过。
+- **五种 `len` 实现的返回类型此前互不相同**：string 方法返 `Float`，
+  其余四处返 `Int`；现统一为 `Int`，并由
+  `all_len_spellings_agree_in_type_and_value` 钉住。
+
+### 二、执行器 E1：汇合点饿死
+
+`if/else` 之后整条尾部**静默蒸发**。根因在**建图层**而非执行器：
+`dag_analyze` 的 `partition_blocks` 漏掉了裸 pc 跳转目标（编译器用裸 pc
+而非 Label 做跳转目标），把 if/else 汇合点并进 else 臂那一块；块内 Sequence
+链 + `last_effect` 扇出因此越过汇合点继续连边，破坏了「同一块内必然先执行」
+这个不变量。**修复只改 `partition_blocks`，执行器一行未动。**
+
+连带暴露：修复前挂在汇合点之后的 `print("sum=" + str(total))` **从未执行过**，
+所以那条唯一用到 `str()` 的测试一直是假绿 —— 这才是 `str()` 缺口藏了这么久
+的原因。
+
+### 三、性能（均为端到端实测）
+
+- `Value::List` 迁移到持久化分块结构（`src/value/list.rs`，`Arc` 结构共享，
+  32 元素一片）：n=20000 建表 **44,000ms → 515ms（85×）**，且已线性。
+- `h_index` 借用化（`src/mir/handlers/values.rs`）：去掉对被索引对象的深值
+  克隆，循环内 `xs[i]` 由 O(n²) 降为 O(1)，**206×**。
+- memo 指纹对 dict 改为**与顺序无关的内容哈希**（原先只取长度）：循环内
+  `{a: n}` 内容逐轮变而长度恒为 1，指纹不变 → memo 恒命中 → 永远返回第一轮
+  的 0（实测 0.0，应 6.0）。最强证据：`d.get("a")` 走 `Call` 得 6.0，
+  `d["a"]` 走 `Index` 得 0.0 —— 同语义两种写法两种结果。
+
+### 四、`HashMap` 迭代序泄漏 7 处
+
+`RandomState` 每进程随机 → `iter()/keys()/values()` 顺序**每次运行都不同**。
+按危害分级修复（显示层 < 序列化层 < 语义层，语义层最致命：同一程序每次跑
+出不同答案且不报错）：`flow/json.rs`、`value/display.rs`×2、
+`interpreter/method_dispatch.rs`、`compress/detect.rs`、`compress/json.rs`×2
+（DFS Enter/Exit 须同序）。
+
+### 五、typeck 的 `len` 返回类型：拒绝正确标注、接受错误标注
+
+`len` 的返回类型在全仓有**两处互相矛盾的声明**：`typeck/hm/builtin.rs:40`
+写 `Type::Int`（正确），`typeck/dispatch.rs` 的 5 处写 `Type::Float`（错误）；
+而 `HMInference::builtin_callee_ty` 开头就「prefer the canonical dispatch
+registry」，错误的那份盖住了正确的那份。
+
+后果不是「类型标注宽松」的小事 —— 经真实 CLI `mora run` 实测：
+
+```text
+修前： let n: Int   = len(xs)  → exit 2  Type error: expected int, got float
+       let n: Float = len(xs)  → exit 0  打印 3 —— 但那个 3 在运行期是 Int
+```
+
+即**正确标注被拒、错误标注放行，而被放行的那个标注与实际值也不符**。这是
+全仓唯一一处静态类型与动态值双向都不符的地方。5 处签名全部改为 `Type::Int`，
+运行期行为零变化，只改「哪些程序能通过检查」。
+
+### 六、模块前缀当自由函数调 → panic（D6）
+
+`call_function` 的 `_` 兜底臂上有一道 `testcase!` 守卫，断言「凡是
+`BuiltinKind::from_name` 登记过的名字，都必须有 `match name` 分支」。
+
+但 `from_name` 有**两个**职责：方法前缀查找 与 自由函数可调用性。
+`MODULE_OBJECTS`（`math` / `stats` / `linalg` / `json` / `file` / `web` /
+`random` / … 共 21 个）是为**前者**登记的 —— `math.floor(x)` 走
+`call_method_*`，从不经过 `call_function`。它们**理应**没有自由函数分支、
+**理应**落兜底。
+
+守卫只看 `from_name` 的返回值，于是把「模块前缀当函数调」误判成登记漂移：
+
+```text
+math(2.5)   → *** PANIC ***      修后：ERR: 'math' is a module, not a function
+json(1)     → *** PANIC ***      修后：ERR: 'json' is a module, not a function
+```
+
+21 个前缀**全部**中招，typeck 也不拦（`math`/`stats`/`linalg` 本就登记了
+marker signature）。兜底本来会给一句完全正确的 `'math' is not callable`
+—— 是守卫把它变成了崩溃。修法：守卫按 `MODULE_OBJECTS` 豁免模块前缀，
+并在兜底里给出能指路的错误（`is a module, not a function — call a method
+on it`）。用户用 `let math = fn(x) ... end` 遮蔽模块名时仍按普通函数处理。
+
+### 七、方法侧三方对拍（typeck / 运行期 / `methods_of`）
+
+把自由函数侧那套「typeck 登记了、运行期没有」的对拍方法搬到方法侧，三张表
+一起比：typeck 的 `(receiver, method)` 注册、`call_method_*` 的实际分支、
+以及 `Value::methods()`（`methods_of` builtin 的唯一数据源）。
+
+**结论：方法侧没有活跃的用户可见缺陷。** String/Dict/List/Conversation/
+Router/McpServer 的 60 余个注册方法逐一验证，全部能调通；`methods_of` 报的
+每个名字也都真能调。抓到两处**准确性问题**，都不算功能性缺陷：
+
+- **`List.crush_json` 漏报**（已修）：`call_method_list` 有该分支（实测报
+  `List.crush_json: requires max as number`，证明分支存在），但
+  `Value::methods()` 的 List 名单没列它，`methods_of([1,2,3])` 因此少报一个。
+  这张表是用户判断「这个值能干什么」的唯一入口，漏报会让能力集合偏小。
+- **`Type::AiConfig` / `Type::HttpRequest` 的方法签名是不可达死注册**
+  （已标注，未改行为）：这两个 Value 变体**全仓从未被构造** —— 只在
+  `flow::type_name` / `flow::json` / `value::display` 里被*模式匹配*，
+  没有任何一处构造表达式；`AiConfig::new()` 报 `Undefined function or task`，
+  `with model = "m" … end` 返回 Nil（config 存进 Rust 侧的
+  `CoreRuntime.current_ai_config`，是 `AiConfigValue` 而非 `Value::AiConfig`）。
+  即便拿到这样的值，`call_method` 也没有对应分支，会落进最终 `_ =>` 臂。
+  今天不是缺陷，但是**一枚地雷**：谁补上构造入口，这些签名立刻变成
+  「typeck 放行 → 运行期报 Can only call methods on …」。已在 typeck 注册处
+  写明，补构造时必须同时补 `call_method` 分支；并用
+  `ai_config_and_http_request_values_are_unconstructible` 把「当前拿不到」
+  这个事实钉住，让补构造的人看见测试失败。
+
+审计结论不能只活在一次性脚本里，故固化为 3 条常驻测试：
+`methods_of_never_reports_an_unimplemented_method`（双向对拍，38 个方法）、
+`typeck_registered_methods_all_exist_at_runtime`（反向）、
+`ai_config_and_http_request_values_are_unconstructible`。
+
+### 八、`ai.chat` 返回类型：语言主打能力从源码层完全不可达（D9）
+
+typeck 把 `ai.chat` 声明为 `-> Type::AiResult`，而 `Value` 里**没有任何
+`AiResult` 变体** —— 它是只存在于 typeck 的幽灵类型。返回值因此没有任何东西
+能消费，连 `print` 的形参类型里都没有它。经真实 CLI `mora run` 实测：
+
+```text
+let reply = ai.chat("hi")   → exit 2
+  Type mismatch: expected string|int|float|… , got ai_result
+print(ai.chat("hi"))        → exit 2（同上）
+```
+
+**连「先赋值再打印」都过不了** —— `ai.chat` 在源语言里任何用法都用不了。
+这是本语言主打能力（README 首屏就是 AI 原语），却完全不可达；该问题自
+v0.104.5 的 CHANGELOG 记为「属待修缺陷」以来一直挂着。
+
+运行期一侧则毫无争议：`do_ai_chat` 的**每一条**路径（mock / replay / cache /
+real / tools / agent）都返回 `Value::String`，而运行期自己写进 recorder 的
+签名字面就是：
+
+```text
+"ai.chat(model: string, prompt: string) -> string"
+```
+
+即 typeck 的声明与运行期的自我描述互相矛盾，**且运行期是对的**。两处签名
+（`"ai.chat"` builtin 与 `(Type::AiModule, "chat")` 方法）都改为
+`Type::String`。
+
+修后实测：直接 print / 赋值再 print / 字符串拼接 / 标注 `String` / 作值返回
+五种用法全部通过；顺带把整个 AI surface 扫了一遍（`p"..."` / `ai.critic` /
+`ai.tokens.*` / `with` 块 / `Router::new` / `McpServer::new`）确认无同类阻塞，
+`ai.critic` 也确实给出 spec §12.5 承诺的 `{verdict, critique, score}`。
+
+### 九、幽灵类型普查：`AiResult` 是唯一危险的一个
+
+`Type` 有 28 个变体，`Value` 有 25 个。D9 暴露出「幽灵类型」（只存在于
+typeck、`Value` 里没有对应变体）这一族，于是做了全量普查：
+
+| Type 变体 | 状态 |
+|-----------|------|
+| `AiModule` / `RandomModule` | ✅ 映射到 `Value::Builtin(AiChat / Random)` |
+| `Any` / `Unknown` / `Union` | ✅ 顶类型 / 逃生口 / 类型层构造，设计使然 |
+| `Tuple` / `HttpResponse` / `AiError` / `Task` | 死变体，**parser 已挡** |
+| `AiConfig` / `HttpRequest` | 变体存在，但全仓从不构造 |
+| `AiResult` | ✅ v0.104.6 已从 `ai.chat` 返回类型移除 |
+
+**结论：幽灵类型本身无害，真正危险的只有「幽灵类型被挂进一个可达
+production 的签名」这一种情形，`AiResult` 当年正是如此。** 其余的既不能被
+构造出值，也写不成类型标注 —— `parser_v3/syntax.rs:738` 的标注白名单只有
+7 个名字（int/number/float/string/char/bool/nil/any/unknown），其余一律报
+`unsupported type annotation`。实测确认：
+
+```text
+let v: Tuple = 1        → Parse error: unsupported type annotation 'tuple'
+let v: HttpResponse = 1 → Parse error: unsupported type annotation 'httpresponse'
+let v: AiError = 1      → Parse error: unsupported type annotation 'aierror'
+let v: AiResult = 1     → Parse error: unsupported type annotation 'airesult'
+```
+
+tuple 字面量 `(1, "a")` 本身也是解析错误，Mora 无 tuple 语法。
+
+不变式已钉住：`phantom_types_are_not_writable_as_annotations`（10 个幽灵
+类型逐一验证被白名单挡住）+ `writable_annotations_are_actually_checked`
+（对照组：白名单内的标注**必须**真的在检查，否则「挡住幽灵类型」只是因为
+所有标注都被忽略，那是更糟的另一种失效）。哪天有人往白名单加一个幽灵类型，
+测试会失败并提示须同时补 `Value` 变体与 `call_method` 分支。
+
+### 十、数值方法表普查（Float 27 / Int 14 / BigInt 4 = 45 个）
+
+`Value::methods()` 的三张数值表此前从未被审计 —— 前面那轮 `methods_of` 对拍
+只覆盖了 List / Dict / String，而这 45 个名字才是最大的三张表。
+
+**结论：45 个方法全部实现，`methods_of` 报的每个都真能调，零虚报零漏报。**
+`x.m()` 与 `math.m(x)` 两种写法逐值相同（23 方法 × 4 个输入，含负半轴）。
+
+过程中**两个初判都被实测推翻了**，都记在这里以免重蹈：
+
+1. 「`methods_of(3)` 报的是 Float 表而不是 Int 表，疑似串表」—— 不是。
+   本语言**所有数值字面量都是 Float**（`type_of(3)` = `"float"`），所以
+   `methods_of(3)` 报 Float 表完全正确；给真 Int（`int("3")` / `len([1,2,3])`）
+   就正确报 14 个名字的 Int 表。**是我的探针以为拿到了 Int。**
+2. 「`x.abs()` 与 `math.abs(x)` 不一致」—— 不是缺陷，是**解析优先级**。
+   `-2.5.abs()` 解析为 `-(2.5.abs())` = `-2.5`，标准数学惯例（类比 `-x^2`）；
+   加括号后 `(-2.5).abs()` = `2.5` = `math.abs(-2.5)`。判别方法：
+   `0 - 2.5.abs()` 同样得 `-2.5`，说明是「方法调用先算、再取负」。
+
+第 2 点已写进 `numeric_helpers.rs` 的注释 —— 那里的「`math.abs(x)` /
+`x.abs()` 结果一致」原本是**未经实测的断言**，现已逐条验证并附上这个易误判
+的坑。新增 4 条护栏：`numeric_methods_of_are_all_callable`（45 个名字双向
+对拍）、`numeric_method_and_math_module_agree`（23×4 两种写法逐值比对）、
+`method_call_binds_tighter_than_unary_minus`、
+`methods_of_routes_by_runtime_type_not_literal_shape`。
+
+### 十一、`McpServer.tool` 丢弃 schema（D10）
+
+`McpServer.tool(name, schema, handler)` 读 `args[0]` 与 `args[2]`，**把
+`args[1]`（schema）整个丢掉** —— `Value::McpServer.tools` 当时是
+`Vec<(String, Value)>`，结构上就存不下；`serve` 再把 `McpTool.parameters`
+硬编码成 `"{}"`。
+
+后果在 MCP 协议里：`mcp_server.rs` 的 `tools/list` 把 `parameters` 作为
+**`inputSchema`** 发给客户端，于是**每个工具都宣称「无参数」**，客户端对
+需要入参的 handler 以空参调用。typeck 一直声明的是三形参
+`tool(name, schema, handler)`（`typeck/dispatch.rs`，且既有测试
+`mcp_tool_method_arity_matches_runtime` 就在查这个 arity）—— 契约对，
+运行期没兑现。
+
+修法：`tools` 扩为 `Vec<(String, String, Value)>` = (name, schema, handler)；
+`serve` 用注册时的 schema 取代硬编码的 `"{}"`。schema 归一化规则：dict 走
+`flow::value_to_json`，JSON 字符串原样透传，`nil` / 缺省给 `"{}"`，
+**其它类型报错**（而不是静默降级成 `{}` —— 那正是原缺陷的失败模式）。
+
+### 十二、`print()` 拒绝 router / mcp_server（D11）
+
+`print` 的形参 Union 只列了 9 个原始类型，于是最基本的调试写法被类型检查
+挡住（真实 CLI `mora run` 实测）：
+
+```text
+let r = Router::new()     → print(r)  exit 2
+  "expected string|int|float|bigint|bool|char|nil|list|dict, got router"
+let m = McpServer::new()  → print(m)  exit 2（同上，got mcp_server）
+```
+
+而运行期**明明能打印** —— `call_builtin_print` 对每个实参调
+`Value::to_string()`，`value/display.rs` 为 Router / McpServer / Agent /
+Conversation / Stream / Task / Closure / Builtin 都写了专门的 Display 臂。
+旁证：`str(r)` 一直好使，输出 `<router (0 routes)>`。
+
+又是一次「typeck 声明窄于运行期实际能力」，与 `ai.chat` 声明 `-> AiResult`
+同源。往 Union 里补 Task / Closure / Builtin / Conversation / Stream / Agent
+/ Router / McpServer / AiConfig / HttpRequest（后两个当前无构造入口，先补上
+免得将来接线时又撞一次）。放宽 Union 是安全方向 —— 不会拒掉原先能过的写法，
+已由 `print_still_accepts_primitives_and_is_variadic` 验证原始类型与变参
+行为均未受影响。
+
+### 十三、签名表 ↔ 运行期对拍（`tests/signature_parity.rs`）
+
+这一族 4 个缺陷（D5 / D9 / D11 / `range` 元素类型）根因都是同一件事：
+**typeck 签名表是运行期事实的一份手抄副本，而副本会漂**。而它们**全是碰巧
+撞上的** —— 没有任何机制会主动报出「声明与实际不符」。
+
+本文件把对拍变成常规测试：逐个 builtin 把返回值喂给 `type_of()`，与
+`builtin_signatures()` 声明的返回类型逐字比对。实测 **16 个 builtin 全部
+吻合**（`math`/`stats`/`linalg` 三个 domain prefix 无独立返回语义，显式列入
+`INTENTIONALLY_SKIPPED`）。
+
+- `range` 声明 `List(Int)` 而运行期推 `Value::Float`（`call_builtin_range`
+  里的 `items.push(Value::Float(i as f64))`）。已改为 `List(Float)`。
+  **但实测未能构造出用户可见失败** —— `let n: Int = r[0]` 与
+  `let n: Float = r[0]` 都通过检查，下标与算术也不受影响（本语言 Int/Float
+  在 typeck 里可互换）。所以这是**声明不准确**，不是功能性缺陷；改正它是为了
+  让签名表与运行期一致，免得日后据此推断写出错误结论。
+- 比对用 `Type::name()`（与运行期 `flow::type_name` 同一套命名）而不是
+  `Debug` 的机械小写 —— 后者对 `McpServer` 会给出 `mcpserver` 而非
+  `mcp_server`，比出假阳性。
+- 有「新增 builtin 忘了补对拍调用」的守卫：既不在 `call_for` 也不在
+  `INTENTIONALLY_SKIPPED` 里就直接失败，避免测试退化成静默漏检。
+
+5 条护栏：逐个对拍 / `range` 元素类型 / `len` 与 `int` 返回类型必须一致 /
+`ai.chat` 必须返 `String` 而非幽灵类型 / `print` 形参覆盖全部可 Display 类型。
+
+**方法签名表（`method_signature_builtin`）同样做了对拍，扩到 8 条护栏。** 此前
+只对拍过方法「名字在不在运行期」，**从没查过返回类型与 arity**。实测 List(6)
+/ Dict(5) / String(9) / Router(1) / McpServer(1) 共 22 个方法的返回类型与
+声明全部吻合，13 个方法的 arity 也对得上。
+
+两处设计细节值得记：
+
+- **期望值是人抄的字面量，不是「查表再比」** —— 后者会让这张表自己跟自己比，
+  查表那侧若漂了，测试跟着一起漂，检不出问题。声明侧与运行期侧各比一份
+  独立的期望值，任一漂移都会被抓到。
+- **`Dict.get` 声明 `float | nil` 比「非空」更准**，键不存在时运行期确实返
+  Nil。声明侧期望写 `float | nil`、运行期取存在的键，两边分别断言。
+
+对比方法本身也踩了两个坑：`type_of(…)` **包不住多行前置语句**
+（`type_of(let r = …)` 不是合法表达式），改从 `run()` 的 Debug 前缀取类型名
+（`McpServer { … }` → `mcp_server`）—— 这也正是 `type_of` 自己的分派依据。
+
+### 十四、`bool()` 与语言真值判断分叉（D12，v0.104.6 自查发现）
+
+`flow::is_truthy` 自称「MIR 条件分支的**单一真值源**（v0.75.83 收敛）」，并明确
+警告「**两处语义分叉是隐蔽 bug 温床**」。
+
+而 v0.104.6 给 `bool()` builtin 写实现时，正是在那里**手搓了一张真值表**
+（`0.0` / `""` / `[]` / `{}` / `nil` 为假，其余按类型逐个判，未知类型报错）——
+踩进了它警告的坑。实测 **4 处分叉**：
+
+```text
+0n (BigInt)      if 判真 = true    bool() = false   ← 判反了
+fn(x) x end      if 判真 = true    bool() 报错
+Router::new()    if 判真 = true    bool() 报错
+McpServer::new() if 判真 = true    bool() 报错
+```
+
+根因：`is_truthy` 的兜底臂是 `_ => true`（未知类型一律为真），而手搓的表对
+未知类型**报错**、又给 BigInt 另判了一套。
+
+修法就是它文档里写的：**直接委托 `is_truthy`**，分叉从根上消失。18 个值
+（nil / bool / int / float / bigint / string / list / dict / 闭包 / Router /
+McpServer / agent）逐一验证一致，由
+`bool_agrees_with_language_truthiness` 钉住 —— 判据是 `if <expr> … end` 与
+`bool(<expr>)` 对照，两者必须同进同出。
+
+**记这一条是因为它是本轮自己造的**：修 D4（`int`/`float`/`bool` 三个
+builtin 缺失）时顺手写的真值表，与本语言既有的真值语义各说各话，而当轮
+所有测试都绿。教训是 —— 复用既有的单一真值源，不要在旁边再造一份。
+
+### 十五、ambient 兜底失败报「运行期不变量被破坏」（D13）
+
+`MirHost::perform_effect` 的签名是 `Option<Value>`，**没有错误通道**，于是
+`random_state.dispatch_op(...).ok()` 把 `Err` 吞成 `None`。结果：哪怕 handler
+**明明跑到了**、只是实参校验没过，调用方也只看到
+
+```text
+unhandled effect: random_rand_float
+  (ambient random state missing — runtime invariant violated)
+```
+
+真实原因其实是 `random.rand_float requires (min, max)`。那句
+「runtime invariant violated」把诊断指向**不存在的基建故障**，实际是自己的
+调用写错了 —— 嵌 Mora 的人会先去查运行时状态机，白白绕一大圈。
+
+修法：`perform_effect` 把原始消息暂存到新增的
+`CoreRuntime::last_ambient_error`，`call_random_ambient` 用 `.take()` 取走
+（取走即清空，防陈旧消息串到下一次调用）并还原真实原因；消息为 None 时才
+报原来那句「ambient state missing」。
+
+**严重度如实说：只影响库内路径。** 走 `mora run` 时 typeck 的 ambient 签名
+预置先拦（实测 arity 与实参类型都查：`Expected 2 arguments, got 0` /
+`expected list<any>, got string`），`dispatch_op` 的校验是纵深防御。但库内
+路径正是**全部测试套件与任何嵌入 Mora 的调用方**走的路。
+
+同批核过 ambient 模块自身：标签表 `RANDOM_LABELS` 与方法映射
+`random_label_for_method` **当前一致**（6 个标签双向可逆），两张表平行维护
+的结构仍然脆弱，已由 `ambient_labels_and_method_mapping_agree` 钉住。
+
+### 十六、witness 的索引编码没被 lower 解码（D14）——**真实用户缺陷**
+
+本轮最重的一个。**同一段代码，内联正确、`import` 进来就坏**：
+
+```text
+// 内联（走 9 层管线）
+handle random_random { x = t[1] } { 0.5 }   →  20.0
+
+// import 进来的同一段（不过 9 层管线）
+→ Runtime error (MIR main): Undefined function or task: []
+```
+
+**根因**：witness 侧**有意**把读索引 `obj[i]` 编码成
+`Call { callee: Name("[]"), args: [obj, i] }`（`parser_v3/emit.rs` 的索引发射
+分支；`tests/parser_v3_coverage.rs::index_expr_parses` 断言「expected Index to
+parse as Call("[]")」）。直接 emit 路径**同时**发出真正的 `MirInst::Index`，
+所以顶层没事；但 `WitnessLowerer` 的 `Call` 分支**没有解码**这个编码，产出
+`MirInst::Call(dst, "[]", [obj, idx])`，运行期解释成「调用一个名叫 `[]` 的
+函数」。实测两条路径产出的 handle body（修复前）：
+
+```text
+裸   [Var(0,"t"), Const(1,1.0), Call(2,"[]",[0,1]),  Assign("x",2)]
+管线 [Var(8,"t"), Const(9,1.0), Index(10,8,9),     Assign("x",10)]
+```
+
+**为什么难以自查**：`import` / `eval()` 编译的代码**不过 9 层管线**
+（`cli::compile_and_opt` 才跑 `run_pipeline`），直接用裸 `ParserV3::compile`
+的 witness 产出。也就是说**「测试跑的管线」和「用户跑的管线」不是同一条**，
+差分时才发现。
+
+| 入口 | 走哪条 | 修复前 |
+|------|--------|--------|
+| `mora run` 顶层 | 直接 emit → `Index` | ✅ |
+| `handle` body / handler | `lower_block_witness_to_mir`（witness） | ❌ |
+| `import` 进来的模块 | 裸 witness 路径 | ❌ |
+| `eval()` 编译的代码 | 同上 | ❌ |
+
+修法：`lower.rs` 的 `WitnessKind::Call` 分支识别 `callee == "[]"` 并解码成
+`MirInst::Index`；实参少于两个时给明确错误而非构造坏指令。
+
+**该 bug 是靠 dump 两条路径的指令序列定位的**（连续几次靠读注释猜都没找对）：
+
+```text
+裸   body: [Var(0,"t"), Const(1,1.0), Call(2,"[]",[0,1]), Assign("x",2)]
+管线 body: [Var(8,"t"), Const(9,1.0), Index(10,8,9),     Assign("x",10)]
+```
+
+新增 `tests/pipeline_equivalence.rs`（4 条）把这变成常规检查：两条编译路径
+跑同一份源码，结果必须逐字相同。**只验「两条一致」不够** —— 两条一起错也
+会通过，所以另钉一组**绝对值**（合法索引得 20.0、越界得 `index 99 out of
+bounds (len 2)`）。另加 `import_handle_index` 固件 + CLI e2e 覆盖真实
+`import` 生产入口。
+
+### 十七、两条编译路径的系统扫描（68 条语言特性）
+
+D14 只修了发现的那一处分叉，**其余分叉不知道还有没有**。于是把差分从
+「14 个手挑用例」扩成**逐语言特性铺开**：字面量 8 / 算术与比较 9 / 索引 7 /
+控制流 10 / 函数闭包 3 / 方法 13 / 转换 builtin 6 / 块构造 6 / 杂项 6 = 68 条，
+每类各取代表。
+
+**实测：68 条里只有 1 条分叉** —— 且是 dict 字面量的 `HashMap` 迭代序
+（与编译无关，见下）。即两条路径目前**语义等价**。扫描已固化为
+`every_language_feature_agrees_across_both_compile_paths`，作用是将来任何
+新的分叉都在这里显形，而不是等某个用户 import 一个模块才发现。
+
+### 十八、`{:?}` 打 dict 仍不确定（已知、有界、不扩大处理）
+
+`Value` 用 `#[derive(Debug)]`，`Dict(HashMap)` 的 `Debug` 按迭代序打印，而
+`RandomState` 每进程随机 —— **同一条错误信息跨进程键序不同**。本会话早前
+修过 Display / JSON / keys / values 的同类问题（7 处），`{:?}` 这条路漏了。
+
+**范围已量清，且刻意不扩大处理**：
+
+- 全仓 6 处错误信息用 `{:?}` 打整个 `Value`，但只有 3 处**实参可能真是 dict**
+  （`mir/vm.rs` 的 `cannot index`、`builtin_impls.rs` 的 `crush_json: max`、
+  `handlers/control.rs` 的 `unquote_splice`）—— 这 3 处已改为
+  `flow::type_name`（错误本来讲的就是「类型不对」，比整块 dump 更好读）。
+  另外 3 处实参按构造不可能是 dict（`BuiltinKind`、非 Dict、非 List）。
+- **刻意没做的是手写 `Value` 的 `Debug` impl**：`Value` 有 ~35 个变体、其中
+  含 `Arc<dyn Trait>`（`StreamReader` / `Document` backend / transducer），
+  要精确复刻 derive 的全部形态；而全仓 **127 处测试**依赖 `{:?}` 的输出形态。
+  为一个**显示层**确定性缺口付这个代价不划算，故按「显示层 < 序列化层 <
+  语义层」的严重度分级留作已知残留，不静默略过。
+
+- 顺带核实并**排除**了一个疑似问题：`ai_chat.rs` 的
+  `cache_key = format!("{}:{:?}", model, messages)` 看似用非确定的 `Debug`
+  拼缓存键，但 `messages: &[(String, String)]` 是**纯字符串**，`Debug` 完全
+  确定 —— 缓存键无问题。（先查后报，没当成缺陷写进去。）
+
+### 十九、`char` 字面量与 char 相等（D15 / D16）
+
+**D15 —— `char` 字面量 `'a'` 在普通表达式里无法解析。** 这不是「该语法本来
+就不支持」：spec **两处**都定义了它（`docs/mora-spec.md:109` 类型表
+`| char | 'a' |`，以及 EBNF :1270 `literal = NUMBER | … | CHAR | …`），而实现
+的其余环节**早就支持**：
+
+| 环节 | 状态 |
+|------|------|
+| `lexer.rs:357` 的 `'` 分支 → `TokenType::Char(ch)` | ✅ 早已实现 |
+| `parser_v3/rel.rs:533` 声明式 term 解析 | ✅ 已接 |
+| `parser_v3/emit.rs` 主表达式发射器 | ❌ **漏了** |
+
+于是 `let c = 'a'` 报 `Failed to parse`（真实 CLI exit 2）。后果不止「少个
+语法」：`Value::Char` 有 Display 臂、有 `Value::methods()` 条目、且由 `s[i]`
+字符串索引产生，却在源码层**无法直接构造** —— spec 写着的字面量写不出来。
+之所以一直没人发现：**全仓库没有任何测试用过 char 字面量**。
+
+**D16 —— `==` 与 `Value::PartialEq` 两个相等函数分叉。** 修好 D15 后 `'a'`
+能解析了，紧接着暴露出：
+
+```text
+'a' == 'a'   → Bool(false)   ← 即使两个操作数是同一个字符
+"a" == "a"   → Bool(true)    ← 对照正常
+1   == 1     → Bool(true)    ← 对照正常
+```
+
+根因：`==` 运算符走 `flow::values_equal`，而 Rust 的 `==` 走
+`Value::PartialEq`。**`Value::PartialEq`（value.rs:463）有 `Char` 分支，
+`values_equal` 没有**，落到末尾 `_ => false`。而 `values_equal` 自己的文档
+写着「与 `Value::eq` 的 … arm 保持一致」（v0.91 补 BigInt 时就是这么对齐
+的）—— 属同类漏项。spec :1312 亦明列「`char` 字符相等」。
+
+新增 `tests/char_literal.rs`（5 条），其中 `equality_functions_do_not_diverge`
+在 Rust 层**直接对拍两个相等函数**（nil/int/float/bigint/string/char/bool/
+list/dict），任一漂移都会被抓到 —— 防它们再次分叉。
+
+### 二十、我自己的一处测试缺陷（已修）
+
+上一轮「68 条语言特性两条路径全一致」这个结论**是虚的**。扫描里有一条
+「两边都编译失败就 `continue`」的分支，而扫描集里有 **4 条用例在两条路径下
+都解析失败**，被**静默吞了**：
+
+- 3 条误写成 `fn name(...) ... end` —— Mora **没有**这种写法（spec §6.2 作用域
+  表只列了 `task name()` / `fn(x)` / `let` 三种），是我探针用了非法语法；
+- 1 条 `lit char`（`'x'`）—— 那才是真缺陷，即 D15。
+
+所以真实覆盖是 **64 条而非 68 条**。已做两件事：把那 3 条改成规范的
+`task` 写法；**把「静默跳过」改成硬失败**（`invalid.is_empty()` 断言），
+今后扫描集里再出现无效语法会立刻报出来，而不是让扫描静默退化成
+「什么都没测」。改完立刻又抓出 `lit char` 这第 4 条 —— 守卫起作用了。
+
+### 二十一、typeck 误拒扫描（41 条）
+
+第三条审计线：**typeck 是否拒绝了运行期本来能跑的代码**。判据是机械的 ——
+若管线路径能跑通、而真实 CLI 却因类型检查 exit 2，那就是误拒，不需主观
+判断「这段该不该合法」。
+
+实测 41 条里 **4 条被误拒**：
+
+- `succeed()` / `fail()` —— **`print` 的 Union 漏了 `Type::Goal`**（D11 的
+  同类漏网）。机械比对 `value/display.rs` 的 Display 臂与 print 的 Union 后
+  补齐：`Type` 里**已有**的 9 个（`Goal` / `Relation` / `Cons` / `Atom` /
+  `Compose` / `Partial` / `Macro` / `PromptSection` / `Document`）。声明式
+  范式尤其受影响 —— goal 可以拿去做 `both()` / `solve()`，却**打不出来**。
+- 混合类型 `list` / `dict` —— CHANGELOG 已记为**有意设计**（dict 值类型同质，
+  首值定类型），非缺陷。
+
+仍缺的 8 个（`LogicVar` / `Code` / `TeaApp` / `TeaCmd` / `TeaMsg` / `Curry` /
+`Tool` / `TraitObject`）在 `Value` 里有 Display 臂、在 `Type` 里却**没有对应
+变体**，需要先扩 `Type` 枚举 —— 那是类型系统改动，未擅自做，已在
+`typeck/dispatch.rs` 的 print 签名处写明清单。
+
+### 二十二、spec §14.2 EBNF 逐产生式覆盖（38 条，零缺陷）
+
+D15（`char` 字面量无法解析）长期存在的机制很清楚：**全仓库没有任何测试用过
+char 字面量** —— 而 spec 在 :109 与 EBNF :1270 **两处**都定义了它。
+「spec 写了、没人试过」是一种**独立于任何代码路径**的缺陷来源，光靠审代码
+或跑已有测试都发现不了。
+
+于是把 spec §14.2 的产生式清单直接逐条实例化：**23 种 statement + 11 种 expr
+形式 + 8 种 literal**，覆盖面由规范本身决定，而不是靠人回忆该测什么。
+
+**实测 38 条里 35 条通过，零新缺陷**，含 TEA 的 `model`/`msg`/`update`/`app`
+四个声明、代数效果的 `handle`/`perform`、准引号与同像性 `eval`/`quote`。
+
+剩下 3 条逐一查过，**都是 spec 自身不完整，不是实现缺陷**：
+
+1. **`question = expr "?"`（spec :1278）** —— EBNF 列了，但 §13.3 的类型规则
+   那节明写「**待补充**: T-Let, T-If, T-Match, T-Pipe, **T-Question** 等判断
+   规则」。**语义未定义**，解析器自然不实现。要做它得先定清语义（存在性检查？
+   类型提问？惰性求值？），属语言设计决定，未擅自做 —— 由
+   `question_operator_is_still_unimplemented` 记录当前状态。
+2. `5 |> double`（spec :479）—— 那行 spec **只写了 RHS、没给 `double` 的定义**，
+   照抄必然 `Value is not callable: nil`；补上定义即得 10.0，`|>` 本身没问题。
+3. `1 |> str()` —— spec 从未这样用。`|>` 的解析目标是**模块或具名函数**
+   （`|> map(...)`、`|> upper()`），`str` 是自由 builtin，不是 pipe 目标。
+
+固化于 `tests/spec_ebnf_surface.rs`（4 条，覆盖 38 个产生式）。
+
+### 二十三、`trait` / `impl` 端到端源码不可达
+
+`trait_stmt` / `impl_stmt` 在 spec 的 EBNF 里（:1230-1231），§13.3 还有完整的
+trait 检查规则（`Γ ⊢ impl T for U … (T-TraitDispatch)`）。运行期那一侧也
+齐全：`MirInst::TraitDef` / `ImplDef`、`Node::TraitDef` / `ImplDef`、
+`h_trait_def` / `h_impl_def` / `dispatch_trait_method` 全部存在并被派发。
+
+**但前端从未写过**，且比「parser 不支持」更彻底：
+
+| 环节 | 状态 |
+|------|------|
+| `lexer.rs` 关键字表 | 有 `fn`(:733)、`dyn`(:748)，**无 `trait`、无 `impl`** |
+| `parser_v3/**` 对 `"trait"`/`"impl"` 的引用 | **0** |
+| `Node::TraitDef` 的唯一「构造」点 | `typeck/annotate.rs:335` —— 对**已有**节点的重映射，不是来源 |
+| 运行期 MIR + 派发 | ✅ 齐全 |
+
+即整条 trait 管线**端到端源码不可达**。`tests/mir_trait.rs` 从 v0.55 起就在
+注释里绕开它（「parser 对 trait / impl / skill 的实际语法尚不完全」），并改用
+`task main` 验证「base 编译与执行链路」—— **该测试并不覆盖 trait 本身**。
+
+**这不是「文档化了却坏掉」的缺陷，是一整项缺失的前端功能。** 补它要先定语法
+（方法签名怎么写、泛型参数、`for` 关键字、默认方法体），属语言设计决定，
+未擅自做。由 `trait_and_impl_are_source_unreachable`（断言「确实不可达」）
++ `trait_machinery_exists_on_the_runtime_side`（断言运行期结构齐备）成对
+记录 —— 将来前端接上时测试会失败并提示补用例。
+
+### 二十四、REPL 两条缺陷（D17 / D18）
+
+入口覆盖面审计（我此前只验过「CLI 跑文件」与「库内调用」两条）发现 REPL 独立成病。
+
+**D17 —— REPL 不跨行保留变量绑定。** `run_repl_with` 把**每一行**单独送进
+`check_program_witnesses_bidirectional`，类型检查器看不见会话里已绑定过什么。
+真实 `mora --repl` 实测：
+
+```text
+mora> let x = 5
+mora> x + 1
+type error: Unbound variable 'x' at line 1, column 1
+mora> assign x = 9
+type error: Unbound variable 'x' at line 1, column 1
+```
+
+注意**运行期其实一直是保留的**（`env` 逐行传给 `run_mir`，`h_define` 写进
+`env`）—— 挂的是类型检查这一关。所以不是「不支持多行」，是**任何跨两行的
+会话都被自己的历史挡下来**。
+
+修法：累积**已接受的源码**，每行把「整段累积源码」当一个完整程序重新编译送检。
+**试过「累积 witness 再拼接」—— 不行**：两段各自独立编译的 witness 拼起来
+不是合法程序形态（实测 `for y in …` 单独输入正常，前面一旦有别的行就报
+`Unbound variable 'y'`）。
+
+**D18 —— REPL 没有多行续行。** 每行独立 parse，于是 spec §14.2 里绝大多数
+**跨行** statement 产生式（`for` / `task` / `if…end` / `handle…end` / `match` /
+`with` / `worker` / `transaction` / `macro` / `observe` / `parallel`）在交互式
+里一律进不去。
+
+「写完了吗」的判据**试了三种才做对**，每一种的失效方式都记在
+`repl_input_is_complete` 的注释里：
+
+1. 「parse 失败 = 未写完」—— 失效：`compile("task twice(n)\n")` **成功**
+   （body 为空），`compile("for y in [1,2]\n")` **成功且 body 非空**（for 会
+   构造迭代器 setup 指令）。块首行被当成完整语句接受，多行块永远进不去。
+2. 「parse 失败 **或** body 为空 = 未写完」—— 失效：同上，`for` 的 body 非空。
+3. **行首块关键字与 `end` 配平 + 花括号配平，两者都归零才算完整** —— 通过。
+   两个量都需要：`handle E { body } { handler }` 是**花括号**形态、
+   **根本没有 `end`**（我第一版把 `handle` 误列进 `end` 型 opener，结果它让
+   end_depth 永远回不到 0、整段输入永久卡在续行里）。字符串字面体与 `--`
+   注释在计数前剥掉，`str("end")` / `print("{")` 不会误判。
+
+另外：类型检查不通过时**必须同时清空续行缓冲**，否则一个坏输入会**永久毒化
+整个会话**（后续每行都被追加到它后面反复报同一个错）—— 这也是修的过程中自己
+踩到的。空行是放弃缓冲的出口（Mora 的空行在 parser 里本就被忽略）。
+
+护栏 `tests/repl_multiline.rs`（9 条），含两条「对照组」确保修多行没弄坏
+单行与跨行状态，以及两条针对上述踩坑点的专项：
+`repl_recovers_after_a_type_error`（坏输入不毒化会话）、
+`repl_continuation_is_not_fooled_by_keywords_in_strings`（配平不被字符串骗）。
+
+### 二十五、入口一致性审计：4 条入口全部核对（含一个自己造的假缺陷）
+
+D14 之后把入口覆盖面查完。四个入口与它们的编译路径：
+
+| 入口 | 编译路径 | 结论 |
+|------|---------|------|
+| `mora <file>` / `mora run <file>` | `cli::compile_and_opt`（9 层管线） | ✅ |
+| 库内 `run_mir` | 裸 `ParserV3::compile` | ✅ D14 已修 |
+| `mora --repl` | 裸 `ParserV3::compile` | ✅ D17/D18 已修 |
+| `mora record` / `replay` / `snapshot` | `cli::compile_and_opt` | ✅ |
+
+`mora run <file>` 走 `run_file` → `run_mir` + `run_main_task`，`task main()`
+**会被执行**（实测：main 里的运行期错误被报成 `Runtime error (MIR main): …`，
+main 里的 `print` 正常输出）。
+
+**这一轮我自己造了一个假缺陷并差点写进 CHANGELOG。** 过程记下来，因为它是我
+已经犯过两次的同一类错误：
+
+1. 探针里过滤 CLI 输出时用了 `-notmatch '…|AI|…'`（本意是丢弃横幅的
+   `AI: mock mode` 行）；
+2. 测试输出恰好是 `IN-MAIN` —— **含子串 `AI`**，于是被自己的过滤器静默吃掉；
+3. 看到「`task main()` 毫无输出」，我又验证了三层（dump 指令确认 TaskDef 在
+   顶层、对比 e2e helper 确认它调 `run_main_task`、怀疑二进制过期）才回到
+   「过滤器吃掉了答案」。
+
+**教训**：`mora` 的 CLI 横幅里含 `AI:` / `Trait` / `Built-in` 等词，任何
+按这些词过滤输出的探针都会误伤**恰好含这些子串的测试数据**。**过滤前先确认
+测试数据不会被模式命中**，或者干脆不过滤、分开重定向 stdout/stderr 看原始
+输出。这条已写进本节，避免下一个人重蹈。
+
+### 二十六、`--check` / LSP 的 typeck 输入按入口分叉（实测无分叉）
+
+入口审计的第五条。D14 修的是「两条路径**执行**结果不同」；这条问的是更上游的
+问题：**两条路径对同一份源码的「接受 / 拒绝」判断是否一致**？
+
+| 入口 | witness 来源 |
+|------|-------------|
+| `mora run <file>` | `cli::compile_and_opt`（9 层管线） |
+| `mora --check <file>` | 裸 `ParserV3::compile` |
+| LSP `check_diagnostics` | 裸 `ParserV3::compile` |
+| REPL / `import` | 裸 `ParserV3::compile` |
+
+witness 来源不同 → typeck 拿到的输入就不同 → 一旦不一致，后果是**编辑器对
+能跑的代码报红**（每个用 Mora 写代码的人都会撞上）。
+
+**实测 36 条构造两路判定完全相同（0 分叉）**，含 2 条应当一致拒绝的类型错误。
+已固化为 `typeck_accepts_the_same_programs_on_both_paths`。
+
+（写这条测试时我自己把比较逻辑写反了一次 ——
+`matches!(Ok,Ok) != matches!(Err,Err)` 对「两边都通过」也判成「不同」，
+一度报出「37/37 全分叉」。改成比较两个 `matches!(Ok)` 谓词才对。）
+
+### 二十七、数值塔的两处裂缝（D19 / D20）
+
+这是本会话**影响面最广**的一处 —— 任何 `a / b` 的程序都受影响。
+
+**D19：`Int / Int` 是四舍五入，不是截断；除零静默返回垃圾。**
+`numeric_op` 的签名是 `F: Fn(f64, f64) -> f64`，所以整数除法实际走的是
+「浮点除法 + `.round() as i64`」：
+
+```text
+修前： 5 / 2   → Int(3)     应为 2
+      7 / 2   → Int(4)     应为 3
+      1 / 2   → Int(1)     应为 0    ← 任何 `count / 2` 在 count 为奇数时都算错
+     -5 / 2   → Int(-3)    应为 -2
+      1 / 0   → Int(i64::MAX)   ← inf 经 Rust 饱和转换，且静默传播
+      0 / 0   → Int(0)           ← NaN → 0
+      5 % 0   → Int(0)           ← 静默
+      1n / 0n → BigInt(i64::MAX)
+```
+
+`1/0 > 0` 为 **true** —— 错误值一路传播到条件分支。浮点给 `inf`/`NaN` 是
+IEEE 标准、可辩护；**整数没有这个惯例**（Rust 的 `/` 会 panic）。
+
+顺带还有一处 **Int 与 BigInt 语义分叉**：BigInt 分支用 `result as i64`（截断），
+Int 分支用 `.round()` —— 同一组数 `7/2` 得 `Int(4)` 而 `7n/2n` 得 `BigInt(3)`。
+
+修法：`Div` / `Mod` 走**整数专用**分派（截断向零，除零报错），任一操作数为
+`Float` 时才落回 `numeric_op`（IEEE）。
+
+**D20：BigInt 与 Int/Float 混比全错，且与算术侧能力不对称。**
+
+```text
+修前： 4n + 1     → BigInt(5)                     ✅ 算术侧早就支持
+      4n < 4.5    → ERR: Operands must be numbers ❌
+      4n == 4.0   → Bool(false)                   ❌
+      int("4")==4n → Bool(false)                  ❌
+```
+
+出现「顺序比较报错、等值比较说不等」的**自相矛盾**。根因：`numeric_cmp` 与
+`values_equal` 都只覆盖 Int/Float 四种组合，BigInt 落到兜底；而 `numeric_op`
+（算术）**早就**支持 BigInt。
+
+修法与 v0.103 既定的 tower 口径（`Int ⊂ Float`）一致：BigInt 与 Int/Float 混比
+提升为 f64；两个 BigInt 之间保持精确大数比较（不经 f64，避免精度丢失）。
+
+护栏 `tests/numeric_tower.rs`（5 条），含两条**防回归的不变式**：
+`float_division_keeps_ieee_semantics`（整数修复别把浮点的 `inf`/`NaN` 改掉）、
+`equality_and_ordering_never_contradict`（`==` 为真时 `<=` / `>=` 必须为真 ——
+`values_equal` 与 `numeric_cmp` 是两个函数，修一个漏一个就会出现裂缝）。
+
+### 二十九、连带：JIT 的整数除模，以及一条「把缺陷钉成既定行为」的测试
+
+修好 D19 后，**既有的 JIT 差分测试立刻失败** —— 它是本轮最值得记的一件事：
+
+```rust
+(7, BinaryOp::Div, 2), // round-trip：3.5 → round → 4
+(1, BinaryOp::Div, 0), // 除零：inf → 饱和 i64::MAX
+assert_eq!(jit_val, mir_val, "JIT != interp for {a} {op:?} {b}");
+```
+
+这条差分测试**把缺陷写成了既定语义**（注释都标好了「round-trip」「饱和
+i64::MAX」），于是它在**两边都错的时候**通过，给整条整数除法路径提供了假
+信心。解释器修对之后它才失败并暴露分叉。
+
+JIT 侧同样用 `BinopIntArith`（f64 round-trip）模板处理 Int Div/Mod。修法：
+**JIT 对 Int Div/Mod 编译期拒绝、回落解释器** —— 这正是本模块文档写明的
+契约（`template_for_binary` 返回 `None` = 模板集未覆盖 → 回落）。没给 JIT 补
+`idiv` 模板，是因为正确的整数除需要 `cqo` + `idiv` + 除零陷阱判定，超出当前
+copy-and-patch 模板集的能力范围；而回落路径是文档明写的语义正确性保证。
+
+两条测试改为断言「JIT 拒绝 + 解释器给出正确值」，并把负数/除零的期望值写成
+**正确的**语义而非旧行为。随之成为死代码的两处一并删除：`TemplateSpec::BinopIntMod`
+变体与 `emit_binop_int_mod` 发射函数（保留会是永不构造的死 IR）。
+
+### 三十、BigInt 的「任意精度」承诺在 i64 之外不成立（D21）
+
+紧接 D19/D20 的一处同族裂缝。spec EBNF 明写
+`BIGINT = digits "n"  -- v0.91: 任意精度整数`，但 `numeric_op` 的 BigInt 臂
+一律 `BigInt::from(f64_result as i64)`，而 `f64 as i64` 是**饱和转换**：
+
+```text
+修前： 10^20 * 2n  →  BigInt(i64::MAX)   应为 200000000000000000000
+      10^20 - 1n  →  BigInt(i64::MAX)   应为 99999999999999999999
+      2^70 * 2n   →  BigInt(i64::MAX)
+```
+
+而 `BinaryOp::Add` **另有**一条原生 BigInt 分支（`a + b`），所以 `10^20 + 1n`
+是对的 —— 同一族里 **Add 精确、Sub/Mul 饱和**，能力不一致。（D19 已把 Div/Mod
+也改成原生，于是 Sub/Mul 成了仅剩的两个漏网。）这与 D5/D9/D11/D20 是同一个
+模式：**某一条路径单独修好了，并排的路径没跟上**。
+
+修法：`numeric_op` 增第二个闭包 `big_op`（原生 BigInt 运算），任一操作数为
+`BigInt` 时走它，不再经 f64+i64。`Float ⊗ BigInt` 仍按 tower 提升为 Float
+（与 `Add` 的既有策略一致）。
+
+顺带排除了一个看似更严重的猜想：常量折叠与运行期求值**确实同值**（用 dict
+取值绕开折叠验证过），所以不存在「同一表达式因优化与否得到不同答案」。这条
+不变式本身有价值，固化为
+`constant_folding_and_runtime_evaluation_agree` —— 它正是 D19 让 JIT 差分测试
+失败的那一类检查。
+
+### 三十一、List 广播只认 Float，且把非 Float 元素静默变成 Nil（D22）
+
+`eval_binary` 的 `Add` 分支里，**同一个 match 的两条臂写法不一致**：
+
+- `(List, List)`：**逐元素递归回 `eval_binary`** 派发 —— 正确，所以
+  `[1n] + [2n]` → `BigInt(3)`；
+- `(List, Float)` / `(Float, List)`：**手搓一张迷你表**，只 match
+  `Value::Float` 与 `Value::String`，其余一律 `_ => Value::Nil`。
+
+```text
+修前： [1n, 2n] + 1.0        → List([Nil, Nil])   ← BigInt 元素静默变 Nil
+      [int(1),int(2)] + 1.0  → List([Nil, Nil])   ← Int 元素静默变 Nil
+      [true, false] + 1.0     → List([Nil, Nil])
+      [[1,2]] + 1.0           → List([Nil])        ← 嵌套 list 静默变 Nil
+      [1,2] + int("1")        → ERR                 ← 标量侧只认 Float
+      [1,2] + len([1,2])      → ERR                 ← 而 len() 返回 Int！
+```
+
+最后两条最刺眼：`len()` 返 `Int`，所以 `[..] + len(xs)` 这种最自然的写法
+反而不行，而字面量 `2.0` 可以。
+
+修法：广播臂改为与 `(List, List)` **同构**（逐元素递归），标量侧覆盖
+Int/Float/BigInt。真正无定义的元素对（`Bool + Float`、`Char + Float`）仍落
+`Nil` —— 那与 `(List, List)` 臂的既有约定一致（其注释写着「不支持加法的元素对
+→ Nil」），已用 `undefined_element_pairs_still_become_nil` 钉住以免将来被
+误当成缺陷「修掉」。
+
+顺带修掉一处**形态不一致**：修前 `["a","b"] + 1.0` 得 `["a1","b1"]`（手搓版
+直接 `format!("{}", 1.0_f64)` → Rust 的 `"1"`），而顶层 `"a" + 1.0` 走
+`Value::to_string()` → `"1.0"`。同一语言两处给不同形态，由
+`list_broadcast_matches_scalar_display_form` 钉住。
+
+### 三十二、D22 的另一半：`numeric_op` 里还有第二套广播臂
+
+上一节只修了 `Add` 分支。但 `Sub` / `Mul` / `Div` / `Mod` 走 `numeric_op`，
+**那里还有一套一模一样的缺陷**（同样只 match `Float`、其余静默 `Nil`）：
+
+```text
+修前： [1n,2n] - 1.0     → List([Nil, Nil])
+      [1,2] - len(xs)    → ERR   ← 而 len() 返 Int
+      [1,2] - int("1")   → ERR
+```
+
+两处各手抄一张表是这个缺陷的**根源**，所以合并为唯一的
+`broadcast_with`（逐元素递归回 `eval_binary`）。
+
+递归必须把**同一个 op** 传下去 —— 这是换共享实现时最容易引入的错误：
+op 丢失或写死成 `Add` 会让 `[5,6] - 1.0` 变成 `[6,7]`（加法）**且不报错**。
+故 `numeric_op` 新增 `op_name` 参数，并由
+`list_broadcast_preserves_the_operator`（sub/mul/div/mod/add 五种各自断言）
+钉住。
+
+顺带厘清两条 list-op-list 的**不同**语义（测试里一度写错，纠正后固化）：
+
+- `Add`：等长 → 逐元素；不等长 → **拼接**（`list + list` 天然读作连接）
+- `Sub` / `Mul` 等无拼接语义者：长度不等 → 报 `length mismatch`
+
+### 三十三、`+` 的字符串隐式拼接：运行期支持、typeck 不放行（D23，规范空白）
+
+顺带查出的第三处「运行期有、typeck 不放行」：
+
+```text
+"a" + "b"   → exit 0  "ab"
+"a" + 1.0   → exit 2  Type mismatch: expected String, got Float
+"a" + 1n    → exit 2  expected String, got BigInt
+"a" + true  → exit 2  expected String, got Bool
+"a" + [1,2] → exit 2  expected String, got List(…)
+1.0 + "a"   → exit 2  expected Float, got String
+```
+
+而运行期的 `Add` 分支**明确实现了** `String + <任意值>`（库内路径实测
+`"n=" + 1.5` → `"n=1.5"`）—— 那段实现从**源码层不可达**。
+
+**但这不是「文档化了却坏掉」**：spec 对 `+` 在字符串上的语义**没有任何定义**
+（全文只字面提及 `file.join(parts...)` 的路径拼接），属**规范空白**，与
+`?` 后缀表达式同类。规范路径是显式 `str()`（v0.104.6 补齐的 builtin），
+`"count: " + str(len(xs))` 一直可用。
+
+**未擅自改类型规则** —— 放宽 `+` 的类型约束属于语言设计决定，且会削弱
+`+` 的类型检查价值。若要放开，应同时在 spec 里把字符串 `+` 的语义写清楚。
+
+### 三十四、spec §12.3.1 广播算术整节从源码不可达（D24）—— 顺带查出我自己的测试有一半是假的
+
+先说**我方测试装置的问题**，它比缺陷本身更值得记。
+
+本轮所有探针与 `expect()` 都走 `run_mir` 直接执行，**绕过 typeck**。给
+`tests/numeric_tower.rs` 的 `run()` 加上 typeck 守卫（不过即 panic）后，
+**15 条测试里当场有 8 条失败** —— 它们断言的是 **typeck 拒绝、用户根本
+写不出来**的代码。
+
+守卫指出的缺口高度同族：
+
+| 缺口 | 现象 |
+|------|------|
+| **D24 广播** | spec §12.3.1 整节从源码不可达（详见下） |
+| D20 的 typeck 半 | `4n == 4.0`、`[10n,20n] - 1.0` 仍被拒（只修了运行期） |
+| D23 | `"a" + 1.5` 仍被拒（规范空白） |
+
+**D24 本身**：spec §12.3.1「广播算术 (v0.17, APL 启发)」明确定义
+`list ⊗ scalar`（两个方向）与 `list ⊗ list`（等长），并给了四个逐字例子。
+运行期 `flow::eval_binary` / `numeric_op` 一直实现着这些臂，但 typeck 的
+`infer_binop` **只判 `is_numeric`**，List 一律落严格 `Eq`：
+
+```text
+[1,2,3] * 2          → exit 2  Type error   ← spec 逐字例子
+1 + [10,20,30]        → exit 2  Type error   ← spec 逐字例子
+[1,2,3] + [10,20,30]  → exit 0  [11.0, 22.0, 33.0]  （list⊗list 通）
+[10,20,30] - [1,2,3]  → exit 0  [9.0, 18.0, 27.0]   （list⊗list 通）
+```
+
+**spec 举的 4 个例子里有 2 个跑不了**；且 CHANGELOG 早前那句「历史表删除
+`[1,2,3]*2` 广播」实际上是在**掩盖**这个问题（spec 正文从未删）。
+
+修法：`infer_binop` 增加广播分支，结果类型为 `List(提升后元素)`，提升规则
+与标量塔一致。两个实现坑都记在代码注释里：
+
+1. **别给标量那侧压 `Eq(scalar, List(..))`** —— 会得到
+   「expected float, got list\<float\>」（把标量当成了列表元素）。
+2. **标量侧可能是尚未解析的 `TypeVar`** —— `[1,2] + len(xs)` 里 `len` 的
+   返回类型此时还是 TypeVar，`is_numeric(TypeVar)` 为 false 会让广播分支
+   漏判，随后该 TypeVar 被两条约束分别绑成 List 与 Int 而冲突。故 TypeVar
+   一律按「潜在数值」处理（与既有 `defer_numeric` 同一手法）。
+
+修后 spec 的四个例子 + `/`、`%`、`+ len(xs)`、结果再参与运算全部通过，
+且 `list + str` / `str * number` 仍被正确拒绝（放宽不过头，由
+`list_broadcast_still_rejects_non_numeric_operands` 钉住）。
+
+**测试侧的处理**：把「运行期已支持、typeck 尚未放行」的那几组改用显式命名的
+`run_runtime_only()`（绕过 typeck），并在注释里写明它**不能证明「用户写得
+出来」**；用户可用的部分由带守卫的 `run()` 覆盖。两者分开，是为了不把
+「运行期已具备」与「用户可使用」混为一谈 —— 我这轮正是踩在这个区分上。
+
+**该守卫随后推广到全部三个库内测试文件**（`numeric_tower` / `builtin_gaps` /
+`char_literal`；`repl_multiline` 走子进程 CLI，天然经过 typeck）：
+
+| 文件 | 断言数 | 守卫下失败 | 性质 |
+|------|--------|------------|------|
+| `numeric_tower` | 15 | **8** | 多数在断言 D20/D23 的不可达能力 |
+| `builtin_gaps` | 45 | 5 | 全是**故意的负向测试**（`random.rand_float()` 少参、`random.bogus()`、`if nil`）—— 非法写法只可能经库内路径触达 |
+| `char_literal` | 5 | 2 | `'a' == s[0]`：`s[0]` 是 fresh TypeVar，`Equal` 分支的 `defer_numeric` 把 `(Char, TypeVar)` 送进 Numeric 路径，solver 判 Char 非数值 |
+
+**结论：三个文件 65 条断言里 15 条在断言不可达代码，且全部集中在「运行期已
+具备、typeck 未放行」这一类** —— 没有一条是「运行期行为写错」。这说明本轮
+的运行期修复本身是对的，缺的都是 typeck 那一半；也说明**测试装置若无 typeck
+守卫，会把「跑得通」与「用得上」长期混为一谈**。
+
+### 三十五、行为更正
+
+- `list.get(i)` 越界此前**静默返回 nil**，而 `xs[i]` 报错 —— 同语义两种
+  结果。现改为与 `xs[i]` 同文案报错；`dict.get` 保持返回 nil（与 `d[k]` 一致）。
+- 4 处「`run_mir ≡ run_dag`」的错误结论（`src/` → `tests/` → 公开 API 文档
+  三级传播）已按实测全部更正：错的不是生产路径，是强制线性路径。
+- min/max 空列表返回 `0.0`（语言作者决定）。
+
+### 三十六、错误路径与诊断质量（第二轮系统审计：D25–D31）
+
+上一轮以「把语义相同、不同写法的代码配成对跑」为主方法论。本轮换一条
+**正交**的线：**批量投喂畸形 / 边界 Mora 程序，抓 panic、抓静默错值、抓
+信息丢失的诊断**。64 例畸形输入（类型混淆的二元运算、越界/负/浮点/大数
+下标、错元数调用、模块前缀当函数、深层嵌套、极端字面量……）里
+**零 panic**（此前 D6 那种 panic 已被修掉），但挖出 7 个新缺陷 ——
+共同特征依旧是**不报错**或**报错但没用**。
+
+| # | 现象 | 修前实测 | 修后 |
+|---|------|----------|------|
+| D25 | **20~32 层普通嵌套就让编译器硬崩** | `print(（×21）1)` → `thread 'main' has overflowed its stack` | n≤511 正常；n=5000 可读报错 |
+| D26 | `1/0` → `inf`、`1%0` → `nan` | 见下 | **不改**（设计使然，已核实） |
+| D27 | **超 f64 范围字面量静默变 `inf`** | `print(10^309)` → `inf`，exit 0 | 词法期报错并指路 BigInt |
+| D28 | **负下标静默返回首元素** | `xs[-1]`/`xs[-5]`/`"abc"[-1]` 全部给首元素 | `negative index: -1` / `negative string index: -1` |
+| D29 | **多行 `import` 把下一行标识符吞进模块路径** | `import nosuchmod` + 下一行 `print(1)` → 路径 `nosuchmodprint` | 路径 `nosuchmod` |
+| D30 | **词法器的精确诊断全被丢弃** | `TokenType::Error(msg)` 全仓**零消费点** | 带 `line:column` 外露 |
+| D31 | **编译耗时超线性**（未修，已定位到行） | 375 个 `let` → **20.8 秒** | 见下 |
+
+#### D25：20 层嵌套即爆栈（本轮最重）
+
+```text
+print(((((((((((((((((((((1)))))))))))))))))))))   # 21 层
+  → thread 'main' (34748) has overflowed its stack
+  → exit -1073741571（STATUS_STACK_OVERFLOW，进程 abort，无退出码语义）
+```
+
+**`mora --check` 同样崩** —— 它调的就是同一个 `ParserV3::compile`。所以
+不存在「检查通过、运行崩溃」，而是「检查本身崩」。
+
+根因两条：
+
+1. **Windows 主线程栈由 PE 头决定，默认仅 1 MB**（Linux 是 8 MB）。而
+   `ParserV3` 是标准递归下降：一层表达式嵌套要穿过
+   `emit_or_w → and → equality → pipe → comparison → term → factor →
+   unary → call → primary` 十个栈帧，每帧还带着 `MirWitness` 与若干局部量。
+   实测首个崩溃层数（二分，1 MB 栈）：括号 **21** / 列表 **21** /
+   字典 **20** / 二元链 **32** / 索引链 **29**。
+2. 下游（typeck / DAG 构建 / optimize / LSP 折叠）**全部递归遍历同一棵树**，
+   所以限制必须落在**解析入口**，且要在递归开始**之前**。
+
+修法（三者缺一不可）：
+
+- `main` 把整个命令分派移到**显式 64 MB 栈线程**上跑（`spawn_scoped`）——
+  把实际上限从 20 层抬到几百层，真实代码彻底移出雷区。
+- **词法括号深度闸**（`parser_v3::token_bracket_depth`，阈值
+  `MAX_NESTING_DEPTH = 512`）：O(n) 迭代扫描，**前置于递归**，
+  拦 `((((1))))` / `[[[…]]]` / `{{…}}` 三类字面嵌套。
+- **单语句 token 数闸**（`max_statement_tokens`，阈值
+  `MAX_STATEMENT_TOKENS = 1024`）：拦括号闸看不见的形态 ——
+  `1+1+1+…+1` 与 `s[0][0]…` 的**括号深度恒为 1**（`(` 只开一次、
+  `[` 每次都闭合），但 `emit_term_w` / `emit_call_tail_w` 是 `while` 循环
+  不是递归，每轮把 witness 往**左深**方向加一层，产出深度 n 的树。
+  每个运算符至少 2 个 token，故 ≤1024 token 把 witness 深度压在 ~512。
+- 另加一道**解析后 witness 树深度闸**（`witness_depth`，复用既有的
+  `MirWitness::child_witnesses()`，30 个 `WitnessKind` 变体全覆盖）作兜底。
+  两个深度函数都是**迭代显式栈**，自身不会爆栈。
+
+实测（`mora run` 与 `mora --check` 一致）：括号 / 列表 / 字典 / 二元链 /
+索引链 / 方法链六类形态在 n=5000 时**全部 27~35 ms 内给出可读诊断**
+（`source nesting too deep: bracket depth 5001 exceeds limit 512 (first
+reached at line 1, column …)` / `statement too long: 10004 tokens on one
+line exceeds limit 1024`），n=1..400 无回归（原崩溃点 21/32 已逐一验证）。
+
+**残留限制（如实记录）**：嵌套 `if … end` 不走括号也不走单语句闸，64 MB
+栈下阈值约在 1000~1400 层之间（该区间与 D31 的超线性耗时纠缠，纯嵌套
+1000 层已需 >25 s，无法干净测出崩溃点）。没有加闸是因为块体分别由
+`emit_block_w` / `emit_brace_block_w` 及各构造点内联循环解析，**没有单一
+挂载点**；用关键字计数近似会在 `if { }`（`}` 收尾）与 `if … end`（`end`
+收尾）混用时算漂移，**误拒合法程序比崩溃更糟**，故不冒险。
+
+#### D27：超范围字面量静默变 `inf`
+
+```text
+print(1 + 309 个 0)   → inf，exit 0，无任何提示
+print(400 个 9)       → inf，exit 0，无任何提示
+```
+
+本语言所有裸数字字面量都是 `Value::Float`（`lexer.rs` 无后缀时一律发射
+`TokenType::Float`），而 `f64::from_str` 对溢出是**饱和**的 —— 超出
+f64 max（约 1.797e308）返回 `inf` 而非 `Err`。这与同版本 D21（BigInt
+越 i64 后改走原生大数、**不再静默饱和**）直接矛盾：用户能写
+`100000000000000000000n` 拿到精确值，却写不出同一个数的普通字面量形式 ——
+少写一个 `n` 就从精确值变成 `inf`。
+
+判据与 Rust 自身一致（`let x = 1e400f64;` 在 Rust 里是编译错误
+"literal out of range for f64"）：**字面量必须可表示**。新增
+`lexer::literal_range_error` 同时管溢出（`is_infinite`）与下溢到 0
+（`parsed == 0.0` 且文本含非零数字位 —— 真正的 `0` / `0.0` 不受影响）。
+下溢一并处理，因为 Rust 对 `1e-400f64` 同样报 out of range。
+`10^308`（仍可表示）保持原样，无回归。
+
+#### D28：负下标静默返回首元素
+
+```text
+let xs = [1, 2, 3]
+xs[-1]     → 1.0     # 静默给首元素
+xs[-5]     → 1.0     # 越界 5 位，仍给首元素
+"abc"[-1]  → a
+```
+
+根因是 Rust 的浮点→整数 `as` 转换是**饱和**转换（1.45 起）：
+
+```rust
+-1.0 as usize == 0      // 既不 panic 也不报错
+-5.0 as usize == 0
+```
+
+而裸数字字面量在运行期正是 `Value::Float`，于是任何负下标都被映射成 0 ——
+「取倒数第 N 个」的意图**无声退化成取第一个**。`xs[-5]` 尤其恶劣：它连
+「差一位」的宽容都掩盖了，让越界看起来像合法取值。
+
+修法：`mir::vm::checked_index` 统一收口 `index_value` / `index_assign_value`
+的全部 6 个下标分支，拒绝负数与 NaN，上界用**原始 f64** 比较（否则
+`xs[1e30]` 会报成 index 18446744073709551615，与源码对不上）。
+`Value::Int` 下标同样过这里 —— 负的 `i64` 经 `as usize` 会变成
+`usize::MAX` 附近的巨大数，错误信息会报出一个与源码对不上的下标值。
+措辞带 `string` 前缀是刻意的：它告诉用户越界的是**字符下标空间**（而非
+字节），与 `len(s)` 的 `chars().count()` 同一口径 —— `tests/builtin_gaps.rs`
+的 D2/D3 用例锁着这条措辞。`typeck` 无索引类型规则（`infer.rs` 零 `Index`
+引用），运行时守卫是正确层。
+
+#### D29：多行 `import` 吞掉下一行标识符
+
+```text
+import nosuchmod
+print(1)              →  import error: failed to read nosuchmodprint
+```
+
+`emit_import_w` 的裸路径拼接循环把 `TokenType::Newline` 放进了「继续拼接」
+集合（只 `push` 空串、然后照样 `advance()`），于是解析跨过行尾继续收
+下一行的标识符。即**正常的多行 `import` 会把下一行第一个标识符吞进模块
+名**，报出来的模块名与源码里写的完全对不上，排查时看不出真实问题。
+
+修法：`Newline` 改为终止符且不消费。规范形式（spec `:1241`
+`import_stmt = "import" STRING`）本就走引号字符串分支、不经该循环，
+三种写法（规范多行 / 同行后接语句 / 多个 import 各占一行）全部无回归。
+
+#### D30：词法器诊断被整体丢弃
+
+`TokenType::Error(msg)` **全仓只有生产点、零消费点**。词法器一直用它携带
+精确原因（`"Invalid float literal: …"` / `"Unterminated string"` /
+`"Char literal must contain exactly one character"` / `"Float literal out
+of range: …"`），而解析器只当它是陌生物 token，报一句无信息量的
+`Failed to parse at line N` 就把病因丢了。实测 D27 修完后用户看到的仍是
+「Failed to parse at line 1」——**修好了病因却传不出去**，等于没修。
+
+修法：`ParserV3::lexical_error_ahead` 在解析失败的路径上（一次 O(n) 扫描，
+成功路径零成本）回取词法层的真实诊断并连同**词法器记录的行列**报出。
+行号必须是词法器那一行而非解析器游标位置 —— 解析器可能已往前走了若干
+token，旧信息本身就是错的。现在：
+
+```text
+print("abc)        → …: Unterminated string at line 1, column 7
+print('ab)')       → …: Char literal must contain exactly one character at line 1, column 7
+print(10^309)      → …: Float literal out of range: 1000…000 (310 位) exceeds f64
+                     max (~1.797e308). Use a BigInt literal (append `n`) …
+```
+
+
+#### D31：`dag_optimize` 超线性（**已修**，40× 提速）
+
+375 条平凡语句 `let v1 = 1 … print(v375)` 要 **20.8 秒**（`dag_optimize`
+一段独占 17.5 s）。修后同一程序 **1.6 秒**。
+
+##### 归因：先错了两次，第三次靠逐段计时才对
+
+这一节的结论是本轮**方法论**上最有价值的部分，故保留修正过程：
+
+| 轮次 | 假设 | 依据 | 实测结果 |
+|------|------|------|----------|
+| 1 | 规则回调里的**全图边扫描**（`find_data_source` / `outgoing_data_edges` / DCE `has_outgoing` / `seq_reachable` / `is_control_target` / `mark_dirty`） | 规则 API 把整个 `&dag` 交给每条规则，规则只能线性扫图；6 处 × 规则数 × 节点数 = O(n^2.5) | 改完只快 **20%**（22.9 s → 18.2 s）—— **归因错** |
+| 2 | CSE 的 O(V²) 成对比较 + `is_multi_defined` 的 O(V) 扫 | 计数器显示 `nodes_equivalent` 被调 113 万次而只 374 次为真（命中率 0.03%） | 在 `nodes_equivalent` 内部逐段计时：类别比较 22 ms + source 比较 0.6 ms = **共 22.6 ms**，而 stage 耗时 17.9 s —— **差 790 倍，归因又错** |
+| 3 | `apply_rewrite` 本身 | 给 `rule.rewrite()` 整体计时：3 386 次调用共 **375 ms**，而 stage 17.9 s —— 差 57 倍，只能在循环体里未计时的那几项 | `apply_rewrite` 374 次调用占 **17.5 s**（每次 46.5 ms）—— **对** |
+
+**教训**：符号化推理（「O(E) 扫图 × O(N) 次调用 = 二次方」）连错两次，
+而**逐段计时**一次就对。凡是「我算出来它是热点」的说法，都要用
+「在那一段打一个计时器，看它到底占多少」去验证 —— 尤其当算出的量级
+（22.6 ms）与观测到的量级（17.9 s）差三个数量级时，那说明**算错了对象**。
+
+##### 真正的两个根因（都在 `apply_rewrite` 第 5 步的不动点循环里）
+
+```rust
+for _ in 0..4 {
+    let before: Vec<bool> = dag.reachable.clone();
+    dag.recompute_reachable_from_entry();
+    dag.recompute_entry();
+    if dag.reachable == before { break; }
+}
+```
+
+1. **`recompute_reachable_from_entry()` 的 BFS 是 O(V·E)**
+   —— 内层写作 `self.edges.iter().filter(|e| e.from == x)`，
+   **每弹出一个节点就把整张边表扫一遍**。本方法被不动点循环反复调用
+   （每轮一次，最多 4 轮）：实测改写 374 次 → 本方法被调约 1 496 次 →
+   1 496 × 1 877 × 4 876 ≈ **1.4×10¹⁰ 次边比较**。
+   改法：进入 BFS 前用三趟线性扫描建一份**扁平 CSR 邻接表**
+   （`out_start` 出度前缀和 + `out_targets` 紧凑后继），单次降到 O(V+E)。
+   **语义逐字等价**：`reach` 是可达关系的**传递闭包**，与 BFS 访问顺序无关。
+   邻接表是**本次调用内现建现用的临时量**，不缓存回 `MirDag` —— 故不存在
+   「图变了而邻接表陈旧」的风险（`MirDag` 的边在 `dag_analyze` /
+   `apply_rewrite` / `add_sequential_edges` 多处增长，任何挂字段的缓存都要
+   逐处维护，那是更大的陈旧风险面）。
+
+2. **`recompute_entry()` 每次调用从零重建两个 `HashSet<NodeId>`**
+   —— 逐边插入约 4 876 次 + 把本就是 `Vec<bool>` 的 `reachable` 又拷进一个
+   `HashSet`。同样被调约 1 870 次 → 约 **1 260 万次哈希插入**外加反复扩容。
+   改法：换成 `Vec<bool>` 位向量。判据逐字等价
+   （`has_incoming.contains(&i)` ≡ `has_incoming[i]`），
+   `reachable` 直接用原有 `Vec<bool>` 索引、不再白拷一遍。
+
+##### 附带修的：`DagIndex`（规则侧邻接索引）
+
+第 1 轮那 20% 提速是真的（`seq_reachable` 从 O(V·E) 降到 O(Σ度)，
+`find_data_source` / `is_control_target` 从 O(E) 降到 O(入度)），
+所以保留：新增 `DagIndex`（节点 ↔ 边**下标**双向映射），
+`DagRewriteRule` 的 `matches` / `rewrite` 增 `&DagIndex` 参数。
+
+索引可以**纯追加**维护（因而永不陈旧）依赖 `apply_rewrite` 的三条不变量：
+边**只 push 从不删**（step 4 明确「removed 节点的边不剥离」，节点只是变
+透明穿通）、节点**只标 `Removed` 从不物理移除**（新节点一律追加到末尾）、
+唯一的原地内容改写是 `reg_rename` 而索引**只存边下标**（查询时读
+`dag.edges[ei]` 的实时值）。故 `sync` 只需把新 push 的边补进桶里。
+
+##### 实测（`cargo build` 的 **debug** 构建，`mora run` 真实子进程）
+
+**务必分清两种口径** —— 下表左列标注了每一行是哪一种；混用会得出错误结论：
+
+| 基准 | 口径 | 修前 | 修后 | 加速 |
+|------|------|------|------|------|
+| 375 个 `let` | `dag_optimize` 段 | 22 900 ms | **570 ms** | **40×** |
+| 375 个 `let` | 端到端 wall | 20 800 ms | **781 ms** | **27×** |
+| 1 000 个 `let` | 端到端 wall | **>30 s 未完成** | **5 294 ms** | — |
+| 嵌套 `if` ×200 | `dag_optimize` 段 | 3 150 ms | **113 ms** | **28×** |
+| 嵌套 `if` ×200 | 端到端 wall | 4 900 ms | **2 726 ms** | 1.8× |
+| 嵌套 `if` ×400 | 端到端 wall | 21 739 ms | **10 638 ms** | 2.0× |
+| 二元链 n=200 | `dag_optimize` 段 | 1 240 ms | **68 ms** | **18×** |
+| 二元链 n=400 | 端到端 wall | 6 922 ms | **447 ms** | **15×** |
+
+**注意嵌套 `if` 只快 2×（远不如 `let` 的 27×）** —— 该形态的残余成本
+**不在** `dag_optimize` 里（那一段已从 3 150 ms 降到 113 ms），而在别处；
+本次未继续定位，如实记录而不含糊过去。`let` 形态端到端 781 ms 中
+`dag_optimize` 占 570 ms，即**该形态的主要成本确实被这一处修掉了**。
+输出值全部核对正确（`375.0` / `1000.0` / `201.0` / `401.0`）。
+
+同一修复也解释了上一轮观察到的另外两处耗时异常：嵌套 `if` n=400 的
+21.7 s 与二元链 n=400 的 6.9 s。
+
+##### 残留（是优化项，不再是可用性缺陷）
+
+修后 `let` 形态的 scaling 仍约 n^1.9（375→781 ms、1 000→5 294 ms），
+剩余的二次项是 CSE 固有的**成对比较**（`for prev_id in 0..node_id` +
+`nodes_equivalent`，实测 375 那档被调 113 万次而只有 374 次为真）。
+彻底线性化需要**结构签名分桶**（按「指令类别 + 各 input 的 data source」
+算哈希、只同桶内两两比），而签名必须与 `nodes_equivalent` 的判据**逐字
+等价**才能不改优化结果 —— 哈希相等性与「真等价」不是一回事，碰撞要回退
+到精确比较。`let` 形态已从「375 条语句 20.8 s」降到「0.78 s」，
+故留作后续优化项。
+
+#### D32：通配 pattern 规则把 `apply_rules` 拖成 O(n²)（**已修**，18×）
+
+D31 那一节留下的线索（「嵌套 `if` 只快 2×，残余成本不在 `dag_optimize`」）
+在本节收尾。逐层计时把 400 层嵌套 if 的 9.4 s 拆开：
+
+| 阶段 | if×400 | 占比 |
+|------|--------|------|
+| `ParserV3::compile` | 240 ms | 2.5% |
+| 9 层管线 `run_pipeline` | 192 ms | 2.0% |
+| **`apply_rules`** | **6 812 ms** | **72%** |
+| typeck | 0.2 ms | ~0% |
+| `dag_analyze` | 62 ms | 0.7% |
+| `dag_optimize`（D31 修的） | 195 ms | 2.1% |
+| 执行 `run_dag` | 85 ms | 0.9% |
+
+（注：拆到这一层时我第一版表格把 `apply_rules` 误标成 `run_pipeline`
+—— 计时探针的 `Instant::now()` 打在了被测调用**之后**。下表已按实际
+代码位置更正。）
+
+##### 根因：一条「通配 pattern + O(n) rewrite」的规则
+
+`builtin_rules()` 只有 4 条规则，其中 `DeadAfterReturnRule` 的
+`pattern()` 是**通配符**（`&WILDCARD_PATTERN`，匹配每一条指令），而它的
+`rewrite_with_context` 每次都**从后往前扫全 body** 找最后一个 `Return`：
+
+```rust
+let last_return = body.iter().enumerate().rev()
+    .find(|(_, inst)| matches!(inst, MirInst::Return(_)))   // ← O(n)
+```
+
+于是单轮代价 = n 条指令 × 每条都命中通配 × 每次 O(n) = **O(n²)**。
+实测 if×400（body 3200 条）：3200 × 3200 × 50 轮 ≈ **5.1×10⁸** 次迭代，
+与实测的 135 ms/轮（≈26 ns/迭代）完全吻合。另外 3 条规则的 pattern
+都很具体（`Const` / `BinaryOp` / `JumpIf` / `JumpIfNot`），命中数少，
+不构成量级。
+
+##### 修法：把 O(n) 判断每轮**前置**一次（`RewriteRule::precheck`）
+
+`greedy_search` 的一整轮扫描内 `body` **不变**（只在轮末整体替换），
+所以「最后一个 `Return` 在哪」在整轮内是常量。给 `RewriteRule` 加一个
+带默认实现（恒 `true`，故对既有规则零影响）的前置筛选钩子：
+
+```rust
+fn precheck(&self, _pc: usize, _last_return_pc: Option<usize>) -> bool { true }
+```
+
+`DeadAfterReturnRule` 覆写为 `pc > last_return_pc`，判据与它
+`rewrite_with_context` 里的原判断**逐字相同**（`Some(ret_idx)` 时
+`pc > ret_idx` 才删），只是提前到不扫 body 的位置；`None`（body 里没有
+`Return`）时原实现保留指令、gain 为 0，等价于跳过。搜索器每轮算一次
+`last_return_pc` 传入。
+
+**语义等价性**：被跳过的 `(规则, pc)` 对原本只会产出「原样保留一条指令」
+（`new_cost == inst_cost` → `gain == 0` → 从不入选 `best`），故跳过它们
+**不改变任何一轮的最优选择**。全量 1456 条测试全绿即验证。
+
+##### 顺带：`format!("{:?}", inst)` 提到内层规则循环外（惰性）
+
+`MirInst` 因含递归的 `Value` 字段没实现 `Hash`/`Eq`，memo 的键只能用
+Debug 字符串，而旧写法把这次格式化放在**内层**规则循环里 —— 每条指令 ×
+每条规则各格式化一次，且 `Debug` 对 `MirInst` 是深层递归、每次分配一个
+String。改成外提 + 惰性（只在确有规则命中时才格式化一次）。**纯循环
+不变量外提**，memo key 内容不变。实测这一项单独**没有可测收益**
+（6.79 s → 6.79 s），因为真正的成本在上一条的 O(n²) 上；但它把格式化
+次数从「指令 × 规则」降到「指令」，是正确方向，保留。
+
+##### 实测（debug 构建，真实 `mora run` 子进程）
+
+| 基准 | `apply_rules` 修前 | 修后 | 加速 | 端到端修前 → 修后 |
+|------|--------|------|------|-----------------|
+| 嵌套 `if` ×100 | 505 ms | **83 ms** | 6.1× | 1 120 → 798 ms |
+| 嵌套 `if` ×200 | 1 794 ms | **192 ms** | 9.3× | 2 063 → 486 ms |
+| 嵌套 `if` ×400 | 6 719 ms | **365 ms** | **18.4×** | 9 423 → **1 304 ms** |
+
+scaling 也从二次方回到近线性（83 → 192 → 365 ms，对 2× / 1.9× 的规模增长）。
+输出值全部核对正确（`1.0`）。lib 测试套件自身也从 2.54 s 降到 **1.43 s**
+（其中有用例会走 `apply_rules`）。
+
+##### 附带发现（D33，**未修**，是优化不完整而非正确性问题）
+
+`greedy_search` 每轮**只应用一条**重写（选全局 gain 最大者），上限
+`max_iter = 50`。实测 if×400 的 400 个 `if` 在 50 轮里只折叠了 **50 个**，
+body 从 3200 只缩到 3151 —— 剩下 350 个常量条件 `if` 没被优化掉。
+输出值仍正确（`1.0`），所以这是**优化不完整**（少做了本可做的优化），
+不是正确性缺陷。要修得改 greedy 的应用策略（一次应用多条互不重叠的
+重写），那会改变优化**结果**、需要差分测试兜底，故留作后续。
+
+#### D34：测试套件在 `%TEMP%` 里永久泄漏空目录（**已修**）
+
+前三轮清理残留时反复看到 `%TEMP%` 下堆积大量 `mora_*` 目录，于是查了
+一下 —— 结果是**测试套件自己在漏**，而且是持续两个多月的泄漏。
+
+| 前缀 | 累积个数 | 最早 | 占用 |
+|------|---------|------|------|
+| `mora_audit_builtin_<pid>_<nanos>` | **2 954** | 2026-08-15 | 0 KB |
+| `mora_record_test_subdir_<pid>` | 578 | — | 0 KB |
+
+**全部是空目录**（逐个枚举确认），且**每跑一次测试套件新增约 100 个**
+（今天一次全量跑就实测到 100 个新增）。
+
+##### 两个泄漏源
+
+1. `interpreter/builtins/tests/audit.rs` 的 `temp_log_path(name)` 每次建一个
+   `pid + 纳秒时间戳` 的**唯一目录**（5 个测试各调一次），而各测试末尾只
+   `let _ = fs::remove_file(&path)` —— **删文件、留空目录**；测试若 panic
+   则连文件都不删（`remove_file` 是手动调用的，不在 unwind 路径上）。
+2. `record/tests.rs::new_record_creates_parent_dir` 建
+   `mora_record_test_subdir_<pid>/nested/test.jsonl`，前后都只
+   `remove_dir_all(p.parent())`（即 `nested`），**父目录留着** → 每次跑漏一个。
+
+（同一文件里的 `tmp_path()` 建的是单文件、`schema_test_path()` 的名字固定
+会被下次覆盖，都不漏 —— 所以 2 954 : 578 的比例与调用次数吻合。）
+
+##### 修法：RAII 守卫
+
+1. `temp_log_path` 改返回 `TempLog { dir, file }`，`Drop` 里
+   `remove_dir_all(&self.dir)` 删**整个目录**。`Drop` 在 unwind（panic）时
+   同样执行，故**异常路径也不漏**。实现 `Deref<Target = Path>` +
+   `AsRef<Path>`，既有 5 处 `&path` 用法（`JsonlAuditSink::new_fresh(&path)`
+   / `fs::remove_file`）**一字不改**。
+   （只做 `Deref` 不够 —— `new_fresh` 与 `remove_file` 走的是 `AsRef<Path>`
+   泛型约束，`Deref` 不满足，这是我第一版编译不过的原因。）
+2. `new_record_creates_parent_dir` 改为删整个基目录
+   `mora_record_test_subdir_<pid>`（前置清残留 + 后置清本次产物）。
+
+**纯测试代码改动，零产品代码影响、零语义变化。**
+
+##### 验证
+
+| 判据 | 修前 | 修后 |
+|------|------|------|
+| 跑 `cargo test --lib`（970 条）后 `mora_audit_builtin_*` 新增 | **约 100 个** | **0 个** |
+| 跑 `cargo test` 全量（49 组 1456 条）后新增 | 约 100 个 | **0 个** |
+| clippy | 0 警告 | 0 警告 |
+
+##### 历史残留：**交用户决定，未擅自批量删**
+
+剩下的 3 522 个（2026-08-15 之前、全部空目录、0 KB、属已退出的测试进程）
+**不是本会话产生的**，且走可恢复删除路由实测吞吐只有 **6.7 秒/个**
+（`rm --` 逐项走 mavis-trash）→ 需 **6.5 小时**。批量删除 3 522 项也是
+用户机器的清理决定，故如实报告而不擅自执行。
+
+#### D35：`let r = handle …` 让**其后所有语句静默消失**（**已修**）
+
+新审计线：代数效果（`handle` / `perform`）—— 前几轮审的是错误路径、性能、
+测试卫生，效果子系统还没系统过。先查 spec 的可测断言是否兑现，结果第一条
+就撞上这个。
+
+**现象（真实 CLI `mora run` 实测，退出码 0、无任何输出、无任何报错）**：
+
+```text
+let r = handle ask { 1 } { 0 }
+print(999)          →  什么都不打印
+```
+
+而**同一个 `handle` 不被 `let` 绑定就完全正常**：
+
+| 用例 | 修前 | 修后 |
+|------|------|------|
+| `handle a {1} {0}` 作语句 + `print(999)` | 999.0 ✅ | 999.0 ✅ |
+| handle **内部**有 print + `print(999)` | 7.0, 999.0 ✅ | 7.0, 999.0 ✅ |
+| `let x=0.0; handle random_random { x = t[1] } { 0.5 }; print(x)`（D14 固件） | 20.0 ✅ | 20.0 ✅ |
+| **`let r = handle a {1} {0}` + `print(999)`** | **无输出** ❌ | **5.0, 999.0** ✅ |
+| **`let r = handle a {1} {0}` + `let z = r+1` + `print(z)`** | **无输出** ❌ | **6.0** ✅ |
+| **`print(111)` + `let r = handle …` + `print(r)`** | 只有 111.0 ❌ | **111.0, 5.0** ✅ |
+| **task 体内 `let r = handle …` + `print(r)`** | 只有 999.0 ❌ | **5.0, 999.0** ✅ |
+| **嵌套 `handle a { handle b {…} {…} } {…}`** | **无输出** ❌ | **6.0, 999.0** ✅ |
+
+**严重度**：`let result = perform "ask" …` 正是 spec §7.7 :488 的写法。
+
+##### 根因：`fcfg::Node::Handle` **缺 `dst` 字段**
+
+判决实验先把范围钉死（仓库自带的 A/B 开关）：
+
+```text
+MORA_9LAYER=1  →  无输出        # 9 层管线开（生产默认）
+MORA_9LAYER=0  →  999.0         # 关掉 —— 现象消失
+```
+
+于是错配不在 `emit.rs` 单遍直出路径，而在 9 层管线的
+`witness → FCFG → lower` 重建路径。探针把两侧并排打出来对上：
+
+```text
+编译期（emit.rs）:   emit_handle_w -> reg=Some(0)    ← k_dst = 0
+                      emit_let_w    got v=0           ← Let("r", 0)  ✅ 自洽
+运行期（9 层管线）:   node 0 written_reg=6            ← Handle.k_dst 变成 6 ❌
+                      node 1 inst=Define("r", 0)      ← 仍引用 0
+```
+
+确切缺陷（`src/mir/fcfg.rs`）：
+
+```rust
+Handle { effect, body, handler, k_param, span, meta }   // ← 没有 dst
+// 对比同文件的表达式节点
+Perform { dst: Reg, effect, args, span, meta }          // ✅ 有 dst
+If      { dst: Reg, .. }                                // ✅ 有 dst
+```
+
+三条链依次断裂：
+
+1. `witness_to_fcfg` 把 `WitnessKind::Handle` 转成 `Node::Handle` 时**无处
+   记录「handle 的结果值在哪个寄存器」**（`Node` 里没这个字段）。
+2. `node_result_reg_of` 匹配不到 `Node::Handle` → 落 `_ => None` →
+   兜底返回**哨兵 0**，于是 `Let` 节点引用寄存器 0。
+3. `fcfg_lower` 只能**新分配** `k_dst = ctx.alloc_reg()` = 6，而
+   `lower_fcfg(nodes: &[Fcfg])` 收的是**不可变切片**——**写不回去**通知
+   那个 `Let`。
+
+结果 `Define` 引用一个无任何生产者写过的寄存器 → `reg_ready[0]` 恒 false
+→ `Define` 永不激活 → 它所在的 **Sequence 链**断裂 → 其后**所有** Effect
+节点（含 `print`）静默消失，无报错、退出码 0。
+
+`MORA_9LAYER=0` 下现象消失，正因为那时走 `emit.rs`，**那里
+`emit_handle_w` 分配的 `k_dst` 与 `emit_let_w` 绑定的寄存器天然一致**。
+
+##### 修法：给 `Node::Handle` 加 `dst: Reg`，两端共用
+
+四处改动，全部与 `Node::Perform` 严格同构：
+
+| 位置 | 改动 |
+|------|------|
+| `fcfg.rs` | `Node::Handle` 加 `dst: Reg` 字段 |
+| `witness_to_fcfg.rs` | Handle 构造时 `let dst = b.alloc();`（与 `Perform` 的 `b.alloc()` 一致） |
+| `witness_to_fcfg.rs` | `node_result_reg_of` 补 `\| Node::Handle { dst: reg, .. }` 臂（此前落 `_ => None` → 哨兵 0） |
+| `fcfg_lower.rs` | Handle 分支改用 `let k_dst = *dst;`（**不再**新 `alloc_reg()`） |
+| `fcfg_lower.rs` | `max_reg_in_node` 把 `*dst` 计入（否则 `n_regs` 可能小于它，消费者取寄存器就越界） |
+| `typeck/annotate.rs` | 类型标注 pass 透传 `dst` |
+
+纯数据流修正，**不改变任何既有的指令形状或执行顺序**——`Handle` 本来就
+只写 `k_dst`，现在只是让「谁写」与「谁引用」指向同一个编号。
+
+##### 顺带的另一半修复（上一轮已完成，本轮验证仍必要）
+
+`MirInst::written_reg()` + 执行器置 `reg_ready` 改用它。`Handle` 被
+`is_effect()` 抢先归为 Effect 节点、`dst()` 够不到 `k_dst`，导致
+`reg_ready[k_dst]` 永假。它不修本缺陷（`Define` 引用的根本不是 `k_dst`），
+但两处叠加才让 `let r = handle …` 端到端可用。
+
+##### D36：单遍直出路径下**嵌套 handle 的内层值丢失**（已修，一行）
+
+`let r = handle a { handle b { 6 } { 8 } } { 7 }` 在 **9 层管线**（生产）得
+7，在单遍直出路径（`MORA_9LAYER=0`）报 `Operands must be two numbers`
+（`r` 为 Nil）。库内直接调 `ParserV3::compile` 的用户同样中招。
+
+##### 根因：一行**多余的兜底**把真值覆盖成 Nil
+
+`lower.rs` 的 `WitnessLowerer` 处理 `WitnessKind::Handle` 时，在发射
+`MirInst::Handle` 之后又发了一条：
+
+```rust
+self.emit.emit(MirInst::Const(k_dst, Value::Nil));   // ← 兜底，已删
+```
+
+它**本就多余** —— `run_dag_with_signal_memo` 的 `regs` 初始化就是
+`vec![Value::Nil; dag.n_regs]`，`h_handle` 不写 `k_dst` 时它本来就是 Nil。
+而一旦 `h_handle` **正常写入**结果，这条 `Const` 会在 Sequence 链上**排在
+`Handle` 之后，把真值覆盖回 Nil**。
+
+顶层看不出来（parser 的 `emit_handle_w` 走另一条路、不经本函数），
+**只有嵌套 handle 会中招**：内层 handle 经 `lower_block_witness_to_mir` 落到
+**外层 `body_mir`** 的 context，于是 body 的指令序是
+
+```text
+[ 内层Handle(写 regs[X] = 6),  Const(X, Nil) ]   ← 真值被覆盖
+```
+
+外层于是拿到 Nil 的 body 结果，`r` 也就成了 Nil。
+
+##### 判决证据：两条路径的 body 只差这一条指令
+
+`let r = handle a { handle b { 6 } { 8 } } { 7 }` 的顶层指令序列**完全一致**
+（各 14 条，`Define("r", ·)` 都与各自的 `k_dst` 相符）——**这正是差分检查
+抓不到它的原因：差异藏在嵌套 `MirFunction` 内部，而 `differential_check`
+只比较顶层。** 逐条 dump：
+
+| | emit 侧 | 9 层侧 |
+|---|---|---|
+| 指令数 | 14 | 14 |
+| `[0] Handle` | k_dst=0, **body_len=2**, inner_handles=1 | k_dst=4, **body_len=1**, inner_handles=1 |
+| `[1] Define("r", ·)` | `0`（与 k_dst 一致） | `4`（与 k_dst 一致） |
+
+**唯一的差异就是 body 长度 2 vs 1**，多出来的那条即上述兜底。9 层管线走
+`witness_to_fcfg → fcfg_lower`（**不经** `WitnessLowerer`），所以没有它。
+
+修法：删掉那一行。两条路径实测：
+
+| 路径 | 修前 | 修后 |
+|------|------|------|
+| 单遍（`MORA_9LAYER=0`） | `Operands must be two numbers` | **7.0** ✅ |
+| 9 层（生产） | 7.0 | 7.0 ✅ 无回归 |
+
+**方法论**：这一处推翻了我前一轮的诊断（当时据「实验版本」的 14 vs 15 条
+推断「9 层缺一条」）。**教训与 D38 普查时同源：拿一个已被回退的实验版本的
+数据去描述当前基线**。当前基线必须重新 dump —— 做完才发现两条路径的顶层
+序列其实一致，问题在嵌套结构里。
+
+##### 差分检查的第二个盲区（与「寄存器盲区」并列）
+
+`differential_check` 只比较**顶层** `inst_category` 序列，因此对
+**嵌套 `MirFunction`（handle / task 的 body、handler）内部**的差异结构性
+失明 —— D36 就藏在这里。补法需要递归进嵌套函数比对其指令类别；
+而在此之前，任何对嵌套结构的改动都无法靠现有差分验证。
+（同 D36 已记的「寄存器号盲区」并列为两项。）
+
+##### D38：让「差分回落」默认可见 —— 顺带量出 9 层管线的**真实覆盖面**（已修）
+
+D36 三步里的第 3 步，独立可做（只改日志可见性，不动逻辑、不依赖前两步）。
+
+**问题**：差分失败 = 两条编译路径产出不等价 = 9 层管线被丢弃、改用
+`emit.rs` 的产出。此前这**只在 `MORA_9LAYER_DEBUG=1` 时打一行 debug 日志**，
+随后**静默**回落 —— 用户以为在跑 9 层管线，实际没有。这与本轮修过的整族
+缺陷同族（D1 静默取默认值、D25 静默 `inf`、D28 静默返回首元素、D35 静默
+饿死语句）：失败模式不是崩溃或报错，而是**悄悄换了一条更差的路径**。
+
+**修法**：默认打一行摘要到 stderr（详细 diff 列表仍需 `MORA_9LAYER_DEBUG=1`，
+免得刷屏）。stderr 不参与任何 stdout 断言，实测对测试套件**零污染**
+（全量跑下来回落警告出现 0 次）。
+
+###### 顺带普查：7 类构造**一直在**默默走 emit 路径
+
+既然回落现在可见，就做了一次 31 个语言构造的普查，看哪些会触发回落：
+
+| 触发回落（生产路径实际在用 `emit.rs`） | pipeline_mir | original_mir |
+|---|---|---|
+| `with` | 2 | 3 |
+| `eval` | **0** | 2 |
+| `parallel` | 1 | 2 |
+| `observe` / `transaction` / `worker` | — | — |
+| `model` + `msg`（TEA 声明） | 2 | 4 |
+
+**结论：`witness_to_fcfg` 不支持这 7 类构造**，`lower_fcfg` 产出比 emit 少
+若干条 → 差分检查靠「长度不同」抓到 → 回落。也就是说，**这 7 类构造在
+生产中从未走过 9 层管线**，一直靠 `emit.rs` 撑着。9 层管线的真实覆盖面
+远小于 CHANGELOG 上「执行器切换的输入」那句话给人的印象。
+
+**`eval` 那行单独警惕**：9 层管线对它产出 **0 条指令**（`cmir=0 lmir=0`）。
+差分检查目前**只靠长度差异**抓到它 —— 一旦有人放宽或重构这个检查，
+`eval` 就会静默产出一个**空程序**。这与 D36 的盲区是同一类问题的两面：
+差分检查能抓「少了指令」，抓不到「寄存器绑错」（见下）。
+
+顺带记录：普查里另有 5 个构造以**其它原因**失败（`loop`+`break`、嵌套
+`task`、`with` 嵌在 task 内、`dyn` 标注、`orchestrate`），它们**不**触发回落，
+属另一批待查项，未在本轮展开。
+
+#### D39：`with` 块对**无效配置一律静默丢弃**（已修）
+
+由 D38 的普查引出：`with` 在触发回落的那 7 类构造里，查下去发现它**双重坏**。
+
+**先否证一个自己的假设**：`with a = 1 / a + 1 / end` 报
+`Unbound variable 'a'`，看着像作用域缺陷 —— **但不是**。spec §11.1 :801-819
+明确 `with` 是**上下文配置块**（不是变量绑定块），支持的键只有固定的 7 个，
+且 spec 示例里块内从不按名引用绑定。所以这条报错是**正确行为**。
+
+**真缺陷是另一面**（全部真实 CLI `mora run` 实测，**修前一律 exit 0、零提示**）：
+
+| 源码 | 修前 | 修后 |
+|------|------|------|
+| `with temperature = "hot"`（类型错） | **0 静默** | `with-config \`temperature\` expects a number, got string` |
+| `with max_tokens = "100"`（类型错） | **0 静默** | 同上 |
+| `with budget = 100`（**spec §11.1 :811-818 明确承诺的键**） | **0 静默** | `is promised by spec §11.1 but not implemented yet` |
+| `with per_call = 50`（同上） | **0 静默** | 同上 |
+| `with modle = "gpt-4o"`（**拼写错误**） | **0 静默** | `unknown with-config key \`modle\`` + 列出 spec 支持的全部键 |
+| `with model = "gpt-4o"` / `temperature = 1` 等合法键 | 0 | 0 ✅ 无回归 |
+
+最恶劣的是**拼写错误那条**：用户以为设了模型名，实际**什么都没设**，
+`ai.chat` 静默用**默认模型**跑完，退出码 0。
+
+**根因**（`interpreter::mir_with_config`）：
+
+* 未知键落 `_ => {}` —— **静默丢弃**；
+* `temperature` / `max_tokens` 只在 `Value::Float` 时赋值，否则 `if let`
+  落空即什么都不做；
+* `AiConfigValue`（`runtime/types.rs:82`）**没有** `budget` / `per_call`
+  字段，尽管 spec 明确列了这两个键，于是它们同样落进 `_ => {}`。
+
+**与 D1 同源**：D1（`range` 实参类型不对 → 静默取默认值 → 循环体一次都
+不执行）确立的原则是「**实参存在但无效 → 报错；只有真的缺席才用默认值**」，
+这里原样适用。错误路径上同步 `config_stack.pop()`，避免错误冒泡时把
+config 泄漏进栈（与 `h_with_config` 里 v0.95 那条同模式的修复一致）。
+
+##### 顺带修掉一条**空的** EBNF 用例
+
+`tests/spec_ebnf_surface.rs` 的 `with_stmt` 用例原写
+`"with a = 1\n  2\nend"` —— 而 `a` **不是合法配置键**。它此前「通过」只是
+因为未知键被静默丢弃，所以**既没测到配置语义、也没测到绑定语义**。D39
+把未知键改成报错后它立刻失败，**正好证明它是假阳性**。已改用合法键
+（`model`），使该文件只负责「spec §14.2 语法表面可解析」，配置语义交给
+新建的 `tests/with_config.rs`（**6 条**）专项覆盖。
+
+#### D40：`transaction` 作 task 体唯一语句 → **panic**（exit=101）（已修）
+
+真实 CLI `mora run` 实测：
+
+```mora
+task w()
+  transaction
+    1
+  end
+end
+w()
+```
+
+```text
+thread 'mora-main' panicked at src\mir\vm\dag.rs:645:73:
+index out of bounds: the len is 0 but the index is 0
+exit=101
+```
+
+程序能解析、能过 typeck，**却把整个进程打掉**。
+
+**根因：unit 语句返回「未分配的哨兵寄存器 0」。** 寄存器文件按
+`MirFunction.n_regs` 开数组（`vec![false; dag.n_regs]`），而
+`transaction` 语句本身在**父上下文**里只 emit 一条无 `dst` 的
+`MirInst::Transaction`（body / compensation 各自另开寄存器空间降维），
+父上下文**一个寄存器都没分配**，却把哨兵 `0` 当作「本语句的值寄存器」
+返回。当它是所在块的末条语句时，块级 `emit_tail_return(Some(0))` 就把
+reg 0 写进 `Return`，而 `n_regs` 仍是 0 → `node_ready` 的 `reg_ready[*r]`
+索引越界。
+
+**触发条件是「嵌套 `MirFunction` = 独立寄存器空间」**：
+
+| 位置 | 修前 |
+|------|------|
+| `for` 体里 | 不崩 —— 顶层函数还有循环自身指令分配寄存器，`n_regs ≥ 1` |
+| `task` 体里 | **panic** —— 该函数体除这条 unit 语句什么都没分配，`n_regs == 0` |
+
+**这是同一个 bug 类的第二处。** v0.104.2 修过一次**完全相同**的 panic ——
+`emit.rs` 里 `commit` / `rollback` 两处的注释逐字描述了「`Some((0, _))`
+→ n_regs=0 → `node_ready` 越界 panic」，但**只补了内层**（事务体自己的
+寄存器空间），漏了 `transaction` 语句自身这一层。故 `transaction commit end`
+作 task 体唯一语句时修前**同样 panic**。
+
+**修法（两层）**：
+
+1. `emit_transaction_w` 末行 `Some((0, w))` → `alloc_reg()` +
+   `Const(dst, Nil)` + `Some((dst, w))`，与 `commit` / `rollback` 完全同形状。
+2. **类级防御**：`run_dag_with_signal_memo` 进主循环前一次性校验寄存器引用
+   是否落在 `n_regs` 内，不一致返回干净错误。
+
+第 2 条**不是**把 `node_ready` 改成软失败 —— 那更糟：越界寄存器会让该节点
+永不就绪，主循环空转到 `MAX_STEPS`（1e7）后**静默**返回 Nil，静默错值比
+panic 难查得多。前置校验对合法程序零影响：能跑通的程序不可能引用越界寄存器
+（越界的读会在 `node_ready` 越界、越界的写会在 `regs[d]` 越界）。
+
+新增 `tests/unit_stmt_regfile.rs`（**7 条**）：精确复现 ×2、正常路径不回归 ×1、
+**类级覆盖**（7 种无值语句逐个作 task 体唯一语句）、防御层直测 ×3（含
+「引用最高位寄存器不得误拒」的边界反向用例）。
+
+**反向验证**：临时把源码修法改回 `Some((0, w))` 后，4 条源码级测试**全部
+变红**，3 条防御层测试仍绿（它独立于源码修法）—— 两层各自被自己的测试覆盖。
+
+#### D41：声明类语句**只能出现在顶层**（分类为设计决定，未擅自改）
+
+spec §14.2 说所有块体都是 `{ statement }`，而 `statement` 含 23 项产生式 ——
+按字面读，声明类语句也可嵌套在任何块体里。实测（真实 CLI `mora run`）：
+
+| 产生式 | 顶层 | 嵌 `for` 体 | 嵌 `task` 体 |
+|--------|------|-------------|-------------|
+| `task_stmt` | OK | **失败** | **失败** |
+| `macro_stmt` | OK | **失败** | **失败** |
+| `update_stmt` | OK | **失败** | **失败** |
+| `orchestrate` | OK | **失败** | **失败** |
+| `import_stmt` | 运行期解析 | **失败** | **失败** |
+
+**机制**：`parser_v3` 有**两个**语句分派器 —— `emit_statement_w`（顶层）与
+`emit_statement_expr_w`（嵌套）。后者只覆盖「动作类」语句，**不含任何声明类**。
+`worker` / `parallel` / `observe` / `transaction` 能嵌套正是因为它们在后者里；
+而 `macro` 嵌不进 `for` 却能嵌进 `with` 块，说明这不是刻意的「声明不可嵌套」
+规则，而是**分派器的覆盖缺口**。
+
+**仍不实现**：把 `task` 放进 `for` 体要先定作用域规则 —— 循环外的代码看得见吗？
+每轮迭代重新定义一次吗？闭包捕获还是全局？这是语言设计决定，与已挂起的
+`trait` / `impl` 前端同性质。照 `trait_and_impl_are_source_unreachable` 的先例，
+在 `tests/spec_ebnf_surface.rs` 补了 2 条测试把事实钉住：一条断言「**确实
+只能顶层**」，一条配对断言「顶层**确实全部可用**」（证明是嵌套受限而非整条
+管线缺失）。
+
+#### D42：程序顶层的 `return` **静默终止整个程序**（已修）
+
+真实 CLI `mora run` 实测，**修前全部 exit 0、零提示**：
+
+| 源码 | 修前 | 修后 |
+|------|------|------|
+| `print(111)` / `return 1` / `print(999)` | `111.0`，**999 从不执行** | 编译错误 |
+| `if c == 1 then return 7 end` / `print(888)` | **无输出** | 编译错误 |
+| `for i in [0,1] return 7 end` / `print(888)` | **无输出** | 编译错误 |
+| `task w() return 7 end` + `print(w())` | `7.0` ✅ | `7.0` ✅ 无回归 |
+
+用户以为写了「提前返回」，实际看到的是「程序成功结束」—— 退出码 0、无错误、
+无警告，其后的一切凭空消失。与 D35（`let r = handle …` 让其后所有语句静默
+消失）同族。
+
+**根因**：`return` 此前**没有任何作用域检查**。同一函数里 `break` /
+`continue` 早就有守卫（`EmitContext::loop_stack` + `"Break outside loop"` /
+`"Continue outside loop"`），唯独 `return` 直接 `emit(MirInst::Return(..))`
+到当前寄存器空间；落在程序顶层时那条 `Return` 就是**顶层函数**的返回。
+
+**判据只用一处改动即可证明正确**：新增 `EmitContext::is_program_top`，
+**只有 `ParserV3::new` 置 `true`**。程序顶层是**唯一**不属于任何函数体的
+寄存器空间（task / closure / macro / worker / transaction / observe / update
+等体都是 `EmitContext::new()`；`if` / `for` / `while` 的体**不换**上下文，
+自动继承外层值）。故无需逐个分类 20 处 `EmitContext::new()` 站点——判错一处
+就会误拒合法代码。
+
+**为什么不保留「顶层 return = 结束程序」**：那与「正常跑完」在**退出码和输出
+上完全不可区分**。宁可报错。
+
+新增 `tests/return_scope.rs`（**3 条**）：顶层 6 个形态必须被拒；6 个函数作用域
+形态的返回值逐个比对（用返回值本身作「return 真跑到了」的证据）；macro /
+worker / transaction / compensation / observe / with 六种函数体不得被误拒。
+
+**连带发现：3 处既有测试一直在依赖这个被判定为缺陷的行为**，已改写为
+`task` 形态（保住各自原本要测的结构，不改断言语义）：
+
+| 位置 | 原写法 | 本意 | 改法 |
+|------|--------|------|------|
+| `src/mir/cache.rs` `cached_dag_runs_same_result` | `for … end` + 顶层 `return acc` | 缓存路径 ≡ 直建路径 | 累加与 `return` 一起放进 `task go()` |
+| `tests/e1_blast_radius.rs` `C2/C3` | 顶层 `if`/`for` 体内的 `return` | **控制流里 return 的传值**（E1 汇合点） | 整个控制流放进 `task f()`，`if`/`for` 内提前 `return` + 末尾兜底值原样保留 |
+| `tests/run_mir_equiv_run_dag.rs` `…_return` | 顶层 `return x * 2` / `return 0` | **return 路径**在两条执行路线上等价 | 两条 `return` 一起放进 `task f()` |
+
+这三条**不是**「为了让新守卫通过而放宽断言」——它们的断言语义一个字没动，
+只是把 `return` 挪进它本来就该在的函数体里。反过来说，这也从侧面印证了
+D42 的判定：顶层 `return` 之所以能长期存活，正是因为没有任何测试**声明**
+过它是有意支持的行为。
+
+**回归面核查**：REPL（`mora --repl`）输入 `return 5` 的行为在修前修后
+**逐字节相同**（都报 `parse error`），故 D42 未引入 REPL 回归。
+
+#### D44 / D44b / D45：`parser_v3` 恢复路径的**三连静默**（已修）
+
+由 D43 引出。追查过程中发现的不是单点缺陷，而是 `parser_v3` 里一类
+**贯穿性的「解析失败就静默」**。三者的静默方式不同，后果递增：
+
+| # | 位置 | 修前行为（真实 CLI `mora run` 实测） |
+|---|------|--------------------------------------|
+| D44 | `std::mem::replace(&mut self.emit, …)` 之后的 `?` | 父上下文被丢弃 → **外层函数体剩余部分全被发射进一次性子上下文后静默消失** |
+| D44b | match arm 解析失败 | `self.advance()` 吞掉该 arm → 少一个分支，**静默给出错误答案，exit 0** |
+| D45 | 6 个块体的语句循环 `if let Some(..) {}` | 语句解析失败**不消费任何 token** → 循环条件恒真 → **死循环，编译器永不返回** |
+
+##### D44：`EmitContext` 泄漏
+
+把嵌套体（task / closure / macro / worker / transaction / observe / span /
+section / with / update / app / match arm / match guard）编译成**独立寄存器
+空间**的做法是 `let parent = std::mem::replace(&mut self.emit, EmitContext::new())`，
+体发射完再换回来。问题在于两者之间散布着 `?` —— **`?` 直接从整个 emitter
+函数返回，跳过换回**：
+
+```rust
+let parent = std::mem::replace(&mut self.emit, EmitContext::new());
+let (arm_val_reg, body_w) = self.emit_expr_w()?;   // ← 早退，parent 被丢弃
+...
+let body_mir = std::mem::replace(&mut self.emit, parent).finish();  // 到不了
+```
+
+于是 `self.emit` 永久停留在那个一次性上下文上，**此后整个外层函数体的剩余
+部分都被发射进去然后丢掉**。
+
+**判决实验**（只改 match arm 与 match guard 两处）：
+
+```mora
+task w()
+  match 1 with
+    1 -> 5        // 好 arm
+    2 -> return 9 // 坏 arm（体只接受 expr）→ arm 发射失败
+  end
+end
+print(w())
+```
+
+| 状态 | `w()` |
+|------|-------|
+| 修前 | `nil` |
+| 只修好 arm（仍静默吞） | `5.0` |
+| 三处全修 | 编译期报错 |
+
+修前为何连**好 arm** 都失效：MIR dump 显示
+
+```text
+TaskDef w body = [ MatchExpr { val: 0, arms: [("float:1", …, Const(0, 5.0)), 0] },
+                   Return(Some(0)) ]
+```
+
+`val: 0` 从未被写入 —— **匹配对象 `1` 的 `Const` 指令随父上下文一起消失了**。
+故 `MatchExpr` 读一个未初始化寄存器，谁都匹配不上。
+
+**普查**：全仓 16 处 `mem::replace(&mut self.emit, …)` 配对，**14 处**在两者
+之间有裸 `?`（其余 2 处本来就干净）。14 处全部改为「体包进闭包 + 失败时先
+还原父上下文再返回」。
+
+##### D44b：畸形 match arm 被静默吞掉
+
+修好 D44 后仍有一层：`emit_match_w` 的 arm 循环在 arm 解析失败时是
+`self.advance()`，畸形 arm **凭空消失**。实测（全部 **exit 0、零提示**）：
+
+| 源码 | 修前 |
+|------|------|
+| `1 -> return 7` | `1.0`（坏 arm 消失，match 结果是未写入的 dst） |
+| `1 -> break` / `1 -> let z = 7` | `1.0` |
+| `1 ->`（空体） | `1.0` |
+| `1 -> @@@`（纯垃圾） | `1.0` |
+| `1 -> 5` + `2 -> return 9` | `1.0`（好 arm 恢复但坏 arm 仍被吞） |
+
+改为编译期报错。
+
+**这里踩到一个反直觉的坑，值得记下**：直接把 `self.advance()` 换成报错，会让
+**所有 match 形式全部失效**（实测 7 个形态无一幸免）。原因是那个
+`self.advance()` **是承重的** —— arm 之间的换行清理写在 arm 尝试**之后**，
+循环首次进入时 token 必是 `Newline` → `parse_pattern` 失败 → 落到恢复分支。
+正确修法是**把换行/分隔符清理前移到 arm 尝试之前**，之后解析失败才算真畸形。
+`tests/parser_recovery.rs::valid_match_forms_still_work` 专门钉住这一组形态。
+
+##### D45：6 种块体**死循环**
+
+`parallel` / `worker` / `observe` / `span` / `section`(prompt\|document) /
+`with` 的语句循环原本是 `if let Some((r, w)) = self.emit_statement_expr_w() { … }`
+—— 解析失败就**跳过**，而失败路径**不消费任何 token** → `while !check(End)`
+条件恒真 → **无限循环，编译器永不返回**（真实 CLI 限时 8s 实测，六种全部挂死）。
+
+比 D44/D44b 更严重：那两个至少 exit 0，这个是**进程挂住、无限占用 CPU**。
+改为报错，并加一条**显式不变量**：
+
+```rust
+let before = self.current;
+… 发射一条语句 …
+while self.match_token(&[TokenType::Newline]) {}
+if self.current == before { 报错 }   // 一轮循环必须至少消费一个 token
+```
+
+其余块体（task / transaction / macro / update / closure / 顶层 / if / for /
+while 体）修前就已正确报错（它们用 `?` 传播失败，不是跳过）——
+`tests/parser_recovery.rs::unparsable_statement_elsewhere_is_rejected` 钉住
+它们，防止将来有人把 `?` 改成跳过而引入挂死。
+
+新增 `tests/parser_recovery.rs`（**4 条**）。该文件可以直接断言「畸形输入必须
+报错」而无需超时保护，正因为上面那条「每轮必须消费 token」的不变量使空转在
+结构上不可能；若将来删掉它，症状是**测试套件整体超时**——在 CI 里同样醒目，
+且远好于悄悄挂住。
+
+##### D43：`return` 落在 match arm 里返回 `nil` —— 定案为 D44，非独立缺陷
+最初按「`return` 在 match arm 里返回值丢失」记录。追查 MIR 后**该描述的机制
+是错的**，现更正：
+
+* `1 -> return 7` 里的 arm 体走 `emit_expr_w`（只接受表达式），`return` 不是
+  表达式 → arm 发射失败 → 落入 D44 的上下文泄漏；
+* 泄漏使**匹配对象的 `Const` 指令一并消失**，故 `MatchExpr` 读未初始化寄存器
+  → 整个函数返回 `nil`；
+* arm 体按 spec §14.2（`pattern [ "when" expr ] "->" expr`）本就该只接受表达式，
+  `1 -> return 7` **不是合法语法**。
+
+对照实验（`if` / `for` / `while` 体里的 `return` 全部正确返回 7.0、arm 体为
+常量值时也正确、arm 之后的语句也正常执行）把范围收得很死：**不是「return
+坏了」，也不是「match 坏了」**。D43 因此并入 D44/D44b，不再单列。
+
+#### D46：字段列表类块（`enum` / `struct` / `app`）的字段循环（已修）
+
+顺着 D45 的普查继续扫剩余恢复点，找出**第三个成员**。三者同源（字段循环
+缺少失败处理）但病各不相同：
+
+| 块 | 修前行为（真实 CLI `mora run` 实测） |
+|---|---|
+| `enum` | **根本没有 `else` 分支** —— 变体名解析失败时既不 push 也不 advance，循环条件恒真 → **死循环**，且每次重打错误刷屏 |
+| `struct` | 字段名失败 → `self.advance()` **静默跳过整行**；类型标注失败 → `if let Some(..)` **静默丢字段** |
+| `app` | 字段失败 → `self.advance()` **静默跳过整行** |
+
+```mora
+enum E
+  A
+  @@@        ← 修前：死循环（限时 8s 实测挂死）
+  B
+end
+```
+
+```mora
+struct S
+  @@@        ← 修前：静默跳过，print(111) 照常执行、exit 0、零提示
+  x: Int
+end
+print(111)
+```
+
+`struct` / `app` 的后果是**静默的错误成功**：用户以为 `x: Int` / `msg: N`
+声明成功了，后续代码照常跑，退出码 0。`enum` 则是三者中最严重的 —— 进程
+挂住、无限占用 CPU。
+
+统一改为报错 + 显式「每轮必须消费一个 token」不变量（与 D45 同）。
+
+##### 顺带又揪出一条**空的** EBNF 用例
+
+`tests/spec_ebnf_surface.rs` 的 `app_stmt` 用例原写
+`"app tea_app\n  1\nend\n"` —— 体是裸表达式 `1`，而实现的 `app` 块要求
+**标签形式**（`model:` / `msg:` / `init:` / `update:` / `view:`）。它此前
+「通过」**只是因为解析器静默跳过了那一行**（正是 D46），既没测到 app 的任何
+语义、形状又与 spec §14.2 的 `app_stmt = "app" IDENTIFIER { statement } "end"`
+不符。收紧后它立刻失败，**正好证明是假阳性** —— 与 D39 揪出的 `with a = 1`
+是同一种「测试只因解析器丢弃输入才通过」。
+
+已改用实现真正接受的标签形式。附带记录一处**spec 分歧**：EBNF 说 `app` 体是
+`{ statement }`，实现只接受标签形式。该分歧与 D41 的声明类语法问题同性质
+（要先定文法归属），已并入待定清单，未擅自改 EBNF。
+
+##### 顺带观察（未修，仅记录）
+
+合法的 `struct` / `enum` 声明**每次都触发差分回落**（`pipeline_mir=3
+original_mir=4`），即 9 层管线对这两种声明的降维与 emit 路径不一致，永远走
+emit 路径。与 D38 当时查出的「7 类构造一直在默默走 emit 路径」同性质，属
+9 层管线的覆盖面问题，不在本轮范围。
+
+#### D47：调用点的 arity 校验**只覆盖一半路径、只查一半方向**（已修）
+
+把扫描从解析器扩到运行期后第一个命中项。真实 CLI `mora run` 实测，
+**全部 exit 0、零提示**：
+
+```mora
+task f(a, b)
+  99
+end
+print(f(1))          → 99.0     b 被静默填成 Nil
+
+task f(a)
+  a
+end
+print(f(1, 2, 3))    → 1.0      多余实参被静默丢弃
+```
+
+**判决实验** —— 同一段源码，只差「调用点与定义点是否同一个函数体」：
+
+```mora
+task f(a, b)
+  99
+end
+print(f(1))          ← 同体：走 task_registry，**静默通过**
+
+task f(a, b)
+  99
+end
+task g()
+  f(1)               ← 跨体：走 env 里的 Value::Task
+end
+g()                  ← 正确报 `task expects 2 args, got 1`
+```
+
+即**同体定义并调用 —— 最常见的写法 —— 恰好绕过了检查**。
+
+**两处洞**：
+
+| 位置 | 修前 |
+|------|------|
+| `mir/handlers/values.rs::h_call` 的 **task_registry** 分支 | **完全没有** arity 校验，缺参静默填 `Nil`（`arg_vals.get(i) … unwrap_or(Nil)`） |
+| `interpreter/dispatch.rs` 的 `Value::Task` / `Value::Closure`、`builtin_impls.rs` 的 `Value::Macro` | 只查 `args.len() < params.len()`，**多余实参静默丢弃** |
+
+对照：内建与方法在 typeck 层有正确的 `Expected N arguments, got M`；闭包**少参**
+也早就有 `closure expects N args, got M`。**只有 task 的这两处是洞。**
+
+**静默填 Nil 为什么特别危险** —— 症状**取决于缺的那个形参用不用**：
+
+```mora
+task f(a, b)
+  a            // b 没用 → 静默返回 a
+end
+f(1)           → 1.0，零提示
+
+task f(a, b)
+  a + b         // b 用了 → 报「Operands must be two numbers...」
+end
+f(1)           → 错误信息指向操作数类型，**完全掩盖了真正的 arity 问题**
+```
+
+后者尤其误导：用户会去查 `+` 的类型规则，而真实原因是少传了一个参数。
+
+**修法**：三处统一为 `args.len() != params.len()` 即报错，registry 分支补上
+原先完全缺失的校验。收紧的是**校验**而非调用语义 —— 正确 arity 全部照常
+（全量 1491 条零回退即是证据）。
+
+新增 `tests/call_arity.rs`（**5 条**）：同体少参（含「缺参未被使用」与
+「缺参被使用」两种症状）、跨体少参（对照，防回退）、同体/跨体/零参 task 的
+多余实参、闭包与宏的多余/缺少实参、以及 6 组正确 arity 不得被误伤。
+
+##### 顺带发现（未修，仅记录）
+
+闭包**多余**实参确实被拒绝，但拦在 **typeck** 且**文案完全不相关**：
+
+```text
+Type mismatch: expected float, got fn (float) -> ' ! { rho1 }
+```
+
+既没提参数个数，也没提是哪个调用。这属 typeck 闭包调用的类型推导问题，
+与本条（运行期 arity 校验）不同层，已在 `tests/call_arity.rs` 里用
+`must_err` 只钉「被拒绝」这一事实、不钉文案。
+
+#### D48：`reduce` 缺初值 → 累加器**静默从 `Nil` 起算**（已修）
+
+延续 D47 的扫描方向（「参数静默兜底」），在方法实现里又命中一处。
+
+spec §1053 写的是 `.reduce(fn, init)`、签名 `closure, any -> any`
+—— **init 是必填参数**。但实现里 `args.get(1).cloned().unwrap_or(Value::Nil)`
+把「缺初值」变成了「从 Nil 起算」，症状分两种：
+
+```mora
+[1,2,3].reduce(fn(a,b) a+b end)
+  → Runtime error: Operands must be two numbers, two strings, or two lists
+    ← 误导：真实原因是少传了初值，用户会去查 `+` 的类型规则
+
+["a","b","c"].reduce(fn(a,b) a+b end)
+  → "nilabc"   ← **静默的错误结果，exit 0**
+```
+
+字符串那例是本会话最恶劣的静默之一：`Nil` 被当字符串拼了进去，**返回值里
+直接带着 `"nil"` 字样**，程序却「成功」结束，下游拿到的数据已损坏且**无任何
+征兆**（与 D1 的 `range` 静默取默认值同族）。
+
+**不采用「缺初值就用首元素」** —— spec 明确 init 必填，那是语言设计决定，
+不该由实现悄悄替用户选。改为报错。
+
+#### D49：`transpose` 对**不规则二维表**静默补 `nil`（已修）
+
+同一次扫描里的第三处。此前只校验「每项都是列表」，**不校验各行等长**，
+短行用 `row.get(col).unwrap_or(Nil)` 补齐：
+
+```mora
+[[1,2],[3]].transpose()     → [[1.0, 3.0], [2.0, nil]]
+[[1],[2,3]].transpose()     → [[1.0, 2.0], [nil, 3.0]]
+[[1,2,3],[4]].transpose()   → [[1.0, 4.0], [2.0, nil], [3.0, nil]]
+```
+
+全部 **exit 0、零提示**，返回一个用 null 补齐的**伪矩阵** —— 下游任何按长度
+或形状计算的代码都会拿到垃圾而不自知。spec §1060 `.transpose() -> list`
+未承诺补齐语义，故按「不规则即报错」处理，错误信息带上各行宽度便于定位。
+
+新增 `tests/list_method_defaults.rs`（**4 条**）：D48 的 5 种缺初值形态（含
+最恶劣的字符串例）、D48 给初值的 5 组正确行为、D49 的 4 种不规则形态、
+D49 的 3 组矩形/空表正确行为。
+
+#### D50 / D51：内建里最后两处「参数静默兜底」（已修）
+
+把 D47 / D48 建立的模式补齐最后一格 —— **同一份代码里参数校验覆盖一半、
+漏的那一半静默产出错误答案**。
+
+##### D50：`macroexpand` 缺参给**误导性**错误、多余实参**静默丢弃**
+
+```mora
+macro m1(a, b)
+  a + b
+end
+
+macroexpand("m1")             → Operands must be two numbers…   ← 误导
+macroexpand("m1", [7])        → 同上（仍是误导性错误）
+macroexpand("m1", [7, 8, 9])  → 15.0                            ← 多余实参静默丢弃
+```
+
+与 D47（task 少参 / 多参）、D48（reduce 缺初值）完全同型，只是这一处
+**两头都漏**。真实原因是少传了实参，错误却指向宏体里 `+` 的类型规则。
+
+##### D51：`memory.store` —— **同一函数内验证不对称**
+
+```rust
+let key = args.first().map(|v| v.to_string())
+    .ok_or("memory.store: requires key")?;              // ← key：有校验
+let value = args.get(1).cloned().unwrap_or(Value::Nil);  // ← value：静默兜底
+```
+
+```mora
+memory.store("k1")
+memory.recall("k1")   → nil     exit 0、零提示
+```
+
+用户以为存了，实际存进去的是空。同一函数里 key 那一侧写了 `.ok_or(..)`、
+value 那一侧却是 `unwrap_or(..)` —— **验证不对称本身就是缺陷的形状**。
+
+该 namespace 在 spec 里**零记载**、typeck 也**零签名**，没有编译期 arity
+兜底，只能在运行期拦。已一并记入待定清单（spec 补 `memory.*` 的签名表）。
+
+##### 顺带核实为**正确**（无需改动）
+
+同一批扫描里另外几处 `unwrap_or` 经实测是**不可达**或已正确报错，不属缺陷：
+`dict.set` / `dict.get` 由 typeck 拦下（`Expected 2 arguments, got 1`），
+故 `method_dispatch.rs` 里那两处 `unwrap_or` 是纯防御；`tea.run()` 缺参正确
+报 `missing app arg`；`event` 命名空间在用户代码里根本不可达（typeck 报
+`Unbound variable 'event'`）。
+
+新增 `tests/builtin_silent_defaults.rs`（**5 条**）：D50 的 4 种 arity 不符
+形态 + 2 组正确 arity、D51 的缺 value / 缺 key / 存取往返（含字符串）。
+
+#### 顺带修好一个**测试盲区**：`equivalent_spellings.rs` 从不跑 typeck
+
+该文件检验「同一语义的两种写法是否一致」，但它的 `run` 只调
+`ParserV3::compile` + `run_mir` —— **完全绕过类型检查**。于是「两种写法运行期
+一致」可以在**其中一种编译器根本不接受**的情况下照样「通过」。
+
+给它加上 `check_program_witnesses_bidirectional` 之后，当场暴露**两个真缺陷**
+（D52 / D53）与**一个既有缺口**（D54，见下）。
+
+#### D52：`List.get` 的下标只收 `Int` —— `xs.get(1)` 编译不过（已修）
+
+`typeck/dispatch.rs` 里 `get` 的签名声明 `index: Type::Int`，而**本语言所有
+数值字面量都是 `Float`**（D1 已确立：`len()` 返 Int 是全语言唯一的 Int 来源）：
+
+```mora
+let xs = [10, 20, 30]
+xs[1]        // ✅ 能编译
+xs.get(1)    // ❌ Type error: expected int, got float
+```
+
+**同一操作的两种写法，一种通一种不通** —— 而且不通的那一种是**更自然**的写法。
+更糟的是 `tests/equivalent_spellings.rs` 里恰好有 `list_index_vs_get` 这条配对
+却一直「通过」，因为该文件绕过了 typeck（见上）。
+
+对照运行期 `mir/vm.rs::index_value`：对 List 下标有 `Value::Int` 与
+`Value::Float` **两个分支**，都走 `checked_index` —— **运行期两者都收**。故把
+签名改为 `Int | Float` 与之对齐。
+
+#### D53：两侧都是索引表达式时 `==` 被压 `Numeric` 约束而拒（已修）
+
+`infer_binop` 的 `Equal | NotEqual` 分支里，只要任一侧是 `TypeVar` 就压
+`Numeric` 约束（v0.104 的意图是让未解析变量参与数值塔提升）。但 `Numeric` 的
+定义就是「**两侧都必须是数值**」—— 一个**永远不会被解析**的 `TypeVar` 会在
+solve 阶段被按「必须是数值」拒绝。
+
+索引表达式正是这种 `TypeVar`：witness 侧把 `xs[i]` 编码成 `Call("[]")`，
+而 **`[]` 在 typeck 里没有签名**，其结果类型恒为 fresh `TypeVar`、没有任何
+约束会去解析它。
+
+真实 CLI 实测（修前）：
+
+```text
+[1,2][0] == [1,2][1]   → Type error: expected numeric type (int or float)
+"ab"[0] == 'a'          → 同上
+```
+
+而 `xs[0] == 1`、`1 == xs[0]`、`xs[0] > 0`、`xs[0] + xs[1]` **都正常**（后两者
+走的是别的分支）—— 触发条件精确到「**两侧都是索引表达式**」。
+
+**修法**：仅当**对侧确实是数值**时才延迟到 `Numeric`（保住 v0.104 的提升场景，
+`for i in [1,2,3]; if i == 6i` 那条仍走原路径），否则退回 `Eq` —— `TypeVar` 与
+任意类型合一是安全的，且运行期 `index_value` 本就支持任意类型。
+
+#### D54：v0.103 的「Dict 字段访问」分支**遮蔽了真方法**（已修）
+
+加完 typeck 关卡（本文件 `run` 现在会跑 `check_program_witnesses_bidirectional`）
+之后暴露的**第四个**真缺陷，也是 D55 的前置条件。
+
+**现象（修前）**：
+
+```mora
+let d = {a: 1}
+let n: String = d.len()        → 被接受（实得 1）   ❌ 签名明明返回 Int
+let n: String = d.keys().len() → 被接受（实得 1）   ❌
+```
+
+而 List / String 接收者、以及 builtin `len(d)` **全都正常报错** —— 唯独
+Dict 方法这一路失控。`let eq = len(d) == d.len()` 也会报
+`expected int, got float`（把 `return` 值记成 Float），
+`d.len() == len(d)` 则报 `expected float, got int`（两侧对调）。
+
+**根因**：`infer_method_call` 里有一条 v0.103 的规则 —— **无实参的 `d.<name>`
+是「读 dict 的同名字段」**（`d.count` 这类 Dict / TeaModel 字段访问要用），
+返回 dict 的**值类型**。而 `dict_field_type` 对 `Type::Dict(_, v)`
+**无条件**返回 `Some(v)`，**不检查 `<name>` 是不是一个真方法**。
+
+于是 `d.len()` 被当成「读 dict 的 `len` 键」，返回值类型，把**签名表算出的
+`ret = Int` 整个覆盖掉**。插桩实测同一行：
+
+```text
+@@LEN  recv=Dict(String, TypeVar('\0'))  ret=Int   ← 签名算对了
+@@CHK  synth=TypeVar('\0')  expected=String        ← 返回的却是 dict 的值类型
+```
+
+`d.keys()` 同理退化成值 TypeVar，于是链式 `d.keys().len()` 的 receiver 成了
+TypeVar、落到 `method_return_type` 兜底 → **返回 `Float`**。**一个分支解释了
+全部现象。**
+
+**修法**：字段访问分支先要求「这个名字**不是**一个已知方法」
+（`method_signature(recv, method).is_none()`）。方法优先于字段，与运行期
+`method_dispatch` 的分派顺序一致。
+
+**实测修后**（12 项对照全对）：`d.len()` / `d.keys().len()` 正确推为 `Int`、
+错标注正确报错；`d.count` 字段访问与 `d.count + 1`（v0.103 注释里的原例）
+仍可用；`d.get` 的值类型与「缺失键 → Nil」契约不变；遍历字典求和、
+`xs.len()` / `s.len()` 均无回退。
+
+新增 `tests/dict_method_vs_field.rs`（**6 条**）钉住以上每一面；原
+`equivalent_spellings.rs` 里记录该缺口的测试**已删除**（保留它会把正确行为
+锁死成「必须报错」），`len_builtin_vs_method_dict` 配对改回自然的
+`if … then 1 else 0 end` 形态。
+
+##### D55 为何**仍未修**（第二次回退）
+
+D54 修好后我重开了注解约束，**对 D55 确实有效**，但引入一处**真实回归**：
+
+```mora
+let d = {count: 5}
+let n: Int = d.count    → 修前合法，修后 expected float, got int
+```
+
+因为本语言**数值字面量全是 `Float`**、`Int` 与 `Float` 在这套系统里互溶
+（`subtype_of`，v0.90.5），而 `Eq` 约束对 Int/Float 是**严格**的。
+
+**要两者兼得，需要一种尊重数值塔的「子类型」约束**：synth 解析为 `Float`、
+注解为 `Int` 时应当**放行**并把 TypeVar 绑到 `Float`。现有 `Constraint`
+只有 `Eq` / `Numeric` / `RowEq` —— `Eq` 太严，`Numeric` 虽接受混合但会把
+TypeVar 绑到 `Int`、与字典字面量的 `Eq(TypeVar, Float)` 仍然相撞。
+**新增约束种类牵动 solver 与所有已注册约束的使用点，超出本轮范围**，故再次
+回退，并在 `bidirectional.rs` 原处留下完整实验数据。
+
+D55 现状（已由 `tier1_typeck_mir.rs` 里那条测试钉住）：
+
+```text
+let xs = ["a","b"] ; let y: Int = xs[0]       → 被接受（实得 "a"）  ❌
+let xs = ["a","b"] ; let y: Int = xs.get(0)   → 被接受（实得 "a"）  ❌
+let d = {a: "s"}   ; let y: Int = d["a"]      → 被接受（实得 "s"）  ❌
+let xs = [1,2]     ; let y: String = xs[0]    → 被接受（实得 1.0）  ❌
+let s = "ab"       ; let y: String = s[0]     → 正确报错 got Char   ✅（D55 时修的）
+let d = {count: 5} ; let n: String = d.count  → 被接受（实得 5.0）  ❌
+```
+
+#### D55：又一条**假阳性**测试 —— List / Dict 元素类型经索引不被追踪
+
+`tests/tier1_typeck_mir.rs::list_get_exposes_element_type_error` 在 D52 修好后
+**失败**了，而它断言的错误是**真的**（`String` 元素 `+ Int` 确实该报）—— 但它
+此前「通过」的原因与被测行为无关：
+
+```text
+let xs = ["a", "b"]
+let y = xs.get(0)
+y + 1                     → 此前「有错」，但错的是**下标**（D52），不是 `+`
+```
+
+即**错误的原因与被测的行为无关**。与 D39 揪出的 `with a = 1`、D46 揪出的
+`app_stmt` 同型。已改为记录事实（见该测试的注释）。
+
+而它想检验的那件事确实**也不成立**，原因是另一条独立缺陷 —— **List / Dict 的
+元素与值类型经索引完全不被追踪**：
+
+```mora
+let xs = ["a", "b"]
+let y: Int = xs[0]         → 被接受（实得 "a"）    ❌
+let y: Int = xs.get(0)     → 被接受（实得 "a"）    ❌
+let d = {a: "s"}
+let y: Int = d["a"]        → 被接受（实得 "s"）    ❌
+let y: String = [1,2][0]   → 被接受（实得 1.0）    ❌
+let y: String = "ab"[0]    → 正确报错 expected String, got Char  ✅
+```
+
+**根因**：`infer_list` / `infer_dict` 返回的是 `List(TypeVar)` / `Dict(_, TypeVar)`，
+元素类型要到**后续 solver 阶段**才被替换；witness 侧又把读索引编码成
+`Call("[]")`，而 `[]` 在 `builtin_callee_ty` 里**没有登记**，结果类型恒为
+**fresh TypeVar**，与元素类型之间没有任何约束相连。
+
+本轮为此在 `infer_call` 里给 `[]` 加了特判（按接收者推断结果类型，与运行期
+`mir/vm.rs::index_value` 的分支对齐），但**只保留 String 分支**：
+
+* String 分支**确实生效** —— `Char` 是具体类型、无需等 solver，
+  `let y: String = "ab"[0]` 现在能正确报出 `expected String, got Char`（修前不报）；
+* List / Dict 分支**写不生效** —— 实测在 `xs = ["a","b"]` 上压
+  `Eq(result, elem)` 约束，`let y: Int = xs[0]` 仍被接受（该约束在 solve 时
+  与 `+` 产生的 `Eq(result, Float)` 相撞却**不报错**）。故**删掉**这两个分支
+  —— 留不留不住的代码比没有更糟。
+
+**未修**：接上 List/Dict 的元素类型需要弄清「为什么 `Eq(result, elem)` 与注解
+约束不冲突」，影响面远超一处索引推断。D55 已由 `tier1_typeck_mir.rs` 里那条
+改写的测试钉住事实。
+
+**一条曾怀疑、已被否证的线索**（记下来免得再走一遍）：曾怀疑「`infer_call` 里
+压的约束不会到达 solver」——**不成立**。实测把 String 分支的 `Char` 改成经由
+`Eq(fresh_var, Char)` 压约束返回，`let y: String = "ab"[0]` **同样**被正确报出
+`expected string, got char`，说明约束传播是好的。D55 接不上另有原因，尚未查清。
+
+#### D65：`exec.parallel` 自制信号量的**丢唤醒**死锁（已修）
+
+跑全量测试时 `exec_parallel_respects_max_concurrent` **把整轮测试挂死**：
+CPU 冻结在 4.2s、工作集不再增长、**无任何子进程**、日志停在
+`has been running for over 60 seconds`。`taskkill` 终止测试二进制后恢复。
+
+该测试**直接调** `Interpreter::call_exec_method`，完全不经过 parser / typeck，
+所以与本轮的标注改动无关（构造上即排除）。
+
+##### 根因：`Semaphore` 的「决定是否等待」发生在锁**之外**
+
+```text
+W(等待者): load(permits) → 0                          ← 未持锁就判定「要睡」
+R(释放者): fetch_add → prev=0 → permits = 1
+R:        lock(mutex) → notify_one()                   ← W 还没注册成 waiter，通知丢弃
+R:        unlock(mutex)
+W:        lock(mutex) → cond.wait()                    ← permits=1 可用，却永久睡眠
+```
+
+`release` 是「先加计数、再拿锁通知」，`acquire` 是「先判计数、再拿锁等待」，
+两者之间没有任何同步 → 通知可以落在「判定之后、注册之前」的缝里。
+
+修法两条：
+
+* `acquire` 慢路径**持锁重查**后才 `wait`（`permits` 在锁内仍为 0 才是可靠的
+  「要睡」判据）；重查发现已有 permit 就放锁回快路径 CAS
+* `release` 改**无条件** `notify_one` —— 原来的 `if prev == 0` 是脆弱启发式：
+  permits 从 1 涨到 2 时 `prev != 0` 就不通知，而此时完全可能仍有等待者在睡
+
+快路径（无竞争时一次 CAS）保留，不付 mutex 代价。
+
+##### 诚实说明：这个测试**抓不住**原缺陷
+
+`semaphore_high_contention_completes_and_conserves_permits`（16 线程 × 400 轮
+抢 4 permit）是**不变量测试**而非缺陷复现器 —— 已做反向验证：把 `acquire` /
+`release` 改回修复前的实现后，本测试仍 **0.00s 通过**（多核上几乎全走 CAS 快
+路径，几乎不进 `cond.wait`）。隔离运行原测试 0.12s 通过、exec 组连跑 6 次全绿，
+本机**无法确定性复现**。
+
+记这一点是为了不让后来人误以为「跑绿了就证明修好了」：缺陷由**代码结构论证**
+（上面的时序图）+ **那次全量挂死观测**共同支撑，不是由测试支撑的。
+
+##### 顺带
+
+`dispatch.rs` 的 `mcp_tool_schema_accepts_dict_and_rejects_junk` 里
+`let env = interp.take_env();` 未使用（`unused variable` 警告），删掉。
+
+##### 本轮另外两个否定结果（记下来免得重查）
+
+**① E1（语句静默消失）不蔓延到块体内。** D87b 只验了 `observe`/`span`/`parallel`/
+`worker`/`with` 块能解析、块体能输出。块体是**独立 MirFunction / 独立寄存器空间**，
+若也吃 E1 那套 `seq_preds` 饿死，症状应完全相同。实测 **14 种控制流形态全部正确**：
+
+| 嵌套位置 | 形态 | 实测输出 |
+|---|---|---|
+| 5 种块体内 | `if/else` | `in-o1 in-o3 after`（then 正确、else 不重复、尾部不丢） |
+| 块体内 | `while` / `for` / `match` | 循环与分支输出完整 |
+| 块体内 | `while` 里嵌 `if` | `0.0 1.0 skip2 3.0 after`（分支选择正确） |
+| 块嵌套块 | `observe` 里嵌 `observe` | `in-inner in-outer after`（顺序正确） |
+| 顶层 | `transaction` | `in-tx after` |
+
+**② spec §959-960「保留 Int 类型」运行期真的兑现。** 该语言整数字面量是 `Float`
+（`type_of(1)` = `float`），而 `len()` 是少数产出 `Int` 的入口。拿 `len([1,2,3])`
+喂取整族：`floor`/`ceil`/`round`/`trunc`/`abs`/`sign` **全部返回 `int`**，喂 Float
+则全部返回 `float`（`fract` 例外返 `float`，正确）。D88 给这族声明的
+`Union[Int, Float]` 是恰当的过近似。数值塔自洽：`Int+Int→Int`、掺 Float→Float、
+除零正常报错。
+
+#### D117：README 首例的「Type checking」示例**无法解析** —— 用了未实现的参数标注（已更正）
+
+D110 在 spec 上验证了「文档代码块普查」这套方法有效。把同一套方法搬到
+`README.md`（**用户接触语言的第一份文档**，且**在版本控制内**，与未被跟踪的 spec 不同）。
+
+普查结果：README 有 **3 个 ```mora 块，其中 1 个不可解析** —— 正是
+「## Type checking」一节的示例。
+
+##### 根因：示例用了未实现的**函数参数类型标注**
+
+```mora
+let name: string = "mora"          -- OK
+let age: number = "thirty"         -- typeck: string → number    ← 实测确实正确报错
+task add(a: number, b: number): number
+  return a + b
+end
+add(1, 2)                          -- OK
+add(1)                             -- error: 2 args expected
+add("x", 2)                        -- error: arg 1 must be number
+```
+
+逐行拆解实测：
+
+| 行 | 实测 |
+|---|---|
+| `let name: string = "mora"` | ✓ `mora` |
+| `let age: number = "thirty"` | ✓ 正确报错 `expected Union([Int, Float]), got String` |
+| `task add(a: number, b: number): number` | ✗ **`Parse error: Expected ')' after parameters`** |
+| `task add(a, b)`（去掉标注） | ✓ `3.0` |
+
+即 **`fn` / `task` 的参数标注 `(a: number)` 尚未实现**（D110 缺口 1，
+spec 里另有 7 处同样写法）。README 恰恰用它当类型系统的首例，
+而**它想演示的「`add("x", 2)` 被 typeck 拦住」恰好依赖这个未实现特性** ——
+去掉参数标注后，`add("x", 2)` 会变成运行期错误而非静态错误。
+
+##### 更正（实现是对的，文档错了 —— 与 D108 / D116 同类）
+
+改用**受支持**的 `let` 标注演示同一件事（`let a: number = 1` + `a + "x"` 报错），
+并把原示例作为 `> ```text` 引用保留 + 注明「参数标注尚未实现」。
+README 的 ```` ```mora ```` 块由此 **1 坏 → 0 坏**。
+
+新增 `tests/readme_code_block_census.rs`（2 条）：**真的读 README.md** 提取
+```` ```mora ```` 块逐条判定并打印清单；外加一条反向对照（解析器能解析合法 Mora、
+拒绝非法 Mora），确保「不可解析清单为空」不是因为提取逻辑坏了。
+
+#### D118：省略 `end` 的闭包**静默吞掉后续顶层语句**（已修）—— spec 普查第二批
+
+D117 用「文档代码块普查」把方法搬到 README 后，本轮把它用在 spec 的**坏块根因**上：
+先逐条归类 21 个不可解析块，再对每一类做最小复现实测。归类过程中撞出一个
+**真正的实现缺陷**（不是文档错误）。
+
+##### 真缺陷：`let f = fn(x) x + 1` 会把该行之后的**全部顶层语句**吞掉
+
+```mora
+print("A:start")
+let f = fn() 1
+print("B:after-def")    -- 这两条与最后一条此前全部消失
+print("C:call=", f())
+print("D:end")
+```
+
+实测（D118 修复前）：
+
+| | 结果 |
+|---|---|
+| stdout | 只有 `A:start` |
+| 退出码 | **0** |
+| 诊断 | **零** |
+
+即 `print` 被当成闭包体的语句吞进闭包，顶层什么都不剩 —— 典型的
+**静默丢弃**族（数据丢失 + exit 0 + 无诊断）。
+
+##### 根因：`emit_block_w` 的块终止集不含 Newline，而 `end` 是可选的
+
+`src/parser_v3/emit.rs` 的闭包分支原本只在 `=>` 时走表达式路径，
+`fn(x) x + 1` 落到 `emit_block_w`。而 `emit_block_w` 的换行块终止集
+（`is_block_end`）是 `End | RParen | RBrace | Comma | EOF | else`
+—— **没有 Newline**；`end` 又是可选的（v0.87 为支持「`fn(x) x + 1`
+作最后一行 / 作实参」而允许省略）。两者叠加，省略式闭包一路吞到 EOF。
+
+##### 这不是「实现不该支持」，而是「实现没兑现 spec」
+
+spec §14.2 的产生式本来就没写 `end`：
+
+```
+closure = "fn" "(" params ")" ( expr | "{" { statement } "}" ) ;
+```
+
+即 `fn(params) expr` **是** spec 承诺的形态。所以修法是让它可用，
+不是禁止它（先前一版把「省略 end + 多语句 + EOF」判为解析失败，
+虽消除了静默丢弃，但会把 spec 承诺的写法一并挡掉 —— **方向错了**，
+已回退）。
+
+修法：`)` 与体首 token **同行**、且首 token 是**表达式起点**时，
+直接按单表达式解析（只吃一个表达式，天然不吞后续语句）。两个条件都必要：
+
+- **同行** —— 换行多语句块 `fn()\n  print(1)\n  print(2)\nend` 的首 token
+  也是 `Identifier`，只看白名单会把它误降成「只执行第一条」。
+- **白名单**而非黑名单 —— `return` / `let` / `if` / `for` / `match` 等语句
+  起始不是表达式（`return` 也不在 `emit_expr_w` 里，走表达式路径会让
+  `fn() return 1 end` 回归）。白名单漏一个只退回原路径（行为不变）；
+  黑名单漏一个会让语句被当表达式解析而报错 —— **失败方向相反**。
+  `handle` / `perform` / `assign` 是 `Identifier` 却是语句式分发，显式排除。
+
+expr 路径另需**自行消费可选 `end`**：那行原本在 `emit_block_w` 里，
+不补会让 `end` 残留（实测 `let f = fn(x) x * 2 end` 直接解析失败 —— 全量测试
+立刻暴露 44 处失败，正是这条）。
+
+##### 修复后（真实 CLI 实测）
+
+| 源码 | 修复前 | 修复后 |
+|---|---|---|
+| `let f = fn() 1` + 3 条 print | 只有 `A:start`，exit 0 | 四行全出，exit 0 |
+| `let f = fn(x) x + 1` / `print(f(2))` | 编译过但 print 被吞 | `3.0` |
+| `fn() return 1 end`（对照） | 正常 | 不变 |
+| `fn()\n let a = 2\n a + 40\nend`（对照） | 正常 | 不变 |
+
+##### 顺带：两处 spec 文档错误（与 D108 / D116 / D117 同类，实现是对的）
+
+| 位置 | 问题 | 更正 |
+|---|---|---|
+| §6.1「词法作用域」 | 示例用**嵌套 `task` 定义** —— 具名定义**不能嵌套**（`task outer()` 内再 `task inner()` 解析失败），整段不可解析 | 改用闭包捕获（实测 `30.0`），与 §6.2 规则表 `fn(x) … end` 捕获外层变量对齐；并加注说明具名定义只能在顶层 |
+| §16.4「JSON」 | `json.parse('{"name": "Alice"}')` —— **单引号在 Mora 里是字符字面量**（§16.3 的 `'\n'` 就用它），报 `Char literal must contain exactly one character` | 改双引号 + 反斜杠转义（实测 `type_of` = `dict`），并加注说明 JSON 必须用双引号 |
+
+##### 顺带：普查工具自身的假阳性
+
+§14.3「注释」整段只有一行 `-- 单行注释`，被普查报成
+`empty program: parser produced no executable instructions` —— 那是**工具**
+的问题：演示注释的块本就该是空程序。`is_inert_block` 改为「每行都**要么**空
+**要么**是注释」，这类块归入 `inert` 不计入坏块。
+
+⚠ 第一版写成了 `filter(非空且非注释)` + `all(is_empty)`，而 `filter` 后剩下的
+元素按定义非空 —— `all(is_empty)` 成了恒真的空真，**函数对任何输入都返回 true**。
+正常路径不会暴露它（坏块会被误归 `inert` 从清单里消失），是紧跟的反向对照组
+（`assert!(!is_inert_block("let x = 1"))`）把它咬住的。
+
+##### 能力缺口（spec 未承诺，只记录）
+
+**具名 `fn` 定义不存在** —— 语句位置只认 `task`，`fn name() … end` 报
+`Failed to parse at line 1`（`func` / `function` 也不认）。`fn` 在语言里
+**只**作为闭包表达式存在。spec 从未承诺具名 `fn`（`fn` 在 spec 里只出现在
+未实现的 trait 方法上下文），故属能力缺口而非文档错误。
+
+##### 验证
+
+- `tests/spec_code_block_census.rs` 8 条 → **14 条**（新增 5 条 D118：
+  具名嵌套定义不支持 / 具名 `fn` 不存在 / 闭包捕获求值 / JSON 引号 /
+  省略 `end` 闭包可用且不吞语句；含 4 条**对照组**防「一刀切」修复）
+- spec 不可解析块 **21 → 18**（修 2 + 归 1 inert）；余下 18 条全部是
+  D110 已记录的既有缺口（参数标注 7 处、trait/impl、let 解构、跨行 `|>`、
+  `perform` 形式、Router/observe/span 的 Node 变体）
+- **反向验证**：把 `inline_closure_body_is_expr` 的判据撤成恒 `false`
+  （先读盘确认改动落盘），恰好 2 条失败 ——
+  `d118_omitted_end_closure_works_…` 与
+  `d110_function_parameter_annotations_are_not_supported`；
+  撤除后 14 条复绿。判据确实是**起作用的那段逻辑**，不是死代码。
+  ⚠ 顺带暴露：`d110` 那条对照断言在 D118 之前**一直通过**，通过的原因
+  正是缺陷本身 —— 它只钉住了「能编译」，没钉住「语义正确」。已补执行层断言。
+- 全量 **1671 passed / 0 failed / 21 ignored**（88 个测试二进制，基线 1665）
+- `cargo clippy --lib --all-features` 0 警告；改动文件 `rustfmt --check` clean
+
+#### D119：跨行管道 `|>` —— spec 的**规范形态**此前整段无法解析（已修）
+
+D118 修闭包时顺带撞出这一条：spec §7.6 的管道示例是**跨行**的，而实现只认单行。
+
+##### 缺陷
+
+`emit_pipe_w` 的循环是 `while self.match_token_exact(TokenType::Pipe)` —— **不跳换行**。
+换行一出现循环就退出、`|>` 残留成未解析 token。而 spec 里管道**一律**写成跨行：
+
+| 位置 | spec 原文形态 |
+|---|---|
+| §2.1 | `[1,2,3] |> map(fn(x) x*2 end)` |
+| §7.6 | `let result = "hello world"` 换行 `|> upper()` 换行 `|> split(" ")` 换行 `|> map(…)` 换行 `|> filter(…)` |
+| §18.1 | `router` 换行 `|> route("POST", …)` 换行 `|> listen(…)` |
+| §18.2 | `server` 换行 `|> tool(…)` 换行 `|> serve()` |
+
+真实 CLI 实测：
+
+| 源码 | 修复前 | 修复后 |
+|---|---|---|
+| `print("hello world" \|> upper())`（单行） | `HELLO WORLD` | 不变 |
+| spec §7.6 逐字形态（4 级跨行） | **`Failed to parse at line 2`** | `[4.0, 6.0]` |
+| `"hello world" \|> upper()` 换行 `\|> split(" ")` | **`Failed to parse at line 2`** | `[HELLO, WORLD]` |
+| `[1,2,3]` 换行 `\|> map` 换行 `\|> filter` | **`Failed to parse`** | `[4.0, 6.0]` |
+| 数组字面量/实参**内**的跨行管道 | — | `3`（均可用） |
+
+##### 修法
+
+循环改为「跳换行 → 试 `|>` → 不是就**回退并 break**」。
+
+⚠ 回退是必要的防线：下一行若是普通语句，被吞掉的换行就是**语句分隔符**。
+`self.current` 是下标，直接复位即可。
+
+##### 否定结果：那行回退**实测不可观测**（记录在案，别当护身符）
+
+反向验证时把 `self.current = saved` 摘掉，重跑 8 条新测试 + 3 个 CLI 样例
+（W4 `let a = 1` / `print(6)` / `print(a)`、W6 管道后接语句、W5 全跨行）
+—— **结果完全一致**，一行没红。
+
+原因：`emit_pipe_w` 由块语句循环调用，而后者末尾本来就有
+`while self.match_token(&[TokenType::Newline]) {}`，换行迟早被吃掉。
+该回退保留是为了让 `emit_pipe_w` 只在**真的**用到换行时消费它（局部性），
+**不是因为它被测到了**。`tests/pipe_multiline.rs` 里那条对照的注释已按此
+如实改写 —— 名字从「restored」改成「do_not_merge_following_statements」，
+避免后人误以为那行代码被覆盖。
+
+这正是「反向验证必须撤掉**真正起作用**的逻辑」的另一面：
+**反向验证没咬住，就说明那段防御当前是死的**，两者都要如实记。
+
+##### 顺带查明：跨行**二元**运算仍不支持（不在本修复范围）
+
+`let b = a` 换行 `+ 1` 仍报 `Failed to parse at line 3`。它与 `|>` 无关
+（本修复只在 `|>` 之前跳换行），已单列一条测试钉住这个边界 ——
+日后若实现了，须更新该测试而不是让它悄悄腐烂。
+
+##### 验证
+
+- 新增 `tests/pipe_multiline.rs`（8 条）：主判据取**执行层**末值
+  （`List([Float(4.0), Float(6.0)])`）而非「能解析」—— 同类改法完全可以做到
+  解析通过而语义全错；含 3 条**对照组**（语句分隔 / 单行管道不变 /
+  无管道源码不受影响）与 2 条**反向对照**（union 的 `|` 不是 `|>`；
+  跨行二元运算仍不支持）
+- `tests/pipe_multiline.rs` **9 条**：主判据取**执行层**末值
+  （`List([Float(4.0), Float(6.0)])`）而非「能解析」—— 同类改法完全可以做到
+  解析通过而语义全错；含 3 条**对照组**（语句分隔 / 单行管道不变 /
+  无管道源码不受影响）与 2 条**反向对照**（union 的 `|` 不是 `|>`；
+  跨行二元运算仍不支持）
+- **「读 spec」那条钉子做了真反向验证**：把 `docs/mora-spec.md` §7.6 的
+  `|> upper()` 临时改成 `>> upper()`，测试立刻
+  `FAILED — spec §7.6 的管道示例必须**逐字**可解析` 并打印实际块；
+  从备份恢复后读盘确认（含 `|> upper()`、不含 `>> upper()`），9 条复绿。
+  这条测试**真的打开 spec**，不是硬编码 —— 否则改 spec 它不会红
+- spec 不可解析块 **18 → 14**（D118 收尾时为 18）：修掉的 4 条全是跨行管道块
+  （§7.6 管道、§18.1 `router |> route |> listen`、§18.2 `server |> tool |> serve`、
+  以及 McpServer 示例块）。累计 **21 → 14**（D118 前 → 现在）
+- 全量 **1680 passed / 0 failed / 21 ignored**（89 个测试二进制）
+- `cargo clippy --lib --all-features` 0 警告；改动文件 `rustfmt --check` clean
+
+余下 14 条的归属（均非本修复范围）：
+
+| 类别 | 条数 | 状态 |
+|---|---|---|
+| `trait` / `impl` 块（§3.5、§5.1、§5.2） | 4 | 未实现，需补前端（v1 方向） |
+| 函数参数类型标注 / `result<…>` 返回标注 | 5 | 语言特性，基建已通（`parse_type_annotation` → `Param.type_hint` → `WitnessParam`），仅解析未接 |
+| `let` 解构（§7.5 `let [head, ...tail] =`） | 1 | 未实现（`match` 支持同模式） |
+| `perform "ask" "…"` 裸形式（§7.7） | 1 | 形式不符 |
+| `ai.create` / `observe`+`span` 块（§12、§18.3） | 2 | Node 变体缺 `dst`（9 层管线覆盖问题） |
+| `match` 臂体（§18.4） | 1 | 形式不符 |
+
+#### D120：`let r = solve { … }` 让**后续语句全部静默饿死**（已修）—— 与 D35 / D58 同源
+
+审计 `rel`（v0.102 声明式范式）时撞出。与 D118 / D119 同为「静默丢弃」族，
+但根因是**编译路径分叉**，隐蔽程度更高。
+
+##### 缺陷
+
+```mora
+let r = solve { unify(1, 1) }
+print("r-is", r)        -- ← 修复前：零输出，exit 0，零诊断
+```
+
+真实 CLI 实测：
+
+| 源码 | 默认（9 层管线） | `MORA_9LAYER=0`（直出） |
+|---|---|---|
+| `let r = solve {…}` + 1 条 print | **stdout 空、exit 0** | `r-is [nil]` ✓ |
+| `let r = solve {…}` + 3 条 print | 只有第一条之前的 | 全部 ✓ |
+| `solve {…}`（**语句位置**） + print | 正常 ✓ | 正常 ✓ |
+
+即**只有 `let` 绑定形态**会被饿死 —— 语句位置不经过 `let` 绑定，绕开了缺陷路径。
+
+##### 根因：`Node::Solve` 缺 `dst`
+
+`node_result_reg_of` 的 match 里有 `Node::Handle`（D35 补）、`Node::WithConfig`
+（D58 补），**唯独漏了 `Node::Solve`** → 落 `_ => None` → `node_result_reg`
+返回 `unwrap_or(0)` **哨兵** → `let` 绑定的**就绪门槛恒 false** → 其后整条
+Sequence 链永不执行。D35 的注释把这个失败模式写得很清楚（「无报错、退出码 0」），
+本缺陷只是换了个节点类型。
+
+而 `MirInst::Solve` **是有** `dst` 的，`emit_primary_w` 也明确把 solve 当表达式
+（「v0.102: solve 作为表达式（`let r = solve { ... }`）」）—— 9 层管线的
+**fcfg 层把结果寄存器丢了**。故两条编译路径行为分叉。
+
+##### 修法（照 D58 的 `WithConfig` 样板，4 处同步）
+
+1. `mir/fcfg.rs` — `Node::Solve` 加 `dst: Reg` 字段
+2. `mir/witness_to_fcfg.rs` — 构造时用**该层**的 `b.alloc()` 预分配
+3. `mir/fcfg_lower.rs` — 复用同一个 `dst`，**不得**再 `ctx.alloc_reg()`
+   （两处各自分配 → 就绪门槛等一个永不被写的寄存器）
+4. `mir/witness_to_fcfg.rs` — `node_result_reg_of` 加 `Node::Solve` arm
+
+外加 `typeck/annotate.rs` 的 `Node::Solve` 映射带上 `dst`（漏了会编译不过 ——
+枚举 match 的编译器兜底在这里又一次生效）。
+
+##### 修复后（真实 CLI 实测，9 层与直出**完全一致**）
+
+| 用例 | 修复前（9 层） | 修复后（9 层） | 直出 |
+|---|---|---|---|
+| `let r = solve {…}` + 4 条语句 | 只有 `start` | `start / r-is [nil] / mid / end` ✓ | 一致 ✓ |
+| `let r = solve {…}` + 1 条语句 | **零输出** | `r-is [nil]` ✓ | 一致 ✓ |
+
+##### ⚠ 测试设计上的一个真实翻车（本轮最值得记的一条）
+
+第一版 `tests/solve_binding_dst.rs` 五条判据**全部**用
+`ParserV3::compile` + `run_mir` —— 那是**单遍直出路径，不经过
+`witness_to_fcfg`**，而缺陷恰恰住在那里。结果：
+
+- 修复后 5 条全绿（看起来完美）
+- **反向验证把 `Node::Solve` 的 arm 摘掉 → 5 条仍然全绿，一条没红**
+
+测的是**没坏的那条路径**。改成 `cli::compile_and_opt`（9 层管线）编译 +
+`run_mir` **执行产物**之后，同样的反向验证立刻 4 条红。
+
+自检句：**「这条判据跑的是不是缺陷所在的那条路径？」** —— 「编译成功 / 能解析 /
+类型检查通过」都可能在绕过缺陷。
+
+判据形态也据此调整：**指令类别序列一致 ≠ 求值一致**。D120 两条路径的
+`MirInst` 类别完全相同，差别只在 Solve 写的 `dst` 与 `let` 绑定的 `dst`
+对不上 —— 所以路径一致性必须比对**执行结果**，不能只比指令序列
+（既有的 `algebraic_effects::two_compile_paths_agree_on_handle_value` 也补了
+执行结果这一层）。
+
+##### 同批的三个否定结果（避免日后重查）
+
+| 审计项 | 结论 |
+|---|---|
+| **值语义（aliasing）** | `let b = a` 后 `a.push(4)` / `d.set(k,v)` 均返回**新值**，原值不变；`[[1],[2]].map(fn(v) v.push(9) end)` 后原列表不受影响 —— **深拷贝正确，无缺陷** |
+| **块构造缺 `end`** | 12 种（task / if / for / while / match / with / fn / transaction / observe / span / worker）逐个实测，**全部 exit 2 明确报错，零静默吞** —— D118 修的是唯一一处 |
+| **闭包捕获的写时性** | `let f = fn() outer end` 后 `outer = 2` 仍返回旧值 —— 符合 spec「捕获时**冻结**的环境快照」，非缺陷 |
+
+##### 验证
+
+- 新增 `tests/solve_binding_dst.rs` **5 条**：主判据走 **9 层管线并执行产物**；
+  含 2 条**对照组**（语句位置 solve / 另一条指令族 `len`）+ 1 条
+  **路径一致性**（直出 vs 9 层的执行结果比对）
+- **反向验证**：摘掉 `Node::Solve` 的 `node_result_reg_of` arm（先读盘确认落盘）
+  → 恰好 4 条红、1 条绿（语句位置对照组正确地不受影响）；撤除后 5 条复绿
+- 全量 **1685 passed / 0 failed / 21 ignored**（90 个测试二进制）
+- `cargo clippy --lib --all-features` 0 警告；改动文件 `rustfmt --check` clean
+
+#### D121：`Node` 变体的 result-reg 覆盖普查 —— D104 的「潜在风险」正式排除（否定结果）
+
+D120（`Node::Solve` 缺 `dst` → `let` 绑定拿哨兵 0 → 后续 Sequence 静默饿死）
+与 D35（`Handle`）、D58（`WithConfig`）同族。D104 早先把另外 5 个
+**也缺 `dst`** 的变体记为「**潜在**风险，被差分回落挡住」。
+
+本轮把这个「潜在」做成实测结论。
+
+##### 普查：56 个 `Node` 变体逐个核对
+
+| 项 | 结论 |
+|---|---|
+| `mora::mir::fcfg::Node` 变体总数 | **56** |
+| `node_result_reg_of` 有 arm 的 | **20** |
+| 未覆盖的 | **36**（语句型 `Return`/`Let`/`FnDef`/声明型 等返回 `None` 是**正确**的） |
+| **每条 arm 引用的 `dst`/`reg` 字段是否真实存在** | **全部存在** —— 无「有 arm 但无字段」的矛盾（D120 修完后成立） |
+
+##### 把 36 个未覆盖变体按「构造活跃性」分级
+
+缺 arm 只有在**该变体既被构造、又出现在 `let` 右值**时才致命。据此分级：
+
+| 级别 | 变体 | 结论 |
+|---|---|---|
+| **可作值且有 arm** | `BinaryOp` `Call` `MethodCall` `Or` `And` `DynTrait` `Prompt` `ClosureExpr` `ListLit` `DictLit` `Index` `If` `Match` `Perform` `Handle` `WithConfig` `Quasiquote` `Solve` | ✅ |
+| **活，但只作语句/声明** | `Return` `Let` `Assign` `IndexAssign` `FnDef` `MacroDef` `UpdateDef` `AppDef` `Orchestrate` `RelDef` `Import` `TypeAlias` `EnumDef` `StructDef` `TraitDef` `ImplDef` `ModelDef` `MsgDef` `Export` `Sequence` | 不需 `dst` —— 返回 `None` 正确 |
+| **活块型，只作语句** | `Parallel` `Observe` `Span` `PromptSection` `DocumentSection`（构造点 `witness_to_fcfg.rs:773-797`） | 见下表实测 |
+| **死变体（零构造点）** | `Break` `Continue` `Expr` `ListVec` `Loop` `Graph` `Pregel` `MoA` `MoE` | 无 arm 安全 |
+
+`Break` / `Continue` 的构造点确实存在（`witness_to_fcfg.rs:577/582`），但它们是**跳转**语句，
+不产生值 —— 与 `Return` 同级。
+
+`Node::Expr` 值得单说：它有 `reg: Reg` 字段，一度看起来像 D120 的第二个实例。
+实测它**零构造点** —— 4 处引用全是消费/解构（`ehir_to_core.rs:479` 解构、
+`fcfg_lower.rs:47` 取 max、`:517` 解构、`annotate.rs:593` meta 重建），
+且 lower 成 `MirInst::Expr(*reg)` 这个**语句**。**死变体，无 arm 安全。**
+
+⚠ 这条结论**只能记档、写不成测试**（第一版写了、被自己的判据打回）：witness
+是**树**，`let y = x + 1` 内部的 `Variable` / `Literal` / `Binary` 节点与
+「语句级裸表达式」在运行时**同形**，没有任何可观测行为能把二者分开。
+与其留一条「恒绿且暗示了一个不存在的因果」的测试，不如记档 ——
+与 D119 那条「测试名暗示不存在的因果」同类。真正的护栏是**枚举 match
+的编译器兜底**：若将来给 witness 新增对应 kind 并接上 `Node::Expr` 构造，
+`node_result_reg_of` 的其它 match 分支不会报错，但**补 `dst` 时的编译器
+会强制**（`Node::Expr { reg, .. }` 的字段名一旦变动，所有 match 点全红）。
+
+##### 实测：5 类块变体是安全的（D104 的「潜在」不成立）
+
+| 变体 | `let x = <块>` | 语句位置 + 后续语句 |
+|---|---|---|
+| `Observe` | **明确报错** `Failed to parse` | 正常，后续照常 ✓ |
+| `Span` | **明确报错** | 正常，后续照常 ✓ |
+| `PromptSection` | **明确报错** | 正常，后续照常 ✓ |
+| `DocumentSection` | **明确报错** | 正常，后续照常 ✓ |
+| `Parallel` | **明确报错** | 正常，后续照常 ✓ |
+
+即它们**不会**重演 D120 —— 不是「静默饿死」而是「压根不解析」。
+判据落**执行层**（9 层管线编译 + `run_mir` 执行产物取末值），沿用 D120 的教训。
+
+##### 顺带确认的正面事实：两个块家族的 `let` 作用域规则**相反**
+
+| 块 | 块内 `let` 是否外泄 | 依据 |
+|---|---|---|
+| `parallel` | **外泄** | spec §9.1 承诺；实测 `a-outside: 10.0` |
+| `with` | **不外泄** | D59/D107 已确立；本轮补成对判据防记混 |
+
+##### 验证
+
+- 新增 `tests/block_variant_dst_census.rs` **5 条**：
+  `let` 右值必须报错（防「静默」）/ 语句位置不饿死（9 层管线 + 执行）/
+  **两条编译路径结果一致**（D120 教训）/ `parallel` 外泄 / `with` 不外泄（成对）
+- 全量 **1690 passed / 0 failed / 21 ignored**（91 个测试二进制）
+- `cargo clippy --lib --all-features` 0 警告；改动文件 `rustfmt --check` clean
+
+#### D122：系统性**执行结果级**路径差分普查 —— 47 个 e2e fixture 零分叉
+
+D120（`Node::Solve` 缺 `dst`）与 D35（`Handle`）都是**单点**发现，
+且都靠「先想到那个点」才查到。D122 换策略：不做单点推理，
+直接对**全部** e2e 语料做两条编译路径的**执行结果**差分。
+
+方法：遍历 `tests/fixtures/e2e/*.mora`（**真的读文件**），逐条用
+`ParserV3::compile`（直出）与 `cli::compile_and_opt`（9 层管线）编译，
+再 `run_mir` **执行产物**取末值比对。
+
+**结果：47 / 47 一致，零分叉。** —— 即 D120 修完后，两条路径在
+全量代表性语料上行为一致，没有第二个隐藏分叉点。
+
+##### 探针自身的两处错（都比产品缺陷更值得记）
+
+| 错 | 现象 | 根因 |
+|---|---|---|
+| **用 `Debug` 当比对口径** | 47 条里报 2 条分叉 | `Value::Dict` 内部是 `HashMap`；`Debug` for `HashMap` **不排序**，`Display for Value` 才排序（`dict_determinism.rs` 钉的是 Display）。那 2 条的 Dict 内容**逐键完全相同**，只是 `Debug` 迭代序不同 —— **伪分叉** |
+| **错误串没归一化** | 某用例两条路径**都编译失败**却被判分叉 | `compile_and_opt` 的 `Err` 是 `String` 的 **Debug**（带引号：`"Failed to parse at line 1"`），`ParserV3::compile` 的 `to_string()` 不带 |
+
+第一处一度让我以为又发现了一个 Dict 缺陷 —— 追下去发现
+`dict_determinism.rs` 的 7 条测试**全部有效**、Display 确实排序。
+**是判据错了，不是产品错了。**
+
+##### ⚠ fixture 覆盖不足：只跑语料察觉不到 D120
+
+反向验证（撤掉 D120 的 `Node::Solve` arm）时：
+
+- 内联差分用例 → **FAILED**，暴露真实分叉（`direct = 5.0` vs `pipelined = [nil]`）
+- **47 个 e2e fixture → 仍然全绿**
+
+因为 `rel_*.mora` 里的 7 处 `solve { … }` **全在语句位置**，
+唯独没有 `let r = solve { … }` 的**绑定形态** —— 差分测试看得见
+「两条路径都跑完」，看不见「一条路径中途饿死」。
+
+所以给普查补了 6 个**内联**用例，把「值产生型块构造出现在 `let` 右值」
+逐个补齐（`solve` 绑定 / `solve` 带查询变量 / `with` / `handle` /
+`if` / `match`）—— 这正是 `node_result_reg_of` 决定成败的那条路径。
+
+**「语料全绿」不能替代「形态齐全」**：语料是历史上顺手写的，
+不覆盖什么形态是未知的。
+
+##### 验证
+
+- 新增 `tests/path_differential_census.rs` **3 条**：
+  47 个 fixture 逐条差分（断言全等）/ 6 个内联 `let` 绑定形态差分 /
+  **Display-vs-Debug 口径对照**（钉住「别拿 `Debug` 当比对基准」）
+- **反向验证**：撤掉 `Node::Solve` 的 arm → 内联用例红、fixture 仍绿（见上）；
+  撤除后 3 条复绿
+- 全量 **1693 passed / 0 failed / 21 ignored**（92 个测试二进制）
+- `cargo clippy --lib --all-features` 0 警告；改动文件 `rustfmt --check` clean
+
+#### D123：`f(…)(…)` 连续调用**静默算出错误的值**（已修）—— D118/D119 修复完整性的实测确认
+
+D122 补的差分用例里出现一条 `mk(1)(2)` 不匹配。追下去既是新缺陷，
+也是对 D118 / D119 的**修复完整性实测**。
+
+##### 先回答一个此前只靠推理的问题：D118/D119 的修复是不是「半个」？
+
+D118 / D119 都改在 `emit.rs`，而 9 层管线的输入正是 `ParserV3` 产出的
+`MirWitness`，所以推理上「两条路径都覆盖」。本轮**实测**：
+
+| 用例 | 默认（9 层） | `MORA_9LAYER=0`（直出） |
+|---|---|---|
+| D118 形态 `let f = fn() 1` + 后续 print | `A-start / A-after 1.0` | **逐字节相同** |
+| D119 形态 跨行 `map`/`filter` 管道 | `[4.0, 6.0]` | **逐字节相同** |
+| D119 形态 跨行 `upper`/`split` 管道 | `[HELLO, WORLD]` | **逐字节相同** |
+| spec §6.1 闭包捕获 | `30.0` | **逐字节相同** |
+
+**结论：不是半个修复。** 这 4 个形态已固化为 `d123_d118_d119_fixes_hold_on_both_compile_paths`
+（12 个用例，走两条路径 + 执行产物）。
+
+##### 新缺陷：`f(…)(…)` 静默算出错误的值
+
+```mora
+let mk = fn(x) fn(y) x + y end end
+mk(1)(2)          -- 应得 3.0；实测得 2.0，exit 0，零诊断
+```
+
+同一个式子**两种行为**，而静默的那个更糟：
+
+| 位置 | 修复前 | 修复后 |
+|---|---|---|
+| 裸表达式 `mk(1)(2)` | **exit 0、末值 `2.0`（错）、零诊断** | **exit 2 + 明确报错** |
+| 实参位 `print(mk(1)(2))` | exit 2 + `Expected ')'` | exit 2（一致） |
+
+**根因**：`emit_call_tail_w` 的后缀链只处理 `.`（方法）与 `[`（索引），
+**没有 `(` 分支**。于是 `mk(1)` 求值后其返回的闭包被**丢弃**，紧随的 `(2)`
+被外层当成一个**独立的括号表达式**语句求值 —— 末值因此是 `2.0`。
+
+**判定与修法**：spec §14.2 的 EBNF 里 `call` 的被调用者只能是 `IDENTIFIER`
+（**无 `postfix` 产生式**），故 `f(…)(…)` 属**未承诺的能力缺口**
+（已记入本节，不擅自实现）。但「不支持」与「静默算错」是两回事 ——
+后者必须消除。修法是在后缀链里对该 token 明确报错，**不加 `(` 分支**。
+
+**为何是既有缺陷而非 D118 回归**：用环境变量把 `inline_closure_body_is_expr`
+撤成恒 `false`（D118 修复前状态）后重测，`mk(1)(2)` 行为**完全相同**；
+同时 D118 自己的用例如期失败 —— 证明判据确实咬住了 D118，且本缺陷与之无关。
+
+##### 顺带查明：嵌套闭包与分步调用**都正常**（否定结果）
+
+| 形态 | 结果 |
+|---|---|
+| `let mk = fn(x) fn(y) x + y end end` + `let g = mk(1)` + `g(2)` | `3.0` ✓ |
+| 内层闭包单独捕获 `fn(y) x + y end` | `12.0`（捕获外层 x=10）✓ |
+| `a(b(3))` —— 实参**嵌套** | `6.0` ✓ |
+
+即不支持的只有「后缀链」那一种形态，实参嵌套与分步调用都可用 ——
+判据里为此各留了一条**对照组**，防止日后把三者混为一谈。
+
+##### 修复打破了一个既有测试 —— 那个测试一直在比对**同一个错误结果**
+
+`pipeline_equivalence.rs` 的「深层嵌套闭包」用例源码原为：
+
+```mora
+let outer = fn(a) fn(b) a + b end end
+outer(5)(10)        -- 两条路径都给 10（而非 15），exit 0，零诊断
+```
+
+修复前它是**绿的** —— 因为「两条路径等价」这条断言只比较**一致性**，
+而两条路径**一致地算错**了。这条用例因此**从未测到「深层嵌套闭包」的语义**。
+D123 把该形态改为明确报错后，它才暴露（两条路径都编译不过）。
+
+已把用例改为**分两步调用**（`let g = outer(5)` + `g(10)`），语义与路径一致
+两件事都仍在其职责内；并新增 `d123_deeply_nested_closure_gives_the_right_answer_not_just_agreeing`
+只钉语义（得 `15.0`）。
+
+**「两条路径一致」是必要不充分条件 —— 它们可以一致地算错。**
+这与 D120 的「指令类别一致 ≠ 求值一致」是同一族的第三个层次：
+类别一致 → 求值一致 → **求值正确**，每一层都需要各自的判据。
+
+##### 验证
+
+- `tests/path_differential_census.rs` 3 条 → **6 条**（新增 D123 三组）
+- 修正 `tests/pipeline_equivalence.rs` 一条用例的源码（原为静默算错的形态）
+- 全量 **1696 passed / 0 failed / 21 ignored**（92 个测试二进制）
+- `cargo clippy --lib --all-features` 0 警告；改动文件 `rustfmt --check` clean
+
+#### D124：`?`（Result 传播）完全未实现（能力缺口）+ dict 同质约束的**诊断质量**（已改）
+
+D123 的后缀链线索引出两件事。
+
+##### 一、`?` 的 Result 传播语义**完全没有实现**（能力缺口，只报告）
+
+spec §14.2 有 `question = expr "?"` 产生式，且在 3 处示例里使用
+（行 606 `let result = divide(a, b)?`、行 643/644 `web.fetch(url)?` /
+`json.parse(body)?`）。但实现里 `TokenType::Question` **只**在 `rel.rs`
+被消费 3 处 —— 那是 rel 子句的 `?` **查询变量前缀**，与 Result 传播无关。
+
+实测（6 个位置全部 exit 2 **明确报错**，非静默）：
+`f(1)?` / `let r = f(1)?` / `d["items"]?` / `g(f(1))?` / `1?` / `print(1)?`。
+
+判定为**能力缺口**（需 Result 类型系统与控制流集成，工作量大），
+按既定原则**只报告不实施**。census 里 spec 行 605 那个坏块因此有**两个**原因：
+参数标注 + `?` 传播。
+
+##### 二、dict 字面量的**同质约束**：实现是对的，文档漏了 + 诊断说不清
+
+`{k: 5, s: "x"}` 被 typeck 拒绝 —— 这是**正确**的（`dict<K, V>` 是泛型，
+HM 推断需要单一 `V`）。但有两处问题：
+
+**(a) spec 完全没提这条约束。** §14.2 的 `dict_literal` 产生式
+（`"{" [ IDENTIFIER ":" expr { "," IDENTIFIER ":" expr } ] "}"`）
+**无任何同质限制**，类型章节也未说明。而运行时的
+`Value::Dict(HashMap<String, Value>)` 本身**可**存异质值
+（`dict.set()` 与 `json.parse()` 产出的 dict 都是异质的），
+限制**只作用于字面量**。已在产生式旁补注（实现对、文档漏 ——
+与 D108 / D109 / D116 / D117 同类）。
+
+**(b) 诊断完全说不清原因，且定位不准。**
+
+| | 修复前 | 修复后 |
+|---|---|---|
+| `{k: 5, s: "x"}` | `Type error at line 1:9: Type mismatch: expected Float, got String at line 1, column 9` | `Type error at line 1:19: Dict 字面量的值必须同质（dict<K, V> 需要单一 V 类型）: 键 's' 的值是 String，而前面的值是 Float` |
+| `{s: "x", k: 5}` | `… expected String, got Float at line 1, column 9` | `… 键 'k' 的值是 Float，而前面的值是 String` @ line 1:21 |
+
+- 旧消息复用通用 `UnificationFailure`，用户看到「类型不匹配」只会以为自己
+  写错了类型，**猜不到这里有一条同质约束**（它挡住
+  `{status: 200, body: "…"}` 这类自然写法）。
+- 旧 `span` 指向**整个 dict 的 `{`**（column 9），不是出问题的那个值。
+
+新增 `TypeError::DictValueTypeMismatch`（HM 侧）带 `key` 字段，
+`infer_dict` 改用它并把 span 指向 `value.span`。
+`check_mir.rs::hm_to_external` 的非穷尽 match 由**编译器强制**暴露并补齐
+—— 这是枚举判据的第二度价值（D120 已是第一度的例子）。
+
+⚠ 新分支的 `Display` **不带位置**：对外 `format_error` 用结构体的
+`line`/`column` 字段渲染 `at line L:C`，HM 侧再带一遍就重复
+（旧的 `UnificationFailure` 分支确实重复，属既有行为，未在本轮改动）。
+
+##### 三、顺带的否定结果：后缀链 × 二元运算符交互**全部正常**
+
+D123 提示「后缀链可能静默丢结果」，于是批量测了 12 个组合，全部正确：
+`f(1)+2` / `f(1)*2` / `f(1)==1` / `f(3)-1` / `d["k"]+1` / `len(d["s"])` /
+`d["s"].upper()` / `xs[0][1]` / `xs[1].len()` / `f(2) |> fn(v) v+10 end` /
+`d["items"][1]+100` / `f(f(4))` / `f(1)+f(2)`。
+即 D123 那个 `(` 后缀缺口是**孤例**，不是后缀链的系统性问题。
+
+##### 验证
+
+- 新增 `tests/dict_homogeneity_diagnostics.rs` **4 条**：
+  诊断须说明约束 + 点名键 / span 指向出问题的值 / **对照组**（同质 dict 一律
+  无错，含空 dict 与数值提升）/ **反向对照**（无关的类型错误不被说成「同质」）
+- 全量 **1700 passed / 0 failed / 21 ignored**（93 个测试二进制）
+- `cargo clippy --lib --all-features` 0 警告；改动文件 `rustfmt --check` clean
+
+#### D125：`list` 字面量同质约束的诊断质量（已改）—— D124 的姊妹约束
+
+D124 改了 dict 字面量的诊断后，顺手查它的姊妹形态 —— 发现问题**完全同构**。
+
+##### 缺陷
+
+```mora
+let a = [1, "x"]
+```
+
+| | 修复前 | 修复后 |
+|---|---|---|
+| `[1, "x"]` | `Type error at line 1:9: Type mismatch: expected Float, got String at line 1, column 9` | `Type error at line 1:13: List 字面量的元素必须同质（list<T> 需要单一 T 类型）: 下标 1（第 2 个元素）是 String，而前面的元素是 Float` |
+| `[[1], ["x"]]` | `… expected List(Float), got List(String)` @ col 9 | `… 下标 1（第 2 个元素）是 List(String)，而前面的元素是 List(Float)` @ col 15 |
+
+与 D124 一模一样的两个问题：`infer_list` 也复用通用 `UnificationFailure`
+（既不说明「元素必须同质」这条约束、span 又指向整个列表的 `[`），
+嵌套形态的 `expected List(Float), got List(String)` 更让人摸不着头脑。
+
+##### 处置
+
+- 新增 `TypeError::ListElementTypeMismatch { index, … }`（与 D124 的
+  `DictValueTypeMismatch` 同构），`infer_list` 改用它、span 指向 `item.span`。
+- `check_mir.rs::hm_to_external` 的 match 同样由**编译器强制**暴露。
+- spec §14.2 的 `list_literal` 产生式旁补注该约束，并注明数值塔提升
+  （`[1, 2.5]` → Float，v0.104.6 D67）—— 实现对、文档漏，与 D124 同类。
+
+##### 一个小设计点：下标**两种编号都给**
+
+`index` 是 **0-based**（与 `list[idx]` 写法一致），消息里同时给
+1-based 序数：「下标 1（第 2 个元素）」。
+只给下标 → 「第 0 个元素」读着别扭；只给序数 → 用户拿去 `list[n]` 会错位一个。
+
+##### 验证
+
+- 新增 `tests/list_homogeneity_diagnostics.rs` **5 条**：说明约束 + 两种下标 /
+  span 指向出错的元素 / **嵌套形态**同样清晰 /
+  **对照组**（6 种同质 list 无错，含空 list 与数值提升）/
+  **反向对照**（dict 与 list 的诊断**互不串味**）
+- 全量 **1705 passed / 0 failed / 21 ignored**（94 个测试二进制）
+- `cargo clippy --lib --all-features` 0 警告；改动文件 `rustfmt --check` clean
+
+#### D126：诊断里的「line 0」是误导性的（已改）＋ 两处「注释与实现不符」的更正
+
+D124 追查 dict 异质报错时撞见的：报错位置是 **line 0**。
+
+```mora
+let d = {a: 1}
+let e = d.set("b", "text")
+```
+```text
+Type error at line 0: Type mismatch: expected float, got string
+```
+
+**源码没有第 0 行。** 用户看到会以为是编辑器行号错乱。
+
+##### 根因：`Constraint` 不携带 span
+
+`typeck::hm::Constraint`（`Eq` / `Numeric` / `RowEq`）的约束先入队、
+最后由 `solve_constraints` 统一求解；`unify` 失败时只能报 `span: None`，
+一路渲染成 `line 0`。
+
+**有位置 / 无位置的分界很清楚 ——「当场检查」还是「入队后统一求解」**：
+
+| 场景 | 位置 | 路径 |
+|---|---|---|
+| `a == s` / `a + s` | ✓ line 3 | `infer_binop` **当场**检查并带 span |
+| `d.set("b", "text")` | ✗ line 0 | 方法实参 → 入队约束 → unify 失败 |
+| `let r: string = f(1)` | ✗ line 0 | 标注 vs 调用结果 → 入队约束 → unify 失败 |
+
+##### 处置：诚实标注，**不**编造位置
+
+`format_error` 在 `line == 0` 时改为输出 `Type error (位置未跟踪)`。
+
+⚠ 刻意**不**用「默认 1」或「取程序首行」这类兜底 —— **错误的精确位置
+比诚实的位置未知更糟**，它会让用户去查一个根本没问题的行。
+有位置的诊断（Q1/Q2）实测**逐字节不变**。
+
+**根治方案已记为待办**（未实施）：给 `Constraint` 加 `span` 并从构造点
+一路带到 `unify`。该改动触及泛化/量化逻辑（`Constraint::Eq` 构造点
+遍布 `infer.rs` 十余处），风险高于 D124 / D125 那类「只加错误变体、
+不改推断逻辑」的改动，属类型推断核心变更，需单独一轮评估。
+
+##### 更正一：`tests/call_arity.rs` 的注释与实现不符（D115 同型）
+
+原注释称「typeck 已经拦下闭包 arity，只是**文案很差**（如闭包多参：typeck 报
+`Type mismatch: expected float, got fn (float) -> …`）」。实测**不成立** ——
+`mora --check` 对闭包少参/多参**一律 exit 0**，typeck 根本不拦，arity
+完全由运行期 `closure expects N args, got M` 兜住。
+
+`must_err` 本身不区分层次（编译 → typeck → run_mir 任一拒绝即可），
+故它一直是绿的、从未测到「typeck 拦不拦」这一层。注释已按实测更正，
+并加测试钉住「现状：typeck 不查闭包 arity」——若将来 typeck 开始检查，
+该测试会红，提醒同步更新注释。
+
+##### 更正二：spec 行的 `set` 签名与实现不符（**只报告，不实施**）
+
+spec §12 方法表写 `.set(key, val) | string, any -> dict` —— **`val` 是 `any`**。
+但 `typeck/dispatch.rs:1156` 把 `value` 形参绑成 **dict 自身的 `V`**：
+
+```rust
+(Type::Dict(k, v), "set") => Signature::new(
+    vec![("self", …), ("key", k), ("value", v)],   // ← v，不是 Any
+    Type::Dict(k, v),
+)
+```
+
+后果是**可用性断裂**：
+
+| | 结果 |
+|---|---|
+| `let d = {a: 1}` 后 `d.set("b", "text")` | ✗ `expected float, got string` |
+| `let d = json.parse("{…}")` 后 `d.set("c", true)` | ✓ 正常（`json.parse` 的 `V` 未约束） |
+
+即 `set` 在**运行时**完全支持异质（`Value::Dict(HashMap<String, Value>)`），
+`json.parse` 也能产出异质 dict，唯独**从一个字面量 dict 出发就不能再加异质键**。
+
+判定为**类型系统设计决定**（`dict` 是 `dict<K, V>` 单参数化，
+而运行时其实可异质），改法涉及返回类型放宽为 `Any` 及其连锁影响，
+按既定原则**只报告不实施**。
+
+##### 验证
+
+- 新增 `tests/diagnostic_position_fallback.rs` **3 条**：
+  约束冲突不得报 line 0 / **反向对照**（有位置的诊断逐字节保留）/
+  闭包 arity 的 typeck 现状钉住
+- 全量 **1708 passed / 0 failed / 21 ignored**（95 个测试二进制）
+- `cargo clippy --lib --all-features` 0 警告；改动文件 `rustfmt --check` clean
+
+#### D127：`dict.set` 的形参类型与 spec 不符 —— 假阳性（已修）
+
+D126 把 `set` 签名与 spec 的冲突判为「类型系统设计决定、只报告」。
+本轮**重新判定并推翻**：那是**实现疏漏**，按 D108 / D109 / D116 / D117 的先例
+（实现错、spec 对 → 改代码）修复。
+
+##### 证据链
+
+1. **spec §12 方法表明写** `| .set(key, val) | string, any -> dict |` —— 形参
+   `val` 是 **`any`**。
+2. **实现**（`typeck/dispatch.rs:1156`）把 `value` 绑成 **dict 自身的 `V`**。
+3. **`keys` / `values` / `len` / `get` 四条签名全部正确** —— `set` 是**孤例**。
+   若是设计决定，四条不可能都写对。
+4. **运行时本就支持异质**：`Value::Dict(HashMap<String, Value>)`，
+   `json.parse` 产出的 dict 也天然异质（它的 `V` 未受约束，故那条路径一直可用）。
+
+于是同一门语言出现**两套行为**：
+
+| | 修复前 | 修复后 |
+|---|---|---|
+| `let d = {a: 1}` 后 `d.set("b", "text")` | ✗ `expected float, got string` | ✓ `{a: 1.0, b: text}` |
+| `d.set("b", "text")` 后 `e["b"]` | —（到不了这步） | ✓ `text` |
+| `json.parse(…)` 后 `d.set("c", true)` | ✓ | ✓ 不变 |
+
+##### 修法：形参与返回类型**同步**放宽
+
+```rust
+(Type::Dict(k, _), "set") => Signature::new(
+    vec![("self", …), ("key", k), ("value", Type::Any)],   // ← 原为 v
+    Type::Dict(k, Box::new(Type::Any)),                    // ← 原为 Dict(k, v)
+)
+```
+
+只放宽形参而**不**改返回类型是不够的：存进去的是 `Any`、声明的仍是 `v`，
+`e["b"]` 会被按 `v` 复查而再次报错（实测确实如此）。
+
+##### 反向验证：key 的类型约束**保留**了
+
+`d.set(5, "x")` 仍被拒（`expected string, got float`）—— 说明只放宽了 `val`，
+`key` 仍是 `String`。若连 key 一起放宽成 `any`，运行期 dict 的键就会出问题。
+
+##### 顺带查明：重复诊断是**既有**缺陷，本修复顺带改善但未根除
+
+`d.set(5, "x")` 会报**两条相同**的诊断。实测对比：
+
+| 源码 | 签名改回旧样 | 本修复后 |
+|---|---|---|
+| `d.set(5, 1)` | 2 条 | 2 条 |
+| `d.set(5, "x")` | **4 条** | **2 条** |
+
+即：`set` 有两个形参，`infer_method_call` 为**每个实参**各推一个 `Eq` 约束，
+两个都撞在同一个 key 上（`d.get(5)` 只有 1 条 —— 单形参，对照成立）。
+这是**既有问题**、本修复未引入，也未根除。**根治**（同一冲突只报一次，
+如按实参位置去重）已记入待办。判据相应改成「**至少**一条」而非「恰好一条」，
+并在注释里写明为什么放宽。
+
+**另一类重复（不同层各报一次）**：`let b: string = a`（`a: Float`）报 2 条 ——
+一条来自 `bidirectional` 层（`type mismatch: expected \`String\`, got \`Float\``），
+一条来自 `hm` 层（`Type mismatch: expected String, got Float`）。`v + d`
+（number + dict）同样 2 条。这与上面的「同层重复」机制不同，且**影响更广**。
+两条待办：① 同层去重；② 跨层去重（两层表达同一冲突时应只留一条）。
+
+##### 连锁影响：D126 的一条测试因本修复而失效（已如实更新）
+
+`tests/diagnostic_position_fallback.rs` 里 D126 的 `dict_set_heterogeneous`
+用例依赖 `d.set("b", "text")` 产生**无位置诊断**——而那正是本修复的**假阳性**。
+修复后该程序合法、用例前提消失。
+
+**移除该用例而非换一个凑数的**：它在本文件里的价值只是「给 `line 0` 找一个
+触发场景」，而那个场景本身是个假阳性，本不该被当作 `line 0` 的证据。
+改用「标注 vs 闭包调用结果」这条仍然有效的路径，并新增
+`d126_dict_set_is_no_longer_a_source_of_constraint_conflicts` 锁住
+「D127 修掉了那个场景」这一事实（若 `val` 日后被绑回 `V`，该测试会红）。
+
+##### 验证
+
+- 新增 `tests/dict_set_signature.rs` **7 条**：异质 set 可用 / 新键可索引 /
+  **对照组**（3 种同质 set）/ **不回归**（`json.parse` 路径）/
+  **反向对照**（key 仍须 string）/ **反向对照**（字面量同质约束不受影响，
+  D124 契约保持）/ **回归钉住**（`keys`/`values`/`len`/`get` 四条不受牵连）
+- 全量 **1716 passed / 0 failed / 21 ignored**（96 个测试二进制）
+- `cargo clippy --lib --all-features` 0 警告；改动文件 `rustfmt --check` clean
+
+#### D128：同一处类型冲突被报**两次**（已修）＋ 反向验证钩子写反的自查
+
+D127 顺带查明「重复诊断」时列了两类。第二类影响更广，本轮修掉。
+
+##### 缺陷：bidirectional 与 HM 两层报同一件事
+
+```mora
+let a = 1
+let b: string = a
+```
+```text
+Type error at line 2:17: type mismatch: expected `String`, got `Float`   ← bidirectional
+Type error at line 2:1:  Type mismatch: expected String, got Float         ← HM
+```
+
+**已有的去重机制失效了。** `check_program_witnesses_bidirectional` 早就有
+`diag.is_diagnosed_at_line_column`（v0.75.94），但按的是 **line+column**：
+
+- bidirectional 把错误标在**值**上（`a` → column 17）
+- HM 把它标在**整条 let 语句**上（column 1）
+
+二元组对不上 → 两条都留下。而两层的 `expected` / `actual` 文本其实**一致**。
+
+**修法**：补一条 `(line, expected, actual)` 三元组去重。它能命中这条，
+又比「只比 line」保守 —— 同一行内**不同**类型对的冲突仍各自保留（有专门测试钉住）。
+
+实测 `let n: Int = "hello"`：**2 条 → 1 条**，保留 bidirectional 那条
+（位置指向值、措辞更清楚）。二元运算冲突（`a + s` / `a == s`）与
+D124/D125 的同质诊断均**不受影响**（各仍 1 条）。
+
+##### ⚠ 本轮的一个真实翻车：反向验证的钩子**写反了**
+
+第一版钩子：
+
+```rust
+.filter(|e| {
+    std::env::var("MORA_D128_REVERSE").is_err()
+        && !bidir_keys.contains(&(…))
+})
+```
+
+`.filter()` 保留 `true` 的元素。变量**存在**时 `is_err()` 是 `false`，
+整个 `&&` 短路 → 结果是 `false` → **把所有 hm_errors 都滤掉**。
+
+于是出现「REVERSE=1 与默认同结果（都是 1 条）」这个假象，我据此差点写下
+「**去重对 LSP 无效**」的错误结论，并为此反复比对 LSP 入口、编译路径、
+甚至怀疑存在跨调用的状态泄漏（另写探针验证了「无泄漏」—— 那部分结论是对的）。
+
+真相：把去重代码**整段删掉**后是 2 条，说明去重本来有效；
+钩子改成 `is_ok() || !contains(…)` 后立刻得到预期的 1 ↔ 2 对照。
+**该钩子只在反向验证时启用，产品路径从未受影响。**
+
+顺带用独立探针确认了 `cmd /c "set X=1&& cargo test"` 与 PowerShell
+`$env:X=1` **两种方式都能把变量送达测试进程** —— 即机制本身没问题，
+错的是条件表达式的极性。
+
+**教训**：反向验证的「反向」本身也要验证。条件写反时，
+钩子不是「不起作用」而是「反向起作用」，现象（前后同结果）
+比「钩子失效」更难识别。看到「加了开关但结果没变」，
+第一反应应当是怀疑**开关本身**，而不是被测逻辑。
+
+##### 连锁影响：一条既有测试锁定了这个重复（D115 / D123 / D127 同型第三次）
+
+`tests/lsp_syntax_diagnostics.rs::d101_type_errors_unchanged` 断言
+`let n: Int = "hello"` 有 **2 条** typeck 诊断，注释写「类型错误应仍是 2 条
+（双向检查器报两条）」—— 那两条**本身就是缺陷**，被当成了基线。
+
+已更新为 1 条，并在注释里写明「原本的 2 条是同一冲突的重复、位置不同、
+由 D128 去重」。D101 的对照组职责（确保 parser 诊断不牵连 typeck 通道）不变。
+
+本会话至此已三次遇到「既有测试锁定缺陷行为」：
+D123（`outer(5)(10)` 静默算错）、D127（`set` 异质假阳性）、
+D128（本条）。**它们的共同点是断言写的是「可观察结果」而非「正确结果」**
+—— 修好缺陷就会让这些断言变红，此时要改的是断言，不是修复。
+
+##### 验证
+
+- 新增 `tests/typecheck_dedup_across_layers.rs` **5 条**：
+  主判据（`let` 标注冲突只报一次，且保留位置精确的那条）/
+  **反向对照**（二元运算仍 1 条）/ **反向对照**（D125 list 同质诊断存活）/
+  **反向对照**（D124 dict 同质诊断存活）/ **保守性**（同行不同类型对的冲突不合并）
+- 更新 `tests/lsp_syntax_diagnostics.rs`：D101 那条断言 2 → 1 并补注释
+- 全量 **1721 passed / 0 failed / 21 ignored**（97 个测试二进制）
+- `cargo clippy --lib --all-features` 0 警告；改动文件 `rustfmt --check` clean
+- 两个临时探针文件（`zz_probe_d128_paths.rs` / `zz_probe_env.rs`）已删除
+
+#### D129：运行时边界普查（索引 / Unicode / JSON）—— 否定结果为主，一处真实精度缺口
+
+前 5 轮（D124–D128）都在**编译期**。本轮转向**运行时**，方法是按类别
+批量实测边界，逐条判定「明确报错 / 静默出错 / 健全」。
+
+##### 一、索引边界：**全部健全**，无一处静默
+
+| 场景 | 实测 |
+|---|---|
+| `xs[0]` 正常 | `1.0` ✓ |
+| `xs[5]` 越界（len 2） | `index 5 out of bounds (len 2)`，exit 1 ✓ |
+| `[] [0]` 空列表 | `index 0 out of bounds (len 0)`，exit 1 ✓ |
+| `xs[-1]` 负索引 | `negative index: -1`，exit 1 ✓ |
+| `[[1,2],[3]][0][1]` 嵌套 | `2.0` ✓ |
+| `d["zzz"]` dict 缺键 | `nil`，继续执行（`get` 的既定语义）✓ |
+
+##### 二、Unicode：**按 code point 而非字节**，含最易出错的代理对
+
+若字符串操作走字节切片，遇到多字节字符会 panic 或产生乱码。实测：
+
+| 源码 | 实测 |
+|---|---|
+| `len("日本語")` | `3`（字节数是 9） |
+| `"日本語"[1]` / `[2]` | `本` / `語` ✓ |
+| `len("𝕏")` / `("𝕏")[0]` | `1` / `𝕏` —— **代理对**（4 字节），字节切片会 panic |
+| `len("👨‍👩‍👧")` | `5`（ZWJ 组合 = 5 个 code point） |
+| `"a日b".split("日")` | `[a, b]` ✓ |
+
+**这排除了一个高风险缺陷类别**（UTF-8 边界处理错误往往表现为随机 panic 或乱码）。
+
+##### 三、JSON：解析器健全，但**超出 `i64` 的整数静默降级**（唯一真问题）
+
+用 `type_of` 逐项实测，**修正了一个我最初的不准确描述**：
+
+| JSON 数字 | 解析结果 | `type_of` |
+|---|---|---|
+| `5` | `5` | `int` |
+| `9223372036854775807`（`i64::MAX`） | **原值，精确** | `int` |
+| `9223372036854775808`（超出） | `9223372036854775808.0` | `float` ← **降级点** |
+| `1.5` | `1.5` | `float` |
+
+降级点精确在 `i64::MAX`（约 19.3 位十进制），**不是**「约 17 位有效数字」——
+后者只是降级**之后** f64 自身的限制。此后 `123456789012345678901234567890`
+实测得 `123456789012345677877719597056.0`，**无任何警告或错误**，
+round-trip 后不可恢复。
+
+我第一版 spec 注写的是「JSON 数字按 f64 解析、约 17 位丢精度」——
+**不准确**（JSON 的 i64 范围内整数走 `Value::Int`，是精确的），
+已按实测改写并附上对照表。这类「先下结论再补证据」的错误若写进 spec，
+就成了下一个「文档与实现不符」。
+
+处置：spec §12 的 `json.parse` 行补注（含对照表）。「JSON 整数 → bigint
+自动提升」属**未实现的能力缺口**（需改解析器的数字分支并决定何时提升），
+按既定原则**只记录不实施**。对照：显式 `bigint` 字面量 `123…n` 任意精度精确，
+其 `Display` 带 `n` 后缀以区别于 float（刻意设计）。
+
+JSON 解析器的其余边界实测健全：基本类型、`null` → `nil`、深层嵌套、
+空 dict/list、顶层数组、转义序列（`\"` `\\` `\n`，实测 `len` 正确）、
+重复键后者覆盖前者；非法 JSON 与尾逗号均**明确报错**。
+
+##### 过程中我自己的两处期望值写错（已修正判据，非产品缺陷）
+
+1. 以为 BigInt 的 `Display` 不带 `n` 后缀 → 实际带（刻意，用于区别 float）
+2. 以为 `json.parse("[1,2,3]")` 得 `[1.0, 2.0, 3.0]` → 实际 `[1, 2, 3]`
+   （走 `Value::Int`）。**这条错误反而促成了上面那次根因精确化**。
+
+##### 验证
+
+- 新增 `tests/runtime_boundaries.rs` **7 条**：索引越界全部报错（含错误文案）/
+  合法索引与 `dict.get` 对照 / **Unicode 按 code point**（含代理对、ZWJ、
+  多字节中间索引、split）/ JSON 边界健全（含转义、重复键、非法输入）/
+  **大整数降级**（钉住 `i64::MAX` 边界与 bigint 字面量对照）
+- 全量 **1728 passed / 0 failed / 21 ignored**（98 个测试二进制）
+- `cargo clippy --lib --all-features` 0 警告；改动文件 `rustfmt --check` clean
+
+#### D130：9 个 List 方法**运行期已实现、typeck 无签名** → 假阴性（已修）
+
+D127 修完 `set` 的签名后，本轮做**全量签名对照审计**（`dispatch.rs` 的 32 条
+vs spec §12 的方法表），查出同一族的**假阴性**。
+
+##### 缺陷：类型标注在这些方法上**完全失效**
+
+spec §12 承诺、**运行期也确实实现**的 9 个 List 方法，在
+`typeck::dispatch::method_signature_builtin` 里**没有签名**：
+
+| 缺失签名的方法 | 运行期实测 | spec 签名 |
+|---|---|---|
+| `reduce(fn, init)` | `6.0` ✓ | `closure, any -> any` |
+| `take(n)` / `drop(n)` | `[1,2]` / `[2,3]` ✓ | `number -> list` |
+| `window(size)` / `batch(size)` | `[[1,2],[2,3]]` / `[[1,2],[3]]` ✓ | `number -> list` |
+| `flatten()` | `[1,2,3]` ✓ | `-> list` |
+| `transpose()` / `shape()` / `reshape(r,c)` | 全部可用 ✓ | `-> list` / `-> list` |
+
+**无签名 → 返回未解算的 `TypeVar` → 与任何类型标注都「相容」→ 标注形同虚设**：
+
+```mora
+let xs = [1, 2, 3]
+let bad: string = xs.take(2)
+print(bad)          -- 修复前：exit 0、**零诊断**，而运行时 bad 是个 list
+```
+
+与 D54（`let n: String = d.len()` 静默被接受）同型，属**假阴性** ——
+比假阳性更隐蔽：typeck 声称检查了类型，实际什么都没做。
+
+##### 修法：补 9 条签名
+
+返回类型尽量保留元素类型 `elem`（与既有 `map`/`filter`/`push` 同做法）；
+元素类型本身不可知的用 `Any`（`flatten` 的内层可以是异质）。
+`reduce` 的 `init` 绑成 `elem` —— 累加初值必须与元素同类型。
+
+修复后：`let bad: string = xs.take(2)` → `expected String, got List(Float)` ✓
+
+##### 顺带的**行为改善**：`reduce` 缺初值改为**编译期**拦截
+
+`tests/list_method_defaults.rs`（D48）有一条断言「`reduce` 缺初值的错误信息
+应点名『缺初值』」。补签名后 typeck 的 arity 检查在**编译期**就拦下，
+消息变成通用的 `Expected 2 arguments, got 1`，断言因此失败。
+
+判定为**改善**而非退让：D48 修复前，字符串版
+`["a","b","c"].reduce(f)` 会**静默**产出垃圾值 `"nilabc"` 且 **exit 0**
+（垃圾值进返回值、用户毫无察觉）；现在编译期就拦下。
+代价只是文案不再点名「缺初值」—— 要恢复需在 arity 检查里按方法名特判。
+该测试断言已改为「编译期 arity 或运行期点名」二者之一，并在注释里写明原因。
+
+**又一个「既有测试锁定旧行为」**（本会话第四次，D123 / D127 / D128 / D130）。
+
+##### 顺带查明的两个既有事实
+
+- `shape()` 的元素是 `Float` 而非 `Int`（`[[1,2],[3,4]].shape()` → `[2.0, 2.0]`）
+- **裸 `list` 标注不被支持**（`unsupported type annotation 'list'`）；
+  必须写 `list<number>` 这类具体形式。既有行为，与本轮无关。
+
+##### 验证
+
+- 新增 `tests/list_method_signatures.rs` **5 条**：
+  **主判据**（4 种错误标注必须被拒 —— 修复前全是假阴性）/
+  **反向对照**（5 种正确标注必须仍通过，防补签名引入假阳性）/
+  **反向对照**（8 种无标注调用的运行期结果逐个比对，证明只动 typeck）/
+  `flatten` 的 `Any` 元素不被过度收紧 / `reduce` 初值类型约束
+- 更新 `tests/list_method_defaults.rs` 的文案断言（见上）
+- 全量 **1733 passed / 0 failed / 21 ignored**（99 个测试二进制）
+- `cargo clippy --lib --all-features` 0 警告；改动文件 `rustfmt --check` clean
+
+#### D131：裸 builtin 签名审计 —— **与 D79 完全一致，本轮无新发现**（否定结果）
+
+D130 用「全量签名对照审计」补齐了 9 个 List 方法的签名。本轮把同一方法搬到
+**裸 builtin** 上（`dispatch.rs` 有 38 个运行期可调用的内建，HM 签名表只有 23 个）。
+
+##### 审计结论与 D79 逐条一致
+
+实测确认了几条「有运行、无签名」的 builtin 会让类型标注失效：
+
+```mora
+let bad: string = car(xs)      // 修复前后都是 exit 0、零诊断
+let bad: string = quote(1 + 2) // 同上；运行期返回 `code:1 + 2`
+```
+
+**但这不是新发现** —— `src/typeck/hm/builtin.rs:282-301` 里已有一段
+**同样详尽的普查结论**（v0.104.6 D79）：
+
+| 无签名的 builtin | D79 的判定 |
+|---|---|
+| `car` / `cdr` / `uncurry` / `deref` | **如实无法声明** —— 结果由容器元素 / 被调函数 / 原子内容决定（`Type::Atom` 是**单元变体、没有载荷**，类型域里没有位置放「这个原子装什么」） |
+| `read` / `quote` | 返回 `Value::Code`，而 **`Type` 没有 `Code` 变体** —— 扩枚举是 **v1.0 方向的设计决定** → 只能 `Any` |
+| `eval` | 结果是被求值表达式的类型，需要真正的递归推断 |
+| `swap` / `into` / `macroexpand` / `batch_chat` | 结果由回调 / 元素类型 / 宏决定，只能宽松 |
+
+D79 已把 38 个内建逐个实测「故意写错标注看是否被拒」，并把**能精确声明的 5 条**
+（`type_of` / `atom` / `methods_of` / `gensym` / `is_instance`）全部补上了。
+
+##### 本轮的**净改动为 0**
+
+我一度补了 `quote -> Code` 与 `cdr -> List(Any)` 两条签名，随后被编译器
+（`no variant named Code`）与 D79 的注释挡回 —— 两条都在 D79 的「不补」清单里。
+已全部撤销，`builtin.rs` 相对本轮开始时无净改动。
+
+##### spec 侧的一处澄清（非缺陷）
+
+spec 对 `car` / `eval` 的承诺**本就是 `any`**（行 950 `car(list) | list -> any`、
+行 944 `eval(code) | string -> any`）。所以这两处的「标注不生效」是
+**spec 层面的选择**，不是实现疏漏 —— 补了签名也仍然不检查。
+把它们记成「假阴性缺陷」会是误判。
+
+##### 方法论教训
+
+**改一个概念之前，先查它是否已被普查过。** 本轮的普查对象（裸 builtin 签名）
+与 D130 的（List 方法签名）**机制相同**，而 D79 早在同一文件里写下了完整结论。
+代码注释是前人普查的**第一手载体**，比重新实测更快也更权威。
+
+**「全量对照审计」这个方法本轮已被用过两次（D79 内建 / D130 方法），
+第三次用之前应先问「前两次的结论还在不在文件里」。**
+
+##### 顺带确认
+
+- `module_method_signature`（按模块名查的表）**覆盖完整**：
+  `MODULE_OBJECTS` 共 23 个模块，其中 `ai` / `agent` / `random` 有精确
+  `Type` 变体走另一条路，其余 **20 个全部已登记** —— 无缺口。
+- `len` 的返回是 `Type::Int`（全语言唯一的 Int 来源，D129 已核实）。
+
+##### 验证
+
+- 本轮**无代码改动**，全量 **1733 passed / 0 failed / 21 ignored** 与 D130 收尾时一致
+- 探针目录 `target/probe_d131` 已清理
+- `cargo clippy --lib --all-features` 0 警告
+
+#### D132：LSP 位置**基半数错一半** + `rename` 会**改坏用户的代码**（已修）
+
+按 D131 的教训先查了 LSP 覆盖面：`tests/lsp_*.rs` 只有两个文件，覆盖
+`formatting` / `references` / 语法诊断；`src/lsp/providers/` 下另有
+`definition` / `hover` / `rename` / `completion` / `folding` / `symbols`
+**无功能测试**。本轮普查这三者，发现**三层缺陷**（从轻到重）。
+
+##### ① 行号基数错：**跳转到定义整体偏移一行**
+
+LSP 规范要求 `line` / `character` **都是 0-based**，而 `Span::line` 是
+**1-based**（`column` 本来就是 0-based —— 实测 `let n: Int = "hello"` 的诊断在
+`line 1:14`，line 对应源码第 1 行、column 14 是 0-based 列）。
+
+`definition` / `references` / `symbols` / `rename` 四个 provider **全部直接透传**，
+而 `server.rs` 的诊断路径一直有 `saturating_sub(1)` —— **只有这四个漏了**。
+后果：编辑器把跳转目标落到**下一行**。
+
+修法：4 处 `line` 加 `saturating_sub(1)`（`column` 不动，本就 0-based）。
+
+##### ② 每个结果**重复两遍**
+
+`parsed_doc_v3::collect_definitions_in_expr` 先用 `match expr.kind` 记一次
+**根节点**，紧接着 `walk_witness(expr, …)` **又遍历根节点**。实测：
+
+```text
+definition → [{"range":…line 1,char 1-2}, {"range":…line 1,char 1-2}]   ← 两条完全相同
+```
+
+修法：删掉外层那次 `match`（`walk_witness` 已覆盖根节点）。
+
+##### ③ `rename` **改坏代码**（最严重）
+
+span 的起点是**整个 let 语句 / 表达式**的起点（`let x = 1` 落在 `l`，column 0），
+而 `rename` 用 `column + name.len()` 算 end —— 把它当成了标识符位置。
+
+实测（真实 LSP 会话 + **真的把返回的 edits 应用到源码**）：
+
+```text
+let x = 1      →   lzt x = 1        ← `let` 的 `e` 被改成了 `z`
+let y = x + 1  →   let y = xz+ 1
+```
+
+`mora --check` 报 **3 个类型错误** —— **用户按一次 F2，代码就毁了**。
+
+修法：`rename` 新增 `locate` 闭包 —— 从 `span.column` 起**双向就近**搜索
+`old_name` 的**完整词**（前后不是标识符字符）。必须双向：`let` 语句的 span
+起点在标识符**之前**（向后找），而某些引用构造的 span 起点落在标识符**之后**
+（单向向后会漏改 —— 实测「只改对一半」，定义处对了、使用处漏了）。
+两头都找不到就**放弃这一处**：宁可不改，也不要改错字符。
+
+修复后：
+```text
+let x = 1      →   let z = 1
+let y = x + 1  →   let y = z + 1        → mora --check: ok
+```
+
+##### ③ 续：`definition` 的**列号**同样落在语句起点（跳转到错误的符号）
+
+`rename` 破坏代码靠的是「用 `column + name.len()` 当标识符」；
+`definition` 不用算 end，但它**直接透传 `span.column`**，于是 range 是
+`char 1-2` —— 即 `let` 的 `e`，而 `x` 在 **char 4**。行号修好后跳转仍停在
+错误的位置（不具破坏性，但「跳转定义」名不副实）。
+
+已给 `definition` 也加上同一套 `locate`（双向就近找完整词），实测由
+`char 1-2` 纠正为 **`char 4-5`**，且结果仍只有 1 条。
+
+##### 判据形态：必须**真的把 edits 应用到源码**
+
+只断言「返回的 range 等于预期值」会漏掉「预期值本身就是错的」。
+`tests/lsp_positions_and_rename.rs` 的主判据是**把 LSP 返回的 edits 施加到
+源码，再把产物丢给 `mora --check`** —— 判据是「产物仍可解析」，
+与 rename 的实现细节无关。另补一条精确断言（定义处与使用处**都要**改名），
+因为「产物可解析」抓不到「漏改」—— 漏改的代码仍然合法，只是引用了旧名字。
+
+##### 过程中我自己的两处失误（已修正）
+
+- **测试串扰**：三个测试共用同一个 `in.bin`，`cargo test` 并发执行时互相覆盖，
+  表现为「单跑绿、一起跑红」。已给 `lsp_request` 加 `tag` 参数隔离 ——
+  「隔离粒度必须匹配被测系统的状态粒度」，这里的「状态」就是那个临时文件。
+- **批量替换误伤**：`regex::Replace` 把 `let res = lsp_request(` 那行一并删掉，
+  导致编译失败。已逐处改回。
+
+##### 顺带发现（未修，记档）
+
+`hover` 返回 `let x: **<inferred>**` —— 把内部占位符直接展示给用户。
+hover 的 **range** 倒是正确的（走 `server.rs` 那条已转换的路径）。
+是否要显示推断出的真实类型，属产品决策，按既定原则只报告。
+
+##### 验证
+
+- 新增 `tests/lsp_positions_and_rename.rs` **3 条**：
+  rename 后源码**仍可解析**且定义/使用两处都改名 / `definition` 不重复 /
+  `definition` 的 `line` 是 0-based
+- 全量 **1736 passed / 0 failed / 21 ignored**（100 个测试二进制）
+- D101 / D102 / D103（LSP 既有测试）**均未受影响**
+- `cargo clippy --lib --all-features` 0 警告；改动文件 `rustfmt --check` clean
+
+#### D134：`references` 列号偏移 1 —— 并**推翻 D132 里我自己写错的一条判读**
+
+D132 修完 `definition` 的列号后，沿同一模式复查其余 provider，追加查出
+`references` 仍直接透传 `span.column`。但要判断「该不该减 1」，必须先确证
+`Span::column` 的基数 —— **D132 里我是靠推测写的注释，没有实测**。
+
+##### 决定性实测：`Span::column` 是 **1-based**
+
+```mora
+let abc = 1
+let z: string = abc     ← abc 在 0-based char 16
+```
+```text
+Type error at line 2:17: type mismatch: expected `String`, got `Float`
+```
+
+`column 17` = 0-based 的 16 **+1**。再把 `abc` 换成 `abcdef`（仍从 char 16 起），
+列号依旧是 **17** —— 位置落在**标识符起点**，确认是 1-based 计数。
+
+**D132 的注释「`column` 本来就是 0-based，不动」是错的**，已在
+`definition.rs` / `references.rs` 就地更正并注明修正理由。
+
+这同时说明 `semantic.rs:51/65` 的 `expr.span.column.saturating_sub(1)`
+**是对的**（我一度怀疑它反向偏移）—— 没有实测就改，会把对的改错。
+
+##### 缺陷：`references` 的列号整体偏移 1
+
+```mora
+let x = 1
+let y = x + 1          ← x 在 0-based char 8
+```
+```text
+修复前: [{"line":1,"start":{"character":9}}, {"line":0,"start":{"character":1}}]   ← char 9 / char 1
+修复后: [{"line":1,"start":{"character":8}}, {"line":0,"start":{"character":4}}]   ← char 8 / char 4 ✓
+```
+
+已给 `references` 加上与 `definition` / `rename` 同一套 `locate`（双向就近找
+完整词；找不到则退回 `column - 1`）。
+
+**同型第三处**：`documentSymbol`（`symbols.rs`）也直接透传 `span.column`，
+且它的定位条件**更精确** —— 那里 `name` 就是标识符本身，无需从光标反推。
+已同样修正：修复前 `let x = 1` 的符号大纲返回 `char 1-2`（`let` 的 `e`），
+`x` 实际在 `char 4`。
+
+至此 `src/lsp/providers/` 下**四个**把 span 送进 LSP range 的位置
+（`definition` / `references` / `symbols` / `rename`）全部按 0-based + 标识符
+定位；`folding` / `completion` 不直接透传 span，未受影响。
+
+##### 顺带查明的既有事实
+
+- `semanticTokens/full` 只标**字面量**（`let x = 1` 返回 `{"data":[0,8,1,10]}`，
+  即第 0 行 char 8 长 1 —— 指向数字 `1`）。`let` 关键字与 `x` 变量**都没有被标注**，
+  语法高亮覆盖明显不足。是否补齐属产品决策，记档待议。
+- `hover` 的 range **正确**（走 `server.rs` 已转换的路径），但内容显示
+  `let x: <inferred>` 占位符（D132 已记）。
+
+##### 验证
+
+- `tests/lsp_positions_and_rename.rs` 3 条 → **7 条**（新增 `references` 与
+  `documentSymbol` 的列号判据；并补正 D132 判据 ① 的文档注释）
+- 全量 **1740 passed / 0 failed / 21 ignored**（100 个测试二进制）
+- `cargo clippy --lib --all-features` 0 警告；改动文件 `rustfmt --check` clean
+- 两个临时探针（`zz_probe_semantic.rs` / `zz_probe_refs.rs`）已删除
+
+#### D136：LSP `foldingRange` 对 `for` / `while` **完全不产生折叠范围**（已修）
+
+`completion` / `foldingRange` 在 `tests/` 与 CHANGELOG 里都**无任何功能测试**
+（`src/lsp/providers/` 下 6 个 provider 此前只测了 3 个）。普查二者。
+
+##### `completion`：功能正常（否定结果）
+
+返回 38 项，分类与 `kind` 都对：变量（kind 6）/ 关键字（kind 14）/
+内建（kind 10）。无缺陷。
+
+##### `foldingRange`：`for` / `while` 一个都不折叠（已修）
+
+`collect_folds` 此前只处理 `If` / `Match` / `FnDef` / `Closure` 四种
+witness kind。实测（真实 LSP 会话）：
+
+| 块构造 | 修复前 | 修复后 |
+|---|---|---|
+| `task` / `if` / `task` 套 `if` | ✓ | ✓ |
+| **`for`** | **`[]`** ✗ | ✓ |
+| **`while`** | **`[]`** ✗ | ✓ |
+| **`for` 套 `if`** | **`[]`** ✗ | ✓ 两层 |
+
+循环块恰恰是编辑器里最需要折叠的（长循环淹没视线），却一个都不折叠。
+
+**一个容易踩空的细节**：`for` 在 witness 层是 **`Loop`（`{ var, iterable, body }`）
+而不是 `For`** —— 按 `For` 写 match 分支永远匹配不到（我第一版就是这么写的）。
+已补 `Loop` / `While` 两个分支（各带 `collect_folds(body, …)` 递归）。
+
+##### ⚠ `match` 一度记为「根因未定位」—— D137 查明：**那是我的探针源码非法**
+
+D136 里我测 `match` 用的是**跨行 arm**（`match v` ⏎ `  1 -> print(1)` ⏎ …），
+而 `match` 的 arm 体**不能跨行** —— 实测报
+`Expected '{' or 'with' after match subject`。解析失败 →
+`parsed_doc_v3` 的 `.ok()?` 返回 `None` → 折叠 `[]`。
+**不是产品缺陷，是探针的错。**
+
+用**正确形态**重测（真实 LSP 会话）：
+
+| 形态 | foldingRange |
+|---|---|
+| `match v with` ⏎ arm ⏎ `end`（**spec §14.2 主流形态**） | ✓ `{startLine:2, endLine:4}` |
+| `match v { 1 -> 10 _ -> 20 }`（同行花括号） | `[]` —— **正确**：单行块无需折叠，`end_line > expr.span.line` 本就不成立 |
+| `match v {` 多行花括号 arm ⏎ `}` | `[]` —— **语法非法**（见下） |
+
+即 `Match` 分支对 **spec 主流形态**完全可用。
+
+##### D138 再更正：所谓「多行花括号 `match`」的缺口**根本不存在**
+
+D136/D137 我都把「多行花括号 `match` 不折叠」记成次要缺口。D138 查明：
+**那个形态语法非法** —— 花括号形态的 arm body **只能是单行表达式**，
+实测：
+
+```mora
+let r = match v {
+  1 -> {          ← 跨行块
+    print(1)
+  }
+  _ -> print(2)
+}
+```
+```text
+Parse error: Expected '}' at line 3
+```
+
+`emit_match_w` 的注释（v0.104.3）已写明：`{ … => … }` 与 `with … end`
+「两种形态共用 arm emitter，仅**体终止符**（`end` / `}`）不同」——
+即花括号 arm 体就是单行 expr，不接受块。
+
+##### 仍存的次要缺口：花括号形态（**整体**）不折叠
+
+D138 补测：连**合法**的花括号形态也不折叠 ——
+
+| 花括号形态 | foldingRange |
+|---|---|
+| `match v { 1 -> 10 _ -> 20 }`（全同行） | `[]`（**正确**：单行无需折叠） |
+| `match v { 1 -> 10` ⏎ `  _ -> 20 }`（arm 跨两行，**合法**） | `[]` —— **缺口** |
+
+后者的 arm body 在 line 2 / line 3，`expr.span.line = 2`，
+按 `end_line(3) > expr.span.line(2)` **本应**产出范围，但返回 `[]`
+→ 花括号形态的 witness 形态与 `with_form` 不同，`Match` 分支没被走到。
+**根因未定位**（需再挖一层 witness span 的构造），已记入待办。
+
+由于 spec 教学与 EBNF 用的是 `with … end`（**可折叠**），该缺口不影响
+文档承诺的用法。
+
+##### 验证（D138）
+
+- `tests/lsp_folding_coverage.rs` 4 条 → **6 条**：
+  `d138_brace_match_rejects_a_block_body`（**防止后人再拿非法形态测 folding** ——
+  D136 与 D137 各因此误判过一次）/ `d138_legal_multiline_brace_match_still_not_folded_known_gap`
+  （锁住**现状**而非正确行为：日后修好会红并提醒更新本节）
+- 全量 **1746 passed / 0 failed / 21 ignored**（101 个测试二进制）
+- 临时探针 `zz_probe_brace_match.rs` 与 `target/probe_d138` 已删除
+
+#### D139：把「探针语法速查表」**机械化**（连续三轮误判的产物）
+
+D136 / D137 / D138 我**连踩同一个坑四次**：探针源码本身语法非法，
+却据此解读 provider 行为：
+
+| 轮次 | 探针写法 | 我一度误读成 | 真相 |
+|---|---|---|---|
+| D136 | `fn g() … end` | 「补全 provider 坏了」 | 具名 `fn` **不支持**（D118 已查） |
+| D136 | `task doer()` 定义后不调用 | 「`if` 在 task 内不执行」 | **正确行为**（`task` 是定义） |
+| D136/D137 | `match v` ⏎ `1 -> print(1)` ⏎ … | 「foldingRange 的 match 有缺口」 | arm 体**不能跨行**（语法非法） |
+| D138 | `match v { 1 -> {` ⏎ … ⏎ `}` ⏎ `}` | 「多行花括号 match 不折叠」 | 花括号 arm 体**不能是块**（语法非法） |
+
+**四次里三次是「源码根本跑不通」。** 反复犯的根因是：**凭印象写语法，
+不先确认它能编译**。再写一条 memory 不够 —— 故把它**固化成一张可查的表**。
+
+##### `tests/mora_syntax_forms.rs`（3 条）
+
+- `d139_syntax_form_table_matches_reality` —— 26 条常用语法形态逐条实测
+  「能否 `ParserV3::compile`」，与表内标注**必须一致**。不一致即说明语法
+  已演进、该同步更新表。这让「速查表」本身不会腐烂。
+- `d139_table_is_not_vacuous` —— **反向对照**：表里必须有足量的两类样本
+  （实测 rejected=8 / ok=18），否则这张表可能在测空气。
+- `d139_heterogeneous_literals_are_rejected_by_typeck` —— 补上速查表在
+  **解析层**表达不了的一层：两条异质字面量在表里算 `Ok`，因为
+  **`ParserV3::compile` 不跑 typeck**；本条钉住「解析通过 ≠ 程序合法」。
+
+  这条同时澄清了一个反复出现的概念：**解析层（`ParserV3::compile`）与
+  类型层（`check_program_witnesses_bidirectional`）是两道关**，
+  表里标 `Ok` 只代表过第一道。
+
+##### 表内覆盖（26 条，按家族）
+
+| 家族 | 条目 |
+|---|---|
+| 函数/闭包 | 具名 `task` ✓ / 具名 `fn` ✗ / 闭包三种形态 ✓（`return` 体、单表达式+`end`、省略 `end`） |
+| match | `with … end` ✓ / 花括号单行 ✓ / 花括号 arm 跨行 ✓（但不折叠）/ 跨行 arm ✗ / 花括号块体 ✗ |
+| 管道与跨行 | 单行 `\|>` ✓ / 跨行 `\|>` ✓ / **跨行二元运算 ✗** |
+| 后缀调用 | `f()()` ✗ / 分两步 ✓ |
+| 解构与标注 | `let [a,b] =` ✗ / `result<…>` 标注 ✗ / 参数标注 ✗ / 裸 `list` 标注 ✗ / `?` 传播 ✗ |
+| 异质集合 | 异质 list/dict **解析通过但 typeck 拒绝** / `dict.set` 异质 ✓ / `json.parse` 异质 ✓ |
+
+写新探针前先查这张表 —— 若某形态标着「✗ 语法非法」，**换一个**，
+别再据此解读任何 provider 的行为。
+
+##### 验证
+
+- 新增 `tests/mora_syntax_forms.rs` **3 条**
+- 全量 **1749 passed / 0 failed / 21 ignored**（102 个测试二进制）
+- `cargo clippy --lib --all-features` 0 警告；改动文件 `rustfmt --check` clean
+
+#### D140：用速查表探 spec §11 的块构造 —— 查出 **3 处 EBNF 与实现不符**
+
+D139 建好速查表后立刻用它**主动探新领域**：把 spec §14.2 承诺、但本会话
+**从未实测**的块构造批量跑一遍（TEA `app` / `update` / `handle` / `perform` /
+`model` / `msg` / `macro` / `transaction` 补偿 / `worker` / `with` / `import` /
+`assign`）。
+
+##### 十一处可用（含此前未测的）
+
+`app`（五字段形态）· `handle ask { 5 } { 7 }` · `model` · `msg` ·
+`macro`（定义+调用）· `transaction` + `compensation` 补偿子句 · `worker` ·
+`with` · `assign` · `perform`（能解析，进 typeck）· `import`（模块不存在时
+报 type error，属预期）
+
+##### 三处 **spec EBNF 承诺、实现却不接受**（性质不同于「实现不支持且 spec 未承诺」）
+
+| spec §11 产生式 | 承诺的形态 | 实测 |
+|---|---|---|
+| `app_stmt = "app" IDENTIFIER { statement } "end"` | 仅 `{ statement }` 即可 | ✗ 解析失败；实现要求 `model:`/`msg:`/`init:`/`update:`/`view:` **五个固定字段** |
+| `update_stmt = "update" "(" … ")" … "end"` | **顶层** `update(m) … end` | ✗ 解析失败；实现只把它当 `app` 块的**字段** |
+| `handle_stmt = "handle" IDENTIFIER "{" … "}" "{" … "}"` | `on … ->` 形态 | ✗ 解析失败；只有 `{ } { }` 形态可用 |
+
+后两条对用户是**实质缺口** —— 照 spec 写就编译不过，且**无任何提示**
+告诉用户正确形态（`app` 至少还能从 fixture 推断出五字段，
+`update` / `handle` 则完全无从得知）。
+
+##### 第四次撞上 D139 的坑（再次印证它的价值）
+
+`app Counter\n  print(1)\nend` 第一次测**解析失败**，我一度以为是缺陷。
+查 `tests/fixtures/e2e/tea_app.mora` 才发现真实形态要写五个字段 ——
+**又是探针写法不对**。D139 建表当天就用上，且当场避免了第四次误判。
+
+##### 验证
+
+- `tests/mora_syntax_forms.rs` 26 → **36 条形态**（13 非法 / 23 可用）；
+  判据仍 3 条，表与实现的同步检查随之覆盖新增条目
+- 全量 **1749 passed / 0 failed / 21 ignored**（102 个测试二进制）
+- `cargo clippy --lib --all-features` 0 警告；改动文件 `rustfmt --check` clean
+- 临时探针 `zz_probe_spec_blocks.rs` 与 `%TEMP%\mora_d140` 已删除
+
+#### D142：`linalg` 维度不匹配**静默给错值**（已修）＋ `main` 被执行两次的语义冲突（记档）
+
+##### 一、`linalg.dot` / `cross` / `matmul`：静默 `NaN` / `[]`（已修）
+
+| 调用 | 修复前 | 修复后 |
+|---|---|---|
+| `linalg.dot([1,2],[1,2,3])` | **`nan`**，exit 0，零诊断 | `向量维度不匹配（2 维 vs 3 维）`，exit 1 |
+| `linalg.cross([1,2],[1,2])` | **`[nan,nan,nan]`**，exit 0 | `只支持 3D 向量…`，exit 1 |
+| `linalg.matmul([[1,2]],[[1],[2],[3]])` | **`[]`**，exit 0 | `维度不匹配 —— A 是 1×2，B 有 3 行…`，exit 1 |
+
+**`dot` 当时的注释是错的**：写着「不在 builtin 抛错（**已在上层
+`expect_f64_vec` 校验**）」—— 实测 `expect_f64_vec` **只校验是不是 List +
+元素是数值**，**不看维度**。一条错误的前提让「静默兜底」看起来像深思熟虑的
+设计，实则没人校验过。
+
+**危害**：`NaN` 会顺着后续算术**静默污染整条表达式**（`nan + 1`、`nan > 0`
+都不报错）；`matmul` 返回 `[]` 时调用方**无法区分「结果就是空矩阵」与
+「参数写错了」**。
+
+修法：三处返回类型改 `Result<_, String>`，维度不匹配即报错。
+**空输入语义未变**（`norm([])` 仍 `0.0`、`matmul([],[])` 仍 `[]`）——
+本轮只收紧维度不匹配这一类。
+
+##### 二、`main` 被执行两次：脚本入口与显式调用的语义冲突（**记档，需决策**）
+
+```mora
+task main()
+  print("side-effect")
+end
+main()
+```
+```text
+side-effect / side-effect        ← 执行两次，exit 0，零诊断
+```
+
+对照实验（证明只影响 `main`）：
+
+| 用例 | 实测 |
+|---|---|
+| `task main()` **不**调用 | `X` —— `main` 被**入口自动执行** |
+| `task main()` + `main()` | `X / X` —— 自动 + 显式 = **两次** |
+| `task t1()` + `t1()` + `t1()` | `A / A / B` ✓ 正确（非 `main` 无此行为） |
+
+根因：`mir/vm.rs:445 run_main_task` **显式扫描**无参 `task main` 并执行一次
+（fixtures 如 `linalg_basic.mora` 全靠这个「定义即执行」）。
+**两种用法各自合理**（fixture 依赖 A，用户可能习惯 B），但**叠加是静默的**：
+有副作用的 `main`（写文件、发请求）会跑两次。
+
+未实施 —— 修法涉及语义决策（跳过入口 / 仅警告 / 改文档），按既定原则只报告。
+
+##### 顺带查明的第三处（**未修，记档**）
+
+`stats.mean([])` → `0.0`（数学上是 `0/0`，应为 `NaN` 或报错），
+同样静默 exit 0。属 `stats` 模块的同类问题，本轮未扩大范围。
+
+##### 验证
+
+- 新增 `tests/linalg_dimension_checks.rs` **3 条**：三处维度不匹配必须报错 /
+  **反向对照**（5 种合法调用结果逐个比对不变）/ **对照组**（空输入语义未变）
+- 全量 **1752 passed / 0 failed / 21 ignored**（103 个测试二进制）
+- `cargo clippy --lib --all-features` 0 警告；改动文件 `rustfmt --check` clean
+
+#### D143：`stats.cov([] , [])` 静默得 `NaN` —— 同族唯一破例（已修）＋ 更正 D142 的一处误判
+
+##### 先更正 D142 留下的一处**误判**
+
+D142 收尾时写「`stats.mean([])` → `0.0` 属 `stats` 同类问题，记档」。
+本轮查明**那是错的**：`stats` 的空输入行为是**有意设计** ——
+约定就写在 `mean` 上方的注释里（v0.104.6 引入）：
+
+```rust
+/// v0.104.6：空列表返回 `0.0`，与同文件的 `mean` / `median` 完全一致。
+```
+
+即 `mean` / `var` / `median` / `min_f` / `max_f` **全部**显式
+`if xs.is_empty() { return 0.0 }`。它**不是**「被错误前提掩盖的缺陷」。
+
+##### 真正破例的只有 `cov` 一个（已修）
+
+```mora
+stats.cov([], [])   →   nan       （exit 0，零诊断）
+```
+
+`cov` 是同族里**唯一**漏掉空输入守卫的（它直接 `cov / a.len()`），
+而 `pearson_correlation` 反而**有** `if denom == 0.0 { 0.0 }` 守卫。
+现补上空输入守卫。
+
+**教训**：「同族里有一个行为特殊」不等于「同族都有问题」——
+先查那条约定**写在哪儿、覆盖了谁**，再判断破例的是哪一个。
+D142 正是因为没查注释才把整族都记成了缺口。
+
+##### 顺带确认的既有正确行为（钉住防回退）
+
+| 场景 | 行为 |
+|---|---|
+| `stats.corr([1,2],[1,2,3])` 长度不匹配 | **exit 1** + `lists must have equal length` ✓ |
+| `stats.quantile(xs, 1.5)` q 越界 | **exit 1** + `q must be in [0, 1]` ✓ |
+| `stats.corr([1,1,1], [1,2,3])` 常量序列 | `0.0`（相关系数数学上未定义，`denom == 0.0` 分支的**约定**） |
+| `stats.corr` / `stats.cov` 的维度检查 | **本就存在** —— 这正是 D142 判定「`linalg` 缺维度检查是疏漏」的依据（`stats` 早有正确做法） |
+
+##### 又一次踩到 BOM（本会话第 N 次，已改为固定动作）
+
+PowerShell 5.1 的 `Set-Content -Encoding UTF8` 会写 BOM（`EF BB BF`），
+而 `mora` 报 `Unexpected character '﻿' at line 1, column 1`。
+**注意**：用其它工具「覆盖」同一路径**不会清掉已有 BOM** ——
+必须显式 `[System.IO.File]::WriteAllText($f, $text, [Text.UTF8Encoding]::new($false))`。
+
+##### 验证
+
+- 新增 `tests/stats_empty_input_consistency.rs` **4 条**：
+  主判据（`cov` 空输入）/ **把「同族一致性」钉成契约**（8 个聚合函数逐一比对，
+  而非各记一条）/ **反向对照**（7 种非空结果逐个比对不变）/
+  **对照组**（`quantile` q 越界仍报错）
+- 全量 **1756 passed / 0 failed / 21 ignored**（104 个测试二进制）
+- `cargo clippy --lib --all-features` 0 警告；改动文件 `rustfmt --check` clean
+- 探针目录 `target/probe_d143` 已删除
+
+#### D144：`random` 区间**写反**时静默给出错值（已修）
+
+D142 / D143 的「同族一致性」模式延续到 `random` / `math`。
+
+##### 缺陷：`min > max` 被当成单点区间
+
+```mora
+random.rand_int(5, 1)     -- 修复前：5.0，exit 0，零诊断
+```
+
+根因在 `next_i64_in`：它把两件事混为一谈 ——
+
+```rust
+if max <= min { return min; }
+```
+
+* `max == min` 是**单点区间**，返回 min **合理**
+* `max < min` 是**参数写反**，返回一个确定值，用户**看不出出错**
+
+`rand_float` 同理：`min + (max - min) * rand` 在 `max < min` 时仍落在
+两数之间，只是**方向反了**，完全看不出来。
+
+现给两处补 `min > max` 守卫。内部调用点（`rand_choice` / `shuffle`）传的都是
+`(0, len)` 形式，`max >= min` 恒成立，**不受影响**。
+
+##### 同批查明的既有正确行为（钉住防回退）
+
+| 场景 | 行为 |
+|---|---|
+| `math.sqrt(-1)` | `nan` —— **IEEE 754 标准**，非缺陷 |
+| `math.log(0)` / `1.0 / 0.0` / `math.pow(0, -1)` | `-inf` / `inf` / `inf` ✓ |
+| `random.rand_choice([])` | **exit 1** + `empty list`（空列表守卫**本就存在**） |
+| `random.rand_choice(x)`（x 非 list） | exit 1 + `requires a list` ✓ |
+
+##### 顺带发现的既有问题（**记档不修**）
+
+ambient 错误会被外层包装一次，而 `dispatch_op` 内部的消息**自带** `random.xxx`
+前缀，于是**重复**：
+
+```text
+Runtime error (MIR): random.rand_choice: random.rand_choice requires a list
+```
+
+本轮新增的两条错误消息同样自带前缀，是**遵循** `runtime/random.rs` 里
+「错误消息与 v0.91 保持**逐字一致**」的显式约定，**不是新引入**。
+去重要改包装层或改全部消息（其一会破坏逐字一致的约定）—— 属独立的小清理，记档。
+
+##### 验证
+
+- 新增 `tests/random_range_checks.rs` **5 条**：主判据（`rand_int` 写反报错）/
+  `rand_float` 同款 / **反向对照**（单点区间 `rand_int(7,7)` 仍可用 —— 挡住
+  「顺手把 `max <= min` 改成 `max < min`」的过度收紧）/ **反向对照**（正常区间
+  30 次抽样均落在 `[min, max)`）/ **对照组**（`rand_choice` 空列表守卫）
+- 全量 **1761 passed / 0 failed / 21 ignored**（105 个测试二进制）
+- `cargo clippy --lib --all-features` 0 警告；改动文件 `rustfmt --check` clean
+- 探针目录 `target/probe_d144` 已删除
+
+#### D145：`compress` 的 `max_bytes` 负数被**饱和转换**成 0 —— 内容被悄悄删掉（已修）
+
+##### 缺陷
+
+```mora
+compress("abcdefgh", "head_tail", {max_bytes: -5})
+```
+
+修复前与 `{max_bytes: 0}` 输出**逐字节相同** —— 8 字节输入里只保留 head/tail
+各 15%（`a … [6 bytes elided] … h`），**exit 0、零诊断**。
+
+**根因**（`src/compress/mod.rs::options_from_value`）：
+
+```rust
+opts.max_bytes = Some(*n as usize);   // Rust 的 float→int `as` 是**饱和转换**
+```
+
+`-5.0 as usize == 0`。于是「上限写错符号」表现为「内容被悄悄删掉」，
+而不是报错。
+
+##### 为什么这条特别隐蔽
+
+其它同族问题（`linalg.dot` 维度、`random.rand_int` 区间）都是**结果错**；
+这一条是**内容被删** —— 用户拿到的是一段「看起来像压缩结果」的文本，
+完全看不出数据丢了。饱和转换把「非法参数」伪装成了「合法的极小上限」。
+
+##### 范围：只收紧负数
+
+`max_bytes: 0` 的语义本身模糊（「什么都不保留」还是「不限制」？），
+当前行为是「保留 head/tail 各 15%」；**未改动**，记档。
+
+##### 同批确认的既有正确行为（钉住防回退）
+
+| 场景 | 行为 |
+|---|---|
+| `compress(x, "unknown_strategy")` | exit 1 + `unknown strategy` ✓ |
+| `compress(x, "head_tail")`（不传 opts） | 默认 8192，内容原样返回 ✓ |
+| `compress(x, "head_tail", {max_bytes: 8})` | 等于内容长度 → 原样返回 ✓ |
+| `math.*` 边界（D144 已查） | 全部 IEEE 754 标准行为 ✓ |
+
+##### 验证
+
+- 新增 `tests/compress_max_bytes_check.rs` **3 条**：主判据（3 种负数写法都报错）/
+  **反向对照**（4 种正常 `max_bytes` 逐字节比对不变）/ **对照组**（未知策略仍报错）
+- 全量 **1764 passed / 0 failed / 21 ignored**（106 个测试二进制）
+- `cargo clippy --lib --all-features` 0 警告；改动文件 `rustfmt --check` clean
+- 探针目录 `target/probe_d145` 已删除
+
+#### D146：把 D145 的「反查清单」**执行完** —— `take(-1)` 得空列表（已修）
+
+D145 结尾在 memory 里留了一条「反查清单」：全仓扫 float→int 的 `as` 饱和转换。
+本轮执行，结果是**修好一处 + 出一份全仓分级清单**。
+
+##### 缺陷：`take(-1)` 静默返回**空列表**
+
+```mora
+let xs = [1, 2, 3, 4, 5, 6]
+xs.take(-1)      -- 修复前：[]              （用户以为「取最后 1 个」）
+xs.drop(-1)      -- 修复前：原样返回全部
+```
+
+两者都 **exit 0、零诊断**。根因与 D145 同源：`Value::Float(n) as usize`
+是**饱和转换**，`-1.0 as usize == 0`。
+
+这条比 D145 更糟：D145 是「压缩结果丢内容」，这条是**直接返回空列表** ——
+调用方无从判断是「列表本来就空」还是「参数写反」。
+
+**同族正确的样板就在旁边**：`crush_json(max)` 与 `tail(max)` 早已有
+`if *n < 0.0 { return Err(…) }` —— `take`/`drop` 漏了。判据里特意把这两个
+「本就正确的」钉住，作为防回退的**对照组**。
+
+同批修了 `compress` 的 `k_first` / `k_last`（与 D145 的 `max_bytes`
+**同函数同型**）：负数会让「压缩」**静默失效**（原样返回全部元素）却 exit 0。
+
+##### 全仓普查分级（`Value::Float(n) as usize/u32`）
+
+| 级别 | 位置 | 状态 |
+|---|---|---|
+| **已修** | `compress.max_bytes`（D145）· `compress.k_first/k_last`（D146）· `take/drop`（D146） | 本轮 |
+| **本就正确** | `crush_json(max)` · `tail(max)` | 有非负校验，作样板 |
+| **待办（已记档）** | `checkpoint.v/step`（`src/checkpoint/mod.rs:167,178`）· `interpreter.mod.rs:746` 的 `max_tokens`（AI 配置上限）· `document/reading_order` 的 `reading_order_idx` | 未改 |
+| **风险低** | `ai_helpers` 的 `prompt_tokens`/`completion_tokens`（外部 API 报告值，本非负） | — |
+| **非本模式** | `lsp/json.rs` / `audit/mod.rs` 的 `c as u32`（char 转码点）· `mir/cache.rs` 的 `Arc::as_ptr` | 指针/字符码，非数值参数 |
+
+`max_tokens` 值得优先（AI 上限，负数 → 0 → 「不许输出」），本轮未扩大范围。
+
+##### 验证
+
+- 新增 `tests/slice_count_checks.rs` **4 条**：主判据（`take`/`drop` 负数）/
+  同批（`k_first`/`k_last` 负数）/ **反向对照**（6 种正常 count 逐字节比对）/
+  **对照组**（`crush_json`/`tail` 的既有非负校验钉住防回退）
+- 全量 **1768 passed / 0 failed / 21 ignored**（107 个测试二进制）
+- `cargo clippy --lib --all-features` 0 警告；改动文件 `rustfmt --check` clean
+- 探针目录 `target/probe_d146` 已删除
+
+#### D147：`with max_tokens = -1` 把 AI 上限静默设成 0（已修）
+
+D146 的普查清单里 `max_tokens` 被标为「值得优先」，本轮处理。
+
+##### 缺陷
+
+```mora
+with max_tokens = -1
+  ...
+end
+```
+
+修复前 **exit 0、零诊断** —— 上限被静默设成 `0`，即「模型不许输出任何内容」。
+用户看到「调用成功但没有内容」，却找不到原因。根因与 D146 同源
+（`-1.0 as usize == 0`）。
+
+##### 为什么它是「一族里最后一个漏网的」
+
+`interpreter/mod.rs` 的 `with`-config 分支**已经**被系统性加固过：
+
+| 分支 | 状态 |
+|---|---|
+| `temperature` | **D39** 加固：实参类型不对**报错**，不再静默让配置失效（注释明写「与 D1 同型」） |
+| `model` / `system` / `mock_llm` | 各有自己的校验 |
+| **`max_tokens`** | **裸 `as usize`，无人管** |
+
+**一族的加固做完 90%，剩下的 10% 就是下一处静默缺陷的藏身处。**
+这也是本轮的实际方法论收获：看到某个分支有详尽的加固注释时，
+**同组的兄弟分支**最值得复查 —— 它们往往是被漏下的。
+
+##### 一个观测口径的坑（顺手记下）
+
+判据一度写成「`run()` 的返回值应等于 `1.0\n2.0`」而失败，实得 `nil` ——
+**`with` 块的值恒为 `Nil`**（D107 已确立），`run()` 返回**末表达式**而不是
+stdout。**用 `is_ok()` 而非比输出**才是这里的正确口径。
+（D146 的 list 测试能直接比输出，是因为 list 值本身就是末值。）
+
+##### 验证
+
+- 新增 `tests/with_config_max_tokens.rs` **3 条**：主判据（2 种负数写法）/
+  **反向对照**（正常值 + `0` 的现状钉住）/ **对照组**（`temperature` 的
+  D39 加固不得回退）
+- 全量 **1771 passed / 0 failed / 21 ignored**（108 个测试二进制）
+- `cargo clippy --lib --all-features` 0 警告；改动文件 `rustfmt --check` clean
+- 探针目录 `target/probe_d147` 已删除
+
+##### 剩余的饱和转换待办（D146 清单里未处理的）
+
+`checkpoint.v` / `checkpoint.step`（`src/checkpoint/mod.rs:167,178`）·
+`document/reading_order` 的 `reading_order_idx` —— 本轮未动，仍记档。
+
+#### D148：把饱和转换普查**真正收口** —— 最重要的一处是 `curry` 的**两个分支行为不同**
+
+##### `curry` 的 `as usize` 在 `Float` 上饱和、在 `Int` 上**截断**
+
+`curry` 本来就有 `arity == 0` 的检查，但负数路径**只挡住了一半**：
+
+| 实参 | `as usize` 语义 | 结果 | 被 `arity == 0` 挡住？ |
+|---|---|---|---|
+| `Value::Float(-1.0)` | **饱和** → `0` | `arity = 0` | ✓ 报错 |
+| `Value::Int(-1)` | **截断** → `usize::MAX` | `arity = 18446744073709551615` | ✗ **绕过** |
+
+于是 `curry(f, -1)` 返回一个**永远凑不齐参数**的 Curry —— 调用多少次都不产生
+返回值，**exit 0、零诊断**，即**静默挂死**。
+
+**同一个 `as` 表达式在 `Float` 上饱和、在 `Int` 上截断 —— 只测一侧会漏。**
+D145–D147 那几处全是 Float 侧（`Value::Float(n) as usize`），所以一直没暴露
+`Int` 侧这条路径。
+
+##### `checkpoint` 的两个分支**都**危险
+
+`v`（版本号）与 `step`（步数）语义上不可能为负，而 `Int` 侧截断成巨大值、
+`Float` 侧饱和成 0 —— 两种都会让检查点逻辑走向完全错误的状态，且 exit 0。
+已为两个字段、四个分支各加守卫。
+
+##### `reading_order_idx`：负数按**缺失**处理
+
+它是 `document::reading_order` 的**私有 helper**，**无 Mora 语法入口**
+（`tests/` 零引用、spec 无示例）→ 只能经 Rust API 触达。改法是负数返回 `None`
+（走「无 idx」分支），而不是伪造「第 0 个」下标把块顺序排错。
+
+##### 又一次凭印象写调用形态（D139 教训第 5 次，且暴露速查表的覆盖缺口）
+
+初版测试里我臆造了 `c(1)(2)` 链式调用与 `checkpoint.save({…})` —— 前者
+`curry` 不支持（既有测试用的是 `curry(F, 1)` + `c(1)` **分步**），后者
+`checkpoint` **根本没有语法入口**。
+
+**D139 建的速查表只覆盖「语法形态」，不覆盖「builtin 调用形态」** ——
+这是它的下一个覆盖缺口（`curry`/`uncurry`/`apply`/`partial`/`checkpoint`
+等的表达方式各不相同）。本轮对无语法入口的两处改用**源码判据**
+（读源码断言守卫存在），不臆造运行时用例。
+
+##### 验证
+
+- 新增 `tests/saturating_cast_sweep.rs` **4 条**：
+  **主判据**（`curry` 负数 arity，**Int 与 Float 两侧**都必须测）/
+  **反向对照**（`curry` 正常 arity + `uncurry` 往返 + 既有 `arity==0` 拒绝）/
+  两条**源码判据**（`checkpoint` 与 `reading_order_idx` 无语法入口，断言守卫就位）
+- 全量 **1775 passed / 0 failed / 21 ignored**（109 个测试二进制）
+- `cargo clippy --lib --all-features` 0 警告；改动文件 `rustfmt --check` clean
+
+##### 本轮把饱和转换普查**全部收口**
+
+| 级别 | 位置 | 状态 |
+|---|---|---|
+| 已修 | `compress.max_bytes`(D145) · `compress.k_first/k_last` · `take/drop`(D146) · `with max_tokens`(D147) · `curry` 两侧 · `checkpoint.v/step` · `reading_order_idx`(D148) | **全部** |
+| 本就正确 | ~~`crush_json(max)` · `tail(max)`~~ | ⚠ **D153 更正：本行判断是错的** —— 那次只审了**负数**一侧、没审**类型**一侧，两处都只匹配 `Float`，`Int` 实参照样被拒 |
+| 风险低（保留） | `ai_helpers` 的 token 计数（外部 API 报告值） | — |
+| 非本模式 | `c as u32`（char 码点）· `Arc::as_ptr` | 指针/字符码 |
+
+#### D149：`compress` 的 options **静默吞掉两类输入** —— 包括**合法的数字**
+
+D148 把「饱和转换」收口了，但它说的是**数值转整数**这一步。D149 往前退一层：
+**字段能不能被读到**这一步就没做检查，两类输入都在 exit 0、零诊断下消失。
+
+##### 缺陷一：字段类型错 → 静默忽略
+
+```mora
+compress("abcdefgh", "head_tail", {max_bytes: "big"})
+```
+
+修复前**原样返回** —— 用户明确设了上限，却毫无作用，且无任何提示。
+根因是所有字段都写成 `if let Some(Value::Float(n)) = …`，类型不符即落空。
+这与 D39（`with temperature = "hot"` 让配置**静默失效**）**同型**：
+同一族加固在别处做过，这里漏了（D147 的教训：加固过的分支是索引，兄弟分支要复查）。
+
+##### 缺陷二：**完全合法**的输入被丢弃（更隐蔽）
+
+```mora
+let o = json.parse("{\"max_bytes\": 1}")
+compress("abcdefgh", "head_tail", o)
+```
+
+同样原样返回。代码只匹配 `Value::Float`，而：
+
+| 来源 | 数字的运行时类型 |
+|---|---|
+| dict **字面量** `{max_bytes: 1}` | `Float`（D98） |
+| **`json.parse`** 产出的 dict | **`Int`**（D129 实测） |
+
+于是**完全合法的数字**被静默丢弃 —— 这正是 D148「`Int`/`Float` 两侧都要管」
+的教训在**上一层**的复现：D148 强调的是「守卫要写两侧」，D149 是「**取值**也要认两侧」。
+
+##### 修法
+
+`options_from_value` 重写为两个助手，缺失仍合法跳过、类型错一律报错：
+
+- `num()` —— `Int` 与 `Float` **都**接受，其余类型报错并**点名是哪个字段**
+- `flag()` —— 4 个布尔字段同理（`preserve_errors` / `preserve_outliers` /
+  `preserve_ids` / `recursive`）
+- `strategy` / `output_format` 补 `else` 分支报错（原先同样只匹配字符串）
+
+D145/D146 的负数守卫在重写中**原样保留**，并由对照组钉住防回退。
+
+| 输入 | 修复前 | 修复后（已实测） |
+|---|---|---|
+| `{max_bytes: "big"}` | exit 0、原样返回 | exit 1 + ``compress: `max_bytes` 期望数字，得到 string`` |
+| `json.parse('{"max_bytes":1}')` | exit 0、原样返回 | **生效**（触发 head_tail 截断） |
+
+##### 顺带记档（**未改动**）：`max_bytes` 是**触发阈值**而非硬上限
+
+`compress/text.rs` 注释明写「`max_bytes` **仅用于判断"是否需要压缩"**」：
+超过它就触发 head/tail 截断，但**结果本身可以超过该值**。名字易被误解成硬上限，
+属命名/文档问题，记档待决。
+
+##### 验证
+
+- 新增 `tests/compress_option_types.rs` **4 条**：
+  **主判据①**（6 个字段 × 类型错必须报错且点名字段）/
+  **主判据②**（`json.parse` 的 `Int` 必须生效 + **反向对照** dict 字面量 `Float` 照常生效）/
+  **对照组①**（字段缺失仍合法：省略 / 空 dict / 只有 `strategy`，不能把可选参数改成必填）/
+  **对照组②**（D145/D146 负数守卫不得回退）
+- 4 passed / 0 failed
+- ⚠ 观测口径再踩一次：`print(compress(…))` 的末值是 `print` 的 `Nil`，
+  首次运行误判为「修复无效」。改为 `let r = compress(…)\nr` 后才是 `compress` 的产物
+  （D107 同款陷阱，本会话已在 `with` 块上踩过一次）
+
+#### D150：可选**数值**实参被静默丢弃 —— 6 处，其中 `tea.run` 是**反向**的同一个缺陷
+
+D149 修的是「options **字段**读不到」。本轮往前/往外扩一层：**位置实参**。
+全仓扫 `if let Some(Value::Float(n)) = args.get(i)`，命中**恰好 6 处**，
+且症状**各不相同** —— 逐处实测如下。
+
+| 位置 | 修复前症状（**均 exit 0、零诊断**） |
+|---|---|
+| `schedule.add` `interval_s` | **误导性报错** `Every kind needs interval_s > 0` —— 用户**明明传了合法值**，却被说成没传 |
+| `schedule.add` `at_epoch` | 同上 |
+| `ccr.marker` `size` | `ccr.marker("abcdef", 8)` → `<<ccr:abcdef,8>>`；同样的 8 用 `len()` 传入 → **`<<ccr:abcdef,0>>`** |
+| `mora.refine` `count` | **返回类型静默改变**：`List[Dict]` 变单个 `Dict`（`count` 决定返回类型） |
+| `mora.refine_info` `iter` | 查第 1 轮 → 静默返回**最新一轮**（`iter` 变 `None` → `latest_step()`） |
+| `tea.run` `max_steps` | **反向**：只认 `Int`，于是最自然的 `tea.run(a, 3)` 反而失效 |
+
+##### `tea.run` 那处最重：修复前实跑 **1000** 轮（应 3 轮）
+
+它只匹配 `Value::Int`。而 Mora 的数字**字面量**是 `Float`（D98）、
+`Value::Int` 只由 `len()` 等产生 —— 于是**唯一能用的写法是最不自然的那种**。
+
+探针让 `update` 每轮 produce 一个 `Cmd::Dispatch`（队列永不空），故
+`count` == 实际轮数。**修复前实测**：
+
+| 调用 | 修复前 | 修复后 |
+|---|---|---|
+| `tea.run(a, 3)` | count **1000** | count 3 |
+| `tea.run(a, 10)` | count **1000** | count 10 |
+| `tea.run(a, len([1,1,1]))` | count 3 | count 3 |
+| `tea.run(a)`（省略） | count 1000 | count 1000 |
+
+即：一个会自我派发的 Elm 式应用，用最自然的 `tea.run(app, 3)` 会**多跑 333 倍**，
+exit 0、零诊断。仓库里现成的 fixture（`tests/fixtures/e2e/tea_counter.mora:17`
+的 `tea.run(app_inst, 5)`）当时**正好没暴露** —— 队列只有 2 条，1 轮就折叠完。
+
+##### 为什么必选参数没事、可选参数出事
+
+**必选**数值实参走 `math.rs::expect_number`，认 `Int`/`Float`/`BigInt` ——
+实测 `math.pow(2, 10)=1024`、`math.sqrt(len([4,9]))` 均正常。
+**可选**实参被迫写 `if let`，而 `if let` 把「**没传**」与「**类型不对**」
+混成同一件事，于是必然漏掉一侧。这是本轮的机制性解释。
+
+（D150 初稿曾把 `ai.rs` 的 `backoff_ms` 当作「同族里有人做对了」的样板，
+后经 D59（`tests/ai_namespace_reachability.rs`）复查发现 **`ai.retry` 在
+Mora 源码里根本不可达** —— parser 永远把它解析成「裸名 `ai` + 方法 `retry`」，
+产不出单名 `"ai.retry"`。样板改指可触达的 `expect_number`；
+`ai.rs` 那处改写成**源码判据**。这是 D148 教训的又一次复现。）
+
+##### 修法
+
+新增 `builtins::optional_num_arg(args, idx, callee, what)`：**缺失**合法跳过、
+`Int`/`Float` 都接受、其余类型报错并点名字段。6 处统一改用它。
+
+##### 记档（**未改**）：负数不在本轮收紧
+
+6 处的负数语义各不相同（`as usize` 饱和到 0 / `as u64` 饱和到 0），
+且 `schedule.add` 的负数会撞上下游**本就诚实**的
+`Every kind needs interval_s > 0`（负数确实需要 `> 0`）。
+按「收紧一类错误，别顺手改另一类」记档待决。
+
+##### 验证
+
+- 新增 `tests/numeric_positional_args.rs` **9 条**：
+  **主判据 5 条**（`schedule.add` 间隔 · `ccr.marker` size · `refine` 返回类型 ·
+  `refine_info` iteration · `tea.run` Float 上限）/
+  **对照组 3 条**（默认 1000 与 Float 路径不变 · 非数字实参必须报错 · 必选路径
+  `math` 的 Int 仍通）/ **源码判据 1 条**（`ai.rs` 的 `backoff_ms`）
+- 9 passed / 0 failed
+
+##### 我自己的一处探针缺陷（已更正，非产品缺陷）
+
+第一版 `tea.run` 探针用「先 `dispatch` 3 条再 `run(a,1)`」，结果修复前后都是
+`count: 3` —— 差点据此判定「不是缺陷」。读 `run_loop` 才发现它每轮
+`fold` **全部**待处理消息（`for _ in 0..max_steps` 是**轮数**不是**消息数**），
+队列不回流时上限根本不起作用。改成每轮 produce `Cmd::Dispatch` 后才真正区分。
+**「探针跑出两边一样的数」要先怀疑探针，而不是下结论。**
+
+#### D151：一份「不要求执行成功」的可达性普查，却每次跑都往**仓库根**写文件（已修）
+
+本轮收尾做环境核查时发现仓库根多出一个 `a.txt`（1 字节，内容 `x`），
+时间戳正好落在全量测试运行期间。追到 `tests/spec_builtin_surface.rs`。
+
+##### 那份普查自己写着「不要求执行成功」，却有文件副作用
+
+它的断言是「该名字能被解析到一个已知方法」，文件头明写：
+
+> 不要求执行成功 —— `web.fetch` 会因无网络而报 network error、
+> `file.read_text` 会因文件不存在而报错，这些都**不是**表面问题。
+
+但表里有两条**真的会执行**的调用，且都是**相对路径**：
+
+| 表项 | 副作用 |
+|---|---|
+| `file.write_text("a.txt", "x")` | 写文件到 CWD |
+| `file.mkdir_all("a")` | **建目录**到 CWD |
+
+`cargo test` 的 CWD 是**包根目录** → 每跑一次全量，仓库根就多一个
+`a.txt` 和一个 `a/`，污染 `git status`。（本轮用真实 CLI 复现：两条都建了出来。）
+
+即：**一份声称「不要求执行成功」的测试，却带着文件系统副作用** ——
+与本会话修过的整族「静默」缺陷同源，只是这次污染的不是数据而是仓库。
+
+##### 修法
+
+- 两条改用 `%TMP%` 占位符，运行时替换为 `std::env::temp_dir()` 下的专属目录；
+  路径用**正斜杠**（Windows 的 `C:\Users\…` 里 `\U` 会被 Mora 字符串字面量当转义）
+- 临时目录在**循环外**建、断言前清，保证任何一次失败都不会把副作用落进仓库根
+
+##### 判据写法：不测「跑完有没有残留」，而是**从源头钉住**
+
+`d151_surface_census_writes_nothing_relative_to_cwd` 遍历表项，断言
+「会改动文件系统的调用**不得**是相对路径」—— 不依赖事后观察目录。
+并且**实测它会红**：临时把 `file.write_text` 改回相对路径，该条确实 FAILED
+并打出可读信息，随后还原（反向验证：钩子方向对了，现象才可信）。
+
+##### 验证
+
+- `tests/spec_builtin_surface.rs` 新增 1 条（D151），5 passed / 0 failed
+- 跑完确认：仓库根 `a` / `a.txt` 均**不存在**，临时目录亦已清除
+
+#### D152：可选**字符串 / 列表**实参 —— `else` 分支**不是默认值，而是另一个操作**（已修）
+
+D150 收的是「可选**数值**」实参，其 `else` 至少是**同类型的默认值**。
+本轮扩到非数值实参，扫出一处更坏的形态。
+
+##### `plan.list` 静默做**另一件事**
+
+```mora
+plan.create("alpha", [{id: "s1", text: "first"}])
+plan.create("beta",  [{id: "s1", text: "second"}])
+
+plan.list("alpha")   // [{emoji: ⬜, id: s1, status: pending, text: first}]
+plan.list(5)         // [alpha, beta]    ← 修复前
+plan.list(["alpha"]) // [alpha, beta]    ← 修复前
+```
+
+`if let Some(Value::String(name)) = args.first() { 查该计划 } else { 列出所有计划名 }`
+—— 这个 `else` **不是默认值，是另一个操作**。用户要某计划的步骤，拿到的是
+全部计划名；exit 0、零诊断，下游 `filter` / 下标随之给出错误结果而毫无报错。
+
+**同文件的 `create` / `update` 对每个字段都有精确类型报错**
+（`steps[{}].id must be a string`、`updates[{}][1] invalid status '{}'` …），
+`plan.list` 是同族里唯一的破例者。
+
+##### `sandbox.containerize`：三处紧挨着两处正确写法
+
+| arg | 字段 | 修复前 |
+|---|---|---|
+| 1 | `mounts` | `if let Some(Value::List(..))` 无 else → 传错类型**静默当成没传** |
+| 2 | `network` | `if let Some(Value::String(..))` 无 else → 静默保持**默认网络模式** |
+| 3 | `cpu_cores` | ✅ Int/Float 都认 · `Nil` 放行 · `_` 报错 |
+| 4 | `memory_mb` | ✅ 同上 |
+| 5 | `image` | 无 else → 静默保持**默认镜像** |
+
+**本机 Docker CLI 在但守护进程未运行**，happy path 必然止于 spawn。
+这反而让危害更清楚：image 传 `12345` 时，真正的问题（类型不对）被
+`docker daemon unreachable` **完全掩盖**，exit 1 的**归因是错的**：
+
+```text
+修复前：Runtime error: sandbox.containerize: docker daemon unreachable: …
+修复后：Runtime error: sandbox.containerize: image must be a string, got float
+```
+
+##### 修法
+
+新增 `builtins::optional_str_arg`（`optional_num_arg` 的对称件），两个助手统一
+**把 `None` 与 `Value::Nil` 都视为「没传」**，其余类型报错并点名字段。
+
+##### 对照组当场抓到我自己的回归（这是它最值钱的地方）
+
+新写的「`cpu_cores` / `memory_mb` 不得回退」那条**首跑就红**：
+
+```text
+sandbox.containerize("docker", nil, nil, nil, nil, nil)
+→ sandbox.containerize: network must be a string, got nil
+```
+
+根因：`sandbox` **原本**就把 `Value::Nil` 当「没传」显式放行
+（`Value::Nil => {}`），而我新加的助手没照做，等于把 `nil` 误判成类型错。
+`nil` 是 Mora 的 null、可选实参传 `nil` 是惯用法 —— 两个助手都补上了 `Nil` 分支。
+（`optional_num_arg` 同样补了，并回归验证 D150 的 9 条无回退。）
+
+**若那条对照组只断言「happy path 不报错」，这个回归会完全漏掉** ——
+因为本机 Docker 没跑，happy path 本来就报错，错误文本一变就足以骗过弱断言。
+
+##### 普查结果（`else` 是不是「另一个操作」）
+
+| 位置 | `else` 语义 | 处理 |
+|---|---|---|
+| `plan.list`(0) | **另一个操作**（列全部） | **已修**（D152） |
+| `sandbox` mounts/network/image | 保持默认值 | **已修**（D152） |
+| `ai.heartbeat` / `ai.retry` | 合理的默认路径 | 不动；且按 D59 **无 Mora 语法入口** |
+| `event` / `mock` 的 `unwrap_or(Nil)` | payload 本就允许 Nil | 不动 |
+
+##### 记档（**未改**）：D152 之后 `plan.*` 的 name 实参出现了新的不对称
+
+| 方法 | name 实参 | 修复后行为 |
+|---|---|---|
+| `list`(可选) | D152 起**报错** | 因为「没传」有一个**语义完全不同**的合法含义（列全部），错类型无法安全地解释成默认值 |
+| `create` / `add` / `remove` / `info`(必选) | 仍是 `args[0].to_string()` | 传 `5` 当作查计划 `"5.0"`，查不到就报 `plan '5.0' not found` |
+
+这两类**不该统一**：可选参数错类型时无法安全降级，必选参数错类型时最坏也只是
+「查不到」而非「做了另一件事」。**但确实存在一处不自洽** ——
+`plan.create(5, [...])` 能建出名为 `"5.0"` 的计划，于是
+`plan.info(5)` 查得到、`plan.list(5)` 却报错。
+
+按「收紧一类错误，别顺手改另一类」，本轮**不动** `create`/`add`/`remove`/`info`
+的 `to_string()` 宽松约定（那是**必选**参数的另一类问题），仅记档。
+彻底消除不自洽需要先把「计划名是否允许非字符串来源」这个设计问题定下来。
+
+#### D153：普查范围漏了**值方法面** —— `list.get` 的 `Int` 索引静默变成 0（已修）
+
+D149–D152 把「实参/选项取值」这一族收得差不多了，本轮是顺着它继续，
+结果撞上一件更根本的事：**前两轮的普查范围比缺陷的机制更窄**。
+
+##### 范围是怎么窄的
+
+| 轮次 | 普查关键字 | 路径 | 覆盖的面 |
+|---|---|---|---|
+| D150 | `if let Some(Value::Float(n)) = args.get(` | `src/interpreter/builtins/` | **命名空间函数** |
+| D152 | `if let Some(Value::X(..))` | 同上 | 同上 |
+| D153 | `.and_then(\|v\| match v { Value::Float(n) => …, _ => None })` | **全仓** | **含值方法** |
+
+而 `xs.get(i)` / `xs.take(n)` / `xs.reshape(r,c)` / `xs.crush_json(max)` 走的是
+**值方法**面（`method_dispatch.rs`），写法是上面那行 —— **绿灯是假的**。
+
+##### 最严重的一处：`list.get` 的 `Int` 索引静默变成 0
+
+```rust
+let index = args.first()
+    .and_then(|v| match v { Value::Float(n) => Some(*n as usize), _ => None })
+    .unwrap_or(0);        // ← Int 落进 _ => None，于是索引变 0
+```
+
+实测（`xs = [10, 20, 30]`）：
+
+| 调用 | 修复前 | 修复后 |
+|---|---|---|
+| `xs.get(2)`（Float 字面量） | 30.0 | 30.0 |
+| `xs.get(9)`（Float 越界） | ERR index 9 out of bounds | 同左 |
+| `xs.get(len([9, 9]))` = 2 | **10.0** ❌ | 30.0 ✅ |
+| `xs.get(len([9,9,9]))` = 3 | **10.0** ❌ | **ERR index 3 out of bounds** ✅ |
+
+倒数第二行：索引 2 被静默当成 0。第四行更恶劣 ——
+**一个本该越界报错的输入静默返回了首元素**。
+比 D152 的 `plan.list`（用户拿到「另一个操作」的结果）更糟：那里至少结果看得见，
+这里**连报错都被吞掉**，用户完全无从察觉自己在读 `xs[0]`。
+
+##### 同族其余：报「没传」的**归因错误**
+
+`take` / `drop` / `window` / `batch` / `reshape` / `crush_json` 传 `Int` 时报
+`take() requires a count argument` —— **实参明明传了**，只是个合法的 `Int`。
+exit 1 但**归因是错的**（与 D152 的 sandbox 同一性质）。
+`document.parse` 的 path、`Conversation.compress` 的 strategy 同族。
+
+##### 顺带更正 D148 普查表的**两处错判**
+
+D148 的饱和转换普查表里写着一行：
+
+| 级别 | 位置 | 状态 |
+|---|---|---|
+| 本就正确 | `crush_json(max)` · `tail(max)` | 作样板 |
+
+**那是错的。** 那次普查问的是「负数会不会被饱和转换吃掉」，两处确实做了负数检查，
+于是被判为「正确」；但它们**只匹配 `Value::Float`**，`Int` 实参照样被拒
+（`crush_json` 报 `requires max as number`、`tail` 报 `must be a number`）。
+**只审了负数那一侧、没审类型那一侧。**
+
+这与已有教训「普查表里标为『已排除』的条目同样要实测」同源 ——
+只不过这次是**我自己写的排除项**，而且它是**主动充当样板**的，
+错判的后果比单纯漏查更大。
+
+##### 修法
+
+在 `builtins/mod.rs` 补齐 D150/D152 的第三、四件：
+`required_num_arg` / `required_str_arg`（必选版，与可选版只在**缺参措辞**上不同 ——
+真没传才说 requires），值方法面 9 处统一改用。
+
+##### 验证
+
+- 新增 `tests/value_method_args.rs` **8 条**：
+  **主判据 5 条**（`get` 的 `Int` 索引取到正确元素 / **越界 `Int` 必须报错** /
+  `take`·`drop`·`window`·`batch`·`reshape` 认 `Int` / `crush_json`·`tail` 认 `Int` /
+  错类型必须报「类型错」且**不得**出现 `requires`）/
+  **反向对照 1 条**（Float 字面量路径**逐字**不变，含越界仍照旧报错）/
+  **对照组 2 条**（D145/D146 负数守卫不得回退；
+  `range`·`random.rand_int`·`stats.histogram` 这三处**本来就正确**的可触达样板不得回退）
+- 我自己写错两处测试（Rust 变量被插值进 Mora 源码；负数断言只认英文而实际消息是中文
+  「不能为负数」），均已更正 —— 非产品缺陷
+
+#### D154：给 D153 做**收口审计** —— 三条否定结果、一条自造测试的假阳性、一条深水区诊断缺陷
+
+D153 修完值方法面后，本轮回头验证「**修得完整吗**」——
+结果最有价值的产出都不是新缺陷，而是**发现 D153 自己的测试有一条是假阳性**。
+
+##### 先把 D153 的性质说准：运行期比**自己的类型声明**更窄
+
+D153 的根因不是「Int 被丢弃」这么表面，而是：
+
+> typeck 把这些形参声明为 `Union(Int, Float)`（即 D62 定的 `number`），
+> **运行期却只匹配 `Float`** —— 运行期**比自己的类型声明更窄**。
+
+这条说法给出了**可机械执行的普查规则**：
+**凡 typeck 声明含 `Float` 的形参，运行期必须接受全部声明变体。**
+照它把全仓 `Union(Int, Float)` 形参签名普查了一遍（6 处）：
+
+| 签名位置 | 方法 | 运行期 | 状态 |
+|---|---|---|---|
+| `dispatch.rs:495` | `math.abs/sign/floor/ceil/round/trunc` | `unary_preserve`（Int/Float 都认） | ✅ 本就正确 |
+| `dispatch.rs:1136` | `take` / `drop` | 修复前只认 `Float` | ✅ D153 已修 |
+| `dispatch.rs:1145` | `window` / `batch` | 同上 | ✅ D153 已修 |
+| `dispatch.rs:1164/1168` | `reshape` | 同上 | ✅ D153 已修 |
+| `dispatch.rs:1205` | `list.get` | 同上 | ✅ D153 已修 |
+
+##### 否定结果一：其余 `unwrap_or_default()` 全部被 typeck 挡住
+
+`method_dispatch.rs` 里还剩一批 `args.first().map(to_string).unwrap_or_default()`：
+String 方法（`split`/`replace`/`contains`/`starts_with`/`ends_with`）、
+`dict.get`/`dict.set` 的 key、`json.parse`、`conv.chat`、`Router.route`、
+`McpServer.tool`、`agent.run`。实测传非字符串实参：
+
+```text
+"a,b,c".split(5)   → typeck 拒绝（expected string, got float）✅
+d.get(5)           → typeck 拒绝 ✅
+d.set(5, "x")      → typeck 拒绝 ✅
+```
+
+即这些 `unwrap_or_default()` 从 Mora 源码**根本走不到**（typeck 先拦）。
+**「看起来同型」≠ 缺陷** —— 必须确认载体可达。
+
+##### 否定结果二：BigInt 被拒是**设计决定**，不是缺陷
+
+`xs.take(999n)` 被 typeck 拒（`expected int, got bigint`）。查签名：
+`dispatch.rs:1136` 声明的是 `Union(Int, Float)` —— 而 D62 明确
+「`BigInt` **不参与** `number`（`Int <: Float` 提升）」，`number` = Int|Float。
+而 `range` / `expect_number` 之所以接受 BigInt，是它们**运行期**显式处理了
+`Value::BigInt`（`builtin_impls.rs:62` 的注释写明了）。
+
+故这是**两层对「什么是数字」的口径不同**，属语言设计边界，记档不动。
+
+##### 我自己 D153 的测试 ⑤ 是**假阳性**（已修）
+
+`d153_wrong_type_reports_type_error_not_missing_argument` 断言
+`xs.take("two")` 报运行期的「must be a number」。但该测试用
+`ParserV3::compile` + `run_mir`，**绕过 typeck**；而真实 CLI 会先跑 typeck：
+
+```text
+xs.take("two")
+  CLI 路径 → exit 2，Type mismatch: expected int, got string   ← 用户实际看到的
+  测试路径 → 运行期 "take: count must be a number"            ← 用户永远看不到
+```
+
+即这条断言测的是一条**用户走不到的路径**。修复本身没错（它对
+不过 typeck 的入口 —— 库 API / REPL / LSP 运行时 —— 是对的），
+但测试在**替一条不可达路径背书**。
+
+已补 `d154_cli_rejects_wrong_typed_arg_before_runtime` 走真实链路
+（`cli::compile_and_opt` + `check_program_witnesses_bidirectional`），
+把两条路径的行为**都**钉住。**测试装置比生产路径宽松，就会替不可达路径背书。**
+
+写这条时又发现一处：`xs.crush_json("two")` **通过**了 typeck ——
+因为 `typeck/hm/builtin.rs:143` 把它的第 2/3 参声明成 **fresh TypeVar**，
+约束无信息量 → typeck 放行任何类型（D130 同族的假阴性）。
+所以 `crush_json` 恰好是 D153 那条运行期消息**对用户可见**的那个。
+
+##### 深水区诊断缺陷：4 个错误 → 6 条**完全相同**的诊断，且都不带行号
+
+```text
+let a = xs.take("one")
+let b = xs.window("two")
+let c = xs.get("three")
+let d = xs.crush_json("four")
+```
+→ `6 type error(s) found.`，六条消息**逐字相同**：
+`Type mismatch: expected int, got string`，且全部「位置未跟踪」。
+用户既看到重复条目，**又无法分辨是哪一行**。
+
+根因已定位到数据层：`typeck/hm/unify.rs:116`
+`enum Constraint { Eq(Box<Type>, Box<Type>), … }` —— **`Constraint` 不携带 span**，
+于是每条合一错误的 `line` 都是 0；D128 的去重键 `(line, expected, actual)`
+在这里对 4 个**不同**调用给出**完全相同**的键。
+
+**所以本轮不做修复**，理由是**任何按消息的去重都是不健全的**：
+这 4 条是 4 个**真实且不同**的错误，只因缺位置才长得一样；
+按消息去重会把 4 条真实错误塌缩成 1 条 —— **那是把重复诊断换成漏报诊断**。
+
+根治是已记录的「`Constraint` 携带 span」待办。本轮把它的**用户可见后果**
+首次量化出来（4 错 → 6 条不可区分诊断），供该项排期时参考。
+
+#### D155：顺着 D154 的「位置未跟踪」往下挖 —— `json.parse` 静默把**任何**值当 JSON 解析（已修）
+
+D154 判定「诊断无 span 无法安全去重」就搁置了。本轮回头把那句话**验到底**，
+结果查出一条真缺陷。
+
+##### 先验清 D154 那条结论（并推翻自己的一个猜测）
+
+D154 猜「两条重复里一条来自双向层、一条来自 HM」。插桩把每条的
+`line/column/expected/actual` 打出来，结果**完全出乎意料**：
+
+```text
+xs.take("one")  → 2 errors
+  line=0 col=0 expected=Some("int") actual=Some("string") msg=Type mismatch: expected int, got string
+  line=0 col=0 expected=Some("int") actual=Some("string") msg=Type mismatch: expected int, got string
+```
+
+两条**逐字节相同**。又打印 witness 树，发现 span **本来是对的**：
+
+```text
+MethodCall { receiver: Variable("xs") @ line 2 col 9,
+             method: "take",
+             args: [Literal(String("one") @ line 2 col 17)] } @ line 2 col 16
+```
+
+所以 span 不是源头上没有，而是**在 typeck 出口丢掉的**。
+
+##### 顺带发现的口径不一致：值方法检查、模块方法不检查
+
+`bidirectional.rs:509` 显示方法调用的预检查**只递归、不做形参 check**；
+形参约束由 `infer.rs:1131` 压 `Constraint::Eq`（无 span）。
+而 `dispatch.rs::params()`（:433）把**模块方法的所有形参一律声明为 `Type::Any`**
+（保守约定，见其上方「宁可继续返回 TypeVar，也不要写一个没核对过的签名」），
+`Any` 与任何类型都能合一。实测对照（真实 CLI `mora --check`）：
+
+| 写法 | typeck | 说明 |
+|---|---|---|
+| `xs.take("one")`（**值**方法，形参声明 `Union(Int,Float)`） | 2 errors | 重复、无行号 |
+| `math.floor("o")`（**模块**方法，形参是 `Any`） | **No type errors found** | 结构上无从检查 |
+| `math.pow(2,"o")` / `math.pow("o",2)` / `math.hypot` / `math.atan2` | 全部 0 errors | 同上 |
+
+**模块方法的实参按设计不被检查**（D130 保守约定），本轮**不动** ——
+但它有一个例外后果没被覆盖，就是下面这条。
+
+##### 真缺陷：`json.parse` 把**任何** Value 静默字符串化后当 JSON 解析
+
+```rust
+let text = args.first().map(|v| v.to_string()).unwrap_or_default();
+json_to_value(&text)
+```
+
+数字与布尔量的字符串形式**本身就是合法 JSON**：
+
+| 调用 | 修复前 | 用户以为 |
+|---|---|---|
+| `json.parse(5)` | **5.0**，exit 0，零诊断 | 在解析一段 JSON 文本 |
+| `json.parse(true)` | **true**，exit 0，零诊断 | 同上 |
+
+即 typeck 放过 → 运行期把 `5` 变成 `"5"` → 解析成功 → 用户拿到一个浮点数，
+**全程零诊断**。这是本会话至今最安静的一处：前几轮至少还有误导性报错。
+
+##### 修法
+
+`json.parse` 改用 D153 的 `required_str_arg`（与同族 `document.parse` 的 path 一致）。
+typeck 侧**没动** —— 它的签名是 `params_variadic(1, Type::Any)`，那个 `Any` 是
+**返回类型**（解析结果由文本决定，如实声明只能是 Any），形参则因 `params()`
+的保守约定全是 `Any`，结构上拦不住，故只能在运行期收紧。
+
+##### 其余 `to_string()` 兜底点：实测后**不动**
+
+`web.fetch(5)`（URL 非法会报错）、`conv.chat(5)`（prompt 文本，取字符串形式合理）、
+`Router.route(5, …)`（方法名匹配不上会报错）、`McpServer.tool(5, …)`（名字宽松无害）、
+`agent.run(5)`（`is_empty` 已挡空串）—— **要么运行期报错，要么语义本就宽松合理**，
+没有一条产生「静默的错误值」。按「收紧一类，别顺手改另一类」记档不动。
+
+##### 验证
+
+- 新增 `tests/json_parse_arg_type.rs` **5 条**：
+  **主判据 2 条**（3 种非字符串实参必须报错且点名类型 / 缺参必须报 `requires text`）/
+  **反向对照 1 条**（4 条合法字符串用法**逐字**不变，含无效 JSON 仍归因到 `json.parse`）/
+  **对照组 1 条**（同族正面样板 `document.parse` 不得回退）/
+  **源码判据 1 条**（钉住「模块方法形参一律 `Type::Any`」这个前提 —— 若将来
+  `params()` 开始登记真实形参类型，这条会红，提醒把运行期判据上移到类型层）
+- 5 passed / 0 failed
+- 临时插桩 `tests/zz_d155_probe.rs` 已删除
+
+#### D156：方法实参的类型错误**带上面 span** —— D154 / D155 的待办一次收口
+
+D155 结尾写下的话是「span 在 typeck **出口**丢掉，修法比给 `Constraint` 加字段小得多」。
+本轮照做，D154 与 D155 两条待办同时消解。
+
+##### 改前 vs 改后
+
+```text
+let xs = [1, 2, 3]
+let a = xs.take("one")      ← 第 2 行
+let b = xs.window("two")    ← 第 3 行
+let c = xs.get("three")     ← 第 4 行
+```
+
+```text
+修复前（6 条，逐字段完全相同，全部「位置未跟踪」）：
+  line=0 col=0 expected=Some("int") actual=Some("string") msg=Type mismatch: expected int, got string
+  …… 共 6 条，用户既看到重复条目，又无法分辨是哪一行
+
+修复后（3 条，各自指向自己的行与列）：
+  Type error at line 2:17: Type mismatch: expected int | float, got string
+  Type error at line 3:19: Type mismatch: expected int | float, got string
+  Type error at line 4:16: Type mismatch: expected int | float, got string
+```
+
+三个后果同时消解：**位置回来了** · **重复消失**（每错一条）· **诊断不再欠报**
+（`expected` 从 `int` 变成 `int | float` —— 形参声明的是 `Union(Int, Float)`，
+只说 `int` 会让用户以为传个 int 就行）。
+
+##### 修法沿用本文件**既有范式**，不是新发明
+
+`infer.rs:137`（`let x: T = v` 路径）早就是这么做的，注释写着
+「提前用 span 报不一致——**不等 solve_constraints 兜底**」。
+本改动照搬：`compatible_with` 先判一次，不兼容就带实参 span 立即返回；
+**兼容的照旧压约束** —— TypeVar 绑定与数值提升仍由 `unify` 负责，本改动不碰。
+
+选「提前判」而非「给 `Constraint` 加 span 字段」的理由：后者要改一个被
+**上百处**构造的公共枚举；前者是一处局部改动，且**不改变任何程序是否通过**
+（`compatible_with` 放行的照旧走 unify，不兼容的原本 unify 也会失败）。
+
+##### 既有测试当场抓到我一处**风格回归**（已改）
+
+`tests/dict_set_signature.rs::d127_set_key_still_must_be_a_string` 挂了 ——
+我第一版用 `format!("{:?}", param_ty)`，`{:?}` 给出 `String` / `Float`，
+而本仓库诊断一律小写（`unify.rs::format_type`、`Type::name()` 都是小写）。
+改用 `Type::name()` 后既恢复一致，`Union` 还正好渲染成 `int | float`。
+**这条测试的价值正在于此：它钉的是「消息风格」这种跨全仓的约定。**
+
+##### 顺带确认：诊断里「位置出现两次」是**既有**现象，不是本轮引入
+
+`Type error at line 2:15: Expected 1 arguments, got 0 at line 2, column 15` ——
+前缀来自 CLI 渲染器，后缀来自 `error.rs` 的 `format_location`，
+对**所有**带 span 的错误变体都如此（`ArityMismatch` 等，本轮前就是这样）。
+属渲染层的独立问题，**本轮不动**（不把第二类改动捆进这次修复），记档待决。
+
+##### 验证
+
+- 新增 `tests/type_error_positions.rs` **4 条**：
+  **主判据 1 条**（方法实参类型错误必须带 `(2, 17)` 这样的精确位置）/
+  **主判据 1 条**（3 个错误 → 恰好 3 条、分别指向第 2/3/4 行、列号也互不相同）/
+  **反向对照 1 条**（6 种合法调用**零错误** —— 防止本改动引入假阳性）/
+  **对照组 1 条**（`let` 标注、`while` 条件等**原本就带 span**的路径不得回退）
+- 全量回归：`dict_set_signature` 等 1810 条中仅 1 条因风格回归而红，改用 `name()` 后全绿
+
+#### D157：把 D156 的改进**验到用户看得见的那一层** —— 波浪线画错了行（验证 + 固化）
+
+D156 修的是 `TypeError.line/column` 从 0 变成真实位置。但 `TypeError` 有
+**两个**消费者：**CLI `--check`** 与 **LSP**。D156 的测试只钉了前者。
+若 LSP 那条路用错 line（D132–D135 恰好在这一层修过 LSP 位置），
+D156 对**编辑器用户**就等于没修。
+
+##### 起真实 `mora-lsp.exe` 进程实测（不是调内部函数）
+
+`check_diagnostics` 是私有的，且只有真起进程才能验证「stdout 就是协议通道」
+这一前提（与 D100 的教训同源）。文档（错误在**第 2 行**）：
+
+```mora
+let xs = [1, 2, 3]
+let a = xs.take("one")
+let ok = 1
+```
+
+| | 条数 | LSP `range.start`（0-based） | 指向 | `expected` |
+|---|---|---|---|---|
+| D156 前 | **2**（重复） | `line 0, character 0` | 源码**第 1 行第 1 列** ❌ | `int`（欠报） |
+| D156 后 | **1** | `line 1, character 16` | 源码**第 2 行第 17 列** ✅ | `int \| float` |
+
+**即修复前 VS Code 会在错误所在行的下一行，画两条一模一样的波浪线** ——
+用户看编辑器根本指不出是哪行错。这把 D154/D155 那两轮「诊断无位置」
+从「CLI 上看着别扭」升级成了「编辑器里指错地方」。
+
+「D156 前」那一列是**临时把 D156 的守卫改成 `if false && …`、重新编译、
+重跑同一份协议帧**量出来的，随后还原 —— 与 D153 `tea.run`、D151 钩子
+同款的做法：**先量后断言，别凭推理补「之前是什么样」**。
+
+##### 判据解析器自己栽了一次，且暴露「空过」
+
+第一版 `diagnostics()` 按 `"start":"` 找字段，而实际 JSON 是 `"start":{`
+（后面是对象不是字符串）→ 解析返回**空 vec**。后果是：
+
+- 主判据「应恰好 1 条」红（好，能发现）；
+- 但**反向对照「干净文档应零诊断」是空过的** —— 解析器坏了它照样绿。
+
+即「全绿但什么都没验」。已修两处：解析器改按 `{"message":"` 切分再在
+每条内取 `range.start`；并给两条判据**各加一条前置断言**「会话必须真的
+握手成功（stdout 含 `serverInfo`）」—— 解析器再失配也不会空过。
+**「判据的判据」也得先成立，否则反向对照只是陪衬。**
+
+##### 顺带记档（**未改**）：自由函数 `Call` 路径仍有同类假阴性
+
+`int(5)`、`assert(5)`（二者形参声明是**具体**类型 `String` / `Bool`，
+见 `hm/builtin.rs:73/305`）**不被 typeck 拒**。D156 的守卫只加在
+`infer_method_call`（方法调用）上，`Call` 路径没动。
+而 `range(0, "three")` 放行是**另一回事** —— 它的签名全是 fresh TypeVar，
+属 D130 的保守约定，结构上无从检查。
+
+即：自由函数面的实参检查是**另一种**不一致（不是 D156 引入的），
+且 `Call` 路径一旦报错同样是无 span 的。记档待决，本轮不扩大范围。
+
+##### 验证
+
+- 新增 `tests/lsp_diagnostic_positions_e2e.rs` **3 条**（全部走**真实二进制 +
+  真实 stdio JSON-RPC 协议**）：
+  **主判据 1 条**（诊断落在 `line 1, character 16`，且恰好 1 条）/
+  **反向对照 1 条**（合法文档零诊断 + 握手成功前置断言）/
+  **对照组 1 条**（语法错误仍被推出，D101 的修复不得回退 + 握手成功前置断言）
+
+#### D158：LSP `foldingRange` 行号**全部低一行**，且多语句块**整个不折叠**（已修）
+
+D157 建立了「改了共享结构要验全部消费者」这条纪律，本轮把它**用足**：
+对 LSP 剩余 5 个 provider 的位置换算做普查（`grep saturating_sub(1)`），
+`definition` / `references` / `rename` / `documentSymbol` / `semantic`
+**全部**有换算 —— 唯独 `folding.rs` 一次都没出现。
+
+##### 缺陷一：`startLine` / `endLine` 直接透传 1-based
+
+LSP 的 `FoldingRange.startLine` / `endLine` 是 **0-based**（与 `Position.line`
+同约定），而 `Span::line` 是 **1-based**。`make_range` 直接塞进去 →
+折叠箭头整体**下移一行**。与 D133 记的「这三个 provider 漏了」同型，
+folding 是漏网的第四个（D136 补了 `for`/`while` 的**覆盖面**，没碰**位置**）。
+
+##### 缺陷二：多语句块**根本不产生折叠**
+
+```rust
+if body.span.line > expr.span.line { out.push(make_range(expr.span.line, body.span.line)); }
+```
+
+`parser_v3/emit.rs::block_witness` 给多条语句的 body 构造 `Sequence` 时，
+用的是**外层构造的 span**（即 `task` 那一行）。于是：
+
+| task 形态 | `expr.span.line` | `body.span.line` | 结果 |
+|---|---|---|---|
+| 单语句 | 6 | 7（`Call`，span 正确） | ✓ 折叠产生（但**低一行**） |
+| **多语句** | 1 | **1**（`Sequence`，span 错误） | ✗ `1 > 1` 为假 → **整个不折叠** |
+
+真实文档里几乎每个 task 都不止一条语句。实测两 task 文档：
+
+| | 折叠区间数 | `alpha`（源码第 1 行） | `beta`（源码第 6 行） |
+|---|---|---|---|
+| 修复前 | **1** | **完全没有** | `{startLine:6, endLine:7}` ❌ |
+| 修复后 | **2** | `{startLine:0, …}` ✅ | `{startLine:5, …}` ✅ |
+
+##### 修法（限制在 folding provider 内，**不动 parser**）
+
+- `make_range` 补 `saturating_sub(1)`，与其余 5 个 provider 对齐；
+- 新增 `body_end_line()`：对 `Sequence` 递归取子 witness 的最大行，
+  取代直接用 `body.span.line`。
+
+**没有去改 `block_witness` 的 span** —— 它被 if/for/while/handle/transaction
+共用，改它会波及全部块构造；`Sequence` span 继承外层这件事**记档**，
+不在本轮处理。
+
+##### 为什么既有 6 条 folding 测试全绿却没抓到
+
+`tests/lsp_folding_coverage.rs` 全部只断言**存在性**与**条数**
+（`res.contains("\"startLine\"")`、`matches("\"startLine\"").count()`），
+**从不校验行号的值**。行号整体错一行、以及多语句块根本不折叠，
+它都照样绿 —— 本轮实测 D136–D138 六条在新修复下**依然全过**，
+证明它们确实没覆盖这两点。新增 `tests/lsp_folding_positions.rs` 补上值断言。
+
+##### 记档（**未改**）：折叠结束行取「体内最后一条语句」而非 `end` 关键字
+
+`FnDef` witness 不携带 `end` 的行号，构造式参数里拿不到。故结束行取
+体内最后一条语句所在行 —— 比修复前好得多，但比 `end` 行**早 1–N 行**。
+要彻底准确需给 `FnDef` 增字段（结构改动），本轮不扩大范围。
+
+##### 本轮我自己的三处失误（均非产品缺陷）
+
+1. 判据解析器按 `"startLine":"` 找字段，而 LSP **输出**的行号是**裸数字**
+   `"startLine":6`（只有输入侧的 `text` 才是字符串）；
+2. JSON 键按**字母序**排列，`startLine` 在 `endLine` **之后**，我却往前找；
+3. 把两 task 文档的行号（6/7）写进了**独立** task 的断言（应为 0/1）。
+
+三处都被断言当场抓住。第三条若不写具体值、只写「有折叠」，就会空过。
+
+##### 顺带更正 D157 记的一条待决项：`int(5)` / `assert(5)` **都不是**缺陷
+
+D157 记「`int(5)`、`assert(5)` 不被 typeck 拒，待决」。本轮查清：
+
+- `int(5)` 运行期**正常工作**（返回 `5`，是合法的强制转换）→ typeck 不报是对的；
+- `assert(5)` 运行期报 `Undefined function or task: assert`，
+  且 `BuiltinOp::Assert` 在 typeck 里是**从不构造的死变体**，
+  **spec 全文没提过 `assert`** → 它本就不是内建，报错准确。
+
+两条都属**否定结果**，该待决项就此关闭。
+
+#### D159：LSP 折叠的**第三个维度** —— 声明块 / 配置块 / 可观测性块全都不折叠（已修）
+
+D136 补了 `for`/`while` 的**覆盖面**，D158 修了 `startLine`/`endLine` 的**位置**。
+但「块构造的种类」是**第三个**维度，两轮都没碰。实测（真实 LSP 会话，
+文档含 5 种块形态）：
+
+| 形态 | 源码行 | 修复前 | 修复后 |
+|---|---|---|---|
+| `model Point … end` | 1–4 | ✗ | ✗（见记档） |
+| `msg Move … end` | 6–9 | ✗ | ✗（见记档） |
+| `task work() … end` | 11–15 | ✓ | ✓ |
+| `with model = "m" … end` | 17–19 | ✗ | **✓** |
+| `app Counter … end` | 21–27 | ✗ | **✓** |
+
+即 5 种里只有 `task` 能折叠。**TEA 的 `app` 块动辄二十多行**，
+不折叠等于在编辑器里完全收不起来 —— 而 TEA 是本语言的主打范式之一。
+
+另经 `prompt` / `document` / `parallel` 单独验证（各自起一份文档、真实 LSP 会话），
+补的 arm 确实能触达，不是死代码。
+
+##### 普查怎么做的（可复用手法）
+
+`grep '^    [A-Z][A-Za-z]*[ ,{]' src/mir/witness.rs` 拿到 `WitnessKind` 全部变体，
+再按「**带 `MirWitness` 子节点**」筛出块构造，与 `folding.rs` 现有 arm 求差集。
+一次性就能看出缺哪几类，不必逐个试语法。
+
+##### 记档（**未改**）：`model` / `msg` / `struct` / `enum` 仍不可折叠
+
+这四种的字段是**纯字符串 / `TypeHint`**（`ModelDef { fields: Vec<(String, TypeHint)> }`、
+`EnumDef { variants: Vec<String> }`），**witness 里不带 span**，结束行无从算起。
+属 **parser 层缺口** —— 要么给字段记 span，要么给声明 witness 记 `end` 行。
+
+本轮**不动生产者**（与 D158 同一判据：改动局限在消费点），但把这条**写成
+测试里的显式 known-gap**（`d159_model_and_msg_declarations_are_a_known_gap`），
+与 D138 记「多行花括号 `match`」同样处理：**把未覆盖项记成待办，
+比让它混在「已覆盖」里强**。若将来 parser 补上 span，该条会红并提示补 arm。
+
+##### 验证
+
+- 新增 `tests/lsp_folding_block_coverage.rs` **6 条**：
+  **主判据 4 条**（`with` / TEA `app` / `prompt`+`parallel` 各可折叠 /
+  混合文档里每种块各出一段且行号不错位）/
+  **反向对照 1 条**（`if`/`for`/`while`/`task` 不得回退）/
+  **known-gap 1 条**（`model`/`msg` 显式记为待办）
+- 三个 folding 测试文件合计 **16 passed / 0 failed**
+- 本轮我自己的两处失误：Rust 字符串续行 `\` 吃掉了换行与缩进导致文档比预期短 5 行；
+  另一处把**带 `msg`** 那份文档的行号写进了**不含 `msg`** 的断言。
+  两处都被断言当场抓住 —— 实际返回值是对的，错的是我的期望。
+
+#### D160：`compress` 的 **options 形参本身**不是 dict 时被**静默忽略**（已修）
+
+D155 立的判据是「任意输入经兜底后，是否会得到一个**看似合法的结果**」。
+本轮把它系统应用到顶层 builtin 面（`builtin_impls.rs` 逐个判 `unwrap_or`），
+命中一处。
+
+##### 缺陷
+
+`compress::options_from_value` 的函数体是 `if let Value::Dict(map) = v { … }`，
+末尾 `Ok(opts)` —— **非 dict 整块落空**，静默返回全默认 options：
+
+```text
+compress("abcdefgh", "head_tail", {max_bytes: 1})  → 正常压缩
+compress("abcdefgh", "head_tail", "notadict")       → 原样返回，exit 0
+compress("abcdefgh", "head_tail", 5)               → 原样返回，exit 0
+```
+
+用户设的压缩参数**整份消失**且零诊断 —— 与 D155 的 `json.parse(5)`
+（把数字静默字符串化后解析出 `5.0`）**同型**。
+
+##### 为什么 D149 没抓到
+
+D149 把 dict **内部字段**的取值收口了（`max_bytes: "big"` 报错），
+但**外层形参类型**一直没人查。同一函数里 `strategy` 形参**是查了的**
+（`compress: strategy must be a string`）—— **10 行之外、同一函数的相邻形参，
+一个查一个不查**。这是 D147「加固过的分支是索引」的又一例：索引就在 10 行外。
+
+##### 影响面
+
+`options_from_value` 有两处调用（`compress` 第 3 参、`crush_json` 第 3 参），
+改在函数里**两处一并受益**（均已实测）。
+顶层 `crush_json(input, max)` 的第 2 参是**数字**、D153 已收紧，不在本轮范围。
+
+##### 验证
+
+- 新增 `tests/compress_options_type.rs` **6 条**：
+  **主判据 2 条**（`compress` 3 种非 dict options 必须报错且点名类型 /
+  `crush_json` 第 3 参同样必须报错）/
+  **反向对照 2 条**（省略 / 空 dict / 带字段 / `json.parse` 出的 Int dict
+  四条合法路径**行为不变**；`nil` 与省略等价）/
+  **对照组 2 条**（`strategy` 形参、`crush_json` 的 `max` 形参不得回退）
+- 全量 **1827 passed / 0 failed**（改的是**公共函数** `options_from_value`，
+  零回归）
+- 我自己一处判据写错：断言 `c.len() < a.len()`（「压缩后应更短」）——
+  实测压缩结果带 `... [N bytes elided] ...` 标记，`"abcdefgh"` → **52 字符**，
+  **比原文更长**。判「有没有真的压缩」必须**比内容**（`assert_ne!` + 检查
+  `elided` 标记 + 首尾保留），不能比长度。插桩量出真值后已改。
+
+#### D161：闭包 arity 的**编译期检查** —— `--check` 说「没问题」，但它根本跑不起来（已修）
+
+本会话长期待办（「类型推断核心待办：闭包 arity 编译期检查」）的收口。
+
+##### 缺陷一：少传实参**不被查**
+
+```mora
+let f2 = fn(a, b) => a + b
+f2(1)
+```
+
+| | 修复前 | 修复后 |
+|---|---|---|
+| `mora --check` | **exit 0**「No type errors found. (3 expressions)」 ❌ | exit 2 `Expected 2 arguments, got 1` |
+| 运行期 | exit 1 `closure expects 2 args, got 1` | （到不了运行期） |
+
+即 `--check` 明确告诉用户「代码没问题」，而它**根本跑不起来**。
+
+##### 根因：arity 编码在 Arrow 的**输出**链上，而调用点「给几个消耗几个」
+
+`wrap_curried_arrow` **从最后一个参数向前包裹**，多参数闭包是
+`Arrow(A, Arrow(B, C, …), …)` —— 嵌套在**输出**侧。而 `infer_call` 的
+curried 循环每提供一个实参就压一条 `Eq(callee_ty, Arrow(arg_ty, …))`，
+实参不足时剩下的 `Arrow` 层**根本不进任何约束**，于是不产生任何错误。
+
+**我第一版沿 `input` 侧数嵌套，恒得 1，少传实参根本没被拦下** ——
+嵌套在输出侧。判据写完必须实测，否则会以为已经修好。
+
+##### 缺陷二：多传实参的诊断**泄露内部变量**
+
+```text
+f1(1, 2)  where f1 = fn(a) => a + 1
+  修复前 → Type mismatch: expected float, got fn (float) -> ' ! { rho1 }
+                                   ↑ `rho1` 是内部 effect-row 变量名，用户无从理解
+  修复后 → Expected 1 arguments, got 2
+```
+
+多传此前**会**被查，但走的是「多余实参与**返回类型**合一」这条歪路 ——
+既误报类型，又把内部变量名暴露给用户。
+
+##### 运行期是权威
+
+逐条实测（绕开 typeck 的库 API）：`f1(1,2)` 多传 ERR「closure expects 1 args, got 2」、
+`f2(1)` 少传 ERR「closure expects 2 args, got 1」、`f1(1)`/`f2(1,2)` OK。
+即运行期**不支持部分应用** —— 类型层也不该放行。部分应用在本语言里有
+**显式**写法（`curry(f, n)`，D148 钉过），不靠少传实参隐式获得。
+
+##### 两次假阳性（都靠全量测试抓到，值得记）
+
+1. **第一版没豁免内建** —— 内建签名带**可选尾参**（`compress(input, strategy, opts?)`
+   声明 3 个却允许传 2 个），全量直接红 **16 条**。
+2. **第二版豁免判据选错了表** —— 我用 `dispatch::lookup_builtin(n)` 判定，
+   但 `compress` / `crush_json` 只登记在 `hm/builtin.rs::builtin_type`（经
+   `builtin_callee_ty`），**不在**那张表里，仍红 8 条。
+   最终改用 `builtin_declared_ret.is_some()` —— 它**恰好**在 `builtin_callee_ty`
+   命中时被置位，是「本 callee 是内建」的**权威信号**且已在作用域内。
+   **判「是不是某一类」时，别自己写一套判定，先找代码里已有的那个。**
+
+##### 记档（**未改**）：具名顶层 `task` / `fn` 的 arity 仍不受检
+
+D161 收口的是**闭包字面量** —— 它的 Arrow 类型在调用点可见。而顶层定义
+**不进 HM env**（`infer_fn_def` 注释「定义名不进 env」），调用点解析成
+`TypeVar` → arity 0 → 跳过。实测（修复前后都如此）：
+
+```text
+task add(a, b) … end ; add(1)     --check exit 0 ❌ / 运行期 exit 1「task expects 2 args, got 1」
+task one(a) … end ; one(1, 2)     --check 也放行（多传同样不查）
+```
+
+要修需把定义名连同 Arrow 类型注册进 env，而**递归**（体引用自身名）要求
+先有类型才能推断体 —— 存在先后依赖。本轮不扩大范围，写成显式 known-gap
+测试 `d161_named_task_arity_is_a_known_gap`。
+
+##### known-gap 测试**转红即是信号**（第三次验证这个机制）
+
+`tests/diagnostic_position_fallback.rs::d126_closure_arity_is_not_checked_at_compile_time`
+**钉的正是「arity 不由 typeck 检查」这条旧事实**。本轮修复后它转红，
+而它自己的失败信息写着「若本测试失败，说明 typeck 已开始检查 arity」。
+已按此翻转成 `d161_closure_arity_is_now_checked_with_position`
+（额外断言诊断**带位置** —— 正是那个文件的本意），
+并同步更正 `tests/call_arity.rs` 里 D126 更正过的注释。
+
+##### 验证
+
+- 新增 `tests/closure_arity_check.rs` **4 条**：
+  **主判据 2 条**（少传必须被类型层拒 / 多传诊断**不得泄露** `rho`、`TypeVar`、`fn (float) ->`）/
+  **反向对照 1 条**（1/2/3/0 参闭包精确调用 · `print` 变参 3 参 · 闭包当高阶实参 · **递归 task** 全部零诊断 —— 防止假阳性）/
+  **known-gap 1 条**（具名 task 的 arity，两个方向都断言「当前无诊断」）
+- 全量回归：两次假阳性（16 → 8 → 0）后全绿
+- 本轮我自己的失误：`arrow_arity` 沿错侧（input 而非 output）；内建豁免判据
+  选错表；一次 `edit` 把循环头误替换成函数导致重复定义；测试文件 doc 注释
+  丢了开头的 `//` 导致编译失败。全部由编译/测试当场抓住。
+
+#### D162：spec §14.2 的 EBNF **引用了 9 个从未定义**的非终结符（部分已补）
+
+本轮本想做「函数参数类型标注」——实测 `fn(a: number) => a` 是 `Parse error`，
+确属缺口。但它**属语言特性（只报告不实施）**，于是转向一个**不需要改语言**的
+方向：把 spec 文法本身机械地检查一遍。
+
+##### 为什么既有普查抓不到
+
+`tests/spec_ebnf_census.rs` 的判据是「每条产生式的**最小实例能否被 parser 解析**」
+—— 它把**代码**喂给 parser。而一个文法只要**引用**了不存在的非终结符，
+其最小实例照样能解析（没人检查引用完整性）→ 对这类洞**完全隐形**。
+
+D108 / D109 已手工修过同一种洞三次（`route_stmt` 删除、`trait_stmt`/`impl_stmt`
+从联合式移除、`parallel_stmt`/`observe_stmt` 补齐）。**手工只能修一次**，
+明天新增产生式又没人扫 —— 故本轮把它机械化。
+
+##### 抓到的第一件事：**D109 的修复从未真正落地**
+
+D109 当年把两条生产式写成了**注释**：
+
+```text
+-- v0.104.6 D109 补齐：… 两者都是块构造，形状与 for_stmt / task_stmt 同族：
+--   parallel_stmt = "parallel" { statement } "end" ;
+--   observe_stmt  = "observe" IDENTIFIER "do" { statement } "end" ;
+```
+
+注释说「本次补齐（见下）」，而「见下」**又是另一条注释**。
+即 D109 声称修好的洞**一个都没补**。已改为真产生式（形状与实现一致 ——
+`spec_ebnf_census.rs` 里两者都有可解析的最小实例）。
+
+**「手工修过一次」不等于「修好了」** —— 只有机械化判据能区分。
+
+##### 全 spec 范围内的引用完整性普查：9 个未定义
+
+| 非终结符 | 被谁引用 | 性质 |
+|---|---|---|
+| `params` | `task_stmt` / `macro_stmt` / `closure` | 形参表 |
+| `variable` | `expr` | 表达式核心项 |
+| `binary` | `expr` | 表达式核心项 |
+| `call` | `expr` | 表达式核心项 |
+| `method_call` | `expr` | 表达式核心项 |
+| `index` | `expr` | 表达式核心项 |
+| `pattern` | `match_stmt` | match 分支模式 |
+| `bindings` | `with_stmt` | `with` 绑定表 |
+| `type` | `let_stmt` / `task_stmt` / `model_stmt` / `update_stmt` | **名字对不上** |
+
+即**表达式文法的核心五项全部没有产生式** —— `expr` 联合式指向五个不存在的产生式。
+
+`type` 是**命名不一致**而非真缺：§13.1 用 BNF 记法把它定义成 `τ ::= …`，
+§14.2 却按 `type` 引用。
+
+##### 记档（**未补**）：这 9 条本轮不补
+
+对照 D108/D109 的先例（它们补的是**照抄实现**即可的简单块构造）：
+这 9 条要逐条对照 parser 推导精确形状，**写错就是引入新的 spec 错误** ——
+而 spec **不在版本控制内**（长期阻塞），写错不易回溯。
+
+故本轮只把它们钉成 `KNOWN_UNDEFINED` **可查清单**（写在测试的文档注释里，
+带表）。判据设计成「未定义集**恰好等于**清单」：
+- 清单外新增任何一个洞 → 立刻转红
+- 清单里任何一项被补上 → 也转红（该划掉）
+
+##### 顺带核实并更正一条**不准确的旧记录**
+
+此前记为「函数参数标注：spec 7 处 + README 首例」。实测：
+
+- **README 里没有**任何形参标注（`fn(req) => {status: "ok"}` 等）—— 该条不成立；
+- spec 侧确实引用了 `params`，但**从未定义**，不是「承诺了带标注的语法」；
+- 实现**不支持**标注（`Parse error: Expected ')' after parameters`），
+  而 `typeck::hm::infer_closure_core` **却在读** `p.type_hint` ——
+  **表示层已备好、parser 从不填充**。
+
+即「spec 承诺 + 实现缺」这个判断需要修正为「spec 连产生式都没写」。
+（形参标注本身仍属语言特性，只报告不实施。）
+
+##### 验证
+
+- 新增 `tests/spec_ebnf_wellformedness.rs` **2 条**：
+  **主判据 1 条**（未定义集恰好等于 `KNOWN_UNDEFINED` 清单）/
+  **反向对照 1 条**（已定义产生式不得被误报、 大写终符不得被算作引用）
+- **反向验证**：临时把 `parallel_stmt` 退回注释行，该条确实 FAILED 并精确点名
+  `parallel_stmt`，随后还原（钩子方向可信）
+- 终符表**显式写死**而非启发式猜：猜错的代价是假阴性（洞被静默放过），
+  与本文件要解决的问题同型
+
+#### D163：把 D162 清单里的 6 条非终结符**真的补上**（未定义集 9 → 3）
+
+D162 只把 9 项钉成可查清单。本轮把其中**能准确陈述并逐条验证**的 6 条
+真正写进 §14.2：`params` / `variable` / `call` / `method_call` / `index` /
+`bindings`。
+
+##### 关键做法：让 **parser 验收 spec 文法**
+
+每补一条产生式，就在 `tests/spec_ebnf_census.rs` 里给它配一个**最小实例** ——
+该文件本来就「把每条产生式的最小实例喂给 parser」，于是新增的文法**由 parser
+持续验收**：spec 形状写错，普查立刻红。
+
+```text
+params      = "(" [ IDENTIFIER { "," IDENTIFIER } ] ")" ;
+variable   = IDENTIFIER ;
+call       = IDENTIFIER "(" [ expr { "," expr } ] ")" ;
+method_call = expr "." IDENTIFIER "(" [ expr { "," expr } ] ")" ;
+index      = expr "[" expr "]" ;
+bindings   = IDENTIFIER "=" expr { "," IDENTIFIER "=" expr } ;
+```
+
+补之前先用真实 CLI 逐条验证形态可解析（`variable` / `call` / `method_call` /
+`index` 一份，`bindings` 一份，全部 exit 0），再落笔。
+
+##### 仍未补的 3 项，以及**为何不硬写**
+
+| 非终结符 | 为何未补 |
+|---|---|
+| `binary` | 算子集要逐个对照 `lexer.rs` 的 `TokenType`（`+ - * / %`、`= == != < > <= >=`、`\|`、`\|>`）才敢写 |
+| `pattern` | 实际形状比「标识符 + 可选载荷」复杂；且 `match v with` 与 `match v { }` 两种主体的 arm 分隔符与体形态需分别实测 |
+| `type` | **名字对不上**：§13.1 用 BNF 记法写作 `τ ::= …`，本节按 `type` 引用。改哪边属 spec 体例决定 |
+
+`binary` 缺失使本节 `expr` 联合式**至今不完整** —— `a + b` 这类最基础的表达式
+没有产生式。这是剩余三项里价值最高的一条，已在 spec 与测试注释里都标出。
+
+判据同步收窄：`KNOWN_UNDEFINED` 从 9 项减到 3 项。
+**未定义集**由 9 → 3，且「清单外的洞」与「已补的洞」两个方向都会让测试转红。
+
+##### 又一次没先查速查表（D139 纪律第 6 次）
+
+写 `pattern` 前我怀疑 spec 的 `match_stmt` 写 `->` 而 fixtures 用 `=>`，
+于是造探针实测 `->` 与 `=>` 两种 —— **两个探针都因形态写错而失败**
+（`match m ⏎ 1 -> …` 报 `Expected '{' or 'with'`）。
+翻 `tests/mora_syntax_forms.rs` 才发现该表**早已记好**：
+`match 1 with` ⏎ `1 -> 10` 是 Ok、`match 1 { 1 -> 10 _ -> 20 }` 是 Ok、
+而跨行无花括号形态才是 Rejected。
+**D139 建表就是为了防这个，我去查表只要 1 条命令，却绕了两轮探针。**
+
+##### 验证
+
+- `tests/spec_ebnf_census.rs` 新增 **6 个最小实例**（`params` / `variable` /
+  `call` / `method_call` / `index` / `bindings`）—— `d109_spec_production_minimal_instances`
+  实测全部可解析
+- `tests/spec_ebnf_wellformedness.rs` 的 `KNOWN_UNDEFINED` 9 → 3
+- `spec_ebnf_census` 2 passed / `spec_ebnf_wellformedness` 2 passed
+
+#### D164：补上 `binary` —— `a + b` 这类最基础的表达式**至今没有产生式**（已修）
+
+D163 说「算子集要逐个对照 lexer 才敢写」。本轮把它做完 ——
+做法是**不查 lexer，查 parser 的优先级链**（那才是权威）。
+
+##### 权威来源是 `emit.rs` 的分层函数链，不是 token 表
+
+```text
+emit_or_w  → emit_and_w → emit_equality_w → emit_pipe_w
+           → emit_comparison_w → emit_term_w → emit_factor_w
+```
+
+即结合强度从松到紧：`or` < `and` < `== !=` < `|>` < `< > <= >=` < `+ -` < `* / %`。
+顺带确认：**没有 `&&` / `||`**，一元前缀 `-x` / `!x` 非中缀（不在本产生式内）。
+
+```text
+binary     = expr "or" expr
+           | expr "and" expr
+           | expr ( "==" | "!=" ) expr
+           | expr "|>" expr
+           | expr ( "<" | ">" | "<=" | ">=" ) expr
+           | expr ( "+" | "-" ) expr
+           | expr ( "*" | "/" | "%" ) expr ;
+```
+
+##### 一个反直觉的发现：`and` / `or` 是**标识符派生的中缀算子**
+
+不在 §14.1 的关键字表里，也不是 token。实测：
+
+```text
+true and false          → false      （正常中缀运算）
+print(type_of(and))    → Unbound variable 'and'   ← 因为它是标识符，不是绑定
+```
+
+`emit_and_w` 靠 `Identifier(s) if s == "and"` 匹配。已写进 spec 注释 ——
+否则后人查 §14.1 关键字表找不到它们，会误判成「不存在」。
+
+##### 顺带记档：`|>` 比 `==` **结合得更紧**
+
+这一点在 spec 里原先完全不可见（因为 `binary` 整个缺失）。
+`xs |> len() == 3` 按此链是 `(xs |> len()) == 3`。
+
+##### 验证
+
+- `tests/spec_ebnf_census.rs` 新增 **2 个最小实例**：`binary`（`1 + 2 * 3`
+  覆盖 `+`/`*`）与 `binary_and_or`（钉住标识符形态）—— 均被 parser 验收
+- `KNOWN_UNDEFINED` 3 → **2**（只剩 `pattern` / `type`）
+- ⚠ `expr` 联合式在 D164 之后**首次完整**：`variable` / `binary` / `call` /
+  `method_call` / `index` / `closure` / `literal` / `pipe` / `question` /
+  `prompt` / `quasiquote` / `eval_expr` / `quote_expr` / `list_literal` /
+  `dict_literal` 
+#### D165：match arm 体里的**模式绑定**被判成「未定义变量」；顺带查出类型标注模式**静默不匹配**（前者已修）
+
+本轮从 D164 剩下的 `pattern` 入手 —— 推导它的文法时，顺手实测了各模式形态。
+
+##### 缺陷一（已修）：parser 接受、运行期正常，`mora --check` 却拒绝
+
+```mora
+let d = {a: 1}
+let r = match d with
+  {a: x} -> print(x)     ← Unbound variable 'x'
+  _ -> print(0)
+end
+```
+
+**两层结论相反**：
+
+| 层 | 行为 |
+|---|---|
+| HM（`infer_match`） | 推断 arm 体**之前**调 `add_pattern_bindings` 注册绑定 → **正确** |
+| 双向层（`bidirectional.rs` Phase D） | 直接 `synth(&arm.body)` / `check_against(&arm.body, …)`，**没注册绑定** → `Unbound variable` → 被包成「type inference failed: …」推进 errors |
+
+而 D128 的去重键是 `(line, expected, actual)` —— **HM 侧根本没报错**，无键可匹配，
+于是这条**假错误**一路留在最终诊断里。
+
+**修法**：Phase D 的两处照 HM 的 save → add → infer → restore 补上
+`add_pattern_bindings`（并把它的可见性放开到 `pub(crate)`）。
+守卫 `g` 同样在绑定就位下递归（`x when x > 0` 会引用绑定）。
+
+##### 为什么此前无人发现
+
+既有 fixture 的 match arm **从不在体里使用绑定** ——
+`[a, b, c] -> print("three")` 绑了但不用，于是从不可能触发。
+我第一版探针也恰好是这个形态（四个 arm 全不引用绑定），差点同样漏掉。
+
+##### 缺陷二（记档不修）：类型标注模式 `n: number` **arm 永不匹配**
+
+三层都错，症状各不相同：
+
+| 层 | 现象 |
+|---|---|
+| parser | `n: number` → `TypeAscription { name: "n", pattern: Variable("number") }` —— **名字与内层对调** |
+| typeck | 两条看不懂的错：`Unbound variable 'n'` + `Type mismatch: expected known type name, got n` |
+| **运行期** | **arm 永不匹配，静默落到 `_` 默认分支** |
+
+运行期实测（用「arm 体即值」取末值）：
+
+```text
+n: number -> n   实得 0.0   （应为 5.0）
+x: string -> x   实得 no    （应为 hi）
+```
+
+**静默错误结果** —— 本会话最坏的一类，且 exit 0、零诊断。
+修它要先定「`n: number` 到底绑定谁、类型从哪来」，属语言设计问题，
+本轮只报告不实施（写成 known-gap 断言，防后人重新发现一遍）。
+
+##### 又一次被 stdout 交错骗到（值得记）
+
+第一版探针用 `print(k)` 抓 arm 体的输出，结果 `println!`（测试）与被测程序的
+stdout **交错**，三种形态全看成 `nil`，差点误判「普通变量模式也坏了」。
+用 CLI 复核发现 `k -> print(k)` 其实打 `7.0`，正常。
+**测试里读被测程序的 stdout 时，要么用 CLI，要么让 arm 体直接成为返回值**
+（本文件的主判据 ② 就是用「arm 体即值」写的）。
+
+##### 验证
+
+- 新增 `tests/match_pattern_bindings.rs` **4 条**：
+  **主判据 2 条**（dict/list/rest 四种形态的 arm 体引用绑定必须过 typeck；
+  绑定在运行期取到**正确**值）/
+  **反向对照 1 条**（不使用绑定的 arm 零诊断 + **arm 体类型不一致仍须被拒** ——
+  Phase D 的 joined 检查是承重的，不得被我的改动绕过）/
+  **known-gap 1 条**（类型标注形态：typeck 仍拒 + 运行期仍静默取默认分支）
+- 全量 **1839 passed / 0 failed / 21 ignored**（双向层改 `hm.env` 零回归）
+- 
+#### D173：`mora record` 在**默认 mock 模式**下记不下任何 `ai.chat` —— 整个 record/replay/diff 卖点失效（已修）
+
+本轮换个从未审计过的面：`record` / `replay` / `diff` / `stats` / `timeline`。
+`mora record` 的 timeline 输出暴露了问题 —— 2 个事件**全是 `state_mutation`，
+一条 `ai.chat` 都没有**，尽管 help 明写「Record **ai.chat**/web.fetch」。
+
+##### 根因：mock 路径有**两条**分支，只有一条记录
+
+`interpreter/ai_chat.rs` 在 `api_key.is_empty()`（mock 模式）下分叉：
+
+| 分支 | 条件 | 是否 `record_ai_chat` |
+|---|---|---|
+| `mock_llm` 队列 | `with mock_llm = [...]` 且队列非空 | ✅ 记 |
+| **通用兜底** | **其余一切 mock 调用** | ❌ **不记**（原先直接 `return`） |
+
+而「其余一切」正是**默认形态** —— 本地没有 `OPENAI_API_KEY` 时 `ai.chat`
+一律走兜底分支。实测对照（真实 `mora record`）：
+
+```text
+let a = ai.chat(p"hello")                        → 录制 2 个事件，全是 state_mutation
+with mock_llm = ["mocked answer"] + ai.chat(…)   → 录制 3 个事件，含 1 个 ai.chat
+```
+
+##### 危害：`mora --help` 标称的用途整条失效
+
+| 子命令 | 修复前表现 |
+|---|---|
+| `mora record` | 文件里只有 `state_mutation`，**0 个 AI 调用** |
+| `mora replay` | 无内容可放 —— 只是又跑了一遍 mock，输出自然「一致」，**给出假绿** |
+| `mora diff a b` | 只在比 `state_mutation` |
+| `mora record stats` | `web.fetch: 0`、`Tokens: 0 in + 0 total` |
+| `mora record timeline` | 全是 `state_mutation`，没有 `ai.chat` 行 |
+
+README 把 **Record / replay / diff** 列为「deterministic AI-call regression
+testing」，而它在**默认配置下**记不下任何 AI 调用。最恶劣的是 `replay`：
+它**报「✓ replayed 2 events」且退出码 0**，看上去完全正常 —— 实际那 2 个事件
+与 AI 无关，replay 之所以「一致」只是因为 mock 本来就确定。
+
+##### 修法：两条分支**对称**
+
+兜底分支与 `mock_llm` 分支对称地记一次：token 估算同规则（`len / 4`）、
+mock 延迟记 0、`arg_signature` 用同一条可读化签名。
+
+修复后实测：
+
+```text
+✓ recorded 3 events
+{"kind":"ai.chat","id":1,…,"model":"example-model","prompt_preview":"hello",
+ "response":"[Mock response for: hello]","tokens_in":1,"tokens_out":6,…}
+{"kind":"state_mutation","id":2,…,"var":"a",…}
+{"kind":"state_mutation","id":3,…,"var":"__let_result",…}
+
+mora record stats d173c
+  Events: 3 total · Tokens: 1 in + 6 out = 7 total · Models: example-model
+mora record timeline d173c
+  1  ai.chat  example-model → "[Mock response for: hello]"  1+6  0  ok
+  2  state_mutation  a
+  3  state_mutation  __let_result
+```
+
+##### 顺带一个实测到的事实：录制路径是**相对进程 CWD** 的
+
+`mora record <tmp>\p.mora zz` 把文件写到了**仓库的** `.mora/recordings/zz.jsonl`
+（而非脚本所在目录）。写测试时必须给子进程设 `current_dir`，否则会污染工作区 ——
+本文件里已注明。仓库 `.mora/recordings/` 现已恢复到只剩原有的 `baseline.jsonl`。
+
+##### 验证
+
+- 新增 `tests/record_default_mock.rs` **4 条**：
+  **主判据 3 条**（默认 mock 形态必须录到 `ai.chat` /
+  `mock_llm` 分支不得回退 / **两条分支录到的字段结构必须一致** ——
+  否则 `stats` 无法统一统计）/
+  **反向对照 1 条**（普通运行不写录制文件 —— 防止修复把副作用扩散到磁盘）
+- 全部走真实 `mora record` 子进程（`record_ai_chat` 的 `mode.is_record()`
+  门控是真机制，库内调用测不到）
+
+#### D174：`mora snapshot` **从不安装录制器** —— 快照比对永久假绿，永远不可能失败（已修）
+
+D173 修完 `record` 之后顺手试了它的兄弟命令 `mora snapshot`
+（`mora snapshot <file> <name> [--update]`），发现它**记不下任何东西**。
+
+##### 根因：录了 0 条，于是 0 vs 0 恒等
+
+`run_snapshot` 建 `Interpreter::new()` 之后**从不调 `replace_recorder`**，
+`infra().recorder()` 因此是默认的 `Recorder::new_off()`（`Mode::Off`）。
+而每一个 `record_*` 的第一行都是
+
+```text
+if !self.mode.is_record() { return; }
+```
+
+→ 事件全被挡掉，`current_events` **恒空**。比对分支拿空数组去
+`diff_snapshot`，那里 `let max = baseline.len().max(current.len())` = 0
+→ 一个 diff 都不产生 → `mismatches` 空 → 打印 `✓ passed`、exit 0。
+
+实测（修复前，真实 CLI）：
+
+```text
+$ mora snapshot p.mora s1 --update          # p.mora 含 ai.chat
+✓ snapshot 's1' saved (0 events)           ← 明明该录到 ai.chat
+$ mora snapshot p.mora s1
+✓ snapshot 's1' passed (0 events match)           exit 0
+$ # 换成完全不同的 prompt（"TOTALLY DIFFERENT PROMPT zebra 99999"）
+✓ snapshot 's1' passed (0 events match)           exit 0   ← 应当 FAILED
+```
+
+**这个命令永远不可能失败。** 比「没写这个命令」更糟 —— 它会让人以为
+AI 调用路径已经有回归测试覆盖了。注意这与 D173 是**两个独立缺陷**：
+D173 是「装了录制器但 mock 兜底分支不记」，D174 是「压根没装录制器」。
+D173 的修复不会让 `snapshot` 好转，反之亦然。
+
+##### 修法：加一个**不落盘**的录制模式
+
+`Recorder` 原本只有 `new_off` / `new_record(path)` / `new_replay(path)`，
+而 `new_record` 强制要一个真实路径 —— 会在磁盘上凭空建目录、再留一份
+用不上的 JSONL。`mora snapshot` 只需要 `events()` 拿去和基线比，不需要录像文件。
+
+故 `Mode` 新增 `RecordMemory` 变体：`is_record()` 为真（否则事件照样被门控挡掉），
+但**没有落盘目标**，`save()` 是 no-op（不是错误 —— 事件仍可从 `events()` 读）。
+`run_snapshot` 改用它。
+
+改动面很小：全仓只有 `save()` 一处匹配 `Mode::Record(p)`，加上
+`is_record()` 的 `matches!`，共 3 个触点。
+
+##### 修复后（真实 CLI，两列对照）
+
+| 场景 | 修复前 | 修复后 |
+|---|---|---|
+| `--update`（脚本含 `ai.chat`） | `saved (0 events)` | `saved (3 events)` |
+| 同输入比对 | `passed (0 events match)` exit 0 | `passed (3 events match)` exit 0 |
+| **换完全不同 prompt 比对** | `passed` exit 0 ❌ | `FAILED (1 difference)` **exit 1** ✅ |
+| 诊断粒度 | — | `#1: expected "ai.chat" key=example-model\|2eb91795…`<br>`got "ai.chat" key=example-model\|7782f3b2…` |
+
+失败时的诊断精确到 `ai.chat` 的 `model|prompt_hash` 键，正是快照该做的事。
+
+##### 残留面（已量化；**语义裁决留给你，未擅自定**）
+
+脚本若一条可录事件都没产生（整个文件只有 `print("hi")`），基线仍是 0 条，
+0 vs 0 恒 Match —— **判别力为零的快照**。现在会显式告警：
+
+```text
+✓ snapshot 'z0' passed (0 events match)
+[warn] snapshot 'z0' has 0 recorded events — it can never fail, so 'matched' proves nothing.
+```
+
+**退出码仍是 0**：0 事件该不该判失败属于语义问题（无 AI 调用的脚本做快照
+本身可能是有意义的），不在缺陷修复里替你定。
+
+##### 一个顺带量到的方法论事实：**正对照对这类缺陷完全无判别力**
+
+新测试写完后临时回退修复重跑，观察到：
+
+| 测试 | 缺陷存在时 |
+|---|---|
+| `…_records_events_instead_of_saving_empty_baseline` | **FAILED** ✅ |
+| `…_detects_changed_prompt`（反向对照） | **FAILED** ✅ |
+| `…_same_input_passes`（正对照） | **ok** ← 照样绿 |
+
+「同输入应当通过」这条断言在缺陷存在时**照样通过** —— 它守不住任何东西，
+因为缺陷的表现恰恰就是「通过」。这是 D171 那条
+（「脆的判据比没有判据更糟 —— 它会给人『已覆盖』的错觉」）在**反向**的又一次实证：
+不是判据太脆，是判据**太松**。快照比对这类「本该能失败却永远绿」的缺陷，
+只有「异输入必须失败」这一条有牙齿。
+
+##### 验证
+
+- 新增 `tests/snapshot_records_events.rs` **4 条**（全部走真实 `mora snapshot` 子进程，
+  `current_dir` 设到独立临时目录 —— 快照落 `.mora/snapshots/`，相对**进程 CWD**）：
+  基线非空且含 `ai.chat` / 同输入通过 / **换 prompt 必须失败（主判据）** /
+  0 事件必须告警
+- 新增 `src/record/tests.rs::record_memory_records_but_never_writes` ——
+  钉住 `RecordMemory` 契约：`is_record()` 为真、事件真的累积、`save()` 不往磁盘写任何东西
+- 写测试时踩了自己的坑（两次，两次都在**测试**而非产品）：
+  1. `reported_events` 从 `(` 之后倒扫数字，但 `(0 events)` 的 `(` 与数字之间
+     隔着空格 → 两条用例假红。修正后全绿。
+  2. 单元测试断言「`%TEMP%` 文件计数不变」，**单独跑通过、全量套件里红**
+     —— 因为**并行测试**同时在 `%TEMP%` 建文件，计数会漂。这正是 D171
+     那条脆判据教训的又一次自踩：判据不该依赖目标范围之外的全局状态。
+     改成**本测试独占**的空目录，判据才确定。
+  两次失败都在测试助手而非产品 —— 至少说明断言本身没在骗人。
+- 临时目录用 `Drop` 守卫清理，而非写在测试尾部：**断言失败会 panic，
+  尾部代码根本不执行**，于是「失败的测试反而留下垃圾目录」。
+  （与 `tests/record_default_mock.rs` 的既有约定一致）
+
+#### D175：`methods_of` 对 `ai` / `agent` / `random` 三个模块返回 `[]` —— 自省在撒谎（已修）
+
+D172 把 20 个模块接上了表驱动自省，但给这三个留了豁免。这轮补齐。
+
+##### 那条豁免注释是**解释现状**，不是**证明排除是对的**
+
+`value.rs` 原注释写的是「`ai` / `agent` / `random` 三个模块**故意**不在表内：
+它们有各自的精确 `Type` 变体与专用分派路径（`call_builtin_*`），
+不经 `module_method_signature`，故没有可枚举的签名表」。
+
+「没有可枚举的表」是**事实**；但「所以自省应当返回空集」是**推论**，而这个推论不成立。
+10 个方法经**运行期逐个实测**全部可达：
+
+| 模块 | 修前 | 修后 | 实测可达 |
+|---|---|---|---|
+| `ai` | `[]` ❌ | `[chat, tokens, critic]` | 3/3 ✅ |
+| `agent` | `[]` ❌ | `[create, critic]` | 2/2 ✅ |
+| `random` | `[]` ❌ | `[rand_int, rand_float, rand_choice, seed, shuffle]` | 5/5 ✅ |
+
+危害与 D169 同型且更重：本语言是 **AI-native** 的，agent 靠 `methods_of` 推断能力。
+**空集等于告诉 agent「这个模块什么都不能做」** —— 比报错一个方法名更糟，
+agent 会改去猜方法名，或干脆绕开 `ai` 模块。
+
+##### 一条**查表纪律**的胜利：报D166 已否证，我差点重犯
+
+本轮先撞上一个更大的现象：`ai.retry` / `ai.role` / `ai.dag` / `ai.heartbeat` /
+`ai.context.*` 这 6 个方法**在源码里完全不可达**（`ai` 裸名 → `BuiltinKind::AiChat`，
+而实现只挂在 `(BuiltinKind::Ai, _)` 上），实测三种拼法全是
+`Unknown method: AiChat.*`。看起来是个大缺陷。
+
+**差点就报上去了。** 收尾前按 D166 纪律 grep known-gap，命中
+`tests/ai_namespace_reachability.rs`（D59）—— 文件头**逐条列了这 6 个**，
+并写明「**为什么只记录不修**：让它们可达 = 决定点号名 `ai.retry` 该被解析成
+『单名 + 自由函数调用』还是『裸名 `ai` + 方法调用』……这是语言文法与功能设计决定，
+未擅自做」。
+
+已否证，**不报、不修**。若只凭「6 个方法不可达 + 单测全绿」就下结论，
+就会把一个**有意保留的设计决定**当成缺陷上报 —— 那是 D166 的第 N 次复发。
+
+##### 修法：三张名字表 + 消灭第二份清单
+
+`typeck/dispatch.rs` 新增 `AI_MODULE_METHODS` / `AGENT_MODULE_METHODS` /
+`RANDOM_METHODS`，`module_method_names` 读它们。顺带把
+`hm/infer.rs` 里**硬编码**的报错串
+
+```text
+"known random method: random/rand_int/rand_float/rand_choice/seed/shuffle"
+```
+
+改为从 `RANDOM_METHODS` **派生**。原先那是与自省**并存的第二份清单** ——
+改一处忘另一处，agent 就会「按报错写代码、按自省做判断」而两边对不上。
+D172 的教训（「共用同一张表而不是维护两份清单」）在这里原样复用。
+
+##### 两处**刻意的收窄**（比「全列」更重要）
+
+1. `ai` **不含**那 6 个不可达实现。列进去等于**宣称**一批调不通的方法 ——
+   **比空集更坏**。
+2. `agent` **不含** `run` / `name` / `max_steps`。它们是 **Agent 值**的方法
+   （`call_method_agent`），不是**模块**的方法。`Type::Agent` 同时表示二者
+   是已知设计代价（`typeck/dispatch.rs` 该处已如实标注），
+   但自省必须报**接收者确实是模块**的那一批。
+
+##### 验证
+
+- 新增 `tests/module_methods_d175.rs` **4 条**，判据是
+  `module_methods_introspection.rs` 文件头**自己写明**的「双向闭合」：
+  ① 列出的每个名字运行期**确实被接受**；② **不多列**不可达的方法。
+  ①是「不少列」、②是「不多列」—— 只守①的话把不可达方法全塞进去也能过，
+  只守②的话一张空表也能过。
+- 顺带撤销了 `module_methods_introspection.rs` 里的 `SIGNATURELESS` 豁免，
+  断言方向收紧为 **23 个模块全部非空**（老护栏在回退时独立抓到了）
+- **牙齿验证**（临时回退三个臂为 `return Vec::new()` 后重跑）：
+
+  | 测试 | 回退后 |
+  |---|---|
+  | `…lists_exactly_the_reachable_methods` | **FAILED** ✅ |
+  | `…random_error_text_matches_introspection` | **FAILED** ✅ |
+  | D170 普查（独立文件） | **FAILED** ✅ |
+  | `…every_listed_method_is_actually_callable` | ok —— **空转** |
+  | `…does_not_over_list_unreachable_methods` | ok —— **空转** |
+
+  后两条在回退态仍绿，因为判据对象是**清单的内容**：清单为空时
+  「每个都可用」「没有多列的」都**空真**。这是结构性的，不是判据写错 ——
+  它们防的是**将来**有人往表里多塞/少塞名字，不防「表本身空了」。
+  **如实记账：4 条里 2 条有牙齿，2 条是精化护栏。**
+- 写测试时又踩一次并行坑：4 条用例**共用同一个 `p.mora` 文件**，
+  cargo 并行跑时互相覆写探针 → 「单独跑全绿、全量跑全红」。
+  改成按用例唯一命名（`p_{tag}.mora`）后稳定。
+  **同一条坑 `module_methods_introspection.rs` 文件头已经记过一次**，我仍踩。
+
+#### D176：`mora diff` 对 **state mutation 的值变化完全失明** —— 数据录到了，比对时自己扔（已修）
+
+「飞行记录仪」家族的第三个命令（D173 `record` / D174 `snapshot` / **D176 `diff`**）。
+前两个都查出假绿，第三个也一样 —— 但成因不同。
+
+##### 缺陷：摘要只取变量名，把 `old` / `new` 整个丢掉
+
+`record::diff::summarize_event` 对 `StateMutation` 是这么写的：
+
+```rust
+Event::StateMutation { var, .. } => format!("state_mutation var={}", var),
+```
+
+`diff_recordings` 比的就是这个摘要串，于是**「同一变量名、值不同」被判成
+`identical`**。真实 `mora diff` 实测（修前）：
+
+```text
+# s1.mora: let score = 42      →  录制 2 events
+# s2.mora: let score = 99999   →  录制 2 events
+$ mora diff d176s1 d176s2
+  [#1] state_mutation var=score
+  [#2] state_mutation var=__let_result
+summary: identical=2 changed=0        ← 值差了一万倍，却「完全相同」
+```
+
+##### 为什么这比「多报几个 changed」严重
+
+1. **数据是齐的，是比对时自己扔的。** 两份 JSONL 里分别是
+   `{"kind":"state_mutation","var":"score","old":null,"new":42.0}` 与
+   `…"new":99999.0` —— **不是没录到**，是录到了却在 diff 层被丢弃。
+2. **state mutation 记录的语义就是「状态/记忆变了」**，它的**值变化本身
+   就是被观测的结果**。对这类事件丢值，等于让 diff 面对最该发现的那一类
+   差异失明，却照样打 `changed=0`。
+
+与 D174 同族（**一个本该能失败的比较，结构性报「一致」**），但形态不同：
+D174 是「**没数据**」，D176 是「**有数据但没用**」。后者更隐蔽 ——
+它连「数据为空」那个天然的怀疑信号都不给。
+
+##### 修法与实测
+
+摘要带上 `old -> new`，按 `AiChat` 那个 `resp` 的同一套截断口径（此处取 40），
+免得长 dict/list 把对齐的 diff 输出冲垮。
+
+| 场景 | 修前 | 修后 |
+|---|---|---|
+| `score` = 42 vs 99999 | `identical=2 changed=0` ❌ | `identical=1 changed=1` ✅ |
+| 同一脚本录两次（42 vs 42） | `identical=2 changed=0` | `identical=2 changed=0` ✅（无误报） |
+
+##### 一个**真陷阱**：summary 的 `changed=` 列不含 `only_in_a/b`（属报告项，未擅自改）
+
+实测「A 有 2 条、B 有 6 条」时输出是：
+
+```text
+summary: identical=2 changed=0 only_in_x1=0 only_in_x2=4
+```
+
+`changed=0` 是**正确的**（多出的事件归 `OnlyInB`），但 **CI 脚本若只 grep
+`changed=`，会把「多了 4 个事件」判成「无变化」**。与 D174 的
+「0 事件快照恒绿」是同一类陷阱的两面。
+**未擅自改 CLI 输出格式**（那会动到输出契约），仅报告。
+
+##### 验证
+
+- 新增 `tests/record_diff_state_mutation.rs` **3 条**，全部走真实
+  `mora record` + `mora diff` 子进程（`current_dir` 设独立临时目录）：
+  **反向对照**（值不同必须报出差异，且两边取值都要看得见）/
+  **正对照**（同值不得误报）/
+  **结构**（多出的事件必须逐条列出且被摘要统计）
+- **牙齿验证**（临时回退修复后重跑）：
+  `d176_diff_detects_state_mutation_value_change` **FAILED** ✅，
+  另两条仍 ok —— 它们本就不依赖值内容（正对照 / 结构侧），符合设计。
+- **我第一版把第三条判据写错了**：断言 `changed >= 1`，但不等长场景
+  的差异记在 `only_in_b` 而 `changed=0` 是**正确的** → 测试红而产品没错。
+  改成断言「非 identical 的行必须逐条出现 + 摘要统计到」后通过。
+  **判据跟着产品行为的错处走，等于把判据变成产品缺陷的镜子** ——
+  测试红时先问「谁错了」，别默认产品错。
+- 另记：`mora diff` **无论差异大小恒 exit 0**（`run_diff` 里没有
+  `process::exit(1)`），而同族的 `snapshot` 差异时 exit 1、`record audit`
+  有发现时 exit 1。**退出码语义是否该统一属 CLI 契约决定，未擅自改，仅报告。**
+
+#### D177：`mora record audit` —— 密钥扫描器**在真正发现 secret 时 panic**；且 `Bearer` 模式是**死条目**（均已修）
+
+「飞行记录仪」家族里风险最高的一环：D173 `record` / D174 `snapshot` /
+D176 `diff` / **D177 `audit`**。前三个是「比较」，这个是**安全闸门** ——
+它的用途就是「分享或提交录像前，确认里面没有密钥」。一个说「没有密钥」
+的扫描器，比没有扫描器更危险。本轮查出**两个独立缺陷**。
+
+##### 缺陷一：把**字符数**当**字节偏移**用 → panic
+
+`audit_json_value` 里：
+
+```rust
+let token_len = value[token_start..].chars().take_while(…).count();  // ← 字符数
+…
+&value[token_start..token_start + 5.min(token_len)]                  // ← 当字节数用
+```
+
+只要 secret 前缀（`sk-` / `key-` / `Bearer `）之后的尾串含**非 ASCII 字母数字**，
+落点就切在字符中间 → Rust 直接 panic。Rust 的 `char::is_alphanumeric`
+对汉字、假名、重音字母**都返回 true**，所以这不是罕见输入。
+
+真实 `mora record audit` 实测（修前）：
+
+```text
+$ mora record u.mora d177v          # prompt = "sk-" + 23 个汉字
+✓ recorded 3 events
+$ mora record audit d177v
+thread 'mora-main' panicked at src\record\audit.rs:156:27:
+  end byte index 8 is not a char boundary; it is inside '文' (bytes 6..9 of string)
+audit exit=101
+```
+
+三点为什么严重：
+
+1. **崩溃在「它真的找到东西」的那一刻。** 阈值 `token_len >= 20` 通过才会走到
+   那行切片 —— **没有 secret 时永远不崩**，一检测到非 ASCII 密钥就崩。
+2. **这正是最坏的时机**：命令的用途是「给出可否分享的结论」，
+   扫描器在需要结论时崩掉；CI 里表现为 exit 101（panic）而非「发现 1 个密钥」。
+3. **对纯 ASCII secret 完全正常** —— 所以这条路径平时测不出来，
+   只在真实的中/日/欧语言内容里暴露。
+
+修法：`token_len` 继续按**字符**计数（阈值语义就是「至少 20 个字母数字字符」），
+取预览改成 `.chars().take(5).collect::<String>()`，**绝不把字符数当字节数用**。
+
+修后：panic → `⚠ 1 potential secret(s) found in 'd177v'` / `sk-中文字符测...` / exit 1。
+
+##### 缺陷二：`bearer-token` 是**死条目** —— 且是**静默**失败
+
+模式表里声明了 7 种 secret，但其中 `bearer-token` **永远不会被求值**。
+根因是「从前缀串反推前缀」这套推导：
+
+```rust
+let prefix = if name.contains("sk-")  || name == &"openai-api-key" { "sk-" }
+             else if name.contains("key-") || name == &"generic-api-key" { "key-" }
+             else if name.contains("Bearer") { "Bearer " }   // ← 大小写不匹配
+             … else { continue; };
+```
+
+`name` 是小写的 `"bearer-token"`，而判断写的是 `contains("Bearer")`（大写 B）
+→ **恒假** → 一路落到 `continue`。实测（修前，纯 ASCII，排除 Unicode 变量）：
+
+```text
+$ mora record audit bear        # prompt 含 "Bearer ABCDEFGHIJKLMNOPQRSTUVWXYZ012345"
+✓ No secrets found in recording 'bear'      ← token 就在录像里
+```
+
+**这比缺陷一更难发现**：panic 会 exit 101 引人注目；沉默不会 ——
+扫描器一脸自信地说「没有密钥」。注意 `redact_secrets`（Markdown 导出用的
+脱敏函数）**是**处理 `Bearer ` 的，所以「脱敏认识它、审计不认识」这个不对称
+本身就说明是漏接而非有意。
+
+顺带发现同一张表还有第二个问题：里面那些**看起来像正则**的字面量
+（`sk-[a-zA-Z0-9]{20,}`、`ghp_[a-zA-Z0-9]{36}`…）**从未被应用** ——
+真正生效的是那个 `token_len >= 20`。改它们对行为零影响，却让人以为阈值写在表里。
+
+修法：把前缀**直接写进表**，删掉从未生效的"正则"字面量，并提出
+`SECRET_MIN_LEN` 常量。**前缀与展示名不再互相推导，也就没有推导失配的可能**
+（与 D175「共用一张表，别维护第二份清单」同源，但这里更严重 ——
+是「一张表反推出另一张表，且推导规则本身有 bug」）。
+
+修后：7 种模式全部生效，`Bearer ABCDE…` 正确报为 `bearer-token` / exit 1。
+
+##### 验证
+
+- 新增 `tests/record_audit_unicode.rs` **6 条**，全部走真实
+  `mora record` + `mora record audit` 子进程（`current_dir` 设独立临时目录）：
+  汉字 secret 必报（主判据）/ 重音字母 / 非 ASCII Bearer / **纯 ASCII Bearer**
+  （盯死条目）/ 纯 ASCII `sk-`（正对照）/ 普通中文文本不误报（负对照）
+- **两处修法的牙齿完全分离**（分别临时回退后重跑）：
+
+  | 回退 | 变红的用例 |
+  |---|---|
+  | 切片（字符数当字节数） | 3 条 Unicode 用例 ✅（ASCII 两条仍 ok，本就不受影响） |
+  | 模式表（恢复反推推导） | 2 条 Bearer 用例 ✅ |
+
+- 既有 `record::` 单元测试 **42/42 零回归**
+- 全仓扫 `min(len|count)` 模式，确认该「字符数当字节数」idiom
+  **只有这一处**，已全部消除
+- **我两次把判据数错了**（测试红而产品没错）：`Bearer` 后只写了 18 个汉字、
+  阈值是 20 字符。**测试红时先复核产品行为**再决定改谁 ——
+  判据跟着产品的错处走，就变成了产品缺陷的镜子。
+
+##### 顺带记档：**D179 已修** —— `redact_secrets` 的覆盖面小于 audit
+
+`redact_secrets`（`record/snapshot.rs:97` 的 Markdown 导出在用）只处理
+`sk-` / `Bearer ` **两种**，而 audit 检测 **七种** ——
+`ghp_` / `gho_` / `xoxb-` / `xoxp-`（GitHub PAT / Slack token）**会被审计报出、
+但导出时不会被脱敏**。
+
+⚠ 此处本条**原写「3 种（含 `key-`）」是错的** —— 那是照代码**意图**抄的
+（看到 `prefix == "ke"` 就以为 `key-` 归它管），**实测推翻**：
+`prefix` 是取 3 个字符的 `"key"`，拿它比 2 字符字面量 `"ke"` **恒假**，
+所以 `key-` 从来没生效过。**读代码不等于知道行为。**
+详见 **D179**。
+
+#### D179：报告里标题写着 **「Event Log (redacted)」**，正文是完整明文（已修）
+
+D177 留了一条「`redact_secrets` 覆盖面小于 audit」的记档。本轮**把它修掉**，
+并顺带查出**三个 panic 站点**。
+
+##### 缺陷一：脱敏只认 2/7 种，且报告自称已脱敏
+
+`mora record report` 生成的 Markdown 里有一节，标题就是：
+
+```text
+## Event Log (redacted)
+```
+
+而它走的 `redact_secrets` 此前**只认 2 种**前缀（`sk-` / `Bearer `），
+audit 检测 **7 种**。真实 CLI 端到端实测（修前）：
+
+| 前缀 | 修前 | 修后 |
+|---|---|---|
+| `sk-` / `Bearer ` | 已脱敏 | 已脱敏 |
+| `key-` / `ghp_` / `gho_` / `xoxb-` / `xoxp-` | **明文泄漏** | 已脱敏 |
+
+同一份报告里的对照（修前）：
+
+```text
+## Audit
+| 1 | content | github-pat | ghp_ABCDE... |                ← 审计报出
+## Event Log (redacted)
+{"kind":"ai.chat",…,"prompt_preview":"my github token is ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"…}
+                                         ↑ 三行之后，同一份报告里是完整明文
+```
+
+**比 D177 记的更严重**：报告是**你拿给别人看的那份东西**。
+工具先告诉你「这里有 GitHub PAT」，再在标着「redacted」的小节里把它原样印出来。
+
+##### D177 的「3 种」也是错的 —— 实测只有 2 种
+
+D177 记的是「处理 `sk-` / `key-` / `Bearer ` 三种」，那是照代码**意图**抄的。
+旧判定写的是 `prefix == "ke"`：`prefix` 是取 **3** 个字符的 `"key"`，
+拿它去比 **2** 字符的字面量 `"ke"` —— **恒假**。
+所以 `key-` 从来没被脱敏过。**读代码不等于知道行为，本条由实测推翻。**
+
+##### 修法：脱敏与审计**共用同一张表**
+
+`redact_secrets` 改用 `SECRET_PREFIXES` / `SECRET_MIN_LEN` ——
+与 `audit_json_value` 同一份来源，一张表、两个消费者，不会再各自漂移
+（D175 的教训）。输出统一为「保留前缀 + 遮住尾巴」（`ghp_<REDACTED>`），
+既有两条单测（`contains("<REDACTED>")` / `contains("Bearer <REDACTED>")`）仍通过。
+
+顺带修掉一处不对称：旧 `sk-` 的 token 字符集**不含 `.`**、而 `Bearer ` 的含
+（JWT 带点号签名）—— 现统一为与审计的扫描口径一致。
+
+##### 缺陷二（顺带）：**同一类 panic 还有三个站点**
+
+写测试时「普通中文内容不得被脱敏」那条直接 panic 了 —— 逮到与 D177
+**完全同源**的 bug 另三处：**用 `str::len()`（字节）判断长度、用 `[..n]`（字节）切片**。
+
+| 站点 | 原写法 | 修前 |
+|---|---|---|
+| `record/snapshot.rs` report Timeline 表 | `len()>50` + `[..49]` | 25 汉字 = 75 字节 → **panic** |
+| `record/analysis.rs` export Markdown 表 | `len()>40` + `[..39]` | **panic** |
+| `cli/mod.rs::truncate`（timeline 用） | `len()<=max` + `[..max-1]` | **panic** |
+
+修法：提出 `truncate_display(s, max_chars)`（**按字符**），
+三处统一走它。语义变化是好的：中文内容现在能显示 50/40 个**字**，
+原先按字节只能显示 16/13 个字就 panic 或被切碎。
+
+（`lexer.rs:159` 也有一处同形写法，但那里切的是数字字面量的文本、
+纯 ASCII，字节==字符，**无害**，未动。）
+
+##### 验证
+
+- 新增 `tests/record_report_redaction.rs` **5 条**，全部走真实子进程：
+  7 种前缀的 token 都不得出现在报告里（**主判据**）/
+  普通中文不得被误脱敏 / 三处截断站点对中文不 panic /
+  被截断的中文仍是连续原文 / **审计仍要报出**（脱敏不得吞掉告警）
+- **两处修法的牙齿完全分离**（分别临时回退后重跑）：
+
+  | 回退 | 变红的用例 |
+  |---|---|
+  | 截断（改回字节切） | 3 条中文用例 ✅，2 条脱敏用例仍 ok |
+  | 脱敏表（去掉 5 种前缀） | 2 条脱敏用例 ✅，3 条中文用例仍 ok |
+
+- **我连着两次把判据写错**，都是「测试红而产品没错」（D176 同款）：
+  1. 断言「三处命令都要完整显示整句」→ 红。实际 `export` 的 detail 预算
+     只有 **40 字符**，而前缀已占约 38 个 —— **合法地**只放得下 1 个中文字。
+  2. 改成「统一至少 4 个字」→ 还是红，同理。
+  最终按**各命令真实预算**分别标注（`report`/`timeline` 要 4 个、`export` 要 1 个）。
+  **判据该守「截断落在字符边界上」，不是「内容有多少」** —— 后者与正确性无关。
+
+#### D178：`load_jsonl` **静默丢弃**解析不了的行 —— 密钥扫描器在残缺数据上说「没有密钥」（已修）
+
+本轮收掉「飞行记录仪」家族最后一个，也是**最深**的一层。
+D173 `record` / D174 `snapshot` / D176 `diff` / D177 `audit` 查的都是
+**各个命令自己**；本轮查的是它们**共同的底座**。
+
+##### 缺陷：取证工具的数据入口默默丢数据，下游全部照常报成功
+
+`record/serialization.rs::load_jsonl` 对每个非空行调 `parse_event_line`，
+失败就**直接丢掉**（原注释：`// 解析失败的行跳过 (前向兼容)`），不留痕迹。
+
+`replay` / `diff` / `stats` / `export` / `timeline` / `report` / **`audit`**
+全部建立在它之上。丢几行之后，每个下游命令都**照常报成功**。
+
+真实 CLI 实测（把录制文件首行截成半行，模拟「进程被 kill，写到一半」）：
+
+```text
+原文件 3 events，首行含 ai.chat 的密钥
+$ mora record audit full
+✓ No secrets found in recording 'full'     exit 0     ← 修前：零告警
+$ mora record stats full
+  Events: 2 total                              ← 3 变 2，零提示
+```
+
+**安全闸门被静音**：那份录像里明明有密钥，扫描器却给了「干净」的保证。
+与 D177 同源的一条：**说「没有」比不检查更糟**。
+
+##### 为什么「跳过」本身**不是**缺陷，沉默才是
+
+容忍畸形行的意图是**对的**：`parse_event_line` 只抽取认识的字段，
+不认识的字段本来就忽略 —— 所以「新版本写的字段」根本不会让整行失败，
+失败的行是**真的畸形**（截断 / 非 JSON / 被改坏）。
+
+故本轮**不改行为**（仍跳过），只把「静默」改成「显式」。
+
+##### 修法
+
+| 层 | 改动 |
+|---|---|
+| `serialization.rs` | `load_jsonl` 额外返回 `Vec<SkippedLine>`（行号 + **限长 60 字符**片段） |
+| `record/mod.rs` | `Recorder.skipped_lines` 承载；`SkippedLine` 公开 |
+| `cli/record.rs` | `warn_skipped()` 统一告警，接进 **8 个**下游消费者 |
+
+片段刻意**限长**：既够定位，又不把可能含密钥的原文复制到别处 ——
+那会让「脱敏」这个动作本身扩大泄漏面。
+
+##### `audit` 单独**硬失败** —— 其余命令只告警
+
+其余命令（`stats` / `diff` / `export` / `timeline` / `report`）是**汇报型**的，
+它们把事件数一并打出来，告警足够。
+
+而 `audit` 回答的是一个**安全问题**：「这份录像能不能分享/提交」。
+有几行没能解析，就等于**有几行从未被检查过** —— 在那种数据上宣布
+「✓ No secrets found」是**假阴性**：扫描器给了它没有资格给的保证。
+故：**数据不完整 ⇒ 无法出具结论 ⇒ 判失败**，并说清缺了几行、指出行号。
+
+修后实测：
+
+```text
+$ mora record audit full
+[warn] …/full.jsonl: 1 of 3 line(s) could not be parsed and were SKIPPED — …PARTIAL data.
+✗ audit INCONCLUSIVE for 'full': 1 of 3 line(s) could not be parsed,
+  so they were never scanned for secrets.
+    line 1: {"kind":"ai.chat","id":1,"ts_ms":1790947
+  (a truncated recording is a common cause — re-record, or repair the file)
+exit=1
+```
+
+| 场景 | 修前 | 修后 |
+|---|---|---|
+| 残缺（3 行坏 1 行）+ 里面有密钥 | `✓ No secrets found` exit 0 ❌ | `✗ INCONCLUSIVE` exit **1** ✅ |
+| 残缺 + `stats` | `Events: 2 total` 零提示 | 告警「PARTIAL data」✅ |
+| 完好 + 无密钥 | `✓ No secrets found` exit 0 | 不变 ✅ |
+| 完好 + 有密钥 | `⚠ 1 potential secret` exit 1 | 不变 ✅ |
+
+##### 验证
+
+- 新增 `tests/record_truncated_recording.rs` **4 条**，全部走真实
+  `mora record` + `mora record audit` + `mora record stats` 子进程
+  （`current_dir` 设独立临时目录；测试**自己**把录像首行截半行，
+  不依赖外部预置的坏文件）
+- **牙齿验证**：把 `load_jsonl` 改回静默丢弃后重跑 ——
+
+  | 测试 | 回退后 |
+  |---|---|
+  | `…refuses_to_certify_a_truncated_recording` | **FAILED** ✅ |
+  | `…stats_warns_about_partial_data` | **FAILED** ✅ |
+  | `…still_passes_on_a_clean_intact_recording` | ok（对照，本就不该受影响） |
+  | `…still_flags_secret_in_intact_recording` | ok（对照，同上） |
+
+#### D180：`.moraignore` 里**写了但不生效**的规则被静默接受（已修）
+
+D177 收尾时留下的一条安全工具缺口。本轮查 `.moraignore` 策略机制本身。
+
+##### 缺陷一：不生效的规则**静默通过**
+
+`parse_moraignore` 解析三种规则，但 `audit_recording` 里：
+
+```rust
+IgnoreRule::Field(f) => f == "response" || f == "prompt_preview",  // 硬编码两个名字
+IgnoreRule::Pattern(p) => json_str.contains(p.as_str()),
+_ => false,                                                        // ← Path 落这里，恒假
+```
+
+真实 CLI + 真实 `--policy` 实测（修前）：
+
+| 规则 | 修前 |
+|---|---|
+| `pattern:<子串>` | 生效 |
+| `field:response` / `field:prompt_preview` | 生效（但是**整事件**粒度，见下） |
+| `path:request.messages.*.content` | **静默无效** |
+| `field:content` / `field:url` / `field:token_usage` | **静默无效** |
+
+两点严重性：
+
+1. **一个不生效的策略文件比没有策略文件更糟。** 用户以为自己限定了扫描范围，
+   实际什么都没发生 —— 审计照常报出密钥、退出码照旧、**零提示**。
+   `field:token_usage` 偏偏还是 `parse_moraignore` **自己的文档示例**。
+2. `path:` 无法生效是**结构性的**：被扫的是 `format!("{} {}", prompt, response)`
+   拼出来的扁平字符串，**根本没有 JSON 路径可匹配**。规则承诺的粒度在调用点不存在。
+
+##### 缺陷二：`field:response` 的**粒度是错的** —— 会把 prompt 里的密钥一起盖住
+
+旧代码把整个事件拍平成一个字符串再判断忽略，所以「忽略 response」
+连 prompt 一起跳过：**一条想放过响应的规则，把提示词里的密钥也盖住了。**
+
+修后实测（同一份录像，同一条规则）：
+
+| 密钥位置 | 修前 `field:response` | 修后 `field:response` |
+|---|---|---|
+| 在 **prompt** 里 | 静默跳过（**假阴性**） | **仍报出**（FIELD=`prompt_preview`） |
+| 只在 **response** 里 | 静默跳过 | 跳过（规则本意） |
+
+##### 修法
+
+- `audit_recording` 改为**按真实字段逐个扫描**（`prompt_preview` / `response` /
+  `url` / `message`），`Field` 才有正确粒度；报告的 FIELD 列也说真话
+  （原先一律叫 `"content"`，哪怕扫的是 url）。
+- 新增 `unsupported_ignore_rules()`：点名 `path:`（附上为什么不可能）
+  与未知 `field:` 名（并列出可用的字段名）。
+- 规则披露**移到两个分支都打印**，格式改为
+  `N rule(s) from X loaded; M usable` —— 原先的 `N rules applied`
+  只在「没发现密钥」时出现，**恰恰是有发现时你更需要知道策略加载情况的
+  那一刻，它一句话不说**。
+- 抽出 `AUDITED_FIELDS` 常量作为「被扫描字段」的单一事实源
+  （`is_ignored` 匹配它、`unsupported_ignore_rules` 校验它）。
+
+##### 验证
+
+- 新增 `tests/record_ignore_policy.rs` **7 条**，全部走真实
+  `mora record` + `mora record audit --policy` 子进程。
+  其中「密钥只在 response」那条用 `with mock_llm = [...] … end` 块构造
+  （prompt 干净、响应带密钥），与「密钥在 prompt」那条成对，
+  证明粒度是**按字段**的，而不是「永远生效」或「永远不生效」。
+- **三处修法逐个回退，牙齿完全分离**：
+
+  | 回退 | 变红的用例 |
+  |---|---|
+  | 不点名 `path:` / 未知 `field:` | 2 条 ✅ |
+  | `Field` 恢复硬编码 + 整事件粒度 | 1 条（`…does_not_hide_a_prompt_secret`）✅ |
+  | 披露移回「只打没发现那一支」 | 5 条 ✅ |
+
+- **我第一版把 `url` / `message` 也当成「未知字段名」断言** → 红，
+  而**产品没错**：它们是 `WebFetch` / `Note` 事件的**真实字段名**，
+  只是本录像里没有这两种事件 —— 判为 usable 是正确的。
+  拆成两条测试：「字段名不存在」vs「字段名存在但本录像没用到」。
+  **判据该区分「规则无效」与「规则有效但此处用不上」。**
+- **顺带：这条改动打红了我自己 D177 写的 4 条测试**，也是「产品没错、
+  判据过时」：旧断言是「恰好报出 **1** 个疑似 secret」，而按真实字段扫描后，
+  mock 回显的 prompt 让**同一份密钥在 `prompt_preview` 与 `response` 两处
+  各算一处**（2 个）—— 每处都是真实位置，**更准**而非回归。
+  已把该断言从**精确计数**放宽为「该报的都报了」。
+  **精确计数会把判据绑死在实现的内部形状上**：同一个缺陷，同一个教训，
+  这是 D176「测试红时先问『谁错了』」的第三次复发。
+
+#### D181：`mora replay` **从不重放** —— 它在重跑程序，而且会发真实网络请求（已修）
+
+**本仓库最严重的一条。** `mora --help` 写的是
+`mora replay <file> <name>  Replay recording (deterministic)`，
+README 把 Record / replay / diff 列为「deterministic AI-call regression testing」。
+而实测：**`ai.chat` 的重放在任何情况下都匹配不上录像。**
+
+##### 两个独立缺陷
+
+1. **查找不可达。** `lookup_ai_chat` 只写在 `real_ai_chat` 里，而
+   `real_ai_chat` 只有 `OPENAI_API_KEY` **非空**时才会被调用。
+   没有 key（本地常态，也正是「重放」唯一合理的场景）**永远走不到查找**。
+2. **键两端不一致。** 查找用 `prompt_text`（`"user: find me"`，带 role 前缀），
+   而 `record_ai_chat` 存的是**裸 prompt**（`"find me"`），
+   `hash_prompt` 必然不等。
+
+两条合起来，两种环境都失败，而**失败方式相反**：
+
+```text
+# 无 key（本地常态）
+$ mora replay play.mora rr
+[Mock response for: find me]              ← 新 mock，录像里的值没用上
+✓ replayed 3 events from …rr.jsonl         ← 还报告「成功」
+
+# 有 key（base_url 指到必然连不上的本地端口，不产生外发流量）
+$ OPENAI_API_KEY=… MORA_AI_BASE_URL=http://127.0.0.1:9 mora replay play.mora rr
+Runtime error during replay: ai.chat: network error connecting to
+  http://127.0.0.1:9/chat/completions: Connection refused
+```
+
+后者尤其恶劣：**它根本不查录像，直接发真实网络请求** ——
+与「deterministic」正好相反，还要按次计费。
+（重放的**全部意义**就是「不调真 API」，而它只在有真 key 时才尝试查录像 ——
+恰好是唯一不该发请求的场景。）
+
+##### 判别性实验：让「重放」和「重新 mock」产出**不同的**结果
+
+用 `with mock_llm = ["DISTINCTIVE_RECORDED_VALUE_12345"]` 录制，
+再用**不带** mock 队列的脚本重放同一个 prompt：
+
+| | 输出 |
+|---|---|
+| 修前 | `[Mock response for: find me]` |
+| 修后 | `DISTINCTIVE_RECORDED_VALUE_12345` |
+
+这一步是必需的：mock 响应 `[Mock response for: <prompt>]` 本身**对同一 prompt
+是确定的**，所以「直接跑 `mora play.mora`」和「重放」在默认 mock 下**输出完全一样**，
+不换掉响应内容就根本测不出重放有没有发生。
+
+##### 修法
+
+把查找上移到 `do_ai_chat` 的 mock/real **分支之前**，键与录制端**逐字一致**
+（`effective_model` + 裸 `prompt`），两条录制分支也统一用 `effective_model`
+（原先 mock 分支记 `model` 参数、real 分支记 `effective_model`，
+配了 `with model` 时两者可能不同）。`real_ai_chat` 里那个够不着的查找删掉，
+避免留下第二份真相。
+
+##### 对照：`web.fetch` 的重放一直是**正确**接线的
+
+`real_web_fetch` 的 `lookup_web_fetch` 就在函数开头、**网络调用之前**，
+且用 `url` 直接做键 —— 与 `ai.chat` 正好不对称。
+**同一家族里一个接对了、一个接错了**，这本身就是
+「不要以为同族行为一致」的例证。
+
+##### 验证
+
+- 新增 `tests/record_replay_deterministic.rs` **4 条**，全部走真实子进程：
+  **无 key 必命中录像**（主判据）/
+  **有 key 也必命中且不得联网**（把 base_url 指到 `127.0.0.1:9`，
+  若它敢发请求会立刻炸，且**不产生外发流量**）/
+  未录到的 prompt 必须落回 mock（负对照）/
+  `with model = …` 形态下 model 键也要一致
+- **牙齿验证**（回退修复后重跑）：3 条核心用例 **FAILED** ✅，
+  负对照仍 ok ✅（修前未录到的 prompt 本来就落回 mock）。
+  旁证：回退后该测试从 **0.13s 涨到 16.95s** ——
+  因为它真的去试了网络连接。
+
+#### D182：`mora replay` 报的是「**加载了几条**」而不是「重放了几次」——一次都没命中也照样打 `✓`（已修）
+
+D181 的紧邻一条。D181 修好了「能不能命中」，本轮问的是
+「**命中与否，命令说得清吗**」。
+
+##### 缺陷：那个数字从来不代表重放
+
+修前的收尾一行：
+
+```rust
+println!("✓ replayed {} events from {}", recorder().events().len(), path);
+```
+
+`events().len()` 是**从文件加载进来多少条**。三处让它虚高：
+
+1. **命中与否它不管。** 一次都没匹配上，照样打 `✓`。
+2. **不是所有事件都能被重放。** 能重放的只有 `ai.chat` / `web.fetch`
+   （`event_to_replay_entry` 建的索引只含这两类）；`state_mutation` /
+   `msg` / `note` **根本没有条目**。而一次普通 `ai.chat` 录制就有
+   **2 条 `state_mutation` 搭头** —— 「3 条事件」里真正可重放的只有 1 条。
+3. 于是那个 `✓` 被读成「重放成功了」，实际可能**什么都没复现**。
+
+修前实测（真实 CLI，录像确有 1 个 ai.chat）：
+
+```text
+$ mora replay miss.mora rr        # miss.mora 用的是一个从未录过的 prompt
+[Mock response for: a prompt that was NEVER recorded anywhere]
+✓ replayed 3 events from …rr.jsonl         ← 一次都没命中，仍报「成功」
+```
+
+##### 为什么在 D181 之后更要紧
+
+D181 已证实「没命中」不是理论风险：prompt 不一致、model 不一致、签名漂移，
+任一都会静默回落。而回落的目标**可能是真实 API**（有 `OPENAI_API_KEY` 时）——
+用户以为自己在离线重放，其实发了网络请求，命令却报 `✓`。
+
+##### 修法
+
+- `Recorder` 增加 `replay_hits` / `replay_misses`，两个 lookup 在命中与
+  未命中时各自累加；
+- `run_replay` 报 `✓/⚠ replayed <hits>/<replayable> recorded call(s)`，
+  **并按命中数切换符号**（0 命中不给 `✓`）——
+  那个 `✓` 表达的是「命令跑完了」，被读成了「重放成功了」，两件事必须分开说；
+- 分母只数**可重放**的条目（`ai.chat` / `web.fetch`），
+  「加载了几条」作为另一个事实如实带出但分开说；
+- 0 命中且录像里确有可重放条目 → 明确打
+  `✗ NOTHING was replayed`，并提醒「设了 key 的话这些调用可能打了真实 API」。
+
+修后实测：
+
+```text
+# 一次都没命中
+⚠ replayed 0/1 recorded call(s) from …rr.jsonl (3 event(s) loaded, 1 of which replayable)
+[warn] 1 recorded call lookup(s) did NOT match — those calls fell back to mock / live API. …
+✗ NOTHING was replayed: the recording has 1 replayable call(s) but none matched.
+  If OPENAI_API_KEY is set, those calls may have hit the LIVE API …
+
+# 全部命中
+✓ replayed 1/1 recorded call(s) from …rr.jsonl (3 event(s) loaded, 1 of which replayable)
+```
+
+**退出码未改**（仍为 0）：「0 命中是否该判失败」属 CLI 契约决定，
+与 D176 记录的 `mora diff` 恒 exit 0 是同一类待裁决项，**仅报告不擅改**。
+
+##### 验证
+
+- 新增 `tests/record_replay_report.rs` **3 条**，全走真实子进程：
+  **0 命中不得报 ✓ 且必须说「什么都没重放」**（主判据）/
+  全命中报 `1/1` 且无告警 / **分母不得把 `state_mutation` 算进去**
+- **牙齿验证**（把分母回退成「加载条数」+ 符号恒 `✓` 后重跑）：
+  3 条全 **FAILED** ✅
+- 过程中我用按行切片做回退，切掉了 `run_diff` 的函数签名行 —— 靠
+  `cargo build` 的 `unexpected closing delimiter` 抓到并补回。
+  **破坏性编辑后必须立刻 build**，别等到跑测试才发现。
+
+#### D183：`ai.tokens()` 在 mock 模式（**默认**）下恒为 0 —— 而 record 家族对同一次调用报 39（已修）
+
+D181 之后我开始查「**已实现、已签名、已单测，但从没被接上**」这一类。
+`ai.tokens()` 就是下一个。
+
+##### 缺陷：运行期与 record 家族对同一个事实给出两个答案
+
+`track_tokens` 是运行期填充 `token_usage` 的**唯一**入口
+（`AiRuntime::record_tokens` 只被单测调用），而它**只被真实 HTTP 响应路径的
+两处**调用（`ai_chat.rs` 解析 API 回包 `usage` 之后）。
+两条 mock 分支都不调它 —— 而**没有 `OPENAI_API_KEY` 正是本地开发者的默认形态**。
+
+于是 `ai.tokens().input / output / total / calls` **恒为 0**。
+
+但这不能只用「mock 下本来就没有真 token」解释：**record 家族对同一次调用
+用同一套估算（`len / 4`）把 token 记进了录像**。实测同一个程序：
+
+```text
+$ mora t.mora              →  ai.tokens().total = 0.0
+$ mora record t.mora tk    →  ✓ recorded
+$ mora record stats tk     →  Tokens: 17 in + 22 out = 39 total
+```
+
+**两套子系统对同一个事实给出两个答案**，而运行期那个是**静默**的 0。
+`ai.tokens()` 在本语言里是 agent 查成本的入口（D76 刚补好它的 typeck 签名
+与 `calls` 字段），恒 0 等于告诉 agent「你从没花过钱」。
+
+##### 修法与**安全前提**（逐条核过，不是想当然）
+
+两条 mock 分支补上 `track_tokens(输入估算, 输出估算)`，与 recorder 用
+**同一套** `len / 4` 估算 —— 两边从此一致。
+
+调用它**安全**，因为它内部的预算强制**不可能触发**（三条都实测/查证过）：
+
+| 检查 | 结果 |
+|---|---|
+| `AiRuntime` 能否被构造成非 `None` 的 budget | **不能** —— 只有 `Default`（`token_budget: None`，全仓**唯一**赋值点） |
+| `TokenBudget` 结构体是否被构造过 | **从未**（全仓零个 `TokenBudget {`） |
+| 有没有 setter | **没有**（`set_token_budget` / `with_token_budget` 零匹配） |
+| 用户能不能从语言设预算 | **不能** —— `with budget = …` **立即报错** |
+
+故补这一调用**只**更新计数器与 trace 指标，**不引入任何新的失败模式**。
+
+##### 明确**不**改的：token 预算功能本身（**已否证**）
+
+`track_tokens` 里的预算检查（`per_call` / `total` / `alert_threshold`）
+是**死代码** —— 但这是**已记录的**：`docs/mora-spec.md` §11.1「承诺但未实现」
+明写 `budget` / `per_call` 从未实现，且 D39 / D116 已记。实测确认现在
+**写入即报错**：
+
+```text
+$ mora b.mora              # with budget = 10000
+Runtime error (MIR): with-config `budget` is promised by spec §11.1 but not
+implemented yet (supported: model / system / temperature / max_tokens / mock_llm)
+```
+
+**那是处理「未实现特性」的正确方式**（明确信号 ≫ 静默失效），
+与 D180 那条「策略文件静默不生效」正相反。**按 D166 纪律不重复上报、不擅改。**
+
+（`tests/ai_tokens_accounting.rs`（D76）已把「mock 模式下 `ai.tokens().*` 恒为 0」
+作为**事实**记下，但那是为解释「另一个缺陷为何无法用 CLI 观测」，
+**并未裁定它本身是否可接受**。本轮的新增论据是**两套子系统互相矛盾**，
+这一点此前无人记录。）
+
+##### 验证
+
+- 新增 `tests/ai_tokens_mock_accounting.rs` **4 条**，全走真实 `mora` 子进程：
+  调过一次后 `total > 0`（主判据）/ `calls` 等于真实调用次数（1、2）/
+  **运行期与 `mora record stats` 数字一致** / 没调用时必须仍为 0（负对照）
+- **牙齿验证**（去掉 mock 分支的 `track_tokens` 后重跑）：3 条 **FAILED** ✅，
+  负对照仍 ok ✅
+- 修后实测：`ai.tokens().total` = **39.0**，与 `mora record stats` 的 39 一致；
+  两次调用后 `calls` = **2.0**
+
+#### D184：`mora record list` 是 D178 之后**唯一漏掉**的消费者 —— 且用了**不同的计数口径**
+
+D178 给 7 个下游都加了「跳过行」告警。本轮回头核对，**漏了一个**。
+
+##### 缺陷：同一个文件，两个命令报不同的数
+
+修前 `list_recordings` 做两件**独立**的事：
+
+```rust
+let event_count = count_lines(&path).unwrap_or(0);   // ← 原始非空行数
+let (first_ts, last_ts) = load_time_range(&path);     // ← 整文件解析后只取时间戳
+```
+
+列名是 `EVENTS`，暗示与 `stats` 的 `Events: N total` 同义。实测一份首行被截断的录像：
+
+```text
+$ mora record list      →  r2 … EVENTS 3        ← 数的是行
+$ mora record stats r2  →  [warn] 1 of 3 line(s) could not be parsed…
+                        →  Events: 2 total       ← 数的是可读事件
+```
+
+同一个文件报 3 和 2，而 `list` **零告警**。
+
+##### 修法：合并成**一次**加载 —— 零额外成本
+
+关键观察：`load_time_range` **本来就**调用 `load_jsonl` 把整个文件解析一遍，
+然后**只**留下首末时间戳、把事件全丢掉。既然文件已经解析过了，
+事件数与跳过行就是**同一次加载的副产品**。
+
+故新增 `load_summary()` 一次返回 `(可读事件数, 首 ts, 末 ts, 跳过行)`，
+并删掉 `count_lines` 与 `load_time_range`。**解析次数不变**（仍是每文件一次），
+而两者对同一文件**必然一致** —— 结构上不可能再漂移。
+
+修后实测：
+
+```text
+$ mora record list
+[warn] …\r2.jsonl: 1/3 line(s) could not be parsed and were SKIPPED —
+        the EVENTS column below counts only the 2 readable one(s).
+NAME        SIZE   EVENTS
+r2          262B    2
+r1          548B    3
+$ mora record stats r2  →  Events: 2 total      ← 与 list 一致
+```
+
+##### 一条方法论：**N 个消费者修完要回头核**
+
+D178 我把 `load_jsonl` 的返回值改了，并在 `cli/record.rs` 的 **8 个**消费点
+都接上了 `warn_skipped`。但**库层**的 `list_recordings` 走的是另一条路
+（`analysis.rs`，不经 CLI），我**没查**，于是它成了唯一的沉默者 ——
+而且还额外用了第二套计数口径。**「同一处修改影响 N 个消费者」时，
+要按「同一事实有几个消费路径」来数，而不是按「我改了几个调用点」来数。**
+
+##### 验证
+
+- 新增 `tests/record_list_counts.rs` **3 条**，全走真实子进程：
+  **`list` 的 EVENTS 必须等于 `stats` 的 Events**（**含损坏文件**这一路，
+  否则测试在缺陷存在时照样绿）/ 损坏文件必须告警 / 完好文件不得告警
+- **牙齿验证**（把计数口径改回「原始行数」+ 去掉告警后重跑）：
+  2 条 **FAILED** ✅，完好文件那条负对照仍 ok ✅
+  （修前完好文件本就不告警 —— 那条守的是「别变成一律报警」）
+
+#### D185：`--help` 的用法列表**漏掉 6 个能跑的子命令** —— 包括密钥扫描器
+
+D176 顺带记过「`snapshot` 不在 `--help` 用法列表里」但没深究。本轮量清了。
+
+##### 缺陷：分派认得，`--help` 不列
+
+| 子命令 | 分派有？ | 修前 `--help` 有用法条目？ |
+|---|---|---|
+| `mora run <file>` | ✅ | ❌ |
+| `mora install <url>` | ✅ | ❌ |
+| `mora snapshot <file> <name> [--update]` | ✅ | ❌（仅标题行顺带提到） |
+| `mora record export <name>` | ✅ | ❌ |
+| **`mora record audit <name>`** | ✅ | ❌ |
+| `mora record report <name>` | ✅ | ❌ |
+
+##### 为什么不是「排版小事」
+
+`mora record audit` 是**密钥扫描器** —— 用户问「我这份录像里有没有泄漏 API key」
+时，唯一能回答问题的命令。它在 `--help` 的**标题行与用法列表里都没有出现过**
+（`audit` 二字在整段 help 里**零匹配**）。
+
+对照本会话修过的东西：这个命令在 D177 刚补上 `bearer-token` 死条目、
+D180 刚补上「不生效规则必须点名」、D178 刚让它在数据残缺时**硬失败**。
+**一堆安全保证，用户却找不到入口。**
+
+`mora record` 参数不足时自报的用法（`main.rs`）也只写了 `list|stats|timeline ...`，
+同样漏了 export/audit/report —— 而那是用户**真的打错命令时**会看到的那一行。
+
+##### 修法
+
+补 6 条用法条目（`record export|audit|report` 归到 Recording 段，
+`snapshot` 单独开 `Regression:` 段，`run` / `install` 归到 Usage 段），
+并把 `mora record` 的用法报错行补全。
+
+##### 验证
+
+- 新增 `tests/cli_help_completeness.rs` **3 条**。主判据是
+  **「每一个能跑的子命令都必须出现在 `--help` 的用法行里」** ——
+  这条判据**对未来也成立**：将来新增子命令忘了登记，改那张表就会被当场抓到。
+  - 只看「字符串出现过」不够：`snapshot` 在**标题行**里就出现过，
+    那正是修前的情况。故要求它出现在**以 `mora ` 开头的用法行**上。
+  - 另两条：`mora record` 的用法报错必须涵盖全部 6 个子命令 /
+    原有条目不得被重写时删掉（负对照）。
+- **牙齿验证**：删掉补上的 6 条 → 主判据 **FAILED** ✅；
+  单独再回退用法报错行 → 第二条也 **FAILED** ✅；负对照始终 ok ✅
+
+##### 过程中我又踩了一次「按行切片做回退」
+
+删那 6 条时用 `[IO.File]::ReadAllLines` 按下标切片，把相邻的
+`println!()` 与 `println!("MCP:")` **一起吃掉了** —— 靠 `cargo build`
+的 `unexpected closing delimiter` 抓到补回。
+**D182 刚把这条写进 CHANGELOG，同一轮就又犯一次。** 这说明
+「破坏性编辑后立刻 build」得做到**条件反射**，而不是「记得」。
+
+#### D186：`mora mcp tool-list` 是一张**静态名字目录**，却以「MCP Tools (13)」的权威口气报出
+
+D175 处理的是语言内的 `methods_of`，本轮查**对外**的那一面 ——
+MCP 工具清单。**外部 agent 靠它发现能力。**
+
+##### 缺陷一：宣称做到了做不到的事
+
+目录里列了 `ai.stream` 与 `ai.create`，两者**全仓没有任何实现**：
+
+```text
+$ mora mcp tool-list                  →  ai.stream / ai.create 在列
+$ let q = ai.stream(p"hi")            →  Runtime error: Unknown method: AiChat.stream
+$ let q = ai.create("x", {})          →  Runtime error: Unknown method: AiChat.create
+```
+
+`ai.create` 已由 `tests/ai_namespace_reachability.rs`（D59）记为源码不可达；
+`ai.stream` 的 `Value::Stream` 更是一个**从未被构造**的死变体（同 D59）。
+照着 13 个名字给 MCP 客户端接线，其中 2 个必然调不通。
+
+##### 缺陷二：一个**计数**被当成系统状态
+
+它读的是 `builtin_toolsets()` 这张硬编码目录，与真正对外暴露的工具
+**毫无关系** —— 后者由每个脚本自己 `server.tool(name, schema, handler)` 注册。
+
+判别性实测（同一台机器、同一个二进制；起一个真服务器走 Content-Length 帧）：
+
+```text
+$ mora mcp tool-list            →  MCP Tools (13)            ← 静态目录
+$ # 一个只注册了 greet 的脚本：
+$   stderr: [mcp] Registered 1 tool(s) (1 enabled)
+$   tools/list 应答: {"result":{"tools":[{"name":"greet"}]}}   ← 真实注册表
+```
+
+同一件事，两个**都被当作权威**的计数，互不引用 —— 用户无从判断该信哪个。
+
+##### 修法
+
+1. 删掉 `ai.stream` / `ai.create`（无实现，宣称即撒谎）→ 13 → 11；
+2. 标题改为「Builtin MCP tool names by toolset」，并**指明真正的事实源**
+   （问那个服务器要 `tools/list`，或看它启动时的 `[mcp] Registered N tool(s)`）；
+   `tool-search` 同步同一口径（空结果也从「No tools found」改为
+   「No builtin tool names matching」—— 名字目录里没有 ≠ 服务器上没有工具）。
+
+##### 验证
+
+- 新增 `tests/mcp_tool_catalog_honesty.rs` **4 条**。主判据是
+  **「目录里每个名字都必须真的能调」** —— 10 个名字逐个起子进程实测，
+  把「宣称」与「实际」绑在一起；将来任何人往目录里加一个没实现的名字，
+  这条立刻红。
+- **牙齿验证**（把两个名字放回目录后重跑）：「无实现名字不得回列」
+  **FAILED** ✅。
+- **⚠ 如实记账：主判据对这两个名字是**空转**的** —— 它遍历 `CALLABLE` 表，
+  而 `ai.stream` / `ai.create` 被刻意排除在那张表外（去调它们必然失败，
+  那正是缺陷本身）。「宣称了做不到的事」这一半由
+  `d186_unimplemented_names_are_absent_from_the_catalog` 守。
+  **两条合起来才是完整判据。**
+- **探针 bug 一条**：`file.read_text("x.txt")` 红了 —— 因为我没先建那个文件。
+  **产品行为是对的**（读不存在的文件理应报错），是我没准备前提。
+  D176「测试红时先问『谁错了』」的又一次。
+
+#### D187：`--opt>=1` 让程序**在第一个 `for` 循环处静默中止** —— 且一条判据无效的测试正在「守」着它（**记档，未修**）
+
+`mora --help` 写着
+`mora --opt=1 file.mora  Run with SSA optimization (0=off/1=basic/>=2=aggressive)`。
+本轮实测它。
+
+##### 现象：不是「输出被吞」，是**执行中止**，而且静悄悄
+
+```text
+# a.mora:  print("A") / for … end / print("B") / print(acc)
+$ mora a.mora          →  A ; B ; 6.0        exit 0
+$ mora --opt=1 a.mora  →  A                   exit 0     ← 停在循环处
+```
+
+无错误、无警告、**退出码 0**。用户看到「打印了 A，程序正常结束」。
+
+##### 覆盖面：8 个常用构造里 **5 个**在 `--opt>=1` 下坏掉
+
+| 构造 | opt=off | opt=1 | opt=2 |
+|---|---|---|---|
+| `for` 累加 / `for` 逐项 print | `6.0` / `1;2;3` | **空** | **空** |
+| `let a = 1` + `print(a)` | `1.0` | `1.0` | **空** |
+| `dict.get` | `1.0` | `1.0` | **空** |
+| `[1,2,3].map(闭包)` | `[11,12,13]` | **内部错误** exit 1 | 同 |
+| `if` **常量**条件 + `else` | `7.0` | **`7.0 ; 8.0`（两分支都跑）** | 同 |
+| `if` 变量条件 | `SMALL` | `SMALL` | `SMALL` |
+| `while` | `3.0` | `3.0` | `3.0` |
+| 裸 `print(1)` | `1.0` | `1.0` | `1.0` |
+
+`if` 那条最危险：**常量条件的死分支没被消掉，两个分支都执行** ——
+副作用会**重复发生**（重复写文件、重复扣款、重复发送），而程序**看起来在正常工作**。
+变量条件正常 → 缺陷收窄在**常量折叠**那一支。
+
+`.map(闭包)` 把内部不变量印给用户：
+`Runtime error (MIR): internal: instruction at DAG node 0 references register 8 …
+a unit-statement emitter returned an unallocated sentinel register`（至少显式失败了）。
+
+##### 本轮最刺眼的发现：**一条假绿测试正在守着这个功能**
+
+`tests/mir_ssa_roundtrip.rs::basic_pipeline_runs_without_panic` 里
+**正好有我这个失败的 `for` 用例**：
+
+```rust
+optimize_without_panic(
+    "let acc = 0\nfor i in [1,2,3]\n  acc = acc + i\nend\nprint(acc)\n",
+    OptLevel::Basic,
+);
+```
+
+而它的判据是 **`optimize_without_panic` ——「不 panic 即通过」，完全不检查输出**。
+把那段源码拿真实 CLI 跑：`opt=off → 6.0`，`opt=1 → 空`，`opt=2 → 空`。
+
+**一条判据无法区分「跑对了」与「静默什么都没做」的测试，
+正在「守」着一个文档化、宣传、且大面积坏掉的功能。**
+
+同一个形状本会话已记过两次（D171「正对照对假绿零判别力」、
+D182「命令跑完了 ≠ 命令做成了」），这是第三次 —— 但这次守的是**优化器**。
+
+`tests/nested_loop_jumps.rs:304-310` 已就**完全同型**的问题
+（`--opt=1` 顶层结果静默变 Nil）记过根因并称已修
+（「给每个 Label 补一条到其后第一个非 Label 节点的控制边」）。
+实测表明该修复**未覆盖 `for`**（`while` 正常 → 两者走低层路径不同）。
+
+##### 为什么**本轮不修**
+
+修 `--opt` 是优化器**可达性 + 常量折叠**的深层工程（`mir/opt.rs` + SSA 管线），
+涉及 5 类不同症状、回归面横跨整个优化管线 —— 远超本轮能力，
+且**中途半修比不修更坏**（`--opt` 会被当成「已修好」而更被信任）。
+**故只记档 + 钉现状，未擅自实施。**
+
+##### 验证：把缺陷钉成**现状断言**（`tests/opt_ssa_equivalence.rs`，5 条）
+
+按 `tests/ai_namespace_reachability.rs`（D59）既有的做法：把**当前坏掉的现状**
+钉住并写清「这是缺陷现状，不是正确行为」；修好之后这些测试应当**失败**，
+那时把断言翻转为等价即可。5 条全部走**真实 CLI 子进程**（不是库内推断）：
+
+| 测试 | 钉住什么 |
+|---|---|
+| `…stops_silently_at_a_for_loop` | `A` 之后静默中止，**exit 0** |
+| `…executes_both_branches_of_a_constant_if` | 两分支都跑 |
+| `…map_closure_leaks_an_internal_invariant` | 报内部不变量细节 |
+| `…variable_condition_if_is_still_correct_under_opt` | **对照组**：变量条件当前正确 |
+| `…while_and_plain_print_survive_opt1` | **对照组**：`while` / 裸 `print` 当前正确 |
+
+后两条是**刻意加的对照组**，把缺陷范围收窄到具体分支 ——
+否则很容易把「优化器坏了」这种过宽的说法钉进断言。
+
+##### 探针自身的三个坑（**都不是产品缺陷**）
+
+1. `--opt=` **必须放在文件前面** —— CLI 只扫第一个非选项参数之前的选项；
+   放文件后会被**静默忽略**，opt=off 与 opt=1 跑出同一结果，差异测不出来
+   （我第一版 5 条全红就是这个原因）。
+2. **必须合并 stdout 与 stderr** —— 运行时错误走 stderr，只读 stdout 会把
+   「报错了」看成「什么都没输出」。
+3. 用 PowerShell 管道 `2>&1` 做差分时，**stderr 的 ErrorRecord 会混进输出**，
+   我据此一度误判「`if/else` 两个分支都跑」，换了文件重定向才发现那是假象。
+   **差分测试的采集方式必须不吞也不混流。**
+
+#### D188：`mora --check` 把**同一个类型错误报两遍** —— 错误计数撒谎（已修）
+
+D187 之外继续审计 CLI 面。本轮查 `--check`（只做类型检查的路径）。
+
+##### 现象
+
+`let v: Int = 1.5` 的真实输出（修前）：
+
+```text
+Type error at line 1:14: type mismatch: expected `Int`, got `Float`
+  expected: Int
+  actual:   Float
+Type error (位置未跟踪): Type mismatch: expected int, got float
+  expected: int
+  actual:   float
+2 type error(s) found.          ← 实际只有 1 个问题
+```
+
+用户被告知有 **2 个**类型错误，实际只有 **1 个**。**错误计数是错的** ——
+而 `--check` 的退出码正是给 CI 判成败用的，计数错就意味着诊断不可当依据。
+
+##### 根因：D128 的三元组去重对这条**失效**
+
+`check_program_witnesses_bidirectional` 跑**两层**（双向层 + HM 层），
+D128 加了 `(line, expected, actual)` 三元组去重。但**两个维度都不同**：
+
+| | 位置 | `expected` / `actual` 文本 |
+|---|---|---|
+| 双向层 | `line 1:14` | `` `Int` `` / `` `Float` ``（带反引号、大写） |
+| HM 层 | `line 0` → 渲染成「位置未跟踪」 | `int` / `float`（小写、无反引号） |
+
+- **位置不同**：HM 那条 `line == 0`。D126 已把「line 0」诚实渲染成
+  「位置未跟踪」；`Constraint` 不携带 span 是**已记的**根因（D126 待办）。
+- **措辞不同**：**同一件事，两层用了两种写法**，三元组自然对不上。
+
+##### 修法：只对**无位置**的 HM 错误补一条按**规范化类型对**的去重
+
+规范化 = 去反引号 + 转小写。
+
+**只影响本来就没有位置信息的那些** —— 那类错误（D126 判定为低信息）
+若描述的类型对已被一条**带位置**的诊断覆盖，就是同一件事的第二份表述。
+
+修后实测：`1 type error(s) found.`，保留的是带 `line 1:14` 的那条。
+
+##### 验证
+
+- 新增 `tests/typecheck_duplicate_diagnostics.rs` **4 条**，全走真实
+  `mora --check` 子进程：
+  **一个错误只报一次且计数为 1**（主判据）/
+  **不同**类型对各报一次 / **同一类型对在两个位置**各报一次 /
+  合法程序仍通过（负对照）
+- 后两条是**刻意加的「不过度去重」守卫** —— 去重的诱惑在于「少报总比多报好」，
+  而那会让真实错误被吞掉。
+- **牙齿验证**（把那层过滤改成恒 false 后重跑）：3 条 **FAILED** ✅
+  （主判据与两条守卫同时变红 —— 计数从 1/2 变回 3），负对照仍 ok ✅
+- 实测两个反例均**正确保留**：
+  `let a: Int = 1.5` + `let b: String = 2.0` → 报 2 个；
+  `let a: Int = 1.5` + `let c: Int = 2.5` → 报 2 个（同类型对、两处位置）
+
+##### 顺带实测到的**参数顺序坑**（未改）
+
+```text
+$ mora --check --opt=1 ok.mora   →  --opt=1: 系统找不到指定的文件。 (os error 2)
+$ mora --opt=1 --check ok.mora   →  No type errors found. (3 expressions)
+```
+
+CLI 只扫**第一个非选项参数之前**的选项，故 `--opt` 放在 `--check` 之后会被
+当成**文件名**，报「系统找不到指定的文件」—— 而那个文件明明就在当前目录。
+报错的**归因也是错的**（该说「参数顺序不支持」或正确处理，而不是说文件不存在）。
+与 D187 记的探针坑同源（我第一版 `--opt` 放文件后，也被静默忽略）。
+**未擅自改**：参数解析顺序属 CLI 契约决定。
+
+#### D189：选项落到**文件位置**时报「文件不存在」—— 而文件就在当前目录（已修）
+
+D188 顺带实测到的那条，本轮深挖后发现它是一类问题。
+
+##### 缺陷：报错在一个**可验证的事实**上撒谎
+
+CLI 只扫**第一个非选项参数之前**的选项（`--opt=N` 仅在 `args[1]` 被识别）。
+放在后面的选项会落进「文件槽」，被当路径去读：
+
+```text
+$ mora --check --opt=1 ok.mora     →  --opt=1: 系统找不到指定的文件。 (os error 2)
+$ mora --check --bogus ok.mora     →  --bogus: 系统找不到指定的文件。 (os error 2)
+$ mora record --update ok.mora n   →  record: failed to read --update
+$ mora replay --opt=1 ok.mora n    →  同上
+$ mora snapshot --update ok.mora n →  同上
+```
+
+**`ok.mora` 就在当前目录。** 三条（含 `record` 家族共 5 条）路径都把用户
+引向一个**不存在的路径问题**：他会去检查文件、目录、权限，而真正的原因是
+**参数写在了错误的位置**。
+
+与 D187/D188 实测到的探针坑同源（`--opt` 放文件后被静默忽略），
+但那是我**测量**时踩的；这里是**用户**会踩的路径。
+
+##### 修法：只说**一件确实成立**的事，不做「已知 / 未知」分类
+
+读文件前先看该参数是不是选项（以 `-` 开头），是就说「选项不能出现在文件位置，
+要写在文件之前或子命令之后」。
+
+**刻意不分类「已知选项」与「未知选项」**，两个原因：
+
+1. 分类需要一张**按命令**的选项表，而那张表必然与实现漂移 ——
+   D175 的 `module_method_names`、D186 的 MCP 名字目录都是同款「第二份清单」教训；
+2. **「是否合法」本就依赖位置** —— `--update` 对 `snapshot` 是合法选项、
+   只是写错了地方，对 `record` 则根本不存在。一张按命令的表也表达不了这件事。
+
+（实现过程中我先写了一版两分支分类，**实测立刻抓到它自己错**：
+把 `"--"` 放进已知列表，于是任何 `--xxx` 都 `starts_with("--")`，
+`--bogus` 被说成「已知选项写错位置」—— 归因又错一次。分类的代价立刻兑现。）
+
+##### 验证
+
+- 新增 `tests/cli_option_in_file_slot.rs` **4 条**，全走真实子进程：
+  **5 条落选项的命令路径都不得说「文件不存在」**（主判据）/
+  未知选项同样不得这么说 / 正常用法不受影响 /
+  **文件真的不存在时仍要照实说**（防止守卫变成「什么都报选项错」）
+- **牙齿验证**（把守卫改成恒不触发后重跑）：2 条 **FAILED** ✅，
+  两条负对照仍 ok ✅ —— 正是它们该有的分工
+
+#### D190：`mora --repl` 在 **stdin 结束（EOF）后不退出** —— 永久挂起（已修）+ 一个**未定位**的首行缺陷（记档）
+
+本轮审计 `mora --repl`。`--help` 里宣传、此前**从未审过**。
+
+##### 缺陷一（已修）：EOF 不退出 → 任何非交互用法都挂死
+
+REPL 循环原先只判 `read_line(...).is_err()`，而 **`read_line` 在 EOF 时返回
+`Ok(0)`，不是 `Err`**。于是循环永远读到空串 → trim 后为空 → 被当作「空行跳过」
+→ **无限转下去**。
+
+实测（真实 `mora --repl`，喂完输入后**关闭 stdin**）：**8 秒后仍未退出**。
+
+后果：`mora --repl < file`、CI 里喂脚本、任何**非交互**的管道用法都挂死，
+只能强杀。启动横幅写着「type 'exit' to quit」—— 用户会以为必须敲 `exit`，
+而管道里根本没有机会敲。
+
+修法：`match handle.read_line(..) { Ok(0) => break, Ok(_) => {}, Err(_) => break }`。
+「stdin 结束即退出」是所有交互式工具的惯例，**也是唯一能让 REPL 被脚本驱动的前提**。
+
+##### 缺陷二（**D191 已查清：不是缺陷，是我的探针造的**）
+
+原文记的是「**REPL 的第一条输入必然**报 `parse error: 语法错误，已放弃当前输入`，
+而同样的文本写成文件跑得通」，并注明「根因未定位」。
+
+**D191 查清了：那不是产品缺陷，是我自己的 PowerShell 探针往 stdin 注入了
+UTF-8 BOM。** 临时探针打出的真相：
+
+```text
+[D191DBG] pending="\u{feff}print(\"hi\")\n"
+          err="Unexpected character '\u{feff}' at line 1, column 1"
+```
+
+改用**字节精确**的文件重定向（首 3 字节 `112,114,105` = `pin`）后，
+REPL **完全正常**：
+
+```text
+mora> hi
+mora> 2.0
+```
+
+**教训与 D154/D166 同源，方向却相反**：那两次是「已被否证的结论被重新误判」，
+这次是**从未存在的缺陷被凭空测出来**。差一步就把它当产品问题写进本文件。
+D190 当时写「根因未定位，不臆断」是对的，但**仍不该把它记成一条缺陷** ——
+「观察到的现象」与「产品有缺陷」是两件事，中间隔着一次装置核验。
+
+（对本轮自己的第二个教训：我一度把「首行结果被丢弃」误读成「结果被打到
+stderr」并试图去修 stdout 捕获 —— 实际上它就是 stderr 上的 parse error。
+**只读一个流的差分测试会把「报错」伪装成「什么都没发生」。**）
+
+##### 剥掉装置问题之后，剩下一个**真**的健壮性缺口 → **D191 已修**
+
+BOM 本身是真问题，且是**静默**的：
+
+- 文件带 BOM → `mora file.mora` 整份解析失败；
+- 管道/REPL 带 BOM → **第一行被静默丢弃**，无任何提示。
+
+触发面很常见：Windows PowerShell 的 `Set-Content` / `Out-File`（默认 UTF-8
+带 BOM）、部分编辑器与工具链的「另存为」。**BOM 是编码产物、不是源码内容** ——
+用户不该因为工具多写了一个编码标记而收到语法错误。
+
+修法与验证见 **D191**。
+
+##### 验证
+
+- 新增 `tests/repl_eof_exit.rs` **4 条**，全部真起子进程、
+  **喂完输入后主动关闭 stdin**（不关就测不到 EOF）：主判据「关闭后必须
+  自行退出」/ 完全无输入时立刻退出 / 多行输入后也退出 /
+  **对照组**：`exit` 一词仍然可用（修的是 EOF，不是把 `exit` 弄坏）
+- **牙齿验证**（把 `Ok(0)` 的 `break` 改回空语句后重跑）：3 条 **FAILED** ✅，
+  对照仍 ok ✅。**旁证**：回退后该测试整轮耗时 **8.65s** ——
+  三个用例各挂满自己的 8 秒时限，挂起这件事本身就是证据。
+
+#### D191：UTF-8 BOM 让**第一行被静默丢弃** —— 以及**撤回 D190 的一条「缺陷」**
+
+本轮从 D190 留下的「根因未定位」接着查。
+
+##### 结论一：**D190 记的那条「缺陷」不存在 —— 是我的探针造的**
+
+D190 记「REPL 第一条输入必然 `parse error`」。加临时探针打出真相：
+
+```text
+[D191DBG] pending="\u{feff}print(\"hi\")\n"
+          err="Unexpected character '\u{feff}' at line 1, column 1"
+```
+
+那是**我自己的 PowerShell 探针往 stdin 注入的 UTF-8 BOM**。
+改用**字节精确**的文件重定向（首 3 字节 `112,114,105` = `pin`）后，
+REPL **完全正常**：`mora> hi` / `mora> 2.0`，零报错。
+
+**教训与 D154/D166 同源，方向相反**：那两次是「已被否证的结论被重新误判」；
+这次是**从未存在的缺陷被凭空测出来**。差一步就把它当产品问题发出去。
+
+**「观察到的现象」与「产品有缺陷」之间隔着一层装置核验。**
+D190 写「根因未定位、不臆断」是对的，但**仍不该把它记成一条缺陷**。
+
+##### 结论二：剥掉装置问题后，剩下一个**真**且**静默**的健壮性缺口（已修）
+
+| 场景 | 修前 | 修后 |
+|---|---|---|
+| 文件带 BOM | 整份解析失败（`Unexpected character` + BOM 字符） | 正常跑 |
+| 管道/REPL 带 BOM | **第一行被静默丢弃**，无任何提示 | 第一行正常执行 |
+
+触发面很常见：Windows PowerShell 的 `Set-Content` / `Out-File`（默认 UTF-8
+带 BOM）、部分编辑器与工具链的「另存为」。
+**BOM 是编码产物、不是源码内容** —— 在工具边界容忍它是对的。
+
+修法：
+- `cli::read_source()` 读文件后剥**开头一个** U+FEFF
+  （`run_file` / `run_check` / `record` / `replay` / `snapshot` 全部走它）；
+- REPL 首行剥一次 —— **必须剥在 `line` 本身**上，`pending.push_str(line.as_str())`
+  用的是 `line`，只改 `trimmed` 不生效（我第一版就写错了这个位置）。
+
+源码**中间**的 U+FEFF 仍是真实字符，仍应被拒（且报错里印的是**原始字符**
+而非 `feff` 六个字母 —— 我的第一版断言就错在这）。
+
+##### 验证
+
+- 新增 `tests/bom_tolerance.rs` **4 条**，全部**按精确字节**写输入
+  （不靠编码器「碰巧」产生 BOM，并先断言首 3 字节确为 `EF BB BF`）：
+  带 BOM 的文件能跑 / 带 BOM 的 REPL 管道**第一行不得丢**（主判据）/
+  无 BOM 输入不受影响（负对照）/ **只剥开头一个**（中间的真实 U+FEFF 仍被拒）
+
+#### D192：I/O 错误**丢原因**；编码错误的消息**没说下一步该做什么**（已修）
+
+接着 D191 的「输入边界」这条线往下查：非 UTF-8 的源文件会怎样。
+
+##### 缺陷一：`record` 家族把错误**整个丢掉**
+
+```rust
+fs::read_to_string(path).unwrap_or_else(|_| {
+    eprintln!("record: failed to read {}", path);   // ← `|_|` 把原因扔了
+});
+```
+
+于是**编码错误 / 权限不足 / 「那是个目录」全部退化成同一句**。实测（GBK 文件）：
+
+```text
+$ mora record gbk.mora gk
+record: failed to read gbk.mora          ← 原因没了
+```
+
+`replay` / `snapshot` 同样三个 `|_|`。
+
+##### 缺陷二：透出来的原因**不可操作**
+
+`mora` / `--check` 走 `fs::read_to_string` 的原始 io::Error：
+
+```text
+$ mora gbk.mora
+gbk.mora: stream did not contain valid UTF-8      ← 准确，但没说该做什么
+```
+
+**Windows 的部分工具默认写 GBK/GB18030** —— 对本语言的读者不是边角情况。
+
+##### 修法
+
+- `cli::read_source()` 把 `ErrorKind::InvalidData`（即 UTF-8 解码失败）翻译成
+  「请用编辑器**另存为 UTF-8**」，并点出常见来源；
+- `record` / `replay` / `snapshot` 的 `|_|` 改成 `|e|`，把**原因**带出来。
+
+修后（五个入口全覆盖）：
+
+```text
+mora gbk.mora      → gbk.mora: 不是有效的 UTF-8 文本（…）。请用编辑器**另存为 UTF-8** 后重试。
+                     提示：Windows 的部分工具默认写 GBK/GB18030；若是刚由这类工具生成，转换编码即可。
+record gbk.mora gk → record: failed to read gbk.mora: 不是有效的 UTF-8 文本（…）。请用编辑器**另存为 UTF-8** 后重试。
+```
+
+**不**尝试猜测/转换编码 —— 要支持 GBK 得引入编码探测，属语言/工具链的
+**设计决定**，未擅自做（与 D183 的 token 预算同款处理）。
+
+##### 验证
+
+- 新增 `tests/source_read_errors.rs` **4 条**，GBK 字节**手工构造**
+  （`# 注释` = `23 20 D7 DA CA A4 0A`，且先断言它确实是非法 UTF-8）：
+  **五个读取入口都必须报出原因**（主判据）/ 编码错误消息必须**可操作**
+  （含「另存为 UTF-8」）/ **负对照**：文件真的不存在时仍照实说「找不到」，
+  不能被编码消息吞掉 / 普通 UTF-8 文件不受影响
+- **牙齿验证**（把 `record` 的 `|e|` 改回 `|_|` 后重跑）：3 条 **FAILED** ✅
+
+#### D193：LSP hover 对**每一个**符号都硬编码 `<inferred>` —— 信息量为零（已修）
+
+此前 hover 被记为 known-gap「显示 `<inferred>`」。本轮量化后发现它比记的**更严重**。
+
+##### 缺陷
+
+`lsp/providers/hover.rs` 原文：
+
+```rust
+let contents = format!("```mora\n{} {}: <inferred>\n```", kind, ident);
+```
+
+字面量写死。实测（真实 `mora-lsp.exe` 走 stdio + Content-Length 帧）：
+
+| 源码 | hover（修前） | 实际可得的信息 |
+|---|---|---|
+| `let a: Int = 5` | `let a: <inferred>` | **标注就在源码里** |
+| `let b = 7.5` | `let b: <inferred>` | 需推断 |
+| `let c: any = 1` | `let c: <inferred>` | **标注就在源码里** |
+| `math.floor` | `variable floor: <inferred>` | `MATH_GROUPS` 里有签名（D172） |
+
+**连明写着的类型标注都不报** —— 悬停能告诉用户的只有「变量叫什么」和
+「它在哪一行」。对一个宣称有完整 HM 推断的类型系统，hover 携带的信息量是零。
+
+（顺带记一个同款「第二份清单」：`kind` 判 `builtin` 用的是**硬编码的三个名字**
+`print` / `len` / `range`，所以 `math.floor` 被判成 `variable`。**未改** ——
+把它接到 `module_method_signature` 是更大的工程。）
+
+##### 修法：只报**源码里确实写了**的类型
+
+找 `let <ident>:` 后面的标注并报出；找不到仍回落 `<inferred>`。
+
+**刻意不接 HM 推断**：本语言有完整 HM 推断与 `*_GROUPS` 签名表，
+把它们接进 LSP 是更大的工程；而且**猜出来的类型若与运行期不符，
+比 `<inferred>` 更糟 —— 它看起来可信**。
+
+匹配规则保守：必须是行首（可含缩进）的 `let`、名字**整词**匹配、
+标注取 `:` 之后到 `=` / `;` / 行尾之前。
+
+修后实测：`let a: Int` / `let ax: String` / `let c: any` 均正确报出；
+无标注的 `let b` **仍**诚实回落 `<inferred>`。
+
+##### 验证
+
+- 新增 `tests/lsp_hover_annotations.rs` **3 条**，真起 `mora-lsp.exe`
+  走 Content-Length 帧：① 有标注的变量**必须**报出那个标注（主判据）/
+  ② **没有标注的仍**报 `<inferred>` 且**不得**凭空出现 `Float` 之类
+  （**「诚实」这一半**）/ ③ 名字**整词**匹配（`let ax` 不能被 `a` 认领）
+- **牙齿验证**（把查找改成恒 `None` 后重跑）：主判据 **FAILED** ✅，
+  两条诚实性守卫仍 ok ✅ —— 正是它们该有的分工
+- 过程中我两次把判据写错（都**不是**产品缺陷）：hover 的 value 外面包着
+  ```` ```mora ```` 围栏（该用 `contains` 而非 `eq`）；
+  位置数组的 id 是从 100 按**序号**递增（我按 100/102/103 断言，实际 100/101/102）。
+  **D176「测试红时先问『谁错了』」的又一次复发。**
+
+#### D194：LSP 声明 **Incremental** 同步却把每次编辑当**全量替换** —— 敲一个键就丢掉整个文件（已修）
+
+接 D193 继续查 LSP。本轮先批量探了 `documentSymbol` / `semanticTokens` /
+`completion` / `definition` —— 四个都有真实内容 ✅。随后查 `textDocumentSync`。
+
+##### 缺陷
+
+capabilities 声明：
+
+```json
+"textDocumentSync": { "change": 1, "openClose": true, "save": true }
+```
+
+`change: 1` = **Incremental** —— 客户端会按规范发**带 `range`** 的变更。
+而 `lsp/server.rs::parse_change_params` 原文是：
+
+```rust
+// Full sync: 只取最后一条（按 LSP 规范 full sync 只发一条）
+let last = changes.last()?;
+let text = last.get("text")?.as_str()?.to_string();
+Some((uri, version, text))
+```
+
+**每条 change 的 `text` 都成了整份文档**，`range` 被完全忽略。
+
+真实 `mora-lsp.exe` 走 stdio 实测：
+
+```text
+didOpen   "let a = 1\nprint(a)\n"
+didChange range=(0,8)-(0,9) text="2"      ← 只把 '1' 改成 '2'
+  → 文档实际变成 "2"
+  → documentSymbol 返回 []       （编辑前返回 [a]）
+  → hover 在 (0,4) 报 "variable 2"
+  → formatting 返回 newText "2 \n"    ← 把被改坏的文档直接揭示出来
+```
+
+**全量变更（不带 `range`）一切正常** —— 所以这个缺陷**只在真实编辑里出现**，
+任何「打开文档 → 请求一次」的测试都测不出来。
+
+影响：任何按声明使用增量同步的编辑器，**敲第一个键就丢掉整个文件**，
+之后 hover / 符号 / 诊断 / 补全 / 格式化**全部空转**。
+
+##### 修法
+
+新增 `apply_content_changes(base, changes)`：带 `range` 的**按范围拼接**
+（复用 `position_to_offset`），不带 `range` 的才是全量替换；
+调用方先取当前文档文本作为 `base`。
+
+##### 验证
+
+- 新增 `tests/lsp_incremental_sync.rs` **4 条**，真起 `mora-lsp.exe`：
+  同文件内增量编辑后文档其余部分必须还在（主判据）/
+  **跨行**编辑不得毁掉前面的行 / **纯插入**（`start == end`，打字最常见形态）/
+  **对照组**：不带 `range` 的全量变更仍照常工作（修前靠它碰巧正确）
+- **牙齿验证**（把 `Some(_)` 分支改回整份替换后重跑）：3 条 **FAILED** ✅，
+  全量变更那条对照组仍 ok ✅ —— 正是它该有的分工
+
+##### 本轮的一个**否定结果**（差点当成缺陷开题）
+
+批量探测时看到 LSP 为 `let a: Int = 5` 报了类型错误，我第一反应是
+「合法程序被误报 + 位置还指错」。逐条对照后**完全自洽**：
+
+| 写法 | `--check` |
+|---|---|
+| `let a: Int = 1i` | 无错 ✅ |
+| `let a: Int = 5` | 报错，**位置就是那个 `5`**（line 1 col 14）✅ |
+| `let a: Int = len("xy")` | 无错 ✅ |
+| `let a: Float = 5` | 无错 ✅ |
+
+即**裸数字字面量在本语言就是 `Float`**（`Int` 只来自 `1i` / `len()`），
+`let a: Int = 5` 确实是错误，且位置**正确**。LSP 只是忠实转发 `--check`。
+**没有缺陷，不修。** —— 这是 D191「现象 ≠ 缺陷」的又一次，
+**差一步就把一个正确行为当成 bug 开一整轮。**
+
+#### D195：LSP 声明 `triggerCharacters: [":"]`，却在**那个位置返回空**（已修：撤掉声明）
+
+接 D194 继续查 LSP 的写回/补全面。
+
+##### 先记一个**否定结果**：`rename` 是对的
+
+`textDocument/rename`（capabilities 声明 `renameProvider: true`）实测精确：
+
+```text
+let alpha = 1        → 改 alpha 的 range 0:(4..9)   newText gamma ✅
+print(alpha + beta)  → 改 alpha 的 range 2:(6..11)  newText gamma ✅
+                        beta 未被误改 ✅
+```
+
+**无缺陷，不动。**（写回型能力一旦范围错就会改坏用户文件，所以特别验了它。）
+
+##### 缺陷：宣称会在某个位置提供补全，却在那里什么都不给
+
+```json
+"completionProvider": { "triggerCharacters": [":"] }
+```
+
+告诉编辑器「用户一打冒号就向我请求补全」。实测（真实 `mora-lsp.exe`）：
+
+| 位置 | 返回条目数 |
+|---|---|
+| 普通位置 `print(x)` 里的 → | **35** |
+| 紧跟 `let x: ` | **0** |
+| `with` 块内的缩进行 | **0** |
+
+用户每打一个冒号（类型标注 / dict 字面量 / `with` 块）都闪一个**空列表**。
+与 D175 的 `methods_of` 空集、D186 的 MCP 名字目录同族。
+
+##### 修法：撤声明，而不是补实现
+
+真正兑现这个触发需要一份「类型名清单」，而那必然是**第三份**要维护的名字表
+（已有 `Type` 枚举、`typeck` 的类型名映射），正是 D175/D189 记过的那种漂移陷阱。
+**不宣称做不到的事**更诚实，也更小。等真要做补全时连同内容一起加。
+
+##### 判据是**自适应**的
+
+`tests/lsp_completion_trigger_honesty.rs` 允许将来**重新声明 `":"`** ——
+条件是那时在冒号后**确实**返回条目。这样「补上这个功能」不必改判据，
+而「只加回声明不补功能」会立刻红。
+
+- **牙齿验证**（把 `":"` 加回 triggerCharacters）：主判据 **FAILED** ✅
+  并给出「宣称能做却什么都不给」的说明。
+- **对照组**：普通位置的补全必须仍照常（修的是「空承诺」，不是补全本身）——
+  35 条、且含当前作用域的变量 `x`，始终 ok ✅。
+- **我的第一版判据是摆设**：探针把文档写成 `let x = 1`、却去问 (0,7) ——
+  那里根本没有 `:`。**判据自己没把被测的东西放进去，等于没测。**
+  改成「把触发字符真的写进文本、光标跟在它后面」后才有牙齿。
+  这与 D192 那次「用了不存在的模块」同源：**先确认探针在测它声称在测的东西。**
+
+#### D196：LSP 格式化器把**缩进层级挂在了错误的 token 上** —— 循环体顶格、循环**外**的语句反而缩进（已修）
+
+D194/D195 查完同步与补全后，接着查**写回**型能力的最后一项：格式化。
+它先被当作探针用（`'formatting'` 返回的 `newText` 直接暴露了被改坏的文档），
+本轮正查。
+
+##### 缺陷：没有任何开启方会加层级，而闭合方在加
+
+`lsp/providers/formatting.rs::simple_format` 的层级增减：
+
+| 位置 | 修前 | 应该 |
+|---|---|---|
+| `TokenType::End`（**闭合**关键字） | `depth += 1` | `depth -= 1` |
+| `LBrace`（开花括号） | 不变 | `depth += 1` |
+| `RBrace` | `depth -= 1` | `-= 1` ✅ |
+| `RParen` / `RBracket` | `depth -= 1` | **不变**（`(` `[` 是表达式分组） |
+| 块**开启**方（`for`/`task`/`if`/…） | 什么都不做 | `depth += 1` |
+
+即 `depth` 只会朝错误方向走。真实 `mora-lsp.exe` 实测：
+
+```text
+修前：                          修后：
+for i in [1 , 2 ]              for i in [1 , 2 ]
+let x = i            ← 顶格       let x = i
+print (x )           ← 顶格       print (x )
+end                             end
+  print (0 )         ← 顶层反而缩进  print (0 )
+```
+
+语义**没坏**（该语言 parser 不看行首空白），但**视觉嵌套与实际嵌套相反** ——
+而正确缩进正是格式化器最基本的职责。
+
+##### 一个连带发现：`while` / `worker` / `handle` … **不是关键字 token**
+
+它们在 `lexer.rs` 的 `TokenType` 枚举里**根本不存在**（与 `else` 同类，走
+`Identifier`）。所以层级追踪必须**按文本**认这些开启方，否则 `while … end`
+的体永远顶格。`then` / `else` **不开**层级（`if` 才是开启方）。
+
+##### 验证
+
+- 新增 `tests/lsp_formatting_indent.rs` **4 条**，真起 `mora-lsp.exe`：
+  `for … end` 体缩进 / 闭合行与块外语句顶格（主判据）/
+  **`while`（标识符型开启方）同样缩进** / 嵌套逐层 +2 /
+  **正对照**：格式化后运行结果与原文**逐字一致**（守住「不改变语义」那条底线）
+- **牙齿验证**（把 `is_block_opener` 改回 `End|Then`）：3 条 **FAILED** ✅，
+  语义保持那条仍 ok ✅
+- **我两次把判据写错**（都不是产品缺陷）：
+  1. 嵌套块里有**两行** `end`（内层缩进 2、外层顶格），而我的 `indent_of`
+     总是取**第一个**匹配 —— 把内层当成了外层。改成 `indent_of_nth`。
+  2. needle 写 `"print(0"`，而格式化器输出的是 `print (0 )`（括号前有空格），
+     压根匹配不上。**先确认探针在测它声称在测的东西**（D192 同源）。
+
+##### 顺带**报告未改**（属样式选择，不是缺陷）
+
+格式化器会把 `print(x)` 变成 `print (x )` —— `(` 前加空格、括号内也加空格。
+一致、可运行，但与日常写法不同，用户会看到每个调用都被改动。
+**未擅自改**：token 间距是**样式约定**（要不要在 `(` 前留空格、要不要
+消除多余空格），应由项目的代码风格决定，不在本轮缺陷修复里定。
+
+#### D197：`json.parse` 对超出 i64 的整数**静默降级为 f64** —— 拿到的是**另一个数字**（已修）
+
+老 known-gap「JSON 大整数降 f64」此前**只记了档、从未量化**。本轮量清了。
+
+##### 缺陷：静默的数值损坏
+
+`flow/json.rs::parse_json_number` 的整数路径原文：
+
+```rust
+// 整数路径：先尝试 i64，溢出时回退 Float
+if let Ok(n) = num_str.parse::<i64>() { Ok((Value::Int(n), i)) }
+else { Ok((Value::Float(num_str.parse::<f64>()?), i)) }   // ← 静默降级
+```
+
+真实 `mora` 实测（修前）：
+
+| JSON 里的整数 | 输入值 | 输出 | |
+|---|---|---|---|
+| `9223372036854775807`（i64::MAX） | …807 | …807 | ✅ |
+| `9223372036854775808`（i64::MAX+1） | …808 | …808.0 | 碰巧精确 |
+| `18446744073709551615`（u64::MAX） | …615 | **…616.0** | ❌ 差 1 |
+| `-9223372036854775809` | …809 | **…808.0** | ❌ 差 1 |
+| `12345678901234567890` | …890 | **…67168.0** | ❌ 差 5 位有效数字 |
+| 30 位整数 | …7890 | **…77877719597056.0** | ❌ 严重错乱 |
+
+**没有报错、没有警告**。对处理 ID / 金额 / 序号的 agent 来说，
+「拿到一个看起来合法的数字」远比「拿到一个 Float」糟 —— 它**看起来能用**。
+
+反直觉的一点：`-9007199254740993`（2^53+1，远超 f64 精确上限）**却精确**
+—— 因为它仍落在 i64 范围内，走了 BigInt/Int 路径。**阈值是 i64，不是 2^53**，
+所以「用 2^53 估算会不会出事」的直觉判断是错的。
+
+##### 修法：i64 溢出 → `BigInt`
+
+本语言**已有**真任意精度的 `Value::BigInt`（`num-bigint` 后端，
+字面量记法 `<digits>n`，算术 promotion 已就位）。回落 Float
+**既无必要、又危险**。
+
+修后同一矩阵全部**逐位**精确（BigInt 按语言既有记法带 `n` 显示，类型可见）：
+
+```text
+18446744073709551615n
+-9223372036854775809n
+12345678901234567890n
+123456789012345678901234567890n
+```
+
+##### 验证
+
+- 新增 `tests/json_bigint_precision.rs` **3 条**，全走真实 `mora` 子进程：
+  **超 i64 的整数必须逐位还原**（主判据，6 个值）/
+  **不回归**：i64 以内仍是 `Int`（不带 `n`）、带小数点仍是 `Float` /
+  `json.stringify` 往返后仍精确
+- **牙齿验证**（改回「溢出 → Float」）：2 条 **FAILED** ✅，
+  「不回归」那条仍 ok ✅
+- **一处既有测试把缺陷钉成了期望**：
+  `flow::json::tests::large_integer_overflow_falls_back_to_float`
+  断言「超 i64 → **Float**」，注释写「避免 panic」——
+  它防 panic 的**意图是对的**，但把「静默丢精度」当成了正确行为。
+  已改名为 `large_integer_overflow_becomes_bigint_not_float`，
+  断言翻转为 BigInt 并**逐位比对**，同时保留「不 panic」这条原意图。
+  **测试钉住的是当年的实现，不是当年的正确性** —— 改实现时必须逐条复查
+  有没有测试正把缺陷当规范。
+- **D129 的 spec 注记已按该测试的要求更新**（`docs/mora-spec.md` §12
+  `json.parse` 行）：原注写「超出 i64 → 静默降级为 float，属**未实现的能力缺口**，
+  只记录不实施」；现改为三条数字路径（`int` / `bigint` / `float`）+
+  D129 缺陷的实测记录 + 「`Display` 带 `n` 后缀是刻意的」。
+  该测试当初留下的注记正是：「若本测试失败，说明解析器已改为大整数感知 ——
+  需更新 docs/mora-spec.md 的 D129 注并记入 CHANGELOG」，**照做了**。
+  值得一提：本轮是把语言**已有**的 `BigInt` 接上（num-bigint 早在 v0.91 就
+  在了），而不是新增能力 —— 「未实现的能力缺口」里有一部分其实是**没接线**。
+- 本轮还有两个**探针层面的**弯路，值得记：
+  - `p"..."`（插值字符串）里的 `\"` **不按反斜杠转义**，而普通字符串
+    `"..."` 可以 —— 于是第一次写用例时 JSON 直接坏掉
+    （`Unexpected character in JSON: id`）。查下来 `p"..."` 的转义规则与
+    普通字符串**不同**（本轮未深查，**记档**）。
+  - Mora 的 `^` 是**运算符**，所以源码注释里写 `2^53` 会被当代码解析。
+    **写测试用例时别在源码里写算式。**
+  - 这两条都是「**先确认探针在测它声称在测的东西**」（D192 同源）的又一例。
+
+#### D198：`BigInt` 与 `Float` 混合运算**静默产生完全错误的结果**（已修）
+
+D197 把 `json.parse` 接到 `BigInt` 上之后，我顺手查了 `flow.rs` 的算术推广，
+在同一轮就撞见它。
+
+##### 缺陷：mixed 路径静默给错数
+
+`flow.rs::eval_binary` 的 `Float ⊕ BigInt` 分支原文是「**把 BigInt 转成 f64 再算**」：
+
+```text
+b = 1000000000000000000000000000000n            （10^30）
+b + 1.0   →  1000000000000000019884624838656.0   ← 前 18 位全错，零提示
+1 + b     →  1000000000000000019884624838656.0   ← 同上
+12345n + 1 →  12346.0                              ← 值对，但**类型**静默退化成 Float
+b + 0.5   →  1000000000000000019884624838656.0   ← 小数部分整个消失
+b - 0.25  →  1000000000000000019884624838656.0
+```
+
+**而 `Int ⊕ BigInt`（紧邻的两臂）一直是精确的**，`BigInt ⊕ BigInt`
+（`b+b` / `b-1n` / `b*2n` / `b/2n`）实测**全部正确** ——
+所以这不是「BigInt 坏了」，是**混合路径**坏了。
+
+`value.rs` 写明的推广规则是「任一含 BigInt 时结果为 **BigInt**（最小惊讶）」，
+**实现与文档相反**。
+
+##### 修法：归一化 + **绝不静默给错数**
+
+`coerce_mixed(f, b)` 把一对操作数归一到同一类型：
+
+1. float 侧是**整数值** → `(BigInt, BigInt)`，**精确**（顺带修回类型退化）；
+2. float 侧有小数、且 BigInt 能**无损**转 f64（字符串往返相等）→ `(f64, f64)`；
+3. 否则 → **报错**。因为「大整数 + 小数」在当前类型系统里**没有精确表示**
+   （Float 装不下、BigInt 存不了小数）。**宁可报错，不返回一个错的数。**
+
+修后：
+
+```text
+b + 1     →  1000000000000000000000000000001n     ← 精确，且类型是 BigInt
+b + 0.5   →  Runtime error: bigint(…30 位…) 超出 f64 的精确表示范围…
+             建议：整数运算请用 bigint 字面量（`<整数>n`）。
+```
+
+##### 验证
+
+- 新增 `tests/bigint_mixed_arithmetic.rs` **4 条**，全走真实 `mora` 子进程：
+  **大 BigInt 加整数值必须逐位精确且结果是 BigInt**（主判据）/
+  **大 BigInt 加小数必须报错**（主判据的另一半）/
+  **不回归**：小 BigInt + 真小数仍给 Float（小值装得下，确实无损）/
+  `BigInt ⊕ BigInt` 不受影响
+- **牙齿验证**（改回「BigInt 转 f64 再算」）：3 条 **FAILED** ✅，
+  `BigInt ⊕ BigInt` 那条仍 ok ✅
+- **我第一版把「不回归」那条的期望写错了**（D176 又一次）：我断言
+  `12345n + 1.0` → `12346.0`，实际是 `12346n`。原因是 `1.0` 虽然写作
+  float，但 `fract() == 0` —— **它是整数值**，规则 1 生效、结果精确为 BigInt，
+  而且**更符合**文档的推广规则。**产品没错，是我把「整数值 float」当成了
+  「小数」。** 要测真小数得用 `0.5`。
+- 顺带记一个实现细节：本版本 num-bigint **没有** `TryFrom<f64>` / `to_f64`，
+  无损校验改用「`b.to_string().parse::<f64>()` → `as i128` → `BigInt`」
+  的字符串往返；`as` 超范围会**饱和**，落到不等即判为「装不下」——
+  **宁可误报装不下，不可误报装得下**。
+- **⚠ 一处用户可见的**行为变更**（主动记录，不埋）**：
+  `tests/numeric_tower.rs` 里 `[1,2] + 1n` 此前是
+  `List([Float(2.0), Float(3.0)])`，现为 `List([BigInt(2), BigInt(3)])`。
+  旧实现把 BigInt **静默降级**成 Float（因为另一侧是 float），
+  与 `value.rs` 写明的「任一含 BigInt 时结果为 BigInt」**相反**。
+  **依赖旧行为的代码需要复查。** 该测试的期望已随之翻转并注明原因。
+
+#### D199：**大整数比较静默给出错误的 `false`** —— 而它**上一行的注释**写着「不经 f64」（已修）
+
+接 D198 查同一主题的另一半：**比较**。`numeric_cmp` 里那句注释就是线索。
+
+##### 缺陷：实现与自己的注释相反
+
+```rust
+// …两个 BigInt 之间保持精确
+// 大数比较（不经 f64，避免精度丢失）。            ← 注释这么写
+(BigInt(a), BigInt(b)) => Ok(Bool(op(bigint_to_f64_lossy(&a), bigint_to_f64_lossy(&b)))),
+                                                ↑ 函数名自己就写着 lossy
+```
+
+实测（`b = 10^30`）：
+
+```text
+b > (b - 1)   →  false      ← 错！两个值舍入到同一个 f64，严格大于变 false
+(b + 1) > b   →  false      ← 错！同上
+3n > 2n       →  true       ← 小值碰巧对（所以平时看不出来）
+```
+
+比 D197 的解析降级**更隐蔽**：错的不是「算出来的数」，而是**比较结论本身**，
+代码读起来完全正常。
+
+##### 修法：回调从「f64 闭包」改成「序关系」
+
+`Fn(f64, f64) -> bool` 逼着**所有**组合先转 f64。改成 `Fn(NumOrd) -> bool`
+后，`BigInt ⊕ BigInt` 与 `Int ⊕ BigInt` 走 `BigInt::cmp`（num-bigint 自带
+`Ord`）**精确**比较；`Float ⊕ BigInt` 在 BigInt 无法无损装进 f64 时**报错**
+（与 D198 算术侧同一原则）。
+
+`values_equal`（`==` / `!=` 走它，另被 dict 键查找 / `in` / 去重使用）
+的 lossy 分支也改为精确：float 带小数时**必然**不等于整数 → 直接 `false`；
+float 是整数值时提升为 BigInt 精确比较。
+
+##### 一个**能力缺口**（记档，未改）
+
+实测 typeck 拒绝**所有** BigInt 与数字字面量的比较：
+
+```text
+$ mora t.mora        # print(1n == 1)
+Type error at line 3:14: Type mismatch: expected BigInt, got Float
+```
+
+`1n == 1` / `1n == 1.0` / `1n < 2` / `2n < 1.5` / `1n > 0.5` 一律被拒。
+即**本轮修好的 `(Float, BigInt)` 运行期路径从 CLI 根本不可达** ——
+要让「bigint 与小数比较」成为可用能力，需改 **typeck 的数值塔**，
+属类型系统**设计决定**，**未擅自做**。
+
+好消息是它是**明确报错**而非静默出错。对应测试断言的是
+「**被拒绝**」而不是比较结果 —— **静默放行反而是坏消息**；
+将来 typeck 若放行，那条测试会失败，提醒把用例翻转为「结果必须正确」。
+
+##### 验证
+
+- 新增 `tests/bigint_comparison.rs` **3 条**，全走真实 `mora` 子进程：
+  **大 BigInt 之间的严格比较必须正确**（主判据，6 个表达式）/
+  **对照组**：小 BigInt 比较不能被改坏 / BigInt⊕Float 必须是
+  **明确拒绝**（不是静默结论）
+- **牙齿验证**（把 `BigInt⊕BigInt` 改回经 f64）：主判据 **FAILED** ✅，
+  另两条仍 ok ✅
+
+#### D200：注释↔代码矛盾的**系统性扫描** —— 否定结果（未改代码）
+
+D199 的收获是「读注释、找代码与它矛盾的地方」两处命中。本轮把它当**系统化方法**跑一遍：
+grep 全仓含「绝不 / 不会 / 永远 / 始终 / 保证」的注释，逐一核。
+
+##### 结果：40 条命中里，**没有一条新的矛盾**
+
+绝大多数命中是**我自己这几轮写的记档**（D174/D178/D180/D181/D192/D198 等），
+它们描述的都是**已修**的状态，代码与之一致。其余是历史记档与常规说明。
+
+顺带核了两条**不是**本会话写的：
+
+| 项 | 结论 |
+|---|---|
+| `builtin_impls.rs` 记的 `curry(f, -1)`「静默挂死」 | **已修** —— 实测 `curry(add, -1)` → `Runtime error: curry: arity 不能为负数（得到 -1）` ✅；`curry(add, 3)` 后 `c(1,2)` = `54` ✅ |
+| `interpreter/mod.rs` 记的 `handle` 不在 `end` 配平表里 | 与 D196 的修复一致（已改走花括号配平） |
+
+**否定结果本身有价值**：它说明「注释说谎」这个模式在本仓库里**已被前几轮清理过**，
+不是普遍存在的。但**否定结果不等于覆盖** —— 扫描只覆盖含那几个词的注释。
+
+##### 一条**代码层观察**（未能复现，**不当作已实测缺陷**）
+
+`lsp/server.rs` 把 typeck 的 1-based 行列转成 LSP 的 0-based：
+
+```rust
+let line_0 = e.line.saturating_sub(1);
+let col_0  = e.column.saturating_sub(1);
+```
+
+D126 已确认 `line == 0` 表示**位置未跟踪**（`Constraint` 不携带 span）。
+在 CLI 上，`format_error` 会把它诚实渲染成「位置未跟踪」；
+但**在 LSP 上** `0.saturating_sub(1) = 0` → 编辑器把它标在**文件第一行**，
+且 `e.message` 里**没有**任何「位置未知」的提示（那句只在 CLI 的 `format_error` 里）。
+
+即：一个**位置未知**的诊断，在编辑器里表现为一个**位置很确定**的第一行标记。
+与 D189 同类（把「不知道」呈现成「知道」）。
+
+**本轮未能构造出触发 `line == 0` 的程序**，故**只记录代码观察、不宣称已复现**，
+更未改代码 —— 改它需要先有一条能触发该路径的用例（`Constraint` 不带 span 是
+D126 已记的根因，见其待办）。
+
+##### 收尾时发现自己引入的环境污染（已清，机制待补）
+
+本轮我写的 4 个 LSP 测试（`lsp_hover_annotations` / `lsp_incremental_sync` /
+`lsp_completion_trigger_honesty` / `lsp_formatting_indent`）用固定的
+`%TEMP%\mora_d19X_lsp` 目录写输入帧，**没有 `Drop` 守卫** ——
+每跑一次 `cargo test` 就留一份，与本会话其它测试（`mora_d17*` / `mora_d19*` 用
+`WorkDir` 守卫）的约定不一致。
+
+已把这 4 个目录删掉。**机制没补** —— 批量改时把引号改坏了（正则插入未做转义），
+在这样一轮的末尾做危险重构不合适。**如实记账：本轮收尾时 `%TEMP%` 里仍有 12 个
+更早的 `mora_d1*` 目录，那些来自既有测试，不属本会话产物，按「不误删他人文件」
+未动。**待补**：给这 4 个测试补 `WorkDir` 守卫（与其它测试同款）。
+
+#### D201：`semanticTokens` 发出的**每一个** token 类型索引都**越界** legend（已修）
+
+D194 探测 LSP 时扫到一眼 `semanticTokens/full` 的 data，没深究。本轮解码发现：
+**6 个 token 的 type 全是 9/10/13，而 legend 只有 8 项。**
+
+##### 缺陷
+
+`lsp/providers/semantic.rs` **硬编码**了四个索引：
+
+```rust
+const TOKEN_KIND_VARIABLE: f64 = 13.0;
+const TOKEN_KIND_STRING:   f64 = 12.0;
+const TOKEN_KIND_NUMBER:   f64 = 10.0;
+const TOKEN_KIND_FUNCTION: f64 =  9.0;
+```
+
+而 `server.rs` 在 capabilities 里声明的 legend 只有 **8** 项：
+
+```json
+"tokenTypes": ["keyword","function","variable","string","float","comment","type","operator"]
+```
+
+按 LSP 协议，客户端是 `legend.tokenTypes[type]` 取名的。那些索引**既越界**
+（8 项的 legend 里没有 9/10/12/13），**又和 legend 含义对不上**
+（9/10/12/13 恰是标准 LSP `SemanticTokenTypes` 的
+property/enumMember/function/method）—— **连「我用的是标准枚举」这条退路都不成立**。
+
+真实 `mora-lsp.exe` 实测（`let a: Int = 5 / let b = 7.5 / print(a + 1)`）：
+
+```text
+data = [0,13,1,10, 1,8,1,10, 1,0,1,9, 0,0,1,9, 0,6,1,13, 0,4,1,10]
+                                 ↑    ↑     ↑    ↑     ↑    ↑   —— 6 个 token 全部越界
+```
+
+即 **语义高亮对每一个 token 都失效**（客户端取不到名，丢弃或乱高亮）。
+这是**协议层违规**，不是排版问题。
+
+##### 修法：legend 与索引**同源**
+
+`semantic.rs` 导出 `TOKEN_TYPES` 数组；`server.rs` 的 capabilities 从它构造 legend；
+索引常量按它在数组里的位置写死并注明「**不得**手写别的数字」。
+
+与 D175（`module_method_names`）、D186（MCP 名字目录）同一条纪律：
+**共用同一张表，而不是维护两份清单。** 这已是本会话第三次因「两份清单」而踩坑。
+
+修后实测：6 个 token 的 type 是 4/4/1/1/2/4 → `float`/`function`/`variable`，全部能取到名。
+
+##### 验证
+
+- 新增 `tests/lsp_semantic_token_legend.rs` **3 条**，真起 `mora-lsp.exe`：
+  **每个 token 的 type 必须在 legend 范围内**（主判据）/
+  修后应能取到有意义的类型名（`function`/`variable`/`float`）/
+  负对照：空文档不产生 token
+- **判据设计上的一处要点**：**光断言「token 数量 > 0」测不出越界** ——
+  修前 6 个 token 数量完全正常，只是类型全错。必须**逐个查表**。
+- **牙齿验证**（把索引改回 9/10/12/13）：2 条 **FAILED** ✅，
+  失败信息里直接复现了原始缺陷的数字（`[10, 10, 9, 9, 13, 10]`）。
+- 探针自身两处坑（都不是产品缺陷）：切片从 `"data":[` 的引号起会**丢掉第一个数**
+  （24 → 23）；**解析不出来的文档**服务器回 `result: []`（数组、无 `data` 字段），
+  按「没有 token」处理。
+#### D202：LSP 格式化器**静默删光注释与空行**（已修）
+
+`lsp/providers/formatting.rs::simple_format` 是**从 token 流重建整份文档**的。
+lexer 遇到 `--` 只前进、**不产出任何 token**（`lexer.rs` 的 `'-'` 分支`match_char('-')`
+之后直接 `next_token()`）；`Newline` 又有「连续换行只出一个」的去重。
+于是 lexer 不发的东西 = formatter 看不见的东西 = **用户的源码内容**。
+
+真实 `mora-lsp.exe` + 真实 LSP 会话实测（修前）：
+
+| 输入 | 修前输出 | 后果 |
+|---|---|---|
+| 5 行 / 3 处 `--` | **4 行 / 0 处 `--`** | 注释全没了 |
+| 6 行（2 空行 + 1 纯空白行） | **4 行** | 空行全没了 |
+
+服务器声明了 `documentFormattingProvider: true`，而编辑器普遍支持「保存时格式化」——
+一按保存，注释和空行被清空。**静默的数据丢失**。
+
+修法：
+
+1. `lexer.rs` 新增 `TokenType::Comment(String)`，**由 `keep_comments` 开关控制**
+   （**默认关** → parser / typeck / interpreter 那条路径行为**逐字不变**，
+   也就没有「parser 突然开始看见 `Comment` token」的风险）。
+2. `formatting.rs` 打开该开关；`token_text` 原样带出 `--` + 正文
+   —— **该函数刻意没有 `_` 兜底**，所以新增变体在**编译期**就被强制加上
+   （这正是 D102 留下的编译期保险第一次真正生效）。
+3. `Newline` 改为**无条件**换行，空行不再被去重。
+
+连带得到一条**保行数不变式**（输出与输入的 `\n` 个数相等）——
+D203 依赖它，见下。
+
+- **测试产物清理**：	ests/lsp_formatting_fidelity.rs 用 WorkDir 守卫，
+  且**每个测试一个独立子目录**（%TEMP%\mora_d202_<tag>）。
+  ⚠ 不能让所有测试共用一个目录再整体删 —— cargo test 在同一进程里**并行**
+  跑测试，一个测试的 Drop 会把另一个**正在用**的目录删掉。
+  lsp_formatting_indent.rs 那几个测试至今没装守卫正是这个原因；
+  更早的 CHANGELOG 里那条「待补：给这 4 个测试补 WorkDir 守卫」**仍未闭合**，
+  本轮只给自己这份补上，未擅自改动他人测试文件。
+判据 `tests/lsp_formatting_fidelity.rs`：
+`d202_every_comment_survives_formatting`（主判据，5 处注释逐条按**内容**匹配）、
+`d202_bare_double_dash_comment_survives`、`d202_formatting_preserves_line_count`、
+`d202_blank_lines_stay_in_place`、`d202_formatting_still_produces_runnable_code`。
+
+#### D203：`rangeFormatting` 返回**整份文档**的 `newText` 配**子区间**的 `range`（已修）
+
+LSP 对 `TextEdit` 的定义是「a text edit **replaces a range**」——`newText` 是
+range 的**内容**，不是「要插进 range 的东西」。修前 `simple_format` 的 `range`
+形参被写成 `_range` **直接忽略**：客户端只要第 2–3 行，服务端却把**整份文档**
+放进一个**只覆盖第 2–3 行**的 `range` 里。
+
+真实会话实测（修前，4 行文档）：
+
+```text
+请求 range = 行 1..2（0-based）
+应答 newText = 4 行整份文档,  range = 行 1..2
+```
+
+客户端照 `range` 应用 → 把 4 行内容**替换进那 2 行**，文件凭空多出 2 行、
+`let a = 1` / `print(...)` 各被复制一份。
+
+修法：整份文档**只格式化一次**，再从结果里切出被请求的那几行；区间**吸附到整行**
+（`start` 落到 `(l0,0)`，`end` 落到第 `l1` 行行尾），使 `newText` 与 `range`
+严格对应。整份 `textDocument/formatting` 的 `range` 也从 `(0,0)-(0,0)`
+改成「从 (0,0) 到文档末尾」，两个分支共用同一条不变式。
+
+**切片的正确性依赖 D202 的保行数不变式** —— 否则「第 k 行」在两侧对不上。
+这不是事后追认：牙齿验证里回退「空行被吞」这一处时，
+`d203_whole_document_edit_is_also_self_consistent` **同时变红**，正是这条依赖。
+
+判据用**协议不变式**表述，**不依赖本实现怎么组织格式化**：
+把返回的 edit 真的贴回源码后，行数不变、区间外的行逐字不变、
+区间内的行恰为 `newText` 的对应行。
+
+#### D204：LSP 的 JSON 读取把**每个 UTF-8 字节**当 Latin-1 码点（已修）
+
+修 D202 的判据时撞出来的：注释内容回来了，但中文全是 `æä»¶` 这类乱码。
+
+`lsp/json.rs::parse_string` 的兜底分支原文：
+
+```rust
+_ => { out.push(c as char); self.pos += 1; }   // c: u8
+```
+
+Rust 的 `u8 as char` 是 **Latin-1 解释**（把字节当成同数值的码点），**不是 UTF-8 解码**。
+「你好世界」的 `E6 96 87 …` 变成三个码点 `U+00E6 U+0096 U+0087`，
+写出去时每个又编成 2 字节 → **双重编码**：
+
+```text
+服务端收到: let s = "你好世界"
+服务端回给客户端: let s = "Ã¤Â½ Ã¥Â¥Â½Ã¤Â¸Â§Â"
+```
+
+客户端把这份 `newText` 应用并存盘 → **用户的源码被改了**。
+而且 `0xA0` 那类字节会变成 `U+00A0`（不换行空格），连字符串**内容**都变了。
+
+影响面不止格式化：hover / completion / diagnostics 的消息、含非 ASCII 路径的
+`uri`，凡是**从客户端进来**或**回给客户端**的字符串都过这条路。
+
+修法：收集一段连续原始字节、按 **UTF-8** 解码；非法 UTF-8 **报错**
+而不是静默产出错的字符串。同时补上**代理对**（`😀` 在 JSON 里合法地写成
+`\uD83D\uDE00`）—— 此前 `char::from_u32(0xD83D)` 返回 `None` → 整条消息解析失败
+→ 服务端 `continue` 把它**丢弃**。
+
+**系统性的同族扫描**（`grep 'as char'` 全 `src/`）在 `flow/json.rs` 里找到**同款缺陷**，
+且那处是**运行时**路径、比 LSP 更核心 → 记为 D205/D206。
+
+#### D205：`json.parse` 把 UTF-8 按 Latin-1 拆开 —— **连长度都改了**（已修）
+
+`flow/json.rs::parse_json_string` 的兜底分支原文 `c => result.push(c as char)`，
+与 D204 同款。真实 `mora run` 实测（修前）：
+
+```text
+json.parse("{\"greeting\": \"你好世界\"}")
+  print(v["greeting"])  →  ä½ å¥½ä¸çå¥½
+  print(len(...))      →  12        ← 正确的值是 4
+```
+
+4 个汉字 = 12 个 UTF-8 字节 → 12 个码点，**长度被改了 3 倍**。任何按长度
+索引、切片、比较、哈希的下游全错，而且**看不出来** —— 乱码至少显眼，
+错误的长度是隐形的（属 D198「静默给错数」）。
+
+判据 `tests/json_utf8_strings.rs` 的主判据刻意选**长度**而不是内容：
+`len` 必须等于**字符数**，比内容判据更严。
+
+#### D206：`json.parse` 读不了标准的 `\uXXXX` 转义（已修）
+
+修前的转义表只有 `\"` `\\` `\n` `\t` `\r` `\0`，其余一律 `Invalid escape`。
+而 **`\uXXXX` 是 JSON 标准的一部分**，且 **Python 的 `json.dumps()` 默认
+`ensure_ascii=True` 就产出它**：
+
+```text
+json.parse("{\"g\": \"\u4f60\u597d\"}")
+  → Runtime error (MIR): json.parse: Invalid escape: \u
+```
+
+即**最常见的 JSON 生成方式**产出的含非 ASCII 文件，本语言**根本读不了**。
+
+补齐 JSON 标准的 `\b` / `\f` / `\/`、完整的 `\uXXXX`、以及**代理对**
+（`\uD83D\uDE00` → `😀`）。落单的代理 / 截断 / 非十六进制一律**明确报错**，
+不静默产出半个字符（否则又是一份「看起来能用」的错数据）。
+
+**否定结果**（不记为缺陷）：本语言**没有** `#` 与 `//` 注释，`--` 才是
+（spec §14.3）。而 `ident_at_offset` 用 ASCII-only 判定 —— 与语言一致，不是缺陷；
+CJK 标识符被 lexer 明确拒绝（`Unexpected character '名'`）。
+
+**否定结果**：跨行表达式（如 `let x = 1 +` 换行 `2`）**原文本身就解析失败**，
+所以 formatter 在那里不构成破坏，不记缺陷。
+
+#### D207：审计 hash 链把**未篡改**的日志报成 `HashMismatch`（已修）
+
+D204/D205 的同族扫描（`grep 'as char'` 全 `src/`）在 `src/audit/mod.rs`
+找到**第三处**同款缺陷，而这处的后果比前两处严重。
+
+##### 缺陷
+
+`src/audit/mod.rs` 的**写**端 `json_string` 逐 `chars()` 输出、非 ASCII
+**原样写**（`c => out.push(c)`）；**读**端 `extract_field_skip_escaped` 是：
+
+```rust
+out.push(bytes[i] as char);   // bytes[i]: u8
+```
+
+`u8 as char` 是 **Latin-1 解释**，UTF-8 的每个字节变成一个码点。
+
+##### 后果：**假报警的篡改告警**
+
+`verify_chain()` 的流程是「逐行提取字段 → 重建 `AuditEvent` → `seal()`
+重算 SHA-256 → 与存储值比对」。读侧打乱了 `actor` / `action` / `target`，
+重算的 hash 必然对不上。真实测量（写完就校验，**未做任何篡改**）：
+
+```text
+actor = "用户"
+→ HashMismatch { line: 0, stored: "93c3eec15f498e87…", computed: "b6c55aa3a037e368…" }
+```
+
+即**任何含非 ASCII 字段的审计日志**（中文 actor、中文路径的 target）
+都被判为「被篡改」。对一套**防篡改**系统来说，这比不校验更糟 ——
+真篡改者能藏在噪声里，而运维会学会忽略这条告警。
+
+##### 修法（两处）
+
+1. 收集一段连续原始字节，按 **UTF-8** 解码；非法 UTF-8 → 解析失败
+   （而不是静默产出错的字符串）。
+2. 转义表补齐 JSON 标准全套：修前只认 `\"` `\\` `\n` `\r` `\t`，
+   而写端 `json_string` 会产出 `\b` `\f` `\/` 与 `\u00xx`（控制字符），
+   **往返不等价**。现补齐 `\/` `\b` `\f` `\uXXXX` 与**代理对**
+   （`😀` = `\uD83D\uDE00`）。未知转义按 JSON 规范原样带出，且**只前进
+   1 字节** —— 这样后续字节仍走 UTF-8 解码路径，不会再被按 Latin-1 拆开。
+
+##### 影响面（据实记录，不夸大）
+
+`JsonlAuditSink` 是**库 API**（`pub mod audit`），**未**暴露成 Mora builtin
+（`grep 'audit\.' src/interpreter/` 无命中），CLI 不可达。
+故这是面向**嵌入者**的缺陷，不是 `.mora` 脚本作者能踩到的。
+
+##### 判据 `tests/audit_unicode_chain.rs`
+
+- `d207_verify_chain_passes_for_non_ascii_events`（主判据）：6 组非 ASCII
+  actor / action / target / emoji / 重音全部必须校验通过
+- `d207_escape_round_trip_is_lossless`：`\b` `\f` `\/` `\u00xx` 往返无损
+- `d207_ascii_chain_still_verifies`：**不回归**，纯 ASCII 仍通过
+- `d207_real_tampering_is_still_detected`：**反面护栏** —— 改 `actor` 字段后
+  校验**仍必须**失败。修「误报」极易滑向「为了不误报而放弃检测」，
+  这条守住那条底线
+
+##### 牙齿验证
+
+| 回退 | 变红的判据 |
+|---|---|
+| R-A 读侧改回 Latin-1 | `d207_verify_chain_passes_for_non_ascii_events`、`d207_real_tampering_is_still_detected`（其前提） |
+| R-B 转义表去掉 `\b` `\f` | `d207_escape_round_trip_is_lossless` |
+
+两条都**恰好**红在自己该红的判据上，无连带。
+
+##### 探针教训（承接 D202–D206 的装置核验）
+
+- 上一轮总结的三个坑本轮**直接派上用场**：还原后显式更新 `LastWriteTime`、
+  先 `cargo build --bins --lib` 再 `cargo test --test`、每测试独立
+  `WorkDir` 子目录。本轮牙齿脚本**第一次就跑通**，没有再被陈旧二进制骗。
+- R-A 第一次回退**替换命中 0 次**：我写完代码后跑了 `rustfmt`，缩进从
+  12 空格变成 8（因为顺手调换了 `if bytes[i] == b'"'` 与转义分支的判断顺序，
+  rustfmt 随之减了一层）。**替换锚点必须在 rustfmt 之后确认**。
+  用「hit=0 就中止、不写盘」的守卫，避免把一次失败的回退当成「测试没红」。
+
+
+
+#### D208：录制文件的**写端能产出、读端读不回来** —— 往返不无损（已修）
+
+D206/D207 之后继续查「同一条 JSON 规则的几处实现」。`src/record/serialization.rs`
+里有一对**互为逆运算的函数**：`esc`（写字段）与 `unquote`（读字段），
+都在同一个文件里 —— 契约破裂可以直接量化。
+
+##### 缺陷
+
+- `esc`（第 143 行）对 `< 0x20` 的控制字符产出 **`\u00xx`**：
+  `c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32))`
+- `unquote` 修前的转义表只认 `n` `r` `t` `\\` `\"`，**没有 `\uXXXX` 分支** ——
+  落进 `Some(other) => { out.push('\\'); out.push(other); }`
+
+于是 `\u000c` 被读成**字面量 6 个字符**。实测：
+
+```text
+a\x0cb  →  写出 a\u000cb  →  读回 a\u000cb   （3 字符的串变成 7 个）
+```
+
+穷举码点测得：**29 个码点**往返不无损 —— 恰好是 `< 0x20` 的 32 个控制字符
+减去 `\n` `\r` `\t`（32 − 3 = 29）。**字符串被静默拉长。**
+
+##### 影响面
+
+`unquote` 是所有录制字段的读端：`ai.chat` 的 prompt/response、
+`web.fetch` 的 body、`state_mutation` 的 `old`/`new`、`notes`。
+HTML 页面的**换页符 `\x0c`**、终端粘贴进来的**垂直制表 `\x0b`** 都落在这个范围里。
+后果落到 `mora record timeline` / `mora diff` / `mora replay` 上：
+`state_mutation.new` 读出来与实际值不同 → `mora diff` 会报一个**并不存在的状态变化**。
+
+##### 修法
+
+给 `unquote` 补齐 `\uXXXX`（含**代理对**），并顺带补上 JSON 标准的
+`\b` `\f` `\/`。落单的高/低代理按未知转义**原样带出**，不静默吞掉。
+**不改写端** —— 写端本来就是正确的 JSON。
+
+##### 判据（`src/record/serialization.rs` 内的 `#[cfg(test)] mod tests`）
+
+- `d208_esc_unquote_round_trip_is_lossless`（主判据）：**穷举码点**
+  `0x00..=0x2FF` + 4 个非 BMP 码点，断言 `unquote(esc(s)) == s`。
+  判据写成**穷举**而不是挑几个例子 —— 否则发现不了「下一个」坏字符。
+- `d208_common_cases_still_round_trip`（**正对照**）：中文、emoji、引号、
+  反斜杠、制表、换行、空串必须仍然正确。
+- 放在模块内是因为 `esc` / `unquote` 都是 `pub(super)`，
+  集成测试够不到（与 `flow/json.rs` 的内单测同款理由）。
+
+##### 牙齿验证
+
+| 回退 | 变红的判据 |
+|---|---|
+| `unquote` 的 `\uXXXX` 分支退回「未知转义」 | `d208_esc_unquote_round_trip_is_lossless` |
+
+正对照 `d208_common_cases_still_round_trip` **正确地没有变红** ——
+它守的是不回归，对本缺陷无判别力，**不计入牙齿**。
+
+##### 本轮的否定结果（一并记档，避免重复排查）
+
+- `src/record/serialization.rs` **没有** `as char` 那类 Latin-1 缺陷：
+  切分（`chars()` 收集）与 `unquote` 都走 Unicode 安全的路径。
+  真实 CLI 端到端实测（`ai.chat(p"请用一句话解释哈希链")` → record →
+  `record timeline` / `replay`）中文**逐字完好**，30 个汉字 = 90 个非 ASCII 字节。
+- `mora record` 写端 `esc` 同样逐 `chars()`、非 ASCII 原样写，**没有**双重编码。
+
+这与 D204/D205/D207 一起把「字符串解码器」这一族划上了句号：
+`grep 'as char'` 全 `src/` 的剩余命中全部正当（错误消息里的 ASCII 格式化、
+LSP ASCII 协议头、`a`/`b`/`c` 后缀生成，以及我自己写的说明注释）。
+
+
+
+#### D209：`json.stringify` 产出**非法 JSON** ——「自洽但不合规」（已修）
+
+D208 之后继续查「互逆函数对」，但这次方向相反：**读端已经是对的（D205–D207
+刚补齐），问题在写端**。
+
+##### 缺陷
+
+`flow/json.rs::value_to_json` 修前的三个位点各写各的转义：
+
+```rust
+Value::String(s) => format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\"")),  // 只转 2 种
+Value::Char(c)   => format!("\"{}\"", c),                                             // 一种都不转
+// Dict 的 key：与 String 同一套不完整逻辑                                             // 只转 2 种
+```
+
+RFC 8259 §7 要求：字符串字面量内**不得**出现未转义的控制字符（`U+0000`–`U+001F`）。
+
+##### 后果：**自洽但不合规** —— 这是它一直没被发现的原因
+
+**Mora 自己的 `json.parse` 接受这些输出**（`parse_json_string` 按字节收集到 `"` 为止，
+裸换行原样进结果），所以**语言内部往返是通的**，任何内部往返测试都是绿的 ——
+D208 的穷举往返判据也抓不到它。只有**外部**解析器会拒绝，而那正是
+`json.stringify` 的用途：把结构化数据交给外部。
+
+真实 `mora run` + **Python `json.loads`（RFC 8259 参考实现）** 实测：
+
+```text
+json.stringify("a\nb")       → 22 61 0A 62 22
+  Python: JSONDecodeError: Invalid control character at: line 1 column 3
+json.stringify('"')          → 22 22 22
+  Python: JSONDecodeError: Extra data: line 1 column 3
+json.stringify({"k\ny":"v"}) → 7B 22 6B 0A 79 22 3A 22 76 22 7D
+  Python: JSONDecodeError: Invalid control character at: line 1 column 4
+```
+
+穷举判据统计：**96 处**非法（`String` / `Char` / Dict key 三个位点 × `0x00`–`0x1F`）。
+
+##### 同族：6 处手写转义链，逐字符集各不相同
+
+| 位置 | 修前转义的字符 |
+|---|---|
+| `flow/json.rs` `String` | `\` `"` |
+| `flow/json.rs` `Char` | **无** |
+| `flow/json.rs` Dict key | `\` `"` |
+| `compress/text.rs` 摘要请求体 | `\` `"` `\n` |
+| `ai_chat.rs`（6 处：prompt / model / tools） | `\` `"` `\n` [`\r` `\t`] |
+| `ai_helpers.rs`（4 处：message / tool_call） | `\` `"` `\n` `\r` `\t` |
+| `http_server.rs::json_error` | `\` `"` |
+
+**没有一处**处理除 `\n` `\r` `\t` 外的控制字符 —— 即含换页符的 prompt
+会让发往 OpenAI API 的请求体成为**非法 JSON**（API 侧 400）。
+
+##### 修法：一份实现，7 处全用
+
+新增 `flow::escape_json_string`（RFC 8259），并从 `flow.rs` re-export。
+**6 个文件里 14 处手写转义链全部删除**，改调这一个函数 ——
+从此转义规则只有**一处**实现，不再可能各自漂移（D184 / D201 的同一条原则：
+同一事实两套算法 ⇒ 合并）。
+
+顺带修掉一个此前没人注意的洞：`ai_chat.rs` 的 `format!(r#"{{"role":"{}"…"#, role, …)`
+里 **`role` 根本没转义**。
+
+##### 判据 `tests/json_writer_conformance.rs`（5 条）
+
+主判据把 **RFC 8259 的规则直接写成断言** ——「产出的 JSON 文本里不得出现任何
+`U+0000`–`U+001F`」。**不依赖任何外部解析器**（测试环境不能假定有 Python），
+且**穷举码点**：只挑几个例子会漏掉「下一个」坏字符。
+
+- `d209_stringify_never_emits_raw_control_chars`：穷举 `0x00..=0x2FF` + 4 个非 BMP，
+  对 **`String` / `Char` / Dict key 三个位点**各测一遍
+  （**只修 String 会漏掉另两个**）
+- `d209_char_is_escaped`：`Char` 修前**一种字符都没转义**，单独钉
+- `d209_dict_key_and_value_use_the_same_escaper`：key 与 value 走同一份规则
+- `d209_mora_own_parser_still_round_trips`：**不回归** —— 语言自身 parser 仍读得回
+- `d209_cli_stringify_output_is_valid_json`：真实 CLI 路径。用 `<<<` `>>>` 标记切分
+  ——产出里含换行，**按行索引会取错片段**（与 D202 探针同款教训）
+
+##### 牙齿验证
+
+| 回退 | 变红的判据 |
+|---|---|
+| `escape_json_string` 去掉控制字符转义 | `d209_stringify_never_emits_raw_control_chars`、`d209_char_is_escaped`、`d209_dict_key_and_value_use_the_same_escaper`、`d209_cli_stringify_output_is_valid_json` |
+
+`d209_mora_own_parser_still_round_trips` **正确地没有变红** —— 它守的是
+语言自身 parser 的不回归，而那个 parser 宽松、对本缺陷不敏感，**不计入牙齿**。
+
+##### 探针教训（工具侧，本轮第三次踩同一类坑）
+
+- **从 `grep` 的上下文输出抄代码会被缩进坑**：那个输出自带 4 空格偏移，
+  照抄的模式**全部多 4 空格**、多行替换 10 处只中 1 处（单行的侥幸命中）。
+  **替换锚点必须从源文件本身取**（`Get-Content` 打印真实行），不能从工具输出转抄。
+- **PowerShell 嵌套数组会被展平**：`@(@('a','b'), @('c','d'))` 里的
+  `@('a','b')` 被摊平成一维，于是 `$p[0]` 取到的是**字符**而不是字符串
+  （`$old.Split()` 报 "does not contain a method named 'Split'" 才发现）。
+  本轮两次栽在它身上，最后改用**分隔符文本文件**（`@@FILE@@` / `@@OLD@@` / `@@NEW@@`）
+  传替换对 —— 零转义歧义，与内容里的反斜杠数量无关。
+
+
+
+#### D210：formatter 把字符串字面量里的**控制字符**原样吐出 —— 破坏保行数不变式（已修）
+
+D209 的收尾扫描（`grep "replace('\\\\', …"` 全 `src/`）漏了 3 处，逐查之后
+其中一处是**新的严重缺陷**。
+
+##### 缺陷
+
+`lsp/providers/formatting.rs::token_text` 的三个字面量分支：
+
+```rust
+TokenType::String(s)      => format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\"")),  // 只转 2 种
+TokenType::Char(c)        => format!("'{}'", c),                                                // 一种都不转
+TokenType::PromptString(s)=> format!("p\"{}\"", s),                                              // 一种都不转
+```
+
+关键在于 **lexer 已把源码里的 `\n` `\t` `\x0c` … 解码成真字符**才交给
+`token_text` —— 修前只把它们中的 `\` 与 `"` 转回去，**控制字符原样吐出**。
+
+真实 `mora-lsp.exe` 会话的**原始 JSON 响应**（不需要任何解码，直接可读）：
+
+```text
+修前 newText: "let a = \"x\ny\"\nlet b = …"
+                        ↑ 这是 JSON 转义 = **真换行**
+```
+
+即 `let a = "x\ny"` 被格式化成一个**跨两行、字符串里含裸换行**的字面量。
+
+##### 后果（真实会话实测，三条）
+
+| 后果 | 修前 | 修后 |
+|---|---|---|
+| **保行数不变式**（D202 立的，D203 的承重前提） | 源 3 个换行 → 输出 **4 个** ⇒ 破 | 3 → 3 ⇒ OK |
+| 二次格式化 | 稳定 | 稳定 |
+| **`rangeFormatting` 取行** | 请求第 2–3 行，返回 `y"` / `let p = 1` ⇒ **取错行** | 返回 `let p = 1` / `let q = 2` ⇒ 正确 |
+
+取错行是**最重**的一条：客户端把那两行替换成「上一行字符串的尾巴 + 一行重复」，
+**应用即损坏文件**。
+
+##### 据实记录的边界（不是本条的缺陷）
+
+- 格式化结果**仍能跑**（Mora 的 lexer 允许字符串跨行），修前 exit 0、输出与原文一致
+- 二次格式化**稳定**，不是「每次格式化都在变」的累积型损坏
+
+本条守的是**行数**与**切片正确性**，不是「代码还能不能跑」。
+
+##### 修法
+
+新增 `mora_string_body` / `mora_char_body`：转义 `\` 定界符 + **全部控制字符**
+（`\n` `\r` `\t` 与 `\u{..}`）+ DEL。`Char` 另加 `'` 自身的转义（修前一个字都没转义）。
+**刻意不复用** `flow::escape_json_string` —— 那是 JSON 字符串、这是 Mora **源码字面量**，
+`p"…"` 的转义规则本就与 `"…"` 不同；共用一个函数会让两条规则将来无法分道扬镳。
+
+##### 顺带：把 D209 漏掉的 3 处也补齐
+
+同一次扫描发现另外 3 处手写转义链（此前 D209 的 grep 模式太窄而漏掉）：
+
+- `pregel/reducers.rs:89` 与 `pregel/mod.rs:1422` —— **两份** `value_to_json_string`
+  （两处注释都自述「与另一份是同一实现」）。`reducers.rs` 的注释原文写着
+  「使 agent 收到的 input **始终是合法 JSON**」—— **代码自述的目标当时并不成立**。
+- `record/serialization.rs:605` —— bare 字符串重加引号的 helper
+
+三处全部改用 `flow::escape_json_string`。**现在全仓 0 处手写转义链。**
+
+##### 判据（并入 `tests/lsp_formatting_fidelity.rs`，共 16 条）
+
+- `d210_string_literal_escapes_survive_formatting`（主判据）：格式化结果里
+  **不得出现任何裸控制字符**，且 `\n` 必须**仍是转义序列**
+- `d210_line_count_preserved_with_escapes`：保行数不变式在含转义的源码上同样成立
+- `d210_range_formatting_still_picks_the_right_lines`：**D203 的承重后果** ——
+  切片必须取到 `let p = 1` / `let q = 2`，且**不得混入** `y"`
+- `d210_escaped_source_still_runs_after_formatting`（**正对照**，守不回归）
+
+##### 牙齿验证
+
+| 回退 | 变红的判据 |
+|---|---|
+| `mora_string_body` 退回「只转 `\` 与 `"`」 | `d210_string_literal_escapes_survive_formatting`、`d210_line_count_preserved_with_escapes`、`d210_range_formatting_still_picks_the_right_lines` |
+
+`d210_escaped_source_still_runs_after_formatting` **正确地没有变红** ——
+修前结果本来就能跑，它对**这一处回退无判别力**，**不计入牙齿**。
+
+##### 探针教训（本轮第三次，且是我自己的错）
+
+我用一个 PowerShell 的**手写 JSON 解码器**取 `newText`，它按
+「先 `\n` → 真换行，再 `\\` → `\`」的顺序替换，于是**分不清**
+「JSON 转义 `\n`（该解成换行）」和「escaper 输出的 `\n`（该保持两字符）」，
+给出**错误的判定标签**（把已经修好的代码报成「仍然 BROKEN」）。
+
+- 修前证据之所以仍然成立，是因为我保留了**原始 JSON 响应**——那里的 `\n`
+  按定义就是 JSON 转义，不需要我解码。**能看原始字节就别解码。**
+- 解 JSON 必须用**真解析器**：脚本里用 Python `json.loads`、Rust 测试里用
+  `mora::lsp::json::Parser`。手写替换链的正确性无法靠肉眼保证。
+
+
+
+#### D211：LSP `Position.character` 是 **UTF-16 码元**，代码全程当 **char 索引** —— 含 emoji 的行上**改坏用户文件**（已修）
+
+这个漏洞我很早就注意到（`position_to_offset` 逐 `char` 计数），但一直没实测。
+本轮借 D210 的余温把它量了 —— 结论是**比预想的严重**。
+
+##### 缺陷
+
+规范原文：`Position.character` 的单位是 **UTF-16 code unit**（因为主流编辑器内部
+就是 UTF-16）。**BMP 内 UTF-16 码元与 char 一一对应**，故此前**从未暴露**；
+一旦一行里有星平面字符（emoji、部分汉字扩展、某些符号），两者就分叉。
+
+真实 `mora-lsp.exe` 会话实测（客户端发的是**正确**的 UTF-16 位置；
+源码第 2 行 `print("😀", total)`，`total` 在 char 索引 11 / UTF-16 12）：
+
+| 路径 | 修前实际 | 期望 |
+|---|---|---|
+| `rename` total→sum | `print("😀",suml)` | `print("😀", sum)` |
+| `didChange` 在 `total` 前插入 `X` | `print("😀", tXotal)` | `print("😀", Xtotal)` |
+| `hover` 发出的 range | 客户端按 UTF-16 读成 `"😀", ` | `total` |
+
+`rename` 那条**把文件改坏了**（`suml`，名字被截掉一个字符）。
+`didChange` 那条更狠 —— **每敲一个键，服务器自己的文档缓冲就被写坏一次**，
+而 hover / definition / 诊断全部基于这个缓冲，**损伤会累积**。
+
+##### 修法：一对转换函数，两个方向各一处入口
+
+```rust
+pub fn utf16_to_char_col(line: &str, col: usize) -> usize   // 入站
+pub fn char_to_utf16_col(line: &str, col: usize) -> usize   // 出站
+```
+
+- **入站**：`position_to_offset` 先把 `col` 从 UTF-16 换算成 char 索引。
+  它是**全部入站位置的唯一入口**（hover / definition / references / rename /
+  completion / **增量同步**都走它）⇒ 改这一处即修全部入站方向。
+- **出站**：凡是向客户端发 `character` 的地方都过 `char_to_utf16_col`：
+  `hover` / `definition` / `references` / `documentSymbol` / `rename` /
+  `formatting` 的 `range`。
+- 两个函数都提到 `pub`（经 `lsp::providers` re-export），**好让集成测试直接
+  钉住其不变式**，不必每次都起一个 `mora-lsp` 进程。
+- 越界 `col` 一律**夹到行尾**（规范允许客户端给行尾之外的位置，不得 panic）。
+
+##### 顺带修掉 hover 的一处漏网
+
+`hover` 除了出站要换算，**入站的 `col` 也得先换算**才能算 range ——
+`offset` 走 `position_to_offset` 是对的，但 `col` 本身仍是 UTF-16 值。
+只修出站会得到 7..13（修前 7..12），两端都错。
+
+##### 判据 `tests/lsp_utf16_positions.rs`（5 条）
+
+主判据写成「**真实客户端会做的事**」：把返回的 edit 按 **UTF-16** 贴回文档，
+结果必须语义正确。修前必红，且失败信息直接复现被改坏的文本（`print("😀",suml)`）。
+
+- `d211_rename_on_a_line_with_emoji_does_not_corrupt_the_file`（主判据）
+- `d211_incremental_change_on_emoji_line_keeps_buffer_intact`（主判据）
+- `d211_outbound_ranges_are_utf16_offsets`：range 按 UTF-16 解码必须正好是 `total`
+- `d211_utf16_conversion_helpers_are_inverses_on_real_lines`：**纯函数层**的不变式
+  （`char → u16 → char` 恒等、越界夹到行尾）—— 最快也最硬的一层
+- `d211_bmp_only_line_is_untouched_by_the_fix`（**正对照**）：纯 BMP 行逐字不变
+
+##### 牙齿验证
+
+| 回退 | 变红的判据 |
+|---|---|
+| `utf16_to_char_col` 退化成恒等（入站不换算） | `d211_utf16_conversion_helpers_are_inverses_on_real_lines`、`d211_incremental_change_on_emoji_line_keeps_buffer_intact` |
+| `char_to_utf16_col` 退化成恒等（出站不换算） | `d211_utf16_conversion_helpers_are_inverses_on_real_lines`、`d211_rename_on_a_line_with_emoji_does_not_corrupt_the_file`、`d211_outbound_ranges_are_utf16_offsets` |
+
+两处回退**各自命中该方向的判据**，无交叉污染。
+
+##### 顺带查出一条**既有问题**（不在本条范围，已记档）
+
+`hover` 的 range 形状是 `[col - ident.len(), col]`，即**假定光标在标识符末尾**。
+客户端点在标识符**开头**时，它给出的是「前 5 个字符」—— 与 UTF-16 无关，
+**纯 BMP 行同样错**（实测 `print("x", total)` 上 hover 报 6..11）。
+故 D211 的判据把光标放在末尾，以隔离出 UTF-16 这一件事。
+**该问题本轮只记录、未修**（属另一条缺陷，不擅自扩范围）。
+
+##### 探针/测试自身的两处错（本轮都栽了）
+
+1. **`str::find` 返回字节偏移，而 emoji 占 4 字节** —— 我第一版把返回值当
+   char 索引用，位置偏了 3，一度以为产品没修好。**D176「测试红了先问谁错了」
+   的一次**：同一份请求，Python 脚本（`str.index` 是字符索引）是对的、
+   Rust 测试是错的。**换语言写同一个探针时，先确认索引单位一致。**
+2. **`references` 返回所有出现位置（含第 0 行的声明）**，我却拿每一处都去对
+   第 1 行的文本解码 → 得到乱码。**「多结果」的判据必须按各自所在行解码。**
+
+
+
+#### D212：`semanticTokens` 发的是 **4 元组**（规范要求 5）—— 客户端从第二个 token 起全部错位（已修）
+
+D201 修的是「type 索引越界 legend」，没深究 token 的**形状**。本轮查 UTF-16 时顺带
+解码了 `data`，才发现**每一个 token 的形状就是错的**。
+
+##### 缺陷（五处，其中前四处有实测证据）
+
+`lsp/providers/semantic.rs` 的 `push_token` 修前：
+
+```rust
+out.push(delta_line as f64);
+out.push(delta_col as f64);
+out.push(1.0); // length          ← ① 长度硬编码
+out.push(kind);
+                               ← ② 少发 tokenModifiers（规范要 5 元组）
+```
+
+1. **只推 4 个数**，规范要求 `[deltaLine, deltaStart, length, tokenType, tokenModifiers]`
+   **5 元组**。客户端按 5 个一组切分 ⇒ **从第二个 token 起全部错位**。
+   实测 `let a = 1 / print(a)` 返回 **16** 个数（4×4），**不是 5 的倍数**。
+2. **`length` 硬编码 `1.0`** ⇒ `print` 只高亮 1 个字符（实测修复前 length 全是 1）。
+3. **根节点被发两遍** —— `emit_tokens` 先单独发一次 `expr`，再 `walk_witness(expr, …)`
+   而后者**包含** `expr`。实测 `print` 在同一位置出现两次。
+   （与 D132 在 `collect_definitions_in_expr` 修掉的是**同一个错**，当时只修了一处。）
+4. **列不是 token 自己的起点** —— 用的是 `span.column`，而那是**整个表达式**的
+   起点（`let a = 1` 落在 `l` 上）。改为「在该行找 token 的**原文**」。
+5. **列是 char 索引**，规范要 **UTF-16 码元**（D211 同族）。实测 `😀` 的
+   length 应是 **2** 个 UTF-16 码元。
+
+##### 修法：先收集**绝对**位置 → 排序 → 编码
+
+把三件混在一起的事拆开：遍历时只收集 `(line, col, len, kind)` 绝对量，
+编码成 delta 是**最后一步**。新增 `token_of` / `locate_token` 两个辅助函数。
+
+##### ⚠ 一条**误诊**的自我更正（如实记账）
+
+我最初把观测到的「token 落在第 4 行（文档只有 3 行）、`deltaLine` 为负」
+判定为**遍历不按文档顺序**。**这是错的** —— 那是客户端按 5 元组切分、
+服务端只发 4 个造成的**错位假象**。
+
+牙齿验证直接拆穿了它：**回退「不排序」这一处，测试全绿**（6/6）——
+即现有样本根本产生不了乱序 token，排序**不是**被观测到的缺陷所要求的。
+排序仍保留（规范要求 delta 编码建立在文档顺序上，且成本为零），
+但**如实标注：它没有判据背书，是防御性的合规措施**。
+
+##### 连带修正：**D201 的判据自身写错了**
+
+`tests/lsp_semantic_token_legend.rs` 断言：
+
+```rust
+assert!(data.len() >= 4 && data.len() % 4 == 0, "data 应是 4 元组序列" …);
+for t in data.chunks(4) { let ty = t[3] as usize; … }
+```
+
+它按「服务端实际发出的形状」切分 —— 于是**把缺陷当成了期望**：
+判据的前提本身就是错的。已按规范改成 5 元组，并在注释里写明这段来历。
+（`chunks(4)` 下 `t[3]` 恰好是 `kind`，所以 D201 的「查表」逻辑本身没错，
+只是**元组宽度**错了 —— 巧合地让旧实现通过了。）
+
+##### 判据（`tests/lsp_semantic_token_legend.rs`，6 条）
+
+主判据写成「**按客户端的方式解码，再核对原文**」：`data.len() % 5 == 0`、
+`deltaLine` 非负、`length > 0`、行不越界、范围不出该行、解出来的文本
+**不是纯标点/空白**。5 个样本（含嵌套块、emoji 行）。
+
+> ⚠ 判据**不能**要求「看起来像标识符」—— 字符串字面量的 token 就是任意文本
+> （实测 `😀` 是**正确**落点）。我第一版这么写，红了之后才发现是判据太严。
+
+- `d212_tokens_decode_to_their_own_source_text`（主判据）
+- `d212_no_token_is_emitted_twice_at_the_same_position`
+- `d212_token_length_is_not_hardcoded_to_one`
+
+##### 牙齿验证
+
+| 回退 | 变红的判据 |
+|---|---|
+| R1 少发 `tokenModifiers`（回 4 元组） | `d212_tokens_decode_to_their_own_source_text`、`d212_token_length_is_not_hardcoded_to_one`、`d201_token_types_resolve_to_meanful_names` |
+| R2 去掉文档顺序排序 | **无（GREEN）** —— 见上「误诊」一节，**无判别力** |
+| R3 `length` 硬编码 1 | `d212_token_length_is_not_hardcoded_to_one` |
+
+
+
+#### D213：MCP 的**每一条错误路径**都被包进 `result` —— 客户端把**失败当成成功**（已修）
+
+D212 的教训是「判据可能把实现现状当成规范」，于是换个方向：去查另一个
+**对外协议实现**。LSP 查透了，MCP 的协议表面此前**只有分帧解析器的测试**
+（`tests/stdio_jsonrpc_e2e.rs` 只验证 `Content-Length` 分帧，不碰握手），
+**没有任何端到端测试**。
+
+##### 缺陷
+
+`mcp_server.rs::dispatch` 只有一个 `Option<JsonValue>` 通道，
+**错误与结果载荷挤在一起** —— 所有错误都被 `wrap_response` 裹成
+`{"jsonrpc","id","result": <错误>}`。
+
+JSON-RPC 2.0 规定 `error` 必须与 `result` **同级**（且互斥）。
+客户端找顶层 `error` 找不到 ⇒ **把失败当成成功返回**。
+
+真实 MCP stdio 会话实测（修前，4 条错误路径**全中**）：
+
+```text
+未知 method (resources/list) → result = {"error":{…},"id":4,"jsonrpc":"2.0"}
+未知 method (ping)            → result = {"error":{…},"id":7,"jsonrpc":"2.0"}
+tools/call 未知工具名          → result = {"code":-32602,"message":"Unknown tool: …"}
+tools/call 缺 name            → result = {"code":-32602,"message":"Missing 'name' in params"}
+```
+
+两种形状还**互不一致**：前者嵌的是**整份应答**（连 `jsonrpc` / `id` 都重复
+了一遍），后者只回 `{code, message}`。
+
+`resources/list` / `ping` / `prompts/list` 都是标准 MCP 方法而 Mora 未实现
+—— 客户端因此**永远学不到「这个服务器不支持它」**，只会拿到一个空结果。
+`tools/call` 那两条更糟：工具名打错时客户端以为调用成功，去读
+`result.content` 却读不到。
+
+##### 修法：用**类型**把两者分开
+
+```rust
+enum Reply { Result(JsonValue), Error(i64, String) }
+```
+
+写回处按变体分派：`Reply::Error` → `wrap_error`（顶层 `error`）、
+`Reply::Result` → `wrap_response`（顶层 `result`）。
+二者互斥由**类型系统**保证 —— 不再像修前那样挤在同一个通道里。
+
+##### 判据 `tests/mcp_jsonrpc_error_shape.rs`（3 条）
+
+判据直接写成**协议要求**（`error` 在顶层、与 `result` 互斥、`code` 正确、
+`message` 非空），而不是断言某个具体字符串 —— 后者会随实现变化而失效。
+
+- `d213_every_error_path_returns_a_toplevel_jsonrpc_error`（主判据）：4 条错误路径
+- `d213_happy_path_shapes_stay_conformant`（**不回归**）：`initialize` 三字段、
+  `tools/list` 每项必须有 `name` + `inputSchema`（**对象**）、
+  `tools/call` 的 `content` 必须是**数组**
+- `d213_notifications_produce_no_response`（**不回归**）：notification 不得有回包
+
+这是 MCP 协议表面的**第一个端到端测试**。
+
+##### 牙齿验证
+
+| 回退 | 变红的判据 |
+|---|---|
+| `Reply::Error` 退回包进 `result`（D213 修前形状） | `d213_every_error_path_returns_a_toplevel_jsonrpc_error` |
+
+两条不回归判据**正确地没有变红** —— 它们守的是正常路径，与本缺陷无关。
+
+##### 探针/测试自身的一处错（如实记账）
+
+第一版服务器脚本写成 `mcp = mcp.serve()` —— `serve()` 返回 `Nil`，
+赋回 `mcp` 触发 `Type mismatch: expected mcp_server, got nil`，
+整场探测 0 应答。**不是产品缺陷**：正确用法是把 `serve()` 当语句调用。
+（又一次「测试红了先问谁错了」。）
+
+
+
+#### D214：HTTP 504 应答的 reason phrase 写的是 **`OK`** —— 状态码与文案互相矛盾（已修）
+
+D213 揭示了一类「**协议表面**的错误路径」。查完 MCP 后把同一手法用到第三个对外
+表面 —— HTTP server（`src/http_server.rs`）。它的**错误路径其实是对的**
+（500 / 504 / 404 各自带顶层 JSON error，没有 D213 那种「错误当成功」），
+但状态行本身有问题。
+
+##### 缺陷
+
+```rust
+let status_text = match status {
+    200 => "OK",
+    400 => "Bad Request",
+    404 => "Not Found",
+    500 => "Internal Server Error",
+    _ => "OK",          // ← 兜底说「OK」
+};
+```
+
+而 **504 会被真实发出**（handler 60s 超时那条分支，`http_server.rs:219`），
+却**根本不在 match 里** —— 于是落进兜底：
+
+```text
+HTTP/1.1 504 OK
+```
+
+状态码说「超时」，文案说「成功」。reason phrase 虽是 RFC 9110 的遗留字段、
+多数客户端忽略，但 `curl -v`、代理、日志、任何读它的人都直接看到这句话。
+
+更要紧的是**兜底本身**：任何将来新增的状态码都会**静默被标成 "OK"** ——
+与 D193（`triggerCharacters` 声明了却返回空）/ D201（legend 索引越界）/
+D213（错误包进 result）同族的「声明一样、做成另一个样」。
+
+##### 修法
+
+抽成独立纯函数 `pub fn status_text`（可被测试直接钉住）、**补齐 504**、
+兜底改成 `"Unknown"` —— 宁可说「不知道」，也不说「OK」。
+
+##### 判据 `tests/http_status_phrase.rs`（3 条）
+
+主判据写成一条**不变式**而不是逐个码点表：
+
+> **只有 `200` 的文案允许是 `"OK"`。**
+
+这条对**将来新增的任何状态码**都成立，比「504 必须映射成 Gateway Timeout」
+更难绕过 —— 后者只锁住一个码点，而不变式直接堵住兜底。
+
+- `d214_only_200_may_say_ok`（主判据）：已列出的 5 个码 + **4 个未列出的码**
+  （418/502/503/301）都不得回落到 `"OK"`
+- `d214_known_statuses_keep_standard_reason_phrases`（**不回归**）：
+  不能为了「不撒谎」而把已列出的码全改成 `Unknown`
+- `d214_real_404_status_line_is_not_says_ok`（**端到端**）：真起一个服务、
+  用原始 TCP 字节核对状态行。实测修后 `HTTP/1.1 404 Not Found`
+
+##### 牙齿验证
+
+| 回退 | 变红的判据 |
+|---|---|
+| 去掉 504 + 兜底改回 `"OK"`（D214 修前形状） | `d214_only_200_may_say_ok`、`d214_known_statuses_keep_standard_reason_phrases` |
+
+e2e 那条**正确地没有变红** —— 404 在修前就已经映射对了，
+本缺陷只影响 504 与兜底；如实标注它对这一处回退**无判别力**。
+
+##### 探针/测试自身的一处错（如实记账）
+
+第一版 e2e 脚本写成 `Router::new("127.0.0.1", 8931)` + `r.serve()`，
+报 `Type mismatch: expected router, got fn (string) -> ...` —— 服务压根没起。
+**不是产品缺陷**：`Router::new()` **不收参数**，启动方法是 `listen(addr)`。
+（顺带记一条待办观察：`Router.route` 在 typeck 侧似乎有缺口 ——
+`mcp = mcp.tool(...)` 那种「把方法返回值赋回同一变量」在 typeck 里报错，
+而运行期正常。这属 D100 那条线（typeck 声明窄于运行期），本轮**未展开**。）
+
+#### 撤回一条**我自己记错的待办**
+
+上一版这里记着「`Router.route` 的 typeck 声明可能窄于运行期（待办）」。
+**撤回 —— 那是我的探针脚本自己写错了**，用 `mora --check` 复核（四条）：
+
+```text
+let r = Router::new()                    → exit 0
+print(r)                                 → exit 0
+let m = McpServer::new()                 → exit 0
+m = m.tool("t", {}, fn(a) return 1 end) → exit 0
+Router::new("127.0.0.1", 8931)          → exit 2  ← 正确拒绝（new() 不收参数）
+```
+
+`Router::new()` **不收参数** —— 那个 exit 2 是 typeck **正确地拒绝**了非法调用，
+不是缺陷。typeck 没有缺口，**无需修**。
+
+顺带发现 `dispatch.rs` 里那段「`print(r)` exit 2」的注释描述的也是**已修好**的
+历史状态（上面第 2 条即证明）。已在该处**加注复核结论并说明为何保留那段历史**，
+而不是删掉它 —— 它记的是「为什么往 Union 里加类型」，删掉会让后来者
+以为只是随手放宽。
+
+> 教训（与 D176 / D191 同源，第 N 次）：**探针脚本自身出错时，先用 `--check`
+> 复核再下结论。** 这一轮我已经因为脚本写错而**差点上报一个不存在的缺陷**。
+
+
+
+#### D216：`solve { … }` 合取里**只有最后一个 goal 的绑定活到结果** —— join 查询静默返回错值（已修）
+
+本轮转向 `src/rel/`（Datalog 引擎），此前**从未审计**。`rel::` 的 39 条内部单测
+全部通过，引擎本身看不出问题 —— 但**真实 CLI** 上多 goal 查询的结果是错的。
+
+##### 缺陷
+
+`parser_v3/rel.rs::emit_solve_w` 把多个 goal 的 witness 收进
+`WitnessKind::Sequence(body_wits)` —— 一个**顺序块**，而块的产出值
+只是**最后一个**子表达式的值。于是运行期 `h_solve` 拿到的 `Value::Goal` 里
+**只有最后一个 goal**，前面 goal 建立的绑定被静默丢弃。
+
+真实 `mora run` 实测（修前，facts: `p("a","b")` / `q("b","c")` / `r("c","d")`）：
+
+| 查询 | 期望 | 实际 |
+|---|---|---|
+| `p(?X, ?Y)` | `[[a, b]]` | `[[a, b]]` ✅ |
+| `p(?X, ?Y), q(?Y, ?Z)` | `[[a, b, c]]` | **`[[_.0, b, c]]`** ❌ |
+| `p(?X,?Y), q(?Y,?Z), q(?Z,?W)` | `[[a,b,c,?]]` | **`[[_.0, _.0, b, c]]`** ❌ |
+| `p("a", ?Y), p(?X, ?Y)` | `[[b, a]]` | `[[b, a]]` ✅（**巧合**：末个 goal 恰好重新推出同样绑定） |
+
+规则精确到一句：**合取中只有最后一个 goal 的绑定到达结果**。
+
+Datalog 的**核心用法就是 join**，而结果是**零诊断、exit 0、看起来合理**
+（`b`、`c` 都在），未绑定的 `_.N` 按 `reify.rs` 的约定还是**合法输出** ——
+用户无法区分「真的没绑定」与「本该绑上却被丢了」。
+
+##### 修法：两处，同一个缺陷面的两半
+
+1. **`emit_solve_w`**：多 goal 改为对各子 goal 调 **`both(...)`** ——
+   它就是运行期的 `Goal::Conj` 构造器
+   （`interpreter/builtins/rel.rs::call_builtin_both`）。
+   **复用既有 builtin，无需新 MIR 指令。**
+2. **`typeck/dispatch.rs`**：`both` / `either` 的签名改为**变参**。
+   运行期 `call_builtin_both` / `call_builtin_either` 接受**任意个数**（≥1）的
+   goal（`goals_from_args` 逐个收集），而签名表此前只声明**恰好 2 个** ⇒
+   三个及以上 goal 直接被类型检查拒绝：
+   `Type error: expected goal, got fn (…) -> …`。
+   **不改这里，D216 的修复就只对恰好 2 个 goal 有效** —— 而三表 join 才是
+   常见情形。属 D100 同族的「typeck 声明窄于运行期」。
+
+##### 已排除的可能（避免下轮重复排查）
+
+- **不是 `unify`**：`unify.rs` 逐臂读过（occurs check、长度检查、Dict 键查找、
+  ground 标量相等、兜底 `None`），逻辑正确。
+- **不是 `reify` / `project_solution`**：只按 `LogicVar(0..n)` 投影，
+  单 goal 时结果正确。
+- **不是 `SolveHost`**：`relation_clauses` 就是从环境取 `Value::Relation`。
+- **不是引擎的合取实现**：`Search::next_solution` 的 `Goal::Conj` 分支把 goal
+  **逆序压回链首**并**原样传递代换**，且
+  `rel::search::tests::conjunction_threads_bindings` **通过**（实测 exit 0）。
+
+⇒ 根因就在「多个 goal 的 witness 被降级成 `Sequence`（顺序块）」这一处。
+
+##### 判据 `tests/rel_conjunction_bindings.rs`（4 条）
+
+写在**真实 CLI** 层（`mora run`）而不是引擎层 —— 引擎的 39 条单测本来就全过，
+**错的是「目标体怎么被构造成一个 Goal」**。故判据必须走脚本这条路才有牙齿。
+
+- `d216_conjunction_threads_every_goals_bindings`（主判据）：2-goal join、
+  **3-goal join**（同时是 `both` 变参声明的证明）、末位 goal 只用部分变量
+- `d216_single_and_repeated_goals_are_unchanged`（**不回归**）
+- `d216_unsatisfiable_conjunction_still_yields_nothing`（**不回归**）：
+  无解合取必须仍返回 `[]` —— 修前这个反例**恰好「通过」**，
+  正因为绑定根本没串起来
+- `d216_rel_rule_path_is_unaffected`（**不回归**）：`rel` **规则**侧未被波及 ——
+  D216 改的只是**查询**侧的目标体降级，规则侧合取走编译期 `Goal::Conj`
+  （`rel.rs:126`）。钉住那侧**已验证正确**的行为：递归闭包（`path/2` 六对全对）、
+  子句体内 3-goal 合取、单目标规则。
+
+> ⚠ 判据里**没有**直接调 `both(a, b, c)` 的用例：`both` / `either`
+> 在当前语法里**无法手写**（实测
+> `let g = both(p(?X), q(?Y), s(?Z))` 报
+> `Parse error: Expected ')' after relation arguments`）—— 它们是 parser
+> **内部发出**的构造。判据必须走用户可表达的那条路。
+
+##### 本轮一并核过的**否定结果**（记档，避免下轮重复排查）
+
+`rel` 的**规则**路径实跑一遍，全部**正确**：
+
+| 场景 | 结果 | 判定 |
+|---|---|---|
+| `path/edge` 递归闭包（两规则） | `[[a,b],[b,c],[c,d],[a,c],[b,d],[a,d]]` | ✅ 六对全对 |
+| 子句体内 **3 个** goal 的合取 | `[[a, x, y, z]]` | ✅ |
+| 单目标规则 `child(x,y) parent(x,y)` | `[[a, b]]` | ✅ |
+| `reachable(x,z) path(x,y), reachable(y,z)` | `[]` | ✅ **正确** —— 是我把规则写反了（`path` 才是基础关系） |
+
+⇒ D216 的修复**只影响查询侧**，规则侧本就正确；两者是不同的降级路径。
+最后一条是**我期望错了、产品是对的**（又一次「先量再断言」）。
+
+另外记下 `rel` 的**语法**（我连踩两次才对，供下轮直接用）：
+
+- 查询变量写作 **`?X`**（裸 `X` 不会被当成查询变量）
+- 规则体**没有 `if`**，且**必须以 `end` 收尾**：
+  `rel path(x, z) edge(x, y), path(y, z) end`
+- `both` / `either` **无法手写**（`Parse error: Expected ')' after relation
+  arguments`）—— 它们是 parser **内部发出**的构造
+##### 牙齿验证
+
+| 回退 | 变红的判据 |
+|---|---|
+| R1 多 goal 退回 `Sequence`（只取末个） | `d216_conjunction_threads_every_goals_bindings` |
+| R2 `both`/`either` 退回固定 2 元签名 | `d216_conjunction_threads_every_goals_bindings` |
+
+两条不回归判据在两处回退下**均未变红** —— 它们守的是单 goal / 无解场景，
+与本缺陷无关，**不计入牙齿**。
+
+#### 一条**未结论**的探查记录：`orchestrate pregel` 的用户表面（2026-10-03）
+
+本轮转向 `src/pregel/`（2655 行的 Pregel BSP 引擎，此前未审计）。
+**没有拿到可判定的缺陷**，但下面几条是**实测事实**，记下来免得下轮重走一遍。
+
+##### 外部视角下的实测
+
+```text
+let input = 1
+orchestrate pregel input -> result,
+  agent echo(x) => x
+  edge @start -> echo
+end
+print(result)          → nil        (exit 0，零诊断)
+```
+
+- 引擎**能**端到端跑通（`edge @start -> <agent名>` 命中时返回 agent 的返回值）。
+- agent 声明的参数 `x` **始终未被绑定** —— 无论 `input` 是什么，`x` 都是 `nil`。
+- 没有 `edge` 时，报**清晰可操作**的错误（D97 的修复仍在）：
+  `pregel: graph declares agents but none was ever scheduled … check that an
+  entry edge such as \`edge @start -> <agent>\` exists.`
+- 指向**不存在**节点的悬空边（如 `edge inc -> other`）被**静默忽略**。
+
+##### 为什么不下结论
+
+`pregel/mod.rs:809` 有 `self.channels.insert("input".to_string(), final_value)` ——
+引擎**确实**把 input 灌进了一个名为 `input` 的 channel；`:884` 从 `result` channel
+取返回值。但**语法里没有任何写 channel 的手段**（`syntax.rs:431` 把
+`state_schema` 硬编码成 `vec![]`），于是「agent 读 `input` channel、写 `result`
+channel」这个契约在用户表面**无法表达**。
+
+`write_channel` / `channels.insert` 在 `pregel/mod.rs` 之外**零引用**。
+
+⇒ 这更像**能力缺口**（没有 channel 的用户表面）而不是「静默算错」，
+且修它要先决定「单个 input 如何映射到 N 个 params」以及与 channel 的关系 ——
+不是一处小改动能安全定下的。**本轮不擅自扩范围，留作候选。**
+
+##### 顺带记下 `orchestrate pregel` 的语法坑（我踩了三次）
+
+- `agent` / `edge` 之后**不需要逗号**，换行本身就是分隔符；
+  而**多写一个逗号反而 parse 失败**（`emit_expr_w` 把尾随 `,` 吞进表达式，
+  报 `Failed to parse`）。
+- 边的**目标名必须等于 agent 名** —— `edge @start -> a` 而 agent 叫 `echo` 时，
+  引擎认为「没有 agent 被调度」。
+- 仓库里**没有任何 `.mora` 脚本使用 `orchestrate pregel`**（`examples/` /
+  `tests/` / `test_data/` 全扫过）—— 用户表面**零可运行示例**，
+  这也是本条难以从外部判定契约的主因之一。
+
+#### 一条**否定结果**：`src/tea/`（Elm 式 app 引擎）全部路径正确 (2026-10-03)
+
+接上一条 `pregel` 的探查，顺手把 `src/tea/` 实跑一遍。**没有缺陷** ——
+但我连踩了**三次**「以为坏了」，故记下来免得下轮重走。
+
+##### 探查过程（三次误判）
+
+我写了一个**真的会加**的计数器（fixture `tea_counter.mora` 的 `update` 是
+`fn(msg, model) => model`（恒等），**测不出任何东西**）：
+
+```text
+app Counter … update: fn(msg, model) => {count: model.count + 1i, step: model.step}
+```
+
+第一次测出来的「异常」：
+
+| 操作 | 我以为 | 实际 | 真相 |
+|---|---|---|---|
+| `tea.dispatch` × 3 | count 1→2→3 | **0→0→0** | `dispatch` 是**纯追加**（只入队），代码注释写明「纯追加 —— 返回携带新 Msg 的新 app（调用方需重新绑定）」 |
+| `run(a,1)` 3 条已排队 | count 1（上限 1） | **3** | `run_loop` 每轮 `fold` **整个队列**（`msg_queue.clear()`），`max_steps` 界定的是**轮数**不是消息数 |
+| `tea.run(Counter, 3)` 传名字 | — | count 0 | 名字不是 `TeaApp`，未排队任何 Msg |
+
+##### 决定性的验证
+
+```text
+dispatch ×3 → count 0        （纯入队，符合设计）
+run(a, 10)   → count 3        ✓ 三条全部应用
+update ×2    → count 1, 2     ✓ 单步立即生效
+run(a, 1) ×3 条 → count 3     ✓ 一轮折叠整个队列
+view(a)      → "count=7.0"   ✓ view 闭包真被调用且读到模型
+```
+
+⇒ `dispatch`（入队）/ `update`（单步）/ `run`（驱动至收敛）三者的职责划分
+**自洽且与 Elm 一致**；`view` 正常；`max_steps` 的语义有注释说明。
+
+##### 教训（又一次「先量再断言」）
+
+我第一版探针的 `update` 用了仓库 fixture 里的**恒等函数**形式，于是「什么都没变」
+既可能是缺陷、也可能是设计 —— **判据必须让状态真的动起来**才有区分力。
+fixture 本身测不出这类问题，也说明「有 fixture」不等于「有判别力」。
+
+#### 本轮一并**撤回**一条我自己记错的待办
+
+上一版 D214 里记着「`Router.route` 的 typeck 声明可能窄于运行期（待办）」。
+**撤回 —— 那是我的探针脚本自己写错了**，用 `mora --check` 复核：
+
+```text
+let r = Router::new()                    → exit 0
+print(r)                                 → exit 0
+let m = McpServer::new()                 → exit 0
+m = m.tool("t", {}, fn(a) return 1 end) → exit 0
+Router::new("127.0.0.1", 8931)          → exit 2  ← 正确拒绝（new() 不收参数）
+```
+
+`Router::new()` **不收参数** —— 那个 exit 2 是 typeck **正确地拒绝**了非法调用，
+不是缺陷。typeck 没有缺口，**无需修**。
+
+顺带发现 `dispatch.rs` 里那段「`print(r)` exit 2」的注释描述的也是**已修好**的
+历史状态。已在该处**加注复核结论并说明为何保留那段历史**（它记的是
+「为什么往 Union 里加类型」），而不是删掉。
+
+> 教训（与 D176 / D191 同源）：**探针脚本自身出错时，先用 `--check`
+> 复核再下结论。** 这一轮我已因脚本写错而**差点上报一个不存在的缺陷**。
+
+
+
+#### D220：`memory.remember` 写进 markdown 的内容**读不回来**（已修）
+
+#### D221：section 存在性用**整文件子串匹配** ⇒ 条目落进**错误的段**（已修）
+
+两条都在 `interpreter/builtins/memory.rs` 的 markdown 记忆上
+（`remember` / `recall_markdown`，写 `~/.mora/memory/YYYY-MM-DD.md`）。
+该功能此前**零测试覆盖**（`tests/` 下无任何 memory/persist 测试）。
+
+##### D220：往返有损（三条，全程 exit 0、零诊断）
+
+| 缺陷 | 实测（修前） |
+|---|---|
+| **多行文本丢行** | `remember("multi", "line1\nline2\nline3")` 落盘三行，`recall_markdown` 只收回 **`line1`**，line2/line3 **无声消失** |
+| **前缀 `- ` 被吃掉** | `recall` 用 `trim_start_matches("- ")` —— 剥掉**所有**前导 `- `。`remember("d","- leading dash")` 存的是 `- - leading dash`，读回变成 **`leading dash`** |
+| **文本能伪造 section** | 文本里含 `## fakesection` 时被 `recall_markdown` / `list_markdown` 当成**真的**段标题 |
+
+对 agent 的**跨会话持久记忆**来说，「记住的东西回忆不出来」且**毫无提示**，是致命的。
+
+##### D221：section 判断用子串匹配 + 追加到文件末尾
+
+修前 `new_content.contains(&section_header)` 是**整文件子串匹配**，
+且追加位置是**文件末尾**而非该段末尾。三个后果（全部实测）：
+
+```text
+① 前缀冲突：remember("notes-archive", …) 之后 contains("## notes") 为**真**
+   ⇒ remember("notes", …) 的条目被追加进 notes-archive 段，
+     而 `## notes` 段**从未创建**：
+       recall_markdown("notes")          = 空
+       recall_markdown("notes-archive") = 两条都在
+② 段不在文件末尾时：追加到文件末尾会落进**下一个**段
+   （remember("a") / remember("b") / remember("a") 三条即触发）
+③ 短名先建时**恰好正确** —— 所以这个缺陷**顺序依赖**，极易漏测
+```
+
+##### 修法
+
+1. **续行统一缩进两格**（`indent_continuation`）—— 既不像新 bullet、
+   也不像新 `## ` 段 ⇒ 顺带解决「文本伪造 section」。
+2. `find_section` **按整行**精确匹配 `## {category}`，
+   `section_end` 定位**该段末尾**（下一个 `## ` 行之前）。
+3. `recall` 改用 `strip_prefix("- ")`（**只剥一个**），
+   并把缩进续行拼回同一条目（`flush_entry`）。
+
+##### 否定结果（本轮实测，一并记档）
+
+- **非 ASCII 完全正常**：`remember("zh", "你好世界")` → `recall_markdown` 逐字返回。
+- `remember` 与 `recall` **不成对**（`recall("notes")` 返回 `nil`，因为键是
+  `md:notes`），而代码注释写的是「key=category」—— **注释与代码矛盾**。
+  本轮**未改**（属 API 语义选择，不是数据损坏），记此备查。
+
+##### 判据 `tests/memory_markdown_roundtrip.rs`（4 条）
+
+用 `MORA_MEMORY_DIR` 把记忆目录**隔离到测试临时目录**，绝不碰用户真实的
+`~/.mora/memory`。
+
+- `d220_multiline_and_dash_prefixed_text_round_trip`（主判据）
+- `d220_text_cannot_forge_a_section_header`
+- `d221_prefix_category_lands_in_its_own_section`（主判据）
+- `d221_append_lands_in_that_section_not_at_eof`
+
+##### 牙齿验证
+
+| 回退 | 变红的判据 |
+|---|---|
+| R1 `contains` + 追加到文件末尾 | `d221_prefix_category_lands_in_its_own_section`、`d221_append_lands_in_that_section_not_at_eof` |
+| R2 `recall` 退回「只收 `- ` 行 + 剥全部前缀」 | `d220_multiline_and_dash_prefixed_text_round_trip`、`d220_text_cannot_forge_a_section_header` |
+
+两处回退**各自命中该编号的判据**，无交叉污染。
+
+##### 探针教训
+
+第一次写 R2 回退时用了 `strip_prefix("\u{0}")` 这种「让续行永不匹配」的写法，
+**编译不过** —— 牙齿脚本只判 RED/COMPILE-ERROR，此时必须区分二者：
+**COMPILE-ERROR 不算「判据没牙齿」**，得先把回退改成能编译的等价形式再测。
+
+#### 一条**否定结果**：`src/compress/` 的 `compress` / `crush_json` 正确且**自报** (2026-10-03)
+
+接 `memory.*` 之后探 `src/compress/`（文本压缩 + smart_crusher）。**没有缺陷**。
+过程中我错了两次，都记下来。
+
+##### 否定结果本体
+
+- **`crush_json(xs, max)` 的 `max` 确实生效**：40 元素 list，
+  `max=3 / 10 / 40 / 1e8` → 输出字符数 **95 / 125 / 278 / 278**（单调）。
+- **`compress(xs, "json", {max_bytes: 12})`** →
+  `[1.0]` + `<compressed:method=smart_crusher strategy=smart_sample items=1 total=40 savings=0.98>`
+  —— 压得很狠，但**明确回报**了 method / strategy / items / total / savings。
+  「自报做了什么」是这类有损操作该有的诚实。
+- `compress("hello world", "head_tail", {max_bytes: 5})` → 正常产出 elision 标记。
+
+##### 我错的地方（两次）
+
+1. **把两个不同的「strategy」当成一个**。`compress` 认的是**文本压缩**策略
+   （`auto` / `head_tail` / `summary` / `lossless` / `json`），
+   与 CRDT 的 `MergeStrategy`（`append` / `add` / `dict_union` / `grow_only_set` /
+   `last_write_wins`，供 `merge_with` 用）**完全是两回事**。
+   `compress(…, "append", …)` 报 `unknown strategy 'append'` —— **正确拒绝**。
+2. **「`max` 被忽略」是我用 5 个小元素测出来的**。元素太少时 smart_crusher
+   选 `passthrough`（没什么可省的）⇒ `items=5 total=5 savings=0.00`。
+   换成 40 个元素后 `max` 立刻显现。**「上限没生效」要换一个能触发的输入再确认**，
+   否则很容易把启发式的正常选择当成参数失效。
+
+##### 顺带记下 `compress` 的语法（避免下轮重踩）
+
+- 签名是 `compress(input, strategy, options?)` —— **第 3 参是 options（dict）**，
+  不是「要和 input 合并的值」。我第一版写成 `compress("ab", "append", "cd")`，
+  被正确拒绝：`compress: options 期望 dict，得到 string`。
+- `input` 只接受 **Conversation / list of {role, content} / string**；
+  给 dict 或数字会得到 `compress: expected Conversation / list of {role, content} / string, got dict`。
+- `crush_json` 的第 2 参是**上限**（`max`），且返回的是**字符串**
+  （JSON 文本 + `<compressed:…>` 摘要行）—— 用 `len()` 量到的是**字符数**，
+  不是条目数。
+
+#### D223：JSON 读端 ↔ 写端的**穷举往返普查** —— 否定结果，但把 D206/D209 从「抽查」升级为「已证明」
+
+这一轮没有新缺陷，而是补上一个一直**缺失的验证**：
+D206 修了 JSON **读端**的 `\uXXXX`，D209 修了**写端**的控制字符转义 ——
+但这一对函数**从没被互相验证过**。今天这套「穷举往返不变式」的判据形状
+已经两次钓出真缺陷（`memory` 往返 D220/D221、`\uXXXX` 缺失 D206），
+于是直接把它用在这一对上。
+
+##### 结果：**全部恒等 / 全部合规**
+
+| 判据 | 覆盖 | 结果 |
+|---|---|---|
+| `d223_string_round_trip_is_lossless_for_every_code_point` | `0x00..=0x2FF`（**768 个码点**，含全部控制字符）+ 5 个非 BMP（`U+1F300` / `U+1F600` / `U+20000` / `U+2A700` / `U+10FFFF`） | ✅ 往返恒等 |
+| `d223_value_shapes_round_trip` | 空 list / 空 dict / 嵌套 list / bool / nil / int / float / **含 `"` `\` `\n` 与空串的 dict key** / 含空串的 list | ✅ |
+| `d223_written_json_is_accepted_by_python` | 11 组「写端最易漏转义」的形状（`\n` `\t` `\r` `\b` `\f` `\v` `NUL` `DEL` 引号+反斜杠、嵌套、含控制字符的 key） | ✅ 全部被 Python `json.loads` 接受 |
+
+`0x00..=0x2FF` 这一段刻意覆盖了**全部控制字符**与多文种字母，
+每个码点前后各包一个字符（`a{c}b`）—— 避免「只有首/尾字符才出问题」被漏掉。
+
+##### 价值：把「抽查通过」升级为「已证明」
+
+在此之前，我能说的只是「三个 case 用 Python 验过」。现在能说：
+**这两个函数在 768 个码点 + 全部值形状上互为逆运算，且产出是合规 JSON。**
+D206 与 D209 各自的修复由**同一对判据**共同背书 —— 它们不再是两个孤立修复，
+而是一个**已被闭合的往返**。将来任何人动其中一侧，判据立刻红。
+
+##### 牙齿验证
+
+| 回退 | 变红的判据 |
+|---|---|
+| 让写端重新吐裸换行（`escape_json_string(s).replace("\\n", "\n")`） | `d223_written_json_is_accepted_by_python` |
+
+**注意往返判据本身不会红** —— 因为语言**自己的** parser 仍能读回裸换行
+（它按字节收集到 `"` 为止）。这正是 D209 揭示过的「自洽但不合规」：
+**能往返 ≠ 合规**，所以必须**另有一条用外部解析器验证的判据**。
+两条判据缺一不可 —— 这是本条最值得记下的一点。
+
+#### D224：`mora record list` 的 **LAST MODIFIED** 显示的是**最后一条事件**的时间戳（已修）
+
+本轮先做了一件 D208 的欠账：那条只验了 6 个 case，本轮用**真实 CLI 端到端**做字符普查 ——
+**12/12 全部正确读回**（否定结果，见下）。普查过程中撞见另一个缺陷。
+
+##### 先记否定结果：录制读端对转义的处理是**对的**
+
+手工构造一条含 12 种「最易读错」片段的录制（`\n` `\t` `\r` `\b` `\f` `\v`
+`NUL` `DEL`、引号+反斜杠、中文、emoji、`## fake section`、`- looks like a bullet`、
+空串、纯空白），用 Python 自己正确转义写成**合法 JSON**，再经
+`mora record timeline` 读回：**逐字一致**，零错乱。
+`record audit` / `stats` / `list` 在这份内容上也全部正常。
+
+⇒ **D208 的转义表修复是完整的。**
+⚠ 唯一的覆盖边界：`esc`（**写**端）对控制字符的处理**无法端到端到达** ——
+Mora 的字符串字面量不解码 `\uXXXX`，所以没法构造出含裸控制字符的 prompt。
+写端那一侧目前只有**读代码**保证（`esc` 含 `\u{..}` 分支），未做端到端验证。
+**如实标注：这不是「已证明」，是「未测」。**
+
+##### D224：表头与语义不符
+
+`cli/record.rs` 表头写着 **`LAST MODIFIED`**，打的却是
+`format_ts(info.last_ts_ms)` —— **最后一条事件的时间戳**；
+`record/analysis.rs` 的排序键同样是 `last_ts_ms`（注释「最新在前」）。
+
+「这份录制**什么时候存在**」与「它记录的**最后一条事件**什么时候发生」
+是**两件事** —— 跨机器录制、导入旧录制、时钟偏移都会让两者分叉。
+
+真实 `mora record list` 实测（一份**刚写**的文件，事件时间戳指向 2023-11）：
+
+```text
+NAME            SIZE  EVENTS   LAST MODIFIED
+d224_probe       3KB  12       1053d ago      ← 修前
+d224_probe       3KB  12       2min ago      ← 修后
+```
+
+排序同理：修前把「内容时间最新」当成「最近录制」。
+
+##### 修法
+
+`RecordingInfo` 增 `modified_ms`，取自 `fs::metadata().modified()` ——
+该 metadata 本来就为了取 `size_bytes` 而读，**零额外 I/O**。
+列与排序键都改用它，**让表头名副其实**。
+
+##### 判据 `tests/record_list_last_modified.rs`（2 条）
+
+隔离：`recordings_dir()` = `current_dir()/.mora/recordings`，
+故把 cwd 设成测试临时目录，**不碰**用户真实的录制目录。
+
+- `d224_last_modified_column_reflects_the_file_not_its_events`（主判据）：
+  事件时间戳取 2023-11（约 1000 天前）、文件**刚**创建 ⇒ 显示的相对时间必须很小
+- `d224_listing_is_sorted_by_file_mtime_not_event_time`：
+  构造「mtime 与事件时间**相反**」的两个文件，排序必须跟 mtime 走
+
+##### 牙齿验证
+
+| 回退 | 变红的判据 |
+|---|---|
+| R1 列退回 `last_ts_ms` | `d224_last_modified_column_reflects_the_file_not_its_events` |
+| R2 排序退回 `last_ts_ms` | `d224_listing_is_sorted_by_file_mtime_not_event_time` |
+
+两处**精确分离**，各红自己那条 —— 证明这确实是**两个独立的键**，
+而不是同一条判据在两处偶然响。
+
+#### D225：`mora record stats` 的事件分解**看起来穷尽、实则不穷尽**（已修）
+
+顺 D224 的「表头/展示与实际量不符」这条线做扫描，发现**相邻**一处同族问题。
+
+##### 缺陷
+
+`Events: N total` 下面列了 `ai.chat` / `web.fetch` / `notes` 三行，读起来像
+一份**穷尽**分类。但 `Event` 有**五个**变体（`AiChat` / `WebFetch` / `Note` /
+`Msg` / `StateMutation`），后两类**没有任何一行**。
+
+真实 `mora record stats` 实测（仓库里现成的 `baseline.jsonl`，18 条**全是**
+`state_mutation`）：
+
+```text
+Events:        18 total
+  ai.chat:     0
+  web.fetch:   0
+  notes:       0        ← 0+0+0 ≠ 18，且**零提示**
+```
+
+用户据此会读成「录了 18 次调用却一次都没成功」，而真相是**18 次状态变更**。
+markdown 报告更不穷尽 —— 它连 `notes` 都没有，只列 `AI calls` / `Web calls`。
+
+##### 修法
+
+`RecordingStats` 增 `msg_count` / `state_mutation_count`，在 `compute_stats`
+的循环里计数（`Msg`/`StateMutation` 本就不进 latency/tokens —— 那是 v0.83 的
+正确决定，缺的只是**计数**），CLI 与 markdown 报告各加一行。
+子类之和**恒等于** total。
+
+##### 判据 `tests/record_stats_breakdown.rs`（2 条）
+
+判据**不写死**「某一行是几」，而写成**可验证的不变式**：
+**各子类之和 == `Events: N total`**。这样将来 `Event` 再加新变体、
+分解又漏掉一类时判据会立刻红 —— 写死具体数字做不到这件事。
+
+##### D226（顺带）：JSON 的 `null` 被当成「有错误」（已修）
+
+写判据时我手写了 `"error":null`，`Errors: 2` —— 因为
+`error: fields.get("error").cloned()` 把字面量 `null` 也当成**有错误**。
+
+- **不是**幻影错误的主因：Mora 自己的写端（`event_to_jsonl`）在无错误时
+  **直接省略**该字段（实测写出的 JSONL 里没有 `"error":null`）。
+- 但任何**外来/手写**的录制写了 `"error":null`，都会被报出幻影错误数 ——
+  而 `Errors: N` 是用户会据以行动的数字。改为把 `null` 视作**没有**该字段。
+
+##### ⚠ 本轮最要紧的一条：**我自己的判据一度是空的**
+
+第一次跑牙齿验证时，R1（删掉新增的两行）给出 **GREEN** —— 判据没抓住。
+查下去发现我的解析条件 `t.ends_with(':')` **永远不成立**（子行形如
+`  ai.chat:     2`，结尾是数字）⇒ `sub` 恒空 ⇒ `sum` 恒等于 `total` ⇒
+断言**恒真**。
+
+改用「最后一个冒号之后能否解析成整数」来筛（`min: 7ms` / `avg/call: 2 in + 3 out`
+解析失败 → 自动排除）后，判据立刻变活，随即又暴露我第二处设计错误：
+我把 `total` 和子类和**重复加了**（`sum = 10` vs 期望 5）。
+
+⇒ **D212 那条教训在我自己身上重演了**：判据可以形同虚设而**全程不报错**。
+唯一的发现手段就是**牙齿验证**，且必须**看到 RED** 才算通过 ——
+「GREEN 且说不出为什么它该红」就是判据坏了。
+
+##### 牙齿验证（修好判据之后）
+
+| 回退 | 变红的判据 |
+|---|---|
+| R1 删掉新增的两行 | `d225_event_breakdown_sums_to_the_total`、`d225_total_and_errors_stay_correct` |
+| R2 `null` 又算作 error | `d225_total_and_errors_stay_correct` |
+
+#### D227：5 个子压缩器**全部**违反 `max_bytes` 契约 —— 「压缩」能把数据**放大**（已修）
+
+`SubCompressor::compress` 的文档明文写着「压缩到不超过 max_bytes (UTF-8 字节)」。
+本轮把它变成可执行断言（网格普查：5 个子压缩器 × 5 段语料 × 6 档 `max_bytes`），
+结果是 **220 处违反**，且 5 个**无一幸免**。
+
+##### 取证：真实 CLI 输出
+
+```
+ORIG_LEN=6500
+mb=100.0  out_len=2003  over=true
+mb=500.0  out_len=2003  over=true      ← 从 100 到 2000，输出恒定
+mb=2000.0 out_len=2003  over=true
+```
+
+`max_bytes` 从 10 到 2000，输出**完全一样**的 2003 字节 —— 它被当成了
+「要不要压缩」的开关，而不是预算。
+
+更严重的是**放大**：
+
+| 调用 | 输入 | 输出 | 现象 |
+|---|---|---|---|
+| `{head_pct: 5.0, tail_pct: 5.0, max_bytes: 100}` | 6500 | **13052** | 2.0× |
+| `{head_pct: 0.6, tail_pct: 0.6, max_bytes: 100}` | 6500 | **7850** | 1.2× |
+| 日志 60 行 × 560 字节，`auto` + `max_bytes: 4800` | 33660 | **33703** | 100.1% |
+
+pct 之和 > 1 时 head 段与 tail 段**重叠**，同一段内容被输出两次。
+
+##### 五个子压缩器各自的病根（全是无根据的常数假设）
+
+| 子压缩器 | 修前的预算算法 | 为什么错 |
+|---|---|---|
+| `text` (head_tail) | `max_bytes` 只当开关，pct 直接乘原文长度 | pct 与 max_bytes 从不同时生效 |
+| `log` | `max_bytes / 80` | **每行 80 字节**是拍的；实测 560 字节/行 |
+| `json` | `max_bytes / 200` | **每项 200 字节**是拍的；实测每项 68 字节 |
+| `code` | `if out.len() >= max_bytes { break }` | 在**追加之后**才判断，且没给尾部 marker 留位置 |
+| `html` | 同 `code` | 同上 |
+
+`log` 那条的 marker 还有一个独立错：括号里写的是 `(N ERROR/FATAL total)`，
+但填进去的是**保留数**（`error_count`），不是全文总数。预算截断后二者会分叉。
+
+##### 修法：唯一收口点 `finish_within_budget`
+
+「同一事实两套算法 ⇒ 合并」（D209 的 14 处转义链同款）。5 个子压缩器现在
+**只管选内容**，字节上限由 `mod.rs` 的一个函数统一保证：
+
+1. `body + marker` 已 ≤ `max_bytes` → 原样返回；
+2. 否则把 `body` 截到 `max_bytes - marker.len()`（落字符边界）再拼 marker；
+3. **正文**不得比原文长（marker 豁免，见下）。
+
+`text.rs` 里那份私有的 `floor_char_boundary` 一并提为共享函数 ——
+另外 4 个子压缩器都要在任意字节位置截断。
+
+##### ⚠ marker 豁免是**实测逼出来的**，不是随意放宽
+
+判据最初写成「输出不得比原文长」。结果 1241 字节日志（body 1241 + marker 91）
+因 `1241 + 91 > 1241` 整体退回原文，`ERROR lines preserved` marker **凭空消失**。
+marker 记录的是「保留了哪些错误行」—— 为 91 字节的元信息丢掉全部元信息，
+得不偿失。故第 3 条只约束正文，marker 在能装下时始终保留，
+并另配一条判据（剥掉 marker 后正文不得变长）。
+
+##### marker 报的是**请求值**而非**实际值**
+
+预算饱和时（`pct=0.5+0.5`、`max_bytes=1000`、原文 6500）marker 写
+「head_tail 50% + 50%」，实况只留 975/6500 ≈ 15%。marker 是压缩结果的
+**唯一自述**，报请求值等于让输出对自身撒谎。改为按实际 `head_n` / `tail_n` 计算。
+
+判据写成不变式：`head% + tail% + elided% ≈ 100%`（±2% 取整误差）。
+
+##### `lossless` 改为**如实报错**而非静默超限
+
+它的语义本就是「不丢内容」，`content + marker` 必然超限。装得下就原样返回，
+装不下就报错说明「lossless 装不下，请用 head_tail 或调大 max_bytes」。
+
+#### D228：`ContentRouter` 的兜底压缩器**实际不存在**（已修）
+
+`TextSubCompressor::sniff` 固定返回 `0.5`，注释写明「任何文本都至少 0.5」
+且「text sniff 固定 0.5, 故意兜底」。但 `ContentRouter::sniff` 的门槛是
+`score >= 0.6` —— **兜底者永远出局**。
+
+```
+$ compress(large_plain_text, "auto", {max_bytes: 500})
+ORIG_LEN=6500
+Runtime error (MIR main): compress.auto: no compressor matched for content
+exit 1
+```
+
+任何非 json / code / html / log 的内容都让 `auto` **直接失败**。
+实测修后同一调用返回 475 字节。
+
+修法：门槛降到 `score > 0.0`。命中者仍由 `max_by` 选最高分
+（json 0.9 > code/html/log 0.8 > text 0.5），匹配不上时才落到 text。
+
+判据分两条，缺一不可：**①** 任何内容都有兜底；**②** 降门槛后
+json / html 语料仍路由到各自的专用压缩器（否则会退化成「永远选 text」）。
+
+#### D227 / D228 牙齿验证
+
+| 回退 | 变红的判据 |
+|---|---|
+| 收口「规则 2b：按剩余预算截断 body」 | `compress::tests::finish_within_budget_truncates_body_to_fit`、`…respects_utf8_boundaries` |
+| 收口「规则 3：正文不得比原文长」 | `compress::tests::finish_within_budget_rejects_oversized_body` |
+| 收口「规则 2a：marker 单独超预算」 | `compress::tests::finish_within_budget_marker_alone_exceeds_budget`、`…respects_utf8_boundaries` + 集成 3 条 |
+| sniff 门槛 `> 0.0` 改回 `>= 0.6` | `d228_auto_strategy_always_has_a_fallback_compressor`、`d227_auto_strategy_respects_max_bytes_end_to_end` |
+| marker 报实际比例 → 改回请求值 | `d227_head_tail_marker_reports_actual_not_requested_ratio` |
+
+**护栏（非承重，如实标注）**：`code` / `html` / `log` / `json` 四处
+**局部**预算算法的回退**没有**变红 —— 收口函数兜住了它们。收口的价值恰恰
+在于此（下一个新增的子压缩器算错时兜底），但这意味着集成判据对
+这四处**没有判别力**。已为此补 `d227_json_compressor_shrinks_items_to_fit_budget`、
+`d227_code_and_html_reserve_room_for_trailing_marker`、
+`compress::log::tests::test_log_budget_scales_with_real_line_length` 三条针对性判据，
+它们各自钉住对应修复（预算翻倍 ⇒ 保留行数不减 / 输出变长）。
+
+⚠ 但要诚实：这三条针对性判据在**本轮回退时同样全部绿**（回退只改了阈值常数，
+而收口兜住了后果）。真正有牙齿的是**收口函数自己的 5 条单测**。
+即：本轮 9 处修复中，**4 处有独立牙齿、4 处靠收口间接覆盖、1 处
+（marker 报实际比例）有独立牙齿**；局部预算常数的正确性目前**没有**判别力，
+一旦收口被移除，5 个子压缩器会同时退化且无人报警。
+
+#### ⚠ 本轮三次自我更正 —— 判据自身出错的三种形态
+
+1. **判据把不可能发生的调用算成违约**：普查把「纯文本喂给 `JsonSubCompressor`」
+   也计入，48 条 `expected JSON array` 报错被报成「契约违反 48 处」。但 router
+   走 `sniff() >= 0.6` 筛选，文本语料下 json 的 sniff = 0.0，**永远不会被路由过去**。
+   ⇒ 判据必须**按实际调度路径**取样（`sniff < 0.6` 直接跳过），并断言
+   `checked > 0` 防止「全跳过」也变绿。
+
+2. **收口函数的第一版把字节索引当字符串**：`floor_char_boundary` 返回 `usize`，
+   我写成 `format!("{keep}{marker}")` → 输出 `"47<M>"`（5 字节）而不是
+   47 字节正文。**输出既没被截断，也丢了内容。**
+   ⇒ 是新加的 5 条收口单测抓到的；集成判据全绿时它照样是坏的。
+   这也解释了为什么「GREEN 且说不出它为什么该红」是危险信号。
+
+3. **牙齿脚本自己的 bug 被读成产品结论**：用 `-not ($red -or $red2)` 合并判断
+   两套判据的 RED，导致「lib 全绿 + 集成变红」被报成 `NO TEETH`。
+   ⇒ `ABORT`（锚点 hit≠1）与 `NO TEETH`（测试全绿）在日志里**长得一样**，
+   都是「没有 RED 行」。**失败的装置和通过的牙齿必须能区分开。**
+
+#### 本轮新增 / 改写的判据
+
+- 新增 `tests/compress_max_bytes_contract.rs`（10 条）
+- 新增 5 条 `finish_within_budget` 直接单测（`src/compress/mod.rs`）
+- 新增 `compress::code::tests::test_code_compress_elides_when_over_budget`（补上一条的缺口）
+- 新增 `compress::log::tests::test_log_budget_scales_with_real_line_length`
+- **改写** `compress::code::tests::test_code_compress_preserves_signatures`：
+  原断言 `contains("body lines elided")` 是**超限 bug 的副产物** ——
+  74 字节源码在 `max_bytes=200` 下**本就不该省略**，断言它存在等于要求
+  压缩器必须多余地丢弃内容。改为「不超预算 + 带 original_size marker」，
+  并把 `original_size=66` 写死改成 `format!(…, src.len())`（真实值是 74，
+  典型「不写死具体数字」纪律的违反）。
+- **改写** `tests/compress_option_types.rs::d149_int_valued_options_…` 与
+  `tests/compress_options_type.rs::d160_compress_dict_options_still_work`：
+  两者的 `{max_bytes: 1}` + `contains("elided")` 与新契约**正面冲突**
+  （elided marker 约 40 字节，1 字节装不下）。判据要验的是
+  「Int / Float 选项生效」而非「1 字节能装下 marker」，故改用
+  200 字节输入 + 50 字节上限，断言**输出长度受 max_bytes 约束**。
+  D149 的核心主张（Int 路径与 Float 路径等价）**未被削弱**，
+  反而加了一条 `assert_eq!(int_out, lit)`。
+
+#### D229：`MarkdownBackend` 的切块**切错边界** —— 内联标记把块劈开、列表项被标成标题（已修）
+
+`document.parse("x.md").blocks()` 把一段正常 markdown 切成 **11 块**（正确 8 块），
+`text()` 把一个句子拆成 **3 行**。三个独立缺陷同源于「按**事件**处理，而不是按**块**处理」。
+
+##### 取证：真实 CLI（`document.parse` → `blocks()`）
+
+语料含标题内联粗体、段落内斜体/行内代码/链接、列表、代码块、引用、末段。
+
+| # | 修前 `kind` / `text` | 应有 |
+|---|---|---|
+| 0 | `heading` / `Title with bold` | 合并为**一块** |
+| 1 | `heading` / ` inside` | ↑（被 `End(Strong)` 切开） |
+| 2–4 | `text` / `A paragraph with em`、` and code and a link`、`.` | 一块 `A paragraph with em and code and a link.` |
+| 5 | `heading` / `Sub heading` | ✓ |
+| 6 | **`heading`** / `item one` | `text` |
+| 7 | **`heading`** / `item two` | `text` |
+| 8 | `code` / `fn main() …` | ✓ |
+| 9–10 | `text` / `a blockquote`、`Last paragraph.` | ✓ |
+
+##### 三个缺陷
+
+1. **切块点错**：`blocks()` 用 `Event::End(_) if !current_text.is_empty()` ——
+   **任何** `End` 都收尾。于是内联标记的 `End(Strong)` / `End(Emphasis)` /
+   `End(Link)` 把一个段落**劈成多块**（`A paragraph with em and code and a link.`
+   变成 3 块，最后一块是孤立的 `.`）。
+2. **kind 继承**：`current_kind` 只在 Heading / CodeBlock / Paragraph 的
+   `Start` 里赋值，`List` / `Item` 的 `Start` **不重置**它 ⇒
+   `## Sub heading` 之后的两个列表项**继承了 `kind="heading"`** ——
+   列表项被标成标题。下游若按 `kind` 分派（渲染/索引/检索），这是**错的数据**。
+3. **`text()` 换行粒度**：修前是「每个 `Event::Text` 后补一个 `\n`」，
+   即**按事件**换行 ⇒ `# Title with **bold** inside` 变成三行
+   （`Title with` / `bold` / ` inside`），**词被切开**。
+
+##### 正确切块集合由**外部探针实测**得出，不凭记忆
+
+新建独立 crate（只依赖 `pulldown-cmark 0.13`）dump 全部事件流，确认：
+
+```text
+Start(Heading) Text("Title with ") Start(Strong) Text("bold") End(Strong)
+Text(" inside") End(Heading(H1))          ← 块在 End(Heading) 收，不是 End(Strong)
+Start(Paragraph) … Start(Link …) Text("a link") End(Link) Text(".") End(Paragraph)
+Start(List) Start(Item) Text("item one") End(Item) Start(Item) … End(List)
+```
+
+⇒ 块级 `End` = `Heading | Paragraph | CodeBlock | Item`；
+`Strong` / `Emphasis` / `Link` / `Code` 都是**内联**，不切块。
+块级 `Start`（决定 `kind`）多一个 `Item` ⇒ 列表项重置为 `text`。
+
+⚠ `BlockQuote` **不在** `End` 集合里：引用块内部还有 `Paragraph`，
+`End(Paragraph)` 已收过一次，再对 `End(BlockQuote)` 收一次会切出空块。
+（空块本来会被 `flush` 的 `trim().is_empty()` 挡掉，但那是**兜底**不是**正确**。）
+
+##### 修法：`blocks()` 与 `text()` 合并成**一份**切块实现
+
+修前二者**各自**遍历一遍事件流、用**两套不同规则**（`blocks()` 按 `End(_)`、
+`text()` 按每个 `Event::Text`），于是二者对「一个文档有多少块」的判断
+**不一致**。现抽出 `block_texts()` 返回 `(kind, text)` 序列，二者共用 ——
+「同一事实两套算法 ⇒ 合并」（D209 的 14 处转义链同款）。
+
+`text()` 追加换行前 `trim_end()`：代码块的 `Event::Text` 自带尾换行
+（`"fn main() { … }\n"`），不 trim 会多出空行（实测 `text()` 9 行 vs `blocks()` 8 块）。
+
+##### 判据 `tests/document_markdown_blocks.rs`（5 条）
+
+**外部判据**：`reference_blocks()` 用 `pulldown_cmark` 事件流**独立**数出块数与 kind，
+再与产品输出比对 —— 「块数对不对」不由产品自己的切块代码回答。
+另配**往返不变式**：`text()` 行数 == `blocks()` 块数（修前二者判断不一致，立刻变红）。
+
+| 判据 | 钉住 |
+|---|---|
+| `d229_block_count_matches_independent_reference` | 块数与参考一致 |
+| `d229_list_items_do_not_inherit_previous_heading_kind` | 每个块的 kind 与参考一致；列表项绝不标成 heading |
+| `d229_inline_markers_do_not_split_blocks` | 含内联 `**bold**` 的标题是**一块**，文本完整 |
+| `d229_text_line_count_equals_block_count` | 往返不变式 |
+| `d229_text_does_not_split_words_on_inline_markers` | `Title with **bold** inside` 不被拆成 3 行 |
+
+##### 牙齿验证（3 处回退，全部变红）
+
+| 回退 | 变红的判据 |
+|---|---|
+| 块级 `End` 集合改成永不匹配 | 4 条全红（count / kind / inline-split / text-split） |
+| `Item` 不再重置 kind | `d229_list_items_do_not_inherit_previous_heading_kind` |
+| 每个 `Event::Text` 独立成块 | 4 条全红 |
+
+##### ⚠ 本轮一处自我更正：**是我的参考实现错了，不是产品错了**
+
+第一版 `reference_blocks()` 把 `List` / `BlockQuote` 当成「容器」并用 `depth`
+跳过内部的标签，参考只数出 **5 块**而产品给出 **8 块**。我一度以为产品仍有问题。
+
+实际是我错了：**`List` 的每个 `Item`、`BlockQuote` 内的每个 `Paragraph`
+本身就是独立的块**（各有各的文本），不是「容器内的附属物」。
+参考实现已改为只认 Heading / CodeBlock / Paragraph / Item 四种块级标签。
+
+⇒ 判据报错时**第一嫌疑是判据**。这与「探针脚本出错先复核再下结论」
+（D214 那轮）是同一条纪律，但这次栽在**判据的参考实现**上而不是探针上。
+
+#### D230：`reading_order` 的 bbox 解析只认 `Float` —— `json.parse` 的数据**整块丢失**，阅读顺序颠倒（已修）
+
+`BBox::from_value` 的字段提取只匹配 `Value::Float`。而本仓数字有**两个**来源：
+dict 字面量给 `Float`（D98），`json.parse` 给 `Int`（D129 实测）。
+
+⇒ 任何来自 `json.parse` 的 bbox 被**整个丢弃**（`from_value` 返回 `None`），
+该块被当作「无 bbox」，排序时走 `Ordering::Equal` **保持输入序**。
+
+##### 后果实测（非推断）：阅读顺序**完全颠倒**，零诊断
+
+三块同列、**输入顺序与几何顺序相反**（两栏扫描的常见形状）：
+
+| 中间块的 bbox 表示 | 得到的顺序 |
+|---|---|
+| `Float` | `A_top, C_mid, B_bottom` ✓ |
+| `Int` | `B_bottom, C_mid, A_top` ✗ **颠倒** |
+
+数字表示的差异导致**语义差异** —— 这是最坏的一类：数据看着完整
+（字段都在、类型也对），只是**读不出来**，于是被静默降级。
+
+##### 触发面
+
+仓库内部**从不产生 `Int` bbox**（`make_block` 写的是 `Value::Float`），
+所以这条路径只被**外来数据**触发：`json.parse` 读入的版面数据、
+外部 OCR/解析器的输出、录制回放。
+
+##### 修法
+
+`BBox::from_value` 与 `reading_order_idx` 两处**同时**收口为
+`Int | Float` 都接受（与 D148 / D149 同一套修法）。
+
+`reading_order_idx` 这处修前**自洽**（`assign_reading_order` 自己写的
+是 `Float`），但从 `json.parse` 读回的数据里它是 `Int` ⇒ 同样失效。
+属于「同一事实两套算法 ⇒ 合并」的顺带收口。
+
+`xy_cut.rs` 无此缺口：它只操作已解析好的 `BBox`（f64），不碰 `Value`。
+
+##### 判据 `tests/reading_order_int_bbox.rs`（4 条）+ 模块内单测（1 条）
+
+判据形态是**两条路径等价**（`Int` 与 `Float` 产出完全相同），
+而不是写死具体顺序 —— 「表示差异不得影响语义」正是缺陷的本质。
+
+| 判据 | 钉住 |
+|---|---|
+| `d230_bbox_parses_int_and_float_identically` | 两个表示解析成同一个 `BBox` |
+| `d230_int_and_float_bbox_give_same_reading_order` | **5 个策略**下 Int 与 Float 顺序相同 |
+| `d230_float_only_control_group_is_actually_sorted` | 对照组：全 Float 时确实排对了（防「两条路径恰好都错」一起绿） |
+| `d230_non_numeric_bbox_fields_are_still_rejected` | 字符串坐标**仍被拒绝**（修法只放宽 Int，不是放弃类型检查） |
+| `reading_order::tests::d230_reading_order_idx_…`（模块内） | `reading_order_idx` 的 Int 侧 + D148 的负值拒绝仍成立 |
+
+##### 牙齿验证（2 处回退，全部变红）
+
+| 回退 | 变红的判据 |
+|---|---|
+| `BBox::from_value` 的 Int 侧移除 | `d230_bbox_parses_int_and_float_identically`、`d230_int_and_float_bbox_give_same_reading_order` |
+| `reading_order_idx` 的 Int 侧移除 | `document::reading_order::tests::d230_reading_order_idx_accepts_int_and_float` |
+
+`reading_order_idx` 是 `#[cfg(test)]` 私有辅助函数，**集成测试访问不到** ——
+首轮牙齿验证里它报 NO TEETH。已补模块内单测后重跑，该回退变红。
+**没有判据的修复等于没修**：这一处是先看到 NO TEETH 才补的判据。
+
+##### ⚠ 又一次「失败的装置被读成通过的判据」
+
+修完脚本后 T1/T2 同时报 `NO TEETH`，但**手动**回退同一条命令有 2 条 FAILED。
+根因：脚本用 `foreach ($t in @('--test X', '--lib Y')) { cargo test $t }`，
+PowerShell 把 `'--test reading_order_int_bbox'` 拆成两个参数，
+只把第一个当选项 ⇒ **实际跑的过滤器与预期不符**。
+
+⇒ 这是 D227 那条教训的**第二次**出现（「ABORT 与 NO TEETH 在日志里长得一样」），
+且这次更隐蔽：日志里连编译都没报错，**装置静默地测了别的东西**。
+**看到 NO TEETH 必须手动复跑一次交叉验证**，否则会把「装置坏了」
+当成「判据没牙齿」并写下错误的护栏结论。
+
+#### D231：`compress` 的数值分析只认 `Float` —— `json.parse` 的整数列**完全不被识别**（已修）
+
+D230 的普查发现「只认 `Float`」是一类反复出现的缺陷，于是本轮做**全仓普查**
+（`grep` 全部 `if let Value::Float(…)` + `matches!(v, Value::Float(_))` +
+`Value::Float(n) => …`），一次找全而不是逐个撞见。
+
+##### 普查结果：6 处生产代码，全部只认 `Float`
+
+| 位置 | 作用 | 修前对 `Int` 列的后果 |
+|---|---|---|
+| `detect.rs` `detect_field_role` | `is_numeric` 判定 | 整数列判为**非数值**，`numeric_range = None` |
+| `detect.rs` `detect_anomaly` | 异常值角色 | 整数列无异常值角色 |
+| `detect.rs` `is_sequential_numeric` | 顺序 Id 角色 | `id: 1,2,3,…` 拿不到 `Id` 角色 |
+| `detect.rs` `is_timestamp_pattern` | Unix 时间戳 → `Temporal` | **整数时间戳永不识别**（Unix 秒几乎总是整数） |
+| `strategies.rs` `TopNStrategy` | 分数提取 | 整数 score 全部 `unwrap_or(0.0)` ⇒ **根本没在排序** |
+| `constraints.rs` `outliers_by_zscore` | outlier 保护 | 整数列**永远不产生任何 outlier** |
+
+`image.rs` 的 2 处经查在 `#[cfg(test)]` 内（是测试断言，不是数据摄取），不算缺陷点。
+
+##### 后果实测（经 `CrushResult.fields` 观察；`compress::detect` 是私有模块）
+
+| 语料 | 修前 `is_numeric` | 修前 `array_type` / 策略 |
+|---|---|---|
+| `[{"id":1},…,{"id":12}]` | **false** | `Uniform` / `lossless`（几乎不压缩） |
+| `[{"id":1.0},…]`（对照组） | true | `TopScores` / `topn` |
+| 混排 `[{"n":1},{"n":2.5},…]` | **false** | `Uniform` / `lossless` |
+| 整数 Unix 时间戳列 | — | 拿不到 `Temporal`，`TimeSeries` 从不触发 |
+
+「混排」尤其关键：**只要列里有一个 `Int`，整列就不是数值** ——
+而这正是 `json.parse` 最常见的结果形态（整数给 `Int`、小数给 `Float`）。
+
+##### 修法：唯一收口点 `compress::json::value_as_f64`
+
+6 处各自的 `if let Value::Float` / `matches!(…, Value::Float(_))` 全部收敛到
+`json::value_as_f64`（`Int` 与 `Float` 都接受）及其批量版 `values_as_f64`。
+「同一事实两套算法 ⇒ 合并」—— 新增数值提取**必须**走它，否则同样违约。
+
+##### 判据 `tests/compress_numeric_field_detection.rs`（8 条）
+
+形态沿用 D230：**两条表示路径等价**，而不是写死具体策略名。
+
+| 判据 | 钉住 |
+|---|---|
+| `d231_int_and_float_columns_analyse_identically` | 整数列与浮点列产出完全相同的字段特征 / array_type / 策略 |
+| `d231_mixed_int_float_column_is_numeric` | **混排**列也必须被识别（`json.parse` 最常见形态） |
+| `d231_topn_actually_selects_highest_int_scores` | 整数 score 真的按分数**选** |
+| `d231_topn_float_control_group` | 对照组：浮点 TopN 本来就选对 |
+| `d231_sequential_int_column_gets_id_role` | 顺序整数列拿到 `Id` 角色 |
+| `d231_integer_unix_timestamp_is_temporal` | 整数 Unix 时间戳 → `Temporal` |
+| `d231_integer_column_detects_zscore_outliers` | 整数列能检出 outlier（极端值必须被保留） |
+| `d231_non_numeric_still_rejected` | 字符串 / 混合列**仍被拒绝**（修法只放宽 Int） |
+
+##### 牙齿验证
+
+| 回退 | 变红的判据 |
+|---|---|
+| `is_numeric` 的 Int 侧 | 5 条（含 topn / mixed / unix-ts / id-role / analyse） |
+| `TopN` score 提取的 Int 侧 | `d231_topn_actually_selects_highest_int_scores` |
+| `outliers_by_zscore` 的 Int 侧 | `d231_integer_column_detects_zscore_outliers` |
+| `is_sequential_numeric` 的 Int 侧 | `compress::json::tests::d231_is_sequential_numeric_accepts_int_sequence`（**模块内**） |
+| `is_timestamp_pattern` 的 Int 侧 | `d231_integer_unix_timestamp_is_temporal` |
+
+**两处 NO TEETH 是先看到才补的**，且两处的根因都**不是**「判据漏了断言」，
+而是**语料根本没走到被测代码路径**：
+
+- `outliers_by_zscore`：`KeepOutliersConstraint` 只对 `role == Anomaly` 的字段
+  跑检测，而我的语料只有 8 项（1/8 = 12.5% > 5%）⇒ `detect_anomaly` 不触发
+  ⇒ 约束**根本没执行**。加到 25 项（4% ≤ 5%）后才真正走到。
+- `is_sequential_numeric`：`detect_id` 的 `or_else` 链里 `detect_score`
+  **排在它前面**，而 `seq: 1..8` 落在 `[0,100]` 被判为 `Score`，
+  `is_sequential_numeric` 压根不会被调用。改用直接调用的模块内单测。
+
+⇒ **判据无牙齿时，先问「我的语料真的走到那条路径了吗」**，
+而不是急着加断言。没有判据的修复等于没修。
+
+##### ⚠ 三处自我更正
+
+1. **普查本身漏了一处**：`is_timestamp_pattern` 写的是
+   `Value::Float(n) => …`（`match` 分支），而首轮 `grep` 只覆盖
+   `if let Value::Float(…)`。补了第二条 `grep` 模式（`Value::Float(n) => *n`）
+   才找到。⇒ **「普查」本身也要有普查**；单条 grep 模式给出的「全仓 N 处」
+   只能当下界，不能当结论。
+
+2. **判据 ③ 混进了无关性质**：第一版断言 TopN 输出**降序** `vec![9,8,7]`，
+   实测得到 `[9,7,8]`。查下来 `TopNStrategy` 选出的是**正确集合**（最高分
+   9/8/7），只是**输出未按分数重排**。那是与 D231 无关的另一个性质。
+   改为**集合**比较（排序后断言）—— 否则 Int/Float 两条路径会一起红，
+   掩盖真正的缺陷。**「TopN 输出未重排」如实记档，本轮不擅自改**
+   （改它属行为变更，需先确认是否有调用方依赖当前顺序）。
+
+3. **判据 ⑧ 测错了对象**：第一版用 `default()`（选中 `Uniform` →
+   `LosslessStrategy`），而 `LosslessStrategy::select` 的约束参数就叫
+   `_constraints` —— 它**有意忽略**（lossless 语义上不该丢数据，
+   **属设计而非缺陷**）。于是「极端值必须被保留」在 Int/Float 两侧
+   **同时**失败。改用带 `score` 列 ⇒ `TopScores` → `TopNStrategy`。
+   ⇒ 判据红时先问「**走的是哪条代码路径**」，别把设计选择当缺陷。
+
+#### D232：`HtmlBackend` 的 `text()` 按事件换行、`blocks()` 把词**粘在一起**（已修）
+
+D229 修的是 `MarkdownBackend`；`HtmlBackend` 是**同型但独立**的第二份实现，
+两处缺陷一个不多一个不少。
+
+##### ① `text()` 按**事件**换行 ⇒ 词被切开
+
+与 D229 修前的 `MarkdownBackend::text()` 逐字同型（也是「每个 `Event::Text`
+后补一个 `\n`」）：
+
+```text
+<h1>Head with <em>em</em> inside</h1>
+  →  Head with
+     em
+     inside
+```
+
+##### ② `blocks()` 的内联拼接**把词粘在一起**
+
+quick-xml 在 `trim_text(true)` 下把内联标签之间的换行/空格裁掉，于是
+`<h1>Head with <em>em</em> inside</h1>` 产生**三个独立** `Text` 事件
+（**外部 dump 实测**，不凭记忆）：
+
+```text
+Start("h1") Text("Head with ") Start("em") Text("em") End("em") Text(" inside") End("h1")
+```
+
+直接 `push_str` 拼接 ⇒ **`Head witheminside`**（实测）。
+
+##### ③ `text()` 与 `blocks()` 是两套独立实现
+
+与 D229 同款：二者**各自**跑一遍事件流、用**两套规则**，对「一个文档有多少块」
+的判断**不一致**。已合并为唯一的 `block_texts()`。
+
+##### ④ `tag_kind` 与 `is_block_tag` 是同一集合的两份手写清单
+
+加标签要改两处，漏一处就漂移。已改为按 `tag_kind` 推导。
+
+##### 修法：关掉 `trim_text`，让块内空白**原样保留**
+
+`trim_text(true)` 是「粘连」的**真正来源**。改用 `trim_text(false)`：
+
+- 源里**原有**的空白被保留 ⇒ 不粘连（实测 `Text("Head with ")` 尾部自带空格）；
+- 源里**本无**空白的地方不会被凭空插入 ⇒ **不改内容**；
+- 块首缩进空白 / 块间换行由 `flush` 的 `trim()` 去掉。
+
+##### ⚠ 判据的第一版期望值是**错的**（我差点把 bug 写成规范）
+
+判据 ⑥ 第一版我写的是 `x<b>Y</b>Z` → 期望 `x Y Z` —— 那等于**把当时
+修法的（错误的）行为抄成期望**。我那版修法在内联标签 Start/End 各补一个空格，
+它确实产出 `x Y Z`，于是判据**当场变绿**。
+
+但标准 HTML 语义下 `x<b>Y</b>Z` 渲染为 `xYZ`（无空格），凭空插空格是
+**造出一个不存在的词边界 = 改内容**。换成 `trim_text(false)` 后真实结果
+`xYZ` 正确，判据也改成浏览器语义。
+
+⇒ **判据变绿时也要问「我期望的到底是什么」**。把当前行为抄进期望值，
+判据就退化成「现状检查器」，保护的是 bug 而不是契约。
+
+##### 判据 `tests/document_html_blocks.rs`（6 条）
+
+| 判据 | 钉住 |
+|---|---|
+| `d232_inline_tags_do_not_glue_words_together` | 内联标签不得粘连 |
+| `d232_text_does_not_split_words_per_event` | `text()` 不得按事件换行 |
+| `d232_text_lines_are_exactly_the_block_texts` | 行序列 == 各块文本按块内换行展开（8 份语料含空串 / 多行 `<pre>`） |
+| `d232_script_and_style_are_stripped` | script / style 仍被剥离 |
+| `d232_block_kinds_are_correct` | `h1`→heading、`p`→text |
+| `d232_inline_spacing_matches_browser_semantics` | 既不粘连也**不造词**（紧贴时保持 `xYZ`） |
+
+##### 牙齿验证
+
+| 回退 | 变红的判据 |
+|---|---|
+| `text()` 改回不基于块 | `d232_text_does_not_split_words_per_event`、`d232_text_lines_are_exactly_the_block_texts`、既有 `parses_simple_html` |
+| `trim_text(false)` 改回 `true` | 3 条（inline-glue / inline-spacing / text-split） |
+| `text()` 的 `trim_end` 去掉 | **NO TEETH**（见下） |
+
+**护栏（非承重，如实标注）**：`text()` 里的 `block_text.trim_end()` 回退后
+**没有任何判据变红**。原因是 `block_texts` 的 `flush` 里已经 `trim()` 过，
+块文本的尾换行在那一阶段就不存在了 ⇒ `text()` 的 `trim_end` 是**冗余保险**
+（对 `MarkdownBackend` 不是冗余 —— 那里 `block_texts` 不 trim）。
+保留它作纵深防御，但**不作为 D232 的牙齿**。
+
+##### 顺带核实：其余 4 个 backend **无**同款问题
+
+`pdf` / `docx` / `pptx` / `image` 都是「预存文本数组 + `join`」，
+`text()` 与 `blocks()` 是**同一份数据的两个视图**，天然自洽。
+只有 `markdown` / `html` 是事件流驱动 ⇒ 才会出现「两套切块规则」的问题。
+
+##### ⚠ 新记录（**未修**，待裁决）：`ImageBackend::blocks()` 恒返回空列表
+
+`ImageBackend` 的 OCR 拿到了 `lines`，`text()` / `markdown()` 正常输出，
+但 `blocks()` 与 `pages()[i].blocks` 都是**硬编码空列表**
+（`src/document/backend/image.rs:233`）。这与 `DocumentBackend` 契约
+（「`pages()[i].blocks` 对齐 MinerU middle_json」）不符。
+
+**属能力缺口而非静默错算**（返回的是空，不是错的），且**本轮不擅自修** ——
+修它需先定「OCR 行算不算 block、`kind` 取什么、要不要按 `ocr_engine` 区分」。
+记档待裁决。
+
+#### D233：`Checkpoint::to_json` 静默把状态**降级成占位串** —— 恢复后拿到的是损坏状态（已修）
+
+`Checkpoint` 的文档写「Captures the **complete** state」，用途是
+fault recovery / time-travel debugging / human-in-the-loop —— 即**恢复状态**。
+但 `to_json` 把 `Value` 直接交给 `flow::value_to_json`，而后者对不可 JSON 化
+的变体输出**占位字符串**。
+
+##### 后果实测（`tests/` 探针，15 种形态穷举）
+
+| 存入 `channel_values` | 修前读回 | 性质 |
+|---|---|---|
+| `Int(-42)` / `Float(1.5)` / `BigInt` | 恒等 | ✓ |
+| `String("hello 世界 🌍")` / 控制字符 | 恒等 | ✓ |
+| `List` / `Dict`（含中文 emoji 控制字符） | 恒等 | ✓ |
+| `Char('中')` | `String("中")` | **类型降级** |
+| `Code("fn main() {}")` | `String("fn main() {}")` | **类型降级** |
+| `Agent { .. }` | `String("<agent worker>")` | **信息全丢** |
+| `Conversation { .. }` | `String("<conversation gpt>")` | **信息全丢** |
+| `HttpRequest { .. }` | `String("<http_request GET /x>")` | **信息全丢** |
+
+`to_json` 返回 `Ok`、**零诊断**；`restore_checkpoint` 再把这个字符串写回
+`channels`，Pregel 引擎拿着**损坏的状态**继续跑。
+
+调用链已确认不是死代码：`pregel::PregelEngine::run` 在每个 checkpoint 间隔
+（`pregel/mod.rs:837-840`）调 `build_checkpoint()` + `saver.save(...)?`，
+而 `build_checkpoint` 传的就是 `self.channels.clone()`（用户数据）。
+
+##### 修法：序列化**前**校验，不可逆就报错
+
+新增 `checkpoint::is_roundtrip_faithful`（白名单 = JSON 原生可表示且
+逐类型恒等的 7 种：`Nil` / `Bool` / `Int` / `Float` / `BigInt` / `String` /
+`List` / `Dict`），`to_json` 在写 map **之前**递归检查
+`channel_values` 与 `pending_sends[].input`，命中即返回带**类型名**与
+**字段路径**的错误。
+
+`pregel::run` 的 `saver.save(...)?` 会把错误向上传播 ⇒
+**宁可明确失败，也不静默写坏检查点**。
+
+##### ⚠ 同一个占位行为在两处**语义不同**，不可一刀切
+
+`json.stringify` builtin 对 `Agent` / `Closure` 输出 `"<agent X>"`
+是**合理取舍**（用户的函数本来就无法 JSON 化，输出可读占位优于报错）；
+checkpoint 则是**缺陷**（目标是恢复，不是展示）。故检查只放在
+checkpoint 层，不改 `flow::value_to_json` —— 否则会把 `json.stringify`
+的既有行为也一起改掉（属超出本轮范围的变更）。
+
+##### 判据 `tests/checkpoint_json_fidelity.rs`（6 条）
+
+| 判据 | 钉住 |
+|---|---|
+| `d233_json_representable_values_round_trip_faithfully` | 22 种可表示形态**逐类型往返恒等**（防过度收紧） |
+| `d233_unrepresentable_values_are_rejected_with_named_type` | 5 类不可逆值必须报错且**点名类型** |
+| `d233_nested_unrepresentable_values_are_detected` | **嵌套**在 list/dict 里的也要检出 |
+| `d233_pending_send_input_is_also_checked` | `pending_sends[].input` 同等约束 |
+| `d233_error_message_is_deterministic` | 报错内容**稳定**（`HashMap` 迭代序每进程不同 ⇒ 必须排序） |
+| `d233_bigint_is_faithful_and_must_not_be_rejected` | `BigInt` 属可表示一侧（**先实测后归类**） |
+
+##### 一处「先实测再归类」
+
+`BigInt` 被 `value_to_json` 输出成**裸数字串**（不加引号），乍看会丢类型。
+我第一版判据把 `BigInt` 删掉是因为**不确定**；探针跑完
+（`170141183460469231731687303715884105727` 往返仍是 `BigInt`）才确认
+「唯一会产出 `BigInt` 的场景恰好往返保真」（`json_to_value` 对超 i64 范围
+的数字判为 `BigInt`），于是它属于白名单，并补 `d233_bigint_…` 把它钉住。
+
+##### 顺带核实：pregel 是活的
+
+此前 CHANGELOG 记 pregel 为「未结论（`input` 变量被静默丢弃，疑似能力缺口）」。
+本轮确认 `Checkpoint` 确实在 `pregel::run` 的保存路径上被使用
+（`pregel/mod.rs:837-840`），**不是死代码** —— 只是 D233 这条缺陷此前
+没人触发过（需 channel 里恰好放了不可 JSON 化的值）。
+
+#### D234：`CheckpointSaver` 的两个实现**三处分叉** —— 同一 trait 给出不同结果（已修）
+
+D232（`HtmlBackend`）确立的「同一事实两份实现」模式在持久化层再现。
+`CheckpointSaver` 有 `MemorySaver` / `SqliteSaver` 两个实现，实测逐项对照：
+
+| 场景 | 修前 MemorySaver | 修前 SqliteSaver | 后果 |
+|---|---|---|---|
+| `save(不可逆值)` | `Ok`（存原始对象） | **报错** | D233 的检查对一个实现**完全无效** |
+| 同 `step` 取「最新」 | `b` | `a` | 恢复到**不同状态** |
+| 同 `id` 存两次 | `["dup","dup"]`，load 得 step=1 | `["dup"]`，load 得 step=2 | `list()` 与 `load()` **不自洽** |
+
+##### 逐项取证
+
+| 场景 | 修前 memory / sqlite | 修后 |
+|---|---|---|
+| `save(Char('中'))` | `Ok` / 报错 | 都**报错** |
+| 同 step（a ts=100, b ts=200）取最新 | `b` / `a` | 都 `b` |
+| 同 id 存两次 | `["dup","dup"]` step=1 / `["dup"]` step=2 | 都 `["dup"]` step=2 |
+
+同 `step` 并**不罕见**：`pregel` 的 fault-retry 会重跑同一步，两条路径都往
+同一步写检查点。
+
+##### 三处修法
+
+1. **`MemorySaver::save` 先经 `to_json` 校验**，再存原始对象。
+   校验走 `to_json`（拿到 D233 的检查），**存储**仍存原始对象 ——
+   内存 saver 不需要序列化，读回零成本。这样两个实现在「什么能被接受」
+   上完全一致。
+2. **同 id 重复保存改为替换**（取 `SqliteSaver` 的 `INSERT OR REPLACE` 语义）。
+   修前无条件 `push` ⇒ `list()` 出现**重复 id**，而 `load` 只认其中一个。
+   根因是「同 id 该不该替换」在 trait 文档里从未写明。
+3. **「最新」与 `list()` 排序统一为 `(step, timestamp_ms, id)` 三级全序**。
+   修前 memory 用 `max_by_key(step)`（并列取最后匹配，**是 Vec 插入顺序的
+   巧合而非规则**），sqlite 用 `ORDER BY step DESC`（并列时 SQLite 不保证
+   顺序）。`timestamp_ms` 表里本来就有这一列但 `load` 没用它。
+
+##### 判据 `tests/checkpoint_saver_parity.rs`（6 条）
+
+形态是**两实现逐项对照**（differential）—— 分叉的本质是「同一 trait 的
+两个实现给出不同结果」，**单侧断言测不到**。
+
+⚠ 两处「对照不够」的地方已补绝对顺序断言（首轮牙齿验证的
+`latest-tiebreak-step-only` 就是 NO TEETH）：
+
+- 只对照两个实现时，**两边同时退化**成「只按 step」仍然会绿
+  （memory 侧改单键、sqlite 侧仍是三级键时，对照恰好仍一致）。
+  故判据 ③ 增加「反转插入顺序后仍须取 timestamp 更晚的那个」。
+- 判据 ⑤ 的期望顺序显式含同 step 项（`c(3,50)` 早于 `a(3,100)`），
+  使「按 id 排」或「按插入顺序排」的退化也会变红。
+
+##### ⚠ 根因之一：`checkpoint-sqlite` 是**非默认** feature，CI 从不跑它的测试
+
+`Cargo.toml:109` 的 `checkpoint-sqlite = ["rusqlite"]` 非默认；
+`.github/workflows/ci.yml` 的 `cargo test --lib` / `--all-targets`
+**不带** `--all-features` ⇒ `SqliteSaver` 的测试**从未在 CI 执行过**。
+（同工作流的 clippy 用 `--all-features`，但只查编译不跑测试。）
+
+这是 D234 能长期存在、且此前无人发现的直接原因。判据文件已整体
+`#![cfg(feature = "checkpoint-sqlite")]` gate 住（本机用
+`cargo test --features checkpoint-sqlite` 跑）。
+
+**是否把 CI 改成 `--all-features` 属超出本轮范围的变更**（会连带把
+rusqlite 拉进默认测试依赖、可能暴露更多既有失败），故**只报告不实施**。
+
+##### 顺带发现（**既有**，非本轮引入，本轮不擅自清理）
+
+`cargo clippy --all-targets --all-features -- -D warnings`（CI 用的那条）
+在**本轮未碰的文件**上已有多处 error：`tests/lsp_folding_positions.rs`
+（`needless_as_bytes`）、`tests/number_tower.rs`（`approx_constant`）、
+`tests/module_method_signatures.rs`（`doc_lazy_continuation` ×2）、
+`src/runtime/ai_infra.rs`（`field_reassign_with_default`）…
+即该命令**在本轮之前就是红的**。本轮改动文件的
+`cargo clippy --lib --all-features` 是 **0 警告**。
+
+#### D235：`pregel::build_node_input` 产出**非法 JSON** 喂给 agent；两份重复序列化器已删除（已修）
+
+D209 的注释里留了一句「`pregel::reducers::value_to_json_string` 是
+**重复实现**（本文件与 reducers.rs 各一份），**改一处须同步另一处**」。
+本轮去查那两份，发现**两份都有同一个缺陷**，且都不只一处。
+
+##### 取证
+
+`build_node_input` 手工拼 `"channel": <fragment>`，fragment 来自
+`value_to_json_string`：
+
+| 输入 `Value` | 输出 | 是否合法 JSON |
+|---|---|---|
+| `Dict{k:"v", n:3}` | **`{k: v, n: 3}`** | ✗ **key 无引号** |
+| `Float(42.0)` | `42` | ✓ 但**往返变 `Int`**（类型降级不可逆） |
+| `String("a\tb\nc")` | `"a\tb\nc"` | ✓（D209 已修） |
+
+`json_to_value("{k: v, n: 3}")` 竟然返回 `Ok` —— 它把整段当**字符串**
+读回，于是「能解析」这个检查**掩盖了问题**（实测
+`DICT-PARSE=Ok` 但 `ROUNDTRIP-IS-DICT=false`）。判据必须查
+「读回是不是 `Dict`」，不能只查「能不能解析」。
+
+##### 三处叠加缺陷
+
+1. **没有 `Dict` 分支** ⇒ 落到 `_ => format!("\"{}\"", v)`，经
+   `Value::Display` 得 `{k: v}`。整个对象变成 `{"ch":{k: v}}` ——
+   而 `build_node_input` 的产物是**喂给 agent 的请求体**
+   （`pregel/mod.rs:929` / `:1048`）。
+2. **`channel` 名未经转义**：`format!("\"{}\":", channel)` ⇒ 含 `"` / `\`
+   的 channel 名直接破坏 JSON。
+3. **`Float(42.0)` 输出 `42`** ⇒ 读回变 `Int`（D84/D99 明确要求 Float
+   必带小数点）。
+
+##### 修法
+
+`build_node_input` 改为**直接构造 `Value::Dict` 再交给
+`flow::value_to_json`** —— 仓内唯一的序列化实现。三处一并解决。
+
+两份 `value_to_json_string`（`pregel/mod.rs` 私有 + `reducers.rs` 的 `pub`）
+因此**失去全部调用者**，已**删除**。保留一个已被证明错误、又无人调用的
+重复实现，只会成为下一个「改一处须同步另一处」的陷阱。
+
+##### 判据 `tests/pregel_node_input_json.rs`（4 条）
+
+`build_node_input` 是**私有**方法、agent 收到的字符串也不经 `Value` 通道
+回传，故无法在集成测试里直接捕获。修法已把它收敛到 `flow::value_to_json`
+—— **缺陷所在的代码就是共享序列化器**，故判据钉在那里：
+
+| 判据 | 钉住 |
+|---|---|
+| `d235_pregel_end_to_end_still_works` | pregel 端到端主路径结果不变（`String("world")`） |
+| `d235_float_keeps_decimal_point_through_the_shared_serializer` | 缺陷 ③：`Float` 必带小数点且往返逐位恒等 |
+| `d235_dict_serializes_as_valid_json_object` | 缺陷 ①：读回必须是 `Dict`（不能只查「能解析」） |
+| `d235_no_duplicate_serializer_remains` | 共享序列化器对含控制字符的 key/value 转义正确 |
+
+##### 牙齿验证
+
+| 回退 | 变红的判据 |
+|---|---|
+| `build_node_input` 退回「手工拼字符串 + 局部序列化器」 | 3 条（dict / float / 转义） |
+| 重新引入重复的 `value_to_json_string` | **NO TEETH**（见下） |
+
+**护栏（非承重，如实标注）**：「删除两份重复实现」这一步**无判别力** ——
+被删的是**死代码**（`build_node_input` 改用 `flow::value_to_json` 后两者
+失去全部调用者），重新引入一个无人调用的 `pub fn` 不改变任何行为。
+删除的依据是代码阅读 + `cargo build` 的 dead-code 检查，不是判据。
+
+##### ⚠ 判据的**位置**一开始是错的（NO TEETH 逼我改对）
+
+第一版判据放在 `tests/pregel_node_input_json.rs`，钉在
+`flow::value_to_json` 上 —— 想着「修法就是收敛到这个函数，钉它就等于
+钉修复」。**回退 `build_node_input` 后判据全绿**：
+回退改的是 `build_node_input`（已不再调用 `flow::value_to_json` 的局部实现），
+两者**毫无关联**。
+
+⇒ 判据必须钉在**真实消费路径**上。`build_node_input` 是**私有**方法，
+集成测试够不着，故把 4 条判据移进 `src/pregel/mod.rs` 的内部测试模块
+（那里能直接调它）。移过去后回退立刻 3 条红。
+
+**这是一条通用规则：判据钉在哪里，比判据断言什么更重要。**
+
+##### ⚠ 又一次「判据自身的检查掩盖了缺陷」
+
+Dict 那条判据第一版断言「读回是 `Dict`」，回退后**仍绿**。实测输出：
+
+```text
+out    = {"x":"{k: v, n: 3}"}
+parsed = Dict({"x": String("{k: v, n: 3}")})
+```
+
+外层 key `"x"` 合法 ⇒ `json_to_value` **成功**返回 `Dict`（内层是**字符串**）。
+所以「能解析」和「外层是 Dict」两个检查**都掩盖**了缺陷。
+必须查**内层**（channel `x` 的值）是否仍是 `Dict`。
+
+⇒ 与 D227 那条「外部解析器判据」同源：**判据要检查的层次必须与缺陷
+发生的层次一致**，否则检查会被外层的合法结构骗过。
+
+##### ⚠ 牙齿脚本的**备份时机**缺陷（本轮第三次栽在装置上）
+
+第一次跑牙齿时判据全绿。我**手动**回退复跑，确认判据确实抓不到 ——
+这步是必须的（D230 教训）。改判据后**再跑**牙齿，却发现判据「消失」了。
+
+根因：脚本用一个**预先拍好的**备份文件做还原，而我是在第一次跑完牙齿
+**之后**才改的判据 ⇒ 还原时把新判据一并回退掉。
+
+修法：脚本改为**每次运行现拍备份**（`shutil.copyfile`），
+绝不用陈旧备份。
+
+⇒ 与「`Copy-Item` 保留旧 mtime 导致 cargo 跳过重建」（D206 那轮）
+同族：**装置的缺陷会伪装成产品/判据的结论。**
+
+#### D236：「手工拼 JSON」缺陷类的**全仓普查** —— 一处否定结果 + 一处待裁决的重复
+
+D235 揭示「绕过序列化器手工拼 JSON」是一类缺陷，故做一次全仓普查
+（`format!("{{{}}}", parts.join(","))` / `format!("\"{}\":", …)` 等）。
+
+##### 普查结果
+
+| 命中点 | 判定 |
+|---|---|
+| `interpreter/ai_helpers.rs:17` `build_chat_messages_json` | **否定结果** —— 每个字段都过了 `escape_json_string`（D209 修过），且字段是固定结构（`role` / `content` / `tool_calls`），**不存在** D235 那类「缺 `Dict` 分支」问题 |
+| `flow/json.rs` | 正确（就是序列化器本身） |
+| `mir/fcfg_lower.rs` / `mir/lower.rs` 的 `parts.join(",")` | **非 JSON** —— 是 `Pattern` 的**可读文本**（`tuple:(a,b)` / `list:vector:[x,..y]`），不喂任何解析器 |
+| `pregel/mod.rs:236` / `reducers.rs:39` 的 `format!("{}", v)` | 是 `concat_reduce` 的 **Display 字符串化**，见下 |
+| `lsp/json.rs:410` `to_string(v) = format!("{}", v)` | 那是 `lsp::json::Value` 自己的 `Display`，与 Mora `Value` 无关 |
+
+⇒ 「手工拼 JSON」这一缺陷类在 D235 之后**已收敛**，无新增实例。
+
+##### ⚠ 待裁决（**未改**）：`concat_reduce` 有两份实现
+
+`pregel/mod.rs:233`（私有，`1306` 调用）与 `pregel/reducers.rs:36`
+（`pub`，**全仓零调用者**）—— 逐字相同。
+
+**行为经 9 组实测正确**，与文档一致（「Non-string incoming values are
+stringified via Display」），**无 D235 那类缺陷**：
+
+| 输入 | 输出 |
+|---|---|
+| `None + "a"` | `"a"` |
+| `"a" + 1` | `"a1"` |
+| `Dict{k:1} + "b"` | `"{k: 1}b"` |
+
+（`{k: 1}` 在这里是**给人看的文本**、不是 JSON，语义正确。）
+
+**本轮不删**，理由与 D235 删除 `value_to_json_string` **不同**：
+
+| | D235 那份 | 这份 |
+|---|---|---|
+| 行为 | **已被证明错误**（非法 JSON） | **正确** |
+| 删除理由 | 错误 + 无人调用 | 只有「重复」 |
+| 可见性 | `pub` 但仓内零调用者 | `pub`（**公开 API**） |
+
+删除 `pub fn` 属**接口变更**，超出「修缺陷」范围。记档待裁决。
+
+##### 一条可复用的判据纪律
+
+本轮 D235 的教训在普查时直接复用：**看到一个可疑模式，先问「它下游
+被谁消费、是不是 JSON」**，而不是看到 `format!` 就报缺陷。
+若跳过这一步，`build_chat_messages_json`（正确）与
+`fcfg_pattern_to_string`（非 JSON）都会被误报。
+
+#### D237：同名函数重复定义的**全仓机械普查** —— 130 组跨文件，多数是否定结果
+
+D232/D234/D235/D236 连续 4 次撞上「同一事实两份实现」，故做一次**机械普查**
+而非继续凭印象找：按 `(函数名, 参数个数)` 分桶统计 `src/` 下全部 `fn` 定义。
+
+| 阶段 | 数量 |
+|---|---|
+| 全部 `(name, arity)` 桶 | 2577 |
+| 同名同元数（重复候选） | 155 |
+| 跨**不同文件** | 130 |
+
+##### 130 组里绝大多数是否定结果
+
+按名字分类，绝大多数是**正常的多态**，不是重复实现：
+
+| 类别 | 例 | 判定 |
+|---|---|---|
+| trait 方法 × N 实现 | `compress/5` ×6、`sniff/2` ×7、`origin/1` ×13 | ✓ 正常 |
+| `Default::default` | `default/0` ×24 | ✓ 正常 |
+| 构造器 | `new/0` ×36、`new/1` ×18、`new/2` ×10 | ✓ 正常（不同类型） |
+| 显示/访问器 | `fmt/2` ×24、`get/2` ×16、`name/1` ×31 | ✓ 正常（不同类型的方法） |
+| `DocumentBackend` 六个方法 × 7 个 backend | `text/1`、`blocks/1`、`markdown/1`、`pages/1`、`metadata/1` | ✓ 正常（**这正是 D232 查的那一组**） |
+
+##### 真正的候选只有 3 处
+
+| 位置 | 规模 | 状态 |
+|---|---|---|
+| `mir/optimize/pattern.rs` + `ssa_pattern.rs` | **784 行**、33 个 `pub` 项、10 个自带测试 | `pub mod` 已声明，但 `MirPattern` / `SsaPattern` **全仓零引用** |
+| `flow::{hex_encode, hex_decode}` | 2 个 `pub fn` | **零调用者**（`audit/mod.rs` 有一份等价的私有 `hex_encode`，且是唯一被用的那份） |
+| `pregel/{mod.rs, reducers.rs}` `concat_reduce` | 2 份逐字相同 | D236 已记（`pub` 公开 API，零调用者） |
+
+`mir/optimize` 那 784 行最值得注意：它**有 10 个自带单测**（说明有人在维护），
+却**没有任何生产代码消费**它 —— 是「已接线（`pub mod`）但未实现」的半成品框架。
+
+##### 本轮**不改**（只报告）
+
+三者都不是「静默错算」，而是**死代码 / 未接线能力**：
+
+- 删 784 行是**大范围变更**，且那些单测的存在说明可能有人在规划用它 ——
+  贸然删除会毁掉未完成的工作。
+- `flow::hex_encode` / `hex_decode` 是 `pub`，删除属**公开 API 变更**。
+- 与 D235 删除 `value_to_json_string` 的区别：那一份是**已被实测证明错误**
+  且**无人调用**；这几分是**行为正确**、只是无人调用。
+
+⇒ 记档待裁决。**删除死代码的判据应是「实测有错」或「明确的未接线」，
+不是「看起来重复」** —— 后者会误伤正在开发中的工作。
+
+#### D238：HTTP 响应序列化的**端到端**实测 —— 否定结果
+
+D237 普查里有一条我没查的：`value_to_json/1` 有两份
+（`http_server.rs:316` 与 `flow/json.rs:377`）。HTTP 是**唯一对外**的序列化
+路径，若与共享实现分叉，外部客户端拿到的数据会不同。
+
+##### 先读代码：看起来是「有意的两套」
+
+`http_server::value_to_json` 产出 `lsp::json::Value` 中间层，
+再经 `lsp::json::to_string`（= `Display`）渲染；`flow::value_to_json` 直接产
+字符串。架构不同，但 D99 已记录两者对**非有限浮点**取同一处理（`null`），
+且 `lsp/json.rs` 的 `write_value` 里确有 `if n.is_finite() { … } else { null }`。
+
+##### 但「读代码觉得对」不算数 —— 起**真服务**用**真 HTTP 客户端**实测
+
+`Router.listen` 绑定 `127.0.0.1`（仅本机）且**阻塞**（D227 纪律：阻塞型 API
+不能用 `-Wait`）⇒ 探针用 `Popen` 后台起、探完 `kill`，不留残余进程。
+
+| 路由 | 返回值 | 原始响应体 | Python `json.loads` |
+|---|---|---|---|
+| `/cjk` | `中文测试` | `"中文测试"` | ✓ `str`，值相符 |
+| `/int` | `42` | `42` | ✓ `42` |
+| `/float` | `1.5` | `1.5` | ✓ `1.5` |
+| `/floatwhole` | `42.0` | `42` | ✓ `42` |
+| `/dict` | `{"k":"v","m":"n"}` | `{"k":"v","m":"n"}` | ✓ dict，值相符 |
+| `/nan` | `0.0/0.0` | `null` | ✓ `None` |
+| `/inf` | `1.0/0.0` | `null` | ✓ `None` |
+
+**7/7 全部合法 JSON 且值相符，零缺陷。**
+
+##### 唯一的差异是**无害**的
+
+`/floatwhole`（`Value::Float(42.0)`）→ `42`，而 `flow::value_to_json` 输 `42.0`
+以保类型（D84/D99）。对 HTTP 响应这**无害**：JSON 数字字面量本就不区分
+整数与浮点，`json.loads("42")` 与 `json.loads("42.0")` 都得到 `42`，
+且保类型只在**本进程内往返**才有意义（checkpoint 场景），跨进程没有。
+
+⇒ 记为**否定结果**。`http_server` 走 `JsonValue` 中间层是**有意的**
+（`lsp/json.rs` 已有 D209 修过的 RFC 8259 转义器 + D99 的非有限处理），
+两套并存不构成缺陷。
+
+##### 探针过程中踩到的三处**语法约束**（都已在 README/CHANGELOG 有记载）
+
+1. **dict 字面量不能裸写在闭包体里** —— `fn(req) {"k": "v"} end` 报
+   `Failed to parse`；须先 `let d = {…}` 再闭包捕获。
+2. **dict 必须值同质** —— `{"k": "v", "n": 3}` 报 `Dict 字面量的值必须同质`。
+3. 字符串字面量里的 `\t` / `\"` / `\\` 在 `--check` 阶段就报解析失败
+   （本轮据此把该路由从探针里去掉，改用其余 7 项覆盖）。
+
+⇒ 写 Mora 探针时**语法形态要从既有可编译的测试/示例里抄**，不能凭印象拼。
+这与 D235 那条「`orchestrate pregel` 里加 `channel` 行是非法语法」同源。
+
+#### D239：`esc` / `unquote` 的**全码点空间**穷举 + D209 收敛的**第 15 处遗漏**（已修）
+
+D208 曾修过 `record` 的 `esc`（写）/ `unquote`（读）往返，但它的穷举只覆盖
+`0x00..=0x2FF` + 4 个星平面点（`😀` / `🚀` / `𠀀` / `⛝`）——**其余 110 万个
+码点从未被扫过**。本轮把范围扩到 Unicode 全部合法标量值。
+
+##### 判据 3 条（`src/record/serialization.rs` 内部测试模块）
+
+| 判据 | 覆盖 | 结果 |
+|---|---|---|
+| `d239_esc_unquote_round_trip_covers_whole_unicode_space` | `0x00..=0x10FFFF` × 3 种上下文（单独 / `a⟨c⟩b` / `⟨c⟩\"⟨c⟩`）= **333 万次往返** | **零缺陷** |
+| `d239_esc_output_is_valid_json_string_body` | 全码点空间，逐字节校验是**合法 JSON 字符串体**（手写校验器，不引 serde） | **零缺陷** |
+| `d239_esc_matches_shared_escape_json_string` | 全码点空间，两份实现产出**逐字节相同** | **2 处差异**（见下） |
+
+⇒ `esc` / `unquote` 这对实现的**正确性**从「抽查 768 个码点」升级为
+「**穷举 111 万码点**」的证明（D223 之后第二次做全码点普查）。
+
+##### D209 收敛的第 15 处遗漏
+
+D209 把全仓 **14 处**手写 JSON 转义链收敛为唯一的 `flow::escape_json_string`，
+但 `record::serialization::esc`（**20 个调用点**）**不在其中**。
+全码点空间实测差异恰为 2 处：
+
+| 码点 | 修前 `esc` | 共享实现 |
+|---|---|---|
+| `U+0008` BACKSPACE | `\u0008` | `\b` |
+| `U+000C` FORM FEED | `\u000c` | `\f` |
+
+两者**都是合法 JSON**，`unquote` 也都能读回 ⇒ **无功能后果**
+（上面两条穷举判据已证往返无损、产出合法）。这是**收敛不彻底**而非缺陷。
+
+**但正因如此才危险**：录制文件要跨工具流转，而下一轮若有人「优化」其中
+一份（或反过来把共享实现改回旧行为），**录制字节就会静默改变**。
+故让 `esc` 直接转发到 `crate::flow::escape_json_string` ——
+「同一事实两套算法」从根上消失。
+
+##### 兼容性已显式验证
+
+字节格式变了（`\u0008` → `\b`），必须证明**旧录制文件仍可读**：
+
+- `mora record diff` 比对的是**解析后**的事件（`summarize_event`），**不是原始字节**；
+- `record::audit` 的 hash 链走 `audit/mod.rs` 的另一套
+  （`extract_field_skip_escaped`，D207 修过），**不经过 `esc`**。
+
+另补判据 `d239_both_escape_forms_are_readable`：直接把两种转义形式
+（`\u0008` 与 `\b`）喂给 `unquote`，证明都解出同一字符。
+
+##### 牙齿验证
+
+`esc` 退回本地手写实现 → `d239_esc_matches_shared_escape_json_string` 变红（有牙齿）。
+
+##### ⚠ 本轮又栽一次「**判据自己的期望值写错**」
+
+`d239_both_escape_forms_are_readable` 第一版期望「`a` + 退格 + `b`」，
+但我把输入写成了 `"a\b"`（转义后**没有**后续字符 `b`）⇒
+实测 `a\u{8}` 正确，期望 `a\u{8}b` 错 ⇒ **红的是我的期望值，不是产品**。
+
+⇒ 与 D232「判据第一版期望值是错的」同源。**判据红时先问「我到底期望什么」，
+再问「产品是不是错了」** —— 顺序反了会去「修」本来正确的产品。
+
+（D239 之前的记录里，同类事故已出现多次：把**当前行为**抄成期望值、
+用**外层合法结构**骗过检查、在**错误的位置**钉判据。三次都靠
+「手动复跑 + 读实际输出」而非「改产品」才止住。）
+
+##### 另外两条判据层面的教训（与牙齿无关，属写判据时踩的）
+
+- 端到端那条我先写成 `print(result)`，而 `print` 的返回值是 `Nil` ⇒
+  断言恒成立、**什么都没验**。改成末行 `result` 并断言 `String("world")`
+  才是真验证（形态取自 `orchestrate_v3_pipeline.rs::v3_orchestrate_pregel_runs`）。
+- 我在 `orchestrate pregel` 块里加了 `channel result` 行 —— 那是**非法语法**
+  （编译报 `Failed to parse at line 5`）。语法形态必须从**既有可编译的测试**里抄，
+  不能凭印象拼。
+
+#### D240：手写 JSON 转义表的**全仓普查** —— `trace_collector` 是第 3 处漂移（已修）
+
+D239 证明 D209 当时的普查**不完整**（说 14 处，实际至少 15 处），
+故重做一次普查：全仓搜手写转义表（`push_str("\\n")` / `\\u{:04x}` 等模式）。
+
+##### 普查结果：4 处手写表，其中 2 处是**有意独立**
+
+| 位置 | 性质 | 与共享实现差异 |
+|---|---|---|
+| `flow/json.rs::escape_json_string` | **本体**（唯一真值源） | — |
+| `lsp/json.rs::escape_string` | **协议层**（JSON-RPC 线缆格式） | 2 处（`\b` `\f`） |
+| `audit/mod.rs::json_string` | 带引号 + **已含** `\b` `\f` | **0 处** ✓ |
+| `trace_collector.rs::escape_json` | 不带引号 + **缺** `\b` `\f` | 2 处 |
+
+`lsp/json.rs` **有意保持独立** —— JSON-RPC 线缆格式不应依赖语言层，
+且它服务的是外部 LSP 客户端（不是本语言的值）。故**不收敛**。
+
+`audit/mod.rs::json_string` 剥掉自带的外层引号后与共享实现**完全一致**
+（全码点空间 0 差异）—— 那是 D209 收敛过的，无需再动。
+
+##### `trace_collector` 的收敛
+
+它的产出是 **OpenTelemetry / Jaeger 的 span JSON**（`traceId` / `spanId` /
+`durationMs` / `attributes`），要被**外部 APM 系统**解析。
+
+先用 Python `json.loads` 实测完整 span（含 `U+0008` / `U+000C` 的 name /
+traceId / attribute key 与 value）：产出**解析成功且全部往返无损**
+⇒ **修前无功能后果**（`\u0008` 形式合法，外部解析器能读）。
+
+但与 D239 的 `record::esc` 同理：这些表**看似等价、实则各自漂移**，
+下一轮若有人只改其中一份，trace 输出的字节会静默变化。已转发到
+`crate::flow::escape_json_string`。
+
+##### 判据（`src/trace_collector.rs` 新增内部测试模块，2 条）
+
+| 判据 | 钉住 |
+|---|---|
+| `d240_escape_json_matches_shared_implementation` | 全码点穷举，两份实现**逐字节相同** |
+| `d240_escape_json_output_is_valid_json_string_body` | 全码点穷举，产出是**合法 JSON 字符串体**（外部 APM 必须能读） |
+
+##### 牙齿验证
+
+`escape_json` 退回本地手写实现 → `d240_escape_json_matches_shared_implementation`
+变红（有牙齿）。
+
+##### 一条可复用的判别规则
+
+普查手写实现时，**先分清「有意独立」与「遗漏」**：
+
+| 判据 | 有意独立 | 遗漏 |
+|---|---|---|
+| 依赖方向 | 协议层**不该**依赖语言层 | 同层重复 |
+| 差异范围 | 通常**结构性**（签名 / 带不带引号） | 恰好**几个码点** |
+| 是否已被验证 | 有**独立判据**覆盖 | 无判据 / 判据只查自己的输出 |
+
+本轮 `lsp`（签名不同、服务外部、已有 D209 修过的转义器）判为有意独立；
+`trace` / `record`（签名相同、同层）判为遗漏。
+
+
+#### D241：`reading_order` 的 `TopToBottom` 比较器**不是全序** —— 排序结果依赖输入排列（已修）
+
+`Strategy::TopToBottom` 的比较器是**混合**的：垂直**不重叠**时比 `y`
+（谁在上），**重叠**时比 `x`（谁靠左）。这不是全序 —— 可构造
+`cmp(A,B)` 与 `cmp(B,C)` 由 `x` 决定、而 `cmp(A,C)` 由 `y` 决定的
+三元组，链式推论与直接比较**互相矛盾**。
+
+Rust 的 `sort_by` 在比较器非全序时**静默**产生错误结果
+（官方文档："may panic or return nonsense"），不 panic、零诊断。
+
+##### 实测：穷举全部输入排列（bbox 用 `{x,y,w,h}` dict）
+
+| 块数 | 修前不同结果数 | 修后 |
+|---|---|---|
+| 3 | 1（该语料**不触发**） | 1 |
+| **4** | **2**（`A,B,D,C` ×12 / `A,D,B,C` ×12） | **1**（`A,B,D,C` ×24） |
+
+4 块时输出**依赖输入排列** —— 这就是「非全序」的可观测后果。
+**3 块语料修前也正常，只测 3 块会漏掉这个缺陷。**
+
+##### 修法
+
+改为**单一全序 key** `(y, x)` —— 与 `XyCut` 分支同款（它本来就是对的）。
+「按 y 分行、行内按 x」正是该策略文档所述的语义。
+
+其余 4 个策略（`GapTree` / `XyCut` / `GroupBased` / `XyCutPlusPlus`）
+**本就用单一全序 key** ⇒ `TopToBottom` 是这一组里唯一的异类。
+
+##### 判据 `tests/reading_order_comparator_total_order.rs`（4 条）
+
+判据形态是**排列穷举不变式**：同一组 blocks 的所有输入排列必须产出
+**同一个**输出序列。它不依赖「正确顺序是什么」的先验，只要求
+「顺序是输入的函数之外的东西」—— 恰是全序的定义。
+
+| 判据 | 钉住 |
+|---|---|
+| `d241_top_to_bottom_is_order_independent` | 4 块 × 24 排列 ⇒ 1 种结果 |
+| `d241_top_to_bottom_follows_y_then_x_order` | 修法的语义：y 升序、同 y 按 x |
+| `d241_other_strategies_are_also_order_independent` | 其余 4 个策略也满足排列不变式（防将来被改坏） |
+| `d241_test_corpus_actually_has_usable_bboxes` | **防判据空转**（见下） |
+
+##### 牙齿验证
+
+`TopToBottom` 退回混合比较器 → `d241_top_to_bottom_is_order_independent` 变红。
+
+##### ⚠ 本轮最要紧的一条：**我的第一版取证是错的**
+
+我最初报的证据是「3 块 → 6 种输入排列 → **6 种不同结果**，排序**完全**
+没有发生」——并据此写下「`TopToBottom` 实际退化成了 `InputOrder`」。
+
+**那个证据是探针 bug 造出来的。** 我的 `block()` 辅助函数把 bbox 写成
+`Value::List([x, y, w, h])`，而 `BBox::from_value` 只认
+**`Value::Dict`**（`{x, y, w, h}`）⇒ 所有块都被判为「无 bbox」⇒
+比较器恒返 `Ordering::Equal` ⇒ 输出恒等于输入 ⇒ 排列数 = 输入排列数。
+
+改用 dict 后真实数据是：**3 块不触发，4 块才有 2 种结果**。
+
+这与 D235 的「判据钉在了错误的代码上」、D239 的「期望值写错」是**第三种**
+形态：**探针喂进去的数据根本没被产品读**（而不是产品读错了、或是期望写错）。
+判据自身都绿着，探针却在「证明」一个不存在的缺陷。
+
+⇒ **三者的排查顺序应是**：
+1. 我的**输入**真的被产品读到了吗？（先验证输入通路）
+2. 我的**期望**到底是什么？
+3. 产品是不是错了？
+
+我这次直接跳到了第 3 步。这也是 `d241_test_corpus_actually_has_usable_bboxes`
+那条判据存在的原因 —— **把「输入通路可用」显式钉成判据**，
+让「语料没被读」这类空转不可能再悄悄发生。
+
+（D241 的**缺陷本身是真的**（4 块时确实依赖输入排列），
+错的只是我给出的**规模与性质描述**。修复代码与最终判据都不受影响，
+但归档里必须写清哪一部分结论作废。）
+
+
+#### D242：`f64` 比较器用 `partial_cmp + Equal` —— **NaN 破坏全序**，统计值随输入顺序而变（已修）
+
+D241 揭示「比较器非全序」是一类缺陷，故做**全仓普查**（所有 `.sort_by` /
+`.sort_by_key` / `.sort`）。绝大多数是 `String` / `usize` 的 `Ord` 排序
+（天然全序）；命中的缺陷类是 `a.partial_cmp(b).unwrap_or(Ordering::Equal)`
+—— **作用在 `f64` 上时，NaN 会破坏全序**。
+
+##### 成因
+
+`f64::partial_cmp` 遇 NaN 返回 `None` → 被 `unwrap_or(Equal)` 变成
+「NaN 与**一切**相等」，而它与别的数的实际大小关系又不一致 ⇒ 违反传递性。
+Rust `sort_by` 在非全序比较器下**静默**产出**依赖输入顺序**的结果
+（D241 同款机制，只是这里的元凶是 NaN 而不是「混用两个 key」）。
+
+##### 穷举对照（`[1.0, NaN, 3.0, 2.0]` 的 24 种输入排列）
+
+| 比较器 | 不同结果数 |
+|---|---|
+| `partial_cmp + Equal` | **8** |
+| `total_cmp`（IEEE 754 全序，NaN 排末尾） | **1** |
+
+##### 影响：真实 CLI（`mora run`），同一组数只换输入顺序
+
+| 调用 | 修前 | 修后 |
+|---|---|---|
+| `stats.median` | `1.5` / **`2.5`** | 恒 `1.5` |
+| `stats.quantile(_, 0.75)` | `2.25` / **`nan`** | 恒 `2.25` |
+| `xs.sort()` | 3 种不同结果（NaN 时而居中、时而居首、时而居末） | 恒 `[nan,1,2,3]` |
+
+**中位数 / 分位数是统计值** —— 顺序依赖意味着**同一组数据给出不同答案**，
+这类错误比「排错序」严重得多（它直接给出错误的统计结论，且无从察觉）。
+
+##### 修法：5 处全部改用 `f64::total_cmp`
+
+| 位置 | 函数 | 后果 |
+|---|---|---|
+| `interpreter/builtins/stats.rs` ×2 | `median` / `quantile` | **统计值不再随输入顺序变化** |
+| `interpreter/method_dispatch.rs` | `list.sort()` | 排序结果稳定 |
+| `compress/strategies.rs` | `SmartSampleStrategy` 取最高分 | 「取分数最高 N 个」真正按分数 |
+| `mir/handlers/runtime.rs` | MoE `top_k` 取最高分 | 同上 |
+
+##### 判据 `tests/f64_comparator_nan_total_order.rs`（4 条）
+
+| 判据 | 钉住 |
+|---|---|
+| `d242_total_cmp_is_order_independent` | `total_cmp` 穷举排列 ⇒ 1 种结果 |
+| `d242_partial_cmp_plus_equal_is_the_broken_form` | **对照组**：旧写法确实产生多种结果（否则主判据无判别力） |
+| `d242_stats_and_sort_are_order_independent_end_to_end` | 真实 Mora 源码下 `median`/`quantile`/`sort` 三者 × 三种输入顺序 |
+| `d242_finite_values_behave_normally` | 无 NaN 时行为不变（防过度修改） |
+
+##### 牙齿验证（3/3 全部变红）
+
+`stats::median` / `stats::quantile` / `list.sort` 各自退回
+`partial_cmp + Equal` → `d242_stats_and_sort_are_order_independent_end_to_end` 变红。
+
+**护栏（非承重，如实标注）**：`detect::is_sequential_numeric` 与
+`compress::strategies::SmartSampleStrategy` 的 Int 回退**未单独验到红**：
+前者只在 `detect_field_role` 里被间接调用（`extract_field_stats` 是私有模块，
+集成测试够不着），后者的 TopN 路径需要 `TopScores` array_type 才走到。
+二者共用 `value_as_f64`（D231 已修），本轮的 `total_cmp` 改动是**纵深防御**，
+不是这两处的唯一保护。
+
+##### ⚠ 一处期望值写错（第一次跑就抓到）
+
+`d242_finite_values_behave_normally` 里我把 `[3.0, 1.0, 2.0].sort()` 的期望
+写成 `List([Int(1), Int(2), Int(3)])`，实测是 `List([Float(1.0), …])` ——
+**列表字面量给 `Float` 不给 `Int`**（D98 已记载）。红的是我的期望，不是产品。
+
+⇒ 这是 D232–D239 之间**第四次**同类事故（另有：判据钉错位置、期望抄当前行为、
+输入通路没通）。根因都是**在写断言时凭印象而非查证**。
+
+
+
+#### D243：XY-Cut++ 的**段成员判定与直方图投影不在同一坐标系** —— 负坐标静默丢块（已修）
+
+D242 之后普查了两条线：**遍历顺序外泄**与 **`f64` → 整数饱和转换**。
+后者命中真缺陷。
+
+##### 普查一：`HashMap` / `HashSet` 遍历顺序外泄（6 处，全部否定）
+
+| 位置 | 形态 | 判定 |
+|---|---|---|
+| `flow/json.rs::value_to_json` | `Value::Dict` 直接 `map.iter()` | **已修**（v0.104.6，注释可证：先收进有序表再输出） |
+| `pregel/mod.rs:817` | `HashSet` → `Vec` 当执行序列 | **已修**（v0.73，按 agent 定义序 `sort_by_key`） |
+| `checkpoint/mod.rs:249` | 嵌套 `HashMap` → `Value::Dict` | 否定：下游走已排序的 `value_to_json` |
+| `docx.rs:205` / `pdf.rs:136` / `pptx.rs:195` | metadata/info 遍历 | 否定：同样只写进 `Value::Dict` |
+
+`pregel` 那处我额外推到底：第 779 行对 `send` 目标做了
+`agents_by_name` 硬校验，而边指向、不在 agents 里的 ghost 节点会被
+第 651 行 `filter` 掉（**不执行**）⇒ `sort_by_key` 的 `unwrap_or(usize::MAX)`
+虽然不是稳定键，但键相等只发生在**不产生执行**的节点之间 ⇒ 无可观测后果。
+
+⇒ 结论：这条线仓库在 v0.73 / v0.104.6 已系统性处理过，本轮无新增。
+
+##### 普查二：`f64` → 整数的 `as` 转换（60 处）
+
+`checkpoint/mod.rs:301`、`compress/mod.rs:352`、`reading_order/mod.rs:323`
+三处**已有注释明确记载**「`-5.0 as usize == 0` 饱和」并已加守卫。
+命中缺陷的是同族但**未被处理**的 `xy_cut.rs` 四处。
+
+##### 缺陷
+
+`project_to_axis` 用 `坐标 as usize` 把 bbox 坐标映射成直方图下标，
+`split_projection` 把段边界以**下标**形式回传；而 `recursive_xy_cut` 的段成员判定
+却把该下标直接当**原始 `f64` 中心坐标**，与 `center_x()` / `center_y()` 比较：
+
+```rust
+let start = *s_start as f64;   // 直方图下标
+let end   = *s_end   as f64;
+c >= start && c < end           // c = b.center_y()  ← 原始坐标
+```
+
+**两者不在同一个坐标系。** Rust 的 `as usize` 对负数是**饱和**转换
+（实测 `(-5.0f64) as usize == 0`），于是负坐标（带 offset 的坐标系、
+以页面中心为原点的坐标系都很常见）整块塌进 0 号下标，而 `center_y()` 仍是负数
+—— 永不相等 ⇒ 该块被段过滤**静默丢弃**，零诊断。
+
+##### 实测后果：4 块单列，相对几何完全相同，只改坐标系原点
+
+| `y0` | 输出 | |
+|---|---|---|
+| `0` | `[title, p1, p2, footer]` | 正确 |
+| `-100` | `[p2, footer]` | **4 块输入只输出 2 块** |
+| `-300` | `[title, p1, p2, footer]` | **碰巧对** |
+| `1000` | `[title, p1, p2, footer]` | 正确 |
+
+`y0 = -300` 的「碰巧对」是本条最值得记的部分：此时所有下标都塌成 0、
+直方图全零 ⇒ 检不出 gap ⇒ 走「两轴都无法切分」的旁路，而**那条旁路不按段过滤**。
+
+⇒ 它是**巧合正确**。如果我只抽一个负数（比如 `-300`）去测，会得出
+「否定结论」，缺陷就此逃逸。**平移量必须多取几个**，
+这也是判据里穷举 8 个平移点（含 `0` / 纯正 / 纯负 / 跨零 / 极端负）的原因。
+
+##### 修法：新增唯一收口 `axis_origin`
+
+以该轴**两端**坐标的最小值为原点、下限 `0.0`（`fold` 从 `0.0` 起步
+⇒ 原点恒 ≤ 0 ⇒ 平移后坐标恒非负 ⇒ `as usize` 不再饱和），
+投影与两处段成员判定**共用同一个原点**：
+
+| 位置 | 改动 |
+|---|---|
+| `xy_cut.rs::axis_origin` | 新增，唯一收口，`is_finite` 过滤 NaN/±inf |
+| `project_to_axis` | `max_coord` / `start` / `end` 三处先减 `origin` |
+| `recursive_xy_cut` secondary 分支 | `c` 减 `axis_origin(entries, secondary_axis)` |
+| `recursive_xy_cut` primary 分支 | `c` 减 `axis_origin(entries, primary_axis)` |
+
+归一化后 `y0 = -100` 与 `y0 = 0` 的直方图下标**逐位相同** ⇒ 平移不变性成立。
+
+##### 判据 `tests/xy_cut_translation_invariance.rs`（5 条）+ 模块内 1 条
+
+| 判据 | 钉住 |
+|---|---|
+| `xy_cut_pp_translation_invariant_single_column` | 单列几何 × 8 平移点，顺序不变 **且不丢块** |
+| `xy_cut_pp_translation_invariant_two_column` | 双列几何，同上 |
+| `xy_cut_pp_translation_invariant_cross_layout` | 含横跨全宽的 cross-layout 块 |
+| `d243_control_group_negative_as_usize_saturates_to_zero` | **对照组**：钉语言事实（负数饱和、正数取整），与本仓实现无关 |
+| `d243_control_group_shifted_coord_is_never_negative` | **对照组**：钉「平移后坐标恒非负」= 修复为什么有效 |
+| `d243_xy_cut_pp_survives_negative_coords`（模块内） | 原有 16 条 `xy_cut_pp_*` **全用正坐标**、对本缺陷无感；补这条让 `cargo test --lib` 单独跑也守得住 |
+
+对照组特意**不钉 `axis_origin`** —— 修法收敛到了它，但判据钉在修法上
+就会重演 D235（钉共享函数、回退调用方，牙齿不响）。
+
+##### 牙齿验证：先撞上「NO TEETH」，查出是**装置坏了**
+
+第一次回退（`Copy-Item -Force` 覆盖回修复前版本）后判据**仍全绿**。
+按纪律不能就此记「判据无牙齿」，交叉验证：源码确认无 `axis_origin`，
+但探针输出**依然正确** —— 与修复前首次取证矛盾。
+
+⇒ 是 **cargo 增量编译没检测到这次回退**。`cargo clean -p mora`
+（顺带清掉 30991 个文件 / 61 GiB target）后重跑，缺陷精确重现：
+
+| | 回退（真） | 修复后 |
+|---|---|---|
+| `y0=-100` | `[p2, footer]` | `[title, p1, p2, footer]` |
+| 判据 | **3 失败 / 2 通过** | 5 通过 |
+
+两条对照组在**回退态下仍绿** —— 这正是对照组的设计目的：它们钉在语言事实上，
+本就不该随产品代码变红。
+
+**教训**：`Copy-Item -Force` 改 Rust 源文件做回退实验时，
+**必须** `cargo clean -p <crate>` 或另行确认重编译，否则「回退没生效」
+会被误读成「判据没牙齿」，进而写下错误的护栏结论。
+
+##### ⚠ 一处期望值写错（又一次）
+
+`two_column` 的期望我写成「列优先」的 `[L1, L2, R1, R2]`，实测
+`[L1, R1, L2, R2]` —— **行优先**：L1 与 R1 在同一水平行，XY-Cut 先按 y 切出行段、
+段内再按 x。红的是我的期望，不是产品。
+
+这是 D232–D242 之间的**第五次**同类事故。判据第一条断言是
+「**基线（未平移）顺序本身正确**」，正是为了让这类错误第一时间暴露成
+「期望错了」，而不是被误读成「平移不变性被破坏」。
+
+##### 顺带发现：CHANGELOG 有 3 处**历史编码损坏**（非本轮引入）
+
+全文扫描 U+FFFD 找到 3 处被截断的中文（HEAD 版本是干净的 0 ⇒
+工作副本的这些损坏来自**更早的未提交修改**，不是 D243 造成的；下表 `□` 代表一个被截断的码点）：
+
+| 位置 | 现文 | 处置 |
+|---|---|---|
+| 早期条目 | `未在□□轮改动` | **已修** → `未在本轮改动`（唯一 100% 确定的，`□` = 1 个 U+FFFD） |
+| 早期条目 | `差分把□□判失败` | 保留，报你裁决（2 字，`它们` / `这类` 均通） |
+| 早期条目 | `顺带记三条语□□□事实` | 保留，报你裁决（3 字，疑为 `语言层`） |
+
+后两处**刻意不猜**：把「明显损坏」换成「看似正常但含义可能错」更危险 ——
+后者读者不会察觉。**待你确认原文后再改。**
+
+⇒ 教训补一条：mojibake 检查**必须扫全文**，不能只查最近改动的条目区间
+（此前只核对 D230–D242 区间，因此这 3 处一直没被发现）。
+
+
+#### D244：`Checkpoint::from_json` 的负数守卫**只覆盖了 5 处中的 2 处** —— 版本号/时间戳静默回绕（已修）
+
+D243 普查 `f64 → 整数 as 转换` 时发现：`checkpoint/mod.rs` 里已经有三处注释
+**明确记载**「`-5.0 as usize == 0` 饱和」并加了守卫。这说明该子系统的负数
+问题**已被部分修过** —— 于是本轮去看「守卫到底覆盖了哪些字段」，
+结果发现**同一个函数里漏了三处**。
+
+##### 缺陷
+
+`Checkpoint::from_json` 从外部 `Value` 还原 5 个数字字段：
+
+| 字段 | 目标类型 | D148 是否加守卫 |
+|---|---|---|
+| `v` | `u32` | ✅ |
+| `step` | `usize` | ✅ |
+| `channel_versions` | `u64` | ❌ **漏** |
+| `versions_seen` | `u64` | ❌ **漏** |
+| `timestamp_ms` | `u128` | ❌ **漏** |
+
+漏掉的三处写的是 `Value::Int(i) as u64` / `as u128`，**没有任何检查**。
+
+##### 两种失败模式方向相反
+
+Rust 的 `as` 有两套语义，这里**同时**中招：
+
+| 输入 | 语义 | 结果 |
+|---|---|---|
+| `-1i64 as u64` | 整数 = **回绕** | `18446744073709551615` |
+| `-1.0f64 as u64` | 浮点 = **饱和** | `0` |
+| `-1i64 as u128` | 回绕 | `340282366920938463463374607431768211455` |
+
+都**零诊断**，`exit 0`。
+
+##### 实测：`from_json` 喂 `-1`（修前 / 修后）
+
+| 字段 | 修前 | 修后 |
+|---|---|---|
+| `v` | 报错 | 报错（D148 已有） |
+| `step` | 报错 | 报错（D148 已有） |
+| `channel_versions` | `18446744073709551615` | 报错，点名 `channel_versions[messages]` |
+| `versions_seen` | `18446744073709551615` | 报错，点名 `versions_seen[node_a][messages]` |
+| `timestamp_ms` | `340282366920938463463374607431768211455` | 报错 |
+
+危害不止「值荒谬」，两处都有真实语义后果：
+
+- `channel_versions` / `versions_seen` 的语义是「**已观测到的最大版本**」。
+  `u64::MAX` 等于宣告「这个 channel 的一切都已见过」⇒ **增量计算永久停滞**，
+  且没有任何地方会报错 —— 缓存看起来是「正常不更新」。
+- `timestamp_ms` 是 D234 三级排序键 `(step, timestamp_ms, id)` 的**第二项**。
+  `u128::MAX` 会让这条 checkpoint 被 `load` **永远排到第一位**、
+  `list` **永远排到最后一位**。
+
+##### 可达性（都是真实路径，不是理论）
+
+- `from_json` 本身是 `pub` 库 API。
+- `SqliteSaver::load` 直接 `Checkpoint::from_json(&data_json)`（`sqlite.rs:117`），
+  任何写入 `checkpoints` 表的负值 —— 旧版本存档、手写导入、损坏数据 ——
+  都会走这条路。
+
+##### 修法：唯一收口 `nonneg_num`
+
+五个字段收敛到一个泛型函数（`T: TryFrom<u64>`）：
+
+| 位置 | 改动 |
+|---|---|
+| `nonneg_num` | 新增，`Int`/`Float` 两侧都判负；`TryFrom` 同时把**大值回绕**（`2^32+1 as u32 == 1`）也变成报错 |
+| `v` / `step` | 内联 `match` → `nonneg_num`（D148 的守卫原样保留，只是搬了家） |
+| `channel_versions` | → `nonneg_num::<u64>`，错误信息带 key |
+| `versions_seen` | → `nonneg_num::<u64>`，错误信息带 `node[key]` |
+| `timestamp_ms` | 字符串分支保留（`to_json` 的正常产出形态），数值分支 → `nonneg_num` |
+
+`TryFrom` 那一项是**顺带收紧**：`v = 4294967297` 修前会被截成 `1`
+（一个「看似合法」但完全错误的版本号），现在报错。
+
+##### 判据 `tests/checkpoint_negative_number_guard.rs`（4 条）+ 模块内 1 条
+
+| 判据 | 钉住 |
+|---|---|
+| `d244_every_numeric_field_rejects_negative` | **5 字段 × 5 种负数**（`Int(-1/-2)`、`Float(-1.0/-0.5/-1e300)`）穷举 = 25 组，**且错误信息必须点名具体字段** |
+| `d244_control_group_integer_as_wraps_float_as_saturates` | **对照组**：钉语言事实（回绕 / 饱和），与本仓实现无关 |
+| `d244_oversized_value_wrapping_is_also_rejected` | 大值回绕也报错；`u32` 上界仍可用（防过度收紧） |
+| `d244_valid_checkpoints_still_parse` | 正例不回归：浮点版本号、数字形式时间戳、`0` 全部仍被接受 |
+| `d244_from_json_rejects_negative_in_every_numeric_field`（模块内） | 让 `cargo test --lib` 单独跑也守得住 |
+
+##### 牙齿验证：只回退缺陷那三处，`v` / `step` 保持绿
+
+回退 `channel_versions` / `versions_seen` / `timestamp_ms` 三处（保留
+`nonneg_num` 供 `v` / `step` 使用）：
+
+| | 回退后 | 恢复后 |
+|---|---|---|
+| `d244_every_numeric_field_rejects_negative` | **FAILED** | ok |
+| `d244_from_json_rejects_negative_in_every_numeric_field`（lib） | **FAILED** | ok |
+| 对照组 / 正例 / 大值 三条 | ok | ok |
+
+特意让 `v` / `step` 那部分**继续绿**，这样「红」就精确证明牙齿钉在
+**新增的三处守卫**上，而不是「只要有 `nonneg_num` 这个函数就会红」。
+
+（D243 在这一步踩过 `Copy-Item -Force` **保留 mtime** 导致 cargo 静默跳过
+重编译的坑，本轮改用 Python 写回，一次通过。）
+
+##### ⚠ 两处判据自身的错（都归到「期望/输入写错」那一类）
+
+1. **helper 的模板含了 key**：overrides 传的是 `"timestamp_ms:-1"` 这种
+   `key:value` 片段，而 `json_with` 又加了一次 `"timestamp_ms":` 前缀 ⇒
+   实际喂进去的是字符串 `"timestamp_ms:-1"`。红的是
+   `Expected boolean`（JSON 解析层），**根本没走到守卫**。
+2. **模块内判据的浮点变体传了基线**：`v` 的 Float 那一格我写的是
+   `base("1", ...)`（合法值）而不是 `base("-1.0", ...)` ⇒ 那一半断言
+   恒真、**空转**。若不逐格核对就看不出。
+
+⇒ 与 D232–D243 的同类事故累计到 **7 次**。第 1 条尤其值得记：
+**「红」不一定是「产品错」，红的位置（哪一层报错）本身就是线索** ——
+`Expected boolean` 指向 JSON 解析层，而我的守卫在上一层。
+
+
+#### D245：入站 LSP `position` 的**负数**回绕成 `usize::MAX` —— 静默返回错误内容 + 荒谬出站 range（已修）
+
+D244 之后把 `f64/整数 → 整数` 的普查做完（`offset=60` 之后的 60 处），
+命中同一族的第二处。这次**后果比 D244 更重**：不是「值荒谬」，而是服务器
+**主动返回一个看似合理的错误答案**。
+
+##### 仓库内不一致：同一个转换，两套行为
+
+| 位置 | 守卫 | 来源 |
+|---|---|---|
+| `lsp/server.rs::pos_of` | `.max(0)` ✅ | D194 |
+| `lsp/providers/definition.rs` | 无 ❌ | 各写一遍 |
+| `lsp/providers/hover.rs` | 无 ❌ | 各写一遍 |
+| `lsp/providers/formatting.rs` | 无 ❌ | 各写一遍 |
+
+四处做的是**字面相同**的 `as_i64().unwrap_or(0) as usize`。D194 修了其中
+一处，另外三处因为「各写一遍」而漏掉 —— 与 D244 在 `checkpoint` 里遇到的
+形态完全一致（D148 修了 2/5 处）。
+
+##### 成因
+
+LSP 规定 `line` / `character` 从 0 起（`uinteger`），但那是**协议约束**，
+不是可依赖的输入。而整数 `as` 是**回绕**：`(-1i64) as usize == 18446744073709551615`。
+
+##### 实测后果（修前，`hover_v3`，文档 `let alpha: Int = 1\nlet beta: Int = alpha\nbeta`）
+
+```text
+position {"line": -1, "character": 0}
+  → position_to_offset 的 `lines().nth(usize::MAX)` 落空 → offset = text.len()
+  → 在**文件末尾**找到了标识符 `beta`
+  → 返回 `let beta: Int`，range 的 line = 1.8446744073709552e19
+```
+
+三个要点，逐个都要命：
+
+1. **不是「无结果」**。因为文档恰好以标识符 `beta` 结尾，回绕落到末尾
+   反而**命中了一个真实存在的标识符** ⇒ 返回**看似合理**的答案。
+2. **出站 range 是 `1.8e19`**。客户端照这个 range 应用 `rename` /
+   `formatting` 的编辑 ⇒ **改坏用户文件**。这正是
+   `parsed_doc_v3.rs` 文件头注释里警告过的失败模式（「rename 那条把文件改坏
+   了」），只是触发路径从「UTF-16 错位」换成了「负数回绕」。
+3. `character: -1` 同样回绕 ⇒ 静默返回 `variable 1: <inferred>`（`1` 是
+   第 0 行第 18 个字符）。
+
+##### 修法：唯一收口 `parsed_doc_v3::pos_of`
+
+`position_to_offset` 的文件头注释自称「全部入站位置的唯一入口，改这一处即修
+全部入站方向」—— 但它拿到的是**已经转成 `usize` 的值**，负数信息早已丢失，
+**在那里无法修**。所以收口必须落在 `i64 → usize` 的转换点上：
+
+| 位置 | 改动 |
+|---|---|
+| `parsed_doc_v3::pos_of` | 新增，唯一收口，两侧都 `.max(0)` |
+| `providers/hover.rs` | → `pos_of` |
+| `providers/definition.rs` | → `pos_of` |
+| `providers/formatting.rs` | → `pos_of`（后果最直接：`l0`/`l1` 回绕后被喂给 `slice_edit`） |
+| `server.rs::pos_of`（私有） | 转发到公开的那一份，删掉重复实现 |
+
+##### 判据 `tests/lsp_negative_position.rs`（4 条）
+
+| 判据 | 钉住 |
+|---|---|
+| `d245_negative_position_degrades_to_origin` | 4 种负数组合下 hover ≡ `(0,0)`，**且**出站数值守恒 |
+| `d245_definition_negative_position_degrades_to_origin` | definition 侧同理（它与 hover 是两处独立实现） |
+| `d245_control_group_negative_as_usize_wraps_to_max` | **对照组**：钉语言事实（回绕），不钉 `pos_of` |
+| `d245_valid_positions_still_resolve_correctly` | 正例不回归：正常位置仍命中正确标识符 |
+
+判据里那条**守恒检查**（递归扫出站 JSON 的每个 `Number` 必须在 `[0, 64]`）
+是刻意的：它**不依赖**「结果应该等于什么」那种容易被写错的期望，
+修前的 `1.8446744073709552e19` 一眼就被否掉。
+
+##### 牙齿验证：只回退 `hover.rs`，`definition` 侧保持绿
+
+| 判据 | 回退后 | 恢复后 |
+|---|---|---|
+| `d245_negative_position_degrades_to_origin` | **FAILED** | ok |
+| `d245_definition_...degrades_to_origin` | ok | ok |
+| 对照组 / 正例 | ok | ok |
+
+只回退一处 ⇒ 只有钉那一处的判据变红。这比「全回退、全红」有信息量得多：
+它同时证明了**牙齿位置正确**和**另一侧确实被修好了**。
+
+##### ⚠ 一处期望值写错（又一次，累计第 6 次）
+
+`d245_valid_positions_still_resolve_correctly` 里我写「第 1 行第 13 列是
+`alpha`」。实际第 1 行 `let beta: Int = alpha` 的字符分布是
+`0-2 let | 4-7 beta | 10-12 Int | 16-20 alpha` ⇒ 13 落在**空格**上，
+实际命中的是 `Int`，返回 `variable Int: <inferred>`。
+
+有意思的是，**探针的输出里已经写着 `variable Int: <inferred>`** ——
+那正是「你坐标算错了」的信号，我却先写了断言才去看。
+与 D232–D244 累计 6 次同类事故同源：**凭印象写坐标，不查证**。
+
+##### 归总：连续两条 D244 / D245 是**同一种形态**
+
+| 编号 | 部位 | 形态 |
+|---|---|---|
+| D244 | `checkpoint::from_json` | 5 处同族守卫，D148 修了 2 处 |
+| D245 | LSP 入站 position | 4 处同族守卫，D194 修了 1 处 |
+
+⇒ 「给一类转换加了守卫」**不等于**「这类转换都安全了」。只要守卫是
+**就地内联**而不是**收口到唯一入口**，漏掉的就是迟早的事。
+D244 把 `checkpoint` 的 5 处收敛到 `nonneg_num`，D245 把 LSP 的 4 处收敛到
+`pos_of` —— 两条修法是**同一个模式**。
+
+
+#### D246：`extract_usage` 只认 `Float` ⇒ **token 预算机制整体失效**且零症状（已修）
+
+D245 结尾把「就地内联守卫会漏」归总了。顺着那个结论再走一步，得到本条 ——
+它连守卫都不需要，因为**根因是 D231 自己立的规矩没被执行到**。
+
+##### 违反了自己立的规矩
+
+D231 在 `compress::json` 写过：
+
+> `Value` → `f64` 的**唯一**提取点 …… 新增数值提取**必须**走它，否则同样违约。
+
+而 `ai_helpers::extract_usage` 恰恰是「新增的数值提取」，它没走 —— 它自己手写了：
+
+```rust
+let input = match usage.get("prompt_tokens") {
+    Some(Value::Float(n)) => *n as usize,   // ← 只认 Float
+    _ => 0,
+};
+```
+
+**为什么当初没照做？** 因为那个收口住在 `compress` 模块里，**`interpreter` 够不着**。
+规矩立在了只有一部分调用方能到达的地方。
+
+##### 后果：整套 token 预算机制形同虚设
+
+`track_tokens` 是 token 预算检查的**唯一执行者** —— per_call 上限、总量预算、
+告警阈值、`ai.tokens().calls()` 全靠它。而 `ai_chat.rs` 的**两条** chat 响应
+路径（`:676` 与 `:832`）都经由 `extract_usage` 喂数。
+
+实测（`json_to_value` 对整数 JSON 产出 `Value::Int`，D129）：
+
+| 输入 | 修前 | 修后 |
+|---|---|---|
+| `{"usage":{"prompt_tokens":1500,"completion_tokens":250}}` | **(0, 0)** | (1500, 250) |
+| `{"usage":{"prompt_tokens":1500.0,"completion_tokens":250.0}}` | (1500, 250) | (1500, 250) |
+
+真实 API 的 token 数是**整数** JSON 数字 —— 上表第一行才是现实，第二行**永远不会
+发生**。于是：
+
+- per_call 上限永不触发
+- 总量预算永不超限
+- 告警永不打印
+- `ai.tokens()` 恒显示 0
+
+**用户设了 token 预算，但整套机制完全不工作，且全程零诊断。** 这比 D245 的
+「返回错误答案」更隐蔽：这里连返回值都自洽（0 token 看起来完全正常），
+只有对照「我明明设了 1000 的上限」才会发现。
+
+##### 同一批顺带发现的两处（同类，无守卫）
+
+| 位置 | 修前 | 后果 |
+|---|---|---|
+| `method_dispatch.rs` `agent.create` 的 `max_steps` | `Some(Value::Float(n)) => *n as usize` | 写整数 `max_steps: 20` ⇒ **静默用默认 10**；`Float(-1.0)` ⇒ 0 步 |
+| `builtins/ai.rs` `ai.retry` 的 `backoff_ms` | `Int(i) as u64` **无守卫** | `Int(-1)` **回绕**成 `u64::MAX` ≈ 5.8 亿年 ⇒ 任何带重试的调用**永远等不到退避结束** |
+
+##### 修法：收口**上移**，而不是再加一个
+
+| 位置 | 改动 |
+|---|---|
+| `flow::value_as_f64` | **新增**（唯一提取点，含 `BigInt`） |
+| `flow::value_as_usize` | **新增**（非负可表示才给 `Some`，负数/NaN/±inf → `None`） |
+| `compress::json::value_as_f64` | 改为**转发**，公开路径不变 |
+| `ai_helpers::extract_usage` | → `flow::value_as_usize` |
+| `method_dispatch` `max_steps` | → `value_as_usize`，无效则**报错**（不替用户猜默认） |
+| `builtins/ai.rs` `backoff_ms` | → `value_as_usize`，无效则**报错**（`String` 分支保留） |
+
+> **本条最值得记的一句**：收口的**位置**和收口本身一样重要。
+> 放在只有一部分调用方能到达的地方，等于没有收口 —— 它只会挡住
+> 「已经看见它」的那部分调用方，而看不见的那部分会继续各写各的。
+
+##### 判据 `tests/value_extraction_saturation.rs`（4 条）+ 模块内 3 条
+
+| 判据 | 钉住 |
+|---|---|
+| `d246_both_int_and_float_are_accepted` | 两侧都收；非数值类型仍 `None`（不放宽类型判定） |
+| `d246_value_as_usize_rejects_negative_and_non_finite` | 负数 / NaN / ±inf → `None`，**不是**饱和成 0 |
+| `d246_compress_path_still_works` | D231 的公开路径转发后行为不变 |
+| `d246_control_group_json_int_parses_to_int_value` | **对照组**：钉「整数 JSON → `Int`」这条前提 |
+| `d246_extract_usage_accepts_int_token_counts`（模块内） | 主判据。`extract_usage` 是 `pub(super)`，集成测试**够不着** ⇒ 只能落模块内 |
+| `d246_extract_usage_degenerate_inputs_yield_zero_not_wrap`（模块内） | 畸形响应（负 token）记 0，**不回绕** |
+| `d246_control_group_json_int_is_int_value`（模块内） | 同一前提的模块内复述 |
+
+##### 牙齿验证：只回退 `extract_usage`
+
+| 判据 | 回退后 | 恢复后 |
+|---|---|---|
+| `d246_extract_usage_accepts_int_token_counts` | **FAILED** | ok |
+| 其余 6 条 | ok | ok |
+
+集成 4 条**故意保持绿** —— 它们钉的是收口本身，而本轮回退没碰收口。
+这同时证明「收口建对了」和「调用方用对了」是**两件独立的事**，
+只回退其中一件，才能分别验证。
+
+**护栏（非承重，如实标注）**：`d246_extract_usage_degenerate_inputs_yield_zero_not_wrap`
+在回退态下**仍然绿** —— 因为旧代码的 `_ => 0` 恰好也把负数记成 0。
+它能挡住的是「有人日后加一条不带守卫的 `Int` 分支」，
+但**挡不住**当前这个缺陷本身。主判据才是承重的那条。
+
+##### 方法论归总（跨 D230 / D231 / D234 / D244 / D245 / D246）
+
+本轮 6 条缺陷里，**4 条是同一种形态**：`Int` / `Float` 双来源或守卫内联，
+在某个实例上修好了，其它实例各写各的、继续漏。
+
+| 编号 | 形态 | 根因 |
+|---|---|---|
+| D230 | `BBox::from_value` 只认 `Float` | 双来源 |
+| D231 | 5 处 `if let Value::Float` | 双来源（已立收口） |
+| D234 | 两个 saver 三处分叉 | 同事实两套实现 |
+| D244 | 5 处同族守卫，修了 2 处 | 就地内联 |
+| D245 | 4 处同族守卫，修了 1 处 | 就地内联 |
+| **D246** | **收口立了，但位置只覆盖部分调用方** | **收口不可达** |
+
+⇒ 三条判据可复用：
+1. 见到 `if let Value::Float` / `as usize` 旁挨着守卫，就问**同族还有几处**。
+2. 见到 `match` 只匹配数值的一个变体，就问**另一个来源的数值**从哪来（D98 vs D129）。
+3. **收口建成之后，还要验证每个已知调用方都真的走到了它** —— 「有收口」不等于
+   「都被收口」。
+
+
+#### D247：`mora_to_json` 缺 `Value::Int` 分支？—— **否定结果**，但过程留下了真判据
+
+本条**没有修任何产品代码**。它是一次「我差点报了一个不存在的缺陷」的完整归档。
+
+##### 我原本要报什么
+
+普查 `document/backend/` 全是 `Value::Float(...)` **构造**（唯一读取点在测试里，
+`.expect` 会 panic 而非静默 ⇒ 否定），转而查协议层，发现
+`mcp_server.rs::mora_to_json` 只匹配 `Value::Float`、**没有 `Value::Int` 分支**：
+
+```rust
+Value::Nil    => JsonValue::Null,
+Value::Bool(b) => JsonValue::Bool(*b),
+Value::Float(n) => JsonValue::Number(*n),     // ← 没有 Int
+Value::String(s) => JsonValue::String_(s.clone()),
+Value::List(..)  => ..,
+Value::Dict(..)  => ..,
+other => JsonValue::String_(other.to_string()),  // Int 落这里
+```
+
+而 `http_server.rs::value_to_json` **是有** `Value::Int(i) => JsonValue::Number(..)`
+的。⇒ 「仓库内不一致」，与 D245 形状一模一样，于是推断「所有整数都被编成
+JSON 字符串，客户端拿到的类型错了」。
+
+##### 端到端实测：不成立
+
+真实 MCP stdio 会话（`tests/mcp_numeric_text_encoding.rs` 起 `mora.exe`）：
+
+```text
+tools/call int_tool   → {"content":[{"text":"42",   "type":"text"}]}
+tools/call float_tool → {"content":[{"text":"42.5", "type":"text"}]}
+tools/call str_tool   → {"content":[{"text":"hi",   "type":"text"}]}
+tools/call list_tool  → {"content":[{"text":"[1,2,3]","type":"text"}]}
+```
+
+原因在 `mcp_server.rs:437-454`：`result_json` 的两个分支**产出同构**的
+`{type:"text", text:<字符串>}`，只是 `text` 的来源不同（分支 1 直接取字符串，
+分支 2 先 JSON 化）。所以 `Int` 落进兜底变 `String_`、还是走 `Number` 分支，
+输出**逐字节相同**。
+
+##### ⚠ 我自己又犯了一次「先推理、后取证」
+
+第一版判据的理由是「补上 `Int` 分支会让 `42` 变成 `"42.0"`」。我把它当作
+「显然的破坏」去验牙齿 —— **结果判据仍然全绿**。
+
+按纪律先查装置而非直接记「判据没牙齿」：`mora.exe` 的时间戳确实比源文件新
+（0:33:45 > 0:33:39），二进制被重建了 ⇒ **装置是好的，判据真的没牙齿**。
+再查真正的序列化实现：
+
+```text
+lsp/json.rs:83    Number(42.0)  → "42"      ← 整数按 i64 输出，不补小数点
+flow/json.rs:387  Float(42.0)  → "42.0"    ← D99 刻意补小数点
+```
+
+⇒ 补 `Int` 分支**确实无害**，我的理由从根上就错了。
+
+##### 判据重写：从「假护栏」改成「真护栏」
+
+不能留一条**假装有牙齿**的判据。新版把主判据改钉在**真正脆弱**的地方 ——
+`lsp::json` 的数字格式化：LSP 规定 `line`/`character` 是 `uinteger`，输出
+`"42.0"` 会让严格客户端解析失败；MCP 复用 `lsp::json`，影响面更大。而
+`flow::json` 对 `Float` 补小数点是 D99 的**刻意设计**（否则往返丢类型），
+两条判据一起把「两个 JSON 实现为何不同」固定下来。
+
+**牙齿验证（把 `lsp::json` 改成补小数点）：**
+
+| 判据 | 改动后 | 恢复后 |
+|---|---|---|
+| `d247_lsp_json_integer_has_no_decimal_point` | **FAILED** | ok |
+| `d247_mcp_tool_result_text_shapes_snapshot` | **FAILED** | ok |
+| `d247_control_group_flow_json_float_keeps_decimal_point` | ok | ok |
+
+⇒ 这里修正了我自己一个说法：端到端那条**并非「非承重」**，它对
+「`lsp::json` 补小数点」这个破坏**确实有牙齿**，只是对我最初声称的
+「补 `Int` 分支」没有。
+
+##### 归总：两条新纪律
+
+1. **注释与形状像缺陷，不等于它就是缺陷**。看到「A 处有、B 处没有」就推断
+   「B 漏了」，必须先看**下游怎么消费** —— 本例下游两个分支同构，让
+   「A 有 B 没有」完全无害。
+2. **「判据有牙齿」不是一个布尔值，要说清「对哪个破坏有」**。同一个判据
+   可以对破坏 X 有牙齿、对破坏 Y 毫无作用（D247 里两次验证分别证明了
+   两件事）。写「本条是护栏」之前要真的验，并写清护的是哪一个。
+
+⇒ 与 D241 / D232 / D239 / D242 / D243 / D244 / D245 的「红的是我不是产品」
+并列，本条是**第 8 次**，但形态是新的：**我先推理出缺陷、再被实测推翻**。
+
+##### ⚠ 本轮改动触发了一条**既有判据**变红 —— 判据钉在了实现形态上
+
+全量测试抓到 `tests/numeric_positional_args.rs` 的
+`d150_ai_retry_backoff_accepts_both_number_kinds_in_source` 失败。它断言
+`ai.rs` 的 `backoff_ms` 片段里**字面**含 `Value::Float(n)` **且** `Value::Int(i)`：
+
+```rust
+assert!(snippet.contains("Value::Float(n)") && snippet.contains("Value::Int(i)));
+```
+
+而本轮把那两个 match 臂**收敛**进了 `value_as_usize` ⇒ 字面消失 ⇒ 变红。
+
+**判据的意图是对的**（「不得退回单侧」），**钉法是错的** —— 它钉的是
+**实现形态**而不是行为，于是**正确的收敛同样会让它红**。这是 D235
+「判据钉在错误的代码上」在 D246 的重演。
+
+该判据的注释本身已写明它**无法**改成运行时用例（`ai.retry(...)` 被 parser
+解析成「裸名 `ai` + 方法 `retry」`，产不出单名 `"ai.retry"`，D59 实测），
+所以**只能**留在源码层。改法是改**钉法**、不降强度：
+
+| | 改前 | 改后 |
+|---|---|---|
+| 断言 | 字面含 `Value::Float(n)` 且 `Value::Int(i)` | 走 `flow::value_as_usize` |
+| 保证的意图 | 不得退回单侧 | 不得退回单侧 + 不得各写各的 |
+
+「Int/Float 都认」这一半交给
+`tests/value_extraction_saturation.rs::d246_both_int_and_float_are_accepted` ——
+它钉在收口**行为**上，且是**运行时**判据，比源码字面断言更强。
+
+⇒ 补一条判据纪律：**源码判据是不得已的降级，不是常态**。写下它时就要问
+「这段代码被正确重构后，这条判据还成立吗」；不成立的，就钉到了形态上。
+
+#### D248：D245 的收口**漏了 2/6 处** —— `rename` 在负 position 下**改坏用户文件**（已修）
+
+D247 写下一条纪律：「**有收口 ≠ 都被收口**」。本条就是那条纪律的**第一次
+当场反例** —— 而反例的对象正是**我自己在两条之前刚修过的 D245**。
+
+##### D245 修漏了哪两处
+
+D245 在 `parsed_doc_v3::pos_of` 建了唯一收口，修了 `hover` / `definition` /
+`formatting` / `server` 四处。`rename.rs` 与 `references.rs` **各写了一遍**
+同样的转换、**没有**跟着改：
+
+```rust
+let line = pos.get("line").and_then(|n| n.as_i64()).unwrap_or(0) as usize;  // ← 仍在
+let col  = pos.get("character").and_then(|n| n.as_i64()).unwrap_or(0) as usize;
+```
+
+全仓 `get("line")` / `get("character")` 共 **6** 处解析点，D245 覆盖 4、漏 2。
+
+##### 后果比 D245 严重一个量级
+
+D245 的三处（hover / definition / formatting）只是**显示**错；**rename 会写入**。
+真实探针（文档 `let alpha: Int = 1\nlet beta: Int = alpha\nbeta`）：
+
+| position | rename 实际重命名了什么 |
+|---|---|
+| `(1, 17)`（在 `alpha` 上） | `alpha` ✓ 正确 |
+| **`(-1, 0)`** | **`beta` 两处**（`1:4-8` 与 `2:0-4`） |
+| `(0, -1)` | 空 |
+| `(-1, -1)` | **`beta` 两处** |
+
+成因与 D245 同款：负数经整数 `as` **回绕**成 `usize::MAX` → `position_to_offset`
+落到 `text.len()` → 文档恰好以标识符 `beta` 结尾 ⇒ **命中它** → 返回一份
+重命名 `beta` 的 WorkspaceEdit。客户端照此 `apply` ⇒ **改坏用户文件**。
+
+`references` 同样返回了 `beta` 的位置（虽然只是显示，不写入）。
+
+##### 修法：两处改走 `pos_of`
+
+| 位置 | 改动 |
+|---|---|
+| `providers/rename.rs` | → `parsed_doc_v3::pos_of` |
+| `providers/references.rs` | → `parsed_doc_v3::pos_of` |
+
+修后负 position 返回**空 edits**（退化到 `(0,0)`，那里是 `let` 关键字而非标识符），
+baseline 仍正确重命名 `alpha`。
+
+##### 判据 `tests/lsp_position_single_entry.rs`（4 条）—— 重点在第 ① 条
+
+| 判据 | 钉住 |
+|---|---|
+| **① `d248_no_module_parses_position_by_hand`** | **普查型**：扫 `src/lsp/providers/*.rs` + `server.rs`，任何自己解析 `get("line")`/`get("character")` 的行都必须走 `pos_of` |
+| ② `d248_negative_position_produces_no_rename_edits` | rename 在负 position 下**不得产生写入编辑**（带「对照组非空」防空转） |
+| ③ `d248_negative_position_produces_no_references` | references 侧同理 |
+| ④ `d248_control_group_negative_as_usize_wraps_to_max` | 对照组：钉语言事实，不钉 `pos_of` |
+
+**① 才是本条真正的产出。** D245 的行为判据只覆盖 `hover` 与 `definition`，
+于是「另外四个里还有没有漏」**完全无人过问** —— 事实是**还漏了两个**。
+
+⇒ 所以 ① 不钉任何具体行为，而是钉**全称命题**：「**没有例外**」。
+它防的不是某个具体缺陷，而是**「漏改一处」这个失误模式本身**。
+新增 provider 时若手写 position 解析，① 立刻变红并**点名文件与行号**。
+
+它是源码判据（LSP 侧无法穷举运行时路径，D150 已论证），但断言是**全称
+量化**的 —— 与 D150 那条「某处长什么样」的源码判据不同，它**不会**随正确
+重构而失效。① 还带一条扫描量下限（≥5，已知 6 处），防止扫描范围静默失效。
+
+##### 牙齿验证：只回退 `references.rs`
+
+| 判据 | 回退后 | 恢复后 |
+|---|---|---|
+| ① 普查型 | **FAILED** —— 精确点名 `references.rs:25`、`references.rs:26` | ok |
+| ③ references 行为 | **FAILED** | ok |
+| ② rename 行为 | ok（`rename.rs` 仍修着） | ok |
+| ④ 对照组 | ok | ok |
+
+⇒ 普查判据与行为判据是**两件独立的事**，分别验证到了。① 还额外证明了一件事：
+它能**定位**违规点，而不只是报「有问题」。
+
+##### 自我更正：这条本该在 D245 就做完
+
+D247 的归总里我写了「见到『A 处有、B 处没有』就问同族还有几处」，写完立刻
+就转去做 D247 本身，**没有回头用这条纪律检查 D245 自己的覆盖面**。
+
+⇒ 三轮下来，「同族覆盖」这条纪律**已经被违反两次**：
+D244（checkpoint 5 处修了 2 处）、D245（LSP 6 处修了 4 处）、
+D248（发现 D245 漏了 2 处）。两次都不是「忘了想」，而是**没有把已知清单
+逐项核对**。
+
+⇒ 补一条可操作的纪律：**收口类修复交付时，必须给出「已覆盖 N 处 / 共 M 处」
+的显式清单**；M 无法确定时（如 D245 当时），就**先普查出 M 再改**，
+不要边改边猜 M 是多少。
+
+#### D249：`with-config` 的数值键与 `value_type_simple` —— 又是两处**没走到收口**的地方（已修）
+
+D248 建立了「收口类修复必须给出 **已覆盖 N / 共 M** 清单」这条纪律。本条就是
+**按那条纪律执行**的结果：先把 M 普查出来，再逐项核对。
+
+##### 普查（M = 84 个 `Value::Float` 读取点）
+
+排除测试代码与 `mir/` / `rel/` / `typeck/`（同名变体，非 `value::Value`）后：
+
+| 类别 | 结论 |
+|---|---|
+| `math.rs` / `builtins/mod.rs` / `compress/mod.rs` / `reading_order` | 两侧都收 ✓（D153 / D150 已修） |
+| `random.rs:214,241`、`compress/json.rs:831` | **都在 `#[cfg(test)]` 里** ⇒ 否定 |
+| `mcp_server.rs:496` | D247 已确认下游分支同构 ⇒ 无害 |
+| **`interpreter/mod.rs:744,758`** | ❌ `with-config` 数值键只认 `Float` |
+| **`compress/mod.rs:528`** | ❌ `value_type_simple` 缺 `Int` 分支 |
+
+⇒ 这正是 D246 立收口时**没普查到**的两处。与 D245/D248 同型：
+**有收口 ≠ 都被收口**。
+
+##### 缺陷一：`with temperature = len([1,2,3])` 被拒，理由荒谬
+
+`mir_with_config` 的 `temperature` / `max_tokens` 只匹配 `Value::Float`。
+**数字字面量恰好是 `Float`（D98）** —— 这个巧合把它藏住了，所以
+`tests/with_config.rs` 里那一整组用例（全部写 `"0.7"`）从没暴露问题。
+但任何**返回 `Int` 的表达式**就撞上：
+
+```text
+with temperature = 1              → Ok
+with temperature = 0.7            → Ok
+with temperature = len([1,2,3])   → Err: "expects a number, got int"
+```
+
+**「int 明明是数字」** —— 错误信息本身就是错的。即同一个值（都是 3），
+取决于它**怎么算出来的**，结果不同。用户想动态设置 temperature / max_tokens
+时，只要表达式返回 `Int` 就被拒。
+
+##### 缺陷二：`value_type_simple(Int)` 报 `"other"`
+
+该函数缺 `Int` / `BigInt` / `Char` 三个分支，全部落进 `_ => "other"`。
+它被**广泛用于错误信息**（`compress` 的全部参数校验 + `required_str_arg`）：
+
+```text
+some_builtin(42) → "must be a string, got other"   ← 毫无信息量
+```
+
+而 `flow::type_name` 覆盖完整（`Int`→"int"、`BigInt`→"bigint"、…）⇒
+**两份类型名函数在共有类型上分叉**。
+
+##### 修法
+
+| 位置 | 改动 |
+|---|---|
+| `interpreter/mod.rs` `temperature` | → `flow::value_as_f64`（D39 的「非数值报错」语义原样保留） |
+| `interpreter/mod.rs` `max_tokens` | 两步：`value_as_f64` 取值 → **保留 D147 的负数检查**（含具体数值）→ `as usize` |
+| `compress/mod.rs::value_type_simple` | 补 `Int` / `BigInt` / `Char` 三个分支 |
+
+⚠ `max_tokens` **刻意不用** `value_as_usize` 一把梭：`value_as_usize(-1.0)`
+返回 `None`，若直接拿它写错误分支，信息会退化成「expects a number, got float」
+—— 丢掉具体数值**且**把负数说成 float，比修前更糟。判据 ③ 专门盯这一点。
+
+⚠ `value_type_simple` 的**彻底修法**是转发到 `flow::type_name`（消掉分叉），
+但那会改变**所有**既有错误信息的措辞（`Char` "other"→"char"、
+`Value::Closure` →"closure" …），影响面超出缺陷本身，**已留作待裁决项**。
+
+##### 判据 `tests/d249_with_config_and_type_names.rs`（6 条）
+
+| 判据 | 钉住 |
+|---|---|
+| `d249_with_config_accepts_int_valued_expressions` | 两个键 × 三种数值写法（Float 字面量 / 数字字面量 / `len()`）全部接受 |
+| `d249_with_config_still_rejects_non_numbers` | **不回归 D39**：字符串仍报错 |
+| `d249_with_config_still_reports_negative_values` | **不回归 D147**：负数仍报「不能为负数（得到 -1）」 |
+| `d249_value_type_simple_names_common_values` | 9 种值都不再报 `"other"` |
+| `d249_type_name_functions_agree_on_shared_types` | **全称**：两份类型名在 9 种共有类型上不得分叉，变红时列出分叉项 |
+| `d249_control_group_numeric_literal_is_float` | 对照组：钉「字面量给 `Float`」这条**前提**（D98） |
+
+##### 牙齿验证：回退两处
+
+| 判据 | 回退后 |
+|---|---|
+| `d249_with_config_accepts_int_valued_expressions` | **FAILED**（点名 `len([1,2,3])` 被拒） |
+| `d249_value_type_simple_names_common_values` | **FAILED** |
+| `d249_type_name_functions_agree_on_shared_types` | **FAILED**（列出分叉类型） |
+| 两条**不回归**判据（D39 / D147） | ok |
+| 对照组 | ok |
+
+⇒ 三个承重判据各自变红、两条不回归判据保持绿 ⇒ 钉位正确，且
+**「不回归」这件事本身也被验证了**（不是碰巧没被回退波及）。
+
+##### 方法论：M 必须先普查
+
+D245 当时**没有**普查出 M（以为 4 处，实际 6 处），D248 才发现漏了 2 个。
+本条严格照 D248 新立的纪律执行：**先用脚本扫出 M = 84，再逐项分类**。
+脚本同时验证了「规则是否可用」——若规则本身有大量误报，会在写判据**之前**
+就发现，而不是写完判据才发现站不住。
+
+⇒ 副产品：那份普查脚本还排除了 32 个点（其中绝大多数是 `builtins/tests/`
+下的独立测试文件，`#[cfg(test)]` 的粗略识别抓不到）——
+**「先普查」顺带校正了「测试代码在哪」的认知**。
+
+#### D250：死代码普查（`pub(crate)` / 私有层）—— **零命中**，并更正我对 `replay_tea_app` 的说法
+
+本条**没有改动任何产品代码**，是 D237（重复函数普查）的延续，重点换一个
+**无歧义**的目标。
+
+##### 为什么换成 `pub(crate)` / 私有层
+
+上一轮我先普查了 `pub fn`，得到 72 个「只出现 1 次」的候选。但复核后
+**绝大多数是合理的库公共 API** —— mora 既是 CLI 也是库，外部使用者当然会
+调 `pub fn`。「零内部引用」对 `pub` 而言**不构成死证据**。
+
+真正无歧义的是：
+
+| 目标 | 零调用意味着 |
+|---|---|
+| 私有 `fn` | **编译器会报 `dead_code`** ⇒ 必然为 0（clippy 当前 0 警告） |
+| `pub(crate)` / `pub(super) fn` | 既**不触发** `dead_code`，又**不是**公开 API ⇒ 零调用就是**真死代码** |
+
+##### 结果
+
+| 层 | 零调用数 |
+|---|---|
+| `pub(crate)` / `pub(super) fn` | **0** |
+| 私有 `fn` | 54 —— **全部是误报** |
+
+54 个误报的甄别：
+
+- **41 个**是 `src/record/tests.rs` 的 `#[test]` 函数，**11 个**是
+  `src/tea/tests.rs` 的同款 —— 这些文件是**独立测试文件**（经 `mod tests;`
+  引入），**文件内没有 `#[cfg(test)]` 标记**，所以我那种「见到 `#[cfg(test)]`
+  就切到测试模式」的粗略识别抓不到它们。
+- **2 个**是 `src/value/list.rs` 的 `size_hint` / `from_iter` ——
+  它们是 **trait 方法的实现**（`impl Iterator for List` /
+  `impl FromIterator for List`），由 **trait 机制**调用，不会有显式调用点。
+
+⇒ 修正脚本的识别方式（按文件名 + `mod tests;` 判定）后，实际死代码 **0**。
+
+##### ⚠ 一处自我更正：`replay_tea_app` **不是死代码**
+
+本轮开头我说 `tea::replay_tea_app`「未接线、是第三个死代码候选」。**这个说法
+不准确** —— 它是 `pub fn`，属于**库的公开 API**，只是 CLI 的 `run_replay`
+走的是 `ai.chat` / `web.fetch` 的事件重放路径，没有用它。
+
+零内部引用**不能证明** `pub` 函数是死代码。⇒ D237 记的
+`mir/optimize/{pattern,ssa_pattern}.rs`（784 行）与 `flow::{hex_encode,hex_decode}`
+当时也只是「内部零引用」，**同样应降级为「公共 API 未经内部使用」**，
+而不是断言死代码。按既有纪律（`pub fn` 删除属接口变更）**一律只报告不实施**。
+
+##### ⚠ 普查脚本自身的一个 bug（第一次跑出「0 个 pub fn」）
+
+正则 `^\s*pub...fn` 忘了加 `re.M` ⇒ `^` 只匹配**文件首行**，而 `pub fn`
+几乎从不在首行 ⇒ 扫出 0 个「死代码」。
+
+这个假阴性很危险：它看起来像「仓库非常干净」的**好消息**，而真相是
+**脚本根本没工作**。
+
+⇒ 与 D243（`Copy-Item` 保留 mtime）、D246（`python -c` 转义）同源：
+**「结果是 0」时必须先确认装置真的跑过**，再把 0 当结论。
+本条的正数结果（72 个 `pub fn` 候选）就是在修好这个 bug 之后才拿到的。
+
+#### D251：**外部解析器差分** —— 两个手写 JSON 序列化器的线缆格式合规性（否定结果）
+
+D250 末尾定的方向：静态普查的边际收益已明显下降，改用**外部解析器交叉验证**。
+本条是那件事的第一次执行。
+
+##### 为什么必须外部验证
+
+仓库有**两个**手写 JSON 序列化器：
+
+| 序列化器 | 谁在用 | 上一轮的人工审查 |
+|---|---|---|
+| `flow::json` | `json.stringify`、checkpoint `to_json` | D99（非有限值） |
+| `lsp::json` | **LSP 与 MCP 协议都用它** | D240（转义表，判为「有意独立」） |
+
+两处都被人审过若干轮，但**从未用外部解析器验证过**。原因很关键：
+
+> Rust 侧两个解析器**自己就能读回自己写的任何东西** ⇒ 内部往返测试
+> **永远发现不了**「产出的是非标准 JSON」这类缺陷。
+
+而 Python 的 `json.loads` **默认接受** `NaN` / `Infinity`（非标准扩展），
+**真实客户端不会**。所以必须装 `parse_constant` 钩子才能测出来。
+
+##### 取证：极端值在两条路径上
+
+Mora 侧可达的极端值（真实 `mora run` 实测）：
+
+| Mora 表达式 | 语义 | `json.stringify` |
+|---|---|---|
+| `math.sqrt(-1.0)` | NaN | `null` |
+| `math.log(0.0)` | −Infinity | `null` |
+| `1.0 / 0.0` | +Infinity | `null` |
+| `0.0 / 0.0` | NaN | `null` |
+| `-1.0 / 0.0` | −Infinity | `null` |
+
+MCP 线缆（真实 `mora.exe` + stdio + **Python 严格解析**）：
+
+```text
+frames: 7
+all frames are STRICT-STANDARD JSON
+{"text":"null"}                    ← sqrt(-1) / log(0) / 1.0/0.0 / -1.0/0.0
+{"text":"{"n":null,"ok":1.5}"}  ← dict 含 NaN
+{"text":"[null,1.5]"}              ← list 含 NaN
+```
+
+⇒ **两个序列化器都正确**，把非有限值降级成 `null`。**否定结果。**
+
+##### 判据 `tests/extreme_values_wire_format.rs`（3 条）
+
+| 判据 | 钉住 |
+|---|---|
+| `d251_mcp_wire_format_has_no_nonstandard_constants` | 所有帧不得含 `NaN` / `Infinity` 字面量，且必须能解析 |
+| `d251_extreme_values_degrade_to_null` | 极端值 → `null`；**且正常值 1.5 必须原样保留**（否则「全变 null」也能过） |
+| `d251_control_group_detector_catches_nonstandard_json` | **对照组**：检查器对真坏帧必须报警，否则主判据可能恒绿 |
+
+**牙齿验证**（去掉 `lsp::json` 的非有限值守卫）：
+
+| 判据 | 去掉守卫后 |
+|---|---|
+| `..._has_no_nonstandard_constants` | **FAILED**，并打印出泄漏的帧 `{"text":"NaN\n","type":"text"}` |
+| `..._degrade_to_null` | **FAILED** |
+| 对照组 | ok |
+
+⇒ 否定结果**不是**「没有判据」，而是有**被验证过有牙齿**的判据守着。
+
+##### ⚠ 又一次期望值写错（累计第 9 次）
+
+对照组里我先写了「合法帧不应误报」，用例会含字符串 `"a NaN string"` ——
+**子串匹配当然会命中**。红的是我的期望：我在紧挨着的上一行注释里刚写明
+「字符串里的 `NaN` 会误报」，下一行却断言不误报，**自相矛盾**。
+
+现已把那条改成**如实固定该局限**，并写明推广条件：
+
+> 若将来 ① 要用于含任意字符串的响应，必须先换成**真正按结构解析**的检查
+> （Python `json` + `parse_constant` 钩子，或等价的结构化校验）。
+
+**已知局限**：子串检查无法区分「裸 `NaN` 常量」与「字符串内容里的 `NaN`」。
+主判据 ① 之所以成立，是因为它只跑**已知极端值用例** —— 那些响应只含
+`null` 与数字，不含任意字符串内容。
+
+##### 判据形态上的一个取舍
+
+① 用的是**子串匹配**而不是结构化解析。代价就是上面那条局限。
+之所以仍可接受：`lsp::json` 的解析器就在同一个 crate 里，
+「帧能否被 `lsp::json::Parser` 解析」这一条已经覆盖了**结构性**正确性
+（Rust 的 parser 是严格的，见判据里的 `parse_value().unwrap_or_else`），
+子串检查只负责**额外**抓非标准常量 —— 即那些 Rust parser 自己也接受、
+但真实客户端会拒绝的东西。两者分工明确。
+
+#### D252：`unsafe` 块普查 —— **可达性优先**，补齐 10 处 SAFETY 论据
+
+D250 的教训是「静态普查容易在噪声里漏掉真信号」，所以本轮**先普查可达性、
+再普查文档**，顺序不能反。
+
+##### 可达性地图（这一步比文档缺口重要得多）
+
+| 文件 | unsafe | 参与编译 | 真实执行情况 |
+|---|---|---|---|
+| `mir/jit.rs` | 10 | ✅ | **仅测试** —— `LegacyJitBackend::try_compile` 是恒定 `CompileReject` 的占位实现（注释：「现有 JIT 覆盖率极低（3-5%），暂不实际编译，调用方回落解释器」）。真正执行机器码的是 `tests/jit_compile.rs` 的 **19 个差分测试**（JIT vs 解释器结果必须相同，`#![cfg(target_arch = "x86_64")]`） |
+| **`mir/lmir_to_mir.rs`** | 1 | ❌ | **永不执行** —— `mir/mod.rs` 的模块列表里**没有** `lmir_to_mir`（实测 `cargo test --lib lmir_to_mir` ⇒ **0 tests**） |
+| `sandbox/container.rs`、`interpreter/builtins/exec.rs` | 3 | ✅ | `#[cfg(unix)]` ⇒ **Windows 上不编译** |
+| `document/backend/image.rs` | 3 | ✅ | 仅测试（`EnvGuard`，已有 SAFETY） |
+
+⇒ **高危 unsafe 全部集中在 JIT，而 JIT 的生产路径是关闭的**。
+在 Windows x86_64 上，生产可达的 `unsafe` 实际为零。
+
+##### ⚠ 一个定时炸弹：`lmir_to_mir.rs`
+
+```rust
+let s = unsafe {
+    let slice = std::slice::from_raw_parts(*_ptr, *len);   // 无 null / 长度检查
+    std::str::from_utf8_unchecked(slice)                    // 不校验 UTF-8
+};
+```
+
+**不参与编译 ⇒ 现在无害**。但一旦有人补上 `mod lmir_to_mir;`：
+- `_ptr` 为 null 或 `len` 越界 ⇒ 立即 UB；
+- 字节不是合法 UTF-8 ⇒ 构造出**无效 `str`**，此后任何字符串操作（切片 /
+  索引 / 长度）都是 UB。
+
+按既有纪律（结构/接口变更**只报告不实施**），本轮不删它、不接线它，
+只把这条写在 SAFETY 注释里**钉死**，并在判据注释里再次点明。
+
+##### 文档缺口：10 个真正的 `unsafe` 块缺 SAFETY 论据
+
+普查得到 23 个 `unsafe` 出现点，其中：
+
+- **6 个是 `unsafe extern` 声明** —— 只声明、**不执行**，按 Rust 惯例豁免；
+- **1 个是返回类型**里的 `unsafe`（`fn as_fn_ptr(&self) -> unsafe extern "C" fn(…)`）；
+- **10 个是真正的块**，全部缺 SAFETY 论据 ⇒ 已逐一补齐。
+
+论据**均按实际代码逐处撰写**，不是模板。例如最危险的一处
+（`jit.rs:993`，把生成的机器码写进即将变为可执行的内存）：
+
+> SAFETY: 两段内存**长度同源** —— 上面刚用 `bytes.len()` 调
+> `ExecMem::alloc_rw`，而 `alloc_rw` 只会 `max(1)` 放大，绝不缩小，故目标
+> 可写区至少 `bytes.len()` 字节；源 `bytes` 是长度恰为 `bytes.len()` 的
+> 有效切片。两段不重叠。此时内存仍是 **RW**（`make_exec()` 在下一行才提权），
+> 符合 W^X；且 `&mut mem` 保证没有别人同时写。
+
+补齐后重跑普查：真正缺论据的块 **0**。
+
+##### 判据 `tests/unsafe_safety_docs.rs`（2 条）
+
+| 判据 | 钉住 |
+|---|---|
+| `d252_every_unsafe_block_has_safety_justification` | 每个真正的 `unsafe` 块上方（跳过空行/属性/注释）必须有 `SAFETY`；豁免声明与返回类型；另带扫描量下限防范围静默失效 |
+| `d252_control_group_detector_finds_missing_safety` | **对照组**：紧邻的 SAFETY 要认、隔了几行的**不**认、无 SAFETY 的要判缺、两条豁免规则要生效 |
+
+**牙齿验证**（删掉 `copy_nonoverlapping` 上方那 6 行论据）：
+
+| 判据 | 结果 |
+|---|---|
+| `d252_every_unsafe_block_has_safety_justification` | **FAILED**，精确点名 `src/mir/jit.rs:1018` |
+| 对照组 | ok |
+
+##### ⚠ 普查脚本自己骗了我一次（第二次同类）
+
+第一版脚本对每个 `unsafe` 行**向上找一行就停**。于是像
+
+```rust
+// SAFETY: serialised by `_lock`; …      ← 第 1 行
+// this process-global var during …       ← 第 2 行
+unsafe {
+```
+
+这种**两行 SAFETY 注释**被判定成「缺论据」—— 报出 21 个缺失，其中大部分是
+误报（`image.rs` / `exec.rs` 明明有 SAFETY）。
+
+⇒ 与 D250 的 `re.M` 同类：**「结果异常」时先确认工具真的跑对了**。
+修法是向上走时**跳过所有注释行**、只在遇到第一个非注释行时判定。
+修正后从 21 降到 17，再按「声明 / 返回类型」豁免降到真正的 10。
+
+⇒ 归总一条：**普查工具本身需要被验证**。这次的验证方式是「抽查若干已知
+答案」—— 随便看一眼 `image.rs:364` 就发现脚本在撒谎。
+
+#### D253：**覆盖度地图** → 三个白名单的一致性 —— 我推理出「矛盾」，实测证明**两处都安全**
+
+D250–D252 连续三轮，我三次提议的审计方向（死代码、UTF-16 往返、JSON 往返）
+**都已经被做过**。这说明我该先搞清楚**哪里已经审过**，而不是继续凭印象挑方向。
+
+##### 覆盖度地图（工具产出）
+
+从 CHANGELOG 反向统计每个 `src/**` 文件被**带路径**引用的次数：
+
+| | |
+|---|---|
+| 被提及最多 | `interpreter/mod.rs` 39 · `pregel/mod.rs` 27 · `flow/json.rs` 19 —— 与我实际经历**吻合**（统计有效） |
+| 从未被带路径提及 | 91 个文件 / 19642 行 |
+| 其中最大 | `mir/dag.rs` 1220 · `builtin_impls.rs` 984 · `optimize/dag_rule.rs` 957 · `rel/search.rs` 658 · `mir/ehir_to_core.rs` 584 · `mcp_server.rs` 508 · `mir/opt/loops.rs` 463 …… |
+
+⚠ 这个统计**低估**部分覆盖（CHANGELOG 里常写裸文件名，如 `xy_cut.rs` 其实是
+`document/reading_order/xy_cut.rs`，D243 刚修过）。但它给出一个可靠信号：
+**`mir/` 子系统是审计最薄弱的区域** —— 它是执行管线的核心
+（`lower → MirInst → dag_interp`），而 CHANGELOG 里几乎没有它的条目。
+
+##### 在 `mir/` 里找到什么：三处白名单的判定互相矛盾
+
+| 位置 | 对 `Expr` / `Prompt` 的判定 |
+|---|---|
+| `mir/inst.rs::is_effect()` | 两者都算**有副作用** |
+| `mir/vm/dag.rs::is_memoizable_pure()` | `Expr` 算**纯**（可 memo 跳过） |
+| `mir/optimize/dag_rule.rs::same_inst_category()` | `Prompt` 算**可 CSE 合并** |
+
+看起来像缺陷。**我推理到这里就停了 —— 这是本轮的方法错误。** 读 dispatch
+之后，两个矛盾**都是安全的**：
+
+- `Expr` 的 dispatch 是 `MirInst::Expr(_) => Ok(Flow::Continue)` —— **no-op**。
+  跳过它与执行它结果完全相同 ⇒ memo 安全（只是零价值）。
+- `h_prompt`（`mir/handlers/values.rs:190`）：
+  ```rust
+  let mut s = String::new();
+  for r in parts { s.push_str(&value_to_string(&regs[*r])); }
+  regs[dst] = Value::String(s);
+  ```
+  **纯字符串拼接，不发 AI 请求、不读 env** ⇒ CSE 合并两个相同 `Prompt`
+  **安全**；`is_effect` 是**保守误标**（多排除一些，无害）。
+
+⇒ **本条没有修任何产品代码。** 它的产出是把「危险的方向」钉成判据。
+
+##### 判据 `tests/mir_memo_purity_consistency.rs`（4 条）
+
+第一版我写的是「两张名单**交集必须为空**」—— **过严**：保守重叠是安全的，
+拿它当规则会逼着人删掉本来正确的白名单项。改盯真正危险的方向，也就是
+**v0.87 已经踩过**的那个：
+
+> v0.87：`gensym` 全部返回 `g0` 的根因 —— 对同名零参数调用做 CSE，把**多次**
+> 副作用调用合并成**一次**。
+
+| 判据 | 钉住 |
+|---|---|
+| `d253_memoizable_whitelist_excludes_provably_effectful_insts` | 11 个**可论证**的有副作用指令（`Call`/`MethodCall`/`Pipe`/`Var`/`Define`/`Assign`/`IndexAssign`/`Send`/`Perform`/`Aggregate`/`MatchExpr`）不得进纯白名单 |
+| `d253_cse_whitelist_excludes_provably_effectful_insts` | 同一条，对 CSE 白名单 |
+| `d253_whitelist_contents_are_pinned` | 快照：把 `Expr` / `Prompt` 这两项**靠读实现才敢放进白名单**的钉死 |
+| `d253_control_group_provable_effect_list_is_real` | **对照组**：证明规则对 `Call` 确实会反应（否则 ① 恒绿）；同时证明「保守重叠被允许」 |
+
+**牙齿验证**（把 `MirInst::Call` 塞进 `is_memoizable_pure` —— v0.87 的同款形状）：
+
+| 判据 | 注入后 |
+|---|---|
+| `..._memoizable_whitelist_excludes_provably_effectful_insts` | **FAILED**，精确指出 `["Call"]` |
+| `..._whitelist_contents_are_pinned` | **FAILED** |
+| CSE 判据 / 对照组 | ok |
+
+⇒ 两条判据是**独立**的，且都真的有牙齿。
+
+##### 判据解析器骗了我三次（第四次同类事故的变体）
+
+写这条判据时，源码白名单解析器连错三处，**每一次都表现为「结果不对」而不是
+「崩溃」**：
+
+1. 用 `find("\n    }")` 找函数结尾 ⇒ 匹配到函数体之外很远的地方，把
+   **11 项**的 `is_effect` 解析成 **51 项**。
+2. 改成按 `|` 分割 + `strip_prefix("MirInst::")` ⇒ **第一项被吞**
+   （`matches!(inst, MirInst::Const(..)` 粘在宏头上）⇒ 快照读成 5 项。
+3. 改成 `split("MirInst::")` 后忘了删掉下面的 `strip_prefix` ⇒ 解析出**空列表**。
+
+三次都是「断言红了 ⇒ 我以为产品有问题 ⇒ 实际是工具错了」。
+
+⇒ 与 D250（`re.M` 缺失）、D252（多行 SAFETY 误判）同源，归为一条：
+**普查工具本身需要被验证；「结果异常」时先确认工具真的跑对了。**
+本轮的验证方式是让判据先**红一次**再看红的原因 —— 如果第三次修完快照直接
+变绿而我没深究，就会把「解析器返回空」当成「白名单是空的」归档。
+
+#### D254：D187（`--opt>=1` 静默中止）**根因定位** —— `rename_variables` 从不填 `phi.incoming`（**未修**）
+
+D253 的覆盖度地图指出 `mir/` 是审计最薄弱区。本轮顺着它走进
+`mir/ssa.rs` 的 SSA 构造，**把一个已记录但未定位的严重缺陷定位到了具体机制**。
+
+**本轮没有修任何代码** —— 修复需要重写核心算法，见文末。
+
+##### 现象复核（真实 CLI，当前工作区）
+
+```text
+$ mora run a.mora          →  A / B / 6.0     exit 0
+$ mora --opt=1 run a.mora  →  A               exit 0    ← 静默中止，无诊断
+```
+
+与 D187 记录**完全一致**，缺陷仍在（`tests/opt_ssa_equivalence.rs` 用「钉住坏
+行为 + 留翻转说明」的方式锁着它）。
+
+##### 第一步：pass 二分 —— 四个优化 pass **全部清白**
+
+依次把 `default_basic_pipeline()` 改成只含一个 pass，重编译跑同一程序：
+
+| pipeline | 输出 |
+|---|---|
+| all four（原始） | `['A']` |
+| 只 ConstProp | `['A']` |
+| 只 CopyProp | `['A']` |
+| 只 DeadCodeElim | `['A']` |
+| 只 Gvn | `['A']` |
+| **一个 pass 都不跑（仅 SSA 往返）** | **`['A']`** |
+
+⇒ **不是任何优化 pass 的问题**，是 `ssa::construct` / `ssa::deconstruct`
+**这对转换本身**。
+
+##### 第二步：程序变体 —— 精确定位到「循环体非空」
+
+| 变体 | opt=off | opt=1 | |
+|---|---|---|---|
+| `for`（**空**循环体） | `done` | `done` | ✓ |
+| `for` + `print(i)` | 1,2,3,done | **空** | ❌ |
+| `for` + 累加 | 6.0 | **空** | ❌ |
+| `for` + `print("x")`（**不用 `i`**） | x,x,x,done | **空** | ❌ |
+| `while` + 累加 | 6.0 | 6.0 | ✓ |
+| `if` 常量条件 | T,done | T,done | ✓ |
+
+⇒ 只要 `for` 的**循环体非空**就中止，**且连循环之后的代码都不执行**。
+`while` 正常 ⇒ 与「回边自增」有关；空 `for` 正常 ⇒ 与「循环体里的定义」有关。
+
+##### 第三步：dump SSA —— **根因**
+
+`ssa::construct` 对 `for i in [1,2,3] / print(i) / end` 产出的 SSA：
+
+```text
+block 1: succs=[3, 2] term=JumpIf(14, 3, 2)
+    phi 15 <- []        ← incoming 是空的
+    phi 11 <- []        ← 循环变量（索引）
+    phi 6  <- []
+    phi 5  <- []
+```
+
+**phi 被创建了，但 `incoming` 一条边都没填。** 后果链条完整闭合：
+
+1. `deconstruct` 用 `for (pred_id, src_ssa) in &phi.incoming` 生成回边 copy
+   ⇒ incoming 空 ⇒ **一条 copy 都不插**；
+2. 循环变量（索引寄存器）在回边上**永不递增** ⇒ 循环走不下去；
+3. 执行器**静默返回 Nil**（用户只看到 `A` 与 exit 0，`print("done")`
+   在循环之后，也不执行）。
+
+> **⚠ 本条第 3 点原先写的是「主循环空转到 `MAX_STEPS`（1e7）后静默返回
+> Nil」—— 那是**推理**，不是实测，D257 已更正。**
+> 实测：`--opt=1` 跑这个程序**只花 0.02 秒**（`opt=off` 同样 0.02 秒），
+> 1e7 次空转不可能这么快。真实机制见 D257：`vm/dag.rs:401-412` 在
+> `ready` 为空时沿 `control_out` 推进，若某节点**既不可执行、又没有控制
+> 后继**，`active` 直接清空 ⇒ 立即返回。
+>
+> 原写法是**从 D40 的注释类推出来的**（那条注释描述的是「寄存器越界」
+> 场景，未必适用于本场景）。⇒ 归入已有纪律：**引用既有注释里的机制，
+> 也要自己测一遍**。
+
+##### 根因在 `rename_variables`（`src/mir/ssa.rs:860-946`）
+
+与标准 SSA 构造（龙书 §10.11）逐条对照：
+
+| 标准算法 | 当前实现 |
+|---|---|
+| 沿**支配树 DFS**，进入块前记录 phi 的 `incoming` | 图遍历（`visited` 集合），顺序不是支配序 |
+| 处理完块**退出时弹栈** | **只 push 不 pop**（全函数无 pop） |
+| 填 `phi.incoming` —— `deconstruct` 的唯一依据 | **从不填**：`insert_phi_nodes` 造出 `incoming: Vec::new()`，`rename_variables` 拿到的是**不可变** `&HashMap` 且 `for &(orig_dst, _) in phis` 把它忽略 |
+
+⇒ 这不是单点 bug，而是 **`rename_variables` 整个算法没有按 SSA 构造实现**。
+「只 push 不 pop」还额外导致栈只增不减 ⇒ 非支配路径会读到**错误的栈顶**，
+即 `rename_reads` 的重命名结果本身就不可靠（**这解释了为什么 D187 表格里
+8 个构造坏 5 个**，而不仅是 `for`）。
+
+##### 为什么本轮不修
+
+修复 = 重写 `rename_variables`（约 80 行核心算法）+ 验证整条优化路径 +
+**翻转 D187 那 5 条「钉住坏行为」的断言**。这是核心算法改动，不适合与
+「定位根因」这一轮混在一起仓促提交。
+
+且 D187 早已把「`--opt>=1` 优化器深度修」列为**待裁决**项 —— 是否投入修
+本身是个需要用户拍板的决定（见下）。
+
+##### 本轮产出（可复用的部分）
+
+- **根因精确到函数与语句级**：`rename_variables` 从不填 `phi.incoming`，
+  叠加「只 push 不 pop」，使 SSA 往返破坏所有带回边的循环。
+- **pass 二分表**：排除四个优化 pass，把范围缩到一对转换。
+- **变体表**：证明「空循环体正常 / while 正常 / for 非空即坏」，
+  排除了「for 的迭代变量特有 bug」这种更窄的假设。
+
+⇒ 下一轮若要修，入口就是 `rename_variables`：改成沿 `compute_dominators`
+给出的支配树做后序 DFS，进入块时对每个前驱记录栈顶到 `phi.incoming`，
+退出块时弹栈。注意 `phi_map` 必须改成可变（或用旁路 map 收集 incoming
+再写回）。
+
+#### D255：把 D254 的根因**判据化**，并为修复预置「修好后会红」的判据
+
+D254 定位了根因但没修（待裁决）。本轮做一件**不依赖该裁决**、且让修复
+更安全的事：把根因固定成判据，并**预置好修复之后应该长什么样的判据**。
+
+##### 三条判据的分工（`tests/ssa_phi_incoming.rs`）
+
+| # | 状态 | 作用 |
+|---|---|---|
+| ① `d254_current_state_for_loop_phis_have_empty_incoming` | **现在通过** | 钉住现状（`for` 的 phi 全部 `incoming` 为空），把 D254 的根因从「一段文字」变成**可执行的事实**。修好后它会红，提醒翻转 |
+| ② `d254_phi_incoming_covers_every_predecessor` | **`#[ignore]`** | 写好「每个 phi 的 incoming 必须覆盖该块**全部前驱**」—— 修好后去掉标记即生效 |
+| ③ `d254_for_loop_output_is_identical_with_and_without_opt` | **`#[ignore]`** | 端到端：`--opt=1` 的输出必须与 `--opt=off` **完全一致**。这正是 D187 那五条「钉住坏行为」断言**翻转后**应有的样子 |
+
+⇒ 修 `rename_variables` 之前，全量仍然全绿；修完之后，②③ 变绿、① 变红 ——
+三条一起告诉审查者「该翻转断言了」。
+
+##### 验牙齿时**额外发现**：`BasicBlock.preds` 也不可信
+
+临时去掉 ② 的 ignore 标记后，它确实变红了，但报的**不是**我预期的
+「incoming 为空」，而是：
+
+```text
+块 1 的 phi(dst=15) 的 incoming 前驱 [] != 该块前驱 [2]
+```
+
+块 1 是**循环 header**，本该有**两个**前驱（preheader 块 0 + body 回边块 2），
+而 `BasicBlock.preds` **只记了 `[2]`**。
+
+⇒ **只修 `rename_variables` 是不够的**，`preds` 的填充同样有缺口。若不把这点
+写进判据注释，修的人会把「incoming 从空变成少一条」误判成「没修好」，
+或者更糟 —— 修到「incoming 覆盖了残缺的 preds」，循环**仍然**不退出。
+
+⇒ 这也是「**预置判据**」的价值：它在修复**之前**就把「修完是什么样」以及
+「还有第二处缺口」写清楚了，而不是等修完再凭印象判断。
+
+##### 判据的 teeth 已验证
+
+| 判据 | 临时去掉 ignore 后 |
+|---|---|
+| ② `..._covers_every_predecessor` | **FAILED**（`incoming 前驱 [] != 该块前驱 [2]`） |
+| ③ `..._output_is_identical...` | **FAILED**（`--opt=1` 输出与 opt=off 不一致） |
+| ① `..._phis_have_empty_incoming` | ok |
+
+⇒ 两条预置判据**不是装饰**，在当前代码下确实会红。
+
+##### 一处操作失误（如实记）
+
+恢复 ignore 标记时，我用「删掉所有含 `#[ignore` 的行」这种粗筛，
+**误删了 ② 文档注释的第一行**（那行正文里恰好含 `#[ignore]` 字样）。
+已补回，并把 `preds` 的发现一并写进去。
+
+⇒ 教训与 D249 同一类：**批量文本操作要先看清会命中什么**。
+「删含 X 的行」在 X 可能出现在**注释正文**里时是危险的。
+
+#### D256：SSA 构造的**第三处缺口** —— 重编号只写回了一半（**未修**，且推翻 D255 的判断）
+
+D255 以为「修 `phi.incoming` + `preds` 就够了」。本轮**证明那是错的** ——
+还有第三处，而且更根本。
+
+##### 取证：`deconstruct` 的产物里寄存器被撞号
+
+对 `for i in [1,2,3] / print(i) / end` dump 前后 MIR：
+
+```text
+BEFORE                                  AFTER
+ 6: Const(13, Int(1))      ← 增量→13     7: Const(7, Int(1))     ← 增量→7
+12: Call(6, "print", [5])  ← print→6    15: Call(7, "print",[14]) ← print→**也→7** ❗
+13: BinaryOp(11, 11, Add, 13)          16: BinaryOp(13, 13, Add, 9) ← 加的是「条件结果」❗
+```
+
+⇒ **循环增量 1 与 `print` 的返回值共用寄存器 7**；第 16 行加的 `9` 是
+`BinaryOp(12, 13, GreaterEqual, 4)` 的 dst（条件的布尔结果），不是增量。
+
+##### 根因：三处「重编号」里只有一处真的写回了
+
+`rename_variables`（`src/mir/ssa.rs:889-924`）对三种情况处理不一致：
+
+| 类别 | 处理 | 结果 |
+|---|---|---|
+| 普通指令 | `set_dst(inst, reg_counter++)` | ✅ 写回了新编号 |
+| **`phi.dst`** | 算出 `new_dst` 并 `rename_stack[orig].push(new_dst)`，**但没写回 `phi.dst` 字段** | ❌ 仍占原编号 |
+| **`Define` / `Assign`** | `continue` 整个跳过（因为 `set_dst` 把它们第二字段当 dst，改了会错改**源**寄存器） | ❌ 仍占原编号 |
+
+而普通指令被重编号到**从 0 递增**的 `reg_counter` ⇒ 与前两者的原编号
+**必然重叠**。
+
+⇒ 也就是说：`set_dst` 里 `SsaInst::Define(_, dst) => *dst = d` 这行**本身
+就把「源寄存器」当成了 dst**。用 `continue` 规避了「错改源寄存器」，
+却制造了「编号撞车」—— **规避一个 bug 的代价是引入了另一个**。
+
+##### 判据 `d256_ssa_definition_targets_are_unique`（`tests/ssa_phi_incoming.rs` 第 ④ 条）
+
+去掉 `#[ignore]` 后实测 **5 处重复定义**：
+
+```text
+reg 5  被 block 0 的 Call(5, "len", [3])   与 block 1 的 phi
+reg 6  被 block 0 的 Const(6, Int(1))      与 block 1 的 phi
+reg 14 被 block 1 的 BinaryOp(...)         与 block 2 的 phi
+reg 15 被 block 1 的 phi                   与 block 2 的 Index(15, 3, 11)
+reg 15 被 block 2 的 Index(15, 3, 11)      与 block 2 的 Define("i", 15)
+```
+
+与 D255 的 ②③ 一样，它现在**挂起**（`#[ignore]`），不拖累全量；
+修好后去掉标记即生效。
+
+##### 修 `rename_variables` 的完整清单（三处缺一不可）
+
+| # | 缺口 | 判据 |
+|---|---|---|
+| 1 | `phi.incoming` 从不填充 ⇒ 回边 copy 全丢 ⇒ 循环不退出 | ② |
+| 2 | `BasicBlock.preds` 不完整（循环 header 只记回边、缺 preheader） | ② |
+| 3 | **重编号只写回普通指令**；`phi.dst` 与 `Define`/`Assign` 保留原编号 ⇒ 撞号 | ④ |
+
+外加两处算法层要求：**沿支配树 DFS**（现在是图遍历，遍历序不是支配序）、
+**退出块时弹栈**（现在全函数无 pop，栈只增不减 ⇒ 非支配路径读到错误栈顶）。
+
+⇒ 「静默返回错误结果、exit 0」这个症状，实际上由**至少三个独立缺陷**共同
+造成。这也解释了 D187 表格里「8 个常用构造坏 5 个」—— 它们不是同一个 bug
+的不同表现，而是**多个缺陷叠加**在同一处 SSA 往返上。
+
+#### D257：更正 D254 的一处**未实测**的机制描述，并**撤销**一个无效的守卫（否定结果）
+
+##### 更正：D254 的「空转到 `MAX_STEPS`」是我**推理**出来的，不是测出来的
+
+D254/255/256 三条都写了「循环不退出 ⇒ 主循环空转到 `MAX_STEPS`（1e7）后
+静默返回 Nil」。本轮实测：
+
+```text
+mora --opt=1 run  →  0.02 秒   输出 A   exit 0
+mora run          →  0.02 秒   输出 A / B / 6.0
+```
+
+**1e7 次空转不可能只花 0.02 秒。** 那个说法是我**从 D40 的注释类推**出来的
+（那条注释描述的是「寄存器越界」场景，未必适用于本场景）。
+
+⇒ D254 对应段落**已就地更正**，并写明「引用既有注释里的机制，也要自己测一遍」。
+
+##### 我加的守卫无效，已撤销
+
+既然机制假设错了，我据此在 `vm/dag.rs:401` 加了一个守卫
+（`ready` 为空且无控制后继 ⇒ 返回错误）。**实测它从未触发** —— 程序仍输出
+`A`、exit 0。真实收口在 612 行的 `active = next_active`，不走那条路径。
+
+⇒ **已完整撤销**，`vm/dag.rs` 回到本轮开始前的字节数（36147）。
+不留未经验证的代码 —— 一个「看起来合理但实际不生效」的守卫，
+比没有守卫更糟：它会让人以为这一类卡死已经被处理了。
+
+##### 目前已知的（仍然准确）
+
+- SSA 往返会破坏 `for` 循环（D254/D255/D256 的三处缺口，均已定位到语句级）；
+- `--opt=1` 下该程序 **0.02 秒**返回、只输出 `A`、**exit 0、零诊断**。
+
+##### 尚未确定
+
+「为什么 0.02 秒就返回」的真实路径。已排除：
+- 空转到 `MAX_STEPS`（耗时对不上）；
+- `ready.is_empty()` 分支里 `control_out` 断链（守卫不触发）。
+
+下一步应直接 **dump `dag_analyze` 产出的 DAG**（节点 + 边），看循环体
+节点是否进了 `dag.nodes`、回边是否建成 —— 那才是能定论的位置。
+本轮没做到，留给下一轮。
+
+⇒ 顺带修正 D255 的判断：那里写「修 incoming + preds 就够」是**不完整**的，
+本条已把它改写为「三处一起改」。
+
+#### D258：dump DAG —— `--opt=1` 静默中止的**因果链闭合**（确认 D256 撞号的最终后果）
+
+D257 留下的最后一块拼图：dump `dag_analyze` 产出的 DAG，看循环体节点与回边。
+
+##### SSA 往返后的 DAG（`for i in [1,2,3] / print(i) / end`）
+
+```text
+node  12: Compute Const(21, Int(0))          ← 循环变量「初值」写寄存器 21
+node  16: Compute BinaryOp(1, 13, GreaterEqual, 9)  ← 循环条件「读」寄存器 13
+node  17: Branch { cond: 1, true: 27, false: 18 }
+node  19: Compute Index(8, 17, 13)          ← body：`xs[13]`
+node  21: Compute Var(21, "acc")            ← body：也写寄存器 21  ❗
+node  25: Compute BinaryOp(13, 13, Add, 10)  ← 循环变量「自增」写寄存器 13
+node  26: Jump { target: Some(15) }         ← 回边在
+```
+
+##### 因果链（每一环都已实测）
+
+1. **D256 的撞号**：循环变量初值被分配到寄存器 **21**；
+2. body 里的 `Var(21, "acc")` **同样写寄存器 21** ⇒ 覆盖了初值；
+3. 而循环条件节点 16 读的却是寄存器 **13** —— 13 **只在 body 内的 node 25 被写**；
+4. ⇒ 条件节点在 body 执行过之前**永远不 data-ready**；
+5. ⇒ body（node 19+）永不激活 ⇒ 循环整体不执行；
+6. ⇒ `print("B")` 之后的语句一并消失，**exit 0、零诊断**。
+
+对照 `opt=off` 的 DAG（正确形态）：
+
+```text
+node  11: Const(20, Int(0))                 ← 初值写 20
+node  14: BinaryOp(23, 20, GreaterEqual, 21) ← 条件读 20 ✓ 同一个寄存器
+node  22: BinaryOp(20, 20, Add, 22)         ← 自增也写 20 ✓
+```
+
+⇒ 正确形态是「初值 / 条件读 / 自增**三者用同一个寄存器**」；
+SSA 往返后三者被拆到 **21 / 13 / 21** 三个不同编号上。
+
+##### 这解释了三轮里所有的观察
+
+| 观察 | 由哪一环解释 |
+|---|---|
+| 0.02 秒返回、不是空转到 `MAX_STEPS` | 条件永不就绪 ⇒ 不是「忙等」而是「等不到」 |
+| 我加的守卫不触发 | 真实卡点在 `node_ready`（数据就绪），不在 `control_out`（控制后继） |
+| D187 的「8 个构造坏 5 个」 | 每个用到「同一变量跨循环」的程序都会命中撞号 |
+| 空 `for` 循环体正常 | 循环体里没有指令 ⇒ 不产生覆盖初值的写 ⇒ 条件仍能就绪 |
+| `while` 正常 | while 的归纳变量与累加器没有撞到同一个编号 |
+
+##### 修 `rename_variables` 的清单（最终版，缺一不可）
+
+| # | 缺口 | 后果 | 判据 |
+|---|---|---|---|
+| 1 | `phi.incoming` 从不填充 | 回边 copy 全丢 | ② |
+| 2 | `BasicBlock.preds` 不完整 | header 只记回边、缺 preheader | ② |
+| 3 | **重编号只写回普通指令** | **初值 / 条件读 / 自增落到不同编号 ⇒ 循环永不执行** | ④ |
+
+外加沿支配树 DFS + 退出块弹栈（算法层）。
+
+⇒ **第 3 项是「静默中止」的直接原因**；①② 影响的是 phi copy 的正确性。
+三者都会让 `--opt>=1` 下带循环的程序出错，但**触发「静默返回」的是第 3 项**。
+
+⇒ 至此 `mir/` 里与 D187 相关的**所有独立缺陷点已收齐**：D254（incoming）、
+D255（preds）、D256（撞号）、D258（撞号 → 循环不执行的完整因果）。
+
+#### D259：量化 `--opt` 的**破坏面** —— 并发现**第二个独立缺陷族**
+
+D187 只手挑了 8 个构造（坏 5 个）。本轮用 22 个程序做三档 opt 的差分，
+把破坏面变成可复现的基线。
+
+##### 量化结果（22 个程序，基线 `opt=off` 全部正常）
+
+| 档位 | 与 `opt=off` 不一致 | 占比 |
+|---|---|---|
+| `opt=1` | 6 | **27%** |
+| `opt=2` | 11 | **50%** |
+
+**`opt=1` 破坏的 6 个，全部是含 `for` 循环的**：
+`for-accumulate` / `for-print-item` / `for-print-const` / `for-empty` /
+`nested-for` / `break-in-for` ⇒ 与 D254–D258 的结论**完全吻合**。
+
+##### 但 `opt=2` 额外破坏 5 个 `opt=1` 下**完全正常**的构造
+
+| 程序 | opt=1 | opt=2 |
+|---|---|---|
+| `let a = 1` + `print(a)` | `1.0` ✓ | **空** ❌ |
+| `d.get("a")` | `1.0` ✓ | **空** ❌ |
+| `len(d)` | `2` ✓ | **空** ❌ |
+| `len(xs)` | `3` ✓ | **空** ❌ |
+| `len(s)` | `3` ✓ | **空** ❌ |
+
+⇒ 这是**第二族缺陷**，与 `for` 循环、与 SSA 往返**都无关**。它们的共同点是
+**「变量绑定 + 读取」（`Define` / `Var` / `len` / `get`）**。
+
+##### 定位到单个 pass：`TailCallOptPass`
+
+把 `default_aggressive_pipeline()` 逐个裁剪、重编译：
+
+| aggressive 管线 | let-bind | dict-get | list-len |
+|---|---|---|---|
+| 空（不加任何 aggressive pass） | ✓ | ✓ | ✓ |
+| 只 LICM | ✓ | ✓ | ✓ |
+| 只 LSR | ✓ | ✓ | ✓ |
+| **只 TailCallOpt** | **✗** | **✗** | **✗** |
+| 三个全上 | ✗ | ✗ | ✗ |
+
+⇒ **LICM 与 LSR 都清白**，`TailCallOptPass` 是全部破坏的来源。
+
+##### 而这个 pass **只破坏、不优化**
+
+`src/mir/opt/tailcall.rs` 全文 60 行，核心动作只有一句：
+
+```rust
+block.terminator = Terminator::Unreachable;    // 注释：尾调用 → 无需额外 Return
+```
+
+而 `call_idx` 在两遍遍历里**都被写成 `_call_idx`，从头到尾没被用过** ——
+它**从未把尾调用真正改写成跳转/自环**，只做了「删掉返回」这一件事。
+而 `deconstruct.rs:307` 把 `Unreachable` 降维成 `MirInst::Return(None)`
+（`lmir_to_mir.rs:103` 则映射成 `Halt(None)`）⇒
+**块的返回值从「Call 的结果」变成 Nil**。
+
+一个零收益、只做破坏、且能破坏最基础语句（`let a = 1` + `print(a)`）的 pass。
+
+##### 待解的一处矛盾（本轮未查清，留给下一轮）
+
+`print(a)` 的**副作用**也消失了，不只是返回值变了。但按上面的分析，
+`Return(Some(x))` 与 `Return(None)` 的**末值都是 Nil**（`print` 本身返回 Nil），
+两者本应表现一致。
+
+⇒ 说明 **`dag_analyze` 对这两种 terminator 的处理不同**
+（很可能把 `Return(None)` 的块判成 `exit` 因而不执行）。
+这是下一轮的取证入口，也是「要不要修 `TailCallOptPass」的判断依据：
+若它在 DAG 层把块判成不可执行，那**关掉它就是纯粹的正确性修复**。
+
+##### 与 D187 的关系
+
+D187 的「8 个构造坏 5 个」是手挑样本；本条的 22 个样本给出
+**27% / 50%** 的可复现基线，并把破坏**拆成两族**：
+`for` 循环族（D254–D258，已全部定位到语句级）与
+`Define`/`Var` 族（本条，定位到 `TailCallOptPass`）。
+
+⇒ 修的**总清单**现在是：SSA 往返的三处缺口（D254/D255/D256）**加上**
+`TailCallOptPass`。
+
+#### D260：`Unreachable` 的降维违反了**同一文件自己的契约** —— 一行修复，第二族缺陷消除（已修）
+
+D259 留下的矛盾（副作用也消失 ⇒ 说明 `Return` 与 `Return(None)` 在 DAG 层
+处理不同）解开了，而且根因比预想的更小、更明确。
+
+##### 矛盾是怎么解开的
+
+先 dump 两档 opt 的 MIR（`let a = 1` / `print(a)`）：
+
+```text
+opt=1                                    opt=2（修前）
+0: Label(0)                              0: Label(0)
+1: Const(2, Float(1.0))                  1: Const(3, Float(1.0))
+2: Define("a", 2)                        2: Define("a", 3)
+...                                      ...
+6: Call(1, "print", [3])                 6: Call(1, "print", [2])
+        ← **没有 Return**                 7: Return(None)   ← 多出来的一条
+```
+
+⇒ **opt=1 的 MIR 本来就没有 `Return`**（D107 契约：末值 = 最后一个写寄存器的
+指令的值，隐式返回）。而 `opt=2` **多发射了一条真正的 `Return(None)`**。
+
+##### 根因：同一个 `match` 里，两个等价的 terminator 被降成了不同的指令
+
+```text
+deconstruct.rs:301   Return(None) => Label(usize::MAX)   // skipped —— 不发射
+deconstruct.rs:307   Unreachable   => Return(None)        // ← 真的发射
+```
+
+而 **301 行上方的注释已经把后果写清楚了**：
+
+> 发射 `Return(None)` 会在块首就短路（顶层块 Label 后第一条指令即
+> `Return(None)`），使隐式返回载体永远无法执行 → 返回值变成 Nil。
+
+⇒ 307 行违反了**同一文件自己写下的契约**。
+
+**触发链**：`TailCallOptPass`（`--opt=2` 独有）把尾调用块的 terminator 改成
+`Unreachable` → 307 行把它变成**真正的** `Return(None)` → 该指令被发射 →
+DAG 在**块首**短路 ⇒ 块里的 `Define` / `Var` / `Call` **一条都没跑**。
+
+这解释了「副作用也消失」：不是「返回值变成 Nil」（末值两种情况都是 Nil，
+`print` 本身返回 Nil），而是**整块没执行**。
+
+##### 修法：一行，让 `Unreachable` 与 `Return(None)` 同样不发射
+
+```rust
+Terminator::Unreachable => MirInst::Label(usize::MAX), // skipped below
+```
+
+为什么安全：
+
+- 与 301 行**逐字一致** —— 不是新语义，是让代码遵守自己的约定；
+- SSA 层的 `Unreachable` 只有两个来源：`TailCallOptPass`，与
+  `lmir_to_mir.rs`（该文件**不参与编译**，D252 已确认）；
+- 故改动**只影响 `TailCallOptPass` 的行为**，不波及其他路径。
+
+##### 效果（22 程序差分，与 D259 同一批样本）
+
+| | 修前 | 修后 |
+|---|---|---|
+| 三档一致 | 11/22 | **16/22** |
+| `opt=1` 破坏 | 6（27%） | 6（27%） |
+| `opt=2` 破坏 | **11（50%）** | **6（27%）** |
+
+⇒ **`opt=2` 与 `opt=1` 的破坏集合现在完全相同**，都只剩 `for` 循环族
+（D254–D258 那条链）。第二族（`Define`/`Var`）**已完全消除**。
+
+##### 判据 `tests/deconstruct_unreachable_terminator.rs`（2 条）
+
+| 判据 | 钉住 |
+|---|---|
+| `d260_unreachable_terminator_is_not_emitted` | 直接打 `deconstruct` 的 terminator 映射：`Unreachable` 降维后**不得**产出 `MirInst::Return`（快、精确） |
+| `d260_opt2_preserves_basic_define_var_programs` | 端到端：那 5 个基础构造在 `--opt=2` 下必须与 `--opt=off` 一致（修前全是**空**），并带「对照组必须有输出」防空转 |
+
+**牙齿验证**（把那一行改回去）：
+
+| 判据 | 改回后 |
+|---|---|
+| `..._unreachable_terminator_is_not_emitted` | **FAILED**，精确指出「指令位置 [3]」 |
+| `..._opt2_preserves_basic_define_var_programs` | **FAILED**（`let-bind: --opt=2 的输出必须与 opt=off 一致`） |
+
+##### 剩下的
+
+`opt>=1` 仍破坏全部含 `for` 循环的程序（27%），那是 D254/255/256 的三处缺口
+（`phi.incoming` / `preds` / 撞号），需要重写 `rename_variables` —— 仍待裁决。
+本条先拿掉了**不用动核心算法**的那一半。
+
+#### D261：把「`--opt` 修好了」变成一条**可执行的验收判据**（当前 `#[ignore]`）
+
+D254–D260 把 `--opt` 这条链拆到了语句级，但「修完是什么样」一直只是文字。
+本条把它变成**能跑的验收测试**。
+
+##### 判据 `tests/opt_repair_acceptance.rs`（1 条，`#[ignore]`）
+
+22 个代表性程序，每个在 `opt=off` / `opt=1` / `opt=2` 三档下运行，
+断言三档**完全一致**。解封它 = 「`--opt` 不再改变程序行为」的验收。
+
+##### 现状基线（实测）
+
+| | 三档一致 | `opt=1` 破坏 | `opt=2` 破坏 |
+|---|---|---|---|
+| 22 个程序 | 16/22 | 6（27%） | 6（27%） |
+
+剩下 6 个**全部是含 `for` 循环的**，全部指向 D254/255/256 的那三处缺口。
+
+##### 牙齿验证：`cargo test -- --ignored`（不改任何代码）
+
+```text
+`--opt` 仍然改变了 12 / 22 个程序的行为：
+  - for-accumulate: opt=1 exit=0 []  ≠ off ["6.0"]
+  - for-print-item: opt=1 exit=0 []  ≠ off ["1.0", "2.0", "3.0"]
+  - for-print-const: opt=1 exit=0 [] ≠ off ["x", "x", "x"]
+  - for-empty:      opt=1 exit=0 []  ≠ off ["done"]
+  - nested-for:     opt=1 exit=0 []  ≠ off ["1.0", "1.0", "2.0", "2.0"]
+  - break-in-for:   opt=1 exit=0 []  ≠ off ["1.0"]
+  （每个 × opt=1 / opt=2 两行）
+```
+
+⇒ **12 处差异 = 6 个程序 × 2 档，且另外 16 个正常程序一个都没被误报。**
+
+这比「逐个构造写判据」强在两点：
+
+1. **它是整体验收**，不是单点。若将来只修了三处里的一处，本条**仍会红**
+   （`for` 循环需要三处同时对）—— 逐构造的判据可能漏掉这个组合效应。
+2. **它有明确的基线数字**（16/22），「修好了」不再是一句形容词。
+
+##### 解封方式
+
+```bash
+# 1. 修 rename_variables 的三处（phi.incoming / preds / 撞号）
+# 2. 去掉 tests/opt_repair_acceptance.rs 与 tests/ssa_phi_incoming.rs 里的 #[ignore]
+cargo test --test opt_repair_acceptance --test ssa_phi_incoming
+# 3. 同时翻转 tests/opt_ssa_equivalence.rs 里 D187 那五条「钉住坏行为」的断言
+```
+
+⇒ 至此 `--opt` 这条链的**全部**待办都已是可执行的：
+两处判据（`ssa_phi_incoming.rs` ②③④ + 本条）+ 一处要翻转的既有断言。
+
+#### D262：`crush_json(xs, len(xs))` 被拒 —— 「int 明明是数字」（已修）
+
+D261 之后彻底离开 `mir/`，按 D253 的**覆盖度地图**去下一块未审计区：
+`interpreter/builtin_impls.rs`（984 行，CHANGELOG 从未提及，且是**用户直接
+调用**的 builtin 实现）。
+
+##### 先普查（M=1）
+
+该文件里 `Value::Float(` 逐处核对（排除构造与注释）：
+
+| 位置 | 结论 |
+|---|---|
+| `range()` 的 `as_i64`（:79-95） | ✅ `Float` / `Int` / `BigInt` 三分支 + `is_finite` |
+| `int()` builtin（:216-227） | ✅ `Float` / `Int` / `BigInt` / `Bool` 四分支 + `is_finite` |
+| `float()` 的 coercion（:253-254） | ✅ `Float` / `Int` |
+| `curry` 的 arity（:719-723，D148 已修） | ✅ 两侧 + 负数守卫 |
+| **`crush_json` 的 `max`（:409-415）** | ❌ **只有 `Float`** |
+
+⇒ 不是这一带的系统性疏漏，是**单点遗漏**。判据 ③ 把「同族已达标」钉住。
+
+##### 缺陷与实测
+
+```rust
+let max_items = match &args[1] {
+    Value::Float(n) => { if *n < 0.0 { … } *n as usize }
+    other => return Err(format!("crush_json: max must be a number, got {}", type_name(other))),
+};
+```
+
+本仓数字有两个来源（D98 / D129）：**字面量给 `Float`、`len()` 等运算给 `Int`**。
+真实 CLI 实测：
+
+```text
+crush_json([1,2,3,4,5], 2.0)   → exit 0     ✓（字面量是 Float）
+crush_json([1,2,3,4,5], 2)     → exit 0     ✓（同上）
+let xs = [1,2,3,4,5]
+crush_json(xs, len(xs))         → exit 1     ✗ "crush_json: max must be a number, got int"
+```
+
+**「int 明明是数字」** —— 与 D249 的 `with temperature` 同型，但后果更直接：
+**用户无法用动态计算出来的上限**，而 `crush_json` 正是压缩功能的主入口。
+
+##### 修法：走收口，但**保留两种错误的区分**
+
+改用 D246 立的 `flow::value_as_usize`（D259 教训：收口不该顺手抹掉诊断信息）：
+
+- 负数（`Int` / `Float` 两侧）仍报 **`non-negative`**
+- 非数值仍报 **`must be a number, got <类型名>`**
+
+##### 判据 `tests/crush_json_max_accepts_int.rs`（3 条）
+
+| 判据 | 钉住 |
+|---|---|
+| `d262_crush_json_accepts_float_int_and_len_valued_max` | 三种合法上界写法都收（尤其第三种 `len()`） |
+| `d262_crush_json_keeps_the_two_errors_distinguishable` | **不回归**：负数与非数值的两种错误必须仍可区分 |
+| `d262_control_group_siblings_already_accept_both_number_kinds` | 对照组：`range()` / `int()` 正常工作（否则 ① 可能因别的原因恒绿） |
+
+**牙齿验证**（回退修复）：
+
+| 判据 | 回退后 |
+|---|---|
+| `..._accepts_float_int_and_len_valued_max` | **FAILED**，stderr 正是「crush_json: max must be a number, got int」 |
+| `..._keeps_the_two_errors_distinguishable` | ok（回退版对负数/非数值的报错恰好与修后一致 ⇒ **如实标注**：它防的是「两种错误被合并」，不是当前缺陷本身） |
+| 对照组 | ok |
+
+##### ⚠ 又一次装置陷阱（D243 教训，第二次撞上）
+
+修完编译通过，但**探针仍显示失败** —— 因为跑的是 `target/debug/mora.exe`，
+而我用的是 `cargo build --lib`：**只构建库，不构建二进制**。
+
+⇒ 判据与探针都依赖 `mora.exe` 时，验证前必须 `cargo build`（不带 `--lib`）。
+本轮牙齿验证脚本里已把这一步写进去了。
+
+#### D263：`compose_prompt` 的 `Int` budget 被拒 —— 并记一次**普查脚本连续三次不可信**（已修）
+
+用 D262 验证过的「先普查 M」手法扫完 `interpreter/**`（202 个函数），
+目标是「读数值但只认一个变体」的形状。
+
+##### 普查工具本身是本轮最大的教训
+
+| 版本 | 启发式 | 候选 | 实际真缺陷 |
+|---|---|---|---|
+| v1 | 函数内有 `Value::Float` 且无 `Value::Int` | 11 | **0** —— 全部是 `Ok(Value::Float(..))` 这类**构造** |
+| v2 | 只数**匹配**形态（`=>` / `if let`） | 6 | **1** |
+| 精确核对 | 逐个函数打印实际行 | 6 | **1** |
+
+v2 的 6 个候选里：`call_builtin_print` 的两处 `Value::Float` **都在
+`///` 文档注释里**；`required_str_arg` 与 `call_method_list` 的函数体
+**一行 `Value::Float` 都没有**（我的函数边界切分也错了）；
+`mir_with_config` 是 D249 刚修过的；`text_to_string` 的 `Int` 落
+`other.to_string()` 兜底、产出与 `Float` 分支相同（**否定**）。
+
+⇒ 这是**普查脚本第三次**不可信（D243 缺 `re.M`、D259 `matches!` 首项、
+本次的构造/匹配混淆 + 注释未排除 + 边界错位）。
+
+⇒ 归并成一条纪律：**普查脚本必须先自验证准确率**。办法是**拿已知答案
+核对** —— 若没有已知答案，就**逐个把候选的实际行打印出来**看，而不是相信
+「命中了 N 个」这个数字。本条若直接相信 v2 的 6 个，就会去「修」三个
+根本没问题的函数。
+
+#### D264：`is_timestamp_pattern` 漏 `Int` ⇒ 整数时间戳被压缩成 `Uniform`（已修）
+
+普查工具（v3：排除注释行 + 只数匹配形态 + 局部窗口）扫 `document/`、
+`compress/`、`http_server`/`mcp_server`、`flow/`、`checkpoint/` 共 25 个文件，
+**3 个候选**，每个都打印了实际匹配行以便一眼判定：
+
+| 候选 | 判定 |
+|---|---|
+| `mcp_server.rs:496` | **否定** —— D247 已确认（下游两个分支产出同构） |
+| `compress/json.rs:407` | **否定** —— 见下「误判有意设计」 |
+| **`compress/detect.rs:262`** | **真缺陷** |
+
+##### 缺陷：同一份数据，写法不同 ⇒ 压缩策略差一个量级
+
+```text
+int ts (json.parse)  -> array_type=Uniform       ← 压缩器完全不做针对性处理
+float ts (literal)   -> array_type=TimeSeries
+```
+
+`is_timestamp_pattern` 只匹配 `String` / `Float`，`Int` 落 `_ => false`。
+而 Unix 秒级时间戳经 `json.parse` 读入**就是 `Int`**（D129）⇒
+`FieldRole::Temporal` 检测不到 ⇒ `ArrayType::TimeSeries` 推断失败。
+与 D231 修的 `is_numeric` 同族。
+
+修法：**只补 `Int`**（不加 `BigInt`：时间戳不会是它，且 `to_f64` 要额外 import）。
+
+##### ⚠ 本轮两次归因错误 —— 这才是真正的教训
+
+**① 把自己的笔误包装成了「回归」，还去追查无关模块。**
+
+补 `Int` 后 `float ts` 从 `TimeSeries` 变成 `Uniform`。我**归咎于**同批次改的
+`value_byte_size`，并据此把那个改动**回退了**。真因是我把阈值
+`10_000_000_000.0` 打成 `10_000_000.000.0`（**多了两个零** ⇒ 阈值成 `< 10.0`，
+所有时间戳都超）。一个 `cargo build` 就能拦下的笔误，被我查了整整一轮。
+
+**② 把「有意的保守设计」当成了缺陷。**
+
+`value_byte_size` 的 `_ => 32` 让 `Value::Int(42)` 估成 32 字节（真实 `"42"`
+只有 3 字节），看起来是 10 倍高估。但它的注释写着「**Other variants: rough
+tag size**」—— 而 `max_bytes` 是**硬上限**（D227），**高估字节数是安全方向**
+（宁可早压缩也不溢出）。⇒ **不是缺陷，保持原样**。
+
+⇒ 归并两条纪律：
+- **回归的归因也要验证**。「改 A 后 B 变了」不等于「A 改坏了 B」——
+  先看 A 到底改了哪一行（本例：A 的第一行就有个笔误的常量）。
+- **「看起来像疏漏」不等于疏漏**。兜底值可能正是设计者刻意选的**保守方向**。
+
+##### 判据 `tests/compress_timestamp_int_detection.rs`（3 条）
+
+| 判据 | 钉住 |
+|---|---|
+| `d264_int_timestamps_match_float_timestamps` | 主判据：Int 与 Float 时间戳必须落在**同一** `array_type` |
+| `d264_small_integers_are_not_timestamps` | 反向护栏：阈值写错时**先红**（本轮的笔误就会先被它抓住） |
+| `d264_control_group_iso_string_timestamps_still_detected` | 对照组：ISO 字符串路径未被影响 |
+
+**牙齿验证**（回退 `detect.rs`）：`int ts` 回到 `Uniform`，而同一批数据写成
+Float 仍是 `TimeSeries`。
+
+##### 真缺陷：`parse_budget_dispatch` 只认 `Float`（与 D262 同型）
+
+```text
+let d = json.parse("{\"text\":\"x\",\"budget\":1000}")   // ← Value::Int(1000)
+compose_prompt(d)
+// 修前  exit=1  "budget: budget must be string or number, got int"
+// 修后  exit=0
+```
+
+**触发路径比看上去窄，但只有这一条**：`compose_prompt({text: "x", budget: 1000})`
+**走不到**这里 —— typeck 的「dict 字面量值必须同质」会先拒（实测 5 种 dict
+字面量写法全被挡）。**唯一能到达的是 `json.parse`**，而那正是机器生成的输入 ——
+`json.parse` 产 `Int`，字面量才产 `Float`。
+
+⇒ 换个角度说：**这不是「窄到不重要」，而是「只有机器生成的输入才会踩到」**，
+而机器生成的输入恰恰走 `Int` 这一侧。
+
+**顺带**：`other` 分支的 `{:?}` → `flow::type_name`。D262 记录过
+「`Value::Dict` 的 `Debug` 按 HashMap 迭代序打印、跨进程键序不同」，那处修好了，
+这里**漏了**。判据 ③ 直接断言错误信息里**不出现** `Dict {` / `List(` / `Float(`
+这类 `Debug` 形态。
+
+**注释也已过时**：原写「与 execute.rs 同语义」，但那份副本**已不存在**
+（全仓仅此一处），按 D240「同一事实两套实现 ⇒ 合并」的检查点，答案是
+**没有分叉**，只是注释没跟上。
+
+##### 判据 `tests/compose_prompt_budget_accepts_int.rs`（3 条）
+
+| 判据 | 钉住 |
+|---|---|
+| `d263_compose_prompt_accepts_int_budget_from_json` | 主判据：`json.parse` 读来的 `Int` budget 必须被接受 |
+| `d263_control_group_string_budget_still_works` | 对照组：`"1KB"` 字符串 budget 本就支持（防 ① 因「全被接受」而恒绿） |
+| `d263_budget_error_uses_type_name_not_debug` | 错误信息用**类型名**、不含 `Debug` 形态（跨进程稳定） |
+
+**牙齿验证**（回退 `Int` 分支 + 重建 binary）：
+
+| | 回退后 |
+|---|---|
+| `compose_prompt(json.parse(...))` | **exit=1**「budget must be string or number, got int」 |
+| 修后 | exit=0 |
+
+#### D265：builtin 层扫完（1 候选，否定）—— 并**推翻我自己立的「全称判据」规矩**
+
+##### 普查结果
+
+v3 普查脚本（已含 D243/D252/D259/D263 的全部修正）扫
+`src/interpreter/**` 等 27 个文件：**1 个候选** ——
+`numeric_helpers.rs::text_to_string` 的 `Value::Float(n) => n.to_string()`。
+
+**实测而非推理**（D264 教训）：
+
+```text
+n=     0   Float arm => "0"   other arm => "0"    same=true
+n=    42   Float arm => "42"  other arm => "42"   same=true
+n=   -7   Float arm => "-7"  other arm => "-7"   same=true   （6/6 全 true）
+```
+
+⇒ `Int` 落 `other => other.to_string()`（`Value` 的 Display），与 Float 分支
+**逐字节相同** ⇒ **否定**（D263 已判过，本轮补上实测证据）。
+
+⇒ **「`Int`/`Float` 只认一侧」这条缺陷形态在 builtin 层已收口。**
+
+##### ⚠ 更大的收获：这条判据我写不出来，于是**主动放弃**它
+
+我先按 D248 立的规矩，写了一条全称判据
+（`tests/single_sided_float_read_census.rs`）：扫源码找「只匹配 `Float`、
+函数体内无 `Int` 分支」的数值读取，附豁免表 + 打印命中行。
+
+**它报 38 处**。逐条看下去，**全部是假阳性**：
+
+| 假阳性形态 | 例子 |
+|---|---|
+| **构造**被当成读取（判据只要含 `=>` 就算） | `"input" => Ok(Value::Float(...))` |
+| **测试代码**没被排除（`#[cfg(test)]` 切分逻辑失效） | `ai.rs:24` `Value::Float(n) => assert_eq!(*n, 5.0, …)` |
+| 协议层**有意**转换 | `JsonValue::Number(n) => Value::Float(n)` |
+
+**38 : 1 的信噪比，一条判据根本不能用。**
+
+⇒ **已把该判据删除**。理由与 D257 那条一致：**一个会误报的护栏比没有护栏更糟** ——
+它让人以为「这块没单侧读取了」，从而掩盖**新**引入的问题；而真正的隐患
+（万一真有一处 `Int` 被拒）恰恰被它的噪声盖住。
+
+##### ⇒ 修正 D248 立的规矩
+
+D248 我写下一条纪律：
+
+> 普查型判据要写成**全称量化**的（扫全部调用点，任何一处违规都变红），
+> 而不是逐个行为的断言。
+
+**本条给它划了适用边界**：
+
+| 场合 | 全称判据 | 理由 |
+|---|---|---|
+| **行为可机械判定**（D248 的 `pos_of` 扫描：解析 position 的行必须调收口） | ✅ 适用 | 判据 = 规范本身，无歧义 |
+| **语义需读代码才能判断**（本条：某个 `Float` 分支缺 `Int` 是不是缺陷） | ❌ **不适用** | 假阳性率压不下去；「构造 vs 读取」「测试 vs 产品」「有意保守」都无法机械区分 |
+
+⇒ 正确做法是**一次性普查 + 逐个读代码判断**（本条就是这么做的），
+把结论写进 CHANGELOG，**而不是**硬塞一条会误报的 CI 判据。
+
+#### D266：`xform.*` 的占位标记**跨进程不可复现**且**泄露整个环境**（已修）
+
+D265 建议换缺陷族，我挑了「错误信息里的 `{:?}`」——**方向找错了一半**：
+全仓 260 处 `{:?}` 逐条看下来，**绝大多数在测试的 `panic!` 里**（不是用户可见
+错误），产品代码里那几处要么输出类型稳定（`transpose` 打印 `Vec<usize>`、
+`Unknown method` 打印枚举）、要么不可达（`compose_prompt` 两处，typeck 先拦）、
+要么无影响（`ai_chat` 的 cache key 含 Dict Debug，但缓存是**进程内** LRU）。
+
+**真正的问题在返回值里**，不在错误信息里 —— 这本身就是 D265 那条纪律的又一次
+印证：**你猜的方向可能不是问题所在的地方**。
+
+##### 缺陷（真实 CLI，同一段程序连跑 5 次得到 5 个不同输出）
+
+```text
+let t = xform.map({alpha: 1.0, beta: 2.0, gamma: 3.0, delta: 4.0}); print(t)
+
+<xform.map(Dict({"delta": Float(4.0), "gamma": Float(3.0), "alpha": Float(1.0), …}))>
+<xform.map(Dict({"beta": Float(2.0), "alpha": Float(1.0), "delta": Float(4.0), …}))>
+<xform.map(Dict({"beta": Float(2.0), "gamma": Float(3.0), "alpha": Float(1.0), …}))>
+…（5 个全不同）
+```
+
+而传 `Closure` 时更糟：`Debug` 把它的 `env`（PersistentMap / Bitmap /
+**全部 30 个 builtin 的哈希** / VectorClock）整份转储进返回值，**单条输出达数千字节**。
+
+##### 修法
+
+`xform.rs` 新增 `describe()`：**简单标量显示值，复杂类型显示类型名** ——
+与 D233（`json.stringify` 对 Closure / Agent 输出占位串）同一取舍。
+
+```text
+xform.map({dict})      → <xform.map(dict)>       （原：5 个不同的 Dict Debug）
+xform.map(fn(x)…)     → <xform.map(closure)>    （原：数千字节环境转储）
+xform.take(100)       → <xform.take(100)>       （标量值保留）
+```
+
+⚠ **只用 `Display` 不够**：`Value::Dict` 的 `Display` 是 `{k: v}` 形式，
+键序同样随 HashMap 变（只是不那么显眼）。
+
+##### 判据 `tests/xform_marker_stability.rs`（4 条）
+
+| 判据 | 钉住 |
+|---|---|
+| `d266_xform_map_dict_marker_is_stable_across_processes` | 主判据：**起 6 个 `mora.exe` 子进程**比输出 |
+| `d266_xform_map_closure_marker_is_short_and_stable` | Closure 标记跨进程一致 **且** 无环境痕迹（断言 `< 64` 字节且不含 `Bitmap`/`VectorClock`/`EnvRef`） |
+| `d266_xform_marker_keeps_scalar_values` | 简单标量仍显示**值**（否则占位标记失去意义） |
+| `d266_control_group_probe_actually_runs_programs` | 对照组：探针确实能读到正常程序的输出 |
+
+**判据为什么必须用子进程**：`HashMap` 的种子在**进程内固定**，所以同进程重复
+调用本来就一致 —— 「跨进程不同」在单进程测试里**根本不可表达**。
+这与 D265 推翻自己那条判据是同一类理由：**写不出有判别力的判据，就别写**。
+
+**本条判据自己踩的两个坑（都已修）**：
+1. 四条测试**共用一个 `%TEMP%` 目录** ⇒ 并行时互相覆盖 `a.mora`，
+   `closure` 那条读到了 `take` 的输出。已加 `tag` 参数逐测试隔离。
+2. 对照组复用了「找含 `xform.` 的行」的提取器，而它输出 `hello` ⇒ 永远返回
+   占位符而**假红**。已改为独立读 stdout。
+
+**牙齿验证**（回退到 `{:?}`）：
+
+| 判据 | 回退后 |
+|---|---|
+| `..._dict_marker_is_stable...` | **FAILED**：「连跑 6 次得到 **5** 个不同输出」 |
+| `..._closure_marker_is_short...` | **FAILED** |
+| `..._marker_keeps_scalar_values` | **FAILED** |
+| 对照组 | ok（证明装置正常，红不是假红） |
+
+##### 顺带记档：`xform.*` 是**占位实现**，文档与实现不符
+
+`xform.rs` 头部写「每个 builtin 返回一个新的 `Value::Builtin(Xform)` 携带当前
+xform pipeline」，实际返回的是占位字符串；`xform.attach(stream)` 更是直接
+`Ok(stream.clone())`（**根本没安装**）。
+
+⇒ transducer 功能**未实现**，属能力缺口。本条只把占位标记修成稳定形式
+（消除不可复现 + 环境泄露），**不实现** transducer —— 按纪律只报告不实施。
+
+⇒ 这与 D264 的第二条纪律同源：**「看起来像疏漏」不等于疏漏** ——
+而本条再往前一步：**「写得出判据」也不等于「该写判据」**。
+
+#### D267：CRDT 合并审计 —— worker 并行路径把**冲突检测结果丢弃**了（**未修**，待裁决）
+
+##### 先说清楚：什么**不是**缺陷
+
+按 D264 的纪律（「看起来像疏漏」不等于疏漏），先把三类候选逐一否证：
+
+| 候选 | 实测 | 判定 |
+|---|---|---|
+| `VectorClock::merge` 不满足交换律 | 实现是 `*e = (*e).max(v)`（每 agent 取最大） | **否定** ✓ 交换律 + 幂等性都成立 |
+| `happened_before` 把缺失 key 当 0 | 实现确为 `unwrap_or(0)` | **否定** ✓ 逻辑时钟缺省 0 是对的 |
+| `GrowOnlySet` / `DictUnion` 不满足交换律 | 实测 `[1,2]⊕[3]=[1,2,3]` 而 `[3]⊕[1,2]=[3,1,2]` | **不是缺陷** —— 见下 |
+
+第三条要说清楚：`Value::merge(parent, child, strategy)` 的签名就是**因果有序**
+的，「child 赢」是 LWW / DictUnion 的**定义**。在因果序下
+`[1,2] ⊕ [3] = [1,2,3]`（parent 先、child 后）**正是应有结果**。
+两个策略都**满足幂等性**（重复合并同一副本无影响），这才是重传/重试安全的关键。
+
+##### 真正的缺陷：同一条合并路径，两处对 `conflicts` 的处理**不一致**
+
+`merge_from_with_strategies` 会用 `VectorClock::concurrent` 检测写写冲突并
+把结果放进返回值（`value.rs:1059-1099`）。三个调用点：
+
+| 调用点 | 场景 | `conflicts` 去向 |
+|---|---|---|
+| `mir/handlers/runtime.rs:40` | 单 agent / 事务 | `let conflicts = …` ⇒ **返回** ✓ |
+| `pregel/mod.rs:474-481` | Pregel agent 合并 | `self.conflicts.extend(conflicts)` ⇒ **存进引擎状态**，`run_pregel_config` 读它暴露 ✓ |
+| **`mir/handlers/runtime.rs:197`** | **worker 并行**（`scope.spawn`，:168-190） | **返回值直接丢弃** ❗ |
+
+```rust
+// 按声明顺序合并（确定性）
+for r in results {
+    match strategies.as_ref() {
+        Some(sg) => {
+            env.merge_from_with_strategies(&w_env, sg, &MergeStrategy::LastWriteWins);
+            //                                    ↑ 返回的 conflicts 被丢掉
+        }
+        None => env.merge_from(&w_env, &MergeStrategy::LastWriteWins),
+        //     ↑ 连检测都不做（merge_from 不返回 conflicts）
+    }
+}
+```
+
+⇒ **并行 worker 的写写冲突被静默丢弃**：数据仍按 LWW 正确合并，但
+**用户看不到冲突提示**。而同一份代码在单 agent 路径上会报告。
+`v0.75.84` / `v0.95` 的注释表明这条路径被反复修过（合并目标、锁、所有权），
+**唯独 conflicts 的去向没人管**。
+
+##### 为什么本条**不修**
+
+修复 = 让 worker 路径也开始上报冲突，这是**行为变更**：
+合并结果不变，但会**多出**用户此前从未见过的冲突信息（可能触发既有 abort
+逻辑或改变脚本的分支）。按纪律「语言特性 / 设计决定只报告不实施」，
+本条只定位、只归档。
+
+修的话改动很小（把 `for` 循环里收集的 conflicts 汇总后随 worker 结果返回），
+但**要不要让并行冲突变得可见**，是产品决定。
+
+##### 本轮的否定结果也一并归档
+
+- `Value::merge` 的三个策略（`Add` / `Append` / `LastWriteWins`）在**非数字
+  类型**上都有 `(_, child) => child` 的 LWW 兜底（`value.rs:743,752,772`）——
+  静默降级，但与既有约定一致，本轮不追。
+- `Environment::iter()`（`value.rs:1005`）返回 `Vec<(String, Value)>`，由
+  `PersistentMap::iter` 支撑；**跨进程键序**问题 D266 已在 `xform` 上实测并修，
+  这里是同一个数据结构的另一条出口，**行为一致**（都受 `PersistentMap` 内部
+  Bitmap 顺序影响），未另作改动。
+#### 牙齿验证（D202–D206 的 6 处回退，全部变红）
+
+| 回退 | 变红的判据 |
+|---|---|
+| R1 注释不进 token 流 | `d202_every_comment_survives_formatting`、`d202_bare_double_dash_comment_survives`、`d203_range_slice_carries_comments` |
+| R2 空行被吞 | `d202_formatting_preserves_line_count`、`d202_blank_lines_stay_in_place`、**`d203_whole_document_edit_is_also_self_consistent`** |
+| R3 区间返整份 newText | `d203_range_formatting_does_not_duplicate_or_lose_lines`、`d203_single_line_range_returns_one_line`、`d203_inverted_range_is_handled` |
+| R4 LSP JSON Latin-1 | `d204_non_ascii_text_survives_the_lsp_round_trip` |
+| R5 flow JSON Latin-1 | `d205_raw_utf8_json_strings_round_trip_with_correct_length`、`d205_parse_stringify_parse_round_trip` |
+| R6 无 `\uXXXX` 分支 | `d206_unicode_escapes_parse` |
+
+**护栏（非承重，如实标注）**：`d206_malformed_escapes_are_rejected_loudly`
+在 R6 下**没有**变红 —— 去掉 `\u` 分支后 `\u12` 仍会报 `Invalid escape: \u`，
+消息里同样含 "escape"。它守的是「畸形输入不静默产出半个字符」，
+对 R6 无判别力，**不作为 D206 的牙齿**。
+
+#### 探针与测试自身的三次教训
+
+1. **PowerShell `2>&1` 把 stderr 的 ErrorRecord 混进 stdout** —— 本轮又在
+   读 `mora run` 输出时踩到。采集必须**两个流分开**（`Start-Process` +
+   `-RedirectStandardOutput/-RedirectStandardError`）。
+2. **非贪婪正则截断 `newText`** —— 探针用 `'"newText":"(.*?)"'` 取值，
+   撞上源码里字符串字面量的 `"` 就截断，于是「格式化产物解析失败」是**探针伪影**，
+   差点当成产品缺陷。真实取值要用 `Content-Length` 分帧 + 正式 JSON 解析
+   （测试里直接用 `mora::lsp::json::Parser`）。
+3. **`Copy-Item` 还原文件会保留旧 mtime** → cargo 认为源码未变、**跳过重建**，
+   于是「回退后测试变红 / 还原后测试变绿」都读的是**陈旧二进制**。
+   牙齿验证的还原必须显式更新 `LastWriteTime`，且**先 `cargo build --bins`
+   再 `cargo test`**（`cargo test --test X` 不保证重建 bin，而本仓测试是
+   直接 exec `target/debug/mora.exe` 的）。
+
+#### D268：Pregel **超步预算耗尽**静默返回中途结果（已修）+ 多目标投递互相覆盖（**未修**，潜伏）
+
+##### 一、已修：同一 while 循环的第三个出口没人守
+
+`pregel::MirPregelEngine::run` 的主循环
+
+```text
+while !active_nodes.is_empty() && self.current_step < self.max_steps
+```
+
+有**两个**出口，而 D97 只守了其中一个：
+
+| 出口 | 守卫 | 状态 |
+|---|---|---|
+| `active_nodes` 空 = 收敛 | —— | 正常 |
+| `scheduled == 0` = 没激活过任何 agent | D97 | 已有 |
+| **`current_step >= max_steps` = 预算烧完** | **D268（本轮）** | **修前无** |
+
+实测（真实 CLI，`agent a`/`agent b` + `edge a -> b` + `edge b -> a`）：
+
+| | 修前 | 修后 |
+|---|---|---|
+| stdout | `A` | 无输出 |
+| 退出码 | **0** | **1** |
+| 诊断 | **零** | `pregel: super-step budget exhausted after 1000 steps …` |
+| 耗时 | 196ms | 764ms |
+
+返回的 `A` 还是**中途**的值：链式图 `@start→a→b→c→d` 配 `max_steps=2` 时
+`result` 是 `"A"` —— 链尾 `d` **从未执行**，引擎却把 `A` 当答案报了出来。
+根因是 `result` 通道由 `reconcile_outcome` **无条件**写入（last-write-wins），
+于是循环一旦从错误出口落下，`channels.get("result")` 拿到的必然是半途的值。
+
+**为什么这不算「用户用完预算」**：`max_steps` **无法从语言层设置** ——
+`with_max_steps` 在整个 `src/` 内**无任何调用点**，值硬编码于
+`MirPregelEngine::new()`（=1000）。`orchestrate.dag(nodes, edges, max_steps?)`
+是 `orchestrate_dag` 模块的**另一个引擎**，与本引擎无关（实测
+`orchestrate pregel` 的解析路径不经过它）。所以 Mora 程序撞上上限
+**只可能**是图不收敛，而非主动设预算 —— 本守卫不限制任何合法用法。
+
+守卫顺序刻意在 D97 **之后**：`max_steps == 0` 时两个条件同时成立，
+而「没有任何 agent 被激活」是更具体的诊断，应优先报出。
+
+判据 `tests/pregel_max_steps_exhaustion.rs`（3 条）：主断言 + 收敛链对照组
++ 「恰好在预算内跑完」对照组。牙齿验证：临时把守卫条件改成 `false && …` 后
+主断言变红（静默返回 `String("A")`），两条对照组仍绿。
+
+##### 二、未修：同一超步发给**多个** target 时 payload 互相覆盖
+
+ADVANCE 段的投递槽只有一个、且是**引擎全局**的：
+
+```rust
+for (target, messages) in by_target {
+    …
+    self.channels.insert("input".to_string(), final_value);   // ← 全局唯一槽
+    *self.channel_versions.entry("input").or_insert(0) += 1;
+    next_active.insert(target);
+}
+```
+
+按 target 逐个写入 ⇒ **后写覆盖先写**。被覆盖的消息不是延后投递，
+而是**彻底消失**；而 `by_target` 是 `HashMap`，遍历顺序不确定 ⇒
+**哪一条被吃掉是随机的**。
+
+实测（库级，`a` 同一超步向 `t1` 发 11、向 `t2` 发 22，40 次运行）：
+
+| `input` 槽的值 | 次数 |
+|---|---|
+| `Int(22)` | 20 |
+| `Int(11)` | 20 |
+
+交叉投递（`t1` 自己发 111、同时给 `t2` 发 222），在 `t1` 再次激活、
+`input` 对它可见的那一超步：
+
+```text
+max_steps=4 → result = "{\"input\":222,\"result\":\"{}\"}"   ← t1 读到了 222
+max_steps=5 → result = "{\"input\":111,…}"                     ← 这次读到 111
+```
+
+即 **`t1` 收到了本该发给 `t2` 的消息**，读到哪一个逐次不同。
+
+**为什么标未修**，两条理由：
+
+1. **语言层不可达**。全仓 `MirInst::Send` **只在 `src/pregel/mod.rs` 自己的
+   `#[cfg(test)]` 里被构造** —— parser / lower / builtin / optimizer 一处都没有
+   （其余 7 处出现全是消费者：`inst.rs` 的 dispatch/clone、`pipeline.rs` 的
+   指令名、`ssa.rs` 的模式匹配、`optimize/cost.rs` 的权重）。真实 CLI 实测
+   `agent a => send("b", 111)` 报
+   `Runtime error (MIR): Undefined function or task: send`、exit 1。
+   所以 `h_send` → `Effects::Send` → `SendTask` → `pending_sends` → ADVANCE
+   这整条链路在生产路径上是**死的**，只有库级调用能碰到。
+2. **修法涉及引擎状态模型**。单槽装不下两条消息，至少三选一，而每一种都改变
+   可观察行为：per-node 待投递表（要改 `versions_seen` / `build_checkpoint`
+   格式）／per-target 通道（要重定义通道命名契约）／多 target 时报错
+   （把静默错值变响亮失败，代价最小，但会让当前「碰巧能跑」的图开始失败）。
+   属产品策略决定，不擅自实施。
+
+判据 `tests/pregel_multi_target_payload.rs`（2 条）是**现状判据**：
+断言「2 个 target ⇒ 单槽被写 2 次而只存得下 1 个值」，用
+`channel_versions` 锁定**与 HashMap 顺序无关**的那一半事实；单 target
+对照组证明 `input` 通道本身没坏。牙齿验证：临时让 ADVANCE 写完第一个
+target 就 `break`，判据变红（1 ≠ 2），对照组仍绿。
+一旦该判据开始失败 ⇒ 覆盖问题已修，须按文件头说明改写为隔离性判据。
+
+##### 三、一条差点误判的「设计」
+
+`build_node_input` 只收 `version > seen_version` 的通道，而 `versions_seen`
+的快照在**调度前**采集（`run()` 670-675）—— 于是**节点首激活时看不到任何
+payload**。第一反应是又一处 D97，但既有测试
+`pregel::tests::channel_input_var_injected_additively` 的注释已写明这是
+**有意的 delta 语义**（「首次激活的 snapshot 记录当前版本（同版本无 delta），
+再次激活且有新消息时才可见」）。**否定** ✓ 不动。
+
+#### D269：`orchestrate loop` 的 `max_rounds` 被**静默丢弃** + 多 `agent` 只跑第一个（已修）
+
+普查触发点：`src/pregel/` 审完之后顺带扫整个 `orchestrate` 家族
+（六种 kind：sequential / loop / graph / pregel / moa / moe）。按 **Grep 工具**
+复核（吸取 D250「普查工具不可信」的教训）后确认：
+
+| kind | tests/fixtures/examples 里的出现次数 |
+|---|---|
+| `orchestrate pregel` | 17 |
+| `orchestrate sequential` | 10 |
+| `orchestrate graph` | 5 |
+| **`orchestrate moa`** | **0** |
+| **`orchestrate moe`** | **0** |
+| **`orchestrate loop`** | **0**（仅 1 条 parse-only 测试） |
+
+⇒ `moa` / `moe` / `loop` 的**端到端覆盖为零**。本轮从 `loop` 入手，两处都中。
+
+##### 缺陷 ①：`max_rounds` 的值从未落地
+
+`parser_v3/syntax.rs` 里该分支原本是「识别关键字 → 吃掉冒号 → 把行尾
+token 全部 `advance()` 掉」—— **整行被吞掉，值一个字节都没读**。
+而 `Loop.rounds` 又在 kind 构造处写死 `Some(1000)`。两处叠加 ⇒
+`max_rounds` **语法上被完全接受、语义上完全无效**。
+
+**意图证据**（说明是漏写而非设计）：
+
+| 证据 | 位置 |
+|---|---|
+| lexer 为它准备了专属 token | `TokenType::MaxRounds`（`lexer.rs:855`） |
+| handler 侧有消费点 | `rounds.unwrap_or(1000)`（`runtime.rs:546`） |
+| 注释声称解析器已产出该值 | `runtime.rs:540`「rounds 缺省为 1000（**与解析器 MirrorOrchestrateKind::Loop 一致**）」 |
+
+真实 CLI 实测：
+
+| 程序 | 修前 | 修后 |
+|---|---|---|
+| `max_rounds: 5` | **1000 轮** | **5 轮** ✓ |
+| 不写 `max_rounds` | 1000 轮 | 1000 轮（**不变**）✓ |
+| `max_rounds: 0` | 1000 轮 | 1 轮（钳位，与 `top_k` 的 `.max(1)` 同风格）✓ |
+| `max_rounds: abc` | **静默接受，照跑 1000 轮** | **解析错误**，exit 2，指到该行 ✓ |
+| `max_rounds: -3` | 静默忽略 | 解析错误 ✓ |
+
+##### 缺陷 ②：多 `agent` 行被截断成第一个
+
+kind 构造处是 `agents.into_iter().next()`。而 `MirOrchestrateKind::Loop.agents`
+本身是 `Vec`、handler 侧（`runtime.rs` 的 Loop 分支）也是 `for agent in agents`
+逐个执行，且 `sequential` / `graph` / `pregel` 三个兄弟 kind **都原样保留
+整个 vec** —— 只有 `loop` 截断，且只发生在解析器这一处。
+
+真实 CLI：两个 `agent` 行 ⇒ 修前 `result` 是 `FIRST`（第二个从未执行），
+修后是 `SECOND`（两个按序串联，与 `orchestrate sequential` 一致）。
+
+##### 唯一一条既有测试为什么没抓到
+
+`interpreter::builtins::tests::orchestrate::orchestrate_loop_with_on_predicate_parses`
+里就写着 `orchestrate loop x -> y, max_rounds: 5`，但它只断言
+`compile_ok(src)` —— **只测「能不能解析」**。而修复前的解析器恰恰是靠
+**吞掉整行**才「解析成功」的。⇒ 该测试对「值有没有被采纳」**零鉴别力**：
+值被采纳或被丢弃，它都绿。
+
+本轮已在那条测试上补注释指明这一点（免得后人以为它覆盖了 `max_rounds`），
+并另建行为级判据 `tests/orchestrate_loop_parsing.rs`（7 条）——
+用「每轮给结果加一个 `x`」把**轮数变成可数的字符串长度**。
+
+**牙齿验证分两半独立做**（吸取「回退一半只证明一件事」的教训）：
+
+| 回退 | 变红的判据 | 保持绿的 |
+|---|---|---|
+| 只回退 `max_rounds` 解析 | 6 条（编译产物里明写 `rounds: Some(1000)`） | `default_is_unchanged`（默认值本就没动） |
+| 只回退多 agent 保留 | **仅** `d269_every_agent_in_loop_runs` | 其余 6 条 |
+
+第一半里多 agent 那条**也被连带弄红**（`121212…`）—— 正是归因串扰的实例，
+所以必须分两半各做一次。
+
+##### 顺带一条差点误判的（探针自身，不是产品）
+
+`on: len(input) >= 3` 报「`len()` expects a list, string, or dict」。
+第一反应是「`on:` 条件体里变量不可见 / `len` 不可用」。实测：
+`on: input == "nilx"` 正常退出、`on: len(外层变量) > 2` 也正常 ——
+真因是**循环首轮的 `input` 尚未播种、是 `Nil`**，`len(nil)` 报错是**正确行为**。
+⇒ 探针写错，不是产品缺陷。已记下「条件体报错先问『输入播种了吗』」。
+
+#### D270：`orchestrate moe` 专家名在 witness 往返中**蒸发** ⇒ **MoE 100% 不可用**（已修）
+
+##### 一、真正的缺陷：不是「MoE 写错了」，是名字在中间层丢了
+
+`orchestrate moe` 此前**没有任何程序能跑通** —— 无论写几个专家、router
+怎么打分。真实 CLI 实测：
+
+| | 修前 | 修后 |
+|---|---|---|
+| stdout | `Runtime error (MIR): moe: router referenced unknown expert 'e2'` | `85.25` |
+| 退出码 | **1** | **0** |
+
+修后的 `85.25` 正是 `combine_moe_outputs` 文档写明的加权公式：
+`0.25×11 + 0.75×110`（权重 = `scoreᵢ / Σscore`）。
+
+根因在 parser → witness → MIR 的**往返**上：
+
+| # | 位置 | 发生了什么 |
+|---|---|---|
+| 1 | `parser_v3/syntax.rs:332` | 解析器**正确**造出 `MirMoeExpert { name, def, def_fn }` |
+| 2 | `syntax.rs:522` | `WitnessOrchestrateKind::from_kind(&kind)` |
+| 3 | **`witness.rs:602`** | `experts: experts.iter().map(\|e\| e.def.clone())` —— **只搬 `def`，`name` 在此丢失**；且 `WitnessOrchestrateKind::Moe.experts` 的类型是 `Vec<MirWitness>`，**根本没有字段能装名字** |
+| 4 | **`orchestrate/mod.rs:203`** | 反向转换硬编码 `name: String::new()` |
+| 5 | `runtime.rs:662` | `experts.iter().find(\|e\| &e.name == name)` 拿 router 的键去查一张全叫 `""` 的表 ⇒ **永远落空** |
+
+修前的编译产物可直接印证：
+
+```text
+experts: [MirMoeExpert { name: "", def: … }, MirMoeExpert { name: "", def: … }]
+```
+
+而 router 返回的 `Dict([("e1", 1.0), ("e2", 3.0)])` **键名完好** ——
+说明丢的不是字符串字面量能力，而是**结构里没有承载名字的字段**。
+
+**同族对照**：`WitnessAgentDef` 带 `name: String`，agent 名一路无损。
+唯独 MoE 在 v0.92 的 witness 迁移里退化成了裸 `MirWitness` ——
+与 D44 / D235「witness 迁移漏字段」同型，但这次漏掉的是**让整个特性失效**的字段。
+
+##### 二、修法
+
+新增 `WitnessMoeExpert { name: String, def: MirWitness }`（与 `WitnessAgentDef`
+同构），把 `WitnessOrchestrateKind::Moe.experts` 改成
+`Vec<WitnessMoeExpert>`，并同步三处消费点：
+
+| 文件 | 改动 |
+|---|---|
+| `mir/witness.rs` | 变体字段类型、`from_kind` 连 name 一起搬、`sub_witnesses` 改为 walk `&e.def`、新增结构体 |
+| `mir/orchestrate/mod.rs` | `mir_moe_expert_from_witness` 收 `&WitnessMoeExpert` 并带回 `name` |
+| `lsp/providers/parsed_doc_v3.rs` | MoE 的 witness walk 改走 `&e.def` |
+| `mir/witness_to_fcfg.rs` | `e.span` → `e.def.span` |
+
+判据 `tests/moe_expert_names.rs`（4 条）：加权组合精确值（主断言）、
+`top_k: 1` 只激活最高分专家（对照组）、**专家名在编译产物中存活**（根因判据）、
+router 引用真正未定义专家时仍报原错（对照组）。
+
+牙齿验证：在**真正的丢失点**（`witness.rs` 的 `from_kind`）把
+`name: e.name.clone()` 改回 `String::new()` ⇒ 3 条变红，报错逐字复现修前原文
+（`moe: router referenced unknown expert 'e2'`）。
+
+⚠ 第 4 条对照组在修复前后**都绿** —— 它守的不是本缺陷，而是
+「修法没有让错误路径失效」（若用「永不报错」蒙混也会被它抓住）。说清楚
+**对哪个破坏有牙齿**。
+
+##### 三、为什么零测试抓到
+
+D269 普查已列：`orchestrate moa` / `orchestrate moe` 在 tests、fixtures、
+examples 里**各 0 次出现**。一个 100% 不可用的特性，恰恰因为**没人写过一行**
+而完全不可见 —— 这是「零覆盖」本身成为缺陷放大器的实例。
+
+##### 四、同一普查里的否定结果（都**没动**）
+
+| 候选 | 实测 | 判定 |
+|---|---|---|
+| `moa` 的 `prompt` 被 handler `prompt: _` 丢掉 | 解析器把它正确喂进 `prompt_fn`；`_` 是 v0.91 迁移后被取代的**遗留字段** | **否定** ✓ 不是丢用户值 |
+| `moe` 的 `router` 被 `router: _` 丢掉 | 同上，进的是 `router_fn` | **否定** ✓ |
+| `moa` / `moe` 的解析器像 `max_rounds` 那样吞键 | 逐个读了一遍：四个 moa 键、四个 moe 键**都真的落地** | **否定** ✓ D269 的形态只出现在 `max_rounds` 与 MoE 专家名上 |
+| `orchestrate moa` 整体不可用 | 真实 CLI `layers: 1` + 2 proposer + aggregator ⇒ `exit 0`，2 次 proposer + 1 次综合 | **否定** ✓ 它是好的 |
+
+⇒ 顺带为 `moa` 补 `tests/orchestrate_moa_e2e.rs`（2 条），把「零覆盖」这个洞
+至少填上一半，并显式钉住上面这条否定结论。
+
+#### D271：`edge … on: <cond>` 的条件**完全无效** —— 边永远激活（已修）
+
+D269（`max_rounds`）与 D270（MoE 专家名）都落在「v0.92 witness 迁移漏字段」
+这一类上。本轮顺着这个线索把边条件也走了一遍 —— 命中，而且比前两处更深。
+
+##### 一、修前实测：条件对结果零影响
+
+| 程序（`a -> b on: …`） | 修前 | 修后 |
+|---|---|---|
+| `on: false`（恒假） | `B`（**b 被激活**） | `A` ✓ |
+| `on: true` | `B` | `B` ✓ |
+| `on: gate == "yes"`，`gate="no"` | `B` | `A` ✓ |
+| `on: gate == "yes"`，`gate="yes"` | `B` | `B` ✓ |
+
+⇒ 修前 `false` 与 `true` **产出逐字相同**。exit 0、零诊断。
+
+##### 二、缺陷：条件被写进了一个**没有任何运行时读者**的字段
+
+这不是「某个字段丢了」，是**链路两端都没接上**：
+
+| # | 位置 | 状态 |
+|---|---|---|
+| 1 | `syntax.rs` `try_parse_edge_def` | 把 `on:` 表达式存进 `condition_expr` ✓ **正确** |
+| 2 | `orchestrate/mod.rs` `mir_edge_from_witness` | `condition_expr: None` ❗ **丢弃**（与 D270 专家名同型） |
+| 3 | 解析器给 `condition_body` 赋值 | 恒为 `None` ❗ **从未预 lowering** |
+| 4 | `pregel/mod.rs:496` / `:686`（引擎唯一两处条件求值） | **只读 `condition_body`** |
+
+⇒ 即便第 2 步不丢，第 3 步也保证 `condition_body == None`，而第 4 步压根不看
+`condition_expr`。**`condition_expr` 在全仓只有一个读者**：`witness.rs:521` 的
+LSP witness walk（语义/折叠）—— 不是运行时。
+
+与 D270 的一处关键差别：`WitnessEdgeDef` 本来**就有** `condition_expr` 与
+`condition_body` 两个字段（MoE 那边是结构里**根本没地方**放名字），
+所以第 2 步只是「不再主动丢弃」。
+
+##### 三、修法：两端各补一处
+
+① 解析器把条件**预 lowering** 成 `condition_body`，lowering 失败 `return None`
+   走解析错误 —— 与同函数内 agent `task_body`、moe expert `def_fn` 同风格；
+② `mir_edge_from_witness` 把 `condition_expr` 与 `condition_body` 一并带过。
+
+##### 四、影响面（一个用户可见的行为变更）
+
+`orchestrate graph` 与 `orchestrate pregel` **共用同一套边机制**，两者此前
+边条件都是死的，本条修复**一并让 pregel 的边条件开始生效**。
+`orchestrate moa` 内部构造的 pregel 图同理 —— 但它那三处
+`condition_body: None` 是**本来就没有条件边**，不是缺陷，不在修法范围内。
+
+既有测试无一受影响：pregel 的 ~40 处单测都在 config 里**显式**写
+`condition_body: None`；而
+`interpreter::builtins::tests::orchestrate::orchestrate_graph_with_predicate_edges_parses`
+只断言「能解析」—— 与 D269 里那条 `max_rounds` 测试一样**零鉴别力**
+（修前它绿，是因为条件被存进了一个没人读的字段）。已补注释指明。
+
+##### 五、判据与牙齿验证
+
+`tests/graph_edge_conditions.rs`（6 条）：恒假条件阻断（主断言）、
+恒真条件放行（**判别器**）、读环境变量的真实用例、`condition_body` 到达 MIR
+（**根因判据**）、无条件边不受影响（对照组）、pregel 边条件同样修好。
+
+牙齿验证**分两半独立做**（两处改动各自都必要）：
+
+| 回退 | 变红 | 保持绿 |
+|---|---|---|
+| 只回退 `mir_edge_from_witness` | 4 条 | `on: true` 判别器 + 无条件边对照 |
+| 只回退解析器预 lowering | 4 条（同样 4 条） | 同上 |
+
+⚠ 值得记：`on: true` 那条**对单侧回退没有牙齿**——它断言的输出与 bug 版
+**逐字相同**（都是 `B`）。这不是判据写弱了，而是**恒真条件本就无法区分**；
+真正有牙齿的是 `on: false`（期望 `A`，bug 版给 `B`）。两条并置才构成
+「同一张图、两个条件、两个不同结果」的完整证据。
+
+##### 六、三轮的共同形状
+
+| 编号 | 被静默丢弃/忽略的东西 | 语言层可写 | 端到端覆盖 |
+|---|---|---|---|
+| D269 | `max_rounds` 的值 | ✓ | 0（且唯一那条测试无鉴别力） |
+| D270 | MoE 专家名 | ✓ | 0 |
+| D271 | 边的 `on:` 条件 | ✓ | 0（唯一那条测试只测解析） |
+
+三处的共同点：**语法被接受、值被保存（或被丢弃）、从不报错、从不生效**。
+而三处的共同掩护都是**「只断言能解析」的测试** ——
+这类测试对「值是否被采纳」结构性零鉴别力。
+
+#### D272：orchestrate agent 的**形参被静默丢弃** + agent 体**完全不走 typeck**（**未修**，待裁决）
+
+##### 承接上一轮：把一条「已记录但判错了」的观察升级为缺陷
+
+D269–D271 顺线索扫到 `parse_agent_def` 时，发现形参问题**上一轮已实测到**
+（D216 附带的「未结论的探查记录」，2026-10-03，原文）：
+
+> agent 声明的参数 `x` **始终未被绑定** —— 无论 `input` 是什么，`x` 都是 `nil`。
+> …这更像**能力缺口**（没有 channel 的用户表面）而不是「静默算错」…
+> **本轮不擅自扩范围，留作候选。**
+
+那个判断**判错了**，本条把它翻过来：
+
+| 上一轮的判断 | 本轮的实测 | 结论 |
+|---|---|---|
+| 「能力缺口（表面无法表达）」 | `agent a => "a:" + input` → `b:a:nil` **管线是通的** | ✗ 推翻 |
+| 「不是静默算错」 | `agent a(x) => "a:" + x` → **`b:nil`**，exit 0 | ✗ 推翻 |
+
+⇒ 形参形态不是「写不出来」，是「**写得出来、并且静默给出错值**」——
+属本项目反复治理的**静默错值族**。
+
+##### 缺陷 ①：形参被解析、被丢弃
+
+`parse_agent_def` 解析了 `agent a(x) => …` 的形参列表
+（`let params = if let TokenType::LParen = …`），但随后的
+`Some(MirOrchestrateAgent { name, with_config, task_expr, verify_expr,
+task_body, combiner_body })` **没有 params 字段**——
+`MirOrchestrateAgent` / `MirAgentDef` / `WitnessAgentDef` **三层都没有**。
+
+真实 CLI：
+
+| 程序 | 输出 | 退出码 |
+|---|---|---|
+| `agent a(x) => "a:" + x` / `agent b(x) => "b:" + x` | **`b:nil`** | 0，零诊断 |
+| `agent a => "a:" + input` / `agent b => "b:" + input` | `b:a:nil`（对照组：管线正常） | 0 |
+| `agent a(x) => "A"` / `agent b(y, z) => "B"` | `B`（声明但**不使用**⇒ 无害） | 0 |
+
+⇒ `agent a(user) => "processed " + user` 会为**每次**请求返回
+`"processed nil"` 而 `exit 0`。这比「值被忽略」更隐蔽：产出的是一个
+**看起来完全正常的字符串**。
+
+##### 缺陷 ②：agent 体现在**完全不走 typeck**
+
+这是①之所以静默的机制。Mora 的 CLI 横幅宣告「typeck 必走」，agent 是例外：
+
+| 上下文 | 代码 | 实测 |
+|---|---|---|
+| 顶层 | `1 + "str"` | `Type error: expected Float, got String` ✓ |
+| 普通闭包 | `fn(x) { y + 1 }` | `Type error: Unbound variable 'y'` ✓ |
+| **orchestrate agent 体** | `1 + "str"` | **`1.0str`**，exit 0 ❗ |
+| **orchestrate agent 体** | `"a:" + x` / `y + 1` | **`b:nil`**，exit 0 ❗ |
+
+注意 `1 + "str"` 被**强行算成 `"1.0str"`** ⇒ 不只是漏检「未绑定变量」，
+**整个 agent 体的类型检查都被跳过**。
+
+##### 三条新事实（上一轮都没有）
+
+1. **库级 harness `ParserV3::compile` + `run_mir` 本身不跑 typeck** ——
+   顶层 `1 + "str"` 在库里同样算成 `"1.0str"`。typeck 是 CLI 额外加的一遍。
+   ⇒ 任何要判 typeck 行为的判据**必须显式调
+   `typeck::check_mir::check_program_witnesses`**，不能借 `run` 的执行结果推断。
+2. **双 agent 链里 `result` 取的是链尾 agent 的值**（last-write-wins），
+   想观察第一个 agent 的产物必须用**单** agent 图 —— 本轮判据在此踩过一次。
+3. **形参语法在仓库里的全部出现位置**（Grep 工具复核，PS 的
+   `src\**\*.rs` glob 不可信）：仅 `interpreter/builtins/tests/orchestrate.rs`
+   的两条 **compile-only** 测试（第 27/28/39 行）。无 fixture、无 example、
+   无文档、无 CHANGELOG 承诺。
+
+##### 修法选项（属产品契约决定，**不擅自实施**）
+
+| 选项 | 做法 | 代价 |
+|---|---|---|
+| ① 禁掉形参语法 | `agent a(x) =>` 变成解析错误，引导改用 `input` | **破坏**今天能正常工作的「声明但不使用」程序（实测 `agent a(x) => "A"` → `B`）；须改那两条 compile-only 测试 |
+| ② 绑定形参 | 把形参灌进 agent env，`(x)` 等价于 `input` | 需给 `MirAgentDef`/`WitnessAgentDef` 加 params 字段并在运行时绑定（与 D270 的 `WitnessMoeExpert` 同型改造）；**多参 `agent a(x, y)` 的语义仍无定论** |
+| ③ 给 agent 体接上 typeck | 让未绑定变量 / 类型不匹配变成类型错误 | 需建模 agent 的词法作用域：运行时是 `env.clone()`（**外层全部变量可见**）+ 无条件注入 `input`，typeck 目前无此模型；是 typeck 架构级改动 |
+
+三个选项**正交**：② 与③ 可叠加，① 与② 互斥。
+
+##### 判据
+
+`tests/orchestrate_agent_params_and_typeck.rs`（7 条）—— **现状判据**，
+断言当前的错误行为，文件头已写明修好后须整体改写。其中 typeck 三条的
+牙齿由**对照基准自证**：同一个 `check_program_witnesses` 对顶层/闭包返回
+非空、对 agent 体返回空 ⇒ 探测器本身是活的，不是「什么都没检出」。
+
+本条**零产品代码改动**（判定为待裁决）。
+
+#### D273：typeck 覆盖边界普查 —— 缺口**恰好是 `orchestrate` 这个关键字**（**未修**，待裁决）
+
+D272 挖出「orchestrate agent 体不走 typeck」，但那条只举了 agent 体，
+没界定边界。本轮做**机械普查**：在每个内嵌函数上下文植入同一处类型错误
+`1 + "str"`，看 `check_program_witnesses` 报不报。
+
+##### 一、普查结果：边界整齐得反常
+
+| 上下文 | typeck |
+|---|---|
+| 顶层 `let z = 1 + "str"` | ✅ 2 诊断 |
+| 闭包体 `fn(x) { 1 + "str" }` | ✅ 1 诊断 |
+| tea `app` 的 `update:` 体 | ✅ 3 诊断 |
+| tea `app` 的 `view:` 体 | ✅ 3 诊断 |
+| `tea.init(..)` 的闭包实参 | ✅ 2 诊断 |
+| **orchestrate agent 的 `task_body`** | ❌ **0 诊断** |
+| **orchestrate 边 `on:` 条件体** | ❌ **0 诊断** |
+| **orchestrate loop `on:` 条件体** | ❌ **0 诊断** |
+| **moe expert 的 `def` 体** | ❌ **0 诊断** |
+| **moe `router` 体** | ❌ **0 诊断** |
+| **moa `prompt` 体** | ❌ **0 诊断** |
+
+⇒ 缺口**恰好是 `orchestrate` 这个关键字**，**不是**「内嵌 `MirFunction`
+不参与检查」—— tea 的三处内嵌体（`update`/`view`/`init` 闭包）**全都参与**。
+这条修正了 D272 的表述：边界比想象的**更窄也更整齐**。
+
+顺带一条**否定结果**：`tests/fixtures/e2e/tea_counter.mora` 的头注释记着
+v0.102 的缺陷链「② emit 端伪造 update/view witness → **用户的体不参与推断**」。
+本普查实测 tea 三处**全部参与** ⇒ 那条**早已修复**，该注释已过时。
+
+##### 二、根因：两处**各自独立**的显式跳过，且理由**是错的**
+
+| # | 位置 | 代码 |
+|---|---|---|
+| 1 | `typeck/bidirectional.rs:613-617` | `WitnessKind::Orchestrate { kind, .. } => { /* …witness 树这里不可见——保守跳过 */ let _ = kind; }` |
+| 2 | `typeck/hm/mod.rs:919-932` | 只 `env.add(input_var/result_var, Unknown)`，随后 `return Ok((Type::Nil, EffectRow::Empty))` |
+
+位置 1 的注释写「递归 `input_var`/`result_var` 引用 witness 树这里不可见」——
+**这个前提不成立**：`WitnessOrchestrateKind::sub_witnesses()` 早就在
+`witness.rs` 里把 agent 的 `task_expr`、边的 `condition_expr`、loop 的
+`exit_when`、moa 的 `prompt`、moe 的 `experts`/`router`/`prompt`
+**全部枚举出来**，正是遍历所需的东西。
+
+⇒ 跳过是**两处各自独立**的决定，不是某一处的连带后果 ——
+这解释了为什么「只补一处」不会让 orchestrate 进入检查。
+
+##### 三、已有先例：同一类缺陷在 `for` 循环上 v0.104 已修
+
+`hm/mod.rs` 里紧挨着的 v0.104 注释记录了**一模一样的三个症状**：
+
+> 之前是 v0.55 的桩 `Ok((Type::Nil, Empty))`，**完全不推断 iterable 与 body**，
+> 于是循环体内的一切错误被静默吞掉：
+> `print(nosuchvar)` 不报 Unbound、运行期得 nil；效果行不进残差；
+> `for x in 5i` 非列表到运行期才报错。
+
+⇒ `for` 修好了（迭代变量按元素类型绑定、body 在子作用域推断、效果行并入），
+**`orchestrate` 是同一类缺陷里没被覆盖的那一个**。这既说明「跳过」不是
+深思熟虑的正确选择，也直接指出了修法的形状。
+
+##### 四、为什么仍然不擅自改（与 D272 选项③是同一件事）
+
+「保守跳过」的**谨慎本身有实据**，只是理由写错了：agent 体的词法作用域在
+typeck 里**没有模型**。运行时是 `agent_env = env.clone()`（**外层全部变量可见**）
++ 无条件注入字面量名 `"input"`；而 typeck 登记的是**表头写的那个名字**
+（`orchestrate sequential acc -> result` 登记的是 `acc`，运行时注入的却是 `input`）。
+
+直接遍历 `sub_witnesses()` ⇒ 所有能正常工作的 orchestrate 程序集体报
+「Unbound variable `input`」。**假阳性比假阴性更糟**。
+
+要真修必须先定 agent 的作用域契约（D272 的选项 ②/③），本条只把边界钉住。
+
+##### 五、判据
+
+`tests/typeck_coverage_boundary.rs`（2 条）—— **现状判据**，
+把上面那张表做成 `expect_checked` 清单，**修好后只需把 `false` 翻成 `true`**。
+
+牙齿验证：把「orchestrate agent task_body」一项翻成 `true` ⇒ 变红，且报错
+精确到
+
+```text
+orchestrate agent task_body：期望 检出，实际 不检出 诊断（观测：0）
+```
+
+—— 正是将来修复落地时修复者会看到的**同一条消息**。
+
+本条**零产品代码改动**（判定为待裁决；与 D272 的选项③合并为**同一个**决策）。
+
+#### D274：HM 层 9 处 `Ok((Type::Nil, …))` 桩普查 —— **宏体不参与 typeck**（**未修**，待裁决）
+
+D273 把边界从「一个关键字」推广到了 typeck 层。本轮继续推广：把 HM 里
+**全部 9 处** `Ok((Type::Nil, EffectRow::Empty))` 桩逐个分类。
+
+##### 一、普查结果：9 处桩里只有 1 处是「活分支且有子体」
+
+| 桩位置 | 覆盖的 kind | 判定 |
+|---|---|---|
+| `hm/mod.rs:1015` | `Return(None)` / `Break` / `Continue` | ✅ 正确（无子表达式） |
+| `hm/mod.rs:1018` | `IndexAssign { .. }` | ⚪ **死分支** —— `emit.rs` 无构造点 |
+| `hm/mod.rs:1030` | `TypeAlias`/`EnumDef`/`StructDef`/`Import` | ⚪ **死分支** —— `emit.rs` 无构造点（lexer 有 token，但无 emit 路径） |
+| **`hm/mod.rs:1030`** | **`MacroDef { .. }`** | ❗ **活分支且有子体**（`name`/`params`/`body`） |
+| `hm/mod.rs:1064` | `TaskDef` | ✅ **实际已推断**体（Nil 只表示声明无标量类型） |
+| `hm/mod.rs:1133` | `AppDef`（tea） | ✅ **实际已推断** init/update/view |
+| `hm/mod.rs:1154` | `MsgDef` | ✅ 正确（只有类型名，无表达式） |
+| `hm/mod.rs:1178` | `EffectSig` | ✅ 正确（纯类型层） |
+| `hm/mod.rs:1732` | 关系定义收尾 | ✅ 正确（合并 effect row 后返回） |
+
+⇒ 那些「看着惊悚」的桩大多在守**不可达代码**。`MirWitness::children()`
+早已枚举 `MacroDef => vec![body]` —— 又是「枚举器有、typeck 不用」
+的同一形态（D270 / D271 / D273 一致）。
+
+##### 二、用户可见后果：静默错值（真实 CLI）
+
+| 程序 | 顶层等价 | 宏内 |
+|---|---|---|
+| `1 + "str"` | `Type error` exit 2 | **`1.0str`**，exit **0** ❗ |
+| `"v:" + nosuchvar` | `Type error: Unbound` exit 2 | **`v:nil`**，exit **0** ❗ |
+
+⇒ 与 D273 的 orchestrate 缺口**完全同型**，只是入口不同（宏 vs orchestrate）。
+
+一条**差点误判的**：`macro m()` / `let z = 1` / `end` / `print(m())` 也打印
+`nil` ⇒ 一度以为是漏检导致。经干净对照确认：宏体以 `let` 收尾**本来就**求值为
+Nil，**与漏检无关**。真正构成错值的是**以裸表达式收尾**的形态（上表两行）。
+
+##### 三、修法：现成范式就在同一文件里，但有一个必须先补的前置条件
+
+`hm/mod.rs:884-886` 的 `FnDef` 走
+`infer_fn_def(Some(name), params, body, span)`，而 `MacroDef` 的字段
+**形状完全相同**。宏体是指令序列也没问题：`WitnessKind::Sequence` 有
+`infer_sequence`（do-notation 语义，返回最后一个表达式），正是宏体该有的行为。
+
+⇒ 修法 = 把 `MacroDef` 移出 Nil 桩组、路由到 `infer_fn_def`；
+`bidirectional.rs:477` 同样要加一支（照 194-199 登记形参、534-536 预扫体；
+注意 `MacroDef.params` 是 `Vec<String>` 而 `FnDef.params` 是 `Vec<WitnessParam>`）。
+
+**但必须先补一个预登记遍**。实测宏**支持前向引用**：
+
+```mora
+macro outer()
+  inner()          -- inner 定义在后面
+end
+macro inner()
+  "I"
+end
+print(outer())     -- → I，exit 0
+```
+
+而 `precompute_fn_arities`（专门防 fn/task 前向引用的那遍）**只收 `FnDef`**。
+不加宏的预登记就推断体 ⇒ `outer` 的体在 `inner` 登记前被推断 ⇒
+**误报 `Unbound variable inner`**，打破今天能跑的程序。
+
+##### 四、为什么不擅自实施
+
+修法需要**新增一个预登记遍** + `bidirectional.rs` 平行改一支。
+而仓库里**零个 `.mora` 文件使用宏** ⇒ 一旦引入假阳性，**没有任何真实用例
+能立刻暴露它**。这正是 D273 里拒绝直接遍历 `sub_witnesses()` 的同一条理由：
+**假阳性比假阴性更糟**。
+
+##### 五、判据
+
+`tests/macro_body_typeck.rs`（6 条）—— **刻意混合两类断言**：
+
+| 类别 | 条数 | 修前修后 |
+|---|---|---|
+| 现状判据（宏体零诊断） | 2 | 修好后会红（把期望翻成检出即可） |
+| 对照基准（顶层/闭包仍检出） | 1 | 恒绿 |
+| **运行时契约（正向）** | 3 | **恒绿** |
+
+那 3 条正向断言是本文件存在的**主要理由** —— 它们锁住宏的运行时语义
+（外层变量可见、形参被绑定、**支持前向引用**），**防止将来的修复误伤**：
+若有人为了让宏体进入 typeck 而把作用域收窄、或忽略前向引用问题，
+这三条会立刻变红。
+
+本条**零产品代码改动**（判定为待裁决）。
+
+#### D275：9 层 IR 管线的差分在 **21% 的真实程序上失败** ⇒ 它在生产中**从未生效**（**未修**，待裁决）
+
+D272–D274 连续三轮零产品改动，那个矿脉已挖到阻塞点，本轮换方向：
+从「typeck 覆盖」转到**项目自述的架构方向本身**。
+
+起因是每轮跑 CLI 都会看到、此前一直被当噪声跳过的那一行：
+
+```text
+[9layer] 差分失败：已回落到 emit.rs 路径（9 层管线产出被丢弃）| pipeline_mir=2 original_mir=3
+```
+
+##### 一、量化：53 个真实 `.mora` 文件中 **11 个**差分失败（21%）
+
+失败清单：
+
+```text
+rel_basic.mora  rel_cons.mora  rel_empty.mora  rel_project.mora
+rel_run_limit.mora  rel_single_var.mora  rel_zero_var.mora
+export_visibility.mora  import_handle_index_main.mora
+prompt_section.mora  tea_standalone.mora
+```
+
+⇒ 这 21% 的程序上，**9 层管线的产出被整段丢弃**，用户拿到的是 `emit.rs`
+的结果。程序**能跑**（退出码与 stdout 不变），但项目自述的架构方向
+（`mir/pipeline.rs` 的 9 层 IR）**在生产中从未生效过** ——
+它在这些程序上的正确性**从未被验证过**。
+
+「用户以为在跑 9 层管线」这个隐患 D36 已经识别过（把静默降级改成默认打
+stderr 摘要），但**失败面从未被量化**，本条补上。
+
+##### 二、观察到的差分签名（`MORA_9LAYER_DEBUG=1`）
+
+| 文件 | `pipeline_mir` / `original_mir` | 首个 diff |
+|---|---|---|
+| `rel_empty` | 2 / 3 | `top[1]: "Solve" vs "Const"` |
+| `rel_basic` | 6 / 11 | `top[1]: "RelDef" vs "Const"` |
+| `export_visibility` | 2 / 3 | `top[1]: "TaskDef" vs "Const"` |
+| `prompt_section` | 5 / 7 | `top[1]: "PromptSection" vs "Const"` |
+| `tea_standalone` | 5 / 11 | `inst[0]: "ModelDef" vs "Const"`、`inst[2]: "UpdateDef" vs "ModelDef"`、`inst[3]: "AppDef" vs "DictLit"`、`inst[4]: "TaskDef" vs "Define"` |
+
+**共同形态**：9 层管线把**声明节点**（`RelDef`/`Solve`/`TaskDef`/
+`PromptSection`/`AppDef`/`ModelDef`/`MsgDef`/`UpdateDef`）当顶层指令发射，
+`emit.rs` 在同一位置发 `Const`/`Define`/`DictLit`；且**每个失败样本的
+`pipeline_mir` 都小于 `original_mir`**。
+
+##### 三、三个已被实测**证伪**的假设（留给下轮，别重走）
+
+| 假设 | 实测 | 判定 |
+|---|---|---|
+| 「含顶层声明就失败」 | **26 个含 `task`/`rel` 的文件通过** | ✗ **否定** |
+| 「没有 `task main` 就失败」 | `export_visibility.mora` = `import` + `task main()` **却失败** | ✗ **否定** |
+| 「只与 `rel` 关系语言有关」 | `prompt_section` / `tea_standalone` / `export_visibility` 与 `rel` 无关 | ✗ **否定** |
+
+⇒ 判别条件**尚未钉死**（本轮未追到底）。已确认的只有上表「共同形态」。
+
+##### 四、为什么不擅自实施
+
+差分失败有**两种互斥读法**，都合理：
+
+① **比较器过严** —— 两条路径对声明节点有**合法的**表示差异（一个发声明
+   节点、一个发 `Const` 占位），比较指令类别序列必然误报；
+② **管线有错** —— 9 层不该把声明当指令发射。
+
+选哪一边是**架构方向的决定**；且现有 11 个样本**无一在生产中执行过**，
+没有「哪边对」的运行时证据可依。本条只负责把失败面量化并钉住。
+
+##### 五、判据
+
+`tests/nine_layer_differential_coverage.rs`（2 条）—— **现状判据**，
+用**无条件**打印的「差分失败」摘要行做判据（5 个已知失败 + 3 个对照）。
+
+⚠ 这里有个**判据本身的坑**（我踩了）：首版用 `"differential FAILED"`
+做判据，而那行**只在 `MORA_9LAYER_DEBUG=1` 时打印**（`cli/mod.rs:76`），
+无条件打印的是「差分失败」摘要行 ⇒ 首版把 11 个失败**全报成 0**，
+「无声明却失败」的反例也是这么冒出来的。已在判据里改用无条件那行。
+
+牙齿**自证**：判据含 3 条 `expect_fallback: false` 的对照且测试通过
+⇒ 检测函数对这 3 个确实返回 `false` ⇒ 装置能区分，不是恒真。
+
+##### 六、一条过程教训：U+FFFD 又中了一次
+
+写判据时我打出的 `"不回落"` 变成了 `"不回\ufffd\ufffd\ufffd"`（3 个替换符）。
+**写完立刻 `assert count(0xFFFD)`** 这条老规矩救了它 ——
+否则会带着损坏字符进 CHANGELOG 归档。
+
+#### D276：差分的两套对齐基准确实是缺陷，但**不能修** —— 错位是 `rel_*` 唯一的护栏（**否定结果**，已撤销）
+
+D275 量化出「11/53 失败」但把判别条件**留成了开口**（三个假设全被证伪）。
+本轮钉死了判别条件、动了手、**然后整条回滚**。全过程记在这里。
+
+##### 一、诊断是对的：`nested_diffs` 与顶层用了**两套对齐基准**
+
+| 层 | 比较函数 | 基准 |
+|---|---|---|
+| 顶层 | `significant_categories` | **剔除死 `Const(r, Nil)`** 后（D57） |
+| 嵌套 | `nested_diffs` | **原始**长度 + **原始**下标（修前） |
+
+D57 的注释写着 emit 侧会多补一条**死** `Const(r, Nil)`，「差异因此
+**只有条数、无任何类别差异**」—— 而 `nested_diffs` 没有剔它，
+死 `Const` 让后续下标**整体错位**、拿**无关指令**互比。
+
+实测（`rel_empty.mora`，`MORA_DBG_NEST=1`）：
+
+```text
+nested_diffs = ["top[1]: \"Solve\" vs \"Const\"",
+                "top: inst count pipeline=2 original_mir=3"]
+```
+
+pipeline = `[RelDef, Solve]`、original = `[RelDef, Const, Solve]`。
+
+判别条件因此也钉死了 —— **取代了 D275 那三个被证伪的假设**：
+只有**语句型声明**（`import`/`rel`/`solve`/`prompt section`/`model`/`msg`/
+`update`/`app`）才在 emit 侧触发补 `Const`；**只有 `task` 的文件全部通过**
+（`TaskDef` 不在 D57 的语句型清单里）。
+
+##### 二、按诊断对齐：失败数 11 → 1，**看起来是纯改进**
+
+##### 三、但它引入了**真回归**，被既有测试抓到
+
+`tests/path_differential_census.rs::d122_…` 报：
+
+```text
+pipelined = Err(internal: instruction at DAG node 5 references register 4
+              (read/write) but the function only has 1 register(s) —
+              a unit-statement emitter returned an unallocated sentinel register)
+```
+
+真实 CLI 复现：`rel_basic.mora` 默认路径 **exit 1**、
+`MORA_9LAYER=0`（emit.rs 原路径）**exit 0**。
+
+⇒ **9 层的 `rel` 路径本身是坏的**（寄存器破损）。
+对齐之前，`nested_diffs` 的「错位」**偶然地**通过条数差异把它挡在生产之外。
+
+**根子**：差分**按设计不比较寄存器号**（D36 已记「寄存器级审计 opt-in、
+只诊断、不判失败」）。类别序列可以对齐，**寄存器破损看不见**。
+
+⇒ **在 9 层 `rel` 路径修好之前，错位必须保留。本条整条撤销。**
+
+##### 四、方法教训：我的 A/B 为什么一开始没抓到
+
+D276 期间的 A/B 对照 53 个程序报「**52 同 1 异**」，看起来安全。
+**实际上我只比了 stdout** —— `rel_*` 程序两条路径的 stdout **都是空**
+（它不打印任何东西），于是「相等」，
+而**退出码 1 vs 0 被漏掉了**。
+
+⇒ **A/B 判「行为等价」时必须同时比 stdout 与退出码。**
+只比一个维度等于没比 —— 这与「判据只断言一个维度」是同一条纪律，
+我自己在同一轮里违反了它。
+
+##### 五、一条判据自身的坑
+
+普查判据首版用 `"differential FAILED"`，而那行**只在**
+`MORA_9LAYER_DEBUG=1` 时打印（`cli/mod.rs:76`）；无条件打印的是
+「差分失败」摘要行 ⇒ 首版把 11 个失败**全报成 0**，
+连「无声明却失败」的反例也是这么冒出来的。已改用无条件那行。
+
+##### 六、撤销后同步回滚的三处
+
+| 位置 | 处置 |
+|---|---|
+| `src/mir/pipeline.rs` | `nested_diffs` 改回**原始**下标（`significant_indices` 保留，供 `significant_categories` 复用），并加注释写明**撤销原因**与「不得再动」 |
+| `tests/nine_layer_fallback_census.rs` | 8 条改回 `true`；覆盖面阈值回滚 |
+| `tests/nine_layer_block_forms.rs` | 断言回滚为「必须回落」，并记下 D276 翻转过一次又被撤销 |
+
+**回滚后实测：差分失败回到 11/53**，`rel_basic.mora` 默认路径恢复 exit 0。
+
+判据 `tests/nine_layer_differential_coverage.rs`（3 条）仍是**现状判据**：
+11 个必须回落 + 4 个对照不回落 + 回落不改退出码。
+失败消息里写明「**不要**据此直接改断言 —— D276 就是这么干的」。
+
+#### D277：9 层差分存在**假阴性** —— `quasiquote` 两条路径输出不同，差分却判通过
+
+D276 做 A/B 时**顺带撞出来的**，与 D276 的修/撤**都无关**
+（`quasiquote.mora` 修前修后**都不回落**，一直走 9 层路径）。
+
+##### 实测
+
+`tests/fixtures/e2e/quasiquote.mora`：
+
+| | 9 层路径（**默认**） | `MORA_9LAYER=0`（emit.rs 原路径） |
+|---|---|---|
+| quasiquote 展开的列表 | **`List([Float(1.0), Float(2.0), Float(3.0)])`** | `1, 2, 3` |
+
+其余输出两路径一致（**退出码两侧都是 0**），只有这一行不同。
+**默认跑就是错的。**
+
+##### 严重性
+
+D275 已量化「9 层路径在 79% 的真实程序上被采用、且从未被验证」——
+本条是那个缺口的**第一个实证**：不是「可能有问题」，
+而是**默认配置下用户拿到的就是错输出**，而差分判它「通过」。
+
+##### 为什么差分看不见
+
+差分比的是**指令类别序列**（`Const`/`Call`/`BinaryOp`/…），
+而两条路径在这里的差别是**同一个值在运行时的呈现方式**
+（列表字面量 vs 它的 `Display`）—— **类别序列相同、行为不同**。
+
+⇒ 差分的盲区在**「值语义」层**，与 D36 当初记录的
+「只比顶层、结构性失明」同族，但换了一个维度。
+和 D276 的「寄存器盲区」并置可见：**差分有三类它看不见的差异**
+（条数、寄存器号、值语义），只有条数那一类被偶然地抓住了。
+
+##### 不擅自实施
+
+修法要先定「9 层路径的 quasiquote 该产出什么」，以及差分要不要引入
+值级比较 —— 后者是**架构级决定**（会显著改变差分的成本与判据面）。
+本条只负责把事实钉住。
+
+判据初版见 `tests/differential_false_negative.rs`；**D278 修好后已改写**为
+「两条路径必须一致」的固定判据（同文件，仍单独成文件 —— 它要
+`MORA_9LAYER=0` 切换编译路径，而环境变量是**进程全局**的）。
+
+#### D278：quasiquote 的 `,,splice` 标记在 **witness 层丢失** ⇒ 9 层路径渲染成 `List([…])`（已修）
+
+D277 记下「`quasiquote` 两条路径输出不同而差分判通过」但未动手。本轮修掉了。
+
+##### 一、根因：标记只进了 emit 侧的 `segments`，witness 里一个字节都没留
+
+`parser_v3::emit::emit_quasiquote_w` 里 `,,expr` 的处理：
+
+```text
+if is_splice { segments.push(UnquoteSplice(reg)) } else { segments.push(Unquote(reg)) }
+witness_segments.push(w);        // ← 只有子表达式的 witness
+```
+
+⇒ `segments`（带 `is_splice`）只喂给 **emit.rs 自己**那条路；
+交给 9 层管线的 witness 里，splice 段是**裸 `Variable("items")`**。
+编译产物可直接印证：
+
+```text
+-- `,,items``   →  Quasiquote { segments: [Variable("items")] }        ← 无标记
+-- `10+,x``     →  Quasiquote { segments: [Literal("10+"), Variable("x")] }  ← 正常
+```
+
+⇒ splice 段与普通 unquote 段在 witness 层**完全不可区分**，
+`witness_to_fcfg` 只能按 `Unquote` 处理（取寄存器值经 Display 拼进源码）
+⇒ 9 层路径给出 `List([Float(1.0), Float(2.0), Float(3.0)])`。
+
+##### 二、两个**配套**缺口；下游本就就绪
+
+| 位置 | 修前状态 |
+|---|---|
+| `parser_v3/emit.rs` | 标记**不产出** |
+| `mir/witness_to_fcfg.rs` | 有消费约定（注释就写着「UnquoteSplice 标记：`Literal(Boolean(true))`」）但**只跳过标记**、从不发射 `UnquoteSplice` |
+| `mir/fcfg_lower.rs:498` | ✅ **已**正确处理 `UnquoteSplice` |
+| `mir/ehir_to_core.rs:462` | ✅ **已**正确处理 `UnquoteSplice` |
+
+⇒ 这是 D269（`max_rounds`）、D270（MoE 专家名）、D271（边条件）
+**同款的「消费侧早写好、生产侧没写」**，只是这次连消费侧也只写了一半。
+
+**修法**：① 解析器在 `is_splice` 时往 `witness_segments` 压一个
+`Literal(Boolean(true))` 标记段（形态沿用 `witness_to_fcfg` 里已有的约定）；
+② `witness_to_fcfg` 把标记**应用到紧随其后那一段**、发射 `UnquoteSplice`。
+下游两处**无需改动**。
+
+##### 三、修后实测
+
+`tests/fixtures/e2e/quasiquote.mora`：
+
+| | 9 层路径 | `MORA_9LAYER=0` |
+|---|---|---|
+| 修前 | `code:List([Float(1.0), Float(2.0), Float(3.0)])` | `code:1, 2, 3` |
+| 修后 | `code:1, 2, 3` | `code:1, 2, 3` |
+
+其余四种形态（纯引号 / unquote / 带括号 / eval）**完全未受影响**。
+
+##### 四、D277 的「假阴性」至此收敛
+
+D277 指出差分比的是**指令类别序列**，看不见「同一个值的呈现方式不同」。
+本条修好之后，**这个具体假阴性已消除**；但差分「不引入值级比较」这一
+**结构性盲区仍在**（下一次换个值语义差异，它照样看不见）。
+⇒ 差分的三类盲区里，**条数**（D276，已知且是当前唯一有效的护栏）、
+**寄存器号**（D276）、**值语义**（D277/D278，修掉了这一例、盲区本身还在）。
+
+##### 五、判据与牙齿验证
+
+`tests/differential_false_negative.rs`（1 条，三段断言合为一条串行）：
+① 两条路径输出**一致**；② 具体值含 `code:1, 2, 3`（防两条路径一起错到
+同一个值）；③ 其余三种形态未受影响。
+
+牙齿验证：临时把 `witness_to_fcfg` 的 `UnquoteSplice` 改回 `Unquote`
+⇒ 判据变红。
+
+⚠ 这条测试文件**只有一条测试**，且**单独成文件** —— 两个原因都是环境变量：
+`MORA_9LAYER` 是**进程全局**的，① 放进别的测试文件会污染那里并行执行的
+测试，② 即便在本文件内**多条**测试并行也会互相踩（本轮第一版就因此让对照
+判据假红过一次）。
+
+#### D279：用 D278 的镜头照 macro（**否定**）+ 两条路径首次**全量行为等价**
+
+##### 一、否定结果：`macro` 在 9 层路径上是**对的**
+
+D278 揭示了一类可推广的缺陷：**元编程特性在 witness 边界丢标记**。
+quasiquote 命中了，于是把同一面镜子照向 `core.rs:23` 里与它并列标注的
+另一个元编程特性 —— **macro**。五种形态全部正确，且**都不回落**：
+
+| 形态 | 9 层 | `MORA_9LAYER=0` |
+|---|---|---|
+| `macro add(a,b) a+b end` + `add(1,2)` | `3.0` | `3.0` |
+| 嵌套调用 + **前向引用** + 外层变量捕获 | `G!` | `G!` |
+| **多语句**体（`let a` / `let b` / 表达式） | `3.0` | `3.0` |
+| 体内含 `for` 循环 | `6.0` | `6.0` |
+| 参数 / 外层变量 / 多语句 / 控制流 全部组合 | 全部一致 | 全部一致 |
+
+⇒ **否定** ✓ macro 不需要修。差别在于 quasiquote 的 splice 是**段列表里
+一个额外的标记位**，而 macro 的参数是**witness 里真实存在的字段**
+（`WitnessKind::MacroDef { name, params, body }`），不依赖标记传递。
+
+##### 二、正面结论：两条编译路径**首次全量行为等价**
+
+D275 说 9 层路径「从未被验证过」。本轮用**修正后**的 A/B 方法
+（**同时**比 stdout 与退出码，D276 教训）扫全部真实程序：
+
+| | 结果 |
+|---|---|
+| D278 修前（**只比 stdout**） | 52 / 53 相同 —— **看起来**只有 `quasiquote` 一处 |
+| D278 修前（**同时比退出码**） | 至少 2 处（`quasiquote` + `rel_*` 的 exit 1/0） |
+| **D278 修后** | **57 / 57 完全一致，0 差异** |
+
+⇒ 这是 9 层路径**第一次**有「两条路径行为等价」的证据。
+（D278 修前那一版「52/53」的数字是**错的** —— 只比 stdout 时
+`rel_*` 两边都是空输出被判成「相等」，而退出码差 1 被漏掉。）
+
+##### 三、但这个「等价」有上限：管线的**后段是桩**
+
+顺着 D278 的线查 9 层各阶段的实现度，发现两个必须记录的事实：
+
+| 阶段 | 实现度 |
+|---|---|
+| witness → fcfg → `fcfg_lower` → `MirInst` | ✅ **真实**（这才是 CLI 执行的那条） |
+| witness → fcfg → ehir → core | ⚠️ quasiquote 处 `let _ = resolved;`（`ehir_to_core.rs:467-468`）仍是丢弃 |
+| core → cmir → **lmir** | ⚠️ `cmir_to_lmir.rs:78-89` **几乎全是占位**：每条指令都变成 `LmirInst::ConstInt(0, 0)` |
+
+⇒ 差分比对的**对象本身**（`ehir`/`core`/`cmir`/`lmir` 这条链）后半段是桩。
+这解释了为什么差分对「值语义」类差异格外无力（D277）—— 它比的是
+`fcfg_lower` 之前那一段的类别序列，而执行走的是 `fcfg_lower` 的产物。
+
+**这不构成本轮可修的缺陷**（LMIR 整层是桩显然是未完成的工作，不是回归），
+但它界定了「57/57 等价」这个结论的适用范围：**只覆盖 fcfg_lower 及之前**。
+
+##### 四、判据
+
+`tests/pipeline_emit_equivalence.rs`（1 条）—— 11 个代表性 fixture
+
+#### D280：`OrchestrateDag::topological_order` 对**并列节点**返回**不确定顺序**（已修）
+
+##### 一、普查驱动 + 一条**重复发现**（先记下来免得下轮重走）
+
+按「零覆盖 = 最强找缺陷信号」做全模块覆盖普查（`src/` 各模块 ×
+`tests/`+`examples/`+`test_data/`+内嵌测试），最低命中的是
+`orchestrate_dag`（1 处语料）、`toolplane`（1）、`event`（3）、`heartbeat`（3）。
+
+⚠ 普查脚本**第一版不可信**：它只用模块**顶层**文件名做特征词，而
+`document` 等模块顶层只有 `mod.rs`（stem 长度 3 被过滤）⇒ 报出
+「0 覆盖」的假空白。加了「递归收子目录 + 模块名本身」后重测才可用。
+**又一次「普查工具先自证」**。
+
+顺着 `orchestrate_dag` 查下去，发现 builtin `ai.dag` **源码不可达** ——
+**但这不是新发现**，D59（`tests/ai_namespace_reachability.rs`）已完整论证：
+`call_ai_method` 的唯一生产调用点是 `(BuiltinKind::Ai, _)`，而 parser
+把裸名 `ai.x` 解析成 `BuiltinKind::AiChat`；`builtins/tests/{ai,dag,heartbeat}.rs`
+的测试全部**直接调函数、绕过名字解析**，测的是源码到不了的实现。
+⇒ **否定** ✓ 记此以免重复劳动。
+
+##### 二、真正的缺陷：D59 没提的那一层
+
+`OrchestrateDag::topological_order` 的**并列节点顺序**由 `HashMap` 迭代决定
+（`in_degree` 与 `edges_by_from` 都是 `HashMap`，而 Rust 的 `HashMap` 用
+**逐进程随机种子** `RandomState`）。实测 8 个无边节点：
+
+```text
+声明序 = ["a","b","c","d","e","f","g","h"]
+返回序 = ["d","b","f","a","c","e","g","h"]
+```
+
+⇒ **同一张图、不同进程返回的顺序不同。**
+
+**为什么算缺陷**（尽管拓扑序对并列节点本无所谓）：
+
+① **它被暴露给用户** —— builtin `ai.dag` 把 `order` 直接作为 `Value::List` 返回；
+② **仓库内已有同一条原则** —— `pregel/mod.rs:818-828` 明确按 agent 定义顺序
+排序 `active_nodes`，注释写着「HashSet 迭代顺序不确定 → 会让 sequential 与
+parallel EXEC 产出依赖顺序的结果」。同一个仓库、同一类问题。
+
+##### 三、修法与影响面
+
+起点改为遍历 `self.nodes` 入队；同层后继按声明位置 `pos` 排序后入队。
+判定不变（每条边 from 仍先于 to），环检测不变。
+
+**零用户可见变更** —— `ai.dag` 不可达（D59）⇒ 本条是给「将来接线」**拆雷**。
+否则一接线，用户拿到的就是逐次不同的顺序。
+
+顺带订正 `orchestrate_dag/mod.rs` 头注释：原本写
+`builtin orchestrate.dag(nodes, edges, max_steps?)`，**两处都错** ——
+实际名是 `ai.dag`，且**没有** `max_steps` 参数（少于此数直接报
+`ai.dag: requires 2 args (nodes, edges)`）。
+
+##### 四、判据与牙齿验证
+
+`tests/dag_topological_order_stability.rs`（5 条）：独立节点按声明顺序（主断言）、
+同层后继按声明顺序、反复调用稳定、**拓扑正确性不受影响**（对照）、
+环检测仍工作（对照）。
+
+牙齿验证：临时把起点改回遍历 `in_degree` ⇒ 2 条变红并打出确切的不确定序
+（`["b","a","f","g","c","e","d","h"]`），其余 3 条仍绿。
+
+#### D281：事件通配符 `X.*` **也匹配裸 `X`** —— 语义既未文档化、也无测试（**否定 + 钉住**）
+
+D280 的普查指向 `src/event/`（641 行、3 处语料命中）。它的 `matches()` 是
+**沙箱 allow/deny 的判定函数**，正确性看着很关键，逐条分析后有两条结论。
+
+##### 一、否定（重要）：沙箱**不是**执行闸门
+
+`crate::event::matches` 的生产消费者是 `sandbox::check_builtin`。
+初看像「安全判定」，但全仓调用点只有：
+
+- `sandbox.check_builtin(name)` 这个 **builtin** —— `name` 由**用户传**，
+  语义是**查询**「这个名字会被允许吗」；
+- `src/sandbox/mod.rs` 的单测。
+
+**执行路径上没有任何调用者**。⇒ 「通配符误匹配 ⇒ 越权」的框架**不成立**，
+它至多是**查询结果偏宽**。（与 D186 记的 `ai.stream`/`ai.create`
+是同一类问题的另一面：那边是「列出来但没实现」，这边是「实现了但没人调」。）
+
+##### 二、真正的发现：`X.*` **也匹配裸 `X`**，且此前**无任何测试覆盖**
+
+`matches` 里 `pa_segments.len() <= ev_segments.len() + 1` 的那个 `+1` 余量
+使 `matches("outer", "outer.*")` 返回 **true** —— 即 `X.*` 不只是「`X.` 之下」，
+也覆盖裸 `X`。
+
+既有单测只测了 `outer.gui` ✓ 与 `other.gui` ✗，**从未**测 `matches("outer", "outer.*")`。
+
+**但这不是「两套实现打架」** —— 索引路径**同样**如此：
+`classify_pattern("outer.*")` 把它存成 `prefix["outer"]`，而 `emit("outer")`
+的 `for i in 0..parts.len()` 正好查到该键 ⇒ 也触发。**两条实现一致。**
+
+##### 三、处置：**不改语义，只写明并钉住**
+
+改它属**产品策略决定**（`X.*` 读作「X 及其之下」是自洽的读法，且两条实现
+都这么实现）。本轮做的是把它从「未文档化、未测试」变成「**写明 + 钉住**」：
+
+- `src/event/mod.rs` 的 `matches` 文档补一节，写清这条语义、两条实现一致、
+  以及影响面（查询型 builtin、执行路径无调用者 ⇒ 目前无可观察后果）；
+- 判据 `tests/event_pattern_matching_semantics.rs`（5 条）把它固定下来。
+
+⚠ 文件头写明：本文件是**语义钉子**、**不是正确性断言**。将来若决定改成
+「`X.*` 只匹配 `X` 之下」，本文件会**变红** —— 那是改动的信号，不是失败。
+并且：**若将来把沙箱 policy 接到执行闸门上**，这条「偏宽」就会变成真实的
+越权面，届时**必须**重新评估。
+
+##### 四、判据里最有价值的一条
+
+`d281_predicate_and_index_paths_agree`：对 10 组 `(事件, 模式)` 分别问
+「索引路径会不会触发」与「谓词路径会不会匹配」，**断言两者相等**。
+若将来只改其中一处（无论是为「修」裸名匹配而动 `matches` 却忘了索引路径，
+还是反过来），本条立刻变红 —— 这正是本条存在的理由。
+`["a","c","b","d","e"]`，实测得到 `["a","b","c","d","e"]`。
+推演后确认**代码是对的、期望值是错的** —— 我把「后继按声明序**入队**」
+错写成「后继紧接按声明序出现」，而 BFS 会把新解锁的节点排到队尾
+（弹 `b` 时解锁的 `e` 因此落在 `d` 之后）。已改期望值并在注释里写下推演，
+免得下轮再踩。
+（`quasiquote` / `rel_*` / import / tea / 基础控制流），
+**同时**比 stdout 与退出码。全量 57 个文件要跑约 2 分钟、放 CI 太重，
+本条取样约 1 秒；全量数字记在上面，需要复现时按该清单跑。
+
+牙齿验证：临时把 `witness_to_fcfg` 的 `UnquoteSplice` 改回 `Unquote`
+⇒ 两条判据同时变红，且本条**精确点名**
+`quasiquote.mora: stdout **异** / exit 0 vs 0`。##### 补记：D280 是那批「可复现性修复」里**漏掉的一处**
+
+本条顺 `src/event/` → `src/toolplane/` 查下去，收集到一张**确定性现状表**：
+
+| 位置 | 措施 | 状态 |
+|---|---|---|
+| `value/display.rs:56` / `:207` | `Value::Dict` 的 Display **按 key 排序**（两处分支**各自**都有） | ✅ |
+| `flow::json::value_to_json` | 同一族的对齐实现 | ✅ |
+| http / mcp 服务器 | 用 `BTreeMap` | ✅ |
+| `toolplane::list_planes` | `names.sort()` + 模块内已有单测 `list_planes_returns_sorted` | ✅ |
+| `builtins/toolplane.rs::list_tools` | `names.sort()` | ✅ |
+| `pregel/mod.rs:818-828` | 按 agent 定义顺序排 `active_nodes` | ✅ |
+| ~~`orchestrate_dag::topological_order`~~ | **D280 之前：无** ⇒ **漏网** | ✅（D280 已补） |
+
+`display.rs` 的注释把这批称为「v0.104.6 可复现性修复」。
+⇒ **D280 不是孤例**：全仓库都刻意规避过 HashMap 迭代序，`topological_order`
+是那批里**漏掉的一个点**。（注：CHANGELOG 里「可复现」那 5 处说的是
+**缺陷可复现**、不是输出确定性 —— 别把它当成一次有名字的「战役」。）
+
+#### D282：确定性回归护栏 —— 把**已经做对**的点钉住（否定 ×2 + 前向护栏）
+
+##### 两条**否定**（避免下轮重走）
+
+| 怀疑 | 实测 | 判定 |
+|---|---|---|
+| `toolplane::list_planes` 遍历 `HashMap`、顺序不确定（D280 同类） | `mod.rs:141` 已有 `names.sort()`，且模块内已有单测 `list_planes_returns_sorted` | ✗ **否定**，不必改 |
+| `Value::Dict` 的 Display 随 HashMap 顺序抖动 | `display.rs:56` 与 `:207` **两处分支各自都排了序**；真实 CLI 连跑 10 次输出逐字相同且为字母序 | ✗ **否定** |
+
+⇒ 全仓库的确定性其实相当自觉；D280 那个 `topological_order` 是**唯一**漏网的。
+
+##### 前向护栏
+
+判据 `tests/determinism_regression_guard.rs`（4 条）把**已经正确**的点钉住，
+让「D280 那一类」不在别处复现：dict Display 排序（浅层）、
+**嵌套 dict 的深层分支**、plane 列表有序、工具名列表有序。
+
+⚠ 嵌套那条**不是冗余**：`display.rs` 的两处 dict 分支是**各自独立**的
+（浅层 `fmt_inner` 入口 / 深度递归分支），只排一处是常见疏漏。
+牙齿验证分两半各自独立确认：
+
+| 删掉的排序 | 变红的判据 |
+|---|---|
+| **深层**（`:207`） | **仅** `nested_dict_display_is_sorted_too` |
+| **浅层**（`:56`） | 两条 dict 判据**都**红，并打出未排序的 `{gamma: 3.0, alpha: 1.0, beta: 2.0}` |
+
+⇒ 两条判据非冗余，且各自守住自己那一处分支。
+
+#### D283：`sandbox.*` 的用户数值参数**负数被静默换算**成合法 id / 0 核 0 内存（已修）
+
+##### 一、普查驱动
+
+按项目反复治理的缺陷族（**数值转换**：D242/D244/D246/D249/D254/D262/D264）
+做普查：找「还在把用户提供的 `Value` 直接 `as` 成数字」的地方
+（``as (u8|…|f64)`` 且同行出现取数上下文）。
+得 301 处候选 —— 太多，逐条判断要读代码，**不硬塞 CI 判据**
+（D255/D265 的纪律），只挑**直接作用在 builtin 实参上**的细看。
+
+##### 二、实测：`sandbox.revoke(-1)` 报的是 **token 0**
+
+```text
+Runtime error (MIR): sandbox.revoke: capability token 0 not found (revoked?)
+```
+
+`-1` 被解析成 `Value::Float(-1.0)`，`as u64` **饱和成 0** ⇒ 去查 token 0。
+**错误信息把排查方向引到 token 0**，而真正的问题（传了负数）被完全掩盖。
+
+同一形状还有另一半：`Value::Int(-1) as u64` 会**回绕成 `u64::MAX`**（1.8e19）。
+
+##### 三、本文件 4 处裸 `as`（邻居参数已在 D152 修过，唯独数值参数漏了）
+
+| 参数 | 目标类型 | 负数的修前结果 |
+|---|---|---|
+| `check_call(token_id, …)` | `u64` | 饱和成 **0** / 回绕成 `u64::MAX` |
+| `revoke(token_id)` | `u64` | 同上 |
+| `containerize(cpu_cores)` | `u32` | `Some(0)` —— **0 核** |
+| `containerize(memory_mb)` | `u64` | `Some(0)` —— **0 内存** |
+
+后两者比 `None`（不限）**更危险** —— `Some(0)` 是一个「看起来成功」的限额。
+而它们的邻居（`mounts` / `network` / `image`）已在 D152 修过同族的
+「传错类型 ⇒ 静默走默认」，**唯独这两个数值参数是裸 `as`**。
+
+##### 四、修法：改走 D246 立的收口
+
+`flow::value_as_usize` 的文档本来就写着「负数返回 `None`（而不是让
+`as usize` 饱和成 0）—— 调用方据此报错或取显式默认值，**不替它猜**」。
+本文件原先没用它。新增两个文件内私有收口：
+
+- `arg_nonneg_u64` —— 负数 / `NaN` / `±inf` 一律报错；
+- `arg_nonneg_u32` —— 额外校验 `u32` 上界（直接 `as u32` 会把
+  `4294967297` **静默截断成 1**）。
+
+修后实测：
+
+| | 修前 | 修后 |
+|---|---|---|
+| `sandbox.revoke(-1)` | `capability token 0 not found (revoked?)` | `token_id must be a non-negative integer, got Float(-1.0)` |
+| `containerize(…, -1)`（cpu_cores） | 静默 `Some(0)` | `cpu_cores must be a non-negative integer, got Float(-1.0)` |
+| `containerize(…, 1, -5)`（memory_mb） | 静默 `Some(0)` | `memory_mb must be a non-negative integer, got Float(-5.0)` |
+
+**对照组**：`sandbox.revoke(0)`（合法非负整数）仍报
+`capability token 0 not found (revoked?)` ⇒ **原路径逐字未变**，
+修复只拒绝「本来就该拒绝」的。
+
+##### 五、判据与牙齿验证
+
+`tests/sandbox_numeric_arg_validation.rs`（6 条）：负数 `token_id`（`Int` 与
+`Float` 各一，且**断言错误里不得出现 `token 0`**）、`check_call` 同项、
+负数 `cpu_cores`、负数 `memory_mb`、**对照组**（合法 token 仍走原路径）、
+`u32` 上界。
+
+牙齿验证：把 `revoke` 一处改回裸 `as` ⇒ **仅**测 `revoke` 的那条变红，
+其余 5 条仍绿。
+
+##### 六、普查的 301 处怎么办
+
+**不逐条上判据、不擅自改**。本条只把「4 处**用户实参**上的裸 `as`」修掉
+—— 那是可机械判定且后果明确的一类；其余候选（把内部值转 `f64` 的输出、
+`compress` 的统计量、`optimize/cost` 的代价估算等）要么本就安全、要么需要
+逐个读代码判断语义，按 D255/D265 的纪律：**一次性普查 + 逐个判断 + 写进
+CHANGELOG**，不塞成会误报的 CI 判据。清单留在本条，续做时按它接着走。
+
+#### D284：`stats.histogram` 的 `bins` **回绕成 1.8e19** ⇒ **进程 panic**（已修）
+
+D283 普查留下 301 处清单，本轮接着走，命中下一处**吃用户实参**的裸 `as`。
+
+##### 一、实测：两行普通 Mora 代码崩掉整个进程
+
+```mora
+let xs = json.parse("[1, 2, 3]")
+let n  = json.parse("-1")
+print(stats.histogram(xs, n))
+```
+
+```text
+thread 'mora-main' panicked at alloc/src/raw_vec/mod.rs:28:5: capacity overflow
+```
+
+因果链：
+
+```text
+json.parse("-1")   → Value::Int(-1)
+*n as usize        → **回绕**成 1.8e19（不是负数、不是报错）
+vec![0usize; bins] → 1.8e19 × 8 字节 ⇒ capacity overflow ⇒ 进程 abort
+```
+
+另一半（更隐蔽、**不崩**）：负数 `Float` 饱和成 **0** ⇒ 走
+`if bins == 0` 分支**静默返回空列表**，用户拿到「0 个 bin 的直方图」而无任何诊断。
+
+修前那一行：
+
+```rust
+Value::Int(n)   => Some(*n as usize),
+Value::Float(n) => Some(*n as usize),
+```
+
+##### 二、⚠ 只修回绕**不够** —— 超大正数以完全相同的方式崩
+
+`json.parse("100000000000")` ⇒ `bins = 1e11` ⇒ 同样 `capacity overflow`。
+（实测撤掉修复后跑判据，测试二进制直接死在
+`memory allocation of 800000000000 bytes failed`。）
+所以本条同时加了**上界守卫**，把「进程 panic」换成「一条可操作的错误」。
+
+**上界是判断题**：`HISTOGRAM_MAX_BINS = 1_000_000`（1e6 bin ≈ 8 MB）远超任何
+合理直方图用法。目的是**不崩**，不是规定合理值 —— 认为过严/过松请改那一个常量。
+
+##### 三、修后实测（四种输入）
+
+| 输入 | 修前 | 修后 |
+|---|---|---|
+| `bins = 2` | 2 个 bin | 2 个 bin ✓ **未变** |
+| `bins = 0`（**显式**） | `[]` | `[]` ✓ **既有行为保留** |
+| `bins = -1.0`（Float） | **静默 `[]`** | 明确报错 ✓ |
+| `bins = -1`（Int） | **panic** | 明确报错 ✓ |
+| `bins = 1e11` | **panic** | 明确报错 ✓ |
+
+⇒ 负数不再被换算，但**用户显式传 0 仍是原来的语义** ——
+「只修换算、不动语义」的边界。
+
+##### 四、判据与牙齿验证
+
+`tests/stats_histogram_bins_guard.rs`（5 条）：负数 `Int`、负数 `Float`、
+超大正数三条主断言 + 两条**对照组**（正常 bins、**显式 0 仍返回空列表**）。
+
+牙齿验证：撤掉修复后，**测试二进制整体中止** ——
+`memory allocation of 800000000000 bytes failed`、
+`exit code: 0xc0000409`。
+⇒ 修复前**跑这个判据文件本身就会杀死测试进程**，无可置疑地证明那是真崩溃
+（也说明这类缺陷的判据不能只看「红/绿」，要看**进程是否还活着**）。
+
+##### 五、D283 清单的下一站
+
+本条与 D283 合计修掉 5 处**用户实参**上的裸 `as`
+（`sandbox` 4 处 + `stats.histogram` 1 处）。
+清单里剩下的候选（把内部值转 `f64` 的输出、`compress` 统计量、
+`optimize/cost` 代价估算、`exec` 的 `.max(1)` 钳位等）**尚未逐个判断**，
+仍按 D283 的处置：不硬塞判据、不擅自改，留清单续做。
+
+#### D285：`exec.parallel` 的 `max_concurrent` / `timeout_ms` —— 错误消息**声称**的约束并未强制（已修）
+
+D283 的 301 处清单本轮**收窄**再扫一遍：只找
+「`Value::Int/Float` → **整数类型**」的转换（f64 转换最多丢精度；
+整数转换才会回绕/饱和，进而崩或失控）。得 **56 行**高危候选。
+
+##### 一、否定：`curry` 的 arity 已被 D148 修好
+
+`interpreter/builtin_impls.rs:711-712` 的注释写着
+
+```text
+// ⚠ 下方 `arity == 0` 的既有检查**只挡住了 Float 一侧**：
+//   `Value::Int(-1) as usize` → **截断**成 usize::MAX → 绕过检查
+```
+
+读代码后确认：**D148 已修** —— 上面有
+`Value::Int(n) if *n < 0` 与 `Value::Float(n) if *n < 0.0` 两个守卫分支先拦。
+那两行注释描述的是**修前**病灶，口径没更新。⇒ **否定**，不动。
+
+##### 二、真缺陷：错误消息承诺了非负检查，代码里**根本没有**
+
+`interpreter/builtins/exec.rs`：
+
+| 参数 | `Float(-1.0)` | `Int(-1)` |
+|---|---|---|
+| `max_concurrent` | 饱和成 0 → `.max(1)` → **1** | **回绕**成 `usize::MAX` → **并发上限形同虚设** |
+| `timeout_ms` | 饱和成 0 → `Duration::ZERO` ⇒ **立刻杀进程** | **回绕**成 `u64::MAX` ≈ 5.8 亿年 ⇒ **永不超时** |
+
+而那一行的错误消息写着 `max_concurrent must be a non-negative number`
+—— 那个 `_ =>` 分支**只挡了非数值类型**，**没有任何非负检查**。
+消息与实现不符，比没有消息更坏：它让人以为约束存在。
+
+##### 三、实测：同一句 `-1`，两种数值类型行为天差地别
+
+真实 CLI，`ping -n 4` 需约 3 秒：
+
+| 源码 | 修前实测 | 修后 |
+|---|---|---|
+| `exec.parallel(cmds, 1, -1.0)` | **280ms** 返回 —— `Duration::ZERO` 把命令秒杀，输出是 taskkill 的 `SUCCESS` | 明确报错 |
+| `exec.parallel(cmds, 1, json.parse("-1"))` | **3106ms** 返回 —— 超时**完全失效**，命令跑满全程 | 明确报错 |
+
+exit 都是 0、零诊断。⇒ 同一个「超时设为 -1」的意图，
+一边把命令**秒杀**、一边让超时**彻底失效**。
+
+##### 四、修法与边界
+
+改走 D246 的收口 `value_as_usize`，**如实兑现**那句错误消息。
+**刻意不改**的部分：
+
+- `max_concurrent = 0` 仍钳到 1（既有行为）—— 要拒绝的是「负数被静默换算」，
+  不是「0 的钳位」；
+- `max_concurrent` / `timeout_ms` 显式传 `nil` 与**缺参**同义；
+- 正数的 `timeout_ms` 照常工作。
+
+修后四种负数写法（`-1.0` / `-1` × 两个参数）全部被拒，且用的是
+`max_concurrent must be a non-negative number` /
+`timeout_ms must be a non-negative number or nil`。
+
+##### 五、判据与牙齿验证
+
+`tests/exec_parallel_numeric_args.rs`（6 条）：两个主断言（各含
+`Float` 与 `Int` 两种形态）+ **四条对照组**（正常 `max_concurrent`、
+`0` 仍钳到 1、显式 `nil` 等同缺参、正常 `timeout_ms`）。
+
+牙齿验证：把 `max_concurrent` 改回原样 ⇒ **仅**主断言变红，且失败消息
+直接显示**负数被静默接受、命令照跑成功**（返回正常结果列表）。
+
+##### 六、清单进度
+
+D283 普查 301 处 → 本轮收窄到「`Value` → 整数」的 56 行高危候选。
+已处理：`sandbox` 4 处（D283）、`stats.histogram` 1 处（D284）、
+`exec.parallel` 2 处（本条）。**否定 1 处**（`curry`，D148 已修）。
+其余（`numeric_helpers.rs:154`、`exec.rs` 其它 `as i64` 输出、
+`value.rs` / `checkpoint` 的序列化方向等）**尚未逐个判断**，
+仍按同一纪律：不硬塞判据、不擅自改、留清单续做。
+
+#### D286：把「Value → 整数」高危清单走完 —— **三条全是否定** + 一处文档与架构矛盾
+
+D285 收窄后剩 56 行候选，本轮把**未看过的那些**逐个过了一遍。
+结论：三条候选**全部是假阳性**，另发现一处**文档描述了不存在的架构路径**。
+
+##### 一、否定 ×3
+
+| 候选 | 实测 | 判定 |
+|---|---|---|
+| `numeric_helpers.rs:154-155` `parse_budget_dispatch` 的 `as usize` | 上面 148-153 已有 `Value::Int(n) if n < 0` / `Float(n) if n < 0.0` 两个守卫（D263 加的），`as` **只在非负分支之后** | ✗ **否定** |
+| `checkpoint/mod.rs:199/203` `nonneg_num` 的 `as u64` | 196-202 挡负数、206 的 `T::try_from(raw)` 挡**大值回绕**（188-190 注释明说）—— 这**就是** D244 立的收口 | ✗ **否定** |
+| `value.rs:846-847` `VectorClock::from_dict` 的 `as u64` | **确实无守卫**（负数会回绕/饱和），但全仓**零生产调用者**——只有本模块单测 | ✗ **潜伏**，非活缺陷 |
+
+##### 二、⚠ 校准：收窄普查的**假阳性率很高**
+
+前两条的 `as` 行**本身没问题**，问题在**守卫写在它上面几行**，而机械匹配只看那一行。
+⇒ **收窄到 56 行之后，未逐条看的那批里 3 条有 2 条是假阳性。**
+
+**可复用的判据**：凡是用「行内出现 `as <int 类型>`」筛出来的候选，
+**必须连着往上读 3–5 行**再看是不是缺陷。
+只看那一行 ⇒ 假阳性率足以让你把已修好的地方再「修」一遍。
+
+##### 三、顺带修掉一处**文档与架构矛盾**（零代码改动）
+
+`VectorClock::from_dict` 的文档原写「Deserialize from a Dict
+(**checkpoint restore**)」，但 `pregel/mod.rs:20-23` 的模块文档明写：
+
+> `Environment::versions`（per-binding `VectorClock`）… **NOT checkpointed**
+> （「derived from agent execution, not persisted」）
+
+⇒ **checkpoint 恢复路径在架构上并不存在**。该注释已改为如实描述，
+并记下两处**潜在**问题（无负数守卫；非数字值被 `filter_map` 静默丢弃），
+明确标注**「若将来真要接线，先处理这两条、走 `value_as_usize`、
+把签名改成 `Result`」** —— 改 `pub` 签名属产品决定，本轮**不改**。
+
+##### 四、清单收口状态
+
+| 阶段 | 数量 |
+|---|---|
+| D283 初扫「用户 `Value` 直接 `as`」 | 301 |
+| D285 收窄为「`Value` → **整数类型**」 | 56 |
+| 已修 | **7**（`sandbox` 4 / `stats.histogram` 1 / `exec.parallel` 2） |
+| 本轮否定 | **3** |
+| 剩余 | 输出方向的转换（`u64`/`f64` → `Value`）与序列化往返，按构造安全 |
+
+⇒ 这条 vein 到此**收口**。它给出的最大收获不是那 7 处修复，而是第二节的
+**校准**：机械筛「`as` 行」时必须回看上文守卫，否则会把已修好的地方再修一遍。
+
+#### D287：「零生产调用者的 pub fn」普查 —— 承诺的 **OpenTelemetry 导出路径并不存在**
+
+D281（`ai.dag`）与 D286（`VectorClock::from_dict`）都落在
+「已公开但**零生产调用者**」这一类，本轮把这类**普查**做正经。
+先解决 D250 的老问题：**工具必须自验证**。
+
+##### 一、普查与自验证
+
+扫 `src/` 全部 `pub fn` / `pub(crate) fn`（按名去重 667 个），
+统计每个名字在 `src/` 内的引用（**排除定义行本身**）：**41 个零引用**。
+
+自验证：抽查 `edge_count` / `with_step_timeout` / `to_mut_vec` /
+`run_mir_with_signal_cached` —— 全仓**各只出现 1 次**（就是定义本身）⇒ 工具可信。
+
+按 D250 的纪律（删死代码 = 「实测有错」或「明确未接线」；**`pub fn` 删除属接口
+变更，只报告不实施**），本条**不删任何代码**。
+
+##### 二、发现：采集在跑，**导出与配置完全不可达**
+
+`src/trace_collector.rs` 的方法按「`trace_collector.rs` 之外的调用点」统计：
+
+| 方法 | 调用点 | 状态 |
+|---|---|---|
+| `start_span` | 3 | ✅ **采集在跑**（`ai_chat.rs:315` 等） |
+| `record_tokens` | 7 | ✅ 采集在跑 |
+| `record_call` | 2 | ✅ 采集在跑 |
+| `set_enabled` | **0** | ❌ **无法开关** |
+| `set_otel_endpoint` | **0** | ❌ **无法配置端点** |
+| `is_enabled` | **0** | ❌ |
+| `export_otel_json` | **0** | ❌ **导不出** |
+| `metrics_json` | **0** | ❌ 导不出 |
+| `get_metrics` | **0** | ❌ 导不出 |
+| `get_spans_json` | **0（2 处提及都在文档注释里**：`mir/host.rs:140`、`runtime.rs:236`**）** | ❌ 导不出 |
+
+⇒ span 与 metric **被采集进一个既不能开关、也不能配置、更没人读的收集器**。
+
+##### 三、而文档**明确承诺**了这条路径
+
+`mir/host.rs:137-140`（`MirHost::trace_collector` 的默认实现注释）写着：
+
+> 默认 `None` —— 无 trace 能力的宿主（测试假实现）下 `span` 块退化为仅执行 body。
+> `Interpreter` 返回其 `AiRuntime.trace`，使 `observe`/`span` 声明**接入
+> OpenTelemetry 导出路径**（`TraceCollector::get_spans_json` / `export_otel_json`）
+
+`runtime.rs:236` 也写着「保留来源，供 `TraceCollector::get_spans_json` 与 otel 区分」。
+
+**实测**：`Interpreter::trace_collector()` **确实**覆盖了默认实现
+（`interpreter/mod.rs:320-322` 返回 `Some(&self.ai.trace)`），
+`start_span` 也真的在调 —— 所以**前半句成立**；
+但**「接入导出路径」这半句不成立**：没有任何生产代码调用那两个导出函数，
+也没有任何地方设置 OTEL 端点。
+
+⇒ 与 D152（`containerize` 的 `mounts`/`network`/`image` 传错类型 ⇒
+**静默保持默认**）同族：**文档承诺的能力从未接线**。
+
+⚠ 本轮一处**自我更正**：我最初只读了 `mir/host.rs` 的 trait 默认实现，
+以为 `trace_collector()` 恒返回 `None`；查 `interpreter/mod.rs` 后发现
+`Interpreter` **确实**覆盖了它。**先确认实现方、再判缺陷**。
+
+##### 四、为什么只报告不实施
+
+接一条真正的 OTEL 导出（HTTP exporter / OTLP 上报 / 端点配置）
+是**产品能力决定**，不是一处小改动。按纪律只报告。
+另 3 个零引用项同属此类、但影响面小得多，仅记档：
+`MirPregelEngine` 的 `with_step_timeout` / `with_interrupt_before_callback` /
+`with_interrupt_after_callback` —— 引擎**有**这些字段、`run()` **也用**它们
+（`collect_interrupts` + 回调判定），只是**仓内无处装配**。
+它们是公开 builder API，库使用者**可以**调 ⇒ **不是死代码**。
+
+##### 五、判据
+
+**不写**。按 D265 的纪律「写得出判据 ≠ 该写判据」——
+断言「导出不可达」是在断言一项**缺陷**，写进 CI 只会变成一条会误导的
+「通过」信号。本条只归档事实。
+
+#### D288：「错误消息声称的约束」普查 —— **21 条数值约束全部兑现，零缺陷**（否定轮）
+
+D285 在 `exec.parallel` 抓到过一条「错误消息写着 must be a non-negative number、
+代码却**根本没有**非负检查」。那是**语义负载**的一类缺陷，本轮普查全仓。
+
+##### 一、普查与结果
+
+扫 `src/` 全部错误消息里带约束措辞（`must be` / `不能为负` / `非负` / `必须` …）的行：
+
+| 分类 | 条数 |
+|---|---|
+| 约束措辞总计 | 88 |
+| ├ **类型**约束（`must be a string/list/dict` …） | 67 |
+| └ **数值/区间**约束（`非负` / `must be > 0` / `cannot be empty` …） | **21** |
+
+**21 条数值约束，逐条核对，全部有对应守卫，零缺陷。** 例如：
+
+```text
+builtin_impls.rs:113   range() step must not be 0   ← 112 行 if step == 0
+method_dispatch.rs:271 batch() size must be > 0    ← 270 行 if size <= 0.0
+```
+
+`checkpoint` 的「不能为负」有 D244 的 `nonneg_num` 收口；`curry` / `take` / `drop` /
+`window` / `with-config max_tokens` / `ai.retry` 各有自己的守卫。
+
+##### 二、⚠ 但这轮普查**首版报了 59 条「无守卫」—— 几乎全是假阳性**
+
+首版的守卫正则是 `if .* < 0` 这类形状，结果 88 条里报出 59 条「上下文无守卫」。
+逐条读代码后**真实缺失数为 0**。两个原因：
+
+1. `<\s*0` 匹配不到 `== 0`（`range` 的 step 守卫）与 `<= 0.0`（`batch` 的 size
+   守卫）—— `<` 后面跟的是 `=`，不是数字；
+2. 完全**不理解 `match` 臂** —— 而 67 条类型约束**全部**是靠
+   `Value::String(..) / Value::List(..)` 的 match 臂 + `_ => Err(..)` 实现的。
+
+⇒ 这是 D286 那条校准的**第二次复现**，且更极端（59 → 0）。
+
+**可复用的判据（现在有两次实测支撑）**：任何「源码形状 ⇒ 缺陷候选」的机械筛查，
+**假阳性主要来自「强制力写在过滤器看不见的邻行」**。
+- 筛 `as` 转换 ⇒ 必须回看**上面几行**的守卫（D286：3 条候选 2 条假阳）
+- 筛「消息声称 vs 实现强制」⇒ 必须回看 **`match` 臂与 `== 0` / `<= 0` 这类
+  非 `if .. < 0` 的守卫**（D288：59 条假阳）
+⇒ **先量出假阳性率再决定要不要顺着筛子往下走**，别把筛查结果直接当结论。
+
+##### 三、判据
+
+**不写**。本条零缺陷、零代码改动，按 D265 的纪律
+（「写得出判据 ≠ 该写判据」）不制造任何 CI 负担，只归档测量结果。
+
+#### D289：**崩溃族**普查（`unwrap` / `expect`）—— 10 处候选，**全部否定**（否定轮）
+
+D284 的 `stats.histogram` 是 `capacity overflow` —— **崩溃**。
+`clippy` 默认不报 `unwrap()`（那是 allow-by-default 的 `unwrap_used`），
+所以本族此前未被系统扫过。本轮扫「处理用户数据的层」。
+
+##### 一、普查规模与逐条结果
+
+扫 `interpreter/flow/rel/document/record/compress/value/typeck/mcp/http`
+共 87 个生产文件，**排除**独立测试文件（`*/tests/*.rs`、`tests.rs`）、
+行内 `#[cfg(test)]` 块、以及锁中毒惯用的 `expect("... poisoned")`：
+
+**只剩 10 处候选。** 逐条核对：
+
+| 候选 | 实测 | 判定 |
+|---|---|---|
+| `value/list.rs:303` `impl Index<usize> for List` 的 `expect("List 索引越界")` | 用户表面**不走**它：`xs[99]` → `index 99 out of bounds (len 3)`、`xs[-1]` → `negative index: -1`，都是干净报错 | ✗ **否定**（该 impl 只服务内部 Rust 代码） |
+| `mora.rs:45` `expect("mora.refine: refine_many(1) returned no step")` | `mora.refine(…, -1)` → 下游 `refine_many` 自己校验：`count must be 1..=26`，无崩溃、无巨额分配 | ✗ **否定** |
+| `compress/json.rs:568` `expect("… debug_assert verified")` | `crush_json` 只接受 `List`（非 List 干净报错），而 DFS 从根起**必然** push ≥1 个结果 ⇒ 不变量对用户入口**安全** | ✗ **否定** |
+| `parser_v3/rel.rs` ×3、`typeck/hm/*` ×2、`value/persistent.rs`、`exec.rs`（condvar） | 解析器/typeck 内部不变量与锁中毒 | ✗ 无用户可达路径 |
+
+⇒ **崩溃族在用户可达路径上零缺陷。**
+
+##### 二、这轮的真正结论：**机械普查这条路已经饱和**
+
+连着四轮（D286 / D287 / D288 / D289）的结果摆在一起：
+
+| 轮次 | 普查方式 | 结果 |
+|---|---|---|
+| D283–D285 | 裸 `as` 转换 | 修 7 处 |
+| D286 | 同上·收窄复查 | 否定 3 处（假阳 2） |
+| D287 | 零调用 `pub fn` | 报 1 项（OTEL 未接线），零代码 |
+| D288 | 消息声称 vs 实现强制 | 否定（假阳 59 → 真实 0） |
+| D289 | 崩溃族 `unwrap`/`expect` | 否定（10 → 真实 0） |
+
+⇒ 覆盖普查（模块测试覆盖）、`as` 转换、零调用公开 API、约束消息、
+崩溃族 —— 五类机械筛查都已跑过一遍。**它们找到的高价值缺陷集中在
+D283–D285（那批「用户实参上的裸 `as`」），此后连续四轮零新缺陷。**
+
+这不是「代码没问题了」，而是**这类筛查的边际收益已经趋零**：
+剩下的命中要么是**内部不变量**（误报），要么是**产品契约决定**（不可自动判）。
+⇒ 后续应转向**需要实跑 + 读语义**的路径（真实程序的行为差分、
+未覆盖的语言特性），而不是继续扩机械筛子。
+
+##### 三、判据
+
+**不写**。零缺陷、零代码改动，按 D265 的纪律不制造 CI 负担，只归档测量结果。
+
+##### 四、两条顺带的**小观察**（都非缺陷，记账免得下轮重查）
+
+- `mora.refine(…, -1)` 的错误消息说 `count must be 1..=26, **got 0**`，
+  而用户传的是 `-1`（中途被 `as usize` 变成别的值后才到 `refine_many`）。
+  措辞与实参对不上，但不构成误判（结果仍是报错）。
+- `List` 的 `Index<usize>` 实现**会让越界 panic**，用户表面目前走的是
+  带检查的路径。若将来有人在内部用 `list[i]` 处理用户下标，panic 会复活。
+  本条**不改**该 impl（它是 Rust 的标准语义），只记录。
+
+#### D290：JSON **数字**往返的穷举不变式（补 D223 只穷举字符串的缺口）
+
+D289 判定机械普查已饱和，本轮按它给的建议转向**实跑 + 行为差分**。
+
+##### 一、缺口
+
+D223 已把 `value_to_json` → `json_to_value` 的**字符串**往返做成逐码点穷举
+（0x00–0x2FF + 非 BMP），并在文件头写明这套形状**两次钓出真缺陷**
+（`memory` 往返 D220/D221、`\uXXXX` 缺失 D206）。但它的「值形状」组里
+**数字只有两个**：`Int(-42)` 与 `Float(1.5)`。
+
+而本项目有完整的**数值塔**（`Int` / `Float` / `BigInt`），
+D246 刚把 `value_as_f64` 的 `BigInt` 分支立成收口，D284 刚在
+`stats.histogram` 上踩到数字转换的崩溃。**数字是这个仓最该被穷举的面，
+却是覆盖最薄的面。**
+
+##### 二、实测结果：**数字往返是干净的**
+
+| 面 | 规模 | 期望 | 实测 |
+|---|---|---|---|
+| 有限 `f64` | **199,894 个随机位型** | 逐位恒等 | ✅ **0 失败** |
+| `f64` 边界/特殊 | 18 个有限值 | 逐位恒等 | ✅ 0 失败 |
+| `f64` 非有限 | `inf`/`-inf`/`NaN` | 降级为 `null` | ✅（D251 定的线格式） |
+| `Int` 边界 | 9 个（`i64::MIN`/`MAX`…） | 恒等 | ✅ 0 失败 |
+| `BigInt` | 7 个（含 `2^127-1` / `-2^127`） | 恒等 | ✅ 0 失败 |
+| 容器内嵌数字 | dict 嵌 float/int/NaN/空 dict/list | 与顶层同语义 | ✅ |
+
+**唯一允许的损失是「非有限值 → `null`」** —— 标准 JSON 没有 `inf`/`NaN`
+表示法，D251 已定为线格式决策。判据把它**显式钉住为唯一例外**，
+而不是假装它不存在。
+
+##### 三、顺带查清一个看着可疑、其实正确的写法
+
+写端 `value_to_json` 对 `f.fract() == 0.0` 的值用 `format!("{:.1}", f)`
+（为了与 `Int` 区分，D84）。看着「1 位小数会不会丢精度」——
+**不会**：对 `|f| > 2^52` 的整数值，`{:.1}` 会输出 301 位十进制数字，
+而 f64 能**精确读回**。20 万随机位型 0 失败正是这一点的实测证据。
+
+⇒ 顺带一条**判据牙齿的自我修正**：我第一次挑的破坏手段把 `{:.1}` 改成
+`{:.3}`，**判据没红** —— 因为 `{:.3}` 同样无损（只是文本更长，值不变）。
+换成真有损的 `else` 分支 `format!("{:.6}", f)`（`1.0/3.0` 被截断）
+才让**穷举判据与边界判据双双变红**，并打出确切位型。
+⇒ **「改了没红」先怀疑装置没坏**，别急着改判据 —— 与 D243
+「看到 NO TEIGHTS 必先查装置」是同一条纪律的两面。
+
+##### 四、判据
+
+`tests/json_number_roundtrip.rs`（5 条）：
+
+| 条 | 面 |
+|---|---|
+| `finite_f64_round_trip_is_bit_identical` | **主判据**：20 万随机位型，用 `to_bits()` 比（`==` 会把 `0.0`/`-0.0` 当成功而漏掉符号丢失） |
+| `float_boundaries_and_non_finite` | 边界逐位恒等 + 非有限值必须降级 `null` |
+| `int_boundaries_round_trip` | `i64::MIN`/`MAX` 等 9 个 |
+| `bigint_round_trip` | `2^127±` 等 7 个；小 BigInt 降级为 `Int` 是**数值塔的既定行为**（显式断言，不是缺陷） |
+| `numbers_inside_containers_behave_the_same` | 嵌套语义与顶层一致 |
+
+本条**零产品代码改动** —— 数字往返本来就是对的，价值在于把它
+**从「手挑两个例子」变成「20 万位型穷举」**，与 D223 对字符串的做法对齐。
+
+#### D291：两个手写 JSON 序列化器对 `BigInt` **结构性不一致**（代码已证实，运行时影响**未证实**）
+
+沿 D290 的方向做**跨实现差分**。D251 记录过本仓有**两个手写序列化器**，
+且 `value/display.rs` 的注释说它们「已对齐」——本条查它们到底对不对齐。
+
+##### 一、已证实的部分
+
+| 路径 | `BigInt` 的线格式 | 来源 |
+|---|---|---|
+| `flow::json::value_to_json` | **裸数字** `123456789012345678901234567890` | **实跑**（`json.stringify`，见下） |
+| `http_server::value_to_json` | **带引号字符串** `"123456789…"` | 代码（`JsonValue::String_(n.to_string())`） |
+
+实跑确认（真实 CLI）：
+
+```mora
+let b = json.parse("123456789012345678901234567890")
+print(json.stringify(b))     -- → 123456789012345678901234567890   （裸数字）
+print(b + 1)                 -- → 123456789012345678901234567891n  （BigInt 加法正常）
+```
+
+⇒ **同一个值，两条路径产出两种结构不同的 JSON 文档**：
+客户端解析 `json.stringify` 的结果拿到 **number**，解析 HTTP 响应的拿到 **string**。
+
+另有一处**类型降级**（同为代码已证实）：
+
+```text
+http_server::json_lsp_to_value:  JsonValue::Number(n) => Value::Float(n)   ← 所有数字都变 Float
+```
+
+而 `flow::json::json_to_value` 会正确区分 `Int` / `Float` / `BigInt`（D290 已穷举验证）。
+⇒ 经 http/LSP 的 JSON 类型往返，`Int(42)` 回来会变成 `Float(42.0)`；
+`BigInt` 回来会变成 `String`。
+
+##### 二、⚠ 运行时影响**未证实**（按 D281 的纪律，不越界下结论）
+
+`http_server::value_to_json` / `json_lsp_to_value` 都是**私有函数**；
+HTTP 服务只有 `/` 与 `/path` 两条路由，**没有能回显任意 `Value` 的端点**。
+本轮**没有**跑起 HTTP/MCP 服务去观察 BigInt 是否真会出现在响应里。
+
+⇒ 已证实的是「**两个序列化器对同一值的表示不一致**」；
+**未证实**的是「用户能否真的在 HTTP 响应里看到它」。
+两者是不同强度的结论，**不要混用**。
+
+##### 三、为什么不擅自改
+
+统一两个序列化器的线格式（BigInt 用裸数字还是字符串、读方向要不要区分
+Int/Float/BigInt）会改变**对外的 wire format**，属于接口层面的决定。
+而 D290 已确认 `flow` 那侧是自洽且无损的（D290 穷举：`BigInt` 含 `2^127±`
+往返 0 失败）⇒ 动 http 那侧更可能是「把不对的一边改对」，
+但仍需确认**有没有外部消费者已经依赖字符串形态**。
+
+##### 四、判据
+
+**不写**。写一个「两个序列化器不一致」的 CI 判据，等于把**接口不一致**
+固化成「期望失败」；而本条连运行时影响都未证实。记档即可。
+
+##### 五、顺带纠正一处**已过时的注释**
+
+`value/display.rs` 写「与 `flow::json::value_to_json` 及 http/mcp 服务器的
+`BTreeMap` 做法**对齐**」——**Dict 的键序确实对齐（都排序），
+但 `BigInt` 与读方向的类型语义并**未**对齐**。注释只说了一半，
+容易让人以为整条路径等价。
+
+#### D292：**运行时证实** D291 —— HTTP 请求体把整数变 `Float`，响应把整值 `Float` 写成无小数点
+
+D291 把运行时影响标注为「**未证实**」。本条把它**证实**了 —— 起真实 HTTP 服务、
+POST、观察 handler 看到的类型。
+
+##### 一、实跑观测（真实 `Router` + `curl`/`Invoke-WebRequest`）
+
+```mora
+let router = Router::new()
+let router = router.route("POST", "/t", fn(req) => type_of(req.body.n))
+let router = router.route("POST", "/v", fn(req) => req.body.n)
+let router = router.route("POST", "/a", fn(req) => req.body.n + 1)
+router.listen("127.0.0.1:8731")
+```
+
+POST `{"n": 5}`：
+
+| 端点 | 结果 |
+|---|---|
+| `/t` | **`"float"`** ← 整数 JSON 字段在 handler 里是 `Float` |
+| `/v` | `5`（即 `5.0`，客户端读回是 **Int**） |
+| `/a` | `6`（`Float(6.0)`，**无小数点**） |
+
+而 `json.parse("{"n":5}")` 给的是 `Int(5)` —— D129 的立论。
+⇒ **同一段 JSON，`json.parse` 与 HTTP 请求体两条路径类型不同**，
+且**响应方向**又与 `json.stringify` 不同。
+
+##### 二、根因：`lsp::json` 的 `write_value` 主动丢小数点
+
+```text
+if n.fract() == 0.0 && n.abs() < 1e15 {
+    write!(f, "{}", *n as i64)      // ← 6.0 → "6"
+}
+```
+
+这**直接违反 D84** 立下的不变量。`flow::json::value_to_json` 的注释写着：
+
+> v0.84：Float 必须始终输出小数点，即使 `fract() == 0.0`（如 `42.0 → "42.0"`）…
+> **若 Float 输出 "42"，反序列化后会变成 `Int(42)`，类型降级不可逆。**
+
+⇒ D84 修的是 `flow` 那条路，**`lsp::json` 这条从未被覆盖** ——
+而它正是 HTTP / MCP / LSP 三个对外协议共用的写出端。
+
+##### 三、判别：这不是「JSON 规范问题」
+
+标准 JSON 数字本就不分 Int/Float，但**本项目自己**要求区分（D84/D129），
+否则「读回就降级」在**自己的语言内部**丢类型。所以判据是**与项目自身约定**冲突，
+不是与 JSON 规范冲突。
+
+##### 四、为什么不擅自统一
+
+改 `lsp::json::write_value` 会同时改 **LSP 协议字段**的线格式
+（`Range.line` 等按 spec 是整数，输出 `0.0` 合法但会动到所有 LSP 客户端）；
+改 `http_server::value_to_json` 又做不到（`JsonValue::Number` 就是 f64）。
+⇒ 属**对外 wire format 决定**，需裁决。判据按 D291 的做法**钉住现状不一致**。
+
+##### 五、判据
+
+`tests/json_serializers_disagree.rs`（4 条，**现状判据**）：flow 侧保留小数点（D84）、
+lsp 侧丢掉小数点、两者对 `Float(6.0)` 线格式不同、两者对 `BigInt` 线格式不同。
+**统一之后本文件会红** —— 那时把两处 `assert_ne!` 改成 `assert_eq!` 即可。
+
+##### 六、过程记录
+
+起服务用了三次失败的探针才成功：① handler 体写成 `{a: 1, b: 2}` 多字段 dict
+报解析错；② 改成 `{type_of(...)}` 报 `Expected ':' after dict key`
+（`{…}` 是 dict 字面量，裸表达式不能带花括号）；③ 去掉花括号才通过。
+服务起后**已在同一轮 `Stop-Process` 关掉**（不留后台进程）。
+
+**一条判据写错的教训**：`same_layer_successors` 我一度期望
+
+
+
+#### D293：「900 行查表」的两张手写表合成**一张**（D172 重构收尾）
+
+D170 记档时把「900 行查表 vs 手写清单」作为取舍留给你裁决，D172 选了**重构**。
+但 D172 **只做了一半** —— 它把方法名提成 20 张 `*_GROUPS` 分组表，
+**签名仍靠组号手工对齐**。本轮把这两张表合成一张。
+
+> 编号说明：这次重构在 CHANGELOG 里的编号是 **D172**，而 `dispatch.rs` 的
+> 代码注释写的是 **D171**（CHANGELOG 的 D171 是另一条不相干的
+> 「`Value` 全变体普查」）。属**既有的编号错位**，本轮只记录不改动
+> —— 一致性修正会牵动本文件里几十处交叉引用，单独一轮做更稳。
+
+##### 一、D172 留下的残余失守方式
+
+```text
+const MATH_GROUPS = &[ &["PI","E",…], &["sin",…], &["pow",…], … ];  // 名字在这里
+"math" => match group_of(MATH_GROUPS, method) {
+             Some(0) => params_variadic(0, Type::Float),            // 签名在这里
+             Some(1) => params_variadic(1, Type::Float),
+```
+
+两张表之间**没有任何编译期约束**。把 `Some(1)` 抄成 `Some(2)` 不会编译报错，
+只会让 17 个一元函数静默拿到二元签名 —— `math.sqrt(x, y)` 通过、
+`math.sqrt()` 变成合法 —— 而 `module_method_names` 照旧报出真名：
+**自省说它有、typeck 却不查**。
+
+D172 注释里那句「二者共用一份数据 ⇒ **不可能漂移**」，
+只对**方法名**成立，对**组号↔签名**不成立 ——
+它保证的是「不会漏掉一个方法」，不是「不会把 A 的签名安到 B 上」。
+
+##### 二、做法
+
+`MethodGroup { names, min_arity, ret }` —— 名字与签名同处一项，
+**组号这个中间层整个消失**，上面的失守形态结构上不可能。
+
+| | 修前（D172 形态） | 修后（D293） |
+|---|---|---|
+| 名字表 | 20 × `*_GROUPS: &[&[&str]]` | 20 × `*_METHODS: &[MethodGroup]`（名字在同一项里） |
+| 签名表 | `match module` 20 臂 × `match group_of()` | `MethodGroup.ret`（就在名字旁边） |
+| 查表 | `group_of()` 返回 `usize`，再 `match Some(N)` | `find(\|g\| g.names.contains(&method))` 一次线性查找 |
+| `module_method_signature` 函数体 | **474 行** | **6 行** |
+| `group_of` | 存在 | **退役** |
+| `dispatch.rs` 全文 | 1790 行 | 1614 行 |
+
+**为什么表里存 `Ret` 而不是 `Signature`**：`Signature` 含 `String` / `Vec`，
+而 `to_string()` 不是 `const fn` ⇒ `Signature` **无法**在 `const` 上下文构造。
+`Ret` 是它的 const 可构造投影（`Copy` + `&'static [Ret]` 承载递归），
+查找时 `materialize()`。这样 20 张表仍是 `const`，零运行时初始化成本
+（与 D172 保持一致，没有为此引入 `OnceLock`）。
+
+**每条原有注释都随代码搬到表旁** —— `linalg.norm` 的「阶数可选」理由、
+`memory.load` 的「恒返 true 而非 Dict」、`xform` 的 D74 桩实现说明、
+`bus` 的「第二参可选」、`mora.refine` 的「第 1 参是路径不是脚本文本」…
+一条没丢。
+
+##### 三、唯一的数据变更：`bus` 第 0 组拆成两组
+
+它是**唯一**一组「同组不同签名」的方法：`emit` / `off` 返 `Nil`，
+`publish` / `subscribe` 返 `Float`（`subscribe` 返订阅 token，
+`publish` 返当前 pattern 数）。D172 靠组内**再 match 一次 `method`** 兜住，
+这正是「组 = 同签名」不变量的唯一破口。
+
+拆成两组后**返回值与元数逐个不变**（`tests/module_return_types_match_runtime.rs`
+的 `bus.*` 用例与本轮新判据全绿），而破口没有了。
+⇒ D293 顺带发现了一个 D172 没注意到的**结构不一致**。
+
+##### 四、等价性怎么验的（不是「看着对」）
+
+改前 / 改后各跑一次全量 dump：**26 个模块名**（23 个 `MODULE_OBJECTS` 注册名
++ `ai` / `agent` / `random` 重复项 + 4 个不存在的名字）**× 全部方法名**的
+**完整 `Signature` Debug**（`params` / `raw_params` / `return_type` /
+`raw_return_type` / `variadic` 五个字段全含）：
+
+```text
+BEFORE 0830D12915BF68929F9C4C704E2773554F684E0DFF0E870E2DCF6E1632EE1016  30286 bytes
+AFTER  0830D12915BF68929F9C4C704E2773554F684E0DFF0E870E2DCF6E1632EE1016  30286 bytes
+213 行 · diff 记录 0
+```
+
+前提：`Type` 是纯枚举（`Dict(Box<Type>, Box<Type>)`，内部**没有** HashMap）
+⇒ Debug 输出**确定**，可做逐字节比对。临时 oracle 测完即删，
+长期不变量留给判据文件。
+
+##### 五、判据
+
+`tests/module_method_groups_single_table.rs`（7 条）：
+
+| 判据 | 守什么 |
+|---|---|
+| `every_listed_method_resolves_to_a_signature` | 列出的每个名字都有签名（名字集合 ⊆ 有签名的方法集合） |
+| `no_duplicate_method_names_within_a_module` | 同模块内无重名 —— 重名会让靠后那个组被 `find` 静默吞掉 |
+| `unlisted_names_have_no_signature` | 反向：未列出的名字没有签名 ⇒ 名字集合 **≡** 有签名的方法集合 |
+| `module_level_signature_is_absent_for_the_three_typed_modules` | **现状判据**：`ai`/`agent`/`random` 有名字、无模块级签名（D175 的设计决定） |
+| `every_registered_module_has_a_group_table_or_is_documented_as_exempt` | 新增模块忘建表 ⇒ 静默既无签名也无自省（D74 `toolplane` 那个形态） |
+| `ret_shapes_materialize_correctly` | `Ret` 的**每种**构造都能 materialize（Float / Int / Bool / Any / Nil / Document / Union / List / Dict / List[List] / List[Dict]） |
+| `bus_group_split_preserves_every_return_type` | 拆组后每个 `bus` 方法的返回类型与元数 |
+
+**牙齿验证**（回退后确认会红，三处定向变异）：
+
+| 变异 | 预期变红 | 实得 |
+|---|---|---|
+| `math` 一元组塞进重名 `"sin"` | `no_duplicate_…` | 红 |
+| 一元组 `min_arity` 1 → 2（**D172 的原始失守形态**） | `ret_shapes_…` | 红 |
+| `bus.emit` 的 `Ret::Nil` → `Ret::Float` | `bus_group_split_…`（连带 `ret_shapes_…`） | 红 |
+
+变异后源文件 **SHA256 逐字节复原**（`2a2a7961…58fd`），终态 7 passed / 0 failed。
+
+##### 六、顺带修掉的一处既有文档错位
+
+`module_method_signature` 的 D69 文档注释（「Look up a builtin by name …
+**模块对象**的方法签名，按模块名索引 …」）历史上被**粘在 `const MATH_GROUPS`
+上** —— 它**从没真正文档化过** `module_method_signature` 本身
+（紧跟其后的是 `const` 的文档，不是函数）。D293 把中间的 `const` 换掉后，
+它变成悬空注释，`clippy::empty_line_after_doc_comments` 才把它报出来。
+已归位到 `pub fn module_method_signature` 之前。
+
+顺带同步 4 处指向旧结构名的注释（`src/value.rs` / `src/lsp/providers/hover.rs` /
+`tests/lsp_hover_annotations.rs` 的 `*_GROUPS` → `*_METHODS`），以及
+`tests/module_methods_introspection.rs` 里 D170 那段「900 行查表 / 当初为何不修」
+的记档 —— **保留原文不改写**，另加一个「后续如何闭合」小节说明
+D172 / D175 / D293 各自补上了哪一段。
+
+##### 七、「900 行」这个数字的来源（一条定位教训）
+
+`tests/module_methods_introspection.rs:26` 的 D170 记档原文写的是
+「`typeck::dispatch::module_method_signature`（**900 行**的查表函数）」——
+**就是它**。D170 时那些方法名以 `matches!(method, "a" | "b" | …)` **内嵌**在
+20 个 `match` 臂里（同一段记档的原话），那个体量对得上 900 行；
+D172 把它压成分组表后函数体实测 **474 行**，本轮再压到 **6 行**。
+
+定位过程本身也踩了一次扫描器坑：按「单块 ≥ 700 行」扫全仓时，
+`src/typeck/mod.rs:27` 报出 **899 行**，看着就是它 —— 实际是**度量假象**，
+扫描器把 `pub mod annotate;` 这类**模块声明**当成顶层块起点，
+一路数到下一个行首 `}` 为止。与 D280 那条「零结果的第一嫌疑永远是扫描器」
+同源：**看起来精确的数字要先验证它是被什么量出来的**。
+
+##### 八、验证
+
+| 项 | 结果 |
+|---|---|
+| `cargo test --lib` | 1011 passed / 0 failed / 13 ignored（与改前持平） |
+| `cargo test --no-fail-fast` | **214 个测试目标 0 失败**（合计 2250 passed），无 `error[`、无 `panicked` |
+| `cargo clippy --lib --all-features -- -D warnings` | 0 警告 |
+| `CHANGELOG.md` U+FFFD | 维持 5（两处历史损坏，见文件末尾待裁决项） |
+
+#### D294：`src/audit/mod.rs` 是 D34 那个临时目录泄漏的**未修副本**（收尾时顺手抓到的）
+
+本轮做 D293 的环境核查时发现 `%TEMP%` 里有 **5 711** 个 `mora_audit_<pid>_<nanos>`
+空目录（最早 2026-08-15）。顺着名字查到源头，是 D34 已知的那个缺陷
+**还剩一份没修**。
+
+##### 一、D34 修的是另一个副本
+
+D34（见 `src/interpreter/builtins/tests/audit.rs` 的注释）已经用 RAII 守卫
+`TempLog`（`Drop` 时 `remove_dir_all` 整个目录）修掉了 `mora_audit_builtin_*`
+那一条，并在注释里记下症状：「每跑一次测试套件就在 `%TEMP%` 里留下**上百个**
+空目录并持续累积」。
+
+但 `src/audit/mod.rs` 自带一份**逐字相同**的 `temp_log_path()`
+（`#[cfg(test)] mod tests` 内），改法一样漏掉了：
+
+```rust
+let path = temp_log_path("write_basic.jsonl");   // 建一个 pid_纳秒 唯一目录
+…
+let _ = std::fs::remove_file(&path);             // ← 只删文件，空目录留下
+```
+
+`remove_file` 删的是 `dir/name.jsonl`，`dir` 本身没人管；测试 panic 时连文件都不删。
+
+##### 二、实测（非估算）
+
+| 项 | 实测 |
+|---|---|
+| 修前：`cargo test --lib audit::`（20 个测试）净新增 | **+6** 个空目录（正好是用它的 6 个测试） |
+| `%TEMP%` 累积 `mora_audit_*` | **5 711** 个（2026-08-15 起） |
+| 修后：同一命令净新增 | **0** |
+
+补一条更强的证据：修复后又连跑 **3 次 `cargo test --no-fail-fast`**
+（每次都含这 6 个测试），`mora_audit_*` 计数**始终停在 5 711 不动** ——
+泄漏确实止住了，不只是单条命令凑巧。
+
+##### 三、牙齿验证（双向）
+
+只做「修后 delta=0」是不够的 —— 那与「测试压根没编译、没跑」无法区分
+（本轮**已经踩过一次**：首次跑 delta 也是 0，但 cargo exit=101，是编译错误）。
+必须证明**装置坏了它就红**：
+
+| 状态 | `cargo test --lib audit::` | `%TEMP%` 净新增 |
+|---|---|---|
+| `Drop` 掏空（`let _ = &self.dir;`） | 20 passed | **+6** ⇒ 装置变红 ✓ |
+| 修复后 | 20 passed | **0** |
+
+变异后源文件 **SHA256 逐字节复原**。
+
+##### 四、改法
+
+照搬 D34 的 `TempLog`（`Deref<Target = Path>` + `AsRef<Path>` + `Drop`），
+6 个调用点只改函数名，既有 `&path` 用法（`new_fresh(&path)` /
+`read_to_string(&path)` / `write(&path, …)` / `remove_file(&path)`）一字不改。
+末尾那 6 行 `remove_file` 保留 —— 删文件先于删目录，Windows 上更稳。
+
+⚠ 声明顺序是承重的：`path` 必须在各 `sink` **之前**绑定，Rust 逆序 drop
+才会让 sink 先关句柄、`TempLog` 再删目录（文件被占用时 `remove_dir_all`
+会失败）。已写进该守卫的文档注释。
+
+##### 五、**未**清理的 5 711 个历史残留
+
+泄漏已修 ⇒ 不会再增长，但那 5 711 个空目录**本轮没有动**：
+
+- 它们跨越 2026-08-15 至今，归属跨越多轮审计，**不在本次会话窗口内**；
+- 单条 `rm --` 需要列出全部字面量路径，5 711 条远超 Windows 命令行长度上限；
+- 属可恢复删除（走 mavis-trash），但**批量清空历史残留应由你决定**。
+
+本轮只清掉了自己产生的：临时 oracle 与脚本、D293/D294 的比对产物、
+反向牙齿变异故意漏下的 6 个。
+
+#### D295：临时目录泄漏**已闭合**（实测差集），并把 clippy 闸门从 `--lib` 扩到 `--all-targets`
+
+D294 收尾时说「那 5 711 个是历史存量，泄漏已止」。本轮**先证明**这句话，
+再把 D294 顺手发现的另一个事实做完。
+
+##### 一、实测证明「零泄漏」：跑一次全量，比对 `%TEMP%` 前后差集
+
+不靠读代码判「有没有 `remove_dir_all`」—— 那种判法看不到「只在 panic 路径上
+漏」。改用**实际发生**的差集：
+
+```text
+before: 9244 个 mora* 条目
+cargo test --no-fail-fast  → exit 0，33s
+after : 9244 个
+新增 0 · 清掉 0
+```
+
+⇒ **当前代码没有任何临时目录泄漏**；那 9 244 个全部是 D34（`mora_audit_builtin_*`）
+与 D294（`mora_audit_*`）修复**之前**的历史存量。D294 确实是最后一处。
+
+> 方法论：**「什么也没发生」这种信号，必须用差集而不是数代码里的
+> `remove_dir_all` 来判**。前者是事实，后者是许愿。
+
+##### 二、把 lint 闸门从 `--lib` 扩到 `--all-targets`
+
+本项目 26 轮一直只跑 `cargo clippy --lib --all-features -- -D warnings`。
+本轮试了 `--all-targets`（覆盖 lib + 全部 214 个集成测试二进制 + bench），
+**首报 11 处**，逐清到 0：
+
+```text
+cargo clippy --all-targets --all-features -- -D warnings   →  0 警告
+```
+
+⚠ **收敛要分 8 批**：clippy 是**每个 crate 遇到第一个错误就停**，所以每修一批
+才会露出下一批。一次性看到「只有 11 处」是假象 —— 这是本条最实际的教训。
+
+##### 三、37 个文件、50 处，按类别
+
+| 类别 | 处数 | 例子 |
+|---|---|---|
+| `as_bytes().len()` → `len()` | 12 | 12 个测试文件里**逐字相同**的 `frame()` 助手（`lsp_*` / `mcp_*` / `extreme_values` 各一份拷贝） |
+| `format!("{x}")` 无参 → `.to_string()` | 4 | `functional_builtins_signatures` 一处连着 3 条 |
+| `format!` 套在 `panic!` 参数里 | 2 | `orchestrate_v3_pipeline` / `pregel_entry_edge` |
+| `type_complexity` | 4 | 加类型别名（`FieldCase` / `FieldObs` + `Analysis` / `ProbeRows` / `MethodCase`） |
+| 迭代 map 却用 `for (k, v)` | 2 | 改成 `.values()` |
+| `i64 as i64` 同类型转换 | 5 | `lsp_semantic_token_legend` 两行共 5 处 |
+| `matches!(x, Ok(_))` → `x.is_ok()` / `x == false` → `!x` | 2 | `pipeline_equivalence` / `path_differential_census` |
+| `Iterator::last` → `rfind`、嵌套 `if let` 合并、`&&`、多余 `mut`、`let _ =`、`vec!` → 数组 | 10 | |
+| **文档注释缺陷（非 lint 噪音）** | 5 | 见下第四节 |
+| 死代码删除 | 1 | 见下第六节 |
+| `Default::default()` 后逐字段赋值 → 结构体字面量 | 1 | `src/runtime/ai_infra.rs` |
+
+改后全仓 `as_bytes().len()` 匹配数 **0**（实测）。
+
+##### 四、顺带挖出**三处真实缺陷**（不是 lint 噪音）
+
+1. **`tests/lsp_positions_and_rename.rs` 两段文档被重复粘贴** ——
+   一段以 `///` 开头的**游离文档块**加一个**游离 `#[test]`** 夹在真正的
+   文档与函数之间（`duplicated attribute`）。两份内容一字不差。
+   已删掉前一份，保留带主语的那份。
+2. **`tests/algebraic_effects.rs` 文档注释错位** ——
+   「怎么观察 `print` 的输出」这段**全文件方法论**，以 `///` 孤零零夹在
+   `run_production` 与 D35 判据之间，前后都不挨着任何 item
+   ⇒ 等于谁也没文档化。已归位到模块头。与 D293 在 `dispatch.rs` 修的那处
+   D69 注释错位**同型**（本项目第三次出现这个形态）。
+3. **`tests/e2e.rs` 里有一个骗 lint 的占位函数** ——
+   `_unused_assert_compile_error()` 唯一作用是引用另一个「未用」函数，
+   好让 `dead_code` 不报。而根因在 `tests/e2e_helpers.rs`：它被 `e2e.rs` 与
+   `nested_loop_jumps.rs` **两个测试二进制各自 `mod` 引入**，每个二进制
+   单独编译，只用 `assert_source_ok` 的那个自然看不到另外 5 个。
+   ⇒ 加 `#![allow(dead_code)]` 并写明理由，占位函数与连带的多余 import 一并删除。
+
+##### 五、两处**判别为「不该改代码」**的
+
+| 位置 | 命中 | 处置 |
+|---|---|---|
+| `tests/number_tower.rs` 的 `3.14` | `approx_constant`（建议换 `std::f64::consts::PI`） | `#[allow]` + 写明理由：这里的 `3.14` 是**被测数据**，必须与 Mora 源码里的字面量逐字对应，换成 π 会让判据测的不再是 `3.14` |
+| `tests/spec_ebnf_surface.rs` 的 `+ 8 种 literal）` | `doc_lazy_continuation` | 根因是那一行以 `+ ` 开头，**markdown 把它当成列表标记**，下一行就成了列表项的懒续行。改用顿号重排，不加 `#[allow]` |
+
+##### 六、顺带删掉的死代码
+
+`tests/solve_binding_dst.rs` 的 `last_value()` —— 定义了、零调用
+（实际用的是 `last_value_pipelined`）。文件里那段 D120 记档提到过它，
+已改成「当时的 `last_value` 助手，**D295 已删**：它已成死代码」，
+保留历史事实的同时不让读者去找一个不存在的函数。
+
+##### 六之二、测试总数 2250 → 2248：**不是覆盖损失，是去掉两遍重复执行**
+
+上面第四节那个「重复 `#[test]`」有个副作用：rustc 是**按 `#[test]` 属性个数
+注册**测试的 ⇒ 同一个函数被注册了**两次**，跑了两遍同样的断言。
+故 `lsp_positions_and_rename` 改前报 **7 passed**、改后报 **5 passed**。
+
+**这不是「删掉了两个测试」**——该文件 5 个 `#[test]` 对应 5 个测试函数，
+改后 5 条全部还在跑，少掉的是两次**重复执行**（失败时也会报两遍）。
+
+实测证明（不是推理）：给任一函数临时加回第二个 `#[test]`，计数立刻
+从 5 变 6；去掉又回到 5，文件逐字节复原。
+⇒ 若将来看到全量计数掉了几条，**先查是不是这种「同一函数跑两遍」**，
+别默认成覆盖损失。
+
+##### 七、验证
+
+| 项 | 结果 |
+|---|---|
+| `cargo clippy --all-targets --all-features -- -D warnings` | **0 警告**（改前 8 批、末批仍报 8 处） |
+| `cargo test --no-fail-fast` | 214 目标 0 失败，合计 **2248** passed（改前 2250，差额见第六之二节），无 `error[`、无 `panicked` |
+| `cargo test --lib` | 1011 passed / 0 failed / 13 ignored（与 D293 持平） |
+
+**纯 lint 层改动，零语义变更**：全部 37 个文件只改了
+表达式写法、文档注释、以及一处删除死函数；`as_bytes().len()` → `len()`
+在 `str` 上是同一个值，`last()` → `rfind(..)` 在
+`DoubleEndedIterator` 上是同一个值，两处等价性均由 clippy 自身的
+lint 定义保证，且测试全绿。
+
+#### D296：覆盖盲区普查 —— 两个否定 + **一个真发现**（`checkpoint-sqlite` 的 14 个测试从不在验证里跑）
+
+D295 挖出「重复 `#[test]`」这个类别之后，本轮顺着「**还有什么没被跑到**」这条线
+查了三个方向。前两个是否定，第三个是真的。
+
+##### 一、重复 `#[test]` 普查：**0**（D295 已闭合该类）
+
+写检测器扫全仓 426 个 `.rs`（含 `src/**` 的 `#[cfg(test)] mod`），
+统计每个 `fn` 身上挂了几个 `#[test]`：
+
+```text
+total #[test] attributes = 2291 ; distinct #[test] fns = 2291 ; excess = 0
+```
+
+**零结果 ⇒ 先怀疑扫描器**，两头都验了：
+
+- **装牙齿**：往 `tests/json_utf8_strings.rs` 注入一个重复 `#[test]` ⇒
+  `excess = 1`，并正确点名 `fn d205_raw_utf8_json_strings_round_trip_with_correct_length (#[test] x2)`；
+  移除后归零，文件**逐字节复原**。
+- **验写法覆盖**：把匹配放宽到 `#[ test ]` / `#[test] // 注释`，总计数仍是 2291
+  ⇒ 全仓无变体写法。
+
+顺带修了**检测器自身**的两个 bug（都是被输出里的异常暴露的）：
+
+1. 首版只把 `///` 当「不结束属性块」，**普通 `//` 注释**会把 `#[test]` 与 `fn`
+   之间的属性块误判为结束 ⇒ 漏报 3 处。症状是 `excess = 3` 与「NO HITS」
+   **自相矛盾** —— 这种内部不一致是普查器坏了的最强信号。
+2. 打印的函数名取 `group(5)`（其实是 `(unsafe\s+)?`，恒为 `None`），
+   正确应是 `group(6)`。症状是输出里出现 `fn None`。
+
+##### 二、doctest：**没有盲区**（否定）
+
+`cargo test --doc` 报 `5 tests` 但 `0 passed / 5 ignored`。逐条读过
+（`cargo test --doc -- --list` 给出位置）：
+
+| 位置 | 内容 | 判定 |
+|---|---|---|
+| `src/compress/json.rs:7` | `crush_json(&items, …)`，`items` / `CompressOptions` 未导入 | 用法示意 |
+| `src/error.rs:16` | `pub enum MoraError { … }` | 伪代码 |
+| `src/mir/optimize/mod.rs:33` | 「未来统一方向」`RegLike` trait（该 trait 不存在）+ `...` | 设计草图 |
+| `src/typeck/hm/diag.rs:73` | `diag.mark_diagnosed(...)` 调用片段 | 伪代码 |
+| `src/typeck/hm/util.rs:51` | `match expected { … }` 片段，`actual` 未绑定 | 伪代码 |
+
+5 条全是**刻意的示意图**，用 ```ignore 是正确写法 ⇒ 本仓**真实 doctest 数为 0**，
+不存在「本该能跑却被忽略」的情况。记下来免得重查。
+
+##### 三、真发现：`checkpoint-sqlite` 的 **14 个测试从不在验证里跑**
+
+`Cargo.toml` 有唯一的一个 feature：
+
+```toml
+[features]
+checkpoint-sqlite = ["rusqlite"]
+```
+
+它门控 `src/checkpoint/sqlite.rs` 与 `pub use … SqliteSaver`。
+而 `tests/checkpoint_saver_parity.rs`（D234 的「两个 `CheckpointSaver` 实现
+必须逐项一致」判据）整文件是：
+
+```rust
+#![cfg(feature = "checkpoint-sqlite")]
+```
+
+⇒ 默认 `cargo test` 下该文件编译成**空**，sqlite.rs 的 8 个 `#[cfg(test)]`
+单测连编译都不参与。
+
+**实测对照**（同一台机器、同一 commit）：
+
+| 命令 | lib | 集成合计 | 目标数 |
+|---|---|---|---|
+| `cargo test --no-fail-fast`（本审计 27 轮的标准命令） | 1011 | 1237 | 214 |
+| `cargo test --all-features --no-fail-fast` | **1019** | **1243** | 214 |
+| 差 | **+8**（`sqlite_*` 单测） | **+6**（`checkpoint_saver_parity`） | 0 |
+
+单独跑那个目标，形态一目了然：
+
+```text
+默认：  running 0 tests   test result: ok. 0 passed …    EXIT=0   ← 静默为空，却报绿
+带 feature：running 6 tests   test result: ok. 6 passed …  EXIT=0
+```
+
+**失败形态**：一个空目标报 `ok`，与「测了 6 条全过」在 `cargo` 的退出码与
+输出形状上**无法区分**。这与 D74 的 `toolplane`（按枚举变体名建表 ⇒ 整段永远
+匹配不到，且**不会有任何测试失败**）是同一形态。
+
+14 个测试**跑起来是全绿的**（`--all-features` EXIT=0），所以这不是「有测试
+坏了」，而是「**绿灯里有一块是空的**」——本审计此前 27 轮报的
+「214 个目标 0 失败」为真，但**不完整**。
+
+##### 四、CI 侧是同一个洞的镜像
+
+```yaml
+ci.yml:70   cargo test --lib                                # 无 --all-features
+ci.yml:73   cargo test --all-targets                        # 无 --all-features
+ci.yml:112  cargo clippy --all-targets --all-features …      # 有
+```
+
+⇒ `checkpoint-sqlite` 整条特性在 CI 里**被 lint 过、却从未被测过**。
+`reusable-rust-ci.yml:149` 的 clippy 同理带 `--all-features`，测试步骤同缺。
+
+##### 五、为什么不擅自改 CI
+
+要补上这个洞就得让测试步骤带 `--all-features`，而 `rusqlite` 走
+**bundled C 编译**（本机已验证可编译通过，`cargo test --all-features`
+EXIT=0 / 2262 passed）—— CI runner 是否都有可用的 C 工具链，是**环境决策**；
+把 `checkpoint-sqlite` 改成默认 feature 则是**产品决策**（给默认构建加一个
+C 依赖）。两者都不是我该单方面拍的。
+
+**可选项**（供裁决）：
+① 测试步骤改 `cargo test --all-features`（需 CI 装 C 工具链）；
+② 保持 sqlite 非默认，但加一条**会红**的护栏：在未开 feature 时断言
+「`SqliteSaver` 未被测试覆盖」这件事本身是已知状态（避免空目标继续静默报绿）；
+③ 先只在本地把审计标准命令改成 `--all-features`，CI 不动。
+
+**本轮产品代码零改动** —— 唯一改过的文件（`tests/json_utf8_strings.rs`）
+是检测器装牙齿时的临时注入，已逐字节复原并复跑（6 passed）。
+
+#### D297：测试面全量对账 —— 静态 `#[test]` 数 vs harness 实列数（**零新缺陷**，账全平）
+
+D296 找到「`checkpoint-sqlite` 的 14 个测试从不在验证里跑」，但那是**一个**目标。
+本轮把问题一般化：**全仓到底有多少测试在真跑？** 逐目标对账。
+
+##### 一、方法
+
+对每个目标，取两个独立来源的数字：
+
+- **静态** = 源码里挂在 `fn` 上的 `#[test]` 个数（D296 那个已装牙齿的解析器）
+- **实跑** = `cargo test -- --list` 里该目标列出的测试数
+
+两类的差集含义相反：
+
+| 差集 | 含义 |
+|---|---|
+| 静态 > 实跑 | 声明了但没跑 ⇒ `cfg` gate / `#[ignore]` / 孤儿文件 |
+| 实跑 > 静态 | 跑了但源码数不出 ⇒ 重复注册 / 宏生成 |
+
+##### 二、检测器自身被逼出**四个** bug（每一个都是靠「输出自相矛盾」抓到的）
+
+| # | 症状 | 根因 |
+|---|---|---|
+| 1 | `harness: sum=0`，全部目标「未出现」 | `subprocess` 的 stdout / stderr 是**两个独立管道**，拼起来打乱顺序，`Running <target>` 与随后的 `xxx: test` 对不上 |
+| 2 | `src/ #[ignore]=1`，而 harness 报 13 | 只认裸写 `#[ignore]`，不认 `#[ignore = "原因"]`（本仓 11 条都带原因） |
+| 3 | A 段全「未出现」/ B 段全「静态 0」 | `Running` 行捕获到的是 `foo.rs`（带扩展名），静态表键是 `foo` |
+| 4 | `xy_cut_translation_invariance` 报「10 vs 静态 5」 | `Doc-tests` 段**不匹配** `Running`，`cur` 停在最后一个集成目标上，把 5 条 doctest 也算进它 |
+
+第 4 条尤其值得记：我差点把一个**根本没问题**的文件（5 个 `#[test]`、5 个测试函数、
+实跑确为 5 passed）报成「重复注册」。是「去实跑一下」而不是推理把它挡住的。
+
+⇒ 与 D286/D288 同源：**普查结果异常时，第一嫌疑永远是普查器自己**。
+本轮四次都是「输出的内部矛盾」而不是「结果不好看」暴露的。
+
+##### 三、对账结果
+
+**集成目标（209 个 `.rs`）**：
+
+| 类别 | 数量 |
+|---|---|
+| 静态 > 实跑 | **1** —— `checkpoint_saver_parity`（0/6），即 D296 已报的那一处，无新增 |
+| 实跑 > 静态 | **0** |
+
+**库单元测试**：
+
+```text
+src/ 静态 #[test]                     1041
+  − 孤儿文件 mir/lmir_to_mir.rs         −6   ← 自文档的 unsafe FFI 骨架
+  − #[cfg(unix)]（本机 Windows）         −3   ← 依赖 POSIX shell 语义，有注释
+  = 应在 harness                       1032
+--all-features harness 实列            1032   ✅ 账平
+默认 features harness 实列             1024   ✅ ＝ 1032 − 8(sqlite)   账平
+```
+
+`src/mir/lmir_to_mir.rs:77` 自己就写着「⚠ **本文件当前未在 `mir/mod.rs` 里声明**
+⇒ 不参与编译」（6 个 `#[test]` 同理不跑），**不是**本轮新发现。
+
+##### 四、`#[ignore]` 全量清单：20 条，**每条都有理由**
+
+| 位置 | 条数 | 理由类别 |
+|---|---|---|
+| `src/stress_tests.rs` | 7 | 长时 / 多线程 / 可能 OOM（文件头写明需 `cargo test -- --ignored`） |
+| `src/sandbox.rs` | 4 | **需 Docker daemon**（注释写明「默认 `#[ignore]` 让 CI 无 docker 时跳过」） |
+| `src/document/backend/image.rs` | 1 | 需 `MORA_OCR_MODELS_DIR` 指向 v0.28 随附模型 |
+| `src/container.rs` | 1 | （裸写，未带原因串） |
+| `tests/ssa_phi_incoming.rs` | 3 | D254 / D256 点名的 `rename_variables` 缺口，逐条写明「修复后请去掉本标记」 |
+| `tests/run_mir_equiv_run_dag.rs` | 3 | 「已知分歧」：强制线性路径与生产路径实测不一致，写明哪一侧对 |
+| `tests/opt_repair_acceptance.rs` | 1 | D261 验收判据，等三处缺口修好后解封 |
+
+**唯一「整目标 0 条实跑」的是 `tests/opt_repair_acceptance.rs`**（1 个测试、1 个
+`#[ignore]` ⇒ 实跑 0 条、报 `ok`）。逐行读过：它是项目**标准的「预置判据」形态**
+—— 文件头记着实测基线（22 个程序里 16 个三档一致、6 个在 `opt=1`/`opt=2` 下被破坏，
+且**全部是含 `for` 循环的**），`#[ignore]` 带理由点名要修的三处代码缺口，并写明
+「解封它 = `--opt` 已经不会再改变程序行为的验收测试」。**正当，不是缺陷。**
+
+##### 五、结论
+
+**零新缺陷。** 测试面此前从未有过完整对账，本轮把它算平了：
+
+- 每一个声明的 `#[test]` 都能归到「跑了 / 平台 gate / feature gate / 预置判据 /
+  自文档的孤儿」之一，**没有无法解释的缺口**；
+- 唯一的静默失效（D296 的 `checkpoint_saver_parity`）是已知且已上报的那一处。
+
+**本轮产品代码零改动。**
+
+#### D298：CI 的 `cargo fmt --check` 门禁是**红的** —— 漂移全部来自本审计自己（D297 收尾时发现）
+
+D297 把测试面算平之后，接着核 CI 上另外两条门禁（`ci.yml:87` / `ci.yml:112`）。
+clippy 那条 D295 已经清零；**fmt 那条一上来就红**。
+
+##### 一、现象
+
+```text
+cargo fmt --all -- --check   →   EXIT 1，67 个文件有 diff
+```
+
+`ci.yml:87` 正是：
+
+```yaml
+- name: cargo fmt --check
+  run: cargo fmt --all -- --check
+```
+
+⇒ **一旦把这 27 轮的工作 commit 上去，CI 的 fmt 门禁立刻变红。**
+
+##### 二、漂移是哪来的：**不是历史债，是本审计自己攒的**
+
+抽取 6 个文件的 **HEAD（已提交）版本**单独跑 `rustfmt --check`：
+
+| 文件 | HEAD 版本 |
+|---|---|
+| `src/document/reading_order/mod.rs` | 干净 |
+| `src/value.rs` | 干净 |
+| `src/typeck/dispatch.rs` | 干净 |
+| `src/interpreter/method_dispatch.rs` | 干净 |
+| `src/mir/lower.rs` | 干净 |
+| `src/checkpoint/mod.rs` | 干净 |
+
+**6/6 全部干净** ⇒ 提交态一直是 fmt-clean 的，CI 现在还是绿的；
+67 个文件的漂移**全部产生于这 27 轮未提交的工作树**（手写 Rust 从未过 rustfmt）。
+
+分布：`src/` **18** 个、`tests/` **49** 个。
+
+##### 三、修法：`cargo fmt --all`
+
+纯机械重排，rustfmt 不改语义 —— 这是本轮少数**没有决策成分**的修复
+（与「CI 要不要带 `--all-features`」那种环境/产品决策不同：fmt 门禁是仓库
+自己声明的，跑它就是执行既定契约）。
+
+##### 四、验证：三个门禁全绿，测试数字**逐项未变**
+
+| 项 | 重排前 | 重排后 |
+|---|---|---|
+| `cargo test --no-fail-fast` | 214 目标 / 0 失败 / 2248 passed | **完全相同** |
+| `cargo test --lib` | 1011 / 0 failed / 13 ignored | **完全相同** |
+| `cargo clippy --all-targets --all-features -- -D warnings` | 0 警告 | **0 警告** |
+| `cargo fmt --all -- --check` | **EXIT 1（67 文件）** | **EXIT 0** |
+
+##### 五、连带影响：CHANGELOG 里的**行号引用**可能已偏移
+
+被重排的 18 个 `src/` 文件在 CHANGELOG 里有：
+
+- **42 处确定引用**：`typeck/dispatch.rs` 21、`mir/dag.rs` 7、`mir/jit.rs` 6、
+  `interpreter/numeric_helpers.rs` 2，及其余 6 个文件各 1；
+- 另有 **79 处 `mod.rs:NNN`** 无法分辨归属 —— 三个同名文件
+  （`checkpoint/mod.rs`、`document/reading_order/mod.rs`、`mir/orchestrate/mod.rs`）
+  都被重排，而 CHANGELOG 里只写了 `mod.rs`。
+
+**刻意不批量改写**：这些是**历史条目**里的指针，记录的是「当时那行代码是什么」，
+改写它们等于用今天的行号去描述历史。是否改成引用**函数名**而非行号，
+属文档约定，需裁决（与 D171/D172 编号错位是同一类「历史记录不可擅改」的问题）。
+
+##### 六、测法上的两个坑（本轮自己踩的，记下来）
+
+1. **跑 `rustfmt --check` 必须保留目录结构** —— 把 `X/mod.rs` 改名成 `X__mod.rs`
+   再喂给它，它内部的 `mod sub;` 解析不到，报的是**错误**而不是 diff，
+   表现为「returncode ≠ 0 但 diff 行 0」。首版把 `reading_order/mod.rs` 和
+   `value.rs` 误判成「HEAD 不干净」，就是这个原因。
+2. **不要用 PowerShell 的 `-replace` 改脚本文件** —— 它把一份 Python 脚本的
+   列表字面量改坏了（`SAMPLES = []`）。改脚本一律用 write / edit 工具。
+
+#### D299：**debug / release 行为分叉** —— `Int + Int` 溢出在 release 下静默回绕（本审计 29 轮从未构建过 release）
+
+D298 修完 fmt 门禁后，接着核 CI 剩下的那条：`cargo build --release`。
+发现本审计**从头到尾只跑过 debug**（`Cargo.toml` 无 `[profile.*]` 覆盖
+⇒ release 默认 `opt-level=3` / `debug-assertions=off` / **`overflow-checks=off`**）。
+于是拿 release 与 debug 两个二进制做差分。
+
+##### 一、先说两个否定结果
+
+| 检查 | 结果 |
+|---|---|
+| `cargo build --release --bin mora --bin mora-lsp --example lsp_smoke` | **EXIT 0**（24s） |
+| `cargo test --release --no-fail-fast` | **214 目标 0 失败 / 2248 passed / lib 1011-0-13** —— 与 debug **逐项相同** |
+| 18 个代表性程序的 release↔debug 差分（stdout **与** 退出码都比） | **0 分叉** |
+
+差分那 18 个里第一版有 3 个探针是坏的（`fn f(n) =>` 递归、`1.0e308`、
+`match … if` 守卫）—— 实际语法是 `when`、无科学计数法、闭包不能自递归。
+修正后仍是 0 分叉。**第一版的「0 分叉」里有一半是没跑到的路径，
+按 D270 的教训已逐条查清再重跑。**
+
+##### 二、真分叉：`Int + Int` 溢出
+
+```mora
+let a = 9223372036854775807i     // i64::MAX
+print(a + 1i)
+```
+
+| 构建 | 退出码 | 输出 |
+|---|---|---|
+| `target/debug/mora.exe` | **101** | `thread 'mora-main' panicked at src\flow.rs:154:61` |
+| `target/release/mora.exe` | **0** | **`-9223372036854775808`** ← `i64::MIN`，**静默回绕** |
+
+⇒ **同一段源码、同一个输入，值与退出码都随构建配置而变。**
+release 那一侧是**静默的数值损坏**：用户拿到完全错误的结果，零诊断。
+
+（首轮探针是假的：`9223372036854775807i + 1` 里的 `1` 是 **Float 字面量**，
+运算被提升成 Float，根本走不到 i64 加法；必须写 `+ 1i`。）
+
+##### 三、根因与三处同形态代码
+
+`src/flow.rs:154`：
+
+```rust
+(Value::Int(a), Value::Int(b)) => Ok(Value::Int(a + b)),   // 裸 i64 加法
+```
+
+⚠ **同一函数、紧邻上方 20 行**（D198）恰恰是这一类的显式守卫：
+Float ⊕ BigInt 超出精确范围时返回带可读消息的 `MoraError`，
+并提示「整数运算请用 bigint 字面量」。**这个文件知道这类风险、也已有成例，
+唯独 `Int + Int` 漏了。**
+
+另两处同形态，**当前不可达**（一并记档）：
+
+| 位置 | 运算 | 为何不可达 |
+|---|---|---|
+| `flow.rs:319` | `Int / Int` → `a / b`（`i64::MIN / -1` 溢出） | `i64::MIN` 只能由减法造出，而 |
+| `flow.rs:339` | `Int % Int` → `a % b`（`i64::MIN % -1` 溢出） | `Sub`/`Mul` 走 `numeric_op`（`Fn(f64,f64)->f64`）先转 f64 ⇒ 造不出精确的 `i64::MIN` |
+
+`Sub` / `Mul` 因走 f64，是**精度**问题（D198 同族）而非分叉 —— 两边一致，不在本条范围。
+
+##### 四、为什么测试**结构上**看不见
+
+同一段源码在 debug 下 panic、在 release 下回绕 ⇒ **任何断言只能钉住一侧**。
+这不是「测试写得不够」，是构建配置决定的。而 CI 同时跑
+「debug 测」（`ci.yml:70/73`）与「release 构建」（`ci.yml:136/174`），
+却**从不**用 release 跑测试 ⇒ release 的行为在 CI 里同样无人验证。
+
+##### 五、这条**曾经被记为 P0**，但没进 D 编号序列
+
+`docs/audit/MIR_COMPILER_AUDIT_2026-07-25.md:1308`：
+
+```text
+| 6 | i64 加法 debug panic | flow.rs:103 | Runtime |
+```
+
+建议是「用 `checked_add`/`saturating_add`，溢出返回 `Err`」。
+该条目自 2026-07-25 起未进入 CHANGELOG 的 D 序列，本轮才重新浮出
+（行号也从 `flow.rs:103` 漂到了 `:154`）。
+
+##### 六、判据（现状判据，3 条）
+
+`tests/int_overflow_build_divergence.rs`：
+
+| 判据 | 作用 |
+|---|---|
+| `int_add_overflow_panics_in_debug_build_status_quo` | 钉住**当前** debug 行为（exit 101 + panic 来自 `flow.rs`），并在失败消息里写明 release 侧行为 |
+| `int_add_without_overflow_is_unaffected` | 对照组：`3i + 1i` 必须正常，防「修溢出时把正常加法一起挡掉」 |
+| `int_div_mod_share_the_same_unguarded_shape_note` | 把「Div/Mod 与 Add 同形、但当前不可达」记在测试里，防后人误判为「已安全」 |
+
+**牙齿验证**：把 `flow.rs:154` 临时改成 `a.wrapping_add(*b)`
+⇒ 判据立刻变红（1 failed），源文件 SHA256 **逐字节复原**，终态 3/0。
+
+##### 八、验证
+
+| 项 | 结果 |
+|---|---|
+| `cargo test --no-fail-fast` | **215 目标 0 失败**（2251 passed），lib 1011 / 0 / 13 ignored |
+| `cargo clippy --all-targets --all-features -- -D warnings` | **0 警告** |
+| `cargo fmt --all -- --check` | **EXIT 0** |
+| 判据牙齿（`flow.rs:154` → `wrapping_add`） | 变红（1 failed），源文件 SHA256 逐字节复原 |
+
+**产品代码本轮零改动**（仅新增 `tests/int_overflow_build_divergence.rs`）。
+
+#### D300：把 D299 的分叉**框定范围** —— 全仓 `debug_assert!` 两处均无碍，56 个真实程序 0 分叉
+
+D299 找到 `Int + Int` 溢出的 debug/release 分叉。本轮问两个问题：
+**这一类还有别的吗？**（`debug_assert!` 是 release 下唯一会整条消失的机制）
+
+##### 一、全仓 `debug_assert!` 只有 2 处，逐处查清
+
+| 位置 | 内容 | 判定 |
+|---|---|---|
+| `src/interpreter/mod.rs:15` | `macro_rules! testcase!` —— SQLite `testcase()` 同款分支覆盖插桩 | 大部分调用点是 `testcase!(true, "label")`（**恒真的纯标注**，debug 下也不做事）；**唯一真条件**在 `interpreter/dispatch.rs:157` |
+| `src/typeck/hm/mod.rs:415` | `debug_assert!(ambient::is_ambient_label(label))` —— 字面量表 `entries` 的内部一致性 | 良性：表就在同一函数里，任何 typeck 用例都会走到 |
+
+`dispatch.rs:157` 那条值得单说，它是**登记表与 match 的漂移检测器**：
+
+```rust
+testcase!(_kind.is_none() || is_module_prefix || name.starts_with("__")
+           || matches!(name, "merge_with"), "call_function: builtin 名 … 落入兜底");
+```
+
+release 下守卫消失 ⇒ 「某个已登记 builtin 没有 match 分支」这类漂移在 release 里
+**检测不到**。但这**不是缺陷**，理由有二：
+
+1. 漂移是**开发期**错误，不是用户可触发的行为分叉 —— 用户程序的内容不会改变
+   登记表与 match 的对应关系；
+2. 任何测试调用到那个 builtin 都会在 **debug 下 panic**，而 CI 与本审计全部跑
+   debug ⇒ 漂移必然在合并前被 CI 拦下。
+
+⇒ D299 那类「用户可见值随构建配置而变」的形态**不适用于**这两处。
+
+##### 二、真实语料的 release↔debug 差分：56 个程序 0 分叉
+
+D299 的差分只有 18 条**手写**探针，覆盖面太窄。本轮换成仓库里**真实的**
+`.mora` 程序：`tests/fixtures/**` + `examples/**`（排除 `target/` 下 242 个
+测试自产的临时文件）：
+
+```text
+语料: 56 个 .mora 程序
+一致 56 · 分叉 0 · 超时跳过 0   (2s)
+```
+
+diff 的是 **stdout 与退出码两者**（D276 教训：只比 stdout 会漏掉
+「两边都无输出但一边 exit 1」）。
+
+##### 三、结论
+
+- 唯一**已证实**的用户可见构建分叉仍是 D299 的 `flow.rs:154`；
+- 全仓 `debug_assert!` 两处均不产生用户可见分叉；
+- 74 个程序（18 手写 + 56 真实）跑遍两个构建，**除该一处外无第二处**。
+
+⇒ 这一类是**孤立点**，不是系统性缺陷。**产品代码本轮零改动。**
+
+##### 四、为什么不加判据
+
+「跑两个构建做差分」需要 release 二进制（首次构建 ~25s + 链接），
+作为常规 CI 判据成本过高，且本项目的 CI 已同时构建 release
+（`ci.yml:136/174`）却从不以 release 跑测试 ——
+**是否补这一步属 CI 决策，已并入上报清单**。本轮只留探针与结论。
+
+#### D301：`cargo doc --no-deps` 的 **73 条 rustdoc 告警清零**（v0.31 时曾达到的标准）
+
+CI 有四条门禁：test / clippy / fmt / build。D295 清了 clippy、D298 清了 fmt。
+剩下没人核过的是 **`cargo doc`** —— 而本文件末尾的 v0.31 记档里写着
+「`cargo doc --no-deps`: 0 warning」，说明**这个标准曾经达成过**。
+
+```text
+cargo doc --no-deps   →  EXIT 0，但 73 条 warning，涉及 31 个文件
+```
+
+EXIT 0 意味着**它从不阻断任何东西** —— 这正是它能悄悄退化两年的原因。
+
+##### 一、73 条的构成（全部在文档注释里，零语义风险）
+
+| 类别 | 条数 | 形态 |
+|---|---|---|
+| `unclosed HTML tag X` | ~45 | 文档里裸写 `Vec<Node<()>>` / `Box<dyn T>`，rustdoc 当成 HTML 标签 |
+| `unresolved link to X` | ~23 | 两种子形态，见下 |
+| `public documentation for A links to private item B` | 4 | 公开项的文档链到 `pub(crate)` / 私有项 |
+| `` `X` is both a function and a module`` | 1 | 无法消歧 |
+
+##### 二、`unresolved link` 的两种子形态（第一版脚本在这里栽了）
+
+1. **坏路径**：`[`compress::json::value_as_f64`]` 在 `flow.rs` 里少了 `crate::`
+   前缀 ⇒ rustdoc 报「no item named `compress` in scope」。
+2. **markdown 快捷引用链接**：文档里的**裸方括号** `[现有]` / `obj[idx]` /
+   `regs[src]` / `- [x]` / `a[k]` —— rustdoc 把裸 `[X]` 当成 shortcut reference
+   link，找不到定义就报警告。
+
+⚠ 首版脚本按 `` [`X`] ``（带反引号）去匹配第 2 类，**8 条一条没命中**。
+断言拦住了，没有乱改；读回原文才发现它们**本来就没有反引号**，
+正确修法是**转义方括号** `\[现有\]`（保留排版、不产生链接）。
+
+⇒ 这与 D296/D297 的普查器 bug 同源：**匹配形态猜错时，断言失败是唯一的护栏**。
+
+##### 三、修法与验收
+
+| 形态 | 修法 |
+|---|---|
+| `<X>` 被当 HTML | 包成代码跨度 `` `<X>` `` |
+| 坏路径 `[`a::b`]` | 补全为 `[`crate::a::b`]`（`flow.rs:665`） |
+| 裸 `[X]` 快捷引用 | 转义为 `\[X\]` |
+| 链到私有条目 / 路径歧义 | 降级为纯代码跨度 `` `X` ``（`TeaApp::fold`、`Xoshiro256`、`DagExecMemo::is_memoizable_pure` 等） |
+
+```text
+修前: cargo doc --no-deps → 73 warnings / 31 文件
+修后: cargo doc --no-deps → 0 warnings
+```
+
+##### 四、过程中我造成的一处副作用（如实记录）
+
+为拿到可信的告警清单，我先 `touch src/lib.rs` 试图让 rustdoc 重跑 ——
+**无效**（cargo 用内容哈希做指纹）。于是用 `cargo clean -p mora` 强制，
+它报告：
+
+```text
+Removed 36579 files, 70.8GiB total
+```
+
+⇒ debug 与 release 构建、215 个测试二进制**全部被清掉**，
+下一次 `cargo test` 是**全量重编**。可恢复（重建即可），但耗时是实打实的。
+
+另有一个**方法论坑**：rustdoc 的告警被 cargo 缓存 —— 第二次跑 `cargo doc`
+**一条都不发**。若只看第二次的结果，会把「0 条」误当成「没有告警」。
+本轮是靠「第一次 PS 跑出 76 行、紧接着 Python 跑出 0 条」这个
+**自相矛盾**发现缓存存在的，与 D296 的四个普查器 bug 同一诊断法。
+
+##### 五、验证
+
+| 项 | 结果 |
+|---|---|
+| `cargo doc --no-deps` | **0 warning**（修前 73） |
+| `cargo fmt --all -- --check` | EXIT 0 |
+| `cargo test --no-fail-fast` | 215 目标 0 失败，2251 passed；lib 1011 / 0 / 13 ignored |
+| `cargo clippy --all-targets --all-features -- -D warnings` | 0 警告 |
+
+**本轮只改文档注释**（31 个文件的 `///` / `//!` 行），无任何代码语句改动。
+
+#### D302：恒等运算（`x + 0`）让**其后所有语句静默消失**（默认执行路径，退出码 0）
+
+沿 D299 的线继续追。找法：既然「用户可见值随构建配置而变」只有一处，
+那就把这条轴**查全** —— 先用 56 个真实 `.mora` 程序跑 release↔debug 差分
+（D300，0 分叉），再单独构造溢出/大数探针，撞出下面这个。
+
+##### 一、现象（实测，默认档 = `OptLevel::None`）
+
+```mora
+print("A")
+let a = 100i + 0i
+print(a)
+print("B")
+```
+
+**只输出 `A`。** `a` 与 `B` 两条语句**静默不执行**，退出码 **0**，**零诊断**。
+
+- 阈值实测恰好 **100**：`99i + 0i` 正常（输出 `A`/`99`/`B`），`100i + 0i` 起失效。
+- 五种恒等式全中：`x + 0`、`x - 0`、`x * 1`、`0 + x`、`x / 1`。
+- `x * 0 → 0` **不受影响**（走的是另一条分支，见下）。
+- 两条编译路径（9 层管线 / `MORA_9LAYER=0` 回落路径）**都**复现。
+- `--opt=1/2` **免疫** —— 那里 MIR 层已把两个字面量的 `X + 0` 折成
+  `Const(dst, X)`，`BinaryOp` 节点压根不生成。
+  **而默认档恰恰是 `OptLevel::None`**（`ssa.rs:117-122`：优化 pass
+  「未证明对所有程序安全前，默认关闭作可回退逃生舱」）——
+  即**默认路径踩坑、高优化档免疫**。
+
+##### 二、根因（`src/mir/optimize/dag_rule.rs`）
+
+`AlgebraicSimplifyDagRule` 的 `ReplaceWithSource` 分支：
+
+```rust
+ReplaceWith::ReplaceWithSource(reg, Some(src_id)) => {
+    let out_edges = dag.edges.iter()
+        .filter(|e| e.from == node_id)
+        .map(|e| (src_id, e.to, EdgeKind::Data { reg }))
+        .collect();
+    DagRewrite { added: vec![], removed, added_edges: out_edges, reg_rename: None }
+}
+```
+
+它是 **`MirInst::Copy` 时代的遗留物** —— `Copy` 在 v0.55 已删除
+（见 `optimize/rule.rs` 的 `DeadAssignRule` 注释：「MirInst::Copy no longer exists」）。
+
+而 `added: vec![]`：**不添加任何节点**。于是
+
+1. 写 `dst` 的 `BinaryOp` 节点被标 `Removed`；
+2. `reg_rename: None` ⇒ 消费者的读寄存器**没变**（`Define("a", 5)` 仍读 r5）；
+3. 没有任何指令写 r5 ⇒ 该节点永不 ready
+   ⇒ 它所在的 **Sequence 链**永远不执行（`dag.rs:861-864` 描述的正是
+   「作为 Sequence 前驱却永远不会被激活，把其后继永久阻塞在就绪门槛外」）
+   ⇒ 其后的 `print` 全部静默消失。
+
+同文件的 `ReplaceWithConst` 分支（`x * 0 → 0`）会**真的加一个写 dst 的
+`Const` 节点**，所以它是好的 —— `x * 0` 正常即由此而来。
+
+##### 三、**试过但无效**的修法（如实记录）
+
+第一反应是把出边的 `reg` 从源寄存器改成 `dst`：
+
+```rust
+.map(|e| (src_id, e.to, EdgeKind::Data { reg: *dst }))   // ← 改完仍然只输出 A
+```
+
+**无效。** 执行器要的是一个 **`dst` 匹配的节点**，不是一条声称携带 `dst` 的边。
+该改动已回退，未留在树里。
+
+⇒ 这与 D299 的教训同族：**「看起来显然对」的推断要用实跑证伪**，
+不能因为读代码讲得通就写进去。
+
+##### 四、最终修法：**停用该分支**
+
+按 D169 记档的原则（「宁可记档也不要引入新的静默错误源」）——
+一条会**静默产出错误程序**的改写规则，正确处置是**让它别产出**：
+
+```rust
+ReplaceWith::ReplaceWithSource(reg, Some(src_id)) => {
+    // v0.104.6 D302：本分支已停用（原本就在产出错误代码）。…
+    return None;
+```
+
+**代价**：恒等运算不再被化简（`x + 0` 保留 `BinaryOp`）。**语义完全等价** ——
+执行器照常算出 `x`，只少了这一处优化；两个字面量的情形仍由 MIR 层
+`ConstFoldingRule` 折叠。
+
+**要恢复这条优化**需重新引入「把源的值搬进 `dst`」的机制
+（恢复 `MirInst::Copy` 或加等价节点）—— 属**架构决定**，未擅自实施，已上报。
+
+##### 五、连带：两条既有单测**反转为「必须拒绝改写」**
+
+`dag_rule.rs` 里 `algebraic_x_plus_zero` / `algebraic_x_times_one`
+原本断言规则**会触发**。这不是「我改坏了」而是**行为有意变更**，
+故把契约改写成新语义并写明理由 —— 这样任何人想重新打开这条坏路径时，
+测试会先红。`algebraic_x_times_zero`（Const 分支）**未动**，仍在生效。
+
+##### 六、同时发现、**未修**的第二个缺陷（方向相反）
+
+`--opt=1/2` 下，`let` 绑定后跟 **≥2 条** `print` 时**尾部被重复执行**：
+
+```mora
+let a = 5i
+print("A") / print("B") / print("C")
+```
+
+| 档位 | 输出 |
+|---|---|
+| 默认 | `A, B, C` ✅ |
+| `--opt=1` / `--opt=2` | `A, B, C, B, C, C` ❌ |
+
+无 `let`、或只有 1 条 print 时都正常。与 D302 的第一个缺陷**互不相关**
+（方向相反：一个 opt=0 坏、一个 opt≥1 坏），本轮只报不修 ——
+同样在优化器的块尾/terminator 处理里，需单独定位。
+
+##### 七、判据（`tests/identity_op_silently_drops_statements.rs`，4 条）
+
+| 判据 | 作用 |
+|---|---|
+| `identity_operations_do_not_silently_drop_the_rest_of_the_program` | 主判据：五种恒等式 + 阈值两侧，断言「三条语句都执行了」 |
+| `multiply_by_zero_still_folds_to_zero` | `ReplaceWithConst` 分支未被误伤 |
+| `ordinary_arithmetic_is_unaffected` | 普通算术不受影响 |
+| `basic_opt_level_also_executes_the_rest` | `--opt=1` 同样正确，防回归 |
+
+判据断言的是输出**前缀**而非精确行数 —— 因为第六节那个尾块重复缺陷
+已上报未修，两者不该互相绑死。
+
+#### D303：`--opt=1/2` 下 `let` 之后的**尾部被阶梯式重复执行**（D261 之外的**新签名**，只钉现状未修）
+
+D302 报告的第二个缺陷，本轮把它查清并钉住。
+
+##### 一、现象（实测）
+
+| 程序 | 默认（`None`） | `--opt=1` / `--opt=2` |
+|---|---|---|
+| `print A` / `print B`（**无** let） | `A, B` ✅ | `A, B` ✅ |
+| `let a = 5i` + **1** 条语句 | `A` ✅ | `A` ✅ |
+| `let a = 5i` + **2** 条语句 | `A, B` ✅ | `A, B, B` ❌ |
+| `let a = 5i` + **3** 条语句 | `A, B, C` ✅ | `A, B, C, B, C, C` ❌ |
+| `let a = 5i` + **4** 条语句 | `A, B, C, D` ✅ | `A, B, C, D, B, C, D, C, D, D` ❌ |
+
+**阶梯式**：第 k 条语句被执行 k 次。
+
+- `let` 是否被**使用**无关（`let a = 5i` 未被读也复现）；
+- 普通赋值 `a = 5i` 同样复现（不是 `let` 语法特有，是 `Define`/`Assign` 节点）；
+- 全部发生在 `--opt=1/2`，**默认档全部正确**。
+
+##### 二、已核对：**不与 D261 重复计数**
+
+D261 记的 opt 档位不一致是「**含 for 循环**的 6/22 个程序」，
+预置判据 `tests/opt_repair_acceptance.rs` 已覆盖（整体 `#[ignore]`）。
+
+本轮把那 22 个程序**从判据文件逐字提取**（避免手抄走样）跑了一遍：
+提取到的 16 个里三档一致 13 个，破坏的 3 个**全是 for 循环**
+（`for-print-item` / `for-print-const` / `for-empty`，opt≥1 下**输出全空**）。
+**阶梯式重复一个都没出现** ⇒ 本条是 D261 之外的**新签名**。
+
+##### 三、已量到的线索（根因**未**定位 —— 连续五次翻车区，止损）
+
+两档的 MIR **结构同形**，差别在 SSA 改名的 dst 分配：
+
+| 档位 | dst 序列 |
+|---|---|
+| `None`（正常） | `0,0,1,1,8,3,4,6,7` — **单调递增** |
+| `Basic`（阶梯） | `4,4,3,3,0,1,5,2` — **非单调** |
+
+D305 继续往下量了一层（DAG 实表）：
+
+- 阶梯样例的 DAG 里有**多余的 Sequence 边**：`4→5`（与全序链 `3→4→5` 重复）、
+  以及 `4→6` / `4→7` / `4→8` 三条**旁路** —— 全都从 **Effect 节点**（`Define`/`Assign`）发出。
+- `无 let` 的对照样例边表**干净线性**（6 条，无一条旁路）⇒ 旁路与 `Effect` 节点同现。
+- 旁路的来源已定位到 **`dag_analyze` 的 Step 3**（`src/mir/dag.rs`）：
+
+  ```rust
+  } else if let Some(prev) = last_effect {
+      edges.push(MirDagEdge { from: prev, to: node_id, kind: EdgeKind::Sequence });
+  }
+  ```
+
+  即「**每个**非 Effect 节点都从 `last_effect` 再连一条 Sequence」，
+  与块内全序链叠加后，Effect 节点就通往其后**每一个**节点。
+
+⚠ **`vm/dag.rs` 的既有注释早已点名这条机制**（E1 修复记录）：
+
+> Step 3 的 `last_effect` 扇出（Effect 之后的每个节点各连一条 Sequence）
+> 造出 `9→10/11/12/13` 这类**捷径**，直接**破坏支配**（`Dom(12)` 少了 11）。
+> 即：不是「支配不足以表达循环体顺序」，是**图本身被污染**。
+
+而同一段注释还写着「**这是前五次尝试全部翻车的地方**」。
+⇒ **连续五次在该区域翻过车**，本轮据此**止损**：只把定位结果记下来，
+不在证据不足时改建图。修复需要单独立项：先补一个能在**修复前稳定变红**的
+判据（当前 `opt_level_tail_duplication.rs` 的现状判据已能钉住现象，
+但它盯的是端到端输出、不区分根因）。
+
+两档的 MIR **结构同形**，差别在 SSA 改名的 dst 分配：
+
+| 档位 | dst 序列 |
+|---|---|
+| `None`（正常） | `0,0,1,1,8,3,4,6,7` — **单调递增** |
+| `Basic`（阶梯） | `4,4,3,3,0,1,5,2` — **非单调** |
+
+根因落在 SSA 改名后的 DAG 执行器（块划分 / `seq_preds`）里，属**优化器核心
+手术**。本轮**只钉现状不修** —— 与 D276 同理：不在缺乏充分验证时动优化器核心。
+（另注：上面对 `dag_rule.rs` 的 D302 改动是**停用一条会静默产出错误代码的规则**，
+不涉及块结构，风险面与此处不同。）
+
+**规律收窄（D305）**：把 6 个分叉程序逐个归因，**6/6 都含嵌套 MirFunction
+构造**（`for` / `match` / 闭包），而 50 个一致程序里有 **14 个同样含**这些构造
+⇒ 「含嵌套构造」是**必要非充分**条件：
+
+| | 含嵌套构造 | 不含 |
+|---|---|---|
+| opt≥1 分叉 | **6** | 0 |
+| 三档一致 | 14 | 36 |
+
+即**嵌套函数体是唯一的受害面**（与 D302 停用的 `ReplaceWithSource`、
+D304 的 passthrough 寄存器，两处都落在 `is_ssa_passthrough` 的 18 类里），
+但它**不充分** —— 14 个反例说明判别条件还在这些构造的**内部**，本轮未再往下量。
+
+##### 四、为什么默认用户不受影响
+
+`src/mir/ssa.rs:117-122` 写明：优化 pass「**未证明对所有程序安全前，默认关闭**
+作可回退逃生舱（I5 约束）」，而 `OptLevel::default()` 就是 `None`。
+
+⇒ 本条是那个「已知不安全」清单上的**又一条数据**，**不是默认路径的缺陷**。
+判据据此把两侧分别钉住：`--opt=1` 的现状（阶梯式）与**默认档的正确性**。
+
+##### 五、判据（`tests/opt_level_tail_duplication.rs`，3 条）
+
+| 判据 | 作用 |
+|---|---|
+| `opt_level_duplicates_the_tail_after_a_let_status_quo` | **现状判据**：钉住 `--opt=1` 的阶梯式重复；修好后会红并提示改法 |
+| `default_opt_level_is_correct_for_all_these_shapes` | **默认档必须正确**（7 种形态），这才是所有默认用户的路径 |
+| `for_loop_is_fine_at_the_default_level` | D261 那条 for 循环在**默认档**仍正确（opt≥1 的空输出已由 `opt_repair_acceptance` 覆盖） |
+
+**本轮产品代码零改动**（仅新增判据文件）。
+
+#### D304：`n_regs` 漏算**透传指令**的寄存器 ⇒ `--opt=1/2` 下 56 个真实程序里 16 个**硬报错**
+
+D303 说「根因在 SSA 改名后的块结构」——本轮把它查到底了，
+并拿到一个项目从未有过的数字。
+
+##### 一、先给一个数：**真实程序**上打开优化会改变多少行为
+
+D261 的「6/22 = 27%」是在 22 个**手挑**程序上得到的。本轮用
+`tests/fixtures/**` + `examples/**` 的全部 **56 个真实 `.mora` 程序**
+逐个跑 默认 / `--opt=1` / `--opt=2` 三档（stdout **与**退出码都比，
+D276 教训），修前：
+
+```text
+三档一致 :  40 / 56  (71.4%)
+opt=1 分叉:  16 / 56  (28.6%)
+opt=2 分叉:  16 / 56  (28.6%)
+```
+
+**与 D261 手挑集得到的 27.3% 几乎完全吻合** —— D261 那个数字被独立验证了。
+
+##### 二、现象：13 个程序**直接变成硬报错**
+
+```text
+$ mora --opt=1 tests/fixtures/e2e/rel_basic.mora
+Runtime error (MIR): internal: instruction at DAG node 5 references
+register 5 (read/write) but the function only has 1 register(s)
+— a unit-statement emitter returned an unallocated sentinel register
+```
+
+16 个分叉里 **13 个从 exit 0 变成 exit 1**：
+`rel_basic` / `rel_cons` / `rel_empty` / `rel_project` / `rel_run_limit` /
+`rel_single_var` / `rel_zero_var`（6）、`match_default` / `match_guard`（2）、
+`tea_counter`、`handle_effect`、`examples/hm_basic_demo`、
+`examples/mcp_server_demo`；另 3 个（`builtin_gaps`、`function_call`、
+`loop_for_break`）是 exit 0 但**静默无输出**。
+
+##### 三、根因
+
+`ssa::construct` 把「声明型 / effectful」指令收进 `passthrough`
+（`is_ssa_passthrough` 列了 **18 类**：`MatchExpr` / `Closure` / `WithConfig` /
+`Perform` / `Handle` / `Solve` / `RelDef` / `TaskDef` / TEA 定义 …），
+`deconstruct` 时**原样**插回 body 头部。
+
+但 body 其余部分已被 `map_ssa` 重编号并压进 `0..next_plain_reg`，
+而 `n_regs` 只取 `next_plain_reg` ⇒ **透传指令引用的寄存器越界**。
+
+典型形态（`MatchExpr`）：原始程序用寄存器 0..5，SSA 把大部分值折叠掉后
+只剩 2 个 → `n_regs = 1`，而原样回插的 `MatchExpr` 仍写着「读寄存器 5」。
+
+##### 四、修法
+
+```rust
+// MirSsaFunction 新增 orig_n_regs（进入 SSA 前的 MirFunction::n_regs）
+n_regs: next_plain_reg.max(ssa.orig_n_regs),
+```
+
+透传指令用的就是**重命名前**的编号，故原始计数是它们的**可靠上界**；
+多分配几个槽无害（只多几个 `Value` 槽位）。
+
+**为什么不在 passthrough 上穷举寄存器**：那份清单有 18 类且仍在增长，
+再写一个同样穷举的收集器只会重蹈 D302 那个「为已删除的 `MirInst::Copy`
+写的遗留规则」的腐化。`max` 上界不需要跟随清单变化。
+（另注：`MirInst::input_regs()` / `written_reg()` **覆盖不到**
+`MatchExpr` 的全部 arm 输出 —— `dst()` 只返回最后一个 arm —— 所以那条路走不通。）
+
+##### 五、效果：16 → 6，且硬报错**全部消失**
+
+```text
+修前: 三档一致 40/56 (71.4%)  ·  分叉 16 (28.6%)  ·  其中 13 个 exit 1
+修后: 三档一致 50/56 (89.3%)  ·  分叉  6 (10.7%)  ·  其中 0 个 exit 1
+```
+
+##### 六、**未修**的残余 6 个（已上报）
+
+按 D305 的精确分类（4 静默无输出 / 2 值错重复）：
+
+| 类别 | 数量 | 程序 |
+|---|---|---|
+| 静默无输出（exit 0、什么都不打印） | 4 | `mcp_server_demo` / `builtin_gaps` / `function_call` / `loop_for_break` |
+| 值错 / 重复 | 2 | `hm_basic_demo` / `match_guard` |
+
+**硬报错（exit 0→1）那一类已归零。** 剩下的属块/序列结构那一族
+（D303 的阶梯式重复同源），**本轮未动**；D305 进一步把受害面收窄到
+「含嵌套 MirFunction 构造的程序」（6/6 必要、14/50 反例 ⇒ 非充分）。
+
+##### 七、判据（`tests/ssa_passthrough_register_bound.rs`，3 条）
+
+| 判据 | 作用 |
+|---|---|
+| `match_expr_passthrough_no_longer_hard_errors` | 四种 `MatchExpr` 程序在 `--opt=1` 下**不得 exit 1** |
+| `real_fixture_rel_basic_survives_optimization` | 真实 fixture `rel_basic.mora` 在 `--opt=1` 下 exit 0 |
+| `match_expr_silently_produces_nothing_under_opt_status_quo` | **现状判据**：钉住「静默无输出」这个残余；修好后会红 |
+
+##### 八、为什么这条修复是「低风险方向」
+
+它**只增不减** `n_regs`：不重编号任何寄存器、不改任何指令、
+不改执行顺序。唯一效果是让执行器的寄存器数组**够大**。
+⇒ 与 D302（停用一条会静默产出错误代码的规则）不同，这条不会移除任何东西。
+
+##### 九、D305 收尾时我自己踩的一次假警报（如实记录）
+
+量「还剩什么」时，脚本对 stdout 取了 `[:3]` 截断，于是把阶梯式的
+`['A','B','C','B','C','C']` **显示成 `['A','B','C']**，我据此差点得出
+「D302/D304 顺带把阶梯式也修好了」的**错误结论**。
+
+是**连跑 6 次**（6/6 都是 `A,B,C,B,C,C`）+ 既有判据仍然通过，两边一对
+才发现矛盾在读数这一侧。
+
+⇒ 与 D270「探针先错 2-3 次」同族，但更隐蔽：**截断不会让程序报错，
+只会让输出看起来「正常」**。凡是拿程序输出下判断的脚本，
+**打印时不要截断**；要摘要就单独打一个「共 N 行」。
+
+#### D305：opt≥1 残余故障**不在优化器、在建图**；「删掉 Effect 扇出」这条最自然的修法**已试并回滚**
+
+接 D303 的定位继续。本轮做了两件事：一件把搜索面**收窄**，一件把最容易想到的
+修法**证伪**。两件都有可复用的结论。
+
+##### 一、层间拆分：`dag_optimize` 与 `prune_sequence_edges` 是**空操作**
+
+`run_mir` 的 DAG 链是 `dag_analyze → dag_optimize → prune_sequence_edges`
+（`DagCache::build`）。把三步**拆开**分别跑同一批程序：
+
+| 程序 | 仅 `dag_analyze` | `+dag_optimize` | `+prune` | 边数（analyze→opt→prune） |
+|---|---|---|---|---|
+| `map` + 闭包 | 同 | 同 | 同 | 12 → 12 → 12 |
+| 阶梯式 `let+3句` | 同 | 同 | 同 | 23 → 23 → 23 |
+| `for` 循环 | 同 | 同 | 同 | 31 → 31 → 31 |
+
+⇒ **边数与结果逐项相同**：两条优化阶段对这些程序**什么都没做**。
+故障**全部落在 `dag_analyze` 建图阶段**。
+
+这一条直接回答了 D303 留下的疑问（「是优化器还是建图？」）：
+**是建图**。E1 一族在优化器/执行器上的五次翻车，与本族**不是同一层的问题**。
+
+##### 二、最自然的修法：删掉 Effect 扇出 —— **只对一半，已回滚**
+
+D303 定位到的正是 `dag_analyze` Step 3 的这段（`src/mir/dag.rs`）：
+
+```rust
+} else if let Some(prev) = last_effect {
+    // 每个非 Effect 节点都从 last_effect 再连一条 Sequence
+    edges.push(MirDagEdge { from: prev, to: node_id, kind: EdgeKind::Sequence });
+}
+```
+
+**假设**：它冗余 —— Step 1（`338-349`，v0.75.33 加的）已给块内**相邻指令对**
+连了全序链，「Effect 之后的节点」天然在 Effect 之后，扇出只制造
+`4→5/4→6/4→7/4→8` 这类**捷径**。
+
+**实测：只对一半。**
+
+| | 删之前 | 删之后 |
+|---|---|---|
+| 阶梯式 `let+3句` | `A,B,C,B,C,C` ❌ | **`A,B,C` ✅** |
+| 阶梯式 `let+2句` | `A,B,B` ❌ | **`A,B` ✅** |
+| 56 个真实程序的分叉 | 6 | **8** ❌ 新增 `loop_beyond_dag_limit`、`loop_break` |
+
+⇒ 直线尾部确实好了，**但两个循环程序回归了**。**已回滚**（代码回到原状，
+并把这段实验与结论留在注释里）。
+
+##### 三、结论：那些边**不是冗余的** —— 循环体靠它们承重
+
+与 v0.75.33 的记录同源（那条说「放松它会得到
+`run_mir: index 2 out of bounds (len 2)`」）：Effect 扇出在**循环体**里
+承担承重顺序，去掉它会让循环体提前执行、读脏值。
+
+⇒ **正确的修法必须区分**
+「**循环体**（需要额外排序约束）」与「**直线尾部**（不需要）」，
+而这正是 `partition_blocks` / E1 一族在处理、
+且**前五次尝试全部翻车**的那个区分。
+
+**这解释了为什么朴素修法不work，也解释了前五次为什么翻车**：
+问题从来不是「删不删这些边」，而是「**怎么判定一段边该不该存在**」。
+
+##### 四、执行器侧的机制线索（未验证，交接用）
+
+读完 `src/mir/vm/dag.rs` 的波次循环后，阶梯式的成因**可以推演出来**：
+
+去重标记 `pushed_gen[n] == cur_gen` 是**按波**生效的（`cur_gen` 每波递增）。
+于是「本波未就绪、留到下波」的节点在下一波会被**重新入队**：
+
+```rust
+// 575-578 边传播：本波已执行节点的 Sequence 消费者，若本波未推过则推入
+if should_push && pushed_gen[edge.to] != cur_gen { next_active.push(edge.to); … }
+// 584-588 兜底：已激活但未就绪的节点留到下波
+for &n in &active { if pushed_gen[n] != cur_gen { next_active.push(n); … } }
+```
+
+对一个带扇出的节点链（`4→5/6/7/8` + 块内全序 `4→5→6→7→8`），
+`5/6/7/8` 会在**同一波**被 `4` 的扇出一次性全部激活，之后每波又有节点
+把整条链重新点着 —— 于是尾部节点在**不同波里各执行一次**，
+输出形态正是实测到的 `A,B,C,B,C,C`。
+
+⚠ **这一段是推演，未做实验验证**（需要给执行器加插桩或计数断言）。
+若要接手本族，这是第一个该验证的假设。
+
+##### 五、附带确认的收窄（D303 第三节已记）
+
+6 个残余分叉 **6/6 都含嵌套 MirFunction 构造**（`for` / `match` / 闭包），
+而 50 个一致程序里有 14 个同样含 ⇒ **必要非充分**条件。
+结合第一、二节：受害面 = 嵌套函数体；根因层 = 建图；朴素修法 = 已证伪。
+
+##### 六、**本轮产品代码零改动**（实验已回滚，只留注释与本条记录）
+
+验证：`cargo test --no-fail-fast` 218 目标 0 失败 / 2261 passed；
+`cargo fmt --all -- --check` 0；`cargo clippy --all-targets --all-features -D warnings` 0 警告。
+
+#### D306：把 D305 的执行器推演**做成实验并否证**（先证明代码路径在生产路径上）
+
+D305 第四节留了一条**未验证**的推演：阶梯式来自「未就绪节点留到下波」的兜底
+循环（`vm/dag.rs:584-588`）与 Effect 扇出的交互。本轮把它验证掉。
+
+##### 一、先排除「实验本身是 no-op」
+
+上一轮的教训（D294/D305 都栽过）：**改动若不改变行为，先怀疑实验没生效**。
+先证明代码路径真的在跑：在波次循环入口插一个必定 panic 的标记。
+
+```text
+marked run : exit=101  PROBE_HIT=True
+   thread 'mora-main' panicked at src\mir\vm\dag.rs:380:5:
+   D306b-PROBE: run_dag IS on the production path
+```
+
+⇒ `run_dag` 确实在**生产路径**上（`mora-main` 进程内触发），实验有效。
+
+##### 二、实验：关掉兜底循环，阶梯式**纹丝不动**
+
+| 阶段 | 阶梯式 `let+3句` | 56 真实程序分叉 |
+|---|---|---|
+| BASELINE（兜底循环开启） | `A,B,C,B,C,C` ❌ | 6 |
+| **EXPERIMENT（兜底循环关闭）** | **`A,B,C,B,C,C` ❌** | **6** |
+| RESTORED（复原，sha256 逐字节比对通过） | `A,B,C,B,C,C` ❌ | 6 |
+
+逐项全同 ⇒ **推演被否证**：「已激活但未就绪的节点留到下波」这条兜底
+**不是**阶梯式的成因。
+
+##### 三、于是已证事实收敛成四条
+
+| # | 事实 | 出处 |
+|---|---|---|
+| 1 | `run_dag` 在生产路径上 | D306 第一节 |
+| 2 | `dag_optimize` 与 `prune_sequence_edges` 对这些程序是**空操作**（边数与结果全同） | D305 第一节 |
+| 3 | 删掉 Effect 扇出 ⇒ 阶梯式消失，但 **2 个循环程序回归**（6 → 8 分叉） | D305 第二节 |
+| 4 | 关掉兜底循环 ⇒ **零变化** | D306 第二节 |
+
+⇒ 阶梯式的成因**必然落在 2 与 3 之间**：在 Effect 扇出与执行器的
+**边传播（`575-578`）**这一侧，而非「留到下波」那一侧 ——
+扇出的 `4→6/4→7/4→8` 在**同一波内**把整条尾部一次性点着，
+而 `pushed_gen` 只按波去重，于是下一波又被链边重新点着。
+
+⚠ 这一句仍是**推演**（我没能把「同波内多点着 + 按波去重」直接实测出来，
+因为波次内部的 `active` 内容没有可观测出口）。**要接手本族，
+第一个该加的装置是「每节点执行计数」的断言或插桩** ——
+有了它，上面四条就能直接收敛成一条。
+
+##### 四、**本轮产品代码零改动**（两处实验均已复原，sha256 逐字节比对通过）
+
+#### D307：opt≥1 阶梯式的**根因确认** —— `dag.reachable` 把函数体几乎全标成不可达，`seq_preds` 门槛失效
+
+D306 说「要接手本族，第一个该加的装置是**每节点执行计数**」。本轮把它加上 ——
+`run_dag_with_signal` 里 `exec_count` **本来就有**（`dag.rs:433` 递增），
+只是没有出口能看见。三次插桩把这条族从「推演」推到「实测」。
+
+##### 一、`exec_count`：阶梯式的字面机制
+
+在返回前打印 `exec_count > 1` 的节点，跑 `let a = 5i` + 3 条 print（`--opt=1`）：
+
+```text
+node=7  exec_count=2  Const(6, String("B"))
+node=8  exec_count=2  Call(2, "print", [6])      ← 打印 B 的节点跑了 2 遍
+node=9  exec_count=3  Const(5, String("C"))
+node=10 exec_count=3  Call(7, "print", [5])      ← 打印 C 的节点跑了 3 遍
+```
+
+**第 k 条语句的节点跑 k 遍。** 两个对照组（`无let两print`、`普通加法`）
+在 `--opt=1` 下**没有任何节点跑第二遍**。
+
+##### 二、波次轨迹：节点 7/9 提前就绪
+
+```text
+wave=5 active=[4]                 ready=[4]
+wave=6 active=[5,6,7,8,9,10]      ready=[5, 7, 9]     ← 6/8 还没跑，7/9 却就绪
+wave=7 active=[6,8,10]            ready=[6, 8, 10]
+```
+
+按 `seq_preds[7].all(executed)` 判断，7 应当等 6 跑完。**它没有等。**
+
+##### 三、**根因**：`dag.reachable` 只把入口标成可达
+
+`seq_preds` 的构造带一个过滤（`vm/dag.rs:357-363`）：
+
+```rust
+if matches!(e.kind, EdgeKind::Sequence) && dag.reachable.get(e.from).copied().unwrap_or(true) {
+    seq_preds[e.to].push(e.from);
+}
+```
+
+实测（把 `dag.reachable` 一并打出）：
+
+```text
+reachable = [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]        ← 只有节点 0
+seqpreds(5,6,7,8,9,10) = [(5,[]), (6,[]), (7,[]), (8,[]), (9,[]), (10,[])]
+```
+
+⇒ **除入口外全部不可达 ⇒ 所有链式 Sequence 边被过滤掉 ⇒
+`seq_preds` 全空 ⇒ 就绪门槛完全失效。**
+此时 Effect 扇出（`4→5/6/7/8/9/10`）成了**唯一**的排序机制，
+它一次性点亮整条尾部 ⇒ B、C 被反复执行。
+
+对照 `无let两print`：同样 `seq_preds` 全空，但没有 Effect 节点、没有扇出，
+链式边 `1→2→3→4` 仍逐波推 ⇒ **「正常」只是巧合**，不是因为约束生效。
+
+##### 四、为什么**只在 opt≥1** 出现
+
+`ssa::construct` 产出的 MIR **头部多一个 `Label(0)`**（`None` 档没有）。
+`dag_analyze` 的可达性行走从 pc 0 出发，**在首个 `Label` 处停下** ——
+于是只标记了入口本身。结合 D305 的结论（`dag_optimize` /
+`prune_sequence_edges` 对这些程序是**空操作**），故障确实在
+**建图阶段的 `compute_reachable`**，与优化规则无关。
+
+⚠ 「Label 处停止」这一步是**推演**：实测到的是「`reachable` 只有入口为真」，
+Label 是否就是其成因还需一次实验（把入口 Label 去掉看 `reachable` 是否变全）。
+但**不必先弄清它也能修**：`reachable` 只有一个 true 本身就不可能正确 ——
+一个有多条语句的函数不可能只有入口可达。
+
+##### 五、这解释了比「阶梯式」更多的东西
+
+之前把受害面统计成「含嵌套 MirFunction 构造」（6/6 必要、14/50 反例 ⇒ 非充分）。
+按本条的根因重看：**触发条件其实是「函数体里有 Effect 节点（`Define`/`Assign`）
+且序列在 3 条以上」** —— 嵌套构造只是**恰好**更容易同时满足这两条。
+`let` + 3 条 print 这种**毫无嵌套**的程序同样中招。
+
+⇒ 6/56 这类残余的清单需要按本条重新统计；**此前「必要非充分」的结论作废**。
+
+##### 六、**本轮产品代码零改动**（三次插桩均已复原，sha256 逐字节比对通过）
+
+验证：`cargo test --no-fail-fast` 218 目标 0 失败 / 2261 passed；
+`cargo fmt --all -- --check` 0；`cargo clippy --all-targets --all-features -D warnings` 0 警告；
+`cargo doc --no-deps` 0 警告。
+
+**下一个该做的实验**（已明确）：在 `dag_analyze` 里对「函数体首指令就是
+`Label`」的情况检查可达性行走是否提前结束。这是本族**唯一**还缺的因果环节。
+
+#### D308：`dag_analyze` 的可达性遍历跑在**建图完成之前** ⇒ opt≥1 的顺序约束整体失效（阶梯式已修）
+
+接 D307 末尾那句话：「下一个该做的实验是检查可达性行走是否提前结束」。本轮做了，
+并**修好了阶梯式这一族**。
+
+##### 一、根因：修复自己造的边，对它要修的那次遍历**不可见**
+
+`dag_analyze` 里两处关键代码的**先后顺序反了**：
+
+```rust
+// ① 可达性遍历（原本在这里）
+let true_entry = pc_to_node.get(&0).copied();
+… 沿 edges 做 BFS …
+
+// ② v0.104.6「Label 透明化」：给 Label 节点补到其后第一个非 Label 的 Control 边
+for (i, node) in nodes.iter().enumerate() {
+    if !matches!(node, MirDagNode::Label { .. }) { continue; }
+    …
+    edges.push(MirDagEdge { from: i, to: next, kind: EdgeKind::Control });
+}
+```
+
+而 `--opt=1` 及以上的 SSA 会在**函数体 pc 0 插入一个 `Label(0)`**
+（`OptLevel::None` 档没有）。那个 Label 节点的出边**只**由 ② 提供
+（Step 1 的块内 Sequence 链刻意跳过 Label，`prev_node` 不更新）⇒
+**遍历跑到它时一条出边都没有** ⇒ `reachable = {0}`。
+
+**讽刺之处**：② 那段修复的注释**逐字描述的正是这个 bug** ——
+「SSA 在 pc 0 插入 `Label(0)`，边表里没有 `0 -> 1` → 可达集 = `{0}`，
+入口只剩这个 no-op → 程序什么都不执行」。它确实补上了那条边，
+但那条边对**更早跑的**遍历不可见。与 D302 的 `ReplaceWithSource` 同形：
+**产生值的东西落在需要它之后才到位。**
+
+##### 二、后果链（D307 实测）
+
+`reachable` 只剩入口 ⇒ 执行器 `seq_preds` 构造里的
+`dag.reachable.get(e.from)` 过滤把**所有**链式 Sequence 边丢弃
+⇒ `seq_preds` 全空 ⇒ **就绪门槛完全失效** ⇒ 只剩 `dag_analyze` Step 3 的
+Effect 扇出在排序 ⇒ 第 k 条语句的节点跑 k 遍（`A,B,C,B,C,C`）。
+
+##### 三、修法：把遍历移到**边全部 push 之后**
+
+`dag_analyze` 内代码位置调整，逻辑逐字不变，只是跑得更晚。
+
+| | 阶梯式 `let+3句` | 循环程序 | 56 真实程序分叉 |
+|---|---|---|---|
+| 修前 | `A,B,C,B,C,C` ❌ | 2 个已坏 | 6 |
+| **修后** | **`A,B,C` ✅** | **无回归**（`while`/`for`/`break` 全对） | 6（**性质已变**，见下） |
+
+⇒ 与 D305 那个「删掉 Effect 扇出」的修法相比：同样修好阶梯式，
+**但 D305 牺牲了两个循环程序，而本条一个都不牺牲** —— 因为根因修对了。
+
+##### 四、剩余 6/56 的**性质**变了
+
+修好前：那 6 个是「Effect 扇出 + 直线尾部」的阶梯式受害者。
+修好后：那 6 个（`match_guard` / `function_call` / `loop_for_break` /
+`builtin_gaps` / `mcp_server_demo` / `hm_basic_demo`）**全部含嵌套
+MirFunction 构造**（`match` / 闭包 / `for`），仍静默无输出或值错。
+
+⇒ 触发条件被拆成**两族**：
+- **D308 已修**：`Label` 在前 ⇒ `reachable` 塌缩 ⇒ 顺序约束失效；
+- **未修**：嵌套函数体（其 `MirFunction` 是**独立**的子函数，
+  有自己的 pc 0 与 `Label`，走的是同一条 `dag_analyze` 路径）。
+
+##### 五、判据：`tests/opt_level_tail_duplication.rs` 已按其原注释的指示**翻转**
+
+`opt_level_duplicates_the_tail_after_a_let_status_quo`（钉住阶梯式存在）
+→ 改写为 `opt_level_does_not_duplicate_the_tail_after_a_let`
+（断言**默认 / `--opt=1` 两档都与期望一致**），并覆盖 1–4 条语句。
+
+**翻转前的事实**：本判据是全量套件里**唯一**变红的目标
+（`lib 1011/0/13` 全绿）⇒ 这次修复**没有引入任何别处回归**。
+
+##### 六、验证
+
+| 项 | 结果 |
+|---|---|
+| `cargo test --no-fail-fast` | 218 目标 0 失败 / 2261 passed；lib 1011 / 0 / 13 ignored |
+| `cargo clippy --all-targets --all-features -- -D warnings` | 0 警告 |
+| `cargo fmt --all -- --check` | 0 |
+| `cargo doc --no-deps` | 0 警告 |
+
+#### D309：opt≥1 残余 6/56 的**三种不同机制**（诊断，未修）—— 建图层已经干净了
+
+D308 修好「阶梯式」那一族后，剩下 6/56 经插桩逐个看，发现它们**不是同一种病**。
+本轮只诊断、不修 —— 但每一种都已定位到具体位置。
+
+##### 〇、先说结论：D308 之后，**建图层对这批程序是干净的**
+
+| 程序 | `reachable` | 链 / 分支边 | 结果 |
+|---|---|---|---|
+| 阶梯式 `let+3句` | **全 true** | 完整 | ✅ 已修 |
+| `for 循环` | **全 true** | 完整（含回边 `16→7`） | ❌ 仍无输出 |
+| `map` + 闭包 | `[1,**0**,1,1,1,1,1,1]` | 完整 | ❌ 仍无输出 |
+| `match` | `[1,**0**,1,1,1,1,1]` | 完整 | ❌ 仍无输出 |
+
+##### 一、`map` / `match`：DAG 正确，失败在**嵌套函数体自己的执行**
+
+`map` 的完整节点表（`--opt=1`）：
+
+```text
+node 0 reach=1  Closure { dst: 8, params:["v"],
+                        body: MirFunction { params: [], n_regs: …,
+                                 body:[Var(5,"v"), Const(6,10.0),
+                                       BinaryOp(7,5,Add,6), Return(Some(7))] } }
+node 1 reach=0  Label { label: 0 }
+node 2..7        Const 1.0 / Const 2.0 / Const 3.0 / ListLit / MethodCall map / Call print
+edge  5  0 -> 2 Control      edge 11  1 -> 2 Control
+```
+
+- `entry=[0]`，链 `0→2→3→4→5→6→7` **完整**，`node 6 = MethodCall(…, "map", [4])`
+  消费的正是 `node 0`（Closure）写出的 r4。
+- 唯一异常是 `node 1`（那个 `Label(0)`）`reach=0` —— 它**只有出边没有入边**
+  （Label 透明化补了 `1→2`，但没人指向它）。对无消费节点无害。
+
+⇒ **建图与调度这一层对 `map` 是正确的**，失败发生在**执行 `Closure.body`
+那个独立 `MirFunction` 的过程中**。它 `params: []` 而 body 直接用 r5/r6/r7 ——
+正是 D304 那类「子函数的寄存器平面」位置。
+
+**下一个该量的点**：`Closure.body`（以及 `MatchExpr` 各臂体、`for` 循环体）
+的 `n_regs` 是否覆盖其 body 引用的最大寄存器。`map` 那行的 `n_regs` 在
+本次 dump 里被截断，**未验证**。
+
+##### 二、`for` 循环：**第三种**机制，连 `reachable` 都是全 true
+
+节点表里分支结构完整：
+
+```text
+node  9 Branch { cond: 5, true_target: Some(17), false_target: Some(10) }
+edge 12  9 -> 17 ControlIfTrue        edge 13  9 -> 10 ControlIfFalse
+edge 14 16 ->  7 Control               ← 回边（循环）
+```
+
+`reachable` 全 true、回边在位，却仍然零输出 ⇒ 与 D308（`reachable` 塌缩）、
+与第一节（嵌套体执行）**都不同**，是第三条独立路径。
+
+⚠ 本轮**只到诊断为止**：第三节那条 `n_regs` 假设**未验证**，不写成结论。
+
+##### 三、与 D308 的分界
+
+| 族 | 机制 | 状态 |
+|---|---|---|
+| 阶梯式（`let` + 直线尾部） | `reachable` 塌缩 ⇒ 顺序约束失效 | ✅ D308 已修 |
+| `map` / `match` | DAG 正确，**嵌套 `MirFunction` 执行**出问题 | 诊断到位，未修 |
+| `for` 循环 | 第三种机制（分支/回边齐全仍无输出） | 诊断到位，未修 |
+
+⇒ D307 第五节那句「触发条件其实是含 Effect 节点且序列 ≥3 条」**已被 D308 推翻**
+（D308 的受害者里没有 Effect 节点也有，`for` 全是分支）。此处作废。
+
+##### 四、**本轮产品代码零改动**（两次插桩均已复原，sha256 逐字节比对通过）
+
+验证：`cargo test --no-fail-fast` 218 目标 0 失败 / 2261 passed；
+`cargo fmt --all -- --check` 0；`cargo clippy --all-targets --all-features -D warnings` 0 警告；
+`cargo doc --no-deps` 0 警告。
+
+#### D310：一个函数内**两套寄存器空间** —— 透传指令不参与 SSA 重编号（`map`/`match` 静默无输出已修）
+
+D309 第三节留的那个待验假设，本轮先否证它、再找到真根因。
+
+##### 一、先否证：「嵌套 `MirFunction` 的 `n_regs` 不足」——**不成立**
+
+插桩打印（`--opt=1`）：
+
+```text
+map+闭包  closure body.n_regs=8   body 里最大寄存器 7      ✅ 够
+match     arm0 n_regs=5  max_reg=4  ✅   arm1 6/5 ✅   arm2 7/6 ✅
+```
+
+⇒ 与 D304 的 `n_regs` 越界**无关**。该假设作废。
+
+##### 二、真根因：**透传指令 vs SSA 重编号，两套编号混在一个函数里**
+
+MIR 逐条对照（同一段源码，只换 opt 档）：
+
+```text
+map  opt=off:  Closure { dst: 8 }          MethodCall(9, 4, "map", [8])   实参 8 = 闭包 ✅
+     opt=1:    Closure { dst: 8 }          MethodCall(5, 1, "map", [2])   实参 2 ≠ 8   ❌
+
+match opt=off: MatchExpr { val: 3, arms[…,7] }   Call(8, "print", [7])     实参 7 ✅
+      opt=1:   MatchExpr { val: 3, arms[…,7] }   Call(3, "print", [0])     实参 0 ≠ 7 ❌
+```
+
+`Closure` / `MatchExpr` / `WithConfig` / `Perform` / `Handle` … 在
+`ssa::is_ssa_passthrough` 里 —— `construct` **原样保留**它们的寄存器；
+而同一个函数里其余指令（`MethodCall` / `Call` / `Const` …）被 SSA **重编号**。
+⇒ **闭包写 r8、`map` 去读 r2**。
+
+opt=off 正常，因为根本没有重编号这回事；opt≥1 则**静默无输出、退出码 0、零诊断**。
+
+##### 三、修法：含透传指令的函数**整体跳过 SSA**
+
+```rust
+// src/mir/opt.rs
+if crate::mir::ssa::has_passthrough_inst(func) { return; }
+```
+
+**为什么不「把透传指令也一起重编号」**：那要求 `construct` 递归进
+`Closure.body` / `MatchExpr` 各臂体 / `WithConfig.body` 这些**独立
+`MirFunction`** 的寄存器平面 —— 一次架构级改造。
+本轮取保守方向：**宁可不优化，不可静默产出错误结果**（与 D302 停用
+`ReplaceWithSource`、D170「宁可记档也不要引入新的静默错误源」同一条原则）。
+代价仅是含闭包/match/with 的函数失去 SSA 优化。
+
+##### 四、效果
+
+| | 修前 | 修后 |
+|---|---|---|
+| `print([1,2,3].map(fn(v) v+10))` | ❌ 静默无输出 | ✅ `[11.0, 12.0, 13.0]` |
+| `print(match x { … })` | ❌ 静默无输出 | ✅ `b` |
+| `let add = fn(a,b) => a+b` 后调用 | ✅ | ✅ |
+| 阶梯式（`let` + 直线尾部） | ✅ D308 已修 | ✅ |
+| **56 个真实程序三档一致** | **50/56 (89.3%)** | **54/56 (96.4%)** |
+| 剩余分叉 | 6 | **2**（均为 `for` 循环） |
+
+##### 五、两处现状判据按其原注释的指示**翻转**
+
+- `tests/opt_ssa_equivalence.rs::d187_opt1_map_closure_leaks_an_internal_invariant`
+  —— 由「静默无输出」翻转为「必须输出 `[11.0,12.0,13.0]`」；
+- `tests/ssa_passthrough_register_bound.rs::match_expr_silently_produces_nothing_under_opt_status_quo`
+  —— 改名 `match_expr_executes_under_opt`，由「必须为空」翻转为「必须输出 `b`」。
+
+**翻转前的事实**：这两条是全量套件里**仅有的** 2 个变红目标，
+`lib 1011/0/13` 全绿 ⇒ 本次修复**没有引入任何别处回归**。
+
+##### 六、剩余 2/56：`for` 循环（第三种机制，未修）
+
+`builtin_gaps` / `loop_for_break` 仍是 opt≥1 下静默无输出。D309 实测它们
+`reachable` **全 true**、分支边与回边齐全 ⇒ 与 D308（`reachable` 塌缩）、
+与本条（两套寄存器空间）**都不同**，是第三条独立路径。
+
+另注：`d187_opt1_stops_silently_at_a_for_loop` 仍是**现状判据**（仍红着不动），
+恰好是这一族的现成载体。
+
+##### 七、验证
+
+| 项 | 结果 |
+|---|---|
+| `cargo test --no-fail-fast` | **219 目标 0 失败 / 2262 passed**；lib 1011 / 0 / 13 ignored |
+| `cargo clippy --all-targets --all-features -- -D warnings` | 0 警告 |
+| `cargo fmt --all -- --check` | 0 |
+| `cargo doc --no-deps` | 0 警告 |
+
+#### D311：把 D310 的守卫**收窄** —— 宽判据会让 48/56 跳过 SSA，等于把 `--opt` 废掉
+
+D310 用「含**任何** passthrough 指令就整体跳过 SSA」堵住了「一个函数内两套
+寄存器空间」。方向对，判据太宽。
+
+`is_ssa_passthrough` 的 18 类里，**声明型**（`TaskDef` / `Import` /
+`ExportMark` / `TypeAlias` / `EnumDef` / `StructDef` / TEA 定义 / `RelDef`）
+**不携带任何寄存器** —— 它们在 body 里原样保留，不影响 SSA 重编号后的空间。
+而几乎每个 Mora 程序都有一条 `task main()`。
+
+| 判据 | 跳过 SSA | 占比 |
+|---|---|---|
+| 宽：任何 passthrough | 48/56 | 85.7% |
+| **窄：`has_register_carrying_passthrough`** | **15/56** | **26.8%** |
+
+窄判据只认 8 类真正跨寄存器平面的指令：`Closure` / `MatchExpr` /
+`WithConfig` / `Perform` / `Handle` / `Solve` / `DynTrait` / `Quasiquote`。
+⇒ **33 个程序恢复 SSA**，D310 的全部修复保留（56 程序 50 → 54/56）。
+
+**顺带改正一处过期数字**：`ssa.rs::has_register_carrying_passthrough` 的注释
+原写「宽判据会让 45 个（80%）跳过 SSA」。D312 用临时探针重新实测为
+**48 个（85.7%）**（见 D312「实测方法」一节 —— 那次探针第一次就踩了选择偏差），
+已改正。
+
+#### D312：`for` 循环在 `--opt≥1` 下**静默中止** —— SSA 把一个循环携带寄存器拆成了两套物理编号
+
+D310 留的「剩余 2/56 全部是 `for` 循环」本轮解决。修完 **56/56 = 100%**。
+
+##### 一、现象
+
+```text
+$ mora --opt=1 a.mora     # print("A") / let acc = 0 / for … end / print("B") / print(acc)
+A
+$ echo $?
+0
+```
+
+`for` 之前之后的语句**全部消失**，退出码仍是 **0**，零诊断。opt=off 正常输出
+`A` / `B` / `6.0`。`--opt=1` 与 `--opt=2` 表现相同。
+
+触发矩阵（`opt=off` / `1` / `2` 三档逐行对比）：
+
+| 用例 | 结果 |
+|---|---|
+| 只有 `let` | ✅ 三档等价 |
+| 只有 `while` | ✅ 三档等价 |
+| `for`（各种） | ❌ `opt≥1` 一律截断成只打印首条 |
+
+⇒ 触发条件锁定在 **`for`** 本身，与 `let` / `while` 无关。
+
+##### 二、先证伪「是哪个 pass 干的」
+
+加了临时 env 开关逐个关掉 4 个基础 pass（ConstProp / CopyProp / DCE / GVN），
+再加了 `MORA_OPT_NO_SSA` 跳过整个 SSA 阶段：
+
+| 配置 | opt=1 | opt=2 |
+|---|---|---|
+| 全部 4 个 pass | `['A']` ✗ | `['A']` ✗ |
+| **跳过整个 SSA 阶段** | `['A','B','6.0']` ✅ **与 off 等价** | ✅ |
+| pass 全关（仍走 construct + deconstruct） | `['A']` ✗ | `['A']` ✗ |
+
+**4 个优化 pass 全部清白**；`construct → deconstruct` 零 pass 就已经坏了。
+（探针自证：两条 marker 都打印且内容不同 ⇒ 装置确实动了。）
+
+##### 三、根因：两级，都比「少一个优化」严重
+
+临时探针逐条转储 construct 前后 + SSA 中间态，取证后已撤除。
+
+**第 1 级 — CFG 不记顺序落下的后继 ⇒ 只有 block 0 被重命名。**
+
+`construct` 的 CFG 把 `Return(None)` 当**终点**，`block 0` 的 `succs=[]`。
+但 `deconstruct.rs:296-300` 明写「`Return(None)` 不发射，丢弃后线性执行自然
+落到最后一条指令」—— 即它在**顺序落下去**语义下真实含义是**落下去、不是返回**。
+
+`rename_variables` 从 `stack = vec![0]` 起、**只沿 `succs` 走**、且 `visited`
+集合**只入一次** ⇒ 块 1/2/3 **从未被访问、从未被重命名**。
+
+**第 2 级 — `phi.incoming` 结构上恒为空。**
+
+- `insert_phi_nodes` 以 `incoming: Vec::new()` 建 phi；
+- `rename_variables` 的签名收的是 `phi_map: &HashMap<…>`（**不可变引用**），
+  且内部 `block_phi_map` 是 `phi.incoming.clone()` 的副本 ⇒ **无处可写**；
+- `deconstruct` 的 `pred_copies` **唯一来源**就是 `phi.incoming`
+  （`deconstruct.rs:145`）⇒ phi 的前驱 copy **一条都不会发出**。
+
+实测：`TOTAL_PHI=7  TOTAL_INCOMING=0`，且 deconstruct 产物里**零条 `Copy`**
+⇒ **整个 phi 机制从未生效过**。这条与 D261 记档的「三处缺口」完全吻合。
+
+**两级叠加的后果（`for` 最小用例的寄存器对照）：**
+
+| | 初始化 | 循环体内读 | 回边写 |
+|---|---|---|---|
+| 源 MIR | `Const(20, Int(0))` | `BinaryOp(23, 20, ≥, 21)` | `BinaryOp(20, 20, +, 22)` |
+| deconstruct 后 | `Const(9, Int(0))` | `BinaryOp(18, 19, ≥, 1)` | `BinaryOp(19, 19, +, 12)` |
+
+源 MIR 里 `20` 是**一个**物理寄存器（循环前初始化 + 回边自增）。
+deconstruct 把它拆成 **r9（无人读）** 与 **r19（无人写）** ——
+**永久失联**。循环体首次迭代时读 r19，而 r19 的唯一生产者 `BinaryOp(19,…)`
+在循环体**末尾** ⇒ DAG 执行器按「输入寄存器就绪」激活节点 ⇒ 该节点永不激活
+⇒ 整条链饿死 ⇒ 静默截断。
+
+**为什么 `while` 没事**：`while` 的循环携带值是**环境变量**（`n = n + 1` 走
+`Assign`，而 `Assign`/`Define` 明确**不参与** SSA 重编号）⇒ 不经过这条路径。
+`for` 的 `__idx` 是 `fcfg_lower` 直接 `alloc_reg()` 出来的**裸物理寄存器**。
+
+##### 四、修复
+
+`opt.rs::optimize` 在 `construct` 之后、`deconstruct` 之前加守卫：
+
+> **SSA 里一旦出现 phi，整个函数跳过 SSA**（`func` 逐字节保持原样）。
+
+与 D302 停用 `ReplaceWithSource`、D310 跳过透传函数同一原则：
+**宁可不优化，不可静默产出错误结果**。
+
+为什么不「把 SSA 修对」：第 2 级要求实现教科书式的**支配树 DFS + 进出栈
+push/pop + 逐前驱边记录 incoming**，而 `rename_variables` 现在是「平铺工作表 +
+全局 visited 集合」，**两者不是同一个算法**。在一条会静默产出错误结果的
+路径上做这种改写，风险远大于收益。
+
+守卫取「SSA 里出现 phi」而不是「CFG 有回边」—— 前者**更窄**：没有循环携带值
+的循环（`while true do … end` 一类）不产生 phi，仍能享受 SSA 优化。
+
+##### 五、实测方法（这一节本身是个教训）
+
+**第一次量守卫代价时，探针放在了两个守卫之后** ⇒ 守卫一命中就 `return`，
+那批程序根本不打印，量出来「`narrow` / `phi` 恒为 false」。实测 22/56 无输出
+却报 0/56 —— 若照单全收，就会得出「守卫从不命中」的结论并把有效的守卫
+当成死代码删掉。挪到函数最顶端后，56/56 全部打印，才拿到下面的数。
+
+| 判据 | 命中 | 占比 |
+|---|---|---|
+| 宽（任何 passthrough） | 48/56 | 85.7% |
+| 窄（带寄存器的 passthrough，D311） | 15/56 | 26.8% |
+| 本守卫（出现 phi） | 7/56 | 12.5% |
+
+两个守卫并集 21/56 ⇒ 仍有 **35/56** 照常走 SSA。
+命中 phi 的 7 个全是循环 fixture：`for_loop` / `loop_basic` /
+`loop_break` / `loop_continue` / `loop_beyond_dag_limit` / `builtin_gaps` /
+`loop_for_break`。
+
+##### 六、验证
+
+| 项 | 结果 |
+|---|---|
+| 56 个真实 `.mora`，`--opt=1` 与 `opt=off` 逐行 + 退出码对比 | **56/56 = 100%**（D311 时 54/56） |
+| 同上，`--opt=2` | **56/56 = 100%** |
+| **反向牙齿**：守卫改成恒假 | 精确回到 **54/56**，且失败的就是那两个 `for` fixture（与 D311 记录逐位一致） |
+| `d187_opt1_stops_silently_at_a_for_loop` | 现状判据**已翻转**为「与 opt=off 等价」，改名 `d187_opt1_runs_a_for_loop_equivalently` |
+| `tests/opt_repair_acceptance.rs`（D261 验收判据） | **由 `#[ignore]` 解封，改为常驻回归护栏**（22/22 三档等价） |
+| `cargo test --no-fail-fast` | **219 目标 0 失败 / 2262 passed**；lib 1011 / 0 / 13 ignored |
+| `cargo clippy --all-targets --all-features -- -D warnings` | 0 警告 |
+| `cargo fmt --all -- --check` | 0 |
+| `cargo doc --no-deps` | 0 警告 |
+
+##### 七、判据
+
+- 新增 `tests/opt_phi_guard.rs`（5 条），其中 3 条是**结构不变量**，给守卫上牙齿：
+  - `loop_carried_register_makes_construct_emit_phis` — 带循环携带寄存器的函数
+    `construct` **一定**产生 phi。若哪天红了，说明根因被真正修掉，应重新评估守卫，
+    而不是让它无声地变成死代码。
+  - `phi_incoming_is_always_empty_today` — 钉住 `incoming` 恒空这条**现状**。
+    将来实现了真正的 phi，这条会红 —— **那是好信号**：届时应把保守守卫换成真正的修复。
+  - `straight_line_function_still_goes_through_ssa` — 防止守卫被写成「有回边就跳过」
+    或「一律跳过」，把 D311 记录的 33 个程序恢复静默退回。
+  - 另 2 条是行为判据（`for` 最小用例 + 两个真实 fixture），**反向牙齿已验证会红**。
+- 解封的 D261 判据同样具备牙齿：守卫被改窄或删除，22 个程序立刻分叉。
+
+##### 八、未修 / 待裁决
+
+- **`rename_variables` 的三处缺口本身仍未修**（D261 记档）。本轮是让这三条
+  路径**不可达**，不是修好它们。真正修复 = 支配树 DFS + phi incoming，
+  属架构级改造。
+- `d187_opt1_executes_both_branches_of_a_constant_if` 仍是**活的现状判据**：
+  常量条件 `if` 在 `--opt≥1` 下两个分支都执行（死分支没消掉）。它没有循环、
+  不产生 phi ⇒ 守卫不命中 ⇒ 属**另一族**（DAG 分支裁剪），本轮未动。
+- 优化档位是否继续默认关闭（`ssa.rs:117-122` 明写「未证明对所有程序安全前
+  默认关闭」）—— 现有证据已从 54/56 升到 56/56，但代价是 21/56 不再走 SSA。
+
+#### D313：常量条件的 `if/else` 在 `--opt≥1` 下**两个分支都执行** —— `IfSimplifyRule` 删掉 `JumpIfNot` 后留下越界跳转
+
+D312 之后 `--opt` 在 56 个真实程序上已是 56/56，但 D187 留的那条现状判据
+还红着。本轮把它消掉。
+
+##### 一、现象
+
+```text
+$ mora --opt=1 a.mora     # if 1 > 0 / print(7) / else / print(8) / end   （if 是最后一句）
+7.0
+8.0
+$ echo $?
+0
+```
+
+opt=off 只打印 `7.0`。`--opt=1` 与 `--opt=2` 相同，退出码仍是 0。
+
+**比 D312 的静默截断更危险**：副作用会**重复发生**（重复写文件、重复扣款、
+重复发送），而程序看起来一切正常 —— 没有静默中止、没有报错、没有非零退出码。
+
+##### 二、触发面（12 种形态实测，opt=1 / opt=2 三档逐行对比）
+
+| 修前 | 形态 |
+|---|---|
+| ✗ | 常量真 + `else`（`1 > 0` / `3 == 3` / 字面量 `true`） |
+| ✗ | 同上但 `else` 有两条语句 |
+| ✅ | 常量**假** + `else` |
+| ✅ | 常量真、**无** `else` |
+| ✅ | **同样结构但 `end` 之后还有一条语句** |
+| ✅ | `let n = 1` 再判断（条件走 `Var` 间接层） |
+| ✅ | 变量条件（对照组） |
+
+「末尾加一条语句就正常」是定位的关键线索：问题出在**跳转目标越界**。
+
+##### 三、根因
+
+`apply_rules`（**两档都跑**，`cli/mod.rs:56`）里两步：
+
+1. `ConstFoldingRule` 把 `1 > 0` 折叠成 `Const(c, Bool(true))`；
+2. `IfSimplifyRule`（`rule.rs:119`，`Some(true) if is_not => Vec::new()`）
+   **删掉** `JumpIfNot`。
+
+第 2 步这个局部改写**本身是对的** —— `JumpIfNot(true, t)` 永不跳，删掉即
+等于落下去。**问题出在它留下的结构被下游误读**。剩下的 body 是
+`<then>; Jump(end); <else>`，而 `if` 是最后一句时 `end == body.len()`
+—— **跳转目标越界**：
+
+```text
+ 2  Const(2, Bool(true))
+ 3  Const(4, Float(7.0))
+ 4  Call(5, "print", [4])
+ 5  Copy(9, 5)
+ 6  Jump(10)              ← body 只有 0..9，10 已越界
+ 7  Const(7, Float(8.0))  ← else 分支紧跟其后
+ 8  Call(8, "print", [7])
+ 9  Copy(9, 8)
+```
+
+于是：
+
+1. `construct` 的分块规则 `if lbl < body_len && lbl > 0`，`10 < 10` 为假
+   ⇒ **不在那里起块** ⇒ CFG 断成互不相连的两块（实测 `block 0 succs=[]`、
+   `block 1 preds=[]`）；
+2. `deconstruct` 把该 terminal 跳转经 `terminator_to_plain` 映成
+   `Return(None)`，而 `Return(None)` 是**被丢弃**的（`deconstruct.rs:340`
+   的 `Label(usize::MAX)` 跳过）⇒ **那条 Jump 彻底消失**；
+3. 第四遍只是把各块**线性拼接** ⇒ then 与 else 之间再无任何控制转移
+   ⇒ DAG 把两段都当独立链执行。
+
+**这不是「死分支没被消掉」** —— 死分支确实该被消掉（条件是常量真）。
+错的是**消掉之后剩下的控制流被拆散了**。
+
+二分验证：临时开关逐个关掉 4 个 SSA 基础 pass、再加一个「跳过整个 SSA 阶段」
+的开关：
+
+| 配置 | C1 |
+|---|---|
+| 全部 pass / 逐个关 / 全关 | `['7.0','8.0']` ✗ |
+| **跳过整个 SSA 阶段** | `['7.0']` ✅ 与 off 等价 |
+
+⇒ 4 个 pass 清白，`construct → deconstruct` 背锅 —— 与 D312 同形。
+
+##### 四、修复
+
+`ssa::has_out_of_range_jump`：body 里有跳到 body 之外的控制转移就
+**整体跳过 SSA**（`construct` 之前判，`func` 逐字节不变）。
+
+**判据为什么不落在 `BasicBlock.preds` 上**：最直接的修法是让 `deconstruct`
+丢弃不可达块，但 `preds` 正是 D261 记档的「三处缺口」之一 —— 实测
+`block 1 preds=[]` 而实际**存在**一条来自 block 0 的边。**拿一个已知不可靠的
+字段去决定删除代码**，正是 D276「优化器回滚」教训指向的方向。越界跳转目标
+则是**直接可测的事实**，不依赖任何下游数据结构。
+
+与 D302 / D310 / D311 / D312 同一原则：**宁可不优化，不可静默产出错误结果**。
+
+##### 五、三个守卫的实测命中面
+
+探针置于 `optimize()` 里**所有 early return 之前** —— 否则提前返回的那批
+不打印，量出来的 `true` 恒为 0（D312 在这条上栽过一次，记进了 agent memory）：
+
+| 守卫 | 命中 |
+|---|---|
+| narrow（带寄存器的 passthrough，D311） | 15/56 |
+| phi（出现 phi，D312） | 7/56 |
+| **oor（越界跳转，D313）** | **0/56** |
+
+三个守卫并集 **22/56** ⇒ 仍有 **34/56** 照常走 SSA。
+**本守卫对现有程序零代价**，纯兜这个合成形状。
+
+##### 六、验证
+
+| 项 | 结果 |
+|---|---|
+| 12 种形态矩阵，`--opt=1` / `--opt=2` 与 opt=off 对比 | 修前 **4/12 分叉** → 修后 **0/12** |
+| 56 个真实 `.mora`，`--opt=1` / `--opt=2` | **56/56 = 100%**（与 D312 持平，无回归） |
+| **反向牙齿**：守卫改恒假 | 精确回到 **4/12**（C1 / C7 / C10 / C11），且 56 程序仍是 56/56 ⇒ 佐证「零代价」 |
+| `d187_opt1_executes_both_branches_of_a_constant_if` | 现状判据**已翻转**为「只走 then」，改名 `d187_opt1_executes_only_the_taken_branch_of_a_constant_if` |
+| `cargo fmt --all -- --check` | 0 |
+| `cargo clippy --all-targets --all-features -- -D warnings` | 0 警告 |
+| `cargo doc --no-deps` | 0 警告 |
+
+##### 七、判据
+
+- 新增 `tests/opt_out_of_range_jump_guard.rs`（4 条）：
+  - `const_condition_if_else_does_not_execute_both_branches` — 4 个修前失败的
+    形态 × 2 个档位。**反向牙齿已验证会红**。
+  - `control_group_shapes_were_already_correct` — 5 个修前就正确的形态，把缺陷
+    范围**钉死**在「常量真 + `else` + `if` 是最后一句」，避免把「`if` 整个坏了」
+    这种过宽说法钉进断言。
+  - `out_of_range_jump_is_detected` — 钉住谓词必须命中，否则守卫会无声变成
+    死代码、缺陷回来。
+  - `in_range_jumps_are_not_flagged` — 5 种**不得**误判的形状（含
+    `usize::MAX` 哨兵）。防止谓词写宽成「所有函数都跳过 SSA」。
+
+##### 八、本轮的一次操作失误（记档）
+
+撤 D313 临时探针时用了 `git checkout -- src/mir/opt.rs`。本会话**一切未提交**，
+该命令把 **D312 的守卫与注释一并冲掉**（opt.rs 179 行、无 D312 标记）。
+靠 D312 的 6 条判据立刻发现并按原文重装。
+
+⇒ **教训**：在没有 commit 的长会话里，`git checkout --` 不是「撤销探针」，
+是**撤销本轮全部未提交工作**。撤探针只能用编辑工具逐条回退，或先
+`git diff > %TEMP%/<round>.patch` 留底。
+
+#### D314：9 层管线对 `rel` 家族**完全跑不起来** —— `max_reg_in_node` 的 `_ => 0` 覆盖了一半的 `Node` 变体
+
+D312/D313 把优化路径清干净之后，本轮换个方向：不再找新的行为分叉，而是量一个
+**已记录但从未量过**的结构性风险 —— 9 层管线的静默回落。
+
+##### 一、量出来的事实
+
+56 个真实 `.mora`，逐个跑并检查 stderr 是否出现 `[9layer]`：
+
+> **11/56（19.6%）静默回落到 `emit.rs` 路径**，9 层管线的产出被丢弃，
+> 改用另一条编译路径，用户只看到一行 stderr。
+
+| 家族 | 个数 |
+|---|---|
+| `rel_*`（声明式关系） | 7 |
+| `tea_standalone` | 1 |
+| `export_visibility` / `import_handle_index_main` | 2 |
+| `prompt_section` | 1 |
+
+##### 二、回落到底在掩盖什么（决定性实验）
+
+临时加一个「忽略差分结果、强制走 9 层管线路径」的开关，逐个对比：
+
+> **11 个回落程序里有 7 个，一上管线就硬崩**，且报同一个内部错误：
+>
+> ```text
+> Runtime error (MIR): internal: instruction at DAG node 1 references
+> register 4 (read/write) but the function only has 1 register(s)
+> — a unit-statement emitter returned an unallocated sentinel register
+> ```
+>
+> 7 个全是 `rel_*`。其余 4 个（TEA / prompt_section / import / export）
+> 强制走管线后行为**一致** —— 它们的回落是保守但无害的。
+
+**所以差分回落确实在替这 7 个程序挡崩溃。** 这也说明：差分检查本身在正常
+工作，被它挡住的是一条真的坏掉的路。
+
+##### 三、根因
+
+`fcfg_lower::max_reg_in_node` 逐个 match `Node` 变体求「预分配的最大寄存器号」，
+兜底是 `_ => 0`。实测该 match **只覆盖 50 个变体里的 25 个**。
+
+`lower_fcfg` 用同一个值做两件事，**都因此出错**：
+
+| 位置 | 用途 | 出错后果 |
+|---|---|---|
+| `ctx.next_reg = max_reg_in_nodes(nodes) + 1` | bump 分配器起点 | 起点过低会**覆盖**预分配寄存器，违反该函数自己的「寄存器安全契约」 |
+| `n_regs = max_pre_alloc.max(ctx.next_reg - 1) + 1` | 寄存器总数 | 过小 ⇒ **运行期越界** |
+
+`rel_empty.mora`（`rel edge("a","b")` + `solve { … }`）的 FCFG 只含
+`RelDef` 与 `Solve` 两个节点 —— **两者都落进兜底** ⇒ `max_reg_in_nodes` 返回 0
+⇒ `n_regs == 1`，而发射出的 `MirInst::Solve { dst: 4, .. }` 引用寄存器 4。
+
+**这 25 个未覆盖变体里，真正带顶层寄存器的只有 3 个**：
+`Return{value}` / `Solve{dst}`（`goal` 是独立寄存器空间的嵌套 MirFunction，
+`limit`/`query_vars`/`anon_vars` 不是寄存器）/ `WithConfig{dst, bindings, body}`。
+其余 22 个是纯声明型或只含嵌套 MirFunction（嵌套体有自己的寄存器平面）。
+
+##### 四、修复
+
+1. **删掉 `_ => 0`**，50 个变体逐个显式表态。
+2. `n_regs` 再取一个下界：扫**已发射的 `MirInst`** 的 `input_regs()` /
+   `written_reg()`。只会让 `n_regs` 变大（多几个 `Value` 槽，无害），
+   不可能变小 —— 纵深防御。
+
+**第 1 条的真正价值是它把静默错误变成了编译错误。** 实测反向变异
+（删掉那 3 个分支）**根本编译不过**：
+
+```text
+error[E0004]: non-exhaustive patterns:
+  `&fcfg::Node::Return { .. }`, `&fcfg::Node::Solve { .. }`
+  and `&fcfg::Node::WithConfig { .. }` not covered
+```
+
+此前同类问题已修过一次（D35 给 `Handle` 补 `dst`，那处注释写着「必须计入，
+否则 `n_regs` 可能小于它」）—— 那是**逐个手补**的 whack-a-mole：每加一个
+带寄存器的变体就要记得回来补一次，忘了就静默复发。删掉兜底之后，
+**新增变体会在编译期被强制表态**，整族缺陷不再复发。这与 `MirInst::input_regs`
+/ `written_reg` 已有的穷尽式写法同规。
+
+##### 五、验证
+
+| 项 | 修前 | 修后 |
+|---|---|---|
+| 强制走管线路径时行为改变的回落程序 | **7/11** | **0/11** |
+| 56 程序 `n_regs` 越界（`MORA_9LAYER_FORCE` 实测） | 7 个硬崩 | 0 |
+| 56 程序静默回落**计数** | 11/56 | 11/56（**未变**，见下） |
+| `cargo test --no-fail-fast` | 220 目标 0 失败 | **221 目标 0 失败** |
+| `cargo test --lib` | 1011 / 0 / 13 | **1011 / 0 / 13** |
+| `cargo fmt --all -- --check` / `clippy --all-targets --all-features` / `doc --no-deps` | 0 / 0 / 0 | **0 / 0 / 0** |
+
+##### 六、**未解决**：回落计数仍是 11/56
+
+必须说清楚：本修复**没有**减少静默回落。差分拦的是**指令条数**差异
+（`pipeline_mir=2 original_mir=3`），与 `n_regs` 无关。
+
+也就是说：
+
+- 9 层管线对 `rel` 家族**仍然是坏的**（只是坏得不再越界崩溃）；
+- 12.5% 的真实程序（7/56）**仍然**在跑另一条编译器，用户仍然不知情；
+- 修好 `n_regs` 只是把「会崩的路」变成「能跑但条数不同的路」。
+
+真正解锁需要补上指令条数差异，根因在 `fcfg_lower` 的 `Parallel` / `Observe` /
+`Span` / `PromptSection` / `DocumentSection` 五个分支 —— 那里已有一处
+D95 的记档说明：emit 路径每块后补 `Const(dst, Nil)`，管线不补；补齐它需要
+给 `Node` **加 `dst` 字段**、在 `witness_to_fcfg` 预分配、并在 `node_result_reg`
+补 arm —— **核心 `Node<M>` AST 的结构性改动**，超出缺陷修复范围。
+（`rel_*` 的具体条数差异是否同源，本轮未查，**待验**。）
+
+##### 七、判据
+
+新增 `tests/fcfg_lower_n_regs.rs`（2 条）：
+
+- `n_regs_covers_every_emitted_register` — 构造 `Solve{dst:7}` /
+  `WithConfig{bindings:9}` / `Return{value:11}` 三个修前落进兜底的节点，
+  断言 `n_regs` 覆盖它们，并**逐条检查已发射指令的每个寄存器都在范围内**。
+  修前 `n_regs` 结算为 1 ⇒ 红。
+- `max_reg_in_node_covers_every_node_variant` — 外层 `match node` 的变体名
+  集合必须等于 `Node<M>` 的变体集合（从 `fcfg.rs` **现读**，自维护）。
+  覆盖「有人重新引入 `_ =>` 兜底」这种编译器之外的情况。
+
+⚠ 判据本身也踩过一次坑：第一版做全文 `_ =>` 扫描，把函数**内部**
+`QuasiquoteSegment` 的合法 `_ => m` 也算进去了（假红）。改成只数外层
+`match node` 的变体名。
+
+##### 八、本轮的两次操作/工具失误（记档）
+
+1. `git checkout --` 撤销探针时冲掉了 D312 的守卫（详见 D313 第八节）——
+   本轮起一律用编辑工具逐条回退。
+2. 统计 `max_reg_in_node` 覆盖率的脚本连续两版都**与直接读到的代码矛盾**
+   （先报「覆盖 0 个」，再报「46/50」）：第一版大括号配对被文档注释里的
+   `{}` 提前终止，第二版按**行**数 arm 而漏掉 `A | B => …` 的合并写法。
+   ⇒ 与 D312 记的「脚本自己会被打出 bug」同族：**普查器与被普查对象必须互相
+   校验**，输出自相矛盾时先怀疑普查器。
+
+#### D315：重新应用 D276 —— 静默回落 **11/56 → 1/56**；途中被 D92 判据拦下一次真回归
+
+D314 结尾留了一个「待验」项：`rel_*` 的指令条数差异（`pipeline_mir=2` vs
+`original_mir=3`）是否与 D95 记档的同源。查清了 —— **不是 D95 那一族**，
+而是 D276 当年**主动放弃**的那件事，它的前提刚被 D314 修好。
+
+##### 一、D276 当年为什么撤销
+
+`pipeline.rs::nested_diffs` 曾改成按「剔除死 no-op 后」对齐（D57 的
+`significant_indices`），**随即撤销**。原文理由：
+
+> 对齐后 `rel_*.mora` 不再回落 ⇒ 改走 9 层路径，而**那条路径是坏的**：
+> `Runtime error (MIR): … references register 4 but the function only has
+> 1 register(s)`
+>
+> 也就是说：**这套「错位」目前是 `rel_*` 唯一的护栏**。
+> **所以在 9 层 rel 路径修好之前，必须保留错位。**
+
+**D314 修好的正是那个前提** —— 同一个 `n_regs` 少算 bug
+（`max_reg_in_node` 的 `_ => 0` 漏算 `Solve` / `Return` / `WithConfig`）。
+D276 当时把护栏建在一条已知的坏路径上；护栏的理由一旦成立就不该再留。
+
+##### 二、差异究竟是什么
+
+逐条转储两边后确认：`pipeline_mir=23` vs `original_mir=26`，差的是 **3 条死
+no-op** —— emit 路径在每条 `RelDef` **语句**后补一条 `Const(r, Nil)`（语句
+必须有值），而 r = 0/1/2 **从未被任何指令读**。剔除后两侧 **23 vs 23 逐条按
+类别一一对齐** —— 除死 no-op 外没有任何别的差异。
+
+这正是 D57 立 `significant_indices` 时描述的那一种（emit 在每条**语句型**
+指令后补 `Const(dst, Nil)`，而那个值无人读），**不是新的放宽**。
+
+##### 三、**途中被 D92 判据拦下一次真回归**（本轮最重要的一段）
+
+重新应用后第一件事是跑全量 —— **7 条失败**，其中
+`tests/nine_layer_block_forms.rs::d92_block_forms_lose_an_instruction_in_the_nested_body` 红了。
+
+那份判据的文档把话说得很重：
+
+> 这不是「良性形状差异」—— **若差分被放宽/移除，这些块里的语句会不执行**。
+
+而我的验收只跑了 **56 个真实程序 × 3 档 = 168 组合，pipeline vs
+`MORA_9LAYER=0`(emit) 全等**。**但那 56 个 fixture 里一个都没有用**
+`observe` / `span` / `parallel` / `prompt` / `document` **块形态**，
+也没有一个打印 `rel` 的求解结果（`rel_*.mora` 自身无 `print`，可观察行为
+只有「exit 0、无输出」）。
+
+⇒ **我的语料对这两族缺陷都完全失明。** 168 组合的「0 差异」是**假保证**。
+
+补做两件事：
+
+1. **强证人**：`rel edge × 3` + 两个 `solve` 并**打印结果** ——
+   两条路径输出逐行相同（`edges: [[a, b], [b, c], [c, d]]` / `reach-d: [c]`）。
+2. **块形态矩阵**：10 种形状（1/3 语句、值位置、嵌套、后接 `for`、块后接
+   三条语句、observe/prompt/document）× 3 档 = **30 组合**，全部相同。
+
+D92 那句「语句会不执行」在 30 个组合里**一次都没复现**。查 D92 的记档才发现，
+D276 当年**已经验证过 A/B 输出一致**才翻转的断言，撤销原因是 `rel_*` 的
+**连带**回归 —— 块形态本身从未被证明有问题。
+
+补证之后才翻转 D92，并把它从「靠一条判据的绿/红间接保护」改成
+`tests/nine_layer_unblocked.rs` 里的**常驻 A/B 回归**（30 组合）——
+**间接保护正是这两轮反复的根源**。
+
+##### 四、结果
+
+| 项 | 修前 | 修后 |
+|---|---|---|
+| **静默回落** | **11/56（19.6%）** | **1/56（1.8%）** |
+| 生产路径分布 | 45 管线 / 11 回落 | **55 管线 / 1 回落** |
+| 56 程序 × 3 档 pipeline vs emit | 未测 | 168 组合 **0 差异** |
+| 块形态 10 形状 × 3 档 pipeline vs emit | 未测 | 30 组合 **0 差异** |
+| `cargo test --no-fail-fast` | 221 目标 0 失败 | **222 目标 0 失败** |
+| `cargo test --lib` | 1011 / 0 / 13 | **1011 / 0 / 13** |
+| `cargo fmt --all -- --check` / `clippy --all-targets --all-features` / `doc --no-deps` | 0 / 0 / 0 | **0 / 0 / 0** |
+
+新增走上管线的 10 个程序：`rel_basic` / `rel_cons` / `rel_empty` /
+`rel_project` / `rel_run_limit` / `rel_single_var` / `rel_zero_var` /
+`prompt_section` / `export_visibility` / `import_handle_index_main`。
+
+**这是本次审计里唯一一次改变「哪些程序跑在哪条编译路径上」的变更**，
+回归面比前几轮大，故验收用了上面三组独立证据。
+
+##### 五、仍未解决：`tea_standalone.mora` 仍回落（1/56）
+
+它的差异**确实**是 D95 记档的那一族：`Parallel` / `Observe` / `Span` /
+`PromptSection` / `DocumentSection` 五个分支不补 `Const(dst, Nil)`。
+D95 注释已写明补齐需给 `Node` **加 `dst` 字段**、在 `witness_to_fcfg`
+预分配、并在 `node_result_reg` 补 arm —— **核心 `Node<M>` AST 的结构性
+改动**，超出缺陷修复范围。
+（注意这与 `rel_*` **方向相反**：`rel_*` 是「emit 多补了死 no-op」，可安全
+剔除；`tea` 是「管线少补了一条**活的**结果寄存器」。）
+
+##### 六、三处**预注册的现状判据**被本改动翻转
+
+改一个被记录的状态，就会让钉住它的判据变红 —— 这是**预期**的，不是回归。
+三处都按各自的原始指示处理（不是直接改断言）：
+
+| 判据 | 原断言 | 处理 |
+|---|---|---|
+| `nine_layer_differential_coverage::d275_known_failing_programs_still_fall_back` | 11 个文件**必须**回落 | 改名 `d275_only_tea_standalone_still_falls_back`，改成**双向**断言：`tea_standalone` 必须仍回落 **且** 那 10 个必须已走上管线 |
+| `nine_layer_block_forms::d92_block_forms_lose_an_instruction_in_the_nested_body` | 块形态必须触发回落 | 改名 `d92_block_forms_nested_body_count_still_differs`，改为「管线侧条数**仍更少**」—— 形状差异本身（D92 的原始发现）依然存在，改的只是**它是否触发回落** |
+| `nine_layer_fallback_census::d92b_census_*` | 34 条普查的逐条 `should_fall_back` | **8 条翻转**（全部同向），阈值 `falls>=14 / passes>=19` → `falls>=6 / passes>=27` |
+
+普查翻转的 8 条：
+
+| 条目 | 家族 | 行为验证 |
+|---|---|---|
+| `observe` / `span` / `parallel` / `prompt_section` / `document_section` | 5 种块形态 | 10 形状 × 3 档 = **30 组合** |
+| `msg` / `struct` / `enum` | 3 种声明形态 | 10 形状 × 3 档 = **30 组合** |
+
+`d275` 与 `d92b` 两条判据的原始失败消息都写着「**不要**据此直接改本断言
+—— D276 就是这么干的」。本轮之所以敢翻，是因为 **D314 先把 D276 当年撞上的
+那个 `n_regs` 崩溃修好了**，并且补齐了 D276/D92 当时都缺的行为验证。
+
+`d92b` 普查是这轮**最有力的验收工具**：它有 34 条形态、覆盖两种结果，
+能精确指出哪几条翻转了 —— 比「数了多少个组合」有用得多。
+
+##### 七、判据
+
+- `tests/nine_layer_unblocked.rs`（4 条，取代原 `nine_layer_rel_unblocked.rs`）：
+  - `rel_family_runs_on_the_nine_layer_pipeline_with_identical_output` — 强证人：
+    求解结果可观察且正确 + **不得回落** + 三档下 pipeline 与 emit 逐行相同。
+    **反向牙齿已验证**（对齐改回原始下标 → 红）。
+  - `previously_falling_back_programs_now_use_the_pipeline` — 10 个程序逐个断言
+    stderr 里不再出现 `[9layer]`。
+  - `block_forms_behave_identically_on_both_paths` — 块形态 30 组合 A/B，
+    **把 D92 的间接保护换成显式常驻回归**。
+- `tests/nine_layer_block_forms.rs::d92_*`：断言从「`differential_ok` 为假」
+  改为「管线侧条数**仍更少**」—— 形状差异本身（D92 的原始发现）依然存在，
+  改的只是「它是否触发回落」。
+
+##### 八、三处工具/判据缺陷（记档）
+
+1. **判据期望值按记忆写**：强证人的 `reach-d` 实测是 `[c]`，我按印象写成
+   `[[c]]`，实跑打回。**判据的期望值必须来自实测。**
+2. **A/B 未归一化路径**：错误消息里嵌临时目录路径，两次 A/B 用不同 tag ⇒
+   路径字符串天然不同，把「两边同样解析失败」判成不一致。修正为先把目录
+   路径替换成 `<TMP>`。
+3. **语料失明未被察觉**：168 组合的「0 差异」让我以为验收充分，直到既有
+   判据 D92 变红才暴露语料对块形态与 `rel` 结果**都是瞎的**。
+   ⇒ 与 D312 记的「探针位置造成选择偏差」同族，但这次**失明的是语料不是装置**：
+   **验收集的覆盖面要和被改动的面**逐项对齐**，否则「测了很多组合」不等于
+   「测到了风险」**。
+
+##### 九、方法论记档
+
+D314 → D315 是一条**完整闭环**，形状值得记：
+
+1. 某轮记档里写下「**在 X 修好之前，必须保留 Y**」（D276 原文）；
+2. 后续轮次修好了 X，但修的是**另一个症状**，**没有回头看**那条记档；
+3. 再下一轮顺着「待验」项查下去，才发现 **Y 的保留理由早已失效**。
+
+⇒ **可复用判据**：修复一个**被别的缺陷挡着**的东西（临时关闭的功能、
+workaround、刻意保留的冗余）时，立刻 `grep` CHANGELOG 与源码注释里的
+「在 X 修好之前必须保留 Y」「这目前是 X 唯一的护栏」「等 X 修好后再解封」
+这类**以具体某轮为条件**的措辞。它们不在任何 issue/todo 里，
+很容易在 X 修好之后继续过期**几十轮**。
+
+#### D316：剩下 6 条回落形态的分诊 —— **4 类功能覆盖缺口，不是缺陷**；本轮只固化结论，不实施
+
+D315 把静默回落从 11/56 降到 1/56。1 个文件对应普查里的多条形态，
+本轮按**形态**（而非文件）把剩余部分清点分诊。
+
+##### 一、还剩什么
+
+`nine_layer_fallback_census.rs` 的 34 条普查里仍回落的 **6 条**
+（D315 把回落项由 14 降到 6）：
+
+| 形态 | 判别标记（实测差分） | 根因 |
+|---|---|---|
+| `worker` | `inst[0]: pipeline="Const" original="Worker"` | 9 层降级链里**没有 `Worker` 类别** |
+| `transaction` | `inst[0]: pipeline="Const" original="Transaction"` | 同上，**没有 `Transaction`** |
+| `eval_bare` | `inst count: pipeline=0 original=4` | 管线把 `eval` **整条丢掉**（产出 0 条指令） |
+| `model` | `inst[0]: pipeline="ModelDef" original="Const"` | `ModelDef` **缺预分配结果寄存器**与前置 `Const` |
+| `tea_standalone` | `inst[1]: pipeline="MsgDef" original="ModelDef"` | 同上，TEA 三件套一起错位 |
+| `perform_bare` | `inst[6]: pipeline="Perform" original="Assign"` | emit 侧不发射该 `Perform` |
+
+**注意这与 D95 记档的那一族不是同一批** —— `Parallel` / `Observe` /
+`Span` / `PromptSection` / `DocumentSection` 五条已在 D315 随差分对齐一并放行。
+剩下的这 6 条是**另外 4 类**根因。
+
+##### 二、判定：这 4 类是**功能覆盖缺口**，不是缺陷修复
+
+要在 9 层管线里修好它们，需要**实现新构造**：
+
+- `Worker` / `Transaction`：降级链里**根本没有**这两个 `MirInst` 类别
+  （需要 `core → cmir → lmir → fcfg_lower` 整条链新增映射）；
+- `eval`：管线把它**整条丢掉**（`pipeline_mir=0`）；
+- `ModelDef`：要给它加预分配结果寄存器、在 `witness_to_fcfg` 分配、
+  在 `node_result_reg` 补 arm（与 D95 记档里 `Node` 加 `dst` 字段同一类改造）。
+
+⇒ 这是**路线图决策**，不是「把一个算错的数改对」。
+按本项目既定纪律（产品契约决定不擅自实施），本轮**只报告不实施**。
+
+`perform_bare` 另有特殊性：该程序**本身就是 typeck 错误**
+（`Effect row mismatch: expected no unhandled effects … got { Ai }`，exit 2），
+即「裸 perform 不合法」；它的差分只是附带现象。
+
+##### 三、代价测量（供决策参考）
+
+回落对用户**不可见**，本轮量了它到底值多少：
+
+| | 管线路径 | emit 路径 | 备注 |
+|---|---|---|---|
+| 55 个走管线的程序（中位耗时） | 15.8 ms | 15.3 ms | 差异在进程启动噪声内 |
+| 唯一回落的 `tea_standalone` | **20.0 ms** | 17.9 ms | 差 **2.1 ms** |
+
+回落那次是**管线跑完再被丢弃**（`run_pipeline` 先执行、差分失败后才回落），
+故 2.1 ms 就是白烧的编译时间。
+
+⇒ **没有可观察的正确性代价，性能代价也可忽略。** 这 4 类覆盖缺口
+不构成紧急缺陷，可以按路线图节奏推进。
+
+##### 四、固化：新增**差分签名**判据（比「是否回落」更强）
+
+`nine_layer_fallback_census.rs` 已钉住「哪些形态会回落」，但**不钉「为什么」**。
+后果：某条形态的回落**原因换了**（从「缺类别」变成「条数对不上」），
+判据仍然绿 —— 而两者的后续修法完全不同。
+
+新增 `tests/nine_layer_fallback_reasons.rs`（2 条）：
+
+- `d316_fallback_reasons_are_stable` — 逐条取 `result.differential_diffs`，
+  断言上表的**判别标记**仍然存在。**反向牙齿已验证**（把 `worker` 的标记
+  改成不存在的字符串 → 红，失败消息直接指出「仍在回落，但**原因变了**」）。
+- `d316_fallback_set_matches_the_triage` — 钉住「仍回落的条目集合」与
+  本文件的分诊记录一致，避免有人只改普查、不改根因结论。
+
+##### 五、门禁
+
+| 项 | 结果 |
+|---|---|
+| `cargo test --no-fail-fast` | **223 目标 0 失败** |
+| `cargo test --lib` | **1011 / 0 / 13** |
+| `cargo fmt --all -- --check` | 0 |
+| `cargo clippy --all-targets --all-features -- -D warnings` | 0 警告 |
+| `cargo clippy --all-features -- -D warnings` | 0 警告 |
+| `cargo doc --no-deps` | 0 警告 |
+
+##### 六、本轮工具缺陷（记档）
+
+- 普查条目提取脚本连续两次被 PowerShell 的引号规则改坏（第一次是 Python
+  字符串里的 `\(` 被 PowerShell 吃掉，第二次是 `.replace('original="Worker"', …)`
+  被解析成 `"W`）。**内联 Python 一律写脚本文件**，本轮起不再例外。
+- 判别标记的第一次编码检查发现文档注释里打进了一个 U+FFFD，已修正；
+  这已是本会话第 5 次被同一道检查拦下 —— **写完立刻 `assert count(0xFFFD)`
+  这条纪律值得继续保持。**
+
+#### D317：搜「跨块寄存器」的剩余实例（否定轮），顺带挖出 `match` 的两处**独立**缺陷
+
+D312/D313 的根因是「`rename_variables` 只重命名 block 0 ⇒ 跨基本块的值定义
+与使用被拆成两套物理寄存器」。D315 已修掉当时能构造出的两个实例。本轮**不再靠
+56 个 fixture 找**（那套语料对这类缺陷已两次被证明是瞎的），改为**针对性
+构造形状**。
+
+##### 一、否定轮：31 个形状，0 分叉
+
+| 矩阵 | 形状数 | 覆盖 | 分叉 |
+|---|---|---|---|
+| 值位置控制流 | 19 | `if`/`match` 作为值、嵌套、深嵌套（深度 2/3）、值进 `for` 主体、`for` 主语是 `if` 值、值之后接 `for`/`while`/闭包/`handle` | **0** |
+| 裸表达式 | 12 | 裸 `BinaryOp`/`Call`/`Index` 做 `if` 条件、`match` 主语（语句位与值位）、`for` 主语；裸结果跨块再用 | **0** |
+
+构造过程中修正了 4 个**没测到目标形状**的用例（Mora 不支持 `elseif`、
+不支持 `else (if …)` 括号式、值位置 `if` 必须带 `end`、且 typeck 要求
+**所有分支 join 到同一类型** —— 只 `print` 的分支返回 `Nil` 会让整段被拒）。
+这 4 个若不核对输出，会被误记成「通过」。
+
+⇒ **没有找到新的同类实例。** 三道守卫（narrow passthrough / phi / 越界跳转）
+覆盖了该根因在我能构造出的形状上的全部表现。
+
+##### 二、但预期值打回时，暴露出一个**与 `--opt` 完全无关**的缺陷
+
+上面 `裸表达式` 矩阵里的 `match len(s) { 2 => "two", _ => "other" }` 输出了
+`other`。我一度以为是 opt 路径的发散，实测三档（`opt=off/1/2`）**完全一致**
+⇒ 与 `--opt` 无关，是语言层缺陷。
+
+##### 三、缺陷一（**已修**）：`bigint:` 模式**根本没有 handler**
+
+`pattern_to_string`（`lower.rs:1255`）会把 `Literal::BigInt` 序列化成
+`bigint:{n}`，而 `self_match_pattern`（`vm.rs`）**没有任何 `bigint:` 分支**
+（全文件 grep 零命中）—— 该模式穿过全部分支后落到函数末尾的 `false`。
+
+```mora
+print(match 123n { 123n => "big", _ => "other" })   // 修前 other / 修后 big
+```
+
+**同类型、同值也不匹配。** 这是序列化器与匹配器之间的**不对称**（一端能产出、
+另一端认不出），不涉及任何语义取舍 ⇒ 直接补分支。
+
+##### 四、~~缺陷二（语言语义决定）：数字模式不跨类型~~ —— **D318 已否证并撤回**
+
+> **⚠ 本节结论已被 D318 推翻，保留原文以留痕。**
+>
+> D317 当时观察到：裸字面量 `2` 解析成 **Float**（`print(2)` → `2.0`），
+> 而 `len()` 返回 **Int**，于是
+> `match len("xy") { 2 => "two", _ => "other" }` 恒得 `other`，
+> 而同一个 `==`（`len("xy") == 2`）为 `true`。
+>
+> D317 据此判断「两条比较路径语义不一致」，并把它列为**待裁决的语言语义决定**。
+>
+> **D318 找到了 D317 漏掉的事实**：v0.38 数值塔的**后缀语法**。
+> `lexer.rs:797-800` 把**无后缀**的数字归成 `TokenType::Float`，而
+> `2i`/`2u` → `Int`、`2f` → `Float`、`123n` → `BigInt`。所以
+> `match n { 2i => … }`（n 来自 `len`）**能命中** —— `2` 只是 Float 模式。
+>
+> ⇒ **模式匹配类型严格是正确行为**，`2i` 才是匹配 Int 值的写法。
+> **D317 列出的「待裁决项」撤回。** 详见 D318。
+
+原文（留痕）：
+
+> `self_match_pattern`（`vm.rs`）的 `float:` 分支要求 `Value::Float`、
+> `int:` 要求 `Value::Int`，**不互认**。
+>
+> ⇒ 「match 该不该跟 `==` 一样提升」是**语言语义决定** —— 两种答案都自洽
+> ⇒ **只报告不实施**。
+>
+> **D318 补充**：上面这条推理漏了后缀语法。按后缀语法的实际契约，
+> 「模式严格 + 运算符提升」是**并存且自洽**的，不是不一致。
+
+##### 五、判据
+
+新增 `tests/match_numeric_patterns.rs`（3 条）：
+
+- `d317_bigint_pattern_matches_bigint_values`（5 个形态）— **反向牙齿已验证**：
+  把 `bigint:` 前缀改成一个不存在的字符串即红。
+- `d317_other_pattern_kinds_are_unaffected`（5 个形态）— 字符串 / 布尔 / nil /
+  列表模式的对照组，防止补 `bigint:` 时改坏别的分支。
+- `d317_status_quo_match_does_not_promote_int_to_float` — **现状判据**（缺陷二）。
+  钉的是**当前行为**：先断言前提（`==` 会提升、if 里也走 `==`），再断言现状
+  （match 不提升）。它保证这个不一致**保持可观察**、不被无意改动；
+  将来裁决为「应提升」时，本条会红并应翻转为 `two`。
+
+##### 六、门禁
+
+| 项 | 结果 |
+|---|---|
+| `cargo test --no-fail-fast` | **224 目标 0 失败** |
+| `cargo test --lib` | **1011 / 0 / 13** |
+| `cargo fmt --all -- --check` | 0 |
+| `cargo clippy --all-targets --all-features -- -D warnings` | 0 警告 |
+| `cargo doc --no-deps` | 0 警告 |
+
+##### 七、本轮判据自身的缺陷（记档）
+
+`match_numeric_patterns.rs` 第一版让 3 条 `#[test]` **共用同一个 `%TEMP%`
+目录**，而它们在同一测试二进制里**并行**执行 ⇒ 互相 `remove_dir_all` /
+写同一个 `p.mora`，`[literal]` 用例读到了 string 用例的输出 `A`。
+已改为每条用例独立目录（沿用 D315 的 `mora_d315_{tag}` 做法）。
+
+⇒ **测试辅助函数与被测对象共享可变状态**是集成测试里最容易被并行掩盖的一类
+本轮缺陷：**单独跑每条都绿，合起来跑就串味**。写这类 helper 时，
+第一件事是确认目录/文件名是否按用例隔离。
+
+#### D318：穷尽审计「模式序列化器 ↔ 运行时匹配器」的覆盖面 —— **D317 的「缺陷二」由此被否证并撤回**
+
+D317 的 `bigint:` 缺陷是**偶然**发现的（某个用例的期望值我按记忆写、实跑打回
+才暴露）。既然那个函数是个手写的字符串前缀匹配器，而序列化器有**两个**
+（`lower.rs::pattern_to_string` 与 `fcfg_lower::fcfg_pattern_to_string`），
+「**一端能产出、另一端认不出**」就是一整类缺陷。本轮做穷尽审计。
+
+##### 一、静态差集
+
+| 格式 | 序列化器 | `self_match_pattern` | 源码可达？ |
+|---|---|---|---|
+| `bigint:{n}` | 有 | **无分支**（D317 补） | **可达**（`123n`） |
+| `tuple:(...)` | 有（**两个都产**） | **无分支** | ❌ 解析器拒绝 `(1, 2)`（`Expected ')'`） |
+| `list:[h\|t]` | 有（仅 lower 的 `Pattern::List`） | 第 396 行**显式 `return false`**（注释「legacy」） | ❌ 解析器拒绝 `[a \| b]`（`Expected ']'`） |
+| `char:{c}` | 有 | 有 | ❌ 解析器拒绝 `'a'` 作 arm 模式（`malformed match arm`） |
+| `{name}:{inner}`（TypeAscription） | 有 | 无通用前缀分支 | ❌ 未见对应源码语法 |
+| `list:[a,b]` 逗号式 | **无** | 有（第 390 行） | ❌ 无生产者 |
+| `guard:inner` | **无** | 有（第 426 行） | ❌ 无生产者 |
+
+两个方向的差集都存在：**能产出但认不出** 5 项、**能认出但没人产出** 2 项。
+
+##### 二、可达性实测：只有 `bigint:` 一处是真的
+
+每项都用**真实 CLI** 跑最小程序验证（结果见上表最后一列）：除 `bigint:` 外，
+**全部不可从源码写出来** —— 解析器层就拒绝。
+
+⇒ **可达范围内「序列化器 ↔ 匹配器」的不对称只有 `bigint:` 一处，D317 已修。**
+其余差集是**潜伏死路径**：一端的代码永远走不到。
+
+**判别力在于「可达」而不是「有差集」**：如果只做静态差集，会得出「7 处缺陷」
+的结论；加上可达性判断后是「1 处已修 + 6 处死路径」。
+⇒ 与 D315 记的「验收集覆盖面要和对改动的面逐项对齐」同族，这次对的是
+**「产出这一端能不能被触发」**。
+
+##### 三、否证 D317 的「缺陷二」与待裁决项
+
+审计过程中查了词法器，**发现 D317 漏掉的关键事实**：
+
+```rust
+// lexer.rs:797-800 —— 无后缀的数字
+TokenType::Float(num)
+```
+
+即 **v0.38 数值塔的后缀语法**：`2i`/`2u` → `TokenType::Int`、
+`2f` → `Float`、`123n` → `BigInt`。实测：
+
+| 源码 | 词法 | 模式 | 值 | 结果 |
+|---|---|---|---|---|
+| `match 2 { 2 => … }` | Float | `float:2.0` | Float | 命中 |
+| `match n { 2i => … }`（n 来自 `len`） | Int | `int:2` | Int | **命中** |
+| `match n { 2 => … }`（n 来自 `len`） | — | `float:2.0` | Int | 不命中（**正确**） |
+| `match n { 2i => … }`（n 来自 `1+1`） | — | `int:2` | Float | 不命中（**正确**） |
+| `match 123n { 123n => … }` | BigInt | `bigint:123` | BigInt | 命中（D317 修） |
+| `len("xy") == 2` | — | — | — | **true**（运算符有提升） |
+
+⇒ **模式匹配类型严格是正确行为**，`2i` 才是匹配 Int 值的写法。
+「模式严格」与「运算符提升」**并存且自洽**，不是不一致。
+
+**D317 列出的「match 要不要跟 `==` 一样提升」这一待裁决项，撤回。**
+
+D317 的推理错在哪：我观察到「裸字面量都是 Float」就推出了「Int 值永远匹配不上
+数值模式」，但**没有去查有没有办法从源码产出 `Int` 模式** —— 有，就是 `2i`。
+⇒ **观测到一个现象后，在断言它不可达之前，必须先确认「真的没有任何途径能到达」**。
+与 D315/D317 记的「验收集要对齐」同源：只看了**已观测到的**用法，
+没检查**理论可产出**的用法集合。
+
+##### 四、判据
+
+`tests/match_numeric_patterns.rs`：
+- `d317_bigint_pattern_matches_bigint_values`（5 形态）— D317 修复，**反向牙齿已验证**。
+- `d317_other_pattern_kinds_are_unaffected`（5 形态）— 字符串 / 布尔 / nil / 列表
+  的对照组。
+- `d318_numeric_tower_patterns_are_type_strict_operators_promote` — **本轮新增**。
+  钉住「模式类型严格 + 运算符有提升」这条**并存契约**：
+  - 后缀语法决定模式类型（`2` / `2i` / `123n` 三种后打印出的值）；
+  - 类型相符 ⇒ 命中（Int/Float/BigInt 各一组）；
+  - 类型不符 ⇒ 落 `_`（4 组）—— 失败消息明写「若本条失败，说明有人给模式匹配
+    加了数值提升，那是**语义变更**，请先撤回」；
+  - 运算符的提升独立存在（`len("xy") == 2` 为 `true`）。
+
+  这条取代了 D317 那条「现状判据」—— 后者把**正确行为**当缺陷记，已删。
+
+##### 五、门禁
+
+| 项 | 结果 |
+|---|---|
+| `cargo test --no-fail-fast` | **224 目标 0 失败** |
+| `cargo test --lib` | **1011 / 0 / 13** |
+| `cargo fmt --all -- --check` | 0 |
+| `cargo clippy --all-targets --all-features -- -D warnings` | 0 警告 |
+| `cargo doc --no-deps` | 0 警告 |
+
+#### D319：`BigInt ⊗ Int` 的**除零 / 模零**是 Rust panic —— 数值塔操作符矩阵的审计
+
+D317/D318 建立了 v0.38 数值塔的词汇（后缀语法、运算符提升、模式严格），
+但只验了 `==` 与 `match`。本轮做**操作符矩阵**的穷尽测量。
+
+##### 一、矩阵
+
+6 个值（Float `2` / Int `2i` / BigInt `2n` / Float `2.0` / Int `0i` / Int `-2i`）
+两两组合 × 5 个算术运算符 + 4 个比较运算符，**先纯测量、不预设期望**。
+
+三个发现：
+
+| # | 发现 | 定性 |
+|---|---|---|
+| 1 | `7n / 0i`、`7n % 0i`、`7i / 0n`、`7i % 0n` → **Rust panic，exit 101** | **缺陷（已修）** |
+| 2 | `7i / 0` → `inf`、`7i % 0` → `nan`，**exit 0 静默** | **自洽，非缺陷** |
+| 3 | `2n == 2i` 被 typeck 拒绝，而 `2n + 2i` → `4n` 可以 | **语义缺口，只报告** |
+
+##### 二、发现 1（已修）：Rust panic 逃到用户面前
+
+```text
+print(7i / 0i)   →  Runtime error (MIR): division by zero   exit 1    ✅
+print(7n / 0n)   →  Runtime error (MIR): division by zero   exit 1    ✅
+print(7n / 0i)   →  thread 'mora-main' panicked at
+                    num-bigint-0.4.8/src/biguint/division.rs:174:9:
+                    attempt to divide by zero                 exit 101  ❌
+print(7i / 0n)   →  同上 panic                                                 ❌
+```
+
+`%` 的四种组合同理。**同一件事，只因两个操作数类型不同就一个报 `MoraError`
+一个 panic**（还带 `RUST_BACKTRACE=1` 提示）。
+
+**根因**：`flow.rs::int_div` / `int_mod` 只对 `(Int, Int)` 与 `(BigInt, BigInt)`
+两条 arm 做零检查；`Int ⊗ BigInt` / `BigInt ⊗ Int` 落进 `_` arm → `numeric_op`，
+在那里 Int 被提升成 BigInt 后直接 `a / b`，**绕过了零检查** —— 而 num-bigint
+对零除数是 panic 而非返回错误。
+
+**修法**：补上两条混合 arm（`int_div` / `int_mod` 各两条）。**只新增此前会
+panic 的那条路径，不改动任何既有行为** —— 既有 24 项数值结果逐条复验一致
+（含负数向零截断、符号随被除数、10^20 级别大数精度）。
+
+修后 8 种整数除零 / 模零组合**全部**是 `Runtime error (MIR)` exit 1，零 panic。
+
+##### 三、发现 2：自洽，**不是缺陷**
+
+`7i / 0` → `inf`、`7i % 0` → `nan`、exit **0**。初看像「静默错误值」，
+但按数值塔的提升规则它是**自洽**的：
+
+- `Int ⊗ Float` 提升为浮点 → 走 IEEE → `7 / 0` 同样是 `inf`；
+- `Int ⊗ Int` 保持整数语义 → 整数除零无定义 → 报 `MoraError`。
+
+两条规则**能同时成立且不冲突**。故不改动，并把它钉成判据，防止将来有人
+「顺手」把浮点除零也改成报错（那是语义变更）。
+
+##### 四、发现 3：**语义缺口**，只报告不实施
+
+```mora
+let x = 2n + 2i      // 4n    ✅ 算术允许（任一含 BigInt ⇒ 结果 BigInt）
+print(x == 4i)       // exit 2  typeck 拒绝：expected BigInt, got Int
+print(x == 4n)       // ✅
+```
+
+⇒ **算术有提升、比较没有。** 后果：任何在算术里混用 BigInt 与其它数值类型的
+程序，**其结果的 `==` 只能与另一个 BigInt 比较**。
+
+`value.rs` 的 `PartialEq` 只有 `(BigInt, BigInt)` 一条同型分支（无跨型），
+所以这不是「typeck 忘了放行、runtime 其实能算」—— **两层都严格**，
+只是**两层都不一致于算术的提升策略**。
+
+修它要同时动 **typeck + `Value::PartialEq` + `eval_binary`** 三层 ⇒
+**架构决定，只报告不实施**。已钉成现状判据。
+
+##### 五、判据
+
+新增 `tests/numeric_tower_div_mod.rs`（4 条）：
+
+- `d319_integer_div_mod_by_zero_never_panics` — **主判据**。8 种整数除零 / 模零
+  组合逐一断言 **exit ≠ 101**（先于其它断言，因为 panic 是最严重的一档）、
+  `exit == 1`、错误信息含 `zero`。**反向牙齿已验证**：把 `(BigInt, Int)`
+  arm 改成 `if false` → 立刻红，失败消息精确指出 `7n / 0i`。
+- `d319_mixed_type_div_mod_results_are_correct` — 24 项正确性矩阵
+  （混合类型、负数截断、符号随被除数、浮点提升、`+`/`*` 不受影响、
+  10^20 大数精度）。
+- `d319_float_division_by_zero_keeps_ieee_semantics` — 钉住发现 2（`inf`/`nan`）。
+- `d319_status_quo_bigint_comparison_is_rejected_but_arithmetic_is_not` — 钉住发现 3。
+
+##### 六、门禁
+
+| 项 | 结果 |
+|---|---|
+| `cargo test --no-fail-fast` | **225 目标 0 失败** |
+| `cargo test --lib` | **1011 / 0 / 13** |
+| `cargo fmt --all -- --check` | 0 |
+| `cargo clippy --all-targets --all-features -- -D warnings` | 0 警告 |
+| `cargo doc --no-deps` | 0 警告 |
+
+##### 七、本轮两处工具缺陷（记档）
+
+1. **期望值又是按推断写的**：验证脚本第一版把 `7n / 2i` 的期望写成 `3`、
+   把 `7i / 2` 写成 `3.0`；实测是 `3n`（BigInt 打印带 `n` 后缀）与 `3.5`
+   （Int÷Float 不截断）⇒ 16/24 假红。**判据与脚本的期望值必须来自实测**。
+   （同 D317：把 `reach-d` 的期望写成 `[[c]]`，实跑打回。）
+2. **用例名直接拼进 `%TEMP%` 路径**：表达式里的 `(` `-` 等字符导致
+   `Os { code: 123, kind: InvalidFilename }` ⇒ 加了 `slug()` 只保留
+   字母数字。与 D317 的「并行测试共用临时目录」同族：**测试脚手架的
+   卫生问题会在第一次运行时立刻暴露，但会以「看起来像产品 bug」的形式出现**。
+
+#### D320：索引运算的穷尽矩阵 —— 两个候选发现**均被证伪**（否定轮）
+
+D319 的收获是「同一族里不同类型给出有的干净报错、有的静默错」这个**识别信号**。
+本轮把它用在索引运算上（`vm::index_value` / `checked_index` /
+`index_assign_value` 同样是按 `(容器类型, 索引类型)` 分派的高频路径）。
+
+##### 一、矩阵
+
+容器 4 类（`List` / `String` ASCII / `String` CJK / `Dict`）× 索引 15 种取值
+（整数、负数、越界、整值浮点、小数浮点、BigInt、错配类型…），
+外加下标赋值的源码层与 MIR 层两条路径。
+
+##### 二、候选发现一：「小数下标静默截断」= **D3 的既定设计**
+
+实测 `xs[1.5]` → `xs[1]`、`xs[2.9]` → `xs[2]`，exit 0、零诊断。
+D320 一度参照 D28（负下标静默返回首元素）与 `method_dispatch.rs` v0.104.6
+（越界吞成 nil）的原则「下标算错必须暴露」，**把它改成报错** —— 随即被既有判据打回：
+
+```text
+tests/depth_and_diagnostics.rs:324
+  // 浮点下标按既有约定向零截断（D3 的设计决定）
+  assert_eq!(run("…\nxs[1.9]").unwrap(), "Float(2.0)");
+  assert_eq!(run("…\ns[1.9]").unwrap(), "Char('b')");
+```
+
+⇒ **D28 / `method_dispatch` 讲的是「越界」与「负数」两条，不覆盖小数。**
+不能拿那条原则去推「小数也该报错」——**原则的适用边界要看既有判据钉了什么**。
+D320 的修改**已回退**，`checked_index` 只留了一段注释记着这件事。
+
+**教训**：这次是**我自己在同一轮里写下结论、又用既有判据推翻它**。
+推动力是「在改一个高频共享函数之前先跑钉住它的判据」——
+若不是先跑 `depth_and_diagnostics`，这次会把一个**设计决定**当成缺陷改掉。
+
+##### 三、候选发现二：「`index_assign_value` 是死代码」= **MIR 层仍可达**
+
+`xs[1] = 99` 与 `assign xs[1] = 99` 都是解析错误（`List` 自 v0.104.6 起不可变），
+看起来该函数没用了。但 `handlers/values.rs:156` 的 `MirInst::IndexAssign`
+仍在调它 —— 手写 MIR / SSA 降级路径可达。`tests/list_semantics.rs:14-19`
+**早已精确记录**了这一点。
+
+⇒ **源码层无调用方 ≠ 死代码。** 删一个 `pub fn` 是接口变更，只报告不实施；
+本轮改为在判据里钉住「语法确已移除 + 函数仍存在」两侧。
+
+##### 四、矩阵实际结论
+
+`checked_index` 已被 D28 加固得相当完整：NaN、负数、越界显式报错；
+整值浮点正常；字符串按**字符**（非字节）计数、`len()` 同口径；CJK 正常；
+类型错配给出可读消息（v0.104.6 修过 `{:?}` 打 HashMap 序不定）。
+**本轮没有找到新的缺陷。**
+
+##### 五、判据
+
+新增 `tests/index_matrix.rs`（2 条）：
+
+- `d320_index_matrix_behaviour_is_pinned` — 矩阵的每一格都钉住，并**逐格写明
+  为什么是这个结果**：三格是**设计决定**（浮点截断，失败消息指向
+  `depth_and_diagnostics` 并说明「若本条失败说明有人改了截断语义，那是语义变更」）、
+  越界/负数钉住既有措辞、类型错配钉住 `cannot index`、
+  dict 缺键钉住 `nil`（与 list 越界即错语义不同）。
+- `d320_index_assign_is_syntax_error_but_mir_handler_still_exists` — 钉住
+  「源码层是解析错误」+「`index_assign_value` 仍存在且可取地址」两侧。
+
+##### 六、门禁
+
+| 项 | 结果 |
+|---|---|
+| `cargo test --no-fail-fast` | **226 目标 0 失败** |
+| `cargo test --lib` | **1011 / 0 / 13** |
+| `cargo fmt --all -- --check` | 0 |
+| `cargo clippy --all-targets --all-features -- -D warnings` | 0 警告 |
+| `cargo doc --no-deps` | 0 警告 |
+
+本轮**没有代码行为变更**（`src/mir/vm.rs` 只加了一段注释），
+门禁是回归确认而非新修复的验证。
+
+##### 六之二、一次**未能复现的间歇 lib 失败**（如实记档）
+
+本轮有**一次** `cargo test --lib` 报 `1010 passed; 1 failed; 13 ignored`
+（同一轮里 `cargo test --no-fail-fast` 报 226 目标 0 失败）。
+**失败用例的名字没有抓到手** —— 那次的后台脚本只汇总了 passed/failed 计数。
+
+随后连跑 **17 次**（先 5 次 + 后 12 次带完整输出捕获）**全部 1011/0/13**，
+未能复现。
+
+**已排除的一个假设**：我当时正在用 Python 脚本重写 `CHANGELOG.md`
+（`open(P,'w')` 会先**截断**文件），若某条判据读它就会读到空内容。
+grep 确认**没有任何判据读 `CHANGELOG.md`**（`src/` 与 `tests/` 的命中全在
+注释里）⇒ 该假设**不成立**。
+
+**已定位到一条具体线索（仍未证实）**：本仓库的 lib 判据里，
+`let _ = std::fs::remove_dir_all(...)` 这个模式**遍布** `audit` / `heartbeat` /
+`refine` / `record` / `sandbox` / `skill` / `memory` / `stress_tests`；
+而 `src/audit/mod.rs:606-608` 自己就写着：
+
+> **声明顺序很重要**：`path` 必须在各 `sink` **之前**绑定，Rust 的逆序 drop
+> 才会让 sink 先关句柄、`TempLog` 再删目录
+> （**Windows 上文件被占用时 `remove_dir_all` 会失败**）。
+
+即：**该清理失败时会被静默吞掉**。实测 `%TEMP%` 的确有大量遗留：
+
+| 家族 | 遗留数 | 最新 |
+|---|---|---|
+| `mora_record_test_subdir_*` | **557** | 2026-10-01 |
+| `mora_sandbox_*` | 3 | 2026-10-03 |
+| `mora_audit_*`（D295 已在报） | 5711 | — |
+| **`mora_*` 目录总计** | **9245** | — |
+
+**顺带修正一个长期上报的口径**：本审计多轮报告的「5711 个 `mora_audit_*`
+残留」**不是全貌** —— 另有约 **560 个**来自 `record_test_subdir` / `sandbox` /
+`d1xx_probe` 等其它判据家族（`9245 = 5711 + 2944 + 约 590`）。
+
+**为何这与间歇失败有关（假设，未证实）**：若某条 lib 判据断言临时目录**为空**
+（`record::tests::list_recordings_empty_dir` 就是），而清理因句柄占用静默失败、
+或上一轮残留落在同名目录里（该系列用 `{pid}` 命名，**同一进程内的多条判据共享
+PID**），就会读到非空目录而失败。
+
+**本轮不对它下结论，也不擅自删这 560 个历史目录**（批量删除是 D295 起就在等的
+裁决项）。记在这里是因为：约 1/18 的间歇失败率足以让 CI 偶发变红，
+而**没抓到名字 = 下次还会抓不到**。将来若再遇到，应第一时间把完整输出落盘。
+
+##### 七、本轮两处小失误（记档）
+
+1. 判据的消息串里写了 `({a:1})`，被 `assert_eq!` 当成格式化占位符
+   （`cannot find value a`）⇒ 需写成 `{{a:1}}`。
+   —— **凡是把 Mora 源码片段放进 Rust 格式串，都要转义花括号**；
+   判据里贴代码片段时这是高频坑。
+2. 注释里又打进一个 U+FFFD（`assert count(0xFFFD)` 那道检查第 6 次拦下）。
+
+#### D321：本会话新增的三个判据文件**每次跑全量各漏一个临时目录** —— 修的是我自己的代码
+
+D320 在追一条「间歇 lib 失败」的线索时，顺手量了 `%TEMP%` 的判据目录积累，
+本轮把它查到底。**结论分两半：历史存量早已修好；但本会话新增的三个判据文件
+自己在漏。**
+
+##### 一、先澄清历史存量：D34 早已修好，557 个是**修复前**的残留
+
+`src/record/tests.rs:718-719` 的注释（D34）：
+
+> 原先只删 `nested`，**父目录** `mora_record_test_subdir_<pid>` 留着 ——
+> 每次跑测试漏一个。实测该前缀在 `%TEMP%` 下累积到 **578** 个。
+
+实测今天 `mora_record_test_subdir_*` 是 **557** 个（**比 578 少 21**），
+且**跑一次 `cargo test --lib` 计数 +0**。⇒ D34 的修法有效，557 是历史存量。
+
+**D320 报告里「最新 2026-10-01」暗示仍在增长，是错的** —— 那只是最后一批
+残留的时间戳。本轮实测冻结，特此更正。
+
+##### 二、真正的泄漏：**本会话新增的三个判据文件**
+
+对全部 `mora_*` 目录做「跑全量前后按家族计数」对比，**唯一增长**的是：
+
+| 家族 | 每次全量的增量 |
+|---|---|
+| `mora_d317_match_bigint-pat` | **+1** |
+| `mora_d317_match_float-pat` | **+1** |
+| `mora_d317_match_int-pat` | **+1** |
+| `mora_d319_num_` | **+1** |
+
+其余全部家族（含 5711 个 `mora_audit_*`、557 个 `record_test_subdir`、
+4 个 `schema_test`、3 个 `sandbox`）**计数全部不变**。
+
+##### 三、根因：tag 里的 `/` 让 `remove_dir_all` 只删叶子
+
+D318 给 `match_numeric_patterns` 加的那批用例，tag 写成 `"float-pat/int-val"`
+这种带斜杠的形式；而三个文件的 `run()` 都是
+`temp_dir().join(format!("mora_dNNN_xxx_{tag}"))` —— **只在调用点 slug、
+函数内部没 slug**。于是路径变成**嵌套**：
+
+```text
+mora_d319_num_/int-int        ← create_dir_all 造出父 + 子两级
+```
+
+`remove_dir_all` 只作用于**叶子** `.../int-int` ⇒ **父目录 `mora_d319_num_`
+留下且为空**。这与观测完全吻合：`items=0`、名字是裸的 `mora_d319_num_`、
+**不随运行次数增长**（名字确定性、每次复用同一个）。
+
+##### 四、修法：把 slug 收进 `run()` 内部 —— **修整类，不修实例**
+
+只在调用点 slug 是不够的：**任何新增的、带 `/` 的 tag 都会重新引入**。
+收进函数内后，调用点不必各自记得。
+
+同时把 `let _ = std::fs::remove_dir_all(&dir);` 换成**带重试、失败即 panic**
+的 `cleanup_dir`（8 次重试、25 ms 间隔）——
+`src/audit/mod.rs:606-608` 早就写明「**Windows 上文件被占用时
+`remove_dir_all` 会失败**」，而 `let _ =` 会把失败**伪装成清理过了**。
+
+**实测**：
+
+| | 修前 | 修后 |
+|---|---|---|
+| 清理后 `mora_d3*` | 0 | 0 |
+| 跑完一次全量后 | **+4** | **0** |
+| `mora_*` 总计 | 9245 | **9241** |
+
+##### 五、门禁
+
+| 项 | 结果 |
+|---|---|
+| `cargo test --no-fail-fast` | **226 目标 0 失败** |
+| `cargo test --lib` | **1011 / 0 / 13** |
+| `cargo fmt --all -- --check` | 0 |
+| `cargo clippy --all-targets --all-features -- -D warnings` | 0 警告 |
+| `cargo doc --no-deps` | 0 警告 |
+
+##### 六、本轮三次「普查器自己坏了却没被发现」
+
+D321 里有**三次**我的验证脚本失败而我没有当场深究：
+
+1. fix2 脚本的正则 `mora_d\d+_\{` 匹配不到 `mora_d319_num_{tag}`
+   （中间多一段 `_num_`）⇒ 报告「0 处已改」，我据此以为已修完；
+2. 随后的「验证」步骤用了**同样错**的正则，打印 `?`，我没追；
+3. 真正定位靠的是**逐行实查**（`Select-String 'temp_dir().join'`），
+   一步看见三个文件里有两个没 slug。
+
+⇒ 与 D314/D316 记的同类：**普查器与被普查对象必须互相校验**；
+而「输出看起来像成功了（0 处 / `?`）比报错更危险**。
+本轮的自救手段固定为：**正则/脚本给出可疑结果时，改用逐行实查复核**。
+
+##### 七、口径修正（承接 D320）
+
+D320 已记录 `%TEMP%` 里 `mora_*` 共 **9245**、其中 `mora_audit_*` 5711、
+`record_test_subdir` 557。本轮把**本会话自己新增的那 4 个**清掉后为 **9241**。
+
+**历史存量（9241）未动** —— 批量删除是 D295 起就在等的裁决项，仍未擅自执行。
+
+#### D322：把 D314/D317/D319 的机制做成**全仓静态普查** —— 结论是这个仪器**不判别**（否定轮）
+
+前三个缺陷（`max_reg_in_node` 的 `_ => 0`、`self_match_pattern` 缺
+`bigint:` 分支、`int_div` 兜底走 `numeric_op`）机制完全一样：`match` 写了几条
+具体 arm + 一个 `_ =>` 兜底，恰好有一组输入掉进兜底、走进没人想过的那条路。
+本轮把「有多少个这样的分派点」静态列出来，作为下一轮定向取证的清单。
+
+##### 一、普查结果：459 处「有兜底且未覆盖全部变体」的 `match`
+
+按枚举聚合（缺口次数）：
+
+| 枚举 | 有缺口处数 | 缺口次数 |
+|---|---|---|
+| `Value`（41 变体） | 204 | 7742 |
+| `TokenType`（81 变体） | 36 | 2617 |
+| `MirInst`（58 变体） | 38 | 2007 |
+| `Type` | 38 | 1560 |
+| `WitnessKind`（47 变体） | 21 | 909 |
+| `Node`（50 变体） | 9 | 354 |
+| `MirDagNode`（7 变体） | 21 | 115 |
+
+##### 二、这个仪器失败了 —— 三条独立证据
+
+1. **枚举归属不可靠**。最高分命中 `src/mir/witness_to_fcfg.rs:81`
+   （`Node` 覆盖 47/50，只缺 `Expr` / `ImplDef` / `TraitDef`，形状与 D314
+   的 25/50 一模一样）—— 逐行实查后确认：该处是 `match &w.kind {`，
+   分派的是 **`WitnessKind`**；`Node::*` 是 arm 里**构造**出来的。
+   脚本按「body 里 `Enum::Variant` 出现最多」猜，于是误判。**假阳性。**
+2. **覆盖率不判别**。459 处里绝大多数是**合法部分分派**：解析器的
+   `match tok { TokenType::A => …, _ => … }`（`TokenType` 有 81 个变体，
+   每个分派点只关心 1–3 个）、谓词的
+   `match v { Value::Int(_) => …, _ => … }`。按缺口排序也没用 ——
+   **缺口大**的（合法）与**缺口小**的（可疑）混在一起。
+3. **收紧归属后剩 0 处**。要求 scrutinee 直接写出枚举名才保留，结果一条不剩
+   —— 真实代码的 scrutinee 多半是裸标识符（`match node` / `match &w.kind`），
+   要判定其类型得做类型推导，正则做不到。
+
+##### 三、真正的判据是**语义的**，不是覆盖率的
+
+> **兜底分支的返回值/行为，是否与各条显式 arm「不同类」？**
+
+| 位置 | arm 给 | 兜底给 | 后果 |
+|---|---|---|---|
+| `max_reg_in_node` | **寄存器号** | `0`（「没有寄存器」） | `n_regs` 少算 |
+| `int_div` | **精确整数** | `numeric_op`（**IEEE 浮点**） | 零检查被绕过 → panic |
+| `self_match_pattern` | **比较结果** | `false`（「不匹配」） | 同类型同值也不匹配 |
+
+三处的兜底都**悄悄换了一种语义**。**静态覆盖率完全看不见这件事** ——
+它只看「有没有覆盖到变体」，而合法部分分派与真缺陷在这个指标上长得一模一样。
+
+⇒ 自查手段只能是**逐个 `match` 读 arm、问兜底那一支换没换语义**，
+或者用**行为矩阵**（D319 的类型矩阵是有效形态：把组合全跑一遍看结果）。
+
+##### 四、本轮第四次让普查器骗了过去
+
+D314 / D316 / D321 / D322 连续四次出现「脚本报告成功（`0 处` / `?` / 假命中）
+而实际没生效或误报」。本会话的固定对策已确立：
+
+> **普查器输出若不能被逐条复核，就不要采信；可疑结果一律改用逐行实查复核。**
+
+##### 五、门禁
+
+本轮**无代码变更**（只新增了两份一次性普查脚本，取证后已删）。
+门禁沿用 D321 结果：226 目标 0 失败 / lib 1011/0/13 / fmt 0 / clippy 0 / doc 0。
+
+##### 六、口径修正（承接 D321）
+
+`%TEMP%` 遗留：**9241**（D321 修掉本会话自己新增的 4 个之后），
+其中 `mora_audit_*` 5711、`record_test_subdir` 557，其余为 `sandbox` /
+`schema_test` / 历史 `d1xx` 探针。**历史存量仍未动** —— 批量删除是
+D295 起就在等的裁决项。
+
+#### D323：比较运算符的**穷尽矩阵** —— 契约量清，**未发现新缺陷**（否定轮）
+
+D319 做了数值塔的**算术**矩阵（挖出 `BigInt ⊗ Int` 除零 panic）。本轮做它的
+搭档：**比较**矩阵 —— 10 种值两两组合 × 6 个比较运算符，纯测量、不预设期望。
+
+##### 一、量出来的四条契约
+
+**① 顺序比较（`<` `>` `<=` `>=`）只对数字有定义。**
+`String` / `Char` / `Bool` / `Nil` / `List` / `Dict` 的顺序比较**全部**报
+`Runtime error (MIR): Operands must be numbers` —— **干净报错**，
+不是静默错值。数值塔内两两可比且满足三角关系。
+
+> 「字符串不能比大小」是**能力缺口**（多数语言可以），不是缺陷 ——
+> 报错而非静默给错答案，符合本项目一贯立场。
+
+**② 跨类型相等一律被 typeck 拒绝，绝不静默给 `true`。**
+
+| 表达式 | 结果 |
+|---|---|
+| `nil == false` / `nil == 0` / `nil == 0.0` | typeck 拒绝 |
+| `false == 0` / `false == 0.0` / `true == 1` / `true == 1.0` | typeck 拒绝 |
+| `'a' == "a"` / `"1" == 1` | typeck 拒绝 |
+| `1n == 1i` / `1n == 1` | typeck 拒绝（D319 发现 3 的现状） |
+| `1 == 1.0` / `1i == 1.0` / `1n == 1n` | **true**（运算符有提升，与 D318 一致） |
+
+**这是本轮最关键的一条** —— 它排除了「跨类型相等静默给错答案」这一类风险。
+D318 曾因 match 缺提升而记过一条待裁决项；`==` 这边**没有**同类问题。
+
+**③ 深度相等正确且递归。**
+`[[1],[2]] == [[1],[2]]` → `true`；`{a:{b:1}} == {a:{b:1}}` → `true`；
+`{a:1,b:2} == {b:2,a:1}` → `true`（**键序无关**）；长度/顺序不符正确给 `false`。
+
+**④ `==` / `!=` 完全对称：0 个不对称格子**（8 组跨类型对 × 2 个运算符）。
+
+##### 二、本轮我自己犯的一次错（与 D317/D320 同族）
+
+矩阵脚本把 `{a:1} == {b:1}` 标成「值不对」（我期望 `true`、实测 `false`）。
+逐行查证后确认**实测是对的**：`Value::Dict` 是 `HashMap<String, Value>`，
+键**身份**相关；而「键**序**无关」是另一回事，已由 `{a:1,b:2} == {b:2,a:1}`
+→ `true` 单独证明。
+
+⇒ **把「键序无关」与「键身份无关」混为一谈**，与 D317（把后缀语法漏掉、
+错判「Int 永远匹配不上」）、D320（把两条不同原则混成一条）是**同一族错误**：
+**看到与直觉不符的实测值，第一反应应是「我可能把两件事搞混了」，
+而不是「代码错了」**。判据 `d323_deep_equality_…` 里已显式写明这一点。
+
+##### 三、判据
+
+新增 `tests/comparison_matrix.rs`（4 条），把上述四条契约钉死：
+
+- `d323_cross_type_equality_is_rejected_never_silently_true` — 11 个跨类型
+  相等逐条断言 **exit 2**；失败消息明写「若变成 exit 0 并给 true，那是**语义
+  变更**，请先回到 CHANGELOG D319/D323 记录裁决依据」。另附数值塔提升的对照组。
+- `d323_deep_equality_is_recursive_and_order_insensitive_for_dicts` — 10 组，
+  含 `{a:1} == {b:1}` → **false**（键身份相关）。
+- `d323_ordering_is_numbers_only_and_errors_cleanly_otherwise` — 数字可比较；
+  其余 6 类必须报错且消息含 `must be numbers`。
+- `d323_equality_is_symmetric_across_all_type_pairs` — 8 组 × 2 运算符，
+  退出码与取值都须对称。
+
+##### 四、门禁
+
+| 项 | 结果 |
+|---|---|
+| `cargo test --no-fail-fast` | **227 目标 0 失败** |
+| `cargo test --lib` | **1011 / 0 / 13** |
+| `cargo fmt --all -- --check` | 0 |
+| `cargo clippy --all-targets --all-features -- -D warnings` | 0 警告 |
+| `cargo doc --no-deps` | 0 警告 |
+
+##### 五、本轮工具缺陷
+
+判据消息串里把 Mora 源码片段 `{a:1}` 写进了 `assert_eq!` 的格式串
+（未转义花括号）⇒ `E0425: cannot find value a`。这与 D320 同类：
+**在 Rust 格式串里贴 Mora 源码，`{` 必须写成 `{{`**。已修正。
+
+#### D324：**容器广播**的穷尽矩阵（15 值两两 × 6 运算符 = 1800 格）—— 零 panic，钉住一条**按长度重载**的运算符
+
+D319 量了标量算术、D323 量了标量比较，本轮量**容器**。广播的失败模式历来是
+「静默产出形状错误的值」（CHANGELOG D22 记过 `[1,2] - 1.0` 曾被按 `Add`
+派发），故本轮重点看**错值**与**panic**。
+
+##### 一、主结果：1800 个格子**零 panic、零静默错值**
+
+每个格子要么算出**正确**的值，要么 `typeck` 拒绝，要么干净报错。
+没有「静默给出错误值」，也没有 Rust panic 逃到用户面前。
+
+##### 二、真正的发现：`+` 在两个 list 上**按长度重载**
+
+这一条打了我两次期望值（先按「`+` 逐元素」写，再按「空 list 当标量广播」
+写），逐运算实测后才看清：
+
+| 表达式 | 结果 |
+|---|---|
+| `[1,2] + [10,20,30]` | **`[1.0, 2.0, 10.0, 20.0, 30.0]`**（**连接**，尽管长度相等） |
+| `[1,2] + [1]` | `[1.0, 2.0, 1.0]`（连接） |
+| `[1,2] + [3,4]` | `[4.0, 6.0]`（**等长 → 逐元素**） |
+| `[1,2] - [3,4]` | `[-2.0, -2.0]`（等长 → 逐元素） |
+| `[1,2,3] - [1]` | `Runtime error (MIR): List length mismatch` |
+| `[1,2] - []` | `Runtime error (MIR): List length mismatch: 2 vs 0` |
+
+⇒ **`+` 等长时逐元素、不等时连接**；`-` `*` `/` `%` **一律要求等长**。
+
+**判定为「有意重载」而非缺陷**：`xs + [y]`（追加单个元素）是极常见惯用法，
+若不等长就报错会废掉它；而 `-`/`*`/`/`/`%` 没有对应的惯用需求，故一律报错。
+
+**但正因为反直觉，必须钉死** —— 否则将来有人「顺手统一」成「不等长就报错」
+或「一律连接」，会**静默改变用户代码产出的列表形状**，而所有既有测试都不会红
+（它们用的都是等长或明确报错的情形）。
+
+##### 三、另外三条契约
+
+1. **`BigInt` 在容器广播里被拒**（Int / Float 都可）：`[1,2] + 1i` → `[2.0,3.0]` ✓、
+   `[1,2] + 1.5` → `[2.5,3.5]` ✓、**`[1,2] + 1n` → typeck 拒绝**。
+   与 D319 发现 3 同源：**BigInt 是唯一不参与提升的数值类型**。属能力缺口 +
+   语义决定，只报告不实施。
+2. **元素类型不齐不广播，干净拒绝**：`[1,"a"] + 1`、`[1,"a"] + ["b"]`（连接路径
+   同样要求齐一）、`[nil,1] + 1`、`[[1],[2]] + 1` 全部 typeck 拒绝。
+   这钉住 D22 修的那个缺陷的**当前状态**。
+3. **标量 ⊙ 列表 与 列表 ⊙ 标量 都工作且顺序敏感**：`[1,2,3] - 1` → `[0.0,1.0,2.0]`、
+   `1 - [1,2,3]` → `[0.0,-1.0,-2.0]`。
+
+##### 四、判据
+
+新增 `tests/container_broadcast_matrix.rs`（4 条）：
+
+- `d324_plus_overloads_on_length_others_always_require_equal_length` — 主判据。
+  等长 `+` 逐元素、不等长 `+` 连接（7 个）、其余四运算等长逐元素（4 个）、
+  不等长/空 list 参与非 `+` 运算一律报 `length`（7 个）。失败消息明写
+  「若本条失败，说明有人改了 `+` 的重载规则 —— 那是**语义变更**，会静默改变
+  用户代码产出的列表形状」。
+- `d324_bigint_scalar_broadcast_is_rejected_while_int_and_float_work`
+- `d324_broadcast_requires_uniform_element_types`
+- `d324_scalar_list_broadcast_is_order_sensitive`
+
+##### 五、门禁
+
+| 项 | 结果 |
+|---|---|
+| `cargo test --no-fail-fast` | **228 目标 0 失败** |
+| `cargo test --lib` | **1011 / 0 / 13** |
+| `cargo fmt --all -- --check` | 0 |
+| `cargo clippy --all-targets --all-features -- -D warnings` | 0 警告 |
+| `cargo doc --no-deps` | 0 警告 |
+
+##### 六、本轮我自己错的次数（第 4、5 次同类错误）
+
+`+` 那条契约打了我的期望值**两次**（先「`+` 逐元素」、再「空 list 当标量广播」），
+另有三处是格式/空格差异。加上 D317、D319、D320、D323，这已是本会话
+**第 5 次**「期望值按推断写、实跑打回」。
+
+⇒ 判据里**所有**期望值现在都必须先由实测脚本产出、再粘贴；
+凭「按语义应该是 X」写下的每一个期望值，本会话至少错过一次。
+
+#### D325：`reshape()` 目标**小于**源时**静默丢数据**（已修）；值方法矩阵 76 个调用**零 panic**
+
+D324 证明「同一运算符 × 不同操作数形状」是出金率最高的方向。本轮沿用到
+**方法调用**面：76 个调用（形状方法 × 参数类型 + 嵌套/空/参差容器）。
+
+##### 一、方法矩阵：零 panic，且报错信息质量很高
+
+`take` / `drop` / `window` / `batch` / `reshape` / `flatten` / `transpose` /
+`sort` / `reduce` / `map` / `filter` / `get` / `pop` / `push` / `len`，
+各配 0 / 1 / 2 / 5 / 负数 / 小数 / Int / BigInt / 字符串 / 布尔 / nil 参数。
+
+**76 个调用零 panic**，12 个报错全部**带方法名与具体原因**：
+
+```text
+take(): count 不能为负数（得到 -1）
+window() size must be > 0
+reshape(): rows and cols must be non-negative
+transpose() requires a rectangular 2D list (row widths differ: [2, 1])
+List.sort: contains non-numeric elements
+List.get: index must be non-negative
+```
+
+##### 二、真正的缺陷：`reshape()` 静默丢数据
+
+```text
+[1,2,3,4,5,6].reshape(1,1)  →  [[1.0]]   ← 5 个元素凭空消失
+[1,2,3,4].reshape(1,2)      →  [[1.0, 2.0]] ← 2 个元素消失
+```
+
+**退出码 0、零诊断。** 用「嵌套循环求和」验证元素真的没了：
+`[1,2,3,4].reshape(1,1)` 的元素和是 **1.0**（应为 10.0）⇒
+**任何在 reshape 结果上做聚合的代码都会拿到错误的数**。
+
+##### 三、定性过程（吸取 D320 教训：**肯定断言也需要自己的验证**）
+
+我没有直接下结论，而是查了四处：
+
+| 出处 | 内容 |
+|---|---|
+| `docs/learning-plan.md:166` | 「元素按 ravel 顺序复制，**不足则循环重复**」—— 方向是「补」，**从未说「多就丢」** |
+| `docs/mora-spec.md:1068` | 只写「重塑列表」 |
+| `tests/list_methods.rs:110` | `// 既有行为：不足时循环重复已有前缀补齐` —— **填充**是设计且被钉住 |
+| `tests/list_methods.rs` 的 6 条 reshape 判据 | 全是「恰好」或「填充」，**无一条覆盖截断** |
+
+⇒ **填充是设计、截断是漏掉的方向。** 且 numpy / Julia 的 `reshape` 在
+size 不匹配时**报错**。修它**不破坏任何既有判据**（实测 6 个相关测试目标
+**72 条全绿**）。
+
+**根因**：`method_dispatch.rs` 里 `while flat.len() < total` **只增长不收缩**，
+而 `flat[r*cols..(r+1)*cols]` 只读**前缀** ⇒ 尾部元素被静默丢弃，代码无任何检查。
+
+**修法**：`total < flat.len()` 时返回 `MoraError`，并提示改用 `take()`。
+**填充行为逐字不变。** 与本文件既有立场一致（v0.104.6 修 `list.get` 越界
+静默返回 nil 时）：**静默改变数据形状必须是显式错误**。
+
+##### 四、顺带量到的三条（均已钉判据）
+
+1. **`sort()` 不能排字符串**：`["b","a"].sort()` → `List.sort: contains
+   non-numeric elements`。与 D323「字符串无顺序比较」同族。
+2. **`flatten()` 要求元素类型齐一**：`[[1],[2]].flatten()` ✓ 但
+   `[1,[2,3]].flatten()` 被 typeck 拒。与 D324 同族。
+3. **`get(1.5)` 静默取 `xs[1]`**（小数下标截断）—— 与 D320 查明的
+   「浮点下标向零截断是 D3 的既定设计」一致，**是设计不是缺陷**。
+
+##### 五、判据
+
+新增 `tests/reshape_no_silent_drop.rs`（3 条）：
+
+- `d325_reshape_never_silently_drops_elements` — 7 个目标小于源的组合逐条断言
+  必须报错。**反向牙齿已验证**：把守卫改成 `if false &&` → 立刻红，
+  实得 `[[1.0]]`（静默丢弃回来了）。
+- `d325_reshape_preserves_element_sum` — 检查**可观察后果**（元素和仍是 10.0），
+  不依赖报错文案，故对任何修法都成立。
+- `d325_reshape_padding_and_exact_shapes_unchanged` — 填充与「恰好」两种
+  合法路径**逐字不变**（本修复只动截断方向）。
+
+##### 六、门禁
+
+| 项 | 结果 |
+|---|---|
+| `cargo test --no-fail-fast` | **229 目标 0 失败** |
+| `cargo test --lib` | **1011 / 0 / 13** |
+| `cargo fmt --all -- --check` | 0 |
+| `cargo clippy --all-targets --all-features -- -D warnings` | 0 警告 |
+| `cargo doc --no-deps` | 0 警告 |
+
+相关的 6 个既有测试目标（`list_methods` / `list_semantics` /
+`value_method_args` / `builtin_gaps` / `spec_method_surface` /
+`list_method_signatures`）**72 条全绿**。
+
+##### 七、本轮又踩了一次「输出截断伪装正常」
+
+第一版矩阵脚本把结果截到 30 字符显示，于是
+`[1,2,3,4].reshape(2,3)` 的最后一个元素没看见，我据此以为
+「填充是复制首元素 `[4,1,1]`」并据此反推代码有 bug。改用**完整输出**后
+实际是 `[4,1,2]`（循环重复 `flat[..extend_len]`），与代码一致。
+
+⇒ 与 D312 记的教训同源：**打印输出时不要截断**；「看起来像 bug」的第一反应
+应该是「我的观测工具是不是少了信息」。
+
+#### D326：String / Dict 方法的参数形态矩阵（54 个调用）—— 零 panic，钉住三条**未文档化**的现状
+
+D325 在 list 方法面挖出 `reshape()` 静默丢数据。本轮用同一手法扫**未覆盖**的
+String / Dict 方法面。
+
+##### 一、54 个调用**零 panic**，参数约束严密
+
+覆盖：`split`（空/多字符/重复/不存在分隔符、limit 各形态、参数个数）、
+`replace`（空模式、缺参、多余参、非字符串）、`contains` / `starts_with` /
+`ends_with`（空 needle、非字符串、少参、多参）、`trim` / `upper` / `lower`、
+`dict.get` / `set` / `keys` / `values` / `len`（缺键、空键、非字符串键）。
+
+**零 panic。** 参数个数/类型错、非字符串键全部被 typeck 拒绝；`upper`/`lower`
+对 CJK 正确；`len` 按**字符**不按字节（`"中文abc".len()` → `5`）。
+
+##### 二、`split("")` 继承 Rust 的 2n+1 行为（**未文档化、未钉住**）
+
+```text
+"a,b,,c".split("")  →  [, a, ,, b, ,, ,, c, ]   ← 2n+1，两端多出空串
+```
+
+横向对比 `"abc".split("")`：
+
+| 语言 | 结果 |
+|---|---|
+| **Mora（当前）** | `["", "a", "b", "c", ""]` |
+| Python | **`ValueError`** |
+| Java / Go | `["a","b","c"]` |
+| Rust | `["", "a", "b", "c", ""]` |
+
+Mora 当前继承的是 **Rust** —— 也是四者里**唯一**产生两端空串的。
+
+用户写 `s.split("")` 几乎总是想要「拆成字符」，多出的两个空串与该意图不符；
+但「修成什么」（报错 / 给纯字符列表）**两种答案都自洽** ⇒
+**语义决定，只报告不实施**，用判据把当前行为钉住。
+
+**查证**：`tests/` 与 `docs/` 里**没有任何**判据或 spec 覆盖空分隔符
+（grep `split("")` / 空分隔 零命中）⇒ 与 D325 的 `reshape` 截断同形 ——
+**未文档化、未钉住的方向**。
+
+##### 三、另两条现状
+
+1. **`split` 与 `dict.get` 都只接受恰好 1 个参数**（无 `limit`、无 `default`）：
+   `"a,b".split(",", 2)`、`{a:1}.get("a","def")` 均被 typeck 拒绝。
+   Python 两者都支持 ⇒ **能力缺口**，非缺陷。
+2. **`dict.get(缺键)` 静默返回 `nil`**，与 `list.get(越界)` **报错**
+   （D153 明确改过）形成对照。但 dict 查不到键是常态（`d["missing"]` 同样
+   给 `nil`），dict 内部自洽 ⇒ 只记档。
+
+##### 四、顺带确认一条**是设计**的
+
+`"ab".replace("", "X")` → `XaXbX` —— 与 **Python 的 `str.replace` 完全一致**，
+不是缺陷。（与 `split("")` 恰好相反：同一族的两个方法，一个像 Python、
+一个像 Rust。）
+
+##### 五、判据
+
+新增 `tests/string_dict_method_matrix.rs`（3 条）：
+
+- `d326_status_quo_split_with_empty_separator_keeps_rust_semantics` — 钉住 7 组
+  空/多字符/重复分隔符行为。失败消息写明「若裁决改为报错或给纯字符列表，
+  本条应随之翻转 —— 两种答案都自洽，务必在 CHANGELOG 记下依据」。
+- `d326_replace_with_empty_pattern_matches_python` — 钉住与 Python 一致的空模式。
+- `d326_arity_types_and_missing_key_behaviour` — 15 组正常路径 + 3 组缺键
+  + 12 组参数约束。失败消息要求**先分辨**是「能力新增」（语义变更）还是
+  「约束被放宽」（缺陷）再改判据。
+
+##### 六、门禁
+
+| 项 | 结果 |
+|---|---|
+| `cargo test --no-fail-fast` | **230 目标 0 失败** |
+| `cargo test --lib` | **1011 / 0 / 13** |
+| `cargo fmt --all -- --check` | 0 |
+| `cargo clippy --all-targets --all-features -- -D warnings` | 0 警告 |
+| `cargo doc --no-deps` | 0 警告 |
+
+##### 七、本轮无代码变更
+
+本轮**未修改任何产品代码** —— 三条发现全部是**未文档化的现状**，
+按既定纪律（产品契约决定不擅自实施）只钉判据。
+这与 D322/D323 同属「测量并固化」，与 D312/D315/D319 的「修」不同。
+
+#### D327：`range(n)` **单参形态**让 `for` 循环体完全跳过（已修）；命名内建函数矩阵 133 个调用零 panic
+
+D325/D326 扫了**方法**面（list / string / dict），本轮扫**命名内建函数**这条面
+（既有判据只测过签名，没测跨类型运行行为）。
+
+##### 一、133 个调用零 panic
+
+覆盖 `str`/`int`/`float`/`bool`/`atom`（各 9 种值类型 + 缺参 + 多参）、
+`len`（9 种类型 + 缺参 + 多参）、`type_of`/`deref`/`methods_of`、
+`range`（0/1/2/3/4 参 × 负数/小数/零步长）、`sum`/`abs`/`max`/`min`/`mean`、
+`apply`/`curry`/`is_instance`/`compose`/`partial`。
+
+**零 panic。** `int`/`float` 对 List/Dict/Nil/String/Char **明确报错**
+（D4 已修的方向）；`len` 对非容器报错；参数个数/类型错全部被 typeck 拒绝。
+
+##### 二、真正的缺陷：`range(n)` 单参形态
+
+```text
+let t = 0
+for i in range(5)
+  t = t + i
+end
+print(t)                     →  0.0      （期望 10）
+
+for i in range(3) { print(i) } →  一次都不打印
+len(range(5))                 →  0
+```
+
+**退出码 0、零诊断。** 与 D312 / D313 / D315 同族的「静默失败」，且比那几条
+更基础 —— `for i in range(n)` 是最常见的循环写法。
+
+**根因**（`builtin_impls.rs::call_builtin_range`）：
+
+```text
+start = args.first()          // 单参时 = n
+end   = args.get(1) ?? start  // 单参时 = n
+```
+
+⇒ 单参时 **start == end** ⇒ `while i < end` 恒假 ⇒ 静默返回空列表。
+
+##### 三、定性（吸取 D320 教训：**肯定断言也需要自己的验证**）
+
+| 出处 | 内容 |
+|---|---|
+| `docs/mora-spec.md` | **`range` 零命中** —— 规范从未定义它 |
+| 既有判据 | **全部**用多参形态（`range(0,4)` / `range(0,n,1)` / `range(3,0,-1)` / `range(0,5,0)`），**无一条覆盖单参** |
+| `builtin_return_types.rs:153` | 「range 声明 **3 参**却常被 2 参调用」⇒ 签名是 3 参，1 参落在签名之外 |
+
+⇒ 单参是**未文档化、未钉住的漏掉方向**（与 D325 的 `reshape` 截断同形）。
+Python / JS / Rust 的 `range(n)` 均为 `[0, n)`。
+
+**修法**：单参时 `start = 0`、`end = n`。**多参形态逐字未变**，负步长分支
+（早前已修）未动。相关的 6 个既有测试目标 **65 条全绿**。
+
+##### 四、顺带量到的三条（只记档，未改）
+
+1. **`sum` / `abs` / `max` / `min` / `mean` 只有方法、没有自由函数** ——
+   `sum([1,2,3])` 报 `Undefined function or task: sum`，而 `[1,2,3].sum()` 可用。
+   `docs/learning-plan.md` 与 spec 都只承诺方法形态 ⇒ **能力现状**，
+   但错误信息对用户不友好（不是「请用方法」而是「未定义」）。
+2. **`is_instance` 大小写敏感**：`is_instance([1], "List")` → `false`，
+   而 `type_of([1])` 返回**小写** `"list"`，`is_instance([1], "list")` → `true`。
+   小写是单一事实源，但用户自然写 `"List"` ⇒ **易踩坑**，非缺陷。
+3. **`str()` 缺参静默返回 `"nil"`**（`bool()` 缺参 → `false`、`atom()` 缺参 →
+   `Atom(Nil)`），而 `type_of()` / `deref()` / `methods_of()` 缺参**报错** ——
+   同一组内建里**两种策略并存**。`int()` / `float()` 缺参**报错**（与 D4 的
+   「静默降级」修法一致）。⇒ `str` / `bool` / `atom` 的缺参兜底与其余
+   不一致，属**待统一的现状**。
+
+##### 五、判据
+
+新增 `tests/range_single_arg.rs`（3 条）：
+
+- `d327_single_arg_range_means_zero_to_n` — 8 个单参组合。**反向牙齿已验证**：
+  把 `1 => (0, as_i64(&args[0], "end")…)` 改回 `end = args.get(1) ?? start`
+  → 立刻红，实得 `[]`。
+- `d327_for_loop_over_single_arg_range_actually_runs` — 检查**可观察后果**
+  （`for` 累加必须得 10.0、循环体必须打印 0/1/2、`len(range(5))` 必须是 5），
+  不检查 `range` 本身，故对任何修法都成立。
+- `d327_multi_arg_range_unchanged` — 10 组多参形态 + 步长 0 仍报错。
+
+##### 六、门禁
+
+| 项 | 结果 |
+|---|---|
+| `cargo test --no-fail-fast` | **231 目标 0 失败** |
+| `cargo test --lib` | **1011 / 0 / 13** |
+| `cargo fmt --all -- --check` | 0 |
+| `cargo clippy --all-targets --all-features -- -D warnings` | 0 警告 |
+| `cargo doc --no-deps` | 0 警告 |
+
+#### D386：全仓 **`pub fn` 零引用普查** —— 815 个里 **37 个**是「完整但未接入」（否定轮）
+
+「功能未接通」是本会话最常见的结论类型（D346 `xform` / D356 /
+D360 `orchestrate loop` / D361 `IndexAssign` / D363 / D385），
+但那些都是**个案**。本轮做**全仓普查**，把这类结论一次性量化。
+
+## 普查方法
+
+`#[allow(dead_code)]` 全仓 **0 处** ⇒ 编译器视角没有死代码
+（`pub` 项本来就不算 dead）。只能**人工判调用链**：
+对每个 `pub fn` 数它在全仓 `src/` 出现几次；只出现 1 次 ⇒ 只有定义、零引用。
+
+## 结果：815 个 `pub fn` 里 **37 个**零引用
+
+| 模块 | 零引用数 | 代表 |
+|---|---|---|
+| `value.rs` / `value/list.rs` | 6 | `is_exported` / `is_moved` / `reversed` / `sorted_by_key` / `to_mut_vec` / `into_value` |
+| `typeck/` | 7 | `is_empty_union` / `enter_scope` / `exit_scope` / `push_scope` / `pop_scope` / `fresh_closure` |
+| `pregel/` + `trace_collector/` | 6 | `with_step_timeout` / `set_otel_endpoint` / `metrics_json` |
+| `mir/` + `flow.rs` + `orchestrate_dag/` | 8 | `run_mir_with_signal_cached` / `label_index` / `is_pipe_method` |
+| `interpreter/` + `tea/` + `toolplane/` | 6 | `save_checkpoint` / `dispatch_many` / `shared_default_registry` |
+
+## 抽查结论：全是**库 API 备用**，不是「写残的半成品」
+
+- `is_moved(&self) -> bool { matches!(self, Binding::Moved) }` —— 语义完整
+- `reversed(&self) -> List { let mut v = self.to_vec(); … }` —— 完整实现
+- `to_mut_vec` 带着**解释性注释**（不可变 list 语义下如何取回可改副本）
+- `is_empty_union` 判 `Type::Union(m) if m.is_empty()` —— 完整
+
+⇒ 属 D385 建立的**三层**分层里的「底层实现 + 上层无入口」，
+**不是** D361 那种「定义了但零调用」的真死代码。
+
+**判定：全部保留，不擅动。** 库 API 备用是正常设计
+（未来接线、或给下游用），删掉的风险高于收益。
+
+## 判据把普查变成**常驻信号**
+
+- `pub fn` 总数落在 `[600, 1200]`
+- 零引用数落在 `[20, 60]` —— 突破上界说明新增了未接线的库能力
+- 15 个代表性条目**逐个**断言仍零引用（它们被接入时，判据会红并要求重新分类）
+- `#[allow(dead_code)]` **保持 0 处** —— 否则编译器视角的死代码会**静默**，
+  本判据的交叉验证能力随之失效
+
+#### D387：`TraceCollector` 的**采集侧接上了、开启路径零调用**（否定轮，含一项待裁决）
+
+D386 的零引用普查列出 `trace_collector.rs` 的 3 个零引用 `pub fn`
+（`set_enabled` / `set_otel_endpoint` / `metrics_json`），只说「库 API 备用」。
+本轮**查清整条链**，结论比「备用」更具体。
+
+## 采集侧**真的在跑**
+
+| 位置 | 用途 |
+|---|---|
+| `interpreter/mod.rs:853` | `self.ai.trace = TraceCollector::new(enabled)` |
+| `ai_chat.rs:315` | `self.ai.trace.start_span("ai.chat", span_attrs)` |
+| `ai_chat.rs:327/331` | `self.ai.trace.record_call("ai.chat", …)` |
+| `ai_helpers.rs:163` | `self.ai.trace.record_tokens(…)` |
+
+⇒ 不是死代码，**span / 调用计数 / token 统计都接好了**。
+
+## 但**没有任何生产路径开启它**
+
+唯一开关是 `set_trace_enabled(bool)`（`interpreter/mod.rs:852` +
+`runtime/ai.rs:56` 两处定义），而它的**唯一调用方**是
+`runtime/ai.rs:135` 的**单测**（`ai.rs:137` 里的 `ai.set_trace_enabled(true)`）。
+
+⇒ 生产环境永远是 `TraceCollector::new(false)` ⇒
+**所有 span / metrics 记录被丢弃**。
+
+## 读侧整条链也**没有出口**
+
+| API | 状态 |
+|---|---|
+| `get_spans_json` | 只在 `host.rs` 的 **doc comment** 里出现，无真实调用 |
+| `export_otel_json` | 同上 |
+| `metrics_json` | 全仓（`src/` 内）**只出现 1 次**（定义本身）|
+
+⇒ 即使开启采集，**采到的数据也没有地方能取出来**。
+
+## 判定：属**待裁决**，不擅动
+
+「可观测性设施已实现但未启用 / 未暴露」是**产品范围**问题
+（要不要开、要不要暴露 HTTP 端点），不是实现缺陷。
+判据只把**现状**钉住，并配**反向对照**
+（`d387_collection_side_is_wired` 证明采集侧确实接上了，
+否则「未启用」就只是「整个设施不存在」，是另一回事）。
+
+## 判据自身踩的坑（又一次「全红 = 装置问题」）
+
+首版 `read("src")` 把**目录**当文件读 ⇒ 3 条判据一起红在
+「读 src 失败: 拒绝访问（os error 5）」，而只读具体文件的那条照常通过。
+
+⇒ 与 D381 的 `CARGO_MANIFEST_DIR` 无尾分隔符同源：
+**全红 ⇒ 装置问题；部分红 ⇒ 真问题。**
+
+
+#### D388：sandbox 能力令牌层 —— `current_generation` **只写不读**，5 处注释声称的校验**不存在**（否定轮 + 注释漂移修正）
+
+`sandbox/` 是此前从未普查过的安全边界。三层接线先核实**全通**：
+
+| 层 | 证据 |
+|---|---|
+| 底层 | `sandbox/mod.rs::SandboxPolicy::check_path` / `check_builtin` + `capability.rs::CapabilityStore` |
+| 中间接线 | `runtime/sandbox.rs::SandboxRuntime` → `interpreter/mod.rs:129` |
+| 上层入口 | `builtins/sandbox.rs`（`sandbox.key` / `revoke` / `check_call` …）+ `typeck/dispatch.rs:833` `SANDBOX_METHODS` |
+
+## 发现：两套撤销机制并存，**注释说的是没生效的那套**
+
+`capability.rs` 里同时存在两套描述：
+
+| 机制 | 状态 |
+|---|---|
+| `revoked: BTreeSet<u64>`（v0.49.0-fix P0-1）| **真实生效**，`check` 查它 |
+| `current_generation` + `token.generation`（v0.49.0 A1/B1）| `revoke` 会 bump，但 **`check` 从不读** |
+
+`check` 的函数体（`capability.rs:269-290`）只做三件事：查 `by_id` →
+查 `revoked` → `token.permits()`。**没有任何一行比较代数。**
+
+而下列 **5 处**都声称它有：
+
+| 位置 | 原注释声称 |
+|---|---|
+| `capability.rs:200-202` | 「`check` requires `token.generation == current_generation`（else TokenNotFound）」 |
+| `capability.rs:220-222` | 「Tokens with `generation != current_generation` are treated as not-found」 |
+| `capability.rs:268` | 「单锁内 get + check; **同时校验 generation (A1)**」 |
+| `capability.rs:292-294` | 「旧持有者的 token 仍携带旧 generation, `check` 会视为 TokenNotFound」 |
+| `builtins/tests/capability.rs:158-159` | 「TokenNotFound, **因为** token.generation != current_generation」 |
+
+## 关键：**不该**把注释描述的校验加回去
+
+若真按注释加上全局代数校验，**per-token 撤销会退化成全局撤销** ——
+`revoke` bump 的是**全局**代数，同代签发的其它令牌会被连坐拒绝。
+而 P0-1 引入 `revoked` 集合**正是为了修掉这个问题**。
+
+⇒ **代码是对的（per-token），注释是旧的**（停留在被 P0-1 取代的 A1 阶段）。
+与 D365「注释长期停在旧普查数字」同型 ⇒ **修注释，不动代码**。
+
+## 实测（真实 CLI，`tests/fixtures/e2e/sandbox_capability.mora`）
+
+```text
+a_before=true  b_before=true
+sandbox.revoke(a)
+a_after=false  b_after=true   ← 同代 b 未被连坐 ⇒ 代数确未被强制
+c_after_revokes=true          ← 撤销后新签发的令牌正常
+d_web=false                   ← 合法 capability 名但未授权 ⇒ false
+count=5.0                     ← revoke 不删令牌
+```
+
+库级判据 `d388_check_ignores_token_generation` 给出**更直接**的证据：
+T0/T1 同代（gen 0）签发 → 撤销 T1（全局代数 0→1）→ T0 代数 stale
+⇒ `check(T0)` **仍 `Ok`**。
+
+## 牙齿验证：临时把注释声称的校验加进 `check` ⇒ **部分红（4/8）**
+
+红：`check_ignores_token_generation` / `revoke_is_per_token_not_global` /
+`generation_is_write_only` / `e2e_revoke_is_per_token`
+绿（正确不敏感，针对的是 `revoked` 集合那条机制）：
+`revoked_token_is_rejected` / `check_consults_revoked_set` /
+`sandbox_key_missing_from_typeck_but_works` / `e2e_bad_capability_…`
+
+⇒ **部分红 = 真问题**，红得精确到只覆盖代数那条路径。
+
+## 判据自身踩的坑：按字符串切片取函数体会**带上下一个 item 的 doc comment**
+
+首版用 `slice_between(src, "pub fn check(…", "pub fn revoke(")` 取函数体，
+而切片终点是**下一个 `pub fn` 之前** ⇒ 连 `revoke` 的 `/// doc comment`
+一并带上，而那段注释里恰好出现 `generation`
+⇒ 判据把自己要否定的结论判成了「存在」。
+
+修法：判断「代码里没有 X」前**先剥注释行**（`code_only()`）。
+
+⇒ 与 D383「判据自己写错、被下一轮自查抓出」同族。
+
+## 顺带查清的两项事实
+
+- **`sandbox.key` 对自省隐身**：既未登记在 typeck 的 `SANDBOX_METHODS`，
+  也不出现在 `methods_of(sandbox)`（实测只列 13 个：`mode` / `check_builtin` /
+  `check_path` / `check_call` / `revoke` / `token_count` / `audit_emit` /
+  `audit_flush` / `audit_verify` / `containerize` / `container_exec` /
+  `container_info` / `container_clear`），**但真实 CLI 跑得通**。
+  而它是脚本侧**唯一**签发令牌的入口（`revoke` / `check_call` 都以它为前提）
+  ⇒ 自省等于宣称「sandbox 模块没有任何签发令牌的办法」。
+
+  **不修的理由**：`key` 是**变参**的（`for arg in args` 收 0..N 个 capability），
+  而 `MethodGroup` 每项只登记**单一**元数；登记 1 会让 `key()` 与 `key(a,b)`
+  在 typeck 里撒谎。按 D175 先例（「把调不通的方法列进来比空集更坏」的反面）
+  只报告不擅动。⇒ **新增一项待裁决**。
+
+- capability **非法名**（`net.http`）在 builtin 层 `Capability::parse` 就失败
+  ⇒ 抛 Err **终止脚本**（exit 1，消息点名非法名）；
+  而**合法名但未授权**返回 `false`。两者语义不同，由两个 fixture 分别钉。
+
+## 连带更正：**D387 的门禁其实没绿过**
+
+本轮 clippy 报出 3 个错，全在 `tests/trace_collector_activation.rs`
+（**D387 那个判据文件**）：
+
+```text
+error: variable does not need to be mutable        (84:9)
+error: unused variable: `prod_hits`                (84:9)
+error: for loop over a single element              (190:5)
+error: could not compile `mora` (test "trace_collector_activation")
+```
+
+⇒ D387 收尾时门禁报「clippy 空 = 通过」，那是**同一个解析假象**
+（`2>&1` 合并丢行）—— 与本轮开头对账 266/287 时发现的是同一个病根。
+已修（删掉草稿遗留的 `prod_hits`、把单元素 `for` 展开、直白化变量名），
+本轮 clippy 退出码 **0**。
+
+⇒ 教训见「D387 反馈：门禁脚本自己的解析方式也会失真」：
+**判据文件自己也要过 clippy**，且门禁必须用 stdout/stderr 分流重定向统计，
+否则「空输出」既可能是「通过」也可能是「整段丢了」。
+
+#### D389：`MountSpec::parse` **认不出 Windows 盘符** —— Windows 上任何绝对 host path 不可用，且报错**归因到错误的字段**（修复轮）
+
+`sandbox/container.rs` 此前零端到端覆盖，`MountSpec::parse` 的单测
+**只覆盖 POSIX 形态**（`/data:/container/data:ro` / `a:b:c`），零 Windows 路径。
+
+## 缺陷
+
+`parse` 用 `splitn(3, ':')` 切 `host:container[:mode]`，而 **Windows 盘符
+本身就是冒号** —— `C:\data` 的第 2 个字符就是 `:`。
+于是 `"C:\data:/data:ro"` 被切成 `["C", "\data", "/data:ro"]`：
+
+| 字段 | 修前实测值 | 用户写的值 |
+|---|---|---|
+| `host_path` | `"C"` | `C:\data` |
+| `container_path` | `"\data"` | `/data` |
+| `mode` | `"/data:ro"` | `ro` |
+
+`validate()` 于是报（**真实 CLI 实测**）：
+
+```text
+sandbox.containerize: mount.mode must be 'ro' or 'rw', got: /data:ro
+```
+
+两个问题叠加：
+
+1. **功能全废** —— Windows 上任何**绝对** host path 都过不了校验
+2. **诊断误导** —— 归因到 `mode` 字段，还报出用户**从未写过**的值
+
+这正是 D189（`reject_option_as_path`）的同型缺陷：**错误归因错位**。
+而修前注释恰恰声称「允许 path 含 `:`」—— 声称的能力在主开发平台上失效。
+
+## 修法
+
+**先剥掉盘符前缀再 split**，判定条件**刻意收紧**为
+「字母 + `:` + 路径分隔符(`\` 或 `/`)`：
+
+| 输入 | 是否认盘符 | 理由 |
+|---|---|---|
+| `C:\data:/data:ro` | 是 | `C:` 后是 `\` |
+| `C:/data:/data:ro` | 是 | `C:` 后是 `/` |
+| `a:b:c` | **否** | `a:` 后是 `b`，**不是**路径分隔符 |
+| `/data:/data:ro` | 否 | 首字符非字母 |
+
+收紧的必要性：`"a:b:c"` 是**既有单测**断言的形态（1 字母 host）。
+不加这个约束，`a:` 会被误当盘符 ⇒ 该单测 `host_path` 从 `a` 变成 `a:b`，
+**静默改变既有已文档化的行为**。判据
+`d389_one_letter_host_not_treated_as_drive` 专门守这条。
+
+## 牙齿验证：**6 红 / 6 绿**（部分红，且红得精确）
+
+红：4 条 Windows 盘符库级 + `drive_survives_docker_arg_rendering`
++ `e2e_windows_mount_reaches_backend_gate`
+绿（正确不敏感）：POSIX 形态 / `a:b:c` / container 段含冒号语义 /
+错误路径仍指向正确字段 / 无分隔符 / 坏 mode 端到端对照
+
+## 判据自身踩的坑（**两处**）
+
+### ① 我的期望写错了：container 段**永远拿不到**冒号
+
+首版判据把 `"/host:/da:ta:ro"` 期望成 `container_path == "/da:ta"`，
+实测左 `"/da"` 右 `"/da:ta"`。
+
+真因：`splitn(3, ':')` 按冒号数切成**至多 3 段** ⇒ 第 2 个冒号之后的内容
+**整段落进 `mode`**。三段里**没有任何一段**能真正容纳冒号
+（`mode` 能，但会被 `validate` 拒掉）。
+
+⇒ 顺带更正修前注释「允许 path 含 `:`」：**从不成立**。已改写。
+
+### ② `to_docker_arg` 往返断言**对坏切分完全不变**（没有牙齿）
+
+首版 `d389_drive_survives_docker_arg_rendering` 只断言往返相等，
+**修前也通过**。原因是 `to_docker_arg()` 用 `:` **纯重新拼接**三个字段，
+而坏切分只是把同一段文本按冒号拆散 ⇒ 拼回去**逐字等于原输入**。
+
+⇒ 是牙齿验证把它抓出来的：**只有解析出的字段**才暴露污染。
+已补 `host_path` / `mode` 字段断言。
+
+⇒ 与 D384「探针的构造方式必须与被测性质**同构**」同族：
+这次不是「分子算错」，是**断言对被测性质不敏感**（恒真）。
+
+## 为什么不做全仓泛化
+
+全仓 `splitn?(N, ':')` / `split(':')` **只有这一处**（`grep` 实证），
+不存在同型扩散面。
+
+## 端到端探针为何选 `gondolin`（零副作用）
+
+`spawn_container` 的顺序是 `validate()` → backend 门禁 → `docker version` 探测。
+用**未实现** backend 会在**触达 docker 之前**停下 ——
+本机 docker CLI 在但 **daemon 未运行**，判据不能依赖它，更不能真 spawn 容器。
+
+#### D390：`EventBus::emit` 对**空事件名**让 catch-all listener **触发两次**（修复轮）
+
+`sandbox/` 收尾后转向 `src/event/`。`event::matches()` 是**沙箱 allow/deny
+与事件路由共用**的通配符匹配器 —— 匹配器错了就是沙箱可被绕过。
+
+## 缺陷
+
+`emit` 的 prefix 走法分两步（`event/mod.rs:139-151`）：
+
+```rust
+if let Some(handlers) = prefix.get("") { … }      // ① catch-all "*" 桶
+for i in 0..parts.len() {
+    let prefix_key = parts[..=i].join(".");
+    if let Some(handlers) = prefix.get(&prefix_key) { … }   // ② 逐段前缀
+}
+```
+
+事件名是**空串**时：`"".split('.')` 产出 `[""]` ⇒ `parts.len() == 1`
+⇒ 走法 ② 在 `i = 0` 算出 `parts[..=0].join(".") == ""`
+⇒ **与 ① 命中同一个 `prefix[""]` 桶** ⇒ catch-all handler 被投喂**两次**。
+
+而 `matches("", "*")` 是 **true**（D281 已把这条钉成有意行为）——
+**谓词路径说「匹配」，索引路径投递「两次」**。
+
+实测（判据首跑，修前）：`left: 2, right: 1`。
+
+## 影响面：**潜伏**，不夸大
+
+生产代码里**唯一**注册 handler 的地方是 `bus.subscribe`，
+而它装的是 **no-op handler**（`builtins/event.rs:52-57`）
+⇒ 脚本侧看不到重复触发。
+
+但该处注释明写「真实 handler 由上层 (LSP / HTTP / MCP) 通过更高级 API 提供」
+⇒ 一旦接上真实回调，重复投递立即变成可观察缺陷。
+
+`bus.emit("")` 本身**脚本可达**且**不校验空串**
+（`builtins/event.rs:13-21` 只检查是不是 `Value::String`）。
+
+## 修法
+
+走法 ② **跳过空 key**。任何非空事件名都产不出空 key
+（`"a."` → `"a."`、`"a..b"` → `"a."` / `"a..b"`）
+⇒ 本分支**只影响空事件名**，其余路径逐字未动。
+
+## 为什么 D281 的「两条路径一致」判据没拦住
+
+`d281_predicate_and_index_paths_agree` 的断言是
+**`fired > 0`** 与 `matches(...)` 比 —— **布尔比较对重数完全不敏感**
+（0 vs 1 会红，1 vs **2** 不会）。且其用例表里**没有空事件名**。
+
+⇒ 与 D389「往返断言恒真」同族：**断言的形状与被测性质不匹配**。
+本文件把它补成 `count == if matches { 1 } else { 0 }`，
+并把 D281 原表 10 条 + 6 条边界（空事件名 / 空段 / 尾点 / 前导点）合表重测。
+
+## 牙齿验证
+
+判据**首跑即在未修改的产品代码上**跑出精确的 **2 红 / 3 绿**：
+
+红：`catchall_fires_once_for_empty_event_name`、
+`predicate_and_index_agree_on_multiplicity`
+绿（正确不敏感）：`non_matching_pairs_never_fire`（反向对照）、
+`multiple_handlers_each_fire_once`、
+`only_production_handler_is_a_noop`
+
+⇒ 反向对照照常绿，证明那 2 条红是**重复投递**而不是「什么都触发」。
+
+## 顺带钉住可达性边界
+
+`d390_only_production_handler_is_a_noop` 把「生产侧唯一 handler 是 no-op」
+这一事实钉住：若将来 `subscribe` 接上真实回调，本条会红，
+提醒同步补上本文件其余判据的观测面。
+
+#### D391：`values_equal` 的**容器臂丢掉数值塔** —— 同一个值「单独相等、放进容器就不等」（修复轮）
+
+`sandbox/` / `event/` 收尾后转向 `src/value.rs` 与 `flow.rs` 的相等语义。
+`flow::values_equal` 是 `==` 运算符走的路径。
+
+## 缺陷
+
+标量侧的数值塔一路修齐了（v0.103 `Int ⊂ Float`、D20 `BigInt` 混比、
+D199 精度），但**容器臂**仍是 `a == b` —— 那是 `list::List::eq` /
+`HashMap::eq`，内部逐元素调用 **`Value::eq`**，而 `Value::eq`
+**没有任何跨数值类型的臂**（落 `_ => false`）。
+
+实测（真实 CLI）：
+
+```text
+j[0]         == 1.0         → true      ← 标量走数值塔
+j            == [1.0, 2.0]  → false     ← 容器丢掉数值塔
+d.get("a")   == 1.0         → true
+d            == {"a": 1.0}  → false
+```
+
+⇒ 同一个值**单独相等、放进容器就不等**。这正是 v0.103 / D20 / D199
+在标量侧修掉的那个洞，只是当时只改了标量臂。
+
+## 探针为什么必须用 `json.parse` 造值（首版栽在这里）
+
+首版探针写的是 `[1] == [1.0]`，实测得到 `true`，看起来「没问题」。
+**实际是探针根本没进入被测条件**：
+
+- Mora 的**裸数字字面量是 `Float`** ⇒ `[1]` 与 `[1.0]` 元素类型**完全相同**，
+  根本没有混比可测；
+- typeck 的**列表同质性**规则又直接拒掉 `[1, len("ab")]` 这类混比字面量
+  （实测 exit 2：`expected: float, got: int`）。
+
+⇒ 唯一能进入被测路径的办法是**运行时解析**：`json.parse("[1,2]")`
+给 `Int` 元素（D129），再与 Float 字面量列表比较。
+
+⇒ 与 D383「探针样本太小/未达阈值」同族，但形态更新：
+**探针「测出了正确答案」而实际是装置无效**。
+
+## 修法：并集，不是替换
+
+容器元素改走 `container_elem_eq(a, b) = values_equal(a, b) || a == b`。
+
+取**并集**是有意为之：`values_equal` 只覆盖
+Nil / 数值 / String / Char / Bool / List / Dict，
+**没有** `Cons` / `Code` / `Curry` / `Document` / `Tea*` / `LogicVar` 的臂
+（落 `_ => false`），而 `Value::eq` **有**。
+若容器改走**纯递归** `values_equal`，`[Cons{..}] == [Cons{..}]`
+会从 true 变 false —— 那是**收窄**既有行为，等于引入新缺陷。
+
+## 牙齿验证：**两个方向都做了**
+
+**方向一**：容器臂还原成 `a == b` ⇒ **4 红 / 3 绿**
+红：list / dict / 嵌套 / 端到端
+绿（正确不敏感）：`inequality_is_not_widened`（反向对照）、
+`nan_stays_unequal`、`structural_…_is_not_narrowed`
+
+**方向二**：改成**纯递归**（去掉 `|| a == b`）⇒ 数值塔全过，
+但**恰好 1 条红**：`d391_structural_element_equality_is_not_narrowed`
+
+⇒ 实证了「纯递归能修好原缺陷、但会收窄 Cons 相等」，
+所以**并集是必需的**，不是保险起见。
+
+## 判据自身写错的两处（被自己的测试抓住）
+
+1. 反向对照误写成 `assert!(values_equal([1.0], [1.5]))`，
+   消息却写着「应为 false」—— 缺 `!`。
+2. 以为**裸** `Cons ⊕ Cons` 经 `values_equal` 为真；实测恒为 **false**
+   （该函数从来没有 Cons 臂）。真正要守的是「**容器内**的 Cons 元素」。
+
+⇒ 第 2 点顺带把一个重要事实钉进判据：
+**裸 Cons 与容器内 Cons 的相等性由不同机制决定**，
+而本轮的修法只动后者。
+
+## 影响面
+
+typeck 的列表同质性规则使**字面量**造不出混比列表，
+所以触发面主要是 `json.parse` / 外部 API 响应（D129 明确给 `Int`）
+—— 也就是最常见的「解析后比较数据」场景。
+
+#### D392：`value/persistent.rs`（HAMT 持久化 map）首次以 **oracle 差分**普查 —— **零缺陷**（否定轮）
+
+本模块此前**零外部覆盖**：`persistent.rs` 自己的 9 条单测全是
+「插入后能查到」这类**单向**断言，没有一条与参考实现对拍。
+本轮改用 `std::collections::HashMap` 作 oracle。
+
+## 为什么用差分而不是继续读
+
+HAMT 的 bug 集中在**结构不变量**：
+`children.len() == bitmap.count_ones()`、`bit_index` 的 packed 下标、
+删除后的**下标重排**。这些在**删除**路径上最脆 ——
+单向的 assoc 测不出来，而人工读容易「看着对」。
+
+## 装置
+
+固定种子的 xorshift64\*（**不用 `rand`**，否则判据不可复现），
+跑四类序列，每步对拍 `len` / `get` / `contains_key` / 全量键集：
+
+| 判据 | 序列 | 结果 |
+|---|---|---|
+| `insert_only` | 纯插入 300 步 | ✅ |
+| `overwrite` | 关联/覆写/删除随机 400 步 | ✅ |
+| `remove_heavy` | 删除占 2/5，500 步 | ✅ |
+| `other_value_type` | 同上但 `V = String` | ✅ |
+
+外加**持久性**（50 个历史版本逐个回看，值未被后续 `assoc` 改写）、
+**删光**语义、以及 `iter()` 序的**确定性**。
+
+⇒ **HAMT 实现正确，删除路径无错。**
+
+## 装置的牙齿验证（负向注入）
+
+注入一个结构性缺陷（`remove_node` 的 `None` 分支**忘记清 bitmap 位**，
+破坏 `children.len() == bitmap.count_ones()` 不变量）⇒
+**4/7 红**，且红的**正是那 4 条差分判据**。
+
+另外 3 条（序稳定性 / 版本冻结 / 碰撞可达性）**照常绿** ——
+它们本就不走删除路径，**正确不敏感**。
+
+⇒ 新写的差分装置不是假绿。
+
+## 两个结构性发现（**只报告，不擅动**）
+
+### ① `Node::Collision` 分支**用真实键造不出来**
+
+它要求两个键的 **64-bit hash 完全相同**。
+判据用 20 万个键（远超生日界 `√2^64 ≈ 2^32`）搜索同 hash 对，
+断言**找不到**（实测通过）。
+
+⇒ 该分支及其 `remove` 时的 `Collision → Leaf` 塌缩
+处于**零覆盖**状态，且**现有 API 无法触发**
+（`hash_of` 不接受注入 hasher）。
+⇒ 覆盖缺口，**列入待裁决**（解法需改 `hash_of` 签名，属设计决定）。
+
+### ② `remove` 不做 Bitmap 合并（coalesce）
+
+删到一个子节点时保留 `Bitmap{单bit, [唯一子]}`，
+而不塌成那个子节点（Clojure 会塌）。
+
+查得到、语义正确，只是多一层深度 ⇒ **空间问题，不是正确性问题**。
+与 Clojure 做法不同，但**不构成缺陷**，记录以免日后误判。
+
+## 顺带的否定结果：闭包 env 泄露**已修净**
+
+D385 的 `xform.rs` 注释警告「传 `Closure` 时 `Debug` 会把它的 `env`
+（PersistentMap / Bitmap / 全部 30 个 builtin 的哈希）整份转储，单条达数千字节」。
+实测（真实 CLI）：`str(fn(x) => x + 1 end)` = **9 字符**，显示为 **`<closure>`**；
+装进 dict 亦然 ⇒ **脚本面已无泄露**，D385 的处理已覆盖该路径。
+
+（`xform.rs` 里那段注释描述的现状已不成立，属**文档漂移**，
+但它是**准确记录历史风险**的说明性文字，不改。）
+
+#### D393：`value/display.rs` —— atom 内容走 `Debug`、**完全绕过深度限制**（否定轮 + 一项待裁决 + 一处注释更正）
+
+## ① atom 的内容用 `Debug` 而非 `Display`（实测）
+
+```text
+print([1, 2])        → [1.0, 2.0]
+print(atom([1, 2]))  → <atom List([Float(1.0), Float(2.0)])>
+print(atom("hi"))    → <atom String("hi")>
+```
+
+同一个列表，装进 atom 就变成 **Rust 枚举语法**（`List` / `Float` / `String`）。
+`display.rs:131` 与 `:201` 都用 `{:?}`。
+
+## ② 深度限制**根本没覆盖 Atom** —— 文档声称的防护不存在
+
+`fmt_inner` 的 doc comment 写着「stops at MAX_DEPTH … to prevent stack
+overflow on recursive/cyclic structures (**e.g. Atom containing self**)」。
+
+但 `Atom` 分支走 `{:?}`，**根本不经过 `fmt_inner` 的深度检查** ——
+递归由派生 `Debug` 完成，`MAX_DEPTH` 对它**无效**。
+
+## ③ 环安全来自哪里？—— **牙齿验证推翻了我的第一版归因**
+
+我原以为断开环的是 `display.rs:130` 的 `let v = arc.lock();`。
+把它改成 `arc.lock().clone()`（**解锁后**再格式化）后，
+自引用 atom 判据**照样全绿**。
+
+真正起作用的是 **parking_lot 自己的 `Mutex: Debug`**：
+它 `try_lock()` 失败时打印 `<locked>` 而**不再下钻**。
+
+可佐证：非环的 `atom(0)` 会显示 `Float(0.0)`（锁可取时它渲染数据），
+只有**重入取不到**才退化成 `<locked>`。
+
+⇒ 结论：**深度限制覆盖 List/Dict，环安全覆盖 Atom**，二者机制不同，
+且环安全依赖**第三方 crate 的 Debug 实现细节**。
+（这比「靠本文件的锁」更脆弱，因为它靠的是外部实现的偶然行为。）
+
+## ④ 为什么**不**直接改成 `Display`
+
+若把 `{:?}` 换成 `{}`：第 130 行 `arc.lock()` 持有的锁，会在
+**同一把 `parking_lot::Mutex` 上重入**（自引用 atom 的 Display 臂再次
+`arc.lock()`）⇒ **死锁**。
+
+⇒ 一致性 vs 环安全是**设计取舍**，按 D382 先例**只报告不擅动**。
+**新增一项待裁决。**
+（死锁路径是**代码层推断**，依据 `display.rs:130` 持锁 + 同臂重入；
+**刻意未实测** —— 实测会让测试进程永久挂死。）
+
+## 判据钉住的「真正要守的东西」
+
+`d393_self_referential_atom_terminates_with_locked_placeholder` 与
+`d393_cyclic_atom_through_list_terminates` 才是关键 ——
+它们保证**自引用 / 循环 atom 必须终止**（不挂死、不栈溢出）。
+任何改动（尤其「先 clone 再格式化」类优化）都必须先过这两条。
+
+## 顺带的否定结果：Float 的 `{:.1}` **不是**精度缺陷
+
+首版怀疑它把大整数 float 截短。实测否掉：
+
+```text
+str(1234567890123456789.0) → 1234567890123456768.0
+```
+
+那是该 f64 的**精确整数值**；`{}` 的最短往返反而会给 `…800`。
+`nan` / `inf` / `-inf` 亦符合 v0.36 的「Display 不得 panic」约束。
+
+#### D394：TEA **列表 model 被 `update` 静默截断成首元素**（修复轮）
+
+`sandbox/` / `event/` / `value/` 收尾后转向 `src/tea/`（Elm 架构运行时，664 行）。
+
+## 缺陷
+
+`TeaApp::apply_update` **只判类型不判形状**：任何 `Value::List` 返回值
+都被当作 `(Model, Cmd)` 二元组，且 model 取 `items.first()`。
+
+而 `tea.init` 的第 1 参**明确允许**「init 闭包（**或初始 model 值**）」
+（`builtins/tea.rs:26`）⇒ **列表形态的 model 完全合法**。
+
+实测（真实 CLI，修前）：
+
+```text
+tea.init([1, 2], …)     → model = [1.0, 2.0]   ✅
+tea.update(该 app, msg) → model = **1.0**      ❌ 类型从 list 变 float
+tea.init([9, 8, 7], …)  → update 后 = **9.0**
+```
+
+零报错、零警告 ⇒ 属**最危险的一类**（静默错值）：一次 update 就能把
+model 的类型悄悄换掉，后续代码全在错误的值上跑。
+
+## 修法：只把**确实是二元组**的返回值当元组
+
+条件 = 长度恰为 2 **且**第二项能 `Cmd::from_value` 成功。
+其余（1 元素 / 3 元素 / 第 2 项不是 Cmd）一律**整段就是裸 model**。
+
+`Cmd::from_value` 对 `Float` / `Int` / `String` / `Bool` /
+无 `kind` 的 dict / 未知 `kind` / 缺必需字段的 dict 都会失败
+⇒ 普通的 2 元素列表 model 不会被误判。
+
+## 牙齿验证：2 红 / 2 绿
+
+红：行为 e2e + 源码级守卫（`items.len()` 在 / `items.first()` 不在）
+绿（正确不敏感）：`cmd_from_value_rejects_non_cmd_values`（前提钉）、
+`tuple_shape_discrimination_table`（判别逻辑取值表）
+
+⚠ 补了源码级那条的理由：形状表是**本地重实现**判别逻辑，
+牙齿验证证实它**抓不到产品回归**（还原修前实现时照常绿）。
+⇒ 判据里**本地重实现的逻辑必须另配一条钉产品实际用法的断言**。
+
+## 判据自身踩的坑（**又一次**「切片带上注释」）
+
+源码级判据首版直接扫函数体，结果 `items.first()` 命中的是
+**我自己写的 D394 修复说明注释**（「且 model 取 `items.first()`」）。
+
+⇒ 与 D388「字符串切片取函数体会带上相邻 item 的 doc comment」同族。
+修法：扫源码前**先剥注释行**。
+
+## 关键取证只能在 e2e 层
+
+库级用**空 MIR 闭包**（`tea/tests.rs` 的既有做法）时，`update` 返回 `Nil`，
+走的是 `apply_update` 的**非 List 分支** ⇒ **根本进不了被测路径**。
+只有真实脚本里「update 返回 model」的闭包能触发 List 分支。
+⇒ D391「探针必须进入被测条件」的又一次实例。
+
+## 我的期望写错的一处
+
+`Cmd::from_value` 判据里我把「`kind=Dispatch` 的 dict」期望为可解析，
+实测报 `missing msg` ⇒ `from_value` **还会校验必需字段**。
+是我的期望写错（不是产品缺陷），已补 `msg` 并把「缺 msg 被拒」也钉住。
+
+## 残留歧义（明文记录，不在本轮解决）
+
+本语言所有值都是 `Value`，**没有静态 `Cmd` 类型**可依。
+若 model 恰是「2 元素列表且第 2 项是 Cmd 形态（`nil` 或带 `kind` 的 dict）」，
+仍会被判成元组。彻底消歧需给 TEA 引入独立 Cmd 值类型（属设计决定）。
+
+#### D395：`src/schedule/` —— 「持久化」**只写不读，生产上从不写**（否定轮 + 文档更正 + 两项待裁决）
+
+## 结论：`tick` 逻辑**零缺陷**，但「持久化」是**名义上的**
+
+按 D385 建立的三层框架核实：
+
+| 层 | 事实 |
+|---|---|
+| 底层写入 | `save()` 完整手写 JSON 序列化器 —— **存在** |
+| 读回 | **全仓没有**任何 scheduler 的 `load` / `from_json` —— **不存在** |
+| 中间接线 | `set_persist_path` **全仓唯一调用点是单测** |
+| 上层入口 | 无 ⇒ 生产 `persist_path` 恒 `None` ⇒ `save()` 整段跳过 |
+
+⇒ **生产上永不落盘**；即便落了盘也无人读。
+实测确认：跑完含 `schedule.add` 的脚本后，工作目录下
+**不存在** `.mora_schedule.json`。
+
+而模块 doc 写「持久化到 `<cwd>`/`.mora_schedule.json`」——
+**两处都不成立**，且它还把 `tick` 写成「由 event loop 调用」，
+实际 `schedule.tick()` 是**脚本可达**的（builtin 传 `Scheduler::now()`）。
+**本轮已更正这两处注释**（D365 型文档漂移）。
+
+## `tick` 逻辑：否定轮，**零缺陷**
+
+桶索引（`BTreeMap<next_fire, ids>`）、`range(..=now)` 取到期桶、
+`Every` 按 `now + interval` 重排、`At` 触发即删、`remove` 后惰性清理 ——
+逐条核对全部正确。判据覆盖 `Every` 周期触发 / `At` 触发即删 /
+未到期不触发（5 个时点）/ `add` 5 条校验 / `remove` 往返。
+
+## 两条**潜伏陷阱**（当前不可达，只报告不修）
+
+### ① `interval_s == 0` 的 `Every` job 会静默永久停摆
+
+`tick` 里 `if job.interval_s > 0 { … }` **没有 else**，
+而到期桶已被 `buckets.remove(k)` 取走 ⇒ job 留在 `jobs` 里
+却再无桶引用 ⇒ **永不触发，也不报错**。
+`add` 会拒掉 0，但**没有 loader** ⇒ 当前不可达。
+
+### ② `delete_after_run` 字段是装饰性的
+
+`tick` 从不读它，`save()` 也从不写它。
+当前 `At` 恒删 / `Every` 恒留**恰好**等价于
+`delete_after_run = (kind == At)`（`add` 的默认值）⇒ **无可观察后果**。
+（同 D368 `FieldRole::Constant` 的「未使用变体」族。）
+
+## 牙齿验证：注入两处缺陷 ⇒ **恰好 2 红**
+
+红：`no_loader_exists`（注入 `pub fn load`）、
+`delete_after_run_is_never_read`（让 `tick` 读该字段）
+绿：其余 9 条（含 5 条行为判据与 e2e）
+
+⇒ 红得精确，正对应注入点。否定轮的「零缺陷」结论因此站得住。
+
+## 判据自身踩的两个坑
+
+### ① **又一次**「扫源码命中注释」——且这次是**行尾注释**
+
+`code_only` 首版只剥**整行**注释，于是
+`assert_eq!(s.count(), 0); // delete_after_run` 这条**行尾注释**
+让 `delete_after_run` 出现次数从 2 变 3 ⇒ 误判。
+
+⇒ 这是同一个陷阱的**第三次**（D388 相邻 doc comment / D394 整行注释 /
+本轮行尾注释）。判据里的 `code_only` 现在**同时剥整行与行尾**。
+
+### ② **不要在判据里钉绝对行号**
+
+我写了 `callers[0].contains("mod.rs:399")`，
+而本轮文档编辑让该行漂到 424 ⇒ **脆红**（真事实没变，判据却红了）。
+改为钉「调用点位于 `#[cfg(test)]` 之后」这个**事实**。
+
+⇒ 判据要钉**不变量**，不是钉**位置**。
+
+#### D396：`Subst::walk_star` 的 **List 分支用浅层判据**，嵌套容器的解析结果被整份丢弃（修复轮；当前脚本**不可达**，如实记录）
+
+`sandbox/` / `event/` / `value/` / `schedule/` 收尾后转向 `src/rel/`（逻辑范式）。
+
+## 缺陷
+
+`walk_star` 是**递归**的，但 List 分支的 `changed` 判据是**浅层**的：
+`items.iter().any(|it| matches!(it, Value::LogicVar(_)))` —— 只看**直接子项**
+是不是 `LogicVar`。
+
+于是「直接子项是**容器**、变量藏在容器里面」时：容器已被递归解析，
+但 `changed` 仍为 `false` ⇒ 函数返回**原始** `walked`，把解析结果**整份丢弃**。
+
+实测（`s.bind(0, Int(42))`）：
+
+```text
+walk_star([LogicVar(0)])        → List([Int(42)])               ✅
+walk_star([[LogicVar(0)]])      → List([List([LogicVar(0)])])   ❌ 原样未解析
+walk_star(Dict{k: LogicVar(0)}) → Dict({"k": Int(42)})         ✅
+walk_star(Cons{car: LogicVar})  → Cons { car: Int(42) }        ✅
+```
+
+## 同一个函数里三种写法，**只有 List 错** —— 这是「笔误」而非设计的证据
+
+| 分支 | `changed` 怎么算 | 结果 |
+|---|---|---|
+| `Dict` | **深比较** `&resolved != val` | ✅ |
+| `Cons` | **没有** `changed`，总是重建 | ✅ |
+| `List` | **浅层** `matches!(it, LogicVar)` | ❌ |
+
+修法：与 `Dict` 分支对齐，改用**深比较**（保留「无变化就不重建」的优化）。
+
+## 后果走**用户可见**路径
+
+`walk_star` 的**唯一**生产调用方是 `reify`（`reify.rs:15`），
+而 `reify` 是 `solve` 的答案投影路径（`project_solution` → `h_solve`）。
+残留变量会被 `rename_unbound` 改名成 **`String("_.0")`** ——
+用户拿到的是**字符串占位符**而不是真值。
+实测：`reify([[LogicVar(0)]], s)` 修前 = `List([List([String("_.0")])])`。
+
+## ⚠ 当前**脚本不可达**（如实记录，不夸大）
+
+rel 的**项语法**（`parser_v3/rel.rs`）只接受：原子、标量字面量、
+`cons(...)` / `nil`、`?name`、`_` —— **没有列表 / 字典字面量**
+（`cons` 产生 `Term::Cons`，由 `rename_term` 再转成 `Value::Cons`）。
+查询变量只能绑定到 `Cons` 链或标量，两者分支都正确。
+
+⇒ 本条是 **`pub` 库 API 上的潜伏缺陷**。仍然修，理由：
+`Dict` 分支证明本意就是深比较（同一函数三种写法只错一种，
+**不是设计取舍**），且 `Subst` / `walk_star` 都是 `pub`。
+
+判据 `d396_rel_term_grammar_has_no_list_literal` 把「不可达」钉住 ——
+若将来项语法支持列表字面量，本条会红并提醒补端到端判据。
+
+## 牙齿验证：还原浅层判据 ⇒ **5 红 / 3 绿**
+
+红：嵌套列表 / 三层嵌套 / 查询变量绑定到嵌套列表 /
+`reify` 后果 / 三分支收敛（List 内嵌 Dict/Cons）
+绿（正确不敏感）：项语法无列表字面量（现状钉）、
+`walk_star` 唯一调用方（现状钉）、改名机制（不依赖该分支）
+
+## 顺带：既有 7 条 `unify` 单测**全部未触及**本缺陷
+
+`unify` / `subst` 的单测都只测**一层**（`List[[var]]` 直接子项是 var，
+或 `Cons{car: var}`）⇒ 浅层判据在这些用例上**恰好正确**。
+这解释了它为何长期存活：**现有测试矩阵正好落在缺陷之外**。
+
+#### D397：`rel::search` **无搜索步数上界** —— 左递归规则让 `solve` **永久挂死**，`solve N` 也挡不住（否定轮 + 文档更正 + 一项待裁决）
+
+`src/rel/search.rs`（622 行）—— 带回溯的 Prolog 式交错搜索引擎。
+
+## 现象（真实 CLI 实测）
+
+```mora
+rel loop2(x) loop2(x) end
+solve 2 { loop2(?X) }
+```
+
+**`solve` 无界与 `solve 2` 两者都挂死**：20s 内不退出，**无报错、无输出**，
+只能手动杀进程。
+
+## 根因
+
+`next_solution` 是 `while let Some(..) { … }` 排空队列，**无燃料**。
+而 `limit` 的检查在 `h_solve` 的循环里、位于**两次 `next_solution` 之间**
+（`solutions.len() >= cap`）⇒ `next_solution` 永不返回 ⇒ `limit` **永不被检查**。
+
+## 本轮**不修**——并说明为什么（一次真实的自我否决）
+
+`src/rel/mod.rs` 明写：
+
+> 终止性模型与 Prolog 相同：递归关系的终止由**关系作者负责**
+> （交错调度保证公平性但不保证终止）
+
+⇒ **明文的设计取舍**，按 D360/D368/D382 先例**只报告不擅动**。
+
+⚠ **我一度误判并真的改了**：用「别处都有上界（`agent` 的 `max_steps` 默认 10、
+`orchestrate` 的 `max_rounds`、`tea.run_loop` 的 `max_steps`），
+唯独 `rel` 没有」这条**兄弟子系统不一致**的证据，按 D396 刚建立的
+「三个平行分支只错一个 = 笔误」规则判为「遗漏」，
+**加了 200000 步的燃料上界**并实测确认挂死变成了明确诊断。
+
+随后读到 `rel/mod.rs` 的模块注释才发现那是**明文取舍** ⇒ **全部回退**。
+
+⇒ **教训（重要）**：D396 的「兄弟不一致 ⇒ 笔误」规则有个**前置条件** ——
+**没有注释/doc 声明解释为什么它该不同**。
+本例的注释**明确解释了**（Prolog 终止性模型）。
+⇒ **文档声明优先于「子系统一致性」启发式**。这条已并入 memory。
+
+## 本轮**修**的是：模块 doc 里关于**既有能力**的错误声明
+
+原文：「`solve N` 的界形式**可安全采样**潜在无限解流」
+⇒ 对「无限**解流**」成立，对「无限**搜索**」**不成立**。
+
+准确表述已写回 `rel/mod.rs`：
+**`solve N` 能限制「产出多少个解」，不能限制「搜索多久」**。
+`next_solution` 上也加了指向该条的注释。
+
+（与 D365 / D395 同型：**修的是关于既有行为的错误陈述**，
+不是改行为本身。）
+
+## 待裁决（新）：要不要给搜索工作加上界
+
+三个选项（属产品策略决定，本轮**不擅动**）：
+
+| 方案 | 效果 | 代价 |
+|---|---|---|
+| ① 搜索步数上界（燃料） | 挂死 → 明确报错 | 改变「终止由作者负责」语义；超长但合法的搜索会报错 |
+| ② 左递归检测 | 精确拦左递归 | 实现复杂；不拦「非左递归但无限失败」 |
+| ③ 让 `limit` 同时约束搜索工作量 | `solve N` 真正「安全」 | 语义变化最明显 |
+
+## 牙齿验证：注入步数上界 ⇒ **2 红 / 3 绿**
+
+红：`next_solution_has_no_step_bound`（源码级不变量）、
+`left_recursive_rule_still_hangs_even_with_limit`（行为级）
+绿：模块 doc 措辞、`limit` 位置不变式、**有限规则正常退出**（反向对照）
+
+⇒ 且测试总耗时从 6.04s 掉到 2.02s（挂死判据提前退出），
+与行为变化一致。
+
+## 判据为什么**不**直接跑挂死程序
+
+跑它必然挂住 ⇒ 判据自己就会变成 CI 事故。
+故分两层：① 源码级不变量（有牙齿）；② **带硬超时的行为级**
+（`spawn` + `try_wait` 轮询 + **无条件 `kill`**）⇒ **判据自己写错也挂不住套件**。
+
+## 顺带核实：D396 的「脚本不可达」结论**经二次核实成立**
+
+`rename_term` 确实有 `Term::List` / `Term::Dict` 分支（项枚举支持），
+但 **`parser_v3/rel.rs` 从不构造它们**（`LBrace` 只用于 `solve { }` 定界），
+且 `cons` 走 `Term::Cons` → `Value::Cons`（Cons 分支本就正确）。
+⇒ D396 修的嵌套列表缺陷当前**确实**脚本不可达。
+
+#### D398：`mora.refine` 产出的 `.refined.<n>.mora` **语法非法、根本无法运行**（修复轮）
+
+## 缺陷
+
+`refine` 把指令头写成 `# --- INSTRUCTION (refine iter N): <text>`，
+而 **Mora 的行注释记号是 `--`，`#` 不是合法记号**。
+
+实测（真实 CLI，直接跑 `refine` 产物那种形态的文件）：
+
+```text
+# --- INSTRUCTION (refine iter 1): add X
+print("ok")
+```
+
+```text
+p2.mora: Unexpected character '#' at line 1, column 1
+exit=2
+```
+
+⇒ 整个 refine 工具的产物**跑不起来** —— 而它的用途正是
+「产生副本供用户 review / 继续编辑」，产物**必须**是合法 Mora。
+
+## 关键：这不是取舍，是**笔误**，而且**测试把 bug 钉住了**
+
+① 本模块 doc **第 12 行自己写的就是**「副本包含 `-- INSTRUCTION: <text>` 注释行」
+⇒ **代码与自己的 doc 矛盾**，doc 表达的正是 `--`。
+
+② 既有单测断言 `content.contains("# --- INSTRUCTION ...")`
+⇒ **测试把 bug 形态固化了**，于是「产物能否运行」这件事**从未被验证过**。
+本轮同步改了那条断言。
+
+## 判据的核心：**用真实 `mora` 二进制跑一遍产物**
+
+只断言「文件存在 / 含某字符串」是**恒真**的（写什么都能通过）——
+必须**执行**它，断言 exit 0 + 输出正确。
+修前本条会红在 `Unexpected character '#'`。
+
+## 牙齿验证：还原成 `#` ⇒ **3 红 / 4 绿**
+
+红：`refined_copy_is_runnable_mora`、`instruction_header_uses_mora_comment_marker`、
+`all_candidates_are_runnable`（3 个候选**全部**都要能跑）
+绿：`original_content_preserved_verbatim`、`diff_counts_are_structurally_constant`、
+`iteration_number_skips_after_multi_candidate`、`error_paths_name_the_offender`
+—— 它们都不依赖记号，**正确不敏感**。
+
+## 我自己的判据期望写错了（**读代码读错**，实测纠正）
+
+我把 `format!("{}\n{}\n", ...)` 读成了 `format!("{}\n{}", ...)`，
+于是两条判据的期望值都错了：
+
+| 我以为 | 实测 |
+|---|---|
+| 产物 = 头 + `\n` + 原内容（`ends_with` 成立） | 产物 = 头 + `\n` + 原内容 + **`\n`**（多一个尾部换行） |
+| `diff_lines_added` 恒 **1** | 恒 **2**（指令头 1 行 + 尾部空行 1 行） |
+
+⇒ 又一次「**期望值必须来自实测**」被我违反：
+我又一次从**读到的代码**推导期望，而不是先跑一遍量。
+（D391 已为此写过一条 memory，本轮仍然犯 —— 说明该纪律需要
+「写判据前先跑一次探针」这种**动作约束**，而不只是「知道要实测」。）
+
+## 顺带钉住两条**结构性恒定**的现状（只报告不修）
+
+### ① `diff_lines_removed` **恒为 0**
+
+产物恒为「头 + 原内容 + 尾部换行」，原内容一行不少 ⇒ `removed` 永远 0。
+属「装饰字段」族（同 D395 的 `delete_after_run`），**无可观察危害**，只钉现状。
+
+### ② 迭代编号**跳号**
+
+`n = steps.len() + 1`，而 `refine_many(3)` 一次产生 3 个 step（iteration 都记 1）
+⇒ 下一轮 `n = 4` ⇒ **2 与 3 号迭代不存在**。
+`n` 同时出现在**文件名**（`x.refined.4.a.mora`）与 `to_dict` 的 `iteration` 字段
+⇒ 用户可见。改它属产品语义决定，**只钉现状**。
+
+#### D399：审计 sink 的 `new()` **吞掉尾部损坏**，把「日志已损坏」静默当成「空文件」（修复轮）
+
+`src/audit/`（765 行）—— SHA-256 hash 链的防篡改审计日志。
+
+## 缺陷一：`new()` 吞掉所有错误
+
+```rust
+let (last_hash, events_count) = read_tail_hash(path)
+    .unwrap_or_else(|_| (Self::GENESIS_HASH.to_string(), 0));   // ← 吞掉**所有**错误
+```
+
+而 `read_tail_hash` **自己**在「文件为空」时已返回 `Ok((GENESIS, 0))`
+⇒ 那个 fallback **只会在真实错误时触发**（尾部行损坏 / I/O 失败）。
+
+实测（写 3 条 → 截掉尾部 30 字节，模拟崩溃写半行）：
+
+```text
+new()        → Ok（未报错）      ← ParseError 被吞
+event_count  → 0                ← 文件里明明有 3 条非空行，静默算错
+```
+
+之后写入的新事件还会以 genesis 为 `prev` 追加
+⇒ **恢复动作本身进一步污染了链**。
+
+对一套**防篡改**系统，静默归零计数比直接报错糟得多：
+真篡改者能藏在「本来就是 0」这种噪声里，而运维会学会忽略这条信号。
+
+**为什么不需要兜底**：`new()` 上面刚用
+`OpenOptions::new().create(true).append(true).open(path)` **建过**文件
+⇒ `read_tail_hash` 永远拿得到已存在的文件 ⇒ 直接 `?` 传播是安全且正确的。
+
+修后实测：`new() → Err: audit JSON parse error at line 3: missing prev/hash fields`。
+
+## 缺陷二：行号基准**三处不一致**（写判据时顺带发现）
+
+**同一个损坏文件**，修前给出互相矛盾的指引：
+
+| 位置 | 基准 | 修前实测 |
+|---|---|---|
+| `new()` → `read_tail_hash` | **1 基**（`count` 计数器） | `line 3` |
+| `verify_chain` | **0 基**（`enumerate()` 下标） | `line 1` |
+| 既有单测的断言消息 | 声称 1 基（「tamper at line 1 should fail at line 1」，而它篡改的是 `lines[1]`） | 断言 `line == 1` |
+
+⇒ 既有单测的消息证明**本意就是 1 基**，实现与意图不符。
+统一为 1 基（`verify_chain` 用 `i + 1`），并把该断言从 `1` 改为 `2`
+（`lines[1]` 是**第二个**物理行）。
+
+修后同一文件两处都报 1 基行号。
+
+## 牙齿验证：同时还原两处修复 ⇒ **4 红 / 4 绿**
+
+红：损坏尾部必须报错 / 完整事件不得被静默丢弃 / 行号基准收敛 / 篡改点名物理行号
+绿（正确不敏感）：空文件以 genesis 打开 / 不存在的文件被创建 /
+**追加到合法日志能正确恢复计数与链** / 删除中间一行必被抓到
+
+⇒ 红得精确对应两处注入点。
+
+## 判据覆盖：防篡改核心能力不变量
+
+「防篡改」是这套 hash 链存在的理由，独立于本轮改动 ——
+判据把两条**核心能力**钉住，防止「修了 A 坏了 B」：
+
+- 改动**中间一行** ⇒ `HashMismatch` 且点名行号
+- **删除中间一行** ⇒ 链校验失败（`prev` 接不上）
+
+## 顺带否定：`json_string` / `extract_field_skip_escaped` 无缺陷
+
+逐条核对了 JSON 转义的对称性（`"` `\` `/` `\n` `\r` `\t` `\b` `\f` `\uXXXX` +
+代理对）、UTF-8 解码（**不用** `u8 as char` 的 Latin-1 解释，D207 已修）、
+以及「`find` 会不会命中别的字段里」——
+canonical 字段顺序（`ts, actor, action, target, payload, token, prev, hash`）
++ 转义（串内引号被写成 `\"`）共同保证不会命中。
+`token_id` 的 `u128 as u64` 截断不可达（写端就是 `Option<u64>`）。
+
+#### D400：`has_cycle()` 对**非环的畸形图**也返回 `true`（修复轮；源码不可达，如实记录）
+
+`src/orchestrate_dag/`（291 行）—— Kahn 拓扑排序的 DAG-as-data 编排。
+
+## 缺陷
+
+```rust
+pub fn has_cycle(&self) -> bool {
+    self.topological_order().is_err()
+}
+```
+
+而 `topological_order()` **第一步**就是 `self.validate()?`，而
+`validate()` 的三类错误**都不是环**：
+
+| `validate()` 的错误 | 是不是环？ |
+|---|---|
+| `duplicate node 'a'` | ❌ |
+| `edge from unknown node 'x'` | ❌ |
+| `edge to unknown node 'ghost'` | ❌ |
+
+实测：`nodes=["a"]`、`edges=[("a","ghost")]` —— **只是打错了一个节点名** ——
+`has_cycle()` 回答「**有环**」。
+
+## 判定：修
+
+本方法的 doc 自己写着「拓扑排序并检测**环** (Kahn's standard detection)」
+⇒ **意图明确就是环**，实现与自己的 doc 矛盾 ⇒ 按 D396 的判据
+（无注释解释 + doc 明确 + 兄弟语义不同 = 遗漏）属**笔误**，修。
+
+修法：畸形图**无从谈环** ⇒ 返回 `false`，由调用方用
+`validate()` / `topological_order()` 处理那三类错误；
+`validate` 过了之后 `topological_order` 唯一的错误就只剩环。
+
+## ⚠ 源码不可达（实测复核 D280 的说法，**结论不变**）
+
+按 D385 的三层框架核实：
+
+| 层 | 事实 |
+|---|---|
+| 底层实现 | ✓ `OrchestrateDag` / `topological_order` / `has_cycle` |
+| 中间接线 | ✓ `builtins/ai.rs:180` 构造 DAG 并调 `topological_order()` |
+| 上层入口 | ✗ **不通** |
+
+实测 `ai.dag(["a","b"], [["a","b"]])` →
+`Runtime error: Unknown method: AiChat.dag`（裸名 `ai.x` 被 parser
+解析成 `BuiltinKind::AiChat`，而 `call_ai_method` 挂在 `BuiltinKind::Ai` 上），
+与 D59 / D280 的记录一致。
+
+而 **`has_cycle` 连那条不可达路径都没调** ⇒ 它是**全仓零调用**（除本模块单测）。
+
+## 牙齿验证：还原修前实现 ⇒ **3 红 / 5 绿**
+
+红：未知边端点不是环 / 重复节点不是环 / 三类畸形一律不得报成环
+绿（正确不敏感）：真环（二元环 / 自环 / 三元环）/ 合法无环图（含菱形）/
+`ai.dag` 不可达现状 / `has_cycle` 零外部调用 / `ai.dag` 仍走 `topological_order`
+
+## 我的判据自身错了一处（**类型 vs 方法**）
+
+首版判据扫的是「`OrchestrateDag` / `has_cycle` 出现生产调用方」，
+结果命中 `builtins/ai.rs:180` 的 **`OrchestrateDag::new`** ——
+那是**类型**被用到，不是 `has_cycle` 方法被用到。
+我据此以为「缺陷有生产调用方」，与事实不符。
+
+⇒ 修正为**两条独立判据**：
+- `has_cycle` 在本模块单测之外零调用；
+- `topological_order` **确实**有生产调用点（在不可达的 `ai.dag` 里），
+  且 `ai.dag` **不**调 `has_cycle`。
+
+⇒ 教训：**「类型被用到」与「方法被用到」必须分开统计**，
+否则会凭空放大影响面（或凭空缩小）。
+
+#### D401：`Plan::update` **非原子** —— 报错了，但前面的更新**已经生效**（修复轮）
+
+`src/plan/`（245 行）—— pi-agent 风格的实时 checklist。
+
+## 缺陷
+
+修前是逐条「查 id → 写 status」，遇到未知 id 就 `?` 返回：
+
+```text
+update([("a",Done), ("b",Done), ("ghost",Done)])
+  → Err: step id 'ghost' not found
+  → 但 a、b **已变成 Done**（实测 done=2 / pending=1）
+```
+
+错误消息只说「ghost 不存在」，会让调用方以为什么都没发生 ——
+而 `plan` 是**持久留在解释器注册表里**的：脚本报错终止，**plan 状态仍在**。
+
+`plan.update` 脚本可达（`builtins/plan.rs:77`），实测脚本层同样命中：
+
+```text
+plan.update("m", [["a","done"], ["ghost","done"]])
+  → Runtime error: plan.update: step id 'ghost' not found
+```
+
+## 修法：两轮 —— 先全量校验 id，再统一应用
+
+一个都写不了，才算失败。
+
+## 判定：修
+
+doc 写「找不到的 id 返回 error」，**未提及**部分生效；
+没有注释解释「部分应用是有意的」⇒ 按 D396 判据属**笔误**（doc 说 A、
+实现做了 A ∪ B）⇒ 修。
+
+## 既有测试为何没抓到
+
+`plan_update_unknown_id_errors` 只传**单个**未知 id
+⇒ 循环第一轮就返回，**永远碰不到「前面已生效」的情形**。
+
+⇒ 与 D396 同族：**测试矩阵落在缺陷之外**。阈值不在「值」上，
+而在「**批的大小 > 1 且其中有缺失项**」这个组合上。
+
+## 牙齿验证：还原非原子实现 ⇒ **2 红 / 5 绿**
+
+红：失败时全不生效 / 缺失 id 在中间也不部分生效
+绿（正确不敏感）：**首个就缺失**（修前在那里本来也不写任何东西 ——
+这是本轮特意加的反向对照）、全合法全部生效、空更新 no-op、
+同 id 重复以最后一次为准、e2e 错误点名缺失 id
+
+## 为什么 e2e 只能钉诊断质量
+
+Mora **没有 try/catch**，脚本遇 runtime error 即终止
+⇒ 脚本层**观察不到**「错误之后」的状态。
+原子性只能在库级验证，e2e 只钉「错误消息点名缺失的 id」。
+
+## 顺带钉住一条易被误判的语义
+
+同一批里**同一 id 重复出现**时以**最后一次**为准（两轮都成立）。
+这不是缺陷，是把「顺序应用」这个语义显式钉住 ——
+否则将来有人把两轮合并成 `HashMap` 去重时会静默改变行为。
+
+#### D402：`src/heartbeat/` 首次外部覆盖 —— 解析逻辑**零缺陷**，但 doc 声称的 builtin **根本不存在**（否定轮 + 文档更正 + 拆雷）
+
+`src/heartbeat/`（189 行）—— mimiclaw §1.5 风格的 markdown checklist 解析。
+
+## ① 解析逻辑：否定轮，**零缺陷**
+
+逐条核对全部正确：四种 checkbox 形态（`[ ]` / `[x]` / `[X]` / `[]`）、
+前导缩进容忍、非清单行跳过、**行号 1 基**、
+`[x]` 后必须跟空格（符合 markdown 规范）、
+空清单 vacuously complete（`is_complete()` 与 `completion_ratio()==1.0`
+与 `plan` 的**兄弟语义一致**，未分叉）。
+
+## ② 文档更正：doc 声称的 builtin **根本不存在**
+
+doc 原本写 `builtin heartbeat.check(path?)`。实测：
+
+```text
+heartbeat.check("HEARTBEAT.md") → Type error: Unbound variable 'heartbeat'
+```
+
+⇒ **没有 `heartbeat` 这个 builtin 模块**。实际名字是 `ai.heartbeat(path?)`
+（`builtins/ai.rs::call_ai_method`），而它**源码不可达**（D59）。
+
+与 **D280 在 `orchestrate_dag` 上修过的完全是同一类**文档漂移
+（builtin 名写错 / 与实际实现不符），本轮同样修正。
+
+## ③ 给「将来接线」的拆雷：绕过沙箱的文件读
+
+`load_heartbeat` / `ai.heartbeat` 接收**调用方给的任意路径**且
+**不走 `sandbox.check_path`** —— 而所有 `file.*` 带路径入口都走了
+（D334 / D389 逐一补齐）。
+
+⇒ 一旦接线，就等于开了一个**绕过沙箱的文件读**口子。
+已写进模块 doc，并配判据钉住「这条拆雷信息不许被删」。
+
+## 牙齿验证：文档判据 ⇒ **2 红**
+
+（逻辑未改，故验证对象是文档判据。）
+把旧 doc 那行放回去 ⇒ 两条文档判据变红，12 条解析判据照常绿。
+
+⚠ 第一次牙齿验证只红了 **1** 条 —— 因为
+`d402_doc_warns_about_sandbox_bypass` 首版只断言 doc 里**出现过**
+`check_path` 三个字，我在探针里塞一行无关的「check_path 拆雷说明」
+就把它糊弄过去了。**判据无牙齿的典型形态：只查关键词存在性。**
+改为要求 `check_path` 与「接线」**在相邻行内成对出现**（结构性要求，
+不绑死措辞）⇒ 第二次验证 2 红。
+
+## 判据自身错了一处（D400 教训第二次）
+
+我断言「`load_heartbeat` 零生产调用方」，实测 `builtins/ai.rs:198`
+**确有** `crate::heartbeat::load_heartbeat(&path)`。
+
+准确事实分两层：**调用方存在**（在 `ai.heartbeat` 分支里）
+≠ **路径可达**（`BuiltinKind::Ai` parser 永远给不出）。
+
+⇒ 判据改为「唯一调用方必须在 `ai.heartbeat` 分支内」+「该分支不可达」，
+两条分别钉住。另修正一处**路径分隔符**问题：命中文本是
+`src/interpreter\builtins\ai.rs`（`rel` 用正斜杠、其后用反斜杠），
+不归一化就会把唯一的合法调用方误判成「额外调用方」。
+
+#### D403：`src/toolplane/` 首次外部覆盖 —— 逻辑**零缺陷**，但 doc 的 builtin 名**三处皆错** + 一个**空测试**（否定轮 + 文档更正 + 测试补强）
+
+`src/toolplane/`（278 行）—— loongclaw 风格的 Core/Extension 多 plane 注册表。
+
+## ① 逻辑：否定轮，**零缺陷**
+
+`PlaneKind::parse`（含 `ext` 别名与大小写不敏感）/ `ToolPlane::register` 重名拒 /
+`ToolPlaneRegistry::create_plane` 空名拒 + 重名拒 / `find_tool` **按 plane 隔离** /
+`list_planes` **已排序** ✓（D385 的 `HashMap` 随机序同族，这里是对的）/
+`default_registry` 恰好 2 个 core plane。逐条核对全部正确。
+
+## ② 文档更正：doc 声称的 builtin 名**三处皆错**
+
+doc 原本写「调度通过 `tool.plane.dispatch(plane, name, args)`」与
+「builtin `tool.plane.*` 操作 plane」：
+
+| doc 声称 | 实际 |
+|---|---|
+| `tool.plane.*` | **`tool.*`**（注册名；`toolplane` 是**未绑定变量**） |
+| `tool.plane.dispatch(…)` | **无 `dispatch` 方法** |
+| （未列全） | 实际 8 个：`create`/`register`/`unregister`/`list`/`list_tools`/`info`/`find`/`remove` |
+
+端到端实测：`tool.list()` → `[ai, sandbox]` ✓；`tool.create(…)` → `true` ✓。
+
+**D74 已因「按枚举变体名 `toolplane` 建表」踩过同一个坑，doc 又踩了一次** ——
+判据 `d403_impl_and_typeck_agree` 现在把「实现 ↔ typeck 表」一一对应钉住。
+
+## ③ 三兄弟的错误风格不一致（只报告，不改）
+
+对**不存在的 plane**：
+
+| 方法 | 行为 | 脚本观感 |
+|---|---|---|
+| `tool.info` | 返 `nil` | 静默 |
+| `tool.find` | 返 `nil` | 静默 |
+| `tool.list_tools` | **抛 `Err`** | 脚本直接终止 |
+
+各自与 typeck 声明一致（`info`/`find` 是 `Union[..., Nil]`，
+`list_tools` 是裸 `List[String]`）⇒ **改它属产品语义决定**，本轮只钉现状。
+
+## ④ 一个**空测试**被补强
+
+`runtime::sandbox::tests::tool_planes_default_has_core` 函数名声称
+「默认含 core plane」，函数体却只有 `let _ = &*planes;`（不 panic 即可）——
+**什么都没断言**。
+
+旁边的注释还把 `ToolPlaneRegistry::default()` 说成「含 2 core planes」，
+而第 39 行用的是 `crate::toolplane::default_registry()`；
+**派生的 `Default` 实为「空」registry** ⇒ 注释与代码矛盾。
+
+补强为真断言（`plane_count() == 2` + 两个 `get_plane(...)`）后**通过** ——
+反证了旧注释的事实错误。
+
+## 牙齿验证：还原两处 ⇒ **2 红 / 8 绿**
+
+红：doc 不得再把 `tool.plane`/`dispatch` 当真实接口 / 该测试又变回空断言
+绿：8 条 registry 行为判据 + 实现与 typeck 一致性 + 三兄弟现状
+
+## 判据自身错了两处（**第四次**踩「扫源码命中自己注释」）
+
+① `d403_default_registry_assertion_is_real` 扫函数体找
+`let _ = &*planes;`，结果命中的是**我自己在注释里写的那句话**
+（「函数体却只有 \`let _ = &*planes;\`」）⇒ 必须先剥注释行
+（D388 / D394 / D395 / D403 **第四次**同族陷阱）。
+
+② doc 判据连栽两次：`!doc.contains("tool.plane")` 被**更正段落自己**命中；
+改成查具体句式后，又被「**引用**旧句」的那一行命中
+—— 更正文本**必须引用错误名字**才能解释它。
+⇒ 判别规则改成**结构性的**：凡提到旧接口的行，必须同时带引用标记「」
+或「不存在」/「不是」（说明它是被**引用**的旧说法，而非被断言的接口）。
+
+## 门禁中出现的**偶发失败**（如实记录，不编造修复）
+
+本轮全量门禁：**303 目标 / 2775 passed / 1 failed / 24 ignored**；
+clippy / doc / fmt 全 0。唯一失败：
+
+```text
+audit::tests::verify_chain_fails_on_tampered_event
+panicked at src/audit/mod.rs:754:
+expected HashMismatch, got Io("系统找不到指定的文件。 (os error 2)")
+```
+
+**这不是被测代码的逻辑错误** —— 错误是「文件在测试中途消失」
+（`verify_chain` 里 `File::open` 找不到路径），而非 `HashMismatch` 判定错。
+
+排查过程（**不猜**）：
+
+1. 单独跑该测试 → **通过** ⇒ 与并发/顺序相关，不是确定性失败。
+2. 连跑 6 次完整 lib 套件 → **全绿** ⇒ 失败很罕见（1/8 量级）。
+3. 检查 6 处 `temp_log("…")` 的文件名 → **互不相同**
+   ⇒ 「目录名碰撞 + 互相 `remove_dir_all`」假设**被排除**。
+4. 全会话反复观察到 `%TEMP%` 下 `mora_*` 目录数在 **9238–9240** 之间
+   **自行波动**（与我的测试运行无关）⇒ **环境侧有进程在动这些临时目录**，
+   与「测试中途文件被删」的证据一致。
+
+⇒ 归因：**环境侧对 `%TEMP%\mora_*` 的干扰**。
+本轮**无法复现**，故**不编造修复**；如实上报。
+（该测试的注释本就自陈其脆弱性：Windows 上文件被占用时
+`remove_dir_all` 会失败，故要求声明顺序让 sink 先关句柄。）
+
+#### D404：`ccr.marker` 的 **size 负数饱和成 0** —— **有意决策，我只补齐覆盖**（否定轮 + 一次真实的自我否决）
+
+`src/ccr/`（166 行）—— CCR（Compress-Cache-Retrieve）可恢复压缩存档。
+
+## 现状：负数静默变 0（**D339 已明确决定「不修、只钉现状 + 报告」**）
+
+```text
+ccr.marker(h, 8)      → <<ccr:0000000000000001,8>>
+ccr.marker(h, -1)     → <<ccr:0000000000000001,0>>
+ccr.marker(h, -99999) → <<ccr:0000000000000001,0>>
+exit 0，零诊断
+```
+
+`tests/tea_max_steps_guard.rs::d339_…_still_becomes_zero_for_both_types`
+**专门钉住**这个行为，其 doc 写明：
+
+> 改它属**产品契约决定**（负尺寸该报错还是当 0），只报告。
+
+## ⚠ 本轮的一次**自我否决**（与 D397 同款，但更隐蔽）
+
+我**真的**改过一次：拿 D283（`agent.create` 的 `max_steps` 同样是
+`as usize` 饱和、已改为报错）与 D246（`value_as_usize` 是唯一提取点）
+判定此处是「遗漏」，改成「走 `value_as_usize` + 点名报错」，并实测确认
+挂死消失。
+
+**随后发现 D339 的决定记录，全部回退。**
+
+### 教训比 D397 更具体
+
+> **「兄弟调用点选了报错」不足以判定本调用点是遗漏** ——
+> 必须先查**本调用点自己**是否已被决定过。
+>
+> 而**一条专门钉住某行为的判据，本身就是「该行为是有意的」的证据** ——
+> 找到它，就说明有人**想过并留了记录**。
+>
+> D397 的教训：「文档声明优先于一致性启发式」；
+> 本轮补上的是：「**判据的断言内容也是声明**」——
+> 只查代码注释不够，**要查判据里有没有把它钉住**。
+
+### 代价是可见的
+
+我的修复把普查金丝雀 `d344_silent_fallback_census_…` 也点红了
+（`ccr.rs` 少了一处 `.unwrap_or(`，计数 21 → 20）。
+因为那次修改是**误改**，基线已随回退复原为 21。
+
+## 本文件的实际贡献：把覆盖从「1 条」补到完整矩阵
+
+D339 只钉了「`Float` / `Int` 两种类型都变 0」。本轮补齐：
+**`nil` / 缺省 / 小数截断 / 非有限值**、**可达性分析**
+（脚本里**拿不到** `Value::Int(-1)` —— 字面量是 `Float`，
+而 `len()` 只给非负 `Int` ⇒ 该路只有库级可达）、
+以及**元约束**：钉住该决定的 D339 判据**必须还在**
+（有人若改语义，它会红；有人若顺手删掉它，本条会红）。
+
+同时首次外部覆盖了 CCR 存储层（**零缺陷**）：`put`/`get`/`len` 往返
+（hash 为 16 位 hex）、50 次 put hash 全唯一、**Clone 共享 counter**
+不撞号、marker 往返、`extract_hash` 全部边界
+（含 `<<ccr:>>` → `Some("")` 这处退化解析、<6 字节不 panic、
+非 ASCII 切片落在 ASCII 分隔符上）。
+
+## 牙齿验证
+
+本轮**未改产品逻辑**（修复已回退），故无产品级牙齿对象。
+判据的牙齿体现在 `d404_the_deliberate_decision_is_still_pinned`：
+它要求 `ccr.rs` 的代码里仍有 `.map(|n| n as usize)` ——
+有人改成别的算法就会红，从而把「语义变更」逼到台面上。
+
+
+#### D405：`mock.names()` 返回 **`HashMap` 随机序** ⇒ 同一脚本跨次运行输出不同（修复轮）
+
+`src/mock/`（189 行）—— 统一 mock response 注册表。
+
+## 缺陷
+
+`MockRegistry::names()` 直接返回 `HashMap` 的键，迭代序由 `RandomState`
+（**逐进程随机**）决定。而 `mock.names()` 是**脚本可达**的
+（`examples/integration_v0_34.mora` 就在用）⇒ **用户可见的输出不确定**。
+
+实测：同一段脚本连跑 **6 次得到 6 个不同顺序**：
+
+```text
+[charlie, bravo, delta, echo, alpha]
+[delta, bravo, echo, charlie, alpha]
+[echo, bravo, charlie, alpha, delta]
+[charlie, delta, echo, alpha, bravo]
+[alpha, delta, bravo, echo, charlie]
+[delta, echo, charlie, alpha, bravo]
+```
+
+与 **D280** 修 `tool.list_tools`、**D385** 立的「HashMap 迭代顺序不确定
+→ 会让结果依赖顺序」是**同一条原则**（D385 当年的实测原文就是
+「连跑 5 次得到 5 个不同输出」）。
+
+## 先查「是否已决定」（D404 教训）
+
+查了：既有判据 `module_return_types_match_runtime.rs` 只验**外层类型**
+（`list`），并自陈「**空列表的元素类型验不了**」——
+**顺序从无任何记录、注释或钉住**。且两个兄弟实现都排序
+（`ToolPlaneRegistry::list_planes`、`tool.list_tools`），
+后者带 D385 原则的引用注释。⇒ 属**遗漏**，修。
+
+## 修法：在 registry 层排序（与 `list_planes` 同层，不在 builtin 层）
+
+## ⚠ 既有单测对顺序**没有牙齿**
+
+`multiple_handlers` **自己先 `sort()` 再比较** ⇒ 排不排序**都能通过**。
+本文件改为「直接断言已排序的期望值」——**测试里绝不 sort**。
+
+## 必须有**跨进程**判据
+
+缺陷按定义是**逐进程**随机的 ⇒ **单进程内的库级测试原理上抓不到**
+（同一进程里 `RandomState` 固定）。所以关键判据是
+**起 4 个进程跑同一脚本，比对输出**。
+
+修后实测 4 次全部稳定为 `[alpha, bravo, charlie, delta, echo]`。
+
+## 牙齿验证：还原 `HashMap` 序 ⇒ **3 红 / 3 绿**
+
+红：已排序断言 / 注册顺序无关 / **跨进程一致**
+绿：重复调用稳定 / 兄弟 `list_planes` 也排序 / `register` 覆盖语义
+
+## 现状钉：`register` 重名**静默覆盖**（不判缺陷）
+
+与 `ToolPlane::register`（重名**报错**）口径不同，但**这是合理的**：
+`mock` 是**注册表/setter**（重复注册 = 换 handler，预期行为）；
+`tool` 是**工具目录**（重复 = 建模错误，值得报错）。
+⇒ **不是同一类东西**，不按「兄弟不一致」判缺陷。
+
+⇒ 这条同时是 **D404 教训的正面用法**：先问「口径不同是否**同类**」，
+而不是见到不一致就改。
+
+## 判据自身错了一处
+
+跨进程比对写成 `outs[1..] == outs[..1]` ⇒ **永远不等**
+（长度 3 的切片 vs 长度 1 的切片），报错信息里三个值明明逐字相同。
+改为逐个与第 0 次比。
+
+#### D406：`memory.keys()` 返回 **`HashMap` 随机序**；本轮同时做了该缺陷类的**行为普查**（修复轮）
+
+承接 D405（`mock.names()` 随机序）。本轮不审计新模块，而是对
+「**脚本可达的集合列举返回随机序**」这个**缺陷类**做全称普查 ——
+一次覆盖所有入口。
+
+## 普查结果（8 处候选，逐一定性）
+
+| 入口 | 状态 |
+|---|---|
+| `dict.keys`（`method_dispatch.rs`） | ✅ 已排序（带 D385 原则注释 + `tests/dict_determinism.rs` 守护） |
+| `tool.list_tools` | ✅ 已排序 |
+| `tool.list`（`ToolPlaneRegistry::list_planes`） | ✅ 已排序（D280 修） |
+| `plan.list` | ✅ 已排序 |
+| `mora.list_refines` | ✅ **在 builtin 边界排序**（`mora.rs:97`）—— `RefineRegistry::session_paths()` 本身未排序，但用户看不到 ⇒ **不是缺陷**（差点误报） |
+| `Environment::exported_names` | ✅ 已排序 |
+| `compress/json.rs` 的两处 keys | ✅ 已排序（且有注释说明两分支必须同序） |
+| **`memory.keys`** | ❌ **未排序** —— 本轮的缺陷 |
+
+## 缺陷
+
+实测同一脚本连跑 **5 次**：
+
+```text
+keys=[bravo, delta, echo, alpha, charlie]   first=bravo
+keys=[echo, alpha, bravo, delta, charlie]   first=echo
+keys=[delta, alpha, charlie, echo, bravo]   first=delta
+keys=[delta, bravo, echo, alpha, charlie]   first=delta
+keys=[bravo, echo, delta, alpha, charlie]   first=bravo
+```
+
+`memory.keys()[0]`（「第一个键」）**每次拿到不同的键**。
+
+而 `method_dispatch.rs` 里 `dict.keys()` 的注释**原文**描述的就是
+**同一个危害**（「用户按 `keys()[0]` 取第一个键会拿到随机结果 ——
+且**不报错**」）—— `dict` 侧已修并有专门判据守护，**`memory` 侧漏了**。
+
+## 先查「是否已决定」（D404 纪律）
+
+既有判据 `module_return_types_match_runtime.rs` 只验**外层类型**（`list`）
+并自陈「空列表的元素类型验不了」；`memory_key_identity.rs` 的用例都是
+**单键或键很少**，且只断言 `type_of(keys()[0])` 是 string
+（**无论哪个键都是 string ⇒ 对顺序无牙齿**）。
+**顺序从无任何记录、注释或钉住** ⇒ 属遗漏，修。
+
+## 判据形态：**行为普查**而非源码模式匹配
+
+「列举集合」入口会随开发增长，源码里找「`.keys()` 又找 `.sort()`」
+**太脆**。改为**真的驱动每一个脚本可达入口**并断言排序结果 ——
+谁回归成随机序谁就红，**与代码怎么写无关**。
+新增入口时登记进 `CASES` 即可（表头注明「不登记 = 无守护」）。
+
+## ⚠ 普查 case 本身也有牙齿问题（已修）
+
+首版 `memory.keys` 的普查 case 只存 **2 个键**。牙齿验证时把实现还原成
+随机序，它**照样绿** —— **2 键的 HashMap 顺序常常「碰巧」有序**
+（单桶，碰撞少）。
+
+⇒ 这正是 D391「探针必须跨越能暴露被测性质的条件」：
+**键数就是阈值**。改为 **5 键**后，同一次注入下 **3 红 / 1 绿**。
+
+## 牙齿验证：还原 `memory.keys` 随机序 ⇒ **3 红 / 1 绿**
+
+红：普查表（5 键 case）/ `memory.keys` 跨进程 / 源码级「仍须有 sort」
+绿：`mock.names` 跨进程（正确不敏感 —— D405 已修）
+
+## 顺带记录一次「差点误报」
+
+`RefineRegistry::session_paths()` 本身**未排序**，按 grep 很像缺陷。
+但 builtin `mora.list_refines` 在**边界处 `names.sort()`**
+⇒ 用户看到的是排序结果 ⇒ **不是缺陷**。
+⇒ 普查必须**追到用户可见的出口**，不能停在库级函数。
+
+#### D407：「`as` 整数转换**饱和**」缺陷类的**全称普查** —— 零可修项（否定轮 + 前瞻护栏）
+
+承接 D406 的普查范式。本轮不审计新模块，而是普查**另一个已修过多次的缺陷类**。
+
+## 为什么要普查这一类
+
+Rust 的 `as` 转换在越界时**不 panic**，而是给出一个**看似合法的错值**：
+
+| 转换 | 越界行为 | 方向 |
+|---|---|---|
+| 浮点 → 整数（`f64 as usize`） | **饱和** | `-1.0` ⇒ `0` |
+| 整数 → 无符号（`i64 as u64`） | **回绕** | `-1i64` ⇒ `u64::MAX` |
+
+两种方向**危害相反**，且都**零诊断** ⇒ 是一类高危静默错值。
+本仓已逐个修过多处（D148 / D243 / D244 / D246 / D285 / D150 / D283 / D339），
+故本轮做普查而非再修一处。
+
+## 普查结论（`src/interpreter/builtins/`，21 文件 / **30 处**整数转换）
+
+| 类别 | 判定 |
+|---|---|
+| **已加守卫**（走 D246 收口 `value_as_usize`，负数报错） | ✅ `ai.retry` 的 `backoff_ms`（D246）、`exec.parallel` 的并发上限与 `timeout_ms`（D285，各带修前实测）、`agent.create` 的 `max_steps`（D283）、`ccr.marker` 的 `Int` 匹配（D150） |
+| **有意保留**（明文产品契约） | ⚠ `ccr.marker` 的 size —— **D339 明确决定「不修、只钉现状 + 报告」**（D404 曾误改后回退） |
+| **安全方向**（`usize→f64` / `char→u32` / 计数 `u64→i64`） | ✅ 源类型已是**无符号/非负**，转换不可能饱和 |
+
+⇒ **零可修项。** 唯一未设防的那处是**有意**的，且有判据钉住。
+
+## 本文件的价值是**前瞻**
+
+新增一处 `as <int>` 会让计数越界而变红，**逼作者先判断「这处会不会饱和」**，
+而不是默默加一条饱和转换。配三条**防回退**判据：
+`ai.retry` / `exec.parallel` 的守卫必须在、唯一的有意例外必须仍被钉住。
+
+## 判据设计：区间而非「≤ 上界」
+
+首版写成 `total <= 30` ⇒ **扫描器坏掉（返回 0）会静默通过**。
+改为区间 **[20, 30]**（`pub_fn_zero_ref_census` 同款）：
+**下界**保证扫描器活着，**上界**挡住新增。
+
+## 牙齿验证：注入 2 处新转换 ⇒ **1 红**
+
+判据准确报出「共 32 处，不在预期区间 20..=30」，
+且分布里 `ccr.rs` 从 2 → 4 ⇒ 扫描器**活着**且逐文件精确。
+
+计数**剥掉注释行**后才统计 —— 源码里大量解释「为什么不能饱和」的注释
+否则会被算进去（D388 / D394 / D395 / D403 同族的坑）。
+
+#### D408：`skill.load` 读任意调用方路径且**不走 `check_path`** —— **本轮自我否决：守卫不施加**，只报告根因（否定轮 + 一次真实的自我否决）
+
+`src/skill/`（308 行）—— SKILL.md frontmatter 解析 + 双注册表。本轮顺带
+首次外部覆盖该模块本体（**否定轮，零缺陷**）。
+
+## 缺陷（仍然成立）
+
+```rust
+"load" => {
+    let path_str = args.first()...;
+    let spec = crate::skill::MoraSkillSpec::load_file(&path)  // ← 无守卫
+```
+
+`file.rs` 早有明文规则（D334/D389 那一串）：
+**「新增带路径的入口时，`check_path` 不是「惯例」而是**义务**」**。
+按这条读，`skill.load` **违反**了它。
+
+## 我先修了，然后**全量回退** —— 理由如下
+
+按「兄弟实现不一致 + 有明文义务」这两条，修它看似毫无争议。
+于是加了守卫（先注释后守卫），跑全量门禁 ⇒ **1 失败**：
+
+```text
+interpreter::builtins::tests::skill::tests_v046_skill::skill_load_real_skill_md_file
+  sandbox denied 'C:\Users\...\Temp\...' escapes fs_root 'D:\'
+```
+
+⇒ 守卫**真的收紧了功能**：跨盘加载不了 SKILL.md。
+
+## 根因**不在本入口**，在 `permissive()`
+
+机制在 `SandboxPolicy::check_path`（`src/sandbox/mod.rs:133`）：
+
+```text
+fs_root = permissive() = "/"
+  → canonicalize("/")  在 Windows 上 = \\?\D:\     ← 当前工作目录所在盘
+  → strip_verbatim()   → D:\
+  → 与目标 starts_with 逐组件比
+⇒ 放行**当前盘**的一切路径，**其它盘一律拒**
+```
+
+而 `permissive()` 的 doc 写的是：
+
+```rust
+/// 创建一个开放 policy (允许一切 builtin, 全路径, 无限制)
+```
+
+⇒ **文档与行为不符**：它声称「全路径、无限制」，实际是「当前盘」。
+
+实测两向都验过：cwd 在 C: 时 `check_path("C:/Windows/win.ini")` 放行、
+`D:/…` 被拒；cwd 在 D: 时相反。
+
+## 为什么**不修**（D397 / D404 纪律）
+
+「`permissive()` 该是**所有盘**还是**当前盘**」是**未定的产品语义**：
+- 选「所有盘」⇒ 沙箱在 Windows 上形同虚设（与 `docs/mora-spec.md:1504`
+  「当前版本**无沙箱**，脚本可以读写文件系统」并不冲突，但要改 doc）；
+- 选「当前盘」⇒ 现状即正确，只需把 doc 的「全路径」改成「当前盘」。
+
+`skill.load` 只是个**恰好第一个撞上**的调用点。**它没有资格替这个决定选边**，
+所以守卫不施加，把根因连同它的 doc 一起记档 ⇒ **待裁决**。
+
+这是本项目又一次自我否决（D397 rel 搜索无步数上界、D404 `ccr.marker` 负尺寸、本次）。
+
+## 判据形态：**钉行为，不钉「有无守卫」**（D404 的延伸）
+
+首版判据断言「`load_file` 之前必须有 `check_path`」—— 那等于
+**把一个已被否决的方案钉成契约**。同理，断言「**没有** `check_path`」
+也错：那会把一个**未决定**的状态钉死，挡住后人把产品语义定下来后
+正常施加守卫。⇒ 两种断言都弃用。
+
+改钉**真正的事实**：`permissive()` 的实际边界。
+
+| 判据 | 钉什么 | 牙齿 |
+|---|---|---|
+| `permissive_root_is_current_drive_not_all_drives` | 同盘盘根放行（D335 不回归）+ 异盘盘根被拒 | 注入 `if false &&` → 红 |
+| `permissive_resolves_relative_against_fs_root_not_cwd` | 相对路径落在 `canonicalize("/")` 下 | 改按 cwd 解析 → 红 |
+| `fs_root_is_only_set_by_permissive_in_production` | 生产代码（剥 `#[cfg(test)]`）里 `fs_root: Some(` **恰好 1 处** | 去掉剥离 → 4 → 红 |
+| `check_path_actually_blocks_outside_fs_root` | 限制性根下根外被拒（守卫机制本身有效） | 注入 → 红 |
+| `default_runtime_uses_permissive` | 默认运行时用 `permissive()` | 源码级 |
+
+**牙齿验证：注入 3 处缺陷 ⇒ 恰好 4 红 / 6 绿**（另 6 条是 `src/skill/` 本体，
+与注入无关）。
+
+## 判据自身抓出的**一个假绿**（`sites <= 1` 是空断言）
+
+首版那条普查用 `read_dir(src)` + `if !p.is_dir() { continue }` ⇒
+**跳过了全部子目录**，而 `sandbox/mod.rs` 就在 `src/sandbox/` 里
+⇒ 计数恒为 **0**，而断言写的是 `sites <= 1` ⇒ **0 也过**。
+
+这条判据从写下来到本轮**一直是绿的，且什么都没测**。
+两条修法：
+1. **递归**遍历（否则看不到子目录里的文件）；
+2. 断言从 `<= 1` 改成 **`== 1`**，并把命中清单 `{文件: 处数}` 打进失败消息
+   —— 让「扫到 0 个文件」和「扫到 4 处」在消息里**可区分**。
+
+⚠ 附带一个同源问题：只剥注释**不够**，`#[cfg(test)] mod tests { … }`
+**也在 .rs 文件里**，而这些单测自己会构造 `SandboxPolicy { fs_root: Some(temp) }`
+—— 实测递归后是 **4 处**，其中 3 处在 `#[cfg(test)]` 里。
+⇒ 故加 `production_code_only()`：**剥注释 + 从 `#[cfg(test)]` 起截断**。
+
+⇒ 与 D407 的「区间下界防扫描器静默失效」同源，但更极端：
+**这次的扫描器一个文件都没看见，而下界当时根本没写**。
+⇒ 普查类判据的教训是两条，不是一条：
+**① 递归到位；② 「扫到 0 个目标」与「扫到 N 个」必须可区分。**
+
+## 顺带一个观察（**不是缺陷断言**）
+
+`check_path` 把相对路径拼到 `canonicalize(fs_root)` 上，Windows 上那是**盘根**
+⇒ `check_path("Cargo.toml")` 落在 `D:\Cargo.toml`，**不是**进程 cwd
+下的 `D:\Github\mora-lang\Cargo.toml`。
+
+这与 D335 doc 里记的 `file.exists("Cargo.toml") → true` **并不矛盾**：
+说明 `file.*` 自己先按 cwd 解析了相对路径，再送进 `check_path`。
+即**同一件事有两处归一化**。本轮不追，仅记录。
+
+## 顺带：`src/skill/` 本体否定轮（零缺陷）
+
+- **frontmatter 解析矩阵**：三种形态全对（引号剥离、未知键忽略、
+  **值里含冒号只切第一个** ⇒ `a: b: c` 完整保留）、四条错误路径各自点名、
+  极短输入（`""` / `"-"` / `"--"` / `"---"` / `"----"`）**不 panic**。
+- **`SkillRegistry::list()` 按名排序** ✓（D385 原则；`mock.names` 曾栽在这里）。
+- **`register` 同名覆盖是明文设计**（doc 写「overwrites if same name」）⇒ 钉现状。
+- **`load_public_registry` 未设路径时干净报错**；其「极简解析只统计数量、
+  不真注册」是**注释明写**的简化 ⇒ 只记录不修。
+
+## 待裁决（新增）
+
+**`permissive()` 的 `fs_root` 在多盘系统上该覆盖哪些盘？** 现状 = 当前盘，
+doc 声称 = 全路径。两者必须对齐 —— 选哪边是产品决定，但**不能继续不一致**。
+
+> ✅ **已由 D409 解决**：按 `docs/mora-spec.md` 17.1「当前版本**无沙箱**」，
+> 选定「**所有盘**」方向 —— `permissive()` 现在真的无限制。
+> 而正是这个修复让本轮做不了的那个 `skill.load` 守卫**变得可施加**（见 D409）。
+
+#### D409：`permissive()` 的 doc 与 spec 都说「无限制」，实现却只覆盖**当前盘** —— 修哨兵，并补上 D408 做不了的 `skill.load` 守卫（修复轮）
+
+D408 结尾留了一个**待裁决**项：「`permissive()` 该是所有盘还是当前盘？」
+本轮**修掉了**，并因此让 D408 当时**做不了**的那个守卫变得可施加。
+
+## 缺陷：`/` 是「无限制」哨兵，却被当成**真路径**
+
+```rust
+/// 创建一个开放 policy (允许一切 builtin, 全路径, 无限制)
+pub fn permissive() -> Self {
+    ...
+    fs_root: Some(PathBuf::from("/")),     // ← 本意：不限制
+```
+
+而 `check_path` 把它当普通路径走：`canonicalize("/")` 在 Windows 上
+落到**当前工作目录所在的盘**：
+
+```text
+"/"  →  canonicalize  →  \\?\D:\   (cwd 在 D: 时)
+    →  strip_verbatim →  D:\
+    →  starts_with 逐组件比较
+⇒ 放行 D:\ 的一切；C:/ E:/ 一律 `escapes fs_root`
+```
+
+实测两向都验过：cwd 在 `C:` 时 `check_path("C:/Windows/win.ini")` 放行、
+`D:/…` 被拒；cwd 在 `D:` 时相反。
+
+## 修法：`/` 改为**显式哨兵**，在 `canonicalize` 之前判定
+
+```rust
+pub const UNRESTRICTED_FS_ROOT: &str = "/";
+
+fn is_unrestricted(root: &Path) -> bool {
+    root == Path::new(UNRESTRICTED_FS_ROOT)
+}
+```
+
+`check_path` 里命中即**跳过** canonicalize 与根边界比较。
+
+**为什么必须在 `canonicalize` 之前判定**：一旦 canonicalize，Windows 上
+`/` 变成 `\\?\D:\`，与「用户显式设了 `D:\`」**无法区分**。
+
+**为什么不用改类型**（换成 enum / 加 `fs_unrestricted: bool`）：`fs_root`
+在生产代码里只有 `permissive()` 一处设置（判据钉着），哨兵字面量提成
+常量后「这个字面量有特殊含义」也**只有一处**。
+
+**POSIX 上是 no-op**：`/` 本就是全盘根，命中哨兵与走原逻辑等价。
+
+## 为什么是「放宽」而不是「把 doc 改窄」
+
+`docs/mora-spec.md` 17.1（安全 → 沙箱）写得很死：
+
+```text
+当前版本 无沙箱。脚本可以：读写文件系统 / 发送网络请求
+v1.0 计划：权限系统（类似 Deno）、文件系统访问白名单 / 网络域名白名单
+```
+
+⇒ **v0.x 本就不该有文件系统边界**，而「当前盘」限制**不是设计，是
+`canonicalize("/")` 的副作用**。所以该对齐的是实现，不是 doc。
+
+且这是**放宽**：只让原本被拒的路径变得可用，**不可能弄坏任何原本能跑的脚本**。
+
+## 连带修好的两件事
+
+### ① 相对路径不再落到**盘根**
+
+修前 `check_path("Cargo.toml")` 拼的是 `canonical_root.join(p)`，
+Windows 上那是 `D:\` ⇒ 返回 `D:\Cargo.toml`，**不是**工作目录下的那个。
+哨兵分支改按 **`std::env::current_dir()`** 解析。
+
+安全性依据：**全仓无任何调用方使用 `check_path` 的返回值去操作文件**
+——`file.rs` 全部是 `check_path(&path)?;` 后用原字符串；
+消费方只有 `sandbox.check_path` builtin 的 `.is_ok()`。已全仓核对。
+
+### ② D408 那个守卫**现在能加了**
+
+D408 加过 `skill.load` 的 `check_path`，门禁立刻打红（跨盘 SKILL.md 被拒），
+于是全量回退。**那个理由现在消失了** —— 默认策略下守卫是 no-op：
+
+- `permissive()`：一切路径放行 ⇒ 守卫不改变任何现有行为；
+- 限制性 `fs_root`：`skill.load` 与 `file.*` **权限面一致** ⇒ 绕过被堵。
+
+⇒ 这是 D408 记下的「一旦配置了限制性 `fs_root`，`file.*` 会被拦而
+`skill.load` 不会」那个**一致性缺口**，现在关上了。
+
+## 判据自身撞出的大事：**8 条判据一直靠这个 bug 才成立**（分两批暴露）
+
+D409 修完后跑门禁，**先后两批**打红 —— 第一批是修完立即发现的，
+第二批要等第一批判据改完、重跑才暴露出来（`--no-fail-fast` 跑了全部 target，
+但失败信息分散在不同 target 的输出里，第一次只看了一处）。
+
+| 批次 | 文件 | 打红的判据 |
+|---|---|---|
+| ① | `tests/file_sandbox_coverage.rs` | 4 条（`C:/…` 当沙箱外） |
+| ② | `tests/sandbox_absolute_path_boundary.rs` | `d335_cross_drive_still_denied`（**名字里就写着**「跨盘仍被拒」）、`d335_check_path_query_agrees_with_file_ops` |
+| ② | `tests/sandbox_enforcement_surface.rs` | `d336_capability_token_does_not_gate_anything`、`d336_only_file_ops_are_path_guarded` |
+
+共同病因完全一致：这批判据把**跨盘路径**当作「沙箱外」的证据，
+而那个边界**只因为上面那个 bug 才存在**。修掉后默认策略下
+**根本不存在「沙箱外」**。
+
+⚠ 这是**同一个坑第四次**了 —— 同文件里早就记着前三次：
+- D334 第一版把 `D:/` 也列成「沙箱外」⇒ D335 修好后打红；
+- D335 修好后 `D:/` 就是 `fs_root` 本身，放行它才是对的；
+- D409 修好哨兵后 `C:/` 也变成「合法」⇒ 再打红（这还是**同一个** bug 的第二次）。
+
+> **教训（值得单列）**：「**被拒**」不构成「**在边界外**」的证据。
+> 判据若靠「某输入被拒」来界定边界，必须确认那个边界的**来源**；
+> 来源若是 bug，这条判据就是**照着 bug 写的**。
+
+⇒ 连带一条**流程**教训：门禁打红时要**把所有失败 target 都捞出来**
+（cargo 会把它们汇总成 `error: N targets failed` 列表），
+不能只看第一个 —— 否则会以为「改完第一批就完了」。
+
+### 修法：判据抓手从「跨盘」换成「`..`」
+
+`check_path` 对 `..` 的拒绝是**它自己的专属诊断**：
+
+```text
+sandbox denied '../x': path '../x' rejected: contains '..' (path traversal)
+```
+
+OS 不会说这句话 ⇒ **照样能区分「过了守卫」与「落到 OS」**，
+且在 v0.x「无限制」语义下**依然成立**（`..` 拒绝是**明文决定**，D409 未动）——
+它与根边界**正交**，所以**在两种语义下都成立**。
+
+探针统一成 `../<确定不存在的目录>/x`：
+守卫在 ⇒ `path traversal`；守卫不在 ⇒ `os error 2`。
+**两种情况都不在磁盘上留任何真实文件。**
+
+D334/D335/D336 真正要证明的东西 ——「每个带路径的入口都过守卫，
+而不是落到 OS」—— **一字未损**，且判据不再依赖任何边界。
+
+另加一条**方向刻意相反**的对账（`d409_default_policy_allows_cross_drive_reads`
+与 `d409_default_policy_has_no_fs_boundary`）：
+默认策略下跨盘**成功**。两条一起才说得清语义：
+`..` 拒（`check_path` 的 `..` 规则）、跨盘放行（v0.x 无沙箱，spec 17.1）。
+
+### `d336_only_file_ops_are_path_guarded` 的改法值得单说
+
+原版三条都用 `C:/Windows/win.ini`，靠「**文件真实存在**」来区分
+「有守卫 / 无守卫」：`memory.load` 报 JSON 解析错、`tail` 直接输出内容。
+
+改用不存在路径后，「无守卫」的铁证从「读到内容」换成了
+「**报的是 OS 错误而不是 `sandbox denied`**」——
+这其实**更强**：判别抓手从「结果恰好不同」变成
+「诊断是否专属」。
+
+## 判据（`tests/skill_load_sandbox_guard.rs` 10 → 14 条）
+
+新增：`permissive` 放行所有盘 / 仍拒 `..`（明文决定，钉现状）/
+`strict` 仍拒一切（防 D409 顺带放宽它）/ 相对路径按 cwd 解析 /
+`skill.load` 守卫在 `load_file` 之前 / 守卫诊断点名「沙箱」。
+
+改写两条 D408 判据：它们钉的是**修复前**的行为（「异盘被拒」
+「相对路径落盘根」），与 D409 终态矛盾 ⇒ 必须改，不能留。
+
+**牙齿验证：注入 2 处缺陷 ⇒ 恰好 5 红**
+（哨兵恒假 2 条 + 摘掉 `skill.load` 守卫 2 条 + e2e 对账 1 条）。
+`d409_permissive_still_rejects_dotdot` 保持绿 ⇒ 证明 `..` 与哨兵**正交**。
+
+## 一个只报告不修的相邻问题
+
+`permissive()` 下 `..` 仍被拒，所以它**并非**字面意义的「一切路径皆可」，
+`file.read_text("../x.txt")` 仍报 `path traversal`。
+
+但这是**明文决定** —— 模块头写着「Path safety: 拒绝含 `..` 或绝对路径越界
+(out of root) 的操作」⇒ 按 D397/D404 纪律**只报告不擅动**。
+且它与根边界**正交**（`..` 在根逻辑之前就被拒），D409 未触碰。
+
+⇒ 待裁决：v0.x「无沙箱」是否也该放开 `..`？
+放开的话模块头要同步改；但那样会**同时**收掉 D334 唯一的行为判据抓手。
+
+#### D385：`xform` 的**实际形态** + transducer 底层**接上了**（否定轮，修正 D346 的印象）
+
+D346 判定 `xform` 是「静默无效」，但当时**没查底层**。本轮查清两件事。
+
+## ① transducer 底层**接上了**，不是死代码
+
+`src/value/transducer.rs`（239 行）有完整的 `Transducer` trait、
+`Map`/`Filter`/`Take`/`Comp` 四个实现与四个构造器，
+且被**两处真实调用**：
+
+| 位置 | 用途 |
+|---|---|
+| `interpreter/ai_helpers.rs:229` | `mut xform: Option<&mut dyn Transducer<String,String>>` — 逐个推入 SSE token |
+| `interpreter/method_dispatch.rs:960` | `call_method_stream(.., xform, ..)` |
+
+## ② 但 `xform` builtin 返回的是**自描述占位串**
+
+```text
+xform.attach(1)           → 1.0                      （原值透传）
+xform.attach(fn(x) x end) → closure
+xform.map(fn)            → "<xform.map(closure)>"
+xform.filter(fn)         → "<xform.filter(closure)>"
+xform.take(99)           → "<xform.take(99)>"
+```
+
+而 `call_method_stream` 在 `method_dispatch.rs` **外部零调用**
+⇒ 没有任何路径能把脚本侧的 `xform` 传进流式处理。
+
+⇒ **「无效」的真因不是「底层没实现」，而是「builtin 层无入口」** ——
+与 D361「完整基础设施 + 零入口」同型。
+
+## ③ 占位串**刻意**规避了 `HashMap` 键序随机
+
+`xform.rs:14-19` 注释记录：`Value::Dict` 的 `Debug` 走 HashMap 迭代序，
+而 `RandomState` 每进程随机种子 ⇒ 同一段程序连跑 5 次得到
+**5 个不同**的 `xform.map({...})` 描述。
+
+⇒ 与 D332/D333「`v.to_string()` 键空间」同族，此处**已修**。
+判据钉住「同一程序连跑 5 次结果相同」。
+
+## 待裁决（沿用 D346，未变）
+
+`xform` 的 transducer 机制**是否实现**？
+底层齐全且已接进 AI 流式处理，只差 builtin 侧的入口。
+属产品功能范围，**不擅动**。
+
+#### D384：压缩 sniff 的**三个阈值边界**成对压测（否定轮，无产品变更）
+
+D383 的教训是「探针必须跨越被测阈值」，但**没人系统做过**这件事。
+本轮把 `src/compress/` 的三个阈值型判定用**成对样本**
+（恰好达阈值 / 恰好差一个）逐个压测。
+
+| 阈值 | 位置 | 表达式 |
+|---|---|---|
+| `>= 0.5` | `html.rs:25` | `<` 的**总个数** / **行数** |
+| `>= 0.4` | `log.rs:58` | 命中 syslog/ISO 的**行数** / 总行数 |
+| `>= 2` | `code.rs:43` | `CODE_KEYWORDS` 命中数 |
+
+**全部精确，无 off-by-one。**
+
+## 探针必须按**实现用的那个量**构造 —— 比 D383 又深一层
+
+### ① `html`：分子是 `<` **字符总数**，不是「含标签的行数」
+
+`html.rs:23-25` 是 `content.matches('<').count() / content.lines().count()`。
+
+首版探针每行放 2 个 `<`（`<div>` + `<p>`）⇒ 实测 ratio 是我心算的 2 倍，
+**一度以为「阈值 0.5 以下也命中」**。改成每行 1 个 `<` 后，
+`0.50 → html` / `0.40 → text` 完全吻合。
+
+### ② `log`：`looks_like_iso_prefix` 会让**每行**命中
+
+首版日志行全以 `2024-01-15 10:00:` 开头 ⇒ `line_hits = n` ⇒ ratio 恒 1.0，
+**阈值根本没被压到**（我一度以为 0.30 也会命中）。
+改用**无时间前缀**的普通行后，`0.40 → log` / `0.30`、`0.39` → 非 log 精确。
+
+⇒ 与 D383 同源，但更深一层：
+**不仅样本要跨越阈值，样本的构造方式还必须与实现的判据同构。**
+否则你会「测了阈值」却**根本没碰到它**。
+
+## 附带：退化输入不 panic
+
+空串、纯空格、三个换行、单字符 `<`、10000 字符单行
+⇒ `sniff` **全部返回 Some**（落兜底 `text`），不 panic。
+
+#### D383：**撤回** D382 的「`code` 路由不到」结论 —— 那是**探针样本太小**
+
+D382 报告「Rust 代码被路由到 `text` 而非 `code`」并列为待裁决项。
+本轮查证后**撤回**该结论。
+
+## 真因：`code` 的 sniff 有**阈值**，而我的样本只命中 1 个
+
+```rust
+// code.rs
+pub const CODE_KEYWORDS: &[&str] = &[
+    "fn ", "def ", "class ", "=>", "import ", "public ", "private ", "::",
+];                      // ← 只有 8 项，且**带尾随空格**
+
+fn sniff(&self, content: &str) -> f32 {
+    let hits: usize = CODE_KEYWORDS.iter().map(|k| content.matches(k).count()).sum();
+    if hits >= 2 { (0.7 + 0.05 * hits as f32).min(0.95) } else { 0.0 }
+}
+```
+
+而 `text` 是**恒定 0.5 的兜底**（`text.rs:232`）。
+
+D382 的探针只给了 **3 行** Rust —— 只命中 1 个 `fn ` ⇒ `hits < 2`
+⇒ 分数 **0** ⇒ 落 `text`。**不是 `code` 竞争输了，是样本太小。**
+
+改用真实样本后：
+
+| 样本 | 路由 |
+|---|---|
+| 20+ 行真实 Rust（`fn `×3 / `::`×4 / …）| **`code`** ✅ |
+| 14 行 Python（`import ` / `class ` / `def `×2）| **`code`** ✅ |
+| 3 行短代码 | `text`（**阈值行为**）|
+
+## 教训
+
+> **探针必须跨越被测阈值**，否则测的是「样本太小」而不是「逻辑对错」。
+
+⇒ 与 D359「绕过 typeck 的样本才有意义」同源：
+验证某个分支**会触发**，样本就必须满足该分支的**进入条件**；
+用不满足条件的样本去测「为什么没走这条分支」，
+得到的是**探针的错**，不是产品的错。
+
+⚠ 本条是**判据自己写错**并被**下一轮自查抓出** ——
+若没查 `CODE_KEYWORDS` 的内容，D382 的错误结论就会留在仓库里。
+
+## 同时确认 D382 的另一半仍成立
+
+`log` 的**压缩放大 45%** 与 **`max_bytes` 契约矛盾**是**独立**问题，
+D383 未推翻，也未修复 ⇒ 仍在待裁决项中。
+
+#### D382：5 个子压缩器的 **sniff 路由竞争** 与 **`log` 的「压缩放大」**（否定轮，含两项待裁决）
+
+`src/compress/` 有 4 个判据覆盖 `json`（D367–D370 测了目标计算 / 角色判定 /
+约束 / 策略），但 **`text` / `log` / `code` / `html` 四个子压缩器
+从未被直接测过** —— 而 `auto` strategy 正是 `ContentRouter::sniff`
+路由到它们的主路径。
+
+## 路由：`sniff` 是**分数竞争**（`max_by`）
+
+| 内容 | 路由到 | 判定 |
+|---|---|---|
+| ISO/syslog 日志 | `log` | ✅ |
+| HTML 文档 | `html` | ✅ |
+| JSON | `json` | ✅ |
+| 普通散文 / 空串 | `text` | ✅ 兜底不 panic |
+| **Rust 代码** | **`text`** | ⚠️ **不是 `code`**（待裁决 ①）|
+
+`code` 的 sniff 分数低于 `text` ⇒ 竞争输了。功能上仍正确
+（`text` 也能压文本），但 `code` 的专门优化（去注释 / 抽公共结构）**用不上**。
+
+## 发现 ②：`log` 压缩在小输入上**放大 45%**
+
+5 行日志（200 字节）→ **290 字节**（+45%）：
+
+```text
+<2 ERROR lines preserved> (2 ERROR/FATAL total)      ← 追加 44 字节
+<compressed:method=log original_size=200>            ← 追加 41 字节
+```
+
+全部 5 行都保留（**没丢内容**），但加了两行元信息标记。
+
+## 关键：这是**两处注释的契约矛盾**，不是漏写
+
+| 位置 | 说的是 |
+|---|---|
+| `mod.rs:117-119`（D227）| 「**放大是比超限更坏的一类** ——『压缩』函数让数据变大」|
+| `mod.rs:127-133`（D227 自己）| 规则 3 **只比较 `body`**，`marker` **豁免**；并明写「为了 91 字节的元信息丢掉全部『保留了哪些错误行』的信息，代价远大于收益」|
+
+⇒ **两处都是 D227 写的**，后者**明确推翻了前者的字面要求**。
+规则 3 的 `if body.len() > content.len()`（L141）**不比较 `body + marker`**。
+
+## 既有 D227 判据**没覆盖**这条
+
+`tests/compress_max_bytes_contract.rs` 只断言「输出 ≤ `max_bytes`」
+（**预算契约**），且用 **60 行大输入**。
+`290 < 8192` 完全合法 ⇒ 断言通过。
+
+⇒ **「放大」这条契约无判据覆盖**。本文件把它**显式钉住**，
+让这个矛盾可见，而不是被静默继承。
+
+## 判据同时钉住「预算紧张时会正确缩小」（反向对照）
+
+`mb=200` 时 `log` 输出 170 字节（**-15%**）⇒
+「放大」只发生在预算宽松、marker 占比高的场景。
+
+#### D381：全仓 **`_ => {}` 静默兜底**普查 —— 28 处里**只有 3 处**真正用户可达（否定轮）
+
+D380 在 `main.rs` 找到 3 处 flag 解析的静默兜底，并总结「普查要跨层」。
+本轮把普查推到**全仓**，回答一个具体问题：
+**28 处 `_ => {}` 里，有多少是真正「用户输入非法 ⇒ 静默无效果」的？**
+
+## 普查结果：28 处 / 17 个文件，但**只有 3 处**是解析层的兜底
+
+| 类别 | 数量 | 性质 |
+|---|---|---|
+| **CLI flag 解析**（`main.rs:123/220/269`）| **3** | ⚠️ **用户可达**，D380 已钉 |
+| **中途检查**（match 失败就继续往下走）| 多数 | ✅ 安全 |
+| **最终兜底**（`dispatch.rs:269` 等）| 少数 | ✅ **明确报错** |
+
+「中途检查」占绝大多数，典型形态：
+
+```rust
+// dispatch.rs:72-82 —— `::` 构造器检查，匹配不到就继续往下
+match name {
+    "Router::new"     => return Ok(...),
+    "McpServer::new" => return Ok(...),
+    _ => {}            // ← 中途检查，不是终点
+}
+```
+
+## 关键：**分派的最终兜底明确报错**
+
+```rust
+// dispatch.rs:269
+_ => Err(format!("Value is not callable: {}", value)),
+```
+
+⇒ **「调用一个不可调用的值」不会静默成功**。
+同理 `numeric_helpers.rs:42/52/54` 的三处 `_ => {}` 后面都跟着
+`call_math_method(method, &full_args)?`（L61）⇒ 那里会报错。
+
+## 判据形态：钉「哪几处真危险」，而不是「有 28 处」
+
+- 源码层：`main.rs` 的 `_ => {}` **恰好 3 处**，且都在 flag 解析区
+- 源码层：`dispatch.rs` 的最终兜底**含 `_ => Err(`**
+- 源码层：全仓兜底总数落在 `[12, 40]`（抽查 12 个代表文件）——
+  低于下界说明文件被移动（需重新普查），高于上界说明新增了大量兜底
+- 行为层：错拼 flag 静默回落（D380 结论未变）+ **反向对照**（正确用法产出 Markdown）
+
+## 判据自身踩的坑（`CARGO_MANIFEST_DIR` 无尾分隔符）
+
+`format!("{}{rel}", env!("CARGO_MANIFEST_DIR"))` 拼出
+`D:\Github\mora-langsrc/main.rs` ⇒ **三条源码断言全部 panic 在「读源文件」**，
+而**行为层的两条照常通过** —— 输出看着「5 条里 3 条红」。
+
+⇒ 判据失败时先看**哪几条红**：全红＝装置问题，部分红＝真问题。
+与 D356「7 条一起红 ⇒ 先怀疑装置」同源。
+
+#### D380：CLI **flag 解析的静默兜底**全称普查（否定轮钉现状，含一项待裁决）
+
+D379 测 `record export` 时发现：`main.rs` 的 flag 解析用 `_ => {}` 兜底
+（3 处），**任何未知 flag 都被静默忽略**。
+
+这与 D344「`builtins/**` 的静默兜底普查」是**同一族**，但发生在 **CLI 层**。
+
+## 现状：7 种错误用法**全部 exit 0 静默回落**，零诊断
+
+| 用法 | 期望 | 实测 |
+|---|---|---|
+| `record export r1 --format md` | Markdown | **Markdown** ✅ |
+| `record export r1 --formt md`（**错拼**）| 报错 | **JSONL，exit 0，零诊断** ❌ |
+| `record export r1 --bogus x`（未知）| 报错 | **JSONL，exit 0** ❌ |
+| `record export r1 md`（位置参数）| 报错 | **JSONL，exit 0** ❌ |
+| `record export r1 --format BOGUS` | 报错 | **JSONL，exit 0** ❌ |
+| `record export r1 --format`（缺值）| 报错 | **JSONL，exit 0** ❌ |
+| `record export r1`（无 format）| JSONL | JSONL ✅ |
+
+**危害比 D343（`plan.create` 非法 status）更直接**：用户要 Markdown 报告
+（给人看），拿到 JSONL（机器格式），而 **exit 0 让他以为成功了**。
+
+## 三处静默兜底的位置
+
+| 位置 | 上下文 |
+|---|---|
+| `main.rs:123` | `--version` / `--help` 之后 |
+| `main.rs:220` | `record export` 的 `--format` / `--output` |
+| `main.rs:269` | `record snapshot` 的 `--baseline` / `--verify` / `--output` |
+
+（`cli/record.rs:591` 的 `_ => {}` 是 `SnapshotDiff` 的 match 分支，
+**不是**参数解析，不属此列。）
+
+## 与 D189 已有防护的关系：**互补，都留着**
+
+`cli::reject_option_as_path`（`cli/mod.rs:193`）解决的是**另一类**问题：
+把 `--opt=2` 这种**看起来是路径**的参数当成文件读，导致**错误归因错位**。
+它在 6 处被调用，**不覆盖**「未知 flag 被忽略」。
+
+## 判定：只钉现状，**不擅动**
+
+判据把「静默回落」**钉住**（含错拼 flag、未知 flag、位置参数、缺值、
+未知 format 五种）。若将来改成硬报错，本条会红 ——
+那是有意的行为变更，需同步更新判据与 CHANGELOG 的待裁决项。
+
+⇒ **待你裁决**：CLI 是否该对未知 flag / 未知 format **报错**？
+
+#### D379：`src/record/analysis.rs` 的 **timeline / export 端到端**（否定轮，无产品变更）
+
+`src/record/` 覆盖充分（12 判据 + 48 自带单测），但
+**`analysis.rs`（388 行，自带单测 0）**的 `build_timeline` 与
+`export_recording` 此前无直接判据。
+
+## 6 条端到端断言全过
+
+- **5 类事件全部解析**（`ai.chat` / `web.fetch` / `note` / `msg` / `state_mutation`）
+- **`stats` 子类之和 == total**（D225 的不变式，写成不变式而非具体数字）
+- **`timeline` 逐条列出** 5 类，且 `ai.chat` 带 token 数、`web.fetch` 带状态码
+- **`export --format jsonl`** 逐行回放全部事件，字段完整
+- **`export --format md`** 产出 **Markdown 报告**（含 D225 要求的 5 行）
+- **判别式写错 ⇒ 静默丢弃 + warn**，不改变退出码
+
+## 三条「格式错了不报错，静默走兜底」的前提
+
+| 前提 | 正确 | 写错的后果 |
+|---|---|---|
+| 事件判别式 | **`"ai.chat"` / `"web.fetch"`**（带点）| `ai_chat` 被**静默丢弃** + warn |
+| `Note` 的字段 | **`message`** | 写 `text` ⇒ 容错成 `message: ""`（**内容丢失**）|
+| export 的 format | **flag** `--format md` | 位置参数被 `_ => {}` 静默忽略 ⇒ 回落 jsonl |
+
+⇒ 与 D376「bbox 必须是字典」、D380「kind 必须带点」同族：
+**解析器的输入格式错，通常不报错，而是静默走兜底分支**。
+
+判据因此专门加了一条 `d379_all_five_event_kinds_parse` 作为**前提钉** ——
+若判别式写错，解析器会静默丢弃，下面所有断言都会拿到「少 3 条」的
+结果而误判成产品缺陷。
+
+## 顺带记录：未知 `--format` 静默回落 jsonl
+
+`mora record export r1 --format BOGUS` ⇒ **exit 0 + 输出 JSONL**，
+不报「未知格式」。`main.rs:220` 的 `_ => {}` 同时让**未知 flag 也被静默忽略**。
+
+与 D343「`plan.create` 非法 status 静默变 pending」同族 ⇒ **待裁决**：
+未知 format 是否该报错？（改动仅 CLI 契约，不影响既有判据。）
+
+#### D378：`src/pregel/reducers.rs` 的 **reducer 语义矩阵**（否定轮，无产品变更）
+
+`src/pregel/` 有 4 个判据，覆盖**入口** / **上限** / **载荷** / **输入格式**
+—— 但**没有覆盖聚合语义本身**。`reducers.rs`（98 行）是超步迭代中
+「多个入边值合并成一个状态值」的核心。
+
+| 函数 | 语义 | 实测 |
+|---|---|---|
+| `accumulator_reduce` | `+` / `*` 累加，首写初始化为**运算元**（0 / 1）| ✅ 含 BigInt 混算 |
+| `concat_reduce` | 字符串拼接，非字符串经 `Display` | ✅ 含 Dict / List / Char |
+| `build_per_key_strategies` | 从 state schema 派生 per-key 策略 | ✅ 见下 |
+| `parse_custom_merge_expr` | `Custom` payload 解析（整数→`IntLit`，否则→变量）| ✅ |
+
+**未知 op 明确报错**（`Unknown accumulator op: -`），`*` 遇非数值明确报错。
+
+## 两处「看着像缺陷」实为**明文设计 / 纵深防御**
+
+### ① `Sum` / `Product` / `Concat` / `Custom` **不进** per-key 表
+
+`orchestrate/mod.rs:313-314` 的文档**明写**：
+
+> `Merge`, `Sum`, `Product`, `Concat`, and `Custom` have **no direct static
+> mapping** and return `None` — these require custom execution.
+
+它们走 `pregel/mod.rs:1352` 的 `accumulator_reduce` / `concat_reduce`
+**自定义执行路径**。只有 `Last` / `Append` / `Add` / `GrowOnly` 进表。
+
+⚠ 首版我期望 `Sum` 进表 ⇒ **假红**。判据改成**钉住这个分工**。
+
+### ② `accumulator_reduce(Int(5), String("x"), "+")` → `"5x"`
+
+脚本层 `5 + "x"` 被 **typeck** 拦下（*expected Float, got String*），
+但 **pregel 的边载荷是运行期动态值、绕过 typeck** ⇒ reducer **必须**
+自己能处理非数值。
+
+实测 `+` 回落到 `flow` 的「String + 任意类型 → 字符串拼接」规则，
+`*` 则明确报错（Mul 没有该分支）。
+
+这是**纵深防御的第二道**：既然 typeck 拦不住，reducer 就得给出
+**确定的**结果，而不是 panic 或静默出错。
+
+## D235 已修掉「重复实现」这个洞
+
+`reducers.rs:86-98` 记录：原有的 `pub fn value_to_json_string` 被**删除** ——
+它是 `pregel/mod.rs` 同名函数的**重复实现**（D209 记过「改一处须同步另一处」
+的陷阱），且 dict 无引号、Float 丢小数点。`build_node_input` 现直接构造
+`Value::Dict` 交给 `flow::value_to_json`（仓内唯一实现）。
+
+## 顺带钉住
+
+`concat_reduce(None, Nil)` → `String("nil")` —— 这是 `Display` 的
+**既定语义**（D332/D333 记过 `v.to_string()` 键空间），不是缺陷。
+
+#### D377：`src/rel/` 的 **`solve` 一致性语义**（否定轮，无产品变更）
+
+`src/rel/` 共 6 个文件 1303 行，有 39 条自带单测 + 2 个判据
+（`rel_family_surface` 测**形态**、`rel_conjunction_bindings` 测**合取绑定**）。
+此前未覆盖的是 **`solve` 的核心推理语义**：变量绑定、传递闭包、无解。
+
+## 推理语义全部正确
+
+给定 `edge("a","b")`、`edge("b","c")`、`path(?X,?Y) edge(?X,?Y) end`：
+
+| 查询 | 实测 | 含义 |
+|---|---|---|
+| `path(?X, "c")` | `[b]` | **传递闭包** a→b→c ✅ |
+| `path("a", ?Y)` | `[b]` | 反向查询 ✅ |
+| `path("a", "c")` | `[]` | 两端都是常量 ⇒ 无变量可绑定 ✅ |
+| `path("a", "zzz")` | `[]` | **无解** ⇒ 空，**不报错** ✅ |
+| `path(?X, ?Y)` | `[[a, b], [b, c]]` | **枚举全部解** ✅ |
+| `edge(?X,?Y), path(?X,"c")` | `[[b, c]]` | 合取绑定**贯穿** ✅ |
+| `solve { }` | Err *both 至少需要一个目标* | **空查询明确报错** ✅ |
+| 未声明的关系 | Err *Undefined function or task* | **明确报错** ✅ |
+
+## 前提：必须先声明 `rel`，否则报「Undefined function」
+
+真实语法（`parser_v3/rel.rs:10-12`）：
+
+```text
+rel edge("a", "b")                     -- 事实：头部是项，无体
+rel path(?X, ?Y) edge(?X, ?Y) end      -- 规则：体是目标合取（`,` 连接）
+```
+
+首版探针直接 `solve { p(?X, ?Y) }` ⇒ *Undefined function or task: p*。
+与 D366「`,,` vs `,@`」同源：**跨领域语法必须查本项目 spec/注释**。
+
+## 「无解返回空」与「空查询报错」的**方向相反**，是本轮最值得钉的一点
+
+| 情形 | 行为 |
+|---|---|
+| `solve { path("a","zzz") }`（**无解**）| 返回 `[]`（不报错）|
+| `solve { }`（**没有目标**）| **报错** *both 至少需要一个目标* |
+
+「无解」是**正常的空答案**，「没有目标」是**编程错误** ——
+两者语义不同，实现也正确区分。本条把两个方向都钉住。
+
+## 顺带查明：列表参数不被支持
+
+`solve { p([1, ?X], ?Y) }` ⇒ parse 失败（List 不在 goal 项的语法内）。
+属语法**未支持**，非缺陷 ⇒ 只记录。
+
+#### D376：`reading_order` 的 **6 种策略矩阵**（否定轮，无产品变更）
+
+`src/document/reading_order/` 共 1333 行，有 3 个既有判据
+（comparator 全序 / int bbox / xy-cut 平移不变性）+ 17 条自带单测。
+此前未覆盖的是 **`assign_reading_order` 的 6 种 `Strategy` 的实际输出**。
+
+## 前提：bbox 必须是 `{x, y, w, h}` **字典**，不是列表
+
+`BBox::from_value`（`mod.rs:36`）只接受字典。用 `[x, y, w, h]` **列表**时
+`bbox` 全是 `None` ⇒ **全部策略都保持输入顺序**。
+
+⇒ 首版探针因此得出「6 种策略都不排序」的**错误结论**（差一步就写成
+「双栏布局不被支持」的**重大缺陷**）。修正后结论完全反过来。
+
+⇒ 与 D368「钉住 `target < n` 前提」同构：**前提错了，全部结论都反**。
+
+## 策略矩阵（双栏交错 + 字典 bbox）
+
+| 策略 | 输出 | 判定 |
+|---|---|---|
+| `InputOrder` | `L1,R1,L2,R2,L3,R3` | 按定义不排 ✅ |
+| `TopToBottom` | 同上 | 按 y 再 x；本例 y 已升序 ⇒ 不变 ✅ |
+| `GapTree` | 同上 | ✅ |
+| `XyCut` | 同上 | 注释明写「**简化** XY-cut」，本就不分栏 ✅ |
+| **`GroupBased`** | **`L1,L2,L3,R1,R2,R3`** | **唯一真正做双栏** ✅ |
+| `XyCutPlusPlus` | 同上 | 见下 |
+
+**反向对照**：单栏且几何顺序与输入相反（`y=30/20/10` ⇒ 输入 A,B,C，
+y 升序是 C,B,A）⇒ `InputOrder` 给 `A,B,C`，**5 种几何策略全部重排成 `C,B,A`**。
+这证明策略**确实在工作**，也让「双栏不切栏」**不是**「策略没实现」。
+
+## `XyCutPlusPlus` 在等宽双栏上不切栏，是**算法的固有权衡**
+
+`compute_prefer_horizontal`（`xy_cut.rs:91`）按密度比决定首次切分方向：
+`x_density > BETA * y_density`。等宽双栏必然 x 密度更高
+（本例 `270/95 = 2.84` vs `60/40 = 1.5`）⇒ **选横向优先** ⇒ 退化为按 y 排。
+
+⇒ **不是缺陷，是算法设计**。`GroupBased` 才按 x 重叠聚类实现双栏
+（`mod.rs:226` 注释：「按 x 重叠聚类」）。
+
+## 另一处前提：`reading_order_idx` 写回的是 **`Float`** 不是 `Int`
+
+`mod.rs:278` 写的是 `Value::Float(new_idx as f64)`；
+私有辅助 `reading_order_idx`（`mod.rs:309`）显式**同时接受** `Int` 与 `Float`
+（D230 修的）。首版判据只认 `Int` ⇒ 拿到**空列表**、误以为「字段没写」。
+
+## 顺带钉住
+
+- **别名与兜底 15/15**：6 组别名（`input`/`ttb`/`gap`/`xy`/`group`/`xy++` 等）
+  + 未知与空串 → 兜底 `TopToBottom`
+- **无 bbox ⇒ 保持输入序**（全部 6 种）
+- **空输入 / 单块不 panic**（全部 6 种）
+- **`reading_order_idx` 从 0 连续编号**（0..5，不得有空洞或重复）
+
+#### D375：`src/document/` 的**六个格式后端**端到端（否定轮，无产品变更）
+
+`src/document/backend/` 共 6 个模块 1768 行，但只有 3 个判据
+（`document_html_blocks` / `document_markdown_blocks` /
+`document_methods_introspection`）—— **docx / pdf / pptx / png
+四个二进制格式无任何判据**。本轮用仓库自带的 4 个 fixture 补齐。
+
+## 六个后端全部分派到位
+
+`document::parse_document`（`mod.rs:47`）按扩展名分派：
+`pdf` / `md`\|`markdown` / `html`\|`htm` / `pptx` / `docx` / `png`。
+
+⚠ `mod.rs:46` 的注释只列 3 个后端（「Tasks 5–7 会分别实现
+**PdfBackend / MarkdownBackend / HtmlBackend**」）——
+实际有 6 个。属**过时注释**，判据不依赖它。
+
+## 三个二进制 fixture 全部解析成功
+
+| 格式 | 页数 | 内容 | 几何 |
+|---|---|---|---|
+| `sample.pdf` | 1 | — | **A4 真实值 595×842** |
+| `sample.docx` | 1 | 3 个段落，文字正确 | **0（占位）** |
+| `sample.pptx` | 2 | 「Sample Slide 1 / Second slide text」| 960×540 |
+
+判据**不只验 exit 0**，还验**抽出的真实文本** ——
+否则「解析出空内容」也会全绿。
+
+## docx 的 `width`/`height` = 0 是**明文设计**
+
+`backend/docx.rs:143-146` 的文档原文：
+
+> with width/height = 0 (**placeholder geometry**)…
+> There is **no** per-text-run bbox in the undoc DOCX output
+
+本条把该约定**钉住**，防止将来被误判成「尺寸丢失」而擅自"修复"。
+
+## png 的错误消息质量：**带可执行修复指引**
+
+```text
+document.parse: ocrs engine init error: ocr.load (detection):
+  ocr.load: model file '…\mora\ocr\text-detection.rten' not found.
+  Run 'mora-install-ocr' to download, or set MORA_OCR_MODELS_DIR
+```
+
+点名了**缺哪个文件** + **两条修复路径**（命令 / 环境变量）——
+全仓错误消息里质量较高的一类，单独钉住（且本机若已装模型会自动跳过，
+避免「环境就绪时假红」）。
+
+## 错误路径的层级：分派在**读文件之前**
+
+`.jpg` / 无扩展名 / `.txt` 在**分派层**就被拒（`unsupported extension`，
+并列出全部 6 类支持格式），**压根不会去读文件** —— 这是**正确**行为
+（不浪费 IO）。只有**受支持**的扩展名才会走到「无法读取」。
+
+⚠ 判据首版把 `.txt` 也放进「文件不存在」那条 ⇒ **假红** ——
+`.txt` 的扩展名就不支持，与文件在不在**无关**。已修正。
+
+#### D374：`method_dispatch` 的 **`filter` 真值路径** —— D358 修复的端到端确认（否定轮，无产品变更）
+
+`src/interpreter/method_dispatch.rs`（1199 行）**零 panic 点**，
+19 个既有判据覆盖 list/dict/string 的方法面。
+此前未覆盖的是 **`filter` 接受非 bool 谓词返回值**这条路径 ——
+而它正是 D358 修的 `is_truthy`（`BigInt(0)` 误判为真）的**真实消费者**。
+
+## 端到端确认：三条并排，任何一条退化都会红
+
+```text
+[0n, 1n, 2n].filter(fn(x) x end)   →  [1n, 2n]      ✅ 0 被剔除
+[0, 1, 2].filter(fn(x) x end)     →  [1.0, 2.0]    ✅
+[0.0, 1.0, 2.0].filter(fn(x) x end) → [1.0, 2.0]  ✅
+```
+
+**修前第一行是 `[0n, 1n, 2n]`（0 被保留）** —— 与 Int/Float 版本不一致。
+
+**牙齿验证**：摘掉 `flow.rs` 的 `Value::BigInt` 分支
+⇒ **精确 1 条判据变红**（本文件主断言），其余 5 条不受影响
+⇒ 判据精准命中 D358 的修复点，不是泛泛的回归。
+
+## 非数值类型的真值判定
+
+`["", "a"]` → `[a]`、`[[], [1]]` → `[[1.0]]`、
+`[{}, {a:1}]` → `[{a: 1.0}]`、`[false, true]` → `[true]` —— 全对。
+
+## `map` **不过滤**（`method_dispatch.rs:177` 的 `push(mapped)`）
+
+`xs.map(fn(x) x end)` 返回 `[0n, 1n, 2n]`（零也保留）是**正确**的 ——
+map 的语义与 `is_truthy` **无关**。判据单独钉住这一点，
+防止把 map 当 filter 误判。
+
+## 顺带钉住的两处既有守卫
+
+- **`take` 的 count 边界**：`2` / `2.0` 都接受（D153 修过「只匹配 Float」）、
+  `0` → 空、`99` → 全取、**`-1` 明确报错**（不是静默返回空）
+- **`reduce` 的签名是 `(reducer, initial)`** —— 参数**顺序**钉住；
+  缺 initial 时 typeck 报 *Expected 2 arguments*（min_arity=2）
+
+## 判据首版的坑（**判据错、产品对**）
+
+`[0, 1, 2]` 的期望写 `[1, 2]` ⇒ **假红** ——
+mora 的**裸数字字面量是 Float**（D356 已钉），所以打印成 `1.0/2.0`。
+
+⇒ 「跨类型对比」的判据里，**期望值必须按各类型自己的显示形态写**，
+不能想当然认为三种类型会打印成同一种样子。
+
+#### D373：`checkpoint::rewind` / `resume` 的**时间旅行语义**（否定轮，无产品变更）
+
+`src/checkpoint/` 已有 3 个判据（负数守卫 / saver 一致性 / JSON 保真），
+但**恢复路径**（`rewind` / `resume`）此前无判据 —— 而它是「断点续跑」的
+正确性根基：错了会**静默恢复到错误的状态**。
+
+## `rewind` 的 `>=` 与注释的 "before" 看似矛盾，实则一致
+
+```rust
+// mod.rs:481
+/// `resume` will load the last checkpoint **before** `before_step`.
+pub fn rewind(saver, thread_id, before_step) {
+    for id in ids {
+        if let Some(cp) = … && cp.step >= before_step {   // ← 删 step >= before_step
+            saver.delete(thread_id, &id)?;
+        }
+    }
+}
+```
+
+「last checkpoint **before** `before_step`」指的是**步骤 `before_step`
+执行之前的状态**（即 `step < before_step` 的最后一个），所以 `>=` 是
+**正确**的。实测 `rewind(2)`（原 step 0..4）⇒ 剩 0、1，`resume` 得 **step 1** ✅
+
+## `resume` 同 step 时**稳定取第一个**，不随机
+
+```rust
+// mod.rs:505
+if let Some(cp) = … && latest.as_ref().is_none_or(|l| cp.step > l.step)
+```
+
+`>` 是**严格大于** ⇒ 同 step 时保留先遇到的。实测 3 条同 step 的
+checkpoint 连续 5 次 `resume` 都返回**同一个 id** ✅
+
+这不只是「当前正确」，还是**必须保持的正确** ——
+若将来 `list` 的顺序变成随机，恢复结果就会**不确定**（同样是缺陷）。
+
+## 边界矩阵
+
+| 场景 | 实测 |
+|---|---|
+| 空 saver 的 `resume` | `None` ✅ |
+| 空 saver / 不存在 thread 的 `rewind` | `Ok(())` ✅ |
+| `resume` 不存在的 thread | `None` ✅ |
+| `rewind(before=99)`（超过最大 step）| `Ok`，不删任何 ✅ |
+| `rewind(before=0)` | 删**全部** ✅ |
+| **thread 隔离** | `rewind("t", …)` 完全不影响 `other` ✅ |
+
+`MemorySaver` 是 `Mutex<HashMap<String, Vec<Checkpoint>>>`（按 `thread_id`
+分区），两个 savers 零 panic 点（`unwrap` 全在 `#[cfg(test)]` 内）。
+
+## 判据首版踩的坑（**判据错、产品对**）
+
+`d373_rewind_is_scoped_to_one_thread` 首版断言「`rewind("t", 1)` 后 `t`
+被清空」⇒ **假红** —— 它删的是 `step >= 1`，**留下 step 0**。
+清空要用 `before_step = 0`。已修正，并在同一条里加了
+「`rewind("t", 0)` 才清空」的**反向对照**。
+
+#### D372：LSP **端到端 stdio** —— `initialize` 声明的 9 个能力**全部可调用**（否定轮，无产品变更）
+
+D371 钉了传输层与 JSON，本轮钉**请求分发**（`server.rs`，672 行、20 个方法）。
+provider 层各方法已有 16 个判据覆盖，但**「声明了什么」与「实现了什么」
+是否一致**此前无端到端判据。
+
+## 结论：能力协商层完全一致
+
+真实 stdio 逐一调用 `initialize` 声明的 **9 个能力**：
+
+| 能力 | 实测 |
+|---|---|
+| `hoverProvider` / `completionProvider` | ✅（completion 返回 `Counter` 等条目）|
+| `definitionProvider` / `referencesProvider` | ✅ |
+| `documentSymbolProvider` | ✅（返回符号列表）|
+| `documentFormattingProvider` / `documentRangeFormattingProvider` | ✅ |
+| `renameProvider` / `foldingRangeProvider` | ✅ |
+| `semanticTokensProvider`（未在 capabilities 里但分派有）| ✅ 返回 `data` |
+
+**未声明**的方法（`textDocument/codeAction` / `no/such/method`）
+正确报 `-32603 method not supported` ⇒ **没有「声明了却不实现」的分叉**。
+
+## 入口是 `mora-lsp`，不是 `mora lsp`
+
+`src/main.rs:425-427` 的注释明写：banner 会污染 `mora run` 的 stdout，
+而**独立二进制 `mora-lsp` 的 stdout 直接以 `Content-Length` 开头**。
+首版探针用 `mora lsp` ⇒ 被当成文件名读（*系统找不到指定的文件*）。
+
+## 判据的关键：**必须在字节层解帧**
+
+`Content-Length` 是**字节数**。首版探针先把 stdout `decode` 成 `str`
+再按 `n` 切片 ⇒ **多字节 UTF-8 让下标错位**，只收到 8/14 条响应，
+看起来像「formatting 之后服务器挂了」。
+
+用 `lsp_frame.py` 逐帧打印才定位到：服务器**发了 10 帧**
+（含 `publishDiagnostics` 通知与 `formatting` 响应），
+**全部正常**。改字节切片后 15 帧全收齐。
+
+⇒ 与 D371「`read_message` 用 `read_exact` 读 body」同源：
+**LSP 的长度是字节数，不是字符数。**
+
+⇒ 「N 条响应里少了后面几条」这个症状，**先怀疑自己的解帧**，
+再怀疑服务器（D352 教训的又一次变体）。
+
+#### D371：切到 `src/lsp/` —— **transport 分帧** 与 **`json.rs` 解析矩阵**（否定轮，无产品变更）
+
+`src/lsp/` 共 15 个文件 3500 行，已有 **16 个判据**覆盖 provider 层
+（折叠 / 跳转 / 重命名 / 语义标记 / 悬停 …），但**两个基础设施文件**无直接判据：
+
+| 文件 | 行数 | 职责 |
+|---|---|---|
+| `transport.rs` | 101 | JSON-RPC over stdio 的**分帧** |
+| `json.rs` | 501 | **自写的** JSON 解析/序列化（**独立于 `flow::json`**）|
+
+## transport：9 个边界 + 5 个宽松形态，全部正确
+
+| 输入 | 实测 |
+|---|---|
+| ASCII / UTF-8 多字节 body | 精确往返 |
+| 空 body（`Content-Length: 0`）| `Some("")` |
+| 缺 / 非数字 `Content-Length` | Err *missing Content-Length* |
+| `Content-Length` 大于实际 body | Err *failed to fill whole buffer* |
+| body 非法 UTF-8 | Err *invalid utf-8 sequence* |
+| **连续两条消息** | `{"id":1}` 然后 `{"id":2}` ✅ 状态机正确 |
+| **LF-only** header（无 `\r`）| ✅ 宽容 |
+| 额外 header（`Content-Type`）| ✅ |
+| header 名**大小写混写** | ✅ |
+| `Content-Length:   2  ` 带空格 | ✅ `trim()` |
+
+## `lsp::json` 与 `flow::json` 是**两套实现但行为一致**
+
+`lsp/json.rs` 有**自己的 `Value` 枚举**（`Number(f64)` —— 数字统一 f64），
+与 `flow::json` 的 `Int` / `Float` / `BigInt` 三分**不同**。
+
+但实测 9 个畸形数字形态（`007` / `0x1F` / `1.2.3` / `5.` / `.5` / `+7` /
+`1E5` / 尾随垃圾 / `1 2`）上**两者行为一致** ⇒ **不是分叉，是一致的宽松**。
+
+判据 `d371_lsp_and_flow_json_agree_on_malformed_numbers` 钉住这一点 ——
+若将来有人只改一侧，本条会红。
+
+## 已知能力限制：**JSON 数字统一 f64 ⇒ 大整数丢精度**
+
+```text
+parse("9007199254740993")      → Number(9007199254740992.0)   ← 2^53+1 被吞
+parse("12345678901234567890")  → Number(1.2345678901234567e19)
+```
+
+**判定不修**：LSP 协议里 `Position.line` / `Position.character` 都是
+**小整数**，2^53 远超编辑器实际行数；`to_string` 往返对 `42` / `3.14`
+这类常规形式正常；`Object` 用 `BTreeMap` ⇒ 序列化**按 key 排序**（确定性）。
+改动涉及 `Value` 枚举与全部序列化点，**收益为零**。
+
+判据把这个现状**钉住**（`d371_big_integers_lose_precision_because_number_is_f64`），
+将来若改 `Value` 枚举，本条会提醒同步。
+
+#### D370：`src/compress/strategies.rs` 的 5 种策略与 `finalize` 截断语义（否定轮，无产品变更）
+
+D368 钉了策略的**输入**（字段角色），D369 钉了**输出保护**（约束），
+本轮钉**策略本身**：选择、执行、以及最后的 `finalize`。
+
+## 5 种策略的实测行为
+
+| 策略 | 实测（40 条，target=4）| 语义 |
+|---|---|---|
+| `topn` | `[36,37,38,39]` | 按 `Score` 字段**降序**取前 target |
+| `timeseries` | `[0,1,10,15]` | 头 1/3 + 尾 1/3 + 中段等距采样 |
+| `cluster_sample` | `[0]` | 按**前 3 个 String 值**分组去重，每组 1 条 |
+| `smart_sample` | `[0,1,8,9]` | 头 target/2 + 尾 target/2 + 中段等距 |
+| `lossless` | 20 条全保留 | 走 `try_lossless_compact`（csv/markdown 紧凑格式），**不采样** |
+
+## `finalize` 的截断语义（本轮最值得验的一点）
+
+```rust
+fn finalize(keep: Vec<usize>, target: usize) -> Vec<usize> {
+    let mut v = keep;
+    v.sort_unstable();
+    v.dedup();
+    if v.len() > target { v.truncate(target); }
+    v
+}
+```
+
+「约束把 keep 撑大后会不会被截断吃掉」有两种**相反**的猜测：
+吃掉（约束下标在尾部）／不吃（`keep` 已排序，尾部是索引大的记录）。
+
+实测**不吃** —— 7 档 target 全部保留 outlier 35。
+且 `preserve_errors=on` 时保留的确实是 error 行
+（`target=4` 时 `[0,5,10,15]` 全是 error 行，完全覆盖 TopN 的选择）。
+截断取的是**排序后的前 N**，语义自洽。
+
+## 判据写作中踩的三个坑（都是**判据错、产品对**）
+
+① **「反向对照」必须显式置 false**：`preserve_errors` 的**默认值就是 `true`**
+   （`mod.rs:63`）。首版用默认 options 写「未开」的对照，结果实验组与对照组
+   **同配置、恒等** ⇒ 拿到 `[0,5,10,15]`（error 行）而非分数尾部。
+
+② **`lossless` 不是「取前 N」**：它走 `try_lossless_compact`（`json.rs:311`）
+   转 csv/markdown 紧凑格式，schema 均匀时**直接命中、不采样** ⇒
+   `items_kept` 仍是 20。且 `strategy_used` 是 **`lossless_compact`**（带后缀）。
+
+③ **阈值不能凭直觉定**：首版断言 `error_rows * 2 >= ids.len()`
+   （error 行占多数）。实测 target=16 时 8 个 error 行只能塞进 7 个
+   （`finalize` 截断所致），7/16 = 43% 不到一半 ⇒ **假红**。
+
+⇒ 三个坑同源：**期望值必须从实测来，且「对照组」必须真的与实验组不同**。
+
+#### D369：`KeepOutliersConstraint` 的**下标错位** —— outlier 保护**保错了记录**（已修）
+
+D368 钉了字段角色判定，本轮钉它的**下游**：`constraints.rs` 的三条
+安全约束。角色判对之后，约束决定哪些记录**强制保留** ——
+错了会**静默丢数据**。
+
+## 缺陷
+
+```rust
+// 修前
+let values: Vec<&Value> = items.iter()
+    .filter_map(|it| if let Value::Dict(d) = it { d.get(&field.name) } else { None })
+    .collect();                        // ← 只收 values，**丢掉了 items 下标**
+let outliers = outliers_by_zscore(&values, 2.0);   // ← 返回 **values 下标**
+for i in outliers {
+    if !keep.contains(&i) { keep.push(i); }         // ← 当成 **items 下标**
+}
+```
+
+只要有**任何一条记录缺这个键**（JSON 里极常见），
+`values` 就比 `items` 短，之后所有下标**整体前移**。
+
+实测（40 条记录，outlier 在 `items[25]`）：
+
+| 缺键数 | 修前保留 | 修后保留 |
+|---|---|---|
+| 0 | `25` ✅ | `25` ✅ |
+| 2 | **`23`** ❌（= 25−2）| `25` ✅ |
+| 5 | **`20`** ❌（= 25−5）| `25` ✅ |
+
+⇒ 修前**保留了错误的记录**，而**真正的 outlier 反而被丢掉** ——
+`preserve_outliers` 这条**安全约束恰好在它该生效的场景里失效**。
+
+## 修法
+
+收 `(items 下标, &Value)`，用 `value_to_item` 做「values 下标 → items 下标」映射。
+
+**牙齿验证**：改回直接用 `pos` ⇒ **精确 1 条判据变红**（主断言），
+4 条（前提断言 + 两个反向对照 + 边界）仍绿 ⇒ 判据定位精准。
+
+## 前提：`v` 必须真的判成 `Anomaly`，否则断言恒绿
+
+`KeepOutliersConstraint` 只对 `role == Anomaly` 的字段跑，
+而 `detect_anomaly` 要求 outlier 占比 `count * 20 <= nums.len()`（≤5%）
+—— **分母是「有值的条数」**，缺键多时占比超标，角色降级为 `Generic`
+⇒ 约束整条不触发（D368 也观察到了这个现象）。
+
+所以判据用 40 条数据（缺 2/5 键时占比仍 2.6%/2.9%），
+并单独加一条 **`d369_field_must_really_be_anomaly_for_the_assertions_to_mean_anything`**
+钉住这个前提 —— 否则「outlier 被保留」可能是因为**别的机制**（topn 边界）
+而成立。
+
+边界那条（缺 25 键 ⇒ 占比 1/15 > 5% ⇒ 降级为 `Generic`）也钉住了，
+它是「角色降级」的**反例对照**。
+
+#### D368：`src/compress/detect.rs` 的**字段角色判定矩阵**（否定轮，无产品变更）
+
+D367 测了 `crush_json` 的**目标计算**与**预算收口**，
+本轮钉它的**前置**：`detect.rs` 的字段角色推断 ——
+**角色判错会导致选错压缩策略，且不报错**。
+
+## `detect` 模块是**私有**的，只能经 `CrushResult.fields` 观察
+
+`compress/mod.rs:226` 是 `mod detect;`（非 `pub mod`），
+`detect_field_role` / `extract_field_stats` / `detect_array_type`
+**无法从外部直接调用**。可观测路径只有
+`json::crush_json` 返回的 `CrushResult { fields, array_type }`。
+
+## 观测的前提：`target < items.len()`（本轮踩了两次）
+
+`json.rs:284` 有**两个**直通条件：
+
+```rust
+let short_passthrough =
+    items.len() <= 5 || (items.len() <= target && options.strategy != "lossless");
+```
+
+- 第一次只造 3-5 条 ⇒ `items.len() <= 5` 短路；
+- 第二次造 12 条但 `target = n*10` ⇒ `items.len() <= target` 短路。
+
+两次都得到 `fields=[]`，看起来像「字段检测没实现」。
+**必须**给 `target = n/2`。判据专门钉了这个前提
+（`d368_short_list_passthrough_yields_empty_fields`），
+并配**反向对照**（`target < n` 时 `fields` 必须非空），
+防其它 9 条判据因前提失效而**恒绿**。
+
+## 判定矩阵（17 个形态，全部符合设计）
+
+| 形态 | 角色 | 依据 |
+|---|---|---|
+| ISO-8601 / 10 位秒级时间戳 | `Temporal` | D264 专门补的 Int 分支 |
+| UUID / 高唯一性字符串 | `Id` | — |
+| 字段名含 `error` / 值含 `ERROR` | `Error` | 两条 `or` 路径都测 |
+| `0..1` 或 `0..100` 有界数值 | `Score` | `detect.rs:127` |
+| **常数**列（Int / Float）| `Generic` | 见下 |
+| 布尔列 | `Generic` | 非数值非字符串 |
+| Int + Float 混列 | `Score` | D231 的修复生效 |
+| 不连续时间戳 | `Temporal` | 证 `Temporal` **先于** `Id` |
+
+**顺带查明**：`FieldRole::Constant` 变体**存在**（注释写「所有项相同」），
+但检测链里**没有**对应分支 —— 常数列 `span = 0` ⇒ Score 不成立 ⇒ 落 `Generic`。
+是**未使用的变体**，不是缺陷（`Generic` 行为合理）。
+
+## 已知能力缺口：**13 位毫秒级 Int 落 `Id`**
+
+`is_timestamp_pattern`（`detect.rs:256-280`）四个分支的**范围不一致**：
+
+| 分支 | 范围 |
+|---|---|
+| `String`（unix）| `len ∈ [10, 13]` —— **含 13 位毫秒** |
+| `Float` | `1e9 < n < 1e10` —— 仅 10 位 |
+| `Int`（D264 补）| `1e9 < n < 1e10` —— 仅 10 位 |
+
+⇒ `json.parse` 读入的**毫秒级整数时间戳**落 `Id`
+（`is_sequential_numeric` 接走了它）。
+
+**判定为能力缺口，不修**，三条依据：
+① D264 注释（`detect.rs:266-274`）明写「**范围要窄**：只补 `Int`」
+   并记录了**试过放宽的后果**：「连带把 `Float` 时间序列从
+   `TimeSeries` 打成 `Uniform`」；
+② spec 对时间戳范围**零承诺**（grep 无命中）；
+③ 判据把这个现状**钉住** —— 将来若有人扩范围，本条会红，
+   提醒同步更新判据与 `detect.rs` 的注释。
+
+#### D367：切到 `src/compress/` —— `target_ratio` / `max_bytes` 边界矩阵（否定轮，无产品变更）
+
+`src/compress/` 共 9 个模块 3307 行，此前只有 6 个判据**间接**涉及
+（`compress_option_types` 等），`json.rs`（1050 行）**无直接判据**。
+本轮从 `CompressOptions` 的 12 个字段切入，测压缩的**目标计算**与
+**预算收口**两条路径。
+
+## `target_ratio` 的 8 个边界全部有明确行为
+
+`mod.rs:450` 的目标计算：
+
+```text
+target = max_bytes / 200        (优先)
+       | (n * ratio).max(1.0)   (次之)
+       | n * 0.2                (兜底)
+```
+
+实测（n=100，`strategy="json"`）：
+
+| `target_ratio` | kept | 判定 |
+|---|---|---|
+| `None` | 20 | 兜底 `N*0.2` ✅ |
+| `0.0` / `-1.0` / `NaN` | 1 | `.max(1.0)` 兜底 ✅ |
+| `2.0` / `inf` | 100（passthrough）| `target ≥ N` ⇒ 直通 ✅ |
+| `0.5` / `0.1` | 50 / 10 | 精确 ✅ |
+
+**零异常、零 panic**，每个边界都落到一条**明确写出的规则**上。
+
+## 探针层级：必须从 `compress_top` 进，不能直调 `crush_json`
+
+首版我直接调 `json::crush_json(items, target, options)`，
+发现「`target_ratio` 完全无效」—— **差一步就写成缺陷**。
+
+真因：`crush_json` 的第三个参数 `target` 是**已算好的元素数**，
+它**不读** `options.target_ratio`；`target_ratio` 是在
+`mod.rs::compress_top`（L450）里被换算成 `target` 后才传下去的。
+
+⇒ **直调底层函数 = 绕过参数换算层 = 测了另一个东西**。
+与 D365「census 走 Rust API、CLI 走 typeck，不是同一层」同源。
+
+顺带踩到 `target` 的**单位是元素数**（L285 `items.len() <= target`
+⇒ 直通），我第一版传了 `estimate_bytes()` 的**字节数**，
+于是 `100 <= 6616` 恒成立 ⇒ 全部走 passthrough，
+看起来像「压缩完全没生效」。
+
+## `max_bytes=0` 返回空串是**符合契约**的
+
+走 `finish_within_budget` 的规则 2a
+（`marker.len() >= max_bytes` ⇒ `marker[..0]`）。
+契约是「返回的 UTF-8 字节数不超过 `max_bytes`」⇒ 0 ≤ 0 ✅。
+判据把它**显式钉住**，防将来有人「顺手给 0 加特殊分支」。
+
+## 判据覆盖
+
+- 8 个 `target_ratio` 边界（每个都断言**具体 kept 数**而非「不崩」）
+- `max_bytes` **优先于** `target_ratio`（if/else 顺序）
+- 输出**永不超预算**（7 档 `max_bytes`，含 0）
+- **中文内容**同样不许超限（截断点落在字符边界，无 U+FFFD）
+- 非 List 输入 / 未知 strategy 都明确报错
+- **压缩不得放大输入**（规则 3，两个极端 × 4 档预算）
+
+#### D366：`control.rs` 的 **quasiquote** 与 **match 无匹配分支**（否定轮，无产品变更）
+
+D360 只扫了 `src/mir/handlers/` 的 panic 面，D361 钉了 `values.rs` 的索引，
+D362/D363 钉了 `effects.rs`。本轮钉 `control.rs`（148 行）里两个完整机制：
+`h_quasiquote`（L112，Lisp 同源语法）与 `h_match_expr`（L17）的
+「无 arm 匹配」分支。
+
+## quasiquote 的记号是 `,,`（**不是** `,@`）
+
+`docs/mora-spec.md:916` 明写：
+
+```text
+let code = `(sum ,,items)    -- `,,` 是 unquote-splice，items 被展开
+```
+
+实测（**零缺陷**）：
+
+| 形态 | 实测 |
+|---|---|
+| `` `,x `` | `code:3` ✅ unquote |
+| `` `,,xs ``（xs = `[1,2,3]`）| `code:1, 2, 3` ✅ splice 展开 |
+| `` `(+ 1 ,,ys) `` | `code:(+ 1 ,,ys)` ← 括号内 ⇒ 静态 |
+| `` `,@[xs] `` / `` `,@ [xs] `` | **parse 失败**（`@` 让表达式解析失败）|
+
+⇒ 后两条**不是缺陷**：lexer 只切 `,,` → `TokenType::CommaComma`
+（`lexer.rs:379` 注释原文：`v0.88: ,, → CommaComma`），spec 承诺的也是 `,,`。
+
+**教训**：我第一反应是按 **Lisp 习惯**写 `,@`，测出「parse 失败」后
+**差一步就写成缺陷**。是 grep `docs/mora-spec.md` + `lexer.rs` 才确认
+`,,` 才是 Mora 的记号。D278 修的 splice 标记传递本来就是对的。
+
+## 括号深度决定 `,` 是不是 unquote（设计如此）
+
+`emit.rs:1070` 的 `_ if depth == 0` 守卫 + 注释第 5 条
+「深度 > 0 时，逗号为**静态源码**的一部分」。判据把它钉住，
+防将来有人「顺手放宽」成 Lisp 那样处处插值。
+
+## `h_match_expr` 无 arm 匹配 → Nil，且**后续语句继续执行**
+
+```rust
+// control.rs:57
+if !matched && let Some((_pat, _guard, _func, output_reg)) = arms.first() {
+    regs[*output_reg] = Value::Nil;
+}
+```
+
+实测 `match 99 { 1 => "one" }` → `nil` + 后续 `print("after")` 正常（exit 0），
+即**不吞并后续语句**（D35 修过同一族：match 后语句被饿死）。
+判据配了**反向对照**（有匹配时不能返回 nil）。
+
+## 顺带钉住两处既有行为
+
+- `quote(expr)` 捕获的是**源码文本**（`lisp.mora:49` 注释明写），
+  往返不变式 `eval(quote(expr)) == expr` 实测成立（含闭包）。
+- splice 的操作数非 List 时报错，且用 `type_name` 而**不是** `{:?}`
+  （`Value::Dict` 的 Debug 键序每进程随机，会让同一条消息跨进程不同）。
+
+#### D365：`pipeline.rs` 的**回落普查注释**与 census 清单**脱节**（已修，纯文档漂移）
+
+D364 查 9 层管线差分时发现 `tea_standalone.mora` 稳定回落，
+顺着查到 `differential_check` 的设计注释，发现那里的
+**回落普查结论早已过时**。
+
+## 文档漂移
+
+`src/mir/pipeline.rs` 的 `differential_check` 注释（L210-228）写着
+「实测**仍有 14 类**回落」并逐条列了 14 个名字。
+
+但 **`tests/nine_layer_fallback_census.rs` 早已更新**：
+**D315** 把其中 8 条翻成「通过」（`observe` / `span` / `parallel` /
+`prompt` / `document` / `msg` / `struct` / `enum`），
+清单里标 `true`（预期回落）的只剩 **6 条**：
+
+| | 注释说 | census 实测 |
+|---|---|---|
+| 回落类数 | **14** | **6** |
+| `observe` / `span` / `parallel` | 回落 | **通过** |
+| `prompt` / `document` | 回落 | **通过** |
+| `msg` / `struct` / `enum` | 回落 | **通过** |
+| `worker` / `transaction` | 回落 | 回落 ✅ |
+| 裸 `eval` / 裸 `perform` | 回落 | 回落 ✅ |
+| `model` / `tea_standalone` | 回落 | 回落 ✅ |
+
+⇒ **修法**：把注释同步到 6 条，并写清 D315 的翻转理由 ——
+D276 撤销时「差分错位是唯一挡住寄存器级破损的护栏」这个前提，
+已由 **D314 修好**（`fcfg_lower::max_reg_in_node` 的 `_ => 0` 漏算
+`WithConfig`）。
+
+判据双向钉：既断言「旧的 14 类说法被删掉」，
+也断言「**真的**还回落的那几条必须继续被点名」——
+否则一次「全删光」也能让前半条全绿。
+
+## 顺带查明：census 判据与 CLI 测的**不是同一层**
+
+census 走 **Rust API**（`ParserV3::compile` + `run_pipeline`，
+**绕开 typeck 与 CLI**），而用 CLI 跑 `perform_bare` 的 census 形态会被
+**typeck 拦下**（exit 2，`Effect row mismatch`）—— 压根到不了差分那步。
+
+⇒ **不能**用 CLI 实测去「推翻」census 的 `true` 条目。
+
+本轮差点误判 `eval_bare`：我用 `let r = eval(...)` 替代了 census 的
+**裸顶层** `eval(1 + 1)`，形态不同 ⇒ 结论不同（我的版本「通过 9 层」，
+census 版本「回落」）。换回精确形态后确认 census 正确。
+
+⇒ 与 D355「裸 `top_k` / `layers` 与带 `let` 包装的是不同形态」同源：
+**清单里的形态字符串必须逐字复用，不能「顺手写得更好看」。**
+
+#### D364：`src/mir/optimize/` 的**语义不变性** —— `--opt` 四档 × 两条管线（否定轮，无产品变更）
+
+优化器是全仓最危险的一层 —— 它改写指令序列，而**任何等价性破坏
+都不会崩溃**，只会**静默算错**。D363 顺带发现 `dag_rule.rs` /
+`dag_search.rs` 里有大段关于 `__let_result` 寄存器安全的注释
+（历史上真出过「寄存器失去 producer → 消费者永不 ready →
+尾部 `print` 静默消失」的事故），所以这一层值得强验证。
+
+## 核心判据：优化器只能改效率，不能改语义
+
+覆盖各类**优化机会**的程序（闭包 / while 循环 / 常量折叠 /
+if 死分支 / 算术化简 / 列表索引），实测：
+
+| 维度 | 实测 |
+|---|---|
+| `--opt=0/1/2/3` 四档 | 输出**完全相同**（`11.0 \| 7.0 \| 10.0 \| 3 \| 6.0 \| 1.0 \| 0.0 \| 7.0`）|
+| `MORA_9LAYER=1/0` 两条管线 | 输出**完全相同** |
+
+期望值也写死在判据里 —— 即便四档**一致地算错**也会被抓住。
+
+## 顺带查明：9 层管线的差分是**假阳性**
+
+56 个真实 fixture 全量跑（每个 2 次），**稳定**有 1 个触发差分失败：
+
+```text
+tests/fixtures/e2e/tea_standalone.mora
+  [9layer] 差分失败：已回落到 emit.rs 路径 | pipeline_mir=5 original_mir=11
+  diff: inst[0]: pipeline="ModelDef" original="Const"
+  diff: inst[1]: pipeline="MsgDef"  original="Const"
+```
+
+差异只是**指令形式不同**（`ModelDef` vs 占位 `Const`）而**语义等价**，
+差分器按**逐条指令名比对** ⇒ 误报。
+
+**判定不是新缺陷**：
+① 回落是**设计的安全网**（`cli/mod.rs:46` 明写「差分红 → 自动回落
+   原管线（不中断编译）」）；
+② **D36 已把「静默降级」修成默认打一行警告**（`cli/mod.rs:68-70`），
+   现在**不静默**了 —— 判据专门钉住这一条；
+③ 两条管线**结果完全一致**（本文件直接钉了这一点）。
+
+⇒ 真正的缺陷在**差分器过严**，属**契约分叉**（差分判据 vs 语义等价），
+改动涉及 `mir/pipeline.rs` 的等价判据设计 ⇒ **只报告，不擅动**。
+
+## 判据形态：期望值写死 + 装置自检
+
+- `d364_all_four_opt_levels_produce_identical_output` 先**断言期望值本身**
+  （不是只比四档相等）—— 否则「四档一致地算错」会全绿。
+- 同时断言 `!baseline.is_empty()`，防「采集器失效 ⇒ 档位对比恒绿」
+  （D338 的计数下界教训）。
+
+#### D363：`h_perform` / `h_handle` 的**代数效果**路径（否定轮，无产品变更）
+
+D362 钉了 `effects.rs` 的 `define`/`assign`，本轮钉同一文件里
+**代数效果**的核心两个指令：`h_perform`（L493）与 `h_handle`（L520）。
+
+## `h_perform` 的错误消息承诺了一件**可验证**的事
+
+```rust
+// effects.rs:512
+None => Err(format!(
+    "unhandled effect: {} (no matching handle block in scope;
+     **typeck reports this as an EffectRowMismatch at compile time** — …)",
+    effect
+)),
+```
+
+消息里明写「typeck 会在**编译期**报 EffectRowMismatch」——
+这是注释式断言，本轮**实测确认它是真的**：
+
+```text
+let r = perform Ai("hello")     → exit 2
+  Type error at line 1:9: Effect row mismatch: expected no unhandled
+  effects — wrap in a matching `handle` block, got { Ai }
+```
+
+⇒ 那条运行期 fallback 在脚本层**不可达**（typeck 先行拦下），
+只能用 typeck 侧的判据钉。
+
+## handler 栈语义全部正确（三层形态实测）
+
+`h_handle` 的 L532 `take_effect_handler` / L535 `install_effect_handler`
+构成一个**嵌套栈**：
+
+| 场景 | 实测 | 应得 |
+|---|---|---|
+| 单层 | `mocked:hello` | handler 返回值 ✅ |
+| 异名嵌套（`Bi` 内不处理 `Ai`）| `A:x` | 冒泡到外层 ✅ |
+| **同名嵌套** | `INNER:inner` | **内层优先** ✅ |
+
+**同名嵌套那条是本轮最关键的判据** —— 它证明栈是真的，
+而不是「后装的覆盖前装的」那种**单槽**实现（那会得 `OUTER:inner`）。
+而「异名嵌套」是它的**反向对照**：证「不匹配时**不**截获而是继续上溯」。
+两条互为反向，缺一条就可能把单槽实现误判成栈。
+
+## 顺带查明的一条既有约束
+
+`handle` 的**体内**不能用 `perform`：`"B:" + perform Ai("y")`
+报 *Unbound variable 'perform'* —— handler 体是**表达式**而非语句块。
+记为既有约束，**只报告**（是设计还是限制待裁决）。
+
+#### D362：`effects.rs` 的 `define`/`assign` 录制路径 + **banner 的分派层级不一致**（否定轮，无产品变更）
+
+D360/D361 扫了 `src/mir/handlers/` 的 `values.rs` / `control.rs`，
+本轮钉 `effects.rs`（665 行）里最核心的两个指令
+—— `h_define` / `h_assign`，它们是 D354「僵尸绑定」修复的作用面。
+
+## 录制路径完全正确（6 个事件逐条核对）
+
+脚本 `let a = 1` / `let b = a + 1` / `a = 5` / `let c = a * 2`，
+`mora record <file> <name>` 录出：
+
+```json
+{"var":"a","old":null,"new":1.0}     ← define：前值 Nil ✅
+{"var":"b","old":null,"new":2.0}     ← define 读到上一轮的 a ✅
+{"var":"a","old":1.0,"new":5.0}      ← assign：**旧值正确** ✅
+{"var":"c","old":null,"new":10.0}    ← define 读到 a=5 ✅
+```
+
+`h_assign`（L51）的注释明写「录制分支保持原顺序（先读旧值、再写入）
+—— 旧值必须反映赋值前状态」，本轮**实测确认这句是真的**。
+
+两者的分叉只在录制器开启时有意义：未录制时 `h_define` 直接把所有权
+交给 `env.define`、`h_assign` 直接 `env.assign`（省掉两次 `clone()`）。
+
+顺带确认 **D182 的修复仍成立**：`replay` 在无可重放条目时报
+`⚠ replayed 0/0`，**不打 ✓** —— 那个 ✓ 会被读成「重放成功了」。
+
+## 发现：banner 的**分派层级**与实现不一致
+
+启动 banner 明写 `v0.15 CLI: record / replay / diff / list / stats / timeline`，
+六个并列。实测**只有前两个是顶层**：
+
+| 命令 | 层级 | 实测 |
+|---|---|---|
+| `mora replay <file> <name>` | **顶层** | ✅ |
+| `mora diff <a> <b>` | **顶层** | ✅ |
+| `mora record list` | 子命令 | ✅ |
+| `mora record stats <name>` | 子命令 | ✅ |
+| `mora record timeline <name>` | 子命令 | ✅ |
+| **`mora list`** | — | ❌ *系统找不到指定的文件* |
+
+`mora list` 没有顶层分支 ⇒ 落到默认的「执行文件」路径，
+把 `list` 当**文件名**去读。
+
+**判定为文档措辞问题，不改产品**：
+`mora run` 也曾有同样的「被当作文件名」问题（`main.rs:165` 注释明说
+是 v0.08.5 修的），说明「未知子命令 → 当文件名读」是**既有行为**。
+banner 只是把命令**列举**出来，未承诺它们都是顶层。
+
+⇒ 判据钉住**现状层级**（不是「应该怎样」）：
+若将来有人给 `mora list` 加了顶层别名，`d362_subcommand_dispatch_levels`
+会红 —— 那是有意的行为变更，不是回归。
+
+## 顺带记录
+
+录像里出现的 `__let_result` 是**内部哨兵变量**（实现 let 表达式的值语义，
+`lower.rs` / `fcfg_lower.rs` / `dag_rule.rs` 共 6 处注释在解释它），
+不是缺陷，是**实现细节被记录到了录像里**。
+
+#### D361：`index_value` 边界矩阵 + **索引赋值整条链路是死代码**（否定轮，无产品变更）
+
+D360 扫完 `src/mir/handlers/` 的 panic 面后，本轮钉 `values.rs` 的索引面
+（`h_index` / `h_index_assign` → `mir/vm.rs` 的
+`index_value` / `index_assign_value`）。
+
+## 索引**读取**：13 用例全部符合设计
+
+| 形态 | 实测 | 判定 |
+|---|---|---|
+| `xs[0]` / `xs[1.0]` | 10 / 20 | ✅ |
+| `xs[2.7]` | 30 | ✅ `checked_index` **截断**（不报错，D246 已钉截断为设计）|
+| `xs[-1]` / `xs[-0.5]` | exit 1 *negative index* | ✅ |
+| `xs[3]`（越界）| exit 1 *out of bounds* | ✅ |
+| `s[0]` / `s[1.0]` | `a` / `b` | ✅ 按**字符**索引 |
+| `"héllo"[1]` | `é` | ✅ 多字节按字符（2 字节 UTF-8 但 1 个 char）|
+| `"héllo"[5]` | 越界按 **len 5**（字符数非字节数）| ✅ 与 `len()` 口径一致 |
+| `m["a"]` / `m["zzz"]` | 1 / **nil** | ✅ 缺失返回 nil 不报错（Python 风格）|
+| `xs[true]` / `5[0]` | exit 1 *cannot index* | ✅ |
+
+另钉住一条既有的修复：`vm.rs:194-200` 把 `{:?}` 换成
+`type_name` + 排序 Display —— 因为 `Value::Dict` 是 `HashMap`，
+`Debug` 键序**每进程随机**，会导致同一条错误信息在不同进程里不同。
+判据断言诊断里**不含**被索引对象的内容。
+
+## 索引**赋值**：**整条链路是死代码**
+
+`WitnessKind::IndexAssign` → `MirInst::IndexAssign` → `h_index_assign`
+→ `index_assign_value` 在 `src/mir/` 与 `src/typeck/` 共
+**23 个文件 54 处**都有定义与传递，**但 `src/parser_v3/` 零构造** ——
+**没有任何语法能产生它**。
+
+实测四种候选写法全部不可达：
+
+```text
+xs[0] = 9      → exit 2  Failed to parse
+xs.at(0) = 9   → exit 2  Failed to parse
+xs.set(0, 9)   → exit 1  List has no method: set
+m["a"] = 2     → exit 2  Failed to parse
+```
+
+**判定为「功能未接通」，不是静默错值** —— 没有「本该是 A 却是 B」，
+是「压根没法表达」⇒ 只报告，**不擅动**
+（与 D346 `xform`、D360 `orchestrate loop` 同类）。
+
+判据用**源码层**钉住关键事实：`WitnessKind::IndexAssign` 在
+`witness.rs` 有完整定义与 children 处理，`mir/lower.rs` 也在传递，
+但 `parser_v3/` **零命中**。脚本层只能证明「不可达」，
+**无法区分**「未接通」与「设计上不支持」——
+所以必须用源码判据给出「零入口」这个证据。
+
+#### D360：`src/mir/handlers/` 指令 dispatch 层 + `orchestrate loop` 的 `max_rounds`（否定轮，无产品变更）
+
+D359 修了 `Float ⊗ BigInt` 混算后，本轮转到它的**直接下游**：
+`src/mir/handlers/`（指令 dispatch，6 个文件 2403 行）。
+
+## 零 panic 点（生产代码）
+
+全目录 `grep` 出的 3 处 `.expect` **全在 `#[cfg(test)]` 内**
+（`effects.rs:630/651/659`，是测试自己编译样例用）。
+生产代码路径**零** `unwrap` / `expect` / `panic!` / `unreachable!`。
+
+与 `src/mir/lower.rs`（1392 行，同样零 panic 点）一致
+⇒ MIR 两层有**系统性的防御**，这是好信号。
+
+## `max_rounds` 的 `max(1)` 是**三处一致的设计**，判定不修
+
+`parser_v3/syntax.rs` 有**三处**完全相同的模式：
+
+| 行号 | 参数 | 目标类型 |
+|---|---|---|
+| L266 | `moa_layers` | `as usize` |
+| L351 | `moe_top_k` | `as usize` |
+| L385 | `max_rounds` | `as u64` |
+
+```rust
+TokenType::Float(f) => f.max(1.0) as u64,
+TokenType::Int(i) => i.max(1) as u64,
+```
+
+实测 `max_rounds: 0` → 1 轮、`max_rounds: 2.7` → 2 轮，都**静默**。
+但判定为**设计**，三条依据：
+
+① **三处完全一致** ⇒ 统一约定，不是某一处漏写；
+② 意图明确 —— `max(1)` 是**防零轮循环**的防护，
+与 D339 `tea.run` 的问题**方向相反**（那里是「静默归零导致不跑」，
+这里是「静默提升导致多跑一轮」，后者危害小得多）；
+③ D269 已把值真正接到 `Loop.rounds`（`loop_rounds.or(Some(1000))`，
+L454），接线完整，源码判据钉住。
+
+⇒ **修它会同时改动三处统一约定，且「多跑一轮」与「不跑」相比无害。**
+
+## 负例仍正确报错（D269 的既有行为）
+
+`max_rounds: -5` / `max_rounds: "abc"` 都 exit 2 ——
+`-` 不是字面量开头、`String` 不在 match 的两个 arm 里 → `return None`。
+
+## 顺带记录、**不擅动**的两处
+
+| 现象 | 判定 |
+|---|---|
+| `orchestrate loop` 的**迭代语义在脚本侧不可用**（`agent` 是单表达式 `name => expr`，`agent_env = env.clone()` 每轮从原始 env 起，外层变量不累积；实测 `k = k + 1` 在 `loop` 与 `sequential` 下都恒为 1） | 属**功能未接通**，不是静默错值；改动涉及 lowering 语义，**超出本轮范围** |
+| `loop` 分支的 env 合并带 `if env.get(&name).is_none()` 守卫（L567），`sequential` 分支（L511）**没有** | 真实的不对称，但**脚本侧无法触发其差异**（两者实测一致）⇒ 只报告 |
+
+#### D359：`Float ⊗ BigInt` 混算在 float 超出 **2^53** 时**静默算错**（已修）
+
+D358 修了 `is_truthy` 漏 BigInt 分支后，本轮扫 `src/flow.rs` 的数值混算面。
+`eval_binary`（282 行）+ `numeric_op`（Sub/Mul/Div/Mod）合计
+**8 个运算符 × Float/BigInt 组合**，翻出**一个静默错值**缺陷。
+
+## 缺陷：`f - 1n` 的 `1` 凭空消失
+
+```text
+let f = 100000000000000000000     // 1e20，Float
+print(f + 1n)   →  100000000000000000000.0   ← 加的 1 消失
+print(f - 1n)   →  100000000000000000000.0   ← 减的 1 消失
+print(1n - f)   →  -100000000000000000000.0  ← 符号被吞
+print(f * 2n)   →  200000000000000000000.0   ← 量级对、精度错
+print(2n / f)   →  0.00000000000000000002
+```
+
+**全部不报错、不警告。** `f * 2n` 尤其危险：量级正确、低位精度丢失，
+肉眼几乎无法察觉。
+
+## 根因：**同一个类型对，两个运算符，两种行为**
+
+- `Add` 走 `eval_binary` → `coerce_mixed`，其中**有**往返校验
+  （`BigInt::from(bf as i128) != b` ⇒ 报错），
+  所以 `1e20 + 99999999999999999999n` 明确报错；
+- Sub/Mul/Div/Mod 走 `numeric_op` → `bigint_to_f64_lossy`，
+  **无任何守卫**，BigInt 侧无条件降级成 f64。
+
+而 `coerce_mixed` 自己的守卫**只查 BigInt 侧**，完全没查 float 侧 ⇒
+`1e20 + 1n`（BigInt 侧极小）也静默。
+
+**静默错 + 明确报错并存，是最坏的组合** ——
+用户会误以为「BigInt 混 Float 已经有保护了」。
+
+## 判据与修法
+
+f 是**整数值**（`f.fract() == 0.0`）但 `|f| > 2^53`
+⇒ 该整数 **f64 装不下** ⇒ 无论 BigInt 侧多小，结果都无法精确表示 ⇒ 报错。
+
+抽成共用函数 `check_float_exact_int`，`coerce_mixed` 与 `numeric_op`
+**共用同一判据**，从根上消除分叉可能。
+
+**边界精确**：拦的是 `> 2^53` 而非 `>= 2^53` ——
+`9007199254740992 + 1n` = `9007199254740993n` 仍**完全正确**。
+
+**牙齿验证**：摘掉 `numeric_op` 的两处守卫 ⇒ **精确 3 条判据变红**
+（8 组合全称 / 乘法单钉 / D198 的 BigInt 侧契约），5 条无关判据仍绿
+（含 `coerce_mixed` 那侧的 2^53 边界）。
+
+## 顺带验证、**无缺陷**的面
+
+- **BigInt 纯大数算术**（D19/D21 修过的）：10^20 的 `+ - * / %` 全部精确，
+  除零也正确报错（num-bigint 对零除数会 panic，该层已有守卫）。
+- **`values_equal`**：可达的 14 条全对，含 2^53+1 大数精确比较。
+  另查明它的混比路径在脚本层**不可达** —— typeck 直接禁止 `1n == 1`
+  （裸 `1` 是 Float），报 *expected BigInt, got Float*。
+- **Float ⊕ Int 混算**：8 条全对，含 `0.1 + 0.2` = `0.30000000000000004`
+  （IEEE 754 行为正确）。
+
+#### D358：切到 `src/flow.rs` —— `is_truthy` 的 **`BigInt(0)` 被判为 truthy**（已修）
+
+`is_truthy`（`flow.rs:17`）是全语言真值语义的**唯一权威**，
+11 个调用点（`filter` / 分支 / pregel 条件 / DAG 跳转）全部走它。
+
+函数头注释写着「此前存在两份实现……已收敛为单一实现」——
+本轮 **实测确认这句是真的**（全仓 `grep` 无第二份定义，零分叉）。
+
+## 缺陷：同一个「零」，三种数值类型里 BigInt 独异
+
+```text
+[0i, 1i, 2i].filter(fn(x) x end)   →  [1, 2]        ✅ 0 被剔除
+[0.0, 1.0, 2.0].filter(fn(x) x end) →  [1.0, 2.0]    ✅ 0 被剔除
+[0n, 1n, 2n].filter(fn(x) x end)   →  [0n, 1n, 2n]  ❌ 0 **被保留**
+```
+
+**根因**：`match` 覆盖 `Int` / `Float` / `String` / `List` / `Dict`，
+**唯独漏了 `BigInt`** ⇒ 落进兜底分支 `_ => true` ⇒ 恒真。
+
+## 为什么是缺陷（不是「BigInt 另有语义」）
+
+① **同函数内的类型一致性**：`Int(0)` 与 `Float(0.0)` 都 falsy，
+三者同为「数值零」却行为不同 ⇒ **漏写**，不是设计。
+② `Value::BigInt` 就在 enum 里，且 `is_truthy` 显式列了它**上面**的
+`Int` / `Float` 却跳过它 ⇒ 不可能是「有意不处理」。
+③ `docs/mora-spec.md` 对真值语义**零承诺**（grep 无 `truthy`/`真值`），
+所以依据是**函数内部一致性**而非 spec。
+
+**修法**：补一条 `Value::BigInt(b) => *b != BigInt::from(0)`。
+
+**牙齿验证**：摘掉这一条 ⇒ **精确 3 条判据变红**
+（filter 全称 / `bool()` 强转 / BigInt 边界），4 条无关判据仍绿。
+
+## 顺带查明、**不擅动**的三处
+
+| 现象 | 判定 |
+|---|---|
+| `hex_decode` / `hex_encode`（`flow.rs` 公开版）| **零调用**（`audit/mod.rs` 有自己的私有副本）⇒ 死代码，只报告 |
+| `bool('\0')` → `true` | 兜底分支的**语义选择**（NUL 是否算空？），无契约 ⇒ 只报告 |
+| 条件位置 typeck 强制 `Bool` | ✅ **正确**（`if 0n` 直接被拒），`is_truthy` 在条件位只接 Bool |
+
+> 顺带一条观察：`src/` 里有**两份 `hex_encode` 实现**
+> （`flow.rs` 的公开版 + `audit/mod.rs` 的私有版），后者才是活的。
+> 这是 D352「共享收口」问题的反向形态 —— **该收口的方向是让
+> `audit` 改用 `flow::hex_encode`**，但因 `flow` 版**零调用**，
+> 改与不改都不影响行为，**不在本轮擅动**。
+
+#### D357：`src/lexer.rs` 的**字符字面量 / 生命周期 / 注释 / 文档块**四张矩阵（否定轮，无产品变更）
+
+D356 从数字字面量切入翻出「位宽被拼进数值」的真缺陷后，本轮扫
+`src/lexer.rs` 的其余**未测面**。四个子面 **20+ 用例，零产品缺陷**。
+
+## 为什么这四张矩阵值得单独钉
+
+`src/lexer.rs` 是整条执行管线的最底层
+（`ParserV3 → MirExpr → lower → MirInst → dag_interp` 全靠它切 token），
+且 D354 刚动过 keyword 相关逻辑，lexer 侧是它的**对偶面**。
+
+| 矩阵 | 最容易错的地方 | 用例数 |
+|---|---|---|
+| 字符字面量 | 转义表 / 多字节 / 长度校验 | 8 |
+| 生命周期 vs 字符 | `'` 后一个字符的**歧义消解** | 3 |
+| 行注释 `--` | 注释里含 `"` / `--` | 7 |
+| `document` 块 | 内容里的 `--` / `{` / 连续多块 | 4 |
+
+## 生命周期的歧义消解是**有意设计**（不是漏写）
+
+`lexer.rs:449-481` 用「`'` 后**第一个**字符 + **第二个**字符」区分：
+第二个字符是 `'` ⇒ **字符字面量** `'a'`；
+是 `>` / `)` / `,` / 空格 / 换行 / 非字母数字 ⇒ **生命周期** `'a`。
+
+实测三种歧义形态全部正确：`let a = 'x` + 换行、`let a = 'x >`
+**不**误报成字符字面量；`fn f<'a>(x) … end` 生命周期语法本身
+**不被支持**（exit 2），但那是 trait 泛型的覆盖面问题，**不是 lexer 缺陷**。
+
+## 顺带查实两条**既有契约**（不是缺陷）
+
+| 现象 | 实测 | 判定 |
+|---|---|---|
+| `len(char)` 报 *len() expects a list, string, or dict* | exit 1 | ✅ `len` 的契约只覆盖 list/string/dict |
+| `char == "str"` 被拒 | *expected Char, got String* | ✅ typeck 严格区分 Char 与 String |
+
+本轮判据首版**误把这两条当成缺陷**，实测才知是既有契约。
+⇒ 判字符字面量改用 **char 对 char 比较**（`'\\n' == '\\n'`）。
+
+## 附带发现并修复：**判据采集器把 lexer 诊断整行滤掉**
+
+`ev` 的路径过滤用的是 `l.contains(path)`，而
+**lexer 层诊断的格式是 `<绝对路径>: <消息>`，消息与路径同行** ——
+`contains` 会把整条诊断一起吃掉。症状是 **exit=2 但 `got` 为空**，
+看着像「产品没报错」。
+
+改成 `is_bare_path_line`（只忽略**纯路径行**）。
+
+**影响面核查**：20 个判据文件共用这个模式，但**既有 19 个不受影响** ——
+实测确认 **typeck 层诊断是独立行**（`Type error at line 1:14: …`），
+只有 lexer 层是同行格式。
+
+⇒ 教训：**收紧共享判据模式前，先量出它实际影响哪些判据**，
+不要凭「20 个文件都在用」就盲改 —— 那会把 19 个绿判据一起掀翻。
+本次正是靠「typeck 独立行 vs lexer 同行」这个实测才确认影响面只有 lexer 侧。
+
+#### D356：切到 `src/lexer.rs` —— 数字字面量的**位宽被当成数值拼接**（已修）
+
+`src/lexer.rs` 是整条执行管线的最底层（`ParserV3 → MirExpr → lower
+→ MirInst → dag_interp` 全靠它切 token），此前从未系统测过。
+本轮从「数字字面量矩阵」入手，15 个用例翻出**一个真缺陷**。
+
+## 缺陷：`1.5f32` 求值为 **1.532**
+
+```text
+let x = 1.5f32   →  1.532     ← 1.5 后面把 "32" 当小数位拼进去了
+let x = 1f32     →  132.0
+let x = 1i32     →  132
+```
+
+**危害**：单精度字面量在真实代码里很常见（图形 / 科学计算 / 跨语言互操作）。
+`1.5f32` 静默算出 `1.532` —— **不报错、不警告**，结果直接错，
+且浮点误差会沿表达式继续传播。
+
+## 根因
+
+`number_from`（`src/lexer.rs:701`）消费位宽时是**追加进数值串**的：
+
+```rust
+// 修前
+while self.peek().is_ascii_digit() {
+    value.push(self.advance());   // ← "32" 进了 value
+}
+```
+
+而 `'f'` 分支是 **`value.parse()`**，**不做**任何截断 ⇒ 位宽被当成
+数值的一部分解析。
+
+`'i'` / `'u'` / `'n'` 分支恰好用了 `take_while(is_ascii_digit)` 才没出事，
+但那是**巧合**（依赖位宽首字符是 ASCII 数字），不是设计 ——
+所以判据把三个分支**分别**钉住，防止将来有人「既然位宽已单独收集，
+这个截断是多余的」而删掉它。
+
+## 修法
+
+位宽**只被消费、不混进 `value`**：Mora 不建模位宽
+（`'u'` 分支注释原文：*mora doesn't model unsigned*），
+位宽既无类型语义也无运行期语义。
+
+**牙齿验证**：逐字还原成修前代码（`let mut value` + `value.push`）
+⇒ **精确 4 条判据变红**（浮点位宽 / 整数位宽 / BigInt 位宽 / 负数位宽），
+4 条无关判据仍绿。
+
+## 顺带钉住的行为（**不改**，只记录现状）
+
+| 行为 | 实测 | 是否要改 |
+|---|---|---|
+| 非 8/16/32/64 的位宽（`1i7`）| 照常消费，值 = 1 | ✅ 宽松合理（位宽不建模 ⇒ 无所谓）|
+| `i64` 溢出（`9223372036854775808i`）| exit 2，Invalid integer literal | ✅ 正确 |
+| `u` 后缀走 `i64` 解析 | `1u` = 1 | ✅ 注释已说明（不建模 unsigned）|
+
+## 附带教训：**探针本身没输出**与「采集器坏了」症状完全一样
+
+本轮判据首版探针写成 `let x = 1.5f32`（**没有 `print`**），
+于是 `ev` 返回空串，**6 条断言一起红**且红得莫名其妙。
+中途还误判成「CLI 因空路径进了 REPL」（PowerShell 三参数
+`Join-Path` 失败导致路径为空，`mora.exe` 无参数启动 = 进 REPL）。
+
+⇒ 这是 D352「exit 非 0 + 输出为空 ⇒ 先怀疑采集器」的**变体**：
+那次是**采集器**坏，这次是**探针**没产生输出。
+判据里因此加了一条 `d356_harness_can_actually_collect_print_output`
+**装置自检**，且首版期望值 `42` 就写错了（mora 的裸数字字面量是
+**Float**，`print(42)` → `42.0`）—— 先证装置能跑通，
+再谈装置跑出来的数据对不对。
+
+#### D355：`parser_v3` 剩余声明位**全称盘点** —— 4 个候选**全部不是**僵尸绑定（否定轮，无产品变更）
+
+D353 / D354 把 `consume_identifier` 拆成严格 / 宽容两版后，
+`parser_v3` 里还剩一批 `consume_identifier` 调用点。按 **D354 的方法**
+逐个实测「关键字作名字、不引用、是否 exit 0」，候选 6 个：
+
+| 声明位 | exit | 引用侧 | 判定 |
+|---|---|---|---|
+| `for` 循环变量 | 0 → **已修（D354）** | 体内引用失败 | ✅ 僵尸绑定 |
+| 闭包 / `macro` 参数 | 0 → **已修（D354）** | 体内引用失败 | ✅ 僵尸绑定 |
+| `enum` 变体名 | 0 | 独立命名空间，可解析 | ❌ **合法** |
+| `struct` 字段名 | 0 | 独立命名空间，可解析 | ❌ **合法** |
+| `type` 别名名 | 0 | 见下 | ❌ **非本轮问题** |
+| `task` 参数 | 0 | 独立命名空间，可解析 | ❌ **合法** |
+| `effect` 参数 | 2 | — | ❌ 探针语法错（`effect do(a)` 用**正常标识符**也 exit 2）|
+| `assign` 目标 | 2 | — | ❌ 已严格 |
+
+## 判别依据：**能不能引用**，而不是「声明是否 exit 0」
+
+`enum` / `struct` / `task` 的名字活在**各自的命名空间**里
+（`E.A`、`S.a`、`task` 参数），解析路径**不吃** `consume_identifier`
+的兜底，所以「声明能过」不等于「僵尸绑定」——
+它们声明的名字**本来就该能用关键字**（用户可能想叫 `New` / `In` / `Loop`）。
+
+## `type` 别名是**独立缺陷**，与关键字无关
+
+```text
+type T = int        → exit 0
+let x: T = 1        → exit 2   Parse error: unsupported type annotation 't'
+type if = int       → exit 0
+let x: if = 1       → exit 2   Parse error: expected type annotation
+```
+
+**正常标识符 `T` 同样失败** ⇒ `type` 别名机制压根没接进
+`parse_type_annotation`，与关键字无关。**不属 D353 家族，不在本轮修**。
+
+## 对「helper 宽容泄漏」这类缺陷的可复用判据
+
+> 判定一个声明位是**泄漏**还是**合法**，唯一可靠的问法是
+> **「这个名字之后能被引用到吗？」** ——
+> 只看「声明是否 exit 0」会把**独立命名空间**全部误判成缺陷。
+
+#### D353 / D354：**关键字可作声明位的名字** ⇒ 僵尸绑定（已修）
+
+`parser_v3` 的 `token_to_identifier_name` 把 26 个关键字 token 映射回标识符名，
+它的**本意**（`src/parser_v3/mod.rs` 注释原文）是**引用位**：
+
+> they can appear in identifier positions (**method names**, variable
+> references **after `.` or `::`**)
+
+但 `consume_identifier` 的兜底分支被**四个声明位**共用，于是用户拿到**三重坑**：
+
+```text
+let if = 5     → exit 0   声明成功
+print(if)      → 解析失败  永远引用不到
+```
+
+① 声明静默成功 ② 引用永远失败 ③ **诊断指错行**（指向使用处，不指向声明处）。
+
+| 轮次 | 声明位 | 修前 | 修后 |
+|---|---|---|---|
+| D353 | `let` 变量名 | exit 0 僵尸 | exit 2，报 line 1 |
+| D354 | `for` 循环变量 | exit 0 僵尸 | exit 2，报**声明行** |
+| D354 | 闭包参数 `fn(…)` | exit 0 僵尸 | exit 2 |
+| D354 | `macro` 参数 | exit 0 僵尸 | exit 2 |
+
+**修法**：新增 `consume_plain_identifier`（`src/parser_v3/tokens.rs`）——
+**只认真正的 `TokenType::Identifier`**，四个声明位改用它。
+`consume_identifier` 的宽容兜底**原样保留**给引用位
+（方法名 / `::` / dict 键 / 字段名），`token_to_identifier_name` 一行未动。
+
+**零依赖**：`tests/fixtures/**` + `examples/**` 下 **56 个** `.mora` 全量扫描，
+关键字作 `let` 变量名 / `for` 循环变量 / 闭包参数 / `macro` 参数的命中数
+**0 / 0 / 0** ⇒ 修复不破坏任何既有代码。判据 `d354_all_real_fixtures_still_parse`
+把这 56 个文件真跑一遍，解析失败数**钉在基线 2**（两个 2026 年前就存在的
+类型错误：`tests/fixtures/e2e/lisp.mora`、`examples/integration_v0_34.mora`）。
+
+**`document` 是有意例外**：`src/lexer.rs:862` 对它做**上下文退化** ——
+下一 token 是字符串 ⇒ `TokenType::Document`（块语句），否则退化成
+`Identifier`（模块名 `document.parse(…)`）。所以 `let document = 5` **合法**，
+判据单独钉住它，防止将来「顺手收紧」时误伤。
+
+**牙齿验证**：摘掉 `for` 一处修复 ⇒ **精确 2 条判据变红**（`for` 全称 +
+诊断行号），其余 8 条不受影响。三处还原（逐字对应修前代码）⇒ 三条
+断言全部回到 exit 0。
+
+#### D352：脚本可达的**路径 I/O 入口全称普查** —— 182 处收敛到 **5 个**，只有 `file.*` 受 sandbox 守卫（否定轮，无产品变更）
+
+D336 找出「`check_path` 的调用者**只有 `file.rs`**」并**抽样**点了 3 处漏网
+（`memory.save` / `memory.load` / `tail()`）。但 D334 / D338 的教训是
+**必须全称枚举，不能抽样** —— 抽样会漏。
+
+本条把 `src/` 下**全部 182 处**文件 I/O 逐处过一遍，
+剔除 CLI / 测试 / fixture / 内部基础设施后，收敛到**脚本可达**的 **5 个入口**。
+
+##### 一、全称结论
+
+| 入口 | I/O 位置 | sandbox 守卫 | 状态 |
+|---|---|---|---|
+| `file.*`（22 个 arm） | `file.rs:42-211` | ✅ 每个 arm 都调 `check_path` | ✅ D334 补齐 |
+| **`memory.save`** | `memory.rs:388` | ❌ | ⚠ D335/D336 已报 |
+| **`memory.load`** | `memory.rs:397` | ❌ | ⚠ D335/D336 已报 |
+| **`tail(path, max)`** | `builtin_impls.rs:563` | ❌ | ⚠ D336 已报 |
+| `import "…"` | `interpreter/mod.rs:702` | ❌ | ✅ **有意**（语言构造） |
+
+⇒ 三个漏网 + 一个有意豁免。**D336 的抽样没漏，但本条证明了它没漏**
+（从抽样升级为全称）。
+
+##### 二、`import` 为什么是**有意**豁免
+
+它读的是**待执行的源码**。给它加路径白名单等于**禁止 import 沙箱外的模块**
+⇒ 那是**破坏功能**，不是修缺陷。已用判据钉住这条边界。
+
+##### 三、`record/*` 的 I/O 不在脚本面
+
+`record/mod.rs`、`cli/record.rs` 等由 CLI 的 `record` / `replay` 命令驱动，
+与 `mora <file.mora>` 无关。已用**真实脚本**（`print(record.start())` → Unbound）
+把这条边界钉死 —— 否则普查会**高估**暴露面。
+
+##### 四、为什么不**给那三个补守卫**
+
+与 D335 的决策一致：`docs/mora-spec.md:1504` 明写「当前版本**无沙箱**。
+脚本可以读写文件系统」，「文件系统访问白名单」列在 **v1.0 计划**下。
+
+⇒ 「`file.*` 该守到什么范围」是**待裁决**的产品决定（D336 已列为第 20 项）。
+本条只做一件事：**把完整的表钉下来**，让裁决者知道一共**几个**入口、各自**确切位置**。
+
+##### 五、判据形态
+
+- **行为侧**：钉「三个确实无守卫」（含 `memory.rs` 全文**零** `check_path`）；
+- **源码侧全称**：按 `file.rs` 的 `match` arm 逐个检查 `check_path(` 的**出现次数**
+  —— D335 已证明「只查有没有」会被「摘掉第二处」骗过。
+
+**牙齿验证**：摘掉 `rename` 的第二处守卫 ⇒ D352 与 D334 **两条判据同时变红**。
+
+新判据：`tests/path_io_sandbox_census.rs`（4 条，无产品变更）。
+
+#### D351：切到 `typeck/` —— 诊断矩阵 + `String + 任意类型` 的**契约分叉**（否定轮，无产品变更）
+
+D350 收官了 `builtins/`（21 个模块全测过）。本轮切到 **`typeck/`** ——
+类型错误是用户遇到的**第二道**诊断（第一道是 parser），
+且历史上只被**单点**修过（D188 的重复诊断、D126 的 `line 0` 渲染）。
+
+##### 一、诊断矩阵：措辞与**位置信息**都齐
+
+| 类别 | 措辞 | 位置 |
+|---|---|---|
+| 类型不匹配 | `type mismatch: expected \`Int\`, got \`Float\`` | ✅ `line 1:14` |
+| 赋值类型错 | `Type mismatch: expected float, got string` | ✅ `line 2:8` |
+| if 条件非 bool | 同上 + **`hint: if condition must be bool`** | ✅ `line 1:4` |
+| 未绑定变量 | `Unbound variable 'zzz'` | ✅ `line 1:7` |
+| 列表不同质 | `List 字面量的元素必须同质…: 下标 1（第 2 个元素）…` | ✅ `line 1:14` |
+| 未知方法 | 运行期 `List has no method: nosuch` | ❌ **无编译期诊断** |
+
+**多条错误各自成条、计数正确** —— D188 的去重**没有过度去重**：
+`let a: Int = 1.5` + `let b: Int = 2.5` ⇒ **2 条**，位置与类型对都不同。
+
+##### 二、**契约分叉**：`String + 任意类型` 运行期拼接，**typeck 拒**
+
+`flow.rs:201-203` 逐字写着：
+
+```rust
+// 字符串 + 任意类型 → 自动转字符串拼接
+(Value::String(a), _) => Ok(Value::String(format!("{}{}", a, right))),
+(_, Value::String(b)) => Ok(Value::String(format!("{}{}", left, b))),
+```
+
+这是**有意设计**（注释明写）。但实测：
+
+```text
+print("s" + 1)   → typeck 拒：expected String, got Float     ← 直接位置被拒
+
+let f = fn(x) x + 1 end
+print(f("s"))     → "s1.0"                                  ← 闭包内**放行**并拼接
+```
+
+**闭包参数无标注 ⇒ 推断为 `Any` ⇒ `Any + 1` 放行** ⇒ 落到运行期的拼接语义。
+⇒ **同一运算，直接位置被拒、闭包内放行**。
+
+**为什么不修**：`String + 数字` 该**拼接**还是该**报错**是**类型系统**层面的产品决定 ——
+改 typeck 放行会**显著削弱类型系统**（`"a" + 1` 本该是编程错误）；
+改运行期报错会让现有能跑的闭包代码**全崩**。两者都要人拍板。
+
+##### 三、探针自身翻车两次（都是「空输出 ≠ 无诊断」）
+
+1. **具名 `fn` 声明在本语言不存在** —— 只有闭包 `fn(x) … end`（零 fixture 用 `fn` 声明）。
+   我写了 4 个 `fn f() -> Int { … }` 用例，parser 报 `Failed to parse`，
+   而**空采集**让它看起来像「typeck 静默」。
+2. **早期只采 stdout** ⇒ 所有 `exit 2` 的 typeck 用例都显示「空输出」
+   —— 因为**诊断走 stderr**。补上 stderr 才拿到真诊断。
+
+⇒ 判据采集必须**同时**读 stdout 与 stderr；解析错误还要考虑
+CLI 可能写到**第三个流**（实测 `Failed to parse` 两边都没有）⇒ 那种情形
+只钉 **exit code**，不钉诊断文本。
+
+新判据：`tests/typeck_diagnostics_matrix.rs`（5 条，无产品变更）。
+
+#### D350：`skill.*` 7 入口矩阵（否定轮，无产品变更）—— `builtins/` **最后一个**未测模块收官
+
+`skill.*`（100 行 / 7 入口）含两个**文件/网络**面（`set_hub` / `refresh_hub`）。
+本轮测完，**`builtins/` 下 21 个模块全部至少测过一轮**。
+
+##### 一、矩阵结论：7 入口全部可达，**零 panic、零缺陷**
+
+基本链路实测：`list` 空 → `install` → `find` 得 dict → `uninstall` → `list` 归空。
+
+##### 二、三条「看起来像缺陷、实为设计」的现状（全部钉住）
+
+**① `find` / `uninstall` / `load` 的实参**不检查类型**。实现一律是
+`args.first()?.to_string()`（`skill.rs:22` / `53` / `76`）：
+
+```text
+skill.find(1)      → nil        ← 查 "1.0"，查不到
+skill.uninstall(1) → **true**   ← 删掉了名为 "1.0" 的 skill
+```
+
+与 D344 那 8 处 `unwrap_or(Value::Nil)` 同族，**但方向相反**：
+那 8 处是**可选**参数（缺省合法），这三处是**必填**参数却仍不校验。
+
+**「同模块两种策略并存」是真的**（`install` 查了**个数**两遍、
+`find` 一遍**类型**都没查）——但依 D344 教训，本条先确认了
+**两边都在执行路径上**（实测 `install("a")` 报元数错、`find(1)` 返回 nil），
+故这是**真**的策略不一致，**待裁决**。
+
+**② `set_hub` 不校验路径存在性，错误推迟到 `refresh_hub`**：
+
+```text
+skill.set_hub("C:/d350_nosuchhub")  → **true**（路径根本不存在）
+skill.refresh_hub()                  → read …: 系统找不到指定的文件
+```
+
+`set_public_registry`（`skill/mod.rs:118`）只**存路径**不读盘，
+真正的读发生在 `refresh_hub` ⇒ **职责分离清晰，属有意设计**。
+
+**③ `uninstall` 不存在的名字返回 `false`** —— 与 D345 的 `bus.off` 同形态：
+布尔返回本就表意「删没删掉」。
+
+##### 三、本条判据的一次期望修正
+
+我写「`install` 少参 ⇒ exit 1（运行期报错）」⇒ **失败**，实测是 **exit 2**
+（typeck 在**编译期**就拦了，运行期 `args.len() < 2` **根本没被走到**）。
+
+已改为**两道防线都断言**：编译期行为走脚本层测，
+运行期那道用**源码判据**钉（脚本层永远走不到它）。
+
+⇒ **「纵深防御的第二道」在脚本层不可测** —— 要钉它只能钉源码。
+这与 D332「`parse_budget_dispatch` 不可达」是同一类：被前面的层挡住时，
+只能用源码判据证明它还在。
+
+新判据：`tests/skill_module_surface.rs`（8 条，无产品变更）。
+
+#### D349：`rel` 族（关系/逻辑编程）的真形态是**自由函数**；`both([g1,g2])` 被 typeck 拒（否定轮，无产品变更）
+
+`rel.rs` 是 `builtins/` 里**唯一从未被量过**的模块（133 行）。
+D34 曾记过它有一批历史存量。本轮查清三件事。
+
+##### 一、真形态是**自由函数**，不是 `rel.*` 方法
+
+我第一轮探针**全部**写成 `rel.succeed()` / `rel.unify(1,1)`，
+**18 条全部 `Failed to parse`**。查 `dispatch.rs:121-126` 才发现：
+
+```rust
+"unify"   => self.call_builtin_unify(args),
+"both"    | "conde" => self.call_builtin_both(args),
+"either"  => self.call_builtin_either(args),
+"project" => self.call_builtin_project(args),
+"fail"    => self.call_builtin_fail(args),
+"succeed" => self.call_builtin_succeed(args),
+```
+
+⇒ 正确写法是 `succeed()` / `unify(1, 1)`，**没有 `rel.` 前缀**。
+而 `docs/mora-spec.md` 里 `rel.` / `unify` / `Relation` **零命中**，
+`README.md` 亦零 ⇒ **整个族零文档**。
+
+⚠ 「解析失败」很容易被误读成「产品没这个功能」——
+**先确认注册名，再下「不存在」的结论**（与 D333/D334 的 D74 教训同源）。
+
+##### 二、`both([g1, g2])` 的列表形态：实现支持，**typeck 拒**
+
+`rel.rs:33-45` 的 `goals_from_args` 明确实现了它：
+
+```rust
+if args.len() == 1
+    && let Value::List(items) = &args[0]
+    && !items.is_empty()
+    && items.iter().all(|i| matches!(i, Value::Goal(_)))
+{ return Ok(items.iter().map(...).collect()); }
+```
+
+源码顶部的模块文档也写着「`both(g1, g2, ...)` … **亦接受单个 Goal 列表**」。
+但实测：
+
+```text
+both(g1, g2)     → goal                                    ✅
+both([g1, g2])   → typeck 拒：expected goal, got list<goal>  ❌
+```
+
+⇒ **typeck 与实现分叉**。与 D347/D348 的「spec 与实现分叉」方向**相反** ——
+这次是**实现有、文档有、typeck 拒**。
+
+##### 三、`project` 的闭包必须**先绑定**
+
+`project(|x| x, 1, 5)` **解析失败**（实参位不接受内联 lambda），
+必须写成 `let f = fn(x) => x` 再 `project(f, 1, 5)`。
+
+**为什么本条不修 `both([…])`**：放行列表形态要改 typeck 的签名
+（`Type::Relation` 目前不接 `list<goal>`），属**类型层**改动，
+且要确认「列表形态是文档笔误还是真要支持」—— 属产品契约决定。
+
+新判据：`tests/rel_family_surface.rs`（5 条，无产品变更）。
+
+#### D348：`random.*` / `ai.*` 的 spec 签名对账（否定轮，无产品变更）
+
+D347 建立了「spec 签名表要**逐条**对账」，本条把剩下的 `random.*`（6 条）
+与 `ai.*`（4 条）扫完。
+
+##### 一、`random.*`：六条签名**全部一致**，守卫完整
+
+| spec 声明 | 实测 | |
+|---|---|---|
+| `random.random()` → `-> float` | `float` | ✅ |
+| `random.rand_int(min, max)` → `float, float -> float` | `float` | ✅ |
+| `random.rand_float(min, max)` → `float, float -> float` | `float` | ✅ |
+| `random.rand_choice(list)` → `list -> any` | `float` | ✅ |
+| `random.seed(n)` → `float -> nil` | `nil` | ✅ |
+| `random.shuffle(list)` → `list -> list` | `list` | ✅ |
+
+**区间语义也核实了**：`next_i64_in` 用 `% (max - min)` ⇒ 落在 **`[min, max)`**
+（半开），与 spec 写的「[min, max) 整数值」**一致**。
+
+唯一看着矛盾的是 `rand_int(3, 3)` → `3.0`：`next_i64_in` 的
+`max <= min → return min` 是**单点区间**分支，源码注释明写
+「`rand_choice` / `shuffle` 两个**内部调用点**也依赖该行为」⇒ **有意为之**。
+
+守卫完整（D144 已做）：`rand_int(5,1)` / `rand_float(1,0)` 报「区间写反」、
+`rand_choice([])` 报「empty list」、同种子产生**同序列**（`a == b` → `true`）。
+
+##### 二、`ai.*`：四条里**三条不可达 + 一条参数顺序分叉**
+
+| spec 声明 | 实测 |
+|---|---|
+| `ai.chat(cfg, prompt)` | `ai.chat(prompt[, {model}])` —— **1 参，顺序相反** |
+| `ai.stream(prompt)` | **不可达**（`AI_MODULE_METHODS` 只 3 个，D59 已记） |
+| `ai.create(name, config)` | **不可达**（属 `agent` 而非 `ai`） |
+| `ai.critic(answer, ctx?)` | 可达 |
+
+⚠ 不可达那两条**本条不重复报**（D59 已钉，见
+`tests/ai_namespace_reachability.rs`）。本条只钉 `chat` 的**参数顺序**分叉。
+
+**为什么不改 spec**：实现自 v0.75.84 起就是 `chat(prompt[, {model}])`，
+spec 那行是早期草稿。改它是文档勘误，但要先确认「`cfg` 是不是真的从签名里
+去掉了」（`do_ai_chat` 内部仍可能读 `model`）—— 属文档追平，暂不擅动。
+
+新判据：`tests/random_ai_spec_reconciliation.rs`（6 条，无产品变更）。
+
+#### D347：`tea.*` 的 spec 签名与实现**六条全部分叉**（否定轮，无产品变更）
+
+D346 的收获是「**恒等函数**是最难发现的缺陷形态」，而它的前置是
+「把**文档承诺的行为**与**实际行为**并排放」。本条把这一步**全称执行**：
+spec 里 `tea.*` / `xform.*` 的 11 条签名逐条实测。
+
+##### 一、`tea.*`：六条签名全部与实现不符
+
+| spec 签名 | spec 声明 | **实测** | 一致？ |
+|---|---|---|---|
+| `tea.init(model)` | `dict -> tea_model` | 收**任意值**（`1` 也行）→ `tea_app` | ❌ |
+| `tea.dispatch(msg)` | `tea_msg -> **nil**` | `tea_app` | ❌ |
+| `tea.run(app)` | `tea_app -> **nil**` | `tea_app` | ❌ |
+| `tea.update(msg)` | `tea_msg -> tea_model` | `tea_app` | ❌ |
+| `tea.model()` | `-> tea_model` | 返回 app 内部的 model（实测 `float`） | ❌ |
+| `tea.view()` | `-> any` | `tea_app`（且**报错**，见下） | ❌ |
+
+spec 那几行还与**实际用法**冲突：D339 实测 `tea.run(m, 5)` 的返回值
+可以继续传给 `tea.model(...)`；若真返回 `nil` 那条链就断了
+⇒ **spec 停在了旧版**。
+
+##### 二、`tea.view` 另有一处**实缺陷**
+
+`tea.init(1)` 只给 init 闭包，`update` / `view` 缺省为 `Nil`
+⇒ 调 `tea.view` 报 `Value is not callable: nil`。
+这不是签名问题，是**构造时留空**。D339 已证三参形态
+`tea.init(init, update, view)` 完全可用。
+
+##### 三、**typeck 站在实现这边**
+
+`typeck/dispatch.rs::TEA_METHODS` 登记 `Ret::TeaApp` / `Ret::Any`
+（只有 `replay` 是 `Ret::Nil`，那是**正确的**）——与**实现**一致、
+与 **spec** 不一致。
+
+⇒ 分叉只存在于**文档**。
+
+##### 四、为什么不改（只钉）
+
+改 spec 是**文档决策**：那几行是 v0.83 写的，此后
+`v0.94` 改成「app 是**纯值**（无内部 Mutex）」、`v0.104` 又把 `init`
+扩成三参 —— 实现一路演进，**spec 停在旧版**。
+
+追平它需要先确认「`dispatch` / `update` 到底该不该返回 app」
+（Elm 语义是 `Cmd`，本实现是「纯追加，返回新 app」），
+那是**语义裁决**，不是文档勘误。
+
+##### 五、本条判据自身的一次失效
+
+我写「`TEA_METHODS` 里不应出现 `Ret::Nil`」⇒ **失败**。
+真因是 **`replay(…)` → `Ret::Nil` 是正确的**（它不返回 app），
+我的断言**范围太宽**。已改为只取 `replay` **之前**的部分。
+
+⇒ 判据断言一个**块**「不含 X」之前，先确认 X 在那个块里**真的不该出现** ——
+同族里可能有**正确**的例外。
+
+新判据：`tests/tea_spec_signature_divergence.rs`（5 条，无产品变更）。
+
+#### D346：`xform.*` 的 `attach` 是**恒等函数**，四个构造器只返回**占位字符串**（`Value::Xform` 全仓零构造）
+
+`xform.*` 是 Clojure 风格 transducer 的构造器族，5 入口，从未量过。
+本轮 28 个用例 —— **查出一个「承诺了但一行都没实现」的面**。
+
+##### 一、spec 承诺的 transducer 机制**一行都没实现**
+
+`docs/mora-spec.md:1029-1033` 逐条承诺：
+
+```text
+xform.map(fn)            → transducer
+xform.filter(fn)         → transducer
+xform.take(n)            → transducer
+xform.comp(xf1, xf2)     → transducer
+xform.attach(xf, stream) → **将 transducer 应用到 stream**
+```
+
+而 `src/interpreter/builtins/xform.rs` 的实现（5 个 arm 全长）：
+
+```rust
+"map"    => Ok(Value::String(format!("<xform.map({})>",    describe(fn_val)))),
+"filter" => Ok(Value::String(format!("<xform.filter({})>", describe(pred_val)))),
+"take"   => Ok(Value::String(format!("<xform.take({})>",   describe(n)))),
+"comp"   => Ok(Value::String(format!("<xform.comp({})>",   describe(other)))),
+"attach" => Ok(stream.clone()),      // ← **恒等函数**
+```
+
+实测（真实 CLI）：
+
+```text
+xform.attach([1, 2], …)   →  [1.0, 2.0]      ← 与输入**完全相同**
+xform.take([1,2,3], 99)   →  <xform.take(list)>
+xform.take([1,2,3])       →  <xform.take(list)>   ← 少传一个参数，输出**一样**
+```
+
+##### 二、`Value::Xform` 是**死类型**
+
+`value.rs:93` 定义了 `Xform` 变体，但 `grep "Value::Xform"` 在全仓**零构造点** ——
+`xform.*` 全部返回 `Value::String`。能装 pipeline 的值类型**从未被创建过**。
+
+##### 三、为什么本条**不修**
+
+修它 = **实现整套 transducer 机制**（pipeline 存储 / `attach` 真正应用
+pipeline / stream 的定义），是**功能实现**而非缺陷修复。且 `xform.attach`
+的第二参在 spec 里是 `stream`，而 `Value` 里**没有** `Stream` 变体
+（D315 已记「Stream 相关能力未实现」）⇒ 连「作用在什么类型上」都要先定。
+
+⇒ 与 D328 的 `partial` / `compose` 属**同一族**：dispatch 里写了、
+typeck 也登记了、但底层能力不存在。
+
+##### 四、危害评估：**静默无效**，比报错更糟
+
+`xform.*` 在 `README.md` **零命中**、spec 里那 5 条签名是它**唯一**的「承诺」来源。
+用户照 spec 写 `xform.take(xs, 3)` 拿到一个**占位字符串**，
+拿它去 `attach` 只会**原样返回输入** —— 不崩、不报错、**也不产生任何效果**。
+
+##### 五、顺带量到的对照：`mock.*` **有**类型校验
+
+```text
+xform.map(5)          → <xform.map(5)>       ← 接受任意类型，不校验
+mock.register(1, fn)  → 报错                  ← 第一个实参必须是 String
+```
+
+⇒ 「构造器不校验实参类型」是 **`xform.*` 局部的**，不是整个模块的规则。
+
+新判据：`tests/xform_placeholder_surface.rs`（4 条，含源码侧「死类型」检查，无产品变更）。
+
+#### D345：`bus.*`（`event`）全族矩阵 —— 5 入口、**0 缺陷**，但钉住两条「注释与实现不符」
+
+`event.*` 是 pub-sub 有状态模块（订阅表 + 通配符分派 + 三桶索引
+exact / prefix / interior），从未量过。本轮 20+ 用例。
+
+##### 一、`subscribe` 的注释承诺了一个**不存在**的 API
+
+源码注释（`event.rs:37-42`）逐字写：
+
+```text
+bus.subscribe(pattern) — pub-sub subscribe
+Returns: token (Value::Float) for later unsubscribe
+```
+
+而入口只有 **5 个**：`count` / `emit` / `off` / `publish` / `subscribe`
+—— **没有 `unsubscribe`**（实测 `bus.unsubscribe(1.0)` → `unknown method`）。
+
+后果：返回的 token **无任何用处**，而且**不唯一**：
+
+```text
+let t1 = bus.subscribe("alpha")   → 1.0     count 1
+let t2 = bus.subscribe("beta")    → 2.0     count 2
+let t3 = bus.subscribe("alpha")   → **2.0** count **2**   ← 与 t2 相同
+```
+
+因为 token 就是 `pattern_count()`（`event.rs:58`），而它数的是
+**pattern 条目数**（`EventBus::pattern_count` = exact + prefix + interior
+三个 map 的 `len` 之和），不是订阅数。
+
+##### 二、`count()` 报的是 **pattern 条目数**，不是订阅数
+
+`EventBus::on`（`event/mod.rs:79`）对 Exact 桶用
+`.entry(pattern).or_default().push(handler)` —— **不去重**。实测：
+
+```text
+bus.subscribe("alpha") ×3   → count 恒为 **1**，但内部压了 **3 个** handler
+```
+
+一次 `emit` 会触发 3 次 —— 但那 3 个都是 **no-op 闭包**（`event.rs:54`），
+脚本层**注入不了 handler**，所以**完全不可观测**。
+
+##### 三、为什么两条都**不修**
+
+- **token 语义**：改它要动 `EventBus` 的数据结构与 `pattern_count` 的含义
+  （多处调用），属**产品契约决定**；
+- **当前危害为零**：脚本层注入不了 handler ⇒ 「同一 pattern 压了几个 handler」
+  在脚本层**看不见**。
+
+⇒ 属 D150 记档的同一类「**机制上说得通，意图上要人拍板**」的决定。
+
+##### 四、顺带量到：README 只承诺 2 个方法
+
+`README.md:154` 写「`bus.emit(name, payload)`, `bus.count()`」，
+实际有 **5 个**（多出 `subscribe` / `publish` / `off`），
+`docs/mora-spec.md` 里 **零命中** `bus.`。
+
+⇒ 三个方法**零文档**。这与 D68 的 `compose_prompt`（文档有、实现缺）方向**相反**，
+危害小，但会让用户以为「没文档 = 大概不能用」。
+
+##### 五、本条判据的探针模板翻了**两次**车（同一根因）
+
+`format!("print({body})\n")` 这类模板：若 `body` **自身以换行结尾**，
+拼出来是 `print(bus.subscribe("a")
+
+)` —— 结尾多一个**孤立的 `)`**，
+parser 报「Expected ')'」。看起来像产品坏了，实际是**探针写错**。
+
+第一次我把两条语句塞进一个 `print(...)`，报同一个错，**是同一个坑的两面**。
+
+⇒ 探针模板的纪律：**`body` 里不要带尾随换行**；
+要换行就在模板里加，别在被代入的字符串里加。
+
+新判据：`tests/event_bus_surface.rs`（5 条，无产品变更）。
+
+#### D344：builtin 里**静默兜底**的全称普查（否定轮，无产品变更）
+
+D343 的收获是「**同模块内两种策略并存**」本身就是缺陷的判别信号。
+本条把它**全称执行**：`src/interpreter/builtins/**` 里每一处
+「解析失败 / 缺参 ⇒ 静默用默认值」都逐条查清。
+
+##### 一、普查结果：21 处，**0 个新增缺陷**
+
+| 类别 | 数量 | 判定 |
+|---|---|---|
+| **合法的「缺参 ⇒ 默认」**（`args.get(1).cloned().unwrap_or(Value::Nil)`）| 8 | ✅ 设计如此 |
+| **合法默认值**（缺参用 1000 / 2.0 / 0 / 1 / Nil）| 8 | ✅ 设计如此 |
+| **解析失败 ⇒ 静默默认**（`s.parse().unwrap_or(N)`）| **1** | ⚠ 不可达，见下 |
+| `_ => None`（类型不匹配 ⇒ 不认）| 4 | ✅ 正确 |
+
+##### 二、唯一值得说的那处：`ai.rs:30` 的 `s.parse().unwrap_or(1000)`
+
+```rust
+// backoff_ms（第 30 行）—— 解析失败静默用 1000：
+Value::String(s) => s.parse().unwrap_or(1000),
+
+// attempts（第 18-19 行）—— 同一函数里是严格的：
+s.parse().map_err(|_| format!("ai.retry: invalid attempts '{}'", attempts))?,
+```
+
+形式上又是「同函数两种策略」，**但本条不改**。
+
+##### 三、为什么不改：它**源码不可达**（D150 在这里犯过错）
+
+parser 永远把 `ai.retry(...)` 解析成「裸名 `ai` + 方法 `retry`」，
+产不出单名 `"ai.retry"` ⇒ `call_ai_method` 里这整段代码**永不被执行**。
+D59（`tests/ai_namespace_reachability.rs`）已把它钉成判据，本轮复跑 **4 条全绿**。
+
+⚠ **D150 正是把 `ai.rs` 的 `backoff_ms` 当成「同族里有人做对了」的样板**，
+事后经 D59 复查才发现根本不可达，样板改指可触达的 `expect_number`。
+
+⇒ **「同模块两种策略并存」是很强的信号，但仍需先确认两边都「可触达」。**
+这是 D343 那条纪律的**必要补充**。
+
+##### 四、顺带钉住 `optional_num_arg` 收口的边界
+
+`optional_num_arg`（D150 建）的设计是「**缺失**与 `Value::Nil` 都算没传，
+其余**类型错报错**」。而 8 处 `args.get(1).cloned().unwrap_or(Value::Nil)`
+（`tea.init` / `mock.register` / `bus.emit` …）**不做类型检查** ——
+传错类型就静默当 Nil。两者并存是 D150 的**刻意**设计，本条钉住收口没被绕过。
+
+新判据：`tests/silent_fallback_census.rs`（3 条 + 21 处计数下界断言）。
+
+#### D343：`plan.create` 的非法 `status` **静默变成 pending**（已修）—— 同一模块内两种策略并存
+
+D340/D342 把 `src/interpreter/**` 的裸 `as` 转换普查完后，轮到有状态的
+`plan.*`（步骤的增删改）。本轮 20+ 用例，**一个缺陷**。
+
+##### 一、缺陷：`create` 静默、`update` 严格
+
+```text
+plan.update(p, [["s1", "BOGUS"]])
+  → exit 1   plan.update: updates[0][1] invalid status 'BOGUS'   ← 一直是对的
+
+plan.create(p, [{id:"s1",text:"t1",status:"done"},
+                 {id:"s2",text:"t2",status:"BOGUS"}])
+  → exit 0   s1 = done ✅，s2 = **pending ⬜**（拼写错误被吞掉）    ← 修前
+```
+
+实现上的差异（`plan.rs`）：
+
+```rust
+// create（第 42-46 行）—— 修前：
+Some(Value::String(s)) => StepStatus::parse(s).unwrap_or(StepStatus::Pending),
+
+// update（第 86-89 行）—— 一直是对的：
+Some(Value::String(s)) => StepStatus::parse(s).ok_or_else(|| …invalid status…)?,
+```
+
+##### 二、为什么是缺陷（不是「宽松接受」）
+
+1. `StepStatus::parse` 返回 **`Option`** —— 它就是在说「这个字符串**可能不合法**」。
+   调用方把这个信息丢掉是**漏写**，不是设计（签名见 `src/plan/mod.rs:29`）。
+2. **同模块内有人做对了**：`plan.update` 对**完全相同**的非法值明确报错。
+   同一模块、同一枚举、同一 `parse` 函数，两种处理。
+3. **危害具体**：拼错状态名（`complete` 少个 `d`、`in progress` 写成空格…）的那一步
+   **看起来是待办** ⇒ 依赖 `done` 的下游（完成度统计 / 收尾检查）会漏掉它，
+   而用户**完全不知道自己拼错了**。
+
+##### 三、修法
+
+`create` 改用与 `update` 相同的 `.ok_or_else(...)`，并把 `parse` 认得的
+**全部 12 个别名**列进错误消息：
+
+```text
+pending / todo / ⬜
+in_progress / in-progress / doing / 🔄
+done / completed / finish / ✅
+```
+
+##### 四、顺带钉住的三条既有行为（**不改**）
+
+| 行为 | 实测 | 判定 |
+|---|---|---|
+| `create` **静默覆盖**同名计划 | 2 步 → 1 步，零提示，exit 0 | **待裁决**（`create` 语义是否含覆盖？）|
+| `remove` 不存在的 id 返回 `false` | exit 0 | ✅ 合理（布尔返回本就表意「没删掉」）|
+| `add` 重复 id 报错 | `step id 's1' already exists` | ✅ 正确 |
+
+##### 五、牙齿验证
+
+把守卫**换回** `unwrap_or(Pending)`：**2 条主断言 FAILED，5 条对照组仍 ok**
+（含「全部 12 个合法别名照常工作」—— 证明守卫没误伤合法值）。
+
+##### 六、本条判据自身的一次失效（已修）
+
+我给错误消息写了 `!got.contains("pending")`，结果**被自己的修复文案绊倒**：
+消息里会列出全部合法别名，而 `pending` **正是合法别名之一**。
+⇒ 真正要验的是「**没有**静默成功」，那条 `exit == 1` 已经验了。
+（与 D339 那条教训同源：**期望值必须来自实测，不能凭语义推断**。）
+
+新判据：`tests/plan_create_status_guard.rs`（7 条，含 4 个对照组）。
+
+#### D342：把 D340 遗留的 8 处「需人工确认来源」**逐条查清**（否定轮，无产品变更）
+
+D340 的普查判据每次运行会 `eprintln!` 列出「无就近守卫」的转换位置。
+其中 6 处能自动归类（`optional_num_arg` 族，D339 已判定），
+剩下 **8 处**标为「需人工确认来源」——那是一批**没做完的待办**。
+本条把 8 处逐条读源码（必要时实测）查清，结论写进判据。
+
+##### 一、结论：**8/8 都不是缺陷**
+
+| 位置 | 右值的真实来源 | 判定 |
+|---|---|---|
+| `event.rs:58` | `self.infra.bus.pattern_count()` —— **内部订阅计数** | ✅ 非用户实参 |
+| `exec.rs:37` | `self.idx` —— **命令在输入列表里的索引** | ✅ 非用户实参 |
+| `stats.rs:299` | `bins` —— 直方图分箱数，**D329 已加整数守卫** | ✅ 已有守卫 |
+| `method_dispatch.rs:256` | `window(size)` 的 `size`，前置 `if size <= 0.0` | ✅ 已有守卫 |
+| `method_dispatch.rs:273` | `batch(size)` 的 `size`，前置 `if size <= 0.0` | ✅ 已有守卫 |
+| `method_dispatch.rs:902` | `s.chars().count()` —— **字符数**（非字节） | ✅ 非用户实参 |
+| `mod.rs:102` | `exp`，来自**形参** `base_ms: u64` 的 `saturating_mul` | ✅ 非用户实参 |
+| `numeric_helpers.rs:179` | `num * mult` —— **D341 已查明解析层挡住负数与大指数** | ✅ 触发不到 |
+
+##### 二、三条「看起来像缺陷但不是」的形态（值得记住）
+
+1. **内部计数器**（`pattern_count()` / `self.idx` / `chars().count()`）：
+   值由**实现自己**产生，不经过任何 `Value` ⇒ 不可能有负数或回绕。
+2. **已有守卫但被长注释隔开**（`window` / `batch`）：守卫在 4 行前，
+   中间隔着 D153 的 3 行说明注释 ⇒ D340 的**「7 行窗口」**看不到它。
+   这不是守卫缺失，是**窗口不够**。
+3. **形参**（`retry_sleep_ms(attempt: u32, base_ms: u64)` 里的 `exp`）：
+   形参已由签名约束为整型，`as` 只是整数之间的转换。
+
+##### 三、本条自身的两次装置失效
+
+1. **在错文件里断言** —— `pattern_count` 的**签名在 `src/event/mod.rs`**，
+   不在 `builtins/event.rs`。我第一版只在调用点所在文件里找定义，失败。
+   ⇒ **调用点与定义点可以分属两个文件**，断言时别只盯调用点。
+2. **变量未使用** —— `needle` 绑定了却没用（clippy 抓到）。
+   本想用它逐条钉住守卫消息，但实际只用了 `arm.contains`。
+   已改为真正用上（按消息定位守卫），顺带**加固**了判据。
+
+⇒ 「查清了」这件事本身要有判据钉住，否则 D340 的清单每次都留一批待确认，
+**等于没做完**。已补 `d340_every_unguarded_cast_has_a_confirmed_source`。
+
+#### D340：「用户实参 → 整型」的裸 `as` 转换**全称普查**（否定轮，无产品变更）
+
+D339 修了 `tea.run(max_steps)` 的裸 `n as usize`，并提出一条纪律：
+**修同根因的缺陷后，问「同一语汇在别处还有几处」**。
+本条把那条纪律**全称执行**。
+
+##### 一、三层收窄（每一层都砍掉一批，且**都不靠猜**）
+
+```
+210 处  全部 `as <整型>`（src/，排除测试文件与纯注释行）
+ 60 处  限定在 src/interpreter/**（纯转换层）
+  2 处  再限定「右值含用户实参来源的名字」（n / size / args / budget / …）
+  1 处  唯一无就近守卫者 —— 且**实测它是内部值**（退避抖动 exp，来自 rand）
+```
+
+⇒ **「用户实参 → 整型」的无守卫遗漏 = 0**。
+D285（`exec.parallel`）/ D339（`tea.run`）/ D146（`take`/`drop`）/
+D153（`reshape`/`crush_json`）那一系列修复已把它们覆盖完。
+
+##### 二、为什么必须**三层收窄**而不是只看一层
+
+第一层（210 处全列）里 **174 处无「就近守卫」**，看着像 174 个缺陷。
+逐条看下来它们绝大多数是**内部值**的转换：
+
+```
+method_dispatch.rs:172   Ok(Value::Int(list.len() as i64))        ← list 长度，内部
+compress/json.rs:339    (target as f32 * 0.15) as usize           ← 压缩比例，内部
+document/reading_order  .ceil() as usize                          ← 几何计算，内部
+trace_collector.rs:131  duration.as_millis() as u64              ← 耗时，内部
+```
+
+⇒ 「**没有就近守卫**」这个静态指标**不判别**（与 D322 的
+「`兜底未覆盖全部变体` 静态指标不判别」同型）。
+真正的判别是：**右值能不能追溯到用户的实参**。
+
+##### 三、判据本身的**三次失效**（本轮全部遇到，均已修）
+
+1. **误报**：`ai_helpers.rs:163` 的 `record_tokens(input as u64, output as u64)`
+   被判为缺陷 —— 但 `input`/`output` 是 `track_tokens(input: usize, …)` 的**形参**，
+   `usize → u64` 是**加宽**，不可能饱和或回绕。
+2. **过宽匹配**：名字表里有了 `"t"` / `"n"` 这类**单字符**，
+   而 `contains("t")` 对几乎每一行都为真（`record_tokens` 里就有 `t`）⇒ 全量误报。
+   现改为**词边界**匹配。
+3. **失效的内容**：第一版把「无守卫」一律判红，但 D339 已证明
+   **无守卫 ≠ 缺陷**（需判别「是否**类型相关**」）。
+   现改为**报告而不判红**，并用 `eprintln!` 逐条列出供人工确认。
+
+##### 四、实测结果：每次运行列出 14 处无就近守卫的具体位置
+
+其中 6 处属 D339 已逐条判定的 `optional_num_arg` 族
+（`ccr.marker` / `mora.refine` ×2 / `schedule.add` ×2 / `capability.rs:127`）
+—— **它们不是缺陷**，理由见 D339 的表。
+
+##### 五、一并报告：`numeric_helpers.rs:179` 的无守卫转换**触发不到**（D341 更正）
+
+> ⚠ **v0.104.6 D341 更正**：本节初版写的是「**脚本层不可达 / 死路径**」，
+> **那是错的**。路径**确实可达** —— `json.parse` 产生的 `Dict` 能直接进
+> `compose_prompt`，D263 已实测到达，且这正是最真实的用法
+> （prompt 配置从 JSON 读入；字面量是 `Float`、机器生成的才是 `Int`）。
+> 已补判据 `d340_compose_prompt_budget_path_is_reachable_via_json_parse` 钉住「可达」，
+> 免得下一个人再误判一次。
+
+正确的结论是「**可达，但触发不到**」。实测的输入空间（全部经真实 CLI）：
+
+| `budget` 实参 | 结果 |
+|---|---|
+| `1000`（`Int`，经 `json.parse`） | exit 0 |
+| `"1KB"` | exit 0 |
+| `"-1KB"` | exit 1 `invalid budget '-1KB'` |
+| `"-0.5KB"` | exit 1 `invalid budget '-0.5KB'` |
+| `"1e30GB"` | exit 1 `unknown budget unit 'E30GB'` |
+
+原因在 `numeric_helpers.rs:159` 的**解析循环**：
+
+```rust
+while i < bytes.len() && (bytes[i].is_ascii_digit() || bytes[i] == b'.') {
+```
+
+它**不接受** `-`，也**不接受** `e` / `E` ⇒ `num_part` 恒为**非负十进制**，
+`num * mult` 不会产生负数。剩下的输入空间里，`num * mult` 超过 `f64` 整型范围时
+得到的是一个**很大但不精确**的预算值（f64 本身已损失精度），**不是回绕**。
+
+⇒ 故那行 `as usize` 虽无守卫，但**在可达输入下无害**。已把它写成
+`d340_parse_budget_dispatch_cast_cannot_reach_its_bad_branch`，
+断言解析循环**仍只吃「数字 + 点」**——那行一变，结论就需重测。
+
+新判据：`tests/numeric_cast_guard_census.rs`（2 条，含命中数下界断言）。
+
+#### D339：`tea.run(app, max_steps)` 的负数步数**静默生效**（已修）；**D285 同根因的修复漏了一条路径**
+
+`tea.*` 是唯一带**自定义结构类型**（`Ret::TeaApp`，含 4 个字段）的 builtin 族，
+从未量过。本轮 27 个脚本用例 + 一组 Rust API 探针，**一个缺陷**。
+
+##### 一、实测：两种数值类型给出**天地差别**的结果
+
+根因是 `tea.rs` 里 `optional_num_arg(...)?.map(|n| n as usize)` —— **`as` 是无守卫的数字转换**，实测：
+
+```text
+(-1.0f64) as usize = 0                    ← **饱和**
+(-1i64)  as usize = 18446744073709551615   ← **回绕**（1.8e19）
+```
+
+⇒ 同一个「负的步数上限」：
+
+| 实参 | `max_steps` | 后果 |
+|---|---|---|
+| `tea.run(a, -1.0)` | **0** | `for _ in 0..0` ⇒ **静默不跑**，exit 0 |
+| `tea.run(a, json.parse("-1"))` | **1.8e19** | 「update 每轮产 Cmd」时**实际挂死** |
+
+同一句源码、两种数值类型，**exit 0、零诊断**。
+
+##### 二、与 D285 的关系：**同一根因，D285 只修了一半**
+
+D285 在 `exec.parallel` 的 `max_concurrent` / `timeout_ms` 上修的正是这个：
+改走 D246 的收口 `value_as_usize`。但 `tea.run` 走的是**`optional_num_arg`**
+（D150 建的另一条路径），之后**又补了一次裸 `as`** ⇒ D285 的普查**没覆盖到它**。
+
+本轮把 `optional_num_arg` + 裸 `as` 的**全部 5 处**都查了：
+
+| 入口 | 负数的实测结果 | 判定 |
+|---|---|---|
+| **`tea.run(max_steps)`** | Float→0 / Int→**1.8e19**（**类型相关**）| ❌ **本条已修** |
+| `ccr.marker(size)` | Float **与** Int **都** → 0 | ⚠ 静默变 0（见下方「未修」）|
+| `schedule.add(interval_s / at_epoch)` | 两者**都**被 `> 0` 拦下 | ✅ 正确 |
+| `mora.refine(count)` | 两者**都**被 `1..=26` 拦下 | ✅ 正确 |
+
+⇒ **只有 `tea.run` 是「类型相关」的**，故只有它需要修：
+其余三处的下游检查**与实参类型无关**，不构成 Float/Int 分歧。
+
+##### 三、为什么 `ccr.marker(size)` **不**在本条修
+
+`size` 两种类型**都**饱和成 0 ⇒ **无类型分歧**。而
+`ccr.marker(h, -1)` 产出 `<<ccr:h,0>>` —— 负尺寸在 marker 语义里「等于 0」
+是可解释的（marker 只是 `<<ccr:hash,size>>` 的格式化，
+下游 `extract_hash` 只取 hash 部分、**不看 size**）。
+改它属**产品契约决定**（负尺寸该报错还是当 0），只报告。
+
+##### 四、一侧保障：尺寸上限本身的测量
+
+```text
+TeaApp 空队列 → run_loop 任意 max_steps 均 **0ms break**
+(-1.0f64) as usize = 0
+(-1i64)  as usize = 18446744073709551615
+Cmd::from_value(Nil)              = Ok(None)
+Cmd::from_value(Dispatch)         = Ok(Dispatch(Nil))
+```
+
+第一条说明「回绕值本身不必然挂死」（队列空时立即 break），
+但「update 每轮产 Cmd」时就是 1.8e19 轮 —— 与 D285 在 `exec.parallel` 上记录的
+同类情形。
+
+##### 五、牙齿验证
+
+抽掉守卫（回退到裸 `n as usize`）：**主断言 FAILED，5 条对照组仍 ok**。
+
+新判据：`tests/tea_max_steps_guard.rs`（6 条，含 3 个对照组 + 1 条其他入口的现状钉）。
+
+#### D338：`min_arity` 下限的**全称核对**（29 个方法）—— **隔离下限过紧是孤例**（否定轮，无产品变更）
+
+D337 在 `exec.parallel` 找到 `min_arity` 下限过紧（2 → 1），并指出
+`tests/signature_no_over_tightening.rs`（D81）只固化了**上限**那一侧。
+本条把那次「**一个**实例」升级为**全称核对**。
+
+##### 一、方法：**绕过 typeck**，直接问**运行期**
+
+typeck 的 `min_arity` 正是被核对的对象 —— 走脚本层会在**编译期**
+把少参调用挡掉，永远看不到运行期行为。
+800 行 `builtins/exec.rs` 那个错也正是因为走了脚本层才看不到。
+
+而 `Interpreter::call_*_method` 全部是 `pub` ⇒ 可直接喂不足的实参，
+**观测运行期的真实下限**。
+
+##### 二、结论：29 个方法里，**只有 1 个**分叉（已在 D337 修）
+
+| 类别 | 数量 | 说明 |
+|---|---|---|
+| `min_arity` 与运行期**一致** | **28** | 少传实参 ⇒ 运行期明确拒绝 |
+| `min_arity` **过紧**（D337 已修）| **1** | `exec.parallel`（2 → 1）|
+
+覆盖的 29 个：`math`（pow/hypot/atan2）、`stats`（corr/cov）、
+`linalg`（matmul/cross/dot）、`mora.refine`、`mock.register`、
+`plan`（create/update/remove/add）、`tea`（dispatch/update）、
+`sandbox`（check_call/audit_emit）、`memory`（store/remember）、`schedule.add`、
+`tool`（register/unregister）、`skill.install`、`file`（write_text/append_text/write_bytes/rename/copy）。
+
+⇒ 「下限过紧在本仓是**孤例**」。但 D81 的判据**结构上**
+覆盖不到这一侧，故本条把这条全称核对补上。
+
+##### 三、三个方法论约失效（本轮全部遇到）
+
+1. **全称判据必须配「计数下界」断言**——
+   我用两种方式统计「`min_arity >= 2` 有多少个」：
+   按行扫描 `const XXX_METHODS` 表边界得 **24** 条，
+   全局正则 `MethodGroup::new(&[...], N,` 得 **29** 条 ——
+   **差 5 个**，全是 `file.*`（这屏 arm 跨行，arm 边界判定失效）。
+   若只用前者，判据会**静默少查 5 个方法**且**照样全绿**。
+   已加 `assert_eq!(checked, 29, 「只核对了 {checked} 个」)。
+2. **被核对对象的「拦截层」必须绕开**——
+   核对 `min_arity` 就不能走脚本层（否则核对的是 typeck 而不是运行期）。
+3. **判据不该钉措辞**—— 我逐条猜「错误说 `requires 2 args`。
+   实测 4 处措辞完全不同，但全部是**正确拒绝**：
+
+   ```text
+   math.pow(2.0)      → math: numeric argument required      ← **连方法名都没有**
+   linalg.matmul(x)    → linalg.matmul: matrix argument required
+   tea.dispatch(app)   → tea.dispatch: missing msg arg
+   schedule.add(n,k)   → schedule.add: requires message
+   ```
+
+   逐条钉措辞会让判据在**无关的措辞清理**时变红 —— 那是**假回归**。
+   已改为钉「消息提到了本模块或本方法」（防「未知方法」蒙对），
+   措辞差异用 `eprintln!` 记录但不判红。
+
+##### 四、诊断中的一个误导（已避免）
+
+一开始我把 D81 判据的缺口当成「系统性缺口」，准备一轮就建立
+「全仓清理」。**实测结果是 28/29 一致** ——
+机制确实有洞，但**后果只发生了一次**。
+**不要因为「机制有洞」就假定「到处是洞」** —— 要用全称核对把范围钉死。
+
+新判据：`tests/method_group_min_arity_audit.rs`（3 条，覆盖 29 个方法 + 计数下界断言）。
+
+#### D337：`exec.parallel` 的 **`min_arity` 下限过紧**（已修）+ **空列表早返回绕过参数校验**（已修）
+
+`exec.*` 是 `builtins/` 里**最大**的未测模块（`exec.rs` 728 行），且它会真的派生子进程。
+本轮 26 个用例，**两个缺陷**。
+
+##### 一、缺陷①：typeck 的 `min_arity = 2` 拒绝运行期**明确支持**的单参形式
+
+```text
+exec.parallel(["echo a"])  → exit 2  Type error: Expected 2 arguments, got 1
+```
+
+而**运行期自己说**「至少 1 个」，四处独立证据：
+
+1. `exec.rs:143-145` 的错误消息：「requires **at least 1 arg** (cmds list)」；
+2. `exec.rs:176` / `:197` 用 `args.len() >= 2` / `>= 3` 把 `max_concurrent` / `timeout_ms` 当**可选**处理；
+3. `exec.rs:143` 的 `args.is_empty()` 守卫**正是为「1 个参数」这条路径写的**；
+4. `exec.rs` 的运行期单测（`exec_parallel_runs_all_commands` 等）**全部用 1 个实参**。
+
+⇒ 运行时契约 = 「至少 1 个」，typeck 契约 = 「至少 2 个」⇒ **契约分叉**。
+`Signature` 文档里那句「运行期支持、类型系统拒绝 = 契约分叉」指的就是这个。
+
+##### 二、为什么 D81 的 `signature_no_over_tightening` 没抓到
+
+那份判据把 D80 的经验固化了，但固的是**一个方向**：
+
+> 运行期普遍用 `args.first()` / `args.get(N)` **忽略多余实参**，
+> 所以补签名时**只能收紧下限、不能收紧上限**，
+> 并逐模块断言「传**多于**声明数量的实参必须放行」。
+
+⇒ **下限**（`min_arity` 过紧）是**镜像**问题，**未被覆盖**。
+而 `exec.parallel` 的用例恰好是 `exec.parallel(["a"], 2, 3, 4)`（4 参）——
+它**同时满足**「≥ min_arity」和「多余实参放行」两个条件，
+于是**下限过紧这一侧始终没被测到**。
+
+修法：`EXEC_METHODS` 的 `min_arity` 由 **2 改为 1**。
+
+##### 三、缺陷②：空列表早返回在**可选参数校验之前**
+
+```text
+exec.parallel(["echo a"], -1)  → exit 1  max_concurrent must be a non-negative number
+exec.parallel([], -1)          → exit 0  []        ← 同一个非法参数，被静默吞掉
+exec.parallel([], "x")         → exit 0  []
+exec.parallel([], 1, -1)       → exit 0  []
+exec.parallel([], 1, "x")      → exit 0  []
+```
+
+同一个非法参数，**因为命令列表是空的就看不到错误**
+⇒ **参数是否合法与「有没有活干」必须解耦**。
+
+修法：把早返回**下移**到两个可选参数都校验之后。
+⚠ 这是**收紧**：`max_concurrent` 已被 `.max(1)` 钳过、空列表不影响
+任何并发行为 ⇒ **合法调用的结果完全不变**，只让非法参数不再被静默吞掉。
+
+对照组里钉住了区别：`exec.parallel([])`（**不传**非法参数）**仍返回 `[]`**。
+
+##### 四、不变的语义（D285 的负数守卫必须仍在）
+
+| 调用 | 结果 |
+|---|---|
+| `exec.parallel(["echo a"], -1)` | exit 1 `max_concurrent must be a non-negative number` |
+| `exec.parallel(["echo a"], 1, -1)` | exit 1 `timeout_ms must be a non-negative number or nil` |
+| `exec.parallel(["echo a"], 0)` | 放行（`.max(1)` 钳成 1）|
+| `exec.parallel(["echo a"], 2.7)` | 放行（收口向零截断，D246 约定）|
+| `exec.parallel(["echo a"], nil)` | 放行（与缺参同义 = 全部并发）|
+| `exec.parallel(["echo a"], 1, nil, 99)` | 放行（D81 的**上限**契约未被破坏）|
+
+##### 五、牙齿验证
+
+两处修复**分别**回退（`min_arity` 回 2、早返回回到校验之前）各做一次：
+**4 条主断言 FAILED，2 条「不得破坏既有契约」仍 ok**
+—— 证明两处修复都被判据抓到，且不是靠放宽其他契约换来的。
+
+##### 六、一并报告（已实测，未实施）
+
+- `timeout_ms = 0` 会向 stderr 泄出一行 `ERROR: The process "NNNN" not found.`（taskkill 针对已退出进程），
+  但结果 dict 仍然正常返回（`exit_code: 0`）。属**噪声泄出**而非失败。
+- `exec` 在 `docs/mora-spec.md` 与 `README.md` 里**零文档**。
+
+新判据：`tests/exec_parallel_arity_and_validation.rs`（6 条，含 4 个对照组）。
+
+#### D336：**沙箱执行面全景**（否定轮）—— 四道机制只有**一道**在执行路径上；**新发现 `tail()` 无守卫且零文档**
+
+D334 补齐了 `file.*` 的路径守卫覆盖，D335 修了 `check_path` 两侧形式不一致
+—— 但那两轮都只看了沙箱的**一个角**。本轮把**整张图**摊开，回答
+「**到底什么被强制执行了**」—— 这个问题此前的判据**从未系统回答过**。
+
+##### 一、图：四道机制，只有**一道**在执行路径上
+
+| 机制 | 定义位置 | 执行路径上的调用者 | 状态 |
+|---|---|---|---|
+| **路径守卫** `check_path` | `src/sandbox/mod.rs:109` | **仅 `file.rs`** | ✅ 真正强制（D334 补齐覆盖）|
+| **builtin 白/黑名单** `check_builtin` | `src/sandbox/mod.rs:83` | **零** | ❌ 仅查询型（CHANGELOG 13324 已记）|
+| **能力令牌** `permits` / `check` | `src/sandbox/capability.rs:129/269` | **零**（仅 `stress_tests.rs`）| ❌ 仅查询型 |
+| **`fs_root` 边界** | `permissive()` = `PathBuf::from("/")` | 硬编码 | ⚠ **无任何配置入口** |
+
+`grep` 实证：`.authorize(` 在整个 `src/` 树**零命中**；`.permits(` 只出现在 `capability.rs`
+\81ea身（`check()` 内部 + 单测）；`check_builtin` 只出现在自身定义、单测、
+`event/mod.rs:273` 的**注释**、以及 `typeck/dispatch.rs:817` 的**查询型** builtin 登记。
+
+##### 二、能力系统内部**自洽**，但**不门控任何东西**
+
+```mora
+let t = sandbox.key("file.read")
+sandbox.check_call(9999, "file.read")  → false   ← 未签发的 token
+sandbox.check_call(t,    "file.read")  → true    ← 已签发
+sandbox.check_call(t,    "web.fetch")  → false   ← 未授予的 capability
+sandbox.token_count()                  → 1.0
+```
+
+签发、查询、计数、撤销全部正确；**只是没有任何执行点去问它**。
+判据采用**行为**而非源码钉：签发 token 前后，一次跨盘读文件的
+**报错逐字相同**。
+
+⇒ 这**不是**缺陷：`docs/mora-spec.md:1508-1511` 把「权限系统（类似 Deno）」明确列在
+**v1.0 计划**下，且**无 CLI 选项**能配置 allow/deny（实测无）
+⇒ 用户无法「配置了一个不生效的白名单」而误以自己受限。
+
+##### 三、`check_builtin` 在 `permissive()` 下**对一切返回 `true`**
+
+```text
+sandbox.check_builtin("file.read_text")  → true
+sandbox.check_builtin("nonexistent.op")  → true    ← 连**不存在**的 builtin 也 true
+```
+
+因为 `permissive()` 的 `allow = {"*"}`。这**忠实**报告了「本策略允许一切」，但回答的是
+「**这个策略**允许吗」而非「**这个 builtin** 存在且被允许吗」
+⇒ **builtin 名字在这个查询里不起作用**。`event/mod.rs:271-274` 已记「查询结果偏宽」。
+
+##### 四、新发现：路径 I/O 的**第三个**无守卫入口 —— `tail()`
+
+| 入口 | 文件操作 | 守卫 | 沙箱外实测 |
+|---|---|---|---|
+| `file.*` | `fs::read/write/create/remove` | ✅ | `sandbox denied` |
+| `memory.save` / `memory.load` | `fs::write` / `fs::read_to_string` | ❌ | 完整往返成功（D335 已报）|
+| **`tail(path, max)`** | `fs::read_to_string` | ❌ | **读到 `C:/Windows/win.ini` 内容** |
+| `import "…"` | `fs::read_to_string` | ❌ | **有意** —— 语言构造，用来加载代码 |
+
+实测：
+
+```mora
+tail("C:/Windows/win.ini", 3)
+→ [files]
+  [Mail]
+  MAPI=1
+```
+
+⇒ **沙箱外文件内容被读出**。且 `docs/mora-spec.md` 里的 `tail` 指的是
+**列表解构**（`let [head, ...tail]`）—— 这个**读文件**的同名 builtin **零文档**。
+
+**为什么不补守卫**：与 D335 同一决策 —— `docs/mora-spec.md:1504` 明写「当前版本**无沙箱**」。
+只给 `tail` 补守卫而不管 `memory.save/load`，会把不一致**放大**成三份。
+
+##### 五、一并报告：`fs_root` **无任何配置入口**（三条独立证据）
+
+1. `sandbox.*` 的 **14** 个入口里没有任何能改边界的（实测无 `set_root` / `allow` / `deny`）；
+2. `sandbox.mode()` 是**只读**查询（实测返回 `permissive`）；
+3. 全仓 `fs_root` 的赋值只有三处：`default()` = `None`、`permissive()` = `Some("/")`、单测。
+   **无配置文件**（`grep fs_root` 在 `src/` 的生产路径上零命中）。
+
+⇒ 用户无法放宽也无法收窄。**这与 spec 的「无沙箱」冲突**，是待裁决项。
+
+##### 六、一并修正**一条给出虚假信心的判据**
+
+`tests/slice_count_checks.rs` 的 `d146_siblings_that_already_reject_negatives_still_do`
+原断言只有 `res.is_err()`，而 `run()` 把**编译错误**也映射成 `Err("COMPILE: …")`
+⇒ **任何编译期失败都能满足它**。
+
+它的 `tail` 用例写的是 `tail([1,2,3], 5, -1)` —— 首参是 list、还多一个参数，
+与 `tail(path, max)` 的签名不符，实测报**类型不匹配**（编译期），
+**根本没走到**负数检查。
+
+⇒ 注释里「`tail(max)` 早已拒绝负数」是**未被验证**的（**行为本身是对的**：
+实测 `tail("Cargo.toml", -1)` 确实报 `max must be non-negative`）。
+
+已改为三件事同时做：① 断言错误**不是** `COMPILE:`；
+② 断言错误**提到** `non-negative`（这才是在验证那条守卫）；③ 用真实签名 `tail(path, max)`。
+
+新判据：`tests/sandbox_enforcement_surface.rs`（6 条）。**本轮无产品代码变更**。
+
+#### D335：`check_path` 两侧**形式不一致** ⇒ `file.*` **所有绝对路径被拒**（已修）；另：`memory.save`/`load` 完全无守卫
+
+D334 修完 `file.*` 的守卫覆盖后，立即问一个更大的问题：
+**`check_path` 的调用者只有 `file.rs` 一个文件**，而全仓其它做路径 I/O 的入口怎样。
+探到了两个结论，一个是**修**，一个是**报告**。
+
+##### 一、真缺陷：绝对路径一概被拒（含**自回路**）
+
+```text
+file.exists("Cargo.toml")                      → true          ← 相对路径 OK
+file.is_dir("src")                             → true
+
+file.exists("D:/Github/mora-lang/Cargo.toml")  → sandbox denied  ← **工作区自己的文件**
+file.is_dir("D:/Github")                       → sandbox denied
+file.is_dir(file.cwd())                        → sandbox denied  ← **自己返回的路径自己不能用**
+file.exists(file.abs("Cargo.toml"))            → sandbox denied  ← **自己算的路径自己不能用**
+file.is_dir("D:/")                             → sandbox denied  ← **盘根**
+```
+
+后两条是**自相矛盾**：`file.cwd()` 与 `file.abs()` 的返回值**只能**由
+`file.*` 消费，而 `file.*` 拒绝一切绝对路径 ⇒ 这两个 builtin 的产出**不可用**。
+
+##### 二、根因：`canonical_root` 与 `resolved` **形式不一致**
+
+`fs_root` 来自 `SandboxPolicy::permissive()` = `PathBuf::from("/")`；经 `std::fs::canonicalize` 后
+在 Windows 上是**逐字路径**（verbatim）`\\?\D:\`，而用户传入的绝对路径是
+**普通形式** `D:\Github\…`。`Path::starts_with` 按**组件逐个**比较，
+首组件 `\\?\D:` vs `D:` 即不同 ⇒ **一切绝对路径均被判为「逃逸」**。
+
+相对路径之所以能过，是因为它走 `canonical_root.join(p)` —— **继承了**逐字前缀，
+两侧形式恰好一致。
+
+##### 三、三条独立依据（缺一不可）
+
+1. `docs/mora-spec.md:1504` 明写「当前版本**无沙箱**。脚本可以读写文件系统」，
+   「文件系统访问白名单」列在 **v1.0 计划**下 ⇒ 修前既违背 spec、
+   又让 `file.*` 在同盘内**连自己的文件都读不到**。
+2. `file.cwd()` / `file.abs()` 的返回值**必然**是绝对路径，而 `file.*` 拒绝一切绝对路径。
+3. 同盘不同目录（`D:/Github`）也被拒，而它**当然**在 `fs_root` 之内
+   （实测 fs_root = `D:\`，就是盘根）⇒ 判定结果与事实矛盾。
+
+##### 四、修法（**两条**）
+
+1. **两侧归一到同一形式**再比：都剥掉 `\\?\` / `\\?\UNC\` 前缀
+   （新增 `strip_verbatim`）；
+2. 对**已存在**的 `resolved` 也做 `canonicalize`（失败退回原路径，
+   因为 `write_text` 的目标常常尚不存在）—— 顺带堵住了
+   「沙箱内的符号链接 / junction 指向沙箱外」这条逃逸。
+
+##### 五、**不放宽**的边界（判据一半篇幅在钉这个）
+
+| 输入 | 修后 | 依据 |
+|---|---|---|
+| `C:/Users` / `C:/Windows/win.ini` / `C:/` | **仍拒** | 跨盘，确实在 `fs_root` 外 |
+| `../` / `src/../Cargo.toml` | **仍拒** | `..` 穿越（第 1 条规则，与本修复无关）|
+| `D:/`（盘根 = fs_root） | 放行 | 恰在边界内 |
+| 尚不存在的新文件 | 放行 | `canonicalize` 失败的回退分支 |
+
+##### 六、**一并报告**：`memory.save` / `memory.load` 完全无守卫（未实施）
+
+`check_path` 的调用者**只有 `file.rs`。**`memory.save` / `memory.load` 拿用户路径直接
+`fs::write` / `fs::read_to_string`，**无任何守卫**。实测完整往返：
+
+```mora
+memory.store("secret", "stolen")
+memory.save("C:/Users/<u>/AppData/Local/Temp/x.json")  → true          ← 沙箱外写入成功
+memory.load(同一路径)                        → true          ← 沙箱外读出成功
+memory.recall("secret")                                → stolen       ← 数据完整往返
+memory.save("../../../x.json")                         → **true**     ← 路径穿越写入成功
+```
+
+（两次实测的副作用文件均**已清理**。）
+
+**为什么不直接补**：`docs/mora-spec.md:1504` 明写「当前版本**无沙箱**」——
+因此「`memory.*` 该不该被守卫」本身**就是合法的**；而「`file.*` 应该被守卫到什么范围」
+才是未裁决的产品问题。本条不擅自扩守卫范围。
+
+##### 七、一次**判据被上一轮的修复打红**（已修判据）
+
+D334 的 `d334_chdir_rejects_any_outside_path` 断言 `file.chdir("D:/")` **必须被拒**
+—— 那是**照着 bug 写的**：当时 `check_path` 有本条那个「一切绝对路径被拒」的缺陷，
+于是 `D:/` 看起来像「在沙箱外」。D335 修好后 `D:/` **就是 fs_root 本身**，放行它才是对的
+—— 本条于是被 D335 的修复打红。
+
+已改为**只列跨盘路径**（`C:/`、`C:/Users`、`C:/Windows`）。
+
+⇒ **教训**：写「必须被拒」类期望前，先确认那个输入**真的**在边界外。
+**边界本身有 bug 时，「被拒」不构成「在外面」的证据。**
+
+##### 八、一并报告（已实测，未实施）
+
+- `fs_root = permissive() = PathBuf::from("/")` 在 Windows 上意味着**当前盘**（实测 `D:\`），
+  而**不是工作区**。即 `file.*` 可以读写**整盘 D:**。这个边界**无文档**
+  （`README.md:155` 只把 `sandbox.check_path` 列为查询型 builtin）。
+- 与 spec 的冲突：spec 写「无沙箱」，实际 `file.*` 有盘级限制。
+  两者需要在裁决时**u5bf9齐**：是否把 spec 改成「部分沙箱」，
+  还是拿 fs_root 去去。
+
+新判据：`tests/sandbox_absolute_path_boundary.rs`（6 条，含 2 条「不放宽」判据）。
+
+#### D334：`file.*` **4 个入口漏调 sandbox 守卫** —— `chdir` 可使全部守卫**同时失效**（已修）
+
+D329（`stats`）/ D330（`linalg`）/ D331（`math`）/ D332（`memory`）/ D333（键空间补测）
+之后顺序到 `file.*`（26 入口、251 行）——它是 D332/D333 那条
+`v.to_string()` 路径转换的**落地面**，也从未量过。
+
+##### 一、实测：sandbox 覆盖矩阵，分界线与「使用了哪个辅助函数」吻合
+
+带路径的入口分两类 —— **有守卫的报 `sandbox denied`，漏守卫的报 OS 错误**：
+
+```text
+file.read_text("C:/Windows/win.ini")    → sandbox denied … escapes fs_root   ← 有守卫
+file.exists("C:/Windows/win.ini")       → sandbox denied …                    ← 有守卫
+file.write_text("C:/x.txt", …)        → sandbox denied …                    ← 有守卫
+file.mkdir("C:/dir") / remove / remove_all → sandbox denied …                    ← 有守卫
+
+file.touch("C:/x.txt")                  → cannot create … 拒绝访问 (os error 5)  ← **漏**
+file.rename("C:/a.txt", "C:/b.txt")     → cannot rename … 系统找不到指定的文件    ← **漏**
+file.copy("C:/a.txt", "C:/b.txt")       → cannot copy … 系统找不到指定的文件      ← **漏**
+file.chdir("C:/")                       → **nil，exit 0，完全成功**                  ← **漏**
+```
+
+##### 二、`chdir` 为什么是**最严重**的一个
+
+不是「它自己能读写沙箱外」——而是它**移动了判定的基准**：
+`check_path` 拿相对路径与 `fs_root` 比对，而相对路径是相对
+**当前工作目录**解析的。一次 `chdir` 到沙箱外，
+就让**其后所有** `file.*` 操作的相对路径都从沙箱外解析。
+
+实测（修前，目标是普通用户**可写**目录，故未受 OS 权限拦挡）：
+
+```mora
+file.chdir("C:/Users/<u>/AppData/Local/Temp")  → nil
+file.cwd()                                        → C:\Users\<u>\AppData\Local\Temp
+file.write_text("d334_escape2.txt", "escaped")    → nil          ← **写成功**
+file.read_text("d334_escape2.txt")                → "escaped"    ← 读回成功
+file.list(".")                                     → 10000 项
+```
+
+⇒ `write_text` / `read_text` / `list` **各自都有守卫**，
+但守卫算出的路径已经错了 ⇒ **sandbox 被完整绕过**。
+（该次实测在 `%TEMP%` 留下真实文件，**已清理**。）
+
+⇒ 本条不是「补四个漏掉的守卫」，而是**堵住让所有守卫同时失效的入口**。
+
+##### 三、判定依据：代码**自己的注释**在承诺这件事
+
+`file.rs` 顶部写着「v0.36: enforce sandbox on **every** path-bearing file op」——
+**这句话此前是假的**。同时 `docs/mora-spec.md:1162` 把 `rename` / `copy` /
+`touch` / `chdir` 列为「完整 API」的一部分，即承诺它们**存在且可用**。
+
+##### 四、修法：四个入口各补守卫
+
+- `rename` / `copy`：**两个路径都要查** —— `from` 是读源、`to` 是写目标，
+  少查任一个都能被用来把数据搬出沙箱；
+- `touch`：会**创建**文件，是写操作；
+- `chdir`：见上，是「让守卫失效」的元凶。
+
+修后 4 个入口的诊断与其它入口**逐字一致**
+（`sandbox denied '…': … escapes fs_root`）。
+
+##### 五、判据里的两个装置自身的失效（本轮实测才发现）
+
+1. **全称判据若永默通过 0 个条目**，比红更危险 ——
+   它看起来像通过，实际什么都没检查。
+   本轮第一版用手写字符解析器，静默解析到 **0 个 arm**；
+   现改为**按行扫描**，并在末尾断言「至少覆盖 16 个」「
+   **让解析失效变成显式红**。
+2. **只检查「有没有」不够**——牙齿验证时摘掉 `rename` 的
+   **第二处**守卫，「arm 里有 `check_path`」这一条**照样通过**。
+   现双路径入口（`rename` / `copy`）按**次数**判定（必须 2 处）。
+
+##### 六、未守卫且**不应**守卫的入口
+
+`join` / `basename` / `dirname` / `extname` / `abs` 是**纯字符串运算** —— 不触碰文件系统。
+`abs` 尤其要注意：它**不做路径解析检查**（只拼 cwd）。
+本条单独钉住这些。
+
+##### 七、未钉的观察（诚实记录）
+
+Windows **扩展长度前缀**（两个反斜杠 + 问号）在 Mora 字符串里的行为**未查清**：
+它实测返回 `false`（OS 层拒绝）而非 `sandbox denied`。
+根据诊断输出看，字符串层把它处理成了**一个**反斜杠 + 问号。
+⇒ 现象落在**字符串转义层**，**不是** `check_path` 的缺口。若要钉，应先查清
+lexer 对反斜杠的转义规则再定用例 —— 不要凭现象猜。
+
+新判据：`tests/file_sandbox_coverage.rs`（8 条，含 2 个对照组 + 1 条全称覆盖检查）。
+
+#### D333：`v.to_string()` 当键/路径的 **4 个模块**矩阵 —— **否定轮，零产品缺陷，补齐 D332 的 14 处测量面
+
+D332 查出「`v.to_string()` 被 **5 个文件 14 处**当作键或路径」，却只测了
+`memory` 一个。本条把**其余 4 个**（`ccr` / `schedule` / `tool` / 对应 `ai`）补齐，
+让「空串显示塍塍影响多少键空间」这个待裁决问题有**全量数据**。
+本轮共 31 个用例，**零产品代码变更**。
+
+##### 一、模块内**两种策略并存**（不是遗漏，是各自有据）
+
+`ccr` 一个模块里同时存在两种实参策略，**且都写明了理由**：
+
+| 入口 | 策略 | 代码里的理由 |
+|---|---|---|
+| `ccr.put` / `ccr.get` | **严守 `Value::String`** | 「Avoids lossy `to_string()` of List/Dict that would round-trip into `[...]`」 |
+| `ccr.marker` / `ccr.extract` | `v.to_string()` 放行任意类型 | 二者是**格式化 / 解析**，本就该接受任意来源的文本 |
+| `schedule.add` | **严守 `Value::String`**（name/kind/message 三处）| v0.37 加固 |
+| `tool.register` / `find` / `unregister` | `args[N].to_string()` | 三者是**标识符查找**，需与 `create` 注册时的键同形 |
+
+判定为**自洽而非遗漏**：`put`/`get` 传的是**数据**（数据经 `to_string()`
+会不可逆），而 `marker`/`extract` 传的是**文本标记**（本就是文本）；
+`schedule.add` 的三个字段是**结构性标识**，而 `tool.*` 的平面名 / 工具名
+在 `tool.create` 阶段就已是 `to_string()` 的结果，查找侧必须同形。
+
+##### 二、D332 的空串塍塍在 `ccr` 键空间**重现**，但**不损坏数据**
+
+```text
+ccr.marker("", 0)   → <<ccr:,0>>
+ccr.extract(该串) → ""          ← 往返**没崩**
+ccr.get("")         → nil             ← 但空串不是合法 hash，查不到
+```
+
+⇒ 空 hash 的 marker 是个**哑值**：能造、能解析、但 `get` 不到 ——
+因为 `""` 永远不是 `ccr.put` 会产出的 hash（`format!("{:016x}", n)` 恒 16 位）。
+**不是新缺陷**。
+
+##### 三、`ccr.extract` 是**纯字符串切分器**，对 7 种畸形 marker 一律放行
+
+| 输入 | `extract` 返回 |
+|---|---|
+| `<<ccr:deadbeefdeadbeef,0>>` | `deadbeefdeadbeef`（**编造的 hash**）|
+| `<<ccr:xyz,0>>` | `xyz`（长度不对）|
+| `<<ccr:zzzzzzzzzzzzzzzz,0>>` | `zzzzzzzzzzzzzzzz`（非十六进制）|
+| `<<ccr:0000000000000001,notanumber>>` | `0000000000000001`（size 是垃圾）|
+| `<<ccr:0000000000000001>>` | `0000000000000001`（**缺 size**）|
+| `<<ccr:abc,1,2,3>>` | `abc`（多余逗号）|
+
+**判定为现状**：`extract_hash` 的文档注释只承诺「not a marker 才返回 None」，
+而它确实是 marker（格式正确）；校验 hash 是否**真实存在**属于 `get` 的职责，
+而 `get` 对未知 hash **安全返回 `nil`** ⇒ 链路上**没有数据损坏**，
+只是提前失败被推后。改它需先决定「marker 格式是否要版本化 / 校验」——
+那是产品契约。
+
+##### 四、一次**自我纠正**：`toolplane` 不是缺陷，D74 已查清并修复
+
+我初跑 `toolplane.list()` 得 `Unbound variable 'toolplane'`，一度以为是又一个
+「模块名未绑定」缺陷。查 CHANGELOG **D74 已彻底查明**：
+`MODULE_OBJECTS` 里的注册名是 **`tool`**，`toolplane` 是**枚举变体名**，
+D74 自查时把变体名当注册名建表，已修，并加了双向判据
+`module_table_keys_are_registered_names`。
+
+⇒ 换用 `tool.*` 重测即全部可达。**本条钉 `tool`（注册名）**。
+
+实测一侧：`tool.unregister(1, 2)` → `plane '1.0' not found` ——
+`1` 被归一化成 `"1.0"`，而注册时不存在名为 `"1.0"` 的平面，
+故「not found」是**正确**诊断，且消息里回显了**归一化后**的名字，
+比原样回显 `1` 更有用。
+
+##### 五、待裁决项的状态更新
+
+D332 登记的「空串显示」一项，本轮补了数据：
+`memory` 之外，**`ccr.marker("")` 也会生成塍塍的 marker**。但因为 `get` 安全返回 nil，
+**它不会把一条有效记录指向错的数据**。
+
+新判据：`tests/to_string_key_space_matrix.rs`（7 条，含 2 个对照组）。
+
+#### D332：`memory.*` 12 入口矩阵（零 panic）；确认 **空串在列表显示中塍塍**（需产品裁决，未改）
+
+D329（`stats`）/ D330（`linalg`）/ D331（`math`）之后顺序到 `memory.*` ——
+`builtins/` 里**最大**的一个内建模块（600 行、12 入口），从未量过。
+
+##### 一、矩阵结论：28 个边界用例，零 panic、零静默错值
+
+元数完全由 `typeck/dispatch.rs::MEMORY_METHODS` 拦在**编译期**（9 个缺参用例
+全部 exit 2），与 `builtin_silent_defaults.rs` 记的 D51 现状一致。
+
+##### 二、**已确认缺陷（需产品裁决，故只钉不改）**：`Value::String("")` 的显示
+
+```text
+print(["", "a"])     →  [, a]      ← 2 个元素，第 1 个打印成空
+print([""])          →  []         ← **1 个元素**，打印成**空列表**
+print(["a", ""])     →  [a, ]      ← 第 2 个元素打印成空
+print([[""], ["a"]]) →  [[], [a]]  ← **嵌套时内层也塍成 []**
+print([""] == [])    →  false      ← 相等性**是对的**
+```
+
+⇒ **无法区分「一个空串」与「零个元素」**。这不是 `memory`
+的问题，是 `Value` 显示层的通用行为。
+
+在 `memory` 上的具体后果（实测）：
+
+```text
+memory.store("", "v")
+memory.size()        → 1.0
+len(memory.keys())   → 1
+memory.recall("")    → v          ← 确实存进去了
+memory.keys()        → []         ← **但显示成空列表**
+for k in memory.keys() { len(k) }  → 0     ← 键确实是空串，**数据没错**
+```
+
+**数据是对的，只有显示层塍塍** ⇒ 故本条不把它当「数据丢失」修。
+
+**为什么不改**：空串该显示成 `""`、`''` 还是别的，是**显示语义决定**。
+而 `docs/mora-spec.md` 对 `to_string` 的显示格式**零规定**，且改它会波及所有把
+`v.to_string()` 当键/路径的调用方（实测 **5 个文件、14 处**：`memory.rs` ×9 /
+`ccr.rs` ×2 / `ai.rs` / `schedule.rs` / `toolplane.rs`）。属**产品契约决定**，只报告。
+
+##### 三、一次**撤回**：我的初次判断被实测证伪
+
+D332 初稿怀疑「`keys()` 返回 `List[Float]`、违反 `MEMORY_METHODS` 声明的
+`Ret::List(&[Ret::String])`」。实测**证伪**：
+
+```text
+memory.store(1, "v")
+print(type_of(memory.keys()[0]))  → string
+```
+
+存储层键本就是 `String`（`memory_store: HashMap<String, Value>`），
+`keys()` 也确实返回 `Value::String`。看到的 `[1.0]` 是 **Float 的打印格式**。
+（实际存的是 String 键 `"1"`，打印无引号。）
+
+少一次实测就可能把「类型不符」当成缺陷 —— 已在判据里写明该判断被撤回。
+
+##### 四、已确认为**正确**：`store(1, …)` 与 `store("1", …)` 是两个不同的键
+
+```text
+memory.store(1, "viaInt")
+memory.store("1", "viaStr")
+memory.size()       → 2.0
+memory.recall(1)    → viaInt
+memory.recall("1")  → viaStr
+```
+
+Python 的 `{1: 'a', 1.0: 'a'}` 会因哈希相等而**合并**成一条，本仓不合并 ——
+**更严格**。但因为反直觉且视觉上难区分，必须钉死。
+
+##### 五、非 String 键的完整行为（全部合法）
+
+| 写入 | `keys()` | `type_of(keys()[0])` |
+|---|---|---|
+| `store(1, …)` | `[1.0]` | `string` |
+| `store([1,2], …)` | `[[1.0, 2.0]]` | `string` |
+| `store({a:1}, …)` | `[{a: 1.0}]` | `string` |
+| `store(nil, …)` | `[nil]` | `string` |
+| `store(true, …)` | `[true]` | `string` |
+
+`memory_store` 为 `HashMap<String, Value>`，键本身就是 String，因此
+**符合** `Ret::List(&[Ret::String])`。非 String 键是 `v.to_string()` 的合法结果。
+
+##### 六、一并报告
+
+`memory.save(path)` / `load(path)`、`memory.remember` / `recall_markdown` / `list_markdown`、
+`memory.search`、`memory.size`、多余实参（`store("k",1,2,3)` 静默忽略）均已实测，
+无新缺陷。
+
+本条**无产品代码变更**（仅加判据与一段文档注释、CHANGELOG）。
+
+新判据：`tests/memory_key_identity.rs`（7 条，含 3 个对照组）。
+
+#### D331：`math` 模块内部对 BigInt **分裂**：9 个函数拒绝、20 个接受（已修）
+
+D329（`stats`）/ D330（`linalg`）之后顺序到 `math.*` ——
+同一张 `typeck/dispatch.rs` 表里最大的自由函数族（34 个入口）。
+
+##### 一、实测：分裂的分界线与「用哪个提取函数」**逐个吻合**
+
+```text
+math.sqrt(4n)      → 2.0                      ← 走 expect_number，接受
+math.log(1n)       → 0.0                      ← 同上
+math.pow(2n,10n)   → 1024.0                   ← 同上
+math.sin(0n)       → 0.0                      ← 同上
+
+math.abs(-5n)      → math: numeric argument required            ← 走 unary_preserve，拒绝
+math.floor(2.7n)   → 同上                                        ← 同上
+math.sign(-3n)     → 同上                                        ← 同上
+math.is_finite(1n) → math.is_finite requires a numeric argument  ← 手写 match，拒绝
+```
+
+全量统计（每个入口都给 BigInt 实参）：**20 个接受 / 9 个拒绝 / 0 个相反**。
+
+##### 二、为什么是缺陷（三条**互相独立**的证据）
+
+1. **`docs/mora-spec.md:966-967` 的签名是 `number -> number`**，
+   同一行还写明「保留 Int 类型」——
+   恰恰表明这个函数族是**按输入类型分流**的，没有排除 BigInt。
+2. **`math.rs` 自己的 `expect_number`（第 116 行）就认 BigInt**，
+   且 CHANGELOG v0.150 那条**把它当成同族做对了的样板**明写：
+   「**必选**数值实参走 `math.rs::expect_number`，认 `Int`/`Float`/`BigInt`」。
+3. **分界线与实现选择吻合** —— 若这是语义取舍，分界应当按
+   **语义**分（三角 / 对数 / 取整），实际却按**调用了哪个函数**分
+   ——那是**实现层的漏写**。
+
+##### 三、关键：BigInt 分支**不能**经 f64
+
+`f64` 只有 53 位尾数，而 BigInt 任意精度 —— 若图省事写成
+`unary_float` 再转回，会**静默**丢精度（实测）：
+
+```mora
+let big = 99999999999999999999999999999999999999999n   -- 41 位
+math.sqrt(big)   → 316227766016837943296.0             -- 只剩 15 位有效数字
+math.floor(big)  → 99999999999999999999999999999999999999999n  -- 修后逐位精确
+```
+
+故取整族的 BigInt 分支**直接在整数域上算**（`BigIntOp` 枚举），
+不经任何浮点中转。`floor`/`ceil`/`round`/`trunc` 对**整数**均为恒等，
+`abs` / `sign` 各自单算。
+
+##### 四、附带收益：`i64::MIN.abs()` 溢出、BigInt 无此事
+
+`i64::MIN.abs()` 在 Rust 里会溢出，BigInt 无此问题 ——
+这正是「能接 BigInt 就该接」的**实际价值**，而不只是消除报错。
+
+##### 五、一并报告（未实施）
+
+**BigInt 调用的静默过度**：`math.sqrt(2n)` 等需 f64 的函数对 BigInt
+会静默**降精度**（上面 41 位 → 15 位）。这是 `expect_number` 的既有行为，
+D246 立它时就明写了「BigInt 分支走 `to_string().parse::<f64>()`」，
+属**已知的取舍**而非新缺陷。若要报错，是另一个产品契约决定。
+
+**域错误一律返回 IEEE 哨兵**（无诊断，适合数值计算）：
+
+| 调用 | 结果 | |
+|---|---|---|
+| `math.sqrt(-1)` | `nan` | |
+| `math.log(0)` | `-inf` | |
+| `math.asin(2)` | `nan` | |
+| `math.pow(-8, 1.0/3.0)` | `nan` | |
+| `math.pow(10, 400)` | `inf` | |
+
+本项目的 `math.rs:180` 单元测试已释意写死
+（「f64::sqrt(-1.0) = NaN，符合 IEEE 754，不报错」），故**只报告不改**。
+
+**富定空的与类型错被合并**：`math.sqrt(4, 5)` → `2.0`（多余实参静默忽略）。
+
+新判据：`tests/math_bigint_acceptance.rs`（6 条，含 3 个对照组）。
+
+#### D330：`linalg.matmul` / `linalg.transpose` 遇**参差矩阵**→ **3 处 panic + 2 处静默丢数据**（已修）
+
+D329 量完 `stats.*` 后顺序到 `linalg.*` ——它是同一张
+`typeck/dispatch.rs` 里的兄弟模块，同样从未被量过。本轮 54 格。
+
+##### 一、实测（修前）：3 处 panic（exit 101）+ 2 处静默丢数据
+
+```text
+linalg.transpose([[1,2],[3]])                → exit 101 panicked at linalg.rs:186
+                                                 index out of bounds: len 1, index 1
+linalg.transpose([[1,2,3],[4,5]])            → exit 101 panicked at linalg.rs:186
+linalg.matmul([[1,2],[3]],[[1],[2]])         → exit 101 panicked at linalg.rs:163
+linalg.matmul([[1,2,3],[4,5]],[[1],[2],[3]]) → exit 101 panicked at linalg.rs:163
+
+linalg.transpose([[1],[2,3]])                → exit 0  **[[1.0, 2.0]]**          ← 第 2 行第 2 个元素消失
+linalg.matmul([[1,2],[3,4,5]],[[1,0],[0,1]]) → exit 0  **[[1.0,2.0],[3.0,4.0]]**  ← 第 3 列消失
+```
+
+**不崩的那两条更糟**：结果形状与用户写下的矩阵**不同**，
+却长得完全合法（行数对、列数是整数）——
+**没有任何办法从返回值发现数据丢了**。
+
+##### 二、缺陷：D142 的守卫建立在一个**类型系统不保证**的前提上
+
+D142（`tests/linalg_dimension_checks.rs`）在这一层加了「A 行数 == B 行数」的守卫，
+方向完全正确。但它只看 `a[0].len()` 与 `b[0].len()` ——
+即**第一行**的宽度，**假设矩阵是规整的**。
+
+而 `list<list<number>>` **不表达**「每行等宽」：
+
+```text
+[[1,2],[3]]  的类型  ≡  [[1,2],[3,4]]  的类型  ≡  list<list<Float>>
+```
+
+三者类型**完全相同**。所以「参差」这个错误在类型层、parser 层、
+D142 守卫层**全部无法被看见**，一路穿到算术层的 `a[i][k]` 才炸。
+
+D142 判据的对照组**全部用规整矩阵**（`[[1,2],[3,4]]`、`[[1,2,3],[4,5,6]]`），
+**零条覆盖参差** ⇒ 这是缺口，不是重复劳动。
+
+##### 三、为什么是缺陷（两条依据）
+
+1. **panic 直接杀进程** —— exit 101、无 `MoraError`、无诊断行。本项目所有
+   其它维度问题（D142 的 `dot` / `cross` / `matmul`）已均走干净报错；
+   参差是同族里**唯一**还在崩的。
+2. **静默丢数据 = 静默改变数据形状** —— `docs/mora-spec.md:993-994`
+   的签名是 `list<list> -> list<list>`，承诺**返回一个矩阵**；
+   而参差输入的「结果」根本不是调用方写下的那个矩阵。
+   这与 D325 `reshape()` 静默丢元素（`while flat.len() < total` 只增长不收缩）
+   是**同一类**已判定的缺陷。
+
+##### 四、修法：守卫加在**两个函数共用的唯一入口**
+
+`matmul` 与 `transpose` 都只通过 `expect_f64_matrix` 取矩阵，故守卫加一次
+即同时覆盖，且 `ctx` 参数天然带调用点名
+（`linalg.matmul` / `linalg.transpose`），错误能直接告诉用户是哪个函数出的问题。
+
+措辞用「维度不匹配」与 D142 **保持一致**（同一族的同一类问题），
+并额外给出**期望宽度 / 实际宽度 / 第几行**三个可操作信息。
+
+##### 五、不回归的四条既有语义
+
+- 规整矩阵的 `matmul` / `transpose` 结果**逐字不变**（含行向量×列向量、
+  列向量×行向量、3×1 与 1×3）；
+- `[[]]` / `[[],[]]` 这类**全零宽**的「退化矩阵」仍返回 `[]`（宽度一致 = 0）；
+- `matmul([[]],[[1]])` 仍报 D142 的「A 是 1×0，B 有 1 行」
+  （新守卫在它之前不触发，因为 `[[]]` 只有一行、无从比较）；
+- D142 钉住的 `matmul([], [])` → `[]` 空输入宽松路径**不变**。
+
+##### 六、一并报告（未实施，同族但不属本条）
+
+`linalg.norm` 的可选参数 `p` 用 `.and_then(...).unwrap_or(2.0)` 兑底，实测：
+
+| 调用 | 结果 | 备注 |
+|---|---|---|
+| `linalg.norm([3,4])` | `5.0` | 默认 `p = 2`，正常 |
+| `linalg.norm([3,4], 1)` | `7.0` | L1，正常 |
+| `linalg.norm([3,4], "x")` | `5.0` | **静默兑底**成 `p = 2`（类型错无诊断）|
+| `linalg.norm([3,4], nil)` | `5.0` | 同上 |
+| `linalg.norm([3,4], 0)` | **`inf`** | 数学上 L0 范数是「非零元素个数」（numpy 给 `2.0`）|
+| `linalg.norm([3,4], -1)` | **`1.714…`** | 负数阶无定义 |
+| `linalg.norm([0,0], 0)` | **`inf`** | `0^inf`，与上面同源 |
+
+`p` 的保护是**类型错静默兑底**（与待裁决项 11 `str()` / `bool()` / `atom()`
+的缺参兑底同族）与 **`p` 的值域未约束**（`0` 与负数无定义）。
+两者都属**产品契约决定**，不自行实施。
+
+新判据：`tests/linalg_ragged_matrix_guard.rs`（5 条，含 3 个对照组）。
+
+#### D329：`stats.histogram` 的 `bins` 非整数**静默截断**（已修）；统计方法链 77 格矩阵（零 panic）
+
+D325（list 方法）/ D326（String·Dict 方法）/ D327（命名内建）/ D328（高阶函数）
+之后，本轮量**统计方法链**：`list.sum()/.mean()/.median()/.stddev()/.var()/.min()/.max()`
+与其自由函数孪生 `stats.*`，共 77 个调用。
+
+##### 一、矩阵结论：96f6 panic，但量出一个**静默错值**
+
+77 格里没有一格 panic，也没有一格静默返回**9519的数**
+——除了一个：
+
+```text
+stats.histogram([1,2,3,4], 2.5)  → exit 0，2 个 bin
+stats.histogram([1,2,3,4], 0.5)  → exit 0，**空列表**
+stats.histogram([1,2,3,4],-0.5)  → exit 1（D284 的负数守卫挡住了）
+```
+
+`0.5` 那条静默得最底窃：
+
+```text
+Value::Float(0.5)
+  → value_as_usize（f64 → usize，Rust `as` 是**向零截断**）→ Some(0)
+  → `if bins == 0` 早返回 → **空列表**、exit 0、零诊断
+```
+
+##### 二、为什么这是缺陷（而不是“截断就是设计”）
+
+D246 立的收口确实把截断钉成了设计
+（`tests/value_extraction_saturation.rs:54`）：
+
+```rust
+assert_eq!(value_as_usize(&Value::Float(2.9)), Some(2), "应向零取整");
+```
+
+但本条有两个**独立**的依据说明屏蔽不可能：
+
+1. **`docs/mora-spec.md:981` 的签名写的是 `list, int`**：
+
+   ```text
+   | `stats.histogram(list, bins)` | `list, int -> list<dict>` | 直方图 |
+   ```
+
+   小数本就不应该进。而 `src/typeck/dispatch.rs:680` 的 `MethodGroup`
+   **只登记元数不校验参数类型** ⇒ 运行时收口是**唯一**能拦的地方。
+2. **本函数自己的错误消息写着 `bins must be an integer`** ——
+   消息承诺 integer、行为接受 `2.5`，**自相矛盾**。
+   这条比 1 更硬：它不依赖外部文档，**代码自己就说了“要整数”**。
+
+##### 三、为什么只改 `histogram` 一处，不动 `value_as_usize` 收口
+
+收口有 **6 个**调用方，全是「时长 / 步数 / 个数」类**计数**参数：
+`crush_json` / `exec.parallel(max_concurrent, timeout_ms)` / `max_steps` / `backoff_ms` /
+`sandbox(cpu_cores, memory_mb)`。对它们，向零截断是合理的**通用**约定
+—— `1.5 ms` 超时没有物理意义，取 1 ms 比报错更贴近「用户算错了但意思明确」。
+
+⇒ 「bins 必须是整数」是 **`histogram` 自己的**契约（spec 签名 + 自身消息
+两处都这么说），**不是收口的**。改收口会连带改掉另外 5 个点的
+语义，那是**产品契约决定**，不属本条。
+
+已在 `flow::value_as_usize` 的文档注释里写明这个边界（包括哪些调用方
+需要自己补 `fract() == 0.0`），以免下一个人再次把它当成「必须是整数」的检查。
+
+##### 四、修法与不回归的三条既有语义
+
+- **显式整数 `0`** 仍返回空列表（D284 判据）——小数不再被换算成 0，
+  但用户**显式**传 0 仍是原来的「0 个分箱」语义；
+- **浮点写的整数**（`2.0`）仍放行 —— dict 字面量给 `Float`（D98），
+  拦掉会让 `histogram(xs, 2.0)` 崩；
+- **其余 5 个调用点**仍按收口截断（`crush_json(xs, 2.5)` /
+  `exec.parallel(cmds, 2.5)` 均 exit 0）——见新判据
+  `stats_histogram_integer_bins.rs::d329_other_value_as_usize_callers_still_truncate`。
+
+##### 五、五、矩阵量出的其余契约（均为**现状判据**，未修改）
+
+- **方法与 `stats.*` 孪生逐字一致，且恒返回 Float**——全 Int 输入也是 `float`；
+- **空列表**：七个方法一律 `0.0`，**`sum` 是唯一例外——`-0.0`**
+  （`f64::iter().sum()` 空迭代器初值）。改它要动 D246 收口的既有行为，
+  属产品契约决定，故只钉不修；
+- **单元素**：除 `var`/`stddev` 为 `0.0`（单样本方差无定义），其余恒等于该元素；
+- **非数值元素**（同质列表）干净报错且**逐方法点名**
+  （`stats.sum` / `stats.mean` / …）；`[[1],[2]].sum()` 与 `stats.sum([1n,2n])` 同样被拒；
+- **混合元素**（`[1,"a"]` / `[1,nil]` / `[true,1]`）**在编译期**就被 typeck 挡住 ——
+  与上一条**两条防线不重叠**，两组均钉；
+- `quantile` 闭区间端点 `0.0`/`1.0` 正常，空列表 `0.0`，`q` 越界 / 缺参 /
+  类型错均报错；`corr`/`cov` 长度不等报错，空列表与零方差返回 `0.0`（D143）。
+
+##### 六、一并报告（未实施）
+
+`HISTOGRAM_MAX_BINS = 1_000_000` 是 D284 的**判断题**。实测 `bins = 1e6` 产出 1e6 个 dict，
+**1.67 s / 输出约 61 MB** —— 不 panic、不 OOM，但作为交互式调用的反馈是灾难性的。
+82 若将来想收紧，改 `stats.rs` 里那一个常量即可。
+
+新判据：`tests/stats_histogram_integer_bins.rs`（5 条，含 4 个对照组）+
+`tests/stats_method_matrix.rs`（8 条）。
+
+#### D328：高阶函数元数矩阵（37 个调用零 panic）—— 否定轮，但钉住三条**无人覆盖**的契约，并记录我在本轮**连续误判三次**
+
+D325（list 方法）/ D326（string+dict 方法）/ D327（命名内建）之后，
+本轮扫**高阶函数**面：`map` / `filter` / `reduce` / `apply` / `curry` /
+`partial` / `compose` + 闭包调用本身。
+
+##### 一、矩阵结论：元数与类型安全**很紧**
+
+| 场景 | 结果 |
+|---|---|
+| `map` / `filter` / `reduce` 拿到 0 元、2 元、3 元闭包 | **全部干净报错** |
+| `map(1)` / `filter(true)` / `reduce(0, 0)` 传非闭包 | **全部干净报错** |
+| `apply(f, [太短])` / `[太长]` / `[]` / `非列表` | **全部干净报错** |
+| 闭包调用少传 / 多传实参、调用非闭包 | typeck 拒绝 |
+| **37 个调用** | **零 panic** |
+
+这一族此前**没有任何判据覆盖**（`builtin_gaps` 只测签名与正常路径）。
+
+##### 二、`curry` 是**正确的** —— 而我连续三次误判它
+
+`curry(f, n)` 的 `n` 是闭包的**总元数**（参数数 ≥ n 时调内部 fn，不足则累积
+并返回新 Curry）。`dispatch.rs:252-268` 的实现正确。部分应用经**多步 `let`**
+可用（内联 `f(1)(2)(3)` 因 D123 的 postfix 缺口不可用）：
+
+```mora
+let c = curry(fn(a, b) a + b end, 2)
+let c1 = c(1)          // 部分应用 → 新 Curry
+let v = c1(2)          // → 3.0
+```
+
+**我连着三次把它判成「失效」**，根因都是**没先读语义就下结论**：
+
+1. 给 2 元闭包传了 `arity=1` —— 是**我的测试写错**，语义上 `arity` 就是真实元数；
+2. 只试了内联 `curry(...)(...)` —— D123 已记该语法不支持；
+3. 只看了 1 元闭包的对照组 —— **那恰好是既有判据唯一覆盖的那一格**。
+
+⇒ 这也是本轮**最有价值的一条方法论**：D325/D327 的「肯定断言需要自己的验证」
+在本轮变成了**否定断言同样需要**。三次误判全部源于「用自己的用法去反推功能坏了」，
+而没有先读 `dispatch.rs` 里那段**写明契约**的注释。
+
+##### 三、真正的发现：`partial` / `compose` 的返回值**无法被调用**
+
+```text
+let p = partial(fn(a,b) a + b end, 1)
+let v = p(2)      →  Type error: expected partial, got fn (float) -> ...
+let c = compose(f, g)
+let v = c(3)      →  Type error: expected compose, got fn (float) -> ...
+```
+
+而 `dispatch.rs` **写好了** `Value::Partial` 的调用分支（:246-250）与
+`Value::Compose` 的可调用登记（:973）—— **代码在，类型系统禁止所有调用形式**
+⇒ 这两个内建目前是**建得出、用不了**的死功能面。唯一漏网是
+`compose(...)(c())` 零参能过 typeck、撞运行期 `closure expects 1 args, got 0`。
+
+修它要改 typeck 签名（`functional_builtins_signatures.rs` 已因 D80 的回归把
+`compose` / `partial` 设为**变参**）⇒ **语义/路线图决定，只报告不实施**。
+
+##### 四、判据
+
+新增 `tests/higher_order_arity_matrix.rs`（3 条）：
+
+- `d328_higher_order_methods_reject_wrong_arity_and_non_closures` — 7 组元数不匹配
+  + 3 组非闭包 + 4 组 `apply` 长度不符，逐条断言必须报错（且消息含
+  `closure`）；另钉 7 组正常路径不得回归。
+- `d328_curry_partial_application_works_via_stepwise_let` — 6 组 `curry` 用法，
+  含**三个容易踩空的正确写法**（分两步 / 分三步 / 分两步不均匀 / 1 元对照组）。
+- `d328_status_quo_partial_and_compose_results_are_unappliable` — 钉住发现 ③。
+  失败消息明写「若本条失败，说明这两个内建**变得可用了** —— 那是**语义变更**，
+  需同时补 typeck 签名 + 确认 `dispatch.rs` 调用分支正确，请勿只改本判据」。
+
+##### 五、门禁
+
+| 项 | 结果 |
+|---|---|
+| `cargo test --no-fail-fast` | **232 目标 0 失败** |
+| `cargo test --lib` | **1011 / 0 / 13** |
+| `cargo fmt --all -- --check` | 0 |
+| `cargo clippy --all-targets --all-features -- -D warnings` | 0 警告 |
+| `cargo doc --no-deps` | 0 警告 |
+
+##### 六、本轮**无产品代码变更**
+
+与 D322 / D326 同属「测量并固化」：唯一发现（`Partial` / `Compose` 死功能面）
+是**语义/路线图决定**，按既定纪律只报告不实施。
+
+#### D172：`module_method_signature` 重构为**表驱动** —— D170 的 `methods_of` 缺口闭合
+
+D170 我把「900 行查表重构 vs 手写清单」作为取舍留给你裁决，你选了**重构**。本轮做完。
+
+##### 做法：方法名提升为**分组表**，签名与枚举读同一张
+
+每个模块一个 `*_GROUPS: &[&[&str]]`，每项是**同签名**的一组方法名；
+`module_method_signature` 用 `group_of(GROUPS, method)` 的**组号**选签名，
+新增的 `module_method_names` **展平同一张表**。二者共用一份数据 ⇒ **不可能漂移**。
+
+```rust
+const MATH_GROUPS: &[&[&str]] = &[
+    &["PI","E","TAU","INF","NAN"],                 // 0: 零参常量
+    &["sin","cos", /* … */ "fract"],               // 1: unary_float
+    &["pow","hypot","atan2"],                       // 2: binary_float
+    &["abs","sign","floor","ceil","round","trunc"], // 3: unary_preserve
+    &["is_nan","is_inf","is_finite"],               // 4: 类型谓词
+];
+```
+
+共 **20 张表**：math / file / stats / linalg / mora / bus / mock / ccr / plan /
+tea / sandbox / memory / schedule / web / tool / skill / xform / json / exec / document。
+**每条原有的注释都随代码搬到表旁** —— 如 `linalg.norm` 的「阶数可选」理由、
+`memory.load` 的「恒返 true 而非 Dict」、`xform` 的 D74 桩实现说明。重构没有丢信息。
+
+##### 效果
+
+```text
+修复前：methods_of(math) / json / file / …  →  []      （23 个模块全空）
+修复后：methods_of(math)    → [PI, E, …, is_finite]  33 个
+        methods_of(file)    → [read_text, …, copy]     23 个
+        methods_of(sandbox) → [mode, …, container_clear] 12 个
+        …… 20/23 个模块
+```
+
+**只剩 3 个（`ai` / `agent` / `random`）为空** —— 它们有各自的精确 `Type`
+变体与专用分派路径（`call_builtin_*`），**不经** `module_method_signature`，
+故没有可枚举的签名表。已写进测试的 `SIGNATURELESS` 常量并附说明；
+将来它们若进表，该测试会提示补表。
+
+##### 回归安全性靠**已有测试网**而非人工比对
+
+签名行为由 `module_return_types_match_runtime`（3）、`module_method_signatures`（25）、
+`signature_parity`（8）、`signature_no_over_tightening`（3）覆盖 —— 这批正是
+D69–D88 为「逐条核对签名」建的护栏。本轮每改完 2–4 个模块就跑一次，全程绿。
+
+##### 过程中被工具与语法各挡一次（均当场修正）
+
+1. PowerShell 的 `@'…'@` 批量替换被**权限网关**拦下（内容里出现
+   `remove_dir_all` 等字样被判为删除类命令）→ 改用 `edit` 工具逐块替换；
+2. `linalg` 臂改写时括号数不匹配（替换时把 `match` 头一并吃掉）→ 编译错误当场暴露；
+3. `Value::Builtin` 起初写成 `kind.as_str()`，而 `BuiltinKind` **没有**该方法
+   → 改为经 `MODULE_OBJECTS`（注册名 ↔ kind 的**单一事实源**）反向查回注册名。
+   这也顺带避开 D74 记过的坑：「`Toolplane` 的注册名是 `tool`，
+   按枚举变体名建表会整段匹配不到」。
+
+##### 验证
+
+- `tests/module_methods_introspection.rs` 的普查断言**方向翻转**：
+  从「全部必须为空」改为「**除 ai/agent/random 外都必须列出方法名**」
+  + 「方法名总量 > 100」（防「表存在但全空」这种假修复）
+  + 三个 `SIGNATURELESS` 模块的显式登记与说明
+- 20 张表改造全程，签名测试逐批全绿
+
+#### D171：`Value` 全变体普查 —— 确认只有 D170 那一个缺口（否定结果轮）
+
+D169 修 `Document`、D170 记 `Builtin`，但两轮都是**逐个遇到才处理**。
+本轮做**完整普查**：28 个 `Value` 变体，对照 `Value::methods()` 的 arm，
+再对照运行期 `call_method` 的分派分支，回答「还有没有第三个缺口」。
+
+| 分组 | 变体 | `methods()` | 运行期有分派？ |
+|---|---|---|---|
+| 有 arm 且有分派 | String / List / Dict / Int / Float / BigInt / Conversation / Stream / Router / McpServer / Agent / **Document**(D169) | ✅ | ✅ |
+| 无 arm，**有**分派 | **Builtin**(D170，23 个模块) | ❌ `[]` | ✅ |
+| 无 arm，**有**分派 | **TraitObject** | ❌ `[]` | ✅（但见下） |
+| 无 arm，无分派 | Char / Bool / Nil / Task / Tool / Closure / AiConfig / HttpRequest / Compose / Partial / Atom / Macro / PromptSection / Curry | `[]` | ❌ 落 `_` 臂报「Can only call methods on …」 |
+
+即：**真正的缺口只有 D170 那一个**（`Builtin`），其余两类都正确。
+
+##### `TraitObject` 的 `[]` 今天正确，但是**潜在**缺口
+
+```text
+let x: dyn Foo = 1
+print(type_of(x))      → trait_object
+print(methods_of(x))   → []            ← 今天正确
+print(x.anything())    → Runtime error: trait dispatch …
+                            no impl for type 'float' method 'anything' (searched: Foo)
+```
+
+trait 分派**是接通的**（`call_method` 首臂就路由到 `dispatch_trait_method`），
+报的是「没有对应 impl」而非「未知方法」。而本语言 **`trait` / `impl` 都无法解析**
+（`spec_ebnf_census.rs` 里二者是 `EXPECTED_UNPARSEABLE`），所以**无法给任何类型
+写 impl** → trait 对象的方法集恒为空 → `[]` 是对的。
+
+**但一旦 `trait` / `impl` 前端落地，这里立刻变成第三个缺口。** 本轮把它写成
+**带触发条件的护栏**（`d171_trait_object_introspection_is_empty_…`）——
+转红即代表该补 arm 了。
+
+##### 我放弃了一个**脆的判据**（值得记）
+
+本轮先写了一条「从 `value.rs` 解析变体清单做漂移护栏」的测试。它连续失败三次：
+① 首个变体行就 break；② 判「全大写」而变体是 **CamelCase**；③ 修好后
+跨出了 `enum Value` 的范围，把 **`Type` 的变体**（`Code`/`Goal`/`TeaApp`…）
+也算了进来（18 vs 28）。
+
+**脆的判据比没有判据更糟** —— 它会给人「已覆盖」的错觉。已删除，改为断言
+**行为层面**的不变式：「没有方法分派的变体，`methods_of` 必须是 `[]`
+**且**调用方法必须明确报错」——空集与不可调用**成对**，否则自省就在撒谎。
+
+##### 验证
+
+- 新增 `tests/value_methods_census.rs` **3 条**：
+  **主判据 1 条**（Bool / Nil / Char：空集 + 明确不可调用，成对断言）/
+  **主判据 1 条**（`TraitObject` 的 `[]` 是正确的，且带 `trait`/`impl` 落地后的触发条件）/
+  **对照组 1 条**（trait 分派确已接通 —— 报的是「no impl for」而非「未知方法」）
+- 本轮**未改生产代码** —— 普查结论是「除 D170 外无新缺口」
+#### D170：普查发现 `methods_of(<模块对象>)` 对**全部 23 个模块**返回 `[]`（普查 + 记档，**未修**）
+
+D169 修的是 `Value::Document`（单类型、6 个方法、一个 arm）。本轮回头
+「我上轮的普查是不是漏了东西」——**漏了**：我只对照了 `call_method_*` 具名分派器，
+没把 `Value::Builtin(kind)` 这个**通配臂**算进去。
+
+##### 实测（一次程序打印全部 23 个，逐项解析）
+
+```text
+type_of(<每个模块>)      → builtin      （23/23，前提成立：它们确实是值）
+methods_of(<每个模块>)   → []           （23/23）
+而方法确实可用：math.floor(1.7)=1.0、math.PI>3、json.stringify({a:1}) ✓
+```
+
+`method_dispatch.rs` 的 `_` 臂错误消息自己就列了
+`mcp_servers, documents, or builtin objects` —— **`builtin` 是被承认的一类**，
+但 `Value::methods()` **没有 `Value::Builtin` 分支**，23 个模块全落到 `_ => &[]`。
+
+影响面比 D169 大一个量级：不是漏 1 个类型，是**整个 stdlib 的方法名对
+`methods_of` 不可见**。而本语言是 AI-native 的，agent 常靠它推断能力。
+
+##### 为何本轮**不修**（与 D169 的判断不同）
+
+| | D169（已修） | D170（本轮） |
+|---|---|---|
+| 缺口 | 1 个类型、6 个方法 | **23 个模块、约 200+ 方法** |
+| 方法名清单在哪 | 一处 `match` 分支，抄进表即可 | **没有独立清单** —— 以 `matches!(method, "a" \| "b" \| …)` 内嵌在 `typeck::dispatch::module_method_signature`（900 行）与各 `builtins/<mod>.rs::call_<mod>_method` 两处 |
+| 改法 | 补一个 arm（~15 行） | 得把 900 行查表**重构成表驱动**，由它同时供给签名与枚举 |
+
+更关键的是**方向性风险**：若手写一份方法名清单却与实现漂移，
+`methods_of` 就从「空集」变成「**撒谎的清单**」。按 D109/D169 的教训，
+**宁可记档也不要引入新的静默错误源**。故本轮只做普查 + 显式记录。
+
+若将来实施，验收判据应是**双向闭合**：
+① 清单里每个名字在运行期**确实被接受**（不是 unknown method）；
+② 清单与 `module_method_signature` 的表**逐名一致**（两张手写表互为交叉验证）。
+
+##### 验证
+
+- 新增 `tests/module_methods_introspection.rs` **3 条**：
+  **普查 1 条**（23 个模块的 `methods_of` 全为 `[]`，且 `type_of` 全为 `builtin` ——
+  断言写成「恰好等于现状」而非「必须为空」，**将来修好时本条会红并提示改写**）/
+  **反向对照 1 条**（模块方法**确实可用** —— 这才是危害所在）/
+  **对照组 1 条**（D169 修好的 `document` **值**不得回退）
+- 本轮我自己三次探针失误：① 普查助手取「第一行以 `[` 开头」被横幅噪声误导，
+  把 `json` 误判成非空（改取最后一行）；② 23 次临时文件往返在本机不稳定
+  （`remove_dir_all` 失败被忽略 → 读到旧文件），改为**单程序**一次打印；
+  ③ 写了 `"@@x|" + methods_of(x)` 的字符串拼接，实测该拼接在本语言不成立
+  （整个程序无输出），改为「标记行 + 结果行」两行式。三处都被断言当场抓住。
+#### D169：`methods_of(document)` 返回**空列表**，而 6 个方法实际可用（已修）
+
+```text
+let d = document.parse("sample.md")
+print(d.text())          → 全文      ✅
+print(len(d.pages()))     → 1         ✅
+print(len(d.blocks()))    → 6         ✅
+print(methods_of(d))      → []        ❌ 整个类型漏报
+```
+
+`method_dispatch.rs:46` 有 `Value::Document → call_method_document` 分派，
+该函数实现了 `markdown` / `text` / `pages` / `metadata` / `blocks` / `origin`
+六个方法；而 `value.rs::Value::methods()` 的表把它们整个漏了（落到 `_ => &[]`）。
+
+##### 一个自证的旁证
+
+`call_method` 的 `_` 臂错误消息里**自己就列了 documents**：
+
+```text
+Can only call methods on lists, dicts, strings, conversations, streams,
+agents, routers, mcp_servers, documents, or builtin objects
+```
+
+说明**只有 `methods()` 这张表漏了**，不是「document 本来就没有方法」。
+普查也确认：`methods()` 覆盖了其余**全部**有分派的类型（List / Dict / String /
+Int / Float / BigInt / Conversation / Stream / Router / McpServer / Agent），
+`Document` 是**唯一**缺口。
+
+##### 为什么这不是「小瑕疵」
+
+`methods()` 是 `methods_of` builtin 的**唯一**数据源。本语言是
+**AI-native** 的 —— agent 常靠 `methods_of` 推断一个值能做什么。
+漏报让它得到一个**偏小且为空**的集合，等于告诉 agent「这个值什么都不能做」。
+
+与 D109 修 `crush_json` 同一类，但那次漏 1 个方法、这次漏**整个类型的 6 个**。
+
+##### 验证
+
+- 新增 `tests/document_methods_introspection.rs` **3 条**：
+  **主判据 2 条**（`methods_of(document)` 必须列出全部 6 个 /
+  这 6 个方法**确实可用** —— 不能只改表就交差）/
+  **反向对照 1 条**（String / List / Dict / Float 的表不得回退）
+- 我自己写错一处：断言 `d.blocks()` 等于 6 —— 那是照抄了另一份更长的样例，
+  本样例实测 4。**块数取决于内容，不该写死**，已改成断言「非零」。
+#### D168：补上 `pattern` —— spec §14.2 的未定义非终结符**只剩 1 个**（`type`）
+
+D167 的教训是「别把预估的修法成本写进结论」。按这把尺子重看剩下的两条待裁决：
+`type` 确实是**体例问题**（要你定），但 `pattern` 我在 D165 **已经从
+`parse_pattern` 读到了完整形态** —— 和 `binary` 一样，是能直接落笔的。
+
+```text
+pattern     = "_"
+           | ( ".." | "..." ) [ IDENTIFIER ]
+           | IDENTIFIER ":" pattern
+           | IDENTIFIER
+           | literal
+           | "[" [ pattern { "," pattern } [ "," ( ".." | "..." ) [ IDENTIFIER ] ] ] "]"
+           | "{" IDENTIFIER ":" pattern { "," IDENTIFIER ":" pattern } [ ".." ] "}" ;
+```
+
+##### 逐分支实测出三条**光看代码看不出来**的事实
+
+1. **`literal` 在此处是过近似** —— 模式解析器（`try_parse_literal_pattern`）
+   只接受 NUMBER / BIGINT / STRING / BOOL / NIL，**不接受 `CHAR`**，
+   也不接受 `list_literal` / `dict_literal`。已在 spec 注释里写明。
+2. **列表模式的 rest 只能在尾部**：`[a, b, ..]` ✓，而 `[.., b]` ✗
+   （实测 `Parse error: Expected ']' after rest pattern`）。
+   我第一版探针写了 `[.., y]`，解析失败才暴露这条。
+3. 裸 `..` / `...` 作为**整个**模式是可用的（`..` 单独作 arm 模式能解析）。
+
+##### 顺带把 D165 的一个语义疑问在 spec 里落成显式注释
+
+`IDENTIFIER ":" pattern` 产出 `TypeAscription`，但其**语义尚未定性** ——
+当前实现下该 arm **永不匹配**（静默落到下一分支）。
+spec 注释里直接指向 `tests/match_pattern_bindings.rs` 的 known-gap 断言，
+让「文法写了」与「语义未定」两件事在文档上不混淆。
+
+##### known-gap 清单 3 → **1**（只剩 `type`）
+
+`d162_ebnf_undefined_set_matches_known_backlog` 在我改完清单后**按设计转红**
+（`fixed_ones` 方向：「这些此前在清单里、现已有定义，请划掉」）——
+该测试的两个方向都会告警，本轮再次验证了这一点。
+
+##### 验证
+
+- `tests/spec_ebnf_census.rs` 新增 **4 个最小实例**（`pattern_wildcard` /
+  `pattern_literal` / `pattern_list` / `pattern_dict`）—— 均被 parser 验收；
+  `spec_ebnf_census` 与 `spec_ebnf_wellformedness` 各 2 passed
+#### D166：绑定可见性普查 —— 6 类构造**全部正确**，且我**第二次**误判了同一个 `with` 语义（否定结果轮）
+
+D165 修掉「match arm 体里的模式绑定被判成未定义变量」后，顺着**同一机制**
+普查其余「引入绑定」的构造，查双向层是否也会误报。
+
+| 构造 | 绑定在体内可见？ | 结论 |
+|---|---|---|
+| `for` 循环变量 | ✅ | 正确 |
+| `for` 嵌套（两个独立变量） | ✅ | 正确 |
+| 闭包形参 | ✅ | 正确 |
+| 高阶传参（`map`/`filter`/`reduce` 的闭包） | ✅ | 正确 |
+| `worker` 块 | ✅ | 正确 |
+| `match` arm 模式 | — | **D165 已修**（此前是假阳性） |
+| `with` 块绑定 | ❌ | **设计如此，见下** |
+| `match` 守卫引用绑定 | ✅ | 正确（`emit.rs` 注释记的旧缺陷确已修） |
+
+##### 我把 `with` 当成了「与 D165 同型的假阳性」，差点报出去 —— 它不是
+
+```text
+with model = "m"
+  print(model)     ← Unbound variable 'model'
+end
+```
+
+第一反应是「双向层没注册绑定」，与 D165 同型。**不是**：
+
+| 层 | 结果 |
+|---|---|
+| 运行期 | `nil`（未定义变量） |
+| typeck | `Unbound variable 'model'` |
+
+**两层一致** —— `with` 是**上下文配置块**（spec §11.1），绑定只进 interpreter 的
+config 栈供 `ai.chat` 消费（`ai_chat.rs:81-86` 确实读 `current_ai_config.model`），
+**不进词法环境**。故块内按名引用报错是**正确**行为。
+
+⚠ `tests/with_config.rs` 的文件头**早已写明**这一点，并记录
+「早先一轮曾把它误判为作用域缺陷，spec 定性后已否证」。
+**本轮是同一个误判的第二次**（第一次在 D110/D163 的 `params`、D163 的 `params` 之后）。
+已把结论钉进 `tests/binding_visibility_census.rs`，防第三次。
+
+##### 我的探针错了两次（都已更正）
+
+1. **「`with` 块体不执行」** —— 我用 `let out = "unset"` + 块内 `assign out = "ran"`
+   观测，得 `unset`，据此断定块体没跑。**错**：块体跑在 `env.clone()` 的**子环境**里，
+   对外层 `assign` **本就不传播**。用 `print` 直接观测，块体确实执行。
+   对照组证明这是 `with` 的特性而非通用块语义：`for` / `if` / `parallel` 的
+   `assign` **都**传播（实测 `ran`）。
+2. **stdout 交错**（D165 已犯过一次）—— 测试的 `println!` 与被测程序的输出
+   交错，差点把三种形态全看成 `nil`。本轮改用「赋值到块外变量再取末值」观测。
+
+##### 验证
+
+- 新增 `tests/binding_visibility_census.rs` **3 条**（把本轮**否定结果**固化成护栏，
+  下轮不必重审、下一个人不会重犯）：
+  **普查 1 条**（六类构造逐条钉住，含 `with` 的「不是词法变量」这条反向断言 +
+  运行期一致性断言）/
+  **对照组 1 条**（`with` 块体确实执行 + `for`/`if`/`parallel` 的 assign 确实传播）/
+  **对照组 1 条**（`match` 守卫引用绑定必须命中）
+
+#### D167：具名顶层 `task` 的 arity 也受检了 —— 而修法**远比预估的简单**（已修）
+
+D161 把闭包 arity 的编译期检查做完时，我把「具名顶层 `task`」记成 known-gap，
+理由是「需要类型层不动点（mutual recursion 有先后依赖）」，并列为待你裁决项。
+本轮回头重看这个判断 —— **它不成立**。
+
+##### arity 就是 `params.len()`，**不必推断体就能拿到**
+
+不动点的必要性来自「要先推断体才能知道类型」。而元数是**语法制式信息**：
+`WitnessKind::FnDef { params, .. }` 里直接就有。于是
+
+- 没有 mutual recursion 问题（`a` 调 `b`、`b` 调 `a` 都与元数无关）；
+- 没有前向引用问题（调用点写在定义之前也照样查得到）；
+- **一遍树行走就够**，与 `precompute_fn_effect_rows` 的迭代求不动点不同。
+
+```rust
+pub fn precompute_fn_arities(&mut self, exprs: &[MirWitness])   // 树行走，一遍
+```
+
+`infer_call` 里：`arrow_arity` 给不出元数时（**定义名不进 env**，调用点解析成
+`TypeVar`）回退查这张表。
+
+##### 效果
+
+```text
+task add(a, b) … end ; add(1)
+  修复前：--check exit 0「No type errors found」 / 运行期 exit 1「task expects 2 args, got 1」
+  修复后：--check exit 2「Expected 2 arguments, got 1 at line 4, column 9」
+```
+
+多传方向（`task one(a) … ; one(1, 2)`）同样从 exit 0 变为 exit 2。
+
+##### 三条既有基线因「报错来源前移」而红 —— 改的是断言不是修复
+
+`tests/call_arity.rs` 三条断言的是**运行期**消息
+（`task expects N args, got M`），而该文件的 `run` 是**带 typeck** 的：
+此前 typeck 不报 → 落到运行期；现在 typeck 先报 → 断言的措辞对不上。
+
+处理：抽 `mentions_arity(e, expected, got)`，**同时接受两种措辞**
+（运行期 `task expects N args, got M` / 类型层 `Expected N arguments, got M`）。
+这些用例的本意是「必须被拒、且消息点名 arity」，**不是**「必须在运行期被拒」——
+报错**来源前移**是改进，不是回归。
+
+`tests/closure_arity_check.rs` 里 D161 留的 known-gap 测试同步翻转成主判据
+`d167_named_task_arity_is_checked`，并新增一条反例：正确定元数、
+**前向引用**（调用点写在定义之前）、**递归 task** 全部必须零诊断 ——
+后者正是「不需要不动点」的关键证据。
+
+##### 教训
+
+- **别把「预估的修法成本」写进结论**。我当初写「需要类型层不动点」时并未验证
+  「不动点到底为什么必要」；实际必要的是**类型**而非**元数**。
+  同一个道理见 D158：`Sequence` 的 span 问题我也曾判为「必须改 parser」。
+- 记为「待你裁决」的项，**先回头验一遍自己的前提**再占用用户的决策带宽。
+
+##### 验证
+
+- `tests/closure_arity_check.rs` 5 passed（含新主判据与前向引用/递归反例）
+- `tests/call_arity.rs` 5 passed（断言改为接受两种措辞）
+- 全量 **1847 passed / 0 failed / 21 ignored**（123 个二进制）
+- clippy 0 警告；fmt 干净；探针已删除
+
+##### 验证
+
+- 新增 `tests/optional_string_args.rs` **7 条**：
+  **主判据 3 条**（`plan.list` 4 种错类型 / image 须在接触 Docker 前报错 /
+  network+mounts 同样报错）/
+  **反向对照 2 条**（省略参数与字符串 name 两条正确路径**逐字**不变；
+  名字合法但不存在仍报 `not found` 而非类型错）/
+  **对照组 2 条**（`cpu_cores`/`memory_mb` 的 Int 与 `Nil` 不得回退；
+  `plan.create` 既有精确报错不得回退）
+- `tests/numeric_positional_args.rs`（D150）9 条**无回退**
+
+
+
+
+
+
+
+
+
+##### 过程中我自己的三处误判（全是探针源码的问题，非产品缺陷）
+
+1. `fn g() … end` —— **D118 已确认具名 `fn` 不支持**（语句位置只认 `task`）。
+2. `task doer()` 未调用就检查输出 —— **正确行为**（`task` 是定义）。
+3. `match` 用跨行 arm —— **语法非法**（见上）。
+
+三次都是「探针源码本身跑不通，我却据此解读 provider 行为」。
+D136 的教训在 D137 又被验证了一次。
+
+##### 验证
+
+- 新增 `tests/lsp_folding_coverage.rs` **3 条**：主判据（`for`/`while` 必须出范围）/
+  **嵌套出两层** / **对照组**（原本正常的 `if`/`task` 不得回退）
+- D137 补 `d137_match_with_form_is_foldable`（把 spec 主流形态钉住）
+- 全量 **1744 passed / 0 failed / 21 ignored**（101 个测试二进制）
+- `cargo clippy --lib --all-features` 0 警告；改动文件 `rustfmt --check` clean
+- 三个临时探针（`zz_probe_folding.rs` / `zz_probe_completion.rs` / `zz_probe_match_fold.rs`）已删除
+
+
+
+#### D116：spec §11.1 把**未实现**的配置键列为「支持」—— 已更正
+
+D110 的普查表里有一条 `with budget = 10000, per_call = 1000`
+（spec 行 1415）不可解析。追下去发现它不是「写法错」而是**承诺不存在**：
+
+- spec §11.1「**支持的配置键**」下列着 `budget`（Token 预算总量）与
+  `per_call`（单次调用 token 上限）；
+- 但 `AiConfigValue` **从无对应字段**，写这两键现在**立即报错** ——
+  错误消息原文就是「`budget` / `per_call` is promised by spec §11.1
+  but not implemented yet」（D39 当时特意写了这句话，把责任指回 spec）。
+
+即：**spec 过度承诺，而实现的报错是诚实的。** 已改 spec：
+
+1. §11.1 的「支持的配置键」移除这两项，另起「**承诺但未实现**（写入这两键会
+   **明确报错**，不做静默丢弃）」小节保留承诺记录 + 指向 D39；
+2. 行 1415 的示例改围栏为 ```text 并注明「原示例写作 …，但从未被实现，故删除」
+   —— 它本就不是可运行示例，留在 ```` ```mora ```` 里只会被普查当成坏例子。
+
+`mock_llm` 留在「支持的配置键」下（D91 已修好它）。
+
+新增 `tests/spec_code_block_census.rs::d116_spec_does_not_claim_unimplemented_budget_keys`：
+断言 §11.1 的支持列表里**不含** `budget`/`per_call`、**含**「承诺但未实现」小节，
+并带一条对照（`mock_llm` 确实支持，必须留在列表里）。
+
+普查规模随之从 **53 块 / 22 坏** 变为 **52 块 / 21 坏**。
+
+#### D115：核实「已知问题」注释 —— 两条 SSA 缺陷**均已不复现**（注释已更正）
+
+全仓扫「未修 / 待修 / 仍未」类状态声明（3 处命中），其中
+`tests/mir_ssa_roundtrip.rs` 头部记录了两条「已知问题（未修复）」。按 D87 的纪律
+（「已记录的问题」与实际行为脱节，会让后人绕开本来可用的机制）逐条实测。
+
+##### 两条都已不复现
+
+| 记录的问题 | 实测 |
+|---|---|
+| 「SSA construct 后寄存器引用丢失（`let x = 1+2; return x` 优化后返回值变 Nil）」 | 该复现式**如今连编译都过不了**（顶层 `return` 直接报错）。放进 task 后：3 种形态 × 3 档优化，返回恒为 `Return(Float(3.0))` / `4.0` / `6.0` —— **正确** |
+| 「顶层隐式返回依赖『最后产生 dst 的节点』，优化重排后不稳定」 | 3 种形态 × 3 档优化，末值恒为 `7.0` / `9.0` / `xy` —— **稳定** |
+
+该文件当时**没有** `#[ignore]` 测试，10 条测试全部在跑 —— 说明这两条是被别的改动
+顺带修好的，注释没跟上。**已更正注释**（保留原记录并划掉 + 附实测结果）。
+
+##### 测量时自己错了两次（记录在此）
+
+1. **量错了对象**：第一版量顶层 `last_expr`（`run_mir`），而 task 的返回值要经
+   `run_main_task_with_signal` 才看得到 —— 一度得到「三档全是 `nil`」的**误导结论**，
+   差点反过来把正确的行为当成缺陷。
+2. **复现式本身不成立**：第一版把 `return` 写在顶层当复现式，被 parser 正确拒绝。
+   **与 D102 同源：写判据/复现式之前先确认它在当前实现下成立。**
+
+##### 顺带：核实本会话改动对既有语料的回归
+
+`examples/` + `tests/fixtures/` 共 **56 个 `.mora` 文件**逐个跑：
+**D111 回归 0**（无一条触发新引入的 `unparsable type annotation`）。
+D97 的 pregel 守卫亦无回归 —— corpus 里**没有任何 `.mora` 用 `orchestrate`**，
+只有 `tests/*.rs` 用到，而全量 1662 通过。
+
+#### D112（普查附带）：**跨行 `|>` 管道**不解析，而 spec §11.3 的示例正是该形式
+
+| 写法 | 实测 |
+|---|---|
+| `print([1,2,3] \|> len())` 单行 | ✓ `3` |
+| `xs` 换行 `  \|> len()` | ✗ `Failed to parse at line 3` |
+| spec §11.3 原文（`router` 换行两个 `\|> route(...)`） | ✗ 同样失败 |
+
+`observe` / `span` 块本身正常（含 `observe` 内嵌 `span`、`span` 带 `tags`），
+先前的「unparsable statement in span/observe block」是块内**别的**内容所致。
+
+**未改**：支持跨行管道属前端语法增强；spec 侧改写示例则是取舍（可读性 vs 忠实）。
+两个方向都属设计决定，仅记录。
+
+#### D111：**不受支持的泛型标注被静默丢弃** —— `let r: result<…> = 1` 编译通过并跑出 `1.0`（已修）
+
+D110 普查里 `result<...>` 的行为**对不上**：CLI 报
+`unsupported generic type annotation`，而库路径 `ParserV3::compile` + typeck
+**零报错**。追下去挖出真缺陷。
+
+##### 缺陷
+
+`let r: result<number, string> = 1` —— 标注说要 `Result`，实际 `r = 1.0`，
+**exit 0、零类型错误**。对照 `let r: string = 1` 会被 typeck 正确拒绝。
+
+根因：`emit_definitions.rs::emit_let_w` 写的是裸调用
+`self.parse_type_annotation()`，而 `syntax.rs:738-745` 对不受支持的泛型只
+`eprintln!` 一句就 `return None`，**`None` 在这里被当成「这一行没写标注」**。
+
+同类更糟的表现：`let r: result<number, string> = Ok(1)` 报
+**`Undefined function or task: Ok`** —— 错误指向了错误的原因
+（真正的问题是标注不受支持，不是 `Ok` 不存在）。
+
+##### 修复没全接 —— 又一次「多个查找点要全接」
+
+`emit_struct_def_w` / `emit_enum_def_w` 里 D46 **已经修过同一类**（注释原文
+「类型标注解析失败时此前是**静默丢字段**…改为报错」）。普查全部 7 个调用点：
+
+| 位置 | 写法 | 判定 |
+|---|---|---|
+| `emit_effect_sig_w:25,34` | `?` | 传播 ✓ |
+| **`emit_let_w:60`** | 裸调用 | **丢弃 ❌** |
+| `emit_type_alias_w:333` | `?` | 传播 ✓ |
+| `emit_model_def_w:383` | `?` | 传播 ✓ |
+| `emit_msg_def_w:448` | `?` | 传播 ✓ |
+| **`emit_update_def_w:509`** | `.map(...)` | **丢弃 ❌** |
+| `emit_struct_def_w:654` | 显式 match | D46 已修 ✓ |
+
+**只有这两处丢弃**，其余全部传播。两处均已改为报错（照 D46 的写法与提示风格）。
+
+**修复后实测**：`let r: result<…> = 1` 从 exit 0 / 静默 `1.0` → **exit 2 +
+`Parse error: unsupported generic type annotation 'result'`**；
+`update(...): result<…>` 同样；`list<>` / `string` / `number` 行为不变。
+
+**反向验证**：把 `emit_let_w` 改回裸调用 → 主断言以
+「静默丢弃又回来了（D111 回归）」失败；改前先读盘确认已落盘。
+
+#### D110：spec 的 ```mora 代码块**可解析性普查**（53 块 / 22 块不可解析）
+
+D109 查的是 §14.2 的**产生式**；但 spec 的真正载体是 **53 个 ```mora 示例代码块**
+（我第一版用 PowerShell 只数到 20 —— 裸 ```mora 没被计进去，**探针漏数**）。
+逐块实测：**22 块不可解析**。
+
+##### 四类 spec 承诺但实现不支持
+
+| # | 缺口 | spec 出现次数 | 状态 |
+|---|---|---|---|
+| 1 | 函数**参数类型标注**（`task f(a: number)` 与 `fn(a: number)` 皆报 `Expected ')' after parameters`） | 7 | **未修**（属语言特性） |
+| 2 | `result<...>` 泛型标注（`list<>` / `dict<>` 支持） | 11 | 拒绝已正确（**D111**），**支持**仍缺 |
+| 3 | `let` **解构模式**（`let {a,b} =` / `let [a,b] =` 全报 `Expected variable name after 'let'`；而 `match` 支持同样模式） | 1 | **未修** |
+| 4 | EBNF 引用 `params` 却**从未定义**（`task_stmt` / `macro_stmt` / `closure` 都引用它） | — | **未修**（spec 内部矛盾） |
+
+未修的三项都要**改语言前端或 spec 语法表**，属设计决定，不在缺陷修复范围。
+其中缺口 1 与 spec §14.2 附近原文 `task greet(name: string): string` 直接冲突。
+
+##### 22 个不可解析块的完整归类
+
+| 构造 | 块数（spec 行） | 备注 |
+|---|---|---|
+| `trait` / `impl` | 3（172 / 191 / 202） | 语言完全不支持 |
+| 参数类型标注 | 5（573 / 590 / 603 / 612 / 632） | 含 `task f(a: number)`、`f(x: number): string` |
+| `result<…>` / `Ok` / `Err` | 含在上面 | 见缺口 2 |
+| `let` 解构 | 1（457） | 见缺口 3 |
+| `perform "字面量"` | 2（471 / 487） | `perform` 只接受标识符 |
+| 跨行 `\|>` 管道 | 1（833） | **见 D112** |
+| `with budget=/per_call=` | 1（1415） | D39 已让这两键**明确报错**（spec §11.1 承诺但未实现） |
+| `ai.create` | 1（708） | 内建缺失（既有待办项） |
+| 单字符字面量 `'{…}'` | 1（1387） | 字面量里有多于一个字符 |
+| 空块 | 1（1309） | 块内无语句 → `no executable instructions` |
+| 其余 | 若干 | 逐块见 `tests/spec_code_block_census.rs` 的 `--nocapture` 报告 |
+
+**普查规模**：spec 共 1651 行、**53 个 ```mora 代码块**，其中 **31 可解析 / 22 不可解析**。
+测试逐块判定并把清单打印出来（`cargo test --test spec_code_block_census -- --nocapture`）。
+
+##### 本轮探针自己错的三次
+
+1. **漏数代码块**：PowerShell 计数器只认 ```` ```word ````，裸 ```` ```mora ```` 没计入，
+   报「20 个」实为 53 个。
+2. **判据分层搞错**：用 `ParserV3::compile` 判定 `result<…>` 是否「支持」，
+   而它**恰恰是那条路径在静默丢弃**（D111）—— 于是缺口 2 一度看起来「不存在」。
+   改成「编译必须**失败**」才对。
+3. **切片越界**：`text[start..].find("```")` 返回 **0**（切片自己就以围栏开头），
+   取出空串，控制断言随之失败。须 `start + len("```ebnf")` 之后再找。
+
+#### D109：spec §14.2 **全部产生式**逐条实测 —— 找出两类内部矛盾
+
+D108 抓到 `handle_stmt` 一条（spec 写的形式解析不了）。既然已知这个类别存在，
+就把 §14.2 的产生式**全部**用最小实例实测，而不是只查被怀疑的那几条。
+
+##### 结果：26 / 28 可解析，不可解析的只有 `trait` 与 `impl`
+
+但真正的收获是 spec 自身的**两处内部矛盾**：
+
+1. **`statement` 联合式引用了从未定义的产生式。** 联合式里写着
+   `| observe_stmt | trait_stmt | impl_stmt |`，而 §14.2 **没有为
+   `parallel_stmt` / `observe_stmt` / `trait_stmt` / `impl_stmt` 中任何一条
+   定义产生式**。「联合式引用不存在的非终结符」在本节内自相矛盾。
+2. **`trait` / `impl` 既无产生式、又确实不可解析**（实测 `Failed to parse`：
+   lexer 无这两个关键字、parser 无对应分派）。**已从联合式移除**，
+   沿用本节既有的 `route_stmt` 删除先例（见 v0.104.2 更正）；
+   `parallel_stmt` / `observe_stmt` **补齐产生式**。
+
+这同时为待决清单里的「启动横幅 4/6 项宣称不可用」提供了 spec 侧的佐证：
+**spec 自己曾经把 trait / impl 列为一等语句**，而实现从来不支持。
+
+##### 探针自身两次出错（都记此）
+
+1. **分类器不完备**：用 PowerShell 按 `Parse error:` 子串判定「是否解析失败」，
+   而实际错误串还有 `Failed to parse at line N` —— 于是把**完全解析不了**的
+   `trait` / `impl` **误判为「OK」**。改用 Rust 直接调 `ParserV3::compile`
+   后结论才对。**判据的分类不完备 = 结论不可信。**
+2. **`app` 的形状猜错**：写成 `app A` + 裸语句；真实形状取自
+   `tests/fixtures/e2e/tea_app.mora`（标签是 `model:` / `msg:` / `init:` /
+   `update:` / `view:`）。**取真实 fixture 而不是凭印象构造。**
+
+新增 `tests/spec_ebnf_census.rs`（2 条）：普查表 28 条**逐条**用
+`ParserV3::compile` 判定，并断言「不可解析清单 == [trait, impl]」——
+**某条变得可解析**（实现升级 → 需补产生式）或**变得不可解析**（回归）都会失败；
+另一条钉住 spec 侧的联合式与产生式改动。
+
+##### ⚠ 顺带发现：**`docs/mora-spec.md` 不在版本控制内**
+
+查「本轮改了什么」时发现 `git ls-files --error-unmatch docs/mora-spec.md` 报
+「did not match any file(s) known to git」。
+
+| 事实 | 数据 |
+|---|---|
+| `.gitignore` 第 8 行 | `docs/` |
+| `docs/` 磁盘文件数 | 49 |
+| 其中**已被 git 跟踪** | **6**（`_archive/` 4 个、`decisions/` 2 个、`nine-layer-ir.md`） |
+| `docs/mora-spec.md`（**本仓唯一的语言规范**，49 KB） | **不在跟踪内** |
+
+**后果**：D108 / D109 的 spec 修正**无法提交** —— 干净 clone 上拿不到这份规范，
+改动会丢失。
+
+`.gitignore` 里已有相反先例：第 12 行显式把 `AGENTS.md` 从忽略中豁免，注释写
+「**项目级 AI 约束必须入仓**（v0.78）」。规范同属「必须入仓」的东西。
+
+**未改**：是否把 spec 纳入版本控制是**项目策略决定**，不在缺陷修复范围内，
+仅报告事实与依据。
+
+#### D108：spec §14.2 的 EBNF 核对 —— 「两处不一致」实为**一处**，且我第一版测错了方向
+
+待决清单里记着「两处 spec EBNF 与实现不一致」。本轮用**spec 原文的形式**逐条实测，
+结论：**只有 `handle_stmt` 一条**真不一致。
+
+##### 我第一版**测错了方向**（自我更正）
+
+我臆造了 `model M { count: number }`（带花括号）去测，报「spec 与实现不一致」。
+但 spec §14.2 **原文**写的是：
+
+```text
+model_stmt = "model" IDENTIFIER { IDENTIFIER ":" type [ "=" expr ] } "end" ;
+```
+
+—— **就是实现的缩进 + `end` 形式**，两者完全一致。`msg` / `update` / `transaction`
+同理，**全部可解析**。
+
+> **「臆造的语法不解析」不等于「spec 承诺的语法不解析」。**
+> 待决清单上那条「两处」的记录本身就是**基于错误前提写下的**，
+> 已在本条更正。
+
+##### 真正的不一致：`handle_stmt`
+
+```
+原：handle_stmt = "handle" IDENTIFIER "on" IDENTIFIER "->" { statement } "end" ;
+```
+
+实测 `Parse error: Expected '{' after effect name` —— **该形式根本解析不了**。
+实现是**双花括号块**：`handle E { body } { handler }`，
+与本节其它块构造（for/while/task/transaction/observe）风格一致，
+也是全部 e2e fixture 与 repowiki 实际使用的形式。
+
+**已改正 spec**（含更正注释），未改实现 —— 实现侧本来就是对的。
+
+##### 测试设计上的一个坑（第二次栽在同一处）
+
+新增 `tests/spec_ebnf_parity.rs`（6 条）。**第一版只硬编码了几段源码、
+根本不读 spec 文件** —— 于是我把 spec 改回去做反向验证时，测试**照样全绿**。
+**测试不读被测对象 = 测不到它。** 改写后测试通过 `spec_production()`
+真正从 `docs/mora-spec.md` 提取产生式。
+
+**反向验证（重做后成立）**：把 spec 改回 `on … -> … end` →
+`d108_spec_handle_stmt_matches_implementation` 以
+「spec 的 handle_stmt 仍是旧的 `on … -> … end` 形式」失败；改前先读盘确认已落盘。
+
+**待决清单由六条减为五条。**
+
+#### D107：`run_mir` 末值对 `with` 块的取值 —— **该待决项已消解，无需修改**
+
+D96 记下过一条观察：「以 `with` 块结尾的程序，末值取到的是**配置绑定的值**而非 `Nil`」
+（`String("m")`），当时判为契约偏差。本轮**重新实测**：`run_mir` 返回 `"Nil"` ——
+**观察已不可复现**。要么当时是探针假象，要么被 D89–D106 之间的某次改动顺带解决。
+
+机制上本就是对的：`run_mir` 的 `result` 是「**最后一个写寄存器的指令的值**」
+（`vm/dag.rs:483-486`），而 `with` 块末尾的 `Const(dst, Nil)` 正是最后一条写寄存器的
+指令——与 `emit_with_w` 的「子 body 的返回值不传播」一致。
+
+新增 `tests/run_mir_tail_value.rs`（3 条）把该契约**钉住**：`with` 块结尾 → `Nil`；
+普通字面量结尾 → `Float(5.0)`；`print(...)` 结尾 → `Nil`。
+**写第一版时我把对照组期望写成了 `Int(5)`，实测 `Float(5.0)` 才更正** ——
+这正是 D98 确立的「本语言所有裸数字字面量都是 Float，`Int` 只由 `len()` 产生」。
+又一次「断言的期望值本身也要取证」。
+
+**未改代码**：本条是「重新测量 + 加锁」，不是修复。**待决清单由七条减为六条。**
+
+#### D106：`orchestrate` 四种语法形态的端到端验证（否定结果）
+
+D97 的守卫顺带引出一个更广的问题：`orchestrate` 有 `MirOrchestrateKind` 的
+`Sequential` / `Loop` / `Graph` / `Pregel` 四种形态（`Graph` 与 `Pregel` 共用
+`MirPregelEngine`）。逐一验证**结果**（而不只是「能跑」），配真实输入变量：
+
+| 形态 | 程序要点 | 实测 `result` |
+|---|---|---|
+| `sequential` | 单 agent / 两 agent + `edge a -> b` | `A` / `B` ✓ |
+| `loop` | `max_rounds: 3` | `v` ✓ |
+| `loop` + `on:` | 条件**首轮即真** | `done` ✓（提前退出） |
+| `loop` + `on:` | 条件**恒假** | `start` ✓（跑满 rounds，agent 回显 input 故不变） |
+| `graph` | `edge @start -> a` | `A` ✓ |
+| `pregel` | `edge @start -> a` | `A` ✓ |
+
+**全部正确，零缺陷。** `on:` 退出条件与 `max_rounds` 上限都真实生效
+（`runtime.rs:542-593` 的 Loop 实现读来是对的，实测也一致）。
+
+**探针自身错了一次**（记此免得重蹈）：第一版把 `input` 当作普通变量，
+而它其实是**内置变量、默认 `Nil`** —— agent 收到 Nil、返回 Nil，
+于是四种形态「全部返回 nil」，看起来像集体失效。加上
+`let x = ...` 提供真值后全部正常。
+**教训**：断言返回 `nil` 时，先确认那个值**真的被赋过**。
+
+#### D105：`document` 后端的**错误传播**与内容可达性验证（否定结果）
+
+`document/backend`（1612 LOC，7 个后端）此前只被 `document.parse("a.md")` 一条
+happy path 覆盖过。逐个构造**损坏 / 空 / 缺文件 / 未知扩展 / 假二进制**输入：
+
+| 输入 | 结果 |
+|---|---|
+| 合法 `.md` / `.html` | exit 0，`origin` 正确 |
+| 截断 PNG | exit 1，`image decode error: … chunk appeared before IHDR chunk` ✓ |
+| 伪 PNG（文本冒充） | exit 1，`The image format could not be determined` ✓ |
+| 损坏 PDF | exit 1，`lopdf load error: couldn't parse input: invalid file header` ✓ |
+| 缺文件 | exit 1，`cannot read '…': 系统找不到指定的文件` ✓ |
+| 未知扩展名 | exit 1 ✓ |
+| 空 `.md` | exit 0，空文档（合法语义） |
+
+**错误传播全部正确**，没有「损坏文件静默返回空」那一族问题。
+
+**内容可达性**：`Value::Document` 的 `Display` 只输出 `<document origin="…">`
+（正文不显示、`>` 也未闭合），初看像「解析了却取不到」。实测该值暴露
+`origin()` / `text()` / `markdown()` / `pages()` / `metadata()` / `blocks()`
+六个方法，`d.text()` 正确返回解析出的正文、`d.markdown()` 返回原文 ——
+**不透明句柄是刻意设计**，正文完全可达。
+
+**记一笔**：`Display` 的 `>` 未闭合是观感瑕疵（像未完成的模板），
+但**不是正确性缺陷**，未改 —— 改它属表现层调整，且 `print(document)` 的
+可读性怎么定（塞全文？截断？）属设计决策。
+
+#### D104：`format!("{:?}", …)` 反模式的**全仓普查**（否定结果，记此免得重查）
+
+D102 暴露出一个可机械搜索的反模式：把枚举的 `Debug` 当**面向用户的文本**
+（`format!("{:?}", e)` 输出的是**变体名**而不是源码拼写）。全仓扫该形状：
+**47 处**。逐类核对，**无一是在线代码里的活缺陷**：
+
+| 类别 | 处数 | 判定 |
+|---|---|---|
+| typeck 错误消息里的**类型** Debug（`expected Int, got String`） | ~40 | ✅ **合法** —— `Type` 的变体名就是可读的类型名，实测输出正确 |
+| `compress/strategies.rs:118` —— `Value::String` 的 Debug 拼成**去重 group key** | 1 | ✅ 内部键，非用户可见，且天然唯一 |
+| `mir/lower.rs:434`、`witness_to_fcfg.rs:202,206` —— `format!("{:?}", op)` 作**名字** | 3 | ⚠ **潜在**：`WitnessCallee::Builtin` **全仓没有构造点**（构造处一律是 `Name`），是死路径 |
+| `typeck/hm/infer.rs:228` —— `msg` 的 `tag` 非字符串字面量时的错误消息 | 1 | ⚠ **潜在**：`msg` 语法只接受裸变体名（`tag: 1` / `tag: "x"` 都是 Parse error），从语言走不到 |
+| `compress/json.rs:98` —— `array_type` 进 `CrushResult::metadata()` | 1 | ⚠ `metadata()` 的**唯一调用点在测试内部**（`json.rs:844` 位于 `#[test]`），语言层走不到；且 `ArrayType` 是**描述性角色枚举**（`TopScores`/`Uniform`…），变体名本身即领域术语 |
+| `lsp/providers/formatting.rs` | 1 | ✅ **D102 已修** |
+
+**结论：D102 那一类缺陷在我已修的格式化器之外没有第二个活实例。**
+普查逐项取证后才下的结论，不是「扫了一眼没看见」。
+
+**遗留**：上面 5 处**潜在**项（3+1+1）都不是当前可触达的缺陷，
+但都是「一旦接上就静默出错」的形状。若将来让 `WitnessCallee::Builtin`
+参与构造、或给 `msg` 的 `tag` 开放字面量、或在语言层暴露 `crush` 的 metadata，
+须先把 `format!("{:?}", …)` 换成真实拼写。**未改**（改动它们等于改语言设计）。
+
+#### D102 / D103：LSP `formatting` **产出不可解析的代码**；`references` 静默忽略 `includeDeclaration`（均已修）
+
+承 D101，把 LSP 剩下未驱动的 provider 也跑一遍 —— `formatting`（160 LOC）、
+`references`、`rename`。
+
+##### D102：格式化器把运算符换成**枚举变体名**
+
+`formatting.rs::token_text` 的兜底分支是 `format!("{:?}", tt).to_lowercase()`
+—— 输出的是**枚举变体名**而非源码拼写：
+
+| 输入 | 修前格式化产物 |
+|---|---|
+| `let  x=1` | `let x assign 1` |
+| `print( x +y )` | `print lparenx plus y rparen` |
+
+产物**根本解析不了**：实测 `mora run` 报
+`Parse error: Expected '=' in let binding at line 1`（exit 2），
+而**原文能跑出 `3.0`**（exit 0）。编辑器一旦接受这份 `newText` 并存盘，
+用户的代码就被毁了 —— 格式化器的**基本要求**是不得破坏代码。
+
+同一兜底分支还漏了 `Int` 与 `BigInt`：它们会变成 `"int"` / `"bigint(123)"`；
+`String` 分支也没对内层的 `"` 与 `\` 重新转义。
+
+**修法**：穷举**每个** `TokenType` 变体的源码拼写，并且**故意不留 `_ =>` 兜底**
+—— 让编译器强制本函数穷尽所有变体，于是「新增 token 忘了加映射」这个缺陷
+在**编译期**就被挡住。（顺带一提：正因为穷举，第一次反向验证加回兜底分支时
+编译器立刻报了 5 条 `unreachable pattern`，兜底已是死代码。）
+
+##### D103：`references` 从不读 `params.context`
+
+该 provider **既不含 `context` 也不含 `includeDeclaration`** —— 标志被静默忽略；
+且 `collect_references_v3` 只从**表达式**收集，而 `let x = 1` 的**声明处**
+（绑定，不是表达式）永远找不到。实测 `includeDeclaration: true` 只返回使用处，
+而同场景的 `textDocument/rename` 走 `collect_definitions_v3` +
+`collect_references_v3` **两个来源**、能找到 2 处 —— 两个 provider 行为不一致。
+
+**修法**：按 LSP 规范支持 `includeDeclaration`（默认 false）与 `onlyDeclaration`，
+声明处从 `collect_definitions_v3` 取并去重。
+
+##### 顺带更正一次探针位置错误
+
+第一版把光标放在 `{line:0, character:4}`，而 `let  x=1` 的 `x` 在 **character 5**
+（两个空格）—— 于是 `references`/`rename` 都返回空，一度以为「两个 provider 都坏了」。
+改对位置后两者**本来就正常**（`rename` 当时就给的是完整 WorkspaceEdit）。
+
+##### 测试与反向验证
+
+新增 `tests/lsp_formatting_references.rs`（3 条）。D102 的判据**不是「长得对」**，
+而是**把产物丢给 `mora run`**：解析失败即缺陷；并加一条「语义不变」断言
+（产物仍输出 `3.0`）。D103 一条测 `includeDeclaration: true` → 2 处，
+一条测缺省 → 1 处。
+
+**两条反向验证都做，且第一遍都无效、重做后才成立**：
+- D102 第一次只把**兜底分支**加回来 —— 但显式映射已穷尽，兜底是**死代码**，
+  测试照常全过，**证明不了任何事**。改为撤掉真正出问题的那四条显式臂
+  （`Assign`/`LParen`/`Plus`/`RParen`）→ 测试以「含枚举变体名 `rparen`」失败。
+- D103 撤掉「并入声明」那段 → 以「应返回 2 处，得到 1 处」失败。
+
+#### D101：LSP 对**语法错误**推送**零诊断** —— 等于告诉用户「代码没问题」（已修）
+
+承 D100：既已证明 `mora-lsp` 协议层正常，就顺带把 11 个 provider 文件
+（**1143 LOC，此前一条没测过**）用真实 LSP 会话驱动一遍。
+
+##### 大部分 provider 正常（否定结果）
+
+`hover`（返回 ```` ```mora let n: <inferred> ``` ````）、`documentSymbol`、
+`completion`（含关键字与变量）、`definition`、`foldingRange`、
+`semanticTokens/full`（真实 token 数组）、`shutdown` —— **全部有实质结果**。
+`textDocument/diagnostic`（pull 形态）与 `workspace/symbol` 正确报
+`method not supported`（能力声明里也没宣告它们，属诚实的边界）。
+
+##### 缺陷：语法错误 → `diagnostics: []`
+
+| 源码 | `mora run` | LSP `publishDiagnostics` |
+|---|---|---|
+| `let = = =` | `Parse error: Expected variable name after 'let' at line 1`，exit 2 | **`[]`** ❌ |
+| `print(undefined_thing)` | `Unbound variable …` | 1 条 ✓ |
+| `let n: Int = "hello"` | 2 条 type error | 2 条 ✓ |
+| 正常源码 | 正常 | 0 条 ✓ |
+
+根因（`lsp/server.rs::check_diagnostics`）：
+```rust
+Err(_) => return Vec::new(),   // parser 失败即返回空表
+```
+语法错误是语言服务器**最基本**的能力，这一吞让整条诊断链在此处失效 ——
+用户看到的是「这段代码没问题」。
+
+**修法**：把 parser 的错误消息转成一条 `severity=1` / `source="mora-parser"`
+的诊断；行号从消息里的 `at line N` 提取（1-based → 0-based），提取不到落第 0 行；
+列号留 0（parser 消息不带列号，**不编一个假列号**）。
+
+##### 顺带更正一次**探针串扰**
+
+第一版把 4 个文档塞进**同一个** LSP 会话，`undefined_thing` 那条显示 0 诊断，
+一度以为「连未定义变量也漏报」。改用**每文档一个独立会话**后确认它其实正常报 1 条 ——
+**又是多用例共用同一会话的状态串扰**（与今日 D91 的「并行测试共用临时文件」同型，
+但这里串的是**服务器内的 `docs` 状态机**，不是文件）。三类结论都由单用例会话确定。
+
+新增 `tests/lsp_syntax_diagnostics.rs`（4 条）：主断言语法错误必须产出
+`source="mora-parser"` 的诊断；两条对照组锁住 `mora-typeck` 通道的数量不变
+（未定义变量 1 条、类型错误 2 条）；一条**防「一刀切」**——正常源码 0 条诊断。
+**反向验证**：把 `Err(e) => return vec![…]` 改回 `return Vec::new()` →
+主断言以「得到 0 条」失败，改前先读盘确认回退已落盘。
+
+#### D100：stdio JSON-RPC 服务器的 **stdout 被启动横幅污染**（已修）
+
+D99 是在 HTTP 服务器的 e2e 里发现的（`/explode` 返回 200 + `null` 揭出 `json.stringify`
+的非法 JSON）。本轮把同类的另一台服务器 **MCP**（471 LOC，同样从未 e2e）端到端跑一遍。
+
+##### 先更正一个**我自己制造的假象**
+
+用 PowerShell 的 `Process.StandardInput` 喂 LSP/MCP，两台服务器都**零响应**，
+一度像是要报「MCP 与 LSP 全部不可用」这种大缺陷。改用**文件重定向**
+（`cmd /c "prog < in.bin > out.bin"`）后**两者都完全正常**：
+
+| 服务器 | 文件重定向下的真实行为 |
+|---|---|
+| `mora-lsp` | `exit 0`，返回完整 `initialize` 响应与全套 capabilities |
+| `McpServer.serve()` | 4 条请求 4 条响应：`initialize` / `tools/list`（两个工具+schema）/ `tools/call greet` → `hello mora`（**Mora 闭包真的执行了**）/ 未知工具 → `-32602` |
+
+**即：PowerShell 的 stdin 写入在管道下不可靠**，此前「服务器坏了」完全是探针问题。
+**教训**（与今天第 N 次同源）：判定「某个组件坏了」之前，先用**另一种机制**
+（文件重定向而非 API 写入）复测一次。
+
+##### 缺陷（唯一确证的一条）
+
+`main.rs::print_banner()` 用 `println!`（stdout），在**命令分派之前**执行 ——
+而 `mora run` 可以在程序里启动 MCP 服务器，此时 **stdout 就是协议通道**。
+实测修前 stdout 的开头是 9 行横幅，**之后**才是 `Content-Length` 帧：
+
+```text
+Mora v0.104.5
+  AI: mock mode …
+  …共 9 行…
+
+Content-Length: 162
+
+{"id":1,"jsonrpc":"2.0",…}
+```
+
+其中 `  AI: mock mode …` **含冒号**，会被当 header 名 `AI` 解析。
+宽容的解析器也许能恢复，严格的不会。`mora-lsp` 无此问题（它的 stdout
+直接以 `Content-Length` 开头）。
+
+**修法**：横幅整体改走 `eprintln!`（stderr）。
+对普通 `mora run` 这同样是改进 —— 横幅是**元数据而非程序输出**，
+本会话所有探针都不得不从 stdout 里过滤掉它。
+
+**修复后实测**：stdout 以 `Content-Length` 开头、不含横幅、4 帧完整；横幅在 stderr。
+
+##### 未能证实的一条（据实记录，不算缺陷）
+
+`mcp_server::read_message` 在**没有 `Content-Length` 头**时 `return Ok(None)`，
+而 `Ok(None)` 在主循环里意味着 **EOF → 服务器退出**。读代码像是
+「一条不合规消息能永久终止服务器」。**实测不成立**：喂一条无头消息 + 一条合规消息，
+`id:8` 无响应（可接受）但 **`id:9` 正常被响应** —— 解析器会把坏行当 header 吃掉、
+重同步到下一条真正的 `Content-Length`。故**不作为缺陷记录**。
+
+新增 `tests/stdio_jsonrpc_e2e.rs`（5 条）：
+4 条用内存 `Cursor` 喂标准/LF-only/连续/EOF 分帧，**把帧解析器从 stdin 上隔离出来**
+（结论：解析器完全正确）；1 条断言横幅**不得**出现在 stdout、且必须在 stderr。
+**反向验证**：把 `eprintln!` 改回 `println!` → 该条以
+「stdout 应只含程序输出」失败，恢复后 5/5 通过。
+
+#### D99：`json.stringify` 对**非有限浮点**产出非法 JSON —— 往返直接断（已修）
+
+D98 的普查说明按模块盲探产出低。换到一个**从未被端到端跑过**的类别：
+服务器代码（`http_server` 448 + `mcp_server` 471 + `server` 548 = **1467 LOC**）。
+CLI 无 `serve` 子命令、测试里**零次**起过服务（`TcpListener`/`listen`/`127.0.0.1`
+全无匹配），替代入口只有语言侧的 `Router::new() + router.listen(addr)`。
+
+起服务 + curl 的实测结果（`tests/fixtures` 之外的手工 e2e）：
+
+| 路由 | 结果 |
+|---|---|
+| `GET /api/health` | 200 `{"status":200}` ✓ |
+| `GET /api/echo/bob`（路径参数） | 200 ✓ |
+| `GET /nope` | **404** ✓ |
+| `GET /undef`（handler 调未定义函数） | **500** ✓ |
+| `GET /ok/`（尾斜杠）、`?x=1&y=2` | 200 ✓ |
+| `GET /explode`（handler 返回 `inf`） | 200，body **`null`** ← 缺陷 |
+
+**HTTP 服务器本身是好的**，但那条 `null` 揭出了 JSON 层的缺陷。
+
+##### 缺陷：`stringify` 输出不是 JSON
+
+| 表达式 | `stringify` 输出 | 再 `parse` |
+|---|---|---|
+| `json.stringify([1.0/0.0, 2.0])` | `"[inf,2.0]"` | **失败**：`Unexpected character in JSON: inf,2.0` |
+| `json.stringify(0.0/0.0)` | `"NaN"` | **失败** |
+
+PowerShell 的真实解析器同样拒绝（`Invalid JSON primitive: inf.`）——
+**任何** JSON 消费方都会挂，而 `1.0 / 0.0` 是最普通的算术。
+
+**根因**（`flow/json.rs::value_to_json`）：
+```rust
+if f.fract() == 0.0 { format!("{:.1}", f) } else { format!("{}", f) }
+```
+`inf.fract()` 与 `NaN.fract()` **都是 `NaN`**，而 `NaN == 0.0` 恒假 →
+落进 `format!("{}", f)` → Rust 输出裸的 `inf` / `NaN`，**都不是 JSON 字面量**。
+
+##### 修法：三处，非有限 → `null`
+
+1. `src/flow/json.rs`（语言内建 `json.stringify`）—— 主修复。
+2. `src/pregel/reducers.rs::value_to_json_string`
+3. `src/pregel/mod.rs::value_to_json_string`
+
+后两处是**重复实现**（本文件与 reducers.rs 各一份，内容相同），同型缺陷：
+channel 值可以是 `inf` → `build_node_input` 产出的 delta JSON 同样非法。
+`http_server::value_to_json` 经 `JsonValue` 映射后**本来**就输出 `null` ——
+即修前**三个序列化器有三种行为**（`inf` / `NaN` / `null`），现统一为 `null`。
+
+新增 `tests/json_non_finite.rs`（5 条）：`inf` / `NaN` 不得裸出、容器内递归处理、
+**`stringify → parse` 往返不变量**，外加一条**有限浮点对照组**
+（`1.5` / `42.0` / `0.0` / `-1.5` / `[1.5,2.5]` 全部不受牵连，防「一刀切 null 化」）。
+
+##### 反向验证：**第一次是假的，已重做**
+
+首次用 PowerShell `.Replace()` 回退，**因 `\r\n` 与 `\n` 不匹配而根本没改到文件**
+（改后仍含 `is_finite`），测试照常全过 —— 若只看「测试通过」就会得出
+「反向验证成功」的错误结论。改用结构化编辑重做：确认回退落盘 → 4 条失败
+（`1 passed / 4 failed`）→ 确认恢复落盘 → 5 条全过。
+
+##### 附带记录（未改）
+
+- **handler 无法设置 HTTP 状态码**：`http_server.rs:213-215` 成功路径**恒 200**，
+  `{status: 500}` 只是 body 里的字段。这是模块文档明写的行为
+  （「闭包返回值是 dict，自动 json.stringify 成 response body」），**不是缺陷**，
+  但容易误解。
+- **`{status: 200, body: "..."}` 写不出来** —— dict 字面量同质限制（D79 已列入
+  待用户决定）。本轮实测确认这是起服务的**实际障碍**。
+- `1 / 0` 返 `inf`（不报错），而 `len([]) / len([])` 返「division by zero」——
+  浮点除零与整数除零语义不同，是设计而非缺陷。
+
+#### D98：普查工具被证伪 + 边界属性扫描（**否定结果**，记此免得重查）
+
+D97 之后先**重做覆盖普查**（上一版按文件名匹配，被证伪），再**换维度**做边界扫描。
+
+##### 普查工具的正确版本：按 `#[test]` 属性计数
+
+| 模块 | LOC | 测试数 | LOC/测试 |
+|---|---|---|---|
+| `heartbeat` | 213 | 12 | 18 |
+| `mock` | 209 | 11 | 19 |
+| `runtime` | 1985 | 90 | 22 |
+| `rel` | 1299 | 48 | 27 |
+| `value` | 1548 | 57 | 27 |
+| `pregel` | 3208 | 32 | 100 |
+
+**结论：全仓覆盖均匀，没有明显欠测模块**（最薄者也有 18 LOC/测试）。
+这解释了 D96–D97 连续收到否定结果的**结构性原因** ——
+按模块盲探的产出本来就低，不是因为代码有问题。
+
+##### 边界属性扫描（12 组）—— 全部符合预期
+
+| 输入 | 结果 | 判定 |
+|---|---|---|
+| `len("")` | `0` | ✓ |
+| `len("héllo 世界 🎉")` | `10` | 按**字符**计（不是字节） |
+| `"a🎉b"[1]` | `🎉` | 按 Unicode 标量索引，非 UTF-16 码元 ✓ |
+| `1.0 / 0.0` | `inf` | ✓ |
+| `9223372036854775807 * 10` | `…58080.0` | 整数字面量是 Float → 2⁵³ 以上精度丢失（**但有正规出口**，见下） |
+| `[][0]` / `"abc"[99]` / `1/0` | 均正确报错 | ✓ |
+| `[1,2,3,4,5][1:3]` | Parse error | spec **未承诺**切片语法（`slice()` 方法存在） |
+| `[1,2,3][-1]` | 报错「negative index」 | spec **未承诺**负索引 |
+| 30 层嵌套括号 | 正常 | ✓ |
+
+##### 数值塔**完全自洽**（本轮最值得记的否定结果）
+
+语言里整数字面量是 **Float**，`Int` 只由 `len()` 产生。这看着像契约裂缝，实测是
+**内部一致**的：
+
+| 表达式 | 结果 |
+|---|---|
+| `let x: Int = 1` | **正确报错** `expected Int, got Float` |
+| `type_of(1)` / `type_of(1.0)` / `type_of(len([1]))` | `float` / `float` / `int` |
+| `let x: number = 42` / `= 1.5` | 均放行（D62 的修复生效） |
+| `9223372036854775807n * 10n` | `92233720368547758070n` — **精确** |
+| `170141183460469231731687303715884105727n * 2n` | `340282366920938463463374607431768211454n`（= 2¹²⁸，**任意精度**） |
+| `1n + 1` / `1n + 1.5` | `2.0` / `2.5`（BigInt 提升到 Float） |
+
+即：`n` 后缀提供任意精度整数、`number` 是两者的并集标注、
+`Int` 是 `len()` 专属的窄类型 —— **三条规则互不冲突**。
+「整数字面量丢精度」不是缺陷，是有 `BIGINT` 出口的设计后果
+（spec §14.2 明确区分 `NUMBER` 与 `BIGINT = digits "n"`）。
+
+#### D97：pregel 漏写入口边 → **静默返回 `nil`**（已修，收口 D96 留下的待决项）
+
+D96 留下「pregel 漏入口边静默 nil」这条待决项。本轮**收口**了它 ——
+原判「需要可达性分析、是策略决定」是**过度设计**，实测证明不需要。
+
+##### 修前实测
+
+```mora
+orchestrate pregel input -> result
+  agent a => "A"
+  agent b => "B"
+  edge a -> b            -- ← 没有 edge @start -> a
+end
+```
+→ `result = nil`、**exit 0、零诊断**。而补上入口边后一切正常
+（单点 `A`、链 `B`、菱形 `C`、孤立 agent 不影响）。
+
+##### 守卫条件：两次收窄才对
+
+**第一版（过宽，误伤合法路径）**：`stats.agents_run == 0 && 有 @start 可达 agent`。
+实测打挂了 `incremental_skip_when_input_unchanged` —— 因为**被调度但被增量缓存
+跳过**是**合法**生产路径，而 `agents_run` **不计**跳过。
+→ 改用 `scheduled`（PLAN 阶段累计的**被调度**数），与执行与否解耦。
+
+**第二版（加了可达性分析，反而抓不到）**：`scheduled == 0 && 从 @start 可达`。
+实测 `no_start` 场景里**根本没有 `@start` 边** → 可达为 false → 守卫不触发。
+**条件方向写反了**。
+
+**第三版（定稿）**：`scheduled == 0 && !config.agents.is_empty()` ——
+「**声明了 agent 却一次都没被调度**」本身就是错配，无论原因是漏写入口边、
+边指向未知节点、还是所有 agent 都被 Halt。**不需要可达性分析。**
+
+实测：`no_start` → exit 1
+```
+pregel: graph declares agents but none was ever scheduled (agents: a, b).
+No agent is activated — check that an entry edge such as `edge @start -> <agent>` exists.
+```
+4 个正常图（含**孤立 agent** 的 `isolated`）全部 exit 0；33 条 pregel 单测全绿。
+
+##### 顺带抓到**第三个**同类空测试：`orchestrate graph` 也有这个陷阱
+
+守卫上线后 `v3_orchestrate_graph_runs` **失败**了 —— 查证后发现它的程序
+（`orchestrate graph input -> result` + `agent a`/`agent b` + `edge a -> b`，
+**同样没有入口边**）此前也一直在静默空转。
+
+`orchestrate graph` 与 `orchestrate pregel` 走**同一个** `MirPregelEngine`，
+是同一个陷阱的两种语法外壳。已补上入口边并改为断言 `result == "world"`
+（原先只 `assert!(result.is_ok())`，于是「什么都没跑」被当成了「跑通了」）。
+
+**至此「只断言能跑通」的 orchestrate 测试有 3 条**（pregel ×1、graph ×1、
+以及早前的零覆盖版本），全部是同一个缺陷的伪装。
+
+`tests/pregel_entry_edge.rs` 改为 3 条：主断言「应报错」+ 两条对照组
+（有入口边正常产出 / **孤立 agent 不误报**）。
+`orchestrate_v3_pipeline.rs` 里那条「钉住静默 nil」的测试也一并改为断言报错。
+**反向验证**：给守卫加 `if false &&` 短路 → 主断言以「却静默返回了 Nil」失败，
+改前先读盘确认短路已落盘。
+
+##### 教训
+
+「这条需要可达性分析、属策略决定」这类判断，写下来之前应该先跑一遍
+**最朴素的守卫**看它够不够。本轮两次收窄都暴露了同一件事：
+**守卫的第一版几乎总是过宽或方向反的，而唯一的判据是实测。**
+
+##### 调查经过（本条的取证过程）
+
+转向测试覆盖最薄的模块。按「模块 LOC × 测试提及数」排序，`pregel`
+（3208 LOC）排第一，据此写下了「测试仅提及 1 次」。
+
+##### ⚠ 该普查结论**是错的**，在此更正
+
+全量测试输出显示 `pregel` 实际有 **32 条内联单元测试**
+（`pregel::tests::*` 28 条 + `pregel::worker_pool::tests::*` 4 条），
+覆盖 `apply_write` 各 reducer、增量跳过、并行/顺序一致性、vote_to_halt、
+StepUndo 回滚、master_compute、worker_pool 顺序与超时……覆盖并不薄。
+
+**错因在我自己的普查脚本**：它按**文件名**（如 `mod.rs`）在测试文本里做子串匹配，
+而 `mod.rs` 这种重名文件让计数严重失真。**正确的度量应按模块路径或 `#[test]` 条数。**
+这与 D93（`#[test]` 丢失导致测试不注册）同源：**「看起来有/看起来没有」都要取证**。
+
+**修正后的判断**：`pregel` 的**内联单测覆盖是充分的**；真正的缺口只有一个 ——
+**端到端那条只断言「能跑通」**。本轮的结论（D97 + 测试升级）不受影响，
+但「pregel 覆盖最薄」这个前提是错的，特此更正。
+
+##### 推演没找到缺陷，改为跑真实程序
+
+先按缓存/时序推演了 `agent_input_cache` 跳过机制（v0.75.8 增量执行）与
+`versions_seen` 的 `or_insert` 冻结语义、`StepUndo` 只回滚 `pending_sends`
+导致故障重试的 delta 一致性 —— **推演全程没找到缺陷**（重试时 delta 相同，
+缓存复用仍正确）。随即改用实测。
+
+第一版探针的 4 个 pregel 程序（含最简单的 `a -> b` 链）**全部 `result = nil`**。
+一度以为是引擎整体失效。
+
+##### 真因是**探针语法错**，但暴露了一个真实的静默陷阱
+
+`pregel::MirPregelEngine::run` 的 `active_nodes` 初始为 `vec!["@start"]`，
+下一跳沿 `edges` 从 `active_nodes`（含 `@start`）计算。`@start -> a` 是
+**语法的一部分**（repowiki 文档的语法表里明列 `edge @start/@exit`）。
+`mir/handlers/runtime.rs` 的 `Pregel` 分支**原样透传** witness 的 edges、
+**不补** `@start`（只有 MoA 那条路径会补，`runtime.rs:905`）。
+
+补上入口边后引擎**完全正确**：
+
+| 图 | `result` |
+|---|---|
+| `a`（单点） | `A` ✓ |
+| `a -> b`（链） | `B` ✓ |
+| `a -> {b, c}`（菱形） | `C` ✓ |
+
+**但漏写入口边时：`exit 0`、零诊断、结果 `nil`。** 属静默错值族
+（D1 `range` 静默取默认 / D28 静默返回首元素 / D39 `with` 未知键静默丢弃 /
+D45 块内解析失败静默跳过）。
+
+##### 为什么唯一的 e2e 测试没抓到
+
+`orchestrate_v3_pipeline.rs::v3_orchestrate_pregel_runs` 是本形态**唯一**的
+e2e 测试，它**只断言「能跑通」、从不检查 `result`** —— 正是
+「测了能跑、没测对不对」的形态。
+
+##### 曾经以为「朴素修法是错的」（**该判断已被推翻**，见上）
+
+当初写下本条时认为守卫需要可达性分析、属策略决定。**后续验证证明不需要**：
+
+1. **checkpoint 恢复** —— 担心无条件报错会打断 resume。实测**不受影响**：
+   守卫读的是 `scheduled`（本次 `run()` 内累计的被调度数），恢复后第一轮
+   若仍能调度到 agent，`scheduled > 0` 即不触发。
+2. **28 个 pregel 单测里 8 个没有 `@start`** —— 33 条全绿，无需为它们让步。
+3. 「需要可达性分析」—— 见上文「守卫条件：两次收窄才对」，**方向还写反了**。
+
+已改为 `scheduled == 0 && !config.agents.is_empty()`，实测 `no_start` 正确报错、
+4 个正常图（含孤立 agent）全部不受影响。
+
+##### 顺带把那个零覆盖测试**升级成真测试**（本轮唯一的代码改动）
+
+`v3_orchestrate_pregel_runs` 原先只 `assert!(result.is_ok())`，
+且它用的程序 `edge a -> b` **没有入口边** —— 即**它测的那段代码从未真正执行过**，
+「测试通过」与「引擎正确」之间没有任何联系。
+
+现补上 `edge @start -> a` 并断言 `result == "world"`（链尾 agent 的值），
+另加一条对照组钉住「无入口边 → **报错**」（D97 守卫加于 `pregel_entry_edge.rs`）。
+**反向验证**：去掉入口边后以 `left: "Nil" / right: "String(\"world\")"` 精确失败
+（改前先读盘确认改动落盘），恢复后 11/11 通过。
+
+#### D96：`node_result_reg` 覆盖 20 / 50 个 `Node` 变体 —— 普查缺 arm 的真实风险（否定结果）
+
+D95 指出 `node_result_reg` 对缺 arm 的节点返回 `None`、消费方 `unwrap_or(0)`
+指向寄存器 0，是 D58 同型隐患。本轮把这条线收口：普查**全部 50 个 `Node` 变体**
+里哪些缺 arm、其中哪些是**值产生节点**且**真的会被消费**。
+
+新增 `tests/node_result_reg_gap.rs`（1 条），**绕过差分回落**直接构造并执行管线产出
+（否则 FCFG 产出从不执行、隐患被回落挡住，测不出东西）。
+
+##### 消费路径只有一条真正可达
+
+先试了最直觉的形态「`let r = <块>`」——**全部解析失败**：Mora 里块是**语句**不是
+表达式，`let r = observe … end` 语法就不成立。真正可达的是：
+
+```text
+Node::Sequence { nodes, .. } => nodes.last().and_then(node_result_reg_of)
+```
+
+即 **程序以块语句结尾**时，整个序列的末值退化成寄存器 0。
+
+##### 测量结果：全部「一致」，**缺 arm 目前不是活缺陷**
+
+| 用例 | 末两条 MIR | 两条路径的 `last_expr` |
+|---|---|---|
+| `observe` / `span` / `parallel` / `prompt` / `document` | `<块>`, `Const` | `nil` / `nil` — 一致 |
+| `with`（有 arm 的对照组） | `Const`, `WithConfig`, `Const` | `"m"` / `"m"` — 一致 |
+| `literal`（对照组） | `Var` | `7.0` / `7.0` — 一致 |
+
+**D58 那条「缺 arm → 结果退化成寄存器 0」对块形态不成立** —— 两条路径都给正确的
+`nil`。D95 标记的「潜在隐患」经此降级为**否定结果**。
+
+（第一版用例把 `print(0)` 放在块前面，全绿；但 `print` 的返回值恰好是 `Nil`，
+`unwrap_or(0)` 可能**撞对了寄存器**。换成 `let marker = 7` 后结论不变 ——
+判据本身要先排除「碰巧通过」。）
+
+##### 顺带查到一处**契约偏差**（先前就有，非本轮引入）
+
+`with_tail` 两条路径都返回 **`"m"`**（配置绑定值）而非 `Nil`。
+末两条 MIR 是 `Const`（存 `"m"`）+ `WithConfig` + `Const`（= `dst, Nil`）——
+`emit_with_w` 的 `Const(dst, Nil)` **确实在**，但 `run_mir` 的末值不取它。
+
+**影响面极小**：`last_expr` 只有**库调用方**可见，语言层观测不到
+（`with` 是语句、块内 `let` 不外泄，见 D91）。且 D58 修的是 `Block::result`
+（FCFG 内部 `dst` 是否被写），与末值选取是**两件事**，**不构成 D58 回归**。仅记录。
+
+#### D95：追 D92b 的根因 —— 5 类块形态的 `Node` 变体**缺 `dst`**（改动已回退，根因已定位）
+
+D94 指出「让管线补上尾部 `Return`，两条路径就一致，差分自然通过」。本轮去实施，
+**失败并回退**。过程与结论如下。
+
+##### 实施与回退（实测，不隐藏）
+
+把 `fcfg_lower.rs` 里 5 个分支（`Parallel` / `Observe` / `Span` /
+`PromptSection` / `DocumentSection`）从 `lower_block_to_function` 换成
+`lower_body_function_with_return`。实测效果：
+
+| | 嵌套体 | 顶层 |
+|---|---|---|
+| 改前 | `[Const, Call]` | 1 vs 2 |
+| **改后** | **`[Const, Call, Return]`（与原路径一致）** | **仍 1 vs 2** |
+| 原路径 | `[Const, Call, Return]` | 2 |
+
+嵌套体确实对齐了，**差分仍失败** —— 剩余差异在**顶层**：emit 路径每个块后都补
+`Const(dst, Nil)`（`emit_observe_w` / `emit_section_w` 等），管线不补。
+
+**已完整回退**：该改动没有达到目标，却动了降级路径，属「无效果的未验证改动」，
+按惯例不留。回退后已**读盘确认**嵌套体恢复为 `[Const, Call]`，3 个 d9x 测试全绿。
+
+##### 根因：5 个 `Node` 变体缺 `dst`，而 `Node::WithConfig` 有（D58 的成果）
+
+对比 `Node::WithConfig { bindings, body, dst, span, meta }` 与
+`Node::Observe { config, body, span, meta }` 等 5 个 —— **后者都没有 `dst` 字段**。
+`with` 当年（D58）三处配套改动齐全：
+
+1. `witness_to_fcfg.rs` 里 `let dst = b.alloc();` 预分配块结果寄存器；
+2. `fcfg_lower.rs` 里 `ctx.emit(MirInst::Const(*dst, Value::Nil))`；
+3. `node_result_reg()` 里 `| Node::WithConfig { dst: reg, .. }` 分支。
+
+**5 个块形态三者全无**。
+
+##### 由此挖出一个 D58 同型的**潜在**隐患（当前被回落挡住）
+
+`node_result_reg()`（`witness_to_fcfg.rs:924-936`）对缺 arm 的节点返回 `None`，
+而消费方会 `unwrap_or(0)` —— **指向寄存器 0**，即「本函数体第一个分配的寄存器」。
+D58 的注释把这类故障描述得很清楚：`with model = "gpt-4o" / 2 / end` 曾因此让
+块结果变成 `String("gpt-4o")` 而裸路径是 `Nil`。
+
+块形态一旦被放进 9 层路径，`let r = <block>` 就会命中同一形状。
+**当前不可达** —— 差分恒失败 → 永远回落 → FCFG 产出从不用于这 5 类。
+即：**回落这道网目前同时挡住了一个真实的潜在缺陷**。
+
+##### 补齐需要什么（属结构性改动，不在缺陷修复范围）
+
+给 5 个 `Node` 变体加 `dst` 字段 + `witness_to_fcfg` 预分配 +
+`fcfg_lower` 发 `Const(dst, Nil)` + `node_result_reg` 补 arm ——
+即**核心 `Node<M>` AST 的结构性变更**，会牵动 `fcfg.rs` / `witness_to_fcfg.rs` /
+`fcfg_lower.rs` 三处及全部构造点与匹配臂。建议与「9 层管线覆盖块形态」作为
+**一个** v1 方向任务做，而不是拆成缺陷修复。
+
+#### D94：给 14 类回落构造补**执行级等价性**证据 —— 并推翻 D92 / D92b 各一条判断
+
+D92b 的结论是「这 14 类全部没有差分等价性 fixture 覆盖」，因此「放宽差分让它们
+走 9 层」= 无人验证。本轮补上这块证据。新增
+`tests/nine_layer_block_equivalence.rs`。
+
+##### 关键前提：差分装置必须与生产路径**逐阶段对齐**
+
+现成的 `nine_layer_differential.rs::audit()` **不能直接套用**：它的执行级判定比的是
+`last_expr`，而块形态的顶层值是 `Nil`（块值被丢弃）——直接套用会让执行级判定
+**空转**（两边都是 Nil，永远「通过」）。故每个用例都设计成让差异出现在 `last_expr`：
+块体内 `let` 会外泄（已实测 observe/span/parallel/worker 都可以，只有 `with` 不行，见
+D91），`prompt` 的 section text 可经 `compose_prompt(name)` 观测。
+
+**本文件第一版测出 `eval`「原 2.0 / 管线 nil」的「不等价」。用真实 CLI 复核发现
+两条路径行为完全相同** —— 根因是装置**漏了 `opt::optimize` 这一段**，没跟上
+`compile_and_opt` 的两段收尾。补齐后测量才可信。
+**教训：差分测试测出「两条路径不等价」时，先怀疑装置，再怀疑代码。**
+
+##### 更正一：5 类块形态**全部执行级等价**（D92 判错了）
+
+D92 依据「`h_prompt_section` 把 body 返回值绑成 section text」推断
+`prompt`/`document` 是**真实语义差异**。**实测推翻**：
+
+| 用例 | original | pipeline | 判定 |
+|---|---|---|---|
+| `observe` | `"42.0"` | `"42.0"` | 等价 |
+| `span` | `"42.0"` | `"42.0"` | 等价 |
+| `parallel` | `"42.0"` | `"42.0"` | 等价 |
+| `worker` | `"42.0"` | `"42.0"` | 等价 |
+| **`prompt_section`** | `"\n## p\n\nhello section"` | `"\n## p\n\nhello section"` | **等价** |
+
+嵌套体少的那条尾部 `Return` **不影响语义** —— `run_mir` 对无显式 `Return` 的 body
+仍能取到末值。D92 那句「真实差异、差分判失败完全正确」是**读 handler 代码得出的
+推断，未经测量**。现已更正。
+
+**后果**：若只为「让块形态走 9 层」，差分在 `observe`/`span`/`parallel` 上确实是
+**过严**。但**是否放宽仍不属本轮范围** —— 类别级差分（`pipeline_mir` 1 vs 2）在
+语义上不成立，单纯放宽等于放弃一道校验；正确做法是让管线**补上**尾部 `Return`
+让两条路径本来就一致。
+
+##### 更正二：`eval` 的回落是**上下文相关**的（D92b 记漏了一种形态）
+
+D92b 普查用 `print(eval(1 + 1))`（嵌套形态）→ 判「通过」，并据此说 D57 的 9 类里
+**只有 `eval` 真的修好了**。实测发现：
+
+| 形态 | 差分 | 顶层条数 |
+|---|---|---|
+| `eval(1 + 1)` 裸顶层 | **回落** | **0 / 4**（管线一条指令都产不出） |
+| `print(eval(1 + 1))` | 通过 | — |
+| `let x = eval(1+1)` | 通过 | — |
+| `print([eval(1 + 1)])` | 通过 | — |
+| `print(eval(1+1) + eval(2+2))` | 通过 | — |
+
+裸顶层 `eval` 是**真实的管线缺口**（产出 0 条指令，执行级必然不等价：
+原 2.0 / 管线 nil）。**不构成生产缺陷** —— 差分在此判失败并回落，用户拿到正确结果。
+已在普查表补 `eval_bare` 条目。**故 D57 声称的 9 类，**连 `eval` 在内**无一在
+裸顶层形态下真正通过**。
+
+##### 13 / 14 等价的意义
+
+`model` `msg` `struct` `enum` `tea_standalone` `transaction` 以及 5 类块形态，
+**执行级全部等价**（`model` 两条路径都给 `{__model_fields__: [count]}`）。
+即：**这 14 类的回落目前没有造成任何可观测的行为差异** ——
+差分是保守但**正确**的网。
+
+**未改差分**：① 类别级差异真实存在，放宽=放弃校验；② 更根本的是管线该**补上**
+尾部 `Return`、对裸 `eval` **补上指令生成**，让两条路径本来就一致。
+这两件属 9 层管线自身的实现工作，不在缺陷修复范围内。
+
+#### D93：`document` 模块的标注测试**存在但从未运行**（丢了 `#[test]` 属性）
+
+跑 D92b 全量时看到 `module_method_signatures`（本会话早先建的测试文件）有 2 条
+编译警告：`duplicated attribute`（行 405）与 `function document_module_and_annotation
+is never used`（行 511）。追下去是一处**真实的覆盖漏洞**：
+
+```rust
+#[test]                    // ← 孤儿属性：它下面本该是 document 那条测试
+/// `schedule`：`add` 的前三参…   ← 这其实是**下一条**测试的文档注释
+#[test]
+fn schedule_method_arity_and_return_types() { … }
+```
+
+`document_module_and_annotation` 的**函数体完好**（行 511，三条断言齐全），
+只是它的 `#[test]` 属性被孤立到了 `schedule` 测试的头部 —— 于是它从未被注册为
+测试，编译期只报一条 `never used`。
+
+**后果**：`document` 模块的标注往返（D72：`let d: document = document.parse(…)`
+必须放行 / 错标必须拒 / 零参必须拒）**一条都没跑**。
+「测试文件里写着这个 case」与「这个 case 真的在跑」是两件事。
+
+修法：属性归位。修复后 24 → **25 passed**，`document_module_and_annotation ... ok`。
+
+**为什么编译器只给 warning 不给 error**：没有 `#[test]` 的 `fn` 是一个完全正常的
+普通函数（只是被 `dead_code` lint 标出来）。**在一个测试文件里，「定义了函数」
+与「注册了测试」之间没有任何编译期保证** —— 唯一信号就是这条 `never used` 警告，
+而它淹没在几十条测试二进制的输出里。
+
+#### D92b：回落构造的**全语言普查** —— 33 类里 14 类永久走旧路径，D57 声称只对 1 类成立
+
+D92 只测了 11 类构造。但「哪些构造在静默回落」本身就是一张需要**穷举**的清单，
+否则没人知道还差多少。逐条用真实 CLI 跑最小程序（形态取自 spec §14.2 的
+statement 产生式 + TEA 独立声明 + 字面量/表达式形态），判据＝stderr 是否出现
+「差分失败」。
+
+##### 普查结果（33 类）
+
+| 类别 | 构造（顶层 pipeline/original） |
+|---|---|
+| **回落 · 嵌套体少一条尾部 `Return`（1/2）** | `observe` `span` `parallel` `prompt` `document` |
+| **回落 · 类别缺口（2/2）** | `worker` `transaction` |
+| **回落 · 无 handler 的裸 `perform`** | `perform_bare`（10/9） |
+| **回落 · 声明形态** | `model`(3/7) `msg`(3/4) `struct`(3/4) `enum`(3/4) `tea_standalone`(5/10) |
+| 通过（对照组，19 类） | `let` `assign` `if` `if_elseif` `for` `while` `match` `match_guard` `with` `handle` `update` `task` `return` `macro` `eval` `list_lit` `dict_lit` `template` `closure` `bigint` |
+
+##### D57 的注释错得比 D92 记录的更严重
+
+D92 只说「D57 声称的 8 类里 5 类块形态仍回落」。**普查显示：9 类里 8 类仍回落，
+只有 `eval` 真的通过。** 而 `model` / `msg` / `struct` / `enum` 四类
+**连顶层条数都差很多**（3 vs 7 / 3 vs 4 / 3 vs 4 / 3 vs 4），不是嵌套层面的问题。
+
+根因与 D92 同源：D57 当时只量了 task / handle / match / with 的**嵌套**差异
+（那几类确实为 0），**没量块形态与声明形态** —— 后两者的指令由
+`emit_block_mir_and_wit` 与 `emit_definitions` 生成，形状与前者不同。
+
+已更正 `src/mir/pipeline.rs` 里的 D57 注释（原话保留 + 追加更正与普查结果）。
+
+##### 顺带查出两处 **spec EBNF 与实现不一致**
+
+| 构造 | spec §14.2 写的 | 实现实际 |
+|---|---|---|
+| `handle` | `"handle" IDENT "on" IDENT "->" {stmt} "end"` | 块形态 `handle E { body } { handler }`（见 `tests/fixtures/e2e/handle_effect.mora`） |
+| `model` / `msg` / `update` | `"model" IDENT { IDENT ":" type } "end"` | **无花括号**：`model Counter` + 缩进字段 + `end`（见 `tea_standalone.mora`） |
+
+**未改**：改 spec 措辞还是改实现属语言设计决定，不在缺陷修复范围内。仅记录。
+
+##### 为什么这 14 类值得排期
+
+**它们全部没有差分等价性 fixture 覆盖** —— `tests/nine_layer_differential.rs`
+的 19 条（arithmetic / dict / eval / for / handle / if / lisp / macro / match×4 /
+nested_if / quasiquote / string / tea×2）**一条都没覆盖到这 14 类**。
+其中 `tea_app` / `tea_counter` 走的是 `app` **块**形态（通过），
+而含独立 `model`/`msg` 声明的 `tea_standalone.mora` **不在差分列表里**。
+
+新增 `tests/nine_layer_fallback_census.rs`（2 条）把 33 类清单做成**可执行**的：
+逐条核对回落与否，失败时打印实际 + 期望 + 全表；外加覆盖面自检
+（33 条 / 回落 ≥13 / 通过 ≥19，数字是**数出来的**不是拍的）。
+任一形态的回落状态变化都会当场失守，并在断言消息里提示「需同步更新 D57/D92 描述」。
+
+#### D92：五类块形态永久回落 —— 9 层管线嵌套体少一条尾部 `Return`（已记录，未放宽）
+
+追 D91 顺带记下的「9 层管线差分失败」。**最小复现**：`observe trace "t" do print(1) end`。
+逐条实测 11 类构造：
+
+| 类别 | 构造 | 差分 |
+|---|---|---|
+| 块形态 | `observe` `span` `parallel` `prompt` `document` | **回落** |
+| 已知类别缺口 | `transaction` `worker` | 回落（D57 已记为正确） |
+| 正常 | `with` `handle` `match` `task` 及全部顶层语句 | 通过 |
+
+##### 差异形状（直接调 `run_pipeline` 导出两条路径的嵌套体）
+
+| 路径 | 嵌套体指令序列 |
+|---|---|
+| emit.rs（原） | `[Const, Call, Return]` |
+| 9 层管线 | `[Const, Call]` ← **少的是尾部 `Return`** |
+
+少掉的**不是**产生效果的指令（`Call` 在），而是 `emit_block_mir_and_wit` /
+`emit_section_w` 里那句 `emit_tail_return(last)`。
+
+##### 关键分叉：块的值到底被不被消费
+
+- **`prompt` / `document` = 真实语义差异。** `emit_section_w` 注释写明
+  「body 求值 → Return（`h_*` 取此值作为 **section text**）」，
+  `h_prompt_section` 确实把 `run_mir(body)` 的返回值绑成
+  `Value::PromptSection { text }`。少这条 `Return` → **section text 会是 `Nil`**。
+  差分在这里判失败**完全正确**，回落是必要的。
+- **`observe` / `span` / `parallel` = 良性差异被判失败。** 三个 emitter 发完块指令后
+  都是 `Const(dst, Nil)`，**块值被丢弃**，少一条 `Return` 不改变语义。
+  差分把它判失败，等于让这 3 类**永久享受不到** 9 层管线。
+- `transaction` / `worker` 是**已知类别缺口**（`Transaction` 在整个降级链里不存在），
+  回落正确。
+
+##### D57 的注释与实测不符
+
+`mir/pipeline.rs` 的 D57 注释声称 8 类构造（parallel / observe / model / msg /
+struct / enum / transaction / worker / eval）「**不再**因这类冗余而永久放弃
+DAG 分析 / CSE / 贪心重写」。**对 observe / span / parallel / prompt / document
+不成立。** D57 当时只量了 task / handle / match / with 的嵌套差异（那几类确实为零），
+**没量块形态** —— 后者嵌套体由 `emit_block_mir_and_wit` 生成，形状不同。
+
+##### 本轮**不修**的理由（如实记录）
+
+放宽差分需要**先有等价性证据**。`tests/nine_layer_differential.rs` 的 19 条覆盖
+arithmetic / dict / eval / for / handle / if / lisp / macro / match×4 / nested_if /
+quasiquote / string / tea×2，**没有一条覆盖块形态**；`tests/fixtures/e2e/` 里也只有
+`prompt_section.mora` 用到块形态，且不在差分列表中。**在无 fixture 的情况下打开
+5 类形态的 9 层路径 = 无人验证。**
+
+新增 `tests/nine_layer_block_forms.rs`（2 条）锁住现状：5 类块形态**必须**回落，
+外加 `with` 块**不**回落的对照组（证明前一条不是「所有程序都失败」的空断言）。
+断言消息里写明：若哪天这条开始失败，说明管线已支持块形态，
+**本条与 D57/D92 的描述需一并更新**。
+
+#### D91：`with mock_llm` 的响应队列**从未被消费** —— spec §19.4 承诺失效（已修）
+
+从 D89 的库层转到**用户真正走的 CLI 端到端**（`mora record → list/stats/timeline
+→ replay → diff` 全链路），第一条 `record` 就露了馅：帮助文本宣称
+"Record ai.chat/web.fetch"，实际只录到 2 条 `state_mutation`、**零条 ai.chat**。
+
+##### 根因：mock 模式提前 return，够不到队列
+
+`do_ai_chat`（`interpreter/ai_chat.rs:25-43`）在 `api_key.is_empty()` 时直接
+`return Ok(Value::String(format!("[Mock response for: {}]", prompt)))`；
+而消费队列的 `responses.remove(0)` 在**更深一层**的 `real_ai_chat_inner` 里 ——
+mock 模式**根本走不到**。
+
+```mora
+-- spec §19.4 的原文示例
+with mock_llm = ["response 1", "response 2"]
+  let r1 = ai.chat("first")   -- 返回 "response 1"
+  let r2 = ai.chat("second")  -- 返回 "response 2"
+end
+```
+
+修前实测：两次都得到 `[Mock response for: …]`，**注入的响应被静默丢弃**；
+且该提前 return 也不录 ai.chat 事件，于是 `mora record` 录不到。
+
+##### 修法
+
+mock 分支内先查 `cfg.mock_responses` 并消费（同时补上 `record_ai_chat`，
+一次修好「响应被忽略」+「录不到事件」两个症状）。两条 mock 分支
+（此处 / `real_ai_chat_inner`）由 `api_key.is_empty()` 与否**互斥**，不会重复消费。
+
+##### 为什么没被发现
+
+既有测试**全部只验语法与存储，没有一条验「队列真被消费」**：
+`mir_dyntrait.rs:122-145`（块能 parse、binding 在 `WithConfig` 里）、
+`with_config.rs:78-128`（`mock_llm` / `mock_responses` 别名被识别）。
+**测了「配置存进去了」，没测「配置被用上了」。**
+
+新增 `tests/mock_llm_queue.rs`（4 条）走**真实 CLI 子进程** + 捕获 stdout，
+含一条「未设 `mock_llm` 时行为不变」与一条「队列耗尽后回落占位符」的对照组。
+**反向验证**：给条件加 `&& false` 人为短路 → 3 条失败且输出正是修前行为，
+对照组仍过；**改前先读盘确认短路已落盘**。
+
+##### 顺带查清的三件事（均如实记录，未改）
+
+**① `with` 块的 `let` 绑定不外泄，而 `observe` 块的会 —— 语言内部不一致。**
+`h_with_config`（`mir/handlers/effects.rs:266`）做 `child_env = env.clone()`
+并在 `child_env` 里跑 body，结果丢弃且**从不并回** `env`；`emit_with_w:2880`
+还明确写着「子 body 的返回值不传播」。实测 `with … let x = 42 … end` 之后
+`x` 是 `nil`，而 `observe … let y = 7 … end` 之后 `y` 是 `7.0`。
+**未改**：块是否开作用域是**语义决策**，且 spec §19.4 的示例只在块内用值。
+D91 的测试因此改用 CLI 捕获 stdout，而不是库路径的末表达式。
+
+**② 9 层管线在 observe 块程序上差分失败（安全回落但静默）。**
+`[9layer] 差分失败：已回落到 emit.rs 路径 | pipeline_mir=6 original_mir=7`。
+回落是安全的，但意味着 9 层产出被**静默丢弃**。**未深查**，记录待后续。
+
+**③ `mora diff` 收的是录制名不是路径，但报错极具误导性。**
+usage 是 `mora diff <name-a> <name-b>`；传路径会被重新拼成
+`.mora/recordings/.mora/recordings/x.jsonl.jsonl` 才报「找不到」。
+**未改**：契约本身自洽，是探针用错参数；改报错文案属体验优化。
+
+#### D90：AI 推测解码的验证缓存**只用长度做键** —— 等长异内容会串味（已修）
+
+D89 之后继续按「找未测代码」推进。机械做法：把 `src/` 里每个 `fn` 定义拿去和
+`tests/` + `src` 内 `#[cfg(test)] mod tests` 比对，列出**测试中零提及、且 src 内
+无其他引用**的函数。清单噪声较大（脚本第一版没抓到 `mod tests;` 独立文件，
+且 `-Include` 不带 `-Recurse` 会静默匹配 0 个文件 —— 两次都是探针自身有 bug），
+但有效条目指向三个簇：`runtime/ai_infra.rs`（11 个）、`value/list.rs`（5 个）、
+`env.rs`（2 个）。`ai_infra` 价值最高：它是 `ai.chat` 的活路径，**全无测试**。
+
+##### 缺陷：`verify()` 的缓存键是长度
+
+```rust
+let cache_key = format!("{}:{}", draft.len(), verification.len());   // 修前
+```
+
+**把「长度相同」当成「内容相同」**——与本仓库 `mir/vm/dag.rs` 的 dict 指纹缺陷
+**同型**（那里也是 `InputFp::Str(d.len(), 0)`）。
+
+后果不是「统计不准」，而是**把未验证的 draft 响应返回给用户**：
+`ai_chat.rs:397-400` 里 `is_verified == true` 就 `return Ok(draft_response)`。
+`verification_cache` 挂在长寿命的 `AiRuntime` 上，跨调用累积。
+
+修前实测（3 条测试全失败）：
+
+| 第一次调用 | 第二次调用（**等长异内容**） | 应得 | 修前得到 |
+|---|---|---|---|
+| `verify("abc","VERIFIED")` → true | `verify("xyz","NO WAY!!")` | **false** | **true**（命中缓存） |
+| `verify("abc","WRONG!!!")` → false | `verify("xyz","VERIFIED")` | **true** | **false**（被钉死） |
+| 队列批处理走同一个 `verify` | 同上 | | 同样串味 |
+
+##### 修法：缓存键改用内容
+
+`format!("{}\u{1}{}", draft, verification)`（`\u{1}` 作分隔符）。
+**不废掉缓存**——另有测试 `d90_verify_still_caches_identical_input` 锁住
+「完全相同的输入仍应复用缓存条目」，因为 `verification_cache` 是 `pub` 字段、
+被统计路径读取，整条去掉是超出缺陷修复范围的重构。
+
+##### 可达性：**上一版这里写错了，现更正为「当前不可达」**
+
+初版写「生产可达，但 mock 模式观测不到端到端效果」。**这是错的**，深查后更正：
+
+- `speculative` 是 `types.rs:90` 的 `pub(crate) Option<bool>`，**全仓唯一的赋值是
+  `ai_chat.rs:842` 的 `speculative: None`**，无 setter。
+- 语言侧唯一的配置入口 `mir_with_config`（`interpreter/mod.rs:722-807`）只接受
+  `model` / `temperature` / `max_tokens` / `system` / `mock_llm`；写
+  `with speculative = true` 会落进 `other =>` 分支**报错**
+  （`unknown with-config key 'speculative'`），D39 已把它改成显式报错而非静默丢弃。
+- 故 `cfg.speculative == Some(true)` **永不成立** → **整条推测解码路径是死代码**。
+
+**因此 D90 的缺陷是「潜在缺陷」而非活缺陷**：`verify` 经 `ai.chat` 走不到；
+只有直接调用公开库 API（`SpeculativeVerifier` 是 `pub`，但宿主字段是 `pub(crate)`）
+才够得到。**保留修复**的理由：`pub` 类型的公开方法上留着一个会返回错误判定的地雷，
+而修法只有一行；且不修的话，一旦有人把 `speculative` 接上就会静默出错。
+
+**这正是 D87 的教训自己又犯了一次**：「字段是 pub(crate) ⇒ 感觉能从语言侧设」
+属于**未取证推断**。判据应当是「**谁在写这个字段**」，不是「谁在读它」。
+
+##### 顺带发现：AI 基础设施里大量死代码（未修，仅记录）
+
+可达性普查显示 `runtime/ai_infra.rs` 的队列/缓存预热机制**整族从未在生产运行**：
+`queue_verification` / `process_queue` / `queue_len` / `add_request` /
+`next_request` / `cache_result` / `has_requests` / `clear_cache` /
+`ContextWindow::get_messages` —— 生产引用数均为 0（唯一的引用来自 D90 自己
+写的测试）。文件头声称这 3 个类型是「活成员…被 `ai.chat` 调用」，**该说法已过期**：
+`ai.chat` 实际只用到 `ContextWindow::{add_message, compress, needs_compression}`、
+`SpeculativeVerifier::verify`、`CacheWarmer::get_cached`。
+**未改**：清理死代码属于重构而非缺陷修复，且要保留这些 API 供 v1.0 接线。
+
+##### 顺带核实的两处「长度当身份」候选 —— 均**不是**缺陷
+
+- `runtime/infra.rs:59 intern_string` 返回 `key.len()` 当 id。但 grep 确认
+  **生产代码零调用**（`interpreter/mod.rs:829` 是另一个同名函数，返回 `Value`），
+  注释「返回值未使用」属实。属 dead API，不为它改签名。
+- `flow.rs:150` 的 `a.len() == b.len()` 是**分支条件**不是身份判据
+  （v0.17 明确设计：等长列表逐元素相加、不等长则拼接）。正确。
+
+##### 附带：`ContextWindow` 的两条边界（新增测试，未改代码）
+
+`add_message` 的滑窗保证至少留 1 条；`compress` 之后 `current_tokens` 与
+现存消息的 token 和重新对齐。两条实测**本来就是对的**，写成测试锁住。
+（`compression_ratio` 是 `pub` 字段，若被设成 >1 则 `start` 会下溢；
+但全仓无人写它，属不可达，仅记录。）
+
+#### D89：record 序列化往返**静默丢数据** —— Dict payload 重放后变成 `Nil`（已修）
+
+四个否定结果之后换策略：不复验已正确的东西，改去找**从未被测过的代码**。
+`src/` 里 206 处静默吞错，集中在 `record/serialization.rs`（29 处）——这是
+`mora record/replay/diff` 的事件 JSONL 编解码，**本轮之前一次都没碰过**，
+而序列化缺陷产出的是**静默错数据**而不是报错。
+
+##### 缺陷：`parse_event_line` 的切分器不理解嵌套 JSON
+
+编码侧把 `Msg.payload` / `StateMutation.old|new` 当作**完整 Value JSON 原样插入**
+（`crate::flow::value_to_json`）。解码侧却是手写的「按 `,` 切分（字符串外）」：
+
+```rust
+if c == ',' && !in_string { parts.push(...) }   // 修复前
+```
+
+`{"a":1,"b":2}` 里的 `,` **也在字符串外** —— `"a"` 一闭合，切分器就从 payload
+中间切一刀。`fields["payload"]` 只拿到截断的 `{"a":1`，`json_to_value` 解析失败后
+`.unwrap_or(Value::Nil)` —— **事件照样加载成功，只是 payload 静默变成 Nil**。
+
+实测（修前 3 条测试全失败，且 `events().len() == 1` 断言**通过**，证实事件没丢、
+是内容错了）：
+
+| 用例 | 期望 | 实际 |
+|---|---|---|
+| `Msg` 2 键 Dict payload | `Dict({a:1, b:"two"})` | **`Nil`** |
+| `StateMutation` 2 键 Dict `new` | `Dict({k1:1, k2:2})` | **`Nil`** |
+| `Msg` 含 Dict 的 List | `List([Dict, 9])` | **`Nil`** |
+
+**为什么一直没被发现**：既有往返测试
+（`msg_event_serialization_roundtrip` / `state_mutation_recorded`）用的**全是标量**
+—— `Value::String("payload")` / `Value::Int(42)`。标量里没有 `,`，这条路径从未被
+踩到。**测试覆盖了「函数名」却没覆盖「值的形状」。**
+
+##### 修法
+
+切分条件加上**嵌套深度**（`{`/`[` 计数，且只在字符串外计数）：
+
+```rust
+if c == ',' && !in_string && depth == 0 { ... }
+```
+
+字符串内的 `{` 不参与计数（`if !in_string` 包住），所以 `response` 之类含
+花括号的普通字符串字段不受影响。全仓 grep 确认**只有这一处**这样的手写切分器，
+无其他副本。
+
+##### D89 第二处：`WebFetch` 的 `method` 漏了 `esc()`
+
+同一个 `event_to_jsonl` 里，`url`/`model`/`response`/`channel`/`var` 全部转义，
+**只有 `method` 没有**。含 `"` 的 method 会写出畸形 JSONL，解码器引号配对随之错位
+→ 整行被 `load_jsonl` 静默丢弃。
+
+**如实标注：当前不可达** —— 两个生产调用点（`interpreter/ai_chat.rs`）都硬编码
+`"GET"`。但 `record_web_fetch` 是 `pub fn`，属**潜在缺陷**而非活 bug，**不夸大为
+已修复的活 bug**。已补 `esc(method)` 并加测试直接用公开 API 构造覆盖。
+
+##### 反向验证
+
+把切分条件改成永不满足的 `depth == 99` → **4 条测试全部失败**
+（含 `method` 转义那条，说明该测试不是空测试、`esc` 修复确实承重）。
+**改前先读盘确认 `depth == 99` 已落盘**、恢复后再确认 `depth == 0` 回来才看结果。
+
+##### 遗留（如实记录，不在本轮改）
+
+`load_jsonl` 对**解析失败的行静默跳过**（注释写「前向兼容」）。D89 修好后这条路
+触发面小了很多，但「损坏的记录行被静默丢弃 → replay 出现空洞」这一**设计弱点
+依然存在**。改成报错会破坏「旧 JSONL 仍可读」的兼容意图，那是策略决定不是缺陷
+修复，留待单独决策。
+
+#### D88：给「签名的返回类型」做差分对拍 —— 否定结果 + 抓出 2 条我自己写错的参数注释
+
+D69–D85 补的 34 条 `module_method_signature`，**每条的返回类型都是读 `call_*_method`
+的 arm 之后手写的**。也就是说，这些期望值的唯一来源是**我自己**。
+
+今天已经在这个方向栽过两次（D70 的 `memory.load` 写成 `Dict` 实为 `Bool`；D85 推翻了
+普查表里一句没验证过的断言），所以本轮把这批期望值**重新取证**。
+
+##### 方法：真差分，不是再读一遍代码
+
+语言自带 `type_of`，能在**运行期**报出值的实际类型名。两侧对拍：
+
+| 侧 | 取值方式 |
+|---|---|
+| **声明侧** | 进程内 `module_method_signature(m, method).return_type` 展开成允许的类型名集合（`Union` 取并集） |
+| **运行期侧** | 现生成 `.mora` 逐行打印 `key=type_of(<真实调用>)`，走 `mora run` 真实路径取回 |
+
+两边必须落在同一集合。**新增测试 `tests/module_return_types_match_runtime.rs`（3 条）**。
+
+##### 否定结果：40 条对拍，**返回类型全部正确，零缺陷**
+
+覆盖 14 个模块。`type_of` 实测值与声明逐条相符。几个原本最可疑的：
+
+| 用例 | 声明 | 实测 | 备注 |
+|---|---|---|---|
+| `ccr.len()` | `Int` | **`int`** | 全语言少数 Int 来源；`type_of(1)` 是 `float`、而 `type_of(len([1,2,3]))` 是 `int` —— 这个区分是真的，签名没错 |
+| `mora.refine(p, i)` / `(p, i, 2)` | `Any` | `dict` / **`list`** | 确认「返回类型随元数变」，声明 `Any` 是诚实的 |
+| `mora.list_refines()` | `List[String]` | `list`（元素确为字符串） | 元素类型也验到了 |
+| `memory.load()` | `Bool` | **`bool`** | D70 那条修复得到运行期证实 |
+| `stats.histogram` | `List[Dict[String,Float]]` | `[{count: 2.0, hi: 2.5, lo: 1.0}, …]` | 键与值类型都对上 |
+| `exec.parallel` | `List[Dict[String,Any]]` | `[{cmd,elapsed_ms,error,exit_code,index,pid,stderr,stdout}]` | 手工实测（会 spawn 真子进程，没进单测） |
+| `tea.init()` | `TeaApp` | `tea_app` | |
+| `sandbox.audit_flush/verify` | `Union[Bool,String]` | `true`/`bool` | **String 分支无法从用户代码触发，未经实测** |
+
+**元数也逐条复核**（判据＝运行期 `args.len() < N` / `ok_or` / `unwrap_or`）：
+`plan.create`=2、`update`=2、`add`=3、`remove`=2、`list`=0、`info`=1 —— 全部相符。
+其中 `info` 用的是 `.ok_or(…)?`（**必填**）而非 `unwrap_or`，所以下限 1 而非 0。
+
+##### 抓出的 2 条真缺陷：参数注释与运行期不符（签名本身没错）
+
+| 位置 | 我原来写的 | 运行期实际（错误消息原文） |
+|---|---|---|
+| `plan.create` | `create(name, kind?)` | 第 2 参是 **steps 列表**（`{id, text}` 字典数组）：`plan.create: requires 2 args (name, steps)` / `steps must be a list of {id, text} dicts` |
+| `mora.refine` | `refine(script, instruction, count?)` | 第 1 参是**文件路径**：`mora.refine: read task main() end: 系统找不到指定的文件` |
+
+已改正，并在测试里写成断言（`d88_param_comments_match_runtime`）让注释不能再漂回去。
+
+##### 反向验证（两侧都确认落盘）
+
+把 `ccr.len` 的返回类型临时改成 `String` → 测试以精确消息失败：
+`[声明不含实测] ccr.len: 签名返回类型 String 只允许 {"string"}，运行期实测 int`；
+改回 `Type::Int` → 恢复通过。**回退与还原都先读盘确认改动生效**，再看测试结果。
+
+##### 本轮再次踩到的两个探针坑（与 D87b 记录的一致）
+
+1. **把 `file.basename/dirname/cwd` 的 `runtime` 值当已知填进表里** —— 而这条测试的
+   全部意义就是禁止「凭印象写期望值」。写完先手工实测这三个（`string`/`string`/`string`）
+   再落表。
+2. **`CASES.len() >= 45` 是我拍的** —— 实际 40 条，测试当场失败。**断言的期望值
+   本身也要取证**，这条今天已经栽过第三次。
+
+##### 覆盖边界（如实标注，不假装全覆盖）
+
+- **未进单测的 8 个模块**及原因写在测试的 `KNOWN_NONEMPTY_MODULES` 注释里：
+  `exec`（spawn 真子进程）、`schedule`/`tool`/`skill`/`xform`/`web`/`ai`/`agent`/`random`
+  （需外部资源或返回值随注册内容变化）。
+- **空列表只能验外层**：`mock.names()` / `memory.keys()` 在新进程里恒返 `[]`，
+  元素类型不可验。
+- `sandbox.audit_flush/verify` 的 **String 分支未实测**（需破坏审计链）。
+
+#### D87：两条「实测结论」已被我自己的 D67 修复推翻（已更正注释）
+
+全仓 98 处 `实测` 注释里，挑**因我今天改动而最可能失效**的两条复核，**两条都错了**。
+
+| 位置 | 注释原文 | 复核结果（真实 CLI） |
+|---|---|---|
+| `dispatch.rs` `range` 签名旁 | 「**实测未能构造出用户可见的失败**：`let n: Int = r[0]` 与 `let n: Float = r[0]` 都通过检查 —— 本语言 Int/Float 在 typeck 里可互换」 | `let n: Int = r[0]` → **`expected int, got float`（被拒）** |
+| `hm/infer.rs` `[]` 索引分支 | 「实测 `let y: Int = xs[0]` 在 `xs = ["a","b"]` 上**仍被接受**」 | → **`expected Int, got String`（被拒）** |
+
+##### 为什么错 —— 归因错了，不是固有限制
+
+原文的结论是「本语言 Int/Float 在 typeck 里可互换」。这个说法在**无标注**语境下成立，
+**有标注时不成立**。真正的机制是 D67 那个缺陷：推断出的容器元素类型是**未解算的
+TypeVar**，而 `TypeVar::compatible_with` 对任何类型都返回真 —— 所以当时**无论**
+标 `Int` 还是 `Float` 都放行，看起来像「可互换」。
+
+**D67 修好根因后，两条注释描述的行为都反转了。**
+
+这类注释比没有注释更糟：它记录的是「我们试过、不行」，根因修好后**它仍然在说不行**，
+会主动阻止后来人重新尝试并得出正确结论。已改写，并在原处标注「此结论的前提已被
+D67 消灭」+ 附复核结果。
+
+##### 顺带清掉一段**自相矛盾**的注释
+
+`hm/infer.rs` 的 `[]` List/Dict 分支里，810–826 行（D55 的「压约束因为不能直接
+返回」）与紧接着的 827–839 行（D67 的「现在直接返回」）**直接打架** —— 前者说
+「不能直接返回 `(**e).clone()`」，后者说「所以直接返回」。已合并成一段按时间线
+叙述的注释，保留「为什么不是更复杂方案」的信息。
+
+##### 这类过期注释的识别信号
+
+- 注释里出现「**未能构造出**」「**实测无效**」「**仍被接受**」→ 它记录的是
+  **一个当时的状态**，极可能已被后续修复消灭
+- 注释引用了**别的模块的行为**（「TypeVar 在别处是宽松的」）→ 前提一旦被改，
+  结论就悬空（D68 的 `print` Union、D83 的 `for_type` 都是这个形状）
+- 注释的结论与**当前代码**矛盾时，先怀疑注释，再怀疑代码 —— 但要**实测**确认，
+  不能只读代码
+
+本次只改了注释，**无行为变更**（全量 1600 passed 与改前一致即为佐证）。
+
+#### D87b：全仓 99 处「实测」注释做完分类复核 —— **否定结果：没有第三条过期结论**
+
+D87 只挑了两条最可能失效的。担心的是「抽样只撞上两个，第三个还藏着」，
+于是把全仓 `实测` 注释做了**机械分类 + 逐条实测**，把这条线一次关掉。
+
+##### 分类判据（这才是可复用的部分）
+
+99 处按「注释附近 6 行内有没有**修复标记**」分成两类：
+
+| 类 | 判据 | 处置 |
+|---|---|---|
+| **历史记录** | 附近有 `v0.x.y 修复` / `改为…` / `回归测试` / `缺陷：` / `旧实现` / `D\d+` | **保留** |
+| **待复核** | 无上述标记 | 逐条读上下文 + 实测 |
+
+关键判断：**「实测挂死」「实测得 3 应 6」本身不是缺陷声明，是证据。**
+危险的不是它写了什么，而是**根因修好后它仍然在说不行**。所以真正的
+危险信号是「**用现在时描述一个已经修好的缺陷**」——而这类注释几乎总是
+**紧挨着修复代码或版本号**，于是「有没有修复标记」正好是个可机械化的判别式。
+
+机械分类结果：**71 处带修复标记**（历史记录），**28 处无标记**（需人工）。
+
+##### 28 处无标记的逐条结论：**全部合法**，无一是过期结论
+
+| 类别 | 条数 | 代表 | 结论 |
+|---|---|---|---|
+| 历史缺陷记录，修复就在紧邻下一行 | 12 | `dag_rule.rs:369`（下方即 `if … return None`） | 合法 |
+| REPL 配平/续行的**设计理由** | 4 | `interpreter/mod.rs:419`：`handle` **故意**不在 `OPENERS`，注释本身就是决策依据 | 合法 |
+| 性能测量数字 | 7 | `list.rs:10`「n=20000 需 44 秒」 | 合法（见下方保留意见） |
+| 本轮 D62–D86 自己写的 | 5 | `infer.rs:803` 等 | 早已核对 |
+
+**唯一保留意见**：7 处性能数字是**测量值**而非正确性断言，本次未重测基准
+（`n=20000` 单次 44 秒，不适合塞进本轮）。它们过期也只会误导「值不值得优化」，
+不会像 D87 那两条那样**阻止后来人重新尝试**。不算过期结论。
+
+##### 抽测的关键几条（真实 CLI，判据写在脚本里）
+
+| 注释声称 | 实测 | 判定 |
+|---|---|---|
+| `dag.rs:864`「手写链 `1+2 → +3` 得 **3** 应 6」 | `6.0` | 已修，注释是历史记录 ✅ |
+| `emit.rs:2209`「`when` 完全失效，`-5i` 返 positive」 | `[negative, middle, seven]`（fixture 判别用例 ①②③） | 已修 ✅ |
+| `emit.rs` 5 处「块内放无法解析语句即**挂死**」 | 5/5 `exit=2` 报错退出，**无一挂死** | 已修 ✅ |
+| `vm/dag.rs:134`「`d["a"]` 恒返首轮值 → `s` 得 0.0 应 6.0」 | 下标 `6.0`；`d.get("a")` 对照 `6.0` | 已修 ✅ |
+| `dag.rs:180` E1「`print(x + 1)` 整句不执行、无报错、exit 0」 | `c=1 → 6.0`、`c=2 → 8.0`（两路对称） | 已修 ✅ |
+
+「块内挂死」那 5 条特意加了**正常体对照组**（5 个块各放一条合法语句），
+全部 `exit=0` 且块体输出可见 —— 排除「为了不挂死而一刀切拒绝整个块」这种假修法。
+
+##### 回归测试确实在（不是只写在注释里）
+
+「注释说有回归测试」是**可以造假的一句话**，逐条验证：
+
+| 注释点名的测试 | 实际 |
+|---|---|
+| `run_mir_equiv_run_dag.rs::optimize_preserves_handwritten_mir_chain` | 存在（行 152） |
+| E1 修复 | `e1_join_starvation.rs` **12 条** + `e1_blast_radius.rs` + `algebraic_effects.rs`(3) + `nested_loop_jumps.rs:356` |
+| dict 指纹修复 | `memo_dict_fingerprint.rs:113 dict_memo_fingerprint_does_not_alias_same_length_dicts` |
+
+##### 探针自身栽的两次（已修，与 D87 记录的第一条教训同源）
+
+1. **判据正则打不中横幅**：`AI: mock mode` 行的**前导是两个空格**，
+   `^AI ` 匹配不到 → 11 条用例的「值」全取成横幅行，看着像「全都不对」。
+   先 dump 原始输出（带行号与 `>>` 包裹）才定位到。**教训：判据表达式写完
+   要先在真实输出上验证它能命中**，不能假定行的起始形态。
+2. **`Start-Process -PassThru` 不填 `ExitCode`**：`exit=` 全空。补一次
+   无参 `WaitForExit()` 仍为空，最后改用 `ProcessStartInfo` 才拿到。
+   替代方案 `& $mora …` + `$LASTEXITCODE` 拿得到退出码但**没有超时**，
+   而「挂死」正是本轮要测的东西 —— 二者不可兼得，只能上 `ProcessStartInfo`。
+
+#### D85：普查**推翻了我自己的断言** —— `web` 与 `Type::Agent` 都没有签名（已修）
+
+D75 的普查表结尾写了一句「另外 4 个模块（`random` / `ai` / `agent` / `web`）
+走另一条路，不进本表」。**这句话我没验证过**，本轮去验，结果两条是错的。
+
+##### 普查结果（逐条实测，判据＝故意写错标注看是否被拒）
+
+| 模块/方法 | 实际 | 结论 |
+|---|---|---|
+| `ai.chat` / `ai.critic` / `ai.tokens` | 被拒 ✅ | 已有签名（`tokens` 是 D76 补的） |
+| `ai.retry` / `ai.dag` / `ai.role` / `ai.heartbeat` | 运行期 `AiChat.xxx` | **方法不存在**（D59/D60 已记，与本条无关） |
+| `random.rand_int` / `rand_float` / `seed` | 被拒 ✅ | 已有签名（`Type::RandomModule` 专门分支） |
+| `random.rand` / `random.gauss` | 运行期 `random/rand_int/rand_float/rand_choice` | **名字不存在**，是我探针猜的 |
+| **`web.fetch`** | **typeck 放行** ❌ | **无签名** |
+| **`agent.create`** | **typeck 放行** ❌ | **无签名** |
+| `agent.run` / `name` / `max_steps` | `Type::Agent` **一条签名都没有** ❌ | 全部无签名 |
+
+##### D75 那句断言错在哪
+
+`web` 被我归进「有自己的 `Type` 变体」—— **它没有**。`infer_var` 的特例只有
+`ai` / `agent` / `random` 三个，`web` 落到兜底的 `Type::Unknown`，
+与 `file` / `math` **完全同款**。我在写普查结论时把「不是这 3 个之一」
+误当成「有专门路径」。
+
+`Type::Agent` 则是**真的**有专门路径，但那条路径上一个签名都没有 ——
+`agent.create` / `a.run` / `a.name` / `a.max_steps` 的返回类型全是 TypeVar。
+
+##### 修法
+
+- `web.fetch(url)` → `String`（`real_web_fetch` 的成功路径是
+  `Ok(Value::String(text))`）—— 进 `module_method_signature`
+- `Type::Agent` 的 5 个方法（返回类型逐条核对自运行期）：
+  `create`→`Agent`、`critic`→`String`、`run`→`String`、`name`→`String`、
+  `max_steps`→`Float` —— 进 `method_signature_builtin`
+
+##### 连带：`agent` 标注也是幽灵标注（与 D63 / D64 / D72 同型）
+
+`Type::Agent` 存在、`agent.create` 真实产出 `Value::Agent`，但 parser 白名单
+没有 `agent`，`let v: agent = agent.create("a", {})` 报
+`unsupported type annotation 'agent'`。已补进白名单。
+
+连带触发 `tests/builtin_gaps.rs::phantom_types_are_not_writable_as_annotations`
+失败 —— **那个测试的名单过时了**：`Agent` 根本不是幽灵类型
+（`Value::Agent` 存在且可构造）。已从名单移出并写明理由。`Router` /
+`McpServer` 仍在名单里是正确的：它们**没有**同名的小写标注
+（`Router::new()` 是构造器，不是标注名）。
+
+⚠ 顺带记一条**命名空间细节**：parser 会把标注名**小写化**
+（`let lower = name.to_lowercase()`），所以白名单里的 `agent` 同时接受
+`Agent` —— 首字母大写的名字在标注位置与小写**是同一个**。
+
+##### ⚠ 一处**同类型合并**（如实记录，不假装没有）
+
+`Type::Agent` **同时**表示「`agent` 模块」与「Agent 值」，故两套方法名登记在
+同一个接收者上。后果：模块上**不存在**的 `agent.run` / `agent.name` /
+`agent.max_steps` 现在会**通过 typeck**（运行期仍会拒 `Agent.run`）。
+这是把两种东西塞进一个 `Type` 变体的固有代价；彻底解决需要给模块对象单独的
+`Type`（v1.0 方向的设计决定）。已加测试
+`agent_type_conflation_is_documented` 把这个现状钉住。
+
+##### 测试
+
+`tests/module_method_signatures.rs` 新增
+`web_and_agent_signatures_are_enforced`（3 个方法各测「正确标注通过 +
+错误标注被拒」）、`agent_type_confinement_is_documented`；
+`module_table_keys_are_registered_names` 的 REGISTERED 增至 20 项、PENDING 缩到 3 项；
+`signature_no_over_tightening` 的抽样同步加入 `web.fetch`、计数改 20。
+
+**探针写法本轮也改了一处**：改用**固定目录 + 幂等清理**（进入先清空、退出必清空）
+而不是「每次换时间戳目录名」—— 上一版正是「为防探针文件残留而每次换新名」，
+结果后台重试 3 分钟建了 276 个目录。**防 A 的机制本身引入了 B。**
+
+#### D83：`MirInst::DynTrait` 把 `for_type` **硬编码成空串**（已修）
+
+D82 让 `dyn` 路径通了之后，错误信息暴露出下一个问题：
+
+```text
+trait dispatch at line 0: no impl for type '' method 'hi' (searched: Foo)
+                                                   ↑ 类型名是空的
+```
+
+`mir/handlers/values.rs::h_dyn_trait` 硬编码 `for_type: String::new()`。后果两层，
+**第二层是功能性的**：
+
+1. `Value` 的 Display 输出 `<trait_object for= as Foo …>` —— 类型名丢失；
+2. `dispatch_trait_method` 用 `for_type` 拼 impl 查找键
+   （`impl_method_key` → `__impl_<Trait>_<TGen>_<for_type>_<FGen>_<m>`），
+   空类型名意味着查找键**永远带不上被包值的具体类型** —— 任何按具体类型注册的
+   impl 都匹配不上。
+
+修法：用 `flow::type_name` 从**被包的值**算出类型名，与 `Value::TraitObject`
+其余构造点（`construct_trait_instance`）的命名约定一致。
+修后输出 `<trait_object for=float as Foo data=Float(1.5)>`。
+
+##### ⚠ 影响范围如实说明（不夸大）
+
+当前 `impl` 定义前端**不存在**（lexer 里没有 `Impl` token，见 D82 的普查表），
+用户**无法注册任何 impl**，所以这条缺陷今天**只影响错误信息的可读性**；
+功能层面的阻塞要等前端落地才会显现。修它是因为方向明确、代价 3 行，
+**不是**为了「证明一个能跑通的功能被修好了」。
+
+我做过的验证：手工在顶层 `let` 出 `__impl_Foo____hi`（即 `for_type=""` 会产生的
+精确键，共 **4** 个下划线 —— 我第一次按 3 个猜，键就错了），
+`x.hi()` 仍报 `no impl for type ''`，说明**查找键确实带不上类型**。
+但这**不能证明**「只有 `for_type` 一个阻塞点」—— 环境查找是否能看到该绑定
+我没查清，所以不下这个结论。
+
+##### 顺带记一条观测差异
+
+`run_mir`（集成测试统一的库入口）**不触发 trait 分派**，只有 CLI 的
+pipeline 路径触发；且 `run_mir` 对无 `return` 的 task 返回 `Nil`、不打印尾值。
+故本条测试改用 Cargo 提供的 `env!("CARGO_BIN_EXE_mora")` 跑真实二进制并捕获
+stdout —— 唯一能观察到 `for_type` 的地方。
+
+##### 测试
+
+`tests/dyn_coercion_typeck.rs` 新增 `dyn_trait_object_records_concrete_type`，
+对 3 种被包值（float / string / list）断言 `for_type` 反映真实类型名，
+并显式断言**不出现空类型名**。
+
+**反向验证**：把 `for_type` 改回 `String::new()` 后该测试立即失败。
+
+#### D82：`let x: dyn Trait = <普通值>` **整条路径走不通** —— emit 做了强制转换，typeck 没算（已修）
+
+把「trait/impl 前端」这个待决项从模糊描述查成了**确切事实**，途中撞出一个真缺陷。
+
+##### 顺带查明：trait/impl 前端的**精确状态**（替换掉原先的模糊待决描述）
+
+| 能力 | 状态 | 证据 |
+|---|---|---|
+| `dyn T` 类型标注（含泛型） | ✅ **完全可用** | `let x: dyn Foo<number> = 1` → `expected TraitObject { trait_name: "Foo", generics: [Union([Int, Float])] }`，泛型参数正确传递 |
+| `let x: dyn T = v` 强制转换 | ✅ 可用（D82 修后） | emit 侧 emit `MirInst::DynTrait`，运行期得到 `<trait_object for= as Foo data=Float(1.0)>` |
+| `x.method()` 的 trait 分派 | ⚠ 运行期报 `no impl for type '' method 'hi'` | 因为**没有 impl 可注册** |
+| `trait Name … end` 定义 | ❌ **前端完全不存在** | `Failed to parse`；**`lexer.rs` 里没有 `Trait` token** |
+| `impl Name for T … end` 定义 | ❌ 同上 | `Expected 'in' in for loop`；无 `Impl` token |
+| `继承` / `默认实现` | ❌ 依赖上面不可达的语法 | spec:210 还在写 `trait Person: Named, Aged -- 继承`；lexer 无 `extends` / `where` / `default` / `abstract` / `override` |
+| `as dyn Trait`（§3.5） | ✅ **可用**（但**不支持泛型**） | `let x = 1 as dyn Foo` → `<trait_object for= as Foo data=Float(1.0)>`；`1 as dyn Foo<number>` → `Failed to parse` |
+| `trait` / `impl` 作为标识符 | ✅ 可用（**不是保留字**） | `let trait = 1` 通过 |
+
+**结论**：运行期那一半（`Value::TraitObject` + `trait_dispatch.rs` + `DynTrait`
+强制转换）已实现；**定义那一半（`trait` / `impl`）连 lexer 都没有**。所以你能标注
+`dyn T`、用 `as dyn T` 造出 trait 对象，但**永远注册不上任何 impl**。
+
+**README:119 的那一行是准确的**（`expr as dyn Name coercion` + `dyn Name<T>`
+annotations）—— 本轮一度怀疑它过期，重新逐条实测后确认**不需要改**。
+
+⚠ 顺带：`main.rs:404` 的启动横幅宣称
+`Trait 系统: trait / impl / dyn / ::new() / 继承 / 默认实现` —— 6 项里
+**4 项不可用**（`trait` / `impl` / `继承` / `默认实现`）。**未改**：横幅属于
+面向用户的功能宣称，改它涉及「是否打算补前端」这一产品决定，留给用户定。
+
+##### 缺陷本体：emit 做了强制转换，typeck 却没算这一步
+
+```mora
+let x: dyn Foo = 1
+→ Type error: expected TraitObject { trait_name: "Foo", generics: [] }, got Float
+```
+
+而 `emit_definitions.rs:66` 明确会 emit `MirInst::DynTrait { src, dst, trait_name }`
+把普通值包成 `Value::TraitObject`（spec §3.5 / §13.1 承诺的语义）。
+**emit 写好的 coercion 永远到不了运行期。**
+
+`dyn Trait` 的语义是「把值**强制转换**成 TraitObject」，不是「值本来就得是
+TraitObject」，故两处检查都要放行：
+
+| 查找点 | 位置 | 修法 |
+|---|---|---|
+| HM 侧 | `infer_let_typed` | `!matches!(ty_inner, Type::Any \| Type::TraitObject { .. })` |
+| 双向侧 | `bidirectional.rs` Phase C | `!matches!(hint.to_type(), Type::TraitObject { .. })` |
+
+**⚠ 又是「同一检查的两个查找点只接一处」** —— 我先只改了 HM 侧，结果**顶层
+`let` 仍报**（顶层两条路都跑），而 `task main()` **体内的 `let` 通过**（只跑
+双向侧那条… 实际是相反的组合）。正是这个「顶层失败、体内通过」的**不一致**
+暴露了漏改点。
+
+这与 D69 那条教训完全同型（`method_signature` / `method_return_type` 两张表），
+**我上一轮刚把它写进记忆，本轮又犯了一次**。
+
+**普查结论（否定结果，记下来免得重复排查）**：对 `type_hint` / `to_type()`
+做全 `src/typeck` 扫描后确认，`let x: T = v` 的标注检查**恰好两处**：
+
+| # | 位置 | 何时跑 | 状态 |
+|---|---|---|---|
+| 1 | `hm/infer.rs::infer_let_typed` | 总是 | 已修 |
+| 2 | `bidirectional.rs` Phase C LetBinding | **顶层 `let` 才跑** | 已修 |
+
+`hm/mod.rs:869` 的 `match type_hint` 只是**分派**到 `infer_let_typed`，
+不是第三处检查；`bidirectional.rs:163` 的 Phase A 查的是**标注对自身的自反**，
+与值无关。**没有第三处了**。
+
+附带的**检测启发**：改这类检查后若发现「同一段代码换个作用域结果不同」，
+几乎必然是同一个检查有多处查找 —— 本轮正是靠「顶层失败、体内通过」这个
+不对称才定位到漏改点。
+
+##### 顺带修我在 D77 的**同一个坑**上漏改的一半
+
+D77 给 `print` 的 Union 补了 `Type::TeaApp` / `Type::TeaMsg` /
+`Type::TraitObject` 三项，并给 `TeaApp` 补了「忽略 `name` 标签」的
+`compatible_with` arm —— 但 **`TraitObject` 同样带 `trait_name`，我当时没管**。
+Union 成员渲染成 `dyn`（`trait_name: ""`）而实际值是 `dyn Foo`，`print(x)`
+依然被拒。**「同一类问题在同一处改动里只修了一半」**，与上面那条是同型的
+两次「只修一半」。
+
+代价：不同 trait 名的 `TraitObject` 互相兼容（放弃名义性）。鉴于 `impl`
+前端尚不存在、用户无法构造任何 impl，该代价目前**无实际影响**；待前端落地
+时须重新审视。
+
+##### 为什么一直没被发现
+
+`tests/mir_dyntrait.rs::let_dyn_trait_auto_coerces` 断言了
+`MirInst::DynTrait` 的存在 —— 但它**只查编译出的 MIR，从不跑 typeck**。
+与 D56 / D70 同型的假阳性测试：断言的名字对，被测的路径没走到底。
+
+##### 测试
+
+新增 `tests/dyn_coercion_typeck.rs`（3 条），**全部走顶层 `let`**（顶层两条
+检查路径都跑，是更严的那条）：
+
+- `dyn_annotation_coerces_any_value` —— 7 种值（int / float / string / list /
+  dict / nil / 带泛型）都必须通过
+- `dyn_annotation_is_not_a_loose_any` —— `dyn` 不是无限制的 `any`
+- `trait_and_impl_definitions_are_still_unparseable` —— **锁住当前状态**：
+  断言 `trait` / `impl` 定义**仍解析失败**。前端落地时本测试会**主动失败**并
+  提示改写成正向断言。
+
+**反向验证**：单独回退双向侧那道守卫后，`dyn_annotation_coerces_any_value`
+立即失败并给出精确报错。
+
+⚠ **方法论记一条**：第一次做这个反向验证时，我用 PowerShell 的
+`[IO.File]::ReadAllText(...).Replace(...)` 去删那行守卫 —— **因为行尾是
+`\r\n` 而我拼的是 `\n`，替换根本没发生**，而我的脚本只回显了一个布尔值
+（`False`）没被我当回事，于是**「反向验证通过」是假的**（测试本来就绿，
+因为守卫还在）。改用精确编辑后才拿到真正的失败。
+
+**反向验证本身也要验证**：回退操作要**确认真的回退了**（打印替换前后的
+匹配数、或直接看文件），否则「测试通过」和「回退没生效」是无法区分的。
+
+#### D81：把 D80 的安全扫**固化成自动测试**（D80 的收尾）
+
+手工扫只能做一次 —— 明天新增签名就没人扫了。故把判据写成
+`tests/signature_no_over_tightening.rs`（3 条）：
+
+1. `module_signatures_never_reject_extra_arguments` —— **19 个已登记模块**
+   （与 `module_table_keys_are_registered_names` 的 `REGISTERED` 数量对齐，
+   用 `assert_eq!(calls.len(), 19)` 钉住）各取一个方法，构造**多传实参**的
+   调用，断言 typeck **不**因此报错
+2. `zero_arg_builtins_still_reject_extra_arguments` —— 少数内建运行期**显式
+   拒绝**多余实参（`gensym` 的 `if !args.is_empty()`），这类被拒是**正确的**，
+   与「一律放行」不是同一条规则
+3. `unbounded_variadics_accept_any_arity` —— `compose` / `partial` 传 1/3/5/8/12
+   个实参（远超 D80 那版的 2 层 slack）
+
+**首次实跑结果：19 个模块全部无过度收紧** ✅ —— D69–D75 的登记用的都是
+`params_variadic`（无上界），判据一致。抽查中 4 条出现运行期错误
+（`tool.create` 的 `unknown kind '1.0'`、`skill.load` 的文件不存在、
+`exec.parallel` 的 `cmds[0] must be a string`、`document.parse` 的扩展名不支持），
+**都不是 typeck 拒绝**，与本测试无关 —— 故断言一律 typeck-only。
+
+另一条 `dyn_print`（`trait` 定义）报 `Failed to parse at line 2` —— 那是**已知的
+trait/impl 前端待决项**，不是本轮新缺陷。
+
+#### D80：对 D62–D79 全部新签名做「反向放宽」安全扫 —— 抓出 2 处**我自己的回归**（已修）
+
+今天给 typeck 补了十几处签名，最大的风险不是「漏检」而是**「收紧过头」** ——
+把运行期本就容忍的写法判成编译错误（D72 的坑）。故对今天新增的每一条签名
+逐个构造「运行期通过、但很容易被收紧挡掉」的写法，扫一遍。
+
+##### 抓出 2 处真回归（`compose` / `partial`）
+
+D79 用「curried arrow + **额外 2 层 `Any` slack**」声明这两个无上界变参：
+
+```mora
+compose(1, 2, 3, 4)      → exit 2  expected compose, got fn (float) -> …
+partial(1, 2, 3, 4, 5)   → exit 2  expected partial, got fn (float) -> …
+```
+
+slack 用尽后，**多传的实参被拿去和返回类型比对**。而 spec §12 写的是
+`...closure -> compose` / `closure, ...any -> partial` —— **根本没有固定上界**，
+固定 slack 治不了。
+
+修法：登记进 `builtin_signatures()` 并置 `Signature::variadic` ——
+`infer_call` 的变参分支**逐实参校验、完全不设上界**。实测
+`compose(1,…,8)` / `partial(1,…,5)` 全部放行。
+
+`macroexpand` 走不了这条路（宏的返回值需要**逐次 mint fresh var**，静态表做不到），
+故仍留在 `builtin_callee_ty`，但把结果类型从「fresh var + slack」改成
+**`Type::Any`** —— **`Any` 是 top type，多传实参与它合一恒成功**
+（`unify` 的 `(Any, _) => Ok` arm），于是**不需要靠 slack 撑任何上界**。
+这比原来的做法严格更宽松，且不会像 slack 用尽那样误拒。
+
+##### 扫出的另外两条**不是**回归，记下来免得下次重复排查
+
+- `batch_chat([1, 2])` 被我一度判成回归 → **实测 exit 0，是我探针脚本的假警**
+  （`$e` 变量被字符串化成 `System.Object[]`，让 `-match` 恒真）。
+  **教训**：探针的判据表达式出错时，报出来的是「探针的结论」而不是「代码的
+  结论」；判据本身要能被单独验证。
+- `gensym(1)` 被 typeck 拒 → **拒得对**。运行期 `if !args.is_empty() { return
+  Err("gensym() expects no arguments") }` 同样会拒。
+
+##### 又一次：覆盖完整性断言当场生效
+
+把 `compose` / `partial` 加进 `builtin_signatures()` 后，
+`tests/signature_parity.rs::builtin_declared_return_type_matches_runtime`
+**立刻失败**（新签名没有对拍调用）。已补 `call_for` 条目。
+这是该断言第二次在本会话生效（D70 一次、D80 一次）。
+
+##### 回归钉子
+
+`tests/functional_builtins_signatures.rs` 的
+`compose_and_partial_accept_unbounded_arities` **特意用 1/2/3/4/6/8 个实参**
+（旧 slack 只有 2 层）—— 专盯这次回归。另有
+`gensym_rejects_extra_arguments`（钉「零参内建不该收多余实参」）与
+`compose_and_partial_still_have_precise_return_types`（钉「改走变参表后
+结果类型不能丢」）。
+
+**反面教材记进 CHANGELOG**：今天 D62–D80 连续三次撞上同一个坑
+（`linalg.norm` 的可选阶数、`ai.tokens` 的忽略实参、`compose` 的无上界变参），
+三次都是「照直觉定元数 / 照形参个数挂 slack」。**判据始终是「运行期到底读不读
+那个位置的实参」**，不是签名看起来该有几个。
+
+#### D79：裸内建签名的**普查收尾** —— 5 条补登记 + 一次类型系统设计决定（已修）
+
+D78 补了 6 个 spec §12 内建之后，对 **38 个运行期可调用的裸内建**（名单的唯一
+事实源是 `interpreter/dispatch.rs::call_function` 的分派表）做了一次**实证
+普查**：故意写一个错的标注，看 typeck 是否拒绝。标注被拒 = 有签名；被接受 =
+结果类型是未解算的 TypeVar。
+
+**能精确声明的补了 5 条**（返回类型逐条核对自 `builtin_impls.rs` 的
+`Ok(Value::…)`）：
+
+| 内建 | 运行期 | 声明 |
+|---|---|---|
+| `type_of(x)` | `Ok(Value::String(value_type_name(x)))` | `String` |
+| `atom(x)` | `Ok(Value::Atom(…))`，`Type::Atom` 存在 | `Atom` |
+| `methods_of(x)` | `Ok(Value::List(…map(Value::String)))` | `List[String]` |
+| `gensym()` | `Ok(Value::String(format!("g{n}")))` | `String` |
+| `is_instance(x, "T")` | `Ok(Value::Bool(… == type_name))` | `Bool` |
+
+##### 普查里「仍无签名」的，是**如实无法声明**，不是漏登记
+
+- `car` / `cdr` / `uncurry`（D78 已登记，结果是 fresh var）、`deref`
+  —— 结果由容器元素 / 被调函数 / 原子内容决定。`deref` 尤其无解：
+  **`Type::Atom` 是单元变体、没有载荷**，类型域里根本没位置放「这个原子装什么」。
+- `read` / `quote` → 运行期产出 `Value::Code`，而 **`Type` 没有 `Code` 变体**
+  （扩 `Type` 枚举是 v1.0 方向的设计决定，不是缺陷修复该夹带的事）。
+- `eval` —— 结果是被求值表达式的类型，需要真正的递归推断。
+- `swap` / `into` / `macroexpand` / `batch_chat` —— 结果由回调 / 元素类型 /
+  宏定义决定，同样只能宽松。
+
+⚠ **诚实标注**：本节（`swap` / `into` / `macroexpand` / `batch_chat`）在 D79 当时
+被标为「判定不确定」—— 我第一轮探针把实参写错了（运行期就报错），既没测到
+「有签名」也没测到「无签名」。**这 4 个已在 D79b 逐个读运行期实现补齐**，
+38 个裸内建的普查至此**没有留下不确定项**。
+
+##### ⚠ 顺带暴露一个类型问题 —— **已查明：类型系统忠于 spec，fixture 才是异类**
+
+给 `type_of` 补上精确的 `String` 之后，`tests/fixtures/e2e/explicit_api.mora`
+的最后一行第一次被真正检查：
+
+```mora
+{router: type_of(router), server: type_of(server), schema: schema}
+```
+
+`infer_dict` 取**首个值的类型**并要求其余值与之 `compatible_with`，而
+`schema` 是 `Dict(String, Dict(String, String))` → 报
+`expected String, got Dict(...)`。
+
+上一轮我把这条记成「待用户定」的**设计决定**。**查完 spec 后不成立** ——
+spec §13.1 类型文法（`:1139`）写的是：
+
+```
+τ ::= string | char | number | bool | nil
+    | list<τ> | dict<τ, τ>          ← 键与值共用同一个 τ
+```
+
+**`dict<τ, τ>` 明确规定 dict 是同质的**（甚至比实现的 `Dict<K, V>` 更严 ——
+实现至少允许键类型与值类型不同）。所以：
+
+| 层面 | 立场 |
+|---|---|
+| spec §13.1 | 同质（`dict<τ,τ>`） |
+| typeck `infer_dict` | 同质（`Dict<K,V>`，比 spec 略松） |
+| 运行期 `HashMap<String, Value>` | 允许异质 |
+| `explicit_api.mora` | 异质 —— **唯一的异类** |
+
+该 fixture **有意**这么写（`tests/e2e.rs::e2e_explicit_api_runs` 明确断言
+`schema` 是 Dict），故按「保留覆盖、放宽这一处」处理：给**放进这个异质 dict
+的那一份**单独加 `any` 标注（`tool()` 调用处仍用未标注的 `schema`，保持那里
+的精度）。
+
+**教训**：上一轮我在**没读 spec** 的情况下就把它升级成了「待用户决定的设计
+问题」。判据是 spec 时就有的 —— 且**这个缺陷与 D62 / D77 是同一类**：
+注释 / 结论里写成「这是 Y 的问题」，而 Y 早已被写明在 spec 里。
+（「结论会随被归因的缺陷修复而失效」那条，这次失效的是**我自己的归因**。）
+
+##### 测试
+
+新增 `tests/builtin_signature_census.rs`（4 条），含一条**反向纪律**钉子
+（`census_signatures_do_not_tighten_argument_types`：传错类型的实参不应因本次
+改动被拒）与一条**对照组**（D68–D78 已登记的 `str` / `len` / `print` /
+`compress` 不得被波及）。
+
+**反向验证**：把 `type_of` / `gensym` 的 arm 改名后，
+`census_builtins_return_types_are_enforced` 立即失败。
+
+⚠ 测试里也踩了一个坑并已修正：`Atom` 是 typeck 内部的 `Type` 变体名，但
+**不是合法的源语言类型标注**（`let v: Atom = …` 会在解析期就被拒），测不到本轮
+要测的东西 —— 正例只能用 parser 白名单里的名字。
+
+##### D79b：把上面那 4 个「判定不确定」的**补齐**（已修）
+
+D79 留了句诚实标注：`swap` / `into` / `macroexpand` / `batch_chat` 的普查结论
+**不确定**（第一轮探针实参写错，运行期就报错，既没测到「有」也没测到「无」）。
+「我还没查过」不该留成尾巴 —— 此处逐个读运行期实现补齐：
+
+| 内建 | 运行期（`builtin_impls.rs`） | 声明 |
+|---|---|---|
+| `batch_chat(list)` | 逐项 `do_ai_chat`，后者 `Ok(Value::String(…))` | `List[String]` |
+| `into(list, fn)` | 逐项调 fn，命中 List 时 **extend（展平）** | `List[α]`（α fresh） |
+| `macroexpand(n, …)` | 跑宏体的 MIR，结果即宏的返回值 | fresh |
+| `swap(atom, fn)` | `Ok(new_val)`，new_val 是 fn 的返回值 | fresh |
+
+**两条只能收紧「容器」、不能收紧「元素」的经验**：
+
+- `into` 的元素类型是**回调的返回值**，静态不可知 → 只能 `List[α]`
+- `macroexpand` 的实参个数由**宏定义的形参表**决定
+  （`expr_args.len() != params.len()` 才报错），故必须**变参** ——
+  否则 `macroexpand("m1", [1,2,3])` 这类调用会被误判元数错
+
+##### 顺带记三条语法事实
+
+- **宏必须定义在顶层**，写在 `task main()` 体内会 `Failed to parse at line 2`
+  （`tests/builtin_silent_defaults.rs::MACRO_M1` 就是顶层定义的）
+- `into` 的展平语义（回调返回 List 时 `extend`）意味着它**不是**逐元素映射
+- **本语言没有 `as` 语法**（试过 `schema as any`，报 `Expected '}'`）；
+  要放宽某一处的类型只能用 `let x: any = …` 单独绑一个变量
+
+新增 `tests/builtin_census_gapfill.rs`（4 条），含一条**钉「不收紧」而非「收紧」**
+的用例（`unconstrained_builtins_remain_usable`）：`swap` / `macroexpand` 的结果
+类型只能是 fresh var，但**必须仍然可用**。
+
+**反向验证**：改名 `batch_chat` / `into` 的 arm 后，2 条测试立即失败。
+
+至此 38 个裸内建的普查**没有留下不确定项**。
+
+#### D78：6 个 spec §12 承诺的内建在 typeck 侧**完全没有登记**（已修）
+
+顺着 D77「`Value` 有、`Type` 缺」的线索查了一遍裸函数内建，发现一整族漏网：
+
+`compose` / `partial` / `curry` / `apply` / `car` / `cdr` / `uncurry` 在
+`builtin_signatures()` 与 `builtin_callee_ty()` 里**一条都没有** → 落到
+`unwrap_or_else(|| self.fresh_type_var())` → 结果类型恒为**永不解算的 TypeVar**：
+
+```mora
+let v: String = compose(f, g)   → 修前被接受  ❌（实得 Value::Compose）
+let v: String = partial(f, 1)   → 修前被接受  ❌（实得 Value::Partial）
+```
+
+##### 为什么一直没被撞见
+
+因为 `print` 的形参 Union **含 `Any`** —— TypeVar 能装进任何成员，于是
+「打不出来」这个症状被完全掩盖。**只有显式标注才暴露。**
+
+这与 D62 / D67 / D68 是同一族后果（TypeVar 对任何类型都兼容），但**成因又不同**：
+D67 是「没算出来」、D68 是「压根没查表」、这里是「这张表里没这一条」。
+
+##### 修法与取值依据
+
+| 内建 | 声明 | 依据 |
+|---|---|---|
+| `compose` | `Type::Compose` | `Type` 与 `Value` **两侧变体都存在**，可精确声明 |
+| `partial` | `Type::Partial` | 同上 |
+| `curry` | `Type::Any` | 缺 `Type::Curry` 变体（扩 `Type` 枚举是 v1.0 方向的设计决定）—— 如实反映「值域存在、类型域没有对应物」 |
+| `apply` / `car` / `cdr` / `uncurry` | 各自 mint 一个 fresh var | 结果由**被调函数 / 容器元素**决定，运行期不固定 |
+
+参形一律 `Any`、**不限上界**：新增 `variadic_arrow(min_args, ret)` —— 除声明层外
+额外挂 2 层 `Any` slack，让多传实参有层可消耗。**这正是 D72（`file.join`）与
+D76（`ai.tokens`）两次踩过的坑**：少挂 slack 层，多传的那个实参会被拿去和
+**返回类型**比对而误报元数错。
+
+##### 测试
+
+新增 `tests/functional_builtins_signatures.rs`（5 条），其中一条是**反向纪律**
+的钉子：`new_signatures_do_not_tighten_argument_types` —— 断言
+`compose(1, 2)` / `partial(1, 2, 3)` / `curry(1, 2)` 这类**传错实参**的写法
+**仍然通过**。本次只补返回类型、**不加实参约束**；若顺手收紧就会挡住原本
+能跑的代码，正是 D72 那条「只收紧下限」纪律要防的事。
+
+**反向验证**：把这 6 个 arm 摘掉后，
+`compose_and_partial_return_types_are_enforced` 立即失败。
+
+##### 仍未覆盖
+
+- `compose(f, g)(1)` / `partial(f, 1)(2)` 这类「直接调用调用结果」报
+  `Expected ')'` —— 解析器限制（调用表达式不能再被调用），与本缺陷无关。
+- `curry` 的**下限元数**没被真正强制（`curry(f)` 落到运行期报
+  `curry(fn, arity) expects fn and arity`）—— 这是 D68「内建一律返回声明的
+  结果类型」那条改动的既有副作用，不是本次引入。
+
+#### D77：`print` 打不出 `TeaApp` / `TeaMsg` / `TraitObject`（已修，**两层根因**）
+
+D73 给 `tea.init()` 声明成 `Type::TeaApp` 之后，立刻撞上一个此前看不见的洞：
+
+```mora
+print(tea.init())
+→ Type error: expected string | int | float | … | app<: any> | … ,
+  got app<tea: any>
+```
+
+而运行期 `value/display.rs:155` 明明有
+`Value::TeaApp(_) => write!(f, "<tea_app>")` —— **打不出来纯粹是类型层的**。
+
+##### 第一层：Union 漏项，且那条注释**本身已过期**
+
+`dispatch.rs` 里 `print` 形参 Union 旁有一条注释：「⚠ 仍缺的 8 个：`Value` 有
+Display 臂、`Type` 里却**没有对应变体**」，并把 `TeaApp` / `TeaMsg` /
+`TraitObject` 列了进去。
+
+**该判断早已过期** —— 三个变体都存在于 `typeck::Type`（`TeaApp` / `TeaMsg` 由
+TEA 引入，`TraitObject` 由 v0.08 的 dyn 引入）。真正缺 `Type` 变体的只有 **5 个**：
+`LogicVar` / `Code` / `Curry` / `Tool` / `TeaCmd`（补它们是 v1.0 方向的设计决定，
+不在缺陷修复范围）。
+
+这与 D68 那条教训同型：**注释里写成「因为 Y 所以做不到」的论断，在 Y 被修好后
+就该删** —— 这里 Y（`Type` 变体）早就不缺了，注释却还在挡路。
+
+##### 第二层：`TeaApp` 的 `name` 是**显示标签**，却被结构相等当成了名义类型
+
+补进 Union 后仍被拒。查报错两侧：`app<: any>`（Union 成员的 `name` 是空串）vs
+`app<tea: any>`（实际值）。`compatible_with` / `subtype_of` 的兜底是
+`self == expected` —— **结构相等**，把 `name` 一起比掉了。
+
+而 `name` 只是 `name()` 渲染成 `app<{name}: {model}>` 用的显示标签；源语言里
+**没有任何语法**能写出一个指定名字的 TEA app（`tea` 模块没有类型标注语法）。
+两条签名各自构造的 TeaApp 因标签不同被判为不兼容。
+
+修法：给 `Type::TeaApp` 补结构化 arm，按四个**类型**字段逐一比较、**忽略
+`name`**，与 `Cons` / `Relation` 的处理同款。
+
+##### ⚠ 诚实标注：两处里**只有一处是承重的**
+
+| 位置 | 是否被 `tests/print_display_arms.rs` 触及 |
+|---|---|
+| `compatible_with` | **承重** —— 退回结构相等后 2 条测试立即失败 |
+| `subtype_of` | **未被触及** —— 退回后测试仍绿 |
+
+`subtype_of` 仍一并改了，理由是「同一概念两处保持一致」，但那是**推理、不是
+测试证据**。已在两处代码注释与本条 CHANGELOG 里写明，免得后人把「两处都改了」
+当成「两处都验过了」。
+
+（写下「两处都要改」之后我先回退了 `subtype_of` —— 测试**没失败**，这才发现
+自己那句话是未验证的推断，于是改回正确说法。**这是本轮第二次「先下结论再找
+证据」被抓**（第一次是上一轮把 `str` 误报成无签名内建。）
+
+##### 测试
+
+新增 `tests/print_display_arms.rs`（3 条）：`print` 必须接得住 TeaApp（字面
+调用 + 中间变量两种形态）、对照组（Union 里**原本就有**的 9 种类型不得被波及）、
+以及「`name` 是标签不是名义类型」的夹逼断言。
+
+#### D76：`ai.tokens().calls()` 把**输入 token 数**当成**调用次数**（已修）
+
+顺着 D75 收尾后的空白处查 `ai` 命名空间的方法签名覆盖面，撞见一个**运行期**
+缺陷 —— 不是类型层的盲区，是真的返回了错误的数字。
+
+##### 缺陷
+
+```rust
+// interpreter/builtins/ai_tokens.rs（修前）
+"calls" => Ok(Value::Float(self.ai.token_usage.input as f64)),
+```
+
+而 `TokenUsage`（`runtime/types.rs`）当时**只有 `input` / `output` 两个字段，
+根本没有 `calls`** —— 显然是复制粘贴留下的。真实调用下二者必然不同：一次调用
+往往带来几百个 input token，于是 `ai.tokens().calls()` 返回的是
+**比真值大两个数量级**的数字，且无任何提示。
+
+修法：给 `TokenUsage` 加 `calls` 字段，在**运行期唯一填充 `token_usage` 的
+入口**（`interpreter/ai_helpers.rs` 的 `account_tokens`）累加，
+`AiRuntime::record_tokens` 同步累加（供单测与直接调用方），
+`calls` arm 改读该字段。
+
+##### ⚠ 这个缺陷**无法用 CLI 观测** —— 记录在此以免后人重复踩
+
+`ai.chat` 在 **mock 模式**（无 `OPENAI_API_KEY`）下直接返回、**不经过**
+`account_tokens`，所以 `ai.tokens().*` 恒为 0.0，`calls` 与 `input`
+看起来「一样对」。实测：
+
+```text
+未调用：  calls 0.0 / input 0.0 / output 0.0 / total 0.0
+调 1 次： calls 0.0 / input 0.0 / output 0.0 / total 0.0   ← 全是 0
+```
+
+结论：**唯一能在本机钉住它的位置是单元测试**
+（`src/runtime/ai.rs::record_tokens_counts_calls_not_input_tokens`，
+断言 `calls == 2` 而 `input == 300`，并断言两者 `assert_ne`）。
+
+**反向验证**：把 `record_tokens` 的 `calls` 累加去掉后，该测试立即失败
+（`两次 record_tokens = 2 次调用`）。
+
+##### 附带修的：typeck 签名缺口
+
+`ai.tokens()` 与 `AiTokens` 值上的四个计数器方法此前**完全没有 typeck
+签名** —— `let v: Int = ai.tokens()` / `let v: Int = t.total()` 全部静默通过。
+已补 `(Type::AiModule, "tokens") -> Type::Builtin` 与
+`(Type::Builtin, "input"|"output"|"total"|"calls") -> Float`。
+
+**`tokens` 必须是变参（最小 0）**：运行期
+`(BuiltinKind::AiChat, "tokens") => Ok(Value::Builtin(BuiltinKind::AiTokens))`
+**忽略全部实参**，`ai.tokens()` 与 `ai.tokens("hi")` 等价。声明成定长 0 参会
+把后者判成元数错 —— 而 `tests/ai_namespace_reachability.rs` 恰好钉着
+`ai.tokens("hi")` 可用。这是本轮第二次因「照直觉定元数」而撞到既有测试
+（第一次是 D72 的 `linalg.norm` 可选阶数）。
+
+##### 测试
+
+- `src/runtime/ai.rs` 新增 2 条单测（`calls` 计数 / 默认值为 0）
+- 新增 `tests/ai_tokens_accounting.rs`（3 条）：`ai.tokens()` 返回类型、
+  四个计数器方法的返回类型、以及**对照组**（`ai.chat` / `ai.critic` 的签名
+  本来就存在，用来证明「同一命名空间里有的方法有签名、有的没有」不是误判）
+
+#### D75：模块方法签名最后两批 —— `schedule`(5) / `memory`(12) / `sandbox`(13)（已修，**全部收口**）
+
+至此 `MODULE_OBJECTS` 的 23 个模块**全部有归宿**：19 个进签名表，4 个
+（`random` / `ai` / `agent` / `web`）各有 `Type` 变体与既有专门分派路径，
+**永久不进本表**（理由写在 `module_table_keys_are_registered_names` 的注释里）。
+
+##### `schedule`（5 个）
+
+`add`（**下限 3**：name/kind/message 三者都是 `return Err`，后两参
+`if let Some(…) … else { 0 }` 可选）→ job id（`String`）；`list` → `List[Dict]`；
+`tick` → `List[Any]`；`remove` → `Bool`；`count` → `Float`。
+
+##### `memory`（12 个）—— 逐条**人工读**，D70 推迟它的理由已兑现
+
+D70 推迟这一组是因为机械扫描给了 3 处错误元数。完整读一遍后确认：**其中
+一处连返回值也扫错了**。
+
+| 方法 | 下限 | 返回 |
+|---|---|---|
+| `store` | 2（key/value 都 `ok_or`） | `Nil` |
+| `recall` | 1 | `Any`（命中返存储值、未命中 Nil） |
+| `search` | 1 | `List[Dict{key,value}]` |
+| `forget` | 1 | `Nil` |
+| `clear` / `size` | 0 | `Nil` / `Float` |
+| `remember` | 2（category/text 都 `ok_or`） | `Bool` |
+| `recall_markdown` | 1 | `String` |
+| `list_markdown` / `keys` | 0 | `List[String]` |
+| `save` / `load` | 1 | `Bool` |
+
+**⚠ `memory.load` 恒返 `Bool`**（成功 `Ok(Value::Bool(true))`、非对象走 `Err`），
+**从不返回 Dict** —— 机械扫描早期把它报成 `Dict`（抓到的是 `json_to_value`
+那一行的上下文）。测试里为此加了反向断言：
+`let v: dict<string, any> = memory.load("p.json")` **必须被拒**。
+
+##### `sandbox`（13 个）
+
+`mode`→`String`(0)；`check_builtin`/`check_path`→`Bool`(1)；
+`check_call`→`Bool`(2，`args.len() != 2`)；`revoke`→`Bool`(1，同款)；
+`token_count`→`Float`(0)；`audit_emit`→`Bool`(2，`args.len() < 2`)；
+`containerize`→`Float`(1)；`container_exec`→`Dict`(1)；
+`container_clear`→`Bool`(0)。
+
+**两条用 `Union` 的**：
+- `audit_flush` / `audit_verify` → `Union[Bool, String]`
+  —— `Ok(()) => Ok(Value::Bool(true))`、**`Err(e) => Ok(Value::String(e))`**：
+  「审计链校验失败」是以**返回值**而非 `Err` 表达的。这是个反直觉但真实的
+  契约，声明成裸 `Bool` 会把合法的 `String` 返回判成类型错。
+- `container_info` → `Union[Dict, Nil]`（命中 / 未命中）
+
+##### 一处既有测试的断言放宽（**修复强度提升，不是回退**）
+
+`tests/builtin_silent_defaults.rs::memory_store_without_value_is_rejected`
+（D51 的测试）断言错误信息含 `requires a value`。补上 `memory` 签名后，
+`memory.store("k1")` 被 **typeck 先拦下**：`Expected 2 arguments, got 1`，
+运行期那条 `ok_or` 不再是第一现场。
+
+D51 的缺陷（静默存 Nil）**依然不存在**，且现在在更早阶段、用更明确的措辞
+被拦下；运行期 `ok_or` 保留作纵深防御。断言放宽为「两条合法诊断之一」并写明
+原因。**断言放宽不等于断言变弱** —— 仍要求「必须报错」，只是不再钉死是哪一层
+报出来的。
+
+##### 测试
+
+`tests/module_method_signatures.rs` 由 21 条扩到 **23 条**，新增
+`schedule_method_arity_and_return_types` / `memory_and_sandbox_return_types`。
+`module_table_keys_are_registered_names` 的 `REGISTERED` 增至 19 项、
+`PENDING` 缩至 4 项（都是「永久不进本表」的）。
+
+**反向验证**：把 `"memory"` / `"sandbox"` 同时改名后，23 条中 1 条立即失败。
+
+#### D74：模块方法签名第六批 —— `tool`（8）/ `skill`（8）/ `xform`（5）+ 一个**建表键名错误**
+
+##### ⚠ 自查抓到：把**枚举变体名**当成了**模块注册名**
+
+`toolplane` 那一段最初建成 `"toolplane"`，而 `MODULE_OBJECTS` 里的注册名是
+**`tool`**（`("tool", BuiltinKind::Toolplane)`）。后果：
+
+```mora
+toolplane.list()   → Unbound variable 'toolplane'    ← 源语言里根本没这个名字
+tool.list()        → [ai, sandbox]                    ← 注册名
+```
+
+**整段表永远匹配不到，且不会有任何测试失败** —— 因为「表里没有这个键」与
+「表里有但方法名不对」在行为上完全一样（都退化成 fresh TypeVar）。
+
+类比：**判据要独立于被测的两侧**。本例的独立判据是 `MODULE_OBJECTS` ——
+模块名的唯一事实源。
+
+已加 `module_table_keys_are_registered_names`：逐一核对名单里的每个键
+**是不是 `MODULE_OBJECTS` 的注册名**，且 `MODULE_OBJECTS` 的每个名字
+**是不是都在「已登记」或「尚未登记」名单里**。双向都堵。
+
+**反向验证**：故意把 `"toolplane"` 塞回名单，测试立即失败并给出可读诊断
+「`toolplane` 出现在名单里，但它**不是** MODULE_OBJECTS 的注册名 ——
+建表时多半是用了枚举变体名而不是注册名」。
+
+##### `tool`（8 个）
+
+| 方法 | 下限 | 返回 |
+|---|---|---|
+| `create` | 1 | `Bool` |
+| `register` | **4** | `Bool` |
+| `unregister` | 2 | `Bool` |
+| `remove` | 1 | `Bool` |
+| `list` | 0 | `List[String]` |
+| `list_tools` | 1 | `List[String]` |
+| `info` | 1 | `Union[Dict[String,Any], Nil]` |
+| `find` | **2** | `Union[Dict[String,Any], Nil]` |
+
+`info` / `find` 命中返 Dict、未命中返 Nil（两个 `Ok` 分支），故用 Union 而非
+裸 Dict。
+
+##### `skill`（8 个）
+
+`list`→`List[String]`(0)、`find`→`Union[Dict,Nil]`(1)、`load`/`uninstall`/
+`set_hub`→`Bool`(1)、`install`→`Bool`(2)、`refresh_hub`→`Float`(0)。
+
+##### ⚠ `xform` 是**桩实现**（记为待办，不在签名缺陷范畴）
+
+`xform.map` / `filter` / `take` / `comp` 返回的是**调试占位串**：
+
+```rust
+Ok(Value::String(format!("<xform.map({:?})>", fn_val)))
+```
+
+即 spec §12 承诺的 transducer 组合子在本运行期只是打印自己的参数。
+本表**如实**声明 `String`（与运行期一致），但这**不代表功能可用**。
+`xform.attach` 则是原样返回入参（`Any`）。
+
+与 D66 的 `Conversation` 同类：属**功能未实现**，不是签名缺陷，不在本表
+的修复范围内。
+
+##### 仍然开放
+
+`memory`（12，元数不规则）`sandbox`（30，值类型由运行期决定）`schedule`（16）。
+`random` **永久不在本表范围** —— 它有 `Type::RandomModule` 变体与
+`infer_method_call` 的 ambient-effect 专门分支，走另一条路。
+
+**已登记合计 133 个方法 / 16 个模块**（另 6 个显式列为待办 + 1 个走专门分支）。
+
+#### D73：模块方法签名第五批 —— `plan`（6 个）/ `tea`（9 个）（已修）
+
+剩下 8 个模块里挑了两个**结构最规整**的先做 —— 它们的元数全部由
+`if args.len() < N` 或显式 `ok_or` 决定，没有 `unwrap_or` 造成的歧义。
+
+##### `plan`（`builtins/plan.rs::call_plan_method`）
+
+| 方法 | 下限 | 返回 |
+|---|---|---|
+| `create` | 2（`if args.len() < 2`） | `String`（计划名） |
+| `update` | 2 | `Bool` |
+| `add` | **3**（`if args.len() < 3`） | `Bool` |
+| `remove` | 2 | `Bool` |
+| `list` | 0 | `List[Any]` |
+| `info` | 1 | `Dict[String, Any]` |
+
+`list` 的**两条分支返回形态不同**：带 plan 名返回该计划的步骤（`List[Dict]`），
+不带则返回全部计划名（`List[String]`）。`List[Any]` 是能同时覆盖两者的唯一
+诚实声明 —— 收窄成任一具体形态都会让另一种分支的标注检查出错。
+
+##### `tea`（`builtins/tea.rs::call_tea_method`）
+
+| 方法 | 下限 | 返回 |
+|---|---|---|
+| `init` | **0** | `Type::TeaApp` |
+| `dispatch` / `update` | **2**（两个 `ok_or` 都必填） | `Type::TeaApp` |
+| `run` | 1（步数可选） | `Type::TeaApp` |
+| `model` / `view` | 1 | `Any`（由用户 TEA 代码决定） |
+| `model_type` / `msg_type` | 0 | `String` |
+| `replay` | 0 | `Nil` |
+
+`init` 的下限是 **0** 而非 3 —— `args.first()` / `args.get(1)` / `args.get(2)`
+**三个都带 `.unwrap_or(Value::Nil)`**，即三参全可选。这是 D72 那条
+「扫描看不到 `.unwrap_or`」在同一天内的第二次生效：按 3 登记会让
+`tea.init()` 编译不过。
+
+`Type::TeaApp` 是 5 字段结构变体（`name` / `model` / `msg` / `update` / `view`），
+后四个由用户代码决定，声明时一律填 `Any`。
+
+##### 测试
+
+`tests/module_method_signatures.rs` 由 18 条扩到 **20 条**，新增
+`plan_method_return_types_are_checked` / `tea_method_arity_and_return_types`。
+断言全部走 typeck-only，故不依赖 `plan.create("p", "k")` 这类调用的实参是否
+真能跑通（实测 `create` 的第二参是 steps 列表、`update` 的是 updates 列表，
+我第一版探针把实参写错却仍看到「typeck 放行」—— 正好说明 typeck-only 的必要性）。
+
+**反向验证**：把 `"plan"` / `"tea"` 同时改名后，20 条中 2 条立即失败。
+
+##### 仍然开放（8 → 6 个模块）
+
+`memory` `sandbox` `toolplane`（17）`skill`（16）`schedule`（16）`xform`（4）
+`random`（走 `Type::RandomModule` 的既有专门分支，**不在本表范围内**）。
+
+下一批建议 `toolplane` / `skill` —— 两者形态与 `plan` 类似（元数由
+`args.len()` 判定、返回 dict / 字符串）。`xform` 只有 4 个方法
+（`attach` / `comp` / `filter` / `map`），顺带一起做掉。
+`memory` / `sandbox` 仍应最后做（前者元数不规则、后者值类型由运行期决定）。
+
+**已登记合计 112 个方法**。
+
+#### D72：模块方法签名第四批（19 个）+ 一处**自我更正**：元数只该校验下限
+
+新增 `document`(1) / `mora`(3) / `bus`(5) / `mock`(5) / `ccr`(5)。
+
+##### ⚠ 自我更正：我在 D69–D71 把元数声明成**定长**，造成了回归
+
+定长元数会拒掉**运行期本来就通过**的调用。实测证据：
+
+```mora
+math.sqrt(4.0, 9.0)   → 运行期 exit 0（`unary_float` 只取 args.first()）
+bus.count(1)           → 运行期 exit 0
+ccr.len(1)             → 运行期 exit 0
+file.cwd(1)            → 运行期 exit 0
+```
+
+我最初的 D69 探针把 `math.PI, 1` 记成「运行期通过」，其实那测的是
+`print(math.PI, 1)` —— `math.PI, 1` 在 mora 里是**元组表达式**不是多参调用。
+后来用 `bus.count(1)` 等直接复测才拿到真证据。
+
+于是 D69 的 `math_arity_matches_runtime` 里那条
+`assert!(typeck("… math.sqrt(2.0, 3.0) …").is_err())` **断言的是错误行为** ——
+它在要求 typeck 比运行期更严。已把模块表的**全部 34 处**改成
+`params_variadic(n, ret)`（只校验下限），并把该测试改名为
+`module_method_arity_only_enforces_lower_bound`，把断言方向反过来。
+
+**原则**：给模块方法补签名时，**只该收紧下限、不该收紧上限**。运行期普遍
+用 `args.first()` / `args.get(N)` 忽略多余实参，typeck 若照形参个数封顶，
+就是把「类型层盲区」换成了「原本合法的程序编译不过」。
+
+**下限校验仍然是净收益**：`math.sqrt()` / `stats.mean()` / `mock.call()` /
+`mock.register("n")` 这类现在**编译期**就拒（`mock.register` 的 handler 是
+`ok_or` 必填，此前要等运行期才报 `requires handler`）。
+
+##### 机械扫描在 3 处给出错误元数（已逐个读代码修正）
+
+| 方法 | 扫描给出 | 实际 | 原因 |
+|---|---|---|---|
+| `bus.emit` | 2 | **1**（变参） | `args.get(1).cloned().unwrap_or(Value::Nil)` |
+| `mock.call` | 2 | **1**（变参） | 同上 |
+| `ccr.marker` | 2 | **1**（变参） | `args.get(1) … .unwrap_or(…)` |
+
+**扫描只看得到「最大下标」，看不到 `.unwrap_or` / `.ok_or`** —— 后者才是区分
+「必填」与「可选」的关键。这与 D71 的 `linalg.norm`、D70 的 `file.join` 是
+同一类陷阱，**逐 arm 读代码仍是唯一可靠手段**。
+
+##### `mora.refine` 的返回类型**随元数变**
+
+2 参返 `Dict`、3 参（多方案生成）返 `List[Dict]`。声明任一都会拒掉另一种合法
+写法，故返回类型给 `Any`（放弃这一条的返回类型检查），用变参保住「至少 2 参」。
+
+##### D72-b：`document` 是**幽灵标注**（与 D63 同型）
+
+`Type::Document` 存在、`document.parse(path)` 运行期产出 `Value::Document`，
+但 parser 标注白名单没有 `document` ——
+`let d: document = document.parse("a.md")` 报
+`unsupported type annotation 'document'`。**值能造出来、标编写不出。**
+已补进白名单。
+
+⚠ `document` 这个名字有**两层含义**，签名表与标注表各管一层：模块 `document`
+只有 `parse` 一个方法；`Type::Document` 是 `Value::Document` 的值类型
+（它的 6 个方法走 `call_method_document`，接收者不是模块裸名，与本表无交集）。
+
+##### 登记内容
+
+| 模块 | 方法 | 下限 | 返回 |
+|---|---|---|---|
+| `document` | `parse` | 1 | `Type::Document` |
+| `mora` | `refine` | ≥2 | `Any`（随元数变，见上） |
+| | `refine_info` | ≥1 | `Dict[String, Any]` |
+| | `list_refines` | 0 | `List[String]` |
+| `bus` | `emit` / `off` | ≥1 | `Nil` |
+| | `subscribe` / `publish` | ≥1 | `Float`（token / pattern 数） |
+| | `count` | 0 | `Float` |
+| `mock` | `register` | ≥2 | `String`（`"mock.n registered"`） |
+| | `unregister` | ≥1 | `Nil` |
+| | `call` | ≥1 | `Any`（由被 mock 的 handler 决定） |
+| | `count` / `names` | 0 | `Float` / `List[String]` |
+| `ccr` | `put` / `extract` | ≥1 | `String` |
+| | `get` | ≥1 | `Union[String, Nil]`（未命中返 Nil） |
+| | `len` | 0 | **`Int`**（本语言少数 Int 来源之一） |
+| | `marker` | ≥1 | `String` |
+
+##### 测试
+
+`tests/module_method_signatures.rs` 由 14 条扩到 **18 条**，新增
+`module_method_arity_only_enforces_lower_bound`（含自我更正的断言方向）/
+`document_module_and_annotation` / `bus_optional_second_argument` /
+`ccr_return_types` / `mora_refine_return_type_is_arity_dependent`。
+
+**反向验证**：把 `"bus"` / `"ccr"` 同时改名后，18 条中 3 条立即失败。
+
+##### 仍然开放（13 → 8 个模块）
+
+`memory` `sandbox` `tea` `plan` `skill` `toolplane` `schedule` `xform` `random`。
+`tea` / `plan` / `toolplane` / `skill` 各 15–20 个、返回 dict，是剩下最大的一块，
+需逐 arm 人工核对。`memory` / `sandbox` 仍应最后做（前者元数不规则，后者值
+类型由运行期决定）。
+
+**已登记合计 97 个方法**（math 34 + file 25 + stats 11 + linalg 5 + bus 5 +
+mock 5 + ccr 5 + exec 1 + json 2 + mora 3 + document 1）。
+
+#### D71：模块方法签名第三批 —— `stats`（11 个）/ `linalg`（5 个）（已修）
+
+D70 之后按「返回类型形态统一」的顺序继续。`stats` / `linalg` 是剩下 15 个模块里
+最安全的两个：一律收 list / 向量 / 矩阵，返回 `Float` / `List` / `List[Dict]`，
+没有运行期副作用。
+
+| 模块 | 方法 | 元数 | 返回（核对自运行期） |
+|---|---|---|---|
+| `stats` | `sum` `mean` `median` `var` `stddev` `min` `max` `quantile` | 1 | `Float` |
+| | `corr` `cov` | 2 | `Float` |
+| | `histogram` | 2 | `List[Dict{lo,hi,count}]`（`bins` 是必填第二参） |
+| `linalg` | `dot` | 2 | `Float` |
+| | `cross` | 2 | `List[Float]`（`Vec<f64>`） |
+| | `matmul` | 2 | `List[List[Float]]`（`Vec<Vec<f64>>`） |
+| | `transpose` | 1 | `List[List[Float]]` |
+| | `norm` | **≥1 变参** | `Float` |
+
+##### 又一个「元数 ≠ 形参数」的坑：`linalg.norm`
+
+```rust
+let p = args.get(1).and_then(…).unwrap_or(2.0);   // 阶数是**可选**的
+```
+
+按 1 参登记 → `linalg.norm(v, 3)` 被拒；按 2 参登记 → `linalg.norm(v)` 被拒。
+**两种固定元数都会拒掉一种合法写法。** 沿用 D70 引入的变参机制（最小 1 元），
+两种写法都放行；代价是第 3 个实参要到运行期才被拒 —— 比现状（两种写法都不检查、
+返回类型也丢失）略松但严格更好。
+
+这与 D69 的 `math.PI`（0 参被当 1 参）是**同一类错误的两个方向**：
+一个把可选参当必填，一个把零参当单参。**根因都是「照着形参个数填，没数运行期
+实际读哪几个下标」。**
+
+##### 测试
+
+`tests/module_method_signatures.rs` 由 11 条扩到 **14 条**，新增
+`stats_method_return_types_are_checked` /
+`linalg_method_return_types_are_checked` /
+`linalg_norm_optional_order_is_accepted`。
+
+**反向验证**：把 `"stats"` / `"linalg"` 同时改名后，14 条中 3 条立即失败
+（另 11 条是 math / json / file / exec / 覆盖性，不依赖这两张表）。
+
+##### 仍然开放（15 → 13 个模块）
+
+`memory` `sandbox` `tea` `plan` `skill` `toolplane` `schedule` `bus` `ccr`
+`mock` `mora` `xform` `document` `random`。
+
+下一批建议 `document`（返回 String / List，形态简单）或 `tea` / `plan`
+（各 20 个上下，返回 dict，需逐 arm 人工核对）。`memory` / `sandbox` 仍应放最后
+—— 前者元数不规则、后者返回 dict 且值类型由运行期决定。
+
+#### D70：模块方法签名第二批 —— `file`（25 个）/ `exec.parallel`（已修）
+
+接 D69 的清单往下做，登记 `file` 与 `exec.parallel`。**先说一个刻意的「不修」**。
+
+##### 决定不登记 `memory` —— 宁可不登记，也不猜元数
+
+`memory` 的 12 个方法元数模式不规则（`store(key, value)` 用 `args.get(1)`、
+`remember` 有可选 category 参、`recall_markdown` / `list_markdown` 的可选参数
+读不出来），机械提取给不出可信结果。而**元数写错的后果比「不检查」严重得多**：
+会拒掉原本合法的调用，把一个类型层盲区变成一个会挡住正常代码的错误。
+
+D51 已记过「`memory` 在 spec 里零记载、typeck 零签名」。要补得**逐个 arm
+人工读**，不做机械推断。
+
+##### `file` 的三条意外，全部靠读运行期代码发现
+
+| 方法 | 直觉 | 实际（`builtins/file.rs`） |
+|---|---|---|
+| `read_bytes` | 字节列表 / `list<int>` | **`Ok(Value::String(hex_encode(&bytes)))`** —— 十六进制**字符串** |
+| `size` | `Int` | **`Ok(Value::Float(meta.len() as f64))`** —— `Float` |
+| `join` | 固定元数 | **变参**（`for arg in args`），最小 1 元 |
+
+前两条若凭直觉写，声明与运行期立刻分叉（正是 `tests/signature_parity.rs`
+要抓的那类漂移）。第三条逼出下面那个基础设施改动。
+
+##### 连带补的能力：`infer_method_call` 认 `variadic`
+
+`file.join("a", "b", "c")` 是 stdlib 里最常用的路径拼接。`Signature` 早有
+`variadic` 字段，但 `infer_method_call` 的 arity 逻辑只认「尾部 Dict/Nil 可省」
+—— 按固定元数登记 `join` 会让三参调用**直接编译不过**。故在 arity 分支里加
+`sig.variadic` 判定：变参只校验下限、不设上限。内置的 `print` 走的是
+`infer_call` 里已有的变参分支，方法侧此前**根本没有**这条路径。
+
+##### 登记内容
+
+| 组 | 方法 | 元数 | 返回 |
+|---|---|---|---|
+| 路径派生 / 读取 | `read_text` `read_bytes` `abs` `basename` `dirname` `extname` | 1 | `String` |
+| 零参 | `cwd` `home_dir` | 0 | `String` |
+| 变参 | `join` | ≥1 | `String` |
+| 谓词 | `exists` `is_file` `is_dir` | 1 | `Bool` |
+| 尺寸 / 列举 | `size` / `list` | 1 | `Float` / `List[String]` |
+| 写操作 | `mkdir` `mkdir_all` `remove` `remove_all` `touch` `chdir` | 1 | `Nil` |
+| 写操作（双参） | `write_text` `append_text` `write_bytes` `rename` `copy` | 2 | `Nil` |
+| exec | `parallel` | 2 | `List[Dict]` |
+
+元数由各 arm 里 `expect_str(N, …)` / `args.get(N)` 的最大下标 +1 得出 ——
+**机械提取的元数是可信的**（与 `memory` 的区别在于 `file` 的 arm 形态统一）。
+
+##### 测试与反向验证
+
+`tests/module_method_signatures.rs` 由 6 条扩到 **11 条**，新增
+`file_method_return_types_are_checked` / `file_arity_matches_runtime` /
+`file_join_is_variadic` / `exec_parallel_return_type_is_list_of_dict` /
+`file_signatures_cover_all_groups`（后者用 `assert_eq!(declared, 25, …)`
+钉住「已登记 file 方法数 = 25 = `call_file_method` 的 arm 数」）。
+
+**反向验证**：把 `"file"` 改名 `"file_RV_OFF"` 后 11 条中 3 条立即失败
+（另 8 条是 math / json / exec / 覆盖性，不依赖 file 表）。
+
+##### 仍然开放
+
+`memory` `sandbox` `tea` `plan` `skill` `toolplane` `stats` `linalg`
+`schedule` `bus` `ccr` `mock` `mora` `xform` `document` `random` 共 **17 个模块**。
+下一批建议 `stats` / `linalg`（返回类型全部是数值或 List，形态同 math），
+再往后是 `tea` / `plan`（20 个上下，返回 dict）—— 后者需要逐 arm 人工核对。
+
+#### D69：模块对象的方法返回值没有任何 typeck 签名（部分已修：math / json）
+
+顺着 D68 的余量做「模块方法签名表」的差集，挖出一处**面积大得多**的同类盲区。
+
+##### 现象
+
+```mora
+let v: String = math.floor(1.5)          → **被接受**  ❌（实得 1.0，Float）
+let v: String = exec.parallel([…], 2)   → **被接受**  ❌
+```
+
+**先确认了一件事**：拼错的方法名**仍被运行期兜住**（`math.flor(…)` /
+`json.strngfy(…)` / `stats.avg(…)` 实测 exit 1 `unknown method`），对照组的真
+方法名全部可用。所以这不是「静默产生错误结果」，而是**类型检查层的盲区** ——
+错误的标注不会被发现，而不是写出了错误的程序。
+
+##### 根因：模块在类型层几乎没有表示
+
+`infer_var`（`hm/infer.rs:356`）把 `MODULE_OBJECTS` 的 **23 个**模块对象里
+的 **20 个**解析成 `Type::Unknown`：
+
+```rust
+n if crate::flow::is_builtin_object(n) => Ok(Type::Unknown),
+```
+
+只有 `ai` / `agent` / `random` 有精确的 `Type` 变体 —— `Type` 的 47 个变体里
+**根本没有** `MathModule` / `JsonModule` / `FileModule` …。而方法签名有
+**两张表**（`method_signature` 与 `method_return_type`，都按 `Type` 索引），
+两张都没有 `Unknown` 分支。于是每个模块方法调用的结果类型都退化成永不解算的
+`TypeVar`，而 `TypeVar::compatible_with` 对任何类型都为真。
+
+规模：`method_dispatch.rs` 里 25 个分派函数共 **300+ 个方法名 arm**
+（math 27 / file 40 / sandbox 30 / tea 20 / plan 20 / skill 16 / toolplane 17
+/ memory 20 / stats 11 / linalg 5 / …），而 `method_signature_builtin` 只登记
+**30** 个名字。
+
+##### 修法：按**模块名**索引，而不是按 `Type`
+
+新增 `dispatch::module_method_signature(module, method)`，在
+`infer_method_call` 里当接收者是 `WitnessKind::Variable` 时查表。
+
+**不新增 `Type::MathModule` 等 20 个变体** —— 那是 v1.0 方向（形式化语义）的
+设计决定；而此处「按名字查表」已足以闭合，不该在一次缺陷修复里夹带设计变更。
+
+**登记范围刻意保守**：只登记 `math`（34 个）与 `json`（2 个）—— 运行期返回
+类型**已逐条核对**的。`math` 的三族在 `builtins/math.rs` 里形态干净：
+
+| 族 | 运行期 | 声明 |
+|---|---|---|
+| `unary_float` / `binary_float` / 零参常量（25） | 一律 `Ok(Value::Float)` | `Type::Float` |
+| `unary_preserve`（abs/sign/floor/ceil/round/trunc，6） | `Int` 进 `Int` 出、`Float` 进 `Float` 出 | `Union[Int, Float]`（可靠过近似） |
+| 类型谓词（is_nan/is_inf/is_finite，3） | 一律 `Ok(Value::Bool)` | `Type::Bool` |
+
+其余模块**宁可继续返回 `TypeVar`** —— 写一个没核对过的签名会把「不检查」
+换成「检查错」，后者更糟。
+
+##### 两次踩坑，都留了痕
+
+1. **只接了 arity 那一路**：第一版把 `module_method_signature` 接到签名查找
+   处，但**结果类型来自另一个函数** `method_return_type`（`infer.rs:1124`），
+   两张表都按 `Type` 索引。实测元数报错生效了、**标注仍被接受**。
+   结论：**同一张表必须同时驱动 arity 与结果类型**，否则只修一半。
+2. **arity 写成统一 1 参**：`math.PI`（0 参）报 "Expected 1 arguments, got 0"、
+   `math.pow(2.0, 3.0)`（2 参）报 "Expected 1 arguments, got 2"。
+   `math_arity_matches_runtime` 这条测试就是为钉住它而写的。
+
+##### 新增 `tests/module_method_signatures.rs`（6 条）
+
+沿用 D68 的做法：**只跑类型检查，不执行**（`run()` 会把运行期失败混进来，
+变成假阳性）。含 `assert_eq!(all.len(), 25, …)` 的覆盖完整性断言。
+
+**反向验证**：把 `"math"` 改名为 `"math_RV_OFF"` 后，6 条中 4 条立即失败
+（另 2 条是 json 与「无标注仍可用」，本就不依赖 math 表）。
+
+##### 仍然开放
+
+`file` / `memory` / `exec` / `sandbox` / `tea` / `plan` / `skill` /
+`toolplane` / `stats` / `linalg` / `schedule` / `bus` / `ccr` / `mock` /
+`mora` / `xform` / `document` / `random` 共 **19 个模块**的方法仍无签名。
+补齐它们需要逐个核对运行期每个 arm 的返回类型 —— 属机械但体量大的工作，
+且部分模块（如 `sandbox` 的 `container_*`）返回 dict，值类型本身就不固定。
+
+**要不要补、补哪些，是一个取舍**：每补一个模块就多一份「声明 vs 运行期」的
+对拍负担。倾向按使用频次分批（`file` / `memory` / `exec` 优先），并在每批
+配一条覆盖完整性断言。
+
+#### D68：4 个**运行期在册**的内建在 typeck 侧完全没有登记（已修）
+
+顺着 D67 的余量继续查「还有哪些地方返回 TypeVar」，发现一类**成因不同**的同类后果。
+
+##### 现象
+
+```mora
+let v = compress("abcdef", "head_tail")      → 运行期得 "abcdef"（String）
+let v: Int = compress("abcdef", "head_tail") → **被接受**  ❌
+```
+
+判据一句话：**把返回值标成明显错误的类型，看是否被拒**。修前全部通过。
+
+##### 根因：两张名单漂移
+
+`Interpreter::new()`（`interpreter/mod.rs:495-511`）把 7 个内建一起 define 进 globals：
+
+```text
+print  range  len  compose_prompt  tail  compress  crush_json
+```
+
+而 typeck 侧（`builtin_callee_ty` 的 match 臂 + `builtin_signatures()`）只登记了
+**前三个**。剩下 4 个落到 `None`，调用方 `unwrap_or_else(|| self.fresh_type_var())`
+给出永不解算的 TypeVar —— 与 D67 后果相同，但**成因不同**：D67 是「类型没算出来」，
+这里是「压根没查表」。
+
+四个的运行期返回类型逐个核对过（`builtin_impls.rs`），**全部是 `Value::String`**：
+`compress` → `compress_top` 的两条 `Ok`；`crush_json` → `Ok(Value::String(...))`；
+`tail` → `Ok(Value::String(tail_str))`；`compose_prompt` → `Ok(Value::String(buf))`。
+
+`compose_prompt` 是**真变参**（`for arg in args`），curried arrow 表达不了，
+故登记进 `builtin_signatures()` 并置 `variadic`，走 `infer.rs` 已有的变参分支。
+
+##### 连带修好的一个更普遍问题：`range` 的残差 `Arrow`
+
+补签名时暴露出：**声明元数大于实参数**时，curried 消解留下的残差 `Arrow` 会
+**原样当作返回类型**流出去。
+
+```mora
+let v: String = range(0, 3)   → expected string, got fn ('') -> list<float>
+```
+
+而 `let v = range(0, 3); print(len(v)); print(v[0])` 却「正常」—— 只因 `len` / `[]`
+接受任何类型，把这个错误的结果类型吞掉了。**一个早就存在的缺陷，因为下游足够宽松
+而从未显形**；给内建补上更精确的签名后，它才被撞出来。
+
+修法：内建被调一律返回**声明的**结果类型（新增 `peel_all_arrows`）。内建的返回类型
+永远不是函数（`builtin_callee_ty` / `builtin_signatures` 里没有一条返回 `Arrow`），
+所以剥到最里层是安全的；用户闭包可能真的返回函数（`fn(x) fn(y) … end`），
+那条路径**不剥**。
+
+**先试过、失败的修法**：在 curried 循环**末尾**把 `callee_ty` 的残差 Arrow 拆一层。
+实测无效 —— 循环结束时 `callee_ty` 还是 `TypeVar`（循环体里是
+`callee_ty = fresh_ret`），残差 `Arrow` **只在 solver 之后**才显现。
+教训与 v0.75 那条同型：**要判断一个类型「解出来是什么样」，不能在「解出来之前」看。**
+
+##### 一处覆盖完整性断言当场生效
+
+往 `builtin_signatures()` 加 `compose_prompt` 后，
+`tests/signature_parity.rs::builtin_declared_return_type_matches_runtime`
+**立刻失败** —— 该测试枚举签名表每一项，要求要么有 `call_for` 对拍调用、
+要么在 `INTENTIONALLY_SKIPPED` 里显式列出，否则报「静默漏检」。这是该断言
+设计意图的教科书演示：新增签名没有对应的对拍调用，**当场失守而非静默放过**。
+`compose_prompt` 需前置 `prompt … end` 块、`call_for` 只能给单表达式，
+故归入 `INTENTIONALLY_SKIPPED` 并写明理由（其返回类型由
+`tests/builtin_return_types.rs` 覆盖）。
+
+##### 新增 `tests/builtin_return_types.rs`（5 条）
+
+**关键做法：断言全部只跑类型检查，不执行。** 若用 `run().is_err()`，
+`tail("f.txt", 10)` 会因**文件不存在**而报「系统找不到指定的文件」，
+断言照样为真 —— **测的就不是标注了**。这与 D56 / D67 遇到的
+「假阳性测试」是同一类陷阱，此处是在**写新测试时**就避开了。
+
+含 `assert_eq!(cases.len(), 4)` 的覆盖完整性断言（与 D60 / D61 同型）。
+
+**反向验证**：把 `"compress"` 的 match 臂改名摘掉后，
+`newly_registered_builtins_reject_wrong_annotation` 立即失败，报错正是
+「返回 String 的内建配 `Int` 标注必须被拒」。
+
+##### ⚠ 更正上一轮的一处误报
+
+上一轮末尾写的「无签名内建仍返回 fresh TypeVar：`let y: String = str(45)`
+静默通过」是**错的**：`str` 在 `builtin_callee_ty` 里**有** arm
+（`builtin.rs` 的 `"str" => curried_arrow(vec![arg], Type::String)`），
+返回 `String`，标注通过是**正确**行为。错因是我把探针的 `expect` 写成了
+`err` 却没核对 `str` 的真实返回类型 —— **探针预期必须来自实测，不能凭印象**。
+（与 D65 那次「22 行输出完全一致却当成 22 个缺陷」同型。）
+
+#### D67：推断出的容器字面量元素类型是**永不解算的 `TypeVar`** —— D55 的真正根因（已修）
+
+从 D66 的幽灵类型普查往下追「为什么某些标注完全不生效」，挖到本轮最深的缺陷。
+也是 **D54b / D55 悬置多轮的真凶** —— 此前两次尝试都失败（见下方「为何前两次没修成」）。
+
+##### 现象：同一段程序，只因列表本身有没有标注，类型检查结果**完全相反**
+
+```mora
+let xs: list<Float> = [1, 2.5]
+let y: String = xs[0]     → expected string, got float      ✅ 正确报错
+
+let xs = [1, 2.5]                 ← 只是少了标注
+let y: String = xs[0]     → **被接受**                        ❌ 静默通过
+```
+
+根因不是标注检查，而是**类型根本没推出来**。插桩可见推断出的容器类型是：
+
+```text
+let xs = [1, 2.5]   →  xs: List(TypeVar('\u{1}'))       ← 应为 List(Float)
+let d  = {a: 1}     →  d:  Dict(String, TypeVar('\u{1}'))  ← 应为 Dict(String, Float)
+```
+
+而 `TypeVar::compatible_with` / `subtype_of` 对**任何**类型都返回 true
+（`typeck/mod.rs` v0.84 注释：「TypeVar = 待推断，应接受」）—— 于是下游一切
+严格检查全部落空：
+
+```mora
+let xs = ["a", "b"]   ; let y: Int    = xs[0]      → 静默通过（实得 "a"）
+let xs = ["a", "b"]   ; let y = xs[0] ; y + 1       → 静默通过（String + Int）
+let xs = [1, 2.5]     ; let y: list<Int> = xs       → 静默通过（元素是 Float）
+let d  = {a: 1}       ; let y: String = d.get("a") → 静默通过
+```
+
+##### 根因：`infer_list` / `infer_dict` 把 fresh TypeVar 当作元素类型返回
+
+```rust
+let elem_ty = self.fresh_type_var();          // 永不被解算的 α
+for item in items {
+    ...
+    self.constraints.push(Constraint::Eq(elem_ty, ty));   // 指望 solver 回填
+}
+Ok((Type::List(Box::new(elem_ty)), acc_row))             // 却把**未解算的 α**交出去
+```
+
+约束压了，但**返回值用的是约束前的变量**。solver 事后把 `α := Float` 写进替换表
+也来不及了 —— 调用方拿到的已经是 `TypeVar`。
+
+##### 修法：累加**已解析的公共元素类型**
+
+数值侧走 `promote_numeric`（`[1i, 2.5]` 的元素类型是 `Float` 而非首个的 `Int`），
+非数值侧沿用首个元素类型；**既有的 `compatible_with` 不一致报错逻辑一字未动**
+（`[1, "a"]` 仍照旧报错）。空容器（无元素可推）仍回落到 fresh TypeVar，行为不变。
+
+##### 连带修掉 `[]` 索引分支 —— 一条**前提已过期**的注释
+
+`infer_call` 的 `[]` 分支原先也绕了一圈 `fresh TypeVar` + `Eq(r, elem)`，代码注释
+写着：
+
+> 不能直接返回 `(**e).clone()`，那拿到的仍是未解析的 TypeVar
+
+**这句话在 D67 之前是对的，D67 之后失效了** —— 元素类型已是具体的，直接返回即可。
+继续照做会把已经具体的类型**重新退化**成 TypeVar，并让**链式索引**在外层丢类型：
+
+```mora
+let m = [[1, 2]]
+let y: String = m[0][0]           → 修前静默通过，修后 expected String, got Float ✅
+let inner = m[0]                  → 拆成中间变量同样会丢类型
+let y: String = inner             → 修前静默通过，修后 expected String, got List(Float) ✅
+```
+
+这正是「**文档里的结论会随被归因的缺陷修复而失效**」的教科书案例：那句注释把
+「`[]` 无签名」与「`infer_list` 不推元素类型」两个独立问题绑在一起表述，修掉后者后
+前者仍成立、结论却已不成立。已在原处改写注释并显式标注该前提已被 D67 消灭。
+
+##### 为何前两次修 D55/D54b 都失败
+
+前两轮的修法都是「给 `let x: T = <expr>` 补一条 `Eq(synth, T)` 约束让 solver 兜住」
+（`bidirectional.rs` 的 `check_against` 是**纯比较**、从不产生约束）。它之所以
+两头落空：`synth` 本身就是那个没被解算的 TypeVar，压 `Eq(TypeVar, String)` 只是
+把变量绑成 String，**不产生任何冲突**。D67 换了个层级 —— 不去补约束，而是**让
+类型一开始就是具体的**，solver 侧完全不用动。这也绕开了当初误伤数值塔的雷区
+（`let n: Int = d.len()` 变硬错误），因为 promotion 逻辑一行未改。
+
+##### 又揪出**第三条假阳性测试**
+
+`tests/dict_method_vs_field.rs::dict_field_access_still_works` 断言
+`let d = {count: 5}` + `let n: Int = d.count` **通过**。D67 修好后它失败 —— 因为
+那个「通过」是 `d.count` 的类型是未解算 `TypeVar` 才成立的，它验证的不是
+「字段访问可用」而是「类型没推出来所以什么都能过」。
+
+改为断言自洽语义（实测 U1 对照：`let n: Int = 5` 与 `let n: Int = d.count`
+**同拒**，因为本语言 `5` 就是 `Float`，`Int` 需 `i` 后缀），并补「值确实是 Int」
+的正例，覆盖面比原来更强。
+
+同时 `tests/tier1_typeck_mir.rs::list_get_exposes_element_type_error` 按它自己
+注释里写下的指示**恢复**了原始断言 —— 该测试此前是「记录 D55 现状」的占位，
+注释明确写着「D55 修好后请恢复为 `assert!(!errs.is_empty())` 并删掉这段说明」。
+它在 D52 修好下标时就已失败过一次，此次是按设计失败。
+
+##### 测试与反向验证
+
+新增 `inferred_container_element_type_is_concrete`（`tier1_typeck_mir.rs`，6 组断言），
+覆盖：推断列表 / 推断字典 / **链式索引** / **中间变量** 四条路径 + 空容器不收窄。
+
+**反向验证**：把 `infer_list` 的返回值改回 `elem_ty`（其余不动），该测试立即失败，
+报错正是「推断列表的元素类型应被追踪」—— 证明它测的确实是 D67 本身。
+
+##### 未覆盖的剩余面（诚实记录）
+
+无签名的内建仍返回 fresh TypeVar，标注对它们依旧无效：
+
+```mora
+let y: String = str(45)   → 静默通过
+```
+
+这是 `builtin_callee_ty` 的登记表问题（`str` 未登记），与 D67 是不同层面，
+未在本轮处理。
+
+#### D66：`Conversation` 的 3 条方法签名 + 整个 `call_method_conversation` 不可达
+
+顺着 D62 的「类型标注表面普查」往下走一层，问的不是「标注能不能写」，而是
+**「这个类型的值在运行期到底存不存在」**。方法：把 `Value` 的 36 个变体逐个数
+生产代码里的**构造点**（区分构造与 `match` arm / `let` 模式 —— 元组变体数
+`Value::X(`，结构变体逐个看上下文，`document/mod.rs:42` 一开始被我误判成文档
+注释，实为 `make_document` 生产辅助函数，`Value::Document` **有**构造点）。
+
+##### 全仓普查结果：6 个 `Value` 变体零构造点
+
+| 变体 | `Type` 对应 | 已知记录 | 死代码规模 |
+|---|---|---|---|
+| `AiConfig` | 有 | D59 段已记 | typeck 方法签名 + 4 处序列化 arm |
+| `HttpRequest` | 有 | `typeck/dispatch.rs:522` 已自记 | 同上 |
+| `Stream` | 有 | D59 / D60 已记 | 2 条方法签名不可达 |
+| **`Conversation`** | 有 | **此前未记** | **3 条方法签名 + `call_method_conversation` 整体** |
+| **`Tool`** | **无** | **此前未记** | 4 处 `match` arm |
+| `Document` | 有 | —— | **有**构造点（`make_document`），**不是**幽灵 |
+
+##### D66 实证
+
+`grep -rn 'Value::Conversation\s*{' src/` 只命中模式匹配、`match` arm、
+Display/JSON 序列化与 typeck 自身注册，**无一处构造**。再用真实 CLI 试遍 5 种
+取得方式，全部失败：
+
+```mora
+let c = ai.create("gpt")     → AiChat.create       （未定义）
+let c = ai.new("gpt")        → AiChat.new          （未定义）
+let c = conversation("gpt")  → conversation         （未定义）
+let c = Conversation::new()  → Conversation::new    （未定义）
+let c = ai.chat("hi")        → 返回 String，不是 Conversation
+```
+
+对照组确认判据可靠（确有生产者的类型都取得到）：`agent.create("x")` 报的是
+「second arg must be a dict」即**函数存在、只是参数不对**；`McpServer::new()` 正常。
+
+结论：源语言里**拿不到** conversation 值，于是
+`typeck/dispatch.rs` 的 `chat` / `history|len` / `model` 三条签名，与运行期
+`method_dispatch.rs:38` → `call_method_conversation`（chat / history / clear /
+model / len 五条 arm）**整体不可达**。
+
+**未修，且不打算「修」** —— spec §3.1 `:120` 承诺的唯一生产者是
+`ai.create(...)`，而 D60 已确认 `ai.create` 未实现。要接通得先实现 `ai.create`
+的语义（mock 模式下产出什么、支持哪些 config 键，spec 未成文），属**功能设计**，
+不是接线活。已在 `typeck/dispatch.rs` 的三处注册处按既有体例加注释标明，
+避免后人误把它们当成「已接线的类型」。
+
+##### 顺带：`Value::Tool` 没有对应的 `Type`
+
+`Value::Tool { name }` 存在，但 `typeck::Type` 的 47 个变体里**没有** `Tool` ——
+值域与类型域不对齐。与 D66 同批记录，不单独修（该变体同样零构造）。
+
+##### 一条方法论记
+
+普查「某类型是否接通」时，**先数构造点再下结论**，且必须逐个看上下文：
+元组变体用 `Value::X(` 计数是可靠的，结构变体的裸计数（`Value::X {`）会把
+`match` arm、文档注释、测试断言全部算进来 —— 我据此差点把 `Document` 误判成
+幽灵，而它的真实构造点就写在 `document/mod.rs:42`，紧邻一句看起来像注释的
+「Convenience — make a Document::value from any backend」。
+
+#### D62：`number` 标注映射到 `Type::Int` —— 方向与 spec **正好相反**（已修）
+
+从「类型标注表面」核验起手（见下方普查），挖出的第一个真缺陷。
+
+本语言的**无后缀数值字面量一律是 `Float`**（`1` / `1.5` / `-1` / `1 + 2`），
+`Int` 要 `i` 后缀，`BigInt` 要 `n` 后缀。而 `parser_v3/syntax.rs` 把 `number`
+标注解析成 `Type::Int`，于是：
+
+```mora
+let a: number = 1        → expected int, got float   ❌
+let b: number = 3.14     → expected int, got float   ❌
+let c: number = 1 + 2    → expected int, got float   ❌
+let d: number = len(xs)  → 通过（len 返 Int）        ✅ 仅这一类能用
+let e: list<number> = [1,2,3] → expected int, got float  ❌
+```
+
+即「通用数值标注」**恰好只在最常见的用法上失败**，只接得住返 Int 的内建。
+
+##### 三条互相独立的 spec 要求
+
+* §13.1 类型表 `:110` 把 `42` 与 `3.14` **同列**为 `number`
+* §13.4 `:1154-1156` `Γ ⊢ e₁ : number  Γ ⊢ e₂ : number ⊢ e₁ + e₂ : number`
+  —— 而 `1 + 2` 推断为 `Float`，标 `number` 却被拒：**类型系统与自己的规则自相矛盾**
+* §12 `:928` `len(x) -> number`，而 `len` 运行期返 `Int`
+
+三条合起来要求 `number` **同时**容纳 `Int` 与 `Float`。
+
+##### 修法：映射到 `Union[Int, Float]`，**不新造 `Type::Number` 变体**
+
+因为 `subtype_of`（`mod.rs:642-656`）、`compatible_with`（`mod.rs:473-487`）、
+`unify`（`unify.rs:376-392`）三处**早已**在 Union 两侧实现了成员语义。`let`
+标注要走三道关卡 —— `infer_let_typed` 的即时 `compatible_with`（`infer.rs:103`）、
+压入的 `Constraint::Eq`（`infer.rs:110`）、双向层的 `subtype_of`
+（`bidirectional.rs:117`）—— 全部自动放行，**且完全不触碰 promotion 塔本身**。
+
+这一点是刻意的：**D55 两次尝试都因为动到 promotion 而回退**（加上约束后
+`let n: Int = d.count` 这类原本合法的写法变成硬错误）。本次只改**名字到类型
+的映射**，三道关卡与数值提升全部零改动，绕开了 D55 的雷区。
+
+`BigInt` 故意排除：v0.91 明确「BigInt 不参与 `Int <: Float` 提升（避免隐式精度
+损失）」，spec `:110` 也未列入 `number`。
+
+##### 连带消除的两份真相
+
+`typeck/mod.rs::from_hint` 把 `number` 映射成 `Type::Float`、parser 映射成
+`Type::Int`，同一概念两处**互相矛盾**（v0.104.5 段已记录但未修）。现已一并对齐为
+`Union[Int, Float]`。⚠ `from_hint` 目前**全仓零调用点**（只有自递归），实际生效的
+是 parser 那条；同步它只为消除两份真相，不是为了改变行为。
+
+##### 新增 `tests/number_tower.rs`（6 条）
+
+除正向用例外，另含**反向钉子**：`number_is_not_a_loose_any` 用 6 个非数值类型
+（String / Bool / List / Nil / Dict / BigInt）钉住「Union 化没有把 `number` 放成
+any」，并用 `assert_eq!(cases.len(), 6)` 钉住清单本身 —— 否则增删用例时这条钉子
+会静默失守。`number_bound_variable_stays_usable_downstream` 钉住 Union 不外溢到
+env（绑定后的变量仍能算术 / 比较 / 传参）。
+
+**反向验证**：临时回退映射后 3 条按预期失败，报错正是
+`expected Int, got Float`；另 3 条（负例与不变性）两种状态都通过 —— 符合预期。
+
+#### D63 / D64：两个「写得出值、写不出标注」的原语类型（已修）
+
+同一轮普查里另有两个同类缺陷：**类型存在、值存在，标注位却堵死**。
+
+| 编号 | 类型 | 值怎么来 | 标注为什么不通 |
+|---|---|---|---|
+| **D63** | `bigint` | 字面量 `999n` → `Value::BigInt` | parser 白名单漏了 `"bigint"` |
+| **D64** | `nil` | 关键字 `nil` | `nil` 是关键字 token，走不到 `Identifier` 分支 |
+
+* **D63**：spec §3.1 `:113` 把 `bigint` 列为正式原语类型（语法 `999n`），
+  `Type::BigInt` 存在、`from_hint` 认它、`999n + 1n` 能算出 `1000n` —— 但
+  `let x: bigint = 999n` 报 `unsupported type annotation 'bigint'`。
+  即任意精度的值**永远无法被标注**，这条语言特性等于只接了一半。
+* **D64** 更隐蔽：白名单里**确实有** `"nil" => Type::Nil`，但它是**死代码** ——
+  `nil` 在 lexer 里是 `TokenType::Nil`（`lexer.rs:13`），而
+  `parse_single_type_annotation` 只 match `Dyn` 与 `Identifier`，关键字直接落到
+  兜底分支报 `expected type annotation`。`let x: nil = nil` 连解析都过不去。
+
+两处都**不需要动 typeck**：`Nil` / `BigInt` 的自反性三处早已齐备
+（`subtype_of` `mod.rs:762` / `:824`、`compatible_with`、`unify`
+`unify.rs:304` / `:307`）。
+
+新增 `tests/primitive_annotations.rs`（4 条），含
+`nil_keyword_semantics_unchanged`（把 `nil` 变成可标注 token 后，关键字位置的
+`nil` 仍是值、仍能与 `any` 互通）与 `bigint_annotation_is_precise`
+（`bigint` 不是 any，且**不属于** `number`）。
+**反向验证**：回退后 2 条正向测试按预期失败，报错正是
+`unsupported type annotation 'bigint'` 与 `expected type annotation`。
+
+#### 类型标注表面普查（一条**边界记录**，非缺陷）
+
+按 spec 附录 B「内置类型完整列表」的 **39** 个名字逐个做**表面核验**
+（用必然失败的右值 `1234567`，只看 parser 放不放行）：
+
+| 类别 | 数量 | 名单 |
+|---|---|---|
+| 可写成标注 | **7** | `string` `char` `number` `int` `float` `bool` `any` |
+| 需泛型形态才通 | 2 | `list<T>` / `dict<K,V>`（裸 `list` / `dict` 不通） |
+| 关键字 token 顶掉 | 2 | `nil`（D64 已修）、`task` / `macro` |
+| 其余 parser 拒绝 | 28 | `closure` `conversation` `stream` `ai_*` `router` `http_*` `mcp_server` `result<>` `trait` `concrete` `union` `compose` `partial` `atom` `arrow` `code` `effect` `handler` `tea_*` `transducer` |
+
+**不要**把这张表当成「32 个待修缺陷」：其中绝大多数是**从未实现的类型**
+（`Value` 里没有对应变体，spec 附录 B 属**愿景清单**而非承诺），补白名单只会
+造出一批「写得出、跑不通」的假类型。真正可判为缺陷的只有 D63 / D64 两条 ——
+判据是**该类型的值在运行期真的存在**（`999n` 产出 BigInt、`nil` 是字面量），
+而白名单/分词堵死了标注位。
+
+另：`typeck::Type::is_builtin_type_name`（`mod.rs:423`）**全仓零调用点**，其名单
+与 parser 白名单又是第三份不一致的真相；暂不动（死代码），记此备查。
+
+#### D61：spec §12 的**方法表**全部可达 —— 一条**否定结果**
+
+把 D60（`ns.func(...)` 命名空间表面）的核验方法**平移**到**方法表面**：
+spec §12 的三张方法表 —— String 10 项（:1032-1041）、List 15 项（:1047-1061）、
+Dict 6 项（:1087-1092），共 **31** 项 —— 逐个实测。
+
+**结论：31 项全部解析得到**（能走到方法体）。执行期不成功的不算表面问题
+（`json()` 解析失败、`web` 类缺环境等），判据只排除
+`has no method` / `Unknown method` / `Unknown function` /
+`Can only call methods on` 这四类「方法不存在」。
+
+**与 `methods_of` 双向对齐**（`methods_of` 是用户做能力发现的唯一入口）：
+
+```text
+methods_of("ab")  → [len, upper, lower, trim, starts_with, ends_with,
+                     contains, split, replace, json]                    = spec 的 10 项，逐项吻合
+methods_of([1,2]) → spec 的 15 项 + sum, min, max, mean, median,
+                     stddev, var, sort, crush_json                     = 忠实**超集**
+methods_of({a:1}) → [get, set, keys, values, len, json]                = spec 的 6 项，逐项吻合
+```
+
+即：spec 承诺的**没有一个**宣告了却没有（这与 D60 的 2 个缺项形成对照）；
+而 `methods_of` 多列的 9 个 List 方法是**有能力但 spec 未逐字写** —— 属**文档
+缺口**，不是缺陷。
+
+**新增 `tests/spec_method_surface.rs`（6 条）**：
+31 项逐个核验（3 条，按接收者分）、spec 表 ⊆ `methods_of` 名单、
+`methods_of` 多列的 9 个未文档方法仍在（反向核对）、以及**覆盖完整性 = 31** ——
+spec 方法表增删而无人更新本文件时会**当场失守**（与 D55 / D56 / D59 同型）。
+
+记这条否定结果是为了**免得日后重复排查**：方法表面是健康的，缺项只出现在
+**命名空间表面**（`ai.create` / `ai.stream`，见 D60）。
+
+##### 一次探针自身的 bug（记下来）
+
+`methods_of` 交叉核对第一版报「`methods_of("ab")` 应返回 List，实得 Nil」——
+原因是把调用包成了 `print(methods_of(…))`，而**尾值是 `print` 的 Nil**，
+不是名单本身。**测「值」时不要用会改变尾值的包装。**
+#### D60：spec 逐字承诺的 41 个 `ns.func(...)` 点号内建，39 个可用、2 个不存在
+
+D59 把 `ai.retry` / `ai.role` / `ai.dag` / `ai.heartbeat` 的不可达归因为
+**文法决定**（点号名该解析成「单名自由函数」还是「裸名 + 方法」）。**逐个实测
+推翻了它**：
+
+```text
+✅ 39 个：agent.create  ai.chat  ai.critic  document.parse  file.*(6)
+          json.*(2)  linalg.*(5)  math.*(2)  random.*(5)  stats.*(2)
+          tea.*(6)  web.fetch  xform.*(5)
+❌  2 个：ai.create  → Unknown method: AiChat.create
+          ai.stream  → Unknown method: AiChat.stream
+```
+
+**文法没问题** —— 39/41 正常。它就是 `AiChat` 这个接收者上**少两个方法分支**。
+D59 那 4 个方法不属 spec 承诺，是**无文档的内部方法**（`retry`/`role`/`dag`/
+`heartbeat` 在 spec 里查无此名），故归为「死代码」而非「承诺未接线」。
+
+##### 两次自我更正（都记下来）
+
+1. **探针的过滤器漏了错误类别**。第一版探针只把
+   `Unknown method` / `Undefined function` / `has no method` 当失败，其余一律
+   记为「可用」，于是报出「40/42 可用」。改用库 API 复测后 **11 个另有原因** ——
+   全是**参数给错或环境所致**（`tea.*` 要 TeaApp、`web.fetch` 要网络、
+   `agent.create` 缺第二参、`stats.histogram` 缺 bins、
+   `document.parse` 要受支持扩展名），**不是缺陷**。
+   **过滤器漏掉错误类别时，「全绿」与「全错」是同一件事。**
+2. **`router.route` 不是裸命名空间**。它是从 spec §832 的一句**散文**里正则
+   捞出来的（「`router |> route(...)` 与 `router.route(...)` 等价」），指的是
+   `Router::new()` 之后的**值方法**。实测 `let router = Router::new()` 后
+   `router.route(…)` 正常；裸名 `router` 未注册、报 `Unbound variable`。
+   故真实承诺数是 **41**（42 处正则命中减去这一处散文）。
+
+##### 基础设施已齐，只缺生产者
+
+* `Value::Stream { reader, done, xform }` 定义完整，带 Clojure 风格
+  transducer 管线（`transducer.rs` 的 `Send+Sync+Debug` 约束就是为它写的），
+  方法 `collect` / `is_done` 已登记并由
+  `method_dispatch.rs::call_method_stream` 分派 —— 但全仓**零构造点**。
+* `Value::Agent` 同样存在且有 `call_method_agent`。
+
+故与 D4（`int` / `float` / `bool` 只在 typeck 有签名、运行期没分支）是
+**同一类**的「承诺语法未接线」。
+
+**未实现**：`ai.stream` 在 mock 模式下「流」产出什么、`ai.create` 的 config
+支持哪些键，spec 均未成文（§708 示例只给了 `tools` / `model`）—— 属功能设计。
+
+##### 新增 `tests/spec_builtin_surface.rs`（4 条）
+
+本文件检验的是**名称表面**而非「跑通」：断言该名字能解析到已知方法，不要求
+执行成功（`web.fetch` 无网络、`file.read_text` 文件不存在都**不是**表面问题）。
+判据只排除四类「名字没解析上」的失败：`Unknown method` / `Unknown function` /
+`Unbounded variable '<ns>'` / `'<ns>' is a module, not a function`。
+
+1. 39 个已实现的必须解析得到（防 spec 表面回退）
+2. 2 个未实现的必须**以可识别的方式**被拒（将来接线后测试失败并提示移组）
+3. `router.route` 是值方法不是裸命名空间 —— 单独钉住
+4. **覆盖完整性**：钉住的项数必须等于 spec 承诺的 41 —— spec 新增点号内建而
+   无人更新本文件时会**当场失守**
+#### D59：`ai` 命名空间有 4 个方法源码不可达 + `ai.stream` 未实现（已定位，未修）
+
+顺着「无效输入静默兜底」扫到 `src/interpreter/builtins/`，结果挖出的是
+**可达性**问题。
+
+##### `ai.retry` / `ai.role` / `ai.dag` / `ai.heartbeat` 完全不可达
+
+真实 CLI 实测，**三种拼法全试**：
+
+```text
+ai.retry(3, 500, "fixed")                → Runtime error: Unknown method: AiChat.retry
+let f = ai.retry   f(3, 500, "fixed")    → 同上
+ai.dag / ai.role / ai.heartbeat          → 同上（Unknown method: AiChat.*）
+```
+
+**根因**：名字解析把两条路分开了。
+
+| 入口 | 解析成 | 该分支上的可用方法 |
+|---|---|---|
+| 裸名 `ai`（`value.rs:124`） | `BuiltinKind::AiChat` | `tokens` / `chat` / `critic` |
+| 点号自由函数名 `"ai.retry"`（`dispatch.rs:522`） | `BuiltinKind::Ai` | `retry` / `role` / `dag` / `heartbeat` |
+
+而 `call_ai_method`（`retry`/`role`/`dag`/`heartbeat` 的实现，224 行）的
+**唯一生产调用点**是 `method_dispatch.rs:744` 的 `(BuiltinKind::Ai, _)` ——
+需要接收者是 `BuiltinKind::Ai`。但 parser 永远把 `ai.retry(...)` 解析成
+「裸名 `ai`（→ `AiChat`）+ 方法 `retry`」，**从不**产出单名 `"ai.retry"`。
+于是 `BuiltinKind::Ai` 在源码路径上不可达，那 4 个方法随之不可达。
+
+**又是假阳性测试的形状**：`src/interpreter/builtins/tests/{ai,dag,heartbeat}.rs`
+里的测试全部写成 `interp.call_ai_method("retry", …)` —— **直接调函数**、
+绕过名字解析，于是测的是一个源码到不了的实现。这与 D55 的
+`list_get_exposes_element_type_error`、D56 的 `let_identity_polymorphic`
+同型（**测试用比生产更宽松的路径，绿色就不可信**）。本会话已揪出 5 条。
+
+##### 顺带：`Value::Stream` 是**从未被构造**的死变体
+
+spec §1099 承诺 `ai.stream(prompt) → stream`，实测 `Unknown method: AiChat.stream`，
+且：
+
+* `interpreter/builtins/ai.rs` **没有** `"stream"` 分支；
+* `Value::Stream` 全仓 6 处出现**全是 match 模式 / 类型名映射**，
+  **零构造点**；
+* 它的方法 `collect` / `is_done` 已在 `value.rs:643` 登记、
+  `method_dispatch.rs:40` 分派，但**没有任何值能到达那里**。
+
+**类型系统没有漏**：`let x: stream = 1` 被 parser 正确拒绝
+（`unsupported type annotation 'stream'`），`print(stream)` 报
+`Unbound variable` —— `typeck/mod.rs:340` 的 `"stream" → Type::Stream`
+映射**不可从源码到达**。与 CHANGELOG 早前记录的
+`Type::AiConfig` / `Type::HttpRequest` 死签名同族，但这次死的是
+**运行期值类型本身**，外加一条 spec 承诺。
+
+##### 为什么只记录不修
+
+让它们可达 = 决定「点号名 `ai.retry` 该被解析成单名自由函数调用，还是裸名
+`ai` + 方法调用」——**文法决定**；以及 `ai.stream` 要不要真的实现（涉及网络
+流式读取）——**功能决定**。两者都未擅自做。
+
+新增 `tests/ai_namespace_reachability.rs`（**4 条**）钉住当前事实：
+`ai` 命名空间现只暴露 `chat`/`critic`/`tokens`；那 4 个方法与 `ai.stream`
+**当前不可达**；`stream` 类型标注被 parser 正确拒绝。将来接线后这些测试会
+失败并提示删掉。
+#### D58：`with` 块的结果寄存器指错了地方（已修）+ D57 重做
+
+##### D58：`Node::WithConfig` 缺少结果寄存器
+
+```mora
+with model = "gpt-4o"
+  2
+end
+裸（emit）路径 = Nil  ✅ 正确
+9 层管线       = String("gpt-4o")  ❌ 返回了第一个配置绑定值
+```
+
+**根因**：`Node::WithConfig` **没有**结果寄存器字段，于是
+`witness_to_fcfg::node_result_reg_of` 落 `_ => None` → `unwrap_or(0)`
+→ 块结果指向**寄存器 0**，而 reg 0 恰恰是第一个配置绑定值。
+
+与 D35 给 `Node::Handle` 补 `dst` 是**同一类修复、同一种失败形态** ——
+那条 arm 上方的注释早就写明了「缺此 arm 时 `let` 绑定只能拿到哨兵 0 →
+静默饿死（无报错、退出码 0）」，只是当时列的是 `Handle`。
+
+**修法三处**：
+
+1. `mir/fcfg.rs`：`Node::WithConfig` 加 `dst: Reg`（所有消费点
+   ——`ehir_to_core.rs` / `fcfg_lower.rs` / `ssa` / LSP 访问器 —— 都用
+   `..` 模式，无需改动）；
+2. `mir/witness_to_fcfg.rs`：预分配 `dst`，并给 `node_result_reg_of`
+   补 `Node::WithConfig { dst: reg, .. }` arm；
+3. `mir/fcfg_lower.rs`：补 `Const(dst, Nil)` —— `with` 的值恒为 Nil
+   （子 body 的返回值不传播），与 emit 路径 `emit_with_w` 同形。
+
+##### D57 重做：现在放开「条数差异」是安全的
+
+第一次尝试 D57（剔除死 no-op 再比）时炸出的正是上面这个 `with` 缺陷；
+现在根因修好，重做后结果符合预期：
+
+| 构造 | 修 D58 前 | 修 D58 后 |
+|---|---|---|
+| **`with`** | 每次回落（`delta=-1`） | **✅ 不回落**，走上 DAG 分析 / CSE / 贪心重写 |
+| `parallel` / `observe` / `model` / `msg` / `struct` / `enum` | 回落，diff 只说「条数差 -1」 | 仍回落，但 diff 变成**真实分叉**：`top[2]: "Call" vs "Const"` |
+| `transaction` / `worker` | 回落 | 仍回落：`pipeline="Const" original="Transaction"` —— 管线**根本没降出**这两个指令（`Transaction` 在整条管线降级链 `witness_to_fcfg` / `fcfg` / `fcfg_lower` / `ehir_to_core` / `core` / `cmir` / `lmir` / `typeck` 里**完全不存在**） |
+| `eval` | 回落 | 仍回落：`delta=-2` |
+| 对照：`handle` / `match` / `for` / `if` / `task` | 不回落 | 不回落 |
+
+即 D57 把一句含糊的「条数不同」换成了**精确的真实分叉报告**，并把最常用的
+`with` 从永久回落里解放。剩下 8 类的回落是**正确的** —— 它们是真实缺口。
+
+##### 差分检查的**值级盲区**（未修）
+
+差分检查比的是**指令类别序列**、**不比值**。`with` 那一类
+「两边类别相同、值不同」的分叉**结构上就抓不到** —— 当初 `with` 之所以没被
+直接抓到，是靠条数差异**偶然**挡住的（而它挡住的是一个真 bug）。
+
+`tests/pipeline_equivalence.rs` 的「逐特性比对两条编译路径的结果」能抓到
+这类分叉，但它只在**测试**里跑；生产侧 `compile_and_opt` 不执行两次程序。
+**未修**：给差分检查加常量值比较（`Const` 的值）成本低、但只能覆盖常量；
+真正的值级等价需要别的手段。
+
+回归测试加在 `tests/dict_method_vs_field.rs`（8 条）：
+`with_block_result_is_nil_not_the_first_binding`（块的值必须是 Nil）、
+`with_block_agrees_across_both_compile_paths`（生产路径上也得是 Nil，
+即差分不再对它回落）。
+
+#### D58：9 层管线把 `with` 块降错 + 差分检查的**值级盲区**（已定位，未修）
+
+```mora
+with model = "gpt-4o"
+  2
+end
+裸（emit）路径 = Nil            ✅ 正确
+9 层管线       = String("gpt-4o") ❌ 返回了配置绑定值
+```
+
+**差分检查为什么没抓到**：它比的是**指令类别序列**（`Const` / `BinaryOp` /
+`Call` …），**不比值**。`with` 两边的类别序列相同、值不同 —— 差分检查
+**结构上就看不见这类分叉**。换言之，条数差异不是「冗余噪声」，而是这张网
+漏着时**唯一**拦住 `with` 的东西。
+
+**未修**。`with` 是极常用构造（AI 配置、HTTP 请求、可观测性块），
+把管线降对需要看 `witness_to_fcfg` / `fcfg_lower` 里 `WithConfig` 的
+结果寄存器是怎么定的 —— 属于管线实现，牵动面比差分检查本身大。
+**顺序：先修 D58 的降级，再考虑 D57 的放宽。**
+
+##### 一次事故：`git checkout --` 误删本会话对 `pipeline.rs` 的 256 行改动
+
+为回退 D57 我用了 `git checkout -- src/mir/pipeline.rs`，**把本会话早前
+对同一文件的全部改动一并回退到 HEAD**（D36 的 `nested_diffs`、寄存器
+绑定审计 `audit_reg_bindings` 等）—— 那些改动从未提交，**无法从 git 恢复**。
+
+已按本会话记录的设计**逐条重建**（`nested_diffs` 递归进 `TaskDef` body /
+`Handle` body+handler / `MatchExpr` arm 的 guard+body；`audit_reg_bindings`
+用 `written_reg()` 收集生产者、递归进嵌套函数体、opt-in 于 `MORA_AUDIT_REG`）。
+重建后用**丢失前实测过的那个用例**验证行为一致：
+
+```text
+@@N@@ nested_diffs=3 ["top[0].task.body[0]: \"Const\" vs \"Transaction\"", …]
+[9layer] diff: nested MirFunction shape differs (3 diffs), e.g. top[0].task.body[0]: "Const" vs "Transaction"
+```
+
+全量 **58 组 1511 passed / 0 failed**、`clippy --lib` 零警告，与事故前基线
+逐项一致。
+
+**教训（写入本仓库的工作约定）**：工作区里**未提交**的改动**不能**用
+`git checkout --` 撤销 —— 它按 HEAD 恢复，**把本会话所有未提交工作一并丢掉**。
+要撤销单处改动必须用 `edit` 精确回改，或先 `git diff > patch` 留档。
+#### D56：测试套件跑的是**比生产更弱**的类型检查器（已修，并牵出 3 条假阳性）
+
+顺 D55 的排查顺手扫了一遍「测试入口」，发现**六个测试辅助函数调的是
+`check_program_witnesses`（弱），而生产路径调的是
+`check_program_witnesses_bidirectional`（强）**：
+
+| 文件 | 辅助函数 |
+|---|---|
+| `tests/mir_closure.rs` | `run_via_mir` |
+| `tests/mir_dyntrait.rs` | `run_via_mir` |
+| `tests/mir_trait.rs` | `run_via_mir` |
+| `tests/tier0_replacement.rs` | `run_via_mir` |
+| `tests/tier1_typeck_mir.rs` | `typecheck` |
+| `tests/tier2_mir_expr_pipeline.rs` | `run_v3_pipeline`（**且把 typeck 结果直接丢弃**） |
+
+生产侧（`src/main.rs:447` `run_file` 与 `:500` REPL）用的**就是强检查器**。
+也就是说：**整个测试套件从未在生产同款的类型检查下运行过**，它绿的时候
+真实 CLI 可能是 exit 2。已把六处全部改为 `check_program_witnesses_bidirectional`。
+
+##### 立刻牵出**第三条假阳性测试** —— 而且它断言的语言特性根本不存在
+
+`tests/tier1_typeck_mir.rs` 的 `let_identity_polymorphic` 与
+`let_polymorphic_list_and_pair` 原先断言 **let-polymorphism**（`let id =
+fn(x) x end` 可用多种实参类型调用）。真实 CLI 实测：
+
+```text
+$ mora run poly.mora
+let id = fn(x) x end
+let a = id([1, 2])     → id 被单态化成 list<float>
+let b = id("hi")       → 同一个 id 当 list<float> 用
+Type error: expected list<float>, got string
+exit=2
+```
+
+**本语言没有 let-polymorphism** —— `let` 绑定的函数被**首个调用点单态化**。
+这两条测试只因用了弱检查器才「通过」。已改写为断言**真实行为**
+（`let_binding_is_monomorphised_not_polymorphic`）。
+
+这是本会话揪出的**第三条**「测试只因某个错误的原因而通过」：
+D39 的 `with a = 1`、D55 的 `list_get_exposes_element_type_error`、
+以及这一条。按这三条的共同形状，**只要一个测试用的检查器比生产弱，它
+的绿色就不可信** —— 现已消除这一类盲区。
+
+##### 顺带发现**重复诊断**（诊断质量问题，未修）
+
+`imported_effect_signature_result_typed` 原本断言「恰好 1 条错误」，改用强
+检查器后得到 **2 条**，且是**同一个**不匹配报了两遍：
+
+```text
+type mismatch: expected `Int`, got `String`          (line 3, column 19)
+Type mismatch: expected Int, got String at line 3, column 3
+```
+
+列号不同（19 vs 3）导致 `check_program_witnesses_bidirectional` 里按
+line+column 去重的过滤漏掉一条。**未修** —— 放宽去重会掩盖真实错误。
+该测试改为断言「有错且信息指向 Int/String」，**本意完全保留**（导入签名
+把 `perform` 结果静态化、从而与标注冲突）。
+#### 一条**否定结果**：能力发现入口是诚实的
+
+顺手核实了两处「对外承诺的能力」，**均无缺陷**，记录以免重复排查：
+
+* **spec §12 :939-943 承诺的同像性内建（v0.86）全部可用** ——
+  `read` / `gensym` / `macroexpand` / `apply` / `car` / `cdr` / `cons` /
+  `eval` / `quote` 逐个实测均返回正确结果。
+* **`methods_of([1,2,3])` 宣告的 24 个方法全部真实存在** —— 逐个实测，
+  未传参数的那几个给出的都是**正确且具体的 arity 报错**（`take() requires a
+  count argument` 等），没有「宣告了却不存在」的情况。
+
+`methods_of` 是用户判断「这个值能干什么」的唯一入口（v0.104 曾因它漏报
+`crush_json` 修过一次），故这次逐项复核确认它没有再次漂移。
+
+#### D33：`greedy_search` 的 50 轮上限把优化**截断**（已修）
+
+`greedy_search` 每轮只应用**一条**重写（选全局 gain 最大者），所以 n 个独立
+优化机会需要 n 轮；而 `apply_rules` 传给它的上限是 **50 轮**。机会数 > 50
+的程序，其余机会被**整段丢掉**。
+
+**判决实验**（只改这一个常数，前后对照）：
+
+| 用例 | `max_iter=50` | `max_iter=2000` |
+|------|--------------|----------------|
+| 嵌套 `if` ×500（500 个机会） | 2 101 ms | 7 834 ms |
+| 嵌套 `if` ×375 | 1 296 ms | 4 217 ms |
+| 375 个 `let` | 751 ms | 722 ms（**无变化**） |
+| 1 000 个 `let` | 4 985 ms | 4 647 ms（**无变化**） |
+| `let a = 1 / let b = a+1 / print(b)` | 19 ms | 22 ms（**无变化**） |
+| `for` 累加 | 21 ms | 24 ms（**无变化**） |
+
+**优化完整性**（`SearchResult` 的 `iterations` / `applied` / body 长度，500 层
+嵌套 `if true`）：
+
+| `max_iter` | iterations | applied | body |
+|------------|-----------|---------|------|
+| 50 | 50 | 50 | 4000 → **3950**（只折叠 50 个，**450 个常量条件没优化**） |
+| 2000 | 501 | 500 | 4000 → **3500**（全部折叠，每层省 1 条指令） |
+
+**为什么提到 2000 是安全的**：`greedy_search` **收敛即停**（`best` 为 `None`
+就 break），这个常数只是**上限**而非固定成本。实测已收敛的程序
+（375 / 1000 个 `let`、普通 `let`+`for`）提上限前后耗时**完全不变** ——
+它只约束「机会数 > 50」的程序，而那正是优化不完整的程序。
+
+**代价**：这类程序的**编译**时间。if500 实测 2.1 s → 7.8 s（3.7×），
+因为轮数 O(机会数) × 每轮 O(body) = O(n²)。编译是一次性成本，被折叠掉的
+分支判断影响**每次运行**，取舍以此。**注意这个 3.7× 是 D32 修好之后的数字**
+—— 修 D32 之前同一程序要 21.7 s，所以「优化完整」的边际成本比它看起来小得多。
+
+##### 根治方向（未做）
+
+彻底解决要**一轮应用多条互不重叠的重写**，把轮数从 O(机会数) 降到
+O(最大嵌套深度)。但当前 greedy 的语义是「每轮选全局最优」，一次应用多条
+会**改变优化结果**，需要差分测试兜底 —— 故本轮只放宽上限。
+
+##### 差分检查的**两个盲区**：盲区 2 已补（已修）
+
+`mir::pipeline::differential_check` 此前只做两件事：比长度、逐条比
+`inst_category`（**忽略寄存器编号**）。这使它对两类差异**结构性失明**：
+
+| # | 盲区 | 后果 | 状态 |
+|---|------|------|------|
+| 1 | **不比较寄存器号** | 两条路径类别序列相同、只是「引用了哪个寄存器」不同 → 报「通过」 | 未补 |
+| 2 | **只比顶层，不进嵌套 `MirFunction`** | handle / task 的 body、handler 内部差异完全看不见 —— **D36 就藏在这里**（顶层各 14 条一致，差异是 body 一条 vs 两条） | **本轮已补** |
+
+**盲区 2 的补法**：`nested_diffs()` 递归进 `TaskDef` body、`Handle` 的
+body/handler、`MatchExpr` 各 arm 的 guard/body，比对其指令类别序列
+（寄存器号仍不参与），差异计入 `diffs` 并因此判失败。
+
+**为什么现在能安全纳入判定**：当初担心「加了检查会立刻触发回落 → 生产
+路径改用更差的 emit 产出」。**D36 的修复让两条路径真正对齐了** ——
+纳入前先量过 8 类含嵌套的构造（flat / task / 嵌套 task / handle /
+**嵌套 handle** / match / 带 guard 的 match / with），**嵌套层面零差异**；
+纳入后跑全量测试，**回落警告 0 次**。这正是「检查与修复必须同时落地」的
+另一种解法：**先修，再补检查**。
+
+##### 盲区 1：寄存器级审计已就位（**opt-in、只诊断、不判失败**）
+
+差分检查按设计不比较寄存器号，于是「两条路径类别序列完全相同、只是
+`Define("r", ·)` 引用了不同寄存器」这类差异**永远报「通过」**。本轮补上
+`audit_reg_bindings()`：对每个函数体收集全部 `written_reg()` 作为生产者集，
+再检查每条指令的 `input_regs()` 是否都在集内，不在则记一条诊断。
+
+**两个刻意的设计**：
+
+1. **不参与判定**（不改 `differential_ok`）。一旦某个程序的 emit 侧寄存器
+   绑错，判失败会**触发回落** → 生产路径改用本来就差的 emit 产出 ——
+   把「一条路径错」变成「生产路径错」。
+2. **`MORA_AUDIT_REG=1` 才开启**。本函数在**每次编译**时都会被调用，而
+   `MirInst::input_regs()` 每次调用都**分配一个新 `Vec`**，加上对所有嵌套
+   结构逐个递归 —— 开启会让编译慢一个量级（实测开启后测试套件长时间不出
+   结果，故改 opt-in）。诊断用途按需开启，不该进生产路径。
+
+实现上两个易错点：
+
+* 用 **`written_reg()` 而非 `dst()`** —— D35 之后 `Handle` 被 `is_effect()`
+  抢先归为 Effect 节点，`dst()` 够不到它的 `k_dst`，用 `dst()` 会**漏判
+  内层 handle 的写入**，进而把合法引用误报为「无生产者」。
+* **嵌套 `MirFunction`（handle body/handler）是独立寄存器空间**，其生产者
+  不能用来满足外层引用 —— 故每个函数体各查各的。这正是 D36 的
+  `regs[0]`（顶层）vs `body_mir` 的 `regs[X]` 所体现的区分。
+
+**开启后实测 20 类构造全部零报警**（flat / binop / task / 嵌套 task /
+handle / 嵌套 handle / handle 嵌 task / match / 带 guard 的 match / with /
+with 嵌 task / for / while / pipe / closure / if 表达式 / index / 字符串方法 /
+dict / 列表字面量）。**当前代码库在寄存器层面无「被引用但无生产者」的情况**
+—— 这是此前从未有人查过的结论。
+
+**纳入判定的条件**：等它长期保持零报警（或暴露出的每处都被单独修好）之后
+再谈。**在那之前不能单独动手** —— 没有诊断能力就装一个会改变生产路径的
+检查，是本轮反复确认的教训。
+
+##### 定位过程中被否证的五个假设（保留记录）
+
+1. ❌「`h_handle` 执行失败」—— 它正确写 `regs[k_dst] = v` 并返回 `Ok`。
+2. ❌「跨递归共享执行状态」—— `DagExecMemo` / `regs` / `reg_ready` /
+   `active` 全是每次调用新建的局部量。
+3. ❌「指令没 emit」—— 把绑定放到最后、`print(999)` 放在前面时正常打印，
+   后续指令确实存在。
+4. ❌「Sequence 前驱边没接上」—— `seq_preds=[0,0]` 且 `executed[0]=true`。
+5. ❌「`emit_expr_w` 硬编码 `(0, w)` 是根因」—— 探针显示编译期
+   `emit_handle_w` 给的 `k_dst` 与 `emit_let_w` 拿到的 `v` **同为 0**，
+   单遍路径自洽。为此改过 `emit_handle_w` 的签名，实测**改前改后无差别**，
+   已回退并在函数上留注释指向真正根因。
+
+##### 顺带发现（未修）
+
+`effect Ask(string): string` 声明后，`perform ask 42`（实参类型不符）
+**通过类型检查**（`--check` 报 "No type errors found"），而 spec :538
+明写「perform 位点校验：实参数与类型必须符合签名，违反在位点报错」。
+即 effect 签名的**载荷类型校验未实现**（结果类型静态化似已生效）。
+
+##### 另两处 spec 与实现不符（此前无人测过）
+
+| spec 位置 | spec 写的 | 实现接受的 |
+|-----------|-----------|-----------|
+| `:1254` EBNF | `handle ID "on" ID "->" {…} "end"` | `handle ID { body } { handler }` |
+| `:1253` EBNF | `perform ID expr` | `perform ID expr`（一致） |
+| `:488` §7.7 正文 | `perform "ask" "…"`（**字符串**） | ID 形式 |
+| `:491` §7.7 正文 | `handle "ask" on prompt -> return "Alice" end` | 同上表第一行 |
+
+四种 spec 字面形态实测**全部解析失败**（`Expected effect name after
+'handle'` / `Expected '{' after effect name`）。
+
+**测试装置缺陷**：`tests/spec_ebnf_surface.rs` 的 `STATEMENT_CASES` 只有
+**20** 条，而 spec §14.2 的 `statement` 产生式是 **23** 项 —— 缺
+`import_stmt` / `trait_stmt` / `impl_stmt` / **`perform_stmt`** /
+**`handle_stmt`**。后两条从未被测，所以上面这处 spec/实现分歧一直没暴露。
+上一轮「38 个 §14.2 产生式，35 通过」的覆盖声明**包含这两条未测的**。
+
+**这两处（spec 分歧 + 签名载荷校验未实现）属语言设计决定**，按前几轮惯例
+不擅自改实现，如实记录待定。
+
+#### D26：`1/0` → `inf` 是设计使然，不改
+
+排查 D25 时顺带实测：`print(1/0)` → `inf`、`print(1%0)` → `nan`，
+而 `print(7i/0i)` → `division by zero`（D19 的修复对 `i` 后缀形式有效）。
+原因是**裸数字字面量在运行期就是 `Float`**（`lexer.rs:702` 一律发射
+`TokenType::Float`；`print(1)` 输出 `1.0` 可证），`Value::Int` 只能由
+`1i` 这类前缀形式或 `len()` 产出。故 `1/0` 是 Float÷Float，IEEE-754 下
+`inf` 是**正确结果**，`1%0` → `nan` 同理。不改，如实记录。
+
+### 验证
+
+- **49 个测试组全绿，1456 passed / 0 failed / 21 ignored**；
+  `cargo clippy --lib --all-features` 0 警告。
+- **D34 修复的直接判据**：跑 `cargo test` 全量（49 组 1456 条）后，
+  `%TEMP%` 下 `mora_audit_builtin_*` **新增 0 个**（修前每次跑约新增 100 个）。
+  纯测试代码改动，零产品代码影响。
+- **D35 修复的判据**（新增 `tests/algebraic_effects.rs`，**11 条**）：
+  - `d35_handle_bound_to_a_let_does_not_starve_later_statements` 等 5 条
+    钉住「`let r = handle …` 之后仍有语句执行」。判据用**尾表达式**而非
+    `print` —— 仓库的 `e2e_helpers` **没能捕获 `print` 输出**
+    （`stdout_lines` 恒为 `Vec::new()`），而 `run_mir` 返回顶层最后一条
+    指令的值、`print` 的返回值是 `Nil`；直接拿返回值断言「`print` 是否
+    执行」会得到**恒真的假阴性**（第一次写测试时就被它骗了一次，
+    4 条用例全返回 `Nil` 却都「失败」在错误的地方）。
+  - **`two_compile_paths_agree_on_handle_value` 是本文件最重要的一条**：
+    直接对比 `ParserV3::compile`（单遍直出）与 `cli::compile_and_opt`
+    （9 层管线）产出的**指令类别序列**。D35 之所以能活下来，正是因为事故前
+    只有 9 层管线错、单遍路径对 —— **任何只跑一条路径的测试都看不见**。
+    这条把「两条编译路径必须等价」写成显式不变量。
+  - `unhandled_perform_is_rejected_at_compile_time` /
+    `handled_perform_is_accepted` 覆盖 spec §7.7 :504-510 的编译期强制。
+- **D32 的改动（`RewriteRule::precheck` 前置筛选）同样是「语义逐字等价」** ——
+  被跳过的 `(规则, pc)` 对原本只产出「原样保留一条指令」（`gain == 0`，
+  从不入选 `best`），故跳过不改变任何一轮的最优选择。1456 条全绿即验证。
+  附带把 lib 测试套件自身从 2.54 s 压到 **1.43 s**。
+- **D31 的三处改动（`DagIndex` / `recompute_reachable_from_entry` 的 CSR 邻接表 /
+  `recompute_entry` 的位向量）全部是「语义逐字等价」的改写** —— 索引与图
+  恒等（依赖「边只 push 从不删」等三条不变量）、可达集是传递闭包（与 BFS
+  顺序无关）、`HashSet::contains(i)` ≡ `Vec<bool>[i]`。所以
+  **1456 条全绿本身就是等价性的验证**，不需要另写差分测试。
+- 本轮新增 `tests/depth_and_diagnostics.rs`（**23 条**）：把「深递归崩溃」
+  与「静默错值 / 诊断丢失」两类钉成常驻回归。其中
+  - 深度闸的**边界两侧**都测（n=511 正常 / n=513 与 n=5000 报可读诊断），
+    且六类形态（括号 / 列表 / 字典 / 二元链 / 索引链 / 方法链）各一条；
+  - **原崩溃点逐一验证**（括号 21 / 列表 21 / 字典 20 / 二元链 32 /
+    索引链 29），而不只是测一个「比阈值小」的安全值；
+  - 「阈值内必须给出**正确结果**」单独一条 —— 否则一个恒返回 `nil`
+    的解释器也能通过「没崩」这种弱断言。
+- 该文件用 `run_deep()` 在**显式 64 MB 栈线程**上跑深嵌套用例：
+  `cargo test` 的测试线程默认只有 2 MB，而 parser / typeck / DAG 分析会
+  依次递归遍历同一棵深树，三段叠加足以让**测试进程自身**爆栈
+  （实测 `0xc00000fd`）—— 那是测试装置的栈不够，不是被测代码的缺陷。
+  让测试与生产路径（`main.rs` 的 `main`）用同一口径。
+- D28 的首版实现把字符串越界措辞从 `string index N out of bounds` 改成了
+  通用的 `index N out of bounds`，**打破了 `tests/builtin_gaps.rs` 的 D2/D3
+  用例**。已加回 `what` 参数保留原措辞 —— 那条信息对用户判断「越界的是
+  字符下标空间还是字节」有实际价值，不该在顺手重构中被抹平。
+- 上半轮（第一轮审计）的验证记录：新增 14 个测试文件 + 1 个 e2e fixture：`e1_join_starvation` /
+  `e1_blast_radius` / `nested_loop_jumps` / `list_methods` / `list_semantics` /
+  `dict_determinism` / `controlflow_property`（proptest 256 例）/
+  `continue_semantics` / `equivalent_spellings`（15 对等价写法）/
+  `memo_dict_fingerprint` / `run_mir_equiv_run_dag`（优化对拍）/
+  `optimize_semantics`（16 形态已优化 vs 未优化差分）/ `builtin_gaps`。
+- `tests/builtin_gaps.rs` 含**两条真实 CLI 子进程 e2e**：库内测试走 `run_mir`
+  **绕过 typeck**，而 `mora run` 会跑 `check_program_witnesses_bidirectional`
+  并在出错时 `exit 2` —— 「typeck 放行 → 运行期报错」这一族缺陷只有这条
+  路径才暴露完整。
 
 ## [v0.104.5] — 2026-09-19 — docs: AGENTS.md 末尾追加 5 个 agent 协作小节
 

@@ -43,11 +43,24 @@ impl Interpreter {
                     .first()
                     .map(|v| v.to_string())
                     .ok_or("ccr.marker: requires hash as first arg")?;
-                let size = if let Some(Value::Float(n)) = args.get(1) {
-                    *n as usize
-                } else {
-                    0
-                };
+                // v0.104.6 D150：此前只匹配 `Value::Float`，于是**合法的 `Int`**
+                // （如 `len(...)`）被静默丢弃、size 变 0，exit 0 零诊断
+                // （实测 `ccr.marker("abcdef", 8)` → `<<ccr:abcdef,8>>`，
+                //  同样的 8 用 `len()` 传入 → `<<ccr:abcdef,0>>`）。
+                //
+                // ⚠ 负数尺寸**当前饱和成 0**（`as usize`），这是 **D339 明确记录的
+                // 「不修、只钉现状 + 报告」**的产品契约决定：负尺寸该报错还是当 0，
+                // 属产品契约。判据 `tests/tea_max_steps_guard.rs::
+                // d339_ccr_marker_negative_size_still_becomes_zero_for_both_types`
+                // 钉着它；`tests/ccr_marker_size_guard.rs`（D404）补齐了
+                // 负值/非有限值/缺省/小数截断的完整矩阵与可达性分析。
+                //
+                // v0.104.6 D404：我一度把它改成「负数报错」（走
+                // `flow::value_as_usize` 收口），**随后回退** ——
+                // 理由见 CHANGELOG D404「一次真实的自我否决」。
+                let size = optional_num_arg(args, 1, "ccr.marker", "size")?
+                    .map(|n| n as usize)
+                    .unwrap_or(0);
                 Ok(Value::String(crate::ccr::make_marker(&hash, size)))
             }
             "extract" => {

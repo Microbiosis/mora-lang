@@ -50,6 +50,12 @@ impl Search {
     }
 
     /// 取下一个解；队列耗尽返回 `None`。
+    ///
+    /// ⚠ **无步数上界**（Prolog 终止性模型，见 `rel/mod.rs` 的模块说明）：
+    /// 左递归规则（`rel loop2(x) loop2(x) end`）会让队列永不排空，
+    /// 本调用**永不返回**。`solve N` 的 `limit` 只在**两次解之间**检查
+    /// （`h_solve` 的循环），因此**挡不住这种情况** ——
+    /// 详见 D397 的 CHANGELOG 条目（属产品策略决定，**本轮不擅改**）。
     pub fn next_solution(&mut self, host: &mut dyn RelHost) -> Result<Option<Subst>, String> {
         while let Some((mut chain, s)) = self.queue.pop_front() {
             let Some(goal) = chain.pop_front() else {

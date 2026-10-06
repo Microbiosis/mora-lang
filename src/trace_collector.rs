@@ -255,18 +255,107 @@ impl Drop for SpanHandle {
     }
 }
 
+/// v0.104.6 D240：转发到共享的 `flow::escape_json_string`。
+///
+/// 修前这是同一 JSON 转义规则的**又一份实现**（全仓共 4 处手写表：
+/// `flow/json.rs` 本体、`lsp/json.rs`、`audit/mod.rs`、本函数）。
+///
+/// 全码点空间实测与共享实现的差异恰为 2 处：
+/// `U+0008`（退格）与 `U+000C`（换页）—— 本实现产出 `\u0008` / `\u000c`
+/// （**合法** JSON，外部 `json.loads` 能读、往返无损，D240 已用 Python
+/// 验证过 Jaeger span 的完整往返）。故**修前无功能后果**。
+///
+/// 收敛的理由与 D239 的 `record::esc` 相同：这些表**看似等价、实则各自
+/// 漂移**，下一轮若有人只改其中一份，trace 输出的字节会静默变化。
+/// 协议层的 `lsp/json.rs` **有意保持独立**（JSON-RPC 线缆格式不应
+/// 依赖语言层），故不收敛。
 fn escape_json(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
-            c => out.push(c),
+    crate::flow::escape_json_string(s)
+}
+
+#[cfg(test)]
+mod d240_tests {
+    use super::escape_json;
+
+    /// v0.104.6 D240：trace 的转义表必须与共享实现**逐字节相同**。
+    ///
+    /// 这些表「看似等价、实则各自漂移」：全码点空间实测，
+    /// 本实现修前与共享实现的差异恰为 `U+0008` / `U+000C` 两处。
+    /// 虽无功能后果（外部 `json.loads` 能读、往返无损，D240 已用 Python
+    /// 验证过完整 Jaeger span），但下一轮只改一份就会让 trace 字节静默变化。
+    ///
+    /// 判据用**全码点穷举**而非抽查 —— 抽查只能证明「这几个字符没问题」。
+    #[test]
+    fn d240_escape_json_matches_shared_implementation() {
+        let mut diffs: Vec<String> = Vec::new();
+        for cp in 0u32..=0x10FFFF {
+            let Some(c) = char::from_u32(cp) else {
+                continue; // 代理项不是合法标量值
+            };
+            let s = c.to_string();
+            let a = escape_json(&s);
+            let b = crate::flow::escape_json_string(&s);
+            if a != b {
+                diffs.push(format!("U+{cp:06X} {c:?}: trace={a:?} flow={b:?}"));
+                if diffs.len() >= 10 {
+                    break;
+                }
+            }
         }
+        assert!(
+            diffs.is_empty(),
+            "D240: `trace_collector::escape_json` 与共享的 \
+             `flow::escape_json_string` 产出不一致。全码点空间共 {} 处差异：\n  {}",
+            diffs.len(),
+            diffs.join("\n  ")
+        );
     }
-    out
+
+    /// v0.104.6 D240 对照组：产出必须是**合法 JSON 字符串体**。
+    ///
+    /// trace 的产出是 OpenTelemetry / Jaeger 的 span JSON，
+    /// 要被**外部 APM 系统**解析，所以「能被 `json.loads` 读」才是契约。
+    /// 本条用手写的最小校验器逐字节检查（不引 serde）。
+    #[test]
+    fn d240_escape_json_output_is_valid_json_string_body() {
+        let mut bad: Vec<String> = Vec::new();
+        for cp in 0u32..=0x10FFFF {
+            let Some(c) = char::from_u32(cp) else {
+                continue;
+            };
+            let body = escape_json(&c.to_string());
+            let bytes = body.as_bytes();
+            let mut i = 0;
+            while i < bytes.len() {
+                if bytes[i] == b'\\' {
+                    if i + 1 >= bytes.len() {
+                        bad.push(format!("U+{cp:06X} 反斜杠在末尾: {body:?}"));
+                        break;
+                    }
+                    let next = bytes[i + 1];
+                    if !matches!(
+                        next,
+                        b'"' | b'\\' | b'/' | b'b' | b'f' | b'n' | b'r' | b't' | b'u'
+                    ) {
+                        bad.push(format!("U+{cp:06X} 非法转义: {body:?}"));
+                        break;
+                    }
+                    i += if next == b'u' { 6 } else { 2 };
+                } else if bytes[i] < 0x20 {
+                    bad.push(format!("U+{cp:06X} 裸控制字符: {body:?}"));
+                    break;
+                } else {
+                    i += 1;
+                }
+            }
+            if bad.len() >= 10 {
+                break;
+            }
+        }
+        assert!(
+            bad.is_empty(),
+            "D240: `escape_json` 对某些码点产出的不是合法 JSON 字符串体：\n  {}",
+            bad.join("\n  ")
+        );
+    }
 }

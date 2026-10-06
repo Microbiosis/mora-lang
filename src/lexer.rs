@@ -111,6 +111,11 @@ pub enum TokenType {
     Amp,              // v0.21: '&' 借用
     AmpMut,           // v0.21: '&mut' 可变借用
     Lifetime(String), // v0.21: 'a 生命周期标注
+    /// v0.104.6 D202：`--` 行注释的**正文**（不含 `--`）。
+    ///
+    /// 仅在 `Lexer::keep_comments(true)` 时产生；默认（parser 走的路径）
+    /// 注释仍被**静默丢弃**，与修前逐字一致 —— 见该分支的说明。
+    Comment(String),
     Newline,
     EOF,
 }
@@ -127,6 +132,61 @@ pub struct Lexer {
     current: usize,
     line: usize,
     column: usize,
+    /// v0.104.6 D202：`--` 注释是否**作为 token 发出**。
+    ///
+    /// 默认 `false` —— 注释被静默丢弃。**只有** `LSP 格式化器`
+    /// （`lsp/providers/formatting.rs`）打开它，因为那条路径要从 token 流
+    /// **重建整份文档**，lexer 不发的东西就等于不存在（见 D202）。
+    ///
+    /// 保持默认关闭的收益：parser / typeck / interpreter **一行都不用改**，
+    /// 也就不会有「parser 突然开始看见 `Comment` token」的风险。
+    keep_comments: bool,
+}
+
+/// 数值字面量**超出 f64 可表示范围**时报错，而非静默产出 `inf` / `0.0`。
+///
+/// v0.104.6 D27：超范围字面量**静默变成 `inf`**。
+///
+/// 本语言所有裸数字字面量都是 `Value::Float`（本函数的调用点，无 `i`/`f`/
+/// `n` 后缀时统一走 `TokenType::Float`），而 `f64::from_str` 对溢出是
+/// **饱和**的 —— 超出 f64 max（约 1.797e308）时返回 `inf` 而非 `Err`：
+///
+/// ```text
+/// print(1` + 309 个 0 + `)   # inf，exit 0，无任何提示
+/// print(` + 400 个 9 + `)    # inf，exit 0，无任何提示
+/// ```
+///
+/// 这与本语言 v0.104.6 D21（BigInt 越 i64 后改走原生大数、**不再静默饱和**）
+/// 直接矛盾：用户能写 `100000000000000000000n` 拿到精确值，却写不出同一个
+/// 数的普通字面量形式 —— 少写一个 `n` 就从精确值变成 `inf`。
+///
+/// 判据与 Rust 自身一致（`let x = 1e400f64;` 在 Rust 里是编译错误
+/// "literal out of range for f64"）：**字面量必须可表示**。
+/// 下溢到 `0.0` 同样处理 —— Rust 对 `1e-400f64` 也报 out of range。
+/// 真正的 `0` / `0.0` / `0e5` 文本里没有非零数字位，不受影响。
+///
+/// 返回 `Some(msg)` 表示该字面量不可表示；可表示时返回 `None`。
+fn literal_range_error(text: &str, parsed: f64) -> Option<String> {
+    let has_nonzero_digit = text.chars().any(|c| ('1'..='9').contains(&c));
+    if parsed.is_infinite() {
+        let shown = if text.len() > 24 {
+            format!("{}… ({} 位)", &text[..24], text.len())
+        } else {
+            text.to_string()
+        };
+        return Some(format!(
+            "Float literal out of range: {} exceeds f64 max (~1.797e308). \
+             Use a BigInt literal (append `n`) for exact large integers.",
+            shown
+        ));
+    }
+    if parsed == 0.0 && has_nonzero_digit {
+        return Some(format!(
+            "Float literal out of range: {} underflows to 0 (f64 min normal ~2.2e-308)",
+            text
+        ));
+    }
+    None
 }
 
 impl Lexer {
@@ -146,7 +206,16 @@ impl Lexer {
             current: 0,
             line: 1,
             column: 1,
+            keep_comments: false,
         }
+    }
+
+    /// v0.104.6 D202：让 `--` 注释**作为 token 发出**（供格式化器重建文档用）。
+    ///
+    /// 默认关闭。见 `keep_comments` 字段的说明。
+    pub fn keep_comments(mut self, on: bool) -> Self {
+        self.keep_comments = on;
+        self
     }
 
     pub fn scan_tokens(&mut self) -> Vec<Token> {
@@ -251,10 +320,33 @@ impl Lexer {
             '+' => Self::simple_token(TokenType::Plus, start_line, start_col),
             '-' => {
                 if self.match_char('-') {
+                    // v0.104.6 D202：注释正文（不含 `--`）。
+                    //
+                    // 修前这个分支**只前进不产出** —— 注释在 token 流里彻底不存在。
+                    // 对 parser 而言这是对的（它不需要注释），但 `LSP 格式化器`
+                    // 是**从 token 流重建整份文档**的：lexer 不发的东西
+                    // 就等于不存在，于是「格式化」会**静默删光文件里所有注释**
+                    // （实测 5 行含 3 处 `--` 的源码 → 4 行 0 注释，
+                    //  而服务器声明了 `documentFormattingProvider: true`，
+                    //  编辑器「保存时格式化」一按，用户的注释就没了）。
+                    //
+                    // 故加 `keep_comments` 开关：**只有**格式化器打开它，
+                    // parser 那条路径行为逐字不变。
+                    let mut body = String::new();
                     while self.peek() != '\n' && !self.is_at_end() {
-                        self.advance();
+                        body.push(self.advance());
                     }
-                    self.next_token()
+                    if self.keep_comments {
+                        // 去掉行尾 `\r`（CRLF 文件）—— 它不是注释内容
+                        let body = body.strip_suffix('\r').unwrap_or(&body);
+                        Self::simple_token(
+                            TokenType::Comment(body.to_string()),
+                            start_line,
+                            start_col,
+                        )
+                    } else {
+                        self.next_token()
+                    }
                 } else if self.match_char('>') {
                     Self::simple_token(TokenType::Arrow, start_line, start_col)
                 } else {
@@ -606,20 +698,33 @@ impl Lexer {
         }
         // v0.38: detect `i` / `u` / `f` / `I` suffix for Int/Number/Float.
         // v0.91: 加 `n` / `N` 后缀 → BigInt 字面量
-        let mut value: String = self.source[start..self.current].iter().collect();
+        let value: String = self.source[start..self.current].iter().collect();
         let mut suffix: Option<char> = None;
+        // v0.104.6 D356：宽度数字**只被消费、不混进 `value`**。
+        //
+        // 修前 `value.push(self.advance())` 把宽度直接追加到数值串上，
+        // 而 `'f'` 分支是 `value.parse()`（**不做** take_while 截断）⇒
+        // 宽度被当成**数值**拼进去：
+        //
+        // ```text
+        // 1.5f32  → 1.532      ← 1.5 + "32" 被解析
+        // 1f32    → 132.0
+        // ```
+        //
+        // `i` / `u` / `n` 分支靠 `take_while(is_ascii_digit)` **侥幸**没受影响
+        // —— 那是巧合（依赖宽度首字符是 ASCII 数字），不是设计。
+        // Mora 不建模位宽（见 `'u'` 分支注释），宽度只需被消费。
         if matches!(self.peek(), 'i' | 'I' | 'u' | 'U' | 'f' | 'F' | 'n' | 'N') {
             suffix = Some(self.advance());
-            // Optional width: 8/16/32/64.
+            // Optional width: 8/16/32/64（其它数字也照常消费，不报错 —— 见下）。
             while self.peek().is_ascii_digit() {
-                value.push(self.advance());
+                self.advance();
             }
         }
         let tt = if let Some(s) = suffix {
             match s {
                 'i' | 'I' => {
-                    // Parse as integer — strip the trailing width digits
-                    // and suffix character before parsing the body.
+                    // 宽度已由上面单独收集（D356），`value` 本身就是纯数字。
                     let digits: String = value
                         .chars()
                         .take_while(|c| c.is_ascii_digit() || *c == '-')
@@ -653,10 +758,8 @@ impl Lexer {
                     }
                 }
                 'f' | 'F' => {
-                    // Float — re-parse with suffix stripped (was parsed as
-                    // a partial number above). The trailing chars we
-                    // appended are width digits ('32'/'64'), which are
-                    // safe to drop.
+                    // v0.104.6 D356：宽度已单独收集，此处 `value` 是**纯数值串**，
+                    // 可直接 parse（修前宽度混在串里 ⇒ `1.5f32` → 1.532）。
                     let num: f64 = match value.parse() {
                         Ok(n) => n,
                         Err(_) => {
@@ -667,6 +770,9 @@ impl Lexer {
                             );
                         }
                     };
+                    if let Some(msg) = literal_range_error(&value, num) {
+                        return self.error_token(start_line, start_col, &msg);
+                    }
                     TokenType::Float(num)
                 }
                 // v0.91: BigInt 字面量 `<digits>n` — 任意精度
@@ -699,6 +805,9 @@ impl Lexer {
                     );
                 }
             };
+            if let Some(msg) = literal_range_error(&value, num) {
+                return self.error_token(start_line, start_col, &msg);
+            }
             TokenType::Float(num)
         };
         Token {

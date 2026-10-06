@@ -273,7 +273,7 @@ mod tests {
     #[test]
     fn test_value_cost_list_sum() {
         let cost = TokenEstimate;
-        let list = Value::List(vec![Value::Int(1), Value::Int(2), Value::Int(3)]);
+        let list = Value::List(vec![Value::Int(1), Value::Int(2), Value::Int(3)].into());
         // [1, 2, 3] → 2 (括号) + 1+1+1 (每个 Int 1 token) + 2 (分隔符) = 7
         assert_eq!(cost.value_cost(&list), 7);
     }

@@ -74,24 +74,18 @@ fn is_leap(year: i32) -> bool {
 ///
 /// ## {category}
 ///
-/// - {text}
+/// - {text 的第一行}
+///   {text 的续行，每行缩进两格}
 ///
 /// ## {other_category}
 ///
 /// - {text}
 /// ```
-/// 文件格式:
-/// ```text
-/// # YYYY-MM-DD
 ///
-/// ## {category}
-///
-/// - {text}
-///
-/// ## {other_category}
-///
-/// - {text}
-/// ```
+/// **续行必须缩进**（v0.104.6 D220）：多行文本的续行若原样写出，
+/// `recall_markdown` 只收集以 `- ` 开头的行 ⇒ 其余各行**静默丢失**。
+/// 缩进两格同时让续行既不像新 bullet 也不像新 `## ` 段，
+/// 于是文本里本来就有 `- x` / `## y` 的行也不会被误判。
 fn remember_markdown(
     override_dir: Option<&std::path::Path>,
     category: &str,
@@ -112,25 +106,64 @@ fn remember_markdown(
     let mut new_content = if existing.is_empty() {
         format!("# {}\n\n", today_date_string())
     } else {
-        existing.clone()
+        existing
     };
 
-    // 检查 category section 是否已存在
     let section_header = format!("## {}", category);
-    if new_content.contains(&section_header) {
-        // 追加 bullet 到现有 section (section_header 不需要再使用)
-        // 追加 bullet 到现有 section
-        new_content.push_str(&format!("- {}\n", text));
-    } else {
-        // 新建 section
-        new_content.push_str(&format!("\n{}\n\n- {}\n", section_header, text));
+    let bullet = format!("- {}\n", indent_continuation(text));
+    // v0.104.6 D221：必须**按整行**精确匹配 `## {category}`，
+    // 且追加到**该段末尾**（下一个 `## ` 行之前），而不是文件末尾。
+    //
+    // 修前是 `new_content.contains(&section_header)` —— 整文件**子串**匹配：
+    //
+    // ① 前缀冲突：`remember("notes-archive", …)` 之后
+    //    `contains("## notes")` 为**真** ⇒ `remember("notes", …)` 的条目被
+    //    追加到 `notes-archive` 段里，而 `## notes` 段**从未创建**：
+    //        recall_markdown("notes")          = 空
+    //        recall_markdown("notes-archive") = 两条都在
+    //    零诊断、exit 0。
+    // ② 段不在文件末尾时：追加到**文件末尾**会落进**下一个**段 ——
+    //    `remember("a")` `remember("b")` `remember("a")` 三条即触发。
+    match find_section(&new_content, &section_header) {
+        Some(pos) => {
+            let at = section_end(&new_content, pos);
+            new_content.insert_str(at, &bullet);
+        }
+        None => {
+            new_content.push_str(&format!("\n{}\n\n{}", section_header, bullet));
+        }
     }
 
-    // 写回 (原子性: write to temp + rename, 简化版直接 overwrite)
+    // 写回
     let mut f = std::fs::File::create(&path)?;
     f.write_all(new_content.as_bytes())?;
     f.flush()?;
     Ok(())
+}
+
+/// 找 `## {name}` **整行**的字节偏移（不做子串匹配）。
+fn find_section(content: &str, name: &str) -> Option<usize> {
+    let mut off = 0usize;
+    for line in content.split_inclusive('\n') {
+        if line.trim_end() == name {
+            return Some(off);
+        }
+        off += line.len();
+    }
+    None
+}
+
+/// 该 section 的**结束**偏移：下一个 `## ` 行之前；没有则到文件末尾。
+fn section_end(content: &str, header_pos: usize) -> usize {
+    match content[header_pos..].find("\n## ") {
+        Some(i) => header_pos + i + 1,
+        None => content.len(),
+    }
+}
+
+/// 多行文本的续行缩进两格。
+fn indent_continuation(text: &str) -> String {
+    text.replace("\r\n", "\n").replace('\n', "\n  ")
 }
 
 /// v0.43.1: recall_markdown(category) — 读所有 markdown 文件, 找 ## category 段, 拼接 bullets
@@ -154,19 +187,50 @@ fn recall_markdown(
 
     for entry in entries {
         let content = std::fs::read_to_string(entry.path()).unwrap_or_default();
-        // 找到 ## {category} 段, 收集直到下一个 ## 或文件末尾
+        // 找到 `## {category}` 段，收集到下一个 `## ` 或文件末尾。
+        //
+        // v0.104.6 D220/D222：条目的**续行**（缩进两格）也要收进来，
+        // 且只剥**一个** `- ` —— 修前用 `trim_start_matches("- ")`
+        // （剥掉**所有**前导 `- `），于是 `remember("d", "- x")`
+        // 存的是 `- - x`、读回却变成 `x`：**前缀被吃掉**。
         let mut in_section = false;
+        let mut cur: Option<String> = None;
         for line in content.lines() {
             if let Some(header) = line.strip_prefix("## ") {
+                flush_entry(&mut cur, &mut out);
                 in_section = header.trim() == category.trim();
-            } else if in_section && line.starts_with("- ") {
-                out.push_str(line.trim_start_matches("- "));
-                out.push('\n');
+                continue;
+            }
+            if !in_section {
+                cur = None;
+                continue;
+            }
+            if let Some(item) = line.strip_prefix("- ") {
+                flush_entry(&mut cur, &mut out);
+                cur = Some(item.to_string());
+            } else if let Some(cont) = line.strip_prefix("  ") {
+                // 续行：拼回同一条目
+                if let Some(buf) = cur.as_mut() {
+                    buf.push('\n');
+                    buf.push_str(cont);
+                }
+            } else {
+                // 空行 / 其它 → 当前条目结束
+                flush_entry(&mut cur, &mut out);
             }
         }
+        flush_entry(&mut cur, &mut out);
     }
 
     Ok(out)
+}
+
+/// 把累积中的条目刷进输出（每条一行）。
+fn flush_entry(cur: &mut Option<String>, out: &mut String) {
+    if let Some(s) = cur.take() {
+        out.push_str(&s);
+        out.push('\n');
+    }
 }
 
 /// v0.43.1: list_markdown_categories() — 列出所有 markdown 文件中出现过的 ## section 标题
@@ -205,7 +269,17 @@ impl Interpreter {
                     .first()
                     .map(|v| v.to_string())
                     .ok_or("memory.store: requires key")?;
-                let value = args.get(1).cloned().unwrap_or(Value::Nil);
+                // v0.104.6 D51：value 此前静默兜底成 `Nil`（`unwrap_or`），
+                // 而**同一函数**里 key 那一侧是 `.ok_or(..)` 报错 —— 验证
+                // 不对称。实测 `memory.store("k1")` 随后 `memory.recall("k1")`
+                // 返回 `nil`，exit 0、零提示：用户以为存了，实际存进去的是空。
+                //
+                // 该 namespace 在 spec 里**零记载**、typeck 也**零签名**，
+                // 故没有编译期 arity 兜底，只能在此处拦。
+                let value = args
+                    .get(1)
+                    .cloned()
+                    .ok_or("memory.store: requires a value")?;
                 self.registry.memory_store.insert(key, value);
                 Ok(Value::Nil)
             }
@@ -239,7 +313,7 @@ impl Interpreter {
                         Value::Dict(m)
                     })
                     .collect();
-                Ok(Value::List(results))
+                Ok(Value::List(results.into()))
             }
             "forget" => {
                 let key = args
@@ -297,13 +371,25 @@ impl Interpreter {
                     .map_err(|e| format!("memory.list_markdown: {}", e))
             }
             "keys" => {
-                let keys: Vec<Value> = self
-                    .registry
-                    .memory_store
-                    .keys()
-                    .map(|k| Value::String(k.clone()))
-                    .collect();
-                Ok(Value::List(keys))
+                // v0.104.6 D406：**按 key 排序**返回。
+                //
+                // 修前直接收集 `HashMap::keys()` ⇒ 迭代序由 `RandomState`
+                // （**逐进程随机**）决定。实测同一脚本连跑 5 次：
+                // ```text
+                // [bravo, delta, echo, alpha, charlie]
+                // [echo, alpha, bravo, delta, charlie]
+                // [delta, alpha, charlie, echo, bravo]   …（5 次全不同）
+                // ```
+                // 而 `memory.keys()[0]`（「第一个键」）每次拿到**不同的键**。
+                //
+                // 这与 `method_dispatch.rs` 里 `dict.keys()` 的注释描述的是
+                // **同一个危害**（「用户按 keys()[0] 取第一个键会拿到随机结果
+                // —— 且**不报错**」）—— `dict` 侧已修并有
+                // `tests/dict_determinism.rs` 守护，`memory` 侧**漏了**。
+                // 本条把它补齐，口径与 `dict.keys()` / `mock.names()` 一致。
+                let mut keys: Vec<String> = self.registry.memory_store.keys().cloned().collect();
+                keys.sort();
+                Ok(Value::List(keys.into_iter().map(Value::String).collect()))
             }
             "save" => {
                 let path = args

@@ -89,7 +89,22 @@ fn summarize_event(ev: &Event) -> String {
         Event::Msg {
             channel, payload, ..
         } => format!("msg channel={} payload={:?}", channel, payload),
-        Event::StateMutation { var, .. } => format!("state_mutation var={}", var),
+        // v0.104.6 D176：原先摘要**只取 `var`（变量名），把 `old` / `new` 两个值
+        // 整个丢掉**。后果是「同一变量名、值不同」被判成 identical ——
+        // 两次运行 `let score = 42` vs `let score = 99999`，
+        // `mora diff` 报 `identical=2 changed=0`。
+        //
+        // 而 JSONL 里**数据是齐的**（`"new":42.0` vs `"new":99999.0`），
+        // 即：不是没录到，是比对时自己扔了。state mutation 记录的是
+        // agent 的状态/记忆变化，**值变化本身就是结果** ——
+        // 丢它等于让这份录像的 diff 面对最该发现的那类差异失明。
+        Event::StateMutation { var, old, new, .. } => {
+            // 与上面 AiChat 的 `resp` 同一套截断口径（60 字符），
+            // 免得长 dict/list 把对齐的 diff 输出冲垮。
+            let old_s: String = old.to_string().chars().take(40).collect();
+            let new_s: String = new.to_string().chars().take(40).collect();
+            format!("state_mutation var={} {} -> {}", var, old_s, new_s)
+        }
     }
 }
 

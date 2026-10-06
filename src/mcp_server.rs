@@ -80,8 +80,21 @@ pub fn builtin_toolsets() -> HashMap<String, Vec<String>> {
         "ai".to_string(),
         vec![
             "ai.chat".to_string(),
-            "ai.stream".to_string(),
-            "ai.create".to_string(),
+            // v0.104.6 D186：删掉 `ai.stream` / `ai.create`。
+            //
+            // 此前这两个名字在本目录里被当作「可用的 MCP 工具」列出去，但
+            // **全仓没有任何实现** —— 实测：
+            //
+            // ```text
+            // $ mora mcp tool-list        →  ai.stream / ai.create 在列
+            // $ let q = ai.stream(p"hi")  →  Runtime error: Unknown method: AiChat.stream
+            // $ let q = ai.create("x",{}) →  Runtime error: Unknown method: AiChat.create
+            // ```
+            //
+            // `ai.create` 已由 `tests/ai_namespace_reachability.rs`（D59）记为
+            // 源码不可达；`ai.stream` 的 `Value::Stream` 更是一个**从未被构造**
+            // 的死变体（同样 D59）。把它们列在一个标着「MCP Tools」的单子下，
+            // 外部 agent 照着接线就会调不通 —— **自省不能宣称做不到的事**。
             "ai.critic".to_string(),
         ],
     );
@@ -190,11 +203,19 @@ pub async fn start(
             });
         } else {
             // 请求同步处理并回写响应
-            let response = dispatch(&req, &tool_registry, &interpreter).await;
-            if let Some(resp) = response {
-                let resp_str = json_to_string(&resp);
-                write_message(&mut writer, &resp_str).await?;
-            }
+            //
+            // v0.104.6 D213：按 `Reply` 分发 —— 错误走 `wrap_error`
+            // （`error` 在**顶层**），成功走 `wrap_response`（`result` 在顶层）。
+            // 二者互斥，且由**类型**保证不会再混（修前错误被裹进 `result`，
+            // 客户端找不到顶层 `error`，于是把每次失败都当成成功）。
+            let id = req.get("id").cloned().unwrap_or(JsonValue::Null);
+            let resp = match dispatch(&req, &tool_registry, &interpreter).await {
+                Some(Reply::Result(r)) => wrap_response(id, r),
+                Some(Reply::Error(code, msg)) => wrap_error(id, code, &msg),
+                None => continue,
+            };
+            let resp_str = json_to_string(&resp);
+            write_message(&mut writer, &resp_str).await?;
         }
     }
     Ok(())
@@ -244,54 +265,58 @@ async fn write_message<W: AsyncWriteExt + Unpin>(writer: &mut W, body: &str) -> 
 
 /// dispatch 一条 JSON-RPC 请求
 /// 返回 None 表示是 notification (不响应)
+/// v0.104.6 D213：`dispatch` 的返回值。
+///
+/// 修前只有一个 `Option<JsonValue>` 通道，**错误与结果载荷挤在一起**：
+/// 所有错误都被当成「结果」交给 `wrap_response` 裹成
+/// `{"jsonrpc","id","result": <错误>}` —— 而 JSON-RPC 2.0 规定 `error`
+/// 必须在**顶层**。客户端找顶层 `error` 找不到 ⇒ **每次失败都被当成成功**。
+///
+/// 实测（真实 MCP stdio 会话，4 条错误路径全中）：
+///
+/// ```text
+/// 未知 method (resources/list) → result = {"error":{…},"id":4,"jsonrpc":"2.0"}
+/// 未知 method (ping)            → result = {"error":{…},"id":7,"jsonrpc":"2.0"}
+/// tools/call 未知工具名          → result = {"code":-32602,"message":"Unknown tool: …"}
+/// tools/call 缺 name            → result = {"code":-32602,"message":"Missing 'name' in params"}
+/// ```
+///
+/// 注意两种形状还**互不一致**（前者嵌的是整份应答、连 `jsonrpc`/`id` 都重复了一遍）。
+/// 拆成两个变体后，错误与结果在**类型上**就不可能再混。
+enum Reply {
+    Result(JsonValue),
+    Error(i64, String),
+}
+
 async fn dispatch(
     req: &JsonValue,
     tools: &ToolRegistry,
     interp: &Arc<RwLock<Interpreter>>,
-) -> Option<JsonValue> {
+) -> Option<Reply> {
     let method = req.get("method").and_then(|v| v.as_str())?;
     let id = req.get("id").cloned();
 
     // notification 没 id
     let is_notification = id.is_none();
 
-    let result = match method {
-        "initialize" => Some(handle_initialize(req)),
-        "tools/list" => Some(handle_tools_list(tools).await),
+    let reply = match method {
+        "initialize" => Some(Reply::Result(handle_initialize(req))),
+        "tools/list" => Some(Reply::Result(handle_tools_list(tools).await)),
         "tools/call" => Some(handle_tools_call(req, tools, interp).await),
         _ => {
-            // 未知 method
-            if !is_notification {
-                let id_clone = id.clone().unwrap_or(JsonValue::Null);
-                Some(JsonValue::Object({
-                    let mut m = std::collections::BTreeMap::new();
-                    m.insert("jsonrpc".to_string(), JsonValue::String_("2.0".to_string()));
-                    m.insert("id".to_string(), id_clone);
-                    m.insert(
-                        "error".to_string(),
-                        JsonValue::Object({
-                            let mut e = std::collections::BTreeMap::new();
-                            e.insert("code".to_string(), JsonValue::Number(-32601.0));
-                            e.insert(
-                                "message".to_string(),
-                                JsonValue::String_(format!("Method not found: {}", method)),
-                            );
-                            e
-                        }),
-                    );
-                    m
-                }))
-            } else {
+            // 未知 method —— 顶层错误，**不再**包进 result
+            if is_notification {
                 None
+            } else {
+                Some(Reply::Error(
+                    -32601,
+                    format!("Method not found: {}", method),
+                ))
             }
         }
     };
 
-    if is_notification {
-        None
-    } else {
-        result.map(|r| wrap_response(id.unwrap_or(JsonValue::Null), r))
-    }
+    if is_notification { None } else { reply }
 }
 
 fn wrap_response(id: JsonValue, result: JsonValue) -> JsonValue {
@@ -299,6 +324,18 @@ fn wrap_response(id: JsonValue, result: JsonValue) -> JsonValue {
     m.insert("jsonrpc".to_string(), JsonValue::String_("2.0".to_string()));
     m.insert("id".to_string(), id);
     m.insert("result".to_string(), result);
+    JsonValue::Object(m)
+}
+
+/// v0.104.6 D213：**顶层** JSON-RPC 错误应答。
+///
+/// `{"jsonrpc":"2.0","id":<id>,"error":{"code":…,"message":…}}`
+/// —— `error` 与 `result` 同级，**互斥**。
+fn wrap_error(id: JsonValue, code: i64, message: &str) -> JsonValue {
+    let mut m = std::collections::BTreeMap::new();
+    m.insert("jsonrpc".to_string(), JsonValue::String_("2.0".to_string()));
+    m.insert("id".to_string(), id);
+    m.insert("error".to_string(), mcp_error(code, message));
     JsonValue::Object(m)
 }
 
@@ -355,12 +392,12 @@ async fn handle_tools_call(
     req: &JsonValue,
     tools: &ToolRegistry,
     interp: &Arc<RwLock<Interpreter>>,
-) -> JsonValue {
+) -> Reply {
     // parse params.name and params.arguments
     let params = req.get("params");
     let name = match params.and_then(|p| p.get("name")).and_then(|n| n.as_str()) {
         Some(n) => n.to_string(),
-        None => return mcp_error(-32602, "Missing 'name' in params"),
+        None => return Reply::Error(-32602, "Missing 'name' in params".to_string()),
     };
     let args_json = params
         .and_then(|p| p.get("arguments"))
@@ -374,7 +411,7 @@ async fn handle_tools_call(
     };
     let tool = match tool {
         Some(t) => t,
-        None => return mcp_error(-32602, &format!("Unknown tool: {}", name)),
+        None => return Reply::Error(-32602, format!("Unknown tool: {}", name)),
     };
 
     // 把 args 转成 Mora Value
@@ -394,7 +431,7 @@ async fn handle_tools_call(
     .await;
 
     match result {
-        Ok(Ok(v)) => {
+        Ok(Ok(v)) => Reply::Result({
             // 转成 MCP content 格式
             let result_json = mora_to_json(&v);
             let content_item = match result_json {
@@ -419,9 +456,9 @@ async fn handle_tools_call(
             let mut result_map = std::collections::BTreeMap::new();
             result_map.insert("content".to_string(), JsonValue::Array(vec![content_item]));
             JsonValue::Object(result_map)
-        }
-        Ok(Err(e)) => mcp_error(-32603, &format!("Tool execution error: {}", e)),
-        Err(e) => mcp_error(-32603, &format!("Task panicked: {}", e)),
+        }),
+        Ok(Err(e)) => Reply::Error(-32603, format!("Tool execution error: {}", e)),
+        Err(e) => Reply::Error(-32603, format!("Task panicked: {}", e)),
     }
 }
 

@@ -13,7 +13,7 @@
 
 mod e2e_helpers;
 
-use e2e_helpers::{assert_compile_error, assert_ok, read_fixture};
+use e2e_helpers::{assert_ok, read_fixture};
 
 // ===================================================================
 // 1. 基本值与算术
@@ -591,12 +591,6 @@ fn e2e_handle_perform_returns_handler_result() {
         "mocked:hello",
         "handle/perform 端到端语义失败：handler 末尾表达式值未传回 perform"
     );
-}
-
-// 静默工具 unused import 警告
-#[allow(dead_code)]
-fn _unused_assert_compile_error() {
-    let _ = assert_compile_error("__unused__");
 }
 
 // ===================================================================

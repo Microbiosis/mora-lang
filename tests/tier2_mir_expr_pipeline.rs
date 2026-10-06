@@ -1,12 +1,12 @@
 //! Tier 2: ParserV3 pipeline integration tests
 //!
-//! 验证完整的 V3 管线：`ParserV3::compile → check_program_witnesses → run_mir`
+//! 验证完整的 V3 管线：`ParserV3::compile → check_program_witnesses_bidirectional → run_mir`
 
 use mora::interpreter::Interpreter;
 use mora::mir::vm::{run_main_task, run_mir};
 use mora::mir::{MirFunction, MirInst};
 use mora::parser_v3::ParserV3;
-use mora::typeck::check_mir::check_program_witnesses;
+use mora::typeck::check_mir::check_program_witnesses_bidirectional;
 use mora::value::Value;
 
 fn compile_v3(source: &str) -> MirFunction {
@@ -15,7 +15,7 @@ fn compile_v3(source: &str) -> MirFunction {
 
 fn run_v3_pipeline(source: &str) -> Result<(), String> {
     let (func, witnesses) = ParserV3::compile(source)?;
-    let _type_errors = check_program_witnesses(&witnesses);
+    let _type_errors = check_program_witnesses_bidirectional(&witnesses);
     let mut interp = Interpreter::new();
     let mut env = interp.take_env();
     let func_arc = std::sync::Arc::new(func);
@@ -168,7 +168,7 @@ fn v3_lower_dict_literal_produces_dict_lit() {
 #[test]
 fn v3_typecheck_then_lower_succeeds() {
     let (func, witnesses) = ParserV3::compile("let x = 42").expect("compile should succeed");
-    let _errors = check_program_witnesses(&witnesses);
+    let _errors = check_program_witnesses_bidirectional(&witnesses);
     assert!(
         !func.body.is_empty(),
         "lowered function should have instructions"
@@ -258,7 +258,7 @@ fn v3_pipeline_closure_runs() {
 #[test]
 fn v3_typecheck_unbound_variable() {
     let (_func, witnesses) = ParserV3::compile("let x = missing").expect("compile should succeed");
-    let errs = check_program_witnesses(&witnesses);
+    let errs = check_program_witnesses_bidirectional(&witnesses);
     assert!(!errs.is_empty(), "unbound variable should produce error");
 }
 
@@ -266,7 +266,7 @@ fn v3_typecheck_unbound_variable() {
 fn v3_typecheck_clean_program() {
     let (_func, witnesses) =
         ParserV3::compile("let x = 1 + 2\nprint(x)").expect("compile should succeed");
-    let errs = check_program_witnesses(&witnesses);
+    let errs = check_program_witnesses_bidirectional(&witnesses);
     assert!(errs.is_empty(), "clean program should have no errors");
 }
 

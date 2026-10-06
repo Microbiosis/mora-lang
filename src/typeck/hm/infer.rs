@@ -18,6 +18,36 @@ fn is_numeric(ty: &crate::typeck::Type) -> bool {
     )
 }
 
+/// 数值塔的提升结果（与 `unify::solve` 的 `Constraint::Numeric` 同口径）：
+/// `Int⊗Int→Int`；含 `Float` → `Float`；含 `BigInt` → `BigInt`。
+///
+/// v0.104.6 D24：广播算术（spec §12.3.1）算结果元素类型时用。
+fn promote_numeric(a: &crate::typeck::Type, b: &crate::typeck::Type) -> crate::typeck::Type {
+    use crate::typeck::Type as T;
+    match (a, b) {
+        (T::Int, T::Int) => T::Int,
+        (T::BigInt, T::BigInt) => T::BigInt,
+        (T::BigInt, _) | (_, T::BigInt) => T::BigInt,
+        (T::Float, _) | (_, T::Float) => T::Float,
+        // TypeVar / 未知：按 Float 兜底（与 solve 阶段的宽松策略一致）
+        _ => T::Float,
+    }
+}
+
+/// 剥掉 curried `Arrow` 的全部参数层，返回其**声明的结果类型**。
+///
+/// v0.104.6 D68：只对**内建**调用点使用。内建的返回类型永远不是函数
+/// （`builtin_callee_ty` / `builtin_signatures` 里没有一条返回 `Arrow`），
+/// 所以剥到最里层是安全的；而用户闭包可能真的返回函数（`fn(x) fn(y) … end`），
+/// 那里绝不能剥。
+fn peel_all_arrows(ty: &Type) -> Type {
+    let mut t = ty.clone();
+    while let Type::Arrow(_, out, _) = t {
+        t = *out;
+    }
+    t
+}
+
 impl HMInference {
     pub(super) fn infer_let(
         &mut self,
@@ -82,7 +112,28 @@ impl HMInference {
         // v0.55: validate the user-supplied `let x: T = ...` annotation
         // against the value's inferred type. Tolerant: Type::Any
         // annotations always succeed.
-        if !matches!(ty_inner, Type::Any) {
+        //
+        // v0.104.6 D82：`Type::TraitObject` 标注同样**不容��值侧**。
+        //
+        // `let x: dyn Any = 42` 的语义是「把 42 **强制转换**成 TraitObject」，
+        // emit 侧也确实这么做了（`emit_definitions.rs` 会 emit
+        // `MirInst::DynTrait { src, dst, trait_name }` 把值包成
+        // `Value::TraitObject`）。但本函数拿**转换前**的 `value_ty`
+        // （这里是 `Float`）去比对 `TraitObject` 标注
+        // → `expected TraitObject { … }, got Float`。
+        //
+        // 后果：`dyn` 这条路径**整条走不通** —— emit 侧写好的 coercion
+        // 永远到不了运行期。spec §13.1 把它列进类型文法、`mir_dyntrait.rs`
+        // 还断言了 `MirInst::DynTrait` 的存在，而真实 CLI 里
+        // `let x: dyn Foo = 1` 直接 exit 2。
+        //
+        // （`mir_dyntrait.rs` 之所以没抓��：它只查编译出的 **MIR**，
+        // **从不跑 typeck** —— 与 D56 / D70 同型的假阳性测试。）
+        //
+        // 修法：`dyn Trait` 标注意味着「**任何**值都会被强制转换」，
+        // 故值侧不加约束 —— 与 `Type::Any` 同等对待。变量本身仍按标注
+        // （`TraitObject`）记进 env，这与转换后的实际值一致。
+        if !matches!(ty_inner, Type::Any | Type::TraitObject { .. }) {
             // v0.75.86: 提前用 span 报不一致——不等 solve_constraints 兜底
             if !value_ty.compatible_with(ty_inner) {
                 return Err(vec![TypeError::UnificationFailure {
@@ -371,7 +422,42 @@ impl HMInference {
                 let left_tv = matches!(left_ty, crate::typeck::Type::TypeVar(_));
                 let right_tv = matches!(right_ty, crate::typeck::Type::TypeVar(_));
                 let defer_numeric = (left_num && right_tv) || (right_num && left_tv);
-                if (!left_num || !right_num) && !defer_numeric {
+
+                // v0.104.6 D24：spec §12.3.1「广播算术 (v0.17, APL 启发)」
+                // 明确定义 `list ⊗ scalar`（两个方向）与 `list ⊗ list`（等长
+                // 逐元素）。运行期 `flow::eval_binary` / `numeric_op` 一直
+                // 实现着这些臂，但**此前这里只判 `is_numeric`**，List 一律
+                // 落严格 `Eq` → 整节特性从源码不可达。真实 CLI 实测：
+                //
+                // ```text
+                // [1,2,3] * 2          → exit 2  Type error   ← spec 逐字例子
+                // 1 + [10,20,30]        → exit 2  Type error   ← spec 逐字例子
+                // [1,2,3] + [10,20,30]  → exit 0  [11.0, 22.0, 33.0]  （list⊗list 通）
+                // [10,20,30] - [1,2,3]  → exit 0  [9.0, 18.0, 27.0]   （list⊗list 通）
+                // ```
+                //
+                // spec 举的 4 个例子里有 2 个跑不了。放行时结果类型为
+                // `List(提升后的元素类型)`，提升规则与标量塔一致
+                // （Int⊗Int→Int、含 Float→Float、含 BigInt→BigInt）。
+                let bcast_elem: Option<crate::typeck::Type> = match (&left_ty, &right_ty) {
+                    (crate::typeck::Type::List(e), n)
+                        if is_numeric(n) || matches!(n, crate::typeck::Type::TypeVar(_)) =>
+                    {
+                        Some(promote_numeric(e, n))
+                    }
+                    (n, crate::typeck::Type::List(e))
+                        if is_numeric(n) || matches!(n, crate::typeck::Type::TypeVar(_)) =>
+                    {
+                        Some(promote_numeric(n, e))
+                    }
+                    (crate::typeck::Type::List(a), crate::typeck::Type::List(b)) => {
+                        Some(promote_numeric(a, b))
+                    }
+                    _ => None,
+                };
+                let is_broadcast = bcast_elem.is_some();
+
+                if (!left_num || !right_num) && !defer_numeric && !is_broadcast {
                     // 非数值类型：检查 symmetric compatible_with（如 String+String 拼接）
                     if !left_ty.compatible_with(&right_ty) {
                         return Err(vec![TypeError::UnificationFailure {
@@ -392,12 +478,48 @@ impl HMInference {
                 } else {
                     // 数值类型：用 Numeric 约束（Int/Float promotion 由 solver 处理）
                     // result 字段让 solver 在校验后自动将 result_ty 与 promotion 类型合一
-                    self.constraints
-                        .push(Constraint::Numeric(super::unify::BinaryConstraint {
-                            left: Box::new(left_ty.clone()),
-                            right: Box::new(right_ty.clone()),
-                            result: Some(Box::new(result_ty.clone())),
-                        }));
+                    // v0.104.6 D24：广播 —— 结果类型定为 `List(提升后元素)`。
+                    // 约束两件事：① `result_ty = List(提升元素)`（`result_ty` 是
+                    // 表达式对外的类型，不绑它则调用方拿到未解析 TypeVar）；
+                    // ② 列表那侧的 `List(e)` 与之合一，把元素 TypeVar 解析掉。
+                    // `List ⊗ List` 两侧都是列表，故两侧都约束。
+                    // 注意**不要**给标量那侧压 `Eq(scalar, List(..))` —— 那会得到
+                    // "expected float, got list<float>"（把标量当成了列表元素）。
+                    let bcast_target: Option<crate::typeck::Type> =
+                        bcast_elem.map(|p| crate::typeck::Type::List(Box::new(p)));
+                    let list_sides: Vec<crate::typeck::Type> =
+                        match (&left_ty, &right_ty, &bcast_target) {
+                            (
+                                crate::typeck::Type::List(_),
+                                crate::typeck::Type::List(_),
+                                Some(_),
+                            ) => vec![left_ty.clone(), right_ty.clone()],
+                            _ => match (&left_ty, &right_ty) {
+                                (crate::typeck::Type::List(_), _) => vec![left_ty.clone()],
+                                (_, crate::typeck::Type::List(_)) => vec![right_ty.clone()],
+                                _ => Vec::new(),
+                            },
+                        };
+                    if let Some(target) = bcast_target {
+                        self.constraints.push(Constraint::Eq(
+                            Box::new(result_ty.clone()),
+                            Box::new(target.clone()),
+                        ));
+                        for side in &list_sides {
+                            self.constraints.push(Constraint::Eq(
+                                Box::new(side.clone()),
+                                Box::new(target.clone()),
+                            ));
+                        }
+                    } else {
+                        self.constraints.push(Constraint::Numeric(
+                            super::unify::BinaryConstraint {
+                                left: Box::new(left_ty.clone()),
+                                right: Box::new(right_ty.clone()),
+                                result: Some(Box::new(result_ty.clone())),
+                            },
+                        ));
+                    }
                 }
                 Ok((result_ty, merged_row))
             }
@@ -423,8 +545,9 @@ impl HMInference {
                             right: Box::new(right_ty),
                             result: None,
                         }));
-                } else if matches!(left_ty, crate::typeck::Type::TypeVar(_))
-                    || matches!(right_ty, crate::typeck::Type::TypeVar(_))
+                } else if (is_numeric(&left_ty)
+                    && matches!(right_ty, crate::typeck::Type::TypeVar(_)))
+                    || (is_numeric(&right_ty) && matches!(left_ty, crate::typeck::Type::TypeVar(_)))
                 {
                     // v0.104: 未解析变量同样推迟 —— 直接把 TypeVar 钉到对侧
                     // 具体类型会让它无法参与数值塔提升。实例：
@@ -433,6 +556,25 @@ impl HMInference {
                     //   end                       --   随后列表的 Eq(α, Float)
                     // 冲突 → "expected float, got int"。走 Numeric 由 solve
                     // 阶段按已解析结果提升。
+                    //
+                    // v0.104.6 D53：此前的条件是「**任一侧**是 TypeVar 就压
+                    // Numeric」，但 Numeric 的定义就是「两侧都必须是数值」——
+                    // 于是一个**永远不会被解析**的 TypeVar 会在 solve 阶段
+                    // 被按「必须是数值」拒绝。索引表达式正是这种 TypeVar：
+                    // witness 侧把 `xs[i]` 编码成 `Call("[]")`，而 `[]` 在
+                    // typeck 里**没有签名**，故其结果类型恒为 fresh TypeVar、
+                    // 没有任何约束会去解析它。
+                    //
+                    // 真实 CLI 实测（修前）：
+                    //   [1,2][0] == [1,2][1]   → Type error: expected numeric
+                    //                                     type (int or float)
+                    //   "ab"[0] == 'a'          → 同上
+                    // 而 `xs[0] == 1`、`xs[0] > 0`、`xs[0] + xs[1]` 都正常
+                    // （后两者走的是别的分支）。
+                    //
+                    // 修法：**仅当对侧确实是数值**时才延迟到 Numeric（保住
+                    // v0.104 的提升场景），否则退回 Eq —— TypeVar 与任意类型
+                    // 合一是安全的，且运行期 `index_value` 本就支持任意类型。
                     self.constraints
                         .push(Constraint::Numeric(super::unify::BinaryConstraint {
                             left: Box::new(left_ty),
@@ -495,6 +637,12 @@ impl HMInference {
         args: &[MirWitness],
         span: Span,
     ) -> Result<(Type, crate::mir::effect::EffectRow), Vec<TypeError>> {
+        // v0.104.6 D68：内建被调体**声明的结果类型**（剥掉全部参数层）。
+        // 少传实参时循环留下的是残差 `Arrow`（且只在 solver 之后才显现），
+        // 直接返回它会让 `let v: String = range(0, 3)` 报
+        // "expected string, got fn ('') -> list<float>"。内建的返回类型
+        // 永远不是函数，故对内建一律用声明结果。见 `peel_all_arrows`。
+        let mut builtin_declared_ret: Option<Type> = None;
         let (mut callee_ty, mut acc_row) = match callee {
             WitnessCallee::Name(name) => {
                 // v0.84: 先查 env（用户定义函数/闭包），再查 builtin，最后 fresh TypeVar。
@@ -522,6 +670,7 @@ impl HMInference {
                 } else if let Some(t) = self.builtin_callee_ty(name) {
                     let inst = self.instantiate_if_forall(&t);
                     let row = Self::arrow_row_of(&inst);
+                    builtin_declared_ret = Some(peel_all_arrows(&inst));
                     (Some(inst), row)
                 } else {
                     let row = self
@@ -590,6 +739,120 @@ impl HMInference {
                 return self.infer_method_call(recv, &method, method_args, span);
             }
         };
+
+        // v0.104.6 D55：**下标表达式 `xs[i]` 特判** —— 按接收者推断元素类型。
+        //
+        // 缺陷：witness 侧把读索引编码成 `Call { callee: Name("[]"), args:
+        // [obj, i] }`（见 `tests/parser_v3_coverage.rs::index_expr_parses`
+        // 断言的形状），而 `[]` 在 `builtin_callee_ty` 里**没有登记**，于是
+        // 走 `unwrap_or_else(|| self.fresh_type_var())` —— 结果类型恒为
+        // **fresh TypeVar**，没有任何约束会去解析它。后果：
+        //
+        // ```mora
+        // let y = "a"
+        // y + 1                       → Type error ✅（String + Float 被拒）
+        //
+        // let xs = ["a", "b"]
+        // let y = xs[0]
+        // y + 1                       → **不报错**，运行期得 "a1.0"
+        // ```
+        //
+        // 元素类型就此**丢失**，后续一切推断都建立在「未知」之上。
+        // `tests/tier1_typeck_mir.rs::list_get_exposes_element_type_error`
+        // 断言「String 元素 + Int 应报类型错」，但它此前是**因错误的原因**
+        // 而通过的 —— `xs.get(0)` 的下标被拒（那是 D52），不是被测的 `+`。
+        //
+        // 修法：按接收者类型给出结果类型，与运行期 `mir/vm.rs::index_value`
+        // 的三个分支**逐条对齐**（List → 元素、Dict → 值 | nil、String → Char）。
+        if matches!(callee, WitnessCallee::Name(n) | WitnessCallee::Var(n) if n == "[]") {
+            let Some((recv, _idx)) = args.split_first() else {
+                return Err(vec![TypeError::ArityMismatch {
+                    expected: 2,
+                    actual: args.len(),
+                    span,
+                }]);
+            };
+            let (recv_ty, recv_row) = self.infer_expr(recv)?;
+            acc_row = self.merge_rows(acc_row, recv_row);
+            if let Some(rest) = args.get(1) {
+                let (_idx_ty, idx_row) = self.infer_expr(rest)?;
+                acc_row = self.merge_rows(acc_row, idx_row);
+            }
+            // 索引实参**不收紧**：此前 `[]` 无签名，索引类型完全不被检查
+            // （越界/类型错一律留到运行期 `index_value` 报）。这里保持同样的
+            // 宽松度，只把**结果**类型接上 —— 避免「修一个坏两个」。
+            //
+            // v0.104.6 D55：**当时**只有 String 分支真正生效。List / Dict 的
+            // 元素/值类型在 `infer_list` / `infer_dict` 里是 fresh TypeVar，
+            // 要到**后续 solver 阶段**才被替换；此处 `Eq(result, elem)`
+            // 约束在 solve 时与 `+` 产生的 `Eq(result, Float)` 相撞而**未
+            // 报错**（D55 当时实测 `let y: Int = xs[0]` 在 `xs = ["a","b"]`
+            // 上仍被接受）。故 D55 时不写「看似生效实则无效」的 List/Dict
+            // 分支 —— 留不留不住的代码比没有更糟。
+            //
+            // ⚠ v0.104.6 D67 已修好根因：`infer_list` / `infer_dict` 现在
+            // **直接返回已解析的公共元素类型**（不再返回未解算的 TypeVar），
+            // 所以下面那段「fresh TypeVar + 压约束」的绕行**已过期**，
+            // 由紧随其后的 `直接返回元素类型` 分支取代。D55 当时记下的
+            // 「实测仍被接受」正是那个缺陷的**症状**，不是 List/Dict 的固有限制。
+            // 复核（真实 CLI）：
+            //     let xs = ["a", "b"]
+            //     let y: Int = xs[0]   → expected Int, got String   （被拒）
+            //
+            // 字符串下标是**具体**的 `Char`，无需等 solver，可直接给。
+            // 实测生效：`let y: String = "ab"[0]` 现在正确报
+            // `expected String, got Char`（修前不报）。
+            match &recv_ty {
+                // 字符串下标是**具体**的 `Char`，无需等 solver，可直接给。
+                // 实测生效：`let y: String = "ab"[0]` 现在正确报
+                // `expected String, got Char`（修前不报）。
+                crate::typeck::Type::String => return Ok((crate::typeck::Type::Char, acc_row)),
+                // List / Dict：v0.104.6 D67 起，元素 / 值类型**已是解析后的具体
+                // 类型**（`infer_list` / `infer_dict` 不再返回未解算的
+                // `TypeVar`），所以这里**直接返回**即可。
+                //
+                // 沿革（留着是为了说明「为什么不是更复杂的方案」）：
+                //   * D55 时期此处绕了一圈 fresh TypeVar + `Eq(r, elem)`，注释
+                //     写着「不能直接返回 `(**e).clone()`，那拿到的仍是未解析的
+                //     TypeVar」—— 那句话的**前提已被 D67 消灭**。
+                //   * D67 之前 `[]` 返回的 TypeVar 与元素 TypeVar 之间**没有
+                //     任何约束**，而 `let` 注解检查也**从不产生约束**
+                //     （`bidirectional.rs` 的 `check_against` 是纯比较，且
+                //     `TypeVar::subtype_of` 对任何类型都返回 true，见
+                //     `typeck/mod.rs` v0.84）—— **两端同时落空**，这才是
+                //     「`let y: Int = xs[0]` 在 `xs = ["a","b"]` 上仍被接受」
+                //     的真正原因。
+                //   * D67 修好根因（容器字面量直接推具体元素类型）后，直接返回
+                //     即可；继续绕圈只会把已经具体的类型重新退化成宽松的
+                //     TypeVar，并让 `m[0][0]` 这类**链式索引**在外层丢掉类型
+                //     （`let y: String = m[0][0]` 静默通过，拆成中间变量
+                //     `let inner = m[0]` 同样失效）。
+                //
+                // 类型本身仍可能是 TypeVar（空列表 `[]`、未解析的形参等），
+                // 那时透传 TypeVar 与修前行为一致，不引入新的宽松。
+                crate::typeck::Type::List(e) => {
+                    return Ok(((**e).clone(), acc_row));
+                }
+                crate::typeck::Type::Dict(_, v) => {
+                    // **只接值类型、不并 `Nil`** —— 这是一处有意识的取舍。
+                    //
+                    // 运行期 `index_value` 对**缺失键**返回 `Nil`（D14 定的
+                    // 契约），类型上如实写应是 `Union(V, Nil)`；但那样
+                    // `t + d[ks[i]]`（遍历字典求和 —— 最常见的字典用法）会因为
+                    // `Float + Union(Float, Nil)` 而**编译不过**，实测确为回归。
+                    //
+                    // 故此处按「键存在」推断，缺失键导致的 `Nil` 交给运行期。
+                    // 代价：`let y: String = d["zz"]`（`d = {a: 1}`，键不存在、
+                    // 运行期得 `Nil`）会因 `Eq(Float, String)` 报错 —— 结论对
+                    // 但理由是「值类型不符」而非「键缺失」。要表达「可能缺失」
+                    // 应显式写 `Union(String, Nil)`。
+                    return Ok((v.as_ref().clone(), acc_row));
+                }
+                // 其他接收者：留 fresh TypeVar（与本修复前的宽松行为一致）
+                _ => {}
+            }
+            return Ok((self.fresh_type_var(), acc_row));
+        }
 
         // v0.102: 关系调用特判 —— 按关系签名（precompute_rel_sigs 不动点）
         // 逐位置校验实参并返回 Goal；关系体的效果行在调用点并入。
@@ -698,6 +961,76 @@ impl HMInference {
             return Ok((sig.return_type.clone(), acc_row));
         }
 
+        // v0.104.6 D161：**闭包 arity 的编译期检查**（本会话长期待办的收口）。
+        //
+        // 多参数闭包 `fn(a, b) -> c` 的类型是 `Arrow(A, Arrow(B, C, eff), eff)`
+        // （见 `wrap_curried_arrow` 的注释）—— arity 编码为 **Arrow 嵌套深度**。
+        // 而下面的 curried 循环是「每个实参消耗一层」：实参**不足**时，
+        // 剩下的 `Arrow` 层根本不进任何约束，**不会产生任何错误**。
+        //
+        // 实测（修复前）：
+        //
+        // ```text
+        // let f2 = fn(a, b) => a + b
+        // f2(1)
+        //   mora --check → exit 0「No type errors found. (3 expressions)」  ❌
+        //   运行期        → exit 1「closure expects 2 args, got 1」        ← 运行期才炸
+        // ```
+        //
+        // 即 `--check` 明确告诉用户「代码没问题」，而它**根本跑不起来**。
+        // 运行期是权威：它**不支持**部分应用（`f2(1)` 直接报错），所以类型层
+        // 也不该放行。部分应用在本语言里有**显式**写法（`curry(f, n)`，D148），
+        // 不靠少传实参隐式获得。
+        //
+        // 反方向（多传）此前**会**被查，但走的是「多余实参与**返回类型**合一」
+        // 这条歪路，产出一条看不懂且**泄露内部变量**的消息：
+        //
+        // ```text
+        // f1(1, 2)  where f1 = fn(a) => a + 1
+        //   → Type mismatch: expected float, got fn (float) -> ' ! { rho1 }
+        //                            ↑ `rho1` 是内部 effect-row 变量，用户无从理解
+        // ```
+        //
+        // 两侧一并用 `ArityMismatch` 表达，语义直白且与运行期措辞一致。
+        //
+        // ⚠ 只在 callee 是**具体的 Arrow 链**时检查：`TypeVar`（递归/尚未定型的
+        // 被调）、`Any`、`Unknown` 的 `arrow_arity` 都是 0，跳过。
+        // ⚠ 变参内建在**上面**已提前返回（`sig.variadic` → :961），
+        // 它们的 `print(1, 2, 3)` 不受本检查影响。
+        //
+        // ⚠ **内建一律豁免**：它们的签名带**可选尾参**（类型含 `Nil`，见 :1084
+        // 的 `min_arity` 约定），如 `compress(input, strategy, opts?)` 声明 3 个
+        // 形参却允许只传 2 个。第一版用 `dispatch::lookup_builtin(n)` 判定，
+        // 全量红 16 条 —— 因为 `compress` / `crush_json` 只登记在
+        // `hm/builtin.rs::builtin_type`（经 `builtin_callee_ty`）而**不在**那张表里。
+        //
+        // 改用 `builtin_declared_ret.is_some()`：它**恰好**在
+        // `builtin_callee_ty(name)` 命中时被置位（:673），是「本 callee 是内建」
+        // 的权威信号，且已在作用域内，不必另写一套判定。
+        let is_registered_builtin = builtin_declared_ret.is_some();
+        let mut want_arity = if is_registered_builtin {
+            0
+        } else {
+            arrow_arity(&callee_ty)
+        };
+        // v0.104.6 D167：Arrow 链给不出 arity 时（**定义名不进 env**，调用点
+        // 解析成 `TypeVar` → arity 0），回退到「顶层 task/fn 形参个数」表。
+        // 故 `task add(a, b) … end; add(1)` 也会在 `--check` 下被拦下，
+        // 而不再只报运行期错。
+        if want_arity == 0
+            && let WitnessCallee::Name(n) | WitnessCallee::Var(n) = &callee
+            && let Some(n) = self.fn_arities.get(n)
+        {
+            want_arity = *n;
+        }
+        if want_arity > 0 && args.len() != want_arity {
+            return Err(vec![TypeError::ArityMismatch {
+                expected: want_arity,
+                actual: args.len(),
+                span,
+            }]);
+        }
+
         // v0.80: curried Arrow 消解 — 每个参数消耗一层 Arrow。
         for arg in args {
             let (arg_ty, arg_row) = self.infer_expr(arg)?;
@@ -730,6 +1063,34 @@ impl HMInference {
                 Some(row) => self.merge_rows(acc_row, row),
                 None => self.merge_rows(acc_row, fresh_eff),
             };
+        }
+        // v0.104.6 D161：数 `Arrow` 链 = 该被调的 arity。
+        //
+        // `wrap_curried_arrow` **从最后一个参数向前包裹**，所以多参数闭包是
+        // `Arrow(A, Arrow(B, C, …), …)` —— 嵌套发生在**输出**侧，不在输入侧
+        // （我第一版沿 `input` 数，恒得 1，于是少传实参**根本没被拦下**）。
+        //
+        // | 定义 | 类型 | arity |
+        // |---|---|---|
+        // | `fn(a) => …`     | `Arrow(A, Float)`            | 1 |
+        // | `fn(a, b) => …`  | `Arrow(A, Arrow(B, Float))`  | 2 |
+        //
+        // 非 `Arrow`（TypeVar / Any / Unknown / 值类型）返回 0，调用点据此跳过
+        // —— 递归函数、尚未定型的被调、动态值都不该被误伤。
+        //
+        // 已知取舍：返回闭包的函数（`fn() => fn(x) => x`）会被算成 arity 2。
+        // 但它**本来就不可用** —— D123 已把 `c(1)(2)` 链式调用改成明确报错，
+        // 取不到内层闭包。故此处的误判方向是「更早地告知」，不是放行错误。
+        fn arrow_arity(ty: &Type) -> usize {
+            match ty {
+                Type::Arrow(_input, out, _row) => 1 + arrow_arity(out),
+                _ => 0,
+            }
+        }
+        // v0.104.6 D68：内建被调一律返回**声明的**结果类型（见函数头注释）。
+        // 实参类型校验仍由上面循环压的约束完成，这里只定结果类型。
+        if let Some(declared) = builtin_declared_ret {
+            return Ok((declared, acc_row));
         }
         Ok((callee_ty, acc_row))
     }
@@ -773,7 +1134,39 @@ impl HMInference {
         // arity we compare against is `sig.params.len() - 1`.
         // v0.75.84: 尾部 dict 配置参数（ai.chat(prompt, {model: ...})）为
         // 可选——arity 下限是签名 user 参数数，多传 dict 不报 ArityMismatch。
-        if let Some(sig) = crate::typeck::dispatch::method_signature(&recv_ty, method) {
+        // v0.104.6 D69：**模块对象**的方法签名按**模块名**查，而非按
+        // `recv_ty`。
+        //
+        // 根因：`infer_var`（:356）把 23 个模块对象里的 **20 个**解析成
+        // `Type::Unknown`（只有 `ai` / `agent` / `random` 有精确变体），
+        // 而 `method_signature` 没有 `Unknown` 分支 —— 于是**每一个模块方法
+        // 调用**的结果类型都退化成永不解算的 TypeVar，标注形同虚设：
+        //
+        // ```mora
+        // let v: String = math.floor(1.5)        → 修前被接受  ❌
+        // let v: String = exec.parallel([…], 2) → 修前被接受  ❌
+        // ```
+        //
+        // 拼错的方法名仍由**运行期**兜住（`math.flor(…)` 报 unknown method），
+        // 所以这不是「静默错误」，是**类型检查层的盲区**。
+        //
+        // 为什么不新增 `Type::MathModule` 等 20 个变体：那是 v1.0 方向
+        // （形式化语义）的设计决定，而此处只需「按名字查表」即可闭合。
+        let module_sig = match &receiver.kind {
+            WitnessKind::Variable(module) => {
+                crate::typeck::dispatch::module_method_signature(module, method)
+            }
+            _ => None,
+        };
+        let resolved_sig = module_sig
+            .clone()
+            .or_else(|| crate::typeck::dispatch::method_signature(&recv_ty, method));
+        // 结果类型优先取模块表 —— 下方 `method_return_type(&recv_ty, method)`
+        // 按 `Type` 索引，对 `Unknown` 接收者恒为 None，故必须在这里抢先。
+        // **同一张表必须同时驱动 arity 与结果类型**，否则只修一半：元数生效了
+        // 而标注仍放行（这正是第一版只接 arity 那条路时的实测结果）。
+        let module_return_ty = module_sig.map(|s| s.return_type);
+        if let Some(sig) = resolved_sig {
             let user_arity = sig.params.len().saturating_sub(1);
             // v0.103: 支持**可选尾参** —— 签名中类型含 `Nil` 的尾部参数可省略。
             // 此前 arity 是「恰好 user_arity」，使 spec 标注为可选（`ctx?`）
@@ -798,25 +1191,75 @@ impl HMInference {
                 }
                 min
             };
-            let extra_configurable = arg_types
-                .iter()
-                .skip(min_arity)
-                .all(|t| matches!(t, Type::Dict(_, _) | Type::Nil))
-                || arg_types
+            // v0.104.6 D69：**变参**的模块方法（`file.join(a, b, c)` ——
+            // 运行期 `for arg in args`）只校验下限，不设上限。`params` 里的
+            // 形参类型全是 `Any`，逐实参的 Eq 约束没有信息量，跳过。
+            if sig.variadic {
+                if arg_types.len() < min_arity {
+                    return Err(vec![TypeError::ArityMismatch {
+                        expected: min_arity,
+                        actual: arg_types.len(),
+                        span,
+                    }]);
+                }
+            } else {
+                let extra_configurable = arg_types
                     .iter()
-                    .skip(user_arity)
-                    .all(|t| matches!(t, Type::Dict(_, _)));
-            if arg_types.len() < min_arity || (arg_types.len() > user_arity && !extra_configurable)
-            {
-                return Err(vec![TypeError::ArityMismatch {
-                    expected: min_arity,
-                    actual: arg_types.len(),
-                    span,
-                }]);
+                    .skip(min_arity)
+                    .all(|t| matches!(t, Type::Dict(_, _) | Type::Nil))
+                    || arg_types
+                        .iter()
+                        .skip(user_arity)
+                        .all(|t| matches!(t, Type::Dict(_, _)));
+                if arg_types.len() < min_arity
+                    || (arg_types.len() > user_arity && !extra_configurable)
+                {
+                    return Err(vec![TypeError::ArityMismatch {
+                        expected: min_arity,
+                        actual: arg_types.len(),
+                        span,
+                    }]);
+                }
             }
-            for (param, arg_ty) in sig.params.iter().skip(1).zip(arg_types.iter()) {
+            // v0.104.6 D156：此前**只**把实参类型压成 `Constraint::Eq` 交给
+            // `solve_constraints` 兜底，而 `unify()` 的每个失败分支都写死
+            // `span: None`（`unify.rs:221/229/321/…`）—— 于是
+            //
+            //   let xs = [1, 2, 3]
+            //   xs.take("one")
+            //
+            // 报出 `line=0` 的「位置未跟踪」，且**逐字段完全相同**。D155 已实测：
+            // witness 树里那个实参的 span 是**正确**的（`line 2 column 17`）——
+            // span 一直都在，只是没被带进错误。
+            //
+            // 修法沿用本文件 `let x: T = v` 路径的既有范式（:137「提前用 span
+            // 报不一致——不等 solve_constraints 兜底」）：先用 `compatible_with`
+            // 快速判一次，不兼容就**带着实参的 span** 立即返回；兼容的照旧压约束
+            // 交给求解器（TypeVar 绑定 / 提升仍由 unify 负责，本改动不碰）。
+            //
+            // 附带收益：每条诊断**指向自己的实参**，于是 D128 的
+            // `(line, expected, actual)` 去重键**重新有了区分度** ——
+            // D154 判定「任何按消息的去重都不健全」正是因为当时它们全都一样。
+            for ((_param_name, param_ty), (arg, arg_ty)) in sig
+                .params
+                .iter()
+                .skip(1)
+                .zip(args.iter().zip(arg_types.iter()))
+            {
+                if !arg_ty.compatible_with(param_ty) {
+                    // 用 `Type::name()` 而非 `{:?}`：本仓库的诊断一律小写
+                    // （`string` / `float`），`{:?}` 会给出 `String` / `Float`
+                    // 破坏一致性。而 `name()` 对 Union 给出 `int | float` ——
+                    // 恰好修正了此前「expected int」的**欠报**（形参其实声明的是
+                    // `Union(Int, Float)`，只说 int 会让用户以为传个 int 就行）。
+                    return Err(vec![TypeError::UnificationFailure {
+                        expected: param_ty.name(),
+                        got: arg_ty.name(),
+                        span: Some(arg.span),
+                    }]);
+                }
                 self.constraints.push(Constraint::Eq(
-                    Box::new(param.1.clone()),
+                    Box::new(param_ty.clone()),
                     Box::new(arg_ty.clone()),
                 ));
             }
@@ -831,13 +1274,27 @@ impl HMInference {
         // 「非 callable 值直接返回」一致；调用形态另由签名/实参表处理）。
         // TeaModel 字段同理由 `model.count` 触发，各字段类型不同 —— 返回其
         // 字段表中该字段的类型。
+        //
+        // v0.104.6 D54：**必须先确认「这个名字不是真方法」**。
+        // `dict_field_type` 对 `Type::Dict(_, v)` **无条件**返回 `Some(v)`，
+        // 于是 `d.len()` / `d.keys()` 这类**真方法**被当成字段访问，返回的是
+        // dict 的**值类型**，把上面签名表算出的 `ret = Int` 整个覆盖掉。
+        // 实测（插桩）：
+        //   @@LEN  recv=Dict(String, TypeVar('\0'))  ret=Int   ← 签名算对了
+        //   @@CHK  synth=TypeVar('\0')  expected=String        ← 返回的却是值类型
+        // 后果：`let n: String = d.len()` 被**静默接受**（List / String 接收者
+        // 都正常报错）；而 `d.keys()` 同样退化成值 TypeVar，于是链式
+        // `d.keys().len()` 的 receiver 成了 TypeVar、落到
+        // `method_return_type` 兜底 → **返回 `Float`**（实测报 `got Float`）。
         if arg_types.is_empty()
+            && crate::typeck::dispatch::method_signature(&recv_ty, method).is_none()
             && let Some(field_ty) = self.dict_field_type(&recv_ty, method)
         {
             return Ok((field_ty, acc_row));
         }
 
-        let return_ty = crate::typeck::dispatch::method_return_type(&recv_ty, method);
+        let return_ty = module_return_ty
+            .unwrap_or_else(|| crate::typeck::dispatch::method_return_type(&recv_ty, method));
         // v0.103: `Unknown` 是 fail-fast 逃逸标签（v0.75.92：与任何类型合一
         // 都失败），且 v0.75.91 明确「Unknown 不算已知签名」。方法结果无法
         // 判定时应交给**待推断变量**，而不是让 Unknown 流进下游约束
@@ -901,9 +1358,16 @@ impl HMInference {
             Some(l) => l,
             None => {
                 return Err(vec![TypeError::UnificationFailure {
-                    expected:
-                        "known random method: random/rand_int/rand_float/rand_choice/seed/shuffle"
-                            .to_string(),
+                    // v0.104.6 D175：从 `RANDOM_METHODS` **派生**，不再手写一遍。
+                    // 原先这里是硬编码字符串 `random/rand_int/rand_float/
+                    // rand_choice/seed/shuffle` —— 与 `module_method_names("random")`
+                    // 是两份独立清单，改一处忘另一处就会让「报错列出的方法」
+                    // 与「自省报出的方法」互相矛盾（agent 按前者写代码，
+                    // 按后者做能力判断，两边对不上）。
+                    expected: format!(
+                        "known random method: random/{}",
+                        crate::typeck::dispatch::RANDOM_METHODS.join("/")
+                    ),
                     got: format!("random.{}", method),
                     span: Some(span),
                 }]);
@@ -1246,7 +1710,18 @@ impl HMInference {
     // 避免从 scrutinee_ty 复制 TypeVar 导致多绑定共享同一变量，unify 时
     // 产生"Cannot unify type variable X with type containing itself"循环。
     // 约束求解器会根据 arm body 的实际用法将 fresh var 合一到正确类型。
-    fn add_pattern_bindings(
+    // v0.104.6 D165：放开到 `pub(crate)` —— **双向层**（`bidirectional.rs`
+    // 的 Phase D）也必须在 `check_against(arm.body)` 之前注册 arm 的模式绑定。
+    //
+    // 此前只有 HM 侧的 `infer_match` 会注册，于是：
+    //   HM          → 绑定就位，body 推断正确
+    //   双向层 Phase D → 直接 `check_against(&arm.body, …)`，env 里**没有**绑定
+    //                  → `Unbound variable 'x'`，被 `check_against` 包成
+    //                    「type inference failed: …」并 push 进 errors
+    // 而 D128 的去重键是 `(line, expected, actual)` —— HM 侧**根本没报错**，
+    // 无键可匹配，于是这条**假错误**一路留在最终诊断里：
+    // 一段 parser 接受、运行期正常的程序被 `mora --check` 拒绝。
+    pub(crate) fn add_pattern_bindings(
         &mut self,
         pattern: &crate::mir::witness::WitnessPattern,
         _scrutinee_ty: &Type,
@@ -1339,29 +1814,51 @@ impl HMInference {
         let elem_ty = self.fresh_type_var();
         let mut acc_row = crate::mir::effect::EffectRow::Empty;
         let mut first_ty: Option<Type> = None;
-        for item in items {
+        // v0.104.6 D67：累加**已解析**的公共元素类型。空列表（无元素可推）
+        // 仍回落到 `elem_ty`，行为不变。
+        let mut acc_elem: Option<Type> = None;
+        for (idx, item) in items.iter().enumerate() {
             let (ty, item_row) = self.infer_expr(item)?;
             acc_row = self.merge_rows(acc_row, item_row);
-            // v0.75.86: 提前用 span 报 list elem type 不一致（避免 line 0）
+            // v0.75.86: 提前报 list elem type 不一致（避免 line 0）
+            //
+            // v0.104.6 D125：改用专门的 `ListElementTypeMismatch` ——
+            // 旧的通用 `UnificationFailure` 消息不说明「元素必须同质」这条
+            // 约束（`list<T>` 需要单一 T），且 span 指向整个列表的 `[`。
+            // 现在带上下标并把 span 指向出错的那个元素。
             if let Some(prev) = &first_ty
                 && !ty.compatible_with(prev)
             {
-                return Err(vec![TypeError::UnificationFailure {
-                    expected: format!("{:?}", prev),
-                    got: format!("{:?}", ty),
-                    span: Some(span),
+                return Err(vec![TypeError::ListElementTypeMismatch {
+                    index: idx,
+                    expected: format!("{prev:?}"),
+                    got: format!("{ty:?}"),
+                    span: Some(item.span),
                 }]);
             }
             if first_ty.is_none() {
                 first_ty = Some(ty.clone());
             }
+            // 数值侧按数值塔提升（`[1i, 2.5]` 的元素类型是 Float 而非首个的
+            // Int）；非数值侧沿用首个元素类型 —— 上面的 `compatible_with`
+            // 已经保证了「后者能装进前者」，这里只负责挑出对外暴露的那个类型。
+            acc_elem = Some(match acc_elem {
+                None => ty.clone(),
+                Some(prev) => {
+                    if is_numeric(&prev) && is_numeric(&ty) {
+                        promote_numeric(&prev, &ty)
+                    } else {
+                        prev
+                    }
+                }
+            });
             self.constraints
                 .push(Constraint::Eq(Box::new(elem_ty.clone()), Box::new(ty)));
         }
         // v0.75.86: 不报错路径，保留 _span 备未来错误检查扩展点
         let _span = span;
         let _ = _span;
-        Ok((Type::List(Box::new(elem_ty)), acc_row))
+        Ok((Type::List(Box::new(acc_elem.unwrap_or(elem_ty))), acc_row))
     }
 
     pub(super) fn infer_dict(
@@ -1373,29 +1870,52 @@ impl HMInference {
         let v_ty = self.fresh_type_var();
         let mut acc_row = crate::mir::effect::EffectRow::Empty;
         let mut first_v: Option<Type> = None;
-        for (_, value) in entries {
+        // v0.104.6 D67：同 infer_list —— 累加已解析的公共 value 类型，
+        // 空 dict 仍回落到 `v_ty`。
+        let mut acc_val: Option<Type> = None;
+        for (key, value) in entries {
             let (ty, val_row) = self.infer_expr(value)?;
             acc_row = self.merge_rows(acc_row, val_row);
-            // v0.75.86: 提前用 span 报 dict value type 不一致（避免 line 0）
+            // v0.75.86: 提前报 dict value type 不一致（避免 line 0）
+            //
+            // v0.104.6 D124：改用专门的 `DictValueTypeMismatch` ——
+            // 旧的通用 `UnificationFailure` 消息是「Type mismatch: expected
+            // Float, got String」，**没说清为什么这里必须同一种类型**（`dict<K,V>`
+            // 需要单一 V），而 span 指向整个 dict 的 `{` 而不是出问题的值。
+            // 现在带上键名并把 span 指向该值本身。
             if let Some(prev) = &first_v
                 && !ty.compatible_with(prev)
             {
-                return Err(vec![TypeError::UnificationFailure {
-                    expected: format!("{:?}", prev),
-                    got: format!("{:?}", ty),
-                    span: Some(span),
+                return Err(vec![TypeError::DictValueTypeMismatch {
+                    key: key.clone(),
+                    expected: format!("{prev:?}"),
+                    got: format!("{ty:?}"),
+                    span: Some(value.span),
                 }]);
             }
             if first_v.is_none() {
                 first_v = Some(ty.clone());
             }
+            acc_val = Some(match acc_val {
+                None => ty.clone(),
+                Some(prev) => {
+                    if is_numeric(&prev) && is_numeric(&ty) {
+                        promote_numeric(&prev, &ty)
+                    } else {
+                        prev
+                    }
+                }
+            });
             self.constraints
                 .push(Constraint::Eq(Box::new(v_ty.clone()), Box::new(ty)));
         }
         // v0.75.86: 不报错路径，保留 _span 备未来错误检查扩展点
         let _span = span;
         let _ = _span;
-        Ok((Type::Dict(Box::new(k_ty), Box::new(v_ty)), acc_row))
+        Ok((
+            Type::Dict(Box::new(k_ty), Box::new(acc_val.unwrap_or(v_ty))),
+            acc_row,
+        ))
     }
 }
 

@@ -52,6 +52,34 @@ impl Interpreter {
                 // 真正从文件加载 SKILL.md (REAL file I/O)
                 let path_str = args.first().ok_or("skill.load: requires path")?.to_string();
                 let path = std::path::PathBuf::from(&path_str);
+                // v0.104.6 D409：**补沙箱守卫**（D408 时做不了，现在可以了）。
+                //
+                // `file.rs` 早有明文规则：「新增带路径的入口时，`check_path`
+                // 不是「惯例」而是**义务**」—— 本入口此前**违反**了它：
+                // 直接 `load_file(&path)` 读**任意**调用方给的路径。
+                //
+                // ## D408 为什么没能修
+                //
+                // D408 加过这个守卫，门禁立刻打出 1 失败（跨盘 SKILL.md 被
+                // `sandbox denied`）。根因在 `permissive()`：`fs_root = "/"`
+                // 会被 `canonicalize` 压成**当前盘**，`/` 这个「无限制」哨兵
+                // 根本没被当哨兵 ⇒ 「不限制」实际是「只能访问当前盘」。
+                // 那时「`permissive()` 该是什么」是**未定的产品语义**，
+                // 所以守卫被全量回退，只报告。
+                //
+                // ## 现在为什么能修
+                //
+                // D409 已把 `/` 定为**显式哨兵**（`is_unrestricted`），
+                // `permissive()` 现在真的「全路径、无限制」—— 这与它的 doc
+                // 和 `docs/mora-spec.md` 17.1「当前版本**无沙箱**」都对齐了。
+                //
+                // ⇒ 本守卫在**默认策略下是 no-op**（不收紧任何现有功能），
+                // 而在配置了**限制性** `fs_root` 时，它让 `skill.load`
+                // 与 `file.*` **权限面一致**，堵掉绕过。
+                self.sandbox
+                    .sandbox
+                    .check_path(&path_str)
+                    .map_err(|e| format!("skill.load: sandbox denied '{}': {}", path_str, e))?;
                 let spec = crate::skill::MoraSkillSpec::load_file(&path)
                     .map_err(|e| format!("skill.load: {}", e))?;
                 reg.register(spec);

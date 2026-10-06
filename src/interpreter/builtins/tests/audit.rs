@@ -8,8 +8,48 @@ mod tests_v0421_audit {
     use crate::value::Value;
     use std::sync::Arc;
 
+    use std::ops::Deref;
+
+    /// v0.104.6 D34：审计日志的临时**目录**用 RAII 守卫回收。
+    ///
+    /// 修复前 `temp_log_path()` 每次建一个 `pid_纳秒` 的唯一目录，而各测试
+    /// 末尾只 `remove_file(&path)` —— **删文件、留空目录**；测试若 panic 则
+    /// 连文件都不删。后果是每跑一次测试套件就在 `%TEMP%` 里留下**上百个**
+    /// 空目录并持续累积：实测 `mora_audit_builtin_*` 累积到 **2 954 个**
+    /// （最早 2026-08-15），一次测试跑新增约 100 个。
+    ///
+    /// 改法：`Drop` 时 `remove_dir_all` 整个目录。`Drop` 在 unwind（panic）
+    /// 时同样执行，故**异常路径也不漏**。`Deref<Target = Path>` 让既有
+    /// `&path` 用法（`JsonlAuditSink::new_fresh(&path)` / `remove_file`）
+    /// 一字不改。
+    struct TempLog {
+        dir: PathBuf,
+        file: PathBuf,
+    }
+
+    impl Deref for TempLog {
+        type Target = Path;
+        fn deref(&self) -> &Path {
+            &self.file
+        }
+    }
+
+    // `Deref` 只解决 `&path` 的自动解引用；`JsonlAuditSink::new_fresh` 与
+    // `fs::remove_file` 走的是 `AsRef<Path>` 泛型约束，Deref 不满足。
+    impl AsRef<Path> for TempLog {
+        fn as_ref(&self) -> &Path {
+            &self.file
+        }
+    }
+
+    impl Drop for TempLog {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
     /// v0.42.1: sandbox.audit_emit / audit_flush / audit_verify builtin tests
-    fn temp_log_path(name: &str) -> std::path::PathBuf {
+    fn temp_log_path(name: &str) -> TempLog {
         let dir = std::env::temp_dir().join(format!(
             "mora_audit_builtin_{}_{}",
             std::process::id(),
@@ -19,9 +59,11 @@ mod tests_v0421_audit {
                 .as_nanos()
         ));
         std::fs::create_dir_all(&dir).unwrap();
-        dir.join(name)
+        let file = dir.join(name);
+        TempLog { dir, file }
     }
 
+    use std::path::{Path, PathBuf};
     use std::time::UNIX_EPOCH;
 
     #[test]

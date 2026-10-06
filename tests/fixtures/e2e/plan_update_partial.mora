@@ -1,0 +1,16 @@
+-- e2e：`plan.update` 遇到未知 id 时的**诊断质量**（v0.104.6 D401）
+--
+-- ⚠ 本文件**不**用于验证原子性「Mora 无 try/catch，runtime error 即终止」，
+-- 脚本层观察不到「错误之后」的状态。原子性在
+-- `tests/plan_update_atomicity.rs` 的库级判据里验证。
+--
+-- 本文件钉的是：错误消息**点名缺失的 id**。
+--
+-- Run: cargo run -- tests/fixtures/e2e/plan_update_partial.mora
+
+let n = plan.create("m", [{id: "a", text: "A"}, {id: "b", text: "B"}])
+print("info0=" + str(plan.info("m")))
+
+-- 第 1 项合法、第 2 项未知 ⇒ 报错并点名 `ghost`
+let r = plan.update("m", [["a", "done"], ["ghost", "done"]])
+print("unreachable=" + str(r))

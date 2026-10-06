@@ -22,10 +22,47 @@ pub fn list_recordings(dir: &Path) -> Result<Vec<RecordingInfo>, String> {
             let metadata =
                 fs::metadata(&path).map_err(|e| format!("list: metadata error: {}", e))?;
             let size_bytes = metadata.len();
-            // 快速计数事件数
-            let event_count = count_lines(&path).unwrap_or(0);
-            // 加载首尾事件获取时间范围
-            let (first_ts, last_ts) = load_time_range(&path);
+            // v0.104.6 D184：事件数改用**解析出的**事件数，不再用 `count_lines`
+            // （原始行数）。
+            //
+            // 修前 `list` 与 `stats` 对同一个文件给出**两个数** —— 实测一份
+            // 首行被截断的录像：
+            //
+            // ```text
+            // $ mora record list      →  r2 … EVENTS 3
+            // $ mora record stats r2  →  [warn] 1 of 3 line(s) could not be parsed…
+            //                           →  Events: 2 total
+            // ```
+            //
+            // 且 `list` 是 D178 之后**唯一**仍对跳过行沉默的消费��。
+            //
+            // ⚠ 零额外成本：`load_time_range`（原第 28 行）**本来就**调用
+            // `load_jsonl` 把整个文件解析一遍再丢掉除时间戳外的一切。
+            // 现在从**同一次**加载里顺带取事件数与跳过行 —— 解析次数不变。
+            let (event_count, first_ts, last_ts, skipped) = load_summary(&path);
+            if !skipped.is_empty() {
+                eprintln!(
+                    "[warn] {}: {}/{} line(s) could not be parsed and were SKIPPED — \
+                     the EVENTS column below counts only the {} readable one(s).",
+                    path.display(),
+                    skipped.len(),
+                    event_count + skipped.len(),
+                    event_count
+                );
+            }
+            // v0.104.6 D224：另存**文件 mtime**。此前 `list` 的
+            // 「LAST MODIFIED」列与排序键都用 `last_ts_ms`（最后一条**事件**的
+            // 时间戳），与表头语义不符：
+            //   实测一份**刚写**的录制（事件 ts 指向 2023-11）显示 `1053d ago`，
+            //   且排序把「内容时间最新」当成「最近录制」。
+            // 事件时间来自被录的程序，与「这份录制什么时候存在」是**两件事**
+            // （跨机器、导入旧录制、时钟偏移都会让两者分叉）。
+            let modified_ms: u128 = metadata
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_millis())
+                .unwrap_or(0);
             infos.push(RecordingInfo {
                 name,
                 path,
@@ -33,10 +70,12 @@ pub fn list_recordings(dir: &Path) -> Result<Vec<RecordingInfo>, String> {
                 event_count,
                 first_ts_ms: first_ts,
                 last_ts_ms: last_ts,
+                modified_ms,
             });
         }
     }
-    infos.sort_by_key(|b| std::cmp::Reverse(b.last_ts_ms)); // 最新在前
+    // v0.104.6 D224：按**文件 mtime** 排（表头说的是「最近修改」）
+    infos.sort_by_key(|b| std::cmp::Reverse(b.modified_ms));
     Ok(infos)
 }
 
@@ -49,23 +88,26 @@ pub struct RecordingInfo {
     pub event_count: usize,
     pub first_ts_ms: u128,
     pub last_ts_ms: u128,
+    /// v0.104.6 D224：**文件**最后修改时间（epoch ms）。
+    /// 与 `last_ts_ms`（最后一条**事件**的时间戳）是两件事。
+    pub modified_ms: u128,
 }
 
-fn count_lines(path: &Path) -> Result<usize, String> {
-    let file = fs::File::open(path).map_err(|e| e.to_string())?;
-    let reader = BufReader::new(file);
-    Ok(reader
-        .lines()
-        .map_while(Result::ok)
-        .filter(|l| !l.trim().is_empty())
-        .count())
-}
-
-fn load_time_range(path: &Path) -> (u128, u128) {
-    let events = load_jsonl(path).unwrap_or_default();
-    let first = events.first().map(event_ts).unwrap_or(0);
-    let last = events.last().map(event_ts).unwrap_or(0);
-    (first, last)
+/// 一次加载同时拿到：可读事件数 / 首末时间戳 / 跳过的行。
+///
+/// v0.104.6 D184。原先 `list_recordings` 做**两次**独立工作 ——
+/// `count_lines`（原始行数）与 `load_time_range`（整文件解析后只留时间戳）——
+/// 前者与后者对「事件数」给出**不同答案**。现在合并成一次，
+/// 两者对同一文件**必然一致**。
+fn load_summary(path: &Path) -> (usize, u128, u128, Vec<super::SkippedLine>) {
+    match load_jsonl(path) {
+        Ok((events, skipped)) => {
+            let first = events.first().map(event_ts).unwrap_or(0);
+            let last = events.last().map(event_ts).unwrap_or(0);
+            (events.len(), first, last, skipped)
+        }
+        Err(_) => (0, 0, 0, Vec::new()),
+    }
 }
 
 fn event_ts(ev: &Event) -> u128 {
@@ -86,6 +128,24 @@ pub struct RecordingStats {
     pub ai_chat_count: usize,
     pub web_fetch_count: usize,
     pub note_count: usize,
+    /// v0.104.6 D225：补齐**其余两类**事件的计数。
+    ///
+    /// 修前 `Events: N total` 下面只列 `ai.chat` / `web.fetch` / `notes`
+    /// 三行，而 `Event` 有**五个**变体 —— `Msg` 与 `StateMutation`
+    /// 被计入 `total_events` 却不显示在任何一行：
+    ///
+    /// ```text
+    /// $ mora record stats baseline     # 18 条全是 state_mutation
+    /// Events:        18 total
+    ///   ai.chat:     0
+    ///   web.fetch:   0
+    ///   notes:       0          ← 0+0+0 ≠ 18，且零提示
+    /// ```
+    ///
+    /// 分解读起来像**穷尽**分类，实则不是 —— 用户据此判断「录了 18 次调用
+    /// 却一次都没成功」之类，是**误导**。加上这两行后子类之和恒等于 total。
+    pub msg_count: usize,
+    pub state_mutation_count: usize,
     pub error_count: usize,
     pub total_tokens_in: usize,
     pub total_tokens_out: usize,
@@ -103,6 +163,8 @@ pub fn compute_stats(events: &[Event]) -> RecordingStats {
         ai_chat_count: 0,
         web_fetch_count: 0,
         note_count: 0,
+        msg_count: 0,
+        state_mutation_count: 0,
         error_count: 0,
         total_tokens_in: 0,
         total_tokens_out: 0,
@@ -149,7 +211,9 @@ pub fn compute_stats(events: &[Event]) -> RecordingStats {
                 stats.note_count += 1;
             }
             // v0.83: Msg + StateMutation 不进 latency/tokens 统计
-            Event::Msg { .. } | Event::StateMutation { .. } => {}
+            // v0.104.6 D225：但**必须计数** —— 否则 `total_events` 与子类之和对不上。
+            Event::Msg { .. } => stats.msg_count += 1,
+            Event::StateMutation { .. } => stats.state_mutation_count += 1,
         }
     }
     stats.models = model_set.into_iter().collect();
@@ -292,6 +356,13 @@ fn export_markdown(events: &[Event], name: &str) -> String {
     md.push_str(&format!("- Events: {}\n", stats.total_events));
     md.push_str(&format!("- AI calls: {}\n", stats.ai_chat_count));
     md.push_str(&format!("- Web calls: {}\n", stats.web_fetch_count));
+    // v0.104.6 D225：markdown 报告此前连 `notes` 都没有，分解更不穷尽。
+    md.push_str(&format!("- Notes: {}\n", stats.note_count));
+    md.push_str(&format!("- Messages: {}\n", stats.msg_count));
+    md.push_str(&format!(
+        "- State mutations: {}\n",
+        stats.state_mutation_count
+    ));
     md.push_str(&format!("- Errors: {}\n", stats.error_count));
     md.push_str(&format!(
         "- Tokens: {} in + {} out\n",
@@ -304,11 +375,10 @@ fn export_markdown(events: &[Event], name: &str) -> String {
     md.push_str("|---|------|--------|--------|---------|--------|\n");
     let rows = build_timeline(events);
     for row in &rows {
-        let detail = if row.detail.len() > 40 {
-            format!("{}…", &row.detail[..39])
-        } else {
-            row.detail.clone()
-        };
+        // v0.104.6 D179：原为 `row.detail.len() > 40` + `&row.detail[..39]`
+        // （字节数判断 + 字节数切片）→ 中文内容必 panic。改走
+        // `truncate_display`（按字符）。
+        let detail = truncate_display(&row.detail, 40);
         md.push_str(&format!(
             "| {} | {} | {} | {} | {}ms | {} |\n",
             row.seq, row.kind, detail, row.tokens, row.latency_ms, row.status

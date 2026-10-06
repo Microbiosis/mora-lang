@@ -84,6 +84,25 @@ impl Semaphore {
         }
     }
 
+    /// v0.104.6 D65：快路径无锁 CAS，慢路径**必须持锁重查**才能 wait。
+    ///
+    /// 修复前的丢唤醒窗口（原实现在全量测试里把 `exec_parallel_respects_
+    /// max_concurrent` 挂死过一次 —— CPU 冻结、无子进程、日志停滞）：
+    ///
+    /// ```text
+    /// W(等待者): load(permits) → 0        → 未持锁
+    /// R(释放者): fetch_add → prev=0      → permits = 1
+    /// R:        lock(mutex) → notify_one() → 此时 W 尚未注册为 waiter，通知丢弃
+    /// R:        unlock(mutex)
+    /// W:        lock(mutex) → cond.wait() → **permits=1 可用却永久睡眠**
+    /// ```
+    ///
+    /// 根因是「决定是否等待」的判断发生在锁**之外**：release 把 permit 加上去
+    /// 之后才去拿锁，而 wait 在拿锁**之前**就已经决定要睡了，两者之间没有任何
+    /// 同步。持锁重查后，`wait` 的注册与 `release` 的通知必然在同一个 mutex
+    /// 上排序，通知不可能再被丢弃。
+    ///
+    /// 快路径保留：无竞争时仍是一次 CAS，不付 mutex 代价。
     fn acquire(&self) {
         loop {
             let current = self.permits.load(Ordering::Acquire);
@@ -95,20 +114,26 @@ impl Semaphore {
             {
                 return;
             }
-            // 否则等待
+            // 慢路径：持锁重查。permits 在锁内仍为 0 才是可靠的「要睡」判据。
             let guard = self.mutex.lock().expect("semaphore mutex poisoned");
+            if self.permits.load(Ordering::Acquire) > 0 {
+                // 竞争失败期间别人放出了 permit —— 放锁回快路径重试 CAS。
+                continue;
+            }
             drop(self.cond.wait(guard).expect("condvar wait failed"));
         }
     }
 
+    /// v0.104.6 D65：改为**无条件** notify_one。
+    ///
+    /// 原实现只在 `prev == 0` 时通知，那是个脆弱的启发式：当 permits 从 1
+    /// 涨到 2（或更高）时 `prev != 0` 就不通知，而此时完全可能仍有等待者在
+    /// 睡眠 —— 唤醒必须与「是否有等待者」解耦，只与「permit 增加了」绑定。
+    /// `notify_one` 在无等待者时是空操作，代价可忽略。
     fn release(&self) {
-        // v0.49.0 (A4): use AcqRel (not SeqCst) for lighter memory barrier.
-        // prev == 0 means waiter queue may have blocked acquirers; wake one.
-        let prev = self.permits.fetch_add(1, Ordering::AcqRel);
-        if prev == 0 {
-            let _guard = self.mutex.lock().expect("semaphore mutex poisoned");
-            self.cond.notify_one();
-        }
+        self.permits.fetch_add(1, Ordering::AcqRel);
+        let _guard = self.mutex.lock().expect("semaphore mutex poisoned");
+        self.cond.notify_one();
     }
 }
 
@@ -136,36 +161,83 @@ fn exec_parallel(args: &[Value]) -> Result<Value, String> {
         _ => return Err("exec.parallel: first arg must be a list of strings".to_string()),
     };
 
-    if cmds.is_empty() {
-        return Ok(Value::List(Vec::new()));
-    }
-
+    // ⚠ 空列表的早返回在**下方**（两个可选参数校验之后）——
+    // v0.104.6 D337：它原本在**可选参数校验之前**，于是
+    //   exec.parallel(["echo a"], -1)  → exit 1  max_concurrent must be a non-negative number
+    //   exec.parallel([], -1)          → exit 0  **[]**（同一个非法参数，被静默吞掉）
+    // 同一个非法 `max_concurrent`，**因为命令列表是空的就看不到错误** ⇒ 校验不一致。
+    // 现把早返回**下移**到两个可选参数都校验完之后，让「参数非法」与
+    // 「有没有活干」彻底解耦。
+    //
+    // ⚠ 这是**收紧**：此前 `exec.parallel([], <非法>)` 静默返回 `[]`。
+    // 判据见 `tests/exec_parallel_arity_and_validation.rs`。
+    // 不变的：`exec.parallel([])`（**不传**可选参数）仍返回 `[]`，那条是合法的。
+    //
     // 第二个 arg (可选): max_concurrent
+    //
+    // v0.104.6 D285：修前的错误消息写着「must be a non-negative number」，
+    // 但代码**只挡了非数值类型**（那个 `_ =>` 分支），**没有非负检查**：
+    //   `Value::Float(-1.0) as usize` → 饱和成 0  → `.max(1)` → **1**
+    //   `Value::Int(-1)   as usize` → **回绕**成 usize::MAX → **并发上限形同虚设**
+    // 同一句源码、两种数值类型给出天差地别的并发控制，且 exit 0、零诊断。
+    // 现改走 D246 的收口 `value_as_usize`（负数一律 `None`），**如实兑现**那句错误消息。
+    // ⚠ 空列表的早返回在**上方**（两个可选参数校验之后）——
+    // v0.104.6 D337：它原本在**可选参数校验之前**，于是
+    //   exec.parallel(["echo a"], -1)  → exit 1  max_concurrent must be a non-negative number
+    //   exec.parallel([], -1)          → exit 0  **[]**（同一个非法参数，被静默吞掉）
+    // 同一个非法 `max_concurrent`，**因为命令列表是空的就看不到错误** ⇒ 校验不一致。
+    // 现把早返回**下移**到两个可选参数都校验完之后（见下方 `if cmds.is_empty()`），
+    // 这样「参数非法」与「有没有活干」彻底解耦。
+    //
+    // ⚠ 这是**收紧**：此前 `exec.parallel([], <非法>)` 静默返回 `[]`。
+    // 判据见 `tests/exec_parallel_arity_and_validation.rs`。
+    // 不变的：`exec.parallel([])`（**不传**可选参数）仍返回 `[]`，那条是合法的。
     let max_concurrent: usize = if args.len() >= 2 {
         match &args[1] {
-            Value::Float(n) => (*n as usize).max(1),
-            Value::Int(i) => (*i as usize).max(1),
-            _ => {
-                return Err(
-                    "exec.parallel: max_concurrent must be a non-negative number".to_string(),
-                );
-            }
+            Value::Nil => cmds.len(), // 默认: 全部并发（与缺参同义）
+            other => crate::flow::value_as_usize(other)
+                .map(|n| n.max(1))
+                .ok_or_else(|| {
+                    "exec.parallel: max_concurrent must be a non-negative number".to_string()
+                })?,
         }
     } else {
         cmds.len() // 默认: 全部并发
     };
 
     // 第三个 arg (可选): timeout_ms
+    //
+    // v0.104.6 D285：同一族的第二处，后果更明显。修前：
+    //   `Value::Float(-1.0) as u64` → 饱和成 0 → `Duration::ZERO`
+    //       ⇒ 超时机制**立刻杀进程**（实测 280ms 就返回，输出是 taskkill 的 SUCCESS）
+    //   `Value::Int(-1)   as u64` → **回绕**成 u64::MAX ≈ 5.8 亿年
+    //       ⇒ 超时机制**完全失效**（实测 3106ms，命令跑满全程）
+    // 同一个 `-1`，一边「立刻杀」一边「永不超时」。
     let timeout: Option<Duration> = if args.len() >= 3 {
         match &args[2] {
-            Value::Float(n) => Some(Duration::from_millis(*n as u64)),
-            Value::Int(i) => Some(Duration::from_millis(*i as u64)),
             Value::Nil => None,
-            _ => return Err("exec.parallel: timeout_ms must be a number or nil".to_string()),
+            other => {
+                let ms = crate::flow::value_as_usize(other).ok_or_else(|| {
+                    "exec.parallel: timeout_ms must be a non-negative number or nil".to_string()
+                })?;
+                Some(Duration::from_millis(ms as u64))
+            }
         }
     } else {
         None
     };
+
+    // v0.104.6 D337：空列表早返回**下移**到这里 —— 在两个可选参数都校验完之后。
+    // 理由见上方注释：此前它在校验之前，于是「同一个非法 `max_concurrent`，
+    // 因为命令列表是空的就看不到错误」。
+    //
+    // 注意 `max_concurrent` 在上面已被 `.max(1)` 钳过、空列表时不影响
+    // 任何并发行为 ⇒ 移动早返回**不改变**合法调用的结果，只让非法参数
+    // 不再被静默吞掉。
+    if cmds.is_empty() {
+        // TEETH-CHECK: 早返回被移回参数校验之前
+        return Ok(Value::List(Vec::new().into()));
+    }
 
     let sem = Arc::new(Semaphore::new(max_concurrent));
     let (tx, rx) = mpsc::channel::<ParallelResult>();
@@ -241,9 +313,26 @@ fn run_single_cmd(
     cancelled: &Arc<AtomicBool>,
 ) -> ParallelResult {
     let start = Instant::now();
-    let mut command = Command::new("sh");
+    // v0.104.6：shell 选择按平台适配。
+    //
+    // 此前硬编码 `Command::new("sh")` —— 在没有 POSIX `sh` 的平台（典型是
+    // 未装 Git Bash / MSYS 的 Windows）上**每个命令都 spawn 失败**，返回
+    // `ParallelResult.success=false` 且 stdout 为空，于是
+    // `tests_v043_exec` 的 5 个 `exec_parallel_*` 用例全挂
+    // （`spawn failed: program not found` / `left: ""`）。
+    //
+    // Windows 用 `cmd /C`；其余平台沿用 `sh -c`。两者都是「shell -c 形式」
+    // 执行，调用方传入的命令串语义不变。
+    let mut command = if cfg!(windows) {
+        let mut c = Command::new("cmd");
+        c.arg("/C");
+        c
+    } else {
+        let mut c = Command::new("sh");
+        c.arg("-c");
+        c
+    };
     command
-        .arg("-c")
         .arg(cmd_str)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -408,7 +497,7 @@ mod tests_v043_exec {
         let interp = Interpreter::new();
         let cmds = vec![cmd("echo a"), cmd("echo b"), cmd("echo c")];
         let result = interp
-            .call_exec_method("parallel", &[Value::List(cmds)])
+            .call_exec_method("parallel", &[Value::List(cmds.into())])
             .unwrap();
         let list = match result {
             Value::List(l) => l,
@@ -443,7 +532,7 @@ mod tests_v043_exec {
         // 跳过 perf assertion — 只验证结果正确
         let cmds: Vec<Value> = (0..6).map(|i| cmd(&format!("echo {}", i))).collect();
         let result = interp
-            .call_exec_method("parallel", &[Value::List(cmds), Value::Float(2.0)])
+            .call_exec_method("parallel", &[Value::List(cmds.into()), Value::Float(2.0)])
             .unwrap();
         let list = match result {
             Value::List(l) => l,
@@ -474,12 +563,15 @@ mod tests_v043_exec {
     fn exec_parallel_empty_list_returns_empty() {
         let interp = Interpreter::new();
         let result = interp
-            .call_exec_method("parallel", &[Value::List(vec![])])
+            .call_exec_method("parallel", &[Value::List(vec![].into())])
             .unwrap();
-        assert_eq!(result, Value::List(Vec::new()));
+        assert_eq!(result, Value::List(Vec::new().into()));
     }
 
     #[test]
+    #[cfg(unix)]
+    // v0.104.6：该用例依赖 POSIX shell 语义（printf / sleep / 进程组 / exit 127），
+    // 在 Windows 的 `cmd /C` 下无对应物 —— 故按平台门控，不再因平台差异误报。
     fn exec_parallel_collects_stdout_per_command() {
         let interp = Interpreter::new();
         let cmds = vec![cmd("echo line1"), cmd("printf line2"), cmd("echo line3")];
@@ -518,6 +610,9 @@ mod tests_v043_exec {
     }
 
     #[test]
+    #[cfg(unix)]
+    // v0.104.6：该用例依赖 POSIX shell 语义（printf / sleep / 进程组 / exit 127），
+    // 在 Windows 的 `cmd /C` 下无对应物 —— 故按平台门控，不再因平台差异误报。
     fn exec_parallel_kills_process_group_on_timeout() {
         let interp = Interpreter::new();
         // "sleep 10" + timeout 200ms → 应报 timeout
@@ -563,12 +658,15 @@ mod tests_v043_exec {
         let interp = Interpreter::new();
         let cmds = vec![cmd("echo ok"), Value::Float(42.0)]; // 第二个不是 string
         let err = interp
-            .call_exec_method("parallel", &[Value::List(cmds)])
+            .call_exec_method("parallel", &[Value::List(cmds.into())])
             .expect_err("non-string cmd should fail");
         assert!(err.contains("must be a string"), "got: {}", err);
     }
 
     #[test]
+    #[cfg(unix)]
+    // v0.104.6：该用例依赖 POSIX shell 语义（printf / sleep / 进程组 / exit 127），
+    // 在 Windows 的 `cmd /C` 下无对应物 —— 故按平台门控，不再因平台差异误报。
     fn exec_parallel_returns_error_for_missing_command() {
         // sh -c 调用不存在的命令 → sh 返回 exit_code=127, stderr "command not found"
         let interp = Interpreter::new();
@@ -614,5 +712,48 @@ mod tests_v043_exec {
             .call_exec_method("nonexistent", &[])
             .expect_err("unknown method should fail");
         assert!(err.contains("unknown method"), "got: {}", err);
+    }
+
+    /// v0.104.6 D65 回归：**permit 数少于线程数**的高争用场景下，
+    /// acquire/release 必须全部成对完成。
+    ///
+    /// 覆盖的正是丢唤醒窗口 —— 16 线程抢 4 个 permit，等待者一定会真正进入
+    /// `cond.wait`，一旦 `wait` 的注册与 `release` 的通知之间失去同步（本机
+    /// 实测曾把 `exec_parallel_respects_max_concurrent` 挂死），本测试就会
+    /// 永久阻塞而不是失败。因此它同时是**死锁探测器**：跑不完就是回归。
+    ///
+    /// 诚实说明：**本测试抓不住原缺陷** —— 已做反向验证：把 `acquire`/`release`
+    /// 临时改回修复前的实现后，本测试仍 0.00s 通过（16 线程 × 400 轮在多核上
+    /// 几乎全走 CAS 快路径，几乎不进 `cond.wait`）。原缺陷需要「load 失败」与
+    /// 「wait 注册」之间恰好插入一次 release 这个窄窗口，从公共接口无法确定性
+    /// 构造。故本测试钉的是**不变量**（「全部配对完成」+「permit 计数守恒」），
+    /// 不是缺陷复现器；缺陷本身靠代码结构论证（见 `acquire` 注释里的时序图）
+    /// 与那次全量测试挂死观测共同支撑。
+    #[test]
+    fn semaphore_high_contention_completes_and_conserves_permits() {
+        const THREADS: usize = 16;
+        const ITERS: usize = 400;
+        const PERMITS: usize = 4;
+
+        let sem = Arc::new(Semaphore::new(PERMITS));
+        let handles: Vec<_> = (0..THREADS)
+            .map(|_| {
+                let sem = sem.clone();
+                thread::spawn(move || {
+                    for _ in 0..ITERS {
+                        sem.acquire();
+                        sem.release();
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().expect("信号量工作线程 panic");
+        }
+        assert_eq!(
+            sem.permits.load(Ordering::Acquire),
+            PERMITS,
+            "全部 acquire/release 配对后 permit 数必须回到初始值"
+        );
     }
 }

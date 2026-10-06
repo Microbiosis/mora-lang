@@ -69,7 +69,7 @@ pub struct CoreRuntime {
     /// v0.87: gensym 计数器。每次 gensym() 调用递增，保证符号名唯一。
     /// v0.95: 纯 `usize` —— 唯一消费点（gensym builtin）在 `&mut self` 上
     /// 递增，无跨线程共享；Clone 按值复制（Pregel worker 各自独立计数，
-    /// 与旧 Arc<Mutex> clone 的分歧语义一致），无需锁。
+    /// 与旧 Arc`<Mutex>` clone 的分歧语义一致），无需锁。
     pub(crate) gensym_counter: usize,
     /// v0.99: ambient random 状态（纯值）。`random.*` 方法调用的 ambient
     /// effect 由本状态兜底应答 —— 取代 v0.91 的进程级
@@ -77,6 +77,18 @@ pub struct CoreRuntime {
     /// （锁分类第 1 类），无锁；Clone 按值复制 —— worker 各自独立推进
     /// 序列，并发从「共享一把锁」变成「值拷贝即隔离」。
     pub(crate) random_state: crate::runtime::random::Xoshiro256,
+
+    /// v0.104.6：`perform_effect` 最近一次 ambient 兜底失败的**真实原因**。
+    ///
+    /// `MirHost::perform_effect` 的签名是 `Option<Value>`，没有错误通道，
+    /// 所以 `dispatch_op` 的 `Err` 过去只能被 `.ok()` 吞掉，调用方一律报
+    /// 「ambient random state missing — runtime invariant violated」——
+    /// 可 handler 其实跑到了，失败原因是实参校验。
+    ///
+    /// 这里暂存原始消息，由 `method_dispatch::call_random_ambient` 取走
+    /// （取走即清空，避免陈旧消息串到下一次调用）。只在 ambient 兜底路径
+    /// 写入；注册表命中与真正 unhandled 都不写。
+    pub(crate) last_ambient_error: Option<String>,
 }
 
 impl Default for CoreRuntime {
@@ -90,6 +102,7 @@ impl Default for CoreRuntime {
             effect_handlers: crate::runtime::effect::EffectRegistry::default(),
             gensym_counter: 0,
             random_state: crate::runtime::random::Xoshiro256::from_time(),
+            last_ambient_error: None,
         }
     }
 }
@@ -114,6 +127,7 @@ impl Clone for CoreRuntime {
             effect_handlers: crate::runtime::effect::EffectRegistry::default(),
             gensym_counter: self.gensym_counter,
             random_state: self.random_state,
+            last_ambient_error: None,
         }
     }
 }

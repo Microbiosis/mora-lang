@@ -42,24 +42,33 @@ fn collect_field_names(items: &[Value]) -> Vec<String> {
             }
         }
     }
+    // v0.104.6 可复现性修复：按 key 排序。
+    //
+    // `Value::Dict` 是 `HashMap`，`d.keys()` 的序**每进程随机**；而本函数
+    // 保留「首次出现」顺序，**把这个随机序原样传给下游** ——
+    // `extract_field_stats` 返回的 `Vec<FieldStats>` 顺序随机，进而影响
+    // `crush_json` 的策略选择（`detect_array_type` / `try_lossless_compact` /
+    // 策略分派都吃这个列表）。
+    //
+    // 字段名来自 JSON 对象，按 RFC 8259 本就无序，故排序不损失任何信息。
+    // 与 `flow::json::value_to_json` / `Value` 的 Display / `keys()`、
+    // `values()` 统一为「按 key 排序」。
+    names.sort();
     names
 }
 
 pub fn detect_field_role(name: &str, values: &[&Value]) -> FieldStats {
     let uniqueness = compute_uniqueness(values);
     let null_rate = compute_null_rate(values);
-    let is_numeric = !values.is_empty() && values.iter().all(|v| matches!(v, Value::Float(_)));
-    let numeric_range = if is_numeric {
-        let nums: Vec<f64> = values
+    // v0.104.6 D231：`Int` 与 `Float` 都算数值。
+    // 修前 `matches!(v, Value::Float(_))` ⇒ `json.parse` 读入的整数列
+    // 被判为**非数值**，角色推断 / range / outlier / 策略选择全部失准。
+    let is_numeric = !values.is_empty()
+        && values
             .iter()
-            .filter_map(|v| {
-                if let Value::Float(n) = v {
-                    Some(*n)
-                } else {
-                    None
-                }
-            })
-            .collect();
+            .all(|v| super::json::value_as_f64(v).is_some());
+    let numeric_range = if is_numeric {
+        let nums: Vec<f64> = super::json::values_as_f64(values.iter().copied());
         if nums.is_empty() {
             None
         } else {
@@ -159,16 +168,8 @@ fn detect_error(name: &str, values: &[&Value]) -> Option<FieldRole> {
 fn detect_anomaly(values: &[&Value]) -> Option<FieldRole> {
     // 数值字段: 远离 mean > 3σ (更严格, 避免均匀分布的尾部被误判)
     // 且 outlier 数量少 (1-5% 范围, 不能 0 也不能太多)
-    let nums: Vec<f64> = values
-        .iter()
-        .filter_map(|v| {
-            if let Value::Float(n) = v {
-                Some(*n)
-            } else {
-                None
-            }
-        })
-        .collect();
+    // v0.104.6 D231：数值提取统一走 `super::json::value_as_f64`（Int 侧也接受）
+    let nums: Vec<f64> = super::json::values_as_f64(values.iter().copied());
     if nums.len() >= 5 {
         let mean = nums.iter().sum::<f64>() / nums.len() as f64;
         let var = nums.iter().map(|n| (n - mean).powi(2)).sum::<f64>() / nums.len() as f64;
@@ -243,16 +244,9 @@ fn is_uuid_pattern(v: &Value) -> bool {
 }
 
 fn is_sequential_numeric(values: &[&Value]) -> bool {
-    let nums: Vec<f64> = values
-        .iter()
-        .filter_map(|v| {
-            if let Value::Float(n) = v {
-                Some(*n)
-            } else {
-                None
-            }
-        })
-        .collect();
+    // v0.104.6 D231：Int 序列 1,2,3,… 本该被识别为**顺序 Id**。
+    // 修前只认 `Float`，`json.parse` 读入的整数列永远进不了 Id 角色。
+    let nums: Vec<f64> = super::json::values_as_f64(values.iter().copied());
     if nums.len() < 3 {
         return false;
     }
@@ -269,6 +263,19 @@ fn is_timestamp_pattern(v: &Value) -> bool {
             iso || unix
         }
         Value::Float(n) => *n > 1_000_000_000.0 && *n < 10_000_000_000.0,
+        // v0.104.6 D264：Unix 秒级时间戳若来自 `json.parse` 就是 `Int`（D129），
+        // 落 `_ => false` ⇒ 字段不被判为 Temporal ⇒ `ArrayType::TimeSeries`
+        // 推断失败（实测落到 `Uniform`，压缩器完全不做针对性处理）。
+        // 与 D231 修的 `is_numeric` 同族。
+        //
+        // ⚠ 范围要窄：**只补 `Int`**，不顺手改 `value_byte_size` 的保守估计
+        // （那是 D227 硬上限的**安全方向**，改了会连带改变压缩行为 —— 本轮
+        // 试过，连带把 `Float` 时间序列从 `TimeSeries` 打成 `Uniform`）。
+        // 也不加 `BigInt`：时间戳不会是 BigInt，且 `to_f64` 需额外 import。
+        Value::Int(n) => {
+            let f = *n as f64;
+            f > 1_000_000_000.0 && f < 10_000_000_000.0
+        }
         _ => false,
     }
 }

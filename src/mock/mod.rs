@@ -77,13 +77,29 @@ impl MockRegistry {
     }
 
     /// 列出所有已注册 handler 名 (test helper)
+    ///
+    /// v0.104.6 D405：**按名称排序**返回。
+    ///
+    /// 修前直接返回 `HashMap` 的键 ⇒ 迭代序由 `RandomState`（**逐进程随机**）
+    /// 决定。实测同一段脚本连跑 6 次得到 **6 个不同顺序**：
+    /// ```text
+    /// [charlie, bravo, delta, echo, alpha]
+    /// [delta, bravo, echo, charlie, alpha]
+    /// [echo, bravo, charlie, alpha, delta]   …（共 6 次全不同）
+    /// ```
+    /// `mock.names()` 是**脚本可达**的（`examples/integration_v0_34.mora` 就在用），
+    /// 所以这不是内部噪声，而是**用户可见的输出不确定** ——
+    /// 与 D280 修 `tool.list_tools`、D385 立的「HashMap 迭代顺序不确定
+    /// → 会让结果依赖顺序」是同一条原则。
+    ///
+    /// ⚠ 既有单测 `multiple_handlers` **自己先 `sort()` 再比较**
+    /// ⇒ 排不排序**都能通过**，对顺序**没有牙齿**；
+    /// 真正的守卫在 `tests/mock_registry_determinism.rs`。
     pub fn names(&self) -> Vec<String> {
-        self.handlers
-            .lock()
-            .expect("mock registry mutex poisoned")
-            .keys()
-            .cloned()
-            .collect()
+        let map = self.handlers.lock().expect("mock registry mutex poisoned");
+        let mut names: Vec<String> = map.keys().cloned().collect();
+        names.sort();
+        names
     }
 }
 

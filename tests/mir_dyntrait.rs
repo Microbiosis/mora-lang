@@ -10,11 +10,11 @@
 use mora::interpreter::Interpreter;
 use mora::mir::vm::{run_main_task, run_mir};
 use mora::parser_v3::ParserV3;
-use mora::typeck::check_mir::check_program_witnesses;
+use mora::typeck::check_mir::check_program_witnesses_bidirectional;
 
 fn run_via_mir(source: &str) -> Result<(), String> {
     let (func, witnesses) = ParserV3::compile(source)?;
-    let type_errs = check_program_witnesses(&witnesses);
+    let type_errs = check_program_witnesses_bidirectional(&witnesses);
     if !type_errs.is_empty() {
         return Err(format!("typeck: {} error(s)", type_errs.len()));
     }

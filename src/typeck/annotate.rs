@@ -1,6 +1,6 @@
 //! v0.89: TypeAnnotator — Phase 2 EHIR 构建。
 //!
-//! 将 FCFG（Node<()>）+ TypeTable（影子表）→ EHIR（Node<TypeInfo>）。
+//! 将 FCFG（Node<()>）+ TypeTable（影子表）→ EHIR（Node`<TypeInfo>`）。
 //!
 //! 遍历每个 Node<()>，用其 span 查 TypeTable，将查到的 (Type, EffectRow)
 //! 填入 TypeInfo meta。查不到的节点保留 TypeInfo::unknown()（降级处理，
@@ -398,8 +398,10 @@ fn annotate_node(node: &Fcfg, table: &TypeTable) -> Node<TypeInfo> {
             handler,
             k_param,
             span,
+            dst,
             ..
         } => Node::Handle {
+            dst: *dst,
             effect: effect.clone(),
             body: annotate_block(body, table),
             handler: annotate_block(handler, table),
@@ -491,6 +493,7 @@ fn annotate_node(node: &Fcfg, table: &TypeTable) -> Node<TypeInfo> {
             meta: info,
         },
         Node::Solve {
+            dst,
             limit,
             query_vars,
             anon_vars,
@@ -498,6 +501,7 @@ fn annotate_node(node: &Fcfg, table: &TypeTable) -> Node<TypeInfo> {
             span,
             ..
         } => Node::Solve {
+            dst: *dst,
             limit: *limit,
             query_vars: query_vars.clone(),
             anon_vars: anon_vars.clone(),
@@ -570,11 +574,14 @@ fn annotate_node(node: &Fcfg, table: &TypeTable) -> Node<TypeInfo> {
         Node::WithConfig {
             bindings,
             body,
+            dst,
             span,
             ..
         } => Node::WithConfig {
             bindings: bindings.clone(),
             body: annotate_block(body, table),
+            // v0.104.6 D58：`dst` 是节点的结果寄存器，标注不改变它
+            dst: *dst,
             span: *span,
             meta: info,
         },

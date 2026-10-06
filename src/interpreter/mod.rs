@@ -254,8 +254,31 @@ impl crate::mir::host::MirHost for Interpreter {
         // v0.99: ambient 兜底 —— ambient 标签（如 random_*）由运行时内置的
         // 单属主纯值状态应答（无锁；用户 handle 注册表优先，动态作用域可覆写）。
         // 查找顺序：注册表 → ambient。都不命中 = 真正 unhandled。
+        //
+        // v0.104.6：`dispatch_op` 的 `Err` 原先被 `.ok()` 吞成 `None`，调用方
+        // `call_random_ambient` 据此报
+        //     unhandled effect: random_rand_float
+        //       (ambient random state missing — runtime invariant violated)
+        // 而真实原因是 `random.rand_float requires (min, max)` —— handler 明明
+        // 跑到了，是**实参校验失败**。那句「runtime invariant violated」把诊断
+        // 引向不存在的基建故障，实际是自己的调用写错了。
+        //
+        // 之所以没被用户撞上：`random.*` 的 arity 与实参类型由 typeck 的
+        // ambient 签名预置先拦（实测 `mora run` 报的是
+        // "Expected 2 arguments, got 0" / "expected list<any>, got string"），
+        // `dispatch_op` 的校验是纵深防御。但**库内路径**（`run_mir` 不跑
+        // typeck，也就是全部测试套件与任何嵌入 Mora 的调用方）够得到。
+        //
+        // 本方法的 trait 签名是 `Option<Value>`，没有错误通道，故把消息暂存
+        // 到 `last_ambient_error`，由 `call_random_ambient` 取走并还原真实原因。
         if crate::mir::effect::ambient::is_ambient_label(effect) {
-            return self.core.random_state.dispatch_op(effect, &args).ok();
+            match self.core.random_state.dispatch_op(effect, &args) {
+                Ok(v) => return Some(v),
+                Err(e) => {
+                    self.core.last_ambient_error = Some(e);
+                    return None;
+                }
+            }
         }
 
         None
@@ -363,6 +386,115 @@ impl Default for Interpreter {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// v0.104.6 D18：REPL 的「这段输入写完了吗」判据。
+///
+/// **不能只看 parse 失败** —— 实测两类块首行都能**成功** parse：
+/// - `ParserV3::compile("task twice(n)\n")` → 成功，body 为空；
+/// - `ParserV3::compile("for y in [1,2]\n")` → **成功且 body 非空**
+///   （for 会构造迭代器 setup：`len` / `Index` / `Define`）。
+///
+/// 只判 parse 会把块首行当成「一条完整的语句」接受，于是多行块永远进不去；
+/// 判「body 是否为空」也救不了 `for`。
+///
+/// 这里同时用**两个**配平量，都归零才算完整：
+/// 1. **行首块关键字与 `end` 的配平** —— `task` / `for` / `while` / `if` /
+///    `match` / `with` / `worker` / `transaction` / `macro` / `observe` /
+///    `parallel` / `model` / `msg` / `update` / `app` 这类**用 `end` 收尾**的；
+/// 2. **花括号配平** —— `handle E { body } { handler }` 是**花括号**形态、
+///    **根本没有 `end`**（只算关键字会永远卡在续行里）。
+///
+/// 只统计**行首**的 opener，因此 `x = for …` 不会误计；`--` 行注释与
+/// 字符串字面体在计数前被剥掉，`str("end")` / `print("{")` 不会破坏配平。
+///
+/// 非块首行输入（表达式 / `let` / `assign` / 调用）不受影响 —— 它们两个
+/// 配平量天然都 ≤ 0。
+fn repl_input_is_complete(src: &str) -> bool {
+    const OPENERS: &[&str] = &[
+        "task",
+        "for",
+        "while",
+        "if",
+        "match",
+        "with",
+        "worker",
+        "transaction",
+        "macro",
+        "observe",
+        "parallel",
+        "model",
+        "msg",
+        "update",
+        "app",
+        // ⚠ `handle` **不在**此列：它是 `handle E { body } { handler }` 的
+        // **花括号**形态、没有 `end`。若按 `end` 计，它会让 end_depth 永远
+        // 回不到 0，整段输入永久卡在续行里（实测）。交给下面的 brace_depth 管。
+    ];
+    let mut end_depth: i64 = 0;
+    let mut brace_depth: i64 = 0;
+    for raw in src.lines() {
+        // 去掉 `--` 行注释（注意不能误伤字符串里的 `--`，故先切字符串）
+        let line = strip_repl_literals(raw);
+        let line = match line.find("--") {
+            Some(i) => line[..i].to_string(),
+            None => line,
+        };
+        let head = line.trim_start();
+        let head = head.split_whitespace().next().unwrap_or("");
+        // 行首 token 可能带尾随标点（`if(x)`），截到非标识符字符
+        let head: String = head
+            .chars()
+            .take_while(|c| c.is_alphanumeric() || *c == '_')
+            .collect();
+        if head == "end" {
+            end_depth -= 1;
+        } else if head == "else" {
+            // `else` / `else if` 都不开新块
+        } else if OPENERS.contains(&head.as_str()) {
+            end_depth += 1;
+        }
+        for c in line.chars() {
+            match c {
+                '{' => brace_depth += 1,
+                '}' => brace_depth -= 1,
+                _ => {}
+            }
+        }
+    }
+    end_depth <= 0 && brace_depth <= 0
+}
+
+/// 把字符串字面体的内容抹掉（保留引号本身），使后续的注释/配平统计
+/// 不会被 `"end"` / `'{'` 之类的内容干扰。
+fn strip_repl_literals(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut chars = line.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '"' | '\'' => {
+                let quote = c;
+                out.push(c);
+                // 跳过到配对的引号；char 字面量 `'a'` 与字符串同形处理
+                while let Some(&n) = chars.peek() {
+                    chars.next();
+                    out.push(n);
+                    if n == '\\' {
+                        if let Some(&e) = chars.peek() {
+                            chars.next();
+                            out.push(e);
+                        }
+                        continue;
+                    }
+                    if n == quote {
+                        break;
+                    }
+                }
+            }
+            _ => out.push(c),
+        }
+    }
+    out
 }
 
 impl Interpreter {
@@ -609,15 +741,47 @@ impl Interpreter {
         for (key, v) in bindings {
             match key.as_str() {
                 "model" => cfg.model = Some(v.to_string()),
-                "temperature" => {
-                    if let Value::Float(n) = v {
-                        cfg.temperature = Some(*n);
+                "temperature" => match crate::flow::value_as_f64(v) {
+                    Some(n) => cfg.temperature = Some(n),
+                    // v0.104.6 D39：实参**存在**但类型不对 —— 报错，不静默跳过。
+                    // 旧实现 `if let Value::Float(n)` 落空即什么都不做，于是
+                    // `with temperature = "hot"` exit 0、零提示，配置**静默失效**。
+                    // 这与 D1（`range` 实参类型不对 → 静默取默认值）同型。
+                    //
+                    // v0.104.6 D249：原先只认 `Value::Float`。而**数字字面量**
+                    // 恰好是 Float（D98），所以 `with temperature = 1` 能过
+                    // —— 但任何**返回 Int 的表达式**就报：
+                    //   with temperature = len([1,2,3])
+                    //   → "expects a number, got int"   ← 「int 明明是数字」
+                    // 即同一个值，取决于它**怎么算出来的**，结果不同。
+                    None => {
+                        self.core.config_stack.pop();
+                        return Err(format!(
+                            "with-config `temperature` expects a number, got {}",
+                            crate::flow::type_name(v)
+                        ));
                     }
-                }
+                },
                 "max_tokens" => {
-                    if let Value::Float(n) = v {
-                        cfg.max_tokens = Some(*n as usize);
+                    // v0.104.6 D249：同 temperature —— 改走收口，Int 也接受。
+                    let n = match crate::flow::value_as_f64(v) {
+                        Some(n) => n,
+                        None => {
+                            self.core.config_stack.pop();
+                            return Err(format!(
+                                "with-config `max_tokens` expects a number, got {}",
+                                crate::flow::type_name(v)
+                            ));
+                        }
+                    };
+                    // v0.104.6 D147：与 D146（`take`/`drop`）同源的**饱和转换**。
+                    // `-1.0 as usize == 0` → `with max_tokens = -1` 把 AI 上限
+                    // 设成 **0**，即「模型不许输出任何内容」—— exit 0、零诊断。
+                    if n < 0.0 {
+                        self.core.config_stack.pop();
+                        return Err(format!("with-config `max_tokens` 不能为负数（得到 {n}）"));
                     }
+                    cfg.max_tokens = Some(n as usize);
                 }
                 "system" => cfg.system = Some(v.to_string()),
                 // v0.85: mock_llm / mock_responses — 为 with 块内 ai.chat 调用
@@ -645,7 +809,28 @@ impl Interpreter {
                         eprintln!("mock_llm expects list<string> or string, got {:?}", v);
                     }
                 },
-                _ => {}
+                // v0.104.6 D39：未知键此前落 `_ => {}` **静默丢弃** ——
+                // `with modle = "gpt-4o"`（拼错）exit 0、零提示，AI 调用照常
+                // 用**默认模型**，用户以为设了模型名。改为报错。
+                //
+                // 注意 `budget` / `per_call` 是 spec §11.1 :811-818 **明确承诺**
+                // 的配置键，但 `AiConfigValue` 从来没有对应字段（`types.rs:82`），
+                // 此前同样静默丢弃。报「承诺但未实现」比继续静默更诚实。
+                "budget" | "per_call" => {
+                    self.core.config_stack.pop();
+                    return Err(format!(
+                        "with-config `{key}` is promised by spec §11.1 but not implemented yet \
+                         (supported: model / system / temperature / max_tokens / mock_llm)"
+                    ));
+                }
+                other => {
+                    self.core.config_stack.pop();
+                    return Err(format!(
+                        "unknown with-config key `{other}` \
+                         (spec §11.1 supports: model / system / temperature / max_tokens / \
+                         budget / per_call / mock_llm)"
+                    ));
+                }
             }
         }
         self.core.current_ai_config = Some(cfg);
@@ -692,6 +877,7 @@ impl Interpreter {
     /// v0.04补: REPL 入口（`mora --repl` 走这里）
     /// 与 main.rs::run_repl 行为一致：循环读 stdin, 逐行 tokenize+parse+lower+run_mir
     /// 接收外部 &mut Interpreter 保留 setup 代码的 state
+    #[allow(clippy::too_many_lines)]
     pub fn run_repl_with(interp: &mut Interpreter) {
         use crate::mir::vm::run_mir;
         use crate::mir::{MirFunction, MirInst};
@@ -705,16 +891,85 @@ impl Interpreter {
         let mut line = String::new();
         let mut env = interp.take_env();
         let mut repl_task_defs: Vec<MirInst> = Vec::new();
+        // v0.104.6 D17：跨行累积的**源码**。
+        //
+        // 此前 REPL 把**每一行**单独送进 `check_program_witnesses_bidirectional`，
+        // 类型检查器完全看不见会话里已经绑定过什么，于是任何跨两行的会话都被
+        // 自己的历史挡下来（真实 `mora --repl` 实测）：
+        //
+        // ```text
+        // mora> let x = 5
+        // mora> x + 1
+        // type error: Unbound variable 'x' at line 1, column 1
+        // mora> assign x = 9
+        // type error: Unbound variable 'x' at line 1, column 1
+        // ```
+        //
+        // 注意运行期其实**一直是保留的**（`env` 逐行传给 `run_mir`，
+        // `h_define` 写进 `env`）—— 挂的是类型检查这一关，不是执行。
+        //
+        // 修法：把**已接受的源码**攒起来，每行把「整段累积源码」当一个完整程序
+        // 重新编译送检。
+        //
+        // 为什么不用「累积 witness 再拼接」：两段**各自独立编译**的 witness
+        // 拼起来并不是一个合法的程序形态 —— 实测 `for y in …` 单独输入正常，
+        // 前面一旦有别的行就报 `Unbound variable 'y'`。重新编译整段则与用户
+        // 实际敲出来的东西逐字一致，不存在形态问题。
+        let mut accepted_source: String = String::new();
+        // v0.104.6 D191：管道/重定向喂进来的首行可能带 UTF-8 BOM。
+        // 剥掉它 —— 否则**第一行被静默丢弃**（`ParserV3` 会如实拒绝
+        // `\u{feff}`）。这在本会话被我自己撞到过：PowerShell 探针写 stdin
+        // 时带了 BOM，`print("hi")` 无声消失，我一度误记成「REPL 首行
+        // 必然 parse error」的产品缺陷。字节精确的无 BOM 输入下一切正常。
+        let mut stripped_first_bom = false;
+        // v0.104.6 D18：多行续行缓冲。
+        //
+        // 此前每行独立 parse，于是 spec §14.2 里绝大多数**跨行** statement
+        // 产生式（`for` / `task` / `if…end` / `handle…end` / `match` / `with` /
+        // `worker` / `transaction` / `macro` / `observe` / `parallel`）在交互式
+        // 里一律进不去：首行 `for x in [1,2]` 立刻 parse error，`print(x)`
+        // 变成 Unbound variable，`end` 又是一个 parse error。
+        //
+        // 判据取「parse 失败 = 还没写完」：Mora 的空行在 parser 里本就被忽略，
+        // 所以**空行 = 放弃当前缓冲**是安全的退出方式（否则用户会被困住）。
+        let mut pending: String = String::new();
 
         loop {
-            print!("mora> ");
+            if pending.is_empty() {
+                print!("mora> ");
+            } else {
+                print!("  ...> ");
+            }
             let _ = io::stdout().flush();
             line.clear();
-            if handle.read_line(&mut line).is_err() {
-                break;
+            // v0.104.6 D190：**必须同时判 EOF（读到 0 字节）**。
+            //
+            // 修前只判 `.is_err()`，而 `read_line` 在 **EOF** 时返回
+            // `Ok(0)`（不是 Err）—— 于是 `mora --repl < file`、
+            // CI 里喂脚本、任何非交互的管道用法，**喂完输入后永久挂起**，
+            // 只能强杀。实测：关闭 stdin 后 8 秒仍未退出。
+            //
+            // 交互式 REPL 的惯例就是「stdin 结束即退出」；只认 `exit`
+            // 一词（启动横幅里也是这么写的）会让所有非交互用法挂死。
+            match handle.read_line(&mut line) {
+                Ok(0) => break, // EOF —— 输入结束，正常退出
+                Ok(_) => {}
+                Err(_) => break,
+            }
+            // v0.104.6 D191：首行的 UTF-8 BOM 剥掉一次。
+            // 必须剥在 **`line` 本身**上 —— 下面 `pending.push_str(line.as_str())`
+            // 用的是 `line`，只改 `trimmed` 不生效。
+            if !stripped_first_bom {
+                stripped_first_bom = true;
+                line = crate::cli::strip_bom(&line).to_string();
             }
             let trimmed = line.trim();
+            // 空行：若正在续行则放弃缓冲并报错（见 pending 的说明），否则跳过。
             if trimmed.is_empty() {
+                if !pending.is_empty() {
+                    eprintln!("parse error: 放弃未完成的输入");
+                    pending.clear();
+                }
                 continue;
             }
             if trimmed == "exit" || trimmed == "quit" {
@@ -722,26 +977,59 @@ impl Interpreter {
                 break;
             }
 
-            let (func, witnesses) = match crate::parser_v3::ParserV3::compile(trimmed) {
-                Ok(pair) => pair,
-                Err(e) => {
-                    eprintln!("parse error: {}", e);
+            // v0.104.6 D18：续行。parse 失败就当作「还没写完」，把这一行
+            // 追加进缓冲继续读；空行是放弃缓冲的出口。
+            pending.push_str(line.as_str());
+            if !repl_input_is_complete(&pending) {
+                // 还写不完 —— 留在 pending 里等下一行。
+                continue;
+            }
+            let func = match crate::parser_v3::ParserV3::compile(&pending) {
+                Ok((f, _ws)) => f,
+                Err(_) => {
+                    // 关键字配平说该完整、parse 却失败：是真语法错，丢掉重来，
+                    // 否则用户会被这段坏输入困住。
+                    eprintln!("parse error: 语法错误，已放弃当前输入");
+                    pending.clear();
                     continue;
                 }
             };
-            if func.body.is_empty() {
-                continue;
-            }
 
-            // v0.35 (P0-C1): REPL also type-checks (other entry points do).
-            let type_errs =
-                crate::typeck::check_mir::check_program_witnesses_bidirectional(&witnesses);
+            // v0.104.6 D17：把「已接受的源码 + 本次输入」当**一个完整程序**
+            // 重新编译送检，否则类型检查器看不见会话里已绑定的变量。
+            // 试过「累积 witness 再拼接」——不行：两段各自独立编译的 witness
+            // 拼起来不是合法程序形态（`for y in …` 单独输入正常，前面一旦有
+            // 别的行就报 `Unbound variable 'y'`）。重新编译整段则与用户实际
+            // 敲出来的内容逐字一致。
+            let mut candidate = accepted_source.clone();
+            candidate.push_str(&pending);
+            let type_errs = match crate::parser_v3::ParserV3::compile(&candidate) {
+                Ok((_, ws)) => crate::typeck::check_mir::check_program_witnesses_bidirectional(&ws),
+                // 理论上到不了这里（pending 刚 parse 通过），但真到了也别 panic。
+                Err(e) => {
+                    eprintln!("parse error: {}", e);
+                    pending.clear();
+                    continue;
+                }
+            };
             if !type_errs.is_empty() {
-                for e in type_errs {
+                for e in &type_errs {
                     eprintln!("type error: {}", e.message);
                 }
+                // 类型不通过 = 这次输入没被接受，不该进历史。
+                // **必须同时清空 pending**：否则这一段多行输入会一直留在缓冲里，
+                // 之后每一行都被追加到它后面、整段一起反复报同一个错 ——
+                // 一个坏输入会**永久毒化整个会话**。
+                pending.clear();
                 continue;
             }
+            // 过了检查才进历史。
+            accepted_source.push_str(&pending);
+            // **必须清空缓冲**：本段已经执行完并入历史了，若不清空，下一行会被
+            // 追加到这段**已经跑过**的源码后面，整段一起重新解析 ——
+            // 实测表现为 `task` 块报 "Expected 'end'"、`twice` 反复
+            // "Undefined function or task"。
+            pending.clear();
 
             let mut body = repl_task_defs.clone();
             body.extend(func.body.clone());

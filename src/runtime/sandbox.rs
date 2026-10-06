@@ -84,8 +84,21 @@ mod tests {
     fn tool_planes_default_has_core() {
         let sb = SandboxRuntime::default();
         let planes = sb.tool_planes.lock().expect("tool_planes poisoned");
-        // ToolPlaneRegistry::default() 含 2 core planes (ai + sandbox)
-        let _ = &*planes; // 不 panic 即可
+        // v0.104.6 D403：本条此前是**空测试** —— 函数名声称「默认含 core plane」，
+        // 函数体却只有 `let _ = &*planes;`（不 panic 即可），什么都没断言。
+        // 旁边的注释还把 `ToolPlaneRegistry::default()` 说成「含 2 core planes」，
+        // 而上面第 39 行用的是 `crate::toolplane::default_registry()`；
+        // 派生的 `Default` 实际是**空** registry —— 注释与代码矛盾。
+        assert_eq!(
+            planes.plane_count(),
+            2,
+            "default_registry() 应含 2 个 core plane"
+        );
+        assert!(planes.get_plane("ai").is_some(), "应含 core plane `ai`");
+        assert!(
+            planes.get_plane("sandbox").is_some(),
+            "应含 core plane `sandbox`"
+        );
     }
 
     #[test]

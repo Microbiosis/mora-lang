@@ -56,6 +56,37 @@ impl MirInst {
         }
     }
 
+    /// 本指令**写**的寄存器 —— 比 [`Self::dst`] 多覆盖「被 `is_effect()`
+    /// 抢先归为 Effect 节点、因而 `dst()` 够不着」的指令。
+    ///
+    /// v0.104.6 D35：唯一的这种指令是 `MirInst::Handle { k_dst, .. }`。
+    /// `h_handle` 确实写 `regs[k_dst] = v`（`handlers/effects.rs`），但
+    /// `dag_analyze` Step 1 先判 `inst.is_effect()`（对 `Handle` 为 true），
+    /// 所以 `dst()` 的返回值根本走不到 `k_dst`。
+    ///
+    /// 后果（静默、退出码 0、无任何报错）：
+    ///
+    /// ```text
+    /// let r = handle ask { 1 } { 0 }
+    /// print(999)            →  什么都不打印
+    /// ```
+    ///
+    /// DAG 执行器用 `inst.dst()` 置 `reg_ready`（`vm/dag.rs`），故
+    /// `reg_ready[k_dst]` 永远是 false → `let` 生成的 `Define("r", k_dst)`
+    /// 的就绪门槛永不满足 → `Define` 不激活 → 它所在的那条 **Sequence 链**
+    /// 从这里断裂 → 其后**所有** Effect 节点（含 `print` 的 `Call`）全被饿死。
+    /// 与 v0.104.6 的 E1「汇合点饿死」同族，只是触发条件不同。
+    ///
+    /// **不用改 `dst()` 本身**：那会让 `Handle` 变成 `Compute` 节点、脱离
+    /// Effect 链，改变执行顺序与既有 `n_regs`/`apply_rules` 的计算，属另一
+    /// 套风险。这里只补「写寄存器」这一个事实。
+    pub fn written_reg(&self) -> Option<Reg> {
+        match self {
+            MirInst::Handle { k_dst, .. } => Some(*k_dst),
+            _ => self.dst(),
+        }
+    }
+
     pub fn input_regs(&self) -> Vec<Reg> {
         match self {
             MirInst::Const(_, _) => vec![],
@@ -137,7 +168,7 @@ impl MirInst {
     /// 输入寄存器重映射 — CSE 合并不同 dst 的节点后，把消费者的输入
     /// 寄存器引用从旧 dst 改写为新 dst（dag_interp 按 input_regs 取数，
     /// 不按 Data 边）。只映射输入位置，dst 不参与。嵌套函数体
-    /// （Closure/TaskDef/... 的 Box<MirFunction>）寄存器空间独立，不改写。
+    /// （Closure/TaskDef/... 的 Box`<MirFunction>`）寄存器空间独立，不改写。
     pub fn map_regs(&self, f: &mut impl FnMut(Reg) -> Reg) -> MirInst {
         let mut m = |r: Reg| f(r);
         match self {

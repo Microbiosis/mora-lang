@@ -1,0 +1,42 @@
+-- e2e：schedule.* 的脚本可达面 + **「持久化」在生产上完全不生效**（v0.104.6 D395）
+--
+-- 本文件驱动 `tests/schedule_persistence_gap.rs`，逐行断言。
+--
+-- 审计结论：`Scheduler` 的「持久化」是**只写不读，且生产上从不写** ——
+--   1. `set_persist_path` 全仓**只有单测**一处调用（`schedule/mod.rs:399`）
+--      ⇒ 生产 `persist_path` 恒为 `None` ⇒ `save()` 直接跳过 ⇒ **永不落盘**；
+--   2. 全仓**没有**任何 scheduler 的读回函数（无 `load` / `from_json`），
+--      即使落了盘也无人读。
+-- 而模块 doc 声称「持久化到 `<cwd>`/`.mora_schedule.json`」—— **不成立**。
+--
+-- ⇒ 本文件**不断言**「重启后 job 还在」（那不成立），
+-- 只断言脚本真正能观察到的行为。
+--
+-- Run: cargo run -- tests/fixtures/e2e/schedule_surface.mora
+
+-- ── ① add / count / list 往返 ───────────────────────────────────
+let id1 = schedule.add("j1", "every", "msg1", 3600)
+print("id_len=" + str(len(id1)))
+print("count1=" + str(schedule.count()))
+print("list_len=" + str(len(schedule.list())))
+
+-- ── ② list 的元素形态（字段是否齐） ──────────────────────────────
+let first = schedule.list()[0]
+print("has_id=" + str(first.id != ""))
+print("has_name=" + str(first.name == "j1"))
+print("has_kind=" + str(first.kind == "every"))
+print("has_message=" + str(first.message == "msg1"))
+
+-- ── ③ tick：interval 未到（3600s）不应触发 ───────────────────────
+let fired = schedule.tick()
+print("tick_len=" + str(len(fired)))
+
+-- ── ④ remove 往返 ───────────────────────────────────────────────
+let ok = schedule.remove(id1)
+print("removed=" + str(ok))
+print("count2=" + str(schedule.count()))
+print("removed_again=" + str(schedule.remove(id1)))
+
+-- ── ⑤ 非法 kind 被拒（错误消息点名） ─────────────────────────────
+let bad = schedule.add("j2", "bogus", "msg2", 10)
+print("bad_kind=" + str(bad))

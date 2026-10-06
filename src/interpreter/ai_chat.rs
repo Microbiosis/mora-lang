@@ -22,8 +22,80 @@ impl Interpreter {
         let base_url =
             env::var(AI_BASE_URL_ENV).unwrap_or_else(|_| AI_BASE_URL_DEFAULT.to_string());
 
+        // v0.xx: 优先使用 current_ai_config.model (with 块语法设置),
+        // 未设定时 fallback 到调用方传入的 model (向后兼容)
+        //
+        // v0.104.6 D181：**提前**算出来 —— 重放查找与两条录制分支必须用
+        // **同一个** model，否则键对不上（原先 mock 分支记 `model` 参数、
+        // real 分支记 `effective_model`，两边可能不同）。
+        let effective_model = interp
+            .core
+            .current_ai_config
+            .as_ref()
+            .and_then(|c| c.model.as_ref())
+            .map_or_else(|| model.to_string(), |v| v.clone());
+
+        // v0.104.6 D181：**重放查找提到 mock/real 分支之前**。
+        //
+        // 修前这个查找只写在 `real_ai_chat` 里，而 `real_ai_chat` 只有
+        // `api_key` 非空时才会被调用 —— 于是**没有 API key 时（本地常态，
+        // 也正是「重放」唯一合理的场景）永远走不到查找**，直接跑 mock。
+        // 更糟的是它**两处都对不上**：
+        //   - 查找键用 `prompt_text`（`"user: find me"`，带 role 前缀），
+        //     而录制时 `record_ai_chat` 存的是**裸 prompt**（`"find me"`），
+        //     `hash_prompt` 必然不等 → 即使有 key 也匹配不上。
+        // 修前实测（真实 CLI，录像里 response 是 `DISTINCTIVE_…`）：
+        //   无 key：$ mora replay → `[Mock response for: find me]`（新 mock）
+        //   有 key：$ mora replay → `network error connecting to …`
+        //          即**根本不查录像，直接发真实网络请求** ——
+        //          与「deterministic」正好相反，还要花钱。
+        //
+        // 键必须与录制端**逐字一致**：model 用 `effective_model`，
+        // prompt 用**裸 prompt**（不带 role 前缀）。
+        if let Some(rec) = interp.infra.recorder_mut().lookup_ai_chat(
+            &effective_model,
+            prompt,
+            "ai.chat(model: string, prompt: string) -> string",
+        ) {
+            return Ok(Value::String(rec.response));
+        }
+
         if api_key.is_empty() {
             // Mock 模式
+            //
+            // ⚠ v0.104.6 D91：原先此处**直接**返回通用占位符
+            // `[Mock response for: {prompt}]`，从不查 `cfg.mock_responses` ——
+            // 而消费队列的逻辑在更深一层的 `real_ai_chat_inner`（本文件下方），
+            // mock 模式下**根本走不到**。于是 `with mock_llm = [...]`
+            // （docs/mora-spec.md §19.4 明确承诺的唯一 Mora 入口）被**静默忽略**。
+            //
+            // 修法：mock 模式也先看队列。两条 mock 分支（此处 / inner）由
+            // `api_key.is_empty()` 与否**互斥**，不会重复消费。
+            if let Some(response) = interp
+                .core
+                .current_ai_config
+                .as_mut()
+                .and_then(|cfg| cfg.mock_responses.as_mut())
+                .and_then(|r| (!r.is_empty()).then(|| r.remove(0)))
+            {
+                // 模拟 token 估算（与 real_ai_chat_inner 的 mock 分支同规则）
+                let tokens_in = prompt.len() / 4;
+                let tokens_out = response.len() / 4;
+                // v0.104.6 D183：把这次调用计入 `ai.tokens()` 的四个计数器。
+                // 见下面「通用兜底」分支处的完整说明。
+                let _ = interp.track_tokens(tokens_in, tokens_out);
+                interp.infra.recorder.record_ai_chat(
+                    effective_model.clone(),
+                    prompt.to_string(),
+                    response.clone(),
+                    tokens_in,
+                    tokens_out,
+                    0, // mock 无延迟
+                    None,
+                    "ai.chat(model: string, prompt: string) -> string".to_string(),
+                );
+                return Ok(Value::String(response));
+            }
             let cfg_info = interp
                 .core
                 .current_ai_config
@@ -39,7 +111,64 @@ impl Interpreter {
                 "[ai.chat mock — set OPENAI_API_KEY for real call] {} {}",
                 prompt, cfg_info
             );
-            return Ok(Value::String(format!("[Mock response for: {}]", prompt)));
+            // v0.104.6 D173：此处**原先直接返回**，从不 `record_ai_chat` ——
+            // 而本函数**上面**那条 `mock_llm` 分支是记的。于是两种 mock 形态
+            // 行为不一致：
+            //
+            // ```text
+            // ai.chat(p"hi")                          → 录制里 0 个 ai_chat 事件
+            // with mock_llm = ["x"] + ai.chat(p"hi")    → 录制里 1 个 ai_chat 事件
+            // ```
+            //
+            // 影响的是**默认**形态：没配 `OPENAI_API_KEY` 的本地用户（本仓库的
+            // 常态）走的就是这条分支，于是 `mora record` 标称的
+            // 「Record ai.chat / web.fetch」**一条 AI 调用都记不下来** ——
+            // 实测录制文件里只有 `state_mutation`，于是
+            //   `mora replay`   无内容可放（只是又跑了一遍 mock，输出自然「一致」）
+            //   `mora diff`     只在比 state_mutation
+            //   `record stats`  web.fetch: 0 · tokens: 0 + 0
+            //   `record timeline` 全是 state_mutation，没有 ai.chat 行
+            // 而「deterministic AI-call regression testing」这个卖点整条失效。
+            //
+            // 修法：与上面 `mock_llm` 分支**对称**地记一次，token 估算同规则、
+            // mock 无延迟记 0。
+            let mock_response = format!("[Mock response for: {}]", prompt);
+            // v0.104.6 D183：两条 mock 分支**都不**更新 `ai.tokens()` 的计数器
+            // —— 而 `track_tokens` 是运行期填充 `token_usage` 的**唯一**入口
+            // （`AiRuntime::record_tokens` 只被单测调用），且它只被
+            // **真实 HTTP 响应路径**的两处调用。mock 是无 key 开发者的默认形态，
+            // 于是 `ai.tokens().input/output/total/calls` **恒为 0**。
+            //
+            // 而 record 家族对**同一次调用**用**同一套估算**（len/4）记进了
+            // 录像，`mora record stats` 因此报非零 —— 实测同一个程序：
+            //
+            // ```text
+            // $ mora t.mora              → ai.tokens().total = 0.0
+            // $ mora record stats tk     → Tokens: 17 in + 22 out = 39 total
+            // ```
+            //
+            // **两套子系统对同一个事实给出两个答案**，而运行期那个是静默的 0。
+            // `ai.tokens()` 在本语言里是 agent 查成本的入口，恒 0 等于
+            // 「这个 agent 从没花过钱」。
+            //
+            // 安全前提（已核）：`track_tokens` 里的预算强制
+            // （per_call / total / alert_threshold）**不可能触发** ——
+            // `AiRuntime` 只有 `Default`（`token_budget: None`，全仓唯一赋值），
+            // `TokenBudget` 结构体从未被构造，也没有 setter；且 `with budget = …`
+            // 会**立即报错**（spec §11.1 承诺但未实现）。故这里调用它
+            // **只**更新计数器与 trace 指标，不引入任何新的失败模式。
+            let _ = interp.track_tokens(prompt.len() / 4, mock_response.len() / 4);
+            interp.infra.recorder.record_ai_chat(
+                effective_model.clone(),
+                prompt.to_string(),
+                mock_response.clone(),
+                prompt.len() / 4,
+                mock_response.len() / 4,
+                0, // mock 无延迟
+                None,
+                "ai.chat(model: string, prompt: string) -> string".to_string(),
+            );
+            return Ok(Value::String(mock_response));
         }
 
         let messages = vec![("user".to_string(), prompt.to_string())];
@@ -47,12 +176,9 @@ impl Interpreter {
         // 拼进 real_ai_chat_inner (v0.06.5 才改函数签名，这里先保留 env 兼容)
         // v0.xx: 优先使用 current_ai_config.model (with 块语法设置),
         // 未设定时 fallback 到调用方传入的 model (向后兼容)
-        let effective_model = interp
-            .core
-            .current_ai_config
-            .as_ref()
-            .and_then(|c| c.model.as_ref())
-            .map_or_else(|| model.to_string(), |v| v.clone());
+        //
+        // v0.104.6 D181：`effective_model` 已提前到本函数入口处算出
+        // （重放查找要用它），此处直接沿用。
         interp.real_ai_chat(&messages, &api_key, &effective_model, &base_url)
     }
 
@@ -165,18 +291,23 @@ impl Interpreter {
         base_url: &str,
     ) -> Result<Value, String> {
         // v0.14: 重放模式直接返回录制响应
+        //
+        // v0.104.6 D181：本函数原先**自己**查一次 `lookup_ai_chat`，但
+        // ① 它只有 `api_key` 非空时才会被调用（没有 key 的本地常态永远
+        //    走不到 —— 而那正是「重放」唯一合理的场景）；
+        // ② 它用 `prompt_text`（`"user: find me"`，带 role 前缀）做键，
+        //    而 `record_ai_chat` 存的是**裸 prompt**（`"find me"`），
+        //    `hash_prompt` 必然不等。
+        // 结果是**两个分支都匹配不上**：无 key 时重跑 mock，
+        // 有 key 时直接发真实网络请求。
+        //
+        // 现已上移到 `do_ai_chat` 的分支之前（键与录制端逐字一致）。
+        // 保留本函数里的消息拼接，供 trace / token 估算 / 录制使用。
         let prompt_text: String = messages
             .iter()
             .map(|(role, content)| format!("{}: {}", role, content))
             .collect::<Vec<_>>()
             .join("\n");
-        if let Some(rec) = self.infra.recorder_mut().lookup_ai_chat(
-            model,
-            &prompt_text,
-            "ai.chat(model: string, prompt: string) -> string",
-        ) {
-            return Ok(Value::String(rec.response));
-        }
 
         let mut span_attrs = std::collections::HashMap::new();
         span_attrs.insert("model".to_string(), model.to_string());
@@ -237,16 +368,19 @@ impl Interpreter {
         let msgs_json: String = messages
             .iter()
             .map(|(role, content)| {
-                let escaped_content = content
-                    .replace('\\', "\\\\")
-                    .replace('"', "\\\"")
-                    .replace('\n', "\\n");
-                format!(r#"{{"role":"{}","content":"{}"}}"#, role, escaped_content)
+                // v0.104.6 D209：改用共享的 RFC 8259 转义器
+                let escaped_content = crate::flow::escape_json_string(content);
+                format!(
+                    r#"{{"role":"{}","content":"{}"}}"#,
+                    crate::flow::escape_json_string(role),
+                    escaped_content
+                )
             })
             .collect::<Vec<_>>()
             .join(",");
 
-        let escaped_model = model.replace('\\', "\\\\").replace('"', "\\\"");
+        // v0.104.6 D209：改用共享的 RFC 8259 转义器
+        let escaped_model = crate::flow::escape_json_string(model);
         let body = format!(
             r#"{{"model":"{}","messages":[{}]}}"#,
             escaped_model, msgs_json
@@ -473,18 +607,15 @@ impl Interpreter {
         let msgs_json: String = messages
             .iter()
             .map(|(role, content)| {
-                let escaped_content = content
-                    .replace('\\', "\\\\")
-                    .replace('"', "\\\"")
-                    .replace('\n', "\\n")
-                    .replace('\r', "\\r")
-                    .replace('\t', "\\t");
+                // v0.104.6 D209：改用共享的 RFC 8259 转义器
+                let escaped_content = crate::flow::escape_json_string(content);
                 format!(r#"{{"role":"{}","content":"{}"}}"#, role, escaped_content)
             })
             .collect::<Vec<_>>()
             .join(",");
 
-        let escaped_model = model.replace('\\', "\\\\").replace('"', "\\\"");
+        // v0.104.6 D209：改用共享的 RFC 8259 转义器
+        let escaped_model = crate::flow::escape_json_string(model);
         // v0.06.5: 拼 temperature/max_tokens/system 从 current_ai_config
         let mut body = format!(
             r#"{{"model":"{}","messages":[{}]"#,
@@ -633,15 +764,16 @@ impl Interpreter {
                 let tool_entries: Vec<String> = tools.iter().map(|t| {
                     format!(
                         r#"{{"type":"function","function":{{"name":"{}","description":"{}","parameters":{}}}}}"#,
-                        t.name.replace('\\', "\\\\").replace('"', "\\\""),
-                        t.description.replace('\\', "\\\\").replace('"', "\\\""),
+                        crate::flow::escape_json_string(&t.name),
+                        crate::flow::escape_json_string(&t.description),
                         t.parameters
                     )
                 }).collect();
                 format!(r#","tools":[{}]"#, tool_entries.join(","))
             };
 
-            let escaped_model = model.replace('\\', "\\\\").replace('"', "\\\"");
+            // v0.104.6 D209：改用共享的 RFC 8259 转义器
+            let escaped_model = crate::flow::escape_json_string(model);
             let mut body = format!(
                 r#"{{"model":"{}","messages":[{}]{}"#,
                 escaped_model, msgs_json, tools_json

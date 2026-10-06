@@ -18,7 +18,7 @@ pub enum EffectRow {
     /// 用于 `forall e. ...` 的多态实例化。
     Var(String),
     /// Cons(head, tail)：head 是具体 effect 标签（如 "Ai"、"Fs"），tail 可以是 Empty / Var / Cons。
-    /// tail 用 Box<EffectRow> 与 Type::List(Box<Type>) 同样形态。
+    /// tail 用 Box`<EffectRow>` 与 Type::List(Box`<Type>`) 同样形态。
     Cons(String, Box<EffectRow>),
 }
 

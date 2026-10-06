@@ -30,12 +30,26 @@ impl SubCompressor for HtmlSubCompressor {
     }
 
     /// 压缩: quick-xml pull-parser 提取文本, 跳过 `<script>` / `<style>`。
+    ///
+    /// v0.104.6 D227：预算检查此前是 `if out.len() >= max_bytes { break; }`
+    /// —— 在**已经追加完本段文本之后**才判断，随后还要追加
+    /// `<compressed:method=html …>` 尾部，输出必然超限。
+    /// 现在给尾部留预算并经收口函数收尾。
     fn compress(
         &self,
         content: &str,
         max_bytes: usize,
         _options: &CompressOptions,
     ) -> Result<String, String> {
+        // v0.104.6 D227：预留量按**真实** marker 长度算，不拍常数。
+        let body_budget = max_bytes.saturating_sub(
+            format!(
+                "\n<compressed:method=html original_size={}>\n",
+                content.len()
+            )
+            .len(),
+        );
+
         let mut reader = Reader::from_str(content);
         reader.config_mut().trim_text(true);
         let mut buf = Vec::new();
@@ -59,6 +73,11 @@ impl SubCompressor for HtmlSubCompressor {
                     if skip_depth == 0 {
                         let un = t.decode().unwrap_or_default().to_string();
                         if !un.trim().is_empty() {
+                            // +1 是追加的 '\n'
+                            if out.len() + un.len() + 1 > body_budget {
+                                buf.clear();
+                                break;
+                            }
                             out.push_str(&un);
                             out.push('\n');
                         }
@@ -69,15 +88,14 @@ impl SubCompressor for HtmlSubCompressor {
                 _ => {}
             }
             buf.clear();
-            if out.len() >= max_bytes {
-                break;
-            }
         }
-        out.push_str(&format!(
+        let marker = format!(
             "\n<compressed:method=html original_size={}>\n",
             content.len()
-        ));
-        Ok(out)
+        );
+        Ok(crate::compress::finish_within_budget(
+            content, out, &marker, max_bytes,
+        ))
     }
 
     fn origin(&self) -> &'static str {

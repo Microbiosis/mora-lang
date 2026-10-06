@@ -239,13 +239,29 @@ mora mcp toolsets                             # list toolsets
 ```mora
 let name: string = "mora"          -- OK
 let age: number = "thirty"         -- typeck: string → number
-task add(a: number, b: number): number
-  return a + b
-end
-add(1, 2)                          -- OK
-add(1)                             -- error: 2 args expected
-add("x", 2)                        -- error: arg 1 must be number
+let a: number = 1
+let b: number = 2
+a + b                               -- OK（number 塔）
+a + "x"                             -- error: arg must be number
 ```
+
+> **v0.104.6 D117 更正**：本节原示例写作
+>
+> ```text
+> task add(a: number, b: number): number
+>   return a + b
+> end
+> add(1, 2)                          -- OK
+> add(1)                             -- error: 2 args expected
+> add("x", 2)                        -- error: arg 1 must be number
+> ```
+>
+> 但**函数参数类型标注（`fn` / `task` 的 `(a: number)`）尚未实现** ——
+> 实测 `Parse error: Expected ')' after parameters`。故整块**无法解析**，
+> 而它恰是 README 展示类型系统的首例。
+>
+> 已改用**受支持**的 `let` 标注来演示同一件事。要让 `add("x", 2)` 这类
+> **实参**类型检查生效，需要先实现参数标注（属语言特性，未实现）。
 
 Errors emit `Type error at line N: …`. Library / builtin tasks fall back
 to `Any` only when no signature is declared. Type checking always runs —

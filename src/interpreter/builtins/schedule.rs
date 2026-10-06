@@ -41,16 +41,18 @@ impl Interpreter {
                     }
                     None => return Err("schedule.add: requires message".to_string()),
                 };
-                let interval_s = if let Some(Value::Float(n)) = args.get(3) {
-                    *n as u64
-                } else {
-                    0
-                };
-                let at_epoch = if let Some(Value::Float(n)) = args.get(4) {
-                    *n as u64
-                } else {
-                    0
-                };
+                // v0.104.6 D150：紧邻上面三个已加固的字符串实参，这两个**数值**
+                // 实参却只匹配 `Value::Float` —— 于是**合法的 `Int`**（如 `len(...)`）
+                // 被静默丢弃成 0，进而撞上下游的
+                // `Every kind needs interval_s > 0`：用户**明明传了合法值**，
+                // 却被报成「没传」。D147 的教训：加固过的分支是索引，
+                // 它的兄弟分支就是下一处静默缺陷的藏身处。
+                let interval_s = optional_num_arg(args, 3, "schedule.add", "interval_s")?
+                    .map(|n| n as u64)
+                    .unwrap_or(0);
+                let at_epoch = optional_num_arg(args, 4, "schedule.add", "at_epoch")?
+                    .map(|n| n as u64)
+                    .unwrap_or(0);
                 self.infra
                     .scheduler
                     .add(&name, kind, &message, interval_s, at_epoch)
@@ -77,7 +79,7 @@ impl Interpreter {
                         Value::Dict(m)
                     })
                     .collect();
-                Ok(Value::List(arr))
+                Ok(Value::List(arr.into()))
             }
             "remove" => {
                 let id = args

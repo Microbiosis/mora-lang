@@ -150,8 +150,23 @@ fn n_regs_covers_every_emitted_register() {
 /// 在其区域内的变体名，不做全文 `_ =>` 扫描。
 #[test]
 fn max_reg_in_node_covers_every_node_variant() {
-    let fcfg_src = include_str!("../src/mir/fcfg.rs");
-    let lower_src = include_str!("../src/mir/fcfg_lower.rs");
+    // v0.104.6 D410：**先把行尾归一**。
+    //
+    // 本条用 `find("\n}\n")` 定位枚举结尾 —— 这是本仓**唯一**一处
+    // 「`\n` 出现在 token 两侧」的匹配串。CRLF 下源码是 `\r\n}\r\n`，
+    // `\n}\n` **永远匹配不上** ⇒ 判据以「Node 枚举应有结尾」panic。
+    //
+    // 触发条件不是产品问题，而是**环境**：`core.autocrlf = true` 时
+    // `git checkout` / `git pull` 会把工作区重写成 CRLF，而
+    // `include_str!` 编的是**工作区**文件的内容。
+    // ⇒ 判据的有效性不该取决于 git 检出配置。
+    //
+    // 实测：CRLF 下 `"\n}\n"` 出现 0 次、`"\r\n}\r\n"` 出现 14 次。
+    //
+    // 其余解析（`.lines()` / `char_indices()` / 固定串 `.find()`）本就不受
+    // 行尾影响，但一并归一，避免同类陷阱将来再咬一次。
+    let fcfg_src = include_str!("../src/mir/fcfg.rs").replace("\r\n", "\n");
+    let lower_src = include_str!("../src/mir/fcfg_lower.rs").replace("\r\n", "\n");
 
     // 1) Node 变体总数
     let decl = fcfg_src

@@ -44,7 +44,27 @@ impl<V: Clone> LruCache<V> {
     }
 
     /// 插入或更新. 超 cap 时 evict 最旧.
+    ///
+    /// v0.104.6 D410：修「`cap = 0` 的缓存反而存了 1 条」。
+    ///
+    /// 修前的淘汰判据是 `self.map.len() >= self.cap`，`cap = 0` 时**恒真**，
+    /// 于是走进淘汰分支 —— 但此刻 `order` 是空的，`pop_front()` 返回 `None`
+    /// ⇒ **什么都没淘汰**；紧接着下面无条件 `push_back` + `insert`
+    /// ⇒ 条目被存了进去。
+    ///
+    /// 实测：`LruCache::new(0)` put 一条后 `len() == 1` 而 `cap() == 0`
+    /// ⇒ `len() > cap()`，**违反本类型自己 doc 承诺的「cap 上限」**。
+    ///
+    /// 修法：`cap == 0` 直接返回 —— 容量 0 的语义只能是「不缓存」。
+    ///
+    /// ⚠ **不关闭任何当前可观测的洞**：生产两处容量是
+    /// `STRING_INTERNER_CAPACITY = 50_000` 与 `AI_CACHE_CAPACITY = 10_000`，
+    /// 都 > 0。本条修的是 `pub` API（经 `interpreter` re-export 对外可见）
+    /// **自身契约**的不一致。
     pub fn put(&mut self, key: String, value: V) {
+        if self.cap == 0 {
+            return;
+        }
         if self.map.contains_key(&key) {
             // 更新 — 刷新 order 为最新
             if let Some(pos) = self.order.iter().position(|k| k == &key) {

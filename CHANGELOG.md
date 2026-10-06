@@ -19368,6 +19368,158 @@ D334/D335/D336 真正要证明的东西 ——「每个带路径的入口都过�
 ⇒ 待裁决：v0.x「无沙箱」是否也该放开 `..`？
 放开的话模块头要同步改；但那样会**同时**收掉 D334 唯一的行为判据抓手。
 
+#### D410：`src/runtime/` 首次整模块外部覆盖 —— `LruCache` 的 `cap = 0` 让「缓存」存进 1 条（否定轮 + 1 处修复）
+
+`src/runtime/`（12 文件、Kernel Services 层）此前只被沙箱相关判据**从旁**碰到，
+从未做过整模块外部覆盖。
+
+## 模块内单测覆盖普查
+
+| 文件 | 行数 | 模块内单测 |
+|---|---|---|
+| ai.rs | 130 | 10 |
+| ai_infra.rs | 208 | 6 |
+| core.rs | 94 | 4 |
+| effect.rs | 133 | 3 |
+| infra.rs | 124 | 7 |
+| orch.rs | 109 | 6 |
+| persist.rs | 102 | 5 |
+| random.rs | 260 | 6 |
+| registry.rs | 107 | 7 |
+| sandbox.rs | 170 | 9 |
+| **types.rs** | **108** | **0** ← 唯一缺口 |
+| mod.rs | 12 | 0（纯模块声明，无需） |
+
+⇒ **覆盖缺口与本轮发现的缺陷重合**：`types.rs`。
+
+## 缺陷：`cap = 0` 的缓存存得下 1 条
+
+```rust
+pub fn put(&mut self, key: String, value: V) {
+    if self.map.contains_key(&key) { ...; return; }
+    if self.map.len() >= self.cap {        // ← cap = 0 时恒真
+        if let Some(oldest) = self.order.pop_front() {   // ← 但 order 是空的 ⇒ None
+            self.map.remove(&oldest);                   // ← 什么都没淘汰
+        }
+    }
+    self.order.push_back(key.clone());      // ← 无条件插入
+    self.map.insert(key, value);
+}
+```
+
+`cap = 0` 时判据恒真 ⇒ 走进淘汰分支 ⇒ `pop_front()` 返回 `None` ⇒ **淘汰没发生**，
+紧接着无条件 `push_back` + `insert` ⇒ 条目被存了进去。
+
+实测：`LruCache::new(0)` put 一条后 `len() == 1` 而 `cap() == 0`
+⇒ **`len() > cap()`**，而本类型 doc 明写「`cap` **上限**, 超过 evict 最旧」。
+
+即：容量 0 的缓存**自相矛盾** —— 上界是 0，却装着 1 条。
+
+## 修法
+
+```rust
+if self.cap == 0 {
+    return;
+}
+```
+
+容量 0 的语义只能是「不缓存」。
+
+⚠ **不关闭任何当前可观测的洞**：生产两处容量是
+`STRING_INTERNER_CAPACITY = 50_000` 与 `AI_CACHE_CAPACITY = 10_000`，都 > 0。
+本条修的是 `pub` API（经 `interpreter` re-export 对外可见）**自身契约**的不一致。
+
+## 裁决依据（D404 纪律：动手前两个检索都做过）
+
+| 检索 | 结果 |
+|---|---|
+| ① 符号附近注释 | doc 写「`cap` 上限」= **上界**；全文无任何注释说「cap=0 存 1 条」 |
+| ② 全仓判据 | `tests/` 下搜 `LruCache` **零命中**；`stress_tests.rs` 三处 cap 为 1000 / 10000 / 50000，无一为 0 |
+
+⇒ 两项均未命中「已记录的决定」⇒ 可修。
+
+## 判据（6 条）
+
+| 判据 | 钉什么 |
+|---|---|
+| `basic_lru_semantics` | 超容量淘汰最旧；`get` 刷新顺序（对照组） |
+| `is_lru_not_fifo` | 「LRU」必须与「FIFO」**可区分** —— 否则刷新逻辑其实没生效 |
+| `put_existing_key_updates_in_place` | 同 key 重复 put 不增长，且刷新顺序 |
+| `len_never_exceeds_cap` | **`len() <= cap()`**，cap ∈ {0,1,2,5} × 20 次 put —— 核心判据 |
+| `zero_capacity_stores_nothing` | cap=0 时 `get` / `len` / `is_empty` 三者自洽 |
+| `matches_reference_implementation` | **差分测试**：对照朴素参考 LRU，cap ∈ {1,2,3,7} × 400 步 × 5 键空间 |
+
+### 差分测试为什么必要
+
+单条条目测试容易漏掉「更新 + 刷新 + 淘汰」的**组合**交互。
+键空间取 5、cap 最大 7 ⇒ 必然触发淘汰；再把 cap 压到 1/2/3 ⇒ 淘汰路径被反复压测。
+差分通过 ⇒ **除 `cap = 0` 外，LRU 语义全对**（含「LRU 而非 FIFO」这一点）。
+
+## 牙齿验证：撤掉 `cap == 0` 守卫 ⇒ **恰好 2 红**（4 绿）
+
+红：`len_never_exceeds_cap`、`zero_capacity_stores_nothing`。
+绿：其余 4 条 —— 差分测试用 cap ∈ {1,2,3,7}，**本就不含 0**，
+它专测 LRU 语义，`cap=0` 由那两条专项负责 ⇒ 这个分工是对的，不该把它也拖红。
+
+## 本轮零缺陷的部分（如实记录）
+
+- **`EffectRegistry` 的 `install`/`take`/`restore`/`top_mut`**：栈语义正确。
+  `take` 后空 `Vec` 残留在 map 里属**轻微内存占用**，不影响任何查询结果
+  （`top_mut` 对空 Vec 正确返回 `None`），不算缺陷。
+- **`ContextWindow` 的 `compress`**：`keep_count` 有 `.max(1.0)` 兜底，
+  `messages.len() == 0/1` 时**不会下溢**；`add_message` 的 `len() > 1`
+  保证至少留一条，不会把窗口清空到无法恢复。
+- `ai_infra.rs` 文件头已由 D90 做过可达性普查，注明「队列与缓存预热整族
+  零生产调用」属**已知并有意保留的 v1.0 预留**（doc 明写「清理属重构而非缺陷修复」）
+  ⇒ 只记录不擅动。
+
+## 顺带撞出：一道判据的**有效性取决于 git 检出配置**
+
+第一次跑全量门禁，`tests/fcfg_lower_n_regs` 的
+`max_reg_in_node_covers_every_node_variant` 报 **「Node 枚举应有结尾」**。
+
+该条用 `find("\n}\n")` 定位枚举结尾。实测工作区 `src/mir/fcfg.rs` 是
+**纯 CRLF**（738 个 CR / 738 个 LF），CRLF 下源码是 `\r\n}\r\n`
+⇒ `\n}\n` 出现 **0 次**，而 `\r\n}\r\n` 出现 **14 次** ⇒ 永远匹配不上。
+
+### 触发条件**不是**产品问题，是环境
+
+`core.autocrlf = true` 时 `git checkout` / `git pull` 会把**工作区**重写成
+CRLF，而 `include_str!` 编的是**工作区**文件内容。
+本轮之前做过 `git checkout main` + `git merge --ff-only` ⇒ 触发了它。
+
+⇒ **判据的有效性不该取决于 git 检出配置。**
+
+修法：`include_str!(..).replace("\r\n", "\n")` 后再解析。
+
+### 这类脆弱模式的全仓普查：**只有这一处**
+
+判据在源码里按 `\n` 匹配有两种形态，只有一种会失效：
+
+| 形态 | 例子 | CRLF 下 |
+|---|---|---|
+| `\n` 只在**起始** | `find("\n    fn ")`、`split("\n    }")` | ✅ 仍匹配（`\n` 后面不是 `\r`） |
+| `\n` 在 **token 两侧** | `find("\n}\n")` | ❌ **失效**（`}` 后面是 `\r`） |
+
+普查 `tests/` 全部 `(find\|contains\|starts_with\|ends_with\|split)(...\\n...)`，
+另一处疑似 `mir_memo_purity_consistency.rs` 的 `find("\n}")` 属**第一类**（安全）。
+`path_io_sandbox_census` / `rel_search_fuel_gap` / `tea_list_model_truncation` /
+`toolplane_surface` 用的都是 `\n` + 缩进，**均安全**。
+⇒ 全仓**仅此一处**需要归一。
+
+验证：修复后工作区**仍是 CRLF** 该条即通过，而 D409 门禁（LF 下）也通过
+⇒ 两种行尾下判定一致。
+
+## 顺带修正了一条我自己上轮的错误结论
+
+D410 里我用 `git show HEAD:src/flow.rs | python ...` 数 CR，得出「1135 个 CR」
+并差点据此报「提交污染行尾」。**那是 PowerShell 文本管道把输出重新编码成
+CRLF 造出来的** —— 仓库里 `src/` 下含 CR 的文件数是 **0**（`git grep -P` 直读）。
+可靠做法是 `git grep -P` 读 blob，不经文本管道。
+
+## 待裁决（新增）
+
+无。本轮 2 处修复（LruCache 契约 + 一道行尾脆弱判据），无产品语义分歧。
 #### D385：`xform` 的**实际形态** + transducer 底层**接上了**（否定轮，修正 D346 的印象）
 
 D346 判定 `xform` 是「静默无效」，但当时**没查底层**。本轮查清两件事。

@@ -1,4 +1,12 @@
-//! v0.104.6 D274：**宏体不参与 typeck** —— 类型错与未绑定变量双双静默（**未修**，待裁决）
+//! v0.104.6 D274 —— 宏体**不参与 typeck**：类型错与未绑定变量双双静默（**已修**）
+//!
+//! 修法已实施：`MacroDef` 从 `hm/mod.rs` 的 Nil 桩组移出，路由到新增的
+//! `infer_macro_def`（把 `Vec<String>` 形参补齐成 `WitnessParam` 后转调
+//! `infer_fn_def`）。宏体是语句序列由 `infer_sequence` 的 do-notation 语义兜住。
+//!
+//! 下方 `d274_runtime_*` 三条**正向断言**（作用域契约）修前修后都应绿，
+//! 它们的作用是**防止将来的修复误伤**；`d274_legal_macro_bodies_are_not_false_positives`
+//! 是本轮新加的反向对照组，专门钉死「合法宏体不被误报」。
 //!
 //! ## ⚠ 本文件混合两类断言
 //!
@@ -105,24 +113,55 @@ fn printed(source: &str) -> String {
     }
 }
 
-/// **现状判据**主断言：宏体里的类型不匹配零诊断。
+/// **宏体里的类型不匹配必须被检出**（v0.104.6 D274 已修）。
 ///
-/// 修好之后本条会红（`expect_checked` 翻成 `true`）。
+/// ⚠ 本条原本断言 `n == 0` —— 把缺陷钉成了契约。修好后必然变红，红得对。
 #[test]
-fn d274_macro_body_type_mismatch_is_not_caught() {
+fn d274_macro_body_type_mismatch_is_caught() {
     let n = typeck_error_count("macro m()\n  1 + \"str\"\nend\n1\n");
-    assert_eq!(
-        n, 0,
-        "现状：宏体里的 `1 + \"str\"` 零诊断（应检出）。\
-         若本条失败说明宏体已接上 typeck —— 把本文件两处 expect 翻成 true 即可"
+    assert!(
+        n > 0,
+        "宏体里的 `1 + \"str\"` 必须被 typeck 检出（修前是 0 诊断 + 运行期 `1.0str`）"
     );
 }
 
-/// **现状判据**：宏体里的未绑定变量零诊断。
+/// **宏体里的未绑定变量必须被检出**（D274 已修）。
+///
+/// 修前：`macro m() let z = nosuchvar end` 零诊断、运行期得 `nil`。
 #[test]
-fn d274_macro_body_unbound_var_is_not_caught() {
+fn d274_macro_body_unbound_var_is_caught() {
     let n = typeck_error_count("macro m()\n  let z = nosuchvar\nend\n1\n");
-    assert_eq!(n, 0, "现状：宏体里引用未绑定变量零诊断（应检出 Unbound）");
+    assert!(
+        n > 0,
+        "宏体里引用未绑定变量必须被检出 Unbound（修前是 0 诊断）"
+    );
+}
+
+/// **反向对照**：**合法**宏体**不得**被误报。
+///
+/// D274 修好宏体检查后最大的风险是假阳性 —— 宏体是语句序列、
+/// 还要看得到外层变量与形参，任何一处收窄都会打断今天能跑的程序。
+/// 本条把三条最容易被误伤的合法形态各钉一次。
+#[test]
+fn d274_legal_macro_bodies_are_not_false_positives() {
+    // ① 语句序列（`infer_sequence` 的 do-notation 语义）
+    assert_eq!(
+        typeck_error_count("macro two()\n  let x = 1\n  let y = 2\n  x + y\nend\n1\n"),
+        0,
+        "宏体是语句序列，最后一个表达式即宏的结果 —— 不该报错"
+    );
+    // ② 形参绑定
+    assert_eq!(
+        typeck_error_count("macro add2(a, b)\n  a + b\nend\n1\n"),
+        0,
+        "宏形参必须绑进宏体作用域"
+    );
+    // ③ 外层变量可见（运行期是 `env.clone()`，外层全部可见）
+    assert_eq!(
+        typeck_error_count("let g = \"G\"\nmacro m()\n  g\nend\n1\n"),
+        0,
+        "宏体应看到外层变量 —— 收窄作用域会把这条变成假阳性"
+    );
 }
 
 /// **对照组**：顶层与闭包体**必须**检出同一处错误。

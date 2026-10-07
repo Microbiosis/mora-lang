@@ -1510,6 +1510,41 @@ impl HMInference {
         Ok((ty, crate::mir::effect::EffectRow::Empty))
     }
 
+    pub(super) fn infer_macro_def(
+        &mut self,
+        name: &str,
+        params: &[String],
+        body: &MirWitness,
+        span: Span,
+    ) -> Result<(Type, crate::mir::effect::EffectRow), Vec<TypeError>> {
+        // v0.104.6 D274：宏体进 typeck。
+        //
+        // 形状与 `FnDef` **完全同构**，唯一差别是形参类型：
+        // `FnDef.params` 是 `Vec<WitnessParam>`（带 `type_hint` / `default`），
+        // `MacroDef.params` 是 `Vec<String>`（宏形参无标注也无默认值）。
+        // 故补齐成无标注的 `WitnessParam` 后直接转调 `infer_fn_def` ——
+        // 宏体是语句序列也没问题：`WitnessKind::Sequence` 有 `infer_sequence`
+        // （do-notation 语义，返回最后一个表达式），正是宏体该有的行为。
+        //
+        // **关于前向引用**（测试文件当初担心的误报来源）：
+        // `macro outer() inner() end` + `macro inner() … end` 能跑通。
+        // 实测 typeck **根本不解析自由函数名**（`print(nosuch())` 也报
+        // 「No type errors found」，只有运行期才报 Undefined），
+        // 所以宏体里调另一个宏**不会**因为「定义在后」而误报。
+        // 真正会变的是**变量**：宏体能看到外层变量（运行期 `env.clone()`），
+        // 而顺序推断下「定义在宏之后」的外层变量仍会 Unbound ——
+        // 这与闭包体同源，且宏是运行期展开，本就允许前向引用。
+        let params: Vec<WitnessParam> = params
+            .iter()
+            .map(|p| WitnessParam {
+                name: p.clone(),
+                type_hint: None,
+                default: None,
+            })
+            .collect();
+        self.infer_fn_def(Some(name), &params, body, span)
+    }
+
     pub(super) fn infer_fn_def(
         &mut self,
         name: Option<&str>,

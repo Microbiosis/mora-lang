@@ -53,6 +53,41 @@ fn main() {
     }
 }
 
+/// D380：未知 flag 静默忽略的**唯一**报错出口。
+///
+/// 此前 `record export` / `record report` 是 `_ => {}` 兜底、`record audit` 是
+/// 无 else 的 `if`，三者都会把错拼的 flag（如 `--formt md`）**默默丢弃**、
+/// 让命令回落到默认值 —— 用户看到的是「exit 0 成功」，而他根本没要求那个格式。
+/// 更糟的是 `--formt` 只差一个字母，拼错的概率远高于拼对。
+///
+/// 与 D189 的 `reject_option_as_path` **互补而非重叠**：后者拦的是
+/// 「选项出现在文件名位置」，根本进不到子命令的 flag 循环；
+/// 这里拦的是「进了子命令、但 flag 名不认识」。两道都需要。
+fn unknown_flag(name: &str, subcommand: &str, accepted: &[&str]) -> ! {
+    eprintln!(
+        "mora {subcommand}: 未知 flag `{name}`。\n\
+         本命令接受的 flag：{}\n\
+         （错拼的 flag 此前会被静默忽略并回落到默认值。）\n\
+         `mora --help` 列出全部可用选项。",
+        accepted.join(" / ")
+    );
+    process::exit(1);
+}
+
+/// 取 flag 的值；缺值时**报错**而不是静默保留默认值。
+/// 此前 `record export r1 --format`（缺值）会 `unwrap_or(default)`，
+/// 于是「写了 format 却没生效」与「没写 format」完全不可区分。
+fn flag_value(args: &[String], i: &mut usize, flag: &str, subcommand: &str) -> String {
+    *i += 1;
+    match args.get(*i) {
+        Some(v) => v.clone(),
+        None => {
+            eprintln!("mora {subcommand}: flag `{flag}` 缺少值。");
+            process::exit(1);
+        }
+    }
+}
+
 fn dispatch() -> i32 {
     let args: Vec<String> = env::args().collect();
 
@@ -120,6 +155,12 @@ fn dispatch() -> i32 {
                 println!("  mora --help                Show this help");
                 return 0;
             }
+            // D380：此处**不是** flag 循环，保留 `_ => {}` 是正确的。
+            // 上面 match 的主语是 `args[1]`（只看**第一个**参数），
+            // 目的是在显示 banner 之前先截获 `--version` / `--help`。
+            // 落进 `_` 的就是文件名、子命令名等正常输入，不是「不认识的 flag」。
+            // D380 的真实缺陷在 `record export` / `record report` /
+            // `record audit` 三处子命令的 flag 循环，已改为 `unknown_flag(...)` 硬报错。
             _ => {}
         }
     }
@@ -208,16 +249,19 @@ fn dispatch() -> i32 {
                     let mut output = None;
                     let mut i = 4;
                     while i < args.len() {
-                        match args[i].as_str() {
+                        let cur = args[i].clone();
+                        match cur.as_str() {
                             "--format" | "-f" => {
-                                i += 1;
-                                format = args.get(i).cloned().unwrap_or(format);
+                                format = flag_value(&args, &mut i, &cur, "record export");
                             }
                             "--output" | "-o" => {
-                                i += 1;
-                                output = args.get(i).cloned();
+                                output = Some(flag_value(&args, &mut i, &cur, "record export"));
                             }
-                            _ => {}
+                            other => unknown_flag(
+                                other,
+                                "record export",
+                                &["--format", "-f", "--output", "-o"],
+                            ),
                         }
                         i += 1;
                     }
@@ -232,9 +276,13 @@ fn dispatch() -> i32 {
                     let mut policy = ".moraignore".to_string();
                     let mut i = 4;
                     while i < args.len() {
-                        if args[i] == "--policy" && i + 1 < args.len() {
-                            i += 1;
-                            policy = args[i].clone();
+                        if args[i] == "--policy" {
+                            policy = flag_value(&args, &mut i, "--policy", "record audit");
+                        } else if args[i].starts_with("--") {
+                            // 只拦 `--x` 形态：裸词（若有）仍按位置参数放过，
+                            // 与 `record export` 的「一律拒」不同 —— audit 没有
+                            // 声明过任何位置参数，保守起见不扩大范围。
+                            unknown_flag(&args[i], "record audit", &["--policy"]);
                         }
                         i += 1;
                     }
@@ -253,20 +301,22 @@ fn dispatch() -> i32 {
                     let mut output = None;
                     let mut i = 4;
                     while i < args.len() {
-                        match args[i].as_str() {
+                        let cur = args[i].clone();
+                        match cur.as_str() {
                             "--note" => {
-                                i += 1;
-                                note = args.get(i).cloned();
+                                note = Some(flag_value(&args, &mut i, &cur, "record report"));
                             }
                             "--verify" => {
-                                i += 1;
-                                verify = args.get(i).cloned();
+                                verify = Some(flag_value(&args, &mut i, &cur, "record report"));
                             }
                             "--output" | "-o" => {
-                                i += 1;
-                                output = args.get(i).cloned();
+                                output = Some(flag_value(&args, &mut i, &cur, "record report"));
                             }
-                            _ => {}
+                            other => unknown_flag(
+                                other,
+                                "record report",
+                                &["--note", "--verify", "--output", "-o"],
+                            ),
                         }
                         i += 1;
                     }
@@ -294,7 +344,24 @@ fn dispatch() -> i32 {
             }
             let file = &args[2];
             let name = &args[3];
-            let update = args.iter().any(|a| a == "--update");
+            // v0.104.6 D380 补漏：此前是
+            // `args.iter().any(|a| a == "--update")` —— **另一种形状**，
+            // 所以 D380 那轮按 `_ => {}` 计数的普查**看不到它**：
+            // `mora snapshot f.mora r1 --updat`（错拼）静默忽略、exit 0。
+            // 改成显式循环，未知 flag 走与其它子命令同一个报错出口。
+            let mut update = false;
+            for a in &args[4..] {
+                // 只把 `-` 开头的当 flag：**裸词交给 D189 的
+                // `reject_option_as_path` 归因**（它在更早的阶段判「选项写在了
+                // 文件位置」）。这里抢着报「未知 flag」会把那条更准确的诊断盖掉。
+                if !a.starts_with('-') {
+                    continue;
+                }
+                match a.as_str() {
+                    "--update" => update = true,
+                    other => unknown_flag(other, "snapshot", &["--update"]),
+                }
+            }
             record::run_snapshot(file, name, update, opt_level);
         }
         "replay" => {

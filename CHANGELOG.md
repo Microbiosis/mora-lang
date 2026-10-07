@@ -33623,3 +33623,202 @@ Module-level `//!`  HTML :
 - `cargo fmt --check`: 0 diff
 - `cargo doc --no-deps`: 0 warning
 
+
+---
+
+## [Unreleased] — 系统性缺陷修复轮：D380 / D327 / D397 / D274 + 三项「已核实为契约」
+
+起点是一次**缺陷汇总复核**：把 CHANGELOG 全部 65 处「未修 / 待裁决 / 未改 / 尚未 / 待定」
+小节逐条回当前代码 + 真实 `mora.exe` CLI 实测（不照抄标题措辞 —— 标题是当时那一轮的措辞，
+本轮实测推翻了其中 **11 处**「标题说未修、实际已修」）。
+
+### ✅ D380：CLI flag 解析的静默兜底（已修）
+
+`record export` / `record report` 的 flag 循环是 `_ => {}`、`record audit` 是无 `else` 的 `if`
+⇒ **错拼的 flag（`--formt md`，只差一个字母）被默默丢弃、命令回落到默认值、退出码仍是 0**。
+用户要 Markdown 报告（给人看）拿到 JSONL（机器格式），而退出码让他以为成功了。
+
+同族第 5 种形态一并修掉：`run_record_export` 里 `_ => ExportFormat::Jsonl`
+⇒ `--format BOGUS` 里 flag 名对、**值**错，同样静默回落 JSONL。
+
+| 位置 | 改法 |
+|---|---|
+| `main.rs` `record export` 循环 | 兜底 → `unknown_flag(...)` |
+| `main.rs` `record report` 循环 | 兜底 → `unknown_flag(...)` |
+| `main.rs` `record audit`（无 else 的 `if`） | 加 else 分支 |
+| `cli/record.rs` `run_record_export` | `_ => Jsonl` → 未知格式值报错 |
+| `main.rs` `record snapshot` | `args.iter().any(...)` → 显式循环 + `unknown_flag` |
+
+**最后一处是普查的盲区**：我那轮按「`_ => {}` 计数」做全称普查，而
+`snapshot` 用的是 `args.iter().any(|a| a == "--update")` —— **形状完全不同，
+普查数不到它**。实测 `mora snapshot f.mora r1 --updat`（错拼）静默忽略、
+exit 0。判据 `d380_snapshot_unknown_flag_is_rejected` 补上这条。
+
+⇒ **教训**：「普查看不到」不等于「不存在」。按**语法形状**计数（`_ => {}`）
+只能覆盖用同一形状写的兜底；`.iter().any()` / `.contains()` 这类
+**扫描式 flag 查找**是完全不同的第三种形态，必须单独查。
+
+三处循环共用 `main.rs::unknown_flag` 一个报错出口；`--format` 等取不到值时共用
+`flag_value`（修前是 `unwrap_or(默认值)`，让「写了 format 却没生效」与「没写 format」
+完全不可区分）。
+
+> **`main.rs` 里剩下的那一处 `_ => {}` 不是缺陷**：它是只扫 `args[1]` 找
+> `--version` / `--help` 的**预扫描**，落进 `_` 的是文件名 / 子命令名等正常输入。
+> 已在原地加注释钉住，免得下一个人（或未来的普查脚本）把它当缺陷改掉。
+
+### ✅ D327：一元内建缺参时**静默**当成 `nil`（已修）
+
+`interpreter/builtin_impls.rs` 里 `str` / `int` / `float` / `bool` / `atom` 五个入口此前是
+同一行 `args.first().cloned().unwrap_or(Value::Nil)` ⇒ `str()` → `"nil"` exit 0、
+`bool()` → `false` exit 0、`atom()` → `Atom(Nil)` exit 0。`int` / `float` 之所以**碰巧**
+报错，是随后撞上「nil 不可转换」，而那句话把「没给参数」误报成「给了个不能用的 nil」。
+
+方向不是随手选的：`typeck/hm/builtin.rs` 把这五个**全部**登记成**一元**箭头，
+同族的 `type_of()` / `deref()` / `methods_of()` / `len()` / `compose()` 也全都对缺参报错
+⇒ 本条不是新增约束，只是**让实现回到已有签名上**。修法：共用一个 `require_1`。
+
+与 `signature_no_over_tightening`「只能收紧下限、不能收紧上限」不冲突：本条收紧的正是
+**下限**（0 → 1）；多余实参的拒绝点在 typeck 的柯里化箭头，与本条无关（判据里分开断言）。
+
+### ✅ D397：`rel::search` 无搜索步数上界 —— 左递归让 `solve` 永久挂死（已修，方案①）
+
+`rel loop2(x) loop2(x) end` + `solve 2 { loop2(?X) }` 此前**永不退出**（`limit` 只在两次解
+**之间**检查，而 `next_solution` 永不返回）。
+
+`Search` 增加 `steps` / `max_steps`，`next_solution` 逐步计数、超限返回 `Err`。
+计数是**跨多次 `next_solution` 累计**的字段而非局部变量 —— 否则 `h_solve` 每轮都白拿一整份
+预算，左递归未必在单次调用内撞上限，而「每次只跑几千步」的合法深搜索会被误杀。
+
+默认 `DEFAULT_MAX_STEPS = 200_000` 是**标定出来的**：左递归在 1 000 000 步下要 8.7 秒才报错
+（每步会克隆越堆越长的 chain），20 万步把最坏等待压到 **~1.8 秒**；而合法搜索量级低得多
+（`rel_basic.mora` 的传递闭包全解只有几十步）。`Search::with_max_steps(n)` 可调，
+传 `0` 回到修前的无限语义。
+
+**代价（明写）**：「终止由关系作者负责」这条 Prolog 式约定，对**产不出解**的规则不再成立。
+
+### ✅ D274：宏体**不参与 typeck** —— 类型错与未绑定变量双双静默（已修）
+
+`MacroDef` 与 `TypeAlias` / `EnumDef` / `StructDef` / `Import` 并列返 `Type::Nil`，但那四者
+都是**纯类型声明**（无子表达式），而宏体是**活表达式**：
+
+```mora
+macro m()
+  1 + "str"        -- 修前：1.0str，exit 0 ❗
+end
+macro m2()
+  "v:" + nosuchvar -- 修前：v:nil，exit 0 ❗
+end
+```
+
+修法：`MacroDef` 移出 Nil 桩组，路由到新增的 `infer_macro_def` —— 把 `Vec<String>` 形参
+补齐成 `WitnessParam` 后转调 `infer_fn_def`（宏体是语句序列由 `infer_sequence` 的
+do-notation 语义兜住）。
+
+> 测试文件当初担心的前置条件（「宏支持前向引用，而 `precompute_fn_arities` 只登记 `FnDef`
+> ⇒ 需要新增预登记遍」）经实测**不成立**：typeck 根本不解析自由函数名
+> （`print(nosuch())` 也报「No type errors found」，只有运行期才报 Undefined）。
+
+新增反向对照组 `d274_legal_macro_bodies_are_not_false_positives`，把语句序列、形参绑定、
+外层变量可见这三条最易被误伤的合法形态各钉一次。
+
+### ⛔ 本轮**自我否决**的两处，以及三项「已核实为契约」
+
+**① 数值塔回归（D55）—— 改了 11 条门禁红，全量回退。**
+
+`let n: Int = 5` / `let n: Int = d.count` / `let y: Int = xs[0]` 此前全被拒。实测三条证据
+指向「应放行」：`1i + 1.5` → `2.5`（算术里完全互溶）、`let n: Float = 5` → `5.0`
+（Int→Float 早已放行）、所有裸字面量都是 `Float`。据此在 `subtype_of` / `compatible_with` /
+`Constraint::Eq` 三处加数值塔 arm 后 —— **门禁 11 条红**。
+
+查下来是 `tests/number_tower.rs` 的**明文契约**：
+
+```rust
+// Int 标注：收 Int、拒 Float（Float 字面量需显式转）
+assert!(run("let x: int = 1.5\nx\n").is_err(), "`int` 不该接住 Float 字面量");
+```
+
+`d188_a_single_type_error_is_reported_once` 的样本就是 `let v: Int = 1.5` 期望 exit 2 ——
+我改完之后它变合法，诊断消失。⇒ 这是**有人明文决定过的语义**，不是疏漏。全量回退。
+
+**② D199 BigInt 数值塔 —— 本就不该动。**
+`tests/number_tower.rs:40`：「**`BigInt` 故意排除**：v0.91 明确『BigInt 不参与
+`Int <: Float` 提升（避免隐式精度损失）』，spec `:110` 也未把 BigInt 列进 `number`」，
+另有 `bigint_comparison.rs` 与 `comparison_matrix.rs` 两处专门钉这个排除。
+
+**③ D142 `mean([])` / `sum([])` —— 现状是契约。**
+`tests/list_methods.rs:292-300` 把 `sum([])` = `-0.0`、`mean([])` = `0.0` 钉为现状
+（注释写明来自 `f64::iter().sum()` 的空迭代器初值），CHANGELOG D246 已收口，
+明写「属产品契约决定，故只钉不修」。
+
+**④ D55 的假阴性 —— D67 早已修好。**
+复核用的探针原先写成 `let y: String = d["a"]`（而 `d = {a: "s"}` 值本来就是 String，
+**被接受是正确的**）；换成 CHANGELOG 原文的 `let y: Int = d["a"]` 后实测已被拒。
+`infer.rs:793-800` 有 D67 的记录，连链式索引 `m[0][0]` 也不丢类型。
+
+### ✅ D268：Pregel 多目标投递 —— 唤醒节点的消息送不到它自己（**已修，两层叠加的缺陷**）
+
+> ⚠ 本条的诊断过程**被推翻过两次**（先以为是「单槽覆盖」，再以为是「缺投递边」），
+> 下面保留经过，是为了让下一轮不从同一个坑重走。
+
+#### 根因是**两层叠加**（临时插桩实证）
+
+```text
+修复前：        EXEC t1 got {}                                  ← 第一层
+只修第一层后：  t1 got {"input":11}  t2 got {"input":11}        ← 第二层显形
+两层都修后：    t1 got {"input":11}  t2 got {"input":22}        ← ✅
+```
+
+**第一层 · 判定层**（`src/pregel/mod.rs` 的「── 2. EXEC ──」段）：
+`versions_seen` 快照记在 EXEC **之前**且用 `or_insert` 灌当前版本，而
+`build_node_input` 的差集判据是 `version > seen_version`
+⇒「先记当前、再比当前」永远为假。
+
+- 对**重复执行**的节点：`or_insert` 保留旧值，差集恰好正确 ⇒ 缺陷长期隐身
+- 对**首次激活**（被 `Send` 唤醒）的节点：`versions_seen` 是空的 ⇒ 被种成当前
+  版本 ⇒ 差集为空 ⇒ `build_node_input` 返回空字典
+  ⇒ **唤醒它的那条消息永远送不到它自己**（不是「被覆盖」）
+
+**第二层 · 存储层**：`channels["input"]` 是**一个全局槽**，同一超步投给 N 个
+target 就写 N 次，只有最后一个的值活下来。修好第一层后这一层才显形。
+
+#### 修法
+
+| 层 | 改法 |
+|---|---|
+| 判定层 | 快照从 EXEC **前** 移到 EXEC **后**、UPDATE/ADVANCE **前**（ADVANCE 会自增版本号，那时记就晚了） |
+| 存储层 | 引擎加 `node_inputs: HashMap<String, Value>`，每跳 ADVANCE 开头清空；`build_node_input` 对 `input` 通道按**节点**取值 |
+
+诊断口 `first_delivered_input_of` 记**首次**执行 —— 节点会被反复激活，
+第二次起有合法基线，读最后一次会**掩盖首次是否收到了唤醒它的那条消息**。
+
+#### 判据
+
+- `d268a_woken_node_actually_receives_its_message` —— 首次收到的必须非空
+- `d268a_each_target_receives_its_own_payload` —— 两个 target 互不相同，
+  合起来正好是 {11, 22}；**不钉「哪一条先到」**（`HashMap` 遍历顺序逐次不同）
+- `d268a_multi_target_fanout_writes_one_slot_n_times` 保留，但降级为
+  **只描述全局通道的状态**（它仍然只装一条）
+
+牙齿验证：把快照循环移回 EXEC **之前** ⇒ **两条判据都精确变红**。
+
+> ⚠ **一次无效的牙齿验证值得记**：第一版牙齿测试只把快照代码的**内容**换回
+> `or_insert`，**没动它的位置** —— 于是第一层压根没被撤掉，判据当然全绿。
+> 我把**测试装置的缺陷**误判成了**判据没有判别力**，差点把这个正确修复也扔掉。
+> ⇒ 牙齿验证撤除缺陷时，要确认**撤掉的是行为**而不只是**文本**。
+
+#### 观测上的工具坑
+
+插桩一律用 **Edit 工具**写，不要用 PowerShell `.Replace()`：后者会吃掉
+`eprintln!` 的 `{}` 占位符（输出字面量而非插值），还会因 `final_value` 已被
+`channels.insert` 移动而编译失败 —— 两种故障都长得像「观测不出结果」，
+白烧了三轮。**观测装置出错时先怀疑装置，再怀疑被观测对象。**
+
+### 门禁
+
+`312` 目标 / **2846 passed / 0 failed** · `cargo clippy --all-targets --all-features -D warnings` clean
+· `cargo fmt --all -- --check` 0 diff · `cargo doc --no-deps` 0 warning
+
+四项修复均做了**牙齿验证**（改坏 → 确认判据精确变红 → 恢复）。过程中判据自身翻车 6 次
+（详见 `tests/` 内各文件的「判据演进记录」注释）：其中 `d380_only_the_help_prescan_keeps_its_wildcard_arm`
+第一版写成 `unknown_flag(` 出现次数 ≥ 4，牙齿验证时发现**删掉 `record report` 的调用也不红**，
+改为按大括号配对取每个 flag 循环的函数体逐个断言后才有牙齿。

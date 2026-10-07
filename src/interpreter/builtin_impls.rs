@@ -9,6 +9,26 @@ use parking_lot::Mutex;
 use super::*;
 use crate::value::Value;
 
+/// D327：取一元内建的**唯一**实参入口。
+///
+/// 修前 `str` / `int` / `float` / `bool` / `atom` 五处都是
+/// `args.first().cloned().unwrap_or(Value::Nil)` —— 少传参数时**静默**
+/// 当成 `nil` 继续算：`str()` → `"nil"`、`bool()` → `false`、
+/// `atom()` → `Atom(Nil)`，而 `int()` / `float()` 因为随后撞上
+/// 「nil 不可转换」才**碰巧**报错（且文案误导，说「does not accept nil」，
+/// 真实原因是「没给参数」）。
+///
+/// 方向由既有证据钉死，不需要另作选择：`typeck/hm/builtin.rs` 把这五个
+/// 全部登记成**一元**箭头（`str: α → String` 等），同族的
+/// `type_of()` / `deref()` / `methods_of()` / `len()` / `compose()`
+/// 也全都对缺参报错。所以「缺参报错」是既有契约，本条只是让实现回到契约上。
+fn require_1(name: &str, args: &[Value]) -> Result<Value, String> {
+    match args.first() {
+        Some(v) => Ok(v.clone()),
+        None => Err(format!("{name}() requires 1 argument")),
+    }
+}
+
 impl Interpreter {
     pub(super) fn call_builtin_merge_with(&mut self, args: Vec<Value>) -> Result<Value, String> {
         let key = match args.first() {
@@ -210,7 +230,7 @@ impl Interpreter {
     /// 语义与 `print` 对单个值的取字一致（`call_builtin_print` 同用
     /// `Value::to_string`），因此 `"x" + str(n)` 的拼接结果与 `print(x, n)` 一致。
     pub(super) fn call_builtin_str(&mut self, args: Vec<Value>) -> Result<Value, String> {
-        let v = args.first().cloned().unwrap_or(Value::Nil);
+        let v = require_1("str", &args)?;
         testcase!(true, "str: any");
         Ok(Value::String(v.to_string()))
     }
@@ -230,7 +250,7 @@ impl Interpreter {
     /// 其余（List/Dict/Nil/…）报明确错误而非静默给 0。
     pub(super) fn call_builtin_int(&mut self, args: Vec<Value>) -> Result<Value, String> {
         use num_traits::ToPrimitive;
-        let v = args.first().cloned().unwrap_or(Value::Nil);
+        let v = require_1("int", &args)?;
         let out = match v {
             Value::String(s) => {
                 let t = s.trim();
@@ -274,7 +294,7 @@ impl Interpreter {
     /// v0.104.6：`float(x)` —— 值 → 浮点。与 `int()` 同源的缺口。
     pub(super) fn call_builtin_float(&mut self, args: Vec<Value>) -> Result<Value, String> {
         use num_traits::ToPrimitive;
-        let v = args.first().cloned().unwrap_or(Value::Nil);
+        let v = require_1("float", &args)?;
         let out = match v {
             Value::String(s) => s
                 .trim()
@@ -326,7 +346,7 @@ impl Interpreter {
     /// 正是它警告的那件事。委托即可，分叉从根上消失。
     /// 由 `tests/builtin_gaps.rs::bool_agrees_with_language_truthiness` 逐值钉住。
     pub(super) fn call_builtin_bool(&mut self, args: Vec<Value>) -> Result<Value, String> {
-        let v = args.first().cloned().unwrap_or(Value::Nil);
+        let v = require_1("bool", &args)?;
         testcase!(true, "bool: coercion");
         Ok(Value::Bool(crate::flow::is_truthy(&v)))
     }
@@ -349,7 +369,7 @@ impl Interpreter {
     }
 
     pub(super) fn call_builtin_atom(&mut self, args: Vec<Value>) -> Result<Value, String> {
-        let value = args.first().cloned().unwrap_or(Value::Nil);
+        let value = require_1("atom", &args)?;
         Ok(Value::Atom(Arc::new(Mutex::new(value))))
     }
 

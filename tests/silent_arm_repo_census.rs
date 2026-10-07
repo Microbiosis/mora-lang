@@ -110,25 +110,39 @@ fn d381_repo_wide_silent_arm_census() {
     );
 }
 
-/// **`main.rs` 恰好 3 处**，且全在 CLI 参数解析上下文。
+/// **`main.rs` 只剩 1 处**，且**不在** flag 解析上下文（**已修**）。
 ///
-/// 这是 D380 的结论**在源码层的固化**：只有这 3 处是用户可达的静默兜底。
+/// 修前是 3 处（`:123` / `:220` / `:269`），D380 把后两处改成了
+/// `unknown_flag(...)` 硬报错。第三处 `:123` 是 `--version` / `--help`
+/// **预扫描**的 match，主语是 `args[1]`，落进 `_` 的是文件名 / 子命令名等
+/// **正常输入** —— 保留兜底是**正确**的（删掉它会让 `mora file.mora` 直接报错）。
+///
+/// ⚠ 本条曾以「恰好 3 处」的形式**钉住缺陷本身**（`d381_only_three_silent_arms…`），
+/// 修好后必然变红 —— 这是有意的行为变更，不是回归。
 #[test]
-fn d381_only_three_silent_arms_in_cli_parsing() {
+fn d381_only_the_help_prescan_keeps_its_silent_arm() {
     let main = read("src/main.rs");
     assert_eq!(
         count_silent_arms(&main),
-        3,
-        "`main.rs` 应恰好 3 处 `_ => {{}}`（:123 / :220 / :269）; 实得 {}",
+        1,
+        "`main.rs` 应只剩 1 处 `_ => {{}}`（`--version`/`--help` 预扫描）; 实得 {}",
         count_silent_arms(&main)
     );
-    // 且都紧跟在参数解析的 match 里（上下文含 flag 字面量）
+    // flag 解析区必须还有这些字面量（说明 flag 解析仍在，只是不再静默了）
     for flag in ["--output", "--verify", "--version"] {
+        assert!(main.contains(flag), "flag 解析区应仍含 `{flag}`");
+    }
+    // 且三处 flag 循环都已改走 unknown_flag 出口
+    for sub in ["record export", "record audit", "record report"] {
         assert!(
-            main.contains(flag),
-            "三处兜底应分布在 flag 解析区（应含 `{flag}`）"
+            main.contains(&format!("\"{sub}\"")),
+            "`{sub}` 的 flag 循环应指名自己并走 unknown_flag"
         );
     }
+    assert!(
+        main.contains("fn unknown_flag("),
+        "唯一的报错出口 `unknown_flag` 应存在"
+    );
 }
 
 /// **函数分派的最终兜底**必须**明确报错**，不能静默。
@@ -146,9 +160,12 @@ fn d381_call_dispatch_final_fallback_errors() {
     );
 }
 
-/// **行为层**：错拼的 flag 仍然静默回落（D380 的结论未变）。
+/// **行为层**：错拼的 flag 现在**被拒**（D380 已修；本条曾钉「仍静默回落」）。
+///
+/// ⚠ 这条原本断言 `code == 0` —— 也就是**把缺陷钉成了契约**。
+/// D380 收紧后它必然变红；红得对，改断言才是对的。
 #[test]
-fn d381_misspelled_flag_still_silently_falls_back() {
+fn d381_misspelled_flag_is_now_rejected() {
     let dir = std::env::temp_dir().join("d381probe");
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(dir.join(".mora").join("recordings")).unwrap();
@@ -159,15 +176,18 @@ fn d381_misspelled_flag_still_silently_falls_back() {
     .unwrap();
 
     let (code, out) = mora(&dir, &["record", "export", "r1", "--formt", "md"]);
-    assert_eq!(code, 0, "错拼 flag 当前静默回落; out={out}");
+    assert_ne!(
+        code, 0,
+        "错拼 flag 现在必须非零退出（修前是 exit 0 静默回落）; out={out}"
+    );
     assert!(
-        out.lines().any(|l| l.trim_start().starts_with('{')),
-        "回落目标是 JSONL; out={out}"
+        out.contains("--formt"),
+        "报错必须**指名**错拼的那个 flag; out={out}"
     );
     assert!(
         !out.lines()
             .any(|l| l.trim_start().starts_with("# Recording")),
-        "错拼的 `--formt` 不能碰巧生效; out={out}"
+        "错拼的 `--formt` 绝不能碰巧生效; out={out}"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }

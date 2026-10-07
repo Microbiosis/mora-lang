@@ -184,8 +184,64 @@ fn d268a_multi_target_fanout_writes_one_slot_n_times() {
         "槽里存下的必然是两条消息之一，实际：{:?}",
         stored
     );
-    // 2 次写入、1 个槽 ⇒ 至少一条消息被销毁。这条不依赖遍历顺序。
-    assert!(writes > 1, "写入次数超过槽位容量 ⇒ 必然有消息被覆盖销毁");
+    // 2 次写入、1 个**全局**槽。⚠ v0.104.6 D268 已修：这条现在只描述全局通道
+    // 的状态；投递语义由下面两条判保证。
+    assert!(writes > 1, "全局槽写入次数超过槽位容量（投递隔离见下两条）");
+}
+
+/// **D268 判据（一）：首次被唤醒时必须真的收到那条消息。**
+///
+/// 第一层缺陷在**判定层**：`versions_seen` 快照记在 EXEC **之前**
+/// （`pregel/mod.rs` 的「── 2. EXEC ──」段），而差集判据是
+/// `version > seen_version` ——「先记当前、再比当前」永远为假。
+/// 对重复执行的节点 `or_insert` 保留旧值、差集恰好正确，缺陷长期隐身；
+/// 对**首次激活**（被 `Send` 唤醒）的节点 `versions_seen` 是空的
+/// ⇒ 被种成当前版本 ⇒ 差集为空 ⇒ 收到空字典。
+/// ⇒ **唤醒它的那条消息永远送不到它自己**（不是「被覆盖」）。
+///
+/// ⚠ 必须读 `first_delivered_input_of`（**首次**执行）。节点会被反复激活，
+/// 第二次起有合法基线，读最后一次会**掩盖首次是否收到了唤醒它的那条消息**。
+#[test]
+fn d268a_woken_node_actually_receives_its_message() {
+    let mut engine = MirPregelEngine::new(fanout_config(11, 22));
+    let mut interp = Interpreter::new();
+    engine.run(&mut interp).unwrap();
+    for node in ["t1", "t2"] {
+        let got = engine.first_delivered_input_of(node).map(str::to_string);
+        assert!(got.is_some(), "{node} 应在首次 EXEC 时收到 input");
+        assert_ne!(
+            got.as_deref(),
+            Some("{}"),
+            "{node} 首次收到的必须是**非空**载荷 —— 第一层缺陷下恒为空字典"
+        );
+    }
+}
+
+/// **D268 判据（二）：多个 target 必须各拿各的。**
+///
+/// 修好判据（一）之后**这一层才显形**：两个节点都收到了消息，但都读到 11
+/// —— `channels["input"]` 是**一个全局槽**，同超步投给 N 个 target 就写 N 次。
+///
+/// ⚠ 断言刻意**不钉「哪一条先到」**（`HashMap` 遍历顺序逐次不同），
+/// 钉的是**隔离性**本身：两者互不相同，且合起来正好是 {11, 22}。
+#[test]
+fn d268a_each_target_receives_its_own_payload() {
+    for _ in 0..40 {
+        let mut engine = MirPregelEngine::new(fanout_config(11, 22));
+        let mut interp = Interpreter::new();
+        engine.run(&mut interp).unwrap();
+        let t1 = engine.first_delivered_input_of("t1").map(str::to_string);
+        let t2 = engine.first_delivered_input_of("t2").map(str::to_string);
+        assert_ne!(
+            t1, t2,
+            "**两个 target 拿到了同一个 input** —— per-node 隔离失效（D268 回归）"
+        );
+        let pair = [t1.unwrap(), t2.unwrap()];
+        assert!(
+            pair.iter().any(|s| s.contains("11")) && pair.iter().any(|s| s.contains("22")),
+            "两个 target 应分别拿到 11 与 22; 实得 {pair:?}"
+        );
+    }
 }
 
 /// 对照组：**单** target 时 `input` 槽正确收到那一条。

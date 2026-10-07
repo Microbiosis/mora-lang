@@ -78,6 +78,17 @@ pub struct MirPregelEngine {
     channel_versions: HashMap<String, u64>,
     versions_seen: HashMap<String, HashMap<String, u64>>,
 
+    /// v0.104.6 D268 第二层：本超步**每个 target 各自**收到的 `input` 载荷。
+    /// `channels["input"]` 是**一个全局槽**，同超步投给 N 个 target 就写
+    /// N 次，只剩最后一个的值活下来。修好第一层后这一层才显形。
+    /// 每跳 ADVANCE 开头清空。
+    node_inputs: HashMap<String, Value>,
+
+    /// v0.104.6 D268：各节点**首次** EXEC 时**实际收到**的 input（诊断用）。
+    /// 与 `agent_input_cache` 不同：后者是增量跳过的判据缓存（预填充空字典），
+    /// 读它看不到「这一跳到底喂了什么」。本表在 EXEC 处只记首次。
+    exec_inputs: HashMap<String, String>,
+
     pending_sends: Vec<SendTask>,
 
     /// v0.61: Concurrent write-write conflicts detected during BSP execution.
@@ -287,6 +298,8 @@ impl MirPregelEngine {
             channels: HashMap::new(),
             channel_versions: HashMap::new(),
             versions_seen: HashMap::new(),
+            node_inputs: HashMap::new(),
+            exec_inputs: HashMap::new(),
             pending_sends: Vec::new(),
             conflicts: Vec::new(),
             max_steps: 1000,
@@ -610,6 +623,12 @@ impl MirPregelEngine {
     /// 2. EXEC：调用 pre-lowered task_body
     /// 3. UPDATE：应用 reducer
     /// 4. ADVANCE：处理 send tasks + 决定下一跳
+    ///
+    /// v0.104.6 D268：该节点**首次** EXEC 时实际收到的 input（诊断用）。
+    pub fn first_delivered_input_of(&self, n: &str) -> Option<&str> {
+        self.exec_inputs.get(n).map(|s| s.as_str())
+    }
+
     pub fn run(&mut self, interpreter: &mut dyn MirHost) -> Result<Value, String> {
         use std::collections::HashSet;
 
@@ -665,14 +684,10 @@ impl MirPregelEngine {
             }
 
             // ─ 2. EXEC ──────
-            // 记录激活节点的 snapshots
+            // v0.104.6 D268 第一层：不再预先记录 `versions_seen`。
+            // （修复前记在 EXEC 之前 + `or_insert` 当前版本 ⇒ 差集恒空 ⇒
+            //   首次激活的节点收到空字典 —— 唤醒它的消息送不到自己。）
             scheduled += to_execute.len();
-            for node_name in &to_execute {
-                let snapshot = self.versions_seen.entry(node_name.clone()).or_default();
-                for (channel, version) in &self.channel_versions {
-                    snapshot.entry(channel.clone()).or_insert(*version);
-                }
-            }
 
             // v0.57 bugfix: 下一跳必须从 active_nodes（含 @start）计算，
             // 而不只是从 to_execute。这样 @start -> a 这类入口边才能触发 agent 执行。
@@ -705,6 +720,24 @@ impl MirPregelEngine {
 
             // v0.75.57: EXEC 段提取至 execute_step（BSP 超步执行 + fault tolerance）
             let writes = self.execute_step(interpreter, &to_execute, &mut next_active)?;
+
+            // v0.104.6 D268 第一层：EXEC 跑完，此刻 `channel_versions` 仍是
+            // **本次执行看到的**版本 ⇒ 记下来就是「上一次执行时看到的版本」，
+            // 正是下一次 `build_node_input` 的差集基线。
+            // 必须在 execute_step **之后**、UPDATE/ADVANCE **之前** ——
+            // ADVANCE 会自增版本号，那时记就晚了。
+            //
+            // 修复前这里记在 EXEC **之前**且用 `or_insert` 灌当前版本，
+            // 于是差集判据 `version > seen_version` 恒为假：
+            // 对重复执行的节点恰好正确（缺陷隐身），
+            // 对**首次激活**（被 `Send` 唤醒）的节点 ⇒ 收到空字典，
+            // **唤醒它的那条消息永远送不到它自己**。
+            for node_name in &to_execute {
+                let snapshot = self.versions_seen.entry(node_name.clone()).or_default();
+                for (channel, version) in &self.channel_versions {
+                    snapshot.insert(channel.clone(), *version);
+                }
+            }
 
             // ─ 3. UPDATE ────
             for (_node, channel, value) in writes {
@@ -772,6 +805,7 @@ impl MirPregelEngine {
                     .or_default()
                     .push(send.input);
             }
+            self.node_inputs.clear();
             for (target, messages) in by_target {
                 // v0.75.4: 提前失败 — send 到未定义节点在消息分发点立即报错，
                 // 而非延迟到下一超步 EXEC 才崩溃（Giraph message-ACK 精神：
@@ -806,7 +840,9 @@ impl MirPregelEngine {
                 } else {
                     messages.last().cloned().unwrap_or(Value::Nil)
                 };
-                self.channels.insert("input".to_string(), final_value);
+                self.channels
+                    .insert("input".to_string(), final_value.clone());
+                self.node_inputs.insert(target.clone(), final_value);
                 *self
                     .channel_versions
                     .entry("input".to_string())
@@ -974,6 +1010,9 @@ impl MirPregelEngine {
 
                         let input_val = self.build_node_input(node_name);
                         let input_str = input_val.to_string();
+                        self.exec_inputs
+                            .entry(node_name.clone())
+                            .or_insert(input_str.clone());
                         let mut env = self.exec_env().clone();
                         // v0.73: define input on the private clone (agent only
                         // sees its own input; no cross-agent contamination).
@@ -1289,10 +1328,16 @@ impl MirPregelEngine {
         let mut map: std::collections::HashMap<String, Value> = std::collections::HashMap::new();
         for (channel, version) in &self.channel_versions {
             let seen_version = snapshot.and_then(|s| s.get(channel)).copied().unwrap_or(0);
-            if *version > seen_version
-                && let Some(v) = self.channels.get(channel)
-            {
-                map.insert(channel.clone(), v.clone());
+            if *version > seen_version {
+                if channel == "input"
+                    && let Some(v) = self.node_inputs.get(node_name)
+                {
+                    map.insert(channel.clone(), v.clone());
+                    continue;
+                }
+                if let Some(v) = self.channels.get(channel) {
+                    map.insert(channel.clone(), v.clone());
+                }
             }
         }
         crate::flow::value_to_json(&Value::Dict(map))

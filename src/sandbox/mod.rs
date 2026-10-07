@@ -151,7 +151,8 @@ impl SandboxPolicy {
     /// v0.104.6 D409：修「D335 修完后 `permissive()` 在 Windows 上仍只覆盖
     /// **当前盘**」。`fs_root = "/"` 会被 `canonicalize` 解析成 `\\?\D:\`，
     /// 于是「无限制」退化成「当前盘」，与本 doc 及 spec 17.1 双重矛盾。
-    /// 修法见 [`is_unrestricted`]：`/` 是**显式哨兵**，不参与根边界比较。
+    /// 修法：把 `/` 当成**显式哨兵**（`UNRESTRICTED_FS_ROOT`），在 `canonicalize`
+    /// 之前就判定「无限制」，不参与根边界比较。
     ///
     /// ⚠ 返回值说明：全仓**没有任何调用方**拿返回值去操作文件
     /// （`file.rs` 一律 `check_path(&path)?;` 后用原字符串），

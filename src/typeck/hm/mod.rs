@@ -1057,11 +1057,19 @@ impl HMInference {
             // 注册 app 名（运行时 h_app_def 会注册 Value::TeaApp，typeck 此前
             // 不注册 → `app Counter ... end` 后的 `Counter` 被判 Unbound
             // variable），并推断真实的 update/view 体。
+            // v0.104.6 D274：**`MacroDef` 已移出本组** —— 它此前与
+            // `TypeAlias`/`EnumDef`/`StructDef`/`Import` 并列返 `Nil`，
+            // 但那四者都是**纯类型声明**（无子表达式），而宏体是**活表达式**，
+            // 于是 `macro m() 1 + "str" end` 的类型错与未绑定变量**双双静默**
+            // （实测：宏体内 `1 + "str"` → `1.0str` exit 0；`nosuchvar` → exit 0）。
+            // 现路由到 `infer_macro_def`（转调 `infer_fn_def`）。
             WitnessKind::TypeAlias { .. }
             | WitnessKind::EnumDef { .. }
             | WitnessKind::StructDef { .. }
-            | WitnessKind::Import(_)
-            | WitnessKind::MacroDef { .. } => Ok((Type::Nil, crate::mir::effect::EffectRow::Empty)),
+            | WitnessKind::Import(_) => Ok((Type::Nil, crate::mir::effect::EffectRow::Empty)),
+            WitnessKind::MacroDef { name, params, body } => {
+                self.infer_macro_def(name, params, body.as_ref(), expr.span)
+            }
             // v0.103: TEA 独立 `update(params) ... end` 声明（spec §9.6）——
             // 注册 `update` 名到 env（运行时 h_update_def 注册同名
             // `Value::Dict`），并推断真实的体。此前它在上面那组「纯声明」里

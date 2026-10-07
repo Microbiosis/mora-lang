@@ -33,7 +33,28 @@ pub trait RelHost {
 pub struct Search {
     queue: VecDeque<(VecDeque<Goal>, Subst)>,
     next_var: u64,
+    /// v0.104.6 D397：已消耗的搜索步数（**跨多次 `next_solution` 累计**）。
+    ///
+    /// 必须是字段而非局部变量：`h_solve` 的循环反复调 `next_solution`，
+    /// 每次都从 0 数的话，左递归在**单次调用内**就会先撞上限，
+    /// 但一个「每次只跑几千步」的合法深搜索也会被误杀。
+    steps: u64,
+    /// 步数上界（燃料）。
+    max_steps: u64,
 }
+
+/// D397 默认燃料。取 **20 万**步。
+///
+/// 标定依据（真实 CLI 实测）：左递归 `rel loop2(x) loop2(x) end` 在
+/// 1 000 000 步下要 **8.7 秒**才报错 —— 每步不是纳秒级，因为 `Disj` 臂
+/// 会 `alt.extend(chain.iter().cloned())`，左递归分支把链越堆越长，
+/// 克隆成本随之上升。20 万步把「挂死」的最坏等待压到 **~1.7 秒**。
+///
+/// 而**合法**搜索的量级低得多：`tests/fixtures/e2e/rel_basic.mora`
+/// 那种传递闭包全解只有几十步，`interleave_fair_across_infinite_left_branch`
+/// 那种靠公平交错产解的也是几十步就够。故 20 万对正常程序是极大冗余。
+/// 需要更深时用 [`Search::with_max_steps`] 调大，传 `0` = 回到修前的无限语义。
+pub const DEFAULT_MAX_STEPS: u64 = 200_000;
 
 impl Search {
     /// 从初始目标与「下一个可用逻辑变量 id」构造搜索。
@@ -41,7 +62,23 @@ impl Search {
     pub fn new(goal: Goal, next_var: u64) -> Search {
         let mut queue = VecDeque::new();
         queue.push_back((VecDeque::from([goal]), Subst::new()));
-        Search { queue, next_var }
+        Search {
+            queue,
+            next_var,
+            steps: 0,
+            max_steps: DEFAULT_MAX_STEPS,
+        }
+    }
+
+    /// D397：自定义燃料上限（`0` = 不限，回到修前语义）。
+    pub fn with_max_steps(mut self, max_steps: u64) -> Search {
+        self.max_steps = max_steps;
+        self
+    }
+
+    /// 已消耗步数（诊断用）。
+    pub fn steps_used(&self) -> u64 {
+        self.steps
     }
 
     /// 引擎当前变量分配水位（诊断用）。
@@ -51,13 +88,25 @@ impl Search {
 
     /// 取下一个解；队列耗尽返回 `None`。
     ///
-    /// ⚠ **无步数上界**（Prolog 终止性模型，见 `rel/mod.rs` 的模块说明）：
-    /// 左递归规则（`rel loop2(x) loop2(x) end`）会让队列永不排空，
-    /// 本调用**永不返回**。`solve N` 的 `limit` 只在**两次解之间**检查
-    /// （`h_solve` 的循环），因此**挡不住这种情况** ——
-    /// 详见 D397 的 CHANGELOG 条目（属产品策略决定，**本轮不擅改**）。
+    /// ⚠ v0.104.6 D397：**已有步数上界**。此前本调用在左递归规则
+    /// （`rel loop2(x) loop2(x) end`）下**永不返回**，因为队列永不排空；
+    /// `solve N` 的 `limit` 只在两次解之间检查，挡不住这种情况。
+    /// 现在累计步数超过 `max_steps` 即**明确报错**（而不是挂死）——
+    /// 代价是「终止由作者负责」这条既有语义对**无解可产**的规则不再成立：
+    /// 超长但**合法**的搜索只要在预算内跑完就不受影响。
     pub fn next_solution(&mut self, host: &mut dyn RelHost) -> Result<Option<Subst>, String> {
         while let Some((mut chain, s)) = self.queue.pop_front() {
+            self.steps += 1;
+            if self.max_steps > 0 && self.steps > self.max_steps {
+                return Err(format!(
+                    "rel::search: exceeded max_steps = {} without producing a solution \
+                     (fuel exhausted at step {}).\n\
+                     This usually means a left-recursive rule such as \
+                     `rel loop2(x) loop2(x) end` can never derive a solution. \
+                     Raise the budget if the search is legitimately deep.",
+                    self.max_steps, self.steps
+                ));
+            }
             let Some(goal) = chain.pop_front() else {
                 return Ok(Some(s)); // 链耗尽 = 一个解
             };

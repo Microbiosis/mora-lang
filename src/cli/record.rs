@@ -403,9 +403,20 @@ pub fn run_record_export(name: &str, format: &str, output: Option<&str>) {
         }
     };
     warn_skipped(&rec);
+    // D380：此前 `_ => ExportFormat::Jsonl`，于是 `--format BOGUS` 与「没写
+    // --format」**完全不可区分** —— 用户点名要了一种格式，拿到另一种，
+    // 而退出码是 0。这是本缺陷的第 5 种形态：flag 名对了、值错了。
     let fmt = match format {
         "md" | "markdown" => record::ExportFormat::Markdown,
-        _ => record::ExportFormat::Jsonl,
+        "jsonl" => record::ExportFormat::Jsonl,
+        other => {
+            eprintln!(
+                "record export: 未知导出格式 `{other}`。\n\
+                 本命令接受的格式：jsonl / md（markdown 亦可）\n\
+                 （此前未知格式会被静默回落到 JSONL。）"
+            );
+            process::exit(1);
+        }
     };
     let content = record::export_recording(rec.events(), &fmt, name);
     match output {

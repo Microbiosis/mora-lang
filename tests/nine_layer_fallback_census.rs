@@ -70,15 +70,22 @@ const CENSUS: &[(&str, &str, bool)] = &[
     // ── 声明形态 ──
     //
     // v0.104.6 D315：`msg`/`struct`/`enum` **重新**改为 `false`（D315 差分
-    // 对齐后实测通过）。`model` 仍为 `true`。
+    // 对齐后实测通过）。
+    //
+    // v0.104.6 **D412**：`model` 与 `tea_standalone` 也**改为 `false`** ——
+    // 真因不是 D95 记档的「5 个分支不补 `Const(dst, Nil)`」，而是
+    // `model` 字段默认值在**入口**就被丢弃
+    // （`let (dreg, _dw) = self.emit_expr_w()?;` 把 `_dw` 扔了
+    // ⇒ `WitnessKind::ModelDef` 没有 `defaults`）。
+    // 补上后两者实测均通过差分。
     //
     // 行为验证：`msg` / `struct` / `enum` 各 2–3 种形状 × 3 个优化档位 =
     // **30 组合**，强制走管线 vs 回落 `emit.rs` 输出**逐行相同**。
-    // 8 条翻转条目**全部同向**（回落 → 通过），无一条反向退化。
+    // D412 的 2 条翻转**同向**（回落 → 通过），无一条反向退化。
     (
         "model",
         "model Counter\n  count: number = 0\nend\nprint(1)\n",
-        true,
+        false,
     ),
     (
         "msg",
@@ -90,7 +97,7 @@ const CENSUS: &[(&str, &str, bool)] = &[
     (
         "tea_standalone",
         "model C\n  count: number = 0\nend\nmsg M\n  Inc\nend\nupdate(msg, model)\n  model\nend\nprint(1)\n",
-        true,
+        false,
     ),
     // ── D57 声称已修且在**嵌套位置**确实通过的那一类 ──
     // ⚠ `eval` 的回落是**上下文相关**的：D94 实测 `eval(1 + 1)` 裸顶层
@@ -212,16 +219,22 @@ fn d92b_census_covers_both_outcomes() {
     // v0.104.6 D276 曾把这两个阈值下调（差分对齐后回落项由 14 降到 6），
     // **已随 D276 的撤销一并回滚** —— 回落项回到 14。
     // v0.104.6 D315：D314 修好 9 层 rel 路径的 `n_regs` 破损后重新对齐，
-    // 回落项由 14 降到 **6**（翻转 8 条，见 `CENSUS` 注释），通过项相应
-    // 由 19 升到 27。阈值按实测下调。
-    assert!(
-        falls.len() >= 6,
-        "回落项只有 {} 条，覆盖面在缩小（当前 {falls:?}）",
-        falls.len()
+    // 回落项由 14 降到 **6**（翻转 8 条，见 `CENSUS` 注释）。
+    // v0.104.6 **D412**：`model` / `tea_standalone` 也走上管线 ⇒
+    // 回落项 **6 → 4**，通过项 **28 → 30**。
+    //
+    // ⚠ 这里用**精确值**而非区间：本表是**静态 34 条**（上面已断言长度），
+    // 条数完全确定，不存在扫描器静默失效的风险（D407 的教训不适用于此）。
+    assert_eq!(
+        falls.len(),
+        4,
+        "回落项应恰好 4 条（worker / transaction / perform_bare / eval_bare）。\
+         当前 {falls:?} —— 若有增减，请同步更新本断言、`FALLBACK_REASONS` 表 \
+         与 CHANGELOG 的回落清单。"
     );
-    assert!(
-        passes.len() >= 27,
-        "通过项只有 {} 条，对照组不足（当前 {passes:?}）",
-        passes.len()
+    assert_eq!(
+        passes.len(),
+        30,
+        "通过项应恰好 30 条（34 − 4）。当前 {passes:?}"
     );
 }

@@ -919,16 +919,50 @@ impl HMInference {
             WitnessKind::Orchestrate {
                 input_var,
                 result_var,
-                ..
+                kind,
             } => {
                 // v0.75.34: orchestrate 在语义上声明 input_var / result_var
                 //（`orchestrate ... input -> result`）— 登记为 Any 类型，
                 // 避免后续引用 result 报 UnboundVariable。此前返回 Nil 但
                 // 不登记变量，pregel/sequential 路径经 CLI 都会撞此缺口
                 //（测试走 run_mir 绕过 typeck 未暴露）。
-                self.env.add(input_var.clone(), Type::Unknown);
-                self.env.add(result_var.clone(), Type::Unknown);
-                Ok((Type::Nil, crate::mir::effect::EffectRow::Empty))
+                // ⚠ `input` 的类型载体必须是 **TypeVar**，不能是 `Type::Unknown` ——
+                //   而这不是「unify 的疏漏」，是 **v0.75.92 的既定 fail-fast 契约**
+                //   （`unify.rs`：「Unknown fail-fast — 与任何类型合一都失败……
+                //   fail-fast 语义**迫使调用方用 TypeVar 推断路径产出精确类型**」）。
+                //
+                //   ⚠ 两层对 `Unknown` 的策略**故意相反**：
+                //   | 层 | 对 `Unknown` |
+                //   |---|---|
+                //   | `compatible_with()`（v0.84） | ✅ 当 top type，一律放行 |
+                //   | `unify()`（v0.75.92） | ❌ **一律失败** |
+                //
+                //   所以「compatible 过了」不代表「能 solve」。用 Unknown 的实测
+                //   后果（合法惯用写法被**拒绝执行**）：
+                //   `agent a => input + "x"` → expected String, got TypeVar，exit 2。
+                //
+                //   优先用**外层实际绑定类型**（`let input = "S"` ⇒ String），
+                //   保留精度；取不到（未绑定 / 本身就是 Unknown）才回落 fresh TypeVar ——
+                //   后者正是 unify 那条注释**点名要求的**做法。
+                let bound_input_ty = self.env.get(input_var).cloned();
+                let input_reg_ty = match bound_input_ty.clone() {
+                    Some(t) if !matches!(t, Type::Unknown) => t,
+                    _ => self.fresh_type_var(),
+                };
+                let result_tv = self.fresh_type_var();
+                self.env.add(input_var.clone(), input_reg_ty);
+                self.env.add(result_var.clone(), result_tv);
+
+                // v0.104.6 D414：**下降进 kind**，推断 agent 体。
+                //
+                // 修前此处直接 `return Nil` ⇒ orchestrate 内部的
+                // 未绑定变量 / 类型不匹配**全部零诊断**（D272 缺陷②）。
+                // 而运行期 agent 体拿的是 `env.clone()`（**外层变量全部可见**）
+                // 再加无条件注入的 `input` ⇒ 这里用同样的作用域建模。
+                let saved_env = self.env.clone();
+                let row = self.infer_orchestrate_kind(kind, bound_input_ty)?;
+                self.env = saved_env;
+                Ok((Type::Nil, row))
             }
             // v0.104: `for x in xs … end` 的真实推断 —— 之前是 v0.55 的桩
             // `Ok((Type::Nil, Empty))`，**完全不推断 iterable 与 body**，
@@ -1120,7 +1154,7 @@ impl HMInference {
                 Ok((body_ty, merged))
             }
             // v0.83: TEA definitions — 注册 Type 到 env（typeck 路径可查）
-            WitnessKind::ModelDef { name, fields } => {
+            WitnessKind::ModelDef { name, fields, .. } => {
                 use crate::typeck::Type;
                 let ty = Type::TeaModel {
                     name: name.clone(),
@@ -1213,6 +1247,95 @@ impl HMInference {
                 b
             }
         }
+    }
+
+    /// v0.104.6 D414：推断 orchestrate 内部的 agent / edge / prompt。
+    ///
+    /// 修前 `WitnessKind::Orchestrate` 直接 `return Nil`，整棵子树零诊断
+    /// （D272 缺陷②）。这里按**运行期真实作用域**逐个下降：
+    /// agent 体拿的是 `env.clone()`（**外层变量全部可见**），
+    /// 再加无条件注入的 `input`（`pregel/mod.rs` 的
+    /// `env.define("input", …)`）与 D413 加的**形参**。
+    ///
+    /// ⚠ **`combiner_body` 是 `MirFunction`（已降级的指令）不是 witness**，
+    ///    本方法**无法**推断它 —— 与其余部分一样，那部分仍零诊断。
+    ///
+    /// ⚠ `pregel` 运行期还会注入 `input_<channel>` 逐 channel 变量
+    ///    （`inject_channel_inputs`）。**typeck 不知道这些名字**，
+    ///    agent 体内若引用它们会误报未绑定。本轮先不预注册，
+    ///    由门禁实测决定要不要加。
+    fn infer_orchestrate_kind(
+        &mut self,
+        kind: &crate::mir::witness::WitnessOrchestrateKind,
+        bound_input_ty: Option<Type>,
+    ) -> Result<crate::mir::effect::EffectRow, Vec<TypeError>> {
+        use crate::mir::effect::EffectRow;
+        use crate::mir::witness::WitnessOrchestrateKind;
+
+        let mut row = EffectRow::Empty;
+
+        // ── ① agent 体：按运行期作用域单独推断 ──
+        // 运行期每个 agent 拿 `env.clone()`（外层变量全可见）+ 无条件注入的
+        // `input`；`input` 对**整棵 kind** 都成立，故先注入一次。
+        let agents: &[crate::mir::witness::WitnessAgentDef] = match kind {
+            WitnessOrchestrateKind::Sequential { agents }
+            | WitnessOrchestrateKind::Loop { agents, .. }
+            | WitnessOrchestrateKind::Graph { agents, .. }
+            | WitnessOrchestrateKind::Pregel { agents, .. } => agents.as_slice(),
+            _ => &[],
+        };
+        // ⚠ **`input` 的类型载体必须是能被 solver 绑定的 TypeVar，
+        //   不能是 `Type::Unknown`**。
+        //
+        //   `compatible_with()` 对 Unknown/Any/TypeVar 一律放行，
+        //   但 **solver 的 `unify()` 没有这层放行** ⇒ 用 Unknown 的实测后果
+        //   （合法惯用写法被拒绝执行，`mora run` 也一样）：
+        //   `agent a => input + "x"` → expected String, got TypeVar('\0')，exit 2。
+        //
+        //   优先用**外层实际绑定类型**（`let input = "S"` ⇒ String），
+        //   保留精度；取不到（未绑定 / 本身就是 Unknown）才回落 fresh TypeVar。
+        let input_ty = match bound_input_ty {
+            Some(t) if !matches!(t, Type::Unknown) => t,
+            _ => self.fresh_type_var(),
+        };
+        self.env.add("input".to_string(), input_ty.clone());
+        for a in agents {
+            let saved = self.env.clone();
+            if let Some(p) = a.params.first() {
+                // D413：形参与 `input` 同值（运行期同一来源）⇒ 同一类型
+                self.env.add(p.clone(), input_ty.clone());
+            }
+            // ⚠ 必须用 `?` **传播**，不能 `if let Ok(..)` 吞掉 ——
+            //   `infer_expr` 的 `Err(Vec<TypeError>)` **就是**要上报的诊断。
+            //   第一版写成 `if let Ok(..)`，结果整棵子树的错误被丢弃
+            //   ⇒ 「下降推断」白做了（agent 体仍零诊断）。
+            let (_, r) = self.infer_expr(&a.task_expr)?;
+            row = self.merge_rows(row, r);
+            if let Some(v) = &a.verify_expr {
+                let (_, r) = self.infer_expr(v)?;
+                row = self.merge_rows(row, r);
+            }
+            self.env = saved;
+        }
+
+        // ── ② 其余子 witness（边条件 / exit_when / with_config /
+        //      MoA·MoE 的 prompt·router·专家定义）──
+        // 用现成的 `child_witnesses()`，不手写 match（漏项风险高）。
+        for w in kind.child_witnesses() {
+            // 跳过 ① 已按正确作用域推断过的 agent 体（裸指针比较：
+            // `child_witnesses()` 返回的是**引用**，没有 PartialEq 可用）
+            let wp = w as *const _;
+            if agents
+                .iter()
+                .any(|a| std::ptr::eq(&a.task_expr as *const _, wp))
+            {
+                continue;
+            }
+            let (_, r) = self.infer_expr(w)?;
+            row = self.merge_rows(row, r);
+        }
+
+        Ok(row)
     }
 
     /// v0.80: Perform 推断 — 产生 effect，返回 fresh type var。

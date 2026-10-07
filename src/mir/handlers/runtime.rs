@@ -499,6 +499,16 @@ pub fn h_orchestrate(
                 // 避免跨 agent 污染；副作用写回见下方合并。
                 let mut agent_env = env.clone();
                 agent_env.define("input".to_string(), input_val.clone(), false);
+                // v0.104.6 D413：形参（**至多 1 个**，多参由 parser 拒绝）
+                // 绑成 `input` 的别名。此前 `parse_agent_def` 把形参丢弃，
+                // 体内引用恒得 `nil` 且 exit 0 零诊断。
+                //
+                // ⚠ Sequential 在**这里**执行，不经 pregel 引擎 ——
+                //   所以 pregel/mod.rs 的两处注入是 Graph/Pregel 分支，
+                //   本处是第三条路径，三处都要有。
+                if let Some(p) = agent.params.first() {
+                    agent_env.define(p.clone(), input_val.clone(), false);
+                }
                 agent_env.clock.tick(&agent.name);
                 result = crate::mir::vm::run_mir(
                     &std::sync::Arc::new(agent.task_body.clone()),
@@ -896,6 +906,8 @@ fn build_moa_config(
             let body = build_proposer_body(l, i, model, prompt_fn, input_var);
             agents.push(crate::mir::orchestrate::MirAgentDef {
                 name: pname.clone(),
+                // v0.104.6 D413：合成 agent 无形参（沿用 \input\）。
+                params: Vec::new(),
                 task_expr: placeholder_expr.clone(),
                 verify_expr: None,
                 with_config: None,
@@ -927,6 +939,8 @@ fn build_moa_config(
         let body = build_aggregator_body(l, aggregator, proposers.len());
         agents.push(crate::mir::orchestrate::MirAgentDef {
             name: aname.clone(),
+            // v0.104.6 D413：合成 agent 无形参（沿用 \input\）。
+            params: Vec::new(),
             task_expr: placeholder_expr.clone(),
             verify_expr: None,
             with_config: None,

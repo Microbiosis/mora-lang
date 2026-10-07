@@ -703,11 +703,26 @@ fn build_node(b: &mut FcfgBuilder, w: &MirWitness) -> Node<()> {
                 meta: (),
             }
         }
-        WitnessKind::ModelDef { name, fields } => Node::ModelDef {
+        WitnessKind::ModelDef {
+            name,
+            fields,
+            defaults,
+        } => Node::ModelDef {
             name: name.clone(),
             fields: fields
                 .iter()
                 .map(|(n, t)| (n.clone(), hint_to_annotation(t)))
+                .collect(),
+            // v0.104.6 D412：把默认值表达式一并带进 Node，
+            // 否则 fcfg_lower 无从发射 `Name.defaults` 派生键。
+            // 寄存器在这里一次算好（`node_result_reg`），下游直接取用。
+            defaults: defaults
+                .iter()
+                .map(|(n, w)| {
+                    let nd = build_node(b, w);
+                    let r = node_result_reg(&nd);
+                    (n.clone(), r, nd)
+                })
                 .collect(),
             span,
             meta: (),

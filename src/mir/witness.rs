@@ -147,9 +147,18 @@ pub enum WitnessKind {
     Sequence(Vec<MirWitness>),
     // v0.83: TEA (The Elm Architecture) 语法糖 witness
     /// Model 定义 — 状态结构（类似 StructDef，但语义是 Model 容器）
+    ///
+    /// v0.104.6 D412：增 `defaults` —— 字段默认值（`name: T = expr`）的**表达式**。
+    ///
+    /// 此前它只在 `emit_definitions.rs` 里被发射进 emit 流（并登记为派生键
+    /// `Name.defaults`），而产出它的 witness **被 `_dw` 直接丢弃**
+    /// ⇒ 9 层管线（witness → Node → fcfg_lower）**结构上拿不到默认值**，
+    /// TEA 程序因此永远触发差分失败回落。
     ModelDef {
         name: String,
         fields: Vec<(String, crate::mir::hint::TypeHint)>,
+        /// `(字段名, 默认值表达式)`，无默认值的字段不出现在此。
+        defaults: Vec<(String, MirWitness)>,
     },
     /// Msg 定义 — tagged union（每个变体可携带 payload 类型）
     MsgDef {
@@ -640,6 +649,15 @@ impl WitnessOrchestrateKind {
 #[derive(Debug, Clone, PartialEq)]
 pub struct WitnessAgentDef {
     pub name: String,
+    /// v0.104.6 D413：形参名（`agent a(x) => …` 的 `x`）。
+    ///
+    /// 此前 `parse_agent_def` 把解析出的形参绑到 `_params` **整个丢弃**，
+    /// 三个类型都没有这个字段 ⇒ 体内引用 `x` 恒得 `nil`，且 **exit 0 零诊断**。
+    ///
+    /// 语义（**单参**才允许，见 `parse_agent_def` 的多参拒绝）：
+    /// 运行期把 `input` 的值绑给 `params[0]`，即 `agent a(x)` 的 `x` **等价于**
+    /// `input`。
+    pub params: Vec<String>,
     pub task_expr: MirWitness,
     pub verify_expr: Option<MirWitness>,
     pub with_config: Option<std::collections::HashMap<String, MirWitness>>,
@@ -651,6 +669,7 @@ impl WitnessAgentDef {
     fn from_agent(agent: &MirAgentDef) -> WitnessAgentDef {
         WitnessAgentDef {
             name: agent.name.clone(),
+            params: agent.params.clone(),
             task_expr: agent.task_expr.clone(),
             verify_expr: agent.verify_expr.clone(),
             with_config: agent.with_config.clone(),

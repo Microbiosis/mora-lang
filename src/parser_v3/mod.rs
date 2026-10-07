@@ -159,6 +159,15 @@ pub struct ParserV3 {
     witnesses: Vec<MirWitness>,
     /// v0.86: 原始源码文本（`quote(expr)` 源码提取用）。
     source: String,
+    /// v0.104.6 D413：解析期**语义**诊断槽。
+    ///
+    /// 解析器主体是 `Option` 驱动的（`None` = 「这条不是 X / 解析失败」），
+    /// 拿不到错误**原因**。对于「语法合法但语义被拒」的情形
+    /// （目前只有 `agent a(x, y)` 多参），把原因记在这里，
+    /// 由 [`ParserV3::compile`] 在 `emit_program()` 之后优先取出。
+    ///
+    /// ⇒ 否则用户只会看到泛化的 `Failed to parse at line N`。
+    diag: Option<String>,
 }
 
 impl ParserV3 {
@@ -166,6 +175,7 @@ impl ParserV3 {
         Self {
             tokens,
             current: 0,
+            diag: None,
             emit: {
                 let mut ec = crate::mir::lower::EmitContext::new();
                 // v0.104.6 D42：程序顶层是**唯一**不属于任何函数体的寄存器
@@ -226,7 +236,15 @@ impl ParserV3 {
             ));
         }
         let mut parser = ParserV3::new(tokens, source);
-        parser.emit_program()?;
+        let emitted = parser.emit_program();
+        // v0.104.6 D413：语义诊断**优先于**泛化的解析失败。
+        // ⚠ 必须先捕获 `emit_program()` 的结果再查 `diag` ——
+        //   直接写 `parser.emit_program()?` 会在 `?` 处提前返回，
+        //   下面的诊断检查**永远执行不到**（第一版就是这么写错的）。
+        if let Some(d) = parser.diag.clone() {
+            return Err(d);
+        }
+        emitted?;
         let func = parser.emit.finish();
         let witnesses = parser.witnesses;
         if func.body.is_empty() {

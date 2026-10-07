@@ -302,6 +302,14 @@ pub enum Node<M> {
     ModelDef {
         name: String,
         fields: Vec<(String, TypeAnnotation)>,
+        /// v0.104.6 D412：字段默认值的**表达式节点**，供 `fcfg_lower` 发射
+        /// `DictLit` + `Define("Name.defaults")` —— 与 `emit_definitions.rs`
+        /// 的 emit 流逐条对齐。没有它，9 层管线会漏掉默认值导致差分失败回落。
+        ///
+        /// 元组是 `(字段名, 结果寄存器, 表达式节点)` —— 寄存器在
+        /// `witness_to_fcfg` 里由 `node_result_reg` **一次算好**带进来，
+        /// 这样 `fcfg_lower` 与 `max_reg_in_node` 都不必重复那个 match。
+        defaults: Vec<(String, Reg, Node<M>)>,
         span: Span,
         meta: M,
     },

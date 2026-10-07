@@ -89,6 +89,8 @@ fn nil_witness() -> MirWitness {
 fn agent(name: &str, body: MirFunction) -> MirAgentDef {
     MirAgentDef {
         name: name.to_string(),
+        // v0.104.6 D413：测试构造的 agent 无形参。
+        params: Vec::new(),
         task_expr: nil_witness(),
         verify_expr: None,
         with_config: None,

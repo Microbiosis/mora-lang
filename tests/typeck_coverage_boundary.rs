@@ -83,7 +83,7 @@ fn typeck_error_count(src: &str) -> usize {
 /// `expect_checked = true` ⇒ 该上下文**必须**报出 `1 + "str"` 的类型错误。
 /// 修好 typeck 之后，只把 `false` 翻成 `true` 即可。
 #[test]
-fn d273_typeck_coverage_boundary_is_exactly_orchestrate() {
+fn d414_typeck_covers_orchestrate_too() {
     struct Case {
         label: &'static str,
         src: &'static str,
@@ -115,32 +115,32 @@ fn d273_typeck_coverage_boundary_is_exactly_orchestrate() {
         Case {
             label: "orchestrate agent task_body",
             src: "orchestrate sequential input -> result\n  agent a => 1 + \"str\"\nend\nresult\n",
-            expect_checked: false,
+            expect_checked: true,
         },
         Case {
             label: "orchestrate 边 on: 条件体",
             src: "orchestrate graph input -> result\n  agent a => \"A\"\n  agent b => \"B\"\n  @start -> a\n  a -> b on: 1 + \"str\"\nend\nresult\n",
-            expect_checked: false,
+            expect_checked: true,
         },
         Case {
             label: "orchestrate loop on: 条件体",
             src: "let acc = \"\"\norchestrate loop acc -> result\n  agent a => input + \"x\"\n  on: 1 + \"str\"\nend\nresult\n",
-            expect_checked: false,
+            expect_checked: true,
         },
         Case {
             label: "moe expert def 体",
             src: "let input = 1\norchestrate moe input -> result\n  experts: { \"e1\": fn (x) { 1 + \"str\" } }\n  top_k: 1\n  router: fn (x) { { \"e1\": 1.0 } }\nend\nresult\n",
-            expect_checked: false,
+            expect_checked: true,
         },
         Case {
             label: "moe router 体",
             src: "let input = 1\norchestrate moe input -> result\n  experts: { \"e1\": fn (x) { x } }\n  top_k: 1\n  router: fn (x) { 1 + \"str\" }\nend\nresult\n",
-            expect_checked: false,
+            expect_checked: true,
         },
         Case {
             label: "moa prompt 体",
             src: "orchestrate moa input -> result\n  layers: 1\n  proposers: [\"p\"]\n  aggregator: \"agg\"\n  prompt: 1 + \"str\"\nend\nresult\n",
-            expect_checked: false,
+            expect_checked: true,
         },
     ];
 

@@ -428,6 +428,8 @@ impl ParserV3 {
                 if agents.is_empty() {
                     agents.push(MirOrchestrateAgent {
                         name: "default".to_string(),
+                        // v0.104.6 D413：占位 agent 无形参。
+                        params: Vec::new(),
                         with_config: None,
                         // v0.92: task_expr 现为 MirWitness。
                         task_expr: crate::mir::witness::MirWitness {
@@ -539,7 +541,7 @@ impl ParserV3 {
             }
         };
 
-        let _params = if self.match_token_exact(TokenType::LParen) {
+        let params = if self.match_token_exact(TokenType::LParen) {
             let mut params = Vec::new();
             while !self.check(&TokenType::RParen) && !self.is_at_end() {
                 if let Some(p) = self.consume_identifier("Expected parameter name") {
@@ -560,6 +562,29 @@ impl ParserV3 {
         } else {
             None
         };
+
+        // v0.104.6 D413：形参真正被绑上（此前绑到 `_params` **整个丢弃**
+        // ⇒ 体内引用恒为 `nil` 且 **exit 0 零诊断**）。
+        //
+        // **多参在解析期拒绝**：agent 只有一个输入值（`input`，见
+        // `pregel/mod.rs` 的 `env.define("input", …)`），没有第二个值可绑；
+        // 形参语法在 `docs/mora-spec.md` 里**零出现**、仓内**全 usages 都是单参**
+        // ⇒ 拒绝的破坏面为零，且优于「让多参也静默给 nil」。
+        if let Some(ps) = &params
+            && ps.len() > 1
+        {
+            self.diag = Some(format!(
+                "agent '{name}' declares {} parameters ({}), but an agent receives a \
+                 single `input` value — at most 1 parameter is supported. \
+                 Write `agent {name} => …` and read `input`, or keep 1 parameter \
+                 and treat it as an alias of `input`.",
+                ps.len(),
+                ps.join(", ")
+            ));
+            self.current = saved;
+            return None;
+        }
+        let params = params.unwrap_or_default();
 
         if !self.match_token_exact(TokenType::FatArrow) {
             self.current = saved;
@@ -582,6 +607,7 @@ impl ParserV3 {
             };
         Some(MirOrchestrateAgent {
             name,
+            params,
             with_config: None,
             // v0.92: task_expr 现为 MirWitness。
             task_expr: body_witness,

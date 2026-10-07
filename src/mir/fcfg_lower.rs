@@ -22,8 +22,19 @@ use crate::value::Value;
 ///（__let_result dst、MatchExpr dst、for-loop 索引等）会覆盖
 /// 预分配寄存器中的值。
 pub fn lower_fcfg(nodes: &[Fcfg]) -> (Vec<MirInst>, usize) {
+    // v0.104.6 D412：**结构分析只算一次**。
+    //
+    // 修前 `max_reg_in_nodes(nodes)` 在本函数里被调了**两遍**（原第 26 行与
+    // 第 37 行）—— 入参相同、其间 `nodes: &[Fcfg]` 不可变 ⇒ 纯冗余的全树遍历。
+    //
+    // 修法：提到循环之前算一次，下游只读结果。
+    // 参照 Zig 0.17 的 configurer/maker 纪律（`zig build -h` 150ms → 14ms 的
+    // 关键不是微优化，而是**把可缓存的「配置」从重复计算里切出来**）：
+    // 这里同理 —— 分析结果不变，少遍历一遍。
+    let max_pre_alloc = max_reg_in_nodes(nodes);
+
     let mut ctx = EmitContext::new();
-    ctx.next_reg = max_reg_in_nodes(nodes) + 1; // 避开预分配寄存器
+    ctx.next_reg = max_pre_alloc + 1; // 避开预分配寄存器
     for node in nodes {
         lower_node(&mut ctx, node);
     }
@@ -34,7 +45,6 @@ pub fn lower_fcfg(nodes: &[Fcfg]) -> (Vec<MirInst>, usize) {
     // 判定是**人工的** —— 判错一个就是运行期越界。这里直接从已发射的
     // `MirInst` 反推一个下界：只会让 `n_regs` 变大（多几个 `Value` 槽，
     // 无害），不可能变小。
-    let max_pre_alloc = max_reg_in_nodes(nodes);
     let max_emitted = ctx
         .insts
         .iter()
@@ -181,13 +191,20 @@ fn max_reg_in_node(node: &Fcfg) -> usize {
         | Node::Observe { body, .. }
         | Node::Span { body, .. }
         | Node::Parallel { body, .. } => max_reg_in_nodes(&body.nodes),
+        // v0.104.6 D412：`ModelDef` 的默认值表达式**会占用寄存器**，
+        // 必须计入 —— 否则 `n_regs` 偏小，消费者按默认值寄存器取值就越界。
+        // 与 D35（`Handle` 的 `dst` 不计入导致越界）同款。
+        Node::ModelDef { defaults, .. } => defaults
+            .iter()
+            .map(|(_, r, n)| (*r).max(max_reg_in_node(n)))
+            .max()
+            .unwrap_or(0),
         Node::TypeAlias { .. }
         | Node::EnumDef { .. }
         | Node::StructDef { .. }
         | Node::TraitDef { .. }
         | Node::ImplDef { .. }
         | Node::Import { .. }
-        | Node::ModelDef { .. }
         | Node::MsgDef { .. }
         | Node::AppDef { .. }
         | Node::RelDef { .. }
@@ -672,7 +689,12 @@ fn lower_node(ctx: &mut EmitContext, node: &Fcfg) {
         }
 
         // ── TEA 定义 ──
-        Node::ModelDef { name, fields, .. } => {
+        Node::ModelDef {
+            name,
+            fields,
+            defaults,
+            ..
+        } => {
             let flds: Vec<crate::common::StructField> = fields
                 .iter()
                 .map(|(n, t)| crate::common::StructField {
@@ -680,10 +702,30 @@ fn lower_node(ctx: &mut EmitContext, node: &Fcfg) {
                     type_hint: t.0.clone(),
                 })
                 .collect();
+            // ⚠ 顺序必须与 `emit_definitions.rs::emit_model_def_w` **逐条对齐**：
+            //   ① 先降级每个默认值表达式（emit.rs 侧由 `emit_expr_w` 在解析字段时就发了）
+            //   ② `ModelDef`
+            //   ③ `DictLit` + `Define("Name.defaults")`（无默认值时跳过）
+            //   ④ 尾部 `Const(Nil)`（emit.rs **无条件**发）
+            // 少一条 / 多一条 / 顺序错 ⇒ 类别差分失败 ⇒ 管线对该程序永久回落 emit.rs。
+            // （与本文件 `emit_loop_result` 的注释同款：少发一条 Const 的历史教训。）
+            for (_, _, dnode) in defaults {
+                lower_node(ctx, dnode);
+            }
             ctx.emit(MirInst::ModelDef {
                 name: name.clone(),
                 fields: flds,
             });
+            if !defaults.is_empty() {
+                let dst = ctx.alloc_reg();
+                ctx.emit(MirInst::DictLit(
+                    dst,
+                    defaults.iter().map(|(n, r, _)| (n.clone(), *r)).collect(),
+                ));
+                ctx.emit(MirInst::Define(format!("{}.defaults", name), dst));
+            }
+            let dst = ctx.alloc_reg();
+            ctx.emit(MirInst::Const(dst, Value::Nil));
         }
         Node::MsgDef { name, variants, .. } => {
             let vars: Vec<crate::common::MsgVariant> = variants

@@ -412,10 +412,20 @@ fn annotate_node(node: &Fcfg, table: &TypeTable) -> Node<TypeInfo> {
 
         // ── TEA ──
         Node::ModelDef {
-            name, fields, span, ..
+            name,
+            fields,
+            defaults,
+            span,
+            ..
         } => Node::ModelDef {
             name: name.clone(),
             fields: fields.clone(),
+            // v0.104.6 D412：默认值表达式也要过一遍 annotate，
+            // 否则它会带着 `Node<()>` 的 meta 进入 lowering（类型不匹配）。
+            defaults: defaults
+                .iter()
+                .map(|(n, r, d)| (n.clone(), *r, annotate_node(d, table)))
+                .collect(),
             span: *span,
             meta: info,
         },

@@ -176,6 +176,7 @@ fn mir_agent_from_witness(a: &crate::mir::witness::WitnessAgentDef) -> MirAgentD
         .unwrap_or_default();
     MirAgentDef {
         name: a.name.clone(),
+        params: a.params.clone(),
         task_expr: a.task_expr.clone(),
         verify_expr: None,
         with_config: None,
@@ -237,6 +238,12 @@ pub struct MirMoeExpert {
 #[derive(Debug, Clone, PartialEq)]
 pub struct MirAgentDef {
     pub name: String,
+    /// v0.104.6 D413：形参名（`agent a(x) => …` 的 `x`）。
+    ///
+    /// 语义：**最多 1 个**（多参由 parser 拒绝）。运行期把 `input` 的值
+    /// 绑给 `params[0]`，即 `x` **等价于** `input`。
+    /// 空（`agent a => …`）= 沿用既有的 `input` 契约，行为不变。
+    pub params: Vec<String>,
     pub task_expr: crate::mir::witness::MirWitness,
     pub verify_expr: Option<crate::mir::witness::MirWitness>,
     pub with_config: Option<HashMap<String, crate::mir::witness::MirWitness>>,

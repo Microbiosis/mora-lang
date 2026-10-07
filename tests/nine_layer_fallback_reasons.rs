@@ -58,19 +58,14 @@ const FALLBACK_REASONS: &[(&str, &str, &str)] = &[
         "let g = \"i\"\ng = perform Ai(\"x\")\nprint(g)\n",
         "pipeline=\"Perform\" original=\"Assign\"",
     ),
-    // TEA ModelDef：管线缺前置的预分配 Const。
-    (
-        "model",
-        "model Counter\n  count: number = 0\nend\nprint(1)\n",
-        "pipeline=\"ModelDef\" original=\"Const\"",
-    ),
-    // TEA 三件套一起错位（多出 MsgDef 的判别标记，可与 `model` 区分）。
-    (
-        "tea_standalone",
-        "model C\n  count: number = 0\nend\nmsg M\n  Inc\nend\n\
-         update(msg, model)\n  model\nend\nprint(1)\n",
-        "pipeline=\"MsgDef\" original=\"ModelDef\"",
-    ),
+    // v0.104.6 **D412**：`model` 与 `tea_standalone` 两条已从本表**移除** ——
+    // 它们不再回落（字段默认值已在入口接进 witness，见 CHANGELOG D412）。
+    //
+    // ⚠ 这两条的判别标记恰好**独立印证了 D412 的根因诊断**：
+    //   `model` 的标记是 `pipeline="ModelDef" original="Const"` ——
+    //   即管线的 `ModelDef` 撞上了 emit.rs 侧那条**默认值 Const**，
+    //   而不是因为「5 个分支缺 Const(dst, Nil)」（那是 D95 的错误归因）。
+    //
     // eval 被整条丢弃：管线产出 0 条指令。
     (
         "eval_bare",
@@ -126,21 +121,16 @@ fn d316_fallback_reasons_are_stable() {
     );
 }
 
-/// 这 6 条**全部**是 9 层管线的功能覆盖缺口（4 类根因），不是缺陷。
+/// 这 4 条**全部**是 9 层管线的功能覆盖缺口，不是缺陷。
 ///
 /// 本条把「普查里仍回落的条目集合」与本文件一致这件事钉住 ——
 /// 避免将来有人只改普查、不改根因分诊。
+///
+/// **D412**：`model` 与 `tea_standalone` 已修（不再回落），从本表移除。
 #[test]
 fn d316_fallback_set_matches_the_triage() {
-    // 与 `nine_layer_fallback_census.rs` 里 `should_fall_back == true` 的 6 条对应。
-    const EXPECTED_FALLBACK: &[&str] = &[
-        "worker",
-        "transaction",
-        "perform_bare",
-        "model",
-        "tea_standalone",
-        "eval_bare",
-    ];
+    // 与 `nine_layer_fallback_census.rs` 里 `should_fall_back == true` 的条目对应。
+    const EXPECTED_FALLBACK: &[&str] = &["worker", "transaction", "perform_bare", "eval_bare"];
     assert_eq!(
         FALLBACK_REASONS.len(),
         EXPECTED_FALLBACK.len(),

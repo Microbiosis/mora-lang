@@ -98,18 +98,31 @@ fn fixture(name: &str) -> String {
 /// 普查里翻转的 8 条**全部同向**（回落 → 通过），无一条反向退化。
 /// 常驻护栏见 `tests/nine_layer_unblocked.rs`。
 ///
-/// `tea_standalone.mora` 仍回落的根因是 D95 记档的那一族
-/// （`Parallel` / `Observe` / `Span` / `PromptSection` / `DocumentSection`
-/// 五个分支不补 `Const(dst, Nil)`），补齐需给 `Node` 加 `dst` 字段并改
-/// `witness_to_fcfg` 与 `node_result_reg` —— 核心 AST 的结构性改动，未做。
+/// v0.104.6 **D412 已翻转**：原名 `d275_only_tea_standalone_still_falls_back`。
+///
+/// 原判据断言「`tea_standalone.mora` **必须**回落」，并把根因记为 D95 记档的
+/// 一族（`Parallel`/`Observe`/`Span`/`PromptSection`/`DocumentSection`
+/// 五个分支不补 `Const(dst, Nil)`）。
+///
+/// **那个根因判断是错的**（与 D412 附记的「CHANGELOG 标题≠当前状态」同源）。
+/// D412 读 `emit_definitions.rs::emit_model_def_w` 的实际代码，查到真因是
+/// `model` 字段默认值在**入口**就被丢弃：
+/// `let (dreg, _dw) = self.emit_expr_w()?;` —— `_dw` 整个扔了
+/// ⇒ `WitnessKind::ModelDef` 没有 `defaults`
+/// ⇒ witness → Node → fcfg_lower 整条 9 层链路结构上拿不到默认值。
+///
+/// 补上后 `tea_standalone.mora` **已走上 9 层管线**（D412 实测：全语料
+/// 57/57 夹具 + 6/6 examples 零回落）。
 ///
 /// 失败集合变化时本条会红 —— **先读文件头再判断是改进还是回归**
-/// （D276 就是一次「看起来是改进、实则是回归」；D315 之所以敢翻，是因为
-/// D314 先把 D276 当年撞上的那个 `n_regs` 崩溃修好了）。
+/// （D276 就是一次「看起来是改进、实则是回归」）。
 #[test]
-fn d275_only_tea_standalone_still_falls_back() {
-    let must_fall_back = ["tea_standalone.mora"];
+fn d412_no_fixture_falls_back() {
+    // v0.104.6 D412：回落集合**已清空**。
+    // 保留一个显式的空数组断言，让「有人加回落项」时本条立刻变红并指名道姓。
+    let must_fall_back: [&str; 0] = [];
     let now_on_pipeline = [
+        "tea_standalone.mora", // ← D412 修好，从 must_fall_back 移到这里
         "rel_basic.mora",
         "rel_cons.mora",
         "rel_empty.mora",
@@ -130,13 +143,13 @@ fn d275_only_tea_standalone_still_falls_back() {
         );
         assert!(
             nine_layer_fell_back(&path),
-            "`{name}` 当前**必须**回落（差分失败；D95 记档的 `Const(dst, Nil)` 缺口）。\n\
-             若它不再回落，说明那 5 个分支已补齐 —— 那时本判据与 \
-             `nine_layer_fallback_census.rs` 的记档都应同步更新。"
+            "`{name}` 当前**必须**回落。\n\
+             D412 已把回落集合清空；若又有文件回落，说明差分对齐被撤销了 —— \
+             届时本判据与 `nine_layer_fallback_census.rs` 的记档都应同步更新。"
         );
     }
 
-    // 反向断言：原本回落的 10 个必须**确实**走上管线了（双向牙齿）。
+    // 反向断言：这 11 个必须**确实**走上管线了（双向牙齿）。
     let mut still_falling_back = Vec::new();
     for name in now_on_pipeline {
         let path = fixture(name);
@@ -150,7 +163,7 @@ fn d275_only_tea_standalone_still_falls_back() {
     }
     assert!(
         still_falling_back.is_empty(),
-        "**D315**：这 10 个文件应当**已走上 9 层管线**。仍回落的有：\n\
+        "**D315 / D412**：这 11 个文件应当**已走上 9 层管线**。仍回落的有：\n\
          {still_falling_back:?}\n\
          若差分对齐被撤销，请一并复查 D314 的 `max_reg_in_node` 穷尽 match\
          是否还在（那正是 D276 撤销的原因）。"
@@ -180,14 +193,11 @@ fn d275_healthy_files_still_do_not_fall_back() {
     }
 }
 
-/// 回落不得改变可观察行为（退出码）。
+/// 跑完必须成功 —— D412 之前这是「回落不得改变可观察行为」的证明，
+/// 现在回落集合已清空，本条退化为「该样本本来就该跑通」的基线。
 ///
-/// 差分失败只丢弃 9 层产出、不改变结果 —— 这条钉住「回落是静默降级、
-/// 不是崩溃」。
-///
-/// 只用 `tea_standalone`：它是失败集里**有 `task main()` 入口**的样本。
-/// （`rel_empty.mora` 只有 `rel` + `solve`、**没有入口**，它 exit 1 是
-/// 正确的、与差分无关 —— 别把它当基线。）
+/// ⚠ 若将来又有文件回落，本条**不再**能证明「回落无害」——
+///   那时需另找样本重钉（判据的适用范围随它所描述的现象一起变化）。
 #[test]
 fn d275_fallback_does_not_break_the_program() {
     let exe = env!("CARGO_BIN_EXE_mora");

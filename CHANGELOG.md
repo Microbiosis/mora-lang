@@ -19606,6 +19606,606 @@ AFTER  = 1                 ← 计数**未增长**
 
 `cargo test --no-fail-fast` / `clippy --all-targets --all-features -D warnings` /
 `fmt --all -- --check` / `cargo doc --no-deps` 全 0（数值见 CHANGELOG 同轮次记录）。
+#### D412：9 层管线**对 TEA 程序永久回落** —— `model` 字段默认值在 witness 层就被丢弃（修复轮）
+
+承接 D275（同一矿脉的第三次挖掘）。D275 记的是「9 层 IR 管线的差分在 21% 的
+真实程序上失败」；本轮**先重测基线**，发现该数字已大幅过时，且剩下的唯一
+失败者的性质也判错了。
+
+## 先说更正：这不是「静默错值」
+
+| | D275 记录 | **本轮实测** |
+|---|---|---|
+| `examples/` | — | **0 / 6** 回落 |
+| `tests/fixtures/e2e/` | 21% | **1 / 57** 回落（仅 `tea_standalone.mora`） |
+
+实跑那个回落程序：输出 `dict / list / closure / tea_app`，与源码预期逐项一致，
+**exit 0**。回落走的是 `emit.rs`（可信路径），且 D36 起那行**默认打到 stderr**
+⇒ **安全且可见的降级**，不产生错误结果。
+
+D275 的标题「在生产中**从未生效**」措辞过重，应为「**对含 `model` 默认值的
+TEA 程序不生效**」。（与 D412 附记的「CHANGELOG 标题≠当前状态」同源。）
+
+## 根因：信息在**源头**就被丢弃
+
+`parser_v3/emit_definitions.rs::emit_model_def_w` 解析 `name: T = expr` 时：
+
+```rust
+let (dreg, _dw) = self.emit_expr_w()?;      // dreg → emit 流；_dw → 丢弃
+defaults.push((fname.clone(), dreg));
+```
+
+`emit_expr_w` **同时**返回寄存器与 witness，而 `_dw` 被下划线**整个丢掉**。
+
+⇒ `WitnessKind::ModelDef` 里没有 `defaults` ⇒ witness → `Node` → `fcfg_lower`
+整条 9 层链路**结构上拿不到默认值**。
+
+这不是「lowering 写漏了」，而是**信息在入口就没进管线**。
+
+另有一处同族缺口：`emit.rs` 无条件发一条尾部 `Const(Nil)`，
+`fcfg_lower` 此前也没有。
+
+## 修法：6 处
+
+| 位置 | 改动 |
+|---|---|
+| `mir/witness.rs` | `WitnessKind::ModelDef` 增 `defaults: Vec<(String, MirWitness)>` |
+| `parser_v3/emit_definitions.rs` | `_dw` 接上，填进 witness |
+| `mir/fcfg.rs` | `Node::ModelDef` 增 `defaults: Vec<(String, Reg, Node<M>)>` |
+| `mir/witness_to_fcfg.rs` | 转换；**寄存器在此一次算好**（`node_result_reg`） |
+| `mir/fcfg_lower.rs` | 按 emit.rs 顺序发射；`max_reg_in_node` 计入默认值寄存器 |
+| `typeck/annotate.rs` | 默认值表达式递归 annotate（`Node<()>` → `Node<TypeInfo>`） |
+
+另有 `typeck/hm/mod.rs`、`mir/lower.rs` 两处解构补 `..`。
+
+### 两个设计选择
+
+**① 元组是 `(字段名, 结果寄存器, 表达式节点)`** —— 寄存器在
+`witness_to_fcfg` 里由 `node_result_reg` **一次算好**。
+否则 `fcfg_lower` 与 `max_reg_in_node` 各要复制那个 15 分支的 match
+（`Literal/Variable/BinaryOp/Call/…/Match`），两处漂移的风险很高。
+
+**② `max_reg_in_node` 必须计入默认值占用的寄存器** —— 否则 `n_regs` 偏小，
+消费者按默认值寄存器取值就越界。这与 D35（`Handle` 的 `dst` 不计入）是**同一类**，
+且那个 bug 已经造成过 9 层管线的永久回落。
+
+## 修后
+
+| 语料 | 回落 |
+|---|---|
+| `tests/fixtures/e2e/`（57 个文件） | **0 / 57**（修前 1） |
+| `examples/`（6 个文件） | **0 / 6** |
+| 普查里的**代码片段**形态（34 条） | **4 / 34**（修前 6） |
+
+且 `tea_standalone.mora` 的运行结果**一字未变**（`dict/list/closure/tea_app`）。
+
+⚠ **不要把「回落清零」说得太满** —— 清零的是**文件**语料；
+`nine_layer_fallback_census` 那张 34 条的**代码片段**表里仍有 4 条回落：
+
+| 仍回落 | 原因（未变） |
+|---|---|
+| `worker` | 9 层降级链里**没有 `Worker` 类别** |
+| `transaction` | 同上，没有 `Transaction` |
+| `perform_bare` | 裸 `perform`（emit 侧不发该 Perform） |
+| `eval_bare` | 裸顶层 `eval`：管线**一条指令都产不出** |
+
+这 4 条**改前就回落**，不是本次引入的回归。
+
+## 连带翻转 4 个 target（它们钉的是**旧状态**）
+
+门禁第一次跑出 4 个 target 红。逐条核对后确认**全是钉旧状态的判据**，无一是真回归：
+
+| 判据 | 原钉 | 改法 |
+|---|---|---|
+| `d275_only_tea_standalone_still_falls_back` | `tea_standalone` **必须**回落 | 翻转为 `d412_no_fixture_falls_back`；它移进「已上管线」组 |
+| `d92b_census_covers_both_outcomes` | 回落 ≥ 6 / 通过 ≥ 27 | 改**精确值** 4 / 30（该表是静态 34 条，无扫描器失效风险） |
+| `d92b_census_matches_measured_fallback_set` | `model` / `tea_standalone` = 回落 | 改 `false` |
+| `d316_fallback_reasons_are_stable` | 二者有分诊记录 | 从 `FALLBACK_REASONS` 移除 |
+| `d316_fallback_set_matches_the_triage` | 6 条集合 | 改 4 条 |
+| `d364_tea_differential_failure_is_a_false_positive` | TEA 差分失败是**假阳性** | 翻转为 `d412_tea_differential_now_passes` |
+| `d364_differential_failure_is_never_silent` | 用 `tea_standalone` 验「失败可见」 | **换样本为 `worker`**，性质不变 |
+
+### 两条值得单独记的
+
+**① `d364_tea_differential_failure_is_a_false_positive` 的结论被推翻了。**
+它断言「TEA 的差分失败是假阳性 —— 只是差分器过严，结果完全正确」。
+D412 查到的真因是**管线少发了指令**（默认值根本没进 9 层路径），
+不是差分器过严。⇒ **「假阳性」这个诊断本身是错的。**
+
+**② `d364_differential_failure_is_never_silent` 我没有删，而是换了样本。**
+它的**性质**（差分失败不得静默）与用哪个样本无关。
+样本失效时正确的做法是**换一个仍会回落的形态**，不是删判据 ——
+删掉就等于丢掉了这条性质。判据的失败消息里也写明了这一点。
+
+### 一个独立的印证
+
+`nine_layer_fallback_reasons.rs` 里 `model` 那条的判别标记是：
+
+```text
+pipeline="ModelDef" original="Const"
+```
+
+即**管线的 `ModelDef` 撞上了 emit.rs 侧那条默认值 `Const`** ——
+这条在 D412 之前就写在表里，**独立印证了本轮读代码得到的根因**。
+而 D95 记的「5 个分支缺 `Const(dst, Nil)`」是**错误归因**。
+
+## 判据（`tests/nine_layer_tea_model_defaults.rs`，2 条）
+
+| 判据 | 钉什么 |
+|---|---|
+| `nine_layer_pipeline_handles_tea_model_defaults` | ① 默认模式下 stderr **无** `[9layer] 差分失败`；② 两条编译路径输出**逐字相同**；③④ 运行结果未变且逐行断言 |
+| `witness_keeps_model_defaults` | `WitnessKind::ModelDef` 里 `defaults` 字段**存在**（剥注释后再判 —— D388 踩过字符串切片带上 doc comment 的坑） |
+
+**牙齿验证：让 parser 停止填充 `defaults` ⇒ 恰好行为判据变红**，
+且 stderr 精确复现原症状 `[9layer] 差分失败：pipeline_mir=6 original_mir=11`。
+源码级那条**保持绿是正确的分工** —— 字段还在、只是没被填充，那是行为判据的职责。
+
+⚠ 本文件单独成文件、且两条测试中只有一条碰环境变量：`MORA_9LAYER` 是**进程全局**的
+（沿用 `differential_false_negative.rs` 的约定）。
+
+## 同一缺陷的**第二处**，且是**既有**的（v0.75.91 起）
+
+修完 agent 体后顺手查了另一条路径 —— orchestrate **之外**使用
+`input_var` / `result_var`。这两个变量同样登记为 `Type::Unknown`
+（**不是** D414 引入，来自 `ed5afe8`「拆分 Type::Any 为 Any + Unknown」）：
+
+```mora
+orchestrate sequential input -> result
+  agent a => "A"
+end
+print(result + "!")     → expected String, got TypeVar('\u{2}')    exit 2
+```
+
+⇒ 同一族假阳性，**潜伏了多个版本**。修法相同：改成 solver 能绑定的
+fresh TypeVar（`input_var` 优先用实际绑定类型，`result_var` 用 fresh TypeVar）。
+
+判据：`d415_result_used_outside_orchestrate_is_not_a_false_positive`（库级 + 真实 CLI）。
+
+## 判据自身踩的坑：并行测试共用临时目录
+
+补上面那条判据后，随机一条 CLI 判据报「文件不存在」。真因：
+`cli_exit()` 用**固定的** `%TEMP%/mora_d415_fp`，而 Rust 测试**默认并行**
+⇒ 两条用例互相 `remove_dir_all` + `create_dir_all`。
+
+修法：`cli_exit(tag, src)` 按用例给**唯一子目录**。
+⇒ 与 D408 的「MORA_9LAYER 是进程全局变量，同类判据必须单独成文件」同源，
+只是这次的共享面是**文件系统**。
+
+## 如何自行复核（**只读即可**，无需改源码）
+
+四个探针程序 + 期望结果。全部用真实 CLI（`target\debug\mora.exe <file>`）：
+
+| 程序 | 期望 | 现状 |
+|---|---|---|
+| `orchestrate sequential input -> result` / `agent a => input + "x"` / `end` / `print(result)` | exit 0，`nilx` | ✅ |
+| 同上但 `let input = "S"` 开头 | exit 0，`Sx` | ✅ |
+| `agent a => "A"` + `print(result + "!")`（orchestrate **之外**用 result） | exit 0，`A!` | ✅ |
+| `agent a => 1 + "str"` | exit 2，`Type mismatch: expected Float, got String` | ✅ |
+| `agent a => zzz + 1` | exit 2，`Unbound variable 'zzz'` | ✅ |
+
+**牙齿实验需改源码**（把 `input_ty` 那行改回 `Type::Unknown` 后重编译）：
+`cargo test --test orchestrate_input_typeck_false_positive` ⇒ **4 红 / 3 绿**；
+`--test typeck_coverage_boundary` 与 `--test orchestrate_agent_params_and_typeck`
+全绿 ⇒ **真实检出不受类型载体影响**。
+
+## 附：本轮再次验证了「CHANGELOG 标题≠当前状态」
+
+我按 D275/D272/D267 的**标题**列过一份「真实缺陷」清单，逐条核对后：
+6 条里 3 条不成立（1 条已修、2 条是安全降级/产品决定）。
+D412 的修法也是因为**读了 D272 原文**才发现「`_dw` 已在手边被丢弃」——
+只看标题会判成「结构性缺失、架构级改造」，成本估计差一个量级。
+#### D413：orchestrate agent 的**形参被解析后丢弃** —— 绑上（修复轮，关闭 D272 缺陷①）
+
+D272 记下「形参被解析、被丢弃，体内引用恒得 `nil` 且 exit 0 零诊断」，
+并明确「修法是**产品契约决定**，不擅自实施」。本轮用户选定 D272 的**选项②**。
+
+## 根因
+
+`parser_v3/syntax.rs::parse_agent_def` 解析出形参后绑到 **`_params`**，
+随即便丢弃：
+
+```rust
+let _params = if self.match_token_exact(TokenType::LParen) { … Some(params) } else { None };
+```
+
+`WitnessAgentDef` / `MirAgentDef` **都没有** `params` 字段
+（`MirOrchestrateAgent` 只是 `MirAgentDef` 的**类型别名** ⇒ 是**两层**不是三层；
+D272 原文写「三层」，本轮更正）。
+
+## 决策（用户选定）
+
+| 决策 | 内容 |
+|---|---|
+| **单参** | `agent a(x) => …` 的 `x` **等价于** `input` |
+| **多参** | `agent a(x, y) => …` **解析期报错** |
+
+### 为什么多参是「报错」而不是「都绑成 input」—— 三条实测证据
+
+| 证据 | 结论 |
+|---|---|
+| `docs/mora-spec.md` 里 `agent <name>(...)` **零出现** | 该语法**完全未文档化** |
+| 仓内形参用法**全是单参**（`orchestrate.rs:27,28,39`） | 多参用法**一处都没有** ⇒ 拒绝的**破坏面为零** |
+| `input` 恒为 `Value::String(input_val.to_string())`（`pregel/mod.rs`）或裸 `Value`（sequential） | **没有 list/dict 可按位置解构** ⇒ 「解构」方案当场作废 |
+
+⇒ 「多参也静默给 nil」正是本轮要消灭的那类缺陷，报错严格优于它。
+
+## 改动（6 处）
+
+| 位置 | 改动 |
+|---|---|
+| `mir/witness.rs` | `WitnessAgentDef` 增 `params`；`from_agent` 透传 |
+| `mir/orchestrate/mod.rs` | `MirAgentDef` 增 `params`；`mir_agent_from_witness` 透传 |
+| `parser_v3/syntax.rs` | 填充 `params`；**多参**写 `self.diag` 并回溯 |
+| `parser_v3/mod.rs` | 新增 `ParserV3::diag: Option<String>` 槽；`compile()` 优先取它 |
+| `mir/handlers/runtime.rs` | `Sequential` 路径绑形参 |
+| `pregel/mod.rs` | Pregel **顺序 + 并行**两处绑形参 |
+
+### ⚠ 运行期有**三条**独立注入路径
+
+| 路径 | 位置 | 是否经 pregel |
+|---|---|---|
+| `Sequential` | `mir/handlers/runtime.rs` | **否** |
+| Pregel 顺序 | `pregel/mod.rs` | 是 |
+| Pregel 并行 | `pregel/mod.rs` | 是 |
+
+**只改 pregel 会漏掉 `Sequential`** —— 本轮第一版就只改了 pregel，
+实测 `_p1.mora` 仍输出 `b:nil`，直到补上第三条路径才生效。
+
+## 诊断质量：为什么多参能报**具体**错误
+
+解析器主体是 `Option` 驱动的（`None` = 「解析失败」），拿不到原因
+⇒ 否则用户只会看到泛化的 `Failed to parse at line 2`（第一版实测就是它）。
+
+给 `ParserV3` 加 `diag: Option<String>` 槽，`compile()` 在解析后优先取出它。
+
+⚠ **第一版把 `emit_program()?` 写在前面**，结果 `?` 提前返回，
+下面的诊断检查**永远执行不到** ⇒ 判据报「实得 `Failed to parse at line 2`」
+才暴露。修法是**先捕获结果、再查诊断、最后才 `?`**。
+
+## 修后实测
+
+```text
+let input = "S"
+orchestrate sequential input -> result
+  agent a(x) => "a:" + x
+  agent b(x) => "b:" + x
+end
+→ b:a:S            （修前：b:a:nil）
+```
+
+⚠ `input` **未设**时是 `b:a:nil` —— 与修前的 `b:nil` **不同**：
+修前连第一个 agent 的结果都没串到第二个。这是「绑定生效但首值恰为 nil」
+与「压根没绑」的区别，判据里单列了一条。
+
+多参：
+
+```text
+agent a(y, z) => "y:" + y
+→ exit 2，错误点名「at most 1 parameter」，并列出 agent 名与全部形参
+```
+
+## 判据（`tests/orchestrate_agent_params_and_typeck.rs`，7 → 12 条）
+
+| 判据 | 钉什么 |
+|---|---|
+| `d413_agent_param_receives_the_real_input` | 核心：`let input = "S"` ⇒ **`b:a:S`** |
+| `d413_param_is_exactly_an_alias_of_input` | 形参版与 `input` 版**逐字相同** ⇒ 钉住「`(x)` ≡ `input`」这个语义本身，而不只是「x 非空」 |
+| `d413_param_with_unset_input_still_nil` | `input` 未设时仍 nil（区分「绑上了但值是 nil」与「没绑」） |
+| `d413_multi_param_agent_is_a_parse_error` | 多参编译失败 + 错误信息**点名至多 1 个**且列出形参 |
+| `d413_single_param_agent_still_compiles` | 与上一条配对 —— 否则「全拒」也能让上一条变绿 |
+| `d413_no_param_agent_is_unchanged` | `agent a => …` 主流写法不受影响 |
+| `d413_declared_but_unused_params_are_harmless` | D272 记的兼容性边界仍成立 |
+| `d413_params_field_exists_on_both_agent_types` | 源码级护栏：`params` 在**两个**类型上真的存在（剥注释后判 —— D388 踩过切片带上 doc comment 的坑） |
+| `d272_type_mismatch_inside_agent_body_is_not_caught` 等 4 条 | **仍未修**的缺陷②（agent 体不走 typeck），按 D272 选项③未选，原样保留 |
+
+**牙齿验证：撤掉 `Sequential` 的绑定 ⇒ 恰好 3 红 / 9 绿**。
+红的是三条绑定断言；解析器层与类型层那两条保持绿是**正确分工** ——
+它们管语法与类型，与运行期绑定无关。
+
+## 仍未修（D272 的选项③）
+
+**agent 体完全不走 typeck** —— 顶层与普通闭包都走，只有 orchestrate agent 是例外。
+需建模 agent 的词法作用域（运行期是 `env.clone()`，**外层全部变量可见**
++ 无条件注入 `input`），typeck 目前无此模型 ⇒ 架构级改动。
+本轮用户选的是选项②，③ 保持原样并由判据钉住现状。
+#### D414：agent 体**完全不走 typeck** —— 补上真正的下降推断（修复轮，关闭 D272 缺陷②）
+
+D272 记了三个修法选项，②（绑形参）已在 D413 落地；本轮做**③**。
+
+## 根因：一行 `return Nil`
+
+`src/typeck/hm/mod.rs` 的 `WitnessKind::Orchestrate` 臂：
+
+```rust
+self.env.add(input_var.clone(), Type::Unknown);
+self.env.add(result_var.clone(), Type::Unknown);
+Ok((Type::Nil, crate::mir::effect::EffectRow::Empty))   // ← 整棵子树零诊断
+```
+
+登记完 `input` / `result` 就直接返回，**完全不下降进 `kind`**。
+⇒ orchestrate 声明内的一切（agent 体、边条件、`exit_when`、`with_config`、
+MoA/MoE 的 `prompt`·`router`·专家定义）**全部不参与类型检查**。
+
+实测（D272）：同一段 `1 + "str"` 在顶层与闭包报错、在 agent 体内被
+**强行算成 `"1.0str"`** 且 exit 0。
+
+## 作用域契约（按**运行期真实语义**建模）
+
+agent 体拿的是 `env.clone()` ⇒ **外层全部变量可见**；再加上：
+
+| 注入项 | 来源 | 本轮处理 |
+|---|---|---|
+| `input` | `pregel/mod.rs` 与 `handlers/runtime.rs` 的 `env.define("input", …)` | 推断前注入 `Type::Unknown` |
+| 形参（至多 1 个） | **D413 新增**的 `params` | 按 agent 逐个注入 |
+| `input_<channel>` | `inject_channel_inputs`（仅 Pregel） | **未预注册** —— 门禁实测无假阳性 |
+
+⇒ 这正是 D273 文件头警告的陷阱：「直接遍历 `sub_witnesses()` 会让所有
+能正常工作的 orchestrate 程序集体报 `Unbound variable input`」。
+本轮**注入后再下降**，且门禁全量跑过 ⇒ **零假阳性**（见下）。
+
+## 实现：`infer_orchestrate_kind`
+
+两段式，刻意分工：
+
+1. **agent 体**：按上面那张表逐个注入作用域后推断（`task_expr` + `verify_expr`）；
+2. **其余子 witness**：复用现成的 `child_witnesses()`，不手写 match ——
+   第一版手写 match **漏了 `with_config`**。
+
+⚠ **`combiner_body` 推断不了**：它是已降级的 `MirFunction`（指令序列）
+而非 witness ⇒ 该部分**仍零诊断**，已在代码注释里写明。
+
+## ⚠ 我自己写错了一版：作用域对了但**错误被吞掉**
+
+第一版 agent 循环里写的是：
+
+```rust
+if let Ok((_, r)) = self.infer_expr(&a.task_expr) { … }
+```
+
+而 `infer_expr` 返回 `Result<(Type, EffectRow), **Vec<TypeError>**>` ——
+**`Err` 里装的正是要上报的诊断**。`if let Ok(..)` 把它们全丢了
+⇒ 「下降推断」**白做**：作用域建模正确，但一个错都没报出来。
+
+症状很有欺骗性：跑门禁时只有 **1 个** target 红
+（`typeck_coverage_boundary` 里 `loop on:` 那一项），我差点当成
+「只修好了一部分」。改成 `?` 传播后，**六项全部检出**。
+
+⇒ 与 D412 的「生产者丢弃」同族，但方向相反：
+**那次是生产者把值扔了，这次是消费者把错误扔了。**
+**「拿到 Result 却不检查 Err 分支」是同一类静默。**
+
+## 修后实测
+
+| 上下文 | `1 + "str"` | 未绑定 `zzz` |
+|---|---|---|
+| 顶层 | 报错 ✓ | 报错 ✓ |
+| 普通闭包 | 报错 ✓ | 报错 ✓ |
+| **orchestrate agent 体** | **报错 ✓**（修前静默算成 `1.0str`） | **报错 ✓**（修前零诊断） |
+
+`tests/typeck_coverage_boundary.rs` 的 6 项 `expect_checked: false` **全部翻成 `true`**，
+测试改名 `d414_typeck_covers_orchestrate_too`，失败消息也从
+「若开始检出说明已修复」改成「若某项开始**不**检出说明 D414 被撤销」。
+
+`tests/orchestrate_agent_params_and_typeck.rs` 里那两条钉现状的
+（`d272_type_mismatch_inside_agent_body_is_not_caught` /
+`d272_unbound_name_inside_agent_body_is_not_caught`）翻转为正确行为断言。
+
+## 牙齿验证
+
+摘掉下降推断调用 ⇒ **恰好 3 红 / 11 绿**（两个文件各贡献）。
+解析层与形参那几条保持绿是正确分工。
+
+## 假阳性核查
+
+D273 明确警告过「让所有正常工作的 orchestrate 程序集体报
+`Unbound variable input`」。本轮注入 `input` + 形参后再下降，
+**全量门禁 0 失败** ⇒ 该假阳性**未发生**。
+
+`input_<channel>`（`inject_channel_inputs`，仅 Pregel）**没有预注册** ——
+实测没有任何现存程序在 agent 体内引用它，所以不需要。
+若将来出现，那时再按实测证据加，**不预先放宽**。
+#### D415：D414 引入的假阳性 —— 合法的 `agent a => input + "x"` 被**拒绝执行**（修复轮）
+
+D414 给 orchestrate 补下降推断后，**合法程序跑不起来了**。本轮修。
+
+## 现象
+
+```mora
+orchestrate sequential input -> result
+  agent a => input + "x"
+end
+```
+
+```text
+Type error (位置未跟踪): Type mismatch: expected String, got TypeVar('\0')
+exit 2
+```
+
+而**同一表达式在普通闭包里通过**：
+
+```mora
+let q = "S"
+let f = fn (q) { q + "x" }
+f(q)           → Sx        exit 0
+```
+
+⚠ 不只是 `--check` 误报：**`mora run` 同样 exit 2，合法程序被拒绝执行。**
+⇒ D414 CHANGELOG 写的「与顶层/普通闭包一致」**并不成立**。
+
+## 为什么全量门禁 2828 全绿却抓不到
+
+**仓内 `.mora` fixture 里零个 agent 体使用 `input`。**
+没有任何现存测试跑过「agent 体里对 `input` 做运算」这条路径
+⇒ 这类回归**结构上**不可能被既有语料覆盖。
+
+⇒ 这是本轮最重要的一条：**门禁全绿与「存在假阳性」是可以并存的**，
+当且仅当那条路径压根没有被任何 fixture 走到。
+
+## 根因：`Type::Unknown` 在 `unify` 里是 **fail-fast 的既定契约**
+
+⚠ **我第一版把它写成「solver 忘了放行 Unknown」—— 那是误诊。**
+`src/typeck/hm/unify.rs` 的注释写得很清楚：
+
+```rust
+// v0.75.92: Unknown fail-fast — 与任何类型合一都失败（v0.75.91 引入的
+// 逃逸标签；fail-fast 语义迫使调用方用 TypeVar 推断路径产出精确类型）。
+(Type::Unknown, _) | (_, Type::Unknown) => Err(UnificationFailure { .. })
+```
+
+⇒ **fail-fast 是有意设计**，而它**点名要求的正解就是「用 TypeVar」** ——
+本轮的修法与该契约一致；错的只是我的**解释**（说成缺口而非既定规则）。
+
+真正容易踩的是**两层对 `Unknown` 的策略故意相反**：
+
+| 层 | 版本 | 对 `Unknown` |
+|---|---|---|
+| `Type::compatible_with()` | v0.84 | ✅ 当 **top type**，一律放行 |
+| `unify()` | v0.75.92 | ❌ **一律失败** |
+
+⇒ **「`compatible_with` 过了」不代表「能 solve」。**
+任何需要「任意类型」的位置都必须用 fresh TypeVar，否则一定在 solve 阶段炸。
+
+## 修法：优先用**外层实际绑定类型**，否则 fresh TypeVar
+
+```rust
+let bound_input_ty = self.env.get(input_var).cloned();   // 覆盖成 Unknown **之前**取
+self.env.add(input_var.clone(), Type::Unknown);
+…
+let input_ty = match bound_input_ty {
+    Some(t) if !matches!(t, Type::Unknown) => t,   // let input = "S" ⇒ String
+    _ => self.fresh_type_var(),                    // 未绑定 ⇒ 多态
+};
+self.env.add("input".to_string(), input_ty.clone());
+```
+
+⚠ **取实际类型必须在覆盖成 `Unknown` 之前** —— 覆盖之后 `get` 就只剩
+`Unknown`，精度全丢（这是我第一版的错误）。
+
+形参（D413 的 `params`）用**同一个** `input_ty` —— 运行期二者同源同值。
+
+## 判据（`tests/orchestrate_input_typeck_false_positive.rs`，6 条）
+
+| 判据 | 钉什么 |
+|---|---|
+| `agent_body_can_operate_on_input` | 核心：`input + "x"` **零诊断** |
+| `legal_agent_body_runs_under_real_cli` | 走**真实 CLI**（typeck 必走那条路）exit 0 且输出 `Sx` |
+| `type_mismatch_in_agent_body_is_still_caught` | 配对①：`1 + "str"` **仍必须**报 |
+| `unbound_name_in_agent_body_is_still_caught` | 配对②：`zzz` **仍必须**报 |
+| `agent_param_can_operate_on_its_value` | 形参同样多态 |
+| `input_respects_the_actual_binding_type` | **反过拟合**：`let input = 1` 时 `input + 1` 通过，而 `input + "x"` **仍报** ⇒ 证明 typeck 真的在用绑定类型，不是无脑放行 |
+
+**牙齿验证：类型载体改回 `Type::Unknown` ⇒ 恰好 4 红 / 16 绿。**
+`d414_typeck_covers_orchestrate_too` 保持绿 ⇒ 真实检出不受类型载体影响。
+
+## 我的错误
+
+D414 收尾时我把「全量门禁 0 失败」当成了充分证据并宣称完成。
+**门禁只覆盖了既有语料走到的路径**；`agent 体用 input` 这条路径
+压根没有任何 fixture 走过，所以它**结构上**不可能被门禁发现。
+⇒ 补一条「常用惯用写法必须可编译」的判据，与既有语料**正交**。
+
+⇒ 与 D409「被拒不构成在边界外的证据」同族：
+**「没测到」不等于「没问题」，而「测过的都过了」也不等于「没测的也没事」。**
+#### D416：`lower_fcfg` 里**同一棵树遍历了两遍** —— 「配置只算一次」（修复轮，小改动）
+
+参考 Zig 0.17 的 configurer/maker 纪律：`zig build -h` 从 150 ms → 14 ms，
+关键不是微优化，而是**把可缓存的「配置」从重复计算里切出来**。
+
+## 缺陷（纯冗余，非错误行为）
+
+`src/mir/fcfg_lower.rs::lower_fcfg` 里 `max_reg_in_nodes(nodes)` 被调了**两遍**：
+
+```rust
+let mut ctx = EmitContext::new();
+ctx.next_reg = max_reg_in_nodes(nodes) + 1;   // 第 26 行
+for node in nodes { lower_node(&mut ctx, node); }
+…
+let max_pre_alloc = max_reg_in_nodes(nodes);  // 第 37 行
+```
+
+入参相同、其间 `nodes: &[Fcfg]` 不可变、`lower_node` 不改节点树
+⇒ 两次结果**必然相同**，第二次是纯浪费的全树递归遍历。
+
+## 修法
+
+把分析提到循环之前算一次，下游只读结果。**产出完全不变** ——
+`ctx.next_reg` 起点与 `n_regs` 的三项取 max 都用同一个值。
+
+## ⚠ 这是「提速」不是「修错」
+
+行为零变化，所以：
+- 不需要新的判据（现有 311 个 target 全绿即证明等价）；
+- 但也**没有缺陷被关闭** —— 记档是为了那条纪律，不是为了修 bug。
+
+## 三档里第一档的定位（后续若做第二/三档）
+
+| 档 | 内容 | 状态 |
+|---|---|---|
+| ① | `lower_fcfg` 去重复遍历 | ✅ 本轮 |
+| ② | `max_reg` 随节点树带下来，消除「人工判定哪个变体带顶层寄存器」 | ❌ **实测后放弃**（见下） |
+| ③ | 缓存编译结果 | ❌ **实测后放弃**（见下） |
+
+### ② 经**实测**放弃（不是凭结构推断放弃）
+
+结构上看，`lower_block_to_function`（21 处调用，每个嵌套块上下文一次）
+会再次 `max_reg_in_nodes(&block.nodes)`，而该块子树刚作为父节点分析的一部分
+被遍历过 —— 看起来「每个嵌套块至少 2 次」。
+
+**临时加计数器实测 57 个夹具**（全部编译成功，测完即回退，探针零残留）：
+
+| 指标 | 数值 |
+|---|---|
+| `max_reg_in_nodes` 调用次数 | 2 499 |
+| `max_reg` 实际遍历的节点数 | 5 576 |
+| `lower_node` 发射的节点数 | 3 556 |
+| **平均每个节点被遍历** | **1.57 次** |
+
+⇒ **1.57 次，不是 2×+**；且绝对量微不足道
+（3 556 节点 / 57 程序 ≈ **每程序 62 个节点**，共 5 576 次节点访问）。
+
+而 ② 要动的是：`max_reg_in_node` 的 match 覆盖 **50 个变体**，
+每个变体「带哪些顶层寄存器」逐个手写 ⇒ 改字段要动全部 50 个，
+或引入 `NodeId` 侧表（`Node` 无稳定 id），或改 17 个调用点。
+
+**投入产出完全不成比例 ⇒ 不做。**
+
+### ③ 经**实测**放弃 —— 两条路径各自都不成立
+
+**CLI 单次调用：天花板就是 5 ms。**
+
+| | 中位耗时 |
+|---|---|
+| 进程启动地板（`--version`） | 11 ms |
+| 完整跑一个文件 | 16 ms |
+| **⇒ 编译 + 执行 + 差分** | **5 ms（占 29%）** |
+
+即：把编译缓存到**完全免费**，每次调用也只省 **5 ms**。
+
+**REPL：O(n²) 是真的，但缓存根本命中不了。**
+
+D17 起 REPL 每行都把**整段累积源码**当完整程序重新编译送检
+（为了跨行绑定正确）。实测复杂度确实是二次的：
+
+| 累积行数 | 20 | 40 | 80 | 160 | 320 |
+|---|---|---|---|---|---|
+| 中位耗时 | 18 ms | 25 ms | 53 ms | 182 ms | **850 ms** |
+| 翻倍耗时比 | — | 1.4× | 2.1× | 3.4× | **4.7×** |
+
+比值收敛到 4× ⇒ **O(n²)** 坐实。但：
+
+1. **缓存命中率恒为 0** —— 每行的输入是「增长中的累积源码」，逐行不同，
+   按内容做键的缓存**在构造上就一次都命中不了**；
+2. 绝对值不高 —— 现实 REPL 会话 20~100 行 ⇒ 20~60 ms，**察觉不到**。
+
+⇒ 真要解决 REPL 的 O(n²)，方向不是缓存而是**增量 typeck**
+（复用上一行的 env / witness）。而 D191 的注释已记过这条路：
+「两段**各自独立编译**的 witness 拼起来并不是一个合法的程序形态」
+⇒ 属**已探明有阻**的方向，需重新设计而非套用缓存。
+
+⚠ 顺带记一笔**测量装置自己装错过一次**：第一版把「节点数」计数器
+打进了 `max_reg_in_node` 而不是 `lower_node`，测出「重复倍数 1.00」
+—— 那是拿 `max_reg` 的两个数相除，纯同义反复。修正后才得到 1.57。
+⇒ **若不装装置、只凭结构推断，会得出「2×+」并去动 50 个变体。**
 #### D385：`xform` 的**实际形态** + transducer 底层**接上了**（否定轮，修正 D346 的印象）
 
 D346 判定 `xform` 是「静默无效」，但当时**没查底层**。本轮查清两件事。

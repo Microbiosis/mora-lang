@@ -416,6 +416,11 @@ impl ParserV3 {
         while self.match_token(&[TokenType::Newline]) {}
         let mut fields: Vec<(String, crate::mir::hint::TypeHint)> = Vec::new();
         let mut defaults: Vec<(String, usize)> = Vec::new(); // (field, default_reg)
+        // v0.104.6 D412：默认值表达式的 **witness**。
+        // 此前 `let (dreg, _dw) = self.emit_expr_w()?;` 把 `_dw` **丢弃**，
+        // 于是 9 层管线（witness → Node → fcfg_lower）拿不到默认值，
+        // TEA 程序永远触发差分失败回落（`[9layer] 差分失败`）。
+        let mut default_wits: Vec<(String, MirWitness)> = Vec::new();
         while !self.check(&TokenType::End) && !self.is_at_end() {
             // 跳过块内空行（字段之间）
             while self.match_token(&[TokenType::Newline]) {}
@@ -426,8 +431,9 @@ impl ParserV3 {
             self.consume(TokenType::Colon, "Expected ':' after model field name")?;
             let ftype = self.parse_type_annotation()?;
             if self.match_token_exact(TokenType::Assign) {
-                let (dreg, _dw) = self.emit_expr_w()?;
+                let (dreg, dw) = self.emit_expr_w()?;
                 defaults.push((fname.clone(), dreg));
+                default_wits.push((fname.clone(), dw));
             }
             fields.push((fname, crate::mir::hint::TypeHint::from_type(ftype)));
             while self.match_token(&[TokenType::Newline]) {}
@@ -458,7 +464,11 @@ impl ParserV3 {
         self.emit
             .emit(MirInst::Const(dst, crate::value::Value::Nil));
         Some(MirWitness {
-            kind: WitnessKind::ModelDef { name, fields },
+            kind: WitnessKind::ModelDef {
+                name,
+                fields,
+                defaults: default_wits,
+            },
             span,
         })
     }

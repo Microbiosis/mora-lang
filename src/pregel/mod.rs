@@ -978,6 +978,13 @@ impl MirPregelEngine {
                         // v0.73: define input on the private clone (agent only
                         // sees its own input; no cross-agent contamination).
                         env.define("input".to_string(), Value::String(input_str.clone()), false);
+                        // v0.104.6 D413：形参（**至多 1 个**，多参由 parser 拒绝）
+                        // 绑成 `input` 的别名 —— `agent a(x) => …` 里的 `x`
+                        // 此后与 `input` 同值。此前形参被 `parse_agent_def`
+                        // 丢弃，体内引用恒得 `nil` 且 exit 0 零诊断。
+                        if let Some(p) = agent.params.first() {
+                            env.define(p.clone(), Value::String(input_str.clone()), false);
+                        }
                         // v0.75.10: 加法注入 — 保留 `input` 契约，另注入
                         // 逐 channel 变更 var（input_<channel>）。旧 agent 无感。
                         Self::inject_channel_inputs(&mut env, node_name, self);
@@ -1095,6 +1102,10 @@ impl MirPregelEngine {
                         let input_str = input_val.to_string();
                         let mut env = self.exec_env().clone();
                         env.define("input".to_string(), Value::String(input_str.clone()), false);
+                        // v0.104.6 D413：同顺序路径，形参绑成 `input` 别名。
+                        if let Some(p) = agent.params.first() {
+                            env.define(p.clone(), Value::String(input_str.clone()), false);
+                        }
                         // v0.75.10: 加法注入（input_<channel>），旧 agent 无感
                         Self::inject_channel_inputs(&mut env, node_name, self);
                         env.clock.tick(node_name);
@@ -1514,6 +1525,8 @@ mod tests {
 
     fn make_agent(name: &str) -> MirAgentDef {
         MirAgentDef {
+            // v0.104.6 D413：测试构造的 agent 无形参。
+            params: Vec::new(),
             name: name.to_string(),
             task_expr: nil_witness(),
             verify_expr: None,
@@ -1851,6 +1864,8 @@ mod tests {
     /// Build an agent whose task_body returns a constant Int.
     fn make_const_agent(name: &str, value: i64) -> MirAgentDef {
         MirAgentDef {
+            // v0.104.6 D413：测试构造的 agent 无形参。
+            params: Vec::new(),
             name: name.to_string(),
             task_expr: nil_witness(),
             verify_expr: None,
@@ -1873,6 +1888,8 @@ mod tests {
     /// 用于验证 effect-as-data 通道（send + contribution 同一数据路径）。
     fn make_aggregating_agent(name: &str, value: i64, agg_name: &str) -> MirAgentDef {
         MirAgentDef {
+            // v0.104.6 D413：测试构造的 agent 无形参。
+            params: Vec::new(),
             name: name.to_string(),
             task_expr: nil_witness(),
             verify_expr: None,
@@ -2062,6 +2079,8 @@ mod tests {
         };
         let config = MirPregelConfig {
             agents: vec![MirAgentDef {
+                // v0.104.6 D413：测试构造的 agent 无形参。
+                params: Vec::new(),
                 name: "a".into(),
                 task_expr: nil_witness(),
                 verify_expr: None,
@@ -2211,6 +2230,8 @@ mod tests {
         };
         let config = MirPregelConfig {
             agents: vec![MirAgentDef {
+                // v0.104.6 D413：测试构造的 agent 无形参。
+                params: Vec::new(),
                 name: "a".into(),
                 task_expr: nil_witness(),
                 verify_expr: None,
@@ -2425,6 +2446,8 @@ mod tests {
             ..Default::default()
         };
         let agent_a = MirAgentDef {
+            // v0.104.6 D413：测试构造的 agent 无形参。
+            params: Vec::new(),
             name: "a".into(),
             task_expr: nil_witness(),
             verify_expr: None,
@@ -2526,6 +2549,8 @@ mod tests {
             ..Default::default()
         };
         let agent_a = MirAgentDef {
+            // v0.104.6 D413：测试构造的 agent 无形参。
+            params: Vec::new(),
             name: "a".into(),
             task_expr: nil_witness(),
             verify_expr: None,
@@ -2753,6 +2778,8 @@ mod tests {
     /// 构造自定义 task_body 的 agent。
     fn make_custom_agent(name: &str, body: MirFunction) -> MirAgentDef {
         MirAgentDef {
+            // v0.104.6 D413：测试构造的 agent 无形参。
+            params: Vec::new(),
             name: name.to_string(),
             task_expr: nil_witness(),
             verify_expr: None,

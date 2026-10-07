@@ -1024,7 +1024,7 @@ impl WitnessLowerer {
             }
 
             // ── TEA (v0.83) + WithConfig + 其他 witness-only 变体 ──
-            WitnessKind::ModelDef { name, fields } => {
+            WitnessKind::ModelDef { name, fields, .. } => {
                 // ModelDef 是类型声明（无 body）——与 StructDef 同构。
                 let sfs: Vec<crate::common::StructField> = fields
                     .iter()

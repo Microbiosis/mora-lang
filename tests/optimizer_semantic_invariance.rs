@@ -259,14 +259,20 @@ fn d364_both_pipelines_produce_identical_output() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// **`tea_standalone.mora` 的差分失败是**假阳性**：
-/// 差分器按指令名比对，`ModelDef` vs 占位 `Const` 被判为不等价，
-/// 但**结果完全正确**（程序 exit 0、输出正确）。
+/// **`tea_standalone.mora` 的差分失败**已不复存在**（D412 已修）。
 ///
-/// 本条钉住「回落不改变结果」这个关键事实 ——
-/// 它证明差分失败**不是**正确性缺陷，只是差分器过严。
+/// 原名 `d364_tea_differential_failure_is_a_false_positive` —— 它断言
+/// 「TEA 的差分失败是假阳性：结果完全正确，只是差分器过严」。
+///
+/// ⚠ **D412 让那个结论失效了**：真因不是差分器过严，而是
+/// `model` 字段默认值在**入口**就被丢弃
+/// （`let (dreg, _dw) = self.emit_expr_w()?;` 把 `_dw` 扔了
+/// ⇒ `WitnessKind::ModelDef` 没有 `defaults`）
+/// ⇒ 管线产出的 `ModelDef` 撞上 emit.rs 的默认值 `Const`，被判不等价。
+///
+/// 补上默认值后差分**通过**，本条随之翻转为正确行为断言。
 #[test]
-fn d364_tea_differential_failure_is_a_false_positive() {
+fn d412_tea_differential_now_passes() {
     let fixture = std::path::Path::new(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/tests/fixtures/e2e/tea_standalone.mora"
@@ -288,41 +294,60 @@ fn d364_tea_differential_failure_is_a_false_positive() {
         )
     };
     let (c1, out1, err1) = run("1");
-    let (c0, out0, err0) = run("0");
+    let (c0, out0, _) = run("0");
 
-    assert_eq!(c1, c0, "两条管线的退出码应一致");
+    assert_eq!(c1, c0, "两条路径的退出码应一致");
     assert_eq!(
         out1, out0,
-        "差分失败后回落到 emit.rs，**结果必须相同**；\
-         若不同则差分失败是真缺陷（不是假阳性）"
+        "两条编译路径的输出应逐字相同（D412 已对齐）;\n 9layer : {out1}\n emit.rs: {out0}"
     );
+    // 核心：9 层管线对 TEA **不再回落**
     assert!(
-        err1.contains("差分失败"),
-        "9 层管线应报差分失败（否则本条「假阳性」的结论需重新评估）; stderr={err1}"
+        !err1.contains("差分失败"),
+        "`tea_standalone.mora` 不应再触发差分失败 —— 9 层管线已能处理 \
+         `model` 字段默认值（D412 已修）。若又失败，说明该修复被撤销。\n\
+         stderr={err1}"
     );
-    // 且 0 命中时 `MORA_9LAYER=0` 不该再报（它根本没跑管线）
-    assert!(
-        !err0.contains("差分失败"),
-        "`MORA_9LAYER=0` 压根不跑 9 层管线，不该报差分失败; stderr={err0}"
+    // 且结果本身不变（防「差分通过但两条路径一起错」）
+    assert_eq!(
+        out1.lines().filter(|l| !l.trim().is_empty()).count(),
+        4,
+        "TEA 程序的 4 行输出应不变; 实得 {out1}"
     );
 }
 
 /// **差分失败必须**默认可见**（D36 已修「静默降级」）。
 ///
-/// 这是本轮最该钉住的一条 —— 若它退��静默，用户会以为在跑 9 层管线，
+/// 这是本轮最该钉住的一条 —— 若它退回静默，用户会以为在跑 9 层管线，
 /// 实际跑的是回落路径。
+///
+/// ## D412：换样本（性质不变，样本失效）
+///
+/// 原样本是 `tea_standalone.mora`，它**不再回落**（D412 修好）⇒ 拿它测
+/// 「差分失败可见」已无意义。改用 `worker` —— `nine_layer_fallback_census`
+/// 实测它**仍在回落**（9 层降级链里没有 `Worker` 类别），
+/// 正是回落集合清空后仅剩的形态之一。
+///
+/// ⚠ 若将来 `worker` 也不回落了，本条需要**再换样本**，而不是删掉 ——
+///   「差分失败不得静默」这条性质与用哪个样本无关。
 #[test]
 fn d364_differential_failure_is_never_silent() {
-    let fixture = std::path::Path::new(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/tests/fixtures/e2e/tea_standalone.mora"
-    ));
+    let dir = std::env::temp_dir().join("mora_d364_visibility");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("建临时目录");
+    let script = dir.join("worker.mora");
+    // 9 层降级链无 `Worker` 类别 ⇒ 差分失败（见 nine_layer_fallback_reasons）。
+    std::fs::write(&script, "worker w do\n  print(1)\nend\n").expect("写脚本");
+
     let exe = concat!(env!("CARGO_MANIFEST_DIR"), "/target/debug/mora.exe");
     // **不设** MORA_9LAYER_DEBUG —— D36 的修复就是让它默认可见
-    let out = Command::new(exe).arg(fixture).output().expect("跑 mora");
+    let out = Command::new(exe).arg(&script).output().expect("跑 mora");
     let err = String::from_utf8_lossy(&out.stderr).into_owned();
+    let _ = std::fs::remove_dir_all(&dir);
     assert!(
         err.contains("差分失败") && err.contains("MORA_9LAYER_DEBUG"),
-        "差分失败必须**默认打一行摘要**并指向 DEBUG 开关（D36 已修「静默降级」）; stderr={err}"
+        "差分失败必须**默认打一行摘要**并指向 DEBUG 开关（D36 已修「静默降级」）。\n\
+         ⚠ 若 `worker` 形态也已走上管线，请**换一个仍会回落的样本**，不要删掉本条。\n\
+         stderr={err}"
     );
 }

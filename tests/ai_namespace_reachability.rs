@@ -55,7 +55,7 @@ use std::sync::Arc;
 
 use mora::interpreter::Interpreter;
 use mora::mir::effect::Effects;
-use mora::mir::vm::run_mir;
+use mora::mir::vm::execute;
 
 fn run(src: &str) -> Result<mora::value::Value, String> {
     let (func, witnesses) =
@@ -67,7 +67,7 @@ fn run(src: &str) -> Result<mora::value::Value, String> {
     let arc = Arc::new(func);
     let mut interp = Interpreter::new();
     let mut env = interp.take_env();
-    run_mir(&arc, &mut interp, &mut env, &mut Effects::new())
+    execute(&arc, &mut interp, &mut env, &mut Effects::new())
 }
 
 /// `ai` 命名空间当前只暴露 `chat` / `critic` / `tokens` 三个方法。

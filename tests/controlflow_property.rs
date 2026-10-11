@@ -371,7 +371,7 @@ fn check(stmts: Vec<Stmt>, init: [f64; 3]) {
         .unwrap_or_else(|e| panic!("compile failed:\n{src}\nerror: {e}"));
     let mut interp = mora::interpreter::Interpreter::new();
     let mut env = interp.take_env();
-    let got = mora::mir::vm::run_mir(
+    let got = mora::mir::vm::execute(
         &std::sync::Arc::new(func),
         &mut interp,
         &mut env,
@@ -510,7 +510,7 @@ proptest! {
             .map_err(|e| TestCaseError::fail(format!("compile failed:\n{src}\nerror: {e}")))?;
         let mut interp = mora::interpreter::Interpreter::new();
         let mut env = interp.take_env();
-        let got = mora::mir::vm::run_mir(
+        let got = mora::mir::vm::execute(
             &std::sync::Arc::new(func),
             &mut interp,
             &mut env,

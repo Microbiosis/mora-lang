@@ -248,11 +248,16 @@ fn d328_status_quo_partial_and_compose_results_are_unappliable() {
         "`compose(...)()` 零参调用当前会漏过 typeck 并在运行期报元数错误; \
          实得 exit={code} out={got}"
     );
-    // 内联 postfix 是 D123 记档的语法缺口
+    // 内联 postfix：v0.104.6 补齐后**已可用**（此前 D123 记为语法缺口）。
+    //
+    // ⚠ 本条走**真实 CLI**（含 typeck），所以它证明的不只是 `run_mir` 能算 ——
+    // 是「解析 + MIR 的 CallValue + typeck 的 Evaluated 被调者」三段都通。
+    // 实得 `3.0`（= `curry(x+1, 1)` 取回 1 元闭包，再喂 `2`）。
     let (code, got) = run("print(curry(fn(x) x+1 end, 1)(2))\n", "curry_inline");
     assert_eq!(
-        code, 2,
-        "内联 `curry(...)(...)` 是 D123 记档的 postfix 语法缺口，当前应解析失败; \
+        (code, got.as_str()),
+        (0, "3.0"),
+        "内联 `curry(...)(...)` 自 v0.104.6 补齐 postfix 值调用后应可用且取值为 3; \
          实得 exit={code} out={got}"
     );
 }

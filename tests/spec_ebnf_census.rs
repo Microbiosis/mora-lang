@@ -73,6 +73,10 @@ const PRODUCTIONS: &[(&str, &str)] = &[
     // 本表把每条产生式的最小实例**喂给 parser**，故这节文法由它持续验收 ——
     // spec 若改错形状，这里立刻红。
     ("params", "let f = fn(x) x + 1\nprint(f(1))\n"),
+    // v0.104.6：形参类型标注已实现（`annotated_params` 用于 task / 闭包 fn）。
+    ("annotated_params", "task t(a: number)\n  print(a)\nend\n"),
+    // v0.104.6：泛型声明子句 `task f<T>(…)`。
+    ("type_params", "task t<T>(a: T)\n  print(a)\nend\n"),
     ("variable", "let v = 1\nprint(v)\n"),
     ("call", "let c = print(1)\n"),
     (
@@ -80,6 +84,11 @@ const PRODUCTIONS: &[(&str, &str)] = &[
         "let m = [1, 2, 3]\nlet g = m.get(0)\nprint(g)\n",
     ),
     ("index", "let m = [1, 2, 3]\nprint(m[0])\n"),
+    // v0.104.6 D123 补齐的 `primary` / `postfix` 两条。`postfix` 的最小实例
+    // 取**值调用**形态 `(primary)(args)` —— 正是此前 spec 推导不出、parser
+    // 硬报错的那一形态。
+    ("primary", "let v = 1\nprint(v)\n"),
+    ("postfix", "print((fn(x) x * 2 end)(5))\n"),
     (
         "bindings",
         "with model = \"m\", temperature = 0.7\n  print(1)\nend\n",

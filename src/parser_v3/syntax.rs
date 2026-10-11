@@ -703,6 +703,56 @@ impl ParserV3 {
     // 类型注解解析（含 union / 泛型）
     // ════════════════════════════════════════════════════════════════
 
+    /// v0.104.6：解析泛型声明子句 `f<T, U>`（紧跟 `task` / `fn` 名字、形参之前）。
+    ///
+    /// 无 `<` ⇒ 非泛型：返回空 `Vec`（与本刀之前逐字等价）。
+    /// 有 `<` ⇒ 解析逗号分隔的**类型参数名**（标识符，不是类型标注），存入
+    /// [`ParserV3::generic_params`] 供形参/返回标注把裸名认作 `Type::TypeVar`，
+    /// 并返回各参数的**首字母**列表（`Type::TypeVar` 是单 `char`）。
+    ///
+    /// 首字母重复时**报错**（`TT` 与 `UU` 都映射到 `'T'` 会静默合并两个类型参数）。
+    /// `fresh_type_var_id` 只发控制字符（`' '`…），故用户声明的类型变量不会与之
+    /// 撞名，无需另做规避。
+    pub(super) fn parse_generic_clause(&mut self) -> Option<Vec<char>> {
+        if !self.match_token(&[TokenType::Less]) {
+            return Some(Vec::new());
+        }
+        let mut names: Vec<String> = Vec::new();
+        loop {
+            let n = self.consume_identifier("Expected type parameter name")?;
+            names.push(n);
+            if self.match_token(&[TokenType::Comma]) {
+                continue;
+            }
+            break;
+        }
+        if !self.match_token(&[TokenType::Greater]) {
+            eprintln!(
+                "Parse error: expected '>' after type parameters at line {}",
+                self.current_line()
+            );
+            return None;
+        }
+        // 首字母去重校验（见文档注释）。
+        let mut seen: Vec<char> = Vec::new();
+        let mut chars = Vec::with_capacity(names.len());
+        for n in &names {
+            let c = n.chars().next().expect("非空标识符必有首字符");
+            if seen.contains(&c) {
+                eprintln!(
+                    "Parse error: generic type parameter names must start with distinct \
+                 characters ('{c}' repeated) at line {}",
+                    self.current_line()
+                );
+                return None;
+            }
+            seen.push(c);
+            chars.push(c);
+        }
+        self.generic_params = names;
+        Some(chars)
+    }
+
     pub(super) fn parse_type_annotation(&mut self) -> Option<crate::typeck::Type> {
         use crate::typeck::Type;
         // v0.85: 先解析一个基础类型，再收集 `|` 分隔的 union 成员
@@ -881,6 +931,24 @@ impl ParserV3 {
                     "any" => Type::Any,
                     "unknown" => Type::Unknown,
                     other => {
+                        // v0.104.6：**泛型声明的类型参数**在作用域内是类型变量
+                        // （`task f<T>(x: T)`）。不加「全局大写即类型变量」规则 ——
+                        // 那会让 `let x: Foo` 到处静默变成类型变量，过松。
+                        // 仅当该名字是**当前泛型声明**显式声明的参数时才认。
+                        if let Some(stored) = self
+                            .generic_params
+                            .iter()
+                            .find(|p| p.to_lowercase() == other)
+                            .cloned()
+                        {
+                            self.advance();
+                            // `Type::TypeVar` 是单 `char`，取**存储的原始名**首字母
+                            //（不是 lowercased 的 `other`）—— 必须与 `type_params`
+                            // 里存的字符一致，否则 `ForAll` 量化不到它，两次调用会被
+                            // 当同一类型统一（实测 `id(1); id("s")` 报 float/string）。
+                            let c = stored.chars().next().expect("非空标识符必有首字符");
+                            return Some(Type::TypeVar(c));
+                        }
                         eprintln!(
                             "Parse error: unsupported type annotation '{}' at line {}",
                             other,

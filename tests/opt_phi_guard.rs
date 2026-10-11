@@ -221,33 +221,41 @@ fn loop_carried_register_makes_construct_emit_phis() {
     );
 }
 
-/// **phi 的 `incoming` 恒为空** —— D312 取保守方向的**直接理由**。
+/// **phi 的 `incoming` 覆盖每个前驱** —— D418 已把本条从「现状断言」翻转成
+/// **正确行为断言**。
 ///
-/// `insert_phi_nodes` 以 `incoming: Vec::new()` 建 phi；`rename_variables` 收的
-/// 是 `phi_map: &HashMap<…>`（**不可变引用**）且内部用 `clone()` ⇒ 无处可写。
-/// `deconstruct` 的 `pred_copies` 唯一来源就是 `phi.incoming` ⇒ 前驱 copy
-/// 一条都不发出 ⇒ phi 目标寄存器**没有生产者**。
+/// 翻转前的记档（D312 现状）：`insert_phi_nodes` 以 `incoming: Vec::new()`
+/// 建 phi，而 `rename_variables` 收的是 `phi_map: &HashMap<…>`（**不可变
+/// 引用**）且内部用 `clone()` ⇒ 全函数无处可写 ⇒ `deconstruct` 的
+/// `pred_copies` 唯一来源恒空 ⇒ **前驱 copy 一条都不发出** ⇒ phi 目标寄存器
+/// 没有生产者 ⇒ 循环变量永不递增（D312 实测：`--opt=1` 静默中止）。
 ///
-/// 如果将来实现了教科书式的支配树 DFS + 逐前驱边记录 incoming，
-/// **这条会红 —— 那是好信号**：那时应当把 D312 的保守守卫换成真正的修复。
+/// D418 的修法：`Phi` 增 `var`（原始变量编号 —— `dst` 会被重命名覆盖，而
+/// 回边指向的祖先块其 `dst` 早已是新号），`rename_variables` 改为**支配树
+/// DFS**（进块压栈 / 出块弹栈 / 逐 CFG 边记录 `φ.incoming.push((前驱, 该前驱
+/// 出口处的版本))`），`opt.rs` 的 phi 守卫随之删除。
 #[test]
-fn phi_incoming_is_always_empty_today() {
+fn phi_incoming_covers_every_predecessor_d418() {
     let ssa = mora::mir::ssa::construct(&for_loop_mir());
     let total_phi: usize = ssa.blocks.iter().map(|b| b.phis.len()).sum();
-    let total_incoming: usize = ssa
-        .blocks
-        .iter()
-        .flat_map(|b| b.phis.iter())
-        .map(|p| p.incoming.len())
-        .sum();
     assert!(total_phi > 0, "前提：应当至少有一个 phi; 实得 {total_phi}");
-    assert_eq!(
-        total_incoming, 0,
-        "**D312 现状**：`phi.incoming` 恒为空 ⇒ `deconstruct` 发不出任何前驱 copy。\n\
-         实得 total_phi={total_phi} total_incoming={total_incoming}。\n\
-         若本条失败（total_incoming > 0）：phi 机制已生效，请把 `opt.rs` 的 D312 \
-         保守守卫换成真正的 SSA 修复，并重跑 56 个真实程序的差分。"
-    );
+    for b in &ssa.blocks {
+        let mut preds = b.preds.clone();
+        preds.sort();
+        preds.dedup();
+        for phi in &b.phis {
+            let mut got: Vec<usize> = phi.incoming.iter().map(|(p, _)| *p).collect();
+            got.sort();
+            got.dedup();
+            assert_eq!(
+                got, preds,
+                "**D418**：块 {} 的 phi(var={}) 的 incoming 前驱 {:?} 与该块前驱 {:?} 不一致。\n\
+                 少一条 incoming ⇒ `deconstruct` 少插一条回边 copy ⇒ 该值在回边上\
+                 没有生产者（D312 观测到的静默中止）。",
+                b.id, phi.var, got, preds
+            );
+        }
+    }
 }
 
 /// **守卫不宽**：直线函数不产生 phi，**仍然走 SSA 优化**。

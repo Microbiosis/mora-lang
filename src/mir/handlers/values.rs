@@ -10,7 +10,7 @@ use crate::flow::eval_binary;
 
 use crate::mir::host::MirHost;
 
-use crate::mir::vm::{index_assign_value, index_value, run_mir, value_to_string};
+use crate::mir::vm::{execute, index_assign_value, index_value, value_to_string};
 
 use crate::mir::{MirFunction, Reg};
 
@@ -96,7 +96,7 @@ pub fn h_call(
             child_env.define(param.clone(), val, false);
         }
         // v0.75.9: 包裹 Arc 走全局 DAG 缓存（task body 借自指令表）
-        run_mir(&Arc::new((*body).clone()), interp, &mut child_env, effects)?
+        execute(&Arc::new((*body).clone()), interp, &mut child_env, effects)?
     } else if let Some(callable) = env.get(name) {
         // v0.75.76: 用户自定义 callable（Closure/Task/Compose/Partial）在
         // 执行 env 中直调（与 h_define 同一容器，无回落）；其余名（builtin、
@@ -184,6 +184,24 @@ pub fn h_pipe(
     let lhs_val = regs[lhs].clone();
     let rhs_val = regs[rhs].clone();
     regs[dst] = interp.call_value(&rhs_val, vec![lhs_val], effects)?;
+    Ok(())
+}
+
+/// v0.104.6 D123：**N 元**值调用 `callee(args)`。
+///
+/// 与 [`h_pipe`] 同一底座（`MirHost::call_value`），区别只在于实参个数：
+/// `Pipe` 恒为 1 元（管道语义），本函数承接 `f(x)(a, b)` 这类多参立即调用。
+pub fn h_call_value(
+    regs: &mut [Value],
+    dst: Reg,
+    callee: Reg,
+    args: &[Reg],
+    interp: &mut dyn MirHost,
+    effects: &mut crate::mir::effect::Effects,
+) -> Result<(), String> {
+    let callee_val = regs[callee].clone();
+    let arg_vals: Vec<Value> = args.iter().map(|r| regs[*r].clone()).collect();
+    regs[dst] = interp.call_value(&callee_val, arg_vals, effects)?;
     Ok(())
 }
 

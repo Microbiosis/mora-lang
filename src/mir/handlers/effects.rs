@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use crate::mir::vm::run_mir;
+use crate::mir::vm::execute;
 
 use crate::mir::{MirFunction, Reg};
 
@@ -271,7 +271,7 @@ pub fn h_with_config(
     // config 泄漏进 config_stack 并驻留到后续无关代码。
     let body_result = if jit {
         // v0.75.43: copy-and-patch JIT（零 LLVM）— 直接编译 MirFunction，
-        // 未覆盖指令回落解释器（run_jit Err → run_mir）。
+        // 未覆盖指令回落解释器（run_jit Err → execute）。
         match crate::mir::jit::run_jit(body, interp, &mut child_env) {
             Ok(v) => Ok(v),
             Err(e) => {
@@ -280,7 +280,7 @@ pub fn h_with_config(
                     e
                 );
                 // v0.75.9: 包裹 Arc 走全局 DAG 缓存
-                run_mir(
+                execute(
                     &std::sync::Arc::new((*body).clone()),
                     interp,
                     &mut child_env,
@@ -290,7 +290,7 @@ pub fn h_with_config(
         }
     } else {
         // v0.75.9: 包裹 Arc 走全局 DAG 缓存
-        run_mir(
+        execute(
             &std::sync::Arc::new((*body).clone()),
             interp,
             &mut child_env,
@@ -440,7 +440,7 @@ pub fn h_solve(
 
     // 2. 运行 goal 构建体
     let goal_arc = Arc::new(goal.clone());
-    let built = run_mir(&goal_arc, interp, &mut builder_env, effects)?;
+    let built = execute(&goal_arc, interp, &mut builder_env, effects)?;
     let built_goal = match built {
         Value::Goal(g) => *g,
         other => {
@@ -550,7 +550,7 @@ pub fn h_handle(
     //    （此前用 `env.clone()` 起独立子环境再丢弃，只靠每绑定 Arc<Mutex>
     //    的写穿才让外层赋值可见，是隐式的共享可变状态。）
     let body_arc = std::sync::Arc::new(body.clone());
-    let result = crate::mir::vm::run_mir(&body_arc, interp, env, effects);
+    let result = crate::mir::vm::execute(&body_arc, interp, env, effects);
 
     // 4. 恢复 handler（无论 body 成功/失败）
     interp.restore_effect_handler(effect.to_string(), prev_handler);
@@ -629,7 +629,7 @@ mod tests {
         let (func, _witnesses) =
             crate::parser_v3::ParserV3::compile(src).expect("compile with block");
         let mut env = crate::value::Environment::new();
-        let result = crate::mir::vm::run_mir(
+        let result = crate::mir::vm::execute(
             &std::sync::Arc::new(func),
             &mut interp,
             &mut env,
@@ -650,7 +650,7 @@ mod tests {
         let (func, _witnesses) =
             crate::parser_v3::ParserV3::compile(src).expect("compile with block");
         let mut env = crate::value::Environment::new();
-        crate::mir::vm::run_mir(
+        crate::mir::vm::execute(
             &std::sync::Arc::new(func),
             &mut interp,
             &mut env,

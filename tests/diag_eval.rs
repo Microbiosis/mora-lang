@@ -8,7 +8,7 @@ fn run_mora(source: &str) -> Result<Value, String> {
     let (func, _witnesses) =
         ParserV3::compile(source).map_err(|e| format!("compile error: {}", e))?;
     let func_arc = Arc::new(func);
-    mora::mir::vm::run_mir(
+    mora::mir::vm::execute(
         &func_arc,
         &mut interp,
         &mut env,

@@ -136,12 +136,16 @@ fn d110_parser_actually_works() {
 // D110 逐条钉住：spec 承诺但实现不支持的四类
 // ============================================================
 
-/// **缺口 1**：`task` / `fn` 的**参数类型标注**完全不支持。
+/// **原缺口 1（v0.104.6 已闭合）**：`task` / `fn` 的**参数类型标注**。
 ///
-/// spec 里出现 7 处（`task greet(name: string): string` 等），但
-/// `task f(a: number)` 与 `fn(a: number)` 同样报 `Expected ')' after parameters`。
+/// spec 里出现 7 处（`task greet(name: string): string` 等）。此前
+/// `task f(a: number)` 与 `fn(a: number)` 一律报 `Expected ')' after parameters`，
+/// 本测试曾钉住「不支持」。**该缺口已闭合**（parser 收 `name[: Type]`，标注
+/// 在调用点受约束），故本测试**反转为钉住「已支持」** —— 若将来回归成不支持，
+/// 本测试立刻红。spec §14.2 附近原文 `task greet(name: string): string`
+/// 现在**可直接解析**。
 #[test]
-fn d110_function_parameter_annotations_are_not_supported() {
+fn d110_function_parameter_annotations_are_supported() {
     for (name, src) in [
         ("task_param_annot", "task f(a: number)\n  return a\nend\n"),
         (
@@ -155,12 +159,12 @@ fn d110_function_parameter_annotations_are_not_supported() {
         ),
     ] {
         assert!(
-            ParserV3::compile(src).is_err(),
-            "{name}: 若参数标注**已支持**，则本测试失败 —— 需把缺口 1 从本文件与 \
-             CHANGELOG D110 移除，并更新 docs/mora-spec.md 的相关示例"
+            ParserV3::compile(src).is_ok(),
+            "{name}: 参数标注**应已支持**（v0.104.6 闭合原缺口 1）。\
+             若报 `Expected ')' after parameters`，说明该能力回归了。"
         );
     }
-    // 对照：无标注的同形签名必须可用（否则不是「标注不支持」而是「签名不支持」）
+    // 对照：无标注的同形签名必须仍可用。
     assert!(ParserV3::compile("task f(a)\n  return a\nend\n").is_ok());
     assert!(ParserV3::compile("let g = fn(a) a + 1\nprint(g(1))\n").is_ok());
 }
@@ -429,7 +433,8 @@ fn d118_omitted_end_closure_works_and_does_not_swallow_statements() {
     assert!(ParserV3::compile("print([1, 2].map(fn(x) x + 1 end))\n").is_ok());
     assert!(ParserV3::compile("let f = fn(x) x + 1\nprint(f(2))\n").is_ok());
 
-    // ⚠ `d110_function_parameter_annotations_are_not_supported` 里那条对照断言
+    // ⚠ `d110_function_parameter_annotations_are_supported`（原
+    //   `..._are_not_supported`）里那条对照断言
     //   写的是 `ParserV3::compile("let g = fn(a) a + 1\nprint(g(1))\n").is_ok()` ——
     //   它在 D118 之前**一直通过**，但通过的原因正是缺陷本身：print 被吞进闭包体。
     //   「能编译」与「语义正确」在这里是两回事，那条断言只钉住了前者。
@@ -484,14 +489,14 @@ fn d118_json_needs_double_quotes_not_single() {
 /// 跑一段 Mora 并返回**末表达式**的运行时值（库层观察，`mora run` 不打印它）。
 fn run_mir_last_value(src: &str) -> String {
     use mora::interpreter::Interpreter;
-    use mora::mir::vm::run_mir;
+    use mora::mir::vm::execute;
     use std::sync::Arc;
 
     let (func, _w) = ParserV3::compile(src).expect("compile");
     let mut interp = Interpreter::new();
     let mut env = interp.take_env();
     let arc = Arc::new(func);
-    match run_mir(
+    match execute(
         &arc,
         &mut interp,
         &mut env,

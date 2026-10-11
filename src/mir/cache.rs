@@ -245,7 +245,7 @@ mod tests {
         // 直建路径（baseline）
         let mut interp = Interpreter::new();
         let mut env = interp.take_env();
-        let baseline = crate::mir::vm::run_mir(
+        let baseline = crate::mir::vm::execute(
             &func,
             &mut interp,
             &mut env,

@@ -29,7 +29,7 @@
 
 use mora::interpreter::Interpreter;
 use mora::mir::effect::Effects;
-use mora::mir::vm::run_mir;
+use mora::mir::vm::execute;
 use mora::parser_v3::ParserV3;
 use std::sync::Arc;
 
@@ -38,7 +38,7 @@ fn run(src: &str) -> Result<String, String> {
     let mut interp = Interpreter::new();
     let mut env = interp.take_env();
     let arc = Arc::new(func);
-    run_mir(&arc, &mut interp, &mut env, &mut Effects::new()).map(|v| format!("{v}"))
+    execute(&arc, &mut interp, &mut env, &mut Effects::new()).map(|v| format!("{v}"))
 }
 
 const SETUP: &str = r#"

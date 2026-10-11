@@ -9,7 +9,7 @@
 //! 走 run_mir，不回退到 arena-based call_task_inner AST 路径。
 
 use mora::interpreter::Interpreter;
-use mora::mir::vm::{run_main_task, run_mir};
+use mora::mir::vm::{execute, run_main_task};
 use mora::parser_v3::ParserV3;
 use mora::typeck::check_mir::check_program_witnesses_bidirectional;
 
@@ -22,7 +22,7 @@ fn run_via_mir(source: &str) -> Result<(), String> {
     let mut interp = Interpreter::new();
     let mut env = interp.take_env();
     let func_arc = std::sync::Arc::new(func);
-    run_mir(
+    execute(
         &func_arc,
         &mut interp,
         &mut env,

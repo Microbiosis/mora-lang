@@ -31,29 +31,13 @@ pub struct MirSsaFunction {
     pub params: Vec<(String, SsaReg)>,
     pub blocks: Vec<BasicBlock>,
     pub entry: BlockId,
-    /// v0.75.30: 声明型指令透传 — construct 中被跳过（SSA 不优化声明）的
-    /// 指令（TaskDef/ToolDef/Import/StructDef/...）原样收集，deconstruct 时
-    /// 还原到 body 头部。此前这些指令被丢弃 → `--opt` 下 task main 消失
-    /// （MORA_OPT=1 默认关掩盖了该 bug，CLI 显式化后暴露）。
-    pub passthrough: Vec<MirInst>,
-    /// v0.104.6 D304：**进入 SSA 之前**的 `MirFunction::n_regs`。
+    /// v0.104.6 D418：版本号计数器的终值 = **SSA 寄存器空间的大小**。
     ///
-    /// `passthrough` 里的指令是**原样回插**的 —— 它们的寄存器号仍是
-    /// **重命名前**的编号，而 body 其余部分已被 `map_ssa` 压进
-    /// `0..next_plain_reg`。若只按 `next_plain_reg` 设 `n_regs`，
-    /// 透传指令引用的寄存器就会**越界**：
-    ///
-    /// ```text
-    /// Runtime error (MIR): internal: instruction at DAG node 5
-    /// references register 5 (read/write) but the function only has
-    /// 1 register(s) — a unit-statement emitter returned an unallocated
-    /// sentinel register
-    /// ```
-    ///
-    /// 取 `max(next_plain_reg, orig_n_regs)`：透传指令引用的每一个寄存器
-    /// 都 < 原始 `n_regs`（它们就是原始编号），故这是**可靠上界**，
-    /// 且多分配几个寄存器是无害的（只多几个 `Value` 槽）。
-    pub orig_n_regs: usize,
+    /// 形参占 `0..params.len()`，此后每次定义（phi 与指令各算一次）`+1`。
+    /// 于是「任一被定义的寄存器 `< n_versions`」是一条精确的不变式：
+    /// **任何漏掉重命名的块都会暴露** —— 它保留的是原始物理编号，可能超出
+    /// 这个空间（未重命名的症状正是 D312 观测到的「部分重命名」）。
+    pub n_versions: SsaReg,
 }
 
 // v0.75.82: RegType 已删除 — 死类型推断（零消费者）。infer_types 全仓
@@ -75,7 +59,21 @@ pub struct BasicBlock {
 /// Phi 节点
 #[derive(Debug, Clone)]
 pub struct Phi {
+    /// phi 结果的 **SSA 版本号** —— 由 `rename_variables` 分配（fresh）。
     pub dst: SsaReg,
+    /// phi 合并的**原始变量编号**。
+    ///
+    /// v0.104.6 D418：`dst` 会被重命名覆盖，而**回边上的 incoming 必须按
+    /// 原始编号查 rename 栈**（回边指向的祖先/自身块早已重命名完毕，
+    /// 那里 `dst` 已是新号）。没有这个字段就只能在「phi 尚未重命名」时
+    /// 记录 incoming —— 而那恰好排除了全部回边。
+    pub var: SsaReg,
+    /// `(前驱块, 该前驱出口处可见的 SSA 版本)`。
+    ///
+    /// v0.104.6 D418：此前**恒为空** —— `insert_phi_nodes` 以
+    /// `incoming: Vec::new()` 建，而 `rename_variables` 收的是不可变引用且
+    /// 内部 `clone()`，无处可写 ⇒ `deconstruct` 一条前驱 copy 都不发 ⇒
+    /// phi 目标寄存器**没有生产者**。
     pub incoming: Vec<(BlockId, SsaReg)>,
 }
 
@@ -86,6 +84,8 @@ pub enum SsaInst {
     Var(SsaReg, String),
     BinaryOp(SsaReg, SsaReg, BinaryOp, SsaReg),
     Call(SsaReg, String, Vec<SsaReg>),
+    /// N 元值调用（被调者在寄存器里）—— 对应 [`MirInst::CallValue`]。
+    CallValue(SsaReg, SsaReg, Vec<SsaReg>),
     ListLit(SsaReg, Vec<SsaReg>),
     DictLit(SsaReg, Vec<(String, SsaReg)>),
     Index(SsaReg, SsaReg, SsaReg),
@@ -97,6 +97,32 @@ pub enum SsaInst {
     Define(String, SsaReg),
     Assign(String, SsaReg),
     Expr(SsaReg),
+    /// v0.104.6 D417：**不透明指令** —— SSA 不为其建模语义（声明型 /
+    /// effectful：`Closure` / `MatchExpr` / `Handle` / `TaskDef` / `RelDef` …），
+    /// 但它**与普通指令走同一条重命名路径**：输入经 `map_regs` 解析、
+    /// 输出按 `written_reg()` 分配 fresh 版本号。
+    ///
+    /// ## 为什么必须是 IR 的一等变体，而不是「收集起来事后拼回去」
+    ///
+    /// 旧做法（v0.75.30 ~ v0.104.6 D316）是：把这类指令抽进
+    /// `MirSsaFunction::passthrough`，`deconstruct` 时用 `chain` **整体前插**
+    /// 到 body 头部。于是：
+    ///
+    /// - **两套寄存器空间**：它们的寄存器不参与重编号，同函数其余指令却会
+    ///   （D310 实测：闭包写 r8 而 `map` 读 r2）。
+    /// - **顺序被打乱**：`passthrough` 只按顺序收集、不记原始位置，
+    ///   前插后声明型指令跑到了使用者之前/之后都取决于原位置。
+    /// - **`n_regs` 只能靠 `max(next_plain_reg, orig_n_regs)` 掩盖**越界
+    ///   （D304）—— 值是错的，只是没报错。
+    ///
+    /// 三条都源于同一个结构缺陷：**`construct` 把指令从 IR 里丢出去，
+    /// 再在降维时猜着放回来**。放进 `insts` 之后，顺序由位置保证、
+    /// 寄存器由重命名保证、`n_regs` 由 `map_ssa` 的实际分配保证，
+    /// 三条缺陷同时消失，不需要任何回填映射。
+    ///
+    /// SSA pass 对它一律**保守**：不可删除（[`crate::mir::opt`] 的 DCE）、
+    /// 不可外提（LICM）、只做寄存器替换。
+    Opaque(MirInst),
 }
 
 /// 基本块 terminator
@@ -108,6 +134,20 @@ pub enum Terminator {
     Return(Option<SsaReg>),
     Break(BlockId),
     Continue(BlockId),
+    /// v0.104.6 D419：**跳到函数末尾**（`Jump(end)` 且 `end == body.len()`）。
+    ///
+    /// 它与 [`Terminator::Return`] 是**两件事**，此前被混成同一个：
+    /// `split_into_ssa` 把越界跳转目标映成 `Return(None)`，而
+    /// `deconstruct` 又把 `Return(None)` **丢弃**（「落下去，线性执行自然
+    /// 进入下一块」）—— 于是那条跳转彻底消失，块与块之间再无控制转移。
+    ///
+    /// 实测（D313）：`if 1 > 0 / print(7) / else / print(8) / end`（`if` 是最后
+    /// 一句）在 `--opt=1` 下**两个分支都执行** ⇒ 副作用重复（重复写文件、
+    /// 重复扣款、重复发送），而程序看起来一切正常、退出码 0。
+    ///
+    /// 降维时它必须产出**真正的终止指令**（见 `deconstruct.rs`），而不是被
+    /// 丢弃的 `Return(None)`。
+    JumpExit,
     Unreachable,
 }
 
@@ -186,19 +226,9 @@ pub fn construct(func: &MirFunction) -> MirSsaFunction {
                 succs: Vec::new(),
             }],
             entry: 0,
-            passthrough: Vec::new(),
-            orig_n_regs: func.n_regs,
+            n_versions: func.params.len(),
         };
     }
-
-    // v0.75.30: 声明型指令透传 — 原样保留跳过列表中的指令（TaskDef 等），
-    // deconstruct 时还原。此前被丢弃 → `--opt` 下 task main 消失。
-    let passthrough: Vec<MirInst> = func
-        .body
-        .iter()
-        .filter(|i| is_ssa_passthrough(i))
-        .cloned()
-        .collect();
 
     let label_to_pos = find_label_targets(&func.body);
     let block_starts = find_block_starts(&func.body, &label_to_pos);
@@ -244,7 +274,7 @@ pub fn construct(func: &MirFunction) -> MirSsaFunction {
         })
         .collect();
 
-    for block in blocks.iter_mut() {
+    for (bid, block) in blocks.iter_mut().enumerate() {
         let mut succs = Vec::new();
         match &block.terminator {
             Terminator::Jump(t) | Terminator::Break(t) | Terminator::Continue(t) => {
@@ -262,14 +292,69 @@ pub fn construct(func: &MirFunction) -> MirSsaFunction {
             }
             _ => {}
         }
+        // v0.104.6 D312 根因之一：`Return(None)` 在 `deconstruct` 里的真实
+        // 语义是「**落下去**」（该 terminator 被降维成 `Label(usize::MAX)`
+        // 后跳过，线性执行自然进入下一块），但 CFG 侧把它当终点 ⇒ 顺序后继
+        // 边缺失 ⇒ 后继块 `preds` 为空、遍历从 `vec![0]` 出发走不到 ⇒
+        // **该块整块未被重命名**（部分重命名，把跨块的值定义与使用拆成两个
+        // 物理寄存器；实测 `for` 循环里 r9 与 r19 永久失联，程序静默截断）。
+        if matches!(block.terminator, Terminator::Return(None)) && bid + 1 < num_blocks {
+            succs.push(bid + 1);
+        }
         block.succs = succs;
     }
     let succs_by_bid: Vec<Vec<BlockId>> = blocks.iter().map(|b| b.succs.clone()).collect();
+
+    // v0.104.6 D418：**只有可达块参与 CFG**。
+    //
+    // 判据是「从入口沿 succs 能到」—— 注意 D417 已经给 `Return(None)` 补了
+    // 顺序后继边，所以 CFG 可达性此时与线性可达性一致（除被 `Jump` /
+    // `Break` 跳过的块，那些是真死代码）。
+    //
+    // 为什么必须先切可达集：`compute_dominators` 用 `⋂_{p ∈ preds} Dom(p)`
+    // 不动点。**死块**的 dom 集是 `{dead}`，它一旦出现在某个可达块的 preds 里，
+    // 那个可达块的 dom 集就被交成空的 ⇒ 它的 idom 变成「无」⇒ 支配树在这里
+    // 断开 ⇒ 后续整棵子树在**空栈**下被重命名 ⇒ 读解析全部落回原始编号。
+    //
+    // 实测症状（`loop_for_break.mora`，`--opt=1` 静默无输出）：`if i == 4 /
+    // break / end` 之后 lowering 仍发射了一段不可达的 join 代码，它成为循环体
+    // 块的一个前驱 ⇒ 循环体块的 dom 集被交空 ⇒ 循环归纳变量的
+    // `__idx += 1` 读到了**从未被写入**的寄存器 ⇒ DAG 节点永不激活 ⇒ 饿死。
+    let mut reachable = vec![false; num_blocks];
+    let mut reach_stack = vec![0usize];
+    while let Some(bid) = reach_stack.pop() {
+        if reachable[bid] {
+            continue;
+        }
+        reachable[bid] = true;
+        for &succ in &succs_by_bid[bid] {
+            if succ < num_blocks && !reachable[succ] {
+                reach_stack.push(succ);
+            }
+        }
+    }
+
     for (bid, succs_copy) in succs_by_bid.iter().enumerate() {
+        if !reachable[bid] {
+            // 死块：不进 CFG —— 清空 pred **与 succ**，让它自成一棵树
+            // （重命名时栈为空）。succ 必须一起清：否则它的边会给**可达后继**
+            // 的 phi 记上一条来自死块的 incoming，而那条 incoming 的源版本
+            // 是在空栈下解析出来的 ⇒ 前驱 copy 去读一个没有生产者的寄存器
+            // ⇒ DAG 节点永不激活 ⇒ 静默饿死。
+            blocks[bid].preds.clear();
+            blocks[bid].succs.clear();
+            continue;
+        }
         for &succ in succs_copy {
             if succ < num_blocks {
                 blocks[succ].preds.push(bid);
             }
+        }
+    }
+    for block in blocks.iter_mut() {
+        if !reachable[block.id] {
+            block.preds.clear();
+            block.succs.clear();
         }
     }
 
@@ -279,16 +364,25 @@ pub fn construct(func: &MirFunction) -> MirSsaFunction {
 
     let mut phi_map: HashMap<(BlockId, SsaReg), Phi> = HashMap::new();
     insert_phi_nodes(&blocks, &dom_frontier, &defs, &mut phi_map);
-    rename_variables(&mut blocks, &phi_map);
 
-    for block in blocks.iter_mut() {
-        let block_phis: Vec<Phi> = phi_map
-            .iter()
-            .filter(|(key, _)| key.0 == block.id)
-            .map(|(_, phi)| phi.clone())
-            .collect();
-        block.phis = block_phis;
+    // v0.104.6 D417：phi **先装进块、再重命名** —— `rename_variables` 要把
+    // fresh 版本号写回 `phi.dst`（此前只压栈不写回，phi 仍占原编号 ⇒ 与被
+    // 重编号的普通指令撞号，D256 实测 6 处）。
+    //
+    // 装入顺序按原始 dst 升序：`phi_map` 是 `HashMap`，直接 `.iter()` 的
+    // 顺序不确定 ⇒ SSA 编号不确定 ⇒ 同一份源码两次编译产出不同 MIR。
+    let mut by_block: HashMap<BlockId, Vec<Phi>> = HashMap::new();
+    for (&(bid, _), phi) in phi_map.iter() {
+        by_block.entry(bid).or_default().push(phi.clone());
     }
+    for v in by_block.values_mut() {
+        v.sort_by_key(|p| p.var);
+    }
+    for block in blocks.iter_mut() {
+        block.phis = by_block.remove(&block.id).unwrap_or_default();
+    }
+
+    let n_versions = rename_variables(&mut blocks, &idom, func.params.len(), func.n_regs);
 
     MirSsaFunction {
         params: func
@@ -299,8 +393,7 @@ pub fn construct(func: &MirFunction) -> MirSsaFunction {
             .collect(),
         blocks,
         entry: 0,
-        passthrough,
-        orig_n_regs: func.n_regs,
+        n_versions,
     }
 }
 
@@ -418,8 +511,10 @@ fn split_into_ssa(
             MirInst::Jump(l) => {
                 let target =
                     resolve_jump_target(*l, label_to_bid, start_to_bid, bid, false, total_body_len);
+                // v0.104.6 D419：跳到 body 之外 = **跳到函数末尾**，不是
+                // 「返回」也不是「落进下一块」。见 `Terminator::JumpExit`。
                 return if target == BlockId::MAX {
-                    (ssa_insts, Terminator::Return(None))
+                    (ssa_insts, Terminator::JumpExit)
                 } else {
                     (ssa_insts, Terminator::Jump(target))
                 };
@@ -467,12 +562,20 @@ fn split_into_ssa(
             MirInst::Break(l) => {
                 let target =
                     resolve_jump_target(*l, label_to_bid, start_to_bid, bid, false, total_body_len);
-                return (ssa_insts, Terminator::Break(target));
+                return if target == BlockId::MAX {
+                    (ssa_insts, Terminator::JumpExit)
+                } else {
+                    (ssa_insts, Terminator::Break(target))
+                };
             }
             MirInst::Continue(l) => {
                 let target =
                     resolve_jump_target(*l, label_to_bid, start_to_bid, bid, false, total_body_len);
-                return (ssa_insts, Terminator::Continue(target));
+                return if target == BlockId::MAX {
+                    (ssa_insts, Terminator::JumpExit)
+                } else {
+                    (ssa_insts, Terminator::Continue(target))
+                };
             }
             MirInst::Label(_) => continue,
 
@@ -491,6 +594,13 @@ fn split_into_ssa(
                     *l as SsaReg,
                     op.clone(),
                     *r as SsaReg,
+                ));
+            }
+            MirInst::CallValue(dst, callee, args) => {
+                ssa_insts.push(SsaInst::CallValue(
+                    *dst as SsaReg,
+                    *callee as SsaReg,
+                    args.iter().map(|a| *a as SsaReg).collect(),
                 ));
             }
             MirInst::Call(dst, callee, args) => {
@@ -559,214 +669,74 @@ fn split_into_ssa(
             MirInst::Expr(reg) => {
                 ssa_insts.push(SsaInst::Expr(*reg as SsaReg));
             }
-            MirInst::TaskDef { .. }
-            | MirInst::Import(_)
-            | MirInst::ExportMark(_)
-            | MirInst::WithConfig { .. }
-            | MirInst::MatchExpr { .. }
-            | MirInst::Closure { .. }
-            | MirInst::TypeAlias { .. }
-            // v0.80: algebraic effects — Perform/Handle 不进入 SSA 线性化（v0.75
-            // 已知 SSA 对 Send/WithConfig 等 effectful 指令同样 pass-through，
-            // 后续 Stage 2.x 升级到 multi-shot continuation 时，这里要
-            // 单独处理 —— 当前保持 pass-through 行为）。
-            | MirInst::Perform { .. }
-            | MirInst::Handle { .. }
-            | MirInst::EnumDef { .. }
-            | MirInst::StructDef { .. }
-            // v0.83: TEA definitions — compile-time only, pass-through
-            // v0.102: 声明式范式 — RelDef 声明型；Solve 与 Perform 同属
-            // effectful 指令，SSA 不线性化（pass-through）
-            | MirInst::RelDef { .. }
-            | MirInst::Solve { .. }
-            | MirInst::ModelDef { .. }
-            | MirInst::MsgDef { .. }
-            | MirInst::UpdateDef { .. }
-            | MirInst::AppDef { .. }
-            | MirInst::Transaction { .. }
-            | MirInst::Send { .. }
-            | MirInst::Aggregate { .. }
-            | MirInst::Rollback
-            // α.5: 宏/运行时/可观测性 — SSA 中跳过
-            | MirInst::MacroDef { .. }
-            | MirInst::Commit
-            | MirInst::Worker { .. }
-            | MirInst::Parallel { .. }
-            | MirInst::Observe { .. }
-            | MirInst::Span { .. }
-            // α.7: 类型系统 — SSA 中跳过
-            | MirInst::TraitDef { .. }
-            | MirInst::ImplDef { .. }
-            // α.8: 高级特性 — SSA 中跳过
-            | MirInst::Orchestrate { .. }
-            | MirInst::Eval { .. }
-            | MirInst::PromptSection { .. }
-            | MirInst::DocumentSection { .. } => {}
-            // v0.88: Quasiquote — 纯指令，SSA 中跳过
-            | MirInst::Quasiquote { .. } => {}
-            | MirInst::DynTrait { .. } => {}
+            // v0.104.6 D417：SSA 不为其余变体建模语义，但**留在原位**、
+            // 参与重命名。此前它们被丢出 IR 再由 deconstruct 前插回 body 头部
+            // ⇒ 两套寄存器空间 + 顺序被打乱 + `n_regs` 靠 `max()` 掩盖。
+            // 覆盖集合由 `MirInst` 的其余全部变体构成，编译器强制新变体
+            // 必须在此显式表态（不会静默落入「丢弃」）。
+            _ => ssa_insts.push(SsaInst::Opaque(inst.clone())),
         }
     }
 
     (ssa_insts, Terminator::Return(None))
 }
 
-/// v0.75.30: 声明型指令 — SSA 构造跳过（不优化声明），deconstruct 还原。
-/// 与 `split_into_ssa` 的跳过列表同源（单点谓词，防两处漂移）。
-///
-/// v0.104.6 D310：这些指令的寄存器**不参与 SSA 重编号**，而同一函数里其余
-/// 指令会重编号 ⇒ 两者一旦同处一个函数就出现两套寄存器空间
-/// （`Closure` 写 r8 而 `map` 读 r2）。故 `crate::mir::opt::optimize`
-/// 在见到它们时**整体跳过 SSA**。
-pub fn has_passthrough_inst(func: &MirFunction) -> bool {
-    func.body.iter().any(is_ssa_passthrough)
-}
+// ── v0.104.6 D419：已删除的越界跳转守卫 ─────────────────────────────
+//
+// `has_out_of_range_jump` 曾守：body 里有**跳到 body 之外**的控制转移
+// （`Jump(end)` 且 `end == body.len()`，`if` 是最后一句 + `IfSimplifyRule`
+// 删掉恒不跳的 `JumpIfNot` 就会留下它）。
+//
+// 旧 SSA 把「越界跳转」映成 `Terminator::Return(None)`，而 `Return(None)` 在
+// 降维时是**被丢弃**的（「落下去，线性执行自然进入下一块」）⇒ 那条跳转彻底消失
+// ⇒ 块与块之间再无控制转移 ⇒ **两个分支都执行**。
+//
+// 现在有 [`Terminator::JumpExit`] 专门表达「跳到函数末尾」，它与「返回」/「落进
+// 下一块」彻底分开，不再需要事后猜测。详见 `opt.rs` 里 D419 的说明注释与
+// `tests/opt_out_of_range_jump_guard.rs`。
+//
 
-/// v0.104.6 D313：body 里存在**跳到 body 之外**的控制转移 —— SSA/DAG 路径会
-/// 把这种块结构拆散。
+// ── v0.104.6 D417：已删除的 SSA 门 ─────────────────────────────────
+//
+// `has_register_carrying_passthrough` 曾守的缺陷是「一个函数内两套寄存器
+// 空间」：`Closure` / `MatchExpr` / `WithConfig` / `Perform` / `Handle` /
+// `Solve` / `DynTrait` / `Quasiquote` 的**写寄存器**不参与重编号，而同函数
+// 其余指令会（D310 实测：闭包写 r8 而 `map` 读 r2）。后果是静默的 ——
+// `function_call.mora` 在 `--opt=1/2` 下无输出、退出码 0。
+//
+// 当时的两个「掩盖」：`deconstruct` 的 `n_regs.max(orig_n_regs)`（撑大帧，
+// **值是错的、只是没越界报错**）与 `opt::optimize` 的整体跳过（安全，但 57 个
+// fixture 里 14 个拿不到优化）。D311 曾试图按 `input_regs()` 收窄判据，
+// 实测是错的 —— 冲突来自**写**不是**读**。
+//
+// D417 把这些指令改成 [`SsaInst::Opaque`] **留在原位**参与同一条重命名路径
+// （读经 `map_regs`、写分配 fresh 版本号），门随之删除。详见
+// `SsaInst::Opaque` 的文档注释与 `tests/ssa_passthrough_remap.rs`。
+
+/// 计算每个块的**立即支配者**（`idom`）。
 ///
-/// ## 缺陷背景（实测，逐条转储 construct 前后）
+/// ## 支配集是**极大**不动点，不是极小不动点
 ///
-/// 源程序 `if 1 > 0 / print(7) / else / print(8) / end`（`if` 是最后一句）
-/// 经 `apply_rules`（**两档都跑**，见 `cli/mod.rs:56`）之后变成：
+/// `Dom(b) = {b} ∪ ⋂_{p ∈ preds(b)} Dom(p)` 这个方程有多个解，**支配集是其中
+/// 最大的那个**。因此迭代必须从 `Universe`（全集）**向下收缩**。
+///
+/// 本函数此前从**空集**起步（`preds.is_empty()` 的块才是 `{bid}`，其余为空）
+/// —— 那算的是**极小**不动点，在含回边的 CFG 上它根本不是支配集。实测症状
+/// （嵌套 `for`，`tests/ssa_phi_roundtrip.rs::d418_loop_shapes_survive_every_opt_level` 抓到）：
 ///
 /// ```text
-///  2  Const(2, Bool(true))    ← ConstFoldingRule 折叠 1 > 0
-///  3  Const(4, Float(7.0))
-///  4  Call(5, "print", [4])
-///  5  Copy(9, 5)
-///  6  Jump(10)                ← IfSimplifyRule 删掉了 JumpIfNot，
-///                                只剩这条「跳到 end」的 Jump；而 end = 10
-///                                **已越过 body 末尾（body 只有 0..9）**
-///  7  Const(7, Float(8.0))     ← else 分支紧跟其后
-///  8  Call(8, "print", [7])
-///  9  Copy(9, 8)
+///   dom[0]={0}  dom[1]={1}  dom[2]={2,1}  dom[3]={3}  dom[4]={4,3}  dom[5]={5,3}
 /// ```
 ///
-/// `IfSimplifyRule`（`rule.rs:119`，`Some(true) if is_not => Vec::new()`）
-/// 这个局部改写**本身是对的** —— `JumpIfNot(true, t)` 永不跳，删掉即落下去。
-/// 出问题的是**它留下的结构被下游误读**：
+/// 于是每个块的 idom 都成了**它自己** ⇒ 支配树碎成一堆单点 ⇒ 每棵树都在
+/// **空栈**下被重命名 ⇒ 外层循环的归纳变量 `__idx += 1` 读到从未被写入的
+/// 寄存器 ⇒ `--opt=1` 下内层循环只跑一半（`2,3` 而非 `2,3,3,4`）⇒
+/// **静默少输出、退出码 0**。
 ///
-/// 1. `construct` 的分块规则是 `if lbl < body_len && lbl > 0`；`10 < 10`
-///    为假 ⇒ **不在那里起块** ⇒ CFG 断成互不相连的两块
-///    （实测 `block 0 succs=[]`、`block 1 preds=[]`）。
-/// 2. `deconstruct` 把该 terminal 跳转经 `terminator_to_plain` 映成
-///    `Return(None)`，而 `Return(None)` 是**被丢弃**的（`deconstruct.rs:340`
-///    的 `Label(usize::MAX)` 跳过）⇒ **那条 Jump 彻底消失**。
-/// 3. 第四遍只是把各块**线性拼接** ⇒ then 与 else 之间再无任何控制转移
-///    ⇒ DAG 把两段都当独立链执行 ⇒ **两个分支都跑**。
+/// ## 无前驱的块
 ///
-/// 结果：`--opt=1/2` 下打印 `7.0` **和** `8.0`；opt=off 只打印 `7.0`。
-/// 副作用会**重复发生**（重复写文件、重复扣款、重复发送）—— 程序看起来
-/// 在正常工作，这比静默中止更危险。
-///
-/// ## 为什么守卫落在**输入 MIR** 上而不是 `BasicBlock.preds`
-///
-/// 最直接的修法是让 `deconstruct` 丢掉不可达块，但**判据不能用 `preds`**：
-/// 它正是 D261 记档的「三处缺口」之一（实测 `block 1 preds=[]`，
-/// 而实际存在一条来自 block 0 的边）—— **拿一个已知不可靠的字段去决定
-/// 删除代码**，正是 D276「优化器回滚」教训指向的方向。
-///
-/// 越界跳转目标则是**直接可测的事实**，在 `construct` 之前就能判，
-/// 不依赖任何下游数据结构。
-///
-/// ## 代价
-///
-/// 实测 56 个真实 `.mora`：**零命中**（`apply_rules` 之后没有程序留下
-/// 越界跳转；探针置于 `optimize()` 里所有 early return 之前，避免
-/// 「守卫命中的样本恰好绕过统计点」这种选择偏差）⇒ 对现有程序**零代价**，
-/// 纯粹兜住这个合成形状。
-pub fn has_out_of_range_jump(func: &MirFunction) -> bool {
-    let n = func.body.len();
-    func.body.iter().any(|i| {
-        let target = match i {
-            MirInst::Jump(t)
-            | MirInst::JumpIf(_, t)
-            | MirInst::JumpIfNot(_, t)
-            | MirInst::Break(t)
-            | MirInst::Continue(t) => *t,
-            _ => return false,
-        };
-        // `usize::MAX` 是 `deconstruct` 的丢弃哨兵（`Label(usize::MAX)`），
-        // 不算越界。
-        target != usize::MAX && target >= n
-    })
-}
-
-/// v0.104.6 D311：**带寄存器**的透传指令 —— 才是「两套寄存器空间」的真正来源。
-///
-/// `is_ssa_passthrough` 里的 18 类并非都会造成编号冲突：
-/// **声明型**（`TaskDef` / `Import` / `ExportMark` / `TypeAlias` / `EnumDef` /
-/// `StructDef` / TEA 定义 / `RelDef`）不携带任何寄存器，它们在 body 里原样
-/// 保留不影响 SSA 重编号后的空间。
-///
-/// 而几乎每个 Mora 程序都有一条 `task main()` ⇒ 用宽判据会让
-/// **56 个真实程序里 48 个（85.7%）整体跳过 SSA**（D312 实测重新确认）——
-/// 等于把 `--opt` 废掉。收窄后降到 **15/56（26.8%）**。
-/// 故守卫只认下面这几类真正跨寄存器平面的指令。
-pub fn has_register_carrying_passthrough(func: &MirFunction) -> bool {
-    func.body.iter().any(|i| {
-        matches!(
-            i,
-            MirInst::Closure { .. }
-                | MirInst::MatchExpr { .. }
-                | MirInst::WithConfig { .. }
-                | MirInst::Perform { .. }
-                | MirInst::Handle { .. }
-                | MirInst::Solve { .. }
-                | MirInst::DynTrait { .. }
-                | MirInst::Quasiquote { .. }
-        )
-    })
-}
-
-fn is_ssa_passthrough(inst: &MirInst) -> bool {
-    matches!(
-        inst,
-        MirInst::TaskDef { .. }
-            | MirInst::Import(_)
-            | MirInst::ExportMark(_)
-            | MirInst::WithConfig { .. }
-            | MirInst::MatchExpr { .. }
-            | MirInst::Closure { .. }
-            | MirInst::TypeAlias { .. }
-            // v0.80: algebraic effects — Perform/Handle 不进入 SSA 线性化（v0.75
-            // 已知 SSA 对 Send/WithConfig 等 effectful 指令同样 pass-through，
-            // 后续 Stage 2.x 升级到 multi-shot continuation 时，这里要
-            // 单独处理 —— 当前保持 pass-through 行为）。
-            | MirInst::Perform { .. }
-            | MirInst::Handle { .. }
-            | MirInst::EnumDef { .. }
-            | MirInst::StructDef { .. }
-            // v0.83: TEA definitions — compile-time only, pass-through
-            // v0.102: 声明式范式 — RelDef 声明型；Solve 与 Perform 同属
-            // effectful 指令，SSA 不线性化（pass-through）
-            | MirInst::RelDef { .. }
-            | MirInst::Solve { .. }
-            | MirInst::ModelDef { .. }
-            | MirInst::MsgDef { .. }
-            | MirInst::UpdateDef { .. }
-            | MirInst::AppDef { .. }
-            | MirInst::Transaction { .. }
-            | MirInst::Send { .. }
-            | MirInst::Aggregate { .. }
-            | MirInst::Rollback
-            | MirInst::MacroDef { .. }
-            | MirInst::Commit
-            | MirInst::Worker { .. }
-            | MirInst::Parallel { .. }
-            | MirInst::Observe { .. }
-            | MirInst::Span { .. }
-            | MirInst::TraitDef { .. }
-            | MirInst::ImplDef { .. }
-            | MirInst::Orchestrate { .. }
-            | MirInst::Eval { .. }
-            | MirInst::PromptSection { .. }
-            | MirInst::DocumentSection { .. }
-            | MirInst::DynTrait { .. }
-    )
-}
-
+/// `preds` 为空 ⇒ 没有任何块能到达它 ⇒ `Dom(b) = {b}`。这同时覆盖入口块与
+/// 不可达块（`construct` 已把不可达块的 `preds`/`succs` 清空，让它们不进 CFG）。
 #[allow(clippy::needless_range_loop)]
 fn compute_dominators(blocks: &[BasicBlock]) -> Vec<Option<BlockId>> {
     let n = blocks.len();
@@ -774,70 +744,42 @@ fn compute_dominators(blocks: &[BasicBlock]) -> Vec<Option<BlockId>> {
         return vec![];
     }
 
-    // Step 1: 计算每个块的支配集合（迭代不动点）
-    // Dom(entry) = {entry}
-    // Dom(b) = {b} ∪ ⋂_{p in preds(b)} Dom(p)
-    let mut dom_sets: Vec<HashSet<BlockId>> = Vec::with_capacity(n);
-    for bid in 0..n {
-        let mut s = HashSet::new();
-        if blocks[bid].preds.is_empty() {
-            s.insert(bid);
-        }
-        dom_sets.push(s);
-    }
+    // 从全集起步 ⇒ 迭代单调收缩 ⇒ 收敛到极大（支配）不动点
+    let universe: HashSet<BlockId> = (0..n).collect();
+    let mut dom_sets: Vec<HashSet<BlockId>> = vec![universe; n];
 
-    // entry 块的支配集合只包含自己
-    if !blocks[0].preds.is_empty() {
-        // 没有前驱的块才是 entry；如果 block 0 有前驱，说明它不是 entry
-        // 找到真正的 entry（无前驱的块）
-        let mut entry = 0;
-        for bid in 0..n {
-            if blocks[bid].preds.is_empty() {
-                entry = bid;
-                break;
-            }
-        }
-        dom_sets[entry].clear();
-        dom_sets[entry].insert(entry);
-    }
-
+    // 轮转迭代至多 n 轮收敛（每轮至少定住一个块）；留 2 轮余量。
     let mut changed = true;
-    let mut iter = 0;
-    while changed && iter < 100 {
+    let mut iter = 0usize;
+    while changed && iter <= n + 2 {
         changed = false;
         iter += 1;
         for bid in 0..n {
             let preds = &blocks[bid].preds;
-            if preds.is_empty() {
-                continue;
-            }
-
-            // Dom(b) = {b} ∪ ⋂_{p in preds(b)} Dom(p)
-            let mut new_dom: HashSet<BlockId> = HashSet::new();
-            new_dom.insert(bid);
-
-            let mut first = true;
-            let mut intersection: HashSet<BlockId> = HashSet::new();
-            for &pred in preds {
-                if first {
-                    intersection = dom_sets[pred].clone();
-                    first = false;
-                } else {
-                    intersection.retain(|x| dom_sets[pred].contains(x));
+            let new_dom: HashSet<BlockId> = if preds.is_empty() {
+                [bid].into_iter().collect()
+            } else {
+                let mut it = preds.iter().map(|&p| dom_sets[p].clone());
+                let mut inter = it.next().expect("preds 非空");
+                for s in it {
+                    inter.retain(|x| s.contains(x));
                 }
-            }
-            new_dom.extend(intersection);
-
+                inter.insert(bid);
+                inter
+            };
             if new_dom != dom_sets[bid] {
                 dom_sets[bid] = new_dom;
                 changed = true;
             }
         }
     }
+    debug_assert!(
+        !changed,
+        "支配集迭代在 {} 轮后仍未收敛（块数 {}）—— CFG 可能有环之外的异常结构",
+        iter, n
+    );
 
-    // Step 2: 从支配集合推导 immediate dominator
-    // idom(b) = d where d is in Dom(b) and Dom(d) is a proper subset of Dom(b)
-    // 且 Dom(d) ∪ {b} 是 Dom(b) 的极大真子集
+    // 立即支配者 = Dom(b)\{b} 中支配集**最大**者（最靠近 b 的那个）
     let mut idom: Vec<Option<BlockId>> = vec![None; n];
     for bid in 0..n {
         let dom = &dom_sets[bid];
@@ -908,23 +850,37 @@ fn collect_definitions(blocks: &[BasicBlock]) -> HashMap<SsaReg, Vec<BlockId>> {
     let mut defs: HashMap<SsaReg, Vec<BlockId>> = HashMap::new();
     for block in blocks {
         for inst in &block.insts {
-            // Define 不是真正的值定义，跳过（真实值由 Assign 提供）
-            if let SsaInst::Define(_, _) = inst {
+            // `Define(name, reg)` / `Assign(name, reg)` 写的是 **env**，第二
+            // 字段是被绑定的**源**寄存器 —— 它们**不定义**任何 SSA 寄存器
+            // （v0.75.7 起 `rename_variables` 对二者也只 resolve 不重编号）。
+            // 把它们算作定义会在本块凭空多出一条 def ⇒ phi 插入点被放大 ⇒
+            // `opt.rs` 的「出现 phi 就跳过 SSA」守卫误伤本可优化的函数。
+            if let SsaInst::Define(_, _) | SsaInst::Assign(_, _) = inst {
                 continue;
             }
-            let dst = ssa_dst(inst);
-            defs.entry(dst).or_default().push(block.id);
+            // 无写的指令（声明型 Opaque：`TaskDef` / `Import` / …）不是值定义。
+            if let Some(dst) = ssa_dst(inst) {
+                defs.entry(dst).or_default().push(block.id);
+            }
         }
     }
     defs
 }
 
-fn ssa_dst(inst: &SsaInst) -> SsaReg {
-    match inst {
+/// 指令定义的 SSA 寄存器；**不写任何寄存器**时为 `None`。
+///
+/// `Option` 不是可有可无的签名选择：声明型不透明指令（`TaskDef` / `Import` /
+/// `RelDef` / TEA 定义 …）确实什么都不写，而它们现在也走同一条 SSA 指令流。
+/// 若用哨兵值（如 `usize::MAX`）代替，`const_propagate` 里
+/// `vec![None; max_dst + 1]` 会直接 OOM —— **静默的资源耗尽**正是本项目
+/// 要消灭的失败模式之一。
+pub fn ssa_dst(inst: &SsaInst) -> Option<SsaReg> {
+    Some(match inst {
         SsaInst::Const(d, _)
         | SsaInst::Var(d, _)
         | SsaInst::BinaryOp(d, _, _, _)
         | SsaInst::Call(d, _, _)
+        | SsaInst::CallValue(d, _, _)
         | SsaInst::ListLit(d, _)
         | SsaInst::DictLit(d, _)
         | SsaInst::Index(d, _, _)
@@ -936,7 +892,8 @@ fn ssa_dst(inst: &SsaInst) -> SsaReg {
         | SsaInst::Define(_, d)
         | SsaInst::Assign(_, d)
         | SsaInst::Expr(d) => *d,
-    }
+        SsaInst::Opaque(m) => return m.written_reg(),
+    })
 }
 
 fn insert_phi_nodes(
@@ -973,6 +930,7 @@ fn insert_phi_nodes(
                 if let std::collections::hash_map::Entry::Vacant(e) = phi_map.entry((target, reg)) {
                     e.insert(Phi {
                         dst: reg,
+                        var: reg,
                         incoming: Vec::new(),
                     });
                     if !visited.contains(&target) && !worklist.iter().any(|&x| x == target) {
@@ -984,92 +942,179 @@ fn insert_phi_nodes(
     }
 }
 
-fn rename_variables(blocks: &mut [BasicBlock], phi_map: &HashMap<(BlockId, SsaReg), Phi>) {
-    let num_blocks = blocks.len();
-    if num_blocks == 0 {
-        return;
+/// 变量重命名 —— **教科书式支配树 DFS**：进块压栈、出块弹栈，并沿每条
+/// CFG 边为后继块的 phi 记录 incoming。
+///
+/// ## 为什么必须是支配树 DFS，而不是「沿 succs 的平铺工作表」
+///
+/// rename 的正确性依赖一条不变式：**读点看到的版本 = 支配该读点的定义**。
+/// 沿 `succs` 的 BFS/DFS 只能保证「块被访问过」，不能保证「支配它的定义先进栈」。
+/// 更致命的是**从不 pop**：一个变量的所有历史版本会一直堆在栈里，任何后来的
+/// 读都解析到**最后一个**版本 —— 包括那些并不支配它的版本。
+///
+/// v0.104.6 D312 记录的三处缺口，本函数一次填掉两处：
+/// - 遍历从 `vec![0]` 出发、只沿 `succs` ⇒ 走不到的块**整块未重命名**；
+/// - 全程不 pop ⇒ 跨块的版本解析错乱。
+///
+/// 第三处（`phi.incoming` 恒空）在本函数里一并解决。
+///
+/// ## 算法
+///
+/// ```text
+/// rename(b):
+///   1. b 的每条 phi：new = fresh；push(var → new)；phi.dst = new
+///   2. b 的每条指令：resolve 读；new = fresh；push(原 dst → new)；写回
+///   3. 对每个后继 s 的每条 phi φ：φ.incoming += (b, 当前版本(φ.var))
+///   4. 递归 rename(idom 树的每个子块)
+///   5. 逆序 pop 第 1、2 步压入的每一项
+/// ```
+///
+/// 步骤 3 必须在第 2 步**之后**（要的是块出口处可见的版本），且必须按
+/// `phi.var`（原始编号）查栈 —— 回边指向的祖先/自身块的 `phi.dst` 早已被
+/// 改写成新号。
+fn rename_variables(
+    blocks: &mut [BasicBlock],
+    idom: &[Option<BlockId>],
+    num_params: usize,
+    orig_n_regs: usize,
+) -> SsaReg {
+    let n = blocks.len();
+    if n == 0 {
+        return num_params as SsaReg;
     }
 
-    let mut reg_counter = 0;
-    let max_orig_reg = phi_map
-        .values()
-        .map(|p| p.dst)
-        .chain(blocks.iter().flat_map(|b| b.insts.iter()).map(ssa_dst))
-        .max()
-        .unwrap_or(0);
-
-    let mut rename_stack: Vec<Vec<SsaReg>> = vec![Vec::new(); max_orig_reg.saturating_add(1)];
-
-    let block_phi_map: HashMap<BlockId, Vec<_>> =
-        phi_map
-            .iter()
-            .fold(HashMap::new(), |mut acc, (&(bid, _), phi)| {
-                acc.entry(bid)
-                    .or_insert_with(Vec::new)
-                    .push((phi.dst, phi.incoming.clone()));
-                acc
-            });
-
-    let mut stack = vec![0];
-    let mut visited: HashSet<BlockId> = HashSet::new();
-
-    while let Some(bid) = stack.pop() {
-        if visited.contains(&bid) {
-            continue;
+    // 支配树：`idom[b] == Some(b)`（入口）与 `None`（无支配者）都是根。
+    // 不可达块会自成一棵树 —— 它们同样必须被重命名，否则又是「部分重命名」。
+    let mut children: Vec<Vec<BlockId>> = vec![Vec::new(); n];
+    let mut roots: Vec<BlockId> = Vec::new();
+    for b in 0..n {
+        match idom.get(b).copied().flatten() {
+            Some(d) if d != b && d < n => children[d].push(b),
+            _ => roots.push(b),
         }
-        visited.insert(bid);
+    }
 
-        let block = &mut blocks[bid];
+    let mut reg_counter = num_params;
+    // `orig_n_regs` 是原始 body 里任何寄存器引用的可靠上界（形参占 0..n_params，
+    // 原始 body 中每个被引用的寄存器都 < 原始 n_regs）。取「所有写的最大值」
+    // 是不够的：只被读、从未在本函数写的寄存器会让栈偏短，push 被静默跳过。
+    let mut rename_stack: Vec<Vec<SsaReg>> = vec![Vec::new(); orig_n_regs.max(num_params).max(1)];
 
-        if let Some(phis) = block_phi_map.get(&bid) {
-            for &(orig_dst, _) in phis {
-                let new_dst = reg_counter;
-                reg_counter += 1;
-                if orig_dst < rename_stack.len() {
-                    rename_stack[orig_dst].push(new_dst);
+    // 显式栈而非递归：块数可到数千，递归会爆栈。
+    // `Enter` 进块并压栈，`Exit` 出块并按逆序弹回该块压入的编号。
+    enum Step {
+        Enter(BlockId),
+        Exit(Vec<usize>),
+    }
+    let mut work: Vec<Step> = roots.iter().rev().map(|&b| Step::Enter(b)).collect();
+    let mut entered: Vec<bool> = vec![false; n];
+
+    while let Some(step) = work.pop() {
+        let (bid, mut pushed) = match step {
+            Step::Enter(b) => {
+                if entered[b] {
+                    continue;
                 }
+                entered[b] = true;
+                (b, Vec::new())
             }
-        }
-
-        for inst in &mut block.insts {
-            // v0.75.7: Define/Assign 的第二字段是「被赋值值的来源寄存器」（读），
-            // 不是 dst — 只 resolve src，不重编号、不推 stack。
-            // 此前 Define 既跳过 resolve 又 set_dst 覆盖（把 src 当 dst 重编号），
-            // deconstruct 时映射错乱 → 优化后返回值丢失。
-            if let SsaInst::Define(_, _) | SsaInst::Assign(_, _) = inst {
-                rename_reads(inst, &rename_stack); // resolve src
+            Step::Exit(pushed) => {
+                for var in pushed.into_iter().rev() {
+                    rename_stack[var]
+                        .pop()
+                        .expect("每个被 push 的编号此刻都还有一个版本在栈上");
+                }
                 continue;
             }
-            rename_reads(inst, &rename_stack);
-            let old_dst = ssa_dst(inst);
+        };
+
+        // ── 1. phi ────────────────────────────────────────────────
+        // phi 先于块内指令取得版本号（D256：此前只压栈、不写回 `phi.dst`，
+        // phi 仍占原编号 ⇒ 与被重编号的普通指令撞号）。
+        for phi in &mut blocks[bid].phis {
             let new_dst = reg_counter;
             reg_counter += 1;
-            set_dst(inst, new_dst);
-            if old_dst < rename_stack.len() {
-                rename_stack[old_dst].push(new_dst);
+            if phi.var < rename_stack.len() {
+                rename_stack[phi.var].push(new_dst);
+                pushed.push(phi.var);
+            }
+            phi.dst = new_dst;
+        }
+
+        // ── 2. 块内指令 ──────────────────────────────────────────
+        let succs: Vec<BlockId> = {
+            let block = &mut blocks[bid];
+            for inst in &mut block.insts {
+                // `Define` / `Assign` 的第二字段是「被赋值值的来源寄存器」（读），
+                // 不是 dst —— 只 resolve src，不重编号、不推栈（v0.75.7）。
+                if let SsaInst::Define(_, _) | SsaInst::Assign(_, _) = inst {
+                    rename_reads(inst, &rename_stack);
+                    continue;
+                }
+                // 不透明指令与普通指令走同一条路径（D417）：读经 `map_regs`
+                // 解析、写分配 fresh 版本号。
+                if let SsaInst::Opaque(m) = inst {
+                    let mapped = m.map_regs(&mut |r| resolve_reg(r, &rename_stack));
+                    // **无写就不占版本号** —— 声明型指令什么都不写；给它分配
+                    // 版本号会让 `reg_counter` 凭空前移，而 `deconstruct` 只按
+                    // 真正出现的寄存器分配 plain 号 ⇒ `n_regs` 偏小 ⇒ 执行期
+                    // 报「references register N but the function only has M」。
+                    match mapped.written_reg() {
+                        Some(old_dst) => {
+                            let new_dst = reg_counter;
+                            reg_counter += 1;
+                            *inst = SsaInst::Opaque(mapped.with_written_reg(new_dst));
+                            if old_dst < rename_stack.len() {
+                                rename_stack[old_dst].push(new_dst);
+                                pushed.push(old_dst);
+                            }
+                        }
+                        None => *inst = SsaInst::Opaque(mapped),
+                    }
+                    continue;
+                }
+                rename_reads(inst, &rename_stack);
+                let old_dst = ssa_dst(inst).expect("非 Opaque 指令恒有定义寄存器");
+                let new_dst = reg_counter;
+                reg_counter += 1;
+                set_dst(inst, new_dst);
+                if old_dst < rename_stack.len() {
+                    rename_stack[old_dst].push(new_dst);
+                    pushed.push(old_dst);
+                }
+            }
+            match &mut block.terminator {
+                Terminator::JumpIf(cond, _, _) | Terminator::JumpIfNot(cond, _, _) => {
+                    *cond = resolve_reg(*cond, &rename_stack);
+                }
+                Terminator::Return(Some(reg)) => *reg = resolve_reg(*reg, &rename_stack),
+                _ => {}
+            }
+            block.succs.clone()
+        };
+
+        // ── 3. 为后继块的 phi 记录本块的 incoming ────────────────
+        for &s in &succs {
+            if s >= n {
+                continue;
+            }
+            for phi in &mut blocks[s].phis {
+                let src = resolve_reg(phi.var, &rename_stack);
+                // 同一对 (前驱, phi) 只记一次：`JumpIf(c, H, H)` 这类同前驱
+                // 双边会重复走到；不去重会让 `deconstruct` 发两条同样的 copy。
+                if !phi.incoming.iter().any(|&(p, _)| p == bid) {
+                    phi.incoming.push((bid, src));
+                }
             }
         }
 
-        match &mut block.terminator {
-            Terminator::JumpIf(cond, _, _) | Terminator::JumpIfNot(cond, _, _) => {
-                let old = *cond;
-                if old < rename_stack.len() && !rename_stack[old].is_empty() {
-                    *cond = *rename_stack[old].last().expect("is_empty checked above");
-                }
-            }
-            Terminator::Return(Some(reg)) => {
-                let old = *reg;
-                if old < rename_stack.len() && !rename_stack[old].is_empty() {
-                    *reg = *rename_stack[old].last().expect("is_empty checked above");
-                }
-            }
-            _ => {}
-        }
-
-        for &succ in &block.succs {
-            stack.push(succ);
+        // ── 4 / 5. 先安排退出（弹栈），再压子块（深度优先）──────
+        work.push(Step::Exit(pushed));
+        for &c in children[bid].iter().rev() {
+            work.push(Step::Enter(c));
         }
     }
+    reg_counter as SsaReg
 }
 
 fn set_dst(inst: &mut SsaInst, d: SsaReg) {
@@ -1086,20 +1131,31 @@ fn set_dst(inst: &mut SsaInst, d: SsaReg) {
         SsaInst::Pipe(dst, _, _) => *dst = d,
         SsaInst::Prompt(dst, _) => *dst = d,
         SsaInst::Copy(dst, _) => *dst = d,
+        SsaInst::CallValue(dst, _, _) => *dst = d,
         SsaInst::Define(_, dst) => *dst = d,
         SsaInst::Assign(_, dst) => *dst = d,
         SsaInst::Expr(dst) => *dst = d,
+        SsaInst::Opaque(m) => {
+            *m = m.with_written_reg(d);
+        }
+    }
+}
+
+/// 把原始寄存器号解析为**当前可见的 SSA 版本**。
+///
+/// 栈空（形参、从未在本函数被定义的寄存器）时返回原号 —— 形参与外部
+/// 寄存器共用编号空间，这是 SSA 构造的既定约定（`deconstruct` 把
+/// `ssa.params` 映回 `0..n_params`）。
+fn resolve_reg(reg: SsaReg, stack: &[Vec<SsaReg>]) -> SsaReg {
+    if reg < stack.len() && !stack[reg].is_empty() {
+        *stack[reg].last().expect("is_empty checked above")
+    } else {
+        reg
     }
 }
 
 fn rename_reads(inst: &mut SsaInst, stack: &[Vec<SsaReg>]) {
-    fn resolve(reg: SsaReg, stack: &[Vec<SsaReg>]) -> SsaReg {
-        if reg < stack.len() && !stack[reg].is_empty() {
-            *stack[reg].last().expect("is_empty checked above")
-        } else {
-            reg
-        }
-    }
+    use resolve_reg as resolve;
 
     match inst {
         SsaInst::BinaryOp(_, l, _, r) => {
@@ -1107,6 +1163,13 @@ fn rename_reads(inst: &mut SsaInst, stack: &[Vec<SsaReg>]) {
             *r = resolve(*r, stack);
         }
         SsaInst::Call(_, _, args) => {
+            for r in args.iter_mut() {
+                *r = resolve(*r, stack);
+            }
+        }
+        // 值调用：被调者寄存器与实参同样需重命名（它们都是读取点）。
+        SsaInst::CallValue(_, callee, args) => {
+            *callee = resolve(*callee, stack);
             for r in args.iter_mut() {
                 *r = resolve(*r, stack);
             }
@@ -1150,6 +1213,9 @@ fn rename_reads(inst: &mut SsaInst, stack: &[Vec<SsaReg>]) {
         // v0.75.7: Define 的 src 也是寄存器读，参与 rename（此前跳过 →
         // deconstruct 映射错乱）。与 Assign 一致。
         SsaInst::Define(_, src) => *src = resolve(*src, stack),
+        // Opaque 的读由 `rename_variables` 走 `MirInst::map_regs` 处理 ——
+        // 不透明指令的寄存器位置只有 `MirInst` 知道。
+        SsaInst::Opaque(_) => {}
         SsaInst::Var(_, _) | SsaInst::Const(_, _) => {}
     }
 }

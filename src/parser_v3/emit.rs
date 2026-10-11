@@ -582,7 +582,8 @@ impl ParserV3 {
         self.emit_call_tail_w(callee_reg, callee_w)
     }
 
-    /// 后缀链（witness 嵌套版）：方法调用 obj.m(args) / 索引 obj[idx]。
+    /// 后缀链（witness 嵌套版）：方法调用 obj.m(args) / 索引 obj[idx] /
+    /// **值调用 `f(…)(…)`**（v0.104.6 补齐 D123 留下的缺口）。
     fn emit_call_tail_w(
         &mut self,
         mut callee_reg: Reg,
@@ -630,23 +631,40 @@ impl ParserV3 {
                     },
                     span,
                 };
-            } else if self.check(&TokenType::LParen) {
-                // D123：值**不支持**被调用的后缀链 `f(…)(…)`，但**绝不能静默**。
+            } else if self.match_token_exact(TokenType::LParen) {
+                // v0.104.6 D123 **补齐能力**（此前是硬报错，见下方沿革）。
                 //
-                // 本函数的后缀链只认 `.`（方法）与 `[`（索引），没有 `(` 分支。
-                // 修复前 `let mk = fn(x) fn(y) x + y end end` + `mk(1)(2)` 的行为是：
-                // `mk(1)` 正常求值并**丢弃**返回的闭包，紧随其后的 `(2)` 被外层
-                // 当成一个**独立的括号表达式**语句求值 —— 末值得到 `2.0` 而不是
-                // `1 + 2 = 3.0`，**退出码 0、零诊断**。
-                // 同一个式子放进实参位（`print(mk(1)(2))`）则报 `Expected ')'` ——
-                // 同一个表达式两种行为，静默的那个更糟。
+                // D123 当时只做了「消除静默」：`mk(1)(2)` 修复前会算出 `2.0`
+                // 而不是 `3.0`（退出码 0、零诊断），于是先把该形态改成明确失败。
+                // 但那只是**止血**——真正的缺口是 `call` 的被调用者被钉死成
+                // `IDENTIFIER`，EBNF 没有 `postfix` 产生式。现在补上：
+                // 被调用者可以是任意已求值表达式，实参任意个。
                 //
-                // spec §14.2 的 EBNF 里 `call` 的被调用者只能是 `IDENTIFIER`，
-                // **无 `postfix` 产生式**，故本形态属未承诺的能力缺口
-                // （已记入 CHANGELOG D123）。此处只负责**消除静默**：
-                // 从此明确解析失败，而不是算出一个错误的值。
-                eprintln!("Parse error: 对表达式的结果再次调用（`f(…)(…)`）尚不支持");
-                return None;
+                // 形状：把 `callee_reg` 装进一个 1 元素的 callee witness 容器，
+                // 发 `CallValue`，再把结果接回 `callee_reg` 继续走后缀链
+                // （`f(x)(1).g()` 能继续链下去）。
+                //
+                // ⚠ 必须用 `match_token_exact`（**消费** `(`）而非 `check`
+                // （只窥视）：`emit_arg_list_w` 假定当前位置就停在 `(` 上。
+                // 写成 `check` 会让实参表从 `(` 开始解析，把 `(args)` 吃成
+                // 一个括号表达式，随后 `consume(RParen)` 必然失败
+                // —— 症状是莫名其妙的 `Expected ')'`。
+                let span = self.span_of_current();
+                let (args, arg_wits) = self.emit_arg_list_w()?;
+                let dst = self.emit.alloc_reg();
+                self.emit.emit(MirInst::CallValue(dst, callee_reg, args));
+                // witness 侧用 `Evaluated` 承载被调用者 —— typeck 的
+                // `hm/infer.rs` 与 `hm/mod.rs` 已有该分支（含「立即调用的
+                // 闭包：body 效果在调用点发生」规则），`witness_to_fcfg`
+                // 也会把它降成 `Node::Call { callee_name: None }`。
+                callee_w = MirWitness {
+                    kind: WitnessKind::Call {
+                        callee: crate::mir::witness::WitnessCallee::Evaluated(Box::new(callee_w)),
+                        args: arg_wits,
+                    },
+                    span,
+                };
+                callee_reg = dst;
             } else {
                 break;
             }
@@ -851,7 +869,16 @@ impl ParserV3 {
             }
             TokenType::Fn => {
                 self.advance();
+                // v0.104.6：泛型闭包子句 `fn<T>(…)`。闭包本身无 `type_params`
+                // 字段（它靠 let-泛化成为多态），但形参标注里的 `T` 需被认作
+                // 类型变量 ⇒ 与 task 同理，进入/退出泛型作用域。
+                let saved_generic = std::mem::take(&mut self.generic_params);
+                if self.parse_generic_clause()?.is_empty() {
+                    // 非泛型：还原为空（无副作用），保持与此前一致。
+                    self.generic_params = saved_generic.clone();
+                }
                 if !self.match_token_exact(TokenType::LParen) {
+                    self.generic_params = saved_generic;
                     return None;
                 }
                 let mut params = Vec::new();
@@ -859,9 +886,21 @@ impl ParserV3 {
                     // v0.104.6 D354：闭包参数是**声明位**，走严格版。
                     // `fn(if) … end` 修前 exit 0 声明成功，但参数**永远引用不到**。
                     if let Some(p) = self.consume_plain_identifier("Expected parameter name") {
+                        // v0.104.6：形参类型标注 `fn(x: number) … end`。
+                        // 承载位 `Param.type_hint`（orchestrate::Param，存
+                        // 原始 `typeck::Type`）与消费端（下方转
+                        // `WitnessParam.type_hint`，再由 bidirectional.rs
+                        // Phase A 绑进 HM 环境做 subtype 检查）本就存在，
+                        // 此前只是从不填值 ⇒ 遇 `:` 直接
+                        // `Expected ')' after parameters`。裸形参仍为 None。
+                        let type_hint = if self.match_token_exact(TokenType::Colon) {
+                            Some(self.parse_type_annotation()?)
+                        } else {
+                            None
+                        };
                         params.push(Param {
                             name: p,
-                            type_hint: None,
+                            type_hint,
                             default: None,
                         });
                     }
@@ -907,8 +946,20 @@ impl ParserV3 {
                     self.match_token_exact(TokenType::End);
                     (r, w)
                 } else {
-                    self.emit_block_w()?
+                    match self.emit_block_w() {
+                        Some(x) => x,
+                        None => {
+                            // v0.104.6：退出泛型作用域（体解析失败的早退路径）。
+                            self.generic_params = saved_generic;
+                            self.emit = parent;
+                            return None;
+                        }
+                    }
                 };
+                // v0.104.6：退出泛型作用域 —— 体解析之后立即还原，**无论成败**
+                // （上面的早退分支已各自还原），避免 `generic_params` 泄漏到
+                // 后续无关标注。
+                self.generic_params = saved_generic;
                 self.emit.emit_tail_return(Some(body_reg));
                 let body_mir = std::mem::replace(&mut self.emit, parent).finish();
                 let dst = self.emit.alloc_reg();

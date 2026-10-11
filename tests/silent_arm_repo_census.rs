@@ -90,7 +90,7 @@ fn d381_repo_wide_silent_arm_census() {
         "src/mir/ssa.rs",
         "src/mir/pipeline.rs",
         "src/mir/lower.rs",
-        "src/mir/lmir_to_mir.rs",
+        // v0.104.6：src/mir/lmir_to_mir.rs 已删除（未声明的死代码 + UB 隐患）
         "src/parser_v3/emit.rs",
         "src/value.rs",
         "src/record/serialization.rs",

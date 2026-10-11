@@ -20,7 +20,7 @@
 //! 两条语句会被并成一条。本文件的对照组专门盯这一条。
 
 use mora::interpreter::Interpreter;
-use mora::mir::vm::run_mir;
+use mora::mir::vm::execute;
 use mora::parser_v3::ParserV3;
 use std::sync::Arc;
 
@@ -29,7 +29,7 @@ fn last_value(src: &str) -> String {
     let mut interp = Interpreter::new();
     let mut env = interp.take_env();
     let arc = Arc::new(func);
-    match run_mir(
+    match execute(
         &arc,
         &mut interp,
         &mut env,

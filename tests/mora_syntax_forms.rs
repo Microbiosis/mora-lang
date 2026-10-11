@@ -122,8 +122,13 @@ const FORMS: &[(&str, &str, Form, &str)] = &[
     (
         "连续调用 f()(…)",
         "let mk = fn(x) fn(y) x + y end end\nprint(mk(1)(2))\n",
-        Form::Rejected,
-        "D123 实测：报 `Expected ')'`；分两步可行",
+        Form::Gap,
+        "v0.104.6 补齐 postfix 值调用后**解析层**已通（此前 D123 报 `Expected ')'`）；\
+         但本条这条 src 仍跑不起来：`mk : Float -> (Float -> Float)`，而 typeck 的 arity \
+         检查按**整条 Arrow 链**取 arity（`typeck/hm/infer.rs` 的 `arrow_arity`），\
+         `mk(1)` 被判「期望 2 个实参」。那是**柯里化部分应用**被有意拒绝的策略\
+         （运行期同样不支持，另有显式写法 `curry(f, n)`），与后缀链无关 —— \
+         单参形态如 `(fn(x) x * 2 end)(5)` 已完全可用，见 tests/postfix_value_call.rs",
     ),
     (
         "分两步调用",
@@ -214,8 +219,9 @@ const FORMS: &[(&str, &str, Form, &str)] = &[
     (
         "函数参数类型标注",
         "task f(a: number)\n  return a\nend\nprint(f(1))\n",
-        Form::Rejected,
-        "D110 实测：报 `Expected ')' after parameters`；spec 7 处 + README 首例都用它",
+        Form::Ok,
+        "v0.104.6 已实现：形参标注可解析，且在调用点按声明检查实参 \
+         （此前 D110 实测报 `Expected ')' after parameters`）",
     ),
     (
         "裸 list 标注",

@@ -9,7 +9,7 @@
 //! 4. 并发自然属性：实例/线程间序列按值隔离，无共享无锁。
 
 use mora::interpreter::Interpreter;
-use mora::mir::vm::run_mir;
+use mora::mir::vm::execute;
 use mora::parser_v3::ParserV3;
 use mora::typeck::check_mir::check_program_witnesses_bidirectional;
 use mora::value::Value;
@@ -27,7 +27,7 @@ fn compile_and_run(src: &str) -> Value {
     let mut interp = Interpreter::new();
     let mut env = interp.take_env();
     let mut effects = mora::mir::effect::Effects::default();
-    run_mir(
+    execute(
         &std::sync::Arc::new(func),
         &mut interp,
         &mut env,
@@ -186,7 +186,7 @@ fn interpreters_are_isolated_across_threads() {
             "task main()\n  random.seed(123)\n  [random.random(), random.random()]\nend",
         )
         .unwrap();
-        run_mir(
+        execute(
             &std::sync::Arc::new(func),
             &mut interp,
             &mut env,
@@ -202,7 +202,7 @@ fn interpreters_are_isolated_across_threads() {
             "task main()\n  random.seed(456)\n  [random.random(), random.random()]\nend",
         )
         .unwrap();
-        run_mir(
+        execute(
             &std::sync::Arc::new(func),
             &mut interp,
             &mut env,

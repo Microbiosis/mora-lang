@@ -28,7 +28,7 @@
 use std::sync::Arc;
 
 use mora::interpreter::Interpreter;
-use mora::mir::vm::{run_mir, run_mir_dag};
+use mora::mir::vm::{execute, run_mir_dag};
 use mora::parser_v3::ParserV3;
 
 fn via_optimized(src: &str) -> String {
@@ -36,7 +36,7 @@ fn via_optimized(src: &str) -> String {
     let arc = Arc::new(func);
     let mut interp = Interpreter::new();
     let mut env = interp.take_env();
-    match run_mir(
+    match execute(
         &arc,
         &mut interp,
         &mut env,

@@ -284,6 +284,9 @@ fn build_node(b: &mut FcfgBuilder, w: &MirWitness) -> Node<()> {
             params,
             return_type,
             body,
+            // v0.104.6：`type_params`（泛型声明）不进 FCFG —— FCFG 是
+            // 无类型的结构化控制流图，泛型信息由 typeck 从 witness 直接消费。
+            ..
         } => {
             let body_block = build_block(b, body);
             Node::FnDef {

@@ -1,6 +1,7 @@
-//! v0.104.6 D313：常量条件的 `if/else` 在 `--opt≥1` 下**两个分支都执行**。
+//! v0.104.6 D419：常量条件的 `if/else` 在 `--opt≥1` 下**两个分支都执行** ——
+//! 已修，守卫已删。
 //!
-//! ## 现象（修前）
+//! ## 现象（D313 记档，修前）
 //!
 //! ```text
 //! $ mora --opt=1 a.mora     # if 1 > 0 / print(7) / else / print(8) / end   （if 是最后一句）
@@ -10,60 +11,33 @@
 //! 0
 //! ```
 //!
-//! opt=off 只打印 `7.0`。`--opt=1` 与 `--opt=2` 相同，退出码仍是 0。
+//! opt=off 只打印 `7.0`。**副作用会重复发生**（重复写文件、重复扣款、
+//! 重复发送），程序看起来一切正常、退出码 0 —— 比静默截断更危险。
 //!
-//! **副作用会重复发生** —— 重复写文件、重复扣款、重复发送。程序看起来还在
-//! 正常工作（没有静默中止、没有报错），这比 D312 那种静默截断**更危险**。
+//! ## 根因：SSA 表达不了「跳到函数末尾」
 //!
-//! ## 触发面（实测 12 种形态，opt=1 / opt=2 三档逐行对比）
+//! `apply_rules`（两档都跑）的 `ConstFoldingRule` 折叠 `1 > 0`、
+//! `IfSimplifyRule` 删掉恒不跳的 `JumpIfNot`，只留下 `Jump(end)` —— 而 `if`
+//! 是最后一句时 `end == body.len()`，**跳转目标越界**。
 //!
-//! | 修前 | 形态 |
-//! |---|---|
-//! | ✗ | 常量真 + `else`（`1 > 0` / `3 == 3` / 字面量 `true`） |
-//! | ✗ | 同上但 `else` 有两条语句 |
-//! | ✅ | 常量**假** + `else` |
-//! | ✅ | 常量真、**无** `else` |
-//! | ✅ | 同样结构但 `end` 之后还有一条语句 |
-//! | ✅ | `let n = 1` 再判断（条件走 `Var` 间接层） |
-//! | ✅ | 变量条件（对照组） |
+//! 旧 SSA 把越界目标映成 `Terminator::Return(None)`，而 `Return(None)` 在降维
+//! 时是**被丢弃**的（「落下去，线性执行自然进入下一块」）⇒ 那条跳转彻底消失
+//! ⇒ 块与块之间再无控制转移 ⇒ **两个分支都执行**。
 //!
-//! 「末尾加一条语句就正常」这条线索直接指向根因：问题出在**跳转目标越界**。
+//! D313 当时的处置是加一道守卫（`has_out_of_range_jump`）整体跳过 SSA。
+//! **D419 删掉守卫**，改为给 SSA 一个能表达这件事的终结符：
+//! [`mora::mir::ssa::Terminator::JumpExit`] —— 「跳到函数末尾」，与
+//! 「返回」/「落进下一块」彻底分开。降维时它发一条真跳转，由第四遍补成重建后
+//! body 的长度：`run_mir` 见 `pc >= body.len()` 即结束并走隐式返回；
+//! `dag_analyze` 解析不到目标节点 ⇒ 该 Jump 节点无出边。两个执行器都与
+//! opt=off 一致。
 //!
-//! ## 根因
-//!
-//! `apply_rules`（**两档都跑**，`cli/mod.rs:56`）里：
-//!
-//! 1. `ConstFoldingRule` 把 `1 > 0` 折叠成 `Const(c, Bool(true))`；
-//! 2. `IfSimplifyRule`（`rule.rs:119`，`Some(true) if is_not => Vec::new()`）
-//!    **删掉** `JumpIfNot` —— 这个局部改写**本身是对的**（`JumpIfNot(true,t)`
-//!    永不跳，删掉即落下去）。问题出在它留下的结构被下游误读。
-//!
-//! 剩下的 body 是 `<then>; Jump(end); <else>`，而 `if` 是最后一句时
-//! `end == body.len()` —— **跳转目标越界**。于是：
-//!
-//! 1. `construct` 的分块规则 `if lbl < body_len` 为假 ⇒ 不在那里起块
-//!    ⇒ CFG 断成互不相连的两块（实测 `block 0 succs=[]`、`block 1 preds=[]`）；
-//! 2. `deconstruct` 把该 terminal 跳转映成 `Return(None)`，而 `Return(None)`
-//!    是**被丢弃**的（`deconstruct.rs:340`）⇒ **那条 Jump 彻底消失**；
-//! 3. 第四遍线性拼接各块 ⇒ 两个分支之间再无控制转移 ⇒ DAG 两段都执行。
-//!
-//! ## 修复
-//!
-//! `opt.rs::optimize` 在 `construct` **之前**加守卫：body 里有跳到 body 之外的
-//! 控制转移就**整体跳过 SSA**（`func` 逐字节不变）。
-//!
-//! **判据为什么不落在 `BasicBlock.preds` 上**：最直接的修法是让 `deconstruct`
-//! 丢弃不可达块，但 `preds` 正是 D261 记档的三处缺口之一（实测 `block 1
-//! preds=[]` 而实际存在一条来自 block 0 的边）—— **拿已知不可靠的字段去决定
-//! 删除代码**正是 D276「优化器回滚」教训指向的方向。越界跳转目标则是
-//! **直接可测的事实**，不依赖任何下游数据结构。
-//!
-//! 实测 56 个真实 `.mora`：**零命中** ⇒ 对现有程序**零代价**。
+//! **本文件从「守卫存在吗」翻转成「行为对吗」** —— 守卫已不存在了。
 
 use std::process::Command;
 
 fn run(src: &str, tag: &str, opt: Option<&str>) -> (i32, Vec<String>) {
-    let dir = std::env::temp_dir().join(format!("mora_d313_{tag}"));
+    let dir = std::env::temp_dir().join(format!("mora_d419_{tag}"));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("建目录");
     let p = dir.join("p.mora");
@@ -100,29 +74,55 @@ fn run(src: &str, tag: &str, opt: Option<&str>) -> (i32, Vec<String>) {
 
 /// **主判据**：常量条件的 `if/else` 在 `--opt=1/2` 下必须只走 then 分支。
 ///
-/// 修前两个分支都执行（`["7.0", "8.0"]`）。**反向牙齿已验证**：把
-/// `opt.rs` 的 `has_out_of_range_jump` 守卫改成恒假，本条会红。
+/// 修前两个分支都执行（`["7.0", "8.0"]`）。**v0.104.6 D419：守卫已删除**，
+/// 本条从「守卫存在」翻转成**直接的行为判据** —— 现在这条 `if/else` 真的会
+/// 走 SSA（`Jump(end)` 降维成 [`mora::mir::ssa::Terminator::JumpExit`]），
+/// 行为仍然正确。
+///
+/// **反向牙齿已验证**：把 `ssa.rs` 里的 `Terminator::JumpExit` 改回
+/// `Terminator::Return(None)`，本条会红（两个分支都跑）。
 #[test]
 fn const_condition_if_else_does_not_execute_both_branches() {
     for (tag, src, want) in [
         (
             "const-gt",
-            "if 1 > 0\n  print(7)\nelse\n  print(8)\nend\n",
+            "if 1 > 0
+  print(7)
+else
+  print(8)
+end
+",
             "7.0",
         ),
         (
             "const-eq",
-            "if 3 == 3\n  print(7)\nelse\n  print(8)\nend\n",
+            "if 3 == 3
+  print(7)
+else
+  print(8)
+end
+",
             "7.0",
         ),
         (
             "bool-literal",
-            "if true\n  print(7)\nelse\n  print(8)\nend\n",
+            "if true
+  print(7)
+else
+  print(8)
+end
+",
             "7.0",
         ),
         (
             "else-two-stmts",
-            "if 1 > 0\n  print(7)\nelse\n  print(8)\n  print(80)\nend\n",
+            "if 1 > 0
+  print(7)
+else
+  print(8)
+  print(80)
+end
+",
             "7.0",
         ),
     ] {
@@ -131,154 +131,180 @@ fn const_condition_if_else_does_not_execute_both_branches() {
         assert_eq!(
             base,
             vec![want.to_string()],
-            "[{tag}] 前提：默认档应只走 then 分支; 实得 {base:?}"
+            "[{tag}] 前提：默认档只走 then"
         );
 
         for lvl in ["1", "2"] {
-            let (c, got) = run(src, &format!("{tag}_opt{lvl}"), Some(lvl));
-            assert_eq!(c, 0, "[{tag}] `--opt={lvl}` 应成功; 实得 {c}");
+            let (c, got) = run(src, &format!("{tag}_o{lvl}"), Some(lvl));
             assert_eq!(
-                got, base,
-                "**D313**：`--opt={lvl}` 下常量条件的 if/else 必须与 opt=off 等价。\n\
-                 修前是**两个分支都执行**（副作用会重复：重复写文件/扣款/发送，\n\
-                 而程序看起来一切正常）。\n  [{tag}] 实得: {got:?}"
+                c, 0,
+                "[{tag}] `--opt={lvl}` 应成功（修前两侧都跑、退出码仍是 0）; 实得 {c}"
+            );
+            assert_eq!(
+                got,
+                base,
+                "**D419**：[{tag}] `--opt={lvl}` 下只能走 then 分支。
+                 修前是**两个分支都执行** —— 副作用会重复发生（重复写文件、                 重复扣款、重复发送），而程序看起来一切正常、退出码 0。
+  实得: {got:?}"
             );
         }
     }
 }
 
-/// **对照组**：这几种形态修前就**已经正确**，本条把缺陷范围**钉死在**
-/// 「常量真 + `else` + `if` 是最后一句」这一支，避免把「`if` 整个坏了」
-/// 这种过宽的说法钉进断言。
+/// **`Jump(end)`（`end == body.len()`）必须被 SSA 表达成「跳到函数末尾」，
+/// 而不是「返回」或「落进下一块」。**
+///
+/// 这是 D419 的结构性判据：越界跳转此前被降成 `Terminator::Return(None)`，
+/// 而 `Return(None)` 在降维时是**被丢弃**的（「落下去，线性执行自然进入下一块」）
+/// ⇒ 那条跳转彻底消失 ⇒ 后续块被线性执行 ⇒ 两个分支都跑。
 #[test]
-fn control_group_shapes_were_already_correct() {
-    for (tag, src) in [
-        (
-            "const-false",
-            "if 1 > 2\n  print(7)\nelse\n  print(8)\nend\n",
-        ),
-        ("no-else", "if 1 > 0\n  print(7)\nend\n"),
-        (
-            "with-tail",
-            "if 1 > 0\n  print(7)\nelse\n  print(8)\nend\nprint(9)\n",
-        ),
-        (
-            "via-var",
-            "let n = 1\nif n > 0\n  print(7)\nelse\n  print(8)\nend\n",
-        ),
-        (
-            "variable",
-            "let n = 5\nif n > 100\n  print(9)\nelse\n  print(8)\nend\n",
-        ),
-    ] {
-        let (dc, base) = run(src, &format!("ctl_{tag}_base"), None);
-        assert_eq!(dc, 0, "[{tag}] 前提：默认档应成功; 实得 {dc}");
-        for lvl in ["1", "2"] {
-            let (c, got) = run(src, &format!("ctl_{tag}_opt{lvl}"), Some(lvl));
-            assert_eq!(c, 0, "[{tag}] `--opt={lvl}` 应成功; 实得 {c}");
-            assert_eq!(
-                got, base,
-                "[{tag}] 对照组：这一支修前就已正确，仍必须保持等价。\n  实得: {got:?} vs {base:?}"
+fn jump_past_body_end_becomes_a_jump_exit_terminator() {
+    let src = "if 1 > 0
+  print(7)
+else
+  print(8)
+end
+";
+    let (func, _) = mora::cli::compile_and_opt(src, None).expect("compile");
+    let ssa = mora::mir::ssa::construct(&func);
+
+    let exits = ssa
+        .blocks
+        .iter()
+        .filter(|b| matches!(b.terminator, mora::mir::ssa::Terminator::JumpExit))
+        .count();
+    assert_eq!(
+        exits,
+        1,
+        "该程序降维后应恰好有**一个**块以 `JumpExit` 收尾（then 臂跳到函数末尾）。
+         实得 {exits} 个；各块 terminator：{:#?}",
+        ssa.blocks
+            .iter()
+            .map(|b| (b.id, format!("{:?}", b.terminator)))
+            .collect::<Vec<_>>()
+    );
+
+    // `JumpExit` 的块不得有顺序后继（否则又会落进下一块）
+    for b in &ssa.blocks {
+        if matches!(b.terminator, mora::mir::ssa::Terminator::JumpExit) {
+            assert!(
+                b.succs.is_empty(),
+                "块 {} 以 `JumpExit` 收尾，却仍有后继 {:?} —— 它会「落下去」而不是终止",
+                b.id,
+                b.succs
             );
         }
     }
 }
 
-// ── 结构不变量：给守卫上牙齿 ─────────────────────────────────────
-
-use mora::mir::{MirFunction, MirInst};
-use mora::value::Value;
-
-/// 复刻 D313 缺陷的**结构形状**：`Jump` 的目标越出 body 末尾。
+/// **降维产物里必须有一条真正的终止跳转**，不能是「什么都不发」。
 ///
-/// ⚠ 不是可执行程序 —— 本文件只用它验证守卫谓词，不跑。
-fn out_of_range_jump_mir() -> MirFunction {
-    let body = vec![
-        MirInst::Const(0, Value::Bool(true)), // 0  条件
-        MirInst::Const(1, Value::Float(7.0)), // 1  then 分支
-        MirInst::Jump(5),                     // 2  跳到 end —— 但 body 只有 0..4 ⇒ 越界
-        MirInst::Const(2, Value::Float(8.0)), // 3  else 分支
-        MirInst::Const(3, Value::Nil),        // 4
-    ];
-    MirFunction {
-        params: vec![],
-        body,
-        n_regs: 4,
-        ..Default::default()
-    }
-}
-
-/// **守卫的必要性**：越界跳转必须被谓词认出来。
-///
-/// 若哪天这条红了（谓词不再命中），守卫会无声地变成死代码，
-/// D313 的缺陷就会回来。
+/// 修前该位置直接消失 —— 后续块被线性执行 ⇒ 两个分支都跑。
 #[test]
-fn out_of_range_jump_is_detected() {
-    let func = out_of_range_jump_mir();
-    assert_eq!(func.body.len(), 5, "前提：body 长度");
+fn deconstructed_body_keeps_a_terminating_jump() {
+    let src = "if 1 > 0
+  print(7)
+else
+  print(8)
+end
+";
+    let (func, _) = mora::cli::compile_and_opt(src, None).expect("compile");
+    let out = mora::mir::ssa::deconstruct(&mora::mir::ssa::construct(&func));
+
+    let terminating = out.body.iter().any(|i| match i {
+        mora::mir::MirInst::Jump(t) => *t >= out.body.len(),
+        _ => false,
+    });
     assert!(
-        mora::mir::ssa::has_out_of_range_jump(&func),
-        "body 末尾的 `Jump(5)` 越界（body 只有 0..4），谓词必须命中。\n\
-         若本条失败：`opt.rs` 的 D313 守卫会变成死代码，缺陷会回来。"
+        terminating,
+        "降维产物里没有任何「跳到 body 末尾」的 `Jump`（body 长 {}）：
+{:#?}",
+        out.body.len(),
+        out.body
     );
 }
 
-/// **守卫不宽**：目标在 body 内的跳转**不得**被误判。
-///
-/// 防止有人把谓词写成 `>= 0`（恒真 ⇒ 等于关掉整个 `--opt`）或漏掉某一类
-/// 控制转移指令。
+/// **越界跳转形状在三档下必须完全一致**（`break` / `continue` / 嵌套 /
+/// 尾语句各变体）。
 #[test]
-fn in_range_jumps_are_not_flagged() {
-    for (tag, body, n_regs) in [
+fn out_of_range_jump_shapes_are_opt_invariant() {
+    for (tag, src) in [
         (
-            "plain",
-            vec![MirInst::Const(0, Value::Int(1)), MirInst::Jump(0)],
-            1,
+            "if-else",
+            "if 1 > 0
+  print(7)
+else
+  print(8)
+end
+",
         ),
         (
-            "jumpif",
-            vec![
-                MirInst::Const(0, Value::Int(1)),
-                MirInst::JumpIf(0, 1),
-                MirInst::Const(1, Value::Nil),
-            ],
-            2,
+            "if-no-else",
+            "if 1 > 0
+  print(7)
+end
+",
         ),
         (
-            "jumpifnot",
-            vec![
-                MirInst::Const(0, Value::Int(1)),
-                MirInst::JumpIfNot(0, 1),
-                MirInst::Const(1, Value::Nil),
-            ],
-            2,
+            "if-trailing",
+            "if 1 > 0
+  print(7)
+else
+  print(8)
+end
+print(9)
+",
         ),
         (
-            "break-continue",
-            vec![
-                MirInst::Const(0, Value::Int(1)),
-                MirInst::Break(0),
-                MirInst::Continue(0),
-            ],
-            1,
+            "nested",
+            "if 1 > 0
+  if 1 > 0
+    print(7)
+  else
+    print(8)
+  end
+else
+  print(9)
+end
+",
         ),
-        // `usize::MAX` 是 `deconstruct` 的丢弃哨兵（`Label(usize::MAX)`），不算越界
         (
-            "usize-max-sentinel",
-            vec![MirInst::Const(0, Value::Int(1)), MirInst::Jump(usize::MAX)],
-            1,
+            "while-break",
+            "let i = 0
+while i < 3
+  i = i + 1
+  if i == 2
+    break
+  end
+end
+print(i)
+",
+        ),
+        (
+            "for-break",
+            "let t = 0i
+for i in [1,2,3]
+  if i == 2
+    break
+  end
+  t = t + i
+end
+print(t)
+",
         ),
     ] {
-        let func = MirFunction {
-            params: vec![],
-            body,
-            n_regs,
-            ..Default::default()
-        };
-        assert!(
-            !mora::mir::ssa::has_out_of_range_jump(&func),
-            "[{tag}] 跳转目标在 body 内（或为 usize::MAX 哨兵），不应被判为越界。\n\
-             谓词写宽 ⇒ 所有函数都跳过 SSA ⇒ `--opt` 被无声废掉。"
-        );
+        let (c0, base) = run(src, &format!("{tag}_base"), None);
+        assert_eq!(c0, 0, "[{tag}] 前提：默认档应成功; 实得 {c0}");
+        assert!(!base.is_empty(), "[{tag}] 前提：默认档应有输出");
+        for lvl in ["1", "2"] {
+            let (c, got) = run(src, &format!("{tag}_o{lvl}"), Some(lvl));
+            assert_eq!(
+                (c, got.clone()),
+                (c0, base.clone()),
+                "[{tag}] `--opt={lvl}` 与默认档不等价。
+  默认 exit={c0} {base:?}
+                   opt={lvl} exit={c} {got:?}"
+            );
+        }
     }
 }

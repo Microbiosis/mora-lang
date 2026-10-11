@@ -1,3 +1,16 @@
+# 所有文本文件在**所有平台**统一以 LF 检出与提交。
+#
+# v0.104.6：此前本仓**没有任何 eol 规则**，全靠 `core.autocrlf=true` 兜底。
+# 实测后果（`git ls-files --eol`）：提交形态 690 个 `i=lf`、零例外，而工作区
+# 在 Windows 上被检出成 `w=crlf`（687 个）、另有 `w=lf`（82 个）—— 也就是
+# **工作区行尾随平台摇摆**。更糟的是「本仓以 CRLF 为主」从来不是约定，只是
+# checkout 的产物：它会让人据此把 rustfmt 写出的 LF "还原"成 CRLF，而那等于
+# 跟官方格式化工具对着干（且因 git 在 commit 时归一化，**0 字节提交内容**变化）。
+#
+# `text=auto` 让 git 按内容判定文本/二进制；`eol=lf` 把工作区形态钉死为 LF。
+# 属性规则**后者胜出**，故下面的 PDF `binary` 行必须留在本行之后。
+* text=auto eol=lf
+
 # Binary fixtures must not be touched by line-ending normalization.
 # CI windows-latest runner previously failed with
 # `lopdf load error: couldn't parse input: invalid file trailer`

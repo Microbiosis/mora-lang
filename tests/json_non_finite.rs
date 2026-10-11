@@ -35,7 +35,7 @@ fn run(src: &str) -> Result<mora::value::Value, String> {
     let mut interp = mora::interpreter::Interpreter::new();
     let mut env = interp.take_env();
     let arc = Arc::new(func);
-    let r = mora::mir::vm::run_mir(
+    let r = mora::mir::vm::execute(
         &arc,
         &mut interp,
         &mut env,

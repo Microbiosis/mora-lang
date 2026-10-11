@@ -18,7 +18,7 @@
 #![allow(dead_code)]
 
 use mora::interpreter::Interpreter;
-use mora::mir::vm::{run_main_task, run_mir};
+use mora::mir::vm::{execute, run_main_task};
 use mora::typeck::{TypeError, check_mir::check_program_witnesses_bidirectional, format_error};
 use mora::value::Value;
 use std::path::PathBuf;
@@ -85,7 +85,7 @@ pub fn run_source(source: &str) -> E2eResult {
     let mut env = interp.take_env();
     let func_arc = Arc::new(func);
 
-    let last_expr = match run_mir(
+    let last_expr = match execute(
         &func_arc,
         &mut interp,
         &mut env,

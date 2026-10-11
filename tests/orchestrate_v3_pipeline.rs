@@ -6,7 +6,7 @@
 use mora::interpreter::Interpreter;
 use mora::mir::MirInst;
 use mora::mir::orchestrate::MirOrchestrateKind;
-use mora::mir::vm::run_mir;
+use mora::mir::vm::execute;
 use mora::parser_v3::ParserV3;
 
 fn compile_v3(source: &str) -> mora::mir::MirFunction {
@@ -184,7 +184,7 @@ print(result)
     let mut interp = Interpreter::new();
     let mut env = interp.take_env();
     let func_arc = std::sync::Arc::new(func);
-    let result = run_mir(
+    let result = execute(
         &func_arc,
         &mut interp,
         &mut env,
@@ -210,7 +210,7 @@ print(result)
     let mut interp = Interpreter::new();
     let mut env = interp.take_env();
     let func_arc = std::sync::Arc::new(func);
-    let result = run_mir(
+    let result = execute(
         &func_arc,
         &mut interp,
         &mut env,
@@ -248,7 +248,7 @@ result
     let mut interp = Interpreter::new();
     let mut env = interp.take_env();
     let func_arc = std::sync::Arc::new(func);
-    let result = run_mir(
+    let result = execute(
         &func_arc,
         &mut interp,
         &mut env,
@@ -282,7 +282,7 @@ result
     let mut interp = Interpreter::new();
     let mut env = interp.take_env();
     let func_arc = std::sync::Arc::new(func);
-    let result = run_mir(
+    let result = execute(
         &func_arc,
         &mut interp,
         &mut env,
@@ -317,7 +317,7 @@ result
     let mut interp = Interpreter::new();
     let mut env = interp.take_env();
     let func_arc = std::sync::Arc::new(func);
-    let result = run_mir(
+    let result = execute(
         &func_arc,
         &mut interp,
         &mut env,

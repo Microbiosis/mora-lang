@@ -43,7 +43,7 @@ use std::sync::Arc;
 
 use mora::interpreter::Interpreter;
 use mora::mir::effect::Effects;
-use mora::mir::vm::run_mir;
+use mora::mir::vm::execute;
 use mora::parser_v3::ParserV3;
 use mora::typeck::check_mir::check_program_witnesses_bidirectional;
 
@@ -62,7 +62,7 @@ fn run_with(src: &str) -> Result<(), String> {
     let arc = Arc::new(func);
     let mut interp = Interpreter::new();
     let mut env = interp.take_env();
-    run_mir(&arc, &mut interp, &mut env, &mut Effects::new()).map(|_| ())
+    execute(&arc, &mut interp, &mut env, &mut Effects::new()).map(|_| ())
 }
 
 // ===================================================================
@@ -151,6 +151,6 @@ fn statements_after_a_with_block_still_run() {
     let arc = Arc::new(func);
     let mut interp = Interpreter::new();
     let mut env = interp.take_env();
-    let v = run_mir(&arc, &mut interp, &mut env, &mut Effects::new()).expect("执行");
+    let v = execute(&arc, &mut interp, &mut env, &mut Effects::new()).expect("执行");
     assert_eq!(format!("{v:?}"), "Float(7.0)", "with 之后的末表达式应求值");
 }

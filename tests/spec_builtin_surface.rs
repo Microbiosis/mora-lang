@@ -46,7 +46,7 @@ use std::sync::Arc;
 
 use mora::interpreter::Interpreter;
 use mora::mir::effect::Effects;
-use mora::mir::vm::run_mir;
+use mora::mir::vm::execute;
 use mora::value::Value;
 
 /// 「名字没解析上」的四类失败 —— 出现任一即表面失守。
@@ -68,7 +68,7 @@ fn run(src: &str) -> Result<Value, String> {
     let arc = Arc::new(func);
     let mut interp = Interpreter::new();
     let mut env = interp.take_env();
-    run_mir(&arc, &mut interp, &mut env, &mut Effects::new())
+    execute(&arc, &mut interp, &mut env, &mut Effects::new())
 }
 
 /// v0.104.6 D151：`%TMP%` 占位符 → 一个**本次运行专属**的临时目录。

@@ -5,7 +5,7 @@
 //! | 位置 | 对 `Expr` / `Prompt` 的判定 |
 //! |---|---|
 //! | `mir/inst.rs::is_effect()` | 两者都算**有副作用** |
-//! | `mir/vm/dag.rs::is_memoizable_pure()` | `Expr` 算**纯**（可 memo 跳过） |
+//! | `mir/vm/engine.rs::is_memoizable_pure()` | `Expr` 算**纯**（可 memo 跳过） |
 //! | `mir/optimize/dag_rule.rs::same_inst_category()` | `Prompt` 算**可 CSE 合并** |
 //!
 //! 看起来像缺陷。**实测之后，两个矛盾都是安全的**：
@@ -90,7 +90,7 @@ const PROVABLY_EFFECTFUL: &[&str] = &[
 ];
 
 fn memoizable() -> Vec<String> {
-    whitelist("src/mir/vm/dag.rs", "is_memoizable_pure")
+    whitelist("src/mir/vm/engine.rs", "is_memoizable_pure")
 }
 
 /// `same_inst_category` 用**元组**模式 `(A(..), A(..)) => …`，不是 `|` 链。

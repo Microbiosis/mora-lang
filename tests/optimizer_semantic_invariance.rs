@@ -301,11 +301,13 @@ fn d412_tea_differential_now_passes() {
         out1, out0,
         "两条编译路径的输出应逐字相同（D412 已对齐）;\n 9layer : {out1}\n emit.rs: {out0}"
     );
-    // 核心：9 层管线对 TEA **不再回落**
+    // 核心：9 层管线对 TEA **不再回落**。
+    // v0.104.6 三态化：回落有多种措辞（未 legalize / 回归 / differential
+    // FAILED），故断言**完全没有 [9layer] 行**，与措辞解耦且更严。
     assert!(
-        !err1.contains("差分失败"),
-        "`tea_standalone.mora` 不应再触发差分失败 —— 9 层管线已能处理 \
-         `model` 字段默认值（D412 已修）。若又失败，说明该修复被撤销。\n\
+        !err1.contains("[9layer]"),
+        "`tea_standalone.mora` 不应再触发任何 9 层回落 —— 9 层管线已能处理 \
+         `model` 字段默认值（D412 已修）。若又回落，说明该修复被撤销。\n\
          stderr={err1}"
     );
     // 且结果本身不变（防「差分通过但两条路径一起错」）
@@ -316,7 +318,7 @@ fn d412_tea_differential_now_passes() {
     );
 }
 
-/// **差分失败必须**默认可见**（D36 已修「静默降级」）。
+/// **差分失败必须**默认可见**（D36 已修「静默降级」；v0.104.6 起按三态措辞）。
 ///
 /// 这是本轮最该钉住的一条 —— 若它退回静默，用户会以为在跑 9 层管线，
 /// 实际跑的是回落路径。
@@ -330,13 +332,22 @@ fn d412_tea_differential_now_passes() {
 ///
 /// ⚠ 若将来 `worker` 也不回落了，本条需要**再换样本**，而不是删掉 ——
 ///   「差分失败不得静默」这条性质与用哪个样本无关。
+///
+/// ## v0.104.6：措辞更新（三态化）
+///
+/// 生产门已从「整函数二值差分」改为**显式合法性登记 + 三态判定**。`worker`
+/// 含未 legalize 构造 `worker`，故现在走「按名回落（预期）」这一支，stderr
+/// 措辞由「差分失败」改为「**未 legalize 构造 ["worker"]** …（预期，非缺陷）」。
+/// 本条守护的**性质不变**——回落必须默认可见并指向 DEBUG 开关——只是断言的
+/// 是新措辞，且现在**额外**要求点名该构造（三态化的核心收益）。
 #[test]
 fn d364_differential_failure_is_never_silent() {
     let dir = std::env::temp_dir().join("mora_d364_visibility");
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("建临时目录");
     let script = dir.join("worker.mora");
-    // 9 层降级链无 `Worker` 类别 ⇒ 差分失败（见 nine_layer_fallback_reasons）。
+    // 9 层降级链无 `Worker` 类别 ⇒ 未 legalize（见 legalization.rs /
+    // nine_layer_fallback_reasons）。
     std::fs::write(&script, "worker w do\n  print(1)\nend\n").expect("写脚本");
 
     let exe = concat!(env!("CARGO_MANIFEST_DIR"), "/target/debug/mora.exe");
@@ -344,9 +355,13 @@ fn d364_differential_failure_is_never_silent() {
     let out = Command::new(exe).arg(&script).output().expect("跑 mora");
     let err = String::from_utf8_lossy(&out.stderr).into_owned();
     let _ = std::fs::remove_dir_all(&dir);
+    // v0.104.6 三态化：`worker` 含未 legalize 构造，走「按名回落（预期）」支。
+    // 该支的职责是**默认可见 + 按名点名**（让「已知缺口」不再与「回归」同形）；
+    // 「指向 DEBUG」是「回归」支的额外提示，因为那里才有 diff 可查。故此处
+    // 断言「未 legalize」+ 构造名 + 「回落」字样即满足「不得静默」的性质。
     assert!(
-        err.contains("差分失败") && err.contains("MORA_9LAYER_DEBUG"),
-        "差分失败必须**默认打一行摘要**并指向 DEBUG 开关（D36 已修「静默降级」）。\n\
+        err.contains("未 legalize") && err.contains("worker") && err.contains("回落"),
+        "回落必须**默认可见**并按**构造名**点名（三态化的「预期回落」支）。\n\
          ⚠ 若 `worker` 形态也已走上管线，请**换一个仍会回落的样本**，不要删掉本条。\n\
          stderr={err}"
     );

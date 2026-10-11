@@ -35,7 +35,7 @@ impl Interpreter {
                 // v0.94: app 是纯值 —— 用 with_model 构造初始 model，返回新 app。
                 let app = if has_init {
                     // 调用 init closure 获取初始 model；失败则回落第一个 arg。
-                    match self.call_value(
+                    match self.call_value_impl(
                         &app.init,
                         vec![],
                         &mut crate::mir::effect::Effects::new(),
@@ -128,7 +128,7 @@ impl Interpreter {
                     Value::TeaApp(a) => a.clone(),
                     _ => return Err("tea.view: first arg must be TeaApp".to_string()),
                 };
-                match self.call_value(
+                match self.call_value_impl(
                     &app.view,
                     vec![app.model()],
                     &mut crate::mir::effect::Effects::new(),

@@ -50,6 +50,12 @@ pub enum WitnessKind {
     },
     FnDef {
         name: String,
+        /// v0.104.6：显式声明的**类型参数**（`task f<T, U>(…)`）。
+        ///
+        /// 空 = 非泛型（与本刀之前逐字等价）。泛型声明时为各类型参数的**首字母**
+        /// （`Type::TypeVar` 是单 `char`；`fresh_type_var_id` 只发控制字符，
+        /// 故与用户声明的类型变量天然不撞名）。parser 保证首字母互不相同。
+        type_params: Vec<char>,
         params: Vec<WitnessParam>,
         return_type: Option<crate::mir::hint::TypeHint>,
         body: Box<MirWitness>,

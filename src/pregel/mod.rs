@@ -510,7 +510,7 @@ impl MirPregelEngine {
                     // v0.95: 读引擎自有的纯值 env 快照（与 run() PLAN 段一致）
                     let mut cond_env = self.exec_env().clone();
                     // v0.75.9: 包裹 Arc 走全局 DAG 缓存
-                    let cond_val = crate::mir::vm::run_mir(
+                    let cond_val = crate::mir::vm::execute(
                         &std::sync::Arc::new(cond_body.clone()),
                         host,
                         &mut cond_env,
@@ -701,7 +701,7 @@ impl MirPregelEngine {
                         if let Some(cond_body) = &edge.condition_body {
                             let mut cond_env = self.exec_env().clone();
                             // v0.75.9: 包裹 Arc 走全局 DAG 缓存
-                            let cond_val = crate::mir::vm::run_mir(
+                            let cond_val = crate::mir::vm::execute(
                                 &std::sync::Arc::new(cond_body.clone()),
                                 interpreter,
                                 &mut cond_env,
@@ -768,7 +768,7 @@ impl MirPregelEngine {
                 let mut master_env = self.exec_env().clone();
                 // v0.75.9: master_compute 已是 Arc，直接走全局 DAG 缓存
                 let mut master_effects = crate::mir::effect::Effects::new();
-                crate::mir::vm::run_mir(
+                crate::mir::vm::execute(
                     &master,
                     interpreter,
                     &mut master_env,
@@ -826,7 +826,7 @@ impl MirPregelEngine {
                         env.define("current".into(), acc.clone(), false);
                         env.define("incoming".into(), incoming.clone(), false);
                         // v0.75.9: combiner_bodies 已是 Arc，直接走全局 DAG 缓存
-                        match crate::mir::vm::run_mir(
+                        match crate::mir::vm::execute(
                             &combiner,
                             interpreter,
                             &mut env,
@@ -1390,7 +1390,7 @@ impl MirPregelEngine {
                     merge_env.define("incoming".into(), value, false);
                     // v0.75.9: 包裹 Arc 走全局 DAG 缓存
                     let mut merge_effects = crate::mir::effect::Effects::new();
-                    let v = crate::mir::vm::run_mir(
+                    let v = crate::mir::vm::execute(
                         &std::sync::Arc::new(merge_fn),
                         interpreter,
                         &mut merge_env,
@@ -1420,7 +1420,7 @@ impl MirPregelEngine {
                     merge_env.define("incoming".into(), value, false);
                     // v0.75.9: 包裹 Arc 走全局 DAG 缓存
                     let mut merge_effects = crate::mir::effect::Effects::new();
-                    let v = crate::mir::vm::run_mir(
+                    let v = crate::mir::vm::execute(
                         &std::sync::Arc::new(merge_fn),
                         interpreter,
                         &mut merge_env,

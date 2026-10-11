@@ -48,7 +48,9 @@ pub(super) fn loop_invariant_motion(ssa: &mut MirSsaFunction) {
         for bid in &natural_loop {
             let block = &ssa.blocks[*bid];
             for inst in &block.insts {
-                loop_defs.insert(ssa_dst(inst));
+                if let Some(d) = ssa_dst(inst) {
+                    loop_defs.insert(d);
+                }
             }
             for phi in &block.phis {
                 loop_defs.insert(phi.dst);
@@ -60,8 +62,12 @@ pub(super) fn loop_invariant_motion(ssa: &mut MirSsaFunction) {
         for bid in &natural_loop {
             let block = &ssa.blocks[*bid];
             for inst in &block.insts {
-                if is_loop_invariant(inst, &loop_defs) {
-                    invariants.push((ssa_dst(inst), inst.clone()));
+                // `is_loop_invariant` 为 false 的分支恒是「不写寄存器」
+                // （副作用指令）或 `Opaque`（不可外提），此处只会拿到有写的。
+                if let Some(d) = ssa_dst(inst)
+                    && is_loop_invariant(inst, &loop_defs)
+                {
+                    invariants.push((d, inst.clone()));
                 }
             }
         }
@@ -226,6 +232,9 @@ fn is_loop_invariant(inst: &SsaInst, loop_defs: &HashSet<SsaReg>) -> bool {
             !loop_defs.contains(recv) && !args.iter().any(|a| loop_defs.contains(a))
         }
         SsaInst::Pipe(_, lhs, rhs) => !loop_defs.contains(lhs) && !loop_defs.contains(rhs),
+        SsaInst::CallValue(_, callee, args) => {
+            !loop_defs.contains(callee) && !args.iter().any(|a| loop_defs.contains(a))
+        }
         SsaInst::Prompt(_, parts) => !parts.iter().any(|p| loop_defs.contains(p)),
         SsaInst::Copy(_, src) => !loop_defs.contains(src),
         // 副作用指令不移动
@@ -233,6 +242,10 @@ fn is_loop_invariant(inst: &SsaInst, loop_defs: &HashSet<SsaReg>) -> bool {
         | SsaInst::Assign(_, _)
         | SsaInst::Expr(_)
         | SsaInst::IndexAssign(_, _, _) => false,
+        // v0.104.6 D417：不透明指令**不可外提**。SSA 不为其建模语义，
+        // 既无法证明它无副作用（`Perform` / `Send` / `Transaction` / `Import` …），
+        // 也无法证明它可重入；`is_effect()` 只覆盖一部分变体。
+        SsaInst::Opaque(_) => false,
     }
 }
 
@@ -274,11 +287,13 @@ fn set_dst_ssa(inst: &mut SsaInst, d: SsaReg) {
         SsaInst::IndexAssign(dst, _, _) => *dst = d,
         SsaInst::MethodCall(dst, _, _, _) => *dst = d,
         SsaInst::Pipe(dst, _, _) => *dst = d,
+        SsaInst::CallValue(dst, _, _) => *dst = d,
         SsaInst::Prompt(dst, _) => *dst = d,
         SsaInst::Copy(dst, _) => *dst = d,
         SsaInst::Define(_, dst) => *dst = d,
         SsaInst::Assign(_, dst) => *dst = d,
         SsaInst::Expr(dst) => *dst = d,
+        SsaInst::Opaque(m) => *m = m.with_written_reg(d),
     }
 }
 
@@ -327,6 +342,12 @@ pub(super) fn apply_reg_replace(inst: &mut SsaInst, old_reg: SsaReg, new_reg: Ss
             replace(lhs);
             replace(rhs);
         }
+        SsaInst::CallValue(_, callee, args) => {
+            replace(callee);
+            for a in args {
+                replace(a);
+            }
+        }
         SsaInst::Prompt(_, parts) => {
             for r in parts {
                 replace(r);
@@ -336,6 +357,9 @@ pub(super) fn apply_reg_replace(inst: &mut SsaInst, old_reg: SsaReg, new_reg: Ss
         SsaInst::Define(_, src) => replace(src),
         SsaInst::Assign(_, src) => replace(src),
         SsaInst::Expr(src) => replace(src),
+        // 读侧替换：寄存器位置只有 `MirInst` 知道（含 `MatchExpr` 的
+        // scrutinee、`Perform` 的实参、`WithConfig` 的绑定值 …）。
+        SsaInst::Opaque(m) => *m = m.map_regs(&mut |r| if r == old_reg { new_reg } else { r }),
         SsaInst::Const(_, _) | SsaInst::Var(_, _) => {}
     }
 }
@@ -375,7 +399,9 @@ pub(super) fn loop_strength_reduction(ssa: &mut MirSsaFunction) {
         for bid in &natural_loop {
             let block = &ssa.blocks[*bid];
             for inst in &block.insts {
-                loop_defs.insert(ssa_dst(inst));
+                if let Some(d) = ssa_dst(inst) {
+                    loop_defs.insert(d);
+                }
             }
             for phi in &block.phis {
                 loop_defs.insert(phi.dst);
@@ -443,7 +469,7 @@ pub(super) fn loop_strength_reduction(ssa: &mut MirSsaFunction) {
 fn find_binary_inst(blocks: &[crate::mir::ssa::BasicBlock], reg: SsaReg) -> Option<&SsaInst> {
     for block in blocks {
         for inst in &block.insts {
-            if ssa_dst(inst) == reg && matches!(inst, SsaInst::BinaryOp(_, _, _, _)) {
+            if ssa_dst(inst) == Some(reg) && matches!(inst, SsaInst::BinaryOp(_, _, _, _)) {
                 return Some(inst);
             }
         }

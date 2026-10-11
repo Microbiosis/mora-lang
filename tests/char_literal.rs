@@ -31,7 +31,7 @@
 use std::sync::Arc;
 
 use mora::interpreter::Interpreter;
-use mora::mir::vm::run_mir;
+use mora::mir::vm::execute;
 use mora::parser_v3::ParserV3;
 use mora::typeck::check_mir::check_program_witnesses_bidirectional;
 
@@ -51,7 +51,7 @@ fn run(src: &str) -> String {
     let arc = Arc::new(func);
     let mut interp = Interpreter::new();
     let mut env = interp.take_env();
-    match run_mir(
+    match execute(
         &arc,
         &mut interp,
         &mut env,
@@ -73,7 +73,7 @@ fn expect_runtime_only(cases: &[(&str, &str, &str)]) {
             let arc = Arc::new(func);
             let mut interp = Interpreter::new();
             let mut env = interp.take_env();
-            match run_mir(
+            match execute(
                 &arc,
                 &mut interp,
                 &mut env,
@@ -136,7 +136,7 @@ fn char_literal_goes_through_both_compile_paths() {
             let arc = Arc::new(f);
             let mut interp = Interpreter::new();
             let mut env = interp.take_env();
-            match run_mir(
+            match execute(
                 &arc,
                 &mut interp,
                 &mut env,

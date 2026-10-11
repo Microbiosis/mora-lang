@@ -12,26 +12,18 @@
 //!     ↓
 //!   ehir_to_core()         → CoreFunction           \[Core\]
 //!     ↓
-//!   core_to_cmir()         → CmirBlock              \[CMIR\]
-//!     ↓
-//!   cmir_to_lmir()         → LmirInst[] + layouts   \[LMIR\]
-//!     ↓
-//!   populate_layout_table()→ LayoutTable            [RIR 桥]
+//!   （v0.104.6：CMIR / LMIR / RIR 三层已删除 —— 它们不在产出路径上，
+//!    详见 `mir/mod.rs` 的删除说明）
 //!     ↓
 //!   差分验证: lower_fcfg(fcfg) vs 原 MirFunction 指令形状等价
 //!
 //! 执行器仍消费原 MirFunction（Phase 2 切换，待差分验证全绿后）。
 
 use crate::mir::MirFunction;
-use crate::mir::cmir_to_lmir::cmir_to_lmir;
 use crate::mir::core::CoreFunction;
-use crate::mir::core_to_cmir::core_to_cmir;
 use crate::mir::ehir_to_core::ehir_to_core;
 use crate::mir::fcfg::Fcfg;
 use crate::mir::fcfg_lower::lower_fcfg;
-use crate::mir::lmir::LmirInst;
-use crate::mir::lmir_to_rir::populate_layout_table;
-use crate::mir::rir::LayoutTable;
 use crate::mir::witness::MirWitness;
 use crate::mir::witness_to_fcfg::witness_to_fcfg;
 use crate::typeck::annotate::annotate;
@@ -46,12 +38,6 @@ pub struct PipelineResult {
     pub typed_nodes: usize,
     /// Core 指令数。
     pub core_insts: usize,
-    /// CMIR 节点数。
-    pub cmir_nodes: usize,
-    /// LMIR 指令数。
-    pub lmir_insts: usize,
-    /// LayoutTable 条目数。
-    pub layouts: usize,
     /// 差分验证：新管线产出的 MirInst 数。
     pub pipeline_mir_count: usize,
     /// 差分验证：原管线 MirInst 数。
@@ -60,9 +46,16 @@ pub struct PipelineResult {
     pub differential_ok: bool,
     /// 差分差异描述（失败时非空）。
     pub differential_diffs: Vec<String>,
+    /// v0.104.6：本程序命中的「未 legalize 构造」（MLIR ConversionTarget 的
+    /// Mora 侧对应）。空 = 全部构造已接入 9 层管线。生产门据此把回落拆成三态：
+    /// 「合法且绿」走快路径 / 「含未 legalize 构造」按名回落（预期）/
+    /// 「全合法却差分红」= 回归（大声报）。见 [`crate::mir::legalization`]。
+    pub unlegalized_constructs: Vec<&'static str>,
 }
 
-/// 运行完整 9 层管线（FCFG → EHIR → Core → CMIR → LMIR → LayoutTable）。
+/// 运行管线（FCFG → EHIR → Core → MIR，经 lower_fcfg）。
+///
+/// v0.104.6：原「9 层」中的 CMIR / LMIR / RIR 已删除（不在产出路径上）。
 ///
 /// 输入：ParserV3::compile() 的产出（MirFunction + witnesses）。
 /// **必须在 apply_rules 之前调用**（差分要求 raw-to-raw 比较）。
@@ -81,18 +74,6 @@ pub fn run_pipeline(func: &MirFunction, witnesses: &[MirWitness]) -> (PipelineRe
     let core: CoreFunction = ehir_to_core(&ehir, vec![], func.effects.clone());
     let core_insts = core.blocks.iter().map(|b| b.insts.len()).sum();
 
-    // ── CMIR ──
-    let cmir = core_to_cmir(&core);
-    let cmir_nodes = cmir.nodes.len();
-
-    // ── LMIR ──
-    let (lmir_insts_vec, layouts_raw): (Vec<LmirInst>, _) = cmir_to_lmir(&cmir);
-    let lmir_insts = lmir_insts_vec.len();
-
-    // ── RIR 布局表 ──
-    let _layout_table: LayoutTable = populate_layout_table(&lmir_insts_vec, &layouts_raw);
-    let layouts = layouts_raw.len();
-
     // ── 管线产出的 MirFunction（执行器切换的输入）──
     let (pipeline_body, pipeline_n_regs) = lower_fcfg(&fcfg);
     let pipeline_func = MirFunction {
@@ -107,17 +88,26 @@ pub fn run_pipeline(func: &MirFunction, witnesses: &[MirWitness]) -> (PipelineRe
     let original_mir_count = func.body.len();
     let (differential_ok, differential_diffs) = differential_check(&pipeline_body, &func.body);
 
+    // ── 显式合法性登记：本程序是否含「尚未接入 9 层管线」的构造 ──
+    //
+    // 两侧都扫：管线的降级链缺某个类别时，`original` 侧仍会有对应指令
+    // （如 Worker / Transaction），此时即便管线产出 0 条也能定位到原因。
+    let mut unlegalized_constructs = crate::mir::legalization::scan_unlegalized(func);
+    for name in crate::mir::legalization::scan_unlegalized(&pipeline_func) {
+        if !unlegalized_constructs.contains(&name) {
+            unlegalized_constructs.push(name);
+        }
+    }
+
     let result = PipelineResult {
         fcfg_nodes,
         typed_nodes,
         core_insts,
-        cmir_nodes,
-        lmir_insts,
-        layouts,
         pipeline_mir_count,
         original_mir_count,
         differential_ok,
         differential_diffs,
+        unlegalized_constructs,
     };
     (result, pipeline_func)
 }
@@ -533,6 +523,7 @@ fn inst_category(inst: &crate::mir::MirInst) -> &'static str {
         MirInst::Copy(_, _) => "Copy",
         MirInst::BinaryOp(_, _, _, _) => "BinaryOp",
         MirInst::Call(_, _, _) => "Call",
+        MirInst::CallValue(_, _, _) => "CallValue",
         MirInst::ListLit(_, _) => "ListLit",
         MirInst::DictLit(_, _) => "DictLit",
         MirInst::Index(_, _, _) => "Index",
@@ -647,16 +638,14 @@ mod tests {
 
     #[test]
     fn pipeline_arithmetic() {
-        // 顶层字面量 → LMIR 布局表填充（task 内字面量在嵌套闭包体中）
+        // 顶层字面量 → FCFG/Core 非空（task 内字面量在嵌套闭包体中）
         let src = "let x = 42i\nlet y = 3.5\nx";
         let (func, witnesses) = crate::parser_v3::ParserV3::compile(src).unwrap();
         let (result, pipeline_func) = run_pipeline(&func, &witnesses);
         assert!(result.fcfg_nodes > 0, "FCFG should be non-empty");
         assert!(result.core_insts > 0, "Core should be non-empty");
-        assert!(
-            result.layouts > 0,
-            "LayoutTable should be populated (top-level Int/Float consts)"
-        );
+        // v0.104.6：原断言 `result.layouts > 0`（LMIR 布局表）随三层删除移除 ——
+        // 布局表不在产出路径上，断言它无意义。
         assert!(
             !pipeline_func.body.is_empty(),
             "pipeline MirFunction should be non-empty"

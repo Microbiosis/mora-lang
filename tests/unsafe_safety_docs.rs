@@ -8,14 +8,17 @@
 //! | 文件 | unsafe | 参与编译 | 真实执行 |
 //! |---|---|---|---|
 //! | `mir/jit.rs` | 10 | ✅ | **仅测试**：`LegacyJitBackend::try_compile` 是恒定 `CompileReject` 的占位实现（生产回落解释器），真正执行的是 `tests/jit_compile.rs` 的 19 个差分测试 |
-//! | `mir/lmir_to_mir.rs` | 1 | ❌ **`mir/mod.rs` 未声明该模块** | 永不执行 |
+//! | ~~`mir/lmir_to_mir.rs`~~ | ~~1~~ | — | **v0.104.6 已删除**（见下） |
 //! | `sandbox/container.rs` / `interpreter/builtins/exec.rs` | 3 | ✅ | **`#[cfg(unix)]`，Windows 上不编译** |
 //! | `document/backend/image.rs` | 3 | ✅ | 仅测试（`EnvGuard` 已有 SAFETY） |
 //!
 //! ⇒ 高危 unsafe 集中在 JIT，而 JIT 的**生产路径是关闭的**。
-//! `lmir_to_mir.rs` 那处 `from_utf8_unchecked` 是**定时炸弹**：不参与编译所以
-//! 现在无害，但一旦有人补 `mod lmir_to_mir;`，没有 null / 长度 / UTF-8 检查的
-//! 裸指针解引用会**立刻变成真实 UB**。
+//!
+//! **v0.104.6：上述「定时炸弹」已随删除而消除。**
+//! `lmir_to_mir.rs` 此前是**未声明模块**（`mir/mod.rs` 未 `mod` 它 ⇒ 根本不参与
+//! 编译），其中那处 `from_utf8_unchecked` 一旦有人补声明即变成真实 UB。取证确认
+//! 它**不在产出路径上**（管线产出的 MIR 来自 `lower_fcfg(&fcfg)`，与 LMIR 无关），
+//! 连同 CMIR / RIR 一并删除（合计 1455 行），UB 隐患随之消失。
 //!
 //! ## 本判据的作用
 //!

@@ -48,7 +48,7 @@ pub fn run_record(path: &str, name: &str, opt_level: Option<crate::mir::ssa::Opt
 
     // v0.75.9: 包裹 Arc 走全局 DAG 缓存
     let func_arc = std::sync::Arc::new(func);
-    match crate::mir::vm::run_mir(
+    match crate::mir::vm::execute(
         &func_arc,
         &mut interpreter,
         &mut env,
@@ -165,7 +165,7 @@ pub fn run_replay(path: &str, name: &str, opt_level: Option<crate::mir::ssa::Opt
 
     // v0.75.9: 包裹 Arc 走全局 DAG 缓存
     let func_arc = std::sync::Arc::new(func);
-    if let Err(e) = crate::mir::vm::run_mir(
+    if let Err(e) = crate::mir::vm::execute(
         &func_arc,
         &mut interpreter,
         &mut env,
@@ -493,7 +493,7 @@ pub fn run_snapshot(
     let mut env = interpreter.take_env();
     // v0.75.9: 包裹 Arc 走全局 DAG 缓存
     let func_arc = std::sync::Arc::new(func);
-    if let Err(e) = crate::mir::vm::run_mir(
+    if let Err(e) = crate::mir::vm::execute(
         &func_arc,
         &mut interpreter,
         &mut env,

@@ -47,7 +47,7 @@ use std::sync::Arc;
 
 use mora::interpreter::Interpreter;
 use mora::mir::effect::Effects;
-use mora::mir::vm::run_mir;
+use mora::mir::vm::execute;
 use mora::value::Value;
 
 fn run(src: &str) -> Result<Value, String> {
@@ -61,7 +61,7 @@ fn run(src: &str) -> Result<Value, String> {
     let arc = Arc::new(func);
     let mut interp = Interpreter::new();
     let mut env = interp.take_env();
-    run_mir(&arc, &mut interp, &mut env, &mut Effects::new())
+    execute(&arc, &mut interp, &mut env, &mut Effects::new())
 }
 
 /// 错标注必须被拒 —— 修前 Dict 方法这一路全部被静默接受。
@@ -256,7 +256,7 @@ fn with_block_agrees_across_both_compile_paths() {
     let arc = Arc::new(func);
     let mut interp = Interpreter::new();
     let mut env = interp.take_env();
-    match run_mir(&arc, &mut interp, &mut env, &mut Effects::new()) {
+    match execute(&arc, &mut interp, &mut env, &mut Effects::new()) {
         Ok(Value::Nil) => {}
         Ok(other) => panic!("生产路径上 `with` 块的值应为 Nil，实得 {other:?}"),
         Err(e) => panic!("生产路径上 `with` 块应能运行，实得: {e}"),

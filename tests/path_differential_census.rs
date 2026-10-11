@@ -14,7 +14,7 @@
 //! 两处内容完全一致的 Dict 被判不等 —— 是判据的错，不是产品的错。
 
 use mora::interpreter::Interpreter;
-use mora::mir::vm::run_mir;
+use mora::mir::vm::execute;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -22,7 +22,7 @@ fn run_func(func: mora::mir::MirFunction) -> String {
     let mut interp = Interpreter::new();
     let mut env = interp.take_env();
     let arc = Arc::new(func);
-    match run_mir(
+    match execute(
         &arc,
         &mut interp,
         &mut env,
@@ -260,36 +260,45 @@ fn d123_d118_d119_fixes_hold_on_both_compile_paths() {
     );
 }
 
-/// D123 查明的能力缺口： **`f(…)(…)` 连续调用不支持**（但**明确报错**，非静默）。
+/// D123 查明、v0.104.6 **已补齐**的能力缺口： `f(…)(…)` 连续调用。
 ///
 /// ```mora
 /// let mk = fn(x) fn(y) x + y end end
-/// print(mk(1)(2))      -- ✗ Parse error: Expected ')' at line 2
+/// mk(1)(2)                    -- ✓ 现在取到 3.0（此前 ✗ Parse error: Expected ')'）
 /// let g = mk(1)
-/// print(g(2))          -- ✓ 分两步可行
+/// g(2)                        -- ✓ 分两步同样可行
 /// ```
 ///
-/// 根因：`emit_call_tail_w` 的后缀链只处理 `.`（方法）与 `[`（索引），
-/// **没有 `(`** 分支去消费「对调用结果再次调用」。
+/// 根因曾是 `emit_call_tail_w` 的后缀链只处理 `.` 与 `[`，**没有 `(`** 分支；
+/// 且 spec §14.2 的 EBNF 里 `call` 的被调用者只能是 `IDENTIFIER`（**无 `postfix`
+/// 产生式**）。v0.104.6 两处都补了（新增 `MirInst::CallValue` 承载 N 元值调用）。
 ///
-/// 判定为**能力缺口**而非缺陷：spec §14.2 的 EBNF 里 `call` 的被调用者
-/// 只能是 `IDENTIFIER`（**无 `postfix` 产生式**），`expr` 联合式也没有
-/// 「后缀链」那一项。故 spec 从未承诺此形态，实现报错**符合 spec**。
+/// ## 本条的判据已随能力翻转（它自己预言过这件事）
 ///
-/// 本条钉住的是「**必须报错**」—— 若哪天有人加了 `(` 分支却处理不周，
-/// 这条会从「拒绝」翻成「成功」，提醒同步更新 spec 与 CHANGELOG。
+/// 原判据是「必须报错」，文档里写着「若哪天有人加了 `(` 分支却处理不周，这条会
+/// 从『拒绝』翻成『成功』，提醒同步更新 spec 与 CHANGELOG」。现在正是那一刻 ——
+/// 但**结论不是「实现是半成品」**：两条路径给出的是**同一个正确值 3.0**。
+/// 修复前它们也都 exit 0，只是算成 `10`（`pipeline_equivalence.rs` 里记着），
+/// 那才是「静默算错」。
+///
+/// ⚠ 本文件的 `direct` / `pipelined` 走 `run_mir`，**绕过 typeck**。所以这条
+/// 证明的是**运行期两条路径一致且取到正确值**；typeck 那侧对**柯里化闭包**
+/// （`fn(x) fn(y) …`）仍按 `arrow_arity` 数整条 Arrow 链而拒绝 `mk(1)` ——
+/// 那是另一条独立策略（有意不支持隐式部分应用），见 `postfix_value_call.rs`。
 #[test]
-fn d123_consecutive_call_chaining_is_rejected_on_both_paths() {
-    // 一��调用：明确报错
+fn d123_consecutive_call_chaining_agrees_on_both_paths() {
+    // 连续调用：两条路径都必须给出**正确值**，而不是「一致地算错」
     let chained = "let mk = fn(x) fn(y) x + y end end\nmk(1)(2)\n";
     let d = direct(chained);
     let q = pipelined(chained);
-    assert!(
-        d.starts_with("COMPILE-ERR") && q.starts_with("COMPILE-ERR"),
-        "`f(…)(…)` 当前应在两条路径上都被**拒绝**（spec 无 postfix 产生式）; \
-         direct={d} pipelined={q}"
+    assert_eq!(
+        d, "3.0",
+        "`f(…)(…)` 连续调用自 v0.104.6 起应取到 1 + 2 = 3.0; direct={d}"
     );
-    assert_eq!(d, q, "两条路径的拒绝理由必须一致（错误串已归一化）");
+    assert_eq!(
+        d, q,
+        "两条路径必须给出同一**正确值**；一致地算错（修复前两条都是 10）不算过"
+    );
 
     // 对照组 1：分两步调用可用，且两条路径取值一致
     let stepwise = "let mk = fn(x) fn(y) x + y end end\nlet g = mk(1)\ng(2)\n";

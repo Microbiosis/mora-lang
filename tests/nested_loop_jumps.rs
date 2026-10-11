@@ -360,7 +360,7 @@ fn if_as_value_not_starved_by_dead_branch() {
         let mut interp = mora::interpreter::Interpreter::new();
         let mut env = interp.take_env();
         let arc = Arc::new(f);
-        mora::mir::vm::run_mir(
+        mora::mir::vm::execute(
             &arc,
             &mut interp,
             &mut env,

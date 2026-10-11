@@ -7,13 +7,14 @@
 use std::collections::HashMap;
 
 use super::handlers::{
-    AppDefArgs, Flow, h_aggregate, h_app_def, h_assign, h_binary_op, h_break, h_call, h_closure,
-    h_const, h_continue, h_define, h_dict_lit, h_document_section, h_dyn_trait, h_enum_def, h_eval,
-    h_export_mark, h_halt, h_handle, h_impl_def, h_import, h_index, h_index_assign, h_jump,
-    h_jump_if, h_jump_if_not, h_list_lit, h_macro_def, h_match_expr, h_method_call, h_model_def,
-    h_msg_def, h_observe, h_orchestrate, h_parallel, h_perform, h_pipe, h_prompt, h_prompt_section,
-    h_quasiquote, h_rel_def, h_return, h_send, h_solve, h_span, h_struct_def, h_task_def,
-    h_trait_def, h_transaction, h_type_alias, h_update_def, h_var, h_with_config, h_worker,
+    AppDefArgs, Flow, h_aggregate, h_app_def, h_assign, h_binary_op, h_break, h_call, h_call_value,
+    h_closure, h_const, h_continue, h_define, h_dict_lit, h_document_section, h_dyn_trait,
+    h_enum_def, h_eval, h_export_mark, h_halt, h_handle, h_impl_def, h_import, h_index,
+    h_index_assign, h_jump, h_jump_if, h_jump_if_not, h_list_lit, h_macro_def, h_match_expr,
+    h_method_call, h_model_def, h_msg_def, h_observe, h_orchestrate, h_parallel, h_perform, h_pipe,
+    h_prompt, h_prompt_section, h_quasiquote, h_rel_def, h_return, h_send, h_solve, h_span,
+    h_struct_def, h_task_def, h_trait_def, h_transaction, h_type_alias, h_update_def, h_var,
+    h_with_config, h_worker,
 };
 
 use crate::mir::host::MirHost;
@@ -35,6 +36,8 @@ impl MirInst {
             MirInst::Copy(r, _) => Some(*r),
             MirInst::BinaryOp(r, _, _, _) => Some(*r),
             MirInst::Call(r, _, _) => Some(*r),
+            // 值调用的结果寄存器（被调者在寄存器里，形态同按名调用）。
+            MirInst::CallValue(r, _, _) => Some(*r),
             MirInst::MethodCall(r, _, _, _) => Some(*r),
             MirInst::ListLit(r, _) => Some(*r),
             MirInst::DictLit(r, _) => Some(*r),
@@ -87,6 +90,56 @@ impl MirInst {
         }
     }
 
+    /// 把本指令写的寄存器换成 `new` —— [`Self::map_regs`]（只改输入）的
+    /// 对称操作，供 SSA 版本化使用：SSA 重命名给每条指令分配 fresh 号时，
+    /// 输入走 `map_regs`、输出走这里。
+    ///
+    /// `MatchExpr` 的**所有臂**一起改：降维契约是「所有 arm 写同一个外层
+    /// 寄存器」（`fcfg_lower::lower_match` 与 `lower.rs` 的 `WitnessKind::Match`
+    /// 都传同一个 `dst`），`h_match_expr` 也只写这一个；只改最后一个臂会
+    /// 在「臂的 output_reg 不一致」的畸形输入上留下两套空间。
+    pub fn with_written_reg(&self, new: Reg) -> MirInst {
+        let mut m = self.clone();
+        match &mut m {
+            MirInst::Const(r, _)
+            | MirInst::Var(r, _)
+            | MirInst::Copy(r, _)
+            | MirInst::BinaryOp(r, _, _, _)
+            | MirInst::Call(r, _, _)
+            | MirInst::CallValue(r, _, _)
+            | MirInst::MethodCall(r, _, _, _)
+            | MirInst::ListLit(r, _)
+            | MirInst::DictLit(r, _)
+            | MirInst::Index(r, _, _)
+            | MirInst::IndexAssign(r, _, _)
+            | MirInst::Pipe(r, _, _)
+            | MirInst::Prompt(r, _)
+            | MirInst::Perform { dst: r, .. }
+            | MirInst::Closure { dst: r, .. }
+            | MirInst::DynTrait { dst: r, .. }
+            | MirInst::Solve { dst: r, .. }
+            | MirInst::Quasiquote { dst: r, .. } => *r = new,
+            MirInst::MatchExpr { arms, .. } => {
+                for (_, _, _, out) in arms.iter_mut() {
+                    *out = new;
+                }
+            }
+            MirInst::Handle { k_dst, .. } => *k_dst = new,
+            _ => {}
+        }
+        debug_assert_eq!(
+            m.written_reg(),
+            if self.written_reg().is_some() {
+                Some(new)
+            } else {
+                None
+            },
+            "with_written_reg 漏掉了某个能写的变体 —— 新增 MirInst 变体时，\
+             `written_reg()` 与本方法的匹配必须同步更新"
+        );
+        m
+    }
+
     pub fn input_regs(&self) -> Vec<Reg> {
         match self {
             MirInst::Const(_, _) => vec![],
@@ -94,6 +147,12 @@ impl MirInst {
             MirInst::Copy(_, src) => vec![*src],
             MirInst::BinaryOp(_, lhs, _, rhs) => vec![*lhs, *rhs],
             MirInst::Call(_, _, args) => args.clone(),
+            // 值调用：被调者寄存器 + 实参**都**是输入。
+            MirInst::CallValue(_, callee, args) => {
+                let mut v = vec![*callee];
+                v.extend(args);
+                v
+            }
             MirInst::Perform { args, .. } => args.clone(),
             // Handle: body 与 handler 用独立 reg 空间（已 box 化），不读外层任何 reg。
             // k_dst 是 output reg（handler 末尾 resume 续 的返回值），由 h_handle 写。
@@ -178,6 +237,9 @@ impl MirInst {
             MirInst::BinaryOp(r, l, op, rr) => MirInst::BinaryOp(*r, m(*l), op.clone(), m(*rr)),
             MirInst::Call(r, name, args) => {
                 MirInst::Call(*r, name.clone(), args.iter().map(|a| m(*a)).collect())
+            }
+            MirInst::CallValue(r, callee, args) => {
+                MirInst::CallValue(*r, m(*callee), args.iter().map(|a| m(*a)).collect())
             }
             // Perform: dst 不映射（SSA 自行管理），args 全部映射。
             MirInst::Perform { dst, effect, args } => MirInst::Perform {
@@ -380,6 +442,7 @@ impl MirInst {
             | MirInst::Copy(_, _)
             | MirInst::BinaryOp(_, _, _, _)
             | MirInst::Call(_, _, _)
+            | MirInst::CallValue(_, _, _)
             | MirInst::MethodCall(_, _, _, _)
             | MirInst::ListLit(_, _)
             | MirInst::DictLit(_, _)
@@ -414,6 +477,12 @@ pub fn dispatch(
 ) -> Result<Flow, String> {
     match inst {
         // ── Pure value ──
+        // N 元值调用：被调者在寄存器里。委托既有的调用执行面
+        // （`h_call` 的值调用分支），不重写调用语义。
+        MirInst::CallValue(dst, callee, args) => {
+            h_call_value(regs, *dst, *callee, args, interp, effects)?;
+            Ok(Flow::Continue)
+        }
         MirInst::Const(dst, v) => {
             h_const(regs, *dst, v);
             Ok(Flow::Continue)

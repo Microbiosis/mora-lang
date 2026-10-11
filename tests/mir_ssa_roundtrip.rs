@@ -36,7 +36,7 @@
 
 use mora::interpreter::Interpreter;
 use mora::mir::ssa::OptLevel;
-use mora::mir::vm::{run_main_task, run_mir};
+use mora::mir::vm::{execute, run_main_task};
 use mora::parser_v3::ParserV3;
 
 /// 应用 SSA 优化（不 panic 即通过 — 管线正确性由等价性测试治理）。
@@ -46,7 +46,7 @@ fn optimize_without_panic(source: &str, level: OptLevel) {
     let mut interp = Interpreter::new();
     let mut env = interp.take_env();
     let func_arc = std::sync::Arc::new(func);
-    let _ = run_mir(
+    let _ = execute(
         &func_arc,
         &mut interp,
         &mut env,
@@ -70,7 +70,7 @@ fn assert_task_equiv(source: &str) {
         let mut interp = Interpreter::new();
         let mut env = interp.take_env();
         let func_arc = std::sync::Arc::new(func);
-        let v = run_mir(
+        let v = execute(
             &func_arc,
             &mut interp,
             &mut env,
@@ -141,7 +141,7 @@ fn assert_top_level_equiv(source: &str) {
         }
         let mut interp = Interpreter::new();
         let mut env = interp.take_env();
-        run_mir(
+        execute(
             &std::sync::Arc::new(func),
             &mut interp,
             &mut env,

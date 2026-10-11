@@ -29,7 +29,7 @@
 use std::sync::Arc;
 
 use mora::interpreter::Interpreter;
-use mora::mir::vm::run_mir;
+use mora::mir::vm::execute;
 
 /// 走**生产路径**（`cli::compile_and_opt`，与 `mora run` 同构）。
 fn pipe(src: &str) -> String {
@@ -40,7 +40,7 @@ fn pipe(src: &str) -> String {
     let arc = Arc::new(f);
     let mut interp = Interpreter::new();
     let mut env = interp.take_env();
-    match run_mir(
+    match execute(
         &arc,
         &mut interp,
         &mut env,

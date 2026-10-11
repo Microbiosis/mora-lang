@@ -25,7 +25,7 @@
 
 use mora::interpreter::Interpreter;
 use mora::mir::effect::Effects;
-use mora::mir::vm::run_mir;
+use mora::mir::vm::execute;
 use mora::parser_v3::ParserV3;
 use std::sync::Arc;
 
@@ -34,7 +34,7 @@ fn run(source: &str) -> Result<mora::value::Value, String> {
     let mut interp = Interpreter::new();
     let mut env = interp.take_env();
     let arc = Arc::new(func);
-    run_mir(&arc, &mut interp, &mut env, &mut Effects::new())
+    execute(&arc, &mut interp, &mut env, &mut Effects::new())
 }
 
 /// 构造一个单 agent 的 pregel 程序源码。

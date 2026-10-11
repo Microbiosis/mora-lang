@@ -18,7 +18,7 @@
 use mora::interpreter::Interpreter;
 use mora::mir::MirFunction;
 use mora::mir::ssa::OptLevel;
-use mora::mir::vm::{run_main_task, run_mir};
+use mora::mir::vm::{execute as run_mir, run_main_task};
 use mora::mir::witness_to_fcfg::witness_to_fcfg;
 use mora::parser_v3::ParserV3;
 use mora::value::Value;

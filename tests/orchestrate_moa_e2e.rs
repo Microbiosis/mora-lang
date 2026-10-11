@@ -41,7 +41,7 @@
 //! （那会随 mock 实现变动而脆，且不属于本条要保护的东西）。
 
 use mora::interpreter::Interpreter;
-use mora::mir::vm::run_mir;
+use mora::mir::vm::execute;
 use mora::parser_v3::ParserV3;
 use std::sync::Arc;
 
@@ -50,7 +50,7 @@ fn run(source: &str) -> Result<mora::value::Value, String> {
     let mut interp = Interpreter::new();
     let mut env = interp.take_env();
     let arc = Arc::new(func);
-    run_mir(
+    execute(
         &arc,
         &mut interp,
         &mut env,

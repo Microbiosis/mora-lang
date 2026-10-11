@@ -200,8 +200,16 @@ fn partition_blocks(body: &[MirInst]) -> Vec<BasicBlock> {
     // 那两条正是让 `Index(list, i)` 不早于 `i = i + 1` 的承重约束。
     for inst in body.iter() {
         let target = match inst {
-            MirInst::Jump(t) => Some(*t),
-            MirInst::JumpIf(_, t) | MirInst::JumpIfNot(_, t) => Some(*t),
+            // v0.104.6 D421：`Break` / `Continue` 也是控制转移 ——
+            // `h_break` / `h_continue` 返回的就是 `Flow::Jump(target)`。
+            // 此前它们既不产生块首、也不被当作块尾，循环体里 `break` 之后
+            // 的指令会被并进同一块，`if i == 2 / break / end` 的出口因此
+            // 落进循环体内部。
+            MirInst::Jump(t)
+            | MirInst::Break(t)
+            | MirInst::Continue(t)
+            | MirInst::JumpIf(_, t)
+            | MirInst::JumpIfNot(_, t) => Some(*t),
             _ => None,
         };
         if let Some(t) = target {
@@ -252,6 +260,36 @@ fn is_block_terminator(inst: &MirInst) -> bool {
     )
 }
 
+/// 控制转移目标 → 目标块的**首个可执行节点**。
+///
+/// ## 解析顺序：**pc 优先**，Label 兜底
+///
+/// v0.75.33 定的是「Label 优先、裸 pc 兜底」，理由是当时担心循环跳转解析不到。
+/// 但**仓内没有第二个生产者发 Label**：注释与实测都表明 `fcfg_lower` /
+/// `emit_loop_w` 的跳转目标一律是**裸 pc**；唯一发 `Label` 的是
+/// `deconstruct`，而它第四遍已把所有跳转目标**补成 pc 位置**。
+///
+/// 于是「Label 优先」在 SSA 往返产物上**必然误判**：`deconstruct` 发的
+/// `Label(bid)` 里，`bid` 是**块下标**，与 pc 共用键空间，于是
+/// `Jump(6)`（跳到 pc 6 = 循环头）会被 `Label(6)`（某个块的入口标记）截胡，
+/// 重定向后变成**跳回自己** ⇒ 自环 ⇒ 循环体永不推进。
+/// 实测（`while … break`）：`--opt=1` 静默无输出、退出码 0。
+///
+/// 命中 `Label` 节点时改指向该块的 head —— `Label` 是块入口标记，
+/// 既不执行也**没有出边**（见 `dag_analyze` 里 `label_redirect` 的说明）。
+fn resolve_control_target(
+    target: usize,
+    label_to_node: &HashMap<Label, NodeId>,
+    pc_to_node: &HashMap<usize, NodeId>,
+    label_redirect: &HashMap<NodeId, NodeId>,
+) -> Option<NodeId> {
+    let raw = pc_to_node
+        .get(&target)
+        .or_else(|| label_to_node.get(&target))
+        .copied()?;
+    Some(label_redirect.get(&raw).copied().unwrap_or(raw))
+}
+
 /// Entry point: analyze a `MirFunction` and construct its `MirDag`.
 pub fn dag_analyze(func: &MirFunction) -> MirDag {
     let body = &func.body;
@@ -279,6 +317,21 @@ pub fn dag_analyze(func: &MirFunction) -> MirDag {
     // 再补一条会把两个后继一起激活（正是 v0.103 修掉的 exit/body 竞态）。
     let mut blk_tails: Vec<(Option<NodeId>, bool)> = Vec::with_capacity(blocks.len());
     let mut blk_heads: Vec<Option<NodeId>> = Vec::with_capacity(blocks.len());
+    // v0.104.6 D421：`Label` 节点 → 所属块的首个**可执行**节点。
+    //
+    // `Label` 是块入口标记：执行器对它 no-op，且**没有任何出边**（块内的
+    // Sequence 链从 Label 之后才开始）。因此控制转移若落在 Label 节点上，
+    // 那条边就是**死路** —— 分支/跳转/break 的目标块永不执行。
+    //
+    // 何时会踩到：`deconstruct` 为**每个**块发一条 `Label(bid)`，于是
+    // `JumpIf/Break` 指向块首时解析到的正是那个 Label。实测
+    // `while i < 3 / i = i + 1 / if i == 2 / break / end / end / print(i)`
+    // 在 `--opt=1` 下**整个循环体不可达** ⇒ 无输出、退出码 0。
+    //
+    // 修法：解析控制转移目标时，若命中 Label 节点则改指向该块的 head。
+    // `fcfg_lower` / `emit_loop_w` 不发 Label，故这条对原生 lowering 是
+    // 无操作 —— 只影响 SSA 往返后的产物。
+    let mut label_redirect: HashMap<NodeId, NodeId> = HashMap::new();
 
     // Step 1: Create nodes for every instruction
     for blk in &blocks {
@@ -286,6 +339,7 @@ pub fn dag_analyze(func: &MirFunction) -> MirDag {
         let mut blk_head: Option<NodeId> = None;
         let mut blk_tail: (Option<NodeId>, bool) = (None, false);
         let mut prev_node: Option<NodeId> = None;
+        let mut blk_labels: Option<Vec<NodeId>> = None;
 
         for (pc, inst) in body.iter().enumerate().take(blk.end).skip(blk.start) {
             // Create the node (Branch cond is set to 0 temporarily, patched below)
@@ -334,6 +388,9 @@ pub fn dag_analyze(func: &MirFunction) -> MirDag {
             if block_first_node.is_none() {
                 block_first_node = Some(idx);
             }
+            if matches!(inst, MirInst::Label(_)) {
+                blk_labels.get_or_insert_with(Vec::new).push(idx);
+            }
 
             // v0.75.33: 基本块内全序 — 每个节点（含 Compute）与前一个节点
             // 连 Sequence，不只 Effect 对。Compute（Var/Const/Index）读 env
@@ -356,6 +413,11 @@ pub fn dag_analyze(func: &MirFunction) -> MirDag {
                 // 逐节点覆盖，块结束时自然停在「最后一个非 Label 节点」上；
                 // Label 只是块入口标记，不参与执行。
                 blk_tail = (Some(idx), is_block_terminator(inst));
+            }
+        }
+        if let (Some(head), Some(labels)) = (blk_head, blk_labels.as_ref()) {
+            for &l in labels {
+                label_redirect.insert(l, head);
             }
         }
         blk_heads.push(blk_head);
@@ -402,11 +464,28 @@ pub fn dag_analyze(func: &MirFunction) -> MirDag {
     for (pc, node_id) in &pc_to_node {
         let inst = &body[*pc];
         match inst {
-            MirInst::Jump(target) => {
-                let target_id = label_to_node
-                    .get(target)
-                    .or_else(|| pc_to_node.get(target))
-                    .copied();
+            // v0.104.6 D421：`Break` / `Continue` 必须与 `Jump` 一样建**控制边**。
+            //
+            // 它们的 handler 返回 `Flow::Jump(target)`，但 `dag_analyze` 此前
+            // 只为 `MirInst::Jump` 建边 ⇒ `Break` 节点**没有任何出边** ⇒
+            // 执行到它时目标块永不被激活 ⇒ `break` 之后的代码整体蒸发。
+            //
+            // 实测（`--opt=1`，静默无输出、退出码 0）：
+            // ```text
+            //   let i = 0
+            //   while i < 3
+            //     i = i + 1
+            //     if i == 2 / break / end
+            //   end
+            //   print(i)
+            //     opt=0 → 2.0      opt=1 → （无输出）
+            // ```
+            //
+            // 节点类型保持 `Effect`（`Break` 不产生值），只补边 —— 与 `Jump`
+            // 靠边而不是靠节点里的 patched target 驱动控制流是同一套机制。
+            MirInst::Jump(target) | MirInst::Break(target) | MirInst::Continue(target) => {
+                let target_id =
+                    resolve_control_target(*target, &label_to_node, &pc_to_node, &label_redirect);
                 if let Some(target_id) = target_id {
                     edges.push(MirDagEdge {
                         from: *node_id,
@@ -420,10 +499,8 @@ pub fn dag_analyze(func: &MirFunction) -> MirDag {
                 }
             }
             MirInst::JumpIf(_cond, target) => {
-                let target_id = label_to_node
-                    .get(target)
-                    .or_else(|| pc_to_node.get(target))
-                    .copied();
+                let target_id =
+                    resolve_control_target(*target, &label_to_node, &pc_to_node, &label_redirect);
                 if let Some(target_id) = target_id {
                     edges.push(MirDagEdge {
                         from: *node_id,
@@ -440,7 +517,10 @@ pub fn dag_analyze(func: &MirFunction) -> MirDag {
                 }
                 // Fall-through: either next instruction or next block
                 let fall_through = pc + 1;
-                if let Some(&fall_id) = pc_to_node.get(&fall_through) {
+                if let Some(&raw_fall) = pc_to_node.get(&fall_through) {
+                    // v0.104.6 D421：顺序落下的下一条也可能是一条 `Label`
+                    // （`deconstruct` 为每个块都发 Label）⇒ 同样要改指块首。
+                    let fall_id = label_redirect.get(&raw_fall).copied().unwrap_or(raw_fall);
                     edges.push(MirDagEdge {
                         from: *node_id,
                         to: fall_id,
@@ -456,10 +536,8 @@ pub fn dag_analyze(func: &MirFunction) -> MirDag {
                 }
             }
             MirInst::JumpIfNot(_cond, target) => {
-                let target_id = label_to_node
-                    .get(target)
-                    .or_else(|| pc_to_node.get(target))
-                    .copied();
+                let target_id =
+                    resolve_control_target(*target, &label_to_node, &pc_to_node, &label_redirect);
                 if let Some(target_id) = target_id {
                     edges.push(MirDagEdge {
                         from: *node_id,
@@ -475,7 +553,10 @@ pub fn dag_analyze(func: &MirFunction) -> MirDag {
                     }
                 }
                 let fall_through = pc + 1;
-                if let Some(&fall_id) = pc_to_node.get(&fall_through) {
+                if let Some(&raw_fall) = pc_to_node.get(&fall_through) {
+                    // v0.104.6 D421：顺序落下的下一条也可能是一条 `Label`
+                    // （`deconstruct` 为每个块都发 Label）⇒ 同样要改指块首。
+                    let fall_id = label_redirect.get(&raw_fall).copied().unwrap_or(raw_fall);
                     edges.push(MirDagEdge {
                         from: *node_id,
                         to: fall_id,
@@ -490,39 +571,77 @@ pub fn dag_analyze(func: &MirFunction) -> MirDag {
                     }
                 }
             }
-            // v0.103: Break/Continue 目标解析 = Label 优先，裸 pc 兜底 ——
-            // 与上方 Jump/JumpIf 同一契约（v0.75.33 给 Jump 补了 pc 兜底，
-            // 但 Break/Continue 漏了同一处）。
-            //
-            // **缺陷背景**：`fcfg_lower` 与 `emit_loop_w` 都不发 `MirInst::Label`，
-            // 它们把 break/continue 的 label 后修补成**指令下标**（`end` /
-            // `loop_start` 的 `ctx.insts.len()`）。因此 `label_to_node` 里没有
-            // 这些键 → 只查 label_to_node 时 Break 节点拿不到任何出边 →
-            // DAG 执行器无从激活退出目标。而 DAG 执行器对 Effect 节点返回的
-            // `Flow::Jump(_)` 是 no-op（控制转移完全由边决定，见 run_dag 内的
-            // 分支注释）→ `break` 被静默忽略 → 循环永不退出（挂死）。
-            //
-            // 实例：`while t < 2i / if t == 1i / break / end / ... end`
-            // 顶层（非 task）挂死；这正是 DAG 边解析缺失而非运行时跳转问题。
-            MirInst::Break(target) | MirInst::Continue(target) => {
-                let target_id = label_to_node
-                    .get(target)
-                    .or_else(|| pc_to_node.get(target))
-                    .copied();
-                if let Some(target_id) = target_id {
-                    edges.push(MirDagEdge {
-                        from: *node_id,
-                        to: target_id,
-                        kind: EdgeKind::Control,
-                    });
+            _ => {}
+        }
+    }
+    // v0.103 的 `Break`/`Continue` 边已并入上方的 `Jump` 分支（D421）：
+    // `fcfg_lower` 与 `emit_loop_w` 都不发 `MirInst::Label`，它们把
+    // break/continue 的 label 后修补成**指令下标**，因此必须走
+    // `pc_to_node` 兜底 —— `label_to_node` 里没有这些键。
+
+    // Label → pc（回边目标解析用；与 `partition_blocks` 同口径：Label 优先，
+    // 裸 pc 兜底 —— 两者共用键空间）。
+    let label_to_pc_local: HashMap<Label, usize> = body
+        .iter()
+        .enumerate()
+        .filter_map(|(pc, i)| match i {
+            MirInst::Label(l) => Some((*l, pc)),
+            _ => None,
+        })
+        .collect();
+
+    // v0.104.6：标出**处于循环中**的基本块 —— 即「可从某个回边到达」的块。
+    //
+    // 用途见下方 Step 3 `last_effect` 扇出的注释：那条 `else` 分支对
+    // **直线尾部**是冗余的（D305 曾整支删掉，直线确实好了），但对**循环体
+    // 承重**（删掉它 `for_loop` / `loop_beyond_dag_limit` 立即回归）。
+    //
+    // ⚠ **判据必须是「在循环里」，不是「块内含回边」**：
+    // 回边只出现在循环**头部**块，而需要扇出的是循环**体**内的块。首版误用
+    // 「本块是否含回边」→ 循环体块的扇出被误删，`continue` 语义直接坏掉
+    // （`production_path_honours_continue` 实测 5.0 → 8.0）。
+    //
+    // 正确做法：从每个回边的**目标块**出发，沿块内顺序前向传播，标记所有
+    // 「在循环体内」的块 —— 循环体一定处于「回边目标 … 回边所在块」之间。
+    let block_index_of_start: HashMap<usize, usize> = blocks
+        .iter()
+        .enumerate()
+        .map(|(i, b)| (b.start, i))
+        .collect();
+    let mut in_loop: Vec<bool> = vec![false; blocks.len()];
+    {
+        // 收集回边：块内某 pc 跳到本块起点之前。
+        let mut back_targets: Vec<usize> = Vec::new(); // 目标块下标
+        for (bi, blk) in blocks.iter().enumerate() {
+            for inst in body.iter().take(blk.end).skip(blk.start) {
+                let target = match inst {
+                    MirInst::Jump(t) => Some(*t),
+                    MirInst::JumpIf(_, t) | MirInst::JumpIfNot(_, t) => Some(*t),
+                    _ => None,
+                };
+                if let Some(t) = target {
+                    let target_pc = label_to_pc_local.get(&t).copied().unwrap_or(t);
+                    if target_pc < blk.start
+                        && let Some(&tbi) = block_index_of_start.get(&target_pc)
+                        && tbi <= bi
+                    {
+                        back_targets.push(tbi);
+                    }
                 }
             }
-            _ => {}
+        }
+        // 从每个回边目标块起，向后（块序）传播直到回边所在块，标记整段循环体。
+        // 保守做法：从回边目标块一路标记到**函数末尾** —— 直线的误标只多留
+        // 一些本可省掉的边（回到修改前的行为），绝不会少留循环体需要的边。
+        for &tbi in &back_targets {
+            for flag in in_loop.iter_mut().skip(tbi) {
+                *flag = true;
+            }
         }
     }
 
     // Step 3: Create Data edges + Sequence edges (reaching definitions within each block)
-    for blk in &blocks {
+    for (blk_idx, blk) in blocks.iter().enumerate() {
         // reg_deps[reg] = (node_id, pc) of the most recent definition within this block
         let mut reg_deps: HashMap<Reg, (NodeId, usize)> = HashMap::new();
         // Track the last effect node for sequential ordering
@@ -596,11 +715,24 @@ pub fn dag_analyze(func: &MirFunction) -> MirDag {
             } else if let Some(prev) = last_effect {
                 // Non-effect nodes after an Effect depend on it
                 // (e.g., Var(name) must execute after Define(name, r))
-                edges.push(MirDagEdge {
-                    from: prev,
-                    to: node_id,
-                    kind: EdgeKind::Sequence,
-                });
+                //
+                // v0.104.6：**仅对非循环块跳过**这条扇出。
+                //
+                // 依据（D305 的实测 + 本刀复现）：
+                // �� 直线尾部确实冗余 —— Step 1 的块内全序链已保证顺序，
+                //   这条扇出只是**重复**施加同一顺序（D305 整支删掉，直线
+                //   的阶梯式重复即消失）。
+                // �� 循环体**承重** —— 整支删掉后 `for_loop` /
+                //   `loop_beyond_dag_limit` 立即回归（本刀实测：行为变化的
+                //   fixture 从 0 增至 4）。循环体的顺序需要它，而
+                //   `block_has_back_edge` 正是可判定的依据。
+                if in_loop.get(blk_idx).copied().unwrap_or(true) {
+                    edges.push(MirDagEdge {
+                        from: prev,
+                        to: node_id,
+                        kind: EdgeKind::Sequence,
+                    });
+                }
             }
         }
     }
@@ -691,6 +823,30 @@ pub fn dag_analyze(func: &MirFunction) -> MirDag {
     }
 
     let n_nodes = nodes.len();
+
+    // v0.104.6：边去重 —— 同一 `(from, to, kind)` 只保留一条。
+    //
+    // **为什么会有重复**：`dag_analyze` 有**两个独立的 Sequence 边发射点**，
+    // 各自 push 而无去重：
+    //   ① Step 1 的块内全序链（`prev_node → idx`，见上方「基本块内全序」注释）；
+    //   ② Step 3 的 `last_effect` 扇出（Effect 之后的每个节点各连一条）。
+    // 一个紧跟 Effect 的 Compute 节点会**同时**被①与②连到 ⇒ 实测 e2e fixture
+    // 共 **197 处同 (from,to) 且 kind 全同**的纯冗余（占边总数 7%）。
+    //
+    // **只去同 kind 的重复**：实测另有 543 处 `(from,to)` 相同但 **kind 不同**
+    // （Data 边与 Sequence 边并存）—— 那**不是**冗余，两条边语义不同
+    // （Data 决定「输入就绪」，Sequence 决定「控制到达」），删任何一条都会
+    // 改变语义。故此处的键是三元组 `(from, to, kind)`。
+    //
+    // 影响：执行器每 wave 的边传播遍历全部 `dag.edges`，冗余边是纯浪费；且
+    // `threaded_successor` 需要自己去重才能判断「是否直线」。
+    {
+        // 键用 `(from, to, kind)`：kind 以 `Debug` 字符串参与比较，避免为
+        // 一次去重给公开的 `EdgeKind` 追加 `Hash`/`Eq` 派生（会牵动其它匹配点）。
+        let mut seen: HashSet<(NodeId, NodeId, String)> = HashSet::new();
+        edges.retain(|e| seen.insert((e.from, e.to, format!("{:?}", e.kind))));
+    }
+
     let mut dag = MirDag {
         nodes,
         edges,
@@ -849,9 +1005,10 @@ impl MirDag {
 
     /// v0.104.6 D9：入口重算的**单一实现** —— 「可达 ∧ 无入边 ∧ 未移除」。
     ///
-    /// `dag_analyze`、`prune_sequence_edges`、`add_sequential_edges` 与
+    /// `dag_analyze`、`prune_sequence_edges` 与
     /// `dag_search::apply_rewrite` 第 5 步统一走本实现，避免 v0.104.2 的可达性
     /// 过滤被任一处旧公式撤销。
+    /// （D466 已删除 `add_sequential_edges`，故此处不再有它的边增长路径。）
     pub fn recompute_entry(&mut self) {
         let n = self.nodes.len();
         // v0.104.6 D31：位向量取代 `HashSet<NodeId>`。
@@ -919,7 +1076,8 @@ impl MirDag {
     /// 顺序无关，故换遍历方式不改变结果。邻接表是**本次调用内现建现用**的
     /// 临时量，不缓存回 `MirDag` —— 故不存在「图变了而邻接表陈旧」的风险
     /// （`MirDag` 的边在 `dag_analyze` / `apply_rewrite` /
-    /// `add_sequential_edges` 多处增长，任何挂字段的缓存都要逐处维护）。
+    /// `prune_sequence_edges` 多处增长，任何挂字段的缓存都要逐处维护；
+    /// D466 删除 `add_sequential_edges` 后这是全部增长点）。
     pub fn recompute_reachable_from_entry(&mut self) {
         let n = self.nodes.len();
         // CSR 第一趟：出度计数（用 `usize`，避免大图上 `u32` 前缀和溢出）
@@ -993,66 +1151,44 @@ impl MirDag {
         (0..n).map(|i| find(&mut parent, i)).collect()
     }
 
-    /// Add Sequence edges between consecutive nodes in each basic block.
-    ///
-    /// # ⚠️ 本方法**不保语义** —— 它是「强制线性化」实验装置，不是等价变换
-    ///
-    /// v0.104.6 复核：本注释原文是
-    /// 「This forces linear execution order, making `run_dag` produce
-    /// exactly the same result as `run_mir`」—— **该表述为假**。
-    /// 它是 v0.59 那句「`run_mir ≡ run_dag`（add_sequential_edges 后退化线性）」
-    /// 的**源头**：正因如此，后续 `src/mir/vm.rs` 的公开 API 文档、
-    /// `tests/run_mir_equiv_run_dag.rs` 的对照实验都建立在这个前提上，
-    /// 而当对照实验出现 3/9 分歧时，又被误判成「生产路径有缺陷（E1）」。
-    ///
-    /// **实测（`tests/run_mir_equiv_run_dag.rs`，9 例）**：6 例等价、
-    /// **3 例发散**，且发散时**错的都是本方法这一侧**：
-    ///
-    /// | 用例          | `run_mir`（生产） | 加本方法后 | 正确值 |
-    /// |---------------|------------------|-----------|--------|
-    /// | if/else       | 8.0              | `Bool(false)` | 8.0 |
-    /// | for + break   | 2.0              | 5.0      | 2.0 |
-    /// | while + continue | 5.0           | 6.0      | 5.0 |
-    ///
-    /// 「哪边对」由独立判据确定：把 `continue` 改写成语义等价的 `if/else`
-    /// 仍得 5.0、删掉 `continue` 才得 6.0 —— 见 `tests/continue_semantics.rs`。
-    ///
-    /// **机制**：本方法把整图连成一条线性链，而 `break` / `continue` 是
-    /// **跳出**线性链的控制转移，在这个模型里失效 —— 循环体被跳过的部分照跑，
-    /// 恰好多执行一轮。`if/else` 那例则是汇合点的分支臂被线性链强行串行化。
-    ///
-    /// **结论**：它**不能**用来判定生产路径的对错（那是把「线性化 + 忽略跳转」
-    /// 的混合体当成基准）。生产路径 `run_mir` 在上述 3 例中全部正确。
-    ///
-    /// 注：本方法在 `src/` 里**无生产调用点**（`DagCache::build` 走的是
-    /// `dag_analyze → dag_optimize → prune_sequence_edges`），仅测试使用。
-    pub fn add_sequential_edges(&mut self) {
-        // Nodes are created in program order (pc ascending), so
-        // consecutive node IDs within each basic block already reflect
-        // the correct linear order. We add Sequence edges between
-        // adjacent pairs.
-        let n = self.nodes.len();
-        for i in 0..n.saturating_sub(1) {
-            let j = i + 1;
-            // Skip Label nodes (they're control-flow markers, not real ops)
-            let from_is_label = matches!(self.nodes[i], MirDagNode::Label { .. });
-            let to_is_label = matches!(self.nodes[j], MirDagNode::Label { .. });
-            if from_is_label || to_is_label {
-                continue;
-            }
-            self.edges.push(MirDagEdge {
-                from: i,
-                to: j,
-                kind: EdgeKind::Sequence,
-            });
-        }
-        // v0.104.6 D9：entry 走统一实现（与 `prune_sequence_edges` 同一语义），
-        // 避免两处公式再次漂移。
-        //
-        // 注：本方法目前**无生产调用点**（`DagCache::build` 走的是
-        // `dag_analyze → dag_optimize → prune_sequence_edges`），仅文档提及。
-        self.recompute_entry();
-    }
+    // ── v0.104.6 D466：删除 `add_sequential_edges` ──────────────────────
+    //
+    // 原方法按**相邻节点编号** i→i+1 补 `Sequence` 边，注释断言「节点按
+    // pc 递增创建，故相邻编号即线性序」。**该断言在有控制流时不成立**：
+    // 跨基本块时节点编号不反映执行序。实测 `for + break` 的 DAG，边数
+    // 73 → 107（+34），新增的 7 条里有 **4 条跨越控制流终结边界**：
+    //
+    //     [15]Branch -> [16]Compute    [21]Branch -> [22]Effect
+    //     [24]Jump   -> [25]Compute    [32]Jump   -> [33]Compute
+    //
+    // 这些边把**互斥的两条路径**连成先后。而边传播会跳过 `Branch`/`Jump`
+    // 的出边（`vm/engine.rs:549-553`，它们由 handler 选中的 target 激活），
+    // 却会激活 `Sequence` 边（`vm/engine.rs:571-573`
+    // `should_push = is_control_edge || Sequence`）—— 伪造的 Sequence 边
+    // 于是成了唯一能绕过该保护的路径。
+    //
+    // **后果**：加此方法后，`break` / `continue` 被架空（跳出线性链的
+    // 控制转移在链上失效，循环体多跑一轮）、if/else 两臂被串行化。实测 3 例
+    // 分歧且**错的恒是加此方法的一侧**，生产路径 `run_mir` 三例全对：
+    //
+    //     | 用例            | run_mir(生产) | 加此方法 | 正确值 |
+    //     |-----------------|---------------|----------|--------|
+    //     | if/else         | 8.0           | Bool(false) | 8.0  |
+    //     | for + break     | 2.0           | 5.0        | 2.0    |
+    //     | while + continue| 5.0           | 6.0        | 5.0    |
+    //
+    // 「哪边对」由独立判据确定（`tests/continue_semantics.rs`：把 `continue`
+    // 改写成语义等价的 `if/else` 仍得 5.0、删掉 `continue` 才得 6.0）。
+    //
+    // **删除理由**：① `src/` 内**零调用**（生产建图是
+    // `dag_analyze → dag_optimize → prune_sequence_edges`）；② 它自己声明
+    // 「不保语义」，留着等于在公共 API 上留一个「已知会造错图」的方法；
+    // ③ 它比 `run_mir ≡ run_dag` 这条 v0.59 旧承诺更可信，是那条**假承诺**
+    // 的源头（`vm.rs` / `vm/engine.rs` 的模块文档已多次更正）。
+    //
+    // 保留替代：生产等价性由 `tests/run_mir_equiv_run_dag.rs` 的 A 组
+    // （优化路径 vs DAG 路径，含 if/else、嵌套 break、while+continue）
+    // 与 B 组 6 条真实等价用例持续钉住。
 }
 
 // ─── Tests ──────────────────────────────────────────────────────────

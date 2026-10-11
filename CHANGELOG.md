@@ -2,6 +2,916 @@
 
 All notable changes to Mora will be documented in this file.
 
+## [Unreleased] — D420/D421：phi 门最终删除，SSA 主路径**无门**
+
+D419 删掉了 `has_out_of_range_jump`，但 phi 门（D418 加回的）还在。把它拿下
+的两块绊脚石，本条一并解决。
+
+### D420：SSA 的 `Copy` 不得经 env 中转
+
+`deconstruct` 把 `SsaInst::Copy(dst, src)` 降成
+`Assign(".tmp_N", src)` + `Var(dst, ".tmp_N")`。而
+`Environment::assign` 对**尚未绑定**的名字返回 `false` 且**什么都不写**
+（`value.rs`：本层没有 → 走父链 → 也没有 → `false`），`.tmp_N` 从未被
+define ⇒ **写入被静默丢弃** ⇒ `Var` 读回 Nil。
+
+```text
+let x = if 1 > 0 / 7 / else / 8 / end
+print(x)          opt=0 → 7.0        opt=1 → nil
+```
+
+未经 SSA 的程序里 `.tmp_N` 同样读不到，但那里的值本来就是 Nil
+（`let` 发射的是 `Assign("__let_result", Const(Nil))`），于是缺陷被 env 往返
+本身掩盖 —— **只有走 SSA 的 `Copy`（`if` 汇合值、phi copy）才暴露**。
+
+修法：`SsaInst::Copy(dst, src)` 直接降为 `MirInst::Copy(dst, src)`。精确的
+寄存器语义、无 env 往返、无临时名污染、少两条指令；phi 前驱 copy 自 D418
+起已是这个形式，两条路径现在一致。
+
+新增 `tests/ssa_copy_lowering.rs`：降维产物里不得出现 `.tmp_N`；以及一组
+**控制流 + 值形状的三档差分**（57 个 fixture 覆盖不到「`if` 表达式赋值给
+变量后立即打印」这类形状 —— D420 就是被它抓到的）。
+
+### D421：DAG 的控制转移目标解析（两处）
+
+#### ① `Break` / `Continue` 没有控制边
+
+它们的 handler 返回 `Flow::Jump(target)`，但 `dag_analyze` 只为
+`MirInst::Jump` 建边 ⇒ `Break` 节点**没有任何出边** ⇒ 目标块永不被激活。
+（`partition_blocks` 同样没把它们当跳转目标 / 块尾。）
+
+#### ② 控制目标落在 `Label` 节点上是**死路**
+
+`deconstruct` 为**每个**块发一条 `Label(bid)`，而块内的 Sequence 链从
+Label **之后**才开始；执行器对 Label 是 no-op ⇒ 它没有任何出边。于是
+`JumpIf` / `Break` 指向块首时，那条边直接断在 Label 上 ⇒ 整个循环体不可达。
+
+实测：`while i < 3 / i = i + 1 / if i == 2 / break / end / end / print(i)`
+在 `--opt=1` 下**无输出、退出码 0**。
+
+#### ③ 解析顺序从「Label 优先」改成 **pc 优先**
+
+v0.75.33 定的是「Label 优先、裸 pc 兜底」，理由是担心循环跳转解析不到。
+但**仓内没有第二个生产者发 Label**：`fcfg_lower` / `emit_loop_w` 的跳转目标
+一律是裸 pc；唯一发 Label 的 `deconstruct` 已把跳转目标补成 pc 位置。
+
+「Label 优先」在 SSA 往返产物上**必然误判**：`Label(bid)` 的 `bid` 是块
+下标，与 pc 共用键空间 ⇒ `Jump(6)`（跳到 pc 6 = 循环头）会被某个块的
+`Label(6)` 截胡 ⇒ 重定向后变成**跳回自己** ⇒ 自环 ⇒ 循环体永不推进。
+
+#### ④ 顺序落下的下一条也要重定向
+
+`JumpIf` / `JumpIfNot` 的 fall-through 用的是 `pc + 1`，同样可能落在 Label 上。
+
+### 实测
+
+| 指标 | D419 后 | 本条后 |
+|---|---|---|
+| 57 fixture × `--opt=0/1/2` | 171/171 一致 | **171/171 一致** |
+| `while+break` / `for+break` / `if` 表达式 / 嵌套 `for` 等 10 种形状 | 4 种不一致 | **10/10 一致** |
+| `opt.rs` 的 SSA 守卫 | 1 道（phi） | **0 道** |
+
+新增/更新的判据：`tests/ssa_copy_lowering.rs`（4 条）。
+
+### SSA 主路径三道门的收束
+
+| 门 | 删除于 | 真正的修法 |
+|---|---|---|
+| `has_register_carrying_passthrough` | D417 | 透传指令改为 `SsaInst::Opaque`，原位参与重命名 |
+| `has_out_of_range_jump` | D419 | 新增 `Terminator::JumpExit`（「跳到函数末尾」） |
+| 「出现 phi 就跳过」 | D420/D421 | 支配树 DFS + `phi.incoming`（D418）+ `Copy` 直接降维（D420）+ DAG 控制边/目标解析（D421） |
+
+`--opt=0/1/2` 现在对全部 fixture 与全部回归形状**零行为差异**。
+
+## [Unreleased] — D419：最后一道 SSA 门删除（`has_out_of_range_jump`）
+
+### 缺陷：SSA 表达不了「跳到函数末尾」
+
+`apply_rules`（两档都跑）的 `ConstFoldingRule` 折叠 `1 > 0`、`IfSimplifyRule`
+删掉恒不跳的 `JumpIfNot`，只留下 `Jump(end)` —— 而 `if` 是最后一句时
+`end == body.len()`，**跳转目标越界**。
+
+旧 SSA 把越界目标映成 `Terminator::Return(None)`，而 `Return(None)` 在降维时
+是**被丢弃**的（「落下去，线性执行自然进入下一块」）⇒ 那条跳转彻底消失
+⇒ 块与块之间再无控制转移 ⇒ **两个分支都执行**。
+
+**副作用会重复发生**（重复写文件、重复扣款、重复发送），程序看起来一切正常、
+退出码 0 —— 比静默截断更危险。D313 当时的处置是加一道守卫整体跳过 SSA。
+
+### 修法
+
+新增 [`Terminator::JumpExit`]（「跳到函数末尾」），与「返回」/「落进下一块」
+彻底分开；降维时发一条**真跳转**，由第四遍补成重建后 body 的长度：
+
+- `run_mir`：`pc >= body.len()` ⇒ 结束并走隐式返回；
+- `dag_analyze`：跳转目标解析不到节点 ⇒ 该 `Jump` 节点**无出边** ⇒ 到此为止。
+
+两个执行器都与 opt=off 一致。`Break` / `Continue` 的越界目标同样归到
+`JumpExit`。
+
+顺带修了一处连带缺陷：`DeadCodeElimPass` 对「隐式返回载体」的保护此前只覆盖
+`Return(None)`。`JumpExit` 也要走隐式返回 —— 漏掉它会让
+`let x = if … end` 在 `--opt=1` 下变成 Nil。
+
+### 回归护栏
+
+`tests/opt_out_of_range_jump_guard.rs` 从「守卫存在吗」翻转成**行为判据**
+（守卫已不存在）：常量 `if/else` 只走 then、降维产物里有终止跳转、
+`JumpExit` 的块无后继、6 种越界跳转形状三档等价。
+
+---
+
+## [Unreleased] — D419 补记：phi 门**恢复**（D418 删早了）
+
+D418 让 `phi.incoming` 真正生效并删掉了 phi 门。实测随即撞上一个**执行器**
+缺陷：
+
+```text
+let x = if 1 > 0 / 7 / else / 8 / end
+print(x)
+  opt=0 → 7.0        opt=1 → nil
+```
+
+逐条追踪（临时插桩，DAG 节点序列 + `h_define`/`h_var`/`Copy` 的实际取值）
+显示：**SSA 产出的 MIR 是对的**（`Assign(".tmp_0", 7.0)` → `Var` → `Copy` →
+phi copy → `Define("x", …)` → `print`，指令顺序与数据依赖齐备），
+`dag_analyze` 的边也对（`Sequence 4→5→6→7→8`、`Control 8→13→14`），
+但 `Var(".tmp_0")` 读到的 env 值是 **Nil** —— 即在**同一个 env 上、紧跟着
+`Assign` 之后**，`get` 读不到 `assign` 写的值。
+
+⇒ 根因在 **DAG 执行器 / env 传递**，不在 SSA。机理**尚未定位**，本轮不猜：
+phi 门放回原位，把这条路径挡在优化之外（「宁可不优化，不可静默产出错误结果」）。
+
+⚠ 这**不是**「phi 机制不完整」—— phi 现在是真的在工作（D419 已让 7 个含循环的
+fixture 走 SSA 且输出正确）。这道门现在挡的是**执行器**的缺陷，判据仍取
+「出现 phi」，因为那是唯一经实测能可靠规避该缺陷的信号。
+
+**待查**（下一刀的首选）：为何 `Assign` / `Var` 在同一 env 上首尾相接却读不到
+值。可能入口：DAG 执行器的 env 传递（每波/每节点是否用了快照），或
+`Environment::assign` 对**尚未 `define`** 的名字的处理。
+
+---
+
+## [Unreleased] — D418：phi 机制首次真正生效，最后一道 SSA 门删除
+
+D417 删掉了透传门，`opt.rs` 里还剩一道：**「SSA 里出现 phi 就整体跳过」**
+（D312）。本条把它也删掉 —— 因为它守的缺陷已经被修掉了。
+
+### 修法
+
+| 缺口 | 修法 |
+|---|---|
+| `phi.incoming` 结构上恒为空 | `Phi` 增 `var`（原始变量编号）；`rename_variables` 改为**支配树 DFS**，在每条 CFG 边上 `φ.incoming.push((前驱, 该前驱出口处的版本))` |
+| 遍历只沿 `succs`、从不 pop | 同一次改写：进块压栈 / 出块弹栈，读点看到的版本 = **支配它的定义** |
+| `preds` 不完整 | 同一份可达集既用于建 `preds` 也用于切支配树 |
+| DCE 活性是**逐块**的 | phi 源寄存器**全函数**入账 —— 它本来就是跨块引用 |
+| CopyProp 无差别改写 phi 的**全部** incoming | 只改写「来自本块」的那条 |
+
+`deconstruct` 侧：phi 前驱 copy 从 `Assign(tmp)+Var(dst,tmp)`（env 中转）改成
+直接 `MirInst::Copy`；无 incoming 的 phi 落 `Const(Nil)` 默认值，不再留
+「没有生产者」的寄存器。
+
+### 三个实测踩到的坑（都是「静默」形态）
+
+#### 0. `compute_dominators` 迭代到了**极小**不动点（最深的一条根因）
+
+`Dom(b) = {b} ∪ ⋂_{p ∈ preds(b)} Dom(p)` 有多个解，**支配集是其中最大的那个**；
+迭代必须从 `Universe` 向下收缩。原实现从**空集**起步，算的是极小不动点 ——
+在含回边的 CFG 上它根本不是支配集：
+
+```text
+dom[0]={0}  dom[1]={1}  dom[2]={2,1}  dom[3]={3}  dom[5]={5,3}
+```
+
+于是每个块的 `idom` 都成了**它自己** ⇒ 支配树碎成一堆单点 ⇒ 每棵树都在
+**空栈**下被重命名 ⇒ 循环归纳变量 `__idx += 1` 读到从未写入的寄存器。
+实测症状：嵌套 `for` 在 `--opt=1` 下内层循环**只跑一半**（打印 `2,3` 而不是
+`2,3,3,4`）⇒ 静默少输出、退出码 0。
+
+这条此前一直**没被发现**，是因为 `rename_variables` 压根没用支配树（它沿
+`succs` 平铺遍历），而 `compute_dominance_frontier` 只用到 idom 的「向上走
+到 None 就停」，极小不动点恰好也能给出「看起来合理」的支配边界。**一旦真的
+按支配树 DFS，这条就暴露了。**
+
+#### 1~3
+
+1. **死块污染支配树**。`if i == 6 / break / end` 之后 lowering 仍发射一段
+   **不可达**的 join 代码，它成了循环体块的一个前驱 ⇒ `compute_dominators`
+   的 `⋂ Dom(pred)` 被交成空 ⇒ 该块 idom 变成「无」⇒ 支配树在此断开 ⇒
+   整棵后续子树在**空栈**下被重命名 ⇒ 循环归纳变量的 `__idx += 1` 读到从未
+   写入的寄存器 ⇒ DAG 节点永不激活 ⇒ `--opt=1` **静默无输出、退出码 0**。
+   修法：先算可达集，只让可达块参与 CFG（死块的 `preds`/`succs` 一并清空，
+   否则死块的边会给可达后继的 phi 记上一条来自死块的 incoming）。
+2. **phi 结果没人读**。循环变量走 **env**（`Var(dst,"total")` /
+   `Assign("total",src)`），而 `SsaInst::Var` **不读寄存器** ⇒ 循环头为
+   `total`/`i` 建的 phi **没有任何消费者**；可它们的 `incoming` 仍被发成
+   copy，于是前驱块去读「只在循环体里定义过」的寄存器 ⇒ 又一次饿死。
+   修法：`deconstruct` 只给「结果真被读到」的 phi 发 copy（phi-elimination
+   的标准步骤）。
+3. **DCE 把回边的值当死代码**。循环体里的 `__idx += 1` 只被**另一个块**的
+   phi 读，局部 `used` 看不见 ⇒ 定义被删 ⇒ 回边 `Copy(phi_dst, <从未定义>)`。
+   实测 `loop_for_break.mora` 在 `--opt=1` 静默无输出。
+
+#### 4. phi 的「必须物化」范围是**传递闭包**，不是「直接被读到」
+
+`deconstruct` 原本只给「结果被指令/terminator 读到」的 phi 发前驱 copy。但
+一条 phi 可以**只被别人当 incoming 源引用**（典型的：循环头为「循环里不变
+的列表」建的 phi，下游块的 phi 从它取值）。漏掉它 ⇒ 那条
+`Copy(_, <没人写的寄存器>)` ⇒ DAG 节点永不激活 ⇒ 静默无输出。
+
+现在物化范围 = 「结果被读到」∪「（传递地）被别人的 incoming 引用」，用工作表
+求闭包；且**没有任何有效 incoming** 的 phi 落一个块首 `Const(Nil)` 默认值，
+保证它的目标寄存器**有生产者**。
+
+#### 5. `insert_phi_nodes` 会为「支配边界上的每个变量」建 phi
+
+实测一个循环头会拿到 **22 条 phi**（其中绝大多数无人读：循环变量走 env）。
+它们由 `insert_phi_nodes` 按支配边界无差别插入。这本身合法（SAA 的 phi 只需
+在被读时才有意义），但要求 `deconstruct` 对「未被物化的 phi」一个字节都不发
+—— 见第 4 条。
+
+（顺带记录一次**走错的弯路**：先试过「删掉死 phi」。死 phi 被删后，**幸存**
+phi 的 `incoming` 里指向它的源就成了悬空引用 ⇒ 孤儿读更多了。这类图上的
+「删除 + 引用修正」必须同时做，否则修一个坏三个。已回退。）
+
+### 实测（57 个 e2e fixture × `--opt=0/1/2` = 171 组合）
+
+| 指标 | D417 后 | D418 后 |
+|---|---|---|
+| 三档输出/退出码一致 | 171/171 | **171/171**（逐字比对） |
+| 能进 SSA 的 fixture | 50/57 | **57/57**（全部三道门都空了） |
+
+`scripts/opt_levels_snapshot.py` 现在是**零门**下的差分：它比对的是「优化真的
+在跑」与「优化没跑」两种情况下程序的可观察行为。
+
+### `tests/ssa_phi_incoming.rs` 的三条 `#[ignore]` 全部解封
+
+| 测试 | 解封原因 |
+|---|---|
+| `d254_phi_incoming_covers_every_predecessor` | D418 补上了 `incoming` 填充 |
+| `d254_for_loop_output_is_identical_with_and_without_opt` | 同上（`for` 循环不再静默中止） |
+| `d256_ssa_definition_targets_are_unique` | D417 修好 `phi.dst` 写回；且它自己**判据有 bug**（把 `Define` 的源寄存器当定义） |
+
+### 仍未修
+
+`has_out_of_range_jump`（D313 守卫，实测在真实程序上**零命中**，纯兜合成
+形状）。SSA 主路径至此无门。
+
+## [Unreleased] — D417：透传指令参与 SSA 重命名，SSA 门少一道
+
+上一条记档的结论是：「真正要修的是让 `deconstruct` 的还原**按 SSA 重命名后的
+映射**回写 passthrough 指令的寄存器」。**本条就是那个修法** —— 但落点比
+「加一张回填映射」更靠下：映射之所以需要，是因为 `construct` 把这些指令
+**丢出了 IR**。本轮让它们**留在 IR 里**。
+
+### 修法：透传指令成为 SSA IR 的一等变体
+
+```rust
+SsaInst::Opaque(MirInst)   // 不为其建模语义，但留在原位、参与同一条重命名路径
+```
+
+`Closure` / `MatchExpr` / `Handle` / `WithConfig` / `Perform` / `Solve` /
+`DynTrait` / `Quasiquote` 以及全部声明型指令（`TaskDef` / `Import` /
+`RelDef` / TEA 定义 …）现在：
+
+- **留在原位**（旧实现把它们抽进 `MirSsaFunction::passthrough`，由
+  `deconstruct` 用 `chain(body)` **整体前插**到 body 头部 —— 顺序被打乱）；
+- **读**经 `MirInst::map_regs` 解析到当前 SSA 版本；
+- **写**按 `written_reg()` 分配 fresh 版本号；
+- **不写**的（声明型）**不占版本号**（否则 `reg_counter` 凭空前移而
+  `deconstruct` 只按实际出现的寄存器分配 plain 号 ⇒ `n_regs` 偏小 ⇒
+  执行期报「references register N but the function only has M」）。
+
+### 删除的东西
+
+| 删除项 | 位置 | 理由 |
+|---|---|---|
+| `MirSsaFunction::passthrough` | `ssa.rs` | 顺序由 IR 位置保证，不再需要事后拼回 |
+| `MirSsaFunction::orig_n_regs` | `ssa.rs` | 只为 `n_regs.max(...)` 兜底而存在 |
+| `has_register_carrying_passthrough` | `ssa.rs` + `opt.rs` | 守卫的缺陷不存在了 |
+| `has_passthrough_inst` / `is_ssa_passthrough` | `ssa.rs` | 零引用；判据已由结构性质取代 |
+| `n_regs.max(orig_n_regs)` | `deconstruct.rs` | **掩盖失同步**，不是正确上界 |
+| SSA pass 里 5 处「跳过不透明指令」的分支 | `opt/{simple,copy,loops}.rs` | 统一由 `mir::ssa::ssa_dst` + `map_regs` 处理 |
+
+### 顺带修掉的三条同族缺陷
+
+1. **`Return(None)` 的顺序后继边缺失**（D312 根因之一）。`deconstruct` 明写
+   它的语义是「落下去」，而 CFG 侧把它当终点 ⇒ 后继块 `preds` 为空、
+   `rename_variables` 从 `vec![0]` 出发走不到 ⇒ **整块未被重命名**
+   （部分重命名把跨块的值定义与使用拆成两个物理寄存器）。
+2. **`collect_definitions` 把 `Assign` 当定义**。`Define`/`Assign` 写的是
+   **env**，第二字段是源寄存器；算作定义会凭空放大 phi 插入点 ⇒ 误伤
+   「SSA 里出现 phi 就跳过」的守卫。
+3. **`phi.dst` 从不写回**（D256）。`rename_variables` 为 phi 算出了
+   `new_dst` 并压栈，却没改 `phi.dst` 字段 ⇒ phi 仍占原编号，与被重编号的
+   指令撞号。改为「phi 先装进 `BasicBlock.phis`（按原始 dst 升序，保证编号
+   确定 —— `phi_map` 是 `HashMap`，直接 `.iter()` 会让同一份源码两次编译
+   产出不同 MIR），`rename_variables` 再就地改写」。
+
+### 实测（57 个 e2e fixture × `--opt=0/1/2` = 171 组合）
+
+| 指标 | 修前 | 修后 |
+|---|---|---|
+| 三档输出/退出码一致 | 171/171 | **171/171**（`scripts/opt_levels_snapshot.py` 逐字比对） |
+| 能进 SSA 的 fixture | 43/57 | **50/57**（余 7 个是 phi 守卫，见下） |
+| 寄存器被重复定义（走 SSA 的） | 多处 | **0** |
+| 读到无生产者寄存器（走 SSA 的） | 多处 | **0** |
+| `rel_*` 族在 `--opt=1` | 静默无输出 | 正常（且不再需要 `n_regs.max` 兜底） |
+
+新增 `tests/ssa_passthrough_remap.rs`（7 条）作为常驻护栏：单寄存器空间、
+每个读都有生产者、往返依赖同构、透传指令原位、57×3 执行等价。
+
+### 仍未修（下一刀）
+
+`opt.rs` 的 **phi 守卫**（D312）与其背后的 `phi.incoming` 恒空
+（`insert_phi_nodes` 以 `incoming: Vec::new()` 建，`rename_variables` 收的是
+不可变引用且无处可写）。`tests/ssa_phi_incoming.rs::d256_ssa_definition_targets_are_unique`
+本轮**解封**（撞号已清零）；`d254_phi_incoming_covers_every_predecessor`
+仍 `#[ignore]`，对应 7 个 fixture 走不到 SSA。真正的修法是教科书式的
+**支配树 DFS + 进出栈 push/pop + 逐前驱边记录 incoming**，而不是继续收窄门。
+
+> 附带教训：`d256` 那条 `#[ignore]` 长期被当作「撞号修不了」的证据，
+> 实际上它混了两个缺陷，其中一个是**判据自身把 `Define` 的源寄存器当成
+> 定义**。**现状断言本身也可能是错的** —— 在把它自身修对之前，
+> 不要拿它当「这条路径修不了」的依据。
+
+## [Unreleased] — SSA 门判据复核：一次「看起来显然」的收窄，实测是错的（已撤销）
+
+### 起因
+
+`has_register_carrying_passthrough`（SSA 主路径的门）把
+`Closure` / `Quasiquote` / `Handle` / `Solve` 列为「跨外层寄存器平面」。
+逐条核对 `MirInst::input_regs()` 发现这四类**输入寄存器集合都是空的**
+（`Closure` 只构造对象、`Handle` 的 body/handler 各自独立空间、`Solve` 的 goal
+是嵌套函数），遂按 D311 已确立的原则「只有带寄存器的才跨平面」尝试收窄。
+
+### 实测：判据问错了方向
+
+| fixture | 收窄后 opt=1/2 | 原判据 opt=1/2 |
+|---|---|---|
+| `function_call.mora` | **静默无输出、退出码 0** | 正常打印 `5` |
+| `tea_list_model.mora` | **静默无输出、退出码 0** | 正常 |
+
+根因（代码里早有记载）：
+
+- `input_regs()` 答的是「本指令**读**哪些外层寄存器」；
+- 而 SSA 的两套空间冲突来自**写** —— `Closure { dst: r }` 的 `dst` 是外层
+  寄存器，`construct` 把该指令**原样 passthrough** ⇒ `dst` **不参与重命名**，
+  而同函数其余指令会重编号。D310 注释早已写明：「`Closure` 写 r8 而 `map` 读 r2」。
+- `deconstruct` 亦自承：passthrough 回插时寄存器号仍是**重命名前**的，只用
+  `n_regs.max(orig_n_regs)` 掩盖越界。
+
+⇒ 四类**都写**外层平面（`written_reg = dst`），原白名单**正确**，保持不变。
+本次改动净效果为**零代码变更 + 一段复核结论注释**（记录该推理为何错，
+避免后人重犯）。
+
+### 顺带更正两处此前的错误数字
+
+- 「57 个 fixture 只有 16 个能进 SSA」—— **错**：那用的是 `has_passthrough_inst`
+  （宽判据，`opt.rs` 并不调用它）。按**实际**的门测：`has_register_carrying`
+  拦 **14/57**、`has_out_of_range_jump` 拦 **0**（其注释亦自承是纯兜底）
+  ⇒ **43/57 可进 SSA**。
+
+### 结论：SSA 主路径的瓶颈不在「门太严」
+
+`Closure` / `MatchExpr` / `Perform` / `WithConfig` / `Handle` / `Solve` /
+`DynTrait` / `Quasiquote` 之所以整体跳过 SSA，是**「passthrough 指令的寄存器不
+参与重命名」这一机制本身**的必然结果。真正要修的是让
+`deconstruct` 的还原**按 SSA 重命名后的映射**回写 passthrough 指令的寄存器，
+而不是继续收窄准入门槛。**该修法未实施**（本刀仅记录）。
+
+## [Unreleased] — 把「顺序直穿 + 建图减边」的收益写成可执行护栏
+
+性能改动的典型失败模式是**静默回退**：代码在、测试全绿，但一次无关重构（或
+一次「顺手清理」）让收益归零，**没有任何测试会红**。本轮两项优化都是性能改动，
+故把收益锁定。
+
+### `tests/perf_regression.rs`（3 条）
+
+| 护栏 | 判据 | 何时跑 |
+|---|---|---|
+| 直穿加速仍在 | 1M 迭代**至少快 15%**（`MORA_NO_THREADING` 开/关对比） | `#[ignore]`，需 release |
+| 直线图保持稀疏 | 直线程序「边/指令」比 **< 2.0** | 常规 CI |
+| 循环体承重边保留 | 循环体**必须**仍有跨节点 Sequence 边 | 常规 CI |
+
+阈值**由实测标定**，非拍脑袋：直线图比值当前 **1.80**，若人为把 `in_loop`
+判定回退成「无条件加扇出」则为 **2.21** ⇒ 阈值取 2.0 居中。已实测该门能抓回退
+（人为改坏 ⇒ FAILED，还原 ⇒ 恢复绿）。
+
+第三条是**反向**护栏，专防「为减边把循环体也减了」—— 首版正是这么错的，
+`continue` 语义从 5.0 变 8.0。
+
+### 一处自我更正
+
+护栏 2 的**初版判据本身是错的**：曾断言「直线程序里没有跨节点 Sequence 边」，
+实测**即使最直白的 `let a = 1i / … / print(a+b+c)` 也不成立** —— Mora 的每个
+`let` 都会隐式生成 `__let_result` 三件套（`Const`/`Define`/`Var`），DAG 正确
+地给它们排序，天然存在跨节点边。那是**真实依赖**，不是冗余扇出。已改为可判定的
+「边/指令比」。
+
+运行方式：
+
+```text
+cargo test --release --test perf_regression -- --ignored --nocapture
+```
+
+## [Unreleased] — 建图：区分「直线尾部」与「循环体」，只为前者去掉 Effect 扇出
+
+### 背景
+
+`dag_analyze` Step 3 的 `last_effect` 扇出（Effect 之后的每个节点各连一条
+Sequence）存在已久，D305 记录了一次**已回滚**的尝试：整支删掉后
+**直线尾部确实好了**（阶梯式重复消失），但 `for_loop` / `loop_break` 等
+**循环**程序回归 ⇒ 判定「直线冗余、循环承重」，但当时无可判定的区分依据，
+只留记录不改代码。
+
+### 本刀的判据与结果
+
+新增 `in_loop[]`：标出**处于循环中**的基本块，据此**只对非循环块**跳过该扇出。
+
+结果（全量 e2e fixture）：边总数 **3067 → 2276**（省 791 条，−26%），
+**57 个 fixture 的 stdout 与退出码逐字节不变**（与修改前的 `dag_analyze`
+逐条比对，见测试）。
+
+### ⚠ 关键：判据是「在循环里」，**不是**「块内含回边」
+
+首版误用「本块是否含回边」→ **直接破掉 `continue` 语义**：
+`continue_semantics::production_path_honours_continue` 实测
+`Float(5.0)` 变 `Float(8.0)`（循环体多跑一轮）。
+
+原因是：回边只出现在循环**头部**块，而需要扇出的是循环**体**内的块 ——
+按「块内含回边」筛会恰好把循环体的承重边删掉。
+
+正确判据：从每个**回边的目标块**出发向前标记（保守地标记到函数末尾 ——
+误标只多留几条本可省掉的边，回到修改前行为，绝不会少留循环体需要的边）。
+
+这正是 `dag.rs` 顶部记的「前五次尝试全翻车」的那类坑：**在执行器/块级找错判据，
+而缺陷是判据本身的粒度不对**。本刀补的正是那个缺失的判据。
+
+### 验证
+
+- `tests/dag_edge_dedup.rs`（3 例）：无完全重复边 / 不同 kind 必须保留 / 边数不塌缩。
+- `tests/continue_semantics.rs`（3 例）：`continue` 语义（含独立第三方判据
+  「`continue` 与其 if/else 等价写法结果必须一致」）全绿 —— 这条正是首版
+  破掉、被本刀修回的那条。
+- 57 个 fixture 与修改前 `dag_analyze` 逐条比对**零差异**。
+- 安全阀无需新增：判据是静态的，不引入运行时开关。
+
+## [Unreleased] — 建图修复：DAG 消除重复边（`dag_analyze` 两个 Sequence 发射点未去重）
+
+### 缺陷
+
+`dag_analyze` 有**两个独立**的 Sequence 边发射点，各自 push 而**无去重**：
+
+1. **Step 1** 的块内全序链（`prev_node → idx`）
+2. **Step 3** 的 `last_effect` 扇出（Effect 之后的每个节点各连一条）
+
+一个紧跟 `Effect` 的 `Compute` 节点会**同时**被两者连到 ⇒ 产生重复边。
+实测 e2e fixture：边总数 **3067**，其中 **197 处** `(from,to,kind)` 完全重复（**7%**）。
+
+危害：
+- 执行器每 wave 遍历全部 `dag.edges`，冗余边是纯浪费；
+- 任何「统计分叉数」的消费者都必须**自己去重**才能得到正确结果 ——
+  `vm/engine.rs` 的 `threaded_successor` 就因此不得不内置一段去重逻辑
+  （否则紧循环里每轮都误判「非直线」而回退）。
+
+### 修法
+
+在 `dag_analyze` 收口处（构造 `MirDag` 之前）做一次 **三元组 `(from, to, kind)`
+去重** —— 单一收口点，不改动 Step 1/Step 3 各自的加边逻辑（它们的顺序
+语义由既有测试守护，不在本刀范围）。
+
+### 关键区分：只去同 kind 的重复
+
+实测另有 **543 处** `(from, to)` 相同但 **kind 不同**（Data 边与 Sequence 边
+并存）—— 那**不是**冗余：Data 决定「输入就绪」、Sequence 决定「控制到达」，
+删任何一条都会改变语义。故去重的键是**三元组**而非 `(from,to)`。
+
+### 结果
+
+- 完全重复边：**197 → 0**；边总数 3067 → **2860**
+- 543 处「同端点不同 kind」的边**全部保留**
+- 性能不受损：1M 次迭代直穿仍为 **1.35×**（去重只省边、不改调度）
+- 顺带简化：`threaded_successor` 里那段「自行去重」的补丁已**删除** ——
+  workaround 不应比它要修的缺陷活得更久
+
+### 验证
+
+`tests/dag_edge_dedup.rs`（3 例）：全量 fixture 无完全重复边；「同端点不同 kind」
+必须保留（防去重被误实现成按 `(from,to)` 去重）；边数不塌缩（防过度去重）。
+已实测该门能抓回归：临时关掉去重 ⇒ 2 条立刻 FAILED。
+
+## [Unreleased] — 顺序直穿（switch-threaded）：紧循环不再为每条指令付 BSP 波次开销
+
+### 问题：420ns/指令，与循环体大小无关
+
+实测基线（release、中位数）：1M 次迭代 **4309 ms**。该循环 DAG 只有
+**26 nodes / 54 edges**，每轮约 6 条指令 ⇒ **每条 ≈ 420 ns**。
+
+逐条核对主循环（`vm/engine.rs` 的 `while !active.is_empty()`）后确认，
+每条指令都在摊这些**与循环体大小无关**的固定开销：重建 `ready`
+（`node_ready` + `seq_preds.iter().all()`）、三组代际标记、**遍历全部 54 条边**
+做边传播、以及纯节点的 memo 指纹/查表。BSP 波次调度是为「并行/乱序」设计的，
+而顺序循环用不上它的任何好处。
+
+### 做法
+
+在主循环顶部插入直穿路径：当 `active` **恰有一个**已就绪节点时，直接执行它
+并沿**唯一后继**继续；后继不唯一或非直线 ⇒ 立刻交还原 BSP 波次路径。
+
+**纪律**（见 `dag.rs` 顶部五次失败记录）：
+
+- 指令语义**只有一个来源** —— 仍调 `handlers::dispatch`，memo
+  （`is_memoizable_pure`/`value_fp`/`reuse`/`record`）照旧执行；
+- **只改调度、不改建图** —— `dag_analyze` / `partition_blocks` 一行未动；
+- **任何不确定立即回退** —— 复杂控制流自动落回已被 300+ 测试验证的路径。
+
+### 收益（release 实测，中位数）
+
+| 场景 | 优化前 | 优化后 | 加速 |
+|---|---|---|---|
+| 1M 次迭代 | 4309 ms | 3140 ms | **1.37×（省 27%）** |
+
+直穿命中率 **89%**（1M 迭代中 1.6M 次直穿 / 200k 次回退）。
+
+### 途中修掉的两个真 bug（均由本刀暴露）
+
+1. **`threaded_successor` 按 `executed` 过滤后继** —— 循环的**回边**指向本次
+   迭代早已执行的节点，过滤掉它会让直穿**每轮都回退**（命中率仅 22%）。改为
+   只看去重后的**目标个数**后，命中率 22% → 89%。
+2. **重复 Sequence 边未去重** —— `dag_analyze` 对 Effect 节点产生重复边
+   （实测 `[3] seq=[4, 4, 5, 6]`），被误判成「多目标 ⇒ 汇合」而回退。
+
+### 验证
+
+`tests/switch_threaded.rs`（3 例）：全量 57 个 e2e fixture 在
+`MORA_NO_THREADING=1` 与默认下 stdout/退出码**逐字节相同**；if/else、
+break/continue、handler、闭包调用等**分叉回退**场景结果不变；性能护栏
+（`#[ignore]`，需 release 二进制）断言 1M 迭代**至少快 15%**，防止优化被静默
+回退——本刀对 release 二进制实测通过。
+
+安全阀 `MORA_NO_THREADING=1` 可一键关闭（用于 A/B 与紧急回退）。
+
+## [Unreleased] — 寄存器分配器：槽位复用（此前 `alloc_reg` 是单调计数器、从不复用）
+
+## [Unreleased] — 寄存器分配器：槽位复用（此前 `alloc_reg` 是单调计数器、从不复用）
+
+### 问题
+
+`EmitContext::alloc_reg`（`mir/lower.rs`）是单调自增计数器：每个值一个**独占**
+槽位，用完不回收，`n_regs == 指令数` 量级。**全仓此前无任何分配器**
+（`grep regalloc|linear_scan|graph_color` 零命中）。而每条解释器指令都在
+`vec![Value::Nil; n_regs]` 上跑。
+
+### 做法
+
+新增 `src/mir/regalloc.rs` —— 活跃**段**着色（linear-scan 的等价形式），
+作为**编译后 pass** 接入三条出口（`apply_rules` 之后、进入 DAG 缓存之前，
+保证 `content_key` 与函数一致）：
+
+- 按 pc 线性扫描建活跃段，每次 def 一段（**不是**「一寄存器一区间」——
+  主路径**非 SSA**，寄存器会被反复重定义，如 for 索引
+  `BinaryOp(9, 9, Add, 11)` 是 read-modify-write，旧值当 pc 即死）；
+- 段在**最后一次读**即结束（不活到函数末）—— 这是槽位能真正复用的关键；
+- 区间重叠者异色，重写 `dst` + 输入寄存器，`n_regs = 最大槽 + 1`；
+- 嵌套 `MirFunction`（闭包/task/handler 是独立寄存器空间）递归处理。
+
+### 收益（实测）
+
+全量 e2e fixture 共 **112 个函数空间**：19 个被压缩，寄存器总数
+**2171 → 1693（−22%）**。单例：`n_regs` 70→5、56→6、36→6、25→3。
+
+### ⚠ 性能收益实测为 0 —— 如实记录
+
+release 构建、中位数实测：
+
+| 场景 | 分配 ON | 分配 OFF | 差异 |
+|---|---|---|---|
+| 1M 次循环迭代 | 2523 ms | 2504 ms | **噪声** |
+| 直线代码 | 12.2 ms | 12.1 ms | ~0 |
+
+`n_regs` 降了 22%，但那 22% **不是解释器的瓶颈**。原因是保守判据（见下）
+把「含循环」整体排除了，而**热代码几乎全是循环**。
+
+本项的价值在于：降低 `n_regs`（JIT 的 `disp(reg)=reg*16+8` 直接按寄存器号算
+帧内位移，槽位越少帧越小）、为将来 CFG 级分配铺路。**但它本身不是性能杠杆**
+——真正的杠杆是紧循环里的 BSP 波次开销，见「顺序直穿」一条。
+
+### 诚实边界（安全优先，两类函数体**不分配**）
+
+1. **含循环**：回边使「pc 序 ≠ 执行序」，跨迭代活跃性需 CFG 级不动点分析。
+   未加此判据时实测 **4 个 fixture 死循环**（for 索引跨迭代被误判为不重叠）。
+2. **含效果/控制语句**（`Handle`/`Perform`/`TaskDef`/`Parallel`/…）：这些指令
+   写寄存器的方式不由 `written_reg()` 完整覆盖，逐指令 def 计数会漏。
+   未加此判据时 `handle_effect` 越界 panic。
+
+不满足者**原样保留** emit 编号，行为与分配前逐位一致。收益覆盖面因此小于
+「全部函数体」——这是刻意的取舍：**宁可少赚，不可错值**。
+
+顺带修掉两个**元数据层既有缺口**（被本分配器暴露）：`MirInst::input_regs()` /
+`map_regs` 对 `Quasiquote` 的 unquote 寄存器**完全不可见**（返回 `vec![]` /
+`segments.clone()`），故 `h_quasiquote` 会读到未重写的旧号并越界。
+
+### 验证
+
+- `tests/regalloc.rs`（3 例）：全量 57 个 e2e fixture 在 `MORA_NO_REGALLOC=1`
+  与默认下的 stdout/退出码**逐字节相同**；确有空间被压缩（防「安全但无用」）；
+  含环/效果语句的函数体原样保留。
+- 安全阀 `MORA_NO_REGALLOC=1` 可一键关闭分配（用于 A/B 与紧急回退）。
+
+## [Unreleased] — D467：MIR 执行模块重构 —— 壳层不再假装拥有执行器
+
+### 问题：命名与模块边界双双撒谎
+
+`src/mir/vm.rs` 的模块文档自称「VM 执行内核 / MIR 解释器（pc 循环）」，
+并 `pub use dag::*` 把子模块内容**平铺**回自己。实测：
+
+- 该文件里**一行指令执行逻辑都没有** —— `run_mir` → `run_mir_with_signal`
+  → `run_dag_with_signal` → `run_dag_with_signal_memo`（唯一实现，在
+  `vm/dag.rs`）是纯转发链；
+- 文档声称的「pc 循环」**不存在**（全仓 grep `pc += 1` 只命中建图映射表与
+  JIT 发射，无解释器循环）；
+- 结果：模块名 `vm`（=执行器）实际是空壳，而真正的执行器叫 `dag` 且被
+  `pub use` 塞回壳里 —— 外面写 `vm::run_mir` 与 `vm::run_dag` 在同一命名空间，
+  **看不出谁转发给谁**。
+
+这与项目「模块化」的定位相悖：唯一实现被包在一个撒谎的壳里。
+
+### 重写后的结构（各司其职）
+
+```text
+mir/vm/mod.rs     ← 模块入口：公共工具（index_value / value_to_string /
+                    self_match_pattern / MirSignal / build_task_registry /
+                    run_main_task）+ 显式入口转出。**无执行实现**。
+mir/vm/engine.rs  ← 唯一的执行引擎（原 vm/dag.rs）：建图 + BSP 超步调度
+mir/inst.rs       ← 唯一的指令语义：dispatch（穷尽 59 个 MirInst 变体）
+```
+
+- `vm.rs` → `vm/mod.rs`，删除「pc 循环执行器」等失实文档；
+- `vm/dag.rs` → `vm/engine.rs`（它就是执行引擎，不只是「DAG 部分」）；
+- `pub use dag::*` → **显式**列出真实导出的入口，停止平铺；
+- 转发层的调用改为 `engine::run_dag_with_signal(...)`，**让委派在代码里可见**，
+  而不是伪装成同级函数；
+- `run_mir` 的文档明确写出：它**不**是线性执行器，与 `run_dag*` 是同一条路径
+  （v0.59 已归并），名字只为兼容 100+ 调用点。
+
+### 行为零变更
+
+纯重构：无逻辑改动。**API 同步更名**（要改就改到位，不留误导性命名）：
+
+| 旧名 | 新名 | 位置 |
+|---|---|---|
+| `vm::run_mir` | **`vm::execute`** | 壳层（100+ 调用点已同步） |
+| `vm::run_mir_with_signal` | **`vm::run_with_signal`** | **迁入** `vm::engine` |
+| `vm::run_mir_with_signal_cached` | **`vm::run_with_signal_cached`** | **迁入** `vm::engine` |
+
+- `run_mir` 这个名字**暗示存在「线性执行器」**，而自 v0.59 起仓库里只有 DAG/BSP
+  一种执行实现 —— 改名为 `execute` 让 API 名副其实。
+- `run_mir_with_signal*` 是**引擎入口**（建图+调度），原先放在壳层且用 `run_mir`
+  前缀，属命名与归属双错；现迁入 `engine` 并去掉前缀。
+- 壳层 `vm/mod.rs` 至此**不再持有任何执行入口**：`execute` 是唯一入口，直接调
+  `engine::run_with_signal`，不再有「壳层转发壳层」的层级。
+- 3 个测试文件（`nine_layer_differential` / `nine_layer_block_equivalence` /
+  `node_result_reg_gap`）已有**同名本地 helper `execute(func)`**，故以
+  `execute as run_mir` 别名导入，避免撞名。
+
+同步更新引用旧名/旧路径的注释与文档（`docs/architecture-diagram.md`、
+`tests/mir_memo_purity_consistency.rs` 的路径断言等）。
+
+## [Unreleased] — D466：删除 `add_sequential_edges`，3 条 `#[ignore]` 分歧转正为真实护栏
+
+### 结论：那 3 条分歧**不是**执行器缺陷，是测试脚手架自造的伪图
+
+`tests/run_mir_equiv_run_dag.rs` 原有 3 条 `#[ignore]`，记录「`run_mir`
+（生产）与强制线性 `run_dag` 不等价」。经逐条取证：**分歧方恒为强制线性
+一侧，而生产路径三例全对**。
+
+### 根因（真实 DAG dump 证明，非推测）
+
+`MirDag::add_sequential_edges` 按**相邻节点编号** i→i+1 补 `Sequence` 边，
+其注释断言「节点按 pc 递增创建 ⇒ 相邻编号即线性序」。**该断言在有控制流时
+不成立** —— 跨基本块时节点编号不反映执行序。
+
+实测 `for + break` 的 DAG：边数 **73 → 107（+34）**，新增的 7 条里有 **4 条
+跨越控制流终结边界**：
+
+```
+[15]Branch -> [16]Compute    [21]Branch -> [22]Effect
+[24]Jump   -> [25]Compute    [32]Jump   -> [33]Compute
+```
+
+边传播会跳过 `Branch`/`Jump` 出边（由 handler 选中的 target 激活，
+`vm/dag.rs:549-553`），却会激活 `Sequence` 边
+（`should_push = is_control_edge || Sequence`）—— **伪造的 Sequence 边成了
+唯一绕过该保护的路径**。后果：`break` / `continue` 被架空（跳出线性链的
+控制转移在链上失效，循环体多跑一轮）、if/else 两臂被串行化。
+
+| 用例 | run_mir（生产） | 加 `add_sequential_edges` | 正确值 |
+|---|---|---|---|
+| if/else | 8.0 | `Bool(false)` | 8.0 |
+| for + break | 2.0 | 5.0 | 2.0 |
+| while + continue | 5.0 | 6.0 | 5.0 |
+
+### 为何此前无人推动
+
+`dag.rs` 记录了**五次**修复尝试，最终结论是「共同的错处：都在**执行器**里
+找判据，而缺陷在**建图**」。但那五次修的是**生产建图**
+（`partition_blocks`），而这 3 条卡在**另一个地方** —— 测试专用的
+`add_sequential_edges`。二者被混为一谈。
+
+### 改动
+
+- **删** `MirDag::add_sequential_edges`（`src/mir/dag.rs`）：`src/` 内**零调用**
+  （生产建图是 `dag_analyze → dag_optimize → prune_sequence_edges`），且它
+  **自述「不保语义」** —— 留着等于在公共 API 上留一个「已知会造错图」的
+  方法。它也是 v0.59 那句假承诺「`run_mir ≡ run_dag`」的**源头**。
+- **改** `tests/run_mir_equiv_run_dag.rs`：原「强制线性」路径改用**生产建图**，
+  于是该文件断言的是**真实**的 `run_mir` ≡ `run_dag`。
+- **转正** 3 条 `#[ignore]` 为常驻护栏（`run_mir_equiv_dag_{if_else_value,
+  while_continue, for_break}`）：正是当初暴露伪图的三个程序，改用生产建图
+  后等价成立，从此作为控制流（分支汇合 / break / continue）的等价护栏。
+- 清理 `vm.rs` / `vm/dag.rs` / `tests/e2e.rs` 里对已删方法的文档引用
+  （`e2e_run_mir_deterministic` 原注释声称的「核心承诺」是**空承诺** ——
+  它从未构造该方法、从未对比两条路线）。
+
+**净效果**：`run_mir_equiv_run_dag` 由「10 passed + 3 ignored」变为
+**13 passed / 0 ignored**，护栏强度提升而非降低。
+
+## [Unreleased] — 泛型函数声明 `task f<T>(x: T): T` / `fn<T>(x: T)`
+
+`task first<T>(x)` 此前直接 Parse error。本刀让**显式泛型函数**可用：类型参数在
+声明处引入、在**调用点按 fresh 变量单态化**。
+
+### 范围界定（如实说明）
+
+Mora 的 **rank-1 let-多态**早已完整可用（`Type::ForAll` + `generalize`/
+`instantiate`，`let id = fn(x) x` 对多种类型调用均通过）。本刀补的是**显式泛型
+声明**这一环。
+
+**本刀不是 kind 多态 / HKT** —— 把「接受函数的类型」当一等人公民（`Functor`、
+`forall f. …`）需给 `Type` 枚举新增 kind 层并重写 unify，属独立的大工程。
+CHANGELOG / spec 如实写明边界，**不宣称「支持高阶类型」**。
+
+### 关键实现点
+
+- **复用既有 `ForAll` 通路**：泛型 `FnDef` 的签名包成 `ForAll(<类型参数>, Arrow)`
+  放进 env，`infer_call` 现有的 `instantiate_if_forall` 即按每次调用展开成 fresh
+  TypeVar —— 与 let-绑定多态闭包走同一条路，无需新的实例化机制。
+- **`Type::TypeVar` 是单 `char`**：类型参数取**首字母**。已取证
+  `fresh_type_var_id` 只发控制字符，故与用户声明的类型变量**天然不撞名**。
+  首字母重复（`<TT, Tx>`）时**解析器报错**，不得静默合并成同一变量。
+- **作用域严格配对**：parser 的 `generic_params` 进入泛型声明时 set、函数体解析后
+  还原；否则后续无关标注会把同名误当类型变量（由「泛型名不泄漏」测试兜）。
+
+### 行为（已逐条实证）
+
+- `task id<T>(x: T): T` 可被 `id(1)` 与 `id("s")` **各自实例化**，运行期也正确
+  （标注擦除，`id(42)` -> `42.0`、`id("hello")` -> `hello`）。
+- 体内一致性：`task same<T>(x: T, y: T)` 传 `(1, "s")` **被拒**。
+- 多参数：`task pair<T, U>(a: T, b: U)` 允许混合类型实参。
+- 泛型容器：`task head<T>(xs: list<T>): T` 可用。
+- 泛型闭包 `fn<T>(x: T)` 同样可用（闭包靠 let-泛化成为多态）。
+- **零回归**：非泛型的形参标注与裸形参行为逐字不变。
+
+### 改动
+
+- `mir/witness.rs`：`FnDef` 增 `type_params: Vec<char>`（空 = 非泛型）。
+- `parser_v3/{mod,syntax,emit_definitions,emit}.rs`：泛型子句解析、泛型作用域、
+  裸名 -> `Type::TypeVar`（仅限声明作用域，不加全局大写规则）。
+- `typeck/hm/mod.rs`：`precompute_fn_signatures` 对泛型 `FnDef` 产出 `ForAll`。
+- `tests/generic_functions.rs`（8 例）、`tests/spec_ebnf_census.rs` 补最小实例。
+- 文档：`docs/mora-spec.md` 新增 `type_params` 产生式（`task` / `closure` 用）。
+
+## [Unreleased] — 该增加的要增加：`task` / `fn` 形参与返回类型标注
+
+`task add(a: number, b: number): number` 与 `fn(x: number) … end` 此前一律
+`Parse error: Expected ')' after parameters` —— README「Type checking」节的
+示例曾因此整块被删（D117）。本刀补齐该能力：标注可解析，且**在调用点**按
+声明检查实参。**本条闭合 D110 缺口 1**（spec 中 7 处参数标注示例现在可直接解析）。
+
+### 为什么是「地基已就位、只差 parser 一步」
+
+承载位与消费端**本就存在**，缺的只是把标注填进去 + 让调用点看得到：
+
+- `WitnessParam.type_hint`（witness.rs）+ `FnDef.return_type`
+- `Param.type_hint`（orchestrate::Param）→ 转 `WitnessParam.type_hint`
+- `bidirectional.rs` Phase A/A' 把形参 `type_hint` 绑进 HM 环境做 subtype 检查
+- 新增 `hm::precompute_fn_signatures`：把**带标注**的 `FnDef` 登记进 env 成
+  curried `Arrow`，调用点据此按声明检查实参
+
+失败根因：形参循环只 `consume_identifier`（裸名），遇 `:` 直接 break；
+且 `FnDef` 定义名此前从不进 `env`（无 Arrow 类型）⇒ `infer_call` 落兜底
+fresh var，实参与之合一**恒成功**，标注即使解析了也不约束调用点。
+
+### 行为
+
+- 标注形参/返回值在**调用点**受约束：`task f(a: number)` 被传 `"x"` ⇒ 报类型错；
+  返回标注同理（`f(1)` 赋给 `string` 被拒）。
+- **裸形参零回归**：`task f(x)` / `fn(x)` 完全不登记，与改动前**逐字一致**；
+  实参不做类型约束（仍按既有 arity 语义）。混合声明只约束标注位。
+- 支持 union 标注（`a: string | number`）。
+
+### 改动
+
+- `parser_v3/emit_definitions.rs`：`task` 形参循环收 `name[: Type]`，
+  包装进 `WitnessParam.type_hint`；接上此前写死的 `return_type`。
+- `parser_v3/emit.rs`：闭包形参循环同上。
+- `typeck/hm/mod.rs`：新增 `precompute_fn_signatures`（仅登记带标注的 `FnDef`）。
+- `tests/param_annotations.rs`（8 例）：能解析 + 标注生效 + 裸形参零回归
+  + union + 混合 + 元数检查不豁免。
+- 文档：`README.md`「Type checking」节恢复真实示例（已实证三行均符合）；
+  `docs/mora-spec.md` 新增 `annotated_params`（task/closure 用），`macro`
+  仍用裸 `params`（其路径未接标注）；`tests/spec_ebnf_census.rs` 补最小实例。
+
+## [Unreleased] — 内建注册表：把「三表不许漂移」从约定变成 CI 强制的不变量
+
+内建语义在仓内**多点独立登记**，靠约定保持一致、实际漂移 —— 这正是
+D4 / D5 / D9 / D12 / D16 一族缺陷的根因。三个登记点：
+
+1. typeck 权威签名表 `typeck::dispatch::builtin_signatures()`
+2. typeck 本地兜底 `typeck::hm::builtin::builtin_callee_ty`
+3. 运行期分发 `interpreter::dispatch` 的 `match`
+
+本次不改任何内建语义，而是**给「不许漂移」装上 CI 门**，让缺口可见、可回归。
+
+### 实测取证与一处结论订正
+
+- **方向 A（typeck 有签名 / 运行期无分支 ⇒ 用户报 `Undefined function`）**：
+  实测**零缺口** —— 这一族已被 D4 等修完；新增断言守住这个 0，防回退。
+- **方向 B（运行期有实现 / typeck 无签名）**：初稿曾据「只看权威表」得出
+  「24 条静默 `Any`、有一批内建零类型检查」。**该结论经复核不成立**：那批里
+  绝大多数本就有签名（落在 `builtin_callee_ty` 本地 match，含多模式 arm），
+  且误用均被 typeck 拦下（实测 `let s: string = atom(1)` 均报错）。**真实缺口
+  只有 5 条**（`conde`/`deref`/`eval`/`quote`/`read`），且 D79 已逐一论证它们
+  **在类型域里如实无法声明**（`Type::Atom` 单元变体无载荷 / `Type` 无 `Code`
+  变体 / `eval` 需递归推断 / `conde` 是 `both` 别名）。
+
+⇒ 因此**没有「该补签名却漏补」的缺陷**；剩余 5 条是**已知且刻意**的宽松。
+
+### 改动
+
+- `interpreter::dispatch::RUNTIME_BUILTIN_NAMES`（经 `interpreter` 重导出）：
+  运行期 free-function 分发名的**显式清单**，供双向核对。
+- 新增 `tests/builtin_registry_consistency.rs`（5 例），判据用**行为探针**（拿故意用错的程序跑库入口 typeck，不经子进程）：
+  - **具体返回类型**的内建（`type_of`/`atom`/… 共 13 条）—— 探针**必须被拒**，签名丢失即红；
+  - **宽松**内建（返回随回调/元素变化）—— 只要求探针能**解析**（证明真实可用）；
+  - `KNOWN_UNTYPABLE` 5 条 —— 逐条验证「探针仍通过」，防白名单养僵尸；
+  - 清单无重复、每条都有探针（防新增内建绕过检查）。
+
+已实测该门会真的抓回归：临时移除 `atom` 的签名 → 主判据立刻 FAILED 并点名 `atom`；还原后恢复绿。
+
+### 当前缺口是「已核账」，不是「已修」
+
+补齐这 5 条（`conde`/`deref`/`eval`/`quote`/`read`）需要**扩类型域**（给 `Type`
+加 `Code` 变体 / 给 `Atom` 加载荷）或**递归推断**，属 v1.0 方向的设计决定（D79
+原文）。在那之前它们是**已知且刻意**的宽松，不是漏补 —— 故此处仅登记，不实施。
+若将来扩了类型域，本测试会让「漏移除」变红。
+
+## [Unreleased] — 9 层管线：整函数静默回落 → MLIR 式显式合法性登记（三态化）
+
+`cli::compile_and_opt` 此前用**整函数二值差分**决定走 9 层还是回落 `emit.rs`：
+差分红就**整份丢弃**管线产出。这把两件本质不同的事压成同一结果：
+
+- **(A)** 程序含**尚未接入 9 层管线**的构造（功能覆盖缺口，**预期**）
+- **(B)** 程序构造**全部已接入**，管线却在某个**已支持**构造上出 bug（**回归**）
+
+二者生产侧看到的一模一样（都是「回落 + 一行 stderr」），于是 **(B) 被静默
+藏住** —— 这正是 D1 那一族（失败模式不是崩溃，而是**悄悄换一条更差的路径**）
+的新同族。
+
+### 本次改动
+
+- **新增 `src/mir/legalization.rs`** —— Mora 侧的 `ConversionTarget`：把「9 层
+  降级链还接不进 / 会整条丢弃」的构造成**显式、按名、带原因**地登记。
+  参照 MLIR `ConversionTarget` + `applyPartialConversion`（只转能转的、
+  转不动的原样留着，让「哪些没 legalize」成为可回归的集合）。
+- **`PipelineResult` 增 `unlegalized_constructs`** —— 递归扫描（含嵌套
+  `MirFunction`）得出本程序命中的未 legalize 构造。
+- **生产门三态化**（`classify()` 为生产与测试共用的**单一事实源**）：
+  1. 合法 + 差分绿 → 走 9 层快路径
+  2. 含未 legalize 构造 → 按**构造名**回落（预期，非缺陷）
+  3. 全合法 + 差分红 → **回归**：仍回落保正确，但 stderr 用醒目措辞点出，
+     不再与 (2) 同形
+
+### 登记判据：结构签名，不是裸类别
+
+不能把整类 MIR 指令一律标未 legalize。实测：合法程序
+`handle Ai { g = perform Ai("hello") } { … }` 的 MIR 里**同样含 `Perform`**，
+却走 9 层差分通过。故 `Perform` 只有**不在任何 `Handle` 作用域内**（裸 perform）
+才算未 legalize —— 判定区分「裸 perform」与「handle 包裹的 perform」。
+
+当前未 legalize 4 条（与 `nine_layer_fallback_reasons.rs` 一一对应）：
+`worker` / `transaction` / `perform_bare` / `eval_bare`。
+
+### 测试
+
+新增 `tests/nine_layer_legalization_registry.rs`（5 例）：登记不虚报、不漏报、
+不误伤合法构造、REGISTRY 与回落清单双射、三态判定穷举（含「回归」态单测）。
+三条清单（census / reasons / registry）任一漂移 CI 即红；以 census 实测为准。
+
+既有 9 层相关测试（census / reasons / differential / executor_switch /
+unblocked / block_forms）语义未动，全绿。
+
 ## [Unreleased] — docs: 文档全面对齐 v0.104.5 实际 API
 
 README / release body / 源码注释描述的是 v0.04~v0.25 时代的声明式语法，
@@ -27536,6 +28446,280 @@ dict / 列表字面量）。**当前代码库在寄存器层面无「被引用�
   并在出错时 `exit 2` —— 「typeck 放行 → 运行期报错」这一族缺陷只有这条
   路径才暴露完整。
 
+### 三十七、工具链归位 stable + Rust 1.96–1.99 新稳定项普查
+
+**先说结论**：最新正式版是 **Rust 1.99.0**（2026-10-01 发布，`rustup check`
+与 `blog.rust-lang.org/2026/10/01/Rust-1.99.0` 双源核对）。本仓库本地激活的
+工具链**本来就是** stable 1.99.0（`rustup show`：无 override、stable 为
+default），且仓库既无 `rust-toolchain.toml`、也无 `Cargo.toml` 的
+`rust-version` —— 即「切到最新正式版」在编译器层面本就成立。真正待办的是
+**把 nightly 从工程里摘掉**，以及把新稳定项真正用起来。
+
+#### 一、nightly lane 移除（含一次实测反证）
+
+`ci.yml` 的 test matrix 原带一条 `include: {os: ubuntu-latest, rust: nightly}`。
+工作区唯一那笔未提交改动（`src/mir/ssa/deconstruct.rs`，把
+`for bid in 0..num_blocks` 改写成 `.iter().enumerate()`）的注释写明是为压制
+**nightly 的** `clippy::needless_range_loop`。实测两态：
+
+| 状态 | `cargo clippy --all-targets --all-features -- -D warnings` |
+|------|------------------------------------------------------------|
+| 带那笔改动 | **exit 101** —— `unused variable: block`（L328 的 `let block = &ssa.blocks[bid];` 遮蔽了 L327 迭代器绑定，把改动卡在半路） |
+| 撤掉该改动（回到 pristine `cb3f928`） | **exit 0**，零 warning；`needless_range_loop` 在 stable 上**根本不触发** |
+
+⇒ 该改动**纯属 nightly 产物，在 stable 上是净负债**。已回退，nightly lane 已
+删除（CRLF 行尾按字节保留）。代价：失去 nightly 对「未来 stable 破坏」的
+预警；换来：不再为每个 Rust 版本追 nightly 新 lint 而反复改写本可不变的代码。
+
+#### 二、Rust 1.96–1.99 新稳定项逐条普查
+
+数据源：四个版本的官方 release note（GitHub release API）+ 本地 `rust-src`
+源码核对，**不用训练数据**。结论：**采纳 1 项，其余逐条否决并记明理由**。
+
+**采纳：`String::from_utf8_lossy_owned`（1.99.0）—— 6 处调用点**
+
+本地 `rust-src` 实现（`alloc/src/string.rs`，
+`#[stable(feature = "string_from_utf8_lossy_owned", since = "1.99.0")]`）是决定性依据：
+
+```rust
+pub fn from_utf8_lossy_owned(v: Vec<u8>) -> String {
+    if let Cow::Owned(string) = String::from_utf8_lossy(&v) { string }
+    else { unsafe { String::from_utf8_unchecked(v) } }  // Cow::Borrowed ⇒ v 必为合法 UTF-8
+}
+```
+
+输出与 `String::from_utf8_lossy(&v).into_owned()` **逐字节等价**（含非法序列
+→ U+FFFD 的替换行为），但吃掉 `Vec<u8>` 所有权：字节本就合法时走
+`from_utf8_unchecked(v)` **复用原分配**，省掉一次「重新分配 + 全量拷贝」。
+
+| 位置 | 原写法 | 收益 |
+|------|--------|------|
+| `src/http_server.rs`（request body） | `from_utf8_lossy(&buf).to_string()` | 省 1 次分配 + 拷贝 |
+| `src/mcp_server.rs`（body 读取） | `from_utf8_lossy(&body).to_string()` | 同上 |
+| `src/interpreter/builtins/exec.rs` | `from_utf8_lossy(&output.stdout/.stderr).into_owned()` ×2 | 同上 ×2 |
+| `src/sandbox/container.rs` | `from_utf8_lossy(&output.stdout/.stderr).into_owned()` ×2 | 同上 ×2 |
+| `src/interpreter/builtin_impls.rs` | budget 字节截断后 `from_utf8_lossy(&t).into_owned()` | 同上 |
+
+**实测验证**（`rustc --edition 2021 -O` 独立跑通，非 smoke）：8 个边界用例
+—— 纯 ASCII / 合法多字节 / 空 / 孤立非法序列 / 纯垃圾字节 / **截断在多字节
+字符中间** / 截断的两字节序列 / 混入非法 continuation —— 新旧写法
+`assert_eq!` 全等；并断言合法 UTF-8 时新写法的 `String` 指针与原 `Vec` 指针
+**相等**（零拷贝复用，非仅输出相同）。
+
+**否决（逐条查过调用点，不是「看着没必要」）：**
+
+| 新稳定项 | 版本 | 否决理由（取证） |
+|----------|------|------------------|
+| `mem::size_of_val_raw` / `align_of_val_raw` / `Layout::for_value_raw` | 1.99 | 全仓裸指针只有 `lmir_to_mir.rs:88` 一处 `slice::from_raw_parts`，目标 `str` 是 Sized，无 unsized 场景 |
+| `Vec::into_parts` / `Vec::from_parts` | 1.99 | 全仓零 `Vec::from_raw_parts` |
+| `Box::into_non_null` / `Box::from_non_null` | 1.99 | 零 `Box::leak` / `Box::from_raw` |
+| `core::ffi::VaList` + C 变参定义 | 1.99 | 无变参 FFI **定义**（Mora 只调用 libc 符号） |
+| `VecDeque::retain_back` | 1.99 | 零 `VecDeque` 使用 |
+| `FromUtf8Error::into_utf8_lossy` | 1.99 | 现有 `String::from_utf8(..)` 严格校验路径是**刻意决定**（`audit/mod.rs:537` 明写「非法 UTF-8 → 解析失败，而不是静默产出错的字符串」），换成 lossy 会改语义 |
+| `core::fmt::NumBuffer` + `<{integer}>::format_into` | 1.98 | `value/display.rs:12` 是 `write!(f, "{}", i)`，整数 Display 已是 core 快路径，改写反而绕远 |
+| `{fN}::algebraic_{add,sub,mul,div,rem}` | 1.98 | **会改语义**：这是 IEEE-754 特殊值（NaN / ±Inf / ±0）算术；Mora 的 `linalg` / `stats` 用普通运算是既定行为，不能换 |
+| `String::from_utf16{le,be}(*_lossy)` | 1.98 | 零 UTF-16 解码路径 |
+| `[T]::strip_circumfix` / `str::strip_circumfix` | 1.98 | Unicode 环绕附标处理，与本项目无关 |
+| `Atomic::from_mut` / `get_mut_slice` / `from_mut_slice` | 1.98 | 原子量全是 `Arc<AtomicU64>` / `Arc<AtomicUsize>` 直接当计数器，无「持有 `&mut T` 再转 `&Atomic<T>`」形态 |
+| `bool::ok_or` / `bool::ok_or_else` | 1.98 | 无值得改写的 `if cond { Ok } else { Err }` 形态 |
+| `str::substr_range` / `[T]::subslice_range` | 1.98 | 无「拿到子切片再反查下标区间」的调用点 |
+| `<{integer}>::bit_width` / `highest_one` / `lowest_one` / `isolate_*` | 1.97 | `value/persistent.rs:36` 的 `bit_index` 已用 `count_ones()`；全仓无手写位宽循环 |
+| `NonZero::{integer}::*`（同上族） | 1.97 | 同上，且无 `NonZero` 热点 |
+| `cargo build.warnings` 配置 | 1.97 | 确可替代 CI 的 `-D warnings`，但会改变门禁触发时机；本项目门禁要求本地与 CI 一致，本轮不动 |
+| `core::range::{Range, RangeFrom, RangeToInclusive, ..}` | 1.96 | `std::ops::Range` 已在 prelude，`core::range::*` 是同一批类型的再导出 |
+| `assert_matches!` / `debug_assert_matches!` | 1.96 | 现有 `assert!(matches!(..))` 已达同等效果 |
+| `cfg(expr)` 元变量 | 1.96 | 现有 feature gate 用 `#[cfg(feature = ...)]` 字符串形态，未用到可传表达式的写法 |
+| `{core,std}::derive` | 1.98 | 纯外观变化，prelude 的 `derive` 已可用，无收益 |
+
+#### 三、门禁复核
+
+| 检查 | 结果 |
+|------|------|
+| `cargo clippy --all-targets --all-features -- -D warnings` | **exit 0**（项目 CI 门禁原文） |
+| `cargo fmt --all -- --check` | **exit 0** |
+| `cargo test --lib` | **1011 passed / 0 failed / 13 ignored**（3.40s） |
+| `cargo test --all-targets` | **未能执行** —— 见下 |
+
+`cargo test --all-targets` 的阻塞是**本机环境问题，与本次改动无关**：本仓库
+有 30+ 个独立 integration test 二进制，Windows MSVC 链接器在带调试信息时
+逐个生成 PDB，撞上 `LNK1140`（超出程序数据库限制）/ `LNK1180` / `LNK1201`
+/ `LNK1318`，**14 个测试目标在链接阶段失败、0 个 rustc 编译错误、0 个测试
+跑起来**。改用无调试信息重试又撞上磁盘耗尽（`os error 112`），并连带清空了
+`target/`（gitignored 产物，可重建）。故本轮以 `--lib` 作为实际测试证据。
+
+### 三十八、Rust 1.99 新增 lint 逐条实测 —— 采纳 `raw_borrows_via_references`
+
+上一轮（三十七）普查的是 1.96–1.99 的**稳定化 API**；本轮补上**lint 与语言
+规则**这一面（同样取自官方 release note，非训练数据），并逐条在全仓实跑。
+
+#### 一、五条 1.98/1.99 新 lint 的实测结果
+
+显式开启后实跑
+`cargo clippy --all-targets --all-features -- -W <lint> ...`：
+
+| lint | 版本 | 默认级别 | 实跑结果 |
+|------|------|---------|---------|
+| `raw_borrows_via_references` | 1.99 | allow | **命中 1 处** —— `src/typeck/hm/mod.rs` |
+| `unconditional_panic`（1.99 扩展到 chunks/windows size=0） | 1.99 | warn | 零命中 |
+| `suspicious_runtime_symbol_definitions` | 1.98，1.99 补 POSIX 符号 | warn | 零命中 |
+| `invalid_runtime_symbol_definitions` | 1.98，1.99 补 POSIX 符号 | deny | 零命中 |
+| `semicolon_in_expressions_from_non_local_macros` | 1.99 | warn | 零命中 |
+
+两个**查过但确认无风险**的点（不是"看着没问题"）：
+
+- `src/interpreter/method_dispatch.rs:275` 的 `list.windows(size)`：`size` 来自
+  Mora 脚本入参，正是该 lint 新覆盖的 panic 形态。但上游 L270 已有
+  `if size <= 0.0 { return Err(...) }` 前置守卫（同款守卫 `window()` L253 也有），
+  `size >= 1` 恒成立 ⇒ 运行时不可达。
+- JIT 的裸符号声明（`src/mir/jit.rs`）：1.99 恰好把 POSIX 符号纳入上述两条
+  runtime-symbol lint，而本仓**手写**了 `mmap` / `mprotect` / `munmap` /
+  `VirtualAlloc` / `VirtualProtect` / `VirtualFree` 六个 `extern` 块。实跑
+  deny 级的那条也是零命中，说明这些声明合法。
+
+#### 二、命中项修复
+
+`src/typeck/hm/mod.rs:1342`（agent 作用域去重，靠裸指针做身份比较）：
+
+```rust
+// 修前
+.any(|a| std::ptr::eq(&a.task_expr as *const _, wp))
+// 修后
+.any(|a| std::ptr::eq(&raw const a.task_expr, wp))
+```
+
+`&x as *const _` 会先**物化一个中间引用**、再立刻退化成裸指针：引用附带的别名
+规则白白背上，却不产生任何收益。`&raw const`（stable 1.82）直接产出裸指针，
+不经过引用。两侧类型不变（`&MirWitness` → `*const MirWitness`），
+`ptr::eq` 的比较对象与语义完全等价。
+
+#### 三、把 lint 固化进 manifest
+
+```toml
+[lints.rust]
+raw_borrows_via_references = "warn"
+```
+
+这是本仓**唯一需要显式声明**的一条 —— 另四条本就是 warn/deny by default，
+已被 CI 的 `-- -D warnings` 覆盖，重复声明只会掩盖真正的门禁来源。
+
+**牙齿验证**（绿了不算数）：把 `&raw const` 改回旧写法后重跑
+`cargo clippy --all-targets --all-features -- -D warnings` ⇒ **exit 101**，
+报错正是 `error: creating an intermediate reference implies aliasing
+requirements even when immediately cast to a raw pointers`；改回后 exit 0。
+即 manifest 声明确实接进了门禁，不是"配了但没生效"。
+
+#### 四、门禁复核
+
+| 检查 | 结果 |
+|------|------|
+| `cargo clippy --all-targets --all-features -- -D warnings`（含新 lint 声明） | **exit 0** |
+| `cargo fmt --all -- --check` | **exit 0** |
+| `cargo test --lib` | **1011 passed / 0 failed / 13 ignored**（3.37s） |
+
+### 三十九、拆边界 #1：后缀值调用 `f(…)(…)` —— 文法 / parser / MIR 三层同时补齐
+
+本条对应 D123 留下的「未承诺的能力缺口」。D123 当时只做了**止血**（把静默算错
+改成明确报错），没补能力；本轮补齐。
+
+#### 〇、先记一次自我推翻
+
+上一轮我判定这条「只差**一个 match 分支**」——**错的**，而且是被自己的
+编译错误推翻的。原因：我只看了 parser 的后缀链循环，没往下追 MIR。
+实际缺口有三层，第二层（`MirInst`）我完全没看见。
+
+> **教训**：「循环里少个分支」和「少个分支」不是一回事。
+> 前者只要求解析器接受该 token，**后者还要问「这条路径上有对应的中间表示吗」**。
+> 本仓的执行管线有 Parser → MirInst → SsaInst → Fcfg → Core 五层，
+> 补语法必须**逐层问「这一层能不能表达它」**——漏问一层，工作量就翻倍。
+
+#### 一、三层缺口（逐层取证）
+
+| 层 | 缺口 | 证据 |
+|----|------|------|
+| 文法 | EBNF 推导不出 `(expr)(args)` | spec §14.2 `call = IDENTIFIER "(" … ")"`，而被调用者钉死成 `IDENTIFIER`；紧邻的 `method_call` / `index` 却都经 `expr` 递归 |
+| parser | 后缀链循环遇 `(` 走硬报错 | `emit.rs` `emit_call_tail_w` 只认 `.` 与 `[` |
+| MIR | **没有任何 N 元值调用指令** | `MirInst::Pipe` 是 1 元的（`h_pipe` = `call_value(callee, [lhs])`），`f(x)(a, b)` 无处可放 |
+
+#### 二、改动
+
+1. **spec §14.2**：新增 `primary` / `postfix` 两条产生式，与实现一一对应。
+   `tests/spec_ebnf_census.rs` 同步补两条最小实例（`postfix` 取值调用形态）。
+2. **parser**：`emit_call_tail_w` 的 `(` 分支改为真调用，发 `MirInst::CallValue`，
+   witness 用 `WitnessCallee::Evaluated`（typeck / `witness_to_fcfg` 早就有分支）。
+3. **MIR**：新增 `MirInst::CallValue(dst, callee_reg, args)` + 对应
+   `SsaInst::CallValue`，接进 11 处穷举 match（`inst` / `ssa` / `opt::loops` /
+   `opt::simple` / `optimize::cost` / `pipeline` / `ssa::deconstruct`），
+   新 handler `h_call_value`（与 `h_pipe` 同底座 `MirHost::call_value`，
+   只是实参 N 个）。
+4. **9 层管线顺带修一个隐藏缺陷**：`fcfg_lower` 原先把动态调用降级成
+   `MirInst::Call("_r{n}", …)` —— callee 寄存器**直接丢弃**，运行期必报
+   `Undefined function or task: _r5`。现按 `callee_name` 有无分流。
+
+#### 三、踩到并修掉的一个自伤
+
+分支初版写成 `self.check(&TokenType::LParen)`（**窥视**不消费），而
+`emit_arg_list_w` 假定当前位置就停在 `(` 上 —— 于是实参表从 `(` 起解析，
+把 `(args)` 吃成一个括号表达式，随后 `consume(RParen)` 必然失败。
+症状是莫名其妙的 `Expected ')'`，与真实原因隔了三层。
+同循环内另两个分支用的都是 `match_token_exact`（消费），**照邻居写即可**。
+已在代码注释里钉住这条。
+
+#### 四、牙齿验证（绿了不算数）
+
+把 `(` 分支改回 D123 的硬报错形状后：`tests/postfix_value_call.rs`
+**4 条能力用例全红**，而钉住「柯里化部分应用仍被拒」的那条策略用例
+**保持绿**（它断言的是拒绝，回退后仍拒绝 ⇒ 判据方向正确，不是凑数）。
+改回后 5 passed。
+
+#### 五、仍然不通的（**不是本条能解的**，逐条取证）
+
+| 现象 | 真实卡点 | 性质 |
+|------|---------|------|
+| `compose(inc, dbl)(5)` | 后缀链已通；卡在 `typeck/dispatch.rs` 把 `compose` 声明为返回**名义类型** `Type::Compose` 而非函数类型 ⇒ 对其结果发起调用即报 `expected compose, got fn (float) -> …` | **签名问题**，该表 D79 注释原样记录了这个错误串，且已因此回归过一次 |
+| `task inc(x) … end` 后 `compose(inc, …)` | 顶层 task 名**不进 typeck env**（调用点解析成 TypeVar），报 `Unbound variable 'inc'` | 独立缺陷（与 D167 同族） |
+| `let mk = fn(x) fn(y) … end; mk(1)` | `infer.rs` 的 arity 检查用 `arrow_arity` 数**整条 Arrow 链**，`mk(1)` 期望 2 实参 | **有意策略**：运行期不支持隐式部分应用，另有显式写法 `curry(f, n)`。已加测试钉住该策略仍生效 |
+
+⇒ 结论不变，但更精确了：**「边界」不是一条，是一串**。这次拆掉的是其中
+「parser + MIR 表达能力」那一段；剩下三段各自独立，其中两段是签名/环境
+问题，一段是**有意为之的设计决策**。
+
+#### 六、门禁
+
+| 检查 | 结果 |
+|------|------|
+| `cargo clippy --all-targets --all-features -- -D warnings` | exit 0 |
+| `cargo fmt --all -- --check` | exit 0 |
+| `cargo test --lib` | 见下 |
+| `cargo test --test postfix_value_call` | **5 passed / 0 failed** |
+| `spec_ebnf_{wellformedness,census,parity,surface}` + `spec_code_block_census` | 全绿 |
+
+#### 七、补充：这条改动波及了三处「钉住旧行为」的判据（含我自己的一次漏报）
+
+补语法能力必然波及既有断言——本条就抓到三处，全部是**钉 D123 旧行为**的：
+
+| 测试 | 原判据 | 新判据 | 处置 |
+|------|--------|--------|------|
+| `tests/mora_syntax_forms.rs` | `连续调用 f()(…)` = `Rejected` | `Form::Gap` | 解析层已通，但该 src 仍被 typeck 的 arity 检查拒 ⇒ `Gap` 恰是「能编译但受限」 |
+| `tests/higher_order_arity_matrix.rs` | 内联 `curry(...)(2)` 应 exit 2 | **exit 0、取值 3.0** | 该 helper 走**真实 CLI**（含 typeck），故它证明的是「解析 + `CallValue` + typeck 的 `Evaluated` 被调者」三段全通 |
+| `tests/path_differential_census.rs` | `f(…)(…)` 两条路径都应 `COMPILE-ERR` | 两条路径都应给出 **3.0** | 见下 |
+
+第三条最值得记：它的文档**自己预言过**这次翻转（「若哪天有人加了 `(` 分支却处理不周，这条会从『拒绝』翻成『成功』，提醒同步更新 spec 与 CHANGELOG」）。现在翻过来的不是「半成品」——**两条路径给出的是同一个正确值 3.0**；修复前它们也都是 exit 0，只是都算成 `10`（`pipeline_equivalence.rs` 里记着这个数）。「一致地算错」与「一致地对」是两件事，本条现在钉的是后者。
+
+另需修正本节开头那张表的一处措辞：`mk(1)(2)` 的**运行期**（绕过 typeck 的 `run_mir`）现已正确给出 `3.0`；仍被拒的只是 **typeck 那一侧**对柯里化闭包按 `arrow_arity` 数整条 Arrow 链。两者不是同一件事。
+
+#### 八、⚠ 本轮我自己的一个失误（记下来，别重犯）
+
+修完 postfix 后我先报了「全绿」——但那**只跑了 `cargo test --lib` 与少数定向测试**。集成套件在本机因 MSVC `LNK1140` 链不动，于是 `mora_syntax_forms` 的红一直没被发现；是后来为验证行尾归一化顺手跑它才暴露。
+
+> **教训**：`--lib` 通过**不等于**改动安全。
+> 凡改动**语义**（不只是行尾），必须先把「钉住旧行为的断言点」全找出来逐个跑 ——
+> 本轮靠 `grep D123` 才把上表三处捞齐；这已是第二次被同一族问题绊倒
+> （前次是「换个写法就重新对拍一遍」）。
+
+**行尾归一（`.gitattributes`）本身未引入任何测试失败**：685 个文件 CRLF→LF，
+提交内容 **0 字节变化**（二进制夹具零改动、`cargo fmt --all -- --check` exit 0、
+`cargo test --lib` 与读夹具的 `e2e` / `spec_code_block_census` /
+`readme_code_block_census` 全绿）。
 ## [v0.104.5] — 2026-09-19 — docs: AGENTS.md 末尾追加 5 个 agent 协作小节
 
 无代码改动。在 `AGENTS.md` 末尾追加 5 节，给后续 agent / IDE 自动化协作铺路：

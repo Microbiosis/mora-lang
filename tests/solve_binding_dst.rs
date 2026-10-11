@@ -24,7 +24,7 @@
 //! 9 层管线的 fcfg 层把结果寄存器丢了。
 
 use mora::interpreter::Interpreter;
-use mora::mir::vm::run_mir;
+use mora::mir::vm::execute;
 use mora::parser_v3::ParserV3;
 use mora::typeck::check_mir::check_program_witnesses_bidirectional;
 use std::sync::Arc;
@@ -45,7 +45,7 @@ fn run_source(func: mora::mir::MirFunction, _src: &str) -> String {
     let mut interp = Interpreter::new();
     let mut env = interp.take_env();
     let arc = Arc::new(func);
-    match run_mir(
+    match execute(
         &arc,
         &mut interp,
         &mut env,

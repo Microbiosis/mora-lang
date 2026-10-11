@@ -84,11 +84,17 @@ fn run_with(env9: Option<&str>) -> (String, String) {
 /// **D412 主断言**，四条合为一条串行。
 #[test]
 fn d412_nine_layer_pipeline_handles_tea_model_defaults() {
-    // ① 默认（9 层管线生效）时**不得**出现差分失败。
+    // ① 默认（9 层管线生效）时**不得**出现任何 9 层回落行。
+    //
+    // v0.104.6 三态化：回落措辞不再是单一的「[9layer] 差分失败」，而是
+    // 「未 legalize 构造…」（预期回落）/「[9layer] **回归**…」/ DEBUG 的
+    // `differential FAILED`。故此处改为断言**完全没有 `[9layer]` 行**——
+    // 这比原文案更严，也与措辞解耦：TEA 一旦走 9 层快路径，任何回落态都不该出现。
     let (nine_out, nine_err) = run_with(None);
     assert!(
-        !nine_err.contains("[9layer] 差分失败"),
+        !nine_err.contains("[9layer]"),
         "9 层管线对 TEA 程序仍在回落 —— `model` 字段默认值没有进 9 层路径。\n\
+         （v0.104.6 起回落有三态措辞，故断言「无任何 [9layer] 行」。）\n\
          stderr:\n{nine_err}"
     );
 

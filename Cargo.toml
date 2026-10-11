@@ -113,3 +113,15 @@ checkpoint-sqlite = ["rusqlite"]
 # v0.75.43: copy-and-patch JIT 零外部依赖（纯 std + 手写机器码模板），
 # 无 feature gate — 始终编译，未覆盖指令自动回落 MIR 解释器。
 # （v0.75.34 前的 jit = ["dep:inkwell"] LLVM 路线已废弃删除。）
+
+[lints.rust]
+# v0.104.6：启用 Rust 1.99 新增的 `raw_borrows_via_references`（默认 allow）。
+# 它盯的是「先物化一个中间引用、紧接着又退化成裸指针」这种写法 —— 白白背上
+# 别名规则却不受益。本仓有两处天然高危面（JIT 的裸指针内存管理、typeck 里的
+# 引用身份比较），首轮开启即命中 `src/typeck/hm/mod.rs` 的 `&a.task_expr as
+# *const _`，已改写为 `&raw const a.task_expr`。
+# 其余 1.98/1.99 新 lint（`unconditional_panic` 扩展、
+# `suspicious_runtime_symbol_definitions`、`invalid_runtime_symbol_definitions`、
+# `semicolon_in_expressions_from_non_local_macros`）本就是 warn/deny by default，
+# 已被 CI 的 `-- -D warnings` 覆盖，无需在此重复声明。
+raw_borrows_via_references = "warn"

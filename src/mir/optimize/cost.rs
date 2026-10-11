@@ -85,6 +85,8 @@ impl CostModel for TokenEstimate {
             MirInst::Copy(_, _) => 1,
             // 二元运算：常量输入 → 可折叠为 Const
             MirInst::BinaryOp(_, _, _, _) => 3, // 折叠前 3 token，折叠后 1 token
+            // 值调用（被调者在寄存器里）：callee + args，按普通调用计。
+            MirInst::CallValue(_, _, _) => 6,
             // 函数调用：name + args 的 token 总和
             // v0.83: TEA definitions are compile-time only (no runtime cost)
             MirInst::ModelDef { .. } => 0,

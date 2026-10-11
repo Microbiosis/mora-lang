@@ -54,7 +54,7 @@ fn run(src: &str) -> Result<String, String> {
     let mut interp = mora::interpreter::Interpreter::new();
     let mut env = interp.take_env();
     let arc = std::sync::Arc::new(f);
-    mora::mir::vm::run_mir(
+    mora::mir::vm::execute(
         &arc,
         &mut interp,
         &mut env,

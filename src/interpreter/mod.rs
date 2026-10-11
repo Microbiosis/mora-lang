@@ -21,6 +21,9 @@ mod ai_helpers;
 mod builtin_impls; // v0.92 P1.2: call_builtin_* 实现（自 dispatch.rs 迁出）
 pub mod builtins;
 mod dispatch;
+// v0.104.6：把运行期 builtin 名清单对外公开，供 builtin 注册表一致性测试
+// （tests/builtin_registry_consistency.rs）与 typeck 注册表双向核对。
+pub use dispatch::RUNTIME_BUILTIN_NAMES;
 mod method_dispatch; // v0.92 P1.2: Value method dispatch (call_method*) split from dispatch.rs
 mod numeric_helpers; // v0.92 P1.2: split from dispatch.rs
 mod trait_dispatch;
@@ -202,7 +205,13 @@ impl crate::mir::host::MirHost for Interpreter {
         args: Vec<Value>,
         effects: &mut crate::mir::effect::Effects,
     ) -> Result<Value, String> {
-        self.call_value(value, args, effects)
+        // 委托给真正的值调用执行面（interpreter/dispatch.rs 的**固有**方法，
+        // 与本 trait 方法同名）。
+        //
+        // ⚠ 不能写 `self.call_value_impl(..)`：会解析回 **trait 方法自身** ⇒
+        // 无限递归（栈溢出 ⇒ 程序静默无输出、退出码 0，极难定位）。
+        // 用「固有方法全路径」消解歧义：先取 inherent 方法的函数指针。
+        self.call_value_impl(value, args, effects)
     }
 
     fn mir_import(
@@ -232,10 +241,10 @@ impl crate::mir::host::MirHost for Interpreter {
         args: Vec<Value>,
         effects: &mut crate::mir::effect::Effects,
     ) -> Option<Value> {
-        // v0.80 Stage 2.0: 真正的 handler 执行 — HandlerClosure::perform 调 run_mir。
+        // v0.80 Stage 2.0: 真正的 handler 执行 — HandlerClosure::perform 调 execute。
         //
         // architectural reason: handler 实际是 MirFunction（handler_mir），必须有
-        // MirHost 才能调 run_mir。EffectHandler::perform 签名带 &mut dyn MirHost。
+        // MirHost 才能调 execute。EffectHandler::perform 签名带 &mut dyn MirHost。
         //
         // v0.99: multi-shot —— handler 执行后回装原深度（take 弹栈顶、install
         // 推回），同一 handle 块内可多次 perform 同一效果。旧 single-shot 语义
@@ -266,7 +275,7 @@ impl crate::mir::host::MirHost for Interpreter {
         // 之所以没被用户撞上：`random.*` 的 arity 与实参类型由 typeck 的
         // ambient 签名预置先拦（实测 `mora run` 报的是
         // "Expected 2 arguments, got 0" / "expected list<any>, got string"），
-        // `dispatch_op` 的校验是纵深防御。但**库内路径**（`run_mir` 不跑
+        // `dispatch_op` 的校验是纵深防御。但**库内路径**（`execute` 不跑
         // typeck，也就是全部测试套件与任何嵌入 Mora 的调用方）够得到。
         //
         // 本方法的 trait 签名是 `Option<Value>`，没有错误通道，故把消息暂存
@@ -691,7 +700,7 @@ impl Interpreter {
     }
 
     /// α.3: MIR 解释器的 import 桥。
-    /// 编译 → run_mir，不依赖 AST 解释器的 execute。
+    /// 编译 → execute，不依赖 AST 解释器的 execute。
     /// v0.75.40: ParserV3::compile 直接产出指令 + witness（单遍编译）。
     pub(crate) fn mir_import(
         &mut self,
@@ -707,7 +716,7 @@ impl Interpreter {
                 // 子 import 的 env 是当前 env 的克隆（与 with 块语义一致）
                 let mut child_env = env.clone();
                 // v0.75.9: 包裹 Arc 走全局 DAG 缓存
-                let _ = crate::mir::vm::run_mir(
+                let _ = crate::mir::vm::execute(
                     &std::sync::Arc::new(imported_func),
                     self,
                     &mut child_env,
@@ -855,7 +864,7 @@ impl Interpreter {
 
     /// α.11: 通过 MIR 解释器求值单个 AST 表达式。
     /// 注：原 `mir_eval_expr` (走 lower_expr_only + ast_v2) 在 v0.55 删除 — 无外部调用者。
-    /// 改用纯 MIR 路径请调用 `crate::mir::lower::lower_mir_exprs` + `run_mir`。
+    /// 改用纯 MIR 路径请调用 `crate::mir::lower::lower_mir_exprs` + `execute`。
     /// v0.22: 字符串驻留 - 相同字符串只存储一次
     pub fn intern_string(&mut self, s: String) -> Value {
         // v0.49.0 (C2): LRU cache + lock (was unbounded HashMap direct access)
@@ -875,11 +884,11 @@ impl Interpreter {
 
     /// 入口：直接执行 v2 AST
     /// v0.04补: REPL 入口（`mora --repl` 走这里）
-    /// 与 main.rs::run_repl 行为一致：循环读 stdin, 逐行 tokenize+parse+lower+run_mir
+    /// 与 main.rs::run_repl 行为一致：循环读 stdin, 逐行 tokenize+parse+lower+execute
     /// 接收外部 &mut Interpreter 保留 setup 代码的 state
     #[allow(clippy::too_many_lines)]
     pub fn run_repl_with(interp: &mut Interpreter) {
-        use crate::mir::vm::run_mir;
+        use crate::mir::vm::execute;
         use crate::mir::{MirFunction, MirInst};
         use std::io::{self, BufRead, Write};
 
@@ -905,7 +914,7 @@ impl Interpreter {
         // type error: Unbound variable 'x' at line 1, column 1
         // ```
         //
-        // 注意运行期其实**一直是保留的**（`env` 逐行传给 `run_mir`，
+        // 注意运行期其实**一直是保留的**（`env` 逐行传给 `execute`，
         // `h_define` 写进 `env`）—— 挂的是类型检查这一关，不是执行。
         //
         // 修法：把**已接受的源码**攒起来，每行把「整段累积源码」当一个完整程序
@@ -1041,7 +1050,7 @@ impl Interpreter {
             };
 
             // v0.75.9: 包裹 Arc 走全局 DAG 缓存（REPL 每行新建 func，天然独立缓存项）
-            match run_mir(
+            match execute(
                 &std::sync::Arc::new(run_func),
                 interp,
                 &mut env,

@@ -23,7 +23,7 @@
 
 use mora::cli::compile_and_opt;
 use mora::interpreter::Interpreter;
-use mora::mir::vm::run_mir;
+use mora::mir::vm::execute;
 use mora::parser_v3::ParserV3;
 use std::sync::Arc;
 
@@ -64,7 +64,7 @@ fn pipelined_last_value(src: &str) -> Result<String, String> {
     let mut interp = Interpreter::new();
     let mut env = interp.take_env();
     let arc = Arc::new(func);
-    match run_mir(
+    match execute(
         &arc,
         &mut interp,
         &mut env,
@@ -121,7 +121,7 @@ fn d121_direct_and_pipelined_paths_agree_for_block_statements() {
             let mut interp = Interpreter::new();
             let mut env = interp.take_env();
             let arc = Arc::new(direct);
-            match run_mir(
+            match execute(
                 &arc,
                 &mut interp,
                 &mut env,

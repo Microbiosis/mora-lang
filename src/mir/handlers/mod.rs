@@ -49,8 +49,8 @@ pub use self::runtime::{
     h_prompt_section, h_send, h_span, h_transaction, h_worker,
 };
 pub use self::values::{
-    h_binary_op, h_call, h_closure, h_const, h_dict_lit, h_dyn_trait, h_index, h_index_assign,
-    h_list_lit, h_method_call, h_pipe, h_prompt, h_var,
+    h_binary_op, h_call, h_call_value, h_closure, h_const, h_dict_lit, h_dyn_trait, h_index,
+    h_index_assign, h_list_lit, h_method_call, h_pipe, h_prompt, h_var,
 };
 
 // v0.75.56: MirInst metadata + dispatch — kept in inst.rs, re-exported here

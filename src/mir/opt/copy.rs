@@ -13,8 +13,9 @@ pub(super) fn next_free_reg(ssa: &MirSsaFunction) -> SsaReg {
     let mut max_reg = 0;
     for block in &ssa.blocks {
         for inst in &block.insts {
-            let d = ssa_dst(inst);
-            if d > max_reg {
+            if let Some(d) = ssa_dst(inst)
+                && d > max_reg
+            {
                 max_reg = d;
             }
         }
@@ -62,10 +63,15 @@ pub(super) fn copy_propagate(ssa: &mut MirSsaFunction) {
             // 替换 terminator 中的使用
             replace_reg_in_terminator(&mut block.terminator, dst, src);
 
-            // 替换 phi incoming 中的使用
+            // v0.104.6 D418：只替换**来自本块**的那条 incoming。
+            //
+            // phi 在块首，值由**每条入边分别写入**；来自别的前驱的 incoming
+            // 用的是那个前驱出口处的版本，与本块的这句 `Copy` 无关。无差别
+            // 替换会把别的前驱传进来的值改成本块的 src —— 在循环回边上
+            // 那就是「把上一轮的 idx 换成这一轮的 idx」，静默错值。
             for phi in &mut block.phis {
-                for (_, reg) in &mut phi.incoming {
-                    if *reg == dst {
+                for (pred_id, reg) in &mut phi.incoming {
+                    if *pred_id == block.id && *reg == dst {
                         *reg = src;
                     }
                 }

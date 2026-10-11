@@ -8,7 +8,7 @@
 //! MIR 路径，不依赖任何 AST 活跃调用方。
 
 use mora::interpreter::Interpreter;
-use mora::mir::vm::{run_main_task, run_mir};
+use mora::mir::vm::{execute, run_main_task};
 use mora::mir::{MirFunction, MirInst};
 use mora::parser_v3::ParserV3;
 use mora::typeck::check_mir::check_program_witnesses_bidirectional;
@@ -29,7 +29,7 @@ fn run_via_mir(source: &str) -> Result<(), String> {
     let mut interp = Interpreter::new();
     let mut env = interp.take_env();
     let func_arc = std::sync::Arc::new(func);
-    run_mir(
+    execute(
         &func_arc,
         &mut interp,
         &mut env,
@@ -157,7 +157,7 @@ fn runtime_transaction_success_path_via_mir() {
     let mut interp = Interpreter::new();
     let mut env = interp.take_env();
     let func_arc = std::sync::Arc::new(func);
-    run_mir(
+    execute(
         &func_arc,
         &mut interp,
         &mut env,
@@ -204,7 +204,7 @@ fn runtime_transaction_rollback_path_via_mir() {
     let mut interp = Interpreter::new();
     let mut env = interp.take_env();
     let func_arc = std::sync::Arc::new(func);
-    let result = run_mir(
+    let result = execute(
         &func_arc,
         &mut interp,
         &mut env,
@@ -242,7 +242,7 @@ fn tier1_public_api_is_stable() {
             &mut mora::value::Environment,
             &mut mora::mir::effect::Effects,
         ) -> Result<(), String>,
-    ) = (run_mir, run_main_task);
+    ) = (execute, run_main_task);
 }
 
 // ─── 6. per-key CRDT 合并策略（v0.75.23）────────────────────────────
@@ -300,7 +300,7 @@ fn merge_with_grow_only_set_merges_worker_outputs() {
     )])));
 
     let w1 = std::sync::Arc::new(wrap_worker("w1", mk_list_worker(vec![1.0, 2.0])));
-    run_mir(
+    execute(
         &w1,
         &mut interp,
         &mut env,
@@ -308,7 +308,7 @@ fn merge_with_grow_only_set_merges_worker_outputs() {
     )
     .expect("worker1 run");
     let w2 = std::sync::Arc::new(wrap_worker("w2", mk_list_worker(vec![2.0, 3.0])));
-    run_mir(
+    execute(
         &w2,
         &mut interp,
         &mut env,
@@ -339,7 +339,7 @@ fn merge_with_lww_default_overwrites() {
     let mut interp = Interpreter::new();
     let mut env = interp.take_env();
     let w1 = std::sync::Arc::new(wrap_worker("w1", mk_list_worker(vec![1.0, 2.0])));
-    run_mir(
+    execute(
         &w1,
         &mut interp,
         &mut env,
@@ -347,7 +347,7 @@ fn merge_with_lww_default_overwrites() {
     )
     .expect("worker1 run");
     let w2 = std::sync::Arc::new(wrap_worker("w2", mk_list_worker(vec![2.0, 3.0])));
-    run_mir(
+    execute(
         &w2,
         &mut interp,
         &mut env,

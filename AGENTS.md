@@ -250,9 +250,20 @@
 - Run `cargo fmt --all` before committing
 - Prefer `expect("meaningful message")` over `unwrap()` in production paths
 
+### Toolchain policy
+
+- The project builds on the **Rust stable release channel only** — no nightly lane.
+- v0.104.6 dropped the `nightly` entry that used to sit in the `ci.yml` test matrix.
+  Reason (measured, not assumed): the one change it motivated — silencing
+  `clippy::needless_range_loop` in `src/mir/ssa/deconstruct.rs` — **does not fire on
+  stable**. Reverting it leaves `cargo clippy --all-targets --all-features -- -D warnings`
+  green on stable. Chasing nightly-only lints buys no coverage here, only per-release churn.
+- No `rust-toolchain.toml` and no `rust-version` in `Cargo.toml`: the toolchain floats with
+  `stable` by design, matching CI's `dtolnay/rust-toolchain@stable`.
+
 ## Testing instructions
 
-- Unit + integration tests: `cargo test --all-targets` (CI matrix: Ubuntu / Windows / macOS, stable + nightly)
+- Unit + integration tests: `cargo test --all-targets` (CI matrix: Ubuntu / Windows / macOS, stable only)
 - Library tests only: `cargo test --lib`
 - Property-based tests: `proptest = "1.7"` dev-dep (see `tests/proptest_*.rs`)
 - LSP smoke: `cargo run --release --example lsp_smoke -- ./target/release/mora-lsp`

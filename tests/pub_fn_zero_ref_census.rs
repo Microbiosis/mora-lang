@@ -149,7 +149,6 @@ fn d386_representative_zero_reference_functions() {
         "exit_scope",
         // mir / pregel / trace
         "label_index",
-        "has_passthrough_inst",
         "with_step_timeout",
         "set_otel_endpoint",
         "metrics_json",

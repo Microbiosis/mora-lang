@@ -4,6 +4,72 @@ use super::*;
 use crate::common::Span;
 use crate::value::Value;
 
+/// v0.104.6：本模块 builtin 分发 `match` 里**全部**自由函数名（运行期实现集）。
+///
+/// ## 为什么把它显式列出来
+///
+/// D4 / D5 / D9 / D12 / D16 一族缺陷的根因是**内建语义多点登记**：同一个名字
+/// 在三处独立声明 ——
+/// 1. typeck 签名表（`typeck::dispatch::builtin_signatures`，权威）
+/// 2. typeck 本地兜底（`typeck::hm::builtin::builtin_callee_ty` 的 match）
+/// 3. **本文件的运行期分发 match**
+///
+/// 三处靠**约定**保持一致、实际会漂移。实测（v0.104.6）：`deref` / `read` /
+/// `conde` / `quote` / `eval` 在运行期有实现、却在 typeck 侧**零出现** ——
+/// 用户调用它们因 typeck 找不到签名而落到 `Any` 兜底，**全程不做任何类型检查**。
+/// 这正是「静默降级」的又一个面：不报错、不崩，只是**悄悄失去类型保障**。
+///
+/// ## 它是「清单」不是「真相源」
+///
+/// 本 const 只承诺「运行期 match 覆盖了这些名字」，供
+/// `tests/builtin_registry_consistency.rs` 与 typeck 注册表做**双向**核对。
+/// 真相源仍是各自那侧：加一个运行期分支必须同步加进本表并补 typeck 签名，
+/// 测试会在 CI 抓出任一侧单独漂移。
+///
+/// 排名字保持与下方 `match` 一致（`=> self.call_builtin_*` 与少数多模式）。
+pub const RUNTIME_BUILTIN_NAMES: &[&str] = &[
+    "apply",
+    "atom",
+    "batch_chat",
+    "bool",
+    "both",
+    "car",
+    "cdr",
+    "compose",
+    "compose_prompt",
+    "compress",
+    "conde",
+    "cons",
+    "crush_json",
+    "curry",
+    "deref",
+    "either",
+    "eval",
+    "fail",
+    "float",
+    "gensym",
+    "int",
+    "into",
+    "is_instance",
+    "len",
+    "macroexpand",
+    "merge_with",
+    "methods_of",
+    "partial",
+    "print",
+    "project",
+    "quote",
+    "range",
+    "read",
+    "str",
+    "succeed",
+    "swap",
+    "tail",
+    "type_of",
+    "uncurry",
+    "unify",
+];
+
 /// S8 fix: 安全地在 async runtime 上阻塞执行，避免嵌套 panic。
 ///
 /// `Runtime::new().unwrap().block_on()` 在已处于 tokio context 时会 panic
@@ -171,14 +237,20 @@ impl Interpreter {
         }
     }
 
-    pub(crate) fn call_value(
+    /// 值调用的**真实实现**（v0.104.6 重命名）。
+    ///
+    /// 原名 `call_value`，与 `MirHost::call_value`（trait 方法）同名 ⇒ 任何
+    /// `self.call_value_impl(..)` / `Interpreter::call_value(..)` 都会解析回 trait
+    /// 方法自身 ⇒ 无限递归（栈溢出，表现为**静默无输出、退出码 0**，极难
+    /// 定位）。改名后 trait impl 可安全委派给它。
+    pub(crate) fn call_value_impl(
         &mut self,
         value: &Value,
         args: Vec<Value>,
         effects: &mut crate::mir::effect::Effects,
     ) -> Result<Value, String> {
         match value {
-            // α.10: MIR-built closure — 走 run_mir。
+            // α.10: MIR-built closure — 走 vm::execute。
             Value::Closure {
                 mir_body,
                 params,
@@ -199,9 +271,9 @@ impl Interpreter {
                     let val = args.get(i).cloned().unwrap_or(Value::Nil);
                     child_env.define(param.clone(), val, false);
                 }
-                crate::mir::vm::run_mir(mir_body, self, &mut child_env, effects)
+                crate::mir::vm::execute(mir_body, self, &mut child_env, effects)
             }
-            // α.11: MIR-built task — 走 run_mir。
+            // α.11: MIR-built task — 走 vm::execute。
             Value::Task {
                 mir_body, params, ..
             } => {
@@ -222,7 +294,7 @@ impl Interpreter {
                     let val = args.get(i).cloned().unwrap_or(Value::Nil);
                     child_env.define(param.clone(), val, false);
                 }
-                crate::mir::vm::run_mir(mir_body, self, &mut child_env, effects)
+                crate::mir::vm::execute(mir_body, self, &mut child_env, effects)
             }
             // v0.102: 关系值调用 → Goal::Invoke（自含子句，搜索期无需按名解析）
             Value::Relation { name, clauses } => {
@@ -239,14 +311,14 @@ impl Interpreter {
             Value::Compose(funcs) => {
                 let mut result = args;
                 for f in funcs {
-                    result = vec![self.call_value(f, result, effects)?];
+                    result = vec![self.call_value_impl(f, result, effects)?];
                 }
                 Ok(result.into_iter().next().unwrap_or(Value::Nil))
             }
             Value::Partial(func, partial_args) => {
                 let mut all_args = partial_args.clone();
                 all_args.extend(args);
-                self.call_value(func, all_args, effects)
+                self.call_value_impl(func, all_args, effects)
             }
             // v0.86: Curry — 累积参数直到 arity 时调用内部函数。
             Value::Curry {
@@ -263,7 +335,11 @@ impl Interpreter {
                         bound_args: total_args,
                     })
                 } else {
-                    self.call_value(func, total_args, effects)
+                    // ⚠ 同名歧义：`self.call_value_impl(..)` 在本模块会解析到
+                    // `MirHost` 的 **trait 方法**（它在作用域内），而不是本
+                    // 固有方法 ⇒ 无限递归（栈溢出 ⇒ 静默无输出、退出码 0）。
+                    // 经自由函数明确指向固有实现。
+                    self.call_value_impl(func, total_args, effects)
                 }
             }
             _ => Err(format!("Value is not callable: {}", value)),

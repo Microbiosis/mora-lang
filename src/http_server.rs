@@ -260,7 +260,7 @@ fn invoke_handler(
     // 调闭包: handler(req_dict)
     let mut interp = interpreter.blocking_write();
     interp
-        .call_value(
+        .call_value_impl(
             &handler,
             vec![req_value],
             &mut crate::mir::effect::Effects::new(),
@@ -412,7 +412,11 @@ async fn parse_request(stream: &mut TcpStream) -> io::Result<HttpRequest> {
     if content_length > 0 {
         let mut buf = vec![0u8; content_length];
         reader.read_exact(&mut buf).await?;
-        body = String::from_utf8_lossy(&buf).to_string();
+        // v0.104.6：`from_utf8_lossy_owned`（stable 1.99）直接吃掉 `Vec<u8>`。
+        // 原写法 `from_utf8_lossy(&buf).to_string()` 恒定「借出 → 再分配 + 拷贝」一次；
+        // 新写法在字节本就合法 UTF-8 时走 `String::from_utf8_unchecked(buf)`，复用原分配。
+        // 输出逐字节等价（含非法序列 → U+FFFD 的替换行为）。
+        body = String::from_utf8_lossy_owned(buf);
     }
 
     Ok(HttpRequest {

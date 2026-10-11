@@ -28,7 +28,7 @@
 //! | `len("👨‍👩‍👧")` | `5` | ZWJ 组合 = 5 个 code point |
 //! | `"a日b".split("日")` | `[a, b]` | ✓ |
 
-use mora::mir::vm::run_mir;
+use mora::mir::vm::execute;
 use mora::parser_v3::ParserV3;
 use std::sync::Arc;
 
@@ -37,7 +37,7 @@ fn run(src: &str) -> Result<String, String> {
     let mut interp = mora::interpreter::Interpreter::new();
     let mut env = interp.take_env();
     let arc = Arc::new(func);
-    match run_mir(
+    match execute(
         &arc,
         &mut interp,
         &mut env,

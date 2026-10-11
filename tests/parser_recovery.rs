@@ -44,7 +44,7 @@ use std::sync::Arc;
 
 use mora::interpreter::Interpreter;
 use mora::mir::effect::Effects;
-use mora::mir::vm::run_mir;
+use mora::mir::vm::execute;
 use mora::value::Value;
 
 fn compile(src: &str) -> Result<(), String> {
@@ -60,7 +60,7 @@ fn compile(src: &str) -> Result<(), String> {
     let arc = Arc::new(func);
     let mut interp = Interpreter::new();
     let mut env = interp.take_env();
-    run_mir(&arc, &mut interp, &mut env, &mut Effects::new()).map(|_| ())
+    execute(&arc, &mut interp, &mut env, &mut Effects::new()).map(|_| ())
 }
 
 /// 返回 `Ok(None)` 表示运行期结果是 `Nil`（无匹配 arm 时的正确结果）。
@@ -69,7 +69,7 @@ fn run_f64(src: &str) -> Result<Option<f64>, String> {
     let arc = Arc::new(func);
     let mut interp = Interpreter::new();
     let mut env = interp.take_env();
-    match run_mir(&arc, &mut interp, &mut env, &mut Effects::new()) {
+    match execute(&arc, &mut interp, &mut env, &mut Effects::new()) {
         Ok(Value::Float(f)) => Ok(Some(f)),
         Ok(Value::Nil) => Ok(None),
         Ok(other) => Err(format!("期望 Float/Nil，实得 {other:?}")),

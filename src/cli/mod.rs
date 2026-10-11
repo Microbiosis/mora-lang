@@ -57,32 +57,63 @@ pub fn compile_and_opt(
             if level.enabled() {
                 crate::mir::opt::optimize(&mut pipeline_func, level);
             }
+            crate::mir::regalloc::allocate(&mut pipeline_func);
             return Ok((pipeline_func, witnesses));
         }
-        // v0.104.6 D36：差分失败 = **两条编译路径产出不等价**，这是一次
-        // 静默降级 —— 9 层管线被丢弃、改用 `emit.rs` 的产出，而用户毫不知情
-        // （他以为在跑 9 层管线）。它与本轮修过的整族缺陷同族：D1 静默取默认
-        // 值、D25 静默 `inf`、D28 静默返回首元素、D35 静默饿死语句 ——
-        // 失败模式都不是崩溃或报错，而是**悄悄换了一条更差的路径**。
+        // v0.104.6：回落三态化（MLIR ConversionTarget 语义）。
         //
-        // 此前这行只在 `MORA_9LAYER_DEBUG=1` 时才可见，等于默认静默。改为
-        // **默认打一行摘要**到 stderr（详细 diff 列表仍需 DEBUG 才输出，
-        // 免得刷屏）。stderr 不参与任何 stdout 断言，故不影响既有测试。
-        eprintln!(
-            "[9layer] 差分失败：已回落到 emit.rs 路径（9 层管线产出被丢弃）| \
-             pipeline_mir={} original_mir={} | 详细 diff 设 MORA_9LAYER_DEBUG=1",
-            result.pipeline_mir_count, result.original_mir_count
-        );
-        if std::env::var("MORA_9LAYER_DEBUG").is_ok_and(|v| v == "1") {
+        // 此前这里是**整函数二值**：`differential_ok` 为假就整份丢弃管线产出。
+        // 那把两件本质不同的事压成同一结果：
+        //   (A) 本程序含**尚未接入 9 层管线**的构造（功能覆盖缺口，**预期**）
+        //   (B) 本程序构造**全部已接入**，管线却在某个已支持构造上出了 bug
+        //       （**回归** = 缺陷）
+        // 二者生产侧看到的一模一样 —— 都是「回落 + 一行 stderr」，于是 (B)
+        // 被静默藏住，而 (B) 恰恰是 D1 那一族（静默换一条更差的路径）的新同族。
+        //
+        // 现按 [`crate::mir::legalization`] 的显式登记把回落拆成三态：
+        // 1. 合法 + 差分绿 → 走 9 层（快路径，与此前一致）
+        // 2. 含未 legalize 构造 → 按**构造名**回落（预期，打印名字）
+        // 3. 全合法 + 差分红 → **回归**（醒目措辞 + 建议查 DEBUG）
+        use crate::mir::legalization::{GateDecision, classify};
+
+        let debug = std::env::var("MORA_9LAYER_DEBUG").is_ok_and(|v| v == "1");
+        if result.differential_ok {
+            // 双侧同序优化 — 管线产出走与原管线完全一致的优化路径
+            crate::mir::optimize::apply_rules(&mut pipeline_func);
+            if level.enabled() {
+                crate::mir::opt::optimize(&mut pipeline_func, level);
+            }
+            crate::mir::regalloc::allocate(&mut pipeline_func);
+            return Ok((pipeline_func, witnesses));
+        }
+        // 差分红：按 [`classify`] 的三态分诊（单一事实源，测试与生产共用）。
+        match classify(&result.unlegalized_constructs, result.differential_ok) {
+            // (2) 含未 legalize 构造 —— 预期回落，点名道姓。
+            GateDecision::HasUnlegalized => eprintln!(
+                "[9layer] 未 legalize 构造 {:?}：已回落到 emit.rs 路径（预期，非缺陷）| \
+                 pipeline_mir={} original_mir={}",
+                result.unlegalized_constructs, result.pipeline_mir_count, result.original_mir_count
+            ),
+            // (3) 全部构造已接入却差分失败 = **回归**。管线在**已支持**构造上
+            // 出了 bug，必须显眼，不能与 (2) 同形、否则真实缺陷会被静默藏住。
+            GateDecision::Regression => eprintln!(
+                "[9layer] **回归**：全部构造已 legalize 但差分失败 —— 9 层管线在 \
+                 已支持构造上出现不一致，已回落到 emit.rs 路径 | \
+                 pipeline_mir={} original_mir={} | 详细 diff 设 MORA_9LAYER_DEBUG=1",
+                result.pipeline_mir_count, result.original_mir_count
+            ),
+            // 差分已绿不会走到这里（上面已 return）。
+            GateDecision::AllLegal => {}
+        }
+        if debug {
             eprintln!(
-                "[9layer] differential FAILED — falling back to emit.rs path | fcfg={} typed={} core={} cmir={} lmir={} | pipeline_mir={} original_mir={}",
+                "[9layer] differential FAILED — falling back to emit.rs path | fcfg={} typed={} core={} | pipeline_mir={} original_mir={} | unlegalized={:?}",
                 result.fcfg_nodes,
                 result.typed_nodes,
                 result.core_insts,
-                result.cmir_nodes,
-                result.lmir_insts,
                 result.pipeline_mir_count,
-                result.original_mir_count
+                result.original_mir_count,
+                result.unlegalized_constructs
             );
             for d in &result.differential_diffs {
                 eprintln!("[9layer] diff: {}", d);
@@ -95,6 +126,7 @@ pub fn compile_and_opt(
     if level.enabled() {
         crate::mir::opt::optimize(&mut func, level);
     }
+    crate::mir::regalloc::allocate(&mut func);
     Ok((func, witnesses))
 }
 

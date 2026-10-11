@@ -89,7 +89,7 @@ impl EffectHandler for HandlerClosure {
         }
 
         // 2. 跑 handler_mir（host 通过 &mut dyn MirHost 传入）
-        crate::mir::vm::run_mir(&self.handler_mir, host, &mut self.env, effects)
+        crate::mir::vm::execute(&self.handler_mir, host, &mut self.env, effects)
     }
 }
 

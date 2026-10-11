@@ -178,7 +178,7 @@ fn teaapp_init_closure_is_callable() {
     let app = TeaApp::new(init_closure, Value::Nil, Value::Nil);
     // 直接调 call_value（绕过 builtin 测试 init 路径）
     let mut interp = crate::interpreter::Interpreter::new();
-    let result = interp.call_value(&app.init, vec![], &mut crate::mir::effect::Effects::new());
+    let result = interp.call_value_impl(&app.init, vec![], &mut crate::mir::effect::Effects::new());
     // 空 init closure 返回 Nil
     assert!(result.is_ok());
 }

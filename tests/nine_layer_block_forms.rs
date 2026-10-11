@@ -21,7 +21,7 @@
 //!
 //! - **`prompt` / `document`：真实语义差异。** `emit_section_w` 的注释写明
 //!   「body 求值 → Return（`h_*` 取此值作为 section text）」，
-//!   `h_prompt_section` 确实把 `run_mir(body)` 的返回值绑成
+//!   `h_prompt_section` 确实把 `execute(body)` 的返回值绑成
 //!   `Value::PromptSection { text }`。管线少这条 `Return` → section text 会是 `Nil`。
 //!   **差分在这里判失败是完全正确的，回落是必要的。**
 //! - **`observe` / `span` / `parallel`：良性差异被判失败。** 三个 emitter 在发完块

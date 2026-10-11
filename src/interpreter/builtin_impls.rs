@@ -385,7 +385,7 @@ impl Interpreter {
             Value::Atom(arc) => {
                 let func = &args[1];
                 let old = arc.lock().clone();
-                let new_val = self.call_value(func, vec![old], effects)?;
+                let new_val = self.call_value_impl(func, vec![old], effects)?;
                 *arc.lock() = new_val.clone();
                 Ok(new_val)
             }
@@ -541,7 +541,7 @@ impl Interpreter {
             Value::List(list) => {
                 let mut result = Vec::new();
                 for item in list {
-                    let mapped = self.call_value(&transform, vec![item], effects)?;
+                    let mapped = self.call_value_impl(&transform, vec![item], effects)?;
                     match mapped {
                         Value::List(items) => result.extend(items),
                         other => result.push(other),
@@ -670,7 +670,10 @@ impl Interpreter {
                 Some(b) if resolved_text.len() > b => {
                     let mut t = resolved_text.into_bytes();
                     t.truncate(b);
-                    String::from_utf8_lossy(&t).into_owned()
+                    // v0.104.6：`truncate` 可能切开一个多字节字符，新写法与原
+                    // `from_utf8_lossy(&t).into_owned()` 输出完全一致（含 U+FFFD 替换），
+                    // 但省去 `Cow::Borrowed → String` 的重新分配。
+                    String::from_utf8_lossy_owned(t)
                 }
                 _ => resolved_text,
             };
@@ -713,7 +716,7 @@ impl Interpreter {
         };
         let func = std::sync::Arc::new(func);
         let mut child_env = Environment::with_parent_of(std::sync::Arc::new(env.clone()));
-        crate::mir::vm::run_mir(&func, self, &mut child_env, effects)
+        crate::mir::vm::execute(&func, self, &mut child_env, effects)
     }
 
     // ===================================================================
@@ -739,7 +742,7 @@ impl Interpreter {
             // 单个元素也算作一个参数的"列表"
             other => vec![other.clone()],
         };
-        self.call_value(fn_val, expanded, effects)
+        self.call_value_impl(fn_val, expanded, effects)
     }
 
     /// v0.86: curry(fn, arity) — 柯里化包装器。
@@ -971,7 +974,7 @@ impl Interpreter {
                     let val = expr_args.get(i).cloned().unwrap_or(Value::Nil);
                     child_env.define(param.clone(), val, false);
                 }
-                crate::mir::vm::run_mir(&body, self, &mut child_env, effects)
+                crate::mir::vm::execute(&body, self, &mut child_env, effects)
                     .map_err(|e| format!("macro '{}' expansion error: {}", mname, e))
             }
             _ => Err(format!("macroexpand: '{}' is not a macro", name)),
@@ -992,10 +995,10 @@ impl Interpreter {
                 | Value::Closure { .. }
                 | Value::Compose(_)
                 | Value::Partial(_, _)
-                | Value::Curry { .. } => self.call_value(&value, args, effects),
+                | Value::Curry { .. } => self.call_value_impl(&value, args, effects),
                 // v0.83: 宏展开 — 完整实现。宏体是 MIR 函数（由 parser emit_macro_def_w
                 // 经子 EmitContext 编译而来），调用时以 args 绑定 params，在子 env 中
-                // run_mir 执行 body（与 Value::Task 语义同构）。
+                // vm::execute 执行 body（与 Value::Task 语义同构）。
                 Value::Macro {
                     name: mname,
                     params,
@@ -1019,7 +1022,7 @@ impl Interpreter {
                         let val = args.get(i).cloned().unwrap_or(Value::Nil);
                         child_env.define(param.clone(), val, false);
                     }
-                    crate::mir::vm::run_mir(&body, self, &mut child_env, effects)
+                    crate::mir::vm::execute(&body, self, &mut child_env, effects)
                         .map_err(|e| format!("macro '{}' execution error: {}", mname, e))
                 }
                 // v0.104.6：模块前缀被当自由函数调（`math(2.5)`）时给一条

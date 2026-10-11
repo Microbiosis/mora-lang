@@ -71,7 +71,7 @@ use std::sync::Arc;
 
 use mora::interpreter::Interpreter;
 use mora::mir::effect::Effects;
-use mora::mir::vm::run_mir;
+use mora::mir::vm::execute;
 use mora::mir::{MirFunction, MirInst};
 use mora::value::Value;
 
@@ -92,7 +92,7 @@ fn run(src: &str) -> Result<Value, String> {
     let arc = Arc::new(func);
     let mut interp = Interpreter::new();
     let mut env = interp.take_env();
-    run_mir(&arc, &mut interp, &mut env, &mut Effects::new())
+    execute(&arc, &mut interp, &mut env, &mut Effects::new())
 }
 
 // ===================================================================
@@ -190,7 +190,7 @@ fn regfile_inconsistency_is_a_clean_error_not_a_panic() {
     let arc = Arc::new(func);
     let mut interp = Interpreter::new();
     let mut env = interp.take_env();
-    let res = run_mir(&arc, &mut interp, &mut env, &mut Effects::new());
+    let res = execute(&arc, &mut interp, &mut env, &mut Effects::new());
     let err = res.expect_err("越界寄存器引用必须返回错误；修前这里是索引越界 panic");
     assert!(
         err.contains("references register 0") && err.contains("0 register"),
@@ -211,7 +211,7 @@ fn out_of_range_write_is_a_clean_error() {
     let arc = Arc::new(func);
     let mut interp = Interpreter::new();
     let mut env = interp.take_env();
-    let res = run_mir(&arc, &mut interp, &mut env, &mut Effects::new());
+    let res = execute(&arc, &mut interp, &mut env, &mut Effects::new());
     let err = res.expect_err("越界写必须返回错误；否则 `regs[3]` 索引越界 panic");
     assert!(
         err.contains("references register 3"),
@@ -231,7 +231,7 @@ fn in_range_highest_register_is_not_rejected() {
     let arc = Arc::new(func);
     let mut interp = Interpreter::new();
     let mut env = interp.take_env();
-    let v = run_mir(&arc, &mut interp, &mut env, &mut Effects::new())
+    let v = execute(&arc, &mut interp, &mut env, &mut Effects::new())
         .expect("引用最高位寄存器是合法的，前置校验不得误拒");
     assert!(
         matches!(v, Value::Int(7)),

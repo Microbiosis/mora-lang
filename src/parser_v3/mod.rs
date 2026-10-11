@@ -168,6 +168,16 @@ pub struct ParserV3 {
     ///
     /// ⇒ 否则用户只会看到泛化的 `Failed to parse at line N`。
     diag: Option<String>,
+    /// v0.104.6：当前正在解析的**泛型声明**的类型参数名（`task f<T, U>(…)`）。
+    ///
+    /// 进入泛型声明时 set，函数体解析完即清空。它让
+    /// [`parse_single_type_annotation`](syntax.rs) 把这些裸名识别为
+    /// `Type::TypeVar` 而非「未知类型注解」报错。
+    ///
+    /// 为空 = 非泛型上下文（与本刀之前逐字等价）。**作用域必须严格配对** ——
+    /// 若函数体解析后未清，后续无关标注会把同名当类型变量（由
+    /// `tests/generic_functions.rs` 的「泛型名不泄漏」一条兜住）。
+    generic_params: Vec<String>,
 }
 
 impl ParserV3 {
@@ -176,6 +186,7 @@ impl ParserV3 {
             tokens,
             current: 0,
             diag: None,
+            generic_params: Vec::new(),
             emit: {
                 let mut ec = crate::mir::lower::EmitContext::new();
                 // v0.104.6 D42：程序顶层是**唯一**不属于任何函数体的寄存器

@@ -445,8 +445,8 @@ fn run_single_cmd(
     ParallelResult {
         idx,
         cmd: cmd_str.to_string(),
-        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        stdout: String::from_utf8_lossy_owned(output.stdout),
+        stderr: String::from_utf8_lossy_owned(output.stderr),
         exit_code: output.status.code(),
         elapsed_ms: start.elapsed().as_millis() as u64,
         pid,

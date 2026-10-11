@@ -67,6 +67,11 @@
 use std::process::Command;
 
 /// 跑一次 `mora run`，返回 stderr 里**无条件**打印的 9 层摘要行。
+///
+/// v0.104.6 三态化后，回落摘要行有三种措辞：「未 legalize 构造…（预期）」、
+/// 「**回归**：全部构造已 legalize 但差分失败」、以及 DEBUG 才打印的
+/// `differential FAILED`。故这里匹配 `[9layer]` 前缀 + 任一回落措辞，
+/// 对三种态都算「回落」，保持本文件「哪些 fixture 回落」的判据不变。
 fn nine_layer_fell_back(path: &str) -> bool {
     let exe = env!("CARGO_BIN_EXE_mora");
     let out = Command::new(exe)
@@ -74,7 +79,12 @@ fn nine_layer_fell_back(path: &str) -> bool {
         .arg(path)
         .output()
         .expect("应能执行 mora");
-    String::from_utf8_lossy(&out.stderr).contains("差分失败")
+    let err = String::from_utf8_lossy(&out.stderr);
+    err.contains("[9layer]")
+        && (err.contains("差分失败")
+            || err.contains("未 legalize")
+            || err.contains("回归")
+            || err.contains("differential FAILED"))
 }
 
 fn fixture(name: &str) -> String {

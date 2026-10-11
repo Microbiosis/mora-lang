@@ -6,7 +6,7 @@
 //! 本测试走完整生产路径（compile_and_opt → run_mir）断言执行结果。
 
 use mora::interpreter::Interpreter;
-use mora::mir::vm::{run_main_task, run_mir};
+use mora::mir::vm::{execute, run_main_task};
 use mora::value::Value;
 use std::sync::Arc;
 
@@ -17,7 +17,7 @@ fn run_production(source: &str) -> Value {
     let mut interp = Interpreter::new();
     let mut env = interp.take_env();
     let func_arc = Arc::new(func);
-    let last = run_mir(
+    let last = execute(
         &func_arc,
         &mut interp,
         &mut env,
@@ -139,14 +139,14 @@ fn switch_chained_method_calls() {
 fn switch_while_break() {
     use mora::cli::compile_and_opt;
     use mora::interpreter::Interpreter;
-    use mora::mir::vm::{run_main_task, run_mir};
+    use mora::mir::vm::{execute, run_main_task};
     use std::sync::Arc;
     let source = std::fs::read_to_string("tests/fixtures/e2e/loop_break.mora").unwrap();
     let (func, _) = compile_and_opt(&source, None).expect("compile_and_opt failed");
     let mut interp = Interpreter::new();
     let mut env = interp.take_env();
     let arc = Arc::new(func);
-    let _ = run_mir(
+    let _ = execute(
         &arc,
         &mut interp,
         &mut env,
@@ -175,14 +175,14 @@ fn switch_while_continue() {
     // 1+2+4+5 = 12（i==3 时 continue，跳过 3）
     use mora::cli::compile_and_opt;
     use mora::interpreter::Interpreter;
-    use mora::mir::vm::{run_main_task, run_mir};
+    use mora::mir::vm::{execute, run_main_task};
     use std::sync::Arc;
     let source = "let total = 0i\nlet i = 0i\nwhile i < 5i\n  i = i + 1i\n  if i == 3i\n    continue\n  end\n  total = total + i\nend\ntotal";
     let (func, _) = compile_and_opt(source, None).expect("compile_and_opt failed");
     let mut interp = Interpreter::new();
     let mut env = interp.take_env();
     let arc = Arc::new(func);
-    let last = run_mir(
+    let last = execute(
         &arc,
         &mut interp,
         &mut env,
@@ -210,14 +210,14 @@ fn switch_for_break() {
     // 1+2+3+4+5 = 15
     use mora::cli::compile_and_opt;
     use mora::interpreter::Interpreter;
-    use mora::mir::vm::{run_main_task, run_mir};
+    use mora::mir::vm::{execute, run_main_task};
     use std::sync::Arc;
     let source = "let total = 0i\nfor i in [1i, 2i, 3i, 4i, 5i]\n  total = total + i\nend\ntotal";
     let (func, _) = compile_and_opt(source, None).expect("compile_and_opt failed");
     let mut interp = Interpreter::new();
     let mut env = interp.take_env();
     let arc = Arc::new(func);
-    let last = run_mir(
+    let last = execute(
         &arc,
         &mut interp,
         &mut env,

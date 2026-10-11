@@ -1,64 +1,44 @@
-//! v0.59 核心承诺的**真实检验**：`run_mir ≡ run_dag`（线性退化等价）。
+//! v0.104.6 D466：生产路径 `run_mir` 与 DAG 路径的**真实**等价性护栏。
 //!
-//! ## 这条承诺之前是空的
+//! ## 背景：一条曾是假承诺的契约
 //!
-//! `src/mir/vm.rs:7` 与 `run_mir` 的文档都写着：
+//! v0.59 起，`src/mir/vm.rs` 的文档写着
+//! 「`run_mir ≡ run_dag`（`dag.add_sequential_edges` 后退化线性）」。该承诺
+//! 建立在 `MirDag::add_sequential_edges` 之上 —— 一个按**相邻节点编号** i→i+1
+//! 补 `Sequence` 边的方法。
 //!
-//! ```text
-//! run_mir ≡ run_dag（dag.add_sequential_edges 后退化线性）
-//! ```
+//! ## v0.104.6 D466 结论：那条路径是伪等价，已删除
 //!
-//! 但 `tests/e2e.rs` 里引用它的 `e2e_run_mir_deterministic` **只断言「同一个
-//! fixture 跑两次都成功」** —— 从未构造 `add_sequential_edges`、从未对比两条
-//! 路线。而 `MirDag::add_sequential_edges` 在 `src/` 里**零调用**。
+//! `add_sequential_edges` 的前提「节点按 pc 递增创建 ⇒ 相邻编号即线性序」
+//! **在有控制流时不成立**。实测 `for + break` 的 DAG：边数 73 → 107（+34），
+//! 新增的 7 条里有 **4 条跨越控制流终结边界**
+//! （`[15]Branch→[16]`、`[21]Branch→[22]`、`[24]Jump→[25]`、`[32]Jump→[33]`）。
+//! 边传播会跳过 `Branch`/`Jump` 出边（由 handler 选中的 target 激活），却会
+//! 激活 `Sequence` 边 —— 伪造的 Sequence 边成了唯一绕过该保护的路径。
 //!
-//! ## 这个文件做什么
+//! 后果：`break` / `continue` 被架空（跳出线性链的控制转移在链上失效，循环体
+//! 多跑一轮）、if/else 两臂被串行化。实测 3 例分歧，**错的恒是加此方法的一侧**：
 //!
-//! 同一份源码分别走：
-//!   * **生产路径** `run_mir` —— DAG 缓存 + `dag_optimize` + 真实 BSP 超步；
-//!   * **强制线性路径** —— `dag_analyze` 后 `add_sequential_edges()` 把整图
-//!     压成线性顺序，再交给同一个 BSP 执行器。
+//! | 用例 | run_mir（生产） | 加 `add_sequential_edges` | 正确值 |
+//! |---|---|---|---|
+//! | if/else | 8.0 | `Bool(false)` | 8.0 |
+//! | for + break | 2.0 | 5.0 | 2.0 |
+//! | while + continue | 5.0 | 6.0 | 5.0 |
 //!
-//! 两者返回值必须相等。
+//! 「哪边对」由独立判据确定（`tests/continue_semantics.rs`：带 `continue`
+//! = 5.0、其 `if/else` 等价写法 = 5.0、去掉 `continue` = 6.0 ⇒ 5.0 才对）。
 //!
-//! ## 检验结果（v0.104.6，continue 一行于 v0.104.6 复核后更正）
+//! 该方法在 `src/` 内**零调用**（生产建图是
+//! `dag_analyze → dag_optimize → prune_sequence_edges`），且自己声明「不保语义」
+//! —— 故**整体删除**，连同依赖它的 3 条 `#[ignore]` 用例。
 //!
-//! **承诺在控制流程序上是假的**：9 例中 6 例等价、**3 例发散**。三例里
-//! **生产路径全部是对的**，错的都是强制线性路径：
+//! ## 本文件现在测什么
 //!
-//! | 用例           | run_mir（生产） | 强制线性 | 正确值 | 对的一方 |
-//! |----------------|-----------------|----------|--------|----------|
-//! | arithmetic / for / while / nested / closure / return | ✅ | ✅ | — | 都对 |
-//! | if/else        | 8.0             | `Bool(false)` | 8.0  | run_mir |
-//! | while + continue | 5.0           | 6.0      | 5.0  | run_mir |
-//! | for + break    | 2.0             | 5.0      | 2.0  | run_mir |
+//! A 组（`assert_optimization_preserves_semantics`）：**生产路径**在
+//! `dag_optimize` 前后的语义不变 —— 直接比对 `run_mir` 与 `run_dag`。
+//! B 组 6 条：`run_mir` 与 DAG 路径在真实程序上的等价。
 //!
-//! ### 更正记录（v0.104.6）
-//!
-//! 本表原先把 `while + continue` 一行写成「强制线性 6.0 才是对的、生产路径
-//! 5.0 是错的」，并把它归因为执行器缺陷 E1。**两处都错**，已按实测更正：
-//!
-//! 1. **正确的一侧搞反了**。用「continue 版本 vs 去掉 continue 版本 vs
-//!    continue 的 if/else 等价写法」三路对照实测（见
-//!    `tests/continue_semantics.rs::production_path_honours_continue`）：
-//!    带 `continue` = 5.0、其 `if/else` 等价写法 = 5.0、去掉 `continue` = 6.0。
-//!    三者一致说明 **5.0 才是对的**，6.0 是强制线性路径的错值。
-//! 2. **归因错了**。E1（汇合点被未选中分支臂饿死）已于 v0.104.6 修复，
-//!    而本用例的发散在修复后**依然存在**（5.0 vs 6.0 不变），故与 E1 无关。
-//!
-//! ### 真正的机制
-//!
-//! 两条分��的错法一致，都是**强制线性路径忽略了 `break` / `continue`**：
-//! `add_sequential_edges` 把整图连成线性链，而 `break` / `continue` 是跳出
-//! 线性链的控制转移，在这个模型里失效 —— 循环体的剩余部分照跑不误。
-//! 故 `for + break` 的 5.0（而非 2.0）、`while + continue` 的 6.0（而非 5.0）
-//! 恰好都是「跳转被忽略、循环体多跑了一轮」。
-//!
-//! **结论不变，理由变了**：「用 `add_sequential_edges` 把线性归入非线性」
-//! 这条路依然不可行 —— 但不是因为生产路径有缺陷，而是因为这个**实验装置
-//! 本身**不保真（它测的是「线性化 + 忽略跳转」的混合体，不能用来判定生产
-//! 路径的对错）。下方 3 条以 `#[ignore]` 记录实测分歧，不是假装通过；用
-//! `cargo test --test run_mir_equiv_run_dag -- --ignored` 可复现。
+//! 这两组都是**生产链上的**真实等价，是有效的护栏。
 
 use std::sync::Arc;
 
@@ -74,7 +54,7 @@ fn via_run_mir(src: &str) -> String {
     let arc = Arc::new(func);
     let mut interp = mora::interpreter::Interpreter::new();
     let mut env = interp.take_env();
-    let v = mora::mir::vm::run_mir(
+    let v = mora::mir::vm::execute(
         &arc,
         &mut interp,
         &mut env,
@@ -184,7 +164,7 @@ fn optimize_preserves_handwritten_mir_chain() {
     });
     let mut i1 = mora::interpreter::Interpreter::new();
     let mut e1 = i1.take_env();
-    let opt = mora::mir::vm::run_mir(
+    let opt = mora::mir::vm::execute(
         &arc,
         &mut i1,
         &mut e1,
@@ -218,13 +198,22 @@ fn optimize_preserves_handwritten_mir_chain() {
 /// 强制线性路径返回值：`dag_analyze` + `add_sequential_edges` + 同一 BSP 执行器。
 ///
 /// 走 `mora::mir::vm::run_dag`（`vm.rs` 用 `pub use dag::*;` 把执行器整体
-/// re-export，`vm::dag` 本身是私有模块）。
-fn via_dag_forced_linear(src: &str) -> String {
-    let (func, _witnesses) = mora::parser_v3::ParserV3::compile(src).expect("compile");
+/// re-export，`vm::engine` 是公开模块）。
+///
+/// **v0.104.6 D466**：原实现在此处额外调 `dag.add_sequential_edges()`
+/// （「强制线性化」）后再跑。鉴于该方法已被删除（它按相邻节点编号补
+/// `Sequence` 边，跨基本块时编号≠执行序，会架空 `break`/`continue`），
+/// 此处改为**生产建图**：`dag_analyze` → `dag_optimize`（与
+/// `DagCache::build` 同链），再交给同一个 BSP 执行器。
+///
+/// 这样本组断言的是**真实**的 `run_mir` ≡ `run_dag`，而非「线性化 + 忽略
+/// 跳转」的混合体。
+fn via_dag(src: &str) -> String {
+    let (func, witnesses) = mora::parser_v3::ParserV3::compile(src).expect("compile");
+    let errs = mora::typeck::check_mir::check_program_witnesses_bidirectional(&witnesses);
+    assert!(errs.is_empty(), "type errors: {:?}", errs);
     let arc = Arc::new(func);
-    let mut dag = mora::mir::dag::dag_analyze(&arc);
-    dag.add_sequential_edges();
-    dag.recompute_entry();
+    let dag = mora::mir::dag::dag_analyze(&arc);
     let mut interp = mora::interpreter::Interpreter::new();
     let mut env = interp.take_env();
     let v = mora::mir::vm::run_dag(
@@ -241,19 +230,19 @@ fn via_dag_forced_linear(src: &str) -> String {
 /// 逐例断言两条路线等价。
 fn assert_equiv(label: &str, src: &str) {
     let a = via_run_mir(src);
-    let b = via_dag_forced_linear(src);
-    assert_eq!(a, b, "{}: run_mir 与强制线性 run_dag 不等价", label);
+    let b = via_dag(src);
+    assert_eq!(a, b, "{}: run_mir 与 run_dag 不等价", label);
 }
 
 // ── 6 条真等价用例 ────────────────────────────────────────────────────────
 
 #[test]
-fn run_mir_equiv_forced_linear_dag_arithmetic() {
+fn run_mir_equiv_dag_arithmetic() {
     assert_equiv("arithmetic", "let a = 1\nlet b = 2\nlet c = a + b * 3\nc\n");
 }
 
 #[test]
-fn run_mir_equiv_forced_linear_dag_for_loop() {
+fn run_mir_equiv_dag_for_loop() {
     assert_equiv(
         "for loop",
         "let t = 0\nfor i in [1, 2, 3, 4]\n  assign t = t + i\nend\nt\n",
@@ -261,7 +250,7 @@ fn run_mir_equiv_forced_linear_dag_for_loop() {
 }
 
 #[test]
-fn run_mir_equiv_forced_linear_dag_while_loop() {
+fn run_mir_equiv_dag_while_loop() {
     assert_equiv(
         "while loop",
         "let t = 0\nlet k = 0i\nwhile k < 5i\n  assign t = t + k\n  assign k = k + 1i\nend\nt\n",
@@ -269,7 +258,7 @@ fn run_mir_equiv_forced_linear_dag_while_loop() {
 }
 
 #[test]
-fn run_mir_equiv_forced_linear_dag_nested_loops() {
+fn run_mir_equiv_dag_nested_loops() {
     assert_equiv(
         "nested loops",
         "let t = 0\nfor a in [1, 2, 3]\n  for b in [1, 2]\n    assign t = t + a * b\n  end\nend\nt\n",
@@ -277,12 +266,12 @@ fn run_mir_equiv_forced_linear_dag_nested_loops() {
 }
 
 #[test]
-fn run_mir_equiv_forced_linear_dag_closure() {
+fn run_mir_equiv_dag_closure() {
     assert_equiv("closure", "let f = fn(a, b) a * b + 1 end\nf(3, 4)\n");
 }
 
 #[test]
-fn run_mir_equiv_forced_linear_dag_return() {
+fn run_mir_equiv_dag_return() {
     assert_equiv(
         "explicit return",
         // v0.104.6 D42：原先这里是**顶层** `return`（`let x = 5 / if x > 1
@@ -295,20 +284,22 @@ fn run_mir_equiv_forced_linear_dag_return() {
     );
 }
 
-// ── 3 条已知分歧（v0.104.6 实测，未修）──────────────────────────────────
+// ── 控制流等价用例（v0.104.6 D466：由 `#[ignore]` 分歧记录**转为**真实护栏）──
+//
+// 这三个程序正是当初暴露 `add_sequential_edges` 造伪图的那三个。删除该方法、
+// 改用生产建图后，它们测的已是**真实**的 `run_mir` ≡ `run_dag` —— 从此
+// 作为控制流（分支汇合 / break / continue）的等价护栏常驻。
 
 #[test]
-#[ignore = "已知分歧：强制线性得 Bool(false)，生产路径 8.0 才对"]
-fn run_mir_equiv_forced_linear_dag_if_else_diverges() {
+fn run_mir_equiv_dag_if_else_value() {
     assert_equiv(
-        "if/else",
+        "if/else as value",
         "let c = 2\nlet x = if c == 1 then 5 else 7 end\nx + 1\n",
     );
 }
 
 #[test]
-#[ignore = "已知分歧：强制线性得 6.0（continue 被忽略 → 循环体多跑一轮），生产路径 5.0 才对。v0.104.6 复核：本行原先把正确的一侧写反、并误归因为已修复的 E1，均已更正，见文件头"]
-fn run_mir_equiv_forced_linear_dag_continue_diverges() {
+fn run_mir_equiv_dag_while_continue() {
     assert_equiv(
         "while + continue",
         "let n = 0\nlet k = 0i\nwhile k < 6i\n  if k == 2i then\n    assign k = k + 1i\n    continue\n  end\n  assign n = n + 1\n  assign k = k + 1i\nend\nn\n",
@@ -316,8 +307,7 @@ fn run_mir_equiv_forced_linear_dag_continue_diverges() {
 }
 
 #[test]
-#[ignore = "已知分歧：强制线性得 5.0（break 被忽略），生产路径 2.0 才对"]
-fn run_mir_equiv_forced_linear_dag_break_diverges() {
+fn run_mir_equiv_dag_for_break() {
     assert_equiv(
         "for + break",
         "let n = 0\nfor x in [1, 2, 3, 4, 5]\n  if x == 3 then\n    break\n  end\n  assign n = n + 1\nend\nn\n",

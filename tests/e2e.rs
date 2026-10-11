@@ -531,11 +531,17 @@ fn e2e_fixtures_are_non_empty() {
 }
 
 // ===================================================================
-// 7. run_mir 与 run_dag 线性退化等价（v0.59 行为契约）
+// 7. 同一 fixture 重复执行（determinism smoke）
 // ===================================================================
 
 /// 验证相同 fixture 跑两次都成功（deterministic 执行）。
-/// run_mir ≡ run_dag(add_sequential_edges 后) 是 v0.59 起的核心承诺。
+///
+/// v0.104.6 D466 **更正**：本函数原注释称
+/// 「`run_mir ≡ run_dag(add_sequential_edges 后)` 是 v0.59 起的核心承诺」——
+/// 但它**从未**构造 `add_sequential_edges`、也**从未**对比两条路线，只断言
+/// 「同一 fixture 跑两次都成功」。真正的 `run_mir` ≡ `run_dag` 等价性护栏在
+/// `tests/run_mir_equiv_run_dag.rs`（13 条，生产建图 vs 生产执行路径）；
+/// `add_sequential_edges` 已于 D466 整体删除。
 #[test]
 fn e2e_run_mir_deterministic() {
     assert_ok("arithmetic.mora");
@@ -1212,7 +1218,7 @@ fn e2e_if_then_block_and_single_stmt_forms() {
     // then + break（语句而非表达式）
     ok("for i in [1i, 2i, 3i]\n  if i == 2i then break end\n  print(i)\nend\n1i");
     // 三种拼写在 run_mir 直调下都返回尾值 7（精确值验证）
-    use mora::mir::vm::run_mir;
+    use mora::mir::vm::execute;
     use std::sync::Arc;
     for src in [
         "if true { print(\"p\") }\n7i\n",
@@ -1223,7 +1229,7 @@ fn e2e_if_then_block_and_single_stmt_forms() {
         let mut interp = mora::interpreter::Interpreter::new();
         let mut env = interp.take_env();
         let arc = Arc::new(func);
-        let v = run_mir(
+        let v = execute(
             &arc,
             &mut interp,
             &mut env,
@@ -1316,7 +1322,7 @@ fn e2e_string_method_arities_match_runtime() {
 /// 同样返回哨兵 0。改用真实分配的寄存器。
 #[test]
 fn e2e_empty_blocks_do_not_panic() {
-    use mora::mir::vm::run_mir;
+    use mora::mir::vm::execute;
     use mora::value::Value;
     use std::sync::Arc;
     // 直调 `run_mir` 断言尾值 —— 与本文件其他条目的 helper 取法无关，
@@ -1343,7 +1349,7 @@ fn e2e_empty_blocks_do_not_panic() {
         let mut interp = mora::interpreter::Interpreter::new();
         let mut env = interp.take_env();
         let arc = Arc::new(func);
-        let v = run_mir(
+        let v = execute(
             &arc,
             &mut interp,
             &mut env,

@@ -24,7 +24,7 @@
 
 use mora::cli::compile_and_opt;
 use mora::interpreter::Interpreter;
-use mora::mir::vm::run_mir;
+use mora::mir::vm::execute;
 use mora::typeck::check_mir::check_program_witnesses_bidirectional;
 use std::sync::Arc;
 
@@ -43,7 +43,7 @@ fn run(src: &str) -> String {
     let arc = Arc::new(func);
     format!(
         "{}",
-        run_mir(
+        execute(
             &arc,
             &mut interp,
             &mut env,

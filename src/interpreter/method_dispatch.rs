@@ -174,7 +174,7 @@ impl Interpreter {
                 let mapper = args.first().cloned().ok_or("map() requires a function")?;
                 let mut result = Vec::new();
                 for item in list {
-                    let mapped = self.call_value(&mapper, vec![item], effects)?;
+                    let mapped = self.call_value_impl(&mapper, vec![item], effects)?;
                     result.push(mapped);
                 }
                 Ok(Value::List(result.into()))
@@ -186,7 +186,7 @@ impl Interpreter {
                     .ok_or("filter() requires a function")?;
                 let mut result = Vec::new();
                 for item in list {
-                    let keep = self.call_value(&predicate, vec![item.clone()], effects)?;
+                    let keep = self.call_value_impl(&predicate, vec![item.clone()], effects)?;
                     if is_truthy(&keep) {
                         result.push(item);
                     }
@@ -216,7 +216,7 @@ impl Interpreter {
                     .cloned()
                     .ok_or("reduce() requires an initial value as the second argument")?;
                 for item in list {
-                    acc = self.call_value(&reducer, vec![acc, item], effects)?;
+                    acc = self.call_value_impl(&reducer, vec![acc, item], effects)?;
                 }
                 Ok(acc)
             }
@@ -566,7 +566,7 @@ impl Interpreter {
                 if let Some(val) = map.get(method) {
                     match val {
                         Value::Task { .. } | Value::Closure { .. } => {
-                            return self.call_value(val, args, effects);
+                            return self.call_value_impl(val, args, effects);
                         }
                         _ => {
                             // 非 callable 值直接返回（如 metadata 字段）

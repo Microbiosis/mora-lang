@@ -52,14 +52,14 @@
 use std::sync::Arc;
 
 use mora::interpreter::Interpreter;
-use mora::mir::vm::run_mir;
+use mora::mir::vm::execute;
 use mora::parser_v3::ParserV3;
 
 fn exec(func: mora::mir::MirFunction) -> String {
     let arc = Arc::new(func);
     let mut interp = Interpreter::new();
     let mut env = interp.take_env();
-    match run_mir(
+    match execute(
         &arc,
         &mut interp,
         &mut env,

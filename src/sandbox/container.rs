@@ -341,8 +341,8 @@ impl ContainerHandle {
                 }
             }
         };
-        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        let stdout = String::from_utf8_lossy_owned(output.stdout);
+        let stderr = String::from_utf8_lossy_owned(output.stderr);
         let code = output.status.code().unwrap_or(-1);
         Ok((code, stdout, stderr))
     }

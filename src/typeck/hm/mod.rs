@@ -347,6 +347,8 @@ impl HMInference {
         // 否则 `task a() … task b() … end` 里对后定义者的调用会漏检。
         // 放在 `precompute_fn_effect_rows` 之后：两者都只做树行走，顺序无关。
         self.precompute_fn_arities(exprs);
+        // v0.104.6：形参/返回类型标注登记进 env（必须在顺序推断之前）。
+        self.precompute_fn_signatures(exprs);
         self.precompute_fn_effect_rows(exprs);
         self.precompute_rel_sigs(exprs);
         for expr in exprs {
@@ -489,6 +491,92 @@ impl HMInference {
                 && !self.fn_arities.contains_key(name)
             {
                 self.fn_arities.insert(name.clone(), params.len());
+            }
+        }
+    }
+
+    /// v0.104.6：把 `task` / `fn` 定义的**签名**（含形参类型标注）登记进
+    /// [`Self::env`]，使调用点能按声明检查实参。
+    ///
+    /// ## 为什么需要（此前为何标注不生效）
+    ///
+    /// 形参类型标注此前连**解析**都做不到；补上 parser 后，witness 层确实带上了
+    /// `WitnessParam.type_hint`，但**调用点仍不检查实参** —— 因为 `FnDef` 定义名
+    /// **从不进 `env`**（见 `fn_effect_rows` 文档注释）。于是 `infer_call` 查 env
+    /// 落空 → 兜底 fresh TypeVar，实参与该 var 合一**恒成功** ⇒ `f("x")` 对
+    /// `task f(a: number)` 也不报错。
+    ///
+    /// ## 本方法做什么
+    ///
+    /// 为每个**带标注**的 `FnDef` 在 env 里登记一个 curried `Arrow`：形参类型取其
+    /// `type_hint`（无标注则 fresh var），返回类型取 `return_type`（无则 fresh var）。
+    ///
+    /// ## 向后兼容（关键）
+    ///
+    /// **无标注**的 `task f(x)` / `fn(x)` 完全不登记（`has_annotation == false`
+    /// 直接 `continue`），与本次改动前**逐字一致**。只有显式写了标注的形参/返回值
+    /// 才产生约束 ⇒ 不会把既有合法程序判错。
+    pub fn precompute_fn_signatures(&mut self, exprs: &[MirWitness]) {
+        fn collect<'a>(w: &'a MirWitness, out: &mut Vec<&'a MirWitness>) {
+            if let WitnessKind::FnDef { .. } = &w.kind {
+                out.push(w);
+            }
+            for c in w.child_witnesses() {
+                collect(c, out);
+            }
+        }
+        let mut defs: Vec<&MirWitness> = Vec::new();
+        for e in exprs {
+            collect(e, &mut defs);
+        }
+        for def in defs {
+            if let WitnessKind::FnDef {
+                name,
+                type_params,
+                params,
+                return_type,
+                ..
+            } = &def.kind
+            {
+                // v0.104.6：泛型声明（`<T>`）也算「有签名」，即便形参/返回都没写
+                // 标注 —— `task id<T>(x)` 的多态性正来自 `<T>` 本身。
+                let has_annotation = !type_params.is_empty()
+                    || params.iter().any(|p| p.type_hint.is_some())
+                    || return_type.is_some();
+                if !has_annotation {
+                    continue;
+                }
+                let param_types: Vec<Type> = params
+                    .iter()
+                    .map(|p| {
+                        p.type_hint
+                            .as_ref()
+                            .map(|h| h.to_type().clone())
+                            .unwrap_or_else(|| self.fresh_type_var())
+                    })
+                    .collect();
+                let ret = return_type
+                    .as_ref()
+                    .map(|h| h.to_type().clone())
+                    .unwrap_or_else(|| self.fresh_type_var());
+                let mut ty = ret;
+                for pt in param_types.into_iter().rev() {
+                    ty = Type::Arrow(
+                        Box::new(pt),
+                        Box::new(ty),
+                        crate::mir::effect::EffectRow::Empty,
+                    );
+                }
+                // v0.104.6：泛型函数把整条签名包进 `ForAll(<类型参数>, ·)` ——
+                // 于是 `infer_call` 现有的 `instantiate_if_forall` 会在**每次调用**
+                // 展开成 fresh TypeVar，实现按调用点单态化（与 `let`-绑定多态闭包
+                // 走同一条路）。无泛型时不包（保持此前逐字等价）。
+                let ty = if type_params.is_empty() {
+                    ty
+                } else {
+                    Type::ForAll(type_params.clone(), Box::new(ty))
+                };
+                self.env.add(name.clone(), ty);
             }
         }
     }
@@ -1332,10 +1420,14 @@ impl HMInference {
         for w in kind.child_witnesses() {
             // 跳过 ① 已按正确作用域推断过的 agent 体（裸指针比较：
             // `child_witnesses()` 返回的是**引用**，没有 PartialEq 可用）
+            //
+            // v0.104.6：`&raw const a.task_expr` 取代 `&a.task_expr as *const _`。
+            // 后者会先物化出一个中间引用再立刻退化成裸指针，白白背上别名规则。
+            // 1.99 新增的 `raw_borrows_via_references` lint 正是盯着这个写法。
             let wp = w as *const _;
             if agents
                 .iter()
-                .any(|a| std::ptr::eq(&a.task_expr as *const _, wp))
+                .any(|a| std::ptr::eq(&raw const a.task_expr, wp))
             {
                 continue;
             }
@@ -1907,6 +1999,7 @@ mod tests {
         MirWitness {
             kind: WitnessKind::FnDef {
                 name: name.to_string(),
+                type_params: vec![],
                 params: vec![],
                 return_type: None,
                 body: Box::new(body),

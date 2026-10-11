@@ -1,49 +1,51 @@
-//! v0.75.47: VM 执行内核 — 由 interp.rs + dag_interp.rs 合并而成
-//! （SQLite VDBE 单文件惯例，P4）。
+//! MIR 执行 — 模块入口（壳层）。
 //!
-//! - interp 部分：`run_mir` / `run_mir_with_signal` / `MirSignal` /
-//!   `build_task_registry` / `run_main_task` / 索引与模式匹配辅助。
-//! - dag_interp 部分：`run_dag_with_signal*` — BSP 超步模型，生产主路径。
+//! ## 这个模块**不拥有执行实现**（v0.104.6 D467 重写）
 //!
-//! v0.104.6 核实：原注释在此写的是
-//!   「`run_mir ≡ run_dag`（dag.add_sequential_edges 后退化线性）」。
-//!   **该表述不成立** —— `run_mir` 的构建链是
-//!   `dag_analyze → dag_optimize → prune_sequence_edges`，**根本不含**
-//!   `add_sequential_edges`；而把图线性化后再交给同一个 BSP 执行器，
-//!   控制流语义会变（实测 9 例中 3 例与生产路径发散：`if-else` /
-//!   `for+break` / `while+continue`）。
+//! v0.75.47 起本文件叫「VM 执行内核」，并在注释里声称拥有
+//! `run_mir` / `run_dag_with_signal*`。实测那是**假的**：本文件里**一行
+//! 指令执行逻辑都没有**，只有一层转发 ——
 //!
-//!   v0.104.6 复核更正：本段原写「`while+continue` 一例线性化反而算对、
-//!   生产路径错，即执行器缺陷 E1」—— **两处都错**。以 `continue` 的
-//!   if/else 等价改写做三路对照实测（`tests/continue_semantics.rs`）：
-//!   生产路径的 5.0 才是对的，线性化的 6.0 是错值（它把 `continue` 当
-//!   跳过的部分照跑，多执行了一轮）。且 E1 早已修复而该发散依旧，归因不成立。
-//!   详见 `tests/run_mir_equiv_run_dag.rs`（6 条真等价 + 3 条已记录分歧）
-//!   与 `tests/continue_semantics.rs`。
+//! ```text
+//! run_mir            (本文件)  → run_mir_with_signal(本文件).1
+//! run_mir_with_signal (本文件)  → run_dag_with_signal(engine)
+//! run_dag_with_signal (engine)  → run_dag_with_signal_memo(engine)
+//! run_dag_with_signal_memo     ← **唯一的指令执行循环**（engine.rs）
+//! ```
 //!
-//! 准确的现状：`run_mir` 已**完全委派**给 `run_dag_with_signal`（经 DAG 缓存），
-//! 两者共用同一套 handler —— 即「线性」的执行实现在 v0.59 就已归并进非线性
-//! 执行器；残留的只是 `add_sequential_edges` 这个**无人调用**、且**不保语义**
-//! 的工具方法。
+//! 真正操作寄存器与 env 的代码只有一份：`handlers::dispatch`
+//! （`mir/inst.rs`，穷尽匹配 59 个 `MirInst` 变体），由 engine 独占调用。
 //!
-//! 模块引用：外部统一 `crate::mir::vm::`（旧 `mir::interp::` /
-//! `mir::dag_interp::` 已合并，见 CHANGELOG v0.75.47）。
-
-//! MIR 解释器（α.0）
+//! ## 重写后的结构（按「模块各司其职」组织）
 //!
-//! pc 循环执行 MirFunction。控制流用 Jump/Return/Break/Continue 直接改 pc，
-//! 替代 AST 解释器的 FlowSignal 枚举层层传返。
+//! ```text
+//! mir/vm/mod.rs     ← 本文件：**公共工具 + 显式入口转出**（无执行实现）
+//! mir/vm/engine.rs  ← 唯一的执行引擎：建图 + BSP 超步调度
+//! mir/inst.rs       ← 唯一的指令语义：dispatch（59 个变体）
+//! ```
 //!
-//! α.0 复用现有宿主（MirHost）的 call_function / eval_binary，不重写 builtins。
-//! 这样 MIR 解释器只替代"执行引擎"，AI/transport/sandbox facade 不受影响。
+//! - 本文件真正拥有的：`index_value` / `index_assign_value` /
+//!   `value_to_string` / `self_match_pattern`（值层工具，与执行策略无关）、
+//!   `MirSignal`、`build_task_registry`、`run_main_task`（main 入口查找）。
+//! - 执行策略（何时建图、怎么调度）全部在 `engine`，本文件**不再假装**拥有它。
 //!
-//! v0.75.x: 参数类型从 `&mut Interpreter` 改为 `&mut dyn MirHost`（mir/host.rs），
-//! 解耦 mir ↔ interpreter 双向依赖。Interpreter 实现 MirHost。
+//! ## 关于 `run_mir` 这个名字
+//!
+//! 它保留下来是为兼容既有 100+ 调用点，但它**不再是「线性执行器」**：
+//! 实际是「建 DAG → BSP 超步调度」。`run_mir` 与 `run_dag*` 是**同一条
+//! 路径**（前者是后者的薄封装），两者共用同一个 `dispatch`。历史上
+//! 「线性执行」的实现已于 v0.59 归并进 DAG 执行器，名字却留了下来 ——
+//! 本次不再新增第二套执行器，也不再让名字暗示存在「两套」。
+//!
+//! 若要直接用引擎，用 `engine::` 下的显式入口（`run_mir_with_signal` 等）。
+//!
+//! 参数类型为 `&mut dyn MirHost`（`mir/host.rs`），解耦 mir ↔ interpreter
+//! 双向依赖。`Interpreter` 实现 `MirHost`。
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use super::{MirFunction, MirInst, cache};
+use super::{MirFunction, MirInst};
 
 use crate::mir::host::MirHost;
 use crate::value::{Environment, Value};
@@ -77,6 +79,9 @@ pub fn build_task_registry(body: &[MirInst]) -> HashMap<&str, (&[String], &MirFu
 /// **该表述不成立**：`add_sequential_edges` 从未出现在本函数的构建链里。
 /// 且实测表明，线性化后的图交给同一个 BSP 执行器会**改变控制流语义**
 /// （`if-else` / `for+break` / `while+continue` 三例发散）。
+/// v0.104.6 **D466**：`add_sequential_edges` 已整体删除（`src/` 内零调用
+/// 且自述不保语义）；本函数的生产链始终是
+/// `dag_analyze → dag_optimize → prune_sequence_edges → run_dag`。
 ///
 /// v0.104.6 复核更正：此段原写「`while+continue` 一例线性化反而正确、
 /// 生产路径错误 —— 即缺陷 E1」。**两处都错**：生产路径的 5.0 才是对的
@@ -88,13 +93,27 @@ pub fn build_task_registry(body: &[MirInst]) -> HashMap<&str, (&[String], &MirFu
 ///
 /// v0.75.9: 接收 `&Arc<MirFunction>` — 优化后 DAG 走宿主内核缓存
 /// （`MirHost::dag_cache`，key = Arc 指针），同 Arc 跨调用复用。
-pub fn run_mir(
+///
+/// **v0.104.6 D467 · 名字说明**：本函数**不**是「线性执行器」，也不暗示
+/// 存在两套执行实现。实际路径是 [`run_mir_with_signal`] → [`engine::run_dag_with_signal`]
+/// → `engine::run_dag_with_signal_memo`（唯一执行循环）。历史上的「线性执行
+/// 实现」已在 v0.59 归并进 DAG 引擎，本函数与 `run_dag*` 是**同一条路径**，
+/// 共用 `handlers::dispatch`。
+///
+/// **v0.104.6 D467**：本函数**原名 `run_mir`**，已重命名为 [`execute`] ——
+/// `run_mir` 这个名字暗示存在「线性执行器」，而自 v0.59 起仓库里**只有**
+/// DAG/BSP 一种执行实现。重命名让 API 名副其实；既有调用点已同步更新。
+///
+/// 需要传播 `MirSignal`（Pregel 的 `Flow::Halt` 等）时用
+/// [`engine::run_with_signal`]；需要显式控制 DAG 缓存时用
+/// [`engine::run_with_signal_cached`]。
+pub fn execute(
     func: &Arc<MirFunction>,
     interp: &mut dyn MirHost,
     env: &mut Environment,
     effects: &mut crate::mir::effect::Effects,
 ) -> Result<Value, String> {
-    Ok(run_mir_with_signal(func, interp, env, effects)?.1)
+    Ok(engine::run_with_signal(func, interp, env, effects)?.1)
 }
 
 /// α.1: 索引操作 List[i] / Dict[key] / String[i]
@@ -491,7 +510,7 @@ pub fn run_main_task(
     }
     if let Some(main_func) = main_body {
         let mut main_env = env.clone();
-        let _ = run_mir(&main_func, interp, &mut main_env, effects)?;
+        let _ = execute(&main_func, interp, &mut main_env, effects)?;
     }
     Ok(())
 }
@@ -517,42 +536,10 @@ pub enum MirSignal {
 /// α.10: 与 `run_mir` 等价，但返回 `(MirSignal, Value)`，保留信号。
 /// REPL/差分测试用此观测控制流出口；生产路径仍走 `run_mir`。
 ///
-/// v0.75: 修复 — 此前无条件返回 `MirSignal::Return`，丢弃 `Flow::Halt`
-/// （vote_to_halt）信号，导致 Pregel 引擎的 vertex_state 永远无法置为
-/// Halted。现在通过 `run_dag_with_signal` 真正传播 Return/Halt。
-///
-/// v0.75.9: 接收 `&Arc<MirFunction>`，优化后 DAG 走宿主内核缓存
-/// （`MirHost::dag_cache`，key = Arc 指针），同一 Arc 跨调用复用，
-/// 不再每次 `dag_analyze + dag_optimize + prune_sequence_edges` 全量重建。
-///
-/// v1.00: 缓存从进程级 `static DAG_CACHE` 全局状态机迁为宿主单属主纯值
-/// —— 同一解释器实例跨调用命中；Pregel worker 克隆继承 master 预热
-/// 条目后独立演化。
-pub fn run_mir_with_signal(
-    func: &Arc<MirFunction>,
-    interp: &mut dyn MirHost,
-    env: &mut Environment,
-    effects: &mut crate::mir::effect::Effects,
-) -> Result<(MirSignal, Value), String> {
-    let dag = interp.dag_cache().get_or_build(func);
-    crate::mir::vm::run_dag_with_signal(&dag, func, interp, env, effects)
-}
-
-/// v0.75.27: 可注入缓存变体 — 测试/多租户可传独立 `DagCache` 实例隔离
-/// 缓存状态。行为与 `run_mir_with_signal` 完全一致，仅缓存来源不同
-/// （显式参数 vs 宿主自有）。缓存为宿主单属主纯值后无锁，签名收
-/// `&mut DagCache`（get_or_build 需要插入条目）。
-pub fn run_mir_with_signal_cached(
-    func: &Arc<MirFunction>,
-    interp: &mut dyn MirHost,
-    env: &mut Environment,
-    dag_cache: &mut cache::DagCache,
-    effects: &mut crate::mir::effect::Effects,
-) -> Result<(MirSignal, Value), String> {
-    let dag = dag_cache.get_or_build(func);
-    crate::mir::vm::run_dag_with_signal(&dag, func, interp, env, effects)
-}
-
+/// v0.104.6 D467：`run_mir_with_signal` 与 `run_mir_with_signal_cached` 已**迁入
+/// [`engine`]**（它们是引擎入口，不是壳层工具），改名
+/// [`engine::run_with_signal`] / [`engine::run_with_signal_cached`]。
+/// 本文件不再持有任何执行入口的实现或转发。
 /// α.10: `run_main_task` 的信号感知变体。
 /// main task 中允许出现显式 `return value`——返回它的值；否则返回 Value::Nil。
 pub fn run_main_task_with_signal(
@@ -575,14 +562,29 @@ pub fn run_main_task_with_signal(
         return Ok((MirSignal::None, Value::Nil));
     };
     let mut main_env = env.clone();
-    let value = run_mir(&main_func, interp, &mut main_env, effects)?;
+    let value = execute(&main_func, interp, &mut main_env, effects)?;
     Ok((MirSignal::Return(value.clone()), value))
 }
 
 // ===================================================================
 
-mod dag; // v0.75.61: DAG 超步执行器（原 dag_interp 部分，自 vm.rs 拆出）
-pub use dag::*; // 保持 vm::run_dag* / vm::DagExecMemo 路径（P4 契约不变）
+// v0.104.6 D467：执行引擎是本模块的**唯一**执行实现，独立成 `engine`
+// （原名 `dag`，因其就是 DAG/BSP 调度器）。
+//
+// 此前此处是 `mod dag; pub use dag::*;` —— 把子模块内容**平铺**回壳层，
+// 于是 `vm::run_dag*` 与（壳里的）`vm::run_mir*` 在同一个命名空间里看不出
+// 谁转发给谁。现改为显式：引擎公开，执行入口由它转出。
+pub mod engine;
+
+// 显式转出（而非 `pub use engine::*`）：只暴露**真实调用过**的引擎入口，
+// 保留壳层作为「模块入口」的语义边界。
+//
+// v0.104.6 D467：`run_with_signal*`（原 `run_mir_with_signal*`）已迁入 engine，
+// 在此一并转出，使既有 `vm::run_with_signal` 调用路径保持可用。
+pub use engine::{
+    DagExecMemo, run_dag, run_dag_with_signal, run_dag_with_signal_memo, run_mir_dag,
+    run_with_signal, run_with_signal_cached,
+};
 
 // ─── Tests ──────────────────────────────────────────────────────────
 
@@ -642,7 +644,7 @@ mod tests {
     #[test]
     fn dag_exec_chain() {
         // 注：`run_mir_dag` 直调 `dag_analyze`、**不跑 `dag_optimize`**
-        // （见 `vm/dag.rs::run_mir_dag` 的 v0.104.6 说明：曾尝试对齐生产链，
+        // （见 `vm/engine.rs::run_mir_dag` 的 v0.104.6 说明：曾尝试对齐生产链，
         // 但本用例随即变红 —— 折叠追加的节点未被激活，且「手写 MIR」与
         // 「编译器产出 MIR」的差异尚未查清，故已回退）。
         //

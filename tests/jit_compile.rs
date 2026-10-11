@@ -24,7 +24,7 @@
 
 use mora::interpreter::Interpreter;
 use mora::mir::jit::run_jit;
-use mora::mir::vm::run_mir;
+use mora::mir::vm::execute;
 use mora::mir::{MirFunction, MirInst};
 use mora::parser_v3::ParserV3;
 use mora::value::Value;
@@ -55,7 +55,7 @@ fn binop_func(a: f64, op: mora::common::BinaryOp, b: f64) -> MirFunction {
 fn run_interp(func: &MirFunction) -> Result<Value, String> {
     let mut interp = Interpreter::new();
     let mut env = interp.take_env();
-    run_mir(
+    execute(
         &std::sync::Arc::new(func.clone()),
         &mut interp,
         &mut env,
@@ -521,7 +521,7 @@ fn with_config_env(body: &MirFunction, jit: bool) -> Result<mora::value::Environ
     };
     let mut interp = Interpreter::new();
     let mut env = interp.take_env();
-    run_mir(
+    execute(
         &std::sync::Arc::new(outer),
         &mut interp,
         &mut env,

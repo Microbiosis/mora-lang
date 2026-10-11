@@ -2,7 +2,7 @@
 
 use crate::flow::is_truthy;
 
-use crate::mir::vm::{run_mir, self_match_pattern, value_to_string};
+use crate::mir::vm::{execute, self_match_pattern, value_to_string};
 
 use crate::mir::Reg;
 
@@ -34,7 +34,7 @@ pub fn h_match_expr(
         // 读到 Nil → 守卫恒假、`when` 完全失效（fixture match_guard.mora
         // 只因取值恰好让首守卫为真而"通过"）。
         if let Some(guard) = guard_func {
-            let g = run_mir(
+            let g = execute(
                 &std::sync::Arc::new((**guard).clone()),
                 interp,
                 env,
@@ -44,7 +44,7 @@ pub fn h_match_expr(
                 continue;
             }
         }
-        let result = run_mir(
+        let result = execute(
             &std::sync::Arc::new((**arm_func).clone()),
             interp,
             env,

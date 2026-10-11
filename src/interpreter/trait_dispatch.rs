@@ -106,7 +106,7 @@ impl Interpreter {
                     Vec::new()
                 };
                 all_args.extend(args);
-                return self.call_value(&task, all_args, effects);
+                return self.call_value_impl(&task, all_args, effects);
             }
 
             // 2. fallback 到 trait 默认实现
@@ -118,7 +118,7 @@ impl Interpreter {
                     Vec::new()
                 };
                 all_args.extend(args);
-                return self.call_value(&task, all_args, effects);
+                return self.call_value_impl(&task, all_args, effects);
             }
         }
 

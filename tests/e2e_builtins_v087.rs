@@ -13,7 +13,7 @@
 //! - v0.84 JSON 对称性：2 + 3 结果为 Float(5.0)（+ 操作语义升级），用字符串比较断言
 
 use mora::interpreter::Interpreter;
-use mora::mir::vm::{run_main_task, run_mir};
+use mora::mir::vm::{execute, run_main_task};
 use mora::parser_v3::ParserV3;
 use mora::value::Value;
 use std::sync::Arc;
@@ -24,7 +24,7 @@ fn run_mora(source: &str) -> Result<Value, String> {
     let mut interp = Interpreter::new();
     let mut env = interp.take_env();
     let func_arc = Arc::new(func);
-    run_mir(
+    execute(
         &func_arc,
         &mut interp,
         &mut env,

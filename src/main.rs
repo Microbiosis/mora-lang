@@ -569,9 +569,9 @@ fn run_file(path: &str, opt_level: Option<mora::mir::ssa::OptLevel>) {
 
     let mut interpreter = Interpreter::new();
     let mut env = interpreter.take_env();
-    // v0.75.9: 包裹 Arc 走全局 DAG 缓存（run_mir + run_main_task 共享同一项）
+    // v0.75.9: 包裹 Arc 走全局 DAG 缓存（vm::execute + run_main_task 共享同一项）
     let func_arc = std::sync::Arc::new(func);
-    if let Err(e) = mora::mir::vm::run_mir(
+    if let Err(e) = mora::mir::vm::execute(
         &func_arc,
         &mut interpreter,
         &mut env,

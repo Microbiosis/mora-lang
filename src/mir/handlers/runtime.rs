@@ -4,7 +4,7 @@ use std::collections::HashMap;
 
 use crate::mir::host::MirHost;
 
-use crate::mir::vm::run_mir;
+use crate::mir::vm::execute;
 
 use crate::mir::{MirFunction, Reg};
 
@@ -28,7 +28,7 @@ pub(super) fn run_isolated(
 ) -> Result<(crate::value::Value, Vec<crate::value::Conflict>), String> {
     let mut child_env = env.clone();
     // v0.75.9: 包裹 Arc 走全局 DAG 缓存
-    let result = run_mir(
+    let result = execute(
         &std::sync::Arc::new((*body).clone()),
         interp,
         &mut child_env,
@@ -59,7 +59,7 @@ pub(super) fn run_mir_fn(
     effects: &mut crate::mir::effect::Effects,
 ) -> Result<Value, String> {
     let mut inner_env = env.clone();
-    crate::mir::vm::run_mir(
+    crate::mir::vm::execute(
         &std::sync::Arc::new(func.clone()),
         interp,
         &mut inner_env,
@@ -92,7 +92,7 @@ pub fn h_transaction(
         Err(_) => {
             let mut comp_env = env.clone();
             // v0.75.9: 包裹 Arc 走全局 DAG 缓存
-            if let Err(e) = run_mir(
+            if let Err(e) = execute(
                 &std::sync::Arc::new((*compensation).clone()),
                 interp,
                 &mut comp_env,
@@ -168,7 +168,7 @@ pub fn h_parallel(
                             scope.spawn(move || {
                                 let mut run_env = w_env;
                                 let mut w_effects = crate::mir::effect::Effects::new();
-                                match crate::mir::vm::run_mir(
+                                match crate::mir::vm::execute(
                                     &wbody_arc,
                                     w_interp.as_mut(),
                                     &mut run_env,
@@ -205,9 +205,9 @@ pub fn h_parallel(
                 effects.absorb(w_effects);
             }
         } else {
-            // 非 worker 段：把连续的非 Worker 指令收成一段，交给 run_mir
+            // 非 worker 段：把连续的非 Worker 指令收成一段，交给 execute
             // 整段执行 —— 逐指令 dispatch 会丢失控制流语义（Label/Jump 的
-            // Flow::Jump 需由 run_mir 的跳转表处理；逐指令调用会直接吞掉
+            // Flow::Jump 需由 execute 的跳转表处理；逐指令调用会直接吞掉
             // 跳转，循环体永不前进）。
             let start = idx;
             while idx < insts.len() && !matches!(insts[idx], MirInst::Worker { .. }) {
@@ -221,7 +221,7 @@ pub fn h_parallel(
                 ..Default::default()
             };
             if !seg_fn.body.is_empty() {
-                crate::mir::vm::run_mir(&std::sync::Arc::new(seg_fn), interp, env, effects)?;
+                crate::mir::vm::execute(&std::sync::Arc::new(seg_fn), interp, env, effects)?;
             }
         }
     }
@@ -277,7 +277,7 @@ pub fn h_span(
 
 /// `prompt "name" do ... end` — 构建 [`Value::PromptSection`] 并绑定到环境。
 ///
-/// v0.103 修复：此前实现只 `let _ = run_mir(...)` 跑一遍 body 就丢弃结果 ——
+/// v0.103 修复：此前实现只 `let _ = execute(...)` 跑一遍 body 就丢弃结果 ——
 /// 既吞掉执行错误（无 `?`），也从未构建 PromptSection。后果是
 /// `compose_prompt(name)` 这个**活的、已注册的** builtin 永远取不到 section
 /// （其错误消息还指引用户用 `prompt "x" do ... end`，而该语法当时 parser
@@ -296,7 +296,7 @@ pub fn h_prompt_section(
     effects: &mut crate::mir::effect::Effects,
 ) -> Result<(), String> {
     let mut child_env = env.clone();
-    let text = run_mir(
+    let text = execute(
         &std::sync::Arc::new((*body).clone()),
         interp,
         &mut child_env,
@@ -317,7 +317,7 @@ pub fn h_prompt_section(
 
 /// `document "name" do ... end` — 构建文档 section 并绑定到环境。
 ///
-/// v0.103 修复：此前只 `let _ = run_mir(...)`（吞错且不构建值）。文档
+/// v0.103 修复：此前只 `let _ = execute(...)`（吞错且不构建值）。文档
 /// section 是 `document.*` 域下的**命名文本块**，与 prompt section 同构但
 /// 归文档流水线（`compose_prompt` 不消费它）。value 层无独立变体，用带
 /// `tag` 的 Dict 承载，保持值空间封闭。
@@ -329,7 +329,7 @@ pub fn h_document_section(
     effects: &mut crate::mir::effect::Effects,
 ) -> Result<(), String> {
     let mut child_env = env.clone();
-    let text = run_mir(
+    let text = execute(
         &std::sync::Arc::new((*body).clone()),
         interp,
         &mut child_env,
@@ -510,7 +510,7 @@ pub fn h_orchestrate(
                     agent_env.define(p.clone(), input_val.clone(), false);
                 }
                 agent_env.clock.tick(&agent.name);
-                result = crate::mir::vm::run_mir(
+                result = crate::mir::vm::execute(
                     &std::sync::Arc::new(agent.task_body.clone()),
                     interp,
                     &mut agent_env,
@@ -567,7 +567,7 @@ pub fn h_orchestrate(
                     let mut agent_env = env.clone();
                     agent_env.define("input".to_string(), input_val.clone(), false);
                     agent_env.clock.tick(&agent.name);
-                    result = crate::mir::vm::run_mir(
+                    result = crate::mir::vm::execute(
                         &std::sync::Arc::new(agent.task_body.clone()),
                         interp,
                         &mut agent_env,
@@ -586,7 +586,7 @@ pub fn h_orchestrate(
                     cond_env.define("input".to_string(), input_val.clone(), false);
                     cond_env.define(result_var.to_string(), result.clone(), false);
                     let cond_body = crate::mir::lower::lower_block_witness_to_mir(cond_w);
-                    let cond_val = crate::mir::vm::run_mir(
+                    let cond_val = crate::mir::vm::execute(
                         &std::sync::Arc::new(cond_body),
                         interp,
                         &mut cond_env,
@@ -749,7 +749,7 @@ fn run_moe_expert(
                 ..Default::default()
             };
             let mut expert_env = env.clone();
-            crate::mir::vm::run_mir(
+            crate::mir::vm::execute(
                 &std::sync::Arc::new(body_fn),
                 interp,
                 &mut expert_env,

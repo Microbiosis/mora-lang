@@ -2,7 +2,7 @@
 //!
 //! ## 缺陷（2026-09-28 修）
 //!
-//! `src/mir/vm/dag.rs` 的 `value_fp` 对 `Value::Dict` 曾只取**长度**：
+//! `src/mir/vm/engine.rs` 的 `value_fp` 对 `Value::Dict` 曾只取**长度**：
 //!
 //! ```ignore
 //! Value::Dict(d) => InputFp::Str(d.len(), 0)
@@ -47,7 +47,7 @@ fn run(src: &str) -> String {
     let arc = Arc::new(func);
     let mut interp = Interpreter::new();
     let mut env = interp.take_env();
-    match run_mir(
+    match execute(
         &arc,
         &mut interp,
         &mut env,
@@ -59,7 +59,7 @@ fn run(src: &str) -> String {
 }
 
 use mora::interpreter::Interpreter;
-use mora::mir::vm::run_mir;
+use mora::mir::vm::execute;
 use mora::parser_v3::ParserV3;
 
 fn cases() -> Vec<(&'static str, &'static str, &'static str)> {

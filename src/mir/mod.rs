@@ -25,11 +25,8 @@ use crate::value::Value;
 
 pub mod cache;
 // v0.89: CMIR — 9 层架构第 5 层（并发降维：BSP/Agent/SIMD）
-pub mod cmir;
 // v0.89: Core → CMIR 桥接
-pub mod core_to_cmir;
 // v0.89: CMIR → LMIR 桥接
-pub mod cmir_to_lmir;
 // v0.89: Core IR — 9 层架构第 3 层（函数式基元指令集，SSA 100% 覆盖）
 pub mod core;
 // v0.78: EffectRow — algebraic effect 的类型表示（Stage 1/4 落地）
@@ -48,9 +45,7 @@ pub mod hint;
 pub mod host;
 pub mod jit;
 // v0.89: LMIR — 9 层架构第 6 层（内存布局降维：Unbox/Alloc/GC/FFI）
-pub mod lmir;
 // v0.89: LMIR → RIR 连接（LayoutTable 填充 + Unbox 接入）
-pub mod lmir_to_rir;
 pub mod lower;
 // v0.90: witness → FCFG 转换器（9 层切换的核心：FCFG 生产者）
 pub mod witness_to_fcfg;
@@ -59,7 +54,6 @@ pub mod opt;
 pub mod optimize;
 pub mod pipeline;
 // v0.89: RIR/JIR — 9 层架构第 7-8 层（运行时 + JIT 接口）
-pub mod rir;
 pub mod ssa;
 // v0.75.38: MirWitness 轻量树骨架（typeck/LSP 消费面，去 AST 化中间层）
 pub mod witness;
@@ -70,21 +64,28 @@ pub mod handlers;
 mod inst; // v0.75.56: MirInst metadata + dispatch（经 handlers::inst re-export）
 pub use inst::*; // 保持 crate::mir::dst() 等旧路径
 pub mod vm;
+// v0.104.6: 9 层管线显式合法性登记（MLIR ConversionTarget 的 Mora 侧对应）
+pub mod legalization;
+// v0.104.6: 寄存器分配器（槽位复用；此前 alloc_reg 是单调计数器、从不复用）
+pub mod regalloc;
 
-pub use vm::run_mir;
+// v0.104.6 D467: `run_mir` 更名为 `execute` —— 它不暗示存在「线性执行器」
+// （自 v0.59 起仓库只有 DAG/BSP 一种执行实现）。既有调用点已同步。
+pub use vm::execute;
 // lower_program removed in Phase A (v0.55) — use lower_mir_witnesses instead
 // v0.92: `pub use expr::MirExpr` 已删除 —— expr 模块整体移除（P0.3）。
 
 // ── 9 层 IR 架构 re-exports ──
-pub use cmir::{CmirBlock, CmirNode, ConcurrencyMode};
+// v0.104.6：CMIR / LMIR / RIR 三层已删除 —— 取证显示它们**不在关键路径上**：
+// 管线产出的 MirFunction 来自 `lower_fcfg(&fcfg)`（直接由 FCFG 降维），三层
+// 的产出只被 debug 打印统计；`lmir_to_mir.rs` 更是未声明的死代码，且含一处
+// `from_utf8_unchecked`（`tests/unsafe_safety_docs.rs` 记为「定时炸弹」：
+// 一旦有人补 `mod lmir_to_mir;` 即变成真实 UB）。
+//
+// JIT 相关类型现居 `mir/jit.rs`（`JitError` 等），不受影响。
 pub use core::{CoreBlock, CoreFunction, CoreInst, CoreTerminator};
 pub use fcfg::{Block as FcfgBlock, Ehir, Fcfg, Node, TypeInfo};
 pub use fcfg_lower::lower_fcfg;
-pub use lmir::{LmirInst, LmirType, MemLayout};
-pub use rir::{
-    CompiledFunction, FunctionVersionTable, JitBackend, JitEntry, JitError, LayoutTable,
-    LegacyJitBackend,
-};
 
 /// 虚拟寄存器索引（无限数量，lowering 时计数器分配）
 pub type Reg = usize;
@@ -140,6 +141,10 @@ pub enum MirInst {
     BinaryOp(Reg, Reg, BinaryOp, Reg),
     /// 函数调用。callee 是名字（ExprKind::Call 的 callee 是 String），非寄存器
     Call(Reg, String, Vec<Reg>),
+    /// N 元**值调用**：被调者是一个寄存器（`f(args)`，`f` 由表达式求值得到），
+    /// 区别于 `Call(.., String, ..)`（按名调用）。承载动态 callee —— 此前
+    /// `fcfg_lower` 会把动态调用降级成假名 `_r{n}`，callee 寄存器直接丢失。
+    CallValue(Reg, Reg, Vec<Reg>),
     /// α.1: 列表字面量 [r0, r1, ...]
     ListLit(Reg, Vec<Reg>),
     /// α.1: 字典字面量 {key: val, ...}（key 是 String，val 是 Reg）

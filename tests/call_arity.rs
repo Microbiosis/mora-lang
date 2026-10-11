@@ -75,7 +75,7 @@ fn mentions_arity(e: &str, expected: usize, got: usize) -> bool {
 
 use mora::interpreter::Interpreter;
 use mora::mir::effect::Effects;
-use mora::mir::vm::run_mir;
+use mora::mir::vm::execute;
 use mora::value::Value;
 
 fn run(src: &str) -> Result<Value, String> {
@@ -91,7 +91,7 @@ fn run(src: &str) -> Result<Value, String> {
     let arc = Arc::new(func);
     let mut interp = Interpreter::new();
     let mut env = interp.take_env();
-    run_mir(&arc, &mut interp, &mut env, &mut Effects::new())
+    execute(&arc, &mut interp, &mut env, &mut Effects::new())
 }
 
 fn err_of(src: &str) -> String {

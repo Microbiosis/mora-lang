@@ -7,7 +7,7 @@
 //! 只有嵌入方（`e2e_helpers::run_source` 等）能看到。
 
 use mora::interpreter::Interpreter;
-use mora::mir::vm::run_mir;
+use mora::mir::vm::execute;
 use mora::parser_v3::ParserV3;
 use std::sync::Arc;
 
@@ -16,7 +16,7 @@ fn last_expr(src: &str) -> String {
     let mut interp = Interpreter::new();
     let mut env = interp.take_env();
     let arc = Arc::new(func);
-    match run_mir(
+    match execute(
         &arc,
         &mut interp,
         &mut env,

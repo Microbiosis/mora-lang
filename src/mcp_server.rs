@@ -251,7 +251,8 @@ async fn read_message<R: AsyncBufReadExt + Unpin>(reader: &mut R) -> io::Result<
     };
     let mut body = vec![0u8; len];
     reader.read_exact(&mut body).await?;
-    Ok(Some(String::from_utf8_lossy(&body).to_string()))
+    // v0.104.6：见 http_server.rs 同名改写 —— 复用 Vec 分配，省一次拷贝。
+    Ok(Some(String::from_utf8_lossy_owned(body)))
 }
 
 /// 写一条 JSON-RPC message (Content-Length framing)
@@ -422,7 +423,7 @@ async fn handle_tools_call(
     let interp = interp.clone();
     let result = tokio::task::spawn_blocking(move || {
         let mut interp = interp.blocking_write();
-        interp.call_value(
+        interp.call_value_impl(
             &handler,
             vec![args_value],
             &mut crate::mir::effect::Effects::new(),

@@ -40,7 +40,7 @@
 //! 「收紧一类错误，别顺手改另一类」记档待决。
 
 use mora::interpreter::Interpreter;
-use mora::mir::vm::run_mir;
+use mora::mir::vm::execute;
 use mora::parser_v3::ParserV3;
 use std::sync::Arc;
 
@@ -49,7 +49,7 @@ fn run(src: &str) -> Result<String, String> {
     let mut interp = Interpreter::new();
     let mut env = interp.take_env();
     let arc = Arc::new(func);
-    run_mir(
+    execute(
         &arc,
         &mut interp,
         &mut env,

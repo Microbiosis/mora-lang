@@ -52,7 +52,7 @@
 //! —— 即它测的那段代码从未真正执行过。现已补入口边并断言 `result` 的值。
 
 use mora::interpreter::Interpreter;
-use mora::mir::vm::run_mir;
+use mora::mir::vm::execute;
 use mora::parser_v3::ParserV3;
 use std::sync::Arc;
 
@@ -61,7 +61,7 @@ fn run(source: &str) -> (Result<mora::value::Value, String>, bool) {
     let mut interp = Interpreter::new();
     let mut env = interp.take_env();
     let arc = Arc::new(func);
-    let r = run_mir(
+    let r = execute(
         &arc,
         &mut interp,
         &mut env,

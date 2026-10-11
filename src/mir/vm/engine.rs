@@ -1,6 +1,34 @@
-//! v0.75.61: DAG 超步执行器 — 原 vm.rs 的 DAG 区（BSP 超步模型，生产主路径）。
-//! 自 vm.rs 拆出（D6 单文件惯例）。所有指令逻辑委托 handlers::dispatch；
-//! 本层只控制执行顺序（拓扑 + BSP 超步）。线性区（run_mir）仍在 vm.rs。
+//! v0.104.6 D467：**MIR 执行引擎**（原 `vm/engine.rs`，v0.75.61 起叫「DAG 超步
+//! 执行器」）。
+//!
+//! ## 本模块是唯一的执行实现
+//!
+//! 整个仓库**只有这里**有指令执行循环：
+//!
+//! ```text
+//! run_dag_with_signal_memo   ← 唯一的执行循环
+//! run_dag_with_signal        ┘ 薄封装
+//! run_dag                    ┘ 薄封装（丢弃信号）
+//! ```
+//!
+//! 每条指令的实际语义**不在这里** —— 由 `handlers::dispatch`
+//! （`mir/inst.rs`，穷尽匹配 59 个 `MirInst` 变体）承担，本模块只决定
+//! **执行顺序**（数据就绪 + BSP 超步 + Sequence 门控）。
+//!
+//! ## 与 `run_mir` 的关系（v0.59 起已归并）
+//!
+//! 历史上曾有「线性执行器 `run_mir`」与本 DAG 执行器两套实现。**v0.59 已
+//! 把线性实现归并进本引擎**：`run_mir` 现在是本引擎的薄封装（`vm/mod.rs`
+//! 里的转发层），两者共用同一个 `dispatch`。故 `run_mir` 这个名字**不代表
+//! 存在「线性执行」** —— 见 `vm/mod.rs` 的模块文档。
+//!
+//! 控制流由**图边**决定：`dispatch` 对 `Jump`/`Break`/`Continue` 返回的
+//! `Flow::Jump(_)` 在本层是 **no-op**（`dag.rs` 内「Edge 驱动」注释处），
+//! 真正的控制转移来自 `dag_analyze` 建图阶段解析出的 `EdgeKind::Control*`。
+//!
+//! v0.104.6 D466：`add_sequential_edges`（按相邻节点编号补 Sequence 边的
+//! 「强制线性化」实验装置）已删除 —— 它架空 `break`/`continue`，详见
+//! `src/mir/dag.rs` 末尾的删除说明。
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -20,15 +48,18 @@ use crate::value::{Environment, Value};
 // logic is delegated to `handlers::dispatch()`. The DAG layer only
 // controls execution ORDER: topological + BSP super-steps.
 //
-// v0.104.6 复核：本段原文是
+// v0.104.6 D466：本段原文是
 //   「With `dag.add_sequential_edges()`, this degenerates to linear
 //     execution, making `run_mir ≡ run_dag`.」
-// **该表述为假** —— 线性化后语义会变：实测 9 例中 3 例与生产路径发散
-// （if/else、for+break、while+continue），且**错的总是线性化那一侧**。
-// 机制是线性链让 `break` / `continue` 这类「跳出链」的控制转移失效。
-// 证据：`tests/run_mir_equiv_run_dag.rs`（3 条 `#[ignore]` 记录分歧）、
-// 哪边对的独立判据见 `tests/continue_semantics.rs`。
-// 详见 `MirDag::add_sequential_edges` 的文档 —— 那里是这条错误表述的源头。
+// **该表述为假，且该方法已删除** —— 线性化后语义会变：实测 3 例与生产
+// 路径发散（if/else、for+break、while+continue），且**错的总是线性化
+// 那一侧**。机制是该方法按相邻节点编号补 `Sequence` 边，跨基本块时
+// 编号≠执行序，于是架空 `break` / `continue`、串行化 if/else 两臂。
+// `add_sequential_edges` 因「`src/` 内零调用 + 自己声明不保语义」于 D466
+// 整体删除；根因与证据见 `src/mir/dag.rs` 末尾的删除说明。
+// 现在等价性由 `tests/run_mir_equiv_run_dag.rs` 的 13 条（生产建图 vs
+// 生产执行路径）持续钉住，「哪边对」的独立判据见
+// `tests/continue_semantics.rs`。
 //
 // # 执行边界（v0.75.33，v0.75.36 修正）
 //
@@ -378,6 +409,79 @@ pub fn run_dag_with_signal_memo(
     let mut ready_gen: Vec<u32> = vec![0; dag.nodes.len()];
 
     while !active.is_empty() && step < MAX_STEPS {
+        // ── v0.104.6 快路径：顺序直穿（switch-threaded）─────────────
+        //
+        // 触发条件：`active` **恰有一个**节点且它已就绪。此时控制流是**直线**的
+        // （块内 Sequence 链全序），无并行/乱序可言 —— BSP 波次调度（重建
+        // ready / 扫全部边 / 代际标记）纯属每条指令的固定开销。
+        //
+        // 实测：1M 次迭代基线 2523 ms（release），每条指令 ≈ 420 ns，其中绝大
+        // 部分是与循环体大小**无关**的波次开销。
+        //
+        // **纪律**（见 `dag.rs` 顶部五次失败记录）：
+        // - 指令语义**只有一个来源**：仍调 `handlers::dispatch`；memo
+        //   （`is_memoizable_pure`/`value_fp`/`reuse`/`record`）**照旧执行**。
+        // - **只改调度、不改建图**：`dag_analyze` / `partition_blocks` 一行未动。
+        // - **任何不确定立即回退**：后继不唯一 / 非直线 ⇒ `break` 交还原 BSP
+        //   波次路径（已被 300+ 测试验证）。
+        //
+        // 安全阀 `MORA_NO_THREADING=1` 可整体关闭（A/B 与紧急回退）。
+        let threading_enabled = std::env::var("MORA_NO_THREADING").as_deref() != Ok("1");
+        if threading_enabled
+            && let [only] = active.as_slice()
+            && node_ready(&dag.nodes[*only], &reg_ready)
+            && seq_preds[*only].iter().all(|&p| executed[p])
+        {
+            let node_id = *only;
+            step += 1;
+            cur_gen += 1;
+            exec_count[node_id] += 1;
+            executed[node_id] = true;
+            let chosen = match step_threaded_node(
+                node_id,
+                dag,
+                &mut regs,
+                &mut reg_ready,
+                interp,
+                env,
+                &task_registry,
+                effects,
+                memo,
+                &mut result,
+                &mut signal,
+            )? {
+                ThreadedStep::Stop => break,
+                ThreadedStep::Cont(to) => to,
+            };
+            // 确定「唯一后继」：
+            //   1) Branch/Jump 已在执行时给出选中的目标（`chosen`）；
+            //   2) Compute/Effect 沿其**唯一** Sequence 出边；
+            //   3) 不可唯一确定 ⇒ 交回 BSP 波次路径（该节点已 executed，
+            //      wave 路径不会重复执行它）。
+            let next = match chosen {
+                Some(t) => ThreadedNext::Next(t),
+                None => threaded_successor(node_id, dag),
+            };
+            match next {
+                ThreadedNext::Next(t) => {
+                    active.clear();
+                    active.push(t);
+                }
+                ThreadedNext::GiveUp => {
+                    // 交回波次路径：`active` 置空会让主循环退出，故把该节点的
+                    // 全部「可激活后继」放进 active，由 wave 路径按就绪判定推进
+                    // —— 与波次路径对 Branch/Jump 的处理一致。
+                    active.clear();
+                    let succs = activatable_successors(node_id, dag);
+                    if succs.is_empty() {
+                        // 没有任何后继：程序自然结束。
+                        break;
+                    }
+                    active.extend(succs);
+                }
+            }
+            continue;
+        }
         step += 1;
         cur_gen += 1;
 
@@ -658,6 +762,209 @@ pub fn run_dag_with_signal(
     effects: &mut crate::mir::effect::Effects,
 ) -> Result<(MirSignal, Value), String> {
     run_dag_with_signal_memo(dag, func, &mut DagExecMemo::new(), interp, env, effects)
+}
+
+// ── v0.104.6 D467：引擎入口（原 `vm/mod.rs` 的 `run_mir_with_signal*`）──────
+//
+// 这两个函数**建图 + 调度**，是引擎自己的入口，原先被放在壳层 `vm/mod.rs`
+// 里并用 `run_mir*` 命名（暗示「线性执行」，而自 v0.59 起并无线性执行实现）。
+// 现迁入本模块并去掉 `run_mir` 前缀。
+
+/// 主入口：按宿主缓存建图后执行，返回 `(MirSignal, Value)`。
+///
+/// v0.75: 修复 — 此前无条件返回 `MirSignal::Return`，丢弃 `Flow::Halt`
+/// （vote_to_halt）信号，导致 Pregel 引擎的 vertex_state 永远无法置为
+/// Halted。现在通过 `run_dag_with_signal` 真正传播 Return/Halt。
+///
+/// v0.75.9: 接收 `&Arc<MirFunction>`，优化后 DAG 走宿主内核缓存
+/// （`MirHost::dag_cache`，key = Arc 指针），同一 Arc 跨调用复用，
+/// 不再每次 `dag_analyze + dag_optimize + prune_sequence_edges` 全量重建。
+///
+/// v1.00: 缓存从进程级 `static DAG_CACHE` 全局状态机迁为宿主单属主纯值
+/// —— 同一解释器实例跨调用命中；Pregel worker 克隆继承 master 预热
+/// 条目后独立演化。
+pub fn run_with_signal(
+    func: &Arc<MirFunction>,
+    interp: &mut dyn MirHost,
+    env: &mut Environment,
+    effects: &mut crate::mir::effect::Effects,
+) -> Result<(MirSignal, Value), String> {
+    let dag = interp.dag_cache().get_or_build(func);
+    run_dag_with_signal(&dag, func, interp, env, effects)
+}
+
+/// v0.75.27: 可注入缓存变体 — 测试/多租户可传独立 `DagCache` 实例隔离
+/// 缓存状态。行为与 [`run_with_signal`] 完全一致，仅缓存来源不同
+/// （显式参数 vs 宿主自有）。缓存为宿主单属主纯值后无锁，签名收
+/// `&mut DagCache`（get_or_build 需要插入条目）。
+pub fn run_with_signal_cached(
+    func: &Arc<MirFunction>,
+    interp: &mut dyn MirHost,
+    env: &mut Environment,
+    dag_cache: &mut crate::mir::cache::DagCache,
+    effects: &mut crate::mir::effect::Effects,
+) -> Result<(MirSignal, Value), String> {
+    let dag = dag_cache.get_or_build(func);
+    run_dag_with_signal(&dag, func, interp, env, effects)
+}
+
+// ── v0.104.6：顺序直穿（switch-threaded）辅助 ────────────────────────────
+
+/// 直穿一步的执行结果。
+enum ThreadedStep {
+    /// 正常继续（`Flow::Continue` / `Flow::Jump(_)`）。`to` 是 Branch/Jump 选中的
+    /// 目标（若有）—— 直穿路径需要它来确定唯一后继。
+    Cont(Option<usize>),
+    /// 程序结束（`Return` / `Halt`）。
+    Stop,
+}
+
+/// 直穿路径下的「下一个节点」。
+enum ThreadedNext {
+    /// 唯一后继，继续直穿。
+    Next(usize),
+    /// 后继不唯一 / 非直线 —— 交回 BSP 波次路径。
+    GiveUp,
+}
+
+/// 执行单个 DAG 节点（与波次路径**同一套语义**：同一个 `dispatch`、同一套 memo）。
+///
+/// 返回 `Stop` 表示程序已结束（Return/Halt），调用方应终止主循环。
+#[allow(clippy::too_many_arguments)]
+fn step_threaded_node(
+    node_id: usize,
+    dag: &MirDag,
+    regs: &mut [Value],
+    reg_ready: &mut [bool],
+    interp: &mut dyn MirHost,
+    env: &mut Environment,
+    task_registry: &HashMap<&str, (&[String], &MirFunction)>,
+    effects: &mut crate::mir::effect::Effects,
+    memo: &mut DagExecMemo,
+    result: &mut Value,
+    signal: &mut MirSignal,
+) -> Result<ThreadedStep, String> {
+    match &dag.nodes[node_id] {
+        MirDagNode::Compute { inst, .. } | MirDagNode::Effect { inst } => {
+            // memo：与波次路径完全一致（纯节点算指纹、复用未变输入的结果）。
+            let pure = is_memoizable_pure(inst);
+            let inputs: Vec<InputFp> = if pure {
+                match &dag.nodes[node_id] {
+                    MirDagNode::Compute { input_regs, .. } => {
+                        input_regs.iter().map(|r| value_fp(&regs[*r])).collect()
+                    }
+                    MirDagNode::Effect { inst } => inst
+                        .input_regs()
+                        .iter()
+                        .map(|r| value_fp(&regs[*r]))
+                        .collect(),
+                    _ => Vec::new(),
+                }
+            } else {
+                Vec::new()
+            };
+            if pure && let Some(cached) = memo.reuse(node_id, &inputs) {
+                if let Some(d) = inst.dst() {
+                    regs[d] = cached;
+                    reg_ready[d] = true;
+                    *result = regs[d].clone();
+                }
+                return Ok(ThreadedStep::Cont(None));
+            }
+            let flow = handlers::dispatch(inst, regs, interp, env, task_registry, effects)?;
+            if pure {
+                if let Some(d) = inst.dst() {
+                    memo.record(node_id, inputs, regs[d].clone());
+                } else {
+                    memo.record(node_id, inputs, Value::Nil);
+                }
+            }
+            if let Some(d) = inst.written_reg() {
+                reg_ready[d] = true;
+                *result = regs[d].clone();
+            }
+            match flow {
+                Flow::Return(v) => {
+                    *signal = MirSignal::Return(v.clone());
+                    *result = v;
+                    Ok(ThreadedStep::Stop)
+                }
+                Flow::Halt(v) => {
+                    *signal = MirSignal::Halt(v.clone());
+                    *result = v.unwrap_or(Value::Nil);
+                    Ok(ThreadedStep::Stop)
+                }
+                // `Flow::Continue` 与 `Flow::Jump(_)`（控制转移完全由边决定，见本
+                // 文件顶部）在直穿路径下同样只是「继续」——后继由
+                // `threaded_successor` 按图边给出。
+                Flow::Continue | Flow::Jump(_) => Ok(ThreadedStep::Cont(None)),
+            }
+        }
+        MirDagNode::Branch {
+            cond,
+            true_target,
+            false_target,
+        } => {
+            let chosen = if crate::flow::is_truthy(&regs[*cond]) {
+                true_target
+            } else {
+                false_target
+            };
+            Ok(ThreadedStep::Cont(*chosen))
+        }
+        MirDagNode::Jump { target } => Ok(ThreadedStep::Cont(*target)),
+        MirDagNode::Label { .. } | MirDagNode::Phi { .. } | MirDagNode::Removed => {
+            Ok(ThreadedStep::Cont(None))
+        }
+    }
+}
+
+/// 求 `Compute`/`Effect` 节点执行后的**唯一** Sequence 后继。
+///
+/// 只有**恰好一条** Sequence 出边才算「直线」；多条（真汇合）或零条 ⇒ `GiveUp`，
+/// 交回 BSP 波次路径。Branch/Jump 的后继由 `step_threaded_node` 在执行时直接
+/// 给出，不走本函数。
+fn threaded_successor(node_id: usize, dag: &MirDag) -> ThreadedNext {
+    // ⚠ **不可按 `executed` 过滤**：循环体的**回边**指向本次迭代早已执行的
+    // 节点（如 `[22] Jump → [10]`，而 `[10]` 在上一轮已跑过）。若把已执行的
+    // 目标过滤掉，直穿在循环里会误判「无直线后继」而**每轮都回退**
+    // （实测 1M 迭代只有 22% 命中）。
+    //
+    // 重复 Sequence 边已由 `dag_analyze` 收口时去重（见 `dag.rs`「边去重」），
+    // 故此处直接计「不同目标个数」，无需再自行去重。
+    let mut succ: Option<usize> = None;
+    let mut n_distinct = 0usize;
+    for e in &dag.edges {
+        if e.from == node_id && matches!(e.kind, crate::mir::dag::EdgeKind::Sequence) {
+            if succ.is_some() {
+                n_distinct += 1;
+            } else {
+                succ = Some(e.to);
+            }
+        }
+    }
+    match succ {
+        Some(t) if n_distinct == 0 => ThreadedNext::Next(t),
+        _ => ThreadedNext::GiveUp, // 真正的多目标 ⇒ 汇合，交回波次路径
+    }
+}
+
+/// 节点的**全部可激活后继**（控制边 + Sequence 边，去重且不含已执行者）。
+///
+/// 仅在直穿要「交回波次路径」时使用：把候选一次性放进 `active`，让波次路径按
+/// 自己的就绪判定（`node_ready` + `seq_preds`）推进 —— 语义与它对
+/// Branch/Jump 的处理完全一致。
+fn activatable_successors(node_id: usize, dag: &MirDag) -> Vec<usize> {
+    let mut out: Vec<usize> = Vec::new();
+    for e in &dag.edges {
+        if e.from == node_id
+            && (is_control_edge(&e.kind) || matches!(e.kind, crate::mir::dag::EdgeKind::Sequence))
+            && !out.contains(&e.to)
+        {
+            out.push(e.to);
+        }
+    }
+    out
 }
 
 fn node_ready(node: &MirDagNode, reg_ready: &[bool]) -> bool {

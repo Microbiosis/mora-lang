@@ -194,17 +194,48 @@ impl ParserV3 {
         let span = self.span_of_current();
         self.advance(); // 'task'
         let name = self.consume_identifier("Expected task name")?;
+        // v0.104.6：进入泛型作用域前先存旧值（供退出时还原）。
+        let saved_generic = std::mem::take(&mut self.generic_params);
+        // v0.104.6：泛型声明子句 `task f<T, U>(…)`。它把类型参数写入
+        // `self.generic_params`，随后形参/返回标注据此把裸名认作 `Type::TypeVar`。
+        let type_params = self.parse_generic_clause()?;
         self.consume(TokenType::LParen, "Expected '(' after task name")?;
-        let mut params = Vec::new();
+        // v0.104.6：形参类型标注 —— `task f(a: number, b: string): Ret`。
+        //
+        // 此前形参循环只收裸标识符，遇 `:` 直接 break ⇒ `Expected ')' after
+        // parameters`（README「Type checking」节的示例曾因此整块无法解析）。
+        // 承载位与消费端**本就存在**：`WitnessParam.type_hint`（witness.rs:446）
+        // 与 `bidirectional.rs:193-202`（Phase A' 把形参 type_hint 绑进 HM 环境
+        // 并做 subtype 检查）—— 缺的只是 parser 把标注填进 `type_hint` 这一步。
+        //
+        // 裸形参 `task f(x)` 行为不变（`type_hint: None`，与此前等价）。
+        let mut params: Vec<(String, Option<crate::mir::hint::TypeHint>)> = Vec::new();
         while !self.check(&TokenType::RParen) && !self.is_at_end() {
             if let Some(p) = self.consume_identifier("Expected parameter name") {
-                params.push(p);
+                let hint = if self.match_token_exact(TokenType::Colon) {
+                    Some(crate::mir::hint::TypeHint::from_type(
+                        self.parse_type_annotation()?,
+                    ))
+                } else {
+                    None
+                };
+                params.push((p, hint));
             }
             if !self.match_token(&[TokenType::Comma]) {
                 break;
             }
         }
         self.consume(TokenType::RParen, "Expected ')' after parameters")?;
+        // v0.104.6：返回类型标注 `): Ret` —— `FnDef.return_type` 位本就存在，
+        // 但此前写死 None（`emit_fn_def_w` 不消费尾随标注）。无 `:` 时保持 None，
+        // 行为不变。
+        let return_type = if self.match_token_exact(TokenType::Colon) {
+            Some(crate::mir::hint::TypeHint::from_type(
+                self.parse_type_annotation()?,
+            ))
+        } else {
+            None
+        };
         // 子上下文：函数体是独立寄存器空间（镜像 lower FnDef 分支）
         //
         // v0.104.6 D44：体发射失败时**还原父上下文**（见 emit_match_arm_w 处的
@@ -240,29 +271,37 @@ impl ParserV3 {
             self.emit.emit_tail_return(body_reg);
             Some((body_reg, body_w))
         })();
+        // v0.104.6：退出泛型作用域 —— 必须在体解析**之后**、且**无论成败**都执行
+        // （下方成功/失败两条路径都会经过这里），否则 `generic_params` 泄漏到后续
+        // 无关标注，把同名误当类型变量。
+        self.generic_params = saved_generic;
         let Some((_body_reg, body_w)) = body_res else {
             self.emit = parent;
             return None;
         };
         let body_mir = std::mem::replace(&mut self.emit, parent).finish();
+        // v0.104.6：`MirInst::TaskDef.params` 仍是**裸名**（执行期不消费标注），
+        // 标注只进 witness 侧的 `WitnessParam.type_hint` 供 typeck 使用。
+        let mir_params: Vec<String> = params.iter().map(|(n, _)| n.clone()).collect();
         self.emit.emit(MirInst::TaskDef {
             name: name.clone(),
-            params: params.clone(),
+            params: mir_params,
             body: Box::new(body_mir),
         });
         let w_params = params
             .iter()
-            .map(|p| WitnessParam {
-                name: p.clone(),
-                type_hint: None,
+            .map(|(n, hint)| WitnessParam {
+                name: n.clone(),
+                type_hint: hint.clone(),
                 default: None,
             })
             .collect();
         Some(MirWitness {
             kind: WitnessKind::FnDef {
                 name,
+                type_params,
                 params: w_params,
-                return_type: None,
+                return_type,
                 body: Box::new(body_w),
             },
             span,

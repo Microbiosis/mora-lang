@@ -23,8 +23,23 @@
 //! 但 body 其余部分已被 `map_ssa` 重编号并压进 `0..next_plain_reg`，
 //! 而 `n_regs` 只取 `next_plain_reg` ⇒ **透传指令引用的寄存器越界**。
 //!
-//! 修法：`n_regs = next_plain_reg.max(orig_n_regs)`。透传指令用的就是
-//! 重命名前的编号，故原始计数是它们的**可靠上界**；多分配几个槽无害。
+//! 当时的修法：`n_regs = next_plain_reg.max(orig_n_regs)`。
+//!
+//! ## v0.104.6 D417：这条「修法」本身已被删除
+//!
+//! `max(...)` 从来不是正确的上界，而是**掩盖失同步**：`passthrough` 里的
+//! 指令原样回插、寄存器号仍是**重命名前**的旧号，而 body 其余部分已被
+//! `map_ssa` 压进 `0..next_plain_reg` —— 一个函数里同时存在两套寄存器空间
+//! （D310 实测：闭包写 r8 而 `map` 读 r2）。撑大帧只是让越界检查不报错，
+//! **值仍然是错的**。
+//!
+//! D417 把透传指令改成 `SsaInst::Opaque` **留在原位参与同一条重命名路径**
+//! （读经 `map_regs`、写分配 fresh 版本号），于是：
+//! `MirSsaFunction::passthrough` 与 `orig_n_regs` 两个字段被删除，
+//! `deconstruct` 的 `n_regs` 回到**精确值** `next_plain_reg`。
+//!
+//! 本文件的判据全部保留有效 —— 它们测的是**行为**（「不再报错 / 输出正确」），
+//! 而 D417 的验收护栏在 `tests/ssa_passthrough_remap.rs`。
 //!
 //! ## 修后（实测）
 

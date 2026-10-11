@@ -310,7 +310,7 @@ fn apply_rewrite(dag: &mut MirDag, rw: DagRewrite) {
     // 4. v0.104.6 D9：**不剥离** removed 节点的边 —— removed 节点改为
     // **透明穿节点**（pass-through）。
     //
-    // DAG 执行器（`vm/dag.rs`）对 `MirDagNode::Removed` 的 match 分支是空操作
+    // DAG 执行器（`vm/engine.rs`）对 `MirDagNode::Removed` 的 match 分支是空操作
     // `=> {}`，但它仍进入 `ready`（`node_ready` 对 Removed 恒真）并参与边传播
     // —— 于是 removed 节点**沿其原出边继续激活后继**，`dag.reachable` 在
     // 优化后依然成立。

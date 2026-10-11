@@ -246,10 +246,15 @@ fn lower_node(ctx: &mut EmitContext, node: &Fcfg) {
             args,
             ..
         } => {
-            let name = callee_name
-                .clone()
-                .unwrap_or_else(|| format!("_r{}", callee));
-            ctx.emit(MirInst::Call(*dst, name, args.clone()));
+            // v0.104.6 D123：`callee_name: None` = 被调用者是一个**已求值的表达式**
+            //（值调用 / 立即调用）。此前这里 `unwrap_or_else(|| format!("_r{}", callee))`
+            // 把它**降级成按名字分发**的 `MirInst::Call("_r5", …)` —— callee 寄存器
+            // 直接丢失，运行期必报 `Undefined function or task: _r5`。
+            // 现在走 `CallValue`，与 parser 直发路径（`emit_call_tail_w`）形状一致。
+            match callee_name {
+                Some(name) => ctx.emit(MirInst::Call(*dst, name.clone(), args.clone())),
+                None => ctx.emit(MirInst::CallValue(*dst, *callee, args.clone())),
+            }
         }
         Node::MethodCall {
             dst,
@@ -361,7 +366,7 @@ fn lower_node(ctx: &mut EmitContext, node: &Fcfg) {
                 // / `top_level_variable_equiv` / `top_level_reassignment_equiv`）。
                 // 那些回归的根因在 DAG 侧（`Label` 孤立节点、可达集塌缩、死块
                 // 留在 Sequence 链上），已在 `dag.rs` / `dag_search.rs` /
-                // `vm/dag.rs` 修复 —— 此处重试。
+                // `vm/engine.rs` 修复 —— 此处重试。
                 //
                 // 寄存器安全：`ctx.next_reg` 起点是 `max_reg_in_nodes + 1`
                 // （见 `lower_fcfg`），此处 alloc 必然高于全部预分配寄存器，

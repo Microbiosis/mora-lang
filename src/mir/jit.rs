@@ -13,11 +13,11 @@
 //!   - **Float×Float** — SSE2 double 算术（addsd/subsd/mulsd/divsd）+
 //!     比较（comisd/setcc）。Float 除零 = IEEE inf、NaN 比较 = false
 //!     （NotEqual = true），与解释器精确一致。
-//!   - **Int×Int** — 精确复刻解释器 `numeric_op` 的 **f64 round-trip**
-//!     （`((a as f64) op (b as f64)).round() as i64`）：cvtsi2sd → 运算 →
-//!     roundsd（half-away）→ cvtsd2si（越界饱和）。Mod 用
-//!     `a - trunc(a/b)*b` 序列复刻 Rust 浮点余数。比较 = `a as f64 op
-//!     b as f64`。
+//!   - **Int×Int** — v0.104.6 D468：**精确 i64**（x86 原生 `add`/`sub`/
+//!     `imul` + `cmp`/`setcc`；`jo` 检出溢出 → bail → 回落解释器）。
+//!     此前 Sub/Mul 走 f64 round-trip（`((a as f64) op (b as f64)).round()
+//!     as i64`），那是**复刻解释器的错误路径** —— D468 解释器改精确后
+//!     两者会分叉（2^53 边界丢最低位），故 JIT 必须同步。
 //!
 //! 编译期拒绝（回落解释器）：Mixed 类型、Var/Define/调用/效果/控制流、
 //!   其他架构。拒绝总是 [`JitError`]（分类可审计）—— 调用方
@@ -400,48 +400,10 @@ impl Code {
         self.extend(&[0x48, 0x8B, 0x07]); // mov rax, [rdi]
     }
 
-    /// `cvtsi2sd xmm0, [rax+disp]` — Int payload → double。
-    fn load_int_xmm0(&mut self, reg: Reg) {
-        self.extend(&[0xF2, 0x0F, 0x2A, 0x80]);
-        self.extend(&Self::disp(reg, true).to_le_bytes());
-    }
-
-    /// `cvtsi2sd xmm1, [rax+disp]`。
-    fn load_int_xmm1(&mut self, reg: Reg) {
-        self.extend(&[0xF2, 0x0F, 0x2A, 0x88]);
-        self.extend(&Self::disp(reg, true).to_le_bytes());
-    }
-
     /// `mov qword [rax+disp], r11` — 写 Int payload。
     fn store_payload_r11(&mut self, reg: Reg) {
         self.extend(&[0x4C, 0x89, 0x98]);
         self.extend(&Self::disp(reg, true).to_le_bytes());
-    }
-
-    fn int_saturate(&mut self) {
-        // comisd xmm0, xmm0（判 nan：无序 → PF）
-        self.extend(&[0x66, 0x0F, 0x2F, 0xC0]);
-        self.extend(&[0x7A, 28]); // jp L_nan（next=0x88 → +28 = 0xa4）
-        // movabs rdx, 0x43E0000000000000（2^63 的 double 位模式 = i64 上限）
-        self.extend(&[0x48, 0xBA, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xE0, 0x43]);
-        // movq xmm1, rdx（modrm=0xCA：mod=11 寄存器形式；0x0A 是 mod=00 的
-        // (%rdx) 内存形式 —— objdump 证实解码为 movq (%rdx),%xmm1，运行时
-        // 解引用 0x43E0... 非法地址 → AV）
-        self.extend(&[0x66, 0x48, 0x0F, 0x6E, 0xCA]);
-        // comisd xmm0, xmm1（modrm=0xC1：mod=11、reg=0→xmm0 第一操作数、
-        // rm=1→xmm1 第二操作数 → Intel comisd xmm0,xmm1 即比较 xmm0 vs
-        // xmm1。0xC8 是 reg=xmm1 → Intel comisd xmm1,xmm0 比较 2^63 vs
-        // xmm0 → 恒 CF=0 → 恒跳 L_max → 全 MAX，objdump 已证实）
-        self.extend(&[0x66, 0x0F, 0x2F, 0xC1]); // comisd xmm0, xmm1（xmm0>=2^63 → CF=0）
-        self.extend(&[0x73, 12]); // jnc L_max（+12 → 40；xmm0>=2^63 → MAX）
-        self.extend(&[0xF2, 0x4C, 0x0F, 0x2D, 0xD8]); // cvtsd2si r11, xmm0（-2^63<=x<2^63 无溢出）
-        self.extend(&[0xEB, 15]); // jmp done（+15 → 50）
-        // L_nan(35)：
-        self.extend(&[0x4D, 0x31, 0xDB]); // xor r11, r11（nan → 0）
-        self.extend(&[0xEB, 10]); // jmp done（+10 → 50）
-        // L_max(40)：
-        self.extend(&[0x49, 0xBB, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x7F]); // movabs r11, i64::MAX
-        // done(50)：
     }
 
     /// `mov qword [rax+disp], imm32` — 写 tag（tag 恒 < 2^31）。
@@ -565,66 +527,117 @@ fn emit_binop_float(code: &mut Code, dst: Reg, a: Reg, op: crate::common::Binary
     code.store_xmm0_mem(dst);
 }
 
-/// Int 算术（复刻解释器**分裂语义**）：
-/// - Add：eval_binary Int+Int **直接 i64 加法**（`a + b`，溢出 wrap ——
-///   x86 add 天然 64 位 wrap；debug 解释器会 panic，release 与 JIT 一致）。
-/// - Sub/Mul/Div：numeric_op **f64 round-trip**
-///   （`((a as f64) op (b as f64)).round() as i64`）：cvtsi2sd → 运算 →
-///   roundsd（half-away）→ cvtsd2si（范围检查饱和）。
+/// Int 算术（v0.104.6 D468：**精确 i64** + 溢出 bail）。
 ///
-/// 除零（Div）：a as f64 / 0 = ±inf → roundsd 保持 inf → cvtsd2si 饱和
-/// i64::MIN/MAX，与解释器 `(inf).round() as i64` 一致。
+/// - Add/Sub/Mul：x86 原生 `add`/`sub`/`imul`（64 位，**精确**），
+///   溢出由 `jo`（jump-if-overflow）检出 → **bail** → `run_jit` 返回 Err
+///   → 调用方回落解释器 → 解释器按 D468 语义报 `MoraError`。
+/// - Div/Mod：仍**编译期拒绝**（回落解释器）—— 正确的整数除需要
+///   `cqo` + `idiv` + 除零陷阱判定，超出本模板集能力范围。
+///
+/// ## 为什么改成精确 i64
+///
+/// v0.104.6 D468 之前，Sub/Mul 走 f64 round-trip
+/// （`((a as f64) op (b as f64)).round() as i64`），
+/// 而解释器当时也走同一条路 —— **两边一起错**，差分测试是绿的。
+/// 解释器改精确后（JIT 不改）两者就会分叉：
+///
+/// ```text
+/// a = 2^53 + 1
+/// a - 0i   JIT Int(...992)  interp Int(...993)   ← 分叉
+/// ```
+///
+/// ⇒ JIT 必须同步改成精确 i64，否则差分测试立刻变红。
+///
+/// x86 的 `add`/`sub`/`imul` 本身就是 64 位精确运算，**不需要** f64 往返 ——
+/// 旧实现走 f64 纯粹是因为复刻了解释器的错误路径。
 fn emit_binop_int(code: &mut Code, dst: Reg, a: Reg, op: crate::common::BinaryOp, b: Reg) {
     code.load_regs();
     code.cmp_tag(a, TAG_INT);
     code.jne_bail();
     code.cmp_tag(b, TAG_INT);
     code.jne_bail();
-    if matches!(op, crate::common::BinaryOp::Add) {
-        // i64 直接加法：mov r11, [a+8]; add r11, [b+8]
-        code.extend(&[0x4C, 0x8B, 0x98]);
-        code.buf.extend(&Code::disp(a, true).to_le_bytes()); // mov r11, [a+8]
-        code.extend(&[0x4C, 0x03, 0x98]);
-        code.buf.extend(&Code::disp(b, true).to_le_bytes()); // add r11, [b+8]
-        code.store_tag(dst, TAG_INT);
-        code.store_payload_r11(dst);
-        return;
-    }
-    code.load_int_xmm0(a);
-    code.load_int_xmm1(b);
-    let opcode = match op {
-        crate::common::BinaryOp::Sub => 0x5C, // subsd
-        crate::common::BinaryOp::Mul => 0x59, // mulsd
-        crate::common::BinaryOp::Div => 0x5E, // divsd
+    // mov r11, [rax+disp(a)+8]
+    code.extend(&[0x4C, 0x8B, 0x98]);
+    code.buf.extend(&Code::disp(a, true).to_le_bytes());
+    // op r11, [rax+disp(b)+8]
+    //
+    // x86-64 编码（REX + opcode + ModRM + disp32）：
+    //   REX = 0x4C = 0100 1100 → W=1（64 位）、R=1、**X=0、B=0**
+    //   ModRM = 0x98 = 10 011 000 → mod=10（disp32）、reg=3（**+R=8 → r11**）、
+    //                                rm=0（+B=0 → rax）
+    //
+    //   ⇒ add  r11, [rax+disp] = 4C 03 98
+    //   ⇒ sub  r11, [rax+disp] = 4C 2B 98
+    //   ⇒ cmp  r11, [rax+disp] = 4C 3B 98
+    //   ⇒ imul r11, [rax+disp] = 4C 0F AF 98   （两操作数形式，有符号）
+    //
+    // ⚠ REX 前缀必须是 **0x4C**：REX.R=1 才能把 ModRM.reg=3 扩展成 r11。
+    // 用 0x4B（REX.R=0, X=1, B=1）会让 reg 保持 rbx、rm 变 r8 —— 读写
+    // 完全错误的寄存器，且不报错（静默给错值）。
+    //
+    // ⚠ `imul` 用 `0F AF`（两操作数）而非 `6B`：`6B` 是「r, r/m, imm8」
+    // 的三操作数形式，会多读一个立即数字节。
+    let (opcode, two_byte): (u8, bool) = match op {
+        crate::common::BinaryOp::Add => (0x03, false), // add r, r/m
+        crate::common::BinaryOp::Sub => (0x2B, false), // sub r, r/m
+        crate::common::BinaryOp::Mul => (0xAF, true),  // imul r, r/m（0F AF）
         _ => unreachable!("non-arith op"),
     };
-    code.extend(&[0xF2, 0x0F, opcode, 0xC1]); // xmm0 op xmm1（rm=xmm1）
-    code.extend(&[0x66, 0x0F, 0x3A, 0x0B, 0xC0, 0x00]); // roundsd xmm0, xmm0, 0
-    code.extend(&[0xF2, 0x4C, 0x0F, 0x2D, 0xD8]); // cvtsd2si r11, xmm0
-    code.int_saturate();
+    code.extend(&[0x4C]);
+    if two_byte {
+        code.extend(&[0x0F]);
+    }
+    code.extend(&[opcode, 0x98]);
+    code.buf.extend(&Code::disp(b, true).to_le_bytes());
+    // jo bail —— 有符号溢出（OF 标志）→ bail → 回落解释器报 MoraError。
+    //
+    // ⚠ 条件码是 **0x80**（JO = jump if overflow），不是 0x82。
+    // x86 近跳转条件码从 0x80 起步：
+    //   0x80=JO  0x81=JNO  0x82=JB(JC)  0x83=JAE(JNC)
+    //   0x84=JE  0x85=JNE 0x86=JBE      0x87=JA
+    // 0x82 是 **JB（无符号低于）** —— 对有符号溢出完全无效：
+    // `i64::MAX + 1` 的 OF=1 但 SF≠CF ⇒ JB 不成立 ⇒ 不 bail ⇒ 静默 wrap。
+    code.jcc_bail(0x80);
     code.store_tag(dst, TAG_INT);
     code.store_payload_r11(dst);
 }
 
-/// 无 NaN 修正（Int→f64 恒有序）。
+/// Int 比较（v0.104.6 D468：**精确 i64**，不经 f64）。
+///
+/// `cmp r11, [rax+disp]` + `setcc` —— 有符号比较，与解释器的 i64
+/// 比较完全一致。
+///
+/// 旧实现转 f64 再 `comisd`，于是 2^53 边界上：
+///
+/// ```text
+/// a = 2^53 + 1, b = 2^53
+/// a > b   JIT false  interp true   ← 分叉
+/// ```
+///
+/// （D468 之后解释器改精确，JIT 必须同步。）
 fn emit_binop_int_cmp(code: &mut Code, dst: Reg, a: Reg, op: crate::common::BinaryOp, b: Reg) {
     code.load_regs();
     code.cmp_tag(a, TAG_INT);
     code.jne_bail();
     code.cmp_tag(b, TAG_INT);
     code.jne_bail();
-    code.load_int_xmm0(a);
-    code.load_int_xmm1(b);
-    code.extend(&[0x66, 0x0F, 0x2F, 0xC1]); // comisd xmm0, xmm1（寄存器形式）
-    // 清 eax 需在 comisd 后 setcc 前？不行——setcc 前清 eax 会毁标志。
-    // 直接 setcc al + movzx（高位残留用 movzx 清，见 Float cmp 同款）。
+    // mov r11, [rax+disp(a)+8]
+    code.extend(&[0x4C, 0x8B, 0x98]);
+    code.buf.extend(&Code::disp(a, true).to_le_bytes());
+    // cmp r11, [rax+disp(b)+8] —— 设置 CF/ZF/SF/OF
+    // 编码：REX 0x4C（W=1, R=1）+ opcode 3B + ModRM 0x98（reg=3→r11,
+    // rm=0→rax, mod=10→disp32） ⇒ 4C 3B 98 <disp32>
+    code.extend(&[0x4C, 0x3B, 0x98]);
+    code.buf.extend(&Code::disp(b, true).to_le_bytes());
+    // setcc al —— 有符号比较的分支条件
     let setcc = match op {
         crate::common::BinaryOp::Equal => 0x94,        // sete
         crate::common::BinaryOp::NotEqual => 0x95,     // setne
-        crate::common::BinaryOp::Less => 0x92,         // setb
-        crate::common::BinaryOp::LessEqual => 0x96,    // setbe
-        crate::common::BinaryOp::Greater => 0x97,      // seta
-        crate::common::BinaryOp::GreaterEqual => 0x93, // setae
+        crate::common::BinaryOp::Less => 0x92,         // setl  （setb 是无符号）
+        crate::common::BinaryOp::LessEqual => 0x96,    // setle
+        crate::common::BinaryOp::Greater => 0x97,      // setg  （seta 是无符号）
+        crate::common::BinaryOp::GreaterEqual => 0x93, // setge
         _ => unreachable!("non-compare op"),
     };
     code.setcc_al(setcc);
@@ -704,8 +717,7 @@ enum TemplateSpec {
     ConstBool,
     BinopFloatArith, // addsd/subsd/mulsd/divsd → Float
     BinopFloatCmp,   // comisd+setcc → Bool
-    BinopIntAdd,     // i64 直接加 → Int
-    BinopIntArith,   // f64 round-trip（Sub/Mul）→ Int
+    BinopIntArith,   // 精确 i64（Add/Sub/Mul）→ Int（D468：不再是 f64 round-trip）
     // v0.104.6 D19：原 `BinopIntMod`（trunc 余数序列）已随 Int Div/Mod 一并
     // 从 `template_for_binary` 移除 —— 二者都需要除零陷阱判定，超出本模板集
     // 能力范围，现按契约回落解释器。保留变体会是永不构造的死 IR。
@@ -717,9 +729,7 @@ enum TemplateSpec {
 impl TemplateSpec {
     fn result_type(self) -> Option<Ty> {
         match self {
-            TemplateSpec::ConstInt | TemplateSpec::BinopIntAdd | TemplateSpec::BinopIntArith => {
-                Some(Ty::Int)
-            }
+            TemplateSpec::ConstInt | TemplateSpec::BinopIntArith => Some(Ty::Int),
             TemplateSpec::ConstFloat | TemplateSpec::BinopFloatArith => Some(Ty::Float),
             TemplateSpec::ConstBool | TemplateSpec::BinopFloatCmp | TemplateSpec::BinopIntCmp => {
                 Some(Ty::Bool)
@@ -752,10 +762,12 @@ fn template_for_binary(
         }
     } else if is_int {
         match op {
-            crate::common::BinaryOp::Add => Some(TemplateSpec::BinopIntAdd),
-            crate::common::BinaryOp::Sub | crate::common::BinaryOp::Mul => {
-                Some(TemplateSpec::BinopIntArith)
-            }
+            // v0.104.6 D468：Add/Sub/Mul 现在**同一条**精确 i64 模板
+            // （旧实现 Add 走裸 i64、Sub/Mul 走 f64 round-trip，故曾拆成
+            // 两个模板；D468 统一后合并为一个）。
+            crate::common::BinaryOp::Add
+            | crate::common::BinaryOp::Sub
+            | crate::common::BinaryOp::Mul => Some(TemplateSpec::BinopIntArith),
             // v0.104.6 D19：Int 的 Div / Mod **不再**走 `BinopIntArith`
             // （f64 round-trip 发射）。
             //
@@ -934,10 +946,6 @@ fn try_compile(func: &MirFunction) -> Result<(ExecMem, Reg), JitError> {
                         emit_binop_float_cmp(&mut code, *dst, *a, op.clone(), *b);
                         types[*dst] = Some(Ty::Bool);
                     }
-                    TemplateSpec::BinopIntAdd => {
-                        emit_binop_int(&mut code, *dst, *a, op.clone(), *b);
-                        types[*dst] = Some(Ty::Int);
-                    }
                     TemplateSpec::BinopIntArith => {
                         emit_binop_int(&mut code, *dst, *a, op.clone(), *b);
                         types[*dst] = Some(Ty::Int);
@@ -1094,8 +1102,15 @@ pub fn run_jit(
     if rc == 0 && state.bail == 0 {
         Ok(jit_to_value(regs[last_dst]))
     } else {
+        // v0.104.6 D468：bail 有两个来源 ——
+        // ① 类型标签守卫失败（tag 不匹配）；
+        // ② **整数溢出**（`jo` 检出 OF 标志，Add/Sub/Mul 超出 i64 范围）。
+        //
+        // 两者都**回落解释器**（`run_jit` 的 Err 分支 → 调用方 `run_mir`），
+        // 由解释器给出最终答案：① 是类型错误，② 是 `MoraError`（整数溢出）。
+        // JIT 自己**不做**语义裁决 —— 裁决权在解释器。
         Err(JitError::GuardFail(
-            "runtime type-tag guard failed (bail)".into(),
+            "runtime guard failed (type tag mismatch or integer overflow) — falling back to interpreter".into(),
         ))
     }
 }

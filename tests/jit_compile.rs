@@ -264,9 +264,17 @@ fn jit_rejects_int_div_and_mod_falling_back_to_interpreter() {
     }
 }
 
-/// Add(Int) 溢出 wrap 语义（JIT x86 add = release 解释器 wrap）。
+/// v0.104.6 D468：Add(Int) 溢出 → JIT **bail**（回落解释器），不再 wrap。
+///
+/// 旧行为是 wrap（x86 `add` 天然 64 位回绕），因为解释器当时也是
+/// 「debug panic / release 回绕」—— 两边一起错，差分测试是绿的。
+///
+/// D468 把解释器统一为「溢出报 `MoraError`」后，JIT 若仍 wrap 就会
+/// 与解释器**分叉**（同一程序，JIT 给 `i64::MIN`，解释器报错）。
+/// 故 JIT 现在用 `jo`（jump-if-overflow）检出溢出 → bail → 回落解释器，
+/// 由解释器报 `MoraError`。
 #[test]
-fn jit_int_add_wraps() {
+fn jit_int_add_overflow_bails_instead_of_wrapping() {
     let func = MirFunction {
         params: Vec::new(),
         body: vec![
@@ -278,9 +286,18 @@ fn jit_int_add_wraps() {
 
         ..Default::default()
     };
-    let jit_val = run_jit_of(&func).expect("JIT should compile Add");
-    // i64 直接加法 wrap：MAX + 1 = MIN
-    assert_eq!(jit_val, Value::Int(i64::MIN), "Add 溢出应 wrap");
+    // JIT 必须 bail（不能给出 wrap 值）。
+    let jit = run_jit_of(&func);
+    assert!(
+        jit.is_err(),
+        "Add 溢出必须 bail（回落解释器），JIT 不得给出 wrap 值；实得 {jit:?}"
+    );
+    // 解释器侧：报 MoraError（不是回绕值）。
+    let interp = run_interp(&func);
+    assert!(
+        interp.is_err(),
+        "解释器对 Add 溢出必须报错，实得 {interp:?}"
+    );
 }
 
 /// Int Mod：JIT **编译期拒绝**（v0.104.6 D19，见
@@ -344,6 +361,52 @@ fn jit_equiv_manual_int_cmp() {
             run_jit_of(&func).unwrap_or_else(|e| panic!("JIT failed for {a} {op:?} {b}: {e}"));
         let mir_val = run_interp(&func).expect("interp should run");
         assert_eq!(jit_val, mir_val, "JIT != interp for {a} {op:?} {b}");
+    }
+}
+
+/// v0.104.6 D468：JIT 的 Int 运算/比较在 **2^53 边界**上仍精确。
+///
+/// 旧实现（Int Sub/Mul 走 f64 round-trip、Int 比较走 f64）在这个边界上
+/// 与解释器**分叉**：
+///
+/// ```text
+/// a = 2^53 + 1, b = 2^53
+/// a - 0i   JIT Int(...992)  interp Int(...993)   ← 分叉
+/// a > b    JIT false        interp true           ← 分叉
+/// ```
+///
+/// 差分测试当时是绿的，因为**解释器也走同一条 f64 路径**（两边一起错）。
+/// D468 解释器改精确后，JIT 必须同步 —— 这条测试就是钉住这一点。
+#[test]
+fn jit_int_is_exact_beyond_2p53() {
+    const P53: i64 = 9_007_199_254_740_992; // 2^53
+    const P53P1: i64 = 9_007_199_254_740_993; // 2^53 + 1（f64 装不下）
+
+    for (a, op, b) in [
+        (P53P1, mora::common::BinaryOp::Sub, 0i64),
+        (P53P1, mora::common::BinaryOp::Mul, 1i64),
+        (P53P1, mora::common::BinaryOp::Greater, P53),
+        (P53, mora::common::BinaryOp::Less, P53P1),
+        (P53P1, mora::common::BinaryOp::GreaterEqual, P53),
+    ] {
+        let func = MirFunction {
+            params: Vec::new(),
+            body: vec![
+                MirInst::Const(0, Value::Int(a)),
+                MirInst::Const(1, Value::Int(b)),
+                fbinop(2, 0, op.clone(), 1),
+            ],
+            n_regs: 3,
+
+            ..Default::default()
+        };
+        let jit_val =
+            run_jit_of(&func).unwrap_or_else(|e| panic!("JIT failed for {a} {op:?} {b}: {e}"));
+        let mir_val = run_interp(&func).expect("interp should run");
+        assert_eq!(
+            jit_val, mir_val,
+            "JIT != interp for {a} {op:?} {b}（2^53 边界必须精确）"
+        );
     }
 }
 

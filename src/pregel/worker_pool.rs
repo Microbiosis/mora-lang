@@ -67,14 +67,14 @@ impl WorkerPool {
                 loop {
                     // Block for the next batch (releases mutex while waiting).
                     let msg = {
-                        let guard = rx.lock().expect("worker pool rx poisoned");
+                        let guard = rx.lock().expect("worker 结果通道不变量已破损（结果可能丢失且永不补发） — 恢复会掩盖已破损的不变量，见 src/common/lock.rs");
                         guard.recv()
                     };
                     let Ok(msg) = msg else { break }; // channel closed → exit
                     // Grab jobs from the shared queue until empty.
                     loop {
                         let job = {
-                            let mut queue = msg.jobs.lock().expect("worker pool queue poisoned");
+                            let mut queue = msg.jobs.lock().expect("worker 任务队列不变量已破损（任务可能已出队但未被执行） — 恢复会掩盖已破损的不变量，见 src/common/lock.rs");
                             queue.pop()
                         };
                         match job {
@@ -184,12 +184,28 @@ impl WorkerPool {
 }
 
 impl Drop for WorkerPool {
+    /// **刻意不 join**。
+    ///
+    /// 修前这里逐个 `w.join()`，而 join 是无界的：worker 正卡在
+    /// `(job.task)()` 里执行用户 step 时，它不会去 `recv`，也就看不到
+    /// 「channel 已关闭」而退出。于是超时路径
+    /// （`pregel/mod.rs`：`self.worker_pool = None; return Err(超时)`）
+    /// 在**调用线程**上同步 join 那个正在超时执行的 step —— 重建 pool 的
+    /// 动作本身把这一步焊死，所谓「drop 掉泄漏线程」变成了永久挂起。
+    ///
+    /// std 的 `JoinHandle::join` 没有超时，无法在这里既等待又兜底。两种
+    /// 结局只能选一个：
+    /// - join  → 卡住的那个 worker 让整个 Pregel 永久挂起（本缺陷）
+    /// - 不 join → 卡住的 worker 线程晚些自己结束；空闲的 worker 立刻
+    ///   退出（`tx.take()` 关闭 channel ⇒ `recv` 立即返回 `Err` ⇒ break）
+    ///
+    /// 泄漏 1 个线程远好过挂死整个解释器，故取后者。空闲 worker 的退出
+    /// 不需要 join 同步：它们被唤醒后自行结束，没有任何资源依赖调用方。
     fn drop(&mut self) {
-        // Closing the channel makes workers exit their recv loop.
+        // 关闭 channel：空闲 worker 的 recv 立即返回 Err 并退出。
         self.tx.take();
-        for w in self.workers.drain(..) {
-            let _ = w.join();
-        }
+        // 丢弃 JoinHandle 即「脱离」，不阻塞。
+        self.workers.clear();
     }
 }
 
@@ -282,5 +298,51 @@ mod tests {
             .unwrap();
         assert!(res.timed_out, "short deadline must report timeout");
         assert!(res.outcomes.is_empty(), "timed-out job has no outcome");
+    }
+
+    /// 回归：`WorkerPool` 被 drop 时**不得**阻塞在还没跑完的 job 上。
+    ///
+    /// 修前 `Drop` 逐个 `w.join()`，而 `join` 无超时：超时路径
+    /// （`pregel/mod.rs` 的 `self.worker_pool = None; return Err(超时)`）
+    /// 会在**调用线程**上同步 join 那个正在超时执行的 step。所谓的
+    /// 「drop 掉泄漏线程以重建 pool」因此变成永久挂起 —— 重建动作本身
+    /// 把这一步焊死，错误信息永远返回不出去。
+    ///
+    /// 本用例在**修复前会永久挂起**（而非断言失败），故整个测试套件会卡死；
+    /// 这正是该缺陷在 CI 上的表现形态。修复后 drop 立即返回，
+    /// 那个 3s 的 worker 线程在后台自行结束。
+    #[test]
+    fn drop_does_not_block_on_an_in_flight_job() {
+        let pool = WorkerPool::new(1);
+
+        // job **不自己结束** —— 它一直等到本测试显式放行为止。这才是缺陷的
+        // 真实形态：卡住的是用户 step 本身，不是「跑得久一点」。
+        // 修前 drop 会 join 它 ⇒ 永久挂起 ⇒ 整个测试套件卡死（CI 上就
+        // 表现为「某个测试不动了」，没有任何断言失败信息）。
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let jobs: Vec<WorkerJob> = vec![WorkerJob {
+            index: 0,
+            task: Box::new(move || {
+                let _ = release_rx.recv();
+                Ok(Box::new(1u8))
+            }),
+        }];
+        let res = pool
+            .run_batch_with_timeout(jobs, Some(std::time::Duration::from_millis(20)))
+            .unwrap();
+        assert!(res.timed_out, "前置条件：job 必须处于超时状态");
+        assert!(res.outcomes.is_empty(), "前置条件：尚无 outcome");
+
+        let started = std::time::Instant::now();
+        drop(pool);
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_millis(1_000),
+            "drop 在 in-flight job 上阻塞了 {:?} —— 修前是永久挂起",
+            elapsed
+        );
+
+        // 放行后台线程，避免测试自身留下永久阻塞的线程。
+        let _ = release_tx.send(());
     }
 }

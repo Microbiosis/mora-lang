@@ -69,6 +69,12 @@ impl ParallelResult {
 }
 
 /// 自制信号量 (std 没有 Semaphore)
+/// kill 之后等待 waiter 线程收尾的宽限期（毫秒）。
+///
+/// 正常路径（kill 生效）下 waiter 会在几毫秒内返回，这个上限不会成为
+/// 延迟来源；只有「杀不掉」这一异常路径才会真的等满。
+const WAITER_GRACE_MS: u64 = 2_000;
+
 struct Semaphore {
     permits: AtomicUsize,
     mutex: Mutex<()>,
@@ -115,7 +121,7 @@ impl Semaphore {
                 return;
             }
             // 慢路径：持锁重查。permits 在锁内仍为 0 才是可靠的「要睡」判据。
-            let guard = self.mutex.lock().expect("semaphore mutex poisoned");
+            let guard = self.mutex.lock().expect("exec 信号量 permits 计数不变量已破损 — 恢复会掩盖已破损的不变量，见 src/common/lock.rs");
             if self.permits.load(Ordering::Acquire) > 0 {
                 // 竞争失败期间别人放出了 permit —— 放锁回快路径重试 CAS。
                 continue;
@@ -132,7 +138,7 @@ impl Semaphore {
     /// `notify_one` 在无等待者时是空操作，代价可忽略。
     fn release(&self) {
         self.permits.fetch_add(1, Ordering::AcqRel);
-        let _guard = self.mutex.lock().expect("semaphore mutex poisoned");
+        let _guard = self.mutex.lock().expect("exec 信号量 permits 计数不变量已破损 — 恢复会掩盖已破损的不变量，见 src/common/lock.rs");
         self.cond.notify_one();
     }
 }
@@ -283,12 +289,70 @@ fn exec_parallel(args: &[Value]) -> Result<Value, String> {
     drop(tx);
 
     // 收集结果
+    //
+    // 预算 = 每条命令的 timeout × 波数 + 收尾宽限。波数 =
+    // ceil(cmds / max_concurrent)，因为 worker 拿信号量是串行取任务的。
+    //
+    // **仅在用户显式给了 timeout 时设预算**：没给 timeout 意味着「我接受
+    // 这条命令跑多久」，此时人为加一个上限就是改变语义而不是修 bug。
+    let collect_budget: Option<Duration> = timeout.map(|per_cmd| {
+        // 用 try_from 而非 `as u32`：后者是**静默截断**（usize→u32），
+        // 与 `tests/int_cast_saturation_census.rs` 那条护栏同属一类问题。
+        // 波数要 > u32::MAX 得有 42 亿条命令，实际不可达；真到了就钳到
+        // u32::MAX，后续 `checked_mul` 再返回 None → Duration::MAX，
+        // 仍是「不早退」的保守方向。
+        let waves =
+            u32::try_from(cmds_arc.len().div_ceil(max_concurrent.max(1))).unwrap_or(u32::MAX);
+        per_cmd
+            .checked_mul(waves)
+            .and_then(|d| d.checked_add(Duration::from_millis(WAITER_GRACE_MS)))
+            .unwrap_or(Duration::MAX)
+    });
+    let deadline = collect_budget.map(|b| std::time::Instant::now() + b);
+
     let mut results: Vec<ParallelResult> = Vec::with_capacity(cmds_arc.len());
+    let mut timed_out = false;
     for _ in 0..cmds_arc.len() {
-        match rx.recv() {
+        let received = match deadline {
+            Some(dl) => {
+                match rx.recv_timeout(dl.saturating_duration_since(std::time::Instant::now())) {
+                    Ok(r) => Ok(r),
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        timed_out = true;
+                        break;
+                    }
+                }
+            }
+            None => rx.recv().map_err(|_| mpsc::RecvTimeoutError::Disconnected),
+        };
+        match received {
             Ok(r) => results.push(r),
             Err(_) => break,
         }
+    }
+
+    if timed_out {
+        // worker 没能按时上报。**不能**在这里 `join()`：那正是要修的挂死。
+        // 缺项按超时错误补齐，让调用方看到「哪几条没回来」而不是静默少几条。
+        let done: std::collections::HashSet<usize> = results.iter().map(|r| r.idx).collect();
+        for idx in 0..cmds_arc.len() {
+            if !done.contains(&idx) {
+                results.push(ParallelResult {
+                    idx,
+                    cmd: cmds_arc[idx].clone(),
+                    stdout: String::new(),
+                    stderr: String::new(),
+                    exit_code: None,
+                    elapsed_ms: 0,
+                    pid: 0,
+                    error: Some("exec.parallel: worker did not report before deadline".to_string()),
+                });
+            }
+        }
+        // worker 线程在此脱离；它们持有的 `tx` 随线程结束而 drop，
+        // `rx` 随后被本函数结束时 drop，不会泄漏到别的调用。
+        return Ok(Value::List(results.iter().map(|r| r.to_value()).collect()));
     }
 
     // 等待所有 worker 完成。worker 线程 panic 会让结果集静默缺项（结果按
@@ -411,7 +475,33 @@ fn run_single_cmd(
                 // Timeout: 杀进程组
                 cancelled.store(true, Ordering::SeqCst);
                 kill_process_group(pid);
-                let _ = waiter.join();
+
+                // `kill_process_group` 是**尽力而为** —— unix 侧 `killpg` 的
+                // 返回值在 `kill_process_group` 里被丢弃，windows 侧 `taskkill`
+                // 的退出码同样被丢弃。杀不掉时（进程已退出但孙进程经 `setsid`
+                // 脱离进程组却仍持有 stdout 管道、权限不足、pid 已被回收…），
+                // 子进程的管道永不 EOF ⇒ `wait_with_output` 永不返回。
+                //
+                // 修前此处是无条件 `waiter.join()`：worker 线程被这条 join 焊死，
+                // 既不 `tx.send` 结果、也不 drop `tx`，于是外层收集
+                // （`rx.recv()`，本文件下方）既收不到结果、也等不到
+                // `Disconnected` ⇒ **整个 `exec.parallel()` 永久挂起**，而
+                // `timeout` 本身正是制造这次挂死的机制。
+                //
+                // 修法：给 waiter 一个**有限**收尾宽限，超时则**脱离**
+                // （Rust 无协作式取消，线程只能泄漏 —— 但泄漏 1 个线程
+                // 远好过挂死整个解释器）。复用已有的 `done_rx`：拿到值或拿到
+                // `Disconnected` 都说明 waiter 已结束，此时 join 是瞬时的；
+                // 只有再次 `Timeout` 才走脱离分支。
+                if done_rx
+                    .recv_timeout(Duration::from_millis(WAITER_GRACE_MS))
+                    .is_ok()
+                {
+                    let _ = waiter.join();
+                }
+                // else: waiter 仍卡在 `wait_with_output` 里，主动脱离。
+                // `done_rx` 随本函数返回被 drop，waiter 之后 send 得到 Err，
+                // 无害。
                 return ParallelResult {
                     idx,
                     cmd: cmd_str.to_string(),
@@ -642,6 +732,56 @@ mod tests_v043_exec {
             Some(Value::String(s)) => assert!(s.contains("timeout"), "got: {}", s),
             other => panic!("expected timeout error, got: {:?}", other),
         }
+    }
+
+    /// 回归：`exec.parallel` 在超时路径上必须**有界返回**。
+    ///
+    /// 修前的机理是三段串联：
+    ///
+    /// 1. `run_single_cmd` 超时后 `kill_process_group(pid)` —— 尽力而为，`killpg` 返回值被丢弃；
+    /// 2. 紧接着无条件 `waiter.join()` —— kill 没杀掉时子进程仍持有 stdout 管道，`wait_with_output` 永不返回 ⇒ waiter 永生；
+    /// 3. worker 线程被 join 焊死，既不 `tx.send` 也不 drop `tx`，外层 `rx.recv()` 于是既收不到结果、也等不到 `Disconnected`。
+    ///
+    /// 结果：一次「杀不掉的超时」= **整个调用永久挂起**，而 `timeout` 参数本身正是制造这次挂死的机制。
+    ///
+    /// 本用例断言的是「有界返回」这一不变量本身。正常平台上 kill 生效，
+    /// 走的是快路径；杀不掉时走宽限期后脱离 waiter 线程，同样有界。
+    #[test]
+    fn exec_parallel_timeout_returns_within_bounded_time() {
+        let interp = Interpreter::new();
+        // 远超 timeout 的命令：timeout_ms = 200
+        let long = if cfg!(windows) {
+            "ping -n 30 127.0.0.1"
+        } else {
+            "sleep 30"
+        };
+        let cmds = vec![cmd(long)];
+        let started = std::time::Instant::now();
+        let result = interp
+            .call_exec_method(
+                "parallel",
+                &[
+                    Value::List(cmds.into()),
+                    Value::Float(1.0),
+                    Value::Float(200.0),
+                ],
+            )
+            .unwrap();
+        let elapsed = started.elapsed();
+
+        // 预算 = timeout 200ms + waiter 宽限 2s + 进程被杀/回收的余量。
+        // 给到 20s：足以覆盖最慢的 Windows 回收路径，又远小于「永久挂起」。
+        assert!(
+            elapsed < std::time::Duration::from_secs(20),
+            "exec.parallel 超时后未在有界时间内返回（耗时 {:?}）——              说明 waiter 被 join 焊死、外层 rx.recv() 收不到 Disconnected",
+            elapsed
+        );
+
+        let list = match result {
+            Value::List(l) => l,
+            _ => panic!("expected List"),
+        };
+        assert_eq!(list.len(), 1, "超时也必须产出一条结果，不能静默缺项");
     }
 
     #[test]

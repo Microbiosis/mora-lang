@@ -1145,3 +1145,116 @@ impl ParserV3 {
         Some((body_mir, wit))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::parser_v3::ParserV3;
+
+    fn compiles(src: &str) -> bool {
+        ParserV3::compile(src).is_ok()
+    }
+
+    /// D353（声明位这一侧）：`let` 的绑定名必须是**真正的标识符**。
+    ///
+    /// `tokens.rs` 侧已钉住「两条 API 对关键字给出相反答案」；本测试钉住
+    /// **调用点确实用了严格的那条**。此前 `emit_let_w` 借用了宽容的
+    /// `consume_identifier`，产出**僵尸绑定**：`let if = 5` exit 0（声明成功）
+    /// 而 `print(if)` 永远解析失败 —— 用户拿到「声明成功、引用失败、
+    /// 诊断还指错行」的三重坑，比直接报错更糟。
+    #[test]
+    fn d353_let_binding_rejects_keyword_names() {
+        for name in ["if", "let", "fn", "end", "match"] {
+            assert!(
+                !compiles(&format!("let {name} = 5\n")),
+                "`let {name}` 是僵尸绑定：声明成功但永远引用不到，必须编译期报错"
+            );
+        }
+        // 对照：真标识符照常工作
+        assert!(compiles("let zz = 5\nprint(zz)\n"));
+    }
+
+    /// 各类定义声明都必须能编译（这些 emitter 集中在本文件）。
+    #[test]
+    fn definition_declarations_compile() {
+        let cases: &[(&str, &str)] = &[
+            ("let", "let x = 1 + 2\nprint(x)\n"),
+            ("let + 类型标注", "let x: int = 7\nprint(x)\n"),
+            ("let + union 标注", "let x: string | int = 7\nprint(x)\n"),
+            // 注意：具名 `fn` 声明在本语言**不存在**（`fn` 只是闭包关键字，
+            // 见 CHANGELOG 23067 行一节）。函数声明走 `task`。
+            (
+                "task",
+                "task add(a, b)\n  return a + b\nend\nprint(add(1, 2))\n",
+            ),
+            ("struct", "struct P\n  x: number\nend\nprint(1)\n"),
+            ("enum", "enum E\n  A\n  B\nend\nprint(1)\n"),
+        ];
+        let mut failures = Vec::new();
+        for (name, src) in cases {
+            if !compiles(src) {
+                failures.push(*name);
+            }
+        }
+        assert!(failures.is_empty(), "以下定义形态应可编译：{failures:?}");
+    }
+
+    /// D46：enum / struct 的成员循环必须**保证进度**。
+    ///
+    /// 此前变体名解析失败时**既不 push 也不 advance**，循环条件恒真 ⇒
+    /// **死循环**（不是报错，是挂死）。
+    ///
+    /// 修复端有**两道彼此独立**的守卫：`None => return None`（显式报错）
+    /// 与 `if self.current == before`（进度校验）。实测**任一道单独存在
+    /// 就足以终止**；把两道都拿掉，本测试会在 45s 后被 timeout 杀掉
+    /// （exit 143），把两道都保留则秒过。故这条测试能跑完本身就是护栏。
+    #[test]
+    fn d46_malformed_enum_and_struct_terminate_instead_of_looping() {
+        for src in [
+            "enum E\n  @@@\nend\n",
+            "enum E\n  A\n  @@@\n  B\nend\n",
+            "struct P\n  @@@\nend\n",
+            "struct P\n  x\nend\n", // 缺 `:`
+            "enum E\n",             // 缺 end
+        ] {
+            // 只断言「能返回」——返回后编译成功或失败都算正确行为。
+            // 修复前这里会永不返回，测试二进制被杀。
+            let _ = compiles(src);
+        }
+    }
+
+    /// struct 字段的类型标注解析失败必须**报错**，不得静默丢字段。
+    ///
+    /// 此前是 `if let Some(..)` 落空即什么都不做，用户以为 `x: T` 声明
+    /// 成功了，而该字段根本没进定义。
+    #[test]
+    fn struct_field_with_bad_type_annotation_is_rejected() {
+        assert!(
+            !compiles("struct P\n  x: @@@\nend\n"),
+            "字段类型标注解析失败必须报错，不得静默丢字段"
+        );
+        assert!(compiles("struct P\n  x: number\nend\nprint(1)\n"));
+    }
+
+    /// 形参与返回类型标注（v0.104.6 起）必须仍被接受。
+    ///
+    /// 与 README 的用户承诺对应：`task f(a: number): T` 此前无法展示，
+    /// 如今必须照常工作。
+    ///
+    /// 顺带钉住一条易被误加的形态：**具名 `fn` 声明在本语言不存在**
+    /// （`fn` 只是闭包关键字，见 CHANGELOG 23067 行一节）。若有人日后
+    /// 「顺手」给 `TokenType::Fn` 也派发到 `emit_fn_def_w`，那是新增语法，
+    /// 不是本测试该放行的东西 —— 故显式断言它仍被拒。
+    #[test]
+    fn typed_parameters_and_return_annotations_still_compile() {
+        assert!(compiles(
+            "task double(a: number): number\n  return a * 2\nend\nprint(double(21))\n"
+        ));
+        assert!(compiles(
+            "task go(a: number): number\n  a + 1\nend\nprint(go(1))\n"
+        ));
+        assert!(
+            !compiles("fn f(a: number): number\n  return a\nend\n"),
+            "具名 `fn` 声明不存在 —— `fn` 仅作闭包关键字"
+        );
+    }
+}

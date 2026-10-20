@@ -190,14 +190,14 @@ mod tests {
             fn acquire(&self) {
                 // v0.50.0 (P0-12): Condvar-based wait (was yield_now spin).
                 // Prevents CPU saturation under contention.
-                let mut permits = self.inner.lock().expect("Sem inner mutex poisoned");
+                let mut permits = self.inner.lock().expect("信号量 permits 计数不变量已破损 — 恢复会掩盖已破损的不变量，见 src/common/lock.rs");
                 while *permits == 0 {
                     permits = self.cvar.wait(permits).expect("Condvar wait failed");
                 }
                 *permits -= 1;
             }
             fn release(&self) {
-                let mut permits = self.inner.lock().expect("Sem inner mutex poisoned");
+                let mut permits = self.inner.lock().expect("信号量 permits 计数不变量已破损 — 恢复会掩盖已破损的不变量，见 src/common/lock.rs");
                 *permits += 1;
                 assert!(
                     *permits <= self.max + 1,
@@ -226,7 +226,9 @@ mod tests {
         }
         assert_eq!(counter.load(Ordering::SeqCst), 1000);
         assert_eq!(
-            *sem.inner.lock().expect("Sem inner mutex poisoned"),
+            *sem.inner.lock().expect(
+                "信号量 permits 计数不变量已破损 — 恢复会掩盖已破损的不变量，见 src/common/lock.rs"
+            ),
             10,
             "permits should return to max"
         );

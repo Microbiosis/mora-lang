@@ -3,6 +3,7 @@
 //! 被 ast_v2 和其他模块共同引用的基础类型。
 //! 这些类型不依赖任何 AST 的 StmtKind/ExprKind/NodeId，是纯粹的数据结构。
 
+pub mod lock;
 pub mod trait_info;
 
 /// 源码位置信息：所有需要报错的 AST 节点带 line。

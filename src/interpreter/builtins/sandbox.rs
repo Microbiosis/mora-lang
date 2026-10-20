@@ -334,13 +334,13 @@ impl Interpreter {
                     h
                 };
 
-                *self.sandbox.container.lock().expect("container poisoned") = Some(handle);
+                *self.sandbox.container.lock().expect("容器句柄注册表不变量已破损（可能泄漏一个活容器） — 恢复会掩盖已破损的不变量，见 src/common/lock.rs") = Some(handle);
                 Ok(Value::Float(id_hash as f64))
             }
             // v0.44.0: sandbox.container_exec(cmd, args...) — run cmd INSIDE container via docker exec
             // Returns: Dict{exit_code, stdout, stderr, elapsed_ms}
             "container_exec" => {
-                let guard = self.sandbox.container.lock().expect("container poisoned");
+                let guard = self.sandbox.container.lock().expect("容器句柄注册表不变量已破损（可能泄漏一个活容器） — 恢复会掩盖已破损的不变量，见 src/common/lock.rs");
                 let handle = guard
                     .as_ref()
                     .ok_or_else(|| {
@@ -383,7 +383,7 @@ impl Interpreter {
             }
             // v0.44.0: sandbox.container_info() — diagnostic, returns Dict (container_id, name, backend, mounts)
             "container_info" => {
-                let guard = self.sandbox.container.lock().expect("container poisoned");
+                let guard = self.sandbox.container.lock().expect("容器句柄注册表不变量已破损（可能泄漏一个活容器） — 恢复会掩盖已破损的不变量，见 src/common/lock.rs");
                 match guard.as_ref() {
                     Some(handle) => {
                         let mut d = std::collections::HashMap::new();
@@ -428,7 +428,7 @@ impl Interpreter {
             }
             // v0.44.0: sandbox.container_clear() — REAL docker rm -f, then clear handle
             "container_clear" => {
-                let mut guard = self.sandbox.container.lock().expect("container poisoned");
+                let mut guard = self.sandbox.container.lock().expect("容器句柄注册表不变量已破损（可能泄漏一个活容器） — 恢复会掩盖已破损的不变量，见 src/common/lock.rs");
                 if let Some(handle) = guard.as_ref() {
                     handle
                         .destroy()

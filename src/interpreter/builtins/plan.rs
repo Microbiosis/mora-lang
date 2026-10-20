@@ -7,7 +7,10 @@ use crate::value::Value;
 
 impl Interpreter {
     pub fn call_plan_method(&mut self, method: &str, args: &[Value]) -> Result<Value, String> {
-        let mut plans = self.orch.plans.lock().expect("plans poisoned");
+        let mut plans =
+            self.orch.plans.lock().expect(
+                "plan 注册表不变量已破损 — 恢复会掩盖已破损的不变量，见 src/common/lock.rs",
+            );
 
         match method {
             "create" => {

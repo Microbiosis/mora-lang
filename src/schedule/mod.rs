@@ -34,6 +34,7 @@
 //! ⚠ `tick` 的 `now` 由 builtin 传入 `Scheduler::now()`（**无参**），
 //!   并非原文所写的「由 event loop 调用」。
 
+use crate::common::lock::lock_or_recover;
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -97,7 +98,7 @@ impl Scheduler {
 
     /// 设置持久化路径 (默认 None, 纯内存)
     pub fn set_persist_path(&self, path: PathBuf) {
-        let mut p = self.persist_path.lock().expect("scheduler mutex poisoned");
+        let mut p = lock_or_recover(&self.persist_path, "scheduler_persist_path");
         *p = Some(path);
     }
 
@@ -174,11 +175,11 @@ impl Scheduler {
         };
         self.jobs
             .lock()
-            .expect("scheduler mutex poisoned")
+            .expect("调度器 jobs/buckets 不变量已破损（任务可能已入 jobs 未入 buckets，永不触发） — 恢复会掩盖已破损的不变量，见 src/common/lock.rs")
             .insert(id.clone(), job);
         self.buckets
             .lock()
-            .expect("scheduler mutex poisoned")
+            .expect("调度器 jobs/buckets 不变量已破损（任务可能已入 jobs 未入 buckets，永不触发） — 恢复会掩盖已破损的不变量，见 src/common/lock.rs")
             .entry(next_fire)
             .or_default()
             .push(id.clone());
@@ -190,7 +191,7 @@ impl Scheduler {
     pub fn list(&self) -> Vec<Job> {
         self.jobs
             .lock()
-            .expect("scheduler mutex poisoned")
+            .expect("调度器 jobs/buckets 不变量已破损（任务可能已入 jobs 未入 buckets，永不触发） — 恢复会掩盖已破损的不变量，见 src/common/lock.rs")
             .values()
             .cloned()
             .collect()
@@ -205,7 +206,7 @@ impl Scheduler {
         let removed = self
             .jobs
             .lock()
-            .expect("scheduler mutex poisoned")
+            .expect("调度器 jobs/buckets 不变量已破损（任务可能已入 jobs 未入 buckets，永不触发） — 恢复会掩盖已破损的不变量，见 src/common/lock.rs")
             .remove(id)
             .is_some();
         if removed {
@@ -221,8 +222,8 @@ impl Scheduler {
     /// 不再线性扫描全部 jobs。Every 触发后以 `now + interval_s` 重排入桶；
     /// At 触发即删（delete_after_run）。
     pub fn tick(&self, now: u64) -> Vec<String> {
-        let mut jobs = self.jobs.lock().expect("scheduler mutex poisoned");
-        let mut buckets = self.buckets.lock().expect("scheduler mutex poisoned");
+        let mut jobs = self.jobs.lock().expect("调度器 jobs/buckets 不变量已破损（任务可能已入 jobs 未入 buckets，永不触发） — 恢复会掩盖已破损的不变量，见 src/common/lock.rs");
+        let mut buckets = self.buckets.lock().expect("调度器 jobs/buckets 不变量已破损（任务可能已入 jobs 未入 buckets，永不触发） — 恢复会掩盖已破损的不变量，见 src/common/lock.rs");
 
         // 先 collect 再 remove，避免 range 迭代期间可变借用 buckets。
         let due: Vec<(u64, Vec<String>)> = buckets
@@ -266,7 +267,7 @@ impl Scheduler {
 
     /// 当前 jobs 数 (test helper)
     pub fn count(&self) -> usize {
-        self.jobs.lock().expect("scheduler mutex poisoned").len()
+        self.jobs.lock().expect("调度器 jobs/buckets 不变量已破损（任务可能已入 jobs 未入 buckets，永不触发） — 恢复会掩盖已破损的不变量，见 src/common/lock.rs").len()
     }
 
     /// 持久化到 JSON (简单 dump, 不用 serde)
@@ -274,7 +275,7 @@ impl Scheduler {
         let path_opt = self
             .persist_path
             .lock()
-            .expect("scheduler mutex poisoned")
+            .expect("调度器 jobs/buckets 不变量已破损（任务可能已入 jobs 未入 buckets，永不触发） — 恢复会掩盖已破损的不变量，见 src/common/lock.rs")
             .clone();
         if let Some(path) = path_opt {
             let jobs = self.list();

@@ -607,3 +607,94 @@ impl ParserV3 {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::parser_v3::ParserV3;
+
+    fn compiles(src: &str) -> bool {
+        ParserV3::compile(src).is_ok()
+    }
+
+    /// 子句局部变量的槽位分配：**同名同槽**，体独有变量各得新槽。
+    ///
+    /// Prolog 语义的基础：头部出现的变量在体内共享一个槽（每次调用 rename
+    /// 成 fresh 实例），只出现在体里的变量同样需要一个自己的槽。
+    #[test]
+    fn slot_for_reuses_slots_and_allocates_for_new_names() {
+        let mut v = ClauseVars::default();
+        assert_eq!(v.slot_for("x"), 0);
+        assert_eq!(v.slot_for("y"), 1);
+        // 同名必须回到同一槽，否则头部与体里的 x 会变成两个逻辑变量
+        assert_eq!(v.slot_for("x"), 0, "同名变量必须共享槽位");
+        // 体独有变量
+        assert_eq!(v.slot_for("z"), 2);
+        assert_eq!(v.slot_names, vec!["x", "y", "z"]);
+    }
+
+    /// 匿名变量 `_` 每次出现都是**独立**的 fresh 变量。
+    ///
+    /// 若匿名变量复用槽位，`f(_, _)` 会退化成 `f(A, A)`，两个位置被迫相等。
+    #[test]
+    fn fresh_anon_allocates_an_independent_slot_each_time() {
+        let mut v = ClauseVars::default();
+        v.slot_for("x");
+        let (i1, n1) = v.fresh_anon();
+        let (i2, n2) = v.fresh_anon();
+        assert_ne!(i1, i2, "两个 `_` 不得共享槽位（否则退化成同一变量）");
+        assert_ne!(n1, n2);
+        assert_eq!((i1, i2), (1, 2));
+    }
+
+    /// 事实（头部是项、无体）与规则（有体）两种形态都必须编译。
+    #[test]
+    fn fact_and_rule_forms_both_compile() {
+        assert!(compiles("rel edge(\"a\", \"b\")\n"));
+        assert!(compiles("rel edge(\"a\", \"b\")\nrel edge(\"b\", \"c\")\n"));
+        // 规则：体是目标合取
+        assert!(compiles("rel path(x, y) edge(x, y) end\n"));
+        // 递归规则 + 体独有变量（y 只在体里出现）
+        assert!(compiles("rel path(x, z) edge(x, y), path(y, z) end\n"));
+        // 匿名变量
+        assert!(compiles("rel near(a, _) end\n"));
+    }
+
+    /// 单目标体走的是 `body_goals.len() == 1` 那条 `.expect("len 1")` 分支，
+    /// 必须走得通 —— 两个 `pop()` 各自作用在不同 vec 上，任一为空都会 panic。
+    #[test]
+    fn single_goal_body_and_query_take_the_len_one_branch_safely() {
+        assert!(compiles("rel path(x, y) edge(x, y) end\n"));
+        assert!(compiles("let r = solve { edge(?x, ?y) }\n"));
+    }
+
+    /// D216：多个 goal 必须**合取**，不能只取最后一个。
+    ///
+    /// 修前多 goal 被降成 `WitnessKind::Sequence`（顺序块），而块的产出值
+    /// 只是**最后一个**子表达式的值 —— 于是查询 `solve { a(?x), b(?x) }`
+    /// 只要 a 不匹配也照样返回 b 的绑定。至少要保证这类形态仍能编译，
+    /// 且不会退化成「只看最后一个」。
+    #[test]
+    fn d216_multi_goal_query_compiles_and_is_not_truncated() {
+        let src = "rel edge(\"a\", \"b\")\nlet r = solve { edge(?x, \"b\"), edge(?x, \"c\") }\n";
+        assert!(
+            compiles(src),
+            "多 goal 查询必须能编译（D216 修的是语义截断，不是让它编不过）"
+        );
+    }
+
+    /// 畸形 rel 声明必须被拒，不得静默吞掉（与 D44b 同一原则）。
+    #[test]
+    fn malformed_rel_declarations_are_rejected() {
+        for src in [
+            "rel edge(\"a\"\n",            // 头部未闭合
+            "rel path(x, y) edge(x, y)\n", // 规则缺 end
+            "rel\n",                       // 只有关键字
+        ] {
+            assert!(
+                !compiles(src),
+                "畸形 rel 声明必须编译期报错，不得静默吞掉：{src:?}"
+            );
+        }
+    }
+}

@@ -61,7 +61,7 @@ impl InfraRuntime {
         let mut cache = self
             .string_interner
             .lock()
-            .expect("InfraRuntime string_interner poisoned");
+            .expect("字符串驻留表不变量已破损（可能产出重复 id） — 恢复会掩盖已破损的不变量，见 src/common/lock.rs");
         // 用 Value::to_string() 作为 key（v0.22 旧逻辑用 Debug fmt — 简化为 to_string）
         let key = val.to_string();
         cache.put(key.clone(), val);
@@ -88,6 +88,7 @@ impl InfraRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::common::lock::lock_or_recover;
 
     #[test]
     fn string_interner_dedups() {
@@ -101,10 +102,7 @@ mod tests {
     #[test]
     fn ai_cache_starts_empty() {
         let infra = InfraRuntime::default();
-        let mut cache = infra
-            .ai_cache
-            .lock()
-            .expect("InfraRuntime ai_cache poisoned");
+        let mut cache = lock_or_recover(&infra.ai_cache, "ai_cache");
         assert!(cache.get("anything").is_none());
     }
 
@@ -128,12 +126,8 @@ mod tests {
         let infra1 = InfraRuntime::default();
         let infra2 = infra1.clone();
         // Arc 共享：改一个应能影响另一个
-        infra1
-            .ai_cache
-            .lock()
-            .expect("poisoned")
-            .put("k".to_string(), "v".to_string());
-        let got = infra2.ai_cache.lock().expect("poisoned").get("k");
+        lock_or_recover(&infra1.ai_cache, "ai_cache").put("k".to_string(), "v".to_string());
+        let got = lock_or_recover(&infra2.ai_cache, "ai_cache").get("k");
         assert_eq!(got, Some("v".to_string()));
     }
 

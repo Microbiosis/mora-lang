@@ -33,7 +33,10 @@ impl Default for OrchRuntime {
 impl OrchRuntime {
     /// 创建新 plan
     pub fn plan_create(&self, name: String) -> bool {
-        let mut plans = self.plans.lock().expect("OrchRuntime plans poisoned");
+        let mut plans = self
+            .plans
+            .lock()
+            .expect("plan 注册表不变量已破损 — 恢复会掩盖已破损的不变量，见 src/common/lock.rs");
         plans.insert(name, Plan::new());
         true
     }
@@ -43,7 +46,7 @@ impl OrchRuntime {
         let mut registry = self
             .skill_registry
             .lock()
-            .expect("OrchRuntime skill_registry poisoned");
+            .expect("skill 注册表不变量已破损 — 恢复会掩盖已破损的不变量，见 src/common/lock.rs");
         let name = skill.name.clone();
         registry.register(skill);
         name
@@ -58,7 +61,10 @@ mod tests {
     #[test]
     fn plans_default_empty() {
         let orch = OrchRuntime::default();
-        let plans = orch.plans.lock().expect("plans poisoned");
+        let plans = orch
+            .plans
+            .lock()
+            .expect("plan 注册表不变量已破损 — 恢复会掩盖已破损的不变量，见 src/common/lock.rs");
         assert!(plans.is_empty());
     }
 
@@ -68,14 +74,17 @@ mod tests {
         let registry = orch
             .refine_registry
             .lock()
-            .expect("refine_registry poisoned");
+            .expect("refine 注册表不变量已破损 — 恢复会掩盖已破损的不变量，见 src/common/lock.rs");
         let _ = &*registry; // 不 panic 即可
     }
 
     #[test]
     fn skill_registry_default() {
         let orch = OrchRuntime::default();
-        let registry = orch.skill_registry.lock().expect("skill_registry poisoned");
+        let registry = orch
+            .skill_registry
+            .lock()
+            .expect("skill 注册表不变量已破损 — 恢复会掩盖已破损的不变量，见 src/common/lock.rs");
         let _ = &*registry;
     }
 
@@ -83,7 +92,10 @@ mod tests {
     fn plan_create_inserts_entry() {
         let orch = OrchRuntime::default();
         assert!(orch.plan_create("test".to_string()));
-        let plans = orch.plans.lock().expect("plans poisoned");
+        let plans = orch
+            .plans
+            .lock()
+            .expect("plan 注册表不变量已破损 — 恢复会掩盖已破损的不变量，见 src/common/lock.rs");
         assert!(plans.contains_key("test"));
     }
 
@@ -99,7 +111,10 @@ mod tests {
         };
         let name = orch.skill_register(skill);
         assert_eq!(name, "s1");
-        let registry = orch.skill_registry.lock().expect("skill_registry poisoned");
+        let registry = orch
+            .skill_registry
+            .lock()
+            .expect("skill 注册表不变量已破损 — 恢复会掩盖已破损的不变量，见 src/common/lock.rs");
         assert!(registry.get("s1").is_some());
     }
 
@@ -111,9 +126,12 @@ mod tests {
         orch1
             .plans
             .lock()
-            .expect("plans poisoned")
+            .expect("plan 注册表不变量已破损 — 恢复会掩盖已破损的不变量，见 src/common/lock.rs")
             .insert("shared".to_string(), Plan::new());
-        let plans2 = orch2.plans.lock().expect("plans poisoned");
+        let plans2 = orch2
+            .plans
+            .lock()
+            .expect("plan 注册表不变量已破损 — 恢复会掩盖已破损的不变量，见 src/common/lock.rs");
         assert!(plans2.contains_key("shared"));
     }
 }

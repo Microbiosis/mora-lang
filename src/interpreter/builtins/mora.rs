@@ -32,7 +32,7 @@ impl Interpreter {
                         .orch
                         .refine_registry
                         .lock()
-                        .expect("refine_registry poisoned");
+                        .expect("refine 注册表不变量已破损 — 恢复会掩盖已破损的不变量，见 src/common/lock.rs");
                     let session = registry.get_or_create(&script);
                     session.refine_many(&instruction, count)
                 }
@@ -64,11 +64,9 @@ impl Interpreter {
                 // 即「查第 1 轮」静默返回**最新一轮**（exit 0、零诊断）。
                 let iter =
                     optional_num_arg(args, 1, "mora.refine_info", "iteration")?.map(|n| n as usize);
-                let registry = self
-                    .orch
-                    .refine_registry
-                    .lock()
-                    .expect("refine_registry poisoned");
+                let registry = self.orch.refine_registry.lock().expect(
+                    "refine 注册表不变量已破损 — 恢复会掩盖已破损的不变量，见 src/common/lock.rs",
+                );
                 let session = registry.get(&script).ok_or_else(|| {
                     format!("mora.refine_info: no session for '{}'", script.display())
                 })?;
@@ -85,11 +83,9 @@ impl Interpreter {
                 Ok(Value::Dict(step.to_dict()))
             }
             "list_refines" => {
-                let registry = self
-                    .orch
-                    .refine_registry
-                    .lock()
-                    .expect("refine_registry poisoned");
+                let registry = self.orch.refine_registry.lock().expect(
+                    "refine 注册表不变量已破损 — 恢复会掩盖已破损的不变量，见 src/common/lock.rs",
+                );
                 let mut names: Vec<String> = Vec::new();
                 for path in registry.session_paths() {
                     names.push(path.clone());

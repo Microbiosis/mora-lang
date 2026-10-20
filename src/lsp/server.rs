@@ -13,6 +13,7 @@ use std::sync::Mutex;
 
 use super::json::{Parser, Value};
 use super::transport;
+use crate::common::lock::lock_or_recover;
 
 pub struct Server {
     stdin: BufReader<io::Stdin>,
@@ -70,11 +71,7 @@ impl Server {
                 }
             };
             self.handle_message(msg)?;
-            if *self
-                .shutdown
-                .lock()
-                .map_err(|_| io::Error::other("shutdown mutex poisoned"))?
-            {
+            if *lock_or_recover(&self.shutdown, "lsp_shutdown") {
                 break;
             }
         }
@@ -111,19 +108,13 @@ impl Server {
                 // 客户端握手完成标志；什么都不做
             }
             "exit" => {
-                *self
-                    .shutdown
-                    .lock()
-                    .map_err(|_| io::Error::other("shutdown mutex poisoned"))? = true;
+                *lock_or_recover(&self.shutdown, "lsp_shutdown") = true;
             }
             "textDocument/didOpen" => {
                 if let Some(doc) = parse_doc_params(&params) {
                     let diags = self.check_diagnostics(&doc.text);
                     let uri = doc.uri.clone();
-                    let mut docs = self
-                        .docs
-                        .lock()
-                        .map_err(|_| io::Error::other("docs mutex poisoned"))?;
+                    let mut docs = lock_or_recover(&self.docs, "lsp_docs");
                     docs.insert(
                         uri.clone(),
                         DocumentState {
@@ -141,18 +132,12 @@ impl Server {
                     // 必须拿到现有文本才能按 `range` 拼接（修前取最后一条的
                     // `text` 当整份文档，增量编辑会丢掉整个文件）。
                     let base = {
-                        let docs = self
-                            .docs
-                            .lock()
-                            .map_err(|_| io::Error::other("docs mutex poisoned"))?;
+                        let docs = lock_or_recover(&self.docs, "lsp_docs");
                         docs.get(&uri).map(|d| d.text.clone()).unwrap_or_default()
                     };
                     let text = apply_content_changes(&base, &changes);
                     let diags = self.check_diagnostics(&text);
-                    let mut docs = self
-                        .docs
-                        .lock()
-                        .map_err(|_| io::Error::other("docs mutex poisoned"))?;
+                    let mut docs = lock_or_recover(&self.docs, "lsp_docs");
                     docs.insert(
                         uri.clone(),
                         DocumentState {
@@ -172,10 +157,7 @@ impl Server {
                     .and_then(|t| t.get("uri"))
                     .and_then(|u| u.as_str())
                 {
-                    self.docs
-                        .lock()
-                        .map_err(|_| io::Error::other("docs mutex poisoned"))?
-                        .remove(uri);
+                    lock_or_recover(&self.docs, "lsp_docs").remove(uri);
                 }
             }
             "textDocument/didSave" => {
@@ -184,18 +166,12 @@ impl Server {
                     .and_then(|t| t.get("uri"))
                     .and_then(|u| u.as_str())
                 {
-                    let text_opt = self
-                        .docs
-                        .lock()
-                        .map_err(|_| io::Error::other("docs mutex poisoned"))?
+                    let text_opt = lock_or_recover(&self.docs, "lsp_docs")
                         .get(uri)
                         .map(|d| d.text.clone());
                     if let Some(text) = text_opt {
                         let diags = self.check_diagnostics(&text);
-                        let mut docs = self
-                            .docs
-                            .lock()
-                            .map_err(|_| io::Error::other("docs mutex poisoned"))?;
+                        let mut docs = lock_or_recover(&self.docs, "lsp_docs");
                         if let Some(d) = docs.get_mut(uri) {
                             d.diagnostics = diags.clone();
                         }
@@ -215,10 +191,7 @@ impl Server {
         match method {
             "initialize" => Ok(self.handle_initialize(params)),
             "shutdown" => {
-                *self
-                    .shutdown
-                    .lock()
-                    .map_err(|_| "shutdown mutex poisoned".to_string())? = true;
+                *lock_or_recover(&self.shutdown, "lsp_shutdown") = true;
                 Ok(Value::Null)
             }
             "textDocument/hover" => self.handle_hover(params),
@@ -327,74 +300,47 @@ impl Server {
     // 各 LSP method 的占位实现 — 真正逻辑在 providers 模块
     // ============================================================
     fn handle_hover(&self, params: Value) -> Result<Value, String> {
-        let docs = self
-            .docs
-            .lock()
-            .map_err(|_| "docs mutex poisoned".to_string())?;
+        let docs = lock_or_recover(&self.docs, "lsp_docs");
         super::providers::hover_v3(&docs, &params)
     }
 
     fn handle_completion(&self, params: Value) -> Result<Value, String> {
-        let docs = self
-            .docs
-            .lock()
-            .map_err(|_| "docs mutex poisoned".to_string())?;
+        let docs = lock_or_recover(&self.docs, "lsp_docs");
         Ok(super::providers::completion_v3(&docs, &params))
     }
 
     fn handle_definition(&self, params: Value) -> Result<Value, String> {
-        let docs = self
-            .docs
-            .lock()
-            .map_err(|_| "docs mutex poisoned".to_string())?;
+        let docs = lock_or_recover(&self.docs, "lsp_docs");
         Ok(super::providers::definition_v3(&docs, &params))
     }
 
     fn handle_references(&self, params: Value) -> Result<Value, String> {
-        let docs = self
-            .docs
-            .lock()
-            .map_err(|_| "docs mutex poisoned".to_string())?;
+        let docs = lock_or_recover(&self.docs, "lsp_docs");
         Ok(super::providers::references_v3(&docs, &params))
     }
 
     fn handle_document_symbol(&self, params: Value) -> Result<Value, String> {
-        let docs = self
-            .docs
-            .lock()
-            .map_err(|_| "docs mutex poisoned".to_string())?;
+        let docs = lock_or_recover(&self.docs, "lsp_docs");
         Ok(super::providers::document_symbol_v3(&docs, &params))
     }
 
     fn handle_formatting(&self, params: Value, range: bool) -> Result<Value, String> {
-        let docs = self
-            .docs
-            .lock()
-            .map_err(|_| "docs mutex poisoned".to_string())?;
+        let docs = lock_or_recover(&self.docs, "lsp_docs");
         Ok(super::providers::formatting(&docs, &params, range))
     }
 
     fn handle_rename(&self, params: Value) -> Result<Value, String> {
-        let docs = self
-            .docs
-            .lock()
-            .map_err(|_| "docs mutex poisoned".to_string())?;
+        let docs = lock_or_recover(&self.docs, "lsp_docs");
         Ok(super::providers::rename_v3(&docs, &params))
     }
 
     fn handle_semantic_tokens(&self, params: Value) -> Result<Value, String> {
-        let docs = self
-            .docs
-            .lock()
-            .map_err(|_| "docs mutex poisoned".to_string())?;
+        let docs = lock_or_recover(&self.docs, "lsp_docs");
         Ok(super::providers::semantic_tokens_v3(&docs, &params))
     }
 
     fn handle_folding_range(&self, params: Value) -> Result<Value, String> {
-        let docs = self
-            .docs
-            .lock()
-            .map_err(|_| "docs mutex poisoned".to_string())?;
+        let docs = lock_or_recover(&self.docs, "lsp_docs");
         Ok(super::providers::folding_range_v3(&docs, &params))
     }
 

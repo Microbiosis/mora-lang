@@ -1264,8 +1264,14 @@ impl MirPregelEngine {
 
                     if batch.timed_out {
                         self.stats.timeouts += 1;
-                        // Drop the pool (leaked timed-out worker threads) and
-                        // force a fresh one on the next step.
+                        // Drop the pool and force a fresh one on the next step.
+                        //
+                        // Drop does NOT join: a worker still inside the timed-out
+                        // `job.task` cannot be rescued (std `join` has no
+                        // timeout), so joining here would block this very call
+                        // forever. Idle workers exit on their own once the
+                        // channel closes; only the in-flight one lingers.
+                        // See `WorkerPool::drop`.
                         self.worker_pool = None;
                         return Err(format!(
                             "Pregel: super-step {} timed out after {:?}",

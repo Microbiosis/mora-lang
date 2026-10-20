@@ -873,7 +873,7 @@ impl Interpreter {
             .infra
             .string_interner
             .lock()
-            .expect("Interpreter string_interner poisoned");
+            .expect("字符串驻留表不变量已破损（可能产出重复 id） — 恢复会掩盖已破损的不变量，见 src/common/lock.rs");
         if let Some(interned) = map.get(&s) {
             return interned;
         }

@@ -335,7 +335,17 @@ impl ContainerHandle {
                     Err(_) => {
                         // timeout — best-effort kill
                         timeout_kill_process_group(pid);
-                        let _ = waiter.join();
+                        // 同 `exec.rs`：kill 是尽力而为（`killpg` 返回值 /
+                        // `taskkill` 退出码都被丢弃）。杀不掉时子进程仍持有
+                        // 管道 ⇒ `wait_with_output` 永不返回 ⇒ 无条件
+                        // `join()` 会把调用线程焊死在这里。
+                        // 给有限宽限，超时就脱离线程（Rust 无协作式取消）。
+                        if rx
+                            .recv_timeout(std::time::Duration::from_millis(WAITER_GRACE_MS))
+                            .is_ok()
+                        {
+                            let _ = waiter.join();
+                        }
                         return Err(format!("docker exec timeout after {}ms", ms));
                     }
                 }
@@ -439,6 +449,10 @@ pub fn spawn_container(spec: &ContainerSpec, name: &str) -> Result<ContainerHand
 
 /// v0.49.0 (B2): timeout helper, kill process group on docker exec timeout.
 /// Unix: killpg(SIGKILL); Windows: taskkill /F /T.
+/// kill 之后等待 waiter 线程收尾的宽限期（毫秒）。
+/// 正常路径下 waiter 几毫秒内返回；只有「杀不掉」才等满。
+const WAITER_GRACE_MS: u64 = 2_000;
+
 fn timeout_kill_process_group(pid: u32) {
     #[cfg(unix)]
     // SAFETY: `libc::killpg` 是直接的进程组信号系统调用 —— 不解引用任何裸

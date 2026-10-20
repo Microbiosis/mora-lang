@@ -76,14 +76,16 @@ mod tests {
     #[test]
     fn container_default_none() {
         let sb = SandboxRuntime::default();
-        let container = sb.container.lock().expect("container poisoned");
+        let container = sb.container.lock().expect("容器句柄注册表不变量已破损（可能泄漏一个活容器） — 恢复会掩盖已破损的不变量，见 src/common/lock.rs");
         assert!(container.is_none());
     }
 
     #[test]
     fn tool_planes_default_has_core() {
         let sb = SandboxRuntime::default();
-        let planes = sb.tool_planes.lock().expect("tool_planes poisoned");
+        let planes = sb.tool_planes.lock().expect(
+            "tool plane 注册表不变量已破损 — 恢复会掩盖已破损的不变量，见 src/common/lock.rs",
+        );
         // v0.104.6 D403：本条此前是**空测试** —— 函数名声称「默认含 core plane」，
         // 函数体却只有 `let _ = &*planes;`（不 panic 即可），什么都没断言。
         // 旁边的注释还把 `ToolPlaneRegistry::default()` 说成「含 2 core planes」，
@@ -197,13 +199,13 @@ mod tests {
         // Arc 共享：改一个应能影响另一个
         sb1.container
             .lock()
-            .expect("container poisoned")
+            .expect("容器句柄注册表不变量已破损（可能泄漏一个活容器） — 恢复会掩盖已破损的不变量，见 src/common/lock.rs")
             .replace(ContainerHandle::new(
                 "test_id".to_string(),
                 "test_name".to_string(),
                 crate::sandbox::ContainerSpec::new(crate::sandbox::ContainerBackend::Docker),
             ));
-        let container2 = sb2.container.lock().expect("container poisoned");
+        let container2 = sb2.container.lock().expect("容器句柄注册表不变量已破损（可能泄漏一个活容器） — 恢复会掩盖已破损的不变量，见 src/common/lock.rs");
         assert!(container2.is_some());
         assert_eq!(container2.as_ref().unwrap().container_id, "test_id");
     }

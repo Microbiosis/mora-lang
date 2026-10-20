@@ -2285,10 +2285,19 @@ impl ParserV3 {
             while !self.check(&TokenType::End) && !self.is_at_end() {
                 // v0.104.6 D44b：**先**吃掉 arm 之间的换行，再尝试解析 arm。
                 //
-                // 此前换行清理写在 arm 尝试**之后**，于是循环第一次进入时 token
+                // 换行清理此前写在 arm 尝试**之后**，于是循环第一次进入时 token
                 // 必是 Newline → `parse_pattern` 失败 → 落到 `self.advance()`
-                // 恢复分支。**那个恢复分支其实是承重的**（不是纯防御），把它
-                // 直接换成报错会让**所有** match 形式失效。
+                // 恢复分支。当时那个恢复分支是**承重的**（不是纯防御）：直接
+                // 换成报错会让**所有** match 形式失效（实测 7 个形态全挂）。
+                //
+                // 风险**已由「清理前移」解除**，而不是靠保留恢复分支：现在
+                // 进入 arm 解析时 token 必已是 arm 的第一个 token，恢复分支
+                // 没有存在理由，故已按 D44b 换成显式报错（见下方 else）。
+                //
+                // ⚠ 不要把清理挪回 arm 尝试**之后**。「`valid_match_forms_
+                // still_work` 一条测试撑着」曾是这个不变量的全部护栏；现在
+                // `tests::d44b_all_valid_match_forms_still_compile` 就近钉住
+                // 它，重排会让那条测试立刻红。
                 while self.match_token(&[TokenType::Newline]) {}
                 if self.check(&TokenType::End) || self.is_at_end() {
                     break;
@@ -3092,5 +3101,99 @@ impl ParserV3 {
             },
             span,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::parser_v3::ParserV3;
+
+    fn compiles(src: &str) -> bool {
+        ParserV3::compile(src).is_ok()
+    }
+
+    /// D44b 不变量的**就近**护栏。
+    ///
+    /// 这条不变量此前只有 `tests/parser_recovery.rs::valid_match_forms_still_work`
+    /// 一条**集成**测试守着，而它离出问题的地方隔着一个 `tests/` 目录。改动
+    /// `emit_match_w` 的人不会先看到它。
+    ///
+    /// 形态覆盖：`with … end` 与 `{ … }` 两族、各 arm 数、arm 体是字面量 /
+    /// 返回值、带守卫 / 不带守卫。任一形态退化都会红。
+    ///
+    /// 关键失效方向：若有人把换行清理挪回 arm 尝试**之后**，循环首次进入时
+    /// token 是 Newline → 首个 arm 解析失败 → 现在会走 else 的显式报错 →
+    /// 编译被拒 ⇒ 本测试红。
+    #[test]
+    fn d44b_all_valid_match_forms_still_compile() {
+        let cases: &[(&str, &str)] = &[
+            ("with / 1 arm", "let v = match 1 with\n  1 -> 5\nend\nv\n"),
+            (
+                "with / 2 arms",
+                "let v = match 1 with\n  1 -> 5\n  2 -> 9\nend\nv\n",
+            ),
+            (
+                "with / guard",
+                "let v = match 1 with\n  x when x > 0 -> 5\n  _ -> 0\nend\nv\n",
+            ),
+            (
+                "with / task 内",
+                "task w()\n  match 1 with\n    1 -> 5\n  end\nend\nw()\n",
+            ),
+            ("brace / 1 arm", "let v = match 1 {\n  1 -> 5\n}\nv\n"),
+            (
+                "brace / 2 arms",
+                "let v = match 1 {\n  1 -> 5,\n  _ -> 0,\n}\nv\n",
+            ),
+            (
+                "brace / task 内",
+                "task w()\n  match 1 {\n    1 -> 5\n  }\nend\nw()\n",
+            ),
+        ];
+        let mut failures = Vec::new();
+        for (name, src) in cases {
+            if !compiles(src) {
+                failures.push(*name);
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "这些**合法** match 形态必须照常编译通过。\
+             典型成因是把换行清理挪回 arm 尝试之后（首个 arm 前是 Newline → \
+             解析失败 → 走显式报错分支）。失效形态：{failures:?}"
+        );
+    }
+
+    /// D44b 的另一半：畸形 arm 必须**编译期报错**，不得被静默吞掉。
+    ///
+    /// 与上一条构成一对：上条钉住「合法的别误伤」，本条钉住「非法的别放过」。
+    /// 若有人把显式报错换回 `self.advance()` 恢复分支（畸形 arm 凭空消失），
+    /// 本测试立刻红 —— 那正是 D44b 修掉的静默错答案。
+    ///
+    /// 畸形 arm 触发的是 `eprintln!` 诊断，故本测试输出里会有 stderr。
+    #[test]
+    fn d44b_malformed_match_arm_is_still_rejected() {
+        let cases: &[(&str, &str)] = &[
+            (
+                "arm 体是 return 而非表达式",
+                "task w()\n  match 1 with\n    1 -> 5\n    2 -> return 9\n  end\nend\nw()\n",
+            ),
+            (
+                "纯垃圾 arm",
+                "task w()\n  match 1 with\n    1 -> 5\n    @@@\n  end\nend\nw()\n",
+            ),
+        ];
+        let mut failures = Vec::new();
+        for (name, src) in cases {
+            if compiles(src) {
+                failures.push(*name);
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "畸形 match arm 必须编译期报错。修前它们被 `self.advance()` \
+             静默吞掉、退出码 0，还连带让**合法** arm 失效（返回 nil）。\
+             如今编译通过说明恢复分支被请回来了：{failures:?}"
+        );
     }
 }

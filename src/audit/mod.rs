@@ -15,6 +15,7 @@
 //! 命名说明: 与 `crate::record::audit` (secret redaction) 不同,
 //! 本模块是审计 *日志* 系统 (audit trail).
 
+use crate::common::lock::lock_or_recover;
 use sha2::{Digest, Sha256};
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
@@ -169,6 +170,14 @@ pub enum AuditError {
     },
     /// JSON 解析错误
     ParseError { line: usize, msg: String },
+    /// sink 状态锁被毒化 —— 某次 `write` 在更新 `last_hash` 与落盘之间
+    /// 被 panic 打断，**hash 链的连续性已无法保证**。
+    ///
+    /// 这里刻意**不做** `PoisonError::into_inner()` 静默恢复：那样 `verify_chain`
+    /// 可能对一条已断的链返回 `Ok(())`，把篡改/损坏伪装成「验证通过」。
+    /// 审计日志的价值就在于「这里坏了」是可见的，故走类型化错误而非 panic，
+    /// 让调用方自己决定是中止、告警还是重建 sink。
+    Poisoned,
 }
 
 impl std::fmt::Display for AuditError {
@@ -196,6 +205,11 @@ impl std::fmt::Display for AuditError {
             Self::ParseError { line, msg } => {
                 write!(f, "audit JSON parse error at line {}: {}", line, msg)
             }
+            Self::Poisoned => write!(
+                f,
+                "audit sink lock poisoned: hash chain continuity is no longer \
+                 guaranteed; refusing to report a verification result"
+            ),
         }
     }
 }
@@ -288,7 +302,7 @@ impl JsonlAuditSink {
 
 impl AuditSink for JsonlAuditSink {
     fn write(&self, mut event: AuditEvent) -> Result<(), AuditError> {
-        let mut state = self.state.lock().expect("audit sink mutex poisoned");
+        let mut state = self.state.lock().map_err(|_| AuditError::Poisoned)?;
         event.prev_hash = state.last_hash.clone();
         event.seal();
 
@@ -337,7 +351,7 @@ impl AuditSink for JsonlAuditSink {
     }
 
     fn flush(&self) -> Result<(), AuditError> {
-        let mut state = self.state.lock().expect("audit sink mutex poisoned");
+        let mut state = self.state.lock().map_err(|_| AuditError::Poisoned)?;
         state
             .writer
             .flush()
@@ -346,7 +360,7 @@ impl AuditSink for JsonlAuditSink {
     }
 
     fn verify_chain(&self) -> Result<(), AuditError> {
-        let state = self.state.lock().expect("audit sink mutex poisoned");
+        let state = self.state.lock().map_err(|_| AuditError::Poisoned)?;
         // 必须先 flush 才能读到所有写入。sync_all 失败意味着后续读取可能
         // 基于不完整数据 —— 若静默忽略，会产出错误的「验证通过」结论。
         state
@@ -404,10 +418,10 @@ impl AuditSink for JsonlAuditSink {
     }
 
     fn event_count(&self) -> u64 {
-        self.state
-            .lock()
-            .expect("audit sink mutex poisoned")
-            .events_count
+        // 计数器与 hash 链不同级：它只用于诊断/测试，中毒后最多读到一个
+        // 偏小的值，而 `write` 已经用 Poisoned 拒绝了后续写入（链已停止增长）。
+        // 因此这里恢复并计数即可，不必让只读调用点 panic。
+        lock_or_recover(&self.state, "audit_sink").events_count
     }
 }
 
@@ -854,5 +868,45 @@ mod tests {
         assert!(sink.flush().is_ok());
         assert!(sink.verify_chain().is_ok());
         assert_eq!(sink.event_count(), 0);
+    }
+
+    /// 中毒的 sink 必须**报错**，且绝不能对已断的链返回「验证通过」。
+    ///
+    /// 这是本仓不采用 `into_inner()` 静默恢复的**唯一**理由：
+    /// 静默恢复会把一条断链伪装成 `Ok(())` —— 审计日志的可信度全部
+    /// 建立在「这里坏了」必须可见之上。同时它也不能 panic：调用方拿到的
+    /// 是类型化的 `Err`，可以自己决定告警还是中止。
+    #[test]
+    fn poisoned_sink_reports_poisoned_instead_of_panicking_or_verifying() {
+        // 用共享的 `temp_log`，而不是自己拼目录名：它按 pid+nanos 唯一命名，
+        // 且 `TempLog` 绑定在 sink **之前**，逆序 drop 才能保证 Windows 上
+        // 先关句柄再删目录 —— 手写 `remove_dir_all` 会在句柄仍打开时静默失败，
+        // 给 `%TEMP%` 留一个孤儿目录。
+        let path = temp_log("poisoned.jsonl");
+        let sink = JsonlAuditSink::new_fresh(&path).expect("fresh sink");
+
+        // 先正常写一条，确保文件里确实有内容
+        sink.write(AuditEvent::new("a", "op", None, None, None))
+            .expect("write");
+        assert!(sink.verify_chain().is_ok(), "前置条件：未中毒时应验证通过");
+
+        // 在持锁时 panic，使 state 中毒（catch_unwind 避免测试进程被带走）
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = sink.state.lock().unwrap();
+            panic!("poison the audit sink");
+        }));
+        assert!(result.is_err(), "前置条件：应确实发生了一次 panic");
+        assert!(sink.state.is_poisoned(), "前置条件：state 应处于中毒态");
+
+        assert_eq!(
+            sink.write(AuditEvent::new("a", "op2", None, None, None)),
+            Err(AuditError::Poisoned)
+        );
+        assert_eq!(sink.flush(), Err(AuditError::Poisoned));
+        // 关键断言：中毒后**不能**给出「验证通过」
+        assert_eq!(sink.verify_chain(), Err(AuditError::Poisoned));
+
+        // 只读计数器走恢复路径（诊断级降级），不会 panic
+        let _ = sink.event_count();
     }
 }

@@ -61,6 +61,7 @@ impl AiRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::common::lock::lock_or_recover;
 
     #[test]
     fn default_ai_routes_empty() {
@@ -124,10 +125,7 @@ mod tests {
     #[test]
     fn draft_model_stats_starts_empty() {
         let ai = AiRuntime::default();
-        let stats = ai
-            .draft_model_stats
-            .lock()
-            .expect("draft_model_stats poisoned");
+        let stats = lock_or_recover(&ai.draft_model_stats, "ai_draft_model_stats");
         assert!(stats.is_empty());
     }
 

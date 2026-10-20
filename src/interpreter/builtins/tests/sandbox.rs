@@ -33,7 +33,7 @@ mod tests_v044_container_real {
                 .sandbox
                 .container
                 .lock()
-                .expect("container poisoned")
+                .expect("容器句柄注册表不变量已破损（可能泄漏一个活容器） — 恢复会掩盖已破损的不变量，见 src/common/lock.rs")
                 .is_some()
         );
         cleanup_container(&mut interp);
@@ -42,7 +42,7 @@ mod tests_v044_container_real {
                 .sandbox
                 .container
                 .lock()
-                .expect("container poisoned")
+                .expect("容器句柄注册表不变量已破损（可能泄漏一个活容器） — 恢复会掩盖已破损的不变量，见 src/common/lock.rs")
                 .is_none()
         );
     }
@@ -135,7 +135,7 @@ mod tests_v044_container_real {
             .call_sandbox_method("containerize", &[Value::String("docker".to_string())])
             .unwrap();
         let id = {
-            let guard = interp.sandbox.container.lock().expect("container poisoned");
+            let guard = interp.sandbox.container.lock().expect("容器句柄注册表不变量已破损（可能泄漏一个活容器） — 恢复会掩盖已破损的不变量，见 src/common/lock.rs");
             guard.as_ref().unwrap().container_id.clone()
         };
         // 验证 container 真的在 docker 里

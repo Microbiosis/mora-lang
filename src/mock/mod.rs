@@ -10,6 +10,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+use crate::common::lock::lock_or_recover;
 use crate::value::Value;
 
 /// v0.34: Mock handler 可以是 Rust 原生闭包，也可以是 Mora 脚本闭包
@@ -52,28 +53,25 @@ impl MockRegistry {
 
     /// 注册一个 mock handler by name
     pub fn register(&self, name: &str, handler: MockHandler) {
-        let mut map = self.handlers.lock().expect("mock registry mutex poisoned");
+        let mut map = lock_or_recover(&self.handlers, "mock_registry");
         map.insert(name.to_string(), handler);
     }
 
     /// 注销
     pub fn unregister(&self, name: &str) {
-        let mut map = self.handlers.lock().expect("mock registry mutex poisoned");
+        let mut map = lock_or_recover(&self.handlers, "mock_registry");
         map.remove(name);
     }
 
     /// 取出 handler 的克隆，由调用方决定如何执行
     pub fn get(&self, name: &str) -> Option<MockHandler> {
-        let map = self.handlers.lock().expect("mock registry mutex poisoned");
+        let map = lock_or_recover(&self.handlers, "mock_registry");
         map.get(name).cloned()
     }
 
     /// 当前注册的 handler 数 (test helper)
     pub fn count(&self) -> usize {
-        self.handlers
-            .lock()
-            .expect("mock registry mutex poisoned")
-            .len()
+        lock_or_recover(&self.handlers, "mock_registry").len()
     }
 
     /// 列出所有已注册 handler 名 (test helper)
@@ -96,7 +94,7 @@ impl MockRegistry {
     /// ⇒ 排不排序**都能通过**，对顺序**没有牙齿**；
     /// 真正的守卫在 `tests/mock_registry_determinism.rs`。
     pub fn names(&self) -> Vec<String> {
-        let map = self.handlers.lock().expect("mock registry mutex poisoned");
+        let map = lock_or_recover(&self.handlers, "mock_registry");
         let mut names: Vec<String> = map.keys().cloned().collect();
         names.sort();
         names

@@ -28,6 +28,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
+use crate::common::lock::write_or_recover;
 use crate::value::Value;
 
 /// Listener 标识: 模式字符串 (e.g. "outer.*" 或 "ai.chat.completed")
@@ -81,25 +82,19 @@ impl EventBus {
         match bucket {
             PatternBucket::Exact => {
                 // v0.50.0 (P0-10): write lock (on is a write op, rare)
-                self.exact
-                    .write()
-                    .expect("event bus rwlock poisoned")
+                write_or_recover(&self.exact, "event_bus")
                     .entry(pattern.to_string())
                     .or_default()
                     .push(handler);
             }
             PatternBucket::Prefix(prefix_key) => {
-                self.prefix
-                    .write()
-                    .expect("event bus rwlock poisoned")
+                write_or_recover(&self.prefix, "event_bus")
                     .entry(prefix_key)
                     .or_default()
                     .push(handler);
             }
             PatternBucket::Interior => {
-                self.interior
-                    .write()
-                    .expect("event bus mutex poisoned")
+                write_or_recover(&self.interior, "event_bus")
                     .entry(pattern.to_string())
                     .or_default()
                     .push(handler);
@@ -182,22 +177,13 @@ impl EventBus {
         let bucket = classify_pattern(pattern);
         match bucket {
             PatternBucket::Exact => {
-                self.exact
-                    .write()
-                    .expect("event bus rwlock poisoned")
-                    .remove(pattern);
+                write_or_recover(&self.exact, "event_bus").remove(pattern);
             }
             PatternBucket::Prefix(prefix_key) => {
-                self.prefix
-                    .write()
-                    .expect("event bus rwlock poisoned")
-                    .remove(&prefix_key);
+                write_or_recover(&self.prefix, "event_bus").remove(&prefix_key);
             }
             PatternBucket::Interior => {
-                self.interior
-                    .write()
-                    .expect("event bus rwlock poisoned")
-                    .remove(pattern);
+                write_or_recover(&self.interior, "event_bus").remove(pattern);
             }
         }
     }

@@ -7,11 +7,9 @@ use crate::value::Value;
 
 impl Interpreter {
     pub fn call_toolplane_method(&self, method: &str, args: &[Value]) -> Result<Value, String> {
-        let mut reg = self
-            .sandbox
-            .tool_planes
-            .lock()
-            .expect("tool_planes poisoned");
+        let mut reg = self.sandbox.tool_planes.lock().expect(
+            "tool plane 注册表不变量已破损 — 恢复会掩盖已破损的不变量，见 src/common/lock.rs",
+        );
 
         match method {
             "create" => {

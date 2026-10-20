@@ -11,6 +11,11 @@
 //! 2. **内容指纹 key**（等价路径）：`params + n_regs + body Debug 表示` 的
 //!    哈希 —— 不同 Arc 包裹同一函数体时命中同一 DAG。
 //!
+//! 两级表容量各为 `MAX_ENTRIES`，超出时**淘汰最久未用的一项**（LRU）。
+//! 此前是「超出即 `clear()` 整表清空」—— 工作集一旦超过 128，每插入一项
+//! 就丢掉全部 128 项，命中率崩到接近 0。MCP 长会话（`Interpreter` 会话级
+//! 存活，`vm/engine.rs` 的热路径每次工具调用都查缓存）必然踩到这个悬崖。
+//!
 //! v0.103 修复：此前只有指针 key，且明确写下「不同 Arc 包裹同一内容则各自
 //! 独立构建 — 内容相等性不在缓存契约内」。但项目内多处每轮新建
 //! `Arc::new((*body).clone())`（`h_call` plan 路径、`h_transaction`、
@@ -41,8 +46,92 @@ use super::MirFunction;
 use super::dag::{MirDag, dag_analyze};
 use super::optimize::dag_optimize;
 
-/// 缓存容量上限：超过则清空（防止长生命周期进程无限增长）。
+/// 缓存容量上限：超过则淘汰最久未用的一项（防止长生命周期进程无限增长）。
 const MAX_ENTRIES: usize = 128;
+
+/// 带容量上限的映射，淘汰**最久未用**的一项。
+///
+/// **不使用 `runtime::types::LruCache`**：它的 key 是 `String`，且刷新访问
+/// 顺序用的是 `order.iter().position()`（线性扫描）。本缓存的 key 是指针
+/// 整数 / 内容哈希，复用它就得为每次查找 `to_string()` 一次分配 —— 那
+/// 是**每次 DAG 查找**的热路径，代价比它省下的还大。
+///
+/// 用「递增 tick + 淘汰时取最小」而非侵入式链表：淘汰只在**超出容量时**
+/// 发生，每次 O(cap)，cap=128 时可忽略；换���不引入任何链表状态机
+/// （那类代码的 bug 率远高于它省下的常数）。
+struct LruMap<K, V> {
+    map: HashMap<K, (u64, V)>,
+    /// 单调递增的访问时戳，存活条目的 tick 互不相同。
+    tick: u64,
+    cap: usize,
+}
+
+impl<K: std::hash::Hash + Eq + Copy, V: Clone> LruMap<K, V> {
+    fn new(cap: usize) -> Self {
+        Self {
+            map: HashMap::new(),
+            tick: 0,
+            cap,
+        }
+    }
+
+    /// 命中时刷新时戳（这正是 LRU 语义与普通 HashMap 的唯一差别）。
+    fn get(&mut self, key: &K) -> Option<V> {
+        let tick = self.tick;
+        self.tick += 1;
+        match self.map.get_mut(key) {
+            Some(slot) => {
+                slot.0 = tick;
+                Some(slot.1.clone())
+            }
+            None => None,
+        }
+    }
+
+    /// 插入或更新；超出容量时淘汰时戳最小的一项。
+    fn put(&mut self, key: K, value: V) {
+        // cap == 0 的语义只能是「不缓存」—— 与 LruCache D410 同一条：
+        // 淘汰判据在此之前成立，而此刻无可淘汰项。
+        if self.cap == 0 {
+            return;
+        }
+        let tick = self.tick;
+        self.tick += 1;
+        if !self.map.contains_key(&key)
+            && self.map.len() >= self.cap
+            && let Some(oldest) = self
+                .map
+                .iter()
+                .min_by_key(|(_, (t, _))| *t)
+                .map(|(k, _)| *k)
+        {
+            self.map.remove(&oldest);
+        }
+        self.map.insert(key, (tick, value));
+    }
+
+    fn len(&self) -> usize {
+        self.map.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.map.is_empty()
+    }
+
+    fn clear(&mut self) {
+        self.map.clear();
+    }
+}
+
+impl<K: std::hash::Hash + Eq + Copy, V: Clone> Clone for LruMap<K, V> {
+    fn clone(&self) -> Self {
+        Self {
+            map: self.map.clone(),
+            tick: self.tick,
+            cap: self.cap,
+        }
+    }
+}
 
 /// `MirFunction` → 优化后 `MirDag` 的缓存。
 /// 缓存项持有 func 强引用（见模块注释，v0.75.11 指针复用修复）。
@@ -52,24 +141,27 @@ type DagCacheEntry = (Arc<MirFunction>, Arc<MirDag>);
 #[derive(Clone)]
 pub struct DagCache {
     /// 指针 key（快路径）：同一 `Arc` 直接命中，O(1)，无内容哈希开销。
-    entries: HashMap<usize, DagCacheEntry>,
+    entries: LruMap<usize, DagCacheEntry>,
     /// 内容指纹 key（等价路径）：不同 `Arc` 包裹同一函数体时命中同一 DAG。
     ///
     /// **v0.103 修复**：此前只有指针 key，而多处调用方每轮新建
     /// `Arc::new((*body).clone())`（`h_call`/`run_isolated`/`Worker` 执行路径
-    /// 等）—— 指针每轮不同 → 每轮都重建 DAG，且 `MAX_ENTRIES` 反复触发
-    /// `clear()` 抖动。worker 内 task 含大循环时表现为**卡死**（实测 n=500
-    /// 即不返回），顺序路径因复用同一 `Arc` 而掩盖了该缺陷。
-    /// 内容 key 使缓存契约与调用方模式匹配（模块注释原写的「不同 Arc 各自
-    /// 独立构建」是设计缺陷，非契约）。
-    content_index: HashMap<u64, Arc<MirDag>>,
+    /// 等）—— 指针每轮不同 → 每轮都重建 DAG。worker 内 task 含大循环时
+    /// 表现为**卡死**（实测 n=500 即不返回），顺序路径因复用同一 `Arc`
+    /// 而掩盖了该缺陷。内容 key 使缓存契约与调用方模式匹配（模块注释原写的
+    /// 「不同 Arc 各自独立构建」是设计缺陷，非契约）。
+    ///
+    /// 本表此前超出 `MAX_ENTRIES` 走的是 `clear()`（整表清空），内容 key
+    /// 只把「每轮重建」降级成「每轮重建 + 周期性全丢」，**工作集 >128 时
+    /// 命中率仍然崩掉**。现改为 LRU 逐项淘汰。
+    content_index: LruMap<u64, Arc<MirDag>>,
 }
 
 impl DagCache {
     pub fn new() -> Self {
         Self {
-            entries: HashMap::new(),
-            content_index: HashMap::new(),
+            entries: LruMap::new(MAX_ENTRIES),
+            content_index: LruMap::new(MAX_ENTRIES),
         }
     }
 
@@ -102,30 +194,19 @@ impl DagCache {
         // 快路径：同一 Arc（指针）直接命中
         let ptr_key = Arc::as_ptr(func_arc) as usize;
         if let Some((_, dag)) = self.entries.get(&ptr_key) {
-            return dag.clone();
+            return dag;
         }
         // 等价路径：不同 Arc 同内容命中内容缓存
         let ckey = Self::content_key(func_arc);
         if let Some(dag) = self.content_index.get(&ckey) {
             // 回填指针 key，后续同 Arc 走快路径
-            self.entries
-                .insert(ptr_key, (func_arc.clone(), dag.clone()));
-            return dag.clone();
+            self.entries.put(ptr_key, (func_arc.clone(), dag.clone()));
+            return dag;
         }
         let dag = Self::build(func_arc);
-        // 容量上限：先清指针表（廉价可重建），内容表保留（价值更高）。
-        // 此前单表满即 clear 全部 —— 循环内新 Arc 每轮触发清空，缓存
-        // 命中率归零是 worker 卡死的直接成因。
-        if self.entries.len() >= MAX_ENTRIES {
-            self.entries.clear();
-        }
-        if self.content_index.len() >= MAX_ENTRIES {
-            self.content_index.clear();
-        }
         // v0.75.11: 持有 func 强引用 — key 指针永不复用（同指针必然同内容）。
-        self.entries
-            .insert(ptr_key, (func_arc.clone(), dag.clone()));
-        self.content_index.insert(ckey, dag.clone());
+        self.entries.put(ptr_key, (func_arc.clone(), dag.clone()));
+        self.content_index.put(ckey, dag.clone());
         dag
     }
 
@@ -228,6 +309,84 @@ mod tests {
         let _ = cloned.get_or_build(&f2);
         assert_eq!(cloned.len(), 2);
         assert_eq!(cache.len(), 1);
+    }
+
+    /// 容量上限改为**淘汰最久未用**后的回归。
+    ///
+    /// 修前是 `if len >= MAX { clear() }` —— 超出容量就把**整张表**清空。
+    /// 于是任何工作集 >128 的调用方（模块注释记录的 n=500 卡死就是这个）
+    /// 每插入一项就丢掉全部 128 项，命中率崩到接近 0；worker 内含大循环的
+    /// task 直接表现为「不返回」。
+    ///
+    /// 修后超出容量只淘汰**一项**，且 len 恒等于 cap。
+    #[test]
+    fn exceeding_capacity_evicts_one_entry_instead_of_clearing() {
+        let mut m: LruMap<usize, u32> = LruMap::new(4);
+        for k in 0..4u32 {
+            m.put(k as usize, k);
+        }
+        assert_eq!(m.len(), 4);
+        m.put(99, 99);
+        assert_eq!(
+            m.len(),
+            4,
+            "超出容量后必须只淘汰一项；清空会让 len 归零（修前行为）"
+        );
+    }
+
+    /// 淘汰的必须是**最久未用**的那一项，而不是插入顺序里的第一项。
+    ///
+    /// 这条才区分「真 LRU」与「FIFO / 随便挑一项」：命中会刷新时戳，
+    /// 所以刚被读过的 key 不该是下一个被淘汰的。
+    #[test]
+    fn eviction_targets_the_least_recently_used_entry() {
+        let mut m: LruMap<usize, u32> = LruMap::new(3);
+        m.put(1, 1);
+        m.put(2, 2);
+        m.put(3, 3);
+        // 触碰 1 ⇒ 它成为最新，2/3 变旧
+        assert_eq!(m.get(&1), Some(1));
+        m.put(4, 4);
+        assert!(m.get(&1).is_some(), "刚访问过的 1 不该被淘汰");
+        assert!(m.get(&4).is_some());
+        // 2 与 3 谁更旧取决于触碰顺序：触碰 1 之后 2 是最旧的
+        assert!(
+            m.get(&2).is_none() || m.get(&3).is_none(),
+            "必须至少淘汰一项最旧条目"
+        );
+    }
+
+    /// cap == 0 的语义只能是「不缓存」（与 `LruCache` D410 同一条判据：
+    /// 淘汰判据在此之前成立，而此刻无可淘汰项）。
+    #[test]
+    fn zero_capacity_caches_nothing() {
+        let mut m: LruMap<usize, u32> = LruMap::new(0);
+        m.put(1, 1);
+        assert_eq!(m.len(), 0, "cap=0 存进任何一条都违反本类型自己的契约");
+        assert!(m.get(&1).is_none());
+    }
+
+    /// DagCache 层：内容表超出容量后仍保有 cap 项，而不是被清空。
+    ///
+    /// 直接用 `clear()` 版本时，这个断言在第 129 个不同函数体处就会炸。
+    #[test]
+    fn dag_cache_stays_populated_beyond_capacity() {
+        let mut cache = DagCache::new();
+        // 造 MAX_ENTRIES + 8 个内容互异的函数体
+        for i in 0..(MAX_ENTRIES + 8) {
+            let f = sample_func(&format!(
+                "let x = {}
+print(x)
+",
+                i * 7 + 1
+            ));
+            let _ = cache.get_or_build(&f);
+        }
+        assert_eq!(
+            cache.content_len(),
+            MAX_ENTRIES,
+            "超出容量后内容表应保持在 cap（修前此处会被 clear 成 0）"
+        );
     }
 
     /// 缓存 DAG 与直建 DAG 等价执行（tier0 管线守卫）。

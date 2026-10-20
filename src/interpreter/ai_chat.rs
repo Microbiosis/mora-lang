@@ -4,6 +4,7 @@
 //!       real_ai_chat_inner, real_ai_chat_with_tools, run_critic, run_agent
 
 use super::*;
+use crate::common::lock::lock_or_recover;
 use std::time::Duration;
 
 impl Interpreter {
@@ -478,13 +479,10 @@ impl Interpreter {
             // v0.24: 自适应 draft 模型选择
             // 检查 draft 模型的历史成功率
             // v0.52 ADR-001: draft_model_stats 迁到 self.ai
-            let should_use_draft = if let Some((success, total)) = self
-                .ai
-                .draft_model_stats
-                .lock()
-                .expect("draft_model_stats poisoned")
-                .get(draft_model.as_str())
-                .copied()
+            let should_use_draft = if let Some((success, total)) =
+                lock_or_recover(&self.ai.draft_model_stats, "ai_draft_model_stats")
+                    .get(draft_model.as_str())
+                    .copied()
             {
                 if total >= 10 {
                     // 有足够历史数据，根据成功率决定
@@ -521,11 +519,8 @@ impl Interpreter {
 
                 // v0.49.0 (A6): 单锁内 update stats (was HashMap entry+stats.x)
                 // v0.52 ADR-001: draft_model_stats 迁到 self.ai
-                let mut stats_map = self
-                    .ai
-                    .draft_model_stats
-                    .lock()
-                    .expect("draft_model_stats poisoned");
+                let mut stats_map =
+                    lock_or_recover(&self.ai.draft_model_stats, "ai_draft_model_stats");
                 let entry = stats_map.entry(draft_model.clone()).or_insert((0, 0));
                 entry.1 += 1; // total += 1
                 if is_verified {
@@ -573,14 +568,7 @@ impl Interpreter {
         // v0.22: AI 调用内联缓存
         let cache_key = format!("{}:{:?}", model, messages);
         // v0.49.0 (C1): LRU cache (was unbounded HashMap)
-        // v0.52: lock 跨 self.infra.ai_cache，poison 概率极低 expect
-        if let Some(cached) = self
-            .infra
-            .ai_cache
-            .lock()
-            .expect("ai_cache poisoned")
-            .get(&cache_key)
-        {
+        if let Some(cached) = lock_or_recover(&self.infra.ai_cache, "ai_cache").get(&cache_key) {
             return Ok(Value::String(cached));
         }
 
@@ -682,12 +670,8 @@ impl Interpreter {
                                 .unwrap_or(Value::String(text.clone()));
                             // v0.22: 缓存 AI 调用结果
                             // v0.49.0 (C1): LRU put (was unbounded HashMap insert)
-                            // v0.52: lock expect (poison 概率极低)
                             if let Value::String(ref s) = result {
-                                self.infra
-                                    .ai_cache
-                                    .lock()
-                                    .expect("ai_cache poisoned")
+                                lock_or_recover(&self.infra.ai_cache, "ai_cache")
                                     .put(cache_key.to_string(), s.clone());
                             }
                             return Ok(result);

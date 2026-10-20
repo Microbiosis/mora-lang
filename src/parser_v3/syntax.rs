@@ -970,3 +970,166 @@ impl ParserV3 {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::lexer::Lexer;
+    use crate::parser_v3::ParserV3;
+    use crate::typeck::Type;
+
+    fn parser(src: &str) -> ParserV3 {
+        let tokens = Lexer::new(src).scan_tokens();
+        ParserV3::new(tokens, src)
+    }
+
+    use crate::mir::witness::WitnessPattern as Pat;
+
+    /// `parse_pattern` 的四种基本形态。
+    ///
+    /// 模式是 `match` arm 与 `let` 解构的共同基础，而 `emit_match_arm_w`
+    /// 首个动作就是调它 —— 它返回 `None` 时 arm 被判为畸形。
+    #[test]
+    fn parse_pattern_covers_wildcard_variable_and_literals() {
+        assert!(matches!(parser("_").parse_pattern(), Some(Pat::Wildcard)));
+        assert!(matches!(
+            parser("x").parse_pattern(),
+            Some(Pat::Variable(ref n)) if n == "x"
+        ));
+        assert!(matches!(
+            parser("42").parse_pattern(),
+            Some(Pat::Literal(_))
+        ));
+        assert!(matches!(
+            parser("\"s\"").parse_pattern(),
+            Some(Pat::Literal(_))
+        ));
+    }
+
+    /// rest 模式 `..name` 绑定新变量，裸 `..` 不绑定。
+    ///
+    /// 两者的区别直接决定 list 模式是「收集剩余元素」还是「丢弃剩余元素」。
+    #[test]
+    fn rest_pattern_binds_or_discards() {
+        assert!(
+            matches!(parser("..rest").parse_pattern(), Some(Pat::Variable(ref n)) if n == "rest"),
+            "`..name` 应绑定为具名变量"
+        );
+        assert!(
+            matches!(parser("..").parse_pattern(), Some(Pat::Wildcard)),
+            "裸 `..` 不绑定，应退化为通配"
+        );
+    }
+
+    /// 列表模式的元素数与 rest 绑定。
+    ///
+    /// `[a, b]` 无 rest、`[a, ..rest]` 捕获剩余元素 —— 这个区别直接决定
+    /// 匹配时是否收集尾部，配错会静默丢元素。
+    #[test]
+    fn list_patterns_carry_elements_and_optional_rest() {
+        match parser("[a, b]").parse_pattern() {
+            Some(Pat::ListVec {
+                ref elements,
+                ref rest,
+            }) => {
+                assert_eq!(elements.len(), 2);
+                assert!(rest.is_none(), "`[a, b]` 不应有 rest 绑定");
+            }
+            other => panic!("应为 ListVec，实得 {other:?}"),
+        }
+        match parser("[a, ..rest]").parse_pattern() {
+            Some(Pat::ListVec {
+                ref elements,
+                ref rest,
+            }) => {
+                assert_eq!(elements.len(), 1);
+                assert!(rest.is_some(), "`[a, ..rest]` 必须捕获 rest");
+            }
+            other => panic!("应为 ListVec，实得 {other:?}"),
+        }
+    }
+
+    /// 字典模式：条目是 `key: pattern`，`{..}` 表示忽略其余字段。
+    ///
+    /// `rest` 标志区分「必须恰好匹配这些键」与「允许多余键」，配错会让
+    /// 多余字段从静默通过变成误拒（或反之）。
+    #[test]
+    fn dict_patterns_distinguish_strict_from_rest() {
+        match parser("{a: 1, b: x}").parse_pattern() {
+            Some(Pat::Dict { ref required, rest }) => {
+                assert_eq!(required.len(), 2, "两个必填键");
+                assert!(!rest, "无 `..` ⇒ rest 为 false");
+            }
+            other => panic!("应为 Dict，实得 {other:?}"),
+        }
+        match parser("{a: 1, ..}").parse_pattern() {
+            Some(Pat::Dict { ref required, rest }) => {
+                assert_eq!(required.len(), 1);
+                assert!(rest, "`{{a: 1, ..}}` 必须置 rest");
+            }
+            other => panic!("应为 Dict，实得 {other:?}"),
+        }
+    }
+
+    /// 单一类型注解**不得**被包成 `Union(vec![T])` —— 单成员 union 会
+    /// 让 `subtype_of` / `unify` 多走一条匹配分支，且打印诊断时呈现为
+    /// 只有一个成员的花括号。
+    #[test]
+    fn single_type_annotation_is_not_wrapped_in_a_one_member_union() {
+        let ty = parser("int").parse_type_annotation().expect("int 应可解析");
+        assert_eq!(ty, Type::Int);
+        assert!(
+            !matches!(ty, Type::Union(_)),
+            "单类型不得包装成 Union：{ty:?}"
+        );
+    }
+
+    /// `|` 连接的多个类型必须合成真正的 `Union`。
+    #[test]
+    fn pipe_joined_annotations_form_a_union() {
+        let ty = parser("string | number")
+            .parse_type_annotation()
+            .expect("联合类型应可解析");
+        match &ty {
+            Type::Union(members) => assert_eq!(members.len(), 2, "两个成员：{ty:?}"),
+            other => panic!("应为 Union，实得 {other:?}"),
+        }
+    }
+
+    /// D64：`nil` 是**关键字 token**，走不到 `Identifier` 白名单分支。
+    ///
+    /// 修前白名单里的 `"nil" => Type::Nil` 是**不可达的死 arm**，
+    /// `let v: nil = nil` 直接报 "expected type annotation"，而 spec §3.1
+    /// 明确把 `nil` 列为正式类型，typeck 三处也都已成对支持 `Nil`。
+    #[test]
+    fn d64_nil_keyword_parses_as_a_type() {
+        assert_eq!(
+            parser("nil").parse_type_annotation(),
+            Some(Type::Nil),
+            "`nil` 关键字必须解析为 Type::Nil"
+        );
+        assert!(
+            ParserV3::compile("let v: nil = nil\nprint(v)\n").is_ok(),
+            "spec §3.1 把 `nil` 列为正式类型，端到端必须能编译"
+        );
+    }
+
+    /// `dyn Trait<...>` 泛型实参必须成对解析，缺 `>` 报错。
+    #[test]
+    fn dyn_trait_objects_parse_with_and_without_generics() {
+        let ty = parser("dyn Show")
+            .parse_type_annotation()
+            .expect("dyn Show");
+        assert!(matches!(ty, Type::TraitObject { .. }));
+
+        let ty = parser("dyn Show<number>").parse_type_annotation();
+        assert!(
+            matches!(ty, Some(Type::TraitObject { ref generics, .. }) if generics.len() == 1),
+            "泛型实参应被收进 TraitObject：{ty:?}"
+        );
+
+        assert!(
+            parser("dyn Show<number").parse_type_annotation().is_none(),
+            "缺 `>` 必须报错，不得当成合法注解放行"
+        );
+    }
+}

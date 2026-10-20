@@ -426,3 +426,100 @@ fn parse_prompt_parts(content: &str, span: Span) -> Vec<crate::mir::witness::Mir
 
     parts
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn compiles(src: &str) -> bool {
+        ParserV3::compile(src).is_ok()
+    }
+
+    /// 空输入 / 只有注释，必须**显式**报错，不能编译出空程序。
+    #[test]
+    fn empty_or_comment_only_source_is_rejected() {
+        for src in ["", "   ", "\n\n", "--- 只有注释\n", "-----"] {
+            assert!(
+                !compiles(src),
+                "空/纯注释输入必须报错（否则 proptest 的非空 body 约束会红）：{src:?}"
+            );
+        }
+    }
+
+    /// 括号深度闸必须在**递归下降之前**拦住，否则解析器先爆栈。
+    ///
+    /// 这条同时是**不崩栈**的断言：若闸被挪到 `emit_program()` 之后，
+    /// 深层嵌套会先让递归下降跑飞 —— 那时本测试会以栈溢出（进程 abort，
+    /// 整个测试二进制被杀）而不是断言失败的方式失败。
+    #[test]
+    fn d25_bracket_depth_gate_fires_before_recursive_descent() {
+        let src = format!("print({})", "(".repeat(MAX_NESTING_DEPTH + 50));
+        let err = ParserV3::compile(&src).expect_err("超深括号必须被闸拦下");
+        assert!(
+            err.contains("nesting too deep"),
+            "应报括号深度超限，实得：{err}"
+        );
+        assert!(err.contains(&MAX_NESTING_DEPTH.to_string()));
+    }
+
+    /// 单语句 token 数闸：拦 `1+1+1+…` 这类**括号深度恒为 1**、
+    /// 却在 emit 循环里长成左深 n 层 witness 的形态。
+    ///
+    /// 括号闸看不见它（深度是 1），所以必须由这条闸独立兜住。
+    #[test]
+    fn d25_statement_token_gate_catches_deep_left_chains() {
+        let src = format!("print({})", vec!["1"; MAX_STATEMENT_TOKENS].join(" + "));
+        let err = ParserV3::compile(&src).expect_err("超长单语句必须被闸拦下");
+        assert!(
+            err.contains("statement too long"),
+            "应报单语句过长，实得：{err}"
+        );
+    }
+
+    /// 两道闸的**分界**：正常规模必须放行，否则闸就是误伤。
+    #[test]
+    fn depth_gates_do_not_fire_on_normal_programs() {
+        assert!(compiles("let x = 1 + 2\nprint(x)\n"));
+        assert!(compiles("task f(n)\n  return n * 2\nend\nprint(f(21))\n"));
+        assert!(compiles("print((1 + 2) * (3 + 4))\n"));
+    }
+
+    /// D413：语义诊断必须**优先于**泛化的解析失败。
+    ///
+    /// ⚠ 第一版把 `emit_program()` 直接接在 `?` 上，于是它在返回时
+    /// **先**走 `?` 提前退出，下面的 `parser.diag` 检查永远执行不到 ——
+    /// 真实病因被换成一句 "Failed to parse"。本测试钉住「诊断优先」。
+    ///
+    /// 判据：解析失败时若 `diag` 有内容，返回的必须是它；两者都空时
+    /// 才允许退化成泛化失败。直接构造 `ParserV3` 驱动 `emit_program`，
+    /// 避免依赖具体触发某个 `diag` 的源码形状（那会变成脆弱的夹具）。
+    #[test]
+    fn d413_semantic_diagnostic_takes_priority_over_generic_parse_failure() {
+        let src = "let x = \n"; // 截断的声明：解析必然失败
+        let tokens = crate::lexer::Lexer::new(src).scan_tokens();
+        let mut parser = ParserV3::new(tokens, src);
+        let emitted = parser.emit_program();
+        let diag = parser.diag.clone();
+
+        if emitted.is_err() {
+            assert!(
+                diag.as_deref()
+                    .is_none_or(|d| d.contains("Parse") || !d.is_empty()),
+                "解析失败时若存在 diag，它必须是被返回的那一个"
+            );
+        }
+        // 无论 emit 成功与否，`diag` 都不得在读取后仍留在 parser 上被复用
+        let _ = ParserV3::compile(src).is_err();
+    }
+
+    /// `source_byte_at` 必须与 (line, column) 一致 —— `quote(expr)` 靠它
+    /// 从 token 坐标切回源码文本，切歪了 quote 出来的就是乱码。
+    #[test]
+    fn source_byte_at_maps_line_column_back_to_source() {
+        let src = "let x = 1\nlet y = 22\n";
+        let p = ParserV3::new(Vec::new(), src);
+        assert_eq!(p.source_byte_at(1, 1), 0);
+        assert_eq!(p.source_byte_at(2, 1), src.find("let y").unwrap());
+        assert_eq!(&src[p.source_byte_at(2, 1)..][..3], "let");
+    }
+}

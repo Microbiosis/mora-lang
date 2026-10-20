@@ -118,7 +118,7 @@ pub struct DagExecMemo {
 /// 对堆值取身份（地址唯一），仅对长字符串/大整数用截断哈希并在其后附
 /// 长度，使碰撞概率在实际使用中可忽略；`reuse` 命中后仍会返回上次输出，
 /// 而 memo 的语义前提是「纯节点 + 输入决定输出」，输入身份相同即输出相同。
-#[derive(PartialEq, Eq)]
+#[derive(PartialEq, Eq, Clone, Debug)]
 enum InputFp {
     Nil,
     Int(i64),
@@ -128,26 +128,48 @@ enum InputFp {
     /// 字符串：长度 + 内容哈希（O(1) 于长度，`DefaultHasher` 对 &str 是 O(len)，
     /// 故只喂前 32 字节 + 长度 —— 长字符串下远快于全量深比较）。
     Str(usize, u64),
-    /// 堆值身份（Arc 指针 / 列表地址）。
+    /// 堆值身份（列表 chunk 地址）。
     Heap(usize),
+    /// 大整数的**内容**哈希（`BigInt` 无 `id()`，且深比较代价与位数成正比）。
+    BigInt(u64),
 }
 
-fn value_fp(v: &Value) -> InputFp {
+/// 计算值指纹。`None` = **这个值没有可靠的身份**，此时调用方必须放弃
+/// 记忆化（重算），绝不能拿别的东西凑一个指纹。
+///
+/// `None` 不是失败降级，而是**安全方向**：指纹只漏一次优化（重算），
+/// 错一次就是静默错值。本函数此前没有 `None` 这一档，于是剩余分支被迫
+/// 兜底成「地址」——而调用点是 `value_fp(&regs[*r])`，`&regs[*r]` 的
+/// 地址只是 `r` 的函数，**与值本身无关**：同一个槽位先后装下两个不同
+/// 的闭包，指纹一模一样，memo 命中并返回上一次的旧值。
+///
+/// ⚠ 不要为了「省一次重算」给下面这些分支补一个看似合理的哈希：
+/// `EnvRef` 是 `Box<Environment>`（值语义），克隆会换地址；裸地址还
+/// 有 ABA 问题 —— 原闭包被 drop、堆地址被复用给另一个内容不同的捕获，
+/// 指纹仍相同。要真正可用，得给闭包稳定 id（如 `EnvRef` 改 `Arc` +
+/// 全局递增 id），那是独立的一笔改动，不在这里偷偷做。
+fn value_fp(v: &Value) -> Option<InputFp> {
     use std::hash::{Hash, Hasher};
     match v {
-        Value::Nil => InputFp::Nil,
-        Value::Int(i) => InputFp::Int(*i),
-        Value::Float(f) => InputFp::Float(f.to_bits()),
-        Value::Bool(b) => InputFp::Bool(*b),
-        Value::Char(c) => InputFp::Char(*c as u32),
+        Value::Nil => Some(InputFp::Nil),
+        Value::Int(i) => Some(InputFp::Int(*i)),
+        Value::Float(f) => Some(InputFp::Float(f.to_bits())),
+        Value::Bool(b) => Some(InputFp::Bool(*b)),
+        Value::Char(c) => Some(InputFp::Char(*c as u32)),
+        Value::BigInt(b) => {
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            b.hash(&mut h);
+            Some(InputFp::BigInt(h.finish()))
+        }
         Value::String(s) => {
             let mut h = std::collections::hash_map::DefaultHasher::new();
             let head = &s.as_bytes()[..s.len().min(32)];
             head.hash(&mut h);
-            InputFp::Str(s.len(), h.finish())
+            Some(InputFp::Str(s.len(), h.finish()))
         }
-        // 堆值：地址身份（列表/字典/闭包/关系等在循环中不可变，同值同址）
-        Value::List(l) => InputFp::Heap(l.id()),
+        // 列表：`id()` 是每个实例独有的 chunk 堆地址（见 `list.rs::id`），
+        // 是真身份，不是「值恰好在哪」。
+        Value::List(l) => Some(InputFp::Heap(l.id())),
         Value::Dict(d) => {
             // v0.104.6 修复：此前是 `InputFp::Str(d.len(), 0)` —— **只记长度**。
             //
@@ -178,33 +200,55 @@ fn value_fp(v: &Value) -> InputFp {
             //
             // 代价：dict 指纹从 O(1) 变 O(k)（k = 键数）。但 dict 作为纯节点
             // 输入极罕见（这正是原注释的判断），正确性优先于这点常数。
-            let mut h = std::collections::hash_map::DefaultHasher::new();
-            d.len().hash(&mut h);
+            // 聚合必须**顺序无关**：`HashMap` 的迭代序由 `RandomState`
+            // 逐进程随机决定，若聚合与顺序绑定，则同一份数据在不同进程里
+            // 得到不同指纹，记忆化命中率随进程变化（实测：同内容不同
+            // 插入序得到 2890978248306056892 / 15321576848528837577）。
+            //
+            // 做法：每项哈希进独立 `item`，再用**异或**聚到 `acc`。
+            // 异或满足交换律与结合律，故与迭代序无关；`DefaultHasher`
+            // 逐字节喂入，`write_u64` 之类的顺序聚合**不满足**，不能替代。
+            let mut acc: u64 = 0;
             for (k, v) in d {
-                k.hash(&mut h);
+                // 嵌套值若没有可靠指纹，整个 dict 的指纹就不可信 ——
+                // 少算一个键的哈希与「两个不同 dict 同哈希」无法区分，
+                // 而后者正是静默错值。故直接放弃记忆化。
+                let fp = value_fp(v)?;
                 let mut item = std::collections::hash_map::DefaultHasher::new();
-                std::mem::discriminant(&value_fp(v)).hash(&mut item);
-                match value_fp(v) {
+                k.hash(&mut item);
+                std::mem::discriminant(&fp).hash(&mut item);
+                match fp {
                     InputFp::Nil => 0u64.hash(&mut item),
                     InputFp::Int(i) => i.hash(&mut item),
                     InputFp::Float(b) => b.hash(&mut item),
                     InputFp::Bool(b) => b.hash(&mut item),
                     InputFp::Char(c) => c.hash(&mut item),
+                    InputFp::BigInt(hsh) => hsh.hash(&mut item),
                     InputFp::Str(l, hsh) => {
                         l.hash(&mut item);
                         hsh.hash(&mut item);
                     }
                     InputFp::Heap(p) => p.hash(&mut item),
                 }
-                // 异或 → 与 HashMap 的迭代顺序无关
-                h.write_u64(item.finish());
+                acc ^= item.finish();
             }
-            InputFp::Str(d.len(), h.finish())
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            d.len().hash(&mut h);
+            acc.hash(&mut h);
+            Some(InputFp::Str(d.len(), h.finish()))
         }
-        Value::Closure { .. } | Value::Task { .. } | Value::Macro { .. } => {
-            InputFp::Heap(v as *const Value as usize)
-        }
-        _ => InputFp::Heap(v as *const Value as usize),
+        // 闭包 / 任务 / 宏：没有可靠身份 ⇒ 不记忆化（见 `value_fp` 文档）。
+        Value::Closure { .. } | Value::Task { .. } | Value::Macro { .. } => None,
+        // 其余全部变体（Tool/Builtin/Conversation/Stream/Agent/Router/
+        // HttpRequest/McpServer/TraitObject/Compose/Partial/Atom/
+        // PromptSection/Document/Curry/Cons/Code/TeaApp/TeaCmd/TeaMsg/
+        // Relation/Goal/LogicVar/…）：同样无可靠身份。
+        //
+        // 此处**不能**退化成「变体 tag + 变体 discriminant」：那样
+        // 两个不同的 `Tool` 会拿到同一个指纹，缺陷原封不动地活下来。
+        // 新增 `Value` 变体时也无需改动本文件 —— 落在 `_` 里即自动
+        // 走保守路径，这正是把 `_` 留成 `None` 而不是兜底成地址的理由。
+        _ => None,
     }
 }
 
@@ -232,8 +276,8 @@ impl DagExecMemo {
     }
 
     /// 记录本次执行的输入指纹 + 输出，供下次比较/复用。
-    fn record(&mut self, node_id: usize, inputs: Vec<InputFp>, output: Value) {
-        self.last_inputs.insert(node_id, inputs);
+    fn record(&mut self, node_id: usize, inputs: &[InputFp], output: Value) {
+        self.last_inputs.insert(node_id, inputs.to_vec());
         self.last_outputs.insert(node_id, output);
         self.executed_nodes += 1;
     }
@@ -543,22 +587,22 @@ pub fn run_dag_with_signal_memo(
                     // Compute 的 input_regs 存于节点；Effect 无该字段，
                     // 从 inst.input_regs() 推导（同一输入集合）。
                     let pure = is_memoizable_pure(inst);
-                    let inputs: Vec<InputFp> = if pure {
-                        match &dag.nodes[node_id] {
-                            MirDagNode::Compute { input_regs, .. } => {
-                                input_regs.iter().map(|r| value_fp(&regs[*r])).collect()
+                    // `None` = 某个输入没有可靠指纹 ⇒ 本节点不记忆化。
+                    let inputs: Option<Vec<InputFp>> = if pure {
+                        let owned;
+                        let input_regs = match &dag.nodes[node_id] {
+                            MirDagNode::Compute { input_regs, .. } => input_regs,
+                            MirDagNode::Effect { inst } => {
+                                owned = inst.input_regs();
+                                &owned
                             }
-                            MirDagNode::Effect { inst } => inst
-                                .input_regs()
-                                .iter()
-                                .map(|r| value_fp(&regs[*r]))
-                                .collect(),
-                            _ => Vec::new(),
-                        }
+                            _ => &[][..],
+                        };
+                        input_regs.iter().map(|r| value_fp(&regs[*r])).collect()
                     } else {
-                        Vec::new()
+                        None
                     };
-                    if pure && let Some(cached) = memo.reuse(node_id, &inputs) {
+                    if let Some(cached) = inputs.as_ref().and_then(|v| memo.reuse(node_id, v)) {
                         if let Some(d) = inst.dst() {
                             regs[d] = cached;
                             reg_ready[d] = true;
@@ -572,9 +616,9 @@ pub fn run_dag_with_signal_memo(
                         handlers::dispatch(inst, &mut regs, interp, env, &task_registry, effects)?;
                     if pure {
                         if let Some(d) = inst.dst() {
-                            memo.record(node_id, inputs, regs[d].clone());
+                            memo.record(node_id, inputs.as_deref().unwrap_or(&[]), regs[d].clone());
                         } else {
-                            memo.record(node_id, inputs, Value::Nil);
+                            memo.record(node_id, inputs.as_deref().unwrap_or(&[]), Value::Nil);
                         }
                     }
                     // v0.104.6 D35：用 `written_reg()` 而非 `dst()` —— `Handle`
@@ -848,22 +892,22 @@ fn step_threaded_node(
         MirDagNode::Compute { inst, .. } | MirDagNode::Effect { inst } => {
             // memo：与波次路径完全一致（纯节点算指纹、复用未变输入的结果）。
             let pure = is_memoizable_pure(inst);
-            let inputs: Vec<InputFp> = if pure {
-                match &dag.nodes[node_id] {
-                    MirDagNode::Compute { input_regs, .. } => {
-                        input_regs.iter().map(|r| value_fp(&regs[*r])).collect()
+            // 与波次路径同一套规则：`None` ⇒ 不记忆化。
+            let inputs: Option<Vec<InputFp>> = if pure {
+                let owned;
+                let input_regs = match &dag.nodes[node_id] {
+                    MirDagNode::Compute { input_regs, .. } => input_regs,
+                    MirDagNode::Effect { inst } => {
+                        owned = inst.input_regs();
+                        &owned
                     }
-                    MirDagNode::Effect { inst } => inst
-                        .input_regs()
-                        .iter()
-                        .map(|r| value_fp(&regs[*r]))
-                        .collect(),
-                    _ => Vec::new(),
-                }
+                    _ => &[][..],
+                };
+                input_regs.iter().map(|r| value_fp(&regs[*r])).collect()
             } else {
-                Vec::new()
+                None
             };
-            if pure && let Some(cached) = memo.reuse(node_id, &inputs) {
+            if let Some(cached) = inputs.as_ref().and_then(|v| memo.reuse(node_id, v)) {
                 if let Some(d) = inst.dst() {
                     regs[d] = cached;
                     reg_ready[d] = true;
@@ -874,9 +918,9 @@ fn step_threaded_node(
             let flow = handlers::dispatch(inst, regs, interp, env, task_registry, effects)?;
             if pure {
                 if let Some(d) = inst.dst() {
-                    memo.record(node_id, inputs, regs[d].clone());
+                    memo.record(node_id, inputs.as_deref().unwrap_or(&[]), regs[d].clone());
                 } else {
-                    memo.record(node_id, inputs, Value::Nil);
+                    memo.record(node_id, inputs.as_deref().unwrap_or(&[]), Value::Nil);
                 }
             }
             if let Some(d) = inst.written_reg() {
@@ -1017,4 +1061,107 @@ fn is_control_edge(kind: &EdgeKind) -> bool {
         kind,
         EdgeKind::Control | EdgeKind::ControlIfTrue | EdgeKind::ControlIfFalse | EdgeKind::BackEdge
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::value::BuiltinKind;
+    use crate::value::list::List;
+
+    /// 回归：`value_fp` 曾用 `v as *const Value as usize` 兜底，而调用点是
+    /// `value_fp(&regs[*r])` —— 该地址只是 `&regs.base + r * size_of::<Value>()`，
+    /// **只由寄存器下标决定，与装在里面的值无关**。同一个槽位先后装下两个
+    /// 不同的值，指纹相同 → memo 命中 → 返回上一次的旧值（静默错值）。
+    ///
+    /// 本测试直接复刻那个失效前提（同一 `Vec` 的同一槽位被反复覆写），
+    /// 修前 `first == second`（同址），修后二者皆为 `None`（拒绝记忆化）。
+    #[test]
+    fn opaque_values_decline_fingerprinting_rather_than_alias_by_address() {
+        let mut slot = [Value::Nil];
+
+        slot[0] = Value::Builtin(BuiltinKind::Print);
+        let first = value_fp(&slot[0]);
+
+        slot[0] = Value::Builtin(BuiltinKind::Len);
+        let second = value_fp(&slot[0]);
+
+        assert!(
+            first.is_none() && second.is_none(),
+            "两个不同的 Builtin 同址 ⇒ 指纹不可区分；\
+             退化成「变体 tag」也只能区分变体不能区分取值，\
+             故必须拒绝记忆化。实测 first={first:?} second={second:?}"
+        );
+    }
+
+    /// 反向守卫：有真实身份的变体，指纹必须**随值变**，而不是随槽位不变。
+    ///
+    /// 若有人日后把 `_` 分支从 `None` 改回地址兜底，本测试立刻失败。
+    #[test]
+    fn fingerprinted_values_track_the_value_not_the_slot() {
+        let mut slot = [Value::Nil];
+
+        slot[0] = Value::List(List::from_vec(vec![Value::Int(1)]));
+        let first = value_fp(&slot[0]);
+
+        slot[0] = Value::List(List::from_vec(vec![Value::Int(2)]));
+        let second = value_fp(&slot[0]);
+
+        assert_ne!(first, second, "同一槽位上的两个不同列表必须得到不同指纹");
+        assert!(
+            first.is_some() && second.is_some(),
+            "列表有真实身份，应参与记忆化"
+        );
+    }
+
+    /// BigInt 曾落在 `_` 兜底里 ⇒ 同址的两个不同大整数指纹相同。修后按内容哈希。
+    #[test]
+    fn bigint_fingerprint_follows_contents_not_slot() {
+        let mut slot = [Value::Nil];
+
+        slot[0] = Value::BigInt(num_bigint::BigInt::from(11));
+        let first = value_fp(&slot[0]);
+
+        slot[0] = Value::BigInt(num_bigint::BigInt::from(22));
+        let second = value_fp(&slot[0]);
+
+        assert_ne!(
+            first, second,
+            "同一槽位上的两个不同 BigInt 必须得到不同指纹"
+        );
+    }
+
+    /// dict 内嵌不可靠的值 ⇒ 整个 dict 的指纹不可信 ⇒ 放弃记忆化。
+    /// 少算一个键与「两个不同 dict 同哈希」无法区分，只能往安全方向倒。
+    #[test]
+    fn dict_containing_an_opaque_value_declines_fingerprinting() {
+        let mut d = std::collections::HashMap::new();
+        d.insert("k".to_string(), Value::Int(1));
+        assert!(
+            value_fp(&Value::Dict(d.clone())).is_some(),
+            "纯标量 dict 可记忆化"
+        );
+
+        d.insert("f".to_string(), Value::Builtin(BuiltinKind::Print));
+        assert!(
+            value_fp(&Value::Dict(d)).is_none(),
+            "含不可靠值的 dict 必须拒绝记忆化"
+        );
+    }
+
+    /// dict 的内容哈希与 `HashMap` 迭代顺序无关（异或聚合），否则同一份
+    /// 数据在不同进程里会得到不同指纹，记忆化命中率随进程变化。
+    #[test]
+    fn dict_fingerprint_is_iteration_order_independent() {
+        let build = |pairs: Vec<(&str, i64)>| {
+            let mut m = std::collections::HashMap::new();
+            for (k, v) in pairs {
+                m.insert(k.to_string(), Value::Int(v));
+            }
+            Value::Dict(m)
+        };
+        let a = build(vec![("x", 1), ("y", 2), ("z", 3)]);
+        let b = build(vec![("z", 3), ("y", 2), ("x", 1)]);
+        assert_eq!(value_fp(&a), value_fp(&b));
+    }
 }

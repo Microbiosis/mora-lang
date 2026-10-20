@@ -19,6 +19,73 @@ All notable changes to Mora will be documented in this file.
 - **`Int` 语义**：算术与比较统一为**精确 i64**（overflow 报 `MoraError`）。
   2^53 之外的 `Int` 运算结果会变（此前静默丢最低位），`Int ⊗ Float` 超界改报错。
 
+### D469：`rustls` 升级修掉 TLS 1.3 握手跨加密层级漏洞（dependabot #1）
+
+GitHub 对默认分支报的 1 条 moderate 依赖告警：**[GHSA-2mjx-qc3c-rqvc]**
+（RUSTSEC-2026-0285，CVSS 5.3），`rustls` 0.23.13 ~ 0.23.44 受影响，
+修复版本 **0.23.45**。
+
+#### 漏洞是什么
+
+rustls 在处理 TLS 1.3 握手时，`Deframer::aligned` 只检查**消息是否完整**，
+不检查**是否跨越密钥切换边界** —— 违反 RFC 8446 §5.1：
+
+> Handshake messages MUST NOT span key changes.
+
+后果：on-path 攻击者可以把**本应加密**的握手消息（如 `EncryptedExtensions`）
+与 `ServerHello` 打包进同一个 record 明文发出，rustls 仍会接受该连接。
+
+**边界要说准**：握手 transcript 仍被认证 ⇒ 攻击者**无法**篡改或完成
+一次握手，也拿不到会话密钥。真实损失是「本该在加密层传输的消息以明文
+过网」——机密性受损、且实现行为偏离 RFC（其他实现
+Botan / OpenSSL / BoringSSL / Go / wolfSSL **都拒绝**这个协议流）。
+
+该缺陷 **2024-09 引入，潜伏近两年**，由一套新的 TLS/DTLS 测试套件发现
+（灵感来自 Go 的 CVE-2025-61730）。
+
+#### 这条依赖在 Mora 的哪条路径上
+
+`rustls` 是**传递依赖**，链路是：
+
+```text
+mora → ureq 3.4.0 → rustls 0.23.40
+```
+
+而 `ureq` 是 Mora **所有出站 HTTPS** 的唯一通道：
+
+- `src/interpreter/ai_chat.rs:217` —— `ai.chat` / `ai.stream` 的 HTTP 调用
+- `src/compress/text.rs:185` —— Chat Completions API 调用
+
+⇒ 该漏洞**就在 AI 调用的链路上**，不是纯理论风险。
+
+#### 修法
+
+`cargo update -p rustls --precise 0.23.45`，连带
+`rustls-webpki 0.103.13 → 0.103.16`。diff 极小：
+
+```diff
+ name = "rustls"
+-version = "0.23.40"
++version = "0.23.45"
+ name = "rustls-webpki"
+-version = "0.103.13"
++version = "0.103.16"
+```
+
+**零新增依赖、零版本约束变化**（ureq 3.4.0 本就允许该版本，cargo 未报冲突）、
+**零 API 破坏**（Mora 全仓**不直接使用 rustls API**，仅经 `ureq` 使用；
+`grep rustls src/` 为空 ⇒ rustls 内部如何变都影响不到 Mora 的代码）。
+
+**刻意不做全量 `cargo update`**：那会连带升级 93 个包、移除 16 个，
+混入大量与漏洞无关的变更（`tokio 1.53→1.54`、`uuid 1.24→1.28`、
+`undoc 0.8.0→0.8.1`（实际可到 0.27）…）。漏洞修复应当**最小 diff**，
+与常规追版本分开做。
+
+#### 验收
+
+`cargo test --all-targets` 319 suites / 0 failed；
+clippy `--all-targets --all-features -- -D warnings` 0；fmt 0。
+
 ### D468：`Int` 语义统一为**精确 i64**（数值塔模块化）
 
 #### 概述

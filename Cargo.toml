@@ -114,6 +114,32 @@ checkpoint-sqlite = ["rusqlite"]
 # 无 feature gate — 始终编译，未覆盖指令自动回落 MIR 解释器。
 # （v0.75.34 前的 jit = ["dep:inkwell"] LLVM 路线已废弃删除。）
 
+# v0.104.6 D470：debug 构建的调试信息降档 —— 治「D 盘被编译产物吃满」。
+#
+# 现象（本机实测）：`cargo test --all-targets` 一次产生 **104 GB** 的
+# `.pdb`。根因是本仓有 **319 个测试文件** ⇒ `--all-targets` 会为每个
+# 集成测试编译一个独立二进制 ⇒ 每个拖一份**完整** PDB 调试符号
+# （Windows 上单份 100–269 MB）。debug profile 默认 `debug = "full"`。
+#
+# 按 PDB 修改时间统计，104 GB 全部产生于一天之内（21 时 646 个 / 70.7 GB，
+# 22 时 326 个 / 33.2 GB）—— 即反复跑全量测试线性累积，**永不回收**
+# （cargo 只在同名产物被覆盖时才复用，不会因「测试二进制不再需要」而删）。
+#
+# 选 `"line-tables-only"` 而非 `0`/`"none"`：本仓大量缺陷分析依赖
+# **panic 的 filename:line**（如 `src/flow.rs:154:61`），`debug = 0`
+# 会让 backtrace 失去行号，诊断信息退化。`"line-tables-only"` 是 cargo
+# 官方给出的「最小可用」档：保留行号，不含变量/参数级信息，
+# PDB 体积下降一个数量级以上。
+#
+# 若某次调试确实需要看变量值，临时用 `CARGO_PROFILE_DEV_DEBUG=full` 覆盖。
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.build-override]
+# build script / proc-macro 不是运行时依赖，不需要调试信息
+# （cargo 默认已是 debug = false；此处显式写出以免将来误改）。
+debug = false
+
 [lints.rust]
 # v0.104.6：启用 Rust 1.99 新增的 `raw_borrows_via_references`（默认 allow）。
 # 它盯的是「先物化一个中间引用、紧接着又退化成裸指针」这种写法 —— 白白背上

@@ -19,6 +19,54 @@ All notable changes to Mora will be documented in this file.
 - **`Int` 语义**：算术与比较统一为**精确 i64**（overflow 报 `MoraError`）。
   2^53 之外的 `Int` 运算结果会变（此前静默丢最低位），`Int ⊗ Float` 超界改报错。
 
+### D470：debug profile 调试信息降档 —— 治「全量测试产出 104 GB PDB」
+
+`cargo test --all-targets` 一次在 `target\debug\deps` 产生 **104 GB** 的
+`.pdb`，把 D 盘压到只剩 23.9 GB 可用。
+
+**根因**：本仓 319 个测试文件 ⇒ `--all-targets` 为每个集成测试编译一个
+独立二进制 ⇒ 每个拖一份**完整** PDB（Windows 上单份 100–269 MB）。
+debug profile 的 cargo 默认是 `debug = "full"`，而本仓 `Cargo.toml`
+**完全没有 `[profile]` 段**。
+
+**且永不回收**：cargo 只在同名产物被覆盖时复用，不会因为「某个测试二进制
+不再需要」而删除。实测按 PDB 修改时间统计，104 GB 全部产生于一天之内
+（21 时 646 个 / 70.7 GB，22 时 326 个 / 33.2 GB）—— 反复跑全量测试
+线性累积。
+
+**修法**：`[profile.dev] debug = "line-tables-only"`。
+
+**为什么不用 `debug = 0`**：本仓大量缺陷分析依赖 **panic 的
+`filename:line`**（如 `src/flow.rs:154:61` 那种），`debug = 0` 会让
+backtrace 失去行号，诊断信息退化到不可用。`"line-tables-only"` 是 cargo
+官方给出的「最小可用」档：保留 filename/line，不含变量/参数级信息。
+
+**实测效果**（一轮全量测试后）：
+
+| | 修复前 | 修复后 |
+|---|---|---|
+| `target` 总量 | 128.7 GB | **17.28 GB** |
+| `target\debug\deps` | 115.9 GB | 14.99 GB |
+| PDB 体积合计 | 104.2 GB | 12.2 GB（500 个） |
+| PDB 单份最大 | 269 MB | 112 MB |
+
+**降 7.4 倍**，且不再随测试轮次线性累积到百 GB 级。
+
+**诊断能力未受损**（已实测 panic 与 backtrace 的行号均完整保留）：
+
+```text
+thread 'main' panicked at examples\panic_line_probe.rs:8:13:
+attempt to divide with overflow
+   3: panic_line_probe::main
+             at .\examples\panic_line_probe.rs:8
+```
+
+清理用 `cargo clean --profile dev`（保留 release 产物）：
+`Removed 102584 files, 127.8GiB total`，D 盘可用空间 23.9 GB → 150.0 GB。
+
+⚠ `cargo clean` **不走回收站** —— `target` 与回收站在同一块盘，127 GB
+塞不进回收站。这是有意的：编译产物本就该直接清，不进回收站占双份空间。
+
 ### D469：`rustls` 升级修掉 TLS 1.3 握手跨加密层级漏洞（dependabot #1）
 
 GitHub 对默认分支报的 1 条 moderate 依赖告警：**[GHSA-2mjx-qc3c-rqvc]**

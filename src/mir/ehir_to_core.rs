@@ -16,7 +16,7 @@ use crate::mir::core::{
     BlockId, CoreBlock, CoreFunction, CoreInst, CoreTerminator, EffectLabel, EnumMatchArm,
 };
 use crate::mir::effect::EffectRow;
-use crate::mir::fcfg::{Ehir, EhirBlock, Node};
+use crate::mir::fcfg::{Ehir, EhirBlock, Node, Reg};
 use crate::typeck::Type;
 use crate::value::Value;
 
@@ -26,11 +26,11 @@ pub fn ehir_to_core(
     params: Vec<(String, Type)>,
     effects: EffectRow,
 ) -> CoreFunction {
-    let mut ctx = CoreContext::new();
+    let mut ctx = CoreContext::new(effects);
     for node in nodes {
         lower_node(&mut ctx, node);
     }
-    ctx.finish(params, effects)
+    ctx.finish(params)
 }
 
 /// Core 降维上下文。
@@ -39,15 +39,18 @@ struct CoreContext {
     blocks: Vec<CoreBlock>,
     current_insts: Vec<CoreInst>,
     next_block_id: BlockId,
+    /// 效果行（函数级；嵌套代码区**继承**外层 —— Core 层不按体拆分效果）。
+    effects: EffectRow,
 }
 
 impl CoreContext {
-    fn new() -> Self {
+    fn new(effects: EffectRow) -> Self {
         Self {
             next_reg: 0,
             blocks: Vec::new(),
             current_insts: Vec::new(),
             next_block_id: 0,
+            effects,
         }
     }
 
@@ -61,13 +64,31 @@ impl CoreContext {
         self.current_insts.push(inst);
     }
 
-    fn finish(mut self, params: Vec<(String, Type)>, effects: EffectRow) -> CoreFunction {
+    fn finish(mut self, params: Vec<(String, Type)>) -> CoreFunction {
         self.flush_block(CoreTerminator::Return(None));
         CoreFunction {
             params,
             blocks: self.blocks,
             entry: 0,
-            effects,
+            effects: self.effects,
+            n_regs: self.next_reg,
+        }
+    }
+
+    /// 组装**嵌套代码区**（闭包体 / match 分支体）。
+    ///
+    /// v0.104.6 D480：末块以 `Return(result)` 收尾（体自身的值），
+    /// **全部块**都保留 —— 此前只保留首块（其余块被丢弃 ⇒ 体里的嵌套分支
+    /// 目标指向不存在的块）。
+    fn finish_body(mut self, result: Option<Reg>) -> CoreFunction {
+        self.flush_block(CoreTerminator::Return(result));
+        CoreFunction {
+            // 嵌套代码区不是「函数」：闭包形参在 `ClosureCreate.params` 里，
+            // match 分支体没有形参 ⇒ 形参表为空。
+            params: vec![],
+            blocks: self.blocks,
+            entry: 0,
+            effects: self.effects,
             n_regs: self.next_reg,
         }
     }
@@ -232,7 +253,7 @@ fn lower_node(ctx: &mut CoreContext, node: &Ehir) {
             dst, params, body, ..
         } => {
             let param_names: Vec<String> = params.iter().map(|p| p.name.clone()).collect();
-            let core_body = lower_block_to_core(ctx, body);
+            let core_body = lower_body_to_core(ctx, body);
             ctx.emit(CoreInst::ClosureCreate {
                 dst: *dst,
                 params: param_names,
@@ -433,7 +454,7 @@ fn lower_node(ctx: &mut CoreContext, node: &Ehir) {
                 .map(|arm| EnumMatchArm {
                     variant: format!("{:?}", arm.pattern),
                     bindings: vec![],
-                    body: lower_block_to_core(ctx, &arm.body),
+                    body: lower_body_to_core(ctx, &arm.body),
                 })
                 .collect();
             ctx.emit(CoreInst::EnumMatch {
@@ -472,7 +493,7 @@ fn lower_node(ctx: &mut CoreContext, node: &Ehir) {
         } => {
             let param_names: Vec<String> = params.iter().map(|p| p.name.clone()).collect();
             let captures = vec![]; // 捕获变量由 EHIR 分析确定
-            let core_body = lower_block_to_core(ctx, body);
+            let core_body = lower_body_to_core(ctx, body);
             let closure_reg = ctx.alloc_reg();
             ctx.emit(CoreInst::ClosureCreate {
                 dst: closure_reg,
@@ -501,7 +522,7 @@ fn lower_node(ctx: &mut CoreContext, node: &Ehir) {
         } => {
             let handler_reg = ctx.alloc_reg();
             // handler 降维为闭包
-            let handler_body = lower_block_to_core(ctx, handler);
+            let handler_body = lower_body_to_core(ctx, handler);
             ctx.emit(CoreInst::ClosureCreate {
                 dst: handler_reg,
                 params: vec!["__arg0".to_string()],
@@ -657,17 +678,20 @@ fn lower_block(ctx: &mut CoreContext, block: &EhirBlock) {
     }
 }
 
-fn lower_block_to_core(_ctx: &mut CoreContext, block: &EhirBlock) -> CoreBlock {
-    let mut sub = CoreContext::new();
+/// 把一个**块体**降维成独立的 Core 代码区（子函数形态）。
+///
+/// v0.104.6 D480：此前只返回**首块**（`sub.blocks.into_iter().next()`）——
+/// 体里的嵌套分支产生的其余块被**丢弃** ⇒ 分支目标指向**并不存在**的块。
+/// D480 起返回**全部块**（`CoreFunction` 形态：块集合 + 入口 + 寄存器数）。
+///
+/// 子代码区**继承**外层的效果行（Core 层不按体拆分效果），但有**自己的
+/// 寄存器空间**（闭包按名捕获，体内局部量不与外层撞号）。
+fn lower_body_to_core(ctx: &mut CoreContext, block: &EhirBlock) -> CoreFunction {
+    let mut sub = CoreContext::new(ctx.effects.clone());
     for node in &block.nodes {
         lower_node(&mut sub, node);
     }
-    sub.flush_block(CoreTerminator::Return(block.result));
-    sub.blocks.into_iter().next().unwrap_or(CoreBlock {
-        id: 0,
-        insts: vec![],
-        terminator: CoreTerminator::Return(None),
-    })
+    sub.finish_body(block.result)
 }
 
 fn literal_to_value(lit: &crate::common::Literal) -> Value {

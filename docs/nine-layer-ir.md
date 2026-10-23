@@ -46,35 +46,33 @@ Token → FCFG → EHIR → Core → MIR
 - **职责**：闭包/ADT/Thunk/Handle 降维为基元
 - **关键设计**：SSA 100% 覆盖（无 passthrough）
 
-> ⚠ **已知限制（显式登记）**：Core 层有一处**模型级**缺口 ——
-> `CoreInst::ClosureCreate.body` 与 `EnumMatchArm.body` 都是**单个**
-> `CoreBlock`，装不下多块 CFG ⇒ **闭包体 / match 分支体里的嵌套分支被截断**：
-> 体里只保留首块，分支目标指向**并不存在**的块。
+> **Core 层的两处结构缺陷均已修**（v0.104.6 D479 / D480），由
+> `tests/core_cfg_wellformed.rs` 递归守卫（外层 + 全部嵌套代码区）：
+> id 唯一连续 / 目标存在 / 指令与终结指令目标一致 / 无死块 / 无未回填 /
+> 无环分支程序无环。
 >
-> 实测（一次性探针打印 Core 块结构，match 分支体里套 `if`）：
+> - **D479：块号相撞** —— 分支块号此前是**预分配**的
+>   （`next_block_id + 1 / +2 / +3`）而实际是**顺序分配**的，分支里再套分支时
+>   外层预留的号与内层实际分配的号相撞 ⇒ 边指错、甚至成环（`if` 里套 `if`
+>   实测 3 ↔ 4 成环、出口块不可达）。D479 改成「**先降维、后回填**」。
+> - **D480：嵌套代码区被截断** —— `CoreInst::ClosureCreate.body` 与
+>   `EnumMatchArm.body` 此前是**单个** `CoreBlock`，装不下多块 CFG ⇒
+>   闭包体 / match 分支体里的嵌套分支被截断（体里只保留首块，分支目标指向
+>   **并不存在**的块）。实测（D480 前）：
 >
-> ```text
-> EnumMatchArm { body: CoreBlock { id: 0,
->     insts: [EnvLoad, Const, BinaryOp, Branch { true_bb: 1, false_bb: 2 }],
->     terminator: Branch { true_bb: 1, false_bb: 2 } } }
->                                  ↑ 目标 1、2 在该体里根本不存在
-> ```
+>   ```text
+>   EnumMatchArm { body: CoreBlock { id: 0,
+>       insts: [EnvLoad, Const, BinaryOp, Branch { true_bb: 1, false_bb: 2 }],
+>       terminator: Branch { true_bb: 1, false_bb: 2 } } }
+>                                    ↑ 目标 1、2 在该体里根本不存在
+>   ```
 >
-> 根因是**模型**（`body` 只能装一个块），不是降维 ⇒ 修它要改 Core 模型
-> （`body` → 多块 / `CoreFunction`），是独立的一批。
-> 钉子：`tests/core_cfg_wellformed.rs::sub_body_nested_branches_are_truncated_known_limitation`
-> —— 缺口消失时该判据会失败，提示把它翻成正面断言。
+>   D480 起 `body` 承载**完整子函数**（`CoreFunction` 形态：块集合 + 入口 +
+>   自己的寄存器空间）⇒ 复用同一个「带入口的代码区」概念，不另立第二套类型。
 >
 > 影响范围：**仅限 Core 层**。Core 函数**从不执行**（`probe_all_layers` 只统计
 > 指令数），可执行的路径是 MIR 层 —— 它的块结构由 `mir/dag.rs` 独立构建，
 > 不受此限制。
->
-> **块号相撞那个缺陷已修**（v0.104.6 D479）：此前分支块号是**预分配**的
-> （`next_block_id + 1 / +2 / +3`），分支里再套分支时外层预留的号与内层实际
-> 分配的号相撞 ⇒ 边指错、甚至成环（`if` 里套 `if` 实测 3 ↔ 4 成环、出口块
-> 不可达）。D479 改成「**先降维、后回填**」，并加了结构良构性守卫
-> （`tests/core_cfg_wellformed.rs`：id 唯一连续 / 目标存在 / 指令与终结指令
-> 一致 / 无死块 / 无未回填 / 无环分支程序无环）。
 
 ### MIR — Mid-level IR（已有）
 - **输入**：`FCFG`（`lower_fcfg` 降维）

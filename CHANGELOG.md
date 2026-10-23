@@ -19,6 +19,47 @@ All notable changes to Mora will be documented in this file.
 - **`Int` 语义**：算术与比较统一为**精确 i64**（overflow 报 `MoraError`）。
   2^53 之外的 `Int` 运算结果会变（此前静默丢最低位），`Int ⊗ Float` 超界改报错。
 
+### D480：Core 模型能承载多块 —— 闭包体 / match 分支体不再被截断
+
+D479 修掉了 Core 层的**块号相撞**，并登记了剩下一处**模型级**缺口：
+`CoreInst::ClosureCreate.body` 与 `EnumMatchArm.body` 都是**单个**
+`CoreBlock`，装不下多块 CFG ⇒ 闭包体 / match 分支体里的嵌套分支被截断
+（体里只保留首块，分支目标指向**并不存在**的块）。本条把那个缺口也收掉。
+
+#### 缺陷（实测取证）
+
+match 分支体里套 `if`（D480 前）：
+
+```text
+EnumMatchArm { body: CoreBlock { id: 0,
+    insts: [EnvLoad, Const, BinaryOp, Branch { true_bb: 1, false_bb: 2 }],
+    terminator: Branch { true_bb: 1, false_bb: 2 } } }
+                                 ↑ 目标 1、2 在该体里根本不存在
+```
+
+#### 修法：模型改多块
+
+- `ClosureCreate.body` / `EnumMatchArm.body`：`CoreBlock` → **`CoreFunction`**
+  （块集合 + 入口 + 自己的寄存器空间）。
+- **复用** `CoreFunction` 而不是另立一个 `CoreCode` 类型 —— 「带入口的代码区」
+  这件事**已经有**一个类型，**不引入第二套概念**。（嵌套代码区不是「函数」：
+  没有调用约定、没有形参表 —— 闭包形参在 `ClosureCreate.params` 里 ——
+  但结构上是同一件事。）
+- `ehir_to_core::lower_block_to_core` → `lower_body_to_core`：返回**全部块**
+  （此前 `sub.blocks.into_iter().next()` 只取首块，其余块被丢弃）。
+- `CoreContext` 携带效果行：嵌套代码区**继承**外层（Core 层不按体拆分效果），
+  但**寄存器空间独立**（闭包按名捕获，体内局部量不与外层撞号）。
+
+#### 守卫升级
+
+`tests/core_cfg_wellformed.rs` 从「只查外层 CFG」升级为**递归**检查
+（外层 + 全部嵌套代码区），并把 D479 那条「缺口存在」的钉子**翻成正面断言**
+（`nested_bodies_keep_their_whole_cfg`：分支体的分支目标必须落在**体自身的
+块集合**内，且体本身多块）。
+
+**反向验证**：临时把子体截回 1 块（`f.blocks.truncate(1)`）⇒ 守卫立刻报
+「含嵌套 if 的分支体应有多块，实际 1 块」⇒ 断言非恒真。
+
 ### D479：Core 层 CFG 构造器 —— 块号「先降维、后回填」，嵌套分支不再指错
 
 D477 把 Core 层的块号相撞限制**显式登记**（当时未修）。本条把它修掉。

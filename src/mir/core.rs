@@ -83,7 +83,13 @@ pub enum CoreInst {
         dst: Reg,
         params: Vec<String>,
         captures: Vec<String>,
-        body: CoreBlock,
+        /// 闭包体 —— **一个完整的子函数**（多块 CFG + 入口 + 自己的寄存器空间）。
+        ///
+        /// v0.104.6 D480：此前是**单个** `CoreBlock` ⇒ 闭包体里的**嵌套分支**
+        /// 装不下（子函数降维只保留首块，其余块被丢弃 ⇒ 分支目标指向
+        /// **并不存在**的块）。改为承载完整子函数后，闭包体 / match 分支体
+        /// 的控制流结构不再丢失。
+        body: CoreFunction,
     },
     /// 调用闭包。
     ClosureCall(Reg, Reg, Vec<Reg>),
@@ -184,7 +190,12 @@ pub enum CoreTerminator {
 pub struct EnumMatchArm {
     pub variant: String,
     pub bindings: Vec<String>,
-    pub body: CoreBlock,
+    /// 分支体 —— 与闭包体同款：**一个完整的子函数**（多块 CFG + 入口）。
+    ///
+    /// v0.104.6 D480：此前是**单个** `CoreBlock` ⇒ 分支体里的嵌套分支被
+    /// 截断（目标指向不存在的块）。理由与后果见
+    /// [`CoreInst::ClosureCreate`] 的 `body` 字段。
+    pub body: CoreFunction,
 }
 
 /// 效果标签（从 EHIR EffectRow 提取）。
@@ -203,12 +214,28 @@ pub enum EffectLabel {
 // ===================================================================
 
 /// Core 函数 — SSA 形式的基本块集合。
+///
+/// v0.104.6 D480：这个类型同时承担两种角色 ——
+///
+/// - **顶层函数**：`ehir_to_core` 的产物（`blocks` 是整个函数的 CFG）；
+/// - **嵌套代码区**：闭包体 / match 分支体（`CoreInst::ClosureCreate.body`
+///   与 `EnumMatchArm.body`）—— 它们是**独立**的代码区：自己的块集合、
+///   自己的入口、**自己的寄存器空间**（与外层不共享编号）。
+///
+/// 嵌套代码区不是「函数」（没有调用约定、没有形参表 —— 闭包形参在
+/// `ClosureCreate.params` 里），但**结构上**是同一件事：一组带入口的块。
+/// 复用同一个类型而不是另立一个 `CoreCode`，是为了不引入第二套「代码区」
+/// 概念。
 #[derive(Debug, Clone)]
 pub struct CoreFunction {
+    /// 形参（仅顶层有意义；嵌套代码区为空 —— 闭包形参在 `ClosureCreate` 里）。
     pub params: Vec<(String, Type)>,
     pub blocks: Vec<CoreBlock>,
+    /// 入口块号。
     pub entry: BlockId,
+    /// 效果行（函数级；嵌套代码区继承外层 —— Core 层不按体拆分效果）。
     pub effects: EffectRow,
+    /// 寄存器数量（该代码区自己的空间）。
     pub n_regs: usize,
 }
 

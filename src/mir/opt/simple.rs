@@ -136,7 +136,7 @@ pub(super) fn dead_code_elim(ssa: &mut MirSsaFunction) {
             Terminator::Return(Some(r)) => {
                 used.insert(*r);
             }
-            // v0.75.6: `Return(None)` 是 Mora 顶层函数的隐式返回 — run_mir
+            // v0.75.6: `Return(None)` 是 Mora 顶层函数的隐式返回 — `execute`
             // 在无显式 Return 时返回「最后一条产生 dst 的指令」的值。
             // 若不把该 dst 计入 used，DCE 会把它当死代码删除 → 函数返回值
             // 从真实值变成 Nil（等价性测试抓到的 Basic 管线语义 bug）。

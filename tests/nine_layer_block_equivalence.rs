@@ -25,7 +25,7 @@
 use mora::interpreter::Interpreter;
 use mora::mir::MirFunction;
 use mora::mir::ssa::OptLevel;
-use mora::mir::vm::execute as run_mir;
+use mora::mir::vm::execute;
 use mora::mir::witness_to_fcfg::witness_to_fcfg;
 use mora::parser_v3::ParserV3;
 use mora::value::Value;
@@ -41,12 +41,15 @@ fn finish(mut func: MirFunction, level: OptLevel) -> MirFunction {
     func
 }
 
-/// 执行一个 MirFunction，返回 `last_expr`（run_mir 顶层最后表达式值）。
-fn execute(func: MirFunction) -> Result<Value, String> {
+/// 执行一个 MirFunction，返回 `last_expr`（顶层最后表达式值）。
+///
+/// 与库入口 [`mora::mir::vm::execute`] 同名会撞，故本地 helper 另起名 ——
+/// 它只取顶层末值，**不**跑 `main` task。
+fn last_value(func: MirFunction) -> Result<Value, String> {
     let mut interp = Interpreter::new();
     let mut env = interp.take_env();
     let func_arc = Arc::new(func);
-    let last = run_mir(
+    let last = execute(
         &func_arc,
         &mut interp,
         &mut env,
@@ -122,7 +125,7 @@ fn d474_block_and_declaration_forms_have_the_expected_last_value() {
         };
 
         let level = OptLevel::default();
-        let got = execute(finish(pipeline_func, level));
+        let got = last_value(finish(pipeline_func, level));
         match got {
             Ok(v) => {
                 let text = v.to_string();

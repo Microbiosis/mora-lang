@@ -1,6 +1,6 @@
 //! Tier 0 → Tier 1 替换集成测试
 //!
-//! 这套测试直接调用 `mora::mir::vm::run_mir` + `run_main_task`，
+//! 这套测试直接调用 `mora::mir::vm::execute` + `run_main_task`，
 //! 跳过 `Interpreter::interpret/execute/evaluate/call_value_inner/call_task_inner`，
 //! 以证明所有 5 个语言面（语法/语义/类型/标准库/运行时）都通过 MIR 解释器执行。
 //!
@@ -14,9 +14,9 @@ use mora::parser_v3::ParserV3;
 use mora::typeck::check_mir::check_program_witnesses_bidirectional;
 use mora::value::Value;
 
-/// 公共执行入口：compile → typeck → run_mir → run_main_task
+/// 公共执行入口：compile → typeck → execute → run_main_task
 /// 这是 `src/main.rs::run_file()` 的纯库版本，可被测试独立调用。
-fn run_via_mir(source: &str) -> Result<(), String> {
+fn run_via_execute(source: &str) -> Result<(), String> {
     let (func, witnesses) = ParserV3::compile(source)?;
     let type_errs = check_program_witnesses_bidirectional(&witnesses);
     if !type_errs.is_empty() {
@@ -53,7 +53,7 @@ task main()
   print(greeting)
 end
 "#;
-    run_via_mir(src).expect("syntax path must execute via MIR");
+    run_via_execute(src).expect("syntax path must execute via MIR");
 }
 
 // ─── 2. 语义 (semantics) ───────────────────────────────────────────
@@ -76,7 +76,7 @@ task main()
   print("sum=" + str(total))
 end
 "#;
-    run_via_mir(src).expect("control flow must execute via MIR");
+    run_via_execute(src).expect("control flow must execute via MIR");
 }
 
 // ─── 3. 类型系统 (type system) ──────────────────────────────────────
@@ -97,7 +97,7 @@ task main()
   print(label)
 end
 "#;
-    run_via_mir(src).expect("typeck + MIR path must succeed");
+    run_via_execute(src).expect("typeck + MIR path must succeed");
 }
 
 // ─── 4. 标准库 / API (stdlib) ──────────────────────────────────────
@@ -115,7 +115,7 @@ task main()
   print(nums)
 end
 "#;
-    run_via_mir(src).expect("stdlib builtin dispatch must execute via MIR");
+    run_via_execute(src).expect("stdlib builtin dispatch must execute via MIR");
 }
 
 // ─── 5. 运行时 (runtime) ───────────────────────────────────────────

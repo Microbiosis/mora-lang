@@ -2,7 +2,7 @@
 //!
 //! ## 为什么扩大覆盖
 //!
-//! `tests/run_mir_equiv_run_dag.rs` 此前只有 **3 例**走这个对拍（if/else 作值、
+//! `tests/execute_equiv_run_dag.rs` 此前只有 **3 例**走这个对拍（if/else 作值、
 //! 嵌套 break、while+continue）。而优化器有三条规则（`CseDagRule` /
 //! `DeadNodeDagRule` / `ConstFoldingDagRule`），3 例远不足以证明「保语义」。
 //!
@@ -19,8 +19,8 @@
 //! ## 判据
 //!
 //! 两条路径跑**同一份源码**，返回值必须逐字相同：
-//!   * 生产路径 `run_mir` —— DAG 缓存 + `dag_optimize` + 真实 BSP 超步；
-//!   * 未优化路径 `run_mir_dag` —— 直调 `dag_analyze`，绕过优化。
+//!   * 生产路径 `execute` —— DAG 缓存 + `dag_optimize` + 真实 BSP 超步；
+//!   * 未优化路径 `execute_program` —— 直调 `dag_analyze`，绕过优化。
 //!
 //! 2026-09-28 实测：16 个形态**全部一致**（`differing = 0`），含已知危害的
 //! 触发形态。故此文件是**回归网**而非缺陷报告。
@@ -28,7 +28,7 @@
 use std::sync::Arc;
 
 use mora::interpreter::Interpreter;
-use mora::mir::vm::{execute, run_mir_dag};
+use mora::mir::vm::{execute, execute_program};
 use mora::parser_v3::ParserV3;
 
 fn via_optimized(src: &str) -> String {
@@ -52,7 +52,7 @@ fn via_unoptimized(src: &str) -> String {
     let arc = Arc::new(func);
     let mut interp = Interpreter::new();
     let mut env = interp.take_env();
-    match run_mir_dag(
+    match execute_program(
         &arc,
         &mut interp,
         &mut env,

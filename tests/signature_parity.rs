@@ -18,7 +18,7 @@
 //!   * `type_of()` 只能报**外层构造名**（`List(Int)` → `list`），元素类型
 //!     报不出来，故 `range` 那一行只比外层 —— 元素类型另由
 //!     `range_element_type_matches_runtime` 单独钉。
-//!   * 库内 `run_mir` **绕过 typeck**（`main.rs:409` 才跑检查），所以本文件
+//!   * 库内 `execute` **绕过 typeck**（`main.rs:409` 才跑检查），所以本文件
 //!     比的是「声明」与「运行期值」两侧，运行期一侧用库内路径即可。
 
 use mora::test_support::TempFile;
@@ -320,7 +320,7 @@ fn print_param_union_covers_every_displayable_value_type() {
 ///
 /// 每条给的是 `(receiver, method, 声明期望, 运行期期望, 前置语句, 求值表达式)`：
 /// 前置语句用于把 receiver 绑成变量（多行表达式没法直接塞进 `type_of(…)`），
-/// 求值表达式是**末表达式**（`run_mir` 取它的值）。
+/// 求值表达式是**末表达式**（`execute` 取它的值）。
 const METHOD_CASES: &[(&str, &str, &str, &str, &str, &str)] = &[
     // (recv, method, 声明期望, 运行期期望, setup, expr)
     ("List", "map", "list", "list", "", "[1].map(fn(x) x end)"),

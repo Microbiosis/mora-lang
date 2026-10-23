@@ -2,7 +2,7 @@
 //!
 //! 解耦 `mir/` ↔ `interpreter/` 双向依赖的枢纽：
 //! - 此前 `mir/interp.rs` / `mir/handlers.rs` / `mir/dag_interp.rs` 直接持有
-//!   `&mut Interpreter`，而 `interpreter/` 又调用 `mir::interp::run_mir`，
+//!   `&mut Interpreter`，而 `interpreter/` 又调用 `mir::vm::execute`，
 //!   构成编译级循环。
 //! - 现在 MIR 解释器只依赖本 trait（定义在 mir 侧），`Interpreter` 实现它。
 //!   mir 侧不再 import `crate::interpreter`。
@@ -84,7 +84,7 @@ pub trait MirHost {
     /// impl 表（`h_impl_def` 用 `Arc::make_mut` 写入）。
     fn impl_table(&mut self) -> &mut Arc<HashMap<String, Vec<String>>>;
     /// 内核 DAG 缓存（宿主单属主纯值，v1.00）。
-    /// `run_mir_with_signal` 从宿主取缓存构建优化 DAG —— 取代 v0.75.27 的
+    /// `run_with_signal` 从宿主取缓存构建优化 DAG —— 取代 v0.75.27 的
     /// 进程级 `static DAG_CACHE` 状态机（OnceLock + Mutex 防御式加锁）。
     /// 缓存是对同一 `Arc<MirFunction>` 确定的纯函数的 memo，单属主
     /// `&mut self` 线性访问无锁；宿主克隆按值复制缓存（memo 透明）。

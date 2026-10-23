@@ -28,7 +28,7 @@
 //! **D419 删掉守卫**，改为给 SSA 一个能表达这件事的终结符：
 //! [`mora::mir::ssa::Terminator::JumpExit`] —— 「跳到函数末尾」，与
 //! 「返回」/「落进下一块」彻底分开。降维时它发一条真跳转，由第四遍补成重建后
-//! body 的长度：`run_mir` 见 `pc >= body.len()` 即结束并走隐式返回；
+//! body 的长度：`execute` 见 `pc >= body.len()` 即结束并走隐式返回；
 //! `dag_analyze` 解析不到目标节点 ⇒ 该 Jump 节点无出边。两个执行器都与
 //! opt=off 一致。
 //!

@@ -1389,7 +1389,7 @@ impl ParserV3 {
         // v0.86: 宏体编译 — 同 emit_fn_def_w 模式：子 EmitContext 编译宏体，
         // 父 EmitContext emit MacroDef 指令。宏体语句序列在子上下文中编译为
         // MirFunction，尾部 emit Return(body_reg)。运行期 dispatch.rs 中
-        // Value::Macro 分支以 args 绑定 params，run_mir 执行 body。
+        // Value::Macro 分支以 args 绑定 params，execute 执行 body。
         let parent = std::mem::replace(&mut self.emit, crate::mir::lower::EmitContext::new());
         // v0.104.6 D44：体发射失败时**必须还原父上下文**（见 emit_match_arm_w
         // 处的完整说明）。体被包进闭包，使 `?` 只退出闭包而不是整个函数。
@@ -1748,7 +1748,7 @@ impl ParserV3 {
                 // 是 unit 指令（无 dst），此前直接返回哨兵 `0`。事务体是独立
                 // 寄存器空间，`transaction commit end` 里它一个寄存器都没分配，
                 // 于是 `Some((0, _))` 被当作 body 的末值寄存器 → 返回语句引用
-                // reg 0 → run_mir 拿到 n_regs=0 的函数 → `node_ready` 越界 panic。
+                // reg 0 → execute 拿到 n_regs=0 的函数 → `node_ready` 越界 panic。
                 let w = MirWitness {
                     kind: WitnessKind::Commit,
                     span,
@@ -1864,7 +1864,7 @@ impl ParserV3 {
         let mut body_wits = Vec::new();
         // v0.104.2: `Option<Reg>` 而非哨兵 0 —— 空事务体（`transaction end`）
         // 在**独立寄存器空间**里一个寄存器都没分配，此时引用 reg 0 会让
-        // `run_mir` 拿到 n_regs=0 的函数 → `node_ready` 用 reg_ready[0] 越界
+        // `execute` 拿到 n_regs=0 的函数 → `node_ready` 用 reg_ready[0] 越界
         // panic（"the len is 0 but the index is 0"）。与 emit_block_mir_and_wit /
         // emit_section_w 的既有一致写法。
         let _last: Option<Reg> = None;

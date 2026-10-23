@@ -3,14 +3,14 @@
 //!
 //! compile_and_opt 在 9 层差分绿时返回管线产出的 MirFunction
 //!（witness→FCFG→lower_fcfg→apply_rules），红时回落 emit.rs 直出。
-//! 本测试走完整生产路径（compile_and_opt → run_mir）断言执行结果。
+//! 本测试走完整生产路径（compile_and_opt → execute）断言执行结果。
 
 use mora::interpreter::Interpreter;
 use mora::mir::vm::{execute, run_main_task};
 use mora::value::Value;
 use std::sync::Arc;
 
-/// 生产路径执行：compile_and_opt → run_mir + run_main_task。
+/// 生产路径执行：compile_and_opt → execute + run_main_task。
 fn run_production(source: &str) -> Value {
     let (func, _witnesses) =
         mora::cli::compile_and_opt(source, None).expect("compile_and_opt failed");
@@ -23,7 +23,7 @@ fn run_production(source: &str) -> Value {
         &mut env,
         &mut mora::mir::effect::Effects::new(),
     )
-    .unwrap_or_else(|e| panic!("run_mir failed: {}", e));
+    .unwrap_or_else(|e| panic!("execute failed: {}", e));
     run_main_task(
         &func_arc,
         &mut interp,
@@ -188,7 +188,7 @@ fn switch_while_continue() {
         &mut env,
         &mut mora::mir::effect::Effects::new(),
     )
-    .expect("while_continue run_mir failed");
+    .expect("while_continue execute failed");
     let _ = run_main_task(
         &arc,
         &mut interp,
@@ -223,7 +223,7 @@ fn switch_for_break() {
         &mut env,
         &mut mora::mir::effect::Effects::new(),
     )
-    .expect("for sum run_mir failed");
+    .expect("for sum execute failed");
     let _ = run_main_task(
         &arc,
         &mut interp,

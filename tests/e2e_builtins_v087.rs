@@ -1,13 +1,13 @@
 //! v0.87: Lisp homoiconicity 三件套 — gensym / read / macroexpand 测试
 //!
 //! 测试策略：inline 源码风格（不依赖 fixture），每条测试独立构造 Interpreter
-//! 和 Environment。通过 ParserV3::compile → run_mir + run_main_task 执行，
+//! 和 Environment。通过 ParserV3::compile → execute + run_main_task 执行，
 //! 将结果存入模块级变量 __result，再从 env 中取出断言。
 //!
 //! 架构注意事项：
-//! - run_mir 返回模块最后表达式的值（task def → Nil），不用其做断言
+//! - execute 返回模块最后表达式的值（task def → Nil），不用其做断言
 //! - run_main_task 返回 ()，不传播 main body 的最后表达式
-//! - __result 变量由 Mora 顶层 let 绑定初始化后，run_mir 存入 env，run_main_task 后 env 可见
+//! - __result 变量由 Mora 顶层 let 绑定初始化后，execute 存入 env，run_main_task 后 env 可见
 //! - DAG 优化器合并相同 Call 节点，因此 `[gensym(), gensym()]` 全部返回同一值
 //!   （gensym 是"volatile" builtin，但 DAG 层尚不知）—— 用多个 let 绑定规避
 //! - v0.84 JSON 对称性：2 + 3 结果为 Float(5.0)（+ 操作语义升级），用字符串比较断言
@@ -30,7 +30,7 @@ fn run_mora(source: &str) -> Result<Value, String> {
         &mut env,
         &mut mora::mir::effect::Effects::new(),
     )
-    .map_err(|e| format!("run_mir error: {}", e))?;
+    .map_err(|e| format!("execute error: {}", e))?;
     run_main_task(
         &func_arc,
         &mut interp,

@@ -1,6 +1,6 @@
 //! Tier 2: ParserV3 pipeline integration tests
 //!
-//! 验证完整的 V3 管线：`ParserV3::compile → check_program_witnesses_bidirectional → run_mir`
+//! 验证完整的 V3 管线：`ParserV3::compile → check_program_witnesses_bidirectional → execute`
 
 use mora::interpreter::Interpreter;
 use mora::mir::vm::{execute, run_main_task};

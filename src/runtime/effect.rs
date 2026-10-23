@@ -34,7 +34,7 @@ use crate::value::{Environment, Value};
 /// 返回 `Ok(reply)` 表示 effect 已处理；`Err(msg)` 表示 handler 内部错误。
 ///
 /// v0.80 Stage 2.0: `perform` 签名扩展为带 `&mut dyn MirHost`（Box dyn）——
-/// handler 内部需要 run_mir 来执行 handler_mir，必须有 host 句柄。
+/// handler 内部需要 execute 来执行 handler_mir，必须有 host 句柄。
 /// 单 dispatch 入口（避免 trait method 双签名）。
 pub trait EffectHandler: Send + Sync {
     /// v0.80: 真正的 handler 执行入口。`host` 是 `MirHost` trait object。
@@ -75,7 +75,7 @@ impl EffectHandler for HandlerClosure {
         //
         // 1. args 注入 handler_env（按 __arg0, __arg1, ... 命名约定）
         //    handler 用 env.get("__arg0") 等访问 arguments。
-        // 2. run_mir(handler_mir, host, env) — handler 末尾表达式的值是返回值。
+        // 2. execute(handler_mir, host, env) — handler 末尾表达式的值是返回值。
         //
         // 第一版（single-shot）：handler 一次性消耗，不还原。注意此 take 拿到
         // 的 handler 已从 EffectRegistry 移除 —— 嵌套 handle 用相同 effect

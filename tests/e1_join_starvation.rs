@@ -13,7 +13,7 @@
 //! `Nil` —— 此时哪怕整条尾部从未执行，断言 `is_ok()` 也照样通过。
 //! **那正是 E1 长期隐身的原因**：`tier0_replacement::
 //! semantics_control_flow_runs_via_mir` 的 `print("sum=" + str(total))` 挂在
-//! 汇合点之后，而该测试只检查 `run_via_mir(src).is_ok()`，于是「从未执行」
+//! 汇合点之后，而该测试只检查 `run_via_execute(src).is_ok()`，于是「从未执行」
 //! 被判成「通过」，还顺手掩盖了 `str()` 缺运行期实现这个独立缺陷。
 //!
 //! 所以本文件**所有用例的尾部都是「有值的表达式」而非 `print`**，并逐条

@@ -92,7 +92,7 @@ fn teaapp_run_loop_drains_cmd_queue() {
     // v0.83: 验证 run_loop 真正消化 cmd_queue（Phase 1 修复）
     let update_mir = Arc::new(crate::mir::MirFunction {
         params: vec!["model".to_string(), "msg".to_string()],
-        body: vec![], // 空 body —— run_mir 应返回 Value::Nil
+        body: vec![], // 空 body —— execute 应返回 Value::Nil
         n_regs: 0,
         effects: Default::default(),
     });

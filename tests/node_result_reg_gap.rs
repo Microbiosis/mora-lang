@@ -37,7 +37,7 @@
 //!
 //! `with_tail` 两条路径都返回 **`"m"`**（配置绑定的值）而不是 `Nil`。
 //! 末两条 MIR 是 `Const`（存 `"m"`）+ `WithConfig` + `Const`（= `dst, Nil`）——
-//! `emit_with_w` 的 `Const(dst, Nil)` **确实在**，但 `run_mir` 的末值不取它。
+//! `emit_with_w` 的 `Const(dst, Nil)` **确实在**，但 `execute` 的末值不取它。
 //!
 //! **影响面极小**：`last_expr` 只有**库调用方**可见；语言层观测不到
 //! （`with` 是语句、`with` 块的 `let` 绑定不外泄 —— D91 实测）。
@@ -47,7 +47,7 @@
 use mora::interpreter::Interpreter;
 use mora::mir::MirFunction;
 use mora::mir::ssa::OptLevel;
-use mora::mir::vm::{execute as run_mir, run_main_task};
+use mora::mir::vm::{execute, run_main_task};
 use mora::mir::witness_to_fcfg::witness_to_fcfg;
 use mora::parser_v3::ParserV3;
 use mora::value::Value;
@@ -61,11 +61,15 @@ fn finish(mut f: MirFunction, level: OptLevel) -> MirFunction {
     f
 }
 
-fn execute(func: MirFunction) -> Result<Value, String> {
+/// 跑整个程序：顶层 body（取末值）+ `main` task。
+///
+/// 与库入口 [`mora::mir::vm::execute`] 同名会撞，故本地 helper 用
+/// `run_program` —— 两者职责差一层（多跑 `main` task）。
+fn run_program(func: MirFunction) -> Result<Value, String> {
     let mut interp = Interpreter::new();
     let mut env = interp.take_env();
     let func_arc = Arc::new(func);
-    let last = run_mir(
+    let last = execute(
         &func_arc,
         &mut interp,
         &mut env,
@@ -86,7 +90,7 @@ fn execute(func: MirFunction) -> Result<Value, String> {
 ///
 /// 为什么是这个形态：块在 Mora 语法里是**语句**不是表达式，
 /// `let r = observe … end` **解析就失败**（实测），所以「块作 `let` 右值」
-/// 那条消费路径结构上不可达。真正会消费它的是 `run_mir` 的
+/// 那条消费路径结构上不可达。真正会消费它的是 `execute` 的
 /// `last_expr` —— 顶层 `Sequence` 的结果取自 `nodes.last()`，
 /// 而末节点缺 arm 时整个序列结果退化成哨兵 0。
 const CASES: &[(&str, &str)] = &[
@@ -141,8 +145,8 @@ fn d96_missing_result_reg_arm_is_latent_not_live() {
             effects: func.effects.clone(),
         };
         let level = OptLevel::default();
-        let a = execute(finish(func.clone(), level));
-        let b = execute(finish(pipeline_func.clone(), level));
+        let a = run_program(finish(func.clone(), level));
+        let b = run_program(finish(pipeline_func.clone(), level));
         let same = match (&a, &b) {
             (Ok(x), Ok(y)) => format!("{x}") == format!("{y}"),
             (Err(_), Err(_)) => true,

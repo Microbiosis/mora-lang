@@ -118,7 +118,7 @@ fn as_dyn_coercion_produces_trait_object() {
 ///     查找键**永远带不上被包值的具体类型**。
 ///
 /// 本测试跑**真实二进制**并捕获 stdout —— 该字段只体现在运行期值的 Display 上，
-/// 库 API 侧（`run_mir`）既不打印尾表达式、也不返回 task 的值。
+/// 库 API 侧（`execute`）既不打印尾表达式、也不返回 task 的值。
 #[test]
 fn dyn_trait_object_records_concrete_type() {
     use std::process::Command;

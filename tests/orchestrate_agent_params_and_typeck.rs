@@ -74,7 +74,7 @@ fn as_str(v: Value) -> String {
 
 /// 跑 typeck。
 ///
-/// 注意：`ParserV3::compile` + `run_mir` 这条库级 harness **本身不跑 typeck**
+/// 注意：`ParserV3::compile` + `execute` 这条库级 harness **本身不跑 typeck**
 /// —— 顶层 `1 + "str"` 在库里同样算成 `"1.0str"`。typeck 是 CLI 额外加的一遍，
 /// 所以判 typeck 行为必须显式调它，不能借 `run` 的执行结果推断。
 fn typeck_errors(source: &str) -> Vec<String> {

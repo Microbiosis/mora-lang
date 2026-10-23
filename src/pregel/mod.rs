@@ -2111,7 +2111,7 @@ mod tests {
     /// Parallel EXEC with a failing agent returns Err (not hang).
     #[test]
     fn parallel_agent_error_propagates() {
-        // Agent "a" task_body errors: 越界索引 → run_mir 返回 Err。
+        // Agent "a" task_body errors: 越界索引 → execute 返回 Err。
         // v0.103: 此前用 `Int + Float`（v0.38 的 Rust-strict 类型错误）当错误
         // 载体；numeric tower 统一后该运算合法地提升为 Float(3.5)，故改用
         // 真正会失败的运行期错误（索引越界），测试意图（并行 agent 错误必须
@@ -2233,7 +2233,7 @@ mod tests {
             result
         );
 
-        // 失败 master_compute（Call 未知函数 → run_mir Err）→ engine.run
+        // 失败 master_compute（Call 未知函数 → execute Err）→ engine.run
         // 必须传播错误（此前 eprintln warn 静默继续）。
         let bad_master = MirFunction {
             params: Vec::new(),

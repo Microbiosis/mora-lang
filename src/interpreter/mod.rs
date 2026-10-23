@@ -135,7 +135,7 @@ pub struct Interpreter {
     /// v0.52 ADR-001: OrchRuntime facade — BC4 (plans + refine_registry + skill_registry)
     pub(crate) orch: crate::runtime::orch::OrchRuntime,
     /// v1.00: 内核 DAG 缓存（宿主单属主纯值）。
-    /// `run_mir_with_signal` 经 `MirHost::dag_cache` 取用 —— 取代 v0.75.27 的
+    /// `run_with_signal` 经 `MirHost::dag_cache` 取用 —— 取代 v0.75.27 的
     /// 进程级 `static DAG_CACHE`（OnceLock + Mutex）全局状态机。缓存的构建
     /// 路径是对同一 `Arc<MirFunction>` 确定的纯函数，单属主 `&mut self`
     /// 线性访问无锁；Clone 按值复制（memo 透明）—— Pregel worker 克隆继承

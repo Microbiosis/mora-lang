@@ -1,17 +1,17 @@
 //! Closure / task MIR dispatch 路径测试 (v0.77 重命名自 tier0_closure_mir.rs)
 //!
 //! v0.77 重构：删除 6 个 source-grep 静态合约测试
-//! （Value::Closure.mir_body 存在性、dispatch 走 run_mir、MirInst::Closure
+//! （Value::Closure.mir_body 存在性、dispatch 走 execute、MirInst::Closure
 //! 存在性等 — 任何重命名都会假阳性断裂）。保留 3 个 runtime 测试。
 //! 这些 runtime 测试验证 `MirInst::Closure` + `MirInst::TaskDef` →
-//! `run_mir` → `run_main_task` 真实端到端路径。
+//! `execute` → `run_main_task` 真实端到端路径。
 
 use mora::interpreter::Interpreter;
 use mora::mir::vm::{execute, run_main_task};
 use mora::parser_v3::ParserV3;
 use mora::typeck::check_mir::check_program_witnesses_bidirectional;
 
-fn run_via_mir(source: &str) -> Result<(), String> {
+fn run_via_execute(source: &str) -> Result<(), String> {
     let (func, witnesses) = ParserV3::compile(source)?;
     let type_errs = check_program_witnesses_bidirectional(&witnesses);
     if !type_errs.is_empty() {
@@ -49,7 +49,7 @@ task main()
   print(total)
 end
 "#;
-    run_via_mir(src).expect("closure/MIR path must succeed");
+    run_via_execute(src).expect("closure/MIR path must succeed");
 }
 
 // ─── 2. 多次调用同一 closure（MIR 函数级语义）───────────────────────
@@ -58,7 +58,7 @@ fn closure_reused_across_calls_via_mir() {
     // 验证 MIR built closure 可被多次调用（EnvRef captured env 不被破坏）。
     // Mora 无 `f(args)` 名字调用语法（Call 指令只查 builtin 表），闭包经
     // Dict 方法调用路径分发：`dict.method(args)` → dispatch 查 Dict 找到
-    // Value::Closure → call_value → run_mir（dispatch.rs:736-749）。
+    // Value::Closure → call_value → execute（dispatch.rs:736-749）。
     // 用 for 循环驱动多次调用。
     //
     // 注：原测试源码用 `if s == 60 then\n  print(...)\nend`（then 独占行）
@@ -74,11 +74,11 @@ task main()
   print(total)
 end
 "#;
-    run_via_mir(src).expect("repeated MIR execution path must work");
+    run_via_execute(src).expect("repeated MIR execution path must work");
 }
 
 // ─── 3. 跨 task 调用（MIR task_registry）───────────────────────────
-// 验证 StmtKind::TaskDef → MirInst::TaskDef → run_mir task_registry 路径。
+// 验证 StmtKind::TaskDef → MirInst::TaskDef → execute task_registry 路径。
 #[test]
 fn cross_task_call_via_mir_task_registry() {
     let src = r#"
@@ -86,11 +86,11 @@ task main()
   print("ok")
 end
 "#;
-    run_via_mir(src).expect("task main via MIR task_registry");
+    run_via_execute(src).expect("task main via MIR task_registry");
 }
 
 // 注：v0.77 之前 §4-6 是 source-grep 测试（assert!(src.contains(...))），
 // 任何改名都会假阳性断裂、零 runtime 保护 — 已删除。
-// 静态合约（Value::Closure.mir_body 存在、dispatch 走 run_mir 分支、
+// 静态合约（Value::Closure.mir_body 存在、dispatch 走 execute 分支、
 // MirInst::Closure 存在）现在由 E2E tests/e2e.rs 镜像 main.rs::run_file
 // 调用栈的真实端到端断言承担。

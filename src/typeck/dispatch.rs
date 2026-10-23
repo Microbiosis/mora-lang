@@ -1247,7 +1247,7 @@ fn method_signature_builtin(receiver: &Type, method: &str) -> Option<Signature> 
         //
         // `tests/equivalent_spellings.rs` 里恰好有 `list_index_vs_get` 这条
         // 配对却一直「通过」——因为该文件的 `run` 只调 `ParserV3::compile` +
-        // `run_mir`，**完全绕过 typeck**。已一并补上（见该文件）。
+        // `execute`，**完全绕过 typeck**。已一并补上（见该文件）。
         (Type::List(elem), "get") => Some(Signature::new(
             vec![
                 ("self".to_string(), receiver.clone()),

@@ -405,7 +405,7 @@ fn d118_omitted_end_closure_works_and_does_not_swallow_statements() {
         ParserV3::compile(src).expect("spec §14.2 的 `fn(params) expr` 必须可解析");
     // 能解析不够 —— 还要能**执行**，且末值取到的是闭包外的语句。
     // 修复前 `let f = fn() 1` 会把后面三条都吞进闭包，顶层什么都不剩。
-    let got = run_mir_last_value(src);
+    let got = execute_last_value(src);
     assert!(
         !got.contains("Err"),
         "省略 `end` 的闭包必须可执行，实际: {got}"
@@ -413,19 +413,19 @@ fn d118_omitted_end_closure_works_and_does_not_swallow_statements() {
 
     // 对照组 1：`fn(x) x + 1` 闭包**返回值**正确（捕获参数 x）
     assert_eq!(
-        run_mir_last_value("let f = fn(x) x + 1\nf(2)\n"),
+        execute_last_value("let f = fn(x) x + 1\nf(2)\n"),
         "Float(3.0)",
         "`fn(params) expr` 必须返回 expr 的值"
     );
     // 对照组 2：显式 `end` 的 `return` 形式不受影响（`return` 不是表达式）
     assert_eq!(
-        run_mir_last_value("let f = fn() return 1 end\nf()\n"),
+        execute_last_value("let f = fn() return 1 end\nf()\n"),
         "Float(1.0)",
         "`return` 形式必须照旧工作（它不在 emit_expr_w 里，靠本测试防回归）"
     );
     // 对照组 3：换行多语句闭包**不能**被降成「只执行第一条」
     assert_eq!(
-        run_mir_last_value("let f = fn()\n  let a = 2\n  a + 40\nend\nf()\n"),
+        execute_last_value("let f = fn()\n  let a = 2\n  a + 40\nend\nf()\n"),
         "Float(42.0)",
         "换行块闭包仍是多语句；只看「首 token 是 Identifier」会把它误降成单表达式"
     );
@@ -440,7 +440,7 @@ fn d118_omitted_end_closure_works_and_does_not_swallow_statements() {
     //   「能编译」与「语义正确」在这里是两回事，那条断言只钉住了前者。
     //   这里补上执行层的钉子。
     assert_eq!(
-        run_mir_last_value("let g = fn(a) a + 1\ng(1)\n"),
+        execute_last_value("let g = fn(a) a + 1\ng(1)\n"),
         "Float(2.0)",
         "省略 end 的闭包必须真能求值"
     );
@@ -450,7 +450,7 @@ fn d118_omitted_end_closure_works_and_does_not_swallow_statements() {
 ///
 /// 这一条是 §6.1 改写的**前提**：如果闭包捕获不可用，就不能断言「实现对、
 /// spec 错」，而得反过来怀疑实现。`ParserV3::compile` 只能证明能解析，
-/// 所以这里另跑一次真实执行（`run_mir`）确认捕获的是**运行时值**。
+/// 所以这里另跑一次真实执行（`execute`）确认捕获的是**运行时值**。
 #[test]
 fn d118_closures_capture_lexical_values() {
     // 解析层：spec §6.1 改写后的原文
@@ -459,7 +459,7 @@ fn d118_closures_capture_lexical_values() {
 
     // 执行层：闭包捕获的是**运行时值**（10 + 20 = 30），不是 0 也不是编译期常量。
     // ⚠ 本语言所有裸数字字面量都是 `Value::Float`（D98：`type_of(1)` = `float`）。
-    let got = run_mir_last_value(spec_6_1);
+    let got = execute_last_value(spec_6_1);
     assert_eq!(
         got, "Float(30.0)",
         "闭包应捕获外层 x=10 与参数 y=20 求得 30"
@@ -487,7 +487,7 @@ fn d118_json_needs_double_quotes_not_single() {
 }
 
 /// 跑一段 Mora 并返回**末表达式**的运行时值（库层观察，`mora run` 不打印它）。
-fn run_mir_last_value(src: &str) -> String {
+fn execute_last_value(src: &str) -> String {
     use mora::interpreter::Interpreter;
     use mora::mir::vm::execute;
     use std::sync::Arc;

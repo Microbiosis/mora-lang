@@ -1,7 +1,7 @@
 //! Tier 2.5: Orchestrate V3 Pipeline integration tests
 //!
 //! 验证 orchestrate 在 V3 管线中完整流通：
-//! ParserV3::compile → MirInst::Orchestrate → run_mir → PregelEngine 执行
+//! ParserV3::compile → MirInst::Orchestrate → execute → PregelEngine 执行
 
 use mora::interpreter::Interpreter;
 use mora::mir::MirInst;

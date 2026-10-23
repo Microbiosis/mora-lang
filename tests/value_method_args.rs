@@ -134,7 +134,7 @@ fn d153_crush_json_and_tail_accept_int_max() {
 
 /// D153 主判据 ⑤：错类型必须报**类型错**，不得报「没传」（归因正确）。
 ///
-/// ⚠ **可达性说明（D154 更正）**：本文件用 `ParserV3::compile` + `run_mir`，
+/// ⚠ **可达性说明（D154 更正）**：本文件用 `ParserV3::compile` + `execute`，
 /// **绕过 typeck**。而真实 CLI（`mora <file>` / `mora --check`）会先跑 typeck，
 /// 同一段程序在**用户手上一条都到不了运行期**：
 ///
@@ -247,7 +247,7 @@ fn d153_already_correct_siblings_not_regressed() {
 
 /// D154：钉住**真实 CLI 路径**（带 typeck）对错类型实参的行为。
 ///
-/// 本文件其余判据用 `ParserV3::compile` + `run_mir` 绕过 typeck；
+/// 本文件其余判据用 `ParserV3::compile` + `execute` 绕过 typeck；
 /// 而 `mora <file>` / `mora --check` **会**先跑 typeck，在那里错类型实参
 /// 一条都到不了运行期。本条用 `cli::compile_and_opt` +
 /// `check_program_witnesses_bidirectional` 复现真实链路。

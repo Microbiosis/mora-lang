@@ -2,7 +2,7 @@
 //!
 //! ## 为什么需要这个文件
 //!
-//! `tests/run_mir_equiv_run_dag.rs` 用「生产路径 vs 强制线性路径」比较，
+//! `tests/execute_equiv_run_dag.rs` 用「生产路径 vs 强制线性路径」比较，
 //! 并在文件头断言 `while + continue` 用例里**生产路径的 5.0 是错的、
 //! 强制线性的 6.0 是对的**，还把它归因为执行器缺陷 E1。
 //!

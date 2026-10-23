@@ -1,6 +1,6 @@
 //! v0.75.9: MirFunction → 优化后 DAG 的跨调用缓存。
 //!
-//! `run_mir_with_signal` 此前每次调用全量重建 DAG（`dag_analyze` +
+//! `run_with_signal` 此前每次调用全量重建 DAG（`dag_analyze` +
 //! `dag_optimize` + `prune_sequence_edges`）。同一函数体多次调用
 //! （Closure/Task/循环内 WithConfig/pregel 每超步 agent）重复重建，
 //! 分析开销与分配都无谓。
@@ -189,7 +189,7 @@ impl DagCache {
 
     /// 获取或构建缓存 DAG。`func_arc` 是调用方持有的 `Arc<MirFunction>`。
     /// 构建路径 = `dag_analyze → dag_optimize → prune_sequence_edges`，
-    /// 与 `run_mir_with_signal` 原本的构建路径一致。
+    /// 与 `run_with_signal` 原本的构建路径一致。
     pub fn get_or_build(&mut self, func_arc: &Arc<MirFunction>) -> Arc<MirDag> {
         // 快路径：同一 Arc（指针）直接命中
         let ptr_key = Arc::as_ptr(func_arc) as usize;

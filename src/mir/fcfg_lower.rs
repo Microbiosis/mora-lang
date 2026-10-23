@@ -1107,7 +1107,7 @@ fn lower_block_to_function(ctx: &mut EmitContext, block: &Block<()>) -> super::M
 
 /// 将块降维为带尾部 Return 的 MirFunction（闭包/task/match-arm 体约定 —
 /// 镜像 emit_closure_mir / emit_fn_def_w：body 末尾必须 Return 结果寄存器，
-/// 否则 run_mir 调用闭包时返回 Nil）。Handle body/handler 不走此路径。
+/// 否则 execute 调用闭包时返回 Nil）。Handle body/handler 不走此路径。
 fn lower_body_function_with_return(ctx: &mut EmitContext, block: &Block<()>) -> super::MirFunction {
     let mut func = lower_block_to_function(ctx, block);
     if func.body.is_empty() || !matches!(func.body.last(), Some(MirInst::Return(_))) {

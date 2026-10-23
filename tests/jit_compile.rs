@@ -6,7 +6,7 @@
 //! 结果，与 aarch64 行为不兼容——加 `#![cfg(target_arch = "x86_64")]`
 //! 让 aarch64 runner 完全跳过整个测试 binary（cargo 编译级别，不 fail）。
 //!
-//! 守卫：JIT（run_jit 原生执行）与 MIR 解释器（run_mir）对同一程序产出
+//! 守卫：JIT（run_jit 原生执行）与 MIR 解释器（execute）对同一程序产出
 //! **相同的 Value**。两类输入：
 //!
 //! 1. 手工构造 `MirFunction`（绕过 lower 常量折叠）— 直接测机器码模板
@@ -568,7 +568,7 @@ fn jit_rejects_non_bool_cond() {
 }
 
 /// with-block 真实路径：WithConfig{jit:true} 经 h_with_config dispatch，
-/// 可编译 body 走 JIT（不回落）、不可编译 body 回落 run_mir —— 与
+/// 可编译 body 走 JIT（不回落）、不可编译 body 回落 execute —— 与
 /// jit=false（纯解释器）的最终 env 状态一致（config 设置/恢复无副作用）。
 fn with_config_env(body: &MirFunction, jit: bool) -> Result<mora::value::Environment, String> {
     use mora::mir::MirInst;
@@ -617,7 +617,7 @@ fn jit_with_config_compilable_body() {
     );
 }
 
-/// 不可编译 body（含 Define 副作用）：JIT 编译期拒绝 → 回落 run_mir，
+/// 不可编译 body（含 Define 副作用）：JIT 编译期拒绝 → 回落 execute，
 /// 与纯解释器行为一致。
 #[test]
 fn jit_with_config_falls_back() {

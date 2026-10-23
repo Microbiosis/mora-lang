@@ -52,7 +52,7 @@ use mora::typeck::check_mir::check_program_witnesses_bidirectional;
 /// 跑一段 Mora 源码，返回 `Value` 的 Debug 形态或 `ERR: …`。
 ///
 /// **同时跑 typeck** —— 本文件的断言都必须是「用户真写得出来」的代码。
-/// 只用 `run_mir` 会绕过 typeck，于是「typeck 拒绝、运行期却支持」的写法
+/// 只用 `execute` 会绕过 typeck，于是「typeck 拒绝、运行期却支持」的写法
 /// 会被当成有效断言固化。v0.104.6 在 `numeric_tower.rs` 上实测：加上这个
 /// 守卫后 15 条测试里 **8 条当场失败**，全在断言不可达代码。
 /// 需要记录「运行期已有、typeck 未放行」的能力时用 `run_runtime_only()`。
@@ -416,7 +416,7 @@ fn canonical_sum_spelling_is_stable() {
 // 真实 CLI 路径
 // ─────────────────────────────────────────────────────────────────────
 
-/// 库内测试走 `run_mir`，**绕过 typeck**。而 `mora run` 会在
+/// 库内测试走 `execute`，**绕过 typeck**。而 `mora run` 会在
 /// `main.rs:409` 跑 `check_program_witnesses_bidirectional`，出错即
 /// `process::exit(2)`。D4 那一族（typeck 放行、运行期报 Undefined）
 /// 只有在这条路径上才完整暴露，所以必须补一条子进程 e2e。
@@ -855,7 +855,7 @@ fn typeck_registered_methods_all_exist_at_runtime() {
 /// `"ai.chat(model: string, prompt: string) -> string"`。是 typeck 写错了。
 ///
 /// 这里逐条钉住常见用法的**可编译性** —— 判据是「typeck 放行」，所以必须走
-/// 真实 CLI（库内 `run_mir` 绕过 typeck，见本文件上方说明）。
+/// 真实 CLI（库内 `execute` 绕过 typeck，见本文件上方说明）。
 #[test]
 fn ai_chat_is_usable_from_source() {
     let cases: &[(&str, &str)] = &[
@@ -1532,7 +1532,7 @@ fn server_side_methods_of_are_all_callable() {
 /// 旁证：`str(r)` 一直好使，输出 `<router (0 routes)>`。
 ///
 /// 又一次「typeck 声明窄于运行期实际能力」，与 `ai.chat` 声明 `-> AiResult`
-/// 同源。判据是**真实 CLI**（库内 `run_mir` 绕过 typeck）。
+/// 同源。判据是**真实 CLI**（库内 `execute` 绕过 typeck）。
 #[test]
 fn print_accepts_server_and_handle_values() {
     let cases: &[(&str, &str)] = &[

@@ -208,7 +208,7 @@ pub fn optimize(func: &mut crate::mir::MirFunction, level: crate::mir::ssa::OptL
     //
     // D419 的修法：新增 [`crate::mir::ssa::Terminator::JumpExit`]（「跳到函数
     // 末尾」），与「返回」/「落进下一块」彻底分开；降维时发一条真跳转，由第四遍
-    // 补成重建后 body 的长度。`run_mir` 见 `pc >= body.len()` 即结束并走隐式
+    // 补成重建后 body 的长度。`execute` 见 `pc >= body.len()` 即结束并走隐式
     // 返回；`dag_analyze` 解析不到目标节点 ⇒ 该 Jump 节点无出边。两个执行器都
     // 与 opt=off 一致。
     //

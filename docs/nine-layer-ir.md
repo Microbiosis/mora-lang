@@ -334,9 +334,28 @@ D472 之后登记项由 4 条减为 1 条（`orchestrate`），D473 之后减为
 同时让注释里的「保持 `crate::mir::dst()` 等旧路径」成为**假话**
 （`mir::dst()` 从来不可用）。删除后 `mir::` 根只剩真正的 9 层 re-export。
 
-### 遗留 3：执行入口命名
+### 遗留 3：执行入口命名 —— **v0.104.6 D478 已解决**
 
 `run_mir` 这个名字暗示存在「线性执行器」，而自 v0.59 起仓库只有 DAG/BSP 一种
-执行实现（`src/mir/vm/mod.rs` 自陈：「`run_mir` 与 `run_dag*` 是**同一条路径**」）。
-v0.104.6 D467 已把主入口更名为 `execute`，但 `run_mir` 及其 100+ 调用点仍在，
-属于命名遗留而非功能缺陷。
+执行实现。v0.104.6 D467 已把主入口更名为 `execute`。
+
+**D478 把残留收干净**（D467 只改了主入口，命名遗留散在别处）：
+
+- **标识符**：`run_mir_dag` → `execute_program`（它跑的是**整个程序**：顶层 body
+  + `main` task，比 `execute` 多一步）；`run_mir_fn` → `execute_fn`。
+- **文件名**：`tests/run_mir_equiv_run_dag.rs` → `tests/execute_equiv_run_dag.rs`、
+  `tests/run_mir_tail_value.rs` → `tests/execute_tail_value.rs`。
+- **注释**：约 200 处引用逐条分类 —— **现时引用**改指现存的名字（`execute` /
+  `run_with_signal` / `execute_program`），**历史记档**（v0.59 归并、v0.59
+  「`run_mir ≡ run_dag`」假承诺、D467 改名说明）保留旧名但**明写「原名/旧名」**。
+- **别名**：`use …::execute as run_mir` 这类把旧名重新引入作用域的写法一并去掉。
+- **防回退守卫**：`tests/execute_naming_hygiene.rs` —— ① 代码里不得出现旧名；
+  ② 注释里提到旧名必须带历史标记词；③ 文件名不得带旧前缀。
+
+> D478 顺带修掉两处**批量替换会造成语义漂移**的地方：`vm/mod.rs` 模块文档里
+> 「## 关于 `run_mir` 这个名字」整段（改名前它说「保留下来是为兼容既有 100+
+> 调用点」—— 名字早已改掉，那段已是**假话**），以及 `vm/mod.rs` 测试里
+> 「`run_mir_dag` 直调 `dag_analyze`、不跑 `dag_optimize`」的注释（它与
+> `engine.rs` 的「改用 `MirHost::dag_cache()`，即 `dag_analyze → dag_optimize
+> → prune_sequence_edges`」**互相矛盾**，以后者为准）。
+

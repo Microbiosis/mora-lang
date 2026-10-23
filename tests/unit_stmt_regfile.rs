@@ -173,7 +173,7 @@ fn valueless_statements_as_sole_task_statement_all_run() {
 // 3) 防御层直接测试
 // ===================================================================
 
-/// 寄存器文件与指令引用不一致时，`run_mir` 必须返回**错误**而不是 panic。
+/// 寄存器文件与指令引用不一致时，`execute` 必须返回**错误**而不是 panic。
 ///
 /// 手工构造一个说谎的 `MirFunction`：`Return(Some(0))` 引用 reg 0，
 /// 而 `n_regs = 0`。这是 `transaction` 修前那条链路的**精确形状** ——

@@ -1059,7 +1059,7 @@ impl HMInference {
                 //（`orchestrate ... input -> result`）— 登记为 Any 类型，
                 // 避免后续引用 result 报 UnboundVariable。此前返回 Nil 但
                 // 不登记变量，pregel/sequential 路径经 CLI 都会撞此缺口
-                //（测试走 run_mir 绕过 typeck 未暴露）。
+                //（测试走 execute 绕过 typeck 未暴露）。
                 // ⚠ `input` 的类型载体必须是 **TypeVar**，不能是 `Type::Unknown` ——
                 //   而这不是「unify 的疏漏」，是 **v0.75.92 的既定 fail-fast 契约**
                 //   （`unify.rs`：「Unknown fail-fast — 与任何类型合一都失败……

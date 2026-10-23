@@ -1,6 +1,6 @@
 //! v0.77: E2E test harness — 镜像 main.rs::run_file 的完整调用栈：
 //!   cli::compile_and_opt → typeck::check_program_witnesses_bidirectional
-//!   → mir::vm::run_mir → mir::vm::run_main_task
+//!   → mir::vm::execute → mir::vm::run_main_task
 //!
 //! 与 parser_v2_integration.rs 那种依赖 cwd 的 read_to_string 不同，
 //! 本模块所有路径用 env!("CARGO_MANIFEST_DIR") 解析，CI 无依赖。
@@ -41,9 +41,9 @@ pub fn read_fixture(name: &str) -> String {
 
 /// E2E 编译 + 类型检查 + 执行的返回结果。
 pub enum E2eResult {
-    /// 编译 + 类型检查 + run_mir + run_main_task 全成功
+    /// 编译 + 类型检查 + execute + run_main_task 全成功
     Ok {
-        /// run_mir 返回的顶层最后表达式值
+        /// execute 返回的顶层最后表达式值
         last_expr: Value,
         /// run_main_task 期间 print 收集的 stdout（按行）
         stdout_lines: Vec<String>,
@@ -92,7 +92,7 @@ pub fn run_source(source: &str) -> E2eResult {
         &mut mora::mir::effect::Effects::new(),
     ) {
         Ok(v) => v,
-        Err(e) => return E2eResult::CompileError(format!("run_mir: {}", e)),
+        Err(e) => return E2eResult::CompileError(format!("execute: {}", e)),
     };
     if let Err(e) = run_main_task(
         &func_arc,

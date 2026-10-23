@@ -366,7 +366,7 @@ fn if_as_value_not_starved_by_dead_branch() {
             &mut env,
             &mut mora::mir::effect::Effects::new(),
         )
-        .expect("run_mir")
+        .expect("execute")
     };
 
     // 条件是常量 → else 臂折叠成死块（本缺陷的触发形态）
@@ -405,7 +405,7 @@ fn if_as_value_not_starved_by_dead_branch() {
 // 机制：`dag_analyze` 把 else 臂与汇合点串成 `12→13→14→15…` 同一个 Sequence 连通
 // 分量，于是 `Define("x", …)` 的 Sequence 前驱是 else 臂的 `Copy`；而 `c == 1`
 // 成立时 else 臂**不执行**，就绪门槛 `seq_preds[n].all(|&p| executed[p])` 永远
-// 不满足 → 汇合点不就绪 → 其后 `x + 1` 从不求值，`run_mir` 返回 `x` 的值。
+// 不满足 → 汇合点不就绪 → 其后 `x + 1` 从不求值，`execute` 返回 `x` 的值。
 // 无报错、退出码 0。
 //
 // 试过三种更严的 `seq_preds` 判据，**都破坏正确性**（后两种都挂

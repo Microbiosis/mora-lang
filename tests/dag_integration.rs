@@ -1,8 +1,8 @@
 //! v0.59: DAG interpreter integration tests.
 //!
-//! Verifies that `run_mir_dag` can execute real programs without crashing.
+//! Verifies that `execute_program` can execute real programs without crashing.
 //! Pure-computation programs use DAG execution; programs with `task main()`
-//! delegate the task body to `run_mir` via `run_main_task`.
+//! delegate the task body to `execute` via `run_main_task`.
 
 use mora::interpreter::Interpreter;
 use mora::parser_v3::ParserV3;
@@ -11,7 +11,7 @@ fn run_dag_path(source: &str) -> Result<(), String> {
     let (func, _witnesses) = ParserV3::compile(source)?;
     let mut interp = Interpreter::new();
     let mut env = interp.take_env();
-    mora::mir::vm::run_mir_dag(
+    mora::mir::vm::execute_program(
         &std::sync::Arc::new(func),
         &mut interp,
         &mut env,
@@ -30,12 +30,12 @@ fn dag_pure_computation_no_crash() {
 
 #[test]
 fn dag_task_with_main_no_crash() {
-    // The task body is executed via run_main_task → run_mir, not through the
+    // The task body is executed via run_main_task → execute, not through the
     // top-level DAG. This test verifies the full pipeline doesn't crash.
     //
     // v0.104.6：补一条真断言 —— `task main()` 的**副作用**（打印）必须发生。
     // 此前只有 `.expect("... via DAG pipeline")`，即只断言顶层 body 不报错；
-    // main task 是否真的执行了完全没验证。`run_mir_dag` 里 main task 的返回值
+    // main task 是否真的执行了完全没验证。`execute_program` 里 main task 的返回值
     // 被 `run_main_task` 丢弃（`let _ = ...`），所以只能从副作用观察。
     // 「Line 1: hello」正是 `examples/compress_demo.mora` 经 DAG 路径运行时的
     // 首行输出；`dag_task_with_main_no_crash` 用的是内联 fixture，故此处
@@ -50,8 +50,8 @@ fn dag_compress_demo_no_crash() {
     let (func, _witnesses) = ParserV3::compile(&source).expect("compile");
     let mut interp = Interpreter::new();
     let mut env = interp.take_env();
-    // v0.75.9: 包裹 Arc（run_mir_dag 签名变更）
-    let v = mora::mir::vm::run_mir_dag(
+    // v0.75.9: 包裹 Arc（execute_program 签名变更）
+    let v = mora::mir::vm::execute_program(
         &std::sync::Arc::new(func),
         &mut interp,
         &mut env,

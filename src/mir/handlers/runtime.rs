@@ -52,7 +52,7 @@ pub(super) fn run_isolated(
 
 /// 执行预 lowered MirFunction → Value（零 MirExpr 依赖）。
 /// v0.91: 替代 eval_expr_value，handlers 不再需要 MirExpr 做运行时求值。
-pub(super) fn run_mir_fn(
+pub(super) fn execute_fn(
     interp: &mut dyn MirHost,
     env: &mut Environment,
     func: &MirFunction,
@@ -634,7 +634,7 @@ fn run_moe(
     let input_val = env.get(input_var).unwrap_or(Value::Nil);
 
     // 1. router 执行（语言面 fn）→ 分数 dict
-    let router_val = run_mir_fn(interp, env, router_fn, effects)?;
+    let router_val = execute_fn(interp, env, router_fn, effects)?;
     let scores = match interp.call_value(&router_val, vec![input_val.clone()], effects)? {
         Value::Dict(d) => d,
         other => {
@@ -693,7 +693,7 @@ fn run_moe_expert(
     prompt_fn: &MirFunction,
     effects: &mut crate::mir::effect::Effects,
 ) -> Result<Value, String> {
-    let def_val = run_mir_fn(interp, env, &expert.def_fn, effects)?;
+    let def_val = execute_fn(interp, env, &expert.def_fn, effects)?;
     match def_val {
         // 函数专家：Closure/Task/Compose/Partial → call_value
         Value::Closure { .. } | Value::Task { .. } | Value::Compose(_) | Value::Partial(_, _) => {
@@ -711,7 +711,7 @@ fn run_moe_expert(
                 }
             };
             // prompt 函数 → 值（含 {input} 插值，经 env 的 input 变量）
-            let prompt_val = run_mir_fn(interp, env, prompt_fn, effects)?;
+            let prompt_val = execute_fn(interp, env, prompt_fn, effects)?;
             let prompt_str = match prompt_val {
                 Value::String(s) => s,
                 other => other.to_string(),

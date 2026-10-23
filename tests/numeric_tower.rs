@@ -50,7 +50,7 @@ use mora::typeck::check_mir::check_program_witnesses_bidirectional;
 /// 跑一段源码，返回 `Value` 的 Debug 形态。
 ///
 /// **同时跑 typeck** —— 本文件里所有断言都必须是「用户真写得出来」的代码。
-/// 只用 `run_mir` 会绕过 typeck，于是「typeck 拒绝、运行期却支持」的写法
+/// 只用 `execute` 会绕过 typeck，于是「typeck 拒绝、运行期却支持」的写法
 /// （D23 的字符串隐式拼接就是这类）会被当成有效断言固化下来。这里让
 /// typeck 不通过就直接 panic，使这类断言当场暴露。
 fn run(src: &str) -> String {
@@ -577,7 +577,7 @@ fn list_broadcast_preserves_the_operator() {
 ///
 /// 这一条是 D24 的直接护栏：广播的实现（`flow` 侧）早就存在且正确，但
 /// typeck 全拒，于是整节 spec 特性从源码不可达。运行期测试**看不出**这件事
-/// （`run_mir` 绕过 typeck），必须显式断言 typeck 放行。
+/// （`execute` 绕过 typeck），必须显式断言 typeck 放行。
 #[test]
 fn list_broadcast_is_accepted_by_typeck() {
     // 本文件的 `run()` 已内建 typeck 守卫（typeck 不过即 panic），

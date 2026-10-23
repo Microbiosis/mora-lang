@@ -1,9 +1,9 @@
-//! v0.104.6 D466：生产路径 `run_mir` 与 DAG 路径的**真实**等价性护栏。
+//! v0.104.6 D466：生产路径 `execute` 与 DAG 路径的**真实**等价性护栏。
 //!
 //! ## 背景：一条曾是假承诺的契约
 //!
 //! v0.59 起，`src/mir/vm.rs` 的文档写着
-//! 「`run_mir ≡ run_dag`（`dag.add_sequential_edges` 后退化线性）」。该承诺
+//! 「`execute ≡ run_dag`（`dag.add_sequential_edges` 后退化线性）」。该承诺
 //! 建立在 `MirDag::add_sequential_edges` 之上 —— 一个按**相邻节点编号** i→i+1
 //! 补 `Sequence` 边的方法。
 //!
@@ -19,7 +19,7 @@
 //! 后果：`break` / `continue` 被架空（跳出线性链的控制转移在链上失效，循环体
 //! 多跑一轮）、if/else 两臂被串行化。实测 3 例分歧，**错的恒是加此方法的一侧**：
 //!
-//! | 用例 | run_mir（生产） | 加 `add_sequential_edges` | 正确值 |
+//! | 用例 | execute（生产） | 加 `add_sequential_edges` | 正确值 |
 //! |---|---|---|---|
 //! | if/else | 8.0 | `Bool(false)` | 8.0 |
 //! | for + break | 2.0 | 5.0 | 2.0 |
@@ -35,8 +35,8 @@
 //! ## 本文件现在测什么
 //!
 //! A 组（`assert_optimization_preserves_semantics`）：**生产路径**在
-//! `dag_optimize` 前后的语义不变 —— 直接比对 `run_mir` 与 `run_dag`。
-//! B 组 6 条：`run_mir` 与 DAG 路径在真实程序上的等价。
+//! `dag_optimize` 前后的语义不变 —— 直接比对 `execute` 与 `run_dag`。
+//! B 组 6 条：`execute` 与 DAG 路径在真实程序上的等价。
 //!
 //! 这两组都是**生产链上的**真实等价，是有效的护栏。
 
@@ -47,7 +47,7 @@ use mora::mir::MirInst;
 use mora::value::Value;
 
 /// 生产路径返回值。
-fn via_run_mir(src: &str) -> String {
+fn via_execute(src: &str) -> String {
     let (func, witnesses) = mora::parser_v3::ParserV3::compile(src).expect("compile");
     let errs = mora::typeck::check_mir::check_program_witnesses_bidirectional(&witnesses);
     assert!(errs.is_empty(), "type errors: {:?}", errs);
@@ -60,11 +60,11 @@ fn via_run_mir(src: &str) -> String {
         &mut env,
         &mut mora::mir::effect::Effects::new(),
     )
-    .expect("run_mir");
+    .expect("execute");
     format!("{:?}", v)
 }
 
-/// **未优化**路径返回值：`run_mir_dag` 直调 `dag_analyze`，**绕过 `dag_optimize`
+/// **未优化**路径返回值：`execute_program` 直调 `dag_analyze`，**绕过 `dag_optimize`
 /// 与 DAG 缓存**（对比生产链 `dag_analyze → dag_optimize → prune_sequence_edges`）。
 ///
 /// 它只在测试里被调用（`tests/dag_integration.rs`），因此**优化阶段对它完全
@@ -73,25 +73,25 @@ fn via_run_mir(src: &str) -> String {
 ///
 /// 本组用例把两条路线**按值**对比 —— 优化是保语义的重写，两者必须相等。
 /// 这是当前缺失的那道护栏。
-fn via_run_mir_dag_unoptimized(src: &str) -> String {
+fn via_execute_program_unoptimized(src: &str) -> String {
     let (func, _witnesses) = mora::parser_v3::ParserV3::compile(src).expect("compile");
     let arc = Arc::new(func);
     let mut interp = mora::interpreter::Interpreter::new();
     let mut env = interp.take_env();
-    let v = mora::mir::vm::run_mir_dag(
+    let v = mora::mir::vm::execute_program(
         &arc,
         &mut interp,
         &mut env,
         &mut mora::mir::effect::Effects::new(),
     )
-    .expect("run_mir_dag");
+    .expect("execute_program");
     format!("{:?}", v)
 }
 
 /// 优化保语义：生产路径（已优化）必须与未优化路径结果一致。
 fn assert_optimization_preserves_semantics(label: &str, src: &str) {
-    let opt = via_run_mir(src);
-    let raw = via_run_mir_dag_unoptimized(src);
+    let opt = via_execute(src);
+    let raw = via_execute_program_unoptimized(src);
     assert_eq!(
         opt, raw,
         "{}: dag_optimize 改变了语义（已优化={} 未优化={}）",
@@ -99,7 +99,7 @@ fn assert_optimization_preserves_semantics(label: &str, src: &str) {
     );
 }
 
-// ── 优化保语义：生产（已优化） ≡ run_mir_dag（未优化）────────────────────
+// ── 优化保语义：生产（已优化） ≡ execute_program（未优化）────────────────────
 //
 // 这组是 v0.104.6 补上的缺失护栏：优化阶段此前没有任何「与未优化结果对比」的
 // 断言，CSE 跨区域合并一类**保语义性破坏**因而能一路存活到生产。
@@ -170,7 +170,7 @@ fn optimize_preserves_handwritten_mir_chain() {
         &mut e1,
         &mut mora::mir::effect::Effects::new(),
     )
-    .expect("run_mir");
+    .expect("execute");
 
     // 未优化
     let arc2 = Arc::new(mora::mir::MirFunction {
@@ -206,7 +206,7 @@ fn optimize_preserves_handwritten_mir_chain() {
 /// 此处改为**生产建图**：`dag_analyze` → `dag_optimize`（与
 /// `DagCache::build` 同链），再交给同一个 BSP 执行器。
 ///
-/// 这样本组断言的是**真实**的 `run_mir` ≡ `run_dag`，而非「线性化 + 忽略
+/// 这样本组断言的是**真实**的 `execute` ≡ `run_dag`，而非「线性化 + 忽略
 /// 跳转」的混合体。
 fn via_dag(src: &str) -> String {
     let (func, witnesses) = mora::parser_v3::ParserV3::compile(src).expect("compile");
@@ -229,20 +229,20 @@ fn via_dag(src: &str) -> String {
 
 /// 逐例断言两条路线等价。
 fn assert_equiv(label: &str, src: &str) {
-    let a = via_run_mir(src);
+    let a = via_execute(src);
     let b = via_dag(src);
-    assert_eq!(a, b, "{}: run_mir 与 run_dag 不等价", label);
+    assert_eq!(a, b, "{}: execute 与 run_dag 不等价", label);
 }
 
 // ── 6 条真等价用例 ────────────────────────────────────────────────────────
 
 #[test]
-fn run_mir_equiv_dag_arithmetic() {
+fn execute_equiv_dag_arithmetic() {
     assert_equiv("arithmetic", "let a = 1\nlet b = 2\nlet c = a + b * 3\nc\n");
 }
 
 #[test]
-fn run_mir_equiv_dag_for_loop() {
+fn execute_equiv_dag_for_loop() {
     assert_equiv(
         "for loop",
         "let t = 0\nfor i in [1, 2, 3, 4]\n  assign t = t + i\nend\nt\n",
@@ -250,7 +250,7 @@ fn run_mir_equiv_dag_for_loop() {
 }
 
 #[test]
-fn run_mir_equiv_dag_while_loop() {
+fn execute_equiv_dag_while_loop() {
     assert_equiv(
         "while loop",
         "let t = 0\nlet k = 0i\nwhile k < 5i\n  assign t = t + k\n  assign k = k + 1i\nend\nt\n",
@@ -258,7 +258,7 @@ fn run_mir_equiv_dag_while_loop() {
 }
 
 #[test]
-fn run_mir_equiv_dag_nested_loops() {
+fn execute_equiv_dag_nested_loops() {
     assert_equiv(
         "nested loops",
         "let t = 0\nfor a in [1, 2, 3]\n  for b in [1, 2]\n    assign t = t + a * b\n  end\nend\nt\n",
@@ -266,12 +266,12 @@ fn run_mir_equiv_dag_nested_loops() {
 }
 
 #[test]
-fn run_mir_equiv_dag_closure() {
+fn execute_equiv_dag_closure() {
     assert_equiv("closure", "let f = fn(a, b) a * b + 1 end\nf(3, 4)\n");
 }
 
 #[test]
-fn run_mir_equiv_dag_return() {
+fn execute_equiv_dag_return() {
     assert_equiv(
         "explicit return",
         // v0.104.6 D42：原先这里是**顶层** `return`（`let x = 5 / if x > 1
@@ -287,11 +287,11 @@ fn run_mir_equiv_dag_return() {
 // ── 控制流等价用例（v0.104.6 D466：由 `#[ignore]` 分歧记录**转为**真实护栏）──
 //
 // 这三个程序正是当初暴露 `add_sequential_edges` 造伪图的那三个。删除该方法、
-// 改用生产建图后，它们测的已是**真实**的 `run_mir` ≡ `run_dag` —— 从此
+// 改用生产建图后，它们测的已是**真实**的 `execute` ≡ `run_dag` —— 从此
 // 作为控制流（分支汇合 / break / continue）的等价护栏常驻。
 
 #[test]
-fn run_mir_equiv_dag_if_else_value() {
+fn execute_equiv_dag_if_else_value() {
     assert_equiv(
         "if/else as value",
         "let c = 2\nlet x = if c == 1 then 5 else 7 end\nx + 1\n",
@@ -299,7 +299,7 @@ fn run_mir_equiv_dag_if_else_value() {
 }
 
 #[test]
-fn run_mir_equiv_dag_while_continue() {
+fn execute_equiv_dag_while_continue() {
     assert_equiv(
         "while + continue",
         "let n = 0\nlet k = 0i\nwhile k < 6i\n  if k == 2i then\n    assign k = k + 1i\n    continue\n  end\n  assign n = n + 1\n  assign k = k + 1i\nend\nn\n",
@@ -307,7 +307,7 @@ fn run_mir_equiv_dag_while_continue() {
 }
 
 #[test]
-fn run_mir_equiv_dag_for_break() {
+fn execute_equiv_dag_for_break() {
     assert_equiv(
         "for + break",
         "let n = 0\nfor x in [1, 2, 3, 4, 5]\n  if x == 3 then\n    break\n  end\n  assign n = n + 1\nend\nn\n",

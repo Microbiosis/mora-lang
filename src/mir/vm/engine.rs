@@ -15,12 +15,13 @@
 //! （`mir/inst.rs`，穷尽匹配 59 个 `MirInst` 变体）承担，本模块只决定
 //! **执行顺序**（数据就绪 + BSP 超步 + Sequence 门控）。
 //!
-//! ## 与 `run_mir` 的关系（v0.59 起已归并）
+//! ## 与 `execute` 的关系（v0.59 起已归并）
 //!
-//! 历史上曾有「线性执行器 `run_mir`」与本 DAG 执行器两套实现。**v0.59 已
-//! 把线性实现归并进本引擎**：`run_mir` 现在是本引擎的薄封装（`vm/mod.rs`
-//! 里的转发层），两者共用同一个 `dispatch`。故 `run_mir` 这个名字**不代表
-//! 存在「线性执行」** —— 见 `vm/mod.rs` 的模块文档。
+//! 历史上曾有「线性执行器 `run_mir`」（v0.104.6 D467 已更名为 `execute`）
+//! 与本 DAG 执行器两套实现。**v0.59 已把线性实现归并进本引擎**：
+//! `execute` 现在是本引擎的薄封装（`vm/mod.rs` 里的转发层），两者共用
+//! 同一个 `dispatch`。故 `execute` 这个名字**不代表存在「线性执行」**
+//! —— 见 `vm/mod.rs` 的模块文档。
 //!
 //! 控制流由**图边**决定：`dispatch` 对 `Jump`/`Break`/`Continue` 返回的
 //! `Flow::Jump(_)` 在本层是 **no-op**（`dag.rs` 内「Edge 驱动」注释处），
@@ -57,14 +58,14 @@ use crate::value::{Environment, Value};
 // 编号≠执行序，于是架空 `break` / `continue`、串行化 if/else 两臂。
 // `add_sequential_edges` 因「`src/` 内零调用 + 自己声明不保语义」于 D466
 // 整体删除；根因与证据见 `src/mir/dag.rs` 末尾的删除说明。
-// 现在等价性由 `tests/run_mir_equiv_run_dag.rs` 的 13 条（生产建图 vs
+// 现在等价性由 `tests/execute_equiv_run_dag.rs` 的 13 条（生产建图 vs
 // 生产执行路径）持续钉住，「哪边对」的独立判据见
 // `tests/continue_semantics.rs`。
 //
 // # 执行边界（v0.75.33，v0.75.36 修正）
 //
 // 本解释器为 **pregel 顶点执行 + 生产主路径** 双用途：pregel BSP 引擎
-// 逐超步调用，同时 `run_mir`（main.rs/REPL/import）经 `run_dag_with_signal`
+// 逐超步调用，同时 `execute`（main.rs/REPL/import）经 `run_dag_with_signal`
 // 也走本解释器——**生产路径全部经过 DAG 解释器，不存在「循环走线性
 // fallback」**。
 // - 无循环的直线/分支程序：正确（Sequence 前驱判定保证 Define/Var 顺序）。
@@ -411,7 +412,7 @@ pub fn run_dag_with_signal_memo(
     // Control，但**循环体自己仍是一整块**，其
     // `seq_preds[body] = [前驱, block_entry]` 原样保留 —— 那正是让
     // `Index(list, i)` 不早于 `i = i + 1` 的约束（放松它会得到
-    // `run_mir: index 2 out of bounds (len 2)`）。
+    // `execute: index 2 out of bounds (len 2)`）。
     //
     // **四次失败的判据为何全都不对**（保留记录：它们都不是「差一点」）：
     //   1. 「同 Sequence 分量」—— 判据本身是同义反复：把 Sequence 连通分量
@@ -745,7 +746,7 @@ pub fn run_dag_with_signal_memo(
 ///
 /// v0.104.6：**改用 `MirHost::dag_cache()` 取 DAG**，即
 /// `dag_analyze → dag_optimize → prune_sequence_edges`，与生产路径
-/// （`run_mir` + `run_main_task`，见 `main.rs::run_file`）**同链**。
+/// （`execute` + `run_main_task`，见 `main.rs::run_file`）**同链**。
 ///
 /// 动机：本函数此前只在 `tests/dag_integration.rs` 用，且直调 `dag_analyze`
 /// **绕过 `dag_optimize`**，于是该文件测的是**未优化**的图 —— 优化阶段的语义
@@ -756,13 +757,13 @@ pub fn run_dag_with_signal_memo(
 /// 项）。该问题已定位并修复：根因是 `dag.reachable` 从 pc 0 出发，而优化会
 /// 改写入口 —— 不可达判据必须是「**能否被当前入口激活**」，已由
 /// `MirDag::recompute_reachable_from_entry` + `apply_rewrite` 中的不动点迭代
-/// 落实。回归测试：`tests/run_mir_equiv_run_dag.rs::optimize_preserves_handwritten_mir_chain`。
+/// 落实。回归测试：`tests/execute_equiv_run_dag.rs::optimize_preserves_handwritten_mir_chain`。
 ///
-/// 注：`run_main_task` 内部 `let _ = run_mir(...)`，**丢弃 main task 的返回值**
+/// 注：`run_main_task` 内部 `let _ = execute(...)`，**丢弃 main task 的返回值**
 /// （`vm.rs`），故本函数返回的始终是**顶层 body 的值**；对纯 `task main()`
 /// 程序该值为 `Nil`。生产路径同样丢弃两者返回值、只检查错误，故两者在返回值
 /// 语义上一致。
-pub fn run_mir_dag(
+pub fn execute_program(
     func: &Arc<MirFunction>,
     interp: &mut dyn MirHost,
     env: &mut Environment,

@@ -53,7 +53,7 @@ use mora::parser_v3::ParserV3;
 use mora::typeck::check_mir::check_program_witnesses_bidirectional;
 
 /// 走**生产路径**（`cli::compile_and_opt` = 9 层管线 + 优化）执行并收集
-/// `print` 的输出行。默认 banner 由 `run_mir` 不产生。
+/// `print` 的输出行。默认 banner 由 `execute` 不产生。
 fn run_production(src: &str) -> Result<String, String> {
     let (func, witnesses) = compile_and_opt(src, None).map_err(|e| format!("COMPILE: {e}"))?;
     let errs = check_program_witnesses_bidirectional(&witnesses);
@@ -76,7 +76,7 @@ fn run_production(src: &str) -> Result<String, String> {
 /// 修前：`print(r)` 与 `print(999)` **都不输出**（静默饿死）。
 ///
 /// 判据用**尾表达式**而非 `print` —— 仓库的 `e2e_helpers` 没能捕获
-/// `print` 输出（`stdout_lines` 恒空），而 `run_mir` 返回顶层最后一条
+/// `print` 输出（`stdout_lines` 恒空），而 `execute` 返回顶层最后一条
 /// 指令的值。`let r = handle …` 之后放一个字面量作哨兵：若 `Define`
 /// 永不激活、其后的语句全被饿死，末表达式就是 `Nil`。
 #[test]

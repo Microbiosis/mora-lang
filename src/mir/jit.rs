@@ -21,7 +21,7 @@
 //!
 //! 编译期拒绝（回落解释器）：Mixed 类型、Var/Define/调用/效果/控制流、
 //!   其他架构。拒绝总是 [`JitError`]（分类可审计）—— 调用方
-//!   （h_with_config）回落 `run_mir`，语义正确性永远由解释器兜底，
+//!   （h_with_config）回落 `execute`，语义正确性永远由解释器兜底，
 //!   JIT 只是加速器。
 //!
 //! ## 错误分类（v0.75.50，JitError）
@@ -1082,7 +1082,7 @@ impl std::error::Error for JitError {}
 /// copy-and-patch JIT：对纯线性数字子集编译执行，其余回落解释器。
 ///
 /// `Err` = 编译期拒绝 / 运行期守卫失败 / 基础设施失败 — 调用方回落
-/// `run_mir`（语义正确性由解释器兜底）。
+/// `execute`（语义正确性由解释器兜底）。
 pub fn run_jit(
     func: &MirFunction,
     _interp: &mut dyn MirHost,
@@ -1106,7 +1106,7 @@ pub fn run_jit(
         // ① 类型标签守卫失败（tag 不匹配）；
         // ② **整数溢出**（`jo` 检出 OF 标志，Add/Sub/Mul 超出 i64 范围）。
         //
-        // 两者都**回落解释器**（`run_jit` 的 Err 分支 → 调用方 `run_mir`），
+        // 两者都**回落解释器**（`run_jit` 的 Err 分支 → 调用方 `execute`），
         // 由解释器给出最终答案：① 是类型错误，② 是 `MoraError`（整数溢出）。
         // JIT 自己**不做**语义裁决 —— 裁决权在解释器。
         Err(JitError::GuardFail(

@@ -243,7 +243,7 @@ fn d328_status_quo_partial_and_compose_results_are_unappliable() {
     );
     // 内联 postfix：v0.104.6 补齐后**已可用**（此前 D123 记为语法缺口）。
     //
-    // ⚠ 本条走**真实 CLI**（含 typeck），所以它证明的不只是 `run_mir` 能算 ——
+    // ⚠ 本条走**真实 CLI**（含 typeck），所以它证明的不只是 `execute` 能算 ——
     // 是「解析 + MIR 的 CallValue + typeck 的 Evaluated 被调者」三段都通。
     // 实得 `3.0`（= `curry(x+1, 1)` 取回 1 元闭包，再喂 `2`）。
     let (code, got) = run("print(curry(fn(x) x+1 end, 1)(2))\n", "curry_inline");

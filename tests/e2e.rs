@@ -402,7 +402,7 @@ fn e2e_dict_access_runs() {
 // ===================================================================
 
 /// function_call.mora：task 定义 + 跨 task 调用 + print。
-/// 这条路径覆盖 call_value → run_mir 关键 dispatch 路径。
+/// 这条路径覆盖 call_value → execute 关键 dispatch 路径。
 #[test]
 fn e2e_task_define_and_call_runs() {
     assert_ok("function_call.mora");
@@ -411,7 +411,7 @@ fn e2e_task_define_and_call_runs() {
 /// macro_def.mora：macro 定义 + 展开 + 调用。
 /// v0.83: 验证 parser emit_macro_def_w 保留宏体（子 EmitContext 编译），
 /// Value::Macro { body: Arc<MirFunction> } 存储宏体，
-/// call_builtin_fallback 以 args 绑定 params，子 env run_mir 执行 body。
+/// call_builtin_fallback 以 args 绑定 params，子 env execute 执行 body。
 /// 此前 Value::Macro 仅存 name+params（无 body），调用方报错"not implemented"。
 #[test]
 fn e2e_macro_define_and_expand_runs() {
@@ -537,13 +537,13 @@ fn e2e_fixtures_are_non_empty() {
 /// 验证相同 fixture 跑两次都成功（deterministic 执行）。
 ///
 /// v0.104.6 D466 **更正**：本函数原注释称
-/// 「`run_mir ≡ run_dag(add_sequential_edges 后)` 是 v0.59 起的核心承诺」——
+/// 「`execute ≡ run_dag(add_sequential_edges 后)` 是 v0.59 起的核心承诺」——
 /// 但它**从未**构造 `add_sequential_edges`、也**从未**对比两条路线，只断言
-/// 「同一 fixture 跑两次都成功」。真正的 `run_mir` ≡ `run_dag` 等价性护栏在
-/// `tests/run_mir_equiv_run_dag.rs`（13 条，生产建图 vs 生产执行路径）；
+/// 「同一 fixture 跑两次都成功」。真正的 `execute` ≡ `run_dag` 等价性护栏在
+/// `tests/execute_equiv_run_dag.rs`（13 条，生产建图 vs 生产执行路径）；
 /// `add_sequential_edges` 已于 D466 整体删除。
 #[test]
-fn e2e_run_mir_deterministic() {
+fn e2e_execute_deterministic() {
     assert_ok("arithmetic.mora");
     assert_ok("arithmetic.mora");
 }
@@ -1196,7 +1196,7 @@ fn e2e_if_then_block_and_single_stmt_forms() {
     // 注：本测试关心的是「这些拼写能否解析 + 执行后是否继续到后续语句」，
     // 而 `run_source` 的 last_expr 取自顶层末表达式 —— 其取法对
     // `if … end` + 尾随表达式的形状不敏感（helper 语义），故这里断言
-    // **执行成功**；精确尾值由下面的 `run_mir` 直调路径验证。
+    // **执行成功**；精确尾值由下面的 `execute` 直调路径验证。
     let ok = |src: &str| match run_source(src) {
         E2eResult::Ok { .. } => true,
         E2eResult::CompileError(e) => panic!("compile error: {e}\n---\n{src}"),
@@ -1217,7 +1217,7 @@ fn e2e_if_then_block_and_single_stmt_forms() {
     ok("if true then print(\"t\") end\n9i");
     // then + break（语句而非表达式）
     ok("for i in [1i, 2i, 3i]\n  if i == 2i then break end\n  print(i)\nend\n1i");
-    // 三种拼写在 run_mir 直调下都返回尾值 7（精确值验证）
+    // 三种拼写在 execute 直调下都返回尾值 7（精确值验证）
     use mora::mir::vm::execute;
     use std::sync::Arc;
     for src in [
@@ -1235,7 +1235,7 @@ fn e2e_if_then_block_and_single_stmt_forms() {
             &mut env,
             &mut mora::mir::effect::Effects::new(),
         )
-        .expect("run_mir");
+        .expect("execute");
         assert!(
             matches!(v, Value::Int(7) | Value::Float(_)),
             "if 语句之后的尾随表达式必须被执行到（得到 {:?}）:\n{src}",
@@ -1317,7 +1317,7 @@ fn e2e_string_method_arities_match_runtime() {
 ///
 /// 缺陷：`emit_transaction_w` 用 `let mut last = 0` 哨兵，而事务体是**独立
 /// 寄存器空间** —— `transaction end`（空体）一个寄存器都没分配，引用 reg 0
-/// 让 `run_mir` 拿到 n_regs=0 的函数 → `node_ready` 的 `reg_ready[0]` 越界
+/// 让 `execute` 拿到 n_regs=0 的函数 → `node_ready` 的 `reg_ready[0]` 越界
 /// panic（"the len is 0 but the index is 0"，退出码 101）。`commit`/`rollback`
 /// 同样返回哨兵 0。改用真实分配的寄存器。
 #[test]
@@ -1325,7 +1325,7 @@ fn e2e_empty_blocks_do_not_panic() {
     use mora::mir::vm::execute;
     use mora::value::Value;
     use std::sync::Arc;
-    // 直调 `run_mir` 断言尾值 —— 与本文件其他条目的 helper 取法无关，
+    // 直调 `execute` 断言尾值 —— 与本文件其他条目的 helper 取法无关，
     // 直接验证「空块之后程序继续执行、返回尾值」。
     for (label, src, expect) in [
         ("空 transaction 体", "transaction\nend\n5i\n", 5.0),
@@ -1355,7 +1355,7 @@ fn e2e_empty_blocks_do_not_panic() {
             &mut env,
             &mut mora::mir::effect::Effects::new(),
         )
-        .expect("run_mir 不得 panic");
+        .expect("execute 不得 panic");
         let n = match v {
             Value::Int(n) => n as f64,
             Value::Float(n) => n,

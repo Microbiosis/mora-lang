@@ -3,12 +3,12 @@
 //! ## 这个模块**不拥有执行实现**（v0.104.6 D467 重写）
 //!
 //! v0.75.47 起本文件叫「VM 执行内核」，并在注释里声称拥有
-//! `run_mir` / `run_dag_with_signal*`。实测那是**假的**：本文件里**一行
+//! `execute` / `run_dag_with_signal*`。实测那是**假的**：本文件里**一行
 //! 指令执行逻辑都没有**，只有一层转发 ——
 //!
 //! ```text
-//! run_mir            (本文件)  → run_mir_with_signal(本文件).1
-//! run_mir_with_signal (本文件)  → run_dag_with_signal(engine)
+//! execute             (本文件)  → run_with_signal(本文件).1
+//! run_with_signal     (本文件)  → run_dag_with_signal(engine)
 //! run_dag_with_signal (engine)  → run_dag_with_signal_memo(engine)
 //! run_dag_with_signal_memo     ← **唯一的指令执行循环**（engine.rs）
 //! ```
@@ -29,15 +29,16 @@
 //!   `MirSignal`、`build_task_registry`、`run_main_task`（main 入口查找）。
 //! - 执行策略（何时建图、怎么调度）全部在 `engine`，本文件**不再假装**拥有它。
 //!
-//! ## 关于 `run_mir` 这个名字
+//! ## 关于 `execute` 这个名字
 //!
-//! 它保留下来是为兼容既有 100+ 调用点，但它**不再是「线性执行器」**：
-//! 实际是「建 DAG → BSP 超步调度」。`run_mir` 与 `run_dag*` 是**同一条
-//! 路径**（前者是后者的薄封装），两者共用同一个 `dispatch`。历史上
-//! 「线性执行」的实现已于 v0.59 归并进 DAG 执行器，名字却留了下来 ——
-//! 本次不再新增第二套执行器，也不再让名字暗示存在「两套」。
+//! v0.104.6 D467：主入口**原名 `run_mir`**，已更名为 `execute` ——
+//! 旧名暗示存在「线性执行器」，而自 v0.59 起仓库里**只有** DAG/BSP 一种
+//! 执行实现。重命名让 API 名副其实。
 //!
-//! 若要直接用引擎，用 `engine::` 下的显式入口（`run_mir_with_signal` 等）。
+//! `execute` 实际是「建 DAG → BSP 超步调度」，与 `run_dag*` 是**同一条
+//! 路径**（前者是后者的薄封装），两者共用同一个 `dispatch`。
+//!
+//! 若要直接用引擎，用 `engine::` 下的显式入口（`run_with_signal` 等）。
 //!
 //! 参数类型为 `&mut dyn MirHost`（`mir/host.rs`），解耦 mir ↔ interpreter
 //! 双向依赖。`Interpreter` 实现 `MirHost`。
@@ -89,19 +90,19 @@ pub fn build_task_registry(body: &[MirInst]) -> HashMap<&str, (&[String], &MirFu
 /// 见 `tests/continue_semantics.rs`）；线性化路径的 6.0 才是错值，原因是
 /// 它**忽略了 `break` / `continue`** —— 这与 `for+break` 那例的错法同源。
 /// E1 早已修复而发散依旧，故原归因不成立。
-/// 证据与复现见 `tests/run_mir_equiv_run_dag.rs`。
+/// 证据与复现见 `tests/execute_equiv_run_dag.rs`。
 ///
 /// v0.75.9: 接收 `&Arc<MirFunction>` — 优化后 DAG 走宿主内核缓存
 /// （`MirHost::dag_cache`，key = Arc 指针），同 Arc 跨调用复用。
 ///
 /// **v0.104.6 D467 · 名字说明**：本函数**不**是「线性执行器」，也不暗示
-/// 存在两套执行实现。实际路径是 [`run_mir_with_signal`] → [`engine::run_dag_with_signal`]
+/// 存在两套执行实现。实际路径是 [`run_with_signal`] → [`engine::run_dag_with_signal`]
 /// → `engine::run_dag_with_signal_memo`（唯一执行循环）。历史上的「线性执行
 /// 实现」已在 v0.59 归并进 DAG 引擎，本函数与 `run_dag*` 是**同一条路径**，
 /// 共用 `handlers::dispatch`。
 ///
 /// **v0.104.6 D467**：本函数**原名 `run_mir`**，已重命名为 [`execute`] ——
-/// `run_mir` 这个名字暗示存在「线性执行器」，而自 v0.59 起仓库里**只有**
+/// 旧名 `run_mir` 暗示存在「线性执行器」，而自 v0.59 起仓库里**只有**
 /// DAG/BSP 一种执行实现。重命名让 API 名副其实；既有调用点已同步更新。
 ///
 /// 需要传播 `MirSignal`（Pregel 的 `Flow::Halt` 等）时用
@@ -491,7 +492,7 @@ pub fn self_match_pattern(
 /// 若不存在或非无参 main 则静默返回 Ok。
 ///
 /// v0.75.9: 接收 `&Arc<MirFunction>`；TaskDef body 克隆进 Arc 以便走
-/// `run_mir` 的全局 DAG 缓存。
+/// `execute` 的全局 DAG 缓存。
 pub fn run_main_task(
     func: &Arc<MirFunction>,
     interp: &mut dyn MirHost,
@@ -517,7 +518,7 @@ pub fn run_main_task(
 
 /// α.10: 控制流信号（与 AST `FlowSignal` 同形）。
 /// REPL 与 differential test 用来观察 Return/Break/Continue 出口；
-/// 主路径 `run_mir` 直接返回 `Result<Value, String>`，不暴露信号。
+/// 主路径 `execute` 直接返回 `Result<Value, String>`，不暴露信号。
 #[derive(Debug, Clone, PartialEq)]
 pub enum MirSignal {
     /// 正常落到函数末尾，无显式 return。
@@ -533,8 +534,8 @@ pub enum MirSignal {
     Halt(Option<Value>),
 }
 
-/// α.10: 与 `run_mir` 等价，但返回 `(MirSignal, Value)`，保留信号。
-/// REPL/差分测试用此观测控制流出口；生产路径仍走 `run_mir`。
+/// α.10: 与 `execute` 等价，但返回 `(MirSignal, Value)`，保留信号。
+/// REPL/差分测试用此观测控制流出口；生产路径仍走 `execute`。
 ///
 /// v0.104.6 D467：`run_mir_with_signal` 与 `run_mir_with_signal_cached` 已**迁入
 /// [`engine`]**（它们是引擎入口，不是壳层工具），改名
@@ -582,7 +583,7 @@ pub mod engine;
 // v0.104.6 D467：`run_with_signal*`（原 `run_mir_with_signal*`）已迁入 engine，
 // 在此一并转出，使既有 `vm::run_with_signal` 调用路径保持可用。
 pub use engine::{
-    DagExecMemo, run_dag, run_dag_with_signal, run_dag_with_signal_memo, run_mir_dag,
+    DagExecMemo, execute_program, run_dag, run_dag_with_signal, run_dag_with_signal_memo,
     run_with_signal, run_with_signal_cached,
 };
 
@@ -611,8 +612,8 @@ mod tests {
         };
         let mut interp = Interpreter::new();
         let mut env = interp.take_env();
-        // v0.75.9: 包裹 Arc（run_mir_dag 签名变更）
-        run_mir_dag(
+        // v0.75.9: 包裹 Arc（execute_program 签名变更）
+        execute_program(
             &Arc::new(func),
             &mut interp,
             &mut env,
@@ -643,14 +644,16 @@ mod tests {
 
     #[test]
     fn dag_exec_chain() {
-        // 注：`run_mir_dag` 直调 `dag_analyze`、**不跑 `dag_optimize`**
-        // （见 `vm/engine.rs::run_mir_dag` 的 v0.104.6 说明：曾尝试对齐生产链，
-        // 但本用例随即变红 —— 折叠追加的节点未被激活，且「手写 MIR」与
-        // 「编译器产出 MIR」的差异尚未查清，故已回退）。
+        // 注：`execute_program` 经 `MirHost::dag_cache()` 取 DAG，即
+        // `dag_analyze → dag_optimize → prune_sequence_edges` —— **与生产链同链**。
         //
-        // 一旦 `run_mir_dag` 将来对齐优化链，本用例需要重新评估：届时
-        // `BinaryOp(4, 2, Add, 3)` 会被常量折叠成追加在尾部的新节点，
-        // 取值可能落到前一个节点（得 3，应 6）。
+        // ⚠ 此前这里写的是「直调 `dag_analyze`、**不跑 `dag_optimize`**」，
+        // 那是**旧实现**的形状：v0.104.6 改用宿主缓存后已不成立（与
+        // `vm/engine.rs::execute_program` 的说明矛盾，以后者为准）。
+        //
+        // 当年的担心是「常量折叠把 `BinaryOp(4, 2, Add, 3)` 折成追加在尾部的
+        // 新节点，取值落到前一个节点（得 3，应 6）」—— 现状实测仍为 6，
+        // 本条即其护栏。
         assert_eq!(
             run(vec![
                 MirInst::Const(0, Value::Int(1)),

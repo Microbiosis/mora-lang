@@ -28,7 +28,7 @@ use mora::mir::vm::execute;
 use mora::parser_v3::ParserV3;
 use mora::typeck::check_mir::check_program_witnesses_bidirectional;
 
-/// 编译 → typeck → run_mir，返回末值。
+/// 编译 → typeck → execute，返回末值。
 ///
 /// 走 `check_program_witnesses_bidirectional` 是刻意的：本项目有
 /// 「运行期已支持、typeck 未放行」的能力，若绕过 typeck，这组断言就变成在

@@ -165,7 +165,7 @@ pub fn greedy_search(
         // **所有 pc > 目标位置**的指令前移一位，而结尾的 `Const(Int(7))`
         // 仍在旧编号上；DAG 按旧的 `Jump(8)` 解析 → 跳到不存在的 pc →
         // 该节点无出边 → 尾部语句（含 `print` 之后的值）**静默丢失**，
-        // `run_mir` 返回 Nil、退出码 0。
+        // `execute` 返回 Nil、退出码 0。
         //
         // 规则：被删/新增区间是 `[pc, pc+1)` → `[pc, pc+m)`。
         //   · target <= pc        : 不受位移影响
@@ -338,7 +338,7 @@ mod tests {
     /// 旧目标编号即指向错误位置（或越界）—— 实测
     /// `if true { print("p") }` + 尾随表达式：`IfSimplifyRule` 折叠掉常量
     /// 分支后长度 -1，结尾的 `Jump` 仍指向旧编号 → 尾随语句**静默丢失**、
-    /// `run_mir` 返回 Nil、退出码 0。
+    /// `execute` 返回 Nil、退出码 0。
     #[test]
     fn test_rewrite_remaps_jump_targets_on_length_change() {
         // body：常量条件假 → IfSimplifyRule 删除 JumpIfNot（长度 -1），

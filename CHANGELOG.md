@@ -19,6 +19,47 @@ All notable changes to Mora will be documented in this file.
 - **`Int` 语义**：算术与比较统一为**精确 i64**（overflow 报 `MoraError`）。
   2^53 之外的 `Int` 运算结果会变（此前静默丢最低位），`Int ⊗ Float` 超界改报错。
 
+### D478：执行入口命名收口（遗留 3）—— 旧名 `run_mir` 彻底退役 + 防回退守卫
+
+D467 只把主入口 `run_mir` 改名为 `execute`，命名遗留散在别处。文档里
+「`run_mir` 及其 100+ 调用点仍在」这句**是假的**（函数早已改名）——
+真正残留的是**约 210 处**引用（56 个 `.rs` 文件 + 若干 `.md`）。
+
+#### 收口范围
+
+- **标识符**：`run_mir_dag` → `execute_program`（它跑的是**整个程序**：顶层 body
+  + `main` task，比 `execute` 多一步，名字要名副其实）；`run_mir_fn` → `execute_fn`。
+- **文件名**：`tests/run_mir_equiv_run_dag.rs` → `tests/execute_equiv_run_dag.rs`、
+  `tests/run_mir_tail_value.rs` → `tests/execute_tail_value.rs`。
+- **注释**：约 200 处逐条分类 —— **现时引用**改指现存的名字（`execute` /
+  `run_with_signal` / `execute_program`）；**历史记档**（v0.59 归并、v0.59
+  「`run_mir ≡ run_dag`」假承诺、D467 改名说明）保留旧名，但**明写「原名/旧名」**。
+- **别名**：`use …::execute as run_mir` 这类把旧名重新引入作用域的写法去掉；
+  随之撞名的两个本地 helper 改为 `run_program` / `last_value`。
+
+#### 顺带修掉两处「批量替换会造成语义漂移」的地方
+
+- `src/mir/vm/mod.rs` 模块文档的「## 关于 `run_mir` 这个名字」整段 —— 它写着
+  「保留下来是为兼容既有 100+ 调用点」，而名字早已改掉 ⇒ **假话**。
+- `src/mir/vm/mod.rs` 测试里「`run_mir_dag` 直调 `dag_analyze`、不跑 `dag_optimize`」
+  的注释 —— 与 `engine.rs` 的「改用 `MirHost::dag_cache()`，即 `dag_analyze →
+  dag_optimize → prune_sequence_edges`」**互相矛盾**；已逐句核对
+  `cache.rs::build`，以后者为准。
+
+#### 防回退守卫
+
+`tests/execute_naming_hygiene.rs`（新建，3 条）：
+
+1. **代码**里不得出现旧名（字符串字面量先剔除，避免误判消息文本）；
+2. **注释**里提到旧名必须带历史标记词（原名 / 旧名 / 旧承诺 / 此前 / 曾 / 历史 /
+   v0.59 / D467 / 迁入 / 原 …）—— 按**连续注释段**判定（历史记档常写成
+   「以下原文是 …」再引一段，标记词在段首、引用在段中）；
+3. **文件名**不得带旧前缀。
+
+守卫的**两条臂都做过反向验证**（造违规 → 确认判红 → 删探针）。第一次写的
+探针注释里带了「旧名」二字、正好命中标记词，守卫放行 —— 这本身说明
+「标记词判定」必须用**真实违规样例**来验，看「全绿」不算数。
+
 ### D477：`or` / `and` 的**求值级短路** —— 目标语义落地，两条编译路径不再分叉
 
 **起点是一次「注释是不是在夸大」的追问**：`or` / `and` 的注释写着「短路求值」，

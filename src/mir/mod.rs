@@ -210,7 +210,7 @@ pub enum MirInst {
 
     /// α.10: 闭包字面量。body 是嵌套 MirFunction（独立寄存器空间），
     /// 解释器构造 Value::Closure { mir_body: Arc`<MirFunction>` }。
-    /// 调用时 dispatch 直接走 run_mir。
+    /// 调用时 dispatch 直接走 execute。
     Closure {
         dst: Reg,
         params: Vec<String>,
@@ -240,7 +240,7 @@ pub enum MirInst {
     /// α.2: with 块。bindings 设置 AI config，body 执行后恢复。
     /// 解释器保存/恢复 current_ai_config。
     /// v0.75.43: jit=true 时 body 经 copy-and-patch JIT（纯线性 Int 子集）
-    /// 编译执行，未覆盖指令回落 run_mir。
+    /// 编译执行，未覆盖指令回落 execute。
     WithConfig {
         bindings: Vec<(String, Reg)>,
         body: Box<MirFunction>,
@@ -274,7 +274,7 @@ pub enum MirInst {
     // 运行时机制（delimited continuation）：
     // 1. 保存当前环境的 clone 给 body
     // 2. install_effect_handler(effect, this_handler)
-    // 3. execute body via run_mir
+    // 3. 执行 body：调用 `execute`
     // 4. 卸载 handler（restore_effect_handler）
     //
     // 类型约束（Stage 2.2 强制）：
@@ -407,7 +407,7 @@ pub enum MirInst {
     /// α.5: macro def — 注册 Value::Macro(name, params, body) 到环境。
     /// body 是宏体的 MIR 编译结果（由 parser_v3 emit_macro_def_w 经子
     /// EmitContext 编译而来）。调用时以 call_args 绑定 params，在子 env
-    /// 中 run_mir 执行 body（v0.83 完整实现，不再跳过宏体）。
+    /// 中 execute 执行 body（v0.83 完整实现，不再跳过宏体）。
     MacroDef {
         name: String,
         params: Vec<String>,
@@ -502,7 +502,7 @@ pub enum MirInst {
         name: String,
         parents: Vec<String>,
         methods: Vec<crate::mir::orchestrate::MirTraitMethod>,
-        /// prelowered method bodies (parallel to methods)，让默认实现走 run_mir。
+        /// prelowered method bodies (parallel to methods)，让默认实现走 execute。
         method_bodies: Vec<MirFunction>,
     },
 

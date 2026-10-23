@@ -6,7 +6,7 @@
 //!
 //! - Topological ordering (expose instruction-level parallelism)
 //! - Dataflow-aware optimization (CSE, LICM on DAG nodes)
-//! - DAG-based execution (Phase D2: `run_mir_dag`)
+//! - DAG-based execution (Phase D2: `execute_program`)
 //!
 //! Design: additive, not replacement. `MirFunction.body` remains the
 //! canonical linear form; `MirDag` is an analysis artifact.
@@ -698,7 +698,7 @@ pub fn dag_analyze(func: &MirFunction) -> MirDag {
             //      `loop_beyond_dag_limit` 与 `loop_break` 两个**循环**程序回归。
             //
             // ⇒ 这些边**不是冗余的**：循环体靠它们承重（与 v0.75.33 那条
-            // 「放松它会得到 `run_mir: index 2 out of bounds (len 2)`」同源）。
+            // 「放松它会得到 `execute: index 2 out of bounds (len 2)`」同源）。
             // 正确的修法必须**区分**「循环体（需要额外排序）」与「直线尾部（不需要）」，
             // 而这正是 `partition_blocks` / E1 一族已经在处理、且**前五次尝试
             // 全部翻车**的那个区分。故本轮只留此记录，不改代码。
@@ -747,7 +747,7 @@ pub fn dag_analyze(func: &MirFunction) -> MirDag {
 
     // v0.104.2: entry = **从 pc 0 可达**的无入边节点，而不是「所有无入边节点」。
     //
-    // **缺陷背景（`if true { print("p") }` 之后 7i 丢失、run_mir 返回 Nil）**：
+    // **缺陷背景（`if true { print("p") }` 之后 7i 丢失、execute 返回 Nil）**：
     // 常量条件的 `JumpIfNot` 被 `IfSimplifyRule` 折叠掉后，else 臂（`Const(Nil)`
     // + `Copy(dst, …)`）成为**不可达死块**，它自然没有入边。此前 entry 取
     // 「所有无入边节点」→ 死块与函数入口**并列成为入口** → DAG 无条件下执行
@@ -1057,7 +1057,7 @@ impl MirDag {
     /// 把其后继永久阻塞在就绪门槛外。
     ///
     /// 实测：手写直线链 `1+2 → +3` 在已优化路径上得 **3** 应 6。
-    /// 回归测试：`tests/run_mir_equiv_run_dag.rs::optimize_preserves_handwritten_mir_chain`。
+    /// 回归测试：`tests/execute_equiv_run_dag.rs::optimize_preserves_handwritten_mir_chain`。
     ///
     /// # v0.104.6 D31：邻接表取代「每弹一个节点扫全边表」
     ///
@@ -1169,9 +1169,9 @@ impl MirDag {
     //
     // **后果**：加此方法后，`break` / `continue` 被架空（跳出线性链的
     // 控制转移在链上失效，循环体多跑一轮）、if/else 两臂被串行化。实测 3 例
-    // 分歧且**错的恒是加此方法的一侧**，生产路径 `run_mir` 三例全对：
+    // 分歧且**错的恒是加此方法的一侧**，生产路径 `execute` 三例全对：
     //
-    //     | 用例            | run_mir(生产) | 加此方法 | 正确值 |
+    //     | 用例            | execute(生产) | 加此方法 | 正确值 |
     //     |-----------------|---------------|----------|--------|
     //     | if/else         | 8.0           | Bool(false) | 8.0  |
     //     | for + break     | 2.0           | 5.0        | 2.0    |
@@ -1186,7 +1186,7 @@ impl MirDag {
     // ③ 它比 `run_mir ≡ run_dag` 这条 v0.59 旧承诺更可信，是那条**假承诺**
     // 的源头（`vm.rs` / `vm/engine.rs` 的模块文档已多次更正）。
     //
-    // 保留替代：生产等价性由 `tests/run_mir_equiv_run_dag.rs` 的 A 组
+    // 保留替代：生产等价性由 `tests/execute_equiv_run_dag.rs` 的 A 组
     // （优化路径 vs DAG 路径，含 if/else、嵌套 break、while+continue）
     // 与 B 组 6 条真实等价用例持续钉住。
 }

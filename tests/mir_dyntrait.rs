@@ -12,7 +12,7 @@ use mora::mir::vm::{execute, run_main_task};
 use mora::parser_v3::ParserV3;
 use mora::typeck::check_mir::check_program_witnesses_bidirectional;
 
-fn run_via_mir(source: &str) -> Result<(), String> {
+fn run_via_execute(source: &str) -> Result<(), String> {
     let (func, witnesses) = ParserV3::compile(source)?;
     let type_errs = check_program_witnesses_bidirectional(&witnesses);
     if !type_errs.is_empty() {
@@ -44,7 +44,7 @@ task main()
   print(obj)
 end
 "#;
-    run_via_mir(src).expect("dyn Trait cast must parse and execute via MIR");
+    run_via_execute(src).expect("dyn Trait cast must parse and execute via MIR");
 }
 
 #[test]
@@ -57,7 +57,7 @@ task main()
   print(obj2)
 end
 "#;
-    run_via_mir(src).expect("chained dyn Trait cast must work");
+    run_via_execute(src).expect("chained dyn Trait cast must work");
 }
 
 // =================================================================

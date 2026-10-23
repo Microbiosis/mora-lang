@@ -24,7 +24,7 @@ use std::sync::Arc;
 
 fn run(src: &str) -> String {
     let (func, witnesses) = ParserV3::compile(src).unwrap_or_else(|e| panic!("compile: {e}"));
-    // v0.104.6 D52：**必须过 typeck**。此前本文件只做 `compile` + `run_mir`，
+    // v0.104.6 D52：**必须过 typeck**。此前本文件只做 `compile` + `execute`，
     // 完全绕过类型检查 —— 于是「两种写法运行期一致」可以在**其中一种编译器
     // 根本不接受**的情况下照样「通过」。真实踩中的例子：
     //

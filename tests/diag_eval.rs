@@ -14,7 +14,7 @@ fn run_mora(source: &str) -> Result<Value, String> {
         &mut env,
         &mut mora::mir::effect::Effects::new(),
     )
-    .map_err(|e| format!("run_mir error: {}", e))?;
+    .map_err(|e| format!("execute error: {}", e))?;
     mora::mir::vm::run_main_task(
         &func_arc,
         &mut interp,

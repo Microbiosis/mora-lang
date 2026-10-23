@@ -697,7 +697,7 @@ impl Interpreter {
         // 这是 Lisp homoiconicity + eval-apply loop 在 Mora 上的落地：
         //   eval("2 + 3") -> Value::Int(5)
         //   eval("function foo(x) x*x end") -> Value::Task/Closure
-        // 实现路径：source string -> Lexer -> ParserV3::compile -> run_mir。
+        // 实现路径：source string -> Lexer -> ParserV3::compile -> execute。
         // 执行环境：子 Environment 以当前调用栈的 env 为 parent（用 parking_lot::Mutex 与
         // value.rs 中的 Environment 类型一致），这样 eval 内部可以读取当前 scope
         // 的变量（如 task 内的 let 绑定），但无法修改外层绑定。

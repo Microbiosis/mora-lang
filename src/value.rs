@@ -273,7 +273,7 @@ pub enum Value {
         name: String,
         params: Vec<String>,
         /// α.10: MIR-built task 体（α.7/α.8 trait/impl/skill 由 MIR lowering 填）。
-        /// 调用方一律走 run_mir；不再保留 v2 arena fallback。
+        /// 调用方一律走 execute；不再保留 v2 arena fallback。
         mir_body: std::sync::Arc<crate::mir::MirFunction>,
     },
     /// v0.54: 工具声明 — 可被 AI 调用的命名工具
@@ -292,7 +292,7 @@ pub enum Value {
         /// EnvRef::new(env) for closure captures.
         env: EnvRef,
         /// α.10/α.11: MIR-built 闭包体。所有 closure 必须有 body；
-        /// dispatch 走 run_mir 不再有 arena fallback（AGENTS_CODE_MODIFICATION §28）。
+        /// dispatch 走 execute 不再有 arena fallback（AGENTS_CODE_MODIFICATION §28）。
         /// Arc 而非 Rc 以保留 Value: Send + Sync（http_server 跨 task 共享 Value）。
         mir_body: std::sync::Arc<crate::mir::MirFunction>,
     },
@@ -378,7 +378,7 @@ pub enum Value {
     Atom(Arc<Mutex<Value>>),
     // v0.20 / v0.83: 宏定义 (Common Lisp 启发) — 宏体作为 MIR 函数存储。
     // body 是宏的 MIR 编译体（由 parser_v3 emit_macro_def_w 经子 EmitContext
-    // 编译而来）。宏调用时以 call_args 绑定 params，在子 env 中 run_mir 执行 body。
+    // 编译而来）。宏调用时以 call_args 绑定 params，在子 env 中 execute 执行 body。
     // Arc 而非 Rc 以保留 Value: Send + Sync（与 Value::Closure 同模式）。
     Macro {
         name: String,

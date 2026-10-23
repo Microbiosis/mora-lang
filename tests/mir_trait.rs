@@ -6,14 +6,14 @@
 //!
 //! α.11 起，MirInst::TraitDef / ImplDef / SkillDef 携带 prelowered MirFunction
 //! body（method_bodies / task_bodies / verify_body），dispatch 见 mir_body: Some
-//! 走 run_mir，不回退到 arena-based call_task_inner AST 路径。
+//! 走 execute，不回退到 arena-based call_task_inner AST 路径。
 
 use mora::interpreter::Interpreter;
 use mora::mir::vm::{execute, run_main_task};
 use mora::parser_v3::ParserV3;
 use mora::typeck::check_mir::check_program_witnesses_bidirectional;
 
-fn run_via_mir(source: &str) -> Result<(), String> {
+fn run_via_execute(source: &str) -> Result<(), String> {
     let (func, witnesses) = ParserV3::compile(source)?;
     let type_errs = check_program_witnesses_bidirectional(&witnesses);
     if !type_errs.is_empty() {
@@ -44,7 +44,7 @@ fn run_via_mir(source: &str) -> Result<(), String> {
 #[test]
 fn trait_impl_skill_registration_does_not_crash() {
     // 验证 StmtKind::TraitDef / ImplDef / SkillDef 三种 lowering 路径
-    // 走完后 run_mir 仍能正常执行（即使 trait body 是空的占位）。
+    // 走完后 execute 仍能正常执行（即使 trait body 是空的占位）。
     // 注：parser 是否实际支持 `trait Foo ... end` 取决于 v0.55；这里用 task main 验证
     // base 编译与执行链路。
     let src = r#"
@@ -57,7 +57,7 @@ task main()
   print(s)
 end
 "#;
-    run_via_mir(src).expect("trait/impl/skill registration does not crash base run_mir");
+    run_via_execute(src).expect("trait/impl/skill registration does not crash base execute");
 }
 
 // 注：v0.77 之前 §静态合约 4 个测试是 source-grep（assert!(src.contains(...))），

@@ -458,7 +458,7 @@ pub fn deconstruct(ssa: &MirSsaFunction) -> MirFunction {
             }
             Terminator::JumpIfNot(cond, _t, f) => MirInst::JumpIfNot(map_reg(*cond), *f),
             // v0.75.6: `Return(None)` 不发射 — Mora 无显式 return 时由
-            // run_mir 隐式返回「最后产生 dst 的指令」，发射 `Return(None)`
+            // execute 隐式返回「最后产生 dst 的指令」，发射 `Return(None)`
             // 会在块首就短路（顶层块 Label 后第一条指令即 Return(None)），
             // 使隐式返回载体永远无法执行 → 返回值变成 Nil（SSA 等价性
             // 测试抓到的语义 bug）。丢弃后线性执行自然落到最后一条指令。
@@ -473,7 +473,7 @@ pub fn deconstruct(ssa: &MirSsaFunction) -> MirFunction {
             // 线性执行 ⇒ 两个分支都跑（副作用重复，D313）。
             //
             // 也不能降成 `Return(None)`（它返回 Nil，丢掉隐式返回值）。发一条
-            // 真跳转、由第四遍补成 `body.len()`：`run_mir` 见 `pc >= body.len()`
+            // 真跳转、由第四遍补成 `body.len()`：`execute` 见 `pc >= body.len()`
             // 即结束并走隐式返回，`dag_analyze` 则解析不到目标 → 该节点无出边
             // —— 两个执行器都与 opt=off 一致。
             Terminator::JumpExit => MirInst::Jump(EXIT_JUMP),
@@ -581,7 +581,7 @@ pub fn deconstruct(ssa: &MirSsaFunction) -> MirFunction {
     // 补丁所有跳转目标
     //
     // v0.104.6 D419：`EXIT_JUMP`（跳到函数末尾）补成**重建后 body 的长度** ——
-    // 两个执行器都据此结束：`run_mir` 的 `pc >= body.len()`，以及
+    // 两个执行器都据此结束：`execute` 的 `pc >= body.len()`，以及
     // `dag_analyze` 解析不到目标节点（该 Jump 节点没有出边）。
     let exit_target = body.len();
     for inst in body.iter_mut() {

@@ -436,6 +436,8 @@ pub fn value_to_json(value: &Value) -> String {
         Value::Task { name, .. } => format!("\"<task {}>\"", name),
         Value::Tool { name, .. } => format!("\"<tool {}>\"", name),
         Value::Closure { .. } => "\"<closure>\"".to_string(),
+        // v0.104.6 D484：Core 层闭包（与 MIR 闭包刻意区分）。
+        Value::CoreClosure { .. } => "\"<coreclosure>\"".to_string(),
         Value::Builtin(name) => format!("\"<builtin {}>\"", name),
         Value::Conversation { model, .. } => format!("\"<conversation {}>\"", model),
         Value::Stream { .. } => "\"<stream>\"".to_string(),

@@ -181,6 +181,26 @@ fn short_circuit_is_semantically_observable() {
     );
 }
 
+/// **D484**：Core 层闭包 —— Core 执行器执行 **Core IR 的闭包体**。
+///
+/// `Value::Closure` 装的是 `Arc<MirFunction>`（MIR 的函数体）⇒ 装不下 Core
+/// 闭包。D484 给语言值加了 `Value::CoreClosure` ⇒ Core 执行器能跑自己的闭包。
+///
+/// 覆盖三条路径：
+/// - **具名调用** `f(1)` —— 走宿主的「内建优先 → 环境查找」解析链，查找结果
+///   是 Core 闭包 ⇒ 宿主委派回 Core 执行器；
+/// - **捕获外层** —— 闭包体读外层绑定（靠捕获的环境作父链）；
+/// - **值调用**（管道 `|>`）—— Core 执行器内部的 `ClosureCall`。
+#[test]
+fn core_closures_execute_identically() {
+    assert_same("闭包调用", "let f = fn(x) x + 1\nf(1)\n");
+    assert_same(
+        "闭包捕获外层",
+        "let base = 10\nlet f = fn(x) x + base\nf(5)\n",
+    );
+    assert_same("闭包值调用", "let f = fn(x) x + 1\n1 |> f\n");
+}
+
 /// 错误路径：两个执行器都应报错（不静默成功）。
 #[test]
 fn both_executors_report_the_same_error_paths() {

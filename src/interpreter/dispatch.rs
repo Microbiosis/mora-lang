@@ -342,6 +342,18 @@ impl Interpreter {
                     self.call_value_impl(func, total_args, effects)
                 }
             }
+            // v0.104.6 D484：**Core 层闭包** —— 函数体是 Core IR（`CoreFunction`），
+            // 只能由 **Core 执行器**执行 ⇒ 委派回去（与 `Value::Closure` 走
+            // `vm::execute` 同款：宿主把自己当 host 传下去）。
+            //
+            // ⚠ 这条只在**具名调用**解析到 Core 闭包时可达 —— Core 层里
+            // `let f = fn(x) … end; f(1)` 的 `f(1)` 是**具名**调用，走
+            // 「内建优先 → 环境查找」的解析链，查找结果就是 Core 闭包。
+            // 由宿主委派 ⇒ **内建优先**的解析顺序与 MIR 层**逐字一致**
+            // （Core 执行器自己查环境会变成「环境优先」⇒ 与 MIR 分叉）。
+            Value::CoreClosure { .. } => {
+                crate::mir::core_exec::call_core_closure(value, args, self, effects)
+            }
             _ => Err(format!("Value is not callable: {}", value)),
         }
     }

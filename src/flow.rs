@@ -429,6 +429,9 @@ pub fn type_name(value: &Value) -> &'static str {
         Value::Task { .. } => "task",
         Value::Tool { .. } => "tool",
         Value::Closure { .. } => "closure",
+        // v0.104.6 D484：Core 层闭包 —— 与 MIR 闭包**刻意区分**（两者函数体
+        // 不同、执行器不同；混称 "closure" 会让「调用失败」难以定位）。
+        Value::CoreClosure { .. } => "coreclosure",
         Value::Builtin(_) => "builtin",
         Value::Conversation { .. } => "conversation",
         Value::Stream { .. } => "stream",

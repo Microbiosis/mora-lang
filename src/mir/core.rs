@@ -37,6 +37,13 @@
 //! （编排更是用**空区域**冒充）⇒ 产物里**看不见**构造，更看不见载荷。
 //! D483 起每个都有原语，形状**镜像** MIR 层对应指令（与 D482 同款原则）：
 //! Core 层的价值是「结构可见」，不是「比 MIR 更少」。
+//!
+//! ### D484：Core 层**自己的值表示**
+//!
+//! `ClosureCreate` 的体是 **Core IR**（`CoreFunction`）⇒ 装不进
+//! `Value::Closure`（那装的是 `Arc<MirFunction>`）⇒ 语言值新增
+//! `Value::CoreClosure { params, env, core_body }`（形状同款）。
+//! **其余值一律复用 `Value`** ⇒ 不重复实现环境语义，也不引入转换层。
 
 use crate::common::BinaryOp;
 use crate::mir::effect::EffectRow;

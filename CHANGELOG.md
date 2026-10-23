@@ -19,6 +19,52 @@ All notable changes to Mora will be documented in this file.
 - **`Int` 语义**：算术与比较统一为**精确 i64**（overflow 报 `MoraError`）。
   2^53 之外的 `Int` 运算结果会变（此前静默丢最低位），`Int ⊗ Float` 超界改报错。
 
+### D484：给 Core 层**自己的值表示** —— `Value::CoreClosure`
+
+Core 执行器此前遇到闭包只能**响亮报错**：`Value::Closure` 装的是
+`Arc<MirFunction>`（**MIR** 的函数体）⇒ 装不下 Core 闭包（函数体是 Core IR 的
+`CoreFunction`）。D484 给语言值加了 `Value::CoreClosure { params, env,
+core_body }`（形状与 `Value::Closure` **同款**）⇒ Core 执行器能执行自己的闭包。
+
+#### 为什么**不**另立一个 `CoreValue` 类型
+
+Core 执行器仍用 Mora 的 `Environment` 与既有 handler ⇒ **不重复实现**环境语义
+（持久 map + 父链 + define/assign/lookup），也**不引入** `Value ↔ CoreValue` 的
+转换层（边界上没有第二套语义）。只有「Core 闭包」这一种值需要新载体 ⇒ 只加
+**一个**变体。（与 `Value::Task` / `Value::Tool` / `Value::Macro` 同款：语言值
+里带 IR 层载荷，已有先例。）
+
+实测影响面：`Value` 36 → 37 个变体，全仓只有 **4 处**穷尽 `match` 需要补齐
+（`flow::type_name` / `flow::value_to_json` / `http_server` / `value::display`）。
+
+#### 闭包调用走**唯一机制**（`mir::core_exec::call_core_closure`）
+
+两个入口都走它 ⇒ 闭包调用语义**逐字同一套**：
+
+- **值调用**（`CoreInst::ClosureCall`）—— Core 执行器内部；
+- **具名调用**（`f(1)`）—— 走宿主的「**内建优先** → 环境查找」解析链，查到
+  Core 闭包 ⇒ 宿主**委派回** Core 执行器。
+
+⚠ **由宿主委派**（而不是 Core 执行器自己查环境）是为了保住「内建优先」的解析
+顺序 —— Core 自己查会变成「环境优先」，与 MIR 层**分叉**（`let len = fn(x) …`
+就会暴露：MIR 调内建 `len`，Core 会调用户闭包）。
+
+#### 两种闭包**可区分**
+
+类型名 `closure` / `coreclosure`、显示 `<closure>` / `<coreclosure>`、JSON 同理
+—— 混称会让「调用失败」这类问题难以定位（两种闭包的函数体不同、执行器不同）。
+
+#### 守卫
+
+- `tests/core_value_repr.rs`（**新建**，3 条）：① 与 MIR 闭包**可区分**；
+  ② Core 执行器造出的闭包值**形态正确**（形参 / 捕获的环境 / Core 体）；
+  ③ 闭包调用走**唯一机制**（具名调用与值调用结果一致）；
+- `tests/core_exec_differential.rs::core_closures_execute_identically`（**新建**）——
+  3 条闭包程序（具名调用 / 捕获外层 / 值调用）MIR 与 Core 结果一致。
+
+四条判据都做了**反向验证**（把类型名改成同名 / 把形参丢掉 / 把闭包调用返回错值
+⇒ 判据报红）。
+
 ### D483：补 Core 模型原语 —— 「有损登记」清空
 
 D481 时 Core 层有 6 类构造**没有对应原语** ⇒ 降维只能写 `Const(dst, Nil)` 占位

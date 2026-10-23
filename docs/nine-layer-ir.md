@@ -48,17 +48,43 @@ Token → FCFG → EHIR → Core → MIR
 - **可执行**（v0.104.6 D482）：`src/mir/core_exec.rs` —— Core 层有**自己的
   执行器**（块调度，无 DAG、无优化），可与 MIR 执行器**对拍**
 
-> **Core 层的可执行子集**（D482，D483 扩充）：常量 / 拷贝 / 二元运算 / 环境读写 /
-> 列表 / 字典 / 索引 / 索引赋值 / 分支 / 跳转 / 返回 / 具名调用 / 值调用 / 方法调用 /
-> 模板 / match（含守卫）/ **断言（eval）/ 聚合（aggregate）/ quasiquote / 事务提交
-> （commit）/ 事务回滚（rollback）**。
+> **Core 层的可执行子集**（D482，D483 扩充，D484 再加**闭包**）：常量 / 拷贝 /
+> 二元运算 / 环境读写 / 列表 / 字典 / 索引 / 索引赋值 / 分支 / 跳转 / 返回 /
+> 具名调用 / 值调用 / 方法调用 / 模板 / match（含守卫）/ **断言（eval）/ 聚合
+> （aggregate）/ quasiquote / 事务提交（commit）/ 事务回滚（rollback）** /
+> **闭包**。
 >
-> **不支持**（执行器**响亮报错**，不静默降级）：闭包 / task（Mora 的
-> `Value::Closure` 装的是 `Arc<MirFunction>`，装不下 Core 闭包）、**区域构造**
+> **不支持**（执行器**响亮报错**，不静默降级）：**task**（`Value::Task` 装的是
+> `Arc<MirFunction>`，Core 层不产出 task —— 闭包**已支持**）、**区域构造**
 > （`Scope` 的并发 / 事务 / 可观测性语义在执行层，顺序执行它会与 MIR 层**静默
 > 分叉**）、**编排执行**（agent 图 / BSP 超步是执行层语义；注意「模型里有编排
 > 原语」与「执行器能跑编排」是**两件事**）、效果（需要 handler 栈与 `resume`）、
 > ADT 构造 / thunk。
+>
+> #### Core 层**自己的值表示**（D484）
+>
+> `Value::Closure` 装的是 `Arc<MirFunction>`（**MIR** 的函数体）⇒ 装不下 Core
+> 闭包（函数体是 Core IR 的 `CoreFunction`）⇒ D484 给语言值加了
+> `Value::CoreClosure { params, env, core_body }`（形状与 `Value::Closure`
+> **同款**）。
+>
+> **其余值一律复用 `Value`** —— 不另立 `CoreValue` 类型：Core 执行器仍用
+> Mora 的 `Environment` 与既有 handler ⇒ **不重复实现**环境语义，也不引入
+> `Value ↔ CoreValue` 的转换层。（与 `Value::Task` / `Value::Tool` / `Value::Macro`
+> 同款：语言值里带 IR 层载荷，已有先例。）
+>
+> 两种闭包在**面向用户的表面**刻意**可区分**（类型名 `closure` / `coreclosure`、
+> 显示 `<closure>` / `<coreclosure>`、JSON 同理）—— 混称会让「调用失败」这类
+> 问题难以定位。
+>
+> **闭包调用走唯一机制**（`mir::core_exec::call_core_closure`）：
+> - **值调用**（`CoreInst::ClosureCall`）—— Core 执行器内部；
+> - **具名调用**（`f(1)`）—— 走宿主的「内建优先 → 环境查找」解析链，查到 Core
+>   闭包 ⇒ 宿主**委派回** Core 执行器。
+>
+> ⇒ 由宿主委派（而不是 Core 执行器自己查环境）是为了保住**内建优先**的解析
+> 顺序 —— Core 自己查会变成「环境优先」，与 MIR 层**分叉**（`let len = fn(x) …`
+> 就会暴露）。
 >
 > **对拍**：`tests/core_exec_differential.rs` —— 同一程序，MIR 执行器
 > （`dag_analyze → dag_optimize → BSP 超步`）与 Core 执行器（块调度）结果必须
@@ -352,7 +378,8 @@ D472 之后登记项由 4 条减为 1 条（`orchestrate`），D473 之后减为
 | execute_naming_hygiene | 3 | 执行入口命名一致性（旧名不得复活，D478 新建） |
 | core_cfg_wellformed | 5 | Core 层 CFG **结构良构性** + 模型限制登记（D479/D480 新建，D483 补 match 守卫体递归） |
 | core_fidelity | 7 | Core 层**保真度**（产物里该看见的东西不能丢，D481 新建；D483 反转为「有损清单已清空」） |
-| core_exec_differential | 4 | Core 执行器 vs MIR 执行器**语义对拍**（D482 新建；D483 加断言/聚合/模板/事务） |
+| core_exec_differential | 5 | Core 执行器 vs MIR 执行器**语义对拍**（D482 新建；D483 加断言/聚合/模板/事务；D484 加闭包） |
+| core_value_repr | 3 | Core 层**自己的值表示**（`Value::CoreClosure`）：可区分 / 形态正确 / 调用唯一机制（D484 新建） |
 
 ## 已知遗留（技术债）
 

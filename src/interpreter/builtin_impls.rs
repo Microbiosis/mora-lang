@@ -1000,6 +1000,9 @@ impl Interpreter {
             match value {
                 Value::Task { .. }
                 | Value::Closure { .. }
+                // v0.104.6 D484：Core 闭包 —— 函数体是 Core IR ⇒ 委派回
+                // Core 执行器（`call_value_impl` 里有对应分支）。
+                | Value::CoreClosure { .. }
                 | Value::Compose(_)
                 | Value::Partial(_, _)
                 | Value::Curry { .. } => self.call_value_impl(&value, args, effects),

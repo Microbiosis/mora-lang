@@ -12,13 +12,13 @@
 //!
 //! 支持：常量 / 拷贝 / 二元运算 / 环境读写 / 列表 / 字典 / 索引 / 索引赋值 /
 //! 分支 / 跳转 / 返回 / 具名调用 / 值调用 / 方法调用 / 模板 / match（含守卫）/
-//! **断言（eval）/ 聚合（aggregate）/ quasiquote / 事务提交（commit）**。
+//! **断言（eval）/ 聚合（aggregate）/ quasiquote / 事务提交（commit）**/
+//! **闭包**（D484：Core 层有自己的值表示 `Value::CoreClosure`）。
 //!
 //! **不支持**（遇到就**响亮报错**，绝不静默降级）：
 //!
-//! - **闭包 / task**（`ClosureCreate`）—— Mora 的 `Value::Closure` 装的是
-//!   `Arc<MirFunction>`，装不下 Core 闭包 ⇒ Core 需要自己的值表示，是独立的
-//!   一批；
+//! - **task**（`Value::Task` 装的是 `Arc<MirFunction>`，Core 层不产出 task）——
+//!   闭包**已支持**（D484），task 还没有；
 //! - **区域构造**（`Scope`）—— Core 的 `Scope` 只是「区域」，**并发 / 事务 /
 //!   可观测性语义在执行层** ⇒ 把它顺序执行会与 MIR 层**静默分叉**
 //!   （所以这里宁可报错，也不假装能跑）；
@@ -33,6 +33,16 @@
 //! 模式匹配复用 `self_match_pattern`、内建分派走 `MirHost`、
 //! 断言 / 聚合 / quasiquote 复用 `h_eval` / `h_aggregate` / `h_quasiquote`
 //! ⇒ 差分覆盖的是**降维与控制流**，不是内建本身。
+//!
+//! ## Core 层自己的值表示（D484）
+//!
+//! `Value::Closure` 装的是 `Arc<MirFunction>`（**MIR** 的函数体）⇒ 装不下
+//! Core 闭包（函数体是 Core IR 的 `CoreFunction`）。
+//!
+//! ⇒ D484 给语言值加了 `Value::CoreClosure { params, env, core_body }`
+//! （形状与 `Value::Closure` 同款）。**其余值一律复用 `Value`** —— Core
+//! 执行器仍用 Mora 的 `Environment` 与既有 handler ⇒ 不重复实现环境语义，
+//! 也不引入 `Value ↔ CoreValue` 的转换层。
 
 use crate::mir::core::{CoreFunction, CoreInst, CoreTerminator};
 use crate::mir::effect::Effects;
@@ -170,10 +180,38 @@ fn exec_inst(
             regs[*dst] = v.clone();
             Ok(Some(v))
         }
+        // v0.104.6 D484：创建 **Core 闭包**。
+        CoreInst::ClosureCreate {
+            dst, params, body, ..
+        } => {
+            // Core 层**自己的值表示** —— `Value::CoreClosure`（形状与
+            // `Value::Closure` 同款：形参 / 捕获的环境 / 函数体；只是函数体是
+            // Core IR 的 `CoreFunction`）。
+            //
+            // 捕获**整个环境**（与 MIR 层 `h_closure` 逐字同款）：闭包体里的
+            // `EnvLoad` 要能读到外层绑定 ⇒ 捕获的环境必须是父链。
+            //
+            // ⚠ `captures` 字段（过近似的捕获名清单）**不参与**运行期 ——
+            // 与 MIR 层同款（`h_closure` 也是捕获整个环境）。
+            let closure = Value::CoreClosure {
+                params: params.clone(),
+                env: crate::value::EnvRef(Box::new(env.clone())),
+                core_body: std::sync::Arc::new(body.clone()),
+            };
+            regs[*dst] = closure.clone();
+            Ok(Some(closure))
+        }
         CoreInst::ClosureCall(dst, callee, args) => {
             let callee_val = reg(regs, *callee)?;
             let arg_vals = arg_values(regs, args)?;
-            let v = interp.call_value(&callee_val, arg_vals, effects)?;
+            let v = match &callee_val {
+                // v0.104.6 D484：Core 闭包 → 执行 **Core 体**（不绕回 MIR 层）。
+                Value::CoreClosure { .. } => {
+                    call_core_closure(&callee_val, arg_vals, interp, effects)?
+                }
+                // MIR 闭包 / 内建可调用值 → 交给宿主（MIR 侧语义）。
+                _ => interp.call_value(&callee_val, arg_vals, effects)?,
+            };
             regs[*dst] = v.clone();
             Ok(Some(v))
         }
@@ -259,11 +297,6 @@ fn exec_inst(
         // 指令形态只是冗余副本（MIR 引擎里 `Flow::Jump(_)` 同样是 no-op）⇒ 忽略。
         CoreInst::Branch { .. } | CoreInst::Jump(_) | CoreInst::Return(_) => Ok(None),
         // ── v1 不支持的部分：响亮报错，不静默降级 ──
-        CoreInst::ClosureCreate { .. } => Err(
-            "Core 执行器（v1）**不支持闭包 / task** —— Mora 的 `Value::Closure` \
-             装的是 `Arc<MirFunction>`，装不下 Core 闭包（需要 Core 自己的值表示）。"
-                .to_string(),
-        ),
         CoreInst::Scope { kind, .. } => Err(format!(
             "Core 执行器（v1）**不支持区域构造** `{kind}` —— 并发 / 事务 / 可观测性 \
              语义在执行层，顺序执行它会与 MIR 层静默分叉。"
@@ -296,6 +329,47 @@ fn exec_inst(
         ),
         CoreInst::Unreachable => Err("Core: 不可达指令".to_string()),
     }
+}
+
+/// 调用一个 **Core 闭包**（`Value::CoreClosure`）—— **唯一机制**。
+///
+/// 两个入口都走这里 ⇒ 闭包调用语义**逐字同一套**：
+///
+/// ① Core 执行器的**值调用**（`CoreInst::ClosureCall`）；
+/// ② MIR 解释器的**具名调用**（名字在环境里绑定到 Core 闭包时）—— 那是
+///    「内建优先 → 环境查找」解析链的产物，只能由宿主发起，故委派回来。
+///
+/// arity 检查 / 子环境构造 / 按位置绑定，与 MIR 侧
+/// `interpreter::dispatch::call_value_impl` 的 `Value::Closure` 分支**同款**。
+pub fn call_core_closure(
+    closure: &Value,
+    args: Vec<Value>,
+    host: &mut dyn MirHost,
+    effects: &mut Effects,
+) -> Result<Value, String> {
+    let Value::CoreClosure {
+        core_body,
+        params,
+        env: captured,
+    } = closure
+    else {
+        return Err(format!("not a Core closure: {}", closure));
+    };
+    if args.len() != params.len() {
+        return Err(format!(
+            "closure expects {} args, got {}",
+            params.len(),
+            args.len()
+        ));
+    }
+    // 子环境：捕获的环境作**父**，形参按位置绑进子层（与 MIR 侧同款）。
+    let mut child_env =
+        Environment::with_parent_of(std::sync::Arc::new(captured.0.as_ref().clone()));
+    for (i, param) in params.iter().enumerate() {
+        let val = args.get(i).cloned().unwrap_or(Value::Nil);
+        child_env.define(param.clone(), val, false);
+    }
+    execute(core_body, &mut child_env, host, effects)
 }
 
 /// 实参值列表。

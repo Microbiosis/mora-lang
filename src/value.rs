@@ -296,6 +296,27 @@ pub enum Value {
         /// Arc 而非 Rc 以保留 Value: Send + Sync（http_server 跨 task 共享 Value）。
         mir_body: std::sync::Arc<crate::mir::MirFunction>,
     },
+    /// v0.104.6 D484：**Core 层闭包** —— Core IR 的闭包体装不进
+    /// [`Value::Closure`]（那装的是 `Arc<MirFunction>`，是 **MIR** 的函数体）。
+    ///
+    /// 形状与 `Value::Closure` **同款**（形参 / 捕获的环境 / 函数体），只是
+    /// 函数体是 `CoreFunction`（Core IR 的多块 CFG + 自己的寄存器空间）⇒
+    /// Core 执行器能执行它，不必绕回 MIR 层。
+    ///
+    /// ⚠ 这是「Core 层自己的值表示」的**唯一**新增载体 —— 其余值（数 / 字符串 /
+    /// 列表 / 字典 …）**原样复用** `Value`：Core 执行器仍用 Mora 的
+    /// `Environment` 与既有 handler ⇒ **不重复实现环境语义**，也不引入
+    /// `Value ↔ CoreValue` 的转换层。
+    ///
+    /// （与 `Value::Task` / `Value::Tool` / `Value::Macro` 同款：语言值里带
+    /// IR 层载荷，已有先例。）
+    CoreClosure {
+        params: Vec<String>,
+        /// 捕获的环境（与 `Value::Closure` 同款：捕获时冻结）。
+        env: EnvRef,
+        /// Core IR 的闭包体。
+        core_body: std::sync::Arc<crate::mir::core::CoreFunction>,
+    },
     Builtin(BuiltinKind),
     // v10: 多轮对话对象
     Conversation {
@@ -1445,6 +1466,19 @@ mod tests {
         // 纯函数式数据（无内部可变性）天然满足 Send + Sync —— 并发不再依赖锁。
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<Environment>();
+    }
+
+    #[test]
+    fn value_is_send_sync() {
+        // v0.104.6 D484：`Value` 的若干变体带 **IR 层载荷**
+        // （`Arc<MirFunction>` / `Arc<CoreFunction>` / `Arc<Mutex<…>>` …）
+        // ⇒ `Value` 必须仍是 `Send + Sync`（`http_server` 跨 task 共享 Value；
+        // `Value::Closure` 的注释明写「Arc 而非 Rc 以保留 Value: Send + Sync」）。
+        //
+        // 此前这条**只写在注释里、没有任何断言** ⇒ 新增变体若引入不可 Send 的
+        // 载荷（如 `Rc`），要等到跨线程用它的测试**炸在运行期**才暴露。
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<Value>();
     }
 
     #[test]

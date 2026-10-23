@@ -130,9 +130,33 @@ pub enum CoreInst {
 
     // ── Thunk 降维 ──
     /// 创建惰性求值 thunk。
-    ThunkCreate { dst: Reg, body: CoreBlock },
+    ///
+    /// v0.104.6 D481：`body` 由**单个** `CoreBlock` 改为**完整子函数** ——
+    /// 与 `ClosureCreate.body`（D480）同款截断：thunk 体里的嵌套分支此前
+    /// 同样装不下（分支目标指向**并不存在**的块）。
+    ThunkCreate { dst: Reg, body: CoreFunction },
     /// 强制求值 thunk。
     ThunkForce(Reg, Reg),
+
+    // ── 区域（结构化作用域）──
+    /// 一个**区域构造**：体是**独立的嵌套代码区**（自己的块集合 + 入口 +
+    /// 自己的寄存器空间），形状**镜像 MIR 层**的嵌套 `MirFunction`
+    /// （`MirInst::Parallel { body: Box<MirFunction> }` 等）。
+    ///
+    /// v0.104.6 D481：此前这类构造（`parallel` / `observe` / `span` /
+    /// `worker` / `transaction` / `with` / `solve` / `section` / `export`）
+    /// 在 Core 层是**原地摊平**的 —— 只把体内容降进外层 CFG，构造本身
+    /// **完全不可见**。加这个原语后，区域结构在 Core 产物里**看得见了**。
+    ///
+    /// `kind` 取值：`parallel` / `observe` / `span` / `worker` /
+    /// `transaction` / `with_config` / `solve` / `prompt_section` /
+    /// `document_section` / `export`。
+    Scope {
+        kind: String,
+        body: CoreFunction,
+        /// 补偿体（**仅** `transaction` 有；其余为 `None`）。
+        compensation: Option<CoreFunction>,
+    },
 
     // ── 控制流（5 种）──
     /// 条件分支。

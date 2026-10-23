@@ -70,9 +70,39 @@ Token → FCFG → EHIR → Core → MIR
 >   D480 起 `body` 承载**完整子函数**（`CoreFunction` 形态：块集合 + 入口 +
 >   自己的寄存器空间）⇒ 复用同一个「带入口的代码区」概念，不另立第二套类型。
 >
+> - **D481：保真度**（`tests/core_fidelity.rs`）—— Core 产物里**说谎**的
+>   地方比「不完整」更糟，D481 把它们逐个修掉：
+>
+>   | 构造 | D481 之前 | 现在 |
+>   |---|---|---|
+>   | `match` 分支的**绑定名** | 恒为空 ⇒ `x when x > 0` 的 `x` 根本不存在 | 从模式里取出 |
+>   | `match` 分支的**变体名** | `format!("{:?}", pattern)` ⇒ 连 `Span` 都进去了 | 只留可读形式 |
+>   | `break` / `continue` | `CoreInst::Jump(0)` ⇒ 一条**假边**（目标是块 0） | 真的**终结跳转**（break→出口块、continue→条件块） |
+>   | 管道 `\|>` | `Const(dst, Nil)` ⇒ 两端全丢 | `Call(dst, left, [right])` |
+>   | 闭包的**捕获变量** | 恒为空，且注释谎称「由 EHIR 分析确定」 | 过近似 + 注释说真话 |
+>   | **区域构造**（`parallel` / `observe` / `span` / `worker` / `transaction` / `with` / `solve` / `section` / `export`） | 原地摊平 ⇒ 构造**完全不可见** | `CoreInst::Scope`（体是独立嵌套代码区，形状镜像 MIR 层的嵌套 `MirFunction`） |
+>   | `ThunkCreate.body` | 单个 `CoreBlock`（与 D480 前的闭包体同款截断） | 完整子函数 |
+>
 > 影响范围：**仅限 Core 层**。Core 函数**从不执行**（`probe_all_layers` 只统计
 > 指令数），可执行的路径是 MIR 层 —— 它的块结构由 `mir/dag.rs` 独立构建，
 > 不受此限制。
+>
+> #### Core 层的**有损登记**（D481 后剩下的）
+>
+> 下列构造在 Core 层**没有对应原语** ⇒ 只能写 Nil 占位 / 空区域。这是
+> **模型**的限制（要整套执行层语义：字符串当代码执行、聚合贡献、模板片段、
+> 事务提交/回滚、agent 图），不是降维的疏忽 ⇒ 登记在此，不擅自扩模型。
+>
+> | 构造 | Core 层表现 | 为什么 Core 装不下 |
+> |---|---|---|
+> | `eval` | `Const(dst, Nil)` | 「把字符串当代码执行」是执行层语义 |
+> | `aggregate` | `Const(dst, Nil)` | 「向聚合器贡献一个值」是执行层语义 |
+> | quasiquote | `Const(dst, Nil)`（片段丢失） | 「文本 + 插值」的混合序列不是任何基元 |
+> | `commit` / `rollback` | `Const(dst, Nil)` | 事务提交/回滚没有 Core 原语 |
+> | `orchestrate` | `Scope{kind:"orchestrate"}`（**空**区域） | agent 图 / 边条件 / state schema 要整套图语义 |
+>
+> 钉子：`tests/core_fidelity.rs::lossy_constructs_stay_registered` —— 哪天
+> 它们变忠实了，本判据会失败并提示更新这张表。
 
 ### MIR — Mid-level IR（已有）
 - **输入**：`FCFG`（`lower_fcfg` 降维）
@@ -276,7 +306,8 @@ D472 之后登记项由 4 条减为 1 条（`orchestrate`），D473 之后减为
 | pipeline_conformance | 11 | 代表性 fixture 的**期望输出**（D474 新建） |
 | short_circuit_evaluation | 3 | `or`/`and` 的**求值级短路**（行为 × 优化档 + 两路径形状，D477 新建） |
 | execute_naming_hygiene | 3 | 执行入口命名一致性（旧名不得复活，D478 新建） |
-| core_cfg_wellformed | 5 | Core 层 CFG **结构良构性** + 模型限制登记（D479 新建） |
+| core_cfg_wellformed | 5 | Core 层 CFG **结构良构性** + 模型限制登记（D479/D480 新建） |
+| core_fidelity | 6 | Core 层**保真度**（产物里该看见的东西不能丢，D481 新建） |
 
 ## 已知遗留（技术债）
 

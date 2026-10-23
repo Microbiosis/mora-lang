@@ -195,7 +195,7 @@ fn assert_acyclic(core: &CoreFunction, tag: &str) {
     }
 }
 
-/// 收集一个 CoreFunction 里的**嵌套代码区**（闭包体 / match 分支体）。
+/// 收集一个 CoreFunction 里的**嵌套代码区**（闭包体 / match 分支体 / 区域体）。
 fn nested_regions(core: &CoreFunction) -> Vec<(String, &CoreFunction)> {
     let mut out: Vec<(String, &CoreFunction)> = Vec::new();
     for b in &core.blocks {
@@ -207,6 +207,18 @@ fn nested_regions(core: &CoreFunction) -> Vec<(String, &CoreFunction)> {
                 CoreInst::EnumMatch { arms, .. } => {
                     for (i, arm) in arms.iter().enumerate() {
                         out.push((format!("EnumMatch.arm[{i}].body"), &arm.body));
+                    }
+                }
+                // v0.104.6 D481：区域体也是独立代码区 ⇒ 同样要递归检查。
+                CoreInst::Scope {
+                    kind,
+                    body,
+                    compensation,
+                    ..
+                } => {
+                    out.push((format!("Scope[{kind}].body"), body));
+                    if let Some(c) = compensation {
+                        out.push((format!("Scope[{kind}].compensation"), c));
                     }
                 }
                 _ => {}

@@ -19,6 +19,39 @@ All notable changes to Mora will be documented in this file.
 - **`Int` 语义**：算术与比较统一为**精确 i64**（overflow 报 `MoraError`）。
   2^53 之外的 `Int` 运算结果会变（此前静默丢最低位），`Int ⊗ Float` 超界改报错。
 
+### D481：Core 层保真度收口 —— 产物里「说谎」的地方逐个修掉
+
+D479 / D480 修掉了 Core 层的两处**结构**缺陷（块号相撞、嵌套代码区被截断）。
+本条处理剩下的**保真度**缺口：Core 产物里**说谎**（而不是「不完整」）的地方。
+
+#### 说谎清单（实测取证）
+
+| 构造 | D481 之前 | 现在 |
+|---|---|---|
+| `match` 分支的**绑定名** | 恒为空 ⇒ `x when x > 0` 的 `x` 在产物里**根本不存在** | 从模式里取出 |
+| `match` 分支的**变体名** | `format!("{:?}", pattern)` ⇒ 把**源码位置**也塞进去了（`Literal(Float(3.0, Span { line: 3, column: 5 }))`） | 只留可读形式 |
+| `break` / `continue` | `CoreInst::Jump(0)` ⇒ 一条**假边**（目标是块 0，与循环出口毫无关系），而且只是块里的**一条指令** ⇒ 块本身照常往下走 | 真的**终结跳转**：`break` → 循环出口块、`continue` → 循环条件块（`break` 的目标要等循环体降完才知道 ⇒ 占位 + 回填） |
+| 管道 `\|>` | `Const(dst, Nil)` ⇒ 管道两端**全丢**（Core 层本来就有 `Call` 原语） | `Call(dst, left, [right])` |
+| 闭包的**捕获变量** | 恒为空，且注释谎称「捕获变量由 EHIR 分析确定」—— EHIR **没有**这项分析 | 过近似的自由变量分析（读取 ∖ 体内绑定）+ 注释说真话 |
+| **区域构造**（`parallel` / `observe` / `span` / `worker` / `transaction` / `with` / `solve` / `section` / `export`） | 原地摊平 ⇒ 只剩体内容，构造本身**完全不可见** | 新增 `CoreInst::Scope { kind, body, compensation }`：体是**独立嵌套代码区**，形状**镜像 MIR 层**的嵌套 `MirFunction` |
+| `ThunkCreate.body` | 单个 `CoreBlock`（与 D480 前的闭包体同款截断） | 完整子函数 |
+
+#### 有损登记（模型确实没有原语的那几个）
+
+`eval` / `aggregate` / quasiquote / `commit` / `rollback` / `orchestrate` 在 Core 层
+**没有对应原语** ⇒ 只能写 Nil 占位或空区域。这是**模型**限制（要整套执行层
+语义），不是降维疏忽 ⇒ 在 `docs/nine-layer-ir.md` 里**显式登记**，不擅自扩模型。
+钉子：`tests/core_fidelity.rs::lossy_constructs_stay_registered`。
+
+#### 守卫
+
+`tests/core_fidelity.rs`（新建，6 条）：match 的绑定名与可读变体名 /
+break-continue 的目标结构（按**结构关系**判，不靠「块 0 是入口」这种位置
+巧合）/ 管道降成 `Call` / 区域构造可见 / 捕获变量非空 / 有损清单仍被登记。
+
+**反向验证**：临时把管道改回 `Const(dst, Nil)` ⇒ 判据立刻报「管道应降成
+`Call`」⇒ 非恒真。
+
 ### D480：Core 模型能承载多块 —— 闭包体 / match 分支体不再被截断
 
 D479 修掉了 Core 层的**块号相撞**，并登记了剩下一处**模型级**缺口：

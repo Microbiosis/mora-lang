@@ -59,7 +59,7 @@ pub fn lower_fcfg(nodes: &[Fcfg]) -> (Vec<MirInst>, usize) {
 }
 
 /// 递归计算节点树中引用的最大寄存器号。
-fn max_reg_in_nodes(nodes: &[Fcfg]) -> usize {
+pub(crate) fn max_reg_in_nodes<M>(nodes: &[Node<M>]) -> usize {
     let mut max = 0usize;
     for node in nodes {
         max = max.max(max_reg_in_node(node));
@@ -67,7 +67,7 @@ fn max_reg_in_nodes(nodes: &[Fcfg]) -> usize {
     max
 }
 
-fn max_reg_in_node(node: &Fcfg) -> usize {
+pub(crate) fn max_reg_in_node<M>(node: &Node<M>) -> usize {
     match node {
         Node::Literal { reg, .. } | Node::Variable { reg, .. } | Node::Expr { reg, .. } => *reg,
         Node::BinaryOp { dst, lhs, rhs, .. } => *dst.max(lhs).max(rhs),
@@ -1156,7 +1156,7 @@ fn lower_match(ctx: &mut EmitContext, scrutinee: Reg, dst: Reg, arms: &[MatchArm
 
 /// fcfg::Pattern → 字符串（镜像 lower.rs::pattern_to_string 的运行时
 /// 匹配器格式：`int:42` / `list:vector:[a,..rest]` / `dict:{k:v,..}` 前缀式）。
-fn fcfg_pattern_to_string(pattern: &Pattern) -> String {
+pub(crate) fn fcfg_pattern_to_string(pattern: &Pattern) -> String {
     match pattern {
         Pattern::Wildcard => "_".to_string(),
         Pattern::Variable(name) => name.clone(),

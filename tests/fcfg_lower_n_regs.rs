@@ -189,8 +189,15 @@ fn max_reg_in_node_covers_every_node_variant() {
         .collect();
 
     // 2) max_reg_in_node 里外层 `match node` 在深度 1 上的 Node:: 分支
+    //
+    // v0.104.6 D482：定位改成**签名无关** —— 该函数被泛型化
+    // （`fn max_reg_in_node<M>(node: &Node<M>)`，Core 层要在 `Node<TypeInfo>`
+    // 上复用同一个实现），按**旧签名**的字面串找会直接 panic。
+    // 「`max_reg_in_node` 后面不是 `s`」用来排除同文件里的 `max_reg_in_nodes`。
     let fn_start = lower_src
-        .find("fn max_reg_in_node(node: &Fcfg) -> usize {")
+        .match_indices("fn max_reg_in_node")
+        .map(|(i, _)| i)
+        .find(|i| !lower_src[*i + "fn max_reg_in_node".len()..].starts_with('s'))
         .expect("应能找到 max_reg_in_node");
     let fn_body = &lower_src[fn_start..];
     let m_at = fn_body

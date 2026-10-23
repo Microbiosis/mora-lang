@@ -63,12 +63,12 @@ fn match_arms_keep_bindings_and_readable_variants() {
         }
     }
     assert!(!arms.is_empty(), "应产生 match 分支");
-    // 变体名可读：不含 Debug 的 Span 噪声
+    // 变体名可读：模式存的是**源码文本**（不含 Debug 的 Span 噪声）
     for arm in &arms {
         assert!(
-            !arm.variant.contains("Span"),
+            !arm.pattern.contains("Span"),
             "变体名里混进了源码位置：{:?}",
-            arm.variant
+            arm.pattern
         );
     }
     // 绑定名被保留（`y -> …` 的 `y`）
@@ -78,10 +78,12 @@ fn match_arms_keep_bindings_and_readable_variants() {
         "模式里的绑定名 `y` 丢失了：{bound:?}"
     );
     // 变体名可读：变量模式的名字直接就是名字
+    let labels: Vec<&String> = arms.iter().map(|a| &a.pattern).collect();
     assert!(
-        arms.iter().any(|a| a.variant == "y" || a.variant == "3"),
-        "变体名不可读：{:?}",
-        arms.iter().map(|a| &a.variant).collect::<Vec<_>>()
+        labels
+            .iter()
+            .any(|l| l.as_str() == "y" || l.as_str() == "3"),
+        "变体名不可读：{labels:?}"
     );
 }
 
@@ -169,20 +171,63 @@ fn break_and_continue_target_the_right_blocks() {
     }
 }
 
-/// 判据 ③：管道降成 `Call`（把 right 当参数调用 left）。
+/// 判据 ③：管道降成**值调用**，且左右 operand 顺序正确。
+///
+/// 管道语义 = 「用 right 调 left」（MIR 的 `h_pipe`：`call_value(&rhs, [lhs])`）。
+/// D481 曾把它写成 `Call(dst, left, [right])` ⇒ **左右反了**（成了「用 left
+/// 调 right」）—— 影子层不被执行，所以当时没暴露；Core 层要能执行前必须纠正。
 #[test]
-fn pipe_lowers_to_a_call() {
-    let core = core_of("let f = fn(x) x + 1\nlet y = 1 |> f\n");
-    let calls: Vec<&CoreInst> = core
+fn pipe_lowers_to_a_value_call_with_correct_operand_order() {
+    let src = "let f = fn(x) x + 1\nlet y = 1 |> f\n";
+    // 取 FCFG 里 Pipe 节点的 left / right 寄存器
+    let (_func, witnesses) = mora::parser_v3::ParserV3::compile(src).expect("解析");
+    let fcfg = mora::mir::witness_to_fcfg::witness_to_fcfg(&witnesses);
+    let (left, right) = find_pipe(&fcfg).expect("FCFG 里应有 Pipe 节点");
+
+    let core = core_of(src);
+    let calls: Vec<(usize, usize, Vec<usize>)> = core
         .blocks
         .iter()
         .flat_map(|b| b.insts.iter())
-        .filter(|i| matches!(i, CoreInst::Call(_, _, _)))
+        .filter_map(|i| match i {
+            CoreInst::ClosureCall(d, c, a) => Some((*d, *c, a.clone())),
+            _ => None,
+        })
         .collect();
     assert!(
         !calls.is_empty(),
-        "管道应降成 `Call`（D481 之前是 `Const(dst, Nil)`，两端全丢）"
+        "管道应降成**值调用** `ClosureCall`（D481 之前是 `Const(dst, Nil)`，两端全丢）"
     );
+    assert!(
+        calls
+            .iter()
+            .any(|(_, callee, args)| *callee == right && args == &vec![left]),
+        "管道的 callee 必须是 **right**、实参是 **left**\
+         （MIR 的 h_pipe: call_value(&rhs, [lhs])）；实际 {calls:?}\
+         （FCFG: left={left} right={right}）"
+    );
+}
+
+/// 在 FCFG 节点树里找 `Pipe` 节点，返回 (left, right) 寄存器。
+fn find_pipe(nodes: &[mora::mir::fcfg::Node<()>]) -> Option<(usize, usize)> {
+    use mora::mir::fcfg::Node;
+    for n in nodes {
+        match n {
+            Node::Pipe { left, right, .. } => return Some((*left, *right)),
+            Node::Sequence { nodes, .. } => {
+                if let Some(x) = find_pipe(nodes) {
+                    return Some(x);
+                }
+            }
+            Node::Let { body, .. } => {
+                if let Some(x) = find_pipe(&body.nodes) {
+                    return Some(x);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 /// 判据 ④：区域构造在产物里**看得见**。

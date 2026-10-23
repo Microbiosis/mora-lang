@@ -32,9 +32,67 @@
 
 use crate::common::BinaryOp;
 use crate::mir::effect::EffectRow;
-use crate::mir::fcfg::Reg;
+use crate::mir::fcfg::{Pattern, Reg};
 use crate::typeck::Type;
 use crate::value::Value;
+
+// ===================================================================
+// 模式辅助
+// ===================================================================
+
+/// 模式里的**绑定名**（`x when x > 0` 里的 `x`）。
+///
+/// v0.104.6 D481：`EnumMatchArm.bindings` 此前**恒为空** ⇒ 模式绑定的名字
+/// 在 Core 产物里**根本不存在**。
+pub fn pattern_bindings(p: &Pattern) -> Vec<String> {
+    let mut out = Vec::new();
+    collect_pattern_bindings(p, &mut out);
+    out
+}
+
+fn collect_pattern_bindings(p: &Pattern, out: &mut Vec<String>) {
+    match p {
+        Pattern::Variable(n) => {
+            if !out.contains(n) {
+                out.push(n.clone());
+            }
+        }
+        Pattern::Tuple(ps) | Pattern::List(ps) => {
+            for x in ps {
+                collect_pattern_bindings(x, out);
+            }
+        }
+        Pattern::ListVec { head, tail } => {
+            for x in head {
+                collect_pattern_bindings(x, out);
+            }
+            if let Some(t) = tail {
+                collect_pattern_bindings(t, out);
+            }
+        }
+        Pattern::Dict(kvs) => {
+            for (_, v) in kvs {
+                collect_pattern_bindings(v, out);
+            }
+        }
+        Pattern::TypeAscription(inner, _) => collect_pattern_bindings(inner, out),
+        Pattern::Wildcard | Pattern::Literal(_) => {}
+    }
+}
+
+/// 字面量 → 运行期值（**去掉源码位置** —— Core 产物里不留 Span 噪声）。
+pub fn literal_to_value(lit: &crate::common::Literal) -> Value {
+    use crate::common::Literal;
+    match lit {
+        Literal::Int(n, _) => Value::Int(*n),
+        Literal::Float(f, _) => Value::Float(*f),
+        Literal::BigInt(n, _) => Value::BigInt(n.clone()),
+        Literal::String(s, _) => Value::String(s.clone()),
+        Literal::Bool(b, _) => Value::Bool(*b),
+        Literal::Nil(_) => Value::Nil,
+        Literal::Char(c, _) => Value::Char(*c),
+    }
+}
 
 // ===================================================================
 // CoreInst — 函数式基元指令集
@@ -60,8 +118,16 @@ pub enum CoreInst {
     Copy(Reg, Reg),
     /// 二元运算。
     BinaryOp(Reg, Reg, BinaryOp, Reg),
-    /// 闭包调用（非名称调用）。callee 是持有闭包值的寄存器。
-    Call(Reg, Reg, Vec<Reg>),
+    /// 具名调用：按**名字**分派（用户函数 / 内建）。
+    ///
+    /// v0.104.6 D482：此前 `Call` **不带名字** ⇒ 降维时把 `callee_name` 丢了
+    /// ⇒ Core 层**根本无法执行具名调用**（分派靠名字）。补上名字后，
+    /// `Call` 与 [`CoreInst::ClosureCall`] 的分工明确：
+    /// `Call` 按名分派，`ClosureCall` 按寄存器里的可调用值分派。
+    ///
+    /// 形状**镜像** `MirInst::Call(dst, name, args)`（同样只留名字，不留
+    /// callee 寄存器 —— 名字才是分派的唯一依据）。
+    Call(Reg, String, Vec<Reg>),
     /// 列表字面量。
     ListLit(Reg, Vec<Reg>),
     /// 字典字面量。
@@ -91,8 +157,21 @@ pub enum CoreInst {
         /// 的控制流结构不再丢失。
         body: CoreFunction,
     },
-    /// 调用闭包。
+    /// 调用闭包（**值调用**）：callee 寄存器持有可调用值。
+    ///
+    /// 形状**镜像** `MirInst::CallValue(dst, callee, args)`。
     ClosureCall(Reg, Reg, Vec<Reg>),
+    /// 方法调用：receiver 寄存器 + 方法名 + 实参。
+    ///
+    /// v0.104.6 D482：此前方法调用被降成**具名** `Call` ⇒ 分派方式错了
+    /// （方法要走 `mir_call_method`，不是 `mir_call_function`）。
+    /// 形状**镜像** `MirInst::MethodCall(dst, receiver, method, args)`。
+    MethodCall(Reg, Reg, String, Vec<Reg>),
+    /// 模板求值：把各片段的字符串形式拼起来。
+    ///
+    /// v0.104.6 D482：此前被降成 `Call("prompt", …)` ⇒ 一个**不存在的函数**
+    /// ⇒ 既执行不了、也误导。形状**镜像** `MirInst::Prompt(dst, parts)`。
+    Prompt(Reg, Vec<Reg>),
 
     // ── ADT 降维 ──
     /// 枚举构造。
@@ -103,7 +182,12 @@ pub enum CoreInst {
         fields: Vec<Reg>,
     },
     /// 枚举匹配。
+    ///
+    /// v0.104.6 D482：补 `dst` —— 匹配**有值**（命中的那条臂的返回值），
+    /// 此前 Core 的 `EnumMatch` 没有结果寄存器 ⇒ 匹配的值在产物里**丢了**。
+    /// 形状**镜像** `MirInst::MatchExpr`（所有臂写同一个外层寄存器）。
     EnumMatch {
+        dst: Reg,
         scrutinee: Reg,
         arms: Vec<EnumMatchArm>,
     },
@@ -212,8 +296,26 @@ pub enum CoreTerminator {
 /// 枚举匹配分支。
 #[derive(Debug, Clone)]
 pub struct EnumMatchArm {
-    pub variant: String,
+    /// 分支的**模式**（源码文本形式，与 `MirInst::MatchArmInst` 同形）。
+    ///
+    /// v0.104.6 D482：此前是**只读标签** `variant: String`（而且是
+    /// `format!("{:?}", pattern)` 的 Debug 串，连 `Span` 都进去了）⇒
+    /// 只能给人看，**没法执行**（匹配要模式本身）。
+    ///
+    /// 现在存的是**模式源码文本**（`3` / `x` / `{a: 1}`）⇒ 执行器可直接
+    /// 复用 `self_match_pattern` ⇒ 与 MIR 层**逐字同一套**匹配语义。
+    pub pattern: String,
+    /// 模式里的绑定名（`x when x > 0` 里的 `x`）。
+    ///
+    /// v0.104.6 D481：此前**恒为空** ⇒ 模式绑定的名字在 Core 产物里
+    /// **根本不存在**。
     pub bindings: Vec<String>,
+    /// 守卫（`when` 条件）—— **独立代码区**（在自己的寄存器空间里求值）。
+    ///
+    /// v0.104.6 D482：此前 Core 的 arm **不带守卫** ⇒ `when` 条件在产物里
+    /// 完全消失（`x when x > 0` 退化成 `x`）。守卫的求值时机与 MIR 层一致：
+    /// **模式绑定之后**（守卫体因此能读到绑定变量）。
+    pub guard: Option<CoreFunction>,
     /// 分支体 —— 与闭包体同款：**一个完整的子函数**（多块 CFG + 入口）。
     ///
     /// v0.104.6 D480：此前是**单个** `CoreBlock` ⇒ 分支体里的嵌套分支被

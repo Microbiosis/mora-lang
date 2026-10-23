@@ -29,6 +29,9 @@ pub mod cache;
 // v0.89: CMIR → LMIR 桥接
 // v0.89: Core IR — 9 层架构第 3 层（函数式基元指令集，SSA 100% 覆盖）
 pub mod core;
+// v0.104.6 D482：Core 层**执行器** —— 让 Core IR 从「影子」变成「可执行」
+// （可执行子集见模块文档；不支持的部分**响亮报错**，不静默降级）。
+pub mod core_exec;
 // v0.78: EffectRow — algebraic effect 的类型表示（Stage 1/4 落地）
 pub mod effect;
 // v0.92: expr 模块已删除 —— MirExpr 平行 AST 世界完全消除（P0.3）。

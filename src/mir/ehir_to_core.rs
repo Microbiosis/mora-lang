@@ -14,9 +14,10 @@
 
 use crate::mir::core::{
     BlockId, CoreBlock, CoreFunction, CoreInst, CoreTerminator, EffectLabel, EnumMatchArm,
+    literal_to_value, pattern_bindings,
 };
 use crate::mir::effect::EffectRow;
-use crate::mir::fcfg::{Ehir, EhirBlock, Node, Pattern, Reg};
+use crate::mir::fcfg::{Ehir, EhirBlock, Node, Reg};
 use crate::typeck::Type;
 use crate::value::Value;
 
@@ -27,6 +28,10 @@ pub fn ehir_to_core(
     effects: EffectRow,
 ) -> CoreFunction {
     let mut ctx = CoreContext::new(effects);
+    // v0.104.6 D482：顶层同样要**跳过** FCFG 预分配的寄存器（见
+    // `lower_body_to_core` 的说明）—— 否则 Core 层的 `alloc_reg()` 会与
+    // FCFG 的预分配号撞车。
+    ctx.next_reg = crate::mir::fcfg_lower::max_reg_in_nodes(nodes) + 1;
     for node in nodes {
         lower_node(&mut ctx, node);
     }
@@ -261,9 +266,11 @@ fn lower_node(ctx: &mut CoreContext, node: &Ehir) {
             ctx.emit(CoreInst::Copy(*dst, *src));
         }
         Node::Prompt { dst, parts, .. } => {
-            // Prompt 在 Core 层表示为 Call("prompt", parts)
-            let prompt_callee = ctx.alloc_reg();
-            ctx.emit(CoreInst::Call(*dst, prompt_callee, parts.clone()));
+            // 模板求值（镜像 `MirInst::Prompt(dst, parts)`）。
+            //
+            // v0.104.6 D482：此前被降成 `Call("prompt", …)` ⇒ 一个**根本不存在
+            // 的函数名**，既执行不了、也误导读者。
+            ctx.emit(CoreInst::Prompt(*dst, parts.clone()));
         }
         Node::ClosureExpr {
             dst, params, body, ..
@@ -285,11 +292,18 @@ fn lower_node(ctx: &mut CoreContext, node: &Ehir) {
             args,
             ..
         } => {
-            // 已知函数名 → 直接 Call，否则 → ClosureCall
-            if callee_name.is_some() {
-                ctx.emit(CoreInst::Call(*dst, *callee, args.clone()));
-            } else {
-                ctx.emit(CoreInst::ClosureCall(*dst, *callee, args.clone()));
+            // 已知函数名 → 具名 `Call`（**带名字**），否则 → 值调用 `ClosureCall`。
+            //
+            // v0.104.6 D482：此前具名调用的**名字被丢了**（`Call` 不带名字）
+            // ⇒ Core 层**无法分派具名调用** ⇒ 根本执行不了。名字是分派的唯一
+            // 依据，必须留在 IR 里。
+            match callee_name {
+                Some(name) => {
+                    ctx.emit(CoreInst::Call(*dst, name.clone(), args.clone()));
+                }
+                None => {
+                    ctx.emit(CoreInst::ClosureCall(*dst, *callee, args.clone()));
+                }
             }
         }
         Node::MethodCall {
@@ -299,11 +313,17 @@ fn lower_node(ctx: &mut CoreContext, node: &Ehir) {
             args,
             ..
         } => {
-            // 方法调用降维为函数调用：callee = receiver, args = [receiver, ...args]
-            let mut full_args = vec![*receiver];
-            full_args.extend_from_slice(args);
-            ctx.emit(CoreInst::Call(*dst, *receiver, full_args));
-            let _ = method; // 方法名已在 EHIR 阶段解析
+            // 方法调用（镜像 `MirInst::MethodCall(dst, receiver, method, args)`）。
+            //
+            // v0.104.6 D482：此前被降成**具名** `Call` ⇒ 分派方式错了
+            // （方法要走 `mir_call_method`，不是 `mir_call_function`），
+            // 而且**方法名被丢了**（`let _ = method;`）。
+            ctx.emit(CoreInst::MethodCall(
+                *dst,
+                *receiver,
+                method.clone(),
+                args.clone(),
+            ));
         }
         Node::ListLit { dst, items, .. } => {
             ctx.emit(CoreInst::ListLit(*dst, items.clone()));
@@ -368,12 +388,21 @@ fn lower_node(ctx: &mut CoreContext, node: &Ehir) {
         Node::While {
             cond, body, dst, ..
         } => {
-            // cond block —— 块号在**降完条件体之后**才定：条件体里若含嵌套
-            // 分支，会先占用若干块，而「条件值所在的那一块」是降完之后的
-            // 当前块（回边要跳回它）。
+            // v0.104.6 D482：**条件必须独立成块**。
+            //
+            // 此前条件指令与「循环之前的语句」落在**同一块**里，而回边跳回
+            // 那一块 ⇒ 循环之前的语句（如 `let j = 0`）被**反复重跑** ⇒
+            // 条件恒真 ⇒ **死循环**。
+            //
+            // MIR 层没有这个问题：它是**线性指令流 + pc 定位循环头**
+            // （`loop_start` = 条件指令之前的位置），回边只重跑条件本身。
+            // Core 是块结构 ⇒ 跳不进块中间 ⇒ 条件必须自己一个块。
+            let pre_idx = ctx.flush_block_at(CoreTerminator::Jump(0)); // 占位，稍后回填
+
+            // cond block
+            let cond_id = ctx.next_block_id;
             lower_block(ctx, cond);
             let cond_reg = cond.result.unwrap_or(0);
-            let cond_id = ctx.next_block_id;
             ctx.emit(CoreInst::Branch {
                 cond: cond_reg,
                 true_bb: 0,
@@ -394,13 +423,15 @@ fn lower_node(ctx: &mut CoreContext, node: &Ehir) {
             });
             lower_block(ctx, body);
             let loop_ctx = ctx.loop_stack.pop().expect("循环上下文已压栈");
-            // 回边：跳回条件块（cond_id 已知，无需回填）
+            // 回边：跳回条件块
             ctx.emit(CoreInst::Jump(cond_id));
             ctx.flush_block_at(CoreTerminator::Jump(cond_id));
 
             // 出口块 = 循环之后的当前块
             let end_id = ctx.next_block_id;
             ctx.patch_branch(cond_idx, body_id, end_id);
+            // 循环之前的块 → 条件块
+            ctx.patch_jump(pre_idx, cond_id);
             // `break` 的目标是**出口块**，它此刻才确定 ⇒ 回填（D481）
             for b in loop_ctx.breaks {
                 ctx.patch_jump(b, end_id);
@@ -418,13 +449,25 @@ fn lower_node(ctx: &mut CoreContext, node: &Ehir) {
             ..
         } => {
             // index-based loop
+            //
+            // v0.104.6 D482：**三块结构** —— 循环之前的语句 / 初始化 / 条件
+            // 各占一块。否则回边跳回条件块时会把 `idx = 0` 一起重跑 ⇒ 索引永远
+            // 归零 ⇒ 死循环（与 `Node::While` 的「条件独立成块」同款理由）。
+            //
+            //   K  : [循环之前的语句]      → Jump(K+1)
+            //   K+1: [初始化 idx/len/one]  → Jump(K+2)
+            //   K+2: [条件 idx >= len]     → Branch(出口 / K+3)
+            //   K+3: [循环体]              → Jump(K+2)
+            let pre_idx = ctx.flush_block_at(CoreTerminator::Jump(0)); // 占位，稍后回填
             let idx_reg = ctx.alloc_reg();
             ctx.emit(CoreInst::Const(idx_reg, Value::Int(0)));
             let len_reg = ctx.alloc_reg();
-            ctx.emit(CoreInst::Call(len_reg, *iter, vec![*iter]));
+            ctx.emit(CoreInst::Call(len_reg, "len".to_string(), vec![*iter]));
             // 步长常量与 fcfg_lower/emit.rs 同序（循环标签前发射）。
             let one = ctx.alloc_reg();
             ctx.emit(CoreInst::Const(one, Value::Int(1)));
+            let init_id = ctx.next_block_id;
+            let init_idx = ctx.flush_block_at(CoreTerminator::Jump(0)); // 占位，稍后回填
 
             // 循环头块：条件计算 + 分支（v0.104.6 D479：先降维、后回填）
             let loop_start = ctx.next_block_id;
@@ -470,6 +513,9 @@ fn lower_node(ctx: &mut CoreContext, node: &Ehir) {
             // 出口块 = 循环之后的当前块
             let end_id = ctx.next_block_id;
             ctx.patch_branch(cond_idx, end_id, body_id);
+            // 循环之前的块 → 初始化块；初始化块 → 循环头块
+            ctx.patch_jump(pre_idx, init_id);
+            ctx.patch_jump(init_idx, loop_start);
             // `break` 的目标是**出口块**，它此刻才确定 ⇒ 回填（D481）
             for b in loop_ctx.breaks {
                 ctx.patch_jump(b, end_id);
@@ -494,19 +540,25 @@ fn lower_node(ctx: &mut CoreContext, node: &Ehir) {
             // - `bindings` 此前**恒为空** ⇒ 模式里的绑定名**全丢**
             //   （`x when x > 0` 的 `x` 在产物里根本不存在）。改为从模式里
             //   取出绑定名。
+            // v0.104.6 D482：可读标签改为**模式源码文本**（与
+            // `MirInst::MatchArmInst` 同形 ⇒ 执行器可直接复用
+            // `self_match_pattern` ⇒ 与 MIR 层**逐字同一套**匹配语义），
+            // arm 里不再存 Debug 串（那会把 `Span` 也塞进去）。
             let core_arms: Vec<EnumMatchArm> = arms
                 .iter()
                 .map(|arm| EnumMatchArm {
-                    variant: pattern_label(&arm.pattern),
+                    pattern: crate::mir::fcfg_lower::fcfg_pattern_to_string(&arm.pattern),
                     bindings: pattern_bindings(&arm.pattern),
+                    // 守卫是独立代码区（在自己的寄存器空间里求值），与 MIR 层同形。
+                    guard: arm.guard.as_ref().map(|g| lower_body_to_core(ctx, g)),
                     body: lower_body_to_core(ctx, &arm.body),
                 })
                 .collect();
             ctx.emit(CoreInst::EnumMatch {
+                dst: *dst,
                 scrutinee: *scrutinee,
                 arms: core_arms,
             });
-            let _ = dst;
         }
         Node::Return { value, .. } => {
             ctx.flush_block(CoreTerminator::Return(*value));
@@ -821,10 +873,13 @@ fn lower_node(ctx: &mut CoreContext, node: &Ehir) {
         Node::Pipe {
             dst, left, right, ..
         } => {
-            // v0.104.6 D481：管道 = 「把 right 当参数调用 left」⇒ Core 层
-            // **有** `Call` 原语，此前却写成 `Const(dst, Nil)` ⇒ 管道两端
-            // 全丢。改为 `Call`（与 MIR 层 `MirInst::Pipe` 的语义同形）。
-            ctx.emit(CoreInst::Call(*dst, *left, vec![*right]));
+            // 管道 = 「用 right 调 left」（与 MIR 层 `h_pipe` 同形：
+            // `call_value(&rhs_val, vec![lhs_val])`）⇒ **值调用**。
+            //
+            // v0.104.6 D482 更正：D481 把它写成 `Call(dst, left, [right])`
+            // —— **左右 operand 反了**（成了「用 left 调 right」）。影子层里
+            // 不会被执行，所以当时没暴露；现在 Core 层要能执行，语义必须对。
+            ctx.emit(CoreInst::ClosureCall(*dst, *right, vec![*left]));
         }
         Node::Commit { dst, .. } | Node::Rollback { dst, .. } => {
             // v0.104.6 D481：Core 层**无事务原语**（提交 / 回滚是执行层的
@@ -837,90 +892,6 @@ fn lower_node(ctx: &mut CoreContext, node: &Ehir) {
 fn lower_block(ctx: &mut CoreContext, block: &EhirBlock) {
     for node in &block.nodes {
         lower_node(ctx, node);
-    }
-}
-
-/// 模式的**可读标签**（Core 的「变体名」位）。
-///
-/// v0.104.6 D481：此前是 `format!("{:?}", pattern)` ⇒ 把**源码位置**也
-/// 塞进了变体名（`Literal(Float(3.0, Span { line: 3, column: 5 }))`），
-/// 既不可读、又不稳定（改一行源码就变一个名字）。
-fn pattern_label(p: &Pattern) -> String {
-    match p {
-        Pattern::Wildcard => "_".to_string(),
-        Pattern::Variable(n) => n.clone(),
-        Pattern::Literal(l) => format!("{:?}", literal_to_value(l)),
-        Pattern::Tuple(ps) => format!(
-            "({})",
-            ps.iter().map(pattern_label).collect::<Vec<_>>().join(", ")
-        ),
-        Pattern::List(ps) => format!(
-            "[{}]",
-            ps.iter().map(pattern_label).collect::<Vec<_>>().join(", ")
-        ),
-        Pattern::ListVec { head, tail } => {
-            let mut s = format!(
-                "[{}",
-                head.iter()
-                    .map(pattern_label)
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            );
-            if let Some(t) = tail {
-                s.push_str(&format!(" .. {}]", pattern_label(t)));
-            } else {
-                s.push(']');
-            }
-            s
-        }
-        Pattern::Dict(kvs) => format!(
-            "{{{}}}",
-            kvs.iter()
-                .map(|(k, v)| format!("{k}: {}", pattern_label(v)))
-                .collect::<Vec<_>>()
-                .join(", ")
-        ),
-        Pattern::TypeAscription(inner, _) => pattern_label(inner),
-    }
-}
-
-/// 模式里的**绑定名**（`x when x > 0` 里的 `x`）。
-///
-/// v0.104.6 D481：`EnumMatchArm.bindings` 此前**恒为空** ⇒ 模式绑定的名字
-/// 在 Core 产物里**根本不存在**。
-fn pattern_bindings(p: &Pattern) -> Vec<String> {
-    let mut out = Vec::new();
-    collect_pattern_bindings(p, &mut out);
-    out
-}
-
-fn collect_pattern_bindings(p: &Pattern, out: &mut Vec<String>) {
-    match p {
-        Pattern::Variable(n) => {
-            if !out.contains(n) {
-                out.push(n.clone());
-            }
-        }
-        Pattern::Tuple(ps) | Pattern::List(ps) => {
-            for x in ps {
-                collect_pattern_bindings(x, out);
-            }
-        }
-        Pattern::ListVec { head, tail } => {
-            for x in head {
-                collect_pattern_bindings(x, out);
-            }
-            if let Some(t) = tail {
-                collect_pattern_bindings(t, out);
-            }
-        }
-        Pattern::Dict(kvs) => {
-            for (_, v) in kvs {
-                collect_pattern_bindings(v, out);
-            }
-        }
-        Pattern::TypeAscription(inner, _) => collect_pattern_bindings(inner, out),
-        Pattern::Wildcard | Pattern::Literal(_) => {}
     }
 }
 
@@ -994,22 +965,17 @@ fn collect_captures_node(node: &Ehir, reads: &mut Vec<String>, binds: &mut Vec<S
 /// 寄存器空间**（闭包按名捕获，体内局部量不与外层撞号）。
 fn lower_body_to_core(ctx: &mut CoreContext, block: &EhirBlock) -> CoreFunction {
     let mut sub = CoreContext::new(ctx.effects.clone());
+    // v0.104.6 D482：**寄存器安全契约** —— 子体的 bump 分配器必须**跳过** FCFG
+    // 预分配的寄存器（否则会覆盖它们）。此前 Core 层**没有**这一步 ⇒ 顶层
+    // 降维的 `alloc_reg()` 与 FCFG 的预分配号**撞车** ⇒ 运行期越界
+    // （`index out of bounds: the len is 1 but the index is 1`）。
+    //
+    // 与 MIR 层 `fcfg_lower::lower_fcfg` 的同一契约对齐。
+    sub.next_reg = crate::mir::fcfg_lower::max_reg_in_nodes(&block.nodes) + 1;
     for node in &block.nodes {
         lower_node(&mut sub, node);
     }
     sub.finish_body(block.result)
-}
-
-fn literal_to_value(lit: &crate::common::Literal) -> Value {
-    match lit {
-        crate::common::Literal::Int(n, _) => Value::Int(*n),
-        crate::common::Literal::Float(f, _) => Value::Float(*f),
-        crate::common::Literal::BigInt(n, _) => Value::BigInt(n.clone()),
-        crate::common::Literal::String(s, _) => Value::String(s.clone()),
-        crate::common::Literal::Bool(b, _) => Value::Bool(*b),
-        crate::common::Literal::Nil(_) => Value::Nil,
-        crate::common::Literal::Char(c, _) => Value::Char(*c),
-    }
 }
 
 #[cfg(test)]

@@ -115,6 +115,18 @@ pub fn compile_optimized(
     f
 }
 
+/// 只编译到 **Core** 层（9 层里的第 3 层）。
+///
+/// v0.104.6 D482：Core 执行器（[`crate::mir::core_exec`]）的入口 —— Core 层
+/// 从此不再只是「影子」：它有自己的**独立执行路径**，可以与 MIR 执行器
+/// **对拍**（语义级对照，弥补 D474 退役差分机制后缺的那一环）。
+pub fn compile_core(func: &MirFunction, witnesses: &[MirWitness]) -> CoreFunction {
+    let fcfg = witness_to_fcfg(witnesses);
+    let table = export_type_table(witnesses);
+    let ehir = annotate(&fcfg, &table);
+    ehir_to_core(&ehir, vec![], func.effects.clone())
+}
+
 /// **全层探针** —— witness → FCFG → EHIR → Core → MIR，返回统计 + 产出的 MIR。
 ///
 /// **CI 验证专用**（v0.104.6 D474）—— 生产编译入口不调用它。

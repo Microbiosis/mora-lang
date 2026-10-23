@@ -41,10 +41,36 @@ Token → FCFG → EHIR → Core → MIR
 
 ### Core — 函数式基元
 - **输入**：`Node<TypeInfo>`
-- **输出**：`CoreFunction`（~20 种 CoreInst）
-- **文件**：`src/mir/core.rs` + `src/mir/ehir_to_core.rs`
+- **输出**：`CoreFunction`（~25 种 CoreInst）
+- **文件**：`src/mir/core.rs` + `src/mir/ehir_to_core.rs` + `src/mir/core_exec.rs`
 - **职责**：闭包/ADT/Thunk/Handle 降维为基元
 - **关键设计**：SSA 100% 覆盖（无 passthrough）
+- **可执行**（v0.104.6 D482）：`src/mir/core_exec.rs` —— Core 层有**自己的
+  执行器**（块调度，无 DAG、无优化），可与 MIR 执行器**对拍**
+
+> **Core 层的可执行子集**（D482）：常量 / 拷贝 / 二元运算 / 环境读写 / 列表 /
+> 字典 / 索引 / 索引赋值 / 分支 / 跳转 / 返回 / 具名调用 / 值调用 / 方法调用 /
+> 模板 / match（含守卫）。
+>
+> **不支持**（执行器**响亮报错**，不静默降级）：闭包 / task（Mora 的
+> `Value::Closure` 装的是 `Arc<MirFunction>`，装不下 Core 闭包）、**区域构造**
+> （`Scope` 的并发 / 事务 / 可观测性语义在执行层，顺序执行它会与 MIR 层**静默
+> 分叉**）、效果（需要 handler 栈与 `resume`）、ADT 构造 / thunk。
+>
+> **对拍**：`tests/core_exec_differential.rs` —— 同一程序，MIR 执行器
+> （`dag_analyze → dag_optimize → BSP 超步`）与 Core 执行器（块调度）结果必须
+> **完全一致**。这正是 D474 退役差分机制时缺的**语义级**对照：当年的差分
+> **只比形状、不比语义**（`or`/`and` 短路不赋值就是**两边一起错**，差分抓不到）。
+>
+> **让 Core 层可执行，当场抓出两个只有执行才暴露的缺陷**：
+>
+> - **寄存器撞车** —— Core 层的 bump 分配器**没有跳过 FCFG 预分配的寄存器**
+>   （MIR 层有这条「寄存器安全契约」）⇒ 顶层降维的 `alloc_reg()` 与预分配号
+>   撞车 ⇒ 运行期越界（`index out of bounds: the len is 1 but the index is 1`）。
+> - **循环块结构错误** —— 条件 / 初始化与「循环之前的语句」落在**同一块**，
+>   而回边跳回那一块 ⇒ `let j = 0` 被**反复重跑** ⇒ 条件恒真 ⇒ **死循环**。
+>   （MIR 层是**线性指令流 + pc 定位循环头**，天然没这问题；Core 是块结构 ⇒
+>   跳不进块中间 ⇒ 条件 / 初始化必须自己成块。）
 
 > **Core 层的两处结构缺陷均已修**（v0.104.6 D479 / D480），由
 > `tests/core_cfg_wellformed.rs` 递归守卫（外层 + 全部嵌套代码区）：
@@ -308,6 +334,7 @@ D472 之后登记项由 4 条减为 1 条（`orchestrate`），D473 之后减为
 | execute_naming_hygiene | 3 | 执行入口命名一致性（旧名不得复活，D478 新建） |
 | core_cfg_wellformed | 5 | Core 层 CFG **结构良构性** + 模型限制登记（D479/D480 新建） |
 | core_fidelity | 6 | Core 层**保真度**（产物里该看见的东西不能丢，D481 新建） |
+| core_exec_differential | 3 | Core 执行器 vs MIR 执行器**语义对拍**（D482 新建） |
 
 ## 已知遗留（技术债）
 

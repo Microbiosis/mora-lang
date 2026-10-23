@@ -32,16 +32,14 @@
 //! `values_equal`（`==` / `!=` 走它，另被 dict 键查找 / `in` / 去重使用）
 //! 的 lossy 分支同样改为精确。
 
-use std::path::PathBuf;
+use mora::test_support::TempDir;
 use std::process::Command;
 
-struct WorkDir(PathBuf);
+struct WorkDir(TempDir);
 
 impl WorkDir {
     fn new(tag: &str) -> Self {
-        let d = std::env::temp_dir().join(format!("mora_d199_{tag}"));
-        let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(&d).expect("建目录");
+        let d = TempDir::new(tag);
         WorkDir(d)
     }
     fn run(&self, tag: &str, expr: &str) -> (String, i32) {

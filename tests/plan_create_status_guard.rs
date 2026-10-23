@@ -48,27 +48,13 @@
 //! | `remove` 不存在的 id 返回 `false` | exit 0，`false` | ✅ 合理（布尔返回本就表意）|
 //! | `add` 重复 id 报错 | `step id 's1' already exists` | ✅ 正确 |
 
+use mora::test_support::TempDir;
 use std::process::Command;
-use std::sync::atomic::{AtomicU64, Ordering};
-
-static SEQ: AtomicU64 = AtomicU64::new(0);
-
-fn slug(s: &str) -> String {
-    let mut out = String::from("d343_");
-    out.extend(
-        s.chars()
-            .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
-            .take(40),
-    );
-    out
-}
 
 /// 独立进程 + 隔离 `HOME`（plan 存在解释器状态里，单进程内多用例会互相污染）。
 /// 取 stdout **全部**实质行（D330 教训：不能用 `find(第一行)`）。
 fn ev(body: &str) -> (i32, String) {
-    let n = SEQ.fetch_add(1, Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!("d343p_{}_{}", n, slug(body)));
-    std::fs::create_dir_all(&dir).expect("建目录");
+    let dir = TempDir::new("d343p_");
     let p = dir.join("p.mora");
     std::fs::write(&p, body).expect("写探针");
     let home = dir.join("home");

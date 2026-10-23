@@ -145,44 +145,70 @@ fn allocation_actually_shrinks_register_pressure() {
 /// 不满足安全判据的函数体（含循环 / 效果语句）**必须原样保留**编号。
 ///
 /// 这是「安全优先」策略的直接断言：宁可零收益，不可错值。
+///
+/// ## v0.104.6 D474：判据改为**逐函数体**
+///
+/// 此前本测试把**所有**嵌套寄存器空间的 `n_regs` 求和后比对。D474 之前
+/// `ParserV3::compile` 走 `emit.rs` 直出，其 MIR 形状恰好让「求和」与
+/// 「逐体」等价；D474 起 MIR 由 9 层管线产出，形状变了 ——
+///
+/// ```text
+/// handle Ai { perform Ai("x") } { 1 }
+///   ├─ 外层        n_regs=4   body=[Handle{…}]
+///   ├─ handle body n_regs=2   body=[Const(0,…), Perform{dst:1,…}]   ← 含效果
+///   └─ handler    n_regs=3   body=[Const(2, 1.0)]                   ← 纯计算
+/// ```
+///
+/// `handle body` 含 `Perform` ⇒ 按契约**原样保留**；`handler` 是纯计算体 ⇒
+/// 按契约**应当**被分配（`Const(2,·)` → `Const(0,·)`，`n_regs` 3 → 1）。
+///
+/// ⇒ 「求和不变」在 9 层形状下**必然失败**，且它断言的并不是分配器的契约。
+/// 本测试改为**逐函数体**比对：只要求「含环 / 含效果的那一个体」编号不变，
+/// 这才是 `regalloc::allocate` 的真实保证，且比原判据**更强**（原判据会被
+/// 其它嵌套体的合法收缩带偏）。
+/// 取出「不安全函数体」的 `n_regs`（按函数体形状定位）。
+type PickNregs = fn(&mora::mir::MirFunction) -> usize;
+
 #[test]
 fn unsafe_shapes_are_left_untouched() {
-    for src in [
-        // 含循环（回跳）
-        "task main()\n  let i = 0\n  while i < 3\n    assign i = i + 1\n  end\n  print(i)\nend\n",
-        // 含 handler（效果语句）
-        "handle Ai {\n  perform Ai(\"x\")\n} {\n  1\n}\n",
-    ] {
+    // (源码, 取出「不安全函数体」的方式, 说明)
+    let cases: &[(&str, PickNregs, &str)] = &[
+        (
+            // 含循环（回跳）
+            "task main()\n  let i = 0\n  while i < 3\n    assign i = i + 1\n  end\n  print(i)\nend\n",
+            |f| {
+                for inst in &f.body {
+                    if let mora::mir::MirInst::TaskDef { body, .. } = inst {
+                        return body.n_regs;
+                    }
+                }
+                panic!("未找到 TaskDef");
+            },
+            "task 体（含 while 回跳）",
+        ),
+        (
+            // 含 handler（效果语句）
+            "handle Ai {\n  perform Ai(\"x\")\n} {\n  1\n}\n",
+            |f| {
+                for inst in &f.body {
+                    if let mora::mir::MirInst::Handle { body, .. } = inst {
+                        return body.n_regs;
+                    }
+                }
+                panic!("未找到 Handle");
+            },
+            "handle 体（含 Perform）",
+        ),
+    ];
+    for (src, pick, what) in cases {
         let (func, _) = mora::parser_v3::ParserV3::compile(src).expect("应能解析");
         let mut g = func.clone();
-        let before_all = collect_nregs(&g);
+        let before = pick(&g);
         mora::mir::regalloc::allocate(&mut g);
+        let after = pick(&g);
         assert_eq!(
-            collect_nregs(&g),
-            before_all,
-            "含环/效果语句的函数体应原样保留（不应被分配）:\n{src}"
+            after, before,
+            "{what} 含环/效果语句，应原样保留（不应被分配）:\n{src}"
         );
     }
-}
-
-/// 递归收集所有寄存器空间的 `n_regs` 之和。
-fn collect_nregs(f: &mora::mir::MirFunction) -> usize {
-    let mut sum = f.n_regs;
-    for inst in &f.body {
-        let mut nested: Vec<&mora::mir::MirFunction> = Vec::new();
-        match inst {
-            mora::mir::MirInst::Closure { body, .. } | mora::mir::MirInst::TaskDef { body, .. } => {
-                nested.push(body)
-            }
-            mora::mir::MirInst::Handle { body, handler, .. } => {
-                nested.push(body);
-                nested.push(handler);
-            }
-            _ => {}
-        }
-        for n in nested {
-            sum += collect_nregs(n);
-        }
-    }
-    sum
 }

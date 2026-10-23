@@ -260,6 +260,59 @@ pub enum WitnessKind {
         names: Vec<String>,
         decl: Box<MirWitness>,
     },
+
+    // ── v0.104.6 D472：9 层管线补齐 ──
+    //
+    // 此前这 4 类构造在 witness 层**完全没有表示** —— parser 只发射 MirInst、
+    // 把结构信息丢进一个扁平的 `Sequence`。于是 9 层降级链
+    // （witness → FCFG → MIR）**结构上就拿不到**它们，
+    // `worker` / `transaction` / `eval` / `aggregate` 必然回落旧路径。
+    //
+    // 补齐后，9 层成为**唯一**编译路径的前提才成立。
+    /// worker 块 —— 与 `MirInst::Worker { name, body }` 同构。
+    Worker {
+        name: String,
+        body: Box<MirWitness>,
+    },
+    /// transaction 块 —— 与 `MirInst::Transaction { body, compensation }` 同构。
+    Transaction {
+        body: Box<MirWitness>,
+        compensation: Box<MirWitness>,
+    },
+    /// eval 断言 —— 与 `MirInst::Eval { name, given_reg, expects, ... }` 对应。
+    Eval {
+        name: String,
+        given: Box<MirWitness>,
+        expects: Vec<MirWitness>,
+        tolerance: Option<f64>,
+        replay_path: Option<String>,
+    },
+    /// aggregate 贡献 —— 与 `MirInst::Aggregate { name, value }` 对应。
+    Aggregate {
+        name: String,
+        value: Box<MirWitness>,
+    },
+
+    /// 管道 `x |> f` —— 承载 `MirInst::Pipe` 的两个操作数。
+    ///
+    /// v0.104.6 D472：此前管道在 witness 层被脱糖成 `Call`
+    /// （`typeck/hm/infer.rs` 的 v0.75.20 记档：「`|` 在 parse_pipe 脱糖为
+    /// Call（right(left)），HM 走 infer_call」，并据此把 `WitnessKind::Pipe`
+    /// 当"死变体"移除）—— 但 **emit 路径发射的是 `MirInst::Pipe` 指令**。
+    /// 两者不同构 ⇒ 9 层降维出 `Call`、emit 出 `Pipe`，差分必红
+    /// （实测 `let x = 1 |> print`：pipeline 6 条 / original 7 条）。
+    /// 补回该变体，让指令与 witness 重新同构。
+    ///
+    /// 类型推断口径**保持不变**（见 `typeck/hm/mod.rs`）：右侧是裸标识符 ⇒
+    /// 值应用 `f(x)`；右侧是任意表达式 ⇒ 内建 `|>(x, expr)`。
+    Pipe {
+        left: Box<MirWitness>,
+        right: Box<MirWitness>,
+    },
+    /// `commit` 语句 —— 与 `MirInst::Commit` 同构（unit 指令）。
+    Commit,
+    /// `rollback` 语句 —— 与 `MirInst::Rollback` 同构（unit 指令）。
+    Rollback,
 }
 
 /// v0.102: 关系子句 witness —— 编译期模板数据 + 类型推断镜像。
@@ -359,6 +412,22 @@ impl MirWitness {
             WitnessKind::Return(Some(v)) => vec![v.as_ref()],
             WitnessKind::Orchestrate { kind, .. } => kind.child_witnesses(),
             WitnessKind::Perform { args, .. } => args.iter().collect(),
+            // v0.104.6 D472：4 类新构造的子 witness 必须被枚举出来 ——
+            // `child_witnesses` 是效果定位游走等树遍历的入口，
+            // 漏一条就等于让子树对遍历者隐形。
+            WitnessKind::Worker { body, .. } => vec![body.as_ref()],
+            WitnessKind::Transaction {
+                body, compensation, ..
+            } => vec![body.as_ref(), compensation.as_ref()],
+            WitnessKind::Eval { given, expects, .. } => {
+                let mut out = vec![given.as_ref()];
+                out.extend(expects);
+                out
+            }
+            WitnessKind::Aggregate { value, .. } => vec![value.as_ref()],
+            // v0.104.6 D472：管道与 commit / rollback 的子 witness
+            WitnessKind::Pipe { left, right, .. } => vec![left.as_ref(), right.as_ref()],
+            WitnessKind::Commit | WitnessKind::Rollback => Vec::new(),
             WitnessKind::Handle { body, handler, .. } => {
                 vec![body.as_ref(), handler.as_ref()]
             }

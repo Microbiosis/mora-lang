@@ -16,6 +16,9 @@ pub const VERSION: &str = env!("MORAGIT_VERSION");
 // v0.92: MirExpr 平行世界删除 — 全链路统一 MirWitness
 // v0.42.1: Audit Sink — SHA-256 hash-chained JSONL (loongclaw-inspired)
 pub mod audit;
+// v0.104.6 D475: 测试用临时目录/文件 —— **本仓唯一的临时文件创建入口**
+// （`tests/test_tempdir_hygiene.rs` 守卫：别处直接调 `temp_dir()` 即判失败）
+pub mod test_support;
 // v0.75.53: CLI 子命令（record + mcp + 共享编译/路径辅助，从 main.rs 拆出）
 pub mod cli;
 // v0.45.0: ToolPlane Core/Extension adapter (loongclaw tool.rs pattern)

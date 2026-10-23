@@ -60,8 +60,8 @@
 //!   它之前不触发，因为 `[[]]` 只有一行、无从比较）；
 //! - D142 钉住的 `matmul([], [])` → `[]` 空输入宽松路径**不变**。
 
+use mora::test_support::TempDir;
 use std::process::Command;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 /// **每进程唯一序号** —— 防并行测试互相抢同一临时目录。
 ///
@@ -72,15 +72,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 ///
 /// 症状极具误导性：`exit == 1` **正确**（进程确实跑了、确实报错了），
 /// 只有**文本**是空的 ⇒ 看起来像「守卫没生效」，实际是**装置自相残杀**。
-static SEQ: AtomicU64 = AtomicU64::new(0);
-
-fn uniq() -> u64 {
-    SEQ.fetch_add(1, Ordering::Relaxed)
-}
-
+///
+/// v0.104.6 D475：原 `uniq()` 靠进程内计数器给临时目录去重；现在
+/// `TempDir` 自身带 pid + 纳秒 + 序号，唯一性由**机制**保证，
+/// 不再需要各测试自备计数器 ⇒ 该函数整体删除。
 fn run(src: &str, tag: &str) -> (i32, String) {
-    let dir = std::env::temp_dir().join(format!("mora_d330_ragged_{}_{}", uniq(), slug(tag)));
-    std::fs::create_dir_all(&dir).expect("建目录");
+    let dir = TempDir::new(tag);
     let p = dir.join("p.mora");
     std::fs::write(&p, src).expect("写探针");
     let exe = concat!(env!("CARGO_MANIFEST_DIR"), "/target/debug/mora.exe");
@@ -112,12 +109,6 @@ fn run(src: &str, tag: &str) -> (i32, String) {
     (out.status.code().unwrap_or(-1), kept.join(" | "))
 }
 
-fn slug(s: &str) -> String {
-    s.chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
-        .collect()
-}
-
 fn ev(e: &str) -> (i32, String) {
     run(&format!("print({e})\n"), e)
 }
@@ -126,8 +117,7 @@ fn ev(e: &str) -> (i32, String) {
 /// 供「结果逐字不变」类对照组比对。绝不与 [`run`] 的诊断视图混用 ——
 /// 后者会把 stdout 与 stderr 拼在一起，破坏逐字比对。
 fn ev_stdout(e: &str) -> (i32, String) {
-    let dir = std::env::temp_dir().join(format!("mora_d330_out_{}_{}", uniq(), slug(e)));
-    std::fs::create_dir_all(&dir).expect("建目录");
+    let dir = TempDir::new("mora_d330_out_");
     let p = dir.join("p.mora");
     std::fs::write(&p, format!("print({e})\n")).expect("写探针");
     let exe = concat!(env!("CARGO_MANIFEST_DIR"), "/target/debug/mora.exe");

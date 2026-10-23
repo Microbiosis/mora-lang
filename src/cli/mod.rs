@@ -15,10 +15,13 @@ use crate::parser_v3::ParserV3;
 use crate::typeck::format_error;
 
 /// v0.75.40: 单遍编译 + 优化 — 取代 parse→lower 双阶段。
-/// ParserV3::compile 直接 emit MirInst + 并行产出 witness；优化语义与
+/// ParserV3::compile 产出 witness，MIR 由 9 层管线从 witness 降出；优化语义与
 /// lower_mir_exprs_with_opt 完全一致（cascades apply_rules 恒跑 + SSA opt
 /// 显式 --opt 优先，未指定走 env 兜底）。调用方各自做 witness typecheck
 /// 并保留原有错误消息。
+///
+/// v0.104.6 D474：MIR 的产出路径**唯一**（`mir::pipeline::compile_optimized`），
+/// 没有环境变量分支、没有回落 —— 详见函数体内注释。
 ///
 /// v0.103: 返回 `Result` —— 此前解析失败直接 `panic!`，于是 CLI 遇到任何
 /// 语法错误都会打印 Rust panic 与回溯（"compile_and_opt failed: Failed to
@@ -35,101 +38,33 @@ pub fn compile_and_opt(
     ),
     String,
 > {
-    let (mut func, witnesses) = ParserV3::compile(source)?;
-
-    // v0.90.3: 执行器切换 — 9 层管线产出成为生产 MirFunction。
-    //
-    // 流程：
-    //   1. 管线在 apply_rules 之前运行（差分要求 raw-to-raw）
-    //   2. 类别级差分（管线 vs emit.rs 直出）绿 → 管线产出经同一套
-    //      优化（apply_rules + SSA opt）后作为返回值 — 生产执行 9 层代码
-    //   3. 差分红 → 自动回落原管线（不中断编译），DEBUG 模式输出差异
-    //
-    // 等价性保证：tests/nine_layer_differential.rs 19 fixture 双级差分
-    // （类别级 + 执行级）锁定两条管线的语义等价。
-    // MORA_9LAYER=0 可禁用（回落纯原管线）。
+    let (func, witnesses) = ParserV3::compile(source)?;
     let level = opt_level.unwrap_or_default();
-    if std::env::var("MORA_9LAYER").map_or(true, |v| v != "0") {
-        let (result, mut pipeline_func) = crate::mir::pipeline::run_pipeline(&func, &witnesses);
-        if result.differential_ok {
-            // 双侧同序优化 — 管线产出走与原管线完全一致的优化路径
-            crate::mir::optimize::apply_rules(&mut pipeline_func);
-            if level.enabled() {
-                crate::mir::opt::optimize(&mut pipeline_func, level);
-            }
-            crate::mir::regalloc::allocate(&mut pipeline_func);
-            return Ok((pipeline_func, witnesses));
-        }
-        // v0.104.6：回落三态化（MLIR ConversionTarget 语义）。
-        //
-        // 此前这里是**整函数二值**：`differential_ok` 为假就整份丢弃管线产出。
-        // 那把两件本质不同的事压成同一结果：
-        //   (A) 本程序含**尚未接入 9 层管线**的构造（功能覆盖缺口，**预期**）
-        //   (B) 本程序构造**全部已接入**，管线却在某个已支持构造上出了 bug
-        //       （**回归** = 缺陷）
-        // 二者生产侧看到的一模一样 —— 都是「回落 + 一行 stderr」，于是 (B)
-        // 被静默藏住，而 (B) 恰恰是 D1 那一族（静默换一条更差的路径）的新同族。
-        //
-        // 现按 [`crate::mir::legalization`] 的显式登记把回落拆成三态：
-        // 1. 合法 + 差分绿 → 走 9 层（快路径，与此前一致）
-        // 2. 含未 legalize 构造 → 按**构造名**回落（预期，打印名字）
-        // 3. 全合法 + 差分红 → **回归**（醒目措辞 + 建议查 DEBUG）
-        use crate::mir::legalization::{GateDecision, classify};
 
-        let debug = std::env::var("MORA_9LAYER_DEBUG").is_ok_and(|v| v == "1");
-        if result.differential_ok {
-            // 双侧同序优化 — 管线产出走与原管线完全一致的优化路径
-            crate::mir::optimize::apply_rules(&mut pipeline_func);
-            if level.enabled() {
-                crate::mir::opt::optimize(&mut pipeline_func, level);
-            }
-            crate::mir::regalloc::allocate(&mut pipeline_func);
-            return Ok((pipeline_func, witnesses));
-        }
-        // 差分红：按 [`classify`] 的三态分诊（单一事实源，测试与生产共用）。
-        match classify(&result.unlegalized_constructs, result.differential_ok) {
-            // (2) 含未 legalize 构造 —— 预期回落，点名道姓。
-            GateDecision::HasUnlegalized => eprintln!(
-                "[9layer] 未 legalize 构造 {:?}：已回落到 emit.rs 路径（预期，非缺陷）| \
-                 pipeline_mir={} original_mir={}",
-                result.unlegalized_constructs, result.pipeline_mir_count, result.original_mir_count
-            ),
-            // (3) 全部构造已接入却差分失败 = **回归**。管线在**已支持**构造上
-            // 出了 bug，必须显眼，不能与 (2) 同形、否则真实缺陷会被静默藏住。
-            GateDecision::Regression => eprintln!(
-                "[9layer] **回归**：全部构造已 legalize 但差分失败 —— 9 层管线在 \
-                 已支持构造上出现不一致，已回落到 emit.rs 路径 | \
-                 pipeline_mir={} original_mir={} | 详细 diff 设 MORA_9LAYER_DEBUG=1",
-                result.pipeline_mir_count, result.original_mir_count
-            ),
-            // 差分已绿不会走到这里（上面已 return）。
-            GateDecision::AllLegal => {}
-        }
-        if debug {
-            eprintln!(
-                "[9layer] differential FAILED — falling back to emit.rs path | fcfg={} typed={} core={} | pipeline_mir={} original_mir={} | unlegalized={:?}",
-                result.fcfg_nodes,
-                result.typed_nodes,
-                result.core_insts,
-                result.pipeline_mir_count,
-                result.original_mir_count,
-                result.unlegalized_constructs
-            );
-            for d in &result.differential_diffs {
-                eprintln!("[9layer] diff: {}", d);
-            }
-        }
-    }
-
-    // 原管线路径（回落 / MORA_9LAYER=0）
-    crate::mir::optimize::apply_rules(&mut func);
-    if level.enabled() {
-        crate::mir::opt::optimize(&mut func, level);
-    }
-    crate::mir::regalloc::allocate(&mut func);
+    // v0.104.6 D473/D474：生产路径 = **9 层唯一路径**。
+    //
+    // 此前（v0.90.3 起）此处每次编译都跑**两条完整 lowering**（9 层 + `emit.rs`
+    // 参考实现）**加**一次逐条差分，差分失败就回落旧路径。实测代价（debug
+    // build，300 个 task 的程序）：9 层开 317 ms / 关 213 ms ⇒ 影子管线 + 差分
+    // 约占总耗时 **31%**（且 EHIR / Core 两层只用于统计，不进产出路径）。
+    //
+    // D473 把**最后一批**未接入的构造补齐（`worker` / `transaction` / `eval` /
+    // `aggregate` / `commit` / `rollback` / `pipe` / `orchestrate`），全量普查
+    // **零回落**（`tests/nine_layer_full_census.rs`：117 个程序 = 67 个仓库真实
+    // `.mora` + 50 个合成构造）。
+    //
+    // **D474 把差分与「参考实现」一起退役**：parser 只产 witness，MIR 全部由
+    // 9 层产出 ⇒「参考实现」这一侧**已不存在**，`MORA_9LAYER=0` 会退化成
+    // 自己跟自己比（恒真）。留着一个恒真的开关比没有更坏 —— 它让人以为
+    // 覆盖还在。故此处**只有一个路径**，没有环境变量分支。
+    //
+    // 等价性保证改由「期望输出」承担：
+    // `tests/nine_layer_conformance.rs`（49 类构造逐条钉住期望输出）+
+    // `tests/nine_layer_full_census.rs`（117 个程序全部编译 + 运行成功）+
+    // `tests/nine_layer_unblocked.rs`（20 种块/声明形态 × 3 档 + 57 个 e2e fixture）。
+    let func = crate::mir::pipeline::compile_optimized(&func, &witnesses, level);
     Ok((func, witnesses))
 }
-
 /// v0.104.6 D191：读源码时**剥掉开头的 UTF-8 BOM**。
 ///
 /// BOM（U+FEFF）是**编码产物**，不是源码内容 —— 但 `ParserV3` 会如实拒绝它：

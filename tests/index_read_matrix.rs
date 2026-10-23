@@ -42,25 +42,11 @@
 //! 索引读取用**脚本层**（能真正区分）；索引赋值用**源码层**
 //! （脚本层只能证明「不可达」，无法区分「未接通」与「不支持」）。
 
+use mora::test_support::TempDir;
 use std::process::Command;
-use std::sync::atomic::{AtomicU64, Ordering};
-
-static SEQ: AtomicU64 = AtomicU64::new(0);
-
-fn slug(s: &str) -> String {
-    let mut out = String::from("d361_");
-    out.extend(
-        s.chars()
-            .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
-            .take(40),
-    );
-    out
-}
 
 fn ev(body: &str) -> (i32, String) {
-    let n = SEQ.fetch_add(1, Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!("d361_{}_{}", n, slug(body)));
-    std::fs::create_dir_all(&dir).expect("建目录");
+    let dir = TempDir::new("d361_");
     let p = dir.join("p.mora");
     std::fs::write(&p, body).expect("写探针");
     let home = dir.join("home");

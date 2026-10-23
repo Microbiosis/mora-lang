@@ -36,6 +36,7 @@
 //! 后者是**全称**的：按 `file.rs` 的 `match` arm 逐个检查 `check_path(` 的
 //! **出现次数**（D335 已证明「只查有没有」会被「摘掉第二处」骗过）。
 
+use mora::test_support::TempDir;
 use std::fs;
 
 fn read(rel: &str) -> String {
@@ -184,7 +185,7 @@ fn d352_import_is_a_deliberate_exemption() {
 #[test]
 fn d352_record_io_is_cli_scoped_not_script_reachable() {
     // `record` 不是脚本层的 builtin —— 用真实脚本确认它不可达
-    let dir = std::env::temp_dir().join(format!("d352_rec_{}", std::process::id()));
+    let dir = TempDir::new("d352_rec_");
     fs::create_dir_all(&dir).expect("建目录");
     let p = dir.join("p.mora");
     fs::write(&p, "print(record.start())\n").expect("写探针");

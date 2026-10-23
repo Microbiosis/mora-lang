@@ -29,6 +29,7 @@
 //! ⇒ 否定结果。判据保留，把这个**跨实现的差分检查**固化下来，防止将来
 //! 「给 `lsp::json` 加个功能」时漏掉非有限值分支。
 
+use mora::test_support::TempDir;
 use std::io::Write;
 use std::process::{Command, Stdio};
 
@@ -59,12 +60,10 @@ const TOOLS: [&str; 6] = [
     "nan_tool", "inf_tool", "div_tool", "dict_nan", "list_nan", "neg_inf",
 ];
 
-struct WorkDir(std::path::PathBuf);
+struct WorkDir(TempDir);
 impl WorkDir {
     fn new(tag: &str) -> Self {
-        let d = std::env::temp_dir().join(format!("mora_d251_{tag}"));
-        let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(&d).expect("mkdir");
+        let d = TempDir::new(tag);
         WorkDir(d)
     }
 }

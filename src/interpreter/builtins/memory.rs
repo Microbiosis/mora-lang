@@ -424,18 +424,12 @@ impl Interpreter {
 #[cfg(test)]
 mod tests_v0431_memory_bus {
     use super::*;
+    use crate::test_support::TempDir;
     use crate::value::Value;
 
     /// v0.43.1: memory.remember / recall_markdown / list_markdown
-    fn setup_temp_memory_dir() -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "mora_md_mem_{}_{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+    fn setup_temp_memory_dir() -> TempDir {
+        let dir = TempDir::new("mora_md_mem_");
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
@@ -444,13 +438,11 @@ mod tests_v0431_memory_bus {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    use std::time::UNIX_EPOCH;
-
     #[test]
     fn memory_remember_appends_to_markdown() {
         let dir = setup_temp_memory_dir();
         let mut interp = Interpreter::new();
-        interp.persist.markdown_memory_dir = Some(dir.clone());
+        interp.persist.markdown_memory_dir = Some(dir.path().to_path_buf());
         let result = interp
             .call_memory_method(
                 "remember",
@@ -477,7 +469,7 @@ mod tests_v0431_memory_bus {
     fn memory_remember_appends_to_existing_section() {
         let dir = setup_temp_memory_dir();
         let mut interp = Interpreter::new();
-        interp.persist.markdown_memory_dir = Some(dir.clone());
+        interp.persist.markdown_memory_dir = Some(dir.path().to_path_buf());
         interp
             .call_memory_method(
                 "remember",
@@ -510,7 +502,7 @@ mod tests_v0431_memory_bus {
     fn memory_recall_markdown_returns_text() {
         let dir = setup_temp_memory_dir();
         let mut interp = Interpreter::new();
-        interp.persist.markdown_memory_dir = Some(dir.clone());
+        interp.persist.markdown_memory_dir = Some(dir.path().to_path_buf());
         interp
             .call_memory_method(
                 "remember",
@@ -534,7 +526,7 @@ mod tests_v0431_memory_bus {
     fn memory_recall_markdown_returns_empty_for_unknown() {
         let dir = setup_temp_memory_dir();
         let mut interp = Interpreter::new();
-        interp.persist.markdown_memory_dir = Some(dir.clone());
+        interp.persist.markdown_memory_dir = Some(dir.path().to_path_buf());
         let result = interp
             .call_memory_method("recall_markdown", &[Value::String("nope".to_string())])
             .expect("recall 调用应成功");
@@ -546,7 +538,7 @@ mod tests_v0431_memory_bus {
     fn memory_list_markdown_lists_categories() {
         let dir = setup_temp_memory_dir();
         let mut interp = Interpreter::new();
-        interp.persist.markdown_memory_dir = Some(dir.clone());
+        interp.persist.markdown_memory_dir = Some(dir.path().to_path_buf());
         interp
             .call_memory_method(
                 "remember",
@@ -589,7 +581,7 @@ mod tests_v0431_memory_bus {
     fn memory_recall_after_remember_syncs_to_memory_store() {
         let dir = setup_temp_memory_dir();
         let mut interp = Interpreter::new();
-        interp.persist.markdown_memory_dir = Some(dir.clone());
+        interp.persist.markdown_memory_dir = Some(dir.path().to_path_buf());
         interp
             .call_memory_method(
                 "remember",

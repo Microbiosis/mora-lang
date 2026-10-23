@@ -11,6 +11,7 @@
 //! 加一批非 BMP 码点（星平面代理对场景），外加一组**值形状**：
 //! 空容器、嵌套、含特殊字符的 dict key、浮点。
 
+use mora::test_support::TempDir;
 use std::collections::HashMap;
 
 use mora::flow::{json_to_value, value_to_json};
@@ -141,9 +142,7 @@ fn d223_written_json_is_accepted_by_python() {
             Value::Dict([("k\nx".to_string(), Value::Int(1))].into_iter().collect()),
         ),
     ];
-    let dir = std::env::temp_dir().join("mora_d223_py");
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("建目录");
+    let dir = TempDir::new("mora_d223_py");
     let mut manifest = String::new();
     for (i, (name, v)) in cases.iter().enumerate() {
         let json = value_to_json(v);

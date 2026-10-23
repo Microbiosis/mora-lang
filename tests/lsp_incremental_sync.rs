@@ -39,7 +39,7 @@
 //! 带 `range` 的**按范围拼接**（复用 `position_to_offset`），不带 `range`
 //! 的才是全量替换。调用方需先取当前文档文本作为 `base`。
 
-use std::path::PathBuf;
+use mora::test_support::TempDir;
 use std::process::{Command, Stdio};
 
 fn json_string(s: &str) -> String {
@@ -61,10 +61,8 @@ fn frame(json: &str) -> String {
     format!("Content-Length: {}\r\n\r\n{}", json.len(), json)
 }
 
-fn temp_dir() -> PathBuf {
-    let d = std::env::temp_dir().join("mora_d194_lsp");
-    std::fs::create_dir_all(&d).expect("建目录");
-    d
+fn temp_dir() -> TempDir {
+    TempDir::new("mora_d194_lsp")
 }
 
 /// 开文档 → 应用若干 didChange → 请求 `documentSymbol` 与 hover。

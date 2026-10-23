@@ -23,11 +23,9 @@
 //! ⇒ 三条前提都是「**格式错了不报错，静默走兜底**」，
 //! 与 D376「bbox 必须是字典」、D380「kind 必须带点」同族。
 
-use std::path::{Path, PathBuf};
+use mora::test_support::TempDir;
+use std::path::Path;
 use std::process::Command;
-use std::sync::atomic::{AtomicU64, Ordering};
-
-static SEQ: AtomicU64 = AtomicU64::new(0);
 
 fn mora(dir: &Path, args: &[&str]) -> (i32, String) {
     let exe = concat!(env!("CARGO_MANIFEST_DIR"), "/target/debug/mora.exe");
@@ -59,12 +57,10 @@ fn mora(dir: &Path, args: &[&str]) -> (i32, String) {
     (out.status.code().unwrap_or(-1), kept.join("\n"))
 }
 
-struct WorkDir(PathBuf);
+struct WorkDir(TempDir);
 impl WorkDir {
     fn new(tag: &str) -> Self {
-        let n = SEQ.fetch_add(1, Ordering::Relaxed);
-        let d = std::env::temp_dir().join(format!("d379_{n}_{tag}"));
-        let _ = std::fs::remove_dir_all(&d);
+        let d = TempDir::new(tag);
         std::fs::create_dir_all(d.join(".mora").join("recordings")).expect("建目录");
         WorkDir(d)
     }

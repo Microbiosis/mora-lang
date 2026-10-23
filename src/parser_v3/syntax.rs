@@ -6,6 +6,7 @@
 //! - `parse_type_annotation` / `parse_single_type_annotation` — 类型注解（含 union / 泛型）
 
 use super::*;
+use crate::mir::MirFunction;
 
 /// v0.92: MoA/MoE 默认 prompt/router —— `input` 变量引用 witness。
 fn input_var_witness(span: Span) -> crate::mir::witness::MirWitness {
@@ -186,9 +187,34 @@ impl ParserV3 {
     // ════════════════════════════════════════════════════════════════
 
     /// v0.92: 返回 MirWitness（Orchestrate 变体）——不再经 MirExpr 桥接。
+    /// v0.104.6 D473：编排块在**独立寄存器空间**里解析。
+    ///
+    /// 此前整个编排块的表达式（agent 体 / 边条件 / MoA·MoE 的 prompt·router·
+    /// expert 定义）都被发射进**主上下文** —— 形成一份"平铺副本"。后果：
+    ///
+    /// 1. **agent 体被执行两遍**：顶层平铺副本执行一次，编排器再执行一次。
+    ///    实测（真实 CLI）：`agent a => print("AGENT-A")` 打印 **两次**；
+    ///    不可达 agent 的平铺副本也照跑。
+    /// 2. 顶层指令序列与 9 层管线的形状不同（多出平铺副本）⇒ 差分必红 ⇒
+    ///    orchestrate 程序**永久回落**旧路径。
+    ///
+    /// 而这些表达式的**真正归宿**是编排载荷 —— agent 的 `task_body`、边的
+    /// `condition_body`、MoA 的 `prompt_fn`、MoE 的 `router_fn`/`def_fn`，
+    /// 它们由 witness **单独 lower**（`lower_mir_witnesses`），与顶层寄存器
+    /// 空间无关。顶层那份平铺副本是**多余的**。
+    ///
+    /// ⇒ 解析期间把 `EmitContext` 换成独立的，结束时丢弃。
     pub(super) fn parse_orchestrate_statement(
         &mut self,
     ) -> Option<crate::mir::witness::MirWitness> {
+        let parent = std::mem::replace(&mut self.emit, crate::mir::lower::EmitContext::new());
+        let result = self.parse_orchestrate_statement_inner();
+        // 丢弃平铺副本：agent 体 / 边条件 / prompt 只存在于编排载荷里。
+        self.emit = parent;
+        result
+    }
+
+    fn parse_orchestrate_statement_inner(&mut self) -> Option<crate::mir::witness::MirWitness> {
         if !self.match_token_exact(TokenType::Orchestrate) {
             return None;
         }
@@ -291,7 +317,7 @@ impl ParserV3 {
                             }
                         }
                         "prompt" => {
-                            moa_prompt = self.emit_expr_w().map(|(_, w)| w);
+                            moa_prompt = self.emit_expr_w();
                         }
                         _ => return None,
                     }
@@ -322,7 +348,7 @@ impl ParserV3 {
                                     _ => return None,
                                 };
                                 self.consume(TokenType::Colon, "Expected ':' after expert name")?;
-                                if let Some((_reg, def_witness)) = self.emit_expr_w() {
+                                if let Some(def_witness) = self.emit_expr_w() {
                                     let def_fn = match crate::mir::lower::lower_mir_witnesses(
                                         std::slice::from_ref(&def_witness),
                                     ) {
@@ -343,7 +369,7 @@ impl ParserV3 {
                             self.consume(TokenType::RBrace, "Expected '}' after experts")?;
                         }
                         "router" => {
-                            moe_router = self.emit_expr_w().map(|(_, w)| w);
+                            moe_router = self.emit_expr_w();
                         }
                         "top_k" => {
                             let tok = self.advance()?;
@@ -355,7 +381,7 @@ impl ParserV3 {
                             moe_top_k = Some(n);
                         }
                         "prompt" => {
-                            moe_prompt = self.emit_expr_w().map(|(_, w)| w);
+                            moe_prompt = self.emit_expr_w();
                         }
                         _ => return None,
                     }
@@ -392,7 +418,7 @@ impl ParserV3 {
             if self.peek_is_identifier("on") {
                 self.advance();
                 self.consume(TokenType::Colon, "Expected ':' after 'on'")?;
-                if let Some((_reg, cond)) = self.emit_expr_w() {
+                if let Some(cond) = self.emit_expr_w() {
                     exit_when = Some(cond);
                 }
                 continue;
@@ -591,7 +617,7 @@ impl ParserV3 {
             return None;
         }
         let body_witness = match self.emit_expr_w() {
-            Some((_reg, w)) => w,
+            Some(w) => w,
             None => {
                 self.current = saved;
                 return None;
@@ -667,7 +693,7 @@ impl ParserV3 {
         if self.peek_is_identifier("on") {
             self.advance();
             self.consume(TokenType::Colon, "Expected ':' after 'on'")?;
-            if let Some((_reg, cond)) = self.emit_expr_w() {
+            if let Some(cond) = self.emit_expr_w() {
                 condition = Some(cond);
             }
         }

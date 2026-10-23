@@ -4,30 +4,21 @@
 
 mod tests_v048_refine {
     use crate::interpreter::Interpreter;
+    use crate::test_support::TempDir;
     use crate::value::Value;
 
-    /// v0.48.0: mora.refine + mora.refine_info + mora.list_refines (CLI-Anything /refine)
-    use std::time::UNIX_EPOCH;
-
-    fn write_temp_script(name: &str, content: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "mora_refine_test_{}_{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
+    /// 返回 **(守卫, 路径)** —— 守卫必须活得比路径久（v0.104.6 D475）。
+    fn write_temp_script(name: &str, content: &str) -> (TempDir, std::path::PathBuf) {
+        let dir = TempDir::new("mora_refine_test_");
         let path = dir.join(name);
         std::fs::write(&path, content).unwrap();
-        path
+        (dir, path)
     }
 
     #[test]
     fn mora_refine_real_file_creates_refined_copy() {
         let mut interp = Interpreter::new();
-        let script = write_temp_script("demo.mora", "task main()\n  print(\"hi\")\n");
+        let (_guard, script) = write_temp_script("demo.mora", "task main()\n  print(\"hi\")\n");
         let result = interp
             .call_mora_method(
                 "refine",
@@ -68,7 +59,7 @@ mod tests_v048_refine {
     #[test]
     fn mora_refine_iteration_increments() {
         let mut interp = Interpreter::new();
-        let script = write_temp_script("iter.mora", "x\n");
+        let (_guard, script) = write_temp_script("iter.mora", "x\n");
         for i in 1..=3 {
             let result = interp
                 .call_mora_method(
@@ -97,7 +88,7 @@ mod tests_v048_refine {
     #[test]
     fn mora_refine_many_returns_list() {
         let mut interp = Interpreter::new();
-        let script = write_temp_script("many.mora", "x\n");
+        let (_guard, script) = write_temp_script("many.mora", "x\n");
         let result = interp
             .call_mora_method(
                 "refine",
@@ -137,7 +128,7 @@ mod tests_v048_refine {
     #[test]
     fn mora_refine_info_returns_latest() {
         let mut interp = Interpreter::new();
-        let script = write_temp_script("info.mora", "x\n");
+        let (_guard, script) = write_temp_script("info.mora", "x\n");
         interp
             .call_mora_method(
                 "refine",
@@ -169,7 +160,7 @@ mod tests_v048_refine {
     #[test]
     fn mora_refine_info_specific_iteration() {
         let mut interp = Interpreter::new();
-        let script = write_temp_script("specific.mora", "x\n");
+        let (_guard, script) = write_temp_script("specific.mora", "x\n");
         interp
             .call_mora_method(
                 "refine",
@@ -213,8 +204,8 @@ mod tests_v048_refine {
     #[test]
     fn mora_list_refines_lists_all_scripts() {
         let mut interp = Interpreter::new();
-        let s1 = write_temp_script("s1.mora", "1\n");
-        let s2 = write_temp_script("s2.mora", "2\n");
+        let (_guard1, s1) = write_temp_script("s1.mora", "1\n");
+        let (_guard2, s2) = write_temp_script("s2.mora", "2\n");
         interp
             .call_mora_method(
                 "refine",

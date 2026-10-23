@@ -25,6 +25,7 @@
 //! 循环，过程本身留在各条注释里。
 
 use mora::mir::ssa;
+use mora::test_support::TempDir;
 
 /// 编译一个含 `for` 循环的程序（不做优化），并对它做 SSA 构造。
 fn ssa_of(src: &str) -> ssa::MirSsaFunction {
@@ -112,9 +113,7 @@ fn d254_phi_incoming_covers_every_predecessor() {
 /// D418 修好 phi 后本条常驻运行。
 #[test]
 fn d254_for_loop_output_is_identical_with_and_without_opt() {
-    let dir = std::env::temp_dir().join(format!("mora_d254_{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("mkdir");
+    let dir = TempDir::new("d254");
     let file = dir.join("a.mora");
     std::fs::write(
         &file,

@@ -34,6 +34,8 @@
 //! `print(x)` 依然被拒。**「同一类问题在同一处改动里只修了一半」**。
 
 /// **只跑类型检查**，不执行。
+use mora::test_support::TempDir;
+
 fn typeck(src: &str) -> Result<(), String> {
     let (_func, witnesses) =
         mora::cli::compile_and_opt(src, None).map_err(|e| format!("COMPILE: {e}"))?;
@@ -122,8 +124,7 @@ fn dyn_trait_object_records_concrete_type() {
     use std::process::Command;
 
     let bin = env!("CARGO_BIN_EXE_mora");
-    let dir = std::env::temp_dir().join(format!("mora_d83_{}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("create temp dir");
+    let dir = TempDir::new("d83");
 
     for (value, expect) in [("1.5", "float"), ("\"s\"", "string"), ("[1]", "list")] {
         let f = dir.join(format!("t_{}.mora", expect));

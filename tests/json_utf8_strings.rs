@@ -44,16 +44,14 @@
 //! ③ `\uXXXX` / 代理对必须能解析（D206 主判据）；
 //! ④ ASCII 与既有转义**不回归**；⑤ `parse → stringify → parse` 往返不断链。
 
-use std::path::PathBuf;
+use mora::test_support::TempDir;
 use std::process::Command;
 
-struct WorkDir(PathBuf);
+struct WorkDir(TempDir);
 
 impl WorkDir {
     fn new(tag: &str) -> Self {
-        let d = std::env::temp_dir().join(format!("mora_d205_{tag}"));
-        let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(&d).expect("建目录");
+        let d = TempDir::new(tag);
         WorkDir(d)
     }
 

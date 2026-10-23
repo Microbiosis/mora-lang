@@ -38,17 +38,16 @@
 //! - 8 个下游消费者一律经 `warn_skipped()` 报出来；
 //! - **`audit` 单独硬失败**：它回答的是安全问题，数据不完整 ⇒ 无资格出结论。
 
+use mora::test_support::TempDir;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// 工作目录守卫 —— `Drop` 时删除。
-struct WorkDir(PathBuf);
+struct WorkDir(TempDir);
 
 impl WorkDir {
     fn new(tag: &str) -> Self {
-        let d = std::env::temp_dir().join(format!("mora_d178_{tag}"));
-        let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(&d).expect("建工作目录");
+        let d = TempDir::new(tag);
         WorkDir(d)
     }
     fn path(&self) -> &Path {

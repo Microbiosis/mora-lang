@@ -50,6 +50,7 @@
 //! ④ **顺序保持**：原位发射 —— 原本在前的指令不得被挪到其后。
 //! ⑤ **执行等价**：57 个 fixture × `--opt=0/1/2` 三档输出与退出码全一致。
 
+use mora::test_support::TempDir;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -485,15 +486,6 @@ fn d417_task_def_keeps_its_place_relative_to_its_call() {
     );
 }
 
-// ── ⑤ 执行等价 ───────────────────────────────────────────────────────
-
-struct WorkDir(PathBuf);
-impl Drop for WorkDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-
 fn run(exe: &str, dir: &Path, file: &str, opt: Option<&str>) -> (i32, String) {
     let mut c = Command::new(exe);
     c.current_dir(dir);
@@ -534,10 +526,7 @@ fn d417_opt_levels_never_change_fixture_behaviour() {
     if !Path::new(exe).exists() {
         panic!("缺 {exe}：集成测试需要 `cargo build --bin mora` 产出的二进制");
     }
-    let dir = std::env::temp_dir().join(format!("mora_d417_{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("建临时目录");
-    let _work = WorkDir(dir.clone());
+    let dir = TempDir::new("d417");
 
     let mut broken: Vec<String> = Vec::new();
     for f in fixtures() {
@@ -575,10 +564,7 @@ fn d417_previously_gated_fixtures_now_reach_ssa() {
     if !Path::new(exe).exists() {
         panic!("缺 {exe}");
     }
-    let dir = std::env::temp_dir().join(format!("mora_d417b_{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("建临时目录");
-    let _work = WorkDir(dir.clone());
+    let dir = TempDir::new("d417b");
 
     // D310 记档的三个「解禁即静默失败」样本 + 语义各异的另外两个。
     for name in [
@@ -606,10 +592,7 @@ fn d417_previously_gated_fixtures_now_reach_ssa() {
 /// `{"add": fn(a,b) a + b end}` 这个 D310 的原始样本：闭包必须能被 SSA 重命名。
 #[test]
 fn d417_closure_literal_survives_renaming() {
-    let dir = std::env::temp_dir().join(format!("mora_d417c_{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("建目录");
-    let _work = WorkDir(dir.clone());
+    let dir = TempDir::new("d417c");
     let f = dir.join("a.mora");
     std::fs::write(
         &f,

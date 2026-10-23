@@ -43,12 +43,11 @@
 //!
 //! ## 修后（实测）
 
+use mora::test_support::TempDir;
 use std::process::Command;
 
 fn run(src: &str, tag: &str, opt: bool) -> (i32, Vec<String>) {
-    let dir = std::env::temp_dir().join(format!("mora_d304_{tag}"));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("建目录");
+    let dir = TempDir::new(tag);
     let p = dir.join("p.mora");
     std::fs::write(&p, src).expect("写探针");
     let exe = concat!(env!("CARGO_MANIFEST_DIR"), "/target/debug/mora.exe");

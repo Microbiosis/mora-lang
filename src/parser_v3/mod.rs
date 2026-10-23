@@ -7,7 +7,6 @@ use crate::common::{BinaryOp, Literal, Span};
 use crate::lexer::{Lexer, Token, TokenType};
 use crate::mir::orchestrate::{MirOrchestrateAgent, MirOrchestrateEdge, MirOrchestrateKind, Param};
 use crate::mir::witness::{MirWitness, WitnessKind, WitnessParam};
-use crate::mir::{MirFunction, MirInst, Reg};
 use std::collections::HashMap;
 
 mod emit;
@@ -151,8 +150,23 @@ pub struct ParserV3 {
     tokens: Vec<Token>,
     current: usize,
     /// v0.75.40: 单遍编译 emit 上下文（阶段 3 完整融合）。
-    /// parse 函数在构造语法树的同时 emit MirInst 到此处；compile() 取走
-    /// 指令序列。
+    ///
+    /// v0.104.6 **D474**：parser **不再发射 MirInst** —— 它只产 witness，
+    /// MIR 全部由 9 层管线产出。故本字段现在**只承载解析期的作用域语义**，
+    /// 不再承载指令：
+    ///
+    /// - `is_program_top`：当前是否在**程序顶层**（不在任何函数体作用域内）。
+    ///   判「`return` 只在函数体里有意义」——程序顶层的 `return` 会静默终止
+    ///   整个程序（D42）。
+    /// - `parse_loop_depth`：当前作用域内的循环嵌套层数。判「循环外
+    ///   `break`/`continue` 是错误」——判的是**源码位置**，不是 IR 跳转标签。
+    ///
+    /// 两者的作用域边界完全一致：**函数体级**（task / closure / macro /
+    /// worker / transaction / observe / parallel / with / section / match arm /
+    /// do / app / update / orchestrate …）。换入全新 `EmitContext` 时两个计数
+    /// 天然归零，退出时随 `self.emit = parent` 一并还原。
+    ///
+    /// ⇒ 换入机制本身必须保留：它是这两条解析语义的**唯一**作用域来源。
     emit: crate::mir::lower::EmitContext,
     /// v0.75.40: 单遍编译并行产出的 witness 树（typeck/LSP 消费面）。
     /// compile() 返回此列表。
@@ -256,10 +270,9 @@ impl ParserV3 {
             return Err(d);
         }
         emitted?;
-        let func = parser.emit.finish();
         let witnesses = parser.witnesses;
-        if func.body.is_empty() {
-            return Err("empty program: parser produced no executable instructions".to_string());
+        if witnesses.is_empty() {
+            return Err("empty program: parser produced no executable statements".to_string());
         }
         // v0.104.6 D25：witness 深度闸 — 括号扫不到的形态（`1+1+1+…` 这类
         // 左结合二元链在 emit 里是循环、括号深度恒为 0，但 witness 仍是
@@ -273,6 +286,13 @@ impl ParserV3 {
                 wd, MAX_NESTING_DEPTH, wspan.line, wspan.column
             ));
         }
+        // v0.104.6 D474：**MIR 由 9 层管线从 witness 产出** —— parser 不再
+        // 发射任何 MirInst（`emit.rs` 里的 123 条发射语句已删）。
+        // 保留 `(MirFunction, Vec<MirWitness>)` 的返回形态是为了让**调用方**
+        // （CLI / import / runtime eval / REPL / LSP / typeck）不必各自决定
+        // 走哪条编译路径 —— 路径在这里**唯一**。
+        let raw = crate::mir::MirFunction::default();
+        let func = crate::mir::pipeline::compile(&raw, &witnesses);
         Ok((func, witnesses))
     }
 
@@ -301,13 +321,9 @@ impl ParserV3 {
 /// emit_match_arm_w 的产出：指令侧 (pat_str/guard/body_mir/val_reg)
 /// + witness 侧 WitnessArm。结构体分组避免五元组返回（type_complexity）。
 struct EmittedMatchArm {
-    pat_str: String,
-    /// v0.104.3: 守卫是**延迟求值**的 MirFunction（在模式绑定之后由
-    /// `h_match_expr` 调用），不再是外层寄存器 —— 守卫引用模式绑定变量，
-    /// 那些绑定只在匹配成功时才存在于 env。
-    guard: Option<Box<MirFunction>>,
-    body_mir: Box<MirFunction>,
-    val_reg: Reg,
+    /// v0.104.6 D474：只保留 witness —— 守卫与体都只以 **witness** 形态存在
+    /// （`WitnessArm { pattern, guard, body }`）。Mir 侧的 `pat_str` /
+    /// `guard` / `body_mir` / `val_reg` 四个字段整体作废。
     witness: crate::mir::witness::WitnessArm,
 }
 
@@ -407,7 +423,7 @@ fn parse_prompt_parts(content: &str, span: Span) -> Vec<crate::mir::witness::Mir
                 let mut lexer = Lexer::new(&expr_text);
                 let tokens = lexer.scan_tokens();
                 let mut parser = ParserV3::new(tokens, &expr_text);
-                if let Some((_reg, w)) = parser.emit_expr_w() {
+                if let Some(w) = parser.emit_expr_w() {
                     parts.push(w);
                 }
             }

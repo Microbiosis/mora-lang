@@ -117,6 +117,7 @@ pub fn load_heartbeat(path: &Path) -> Result<HeartbeatReport, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::TempDir;
 
     #[test]
     fn parse_simple_unchecked() {
@@ -201,14 +202,7 @@ mod tests {
 
     #[test]
     fn load_heartbeat_real_file() {
-        let dir = std::env::temp_dir().join(format!(
-            "mora_heartbeat_{}_{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let dir = TempDir::new("mora_heartbeat_");
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("HEARTBEAT.md");
         let content = "# Heartbeat\n\n- [x] first done\n- [ ] second pending\n- [x] third done\n";
@@ -225,6 +219,4 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir);
     }
-
-    use std::time::UNIX_EPOCH;
 }

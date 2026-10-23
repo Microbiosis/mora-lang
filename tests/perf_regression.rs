@@ -14,6 +14,7 @@
 //! cargo test --release --test perf_regression -- --ignored --nocapture
 //! ```
 
+use mora::test_support::TempDir;
 use std::time::Instant;
 
 /// 跑一个脚本，返回墙钟秒数（取 n 次的中位数，降低噪声）。
@@ -45,7 +46,7 @@ const TIGHT_LOOP: &str = "let s = 0i\nlet j = 0i\nwhile j < 1000000\n  assign s 
 #[test]
 #[ignore = "性能护栏：需 release 二进制；cargo test --release --test perf_regression -- --ignored"]
 fn switch_threading_speedup_is_preserved() {
-    let p = std::env::temp_dir().join("mora_perf_tight.mora");
+    let p = TempDir::new("mora_perf_tight");
     std::fs::write(&p, TIGHT_LOOP).expect("写基准");
     let f = p.to_string_lossy().into_owned();
 

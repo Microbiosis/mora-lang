@@ -1,45 +1,47 @@
-//! v0.104.6 D94：为 D92b 普查出的 **14 类回落构造**补**执行级等价性**证据。
+//! v0.104.6 D94/D474：块形态 / 声明形态的**执行级行为契约**。
 //!
-//! D92b 的结论是「这 14 类全部没有差分等价性 fixture 覆盖」，因此
-//! 「放宽差分让它们走 9 层」= 无人验证。本文件补上这块证据。
+//! ## 与 D94 版的差别
 //!
-//! ## 为什么不能直接套用 `nine_layer_differential.rs` 的 `audit()`
+//! D94 版测的是「原 emit 产出」与「9 层管线产出」的**执行结果是否一致**。
+//! **D474 把差分机制整个退役** —— parser 不再发射 MirInst（只产 witness），
+//! MIR 全部由 9 层产出 ⇒「参考实现」这一侧**已不存在**，那次比对成了
+//! **自己跟自己比**（恒真）。
 //!
-//! 那个 `audit()` 的执行级判定比的是 **`last_expr`**。而块形态的顶层值是
-//! `Nil`（emitter 发完块指令就是 `Const(dst, Nil)`，块值被丢弃）——
-//! 直接套用会让执行级判定**空转**（两边都是 Nil，永远「通过」）。
+//! ⇒ 判据换成**钉死的期望值**：每个用例的 `last_expr` 必须是**具体且正确**
+//! 的值。这比原判据**更强** —— 原判据只能发现「两条路径不一致」（两条一起
+//! 错到同一个错值时反而绿）。
 //!
-//! 故每个用例都必须让差异**可观测**：
-//! - 块体内 `let` 绑定会外泄（已实测：observe / span / parallel / worker
-//!   都可以 —— 只有 `with` 不行，见 D91），所以末表达式取块内定义的名字；
-//! - `prompt` 的 section text 可经 `compose_prompt(name)` 观测 ——
-//!   **这正是缺失尾部 `Return` 会暴露的地方**（D92 已判定它是真实语义差异）。
+//! ## 这些用例为什么选「让差异出现在 last_expr 上」
+//!
+//! 块形态的顶层值是 `Nil`（块的值被丢弃），直接断言顶层值**什么也测不到**
+//! —— 故每个用例都让块内的绑定**外泄**（已实测：observe / span / parallel /
+//! worker 都可以；只有 `with` 不行，见 D91），末表达式取块内定义的名字。
+//!
+//! `prompt` 的 section text 可经 `compose_prompt(name)` 观测 —— **这正是
+//! 缺失尾部 `Return` 会暴露的地方**（D92 曾据此判定它是真实语义差异；
+//! D94 实测否证了那条判断：两条路径的 `compose_prompt("p")` 都给出
+//! `"\n## p\n\nhello section"`）。
 
 use mora::interpreter::Interpreter;
 use mora::mir::MirFunction;
 use mora::mir::ssa::OptLevel;
-use mora::mir::vm::{execute as run_mir, run_main_task};
+use mora::mir::vm::execute as run_mir;
 use mora::mir::witness_to_fcfg::witness_to_fcfg;
 use mora::parser_v3::ParserV3;
 use mora::value::Value;
 use std::sync::Arc;
 
-/// 与 `cli::compile_and_opt` **完全同序**的收尾：两条路径都走 `apply_rules`，
-/// 再在等级启用时走 `opt::optimize`。
-///
-/// ⚠ 本函数第一版**漏了 `opt::optimize`**，于是测出 `eval` 「原 2.0 / 管线 nil」
-/// 的「不等价」。用真实 CLI 复核发现**两条路径行为完全相同**（都报
-/// `eval(source: string|code) expects a string or code argument`），
-/// 即该差异是**测试装置不忠实**的产物，不是生产缺陷。
-/// **教训：差分测试的装置必须与生产路径逐阶段对齐**，否则它测的是装置的差异。
-fn finish(mut f: MirFunction, level: OptLevel) -> MirFunction {
-    mora::mir::optimize::apply_rules(&mut f);
+/// 与 `cli::compile_and_opt` **完全同序**的收尾：走 `apply_rules`，再在
+/// 等级启用时走 `opt::optimize`。
+fn finish(mut func: MirFunction, level: OptLevel) -> MirFunction {
+    mora::mir::optimize::apply_rules(&mut func);
     if level.enabled() {
-        mora::mir::opt::optimize(&mut f, level);
+        mora::mir::opt::optimize(&mut func, level);
     }
-    f
+    func
 }
 
+/// 执行一个 MirFunction，返回 `last_expr`（run_mir 顶层最后表达式值）。
 fn execute(func: MirFunction) -> Result<Value, String> {
     let mut interp = Interpreter::new();
     let mut env = interp.take_env();
@@ -50,78 +52,66 @@ fn execute(func: MirFunction) -> Result<Value, String> {
         &mut env,
         &mut mora::mir::effect::Effects::new(),
     )?;
-    run_main_task(
-        &func_arc,
-        &mut interp,
-        &mut env,
-        &mut mora::mir::effect::Effects::new(),
-    )?;
     Ok(last)
 }
 
 /// 每个用例的源码都让差异出现在 `last_expr` 上。
-const CASES: &[(&str, &str)] = &[
+const CASES: &[(&str, &str, &str)] = &[
     // ── 块形态：块内 let 外泄，末表达式取该名字 ──
-    ("observe", "observe trace \"t\" do\n  let v = 42\nend\nv\n"),
-    ("span", "span \"s\" do\n  let v = 42\nend\nv\n"),
-    ("parallel", "parallel\n  let v = 42\nend\nv\n"),
-    ("worker", "worker w do\n  let v = 42\nend\nv\n"),
+    (
+        "observe",
+        "observe trace \"t\" do\n  let v = 42\nend\nv\n",
+        "42.0",
+    ),
+    ("span", "span \"s\" do\n  let v = 42\nend\nv\n", "42.0"),
+    ("parallel", "parallel\n  let v = 42\nend\nv\n", "42.0"),
+    ("worker", "worker w do\n  let v = 42\nend\nv\n", "42.0"),
     // ── section：值被 handler 消费，缺失 Return 必然暴露 ──
     (
         "prompt_section",
         "prompt \"p\" do\n  \"hello section\"\nend\ncompose_prompt(\"p\")\n",
+        "\n## p\n\nhello section",
     ),
     (
         "document_section",
         "document \"d\" do\n  \"doc section\"\nend\n1\n",
+        "1.0",
     ),
     // ── 声明形态：末表达式取声明出的名字/字段 ──
     (
         "model",
         "model M\n  count: number = 7\nend\nlet d = M\nprint(type_of(d))\nd\n",
+        "{__model_fields__: [count]}",
     ),
-    ("msg", "msg Inc\n  Bump\nend\n1\n"),
-    ("struct", "struct P\n  x: number\nend\n1\n"),
-    ("enum", "enum E\n  A\n  B\nend\n1\n"),
+    ("msg", "msg Inc\n  Bump\nend\n1\n", "1.0"),
+    ("struct", "struct P\n  x: number\nend\n1\n", "1.0"),
+    ("enum", "enum E\n  A\n  B\nend\n1\n", "1.0"),
     // ── 类别缺口 / 裸 perform ──
-    ("transaction", "transaction\n  let v = 42\nend\nv\n"),
+    ("transaction", "transaction\n  let v = 42\nend\nv\n", "42.0"),
     (
         "tea_standalone",
         "model C\n  count: number = 0\nend\nmsg M\n  Inc\nend\nupdate(msg, model)\n  model\nend\n1\n",
+        "1.0",
     ),
     // ── 对照组：D92b 判为「通过」的两类 ──
-    ("with", "with model = \"m\"\n  print(1)\nend\n1\n"),
-    ("eval", "eval(1 + 1)\n"),
+    ("with", "with model = \"m\"\n  print(1)\nend\n1\n", "1.0"),
+    ("eval", "eval(1 + 1)\n", "2.0"),
 ];
 
-/// 测量：对每个用例比较「原 emit 产出」与「9 层管线产出」的执行结果。
-///
-/// **测量结论（D94，已实测固化）**：
-/// - 13 个用例**执行级等价** —— 包括 D92 曾判定为「真实语义差异」的
-///   `prompt_section`：两条路径的 `compose_prompt("p")` 都给出
-///   `"\n## p\n\nhello section"`。**D92 那条判断是读 handler 代码得出的，
-///   未经测量，现更正。**
-/// - `eval` **不等价**（原 2.0 / 管线 nil）—— 这是**真实的管线缺口**：
-///   裸顶层 `eval(1 + 1)` 时管线产出 **0 条指令**。
-///   但它**不构成生产缺陷**：差分检查在此时判失败并回落（`pipeline_mir=0`），
-///   用户拿到的仍是正确结果。D92b 普查里 `eval` 记为「通过」是因为那条用例
-///   写的是嵌套形态 `print(eval(1 + 1))`，现已补入 `eval_bare` 条目。
+/// **主判据**：每个用例的 `last_expr` 必须是钉死的期望值。
 #[test]
-fn d94_execution_equivalence_for_fallback_constructs() {
-    let mut equivalent = Vec::new();
-    let mut divergent = Vec::new();
-    let mut report = Vec::new();
-
-    for (name, source) in CASES {
+fn d474_block_and_declaration_forms_have_the_expected_last_value() {
+    let mut failures: Vec<String> = Vec::new();
+    for (name, source, want) in CASES {
         let (func, witnesses) = match ParserV3::compile(source) {
             Ok(v) => v,
             Err(e) => {
-                report.push(format!("{name}: COMPILE_ERR {e}"));
+                failures.push(format!("  [{name}] 编译失败: {e}"));
                 continue;
             }
         };
 
-        // 9 层产出（与 `nine_layer_differential.rs::audit` 同一条构造路径）
+        // 9 层产出（生产路径的同一条构造路径）
         let fcfg = witness_to_fcfg(&witnesses);
         let (body, n_regs) = mora::mir::fcfg_lower::lower_fcfg(&fcfg);
         let pipeline_func = MirFunction {
@@ -132,53 +122,32 @@ fn d94_execution_equivalence_for_fallback_constructs() {
         };
 
         let level = OptLevel::default();
-        let original_opt = finish(func.clone(), level);
-        let pipeline_opt = finish(pipeline_func.clone(), level);
-
-        let a = execute(original_opt);
-        let b = execute(pipeline_opt);
-        let same = match (&a, &b) {
-            (Ok(x), Ok(y)) => format!("{x}") == format!("{y}"),
-            (Err(_), Err(_)) => true, // 两侧同为运行期缺口，不构成路径差异
-            _ => false,
-        };
-        if same {
-            equivalent.push(*name);
-        } else {
-            divergent.push(*name);
+        let got = execute(finish(pipeline_func, level));
+        match got {
+            Ok(v) => {
+                let text = v.to_string();
+                if text != *want {
+                    failures.push(format!("  [{name}] 期望 {want:?}，实得 {text:?}"));
+                }
+            }
+            Err(e) => failures.push(format!("  [{name}] 运行失败: {e}")),
         }
-        report.push(format!(
-            "{name}: {}  original={:?} pipeline={:?}",
-            if same { "等价" } else { "**不等价**" },
-            a.as_ref()
-                .map(|v| v.to_string())
-                .unwrap_or_else(|e| format!("Err({e})")),
-            b.as_ref()
-                .map(|v| v.to_string())
-                .unwrap_or_else(|e| format!("Err({e})"))
-        ));
     }
-    eprintln!("D94 执行级等价性：\n  {}", report.join("\n  "));
+    assert!(
+        failures.is_empty(),
+        "块形态 / 声明形态的 last_expr 与期望不符（{} 条）：\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
+}
 
+/// 覆盖面自检：这张表**不能悄悄变小**。
+#[test]
+fn d474_case_table_keeps_its_size() {
     assert_eq!(
-        report.len(),
         CASES.len(),
-        "有用例没跑出结论：\n  {}",
-        report.join("\n  ")
-    );
-
-    // 唯一已知不等价的：`eval`（真实管线缺口，差分已挡住，不影响生产）。
-    // 它的处置见 `nine_layer_fallback_census.rs` 的 `eval_bare` 条目。
-    assert_eq!(
-        divergent,
-        vec!["eval"],
-        "不等价清单变了 —— 若 `eval` 已被修好，把本断言改空并同步更新 CHANGELOG D94"
-    );
-    assert_eq!(
-        equivalent.len(),
-        CASES.len() - 1,
-        "等价项数变了（{}），请复核报告：\n  {}",
-        equivalent.len(),
-        report.join("\n  ")
+        14,
+        "用例表现在 {} 条 —— 若有意增删，请同步更新本断言与 CHANGELOG D474",
+        CASES.len()
     );
 }

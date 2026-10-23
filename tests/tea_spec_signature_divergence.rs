@@ -39,29 +39,15 @@
 //! （Elm 语义是 `Cmd`，本实现是「纯追加，返回新 app」），
 //! 那是**语义裁决**，不是文档勘误。
 
+use mora::test_support::TempDir;
 use std::process::Command;
-use std::sync::atomic::{AtomicU64, Ordering};
-
-static SEQ: AtomicU64 = AtomicU64::new(0);
-
-fn slug(s: &str) -> String {
-    let mut out = String::from("d347_");
-    out.extend(
-        s.chars()
-            .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
-            .take(40),
-    );
-    out
-}
 
 /// 独立进程 + 隔离 `HOME`；取 stdout **全部**实质行。
 ///
 /// ⚠ 探针**不带**尾随换行（D345 教训）：`format!("print({body})")`
 /// 若 `body` 自身以 `\n` 结尾会多出孤立的 `)`，parser 报「Expected ')'」。
 fn ev(body: &str) -> (i32, String) {
-    let n = SEQ.fetch_add(1, Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!("d347t_{}_{}", n, slug(body)));
-    std::fs::create_dir_all(&dir).expect("建目录");
+    let dir = TempDir::new("d347t_");
     let p = dir.join("p.mora");
     std::fs::write(&p, body).expect("写探针");
     let home = dir.join("home");

@@ -34,14 +34,13 @@
 //! 隔离：`recordings_dir()` = `current_dir()/.mora/recordings`，
 //! 故把 cwd 设成测试临时目录，**不碰**用户真实的 `.mora/recordings`。
 
-use std::path::PathBuf;
+use mora::test_support::TempDir;
 use std::process::Command;
 
-struct WorkDir(PathBuf);
+struct WorkDir(TempDir);
 impl WorkDir {
     fn new(tag: &str) -> Self {
-        let d = std::env::temp_dir().join(format!("mora_d224_{tag}"));
-        let _ = std::fs::remove_dir_all(&d);
+        let d = TempDir::new(tag);
         std::fs::create_dir_all(d.join(".mora").join("recordings")).expect("建目录");
         WorkDir(d)
     }

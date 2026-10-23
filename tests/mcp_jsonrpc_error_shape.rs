@@ -42,6 +42,7 @@
 //! 另有正常路径的形状校验（`initialize` 三字段、`tools/list` 每项必须有
 //! `name` + `inputSchema`、`tools/call` 的 `content` 必须是数组）作为**不回归**。
 
+use mora::test_support::TempDir;
 use std::io::Write;
 use std::process::{Command, Stdio};
 
@@ -60,12 +61,10 @@ end)
 mcp.serve()
 "#;
 
-struct WorkDir(std::path::PathBuf);
+struct WorkDir(TempDir);
 impl WorkDir {
     fn new(tag: &str) -> Self {
-        let d = std::env::temp_dir().join(format!("mora_d213_{tag}"));
-        let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(&d).expect("建目录");
+        let d = TempDir::new(tag);
         WorkDir(d)
     }
 }

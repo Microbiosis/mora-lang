@@ -26,7 +26,7 @@
 //! 本测试**允许将来重新声明 `":"`** —— 条件是那时在冒号后**确实**返回条目。
 //! 这样「补上这个功能」不需要改判据，而「只加回声明不补功能」会立刻红。
 
-use std::path::PathBuf;
+use mora::test_support::TempDir;
 use std::process::{Command, Stdio};
 
 fn json_string(s: &str) -> String {
@@ -48,10 +48,8 @@ fn frame(json: &str) -> String {
     format!("Content-Length: {}\r\n\r\n{}", json.len(), json)
 }
 
-fn temp_dir() -> PathBuf {
-    let d = std::env::temp_dir().join("mora_d195_lsp");
-    std::fs::create_dir_all(&d).expect("建目录");
-    d
+fn temp_dir() -> TempDir {
+    TempDir::new("mora_d195_lsp")
 }
 
 /// 跑一个会话，返回原始 stdout。

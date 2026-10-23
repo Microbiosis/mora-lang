@@ -37,12 +37,11 @@
 //! 与本文件既有立场一致（v0.104.6 修 `list.get` 越界静默返回 nil 时）：
 //! **静默改变数据形状必须是显式错误**。
 
+use mora::test_support::TempDir;
 use std::process::Command;
 
 fn run(src: &str, tag: &str) -> (i32, String) {
-    let dir = std::env::temp_dir().join(format!("mora_d325_{}", slug(tag)));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("建目录");
+    let dir = TempDir::new(tag);
     let p = dir.join("p.mora");
     std::fs::write(&p, src).expect("写探针");
     let exe = concat!(env!("CARGO_MANIFEST_DIR"), "/target/debug/mora.exe");
@@ -70,12 +69,6 @@ fn run(src: &str, tag: &str) -> (i32, String) {
         .replace(&p.to_string_lossy().to_string(), "<TMP>")
         .to_string();
     (out.status.code().unwrap_or(-1), first)
-}
-
-fn slug(s: &str) -> String {
-    s.chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
-        .collect()
 }
 
 fn sh(e: &str) -> (i32, String) {

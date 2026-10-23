@@ -49,15 +49,13 @@
 //! `Parse error: Expected ')' after relation arguments`）—— 它们是 parser
 //! **内部发出**的构造。判据必须走用户可表达的那条路。
 
-use std::path::PathBuf;
+use mora::test_support::TempDir;
 use std::process::Command;
 
-struct WorkDir(PathBuf);
+struct WorkDir(TempDir);
 impl WorkDir {
     fn new(tag: &str) -> Self {
-        let d = std::env::temp_dir().join(format!("mora_d216_{tag}"));
-        let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(&d).expect("建目录");
+        let d = TempDir::new(tag);
         WorkDir(d)
     }
 }

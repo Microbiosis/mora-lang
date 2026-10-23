@@ -46,8 +46,34 @@ Token → FCFG → EHIR → Core → MIR
 - **职责**：闭包/ADT/Thunk/Handle 降维为基元
 - **关键设计**：SSA 100% 覆盖（无 passthrough）
 
+> ⚠ **块号分配的嵌套限制（既有，未修）**：`ehir_to_core` 的分支块号是
+> **预分配**的（`next_block_id + 1 / +2 / +3`），因此**分支里再套分支**
+> 会让外层预留的块号与内层实际分配的块号相撞 ⇒ **边指错、甚至成环**。
+>
+> 实测（一次性探针打印 Core 块结构，`if` 里套 `if`）：
+>
+> ```text
+> block 0: Branch(cond=0, true_bb=1, false_bb=3)   ← 外层 if
+> block 1: Branch(cond=1, true_bb=2, false_bb=4)   ← 内层 if（在外层的 then 里）
+> block 2: <内层 then 体>  Jump(4)
+> block 3: []  Jump(4)                              ← 外层 else（空）
+> block 4: []  Jump(3)                              ← ⇒ 3 ↔ 4 成环
+> ```
+>
+> 而 `or` / `and` 出现在 `if` 的**条件**位置（先算条件、再分支）**不受影响**
+> —— 那时两者的块是先后关系而非嵌套关系。
+>
+> 影响范围：**仅限 Core 层**。Core 函数**从不执行**（`probe_all_layers` 只统计
+> 指令数），可执行的路径是 MIR 层 —— 它的块结构由 `mir/dag.rs` 独立构建，
+> 不受此限制。
+>
+> D477 让 `or`/`and` 在 Core 层也走 `Branch` + 两块（此前它们被降成普通
+> `BinaryOp`，**既不取值短路也不求值短路**），于是**新增**了一个嵌套来源。
+> 真要修，得把 Core 层改成**先降维、后回填块号**的 CFG 构造器 ——
+> 那是独立的一批，不在 D477 范围内。
+
 ### MIR — Mid-level IR（已有）
-- **输入**：`CoreFunction` 或 emit.rs 直出
+- **输入**：`FCFG`（`lower_fcfg` 降维）
 - **输出**：`MirFunction`（50 种 MirInst）
 - **文件**：`src/mir/mod.rs` + `src/mir/ssa.rs` + `src/mir/optimize/`
 - **职责**：SSA 构造 + 优化（Cascades + SSA opt）
@@ -94,41 +120,107 @@ Token → FCFG → EHIR → Core → MIR
 - **文件**：`src/mir/jit.rs`
 - **职责**：copy-and-patch JIT（零 LLVM）
 
-## 生产管线（v0.90.3+）
+## 生产管线（v0.104.6 D474 起：**唯一**路径）
 
 ```
-Token → ParserV3::compile → MirInst[] + MirWitness[]
-                                    ↓              ↓
-                            [原管线 fallback]   witness_to_fcfg → FCFG
-                                                    ↓
-                                              annotate + TypeTable → EHIR
-                                                    ↓
-                                              ehir_to_core → Core
-                                                    ↓
-                                              lower_fcfg → MirInst[]（管线产出）
-                                                    ↓
-                                              apply_rules + SSA opt
-                                                    ↓
-                                              run_mir / execute（执行器消费管线产出）
+Token → ParserV3::compile → MirWitness[]（parser 只产 witness，不发任何指令）
+                                    ↓
+                              witness_to_fcfg → FCFG
+                                    ↓
+                              lower_fcfg → MirInst[]（执行器消费它）
+                                    ↓
+                              apply_rules + SSA opt + regalloc
+                                    ↓
+                              execute（执行器）
 ```
 
-**切换逻辑**（`cli::compile_and_opt`）：
-1. 管线在 apply_rules 之前运行（差分 raw-to-raw）
-2. 类别级差分绿 → 管线产出经同一套优化后作为返回值
-3. 差分红 → 自动回落 emit.rs 直出
-4. `MORA_9LAYER=0` 禁用，`MORA_9LAYER_DEBUG=1` 输出差分诊断
+**EHIR / Core 两层不在产出路径上**（只用于统计）。它们由
+`mir::pipeline::probe_all_layers` 单独跑，供 CI 覆盖那两层的可运行性。
 
-## 差分验证
+> ⚠ **v0.104.6 D474：没有「切换逻辑」了。**
+>
+> 此前 `cli::compile_and_opt` 的流程是「跑两条 lowering → 逐条差分 → 差分红就
+> 回落 `emit.rs` 直出」。D474 把 parser 改成**只产 witness** ⇒ **参考实现这一侧
+> 已经不存在** ⇒ 差分退化成**自己跟自己比**（恒真）⇒ 差分机制与
+> `MORA_9LAYER=0` 开关**一并退役**。
+>
+> ⇒ 现在的生产路径是**一条**，没有环境变量分支。
 
-**两级差分**（`tests/nine_layer_differential.rs`）：
-1. **类别级**：顶层指令序列逐条类别比较（忽略寄存器编号）
-2. **执行级**：双管线各自 run_mir + run_main_task，last_expr 必须相等
+## 等价性由「期望输出」保证（不是差分）
 
-**覆盖**：19 个 e2e fixture 全部通过双级差分。
+| 判据 | 能发现 | 发现不了 |
+|---|---|---|
+| 两条路径一致 | 两条路径**不一致** | 两条路径**一起错**到同一个错值 |
+| 期望输出 | 值**不对** | —— |
+
+⇒ CI 改为断言**具体且正确**的输出：
+
+| 测试 | 覆盖 |
+|---|---|
+| `tests/nine_layer_conformance.rs` | 48 类语言构造 → 钉死的期望 stdout |
+| `tests/nine_layer_full_census.rs` | 117 个程序（67 仓库真实 + 50 合成）→ 编译 + 运行成功 |
+| `tests/nine_layer_unblocked.rs` | 20 种块/声明形态 × 3 优化档 + 57 个 e2e fixture |
+| `tests/nine_layer_block_equivalence.rs` | 14 类构造 → 钉死的 `last_expr` |
+| `tests/pipeline_conformance.rs` | 11 个代表性 fixture → 钉死的 stdout + 退出码 |
+| `tests/pipeline_equivalence.rs` | 68 条语言特性 → 必须编译过 + 优化档位不变 |
+
+> **历史记档**：改写判据时当场抓到**三个真缺陷**（`or`/`and` 短路不赋值、
+> `--opt=1` 丢裸字面量的值、parser 手术误删两条解析语义）—— 它们**两边一样错**，
+> 逐条差分**结构上抓不到**。这正是「差分只比形状、不比语义」的盲区。
+
+## 短路求值：`or` / `and` 的 rhs 只在必要时求值（v0.104.6 D477）
+
+`or` / `and` 的**求值级短路**是语言的目标语义（spec §4.3.1）。
+D477 之前它**只在一条路径上成立**：
+
+| 路径 | 入口 | rhs 的位置 | 是否短路**求值** |
+|------|------|-----------|------------------|
+| 生产路径 | `witness_to_fcfg` → `lower_fcfg` | `Or` 节点**之前**（rhs 是已算好的寄存器） | ✗ rhs 无条件求值 |
+| 直连路径 | `mir::lower` | `JumpIf` **之后**（rhs 在分支里） | ✓ |
+
+⇒ 同一个程序，两条编译路径的**副作用**不同 —— 生产路径上
+`let x = true or bump()` 仍会执行 `bump()`。
+
+**根因是节点形状**：`Node::Or { rhs: Reg }` 承载的是**已算好的寄存器**，
+而寄存器在节点降级之前就已写好 ⇒ rhs 的副作用早已发生，**结构上无法**
+表达「只在某条分支上求值」。
+
+**D477 的修法**：`Node::Or` / `Node::And` 的 `rhs` 改成**未求值的块**
+（`Block<M>`），降级时把 rhs 的指令放进「非短路分支」：
+
+```text
+JumpIf(l, short)          ; l 为真 ⇒ 走短路（rhs 不求值）
+<rhs 块>                  ; ← 只在 fall-through 这条路上求值
+BinaryOp(dst, l, .., r)
+Jump(end)
+short:
+Copy(dst, l)
+end:
+```
+
+⇒ 生产路径与直连路径的指令序列**逐条一致**，且真正兑现短路求值。
+Core 层同步改成 `Branch` + 两块（此前它把 or/and 降成普通 `BinaryOp`，
+**既不取值短路也不求值短路**）。
+
+回归护栏：`tests/short_circuit_evaluation.rs`（行为 × 三个优化档位 +
+两条路径的形状对照）+ `tests/nine_layer_conformance.rs` 的
+`or_and_skip_rhs_evaluation`。
 
 ## 已知限制（显式合法性登记）
 
-v0.104.6 起，「哪些构造还没接进 9 层管线」不再是**沉默的二值回落**，
+> ⚠ **v0.104.6 D473：本节连同「显式合法性登记」机制一起删除。**
+>
+> 登记表的用途是让**回落** legible（区分「已知缺口」与「管线回归」）。
+> D473 补齐最后一批构造后，**回落机制本身被删除** —— 9 层是**唯一**生产路径，
+> 不再存在「已知缺口 / 回归」之分。
+>
+> ⇒ 差分从**生产门**降为 **CI 等价性验证**：
+> 9 层是**规范**，`emit.rs` 参考实现是**对照物**（golden model），
+> 二者不一致 = 9 层的 bug，由 CI 抓住；生产不再为此付费。
+
+**v0.104.6 D473 之前**的状态（保留作历史记录）：
+
+v0.104.6 起，「哪些构造还没接进 9 层管线」不再��**沉默的二值回落**，
 而是一张**显式、按名、带原因**的登记表（`src/mir/legalization.rs`），
 语义对应 MLIR 的 `ConversionTarget` / `applyPartialConversion`：
 
@@ -138,15 +230,22 @@ v0.104.6 起，「哪些构造还没接进 9 层管线」不再是**沉默的二
 | 含未 legalize 构造 | 功能覆盖缺口（**预期**） | 按**构造名**回落，stderr 点名 |
 | 全合法 + 差分红 | 管线在已支持构造上出 bug（**回归**） | 回落 + stderr 打出「回归」醒目措辞 |
 
-当前登记的**未 legalize 构造**（4 条，与
-`tests/nine_layer_fallback_reasons.rs` 的 `FALLBACK_REASONS` 一一对应）：
+D472 之后登记项由 4 条减为 1 条（`orchestrate`），D473 之后减为 **0 条**：
 
-| 构造 | 未 legalize 原因 |
-|------|------|
-| `worker` | 9 层降级链里没有 `Worker` 类别 |
-| `transaction` | 9 层降级链里没有 `Transaction` 类别 |
-| `perform_bare` | 裸 perform：emit 侧不发射该 `Perform` |
-| `eval_bare` | `eval` 顶层裸形态：管线整条丢弃（产出 0 条指令） |
+| 阶段 | 登记项 | 说明 |
+|------|--------|------|
+| D472 前 | `worker` / `transaction` / `perform_bare` / `eval_bare` | witness 层**根本没有**这些构造的表示 |
+| D472 后 | `orchestrate` | 9 层 FCFG 的编排表示承载不下 agent 体 / 边条件等运行时元数据 |
+| D473 后 | **无** | 9 层覆盖全部语言构造，回落机制删除 |
+
+> **D472 之前是 4 条**（`worker` / `transaction` / `perform_bare` /
+> `eval_bare`）——它们的根因是**witness 层根本没有该构造的表示**（parser
+> 只发射 MirInst、把结构压成扁平 `Sequence`），9 层降级链结构上就产不出对应
+> 指令。D472 补齐 witness 变体 + FCFG 节点 + 降维 arm 后全部合法化。
+>
+> D472 一并修好了 4 类**原登记表漏掉**的构造（`aggregate` / `commit` /
+> `rollback` / `pipe`）——它们此前同样差分必红，只是从未被登记，于是回落时
+> 既不点名也不报错（**静默回落**）。
 
 **登记判据是结构签名，不是裸类别** —— 合法程序
 `handle Ai { g = perform Ai("hello") } { … }` 的 MIR 里同样含 `Perform`
@@ -169,19 +268,75 @@ v0.104.6 起，「哪些构造还没接进 9 层管线」不再是**沉默的二
 | lib tests | 836 | 全量单元测试 |
 | e2e | 23 | 全部 fixture 端到端 |
 | executor_switch | 17 | 生产路径执行验证 |
-| nine_layer_differential | 19 | 双级差分等价 |
+| nine_layer_conformance | 49 | 语言构造的**期望输出**（D474 建表，D477 增补 1 条） |
+| nine_layer_full_census | 117 | 全部程序编译 + 运行成功 |
+| nine_layer_unblocked | 20×3 + 57 | 块/声明形态 × 优化档 + 全部 e2e fixture |
+| pipeline_conformance | 11 | 代表性 fixture 的**期望输出**（D474 新建） |
+| short_circuit_evaluation | 3 | `or`/`and` 的**求值级短路**（行为 × 优化档 + 两路径形状，D477 新建） |
 
-## 已知架构层级违反（技术债）
+## 已知遗留（技术债）
 
-以下违反 AGENTS.md §0.2（Foundation→Kernel→Expression 层级），需要后续重构：
+> ⚠ **本节此前整表失效，已于 v0.104.6 批次重写。**
+>
+> 原表列的 4 条「层级违反」全部以 `MirExpr` 跨层使用为根因，而
+> **`MirExpr` 已随 v0.92 整体删除**（`src/mir/mod.rs`：
+> 「v0.92: expr 模块已删除 —— MirExpr 平行 AST 世界完全消除」）。
+> 原表引用的 `typeck/check_mir.rs:18`、`mir/handlers.rs:978,1047,1140`、
+> `interpreter/builtins/mod.rs:650` 均已不成立——`check_mir.rs` 早已改为
+> 「零 MirExpr 桥接」消费 witness，`mir/handlers.rs` 也已拆成 `mir/handlers/`
+> 目录的五个子模块。表中那句「修复路径：MirExpr 可收缩为仅
+> orchestrate/pregel 数据构造类型」实际已被**直接删除**执行掉了。
+> ⇒ 保留它会让人以为还有一整条 MirExpr 迁移债要还，那是假的。
 
-| 违反 | 位置 | 说明 |
+### 遗留 1：双编译管线并存 —— **v0.104.6 D474 已解决**
+
+`cli::compile_and_opt` 此前每次编译都跑两条完整的 lowering 再逐条差分：
+
+| 路径 | 入口 | 规模 |
 |------|------|------|
-| typeck 依赖 MirExpr | `typeck/check_mir.rs:18` | Foundation 层（类型检查）依赖 Expression 层（MirExpr） |
-| handlers 用 MirExpr | `mir/handlers.rs:978,1047,1140` | Kernel 层（效果处理）用 Expression 层做 dispatch |
-| interpreter 用 MirExpr | `interpreter/builtins/mod.rs:650` | Runtime 层直接引用 Expression 层 |
-| 通配符 re-export | `mir/mod.rs:68` `pub use inst::*` | 命名空间污染 |
+| A（旧） | `parser_v3/emit*.rs` + `mir/lower.rs` | 6313 行 |
+| B（9 层） | `witness_to_fcfg` → FCFG → EHIR → Core → `lower_fcfg` | 4757 行 |
 
-**根因**：MirExpr 是旧 parse→lower 路径的产物，9 层架构用 Node<M> 替代。MirExpr 跨层使用是历史遗留，不是设计意图。
+差分绿且构造已 legalize ⇒ 走 9 层产出；否则**回落旧路径**。
+实测代价（debug build，300 个 task 的程序）：9 层开 317 ms / 关 213 ms，
+即影子管线 + 差分约占总耗时 **31%**。
 
-**修复路径**：当 9 层管线完全替代旧路径后，MirExpr 可收缩为仅 orchestrate/pregel 数据构造类型，handlers/interpreter 改用 CoreInst 或 Node<TypeInfo>。
+**D472 补齐了最后一批构造**（`worker` / `transaction` / `eval` / `aggregate` /
+`commit` / `rollback` / `pipe` / `orchestrate`），**D473 删除了回落机制**，
+**D474 把 parser 改成只产 witness** ⇒ **路径 A 整个消失**：
+
+- 生产路径 = **9 层唯一路径**（`mir::pipeline::compile_optimized`）——
+  CLI、`import`、runtime `eval`、REPL **四处全部**走它；
+  不做差分、不跑 EHIR / Core（那两层只用于统计）⇒ **31% 开销归零**；
+- 差分机制与 `MORA_9LAYER=0` 开关**一并退役** —— 差分的对照物（参考实现）
+  已不存在，保留它只会变成**恒真判据**；
+- `src/mir/legalization.rs`（显式合法性登记）与三态回落门**一并删除** ——
+  没有回落，就没有「已知缺口 vs 回归」需要区分；
+- 等价性改由**「期望输出」**判据承担（见上节）—— 它比差分**更强**：
+  差分只能发现「两条路径不一致」，期望输出直接钉住**正确值**。
+
+> **历史记档**：D474 的判据改写当场抓到三个真缺陷（`or`/`and` 短路不赋值、
+> `--opt=1` 丢裸字面量的值、parser 手术误删两条解析语义）—— 它们**两边一样错**，
+> 差分**结构上抓不到**。这是「退役差分必须同时换上期望输出判据」的直接证据。
+
+### 遗留 2：通配符 re-export —— **v0.104.6 D476 已解决**
+
+`src/mir/mod.rs` 的 `pub use inst::*;`（注释写「保持 `crate::mir::dst()`
+等旧路径」）是命名空间污染。
+
+**D476 取证后删除**：它其实**什么都没导出** ——
+`inst.rs` 里 MirInst 的元数据方法是 **inherent impl**
+（`impl MirInst { pub fn dst() … }`），而 inherent 方法**不能**被 glob 再导出，
+它们本来就随类型可达（`MirInst::dst()`）；模块级 pub 项只有 `dispatch` 一个，
+它真正的出口是 `handlers::mod` 的 `pub use crate::mir::inst::dispatch;`。
+
+⇒ 那行 glob 只是把 `dispatch` 额外提升到 `mir::` 根（**零消费者**），
+同时让注释里的「保持 `crate::mir::dst()` 等旧路径」成为**假话**
+（`mir::dst()` 从来不可用）。删除后 `mir::` 根只剩真正的 9 层 re-export。
+
+### 遗留 3：执行入口命名
+
+`run_mir` 这个名字暗示存在「线性执行器」，而自 v0.59 起仓库只有 DAG/BSP 一种
+执行实现（`src/mir/vm/mod.rs` 自陈：「`run_mir` 与 `run_dag*` 是**同一条路径**」）。
+v0.104.6 D467 已把主入口更名为 `execute`，但 `run_mir` 及其 100+ 调用点仍在，
+属于命名遗留而非功能缺陷。

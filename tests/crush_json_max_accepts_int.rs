@@ -36,7 +36,7 @@
 //! （D259 教训：收口不该顺手抹掉诊断信息）—— 负数仍报 `non-negative`，
 //! 非数值仍报 `must be a number, got <类型名>`。
 
-use std::path::PathBuf;
+use mora::test_support::TempDir;
 
 const NOISE: &[&str] = &[
     "Mora v",
@@ -49,14 +49,6 @@ const NOISE: &[&str] = &[
     "显式 API",
     "Trait",
 ];
-
-/// `Drop` 守卫：assert 失败时也要清理。
-struct WorkDir(PathBuf);
-impl Drop for WorkDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
 
 fn run(dir: &std::path::Path, src: &str) -> (i32, String, String) {
     let f = dir.join("a.mora");
@@ -88,10 +80,7 @@ fn run(dir: &std::path::Path, src: &str) -> (i32, String, String) {
 /// （`len()` 产 `Int`，修前报 "got int"）。
 #[test]
 fn d262_crush_json_accepts_float_int_and_len_valued_max() {
-    let dir = std::env::temp_dir().join(format!("mora_d262_{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("mkdir");
-    let _work = WorkDir(dir.clone());
+    let dir = TempDir::new("d262");
 
     for (label, src) in [
         ("float literal", "crush_json([1,2,3,4,5], 2.0)\n"),
@@ -116,10 +105,7 @@ fn d262_crush_json_accepts_float_int_and_len_valued_max() {
 /// ② 不回归：两种错误必须**各自保持可区分**（D259 教训）。
 #[test]
 fn d262_crush_json_keeps_the_two_errors_distinguishable() {
-    let dir = std::env::temp_dir().join(format!("mora_d262e_{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("mkdir");
-    let _work = WorkDir(dir.clone());
+    let dir = TempDir::new("d262e");
 
     // 负数：报「非负」而不是「不是数字」
     for src in ["crush_json([1,2,3], -1)\n", "crush_json([1,2,3], -1.0)\n"] {
@@ -143,10 +129,7 @@ fn d262_crush_json_keeps_the_two_errors_distinguishable() {
 /// —— 钉住「crush_json 是单点遗漏，不是这一带的系统性疏漏」。
 #[test]
 fn d262_control_group_siblings_already_accept_both_number_kinds() {
-    let dir = std::env::temp_dir().join(format!("mora_d262c_{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("mkdir");
-    let _work = WorkDir(dir.clone());
+    let dir = TempDir::new("d262c");
 
     for (label, src) in [
         ("range(1, 3)", "print(len(range(1, 3)))\n"),

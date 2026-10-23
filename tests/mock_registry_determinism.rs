@@ -34,20 +34,14 @@
 //! （同一个进程里 `RandomState` 是固定的）。所以关键判据是
 //! **起 N 个进程比对输出**。
 
+use mora::test_support::TempDir;
 use std::process::Command;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use mora::mock::{MockHandler, MockRegistry};
 use mora::value::Value;
 
-static SEQ: AtomicU64 = AtomicU64::new(0);
-
-fn work_dir(tag: &str) -> std::path::PathBuf {
-    let n = SEQ.fetch_add(1, Ordering::Relaxed);
-    let d = std::env::temp_dir().join(format!("mora_d405_{n}_{tag}"));
-    let _ = std::fs::remove_dir_all(&d);
-    std::fs::create_dir_all(&d).expect("建临时目录");
-    d
+fn work_dir(tag: &str) -> TempDir {
+    TempDir::new(tag)
 }
 
 fn native() -> MockHandler {

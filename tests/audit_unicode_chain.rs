@@ -37,15 +37,13 @@
 //! ④ 完整的转义表（`\b` `\f` `\/` `\uXXXX` + 代理对）也要能反转义。
 
 use mora::audit::{AuditEvent, AuditSink, JsonlAuditSink};
-use std::path::PathBuf;
+use mora::test_support::TempDir;
 
-struct WorkDir(PathBuf);
+struct WorkDir(TempDir);
 
 impl WorkDir {
     fn new(tag: &str) -> Self {
-        let d = std::env::temp_dir().join(format!("mora_d207_{tag}"));
-        let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(&d).expect("建目录");
+        let d = TempDir::new(tag);
         WorkDir(d)
     }
 }

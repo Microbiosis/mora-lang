@@ -713,6 +713,14 @@ impl Interpreter {
                 let (imported_func, witnesses) = crate::parser_v3::ParserV3::compile(&source)?;
                 let _type_errs =
                     crate::typeck::check_mir::check_program_witnesses_bidirectional(&witnesses);
+                // v0.104.6 D473：import 走**9 层唯一路径**（此前直接消费
+                // `ParserV3::compile` 的 `emit.rs` 直出产物 —— 旧路径在生产里
+                // 始终是活的，不只作为回落）。
+                let imported_func = crate::mir::pipeline::compile_optimized(
+                    &imported_func,
+                    &witnesses,
+                    crate::mir::ssa::OptLevel::default(),
+                );
                 // 子 import 的 env 是当前 env 的克隆（与 with 块语义一致）
                 let mut child_env = env.clone();
                 // v0.75.9: 包裹 Arc 走全局 DAG 缓存
@@ -993,8 +1001,8 @@ impl Interpreter {
                 // 还写不完 —— 留在 pending 里等下一行。
                 continue;
             }
-            let func = match crate::parser_v3::ParserV3::compile(&pending) {
-                Ok((f, _ws)) => f,
+            let (func, func_witnesses) = match crate::parser_v3::ParserV3::compile(&pending) {
+                Ok((f, ws)) => (f, ws),
                 Err(_) => {
                     // 关键字配平说该完整、parse 却失败：是真语法错，丢掉重来，
                     // 否则用户会被这段坏输入困住。
@@ -1003,6 +1011,17 @@ impl Interpreter {
                     continue;
                 }
             };
+            // v0.104.6 D473：REPL 走**9 层唯一路径**（此前直接消费
+            // `ParserV3::compile` 的 `emit.rs` 直出产物）。
+            //
+            // ⚠ REPL 的结构是「每行单独编译 + 累积 `repl_task_defs`」，故
+            // 9 层产出里的 `TaskDef` 指令同样被收集（`MirInst::TaskDef` 在
+            // 两条路径上同形）—— 累积机制不变。
+            let func = crate::mir::pipeline::compile_optimized(
+                &func,
+                &func_witnesses,
+                crate::mir::ssa::OptLevel::default(),
+            );
 
             // v0.104.6 D17：把「已接受的源码 + 本次输入」当**一个完整程序**
             // 重新编译送检，否则类型检查器看不见会话里已绑定的变量。

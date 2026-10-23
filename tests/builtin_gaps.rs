@@ -41,6 +41,7 @@
 //! 执行器缺陷 E1 连带掩盖（见 `builtin_impls.rs::call_builtin_str` 的注释）；
 //! `int/float/bool` 则是从一开始就没有任何测试碰过。
 
+use mora::test_support::TempFile;
 use std::sync::Arc;
 
 use mora::interpreter::Interpreter;
@@ -488,15 +489,16 @@ fn cli_path_reports_no_undefined_builtin() {
 // ─────────────────────────────────────────────────────────────────────
 
 /// 写一个临时 .mora 文件，经真实 CLI 跑，返回 `(exit_code, 合并输出)`。
-fn cli_run_src(name: &str, src: &str) -> (i32, String) {
+fn cli_run_src(_name: &str, src: &str) -> (i32, String) {
     use std::process::Command;
-    let path = std::env::temp_dir().join(format!("mora_builtin_gaps_{name}.mora"));
-    std::fs::write(&path, src).expect("write temp .mora");
+    // v0.104.6 D475：这里要的是一个**文件**（.mora 脚本），不是目录 ⇒ 用 TempFile。
+    let tmp = TempFile::new("builtin_gaps", "p.mora");
+    let path = tmp.path();
+    std::fs::write(path, src).expect("write temp .mora");
     let out = Command::new(env!("CARGO_BIN_EXE_mora"))
-        .arg(&path)
+        .arg(path)
         .output()
         .expect("run temp .mora");
-    let _ = std::fs::remove_file(&path);
     let combined = format!(
         "{}{}",
         String::from_utf8_lossy(&out.stdout),

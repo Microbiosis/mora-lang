@@ -61,26 +61,12 @@
 //! `compose_prompt` 相反）——这类缺口**危害小**，但会让用户以为
 //! 「订阅了但没文档 = 大概不能用」。
 
+use mora::test_support::TempDir;
 use std::process::Command;
-use std::sync::atomic::{AtomicU64, Ordering};
-
-static SEQ: AtomicU64 = AtomicU64::new(0);
-
-fn slug(s: &str) -> String {
-    let mut out = String::from("d345_");
-    out.extend(
-        s.chars()
-            .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
-            .take(40),
-    );
-    out
-}
 
 /// 独立进程 + 隔离 `HOME`；取 stdout **全部**实质行（D330 教训）。
 fn ev(body: &str) -> (i32, String) {
-    let n = SEQ.fetch_add(1, Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!("d345b_{}_{}", n, slug(body)));
-    std::fs::create_dir_all(&dir).expect("建目录");
+    let dir = TempDir::new("d345b_");
     let p = dir.join("p.mora");
     std::fs::write(&p, body).expect("写探针");
     let home = dir.join("home");

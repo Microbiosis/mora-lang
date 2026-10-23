@@ -86,50 +86,31 @@ fn d120_solve_binding_yields_a_real_value() {
     );
 }
 
-/// ⚠ **路径一致性**：两条编译路径的**执行结果**必须一致。
+/// ⚠ **绝对值**：`solve` 之后的值必须真的被取到。
 ///
-/// 本缺陷的隐蔽之处正在于此 —— 直出路径一直是对的，只测直出路径会全绿。
-/// 第一版测试就是栽在这：五条判据全用直出路径，反向验证时**一条没红**。
+/// 本缺陷的隐蔽之处正在于此 —— 旧实现里 9 层管线**拿不到** solve 的值
+/// （`solve` 写的 dst 与 `let` 绑定的 dst 对不上），而单遍直出路径一直
+/// 是对的 ⇒ 只测直出路径会全绿。
 ///
-/// ℹ 刻意**不**改 `MORA_9LAYER` 环境变量：`cargo test` 里测试并发执行，
-/// 改进程级环境变量会互相干扰（既有的
-/// `algebraic_effects::two_compile_paths_agree_on_handle_value` 同理）。
+/// v0.104.6 **D474**：原判据里的「两条编译路径执行结果一致」**已作废** ——
+/// D474 把差分机制整个退役，parser 只产 witness、MIR 全部由 9 层产出 ⇒
+/// 两个入口**走同一条路** ⇒ 那条比对成了**恒真**。
+///
+/// ⇒ 换成**绝对值**判据：直接断言程序算出的值。
 #[test]
-fn d120_both_compile_paths_agree() {
-    use mora::mir::pipeline::inst_category_pub;
-
+fn d120_solve_binding_takes_the_value() {
     let src = "let r = solve { unify(1, 1) }\nlet after = 42\nafter";
 
-    // 路径 1：单遍直出（缺陷不存在，一直是对的）
-    let (direct, dwit) = ParserV3::compile(src).expect("直出路径编译");
-    // 路径 2：9 层管线（缺陷住在这里）
-    let (pipelined, pwit) = mora::cli::compile_and_opt(src, None).expect("9 层管线编译");
+    let (compiled, wit) = mora::cli::compile_and_opt(src, None).expect("编译");
     assert!(
-        check_program_witnesses_bidirectional(&dwit).is_empty(),
-        "直出路径 typeck 应无错"
-    );
-    assert!(
-        check_program_witnesses_bidirectional(&pwit).is_empty(),
-        "9 层管线 typeck 应无错"
+        check_program_witnesses_bidirectional(&wit).is_empty(),
+        "typeck 应无错"
     );
 
-    // 逐指令比类别（寄存器号允许不同 —— 两条路径分配策略本就不同）
-    let direct_cats: Vec<&str> = direct.body.iter().map(inst_category_pub).collect();
-    let pipe_cats: Vec<&str> = pipelined.body.iter().map(inst_category_pub).collect();
-    assert_eq!(
-        direct_cats, pipe_cats,
-        "两条编译路径产出的指令类别序列必须一致（D120 就是这里脱节的）"
-    );
-
-    // 且**执行结果**一致 —— 类别相同不代表求值相同（D120 的两条路径
-    // 指令类别完全一样，差别在 Solve 写的 dst 与 let 绑定的 dst 对不上）
-    let direct_val = run_source(direct, src);
-    let pipe_val = run_source(pipelined, src);
-    assert_eq!(
-        direct_val, pipe_val,
-        "两条路径的执行结果分叉（9 层管线的 solve 绑定拿不到值）"
-    );
-    assert_eq!(pipe_val, "Float(42.0)", "9 层管线必须取到 solve 之后的值");
+    // **执行结果**必须是 42.0 —— D120 的两条路径指令类别完全一样，
+    // 差别在 `Solve` 写的 dst 与 `let` 绑定的 dst 对不上（只有执行能看出来）。
+    let val = run_source(compiled, src);
+    assert_eq!(val, "Float(42.0)", "必须取到 solve 之后的值");
 }
 
 /// 对照组：**语句位置**的 `solve { … }` 一直是对的（D120 之前也正常）。

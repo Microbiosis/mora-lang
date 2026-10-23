@@ -53,12 +53,11 @@
 //! `compose` / `partial` 设为**变参**以容纳 D80 的回归）⇒ **语义/路线图决定，
 //! 本轮只报告不实施**。
 
+use mora::test_support::TempDir;
 use std::process::Command;
 
 fn run(src: &str, tag: &str) -> (i32, String) {
-    let dir = std::env::temp_dir().join(format!("mora_d328_{}", slug(tag)));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("建目录");
+    let dir = TempDir::new(tag);
     let p = dir.join("p.mora");
     std::fs::write(&p, src).expect("写探针");
     let exe = concat!(env!("CARGO_MANIFEST_DIR"), "/target/debug/mora.exe");
@@ -88,12 +87,6 @@ fn run(src: &str, tag: &str) -> (i32, String) {
         })
         .collect();
     (out.status.code().unwrap_or(-1), all.join(" | "))
-}
-
-fn slug(s: &str) -> String {
-    s.chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
-        .collect()
 }
 
 /// **主判据**：高阶方法拿到**元数不匹配**的闭包或**非闭包**，必须报错。
@@ -228,7 +221,7 @@ fn d328_status_quo_partial_and_compose_results_are_unappliable() {
         "let c = compose(fn(x) x+1 end, fn(x) x*2 end)\nlet v = c(3)\nprint(v)\n",
         "let c = compose(fn(x) x+1 end, fn(x) x*2 end)\nlet v = c(1,2,3)\nprint(v)\n",
     ] {
-        let (code, got) = run(src, &slug(src));
+        let (code, got) = run(src, "case");
         assert_eq!(
             code, 2,
             "**D328 现状**：`partial` / `compose` 的返回值当前**无法被调用**\

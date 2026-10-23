@@ -38,7 +38,7 @@
 //! ② 没有标注的**仍**回落 `<inferred>`（**不猜** —— 这是「诚实」这一半）；
 //! ③ 名字**整词**匹配（`let ax` 不能匹配 `a`）—— 防止张冠李戴。
 
-use std::path::PathBuf;
+use mora::test_support::TempDir;
 use std::process::{Command, Stdio};
 
 fn json_string(s: &str) -> String {
@@ -60,10 +60,8 @@ fn frame(json: &str) -> String {
     format!("Content-Length: {}\r\n\r\n{}", json.len(), json)
 }
 
-fn temp_dir() -> PathBuf {
-    let d = std::env::temp_dir().join("mora_d193_lsp");
-    std::fs::create_dir_all(&d).expect("建临时目录");
-    d
+fn temp_dir() -> TempDir {
+    TempDir::new("mora_d193_lsp")
 }
 
 /// 打开一个文档，对若干位置取 hover，返回 `(id, hover 文本)` 列表。

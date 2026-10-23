@@ -35,25 +35,11 @@
 //! 下一 token 是字符串 ⇒ `TokenType::Document`（块语句）；
 //! 否则退化成 `Identifier`（模块名 `document.parse(…)`）。
 
+use mora::test_support::TempDir;
 use std::process::Command;
-use std::sync::atomic::{AtomicU64, Ordering};
-
-static SEQ: AtomicU64 = AtomicU64::new(0);
-
-fn slug(s: &str) -> String {
-    let mut out = String::from("d357_");
-    out.extend(
-        s.chars()
-            .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
-            .take(40),
-    );
-    out
-}
 
 fn ev(body: &str) -> (i32, String) {
-    let n = SEQ.fetch_add(1, Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!("d357_{}_{}", n, slug(body)));
-    std::fs::create_dir_all(&dir).expect("建目录");
+    let dir = TempDir::new("d357_");
     let p = dir.join("p.mora");
     std::fs::write(&p, body).expect("写探针");
     let home = dir.join("home");

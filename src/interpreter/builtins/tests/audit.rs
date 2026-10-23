@@ -5,6 +5,7 @@
 mod tests_v0421_audit {
     use crate::audit::{AuditSink, JsonlAuditSink};
     use crate::interpreter::Interpreter;
+    use crate::test_support::TempDir;
     use crate::value::Value;
     use std::sync::Arc;
 
@@ -23,7 +24,7 @@ mod tests_v0421_audit {
     /// `&path` 用法（`JsonlAuditSink::new_fresh(&path)` / `remove_file`）
     /// 一字不改。
     struct TempLog {
-        dir: PathBuf,
+        dir: TempDir,
         file: PathBuf,
     }
 
@@ -50,21 +51,13 @@ mod tests_v0421_audit {
 
     /// v0.42.1: sandbox.audit_emit / audit_flush / audit_verify builtin tests
     fn temp_log_path(name: &str) -> TempLog {
-        let dir = std::env::temp_dir().join(format!(
-            "mora_audit_builtin_{}_{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let dir = TempDir::new("mora_audit_builtin_");
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join(name);
         TempLog { dir, file }
     }
 
     use std::path::{Path, PathBuf};
-    use std::time::UNIX_EPOCH;
 
     #[test]
     fn audit_emit_writes_event_and_returns_true() {

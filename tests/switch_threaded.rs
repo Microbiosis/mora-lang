@@ -8,6 +8,7 @@
 //! 1. **等价性** —— 全量 e2e fixture 在快路径开/关下 stdout 与退出码逐字节相同。
 //! 2. **性能护栏** —— 1M 迭代基准，快路径必须显著快于基线，防止优化被静默回退。
 
+use mora::test_support::TempFile;
 use std::path::Path;
 
 /// 跑一个 fixture，返回 `(stdout, exit_code)`；`no_threading` 控制快路径开关。
@@ -94,12 +95,13 @@ fn switch_threading_handles_forking_control_flow() {
             "5.0\n",
         ),
     ] {
-        let path = std::env::temp_dir().join("mora_threading_case.mora");
-        std::fs::write(&path, src).expect("写临时脚本");
+        // v0.104.6 D475：要的是**文件** ⇒ TempFile。
+        let tmp = TempFile::new("threading_case", "p.mora");
+        let path = tmp.path();
+        std::fs::write(path, src).expect("写临时脚本");
         let p = path.to_string_lossy().into_owned();
         let off = run(&p, true);
         let on = run(&p, false);
-        let _ = std::fs::remove_file(&path);
         assert_eq!(
             (off.1, off.0.clone()),
             (on.1, on.0),
@@ -120,8 +122,9 @@ fn switch_threading_handles_forking_control_flow() {
 #[ignore = "性能护栏：需 --release 二进制；由 scripts/ 或 CI 显式运行"]
 fn switch_threading_is_faster_on_tight_loop() {
     let src = "let s = 0i\nlet j = 0i\nwhile j < 1000000\n  assign s = s + 1i\n  assign j = j + 1i\nend\nprint(s)\n";
-    let path = std::env::temp_dir().join("mora_threading_bench.mora");
-    std::fs::write(&path, src).expect("写基准脚本");
+    let tmp = TempFile::new("threading_bench", "p.mora");
+    let path = tmp.path();
+    std::fs::write(path, src).expect("写基准脚本");
     let p = path.to_string_lossy().into_owned();
 
     let exe = env!("CARGO_BIN_EXE_mora");
@@ -143,7 +146,6 @@ fn switch_threading_is_faster_on_tight_loop() {
 
     let off = median(true);
     let on = median(false);
-    let _ = std::fs::remove_file(&path);
 
     assert!(
         on < off * 0.85,

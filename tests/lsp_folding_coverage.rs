@@ -21,13 +21,11 @@
 //! **`for` 在 witness 层是 `Loop`（`{ var, iterable, body }`）而**不是** `For`
 //! —— 按 `For` 写 match 分支永远匹配不到（我最初就是这么写的）。
 
-use std::path::PathBuf;
+use mora::test_support::TempDir;
 use std::process::Command;
 
-fn temp_dir() -> PathBuf {
-    let d = std::env::temp_dir().join("mora_d136_fold");
-    std::fs::create_dir_all(&d).expect("create");
-    d
+fn temp_dir() -> TempDir {
+    TempDir::new("mora_d136_fold")
 }
 fn frame(json: &str) -> String {
     let n = json.len();

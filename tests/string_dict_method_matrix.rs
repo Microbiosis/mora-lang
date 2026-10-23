@@ -36,12 +36,11 @@
 //! `upper`/`lower` 对 CJK 正确；`len` 按**字符**不按字节（CJK 串 `"中文abc".len()`
 //! → `5`）。
 
+use mora::test_support::TempDir;
 use std::process::Command;
 
 fn run(src: &str, tag: &str) -> (i32, String) {
-    let dir = std::env::temp_dir().join(format!("mora_d326_{}", slug(tag)));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("建目录");
+    let dir = TempDir::new(tag);
     let p = dir.join("p.mora");
     std::fs::write(&p, src).expect("写探针");
     let exe = concat!(env!("CARGO_MANIFEST_DIR"), "/target/debug/mora.exe");
@@ -69,12 +68,6 @@ fn run(src: &str, tag: &str) -> (i32, String) {
         .replace(&p.to_string_lossy().to_string(), "<TMP>")
         .to_string();
     (out.status.code().unwrap_or(-1), first)
-}
-
-fn slug(s: &str) -> String {
-    s.chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
-        .collect()
 }
 
 fn ev(e: &str) -> (i32, String) {

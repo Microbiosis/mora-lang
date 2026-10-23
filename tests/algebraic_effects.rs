@@ -188,46 +188,34 @@ fn plain_let_binding_unaffected() {
 }
 
 // ===================================================================
-// 架构不变量：两条编译路径必须等价
+// 架构不变量：handle 的结果绑定必须自洽
 // ===================================================================
 
 /// **本文件最重要的一条。**
 ///
 /// D35 之所以能活下来，正是因为事故前只有 9 层管线错、`emit.rs` 单遍直出
-/// 对 —— 任何只跑一条路径的测试都看不见它。这里把「两条路径等价」写成
-/// 显式断言：`MORA_9LAYER=0`（回落原管线）与默认（9 层）产出的**指令类别
-/// 序列**必须一致。
+/// 对 —— 任何只跑一条路径的测试都看不见它。
 ///
-/// `MORA_9LAYER` 是进程级环境变量，而 `cargo test` 里多个测试并发跑会互相
-/// 干扰 —— 故本测试**不**改环境变量，而是直接对比两个可单点调用的入口：
-/// `ParserV3::compile`（单遍直出）与 `cli::compile_and_opt`（9 层管线）。
+/// v0.104.6 **D474**：原判据是「两条编译路径产出的**指令类别序列**必须
+/// 一致」（`ParserV3::compile` vs `cli::compile_and_opt`）。D474 把差分
+/// 机制整个退役 —— parser 只产 witness、MIR 全部由 9 层产出 ⇒ 这两个
+/// 入口**走同一条路** ⇒ 那条比对成了**恒真**。
+///
+/// ⇒ 换成两条**绝对值**判据（不依赖任何对照物）：
+/// ① `handle` 的结果寄存器**必须**被真正写出（k_dst 自洽）；
+/// ② 程序**必须**算出正确的值。
 #[test]
-fn two_compile_paths_agree_on_handle_value() {
+fn handle_result_binding_is_self_consistent() {
     let src = "let r = handle a { 5 } { 7 }\nlet z = r * 2\nprint(z)";
 
-    // 路径 1：单遍直出
-    let (direct, dwit) = ParserV3::compile(src).expect("直出路径编译");
-
-    // 路径 2：9 层管线
-    let (pipelined, pwit) = compile_and_opt(src, None).expect("9 层管线编译");
-
-    // 两条路径都要通过 typeck
-    let derrs = check_program_witnesses_bidirectional(&dwit);
-    let perrs = check_program_witnesses_bidirectional(&pwit);
-    assert!(derrs.is_empty(), "直出路径 typeck: {derrs:?}");
-    assert!(perrs.is_empty(), "9 层管线 typeck: {perrs:?}");
-
-    // 逐指令比类别（寄存器号允许不同 —— 两条路径的分配策略本就不同，
-    // 这与 `mir::pipeline::differential_check` 的口径一致）
-    use mora::mir::pipeline::inst_category_pub;
-    let direct_cats: Vec<&str> = direct.body.iter().map(inst_category_pub).collect();
-    let pipe_cats: Vec<&str> = pipelined.body.iter().map(inst_category_pub).collect();
-    assert_eq!(
-        direct_cats, pipe_cats,
-        "两条编译路径产出的指令类别序列必须一致（D35 就是这里脱节的）"
+    let (pipelined, pwit) = compile_and_opt(src, None).expect("编译");
+    assert!(
+        check_program_witnesses_bidirectional(&pwit).is_empty(),
+        "typeck 应无错: {:?}",
+        check_program_witnesses_bidirectional(&pwit)
     );
 
-    // 且 Handle 指令的 k_dst 必须在**该路径内**被某条指令真正写出
+    // ① Handle 指令的 k_dst 必须在**该路径内**被某条指令真正写出
     let handle_dst = pipelined
         .body
         .iter()
@@ -235,7 +223,7 @@ fn two_compile_paths_agree_on_handle_value() {
             mora::mir::MirInst::Handle { k_dst, .. } => Some(*k_dst),
             _ => None,
         })
-        .expect("9 层管线应产出 Handle 指令");
+        .expect("应产出 Handle 指令");
     let written_by_define = pipelined.body.iter().any(|i| {
         matches!(i, mora::mir::MirInst::Define(_, r) if *r == handle_dst)
             || matches!(i, mora::mir::MirInst::Var(r, _) if *r == handle_dst)
@@ -243,6 +231,15 @@ fn two_compile_paths_agree_on_handle_value() {
     assert!(
         written_by_define,
         "引用 handle 结果的指令（k_dst={handle_dst}）必须与 Handle 的写入端一致"
+    );
+
+    // ② **绝对值**：程序必须算出正确的值。
+    //    `handle a { 5 } { 7 }` 的体返回 5（handler 只在效果未处理时兜底），
+    //    故 `r = 5`、`z = r * 2 = 10`。
+    assert_eq!(
+        run_production("let r = handle a { 5 } { 7 }\nlet z = r * 2\nz").unwrap(),
+        "Float(10.0)",
+        "handle 体的值必须真的被绑定到 r 并参与运算"
     );
 }
 

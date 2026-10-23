@@ -83,24 +83,14 @@
 //! 输出与 `HashMap` 的随机迭代序**无关**（或已排序）。实测一次即命中，
 //! 但**只跑一次不算证据**，故本条不钉它（见文件末尾「未钉的观察」）。
 
+use mora::test_support::TempDir;
 use std::process::Command;
-use std::sync::atomic::{AtomicU64, Ordering};
-
-static SEQ: AtomicU64 = AtomicU64::new(0);
-
-fn slug(s: &str) -> String {
-    s.chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
-        .collect()
-}
 
 /// 每个用例**独立进程**（memory 是有状态面，串在一个进程里会互相污染），
 /// 且 `HOME` / `USERPROFILE` 指向临时目录 —— 避免 `memory.remember` 那几个
 /// 入口写到用户真实的 `~/.mora/`。
 fn run(body: &str, tag: &str) -> (i32, String) {
-    let n = SEQ.fetch_add(1, Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!("mora_d332_mem_{}_{}", n, slug(tag)));
-    std::fs::create_dir_all(&dir).expect("建目录");
+    let dir = TempDir::new(tag);
     let p = dir.join("p.mora");
     std::fs::write(&p, body).expect("写探针");
     let home = dir.join("home");
@@ -143,9 +133,7 @@ fn run(body: &str, tag: &str) -> (i32, String) {
 /// 第一行，其余断言全部拿不到内容，症状是「exit 对、文本缺」——
 /// 极易误判成产品行为变了。这里一次取全。
 fn ev_stdout(body: &str) -> (i32, String) {
-    let n = SEQ.fetch_add(1, Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!("mora_d332_out_{}_{}", n, slug(body)));
-    std::fs::create_dir_all(&dir).expect("建目录");
+    let dir = TempDir::new("mora_d332_out_");
     let p = dir.join("p.mora");
     std::fs::write(&p, body).expect("写探针");
     let home = dir.join("home");

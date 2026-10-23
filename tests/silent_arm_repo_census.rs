@@ -42,6 +42,7 @@
 //! - 源码层：`dispatch.rs` 的最终兜底**含 `Err(`**
 //! - 行为层：错拼 flag 静默回落（D380 的结论仍然成立）
 
+use mora::test_support::TempDir;
 use std::process::Command;
 
 fn mora(dir: &std::path::Path, args: &[&str]) -> (i32, String) {
@@ -166,8 +167,7 @@ fn d381_call_dispatch_final_fallback_errors() {
 /// D380 收紧后它必然变红；红得对，改断言才是对的。
 #[test]
 fn d381_misspelled_flag_is_now_rejected() {
-    let dir = std::env::temp_dir().join("d381probe");
-    let _ = std::fs::remove_dir_all(&dir);
+    let dir = TempDir::new("d381probe");
     std::fs::create_dir_all(dir.join(".mora").join("recordings")).unwrap();
     std::fs::write(
         dir.join(".mora").join("recordings").join("r1.jsonl"),
@@ -195,8 +195,7 @@ fn d381_misspelled_flag_is_now_rejected() {
 /// **反向对照**：正确用法必须产出 Markdown（证明上一条不是「怎么写都回落」）。
 #[test]
 fn d381_correct_flag_still_produces_markdown() {
-    let dir = std::env::temp_dir().join("d381probe2");
-    let _ = std::fs::remove_dir_all(&dir);
+    let dir = TempDir::new("d381probe2");
     std::fs::create_dir_all(dir.join(".mora").join("recordings")).unwrap();
     std::fs::write(
         dir.join(".mora").join("recordings").join("r1.jsonl"),

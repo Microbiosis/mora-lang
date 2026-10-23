@@ -246,25 +246,22 @@ impl RefineRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::TempDir;
 
-    fn write_temp_script(name: &str, content: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "mora_refine_{}_{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
+    /// 返回 **(守卫, 路径)** —— 守卫必须活得比路径久。
+    ///
+    /// v0.104.6 D475：此前只返回裸路径，守卫在函数返回时就析构 ⇒ 目录连同
+    /// 脚本当场被删，后续断言拿到的是「文件不存在」。
+    fn write_temp_script(name: &str, content: &str) -> (TempDir, std::path::PathBuf) {
+        let dir = TempDir::new("mora_refine_");
         let path = dir.join(name);
         std::fs::write(&path, content).unwrap();
-        path
+        (dir, path)
     }
 
     #[test]
     fn refine_session_real_file_io() {
-        let script = write_temp_script("demo.mora", "task main()\n  print(\"hi\")\n");
+        let (_guard, script) = write_temp_script("demo.mora", "task main()\n  print(\"hi\")\n");
         let mut session = RefineSession::new(&script);
         let refine_dir = session.refine_dir.clone();
         let step = session.refine("add greeting").expect("refine 调用应成功");
@@ -295,7 +292,7 @@ mod tests {
 
     #[test]
     fn refine_iteration_increments() {
-        let script = write_temp_script("iter.mora", "task main()\n  pass\n");
+        let (_guard, script) = write_temp_script("iter.mora", "task main()\n  pass\n");
         let mut session = RefineSession::new(&script);
         let i1 = {
             let s = session.refine("first").unwrap();
@@ -318,7 +315,7 @@ mod tests {
 
     #[test]
     fn refine_creates_separate_refined_files() {
-        let script = write_temp_script("separate.mora", "original\n");
+        let (_guard, script) = write_temp_script("separate.mora", "original\n");
         let mut session = RefineSession::new(&script);
         let p1 = session.refine("v1").unwrap().refined_path.clone();
         let p2 = session.refine("v2").unwrap().refined_path.clone();
@@ -349,7 +346,7 @@ mod tests {
 
     #[test]
     fn refine_many_creates_n_candidates() {
-        let script = write_temp_script("many.mora", "original\n");
+        let (_guard, script) = write_temp_script("many.mora", "original\n");
         let mut session = RefineSession::new(&script);
         let steps = session.refine_many("add greeting", 3).unwrap();
         assert_eq!(steps.len(), 3, "应生成 3 个候选");
@@ -375,7 +372,7 @@ mod tests {
 
     #[test]
     fn refine_many_validates_count() {
-        let script = write_temp_script("many_err.mora", "x\n");
+        let (_guard, script) = write_temp_script("many_err.mora", "x\n");
         let mut session = RefineSession::new(&script);
         assert!(session.refine_many("x", 0).is_err());
         assert!(session.refine_many("x", 27).is_err());
@@ -385,7 +382,7 @@ mod tests {
     #[test]
     fn refine_single_keeps_legacy_filename() {
         // count=1（refine() 兼容路径）保持旧文件名格式 <stem>.refined.<n>.mora
-        let script = write_temp_script("legacy.mora", "x\n");
+        let (_guard, script) = write_temp_script("legacy.mora", "x\n");
         let mut session = RefineSession::new(&script);
         let step = session.refine("v1").unwrap();
         assert!(
@@ -400,8 +397,8 @@ mod tests {
 
     #[test]
     fn refine_registry_multi_session() {
-        let script1 = write_temp_script("s1.mora", "1\n");
-        let script2 = write_temp_script("s2.mora", "2\n");
+        let (_guard1, script1) = write_temp_script("s1.mora", "1\n");
+        let (_guard2, script2) = write_temp_script("s2.mora", "2\n");
 
         let mut registry = RefineRegistry::new();
         registry.get_or_create(&script1).refine("a").unwrap();
@@ -418,7 +415,7 @@ mod tests {
 
     #[test]
     fn refine_step_to_dict_contains_all_fields() {
-        let script = write_temp_script("dict.mora", "x\n");
+        let (_guard, script) = write_temp_script("dict.mora", "x\n");
         let mut session = RefineSession::new(&script);
         let step = session.refine("test").unwrap();
         let d = step.to_dict();

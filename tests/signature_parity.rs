@@ -21,6 +21,7 @@
 //!   * 库内 `run_mir` **绕过 typeck**（`main.rs:409` 才跑检查），所以本文件
 //!     比的是「声明」与「运行期值」两侧，运行期一侧用库内路径即可。
 
+use mora::test_support::TempFile;
 use std::sync::Arc;
 
 use mora::interpreter::Interpreter;
@@ -277,13 +278,14 @@ fn print_param_union_covers_every_displayable_value_type() {
     ];
     let mut failures = Vec::new();
     for (name, src) in cases {
-        let path = std::env::temp_dir().join(format!("mora_print_{name}.mora"));
-        std::fs::write(&path, src).expect("write temp .mora");
+        // v0.104.6 D475：要的是**文件** ⇒ TempFile。
+        let tmp = TempFile::new("signature_parity", "p.mora");
+        let path = tmp.path();
+        std::fs::write(path, src).expect("write temp .mora");
         let out = Command::new(env!("CARGO_BIN_EXE_mora"))
-            .arg(&path)
+            .arg(path)
             .output()
             .expect("run temp .mora");
-        let _ = std::fs::remove_file(&path);
         let combined = format!(
             "{}{}",
             String::from_utf8_lossy(&out.stdout),

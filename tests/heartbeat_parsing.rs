@@ -29,6 +29,7 @@
 //! （D334 / D389 逐一补齐）。
 //! ⇒ 一旦接线就等于开了一个**绕过沙箱的文件读**口子。已写进模块 doc。
 
+use mora::test_support::{TempDir, TempFile};
 use std::path::{Path, PathBuf};
 
 use mora::heartbeat::{load_heartbeat, parse_heartbeat};
@@ -124,9 +125,7 @@ fn d402_completion_ratio_correct() {
 /// **真实文件**加载路径可用，`source` 被记录。
 #[test]
 fn d402_load_real_file_records_source() {
-    let dir = std::env::temp_dir().join("mora_d402_hb");
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("建目录");
+    let dir = TempDir::new("mora_d402_hb");
     let path: PathBuf = dir.join("HEARTBEAT.md");
     std::fs::write(&path, "# H\n\n- [x] first\n- [ ] second\n").expect("写文件");
 
@@ -140,9 +139,10 @@ fn d402_load_real_file_records_source() {
 /// **不存在的文件**给出点名路径的错误。
 #[test]
 fn d402_missing_file_error_names_path() {
-    let p = std::env::temp_dir().join("mora_d402_missing_hb.md");
-    let _ = std::fs::remove_file(&p);
-    let err = load_heartbeat(&p).expect_err("不存在的文件应报错");
+    // 要的是**一个不存在的文件路径** ⇒ TempFile（只建父目录，文件本身不建）。
+    let tmp = TempFile::new("d402_missing_hb", "mora_d402_missing_hb.md");
+    let p = tmp.path();
+    let err = load_heartbeat(p).expect_err("不存在的文件应报错");
     let msg = err.to_string();
     assert!(
         msg.contains("read ") && msg.contains("mora_d402_missing_hb.md"),

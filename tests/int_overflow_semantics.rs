@@ -41,15 +41,14 @@
 //! 由解释器报 `MoraError`（见 `tests/jit_compile.rs::
 //! jit_int_add_overflow_bails_instead_of_wrapping`）。
 
+use mora::test_support::TempDir;
 use std::process::Command;
 
 /// i64::MAX + 1 —— 唯一能触发 i64 加法溢出的用户程序。
 const OVERFLOW_SRC: &str = "let a = 9223372036854775807i\nprint(a + 1i)\n";
 
 fn run(src: &str, tag: &str) -> (i32, String) {
-    let dir = std::env::temp_dir().join(format!("mora_d468_{tag}"));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("建目录");
+    let dir = TempDir::new(tag);
     let p = dir.join("p.mora");
     std::fs::write(&p, src).expect("写探针");
     let exe = concat!(env!("CARGO_MANIFEST_DIR"), "/target/debug/mora.exe");

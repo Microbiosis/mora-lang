@@ -61,11 +61,24 @@ pub mod witness;
 // v0.59: DAG IR — dataflow analysis from linear MIR
 pub mod dag;
 pub mod handlers;
-mod inst; // v0.75.56: MirInst metadata + dispatch（经 handlers::inst re-export）
-pub use inst::*; // 保持 crate::mir::dst() 等旧路径
+// v0.75.56: MirInst metadata + dispatch。
+//
+// v0.104.6 D476：删除 `pub use inst::*;`（通配符 re-export）。
+//
+// **它其实什么都没导出**：`inst.rs` 里 MirInst 的元数据方法是
+// **inherent impl**（`impl MirInst { pub fn dst() … }`）—— inherent 方法
+// **不能**被 glob 再导出，它们本来就随类型可达（`MirInst::dst()`）。
+// 模块级 pub 项只有 `dispatch` 一个，而它真正的出口是
+// `handlers::mod` 的 `pub use crate::mir::inst::dispatch;`。
+//
+// ⇒ `pub use inst::*;` 把 `dispatch` 额外提升到 `mir::` 根（**零消费者**），
+// 同时让注释里的「保持 crate::mir::dst() 等旧路径」成为**假话**
+// （`mir::dst()` 从来不可用）。
+//
+// 收掉它 = 命名空间不再被污染：`mir::` 根只剩真正的 9 层 re-export。
+mod inst;
 pub mod vm;
 // v0.104.6: 9 层管线显式合法性登记（MLIR ConversionTarget 的 Mora 侧对应）
-pub mod legalization;
 // v0.104.6: 寄存器分配器（槽位复用；此前 alloc_reg 是单调计数器、从不复用）
 pub mod regalloc;
 
@@ -521,9 +534,8 @@ pub enum MirInst {
         replay_path: Option<String>,
     },
 
-    /// v0.55: skill def 已删除（v0.103）—— 零 producer 死 IR：三个生产路径
-    /// 均无构造点，能力由 `skill.*` builtin 承担。
-
+    // v0.55: skill def 已删除（v0.103）—— 零 producer 死 IR：三个生产路径
+    // 均无构造点，能力由 `skill.*` builtin 承担。
     /// α.8: prompt section — 扫描 body，构建 Value::PromptSection 到环境。
     PromptSection {
         name: String,

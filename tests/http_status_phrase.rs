@@ -43,22 +43,22 @@
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
-use std::path::PathBuf;
 
 use mora::http_server::status_text;
+use mora::test_support::TempDir;
 
-struct WorkDir(PathBuf);
+struct WorkDir(TempDir);
 impl WorkDir {
     fn new(tag: &str) -> Self {
-        let d = std::env::temp_dir().join(format!("mora_d214_{tag}"));
-        let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(&d).expect("建目录");
-        WorkDir(d)
+        // v0.104.6 D475：临时目录走**全仓唯一入口** `mora::test_support::TempDir`
+        // （原先此处是第 N 份逐字复制的 `WorkDir` 副本）。
+        WorkDir(TempDir::new(tag))
     }
 }
-impl Drop for WorkDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
+impl std::ops::Deref for WorkDir {
+    type Target = std::path::Path;
+    fn deref(&self) -> &std::path::Path {
+        self.0.path()
     }
 }
 
@@ -111,7 +111,7 @@ fn d214_known_statuses_keep_standard_reason_phrases() {
 #[test]
 fn d214_real_404_status_line_is_not_says_ok() {
     let _d = WorkDir::new("e2e");
-    let dir = _d.0.clone();
+    let dir = _d.0.path().to_path_buf();
     // 一个只有一个路由的服务；请求一个**不存在**的路径 → 404
     //
     // ⚠ `Router::new()` **不收参数**，启动方法是 `listen(addr)`（不是 `serve()`）

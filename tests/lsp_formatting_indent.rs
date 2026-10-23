@@ -42,7 +42,7 @@
 //! ① 块体必须缩进、闭合行与块**外**语句必须顶格（主判据，含嵌套）；
 //! ② **格式化不改变语义**：格式化后的文本运行结果必须与原文**逐字一致**。
 
-use std::path::PathBuf;
+use mora::test_support::TempDir;
 use std::process::{Command, Stdio};
 
 fn json_string(s: &str) -> String {
@@ -64,10 +64,8 @@ fn frame(json: &str) -> String {
     format!("Content-Length: {}\r\n\r\n{}", json.len(), json)
 }
 
-fn temp_dir() -> PathBuf {
-    let d = std::env::temp_dir().join("mora_d196_lsp");
-    std::fs::create_dir_all(&d).expect("建目录");
-    d
+fn temp_dir() -> TempDir {
+    TempDir::new("mora_d196_lsp")
 }
 
 /// 对一段源码跑 LSP 格式化，返回格式化后的文本。

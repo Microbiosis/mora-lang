@@ -45,7 +45,8 @@
 //!
 //! ## 顺带：`src/skill/` 本体首次外部覆盖（**否定轮，零缺陷**）
 
-use std::path::{Path, PathBuf};
+use mora::test_support::TempDir;
+use std::path::Path;
 
 use mora::sandbox::SandboxPolicy;
 use mora::skill::{MoraSkillSpec, SkillRegistry};
@@ -87,11 +88,8 @@ fn production_code_only(s: &str) -> String {
     }
 }
 
-fn temp_dir(tag: &str) -> PathBuf {
-    let d = std::env::temp_dir().join(format!("mora_d408_{tag}"));
-    let _ = std::fs::remove_dir_all(&d);
-    std::fs::create_dir_all(&d).expect("建临时目录");
-    d
+fn temp_dir(tag: &str) -> TempDir {
+    TempDir::new(tag)
 }
 
 // ── ① `permissive()` 真正「全路径、无限制」（D409 修掉了 D408 发现的错） ──
@@ -225,7 +223,7 @@ fn d408_check_path_actually_blocks_outside_fs_root() {
     std::fs::write(&outside_file, "---\nname: y\ndescription: d\n---\nbody\n").expect("写文件");
 
     let policy = SandboxPolicy {
-        fs_root: Some(dir.clone()),
+        fs_root: Some(dir.path().to_path_buf()),
         ..SandboxPolicy::permissive()
     };
     assert!(

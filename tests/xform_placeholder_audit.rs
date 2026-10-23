@@ -38,15 +38,11 @@
 //! ⇒ 与 D332/D333「`v.to_string()` 键空间」同族，此处**已修**。
 //! 判据钉住「同一程序连跑结果相同」。
 
+use mora::test_support::TempDir;
 use std::process::Command;
-use std::sync::atomic::{AtomicU64, Ordering};
-
-static SEQ: AtomicU64 = AtomicU64::new(0);
 
 fn ev(body: &str) -> (i32, String) {
-    let n = SEQ.fetch_add(1, Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!("d385_{n}_{}", n));
-    std::fs::create_dir_all(&dir).expect("建目录");
+    let dir = TempDir::new("d385_");
     let p = dir.join("p.mora");
     std::fs::write(&p, body).expect("写探针");
     let home = dir.join("home");

@@ -506,7 +506,17 @@ fn list_broadcast_works_for_sub_mul_div_mod_too() {
         (
             "bigint 元素 - float",
             "[10n,20n] - 1.0",
-            "List([Float(9.0), Float(19.0)])",
+            // v0.104.6 **D472 追正**：原期望 `List([Float(9.0), Float(19.0)])`，
+            // 实得 `List([BigInt(9), BigInt(19)])`。
+            //
+            // 旧期望编码的是 **D468 统一数值塔之前**的行为：当时 `Sub` 走
+            // f64 round-trip（10n − 1.0 = 9.0，Float），而 `Add` 走提升
+            // （100.0 + 100n = 200n，BigInt）—— 同一组操作数因**运算符**不同
+            // 而结果类型不同。D468 统一后：整数值 float 提升为 BigInt，
+            // 故 `10n - 1.0` ≡ `10n - 1n` = **BigInt(9)**。
+            //
+            // ⇒ 与 `mixed_float_bigint_precision.rs` 的 `3 + 1n` → `4n` 一致。
+            "List([BigInt(9), BigInt(19)])",
         ),
         (
             "int 元素 * int",

@@ -4,6 +4,7 @@
 
 mod tests_v046_skill {
     use crate::interpreter::Interpreter;
+    use crate::test_support::TempDir;
     use crate::value::Value;
 
     /// v0.46.0: skill.* builtin (CLI-Anything SKILL.md pattern)
@@ -21,7 +22,7 @@ mod tests_v046_skill {
     /// 实测：本会话内 `%TEMP%` 里新增了 `mora_skill_test_13828_…`；
     /// 修后同一测试连跑多次，`%TEMP%` 计数**不再增长**（见 CHANGELOG D411）。
     struct TempSkillFile {
-        dir: std::path::PathBuf,
+        dir: TempDir,
         path: std::path::PathBuf,
     }
 
@@ -32,21 +33,12 @@ mod tests_v046_skill {
     }
 
     fn write_temp_skill_file(name: &str, content: &str) -> TempSkillFile {
-        let dir = std::env::temp_dir().join(format!(
-            "mora_skill_test_{}_{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let dir = TempDir::new("mora_skill_test_");
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join(format!("{}.md", name));
         std::fs::write(&path, content).unwrap();
         TempSkillFile { dir, path }
     }
-
-    use std::time::UNIX_EPOCH;
 
     #[test]
     fn skill_list_empty_by_default() {
@@ -253,14 +245,7 @@ body
     #[test]
     fn skill_set_hub_and_refresh_real_file() {
         let mut interp = Interpreter::new();
-        let dir = std::env::temp_dir().join(format!(
-            "mora_hub_{}_{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let dir = TempDir::new("mora_hub_");
         std::fs::create_dir_all(&dir).unwrap();
         let hub_path = dir.join("mora-public.json");
         let hub_content = r#"{

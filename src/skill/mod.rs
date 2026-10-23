@@ -184,6 +184,7 @@ fn find_json_string(content: &str, start: usize, key: &str) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::TempDir;
 
     #[test]
     fn parse_full_frontmatter() {
@@ -312,13 +313,7 @@ body
     #[test]
     fn registry_load_public_registry_real_file() {
         // 真实读写文件 (REAL test, not metadata)
-        let dir = std::env::temp_dir().join(format!(
-            "mora_skill_{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let dir = TempDir::new("mora_skill_");
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("mora-public.json");
         let content = r#"{

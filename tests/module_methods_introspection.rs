@@ -51,6 +51,7 @@
 //! 判据 ② 至此从「需要人工维护的约定」变成**由同一张表保证的不变量**，
 //! 钉在 `tests/module_method_groups_single_table.rs`；本文件继续守判据 ①。
 
+use mora::test_support::TempDir;
 use std::process::Command;
 
 /// `value.rs::MODULE_OBJECTS` 里的 23 个模块名（与生产表逐项对照）。
@@ -61,8 +62,7 @@ const MODULES: &[&str] = &[
 ];
 
 fn run_src(src: &str, tag: &str) -> String {
-    let base = std::env::temp_dir().join(format!("mora_d170_{tag}"));
-    std::fs::create_dir_all(&base).expect("建目录");
+    let base = TempDir::new(tag);
     let prog = base.join("p.mora");
     std::fs::write(&prog, src).expect("写探针");
     let mora = concat!(env!("CARGO_MANIFEST_DIR"), "/target/debug/mora.exe");
@@ -198,8 +198,7 @@ fn d170_module_methods_actually_work_despite_empty_introspection() {
 /// D170 对照组：D169 修好的 `document` 值（不是模块对象）**不得**被本轮影响。
 #[test]
 fn d170_document_value_introspection_still_listed() {
-    let base = std::env::temp_dir().join("mora_d170_doc");
-    std::fs::create_dir_all(&base).expect("建目录");
+    let base = TempDir::new("mora_d170_doc");
     let md = base.join("s.md");
     std::fs::write(&md, "# T\n\ntext\n").expect("写 md");
     let prog = base.join("p.mora");

@@ -45,16 +45,15 @@
 //! （含「另存为 UTF-8」）；③ **负对照**：文件真的不存在时仍要照实说
 //! 「找不到」，不能被守卫吞成「编码问题」。
 
+use mora::test_support::TempDir;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-struct WorkDir(PathBuf);
+struct WorkDir(TempDir);
 
 impl WorkDir {
     fn new(tag: &str) -> Self {
-        let d = std::env::temp_dir().join(format!("mora_d192_{tag}"));
-        let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(&d).expect("建目录");
+        let d = TempDir::new(tag);
         WorkDir(d)
     }
     fn path(&self) -> &Path {

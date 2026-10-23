@@ -39,6 +39,7 @@
 //! 哪怕燃料机制本身坏掉（没报错、也没退出），判据也**绝不会挂住测试套件**。
 //! 只是断言方向从「仍在运行」翻转为「已退出且报 fuel exhausted」。
 
+use mora::test_support::TempDir;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -65,13 +66,16 @@ fn read(rel: &str) -> String {
     std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("读 {} 失败: {e}", p.display()))
 }
 
-/// 写一个探针脚本到临时目录，返回其路径。
-fn write_probe(tag: &str, src: &str) -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!("mora_d397_{tag}"));
-    let _ = std::fs::create_dir_all(&dir);
+/// 写一个探针脚本到临时目录，返回**守卫**。
+///
+/// v0.104.6 D475：返回守卫而非裸路径 —— 裸路径没有生命周期，
+/// 守卫一析构目录就被回收了（探针脚本还在用）。调用方需要文件路径时
+/// 用 `dir.join("p.mora")`。
+fn write_probe(tag: &str, src: &str) -> (TempDir, std::path::PathBuf) {
+    let dir = TempDir::new(tag);
     let p = dir.join("p.mora");
     std::fs::write(&p, src).expect("写探针");
-    p
+    (dir, p)
 }
 
 // ── ① 源码级不变量（有牙齿） ──
@@ -226,7 +230,7 @@ fn d397_module_doc_states_the_real_limit_scope() {
 /// 坏掉（既不报错也不退出），本判据也**绝不会挂住测试套件**。
 #[test]
 fn d397_left_recursive_rule_now_errors_instead_of_hanging() {
-    let p = write_probe("hang", "rel loop2(x) loop2(x) end\nsolve 2 { loop2(?X) }\n");
+    let (_guard, p) = write_probe("hang", "rel loop2(x) loop2(x) end\nsolve 2 { loop2(?X) }\n");
     let exe = concat!(env!("CARGO_MANIFEST_DIR"), "/target/debug/mora.exe");
     let mut child = Command::new(exe)
         .arg(&p)
@@ -262,7 +266,7 @@ fn d397_left_recursive_rule_now_errors_instead_of_hanging() {
 /// 防止上面那条只是在测「一切程序都报错」。
 #[test]
 fn d397_finite_rule_terminates_normally() {
-    let p = write_probe(
+    let (_guard, p) = write_probe(
         "finite",
         "rel edge(\"a\", \"b\")\nrel edge(\"b\", \"c\")\n\
          rel path(x, y) edge(x, y) end\n\
@@ -291,7 +295,7 @@ fn d397_finite_rule_terminates_normally() {
 /// 光断言「退出了」不够 —— 它也可能是别的错误（例如解析失败）导致的退出。
 #[test]
 fn d397_left_recursion_reports_fuel_exhausted() {
-    let p = write_probe(
+    let (_guard, p) = write_probe(
         "fuelmsg",
         "rel loop2(x) loop2(x) end\nsolve 2 { loop2(?X) }\n",
     );

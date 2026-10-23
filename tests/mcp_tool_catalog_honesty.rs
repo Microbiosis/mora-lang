@@ -44,6 +44,7 @@
 //! 这比「某个名字在不在列表里」强得多 —— 它把「宣称」与「实际」绑在一起，
 //! 将来任何人往目录里加一个没实现的名字，这条测试立刻红。
 
+use mora::test_support::TempDir;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -70,13 +71,11 @@ fn tool_list() -> String {
     out
 }
 
-struct WorkDir(PathBuf);
+struct WorkDir(TempDir);
 
 impl WorkDir {
     fn new(tag: &str) -> Self {
-        let d = std::env::temp_dir().join(format!("mora_d186_{tag}"));
-        let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(&d).expect("建目录");
+        let d = TempDir::new(tag);
         WorkDir(d)
     }
     fn path(&self) -> &Path {

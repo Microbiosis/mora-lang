@@ -38,13 +38,11 @@
 //! 本文件的核心判据是**把 LSP 返回的 edits 施加到源码，再把产物丢给
 //! `mora --check`** —— 判据是「产物仍可解析」，与 rename 的实现细节无关。
 
-use std::path::PathBuf;
+use mora::test_support::TempDir;
 use std::process::Command;
 
-fn temp_dir() -> PathBuf {
-    let d = std::env::temp_dir().join("mora_d132_apply");
-    std::fs::create_dir_all(&d).expect("create temp dir");
-    d
+fn temp_dir() -> TempDir {
+    TempDir::new("mora_d132_apply")
 }
 
 fn frame(json: &str) -> String {
@@ -181,7 +179,9 @@ fn apply_edits(src: &str, result_json: &str) -> String {
 }
 
 fn parses_ok(src: &str) -> (bool, String) {
-    let f = temp_dir().join("applied.mora");
+    // v0.104.6 D475：守卫必须**绑到变量** —— 直接 	emp_dir().join(...)`n    // 会在语句结束时析构，文件当场消失。
+    let dir = temp_dir();
+    let f = dir.join("applied.mora");
     std::fs::write(&f, src).expect("write");
     let out = Command::new(env!("CARGO_BIN_EXE_mora"))
         .arg("--check")

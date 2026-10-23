@@ -88,6 +88,8 @@ fn annotate_node(node: &Fcfg, table: &TypeTable) -> Node<TypeInfo> {
             span: *span,
             meta: info,
         },
+        // v0.104.6 D477：rhs 是**未求值的块** ⇒ 递归标注（与 `Node::If`
+        // 的分支块同款处理），否则 rhs 里的节点拿不到类型。
         Node::Or {
             dst,
             lhs,
@@ -97,7 +99,7 @@ fn annotate_node(node: &Fcfg, table: &TypeTable) -> Node<TypeInfo> {
         } => Node::Or {
             dst: *dst,
             lhs: *lhs,
-            rhs: *rhs,
+            rhs: annotate_block(rhs, table),
             span: *span,
             meta: info,
         },
@@ -110,7 +112,7 @@ fn annotate_node(node: &Fcfg, table: &TypeTable) -> Node<TypeInfo> {
         } => Node::And {
             dst: *dst,
             lhs: *lhs,
-            rhs: *rhs,
+            rhs: annotate_block(rhs, table),
             span: *span,
             meta: info,
         },
@@ -572,12 +574,15 @@ fn annotate_node(node: &Fcfg, table: &TypeTable) -> Node<TypeInfo> {
             input_var,
             result_var,
             kind,
+            dst,
             span,
             ..
         } => Node::Orchestrate {
             input_var: input_var.clone(),
             result_var: result_var.clone(),
-            kind: annotate_orchestrate_kind(kind, table),
+            // v0.104.6 D473：载荷是 witness 数据（非 CFG 结构），原样透传。
+            kind: kind.clone(),
+            dst: *dst,
             span: *span,
             meta: info,
         },
@@ -597,6 +602,90 @@ fn annotate_node(node: &Fcfg, table: &TypeTable) -> Node<TypeInfo> {
         },
         Node::Sequence { nodes, span, .. } => Node::Sequence {
             nodes: annotate(nodes, table),
+            span: *span,
+            meta: info,
+        },
+        // ── v0.104.6 D472：4 类新构造 ──
+        // 标注只补 meta（类型 + 效果行），**不改寄存器与结构**。
+        Node::Worker {
+            name,
+            body,
+            dst,
+            span,
+            ..
+        } => Node::Worker {
+            name: name.clone(),
+            body: annotate_block(body, table),
+            dst: *dst,
+            span: *span,
+            meta: info,
+        },
+        Node::Transaction {
+            body,
+            compensation,
+            dst,
+            span,
+            ..
+        } => Node::Transaction {
+            body: annotate_block(body, table),
+            compensation: annotate_block(compensation, table),
+            dst: *dst,
+            span: *span,
+            meta: info,
+        },
+        Node::Eval {
+            name,
+            given,
+            expects,
+            tolerance,
+            replay_path,
+            dst,
+            span,
+            ..
+        } => Node::Eval {
+            name: name.clone(),
+            given: *given,
+            expects: expects.clone(),
+            tolerance: *tolerance,
+            replay_path: replay_path.clone(),
+            dst: *dst,
+            span: *span,
+            meta: info,
+        },
+        Node::Aggregate {
+            name,
+            value,
+            dst,
+            span,
+            ..
+        } => Node::Aggregate {
+            name: name.clone(),
+            value: *value,
+            dst: *dst,
+            span: *span,
+            meta: info,
+        },
+        // ── v0.104.6 D472：管道 + commit / rollback ──
+        Node::Pipe {
+            dst,
+            left,
+            right,
+            span,
+            ..
+        } => Node::Pipe {
+            dst: *dst,
+            left: *left,
+            right: *right,
+            span: *span,
+            meta: info,
+        },
+        Node::Commit { dst, span, .. } => Node::Commit {
+            dst: *dst,
+            span: *span,
+            meta: info,
+        },
+        Node::Rollback { dst, span, .. } => Node::Rollback {
+            dst: *dst,
             span: *span,
             meta: info,
         },
@@ -620,54 +709,6 @@ fn annotate_arm(arm: &MatchArm<()>, table: &TypeTable) -> MatchArm<TypeInfo> {
         pattern: arm.pattern.clone(),
         guard: arm.guard.as_ref().map(|g| annotate_block(g, table)),
         body: annotate_block(&arm.body, table),
-    }
-}
-
-fn annotate_orchestrate_kind(
-    kind: &crate::mir::fcfg::OrchestrateKind<()>,
-    table: &TypeTable,
-) -> crate::mir::fcfg::OrchestrateKind<TypeInfo> {
-    use crate::mir::fcfg::OrchestrateKind;
-    match kind {
-        OrchestrateKind::Sequential => OrchestrateKind::Sequential,
-        OrchestrateKind::Loop { body } => OrchestrateKind::Loop {
-            body: annotate_block(body, table),
-        },
-        OrchestrateKind::Graph { vertices, edges } => OrchestrateKind::Graph {
-            vertices: vertices.clone(),
-            edges: edges.clone(),
-        },
-        OrchestrateKind::Pregel { config } => OrchestrateKind::Pregel {
-            config: crate::mir::fcfg::PregelConfig {
-                vertices: config.vertices.clone(),
-                edges: config.edges.clone(),
-                compute: annotate_block(&config.compute, table),
-                combine: config.combine.as_ref().map(|c| annotate_block(c, table)),
-                max_supersteps: config.max_supersteps,
-            },
-        },
-        OrchestrateKind::MoA { layers } => OrchestrateKind::MoA {
-            layers: layers
-                .iter()
-                .map(|l| crate::mir::fcfg::MoALayer {
-                    proposers: l
-                        .proposers
-                        .iter()
-                        .map(|p| annotate_block(p, table))
-                        .collect(),
-                    aggregator: annotate_block(&l.aggregator, table),
-                })
-                .collect(),
-        },
-        OrchestrateKind::MoE {
-            experts,
-            router,
-            top_k,
-        } => OrchestrateKind::MoE {
-            experts: experts.clone(),
-            router: router.clone(),
-            top_k: *top_k,
-        },
     }
 }
 

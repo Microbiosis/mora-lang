@@ -26,13 +26,11 @@
 //!
 //! 修法：按 LSP 规范支持 `includeDeclaration`（默认 false）与 `onlyDeclaration`。
 
-use std::path::PathBuf;
+use mora::test_support::TempDir;
 use std::process::Command;
 
-fn temp_dir() -> PathBuf {
-    let d = std::env::temp_dir().join("mora_d102_fmt");
-    std::fs::create_dir_all(&d).expect("create temp dir");
-    d
+fn temp_dir() -> TempDir {
+    TempDir::new("mora_d102_fmt")
 }
 
 fn frame(json: &str) -> String {

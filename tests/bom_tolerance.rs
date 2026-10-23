@@ -49,18 +49,17 @@
 //! ① 带 BOM 的**文件**必须能跑；② 带 BOM 的 **REPL 管道**第一行不得丢；
 //! ③ 无 BOM 输入不受影响（负对照）；④ 只剥开头一个（中间的不剥）。
 
+use mora::test_support::TempDir;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// 工作目录守卫。
-struct WorkDir(PathBuf);
+struct WorkDir(TempDir);
 
 impl WorkDir {
     fn new(tag: &str) -> Self {
-        let d = std::env::temp_dir().join(format!("mora_d191_{tag}"));
-        let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(&d).expect("建目录");
+        let d = TempDir::new(tag);
         WorkDir(d)
     }
     fn path(&self) -> &Path {

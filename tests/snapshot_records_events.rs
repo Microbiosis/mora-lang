@@ -48,6 +48,7 @@
 //! 只验「同输入通过」的测试在缺陷存在时同样会绿（它就是原始的假绿形态），
 //! 所以必须同时验「异输入必须失败」，这一条才是真正的判据。
 
+use mora::test_support::TempDir;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -55,29 +56,11 @@ fn mora_exe() -> String {
     concat!(env!("CARGO_MANIFEST_DIR"), "/target/debug/mora.exe").to_string()
 }
 
-/// 临时工作目录守卫 —— `Drop` 时删除。
-///
-/// 不能只在测试尾部写 `remove_dir_all`：断言失败会 panic，尾部代码根本不执行，
-/// 于是**失败的测试反而留下垃圾目录**。`Drop` 才管得住所有出口。
-struct TempDir(PathBuf);
-
-impl TempDir {
-    fn new(tag: &str) -> Self {
-        let dir = std::env::temp_dir().join(format!("mora_d174_{}", tag));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("建工作目录");
-        TempDir(dir)
-    }
-    fn path(&self) -> &Path {
-        &self.0
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
+// v0.104.6 D475：本文件原先**自带**一份 `TempDir` 副本（局部守卫 + 自己的
+// Drop），现统一改用全仓唯一入口 `mora::test_support::TempDir`（同名不再遮蔽）。
+//
+// 局部守卫的职责（`Drop` 时删除、覆盖 panic 出口）已由共享机制承担 ⇒
+// 副本整体删除，机制只有一处。
 
 fn write_script(dir: &Path, file: &str, src: &str) -> PathBuf {
     let p = dir.join(file);

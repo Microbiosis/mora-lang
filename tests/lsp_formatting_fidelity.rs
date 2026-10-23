@@ -44,7 +44,8 @@
 //! 行数不变、**区间外的行逐字不变**、区间内的行恰为 `newText` 的各行。
 //! 这条**不依赖本实现怎么写**，修前必红（会多出 2 行）。
 
-use std::path::{Path, PathBuf};
+use mora::test_support::TempDir;
+use std::path::Path;
 use std::process::{Command, Stdio};
 
 // ===================================================================
@@ -118,13 +119,11 @@ fn num(v: &mora::lsp::json::Value, key: &str) -> usize {
 /// **并行**跑测试，一个测试的 Drop 会把另一个**正在用**的目录删掉。
 /// `lsp_formatting_indent.rs` 那几个测试至今没装守卫正是这个原因 ——
 /// 本轮给自己这份补上，靠「每测试独立子目录」绕开并行互删。
-struct WorkDir(PathBuf);
+struct WorkDir(TempDir);
 
 impl WorkDir {
     fn new(tag: &str) -> Self {
-        let d = std::env::temp_dir().join(format!("mora_d202_{tag}"));
-        let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(&d).expect("建目录");
+        let d = TempDir::new(tag);
         WorkDir(d)
     }
 }

@@ -61,6 +61,8 @@
 ///
 /// 这是 D339 那条纪律的**机械化**：新加一个 `xs.take(some_arg)` 而忘了
 /// 负数检查，本条会立刻红。
+use mora::test_support::TempDir;
+
 #[test]
 fn d340_user_facing_numeric_casts_all_have_guards() {
     // 用户实参可能来源的名字（参数名 / Value 提取结果 / args 索引）
@@ -329,8 +331,7 @@ fn d340_parse_budget_dispatch_cast_cannot_reach_its_bad_branch() {
 /// 钉它是为了让「可达」这件事**有判据**，下一个人不会再次误判为死路径。
 #[test]
 fn d340_compose_prompt_budget_path_is_reachable_via_json_parse() {
-    let dir = std::env::temp_dir().join(format!("d340_reach_{}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("建目录");
+    let dir = TempDir::new("d340_reach_");
     let p = dir.join("p.mora");
     // 用 `Int` budget（D263 修的正是「int 明明是数字」那一侧）
     std::fs::write(

@@ -47,10 +47,8 @@
 //! 所以 `let document = 5` **合法**且 exit 0 —— 这是注释明写的设计，
 //! 本判据把它钉住，防止将来"顺手收紧"时误伤。
 
+use mora::test_support::TempDir;
 use std::process::Command;
-use std::sync::atomic::{AtomicU64, Ordering};
-
-static SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// 25 个**真正**作关键字 token 的词面（`document` 除外，见文件头说明）。
 const KEYWORDS: [&str; 25] = [
@@ -81,23 +79,11 @@ const KEYWORDS: [&str; 25] = [
     "task",
 ];
 
-fn slug(s: &str) -> String {
-    let mut out = String::from("d353_");
-    out.extend(
-        s.chars()
-            .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
-            .take(40),
-    );
-    out
-}
-
 /// 独立进程 + 隔离 `HOME`；**stdout 与 stderr 都采**（D351 教训：
 /// 解析错误走 stderr，只读 stdout 会看到"空输出 + exit 非 0"，
 /// 那时候要先怀疑采集器，再怀疑产品）。
 fn ev(body: &str) -> (i32, String) {
-    let n = SEQ.fetch_add(1, Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!("d353_{}_{}", n, slug(body)));
-    std::fs::create_dir_all(&dir).expect("建目录");
+    let dir = TempDir::new("d353_");
     let p = dir.join("p.mora");
     std::fs::write(&p, body).expect("写探针");
     let home = dir.join("home");

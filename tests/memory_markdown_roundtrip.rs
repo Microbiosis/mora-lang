@@ -44,15 +44,14 @@
 //! 此前**零测试覆盖**（`tests/` 下无任何 memory/persist 测试）。
 //! 记忆写进去却读不回来，且没有任何提示 —— 对一个「记住/回忆」功能是致命的。
 
+use mora::test_support::TempDir;
 use std::path::PathBuf;
 use std::process::Command;
 
-struct WorkDir(PathBuf);
+struct WorkDir(TempDir);
 impl WorkDir {
     fn new(tag: &str) -> Self {
-        let d = std::env::temp_dir().join(format!("mora_d220_{tag}"));
-        let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(&d).expect("建目录");
+        let d = TempDir::new(tag);
         WorkDir(d)
     }
     fn script(&self, name: &str, body: &str) -> PathBuf {

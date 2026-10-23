@@ -80,7 +80,11 @@ fn max_reg_in_node(node: &Fcfg) -> usize {
             args,
             ..
         } => args.iter().fold(*dst.max(receiver), |m, r| m.max(*r)),
-        Node::Or { dst, lhs, rhs, .. } | Node::And { dst, lhs, rhs, .. } => *dst.max(lhs).max(rhs),
+        // v0.104.6 D477：rhs 是**未求值的块** —— 其寄存器必须计入 max，
+        // 否则 rhs 的求值会落进与本层 bump 分配器冲突的寄存器。
+        Node::Or { dst, lhs, rhs, .. } | Node::And { dst, lhs, rhs, .. } => {
+            (*dst).max(*lhs).max(max_reg_in_nodes(&rhs.nodes))
+        }
         Node::DynTrait { dst, src, .. } => *dst.max(src),
         Node::Prompt { dst, parts, .. } => parts.iter().fold(*dst, |m, r| m.max(*r)),
         Node::ClosureExpr { dst, body, .. } => *dst.max(&max_reg_in_nodes(&body.nodes)),
@@ -199,6 +203,29 @@ fn max_reg_in_node(node: &Fcfg) -> usize {
             .map(|(_, r, n)| (*r).max(max_reg_in_node(n)))
             .max()
             .unwrap_or(0),
+        Node::Worker { body, dst, .. } => (*dst).max(max_reg_in_nodes(&body.nodes)),
+        Node::Transaction {
+            body,
+            compensation,
+            dst,
+            ..
+        } => (*dst)
+            .max(max_reg_in_nodes(&body.nodes))
+            .max(max_reg_in_nodes(&compensation.nodes)),
+        Node::Eval {
+            given,
+            expects,
+            dst,
+            ..
+        } => expects.iter().fold((*given).max(*dst), |m, r| m.max(*r)),
+        Node::Aggregate { value, dst, .. } => (*value).max(*dst),
+        // v0.104.6 D472：管道 + commit / rollback
+        Node::Pipe {
+            dst, left, right, ..
+        } => (*dst).max(*left).max(*right),
+        Node::Commit { dst, .. } | Node::Rollback { dst, .. } => *dst,
+        // v0.104.6 D473：编排语句的结果寄存器（值为 Nil）
+        Node::Orchestrate { dst, .. } => *dst,
         Node::TypeAlias { .. }
         | Node::EnumDef { .. }
         | Node::StructDef { .. }
@@ -208,8 +235,7 @@ fn max_reg_in_node(node: &Fcfg) -> usize {
         | Node::MsgDef { .. }
         | Node::AppDef { .. }
         | Node::RelDef { .. }
-        | Node::Export { .. }
-        | Node::Orchestrate { .. } => 0,
+        | Node::Export { .. } => 0,
     }
 }
 
@@ -270,22 +296,89 @@ fn lower_node(ctx: &mut EmitContext, node: &Fcfg) {
                 args.clone(),
             ));
         }
-        // Or/And → 短路求值（镜像 emit_or_w 的 JumpIf + NotEqual 模式）
+        // Or/And → **短路求值**（镜像 emit_or_w 的 JumpIf + NotEqual 模式）
+        //
+        // v0.104.6 D474：**短路路径必须显式给 `dst` 赋值，且必须显式跳过**。
+        //
+        // ## 缺陷（既有，D473 的 `emit.rs` 直出路径同款）
+        //
+        // 此前短路目标直接跳到 `end`（跳过 `BinaryOp`）⇒ `dst` 从未被写过 ⇒
+        // `reg_ready[dst]` 恒 false ⇒ **依赖它的后续 Effect 永远不就绪、
+        // 整条不执行**（`node_ready` 对 Effect 节点判的是 `input_regs` 的
+        // 数据就绪，不是控制流到达）。
+        //
+        // 实测（真实 CLI，真值表 8 例**错 4 例**）：
+        //   print(true or false)   → 无任何输出（应为 true）
+        //   print(false and true)  → 无任何输出（应为 false）
+        //
+        // 该缺陷两边一样错 ⇒ 逐条差分**抓不到**它 —— 这正是「差分只比形状、
+        // 不比语义」的盲区。差分退役后必须由「期望输出」判据兜住。
+        //
+        // ## v0.104.6 D477：rhs 必须**只求值一次，且只在必要时**
+        //
+        // D477 之前，生产路径把 rhs 当作**已算好的寄存器**（`Node::Or` 的
+        // `rhs: Reg`），而 `witness_to_fcfg` 把它排在 `Or` 节点**之前**
+        // （`Sequence[lhs, rhs, Or]`）⇒ **rhs 无条件求值**：短路只作用于
+        // 「取值」，不作用于「求值」。
+        //
+        // 实测（真实 CLI，rhs 是一句有副作用的 `task bump() : bool`）：
+        //   let a = true  or  bump()   → bump() **仍然执行**（应短路）
+        //   let b = false and bump()   → bump() **仍然执行**（应短路）
+        //
+        // 而**直连路径**（`lower.rs`）一直把 rhs 发射在 `JumpIf` **之后**
+        // ⇒ 它本就短路 ⇒ 两条路径语义**不一致**（同一个程序、两条编译路径，
+        // 副作用不同）。
+        //
+        // D477 起 `Node::Or` / `Node::And` 的 rhs 改成**未求值的块**，
+        // 降级时把 rhs 的指令放进「非短路分支」⇒ 两条路径的指令序列
+        // **逐条一致**，且真正兑现短路求值。
+        //
+        // ## 修法（结构与本文件 `if/else` 的降级同款）
+        //
+        // ```text
+        //   JumpIf(l, short)          ; l 为真 ⇒ 走短路
+        //   <rhs 块>                  ; ← 只在 fall-through 这条路上求值
+        //   BinaryOp(dst, l, .., r)   ; fall-through：l 为假 ⇒ 结果 = r
+        //   Jump(end)                 ; ← 必须显式跳走！
+        // short:
+        //   Copy(dst, l)              ; 短路：结果 = l
+        // end:
+        // ```
+        //
+        // ⚠ 那条显式 `Jump(end)` **不可省**：DAG 的块边界会为「不以终结符收尾的
+        // 块」补一条 fall-through 控制边。若 fall-through 直接落到 `Copy`，
+        // 短路块会被**两条路一起激活** ⇒ `dst` 被 `Copy` 覆盖 ⇒ 值又错。
         Node::Or { dst, lhs, rhs, .. } => {
             let l = *lhs;
             ctx.emit(MirInst::JumpIf(l, 0));
             let jump_idx = ctx.insts.len() - 1;
-            ctx.emit(MirInst::BinaryOp(*dst, l, BinaryOp::NotEqual, *rhs));
+            // v0.104.6 D477：rhs 只在「不短路」这条路上求值。
+            lower_block(ctx, rhs);
+            let r = rhs.result.unwrap_or(0);
+            ctx.emit(MirInst::BinaryOp(*dst, l, BinaryOp::NotEqual, r));
+            ctx.emit(MirInst::Jump(0));
+            let skip_idx = ctx.insts.len() - 1;
+            let short = ctx.insts.len();
+            ctx.emit(MirInst::Copy(*dst, l));
             let end = ctx.insts.len();
-            ctx.patch_label_at(jump_idx, end);
+            ctx.patch_label_at(jump_idx, short);
+            ctx.patch_label_at(skip_idx, end);
         }
         Node::And { dst, lhs, rhs, .. } => {
             let l = *lhs;
             ctx.emit(MirInst::JumpIfNot(l, 0));
             let jump_idx = ctx.insts.len() - 1;
-            ctx.emit(MirInst::BinaryOp(*dst, l, BinaryOp::Equal, *rhs));
+            // v0.104.6 D477：同上 —— rhs 只在「不短路」这条路上求值。
+            lower_block(ctx, rhs);
+            let r = rhs.result.unwrap_or(0);
+            ctx.emit(MirInst::BinaryOp(*dst, l, BinaryOp::Equal, r));
+            ctx.emit(MirInst::Jump(0));
+            let skip_idx = ctx.insts.len() - 1;
+            let short = ctx.insts.len();
+            ctx.emit(MirInst::Copy(*dst, l));
             let end = ctx.insts.len();
-            ctx.patch_label_at(jump_idx, end);
+            ctx.patch_label_at(jump_idx, short);
+            ctx.patch_label_at(skip_idx, end);
         }
         Node::DynTrait {
             dst,
@@ -872,17 +965,30 @@ fn lower_node(ctx: &mut EmitContext, node: &Fcfg) {
         Node::Orchestrate {
             input_var,
             result_var,
+            kind,
+            dst,
             ..
         } => {
-            // FCFG OrchestrateKind → MirOrchestrateKind 转换需要 agent 定义，
-            // 桥接层暂用 Sequential 占位。
+            // v0.104.6 D473：此前此处是**占位** —— `Sequential { agents: vec![] }`
+            // （注释：「转换需要 agent 定义，桥接层暂用 Sequential 占位」）。
+            // 于是 9 层产出的 `MirInst::Orchestrate` **丢掉全部 agent**，
+            // 与 emit 路径的 `MirInst::Orchestrate` 形状不同 ⇒ 差分必红 ⇒
+            // orchestrate 程序**永久回落**旧路径。
+            //
+            // 现在载荷原样携带 witness 的 `WitnessOrchestrateKind`，
+            // 由**桥接层**（本层）做 witness→Mir 的转换 ——
+            // 与 emit 路径（`parser_v3/emit.rs::emit_orchestrate_w`）调用
+            // **同一个** `MirOrchestrateKind::from_witness_kind`，
+            // 故两条路径产出的 `MirInst::Orchestrate` **逐字段相同**。
             ctx.emit(MirInst::Orchestrate {
                 input_var: input_var.clone(),
                 result_var: result_var.clone(),
-                kind: Box::new(super::orchestrate::MirOrchestrateKind::Sequential {
-                    agents: vec![],
-                }),
+                kind: Box::new(super::orchestrate::MirOrchestrateKind::from_witness_kind(
+                    kind,
+                )),
             });
+            // 语句的值恒为 Nil（与 emit 路径的 `Const(dst, Nil)` 同形）。
+            ctx.emit(MirInst::Const(*dst, crate::value::Value::Nil));
         }
 
         // ── 配置块 ──
@@ -901,6 +1007,81 @@ fn lower_node(ctx: &mut EmitContext, node: &Fcfg) {
             // v0.104.6 D58：`with` 块的值恒为 Nil（子 body 的返回值不传播）
             // —— 与 emit 路径 `emit_with_w` 补的那条 `Const(dst, Nil)` 同形。
             // 缺了它，`Block::result` 指向的 dst 从未被写。
+            ctx.emit(MirInst::Const(*dst, crate::value::Value::Nil));
+        }
+
+        // ── v0.104.6 D472：4 类此前降级链产不出的构造 ──
+        //
+        // 每条都**同时**发射「构造指令 + 结果寄存器的 Nil 常量」——
+        // 后者与 emit 路径同形（worker / transaction 分支本就有；
+        // eval / aggregate 此前缺，是 D472 一并补上的）。
+        Node::Worker {
+            name, body, dst, ..
+        } => {
+            // 体是独立寄存器空间的 MirFunction —— 走带尾 Return 的路径
+            // （与 emit 路径 worker 分支的 `emit_tail_return` 同形）。
+            let body_mir = lower_body_function_with_return(ctx, body);
+            ctx.emit(MirInst::Worker {
+                name: name.clone(),
+                body: Box::new(body_mir),
+            });
+            ctx.emit(MirInst::Const(*dst, crate::value::Value::Nil));
+        }
+        Node::Transaction {
+            body,
+            compensation,
+            dst,
+            ..
+        } => {
+            let body_mir = lower_body_function_with_return(ctx, body);
+            let comp_mir = lower_body_function_with_return(ctx, compensation);
+            ctx.emit(MirInst::Transaction {
+                body: Box::new(body_mir),
+                compensation: Box::new(comp_mir),
+            });
+            ctx.emit(MirInst::Const(*dst, crate::value::Value::Nil));
+        }
+        Node::Eval {
+            name,
+            given,
+            expects,
+            tolerance,
+            replay_path,
+            ..
+        } => {
+            ctx.emit(MirInst::Eval {
+                name: name.clone(),
+                given_reg: *given,
+                expects: expects.clone(),
+                tolerance: *tolerance,
+                replay_path: replay_path.clone(),
+            });
+            // ⚠ 不补 `Const(dst, Nil)`：eval 语句的值 = **given 表达式的值**
+            // （与 emit 路径逐字一致）。spec §14.2 的 `eval_expr` 产生式
+            // （`eval("1")`）期望值是 `String("1")` —— 即 given 的值。
+        }
+        Node::Aggregate { name, value, .. } => {
+            ctx.emit(MirInst::Aggregate {
+                name: name.clone(),
+                value: *value,
+            });
+            // 同 eval：值 = 被贡献表达式的值，不补 Nil 常量。
+        }
+        // ── v0.104.6 D472：管道 + commit / rollback ──
+        //
+        // 管道是**表达式**（结果 = 应用的返回值）⇒ 不补 Nil 常量；
+        // commit / rollback 是 unit 语句 ⇒ 与 worker / transaction 同形补 Nil。
+        Node::Pipe {
+            dst, left, right, ..
+        } => {
+            ctx.emit(MirInst::Pipe(*dst, *left, *right));
+        }
+        Node::Commit { dst, .. } => {
+            ctx.emit(MirInst::Commit);
+            ctx.emit(MirInst::Const(*dst, crate::value::Value::Nil));
+        }
+        Node::Rollback { dst, .. } => {
+            ctx.emit(MirInst::Rollback);
             ctx.emit(MirInst::Const(*dst, crate::value::Value::Nil));
         }
     }

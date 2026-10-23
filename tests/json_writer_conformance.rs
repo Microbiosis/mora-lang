@@ -58,7 +58,7 @@
 //! Mora 自身 parser 的往返、真实 CLI 路径。
 
 use mora::flow::{json_to_value, value_to_json};
-use std::path::PathBuf;
+use mora::test_support::TempDir;
 use std::process::Command;
 
 /// 产出里出现的**未转义控制字符** —— 修前应为空。
@@ -179,12 +179,10 @@ fn d209_mora_own_parser_still_round_trips() {
 }
 
 /// **真实 CLI 路径**（用户实际用的那条）也必须合规。
-struct WorkDir(PathBuf);
+struct WorkDir(TempDir);
 impl WorkDir {
     fn new(tag: &str) -> Self {
-        let d = std::env::temp_dir().join(format!("mora_d209_{tag}"));
-        let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(&d).expect("建目录");
+        let d = TempDir::new(tag);
         WorkDir(d)
     }
 }

@@ -927,6 +927,52 @@ impl HMInference {
             // v0.103: export 内部声明 —— 类型/效果与不加 export 时相同
             // （export 只影响跨模块可见性，属 import 收集侧的静态判定）。
             WitnessKind::Export { decl, .. } => self.infer_expr(decl),
+            // ── v0.104.6 D472：4 类新构造（语句型）──
+            // 类型恒为 Nil（与 worker / transaction / eval / aggregate 的
+            // 语义一致：它们是语句，不产生值）；效果行从体 / 被断言的
+            // 表达式 / 贡献值传播。
+            WitnessKind::Worker { body, .. } => {
+                let (_ty, body_row) = self.infer_expr(body)?;
+                Ok((Type::Nil, body_row))
+            }
+            WitnessKind::Transaction {
+                body, compensation, ..
+            } => {
+                let (_ty, body_row) = self.infer_expr(body)?;
+                let (_ty2, comp_row) = self.infer_expr(compensation)?;
+                Ok((Type::Nil, Self::union_effect_rows(&body_row, &comp_row)))
+            }
+            WitnessKind::Eval { given, expects, .. } => {
+                let (_ty, given_row) = self.infer_expr(given)?;
+                let mut row = given_row;
+                for e in expects {
+                    let (_t, r) = self.infer_expr(e)?;
+                    row = Self::union_effect_rows(&row, &r);
+                }
+                Ok((Type::Nil, row))
+            }
+            WitnessKind::Aggregate { value, .. } => {
+                let (_ty, value_row) = self.infer_expr(value)?;
+                Ok((Type::Nil, value_row))
+            }
+            // v0.104.6 D472：管道 —— 推断口径与旧 witness 形态**逐字相同**：
+            // 右侧是裸标识符 ⇒ 值应用 `f(x)`；右侧是任意表达式 ⇒ 内建
+            // `|>(x, expr)`。改的只是 witness 的**承载形态**（`Pipe` 而非
+            // `Call`），推断语义不动。
+            WitnessKind::Pipe { left, right } => match &right.kind {
+                WitnessKind::Variable(name) => {
+                    let args: Vec<MirWitness> = vec![(**left).clone()];
+                    self.infer_call(&WitnessCallee::Name(name.clone()), &args, expr.span)
+                }
+                _ => {
+                    let args: Vec<MirWitness> = vec![(**left).clone(), (**right).clone()];
+                    self.infer_call(&WitnessCallee::Name("|>".to_string()), &args, expr.span)
+                }
+            },
+            // commit / rollback 是 unit 语句 —— 无类型、无效果。
+            WitnessKind::Commit | WitnessKind::Rollback => {
+                Ok((Type::Nil, crate::mir::effect::EffectRow::Empty))
+            }
             WitnessKind::Solve {
                 limit: _,
                 query_vars,

@@ -94,9 +94,11 @@
 ### 1.2 例外（可直接用训练数据）
 
 - Mora 语言自身的语法、语义、执行管线 —— 直接读 `src/` 与 `docs/`（**项目无 AST**，v0.55 去 AST 化后已无 AST 解释器）
-  - **生产主路径（单遍编译）**：`source → Lexer → ParserV3::compile → MirFunction<MirInst> + MirWitness → witness typecheck → MIR optimize → DAG analyze/optimize/cache → vm::run_mir`（v0.75.40+ 全部执行入口切 compile；`MirExpr` 仅为 orchestrate/pregel 数据构造类型）
+  - **生产主路径（单遍编译）**：`source → Lexer → ParserV3::compile → MirWitness[] → 9 层管线（witness → FCFG → MirFunction<MirInst>）→ witness typecheck → MIR optimize → DAG analyze/optimize/cache → vm::execute`
+    （v0.75.40+ 全部执行入口切 compile；**v0.104.6 D474 起 parser 只产 witness**，MIR 全部由 9 层产出，**没有第二条编译路径**；`MirExpr` 仅为 orchestrate/pregel 数据构造类型）
   - 旧路径 `ParserV3::parse → MirExpr → lower → MirInst` 是历史/兼容路径，仅 LSP 测试桥保留
-  - 执行内核：`src/mir/vm.rs`（interp + dag_interp 合并，v0.75.48）+ `src/mir/jit.rs`（copy-and-patch JIT，零 LLVM，Float/Int 算术 + Mod + 控制流子集，未覆盖回落解释器）
+  - 执行内核：`src/mir/vm/`（interp + dag_interp 合并，v0.75.48）+ `src/mir/jit.rs`（copy-and-patch JIT，零 LLVM，Float/Int 算术 + Mod + 控制流子集，未覆盖回落解释器）
+  - **测试临时目录的唯一入口**：`src/test_support.rs` 的 `TempDir` / `TempFile`（v0.104.6 D475）。根目录、命名、回收策略都只此一处；**别处不得直接调 `std::env::temp_dir()`** —— `tests/test_tempdir_hygiene.rs` 守卫会判失败。此前全仓 163 处散落写法（5+ 种命名、4 种回收策略）在 `%TEMP%` 累积了 9 205 个空目录。
 - 项目内部命名、模块结构、历史 commit 含义 —— 直接 `grep` / `git log`
 - 通用编程语言基础（Rust 语法、Python 语法等）
 

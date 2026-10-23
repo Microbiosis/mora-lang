@@ -88,6 +88,28 @@ fn walk_witness_kind<F: FnMut(&MirWitness)>(kind: &WitnessKind, visit: &mut F) {
             walk_witness(body, visit)
         }
         WitnessKind::Parallel { body } => walk_witness(body, visit),
+        // v0.104.6 D472：4 类新构造 —— 遍历其子 witness，
+        // 否则 hover/补全看不到 worker 体 / 事务补偿段 / eval 的 given 与 expects。
+        WitnessKind::Worker { body, .. } => walk_witness(body, visit),
+        WitnessKind::Transaction {
+            body, compensation, ..
+        } => {
+            walk_witness(body, visit);
+            walk_witness(compensation, visit);
+        }
+        WitnessKind::Eval { given, expects, .. } => {
+            walk_witness(given, visit);
+            for e in expects {
+                walk_witness(e, visit);
+            }
+        }
+        WitnessKind::Aggregate { value, .. } => walk_witness(value, visit),
+        // v0.104.6 D472：管道 + commit / rollback
+        WitnessKind::Pipe { left, right, .. } => {
+            walk_witness(left, visit);
+            walk_witness(right, visit);
+        }
+        WitnessKind::Commit | WitnessKind::Rollback => {}
         WitnessKind::Export { decl, .. } => walk_witness(decl, visit),
         WitnessKind::Binary { left, right, .. } => {
             walk_witness(left, visit);

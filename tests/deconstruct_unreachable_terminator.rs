@@ -42,6 +42,7 @@
 //! `Define` / `Var` / `Call` 一条都没跑 ⇒ 连 `print` 的输出都没有。
 
 use mora::mir::ssa::Terminator;
+use mora::test_support::TempDir;
 
 /// ① **主判据（有牙齿）**：`Unreachable` 降维后**不得**产出 `MirInst::Return`。
 ///
@@ -107,19 +108,7 @@ fn d260_opt2_preserves_basic_define_var_programs() {
         "显式 API",
         "Trait",
     ];
-
-    // `Drop` 守卫：assert 失败（panic）时末尾的清理**执行不到**，
-    // 而牙齿验证正是靠让它失败 ⇒ 残留会稳定复现。
-    struct WorkDir(std::path::PathBuf);
-    impl Drop for WorkDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
-    let dir = std::env::temp_dir().join(format!("mora_d260_{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("mkdir");
-    let _work = WorkDir(dir.clone());
+    let dir = TempDir::new("d260");
 
     let exe = concat!(env!("CARGO_MANIFEST_DIR"), "/target/debug/mora.exe");
     let run = |src: &str, opt: Option<&str>| -> (i32, Vec<String>) {

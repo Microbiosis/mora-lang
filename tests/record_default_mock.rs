@@ -38,6 +38,7 @@
 //! 兜底分支与 `mock_llm` 分支**对称**地记一次：token 估算同规则
 //! （`len / 4`）、mock 延迟记 0、`arg_signature` 用同一条可读化签名。
 
+use mora::test_support::TempDir;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -99,8 +100,7 @@ fn read_recording(dir: &Path, name: &str) -> String {
 /// D173 主判据：默认 mock 形态（**无** `mock_llm`）也必须录到 `ai.chat` 事件。
 #[test]
 fn d173_default_mock_ai_chat_is_recorded() {
-    let dir = std::env::temp_dir().join("mora_d173_a");
-    let _ = std::fs::remove_dir_all(&dir);
+    let dir = TempDir::new("mora_d173_a");
     let (out, err, code) = record_in(&dir, "a", "let a = ai.chat(p\"hello\")\nprint(a)\n");
     assert_eq!(code, 0, "record 应成功; stdout={out} stderr={err}");
     let jsonl = read_recording(&dir, "a");
@@ -115,8 +115,7 @@ fn d173_default_mock_ai_chat_is_recorded() {
 /// D173 主判据 ②：`mock_llm` 分支**不得回退**（它本来就对）。
 #[test]
 fn d173_mock_llm_branch_still_recorded() {
-    let dir = std::env::temp_dir().join("mora_d173_b");
-    let _ = std::fs::remove_dir_all(&dir);
+    let dir = TempDir::new("mora_d173_b");
     let (out, err, code) = record_in(
         &dir,
         "b",
@@ -154,8 +153,7 @@ fn d173_both_mock_branches_record_same_fields() {
             "k2",
         ),
     ] {
-        let dir = std::env::temp_dir().join(format!("mora_d173_{tag}"));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = TempDir::new("d173");
         record_in(&dir, tag, src);
         let jsonl = read_recording(&dir, tag);
         let line = jsonl
@@ -177,8 +175,7 @@ fn d173_both_mock_branches_record_same_fields() {
 /// 否则这条修复会把「跑一下脚本」的副作用扩散到磁盘。
 #[test]
 fn d173_plain_run_writes_no_recording() {
-    let dir = std::env::temp_dir().join("mora_d173_plain");
-    let _ = std::fs::remove_dir_all(&dir);
+    let dir = TempDir::new("mora_d173_plain");
     let (out, err, code) = run_in(&dir, "let a = ai.chat(p\"hello\")\nprint(a)\n");
     assert_eq!(code, 0, "普通运行应成功; stdout={out} stderr={err}");
     assert!(

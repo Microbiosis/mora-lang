@@ -44,16 +44,46 @@
 //! （`cli::compile_and_opt` 才跑 `run_pipeline`），直接用裸
 //! `ParserV3::compile` 的 witness 产出。
 //!
-//! ## 本文件的判据
+//! ## 本文件的判据（v0.104.6 D474：从「两条路径一致」改为「绝对值 + 档位不变」）
 //!
-//! **两条编译路径跑同一份源码，结果必须逐字相同。** 这类分叉最难自查 ——
-//! 因为「测试跑的管线」和「用户跑的管线」根本不是同一条。
+//! 原判据是「两条编译路径跑同一份源码，结果必须逐字相同」。**D474 把差分
+//! 机制整个退役** —— parser 不再发射 MirInst（只产 witness），MIR 全部由
+//! 9 层产出 ⇒「参考实现」这一侧**已不存在**，`ParserV3::compile` 与
+//! `cli::compile_and_opt` 现在**走同一条路** ⇒ 那条比对成了恒真。
+//!
+//! ⇒ 判据换成两条**非平凡**的不变量：
+//!
+//! 1. **绝对值**：关键用例的结果**具体且正确**（不依赖任何对照物）；
+//! 2. **优化档位不变性**：同一份源码在 `--opt` 关 / 1 / 2 下结果必须**逐字
+//!    相同** —— 判的是「优化器只能改效率，不能改语义」，与编译路径**无关**。
+//!
+//! 另有两条**源码级**护栏（witness 侧的索引编码、`ModelDef.defaults`）保持
+//! 原样：它们查的是「某个信息在源头还在不在」，与路径无关。
 
 use std::sync::Arc;
 
 use mora::interpreter::Interpreter;
 use mora::mir::vm::execute;
 use mora::parser_v3::ParserV3;
+
+/// 在给定优化档位下编译并执行，返回结果的字符串形式。
+///
+/// 档位不变性判据用它：**优化器只能改效率，不能改语义**。
+fn run_at_opt(src: &str, level: mora::mir::ssa::OptLevel) -> String {
+    match mora::cli::compile_and_opt(src, Some(level)) {
+        Ok((f, _)) => exec(f),
+        Err(e) => format!("COMPILE-ERR: {e}"),
+    }
+}
+
+/// 三个优化档位下结果是否一致。
+fn stable_across_opt_levels(src: &str) -> (bool, String, String, String) {
+    let off = run_at_opt(src, mora::mir::ssa::OptLevel::None);
+    let basic = run_at_opt(src, mora::mir::ssa::OptLevel::Basic);
+    let aggressive = run_at_opt(src, mora::mir::ssa::OptLevel::Aggressive);
+    let same = off == basic && basic == aggressive;
+    (same, off, basic, aggressive)
+}
 
 fn exec(func: mora::mir::MirFunction) -> String {
     let arc = Arc::new(func);
@@ -95,8 +125,13 @@ const HANDLE_VAR: &str =
 const HANDLE_OK: &str =
     "let x = 0.0\nlet t = [10,20,30]\nhandle random_random {\n  x = t[1]\n} {\n  0.5\n}\nx\n";
 
+/// v0.104.6 D474：handle 体里的索引在**三个优化档位**下必须给出**相同**结果。
+///
+/// 原判据是「两条编译路径一致」—— D474 起两条路径是同一条 ⇒ 恒真。
+/// 换成「优化档位不变性」：这条判的是**优化器**（与编译路径无关），
+/// 仍能抓住「某个优化档位把 handle 体的索引算错」这类缺陷。
 #[test]
-fn handle_body_index_agrees_across_both_compile_paths() {
+fn handle_body_index_is_stable_across_opt_levels() {
     let cases: &[(&str, &str)] = &[
         ("handle 列表字面量索引越界", HANDLE_LIT),
         ("handle 字符串索引越界", HANDLE_STR),
@@ -105,15 +140,16 @@ fn handle_body_index_agrees_across_both_compile_paths() {
     ];
     let mut failures = Vec::new();
     for (name, src) in cases {
-        let bare = run_bare(src);
-        let pipe = run_pipeline(src);
-        if bare != pipe {
-            failures.push(format!("  [{name}]\n    裸   = {bare}\n    管线 = {pipe}"));
+        let (same, off, basic, aggressive) = stable_across_opt_levels(src);
+        if !same {
+            failures.push(format!(
+                "  [{name}]\n    opt=0 : {off}\n    opt=1 : {basic}\n    opt=2 : {aggressive}"
+            ));
         }
     }
     assert!(
         failures.is_empty(),
-        "{} 个 handle+索引用例在两条编译路径下结果不同：\n{}",
+        "{} 个 handle+索引用例在不同优化档位下结果不同 —— 优化器改坏了语义：\n{}",
         failures.len(),
         failures.join("\n")
     );
@@ -183,11 +219,12 @@ fn witness_index_encoding_is_decoded_back_to_index_instruction() {
     );
 }
 
-/// 覆盖范围：handle 是唯一「嵌套 lower 块」的场景吗？不是 —— `import` 与
-/// `eval()` 编译的代码整体走 witness 路径，所以它们比 handle 受影响更广。
-/// 这里钉住「顶层源码本身两条路径一致」，防止将来新增别的分叉。
+/// v0.104.6 D474：普通用例在**三个优化档位**下必须给出相同结果。
+///
+/// 原判据是「两条编译路径一致」—— D474 起两条路径是同一条 ⇒ 恒真。
+/// 换成「优化档位不变性」（与编译路径无关，仍非平凡）。
 #[test]
-fn ordinary_programs_agree_across_both_compile_paths() {
+fn ordinary_programs_are_stable_across_opt_levels() {
     let cases: &[(&str, &str)] = &[
         ("顶层列表索引越界", "[1,2][99]\n"),
         ("顶层列表索引正常", "[1,2][0]\n"),
@@ -207,15 +244,16 @@ fn ordinary_programs_agree_across_both_compile_paths() {
     ];
     let mut failures = Vec::new();
     for (name, src) in cases {
-        let bare = run_bare(src);
-        let pipe = run_pipeline(src);
-        if bare != pipe {
-            failures.push(format!("  [{name}]\n    裸   = {bare}\n    管线 = {pipe}"));
+        let (same, off, basic, aggressive) = stable_across_opt_levels(src);
+        if !same {
+            failures.push(format!(
+                "  [{name}]\n    opt=0 : {off}\n    opt=1 : {basic}\n    opt=2 : {aggressive}"
+            ));
         }
     }
     assert!(
         failures.is_empty(),
-        "{} 个普通用例在两条编译路径下结果不同：\n{}",
+        "{} 个普通用例在不同优化档位下结果不同 —— 优化器改坏了语义：\n{}",
         failures.len(),
         failures.join("\n")
     );
@@ -385,8 +423,17 @@ fn sweep_cases() -> Vec<(&'static str, &'static str)> {
     ]
 }
 
+/// v0.104.6 D474：逐语言特性铺开扫描 —— ①每条都**必须编译得过**；
+/// ②在**三个优化档位**下结果**逐字相同**。
+///
+/// 原判据是「两条编译路径一致」—— D474 起两条路径是同一条 ⇒ 恒真。
+///
+/// ⚠ 「必须编译得过」这条**不能省**：扫描集里一旦混入无效语法，那些用例
+/// 会退化成「什么都没测」而**看不出来**（本文件早先就在这里踩过 ——
+/// 三条误写成 `fn name(...)`（Mora 无此语法）的用例被静默跳过，
+/// 「68 条全一致」的结论其实只有 65 条成立）。
 #[test]
-fn every_language_feature_agrees_across_both_compile_paths() {
+fn every_language_feature_compiles_and_is_stable_across_opt_levels() {
     let all = sweep_cases();
     assert!(
         all.len() >= 60,
@@ -396,23 +443,20 @@ fn every_language_feature_agrees_across_both_compile_paths() {
     let mut failures = Vec::new();
     let mut invalid: Vec<String> = Vec::new();
     for (name, src) in &all {
-        let b = run_bare(src);
-        let p = run_pipeline(src);
-        if b.starts_with("COMPILE-ERR") && p.starts_with("COMPILE-ERR") {
-            // **不再静默跳过。** 早先这里是 `continue`，于是三条误写成
-            // `fn name(...)`（Mora 无此语法）的用例被吞掉，「68 条全一致」
-            // 的结论其实只有 65 条成立 —— 扫描集用无效语法会让它退化成
-            // 「什么都没测」而**看不出来**。现在直接列出并失败。
-            invalid.push(format!("  [{name}] 两条路径都编译不过：{b}"));
+        let (same, off, basic, aggressive) = stable_across_opt_levels(src);
+        if off.starts_with("COMPILE-ERR") {
+            invalid.push(format!("  [{name}] 编译不过：{off}"));
             continue;
         }
-        if b != p {
-            failures.push(format!("  [{name}]\n    裸   = {b}\n    管线 = {p}"));
+        if !same {
+            failures.push(format!(
+                "  [{name}]\n    opt=0 : {off}\n    opt=1 : {basic}\n    opt=2 : {aggressive}"
+            ));
         }
     }
     assert!(
         invalid.is_empty(),
-        "扫描集里有 {} 条用例在两条路径下都编译不过 —— 它们根本没测到语义，\
+        "扫描集里有 {} 条用例编译不过 —— 它们根本没测到语义，\
          扫描会静默退化。修正这些用例的语法（注意：Mora 的具名函数是 \
          `task name(...)`，不是 `fn name(...)`）：\n{}",
         invalid.len(),
@@ -420,8 +464,7 @@ fn every_language_feature_agrees_across_both_compile_paths() {
     );
     assert!(
         failures.is_empty(),
-        "{} 个语言特性在两条编译路径下结果不同 —— `import` / `eval()` \
-         编译的代码与内联代码语义分叉：\n{}",
+        "{} 个语言特性在不同优化档位下结果不同 —— 优化器改坏了语义：\n{}",
         failures.len(),
         failures.join("\n")
     );
@@ -508,16 +551,6 @@ fn path_agreement_cases() -> Vec<(&'static str, &'static str)> {
     v
 }
 
-fn accept_run_path(src: &str) -> Result<usize, String> {
-    let (_f, ws) = mora::cli::compile_and_opt(src, None)?;
-    let errs = mora::typeck::check_mir::check_program_witnesses_bidirectional(&ws);
-    if errs.is_empty() {
-        Ok(ws.len())
-    } else {
-        Err("type errors".into())
-    }
-}
-
 fn accept_check_path(src: &str) -> Result<usize, String> {
     let (_f, ws) = mora::parser_v3::ParserV3::compile(src)?;
     let errs = mora::typeck::check_mir::check_program_witnesses_bidirectional(&ws);
@@ -528,25 +561,60 @@ fn accept_check_path(src: &str) -> Result<usize, String> {
     }
 }
 
+/// v0.104.6 D474：typeck 的**接受 / 拒绝**判定必须与**钉死的期望集合**一致。
+///
+/// 原判据是「两条 typeck 路径判定一致」—— D474 起两条路径是同一条 ⇒ 恒真。
+/// 换成**绝对值**判据：每条构造的判定必须落在期望集合里。
+///
+/// 这比原判据**更强**：原判据只能发现「两条路径不一致」，而「被接受」
+/// 与「被拒绝」都是**具体的事实** —— 一条本该被拒的构造被放行（或反之）
+/// 会被直接抓住。
+///
+/// 期望集合取自 D474 退役差分时的**实测基线**（`mora --check` 路径）。
+/// ⚠ 「拒绝」的那些**不是** bug —— 它们是当前 typeck 的**已知边界**
+/// （如 `with` 块、`perform` 裸用、类型标注 let、TEA app、嵌套闭包、
+/// 显式类型错误、未实现的 `?` 运算符）。若某条被改成「接受」，
+/// 本测试会要求**同步更新**这份清单 —— 那正是要发生的事。
 #[test]
-fn typeck_accepts_the_same_programs_on_both_paths() {
+fn typeck_verdicts_match_the_pinned_expectation() {
+    /// 应当**被拒绝**的构造名（其余全部应当被接受）。
+    const REJECTED: &[&str] = &[
+        "带类型标注",
+        "with",
+        "perform",
+        "TEA app",
+        "嵌套闭包",
+        "类型错误 String=int",
+        "类型错误 Bool=float",
+        "expr question",
+    ];
+
     let all = path_agreement_cases();
-    let mut diffs = Vec::new();
+    let mut wrong = Vec::new();
     for (name, src) in &all {
-        let a = accept_run_path(src);
-        let b = accept_check_path(src);
-        // 判据是「接受 / 拒绝」这一层，不是具体错误条数 —— 后者允许合理差异。
-        // 两个谓词都是「是否被接受」，不等即为分叉。
-        if a.is_ok() != b.is_ok() {
-            diffs.push(format!("  [{name}]\n    run   = {a:?}\n    check = {b:?}"));
+        let accepted = accept_check_path(src).is_ok();
+        let should_accept = !REJECTED.contains(name);
+        if accepted != should_accept {
+            wrong.push(format!(
+                "  [{name}] 实得={}，期望={}",
+                if accepted { "接受" } else { "拒绝" },
+                if should_accept { "接受" } else { "拒绝" }
+            ));
         }
     }
+    // 清单里的每个名字都必须真的存在于扫描集里（防清单与扫描集脱节）。
+    for name in REJECTED {
+        assert!(
+            all.iter().any(|(n, _)| n == name),
+            "REJECTED 清单里的 `{name}` 不在扫描集中 —— 扫描集改名了？\
+             请同步更新本清单（否则这条断言会**静默失效**）。"
+        );
+    }
     assert!(
-        diffs.is_empty(),
-        "{} / {} 条构造在两条 typeck 路径下判定不同 —— 后果是**编辑器对能跑的\
-         代码报红**（`mora --check` 与 LSP 走裸 witness 路径，`mora run` 走管线）：\n{}",
-        diffs.len(),
+        wrong.is_empty(),
+        "{} / {} 条构造的 typeck 判定与期望不符：\n{}",
+        wrong.len(),
         all.len(),
-        diffs.join("\n")
+        wrong.join("\n")
     );
 }

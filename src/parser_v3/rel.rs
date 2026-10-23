@@ -132,14 +132,6 @@ impl ParserV3 {
             body: Box::new(body_wit),
         };
 
-        self.emit.emit(MirInst::RelDef {
-            name: name.clone(),
-            clauses: vec![clause.clone()],
-        });
-        let dst = self.emit.alloc_reg();
-        self.emit
-            .emit(MirInst::Const(dst, crate::value::Value::Nil));
-
         Some(MirWitness {
             kind: WitnessKind::RelDef {
                 name,
@@ -152,7 +144,7 @@ impl ParserV3 {
 
     /// `solve` 查询：`solve { goal }` 或 `solve N { goal }`（run N）。
     /// 返回 (结果寄存器, witness) —— 可作语句亦可作表达式。
-    pub(super) fn emit_solve_w(&mut self) -> Option<(Reg, MirWitness)> {
+    pub(super) fn emit_solve_w(&mut self) -> Option<MirWitness> {
         let span = self.span_of_current();
         self.advance(); // 'solve'
         // 上界 N。注意：无后缀数字字面量在词法层是 Float（Mora 词法约定），
@@ -215,29 +207,16 @@ impl ParserV3 {
                 span,
             }
         };
-        let goal_mir = crate::mir::lower::lower_block_witness_to_mir(&goal_wit);
 
-        let dst = self.emit.alloc_reg();
-        self.emit.emit(MirInst::Solve {
-            dst,
-            limit,
-            query_vars: query_vars.clone(),
-            anon_vars: anon_vars.clone(),
-            goal: Box::new(goal_mir),
-        });
-
-        Some((
-            dst,
-            MirWitness {
-                kind: WitnessKind::Solve {
-                    limit,
-                    query_vars,
-                    anon_vars,
-                    goal: Box::new(goal_wit),
-                },
-                span,
+        Some(MirWitness {
+            kind: WitnessKind::Solve {
+                limit,
+                query_vars,
+                anon_vars,
+                goal: Box::new(goal_wit),
             },
-        ))
+            span,
+        })
     }
 
     // ── 子句（rel 头/体）目标与项 ──

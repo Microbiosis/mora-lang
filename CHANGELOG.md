@@ -2,7 +2,7 @@
 
 All notable changes to Mora will be documented in this file.
 
-## [Unreleased] — `Int` 语义统一为精确 i64（数值塔模块化）+ SSA 门最终删除 + 执行器重构
+## [Unreleased] — `Int` 语义统一为精确 i64（数值塔模块化）+ SSA 门最终删除 + 执行器重构 + 文档订正
 
 自 `v0.104.5`（最后一个真正的发布，tag `v0.104.5`）起累计：
 7 个提交 + 工作区在制品 + D468 数值塔重构。
@@ -18,6 +18,612 @@ All notable changes to Mora will be documented in this file.
 
 - **`Int` 语义**：算术与比较统一为**精确 i64**（overflow 报 `MoraError`）。
   2^53 之外的 `Int` 运算结果会变（此前静默丢最低位），`Int ⊗ Float` 超界改报错。
+
+### D477：`or` / `and` 的**求值级短路** —— 目标语义落地，两条编译路径不再分叉
+
+**起点是一次「注释是不是在夸大」的追问**：`or` / `and` 的注释写着「短路求值」，
+而当时的实现只短路**取值**、不短路**求值**。结论不是「注释夸大」，而是
+**生产路径没兑现语言的目标** —— 短路求值是**语义**，不是描述。
+
+#### 缺陷（实测取证）
+
+rhs 是一句有副作用的 `task bump() : bool`（打印一行、返回 `true`）：
+
+| 程序 | 改动前 | 改动后 | 应有 |
+|------|--------|--------|------|
+| `let a = true or bump()` | bump() **执行** | 不执行 | 不执行 |
+| `let b = false and bump()` | bump() **执行** | 不执行 | 不执行 |
+| `let c = false or bump()` | 执行 | 执行 | 执行 |
+| `let d = true and bump()` | 执行 | 执行 | 执行 |
+
+#### 根因：节点形状承载不了「未求值的 rhs」
+
+生产路径（`witness_to_fcfg` → `lower_fcfg`）把 rhs 当作**已算好的寄存器**
+（`Node::Or { rhs: Reg }`），并把它排在 `Or` 节点**之前**
+（`Sequence[lhs, rhs, Or]`）⇒ **rhs 无条件求值**。
+
+寄存器在节点降级之前就已写好 ⇒ rhs 的副作用早已发生 ⇒ **结构上无法**
+表达「只在某条分支上求值」。这不是注释问题，是**表示能力**问题。
+
+而**直连路径**（`mir/lower`）一直把 rhs 发射在 `JumpIf` **之后** ⇒ 它本就
+短路 ⇒ **两条编译路径对同一个程序的副作用不同**（生产路径多跑 rhs）。
+
+#### 修法
+
+`Node::Or` / `Node::And` 的 `rhs` 改成**未求值的块**（`Block<M>`），
+降级时把 rhs 的指令放进「非短路分支」：
+
+```text
+JumpIf(l, short)          ; l 为真 ⇒ 走短路（rhs 不求值）
+<rhs 块>                  ; ← 只在 fall-through 这条路上求值
+BinaryOp(dst, l, .., r)
+Jump(end)
+short:
+Copy(dst, l)
+end:
+```
+
+⇒ 生产路径与直连路径的指令序列**逐条一致**，且真正兑现短路求值。
+Core 层（影子层）同步从「普通 `BinaryOp`」（**既不取值短路也不求值短路**，
+`true or true` 会算成 `false`）改成 `Branch` + 两块。
+
+#### 连带订正
+
+- spec 新增 **§4.3.1**：`or` / `and` 的**求值级短路**语义（此前 spec 只规定
+  §14.2 的**语法**，从未写语义）；§14.2 加交叉引用。
+- `docs/nine-layer-ir.md` 新增「短路求值」一节 + 测试覆盖表加一行。
+- 行为契约表 48 → **49** 条（新增 `or_and_skip_rhs_evaluation`），并同步
+  `src/cli/mod.rs` 与 `docs/nine-layer-ir.md` 里的条数 —— 该表的覆盖面自检
+  判据（`conformance_table_covers_the_whole_language_surface`）会因条数
+  不符而**报错**，逼着增删都留下痕迹。
+- 回归护栏：`tests/short_circuit_evaluation.rs`（新建，3 条 —— 行为 × 三个
+  优化档位、取值语义、**两条路径的形状对照**）+
+  `tests/nine_layer_conformance.rs` 的 `or_and_skip_rhs_evaluation`。
+
+### D476：删除通配符 re-export —— `mir::` 根不再被污染
+
+`src/mir/mod.rs` 的 `pub use inst::*;`（注释写「保持 `crate::mir::dst()`
+等旧路径」）是命名空间污染。
+
+**D476 取证后删除**：它其实**什么都没导出** —— `inst.rs` 里 MirInst 的
+元数据方法是 **inherent impl**（`impl MirInst { pub fn dst() … }`），而
+inherent 方法**不能**被 glob 再导出，它们本来就随类型可达
+（`MirInst::dst()`）；模块级 pub 项只有 `dispatch` 一个，它真正的出口是
+`handlers::mod` 的 `pub use crate::mir::inst::dispatch;`。
+
+⇒ 那行 glob 只是把 `dispatch` 额外提升到 `mir::` 根（**零消费者**），
+同时让注释里的「保持 `crate::mir::dst()` 等旧路径」成为**假话**
+（`mir::dst()` 从来不可用）。删除后 `mir::` 根只剩真正的 9 层 re-export。
+`docs/nine-layer-ir.md` 的「遗留 2」相应改为「v0.104.6 D476 已解决」。
+
+### D475：测试临时目录**机制统一** —— 唯一入口 + 全量迁移 + 防回退守卫
+
+D474 收尾时顺手清理 `%TEMP%`，发现那里躺着 **9 205 个** `mora_*` 空目录
+（最早 2026-08-15，两个多月）。本条处理的是**根因**，不是残留。
+
+#### 碎片化现状（实测，非估计）
+
+| 维度 | 形态 | 数量 |
+|---|---|---|
+| 「在 `%TEMP%` 下建目录/写文件」的站点 | 散落全仓 | **163 处 / 145 个文件** |
+| 命名 | `mora_d198_{tag}` / `mora_audit_{pid}_{nanos}` / `d363_{n}_{slug}` / `mora_sandbox_{pid}` / `mora_schema_test_{name}` … | **5 种以上** |
+| 回收 | `Drop` 守卫 / 开头清一次 / 结尾清一次 / **完全不清** | **4 种** |
+| `WorkDir` 结构体的**逐字复制** | 每个文件一份 | **41 份** |
+
+⇒ 根因不是「某几处忘了删」，而是**机制本身是碎的**：每加一个测试就要重新发明
+一次命名与回收，「忘了删」只是默认结局。**在既有碎片上再补两个守卫 = 把碎片
+固化**，不是修复。
+
+#### 修法：三件事一起做
+
+1. **唯一机制** —— `mora::test_support::{TempDir, TempFile}`：
+   - **唯一根目录**：优先仓库内 `target/test-scratch/`（gitignore 覆盖、
+     `cargo clean` 顺带清掉）；仓库不可写时（crate 作为依赖被别处测试）退回
+     `%TEMP%/mora_test_scratch/`。
+   - **唯一命名**：`{tag}_{pid}_{纳秒}_{进程内序号}` ⇒ 并行测试**天然不撞名**。
+   - **唯一回收**：`Drop` 时 `remove_dir_all` **整个目录** ⇒ panic（unwind）
+     路径也不漏。
+2. **全量迁移** —— 163 个站点 + 41 份 `WorkDir` 副本全部并轨。
+3. **防回退守卫** —— `tests/test_tempdir_hygiene.rs`：扫描全仓 `src/` + `tests/`，
+   **入口之外**出现 `temp_dir()` 直接调用即判失败；7 条例外（把 `%TEMP%` 当
+   子进程 cwd / 只读路径 / HOME 兜底）逐条登记理由，并有第二条测试钉住
+   「例外不许腐化」。
+
+#### 顺带修掉的真问题
+
+- **`mora_sandbox_{pid}` 这类按 pid 命名的目录** ⇒ 同一进程内**多个并行测试
+  共享同一个目录**（潜在竞态）。统一命名后各测试各占各的。
+- **「结尾手动 `remove_dir_all`」在断言失败 panic 时根本不执行** ⇒ **失败的测试
+  反而留下垃圾目录**（最坏的组合：出问题时正好留证据）。`Drop` 覆盖所有出口。
+- **4 处本地 `TempDir` / `TempLog` 副本与共享类型同名遮蔽** ⇒ 其中一处
+  `fn new` 被迁移脚本改成了**自递归**（`TempDir::new` 调自己）⇒ 编译期暴露。
+
+#### 机制统一后暴露的另外两个真缺陷
+
+迁移把「谁负责生命周期」这件事显式化，于是暴露出两个**此前被掩盖**的问题：
+
+1. **数值字面量的诊断没点名用户写的 token** ——
+   `9223372036854775808i` 越界时，诊断只报**数值部分**
+   （`Invalid integer literal: 9223372036854775808`），丢掉 `i` 与位宽。
+   ⇒ `src/lexer.rs` 新增 `literal_text()`，诊断报**完整**字面量。
+   ⚠ 这条之所以长期没被发现：`tests/numeric_width_suffix.rs` 一直在断言
+   「诊断应点名这个字面量」，但它此前是**假通过** —— 旧实现把**源码片段
+   slug 进了临时目录名**，目录名恰好含有那个字面量，断言其实是被**路径**
+   满足的。统一命名后假通过消失，真实缺陷才露出来。
+2. **守卫活得比路径短** ⇒ 路径指向的文件在用之前就被删了。
+   典型形态是「helper 返回裸路径」：守卫随 helper 返回而析构。
+   ⇒ 约定改为「**持有路径的测试必须同时持有守卫**」：helper 返回
+   `(TempDir, PathBuf)`，调用方 `let (_guard, path) = ...`；
+   另有一处是 `let md = md.to_string_lossy()` 这种**同名遮蔽**把守卫覆盖掉。
+
+#### 迁移期间的环境性事故（记录在案）
+
+D475 用脚本批量改写 500+ 个文件，期间发现 **2 个文件在写入时被位翻转损坏**：
+`tests/http_status_phrase.rs` 的**每个字母 `d` 被改成 `i`**（`std`→`sti`、
+`drop`→`irop`、`Not Found`→`Not Founi`），`tests/refine_output_runnable.rs`
+的**每个 `s` 被改成 `t`**（`script`→`tcript`、`assert`→`attert`）。
+
+⇒ 写入在这个环境里**不可靠**。为此加了两道验证，并保留为流程的一部分：
+
+- **写后回读校验**：每次写入立刻回读、逐字节比对，不一致即报；
+- **单字符篡改检测**（`target/d475_tamper2.ps1`）：比对 diff 的增删行对，
+  找出「只差 1~2 个字符」的行 —— 位翻转损坏的特征。
+
+两个受损文件均已从 HEAD 恢复并重做迁移。**这次事故说明：批量改写代码后，
+「编译通过」不足以证明内容正确**（标识符级损坏编译会红，但注释/字符串里的
+损坏编译不会）。
+
+### D471：文档订正 —— agent 指令文件对齐 + 架构文档路径订正 + 历史工件归档
+
+一次**只读排查**引出的结论：仓库的文档面比代码面落后得多，且落后方式高度集中
+在「架构文档」与「AI 指令文件」两处。本条只做订正，**不改任何运行时行为**。
+
+#### 排查发现（取证）
+
+| 发现 | 证据 |
+|------|------|
+| **双编译管线并存**：每次编译都跑「`emit.rs` 直出」与「9 层管线」两条 lowering，再逐条差分 | `src/cli/mod.rs:52-122` |
+| 9 层链 4757 行 vs 旧侧 lowering 6313 行 | `witness_to_fcfg` 1185 / `fcfg_lower` 1115 / `fcfg` 708 / `pipeline` 661 / `core` 544 / `ehir_to_core` 544；`parser_v3/emit.rs` 3112 / `emit_definitions.rs` 1224 / `rel.rs` 662 / `mir/lower.rs` 1315 |
+| 影子管线 + 差分约占总耗时 **31%** | 实测（debug build，300 个 task 的程序）：9 层开 317 ms / `MORA_9LAYER=0` 关 213 ms |
+| 4 类构造**永久**走旧路径 | `src/mir/legalization.rs:68-83`；实测 `worker`/`transaction` 打出 `[9layer] 未 legalize 构造 ["worker"]：已回落到 emit.rs 路径` |
+| `CLAUDE.md`「代码结构」节停留在 v0.55 的 `MirExpr` 世界 | 其中 `src/mir/expr/`、`src/mir/interp.rs`、`src/mir/dag_interp.rs` **均不存在**；`MirExpr` 已于 v0.92 整体删除 |
+| `docs/nine-layer-ir.md` 的「已知架构层级违反」表整表失效 | 表中 4 条违规全部以 `MirExpr` 依赖为根因；「修复路径」其实已被直接删除执行掉了 |
+| `docs/architecture-diagram.md` 同样带过期路径 | `mir/vm.rs`（实为 `mir/vm/`）、`mir/handlers.rs`（实为目录）、`handlers::inst`（实为 `handlers::dispatch`）、`mir::vm::run_mir`（**函数已改名 `execute`**，v0.104.6 D467） |
+
+#### 已订正
+
+- **`CLAUDE.md`「代码结构」节重写** —— 全部路径逐条 `Test-Path` 核验存在；
+  语义描述改为指向 `AGENTS.md` §1.2（已是准确的当前版本），**不再做第二份事实源**。
+  另加一句版本标签说明：代码注释里的 `v0.104.6 D<n>` 是**未发布批次**的工作标签，
+  不是已发布版本号（版本号以 `Cargo.toml` 为准）。
+- **`docs/nine-layer-ir.md`** —— 失效的技术债表替换为**当前真实的遗留**：
+  ① 双编译管线并存（含实测开销与两个处置方向）、② `pub use inst::*` 通配符 re-export、
+  ③ `run_mir` 命名遗留。并显式留档「原表为何失效」，避免后人照旧表再修一遍。
+- **`docs/architecture-diagram.md`** —— 8 处 mermaid 节点 + 4.2/4.3/4.6 正文
+  + 时序图 + 分层总结表逐处订正；`mir/expr/` 节标记为「v0.92 已删除」并说明去向。
+- **`src/mir/pipeline.rs`** 模块头 —— 原文「执行器仍消费原 MirFunction（Phase 2 切换，
+  待差分验证全绿后）」与 `src/cli/mod.rs:40`「v0.90.3 执行器切换」**互相矛盾**，
+  且前者已过时（执行器确实早切到管线产出）。改为按 `legalization` 三态描述回落语义。
+- **`src/mir/ssa.rs`** —— 移除对已归档文档 `PHASE_ALPHA_IR_DESIGN.md` 的引用
+  （该文件编码损坏不可读），改为自包含描述。
+- **`README.md`**（根，已跟踪）—— 修掉归档动作引入的**断链**：`docs/ARCHITECTURE.md`
+  已归档 ⇒ 两处链接改指 `docs/architecture-diagram.md`；另把 Highlights 里的
+  `vm::run_mir` 改为 `vm::execute`（该函数已改名）。
+
+#### 历史工件归档（31 份 → `docs/_archive/`）
+
+`docs/` 顶层此前有 6 份 if/else 实现报告、7 份 PHASE_GAMMA 文档、4 份 PHASE_2 文档，
+彼此重叠且版本互不一致，AI 助手与新人无从判断哪份为准。
+
+- 按「完成报告 / 阶段计划 / 补丁」归档，保留「规范 / 设计 / 决策」类。
+- 其中 **9 份是编码损坏**（CJK 在写入时即丢失，非读取端问题——按 GBK 重解后
+  CJK 仍稀稀落落；以 `mora-spec.md` 9589 汉字 / `architecture-diagram.md` 4972 汉字作基准）：
+  `ARCHITECTURE.md`、`ARCHITECTURE_DESIGN_v2.md`、`CODEBASE_ANALYSIS.md`、
+  `METAMORPHOSIS_ROADMAP.md`、`PHASE_ALPHA_IR_DESIGN.md`、`multi-agent-design.md`、
+  `orchestrate_v50_implementation_plan.md`、`semantics/T-values.md`，
+  外加 `de-ast-boundary.md`（可读，但全文前提 `MirExpr` 已随 v0.92 消失）。
+- 新建 `docs/README.md`（当前文档索引）与 `docs/_archive/README.md`（归档清单 + 判定方法），
+  确立「每个主题只有一份事实源」的登记入口。
+- 归档前已核实：保留文档对全部归档候选**零引用**；`tests/` 中唯一扫 docs 的
+  `unsafe_safety_docs.rs` 只扫 `src/**/*.rs`，不扫 `docs/`，故移动无影响。
+
+#### 未做（需用户决策，不在本次范围）
+
+- **P1：9 层管线的去留** —— 要么把 `worker`/`transaction`/`perform_bare`/`eval_bare`
+  接进降级链后删掉 `emit.rs` 旧 lowering 与差分机制，要么整条链回退。
+  当前两者都没做，代价即上表 31% 的常驻编译开销与两条链的同步维护成本。
+- `run_mir` → `execute` 的 100+ 调用点改名收尾。
+- `src/value/list.rs`（不可变分块列表，已完整实现并测试）接管 `Value::List`。
+
+### D474：parser **只产 witness** —— 手术实施 + **差分验证退役**
+
+D473 之后，**唯一**还在跑旧路径的是 `parser_v3/emit*.rs` 的 MirInst 直出
+（参考实现 / golden model）。删掉它 = 把 parser 改成**只产 witness**，
+MIR 全部由 9 层产出。**本条实施该手术，并把差分验证机制整个退役。**
+
+#### 手术规模（实测，非估计）
+
+| 项 | 数量 | 位置 |
+|---|---|---|
+| `self.emit.emit(MirInst::…)` 调用 | **75** | `emit.rs` 60 / `emit_definitions.rs` 13 / `rel.rs` 2 |
+| `self.emit.alloc_reg()` 调用 | **79** | 同上分布 |
+| `self.emit.emit_tail_return(…)` 调用 | **12** | — |
+| 需改签名的 parser 函数（`Option<(Reg, MirWitness)>` → `Option<MirWitness>`） | **33** | `emit.rs` 29 / `rel.rs` 1 / `emit_definitions.rs` 3 |
+| 受影响的**函数体**（需逐个删 Reg 机制） | **26** | — |
+| `ParserV3::compile` 返回值改动的调用方 | **~15** | `cli` / `interpreter`（import·eval·REPL）/ `lsp` / `typeck` / `tests` |
+
+⇒ 「5000 行 parser 手术」的**真实工作量**是：166 个发射点 + 33 个签名 +
+26 个函数体的 Reg 机制拆除 + 15 个调用方。**不是**重写 5000 行 —— 大部分代码
+（witness 构造逻辑）原样保留。
+
+#### 两个必须小心的陷阱（实测踩到）
+
+1. **parser 内部有非 Reg 的元组返回**：`rel.rs` 的
+   `emit_clause_term_w` / `emit_clause_goal_w` / `emit_query_goal_w` 返回
+   `(Term|Goal, MirWitness)` —— 元组的**第一个元素是逻辑项/目标，不是寄存器**。
+   机械地把「丢弃元组第一项」当通用规则会**删掉 rel 的 Term/Goal 构造**
+   （编译器报 E0425 兜住，但代价是一轮返工）。
+2. **正则删除 `MirInst::…{…}` 字面量会误伤**：`MirInst` 的结构体字面量里
+   嵌套花括号，单层正则删不干净、跨语句正则会吞掉相邻代码。
+
+⇒ 正确做法是**逐函数**改（编译器驱动），不是正则批改。
+
+#### 实施结果
+
+- **删除全部 74 条 MirInst 发射语句**（`self.emit.emit(MirInst::…)`：74 → **0**）
+  与 **78 处 `alloc_reg` 调用**（78 → **0**）—— 上表的取证是 75 / 79，
+  实际删除数略少（有两处在 D473 期间已被合并）。33 个 parser 函数签名改为
+  `Option<MirWitness>`；随之作废：寄存器机制、尾返回、循环标签回填、
+  `last` 追踪、准引号 Mir 层 `segments`、管道就地改写 Call→MethodCall、
+  `EmittedMatchArm` 的 4 个 Mir 侧字段、嵌套体 MirFunction 构造。
+- `ParserV3::compile` 保留 `(MirFunction, Vec<MirWitness>)` 返回形态 ——
+  **MIR 改由 `mir::pipeline::compile` 产出**，路径在 `compile` 内部**唯一**，
+  于是 CLI / import / runtime eval / REPL / LSP / typeck 六个调用方
+  **不必各自决定**走哪条编译路径。
+- `src/parser_v3/` 净 **+543 / −973**（含本条后续的语义修复）。
+
+```mermaid
+graph LR
+    subgraph 手术前
+        A1[Mora 源码] --> B1[ParserV3<br/>只产 witness + 直出 MirInst]
+        B1 --> C1[emit.rs 参考实现<br/>MIR ①]
+        B1 --> D1[9 层管线<br/>MIR ②]
+        C1 --> E1[逐条差分]
+        D1 --> E1
+        E1 -->|红| C1
+        E1 -->|绿| D1
+    end
+    subgraph 手术后
+        A2[Mora 源码] --> B2[ParserV3<br/>**只产 witness**]
+        B2 --> C2[9 层管线<br/>witness → FCFG → MIR]
+        C2 --> D2[执行器]
+    end
+```
+
+#### 差分验证机制的退役（**必然**，不是选择）
+
+差分的**对照物已经不存在**：parser 不再发射 MirInst ⇒「参考实现」这一侧
+**没有第二条路径可对比**。差分若继续存在，只会变成**自己跟自己比**（恒真）——
+一条恒真的判据比没有判据更坏：它让人以为覆盖还在。
+
+| 退役项 | 处置 |
+|---|---|
+| `MORA_9LAYER=0` 开关 | **删除**（`cli::compile_and_opt` 现在只有一个路径，无环境变量分支） |
+| `mir::pipeline::run_pipeline` 的差分部分 | **删除**（`differential_check` / `nested_diffs` / `significant_indices` / `audit_reg_bindings` 全部作废） |
+| `PipelineResult` 的 4 个差分字段 | **删除**，改为 `LayerStats`（FCFG / EHIR / Core 三层统计） |
+| `run_pipeline` | 更名 `probe_all_layers` —— 它现在的职责是「跑 EHIR / Core 两层（仅统计）」，差分不是它的职责 |
+| 11 个差分类测试文件 | **改写为「期望输出」判据**（见下） |
+
+**判据的替换是变强，不是变弱**：
+
+| 判据 | 能发现 | 发现不了 |
+|---|---|---|
+| 两条路径一致 | 两条路径**不一致** | 两条路径**一起错**到同一个错值 |
+| 期望输出 | 值**不对** | —— |
+
+#### 改写后的测试面（11 个文件）
+
+| 文件 | 处置 | 新判据 |
+|---|---|---|
+| `nine_layer_conformance.rs` | **新建** | 48 类构造 → **钉死的期望 stdout**（含类型错误 / 运行期错误两类） |
+| `nine_layer_full_census.rs` | 改写 | 117 个程序（67 仓库真实 + 50 合成）→ **编译 + 运行成功** |
+| `nine_layer_unblocked.rs` | 改写 | 20 种块/声明形态 × 3 优化档 → 期望输出；57 个 e2e fixture → 跑得通（7 个**故意的负例**单独钉死退出码） |
+| `nine_layer_block_equivalence.rs` | 改写 | 14 类构造 → **钉死的 `last_expr`** |
+| `pipeline_conformance.rs` | **新建**（取代 `pipeline_emit_equivalence.rs`） | 11 个代表性 fixture → 钉死的 stdout + 退出码 |
+| `pipeline_equivalence.rs` | 改写 | 68 条语言特性 → **必须编译过** + **优化档位不变**；37 条 typeck 构造 → **钉死的接受/拒绝集合** |
+| `optimizer_semantic_invariance.rs` | 改写 | 去掉「编译路径」那一维，保留**优化档位不变性** |
+| `nine_layer_tea_model_defaults.rs` | 改写 | TEA 程序的 4 行输出 → 钉死 |
+| `algebraic_effects.rs` / `solve_binding_dst.rs` | 改写 | 「两条路径一致」→ **绝对值**（handle 绑定自洽 / solve 取到值） |
+| `nine_layer_fallback_census.rs` / `nine_layer_block_forms.rs` / `pipeline_emit_equivalence.rs` / `path_differential_census.rs` / `nine_layer_differential.rs` | **删除** | 判据已恒真或已被上面覆盖 |
+
+#### 改写判据时抓到的**三个真缺陷**（都是差分结构上抓不到的）
+
+1. **`or` / `and` 的短路降级从不给结果寄存器赋值** ⇒ 依赖它的后续 Effect
+   永远不就绪、**整条不执行**。真值表 8 例**错 4 例**：
+   `print(true or false)` **无任何输出**（应为 `true`）。
+   该缺陷**既有**（D473 的 `emit.rs` 直出路径同款）—— 两边一样错 ⇒
+   逐条差分**结构上抓不到**（差分只比指令形状）。
+   **修法**：短路路径补 `Copy(dst, l)`，并**显式 `Jump`** 跳过短路块
+   （否则 DAG 块边界的 fall-through 边会把短路块也激活 ⇒ 两条路都执行）。
+2. **`--opt=1` / `--opt=2` 让「末语句是裸字面量」的程序丢值**：
+   `1` ⇒ `Float(1.0)` 变 `Nil`。根因是 SSA-DCE 的「隐式返回」保护带一个
+   `.filter(|&d| d > 0)`，把**寄存器 0**排除在外 —— 而这正是「值在第一条
+   指令里」的情形。**既有**缺陷（默认不开优化，需显式 `--opt`）。
+3. **parser 手术误删了两条解析语义**：
+   - `return` 的**程序顶层拦截**（D42）被连带删掉 ⇒ 顶层 `return` 又能
+     静默终止整个程序；
+   - `with` 体的**作用域换入**被删掉 ⇒ `with` 里的 `return` 被误拒、
+     `break`/`continue` 的循环深度不再按函数体作用域归零。
+   ⇒ 修复：把「循环外 `break`/`continue` 是错误」的判据从 IR 的
+     `loop_stack`（标签栈）迁到**解析期循环深度**（`EmitContext::parse_loop_depth`），
+     并恢复 `with` 体的作用域换入。
+
+⇒ 这三条都说明一件事：**差分能覆盖「两条路径不一致」，覆盖不了
+「两条路径一起错」**。退役差分必须同时换上「期望输出」判据，否则覆盖是**净减少**。
+
+#### breaking 变更（尚未发布）
+
+- **裸 `perform`（无匹配 `handle`）**：由「静默 no-op」变为
+  **typeck 拦截**（效果行不匹配）⇒ 编译期报错，不再是运行期 `unhandled effect`。
+- **`MORA_9LAYER=0` 环境变量被删除**（原本用于切换到参考实现；该实现已不存在）。
+  设了它也**不再有任何效果**（不是「回落到旧路径」，而是「什么也不做」）。
+- **`or` / `and` 的返回值**：此前在短路路径上**未定义**（表现为「依赖它的
+  后续语句整条不执行」），现在按短路语义取被短路掉的那个操作数。
+
+
+### D473：编排接入 9 层 + **删除回落机制** —— 生产路径成为 9 层唯一路径
+
+D472 把 8 类构造接进 9 层后，只剩 `orchestrate` 一类仍回落。D473 补齐它，
+并**删除整条回落机制** —— 9 层自此是**唯一**生产编译路径。
+
+#### 编排为什么接不上：不是节点缺失，是**表示有损**
+
+`fcfg::OrchestrateKind<M>` 是 witness 编排载荷的**有损投影**：agent 体、
+边条件、`state_schema` / `checkpoint` / `interrupt_points` / `adjacency`、
+MoA/MoE 的 prompt **全部丢失**（MoE 甚至把专家名写成了 `format!("{:?}", span)`）。
+
+而它的**唯一消费者**（`fcfg_lower`）本来就把投影结果整体替换成
+`Sequential { agents: vec![] }` 占位（注释：「转换需要 agent 定义，桥接层暂用
+Sequential 占位」）—— **这份有损数据从头到尾没被用过**，只让 9 层产不出真正的
+`MirInst::Orchestrate`（于是 orchestrate 程序必然差分失败、必然回落）。
+
+**修法**：FCFG 节点改为**原样承载** witness 的 `WitnessOrchestrateKind`
+（并删掉那份有损投影及其 `PregelConfig` / `MoALayer`），witness→Mir 的转换
+交给 **FCFG→MIR 桥接层** —— 那正是该层的职责。
+
+关键点：**emit 路径本来就调用同一个**
+`MirOrchestrateKind::from_witness_kind`（`parser_v3/emit.rs::emit_orchestrate_w`），
+故两条路径产出的 `MirInst::Orchestrate` **逐字段相同** ⇒ 差分恒绿。
+
+编排是**数据构造语句**（不参与控制流），其载荷是**数据**而非 CFG 结构 ——
+按原样透传与 `Node::RelDef { clauses }` 同款。
+
+#### 顺带修掉一个**双执行 bug**
+
+实测（真实 CLI）：`orchestrate graph` 的 agent 体被**执行两次** ——
+顶层平铺副本一次、编排器再一次；**不可达** agent 的平铺副本也照跑。
+
+根因：编排块的表达式（agent 体 / 边条件 / MoA·MoE 的 prompt·router·expert
+定义）此前被发射进**主上下文**，形成一份平铺副本。而这些表达式的**真正
+归宿**是编排载荷（agent 的 `task_body`、边的 `condition_body`、`prompt_fn`、
+`router_fn`、`def_fn`）—— 由 witness **单独 lower**，顶层那份是**多余的**。
+
+⇒ 解析期间把 `EmitContext` 换成独立的，结束时丢弃（`parser_v3/syntax.rs`）。
+修后：agent 体只跑一次，不可达 agent 不再跑，两条路径输出**完全一致**。
+
+#### 删除回落机制
+
+| | D473 前 | D473 后 |
+|---|---|---|
+| 生产编译路径 | 9 层 + 差分，失败则**回落**旧路径 | **9 层唯一** |
+| 每次编译的代价 | 双 lowering + 逐条差分 | 单次 lowering |
+| `import` / runtime `eval` / REPL | 直接消费 `emit.rs` 直出产物 | **全部走 9 层** |
+| 差分的角色 | 生产门（决定走哪条路） | **CI 等价性验证** |
+| `src/mir/legalization.rs` | 显式合法性登记 + 三态回落门 | **删除** |
+
+**实测编译开销**（同一台机器、同一个 300 个 task 的程序、debug build，各 4 轮取稳定值）：
+
+| | 耗时 |
+|---|---|
+| D473 前：9 层 + 差分 + 回落机制 | **317 ms** |
+| D473 后：9 层唯一（无差分） | **~270 ms** |
+| 参考实现（`MORA_9LAYER=0`，旧路径） | ~235 ms |
+
+⇒ **影子差分那一份编译彻底省掉了**（−47 ms / **−15%**）。
+剩余的「9 层 ~270 ms vs 参考实现 ~235 ms」是 9 层**自身**的 lowering 更重
+（witness → FCFG → MIR 三步 vs 解析期直出 MIR），**不是浪费**。
+
+**差分从生产门降为 CI 验证**：9 层是**规范**，`emit.rs` 参考实现是**对照物**
+（golden model），二者不一致 = 9 层的 bug，由 CI 抓住
+（`tests/nine_layer_full_census.rs` 117 个程序 +
+`tests/nine_layer_differential.rs` 19 fixture 双级差分）。
+生产不再为此付费，也不再有「静默换一条更差的路径」（D1 那一族缺陷）。
+
+⚠ `MORA_9LAYER=0` 保留，但语义改为「**显式选用参考实现**」（供 `tests/`
+的等价性测试用），**不再**是静默回落开关。
+
+#### 现在的编译路径
+
+```text
+Token → ParserV3::compile() → MirWitness[]
+    ↓
+  witness_to_fcfg()  → Vec<Node<()>>    \[FCFG\]
+    ↓
+  lower_fcfg()       → MirInst[]        \[MIR —— 执行器消费它\]
+    ↓
+  apply_rules → SSA opt → regalloc
+```
+
+CLI / `import` / runtime `eval` / REPL **四处**共用
+`mir::pipeline::compile_optimized`。
+
+#### 未做
+
+- **`parser_v3/emit*.rs` 的 MirInst 直出（约 5000 行）尚存** —— 它现在是差分
+  验证的**对照物**，不再是生产路径。删它需要把 parser 改成只产 witness，
+  是一次独立的 parser 级手术。
+
+### D472：9 层管线补齐 —— 8 类构造接入，普查回落 **4 → 0**
+
+**目标**：把 9 层 IR 管线从「大部分程序走管线、少数回落」推进到
+**除 `orchestrate` 外全部语言构造都走管线**，为「删除旧 `emit.rs` 直出路径 +
+差分机制」铺路（AGENTS.md §0.1「禁止向后兼容优先压在架构正确之上」）。
+
+#### 根因：witness 层**根本没有**这些构造的表示
+
+9 层管线是 `MirWitness → FCFG → MIR`。此前 4 类构造的 parser 侧只发射
+`MirInst`，把结构压成**扁平 `Sequence`** 后就丢弃了：
+
+| 构造 | parser 侧 | witness 侧 | 9 层能否产出 |
+|------|-----------|-----------|-------------|
+| `worker` | `MirInst::Worker` | `Sequence(body_wits)` | ❌ 结构上产不出 |
+| `transaction` | `MirInst::Transaction` | `Sequence(body_wits + comp_wits)` | ❌ 补偿段与事务体**无法区分** |
+| `eval` | `MirInst::Eval` | `Sequence(vec![])`（given/expects 被丢） | ❌ 产出 0 条指令 |
+| `aggregate` | `MirInst::Aggregate` | `Sequence(vec![])`（贡献值被丢） | ❌ 产出 0 条指令 |
+
+⇒ 「9 层降级链里没有 `Worker` 类别」这句旧记档**说浅了**：不是降级链没写，
+是**连节点类型都没有**。FCFG 侧同样缺 `Node::Worker` / `Node::Transaction` /
+`Node::Eval` / `Node::Aggregate`。
+
+全量普查（78 个仓库真实 `.mora` + 50 个合成构造）另外挖出 **4 类原登记表
+漏掉**的构造 —— 它们此前同样差分必红，只是**从未被登记**，于是回落时既不
+点名也不报错（**静默回落**）：
+
+| 构造 | 根因 |
+|------|------|
+| `commit` / `rollback` | witness 是空 `Sequence` |
+| `pipe` | `WitnessKind::Pipe` 曾于 v0.75.20 被当「死变体」删除（`typeck/hm/infer.rs` 记档：管道在 parse 侧脱糖为 `Call`），但 **emit 路径发射的是 `MirInst::Pipe` 指令** —— 指令与 witness **不同构** |
+| `aggregate` | 同上表 |
+
+#### 改动
+
+- **Witness 层**（`src/mir/witness.rs`）：新增 `Worker` / `Transaction` /
+  `Eval` / `Aggregate` / `Pipe` / `Commit` / `Rollback` 共 7 个变体，
+  `child_witnesses` 同步枚举。
+- **FCFG 层**（`src/mir/fcfg.rs`）：新增对应 7 个 `Node<M>` 变体。
+- **降维**（`src/mir/witness_to_fcfg.rs` + `src/mir/fcfg_lower.rs` +
+  `src/mir/lower.rs`）：三条 lowering 路径（FCFG 桥接 / 旧 `WitnessLowerer`）
+  产出**逐条同形**的指令 —— 差分判据才可能绿。
+- **parser**（`src/parser_v3/emit.rs`）：产出上述新 witness；`transaction` 的
+  补偿段与事务体**分列**两个 witness（此前被 `extend` 合并）。
+- **ripple**：8 处非穷尽 `match` 补齐（`typeck/{annotate,bidirectional,hm/mod}`、
+  `mir/{ehir_to_core,lower,fcfg}`、`lsp/providers/parsed_doc_v3`）。
+
+#### 顺带修好的 3 个**真实缺陷**（此前被回落的差分红掩盖）
+1. **裸 `perform` 静默 no-op** —— `emit_perform_w` 此前**只产 witness、不发
+   指令**，于是 `g = perform Ai("x")` 把 `g` 绑成**寄存器 0 的旧值**，
+   用户写的 effect 请求被无声吞掉。这与 `h_perform` 的既定契约
+   （`handlers/effects.rs`：无匹配 handler 时返回 `unhandled effect` 错误）
+   **直接矛盾**，而 typeck 也**未**拦截裸 perform（实测 `--check` 报
+   "No type errors found"）。现 emit 侧也发射 `MirInst::Perform`。
+2. **管道指令与 witness 不同构** —— 见上表 `pipe` 条。
+
+⚠ `eval` / `aggregate` 的**语句值语义逐字保留**（未改）：二者的值 = **被断言
+/ 被贡献表达式的值**（`given_reg` / `value_reg`），**不是** Nil，也**不是**
+旧实现里那个「硬编码寄存器 0」。
+
+- 旧实现把返回值硬编码为**寄存器 0** ⇒ 块尾 `Return(0)` 返回的是**寄存器 0
+  的旧值**（实测 `task f() let x = 42 / eval 1,1 end` 的 `f()` 返回 42）——
+  这确实是缺陷，但**修法不是改成 Nil**：
+- spec §14.2 的 `eval_expr` 产生式（`eval("1")`）在 `tests/spec_ebnf_surface.rs`
+  里钉着期望值 `String("1")` —— 即 **given 的值**。改成 Nil 会让该 spec 用例
+  变红（`OK:Nil`）。
+- ⇒ 最终取「**given / value 表达式的值**」：既修掉了「寄存器 0 的旧值」这个
+  无意义的语义，又保住 spec 用例。9 层路径与 emit 路径**逐条同形**。
+
+#### 行为变更（**breaking**，尚未发布）
+
+- **裸 `perform` 从「静默 no-op」变为「运行期报 `unhandled effect`」**。
+  这是向 `h_perform` 既定契约的回归，但**确实是行为变更**：
+  此前写 `perform` 却什么都没发生的程序，现在会报错退出。
+- **`eval` / `aggregate` 作为块尾语句时，所在函数的返回值从「寄存器 0 的旧值」
+  变为「被断言 / 被贡献表达式的值」**（上面第 2 条的实测例：42 → 1）。
+  这不是 Nil —— 见该条的说明。
+
+#### 验证
+
+| | D472 前 | D472 后 |
+|---|---|---|
+| 普查表（`nine_layer_fallback_census.rs`）回落项 | 4 | **0** |
+| 全量普查（78 个真实 `.mora` + 50 个合成构造）回落项 | 5 + 4 静默 | **0** |
+| `nine_layer_legalization_registry.rs` 登记项 | 4 | 1（`orchestrate`） |
+| `nine_layer_block_equivalence.rs` 执行级不等价项 | 1（`eval`） | **0** |
+
+#### 另修：D468 遗留的 2 条**过期测试期望**（与本刀无因果关系，但会让 CI 红）
+
+全量测试套此前有 **1 个红**：`tests/mixed_float_bigint_precision.rs` 的
+`d359_in_range_mixed_arithmetic_still_works`。**取证确认它与 D472 无关** ——
+`git stash` 后在 HEAD 上同样红（实得 `2n`），且改动范围完全不含数值塔
+（`src/flow.rs` / `src/flow/numeric/` 未被本刀触碰）。
+
+根因是 **D468 统一数值塔后，该测试的期望没同步**（D468 只更新了
+`int_overflow_*` 与 `jit_compile` 两个测试文件）。两条期望都编码了
+**统一前**那个「同一组操作数、因运算符不同而结果类型不同」的行为：
+
+| 用例 | 旧期望 | 统一后 | 旧行为的来源 |
+|------|--------|--------|-------------|
+| `3 - 1n` | `2.0`（Float） | **`2n`**（BigInt） | `Sub` 走 f64 round-trip，`Add` 走提升 |
+| `3.0 / 2n` | `1.5`（Float） | **`1n`**（BigInt） | `Div` 走 f64 round-trip，`Add` 走提升 |
+
+⇒ 现按统一后的语义订正期望（**不改数值塔本身**）：`3.0` 与 `3n` 是同一个值，
+按 D198 的「最小惊讶」规则提升为 BigInt，故 `3.0 / 2n` ≡ `3n / 2n` = `1n`
+（BigInt 域本就是整除）。这与**下一行** `3 + 1n` → `4n` 一致 ——
+**运算符不再改变结果类型**，正是 D468 要消除的不自洽。
+
+同时订正 `src/flow/numeric/mod.rs` 的跨塔规则表：原表写
+「`Float ⊗ BigInt` → Float」，与实现（整数值 float 提升为 BigInt）矛盾；
+现改为「两段式」并写明判据是**操作数的值**而非**字面量的写法**。
+
+#### 又 2 条 D468 遗留（同族，且此前被 `cargo test` 的 fail-fast 遮住）
+
+`cargo test` **默认 fail-fast**（首个失败目标即停），故 HEAD 上「红在第一个
+失败处」掩盖了后面的。D472 修掉前一个之后，`tests/numeric_tower.rs` 的
+2 条才露出来——**同样在 HEAD 上就红**（`git stash` 复验：与本刀无关）。
+
+| 用例 | 旧期望 | 现结果 | 性质 |
+|------|--------|--------|------|
+| `[10n,20n] - 1.0` | `List([Float(9.0), Float(19.0)])` | `List([BigInt(9), BigInt(19)])` | 过期期望（统一前的 operator 相关性） |
+| `4n < 4.5` / `4n > 3.5` | `Bool(true)` | **ERR**（修复前） | **真 bug** |
+
+**真 bug 的根因**（`src/flow/numeric/mod.rs` 的 `compare`）：
+`(Float, BigInt)` / `(BigInt, Float)` 两个臂用
+`guard::float_fits_bigint_exactly` 把关，而该判据只接受**整数值** float
+（`fract() == 0.0`）。于是：
+
+- `4n < 4.5`（4.5 **带小数**）⇒ 落到「float 超出 f64 精确表示范围」的报错
+  分支 ⇒ 合法比较被拒，且**错误信息驴唇不对马嘴**（4.5 不是整数，与
+  「2^53 以内的整数」毫无关系）；
+- 那个报错分支本来是为了防 `4.5 as i128` 截断成 4 —— 担忧是对的，但
+  **不该用「整数值」判据去挡带小数的 float**。
+
+**修法**：带小数的 float **不提升为 BigInt**（提升会截断），改走 f64 比较，
+并用 `guard::bigint_fits_float_exactly` 保证 BigInt 侧**无损**装得下 f64
+（装不下就报错 —— 宁可报错，不返回错的序）。
+⇒ `4n < 4.5` → `Bool(true)`，`4n > 3.5` → `Bool(true)`。
+
+同时订正 `src/flow/numeric/mod.rs` 的跨塔规则表：原表写
+「`Float ⊗ BigInt` → Float」，与实现（整数值 float 提升为 BigInt）矛盾；
+现改为「两段式」并写明判据是**操作数的值**而非**字面量的写法**。
+
+#### 未做（下一步，需独立决策）
+
+- **`orchestrate` 仍未接入 9 层** —— 根因**不是**节点类型缺失，而是
+  **9 层 FCFG 的编排表示承载不下运行时元数据**：`fcfg::OrchestrateKind<M>`
+  只有 `vertices` / `edges` 的**名字**，而 `MirOrchestrateKind` 需要 agent 体
+  （`MirAgentDef`）、边条件（`MirEdgeDef`）、`state_schema` / `checkpoint` /
+  `interrupt_points` / `adjacency`，MoA/MoE 还需 `prompt` 与预 lowering 的
+  `prompt_fn`。`fcfg_lower` 目前只能降出 `Sequential` 占位（**丢掉全部
+  agent**）。补齐它需要扩充 FCFG 的编排表示 + 一条完整的转换 ——
+  是独立子工程。**在此之前不能删除回落机制**，否则 orchestrate 程序会
+  静默丢 agent。现已把 `orchestrate` 显式登记为未 legalize 构造，
+  它的回落是「预期（stderr 点名）」而非「回归」。
+- **删除回落分支 + 差分机制 + `legalization.rs` 的三态门** —— 被上一条阻塞。
+- **`import` / runtime `eval` / REPL 切到 9 层** —— 这三条入口
+  （`interpreter/mod.rs::mir_import`、`interpreter/builtin_impls.rs` 的
+  runtime `eval`、`interpreter/mod.rs` 的 REPL）**至今直接消费
+  `ParserV3::compile` 的 MirFunction，根本没走 9 层管线**。
+- **删除 `parser_v3/emit*.rs` 的 MirInst 直出** —— 上述三条入口切到 9 层后
+  即成为死代码，约 5000 行 parser 手术。
 
 ### D470：debug profile 调试信息降档 —— 治「全量测试产出 104 GB PDB」
 

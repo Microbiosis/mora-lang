@@ -51,14 +51,13 @@
 //! 它拦的是「选项出现在文件名位置」，根本进不到子命令的 flag 循环 ——
 //! 与本文件拦的「进了子命令、但 flag 名不认识」**互补而非重叠**，两者都留着。
 
-use std::path::PathBuf;
+use mora::test_support::TempDir;
 use std::process::Command;
 
-struct WorkDir(PathBuf);
+struct WorkDir(TempDir);
 impl WorkDir {
     fn new(tag: &str) -> Self {
-        let d = std::env::temp_dir().join(format!("mora_d380_{tag}"));
-        let _ = std::fs::remove_dir_all(&d);
+        let d = TempDir::new(tag);
         std::fs::create_dir_all(d.join(".mora").join("recordings")).expect("建临时目录");
         std::fs::write(
             d.join(".mora").join("recordings").join("r1.jsonl"),
@@ -185,9 +184,7 @@ fn d380_unknown_flag_is_rejected() {
 /// 实测：`mora snapshot f.mora r1 --updat`（错拼）静默忽略、exit 0。
 #[test]
 fn d380_snapshot_unknown_flag_is_rejected() {
-    let dir = std::env::temp_dir().join("mora_d380_snap");
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("建临时目录");
+    let dir = TempDir::new("mora_d380_snap");
     let script = dir.join("s.mora");
     std::fs::write(&script, "print(1)\n").expect("写脚本");
     let exe = concat!(env!("CARGO_MANIFEST_DIR"), "/target/debug/mora.exe");

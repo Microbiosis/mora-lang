@@ -8,7 +8,7 @@
 agent orchestration and cloud-native observability. One binary ships both
 an HTTP server and an MCP server.
 
-[Architecture](docs/ARCHITECTURE.md) · [CHANGELOG](CHANGELOG.md) · [Influences](docs/influences.md) · [Spec](docs/mora-spec.md)
+[Architecture](docs/architecture-diagram.md) · [CHANGELOG](CHANGELOG.md) · [Influences](docs/influences.md) · [Spec](docs/mora-spec.md)
 
 ## Highlights
 
@@ -29,7 +29,7 @@ an HTTP server and an MCP server.
   deterministic AI-call regression testing, `.mora/recordings/*.jsonl`.
 - **Single-pass compile + MIR SSA + JIT** — Lexer → ParserV3 →
   `MirFunction<MirInst>` + `MirWitness` → witness typecheck → MIR
-  optimize → DAG → `vm::run_mir`; copy-and-patch JIT always compiled
+  optimize → DAG → `vm::execute`; copy-and-patch JIT always compiled
   (v0.75.43, no feature gate).
 - **HM type inference** — Hindley-Milner inference is the default
   type checker (`src/typeck/hm/`); v0.75.29 removed the dead
@@ -352,7 +352,7 @@ Run any file with `mora path/to/file.mora`:
 - [docs/mora-spec.md](docs/mora-spec.md) — language spec, 20 chapters
 - [docs/influences.md](docs/influences.md) — 9-language heritage
 - [docs/learning-plan.md](docs/learning-plan.md) — 6-stage learning path
-- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — runtime architecture (v0.50 snapshot)
+- [docs/architecture-diagram.md](docs/architecture-diagram.md) — module-level runtime architecture (current)
 - [CHANGELOG.md](CHANGELOG.md) — full version history
 
 ## Tests

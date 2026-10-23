@@ -2,7 +2,7 @@
 //!
 //! MIR-plain（线性指令列表 + 直接索引跳转） → MIR-ssa（基本块 + phi + 单赋值）
 //!
-//! 算法（PHASE_ALPHA_IR_DESIGN.md §2.2）：
+//! 算法（基本块划分 → 支配树 → 支配边界/phi → DFS 重命名 → deconstruct）：
 //! 1. 基本块划分 — Label 入口，terminator 出口
 //! 2. 支配树（迭代数据流，CFG 块数少 ~20）
 //! 3. 支配边界 + phi 插入

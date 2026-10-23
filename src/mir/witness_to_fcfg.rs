@@ -18,13 +18,10 @@
 
 use crate::common::Literal;
 use crate::mir::fcfg::{
-    Block, MatchArm, Node, OrchestrateKind, Param, Pattern, QuasiquoteSegment, Reg, TypeAnnotation,
-    Variant,
+    Block, MatchArm, Node, Param, Pattern, QuasiquoteSegment, Reg, TypeAnnotation, Variant,
 };
 use crate::mir::hint::TypeHint;
-use crate::mir::witness::{
-    MirWitness, WitnessCallee, WitnessKind, WitnessOrchestrateKind, WitnessParam, WitnessPattern,
-};
+use crate::mir::witness::{MirWitness, WitnessCallee, WitnessKind, WitnessParam, WitnessPattern};
 
 /// 转换上下文 — bump 寄存器分配器 + 循环栈（break/continue 跳转目标）。
 struct FcfgBuilder {
@@ -123,18 +120,18 @@ fn build_node(b: &mut FcfgBuilder, w: &MirWitness) -> Node<()> {
         }
         WitnessKind::Or { left, right } => {
             let lhs = build_node(b, left);
-            let rhs = build_node(b, right);
             let l = node_result_reg(&lhs);
-            let r = node_result_reg(&rhs);
+            // v0.104.6 D477：rhs 是**未求值的块**，不是已算好的寄存器 ——
+            // 短路求值要求 rhs 只在「lhs 为假」这条路上求值。
+            let rhs = build_block(b, right);
             let dst = b.alloc();
             Node::Sequence {
                 nodes: vec![
                     lhs,
-                    rhs,
                     Node::Or {
                         dst,
                         lhs: l,
-                        rhs: r,
+                        rhs,
                         span,
                         meta: (),
                     },
@@ -145,18 +142,17 @@ fn build_node(b: &mut FcfgBuilder, w: &MirWitness) -> Node<()> {
         }
         WitnessKind::And { left, right } => {
             let lhs = build_node(b, left);
-            let rhs = build_node(b, right);
             let l = node_result_reg(&lhs);
-            let r = node_result_reg(&rhs);
+            // v0.104.6 D477：同上 —— rhs 是块，只在「lhs 为真」时求值。
+            let rhs = build_block(b, right);
             let dst = b.alloc();
             Node::Sequence {
                 nodes: vec![
                     lhs,
-                    rhs,
                     Node::And {
                         dst,
                         lhs: l,
-                        rhs: r,
+                        rhs,
                         span,
                         meta: (),
                     },
@@ -592,11 +588,15 @@ fn build_node(b: &mut FcfgBuilder, w: &MirWitness) -> Node<()> {
             result_var,
             kind,
         } => {
-            let mir_kind = build_orchestrate_kind(b, kind);
+            // v0.104.6 D473：载荷**原样**透传（此前经 `fcfg::OrchestrateKind<M>`
+            // 的有损投影，agent 体 / 边条件 / prompt 全部丢失，
+            // 而其唯一消费者又整体替换成 `Sequential` 占位）。
+            let dst = b.alloc();
             Node::Orchestrate {
                 input_var: input_var.clone(),
                 result_var: result_var.clone(),
-                kind: mir_kind,
+                kind: kind.as_ref().clone(),
+                dst,
                 span,
                 meta: (),
             }
@@ -788,6 +788,130 @@ fn build_node(b: &mut FcfgBuilder, w: &MirWitness) -> Node<()> {
             span,
             meta: (),
         },
+        // ── v0.104.6 D472：4 类此前在 witness 层无表示、FCFG 层无节点的构造 ──
+        //
+        // 此前它们只有 emit 路径的 MirInst，witness 侧被压成扁平 Sequence，
+        // 于是 9 层降级链**结构上**产不出对应指令 → 必然回落旧路径。
+        WitnessKind::Worker { name, body } => {
+            let body_block = build_block(b, body);
+            // 语句型构造必须有自己的结果寄存器（值为 Nil）——
+            // 与 emit 路径 worker 分支的 `Const(dst, Nil)` 同形。
+            let dst = b.alloc();
+            Node::Worker {
+                name: name.clone(),
+                body: body_block,
+                dst,
+                span,
+                meta: (),
+            }
+        }
+        WitnessKind::Transaction { body, compensation } => {
+            let body_block = build_block(b, body);
+            let comp_block = build_block(b, compensation);
+            let dst = b.alloc();
+            Node::Transaction {
+                body: body_block,
+                compensation: comp_block,
+                dst,
+                span,
+                meta: (),
+            }
+        }
+        WitnessKind::Eval {
+            name,
+            given,
+            expects,
+            tolerance,
+            replay_path,
+        } => {
+            // **求值顺序**必须与 emit 路径一致：先算 given、再算各 expect、
+            // 最后发 Eval 指令。故值节点先进 Sequence，Eval 节点压尾。
+            let mut nodes: Vec<Node<()>> = Vec::new();
+            let given_node = build_node(b, given);
+            let given_reg = node_result_reg(&given_node);
+            nodes.push(given_node);
+            let mut expect_regs = Vec::new();
+            for e in expects {
+                let n = build_node(b, e);
+                expect_regs.push(node_result_reg(&n));
+                nodes.push(n);
+            }
+            let dst = given_reg; // 语句的值 = given 表达式的值（与 emit 路径同形）
+            nodes.push(Node::Eval {
+                name: name.clone(),
+                given: given_reg,
+                expects: expect_regs,
+                tolerance: *tolerance,
+                replay_path: replay_path.clone(),
+                dst,
+                span,
+                meta: (),
+            });
+            Node::Sequence {
+                nodes,
+                span,
+                meta: (),
+            }
+        }
+        WitnessKind::Aggregate { name, value } => {
+            // 同 Eval：先算贡献值，再发 Aggregate。
+            let mut nodes: Vec<Node<()>> = Vec::new();
+            let value_node = build_node(b, value);
+            let value_reg = node_result_reg(&value_node);
+            nodes.push(value_node);
+            let dst = value_reg; // 语句的值 = 被贡献表达式的值（与 emit 路径同形）
+            nodes.push(Node::Aggregate {
+                name: name.clone(),
+                value: value_reg,
+                dst,
+                span,
+                meta: (),
+            });
+            Node::Sequence {
+                nodes,
+                span,
+                meta: (),
+            }
+        }
+        WitnessKind::Pipe { left, right } => {
+            // 顺序必须与 emit 路径一致：先算左侧 → 再算右侧 → 最后发 Pipe。
+            let mut nodes: Vec<Node<()>> = Vec::new();
+            let left_node = build_node(b, left);
+            let left_reg = node_result_reg(&left_node);
+            nodes.push(left_node);
+            let right_node = build_node(b, right);
+            let right_reg = node_result_reg(&right_node);
+            nodes.push(right_node);
+            let dst = b.alloc();
+            nodes.push(Node::Pipe {
+                dst,
+                left: left_reg,
+                right: right_reg,
+                span,
+                meta: (),
+            });
+            Node::Sequence {
+                nodes,
+                span,
+                meta: (),
+            }
+        }
+        WitnessKind::Commit => {
+            let dst = b.alloc();
+            Node::Commit {
+                dst,
+                span,
+                meta: (),
+            }
+        }
+        WitnessKind::Rollback => {
+            let dst = b.alloc();
+            Node::Rollback {
+                dst,
+                span,
+                meta: (),
+            }
+        }
         WitnessKind::Parallel { body } => Node::Parallel {
             body: build_block(b, body),
             span,
@@ -969,6 +1093,20 @@ fn node_result_reg_of(n: &Node<()>) -> Option<Reg> {
         // → `with model = "gpt-4o" / 2 / end` 的块结果变成 `String("gpt-4o")`，
         // 而裸路径是 `Nil`。与上面 D35 的 `Handle` arm 同一类。
         | Node::WithConfig { dst: reg, .. }
+        // v0.104.6 D472：4 类新构造都是**语句型**，但各自持有自己的结果
+        // 寄存器（值为 Nil）。缺此 arm 时它们落 `unwrap_or(0)` → 块结果指向
+        // **寄存器 0**（恰是前面某个绑定的值）——与 D35(`Handle`)/D58(`WithConfig`)
+        // 同一类失败形态：块尾 `Return` 引用一个语义不对的寄存器。
+        | Node::Worker { dst: reg, .. }
+        | Node::Transaction { dst: reg, .. }
+        | Node::Eval { dst: reg, .. }
+        | Node::Aggregate { dst: reg, .. }
+        // v0.104.6 D472：管道 + commit / rollback 同理（各有自己的结果寄存器）
+        | Node::Pipe { dst: reg, .. }
+        | Node::Commit { dst: reg, .. }
+        | Node::Rollback { dst: reg, .. }
+        // v0.104.6 D473：编排语句的结果寄存器（值为 Nil）—— 与 emit 路径同形。
+        | Node::Orchestrate { dst: reg, .. }
         | Node::Quasiquote { dst: reg, .. } => Some(*reg),
         // v0.104.6 D120：solve 产生**解列表**，是值产生节点。缺此 arm 时
         // `let r = solve { … }` 的绑定拿到哨兵 0，就绪门槛恒 false。
@@ -1037,84 +1175,6 @@ fn witness_pattern_to_pattern(p: &WitnessPattern) -> Pattern {
             Box::new(witness_pattern_to_pattern(pattern)),
             TypeAnnotation(name.clone()),
         ),
-    }
-}
-
-/// WitnessOrchestrateKind → fcfg::OrchestrateKind。
-fn build_orchestrate_kind(_b: &mut FcfgBuilder, k: &WitnessOrchestrateKind) -> OrchestrateKind<()> {
-    use crate::mir::witness::WitnessOrchestrateKind as W;
-    match k {
-        W::Sequential { .. } => OrchestrateKind::Sequential,
-        W::Loop { .. } => OrchestrateKind::Loop {
-            body: Block {
-                nodes: vec![],
-                result: None,
-            },
-        },
-        W::Graph { agents, edges } => OrchestrateKind::Graph {
-            vertices: agents.iter().map(|a| a.name.clone()).collect(),
-            edges: edges
-                .iter()
-                .map(|e| (e.from.clone(), e.to.clone()))
-                .collect(),
-        },
-        W::Pregel { agents, edges, .. } => OrchestrateKind::Pregel {
-            config: crate::mir::fcfg::PregelConfig {
-                vertices: agents.iter().map(|a| a.name.clone()).collect(),
-                edges: edges
-                    .iter()
-                    .map(|e| (e.from.clone(), e.to.clone()))
-                    .collect(),
-                compute: Block {
-                    nodes: vec![],
-                    result: None,
-                },
-                combine: None,
-                max_supersteps: None,
-            },
-        },
-        W::Moa {
-            proposers,
-            aggregator,
-            ..
-        } => OrchestrateKind::MoA {
-            layers: vec![crate::mir::fcfg::MoALayer {
-                proposers: vec![],
-                aggregator: crate::mir::fcfg::Block {
-                    nodes: vec![],
-                    result: None,
-                },
-            }],
-        }
-        .tag_moa(proposers, aggregator),
-        W::Moe {
-            experts,
-            router,
-            top_k,
-            ..
-        } => OrchestrateKind::MoE {
-            // v0.104.6 D270：专家项现为 `WitnessMoeExpert`，span 在其 `def` 上。
-            experts: experts
-                .iter()
-                .map(|e| format!("{:?}", e.def.span))
-                .collect(),
-            router: format!("{:?}", router.span),
-            top_k: *top_k,
-        },
-    }
-}
-
-/// MoA 层标注辅助（witness 层的 proposers/aggregator 名单填入 fcfg）。
-trait MoaTag {
-    fn tag_moa(self, _proposers: &[String], _aggregator: &str) -> Self;
-}
-
-impl MoaTag for OrchestrateKind<()> {
-    fn tag_moa(self, proposers: &[String], aggregator: &str) -> Self {
-        // fcfg::MoALayer 的 proposers 是 Block，witness 层是名字列表 —
-        // 暂存到 layers 数量中，完整 agent 定义待 emit 拆分时补全。
-        let _ = (proposers, aggregator);
-        self
     }
 }
 

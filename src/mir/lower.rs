@@ -66,6 +66,21 @@ pub struct EmitContext {
     /// （见 `emit_definitions.rs::emit_return_break_continue_w` 的守卫）。
     /// 与 `loop_stack` 同款：`break`/`continue` 靠它判「循环外」。
     pub is_program_top: bool,
+    /// v0.104.6 D474：解析期**循环深度** —— `break`/`continue` 的合法性判据。
+    ///
+    /// 「循环外 `break`/`continue` 是错误」是**解析语义**（判源码位置），
+    /// 不是 IR 语义（判跳转标签）。D474 之前它挂在 `loop_stack` 上是历史偶然 ——
+    /// `loop_stack` 是 IR 的跳转标签栈，parser 借它当「是否在循环内」的标记；
+    /// D474 把 parser 的 MirInst 直出删干净后，`loop_stack` 在 parser 侧永远为空，
+    /// 于是合法写法里的 `break`/`continue` 一律被拒（解析失败）。
+    ///
+    /// 放在 `EmitContext` 里与 `is_program_top` 同款：**独立寄存器空间的边界
+    /// 恰好就是 `EmitContext` 的换入换出** —— task / closure / macro /
+    /// match arm / worker / transaction / observe / parallel / app / update
+    /// 的体都是全新 `EmitContext` ⇒ 深度天然归零，嵌套函数体里的 `break`
+    /// 不会被误认成外层循环的（它们是另一个函数体，本就跳不出外层循环）。
+    /// 内联块（`if` / `for` / `while` / `with` 的体）**不**换上下文，故继承外层深度。
+    pub parse_loop_depth: usize,
     /// v0.104.6 缺陷修复：每层循环**自己**的 `break` 指令索引栈。
     ///
     /// **为什么需要**：循环出口标签在 body 全部 emit 之后才知道，历史上靠
@@ -377,6 +392,28 @@ impl WitnessLowerer {
             }
 
             // ── Logical And/Or (short-circuit) ──
+            //
+            // v0.104.6 D474：**短路路径必须显式给 `dst` 赋值，且必须显式跳过**。
+            //
+            // 此前短路目标直接跳到 `end`（跳过 `BinaryOp`）⇒ `dst` 从未被写过 ⇒
+            // `reg_ready[dst]` 恒 false ⇒ 依赖它的后续 Effect（`print` 等）
+            // 永远不就绪、**整条不执行**（实测 `print(true or false)` 无输出）。
+            //
+            // 该缺陷**既有**（9 层管线 `fcfg_lower` 同款，见那里的完整说明），
+            // 两边一样错 ⇒ 逐条差分抓不到它。
+            //
+            // 结构与 `fcfg_lower` 的 `if/else` 降级同款：那条显式 `Jump(end)`
+            // **不可省** —— 否则 DAG 块边界的 fall-through 边会把短路块也激活。
+            //
+            // v0.104.6 D477：本路径**一直**把 rhs 发射在 `JumpIf` **之后**
+            // ⇒ 它本就是**求值级短路**（rhs 的副作用也不发生）。而生产路径
+            // （`witness_to_fcfg` + `fcfg_lower`）此前把 rhs 当作已算好的
+            // 寄存器排在 `Or` 节点**之前** ⇒ 只短路取值、不短路求值 ⇒
+            // **两条路径语义分叉**（同一个程序，两条编译路径副作用不同）。
+            //
+            // D477 起生产路径改成同样的形状（`Node::Or` 的 rhs 是**未求值的
+            // 块**）⇒ 两条路径的指令序列**逐条一致**。回归护栏：
+            // `tests/short_circuit_evaluation.rs`（行为 + 两路径形状对照）。
             WitnessKind::And { left, right } => {
                 let l = self.lower_witness(left)?;
                 let dst = self.alloc_reg();
@@ -384,8 +421,13 @@ impl WitnessLowerer {
                 let jump_idx = self.emit.insts.len() - 1;
                 let r = self.lower_witness(right)?;
                 self.emit(MirInst::BinaryOp(dst, l, crate::common::BinaryOp::Equal, r));
+                self.emit(MirInst::Jump(0));
+                let skip_idx = self.emit.insts.len() - 1;
+                let short = self.emit.insts.len();
+                self.emit(MirInst::Copy(dst, l));
                 let end = self.emit.insts.len();
-                self.patch_label_at(jump_idx, end);
+                self.patch_label_at(jump_idx, short);
+                self.patch_label_at(skip_idx, end);
                 Ok(dst)
             }
             WitnessKind::Or { left, right } => {
@@ -400,8 +442,13 @@ impl WitnessLowerer {
                     crate::common::BinaryOp::NotEqual,
                     r,
                 ));
+                self.emit(MirInst::Jump(0));
+                let skip_idx = self.emit.insts.len() - 1;
+                let short = self.emit.insts.len();
+                self.emit(MirInst::Copy(dst, l));
                 let end = self.emit.insts.len();
-                self.patch_label_at(jump_idx, end);
+                self.patch_label_at(jump_idx, short);
+                self.patch_label_at(skip_idx, end);
                 Ok(dst)
             }
 
@@ -980,6 +1027,7 @@ impl WitnessLowerer {
                 // { 8 } } { 7 }`）：修前 `r` 为 Nil、`r + 1` 报 "Operands must
                 // be two numbers"。对照 9 层管线的 body 只有 1 条指令（无此
                 // 兜底），运行正确 —— 两条路径的差异正来自这一行。
+                // 〔历史记档：`MORA_9LAYER=0` 已于 v0.104.6 D474 退役〕
                 let _ = (body_reg, handler_reg, body_w, handler_w);
                 Ok(k_dst)
             }
@@ -1195,6 +1243,94 @@ impl WitnessLowerer {
                 self.emit(MirInst::Parallel {
                     body: Box::new(body_mir),
                 });
+                let dst = self.alloc_reg();
+                self.emit(MirInst::Const(dst, crate::value::Value::Nil));
+                Ok(dst)
+            }
+            // ── v0.104.6 D472：4 类新构造 ──
+            //
+            // 与 `fcfg_lower` 的对应 arm **同形**：同样的指令序列、同样的
+            // 「构造指令 + Nil 常量」两段式。两条 lowering 路径（旧的
+            // WitnessLowerer 与新的 FCFG 桥接）必须产出**逐条同形**的指令 ——
+            // 否则差分验证会判它们不等。
+            WitnessKind::Worker { name, body } => {
+                let mut body_l = WitnessLowerer::new();
+                let body_dst = body_l.lower_witness(body)?;
+                body_l.emit(MirInst::Return(Some(body_dst)));
+                let body_mir = body_l.finish();
+                self.emit(MirInst::Worker {
+                    name: name.clone(),
+                    body: Box::new(body_mir),
+                });
+                let dst = self.alloc_reg();
+                self.emit(MirInst::Const(dst, crate::value::Value::Nil));
+                Ok(dst)
+            }
+            WitnessKind::Transaction { body, compensation } => {
+                let mut body_l = WitnessLowerer::new();
+                let body_dst = body_l.lower_witness(body)?;
+                body_l.emit(MirInst::Return(Some(body_dst)));
+                let body_mir = body_l.finish();
+                let mut comp_l = WitnessLowerer::new();
+                let comp_dst = comp_l.lower_witness(compensation)?;
+                comp_l.emit(MirInst::Return(Some(comp_dst)));
+                let comp_mir = comp_l.finish();
+                self.emit(MirInst::Transaction {
+                    body: Box::new(body_mir),
+                    compensation: Box::new(comp_mir),
+                });
+                let dst = self.alloc_reg();
+                self.emit(MirInst::Const(dst, crate::value::Value::Nil));
+                Ok(dst)
+            }
+            WitnessKind::Eval {
+                name,
+                given,
+                expects,
+                tolerance,
+                replay_path,
+            } => {
+                let given_reg = self.lower_witness(given)?;
+                let mut expect_regs = Vec::new();
+                for e in expects {
+                    expect_regs.push(self.lower_witness(e)?);
+                }
+                self.emit(MirInst::Eval {
+                    name: name.clone(),
+                    given_reg,
+                    expects: expect_regs,
+                    tolerance: *tolerance,
+                    replay_path: replay_path.clone(),
+                });
+                // 语句的值 = **given 表达式的值**（与 emit 路径逐字一致，
+                // 且 spec §14.2 的 `eval_expr` 产生式依赖它）。
+                Ok(given_reg)
+            }
+            WitnessKind::Aggregate { name, value } => {
+                let value_reg = self.lower_witness(value)?;
+                self.emit(MirInst::Aggregate {
+                    name: name.clone(),
+                    value: value_reg,
+                });
+                // 同 eval：值 = 被贡献表达式的值。
+                Ok(value_reg)
+            }
+            // ── v0.104.6 D472：管道 + commit / rollback ──
+            WitnessKind::Pipe { left, right } => {
+                let left_reg = self.lower_witness(left)?;
+                let right_reg = self.lower_witness(right)?;
+                let dst = self.alloc_reg();
+                self.emit(MirInst::Pipe(dst, left_reg, right_reg));
+                Ok(dst)
+            }
+            WitnessKind::Commit => {
+                self.emit(MirInst::Commit);
+                let dst = self.alloc_reg();
+                self.emit(MirInst::Const(dst, crate::value::Value::Nil));
+                Ok(dst)
+            }
+            WitnessKind::Rollback => {
+                self.emit(MirInst::Rollback);
                 let dst = self.alloc_reg();
                 self.emit(MirInst::Const(dst, crate::value::Value::Nil));
                 Ok(dst)

@@ -39,16 +39,15 @@
 //! - 规则披露**移到两个分支都打印** —— 原先它只在「没发现密钥」那支，
 //!   恰恰是有发现时你最想知道策略加载情况的时候，它一句话不说。
 
+use mora::test_support::TempDir;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-struct WorkDir(PathBuf);
+struct WorkDir(TempDir);
 
 impl WorkDir {
     fn new(tag: &str) -> Self {
-        let d = std::env::temp_dir().join(format!("mora_d180_{tag}"));
-        let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(&d).expect("建目录");
+        let d = TempDir::new(tag);
         WorkDir(d)
     }
     fn path(&self) -> &Path {

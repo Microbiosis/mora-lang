@@ -75,10 +75,20 @@ pub type Ord = Option<std::cmp::Ordering>;
 /// | Int | BigInt | BigInt | 精确（i64 → BigInt 无损） |
 /// | Float | Float | Float | IEEE 754 |
 /// | Float | Int | Float | 同 `Int ⊗ Float` |
-/// | Float | BigInt | Float | BigInt 侧须装得下 f64，否则报错 |
+/// | Float | BigInt | **见下** | 整数值 float 提升为 BigInt（D198）；否则 Float，BigInt 侧须装得下 f64 |
 /// | BigInt | Int | BigInt | 精确 |
-/// | BigInt | Float | Float | 同 `Float ⊗ BigInt` |
+/// | BigInt | Float | **见下** | 同 `Float ⊗ BigInt` |
 /// | BigInt | BigInt | BigInt | 任意精度 |
+///
+/// ⚠ **`Float ⊗ BigInt` 的结果类型是「两段」的**（D198 的「最小惊讶」规则，
+/// D468 统一）：Float 侧若是**整数值** ⇒ 提升为 BigInt，结果是 **BigInt**
+/// （于是 `3.0 / 2n` = `3n / 2n` = `1n` —— 整除，与 BigInt 域一致）；
+/// Float 侧带小数 ⇒ 结果只能是 **Float**（`1.5 + 1n` = `2.5`）。
+///
+/// ⇒ 判据是**操作数的值**（整数值与否），**不是字面量的写法** ——
+/// `3.0` 与 `3n` 是同一个值，故它们与 `2n` 混算的结果类型必然相同。
+/// 这也意味着**运算符不再改变结果类型**（D468 之前 `Float ⊗ BigInt` 的
+/// `Div` 走 f64 round-trip、`Add` 走提升，同一组操作数因运算符而类型不同）。
 pub fn eval(op: &BinaryOp, left: &Value, right: &Value) -> Result<Value, MoraError> {
     use Value::*;
     match (left, right) {
@@ -228,17 +238,31 @@ pub fn compare(left: &Value, right: &Value) -> Result<Ord, MoraError> {
 
         // Float ⊗ BigInt：Float 侧须能精确表示，否则报错（D199/D359）。
         (Float(a), BigInt(b)) => {
-            if !guard::float_fits_bigint_exactly(*a) {
+            if guard::float_fits_bigint_exactly(*a) {
+                // Float 是整数值且装得下 ⇒ 提升为 BigInt 精确比较。
+                return Ok(Some(bigint::cmp(&BigNum::from(*a as i128), b)));
+            }
+            // Float **带小数** ⇒ 不能提升为 BigInt（`4.5 as i128` 会截断成 4，
+            // 比较的序随之出错）。此时退到 f64 比较 —— BigInt 侧必须**无损**
+            // 装得下 f64（否则 f64 舍入会给出错的序 ⇒ 报错，不静默给错数）。
+            //
+            // v0.104.6 D472 修：此前此处**一律**走「float 超出 f64 精确表示
+            // 范围」的报错分支 ⇒ `4n < 4.5` 这种**带小数**的合法比较也被拒，
+            // 且错误信息驴唇不对马嘴（4.5 不是整数，与「2^53 以内的整数」无关）。
+            if !guard::bigint_fits_float_exactly(b) {
                 return Err(guard::err_float_vs_bigint(*a, b));
             }
-            // Float 是整数值且装得下 ⇒ 提升为 BigInt 精确比较。
-            Ok(Some(bigint::cmp(&BigNum::from(*a as i128), b)))
+            Ok(float::cmp(*a, bigint::to_f64_lossy(b)))
         }
         (BigInt(a), Float(b)) => {
-            if !guard::float_fits_bigint_exactly(*b) {
+            if guard::float_fits_bigint_exactly(*b) {
+                return Ok(Some(bigint::cmp(a, &BigNum::from(*b as i128))));
+            }
+            // 同上：带小数的 float 退到 f64 比较。
+            if !guard::bigint_fits_float_exactly(a) {
                 return Err(guard::err_float_vs_bigint(*b, a));
             }
-            Ok(Some(bigint::cmp(a, &BigNum::from(*b as i128))))
+            Ok(float::cmp(bigint::to_f64_lossy(a), *b))
         }
 
         _ => Err(MoraError::Other("Operands must be numbers".to_string())),

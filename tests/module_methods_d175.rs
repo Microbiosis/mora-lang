@@ -62,7 +62,8 @@
 //! 「表不能空」由上面那条精确比对负责。**如实记账：4 条里 2 条有牙齿，
 //! 2 条是精化护栏。**
 
-use std::path::{Path, PathBuf};
+use mora::test_support::TempDir;
+use std::path::Path;
 use std::process::Command;
 
 /// 三个模块的 `methods_of` 结果（修后应得的精确值）。
@@ -118,17 +119,15 @@ const MUST_NOT_LIST: &[(&str, &[&str])] = &[
 ///   用例都不一样」。`module_methods_introspection.rs` 文件头记过一次同类坑。
 /// - **失败也清理**：写在测试尾部的 `remove_dir_all` 在断言失败 panic 时
 ///   **根本不执行**，于是「失败的测试反而留下垃圾目录」。`Drop` 管得住所有出口。
-struct ProbeDir(PathBuf);
+struct ProbeDir(TempDir);
 
 impl ProbeDir {
     fn new(tag: &str) -> Self {
-        let d = std::env::temp_dir().join(format!("mora_d175_{tag}"));
-        let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(&d).expect("建探针目录");
+        let d = TempDir::new(tag);
         ProbeDir(d)
     }
     fn path(&self) -> &Path {
-        &self.0
+        self.0.path()
     }
 }
 

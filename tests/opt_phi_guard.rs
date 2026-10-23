@@ -51,12 +51,11 @@
 //! 守卫取「SSA 里出现 phi」而不是「CFG 有回边」——前者**更窄**：没有循环
 //! 携带值的循环不产生 phi，仍能享受 SSA 优化。
 
+use mora::test_support::TempDir;
 use std::process::Command;
 
 fn run(src: &str, tag: &str, opt: Option<&str>) -> (i32, Vec<String>) {
-    let dir = std::env::temp_dir().join(format!("mora_d312_{tag}"));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("建目录");
+    let dir = TempDir::new(tag);
     let p = dir.join("p.mora");
     std::fs::write(&p, src).expect("写探针");
     let exe = concat!(env!("CARGO_MANIFEST_DIR"), "/target/debug/mora.exe");

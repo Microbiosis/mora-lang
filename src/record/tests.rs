@@ -1,18 +1,16 @@
 //! v0.25: record 单元测试（录制/重放/审计/快照回路）。
 
 use crate::record::*;
-use std::env;
+use crate::test_support::{TempDir, TempFile};
 use std::fs;
-use std::path::PathBuf;
 
-fn tmp_path(name: &str) -> PathBuf {
-    let mut p = env::temp_dir();
-    p.push(format!(
-        "mora_record_test_{}_{}.jsonl",
-        name,
-        std::process::id()
-    ));
-    p
+fn tmp_path(name: &str) -> TempFile {
+    // v0.104.6 D475：返回**守卫**而不是裸路径 —— 裸路径没有生命周期，
+    // 守卫一旦析构文件就被删了。调用方持有 `path` 即持有生命周期。
+    TempFile::new(
+        "record",
+        &format!("mora_record_test_{}_{}.jsonl", name, std::process::id()),
+    )
 }
 
 #[test]
@@ -63,11 +61,7 @@ fn record_memory_records_but_never_writes() {
     // 判据用**独占目录**而不是 `%TEMP%` 的文件计数 —— 后者是脆判据：
     // 单独跑本测试时通过，全量套件里红，因为**并行测试**同时在
     // `%TEMP%` 建文件，计数会漂。（D171 教训的又一次自踩。）
-    let dir = env::temp_dir().join(format!(
-        "mora_recmem_{}_{}",
-        std::process::id(),
-        Recorder::now_ms()
-    ));
+    let dir = TempDir::new("mora_recmem_");
     fs::create_dir_all(&dir).expect("建独占目录");
     let count = || fs::read_dir(&dir).map(|d| d.count()).unwrap_or(0);
     assert_eq!(count(), 0, "独占目录初始应为空");
@@ -84,7 +78,7 @@ fn record_roundtrip() {
     let path = tmp_path("roundtrip");
     let _ = fs::remove_file(&path);
 
-    let mut r = Recorder::new_record(path.clone()).unwrap();
+    let mut r = Recorder::new_record(path.path().to_path_buf()).unwrap();
     assert!(r.mode().is_record());
     r.record_ai_chat(
         "gpt-4o".to_string(),
@@ -109,7 +103,7 @@ fn record_roundtrip() {
     r.save().unwrap();
 
     // load + replay
-    let mut r2 = Recorder::new_replay(path.clone()).unwrap();
+    let mut r2 = Recorder::new_replay(path.path().to_path_buf()).unwrap();
     assert!(r2.mode().is_replay());
     assert_eq!(r2.events().len(), 3);
     // lookup ai.chat
@@ -132,7 +126,7 @@ fn record_roundtrip() {
 fn replay_missing_returns_none() {
     let path = tmp_path("missing");
     let _ = fs::remove_file(&path);
-    let mut r = Recorder::new_record(path.clone()).unwrap();
+    let mut r = Recorder::new_record(path.path().to_path_buf()).unwrap();
     r.record_ai_chat(
         "gpt-4o".to_string(),
         "first".to_string(),
@@ -145,7 +139,7 @@ fn replay_missing_returns_none() {
     );
     r.save().unwrap();
 
-    let mut r2 = Recorder::new_replay(path.clone()).unwrap();
+    let mut r2 = Recorder::new_replay(path.path().to_path_buf()).unwrap();
     // 询问不同 prompt → 找不到
     let resp = r2.lookup_ai_chat("gpt-4o", "second", "test_sig");
     assert!(resp.is_none());
@@ -173,7 +167,7 @@ fn diff_identical_recordings() {
     let _ = fs::remove_file(&path_a);
     let _ = fs::remove_file(&path_b);
 
-    let mut a = Recorder::new_record(path_a.clone()).unwrap();
+    let mut a = Recorder::new_record(path_a.path().to_path_buf()).unwrap();
     a.record_ai_chat(
         "m".into(),
         "p".into(),
@@ -186,7 +180,7 @@ fn diff_identical_recordings() {
     );
     a.save().unwrap();
 
-    let mut b = Recorder::new_record(path_b.clone()).unwrap();
+    let mut b = Recorder::new_record(path_b.path().to_path_buf()).unwrap();
     b.record_ai_chat(
         "m".into(),
         "p".into(),
@@ -199,8 +193,8 @@ fn diff_identical_recordings() {
     );
     b.save().unwrap();
 
-    let ra = Recorder::new_replay(path_a.clone()).unwrap();
-    let rb = Recorder::new_replay(path_b.clone()).unwrap();
+    let ra = Recorder::new_replay(path_a.path().to_path_buf()).unwrap();
+    let rb = Recorder::new_replay(path_b.path().to_path_buf()).unwrap();
     let diff = diff_recordings(ra.events(), rb.events());
     assert_eq!(diff.len(), 1);
     assert!(matches!(diff[0], DiffLine::Identical(1, _)));
@@ -216,7 +210,7 @@ fn diff_changed_response() {
     let _ = fs::remove_file(&path_a);
     let _ = fs::remove_file(&path_b);
 
-    let mut a = Recorder::new_record(path_a.clone()).unwrap();
+    let mut a = Recorder::new_record(path_a.path().to_path_buf()).unwrap();
     a.record_ai_chat(
         "m".into(),
         "p".into(),
@@ -229,7 +223,7 @@ fn diff_changed_response() {
     );
     a.save().unwrap();
 
-    let mut b = Recorder::new_record(path_b.clone()).unwrap();
+    let mut b = Recorder::new_record(path_b.path().to_path_buf()).unwrap();
     b.record_ai_chat(
         "m".into(),
         "p".into(),
@@ -242,8 +236,8 @@ fn diff_changed_response() {
     );
     b.save().unwrap();
 
-    let ra = Recorder::new_replay(path_a.clone()).unwrap();
-    let rb = Recorder::new_replay(path_b.clone()).unwrap();
+    let ra = Recorder::new_replay(path_a.path().to_path_buf()).unwrap();
+    let rb = Recorder::new_replay(path_b.path().to_path_buf()).unwrap();
     let diff = diff_recordings(ra.events(), rb.events());
     assert_eq!(diff.len(), 1);
     assert!(matches!(diff[0], DiffLine::Changed(1, _, _)));
@@ -259,10 +253,10 @@ fn diff_only_in_b() {
     let _ = fs::remove_file(&path_a);
     let _ = fs::remove_file(&path_b);
 
-    let a = Recorder::new_record(path_a.clone()).unwrap();
+    let a = Recorder::new_record(path_a.path().to_path_buf()).unwrap();
     a.save().unwrap(); // empty
 
-    let mut b = Recorder::new_record(path_b.clone()).unwrap();
+    let mut b = Recorder::new_record(path_b.path().to_path_buf()).unwrap();
     b.record_ai_chat(
         "m".into(),
         "p".into(),
@@ -275,8 +269,8 @@ fn diff_only_in_b() {
     );
     b.save().unwrap();
 
-    let ra = Recorder::new_replay(path_a.clone()).unwrap();
-    let rb = Recorder::new_replay(path_b.clone()).unwrap();
+    let ra = Recorder::new_replay(path_a.path().to_path_buf()).unwrap();
+    let rb = Recorder::new_replay(path_b.path().to_path_buf()).unwrap();
     let diff = diff_recordings(ra.events(), rb.events());
     assert_eq!(diff.len(), 1);
     assert!(matches!(diff[0], DiffLine::OnlyInB(1, _)));
@@ -287,27 +281,21 @@ fn diff_only_in_b() {
 
 #[test]
 fn list_recordings_empty_dir() {
-    let mut dir = env::temp_dir();
-    dir.push(format!("mora_list_test_{}", std::process::id()));
-    let _ = fs::remove_dir_all(&dir);
-    fs::create_dir_all(&dir).unwrap();
+    // v0.104.6 D475：临时目录改走全仓唯一入口 `mora::test_support::TempDir`
+    // （原先这里是手写的「清残留 + 建目录 + 尾部再删」三段式）。
+    let dir = TempDir::new("list_test");
 
     let result = list_recordings(&dir);
     assert!(result.is_ok());
     assert_eq!(result.unwrap().len(), 0);
-
-    let _ = fs::remove_dir_all(&dir);
 }
 
 #[test]
 fn list_recordings_finds_files() {
-    let mut dir = env::temp_dir();
-    dir.push(format!("mora_list_test2_{}", std::process::id()));
-    let _ = fs::remove_dir_all(&dir);
-    fs::create_dir_all(&dir).unwrap();
+    let dir = TempDir::new("list_test2");
 
     // 创建一个录制文件
-    let mut path = dir.clone();
+    let mut path = dir.path().to_path_buf();
     path.push("test-rec.jsonl");
     let mut r = Recorder::new_record(path).unwrap();
     r.record_ai_chat(
@@ -334,7 +322,7 @@ fn list_recordings_finds_files() {
 fn compute_stats_basic() {
     let path = tmp_path("stats");
     let _ = fs::remove_file(&path);
-    let mut r = Recorder::new_record(path.clone()).unwrap();
+    let mut r = Recorder::new_record(path.path().to_path_buf()).unwrap();
     r.record_ai_chat(
         "gpt-4o".into(),
         "p".into(),
@@ -367,7 +355,7 @@ fn compute_stats_basic() {
     r.record_note("test".into());
     r.save().unwrap();
 
-    let r2 = Recorder::new_replay(path.clone()).unwrap();
+    let r2 = Recorder::new_replay(path.path().to_path_buf()).unwrap();
     let stats = compute_stats(r2.events());
     assert_eq!(stats.total_events, 4);
     assert_eq!(stats.ai_chat_count, 2);
@@ -717,35 +705,32 @@ fn build_timeline_basic() {
 fn new_record_creates_parent_dir() {
     // v0.104.6 D34：原先只删 `nested`，**父目录** `mora_record_test_subdir_<pid>`
     // 留着 —— 每次跑测试漏一个。实测该前缀在 `%TEMP%` 下累积到 578 个。
-    // 现在把整个基目录删掉（两次：前置清残留 + 后置清本次产物）。
-    let mut base = env::temp_dir();
-    base.push(format!("mora_record_test_subdir_{}", std::process::id()));
-    let _ = fs::remove_dir_all(&base);
+    // v0.104.6 **D475**：整个基目录改由 `TempDir` 守卫回收 ⇒ 前置清残留、
+    // 后置清产物**两段手工删除都不再需要**（守卫的 `Drop` 覆盖所有出口，
+    // 包括断言失败 panic 的那条）。
+    let base = TempDir::new("record_test_subdir");
 
-    let mut p = base.clone();
+    let mut p = base.path().to_path_buf();
     p.push("nested");
     p.push("test.jsonl");
 
     let r = Recorder::new_record(p.clone());
     assert!(r.is_ok());
     assert!(p.parent().unwrap().exists());
-
-    let _ = fs::remove_dir_all(&base);
 }
 
 // v0.76.05: Schema 校验测试——arg_signature 不匹配时返 None
 
-fn schema_test_path(name: &str) -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!("mora_schema_test_{}", name));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir.join("rec.jsonl")
+fn schema_test_path(name: &str) -> TempDir {
+    // v0.104.6 D475：返回**守卫**（此前返回裸路径 ⇒ 目录在调用方用之前就被回收）。
+    TempDir::new(name)
 }
 
 #[test]
 fn schema_lookup_ai_chat_mismatch_returns_none() {
     // 录制用签名 A，replay 用签名 B → 应返 None（不报 error）
-    let path = schema_test_path("ai_mismatch");
+    let dir = schema_test_path("ai_mismatch");
+    let path = dir.path().join("rec.jsonl");
     let mut r = Recorder::new_record(path.clone()).unwrap();
     r.record_ai_chat(
         "gpt-4o".into(),
@@ -771,7 +756,8 @@ fn schema_lookup_ai_chat_mismatch_returns_none() {
 #[test]
 fn schema_lookup_ai_chat_match_returns_some() {
     // 录制与 replay 用同签名 → 返 Some
-    let path = schema_test_path("ai_match");
+    let dir = schema_test_path("ai_match");
+    let path = dir.path().join("rec.jsonl");
     let mut r = Recorder::new_record(path.clone()).unwrap();
     r.record_ai_chat(
         "gpt-4o".into(),
@@ -795,7 +781,8 @@ fn schema_lookup_ai_chat_match_returns_some() {
 
 #[test]
 fn schema_lookup_web_fetch_mismatch_returns_none() {
-    let path = schema_test_path("web_mismatch");
+    let dir = schema_test_path("web_mismatch");
+    let path = dir.path().join("rec.jsonl");
     let mut r = Recorder::new_record(path.clone()).unwrap();
     r.record_web_fetch(
         "https://x.com".into(),
@@ -818,7 +805,8 @@ fn schema_lookup_web_fetch_mismatch_returns_none() {
 #[test]
 fn schema_mismatch_pushes_warning() {
     // v0.76.06: 签名漂移时不仅返 None，还 push warning 到 self.warnings
-    let path = schema_test_path("warning");
+    let dir = schema_test_path("warning");
+    let path = dir.path().join("rec.jsonl");
     let mut r = Recorder::new_record(path.clone()).unwrap();
     r.record_ai_chat(
         "gpt-4o".into(),
@@ -863,7 +851,7 @@ fn record_msg_event() {
 #[test]
 fn record_state_mutation_event() {
     let path = tmp_path("state_mutation");
-    let mut r = Recorder::new_record(path.clone()).unwrap();
+    let mut r = Recorder::new_record(path.path().to_path_buf()).unwrap();
     r.record_state_mutation(
         "x".to_string(),
         crate::value::Value::Int(0),
@@ -884,14 +872,14 @@ fn record_state_mutation_event() {
 #[test]
 fn msg_event_serialization_roundtrip() {
     let path = tmp_path("msg_roundtrip");
-    let mut r = Recorder::new_record(path.clone()).unwrap();
+    let mut r = Recorder::new_record(path.path().to_path_buf()).unwrap();
     r.record_msg(
         "channel_a".to_string(),
         crate::value::Value::String("payload".to_string()),
         12345,
     );
     r.save().unwrap();
-    let r2 = Recorder::new_replay(path.clone()).unwrap();
+    let r2 = Recorder::new_replay(path.path().to_path_buf()).unwrap();
     assert_eq!(r2.events().len(), 1);
     match &r2.events()[0] {
         Event::Msg {
@@ -916,14 +904,14 @@ fn msg_event_serialization_roundtrip() {
 #[test]
 fn state_mutation_event_serialization_roundtrip() {
     let path = tmp_path("sm_roundtrip");
-    let mut r = Recorder::new_record(path.clone()).unwrap();
+    let mut r = Recorder::new_record(path.path().to_path_buf()).unwrap();
     r.record_state_mutation(
         "var1".to_string(),
         crate::value::Value::Nil,
         crate::value::Value::Int(100),
     );
     r.save().unwrap();
-    let r2 = Recorder::new_replay(path.clone()).unwrap();
+    let r2 = Recorder::new_replay(path.path().to_path_buf()).unwrap();
     assert_eq!(r2.events().len(), 1);
     match &r2.events()[0] {
         Event::StateMutation { var, old, new, .. } => {
@@ -942,7 +930,7 @@ fn recorder_is_off_check() {
     let r1 = Recorder::new_off();
     assert!(r1.is_off());
     let path = tmp_path("not_off");
-    let mut r2 = Recorder::new_record(path.clone()).unwrap();
+    let mut r2 = Recorder::new_record(path.path().to_path_buf()).unwrap();
     assert!(!r2.is_off());
     // 写入一个 event 让 file 存在，然后才能 replay
     r2.record_state_mutation(
@@ -951,7 +939,7 @@ fn recorder_is_off_check() {
         crate::value::Value::Int(1),
     );
     r2.save().unwrap();
-    let r3 = Recorder::new_replay(path.clone()).unwrap();
+    let r3 = Recorder::new_replay(path.path().to_path_buf()).unwrap();
     assert!(!r3.is_off());
     let _ = fs::remove_file(&path);
 }
@@ -991,7 +979,7 @@ fn timeline_includes_msg_and_state_mutation() {
 #[test]
 fn d89_web_fetch_method_is_escaped() {
     let path = tmp_path("d89_method_esc");
-    let mut r = Recorder::new_record(path.clone()).unwrap();
+    let mut r = Recorder::new_record(path.path().to_path_buf()).unwrap();
     let nasty = r#"GE"T,X\Y"#;
     r.record_web_fetch(
         "https://example.com/a?b=1&c=\"2\"".to_string(),
@@ -1010,7 +998,7 @@ fn d89_web_fetch_method_is_escaped() {
         1,
         "写入必须恰好一行（未转义的引号会撑破 JSON 结构）：\n{raw}"
     );
-    let r2 = Recorder::new_replay(path.clone()).unwrap();
+    let r2 = Recorder::new_replay(path.path().to_path_buf()).unwrap();
     assert_eq!(r2.events().len(), 1, "该行不该被静默丢弃");
     match &r2.events()[0] {
         Event::WebFetch { method, url, .. } => {
@@ -1043,11 +1031,11 @@ fn d89_msg_payload_dict_with_multiple_keys_survives_roundtrip() {
     let payload = crate::value::Value::Dict(d);
 
     let path = tmp_path("d89_msg_dict");
-    let mut r = Recorder::new_record(path.clone()).unwrap();
+    let mut r = Recorder::new_record(path.path().to_path_buf()).unwrap();
     r.record_msg("ch".to_string(), payload.clone(), 7);
     r.save().unwrap();
 
-    let r2 = Recorder::new_replay(path.clone()).unwrap();
+    let r2 = Recorder::new_replay(path.path().to_path_buf()).unwrap();
     assert_eq!(r2.events().len(), 1, "事件本身不该丢");
     match &r2.events()[0] {
         Event::Msg {
@@ -1072,11 +1060,11 @@ fn d89_state_mutation_dict_survives_roundtrip() {
     let new = crate::value::Value::Dict(d);
 
     let path = tmp_path("d89_sm_dict");
-    let mut r = Recorder::new_record(path.clone()).unwrap();
+    let mut r = Recorder::new_record(path.path().to_path_buf()).unwrap();
     r.record_state_mutation("v".to_string(), crate::value::Value::Nil, new.clone());
     r.save().unwrap();
 
-    let r2 = Recorder::new_replay(path.clone()).unwrap();
+    let r2 = Recorder::new_replay(path.path().to_path_buf()).unwrap();
     assert_eq!(r2.events().len(), 1);
     match &r2.events()[0] {
         Event::StateMutation { var, new: got, .. } => {
@@ -1100,11 +1088,11 @@ fn d89_msg_payload_list_of_dicts_survives_roundtrip() {
     );
 
     let path = tmp_path("d89_msg_list");
-    let mut r = Recorder::new_record(path.clone()).unwrap();
+    let mut r = Recorder::new_record(path.path().to_path_buf()).unwrap();
     r.record_msg("ch".to_string(), payload.clone(), 1);
     r.save().unwrap();
 
-    let r2 = Recorder::new_replay(path.clone()).unwrap();
+    let r2 = Recorder::new_replay(path.path().to_path_buf()).unwrap();
     match &r2.events()[0] {
         Event::Msg { payload: got, .. } => {
             assert_eq!(*got, payload, "含 Dict 的 List payload 必须原样往返");

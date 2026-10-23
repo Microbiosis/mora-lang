@@ -53,19 +53,8 @@
 //! ⇒ **可达范围内只有 `bigint:` 一处不对称，已修**；其余差集全是
 //! **不可达的潜伏死路径**（解析器层就不让写出来）。
 //!
+use mora::test_support::TempDir;
 use std::process::Command;
-
-/// 把用例名变成**合法的 Windows 路径片段**。
-///
-/// D321：必须在这里（`run()` 内部）施加，**不能**只靠调用点各自 slug ——
-/// tag 里一旦带 `/`（D318 的 `float-pat/int-val` 就是），
-/// `mora_d317_match_{tag}` 会变成**嵌套路径**，`remove_dir_all` 只删叶子，
-/// **父目录留下**（实测每跑一次全量 +1）。收进函数内才是「修整类」。
-fn slug(s: &str) -> String {
-    s.chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
-        .collect()
-}
 
 /// 删除临时目录，**带重试**。
 ///
@@ -100,7 +89,7 @@ fn cleanup_dir(dir: &std::path::Path) {
 /// 别人的输出（本轮第一版就这么炸的：`[literal]` 拿到了 string 用例的 `A`）。
 /// D315 的 `nine_layer_unblocked.rs` 用 `mora_d315_{tag}` 避开了，本条沿用。
 fn run(src: &str, tag: &str) -> (i32, Vec<String>) {
-    let dir = std::env::temp_dir().join(format!("mora_d317_match_{}", slug(tag)));
+    let dir = TempDir::new(tag);
     cleanup_dir(&dir);
     std::fs::create_dir_all(&dir).expect("建目录");
     let p = dir.join("p.mora");

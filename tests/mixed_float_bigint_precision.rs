@@ -45,25 +45,11 @@
 //! `2^53` **本身仍精确**（`9007199254740992 + 1n` = `9007199254740993n`），
 //! 拦的是 `> 2^53` 而非 `>= 2^53`。
 
+use mora::test_support::TempDir;
 use std::process::Command;
-use std::sync::atomic::{AtomicU64, Ordering};
-
-static SEQ: AtomicU64 = AtomicU64::new(0);
-
-fn slug(s: &str) -> String {
-    let mut out = String::from("d359_");
-    out.extend(
-        s.chars()
-            .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
-            .take(40),
-    );
-    out
-}
 
 fn ev(body: &str) -> (i32, String) {
-    let n = SEQ.fetch_add(1, Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!("d359_{}_{}", n, slug(body)));
-    std::fs::create_dir_all(&dir).expect("建目录");
+    let dir = TempDir::new("d359_");
     let p = dir.join("p.mora");
     std::fs::write(&p, body).expect("写探针");
     let home = dir.join("home");
@@ -175,9 +161,35 @@ fn d359_two_to_the_53_boundary_is_still_exact() {
 fn d359_in_range_mixed_arithmetic_still_works() {
     for (body, expected) in [
         ("print(1.5 + 1n)\n", "2.5"),
-        ("print(3 - 1n)\n", "2.0"),
+        // v0.104.6 **D468 追正**：此处原期望 `2.0`，实得 `2n`。
+        //
+        // 旧期望是 **D468 修掉的那个 bug 的残留**：`Sub` 走 f64 round-trip、
+        // `Add` 不走，于是同一组操作数 `3 ⊗ 1n` 的加法给 BigInt、减法给 Float
+        // —— 这正是 D468 记档的「`a - 0i ≠ a + 0i`」在跨塔场景的同款表现。
+        // 本测试**下一行**本来就写着 `print(3 + 1n)` → `4n`（BigInt），
+        // 即两条期望自身**互相矛盾**：同样的操作数，运算符不同结果类型就不同。
+        //
+        // D468 把跨塔提升统一（整数值 Int 与 Float 同理提升为 BigInt），
+        // 故 `3 - 1n` 现为 `2n`，与 `3 + 1n` → `4n` 一致。
+        // —— 与本测试对 `100.0 + 100n` 的判词同款：「期望写错，不是产品错」。
+        ("print(3 - 1n)\n", "2n"),
         ("print(1.5 * 2n)\n", "3.0"),
-        ("print(3.0 / 2n)\n", "1.5"),
+        // v0.104.6 **D468 追正**：此处原期望 `1.5`，实得 `1n`。
+        //
+        // 旧期望是 **D468 统一数值塔之前**的行为残留：当时
+        // `Float ⊗ BigInt` 的 **`Div` 走 f64 round-trip**（3.0/2.0 = 1.5，
+        // Float），而 **`Add` 走提升**（3.0+2n → BigInt）—— 同一组操作数
+        // 因**运算符不同**而结果类型不同。D468 把所有运算符统一到
+        // 「先按 D198 规则提升、再走该域自己的算术」：
+        // 整数值 float 提升为 BigInt ⇒ `3.0 / 2n` = `3n / 2n` = **1n**。
+        //
+        // ⇒ 与本测试**下一行** `print(3 + 1n)` → `4n` 一致：同类型操作数
+        // 不再因运算符而给出不同类型的结果（那正是 D468 要消除的不自洽）。
+        //
+        // ⚠ 「`3.0 / 2n` 得整数商」是**整数值 float 提升为 BigInt** 的直接
+        // 后果（D198 的「最小惊讶」规则），不是除法本身的缺陷 ——
+        // BigInt 域的除法本就是整除（`7n/2n` = 3n）。
+        ("print(3.0 / 2n)\n", "1n"),
         ("print(3 + 1n)\n", "4n"),
         // 整数值 float 提升为 BigInt（D198 的「最小惊讶」规则）⇒ 结果 BigInt。
         // 首版这里写期望 `200.0`，实测是 `200n` —— 期望写错，不是产品错。

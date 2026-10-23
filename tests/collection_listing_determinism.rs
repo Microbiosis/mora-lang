@@ -33,18 +33,11 @@
 //!
 //! ⚠ 按 D405 的教训：判据里**绝不 sort** —— 排序的是**被测代码**。
 
-use std::path::PathBuf;
+use mora::test_support::TempDir;
 use std::process::Command;
-use std::sync::atomic::{AtomicU64, Ordering};
 
-static SEQ: AtomicU64 = AtomicU64::new(0);
-
-fn work_dir() -> PathBuf {
-    let n = SEQ.fetch_add(1, Ordering::Relaxed);
-    let d = std::env::temp_dir().join(format!("mora_d406_{n}"));
-    let _ = std::fs::remove_dir_all(&d);
-    std::fs::create_dir_all(&d).expect("建临时目录");
-    d
+fn work_dir() -> TempDir {
+    TempDir::new("d406")
 }
 
 fn mora_exe() -> String {

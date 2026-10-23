@@ -685,6 +685,24 @@ impl Lexer {
         }
     }
 
+    /// 还原用户写下的**完整**字面量文本（数值 + 类型后缀 + 位宽）。
+    ///
+    /// v0.104.6 D475：诊断此前只报**数值部分**（`9223372036854775808`），
+    /// 丢掉了 `i` / `u` / `f` / `n` 与位宽 ⇒ 用户看到的诊断**没有点名
+    /// 自己写的那个 token**。
+    ///
+    /// `tests/numeric_width_suffix.rs` 一直在断言「诊断应点名这个字面量」，
+    /// 但它此前是**假通过** —— 旧实现把源码片段 slug 进了临时目录名，
+    /// 目录名恰好含有那个字面量，断言其实是被**路径**满足的。
+    fn literal_text(value: &str, suffix: Option<char>, width: &str) -> String {
+        let mut s = String::from(value);
+        if let Some(c) = suffix {
+            s.push(c);
+        }
+        s.push_str(width);
+        s
+    }
+
     fn number_from(&mut self, start_line: usize, start_col: usize) -> Token {
         let start = self.current - 1;
         while self.peek().is_ascii_digit() {
@@ -700,6 +718,9 @@ impl Lexer {
         // v0.91: 加 `n` / `N` 后缀 → BigInt 字面量
         let value: String = self.source[start..self.current].iter().collect();
         let mut suffix: Option<char> = None;
+        // v0.104.6 D475：位宽文本**留一份** —— 诊断要报用户写下的**完整**
+        // token（数值 + 类型后缀 + 位宽），否则用户看到的诊断没点名自己写的东西。
+        let mut width = String::new();
         // v0.104.6 D356：宽度数字**只被消费、不混进 `value`**。
         //
         // 修前 `value.push(self.advance())` 把宽度直接追加到数值串上，
@@ -718,7 +739,7 @@ impl Lexer {
             suffix = Some(self.advance());
             // Optional width: 8/16/32/64（其它数字也照常消费，不报错 —— 见下）。
             while self.peek().is_ascii_digit() {
-                self.advance();
+                width.push(self.advance());
             }
         }
         let tt = if let Some(s) = suffix {
@@ -735,7 +756,10 @@ impl Lexer {
                             return self.error_token(
                                 start_line,
                                 start_col,
-                                &format!("Invalid integer literal: {}", value),
+                                &format!(
+                                    "Invalid integer literal: {}",
+                                    Self::literal_text(&value, Some(s), &width)
+                                ),
                             );
                         }
                     }
@@ -752,7 +776,10 @@ impl Lexer {
                             return self.error_token(
                                 start_line,
                                 start_col,
-                                &format!("Invalid integer literal: {}", value),
+                                &format!(
+                                    "Invalid integer literal: {}",
+                                    Self::literal_text(&value, Some(s), &width)
+                                ),
                             );
                         }
                     }
@@ -766,7 +793,10 @@ impl Lexer {
                             return self.error_token(
                                 start_line,
                                 start_col,
-                                &format!("Invalid float literal: {}", value),
+                                &format!(
+                                    "Invalid float literal: {}",
+                                    Self::literal_text(&value, Some(s), &width)
+                                ),
                             );
                         }
                     };
@@ -787,7 +817,10 @@ impl Lexer {
                             return self.error_token(
                                 start_line,
                                 start_col,
-                                &format!("Invalid bigint literal: {}", value),
+                                &format!(
+                                    "Invalid bigint literal: {}",
+                                    Self::literal_text(&value, Some(s), &width)
+                                ),
                             );
                         }
                     }

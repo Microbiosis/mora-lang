@@ -32,6 +32,7 @@
 //! 下面这些用例保留下来，防止将来有人再怀疑解析器。
 
 use mora::lsp::transport::read_message;
+use mora::test_support::TempDir;
 use std::io::Cursor;
 
 fn frame(len: usize, body: &str) -> String {
@@ -89,8 +90,7 @@ fn d100_eof_returns_none() {
 /// `Process.StandardInput` 写入在本轮调查中制造过假象，见文件头注释）。
 #[test]
 fn d100_banner_does_not_pollute_stdout() {
-    let dir = std::env::temp_dir().join("mora_d100_banner");
-    std::fs::create_dir_all(&dir).expect("create temp dir");
+    let dir = TempDir::new("mora_d100_banner");
     let prog = dir.join("p.mora");
     std::fs::write(&prog, "print(\"program-output\")\n").expect("write prog");
     let bin = env!("CARGO_BIN_EXE_mora");

@@ -45,16 +45,15 @@
 //! **退出码未改**（仍为 0）：「0 命中是否该判失败」属 CLI 契约决定，
 //! 与 D176 记录的 `mora diff` 恒 exit 0 是同一类待裁决项，**仅报告不擅改**。
 
+use mora::test_support::TempDir;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-struct WorkDir(PathBuf);
+struct WorkDir(TempDir);
 
 impl WorkDir {
     fn new(tag: &str) -> Self {
-        let d = std::env::temp_dir().join(format!("mora_d182_{tag}"));
-        let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(&d).expect("建目录");
+        let d = TempDir::new(tag);
         WorkDir(d)
     }
     fn path(&self) -> &Path {

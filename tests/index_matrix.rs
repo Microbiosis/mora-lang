@@ -41,6 +41,7 @@
 //! 字符串按**字符**（非字节）计数、CJK 正常、类型错配给出可读消息。
 //! **本轮没有找到新的缺陷。**
 
+use mora::test_support::TempDir;
 use std::process::Command;
 
 /// 删除临时目录，**带重试**。
@@ -73,7 +74,7 @@ fn run(src: &str, tag: &str) -> (i32, String) {
     // ⚠ 每条用例独立目录：同文件 `#[test]` 并行执行，共用目录会串味
     //   （D317 踩过）。tag 需先 slug —— 表达式里含 `(` `-` 等字符，
     //   直接拼进 %TEMP% 会得到 Windows `Os { code: 123 }`（D319 踩过）。
-    let dir = std::env::temp_dir().join(format!("mora_d320_idx_{}", slug(tag)));
+    let dir = TempDir::new(tag);
     cleanup_dir(&dir);
     std::fs::create_dir_all(&dir).expect("建目录");
     let p = dir.join("p.mora");
@@ -103,12 +104,6 @@ fn run(src: &str, tag: &str) -> (i32, String) {
         .replace(&p.to_string_lossy().to_string(), "<TMP>")
         .to_string();
     (out.status.code().unwrap_or(-1), first)
-}
-
-fn slug(s: &str) -> String {
-    s.chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
-        .collect()
 }
 
 fn print_of(e: &str) -> (i32, String) {
@@ -225,7 +220,7 @@ fn d320_index_assign_is_syntax_error_but_mir_handler_still_exists() {
         "let xs = [1,2,3]\nxs[1] = 99\nprint(xs)\n",
         "let xs = [1,2,3]\nassign xs[1] = 99\nprint(xs)\n",
     ] {
-        let (code, got) = run(src, &slug(src));
+        let (code, got) = run(src, "case");
         assert_eq!(
             code, 2,
             "`List` 自 v0.104.6 起不可变，下标赋值应是**解析错误**（exit 2）; \

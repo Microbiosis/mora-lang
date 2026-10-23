@@ -34,16 +34,14 @@
 //! ② 大 BigInt 与**小数**相加必须**报错**，不能返回错数（主判据的另一半）；
 //! ③ **不回归**：小 BigInt + 小数仍按旧规则给 Float；`BigInt ⊕ BigInt` 不受影响。
 
-use std::path::PathBuf;
+use mora::test_support::TempDir;
 use std::process::Command;
 
-struct WorkDir(PathBuf);
+struct WorkDir(TempDir);
 
 impl WorkDir {
     fn new(tag: &str) -> Self {
-        let d = std::env::temp_dir().join(format!("mora_d198_{tag}"));
-        let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(&d).expect("建目录");
+        let d = TempDir::new(tag);
         WorkDir(d)
     }
     fn run(&self, tag: &str, expr: &str) -> (String, i32) {

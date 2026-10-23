@@ -32,22 +32,17 @@
 //! ⇒ 空文件走 `Ok((GENESIS, 0))`，非空但损坏走 `Err`。
 //! ⇒ 直接 `?` 传播是安全且正确的。
 
+use mora::test_support::TempDir;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use mora::audit::{AuditEvent, AuditSink, JsonlAuditSink};
 
-static SEQ: AtomicU64 = AtomicU64::new(0);
-
-struct Work(PathBuf);
+struct Work(TempDir);
 
 impl Work {
     fn new(tag: &str) -> Self {
-        let n = SEQ.fetch_add(1, Ordering::Relaxed);
-        let d = std::env::temp_dir().join(format!("mora_d399_{n}_{tag}"));
-        let _ = fs::remove_dir_all(&d);
-        fs::create_dir_all(&d).expect("建临时目录");
+        let d = TempDir::new(tag);
         Work(d)
     }
     fn log(&self) -> PathBuf {

@@ -39,7 +39,7 @@
 //! ⇒ **本条现在是那道守卫的活护栏**：谁把守卫改窄、改窄的判据、或删掉它，
 //! 本条会红。它从「验收测试」变成了「回归测试」。
 
-use std::path::PathBuf;
+use mora::test_support::TempDir;
 
 const PROGRAMS: &[(&str, &str)] = &[
     ("print-literal", "print(\"A\")\n"),
@@ -95,14 +95,6 @@ const NOISE: &[&str] = &[
     "Trait",
 ];
 
-/// `Drop` 守卫：解封后若中途 assert 失败，panic 会跳过后续清理。
-struct WorkDir(PathBuf);
-impl Drop for WorkDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-
 fn run(exe: &str, dir: &std::path::Path, src: &str, opt: Option<&str>) -> (i32, Vec<String>) {
     let f = dir.join("a.mora");
     std::fs::write(&f, src).expect("write scratch");
@@ -127,10 +119,7 @@ fn run(exe: &str, dir: &std::path::Path, src: &str, opt: Option<&str>) -> (i32, 
 #[test]
 fn d261_opt_levels_never_change_program_behaviour() {
     let exe = concat!(env!("CARGO_MANIFEST_DIR"), "/target/debug/mora.exe");
-    let dir = std::env::temp_dir().join(format!("mora_d261_{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("mkdir");
-    let _work = WorkDir(dir.clone());
+    let dir = TempDir::new("d261");
 
     let mut broken: Vec<String> = Vec::new();
     for (name, src) in PROGRAMS {

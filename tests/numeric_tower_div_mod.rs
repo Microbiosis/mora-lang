@@ -38,6 +38,7 @@
 //!   修它要同时动 typeck + `Value::PartialEq` + `eval_binary` 三层，
 //!   是**架构决定**。本文件把它钉成现状判据。
 
+use mora::test_support::TempDir;
 use std::process::Command;
 
 /// 删除临时目录，**带重试**。
@@ -69,7 +70,7 @@ fn cleanup_dir(dir: &std::path::Path) {
 fn run(src: &str, tag: &str) -> (i32, Vec<String>) {
     // ⚠ 每条用例必须用**独立**目录：同文件的 `#[test]` 并行执行，
     //   共用目录会互相 remove_dir_all / 写同一个 p.mora（D317 踩过）。
-    let dir = std::env::temp_dir().join(format!("mora_d319_num_{}", slug(tag)));
+    let dir = TempDir::new(tag);
     cleanup_dir(&dir);
     std::fs::create_dir_all(&dir).expect("建目录");
     let p = dir.join("p.mora");
@@ -101,16 +102,6 @@ fn run(src: &str, tag: &str) -> (i32, Vec<String>) {
 
 fn expr(e: &str) -> String {
     format!("print({e})\n")
-}
-
-/// 把用例名变成**合法的 Windows 目录名片段**。
-///
-/// ⚠ 表达式里含 `(` `)` `-` `>` `/` `%` 等字符，直接拼进 `%TEMP%` 路径
-///   会得到 `Os { code: 123, kind: InvalidFilename }`（本轮第一版就这么炸的）。
-fn slug(s: &str) -> String {
-    s.chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
-        .collect()
 }
 
 /// **主判据**：整数除法 / 取模的**全部 8 种类型组合**遇到零除数，都必须返回
@@ -185,7 +176,7 @@ fn d319_mixed_type_div_mod_results_are_correct() {
         ("100000000000000000000n / 3i", "33333333333333333333n"),
         ("100000000000000000000n % 7i", "2n"),
     ] {
-        let (code, lines) = run(&expr(e), &format!("val_{}", slug(e)));
+        let (code, lines) = run(&expr(e), "val");
         assert_eq!(code, 0, "`{e}` 应成功; 实得 exit={code} out={lines:?}");
         assert_eq!(
             lines.first().map(String::as_str),
@@ -201,7 +192,7 @@ fn d319_mixed_type_div_mod_results_are_correct() {
 #[test]
 fn d319_float_division_by_zero_keeps_ieee_semantics() {
     for (e, want) in [("7 / 0", "inf"), ("7i / 0", "inf"), ("7 / 0.0", "inf")] {
-        let (code, lines) = run(&expr(e), &format!("f_{}", slug(e)));
+        let (code, lines) = run(&expr(e), "f");
         assert_eq!(code, 0, "`{e}` 应成功（IEEE 语义）; 实得 exit={code}");
         assert_eq!(
             lines.first().map(String::as_str),
@@ -230,7 +221,7 @@ fn d319_float_division_by_zero_keeps_ieee_semantics() {
 fn d319_status_quo_bigint_comparison_is_rejected_but_arithmetic_is_not() {
     // 算术：允许（→ BigInt）
     for e in ["2n + 2i", "2i + 2n", "2n + 2"] {
-        let (code, lines) = run(&expr(e), &format!("ar_{}", slug(e)));
+        let (code, lines) = run(&expr(e), "ar");
         assert_eq!(
             code, 0,
             "`{e}` 算术应被允许; 实得 exit={code} out={lines:?}"
@@ -243,7 +234,7 @@ fn d319_status_quo_bigint_comparison_is_rejected_but_arithmetic_is_not() {
     }
     // 比较：拒绝（typeck）
     for e in ["2n == 2i", "2n == 2", "2n < 2i", "2n > 2i"] {
-        let (code, lines) = run(&expr(e), &format!("cmp_{}", slug(e)));
+        let (code, lines) = run(&expr(e), "cmp");
         assert_eq!(
             code, 2,
             "**D319 现状**：`{e}` 当前被 typeck 拒绝（BigInt 与 Int/Float 不可比）。\n\

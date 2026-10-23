@@ -26,6 +26,7 @@
 //! ⚠ 计数**剥掉注释行**后才统计 —— 否则源码里大量解释「为什么不能饱和」
 //! 的注释会被算进去（与 D388/D394/D395/D403 同族的坑）。
 
+use mora::test_support::TempDir;
 use std::collections::BTreeMap;
 use std::path::Path;
 
@@ -214,9 +215,7 @@ fn d407_ccr_marker_is_the_only_intentional_exception() {
 /// **`exec.parallel` 传负数超时必须报错**（而非静默饱和/回绕）。
 #[test]
 fn d407_exec_parallel_negative_timeout_errors() {
-    let dir = std::env::temp_dir().join("mora_d407_exec");
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("建临时目录");
+    let dir = TempDir::new("mora_d407_exec");
     let script = dir.join("p.mora");
     std::fs::write(&script, "print(exec.parallel([\"echo hi\"], 1, -1))\n").expect("写探针");
     let exe = concat!(env!("CARGO_MANIFEST_DIR"), "/target/debug/mora.exe");

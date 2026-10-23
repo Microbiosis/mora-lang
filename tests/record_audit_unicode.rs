@@ -48,19 +48,18 @@
 //! 主判据是**反向对照**：非 ASCII secret 必须被**报出**（不是 panic）。
 //! 正向对照（纯 ASCII secret）守住「修复没改坏原有行为」。
 
+use mora::test_support::TempDir;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// 工作目录守卫 —— `Drop` 时删除。
 ///
 /// 不写在测试尾部：断言失败 panic 时尾部不执行，失败的测试反而留下垃圾目录。
-struct WorkDir(PathBuf);
+struct WorkDir(TempDir);
 
 impl WorkDir {
     fn new(tag: &str) -> Self {
-        let d = std::env::temp_dir().join(format!("mora_d177_{tag}"));
-        let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(&d).expect("建工作目录");
+        let d = TempDir::new(tag);
         WorkDir(d)
     }
     fn path(&self) -> &Path {

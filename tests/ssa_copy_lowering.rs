@@ -31,7 +31,8 @@
 //! 本条是最后一道 phi 门的最后一块绊脚石。修好后 `opt.rs` 的 SSA 主路径
 //! **无门**。
 
-use std::path::{Path, PathBuf};
+use mora::test_support::TempDir;
+use std::path::Path;
 use std::process::Command;
 
 use mora::mir::{MirFunction, MirInst};
@@ -114,16 +115,7 @@ fn d420_if_expression_value_survives_every_opt_level() {
     if !Path::new(exe).exists() {
         panic!("缺 {exe}：集成测试需要 `cargo build --bin mora` 产出的二进制");
     }
-    let dir = std::env::temp_dir().join(format!("mora_d420_{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("建临时目录");
-    struct WorkDir(PathBuf);
-    impl Drop for WorkDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
-    let _work = WorkDir(dir.clone());
+    let dir = TempDir::new("d420");
 
     for (tag, src) in [
         (
@@ -200,16 +192,7 @@ fn d420_control_flow_shapes_are_opt_invariant() {
     if !Path::new(exe).exists() {
         panic!("缺 {exe}：集成测试需要 `cargo build --bin mora` 产出的二进制");
     }
-    let dir = std::env::temp_dir().join(format!("mora_d420s_{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("建临时目录");
-    struct WorkDir(PathBuf);
-    impl Drop for WorkDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
-    let _work = WorkDir(dir.clone());
+    let dir = TempDir::new("d420s");
 
     for (tag, src) in [
         (

@@ -59,28 +59,13 @@
 //! ⚠ 若本条红，说明有人收紧了边界 —— 那**必须**连同「D334 修好的
 //! `chdir` / `rename` / `copy` / `touch` 守卫」一起看，否则会把 D334 撤销掉。
 
+use mora::test_support::TempDir;
 use std::process::Command;
-use std::sync::atomic::{AtomicU64, Ordering};
-
-static SEQ: AtomicU64 = AtomicU64::new(0);
-
-fn slug(s: &str) -> String {
-    // 固定前缀 + 截断：避开 Windows 保留设备名与 260 路径上限（D334 教训）
-    let mut out = String::from("d335_");
-    out.extend(
-        s.chars()
-            .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
-            .take(40),
-    );
-    out
-}
 
 /// 取 stdout **全部**实质行并以 ` | ` 连接（D330 教训：不能用 `find(第一行)`）。
 /// 探针在 `%TEMP%` 下跑，`HOME` / `USERPROFILE` 指向临时目录。
 fn ev(body: &str) -> (i32, String) {
-    let n = SEQ.fetch_add(1, Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!("d335q_{}_{}", n, slug(body)));
-    std::fs::create_dir_all(&dir).expect("建目录");
+    let dir = TempDir::new("d335q_");
     let p = dir.join("p.mora");
     std::fs::write(&p, body).expect("写探针");
     let home = dir.join("home");

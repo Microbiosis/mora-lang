@@ -34,12 +34,11 @@
 //! 但 `None` 的 dst 单调递增、`Basic` 的非单调），属**优化器核心手术**，
 //! 本轮只钉现状不修 —— 与 D276 同理，不在没有充分验证时动优化器核心。
 
+use mora::test_support::TempDir;
 use std::process::Command;
 
 fn run(src: &str, tag: &str, opt: bool) -> Vec<String> {
-    let dir = std::env::temp_dir().join(format!("mora_d303_{tag}"));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("建目录");
+    let dir = TempDir::new(tag);
     let p = dir.join("p.mora");
     std::fs::write(&p, src).expect("写探针");
     let exe = concat!(env!("CARGO_MANIFEST_DIR"), "/target/debug/mora.exe");

@@ -710,10 +710,17 @@ impl Interpreter {
                 );
             }
         };
-        let (func, _witnesses) = match crate::parser_v3::ParserV3::compile(&source) {
+        let (func, witnesses) = match crate::parser_v3::ParserV3::compile(&source) {
             Ok(f) => f,
             Err(e) => return Err(format!("eval: compile error: {}", e)),
         };
+        // v0.104.6 D473：runtime eval 走**9 层唯一路径**（此前直接消费
+        // `ParserV3::compile` 的 `emit.rs` 直出产物）。
+        let func = crate::mir::pipeline::compile_optimized(
+            &func,
+            &witnesses,
+            crate::mir::ssa::OptLevel::default(),
+        );
         let func = std::sync::Arc::new(func);
         let mut child_env = Environment::with_parent_of(std::sync::Arc::new(env.clone()));
         crate::mir::vm::execute(&func, self, &mut child_env, effects)

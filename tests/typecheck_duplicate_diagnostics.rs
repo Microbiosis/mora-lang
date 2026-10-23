@@ -42,16 +42,15 @@
 //! 同一行/不同行的**不同**类型对仍各自保留；**带位置**的同类型对也各自保留
 //! （`let a: Int = 1.5` 与 `let c: Int = 2.5` 必须报 2 个）。
 
+use mora::test_support::TempDir;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-struct WorkDir(PathBuf);
+struct WorkDir(TempDir);
 
 impl WorkDir {
     fn new(tag: &str) -> Self {
-        let d = std::env::temp_dir().join(format!("mora_d188_{tag}"));
-        let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(&d).expect("建目录");
+        let d = TempDir::new(tag);
         WorkDir(d)
     }
     fn path(&self) -> &Path {

@@ -37,6 +37,7 @@ use mora::interpreter::Interpreter;
 use mora::mir::effect::Effects;
 use mora::mir::vm::execute;
 use mora::parser_v3::ParserV3;
+use mora::test_support::TempDir;
 use std::sync::Arc;
 
 fn run(src: &str) -> Result<String, String> {
@@ -118,8 +119,7 @@ fn d153_crush_json_and_tail_accept_int_max() {
         "crush_json 的 Int max 必须与 Float 等价（items=2）; 实得: {c}"
     );
 
-    let dir = std::env::temp_dir().join("mora_d153_tail");
-    std::fs::create_dir_all(&dir).expect("建临时目录");
+    let dir = TempDir::new("mora_d153_tail");
     let f = dir.join("t.txt");
     std::fs::write(&f, "l1\nl2\nl3\nl4\n").expect("写文件");
     let p = f.display().to_string().replace('\\', "/");

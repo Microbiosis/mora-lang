@@ -501,6 +501,33 @@ impl<'a> BidirectionalChecker<'a> {
             WitnessKind::Export { decl, .. } => {
                 self.pre_check_witness(decl);
             }
+            // ── v0.104.6 D472：4 类新构造 —— 递归其子 witness，
+            // 否则 worker 体 / 事务补偿段 / eval 的 given 与 expects
+            // 里的错误不会被双向检查发现。
+            WitnessKind::Worker { body, .. } => {
+                self.pre_check_witness(body);
+            }
+            WitnessKind::Transaction {
+                body, compensation, ..
+            } => {
+                self.pre_check_witness(body);
+                self.pre_check_witness(compensation);
+            }
+            WitnessKind::Eval { given, expects, .. } => {
+                self.pre_check_witness(given);
+                for e in expects {
+                    self.pre_check_witness(e);
+                }
+            }
+            WitnessKind::Aggregate { value, .. } => {
+                self.pre_check_witness(value);
+            }
+            // v0.104.6 D472：管道 + commit / rollback
+            WitnessKind::Pipe { left, right, .. } => {
+                self.pre_check_witness(left);
+                self.pre_check_witness(right);
+            }
+            WitnessKind::Commit | WitnessKind::Rollback => {}
             // v0.80: algebraic effects — Perform/Handle 递归子节点
             WitnessKind::Perform { args, .. } => {
                 for arg in args {

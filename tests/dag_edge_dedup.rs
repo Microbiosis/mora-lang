@@ -36,8 +36,8 @@ fn analyze(fixture: &str) -> (usize, usize, usize) {
 }
 
 fn fixtures() -> Vec<String> {
-    let dir = std::env::temp_dir();
-    let _ = &dir;
+    // v0.104.6 D475：原有一行 `let dir = std::env::temp_dir(); let _ = &dir;`
+    // —— 纯粹的死代码（取了路径又不用），已删。
     let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/e2e");
     let mut v: Vec<String> = std::fs::read_dir(base)
         .expect("读 fixtures 目录")

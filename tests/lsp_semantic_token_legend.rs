@@ -42,16 +42,14 @@
 //! 把真实应答的 `data` 按 4 元组解码，逐个查它声明的 legend ——
 //! **每一个都必须能取到名字**。光断言「token 数量 > 0」**测不出**越界。
 
-use std::path::PathBuf;
+use mora::test_support::TempDir;
 use std::process::{Command, Stdio};
 
-struct WorkDir(PathBuf);
+struct WorkDir(TempDir);
 
 impl WorkDir {
     fn new(tag: &str) -> Self {
-        let d = std::env::temp_dir().join(format!("mora_d201_{tag}"));
-        let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(&d).expect("建目录");
+        let d = TempDir::new(tag);
         WorkDir(d)
     }
     /// 起一次 LSP 会话：initialize → didOpen → semanticTokens/full。

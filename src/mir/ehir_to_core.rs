@@ -98,23 +98,70 @@ fn lower_node(ctx: &mut CoreContext, node: &Ehir) {
         } => {
             ctx.emit(CoreInst::BinaryOp(*dst, *lhs, op.clone(), *rhs));
         }
-        // Or/And → Core 层降维为短路求值的控制流（Branch + 常量合并）
+        // Or/And → Core 层降维为**短路控制流**（Branch + 两块）
+        //
+        // v0.104.6 D477：此前 Core 层把 or/and 降成**普通 BinaryOp**
+        // （`lhs != rhs` / `lhs == rhs`）—— 那**既不是取值短路、也不是求值
+        // 短路**（`true or true` 会算成 `false`），与 MIR 层的语义不符。
+        // D477 起与 MIR 层同形：短路分支只写 `dst ← lhs`，非短路分支才
+        // 求值 rhs。块结构与本文件 `Node::If` 的降级同款。
         Node::Or { dst, lhs, rhs, .. } => {
-            // 简化：非短路直接 BinaryOp（NotEqual 语义与 emit_or_w 一致）
+            // cond 为真 ⇒ 短路（结果 = lhs，rhs 不求值）
+            let short_id = ctx.next_block_id + 1;
+            let eval_id = ctx.next_block_id + 2;
+            let end_id = ctx.next_block_id + 3;
+            ctx.emit(CoreInst::Branch {
+                cond: *lhs,
+                true_bb: short_id,
+                false_bb: eval_id,
+            });
+            ctx.flush_block(CoreTerminator::Branch {
+                cond: *lhs,
+                true_bb: short_id,
+                false_bb: eval_id,
+            });
+            // 短路块
+            ctx.emit(CoreInst::Copy(*dst, *lhs));
+            ctx.flush_block(CoreTerminator::Jump(end_id));
+            // 非短路块：求值 rhs，结果 = (lhs != rhs)
+            lower_block(ctx, rhs);
+            let r = rhs.result.unwrap_or(0);
             ctx.emit(CoreInst::BinaryOp(
                 *dst,
                 *lhs,
                 crate::common::BinaryOp::NotEqual,
-                *rhs,
+                r,
             ));
+            ctx.flush_block(CoreTerminator::Jump(end_id));
         }
         Node::And { dst, lhs, rhs, .. } => {
+            // cond 为假 ⇒ 短路（结果 = lhs，rhs 不求值）
+            let eval_id = ctx.next_block_id + 1;
+            let short_id = ctx.next_block_id + 2;
+            let end_id = ctx.next_block_id + 3;
+            ctx.emit(CoreInst::Branch {
+                cond: *lhs,
+                true_bb: eval_id,
+                false_bb: short_id,
+            });
+            ctx.flush_block(CoreTerminator::Branch {
+                cond: *lhs,
+                true_bb: eval_id,
+                false_bb: short_id,
+            });
+            // 非短路块：求值 rhs，结果 = (lhs == rhs)
+            lower_block(ctx, rhs);
+            let r = rhs.result.unwrap_or(0);
             ctx.emit(CoreInst::BinaryOp(
                 *dst,
                 *lhs,
                 crate::common::BinaryOp::Equal,
-                *rhs,
+                r,
             ));
+            ctx.flush_block(CoreTerminator::Jump(end_id));
+            // 短路块
+            ctx.emit(CoreInst::Copy(*dst, *lhs));
+            ctx.flush_block(CoreTerminator::Jump(end_id));
         }
         // DynTrait/Prompt → Core 层降维为透传调用
         Node::DynTrait { dst, src, .. } => {
@@ -478,6 +525,48 @@ fn lower_node(ctx: &mut CoreContext, node: &Ehir) {
         // ── 表达式语句 ──
         Node::Expr { reg, .. } => {
             ctx.emit(CoreInst::Expr(*reg));
+        }
+
+        // ── v0.104.6 D472：4 类新构造 → Core 层透传 ──
+        //
+        // Core 层是**影子/统计层**（产出不进执行路径，见 `mir/pipeline.rs`：
+        // 管线产出的 MirFunction 来自 `lower_fcfg(&fcfg)`），且其基元集
+        // 本就不覆盖全部 MirInst 变体（`core.rs`：「44/50 MirInst 变体没有
+        // CoreInst 直接等价物」）。故此处按既有惯例透传：
+        // - worker / transaction：嵌套体是**独立寄存器空间**的 MirFunction，
+        //   Core 层无嵌套体字段可承载 → 只透传体内容。
+        // - eval / aggregate：断言/贡献是执行层语义，Core 层只占位 Nil。
+        Node::Worker { body, .. } => {
+            lower_block(ctx, body);
+        }
+        Node::Transaction {
+            body, compensation, ..
+        } => {
+            lower_block(ctx, body);
+            lower_block(ctx, compensation);
+        }
+        Node::Eval {
+            given,
+            expects,
+            dst,
+            ..
+        } => {
+            ctx.emit(CoreInst::Const(*dst, Value::Nil));
+            let _ = (given, expects);
+        }
+        Node::Aggregate { value, dst, .. } => {
+            ctx.emit(CoreInst::Const(*dst, Value::Nil));
+            let _ = value;
+        }
+        // v0.104.6 D472：管道 + commit / rollback → Core 层透传
+        Node::Pipe {
+            dst, left, right, ..
+        } => {
+            ctx.emit(CoreInst::Const(*dst, Value::Nil));
+            let _ = (left, right);
+        }
+        Node::Commit { dst, .. } | Node::Rollback { dst, .. } => {
+            ctx.emit(CoreInst::Const(*dst, Value::Nil));
         }
     }
 }

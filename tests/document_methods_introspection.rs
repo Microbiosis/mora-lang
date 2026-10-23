@@ -26,6 +26,7 @@
 //! （「…routers, mcp_servers, documents, or builtin objects」）——
 //! 说明只有 `methods()` 这张表漏了，不是「document 本来就没有方法」。
 
+use mora::test_support::TempDir;
 use std::io::Write;
 use std::process::Command;
 
@@ -66,8 +67,7 @@ fn d169_methods_of_document_lists_all_methods() {
 /// D169 主判据 ②：这些方法**确实可用** —— 不能只改表就交差。
 #[test]
 fn d169_document_methods_actually_work() {
-    let base = std::env::temp_dir().join("mora_d169_b");
-    std::fs::create_dir_all(&base).expect("建目录");
+    let base = TempDir::new("mora_d169_b");
     let md = base.join("s.md");
     std::fs::write(&md, "# T\n\ntext\n\n## S\n\nbody\n").expect("写 md");
     let prog = base.join("p.mora");
@@ -101,8 +101,7 @@ fn d169_document_methods_actually_work() {
 /// D169 反向对照：`methods_of` 对其它类型**不得**被这次改动影响。
 #[test]
 fn d169_other_types_unchanged() {
-    let base = std::env::temp_dir().join("mora_d169_c");
-    std::fs::create_dir_all(&base).expect("建目录");
+    let base = TempDir::new("mora_d169_c");
     let prog = base.join("p.mora");
     std::fs::write(
         &prog,

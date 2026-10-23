@@ -81,18 +81,15 @@ pub fn replay_tea_app(app: &TeaApp, recorder: &Recorder) -> ReplayResult {
 mod tests {
     use super::*;
     use crate::record::Recorder;
-    use std::env;
-    use std::fs;
-    use std::path::PathBuf;
+    use crate::test_support::TempFile;
 
-    fn tmp_path(name: &str) -> PathBuf {
-        let mut p = env::temp_dir();
-        p.push(format!(
-            "mora_tea_replay_test_{}_{}.jsonl",
-            name,
-            std::process::id()
-        ));
-        p
+    use std::fs;
+
+    fn tmp_path(name: &str) -> TempFile {
+        TempFile::new(
+            "tea_replay",
+            &format!("mora_tea_replay_test_{}_{}.jsonl", name, std::process::id()),
+        )
     }
 
     #[test]
@@ -103,10 +100,10 @@ mod tests {
         let app = app.with_model(Value::Dict(model));
 
         let path = tmp_path("state_mut");
-        let mut r = Recorder::new_record(path.clone()).unwrap();
+        let mut r = Recorder::new_record(path.path().to_path_buf()).unwrap();
         r.record_state_mutation("count".to_string(), Value::Int(0), Value::Int(42));
         r.save().unwrap();
-        let r2 = Recorder::new_replay(path.clone()).unwrap();
+        let r2 = Recorder::new_replay(path.path().to_path_buf()).unwrap();
         let result = replay_tea_app(&app, &r2);
         assert_eq!(result.mutation_count, 1);
         match result.final_model {
@@ -123,12 +120,12 @@ mod tests {
     fn replay_dispatches_msgs() {
         let app = TeaApp::new(Value::Nil, Value::Nil, Value::Nil);
         let path = tmp_path("msgs");
-        let mut r = Recorder::new_record(path.clone()).unwrap();
+        let mut r = Recorder::new_record(path.path().to_path_buf()).unwrap();
         let mut payload = std::collections::HashMap::new();
         payload.insert("tag".to_string(), Value::String("Inc".to_string()));
         r.record_msg("user".to_string(), Value::Dict(payload), 0);
         r.save().unwrap();
-        let r2 = Recorder::new_replay(path.clone()).unwrap();
+        let r2 = Recorder::new_replay(path.path().to_path_buf()).unwrap();
         let result = replay_tea_app(&app, &r2);
         assert_eq!(result.msg_count, 1);
         let _ = fs::remove_file(&path);

@@ -145,13 +145,23 @@ pub(super) fn dead_code_elim(ssa: &mut MirSsaFunction) {
             // 它降维成一条真跳转，落地时 `pc >= body.len()`，返回的仍是「最后
             // 产生 dst 的指令」。漏掉它 ⇒ `let x = if … end` 在 `--opt=1` 下
             // 变成 Nil（实测）。
+            //
+            // v0.104.6 **D474**：原实现带一个 `.filter(|&d| d > 0)` ——
+            // 它把**寄存器 0**排除在「隐式返回的值」之外。而 reg 0 恰恰是
+            // 「程序只有一条语句、值就在第一条指令里」的情形：
+            //
+            // ```text
+            // 1        →  MIR = [Const(0, 1.0)]   →  reg 0 被 DCE 删掉
+            // ```
+            //
+            // ⇒ `--opt=1` / `--opt=2` 下这类程序的返回值从真实值变成 **Nil**
+            // （实测 `Float(1.0)` → `Nil`；`let x = 1 / x` 则正常，因为它的
+            // 值落在 reg 2）。
+            //
+            // 该过滤没有任何依据：`ssa_dst` 返回的就是「该指令写的寄存器」，
+            // reg 0 与其它寄存器**没有区别**（`SsaReg` 空间从 0 起编号）。
             Terminator::Return(None) | Terminator::JumpExit => {
-                if let Some(last_dst) = block
-                    .insts
-                    .iter()
-                    .rev()
-                    .find_map(|inst| ssa_dst(inst).filter(|&d| d > 0))
-                {
+                if let Some(last_dst) = block.insts.iter().rev().find_map(ssa_dst) {
                     used.insert(last_dst);
                 }
             }

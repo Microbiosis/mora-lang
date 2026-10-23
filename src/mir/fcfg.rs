@@ -68,19 +68,43 @@ pub enum Node<M> {
         span: Span,
         meta: M,
     },
-    /// 逻辑或（短路求值）。WitnessKind::Or 对应。
+    /// 逻辑或。WitnessKind::Or 对应。
+    ///
+    /// v0.104.6 D477：**rhs 是「块」而不是已算好的寄存器**。
+    ///
+    /// 短路求值要求 rhs **只在 lhs 为假时**才求值 ⇒ rhs 的求值必须能被放进
+    /// 「非短路分支」里。承载寄存器（`rhs: Reg`）的形状**结构上无法**表达
+    /// 短路求值：寄存器在节点降级之前就已写好，rhs 的副作用早已发生
+    /// （D477 前的生产路径正是如此 —— 见 `fcfg_lower` 的降级注释）。
+    ///
+    /// 降级后的指令序列（`fcfg_lower`）：
+    ///
+    /// ```text
+    ///   JumpIf(l, short)          ; l 为真 ⇒ 走短路（rhs 不求值）
+    ///   <rhs 块的指令>            ; ← 只在这条路上求值
+    ///   BinaryOp(dst, l, .., r)   ; fall-through：l 为假 ⇒ 结果 = r
+    ///   Jump(end)
+    /// short:
+    ///   Copy(dst, l)              ; 短路：结果 = l
+    /// end:
+    /// ```
     Or {
         dst: Reg,
         lhs: Reg,
-        rhs: Reg,
+        /// rhs 的**表达式块**（未求值）：只在 lhs 为假时求值。
+        rhs: Block<M>,
         span: Span,
         meta: M,
     },
-    /// 逻辑与（短路求值）。WitnessKind::And 对应。
+    /// 逻辑与。WitnessKind::And 对应。
+    ///
+    /// v0.104.6 D477：rhs 是**未求值的块**（契约同 [`Node::Or`]）——
+    /// 只在 lhs 为真时求值。
     And {
         dst: Reg,
         lhs: Reg,
-        rhs: Reg,
+        /// rhs 的**表达式块**（未求值）：只在 lhs 为真时求值。
+        rhs: Block<M>,
         span: Span,
         meta: M,
     },
@@ -289,6 +313,7 @@ pub enum Node<M> {
         /// Sequence 链断裂 → **其后所有 Effect 节点（含 `print`）静默消失**，
         /// 无报错、退出码 0。判决实验：`MORA_9LAYER=0`（走 `emit.rs` 单遍
         /// 直出、不经本 IR）现象消失。
+        /// 〔历史记档：`MORA_9LAYER=0` 已于 v0.104.6 D474 退役〕
         dst: Reg,
         effect: String,
         body: Block<M>,
@@ -419,7 +444,21 @@ pub enum Node<M> {
     Orchestrate {
         input_var: String,
         result_var: String,
-        kind: OrchestrateKind<M>,
+        /// v0.104.6 D473：编排载荷**原样**承载 witness 的
+        /// `WitnessOrchestrateKind`（不再经 `fcfg::OrchestrateKind<M>` 投影）。
+        ///
+        /// 旧投影是**有损**的：agent 体、边条件、state_schema / checkpoint /
+        /// interrupt_points / adjacency、MoA/MoE 的 prompt 全部丢失 ——
+        /// 而它的唯一消费者（`fcfg_lower`）本来就把一切替换成
+        /// `Sequential { agents: vec![] }` 占位。
+        ///
+        /// ⇒ 编排是**数据构造语句**（不参与控制流），其载荷是**数据**而非
+        /// CFG 结构，故按原样透传（与 `Node::RelDef { clauses }` 同款）；
+        /// witness→Mir 的转换由 FCFG→MIR 桥接层（`fcfg_lower`）负责 ——
+        /// 那正是该层的职责。
+        kind: crate::mir::witness::WitnessOrchestrateKind,
+        /// 语句自身的结果寄存器（值为 Nil）—— 与 emit 路径同形。
+        dst: Reg,
         span: Span,
         meta: M,
     },
@@ -444,13 +483,82 @@ pub enum Node<M> {
         meta: M,
     },
 
+    // ── v0.104.6 D472：9 层管线补齐 ──
+    //
+    // 这 4 类构造此前在 FCFG 层**没有对应节点**，所以 9 层降级链
+    // 结构上产不出 `Worker` / `Transaction` / `Eval` / `Aggregate` 指令 ——
+    // 不是「降级链没写」，是**连节点类型都没有**。
+    // 现与 WitnessKind 的 4 个新变体、MirInst 的 4 个变体一一对应。
+    /// worker 块 —— 与 `MirInst::Worker { name, body }` 同构。
+    Worker {
+        name: String,
+        body: Block<M>,
+        /// 块自身的结果寄存器（值为 Nil）—— 语句型构造必须有值。
+        dst: Reg,
+        span: Span,
+        meta: M,
+    },
+    /// transaction 块 —— 与 `MirInst::Transaction { body, compensation }` 同构。
+    Transaction {
+        body: Block<M>,
+        compensation: Block<M>,
+        /// 块自身的结果寄存器（值为 Nil）。
+        dst: Reg,
+        span: Span,
+        meta: M,
+    },
+    /// eval 断言 —— 与 `MirInst::Eval { name, given_reg, expects, ... }` 对应。
+    Eval {
+        name: String,
+        given: Reg,
+        expects: Vec<Reg>,
+        tolerance: Option<f64>,
+        replay_path: Option<String>,
+        /// 语句自身的结果寄存器（值为 Nil）。
+        dst: Reg,
+        span: Span,
+        meta: M,
+    },
+    /// aggregate 贡献 —— 与 `MirInst::Aggregate { name, value }` 对应。
+    Aggregate {
+        name: String,
+        value: Reg,
+        /// 语句自身的结果寄存器（值为 Nil）。
+        dst: Reg,
+        span: Span,
+        meta: M,
+    },
+
+    // ── v0.104.6 D472：管道与事务家族补齐 ──
+    /// 管道 `x |> f` —— 与 `MirInst::Pipe { dst, lhs, rhs }` 同构。
+    Pipe {
+        dst: Reg,
+        left: Reg,
+        right: Reg,
+        span: Span,
+        meta: M,
+    },
+    /// `commit` —— 与 `MirInst::Commit` 同构（unit 指令）。
+    Commit {
+        /// 语句自身的结果寄存器（值为 Nil）。
+        dst: Reg,
+        span: Span,
+        meta: M,
+    },
+    /// `rollback` —— 与 `MirInst::Rollback` 同构（unit 指令）。
+    Rollback {
+        /// 语句自身的结果寄存器（值为 Nil）。
+        dst: Reg,
+        span: Span,
+        meta: M,
+    },
+
     // ── 序列 ──
     Sequence {
         nodes: Vec<Node<M>>,
         span: Span,
         meta: M,
     },
-
     // ── 表达式语句（丢弃结果）──
     Expr {
         reg: Reg,
@@ -539,46 +647,20 @@ pub enum QuasiquoteSegment {
     UnquoteSplice(Reg),
 }
 
-/// 编排类型。
-#[derive(Debug, Clone)]
-pub enum OrchestrateKind<M> {
-    Sequential,
-    Loop {
-        body: Block<M>,
-    },
-    Graph {
-        vertices: Vec<String>,
-        edges: Vec<(String, String)>,
-    },
-    Pregel {
-        config: PregelConfig<M>,
-    },
-    MoA {
-        layers: Vec<MoALayer<M>>,
-    },
-    MoE {
-        experts: Vec<String>,
-        router: String,
-        top_k: usize,
-    },
-}
-
-/// Pregel 配置。
-#[derive(Debug, Clone)]
-pub struct PregelConfig<M> {
-    pub vertices: Vec<String>,
-    pub edges: Vec<(String, String)>,
-    pub compute: Block<M>,
-    pub combine: Option<Block<M>>,
-    pub max_supersteps: Option<usize>,
-}
-
-/// MoA 层。
-#[derive(Debug, Clone)]
-pub struct MoALayer<M> {
-    pub proposers: Vec<Block<M>>,
-    pub aggregator: Block<M>,
-}
+// ── v0.104.6 D473：删除 `fcfg::OrchestrateKind<M>` / `PregelConfig<M>` /
+// `MoALayer<M>` ──
+//
+// 它们是 witness 编排载荷的**有损投影**：agent 体、边条件、state_schema /
+// checkpoint / interrupt_points / adjacency、MoA/MoE 的 prompt 全部丢失
+// （MoE 甚至把专家名写成了 `format!("{:?}", span)`）。
+//
+// 而它们的**唯一消费者**（`fcfg_lower`）本来就把投影结果整体替换成
+// `Sequential { agents: vec![] }` 占位 —— 即：这份有损数据**从头到尾没被
+// 用过**，只让 9 层管线产不出真正的 `MirInst::Orchestrate`（于是 orchestrate
+// 程序必然差分失败、必然回落旧路径）。
+//
+// ⇒ 现由 `Node::Orchestrate::kind` 直接承载 witness 载荷
+// （`WitnessOrchestrateKind`），转换在 FCFG→MIR 桥接层完成。
 
 // ===================================================================
 // EHIR 元数据
@@ -684,6 +766,15 @@ impl<M> Node<M> {
             | Node::Orchestrate { span, .. }
             | Node::WithConfig { span, .. }
             | Node::Sequence { span, .. }
+            // v0.104.6 D472：4 类新构造
+            | Node::Worker { span, .. }
+            | Node::Transaction { span, .. }
+            | Node::Eval { span, .. }
+            | Node::Aggregate { span, .. }
+            // v0.104.6 D472：管道 + commit / rollback
+            | Node::Pipe { span, .. }
+            | Node::Commit { span, .. }
+            | Node::Rollback { span, .. }
             | Node::Expr { span, .. } => *span,
         }
     }
@@ -740,6 +831,15 @@ impl<M> Node<M> {
             | Node::Orchestrate { meta, .. }
             | Node::WithConfig { meta, .. }
             | Node::Sequence { meta, .. }
+            // v0.104.6 D472：4 类新构造
+            | Node::Worker { meta, .. }
+            | Node::Transaction { meta, .. }
+            | Node::Eval { meta, .. }
+            | Node::Aggregate { meta, .. }
+            // v0.104.6 D472：管道 + commit / rollback
+            | Node::Pipe { meta, .. }
+            | Node::Commit { meta, .. }
+            | Node::Rollback { meta, .. }
             | Node::Expr { meta, .. } => meta,
         }
     }

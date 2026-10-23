@@ -60,20 +60,8 @@
 //! ⇒ **只报告**，是否把 banner 改成 `record {list,stats,timeline}` 的
 //! 分组写法，属**文档措辞决定**，待裁决。
 
+use mora::test_support::TempDir;
 use std::process::Command;
-use std::sync::atomic::{AtomicU64, Ordering};
-
-static SEQ: AtomicU64 = AtomicU64::new(0);
-
-fn slug(s: &str) -> String {
-    let mut out = String::from("d362_");
-    out.extend(
-        s.chars()
-            .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
-            .take(40),
-    );
-    out
-}
 
 /// 在独立工作目录里跑一条 CLI 命令，返回 (exit, 合并输出)。
 fn cli(dir: &std::path::Path, args: &[&str]) -> (i32, String) {
@@ -109,12 +97,8 @@ fn cli(dir: &std::path::Path, args: &[&str]) -> (i32, String) {
     (out.status.code().unwrap_or(-1), kept.join(" | "))
 }
 
-fn fresh_dir(tag: &str) -> std::path::PathBuf {
-    let n = SEQ.fetch_add(1, Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!("d362_{n}_{}", slug(tag)));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("建目录");
-    dir
+fn fresh_dir(tag: &str) -> TempDir {
+    TempDir::new(tag)
 }
 
 const SCRIPT: &str = "let a = 1\nlet b = a + 1\na = 5\nlet c = a * 2\nprint(b)\nprint(c)\n";

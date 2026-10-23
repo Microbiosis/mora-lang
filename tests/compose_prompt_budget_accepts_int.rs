@@ -36,7 +36,7 @@
 //! 同一条错误信息跨进程键序不同」。那处修好了，`parse_budget_dispatch` 的
 //! `other` 分支**漏了**，本条一并修。
 
-use std::path::PathBuf;
+use mora::test_support::TempDir;
 
 const NOISE: &[&str] = &[
     "Mora v",
@@ -50,7 +50,7 @@ const NOISE: &[&str] = &[
     "Trait",
 ];
 
-struct WorkDir(PathBuf);
+struct WorkDir(TempDir);
 impl Drop for WorkDir {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
@@ -83,9 +83,7 @@ fn run(dir: &std::path::Path, src: &str) -> (i32, String) {
 }
 
 fn work(tag: &str) -> WorkDir {
-    let d = std::env::temp_dir().join(format!("mora_d263_{tag}_{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&d);
-    std::fs::create_dir_all(&d).expect("mkdir");
+    let d = TempDir::new(tag);
     WorkDir(d)
 }
 

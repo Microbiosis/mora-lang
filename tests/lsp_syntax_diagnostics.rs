@@ -16,13 +16,11 @@
 //! 修法：把 parser 的错误消息转成一条 `severity=1` / `source="mora-parser"`
 //! 的诊断，行号从消息里的 `at line N` 提取。
 
-use std::path::PathBuf;
+use mora::test_support::TempDir;
 use std::process::Command;
 
-fn temp_dir() -> PathBuf {
-    let d = std::env::temp_dir().join("mora_d101_lsp");
-    std::fs::create_dir_all(&d).expect("create temp dir");
-    d
+fn temp_dir() -> TempDir {
+    TempDir::new("mora_d101_lsp")
 }
 
 fn frame(json: &str) -> String {

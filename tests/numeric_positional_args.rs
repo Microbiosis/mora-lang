@@ -42,6 +42,7 @@
 use mora::interpreter::Interpreter;
 use mora::mir::vm::execute;
 use mora::parser_v3::ParserV3;
+use mora::test_support::TempDir;
 use std::sync::Arc;
 
 fn run(src: &str) -> Result<String, String> {
@@ -99,8 +100,7 @@ fn d150_ccr_marker_accepts_int_valued_size() {
 #[test]
 fn d150_refine_count_accepts_int_and_keeps_list_return_type() {
     // 需要一个真实脚本文件作为第 1 参（它是**路径**不是脚本文本）
-    let dir = std::env::temp_dir().join("mora_d150_refine");
-    std::fs::create_dir_all(&dir).expect("建临时目录");
+    let dir = TempDir::new("mora_d150_refine");
     let script = dir.join("s.mora");
     std::fs::write(&script, "task main()\n  print(\"hi\")\nend\n").expect("写脚本");
 
@@ -123,8 +123,7 @@ fn d150_refine_count_accepts_int_and_keeps_list_return_type() {
 /// 即「查第 1 轮」静默返回**最新一轮**。
 #[test]
 fn d150_refine_info_accepts_int_valued_iteration() {
-    let dir = std::env::temp_dir().join("mora_d150_info");
-    std::fs::create_dir_all(&dir).expect("建临时目录");
+    let dir = TempDir::new("mora_d150_info");
     let script = dir.join("s.mora");
     std::fs::write(&script, "task main()\n  print(\"hi\")\nend\n").expect("写脚本");
     let p = script.display().to_string().replace('\\', "\\\\");

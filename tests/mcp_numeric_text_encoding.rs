@@ -40,6 +40,7 @@
 //! 再决定修不修；写下护栏后必须真的验一次牙齿，`绿` 有时意味着「你要防的
 //! 东西根本不存在」。
 
+use mora::test_support::TempDir;
 use std::io::Write;
 use std::process::{Command, Stdio};
 
@@ -116,12 +117,10 @@ end)
 mcp.serve()
 "#;
 
-struct WorkDir(std::path::PathBuf);
+struct WorkDir(TempDir);
 impl WorkDir {
     fn new(tag: &str) -> Self {
-        let d = std::env::temp_dir().join(format!("mora_d247_{tag}"));
-        let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(&d).expect("mkdir");
+        let d = TempDir::new(tag);
         WorkDir(d)
     }
 }

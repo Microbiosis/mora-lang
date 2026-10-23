@@ -34,24 +34,21 @@
 //! 必须**执行**它，断言 exit 0 + 输出正确。修前本条会红在
 //! `Unexpected character '#'`。
 
+use mora::test_support::TempDir;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use mora::refine::RefineSession;
 
-static SEQ: AtomicU64 = AtomicU64::new(0);
-
 /// 临时工作目录（Drop 时清理）。
-struct Work(PathBuf);
+///
+/// v0.104.6 D475：目录由**全仓唯一入口** `mora::test_support::TempDir` 提供
+/// （原先这里是又一份逐字复制的 `Work` 副本）。
+struct Work(TempDir);
 
 impl Work {
     fn new(tag: &str) -> Self {
-        let n = SEQ.fetch_add(1, Ordering::Relaxed);
-        let d = std::env::temp_dir().join(format!("mora_d398_{n}_{tag}"));
-        let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(&d).expect("建临时目录");
-        Work(d)
+        Work(TempDir::new(tag))
     }
     fn write_script(&self, name: &str, body: &str) -> PathBuf {
         let p = self.0.join(name);

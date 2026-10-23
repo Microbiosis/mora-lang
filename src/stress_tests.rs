@@ -36,6 +36,7 @@ use std::time::Instant;
 )]
 mod tests {
     use super::*;
+    use crate::test_support::TempDir;
 
     /// v0.49.0 (A1+B1): capability revoke under race.
     /// 100 threads each issue + revoke 100 tokens concurrently.
@@ -118,13 +119,7 @@ mod tests {
     fn stress_refine_concurrent() {
         use std::time::Duration;
 
-        let dir = std::env::temp_dir().join(format!(
-            "mora_stress_refine_{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let dir = TempDir::new("mora_stress_refine_");
         std::fs::create_dir_all(&dir).unwrap();
 
         // Write 5 scripts

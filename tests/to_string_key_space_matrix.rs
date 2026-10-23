@@ -73,25 +73,15 @@
 //!
 //! ⇒ 换用 `tool.*` 重测即全部可达。**本条钉 `tool`（注册名）**。
 
+use mora::test_support::TempDir;
 use std::process::Command;
-use std::sync::atomic::{AtomicU64, Ordering};
-
-static SEQ: AtomicU64 = AtomicU64::new(0);
-
-fn slug(s: &str) -> String {
-    s.chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
-        .collect()
-}
 
 /// 每个用例独立进程，且 `HOME` / `USERPROFILE` 指向临时目录
 /// （`tool.create` / `schedule.add` 会落盘到用户目录）。
 /// 取 stdout **全部**实质行并以 ` | ` 连接 —— D330 教训：不能用
 /// `lines().find(第一行)`，多行探针只取得到第一行。
 fn ev(body: &str) -> (i32, String) {
-    let n = SEQ.fetch_add(1, Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!("mora_d333_s_{}_{}", n, slug(body)));
-    std::fs::create_dir_all(&dir).expect("建目录");
+    let dir = TempDir::new("mora_d333_s_");
     let p = dir.join("p.mora");
     std::fs::write(&p, body).expect("写探针");
     let home = dir.join("home");

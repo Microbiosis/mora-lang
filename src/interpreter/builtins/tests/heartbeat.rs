@@ -4,24 +4,15 @@
 
 mod tests_v047_heartbeat {
     use crate::interpreter::Interpreter;
+    use crate::test_support::TempDir;
     use crate::value::Value;
 
-    /// v0.47.0: ai.heartbeat builtin (mimiclaw §1.5 HEARTBEAT.md pattern)
-    use std::time::UNIX_EPOCH;
-
-    fn write_heartbeat(name: &str, content: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "mora_hb_test_{}_{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
+    /// 返回 **(守卫, 路径)** —— 守卫必须活得比路径久（v0.104.6 D475）。
+    fn write_heartbeat(name: &str, content: &str) -> (TempDir, std::path::PathBuf) {
+        let dir = TempDir::new("mora_hb_test_");
         let path = dir.join(format!("{}.md", name));
         std::fs::write(&path, content).unwrap();
-        path
+        (dir, path)
     }
 
     #[test]
@@ -33,7 +24,7 @@ mod tests_v047_heartbeat {
 - [x] third done
 - [ ] fourth pending
 "#;
-        let path = write_heartbeat("HB", content);
+        let (_guard, path) = write_heartbeat("HB", content);
         let result = interp
             .call_ai_method(
                 "heartbeat",
@@ -74,7 +65,7 @@ mod tests_v047_heartbeat {
     fn ai_heartbeat_all_done_is_complete() {
         let mut interp = Interpreter::new();
         let content = "- [x] a\n- [X] b\n- [x] c\n";
-        let path = write_heartbeat("all_done", content);
+        let (_guard, path) = write_heartbeat("all_done", content);
         let result = interp
             .call_ai_method(
                 "heartbeat",
@@ -95,7 +86,7 @@ mod tests_v047_heartbeat {
     fn ai_heartbeat_empty_heartbeat_is_vacuously_complete() {
         let mut interp = Interpreter::new();
         let content = "# only heading\nno checklist items\n";
-        let path = write_heartbeat("empty", content);
+        let (_guard, path) = write_heartbeat("empty", content);
         let result = interp
             .call_ai_method(
                 "heartbeat",
@@ -133,7 +124,7 @@ mod tests_v047_heartbeat {
     fn ai_heartbeat_items_list_contains_text_and_done() {
         let mut interp = Interpreter::new();
         let content = "- [x] task A\n- [ ] task B\n";
-        let path = write_heartbeat("items", content);
+        let (_guard, path) = write_heartbeat("items", content);
         let result = interp
             .call_ai_method(
                 "heartbeat",

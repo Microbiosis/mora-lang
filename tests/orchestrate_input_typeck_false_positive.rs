@@ -53,6 +53,7 @@
 //! 只钉前者，则「typeck 整体对 orchestrate 沉默」也能让它变绿
 //! （那正是 D414 之前的状况）。
 
+use mora::test_support::TempDir;
 use std::process::Command;
 
 use mora::parser_v3::ParserV3;
@@ -69,9 +70,7 @@ fn typeck_error_count(src: &str) -> usize {
 /// 测试默认**并行**⇒ 共用一个目录会互相踩（我第一版就踩了：
 /// 两条 CLI 判据同用 `mora_d415_fp`，随机一条报「文件不存在」）。
 fn cli_exit(tag: &str, src: &str) -> (i32, String) {
-    let dir = std::env::temp_dir().join(format!("mora_d415_fp_{tag}"));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("建临时目录");
+    let dir = TempDir::new(tag);
     let p = dir.join("p.mora");
     std::fs::write(&p, src).expect("写脚本");
     let exe = concat!(env!("CARGO_MANIFEST_DIR"), "/target/debug/mora.exe");

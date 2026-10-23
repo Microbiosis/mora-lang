@@ -32,27 +32,17 @@
 //! 「跨进程不同」在单进程测试里**根本不可表达**（这也是 D265 推翻自己那条
 //! 判据的同类理由）。所以这里起 N 个真实 `mora.exe` 子进程比输出。
 
-use std::path::PathBuf;
+use mora::test_support::TempDir;
 use std::process::Command;
 
 const RUNS: usize = 6;
-
-struct WorkDir(PathBuf);
-impl Drop for WorkDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
 
 /// 同一段程序跑 N 次，返回**去重后**的 stdout 行。
 ///
 /// ⚠ `tag` 必须**逐测试不同**：四个测试并行运行，若共用一个目录会互相
 /// 覆盖 `a.mora`，读到的就是别的测试的输出（本条判据第一版就栽在这）。
 fn outputs_distinct(tag: &str, src: &str) -> Vec<String> {
-    let d = std::env::temp_dir().join(format!("mora_d266_{tag}_{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&d);
-    std::fs::create_dir_all(&d).expect("mkdir");
-    let _w = WorkDir(d.clone());
+    let d = TempDir::new(tag);
     let f = d.join("a.mora");
     std::fs::write(&f, src).expect("write");
 
@@ -145,10 +135,7 @@ fn d266_xform_marker_keeps_scalar_values() {
 /// `xform.` 的行，而本组输出是 `hello` ⇒ 会永远返回占位符而假红。
 #[test]
 fn d266_control_group_probe_actually_runs_programs() {
-    let d = std::env::temp_dir().join(format!("mora_d266c_{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&d);
-    std::fs::create_dir_all(&d).expect("mkdir");
-    let _w = WorkDir(d.clone());
+    let d = TempDir::new("d266c");
     let f = d.join("a.mora");
     std::fs::write(&f, "print(\"hello\")\n").expect("write");
     let out = Command::new(concat!(

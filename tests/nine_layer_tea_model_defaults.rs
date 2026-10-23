@@ -48,74 +48,59 @@
 //! 全语料回落率 **57/57 夹具 + 6/6 examples 全部 0 回落**（修前 1/57），
 //! 且 `tea_standalone.mora` 的运行结果**一字未变**。
 //!
-//! ## 本文件为何单独成文件、且只有一条测试
+//! ## 本文件为何单独成文件
 //!
-//! 要用 `MORA_9LAYER=0` 切换编译路径，而**环境变量是进程全局的**：
-//! 放在别的文件里会污染那里并行 spawn `mora.exe` 的测试。
-//! 同 `tests/differential_false_negative.rs` 的约定：**合并成一条串行断言**。
+//! TEA 程序有**自己的一整套声明形态**（model / msg / update / app），
+//! 与普通程序不共用降级路径，单独一个文件便于定位回归。
+//!
+//! ## v0.104.6 D474：判据从「两条编译路径一致」改为「期望输出」
+//!
+//! 原判据的 ①②（无 `[9layer]` 回落行 / `MORA_9LAYER=0` 的 A/B）**已作废**：
+//! D474 把差分机制整个退役 —— parser 只产 witness、MIR 全部由 9 层产出 ⇒
+//! 「参考实现」这一侧**已不存在**，`MORA_9LAYER=0` 会退化成自己跟自己比。
+//!
+//! ⇒ 保留 ③④：**运行结果必须逐行钉死**（不依赖任何对照物）。这比原判据
+//! **更强** —— 原判据只能发现「两条路径不一致」（两条一起错到同一个错值
+//! 时反而绿）。
 
 use std::process::Command;
 
 const TEA: &str = "tests/fixtures/e2e/tea_standalone.mora";
 
-fn run_with(env9: Option<&str>) -> (String, String) {
-    // SAFETY: 本文件**只有这一条**测试在跑（见文件末说明），
-    // 不存在与其他线程并发读环境变量的可能。
-    unsafe {
-        match env9 {
-            Some(v) => std::env::set_var("MORA_9LAYER", v),
-            None => std::env::remove_var("MORA_9LAYER"),
-        }
-    }
+fn run_tea() -> (String, String, i32) {
     let exe = env!("CARGO_BIN_EXE_mora");
     let out = Command::new(exe)
         .arg("run")
         .arg(TEA)
         .output()
         .expect("应能执行 mora");
-    // SAFETY: 同上。
-    unsafe { std::env::remove_var("MORA_9LAYER") };
     (
-        String::from_utf8_lossy(&out.stdout).trim_end().to_string(),
-        String::from_utf8_lossy(&out.stderr).to_string(),
+        String::from_utf8_lossy(&out.stdout)
+            .replace("\r\n", "\n")
+            .trim_end()
+            .to_string(),
+        String::from_utf8_lossy(&out.stderr).replace("\r\n", "\n"),
+        out.status.code().unwrap_or(-1),
     )
 }
 
-/// **D412 主断言**，四条合为一条串行。
+/// **D412 主断言**：TEA 程序的运行结果必须是**钉死的 4 行**。
 #[test]
-fn d412_nine_layer_pipeline_handles_tea_model_defaults() {
-    // ① 默认（9 层管线生效）时**不得**出现任何 9 层回落行。
-    //
-    // v0.104.6 三态化：回落措辞不再是单一的「[9layer] 差分失败」，而是
-    // 「未 legalize 构造…」（预期回落）/「[9layer] **回归**…」/ DEBUG 的
-    // `differential FAILED`。故此处改为断言**完全没有 `[9layer]` 行**——
-    // 这比原文案更严，也与措辞解耦：TEA 一旦走 9 层快路径，任何回落态都不该出现。
-    let (nine_out, nine_err) = run_with(None);
-    assert!(
-        !nine_err.contains("[9layer]"),
-        "9 层管线对 TEA 程序仍在回落 —— `model` 字段默认值没有进 9 层路径。\n\
-         （v0.104.6 起回落有三态措辞，故断言「无任何 [9layer] 行」。）\n\
-         stderr:\n{nine_err}"
-    );
+fn d412_tea_model_defaults_produce_the_expected_output() {
+    let (out, err, code) = run_tea();
+    assert_eq!(code, 0, "TEA 程序应成功运行; stderr:\n{err}");
 
-    // ② 两条编译路径输出**逐字相同**（差分通过的独立佐证）。
-    let (emit_out, _) = run_with(Some("0"));
+    // ① 运行结果**逐字**等于期望（防「两条路径一起错到同一个错值」）。
     assert_eq!(
-        nine_out, emit_out,
-        "两条编译路径的输出应一致。\n 9layer : {nine_out}\n emit.rs: {emit_out}"
+        out, "dict\nlist\nclosure\ntea_app",
+        "TEA 程序的 4 行输出应不变（type_of(Counter/CounterMsg/update/a)）; 实得 {out}"
     );
 
-    // ③ 运行结果**未被本次改动改变**（防「两条路径一起错到同一个值」）。
-    assert_eq!(
-        nine_out, "dict\nlist\nclosure\ntea_app",
-        "TEA 程序的 4 行输出应不变（type_of(Counter/CounterMsg/update/a)）; 实得 {nine_out}"
-    );
-
-    // ④ 逐个值都断言（防上面那个整体相等因换行/空白巧合而通过）。
+    // ② 逐个值都断言（防上面那个整体相等因换行/空白巧合而通过）。
     for want in ["dict", "list", "closure", "tea_app"] {
         assert!(
-            nine_out.lines().any(|l| l == want),
-            "输出应含独立一行 `{want}`; 实得:\n{nine_out}"
+            out.lines().any(|l| l == want),
+            "输出应含独立一行 `{want}`; 实得:\n{out}"
         );
     }
 }

@@ -35,8 +35,9 @@
 //!   （成功 Bool、失败 String）。**失败分支无法从用户代码触发**（需要破坏
 //!   审计链），本测试只覆盖成功分支，String 分支**未经实测**。
 
+use mora::test_support::TempDir;
 use std::collections::BTreeSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// 一条对拍记录。
 ///
@@ -352,14 +353,20 @@ const CASES: &[Case] = &[
 ];
 
 /// 临时 `.md` 的路径（`document.parse` 的实参）。每次调用都确保文件存在。
-fn tmp_md_path() -> PathBuf {
-    let dir = std::env::temp_dir().join("mora_d88_return_types");
-    std::fs::create_dir_all(&dir).expect("create temp dir");
+///
+/// v0.104.6 D475：返回**守卫**而非裸路径 —— 裸路径没有生命周期，
+/// 守卫一析构文件就被删了（调用方需要文件在断言期间一直存在）。
+/// 临时 `.md` 所在的目录（`document.parse` 的实参）：返回**守卫**。
+///
+/// v0.104.6 D475：返回**守卫**而非裸路径 —— 裸路径没有生命周期，
+/// 守卫一析构文件就被删了（调用方需要文件在断言期间一直存在）。
+fn tmp_md_dir() -> TempDir {
+    let dir = TempDir::new("mora_d88_return_types");
     let p = dir.join("doc.md");
     if !p.exists() {
         std::fs::write(&p, "# d88\n\nbody\n").expect("write temp md");
     }
-    p
+    dir
 }
 
 /// 把 `Type` 展开成它**允许**的运行期类型名集合。
@@ -416,9 +423,12 @@ fn allowed_runtime_names(ty: &mora::typeck::Type) -> BTreeSet<String> {
 }
 
 /// 生成 `.mora` 源码，逐行打印 `key=type_of(call)`。
-fn program_source() -> String {
-    let md = tmp_md_path();
-    let md = md.to_string_lossy().replace('\\', "/");
+fn program_source(md_file: &Path) -> String {
+    // v0.104.6 D475：`md` 此前是**同名遮蔽**守卫的那一行 ——
+    // `let md = md.to_string_lossy()` 把守卫覆盖掉 ⇒ 守卫当场析构 ⇒
+    // doc.md 被删 ⇒ 探针程序引用的文件不存在 ⇒ 探针跑不起来。
+    // ⇒ 守卫留在调用方（`observe_runtime`）持有，这里只收路径。
+    let md = md_file.to_string_lossy().replace('\\', "/");
     let mut s = String::from("task main()\n");
     for c in CASES {
         s.push_str(&format!(
@@ -433,10 +443,11 @@ fn program_source() -> String {
 
 /// 跑真实 `mora run`，把 `key=typename` 解析成 map。
 fn observe_runtime() -> BTreeSet<(String, String)> {
-    let dir = std::env::temp_dir().join("mora_d88_return_types");
-    std::fs::create_dir_all(&dir).expect("create temp dir");
+    let dir = TempDir::new("mora_d88_return_types");
     let prog: PathBuf = dir.join("probe.mora");
-    std::fs::write(&prog, program_source()).expect("write probe");
+    // 守卫必须活到探针**跑完** —— 探针要读 doc.md。
+    let md_dir = tmp_md_dir();
+    std::fs::write(&prog, program_source(&md_dir.join("doc.md"))).expect("write probe");
 
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_mora"))
         .arg("run")
@@ -569,8 +580,7 @@ const KNOWN_NONEMPTY_MODULES: &[&str] = &[
 #[test]
 fn d88_param_comments_match_runtime() {
     // plan.create：传字符串当第 2 参必须被运行期拒绝，且消息提到 steps
-    let dir = std::env::temp_dir().join("mora_d88_return_types");
-    std::fs::create_dir_all(&dir).expect("create temp dir");
+    let dir = TempDir::new("mora_d88_return_types");
     let prog: PathBuf = dir.join("plan_create.mora");
     std::fs::write(&prog, "task main()\n  plan.create(\"p\", \"kind\")\nend\n").expect("write");
 

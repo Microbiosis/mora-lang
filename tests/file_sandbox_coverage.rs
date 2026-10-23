@@ -90,38 +90,11 @@
 //! **不做路径解析检查**（只拼 cwd），故 `file.abs("C:/x")` 正常返回。
 //! 这两个在本文件末尾单独钉住。
 
+use mora::test_support::TempDir;
 use std::process::Command;
-use std::sync::atomic::{AtomicU64, Ordering};
-
-static SEQ: AtomicU64 = AtomicU64::new(0);
-
-fn slug(s: &str) -> String {
-    // ⚠ 两个 Windows 陷阱（D334 判据第一版连踩两个）：
-    //
-    // ① **保留设备名**：`basename` / `dirname` / `exists` / `remove` 这些 tag
-    //    slug 化后落进 `CON` / `NUL` / `PRN` / `AUX` / `COM1`… 的形态，
-    //    `create_dir_all` 报 `os error 123 文件名…语法不正确`。
-    //    办法：**加固定前缀**（`d334_`）—— 加了前缀就不再是保留名。
-    //    比「逐个查保留名表」稳：那张表有大小写与扩展名的坑
-    //    （`NUL.txt` 同样是设备名）。
-    //
-    // ② **路径长度**：多行探针 body 很长，整段 slug 化后
-    //    `%TEMP%\mora_d334_f_<seq>_<slug>\p.mora` 会**超 260**，
-    //    同样报 `os error 123`。办法：**只取前 40 个字符**。
-    //    目录名不需要可读，只需要唯一 —— 唯一性由前面的 `AtomicU64` 序号保证。
-    let mut out = String::from("d334_");
-    out.extend(
-        s.chars()
-            .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
-            .take(40),
-    );
-    out
-}
 
 fn ev(body: &str) -> (i32, String) {
-    let n = SEQ.fetch_add(1, Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!("mora_d334_f_{}_{}", n, slug(body)));
-    std::fs::create_dir_all(&dir).expect("建目录");
+    let dir = TempDir::new("mora_d334_f_");
     let p = dir.join("p.mora");
     std::fs::write(&p, body).expect("写探针");
     let home = dir.join("home");
@@ -559,7 +532,7 @@ fn d334_every_new_op_must_call_check_path() {
 //     落进 `CON` / `NUL` / `AUX` / `COM1`… 的形态 => `os error 123`。
 // (2) **路径长度上限 260**：多行探针 body 整段 slug 化会超限 => 同样 `os error 123`。
 //
-// 前两者的症状都是「判据红 + 产品完全正常」，详见 `slug()` 的注释。
+// 前两者的症状都是「判据红 + 产品完全正常」，详见当时的 `slug()` 注释（该辅助函数已随临时目录机制统一而删除）。
 //
 // (3) **POSIX 路径在 Windows 上无意义**：`/etc` 解析成当前盘下的 `D:\etc`
 //     （**仍在沙箱内**），实测得 OS 错误而非 `sandbox denied`。

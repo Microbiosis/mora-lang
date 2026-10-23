@@ -38,12 +38,11 @@
 //! 输出行数 —— 因为 `--opt=1/2` 下另有一个**已上报未修**的尾块重复执行缺陷
 //! （`let` 后跟 ≥2 条 print 时尾部会多跑一遍），两者互不相关，不应互相绑死。
 
+use mora::test_support::TempDir;
 use std::process::Command;
 
 fn run(src: &str, tag: &str) -> (i32, Vec<String>) {
-    let dir = std::env::temp_dir().join(format!("mora_d302_{tag}"));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("建目录");
+    let dir = TempDir::new(tag);
     let p = dir.join("p.mora");
     std::fs::write(&p, src).expect("写探针");
     let exe = concat!(env!("CARGO_MANIFEST_DIR"), "/target/debug/mora.exe");
@@ -156,9 +155,7 @@ fn ordinary_arithmetic_is_unaffected() {
 /// `--opt=1` 也必须正确（那边原本就靠 MIR 层常量折叠免疫，本条防回归）。
 #[test]
 fn basic_opt_level_also_executes_the_rest() {
-    let dir = std::env::temp_dir().join("mora_d302_opt1");
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("建目录");
+    let dir = TempDir::new("mora_d302_opt1");
     let p = dir.join("p.mora");
     std::fs::write(
         &p,

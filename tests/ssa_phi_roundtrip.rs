@@ -26,8 +26,9 @@
 //!
 //! 每条都对应本文件下面的一条判据。
 
+use mora::test_support::TempDir;
 use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
 
 use mora::mir::ssa::{MirSsaFunction, SsaInst, Terminator};
@@ -396,13 +397,6 @@ fn d418_no_copy_reads_an_unproduced_register() {
 
 // ── ⑤：执行等价（真实 CLI） ─────────────────────────────────────────
 
-struct WorkDir(PathBuf);
-impl Drop for WorkDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-
 fn run(exe: &str, dir: &Path, file: &str, opt: Option<&str>) -> (i32, String) {
     let mut c = Command::new(exe);
     c.current_dir(dir);
@@ -441,10 +435,7 @@ fn d418_loop_shapes_survive_every_opt_level() {
     if !Path::new(exe).exists() {
         panic!("缺 {exe}：集成测试需要 `cargo build --bin mora` 产出的二进制");
     }
-    let dir = std::env::temp_dir().join(format!("mora_d418_{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("建临时目录");
-    let _work = WorkDir(dir.clone());
+    let dir = TempDir::new("d418");
 
     for (tag, src) in [
         (

@@ -53,6 +53,7 @@
 //! - capability **非法名**（如 `net.http`）在 builtin 层 `Capability::parse`
 //!   就失败 ⇒ 抛 Err **终止脚本**（exit 1）；而**合法名但未授权**返回 `false`。
 
+use mora::test_support::TempDir;
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::Path;
@@ -306,7 +307,7 @@ fn d388_sandbox_key_callable_but_invisible_to_introspection() {
     );
 
     // 自省里 `key` 缺席（现状钉）
-    let base = std::env::temp_dir().join("mora_d388_introspect");
+    let base = TempDir::new("mora_d388_introspect");
     let _ = std::fs::create_dir_all(&base);
     let prog = base.join("p.mora");
     std::fs::write(&prog, "print(methods_of(sandbox))").expect("写探针");

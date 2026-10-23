@@ -617,6 +617,7 @@ impl AuditSink for NullSink {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::TempDir;
     use std::collections::HashSet;
     use std::ops::Deref;
     use std::path::{Path, PathBuf};
@@ -643,7 +644,7 @@ mod tests {
     /// Rust 的逆序 drop 才会让 sink 先关句柄、`TempLog` 再删目录
     /// （Windows 上文件被占用时 `remove_dir_all` 会失败）。
     struct TempLog {
-        dir: PathBuf,
+        dir: TempDir,
         file: PathBuf,
     }
 
@@ -667,14 +668,7 @@ mod tests {
     }
 
     fn temp_log(name: &str) -> TempLog {
-        let dir = std::env::temp_dir().join(format!(
-            "mora_audit_{}_{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let dir = TempDir::new("mora_audit_");
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join(name);
         TempLog { dir, file }

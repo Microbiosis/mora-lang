@@ -38,12 +38,11 @@
 //! 说明 trait/impl 已可声明 —— 此时应给 `Value::TraitObject` 补 arm，
 //! 并按「该值实际匹配到哪个 trait」动态列方法」。
 
+use mora::test_support::TempDir;
 use std::process::Command;
 
 fn run_src(src: &str, tag: &str) -> String {
-    let base = std::env::temp_dir().join(format!("mora_d171_{tag}"));
-    let _ = std::fs::remove_dir_all(&base);
-    std::fs::create_dir_all(&base).expect("建目录");
+    let base = TempDir::new(tag);
     let prog = base.join("p.mora");
     std::fs::write(&prog, src).expect("写探针");
     let mora = concat!(env!("CARGO_MANIFEST_DIR"), "/target/debug/mora.exe");
@@ -63,7 +62,7 @@ fn run_src(src: &str, tag: &str) -> String {
 #[test]
 fn d171_variants_without_dispatchers_are_empty_and_explicitly_uncallable() {
     for (label, expr) in [("Bool", "true"), ("Nil", "nil"), ("Char", "'c'")] {
-        let base = std::env::temp_dir().join("mora_d171_v");
+        let base = TempDir::new("mora_d171_v");
         let _ = std::fs::create_dir_all(&base);
         let prog = base.join("p.mora");
         std::fs::write(&prog, format!("print(methods_of({expr}))\n")).expect("写");
@@ -129,7 +128,7 @@ fn d171_trait_dispatch_is_wired_but_has_no_impls() {
         !out.contains("anything"),
         "`x.anything()` 不应成功返回; 实得: {out}"
     );
-    let dir = std::env::temp_dir().join("mora_d171_dyn2");
+    let dir = TempDir::new("mora_d171_dyn2");
     let _ = std::fs::create_dir_all(&dir);
     let prog = dir.join("p.mora");
     std::fs::write(&prog, "let x: dyn Foo = 1\nx.anything()\n").expect("写探针");

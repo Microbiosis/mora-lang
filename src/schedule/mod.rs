@@ -309,6 +309,7 @@ impl Scheduler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::TempDir;
 
     #[test]
     fn add_every_job() {
@@ -406,7 +407,7 @@ mod tests {
 
     #[test]
     fn persistence_roundtrip() {
-        let dir = std::env::temp_dir().join("mora_schedule_test");
+        let dir = TempDir::new("mora_schedule_test");
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("schedule.json");
         let _ = std::fs::remove_file(&path);

@@ -44,18 +44,16 @@
 //! 与本条收紧的下限无关。真正逐字钉住「只查下限」的是 `require_1` 的源码层断言
 //! —— 它必须用 `args.first()`，不得写成 `args.len() == 1`。
 
-use std::path::PathBuf;
+use mora::test_support::TempDir;
 use std::process::Command;
 
 /// 这五个在 `typeck/hm/builtin.rs` 里被登记成一元箭头的内建。
 const UNARY: [&str; 5] = ["str", "int", "float", "bool", "atom"];
 
-struct WorkDir(PathBuf);
+struct WorkDir(TempDir);
 impl WorkDir {
     fn new(tag: &str) -> Self {
-        let d = std::env::temp_dir().join(format!("mora_d327_{tag}"));
-        let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(&d).expect("建临时目录");
+        let d = TempDir::new(tag);
         WorkDir(d)
     }
     fn run(&self, src: &str) -> (i32, String) {

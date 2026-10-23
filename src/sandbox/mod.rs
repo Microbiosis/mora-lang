@@ -260,11 +260,10 @@ fn strip_verbatim(p: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::TempDir;
 
-    fn temp_dir() -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("mora_sandbox_{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&dir);
-        dir
+    fn temp_dir() -> TempDir {
+        TempDir::new("sandbox")
     }
 
     #[test]
@@ -314,7 +313,7 @@ mod tests {
     fn path_rejects_parent_traversal() {
         let dir = temp_dir();
         let p = SandboxPolicy {
-            fs_root: Some(dir.clone()),
+            fs_root: Some(dir.path().to_path_buf()),
             ..SandboxPolicy::permissive()
         };
         assert!(p.check_path("../etc/passwd").is_err());
@@ -327,7 +326,7 @@ mod tests {
         let sub = dir.join("sub");
         let _ = std::fs::create_dir_all(&sub);
         let p = SandboxPolicy {
-            fs_root: Some(dir.clone()),
+            fs_root: Some(dir.path().to_path_buf()),
             ..SandboxPolicy::permissive()
         };
         assert!(p.check_path("sub/file.txt").is_ok());
@@ -341,7 +340,7 @@ mod tests {
     fn path_rejects_absolute_escape() {
         let dir = temp_dir();
         let p = SandboxPolicy {
-            fs_root: Some(dir.clone()),
+            fs_root: Some(dir.path().to_path_buf()),
             ..SandboxPolicy::permissive()
         };
         // absolute path 试图逃出 root

@@ -48,6 +48,7 @@
 //!
 //! 只守正向的话，把摘要改成常量字符串也能过。
 
+use mora::test_support::TempDir;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -55,13 +56,11 @@ use std::process::Command;
 ///
 /// 不能只在测试尾部 `remove_dir_all`：断言失败 panic 时尾部根本不执行，
 /// 于是**失败的测试反而留下垃圾目录**。守卫管得住所有出口。
-struct WorkDir(PathBuf);
+struct WorkDir(TempDir);
 
 impl WorkDir {
     fn new(tag: &str) -> Self {
-        let d = std::env::temp_dir().join(format!("mora_d176_{tag}"));
-        let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(&d).expect("建工作目录");
+        let d = TempDir::new(tag);
         WorkDir(d)
     }
     fn path(&self) -> &Path {

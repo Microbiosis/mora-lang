@@ -41,6 +41,7 @@
 //! 跑 body 且从不并回），所以库路径的「末表达式」观测不到块内的值。
 //! `print` 写在块内则正常输出，故走真实 CLI 捕获 stdout。
 
+use mora::test_support::TempDir;
 use std::process::Command;
 
 /// 跑一段 `.mora` 源码，返回 `(exit_code, stdout)`。
@@ -49,8 +50,7 @@ use std::process::Command;
 /// 路径，各子进程会互相覆盖对方刚写下的源码（本人第一版就踩了，表现为
 /// 「修复没生效」的假象）。
 fn run(tag: &str, src: &str) -> (i32, String) {
-    let dir = std::env::temp_dir().join("mora_d91_mock_llm");
-    std::fs::create_dir_all(&dir).expect("create temp dir");
+    let dir = TempDir::new(tag);
     let prog = dir.join(format!("{tag}.mora"));
     std::fs::write(&prog, src).expect("write case");
 

@@ -34,14 +34,13 @@
 //! **各子类之和 == `Events: N total`**。这样将来 `Event` 再加新变体、
 //! 分解又漏掉一类时，判据会立刻红 —— 而写死具体数字做不到这件事。
 
-use std::path::PathBuf;
+use mora::test_support::TempDir;
 use std::process::Command;
 
-struct WorkDir(PathBuf);
+struct WorkDir(TempDir);
 impl WorkDir {
     fn new(tag: &str) -> Self {
-        let d = std::env::temp_dir().join(format!("mora_d225_{tag}"));
-        let _ = std::fs::remove_dir_all(&d);
+        let d = TempDir::new(tag);
         std::fs::create_dir_all(d.join(".mora").join("recordings")).expect("建目录");
         WorkDir(d)
     }

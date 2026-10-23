@@ -1,86 +1,56 @@
-//! v0.104.6 D315：9 层管线的**静默回落 11/56 → 1/56** —— 重新应用 D276
+//! v0.104.6 D474：块形态 / 声明形态 / 真实 `.mora` 的**行为契约**。
 //!
-//! ## 背景：一条**以某个具体修复为前提**的护栏
+//! ## 与 D315 版的差别
 //!
-//! D276 把 `nested_diffs` 改成按「剔除死 no-op 后」对齐，**随即撤销**。
-//! 撤销理由是原文记录的：
+//! D315 版用「两条编译路径（9 层 vs `emit.rs`）输出逐行相同」作判据。
+//! **D474 把差分机制整个退役** —— parser 不再发射 MirInst（只产 witness），
+//! MIR 全部由 9 层产出 ⇒「参考实现」这一侧**已不存在**，那条 A/B 会变成
+//! **自己跟自己比**（恒真）。
 //!
-//! > 对齐后 `rel_*.mora` 不再回落 ⇒ 改走 9 层路径，而**那条路径是坏的**：
-//! > `Runtime error (MIR): … references register 4 but the function only has
-//! > 1 register(s)`
+//! ⇒ 判据换成**钉死的期望输出**：每种形态在每个优化档位下都必须产出
+//! **具体且正确**的值。这比「两条路径一致」**更强** —— 后者只能发现
+//! 「两条路径不一致」（两条一起错到同一个错值时反而绿）。
 //!
-//! > 也就是说：**这套「错位」目前是 `rel_*` 唯一的护栏**。
-//! > **所以在 9 层 rel 路径修好之前，必须保留错位。**
+//! ## 三个优化档位（`--opt` 关 / 1 / 2）
 //!
-//! **D314 修好了那个前提**（同一个 `n_regs` 少算 bug），却没有回头看这条
-//! 注释。D315 顺着 D314 结尾的「待验」项查下去才发现它早已失效。
+//! 保留这一维的理由：它判的是**「优化器只能改效率，不能改语义」** ——
+//! 一条与编译路径**无关**的、不变量。
 //!
-//! ## 差异究竟是什么
+//! ## 覆盖的两类形态
 //!
-//! 逐条转储后确认：`pipeline_mir=23` vs `original_mir=26`，差的是 **3 条死
-//! no-op** —— emit 路径在每条 `RelDef` **语句**后补一条 `Const(r, Nil)`
-//! （语句必须有值），而 r = 0/1/2 **从未被任何指令读**。剔除后两侧
-//! **23 vs 23 逐条按类别一一对齐**。这正是 D57 立 `significant_indices`
-//! 过滤时描述的那一种，**不是新的放宽**。
-//!
-//! ## 证据（缺一不可）
-//!
-//! | 验证 | 规模 | 结果 |
-//! |---|---|---|
-//! | 56 个真实 `.mora` × 3 档，pipeline vs `MORA_9LAYER=0`(emit) | 168 组合 | **0 差异** |
-//! | 10 种**块形态** × 3 档 | 30 组合 | **0 差异** |
-//! | `rel` 强证人（打印求解结果） | 1 | 输出**逐行相同** |
-//!
-//! ⚠ 第一项**单独不够**：`rel_*.mora` fixture 自身**一个 `print` 都没有**，
-//! 可观察行为只有「exit 0、无输出」，比不出对错；56 个 fixture 里也**没有**
-//! 一个用块形态。第二项与第三项才是 D276 当年缺的那块证据。
+//! - **块形态**（span / observe / parallel / prompt / document）：D92 原文
+//!   警告「若差分被放宽/移除，这些块里的语句会**不执行**」。D315 用 30 个
+//!   A/B 组合否证了它；本文件把该验证固化为**期望输出**断言。
+//! - **声明形态**（msg / struct / enum）：D315 从「回落」翻成「通过」的那一组。
 
+use mora::test_support::TempDir;
 use std::process::Command;
 
-const EXE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/target/debug/mora.exe");
+/// 一条形态的期望结果。
+#[derive(Debug, Clone, Copy)]
+enum Expect {
+    /// 运行成功（退出码 0），stdout **逐行**等于给定值。
+    Out(&'static str),
+    /// 编译期类型错误（退出码 2）。
+    TypeErr,
+}
 
-/// 跑一个程序。`force_emit = true` 时用 `MORA_9LAYER=0` 关掉 9 层管线、
-/// 强制走 `emit.rs` 路径 —— 用来做**两条编译路径的 A/B**。
-fn run(src: &str, tag: &str, opt: Option<&str>, force_emit: bool) -> (i32, Vec<String>, bool) {
-    let dir = std::env::temp_dir().join(format!("mora_d315_{tag}"));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("建目录");
+/// 跑一个程序，返回 `(stdout, stderr, 退出码)`。
+fn run(tag: &str, src: &str, opt: Option<&str>) -> (String, String, i32) {
+    let dir = TempDir::new(tag);
     let p = dir.join("p.mora");
     std::fs::write(&p, src).expect("写探针");
-    let mut c = Command::new(EXE);
+    let mut c = Command::new(env!("CARGO_BIN_EXE_mora"));
     if let Some(l) = opt {
         c.arg(format!("--opt={l}"));
     }
-    if force_emit {
-        c.env("MORA_9LAYER", "0");
-    }
-    let out = c.arg(&p).output().expect("跑 mora");
+    let out = c.arg("run").arg(&p).output().expect("跑 mora");
     let _ = std::fs::remove_dir_all(&dir);
-    let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
-    text.push('\n');
-    text.push_str(&String::from_utf8_lossy(&out.stderr));
-    let fell_back = text.contains("[9layer]");
-    // ⚠ 错误消息里会嵌入**临时目录路径**（如 `…/mora_d315_xxx/p.mora: Failed to
-    // parse`），而 A/B 两次用的 tag 不同 ⇒ 路径字符串天然不同。必须先归一化，
-    // 否则「两边同样解析失败」也会被判成不一致。头两版没做归一化，踩了这个坑。
-    let norm = text.replace(&dir.to_string_lossy().to_string(), "<TMP>");
-    let lines = norm
-        .lines()
-        .map(|l| l.trim().to_string())
-        .filter(|l| {
-            !l.is_empty()
-                && !l.starts_with("Mora v")
-                && !l.starts_with("AI:")
-                && !l.starts_with("AI 原语")
-                && !l.starts_with("显式 API")
-                && !l.starts_with("Trait 系统")
-                && !l.starts_with("Built-in")
-                && !l.starts_with("v0.15 CLI")
-                && !l.starts_with('⚠')
-                && !l.starts_with("[9layer]")
-        })
-        .collect();
-    (out.status.code().unwrap_or(-1), lines, fell_back)
+    (
+        String::from_utf8_lossy(&out.stdout).replace("\r\n", "\n"),
+        String::from_utf8_lossy(&out.stderr).replace("\r\n", "\n"),
+        out.status.code().unwrap_or(-1),
+    )
 }
 
 /// **强证人**：打印求解结果的 `rel` 程序。
@@ -99,208 +69,248 @@ const REL_WITNESS: &str = concat!(
     "print(\"done\")\n",
 );
 
-/// **主判据**：`rel` 家族真走上 9 层管线，且两条路径输出**逐行相同**。
+/// `rel` 家族必须走上 9 层管线，且求解结果**可观察且正确**。
 #[test]
-fn rel_family_runs_on_the_nine_layer_pipeline_with_identical_output() {
-    let (dc, got, fell_back) = run(REL_WITNESS, "witness", None, false);
-    assert_eq!(dc, 0, "前提：默认档应成功; 实得 {dc}");
-    assert_eq!(
-        got,
-        vec![
-            "edges:".to_string(),
-            "[[a, b], [b, c], [c, d]]".to_string(),
-            "reach-d:".to_string(),
-            // 实测值：`solve { edge(?x, "d") }` 命中一条边，print 出该行本身。
-            // （此处曾按记忆写成 `[[c]]`，实跑打回 —— 期望值必须来自实测。）
-            "[c]".to_string(),
-            "done".to_string(),
-        ],
-        "**D315**：`rel` 程序的求解结果必须是可观察且正确的。\n  实得: {got:?}"
-    );
-    assert!(
-        !fell_back,
-        "**D315**：`rel` 家族应当**走 9 层管线**（静默回落应已从 11/56 降到 1/56）。\n\
-         若又回落，说明 `nested_diffs` 的死 no-op 对齐被撤销了 —— 参考 D276：\n\
-         那次撤销的原因是 9 层 rel 路径会越界崩溃，而该崩溃已由 D314 修复。\n\
-         详见 `src/mir/pipeline.rs::nested_diffs` 的 D315 注释。"
-    );
-
+fn rel_family_produces_its_expected_output() {
     for opt in [None, Some("1"), Some("2")] {
         let lbl = opt.unwrap_or("off");
-        let (pc, pipe, _) = run(REL_WITNESS, &format!("pipe_{lbl}"), opt, false);
-        let (ec, emit, _) = run(REL_WITNESS, &format!("emit_{lbl}"), opt, true);
+        let (stdout, stderr, code) = run("rel_witness", REL_WITNESS, opt);
+        assert_eq!(code, 0, "前提：opt={lbl} 应成功; stderr={stderr}");
         assert_eq!(
-            (pc, pipe.clone()),
-            (ec, emit.clone()),
-            "**D315**：opt={lbl} 下 9 层管线与 emit.rs 两条路径的输出必须**逐行相同**。\n\
-             这 10 个程序的生产路径本轮从 emit 换成了管线，这是本次变更最大的\n\
-             回归面。\n  管线: {pipe:?}\n  emit : {emit:?}"
+            stdout.trim_end(),
+            "edges:\n[[a, b], [b, c], [c, d]]\nreach-d:\n[c]\ndone",
+            "**D474**：`rel` 程序的求解结果必须是可观察且正确的（opt={lbl}）。\n  实得: {stdout:?}"
         );
     }
 }
 
-/// D314 之前处于回落名单里的 10 个程序，现在都必须**不再回落**。
+/// 块形态 —— 每种形态在每个优化档位下的期望输出。
+const BLOCK_FORMS: &[(&str, &str, Expect)] = &[
+    (
+        "span-1stmt",
+        "span \"s\" do\n  print(1)\nend\nprint(\"after\")\n",
+        Expect::Out("1.0\nafter"),
+    ),
+    (
+        "span-3stmt",
+        "span \"s\" do\n  print(1)\n  print(2)\n  print(3)\nend\nprint(\"after\")\n",
+        Expect::Out("1.0\n2.0\n3.0\nafter"),
+    ),
+    (
+        "parallel-3stmt",
+        "parallel\n  print(1)\n  print(2)\n  print(3)\nend\nprint(\"after\")\n",
+        Expect::Out("1.0\n2.0\n3.0\nafter"),
+    ),
+    (
+        // `span` 块的值是 **Nil**（块值被丢弃）⇒ 绑到 `let` 上是类型错误。
+        // 这条把「块的值不可用」钉住。
+        "span-in-value",
+        "let x = span \"s\" do\n  print(1)\nend\nprint(\"after\")\n",
+        Expect::TypeErr,
+    ),
+    (
+        "span-nested",
+        "span \"o\" do\n  span \"i\" do\n    print(1)\n  end\n  print(2)\nend\nprint(\"after\")\n",
+        Expect::Out("1.0\n2.0\nafter"),
+    ),
+    (
+        "span-then-loop",
+        "span \"s\" do\n  print(1)\nend\nlet t = 0\nfor i in [1,2,3]\n  t = t + i\nend\nprint(t)\n",
+        Expect::Out("1.0\n6.0"),
+    ),
+    (
+        "span-then-3prints",
+        "span \"s\" do\n  print(1)\nend\nprint(\"a\")\nprint(\"b\")\nprint(\"c\")\n",
+        Expect::Out("1.0\na\nb\nc"),
+    ),
+    (
+        "observe-trace",
+        "observe trace \"t\" do\n  print(1)\nend\nprint(\"after\")\n",
+        Expect::Out("1.0\nafter"),
+    ),
+    (
+        "prompt-block",
+        "prompt \"p\" do\n  print(1)\nend\nprint(\"after\")\n",
+        Expect::Out("1.0\nafter"),
+    ),
+    (
+        "document-block",
+        "document \"d\" do\n  print(1)\nend\nprint(\"after\")\n",
+        Expect::Out("1.0\nafter"),
+    ),
+];
+
+/// 声明形态 —— 每种形态在每个优化档位下的期望输出。
+const DECLARATION_FORMS: &[(&str, &str, Expect)] = &[
+    (
+        "msg-1print",
+        "msg CounterMsg\n  Increment\n  Decrement\nend\nprint(1)\n",
+        Expect::Out("1.0"),
+    ),
+    (
+        "msg-3print",
+        "msg M\n  Inc\nend\nprint(1)\nprint(2)\nprint(3)\n",
+        Expect::Out("1.0\n2.0\n3.0"),
+    ),
+    (
+        "struct-1print",
+        "struct P\n  x: number\nend\nprint(1)\n",
+        Expect::Out("1.0"),
+    ),
+    (
+        "struct-3print",
+        "struct P\n  x: number\nend\nprint(1)\nprint(2)\nprint(3)\n",
+        Expect::Out("1.0\n2.0\n3.0"),
+    ),
+    (
+        "enum-1print",
+        "enum E\n  A\n  B\nend\nprint(1)\n",
+        Expect::Out("1.0"),
+    ),
+    (
+        "enum-3print",
+        "enum E\n  A\n  B\nend\nprint(1)\nprint(2)\nprint(3)\n",
+        Expect::Out("1.0\n2.0\n3.0"),
+    ),
+    (
+        "struct-then-let",
+        "struct P\n  x: number\nend\nlet y = 1\nprint(y)\nprint(y + 1)\n",
+        Expect::Out("1.0\n2.0"),
+    ),
+    (
+        "enum-then-for",
+        "enum E\n  A\n  B\nend\nlet t = 0\nfor i in [1,2,3]\n  t = t + i\nend\nprint(t)\n",
+        Expect::Out("6.0"),
+    ),
+    (
+        "msg+struct+enum",
+        "struct P\n  x: number\nend\nmsg M\n  Inc\nend\nenum E\n  A\nend\nprint(1)\nprint(2)\n",
+        Expect::Out("1.0\n2.0"),
+    ),
+    (
+        "msg-then-span",
+        "msg M\n  Inc\nend\nspan \"s\" do\n  print(1)\nend\nprint(2)\n",
+        Expect::Out("1.0\n2.0"),
+    ),
+];
+
+/// 块形态与声明形态：**每个优化档位下**都必须产出钉死的期望输出。
 ///
-/// 仍回落的只有 `tea_standalone.mora`。
+/// 这同时钉住两件事：
+/// 1. 形态本身的行为正确（块里的语句**确实执行了**、值**确实对**）；
+/// 2. 优化器不改语义（三个档位输出**逐行相同**）。
 #[test]
-fn previously_falling_back_programs_now_use_the_pipeline() {
-    for fixture in [
-        "rel_basic",
-        "rel_cons",
-        "rel_empty",
-        "rel_project",
-        "rel_run_limit",
-        "rel_single_var",
-        "rel_zero_var",
-        "prompt_section",
-        "export_visibility",
-        "import_handle_index_main",
-    ] {
-        let path = format!(
-            "{}/tests/fixtures/e2e/{}.mora",
-            env!("CARGO_MANIFEST_DIR"),
-            fixture
-        );
-        let out = Command::new(EXE).arg(&path).output().expect("跑");
-        let text = String::from_utf8_lossy(&out.stderr).into_owned();
+fn block_and_declaration_forms_produce_expected_output_on_every_opt_level() {
+    let mut failures: Vec<String> = Vec::new();
+    for (group, forms) in [("block", BLOCK_FORMS), ("declaration", DECLARATION_FORMS)] {
+        for (name, src, expect) in forms {
+            for opt in [None, Some("1"), Some("2")] {
+                let lbl = opt.unwrap_or("off");
+                let (stdout, stderr, code) = run(&format!("{group}_{name}_{lbl}"), src, opt);
+                let got = stdout.trim_end_matches('\n');
+                let ok = match expect {
+                    Expect::Out(want) => code == 0 && got == *want,
+                    Expect::TypeErr => code == 2,
+                };
+                if !ok {
+                    failures.push(format!(
+                        "  [{group}/{name} opt={lbl}] 期望 {expect:?}\n    实得: exit={code} stdout={got:?}\n    stderr: {}",
+                        stderr.trim_end()
+                    ));
+                }
+            }
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "块形态 / 声明形态的行为与期望不符（{} 条）：\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
+}
+
+/// 仓库里**每一个** e2e fixture 都必须跑得通 —— **除了 7 个故意的负例**。
+///
+/// D315 版这里断言的是「不再回落」（stderr 里不出现 `[9layer]`）。D474 起
+/// **没有回落机制**了 ⇒ 那条判据恒真 ⇒ 换成**真正可观察**的判据：
+/// fixture 必须**成功运行**。
+///
+/// 7 个负例是**故意**失败的（名字里就写着 bad / missing / partial / win
+/// —— 它们测的是「错误路径的诊断」），故单独列出并**钉死退出码**：
+/// 退出码变了 ⇒ 那条诊断路径变了，需要人来确认。
+const KNOWN_FAILURES: &[(&str, i32)] = &[
+    // 类型错误（编译期）
+    ("lisp.mora", 2),
+    // 运行期错误
+    ("plan_update_partial.mora", 1),
+    ("sandbox_bad_capability.mora", 1),
+    ("sandbox_container_mount_bad_mode.mora", 1),
+    ("sandbox_container_mount_win.mora", 1),
+    ("schedule_surface.mora", 1),
+    ("toolplane_missing_plane.mora", 1),
+];
+
+#[test]
+fn every_e2e_fixture_runs_successfully() {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/e2e");
+    let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
+        .expect("读 e2e fixture 目录")
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "mora"))
+        .collect();
+    files.sort();
+    assert!(
+        !files.is_empty(),
+        "e2e fixture 目录空了？本测试会**静默变绿**"
+    );
+
+    let mut failures: Vec<String> = Vec::new();
+    for f in &files {
+        let out = Command::new(env!("CARGO_BIN_EXE_mora"))
+            .arg("run")
+            .arg(f)
+            .output()
+            .expect("跑 mora");
+        let code = out.status.code().unwrap_or(-1);
+        let name = f
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        match KNOWN_FAILURES.iter().find(|(n, _)| *n == name) {
+            Some((_, want)) => {
+                if code != *want {
+                    let stderr = String::from_utf8_lossy(&out.stderr).replace("\r\n", "\n");
+                    failures.push(format!(
+                        "  {name}  负例的退出码应恰为 {want}，实得 {code}\n    {}",
+                        stderr.trim_end()
+                    ));
+                }
+            }
+            None => {
+                if code != 0 {
+                    let stderr = String::from_utf8_lossy(&out.stderr).replace("\r\n", "\n");
+                    failures.push(format!("  {name}  exit={code}\n    {}", stderr.trim_end()));
+                }
+            }
+        }
+    }
+    // 负例清单里的每个名字都必须真的存在于 fixture 目录里（防清单与目录脱节）。
+    for (name, _) in KNOWN_FAILURES {
         assert!(
-            !text.contains("[9layer]"),
-            "**D315**：`{fixture}.mora` 应当走 9 层管线。\n\
-             它此前因 `nested_diffs` 的下标错位而静默回落（死 no-op 对齐 +\n\
-             D314 修好 `n_regs` 之后应当放行）。stderr 里仍出现 `[9layer]`：\n{}",
-            text.lines().find(|l| l.contains("[9layer]")).unwrap_or("")
+            files.iter().any(|f| {
+                f.file_name()
+                    .map(|n| n.to_string_lossy() == *name)
+                    .unwrap_or(false)
+            }),
+            "KNOWN_FAILURES 里的 `{name}` 不在 e2e fixture 目录里 —— \
+             fixture 改名或删除了？请同步更新本清单（否则这条断言会**静默失效**）。"
         );
     }
-}
-
-/// **声明形态护栏**：`msg` / `struct` / `enum` 本轮也**从回落翻成了通过**。
-///
-/// 与块形态同源：emit 在声明型指令后补的 `Const(r, Nil)` 是死 no-op。
-/// 实测 10 种形状 × 3 档 = **30 组合**，两条路径输出逐行相同。
-///
-/// 普查里翻转的 8 条**全部同向**（回落 → 通过），无一条反向退化 —— 若哪天
-/// 出现反向条目，`nine_layer_fallback_census.rs` 的
-/// `d92b_census_matches_measured_fallback_set` 会先红。
-#[test]
-fn declaration_forms_behave_identically_on_both_paths() {
-    const FORMS: &[(&str, &str)] = &[
-        (
-            "msg-1print",
-            "msg CounterMsg\n  Increment\n  Decrement\nend\nprint(1)\n",
-        ),
-        (
-            "msg-3print",
-            "msg M\n  Inc\nend\nprint(1)\nprint(2)\nprint(3)\n",
-        ),
-        ("struct-1print", "struct P\n  x: number\nend\nprint(1)\n"),
-        (
-            "struct-3print",
-            "struct P\n  x: number\nend\nprint(1)\nprint(2)\nprint(3)\n",
-        ),
-        ("enum-1print", "enum E\n  A\n  B\nend\nprint(1)\n"),
-        (
-            "enum-3print",
-            "enum E\n  A\n  B\nend\nprint(1)\nprint(2)\nprint(3)\n",
-        ),
-        (
-            "struct-then-let",
-            "struct P\n  x: number\nend\nlet y = 1\nprint(y)\nprint(y + 1)\n",
-        ),
-        (
-            "enum-then-for",
-            "enum E\n  A\n  B\nend\nlet t = 0\nfor i in [1,2,3]\n  t = t + i\nend\nprint(t)\n",
-        ),
-        (
-            "msg+struct+enum",
-            "struct P\n  x: number\nend\nmsg M\n  Inc\nend\nenum E\n  A\nend\nprint(1)\nprint(2)\n",
-        ),
-        (
-            "msg-then-span",
-            "msg M\n  Inc\nend\nspan \"s\" do\n  print(1)\nend\nprint(2)\n",
-        ),
-    ];
-
-    for (name, src) in FORMS {
-        for opt in [None, Some("1"), Some("2")] {
-            let lbl = opt.unwrap_or("off");
-            let (pc, pipe, _) = run(src, &format!("dc_pipe_{name}_{lbl}"), opt, false);
-            let (ec, emit, _) = run(src, &format!("dc_emit_{name}_{lbl}"), opt, true);
-            assert_eq!(
-                (pc, pipe.clone()),
-                (ec, emit.clone()),
-                "**D315**：声明形态 `{name}` 在 opt={lbl} 下，两条编译路径必须等价。\n\
-                 这 3 条与 5 种块形态是 D315 里从「回落」翻成「通过」的全部 8 条。\n\
-                 管线: {pipe:?}\n  emit : {emit:?}"
-            );
-        }
-    }
-}
-
-/// **块形态护栏**（D92 的后续）：这 5 种块形态本轮**也**走上了管线。
-///
-/// D92 原文警告「若差分被放宽/移除，这些块里的语句会**不执行**」。
-/// D315 实测 10 种形状 × 3 个优化档位 = **30 个组合**，输出**逐行相同**
-/// ⇒ 那条缺失的尾部 `Return` 不产生可观察差异（D315 未单独定位其补偿点）。
-///
-/// 本条把该验证固化为**常驻回归**，而不是像 D276/D92 那样靠一条判据的
-/// 绿/红来间接保护 —— 间接保护正是这两次反复的根源。
-#[test]
-fn block_forms_behave_identically_on_both_paths() {
-    const FORMS: &[(&str, &str)] = &[
-        (
-            "span-1stmt",
-            "span \"s\" do\n  print(1)\nend\nprint(\"after\")\n",
-        ),
-        (
-            "span-3stmt",
-            "span \"s\" do\n  print(1)\n  print(2)\n  print(3)\nend\nprint(\"after\")\n",
-        ),
-        (
-            "parallel-3stmt",
-            "parallel\n  print(1)\n  print(2)\n  print(3)\nend\nprint(\"after\")\n",
-        ),
-        (
-            "span-in-value",
-            "let x = span \"s\" do\n  print(1)\nend\nprint(\"after\")\n",
-        ),
-        (
-            "span-nested",
-            "span \"o\" do\n  span \"i\" do\n    print(1)\n  end\n  print(2)\nend\nprint(\"after\")\n",
-        ),
-        (
-            "span-then-loop",
-            "span \"s\" do\n  print(1)\nend\nlet t = 0\nfor i in [1,2,3]\n  t = t + i\nend\nprint(t)\n",
-        ),
-        (
-            "span-then-3prints",
-            "span \"s\" do\n  print(1)\nend\nprint(\"a\")\nprint(\"b\")\nprint(\"c\")\n",
-        ),
-        (
-            "observe-trace",
-            "observe trace \"t\" do\n  print(1)\nend\nprint(\"after\")\n",
-        ),
-        (
-            "prompt-block",
-            "prompt \"p\" do\n  print(1)\nend\nprint(\"after\")\n",
-        ),
-        (
-            "document-block",
-            "document \"d\" do\n  print(1)\nend\nprint(\"after\")\n",
-        ),
-    ];
-
-    for (name, src) in FORMS {
-        for opt in [None, Some("1"), Some("2")] {
-            let lbl = opt.unwrap_or("off");
-            let (pc, pipe, _) = run(src, &format!("bf_pipe_{name}_{lbl}"), opt, false);
-            let (ec, emit, _) = run(src, &format!("bf_emit_{name}_{lbl}"), opt, true);
-            assert_eq!(
-                (pc, pipe.clone()),
-                (ec, emit.clone()),
-                "**D315**：块形态 `{name}` 在 opt={lbl} 下，两条编译路径必须等价。\n\
-                 D92 曾断言「差分被放宽 ⇒ 块里的语句不执行」；D315 实测 30 组合\
-                 全部相同，故把该验证固化为常驻护栏。\n  管线: {pipe:?}\n  emit : {emit:?}"
-            );
-        }
-    }
+    assert!(
+        failures.is_empty(),
+        "e2e fixture 跑不通（{} 个）：\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
 }

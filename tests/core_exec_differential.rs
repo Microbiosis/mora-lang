@@ -28,7 +28,10 @@ use mora::mir::effect::Effects;
 use mora::value::Value;
 
 /// 走 **MIR 生产路径**执行（`dag_analyze → dag_optimize → BSP 超步`）。
-fn exec_mir(src: &str) -> Result<Value, String> {
+///
+/// 返回 `(值, 效应)` —— **效应也要对拍**：`aggregate` 的贡献走的是效应数据
+/// 通道（`Effect::Contribute`），只比返回值的话它**完全不可观测**。
+fn exec_mir(src: &str) -> Result<(Value, Effects), String> {
     let (func, witnesses) = mora::parser_v3::ParserV3::compile(src).map_err(|e| e.to_string())?;
     let mir = mora::mir::pipeline::compile_optimized(
         &func,
@@ -38,17 +41,19 @@ fn exec_mir(src: &str) -> Result<Value, String> {
     let mut interp = mora::interpreter::Interpreter::new();
     let mut env = interp.take_env();
     let mut effects = Effects::new();
-    mora::mir::vm::execute(&Arc::new(mir), &mut interp, &mut env, &mut effects)
+    let v = mora::mir::vm::execute(&Arc::new(mir), &mut interp, &mut env, &mut effects)?;
+    Ok((v, effects))
 }
 
 /// 走 **Core 执行器**执行（`mir::core_exec` 的块调度）。
-fn exec_core(src: &str) -> Result<Value, String> {
+fn exec_core(src: &str) -> Result<(Value, Effects), String> {
     let (func, witnesses) = mora::parser_v3::ParserV3::compile(src).map_err(|e| e.to_string())?;
     let core = mora::mir::pipeline::compile_core(&func, &witnesses);
     let mut interp = mora::interpreter::Interpreter::new();
     let mut env = interp.take_env();
     let mut effects = Effects::new();
-    mora::mir::core_exec::execute(&core, &mut env, &mut interp, &mut effects)
+    let v = mora::mir::core_exec::execute(&core, &mut env, &mut interp, &mut effects)?;
+    Ok((v, effects))
 }
 
 /// 程序本身必须是**合法 Mora**（过 typeck）—— 否则对拍的是两个错误。
@@ -61,21 +66,53 @@ fn assert_typechecks(src: &str) {
     );
 }
 
-/// 对拍：两个执行器的结果必须**完全一致**。
+/// 对拍：两个执行器的**值**与**效应**必须**完全一致**。
 fn assert_same(tag: &str, src: &str) {
     assert_typechecks(src);
     let m = exec_mir(src);
     let c = exec_core(src);
     match (&m, &c) {
-        (Ok(vm), Ok(vc)) => assert_eq!(
-            vm, vc,
-            "[{tag}] 两个执行器结果不同\n程序：\n{src}\nMIR : {vm:?}\nCore: {vc:?}"
-        ),
-        (Err(_), Err(_)) => {} // 两边都报错 ⇒ 一致（错误文案不必逐字相同）
+        (Ok((vm, em)), Ok((vc, ec))) => {
+            assert_eq!(
+                vm, vc,
+                "[{tag}] 两个执行器的**值**不同\n程序：\n{src}\nMIR : {vm:?}\nCore: {vc:?}"
+            );
+            assert_eq!(
+                em, ec,
+                "[{tag}] 两个执行器的**效应**不同\n程序：\n{src}\nMIR : {em:?}\nCore: {ec:?}"
+            );
+        }
+        (Err(_), Err(_)) => {} // 两边都报错 ⇒ 一致（错误文案由专门判据核对）
         (m, c) => {
             panic!("[{tag}] 一个成功一个失败 ⇒ 语义分叉\n程序：\n{src}\nMIR : {m:?}\nCore: {c:?}")
         }
     }
+}
+
+/// 对拍：两个执行器都应**报错**，且错误文案**都含同一句关键词**。
+///
+/// 比 `assert_same` 的 `(Err, Err)` 分支**严格**：后者只判「都报错」，
+/// ⇒ 「Core 侧根本不支持这个构造所以报错」也会被当成「一致」（**恒真陷阱**）。
+fn assert_same_err(tag: &str, src: &str, keyword: &str) {
+    assert_typechecks(src);
+    let m = exec_mir(src);
+    let c = exec_core(src);
+    let em = match &m {
+        Ok(v) => panic!("[{tag}] MIR 侧应报错，实际成功：{v:?}"),
+        Err(e) => e.clone(),
+    };
+    let ec = match &c {
+        Ok(v) => panic!("[{tag}] Core 侧应报错，实际成功：{v:?}"),
+        Err(e) => e.clone(),
+    };
+    assert!(
+        em.contains(keyword),
+        "[{tag}] MIR 侧错误应含 {keyword:?}（否则可能是「另一个原因」）：{em}"
+    );
+    assert!(
+        ec.contains(keyword),
+        "[{tag}] Core 侧错误应含 {keyword:?}（否则可能是「另一个原因」）：{ec}"
+    );
 }
 
 #[test]
@@ -151,4 +188,49 @@ fn both_executors_report_the_same_error_paths() {
     assert_typechecks(src);
     assert!(exec_mir(src).is_err(), "MIR 侧应报错");
     assert!(exec_core(src).is_err(), "Core 侧应报错");
+}
+
+/// **D483**：曾经「有损」的 6 类构造，现在两个执行器的行为必须**完全一致**。
+///
+/// 其中 5 类（`eval` / `aggregate` / quasiquote / `commit` / `rollback`）
+/// Core 执行器支持 ⇒ 可直接对拍；`orchestrate` 的执行语义（agent 图 / BSP
+/// 超步）在**执行层** ⇒ Core 执行器**响亮报错**（不是「假装能跑」）⇒ 它由
+/// **形状**判据守住（`core_fidelity::formerly_lossy_constructs_are_now_faithful`）。
+///
+/// ⚠ 用例是**精选**的：每一条都恰好能区分「忠实」与「D481/D482 的占位」：
+/// - `eval "n" 1`：值 = **given 的值**（不是 Nil）—— 占位路径会把它覆盖成 Nil；
+/// - `aggregate acc, 1`：贡献进**效应通道** ⇒ 值与效应都要一致；
+/// - quasiquote：片段重组为 Code（占位路径下片段全丢 ⇒ 值是 Nil）。
+#[test]
+fn formerly_lossy_constructs_execute_identically() {
+    // 断言通过：语句的值 = **given 的值**（不是 Nil）。
+    assert_same("eval 通过", "eval \"n\" 1\n");
+    // 断言失败：两个执行器都应报错，且错误**都**含「assertion failed」。
+    assert_same_err("eval 失败", "eval \"n\" 1, 2\n", "assertion failed");
+    // 聚合：贡献进**效应通道** ⇒ 值与**效应**都要一致。
+    assert_same("aggregate", "aggregate acc, 1\n");
+    // ⭐ 效应通道**显式**核对：光靠「两边相等」不够 —— 若两边都空，
+    // 判据会**恒真**。这里直接看贡献本身。
+    for (tag, r) in [
+        ("MIR", exec_mir("aggregate acc, 1\n")),
+        ("Core", exec_core("aggregate acc, 1\n")),
+    ] {
+        let effects = r.expect("应成功").1;
+        assert_eq!(
+            effects.contributions.len(),
+            1,
+            "[{tag}] 应恰好有一条聚合贡献，实际 {:?}",
+            effects.contributions
+        );
+        assert_eq!(
+            effects.contributions[0].name, "acc",
+            "[{tag}] 贡献的聚合器名不对"
+        );
+    }
+    // quasiquote：片段重组为 Code。
+    assert_same("quasiquote", "let x = 5\n`10+,x\n");
+    // 提交：unit 语句（两边都是空操作）。
+    assert_same("commit", "commit\n");
+    // 回滚：两个执行器都应报「已回滚」（不是静默放行）。
+    assert_same_err("rollback", "rollback\n", "rolled back");
 }

@@ -11,7 +11,8 @@
 //! ## 可执行子集（v1）
 //!
 //! 支持：常量 / 拷贝 / 二元运算 / 环境读写 / 列表 / 字典 / 索引 / 索引赋值 /
-//! 分支 / 跳转 / 返回 / 具名调用 / 值调用 / 方法调用 / 模板 / match（含守卫）。
+//! 分支 / 跳转 / 返回 / 具名调用 / 值调用 / 方法调用 / 模板 / match（含守卫）/
+//! **断言（eval）/ 聚合（aggregate）/ quasiquote / 事务提交（commit）**。
 //!
 //! **不支持**（遇到就**响亮报错**，绝不静默降级）：
 //!
@@ -21,6 +22,7 @@
 //! - **区域构造**（`Scope`）—— Core 的 `Scope` 只是「区域」，**并发 / 事务 /
 //!   可观测性语义在执行层** ⇒ 把它顺序执行会与 MIR 层**静默分叉**
 //!   （所以这里宁可报错，也不假装能跑）；
+//! - **编排**（`Orchestrate`）—— agent 图 / BSP 超步是执行层的语义（同上）；
 //! - **效果**（`EffectPerform` / `EffectInstall` / `EffectRestore`）—— 需要
 //!   handler 栈与 `resume` 语义；
 //! - **ADT 构造 / thunk** —— Core 层当前不产出这些指令。
@@ -28,7 +30,8 @@
 //! ## 语义基线
 //!
 //! 与 MIR 层**同源**：环境用 Mora 的 `Environment`（持久 map + 父链）、
-//! 模式匹配复用 `self_match_pattern`、内建分派走 `MirHost`
+//! 模式匹配复用 `self_match_pattern`、内建分派走 `MirHost`、
+//! 断言 / 聚合 / quasiquote 复用 `h_eval` / `h_aggregate` / `h_quasiquote`
 //! ⇒ 差分覆盖的是**降维与控制流**，不是内建本身。
 
 use crate::mir::core::{CoreFunction, CoreInst, CoreTerminator};
@@ -190,6 +193,37 @@ fn exec_inst(
             let _ = reg(regs, *r)?;
             Ok(None)
         }
+        // ── v0.104.6 D483：断言 / 聚合 / 模板 / 事务 ──
+        //
+        // 语义**复用** MIR 层的 handler（唯一来源）⇒ 与 MIR 执行器逐字同一套
+        // 规则（比较 / 容差 / 失败文案 / 拼接 / 展平），不另写一份。
+        CoreInst::Eval {
+            name,
+            given,
+            expects,
+            tolerance,
+            ..
+        } => {
+            crate::mir::handlers::h_eval(regs, env, name, *given, expects, tolerance)?;
+            // 语句**不写**寄存器（MIR 层 `MirInst::Eval` 的 `dst()` 也是 None）
+            // ⇒ 不更新 `last`。
+            Ok(None)
+        }
+        CoreInst::Aggregate { name, value } => {
+            // 贡献进 `Effects` 数据通道（与 MIR 层 dispatch 同款：纯生产者，
+            // 由引擎侧在 worker 边界归约）。
+            let effect = crate::mir::handlers::h_aggregate(regs, *value, name);
+            effects.push(effect);
+            Ok(None)
+        }
+        CoreInst::Quasiquote { dst, segments } => {
+            crate::mir::handlers::h_quasiquote(regs, *dst, segments)?;
+            Ok(Some(regs[*dst].clone()))
+        }
+        CoreInst::Commit => Ok(None),
+        // 回滚在 MIR 层是**运行期错误**（`MirInst::Rollback => Err(...)`）
+        // ⇒ Core 侧必须同样报错，不能「当成空操作放过去」。
+        CoreInst::Rollback => Err("Transaction rolled back".to_string()),
         CoreInst::EnumMatch {
             dst,
             scrutinee,
@@ -242,6 +276,16 @@ fn exec_inst(
         CoreInst::ThunkCreate { .. } | CoreInst::ThunkForce(_, _) => {
             Err("Core 执行器（v1）**不支持 thunk**。".to_string())
         }
+        // 编排：agent 图 / BSP 超步是**执行层**的语义 ⇒ 顺序执行它会与 MIR 层
+        // 静默分叉 ⇒ 宁可报错，也不假装能跑。
+        //
+        // ⚠ D483 起 Core 层有了编排**原语**（模型忠实），但执行器仍不支持
+        // **执行**它 —— 「模型里有」与「执行器能跑」是**两件事**，别混。
+        CoreInst::Orchestrate { .. } => Err(
+            "Core 执行器（v1）**不支持编排执行** —— agent 图 / BSP 超步是执行层的语义，\
+             顺序执行它会与 MIR 层静默分叉。"
+                .to_string(),
+        ),
         CoreInst::EnumConstruct { .. }
         | CoreInst::StructConstruct { .. }
         | CoreInst::StructAccess(_, _, _) => {

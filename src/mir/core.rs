@@ -1,6 +1,6 @@
 //! v0.89: Core IR — 9 层架构第 3 层（函数式降维）。
 //!
-//! CoreInst 是 ~20 种 SSA 可处理的基元指令。高层抽象（闭包、ADT、
+//! CoreInst 是 38 种 SSA 可处理的基元指令。高层抽象（闭包、ADT、
 //! Thunk、效果处理、TEA）在这一层被降维为基元操作。
 //!
 //! 设计目标：
@@ -11,24 +11,32 @@
 //!
 //! ## CoreInst vs MirInst 覆盖范围
 //!
-//! MirInst 有 50 个变体，CoreInst 有 ~20 个。**44/50 MirInst 变体没有
-//! CoreInst 直接等价物**。这是设计如此，不是缺口：
+//! MirInst 有 59 个变体，CoreInst 有 38 个。**大部分** MirInst 变体没有
+//! CoreInst 直接等价物 —— 这是设计如此，不是缺口：
 //!
 //! | 类别 | MirInst 变体 | Core 处理方式 |
 //! |------|-------------|--------------|
 //! | 声明 | TraitDef/ImplDef/EnumDef/StructDef/TypeAlias | 编译期消失，不进 Core |
 //! | TEA | ModelDef/MsgDef/UpdateDef/AppDef | 编译期注册，不进 Core |
 //! | I/O | Save/Load/ReadFile/WriteFile/... | RIR 层处理 |
-//! | 并发 | Send/Aggregate/Halt/Worker | CMIR 层处理 |
-//! | 元编程 | Quasiquote/MacroDef | 编译期展开 |
+//! | 并发 | Send/Halt | CMIR 层处理（`Aggregate` 自 D483 起有 Core 原语） |
+//! | 元编程 | MacroDef | 编译期展开（`Quasiquote` 自 D483 起有 Core 原语） |
 //! | 效果 | Handle (单节点) | EffectInstall + EffectRestore (拆分) |
 //! | 闭包 | TaskDef/Closure | ClosureCreate + ClosureCall |
 //! | 控制流 | Label/Jump/JumpIf/JumpIfNot | Branch/Jump (BlockId) |
-//! | 管道 | Pipe | Call 链 |
-//! | AI | Prompt/PromptSection/DocumentSection | 高层语义，Core 不感知 |
+//! | 管道 | Pipe | ClosureCall（值调用） |
+//! | AI | Prompt/PromptSection/DocumentSection | Prompt / Scope |
 //!
 //! Core 的职责是**纯 SSA 可优化子集**，而非 MirInst 的全集映射。
 //! 声明/TEA/I/O/并发/元编程等语义由各自层级处理，不经过 Core 优化。
+//!
+//! ### D483：补齐 6 个原语（断言 / 聚合 / 模板 / 事务 / 编排）
+//!
+//! `eval` / `aggregate` / quasiquote / `commit` / `rollback` / `orchestrate`
+//! 此前在 Core 层**没有对应原语** ⇒ 降维只能写 `Const(dst, Nil)` 占位
+//! （编排更是用**空区域**冒充）⇒ 产物里**看不见**构造，更看不见载荷。
+//! D483 起每个都有原语，形状**镜像** MIR 层对应指令（与 D482 同款原则）：
+//! Core 层的价值是「结构可见」，不是「比 MIR 更少」。
 
 use crate::common::BinaryOp;
 use crate::mir::effect::EffectRow;
@@ -263,6 +271,67 @@ pub enum CoreInst {
     Expr(Reg),
     /// 索引赋值。
     IndexAssign(Reg, Reg, Reg),
+
+    // ── 断言 / 聚合 / 模板 / 事务 / 编排（D483）──
+    //
+    // 这 6 类构造此前在 Core 层**没有对应原语** ⇒ 只能写 `Const(dst, Nil)`
+    // 占位（编排更是用**空区域**冒充）⇒ 产物里**看不见**它们，更看不见它们
+    // 的载荷（断言名 / 聚合器名 / 模板片段 / 编排图）。
+    //
+    // D483 起它们各自有原语，形状**镜像** MIR 层对应指令（与 D482 同款原则）：
+    // Core 层的价值是「结构可见」，不是「比 MIR 更少」。
+    //
+    // **语句的值**契约（与 MIR 层**逐字**一致，改动前先读 MIR 侧注释）：
+    // - `eval` 的值 = **given 表达式的值**（不是 Nil）；
+    // - `aggregate` 的值 = **被贡献表达式的值**（不是 Nil）；
+    // - `commit` / `rollback` / `orchestrate` 是 unit 语句 ⇒ 值恒为 Nil。
+    //
+    // ⚠ 此前 Core 层给 `eval` / `aggregate` 补的 `Const(dst, Nil)` 会**覆盖**
+    // 那个寄存器（`dst` 与 `given` / `value` **同一个**寄存器）⇒ 把语句的值
+    // 变成了 Nil，与 MIR 层分叉。D483 起不再补。
+    /// 断言求值（`eval` 语句）—— 镜像 `MirInst::Eval`。
+    Eval {
+        /// 断言名（`eval "n" ...` 的 `"n"`；未给名字时是空串）。
+        name: String,
+        /// 被断言的表达式所在寄存器（**语句的值 = 它的值**）。
+        given: Reg,
+        /// 期望值所在寄存器（逐一比较；任一不等 ⇒ 运行期报错）。
+        expects: Vec<Reg>,
+        /// 数值容差（`None` ⇒ 精确比较）。
+        tolerance: Option<f64>,
+        /// 回放路径（**仅记录用**，执行层不消费）。
+        replay_path: Option<String>,
+    },
+    /// 向聚合器贡献一个值（`aggregate`）—— 镜像 `MirInst::Aggregate`。
+    Aggregate {
+        /// 聚合器名。
+        name: String,
+        /// 被贡献的值所在寄存器（**语句的值 = 它的值**）。
+        value: Reg,
+    },
+    /// quasiquote —— 镜像 `MirInst::Quasiquote`。
+    ///
+    /// 片段类型**复用** `crate::mir::QuasiquoteSegment`（不另立一份）：
+    /// 片段是「静态文字 + 寄存器引用」的混合序列，执行语义由 `h_quasiquote`
+    /// 唯一定义 ⇒ 复用它才能让 Core 执行器与 MIR 执行器**逐字同一套**拼接规则。
+    Quasiquote {
+        dst: Reg,
+        segments: Vec<crate::mir::QuasiquoteSegment>,
+    },
+    /// 事务提交 —— 镜像 `MirInst::Commit`（unit 语句，值恒为 Nil）。
+    Commit,
+    /// 事务回滚 —— 镜像 `MirInst::Rollback`（unit 语句，值恒为 Nil）。
+    Rollback,
+    /// 编排 —— 镜像 `MirInst::Orchestrate`。
+    ///
+    /// 载荷**原样**承载 witness 形态（与 `Node::Orchestrate` 同款，理由见
+    /// D473）：编排是**数据构造语句**（不参与控制流），其载荷是**数据**而非
+    /// CFG 结构 ⇒ 原样透传，不做有损投影。
+    Orchestrate {
+        input_var: String,
+        result_var: String,
+        kind: crate::mir::witness::WitnessOrchestrateKind,
+    },
 }
 
 // ===================================================================

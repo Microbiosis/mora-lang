@@ -41,26 +41,30 @@ Token → FCFG → EHIR → Core → MIR
 
 ### Core — 函数式基元
 - **输入**：`Node<TypeInfo>`
-- **输出**：`CoreFunction`（~25 种 CoreInst）
+- **输出**：`CoreFunction`（38 种 CoreInst）
 - **文件**：`src/mir/core.rs` + `src/mir/ehir_to_core.rs` + `src/mir/core_exec.rs`
 - **职责**：闭包/ADT/Thunk/Handle 降维为基元
 - **关键设计**：SSA 100% 覆盖（无 passthrough）
 - **可执行**（v0.104.6 D482）：`src/mir/core_exec.rs` —— Core 层有**自己的
   执行器**（块调度，无 DAG、无优化），可与 MIR 执行器**对拍**
 
-> **Core 层的可执行子集**（D482）：常量 / 拷贝 / 二元运算 / 环境读写 / 列表 /
-> 字典 / 索引 / 索引赋值 / 分支 / 跳转 / 返回 / 具名调用 / 值调用 / 方法调用 /
-> 模板 / match（含守卫）。
+> **Core 层的可执行子集**（D482，D483 扩充）：常量 / 拷贝 / 二元运算 / 环境读写 /
+> 列表 / 字典 / 索引 / 索引赋值 / 分支 / 跳转 / 返回 / 具名调用 / 值调用 / 方法调用 /
+> 模板 / match（含守卫）/ **断言（eval）/ 聚合（aggregate）/ quasiquote / 事务提交
+> （commit）/ 事务回滚（rollback）**。
 >
 > **不支持**（执行器**响亮报错**，不静默降级）：闭包 / task（Mora 的
 > `Value::Closure` 装的是 `Arc<MirFunction>`，装不下 Core 闭包）、**区域构造**
 > （`Scope` 的并发 / 事务 / 可观测性语义在执行层，顺序执行它会与 MIR 层**静默
-> 分叉**）、效果（需要 handler 栈与 `resume`）、ADT 构造 / thunk。
+> 分叉**）、**编排执行**（agent 图 / BSP 超步是执行层语义；注意「模型里有编排
+> 原语」与「执行器能跑编排」是**两件事**）、效果（需要 handler 栈与 `resume`）、
+> ADT 构造 / thunk。
 >
 > **对拍**：`tests/core_exec_differential.rs` —— 同一程序，MIR 执行器
 > （`dag_analyze → dag_optimize → BSP 超步`）与 Core 执行器（块调度）结果必须
-> **完全一致**。这正是 D474 退役差分机制时缺的**语义级**对照：当年的差分
-> **只比形状、不比语义**（`or`/`and` 短路不赋值就是**两边一起错**，差分抓不到）。
+> **完全一致**（**值与效应都比**）。这正是 D474 退役差分机制时缺的**语义级**对照：
+> 当年的差分**只比形状、不比语义**（`or`/`and` 短路不赋值就是**两边一起错**，差分
+> 抓不到）。
 >
 > **让 Core 层可执行，当场抓出两个只有执行才暴露的缺陷**：
 >
@@ -113,22 +117,36 @@ Token → FCFG → EHIR → Core → MIR
 > 指令数），可执行的路径是 MIR 层 —— 它的块结构由 `mir/dag.rs` 独立构建，
 > 不受此限制。
 >
-> #### Core 层的**有损登记**（D481 后剩下的）
+> #### Core 层的**有损登记** —— **D483 之后为空**
 >
-> 下列构造在 Core 层**没有对应原语** ⇒ 只能写 Nil 占位 / 空区域。这是
-> **模型**的限制（要整套执行层语义：字符串当代码执行、聚合贡献、模板片段、
-> 事务提交/回滚、agent 图），不是降维的疏忽 ⇒ 登记在此，不擅自扩模型。
+> D481 时下列构造在 Core 层**没有对应原语** ⇒ 只能写 Nil 占位 / 空区域。当时
+> 判为「**模型**的限制」（要整套执行层语义），登记在此。
 >
-> | 构造 | Core 层表现 | 为什么 Core 装不下 |
+> **D483 把这 6 类全补上了**：Core 层给它们各配了一个原语，形状**镜像** MIR 层
+> 对应指令，载荷**原样**带过 ⇒ 「有损」清空。
+>
+> | 构造 | D481/D482 之前 | D483 之后 |
 > |---|---|---|
-> | `eval` | `Const(dst, Nil)` | 「把字符串当代码执行」是执行层语义 |
-> | `aggregate` | `Const(dst, Nil)` | 「向聚合器贡献一个值」是执行层语义 |
-> | quasiquote | `Const(dst, Nil)`（片段丢失） | 「文本 + 插值」的混合序列不是任何基元 |
-> | `commit` / `rollback` | `Const(dst, Nil)` | 事务提交/回滚没有 Core 原语 |
-> | `orchestrate` | `Scope{kind:"orchestrate"}`（**空**区域） | agent 图 / 边条件 / state schema 要整套图语义 |
+> | `eval` | `Const(dst, Nil)`（断言名 / expects 全丢，且**覆盖**了值寄存器） | `CoreInst::Eval { name, given, expects, tolerance, replay_path }` |
+> | `aggregate` | `Const(dst, Nil)`（聚合器名全丢，且**覆盖**了值寄存器） | `CoreInst::Aggregate { name, value }` |
+> | quasiquote | `Const(dst, Nil)`（片段全丢） | `CoreInst::Quasiquote { dst, segments }` |
+> | `commit` / `rollback` | `Const(dst, Nil)`（与「别的语句返回 Nil」**无法区分**） | `CoreInst::Commit` / `CoreInst::Rollback` |
+> | `orchestrate` | `Scope{kind:"orchestrate"}`（**空**区域，载荷全丢） | `CoreInst::Orchestrate { input_var, result_var, kind }`（载荷原样） |
 >
-> 钉子：`tests/core_fidelity.rs::lossy_constructs_stay_registered` —— 哪天
-> 它们变忠实了，本判据会失败并提示更新这张表。
+> **两处「模型」与「执行」要分清**：
+>
+> - `eval` / `aggregate` / quasiquote / `commit` / `rollback` —— 模型**与**执行都
+>   齐了 ⇒ Core 执行器能跑它们，可与 MIR 执行器**对拍**；
+> - `orchestrate` —— 模型齐了（载荷原样），但**执行**仍不支持（agent 图 / BSP
+>   超步是执行层语义）⇒ Core 执行器**响亮报错**，不假装能跑。
+>
+> 钉子：
+> - `tests/core_fidelity.rs::formerly_lossy_constructs_are_now_faithful` ——
+>   原语**存在** + 载荷**逐字段**对得上；
+> - `tests/core_fidelity.rs::eval_and_aggregate_values_are_not_clobbered_by_nil`
+>   —— 值寄存器不许被 Nil 覆盖（D481/D482 的占位路径会覆盖它）；
+> - `tests/core_exec_differential.rs::formerly_lossy_constructs_execute_identically`
+>   —— 两个执行器的**值与效应**必须一致。
 
 ### MIR — Mid-level IR（已有）
 - **输入**：`FCFG`（`lower_fcfg` 降维）
@@ -332,9 +350,9 @@ D472 之后登记项由 4 条减为 1 条（`orchestrate`），D473 之后减为
 | pipeline_conformance | 11 | 代表性 fixture 的**期望输出**（D474 新建） |
 | short_circuit_evaluation | 3 | `or`/`and` 的**求值级短路**（行为 × 优化档 + 两路径形状，D477 新建） |
 | execute_naming_hygiene | 3 | 执行入口命名一致性（旧名不得复活，D478 新建） |
-| core_cfg_wellformed | 5 | Core 层 CFG **结构良构性** + 模型限制登记（D479/D480 新建） |
-| core_fidelity | 6 | Core 层**保真度**（产物里该看见的东西不能丢，D481 新建） |
-| core_exec_differential | 3 | Core 执行器 vs MIR 执行器**语义对拍**（D482 新建） |
+| core_cfg_wellformed | 5 | Core 层 CFG **结构良构性** + 模型限制登记（D479/D480 新建，D483 补 match 守卫体递归） |
+| core_fidelity | 7 | Core 层**保真度**（产物里该看见的东西不能丢，D481 新建；D483 反转为「有损清单已清空」） |
+| core_exec_differential | 4 | Core 执行器 vs MIR 执行器**语义对拍**（D482 新建；D483 加断言/聚合/模板/事务） |
 
 ## 已知遗留（技术债）
 

@@ -207,6 +207,14 @@ fn nested_regions(core: &CoreFunction) -> Vec<(String, &CoreFunction)> {
                 CoreInst::EnumMatch { arms, .. } => {
                     for (i, arm) in arms.iter().enumerate() {
                         out.push((format!("EnumMatch.arm[{i}].body"), &arm.body));
+                        // v0.104.6 D483：**守卫体**也是独立代码区（D482 加的
+                        // `EnumMatchArm.guard`）⇒ 同样要递归检查。
+                        //
+                        // ⚠ 此前漏了它 ⇒ 守卫体里的结构缺陷（分支目标指向不存在
+                        // 的块 / 未回填 / 死块）**无人检查**。
+                        if let Some(g) = &arm.guard {
+                            out.push((format!("EnumMatch.arm[{i}].guard"), g));
+                        }
                     }
                 }
                 // v0.104.6 D481：区域体也是独立代码区 ⇒ 同样要递归检查。
@@ -244,7 +252,7 @@ fn assert_well_formed_recursive(core: &CoreFunction, tag: &str, acyclic: bool) {
 /// 无环分支程序：块结构必须良构（含嵌套代码区）。
 #[test]
 fn branch_cfgs_are_well_formed() {
-    let cases: [(&str, &str); 5] = [
+    let cases: [(&str, &str); 6] = [
         (
             "if_else",
             "if true then\n  print(1)\nelse\n  print(2)\nend\n",
@@ -264,6 +272,12 @@ fn branch_cfgs_are_well_formed() {
         (
             "and_inside_else",
             "if false then\n  print(0)\nelse\n  let x = false and true\n  print(x)\nend\n",
+        ),
+        // v0.104.6 D483：**带守卫的 match** —— 守卫体是独立代码区 ⇒ 递归
+        // 检查必须覆盖它（此前漏了 ⇒ 守卫体里的结构缺陷无人检查）。
+        (
+            "match_with_guard",
+            "let x = 2\nmatch x with\n  y when y > 5 -> print(1)\n  _ -> print(2)\nend\n",
         ),
     ];
     for (tag, src) in cases {

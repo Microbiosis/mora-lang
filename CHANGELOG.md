@@ -19,6 +19,72 @@ All notable changes to Mora will be documented in this file.
 - **`Int` 语义**：算术与比较统一为**精确 i64**（overflow 报 `MoraError`）。
   2^53 之外的 `Int` 运算结果会变（此前静默丢最低位），`Int ⊗ Float` 超界改报错。
 
+### D483：补 Core 模型原语 —— 「有损登记」清空
+
+D481 时 Core 层有 6 类构造**没有对应原语** ⇒ 降维只能写 `Const(dst, Nil)` 占位
+（编排更是用**空区域**冒充）⇒ 产物里**看不见**构造，更看不见载荷。当时判为
+「**模型**的限制」并登记在 `docs/nine-layer-ir.md`。
+
+D482 让 Core 层**可执行**之后，「模型层」是可以补齐的 —— 本条给这 6 类各配一个
+原语，形状**镜像** MIR 层对应指令，载荷**原样**带过 ⇒ **有损清单清空**。
+
+| 构造 | D482 之前 | D483 之后 |
+|---|---|---|
+| `eval` | `Const(dst, Nil)`（断言名 / expects 全丢，且**覆盖**了值寄存器） | `CoreInst::Eval { name, given, expects, tolerance, replay_path }` |
+| `aggregate` | `Const(dst, Nil)`（聚合器名全丢，且**覆盖**了值寄存器） | `CoreInst::Aggregate { name, value }` |
+| quasiquote | `Const(dst, Nil)`（片段全丢） | `CoreInst::Quasiquote { dst, segments }` |
+| `commit` / `rollback` | `Const(dst, Nil)`（与「别的语句返回 Nil」**无法区分**） | `CoreInst::Commit` / `CoreInst::Rollback` |
+| `orchestrate` | `Scope{kind:"orchestrate"}`（**空**区域，载荷全丢） | `CoreInst::Orchestrate { input_var, result_var, kind }`（载荷原样） |
+
+#### 顺带修掉一个**真的语义分叉**
+
+`eval` / `aggregate` 的占位 `Const(dst, Nil)` 里，`dst` 与 `given` / `value` **是
+同一个寄存器** ⇒ 那条 Nil 把值**覆盖**掉了 ⇒ 语句的值变成 Nil，而 MIR 层的契约是
+「值 = **given / 被贡献表达式的值**」（见 `fcfg_lower` 的同款注释）。⇒ Core 与 MIR
+在这一点上**分叉**了。D483 起不再补 Nil。
+
+#### 语义**复用**既有 handler（不另写一份）
+
+- `eval` → `h_eval`（含容差比较与失败文案）
+- `aggregate` → `h_aggregate`（贡献进 `Effects` 数据通道）
+- quasiquote → `h_quasiquote`（片段拼接 / splice 展平）；片段类型**复用**
+  `crate::mir::QuasiquoteSegment`，不另立一份
+
+⇒ Core 执行器与 MIR 执行器**逐字同一套**规则。
+
+#### 「模型」与「执行」要分清
+
+- `eval` / `aggregate` / quasiquote / `commit` / `rollback` —— 模型**与**执行都齐了
+  ⇒ Core 执行器能跑，可与 MIR 执行器**对拍**；
+- `orchestrate` —— 模型齐了（agent 图 / 边 / state schema 载荷原样），但**执行**
+  仍不支持（agent 图 / BSP 超步是**执行层**语义）⇒ Core 执行器**响亮报错**，
+  不假装能跑（顺序执行它会与 MIR 层静默分叉）。
+
+#### 对拍升级：效应也要比
+
+`tests/core_exec_differential.rs` 的对拍从「比返回值」升级为「比**值 + 效应**」
+⇒ `aggregate` 的贡献（走 `Effect::Contribute` 通道）从此**可观测**。
+另加 `assert_same_err`：错误路径要求两边**都报错且都含同一句关键词** ——
+否则「Core 侧根本不支持所以报错」也会被当成「一致」（**恒真陷阱**）。
+
+#### 守卫
+
+- `tests/core_fidelity.rs::formerly_lossy_constructs_are_now_faithful`（**取代**
+  `lossy_constructs_stay_registered`）—— 6 类构造逐个核对「原语存在 + 载荷逐字段
+  对得上」；
+- `tests/core_fidelity.rs::eval_and_aggregate_values_are_not_clobbered_by_nil` ——
+  值寄存器不许被 Nil 覆盖；
+- `tests/core_exec_differential.rs::formerly_lossy_constructs_execute_identically`
+  —— 5 类可执行构造的**值与效应**必须一致。
+
+三条判据都做了**反向验证**（把降维改回占位 / 补回 Nil 覆盖 ⇒ 判据报红）。
+
+#### 顺带补一个机制缺口
+
+`tests/core_cfg_wellformed.rs` 递归检查全部**嵌套代码区**（闭包体 / match 分支体 /
+区域体）—— 但 **D482 引入的 match 守卫体**此前**不在**递归范围内 ⇒ 守卫体里的
+结构缺陷无人检查。D483 把它纳入，并加了「带守卫的 match」用例。
+
 ### D482：Core 层**可执行** —— 自己的执行器 + 与 MIR 的语义对拍
 
 Core 层此前只是**影子**（`probe_all_layers` 只统计指令数）⇒ 降维里的错误不会被

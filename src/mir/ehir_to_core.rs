@@ -17,7 +17,7 @@ use crate::mir::core::{
     literal_to_value, pattern_bindings,
 };
 use crate::mir::effect::EffectRow;
-use crate::mir::fcfg::{Ehir, EhirBlock, Node, Reg};
+use crate::mir::fcfg::{Ehir, EhirBlock, Node, QuasiquoteSegment as FcfgSegment, Reg};
 use crate::typeck::Type;
 use crate::value::Value;
 
@@ -764,23 +764,28 @@ fn lower_node(ctx: &mut CoreContext, node: &Ehir) {
             });
         }
 
-        // ── 编排 → CMIR 层处理，Core 层有损（见下）──
-        Node::Orchestrate { .. } => {
-            // 编排在 CMIR 层降维；Core 层**无对应原语**（agent 图 / 边条件 /
-            // state schema 都要整套图语义，装不进任何基元）⇒ 登记为有损，
-            // 不静默丢弃：用一个**空区域**占位，让产物里看得见「这里有编排」。
-            let b = lower_body_to_core(
-                ctx,
-                &EhirBlock {
-                    nodes: vec![],
-                    result: None,
-                },
-            );
-            ctx.emit(CoreInst::Scope {
-                kind: "orchestrate".to_string(),
-                body: b,
-                compensation: None,
+        // ── 编排 → Core 原语（载荷原样透传，D483）──
+        Node::Orchestrate {
+            input_var,
+            result_var,
+            kind,
+            dst,
+            ..
+        } => {
+            // v0.104.6 D483：Core 层**有了编排原语** —— 载荷**原样**透传
+            // （witness 形态，与 `Node::Orchestrate` 同款，理由见 D473：
+            // 编排是**数据构造语句**，载荷是数据而非 CFG 结构）。
+            //
+            // 此前这里是**空区域**（`Scope{kind:"orchestrate"}`，体为空）
+            // ⇒ 产物里只看得见「这里有编排」，**载荷全丢**（agent 图 / 边条件 /
+            // state schema / MoA / MoE 的 prompt）。
+            ctx.emit(CoreInst::Orchestrate {
+                input_var: input_var.clone(),
+                result_var: result_var.clone(),
+                kind: kind.clone(),
             });
+            // 编排语句的值恒为 Nil（与 MIR 层同形）。
+            ctx.emit(CoreInst::Const(*dst, Value::Nil));
         }
 
         // ── 配置块 → 区域（D481）──
@@ -795,13 +800,29 @@ fn lower_node(ctx: &mut CoreContext, node: &Ehir) {
             ctx.emit(CoreInst::Const(*dst, Value::Nil));
         }
 
-        // ── 元编程 → 编译期展开 ──
+        // ── 元编程 → quasiquote 原语（运行期重组为源码文本，D483）──
         Node::Quasiquote { dst, segments, .. } => {
-            // v0.104.6 D481：Core 层**没有模板原语**（片段是「文本 + 插值」的
-            // 混合序列，不是任何基元）⇒ 登记为**有损**。结果寄存器写 Nil
-            // （与 MIR 层同契约），片段内容不进 Core 产物。
-            let _ = segments;
-            ctx.emit(CoreInst::Const(*dst, Value::Nil));
+            // v0.104.6 D483：Core 层**有了模板原语** —— 片段（静态文字 +
+            // 寄存器引用）逐段带过。此前写 `Const(dst, Nil)` ⇒ **片段全丢**。
+            //
+            // 片段类型**复用** `crate::mir::QuasiquoteSegment`（不另立一份）：
+            // 拼接语义由 `h_quasiquote` 唯一定义 ⇒ Core 执行器与 MIR 执行器
+            // 逐字同一套规则（与 `EnumMatchArm.pattern` 复用 `self_match_pattern`
+            // 同款理由）。
+            let segments = segments
+                .iter()
+                .map(|seg| match seg {
+                    FcfgSegment::Quote(s) => crate::mir::QuasiquoteSegment::Quote(s.clone()),
+                    FcfgSegment::Unquote(r) => crate::mir::QuasiquoteSegment::Unquote(*r),
+                    FcfgSegment::UnquoteSplice(r) => {
+                        crate::mir::QuasiquoteSegment::UnquoteSplice(*r)
+                    }
+                })
+                .collect();
+            ctx.emit(CoreInst::Quasiquote {
+                dst: *dst,
+                segments,
+            });
         }
 
         // ── 序列 ──
@@ -818,16 +839,16 @@ fn lower_node(ctx: &mut CoreContext, node: &Ehir) {
 
         // ── v0.104.6 D472：4 类新构造 → Core 层 ──
         //
-        // Core 层是**影子/统计层**（产出不进执行路径，见 `mir/pipeline.rs`：
+        // Core 层是**影子/统计层**（产出不进生产路径，见 `mir/pipeline.rs`：
         // 管线产出的 MirFunction 来自 `lower_fcfg(&fcfg)`），且其基元集
-        // 本就不覆盖全部 MirInst 变体（`core.rs`：「44/50 MirInst 变体没有
-        // CoreInst 直接等价物」）。
+        // 本就不覆盖全部 MirInst 变体（见 `core.rs` 的「CoreInst vs MirInst
+        // 覆盖范围」表）。
         //
-        // v0.104.6 D481 重新归类：
+        // v0.104.6 D481 重新归类，D483 补齐：
         // - **worker / transaction** ⇒ 区域构造（体是独立嵌套代码区，
         //   形状镜像 MIR 层的嵌套 `MirFunction`）⇒ `CoreInst::Scope`；
-        // - **eval / aggregate** ⇒ Core 层**无对应原语**（断言 / 贡献是执行层
-        //   语义）⇒ 登记为**有损**，结果寄存器写 Nil（与 MIR 层同契约）。
+        // - **eval / aggregate** ⇒ D483 起各有**自己的原语**
+        //   （`CoreInst::Eval` / `CoreInst::Aggregate`），载荷原样带过。
         Node::Worker { body, dst, .. } => {
             let b = lower_body_to_core(ctx, body);
             ctx.emit(CoreInst::Scope {
@@ -853,21 +874,48 @@ fn lower_node(ctx: &mut CoreContext, node: &Ehir) {
             ctx.emit(CoreInst::Const(*dst, Value::Nil));
         }
         Node::Eval {
+            name,
             given,
             expects,
+            tolerance,
+            replay_path,
             dst,
             ..
         } => {
-            // v0.104.6 D481：Core 层**无对应原语**（`eval` 是「把字符串当代码
-            // 执行」的执行层语义）⇒ 登记为**有损**，结果寄存器写 Nil。
-            let _ = (given, expects);
-            ctx.emit(CoreInst::Const(*dst, Value::Nil));
+            // v0.104.6 D483：Core 层**有了断言原语** —— 断言名 / given /
+            // expects / tolerance / replay_path 全部带过。此前写
+            // `Const(dst, Nil)` ⇒ **载荷全丢**（连断言名都看不见）。
+            //
+            // **不补 Nil**：语句的值 = **given 表达式的值**（`dst` 与 `given`
+            // 是同一个寄存器）—— 与 MIR 层逐字一致。补 Nil 会把那个寄存器
+            // **覆盖成 Nil**，使语句的值与 MIR 层分叉。
+            debug_assert_eq!(
+                *dst, *given,
+                "eval 语句的结果寄存器必须就是 given 的寄存器（与 MIR 层同契约）"
+            );
+            ctx.emit(CoreInst::Eval {
+                name: name.clone(),
+                given: *given,
+                expects: expects.clone(),
+                tolerance: *tolerance,
+                replay_path: replay_path.clone(),
+            });
         }
-        Node::Aggregate { value, dst, .. } => {
-            // v0.104.6 D481：同上（`aggregate` 是「向聚合器贡献一个值」的
-            // 执行层语义）⇒ 登记为有损。
-            let _ = value;
-            ctx.emit(CoreInst::Const(*dst, Value::Nil));
+        Node::Aggregate {
+            name, value, dst, ..
+        } => {
+            // v0.104.6 D483：同上 —— 聚合器名与被贡献的值都带过。
+            //
+            // **不补 Nil**：语句的值 = **被贡献表达式的值**（`dst` 与 `value`
+            // 是同一个寄存器）—— 与 MIR 层逐字一致。
+            debug_assert_eq!(
+                *dst, *value,
+                "aggregate 语句的结果寄存器必须就是被贡献值的寄存器（与 MIR 层同契约）"
+            );
+            ctx.emit(CoreInst::Aggregate {
+                name: name.clone(),
+                value: *value,
+            });
         }
         // v0.104.6 D472：管道 + commit / rollback → Core 层透传
         Node::Pipe {
@@ -881,9 +929,17 @@ fn lower_node(ctx: &mut CoreContext, node: &Ehir) {
             // 不会被执行，所以当时没暴露；现在 Core 层要能执行，语义必须对。
             ctx.emit(CoreInst::ClosureCall(*dst, *right, vec![*left]));
         }
-        Node::Commit { dst, .. } | Node::Rollback { dst, .. } => {
-            // v0.104.6 D481：Core 层**无事务原语**（提交 / 回滚是执行层的
-            // 事务语义）⇒ 登记为**有损**，结果寄存器写 Nil（与 MIR 层同契约）。
+        Node::Commit { dst, .. } => {
+            // v0.104.6 D483：Core 层**有了事务原语** —— 提交这件事在产物里
+            // **看得见**了。此前只有 `Const(dst, Nil)` ⇒ 与「别的语句返回 Nil」
+            // **完全无法区分**。
+            ctx.emit(CoreInst::Commit);
+            // unit 语句 ⇒ 值恒为 Nil（与 MIR 层同形）。
+            ctx.emit(CoreInst::Const(*dst, Value::Nil));
+        }
+        Node::Rollback { dst, .. } => {
+            // 同 commit：回滚在产物里看得见。
+            ctx.emit(CoreInst::Rollback);
             ctx.emit(CoreInst::Const(*dst, Value::Nil));
         }
     }

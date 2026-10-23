@@ -16,17 +16,34 @@
 //! | 闭包的**捕获变量** | 恒为空，且注释谎称「由 EHIR 分析确定」 | 过近似 + 注释说真话 |
 //! | 区域构造（`parallel` / `observe` / `span` / `worker` / `transaction` / `with` / `solve` / `section` / `export`） | 原地摊平 ⇒ 构造**完全不可见** | `CoreInst::Scope`（体是独立嵌套代码区，形状镜像 MIR 层） |
 //!
+//! D482 让 Core 层**可执行**（有了自己的执行器 + 与 MIR 的语义对拍）⇒ 顺带
+//! 发现 D481 登记的「有损清单」里，**模型**这一层是可以补齐的：D483 给
+//! `eval` / `aggregate` / quasiquote / `commit` / `rollback` / `orchestrate`
+//! 各补了一个原语，载荷原样带过 ⇒ 「有损登记」表**清空**。
+//!
+//! | 构造 | D482 之前 | D483 之后 |
+//! |---|---|---|
+//! | `eval` | `Const(dst, Nil)`（断言名 / expects 全丢，且**覆盖**了值寄存器） | `CoreInst::Eval { name, given, expects, tolerance, replay_path }` |
+//! | `aggregate` | `Const(dst, Nil)`（聚合器名全丢，且**覆盖**了值寄存器） | `CoreInst::Aggregate { name, value }` |
+//! | quasiquote | `Const(dst, Nil)`（片段全丢） | `CoreInst::Quasiquote { dst, segments }` |
+//! | `commit` / `rollback` | `Const(dst, Nil)`（与「别的语句返回 Nil」**无法区分**） | `CoreInst::Commit` / `CoreInst::Rollback` |
+//! | `orchestrate` | `Scope{kind:"orchestrate"}`（**空**区域，载荷全丢） | `CoreInst::Orchestrate { input_var, result_var, kind }`（载荷原样） |
+//!
 //! ## 判据
 //!
 //! ① `match` 的 arm 保留绑定名、变体名可读（不含 `Span` 噪声）；
 //! ② `break` 跳到**循环出口块**、`continue` 跳到**循环条件块**（不是块 0）；
-//! ③ 管道降成 `Call`；
+//! ③ 管道降成**值调用**（左右 operand 顺序正确）；
 //! ④ 区域构造在产物里**看得见**（`Scope` + 正确的 kind）；
 //! ⑤ 闭包的捕获变量**非空**（过近似）；
-//! ⑥ 有损清单（Core 层无对应原语的那几个）**仍然是有损的** —— 钉住
-//!    「登记」这件事本身；哪天它们变忠实了，本判据会失败并提示更新登记。
+//! ⑥（D483）曾经「有损」的 6 类构造（`eval` / `aggregate` / quasiquote /
+//!    `commit` / `rollback` / `orchestrate`）现在**忠实可见** —— 原语存在 +
+//!    载荷逐字段对得上；
+//! ⑦（D483）`eval` / `aggregate` 的**值寄存器不许被 Nil 覆盖**（D481/D482
+//!    的占位路径会把语句的值从「given / 被贡献表达式的值」改成 Nil）。
 
 use mora::mir::core::{CoreInst, CoreTerminator};
+use mora::value::Value;
 
 /// 构造一个程序的 CoreFunction（走 9 层里的 EHIR → Core 段）。
 fn core_of(src: &str) -> mora::mir::core::CoreFunction {
@@ -270,16 +287,191 @@ fn closure_captures_are_computed() {
     );
 }
 
-/// 判据 ⑥：有损清单**仍然是有损的** —— 钉住「登记」这件事本身。
+/// 判据 ⑥（D483）：曾经「有损」的 6 类构造，在 Core 产物里**忠实可见**。
 ///
-/// Core 层**没有对应原语**的构造（`eval` / `aggregate` / quasiquote /
-/// `commit` / `rollback`）只能写 Nil 占位。哪天它们变忠实了，本判据会失败
-/// ⇒ 提示把 `docs/nine-layer-ir.md` 的「有损登记」表更新掉。
+/// D481/D482 时代它们只能写 `Const(dst, Nil)` 占位（编排更是用**空区域**
+/// 冒充）⇒ 产物里**看不见**构造，更看不见载荷。
+/// D483 起每个都有对应原语（形状**镜像** MIR 层）⇒ 本判据逐个核对
+/// **原语存在** + **载荷逐字段对得上**。
 #[test]
-fn lossy_constructs_stay_registered() {
-    let core = core_of("let x = 1\n");
-    // 没有任何 Scope / EnumMatch / Call 时，产物应只有常量 —— 说明
-    // 「无原语 ⇒ 占位」这条路径仍然是唯一出口。
-    let kinds = scope_kinds(&core);
-    assert!(kinds.is_empty(), "无分支的程序不该出现区域构造：{kinds:?}");
+fn formerly_lossy_constructs_are_now_faithful() {
+    // ── eval：断言名 / expects / 容差 / 回放路径都要在 ──
+    let core = core_of("eval \"n\" 1, 2\n");
+    let evals = collect(&core, |i| match i {
+        CoreInst::Eval {
+            name,
+            expects,
+            tolerance,
+            replay_path,
+            ..
+        } => Some((
+            name.clone(),
+            expects.clone(),
+            *tolerance,
+            replay_path.clone(),
+        )),
+        _ => None,
+    });
+    assert_eq!(
+        evals.len(),
+        1,
+        "应恰好有一条断言原语（D481 之前是 `Const(dst, Nil)`，断言名与 expects 全丢），实际 {evals:?}"
+    );
+    let (name, expects, tolerance, replay_path) = &evals[0];
+    assert_eq!(name, "n", "断言名丢了");
+    assert_eq!(expects.len(), 1, "expects 丢了");
+    assert_eq!(*tolerance, None, "容差丢了");
+    assert_eq!(*replay_path, None, "回放路径丢了");
+
+    // ── aggregate：聚合器名 + 被贡献的值都要在 ──
+    let core = core_of("aggregate acc, 1\n");
+    let aggs = collect(&core, |i| match i {
+        CoreInst::Aggregate { name, value } => Some((name.clone(), *value)),
+        _ => None,
+    });
+    assert_eq!(
+        aggs.len(),
+        1,
+        "应恰好有一条聚合原语（D481 之前是 `Const(dst, Nil)`，聚合器名全丢），实际 {aggs:?}"
+    );
+    assert_eq!(aggs[0].0, "acc", "聚合器名丢了");
+
+    // ── quasiquote：片段（静态文字 + 寄存器引用）都要在 ──
+    let core = core_of("let x = 5\nlet q = `10+,x\n");
+    let quotes = collect(&core, |i| match i {
+        CoreInst::Quasiquote { segments, .. } => Some(segments.clone()),
+        _ => None,
+    });
+    assert_eq!(
+        quotes.len(),
+        1,
+        "应恰好有一条 quasiquote 原语（D481 之前是 `Const(dst, Nil)`，片段全丢），实际 {quotes:?}"
+    );
+    let segments = &quotes[0];
+    assert_eq!(
+        segments.len(),
+        2,
+        "`10+,x` 应是「静态片段 + 一个插值」两段，实际 {segments:?}"
+    );
+    assert!(
+        matches!(&segments[0], mora::mir::QuasiquoteSegment::Quote(s) if s == "10+"),
+        "第一段应是静态文字 `10+`，实际 {:?}",
+        segments[0]
+    );
+    assert!(
+        matches!(&segments[1], mora::mir::QuasiquoteSegment::Unquote(_)),
+        "第二段应是寄存器插值（`,x`），实际 {:?}",
+        segments[1]
+    );
+
+    // ── commit / rollback：这两件事在产物里必须**看得见** ──
+    // （此前只有 `Const(dst, Nil)` ⇒ 与「别的语句返回 Nil」完全无法区分。）
+    let core = core_of("transaction\n  print(1)\nend\ncommit\n");
+    assert_eq!(
+        count(&core, |i| matches!(i, CoreInst::Commit)),
+        1,
+        "提交在产物里应看得见（D481 之前只有 Nil 占位）"
+    );
+    let core = core_of("rollback\n");
+    assert_eq!(
+        count(&core, |i| matches!(i, CoreInst::Rollback)),
+        1,
+        "回滚在产物里应看得见（D481 之前只有 Nil 占位）"
+    );
+
+    // ── orchestrate：载荷（agent 图 / 边）要**原样**在 ──
+    let core = core_of(
+        "orchestrate graph input -> result\n  agent a => \"A\"\n  agent b => \"B\"\n  @start -> a\n  a -> b\nend\n",
+    );
+    let orchs = collect(&core, |i| match i {
+        CoreInst::Orchestrate {
+            input_var,
+            result_var,
+            kind,
+        } => Some((input_var.clone(), result_var.clone(), kind.clone())),
+        _ => None,
+    });
+    assert_eq!(
+        orchs.len(),
+        1,
+        "应恰好有一条编排原语（D481 之前是**空区域** Scope{{kind:\"orchestrate\"}}，载荷全丢），实际 {orchs:?}"
+    );
+    let (input_var, result_var, kind) = &orchs[0];
+    assert_eq!(input_var, "input", "编排的输入变量名丢了");
+    assert_eq!(result_var, "result", "编排的结果变量名丢了");
+    match kind {
+        mora::mir::witness::WitnessOrchestrateKind::Graph { agents, edges } => {
+            assert_eq!(agents.len(), 2, "编排的 agent 列表丢了：{agents:?}");
+            assert_eq!(edges.len(), 2, "编排的边列表丢了：{edges:?}");
+        }
+        other => panic!("编排载荷的种类不对：{other:?}"),
+    }
+}
+
+/// 判据 ⑦（D483）：`eval` / `aggregate` 的**值寄存器不许被 Nil 覆盖**。
+///
+/// D481/D482 时代这两个构造降成 `Const(dst, Nil)`，而 `dst` 与 `given` /
+/// `value` **是同一个寄存器** ⇒ 那条 Nil 把值**覆盖**掉了 ⇒ 语句的值变成
+/// Nil，与 MIR 层（值 = given / 被贡献表达式的值）**分叉**。
+///
+/// 本判据按**位置关系**写：某个 `Eval` / `Aggregate` 之后，**不得**再出现
+/// 往同一个寄存器写 Nil 的指令。
+#[test]
+fn eval_and_aggregate_values_are_not_clobbered_by_nil() {
+    let cases: [(&str, &str); 2] = [
+        ("eval", "eval \"n\" 1, 2\n"),
+        ("aggregate", "aggregate acc, 1\n"),
+    ];
+    for (tag, src) in cases {
+        let core = core_of(src);
+        let mut seen = 0usize;
+        for b in &core.blocks {
+            for (i, inst) in b.insts.iter().enumerate() {
+                // 这两个构造的值寄存器
+                let value_reg = match inst {
+                    CoreInst::Eval { given, .. } => *given,
+                    CoreInst::Aggregate { value, .. } => *value,
+                    _ => continue,
+                };
+                seen += 1;
+                for later in &b.insts[i + 1..] {
+                    if let CoreInst::Const(r, Value::Nil) = later
+                        && *r == value_reg
+                    {
+                        panic!(
+                            "[{tag}] 块 {} 里，值寄存器 {value_reg} 在构造之后被 `Const(_, Nil)` \
+                             覆盖了（D481/D482 的占位路径）⇒ 语句的值不再是 \
+                             given / 被贡献表达式的值",
+                            b.id
+                        );
+                    }
+                }
+            }
+        }
+        // ⚠ 防「空转通过」：若原语整个消失（降维退回占位），本判据会因为
+        // 「找不到可检查的构造」而**恒真** ⇒ 必须先确认确实找到了。
+        assert!(
+            seen >= 1,
+            "[{tag}] 产物里应至少有一条对应的原语，却一条都没有 \
+             （降维退回占位路径了？）"
+        );
+    }
+}
+
+/// 产物里所有满足条件的指令（顶层块）。
+fn collect<T>(core: &mora::mir::core::CoreFunction, f: impl Fn(&CoreInst) -> Option<T>) -> Vec<T> {
+    core.blocks
+        .iter()
+        .flat_map(|b| b.insts.iter())
+        .filter_map(f)
+        .collect()
+}
+
+/// 产物里满足条件的指令**条数**。
+fn count(core: &mora::mir::core::CoreFunction, f: impl Fn(&CoreInst) -> bool) -> usize {
+    core.blocks
+        .iter()
+        .flat_map(|b| b.insts.iter())
+        .filter(|i| f(i))
+        .count()
 }

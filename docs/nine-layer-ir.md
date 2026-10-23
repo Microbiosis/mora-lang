@@ -46,31 +46,35 @@ Token → FCFG → EHIR → Core → MIR
 - **职责**：闭包/ADT/Thunk/Handle 降维为基元
 - **关键设计**：SSA 100% 覆盖（无 passthrough）
 
-> ⚠ **块号分配的嵌套限制（既有，未修）**：`ehir_to_core` 的分支块号是
-> **预分配**的（`next_block_id + 1 / +2 / +3`），因此**分支里再套分支**
-> 会让外层预留的块号与内层实际分配的块号相撞 ⇒ **边指错、甚至成环**。
+> ⚠ **已知限制（显式登记）**：Core 层有一处**模型级**缺口 ——
+> `CoreInst::ClosureCreate.body` 与 `EnumMatchArm.body` 都是**单个**
+> `CoreBlock`，装不下多块 CFG ⇒ **闭包体 / match 分支体里的嵌套分支被截断**：
+> 体里只保留首块，分支目标指向**并不存在**的块。
 >
-> 实测（一次性探针打印 Core 块结构，`if` 里套 `if`）：
+> 实测（一次性探针打印 Core 块结构，match 分支体里套 `if`）：
 >
 > ```text
-> block 0: Branch(cond=0, true_bb=1, false_bb=3)   ← 外层 if
-> block 1: Branch(cond=1, true_bb=2, false_bb=4)   ← 内层 if（在外层的 then 里）
-> block 2: <内层 then 体>  Jump(4)
-> block 3: []  Jump(4)                              ← 外层 else（空）
-> block 4: []  Jump(3)                              ← ⇒ 3 ↔ 4 成环
+> EnumMatchArm { body: CoreBlock { id: 0,
+>     insts: [EnvLoad, Const, BinaryOp, Branch { true_bb: 1, false_bb: 2 }],
+>     terminator: Branch { true_bb: 1, false_bb: 2 } } }
+>                                  ↑ 目标 1、2 在该体里根本不存在
 > ```
 >
-> 而 `or` / `and` 出现在 `if` 的**条件**位置（先算条件、再分支）**不受影响**
-> —— 那时两者的块是先后关系而非嵌套关系。
+> 根因是**模型**（`body` 只能装一个块），不是降维 ⇒ 修它要改 Core 模型
+> （`body` → 多块 / `CoreFunction`），是独立的一批。
+> 钉子：`tests/core_cfg_wellformed.rs::sub_body_nested_branches_are_truncated_known_limitation`
+> —— 缺口消失时该判据会失败，提示把它翻成正面断言。
 >
 > 影响范围：**仅限 Core 层**。Core 函数**从不执行**（`probe_all_layers` 只统计
 > 指令数），可执行的路径是 MIR 层 —— 它的块结构由 `mir/dag.rs` 独立构建，
 > 不受此限制。
 >
-> D477 让 `or`/`and` 在 Core 层也走 `Branch` + 两块（此前它们被降成普通
-> `BinaryOp`，**既不取值短路也不求值短路**），于是**新增**了一个嵌套来源。
-> 真要修，得把 Core 层改成**先降维、后回填块号**的 CFG 构造器 ——
-> 那是独立的一批，不在 D477 范围内。
+> **块号相撞那个缺陷已修**（v0.104.6 D479）：此前分支块号是**预分配**的
+> （`next_block_id + 1 / +2 / +3`），分支里再套分支时外层预留的号与内层实际
+> 分配的号相撞 ⇒ 边指错、甚至成环（`if` 里套 `if` 实测 3 ↔ 4 成环、出口块
+> 不可达）。D479 改成「**先降维、后回填**」，并加了结构良构性守卫
+> （`tests/core_cfg_wellformed.rs`：id 唯一连续 / 目标存在 / 指令与终结指令
+> 一致 / 无死块 / 无未回填 / 无环分支程序无环）。
 
 ### MIR — Mid-level IR（已有）
 - **输入**：`FCFG`（`lower_fcfg` 降维）
@@ -273,6 +277,8 @@ D472 之后登记项由 4 条减为 1 条（`orchestrate`），D473 之后减为
 | nine_layer_unblocked | 20×3 + 57 | 块/声明形态 × 优化档 + 全部 e2e fixture |
 | pipeline_conformance | 11 | 代表性 fixture 的**期望输出**（D474 新建） |
 | short_circuit_evaluation | 3 | `or`/`and` 的**求值级短路**（行为 × 优化档 + 两路径形状，D477 新建） |
+| execute_naming_hygiene | 3 | 执行入口命名一致性（旧名不得复活，D478 新建） |
+| core_cfg_wellformed | 5 | Core 层 CFG **结构良构性** + 模型限制登记（D479 新建） |
 
 ## 已知遗留（技术债）
 

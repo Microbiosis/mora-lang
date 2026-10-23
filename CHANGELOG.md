@@ -19,6 +19,62 @@ All notable changes to Mora will be documented in this file.
 - **`Int` 语义**：算术与比较统一为**精确 i64**（overflow 报 `MoraError`）。
   2^53 之外的 `Int` 运算结果会变（此前静默丢最低位），`Int ⊗ Float` 超界改报错。
 
+### D479：Core 层 CFG 构造器 —— 块号「先降维、后回填」，嵌套分支不再指错
+
+D477 把 Core 层的块号相撞限制**显式登记**（当时未修）。本条把它修掉。
+
+#### 缺陷
+
+Core 层的分支块号是**预分配**的（`next_block_id + 1 / +2 / +3`），而块号
+实际是**顺序分配**的（`flush_block` 单调递增）⇒ **分支里再套分支**时，
+外层预留的号与内层实际拿到的号**相撞** ⇒ 边指错、甚至成环。
+
+实测（一次性探针打印 Core 块结构，`if` 里套 `if`）：
+
+```text
+block 0: Branch(cond=0, true_bb=1, false_bb=3)   ← 外层 if
+block 1: Branch(cond=1, true_bb=2, false_bb=4)   ← 内层 if（在外层的 then 里）
+block 2: <内层 then 体>  Jump(4)
+block 3: []  Jump(4)                              ← 外层 else（空）
+block 4: []  Jump(3)                              ← ⇒ 3 ↔ 4 成环
+```
+
+⇒ 外层 `false_bb` 指向内层的 then 块；出口块不可达。
+
+#### 修法
+
+块号**只能顺序分配**，所以「先降维、后回填」是唯一能得到正确块号的办法：
+分支目标要等**两个分支体都降完**才知道（它们各自占用了多少块），汇合块更是
+在那之后才存在。
+
+- `CoreContext` 新增 `flush_block_at`（返回块下标）/ `patch_branch` /
+  `patch_jump`；
+- `If` / `While` / `For` / `Or` / `And` 五个分支构造全部改为：先降维 →
+  记录各段首块 → flush 占位终结指令 → 拿到汇合块号 → 回填分支目标与跳转。
+- 顺带补上 `If` 此前**从不写**自己的结果寄存器（`dst`）—— 两个分支各
+  `Copy` 一次，与 MIR 层 `fcfg_lower` 的 `if` 降级同款；无 `else` 时物化
+  隐式 else（`dst ← Nil`）。
+
+#### 防回退守卫
+
+`tests/core_cfg_wellformed.rs`（新建，5 条）：id 唯一且连续 / 目标块存在 /
+块内 `Branch` 指令与块终结指令的分支目标**一致**（Core 模型把分支信息存了
+两处）/ 从入口可达 = 全部块（无死块）/ 无未回填的 `Unreachable` 占位 /
+无环分支程序里无环（循环的回边合法，故只对无环程序断言）。
+
+守卫**做过反向验证**：`git stash` 掉实现、只留判据 ⇒ 旧实现在
+`nested_if_in_then` 上报「不可达块 [5, 6]」、在 `while_with_nested_if` 上报
+「不可达块 [3, 5]」⇒ 判据确实抓得住那个缺陷，不是恒真。
+
+#### 一处**模型级**限制（登记，未修）
+
+`CoreInst::ClosureCreate.body` 与 `EnumMatchArm.body` 都是**单个**
+`CoreBlock`，装不下多块 CFG ⇒ **闭包体 / match 分支体里的嵌套分支被截断**
+（体里只保留首块，分支目标指向并不存在的块）。根因是**模型**不是降维 ⇒
+修它要改 Core 模型（`body` → 多块 / `CoreFunction`），是独立的一批。
+钉子：`tests/core_cfg_wellformed.rs::sub_body_nested_branches_are_truncated_known_limitation`
+—— 缺口消失时该判据会失败，提示把它翻成正面断言。
+
 ### D478：执行入口命名收口（遗留 3）—— 旧名 `run_mir` 彻底退役 + 防回退守卫
 
 D467 只把主入口 `run_mir` 改名为 `execute`，命名遗留散在别处。文档里

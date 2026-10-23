@@ -73,6 +73,16 @@ impl CoreContext {
     }
 
     fn flush_block(&mut self, terminator: CoreTerminator) {
+        self.flush_block_at(terminator);
+    }
+
+    /// flush 当前块，返回它在 `blocks` 里的下标（供事后回填）。
+    ///
+    /// v0.104.6 D479：块号**只能顺序分配**（`next_block_id` 单调递增），
+    /// 所以「先降维、后回填」是唯一能拿到正确块号的办法 ——
+    /// 分支目标要等**两个分支体都降完**才知道（它们各自占用了多少块），
+    /// 汇合块更是在那之后才存在。
+    fn flush_block_at(&mut self, terminator: CoreTerminator) -> usize {
         let id = self.next_block_id;
         self.next_block_id += 1;
         self.blocks.push(CoreBlock {
@@ -80,6 +90,40 @@ impl CoreContext {
             insts: std::mem::take(&mut self.current_insts),
             terminator,
         });
+        self.blocks.len() - 1
+    }
+
+    /// 回填某块的分支目标。
+    ///
+    /// ⚠ Core 的分支信息在**两处**都有：块内的 `CoreInst::Branch` 与块的
+    /// `CoreTerminator::Branch`（模型既有设计），两处都要改，否则指令与
+    /// 终结指令会指向不同的块。
+    fn patch_branch(&mut self, block_idx: usize, true_bb: BlockId, false_bb: BlockId) {
+        for inst in self.blocks[block_idx].insts.iter_mut() {
+            if let CoreInst::Branch {
+                true_bb: t,
+                false_bb: f,
+                ..
+            } = inst
+            {
+                *t = true_bb;
+                *f = false_bb;
+            }
+        }
+        if let CoreTerminator::Branch {
+            true_bb: t,
+            false_bb: f,
+            ..
+        } = &mut self.blocks[block_idx].terminator
+        {
+            *t = true_bb;
+            *f = false_bb;
+        }
+    }
+
+    /// 回填某块的终结指令为 `Jump(target)`。
+    fn patch_jump(&mut self, block_idx: usize, target: BlockId) {
+        self.blocks[block_idx].terminator = CoreTerminator::Jump(target);
     }
 }
 
@@ -107,23 +151,27 @@ fn lower_node(ctx: &mut CoreContext, node: &Ehir) {
         // 求值 rhs。块结构与本文件 `Node::If` 的降级同款。
         Node::Or { dst, lhs, rhs, .. } => {
             // cond 为真 ⇒ 短路（结果 = lhs，rhs 不求值）
-            let short_id = ctx.next_block_id + 1;
-            let eval_id = ctx.next_block_id + 2;
-            let end_id = ctx.next_block_id + 3;
+            //
+            // v0.104.6 D479：块号改为**先降维、后回填**。此前是「预分配」
+            // （`next_block_id + 1 / +2 / +3`）⇒ 嵌套分支时必然与内层实际
+            // 分配的块号相撞 ⇒ 边指错、甚至成环（实测：`if` 里套 `if` 时
+            // 外层 `false_bb` 指向内层的 then 块，3 ↔ 4 成环）。
             ctx.emit(CoreInst::Branch {
                 cond: *lhs,
-                true_bb: short_id,
-                false_bb: eval_id,
+                true_bb: 0,
+                false_bb: 0,
             });
-            ctx.flush_block(CoreTerminator::Branch {
+            let branch_idx = ctx.flush_block_at(CoreTerminator::Branch {
                 cond: *lhs,
-                true_bb: short_id,
-                false_bb: eval_id,
+                true_bb: 0,
+                false_bb: 0,
             });
-            // 短路块
+            // 短路块：结果 = lhs（rhs 不求值）
+            let short_start = ctx.next_block_id;
             ctx.emit(CoreInst::Copy(*dst, *lhs));
-            ctx.flush_block(CoreTerminator::Jump(end_id));
+            let short_join = ctx.flush_block_at(CoreTerminator::Unreachable);
             // 非短路块：求值 rhs，结果 = (lhs != rhs)
+            let eval_start = ctx.next_block_id;
             lower_block(ctx, rhs);
             let r = rhs.result.unwrap_or(0);
             ctx.emit(CoreInst::BinaryOp(
@@ -132,24 +180,27 @@ fn lower_node(ctx: &mut CoreContext, node: &Ehir) {
                 crate::common::BinaryOp::NotEqual,
                 r,
             ));
-            ctx.flush_block(CoreTerminator::Jump(end_id));
+            let eval_join = ctx.flush_block_at(CoreTerminator::Unreachable);
+            // 汇合块 = 本分支之后的当前块（此刻尚未 flush，flush 时拿到这个 id）
+            let join = ctx.next_block_id;
+            ctx.patch_branch(branch_idx, short_start, eval_start);
+            ctx.patch_jump(short_join, join);
+            ctx.patch_jump(eval_join, join);
         }
         Node::And { dst, lhs, rhs, .. } => {
             // cond 为假 ⇒ 短路（结果 = lhs，rhs 不求值）
-            let eval_id = ctx.next_block_id + 1;
-            let short_id = ctx.next_block_id + 2;
-            let end_id = ctx.next_block_id + 3;
             ctx.emit(CoreInst::Branch {
                 cond: *lhs,
-                true_bb: eval_id,
-                false_bb: short_id,
+                true_bb: 0,
+                false_bb: 0,
             });
-            ctx.flush_block(CoreTerminator::Branch {
+            let branch_idx = ctx.flush_block_at(CoreTerminator::Branch {
                 cond: *lhs,
-                true_bb: eval_id,
-                false_bb: short_id,
+                true_bb: 0,
+                false_bb: 0,
             });
             // 非短路块：求值 rhs，结果 = (lhs == rhs)
+            let eval_start = ctx.next_block_id;
             lower_block(ctx, rhs);
             let r = rhs.result.unwrap_or(0);
             ctx.emit(CoreInst::BinaryOp(
@@ -158,10 +209,15 @@ fn lower_node(ctx: &mut CoreContext, node: &Ehir) {
                 crate::common::BinaryOp::Equal,
                 r,
             ));
-            ctx.flush_block(CoreTerminator::Jump(end_id));
+            let eval_join = ctx.flush_block_at(CoreTerminator::Unreachable);
             // 短路块
+            let short_start = ctx.next_block_id;
             ctx.emit(CoreInst::Copy(*dst, *lhs));
-            ctx.flush_block(CoreTerminator::Jump(end_id));
+            let short_join = ctx.flush_block_at(CoreTerminator::Unreachable);
+            let join = ctx.next_block_id;
+            ctx.patch_branch(branch_idx, eval_start, short_start);
+            ctx.patch_jump(eval_join, join);
+            ctx.patch_jump(short_join, join);
         }
         // DynTrait/Prompt → Core 层降维为透传调用
         Node::DynTrait { dst, src, .. } => {
@@ -223,63 +279,84 @@ fn lower_node(ctx: &mut CoreContext, node: &Ehir) {
 
         // ── 控制流 ──
         Node::If {
-            cond, then, else_, ..
+            cond,
+            then,
+            else_,
+            dst,
+            ..
         } => {
             // 降维为 Branch + 两个基本块
-            let then_id = ctx.next_block_id + 1;
-            let else_id = if else_.is_some() {
-                ctx.next_block_id + 2
-            } else {
-                ctx.next_block_id + 3
-            };
-            let end_id = ctx.next_block_id + 3;
-
+            //
+            // v0.104.6 D479：块号改为**先降维、后回填**（见 `Node::Or` 处的
+            // 说明）：预分配的 `+1/+2/+3` 在嵌套分支下必然撞车。
             ctx.emit(CoreInst::Branch {
                 cond: *cond,
-                true_bb: then_id,
-                false_bb: else_id,
+                true_bb: 0,
+                false_bb: 0,
             });
-            ctx.flush_block(CoreTerminator::Branch {
+            let branch_idx = ctx.flush_block_at(CoreTerminator::Branch {
                 cond: *cond,
-                true_bb: then_id,
-                false_bb: else_id,
+                true_bb: 0,
+                false_bb: 0,
             });
 
             // then block
+            let then_start = ctx.next_block_id;
             lower_block(ctx, then);
-            ctx.flush_block(CoreTerminator::Jump(end_id));
+            ctx.emit(CoreInst::Copy(*dst, then.result.unwrap_or(0)));
+            let then_join = ctx.flush_block_at(CoreTerminator::Unreachable);
 
             // else block
-            if let Some(else_block) = else_ {
-                lower_block(ctx, else_block);
+            let else_start = ctx.next_block_id;
+            match else_ {
+                Some(else_block) => {
+                    lower_block(ctx, else_block);
+                    ctx.emit(CoreInst::Copy(*dst, else_block.result.unwrap_or(0)));
+                }
+                // 无 else ⇒ 物化隐式 else（`dst ← Nil`），与 MIR 层
+                // `fcfg_lower` 的 else-less `if` 降级同款。
+                None => {
+                    ctx.emit(CoreInst::Const(*dst, Value::Nil));
+                }
             }
-            ctx.flush_block(CoreTerminator::Jump(end_id));
+            let else_join = ctx.flush_block_at(CoreTerminator::Unreachable);
+
+            // 汇合块 = 本 if 之后的当前块（此刻尚未 flush）
+            let join = ctx.next_block_id;
+            ctx.patch_branch(branch_idx, then_start, else_start);
+            ctx.patch_jump(then_join, join);
+            ctx.patch_jump(else_join, join);
         }
         Node::While {
             cond, body, dst, ..
         } => {
-            let cond_id = ctx.next_block_id;
-            let body_id = ctx.next_block_id + 1;
-            let end_id = ctx.next_block_id + 2;
-
-            // cond block
+            // cond block —— 块号在**降完条件体之后**才定：条件体里若含嵌套
+            // 分支，会先占用若干块，而「条件值所在的那一块」是降完之后的
+            // 当前块（回边要跳回它）。
             lower_block(ctx, cond);
             let cond_reg = cond.result.unwrap_or(0);
+            let cond_id = ctx.next_block_id;
             ctx.emit(CoreInst::Branch {
                 cond: cond_reg,
-                true_bb: body_id,
-                false_bb: end_id,
+                true_bb: 0,
+                false_bb: 0,
             });
-            ctx.flush_block(CoreTerminator::Branch {
+            let cond_idx = ctx.flush_block_at(CoreTerminator::Branch {
                 cond: cond_reg,
-                true_bb: body_id,
-                false_bb: end_id,
+                true_bb: 0,
+                false_bb: 0,
             });
 
             // body block
+            let body_id = ctx.next_block_id;
             lower_block(ctx, body);
+            // 回边：跳回条件块（cond_id 已知，无需回填）
             ctx.emit(CoreInst::Jump(cond_id));
-            ctx.flush_block(CoreTerminator::Jump(cond_id));
+            ctx.flush_block_at(CoreTerminator::Jump(cond_id));
+
+            // 出口块 = 循环之后的当前块
+            let end_id = ctx.next_block_id;
+            ctx.patch_branch(cond_idx, body_id, end_id);
 
             // v0.103: 循环作为表达式的结果 = Nil，写节点自带 dst（emit.rs
             // emit_while_w / fcfg_lower 的同一契约）。
@@ -301,10 +378,8 @@ fn lower_node(ctx: &mut CoreContext, node: &Ehir) {
             let one = ctx.alloc_reg();
             ctx.emit(CoreInst::Const(one, Value::Int(1)));
 
+            // 循环头块：条件计算 + 分支（v0.104.6 D479：先降维、后回填）
             let loop_start = ctx.next_block_id;
-            let body_id = ctx.next_block_id + 1;
-            let end_id = ctx.next_block_id + 2;
-
             let cond_reg = ctx.alloc_reg();
             ctx.emit(CoreInst::BinaryOp(
                 cond_reg,
@@ -314,16 +389,17 @@ fn lower_node(ctx: &mut CoreContext, node: &Ehir) {
             ));
             ctx.emit(CoreInst::Branch {
                 cond: cond_reg,
-                true_bb: end_id,
-                false_bb: body_id,
+                true_bb: 0,
+                false_bb: 0,
             });
-            ctx.flush_block(CoreTerminator::Branch {
+            let cond_idx = ctx.flush_block_at(CoreTerminator::Branch {
                 cond: cond_reg,
-                true_bb: end_id,
-                false_bb: body_id,
+                true_bb: 0,
+                false_bb: 0,
             });
 
             // body
+            let body_id = ctx.next_block_id;
             let val_reg = ctx.alloc_reg();
             ctx.emit(CoreInst::Index(val_reg, *iter, idx_reg));
             ctx.emit(CoreInst::EnvStore(var.clone(), val_reg));
@@ -335,7 +411,11 @@ fn lower_node(ctx: &mut CoreContext, node: &Ehir) {
                 one,
             ));
             ctx.emit(CoreInst::Jump(loop_start));
-            ctx.flush_block(CoreTerminator::Jump(loop_start));
+            ctx.flush_block_at(CoreTerminator::Jump(loop_start));
+
+            // 出口块 = 循环之后的当前块
+            let end_id = ctx.next_block_id;
+            ctx.patch_branch(cond_idx, end_id, body_id);
 
             // v0.103: 循环作为表达式的结果 = Nil，写节点自带 dst（emit.rs
             // emit_loop_w / fcfg_lower 的同一契约）。

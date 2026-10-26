@@ -290,6 +290,47 @@ fn closure_captures_are_computed() {
     );
 }
 
+/// 判据 ⑪（D489）：TEA `update` / `app` 在 Core 产物里**看得见**。
+///
+/// D489 之前这两类是**无操作** ⇒ TEA 程序在 Core 侧根本跑不了。
+#[test]
+fn tea_definitions_are_visible() {
+    let core = core_of(
+        "model Counter\n  count: number = 0\nend\nmsg CounterMsg\n  Increment\nend\n\
+         update(msg, model)\n  model\nend\n\
+         app CounterApp\n  model: Counter\n  msg: CounterMsg\n  init: {count: 0}\n  \
+         update: update\n  view: fn(m) => m\nend\n",
+    );
+    let updates: Vec<String> = core
+        .blocks
+        .iter()
+        .flat_map(|b| b.insts.iter())
+        .filter_map(|i| match i {
+            CoreInst::UpdateDef { name, .. } => Some(name.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        updates,
+        vec!["update".to_string()],
+        "update 定义应进 Core 产物"
+    );
+    let apps: Vec<String> = core
+        .blocks
+        .iter()
+        .flat_map(|b| b.insts.iter())
+        .filter_map(|i| match i {
+            CoreInst::AppDef { name, .. } => Some(name.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        apps,
+        vec!["CounterApp".to_string()],
+        "app 定义应进 Core 产物"
+    );
+}
+
 /// 判据 ⑩（D488）：声明型构造在 Core 产物里**看得见**（且载荷带对）。
 ///
 /// D488 之前这 5 类是**无操作**（「编译期注册，Core 层无操作」）⇒ 声明在 Core

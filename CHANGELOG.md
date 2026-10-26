@@ -19,6 +19,42 @@ All notable changes to Mora will be documented in this file.
 - **`Int` 语义**：算术与比较统一为**精确 i64**（overflow 报 `MoraError`）。
   2^53 之外的 `Int` 运算结果会变（此前静默丢最低位），`Int ⊗ Float` 超界改报错。
 
+### D489：TEA 的 `update` / `app` 接上 —— Core 能端到端跑完整 TEA 程序
+
+D488 留下的 4 类里，TEA 的 `update` / `app` **挡路的东西比想象的小**。
+
+#### 关键发现：`TeaApp` 的三个函数字段是**普通 `Value`**
+
+`TeaApp { model, msg_queue, cmd_queue, init: Value, update: Value, view: Value }` ——
+不是 MIR 专属类型 ⇒ Core 侧传 `Value::CoreClosure` 也能被 TEA 运行时正常调用
+（`interp.call_value` → `call_value_impl` → D484 的 Core 闭包委派）⇒
+**无需**给 `Value::TeaApp` 加 Core 形态的变体。
+
+⇒ `update` 定义绑 `Value::CoreClosure`；`app` 定义的三个体各造一个 Core 闭包。
+
+#### 唯一机制：app 的**装配**共用一份
+
+app 的装配（造 app → 跑 init → 注册 app 与三个闭包）抽成
+`build_and_register_tea_app` ⇒ MIR 侧的 `h_app_def` 与 Core 执行器**共用** ⇒
+两个执行器装配出的 app **逐字相同**。
+
+（Core 侧造闭包也统一走 `make_core_closure` —— 与 `ClosureCreate` 同一份 ⇒
+三处造出的闭包形状一致。）
+
+#### 守卫
+
+- `tests/core_exec_differential.rs::tea_update_and_app_execute_identically`
+  （**新建**）—— spec §9.6 的**完整 TEA 链路**（声明 model / msg / update /
+  app ⇒ `tea.dispatch` ×3 ⇒ `tea.run` ⇒ `tea.model`）MIR 与 Core 结果一致；
+- `tests/core_fidelity.rs::tea_definitions_are_visible`（**新建**）—— `update` /
+  `app` 定义在 Core 产物里**看得见**。
+
+#### 仍不支持
+
+`trait` / `impl`（运行期写的是**宿主注册表**，其类型是 MIR 类型 ⇒ 要动
+`MirHost`）、`import`（要**编译并执行另一个模块**）、`macro def`（体是函数 ⇒
+需 Core 形态的宏值）⇒ 独立的一批（D490+）。
+
 ### D488：Core 层补**声明型**构造（类型别名 / 枚举 / 结构体 / TEA model / TEA msg）
 
 Core 层此前把这 5 类声明当「编译期注册，**无操作**」⇒ 声明**在 Core 产物里完全

@@ -164,7 +164,6 @@ pub struct AppDefArgs<'a> {
 }
 
 pub fn h_app_def(args: AppDefArgs) {
-    use crate::tea::TeaApp;
     let AppDefArgs {
         interp,
         env,
@@ -210,24 +209,50 @@ pub fn h_app_def(args: AppDefArgs) {
         env: crate::value::EnvRef(Box::new(env.clone())),
         mir_body: std::sync::Arc::new(view_mir.clone()),
     };
-    let app = TeaApp::new(
-        init_closure.clone(),
-        update_closure.clone(),
-        view_closure.clone(),
-    );
     // v0.84 Phase 4: 自动执行 init closure 获取初始 model（v0.94: 纯转换返回新 app）
-    let app = app.initialized(interp);
     // 注册到 env：app + 三个独立闭包（供 builtin tea.* 通过 name 调用）
+    //
+    // v0.104.6 D489：装配逻辑抽成 [`build_and_register_tea_app`] ⇒ MIR 侧与
+    // Core 执行器**共用同一份** ⇒ 两个执行器装配出的 app **逐字相同**。
+    build_and_register_tea_app(
+        interp,
+        env,
+        name,
+        init_closure,
+        update_closure,
+        view_closure,
+    );
+    // 引用 model_name/msg_name（供 typeck 后续扩展检查 Model/Msg 字段匹配）
+    let _ = (model_name, msg_name);
+}
+
+/// TEA app 的**装配**（纯值层面）—— 把三个闭包装成 app、跑 init、注册到环境。
+///
+/// v0.104.6 D489：MIR 侧的 `h_app_def` 与 **Core 执行器**共用这一份 ⇒ 两个
+/// 执行器装配出的 app **逐字相同**。
+///
+/// 三个函数字段是普通 [`Value`]（不是 MIR 专属类型）⇒ Core 侧传
+/// `Value::CoreClosure` 也能被 TEA 运行时正常调用 ⇒ **无需**给
+/// `Value::TeaApp` 加 Core 形态的变体。
+pub fn build_and_register_tea_app(
+    interp: &mut dyn crate::mir::host::MirHost,
+    env: &mut Environment,
+    name: &str,
+    init: Value,
+    update: Value,
+    view: Value,
+) {
+    let app = crate::tea::TeaApp::new(init.clone(), update.clone(), view.clone());
+    // v0.84 Phase 4：自动执行 init closure 获取初始 model（v0.94: 纯转换返回新 app）
+    let app = app.initialized(interp);
     env.define(
         name.to_string(),
         Value::TeaApp(std::sync::Arc::new(app)),
         false,
     );
-    env.define(format!("{}.init", name), init_closure, false);
-    env.define(format!("{}.update", name), update_closure, false);
-    env.define(format!("{}.view", name), view_closure, false);
-    // 引用 model_name/msg_name（供 typeck 后续扩展检查 Model/Msg 字段匹配）
-    let _ = (model_name, msg_name);
+    env.define(format!("{}.init", name), init, false);
+    env.define(format!("{}.update", name), update, false);
+    env.define(format!("{}.view", name), view, false);
 }
 
 /// v0.103: `export <声明>` —— 把名字写入环境导出集（spec §10.2）。

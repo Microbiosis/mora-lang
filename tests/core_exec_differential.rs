@@ -325,6 +325,30 @@ fn declarations_execute_identically() {
     assert_same("type 别名", "type Alias = number\n1\n");
 }
 
+/// **D489**：TEA `update` / `app` —— Core 执行器与 MIR 执行器行为一致。
+///
+/// TEA 的三个函数字段（init / update / view）是普通 `Value` ⇒ Core 侧传
+/// `Value::CoreClosure` 也能被 TEA 运行时正常调用 ⇒ **无需**给
+/// `Value::TeaApp` 加 Core 形态的变体。
+///
+/// 用例是 spec §9.6 的完整 TEA 链路（声明 model / msg / update / app ⇒
+/// `tea.dispatch` ×3 ⇒ `tea.run` ⇒ `tea.model`）⇒ 端到端可观测。
+#[test]
+fn tea_update_and_app_execute_identically() {
+    assert_same(
+        "TEA 全链路",
+        "model Counter\n  count: number = 0\nend\nmsg CounterMsg\n  Increment\n  Decrement\nend\n\
+         update(msg, model)\n  match msg {\n    Increment => {count: model.count + 1i}\n    \
+         Decrement => {count: model.count - 1i}\n  }\nend\n\
+         app CounterApp\n  model: Counter\n  msg: CounterMsg\n  init: {count: 0}\n  \
+         update: update\n  view: fn(m) => m\nend\n\
+         let a = tea.dispatch(CounterApp, {tag: \"Increment\"})\n\
+         let a = tea.dispatch(a, {tag: \"Increment\"})\n\
+         let a = tea.dispatch(a, {tag: \"Decrement\"})\n\
+         let b = tea.run(a, 5)\ntea.model(b)\n",
+    );
+}
+
 /// 错误路径：两个执行器都应报错（不静默成功）。
 #[test]
 fn both_executors_report_the_same_error_paths() {

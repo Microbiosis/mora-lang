@@ -80,8 +80,19 @@ Token → FCFG → EHIR → Core → MIR
 >
 > ⚠ **仍不支持**（要 Core **形态**的对应物 ⇒ 独立的一批）：
 > `trait` / `impl`（运行期写的是**宿主注册表**，其类型是 MIR 类型）、`import`
-> （要**编译并执行另一个模块**）、`macro def`（体是函数）、TEA `update` / `app`
-> （体是函数 / `Value::TeaApp` 装 MIR 函数）。
+> （要**编译并执行另一个模块**）、`macro def`（体是函数）。
+>
+> #### TEA 的 `update` / `app`（D489）
+>
+> 这两个此前也接不上 —— 但**挡路的东西比想象的小**：`TeaApp` 的三个函数字段
+> （init / update / view）是**普通 `Value`**，不是 MIR 专属类型 ⇒ Core 侧传
+> `Value::CoreClosure` 也能被 TEA 运行时正常调用 ⇒ **无需**给 `Value::TeaApp`
+> 加 Core 形态的变体。
+>
+> app 的**装配**抽成 `build_and_register_tea_app` ⇒ MIR 侧与 Core 执行器
+> **共用同一份** ⇒ 两个执行器装配出的 app **逐字相同**。现在 Core 能端到端跑
+> 完整的 TEA 程序（声明 model / msg / update / app ⇒ `tea.dispatch` ⇒ `tea.run`
+> ⇒ `tea.model`）。
 >
 > 另注：这些声明的**名字不进词法环境**（typeck 报未绑定）⇒ 它们的运行期效果
 > 对用户代码**不可观测** ⇒ 守卫只能核**产物形状**；可观测的那一个（`model` 的
@@ -464,8 +475,8 @@ D472 之后登记项由 4 条减为 1 条（`orchestrate`），D473 之后减为
 | short_circuit_evaluation | 3 | `or`/`and` 的**求值级短路**（行为 × 优化档 + 两路径形状，D477 新建） |
 | execute_naming_hygiene | 3 | 执行入口命名一致性（旧名不得复活，D478 新建） |
 | core_cfg_wellformed | 5 | Core 层 CFG **结构良构性** + 模型限制登记（D479/D480 新建，D483 补 match 守卫体递归） |
-| core_fidelity | 10 | Core 层**保真度**（产物里该看见的东西不能丢，D481 新建；D483 反转为「有损清单已清空」；D485 加区域载荷；D486 加 section/solve/关系载荷；D488 加声明型构造） |
-| core_exec_differential | 8 | Core 执行器 vs MIR 执行器**语义对拍**（D482 新建；D483 加断言/聚合/模板/事务；D484 加闭包；D485 加区域/效果/编排；D486 加 section/关系搜索；D488 加声明型构造） |
+| core_fidelity | 11 | Core 层**保真度**（产物里该看见的东西不能丢，D481 新建；D483 反转为「有损清单已清空」；D485 加区域载荷；D486 加 section/solve/关系载荷；D488 加声明型构造；D489 加 TEA 定义） |
+| core_exec_differential | 9 | Core 执行器 vs MIR 执行器**语义对拍**（D482 新建；D483 加断言/聚合/模板/事务；D484 加闭包；D485 加区域/效果/编排；D486 加 section/关系搜索；D488 加声明型构造；D489 加 TEA 全链路） |
 | core_no_dead_variants | 2 | Core 模型**零死变体**（每个变体都有生产者；执行器无「不支持」分支）（D487 新建） |
 | core_value_repr | 3 | Core 层**自己的值表示**（`Value::CoreClosure`）：可区分 / 形态正确 / 调用唯一机制（D484 新建） |
 

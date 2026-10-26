@@ -754,6 +754,41 @@ fn lower_node(ctx: &mut CoreContext, node: &Ehir) {
                 variants: vars,
             });
         }
+        Node::UpdateDef {
+            name, params, body, ..
+        } => {
+            // v0.104.6 D489：TEA update 进 Core 产物了 —— body 是 **Core IR**
+            // ⇒ 运行期绑 `Value::CoreClosure`。
+            let param_names: Vec<String> = params.iter().map(|p| p.name.clone()).collect();
+            let core_body = lower_body_to_core(ctx, body);
+            ctx.emit(CoreInst::UpdateDef {
+                name: name.clone(),
+                params: param_names,
+                body: core_body,
+            });
+        }
+        Node::AppDef {
+            name,
+            init,
+            update_params,
+            update,
+            view_params,
+            view,
+            ..
+        } => {
+            // v0.104.6 D489：TEA app 进 Core 产物了 —— 三个体都是 Core IR。
+            let core_init = lower_body_to_core(ctx, init);
+            let core_update = lower_body_to_core(ctx, update);
+            let core_view = lower_body_to_core(ctx, view);
+            ctx.emit(CoreInst::AppDef {
+                name: name.clone(),
+                update_params: update_params.iter().map(|p| p.name.clone()).collect(),
+                view_params: view_params.iter().map(|p| p.name.clone()).collect(),
+                init: core_init,
+                update: core_update,
+                view: core_view,
+            });
+        }
         Node::TraitDef { .. }
         | Node::ImplDef { .. }
         | Node::Import { .. }
@@ -768,13 +803,9 @@ fn lower_node(ctx: &mut CoreContext, node: &Ehir) {
         }
 
         // ── TEA → Core 原语（部分）──
-        Node::UpdateDef { .. } | Node::AppDef { .. } => {
-            // TEA 定义在 EHIR 阶段已注册到 env，Core 层无操作
-            //
-            // ⚠ v0.104.6 D488：`update` / `app` 的体是**函数**（`Value::Closure`
-            // / `Value::TeaApp` 装 `Arc<MirFunction>`）⇒ 要接上得先有 **Core
-            // 形态**的对应值 ⇒ 独立的一批（D489+）。
-        }
+        // ⚠ v0.104.6 D489：`update` / `app` 已接上（见上）；`macro def` 的体是
+        // **函数**（`Value::Macro` 装 `Arc<MirFunction>`）⇒ 要接上得先有 **Core
+        // 形态**的宏值 ⇒ 独立的一批（D490+）。
 
         // ── v0.104.6 D481：区域构造 → `CoreInst::Scope` ──
         //

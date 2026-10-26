@@ -237,11 +237,7 @@ fn exec_inst(
             //
             // ⚠ `captures` 字段（过近似的捕获名清单）**不参与**运行期 ——
             // 与 MIR 层同款（`h_closure` 也是捕获整个环境）。
-            let closure = Value::CoreClosure {
-                params: params.clone(),
-                env: crate::value::EnvRef(Box::new(env.clone())),
-                core_body: std::sync::Arc::new(body.clone()),
-            };
+            let closure = make_core_closure(params.clone(), env, body.clone());
             regs[*dst] = closure.clone();
             Ok(Some(closure))
         }
@@ -599,6 +595,53 @@ fn exec_inst(
             crate::mir::handlers::h_rel_def(env, name, clauses);
             Ok(None)
         }
+        // ── v0.104.6 D489：TEA update / app ──
+        //
+        // body 是 **Core IR** ⇒ 绑的是 `Value::CoreClosure`（**不是**
+        // `Value::Closure` —— 那个装的是 `Arc<MirFunction>`）。
+        //
+        // app 的装配**复用** MIR 侧同一份 `build_and_register_tea_app`
+        // （`TeaApp` 的三个函数字段是普通 `Value` ⇒ TEA 运行时照常调用 Core
+        // 闭包 ⇒ **无需**给 `Value::TeaApp` 加 Core 形态的变体）。
+        CoreInst::UpdateDef { name, params, body } => {
+            let closure = make_core_closure(params.clone(), env, body.clone());
+            env.define(name.clone(), closure, false);
+            Ok(None)
+        }
+        CoreInst::AppDef {
+            name,
+            update_params,
+            view_params,
+            init,
+            update,
+            view,
+            ..
+        } => {
+            // update / view 的形参名：与 MIR 侧 `h_app_def` 同款 —— 取声明的
+            // 形参，空则用 TEA 契约的默认名（`["model","msg"]` / `["model"]`）。
+            let update_params = if update_params.is_empty() {
+                vec!["model".to_string(), "msg".to_string()]
+            } else {
+                update_params.clone()
+            };
+            let view_params = if view_params.is_empty() {
+                vec!["model".to_string()]
+            } else {
+                view_params.clone()
+            };
+            let init_closure = make_core_closure(Vec::new(), env, init.clone());
+            let update_closure = make_core_closure(update_params, env, update.clone());
+            let view_closure = make_core_closure(view_params, env, view.clone());
+            crate::mir::handlers::build_and_register_tea_app(
+                interp,
+                env,
+                name,
+                init_closure,
+                update_closure,
+                view_closure,
+            );
+            Ok(None)
+        }
         // ── v0.104.6 D488：声明型 → 在环境里注册绑定 ──
         //
         // 与 MIR 侧**同一份** handler（`h_type_alias` / `h_enum_def` /
@@ -668,6 +711,18 @@ impl crate::runtime::effect::EffectHandler for CoreHandlerClosure {
         // 2. 跑 handler 体（Core IR）—— 与 MIR 侧 `HandlerClosure::perform_box`
         //    跑 `handler_mir` 同款，只是执行器不同。
         execute(&self.handler_core, &mut self.env, host, effects)
+    }
+}
+
+/// 造一个 **Core 闭包**值（`Value::CoreClosure`）—— **唯一机制**。
+///
+/// v0.104.6 D489：`ClosureCreate` 与 TEA `UpdateDef` / `AppDef` 都用它 ⇒ 三处
+/// 造出的闭包**形状一致**（形参 / 捕获的整个环境 / Core 体）。
+fn make_core_closure(params: Vec<String>, env: &Environment, body: CoreFunction) -> Value {
+    Value::CoreClosure {
+        params,
+        env: crate::value::EnvRef(Box::new(env.clone())),
+        core_body: std::sync::Arc::new(body),
     }
 }
 

@@ -245,6 +245,31 @@ pub enum CoreInst {
         name: String,
         variants: Vec<crate::common::MsgVariant>,
     },
+    /// TEA update 定义 —— 镜像 `MirInst::UpdateDef`。
+    ///
+    /// v0.104.6 D489：body 是 **Core IR** ⇒ 运行期绑的是 `Value::CoreClosure`
+    /// （**不是** `Value::Closure` —— 那个装的是 `Arc<MirFunction>`）。
+    UpdateDef {
+        name: String,
+        params: Vec<String>,
+        body: CoreFunction,
+    },
+    /// TEA app 定义 —— 镜像 `MirInst::AppDef`。
+    ///
+    /// init / update / view 三个体都是 **Core IR** ⇒ 运行期是三个
+    /// `Value::CoreClosure`（`TeaApp` 的三个函数字段是普通 `Value` ⇒ TEA 运行时
+    /// 照常调用 ⇒ 无需给 `Value::TeaApp` 加 Core 形态的变体）。
+    AppDef {
+        name: String,
+        /// update 的形参名（**Core 的嵌套代码区不存形参表** ⇒ 必须带过来；
+        /// 与 FCFG 的 `Node::AppDef.update_params` 同款）。
+        update_params: Vec<String>,
+        /// view 的形参名（同上）。
+        view_params: Vec<String>,
+        init: CoreFunction,
+        update: CoreFunction,
+        view: CoreFunction,
+    },
 
     // ── 效果降维 ──
     /// 执行代数效果。

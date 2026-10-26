@@ -18,14 +18,10 @@
 //! `with_config` / `span` / `observe`）/ **代数效果**（D485：`EffectInstall` /
 //! `EffectPerform` / `EffectRestore`）/ **编排执行**（D485）。
 //!
-//! **不支持**（遇到就**响亮报错**，绝不静默降级）：
-//!
-//! - **section 构建 / 关系搜索**（`prompt_section` / `document_section` /
-//!   `solve` 区域）—— 它们要**构建一个值**（`Value::PromptSection` 等）或
-//!   **跑关系搜索**（解列表）⇒ 语义在 MIR 执行层（`h_prompt_section` /
-//!   `h_document_section` / `h_solve`），那些 handler 收的是 `MirFunction` 体，
-//!   **装不下 Core 体** ⇒ 宁可报错，也不顺序执行冒充；
-//! - **ADT 构造 / thunk** —— Core 层当前不产出这些指令。
+//! **不支持**：**没有** —— D487 删掉了 9 个**零生产者的死变体**（ADT 构造 /
+//! 字段访问 / thunk / phi / `Var` / 指令形态的 `Return`·`Unreachable`）⇒
+//! 本执行器覆盖 Core 模型的**每一个**变体（编译器保证 match 穷尽且无报错
+//! 分支；守卫 `tests/core_no_dead_variants.rs` 保证没有「有指令但没人发」）。
 //!
 //! > **task 不在不支持清单里**（D485 更正）：MIR 侧有 `MirInst::TaskDef`，但
 //! > FCFG 的 `Node::FnDef` **同时**覆盖 `fn` 与 `task` 声明 ⇒ Core 层把 task
@@ -157,10 +153,6 @@ fn exec_inst(
     match inst {
         CoreInst::Const(dst, v) => {
             h_const(regs, *dst, v);
-            Ok(Some(regs[*dst].clone()))
-        }
-        CoreInst::Var(dst, name) => {
-            h_var(regs, *dst, name, env);
             Ok(Some(regs[*dst].clone()))
         }
         CoreInst::EnvLoad(dst, name) => {
@@ -345,9 +337,10 @@ fn exec_inst(
             }
             Ok(Some(regs[*dst].clone()))
         }
-        // 分支 / 跳转 / 返回的**指令形态**：控制流由**终结指令**决定，
-        // 指令形态只是冗余副本（MIR 引擎里 `Flow::Jump(_)` 同样是 no-op）⇒ 忽略。
-        CoreInst::Branch { .. } | CoreInst::Jump(_) | CoreInst::Return(_) => Ok(None),
+        // 分支 / 跳转的**指令形态**：控制流由**终结指令**决定，指令形态只是
+        // 冗余副本（MIR 引擎里 `Flow::Jump(_)` 同样是 no-op）⇒ 忽略。
+        // （`Return` 的指令形态此前也在此列 ⇒ D487 随死变体一并删除。）
+        CoreInst::Branch { .. } | CoreInst::Jump(_) => Ok(None),
         // ── v1 不支持的部分：响亮报错，不静默降级 ──
         // ── v0.104.6 D485：区域构造 ──
         //
@@ -605,20 +598,16 @@ fn exec_inst(
         CoreInst::RelDef { name, clauses } => {
             crate::mir::handlers::h_rel_def(env, name, clauses);
             Ok(None)
-        }
-        // ── v1 不支持的部分：响亮报错，不静默降级 ──
-        CoreInst::ThunkCreate { .. } | CoreInst::ThunkForce(_, _) => {
-            Err("Core 执行器（v1）**不支持 thunk**。".to_string())
-        }
-        CoreInst::EnumConstruct { .. }
-        | CoreInst::StructConstruct { .. }
-        | CoreInst::StructAccess(_, _, _) => {
-            Err("Core 执行器（v1）**不支持 ADT 构造 / 字段访问**。".to_string())
-        }
-        CoreInst::Phi(_, _) => Err(
-            "Core 执行器（v1）**不支持 phi 节点**（Core 层由 SSA 前的分支汇合承担）。".to_string(),
-        ),
-        CoreInst::Unreachable => Err("Core: 不可达指令".to_string()),
+        } // ── v0.104.6 D487：**没有「不支持」的分支了** ──
+          //
+          // 此前这里有 4 组报错分支（thunk / ADT 构造 / 字段访问 / phi）⇒
+          // 「Core 执行器支持 Core 模型的**每一个**变体」这句话**不成立**。
+          //
+          // D487 查明：那些变体**全是零生产者的死变体**（语言层没有对应语法、
+          // MIR 侧也没有对应指令）⇒ 已从模型里**删除** ⇒ 现在这个 match
+          // **穷尽且无报错** ⇒ **编译器**保证「执行器覆盖模型的每个变体」。
+          //
+          // 守卫：`tests/core_no_dead_variants.rs`（零死变体普查）。
     }
 }
 

@@ -1,7 +1,7 @@
 //! v0.89: Core IR — 9 层架构第 3 层（函数式降维）。
 //!
-//! CoreInst 是 38 种 SSA 可处理的基元指令。高层抽象（闭包、ADT、
-//! Thunk、效果处理、TEA）在这一层被降维为基元操作。
+//! CoreInst 是 30 种 SSA 可处理的基元指令。高层抽象（闭包、效果处理、TEA）
+//! 在这一层被降维为基元操作。
 //!
 //! 设计目标：
 //! - SSA 覆盖率 100%（无 passthrough，CoreInst 的所有变体都可优化）
@@ -11,7 +11,7 @@
 //!
 //! ## CoreInst vs MirInst 覆盖范围
 //!
-//! MirInst 有 59 个变体，CoreInst 有 38 个。**大部分** MirInst 变体没有
+//! MirInst 有 59 个变体，CoreInst 有 30 个。**大部分** MirInst 变体没有
 //! CoreInst 直接等价物 —— 这是设计如此，不是缺口：
 //!
 //! | 类别 | MirInst 变体 | Core 处理方式 |
@@ -44,6 +44,18 @@
 //! `Value::Closure`（那装的是 `Arc<MirFunction>`）⇒ 语言值新增
 //! `Value::CoreClosure { params, env, core_body }`（形状同款）。
 //! **其余值一律复用 `Value`** ⇒ 不重复实现环境语义，也不引入转换层。
+//!
+//! ### D487：删掉 **9 个零生产者的死变体**
+//!
+//! 此前模型里有 `Var` / `Return` / `Unreachable` / `Phi` / `EnumConstruct` /
+//! `StructConstruct` / `StructAccess` / `ThunkCreate` / `ThunkForce` ——
+//! **降维从不产生**它们，MIR 侧也**没有对应指令**（语言层根本没有这些构造，
+//! `Thunk` 更是连 MIR 指令都没有）⇒ 是**虚构**的 IR。
+//!
+//! 删掉后：① 模型不再摆着没人会发的指令；② 执行器**不再需要**「不支持」
+//! 分支 ⇒ 「执行器覆盖模型的**每一个**变体」**成立**（编译器保证 match 穷尽）。
+//!
+//! 钉子：`tests/core_no_dead_variants.rs`（零死变体普查）。
 
 use crate::common::BinaryOp;
 use crate::mir::effect::EffectRow;
@@ -113,22 +125,20 @@ pub fn literal_to_value(lit: &crate::common::Literal) -> Value {
 // CoreInst — 函数式基元指令集
 // ===================================================================
 
-/// Core 基元指令 — ~20 种，全部 SSA 可处理。
+/// Core 基元指令 — 30 种，全部 SSA 可处理。
 ///
-/// 与 MirInst（50 变体，含 35+ passthrough）的关键区别：
+/// 与 MirInst（59 变体）的关键区别：
 /// - 闭包 → ClosureCreate + ClosureCall（非 TaskDef + Call-by-name）
-/// - ADT → EnumConstruct + EnumMatch + StructConstruct + StructAccess
 /// - 效果 → EffectPerform + EffectInstall + EffectRestore
-/// - Thunk → ThunkCreate + ThunkForce
 /// - 无声明变体（TraitDef/EnumDef/StructDef 等编译期消失）
 /// - 无 I/O 变体（Save/Load/ReadFile 等由 RIR 处理）
+/// - 无死变体（v0.104.6 D487：每个变体都有生产者 ⇒ 守卫
+///   `tests/core_no_dead_variants.rs`）
 #[derive(Debug, Clone)]
 pub enum CoreInst {
-    // ── 值（8 种）──
+    // ── 值（7 种）──
     /// 常量加载。
     Const(Reg, Value),
-    /// 变量读取（从环境加载）。
-    Var(Reg, String),
     /// 寄存器拷贝。
     Copy(Reg, Reg),
     /// 二元运算。
@@ -189,13 +199,6 @@ pub enum CoreInst {
     Prompt(Reg, Vec<Reg>),
 
     // ── ADT 降维 ──
-    /// 枚举构造。
-    EnumConstruct {
-        dst: Reg,
-        enum_name: String,
-        variant: String,
-        fields: Vec<Reg>,
-    },
     /// 枚举匹配。
     ///
     /// v0.104.6 D482：补 `dst` —— 匹配**有值**（命中的那条臂的返回值），
@@ -206,14 +209,6 @@ pub enum CoreInst {
         scrutinee: Reg,
         arms: Vec<EnumMatchArm>,
     },
-    /// 结构体构造。
-    StructConstruct {
-        dst: Reg,
-        name: String,
-        fields: Vec<(String, Reg)>,
-    },
-    /// 结构体字段访问。
-    StructAccess(Reg, Reg, String),
 
     // ── 效果降维 ──
     /// 执行代数效果。
@@ -226,16 +221,6 @@ pub enum CoreInst {
     EffectInstall { label: EffectLabel, handler: Reg },
     /// 恢复效果处理器。
     EffectRestore { label: EffectLabel },
-
-    // ── Thunk 降维 ──
-    /// 创建惰性求值 thunk。
-    ///
-    /// v0.104.6 D481：`body` 由**单个** `CoreBlock` 改为**完整子函数** ——
-    /// 与 `ClosureCreate.body`（D480）同款截断：thunk 体里的嵌套分支此前
-    /// 同样装不下（分支目标指向**并不存在**的块）。
-    ThunkCreate { dst: Reg, body: CoreFunction },
-    /// 强制求值 thunk。
-    ThunkForce(Reg, Reg),
 
     /// 关系定义 —— 镜像 `MirInst::RelDef`。
     ///
@@ -275,7 +260,7 @@ pub enum CoreInst {
         payload: ScopePayload,
     },
 
-    // ── 控制流（5 种）──
+    // ── 控制流（2 种）──
     /// 条件分支。
     Branch {
         cond: Reg,
@@ -284,12 +269,13 @@ pub enum CoreInst {
     },
     /// 无条件跳转。
     Jump(BlockId),
-    /// 函数返回。
-    Return(Option<Reg>),
-    /// SSA phi 节点（CMIR 层插入，Core 层保留占位）。
-    Phi(Reg, Vec<(BlockId, Reg)>),
-    /// 不可达标记。
-    Unreachable,
+    // ⚠ v0.104.6 D487：此前这里还有 `Return` / `Unreachable` 两个**指令**形态的
+    // 变体 ⇒ 与**终结指令** `CoreTerminator::Return` / `CoreTerminator::Unreachable`
+    // **重复**，且**零生产者**（降维只发终结指令）⇒ 死变体，已删。
+    // 同批删掉的还有 `Var`（与 `EnvLoad` 重复）、`Phi`（无人插入）、
+    // `EnumConstruct` / `StructConstruct` / `StructAccess`（语言层没有
+    // 构造语法，MIR 侧也无对应指令）、`ThunkCreate` / `ThunkForce`
+    // （MIR 侧根本没有 thunk 指令）⇒ Core 模型不再有**虚构**的指令。
 
     // ── 副作用（保留，但已降维）──
     /// 表达式语句（丢弃结果）。

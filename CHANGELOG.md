@@ -19,6 +19,44 @@ All notable changes to Mora will be documented in this file.
 - **`Int` 语义**：算术与比较统一为**精确 i64**（overflow 报 `MoraError`）。
   2^53 之外的 `Int` 运算结果会变（此前静默丢最低位），`Int ⊗ Float` 超界改报错。
 
+### D487：删掉 Core 模型的 **9 个零生产者死变体** —— 「不支持」清单清空
+
+D486 之后 Core 执行器只剩「ADT 构造 / thunk」两类不支持。D487 查明：这两类
+**接不上，也不该接** —— 它们**根本不存在**。
+
+#### 9 个死变体
+
+| 变体 | 为什么是死的 |
+|---|---|
+| `Var` | 与 `EnvLoad` **重复**（降维发的是 `EnvLoad`） |
+| `Return` / `Unreachable` | 与**终结指令** `CoreTerminator::Return` / `CoreTerminator::Unreachable` 重复 |
+| `Phi` | 无人插入 |
+| `EnumConstruct` / `StructConstruct` / `StructAccess` | 语言层**没有**构造语法，MIR 侧也**无对应指令** |
+| `ThunkCreate` / `ThunkForce` | MIR 侧**根本没有** thunk 指令 |
+
+⇒ 全仓每个都**只有 1 处引用**（执行器里那个「不支持」分支）⇒ **零生产者**。
+
+⇒ **删掉**（不是「接上」）：接上要先在 witness / FCFG 层**补语言表示**（那是
+新特性，不是清理）；删掉让模型**说真话** —— 模型文档里那句「ADT →
+EnumConstruct + EnumMatch + StructConstruct + StructAccess」「Thunk →
+ThunkCreate + ThunkForce」**是假的**（MIR 侧没有对应物）。
+
+#### 连带效果：执行器的「不支持」清单**清空**
+
+删掉死变体 ⇒ 执行器不再需要为它们留报错分支 ⇒ 「Core 执行器覆盖 Core 模型的
+**每一个**变体」**成立**（编译器保证 match 穷尽且无报错分支）。
+
+#### 零死变体守卫（`tests/core_no_dead_variants.rs`，**新建**，2 条）
+
+- 每个 `CoreInst` 变体都**有生产者**（降维 `src/mir/ehir_to_core.rs` 是 Core 层
+  的**唯一**生产点）⇒ 没有「有指令但没人发」；
+- 执行器**没有**「不支持」的分支 ⇒ 没有「发了但执行不了」。
+
+⇒ 与编译器**互补**：编译器管「执行器覆盖每个变体」，守卫管「每个变体都有人发」
+⇒ 模型与执行器**互不落空**。
+
+（反向验证：把 `ThunkCreate` 加回模型 + 执行器分支 ⇒ 守卫报红 ✓）
+
 ### D486：Core 执行器接上 **section 构建 / 关系搜索**（并修好 D484 的一处解析分叉）
 
 D485 之后 Core 执行器只剩三类不支持。**其中两类的「不支持」理由此前是错的**

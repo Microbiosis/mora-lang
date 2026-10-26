@@ -56,8 +56,26 @@ Token → FCFG → EHIR → Core → MIR
 > `export` / `with_config` / `span` / `observe`）/ **代数效果**（D485）/
 > **编排执行**（D485）。
 >
-> **不支持**（执行器**响亮报错**，不静默降级）：**ADT 构造 / thunk** —— Core 层
-> 当前不产出这些指令。
+> **不支持**：**没有** —— D487 删掉了 Core 模型里 **9 个零生产者的死变体**
+> （`EnumConstruct` / `StructConstruct` / `StructAccess` / `ThunkCreate` /
+> `ThunkForce` / `Phi` / `Var` / 指令形态的 `Return`·`Unreachable`）⇒ 执行器
+> 覆盖 Core 模型的**每一个**变体。
+>
+> > **为什么是「删掉」而不是「接上」**：那 9 个变体**降维从不产生**，MIR 侧也
+> > **没有对应指令** —— 语言层根本没有 ADT 构造语法，MIR 层连 thunk 指令都
+> > 没有 ⇒ 它们是**虚构**的 IR（模型文档里那句「ADT → EnumConstruct + … 」
+> > 「Thunk → ThunkCreate + ThunkForce」**是假的**）。接上它们要先在
+> > witness / FCFG 层**补语言表示**（那是新特性，不是清理）；删掉它们让模型
+> > 说真话。
+>
+> #### 零死变体（D487）
+>
+> 两道互补的钉子：
+> - **编译器**：执行器的 match **穷尽且无报错分支** ⇒ 执行器覆盖每个变体；
+> - `tests/core_no_dead_variants.rs`：模型的每个变体都**有生产者** ⇒ 没有
+>   「有指令但没人发」。
+>
+> ⇒ 模型与执行器**互不落空**。
 >
 > > **task 不在不支持清单里**（D485 更正）：MIR 侧有 `MirInst::TaskDef`，但
 > > FCFG 的 `Node::FnDef` **同时**覆盖 `fn` 与 `task` 声明 ⇒ Core 层把 task
@@ -430,6 +448,7 @@ D472 之后登记项由 4 条减为 1 条（`orchestrate`），D473 之后减为
 | core_cfg_wellformed | 5 | Core 层 CFG **结构良构性** + 模型限制登记（D479/D480 新建，D483 补 match 守卫体递归） |
 | core_fidelity | 9 | Core 层**保真度**（产物里该看见的东西不能丢，D481 新建；D483 反转为「有损清单已清空」；D485 加区域载荷；D486 加 section/solve/关系载荷） |
 | core_exec_differential | 7 | Core 执行器 vs MIR 执行器**语义对拍**（D482 新建；D483 加断言/聚合/模板/事务；D484 加闭包；D485 加区域/效果/编排；D486 加 section/关系搜索） |
+| core_no_dead_variants | 2 | Core 模型**零死变体**（每个变体都有生产者；执行器无「不支持」分支）（D487 新建） |
 | core_value_repr | 3 | Core 层**自己的值表示**（`Value::CoreClosure`）：可区分 / 形态正确 / 调用唯一机制（D484 新建） |
 
 ## 已知遗留（技术债）

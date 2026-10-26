@@ -79,6 +79,9 @@ impl std::fmt::Display for Value {
             // v0.104.6 D484：Core 层闭包（与 MIR 闭包刻意区分 —— 函数体是
             // Core IR，只能由 Core 执行器调用）。
             Value::CoreClosure { .. } => write!(f, "<coreclosure>"),
+            // v0.104.6 D490：Core 层宏（与 MIR 宏刻意区分 —— 体是 Core IR，
+            // 只能由 Core 执行器展开）。
+            Value::CoreMacro { .. } => write!(f, "<coremacro>"),
             Value::Builtin(name) => write!(f, "<builtin {}>", name),
             Value::Conversation {
                 model, messages, ..

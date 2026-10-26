@@ -438,6 +438,8 @@ pub fn value_to_json(value: &Value) -> String {
         Value::Closure { .. } => "\"<closure>\"".to_string(),
         // v0.104.6 D484：Core 层闭包（与 MIR 闭包刻意区分）。
         Value::CoreClosure { .. } => "\"<coreclosure>\"".to_string(),
+        // v0.104.6 D490：Core 层宏（与 MIR 宏刻意区分）。
+        Value::CoreMacro { .. } => "\"<coremacro>\"".to_string(),
         Value::Builtin(name) => format!("\"<builtin {}>\"", name),
         Value::Conversation { model, .. } => format!("\"<conversation {}>\"", model),
         Value::Stream { .. } => "\"<stream>\"".to_string(),

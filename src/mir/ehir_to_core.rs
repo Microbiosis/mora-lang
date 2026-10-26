@@ -789,17 +789,25 @@ fn lower_node(ctx: &mut CoreContext, node: &Ehir) {
                 view: core_view,
             });
         }
-        Node::TraitDef { .. }
-        | Node::ImplDef { .. }
-        | Node::Import { .. }
-        | Node::MacroDef { .. } => {
+        Node::MacroDef {
+            name, params, body, ..
+        } => {
+            // v0.104.6 D490：宏定义进 Core 产物了 —— body 是 **Core IR**
+            // ⇒ 运行期绑 `Value::CoreMacro`。
+            let core_body = lower_body_to_core(ctx, body);
+            ctx.emit(CoreInst::MacroDef {
+                name: name.clone(),
+                params: params.clone(),
+                body: core_body,
+            });
+        }
+        Node::TraitDef { .. } | Node::ImplDef { .. } | Node::Import { .. } => {
             // 编译期注册，Core 层无操作
             //
-            // ⚠ v0.104.6 D488：这几类的运行期语义**不是纯数据** ——
+            // ⚠ v0.104.6 D490：这几类的运行期语义**不是纯数据** ——
             // trait / impl 写的是**宿主注册表**（`MirHost::trait_registry` /
-            // `impl_table`，MIR 类型），`import` 要**编译并执行另一个模块**，
-            // `macro def` 的体是**函数**（`Value::Macro` 装 `Arc<MirFunction>`）⇒
-            // 要接上它们得先有 **Core 形态**的对应物 ⇒ 独立的一批（D489+）。
+            // `impl_table`，MIR 类型），`import` 要**编译并执行另一个模块**
+            // ⇒ 要接上它们得先有 **Core 形态**的对应物 ⇒ 独立的一批（D491+）。
         }
 
         // ── TEA → Core 原语（部分）──

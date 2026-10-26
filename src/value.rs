@@ -406,6 +406,18 @@ pub enum Value {
         params: Vec<String>,
         body: std::sync::Arc<crate::mir::MirFunction>,
     },
+    /// v0.104.6 D490：**Core 层宏** —— 宏体是 **Core IR**，装不进
+    /// [`Value::Macro`]（那装的是 `Arc<MirFunction>`）。
+    ///
+    /// 形状与 `Value::Macro` **同款**（名字 / 形参 / 体），只是体是 Core 的
+    /// `CoreFunction` ⇒ Core 执行器能展开它，不必绕回 MIR 层。
+    ///
+    /// （与 `Value::CoreClosure` 同款：Core 层需要自己的值表示。）
+    CoreMacro {
+        name: String,
+        params: Vec<String>,
+        body: std::sync::Arc<crate::mir::core::CoreFunction>,
+    },
     // v0.26: Prompt 分段 — 一段有 role / text / byte 预算的 system prompt 片段
     // (灵感: mimiclaw 的 5 段固定缓冲 + headroom 的内容感知压缩器)
     PromptSection {

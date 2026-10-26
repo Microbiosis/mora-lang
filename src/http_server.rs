@@ -343,6 +343,8 @@ fn value_to_json(v: &Value) -> JsonValue {
         Value::Closure { .. } => JsonValue::String_("<closure>".to_string()),
         // v0.104.6 D484：Core 层闭包（与 MIR 闭包刻意区分）。
         Value::CoreClosure { .. } => JsonValue::String_("<coreclosure>".to_string()),
+        // v0.104.6 D490：Core 层宏（与 MIR 宏刻意区分）。
+        Value::CoreMacro { .. } => JsonValue::String_("<coremacro>".to_string()),
         Value::Builtin(kind) => JsonValue::String_(format!("<builtin {}>", kind)),
         Value::Stream { .. } => JsonValue::String_("<stream>".to_string()),
         Value::Conversation { .. } => JsonValue::String_("<conversation>".to_string()),

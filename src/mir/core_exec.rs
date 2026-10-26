@@ -595,6 +595,21 @@ fn exec_inst(
             crate::mir::handlers::h_rel_def(env, name, clauses);
             Ok(None)
         }
+        // ── v0.104.6 D490：宏定义 ──
+        //
+        // body 是 **Core IR** ⇒ 绑的是 `Value::CoreMacro`（**不是**
+        // `Value::Macro` —— 那个装的是 `Arc<MirFunction>`）。
+        // 展开由 `macroexpand` builtin 委派回这里（与 `Value::CoreClosure`
+        // 同一款委派）。
+        CoreInst::MacroDef { name, params, body } => {
+            let m = Value::CoreMacro {
+                name: name.clone(),
+                params: params.clone(),
+                body: std::sync::Arc::new(body.clone()),
+            };
+            env.define(name.clone(), m, false);
+            Ok(None)
+        }
         // ── v0.104.6 D489：TEA update / app ──
         //
         // body 是 **Core IR** ⇒ 绑的是 `Value::CoreClosure`（**不是**

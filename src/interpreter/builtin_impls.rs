@@ -965,23 +965,23 @@ impl Interpreter {
                 params,
                 body,
             } => {
-                // v0.104.6 D50：arity 校验。此前缺参静默填 Nil（症状是宏体里
-                // 冒出「Operands must be two numbers...」这类**误导性**错误），
-                // 多余实参**静默丢弃**。与 D47 的 task / D48 的 reduce 同型。
-                if expr_args.len() != params.len() {
-                    return Err(format!(
-                        "macroexpand: macro '{}' expects {} args, got {}",
-                        mname,
-                        params.len(),
-                        expr_args.len()
-                    ));
-                }
-                let mut child_env = Environment::with_parent_of(std::sync::Arc::new(env.clone()));
-                for (i, param) in params.iter().enumerate() {
-                    let val = expr_args.get(i).cloned().unwrap_or(Value::Nil);
-                    child_env.define(param.clone(), val, false);
-                }
+                // arity 校验 + 按位置绑参 ⇒ 与 Core 侧**共用**同一份
+                // （`handlers::bind_macro_args`）⇒ 两个执行器的宏语义一致。
+                let mut child_env =
+                    crate::mir::handlers::bind_macro_args(&mname, &params, &expr_args, env)?;
                 crate::mir::vm::execute(&body, self, &mut child_env, effects)
+                    .map_err(|e| format!("macro '{}' expansion error: {}", mname, e))
+            }
+            // v0.104.6 D490：**Core 层宏** —— 体是 Core IR ⇒ 委派回 Core 执行器
+            // （与 `Value::CoreClosure` 同一款委派）。
+            Value::CoreMacro {
+                name: mname,
+                params,
+                body,
+            } => {
+                let mut child_env =
+                    crate::mir::handlers::bind_macro_args(&mname, &params, &expr_args, env)?;
+                crate::mir::core_exec::execute(&body, &mut child_env, self, effects)
                     .map_err(|e| format!("macro '{}' expansion error: {}", mname, e))
             }
             _ => Err(format!("macroexpand: '{}' is not a macro", name)),

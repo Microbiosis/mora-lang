@@ -349,6 +349,18 @@ fn tea_update_and_app_execute_identically() {
     );
 }
 
+/// **D490**：宏定义 —— Core 执行器与 MIR 执行器行为一致。
+///
+/// 宏体是 **Core IR** ⇒ 绑 `Value::CoreMacro` ⇒ `macroexpand` builtin 委派回
+/// Core 执行器（与 `Value::CoreClosure` 同一款委派）。
+#[test]
+fn macro_definitions_execute_identically() {
+    assert_same(
+        "宏定义与展开",
+        "macro add(a, b)\n  a + b\nend\nmacroexpand(\"add\", [1, 2])\n",
+    );
+}
+
 /// 错误路径：两个执行器都应报错（不静默成功）。
 #[test]
 fn both_executors_report_the_same_error_paths() {

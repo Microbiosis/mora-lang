@@ -19,6 +19,28 @@ All notable changes to Mora will be documented in this file.
 - **`Int` 语义**：算术与比较统一为**精确 i64**（overflow 报 `MoraError`）。
   2^53 之外的 `Int` 运算结果会变（此前静默丢最低位），`Int ⊗ Float` 超界改报错。
 
+### D490：宏定义接上 —— Core 侧能展开宏
+
+宏体是 **Core IR** ⇒ 装不进 `Value::Macro`（那装的是 `Arc<MirFunction>`）⇒
+D490 加 `Value::CoreMacro`（形状同款）+ `CoreInst::MacroDef`；`macroexpand`
+builtin 遇到它**委派回** Core 执行器（与 `Value::CoreClosure` 同一款委派）。
+
+宏展开的公共部分（arity 检查 + 按位置把实参绑进子环境）抽成
+`bind_macro_args` ⇒ MIR 侧与 Core 侧**共用** ⇒ 两个执行器的宏调用语义**逐字
+一致**（含 arity 报错文案）。
+
+#### 守卫
+
+- `tests/core_exec_differential.rs::macro_definitions_execute_identically`（**新建**）
+  —— 宏定义 + `macroexpand` 两边结果一致；
+- `tests/core_fidelity.rs::macro_definitions_are_visible`（**新建**）—— 宏定义在
+  Core 产物里**看得见**。
+
+#### 仍不支持
+
+`trait` / `impl`（要动 `MirHost` 的注册表类型 ⇒ 碰 MIR 侧）、`import`（要**编译
+并执行另一个模块**）⇒ 独立的两批（D491 / D492）。
+
 ### D489：TEA 的 `update` / `app` 接上 —— Core 能端到端跑完整 TEA 程序
 
 D488 留下的 4 类里，TEA 的 `update` / `app` **挡路的东西比想象的小**。

@@ -80,7 +80,15 @@ Token → FCFG → EHIR → Core → MIR
 >
 > ⚠ **仍不支持**（要 Core **形态**的对应物 ⇒ 独立的一批）：
 > `trait` / `impl`（运行期写的是**宿主注册表**，其类型是 MIR 类型）、`import`
-> （要**编译并执行另一个模块**）、`macro def`（体是函数）。
+> （要**编译并执行另一个模块**）。
+>
+> #### 宏定义（D490）
+>
+> 宏体是 **Core IR** ⇒ 装不进 `Value::Macro`（那装的是 `Arc<MirFunction>`）⇒
+> D490 加 `Value::CoreMacro`（形状同款）+ `CoreInst::MacroDef`；`macroexpand`
+> builtin 遇到它**委派回** Core 执行器（与 `Value::CoreClosure` 同一款委派）。
+> 宏展开的公共部分（arity 检查 + 按位置绑参）抽成 `bind_macro_args` ⇒ MIR 侧与
+> Core 侧**共用** ⇒ 两个执行器的宏语义**逐字一致**。
 >
 > #### TEA 的 `update` / `app`（D489）
 >

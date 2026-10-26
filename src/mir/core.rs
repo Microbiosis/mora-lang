@@ -254,8 +254,16 @@ pub enum CoreInst {
         params: Vec<String>,
         body: CoreFunction,
     },
-    /// TEA app 定义 —— 镜像 `MirInst::AppDef`。
+    /// 宏定义 —— 镜像 `MirInst::MacroDef`。
     ///
+    /// v0.104.6 D490：body 是 **Core IR** ⇒ 运行期绑的是 `Value::CoreMacro`
+    /// （**不是** `Value::Macro` —— 那个装的是 `Arc<MirFunction>`）。
+    MacroDef {
+        name: String,
+        params: Vec<String>,
+        body: CoreFunction,
+    },
+    /// TEA app 定义 —— 镜像 `MirInst::AppDef`。    ///
     /// init / update / view 三个体都是 **Core IR** ⇒ 运行期是三个
     /// `Value::CoreClosure`（`TeaApp` 的三个函数字段是普通 `Value` ⇒ TEA 运行时
     /// 照常调用 ⇒ 无需给 `Value::TeaApp` 加 Core 形态的变体）。

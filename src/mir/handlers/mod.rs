@@ -40,9 +40,10 @@ pub use self::control::{
 };
 pub use self::definitions::{h_impl_def, h_trait_def};
 pub use self::effects::{
-    AppDefArgs, build_and_register_tea_app, h_app_def, h_assign, h_define, h_enum_def,
-    h_export_mark, h_handle, h_import, h_macro_def, h_model_def, h_msg_def, h_perform, h_rel_def,
-    h_solve, h_struct_def, h_task_def, h_type_alias, h_update_def, h_with_config, solve_from_goal,
+    AppDefArgs, bind_macro_args, build_and_register_tea_app, h_app_def, h_assign, h_define,
+    h_enum_def, h_export_mark, h_handle, h_import, h_macro_def, h_model_def, h_msg_def, h_perform,
+    h_rel_def, h_solve, h_struct_def, h_task_def, h_type_alias, h_update_def, h_with_config,
+    solve_from_goal,
 };
 pub use self::runtime::{
     document_section_value, h_aggregate, h_document_section, h_eval, h_observe, h_orchestrate,

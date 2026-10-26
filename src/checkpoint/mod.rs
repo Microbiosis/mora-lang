@@ -101,6 +101,8 @@ fn value_kind_name(v: &Value) -> &'static str {
         Value::Closure { .. } => "closure",
         // v0.104.6 D484：Core 层闭包（与 MIR 闭包刻意区分）。
         Value::CoreClosure { .. } => "coreclosure",
+        // v0.104.6 D490：Core 层宏（与 MIR 宏刻意区分）。
+        Value::CoreMacro { .. } => "coremacro",
         Value::Conversation { .. } => "conversation",
         Value::Stream { .. } => "stream",
         Value::Agent { .. } => "agent",

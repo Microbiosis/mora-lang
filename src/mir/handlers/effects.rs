@@ -621,6 +621,36 @@ pub fn h_handle(
     }
 }
 
+/// 宏展开的**公共部分**：arity 检查 + 按位置把实参绑进子环境。
+///
+/// v0.104.6 D490：MIR 侧的 `macroexpand`（`Value::Macro`）与 Core 执行器的
+/// 宏展开（`Value::CoreMacro`）**共用**这一份 ⇒ 两个执行器的宏调用语义
+/// **逐字一致**（含 arity 报错文案）。
+pub fn bind_macro_args(
+    mname: &str,
+    params: &[String],
+    args: &[Value],
+    env: &Environment,
+) -> Result<Environment, String> {
+    // v0.104.6 D50：arity 校验。缺参静默填 Nil 会让宏体里冒出
+    // 「Operands must be two numbers...」这类**误导性**错误；多余实参
+    // **静默丢弃**。与 D47 的 task / D48 的 reduce 同型。
+    if args.len() != params.len() {
+        return Err(format!(
+            "macroexpand: macro '{}' expects {} args, got {}",
+            mname,
+            params.len(),
+            args.len()
+        ));
+    }
+    let mut child_env = Environment::with_parent_of(std::sync::Arc::new(env.clone()));
+    for (i, param) in params.iter().enumerate() {
+        let val = args.get(i).cloned().unwrap_or(Value::Nil);
+        child_env.define(param.clone(), val, false);
+    }
+    Ok(child_env)
+}
+
 pub fn h_macro_def(
     env: &mut Environment,
     name: &str,

@@ -290,6 +290,24 @@ fn closure_captures_are_computed() {
     );
 }
 
+/// 判据 ⑫（D490）：宏定义在 Core 产物里**看得见**。
+///
+/// D490 之前宏定义是**无操作** ⇒ Core 侧展开不了宏。
+#[test]
+fn macro_definitions_are_visible() {
+    let core = core_of("macro add(a, b)\n  a + b\nend\n");
+    let names: Vec<String> = core
+        .blocks
+        .iter()
+        .flat_map(|b| b.insts.iter())
+        .filter_map(|i| match i {
+            CoreInst::MacroDef { name, .. } => Some(name.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(names, vec!["add".to_string()], "宏定义应进 Core 产物");
+}
+
 /// 判据 ⑪（D489）：TEA `update` / `app` 在 Core 产物里**看得见**。
 ///
 /// D489 之前这两类是**无操作** ⇒ TEA 程序在 Core 侧根本跑不了。

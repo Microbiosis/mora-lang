@@ -19,6 +19,53 @@ All notable changes to Mora will be documented in this file.
 - **`Int` 语义**：算术与比较统一为**精确 i64**（overflow 报 `MoraError`）。
   2^53 之外的 `Int` 运算结果会变（此前静默丢最低位），`Int ⊗ Float` 超界改报错。
 
+### D488：Core 层补**声明型**构造（类型别名 / 枚举 / 结构体 / TEA model / TEA msg）
+
+Core 层此前把这 5 类声明当「编译期注册，**无操作**」⇒ 声明**在 Core 产物里完全
+不可见** ⇒ Core 跑不了带类型 / TEA 声明的程序。
+
+它们的运行期语义都是**纯数据**（在环境里注册一个绑定）⇒ 给它们各配一个原语
+（**镜像** `MirInst` 对应指令），执行器复用**同一份** handler ⇒ 两个执行器注册
+出的绑定**逐字相同**：
+
+| 构造 | 运行期效果 | Core 原语 |
+|---|---|---|
+| `type X = T` | `X` → `String("T")` | `CoreInst::TypeAlias` |
+| `enum E { … }` | `E` → `Dict(variant → String)` | `CoreInst::EnumDef` |
+| `struct S { … }` | `S` → `Dict{__struct_fields__: [...]}` | `CoreInst::StructDef` |
+| TEA `model M { … }` | `M` → `Dict{__model_fields__: [...]}` + `M.defaults` | `CoreInst::ModelDef` |
+| TEA `msg G { … }` | `G` → `Dict(variant → …)` | `CoreInst::MsgDef` |
+
+（`model` 的**默认值**是**独立**的 `DictLit` + `EnvStore("M.defaults")` 两条指令，
+与 MIR 侧同款 —— 默认值表达式用 FCFG **预分配**的寄存器 ⇒ 两边同一批号。）
+
+#### 仍不支持（要 Core **形态**的对应物 ⇒ 独立的一批）
+
+| 构造 | 挡路的东西 |
+|---|---|
+| `trait` / `impl` | 运行期写的是**宿主注册表**，其类型是 MIR 类型（`MirHost::trait_registry` / `impl_table`） |
+| `import` | 要**编译并执行另一个模块**（模块的 Core 产物） |
+| `macro def` | 体是**函数**（`Value::Macro` 装 `Arc<MirFunction>`）⇒ 需 Core 形态的宏值 |
+| TEA `update` / `app` | 体是**函数**（`Value::Closure` / `Value::TeaApp` 装 MIR 函数）⇒ 需 Core 形态的 TEA 值 |
+
+⇒ 这几类与 D484 的 `Value::CoreClosure` **同款问题**（值载荷装不下 Core 体）
+⇒ 解法也是**同款**：给值加 Core 形态的变体 ⇒ 独立的一批（D489+）。
+
+#### 一处**可观测性**限制（已登记）
+
+这些声明的**名字不进词法环境**（typeck 报未绑定）⇒ 它们的运行期效果对用户代码
+**不可观测** ⇒ 守卫只能核**产物形状**；可观测的那一个（`model` 的名字本身是值）
+由对拍判据覆盖。
+
+#### 守卫
+
+- `tests/core_fidelity.rs::declarations_are_visible`（**新建**）—— 5 类声明在
+  Core 产物里**看得见**且名字带对；
+- `tests/core_exec_differential.rs::declarations_execute_identically`（**新建**）
+  —— 5 个程序 MIR 与 Core 结果一致。
+
+（反向验证：把 `type` 别名降回「无操作」⇒ 形状判据报红 ✓）
+
 ### D487：删掉 Core 模型的 **9 个零生产者死变体** —— 「不支持」清单清空
 
 D486 之后 Core 执行器只剩「ADT 构造 / thunk」两类不支持。D487 查明：这两类

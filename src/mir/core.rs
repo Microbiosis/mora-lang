@@ -210,6 +210,42 @@ pub enum CoreInst {
         arms: Vec<EnumMatchArm>,
     },
 
+    // ── 声明型（D488）──
+    //
+    // v0.104.6 D488：此前这 5 类在 Core 层是**无操作**（「编译期注册，Core 层
+    // 无操作」）⇒ 声明**在 Core 产物里完全不可见** ⇒ Core 跑不了带类型 /
+    // TEA 声明的程序。
+    //
+    // 它们的运行期语义都是**纯数据**（在环境里注册一个绑定）⇒ 可精确镜像。
+    TypeAlias {
+        name: String,
+        /// 目标类型（**文本**形式，与 `MirInst::TypeAlias` 同款）。
+        target: String,
+    },
+    /// 枚举定义 —— 镜像 `MirInst::EnumDef`。
+    EnumDef {
+        name: String,
+        variants: Vec<crate::common::EnumVariant>,
+    },
+    /// 结构体定义 —— 镜像 `MirInst::StructDef`。
+    StructDef {
+        name: String,
+        fields: Vec<crate::common::StructField>,
+    },
+    /// TEA model 定义 —— 镜像 `MirInst::ModelDef`。
+    ///
+    /// ⚠ 字段的**默认值**不在这里 —— 与 MIR 侧同款：默认值是**独立**的
+    /// `DictLit` + `Define("Name.defaults")` 两条指令（在声明**之前**发）。
+    ModelDef {
+        name: String,
+        fields: Vec<crate::common::StructField>,
+    },
+    /// TEA msg 定义 —— 镜像 `MirInst::MsgDef`。
+    MsgDef {
+        name: String,
+        variants: Vec<crate::common::MsgVariant>,
+    },
+
     // ── 效果降维 ──
     /// 执行代数效果。
     EffectPerform {

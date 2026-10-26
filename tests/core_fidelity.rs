@@ -290,6 +290,54 @@ fn closure_captures_are_computed() {
     );
 }
 
+/// 判据 ⑩（D488）：声明型构造在 Core 产物里**看得见**（且载荷带对）。
+///
+/// D488 之前这 5 类是**无操作**（「编译期注册，Core 层无操作」）⇒ 声明在 Core
+/// 产物里**完全不可见** ⇒ Core 跑不了带类型 / TEA 声明的程序。
+///
+/// 注意：这些声明的**名字不进词法环境**（typeck 报未绑定）⇒ 它们的运行期
+/// 效果对用户代码**不可观测** ⇒ 这里只能核**产物形状**；可观测的那一个
+/// （`model` 的名字是值）由对拍判据覆盖。
+#[test]
+fn declarations_are_visible() {
+    let cases: [(&str, &str, &str); 5] = [
+        ("type_alias", "type Alias = number\n", "Alias"),
+        ("enum_def", "enum E\n  A\n  B\nend\n", "E"),
+        ("struct_def", "struct P\n  x: number\nend\n", "P"),
+        (
+            "model_def",
+            "model Counter\n  count: number = 0\nend\n",
+            "Counter",
+        ),
+        (
+            "msg_def",
+            "msg CounterMsg\n  Increment\nend\n",
+            "CounterMsg",
+        ),
+    ];
+    for (tag, src, want_name) in cases {
+        let core = core_of(src);
+        let names: Vec<String> = core
+            .blocks
+            .iter()
+            .flat_map(|b| b.insts.iter())
+            .filter_map(|i| match i {
+                CoreInst::TypeAlias { name, .. }
+                | CoreInst::EnumDef { name, .. }
+                | CoreInst::StructDef { name, .. }
+                | CoreInst::ModelDef { name, .. }
+                | CoreInst::MsgDef { name, .. } => Some(name.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            names,
+            vec![want_name.to_string()],
+            "[{tag}] 声明应进 Core 产物（D488 之前是**无操作**），实际 {names:?}"
+        );
+    }
+}
+
 /// 判据 ⑨（D486）：section / solve 的载荷 + **关系定义**在产物里看得见。
 ///
 /// D486 之前：`prompt_section` / `document_section` / `solve` 的载荷全丢

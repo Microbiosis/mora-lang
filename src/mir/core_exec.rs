@@ -598,6 +598,31 @@ fn exec_inst(
         CoreInst::RelDef { name, clauses } => {
             crate::mir::handlers::h_rel_def(env, name, clauses);
             Ok(None)
+        }
+        // ── v0.104.6 D488：声明型 → 在环境里注册绑定 ──
+        //
+        // 与 MIR 侧**同一份** handler（`h_type_alias` / `h_enum_def` /
+        // `h_struct_def` / `h_model_def` / `h_msg_def`）⇒ 两个执行器注册出的
+        // 绑定**逐字相同**。
+        CoreInst::TypeAlias { name, target } => {
+            crate::mir::handlers::h_type_alias(env, name, target);
+            Ok(None)
+        }
+        CoreInst::EnumDef { name, variants } => {
+            crate::mir::handlers::h_enum_def(env, name, variants);
+            Ok(None)
+        }
+        CoreInst::StructDef { name, fields } => {
+            crate::mir::handlers::h_struct_def(env, name, fields);
+            Ok(None)
+        }
+        CoreInst::ModelDef { name, fields } => {
+            crate::mir::handlers::h_model_def(env, name, fields);
+            Ok(None)
+        }
+        CoreInst::MsgDef { name, variants } => {
+            crate::mir::handlers::h_msg_def(env, name, variants);
+            Ok(None)
         } // ── v0.104.6 D487：**没有「不支持」的分支了** ──
           //
           // 此前这里有 4 组报错分支（thunk / ADT 构造 / 字段访问 / phi）⇒

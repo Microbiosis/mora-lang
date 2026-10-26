@@ -301,6 +301,30 @@ fn sections_and_relation_search_execute_identically() {
     assert_same("solve", "rel edge(\"a\", \"b\")\nsolve { edge(?x, ?y) }\n");
 }
 
+/// **D488**：声明型构造（类型别名 / 枚举 / 结构体 / TEA model / TEA msg）——
+/// Core 执行器与 MIR 执行器的行为必须**完全一致**。
+///
+/// 这几类的运行期语义都是**纯数据**（在环境里注册一个绑定）⇒ Core 侧复用
+/// **同一份** handler ⇒ 两个执行器注册出的绑定**逐字相同**。
+#[test]
+fn declarations_execute_identically() {
+    // ── model（含默认值）—— 名字是**可观测**的值（`Dict{__model_fields__}`）──
+    assert_same(
+        "model 声明",
+        "model Counter\n  count: number = 0\nend\nCounter\n",
+    );
+    // ── 其余声明：名字**不进词法环境**（typeck 报未绑定）⇒ 这里只验
+    //    「声明后程序仍正常」，载荷由**形状**判据核对
+    //    （`core_fidelity::declarations_are_visible`）──
+    assert_same(
+        "msg 声明",
+        "msg CounterMsg\n  Increment\n  Decrement\nend\n1\n",
+    );
+    assert_same("struct 声明", "struct P\n  x: number\nend\n1\n");
+    assert_same("enum 声明", "enum E\n  A\n  B\nend\n1\n");
+    assert_same("type 别名", "type Alias = number\n1\n");
+}
+
 /// 错误路径：两个执行器都应报错（不静默成功）。
 #[test]
 fn both_executors_report_the_same_error_paths() {

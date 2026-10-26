@@ -670,23 +670,110 @@ fn lower_node(ctx: &mut CoreContext, node: &Ehir) {
             });
         }
 
-        // ── 声明类 → 编译期消失 ──
-        Node::TypeAlias { .. }
-        | Node::EnumDef { .. }
-        | Node::StructDef { .. }
-        | Node::TraitDef { .. }
+        // ── 声明类 → Core 原语（D488）──
+        //
+        // v0.104.6 D488：此前这里是**无操作**（「编译期注册，Core 层无操作」）
+        // ⇒ 声明**在 Core 产物里完全不可见** ⇒ Core 跑不了带类型 / TEA 声明的
+        // 程序。这些声明的运行期语义都是**纯数据**（环境里注册一个绑定）⇒
+        // 可精确镜像，形状与 MIR 侧对应指令**逐字段**一致。
+        Node::TypeAlias { name, target, .. } => {
+            ctx.emit(CoreInst::TypeAlias {
+                name: name.clone(),
+                target: target.0.clone(),
+            });
+        }
+        Node::EnumDef { name, variants, .. } => {
+            let vars: Vec<crate::common::EnumVariant> = variants
+                .iter()
+                .map(|v| crate::common::EnumVariant {
+                    name: v.name.clone(),
+                    data: v.payload.as_ref().map(|p| p.0.clone()),
+                })
+                .collect();
+            ctx.emit(CoreInst::EnumDef {
+                name: name.clone(),
+                variants: vars,
+            });
+        }
+        Node::StructDef { name, fields, .. } => {
+            let flds: Vec<crate::common::StructField> = fields
+                .iter()
+                .map(|(n, t)| crate::common::StructField {
+                    name: n.clone(),
+                    type_hint: t.0.clone(),
+                })
+                .collect();
+            ctx.emit(CoreInst::StructDef {
+                name: name.clone(),
+                fields: flds,
+            });
+        }
+        Node::ModelDef {
+            name,
+            fields,
+            defaults,
+            ..
+        } => {
+            let flds: Vec<crate::common::StructField> = fields
+                .iter()
+                .map(|(n, t)| crate::common::StructField {
+                    name: n.clone(),
+                    type_hint: t.0.clone(),
+                })
+                .collect();
+            // 默认值：与 MIR 侧同序 —— **先**降表达式、**再**发 `DictLit` +
+            // `Define("Name.defaults")`，**最后**才是 model 定义本身。
+            // （默认值表达式用 FCFG **预分配**的寄存器 ⇒ 与 MIR 侧同一批号。）
+            for (_, r, node) in defaults {
+                lower_node(ctx, node);
+                let _ = r;
+            }
+            if !defaults.is_empty() {
+                let dst = ctx.alloc_reg();
+                ctx.emit(CoreInst::DictLit(
+                    dst,
+                    defaults.iter().map(|(n, r, _)| (n.clone(), *r)).collect(),
+                ));
+                ctx.emit(CoreInst::EnvStore(format!("{}.defaults", name), dst));
+            }
+            ctx.emit(CoreInst::ModelDef {
+                name: name.clone(),
+                fields: flds,
+            });
+        }
+        Node::MsgDef { name, variants, .. } => {
+            let vars: Vec<crate::common::MsgVariant> = variants
+                .iter()
+                .map(|v| crate::common::MsgVariant {
+                    name: v.name.clone(),
+                    payload_type: v.payload.as_ref().map(|p| p.0.clone()),
+                })
+                .collect();
+            ctx.emit(CoreInst::MsgDef {
+                name: name.clone(),
+                variants: vars,
+            });
+        }
+        Node::TraitDef { .. }
         | Node::ImplDef { .. }
         | Node::Import { .. }
         | Node::MacroDef { .. } => {
             // 编译期注册，Core 层无操作
+            //
+            // ⚠ v0.104.6 D488：这几类的运行期语义**不是纯数据** ——
+            // trait / impl 写的是**宿主注册表**（`MirHost::trait_registry` /
+            // `impl_table`，MIR 类型），`import` 要**编译并执行另一个模块**，
+            // `macro def` 的体是**函数**（`Value::Macro` 装 `Arc<MirFunction>`）⇒
+            // 要接上它们得先有 **Core 形态**的对应物 ⇒ 独立的一批（D489+）。
         }
 
-        // ── TEA → 编译期注册 ──
-        Node::ModelDef { .. }
-        | Node::MsgDef { .. }
-        | Node::UpdateDef { .. }
-        | Node::AppDef { .. } => {
+        // ── TEA → Core 原语（部分）──
+        Node::UpdateDef { .. } | Node::AppDef { .. } => {
             // TEA 定义在 EHIR 阶段已注册到 env，Core 层无操作
+            //
+            // ⚠ v0.104.6 D488：`update` / `app` 的体是**函数**（`Value::Closure`
+            // / `Value::TeaApp` 装 `Arc<MirFunction>`）⇒ 要接上得先有 **Core
+            // 形态**的对应值 ⇒ 独立的一批（D489+）。
         }
 
         // ── v0.104.6 D481：区域构造 → `CoreInst::Scope` ──

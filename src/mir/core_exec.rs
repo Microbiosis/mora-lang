@@ -203,10 +203,34 @@ fn exec_inst(
             Ok(None)
         }
         CoreInst::Call(dst, name, args) => {
-            let arg_vals = arg_values(regs, args)?;
-            let v = interp.mir_call_function(name, arg_vals, env, effects)?;
-            regs[*dst] = v.clone();
-            Ok(Some(v))
+            // v0.104.6 D486：走 **`h_call`**（MIR 侧 `MirInst::Call` 的 dispatch
+            // **同一份**）⇒ 解析顺序逐字一致：
+            // ① 任务注册表（MIR 侧有；**Core 侧 task 降成了闭包** ⇒ 恒空）；
+            // ② 环境里绑了 Task / Closure / Compose / Partial / **Relation** /
+            //    CoreClosure ⇒ 直接值调用；
+            // ③ 其余 → 宿主 `mir_call_function`（内建分派）。
+            //
+            // ⚠ 此前 Core 侧**直接**调 `mir_call_function` ⇒ **跳过了 ②** ⇒
+            // ① 关系值（`rel edge(...)`）不可调用 ⇒ `solve` 的目标构建体失败；
+            // ② 用户函数**遮蔽内建**时与 MIR 层分叉（MIR 走 ②，Core 走 ③）。
+            //
+            // 任务注册表恒空：Core 层把 `task` 降成**具名闭包** ⇒ 走 ② 的
+            // `Value::CoreClosure` 分支（D484）⇒ 语义等价。
+            let task_registry: std::collections::HashMap<
+                &str,
+                (&[String], &crate::mir::MirFunction),
+            > = std::collections::HashMap::new();
+            crate::mir::handlers::h_call(
+                regs,
+                *dst,
+                name,
+                args,
+                &task_registry,
+                interp,
+                env,
+                effects,
+            )?;
+            Ok(Some(regs[*dst].clone()))
         }
         // v0.104.6 D484：创建 **Core 闭包**。
         CoreInst::ClosureCreate {
@@ -426,17 +450,77 @@ fn exec_inst(
                     result?;
                     Ok(None)
                 }
-                // ── 仍不支持的：section 构建 / 关系搜索 ──
+                // ── prompt_section / document_section：body 求值 ⇒ 建 section 值
+                //    ⇒ 绑定到环境 ──
                 //
-                // 这两类要**构建一个值**（`PromptSection` / `DocumentSection`）
-                // 或**跑关系搜索**（`solve` 的解列表）⇒ 语义在 MIR 执行层
-                // （`h_prompt_section` / `h_document_section` / `h_solve`），
-                // 那些 handler 收的是 `MirFunction` 体，装不下 Core 体 ⇒
-                // 宁可**响亮报错**，也不顺序执行冒充。
-                "prompt_section" | "document_section" | "solve" => Err(format!(
-                    "Core 执行器**不支持区域 `{kind}`** —— 它要构建值 / 跑关系搜索 \
-                     （语义在 MIR 执行层，handler 收的是 MIR 函数体，装不下 Core 体）"
-                )),
+                // 与 MIR 侧 `h_prompt_section` / `h_document_section` 同款：
+                // body 在**克隆**的环境里跑（文本求值），值用**同一份** helper
+                // 建（`prompt_section_value` / `document_section_value`）⇒
+                // 两个执行器建出的值**逐字相同**。
+                "prompt_section" | "document_section" => {
+                    let ScopePayload::Section { name } = payload else {
+                        return Err(format!("Core: {kind} 区域缺 section 名字载荷"));
+                    };
+                    let mut child_env = env.clone();
+                    let text = execute(body, &mut child_env, interp, effects)?;
+                    let value = if kind == "prompt_section" {
+                        crate::mir::handlers::prompt_section_value(name, text)
+                    } else {
+                        crate::mir::handlers::document_section_value(name, text)
+                    };
+                    env.define(name.clone(), value, false);
+                    Ok(None)
+                }
+                // ── solve：建 goal ⇒ 关系搜索 ⇒ 解列表写回外层寄存器 ──
+                //
+                // 与 MIR 侧 `h_solve` 同款：查询变量按序分配 `Value::LogicVar`
+                // 注入**新作用域层**（不外泄）⇒ 跑 goal 构建体（产物必须是
+                // `Value::Goal`）⇒ 搜索（**值层面**，与 IR 无关 ⇒ 复用
+                // `solve_from_goal`）⇒ 解列表写 `dst`。
+                "solve" => {
+                    let ScopePayload::Solve {
+                        dst,
+                        limit,
+                        query_vars,
+                        anon_vars,
+                    } = payload
+                    else {
+                        return Err("Core: solve 区域缺查询参数载荷".to_string());
+                    };
+                    let mut builder_env = env.clone();
+                    for (i, name) in query_vars.iter().enumerate() {
+                        builder_env.define(name.clone(), Value::LogicVar(i as u64), false);
+                    }
+                    let base = query_vars.len() as u64;
+                    for (i, name) in anon_vars.iter().enumerate() {
+                        builder_env.define(name.clone(), Value::LogicVar(base + i as u64), false);
+                    }
+                    let built = execute(body, &mut builder_env, interp, effects)?;
+                    let built_goal = match built {
+                        Value::Goal(g) => *g,
+                        other => {
+                            return Err(format!(
+                                "solve 的目标构建体必须返回 goal 值，得到 {}",
+                                crate::flow::type_name(&other)
+                            ));
+                        }
+                    };
+                    let solutions = crate::mir::handlers::solve_from_goal(
+                        built_goal,
+                        *limit,
+                        query_vars,
+                        anon_vars.len() as u64,
+                        env,
+                        interp,
+                        effects,
+                    )?;
+                    let value = Value::List(solutions.into());
+                    regs[*dst] = value.clone();
+                    // ⚠ solve **有值**（解列表）—— 与 MIR 侧 `MirInst::Solve` 的
+                    // `dst()` = Some(dst) 同款 ⇒ 必须更新末值，否则程序的返回值
+                    // 是 Nil（实测：`solve { edge(?x, ?y) }` 两边值不同）。
+                    Ok(Some(value))
+                }
                 other => Err(format!("Core 执行器遇到未知区域构造 `{other}`")),
             }
         }
@@ -514,6 +598,14 @@ fn exec_inst(
             )?;
             Ok(None)
         }
+        // ── v0.104.6 D486：关系定义 → 注册到环境 ──
+        //
+        // 与 MIR 侧 `h_rel_def` **同一份**（同名定义累积子句 = Prolog consult
+        // 语义）⇒ 两个执行器注册出的关系**逐字相同**。
+        CoreInst::RelDef { name, clauses } => {
+            crate::mir::handlers::h_rel_def(env, name, clauses);
+            Ok(None)
+        }
         // ── v1 不支持的部分：响亮报错，不静默降级 ──
         CoreInst::ThunkCreate { .. } | CoreInst::ThunkForce(_, _) => {
             Err("Core 执行器（v1）**不支持 thunk**。".to_string())
@@ -571,7 +663,7 @@ impl crate::runtime::effect::EffectHandler for CoreHandlerClosure {
 ///
 /// ① Core 执行器的**值调用**（`CoreInst::ClosureCall`）；
 /// ② MIR 解释器的**具名调用**（名字在环境里绑定到 Core 闭包时）—— 那是
-///    「内建优先 → 环境查找」解析链的产物，只能由宿主发起，故委派回来。
+///    `h_call` 的「**环境**查找」分支的产物，只能由宿主发起，故委派回来。
 ///
 /// arity 检查 / 子环境构造 / 按位置绑定，与 MIR 侧
 /// `interpreter::dispatch::call_value_impl` 的 `Value::Closure` 分支**同款**。

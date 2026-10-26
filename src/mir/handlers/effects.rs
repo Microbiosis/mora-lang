@@ -451,8 +451,42 @@ pub fn h_solve(
         }
     };
 
-    // 3. 交错搜索
-    let mut search = Search::new(built_goal, base + anon_vars.len() as u64);
+    // 3. 交错搜索（**值层面** ⇒ 与 IR 无关 ⇒ Core 层复用同一份）
+    let solutions = solve_from_goal(
+        built_goal,
+        limit,
+        query_vars,
+        anon_vars.len() as u64,
+        env,
+        interp,
+        effects,
+    )?;
+
+    // 4. 写解列表
+    regs[dst] = Value::List(solutions.into());
+    Ok(())
+}
+
+/// 从**已建好的 goal 值**跑搜索，返回解列表。
+///
+/// v0.104.6 D486：这是**值层面**的部分（IR 无关）⇒ 抽出来给 Core 层复用：
+/// MIR 侧的 `h_solve` 与 Core 执行器**同一份**搜索逻辑 ⇒ 两个执行器解出的
+/// 解列表**逐字相同**。
+///
+/// 与 `h_solve` 的差别只有一处：goal **已经建好**（MIR 侧由 MIR 体建、
+/// Core 侧由 Core 体建）⇒ 本函数只管「搜索 + 投影」。
+#[allow(clippy::too_many_arguments)]
+pub fn solve_from_goal(
+    built_goal: crate::rel::Goal,
+    limit: Option<usize>,
+    query_vars: &[String],
+    anon_count: u64,
+    env: &mut Environment,
+    interp: &mut dyn crate::mir::host::MirHost,
+    effects: &mut crate::mir::effect::Effects,
+) -> Result<Vec<Value>, String> {
+    let base = query_vars.len() as u64;
+    let mut search = Search::new(built_goal, base + anon_count);
     let mut host = SolveHost {
         env,
         interp,
@@ -471,10 +505,7 @@ pub fn h_solve(
         }
     }
     effects.absorb(host.collected);
-
-    // 4. 写解列表
-    regs[dst] = Value::List(solutions.into());
-    Ok(())
+    Ok(solutions)
 }
 
 // v0.80: algebraic effects 的完整实现（Stage 2/4 Stage 2.5 落地）。

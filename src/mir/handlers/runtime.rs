@@ -275,6 +275,34 @@ pub fn h_span(
     result.map(|_| ())
 }
 
+/// 构建 `prompt` section 的**值**（名字 + 文本）。
+///
+/// v0.104.6 D486：这是**值层面**的构造（与 IR 无关）⇒ 抽出来给 Core 层
+/// 复用（MIR 侧的 `h_prompt_section` 与 Core 执行器**同一份** ⇒ 两个执行器
+/// 建出的 section 值**逐字相同**）。
+pub fn prompt_section_value(name: &str, text: Value) -> Value {
+    Value::PromptSection {
+        name: name.to_string(),
+        role: None,
+        text: Box::new(text),
+        budget_bytes: None,
+    }
+}
+
+/// 构建 `document` section 的**值**（带 `tag` 的 Dict）。
+///
+/// v0.104.6 D486：同 [`prompt_section_value`] —— 值层面，Core 层复用。
+pub fn document_section_value(name: &str, text: Value) -> Value {
+    let mut m = HashMap::new();
+    m.insert(
+        "tag".to_string(),
+        Value::String("document_section".to_string()),
+    );
+    m.insert("name".to_string(), Value::String(name.to_string()));
+    m.insert("text".to_string(), text);
+    Value::Dict(m)
+}
+
 /// `prompt "name" do ... end` — 构建 [`Value::PromptSection`] 并绑定到环境。
 ///
 /// v0.103 修复：此前实现只 `let _ = execute(...)` 跑一遍 body 就丢弃结果 ——
@@ -302,16 +330,7 @@ pub fn h_prompt_section(
         &mut child_env,
         effects,
     )?;
-    env.define(
-        name.to_string(),
-        Value::PromptSection {
-            name: name.to_string(),
-            role: None,
-            text: Box::new(text),
-            budget_bytes: None,
-        },
-        false,
-    );
+    env.define(name.to_string(), prompt_section_value(name, text), false);
     Ok(())
 }
 
@@ -335,14 +354,7 @@ pub fn h_document_section(
         &mut child_env,
         effects,
     )?;
-    let mut m = HashMap::new();
-    m.insert(
-        "tag".to_string(),
-        Value::String("document_section".to_string()),
-    );
-    m.insert("name".to_string(), Value::String(name.to_string()));
-    m.insert("text".to_string(), text);
-    env.define(name.to_string(), Value::Dict(m), false);
+    env.define(name.to_string(), document_section_value(name, text), false);
     Ok(())
 }
 

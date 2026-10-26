@@ -237,6 +237,18 @@ pub enum CoreInst {
     /// 强制求值 thunk。
     ThunkForce(Reg, Reg),
 
+    /// 关系定义 —— 镜像 `MirInst::RelDef`。
+    ///
+    /// v0.104.6 D486：此前 Core 层对 `Node::RelDef` **无操作**（注释说
+    /// 「关系定义在 emit 阶段注册到 env」）⇒ 关系**根本没进** Core 产物 ⇒
+    /// `solve` 的目标构建体在 Core 侧拿不到关系 ⇒ 关系搜索**跑不了**。
+    ///
+    /// 子句是**数据**（不是 CFG 结构）⇒ 原样带过，与 `Node::RelDef` 同款。
+    RelDef {
+        name: String,
+        clauses: Vec<crate::rel::Clause>,
+    },
+
     // ── 区域（结构化作用域）──
     /// 一个**区域构造**：体是**独立的嵌套代码区**（自己的块集合 + 入口 +
     /// 自己的寄存器空间），形状**镜像 MIR 层**的嵌套 `MirFunction`
@@ -438,6 +450,21 @@ pub enum ScopePayload {
     },
     /// `export`：被导出的名字（声明在体**之后**标记，与 MIR 层同序）。
     Export(Vec<String>),
+    /// `prompt_section` / `document_section`：section 的**名字**。
+    ///
+    /// v0.104.6 D486：body 求值出的文本 + 名字 ⇒ 建出 section 值并绑定到环境
+    /// （与 MIR 侧 `h_prompt_section` / `h_document_section` 同款）。
+    Section { name: String },
+    /// `solve`：关系搜索的**查询参数**。
+    ///
+    /// v0.104.6 D486：`dst` 是**解列表**的结果寄存器（值在**外层**寄存器
+    /// 空间 —— 区域体的寄存器空间是独立的）。
+    Solve {
+        dst: Reg,
+        limit: Option<usize>,
+        query_vars: Vec<String>,
+        anon_vars: Vec<String>,
+    },
 }
 
 // ===================================================================

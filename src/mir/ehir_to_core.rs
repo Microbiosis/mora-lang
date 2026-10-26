@@ -750,38 +750,63 @@ fn lower_node(ctx: &mut CoreContext, node: &Ehir) {
             });
         }
         // ── v0.103: 命名 section 声明 → 与 TEA 定义同为编译期注册 ──
-        Node::PromptSection { body, .. } => {
-            // section 的构建在 MIR 执行层（h_prompt_section 绑定值到 env）；
+        Node::PromptSection { name, body, .. } => {
+            // section 的构建在 MIR 执行层（`h_prompt_section` 绑定值到 env）；
             // Core 层只把 body 作为**区域**表示出来（D481）。
             let b = lower_body_to_core(ctx, body);
             ctx.emit(CoreInst::Scope {
                 kind: "prompt_section".to_string(),
                 body: b,
                 compensation: None,
-                payload: ScopePayload::None,
+                // v0.104.6 D486：section 的**名字**（建值时要绑到环境）。
+                payload: ScopePayload::Section { name: name.clone() },
             });
         }
-        Node::DocumentSection { body, .. } => {
+        Node::DocumentSection { name, body, .. } => {
             let b = lower_body_to_core(ctx, body);
             ctx.emit(CoreInst::Scope {
                 kind: "document_section".to_string(),
                 body: b,
                 compensation: None,
-                payload: ScopePayload::None,
+                // v0.104.6 D486：同上。
+                payload: ScopePayload::Section { name: name.clone() },
             });
         }
         // ── v0.102: 声明式范式 ──
-        Node::RelDef { .. } => {
-            // 关系定义在 emit 阶段注册到 env，Core 层无操作（同 TEA 定义）
+        Node::RelDef { name, clauses, .. } => {
+            // v0.104.6 D486：关系定义**进** Core 产物了 —— 此前这里是**无操作**
+            // ⇒ 关系根本没进 Core ⇒ `solve` 的目标构建体拿不到关系 ⇒
+            // 关系搜索在 Core 侧跑不了（与 D486 的 solve 缺口同源）。
+            //
+            // 子句是**数据** ⇒ 原样带过（与 `Node::RelDef` 同款）。
+            ctx.emit(CoreInst::RelDef {
+                name: name.clone(),
+                clauses: clauses.clone(),
+            });
         }
-        Node::Solve { goal, .. } => {
+        Node::Solve {
+            dst,
+            limit,
+            query_vars,
+            anon_vars,
+            goal,
+            ..
+        } => {
             // 目标构建体作为**区域**表示（D481）；搜索语义在 MIR 执行层。
             let b = lower_body_to_core(ctx, goal);
             ctx.emit(CoreInst::Scope {
                 kind: "solve".to_string(),
                 body: b,
                 compensation: None,
-                payload: ScopePayload::None,
+                // v0.104.6 D486：查询参数 + **解列表的结果寄存器**
+                // （`dst` 在外层寄存器空间）—— 此前全丢 ⇒ solve 的值在 Core
+                // 产物里**根本不存在**（与 D35/D58/D120 同族：结果寄存器没人写）。
+                payload: ScopePayload::Solve {
+                    dst: *dst,
+                    limit: *limit,
+                    query_vars: query_vars.clone(),
+                    anon_vars: anon_vars.clone(),
+                },
             });
         }
 

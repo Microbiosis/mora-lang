@@ -290,6 +290,65 @@ fn closure_captures_are_computed() {
     );
 }
 
+/// 判据 ⑨（D486）：section / solve 的载荷 + **关系定义**在产物里看得见。
+///
+/// D486 之前：`prompt_section` / `document_section` / `solve` 的载荷全丢
+/// （section 的名字、solve 的查询参数与**解列表结果寄存器**）⇒ 区域「看得见
+/// 但执行不了」；`Node::RelDef` 更是**无操作** ⇒ 关系**根本没进** Core 产物
+/// ⇒ `solve` 连目标都建不出来。
+#[test]
+fn section_solve_and_relation_payloads_are_visible() {
+    // ── prompt section：名字 ──
+    let core = core_of("prompt \"p\" do\n  \"text\"\nend\n");
+    match scope_payload(&core, "prompt_section") {
+        Some(ScopePayload::Section { name }) => assert_eq!(name, "p", "section 名丢了"),
+        other => panic!("prompt_section 应带名字载荷，实际 {other:?}"),
+    }
+    // ── document section：名字 ──
+    let core = core_of("document \"d\" do\n  \"text\"\nend\n");
+    match scope_payload(&core, "document_section") {
+        Some(ScopePayload::Section { name }) => assert_eq!(name, "d", "section 名丢了"),
+        other => panic!("document_section 应带名字载荷，实际 {other:?}"),
+    }
+    // ── solve：查询变量 + 结果寄存器 ──
+    let core = core_of("rel edge(\"a\", \"b\")\nsolve { edge(?x, ?y) }\n");
+    match scope_payload(&core, "solve") {
+        Some(ScopePayload::Solve {
+            dst,
+            query_vars,
+            anon_vars,
+            ..
+        }) => {
+            assert_eq!(
+                query_vars,
+                &vec!["x".to_string(), "y".to_string()],
+                "查询变量丢了"
+            );
+            assert!(anon_vars.is_empty(), "匿名变量应为空：{anon_vars:?}");
+            assert!(*dst > 0, "solve 的解列表结果寄存器丢了（dst={dst}）");
+        }
+        other => panic!("solve 应带查询参数载荷，实际 {other:?}"),
+    }
+    // ── 关系定义：进产物了 ──
+    let core = core_of("rel edge(\"a\", \"b\")\n");
+    let rels: Vec<_> = core
+        .blocks
+        .iter()
+        .flat_map(|b| b.insts.iter())
+        .filter_map(|i| match i {
+            CoreInst::RelDef { name, clauses } => Some((name.clone(), clauses.len())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        rels.len(),
+        1,
+        "关系定义应进 Core 产物（D486 之前是**无操作** ⇒ `solve` 跑不了）：{rels:?}"
+    );
+    assert_eq!(rels[0].0, "edge");
+    assert!(rels[0].1 >= 1, "关系子句丢了：{rels:?}");
+}
+
 /// 判据 ⑧（D485）：区域**载荷**在 Core 产物里**看得见**。
 ///
 /// D485 之前 `Scope` 只带 `kind` + 体 ⇒ `with_config` 的**绑定**、`span` /

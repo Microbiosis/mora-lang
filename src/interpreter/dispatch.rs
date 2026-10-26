@@ -348,9 +348,9 @@ impl Interpreter {
             //
             // ⚠ 这条只在**具名调用**解析到 Core 闭包时可达 —— Core 层里
             // `let f = fn(x) … end; f(1)` 的 `f(1)` 是**具名**调用，走
-            // 「内建优先 → 环境查找」的解析链，查找结果就是 Core 闭包。
-            // 由宿主委派 ⇒ **内建优先**的解析顺序与 MIR 层**逐字一致**
-            // （Core 执行器自己查环境会变成「环境优先」⇒ 与 MIR 分叉）。
+            // `h_call` 的「**环境**查找」分支，查找结果就是 Core 闭包。
+            // 由宿主委派 ⇒ 解析顺序与 MIR 层**逐字一致**（D486 更正：真实顺序是
+            // 「**任务表 → 环境 → 内建**」，D484 此处误写成「内建优先」）。
             Value::CoreClosure { .. } => {
                 crate::mir::core_exec::call_core_closure(value, args, self, effects)
             }

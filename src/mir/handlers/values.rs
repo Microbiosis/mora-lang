@@ -106,6 +106,10 @@ pub fn h_call(
             | Value::Closure { .. }
             | Value::Compose(_)
             | Value::Partial(_, _)
+            // v0.104.6 D486：**Core 层闭包** —— 函数体是 Core IR ⇒ 只能由
+            // Core 执行器跑 ⇒ 与 `Value::Closure` 同款：走 `call_value`
+            // （`call_value_impl` 里有对应分支，委派回 Core 执行器）。
+            | Value::CoreClosure { .. }
             // v0.102: 关系值可调用 —— 调用构造 Goal::Invoke（目标构建期）
             | Value::Relation { .. } => interp.call_value(&callable, arg_vals, effects)?,
             _ => interp.mir_call_function(name, arg_vals, env, effects)?,

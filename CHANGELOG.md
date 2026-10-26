@@ -19,6 +19,57 @@ All notable changes to Mora will be documented in this file.
 - **`Int` 语义**：算术与比较统一为**精确 i64**（overflow 报 `MoraError`）。
   2^53 之外的 `Int` 运算结果会变（此前静默丢最低位），`Int ⊗ Float` 超界改报错。
 
+### D486：Core 执行器接上 **section 构建 / 关系搜索**（并修好 D484 的一处解析分叉）
+
+D485 之后 Core 执行器只剩三类不支持。**其中两类的「不支持」理由此前是错的**
+—— D486 查明它们的语义**都是值层面**的。
+
+#### 「装不下 Core 体」只是**一半**理由
+
+- **section**（`prompt_section` / `document_section`）：body 求值出文本 ⇒ 建值 ⇒
+  绑到环境 ⇒ **值层面**；
+- **solve**：goal 体求值出 `Value::Goal` ⇒ 搜索引擎吃的是**运行期 goal 值**
+  ⇒ **值层面**。
+
+⇒ 把值层面的部分抽成**共享 helper**（`prompt_section_value` /
+`document_section_value` / `solve_from_goal`）⇒ MIR 侧与 Core 侧**同一份** ⇒ 两个
+执行器建出的 section 值、解出的解列表**逐字相同**。
+
+（此前 Core 侧把 `Scope{kind:"solve"}` 的**查询参数**与**解列表结果寄存器**
+全丢了 ⇒ `solve` 的值在 Core 产物里**根本不存在** —— 与 D35/D58/D120 同族。）
+
+#### 顺带补一个**原语**：`CoreInst::RelDef`（镜像 `MirInst::RelDef`）
+
+此前 `Node::RelDef` 在 Core 层是**无操作**（注释说「关系定义在 emit 阶段注册到
+env」）⇒ 关系**根本没进** Core 产物 ⇒ `solve` 连目标都建不出来（实测：
+`'edge' is not callable`）。
+
+#### 修好 D484 的一处**解析分叉**（顺带更正一处写错的说法）
+
+Core 侧的具名调用此前**直接**调 `mir_call_function`（内建优先的路径）⇒ 跳过了
+MIR 侧 `h_call` 的「环境查找」分支 ⇒
+
+- ① **关系值**（`rel edge(...)`）不可调用 ⇒ `solve` 跑不了；
+- ② 用户函数**遮蔽内建**时与 MIR 层分叉。
+
+⇒ D486 起 Core 的具名调用**直接复用 `h_call`** ⇒ 解析顺序逐字一致：
+**任务表 → 环境 → 内建**。
+
+⚠ **D484 的注释 / 文档把顺序写成了「内建优先」** —— 那是**错的**（真实顺序是
+**环境优先**）⇒ 本条一并更正（`core_exec.rs` / `dispatch.rs` /
+`docs/nine-layer-ir.md` / 本文件）。
+
+#### 守卫
+
+- `tests/core_exec_differential.rs::sections_and_relation_search_execute_identically`
+  （**新建**）—— 3 个程序（prompt section / document section / solve）MIR 与 Core
+  结果一致；
+- `tests/core_fidelity.rs::section_solve_and_relation_payloads_are_visible`
+  （**新建**）—— section 名 / solve 的查询参数与结果寄存器 / **关系定义**在产物里
+  看得见。
+
+（反向验证：撤掉 `RelDef` 原语 ⇒ 形状判据与对拍**双双**报红 ✓）
+
 ### D485：Core 执行器接上**区域构造 / 代数效果 / 编排执行**
 
 D484 给 Core 层补了自己的值表示后，执行器剩下的三类「不支持」也能接上了。顺带

@@ -56,15 +56,41 @@ Token → FCFG → EHIR → Core → MIR
 > `export` / `with_config` / `span` / `observe`）/ **代数效果**（D485）/
 > **编排执行**（D485）。
 >
-> **不支持**（执行器**响亮报错**，不静默降级）：**section 构建 / 关系搜索**
-> （`prompt_section` / `document_section` / `solve` 区域 —— 它们要**构建一个值**
-> 或**跑关系搜索** ⇒ 语义在 MIR 执行层，那些 handler 收的是 `MirFunction` 体，
-> **装不下 Core 体**）、ADT 构造 / thunk。
+> **不支持**（执行器**响亮报错**，不静默降级）：**ADT 构造 / thunk** —— Core 层
+> 当前不产出这些指令。
 >
 > > **task 不在不支持清单里**（D485 更正）：MIR 侧有 `MirInst::TaskDef`，但
 > > FCFG 的 `Node::FnDef` **同时**覆盖 `fn` 与 `task` 声明 ⇒ Core 层把 task
 > > 降成**具名闭包** ⇒ 已被 D484 的闭包支持覆盖。此前把 task 列为「不支持」
 > > 是**假命题**。
+>
+> #### section 构建 / 关系搜索（D486）
+>
+> `prompt_section` / `document_section`（建 section 值并绑到环境）与 `solve`
+> （关系搜索的解列表）此前**不支持** —— 理由是「handler 收的是 `MirFunction`
+> 体，装不下 Core 体」。
+>
+> D486 查明：那只是**一半**理由。三者的语义**都是值层面**的：
+> - section：body 求值出文本 ⇒ 建值 ⇒ 绑到环境 ⇒ **值层面**；
+> - solve：goal 体求值出 `Value::Goal` ⇒ 搜索引擎吃的是**运行期 goal 值**
+>   ⇒ **值层面**。
+>
+> ⇒ 把值层面的部分抽成**共享 helper**（`prompt_section_value` /
+> `document_section_value` / `solve_from_goal`）⇒ MIR 与 Core **同一份** ⇒ 两个
+> 执行器建出的 section 值、解出的解列表**逐字相同**。
+>
+> 顺带补一个**原语**：`CoreInst::RelDef`（镜像 `MirInst::RelDef`）—— 此前
+> `Node::RelDef` 在 Core 层是**无操作** ⇒ 关系**根本没进** Core 产物 ⇒ `solve`
+> 连目标都建不出来。
+>
+> #### 具名调用的解析顺序（D486 更正）
+>
+> Core 侧的具名调用现在**直接复用 `h_call`**（MIR 侧 `MirInst::Call` 的
+> dispatch **同一份**）⇒ 解析顺序逐字一致：**任务表 → 环境 → 内建**。
+>
+> ⚠ **D484 此处写错过**：当时 Core 侧直接调 `mir_call_function`（内建优先的
+> 路径）⇒ ① 关系值（`rel edge(...)`）不可调用；② 用户函数**遮蔽内建**时与 MIR
+> 层分叉。D486 一并修好。
 >
 > #### 区域**载荷**（D485）
 >
@@ -402,8 +428,8 @@ D472 之后登记项由 4 条减为 1 条（`orchestrate`），D473 之后减为
 | short_circuit_evaluation | 3 | `or`/`and` 的**求值级短路**（行为 × 优化档 + 两路径形状，D477 新建） |
 | execute_naming_hygiene | 3 | 执行入口命名一致性（旧名不得复活，D478 新建） |
 | core_cfg_wellformed | 5 | Core 层 CFG **结构良构性** + 模型限制登记（D479/D480 新建，D483 补 match 守卫体递归） |
-| core_fidelity | 8 | Core 层**保真度**（产物里该看见的东西不能丢，D481 新建；D483 反转为「有损清单已清空」；D485 加区域载荷） |
-| core_exec_differential | 6 | Core 执行器 vs MIR 执行器**语义对拍**（D482 新建；D483 加断言/聚合/模板/事务；D484 加闭包；D485 加区域/效果/编排） |
+| core_fidelity | 9 | Core 层**保真度**（产物里该看见的东西不能丢，D481 新建；D483 反转为「有损清单已清空」；D485 加区域载荷；D486 加 section/solve/关系载荷） |
+| core_exec_differential | 7 | Core 执行器 vs MIR 执行器**语义对拍**（D482 新建；D483 加断言/聚合/模板/事务；D484 加闭包；D485 加区域/效果/编排；D486 加 section/关系搜索） |
 | core_value_repr | 3 | Core 层**自己的值表示**（`Value::CoreClosure`）：可区分 / 形态正确 / 调用唯一机制（D484 新建） |
 
 ## 已知遗留（技术债）

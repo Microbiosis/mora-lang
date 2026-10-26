@@ -42,11 +42,11 @@ pub use self::definitions::{h_impl_def, h_trait_def};
 pub use self::effects::{
     AppDefArgs, h_app_def, h_assign, h_define, h_enum_def, h_export_mark, h_handle, h_import,
     h_macro_def, h_model_def, h_msg_def, h_perform, h_rel_def, h_solve, h_struct_def, h_task_def,
-    h_type_alias, h_update_def, h_with_config,
+    h_type_alias, h_update_def, h_with_config, solve_from_goal,
 };
 pub use self::runtime::{
-    h_aggregate, h_document_section, h_eval, h_observe, h_orchestrate, h_parallel,
-    h_prompt_section, h_send, h_span, h_transaction, h_worker,
+    document_section_value, h_aggregate, h_document_section, h_eval, h_observe, h_orchestrate,
+    h_parallel, h_prompt_section, h_send, h_span, h_transaction, h_worker, prompt_section_value,
 };
 pub use self::values::{
     h_binary_op, h_call, h_call_value, h_closure, h_const, h_dict_lit, h_dyn_trait, h_index,

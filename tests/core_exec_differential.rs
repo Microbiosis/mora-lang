@@ -207,7 +207,7 @@ fn short_circuit_is_semantically_observable() {
 /// 闭包。D484 给语言值加了 `Value::CoreClosure` ⇒ Core 执行器能跑自己的闭包。
 ///
 /// 覆盖三条路径：
-/// - **具名调用** `f(1)` —— 走宿主的「内建优先 → 环境查找」解析链，查找结果
+/// - **具名调用** `f(1)` —— 走 `h_call` 的「**环境**查找」分支，查找结果
 ///   是 Core 闭包 ⇒ 宿主委派回 Core 执行器；
 /// - **捕获外层** —— 闭包体读外层绑定（靠捕获的环境作父链）；
 /// - **值调用**（管道 `|>`）—— Core 执行器内部的 `ClosureCall`。
@@ -277,6 +277,28 @@ fn regions_effects_and_orchestration_execute_identically() {
         "orchestrate",
         "orchestrate graph input -> result\n  agent a => \"A\"\n  agent b => \"B\"\n  @start -> a\n  a -> b\nend\nresult\n",
     );
+}
+
+/// **D486**：section 构建 / 关系搜索 —— Core 执行器与 MIR 执行器行为一致。
+///
+/// - `prompt_section`：body 求值 ⇒ 建 `Value::PromptSection` ⇒ 绑到环境 ⇒
+///   `compose_prompt` 能取到（**可观测**）；
+/// - `document_section`：建带 `tag` 的 Dict ⇒ 绑到环境（**可观测**）；
+/// - `solve`：关系搜索 ⇒ 解列表（**可观测**）。
+#[test]
+fn sections_and_relation_search_execute_identically() {
+    // ── prompt section：值被 compose_prompt 消费 ──
+    assert_same(
+        "prompt section",
+        "prompt \"p\" do\n  \"hello section\"\nend\ncompose_prompt(\"p\")\n",
+    );
+    // ── document section：值是带 tag 的 Dict，绑在名字上 ──
+    assert_same(
+        "document section",
+        "document \"d\" do\n  \"doc section\"\nend\nd\n",
+    );
+    // ── solve：关系搜索的解列表 ──
+    assert_same("solve", "rel edge(\"a\", \"b\")\nsolve { edge(?x, ?y) }\n");
 }
 
 /// 错误路径：两个执行器都应报错（不静默成功）。

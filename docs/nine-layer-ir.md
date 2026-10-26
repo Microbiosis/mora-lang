@@ -48,18 +48,43 @@ Token → FCFG → EHIR → Core → MIR
 - **可执行**（v0.104.6 D482）：`src/mir/core_exec.rs` —— Core 层有**自己的
   执行器**（块调度，无 DAG、无优化），可与 MIR 执行器**对拍**
 
-> **Core 层的可执行子集**（D482，D483 扩充，D484 再加**闭包**）：常量 / 拷贝 /
+> **Core 层的可执行子集**（D482 起，D483/D484/D485 逐步扩充）：常量 / 拷贝 /
 > 二元运算 / 环境读写 / 列表 / 字典 / 索引 / 索引赋值 / 分支 / 跳转 / 返回 /
 > 具名调用 / 值调用 / 方法调用 / 模板 / match（含守卫）/ **断言（eval）/ 聚合
 > （aggregate）/ quasiquote / 事务提交（commit）/ 事务回滚（rollback）** /
-> **闭包**。
+> **闭包**（D484）/ **区域构造**（D485：`transaction` / `worker` / `parallel` /
+> `export` / `with_config` / `span` / `observe`）/ **代数效果**（D485）/
+> **编排执行**（D485）。
 >
-> **不支持**（执行器**响亮报错**，不静默降级）：**task**（`Value::Task` 装的是
-> `Arc<MirFunction>`，Core 层不产出 task —— 闭包**已支持**）、**区域构造**
-> （`Scope` 的并发 / 事务 / 可观测性语义在执行层，顺序执行它会与 MIR 层**静默
-> 分叉**）、**编排执行**（agent 图 / BSP 超步是执行层语义；注意「模型里有编排
-> 原语」与「执行器能跑编排」是**两件事**）、效果（需要 handler 栈与 `resume`）、
-> ADT 构造 / thunk。
+> **不支持**（执行器**响亮报错**，不静默降级）：**section 构建 / 关系搜索**
+> （`prompt_section` / `document_section` / `solve` 区域 —— 它们要**构建一个值**
+> 或**跑关系搜索** ⇒ 语义在 MIR 执行层，那些 handler 收的是 `MirFunction` 体，
+> **装不下 Core 体**）、ADT 构造 / thunk。
+>
+> > **task 不在不支持清单里**（D485 更正）：MIR 侧有 `MirInst::TaskDef`，但
+> > FCFG 的 `Node::FnDef` **同时**覆盖 `fn` 与 `task` 声明 ⇒ Core 层把 task
+> > 降成**具名闭包** ⇒ 已被 D484 的闭包支持覆盖。此前把 task 列为「不支持」
+> > 是**假命题**。
+>
+> #### 区域**载荷**（D485）
+>
+> `CoreInst::Scope` 此前只带 `kind` + 体 ⇒ 各 kind 自己的数据无处安放
+> （`with_config` 的**绑定**、`span` / `observe` 的**名字与标签**、`export` 的
+> **名字**全丢）⇒ 区域在 Core 层「**看得见但执行不了**」。D485 补
+> `ScopePayload`（按 kind 而异），执行器据此逐条对齐 MIR 侧
+> `h_transaction` / `h_worker` / `h_parallel` / `h_span` / `h_observe` /
+> `h_with_config`。
+>
+> #### 效果与编排（D485）
+>
+> - **效果**：`EffectInstall` 换下宿主的旧 handler（嵌套 handle 栈）、
+>   `EffectPerform` 走宿主注册表、`EffectRestore` 放回旧 handler。handler 体是
+>   **Core IR** ⇒ 另配 `CoreHandlerClosure`（装 `CoreFunction`），与 MIR 侧
+>   `HandlerClosure`（装 `MirFunction`）**同款**（`__arg0` 注入 + single-shot
+>   回复）。
+> - **编排**：载荷是 witness 形态 ⇒ 执行前转成 MIR 形态
+>   （`MirOrchestrateKind::from_witness_kind`，与 FCFG→MIR 桥接层同一机制），
+>   再交给 MIR 侧的 `h_orchestrate`（agent 图 / BSP 超步的语义在那一层）。
 >
 > #### Core 层**自己的值表示**（D484）
 >
@@ -377,8 +402,8 @@ D472 之后登记项由 4 条减为 1 条（`orchestrate`），D473 之后减为
 | short_circuit_evaluation | 3 | `or`/`and` 的**求值级短路**（行为 × 优化档 + 两路径形状，D477 新建） |
 | execute_naming_hygiene | 3 | 执行入口命名一致性（旧名不得复活，D478 新建） |
 | core_cfg_wellformed | 5 | Core 层 CFG **结构良构性** + 模型限制登记（D479/D480 新建，D483 补 match 守卫体递归） |
-| core_fidelity | 7 | Core 层**保真度**（产物里该看见的东西不能丢，D481 新建；D483 反转为「有损清单已清空」） |
-| core_exec_differential | 5 | Core 执行器 vs MIR 执行器**语义对拍**（D482 新建；D483 加断言/聚合/模板/事务；D484 加闭包） |
+| core_fidelity | 8 | Core 层**保真度**（产物里该看见的东西不能丢，D481 新建；D483 反转为「有损清单已清空」；D485 加区域载荷） |
+| core_exec_differential | 6 | Core 执行器 vs MIR 执行器**语义对拍**（D482 新建；D483 加断言/聚合/模板/事务；D484 加闭包；D485 加区域/效果/编排） |
 | core_value_repr | 3 | Core 层**自己的值表示**（`Value::CoreClosure`）：可区分 / 形态正确 / 调用唯一机制（D484 新建） |
 
 ## 已知遗留（技术债）

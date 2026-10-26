@@ -29,10 +29,15 @@ use mora::value::Value;
 
 /// 走 **MIR 生产路径**执行（`dag_analyze → dag_optimize → BSP 超步`）。
 ///
-/// 返回 `(值, 效应)` —— **效应也要对拍**：`aggregate` 的贡献走的是效应数据
-/// 通道（`Effect::Contribute`），只比返回值的话它**完全不可观测**。
-fn exec_mir(src: &str) -> Result<(Value, Effects), String> {
-    let (func, witnesses) = mora::parser_v3::ParserV3::compile(src).map_err(|e| e.to_string())?;
+/// 返回 `(结果, 效应)` —— **效应始终返回**（哪怕结果报错）：有些构造的
+/// 可观测性**只在效应里**（例：`transaction` 的补偿体在隔离环境里跑 ⇒ 它的
+/// 环境改动被丢弃，但它的**效应**会向上传播）⇒ 只在成功路径上比效应会漏掉
+/// 一整类缺陷。
+fn exec_mir(src: &str) -> (Result<Value, String>, Effects) {
+    let (func, witnesses) = match mora::parser_v3::ParserV3::compile(src) {
+        Ok(v) => v,
+        Err(e) => return (Err(e.to_string()), Effects::new()),
+    };
     let mir = mora::mir::pipeline::compile_optimized(
         &func,
         &witnesses,
@@ -41,19 +46,22 @@ fn exec_mir(src: &str) -> Result<(Value, Effects), String> {
     let mut interp = mora::interpreter::Interpreter::new();
     let mut env = interp.take_env();
     let mut effects = Effects::new();
-    let v = mora::mir::vm::execute(&Arc::new(mir), &mut interp, &mut env, &mut effects)?;
-    Ok((v, effects))
+    let r = mora::mir::vm::execute(&Arc::new(mir), &mut interp, &mut env, &mut effects);
+    (r, effects)
 }
 
 /// 走 **Core 执行器**执行（`mir::core_exec` 的块调度）。
-fn exec_core(src: &str) -> Result<(Value, Effects), String> {
-    let (func, witnesses) = mora::parser_v3::ParserV3::compile(src).map_err(|e| e.to_string())?;
+fn exec_core(src: &str) -> (Result<Value, String>, Effects) {
+    let (func, witnesses) = match mora::parser_v3::ParserV3::compile(src) {
+        Ok(v) => v,
+        Err(e) => return (Err(e.to_string()), Effects::new()),
+    };
     let core = mora::mir::pipeline::compile_core(&func, &witnesses);
     let mut interp = mora::interpreter::Interpreter::new();
     let mut env = interp.take_env();
     let mut effects = Effects::new();
-    let v = mora::mir::core_exec::execute(&core, &mut env, &mut interp, &mut effects)?;
-    Ok((v, effects))
+    let r = mora::mir::core_exec::execute(&core, &mut env, &mut interp, &mut effects);
+    (r, effects)
 }
 
 /// 程序本身必须是**合法 Mora**（过 typeck）—— 否则对拍的是两个错误。
@@ -69,10 +77,10 @@ fn assert_typechecks(src: &str) {
 /// 对拍：两个执行器的**值**与**效应**必须**完全一致**。
 fn assert_same(tag: &str, src: &str) {
     assert_typechecks(src);
-    let m = exec_mir(src);
-    let c = exec_core(src);
+    let (m, em) = exec_mir(src);
+    let (c, ec) = exec_core(src);
     match (&m, &c) {
-        (Ok((vm, em)), Ok((vc, ec))) => {
+        (Ok(vm), Ok(vc)) => {
             assert_eq!(
                 vm, vc,
                 "[{tag}] 两个执行器的**值**不同\n程序：\n{src}\nMIR : {vm:?}\nCore: {vc:?}"
@@ -82,36 +90,48 @@ fn assert_same(tag: &str, src: &str) {
                 "[{tag}] 两个执行器的**效应**不同\n程序：\n{src}\nMIR : {em:?}\nCore: {ec:?}"
             );
         }
-        (Err(_), Err(_)) => {} // 两边都报错 ⇒ 一致（错误文案由专门判据核对）
+        (Err(_), Err(_)) => {
+            // 两边都报错 ⇒ 值一致；**效应也要一致**（补偿体的效应在这里
+            // 才看得见 —— 只在成功路径上比效应会漏掉一整类缺陷）。
+            assert_eq!(
+                em, ec,
+                "[{tag}] 两个执行器都报错，但**效应**不同\n程序：\n{src}\nMIR : {em:?}\nCore: {ec:?}"
+            );
+        }
         (m, c) => {
             panic!("[{tag}] 一个成功一个失败 ⇒ 语义分叉\n程序：\n{src}\nMIR : {m:?}\nCore: {c:?}")
         }
     }
 }
 
-/// 对拍：两个执行器都应**报错**，且错误文案**都含同一句关键词**。
+/// 对拍：两个执行器都应**报错**，且错误文案**都含同一句关键词**、**效应一致**。
 ///
 /// 比 `assert_same` 的 `(Err, Err)` 分支**严格**：后者只判「都报错」，
 /// ⇒ 「Core 侧根本不支持这个构造所以报错」也会被当成「一致」（**恒真陷阱**）。
 fn assert_same_err(tag: &str, src: &str, keyword: &str) {
     assert_typechecks(src);
-    let m = exec_mir(src);
-    let c = exec_core(src);
-    let em = match &m {
+    let (m, em) = exec_mir(src);
+    let (c, ec) = exec_core(src);
+    let emsg = match &m {
         Ok(v) => panic!("[{tag}] MIR 侧应报错，实际成功：{v:?}"),
         Err(e) => e.clone(),
     };
-    let ec = match &c {
+    let ecsmsg = match &c {
         Ok(v) => panic!("[{tag}] Core 侧应报错，实际成功：{v:?}"),
         Err(e) => e.clone(),
     };
     assert!(
-        em.contains(keyword),
-        "[{tag}] MIR 侧错误应含 {keyword:?}（否则可能是「另一个原因」）：{em}"
+        emsg.contains(keyword),
+        "[{tag}] MIR 侧错误应含 {keyword:?}（否则可能是「另一个原因」）：{emsg}"
     );
     assert!(
-        ec.contains(keyword),
-        "[{tag}] Core 侧错误应含 {keyword:?}（否则可能是「另一个原因」）：{ec}"
+        ecsmsg.contains(keyword),
+        "[{tag}] Core 侧错误应含 {keyword:?}（否则可能是「另一个原因」）：{ecsmsg}"
+    );
+    assert_eq!(
+        em, ec,
+        "[{tag}] 两边都报错，但**效应**不同（补偿体 / 效应通道的可观测性在这里）\
+         \n程序：\n{src}\nMIR : {em:?}\nCore: {ec:?}"
     );
 }
 
@@ -172,11 +192,11 @@ fn short_circuit_is_semantically_observable() {
     let src = "let xs = [1, 2]\nlet r = false or xs[9] == 1\nr\n";
     assert_typechecks(src);
     assert!(
-        exec_mir(src).is_err(),
+        exec_mir(src).0.is_err(),
         "MIR 侧：rhs 未被求值（`false or xs[9] == 1` 不报错）⇒ 短路语义不对"
     );
     assert!(
-        exec_core(src).is_err(),
+        exec_core(src).0.is_err(),
         "Core 侧：rhs 未被求值 ⇒ 短路语义不对"
     );
 }
@@ -201,13 +221,71 @@ fn core_closures_execute_identically() {
     assert_same("闭包值调用", "let f = fn(x) x + 1\n1 |> f\n");
 }
 
+/// **D485**：区域构造 / 代数效果 / 编排执行 —— Core 执行器与 MIR 执行器
+/// 的行为必须**完全一致**。
+///
+/// | 类别 | 覆盖点 |
+/// |---|---|
+/// | `transaction` | 体在**隔离**环境里跑；体失败 ⇒ 跑补偿 ⇒ 报「已回滚」 |
+/// | `worker` | 隔离执行（环境变更不外泄） |
+/// | `parallel` | 体在当前环境跑（worker 的合并按声明顺序 ⇒ 顺序执行等价） |
+/// | `with_config` | 宿主 config 的设置与恢复 |
+/// | `export` | 导出名标记 |
+/// | `handle` / `perform` | handler 栈的 install / perform / restore |
+/// | `orchestrate` | agent 图执行（结果变量回填环境） |
+#[test]
+fn regions_effects_and_orchestration_execute_identically() {
+    // ── transaction：体成功 ⇒ 正常继续 ──
+    assert_same("transaction", "transaction\n  1\nend\n2i\n");
+    // ── transaction：体失败 ⇒ 跑补偿 ⇒ 报「已回滚」──
+    //
+    // ⚠ 用例的体**故意**报**别的**错（越界）—— 若体自己就报「已回滚」，
+    // 这条断言就分不清「补偿跑过了」与「体错了直接冒泡」。
+    assert_same_err(
+        "transaction 回滚",
+        "let xs = [1, 2]\ntransaction\n  xs[9]\nend\n1i\n",
+        "rolled back",
+    );
+    // ── transaction：**补偿体确实跑了** ──
+    //
+    // 补偿体在**隔离**环境里跑 ⇒ 它的环境改动被丢弃 ⇒ **值上不可观测**；
+    // 但它的**效应**会向上传播 ⇒ 补偿「没跑」在这里是**可观测**的。
+    // （这正是把对拍改成「错误路径也比效应」的原因。）
+    assert_same_err(
+        "transaction 补偿体",
+        "let xs = [1, 2]\ntransaction\n  xs[9]\ncompensation\n  aggregate c, 1\nend\n1i\n",
+        "rolled back",
+    );
+    // ── worker：隔离执行 ──
+    assert_same("worker", "worker w do\n  let q = 1\nend\n2i\n");
+    // ── parallel ──
+    assert_same(
+        "parallel",
+        "parallel\n  worker a do\n    let p = 1\n  end\nend\n2i\n",
+    );
+    // ── with_config：宿主 config ──
+    assert_same("with_config", "with model = \"gpt-4o\"\n  1\nend\n2i\n");
+    // ── export ──
+    assert_same("export", "export let e = 1\n2i\n");
+    // ── handle / perform：handler 栈 ──
+    assert_same(
+        "handle/perform",
+        "handle Ai {\n  perform Ai(\"x\")\n} {\n  \"handled\"\n}\n",
+    );
+    // ── orchestrate：agent 图执行 ──
+    assert_same(
+        "orchestrate",
+        "orchestrate graph input -> result\n  agent a => \"A\"\n  agent b => \"B\"\n  @start -> a\n  a -> b\nend\nresult\n",
+    );
+}
+
 /// 错误路径：两个执行器都应报错（不静默成功）。
 #[test]
 fn both_executors_report_the_same_error_paths() {
     let src = "let xs = [1, 2]\nxs[9]\n";
     assert_typechecks(src);
-    assert!(exec_mir(src).is_err(), "MIR 侧应报错");
-    assert!(exec_core(src).is_err(), "Core 侧应报错");
+    assert!(exec_mir(src).0.is_err(), "MIR 侧应报错");
+    assert!(exec_core(src).0.is_err(), "Core 侧应报错");
 }
 
 /// **D483**：曾经「有损」的 6 类构造，现在两个执行器的行为必须**完全一致**。
@@ -235,7 +313,8 @@ fn formerly_lossy_constructs_execute_identically() {
         ("MIR", exec_mir("aggregate acc, 1\n")),
         ("Core", exec_core("aggregate acc, 1\n")),
     ] {
-        let effects = r.expect("应成功").1;
+        let effects = r.1;
+        r.0.expect("应成功");
         assert_eq!(
             effects.contributions.len(),
             1,

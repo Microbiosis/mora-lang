@@ -19,6 +19,72 @@ All notable changes to Mora will be documented in this file.
 - **`Int` 语义**：算术与比较统一为**精确 i64**（overflow 报 `MoraError`）。
   2^53 之外的 `Int` 运算结果会变（此前静默丢最低位），`Int ⊗ Float` 超界改报错。
 
+### D485：Core 执行器接上**区域构造 / 代数效果 / 编排执行**
+
+D484 给 Core 层补了自己的值表示后，执行器剩下的三类「不支持」也能接上了。顺带
+更正一条**假命题**：此前把 **task** 列为「Core 执行器不支持」—— 实际 FCFG 的
+`Node::FnDef` **同时**覆盖 `fn` 与 `task` 声明 ⇒ Core 层把 task 降成**具名闭包**
+⇒ 早已被 D484 的闭包支持覆盖。
+
+#### 区域构造：先补**载荷**，再接线
+
+`CoreInst::Scope` 此前只带 `kind` + 体 ⇒ 各 kind 自己的数据无处安放
+（`with_config` 的**绑定**、`span` / `observe` 的**名字与标签**、`export` 的
+**名字**全丢）⇒ 区域在 Core 层「**看得见但执行不了**」。
+
+D485 补 `ScopePayload`（按 kind 而异：`WithConfig` / `Trace` / `Export` /
+`None`），执行器据此逐条对齐 MIR 侧 handler：
+
+| kind | MIR 侧 | Core 侧（D485） |
+|---|---|---|
+| `transaction` | `h_transaction` | 体在**隔离**环境里跑；体失败 ⇒ 跑补偿 ⇒ 报「已回滚」 |
+| `worker` | `h_worker` → `run_isolated` | 隔离执行（环境变更不外泄） |
+| `parallel` | `h_parallel` | 体在当前环境跑（MIR 保证 worker 变更按**声明顺序**合并 ⇒ 顺序执行等价） |
+| `export` | `ExportMark` | 体跑完标记导出名（与 MIR 同序） |
+| `with_config` | `h_with_config` | 宿主 config 的设置与恢复（`MirHost::mir_with_config`） |
+| `span` / `observe` | `h_span` / `h_observe` | 记 trace span（无 trace 能力的宿主退化为仅执行体） |
+
+**仍不支持**（**响亮报错**，不顺序执行冒充）：`prompt_section` /
+`document_section` / `solve` —— 它们要**构建一个值**或**跑关系搜索** ⇒ 语义在
+MIR 执行层（`h_prompt_section` / `h_document_section` / `h_solve`），那些 handler
+收的是 `MirFunction` 体，**装不下 Core 体**。
+
+#### 代数效果
+
+`EffectInstall` 换下宿主的旧 handler（嵌套 handle 栈）、`EffectPerform` 走宿主
+注册表、`EffectRestore` 放回旧 handler。handler 体是 **Core IR** ⇒ 另配
+`CoreHandlerClosure`（装 `CoreFunction`），与 MIR 侧 `HandlerClosure`（装
+`MirFunction`）**同款**（`__arg0` 注入 + single-shot 回复）。
+
+旧 handler 的暂存栈放在**每次 `execute` 的局部**里：install / restore 在降维里
+**总是**同一动态范围内配对（体是内联的）⇒ 任何嵌套代码区自带一个新栈仍自洽；
+而 perform 找的是**宿主**的注册表（不在这栈上）⇒ 外层 handler 照样可见。
+
+#### 编排执行
+
+载荷是 witness 形态 ⇒ 执行前转成 MIR 形态（`MirOrchestrateKind::from_witness_kind`，
+与 FCFG→MIR 桥接层**同一机制**），再交给 MIR 侧的 `h_orchestrate`（agent 图 /
+BSP 超步的语义在那一层）。
+
+#### 守卫
+
+- `tests/core_exec_differential.rs::regions_effects_and_orchestration_execute_identically`
+  （**新建**）—— 9 个程序（transaction / transaction 回滚 / **transaction 补偿体** /
+  worker / parallel / with_config / export / handle+perform / orchestrate）MIR 与
+  Core 结果一致；
+- `tests/core_fidelity.rs::region_payloads_are_visible`（**新建**）—— 区域**载荷**
+  在产物里看得见（绑定名 / span 名与标签 / observe 前缀 / 导出名）。
+
+#### 对拍 harness 升级：**错误路径也比效应**
+
+`transaction` 的**补偿体**在隔离环境里跑 ⇒ 它的环境改动被丢弃 ⇒ **值上不可观测**
+⇒ 「补偿没跑」在只看值的对拍里是**恒真**的。
+
+⇒ 把 harness 改成「**效应始终返回**（哪怕结果报错）」，且 `(Err, Err)` 分支也
+**比效应** ⇒ 补偿体的效应（`aggregate` 贡献）成为可观测信号。
+
+（反向验证：撤掉补偿执行 ⇒ 「两边都报错，但**效应**不同」⇒ 判据报红 ✓）
+
 ### D484：给 Core 层**自己的值表示** —— `Value::CoreClosure`
 
 Core 执行器此前遇到闭包只能**响亮报错**：`Value::Closure` 装的是

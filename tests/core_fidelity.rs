@@ -40,9 +40,12 @@
 //!    `commit` / `rollback` / `orchestrate`）现在**忠实可见** —— 原语存在 +
 //!    载荷逐字段对得上；
 //! ⑦（D483）`eval` / `aggregate` 的**值寄存器不许被 Nil 覆盖**（D481/D482
-//!    的占位路径会把语句的值从「given / 被贡献表达式的值」改成 Nil）。
+//!    的占位路径会把语句的值从「given / 被贡献表达式的值」改成 Nil）；
+//! ⑧（D485）区域**载荷**（`with_config` 的绑定 / `span`·`observe` 的名字与
+//!    标签 / `export` 的名字）在产物里看得见 —— 缺了它们区域就「看得见但
+//!    执行不了」。
 
-use mora::mir::core::{CoreInst, CoreTerminator};
+use mora::mir::core::{CoreInst, CoreTerminator, ScopePayload};
 use mora::value::Value;
 
 /// 构造一个程序的 CoreFunction（走 9 层里的 EHIR → Core 段）。
@@ -285,6 +288,72 @@ fn closure_captures_are_computed() {
         captures.iter().any(|c| c == "n"),
         "闭包应捕获外层的 `n`（D481 之前 captures 恒为空），实际 {captures:?}"
     );
+}
+
+/// 判据 ⑧（D485）：区域**载荷**在 Core 产物里**看得见**。
+///
+/// D485 之前 `Scope` 只带 `kind` + 体 ⇒ `with_config` 的**绑定**、`span` /
+/// `observe` 的**名字与标签**、`export` 的**名字**全丢 ⇒ 区域在 Core 层
+/// 「**看得见但执行不了**」（执行器拿不到自己的数据）。
+#[test]
+fn region_payloads_are_visible() {
+    // ── with_config：绑定名 + 值所在寄存器 ──
+    let core = core_of("with model = \"m\"\n  1\nend\n");
+    match scope_payload(&core, "with_config") {
+        Some(ScopePayload::WithConfig(bindings)) => {
+            assert_eq!(bindings.len(), 1, "应恰好一条配置绑定：{bindings:?}");
+            assert_eq!(bindings[0].0, "model", "绑定名丢了：{bindings:?}");
+        }
+        other => panic!("with_config 应带绑定载荷，实际 {other:?}"),
+    }
+
+    // ── span：名字 + 标签 ──
+    let core = core_of("span \"s\" tags {a: \"b\"} do\n  1\nend\n");
+    match scope_payload(&core, "span") {
+        Some(ScopePayload::Trace { name, tags }) => {
+            assert_eq!(name, "s", "span 名丢了");
+            assert!(
+                tags.iter().any(|(k, v)| k == "a" && v == "b"),
+                "span 标签丢了：{tags:?}"
+            );
+        }
+        other => panic!("span 应带 trace 载荷，实际 {other:?}"),
+    }
+
+    // ── observe：名字带 `observe/` 前缀（与 MIR 侧 `h_observe` 的
+    //    `format!("observe/{}", config)` 同款；config = kind + 名字）──
+    let core = core_of("observe trace \"t\" do\n  1\nend\n");
+    match scope_payload(&core, "observe") {
+        Some(ScopePayload::Trace { name, .. }) => {
+            assert_eq!(name, "observe/trace t", "observe 的 span 名不对：{name}");
+        }
+        other => panic!("observe 应带 trace 载荷，实际 {other:?}"),
+    }
+
+    // ── export：被导出的名字 ──
+    let core = core_of("export let e = 1\n");
+    match scope_payload(&core, "export") {
+        Some(ScopePayload::Export(names)) => {
+            assert!(names.iter().any(|n| n == "e"), "导出名丢了：{names:?}");
+        }
+        other => panic!("export 应带名字载荷，实际 {other:?}"),
+    }
+}
+
+/// 产物里某个 kind 的区域**载荷**。
+fn scope_payload<'a>(
+    core: &'a mora::mir::core::CoreFunction,
+    kind: &str,
+) -> Option<&'a ScopePayload> {
+    core.blocks
+        .iter()
+        .flat_map(|b| b.insts.iter())
+        .find_map(|i| match i {
+            CoreInst::Scope {
+                kind: k, payload, ..
+            } if k == kind => Some(payload),
+            _ => None,
+        })
 }
 
 /// 判据 ⑥（D483）：曾经「有损」的 6 类构造，在 Core 产物里**忠实可见**。

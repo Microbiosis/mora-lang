@@ -14,7 +14,7 @@
 
 use crate::mir::core::{
     BlockId, CoreBlock, CoreFunction, CoreInst, CoreTerminator, EffectLabel, EnumMatchArm,
-    literal_to_value, pattern_bindings,
+    ScopePayload, literal_to_value, pattern_bindings,
 };
 use crate::mir::effect::EffectRow;
 use crate::mir::fcfg::{Ehir, EhirBlock, Node, QuasiquoteSegment as FcfgSegment, Reg};
@@ -699,12 +699,15 @@ fn lower_node(ctx: &mut CoreContext, node: &Ehir) {
         //
         // 区域**内部**的并发 / 事务 / 可观测性语义仍在执行层（MIR），
         // Core 层只保证**结构可见**。
-        Node::Export { decl, .. } => {
+        Node::Export { names, decl, .. } => {
             let b = lower_body_to_core(ctx, decl);
             ctx.emit(CoreInst::Scope {
                 kind: "export".to_string(),
                 body: b,
                 compensation: None,
+                // v0.104.6 D485：被导出的**名字**（MIR 侧在声明体之后发
+                // `ExportMark`，同序）。
+                payload: ScopePayload::Export(names.clone()),
             });
         }
         Node::Parallel { body, .. } => {
@@ -713,22 +716,37 @@ fn lower_node(ctx: &mut CoreContext, node: &Ehir) {
                 kind: "parallel".to_string(),
                 body: b,
                 compensation: None,
+                payload: ScopePayload::None,
             });
         }
-        Node::Observe { body, .. } => {
+        Node::Observe { config, body, .. } => {
             let b = lower_body_to_core(ctx, body);
             ctx.emit(CoreInst::Scope {
                 kind: "observe".to_string(),
                 body: b,
                 compensation: None,
+                // v0.104.6 D485：span 名（`observe` 的 kind 作前缀，与 MIR 侧
+                // `h_observe` 的 `observe/{config}` 逐字一致）。
+                payload: ScopePayload::Trace {
+                    name: format!("observe/{}", config),
+                    tags: Vec::new(),
+                },
             });
         }
-        Node::Span { body, .. } => {
+        Node::Span {
+            name, tags, body, ..
+        } => {
             let b = lower_body_to_core(ctx, body);
             ctx.emit(CoreInst::Scope {
                 kind: "span".to_string(),
                 body: b,
                 compensation: None,
+                // v0.104.6 D485：span 名 + 属性（此前全丢 ⇒ 区域看得见但
+                // 执行不了）。
+                payload: ScopePayload::Trace {
+                    name: name.clone(),
+                    tags: tags.clone(),
+                },
             });
         }
         // ── v0.103: 命名 section 声明 → 与 TEA 定义同为编译期注册 ──
@@ -740,6 +758,7 @@ fn lower_node(ctx: &mut CoreContext, node: &Ehir) {
                 kind: "prompt_section".to_string(),
                 body: b,
                 compensation: None,
+                payload: ScopePayload::None,
             });
         }
         Node::DocumentSection { body, .. } => {
@@ -748,6 +767,7 @@ fn lower_node(ctx: &mut CoreContext, node: &Ehir) {
                 kind: "document_section".to_string(),
                 body: b,
                 compensation: None,
+                payload: ScopePayload::None,
             });
         }
         // ── v0.102: 声明式范式 ──
@@ -761,6 +781,7 @@ fn lower_node(ctx: &mut CoreContext, node: &Ehir) {
                 kind: "solve".to_string(),
                 body: b,
                 compensation: None,
+                payload: ScopePayload::None,
             });
         }
 
@@ -789,12 +810,20 @@ fn lower_node(ctx: &mut CoreContext, node: &Ehir) {
         }
 
         // ── 配置块 → 区域（D481）──
-        Node::WithConfig { body, dst, .. } => {
+        Node::WithConfig {
+            bindings,
+            body,
+            dst,
+            ..
+        } => {
             let b = lower_body_to_core(ctx, body);
             ctx.emit(CoreInst::Scope {
                 kind: "with_config".to_string(),
                 body: b,
                 compensation: None,
+                // v0.104.6 D485：配置**绑定**（名 + 值所在寄存器；值在外层
+                // 寄存器空间）—— 此前全丢 ⇒ 区域看得见但执行不了。
+                payload: ScopePayload::WithConfig(bindings.clone()),
             });
             // `with` 块的值恒为 Nil（与 MIR 层 D58 的同形契约）。
             ctx.emit(CoreInst::Const(*dst, Value::Nil));
@@ -855,6 +884,7 @@ fn lower_node(ctx: &mut CoreContext, node: &Ehir) {
                 kind: "worker".to_string(),
                 body: b,
                 compensation: None,
+                payload: ScopePayload::None,
             });
             ctx.emit(CoreInst::Const(*dst, Value::Nil));
         }
@@ -870,6 +900,7 @@ fn lower_node(ctx: &mut CoreContext, node: &Ehir) {
                 kind: "transaction".to_string(),
                 body: b,
                 compensation: Some(c),
+                payload: ScopePayload::None,
             });
             ctx.emit(CoreInst::Const(*dst, Value::Nil));
         }

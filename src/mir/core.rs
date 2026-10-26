@@ -255,6 +255,12 @@ pub enum CoreInst {
         body: CoreFunction,
         /// 补偿体（**仅** `transaction` 有；其余为 `None`）。
         compensation: Option<CoreFunction>,
+        /// 区域**载荷**（按 `kind` 而异）。
+        ///
+        /// v0.104.6 D485：此前 `Scope` 只带 `kind` + 体 ⇒ 各 kind 的**载荷
+        /// 全丢**（`with_config` 的绑定、`span` / `observe` 的名字与标签、
+        /// `export` 的名字）⇒ 区域在 Core 层「**看得见但执行不了**」。
+        payload: ScopePayload,
     },
 
     // ── 控制流（5 种）──
@@ -409,6 +415,29 @@ pub enum EffectLabel {
     Net,
     Bsp,
     Custom(String),
+}
+
+/// 区域**载荷**（按 [`CoreInst::Scope`] 的 `kind` 而异）。
+///
+/// v0.104.6 D485：`Scope` 此前只带 `kind` + 体 ⇒ 各 kind 自己的数据无处安放
+/// ⇒ 执行器**无法**忠实复现（MIR 侧这些数据在 handler 的实参里）。
+///
+/// 载荷是**数据**（不是 CFG 结构）⇒ 与 D473「编排载荷原样透传」同款理由。
+#[derive(Debug, Clone)]
+pub enum ScopePayload {
+    /// 无额外载荷（`worker` / `parallel` / `transaction` …）。
+    None,
+    /// `with_config`：绑定名 + 值所在寄存器。
+    ///
+    /// ⚠ 值在**外层**寄存器空间（配置绑定在外层求值，块体是独立代码区）。
+    WithConfig(Vec<(String, Reg)>),
+    /// `span` / `observe`：span 名 + 属性（`observe` 的 kind 作名前缀）。
+    Trace {
+        name: String,
+        tags: Vec<(String, String)>,
+    },
+    /// `export`：被导出的名字（声明在体**之后**标记，与 MIR 层同序）。
+    Export(Vec<String>),
 }
 
 // ===================================================================

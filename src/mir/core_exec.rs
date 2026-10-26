@@ -13,25 +13,32 @@
 //! 支持：常量 / 拷贝 / 二元运算 / 环境读写 / 列表 / 字典 / 索引 / 索引赋值 /
 //! 分支 / 跳转 / 返回 / 具名调用 / 值调用 / 方法调用 / 模板 / match（含守卫）/
 //! **断言（eval）/ 聚合（aggregate）/ quasiquote / 事务提交（commit）**/
-//! **闭包**（D484：Core 层有自己的值表示 `Value::CoreClosure`）。
+//! **闭包**（D484：Core 层有自己的值表示 `Value::CoreClosure`）/
+//! **区域构造**（D485：`transaction` / `worker` / `parallel` / `export` /
+//! `with_config` / `span` / `observe`）/ **代数效果**（D485：`EffectInstall` /
+//! `EffectPerform` / `EffectRestore`）/ **编排执行**（D485）。
 //!
 //! **不支持**（遇到就**响亮报错**，绝不静默降级）：
 //!
-//! - **task**（`Value::Task` 装的是 `Arc<MirFunction>`，Core 层不产出 task）——
-//!   闭包**已支持**（D484），task 还没有；
-//! - **区域构造**（`Scope`）—— Core 的 `Scope` 只是「区域」，**并发 / 事务 /
-//!   可观测性语义在执行层** ⇒ 把它顺序执行会与 MIR 层**静默分叉**
-//!   （所以这里宁可报错，也不假装能跑）；
-//! - **编排**（`Orchestrate`）—— agent 图 / BSP 超步是执行层的语义（同上）；
-//! - **效果**（`EffectPerform` / `EffectInstall` / `EffectRestore`）—— 需要
-//!   handler 栈与 `resume` 语义；
+//! - **section 构建 / 关系搜索**（`prompt_section` / `document_section` /
+//!   `solve` 区域）—— 它们要**构建一个值**（`Value::PromptSection` 等）或
+//!   **跑关系搜索**（解列表）⇒ 语义在 MIR 执行层（`h_prompt_section` /
+//!   `h_document_section` / `h_solve`），那些 handler 收的是 `MirFunction` 体，
+//!   **装不下 Core 体** ⇒ 宁可报错，也不顺序执行冒充；
 //! - **ADT 构造 / thunk** —— Core 层当前不产出这些指令。
+//!
+//! > **task 不在不支持清单里**（D485 更正）：MIR 侧有 `MirInst::TaskDef`，但
+//! > FCFG 的 `Node::FnDef` **同时**覆盖 `fn` 与 `task` 声明 ⇒ Core 层把 task
+//! > 降成**具名闭包**（`ClosureCreate` + `EnvStore`）⇒ 已被 D484 的闭包支持
+//! > 覆盖。此前把 task 列为「不支持」是**假命题**。
 //!
 //! ## 语义基线
 //!
 //! 与 MIR 层**同源**：环境用 Mora 的 `Environment`（持久 map + 父链）、
 //! 模式匹配复用 `self_match_pattern`、内建分派走 `MirHost`、
-//! 断言 / 聚合 / quasiquote 复用 `h_eval` / `h_aggregate` / `h_quasiquote`
+//! 断言 / 聚合 / quasiquote 复用 `h_eval` / `h_aggregate` / `h_quasiquote`、
+//! 区域语义逐条对齐 `h_transaction` / `h_worker` / `h_parallel` / `h_span` /
+//! `h_observe` / `h_with_config`、编排复用 `h_orchestrate`
 //! ⇒ 差分覆盖的是**降维与控制流**，不是内建本身。
 //!
 //! ## Core 层自己的值表示（D484）
@@ -44,7 +51,7 @@
 //! 执行器仍用 Mora 的 `Environment` 与既有 handler ⇒ 不重复实现环境语义，
 //! 也不引入 `Value ↔ CoreValue` 的转换层。
 
-use crate::mir::core::{CoreFunction, CoreInst, CoreTerminator};
+use crate::mir::core::{CoreFunction, CoreInst, CoreTerminator, ScopePayload};
 use crate::mir::effect::Effects;
 use crate::mir::handlers::{
     h_assign, h_binary_op, h_const, h_define, h_dict_lit, h_index, h_index_assign, h_list_lit,
@@ -66,6 +73,21 @@ pub fn execute(
     let mut regs = vec![Value::Nil; func.n_regs.max(1)];
     let mut pc = func.entry;
     let mut last = Value::Nil;
+    // v0.104.6 D485：效果 handler 的**旧值暂存栈**。
+    //
+    // Core 模型把 `handle` 拆成 `EffectInstall` → 体 → `EffectRestore` 三条
+    // 指令（体**内联**在外层 CFG 里）⇒ install 与 restore 之间必须记住被
+    // 换下的旧 handler（嵌套 handle 要能逐层恢复）⇒ 需要一处栈。
+    //
+    // 为什么**每次 execute 一个新栈**就够：install/restore 在降维里**总是**
+    // 同一个动态范围内配对（体是内联的）⇒ 任何嵌套代码区（闭包体 / 区域体 /
+    // 守卫体）自带一个新栈，它自己的 install/restore 依然自洽；而 perform
+    // 找的是**宿主**的 handler 注册表（不在这栈上）⇒ 外层的 handler 照样
+    // 可见。
+    let mut saved_handlers: Vec<(
+        String,
+        Option<Box<dyn crate::runtime::effect::EffectHandler>>,
+    )> = Vec::new();
     // 步数上限：Core 函数不该有无限循环（与 MIR 引擎的 wave 上限同思路）——
     // 无上限的话，一个坏掉的分支目标会让测试**挂死**而不是报错。
     let mut steps: u64 = 0;
@@ -84,7 +106,8 @@ pub fn execute(
             )
         })?;
         for inst in &block.insts {
-            if let Some(v) = exec_inst(inst, &mut regs, env, interp, effects)? {
+            if let Some(v) = exec_inst(inst, &mut regs, env, interp, effects, &mut saved_handlers)?
+            {
                 last = v;
             }
         }
@@ -119,12 +142,17 @@ fn reg(regs: &[Value], r: usize) -> Result<Value, String> {
 }
 
 /// 执行一条指令，返回它写下的值（无值 ⇒ `None`）。
+#[allow(clippy::too_many_arguments)]
 fn exec_inst(
     inst: &CoreInst,
     regs: &mut [Value],
     env: &mut Environment,
     interp: &mut dyn MirHost,
     effects: &mut Effects,
+    saved_handlers: &mut Vec<(
+        String,
+        Option<Box<dyn crate::runtime::effect::EffectHandler>>,
+    )>,
 ) -> Result<Option<Value>, String> {
     match inst {
         CoreInst::Const(dst, v) => {
@@ -297,28 +325,199 @@ fn exec_inst(
         // 指令形态只是冗余副本（MIR 引擎里 `Flow::Jump(_)` 同样是 no-op）⇒ 忽略。
         CoreInst::Branch { .. } | CoreInst::Jump(_) | CoreInst::Return(_) => Ok(None),
         // ── v1 不支持的部分：响亮报错，不静默降级 ──
-        CoreInst::Scope { kind, .. } => Err(format!(
-            "Core 执行器（v1）**不支持区域构造** `{kind}` —— 并发 / 事务 / 可观测性 \
-             语义在执行层，顺序执行它会与 MIR 层静默分叉。"
-        )),
-        CoreInst::EffectPerform { .. }
-        | CoreInst::EffectInstall { .. }
-        | CoreInst::EffectRestore { .. } => {
-            Err("Core 执行器（v1）**不支持效果**（需要 handler 栈与 resume 语义）。".to_string())
+        // ── v0.104.6 D485：区域构造 ──
+        //
+        // 语义**逐条对齐** MIR 侧对应的 handler（`h_transaction` / `h_worker` /
+        // `h_parallel` / `h_observe` / `h_span` / `h_with_config`）。
+        CoreInst::Scope {
+            kind,
+            body,
+            compensation,
+            payload,
+        } => {
+            match kind.as_str() {
+                // ── transaction：体失败 ⇒ 跑补偿 ⇒ 报「已回滚」──
+                "transaction" => {
+                    let comp = compensation
+                        .as_ref()
+                        .ok_or_else(|| format!("Core: transaction 区域缺补偿体（kind={kind}）"))?;
+                    // 体在**隔离**环境里跑（与 MIR 侧 `run_isolated` 同款：
+                    // 环境变更不外泄），效应仍向上传播。
+                    let mut inner_env = env.clone();
+                    match execute(body, &mut inner_env, interp, effects) {
+                        Ok(_) => Ok(None),
+                        Err(_) => {
+                            let mut comp_env = env.clone();
+                            if let Err(e) = execute(comp, &mut comp_env, interp, effects) {
+                                eprintln!("[warn] transaction compensation failed: {}", e);
+                            }
+                            Err("Transaction rolled back".to_string())
+                        }
+                    }
+                }
+                // ── worker：隔离执行 ──
+                //
+                // MIR 侧 `h_worker` → `run_isolated`（克隆 env 跑完丢弃）⇒
+                // worker 内的环境变更**不**外泄。
+                "worker" => {
+                    let mut inner_env = env.clone();
+                    execute(body, &mut inner_env, interp, effects)?;
+                    Ok(None)
+                }
+                // ── parallel：体在**当前**环境里跑 ──
+                //
+                // MIR 侧 `h_parallel` 把体里连续的 worker 声明**并发**跑，
+                // 但明确保证「环境变更按**声明顺序**合并 ⇒ 并发完成顺序不影响
+                // 最终状态」⇒ 顺序执行与并发执行**结果相同** ⇒ Core 侧顺序
+                // 执行是忠实的。
+                "parallel" => {
+                    execute(body, env, interp, effects)?;
+                    Ok(None)
+                }
+                // ── export：体在当前环境里跑，之后标记导出名 ──
+                //
+                // 与 MIR 侧同序（`fcfg_lower`：先降声明体，再发 `ExportMark`）。
+                "export" => {
+                    execute(body, env, interp, effects)?;
+                    if let ScopePayload::Export(names) = payload {
+                        for n in names {
+                            env.exports.insert(n.clone());
+                        }
+                    }
+                    Ok(None)
+                }
+                // ── with_config：设宿主 config → 跑体 → 恢复 ──
+                //
+                // 与 MIR 侧 `h_with_config` 同款：config 是**宿主状态**
+                // （`MirHost::mir_with_config` / `mir_restore_config`）。
+                "with_config" => {
+                    let ScopePayload::WithConfig(bindings) = payload else {
+                        return Err("Core: with_config 区域缺绑定载荷".to_string());
+                    };
+                    let mut vals: Vec<(String, Value)> = Vec::with_capacity(bindings.len());
+                    for (name, r) in bindings {
+                        vals.push((name.clone(), reg(regs, *r)?));
+                    }
+                    interp.mir_with_config(&vals)?;
+                    let result = execute(body, env, interp, effects);
+                    // 无论成败都恢复（与 MIR 侧同款）。
+                    interp.mir_restore_config();
+                    result?;
+                    Ok(None)
+                }
+                // ── span / observe：记录 trace span → 隔离跑体 ──
+                //
+                // 与 MIR 侧 `h_span` / `h_observe` 同款：无 trace 能力的宿主
+                // 退化为**仅执行体**（`trace_collector()` 返回 `None`）。
+                "span" | "observe" => {
+                    let ScopePayload::Trace { name, tags } = payload else {
+                        return Err(format!("Core: {kind} 区域缺 trace 载荷"));
+                    };
+                    let attrs: std::collections::HashMap<String, String> =
+                        tags.iter().cloned().collect();
+                    let handle = interp
+                        .trace_collector()
+                        .map(|t| t.start_span(name, attrs.clone()));
+                    let mut inner_env = env.clone();
+                    let result = execute(body, &mut inner_env, interp, effects);
+                    if let Some(h) = handle {
+                        h.end(attrs);
+                    }
+                    result?;
+                    Ok(None)
+                }
+                // ── 仍不支持的：section 构建 / 关系搜索 ──
+                //
+                // 这两类要**构建一个值**（`PromptSection` / `DocumentSection`）
+                // 或**跑关系搜索**（`solve` 的解列表）⇒ 语义在 MIR 执行层
+                // （`h_prompt_section` / `h_document_section` / `h_solve`），
+                // 那些 handler 收的是 `MirFunction` 体，装不下 Core 体 ⇒
+                // 宁可**响亮报错**，也不顺序执行冒充。
+                "prompt_section" | "document_section" | "solve" => Err(format!(
+                    "Core 执行器**不支持区域 `{kind}`** —— 它要构建值 / 跑关系搜索 \
+                     （语义在 MIR 执行层，handler 收的是 MIR 函数体，装不下 Core 体）"
+                )),
+                other => Err(format!("Core 执行器遇到未知区域构造 `{other}`")),
+            }
         }
+        // ── v0.104.6 D485：代数效果 ──
+        //
+        // 与 MIR 侧 `h_handle` / `h_perform` 同款：install 换下旧 handler、
+        // perform 走**宿主**的 handler 栈、restore 把旧 handler 放回去。
+        CoreInst::EffectInstall { label, handler } => {
+            let name = label.name().to_string();
+            let h = reg(regs, *handler)?;
+            let Value::CoreClosure {
+                core_body,
+                env: captured,
+                ..
+            } = &h
+            else {
+                return Err(format!(
+                    "Core: EffectInstall 的 handler 不是 Core 闭包（实际 {}）",
+                    crate::flow::type_name(&h)
+                ));
+            };
+            // 换下旧 handler（嵌套 handle 栈）—— 与 `h_handle` 的 take 同款。
+            let prev = interp.take_effect_handler(&name);
+            saved_handlers.push((name.clone(), prev));
+            interp.install_effect_handler(
+                name.clone(),
+                Box::new(CoreHandlerClosure {
+                    handler_core: core_body.clone(),
+                    // handler 自有的执行环境（安装时的快照）—— 与 MIR 侧
+                    // `HandlerClosure.env` 同款。
+                    env: captured.0.as_ref().clone(),
+                }),
+            );
+            Ok(None)
+        }
+        CoreInst::EffectPerform { dst, label, args } => {
+            let name = label.name().to_string();
+            let arg_vals = arg_values(regs, args)?;
+            // 与 MIR 侧 `h_perform` 同款：走宿主的 handler 栈。
+            match interp.perform_effect(&name, arg_vals, effects) {
+                Some(reply) => {
+                    regs[*dst] = reply.clone();
+                    Ok(Some(reply))
+                }
+                None => Err(format!(
+                    "unhandled effect: {name} (no matching handle block in scope)"
+                )),
+            }
+        }
+        CoreInst::EffectRestore { label } => {
+            let name = label.name().to_string();
+            // 弹出保存的旧 handler 并放回（与 `h_handle` 的 restore 同款）。
+            let idx = saved_handlers.iter().rposition(|(n, _)| *n == name);
+            let prev = match idx {
+                Some(i) => saved_handlers.remove(i).1,
+                None => None,
+            };
+            interp.restore_effect_handler(name, prev);
+            Ok(None)
+        }
+        // ── v0.104.6 D485：编排执行 ──
+        //
+        // 载荷是 **witness 形态**（D483 原样透传）⇒ 执行前转成 MIR 形态
+        // （`MirOrchestrateKind::from_witness_kind`，与 FCFG→MIR 桥接层
+        // 同一机制），再交给 MIR 侧的 `h_orchestrate`（agent 图 / BSP 超步
+        // 的语义在那一层）。
+        CoreInst::Orchestrate {
+            input_var,
+            result_var,
+            kind,
+        } => {
+            let mir_kind = crate::mir::orchestrate::MirOrchestrateKind::from_witness_kind(kind);
+            crate::mir::handlers::h_orchestrate(
+                interp, env, input_var, result_var, &mir_kind, effects,
+            )?;
+            Ok(None)
+        }
+        // ── v1 不支持的部分：响亮报错，不静默降级 ──
         CoreInst::ThunkCreate { .. } | CoreInst::ThunkForce(_, _) => {
             Err("Core 执行器（v1）**不支持 thunk**。".to_string())
         }
-        // 编排：agent 图 / BSP 超步是**执行层**的语义 ⇒ 顺序执行它会与 MIR 层
-        // 静默分叉 ⇒ 宁可报错，也不假装能跑。
-        //
-        // ⚠ D483 起 Core 层有了编排**原语**（模型忠实），但执行器仍不支持
-        // **执行**它 —— 「模型里有」与「执行器能跑」是**两件事**，别混。
-        CoreInst::Orchestrate { .. } => Err(
-            "Core 执行器（v1）**不支持编排执行** —— agent 图 / BSP 超步是执行层的语义，\
-             顺序执行它会与 MIR 层静默分叉。"
-                .to_string(),
-        ),
         CoreInst::EnumConstruct { .. }
         | CoreInst::StructConstruct { .. }
         | CoreInst::StructAccess(_, _, _) => {
@@ -328,6 +527,41 @@ fn exec_inst(
             "Core 执行器（v1）**不支持 phi 节点**（Core 层由 SSA 前的分支汇合承担）。".to_string(),
         ),
         CoreInst::Unreachable => Err("Core: 不可达指令".to_string()),
+    }
+}
+
+/// **Core 闭包**装进宿主的代数效果 handler 槽。
+///
+/// v0.104.6 D485：MIR 侧的对应物是 `runtime::effect::HandlerClosure`（装
+/// `MirFunction` handler 体）。Core 侧的 handler 体是 **Core IR** ⇒ 装不下 ⇒
+/// 另配一个。
+///
+/// 与 MIR 侧**同款**的契约：
+/// - `perform` 时把实参按 `__arg0` / `__arg1` … 注入 **handler 自有的环境**；
+/// - handler 末尾表达式的值就是本次 perform 的**回复值**（single-shot：
+///   handler 一次性消耗，不还原）。
+struct CoreHandlerClosure {
+    /// handler 体（Core IR 的子函数）。
+    handler_core: std::sync::Arc<CoreFunction>,
+    /// handler 自有的执行环境（安装时的快照）—— 跨多次 perform 保持 handler
+    /// 侧写可见（与 `HandlerClosure.env` 同款）。
+    env: Environment,
+}
+
+impl crate::runtime::effect::EffectHandler for CoreHandlerClosure {
+    fn perform_box(
+        &mut self,
+        host: &mut dyn MirHost,
+        args: Vec<Value>,
+        effects: &mut Effects,
+    ) -> Result<Value, String> {
+        // 1. 实参注入 handler 环境（`__arg0`、`__arg1` …）。
+        for (i, arg) in args.iter().enumerate() {
+            self.env.define(format!("__arg{}", i), arg.clone(), false);
+        }
+        // 2. 跑 handler 体（Core IR）—— 与 MIR 侧 `HandlerClosure::perform_box`
+        //    跑 `handler_mir` 同款，只是执行器不同。
+        execute(&self.handler_core, &mut self.env, host, effects)
     }
 }
 

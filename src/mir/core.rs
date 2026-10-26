@@ -254,6 +254,11 @@ pub enum CoreInst {
         params: Vec<String>,
         body: CoreFunction,
     },
+    /// 模块导入 —— 镜像 `MirInst::Import`。
+    ///
+    /// v0.104.6 D491：Core 侧的导入把模块编译成 **Core 产物**再执行 ⇒
+    /// 导入方看到的是 Core 世界里的绑定。
+    Import { path: String },
     /// 宏定义 —— 镜像 `MirInst::MacroDef`。
     ///
     /// v0.104.6 D490：body 是 **Core IR** ⇒ 运行期绑的是 `Value::CoreMacro`

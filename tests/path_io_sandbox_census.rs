@@ -171,9 +171,18 @@ fn d352_import_is_a_deliberate_exemption() {
         "`import` 所在的 interpreter/mod.rs 不应有 `check_path` —— \
          它读的是待执行源码，加白名单等于**禁止 import 沙箱外模块** ⇒ 破坏功能"
     );
+    // v0.104.6 D491：`import` 的**读文件 + 编译**搬到了
+    // `mir::handlers::read_and_compile_module`（与 Core 侧共用同一份）⇒
+    // 断言的位置跟着搬；**豁免的意图不变**（仍不查路径白名单）。
+    let handlers = read("src/mir/handlers/effects.rs");
+    assert!(
+        !handlers.contains("check_path"),
+        "`import` 的读文件处（mir/handlers/effects.rs）不应有 `check_path` —— \
+         它读的是待执行源码，加白名单等于**禁止 import 沙箱外模块** ⇒ 破坏功能"
+    );
     // 且它确实在读文件
     assert!(
-        src.contains("match std::fs::read_to_string(path)"),
+        handlers.contains("std::fs::read_to_string(path)"),
         "`import` 应仍走 `fs::read_to_string`"
     );
 }

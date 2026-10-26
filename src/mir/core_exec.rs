@@ -595,6 +595,20 @@ fn exec_inst(
             crate::mir::handlers::h_rel_def(env, name, clauses);
             Ok(None)
         }
+        // ── v0.104.6 D491：模块导入 ──
+        //
+        // 与 MIR 侧**共用**前半段（读文件 + 编译）与后半段（只合并**导出集内**
+        // 的绑定）⇒ 两个执行器的模块可见性语义**逐字一致**。
+        // 差别只有一处：Core 侧把模块编译成 **Core 产物**并用 Core 执行器跑。
+        CoreInst::Import { path } => {
+            let (func, witnesses) = crate::mir::handlers::read_and_compile_module(path)?;
+            let core = crate::mir::pipeline::compile_core(&func, &witnesses);
+            // 子 import 的 env 是当前 env 的克隆（与 with 块语义一致）。
+            let mut child_env = env.clone();
+            execute(&core, &mut child_env, interp, effects)?;
+            crate::mir::handlers::merge_exported_bindings(&child_env, env);
+            Ok(None)
+        }
         // ── v0.104.6 D490：宏定义 ──
         //
         // body 是 **Core IR** ⇒ 绑的是 `Value::CoreMacro`（**不是**

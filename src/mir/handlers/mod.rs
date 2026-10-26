@@ -43,7 +43,7 @@ pub use self::effects::{
     AppDefArgs, bind_macro_args, build_and_register_tea_app, h_app_def, h_assign, h_define,
     h_enum_def, h_export_mark, h_handle, h_import, h_macro_def, h_model_def, h_msg_def, h_perform,
     h_rel_def, h_solve, h_struct_def, h_task_def, h_type_alias, h_update_def, h_with_config,
-    solve_from_goal,
+    merge_exported_bindings, read_and_compile_module, solve_from_goal,
 };
 pub use self::runtime::{
     document_section_value, h_aggregate, h_document_section, h_eval, h_observe, h_orchestrate,

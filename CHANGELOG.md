@@ -19,6 +19,31 @@ All notable changes to Mora will be documented in this file.
 - **`Int` 语义**：算术与比较统一为**精确 i64**（overflow 报 `MoraError`）。
   2^53 之外的 `Int` 运算结果会变（此前静默丢最低位），`Int ⊗ Float` 超界改报错。
 
+### D491：模块导入接上 —— Core 侧能导入模块
+
+Core 侧的导入把模块编译成 **Core 产物**再执行 ⇒ 导入方看到的是 Core 世界里的
+绑定。
+
+读文件 / 编译（`read_and_compile_module`）与「只合并**导出集内**的绑定」
+（`merge_exported_bindings`）**共用** MIR 侧的实现 ⇒ 两个执行器的模块可见性
+语义（spec §10.2）**逐字一致**。
+
+#### 守卫
+
+- `tests/core_exec_differential.rs::module_imports_execute_identically`（**新建**）
+  —— 写一个 `export let greeting = 42i` 的模块 ⇒ 导入 ⇒ 引用导出绑定，
+  两边结果一致且可见。
+
+  ⚠ 这条**绕过 typeck**：导入的绑定是**运行期**才进环境的 ⇒ typeck 看不到 ⇒
+  引用导入名的程序会被报「未绑定」（MIR 侧同样如此）⇒ 判据不能走
+  `assert_typechecks`。
+
+#### 仍不支持
+
+`trait` / `impl` —— 运行期写的是**宿主注册表**（`MirHost::trait_registry` /
+`impl_table`），其类型是 MIR 类型 ⇒ 要接上得先有 **Core 形态**的注册表 ⇒ 要动
+`MirHost` 的 trait 签名（**碰 MIR 侧**，影响面比前几批大）⇒ 独立的一批（D492）。
+
 ### D490：宏定义接上 —— Core 侧能展开宏
 
 宏体是 **Core IR** ⇒ 装不进 `Value::Macro`（那装的是 `Arc<MirFunction>`）⇒

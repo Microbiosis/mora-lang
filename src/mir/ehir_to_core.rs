@@ -801,13 +801,18 @@ fn lower_node(ctx: &mut CoreContext, node: &Ehir) {
                 body: core_body,
             });
         }
-        Node::TraitDef { .. } | Node::ImplDef { .. } | Node::Import { .. } => {
+        Node::Import { path, .. } => {
+            // v0.104.6 D491：导入进 Core 产物了 —— Core 侧把模块编译成
+            // **Core 产物**再执行 ⇒ 导入方看到的是 Core 世界里的绑定。
+            ctx.emit(CoreInst::Import { path: path.clone() });
+        }
+        Node::TraitDef { .. } | Node::ImplDef { .. } => {
             // 编译期注册，Core 层无操作
             //
-            // ⚠ v0.104.6 D490：这几类的运行期语义**不是纯数据** ——
+            // ⚠ v0.104.6 D490：这两类的运行期语义**不是纯数据** ——
             // trait / impl 写的是**宿主注册表**（`MirHost::trait_registry` /
-            // `impl_table`，MIR 类型），`import` 要**编译并执行另一个模块**
-            // ⇒ 要接上它们得先有 **Core 形态**的对应物 ⇒ 独立的一批（D491+）。
+            // `impl_table`，MIR 类型）⇒ 要接上得先有 **Core 形态**的注册表
+            // ⇒ 独立的一批（D492+）。
         }
 
         // ── TEA → Core 原语（部分）──

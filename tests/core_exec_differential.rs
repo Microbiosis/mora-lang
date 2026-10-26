@@ -361,6 +361,35 @@ fn macro_definitions_execute_identically() {
     );
 }
 
+/// **D491**：模块导入 —— Core 执行器与 MIR 执行器行为一致。
+///
+/// ⚠ 这条**绕过 typeck**：导入的绑定是**运行期**才进环境的 ⇒ typeck 看不到
+/// ⇒ 引用导入名的程序会被报「未绑定」（MIR 侧同样如此）⇒ 判据不能走
+/// `assert_typechecks`。
+#[test]
+fn module_imports_execute_identically() {
+    let dir = mora::test_support::TempDir::new("core_import");
+    let mod_path = dir.file("mod.mora");
+    std::fs::write(&mod_path, "export let greeting = 42i\n").expect("写模块");
+    // Windows 路径里的反斜杠会被当成转义 ⇒ 统一用正斜杠。
+    let import_path = mod_path.to_string_lossy().replace('\\', "/");
+    let src = format!("import \"{import_path}\"\ngreeting\n");
+
+    let m = exec_mir(&src);
+    let c = exec_core(&src);
+    let mv = m.0.expect("MIR 侧应成功");
+    let cv = c.0.expect("Core 侧应成功");
+    assert_eq!(
+        mv, cv,
+        "两个执行器的导入结果应一致\nMIR : {mv:?}\nCore: {cv:?}"
+    );
+    assert_eq!(
+        mv,
+        mora::value::Value::Int(42),
+        "导入的**导出绑定**应可见（未导出的名字是模块私有）"
+    );
+}
+
 /// 错误路径：两个执行器都应报错（不静默成功）。
 #[test]
 fn both_executors_report_the_same_error_paths() {

@@ -708,43 +708,30 @@ impl Interpreter {
         env: &mut crate::value::Environment,
         effects: &mut crate::mir::effect::Effects,
     ) -> Result<(), String> {
-        match std::fs::read_to_string(path) {
-            Ok(source) => {
-                let (imported_func, witnesses) = crate::parser_v3::ParserV3::compile(&source)?;
-                let _type_errs =
-                    crate::typeck::check_mir::check_program_witnesses_bidirectional(&witnesses);
-                // v0.104.6 D473：import 走**9 层唯一路径**（此前直接消费
-                // `ParserV3::compile` 的 `emit.rs` 直出产物 —— 旧路径在生产里
-                // 始终是活的，不只作为回落）。
-                let imported_func = crate::mir::pipeline::compile_optimized(
-                    &imported_func,
-                    &witnesses,
-                    crate::mir::ssa::OptLevel::default(),
-                );
-                // 子 import 的 env 是当前 env 的克隆（与 with 块语义一致）
-                let mut child_env = env.clone();
-                // v0.75.9: 包裹 Arc 走全局 DAG 缓存
-                let _ = crate::mir::vm::execute(
-                    &std::sync::Arc::new(imported_func),
-                    self,
-                    &mut child_env,
-                    effects,
-                )?;
-                // v0.103: 只合并**导出集内**的绑定（spec §10.2 可见性语义）。
-                // `export <声明>` 在模块执行时把名字写入 child_env 导出集
-                // （`Environment::exported_names`）；未导出的名字是模块私有，
-                // 不得泄漏进导入方。此前无条件合并全部绑定 —— 可见性机制
-                // 完全缺失（`Environment::define` 的 `exported` 参数被忽略）。
-                let exported = child_env.exported_names();
-                for name in exported {
-                    if let Some(val) = child_env.get(&name) {
-                        env.define(name, val, false);
-                    }
-                }
-                Ok(())
-            }
-            Err(e) => Err(format!("import error: {}", e)),
-        }
+        // v0.104.6 D491：读文件 + 编译 + 合并导出集**共用** Core 侧的 helper
+        // ⇒ 两个执行器的模块语义**逐字一致**（只差「编译成什么」与「用什么
+        // 执行」）。
+        let (imported_func, witnesses) = crate::mir::handlers::read_and_compile_module(path)?;
+        // v0.104.6 D473：import 走**9 层唯一路径**（此前直接消费
+        // `ParserV3::compile` 的 `emit.rs` 直出产物 —— 旧路径在生产里
+        // 始终是活的，不只作为回落）。
+        let imported_func = crate::mir::pipeline::compile_optimized(
+            &imported_func,
+            &witnesses,
+            crate::mir::ssa::OptLevel::default(),
+        );
+        // 子 import 的 env 是当前 env 的克隆（与 with 块语义一致）
+        let mut child_env = env.clone();
+        // v0.75.9: 包裹 Arc 走全局 DAG 缓存
+        let _ = crate::mir::vm::execute(
+            &std::sync::Arc::new(imported_func),
+            self,
+            &mut child_env,
+            effects,
+        )?;
+        // v0.103: 只合并**导出集内**的绑定（spec §10.2 可见性语义）。
+        crate::mir::handlers::merge_exported_bindings(&child_env, env);
+        Ok(())
     }
 
     /// α.2: MIR 解释器的 with 块 config 设置桥。

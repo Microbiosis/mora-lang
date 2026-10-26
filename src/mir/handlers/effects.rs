@@ -651,6 +651,38 @@ pub fn bind_macro_args(
     Ok(child_env)
 }
 
+/// import 的**公共前半段**：读模块文件 + 编译成 witness。
+///
+/// v0.104.6 D491：MIR 侧与 Core 侧**共用**这一步（只差「编译成什么」与
+/// 「用什么执行」）⇒ 两个执行器的模块语义**逐字一致**。
+pub fn read_and_compile_module(
+    path: &str,
+) -> Result<
+    (
+        crate::mir::MirFunction,
+        Vec<crate::mir::witness::MirWitness>,
+    ),
+    String,
+> {
+    let source = std::fs::read_to_string(path).map_err(|e| format!("import error: {}", e))?;
+    let (func, witnesses) = crate::parser_v3::ParserV3::compile(&source)?;
+    // 类型错**不**阻断导入（与 MIR 侧同款：只记录不报错）。
+    let _type_errs = crate::typeck::check_mir::check_program_witnesses_bidirectional(&witnesses);
+    Ok((func, witnesses))
+}
+
+/// import 的**公共后半段**：只把**导出集内**的绑定合并进父环境。
+///
+/// v0.103：模块可见性（spec §10.2）—— 未导出的名字是模块私有，**不得**泄漏
+/// 进导入方。此前无条件合并全部绑定 ⇒ 可见性机制完全缺失。
+pub fn merge_exported_bindings(child_env: &Environment, env: &mut Environment) {
+    for name in child_env.exported_names() {
+        if let Some(val) = child_env.get(&name) {
+            env.define(name, val, false);
+        }
+    }
+}
+
 pub fn h_macro_def(
     env: &mut Environment,
     name: &str,
